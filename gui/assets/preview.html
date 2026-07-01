@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<!-- Visual preview of strongtalk.css — open in Safari to eyeball the look.
+     Mimics the Launcher + a start-page fragment, per gui/PLAN.md §2. -->
+<html>
+<head>
+<meta charset="utf-8">
+<title>MACVM — Strongtalk style preview</title>
+<link rel="stylesheet" href="strongtalk.css">
+<style>
+  html, body { height: 100%; }
+  .window { display: flex; flex-direction: column; height: 100%; }
+  .content { flex: 1; overflow: auto; }
+</style>
+</head>
+<body>
+<div class="window">
+  <div class="st-toolbar st-raised">
+    <button title="Start page"><img src="../reference/icons-png/smallHome.png"></button>
+    <button title="Find definition"><img src="../reference/icons-png/open.png"></button>
+    <button title="Implementors"><img src="../reference/icons-png/implementors.png"></button>
+    <button title="Senders"><img src="../reference/icons-png/senders.png"></button>
+    <button title="User hierarchy"><img src="../reference/icons-png/userHierarchy.png"></button>
+    <button title="Full hierarchy"><img src="../reference/icons-png/hierarchy.png"></button>
+    <button title="Workspace"><img src="../reference/icons-png/blankSheet.png"></button>
+    <button title="Text editor"><img src="../reference/icons-png/texteditor.png"></button>
+    <button title="Documentation"><img src="../reference/icons-png/documentation.png"></button>
+  </div>
+
+  <div class="content">
+    <div class="st-page">
+      <h2 align="center">Welcome to the MACVM System!</h2>
+      <p>This is the MACVM start page, rendered in the visual style of the
+      Strongtalk browser. Links that <a class="doit" href="#">execute code</a>
+      look like this; embedded applications render inline via the
+      <strong>smappl</strong> tag:
+      <span class="smappl">Button withImage: … action: […]</span></p>
+
+      <h3>Some Important Classes</h3>
+      <ul class="st-outliner">
+        <li class="st-node"><img class="st-toggle" src="../reference/icons-png/openItem.png">
+            <span class="st-class">Object</span></li>
+        <li class="st-node" style="margin-left: 30px">
+            <img class="st-toggle" src="../reference/icons-png/closedItem.png">
+            <span class="st-class">Collection</span></li>
+        <li class="st-node" style="margin-left: 30px">
+            <img class="st-toggle" src="../reference/icons-png/closedItem.png">
+            <span class="st-class">Visual</span></li>
+      </ul>
+
+      <h3>Actions</h3>
+      <ul>
+        <li><a class="doit" href="#">Collect Garbage</a></li>
+        <li><a class="doit" href="#">Open Workspace</a></li>
+      </ul>
+
+      <pre class="st-raised" style="padding: 6px; background: #ffffff">goForwardOrIfAbsent: failBlk &lt;[]&gt;
+    | current &lt;URL&gt; |
+    current := self model.
+    self bareModel: (self popNextURLOrIfAbsent: [ failBlk value. ^self ]).
+    self history addLast: current.</pre>
+    </div>
+  </div>
+
+  <div class="st-transcript st-lowered" style="height: 72px">
+    MACVM Transcript
+    Ready.
+  </div>
+
+  <div class="st-statusbar st-raised">
+    <span class="st-field">Ready</span>
+  </div>
+</div>
+</body>
+</html>

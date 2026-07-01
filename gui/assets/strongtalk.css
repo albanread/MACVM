@@ -1,0 +1,179 @@
+/* strongtalk.css — the Strongtalk (1996) visual language, per gui/PLAN.md §2.
+   Ground truth: strongtalk-repo/StrongtalkSource
+   Paint.dlt:76-85 (palette) · HTMLBuilder.dlt:360,515 (body font, link blue)
+   ElementH1-6.dlt (heading scale) · ElementPRE.dlt:24 (code font)
+   Button.dlt:311 (widget font) · Border.dlt (standard3DRaised bevels) */
+
+:root {
+  /* Paint.dlt */
+  --st-white: #ffffff;
+  --st-black: #000000;
+  --st-gray: #808080;
+  --st-background-gray: #c0c0c0;   /* window / toolbar / outliner chrome */
+  --st-blue: #0000ff;              /* linkPaint */
+  --st-bluegreen: #008080;
+  --st-bevel-light: #dfdfdf;       /* inner highlight of 3D borders */
+
+  /* Glue rigid spacing values */
+  --st-space-1: 2px;
+  --st-space-2: 6px;
+  --st-space-3: 10px;
+
+  /* Type. GDI points ≈ px at 96dpi; tune vs 750px page width (PLAN §5). */
+  --st-font-body: 'Times New Roman', Times, serif;
+  --st-font-code: 'Lucida Console', Menlo, monospace;
+  --st-font-widget: Tahoma, Geneva, sans-serif;
+  --st-size-body: 16px;   /* 12pt */
+  --st-size-code: 13px;   /* 10pt */
+  --st-size-widget: 11px; /*  8pt */
+
+  --st-page-width: 750px; /* HTMLVisual defaultWidth */
+  --st-page-left-margin: 30px; /* HTMLBuilder initialLeftMargin */
+}
+
+/* ---- page ---- */
+body {
+  margin: 0;
+  background: var(--st-white);
+  color: var(--st-black);
+  font-family: var(--st-font-body);
+  font-size: var(--st-size-body);
+  -webkit-font-smoothing: none; /* period-correct crunch where honored */
+}
+.st-page {
+  max-width: var(--st-page-width);
+  padding: var(--st-space-2) var(--st-space-3) var(--st-space-3)
+           var(--st-page-left-margin);
+}
+
+/* Heading scale: 24/18/14/12/12/10pt, boldness 0.8 */
+h1, h2, h3, h4, h5, h6 { font-family: var(--st-font-body); font-weight: bold; }
+h1 { font-size: 32px; }
+h2 { font-size: 24px; }
+h3 { font-size: 19px; }
+h4 { font-size: 16px; }
+h5 { font-size: 16px; }
+h6 { font-size: 13px; }
+
+a, a.doit { color: var(--st-blue); text-decoration: underline; cursor: default; }
+a:visited { color: var(--st-blue); } /* no visited distinction in HTMLView */
+
+pre, code, .st-code {
+  font-family: var(--st-font-code);
+  font-size: var(--st-size-code);
+}
+
+ul { list-style-type: disc; } /* Symbol ch.183 middle-dot bullet */
+
+/* ---- 3D bevels (Border standard3DRaised:) ---- */
+.st-raised {
+  box-shadow: inset -1px -1px 0 var(--st-black),
+              inset  1px  1px 0 var(--st-white),
+              inset -2px -2px 0 var(--st-gray),
+              inset  2px  2px 0 var(--st-bevel-light);
+}
+.st-lowered {
+  box-shadow: inset -1px -1px 0 var(--st-white),
+              inset  1px  1px 0 var(--st-black),
+              inset -2px -2px 0 var(--st-bevel-light),
+              inset  2px  2px 0 var(--st-gray);
+}
+
+/* ---- chrome: toolbar / status bar / transcript ---- */
+.st-toolbar {
+  display: flex;
+  align-items: center;
+  gap: var(--st-space-3);
+  background: var(--st-background-gray);
+  padding: var(--st-space-1) var(--st-space-2);
+}
+.st-toolbar button {
+  width: 33px; height: 33px;
+  padding: 3px;
+  background: var(--st-background-gray);
+  border: none;
+  box-shadow: inset -1px -1px 0 var(--st-black),
+              inset  1px  1px 0 var(--st-white),
+              inset -2px -2px 0 var(--st-gray),
+              inset  2px  2px 0 var(--st-bevel-light);
+  font-family: var(--st-font-widget);
+  font-size: var(--st-size-widget);
+}
+.st-toolbar button:active {
+  box-shadow: inset  1px  1px 0 var(--st-black),
+              inset -1px -1px 0 var(--st-white),
+              inset  2px  2px 0 var(--st-gray),
+              inset -2px -2px 0 var(--st-bevel-light);
+  padding: 4px 2px 2px 4px; /* nudge the icon like a real Win95 press */
+}
+.st-toolbar button img, .st-icon {
+  image-rendering: pixelated;
+  width: 25px; height: 25px;
+}
+
+.st-statusbar {
+  background: var(--st-background-gray);
+  font-family: var(--st-font-widget);
+  font-size: var(--st-size-widget);
+  padding: 3px var(--st-space-2);
+}
+.st-statusbar .st-field { /* lowered field inside the bar */
+  display: inline-block;
+  padding: 1px var(--st-space-2);
+  box-shadow: inset 1px 1px 0 var(--st-gray),
+              inset -1px -1px 0 var(--st-white);
+}
+
+.st-transcript {
+  background: var(--st-white);
+  font-family: var(--st-font-code);
+  font-size: var(--st-size-code);
+  padding: var(--st-space-1) var(--st-space-2);
+  overflow: auto;
+}
+
+/* ---- smappl placeholder (G0, inert) ---- */
+.smappl {
+  display: inline-block;
+  background: var(--st-background-gray);
+  font-family: var(--st-font-code);
+  font-size: var(--st-size-code);
+  padding: var(--st-space-1) var(--st-space-2);
+  box-shadow: inset 1px 1px 0 var(--st-black),
+              inset -1px -1px 0 var(--st-white),
+              inset 2px 2px 0 var(--st-gray),
+              inset -2px -2px 0 var(--st-bevel-light);
+}
+
+/* ---- outliner (G3) ---- */
+.st-outliner { font-family: var(--st-font-body); }
+.st-outliner .st-node { margin-left: 15px; } /* LI indent per HTMLBuilder */
+.st-outliner .st-toggle {
+  image-rendering: pixelated;
+  vertical-align: middle;
+  margin-right: var(--st-space-1);
+}
+.st-outliner .st-header {
+  background: var(--st-background-gray);
+  padding: 1px var(--st-space-1);
+}
+.st-outliner .st-superclass { font-weight: normal; color: var(--st-black); }
+.st-outliner .st-class { font-weight: bold; }
+
+/* ---- retro scrollbars ---- */
+::-webkit-scrollbar { width: 16px; height: 16px; background: #e8e8e8; }
+::-webkit-scrollbar-thumb {
+  background: var(--st-background-gray);
+  box-shadow: inset -1px -1px 0 var(--st-black),
+              inset  1px  1px 0 var(--st-white),
+              inset -2px -2px 0 var(--st-gray),
+              inset  2px  2px 0 var(--st-bevel-light);
+}
+::-webkit-scrollbar-button {
+  background: var(--st-background-gray);
+  height: 16px; width: 16px;
+  box-shadow: inset -1px -1px 0 var(--st-black),
+              inset  1px  1px 0 var(--st-white),
+              inset -2px -2px 0 var(--st-gray),
+              inset  2px  2px 0 var(--st-bevel-light);
+}
