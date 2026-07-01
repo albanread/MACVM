@@ -1,0 +1,27 @@
+[package]
+name = "macvm"
+version = "0.0.0"
+edition = "2021"
+description = "A Self/Strongtalk-lineage adaptive research VM for macOS on Apple Silicon (arm64)."
+license = "BSD-2-Clause"
+publish = false
+
+[[bin]]
+name = "macvm"
+path = "src/main.rs"
+
+[lib]
+name = "macvm"
+path = "src/lib.rs"
+
+# Codegen backend is an OPEN DECISION (see docs/DESIGN.md §4). Backends are
+# selected by feature so the compiler front end never hard-depends on one.
+[features]
+default = []
+# backend-jasm = []   # reuse the JASM AArch64 encoder
+# backend-llvm = []   # emit LLVM IR
+# interp-only  = []   # baseline interpreter, no native codegen
+
+[profile.release]
+opt-level = 3
+lto = "thin"

@@ -1,0 +1,20 @@
+# Rust build output
+/target/
+
+# Misc build output
+*.o
+*.a
+*.dylib
+*.dSYM/
+
+# macOS
+.DS_Store
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+
+# VM artifacts
+*.image
+*.snapshot
