@@ -28,6 +28,7 @@ Silicon (arm64)**.
 | D11 | Language: **Smalltalk-80 dialect** (GST-style class braces, Strongtalk type annotations parsed-and-ignored, mixins deferred) | fixed | `SPEC.md` §1. |
 | D12 | Bytecode: **immutable ~45-opcode set + per-method IC side tables** | fixed | `SPEC.md` §4 (replaces Strongtalk's self-modifying send opcodes). |
 | D13 | Tiers: **interpreter + one optimizing compiler**, synchronous compilation | fixed | Strongtalk's shape; `SPEC.md` §0, §8.1. |
+| D14 | GUI: **Strongtalk live-HTML environment** recreated in Cocoa+WKWebView (`gui/` = `macvm-gui` workspace member, Rust/`objc2` shell), developed as parallel track Phase G | fixed | Plan: `../gui/PLAN.md` (D-G1…D-G5); core seam: `SPEC.md` §16 (VmHandle, TranscriptSink, mirrors, source registry). |
 
 **The full engineering specification is [`SPEC.md`](SPEC.md)** (language,
 bytecode, object-model bits, interpreter, GC, adaptive compiler, deopt,
@@ -179,7 +180,9 @@ Rust modules retain their original headers. New code carries the MACVM `LICENSE`
 
 Superseded by [`SPRINTS.md`](SPRINTS.md): Phase A object world & interpreter
 (S0–S6) → Phase B GC (S7–S8) → Phase C native code substrate (S9–S12) →
-Phase D adaptive optimization (S13–S15) → Phase E stretch goals.
+Phase D adaptive optimization (S13–S15) → Phase E stretch goals, with
+**Phase G (the GUI track, D14) running in parallel** — G0/G1 have no core
+dependency at all.
 
 ## Open questions log
 

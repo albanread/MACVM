@@ -614,3 +614,11 @@ Array at:/at:put:, whileTrue:/to:do:, comparison sends, allocation.
 - ReadStream, collection sorting, `species`, copy protocols beyond
   `copyFrom:to:` (post-v1 as needed).
 - Unicode-correct String operations (SPEC §1.3 documented limitation).
+
+## Addendum — GUI-track obligation (SPEC §16.2, amendment A17)
+
+`Transcript`'s primitive output path (`printOnStdout:`) must route through a
+`TranscriptSink` held in `VmState` (default sink = stdout — behavior
+identical to this sprint's spec). The GUI (Phase G2) installs a channel sink
+via `VmHandle::set_transcript`; nothing else in the world files changes.
+Design the primitive with the sink indirection now so G2 is a no-touch swap.

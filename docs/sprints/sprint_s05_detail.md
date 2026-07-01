@@ -662,3 +662,13 @@ pub fn execute_doit(vm: &mut VmState, m: MethodOop) -> Result<Oop, VmError>;
 - Parser error recovery / multiple diagnostics per run.
 - Mixins, namespaces, `.dlt` chunk format (SPEC §1.2 Δ).
 - Unicode-aware `String at:` (byte-indexed per SPEC §1.3).
+
+## Addendum — GUI-track obligation (SPEC §16.4, amendment A16)
+
+The frontend must **record method source** in the world-side registry
+`Smalltalk methodSources` (IdentityDictionary: CompiledMethod → String),
+gated by `MACVM_KEEP_SOURCE` (default on). Record at install time in the
+class-definition executor (and the REPL's doit path may skip it). No
+CompiledMethod layout change — the registry is an ordinary heap object. The
+GUI's G3/G4 browsers and the `VmHandle::mirrors` accept path (SPEC §16.3)
+consume this; `eval` reuses this sprint's doit machinery.

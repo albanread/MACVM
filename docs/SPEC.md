@@ -801,3 +801,73 @@ FP+5 serial / FP+6 marker; §5.3 rcvr index; §5.4 closure copied[] convention;
 | A13 | S11 ships a temporary GC bridge (old-direct alloc while compiled frames live); S12's first commit deletes it | s11/s12 |
 | A14 | `brk` imm namespace `#0xDE00–02` for uncommon traps; foreign brk re-raised | s13 |
 | A15 | v1 capture rule: all explicit captures via Context (`ncopied` = 0); by-value copies deferred | s05 (matches §5.4 as amended) |
+| A16 | Method-source retention via `Smalltalk methodSources` IdentityDictionary (no CompiledMethod layout change); populated by the S5 frontend, `MACVM_KEEP_SOURCE` default on | §16.4 |
+| A17 | Embedding API: `VmHandle` (boot/eval/mirrors) + `TranscriptSink` routing of §10 `printOnStdout:` | §16.2–16.3 |
+| A18 | Repo becomes a cargo workspace (`macvm` + `gui/` = `macvm-gui`); VM on worker thread, AppKit on main, channel bridge | §16.1 |
+| A19 | §16.3 revised: mirrors are **Smalltalk-side** over VM primitive groups R1–R5; HtmlWriter fragment rendering is Smalltalk-side; gui crate = shell + transport only | APPS.md §1–§3, §6 |
+| A20 | Eval/accept error contract: compile-service errors return **(message, character position)** for in-editor display; `evaluate:receiver:ifError:` and the deferred `blockToEvaluateFor:` forms pinned | APPS.md §4 |
+
+---
+
+## 16. Embedding & GUI — the `GuiHost` seam
+
+MACVM's user interface is a recreation of the **Strongtalk live-HTML
+programming environment** in a native Cocoa window (WKWebView), developed as a
+parallel track — plan of record: [`../gui/PLAN.md`](../gui/PLAN.md) (decisions
+D-G1…D-G5), phases G0–G5 in `SPRINTS.md` Phase G. The GUI never reaches into
+VM internals; everything crosses one seam. What the *core* must provide:
+
+### 16.1 Crate & threading model
+- The repo root becomes a cargo **workspace**: the existing `macvm` package
+  (lib + bin) plus member `gui/` = `macvm-gui` (Rust shell via
+  `objc2`/`objc2-app-kit`/`objc2-web-kit`, per D-G2), which depends on the
+  `macvm` lib.
+- AppKit owns the **main thread**; the VM runs on a dedicated **worker
+  thread** (the VM is single-threaded internally, §11 — this adds no VM-level
+  concurrency). GUI→VM requests (doits, mirror queries, accepts) are queued
+  over a channel and executed between interpreter turns; VM→GUI output
+  (transcript, rendered fragments) returns via a channel drained on the main
+  thread into `evaluateJavaScript`.
+
+### 16.2 `VmHandle` — the embedding API (Rust)
+```rust
+pub struct VmHandle { /* owns VmState + world, lives on the VM thread */ }
+impl VmHandle {
+    pub fn boot(opts: VmOptions) -> Result<VmHandle, VmError>;   // genesis + world
+    pub fn eval(&mut self, source: &str) -> Result<String, GuestError>;
+        // compile as a doit (S5 REPL machinery), run, answer printString
+    pub fn set_transcript(&mut self, sink: Box<dyn TranscriptSink>);
+    pub fn mirrors(&mut self) -> Mirrors<'_>;                    // §16.3
+}
+pub trait TranscriptSink: Send { fn show(&mut self, text: &str); }
+```
+`Transcript`'s primitive path (§10 `printOnStdout:`) routes through the
+`VmState`-held sink; the default sink is stdout, the GUI installs a channel
+sink. Guest errors surface as `GuestError` values (message + Smalltalk stack
+trace string), never as Rust panics.
+
+### 16.3 Mirrors — the reflection surface (needed by G3/G4) *(REVISED — A19)*
+**Mirrors are Smalltalk-side objects backed by small, dumb VM primitives** —
+exactly Strongtalk's architecture (its whole tool suite is image-side over a
+primitive floor; survey in `APPS.md`). The VM provides the primitive groups
+**R1–R5** pinned in `APPS.md` §3 (structure reads; method reads incl.
+referenced-selector scans for find tools; the compile service; heap queries;
+debugger/activation access — the first two plus R3 are what G2–G4 need). The
+Smalltalk mirror library (`ObjectMirror`, `ClassMirror`, `MethodMirror`, …)
+and the tools built on it are Phase W (W2–W4); **rendering fragments is
+Smalltalk-side too** (`HtmlWriter`, APPS.md §6) — the gui crate keeps only
+the shell and transport. The original Rust-side-queries sketch is withdrawn.
+
+### 16.4 Method-source retention *(Amendment A16)*
+The GUI's browsers/editors need method source; CompiledMethod's pinned layout
+(§4.4) is **not** changed. Instead the frontend records source in a VM-known
+world-side registry: `Smalltalk methodSources`, an IdentityDictionary
+(CompiledMethod → String). GC-safe by construction (it's an ordinary heap
+object; identity hashes are stable across compaction — the S8 gate proves it).
+Controlled by `MACVM_KEEP_SOURCE` (default **on**; `=0` for memory-lean runs).
+
+### 16.5 Redefinition caveat
+Interpreter-tier method redefinition is safe from S3 (IC self-heal + lookup
+flush). **Compiled-tier** redefinition requires S13's dependency invalidation —
+until S13 lands, the GUI's accept path (G4) must run the VM with
+`MACVM_JIT=off`.

@@ -202,6 +202,50 @@ Goal: hot loops enter compiled code without waiting for re-invocation.
 - **Gate:** long-running-loop benchmark reaches compiled speed without method
   re-entry; Richards ≥ 5× interpreter; no regression in stress suites.
 
+## Phase G — GUI track (parallel)
+
+The MACVM user interface: the **Strongtalk live-HTML programming environment**
+recreated in a native Cocoa window (WKWebView), built as the separate cargo
+workspace member `gui/` (`macvm-gui`). Plan of record with visual ground truth
+and decisions D-G1…D-G5: [`../gui/PLAN.md`](../gui/PLAN.md); the core-side
+contract (VmHandle, TranscriptSink, mirrors, source registry, threading) is
+SPEC §16. This track runs **concurrently** with the core phases; its gates
+never block core sprints, and core stress gates never require the GUI.
+
+| Phase | Size | Needs from core | Gate (from PLAN.md) |
+|---|---|---|---|
+| G0 static shell | `M` | nothing | start page + tour render period-faithful; nav + status bar live |
+| G1 live-page runtime, stub host | `S` | nothing | doit click → transcript echo, full JS↔Rust round trip |
+| G2 VM bridge | `M` | **S5** (eval/doit compile) + **S6** (Transcript, world) + SPEC §16.1–16.2 | original `startPage.html` fully live against MACVM |
+| G3 outliner tools | `L` | S6 world + **W2/W3** (mirrors, ToolNode, HtmlWriter — see APPS.md) | browse Object hierarchy → class → category → method source, lazily |
+| G4 code editing & find tools | `L` | **W4** (accept path) + source registry (A16); **S13 for JIT-on redefinition** (else `MACVM_JIT=off`) | tour's "little project" workflow end to end |
+| G5 polish & parity sweep | `S` | — | every toolbar icon wired or consciously deferred |
+
+Sequencing guidance: G0–G1 can start **immediately** (no VM dependency) and
+are a natural parallel workstream during Phases A–B. If the GUI outruns the
+core, extend G1's stub host with fixture data (PLAN.md §5) rather than
+blocking. The S5/S6 sprint docs carry addenda for the two core-side
+obligations this track adds (source registry; TranscriptSink routing).
+
+## Phase W — world track (library + apps, parallel after S6)
+
+The Smalltalk side beyond the S6 seed: the full library and the programming
+tools, designed from a file-level survey of the real Strongtalk source.
+Design docs: [`WORLD.md`](WORLD.md) (library, `.dlt→.mst` converter, load
+order) and [`APPS.md`](APPS.md) (mirrors, tools, HtmlWriter, reflection
+primitives R1–R5). Like Phase G, this track runs parallel to the core and
+interleaves with it; every wave lands with in-language tests.
+
+| Wave | Size | Contents | Needs |
+|---|---|---|---|
+| W1 library wave 1 | `M` | `tools/dlt2mst` converter (WORLD §10); full collections protocol, Fraction, Character tables, ReadStream; two-pass world loader; Strongtalk test-oracle port | S6 |
+| W2 reflection base | `M` | Mirror library (Object/Class/Method mirrors), R1+R2 primitives, HtmlWriter, ToolNode framework (APPS §2–§6) | S6 (+A16) |
+| W3 tools wave 1 | `M` | Inspector, Workspace/eval wiring (R3), find tools (senders/implementors sweeps) | W2; pairs with G2/G3 |
+| W4 tools wave 2 | `L` | Browser node suite (hierarchy/class/category/method), accept path, update protocol | W3; pairs with G4 |
+| W5 exceptions + SUnit | `M` | ANSI exception layer (~10 classes, zero new VM features — WORLD §7), SUnit 3.1 convergence; adds exception tests to S13+ stress gates | S4 solid, W1 |
+| W6 benchmark harvest | `S` | Richards (13 cls), DeltaBlue (12 cls), Stanford suite + seeded LCG, BenchmarkRunner-style harness in `world/bench/` | W1; **feeds S15** |
+| W-debugger | `L` | StackTraceInspector + ActivationMirror + R5 primitives (single-step interpreter mode) | W4; schedule with Phase-E processes |
+
 ## Phase E — stretch (unordered)
 
 - **S16 Snapshot/image** — save/load the world (root schema = Universe list;
@@ -209,8 +253,9 @@ Goal: hot loops enter compiled code without waiting for re-invocation.
 - **S17 Green processes + scheduler** (§11); `Processor yield`, delays.
 - **S18 Exceptions** — ANSI `Exception` hierarchy over NLR/ensure.
 - **S19 Splitting & advanced opts** — Self-style splitting, better regalloc.
-- **S20 Cocoa bridge** — `objc_msgSend` via the MacModula2 pattern; Transcript
-  window as the hello-world.
+- **S20 Guest-language Cocoa bridge** — Smalltalk code sending messages to
+  Cocoa objects via `objc_msgSend` (the MacModula2 pattern). Distinct from the
+  Phase G GUI shell, which is Rust-side `objc2` and needs none of this.
 - **S21 Mixins** — Strongtalk's mixin model on the reserved klass slot.
 - **S22 Weak refs + finalization; weak symbol table.**
 

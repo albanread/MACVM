@@ -248,3 +248,23 @@ reflection surface*
 - **VM dependency pacing:** G2+ gates assume interpreter + mirrors exist; if
   the GUI outruns the core, extend the G1 stub host (canned class data) so
   G3's outliner UI can be built and tested against fixtures.
+
+## 6. Integration with the core plan (added on adoption into SPRINTS.md)
+
+This track is **Phase G** in [`../docs/SPRINTS.md`](../docs/SPRINTS.md); the
+core-side contract it builds against is [`../docs/SPEC.md`](../docs/SPEC.md)
+**§16** (VmHandle embedding API, TranscriptSink, mirrors, method-source
+registry, workspace + threading model — amendments A16–A18).
+
+| GUI phase | Core dependency | Notes |
+|---|---|---|
+| G0, G1 | none | can start immediately, parallel to core Phases A–B |
+| G2 | S5 + S6 + SPEC §16.1–16.2 | doits via `VmHandle::eval`; `Transcript show:` via `TranscriptSink` |
+| G3 | S6 + Phase **W2/W3** (Smalltalk mirrors + ToolNode + HtmlWriter — `docs/APPS.md`) | outliner nodes are Smalltalk `ToolNode`s rendering fragments image-side (D-G5, as Strongtalk did) |
+| G4 | Phase **W4** (accept path) + source registry (SPEC §16.4 / A16) | **JIT-on redefinition needs S13** — until then run `MACVM_JIT=off` |
+| G5 | — | |
+
+Crate wiring (SPEC A18): the repo root is a cargo workspace; this directory
+is member `macvm-gui`, depending on the `macvm` lib. AppKit owns the main
+thread; the VM runs on a worker thread; all traffic crosses the §16.1 channel
+bridge (which is also the D-G3 message protocol's Rust end).
