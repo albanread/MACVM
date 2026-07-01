@@ -22,12 +22,17 @@ Silicon (arm64)**.
 | D5 | **Adaptive compilation kept from Self/Strongtalk** | fixed | Inline caches → PICs → type feedback → optimizing recompilation → deoptimization. The crown jewels; present in both. §4 |
 | D6 | **Codegen backend: vendor JASM's Rust AArch64 encoder** | leaning | Pure-Rust, LLVM-MC-verified, with a working `MAP_JIT` loader. Wrapped behind the `Assembler` trait. §5 |
 | D7 | **Baseline tier: threaded-code interpreter** | fixed | Fast start, gathers IC feedback, serves as deopt target. §4.1 |
-| — | Exact tag/header bit layout | **open** | §3.1 / `arm64.md` |
-| — | NaN-boxing vs. heap-boxed doubles | **open** | `arm64.md` |
-| — | GC: precise-through-JIT from day 1 vs. conservative bootstrap | **open** | §6 |
+| D8 | Tag scheme: **2-bit, Int=00/Mem=01/Mark=11**, 62-bit smis | fixed | Pinned in `SPEC.md` §2.1–2.2 (with explicit 64-bit mark-word fields). |
+| D9 | Floats: **heap-boxed Double** (NaN-boxing shelved) | fixed | `SPEC.md` §1.3; isolated behind oops accessors, revisitable. |
+| D10 | GC: **precise from day 1** — VM-managed interpreter stacks are exact; compiled-frame oop maps arrive with tier 1 | fixed | `SPEC.md` §5.1, §7, §8.5; retires the conservative-bootstrap option. |
+| D11 | Language: **Smalltalk-80 dialect** (GST-style class braces, Strongtalk type annotations parsed-and-ignored, mixins deferred) | fixed | `SPEC.md` §1. |
+| D12 | Bytecode: **immutable ~45-opcode set + per-method IC side tables** | fixed | `SPEC.md` §4 (replaces Strongtalk's self-modifying send opcodes). |
+| D13 | Tiers: **interpreter + one optimizing compiler**, synchronous compilation | fixed | Strongtalk's shape; `SPEC.md` §0, §8.1. |
 
-The language exposed by MACVM (Smalltalk-like, Self-like, or a new surface
-syntax) is **not yet decided** and is deliberately downstream of the VM design.
+**The full engineering specification is [`SPEC.md`](SPEC.md)** (language,
+bytecode, object-model bits, interpreter, GC, adaptive compiler, deopt,
+primitives, bootstrap, testing). **The implementation plan is
+[`SPRINTS.md`](SPRINTS.md)** (phased, individually-testable sprints).
 
 ---
 
@@ -170,25 +175,16 @@ We translate designs, not code; there is no line-by-line C++ port. Where a file
 `strongtalk-repo` path) and what changed at the top of the file. Vendored JASM
 Rust modules retain their original headers. New code carries the MACVM `LICENSE`.
 
-## 10. Rough roadmap (VM-first)
+## 10. Roadmap
 
-1. Object model + heap allocation (bump-pointer eden), no GC yet.
-2. Bytecode + threaded interpreter; classes, method dictionaries, sends via
-   side-table inline caches.
-3. Generational scavenge + card-marking write barrier.
-4. `Assembler` trait + `JasmAssembler` (vendor `wfasm`); emit a trivial compiled
-   method; `MacJit` execution.
-5. Compiled inline caches + PICs; type feedback plumbing.
-6. Optimizing compiler: IR, inlining, customization; oop maps for precise GC.
-7. Deoptimization + OSR (the arm64 frame-copy/continuation glue Self never had
-   outside SPARC).
-8. Compacting major GC.
+Superseded by [`SPRINTS.md`](SPRINTS.md): Phase A object world & interpreter
+(S0–S6) → Phase B GC (S7–S8) → Phase C native code substrate (S9–S12) →
+Phase D adaptive optimization (S13–S15) → Phase E stretch goals.
 
 ## Open questions log
 
-- [ ] Exact tag scheme / 64-bit mark-word field layout (§3.1, `arm64.md`).
-- [ ] NaN-boxing vs. heap-boxed doubles (§3.3, `arm64.md`).
-- [ ] Precise-GC-through-JIT from day 1 vs. conservative bootstrap (§6).
-- [ ] Bytecode set definition (baseline tier).
-- [ ] Bootstrap: hand-written world vs. imported from a reference image.
-- [ ] Confirm D6 (JASM vendor) after a spike wrapping `encode` behind `Assembler`.
+All questions previously listed here were closed by [`SPEC.md`](SPEC.md) — see
+decisions D8–D13 in §0 and `SPEC.md` §14. Remaining genuinely-open item:
+
+- [ ] Confirm D6 (JASM vendor) via the Sprint S9 spike wrapping `encode`
+      behind the `Assembler` trait.

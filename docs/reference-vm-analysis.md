@@ -10,6 +10,7 @@ Sections:
 2. Self — dispatch & adaptive compilation ✅
 3. Strongtalk — VM & type system ✅
 4. Codegen backend — JASM AArch64 encoder + macOS JIT ✅
+5. MacNCL GC — reuse assessment ✅ (verdict: lessons + scaffolding, not engine)
 
 ---
 
@@ -480,3 +481,65 @@ MacModula2's runtime bridge is `../MacModula2/src/newm2-runtime/src/objc.rs`
 entry points. This is the pattern MACVM mirrors when it wants Cocoa integration;
 MACVM would reuse the resolver/msgSend approach and supply its own high-level
 binding layer.
+
+---
+
+## 5. MacNCL GC — reuse assessment
+
+MacNCL (`../MacNCL`, sibling Rust Lisp system) delegates its GC to the external
+crate **`newgc-core`** (repo `github.com/albanread/GC-.git`, pinned in
+`MacNCL/src/ncl-runtime/Cargo.toml`). Assessed against SPEC §2/§7.
+
+### 5.1 What it is
+A **page-based, conservatively-pinning, cohort-promoting mark-evacuate**
+generational GC (SBCL-gencgc lineage, not Strongtalk lineage): one 2 GiB
+reservation carved into 64 KiB pages whose generation is a *per-page property*;
+Cheney-style evacuation to fresh pages (no slide compaction anywhere);
+promotion is whole-cohort every N cycles (no per-object age); roots are a
+precise explicit root stack **plus load-bearing conservative native-stack
+scanning with object pinning** (per-page pin bytes, start-bit bitmaps,
+interior-pointer gates, pinned-page generation flips); 1-word self-describing
+headers (size in header, no class chase); 512-byte lock-free card table
+(dirty=1, rebuilt from heap walk each cycle).
+
+### 5.2 Verdict: engine does NOT transfer — lessons + scaffolding do
+Five structural mismatches, each disqualifying for direct reuse:
+1. **Conservative pinning woven through the engine** — MACVM is precise-only;
+   the pin plumbing is a large correctness-critical subsystem we'd maintain
+   but never use (and it's where MacNCL's bugs lived).
+2. **Wrong generational geometry** — page/cohort vs. MACVM's contiguous
+   eden+survivors with 7-bit per-object age and adaptive tenuring.
+3. **No slide compactor** — MACVM full GC is mark + slide compact.
+4. **Header contract mismatch** — newgc sizes objects from the header alone;
+   MACVM `Slots` sizing chases a (possibly forwarded) klass oop.
+5. **No single is_old boundary** possible in a page heap.
+(newgc-core's own README: "Experimental — do not depend on this.")
+
+**What transfers:** the `Backing` mmap reservation abstraction
+(reserve PROT_NONE / commit / decommit, idempotent commit path — exactly
+SPEC §7.1's mechanism, proven on this platform); the lock-free `CardTable`
+(512-byte cards — flip dirty polarity to 0); `ncl:stack_map.rs`'s
+PC→live-slot table shapes (the oop-map skeleton for tier 1); the
+`GcStallError` structured-failure pattern; the categorized+stochastic test
+corpus *shape* (categories and oracles, not code).
+
+### 5.3 Lessons imported into S7/S8 (from GC_LESSONS.md + bughunt docs)
+Full 15-lesson list lives in `sprints/sprint_s07_detail.md`; headlines:
+- Unit tests test GC *mechanics*, not *semantics* — MacNCL had 312 passing
+  tests "and it didn't work on `(+ 1 2)`". The smallest meaningful test is a
+  guest-language workload through the production allocator with an **exact**
+  result oracle (the canonical list-walk reproducer: sum == 5000000 exactly
+  under a shrunken eden).
+- Every bug was *disagreement between separately-correct data structures* —
+  ship a debug cross-check pass (card table vs offset table vs marks vs
+  handles) run at every GC entry, plus a single-oop trace hook
+  (`MACVM_DBG_OOP`) and a frozen invariants list *before* bring-up.
+- Cascaded collection phases must not wipe each other's per-cycle state (the
+  nastiest MacNCL bug: per-sub-evac pin clearing during a cascading cycle).
+- Rust containers holding raw oops are invisible roots — MacNCL's history is
+  the evidence for enforcing Handle discipline + GC-stress from day one.
+- Never assume recycled memory is zeroed; define the fill discipline (nil).
+- Scavenger OOM must be a designed cascade (survivor overflow → direct
+  promotion → old growth → full GC), not a reserve constant.
+- When survivors look too big, measure marked bytes vs expected working set
+  before touching policy — the problem is almost always in the roots.

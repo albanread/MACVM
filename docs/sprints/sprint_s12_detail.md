@@ -1,0 +1,369 @@
+# Sprint S12 — Moving GC under compiled frames
+
+Objective: the two hard subsystems coexist. The scavenger and the full
+collector find, trace, and relocate every oop held by compiled activations
+(spill slots via oop maps), by code (literal pools via reloc records), and by
+the IC machinery (PIC/adapter/mega pools) — while compiled frames are live on
+the native stack. Deletes S11's temporary GC bridge. Implements SPEC §8.5
+(GC interaction), §7.3/§7.5 (root sets extended), the nmethod key-klass
+weakness + flushing, and the flagship combined gate (`threshold=1` +
+`MACVM_GC_STRESS=1`).
+
+## Prerequisites
+
+- S11 complete: send sites with PcDescs at every call/alloc-slow return
+  address, RootSpill-disciplined stubs + adapters (pinned offsets in
+  `layout.rs`), anchor protocol (`last_compiled_fp/pc`), `TierLink`s,
+  `PicTable`/`AdapterTable`/mega map, D8 bridge in `memory/allocator.rs`
+  (marked `// S12: remove`).
+- S10: regalloc `slot_is_oop` + spill-all-at-safepoint policy + its debug
+  assert; `OopMap`/`PcDesc` emission plumbing; `CodeTable::{oops_do,
+  find_by_pc, rehash}`.
+- S7/S8: scavenger + full GC with pluggable root iteration
+  (`memory::roots::each_root(vm, f)` — if S7 hard-coded the root list,
+  refactor to a visitor FIRST, as step 0).
+
+## Deliverables
+
+- `src/compiler/oopmap.rs` — `OopMap` format, builder, decoder, verifier.
+- `src/codecache/nmethod.rs` — finalized `PcDesc`, per-nmethod map tables,
+  `Nmethod::oops_do_frame` helpers.
+- `src/runtime/frames.rs` — `FrameView` + `walk_frames` unifying process
+  stack, native compiled frames, adapters, stubs.
+- GC integration: compiled-frame root enumeration in scavenge + full GC;
+  literal-pool rewriting via relocs (already live from S10 — extended +
+  verified here); key-klass weakness; nmethod flush + IC/PIC invalidation
+  on free; bridge deletion.
+- The flagship gate wiring: `just gate-s12`.
+
+## Design
+
+### D1. Safepoints — the v1 definition (explicit and enforced)
+
+**A compiled-code safepoint is the return address of a call emitted for
+`CallSend`, `CallRuntime`, or the slow edge of `Alloc`. Nothing else.**
+Loop polls are NOT GC safepoints in v1: `stub_poll` neither allocates nor
+GCs (S10 D5.6), so a frame stopped in a poll has its GC-relevant state
+identical to the poll's enclosing call-free region — and since the VM is
+single-threaded and GC only ever starts inside an allocating runtime call,
+every compiled frame on the stack at GC time is ALWAYS suspended at a
+safepoint return address. This holds **by construction**; the walker asserts
+it (D4, exact PcDesc match required).
+
+**The spill-all invariant (restated from S10 D3.5, now load-bearing):**
+at every safepoint, no oop lives in a register — every oop live across the
+call is in a spill slot for its entire interval. Therefore **oop maps cover
+stack slots only**; there are no register maps in v1. Enforcement is
+mechanical, in two places:
+
+1. `regalloc`: any interval with `crosses_safepoint` is `Assignment::Spill`
+   (policy), followed by `verify_spill_all(&intervals, &safepoints)` — a
+   release-mode-cheap pass that walks every safepoint position and panics if
+   any `Assignment::Reg` interval spans it. Runs always, not just debug
+   (it is O(intervals·safepoints), trivial).
+2. `oopmap::verify(nm)` (debug + stress): decodes every map and checks
+   `bit ⇒ slot < frame_slots` and `bit ⇒ slot_is_oop[slot]`.
+
+Resist register maps, callee-saved carrying, or safepoints-at-polls until
+v2 — spill-all is exactly what makes this sprint one sprint.
+
+### D2. OopMap + PcDesc — formats
+
+```rust
+// src/compiler/oopmap.rs
+/// Bitmap over spill slots: bit i set ⇔ frame slot i (at [fp − 8·(i+1)])
+/// holds a live oop at the associated safepoint. Slots only — no registers
+/// (D1). frame_slots ≤ 60 (S10 eligibility) ⇒ one u64 usually suffices.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct OopMap {
+    pub bits: SmallVec<[u64; 1]>,       // ceil(frame_slots / 64) words
+}
+impl OopMap {
+    pub fn set(&mut self, slot: u16);
+    pub fn is_oop(&self, slot: u16) -> bool;
+    pub fn iter_slots(&self) -> impl Iterator<Item = u16> + '_;
+}
+
+// src/codecache/nmethod.rs
+#[derive(Clone, Copy, Debug)]
+pub struct PcDesc {
+    pub pc_off: u32,      // RETURN-ADDRESS offset from code base (call + 4)
+    pub bci: u16,         // bytecode index of the send/alloc (traces, S13 seed)
+    pub oopmap: u16,      // index into Nmethod.oopmaps; u16::MAX = block-start
+                          // entry (trace-only, no map — S10 legacy entries)
+}
+// Nmethod.pcdescs: Vec<PcDesc> sorted by pc_off (binary search);
+// Nmethod.oopmaps: Vec<OopMap> — identical maps deduplicated by the builder.
+
+impl Nmethod {
+    /// Exact-match lookup — GC path. Panics (VM bug) if `ret_pc` is not a
+    /// recorded safepoint: a compiled frame suspended anywhere else means
+    /// the D1 invariant broke.
+    pub fn oopmap_at(&self, ret_pc: u64) -> &OopMap;
+    /// Nearest-below lookup — trace path (any pc inside the method).
+    pub fn bci_at(&self, pc: u64) -> u16;
+}
+```
+
+The emit stage (S10 D7 plumbing, live since S11 emitted calls) fills these:
+at each call's return offset, snapshot `slot_is_oop ∧ slot_live_at(pos)` —
+liveness at the safepoint, not the whole method, so dead slots don't drag
+garbage through a collection (compute from the same interval data:
+slot live ⇔ its interval contains the safepoint position).
+
+### D3. FrameView + walk_frames — the unified walker
+
+```rust
+// src/runtime/frames.rs
+pub enum FrameView<'a> {
+    Interpreted { frame_index: usize, method: MethodOop, bci: usize },
+    Compiled    { fp: u64, ret_pc: u64, nm: NmethodId },
+    Adapter     { fp: u64, kind: AdapterKind },   // c2i / resolve / mega / dnu /
+                                                  // alloc-slow / poll stubs
+    CallStub    { fp: u64 },                      // the I→C trampoline frame
+}
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AdapterKind { C2i, Resolve, Mega, Dnu, AllocSlow, Poll }
+
+/// Walk all activations of the (single) process, innermost first,
+/// interleaving native compiled/stub frames and process-stack interpreter
+/// frames via VmState.tier_links + the anchor.
+pub fn walk_frames(vm: &VmState, f: impl FnMut(FrameView<'_>));
+```
+
+Algorithm (single-threaded; `tier_links` is a faithful journal of every tier
+crossing):
+
+1. **Start segment.** If `vm.last_compiled_fp != 0`, the VM is in Rust
+   called from compiled code: start at `(last_compiled_fp,
+   last_compiled_pc)`. Otherwise the innermost activation is interpreted:
+   start with the interpreter frame at `vm.current_frame`, and skip to
+   step 3 with the topmost un-consumed TierLink.
+2. **Native segment.** From `(fp, pc)`: classify `pc` — in an nmethod range
+   (`code_table.find_by_pc`) → `Compiled`; in a stub/adapter range
+   (`RuntimeStubs`/`AdapterTable` ranges) → `Adapter`; equal to the call
+   stub's interior → `CallStub`, END of segment. Step: `pc = [fp+8]`,
+   `fp = [fp]`. Every `Compiled` frame's `ret_pc` (the pc by which the
+   walker LEFT it, i.e. its resume address) must exact-match a PcDesc when
+   the walk is on behalf of GC (D1 assert).
+3. **Interpreter segment.** Consume the matching
+   `TierLink::IntoCompiled { interp_frame, .. }` and walk process-stack
+   frames from `interp_frame` downward (SPEC §5.1 layout) until a frame that
+   is the base of the next `TierLink::IntoInterpreter { compiled_fp, .. }`
+   → resume step 2 at that `compiled_fp`. Repeat until both the tier-link
+   stack and the process stack are exhausted.
+
+Consumers: GC root iteration (below), `print_stack_trace` (replaces S10's
+version), S13's deopt scan, the recompilation policy's caller walk
+(SPEC §8.1, S14).
+
+### D4. GC integration
+
+**D4.1 Root enumeration additions** (both collectors — one visitor):
+
+```rust
+pub fn each_code_root(vm: &mut VmState, f: &mut dyn FnMut(&mut u64)) {
+    // 1. compiled frame spill slots (via oop maps):
+    walk_frames-mut variant over raw slots:
+      Compiled { fp, ret_pc, nm } →
+        for slot in nm.oopmap_at(ret_pc).iter_slots() {
+            f(&mut *((fp − 8·(slot as u64 + 1)) as *mut u64))
+        }
+      Adapter { fp, kind } →  f over that kind's FIXED RootSpill slots
+        (offsets from layout.rs — 6 arg words + method word for C2i, 6 arg
+        words for Resolve/Mega/Dnu, klass word for AllocSlow, none for Poll)
+      CallStub / Interpreted → nothing here (interpreter frames are already
+        roots via the process-stack scan, SPEC §7.3 item “process stacks”)
+    // 2. code-embedded oops:
+    code_table.oops_do(cache, f)      // nmethod pools + IcSite selectors (S10/S11)
+    pic_table.oops_do(cache, f)       // PIC klass pool words
+    adapter_table.oops_do(cache, f)   // c2i method pool words
+    mega_map keys                     // selector oops (Rust-side u64 bits — visit + rehash)
+}
+```
+
+Scavenge calls this with the copy/forward closure; full GC calls it in mark
+(as strong roots, EXCEPT key-klass words — D5) and again in the update phase
+with the pointer-rewrite closure. All pool writes happen inside one
+`JitWriteGuard` per phase (pool words are data — the flush is belt-and-
+braces, S9 P5/D3.3 rationale).
+
+**D4.2 Code does not move — the invariant, stated once:** the code cache
+never relocates a published blob (bump + free list, no compaction — SPEC §9).
+Therefore return addresses into code held in native frames, `TierLink`s, the
+anchor, and interpreter-IC smi ids **never need rewriting by GC**. The only
+GC-mutable things in the cache are 8-byte pool words. Any future compacting
+code GC must revisit every one of those holders — that is why it is a
+stretch goal and why `CodeCache::free` requires the no-live-frames proof
+(D6.2).
+
+**D4.3 Bridge deletion.** Remove S11 D8 from `memory/allocator.rs`
+(`compiled_depth` stays — traces + asserts use it). Scavenge and full GC now
+run with compiled frames on stack as a matter of course. Keep
+`vm.stats.gc_under_compiled` counting (now expected > 0 under the flagship
+gate — the S11 test asserting it was zero is inverted, see tests).
+
+### D5. nmethod key-klass weakness + flushing (full GC only)
+
+Ordering within full GC (extends SPEC §7.5):
+
+1. **Mark** from all roots. Code roots participate EXCEPT pool words whose
+   reloc kind is `KeyKlassOop` (the customization key klass — SPEC §8.5
+   "weak treatment of nmethod key.klass"): these are skipped by
+   `oops_do`'s mark pass (an `oops_do_filtered(kinds)` variant). The
+   Rust-side `Nmethod.key_klass` field is likewise NOT marked through.
+   Everything else in pools (method literals, selectors, guard klasses in
+   PICs, adapter method oops) stays STRONG in v1 — deliberately
+   conservative; only the key is weak, so only true klass death flushes.
+2. **Weak sweep**: for each alive nmethod, if `key_klass` is unmarked →
+   add to `flush_set`. Invariant check: a dead key klass implies no live
+   activation of that nmethod exists (any receiver would have marked the
+   klass via its header) — `debug_assert` by walking frames for members of
+   `flush_set`.
+3. **Flush** (D6) the set — BEFORE the update phase, so no updater touches
+   freed memory.
+4. **Update phase** rewrites all surviving references, including surviving
+   `KeyKlassOop` pool words and `Nmethod.key_klass/key_selector` fields
+   (weak ≠ unmaintained), interpreter stacks, compiled frames (D4.1 again
+   with the rewrite closure), then `code_table.rehash()`, PIC/adapter/mega
+   map rehashes (S11 P11), lookup-cache flush (SPEC §7.5).
+
+Scavenge never flushes: key klasses are old-gen-reachable or the nmethod is
+newborn; treat all code-root kinds strongly at scavenge (a young key klass
+is kept alive by its nmethod — acceptable float, gone at the next full GC).
+
+### D6. Flushing an nmethod (also the S13 zombie path's substrate)
+
+`CodeTable::flush(vm, id)`:
+
+1. `state = Zombie`; remove from `by_key` (id slot retained, `find_by_pc`
+   entry retained until step 4 so a concurrent walk this cycle still
+   classifies frames — flush is only called when step-2's no-activations
+   invariant holds, but ordering discipline costs nothing).
+2. **Compiled-site invalidation sweep**: for every alive nmethod, for every
+   `IcSite`, read the current `bl` target word; if it resolves into the
+   flushed nmethod's `code` range (directly or via a recorded veneer) →
+   `icpatch::reset_site` (repatch to `stub_resolve`, state Unresolved).
+   For every `PicDesc`: if any pair's target is in range → free the PIC and
+   reset its owning site. One `JitWriteGuard` around the sweep. O(all
+   sites) per flush — flushes are rare (klass death, redefinition);
+   the reverse-dependency index that makes this O(callers) is S13's
+   dependency work, don't build it twice.
+3. **Interpreter ICs**: NO sweep — the id-validation dispatch (S10 D4)
+   makes stale smi ids self-heal on next use. This is the pinned mechanism;
+   S13's dependency index supersedes it for eager invalidation but the
+   validation check REMAINS as the safety net.
+4. Remove `by_addr` entry, `cache.free(code)`, drop the `Nmethod`
+   (slot → None; id reusable — safe because of the validation check).
+
+### D7. Return-address safety recap (what could go wrong, pinned)
+
+| holder of a code address | why it stays valid |
+|---|---|
+| native frame return addrs (bl continuations) | code never moves (D4.2); callee flush requires no-activations (D5.2/D6) |
+| anchor `last_compiled_pc` | same |
+| interpreter IC smi ids | validated on every dispatch (S10 D4) |
+| compiled IC `bl` targets | reset by the D6.2 sweep when target dies |
+| PIC pair targets | PIC freed by the same sweep |
+| `TierLink` snapshots (sp/fp, not pcs) | native stack, untouched by GC |
+
+## Implementation order
+
+0. If needed: refactor S7/S8 root iteration to the visitor form.
+1. `oopmap.rs` (format, builder from interval data, decoder, verifier) —
+   pure, unit-tested against hand intervals.
+2. PcDesc finalization + `oopmap_at` exact-match + emit-side liveness
+   snapshot. Listing/pcdesc golden for one two-send method.
+3. `frames.rs` walker + `print_stack_trace` re-pointed onto it; mixed-trace
+   goldens from S10/S11 re-verified.
+4. `each_code_root` — scavenge integration first (strong everything);
+   mid-loop-forced-scavenge unit test (tests file) green.
+5. Full-GC integration: mark with weak-key filtering, weak sweep, update
+   phase ordering, rehashes.
+6. `CodeTable::flush` + invalidation sweep + `cache.free` wiring; key-klass
+   death test green.
+7. Delete the S11 bridge; flip the S11 bridge-assert test.
+8. Flagship gate runs + soak.
+
+## Pitfalls
+
+- **P1 — exact PcDesc match or die.** The GC-path `oopmap_at` must panic on
+  a missing entry, never fall back to "nearest". A near-miss means a call
+  site got emitted without a map (or the walker mis-stepped) — silent
+  nearest-match converts that into heap corruption three tests later.
+- **P2 — the map must reflect liveness AT the safepoint**, not slot
+  oop-ness globally. A dead slot may hold a stale oop from a previous
+  interval sharing the slot; tracing it retains garbage (annoying) — but a
+  NON-oop interval reusing an oop slot number that the map still claims is
+  fatal (random bits traced as a pointer). The builder intersects
+  `slot_is_oop` with interval-live-at-position; the verifier cross-checks.
+- **P3 — spill-slot addresses are fp-relative NEGATIVE** (`fp − 8·(i+1)`,
+  S10 D5.2). An off-by-one reads the saved-fp/lr pair as an "oop". The
+  layout consts + `rootspill_offsets_pinned`-style test guard it.
+- **P4 — literal pools are data; instructions are not.** GC rewrites ONLY
+  reloc-recorded 8-byte pool words. If any future emit path materializes an
+  oop via movz/movk or adrp/add, GC would have to re-encode instructions +
+  icache-flush mid-collection — this is forbidden (S9 P5); the oopmap
+  verifier should also grep blob relocs: every `Oop`/`KeyKlassOop` reloc
+  offset must be ≥ `literal_off`.
+- **P5 — write-toggle scope during GC.** One `JitWriteGuard` per GC phase
+  that writes pools, not one per word (the toggle is a per-thread mode
+  switch — cheap, but thousands per scavenge shows up), and NEVER hold it
+  across the parts of GC that execute cache code (there are none — assert
+  by construction: the guard lives strictly inside `each_code_root`
+  passes). Remember it is per-thread (S9 P3) — irrelevant single-threaded,
+  but the flagship gate would hide a latent multi-thread bug; leave the
+  depth assert on.
+- **P6 — anchor discipline is now load-bearing for correctness**, not just
+  traces: if a runtime path that can GC is reachable WITHOUT the anchor set
+  (a Rust function called directly from another Rust function that was
+  called from compiled code — fine, anchor still set from the original
+  entry; the bug is a stub that clears the anchor too early), the walker
+  misses every compiled frame silently. Stress mode: poison-check — on
+  every allocation with `compiled_depth > 0`, assert `last_compiled_fp !=
+  0`.
+- **P7 — mega-map/adapter/CodeTable rehash ordering**: rehash AFTER the
+  update phase rewrote the key oops (S10 P7 family). The lookup cache is
+  flushed, not rehashed (SPEC §6.1).
+- **P8 — flush ordering vs. update phase** (D5 step 3 before 4): updating a
+  pool word inside an nmethod that is about to be freed is wasted but
+  harmless; the reverse — freeing then updating — writes freed cache
+  memory. Keep the order test-pinned (`flush_before_update` assertion via
+  trace scrape in the key-klass test).
+- **P9 — don't let the scavenger tenure the world through code roots.**
+  Code roots are scanned every scavenge (v1 scans ALL alive nmethods'
+  pools — no scavengeable-nmethod list yet). With `GC_STRESS=1` this is
+  every allocation: O(nmethods) per alloc. Acceptable for the suite; if the
+  flagship gate is intolerably slow, add the Strongtalk-style
+  "nmethods-with-young-pool-refs" side list — as an OPTIMIZATION ONLY,
+  behind the same visitor.
+- **P10 — S11's `gc_under_compiled == 0` test must be inverted, not
+  deleted** — it becomes the proof the bridge is gone (must be > 0 under
+  the flagship gate).
+
+## Interfaces for later sprints
+
+- S13: `PcDesc.bci` + `oopmap` per safepoint (scope descs attach here);
+  `walk_frames`/`FrameView` (deopt scan + frame materialization);
+  `NmState::NotEntrant` + `CodeTable::flush` (zombie path);
+  `oops_do_filtered` (deopt metadata oops).
+- S14: `walk_frames` for the recompilation policy's caller preference;
+  flush sweep reused by dependency invalidation (until the reverse index
+  lands).
+- S15: OSR frames must emit the same OopMap/PcDesc artifacts — the formats
+  here are the contract.
+
+## Out of scope
+
+- Deoptimization, scope descs, not_entrant patching, dependency index,
+  `MACVM_DEOPT_STRESS` — S13 (S12 flushes only on klass DEATH; method
+  redefinition freshness remains the documented S11 hole until S13).
+- Register oop maps, safepoints at polls, derived/interior pointers
+  (`arm64.md` §6 budgets them; v1 has none: no compiled code holds an
+  interior pointer across a safepoint — spill-all + no-raw-pointer IR ops
+  guarantee it; assert in the oopmap verifier).
+- Compacting/moving code cache; scavengeable-nmethod side list (P9, only
+  if measured); weak PIC guard klasses (v1 strong — flushed only via key
+  death or S13 deps).
+- Green-process multi-stack walking (§11 stretch) — `walk_frames` takes the
+  single process; keep its signature process-agnostic internally.

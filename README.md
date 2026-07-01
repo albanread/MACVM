@@ -27,13 +27,21 @@ design is in [`docs/reference-vm-analysis.md`](docs/reference-vm-analysis.md).
 
 ## Status
 
-Early scaffold, implemented in **Rust**, with the design documented ahead of the
-code (see `docs/`). The object model and memory system are being sketched first;
-the **native code generator is deliberately left abstract** (see
-[`docs/DESIGN.md`](docs/DESIGN.md) §5) behind an `Assembler` trait
-([`src/compiler/assembler.rs`](src/compiler/assembler.rs)). The leading backend is
-to vendor JASM's pure-Rust, LLVM-MC-verified AArch64 encoder; an LLVM backend or
-interpreter-first path stay possible behind the same trait.
+Design-complete, pre-implementation. The full engineering specification and the
+sprint plan are written ahead of the code:
+
+| Doc | Contents |
+|-----|----------|
+| [`docs/SPEC.md`](docs/SPEC.md) | **The full design** — language, object-model bits, bytecode set, interpreter, GC, adaptive compiler, deopt, primitives, bootstrap, testing |
+| [`docs/SPRINTS.md`](docs/SPRINTS.md) | Phased implementation plan of individually-testable sprints |
+| [`docs/DESIGN.md`](docs/DESIGN.md) | High-level architecture + decisions of record (D1–D13) |
+| [`docs/arm64.md`](docs/arm64.md) | Machine-level design: MAP_JIT/W^X, AAPCS64, PAC, relocs, oop maps, deopt glue |
+| [`docs/reference-vm-analysis.md`](docs/reference-vm-analysis.md) | Source-anchored analysis of Self, Strongtalk, and the JASM codegen assets |
+
+The codegen backend is a vendored copy of JASM's pure-Rust, LLVM-MC-verified
+AArch64 encoder behind the `Assembler` trait
+([`src/compiler/assembler.rs`](src/compiler/assembler.rs)); LLVM or
+interpreter-only remain possible behind the same seam.
 
 ## Layout
 
@@ -47,6 +55,7 @@ interpreter-first path stay possible behind the same trait.
 | `src/runtime.rs`           | Runtime support, stacks, activation frames, deoptimization |
 | `src/utils.rs`             | Shared utilities                                           |
 | `world/`                   | The object world / image sources                           |
+| `gui/`                     | Strongtalk-style HTML GUI: plan, reference artifacts, CSS  |
 | `docs/`                    | Design notes                                               |
 | `tools/`                   | Build & development tooling                                |
 | `test/`                    | Tests                                                      |
