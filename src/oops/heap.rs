@@ -197,6 +197,56 @@ impl MemOop {
         self.set_raw_body_word(index, v.raw());
     }
 
+    /// Visits every oop-bearing BODY field (SPEC §7.3 A5's format table),
+    /// replacing each in place with `f`'s result. The klass field itself is
+    /// the caller's own responsibility (same convention as every caller
+    /// below) — this walks only the named/indexable body.
+    ///
+    /// `klass` is a parameter, not derived via `self.klass()`, because the
+    /// collectors sharing this walk (`memory::scavenge`'s copying scavenger,
+    /// the coming full mark-slide-compact GC) read it at different times
+    /// relative to when THIS object's own klass field gets rewritten: the
+    /// scavenger eagerly copies each object (klass field included) before
+    /// scanning its body, so `self.klass()` is already the safe, freshly-
+    /// copied value by then; a full GC's reference-rewrite phase must
+    /// capture the klass BEFORE overwriting the klass field — nothing has
+    /// been copied yet at that point, so the OLD klass body is what's still
+    /// valid to read format from (SPEC §7.5 phase C, invariant F3).
+    pub(crate) fn for_each_oop_field(self, klass: KlassOop, mut f: impl FnMut(Oop) -> Oop) {
+        let nis = klass.non_indexable_size();
+        let named = nis - HEADER_WORDS;
+        match klass.format() {
+            Format::Slots | Format::Klass => {
+                for i in 0..named {
+                    let v = self.body_oop(i);
+                    self.set_body_oop(i, f(v));
+                }
+            }
+            Format::Double | Format::Process => {
+                // Double: raw f64 bits, never oops. Process: unreachable in v1.
+            }
+            Format::IndexableOops | Format::Closure | Format::Context => {
+                for i in 0..named {
+                    let v = self.body_oop(i);
+                    self.set_body_oop(i, f(v));
+                }
+                let len = self.raw_size_slot(nis);
+                let tail_start = named + 1;
+                for i in 0..len {
+                    let v = self.body_oop(tail_start + i);
+                    self.set_body_oop(tail_start + i, f(v));
+                }
+            }
+            Format::IndexableBytes | Format::Method => {
+                for i in 0..named {
+                    let v = self.body_oop(i);
+                    self.set_body_oop(i, f(v));
+                }
+                // Byte tail (or Method's bytecode bytes): never oop-scanned.
+            }
+        }
+    }
+
     /// A raw (non-oop) body word, e.g. a `Double`'s f64 payload. Deliberately
     /// distinct from [`MemOop::body_oop`]: an arbitrary bit pattern (a float)
     /// must never be run through `Oop::from_raw`'s tag `debug_assert`s.

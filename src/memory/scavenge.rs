@@ -230,46 +230,14 @@ pub fn scavenge_oop(vm: &mut VmState, oop: Oop) -> Oop {
 
 /// Scavenges every oop-bearing body word of `obj` (already relocated —
 /// `to`-space or promoted `old` — with its OWN klass field already fixed
-/// up by the caller, per A5's klass-first protocol) per the `Format`
-/// table (SPEC §7.3 A5). Uses `obj.klass()` directly: safe here (unlike
-/// `object_size_for_copy`) because the klass field was scavenged first.
+/// up by the caller, per A5's klass-first protocol). Uses `obj.klass()`
+/// directly: safe here (unlike `object_size_for_copy`) because the klass
+/// field was scavenged first. The format-dispatch table itself lives on
+/// `MemOop::for_each_oop_field` (SPEC §7.3 A5), shared with the coming full
+/// GC's mark/rewrite phases rather than hand-copied a second time.
 fn scan_body(vm: &mut VmState, obj: MemOop) {
     let klass = obj.klass();
-    let nis = klass.non_indexable_size();
-    let named = nis - HEADER_WORDS;
-    match klass.format() {
-        Format::Slots | Format::Klass => {
-            for i in 0..named {
-                let v = obj.body_oop(i);
-                let nv = scavenge_oop(vm, v);
-                obj.set_body_oop(i, nv);
-            }
-        }
-        Format::Double | Format::Process => {
-            // Double: raw f64 bits, never oops. Process: unreachable in v1.
-        }
-        Format::IndexableOops | Format::Closure | Format::Context => {
-            for i in 0..named {
-                let v = obj.body_oop(i);
-                let nv = scavenge_oop(vm, v);
-                obj.set_body_oop(i, nv);
-            }
-            let len = obj.indexable_len();
-            for i in 0..len {
-                let v = obj.tail_oop_at(i);
-                let nv = scavenge_oop(vm, v);
-                obj.set_tail_oop_at(i, nv);
-            }
-        }
-        Format::IndexableBytes | Format::Method => {
-            for i in 0..named {
-                let v = obj.body_oop(i);
-                let nv = scavenge_oop(vm, v);
-                obj.set_body_oop(i, nv);
-            }
-            // Byte tail (or Method's bytecode bytes): never scanned.
-        }
-    }
+    obj.for_each_oop_field(klass, |v| scavenge_oop(vm, v));
 }
 
 /// A6: for each dirty card below `old_top_before`, resolve its object
