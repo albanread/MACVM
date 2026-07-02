@@ -171,7 +171,7 @@ impl VmState {
     /// cannot race on process-wide env vars) and by any later embedder.
     pub fn with_options(options: VmOptions) -> VmState {
         let universe = Universe::genesis(&options);
-        VmState {
+        let mut vm = VmState {
             universe,
             options,
             stack: ProcessStack::with_capacity(DEFAULT_STACK_CAPACITY),
@@ -184,7 +184,9 @@ impl VmState {
             exit_requested: false,
             start_instant: Instant::now(),
             next_frame_serial: 0,
-        }
+        };
+        crate::runtime::globals::bootstrap_well_known(&mut vm);
+        vm
     }
 
     /// Re-reads live stack slot `prim_arg_base + i` — the choke-point a

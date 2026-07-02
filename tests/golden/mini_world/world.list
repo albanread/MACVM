@@ -1,0 +1,4 @@
+# Minimal test-only library: just enough smi arithmetic/comparison and
+# BlockClosure>>value[:] for the it_cli.rs REPL tests (no real library
+# exists until S6).
+mini.mst

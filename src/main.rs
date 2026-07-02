@@ -14,9 +14,13 @@
 //! anywhere, exercising `runtime::error::dnu_fallback`'s pinned stdout
 //! format and its real `exit(1)` (`tests/it_sends.rs::dnu_trace_golden`).
 
+use std::io::{BufRead, Write as _};
+use std::path::{Path, PathBuf};
+
 use macvm::bytecode::BytecodeBuilder;
 use macvm::memory::alloc;
 use macvm::oops::smi::SmallInt;
+use macvm::oops::Oop;
 use macvm::runtime::{VmOptions, VmState};
 
 fn main() {
@@ -32,7 +36,127 @@ fn main() {
     if std::env::args().any(|a| a == "--selftest-dnu-fallback") {
         selftest_dnu_fallback();
     }
-    println!("MACVM — Self/Strongtalk-lineage research VM (arm64). Scaffold only.");
+
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.first().map(|s| s.as_str()) {
+        Some("run") => cmd_run(&args[1..]),
+        Some("repl") => cmd_repl(&args[1..]),
+        _ => println!("MACVM — Self/Strongtalk-lineage research VM (arm64). Scaffold only."),
+    }
+}
+
+/// `--world <dir>` parsing shared by `run`/`repl`; any other args are
+/// returned as the positional leftovers (`run`'s `<file.mst>`).
+fn parse_world_flag(args: &[String]) -> (Option<PathBuf>, Vec<String>) {
+    let mut world_dir = None;
+    let mut rest = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--world" {
+            i += 1;
+            world_dir = args.get(i).map(PathBuf::from);
+        } else {
+            rest.push(args[i].clone());
+        }
+        i += 1;
+    }
+    (world_dir, rest)
+}
+
+fn load_world_with_warning(vm: &mut VmState, world_dir: &Path) {
+    match macvm::frontend::world::load_world(vm, world_dir) {
+        Ok(true) => {}
+        Ok(false) => eprintln!(
+            "warning: no world.list found at {} — continuing without a world",
+            world_dir.display()
+        ),
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// `macvm run <file.mst> [--world <dir>]` (SPEC §3.2, `sprint_s05_detail.md`
+/// §Design "CLI"). Exit 0 unless a compile error / uncaught VM error.
+fn cmd_run(args: &[String]) {
+    let (world_dir, rest) = parse_world_flag(args);
+    let Some(file) = rest.first() else {
+        eprintln!("usage: macvm run <file.mst> [--world <dir>]");
+        std::process::exit(2);
+    };
+    let mut vm = VmState::new();
+    load_world_with_warning(
+        &mut vm,
+        &world_dir.unwrap_or_else(|| PathBuf::from("world")),
+    );
+
+    match macvm::frontend::world::load_file(&mut vm, Path::new(file)) {
+        Ok(()) => std::process::exit(0),
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// `macvm repl [--world <dir>]`: prompts `mst> `, accumulates lines until a
+/// complete statement parses (an "unexpected EOF" parse error keeps
+/// reading; any other error reports and resets the buffer), executes each
+/// complete doIt, and prints its result via `printString` if understood,
+/// else the Rust `print_oop` fallback (pre-S6 worlds).
+fn cmd_repl(args: &[String]) {
+    let (world_dir, _rest) = parse_world_flag(args);
+    let mut vm = VmState::new();
+    load_world_with_warning(
+        &mut vm,
+        &world_dir.unwrap_or_else(|| PathBuf::from("world")),
+    );
+
+    let stdin = std::io::stdin();
+    let mut buf = String::new();
+    loop {
+        print!("{}", if buf.is_empty() { "mst> " } else { "...> " });
+        let _ = std::io::stdout().flush();
+        let mut line = String::new();
+        match stdin.lock().read_line(&mut line) {
+            Ok(0) => break, // EOF
+            Ok(_) => {}
+            Err(_) => break,
+        }
+        buf.push_str(&line);
+
+        match macvm::frontend::parser::parse_one_top_item(&buf) {
+            Ok(None) => buf.clear(),
+            Ok(Some(item)) => {
+                buf.clear();
+                match macvm::frontend::classdef::execute_top_item(&mut vm, item) {
+                    Ok(Some(result)) => println!("{}", print_result(&mut vm, result)),
+                    Ok(None) => {}
+                    Err(e) => println!("{e}"),
+                }
+            }
+            Err(e) if e.eof => {} // keep buffering
+            Err(e) => {
+                println!("{e}");
+                buf.clear();
+            }
+        }
+    }
+}
+
+fn print_result(vm: &mut VmState, result: Oop) -> String {
+    let klass = macvm::runtime::lookup::klass_of(vm, result);
+    let sel = vm.universe.intern(b"printString");
+    if let Some(m) = macvm::runtime::lookup::lookup(vm, klass, sel) {
+        let s = macvm::interpreter::run_method(vm, m, result, &[]);
+        if let Some(b) = macvm::oops::wrappers::ByteArrayOop::try_from(s) {
+            let mut bytes = Vec::new();
+            b.copy_bytes_out(&mut bytes);
+            return String::from_utf8_lossy(&bytes).into_owned();
+        }
+    }
+    macvm::memory::print_oop(&vm.universe, result)
 }
 
 fn selftest_alloc_loop() -> ! {

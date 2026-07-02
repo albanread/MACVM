@@ -1,0 +1,8 @@
+method #storeTempNonpop argc=0 ntemps=1 prim=0 flags=
+  0: push_smi 9
+  2: store_temp 0
+  4: pop
+  5: push_temp 0
+  7: return_tos
+literals:
+ics: 0

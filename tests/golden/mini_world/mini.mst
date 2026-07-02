@@ -1,0 +1,29 @@
+Object subclass: SmallInteger [
+    + other [
+        <primitive: 1>
+        ^self
+    ]
+    - other [
+        <primitive: 2>
+        ^self
+    ]
+    * other [
+        <primitive: 3>
+        ^self
+    ]
+    <= other [
+        <primitive: 11>
+        ^self
+    ]
+]
+
+Object subclass: BlockClosure [
+    value [
+        <primitive: 50>
+        ^self
+    ]
+    value: a [
+        <primitive: 51>
+        ^self
+    ]
+]

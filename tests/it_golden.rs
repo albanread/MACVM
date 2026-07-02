@@ -137,3 +137,82 @@ fn bc_wide() {
     let text = disassemble(&vm.universe, m);
     check_golden("bc_wide", &text);
 }
+
+/// `store_temp` (0x07, non-popping) has no S5 codegen pattern that emits it
+/// (assignment-in-value-position uses `dup`+`store_temp_pop` uniformly) —
+/// covered here directly so the sprint's full opcode-coverage meta-test
+/// (`opcode_coverage_meta`) sees it at least once, per SPEC §4.1's pinned
+/// set (tests_s05.md acceptance gate item 1).
+#[test]
+fn bc_store_temp_nonpop() {
+    let mut vm = common::test_vm();
+    let mut b = BytecodeBuilder::new();
+    b.push_smi_i8(9);
+    b.store_temp(0);
+    b.pop();
+    b.push_temp(0);
+    b.ret_tos();
+    let sel = vm.universe.intern(b"storeTempNonpop");
+    let m = b.finish(&mut vm, sel, 0, 1);
+    let text = disassemble(&vm.universe, m);
+    check_golden("bc_store_temp_nonpop", &text);
+}
+
+/// Narrow `send`(0x20)/`send_super`(0x21) — S3's own goldens exercise real
+/// dispatch semantics; this one just pins the disassembly shape (and gives
+/// the opcode-coverage meta-test a `send_super` narrow-form hit alongside
+/// `tests/it_sends.rs`'s behavioral coverage).
+#[test]
+fn bc_send_narrow() {
+    let mut vm = common::test_vm();
+    let mut b = BytecodeBuilder::new();
+    let foo_sel = vm.universe.intern(b"foo");
+    let bar_sel = vm.universe.intern(b"bar");
+    b.push_self();
+    b.send(foo_sel, 0);
+    b.pop();
+    b.push_self();
+    b.send_super(bar_sel, 0);
+    b.ret_tos();
+    let sel = vm.universe.intern(b"sendNarrow");
+    let m = b.finish(&mut vm, sel, 0, 0);
+    let text = disassemble(&vm.universe, m);
+    check_golden("bc_send_narrow", &text);
+}
+
+/// `send_w` (0x22): forcing IC site index > 255 auto-widens the builder's
+/// emitted opcode (mirrors `bc_wide`'s literal-index widening).
+#[test]
+fn bc_send_wide() {
+    let mut vm = common::test_vm();
+    let mut b = BytecodeBuilder::new();
+    let sel_each = vm.universe.intern(b"foo");
+    for _ in 0..260 {
+        b.push_self();
+        b.send(sel_each, 0);
+        b.pop();
+    }
+    b.ret_self();
+    let sel = vm.universe.intern(b"sendWide");
+    let m = b.finish(&mut vm, sel, 0, 0);
+    let text = disassemble(&vm.universe, m);
+    check_golden("bc_send_wide", &text);
+}
+
+/// `send_super_w` (0x23): same widening, for super sends.
+#[test]
+fn bc_send_super_wide() {
+    let mut vm = common::test_vm();
+    let mut b = BytecodeBuilder::new();
+    let sel_each = vm.universe.intern(b"foo");
+    for _ in 0..260 {
+        b.push_self();
+        b.send_super(sel_each, 0);
+        b.pop();
+    }
+    b.ret_self();
+    let sel = vm.universe.intern(b"sendSuperWide");
+    let m = b.finish(&mut vm, sel, 0, 0);
+    let text = disassemble(&vm.universe, m);
+    check_golden("bc_send_super_wide", &text);
+}

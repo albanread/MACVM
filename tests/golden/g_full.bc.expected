@@ -1,0 +1,138 @@
+method #greet argc=0 ntemps=0 prim=0 flags=
+  0: push_smi 1
+  2: return_tos
+  3: return_self
+literals:
+ics: 0
+method #isReady argc=0 ntemps=0 prim=0 flags=
+  0: push_true
+  1: return_tos
+  2: return_self
+literals:
+ics: 0
+method #notReady argc=0 ntemps=0 prim=0 flags=
+  0: push_false
+  1: return_tos
+  2: return_self
+literals:
+ics: 0
+method #nothing argc=0 ntemps=0 prim=0 flags=
+  0: push_nil
+  1: return_tos
+  2: return_self
+literals:
+ics: 0
+method #label argc=0 ntemps=0 prim=0 flags=
+  0: push_literal 0; #hello
+  2: return_tos
+  3: return_self
+literals:
+  0: #hello
+ics: 0
+method #setIv: argc=1 ntemps=0 prim=0 flags=
+  0: push_temp 0
+  2: store_instvar_pop 0
+  4: return_self
+literals:
+ics: 0
+method #getIv argc=0 ntemps=0 prim=0 flags=
+  0: push_instvar 0
+  2: return_tos
+  3: return_self
+literals:
+ics: 0
+method #bumpTotal argc=0 ntemps=0 prim=0 flags=
+  0: push_global 0; a Association
+  2: push_smi 1
+  4: send 0; #+
+  6: dup
+  7: store_global_pop 0; a Association
+  9: return_tos
+  10: return_self
+literals:
+  0: a Association
+ics: 1
+method #makeAdder: argc=1 ntemps=0 prim=0 flags=has_ctx
+  0: push_temp 0
+  2: store_ctx_temp_pop 0 0
+  5: push_closure 0 0
+  8: return_tos
+  9: return_self
+literals:
+  0: a CompiledMethod
+ics: 0
+method #aBlock argc=1 ntemps=0 prim=0 flags=is_block
+  0: push_temp 0
+  2: push_ctx_temp 0 0
+  5: send 0; #+
+  7: block_return_tos
+literals:
+ics: 1
+method #runBlock argc=0 ntemps=1 prim=0 flags=
+  0: push_closure 0 0
+  3: store_temp_pop 0
+  5: push_temp 0
+  7: push_smi 5
+  9: send 0; #value:
+  11: push_smi 1
+  13: send 1; #+
+  15: return_tos
+  16: return_self
+literals:
+  0: a CompiledMethod
+ics: 2
+method #aBlock argc=1 ntemps=0 prim=0 flags=is_block
+  0: push_temp 0
+  2: nlr_tos
+literals:
+ics: 0
+method #choose: argc=1 ntemps=0 prim=0 flags=
+  0: push_temp 0
+  2: br_false_fwd 6 -> 11
+  5: push_smi 1
+  7: return_tos
+  8: jump_fwd 3 -> 14
+  11: push_smi 2
+  13: return_tos
+  14: pop
+  15: return_self
+literals:
+ics: 0
+method #checkOr:with: argc=2 ntemps=0 prim=0 flags=
+  0: push_temp 0
+  2: br_true_fwd 5 -> 10
+  5: push_temp 1
+  7: jump_fwd 1 -> 11
+  10: push_true
+  11: return_tos
+  12: return_self
+literals:
+ics: 0
+method #countTo: argc=1 ntemps=1 prim=0 flags=
+  0: push_smi 0
+  2: store_temp_pop 1
+  4: push_temp 1
+  6: push_temp 0
+  8: send 0; #<=
+  10: br_false_fwd 13 -> 26
+  13: push_temp 1
+  15: push_smi 1
+  17: send 1; #+
+  19: dup
+  20: store_temp_pop 1
+  22: pop
+  23: jump_back 22 -> 4
+  26: push_nil
+  27: pop
+  28: push_temp 1
+  30: return_tos
+  31: return_self
+literals:
+ics: 2
+method #greet argc=0 ntemps=0 prim=0 flags=
+  0: push_self
+  1: send_super 0; #greet
+  3: return_tos
+  4: return_self
+literals:
+ics: 1

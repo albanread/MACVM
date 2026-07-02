@@ -1,0 +1,37 @@
+Object subclass: SmallInteger [
+    + other [
+        <primitive: 1>
+        ^self
+    ]
+]
+
+Object subclass: Point [
+    | x y |
+    Point class >> new [
+        <primitive: 23>
+        ^self
+    ]
+    setX: ax y: ay [
+        x := ax.
+        y := ay
+    ]
+    x [ ^x ]
+    y [ ^y ]
+    + p [
+        ^(Point new) setX: x + p x y: y + p y
+    ]
+    tell: aString [
+        <primitive: 91>
+        ^self
+    ]
+]
+
+P1 := Point new.
+P1 setX: 1 y: 2.
+P1 tell: 'Point creation ok
+'.
+P2 := Point new.
+P2 setX: 3 y: 4.
+P3 := P1 + P2.
+P3 tell: 'Point + ok
+'.

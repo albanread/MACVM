@@ -1,0 +1,9 @@
+method #sendNarrow argc=0 ntemps=0 prim=0 flags=
+  0: push_self
+  1: send 0; #foo
+  3: pop
+  4: push_self
+  5: send_super 1; #bar
+  7: return_tos
+literals:
+ics: 2

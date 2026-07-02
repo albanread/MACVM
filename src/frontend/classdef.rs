@@ -1,0 +1,193 @@
+//! Class-definition execution and top-level `do_it` execution
+//! (`sprint_s05_detail.md` §Algorithms "Class-definition execution").
+//! `classdef.rs` is the only module that creates/reopens klasses from
+//! source (SPEC §3.2 step 2's `subclass:` equivalent, S5's compile-time
+//! version — the bytecode-level `subclass:` primitive is a later sprint).
+
+use crate::memory::alloc;
+use crate::oops::wrappers::{ArrayOop, KlassOop, MemOop, SymbolOop};
+use crate::oops::{Format, Oop};
+use crate::runtime::vm_state::VmState;
+
+use super::ast::{ClassDefNode, Indexable, TopItem};
+use super::codegen::find_class_var;
+use super::lexer::Span;
+use super::CompileError;
+
+fn err(span: Span, msg: impl Into<String>) -> CompileError {
+    CompileError {
+        path: None,
+        span,
+        msg: msg.into(),
+        eof: false,
+    }
+}
+
+fn create_klass(vm: &mut VmState, super_klass: KlassOop, node: &ClassDefNode) -> KlassOop {
+    let format = match node.indexable {
+        Some(Indexable::Oops) => Format::IndexableOops,
+        Some(Indexable::Bytes) => Format::IndexableBytes,
+        None => super_klass.format(),
+    };
+    let untagged = match node.indexable {
+        Some(Indexable::Oops) => false,
+        Some(Indexable::Bytes) => true,
+        None => super_klass.has_untagged_contents(),
+    };
+    let nis = super_klass.non_indexable_size() + node.inst_vars.len();
+    let klass = vm
+        .universe
+        .new_klass(super_klass, &node.name, format, untagged, nis);
+
+    let array_klass = vm.universe.array_klass;
+    let iv_syms: Vec<Oop> = node
+        .inst_vars
+        .iter()
+        .map(|n| vm.universe.intern(n.as_bytes()).oop())
+        .collect();
+    let ivn = alloc::alloc_indexable_oops(vm, array_klass, iv_syms.len());
+    for (i, &s) in iv_syms.iter().enumerate() {
+        ivn.at_put(i, s);
+    }
+    klass.set_inst_var_names(ivn.oop());
+
+    let cvs = alloc::alloc_indexable_oops(vm, array_klass, 0);
+    klass.set_class_vars(cvs.oop());
+    for name in &node.class_vars {
+        let sym = vm.universe.intern(name.as_bytes());
+        append_class_var(vm, klass, sym);
+    }
+    klass
+}
+
+fn append_class_var(vm: &mut VmState, klass: KlassOop, sym: SymbolOop) {
+    if find_class_var(klass, sym.oop()).is_some() {
+        return; // re-declaring an existing class var is a no-op
+    }
+    let array_klass = vm.universe.array_klass;
+    let association_klass = vm.universe.association_klass;
+    let nil = vm.universe.nil_obj;
+
+    let assoc = alloc::alloc_slots(vm, association_klass);
+    assoc.set_body_oop(0, sym.oop());
+    assoc.set_body_oop(1, nil);
+
+    let old_len = ArrayOop::try_from(klass.class_vars())
+        .map(|a| a.len())
+        .unwrap_or(0);
+    let new_arr = alloc::alloc_indexable_oops(vm, array_klass, old_len + 1);
+    if let Some(old) = ArrayOop::try_from(klass.class_vars()) {
+        for i in 0..old_len {
+            new_arr.at_put(i, old.at(i));
+        }
+    }
+    new_arr.at_put(old_len, assoc.oop());
+    klass.set_class_vars(new_arr.oop());
+}
+
+fn reopen_klass(
+    vm: &mut VmState,
+    klass: KlassOop,
+    super_klass: KlassOop,
+    node: &ClassDefNode,
+) -> Result<(), CompileError> {
+    if klass.superclass().raw() != super_klass.oop().raw() {
+        return Err(err(
+            node.span,
+            format!(
+                "cannot change shape of existing class {}: superclass differs",
+                node.name
+            ),
+        ));
+    }
+    if !node.inst_vars.is_empty() || node.indexable.is_some() {
+        return Err(err(
+            node.span,
+            format!("cannot change shape of existing class {}", node.name),
+        ));
+    }
+    for name in &node.class_vars {
+        let sym = vm.universe.intern(name.as_bytes());
+        append_class_var(vm, klass, sym);
+    }
+    Ok(())
+}
+
+/// SPEC §3.2 step 2 / `sprint_s05_detail.md` §Algorithms "Class-definition
+/// execution": create-or-reopen `node.name`, then compile+install every
+/// method (instance-side into `klass`'s own `MethodDictionary`, class-side
+/// into its metaclass's — `runtime::lookup::install_method` already flushes
+/// the lookup cache and bumps `ic_epoch`, SPEC §6.2).
+pub fn install_class_def(vm: &mut VmState, node: &mut ClassDefNode) -> Result<(), CompileError> {
+    let super_sym = vm.universe.intern(node.superclass.as_bytes());
+    let super_assoc = crate::runtime::globals::global_lookup(vm, super_sym).ok_or_else(|| {
+        err(
+            node.span,
+            format!("superclass '{}' not found", node.superclass),
+        )
+    })?;
+    let super_val = MemOop::try_from(super_assoc)
+        .expect("global association is a mem oop")
+        .body_oop(1);
+    let super_klass = KlassOop::try_from(super_val)
+        .ok_or_else(|| err(node.span, format!("'{}' is not a class", node.superclass)))?;
+
+    let name_sym = vm.universe.intern(node.name.as_bytes());
+    let klass = match crate::runtime::globals::global_lookup(vm, name_sym) {
+        None => create_klass(vm, super_klass, node),
+        Some(assoc) => {
+            let val = MemOop::try_from(assoc)
+                .expect("global association is a mem oop")
+                .body_oop(1);
+            let existing = KlassOop::try_from(val).ok_or_else(|| {
+                err(
+                    node.span,
+                    format!("'{}' is already bound to a non-class value", node.name),
+                )
+            })?;
+            reopen_klass(vm, existing, super_klass, node)?;
+            existing
+        }
+    };
+
+    let assoc = crate::runtime::globals::global_declare(vm, name_sym);
+    MemOop::try_from(assoc)
+        .expect("global association is a mem oop")
+        .set_body_oop(1, klass.oop());
+
+    for method in &mut node.methods {
+        let compiled = super::codegen::compile_method(vm, klass, method.class_side, method)?;
+        let sel = vm.universe.intern(method.pattern_selector.as_bytes());
+        let target = if method.class_side {
+            klass.klass()
+        } else {
+            klass
+        };
+        crate::runtime::lookup::install_method(vm, target, sel, compiled);
+    }
+    Ok(())
+}
+
+/// A top-level `do_it` (SPEC §3.2 step 3's REPL/script path): compiles and
+/// executes `stmt` as an anonymous `#doIt` method (receiver `nil`, holder
+/// `UndefinedObject`'s klass) and returns its result. `frontend/` never
+/// calls `interpreter/` directly — this goes through `runtime::execute_doit`.
+pub fn execute_do_it(vm: &mut VmState, stmt: super::ast::Expr) -> Result<Oop, CompileError> {
+    let span = stmt.span();
+    let holder = vm.universe.undefined_object_klass;
+    let m = super::codegen::compile_doit(vm, holder, stmt)?;
+    crate::runtime::execute_doit(vm, m).map_err(|e| err(span, e.msg))
+}
+
+/// Executes one parsed top-level item — a class definition (installed, no
+/// value) or a `do_it` (its result). Shared by `world::load_file` and the
+/// REPL.
+pub fn execute_top_item(vm: &mut VmState, item: TopItem) -> Result<Option<Oop>, CompileError> {
+    match item {
+        TopItem::ClassDef(mut c) => {
+            install_class_def(vm, &mut c)?;
+            Ok(None)
+        }
+        TopItem::DoIt(stmt) => Ok(Some(execute_do_it(vm, stmt)?)),
+    }
+}

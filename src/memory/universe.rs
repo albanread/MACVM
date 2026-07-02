@@ -61,9 +61,21 @@ pub struct Universe {
     /// 2 named slots: `selector`, `arguments` — built by the DNU path
     /// (`interpreter::send`, S3) and handed to `#doesNotUnderstand:`.
     pub message_klass: KlassOop,
+    /// `IndexableBytes`, base-256 little-endian magnitude (S5's BigInt
+    /// literals, SPEC-QUESTION in `sprint_s05_detail.md` §Literal frame).
+    /// No arithmetic primitives target these yet — S6 adds Large fallback
+    /// code; this sprint only needs the klasses to exist so literal building
+    /// has somewhere to allocate.
+    pub large_pos_int_klass: KlassOop,
+    pub large_neg_int_klass: KlassOop,
 
-    /// The global namespace. `nil` until S5's loader populates it.
+    /// The global namespace (SPEC §3.1: "a Dictionary of Association"). `nil`
+    /// until the first `runtime::globals::global_declare` call; from then on
+    /// an `ArrayOop` laid out `[tally][assoc-or-nil…]` (dense, append-only —
+    /// S6's real `SystemDictionary` replaces this representation, A5).
     pub smalltalk: Oop,
+    /// Set once `frontend::world::load_world` finishes (SPEC §3.2 step 2).
+    pub world_loaded: bool,
 
     pub symbols: SymbolTable,
     hash_counter: u32,
@@ -327,6 +339,20 @@ impl Universe {
             false,
             HEADER_WORDS + 2
         );
+        let large_pos_int_klass = remaining_klass!(
+            "LargePositiveInteger",
+            object_klass.oop(),
+            Format::IndexableBytes,
+            true,
+            HEADER_WORDS
+        );
+        let large_neg_int_klass = remaining_klass!(
+            "LargeNegativeInteger",
+            large_pos_int_klass.oop(),
+            Format::IndexableBytes,
+            true,
+            HEADER_WORDS
+        );
 
         // Association's named instance variables: #key #value.
         {
@@ -418,7 +444,10 @@ impl Universe {
             context_klass,
             process_klass,
             message_klass,
+            large_pos_int_klass,
+            large_neg_int_klass,
             smalltalk,
+            world_loaded: false,
             symbols,
             hash_counter,
             sel_does_not_understand,
@@ -713,6 +742,8 @@ mod tests {
             u.context_klass,
             u.process_klass,
             u.message_klass,
+            u.large_pos_int_klass,
+            u.large_neg_int_klass,
         ];
         for k in klasses {
             assert!(k.oop().is_mem());

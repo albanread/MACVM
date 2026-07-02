@@ -119,7 +119,22 @@ pub fn disassemble(u: &Universe, m: MethodOop) -> String {
                 write!(out, " {depth} {idx}").unwrap()
             }
             Instr::PushClosure { lit, ncopied } => write!(out, " {lit} {ncopied}").unwrap(),
-            Instr::Send { ic, .. } => write!(out, " {ic}").unwrap(),
+            Instr::Send { ic, .. } => {
+                write!(out, " {ic}").unwrap();
+                // P12 (sprint_s05_detail.md Pitfalls): print both the site
+                // index and its selector — an off-by-4 (word vs. site
+                // index) reads the wrong site's selector and "works"
+                // alarmingly often; goldens must be able to pin this.
+                let ics = m.ics();
+                let base = ic as usize * crate::oops::layout::IC_STRIDE;
+                if base + crate::oops::layout::IC_SEL_OFFSET < ics.len() {
+                    let sel_str = crate::memory::print_oop(
+                        u,
+                        ics.at(base + crate::oops::layout::IC_SEL_OFFSET),
+                    );
+                    write!(out, "; {sel_str}").unwrap();
+                }
+            }
             Instr::JumpFwd(d) | Instr::BrTrueFwd(d) | Instr::BrFalseFwd(d) => {
                 let target = next + d as usize;
                 write!(out, " {d} -> {target}").unwrap();

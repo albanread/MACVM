@@ -1,0 +1,41 @@
+Object subclass: GFullBase [
+    greet [ ^1 ]
+]
+
+GFullBase subclass: GFull [
+    <classVars: GTotal>
+    | iv |
+
+    isReady [ ^true ]
+    notReady [ ^false ]
+    nothing [ ^nil ]
+    label [ ^#hello ]
+
+    setIv: v [ iv := v ]
+    getIv [ ^iv ]
+
+    bumpTotal [ ^GTotal := GTotal + 1 ]
+
+    makeAdder: n [ ^[:x | x + n] ]
+
+    runBlock [
+        | b |
+        b := [:x | ^x].
+        ^(b value: 5) + 1
+    ]
+
+    choose: aBool [
+        aBool ifTrue: [^1] ifFalse: [^2]
+    ]
+
+    checkOr: a with: b [ ^a or: [b] ]
+
+    countTo: lim [
+        | i |
+        i := 0.
+        [i <= lim] whileTrue: [i := i + 1].
+        ^i
+    ]
+
+    greet [ ^super greet ]
+]
