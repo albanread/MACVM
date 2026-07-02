@@ -163,6 +163,8 @@ mod tests {
         VmState::with_options(VmOptions {
             heap_mib: 64,
             trace: Default::default(),
+            gc_stress: false,
+            eden_kb: None,
         })
     }
 
@@ -184,7 +186,7 @@ mod tests {
         for t in 0..=argc {
             b.push_temp(t);
         }
-        b.send(sel, argc);
+        b.send(vm, sel, argc);
         b.ret_tos();
         let name = vm.universe.intern(b"caller");
         b.finish(vm, name, (argc + 1) as usize, 0)
@@ -321,12 +323,12 @@ mod tests {
         // The block itself has 1 local temp, never explicitly stored to —
         // if `Activated` handling pushed a stray result, it would land
         // exactly here.
-        let lit = home.build_block(&mut vm, 0, 1, false, 0, false, |b| {
+        let lit = home.build_block(&mut vm, 0, 1, false, 0, false, |b, _vm| {
             b.push_temp(0);
             b.ret_tos();
         });
         home.push_closure(lit, 0);
-        home.send(value_sel, 0);
+        home.send(&mut vm, value_sel, 0);
         home.ret_tos();
         let sel = vm.universe.intern(b"m");
         let method = home.finish(&mut vm, sel, 0, 0);

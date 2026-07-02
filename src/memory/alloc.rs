@@ -21,16 +21,57 @@ use crate::oops::wrappers::{
 use crate::oops::Oop;
 use crate::runtime::vm_state::VmState;
 
-use super::space::Eden;
+use super::spaces::Eden;
 
 // --- raw layer: usable before a VmState exists (genesis) -------------------
+
+/// Writes a fresh object's header (mark + klass) and nil/zero-fills its
+/// body — the tail shared by every allocation path (eden bump, old-gen
+/// direct) once an address has been carved out. Caller guarantees `[addr,
+/// addr + words*8)` is freshly reserved, uninitialized, 8-byte-aligned
+/// space this call owns exclusively.
+fn init_object_at(addr: usize, words: usize, klass: Oop, tagged: bool, nil_fill: Oop) -> MemOop {
+    // SAFETY: per this function's own doc contract, established by every
+    // call site below.
+    let obj = unsafe { MemOop::from_oop_unchecked(Oop::from_raw(addr as u64 + MEM_TAG)) };
+    obj.set_mark(Mark::pristine().with_tagged_contents(tagged));
+    obj.set_klass_raw(klass);
+
+    let body_words = words - HEADER_WORDS;
+    let fill_word = if tagged { nil_fill.raw() } else { 0 };
+    for i in 0..body_words {
+        obj.set_raw_body_word(i, fill_word);
+    }
+    obj
+}
+
+/// Bumps `eden.top` by `words*8` bytes if it fits; `None` (never exits)
+/// otherwise — the fallible primitive both the genesis-only raw layer and
+/// the public A2 cascade build on.
+fn try_bump_eden(eden: &mut Eden, words: usize) -> Option<usize> {
+    let size = words
+        .checked_mul(WORD_SIZE)
+        .expect("alloc_words: size overflow");
+    let new_top = eden
+        .top
+        .checked_add(size)
+        .expect("alloc_words: eden.top overflow");
+    if new_top > eden.end {
+        return None;
+    }
+    let addr = eden.top;
+    eden.top = new_top;
+    Some(addr)
+}
 
 /// The core bump-allocation primitive. `nil_fill` is the value tagged
 /// (oop-bearing) allocations fill their body with; genesis passes its
 /// in-progress `nil_obj` (a placeholder for the very first call, the real
 /// `nil_obj` from then on — SPEC-aligned with `sprint_s01_detail.md`'s
-/// pitfalls). Exits the process (code 70) on exhaustion — S7 replaces this
-/// branch with the scavenger.
+/// pitfalls). Exits the process (code 70) on exhaustion: genesis runs with
+/// GC disabled (SPEC §7.3 A1 — the half-built metaobject knot must never be
+/// scanned), so there is no scavenger to fall back on here; the public
+/// layer below (`alloc_words`) is what implements the real A2 cascade.
 pub(crate) fn alloc_words_raw(
     eden: &mut Eden,
     nil_fill: Oop,
@@ -42,34 +83,14 @@ pub(crate) fn alloc_words_raw(
         words >= HEADER_WORDS,
         "alloc_words: {words} words is smaller than a header"
     );
-    let size = words
-        .checked_mul(WORD_SIZE)
-        .expect("alloc_words: size overflow");
-    let new_top = eden
-        .top
-        .checked_add(size)
-        .expect("alloc_words: eden.top overflow");
-    if new_top > eden.end {
-        eprintln!("macvm: eden exhausted ({size} bytes requested)");
-        std::process::exit(70);
+    match try_bump_eden(eden, words) {
+        Some(addr) => init_object_at(addr, words, klass, tagged, nil_fill),
+        None => {
+            let size = words * WORD_SIZE;
+            eprintln!("macvm: eden exhausted ({size} bytes requested)");
+            std::process::exit(70);
+        }
     }
-    let addr = eden.top;
-    eden.top = new_top;
-
-    // SAFETY: [addr, addr+size) was just carved out of committed,
-    // otherwise-unused eden space, and is 8-byte aligned because `addr` is
-    // eden.top, which starts aligned and only ever advances by whole words.
-    let obj = unsafe { MemOop::from_oop_unchecked(Oop::from_raw(addr as u64 + MEM_TAG)) };
-
-    obj.set_mark(Mark::pristine().with_tagged_contents(tagged));
-    obj.set_klass_raw(klass);
-
-    let body_words = words - HEADER_WORDS;
-    let fill_word = if tagged { nil_fill.raw() } else { 0 };
-    for i in 0..body_words {
-        obj.set_raw_body_word(i, fill_word);
-    }
-    obj
 }
 
 /// A klass-shaped (10-word, tagged) object whose klass field is `meta`.
@@ -119,10 +140,80 @@ pub(crate) fn alloc_indexable_bytes_raw(
 
 // --- public layer: VmState-based, used from S2 onward -----------------------
 
-/// Every heap object allocates through here. SPEC §7.2.
+/// Every heap object allocates through here (SPEC §7.2 A2's designed
+/// cascade, S7-10): (1) `MACVM_GC_STRESS=1` scavenges before every
+/// allocation once the universe is past genesis — the harness that flushes
+/// out invisible-root bugs (S7-9's `Handle` discipline) deterministically
+/// instead of waiting for an unlucky eden-boundary allocation; (2) bump
+/// eden; (3) on failure, scavenge and retry the bump; (4) on failure,
+/// allocate directly into old gen (also covers objects too big for eden to
+/// ever hold); (5) still nothing → a structured `GcStallError` report, then
+/// exit non-zero (lesson 7: never panic on OOM). Old-gen growth and full GC
+/// (the cascade's remaining stages) are S8.
+///
+/// `klass` is handle-protected for the whole call: once this function can
+/// itself trigger a scavenge, its own `klass` parameter is exactly the kind
+/// of bare-local invisible root S7-9 exists to close (a caller like
+/// `alloc_slots` passes a `KlassOop` that may still be new-gen and
+/// unrelated to any other root at the moment of this call).
 pub fn alloc_words(vm: &mut VmState, words: usize, klass: Oop, tagged: bool) -> MemOop {
+    debug_assert!(
+        words >= HEADER_WORDS,
+        "alloc_words: {words} words is smaller than a header"
+    );
+    let size_bytes = words
+        .checked_mul(WORD_SIZE)
+        .expect("alloc_words: size overflow");
+
+    let scope = crate::memory::handles::HandleScope::enter(vm);
+    let klass_h = scope.handle(vm, klass);
+
+    if vm.options.gc_stress && vm.universe.gc_enabled {
+        let _ = crate::memory::scavenge::scavenge(vm);
+    }
+
     let nil_fill = vm.universe.nil_obj;
-    alloc_words_raw(&mut vm.universe.eden, nil_fill, words, klass, tagged)
+    if let Some(addr) = try_bump_eden(&mut vm.universe.eden, words) {
+        return init_object_at(addr, words, klass_h.get(vm), tagged, nil_fill);
+    }
+
+    if vm.universe.gc_enabled {
+        let _ = crate::memory::scavenge::scavenge(vm);
+        let nil_fill = vm.universe.nil_obj;
+        if let Some(addr) = try_bump_eden(&mut vm.universe.eden, words) {
+            return init_object_at(addr, words, klass_h.get(vm), tagged, nil_fill);
+        }
+    }
+
+    let nil_fill = vm.universe.nil_obj;
+    let old_addr = {
+        let offsets = &mut vm.universe.offsets;
+        let old = &mut vm.universe.old;
+        old.allocate(offsets, size_bytes, |_| {})
+    };
+    if let Some(addr) = old_addr {
+        let obj = init_object_at(addr, words, klass_h.get(vm), tagged, nil_fill);
+        // This object is being born directly in old gen (unlike a
+        // promotion, which copies an already-scanned body): its klass
+        // field — and, for a caller that fills the body itself right
+        // after this call returns, potentially its body too — may point
+        // into new gen. Mirror A4 step 8's promotion-path policy: mark the
+        // whole range dirty unconditionally; the next dirty-card scan
+        // clears cards that turn out to hold nothing new-gen
+        // (self-correcting, A6).
+        vm.universe
+            .cards
+            .record_multistores(addr, addr + size_bytes);
+        return obj;
+    }
+
+    let err = crate::memory::stall::GcStallError::snapshot(
+        &vm.universe,
+        size_bytes,
+        crate::memory::stall::GcPhase::Mutator,
+    );
+    eprintln!("{err}");
+    std::process::exit(70);
 }
 
 pub fn alloc_slots(vm: &mut VmState, klass: KlassOop) -> MemOop {
@@ -243,6 +334,8 @@ mod tests {
         VmState::with_options(VmOptions {
             heap_mib: 64,
             trace: Default::default(),
+            gc_stress: false,
+            eden_kb: None,
         })
     }
 

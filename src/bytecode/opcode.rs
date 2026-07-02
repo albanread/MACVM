@@ -209,6 +209,8 @@ mod tests {
         crate::runtime::VmState::with_options(crate::runtime::VmOptions {
             heap_mib: 64,
             trace: Default::default(),
+            gc_stress: false,
+            eden_kb: None,
         })
     }
 

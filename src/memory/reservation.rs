@@ -1,16 +1,28 @@
-//! Address-space reservation (SPEC §7.1, S1 subset): one `mmap` reservation,
-//! `PROT_NONE`, committed lazily with `mprotect`. S1 commits only eden at
-//! offset 0; the `from`/`to`/old layout inside the reservation is S7's
-//! concern.
+//! Address-space reservation (SPEC §7.1): one `mmap` reservation,
+//! `PROT_NONE`, committed lazily with `mprotect` — the MacNCL `Backing`
+//! pattern (`sprint_s07_detail.md` §Design). `commit`/`decommit` are
+//! idempotent: `mprotect`/`madvise` are themselves idempotent at the OS
+//! level, so no separate range-bookkeeping structure is needed for
+//! correctness (re-committing an already-committed range, or decommitting
+//! an already-decommitted one, is just a repeat syscall — never an error).
+//! [`test_heap`](Reservation::test_heap) swaps the mmap for a plain
+//! `Box<[u8]>` for deterministic, allocation-cheap unit tests: no real
+//! `mmap`/`mprotect` calls, `commit`/`decommit` are no-ops (a `Box<[u8]>`
+//! is already fully readable/writable and there is nothing meaningful to
+//! protect).
 
 use std::ffi::c_void;
 
-/// A single `mmap` address-space reservation. Uncommitted pages are
-/// `PROT_NONE` and touching them faults; [`commit`](Reservation::commit)
-/// makes a sub-range read/write.
+/// A single `mmap` address-space reservation, OR (in test mode) a plain
+/// heap allocation standing in for one. Uncommitted pages are `PROT_NONE`
+/// and touching them faults; [`commit`](Reservation::commit) makes a
+/// sub-range read/write.
 pub struct Reservation {
     base: usize,
     size: usize,
+    /// `Some` in `test_heap` mode: owns the backing memory (dropped
+    /// normally by Rust), and `commit`/`decommit` become no-ops.
+    test_box: Option<Box<[u8]>>,
 }
 
 impl Reservation {
@@ -43,12 +55,31 @@ impl Reservation {
         Reservation {
             base: ptr as usize,
             size,
+            test_box: None,
+        }
+    }
+
+    /// A deterministic small heap for unit tests: a plain `Box<[u8]>`
+    /// (8-byte aligned via `vec![0u8; size]`'s allocator guarantee), no
+    /// `mmap` involved. `commit`/`decommit` are no-ops — the memory is
+    /// already fully accessible.
+    pub fn test_heap(size: usize) -> Reservation {
+        let size = round_up(size, 8);
+        let mut v = vec![0u8; size].into_boxed_slice();
+        let base = v.as_mut_ptr() as usize;
+        Reservation {
+            base,
+            size,
+            test_box: Some(v),
         }
     }
 
     /// Make `[off, off+len)` (page-rounded outward) readable and writable.
-    /// Exits the process if `mprotect` fails.
+    /// Exits the process if `mprotect` fails. No-op in `test_heap` mode.
     pub fn commit(&self, off: usize, len: usize) {
+        if self.test_box.is_some() {
+            return;
+        }
         let page = page_size();
         let start = round_down(off, page);
         let end = round_up(off.checked_add(len).expect("commit range overflow"), page);
@@ -71,6 +102,41 @@ impl Reservation {
         }
     }
 
+    /// `madvise(MADV_FREE)` (the effective "give pages back" advice on
+    /// macOS, not `MADV_DONTNEED`) then `mprotect(PROT_NONE)` over
+    /// `[off, off+len)`, page-rounded outward. Reclaimed memory is NOT
+    /// guaranteed zeroed on a later re-`commit` (lesson 5 — callers must
+    /// never assume it). No-op in `test_heap` mode. Exits the process on
+    /// failure, same policy as `commit`.
+    pub fn decommit(&self, off: usize, len: usize) {
+        if self.test_box.is_some() {
+            return;
+        }
+        let page = page_size();
+        let start = round_down(off, page);
+        let end = round_up(off.checked_add(len).expect("decommit range overflow"), page);
+        debug_assert!(
+            end <= self.size,
+            "decommit range [{start},{end}) exceeds reservation of {} bytes",
+            self.size
+        );
+        let ptr = (self.base + start) as *mut c_void;
+        // SAFETY: as `commit` — range is within this reservation; madvise
+        // is advisory (never a correctness requirement) and mprotect only
+        // changes protection.
+        unsafe {
+            libc::madvise(ptr, end - start, libc::MADV_FREE);
+        }
+        let rc = unsafe { libc::mprotect(ptr, end - start, libc::PROT_NONE) };
+        if rc != 0 {
+            eprintln!(
+                "macvm: failed to decommit {len} bytes at offset {off}: {}",
+                std::io::Error::last_os_error()
+            );
+            std::process::exit(71);
+        }
+    }
+
     #[inline]
     pub fn base(&self) -> usize {
         self.base
@@ -84,6 +150,9 @@ impl Reservation {
 
 impl Drop for Reservation {
     fn drop(&mut self) {
+        if self.test_box.is_some() {
+            return; // Box drops itself normally — no mapping to release.
+        }
         // SAFETY: `self.base`/`self.size` describe exactly the mapping
         // created in `reserve`; nothing else can alias it (Reservation is
         // not Clone).
@@ -143,5 +212,69 @@ mod tests {
         assert_eq!(round_up(16, 16), 16);
         assert_eq!(round_down(17, 16), 16);
         assert_eq!(round_down(16, 16), 16);
+    }
+
+    /// `tests_s07.md`: double `commit` of the same range succeeds; the
+    /// range is still readable/writable afterwards (mprotect is naturally
+    /// idempotent, but this pins the contract, not just the mechanism).
+    #[test]
+    fn reserve_commit_idempotent() {
+        let r = Reservation::reserve(16 << 20);
+        r.commit(0, 4096);
+        r.commit(0, 4096);
+        let p = r.base() as *mut u64;
+        unsafe {
+            p.write(0x1122_3344_5566_7788);
+            assert_eq!(p.read(), 0x1122_3344_5566_7788);
+        }
+    }
+
+    /// Apple Silicon pages are 16 KiB — committing a single byte must make
+    /// the WHOLE surrounding 16 KiB page writable, not just a 4 KiB slice.
+    #[test]
+    fn commit_rounds_to_host_page() {
+        let r = Reservation::reserve(1 << 20);
+        r.commit(0, 1);
+        let page = 16 << 10;
+        let last_in_page = (r.base() + page - 8) as *mut u64;
+        unsafe {
+            last_in_page.write(0xAA);
+            assert_eq!(last_in_page.read(), 0xAA);
+        }
+    }
+
+    /// decommit → recommit → the range is readable/writable again
+    /// (contents unspecified — lesson 5: reclaimed memory is never assumed
+    /// zeroed).
+    #[test]
+    fn decommit_then_recommit() {
+        let r = Reservation::reserve(16 << 20);
+        r.commit(0, 4096);
+        let p = r.base() as *mut u64;
+        unsafe { p.write(0xDEAD) };
+        r.decommit(0, 4096);
+        r.commit(0, 4096);
+        unsafe {
+            p.write(0xBEEF);
+            assert_eq!(p.read(), 0xBEEF);
+        }
+    }
+
+    /// `test_heap` needs no `mmap`; `commit`/`decommit` are no-ops and the
+    /// backing memory is immediately readable/writable.
+    #[test]
+    fn test_heap_deterministic() {
+        let r = Reservation::test_heap(4096);
+        // No commit() call at all — test_heap memory starts accessible.
+        let p = r.base() as *mut u64;
+        unsafe {
+            p.write(0x42);
+            assert_eq!(p.read(), 0x42);
+        }
+        r.commit(0, 4096); // no-op, must not panic or fault
+        r.decommit(0, 4096); // no-op, must not panic or fault
+        unsafe {
+            assert_eq!(p.read(), 0x42); // decommit didn't actually reclaim it
+        }
     }
 }

@@ -48,6 +48,8 @@ fn small_heap_boot() {
     let vm = VmState::with_options(VmOptions {
         heap_mib: 16,
         trace: Default::default(),
+        gc_stress: false,
+        eden_kb: None,
     });
     verify::verify_heap(&vm.universe).expect("genesis must succeed in a 16 MiB reservation");
 }
@@ -70,7 +72,7 @@ fn eden_exhaustion_aborts() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("eden exhausted"),
+        stderr.contains("heap exhausted"),
         "stderr did not mention exhaustion: {stderr}"
     );
 }
@@ -137,10 +139,14 @@ fn genesis_is_deterministic() {
     let vm1 = VmState::with_options(VmOptions {
         heap_mib: 64,
         trace: Default::default(),
+        gc_stress: false,
+        eden_kb: None,
     });
     let vm2 = VmState::with_options(VmOptions {
         heap_mib: 64,
         trace: Default::default(),
+        gc_stress: false,
+        eden_kb: None,
     });
 
     let klasses1: Vec<KlassOop> = well_known(&vm1);

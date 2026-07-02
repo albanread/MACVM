@@ -26,48 +26,63 @@ fn assoc_key(assoc: Oop) -> Oop {
 /// just no-op via `global_declare`'s existing-lookup fast path), so tests
 /// that build a `Universe` directly (bypassing `VmState`) are unaffected.
 pub(crate) fn bootstrap_well_known(vm: &mut VmState) {
-    let klasses = [
-        vm.universe.metaclass_klass,
-        vm.universe.class_klass,
-        vm.universe.object_klass,
-        vm.universe.undefined_object_klass,
-        vm.universe.boolean_klass,
-        vm.universe.true_klass,
-        vm.universe.false_klass,
-        vm.universe.smi_klass,
-        vm.universe.character_klass,
-        vm.universe.double_klass,
-        vm.universe.string_klass,
-        vm.universe.symbol_klass,
-        vm.universe.array_klass,
-        vm.universe.bytearray_klass,
-        vm.universe.association_klass,
-        vm.universe.methoddict_klass,
-        vm.universe.method_klass,
-        vm.universe.closure_klass,
-        vm.universe.context_klass,
-        vm.universe.process_klass,
-        vm.universe.message_klass,
-        vm.universe.large_pos_int_klass,
-        vm.universe.large_neg_int_klass,
-        vm.universe.behavior_klass,
-        vm.universe.magnitude_klass,
-        vm.universe.number_klass,
-        vm.universe.integer_klass,
-        vm.universe.large_integer_klass,
-        vm.universe.collection_klass,
-        vm.universe.sequenceable_collection_klass,
-        vm.universe.arrayed_collection_klass,
-        vm.universe.system_dictionary_klass,
-    ];
-    for k in klasses {
-        let name_sym =
-            SymbolOop::try_from(k.name()).expect("genesis klass name is always a Symbol");
-        let assoc = global_declare(vm, name_sym);
-        MemOop::try_from(assoc)
-            .expect("global association is a mem oop")
-            .set_body_oop(1, k.oop());
+    // Each klass is re-read fresh from `vm.universe.$f` (never captured
+    // into a Rust array up front, the way this loop originally worked) and
+    // handle-protected across `global_declare`'s own allocation — S7-9/
+    // S7-10 (found via `MACVM_GC_STRESS=1`): a plain `[KlassOop; 32]` built
+    // before the loop starts is exactly the "Rust container holding raw
+    // oops" MacNCL lesson 13 warns about — every entry after the first
+    // goes stale the moment the first `global_declare` call scavenges.
+    let scope = crate::memory::handles::HandleScope::enter(vm);
+    macro_rules! bootstrap_one {
+        ($($f:ident),* $(,)?) => {
+            $(
+                let k = vm.universe.$f;
+                let k_h = scope.handle(vm, k.oop());
+                let name_sym = SymbolOop::try_from(k.name())
+                    .expect("genesis klass name is always a Symbol");
+                let name_sym_h = scope.handle(vm, name_sym);
+                let assoc = global_declare(vm, name_sym_h.get(vm));
+                MemOop::try_from(assoc)
+                    .expect("global association is a mem oop")
+                    .set_body_oop(1, k_h.get(vm));
+            )*
+        };
     }
+    bootstrap_one!(
+        metaclass_klass,
+        class_klass,
+        object_klass,
+        undefined_object_klass,
+        boolean_klass,
+        true_klass,
+        false_klass,
+        smi_klass,
+        character_klass,
+        double_klass,
+        string_klass,
+        symbol_klass,
+        array_klass,
+        bytearray_klass,
+        association_klass,
+        methoddict_klass,
+        method_klass,
+        closure_klass,
+        context_klass,
+        process_klass,
+        message_klass,
+        large_pos_int_klass,
+        large_neg_int_klass,
+        behavior_klass,
+        magnitude_klass,
+        number_klass,
+        integer_klass,
+        large_integer_klass,
+        collection_klass,
+        sequenceable_collection_klass,
+        arrayed_collection_klass,
+        system_dictionary_klass,
+    );
 
     // `Smalltalk` itself (SPEC §3.2 step 3's `Smalltalk startUp` send target)
     // — bound last, once the namespace's own backing array definitely
@@ -100,12 +115,19 @@ pub fn global_declare(vm: &mut VmState, name: SymbolOop) -> Oop {
     if let Some(assoc) = global_lookup(vm, name) {
         return assoc;
     }
+    // `name` (reachable via the symbol table root, but a separate unrooted
+    // copy in this parameter) is held across `ensure_capacity`'s own
+    // possible allocation below — needs protecting (S7-9/S7-10, found via
+    // `MACVM_GC_STRESS=1`).
+    let scope = crate::memory::handles::HandleScope::enter(vm);
+    let name_h = scope.handle(vm, name);
+
     ensure_capacity(vm);
 
     let association_klass = vm.universe.association_klass;
     let assoc = alloc::alloc_slots(vm, association_klass);
     let nil = vm.universe.nil_obj;
-    assoc.set_body_oop(0, name.oop());
+    assoc.set_body_oop(0, name_h.get(vm).oop());
     assoc.set_body_oop(1, nil);
 
     let arr = ArrayOop::try_from(vm.universe.smalltalk)
@@ -157,6 +179,8 @@ mod tests {
         VmState::with_options(VmOptions {
             heap_mib: 64,
             trace: Default::default(),
+            gc_stress: false,
+            eden_kb: None,
         })
     }
 

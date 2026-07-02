@@ -169,6 +169,8 @@ mod tests {
         VmState::with_options(VmOptions {
             heap_mib: 64,
             trace: Default::default(),
+            gc_stress: false,
+            eden_kb: None,
         })
     }
 

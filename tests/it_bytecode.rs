@@ -84,7 +84,7 @@ fn wide_literal_index() {
     let mut vm = common::test_vm();
     let mut b = BytecodeBuilder::new();
     for i in 0..300i64 {
-        b.push_literal(SmallInt::new(i).oop());
+        b.push_literal(&mut vm, SmallInt::new(i).oop());
     }
     b.ret_self();
     let sel = vm.universe.intern(b"m");

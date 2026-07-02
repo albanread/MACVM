@@ -72,6 +72,17 @@ pub struct VmOptions {
     /// tunable default), overridden by `MACVM_HEAP`.
     pub heap_mib: usize,
     pub trace: TraceFlags,
+    /// `MACVM_GC_STRESS=1` (S7-10, SPEC §7.2 A2 step 1): scavenge before
+    /// every allocation through the public choke point (`memory::alloc::
+    /// alloc_words`), not just on eden exhaustion — the harness that flushes
+    /// out invisible-root bugs (S7-9's `Handle` discipline) deterministically
+    /// instead of waiting for an unlucky eden-boundary allocation.
+    pub gc_stress: bool,
+    /// `MACVM_EDEN=<KiB>` (S7 A1 step 3's "tests" override): eden size in
+    /// KiB, overriding `layout::DEFAULT_EDEN_SIZE`. `None` keeps the
+    /// default — used to shrink eden in tests so a scavenge is reachable
+    /// without allocating megabytes of filler first.
+    pub eden_kb: Option<usize>,
 }
 
 impl VmOptions {
@@ -86,7 +97,19 @@ impl VmOptions {
             .ok()
             .map(|s| TraceFlags::parse(&s))
             .unwrap_or_default();
-        VmOptions { heap_mib, trace }
+        let gc_stress = std::env::var("MACVM_GC_STRESS")
+            .ok()
+            .map(|s| s.trim() == "1")
+            .unwrap_or(false);
+        let eden_kb = std::env::var("MACVM_EDEN")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok());
+        VmOptions {
+            heap_mib,
+            trace,
+            gc_stress,
+            eden_kb,
+        }
     }
 }
 
@@ -95,6 +118,8 @@ impl Default for VmOptions {
         VmOptions {
             heap_mib: Self::DEFAULT_HEAP_MIB,
             trace: TraceFlags::default(),
+            gc_stress: false,
+            eden_kb: None,
         }
     }
 }
@@ -168,12 +193,30 @@ pub struct VmState {
     /// same `fp` always has a different serial. u32 wrap after 4G pushes is
     /// an accepted, `debug_assert`-guarded risk.
     next_frame_serial: u32,
+    /// `MACVM_DBG_OOP=<hex-addr>` (S7, lesson 11): the single-address trace
+    /// hook, updated to the object's new address every time it moves.
+    /// `None` unless set by [`VmState::new`] (which reads the env var);
+    /// `with_options` always starts `None` — tests set it directly if they
+    /// need it, avoiding the env-var-race concern `MACVM_HEAP`/
+    /// `MACVM_TRACE` are parsed once for in `VmOptions::from_env`, not here.
+    pub dbg_oop: Option<usize>,
+    /// Scoped GC roots for oops held across an allocating call (S7-9, SPEC
+    /// §7.6) — see `memory::handles`. Boxed so its address is stable across
+    /// this struct moving; `HandleScope` points directly at the box's
+    /// pointee.
+    pub handle_arena: Box<crate::memory::handles::HandleArena>,
 }
 
 impl VmState {
     /// Parses options from the environment once and boots a fresh universe.
     pub fn new() -> VmState {
-        Self::with_options(VmOptions::from_env())
+        let mut vm = Self::with_options(VmOptions::from_env());
+        vm.dbg_oop = std::env::var("MACVM_DBG_OOP").ok().and_then(|s| {
+            let s = s.trim();
+            let s = s.strip_prefix("0x").unwrap_or(s);
+            usize::from_str_radix(s, 16).ok()
+        });
+        vm
     }
 
     /// Bypasses env parsing — required by tests (parallel test runners
@@ -195,6 +238,8 @@ impl VmState {
             start_instant: Instant::now(),
             bytecode_count: 0,
             next_frame_serial: 0,
+            dbg_oop: None,
+            handle_arena: Box::new(crate::memory::handles::HandleArena::new()),
         };
         crate::runtime::globals::bootstrap_well_known(&mut vm);
         vm

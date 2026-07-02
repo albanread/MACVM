@@ -71,7 +71,7 @@ fn k_push_const_matrix() {
 
     let sym = vm.universe.intern(b"probe");
     let mut b = BytecodeBuilder::new();
-    b.push_literal(sym.oop());
+    b.push_literal(&mut vm, sym.oop());
     b.ret_tos();
     let sel = vm.universe.intern(b"push_lit");
     let m = b.finish(&mut vm, sel, 0, 0);
@@ -130,7 +130,7 @@ fn k_instvar() {
     let value_lit = SmallInt::new(99).oop();
 
     let mut b = BytecodeBuilder::new();
-    b.push_literal(value_lit);
+    b.push_literal(&mut vm, value_lit);
     b.store_instvar_pop(1); // Association's #value is body index 1
     b.push_instvar(1);
     b.ret_tos();
@@ -157,7 +157,7 @@ fn k_global() {
     assoc.set_body_oop(1, SmallInt::new(5).oop());
 
     let mut b = BytecodeBuilder::new();
-    b.push_global(assoc.oop());
+    b.push_global(&mut vm, assoc.oop());
     b.ret_tos();
     let sel = vm.universe.intern(b"k_global_read");
     let m = b.finish(&mut vm, sel, 0, 0);
@@ -167,8 +167,8 @@ fn k_global() {
 
     let mut b = BytecodeBuilder::new();
     b.push_smi_i8(9);
-    b.store_global_pop(assoc.oop());
-    b.push_global(assoc.oop());
+    b.store_global_pop(&mut vm, assoc.oop());
+    b.push_global(&mut vm, assoc.oop());
     b.ret_tos();
     let sel = vm.universe.intern(b"k_global_write");
     let m = b.finish(&mut vm, sel, 0, 0);
@@ -298,6 +298,8 @@ fn trace_mode_smoke() {
     let mut vm = VmState::with_options(VmOptions {
         heap_mib: 64,
         trace: macvm::runtime::TraceFlags::parse("bytecode"),
+        gc_stress: false,
+        eden_kb: None,
     });
     let m = build_diamond(&mut vm);
     let true_obj = vm.universe.true_obj;

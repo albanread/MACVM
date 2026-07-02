@@ -151,11 +151,21 @@ pub fn lookup(vm: &mut VmState, klass: KlassOop, selector: SymbolOop) -> Option<
 /// triggers (SPEC §6.2): the lookup cache and every IC self-heal on their
 /// next use via the bumped epoch.
 pub fn install_method(vm: &mut VmState, klass: KlassOop, selector: SymbolOop, m: MethodOop) {
+    // `klass`/`selector`/`m` are bare parameters held across `dict.insert`'s
+    // possible growth allocation below — S7-9/S7-10 (found via
+    // `MACVM_GC_STRESS=1`).
+    let scope = crate::memory::handles::HandleScope::enter(vm);
+    let klass_h = scope.handle(vm, klass);
+    let selector_h = scope.handle(vm, selector);
+    let m_h = scope.handle(vm, m);
+
     let dict = match MethodDictOop::try_from(klass.methods()) {
         Some(d) => d,
         None => crate::oops::method_dict::alloc_method_dict(vm, 8),
     };
-    let dict = dict.insert(vm, selector, m);
+    let dict = dict.insert(vm, selector_h.get(vm), m_h.get(vm));
+    let klass = klass_h.get(vm);
+    let m = m_h.get(vm);
     klass.set_methods(dict.oop());
     m.set_holder(klass.oop());
     patch_block_holders(klass.oop(), m);
@@ -203,6 +213,8 @@ mod tests {
         VmState::with_options(VmOptions {
             heap_mib: 64,
             trace: Default::default(),
+            gc_stress: false,
+            eden_kb: None,
         })
     }
 

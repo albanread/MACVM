@@ -34,7 +34,7 @@ fn build_caller(vm: &mut VmState, sel: SymbolOop, argc: u8) -> MethodOop {
     for t in 0..=argc {
         b.push_temp(t);
     }
-    b.send(sel, argc);
+    b.send(vm, sel, argc);
     b.ret_tos();
     let name = vm.universe.intern(b"caller");
     b.finish(vm, name, (argc + 1) as usize, 0)
@@ -86,7 +86,7 @@ fn super_send_chain() {
     // receiver klass.
     let mut b = BytecodeBuilder::new();
     b.push_self();
-    b.send_super(sel, 0);
+    b.send_super(&mut vm, sel, 0);
     b.ret_tos();
     let mid_impl = b.finish(&mut vm, sel, 0, 0);
     install_method(&mut vm, mid, sel, mid_impl);
@@ -120,7 +120,7 @@ fn dnu_smalltalk_handler() {
     let mut b = BytecodeBuilder::new();
     b.push_temp(0); // the Message argument (argc=1: t=0 is the sole arg)
     b.push_smi_i8(1);
-    b.send(instvar_at_sel, 1);
+    b.send(&mut vm, instvar_at_sel, 1);
     b.ret_tos();
     let handler = b.finish(&mut vm, dnu_sel, 1, 0);
     install_method(&mut vm, object_klass, dnu_sel, handler);
@@ -158,7 +158,7 @@ fn mixed_arity_sends() {
         b.push_smi_i8(0);
         for t in 0..argc {
             b.push_temp(t); // unified indexing: t < argc addresses arg t directly
-            b.send(plus_sel, 1);
+            b.send(&mut vm, plus_sel, 1);
         }
         b.ret_tos();
         let m = b.finish(&mut vm, sel, argc as usize, 0);
@@ -193,9 +193,9 @@ fn send_w_wide() {
     b.push_temp(0);
     for i in 0..300 {
         let sel = vm.universe.intern(format!("pad{i}").as_bytes());
-        b.add_send(sel, 0); // IC site only, no matching opcode needed
+        b.add_send(&mut vm, sel, 0); // IC site only, no matching opcode needed
     }
-    b.send(target_sel, 0);
+    b.send(&mut vm, target_sel, 0);
     b.ret_tos();
     let caller_sel = vm.universe.intern(b"wideCaller");
     let caller = b.finish(&mut vm, caller_sel, 1, 0);

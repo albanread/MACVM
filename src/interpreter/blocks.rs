@@ -193,6 +193,8 @@ mod tests {
         VmState::with_options(VmOptions {
             heap_mib: 64,
             trace: Default::default(),
+            gc_stress: false,
+            eden_kb: None,
         })
     }
 
@@ -261,7 +263,7 @@ mod tests {
     fn push_closure_copied_layout() {
         let mut vm = test_vm();
         let mut home = BytecodeBuilder::new();
-        let lit = home.build_block(&mut vm, 0, 0, false, 0, false, |b| {
+        let lit = home.build_block(&mut vm, 0, 0, false, 0, false, |b, _vm| {
             b.ret_self();
         });
         home.push_smi_i8(10);
@@ -284,7 +286,7 @@ mod tests {
     fn push_closure_home_method() {
         let mut vm = test_vm();
         let mut home = BytecodeBuilder::new();
-        let lit = home.build_block(&mut vm, 0, 0, false, 0, false, |b| {
+        let lit = home.build_block(&mut vm, 0, 0, false, 0, false, |b, _vm| {
             b.ret_self();
         });
         home.push_closure(lit, 0);
@@ -321,7 +323,7 @@ mod tests {
 
         // The "outer" closure whose home we expect to see propagated.
         let mut home = BytecodeBuilder::new();
-        let outer_lit = home.build_block(&mut vm, 0, 0, false, 0, false, |b| {
+        let outer_lit = home.build_block(&mut vm, 0, 0, false, 0, false, |b, _vm| {
             b.ret_self();
         });
         home.push_closure(outer_lit, 0);
@@ -335,7 +337,7 @@ mod tests {
         // A second, INNER block (built standalone — its own literal pool
         // is irrelevant here) that itself does `push_closure` when run.
         let mut inner_home_builder = BytecodeBuilder::new();
-        let inner_lit = inner_home_builder.build_block(&mut vm, 0, 0, false, 0, false, |b| {
+        let inner_lit = inner_home_builder.build_block(&mut vm, 0, 0, false, 0, false, |b, _vm| {
             b.ret_self();
         });
         inner_home_builder.ret_self(); // never run — only `discard_method`'s literal pool matters
@@ -370,7 +372,7 @@ mod tests {
         let mut vm = test_vm();
         let mut home = BytecodeBuilder::new();
         // argc=1, ntemps=1 (1 value capture, 0 block locals), no ctx.
-        let lit = home.build_block(&mut vm, 1, 1, false, 0, false, |b| {
+        let lit = home.build_block(&mut vm, 1, 1, false, 0, false, |b, _vm| {
             b.ret_self();
         });
         home.push_smi_i8(7); // 1 value capture
@@ -416,7 +418,7 @@ mod tests {
     fn activate_block_argc_mismatch() {
         let mut vm = test_vm();
         let mut home = BytecodeBuilder::new();
-        let lit = home.build_block(&mut vm, 2, 2, false, 0, false, |b| {
+        let lit = home.build_block(&mut vm, 2, 2, false, 0, false, |b, _vm| {
             b.ret_self();
         });
         home.push_closure(lit, 0);
@@ -443,7 +445,7 @@ mod tests {
         home.push_smi_i8(10);
         home.store_ctx_temp_pop(0, 0);
         // Block: has_ctx too, captures the enclosing context.
-        let lit = home.build_block(&mut vm, 0, 1, true, 1, true, |b| {
+        let lit = home.build_block(&mut vm, 0, 1, true, 1, true, |b, _vm| {
             b.ret_self();
         });
         home.push_closure(lit, 0);
@@ -475,7 +477,7 @@ mod tests {
         home.push_smi_i8(10);
         home.store_ctx_temp_pop(0, 0);
         // Block has NO own context, but does capture the enclosing one.
-        let lit = home.build_block(&mut vm, 0, 0, false, 0, true, |b| {
+        let lit = home.build_block(&mut vm, 0, 0, false, 0, true, |b, _vm| {
             b.ret_self();
         });
         home.push_closure(lit, 0);
@@ -513,9 +515,9 @@ mod tests {
         crate::runtime::lookup::install_method(&mut vm, object_klass, foo_sel, foo_method);
 
         let mut home = BytecodeBuilder::new();
-        let lit = home.build_block(&mut vm, 0, 0, false, 0, false, |b| {
+        let lit = home.build_block(&mut vm, 0, 0, false, 0, false, |b, vm| {
             b.push_self();
-            b.send(foo_sel, 0);
+            b.send(vm, foo_sel, 0);
             b.ret_tos();
         });
         home.push_self();

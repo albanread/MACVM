@@ -233,7 +233,7 @@ fn dispatch(vm: &mut VmState) -> Oop {
                     "store_instvar_pop: index {i} out of the named part"
                 );
                 let v = pop(vm);
-                m.set_body_oop(i, v);
+                crate::memory::store::store(vm, m, i, v);
                 bci += 2;
             }
             OP_PUSH_GLOBAL => {
@@ -250,7 +250,7 @@ fn dispatch(vm: &mut VmState) -> Oop {
                 let assoc = crate::oops::wrappers::MemOop::try_from(assoc_oop)
                     .expect("store_global_pop: literal is not an Association");
                 let v = pop(vm);
-                assoc.set_body_oop(1, v);
+                crate::memory::store::store(vm, assoc, 1, v);
                 bci += 2;
             }
             OP_POP => {
@@ -463,6 +463,8 @@ mod tests {
         VmState::with_options(VmOptions {
             heap_mib: 64,
             trace: Default::default(),
+            gc_stress: false,
+            eden_kb: None,
         })
     }
 
@@ -482,6 +484,8 @@ mod tests {
         let mut vm = VmState::with_options(VmOptions {
             heap_mib: 64,
             trace: crate::runtime::vm_state::TraceFlags::parse("count"),
+            gc_stress: false,
+            eden_kb: None,
         });
         let mut b = BytecodeBuilder::new();
         b.push_smi_i8(42);
@@ -678,6 +682,8 @@ mod tests {
         let mut vm = VmState::with_options(VmOptions {
             heap_mib: 64,
             trace: crate::runtime::vm_state::TraceFlags::parse("bytecode"),
+            gc_stress: false,
+            eden_kb: None,
         });
         let mut b = BytecodeBuilder::new();
         b.push_true();

@@ -336,6 +336,8 @@ mod tests {
         VmState::with_options(VmOptions {
             heap_mib: 64,
             trace: Default::default(),
+            gc_stress: false,
+            eden_kb: None,
         })
     }
 
@@ -388,7 +390,7 @@ mod tests {
         for t in 0..=argc {
             b.push_temp(t);
         }
-        b.send(sel, argc);
+        b.send(vm, sel, argc);
         b.ret_tos();
         let name = vm.universe.intern(b"caller");
         b.finish(vm, name, (argc + 1) as usize, 0)
@@ -762,7 +764,7 @@ mod tests {
         // own unary-send shape.
         let mut b = BytecodeBuilder::new();
         b.push_self();
-        b.send_super(sel, 0);
+        b.send_super(&mut vm, sel, 0);
         b.ret_tos();
         let mid_sel = vm.universe.intern(b"midMethod");
         let mid_method = b.finish(&mut vm, mid_sel, 0, 0);
@@ -812,7 +814,7 @@ mod tests {
         let mut sites = Vec::new();
         for &argc in &argcs {
             let sel = vm.universe.intern(format!("sel{argc}").as_bytes());
-            sites.push((b.add_send(sel, argc), argc));
+            sites.push((b.add_send(&mut vm, sel, argc), argc));
         }
         let name = vm.universe.intern(b"holder");
         let holder_method = b.finish(&mut vm, name, 0, 0);

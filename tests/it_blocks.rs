@@ -49,14 +49,17 @@ fn counter_closure() {
     home.push_smi_i8(0);
     home.store_ctx_temp_pop(0, 0); // n := 0
                                    // [n := n + 1. n] — captures the enclosing (home's) Context.
-    let lit = home.build_block(&mut vm, 0, 0, false, 0, true, |b| {
-        b.push_ctx_temp(0, 0);
-        b.push_smi_i8(1);
-        b.send(plus_sel, 1);
-        b.store_ctx_temp_pop(0, 0);
-        b.push_ctx_temp(0, 0);
-        b.ret_tos();
-    });
+    let mut blk_b = BytecodeBuilder::new();
+    blk_b.push_ctx_temp(0, 0);
+    blk_b.push_smi_i8(1);
+    blk_b.send(&mut vm, plus_sel, 1);
+    blk_b.store_ctx_temp_pop(0, 0);
+    blk_b.push_ctx_temp(0, 0);
+    blk_b.ret_tos();
+    let blk_sel = vm.universe.intern(b"aBlock");
+    let blk = blk_b.finish(&mut vm, blk_sel, 0, 0);
+    blk.set_flags(0, 0, false, true, false, true, 0);
+    let lit = home.intern_block_literal(&mut vm, blk);
     home.push_closure(lit, 0);
     home.ret_tos();
     let home_sel = vm.universe.intern(b"home");
@@ -77,7 +80,7 @@ fn counter_closure() {
     for _ in 0..3 {
         let mut caller = BytecodeBuilder::new();
         caller.push_temp(0);
-        caller.send(value_sel, 0);
+        caller.send(&mut vm, value_sel, 0);
         caller.ret_tos();
         let caller_sel = vm.universe.intern(b"caller");
         let caller_method = caller.finish(&mut vm, caller_sel, 1, 0);
@@ -104,26 +107,28 @@ fn nested_blocks_3deep() {
 
     // B3 = [a + b + c. a := 99. a] — has no ctx of its own; captures the
     // enclosing (B2's) Context, plus a value-capture `c`=30.
-    let b3_blk = macvm::bytecode::build_standalone_block(&mut vm, 0, 1, false, 0, true, |b| {
-        b.push_ctx_temp(1, 0); // a (one has_ctx hop up: B2's ctx -> M's ctx)
-        b.push_ctx_temp(0, 0); // b (B2's own ctx, depth 0)
-        b.send(plus_sel, 1);
-        b.push_temp(0); // c: the value-capture, unified temp index 0 (argc=0)
-        b.send(plus_sel, 1);
-        b.push_smi_i8(99);
-        b.store_ctx_temp_pop(1, 0); // a := 99 (store-through)
-        b.ret_tos();
-    });
+    let mut b3_b = BytecodeBuilder::new();
+    b3_b.push_ctx_temp(1, 0); // a (one has_ctx hop up: B2's ctx -> M's ctx)
+    b3_b.push_ctx_temp(0, 0); // b (B2's own ctx, depth 0)
+    b3_b.send(&mut vm, plus_sel, 1);
+    b3_b.push_temp(0); // c: the value-capture, unified temp index 0 (argc=0)
+    b3_b.send(&mut vm, plus_sel, 1);
+    b3_b.push_smi_i8(99);
+    b3_b.store_ctx_temp_pop(1, 0); // a := 99 (store-through)
+    b3_b.ret_tos();
+    let b3_sel = vm.universe.intern(b"aBlock");
+    let b3_blk = b3_b.finish(&mut vm, b3_sel, 0, 1);
+    b3_blk.set_flags(0, 1, false, true, false, true, 0);
 
     // B2(ctx: b=20) ⊃ [B3] — captures the enclosing (B1-aliased-M's) ctx,
     // has its own ctx (nctx=1) for `b`.
     let mut b2_builder = BytecodeBuilder::new();
     b2_builder.push_smi_i8(20);
     b2_builder.store_ctx_temp_pop(0, 0); // b := 20
-    let b3_lit = b2_builder.intern_block_literal(b3_blk);
+    let b3_lit = b2_builder.intern_block_literal(&mut vm, b3_blk);
     b2_builder.push_smi_i8(30); // value-capture c
     b2_builder.push_closure(b3_lit, 1);
-    b2_builder.send(value_sel, 0);
+    b2_builder.send(&mut vm, value_sel, 0);
     b2_builder.ret_tos();
     let b2_sel = vm.universe.intern(b"aBlock");
     let b2_method = b2_builder.finish(&mut vm, b2_sel, 0, 1);
@@ -131,9 +136,9 @@ fn nested_blocks_3deep() {
 
     // B1 ⊃ [B2] — no ctx of its own, aliases the enclosing (M's) ctx.
     let mut b1_builder = BytecodeBuilder::new();
-    let b2_lit = b1_builder.intern_block_literal(b2_method);
+    let b2_lit = b1_builder.intern_block_literal(&mut vm, b2_method);
     b1_builder.push_closure(b2_lit, 0);
-    b1_builder.send(value_sel, 0);
+    b1_builder.send(&mut vm, value_sel, 0);
     b1_builder.ret_tos();
     let b1_sel = vm.universe.intern(b"aBlock");
     let b1_method = b1_builder.finish(&mut vm, b1_sel, 0, 0);
@@ -143,9 +148,9 @@ fn nested_blocks_3deep() {
     let mut m = BytecodeBuilder::new();
     m.push_smi_i8(10);
     m.store_ctx_temp_pop(0, 0); // a := 10
-    let b1_lit = m.intern_block_literal(b1_method);
+    let b1_lit = m.intern_block_literal(&mut vm, b1_method);
     m.push_closure(b1_lit, 0);
-    m.send(value_sel, 0);
+    m.send(&mut vm, value_sel, 0);
     m.pop();
     m.push_ctx_temp(0, 0); // read `a` back after the store-through
     m.ret_tos();
@@ -174,12 +179,15 @@ fn block_reentry_after_home_return() {
 
     let mut home = BytecodeBuilder::new();
     home.push_smi_i8(21); // value-capture x
-    let lit = home.build_block(&mut vm, 0, 1, false, 0, false, |b| {
-        b.push_temp(0); // x
-        b.push_temp(0); // x
-        b.send(plus_sel, 1);
-        b.ret_tos();
-    });
+    let mut blk_b = BytecodeBuilder::new();
+    blk_b.push_temp(0); // x
+    blk_b.push_temp(0); // x
+    blk_b.send(&mut vm, plus_sel, 1);
+    blk_b.ret_tos();
+    let blk_sel = vm.universe.intern(b"aBlock");
+    let blk = blk_b.finish(&mut vm, blk_sel, 0, 1);
+    blk.set_flags(0, 1, false, true, false, false, 0);
+    let lit = home.intern_block_literal(&mut vm, blk);
     home.push_closure(lit, 1);
     home.ret_tos();
     let home_sel = vm.universe.intern(b"home");
@@ -194,7 +202,7 @@ fn block_reentry_after_home_return() {
     for _ in 0..3 {
         let mut caller = BytecodeBuilder::new();
         caller.push_temp(0);
-        caller.send(value_sel, 0);
+        caller.send(&mut vm, value_sel, 0);
         caller.ret_tos();
         let caller_sel = vm.universe.intern(b"caller");
         let caller_method = caller.finish(&mut vm, caller_sel, 1, 0);

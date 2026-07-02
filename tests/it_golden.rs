@@ -114,9 +114,9 @@ fn bc_literals() {
     let assoc = alloc::alloc_slots(&mut vm, assoc_klass).oop();
 
     let mut b = BytecodeBuilder::new();
-    b.push_literal(foo);
-    b.push_literal(bar);
-    b.push_global(assoc);
+    b.push_literal(&mut vm, foo);
+    b.push_literal(&mut vm, bar);
+    b.push_global(&mut vm, assoc);
     b.ret_tos();
     let sel = vm.universe.intern(b"literals");
     let m = b.finish(&mut vm, sel, 0, 0);
@@ -129,7 +129,7 @@ fn bc_wide() {
     let mut vm = common::test_vm();
     let mut b = BytecodeBuilder::new();
     for i in 0..260i64 {
-        b.push_literal(SmallInt::new(i).oop());
+        b.push_literal(&mut vm, SmallInt::new(i).oop());
     }
     b.ret_self();
     let sel = vm.universe.intern(b"wide");
@@ -169,10 +169,10 @@ fn bc_send_narrow() {
     let foo_sel = vm.universe.intern(b"foo");
     let bar_sel = vm.universe.intern(b"bar");
     b.push_self();
-    b.send(foo_sel, 0);
+    b.send(&mut vm, foo_sel, 0);
     b.pop();
     b.push_self();
-    b.send_super(bar_sel, 0);
+    b.send_super(&mut vm, bar_sel, 0);
     b.ret_tos();
     let sel = vm.universe.intern(b"sendNarrow");
     let m = b.finish(&mut vm, sel, 0, 0);
@@ -189,7 +189,7 @@ fn bc_send_wide() {
     let sel_each = vm.universe.intern(b"foo");
     for _ in 0..260 {
         b.push_self();
-        b.send(sel_each, 0);
+        b.send(&mut vm, sel_each, 0);
         b.pop();
     }
     b.ret_self();
@@ -207,7 +207,7 @@ fn bc_send_super_wide() {
     let sel_each = vm.universe.intern(b"foo");
     for _ in 0..260 {
         b.push_self();
-        b.send_super(sel_each, 0);
+        b.send_super(&mut vm, sel_each, 0);
         b.pop();
     }
     b.ret_self();

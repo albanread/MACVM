@@ -110,7 +110,7 @@ impl MethodDictOop {
         let nil = vm.universe.nil_obj;
 
         // Reopening an existing selector overwrites in place — no growth,
-        // tally unchanged.
+        // no allocation, so no staleness risk on this path.
         if let Some(slot) = self.probe_slot(nil, selector) {
             self.set_value_at(slot, method.oop());
             return self;
@@ -118,25 +118,34 @@ impl MethodDictOop {
 
         let capacity = self.capacity();
         let tally = self.tally();
-        let dict = if capacity == 0 || 4 * (tally + 1) > 3 * capacity {
+        let (dict, selector, method) = if capacity == 0 || 4 * (tally + 1) > 3 * capacity {
+            // `self`/`selector`/`method` are bare locals held across
+            // `alloc_method_dict`'s allocation below — this exact spot was
+            // flagged back in S1/S3 ("S7 wraps this in a HandleScope") but
+            // never actually fixed; closed here (S7-9/S7-10, found via
+            // `MACVM_GC_STRESS=1`).
+            let scope = crate::memory::handles::HandleScope::enter(vm);
+            let self_h = scope.handle(vm, self);
+            let selector_h = scope.handle(vm, selector);
+            let method_h = scope.handle(vm, method);
+
             let new_capacity = (capacity * 2).max(8);
             let grown = alloc_method_dict(vm, new_capacity);
-            // `self` (the old dict) stays reachable via the klass's
-            // `methods` slot (not yet overwritten) for the duration of this
-            // reinsert loop — safe pre-GC; S7 wraps this in a HandleScope.
-            for i in 0..self.capacity() {
-                let k = self.key_at(i);
+
+            let old = self_h.get(vm);
+            for i in 0..old.capacity() {
+                let k = old.key_at(i);
                 if k.raw() != nil.raw() {
                     let ks = SymbolOop::try_from(k).expect("MethodDictOop: key is not a Symbol");
-                    let v = MethodOop::try_from(self.value_at(i))
+                    let v = MethodOop::try_from(old.value_at(i))
                         .expect("MethodDictOop: value is not a CompiledMethod");
                     grown.raw_insert_new(nil, ks, v);
                 }
             }
             grown.set_tally(tally);
-            grown
+            (grown, selector_h.get(vm), method_h.get(vm))
         } else {
-            self
+            (self, selector, method)
         };
 
         dict.raw_insert_new(nil, selector, method);
@@ -190,6 +199,8 @@ mod tests {
         VmState::with_options(VmOptions {
             heap_mib: 64,
             trace: Default::default(),
+            gc_stress: false,
+            eden_kb: None,
         })
     }
 

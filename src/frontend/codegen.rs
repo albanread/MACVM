@@ -9,6 +9,7 @@ use std::collections::HashMap;
 
 use crate::bytecode::BytecodeBuilder;
 use crate::memory::alloc;
+use crate::memory::handles::{Handle, HandleScope};
 use crate::oops::layout::{METHOD_ARGC_MAX, METHOD_NCTX_MAX, METHOD_NTEMPS_MAX};
 use crate::oops::smi::SmallInt;
 use crate::oops::wrappers::{ArrayOop, KlassOop, MemOop, MethodOop};
@@ -82,21 +83,50 @@ pub(crate) fn find_class_var(klass: KlassOop, name: Oop) -> Option<Oop> {
 /// Characters/BigInts; Symbols dedupe for free via interning; Arrays/
 /// ByteArrays are explicitly NOT deduped). Fresh per method/block — never
 /// shared across a nested block's own compilation.
+///
+/// Values are stored as `Handle<Oop>`, not `Oop`: a hit returned much
+/// later in the same compile unit, after any number of intervening
+/// allocations, must read the object's CURRENT address, not the one it
+/// had when cached (S7-9 handle discipline — a bare `HashMap<_, Oop>` is
+/// exactly the "invisible root" MacNCL lesson 13 warns about).
+///
+/// Deliberately owns no `HandleScope` of its own (S7-10 — found via
+/// `MACVM_GC_STRESS=1`): two independently, lazily-entered scopes have no
+/// fixed relative entry order, since it depends on whichever of
+/// cache-a-literal / push-a-literal happens first in the source being
+/// compiled. Whichever scope drops first then truncates the other's
+/// still-live entries out from under it — the exact failure that
+/// corrupted a compiled block's literal frame. Every handle this cache
+/// hands out instead comes from `BytecodeBuilder::make_handle`, i.e. the
+/// SAME scope as the builder's own literal-frame handles, which is always
+/// consumed last (via `finish`) — removing the ordering hazard structurally
+/// rather than requiring callers to get manual drop order right.
 #[derive(Default)]
 struct LitCache {
-    doubles: HashMap<u64, Oop>,
-    strings: HashMap<String, Oop>,
-    chars: HashMap<char, Oop>,
-    bigints: HashMap<(bool, Vec<u8>), Oop>,
+    doubles: HashMap<u64, Handle<Oop>>,
+    strings: HashMap<String, Handle<Oop>>,
+    chars: HashMap<char, Handle<Oop>>,
+    bigints: HashMap<(bool, Vec<u8>), Handle<Oop>>,
 }
 
-fn build_literal_value(vm: &mut VmState, cache: &mut LitCache, lit: &Literal) -> Oop {
+impl LitCache {
+    fn new() -> LitCache {
+        LitCache::default()
+    }
+}
+
+fn build_literal_value(
+    vm: &mut VmState,
+    cache: &mut LitCache,
+    bb: &mut BytecodeBuilder,
+    lit: &Literal,
+) -> Oop {
     match lit {
         Literal::Int(v) => SmallInt::new(*v).oop(),
         Literal::BigInt { negative, digits } => {
             let key = (*negative, digits.clone());
-            if let Some(&o) = cache.bigints.get(&key) {
-                return o;
+            if let Some(h) = cache.bigints.get(&key) {
+                return h.get(vm);
             }
             let klass = if *negative {
                 vm.universe.large_neg_int_klass
@@ -107,49 +137,57 @@ fn build_literal_value(vm: &mut VmState, cache: &mut LitCache, lit: &Literal) ->
             for (i, &byte) in digits.iter().enumerate() {
                 b.byte_at_put(i, byte);
             }
-            cache.bigints.insert(key, b.oop());
+            let h = bb.make_handle(vm, b.oop());
+            cache.bigints.insert(key, h);
             b.oop()
         }
         Literal::Float(v) => {
             let bits = v.to_bits();
-            if let Some(&o) = cache.doubles.get(&bits) {
-                return o;
+            if let Some(h) = cache.doubles.get(&bits) {
+                return h.get(vm);
             }
             let d = alloc::alloc_double(vm, *v);
-            cache.doubles.insert(bits, d.oop());
+            let h = bb.make_handle(vm, d.oop());
+            cache.doubles.insert(bits, h);
             d.oop()
         }
         Literal::Char(c) => {
-            if let Some(&o) = cache.chars.get(c) {
-                return o;
+            if let Some(h) = cache.chars.get(c) {
+                return h.get(vm);
             }
             let klass = vm.universe.character_klass;
             let obj = alloc::alloc_slots(vm, klass);
             obj.set_body_oop(0, SmallInt::new(*c as i64).oop());
-            cache.chars.insert(*c, obj.oop());
+            let h = bb.make_handle(vm, obj.oop());
+            cache.chars.insert(*c, h);
             obj.oop()
         }
         Literal::Str(s) => {
-            if let Some(&o) = cache.strings.get(s) {
-                return o;
+            if let Some(h) = cache.strings.get(s) {
+                return h.get(vm);
             }
             let klass = vm.universe.string_klass;
             let b = alloc::alloc_indexable_bytes(vm, klass, s.len());
             for (i, byte) in s.bytes().enumerate() {
                 b.byte_at_put(i, byte);
             }
-            cache.strings.insert(s.clone(), b.oop());
+            let h = bb.make_handle(vm, b.oop());
+            cache.strings.insert(s.clone(), h);
             b.oop()
         }
         Literal::Symbol(s) => vm.universe.intern(s.as_bytes()).oop(),
         Literal::Array(items) => {
             let klass = vm.universe.array_klass;
             let arr = alloc::alloc_indexable_oops(vm, klass, items.len());
+            let arr_h = bb.make_handle(vm, arr.oop());
             for (i, it) in items.iter().enumerate() {
-                let v = build_literal_value(vm, cache, it);
+                let v = build_literal_value(vm, cache, bb, it);
+                // Re-fetched fresh: `build_literal_value`'s own recursive
+                // call (or the allocation inside it) may have moved `arr`.
+                let arr = ArrayOop::try_from(arr_h.get(vm)).expect("array literal stays an array");
                 arr.at_put(i, v);
             }
-            arr.oop()
+            arr_h.get(vm)
         }
         Literal::ByteArray(bytes) => {
             let klass = vm.universe.bytearray_klass;
@@ -185,7 +223,11 @@ struct Ctx<'v> {
     class_side: bool,
     top_level: bool,
     capture: CaptureInfo,
-    inst_var_names: Vec<Oop>,
+    /// Handles, not bare `Oop`s (S7-9): this list is built once, up front,
+    /// then read throughout a compile unit that can span many intervening
+    /// allocations (literals, nested block compiles) — any of which can
+    /// move these symbols.
+    inst_var_names: Vec<Handle<Oop>>,
     /// Whether the compiled unit CURRENTLY being emitted (saved/restored
     /// around `emit_block_literal`) is a block — decides which opcode an
     /// explicit `^` inside a DISSOLVED inlined body (`emit_statement_seq`)
@@ -194,6 +236,12 @@ struct Ctx<'v> {
     /// can't be read off `is_block` the way `emit_body`'s own top-level
     /// Return handling does).
     in_block: bool,
+    /// Backs `inst_var_names`; lives for the whole compile unit (outlives
+    /// every per-block `LitCache`'s own nested scope). Never read directly
+    /// — held only so its `Drop` doesn't truncate `inst_var_names`' handles
+    /// early.
+    #[allow(dead_code)]
+    scope: HandleScope,
 }
 
 impl Ctx<'_> {
@@ -227,11 +275,12 @@ impl Ctx<'_> {
         }
         let sym = self.vm.universe.intern(name.as_bytes());
         if !self.class_side {
-            if let Some(idx) = self
+            let target = sym.oop().raw();
+            let idx = self
                 .inst_var_names
                 .iter()
-                .position(|&o| o.raw() == sym.oop().raw())
-            {
+                .position(|&h| h.get(self.vm).raw() == target);
+            if let Some(idx) = idx {
                 return Ok(VarRef::InstVar(idx as u8));
             }
         }
@@ -299,7 +348,7 @@ fn emit_load(
             b.push_instvar(i);
         }
         VarRef::Global(assoc) => {
-            b.push_global(assoc);
+            b.push_global(cx.vm, assoc);
         }
     }
     Ok(())
@@ -324,7 +373,7 @@ fn emit_store(
             b.store_instvar_pop(i);
         }
         VarRef::Global(assoc) => {
-            b.store_global_pop(assoc);
+            b.store_global_pop(cx.vm, assoc);
         }
     }
     Ok(())
@@ -347,8 +396,8 @@ fn emit_literal(cx: &mut Ctx, cache: &mut LitCache, b: &mut BytecodeBuilder, lit
             b.push_false();
         }
         other => {
-            let v = build_literal_value(cx.vm, cache, other);
-            b.push_literal(v);
+            let v = build_literal_value(cx.vm, cache, b, other);
+            b.push_literal(cx.vm, v);
         }
     }
 }
@@ -456,9 +505,9 @@ fn emit_send(
     }
     let sel = cx.vm.universe.intern(selector.as_bytes());
     if is_super {
-        b.send_super(sel, args.len() as u8);
+        b.send_super(cx.vm, sel, args.len() as u8);
     } else {
-        b.send(sel, args.len() as u8);
+        b.send(cx.vm, sel, args.len() as u8);
     }
     Ok(())
 }
@@ -670,7 +719,7 @@ fn emit_inlined(
             b.push_temp(i_slot);
             b.push_temp(lim_slot);
             let le_sel = cx.vm.universe.intern(b"<=");
-            b.send(le_sel, 1);
+            b.send(cx.vm, le_sel, 1);
             b.br_false_fwd(l2);
 
             hoist.push(HoistScope {
@@ -691,7 +740,7 @@ fn emit_inlined(
             b.push_temp(i_slot);
             b.push_smi_i8(1);
             let plus_sel = cx.vm.universe.intern(b"+");
-            b.send(plus_sel, 1);
+            b.send(cx.vm, plus_sel, 1);
             b.store_temp_pop(i_slot);
             b.jump_back(l0);
             b.bind(l2);
@@ -873,7 +922,7 @@ fn emit_block_literal(
     check_limits(cx, blk.span, argc, info.frame_temp_count, info.nctx)?;
 
     let mut inner_b = BytecodeBuilder::new();
-    let mut inner_cache = LitCache::default();
+    let mut inner_cache = LitCache::new();
     let mut hoist: Vec<HoistScope> = Vec::new();
     let mut next_hoist_slot = info.frame_temp_count + argc;
     emit_prologue(&mut inner_b, &info);
@@ -903,8 +952,7 @@ fn emit_block_literal(
         info.captures_ctx,
         info.nctx,
     );
-
-    let lit = outer_b.intern_block_literal(built);
+    let lit = outer_b.intern_block_literal(cx.vm, built);
     outer_b.push_closure(lit, 0);
     Ok(())
 }
@@ -952,13 +1000,22 @@ fn compile_method_inner(
     method: &mut MethodNode,
 ) -> Result<MethodOop, CompileError> {
     let capture = capture::analyze(method);
-    let inst_var_names = if class_side {
+    let raw_inst_var_names = if class_side {
         Vec::new()
     } else {
         flatten_inst_vars(holder)
     };
     let scope0 = capture.scopes[0].clone();
     let argc = method.params.len();
+
+    // `flatten_inst_vars` itself never allocates (pure klass-chain reads),
+    // but every symbol it returns needs handle protection before codegen's
+    // many subsequent allocations can move it (S7-9).
+    let scope = HandleScope::enter(vm);
+    let inst_var_names: Vec<Handle<Oop>> = raw_inst_var_names
+        .into_iter()
+        .map(|o| scope.handle(vm, o))
+        .collect();
 
     let mut cx = Ctx {
         vm,
@@ -968,11 +1025,12 @@ fn compile_method_inner(
         capture,
         inst_var_names,
         in_block: false,
+        scope,
     };
     check_limits(&cx, method.span, argc, scope0.frame_temp_count, scope0.nctx)?;
 
     let mut b = BytecodeBuilder::new();
-    let mut cache = LitCache::default();
+    let mut cache = LitCache::new();
     let mut hoist: Vec<HoistScope> = Vec::new();
     let mut next_hoist_slot = scope0.frame_temp_count + argc;
     emit_prologue(&mut b, &scope0);
@@ -1023,6 +1081,8 @@ mod tests {
         VmState::with_options(VmOptions {
             heap_mib: 64,
             trace: Default::default(),
+            gc_stress: false,
+            eden_kb: None,
         })
     }
 

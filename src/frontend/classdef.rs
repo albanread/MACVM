@@ -5,6 +5,7 @@
 //! version — the bytecode-level `subclass:` primitive is a later sprint).
 
 use crate::memory::alloc;
+use crate::memory::handles::HandleScope;
 use crate::oops::wrappers::{ArrayOop, KlassOop, MemOop, SymbolOop};
 use crate::oops::{Format, Oop};
 use crate::runtime::vm_state::VmState;
@@ -39,25 +40,34 @@ fn create_klass(vm: &mut VmState, super_klass: KlassOop, node: &ClassDefNode) ->
         .universe
         .new_klass(super_klass, &node.name, format, untagged, nis);
 
+    // `klass` is fresh eden garbage — not yet linked into any global, so
+    // not reachable from any GC root — until `install_class_def` declares
+    // it. Every allocation below can move it, so it's handle-protected for
+    // the rest of this function (and threaded into `append_class_var` the
+    // same way).
+    let scope = HandleScope::enter(vm);
+    let klass_h = scope.handle(vm, klass);
+
     let array_klass = vm.universe.array_klass;
-    let iv_syms: Vec<Oop> = node
-        .inst_vars
-        .iter()
-        .map(|n| vm.universe.intern(n.as_bytes()).oop())
-        .collect();
-    let ivn = alloc::alloc_indexable_oops(vm, array_klass, iv_syms.len());
-    for (i, &s) in iv_syms.iter().enumerate() {
-        ivn.at_put(i, s);
+    // Interned directly into `ivn` rather than collected into a `Vec<Oop>`
+    // first: `Universe::intern` never allocates through the scavenge-aware
+    // choke point (SPEC §7.2's genesis-era raw eden path), so nothing here
+    // needs its own handle as long as each symbol is consumed before the
+    // next allocating call.
+    let ivn = alloc::alloc_indexable_oops(vm, array_klass, node.inst_vars.len());
+    for (i, n) in node.inst_vars.iter().enumerate() {
+        let s = vm.universe.intern(n.as_bytes());
+        ivn.at_put(i, s.oop());
     }
-    klass.set_inst_var_names(ivn.oop());
+    klass_h.get(vm).set_inst_var_names(ivn.oop());
 
     let cvs = alloc::alloc_indexable_oops(vm, array_klass, 0);
-    klass.set_class_vars(cvs.oop());
+    klass_h.get(vm).set_class_vars(cvs.oop());
     for name in &node.class_vars {
         let sym = vm.universe.intern(name.as_bytes());
-        append_class_var(vm, klass, sym);
+        append_class_var(vm, klass_h.get(vm), sym);
     }
-    klass
+    klass_h.get(vm)
 }
 
 fn append_class_var(vm: &mut VmState, klass: KlassOop, sym: SymbolOop) {
@@ -68,21 +78,30 @@ fn append_class_var(vm: &mut VmState, klass: KlassOop, sym: SymbolOop) {
     let association_klass = vm.universe.association_klass;
     let nil = vm.universe.nil_obj;
 
-    let assoc = alloc::alloc_slots(vm, association_klass);
-    assoc.set_body_oop(0, sym.oop());
-    assoc.set_body_oop(1, nil);
+    let scope = HandleScope::enter(vm);
+    // `klass` may itself still be unlinked eden garbage (see
+    // `create_klass`'s caller-side handle) and `sym`, though reachable via
+    // the symbol table root, is a separate unrooted copy in this bare
+    // parameter — both need protecting across the allocations below.
+    let klass_h = scope.handle(vm, klass);
+    let sym_h = scope.handle(vm, sym);
 
-    let old_len = ArrayOop::try_from(klass.class_vars())
+    let assoc = alloc::alloc_slots(vm, association_klass);
+    assoc.set_body_oop(0, sym_h.get(vm).oop());
+    assoc.set_body_oop(1, nil);
+    let assoc_h = scope.handle(vm, assoc);
+
+    let old_len = ArrayOop::try_from(klass_h.get(vm).class_vars())
         .map(|a| a.len())
         .unwrap_or(0);
     let new_arr = alloc::alloc_indexable_oops(vm, array_klass, old_len + 1);
-    if let Some(old) = ArrayOop::try_from(klass.class_vars()) {
+    if let Some(old) = ArrayOop::try_from(klass_h.get(vm).class_vars()) {
         for i in 0..old_len {
             new_arr.at_put(i, old.at(i));
         }
     }
-    new_arr.at_put(old_len, assoc.oop());
-    klass.set_class_vars(new_arr.oop());
+    new_arr.at_put(old_len, assoc_h.get(vm).oop());
+    klass_h.get(vm).set_class_vars(new_arr.oop());
 }
 
 fn reopen_klass(
@@ -106,9 +125,16 @@ fn reopen_klass(
             format!("cannot change shape of existing class {}", node.name),
         ));
     }
+    // `klass` is reachable from the globals root, but this loop's own
+    // local copy isn't updated when a scavenge inside `append_class_var`
+    // moves it — a later iteration would call in with a stale address
+    // without re-reading through a handle each time (same hazard
+    // `create_klass`'s loop has).
+    let scope = HandleScope::enter(vm);
+    let klass_h = scope.handle(vm, klass);
     for name in &node.class_vars {
         let sym = vm.universe.intern(name.as_bytes());
-        append_class_var(vm, klass, sym);
+        append_class_var(vm, klass_h.get(vm), sym);
     }
     Ok(())
 }
@@ -167,18 +193,28 @@ pub fn install_class_def(vm: &mut VmState, node: &mut ClassDefNode) -> Result<()
         }
     };
 
-    let assoc = crate::runtime::globals::global_declare(vm, name_sym);
+    // `klass` (freshly created, in the `None` arm) isn't linked into the
+    // globals until `global_declare` below runs, and both that call and
+    // every `compile_method` in the loop allocate — protect `klass` and
+    // `name_sym` (a bare, unrooted copy of an otherwise-rooted symbol) for
+    // the rest of this function.
+    let scope = HandleScope::enter(vm);
+    let klass_h = scope.handle(vm, klass);
+    let name_sym_h = scope.handle(vm, name_sym);
+
+    let assoc = crate::runtime::globals::global_declare(vm, name_sym_h.get(vm));
     MemOop::try_from(assoc)
         .expect("global association is a mem oop")
-        .set_body_oop(1, klass.oop());
+        .set_body_oop(1, klass_h.get(vm).oop());
 
     for method in &mut node.methods {
-        let compiled = super::codegen::compile_method(vm, klass, method.class_side, method)?;
+        let compiled =
+            super::codegen::compile_method(vm, klass_h.get(vm), method.class_side, method)?;
         let sel = vm.universe.intern(method.pattern_selector.as_bytes());
         let target = if method.class_side {
-            klass.klass()
+            klass_h.get(vm).klass()
         } else {
-            klass
+            klass_h.get(vm)
         };
         crate::runtime::lookup::install_method(vm, target, sel, compiled);
     }

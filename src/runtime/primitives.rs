@@ -697,7 +697,7 @@ fn prim_at(_vm: &mut VmState, args: &[Oop]) -> PrimResult {
     PrimResult::Ok(a.at((i - 1) as usize))
 }
 
-fn prim_at_put(_vm: &mut VmState, args: &[Oop]) -> PrimResult {
+fn prim_at_put(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     let Some(a) = ArrayOop::try_from(args[0]) else {
         return PrimResult::Fail;
     };
@@ -708,7 +708,7 @@ fn prim_at_put(_vm: &mut VmState, args: &[Oop]) -> PrimResult {
     if i < 1 || i as usize > a.len() {
         return PrimResult::Fail;
     }
-    a.at_put((i - 1) as usize, args[2]);
+    crate::memory::store::store_tail_oop(vm, a.as_mem(), (i - 1) as usize, args[2]);
     PrimResult::Ok(args[2])
 }
 
@@ -1150,6 +1150,8 @@ mod tests {
         VmState::with_options(VmOptions {
             heap_mib: 64,
             trace: Default::default(),
+            gc_stress: false,
+            eden_kb: None,
         })
     }
 
@@ -1460,7 +1462,7 @@ mod tests {
     /// without needing any real computation inside the block body.
     fn make_block_closure(vm: &mut VmState, argc: usize) -> Oop {
         let mut home = crate::bytecode::BytecodeBuilder::new();
-        let lit = home.build_block(vm, argc, argc, false, 0, false, |b| {
+        let lit = home.build_block(vm, argc, argc, false, 0, false, |b, _vm| {
             b.ret_self();
         });
         home.push_closure(lit, 0);

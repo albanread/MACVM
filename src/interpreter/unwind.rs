@@ -348,6 +348,8 @@ mod tests {
         VmState::with_options(VmOptions {
             heap_mib: 64,
             trace: Default::default(),
+            gc_stress: false,
+            eden_kb: None,
         })
     }
 
@@ -499,12 +501,12 @@ mod tests {
         crate::runtime::lookup::install_method(&mut vm, closure_klass, value_sel, value_method);
 
         let mut home = BytecodeBuilder::new();
-        let lit = home.build_block(&mut vm, 0, 0, false, 0, false, |b| {
+        let lit = home.build_block(&mut vm, 0, 0, false, 0, false, |b, _vm| {
             b.push_smi_i8(42);
             b.nlr_tos();
         });
         home.push_closure(lit, 0);
-        home.send(value_sel, 0);
+        home.send(&mut vm, value_sel, 0);
         home.push_smi_i8(99); // must never be reached
         home.ret_tos();
         let sel = vm.universe.intern(b"run");
@@ -566,23 +568,23 @@ mod tests {
         let cleanup_str = string_literal(&mut vm, "cleanup");
 
         let mut home = BytecodeBuilder::new();
-        let protected_lit = home.build_block(&mut vm, 0, 0, false, 0, false, |b| {
+        let protected_lit = home.build_block(&mut vm, 0, 0, false, 0, false, |b, vm| {
             b.push_self();
-            b.push_literal(body_str);
-            b.send(print_sel, 1);
+            b.push_literal(vm, body_str);
+            b.send(vm, print_sel, 1);
             b.pop();
             b.push_smi_i8(7);
             b.ret_tos();
         });
-        let handler_lit = home.build_block(&mut vm, 0, 0, false, 0, false, |b| {
+        let handler_lit = home.build_block(&mut vm, 0, 0, false, 0, false, |b, vm| {
             b.push_self();
-            b.push_literal(cleanup_str);
-            b.send(print_sel, 1);
+            b.push_literal(vm, cleanup_str);
+            b.send(vm, print_sel, 1);
             b.ret_self();
         });
         home.push_closure(protected_lit, 0);
         home.push_closure(handler_lit, 0);
-        home.send(ensure_sel, 1);
+        home.send(&mut vm, ensure_sel, 1);
         home.ret_tos();
         let sel = vm.universe.intern(b"run");
         let method = home.finish(&mut vm, sel, 0, 0);
@@ -614,14 +616,14 @@ mod tests {
         // can't share one `&mut VmState` borrow — see
         // `BytecodeBuilder::intern_block_literal`'s doc).
         let handler_inner_blk =
-            crate::bytecode::build_standalone_block(&mut vm, 0, 0, false, 0, false, |h| {
+            crate::bytecode::build_standalone_block(&mut vm, 0, 0, false, 0, false, |h, vm| {
                 h.push_self();
-                h.push_literal(inner_str);
-                h.send(print_sel, 1);
+                h.push_literal(vm, inner_str);
+                h.send(vm, print_sel, 1);
                 h.ret_self();
             });
         let nlr_blk =
-            crate::bytecode::build_standalone_block(&mut vm, 0, 0, false, 0, false, |b| {
+            crate::bytecode::build_standalone_block(&mut vm, 0, 0, false, 0, false, |b, _vm| {
                 b.push_smi_i8(42);
                 b.nlr_tos();
             });
@@ -630,23 +632,23 @@ mod tests {
         // The inner-most block's home propagates from L_outer's own closure
         // (L_outer is itself a block created directly in `run`, so ITS home
         // is `run`) — this is the classic NLR-propagation case.
-        let outer_lit = run_b.build_block(&mut vm, 0, 0, false, 0, false, |lo| {
-            let handler_inner_lit = lo.intern_block_literal(handler_inner_blk);
-            let nlr_lit = lo.intern_block_literal(nlr_blk);
+        let outer_lit = run_b.build_block(&mut vm, 0, 0, false, 0, false, |lo, vm| {
+            let handler_inner_lit = lo.intern_block_literal(vm, handler_inner_blk);
+            let nlr_lit = lo.intern_block_literal(vm, nlr_blk);
             lo.push_closure(nlr_lit, 0);
             lo.push_closure(handler_inner_lit, 0);
-            lo.send(ensure_sel, 1);
+            lo.send(vm, ensure_sel, 1);
             lo.ret_tos(); // unreachable: the NLR above always fires first
         });
-        let handler_outer_lit = run_b.build_block(&mut vm, 0, 0, false, 0, false, |h| {
+        let handler_outer_lit = run_b.build_block(&mut vm, 0, 0, false, 0, false, |h, vm| {
             h.push_self();
-            h.push_literal(outer_str);
-            h.send(print_sel, 1);
+            h.push_literal(vm, outer_str);
+            h.send(vm, print_sel, 1);
             h.ret_self();
         });
         run_b.push_closure(outer_lit, 0);
         run_b.push_closure(handler_outer_lit, 0);
-        run_b.send(ensure_sel, 1);
+        run_b.send(&mut vm, ensure_sel, 1);
         run_b.ret_tos(); // unreachable: home receives the NLR directly
         let run_method_oop = run_b.finish(&mut vm, run_sel, 0, 0);
         let object_klass = vm.universe.object_klass;
@@ -654,11 +656,11 @@ mod tests {
 
         let mut driver = BytecodeBuilder::new();
         driver.push_self();
-        driver.send(run_sel, 0);
+        driver.send(&mut vm, run_sel, 0);
         driver.store_temp_pop(0);
         driver.push_self();
-        driver.push_literal(done_str);
-        driver.send(print_sel, 1);
+        driver.push_literal(&mut vm, done_str);
+        driver.send(&mut vm, print_sel, 1);
         driver.pop();
         driver.push_temp(0);
         driver.ret_tos();
@@ -688,15 +690,15 @@ mod tests {
             let marker_str = string_literal(vm, "curtailed");
 
             let handler_lit =
-                crate::bytecode::build_standalone_block(vm, 0, 0, false, 0, false, |h| {
+                crate::bytecode::build_standalone_block(vm, 0, 0, false, 0, false, |h, vm| {
                     h.push_self();
-                    h.push_literal(marker_str);
-                    h.send(print_sel, 1);
+                    h.push_literal(vm, marker_str);
+                    h.send(vm, print_sel, 1);
                     h.ret_self();
                 });
 
             let mut run_b = BytecodeBuilder::new();
-            let protected_lit = run_b.build_block(vm, 0, 0, false, 0, false, |b| {
+            let protected_lit = run_b.build_block(vm, 0, 0, false, 0, false, |b, _vm| {
                 if do_nlr {
                     b.push_smi_i8(1);
                     b.nlr_tos();
@@ -706,9 +708,9 @@ mod tests {
                 }
             });
             run_b.push_closure(protected_lit, 0);
-            let hl = run_b.intern_block_literal(handler_lit);
+            let hl = run_b.intern_block_literal(vm, handler_lit);
             run_b.push_closure(hl, 0);
-            run_b.send(if_curtailed_sel, 1);
+            run_b.send(vm, if_curtailed_sel, 1);
             run_b.ret_tos();
             let run_sel = vm.universe.intern(b"run");
             let method = run_b.finish(vm, run_sel, 0, 0);

@@ -40,6 +40,39 @@ impl MemOop {
         unsafe { self.word_ptr(MARK_OFFSET).write(m.word()) }
     }
 
+    /// The raw header word, with NO validation that it's actually a mark
+    /// (SPEC §2.2 / `sprint_s07_detail.md` §Design: once a scavenge
+    /// installs forwarding, the header word is a tagged oop, not a mark —
+    /// `mark()`/`Mark::from_word` would panic on it). Use this, plus
+    /// [`is_forwarded`](MemOop::is_forwarded)/[`forwardee`](MemOop::forwardee),
+    /// whenever the object might already be forwarded.
+    pub fn mark_word_raw(self) -> u64 {
+        // SAFETY: as `mark()` — every allocated object has a header.
+        unsafe { self.word_ptr(MARK_OFFSET).read() }
+    }
+
+    /// `true` iff this object's header has already been overwritten with a
+    /// forwarding pointer by a scavenge in progress.
+    pub fn is_forwarded(self) -> bool {
+        super::mark::word_is_forwarded(self.mark_word_raw())
+    }
+
+    /// The forwardee oop. Caller must ensure `is_forwarded()`.
+    pub fn forwardee(self) -> Oop {
+        super::mark::forwardee(self.mark_word_raw())
+    }
+
+    /// Install forwarding: overwrite this (from-space) copy's header with
+    /// `target`'s oop (SPEC §2.2's tag-01 discrimination). The body is left
+    /// untouched — callers that still need to read it (e.g. sizing a
+    /// not-yet-scanned object during the Cheney loop) must do so before
+    /// calling this, or via the target copy instead.
+    pub fn install_forwarding(self, target: Oop) {
+        // SAFETY: as `set_mark` — overwrites the same header word with a
+        // different tag; the slot itself always exists.
+        unsafe { self.word_ptr(MARK_OFFSET).write(target.raw()) }
+    }
+
     /// The raw klass field, without validating it holds a mem oop. Use this
     /// (never [`MemOop::klass`]) on objects whose klass field may still be
     /// a genesis placeholder — it never panics and never performs a wild
@@ -96,8 +129,13 @@ impl MemOop {
     /// of an indexable-shaped object, given its klass's `non_indexable_size`.
     /// The slot itself is always within the guaranteed-allocated minimum
     /// (`nis + 1` words), so this bypasses the dynamic bounds check that
-    /// would otherwise need the very value being computed.
-    fn raw_size_slot(self, nis: usize) -> usize {
+    /// would otherwise need the very value being computed. `pub(crate)`:
+    /// `memory::scavenge`'s `object_size_for_copy` (SPEC §7.3 A5) needs
+    /// this directly — it computes size using a caller-resolved klass
+    /// (chasing that klass's OWN forwarding first) rather than
+    /// `instance_size_words()`'s `self.klass()`, which would try to
+    /// re-derive the klass from a field that might itself be forwarded.
+    pub(crate) fn raw_size_slot(self, nis: usize) -> usize {
         let idx = nis - HEADER_WORDS;
         let raw = self.raw_body_word(idx);
         SmallInt::try_from(Oop::from_raw(raw))
@@ -128,6 +166,18 @@ impl MemOop {
     }
 
     // --- body (general, dynamically bounds-checked) --------------------
+
+    /// The untagged address of body slot `index` — `memory::store`'s only
+    /// use for this (SPEC §7.4): it needs the slot's own address to
+    /// compute which card to dirty, not just to write through it.
+    pub fn body_addr(self, index: usize) -> usize {
+        let bound = self.body_word_count();
+        debug_assert!(
+            index < bound,
+            "body_addr: index {index} out of bounds ({bound})"
+        );
+        self.body_ptr(index) as usize
+    }
 
     pub fn body_oop(self, index: usize) -> Oop {
         let bound = self.body_word_count();
@@ -219,5 +269,40 @@ impl MemOop {
     pub fn set_tail_oop_at(self, i: usize, v: Oop) {
         let idx = self.tail_start_word() + i;
         self.set_body_oop(idx, v);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::layout::MEM_TAG;
+    use super::*;
+
+    /// A minimal 2-word (mark + klass) fake object over a self-owned
+    /// buffer — `oops::` cannot depend on `memory::` (layering: memory
+    /// builds on oops, not the reverse), so this can't reuse
+    /// `Universe::genesis` the way `memory::` tests do. The returned `Box`
+    /// must outlive the `MemOop` (it owns the backing words).
+    fn fake_object() -> (Box<[u64]>, MemOop) {
+        let mut buf = vec![Mark::pristine().word(), 0].into_boxed_slice();
+        let addr = buf.as_mut_ptr() as u64;
+        debug_assert_eq!(addr & 0b111, 0, "Vec<u64> must be 8-byte aligned");
+        let oop = Oop::from_raw(addr + MEM_TAG);
+        let mem = MemOop::try_from(oop).expect("tag-level mem oop construction");
+        (buf, mem)
+    }
+
+    /// `tests_s07.md`'s `mark_forward_roundtrip`: install forwarding,
+    /// `is_forwarded`, read forwardee; a non-forwarded mark says no.
+    #[test]
+    fn mark_forward_roundtrip() {
+        let (_buf, obj) = fake_object();
+        assert!(!obj.is_forwarded());
+
+        let target_addr = 0x8000u64;
+        let target = Oop::from_raw(target_addr + MEM_TAG);
+        obj.install_forwarding(target);
+
+        assert!(obj.is_forwarded());
+        assert_eq!(obj.forwardee().raw(), target.raw());
     }
 }

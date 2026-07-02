@@ -3,8 +3,8 @@
 //! The VM is at the scaffold stage; this just proves the crate builds and
 //! links. Hidden test hooks observed via a real subprocess (integration
 //! tests can't otherwise see this process's own exit code or exhaustive
-//! stderr output): `--selftest-alloc-loop` allocates until eden is
-//! exhausted (`tests/it_memory.rs::eden_exhaustion_aborts`);
+//! stderr output): `--selftest-alloc-loop` allocates rooted objects until
+//! the heap is genuinely exhausted (`tests/it_memory.rs::eden_exhaustion_aborts`);
 //! `--selftest-stack-overflow` pushes until the process stack is exhausted
 //! (`tests/it_interp.rs::process_stack_overflow_exits_cleanly`);
 //! `--selftest-trace-diamond` runs the k_diamond kernel under
@@ -170,11 +170,19 @@ fn print_result(vm: &mut VmState, result: Oop) -> String {
     macvm::memory::print_oop(&vm.universe, result)
 }
 
+/// Allocates rooted (process-stack-pushed) arrays until the heap is
+/// genuinely exhausted (S7-10: with a real scavenger wired into the
+/// allocation choke point, unrooted garbage would just get reclaimed
+/// forever and this would hang instead of exiting — `klass` is re-read
+/// from `vm.universe` every iteration rather than captured once outside
+/// the loop, since a bare local can go stale across the scavenges this
+/// loop now triggers).
 fn selftest_alloc_loop() -> ! {
     let mut vm = VmState::new();
-    let klass = vm.universe.array_klass;
     loop {
-        let _ = alloc::alloc_indexable_oops(&mut vm, klass, 1000);
+        let klass = vm.universe.array_klass;
+        let arr = alloc::alloc_indexable_oops(&mut vm, klass, 1000);
+        vm.stack.push(arr.oop());
     }
 }
 
@@ -190,6 +198,8 @@ fn selftest_trace_diamond() -> ! {
     let mut vm = VmState::with_options(VmOptions {
         heap_mib: 64,
         trace: macvm::runtime::TraceFlags::parse("bytecode"),
+        gc_stress: false,
+        eden_kb: None,
     });
     let mut b = BytecodeBuilder::new();
     let l1 = b.new_label();
@@ -215,7 +225,7 @@ fn selftest_dnu_fallback() -> ! {
     let sel = vm.universe.intern(b"bar");
     let mut b = BytecodeBuilder::new();
     b.push_temp(0);
-    b.send(sel, 0);
+    b.send(&mut vm, sel, 0);
     b.ret_tos();
     let caller_sel = vm.universe.intern(b"caller");
     let caller = b.finish(&mut vm, caller_sel, 1, 0);

@@ -8,9 +8,26 @@
 //! after the whole 3-byte instruction). `jump_fwd`/`br_*_fwd`:
 //! `target = next_bci + distance` (distance 0 = fall straight through).
 //! `jump_back`: `target = next_bci - distance`.
+//!
+//! **S7-9/S7-10 handle discipline.** `literals`/`ic_sites` accumulate oop
+//! values across an entire build session (every `push_literal`/`send`/
+//! `send_super`/`add_send` call), which can span many intervening
+//! allocations (nested block compiles, other literals, sends) — exactly
+//! the invisible-root shape S7-9's `Handle` exists to close: a bare
+//! `Vec<Oop>`/`Vec<(SymbolOop, u8)>` accumulated this way is untouched by
+//! a scavenge and goes stale the moment anything referenced moves.
+//! `literals`/`ic_sites` are therefore `Handle`-backed, and every method
+//! that can add to them takes `vm: &mut VmState` — confirmed necessary (not
+//! just theoretical) by S7-10's `MACVM_GC_STRESS=1` run, which failed on
+//! even a trivial `Transcript show:` before this fix. `BytecodeBuilder`
+//! itself still needs no `vm` at construction (`new()`'s signature is
+//! unchanged — its own `HandleScope` is entered lazily, on the first call
+//! that needs to protect a value), so the ~50 test-only `BytecodeBuilder::
+//! new()` call sites that never push a literal or a send are untouched.
 
 use std::collections::HashMap;
 
+use crate::memory::handles::{Handle, HandleScope};
 use crate::oops::layout::{
     BCI_SENTINEL_BASE, IC_GUARD_OFFSET, IC_META_ARGC_SHIFT, IC_META_OFFSET, IC_SEL_OFFSET,
     IC_STRIDE, IC_TARGET_OFFSET, METHOD_ARGC_MAX, METHOD_NTEMPS_MAX,
@@ -32,11 +49,21 @@ enum LabelState {
 
 pub struct BytecodeBuilder {
     code: Vec<u8>,
-    literals: Vec<Oop>,
+    literals: Vec<Handle<Oop>>,
+    /// Dedup cache: `Oop::raw()` at the MOMENT of insertion. Never updated
+    /// when the underlying value later moves — a stale entry just misses a
+    /// dedup opportunity (an extra literal-frame slot), never a
+    /// correctness issue, since the actual storage (`literals`) is
+    /// handle-backed regardless.
     literal_index: HashMap<u64, usize>,
     n_ics: usize,
-    ic_sites: Vec<(SymbolOop, u8)>,
+    ic_sites: Vec<(Handle<SymbolOop>, u8)>,
     labels: Vec<LabelState>,
+    /// Lazily entered on the first `push_literal`/`add_send` call — kept
+    /// alive for this builder's whole session so every `Handle` created
+    /// through it stays valid until `finish()` (or `Drop`, for a session
+    /// abandoned mid-build, e.g. a compile error) consumes/releases it.
+    scope: Option<HandleScope>,
 }
 
 impl Default for BytecodeBuilder {
@@ -54,6 +81,7 @@ impl BytecodeBuilder {
             n_ics: 0,
             ic_sites: Vec::new(),
             labels: Vec::new(),
+            scope: None,
         }
     }
 
@@ -96,20 +124,40 @@ impl BytecodeBuilder {
     /// Interns `o` into the literal frame (deduplicating by raw oop
     /// identity) and emits `push_literal`, auto-widening to the `u16` form
     /// (0x12) when the literal's index exceeds `u8::MAX`.
-    pub fn push_literal(&mut self, o: Oop) -> &mut Self {
-        let idx = self.intern_literal(o);
+    pub fn push_literal(&mut self, vm: &mut VmState, o: Oop) -> &mut Self {
+        let idx = self.intern_literal(vm, o);
         self.emit_literal_ref(idx);
         self
     }
 
-    fn intern_literal(&mut self, o: Oop) -> usize {
+    fn intern_literal(&mut self, vm: &mut VmState, o: Oop) -> usize {
         if let Some(&idx) = self.literal_index.get(&o.raw()) {
             return idx;
         }
+        let h = self.make_handle(vm, o);
         let idx = self.literals.len();
-        self.literals.push(o);
+        self.literals.push(h);
         self.literal_index.insert(o.raw(), idx);
         idx
+    }
+
+    /// Wraps `o` in a `Handle` backed by this builder's own (lazily
+    /// entered) session scope. Exposed so `frontend::codegen`'s `LitCache`
+    /// — a purely local dedup helper that must never outlive the builder
+    /// it feeds — shares THIS scope instead of owning an independent one.
+    /// Two independently, lazily-entered scopes have no fixed relative
+    /// entry order (whichever construct happens to push first "wins" the
+    /// smaller `saved_len`), so whichever one drops first can truncate the
+    /// other's still-live entries out from under it; sharing one scope
+    /// (this builder's, always the one consumed last, via `finish`)
+    /// removes the ordering hazard entirely rather than requiring every
+    /// caller to get manual drop ordering right (S7-10, found via
+    /// `MACVM_GC_STRESS=1` corrupting a compiled block's literal frame).
+    pub(crate) fn make_handle(&mut self, vm: &mut VmState, o: Oop) -> Handle<Oop> {
+        if self.scope.is_none() {
+            self.scope = Some(HandleScope::enter(vm));
+        }
+        self.scope.as_ref().unwrap().handle(vm, o)
     }
 
     fn emit_literal_ref(&mut self, idx: usize) {
@@ -167,14 +215,14 @@ impl BytecodeBuilder {
     /// `assoc` is an Association literal (SPEC §4.1: index 0 = key, index 1
     /// = value, pinned in `sprint_s01`'s genesis); `push_global` pushes its
     /// value, `store_global_pop` writes it.
-    pub fn push_global(&mut self, assoc: Oop) -> &mut Self {
-        let idx = self.intern_literal(assoc);
+    pub fn push_global(&mut self, vm: &mut VmState, assoc: Oop) -> &mut Self {
+        let idx = self.intern_literal(vm, assoc);
         self.emit_u8(OP_PUSH_GLOBAL);
         self.emit_u8(idx as u8);
         self
     }
-    pub fn store_global_pop(&mut self, assoc: Oop) -> &mut Self {
-        let idx = self.intern_literal(assoc);
+    pub fn store_global_pop(&mut self, vm: &mut VmState, assoc: Oop) -> &mut Self {
+        let idx = self.intern_literal(vm, assoc);
         self.emit_u8(OP_STORE_GLOBAL_POP);
         self.emit_u8(idx as u8);
         self
@@ -217,22 +265,27 @@ impl BytecodeBuilder {
 
     /// Appends a new 4-word IC site for `(selector, argc)` and returns its
     /// index — the low-level primitive `send`/`send_super` build on.
-    pub fn add_send(&mut self, selector: SymbolOop, argc: u8) -> u16 {
+    pub fn add_send(&mut self, vm: &mut VmState, selector: SymbolOop, argc: u8) -> u16 {
         let idx = self.n_ics;
         assert!(idx <= u16::MAX as usize, "add_send: too many send sites");
         self.n_ics += 1;
-        self.ic_sites.push((selector, argc));
+        if self.scope.is_none() {
+            self.scope = Some(HandleScope::enter(vm));
+        }
+        let h = self.scope.as_ref().unwrap().handle(vm, selector);
+        self.ic_sites.push((h, argc));
         idx as u16
     }
 
     fn emit_send(
         &mut self,
+        vm: &mut VmState,
         op_narrow: u8,
         op_wide: u8,
         selector: SymbolOop,
         argc: u8,
     ) -> &mut Self {
-        let ic_idx = self.add_send(selector, argc);
+        let ic_idx = self.add_send(vm, selector, argc);
         if ic_idx <= u8::MAX as u16 {
             self.emit_u8(op_narrow);
             self.emit_u8(ic_idx as u8);
@@ -243,12 +296,12 @@ impl BytecodeBuilder {
         self
     }
 
-    pub fn send(&mut self, selector: SymbolOop, argc: u8) -> &mut Self {
-        self.emit_send(OP_SEND, OP_SEND_W, selector, argc)
+    pub fn send(&mut self, vm: &mut VmState, selector: SymbolOop, argc: u8) -> &mut Self {
+        self.emit_send(vm, OP_SEND, OP_SEND_W, selector, argc)
     }
 
-    pub fn send_super(&mut self, selector: SymbolOop, argc: u8) -> &mut Self {
-        self.emit_send(OP_SEND_SUPER, OP_SEND_SUPER_W, selector, argc)
+    pub fn send_super(&mut self, vm: &mut VmState, selector: SymbolOop, argc: u8) -> &mut Self {
+        self.emit_send(vm, OP_SEND_SUPER, OP_SEND_SUPER_W, selector, argc)
     }
 
     // --- closures (SPEC §2.3, §4.2, §5.4, S4) -------------------------------
@@ -269,10 +322,10 @@ impl BytecodeBuilder {
         has_ctx: bool,
         nctx: usize,
         captures_ctx: bool,
-        body: impl FnOnce(&mut BytecodeBuilder),
+        body: impl FnOnce(&mut BytecodeBuilder, &mut VmState),
     ) -> usize {
         let blk = build_standalone_block(vm, argc, ntemps, has_ctx, nctx, captures_ctx, body);
-        self.intern_block_literal(blk)
+        self.intern_block_literal(vm, blk)
     }
 
     /// Interns an already-built `CompiledBlock` (e.g. from
@@ -282,8 +335,8 @@ impl BytecodeBuilder {
     /// re-entrantly (its `body` closure would need a second concurrent
     /// `&mut VmState`) — build inner blocks standalone first, then intern
     /// them into the outer block's own builder from *within* its `body`.
-    pub fn intern_block_literal(&mut self, blk: MethodOop) -> usize {
-        self.intern_literal(blk.oop())
+    pub fn intern_block_literal(&mut self, vm: &mut VmState, blk: MethodOop) -> usize {
+        self.intern_literal(vm, blk.oop())
     }
 
     /// `lit` must fit the opcode's `u8` literal-index operand (SPEC §4.2
@@ -419,7 +472,17 @@ impl BytecodeBuilder {
             "BytecodeBuilder::finish: empty method body"
         );
 
+        // `method` is fresh, unrooted eden garbage the moment it's
+        // allocated, and `selector` (the parameter, reachable via the
+        // symbol table root but a separate unrooted copy here) is held
+        // across two further allocating calls below — both need
+        // protecting (S7-9). `self.literals`/`self.ic_sites` are already
+        // handle-backed by `intern_literal`/`add_send`.
+        let scope = crate::memory::handles::HandleScope::enter(vm);
+        let selector_h = scope.handle(vm, selector.oop());
+
         let method = crate::memory::alloc::alloc_method(vm, self.code.len());
+        let method_h = scope.handle(vm, method.oop());
         for (i, &b) in self.code.iter().enumerate() {
             method.set_bytecode_byte(i, b);
         }
@@ -445,10 +508,22 @@ impl BytecodeBuilder {
         let array_klass = vm.universe.array_klass;
         let literals =
             crate::memory::alloc::alloc_indexable_oops(vm, array_klass, self.literals.len());
+        let literals_h = scope.handle(vm, literals.oop());
         for (i, &lit) in self.literals.iter().enumerate() {
-            literals.at_put(i, lit);
+            let v = lit.get(vm);
+            literals.at_put(i, v);
         }
 
+        // Re-read fresh: `array_klass` above was captured before the
+        // `literals` allocation, which — under `MACVM_GC_STRESS=1` — can
+        // scavenge and move it. A stale `KlassOop` local re-used here
+        // isn't caught by the usual "already forwarded" check the way a
+        // single re-use would be: `alloc_words`'s own internal handle
+        // protects whatever value it's GIVEN, but a value that's already
+        // TWO scavenges stale resolves its one-hop forwarding to an
+        // address that has itself since moved again (S7-10, found via
+        // `MACVM_GC_STRESS=1` corrupting a compiled method's `ics` array).
+        let array_klass = vm.universe.array_klass;
         let ics: ArrayOop =
             crate::memory::alloc::alloc_indexable_oops(vm, array_klass, self.n_ics * IC_STRIDE);
         let nil = vm.universe.nil_obj;
@@ -457,7 +532,7 @@ impl BytecodeBuilder {
             // Epoch 0 matches a fresh `VmState::ic_epoch` — harmless for an
             // empty-guard IC, since rows 1/2 never check the epoch.
             let meta = (argc as i64) << IC_META_ARGC_SHIFT;
-            ics.at_put(base + IC_SEL_OFFSET, selector.oop());
+            ics.at_put(base + IC_SEL_OFFSET, selector.get(vm).oop());
             ics.at_put(
                 base + IC_META_OFFSET,
                 crate::oops::smi::SmallInt::new(meta).oop(),
@@ -466,7 +541,14 @@ impl BytecodeBuilder {
             ics.at_put(base + IC_TARGET_OFFSET, nil);
         }
 
-        method.set_selector(selector.oop());
+        // Re-derived fresh: `ics`'s own allocation just above may have
+        // moved `method`/`literals`/`selector`.
+        let method = MethodOop::try_from(method_h.get(vm)).expect("finish: method stays a Method");
+        let literals =
+            ArrayOop::try_from(literals_h.get(vm)).expect("finish: literals stays an array");
+        let selector = selector_h.get(vm);
+
+        method.set_selector(selector);
         method.set_holder(nil); // nil until S3 install
         method.set_flags(argc, ntemps, false, false, false, false, 0);
         method.set_primitive(0);
@@ -491,10 +573,10 @@ pub fn build_standalone_block(
     has_ctx: bool,
     nctx: usize,
     captures_ctx: bool,
-    body: impl FnOnce(&mut BytecodeBuilder),
+    body: impl FnOnce(&mut BytecodeBuilder, &mut VmState),
 ) -> MethodOop {
     let mut inner = BytecodeBuilder::new();
-    body(&mut inner);
+    body(&mut inner, vm);
     let sel = vm.universe.intern(b"aBlock"); // CompiledBlocks are never looked up by selector; a fixed placeholder.
     let blk = inner.finish(vm, sel, argc, ntemps);
     blk.set_flags(argc, ntemps, has_ctx, true, false, captures_ctx, nctx);
@@ -523,6 +605,8 @@ mod tests {
         VmState::with_options(VmOptions {
             heap_mib: 64,
             trace: Default::default(),
+            gc_stress: false,
+            eden_kb: None,
         })
     }
 
@@ -531,8 +615,8 @@ mod tests {
         let mut vm = test_vm();
         let sym = vm.universe.intern(b"foo");
         let mut b = BytecodeBuilder::new();
-        b.push_literal(sym.oop());
-        b.push_literal(sym.oop());
+        b.push_literal(&mut vm, sym.oop());
+        b.push_literal(&mut vm, sym.oop());
         b.ret_self();
         let sel = vm.universe.intern(b"test");
 
@@ -548,7 +632,7 @@ mod tests {
         let mut vm = test_vm();
         let mut b = BytecodeBuilder::new();
         for i in 0..300i64 {
-            b.push_literal(SmallInt::new(i).oop());
+            b.push_literal(&mut vm, SmallInt::new(i).oop());
         }
         b.ret_self();
         let sel = vm.universe.intern(b"test");

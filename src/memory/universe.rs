@@ -25,14 +25,56 @@ use crate::oops::Oop;
 use crate::runtime::vm_state::VmOptions;
 
 use super::alloc;
+use super::cards::CardTable;
+use super::layout::HeapLayout;
+use super::offsets::OffsetTable;
 use super::reservation::Reservation;
-use super::space::Eden;
+use super::spaces::{Eden, OldGen, SurvivorSpace};
+use super::stats::GcStats;
 use super::symbols::SymbolTable;
 
 pub struct Universe {
     #[allow(dead_code)] // kept alive for its Drop impl; no other field reads it in S1
     reservation: Reservation,
     pub eden: Eden,
+    /// Fixed geometry `eden`/`from`/`to`/`old` bounds were carved out of
+    /// (SPEC §7.1) — `is_old`/`is_new` are defined here.
+    pub layout: HeapLayout,
+    /// Scavenge copy destination this cycle (S7-7 swaps `from`/`to` after
+    /// each scavenge); both start empty and are not yet allocated into.
+    pub from: SurvivorSpace,
+    pub to: SurvivorSpace,
+    /// Committed prefix of the reserved old-gen range; not yet allocated
+    /// into by the interpreter (S7-7's promotion path is the first real
+    /// caller of `OldGen::allocate`).
+    pub old: OldGen,
+    /// The write barrier's remembered set (SPEC §7.4) — `memory::store`
+    /// dirties a card whenever an old-gen slot is written a new-gen oop.
+    pub cards: CardTable,
+    /// Object-start table over old gen, maintained in lockstep with
+    /// `old`'s allocations — lets a dirty-card scan find an object's
+    /// header without walking from `old.bounds.start`.
+    pub offsets: OffsetTable,
+    /// GC counters (SPEC §12.4-ish observability) — read by `GcStallError`
+    /// and, later, `Smalltalk`-level introspection.
+    pub gc_stats: GcStats,
+    /// Per-age surviving-byte histogram for the scavenge in progress
+    /// (SPEC §7.3 step 4); cleared at the start of every scavenge.
+    pub age_table: super::scavenge::AgeTable,
+    /// Ages `>= tenuring_threshold` promote directly to old gen instead of
+    /// copying to the `to` survivor space. Starts at 127 (never tenure by
+    /// age) until a scavenge recomputes it; forced to 127 during S7-7's
+    /// own bring-up (promotion enabled once copy+scan are solid).
+    pub tenuring_threshold: u8,
+    /// `false` only during genesis itself — the half-built metaobject knot
+    /// must never be scanned (SPEC §7.3 A1). Set `true` once genesis
+    /// returns; `scavenge` asserts it.
+    pub gc_enabled: bool,
+    /// Set by `scavenge_oop` when a copy/promotion allocation fails
+    /// mid-scavenge; `scavenge()` checks it between phases and turns it
+    /// into a returned `Err` rather than silently leaving a root pointed
+    /// at an un-copied from-space object. `None` the rest of the time.
+    pub pending_stall: Option<super::stall::GcStallError>,
 
     pub nil_obj: Oop,
     pub true_obj: Oop,
@@ -106,17 +148,36 @@ pub struct Universe {
     pub sel_cannot_return: SymbolOop,
 }
 
-/// Default eden size *(tunable)* — SPEC §7.1.
-const EDEN_SIZE: usize = 4 << 20;
+/// Default eden size *(tunable)* — SPEC §7.1. `options.eden_kb`
+/// (`MACVM_EDEN` env override, S7-10) overrides it — the S7 GC-stress test's
+/// actual consumer: a small eden makes a scavenge reachable without first
+/// allocating megabytes of filler.
+const EDEN_SIZE: usize = super::layout::DEFAULT_EDEN_SIZE;
 /// Initial symbol table capacity *(tunable)* — SPEC §3.1.
 const SYMBOL_TABLE_CAPACITY: usize = 1024;
 
 impl Universe {
     pub fn genesis(options: &VmOptions) -> Universe {
-        // --- step 1: heap up ------------------------------------------------
-        let reservation = Reservation::reserve(options.heap_mib << 20);
-        reservation.commit(0, EDEN_SIZE);
-        let mut eden = Eden::new(reservation.base(), EDEN_SIZE);
+        // --- step 1: heap up (sprint_s07_detail.md A1) -----------------------
+        let heap_bytes = options.heap_mib << 20;
+        let eden_size = options.eden_kb.map(|kb| kb << 10).unwrap_or(EDEN_SIZE);
+        let reservation = Reservation::reserve(heap_bytes);
+        let layout = HeapLayout::new(reservation.base(), heap_bytes, eden_size);
+        reservation.commit(layout.eden.start - reservation.base(), layout.eden.len());
+        reservation.commit(layout.from.start - reservation.base(), layout.from.len());
+        reservation.commit(layout.to.start - reservation.base(), layout.to.len());
+        let old_committed_len = super::layout::OLD_INITIAL_SEGMENT.min(layout.old.len());
+        reservation.commit(layout.old.start - reservation.base(), old_committed_len);
+
+        let mut eden = Eden::new(layout.eden.start, layout.eden.len());
+        let from = SurvivorSpace::new(layout.from);
+        let to = SurvivorSpace::new(layout.to);
+        let old = OldGen::new(layout.old, layout.old.start + old_committed_len);
+        let cards = CardTable::new(layout.old);
+        let offsets = OffsetTable::new(layout.old);
+        let gc_stats = GcStats::new();
+        let age_table = super::scavenge::AgeTable::new();
+        let tenuring_threshold = 127; // never tenure by age until a scavenge recomputes it
 
         let placeholder = SmallInt::new(0).oop();
 
@@ -522,6 +583,17 @@ impl Universe {
         let universe = Universe {
             reservation,
             eden,
+            layout,
+            from,
+            to,
+            old,
+            cards,
+            offsets,
+            gc_stats,
+            age_table,
+            tenuring_threshold,
+            gc_enabled: false, // flipped true just before genesis() returns (SPEC §7.3 A1)
+            pending_stall: None,
             nil_obj: nil,
             true_obj: true_obj.oop(),
             false_obj: false_obj.oop(),
@@ -569,6 +641,8 @@ impl Universe {
         // --- step 12: verify -------------------------------------------------------
         super::verify::verify_heap(&universe).expect("genesis produced an invalid heap");
 
+        let mut universe = universe;
+        universe.gc_enabled = true; // the half-built metaobject knot is safe to scan now
         universe
     }
 
@@ -783,6 +857,8 @@ mod tests {
         Universe::genesis(&VmOptions {
             heap_mib: 64,
             trace: Default::default(),
+            gc_stress: false,
+            eden_kb: None,
         })
     }
 
