@@ -1,0 +1,21 @@
+"99_run_all.mst — SUnit-lite driver (sprint_s06_detail.md 'SUnit-lite').
+ Only loaded via world/tests/tests.list (tests/it_world.rs), never by
+ macvm run/repl's plain --world world.list load."
+
+TestRunner start.
+TestRunner run: ObjectTests.
+TestRunner run: BooleanTests.
+TestRunner run: IntegerTests.
+TestRunner run: LargeIntegerTests.
+TestRunner run: DoubleTests.
+TestRunner run: CharacterTests.
+TestRunner run: StringTests.
+TestRunner run: SymbolTests.
+TestRunner run: ArrayTests.
+TestRunner run: ByteArrayTests.
+TestRunner run: OrderedCollectionTests.
+TestRunner run: DictionaryTests.
+TestRunner run: IntervalTests.
+TestRunner run: StreamAndPrintTests.
+TestRunner run: BlockTests.
+TestRunner report.

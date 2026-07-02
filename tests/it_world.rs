@@ -1,0 +1,219 @@
+//! World + SUnit-lite integration tests (`tests_s06.md` "Integration /
+//! golden tests" and "Stress / negative tests"). Most of these run
+//! in-process (`Smalltalk quit:` just sets `vm.exit_code`, it never calls
+//! `std::process::exit` — only the `error:` primitive does that) so only
+//! the DNU/`error:` case needs a real subprocess.
+
+mod common;
+
+use std::path::PathBuf;
+use std::process::{Command, Stdio};
+
+use macvm::frontend::world;
+use macvm::runtime::vm_state::OutputBuffer;
+
+fn world_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("world")
+}
+
+/// Loads `world/tests/tests.list` (NOT named `world.list`, so
+/// `frontend::world::load_world` doesn't apply directly) relative to
+/// `world/tests/`, in order, stopping early if a file requests exit.
+fn load_tests_list(vm: &mut macvm::runtime::VmState) {
+    let dir = world_dir().join("tests");
+    let list_src = std::fs::read_to_string(dir.join("tests.list")).expect("read tests.list");
+    for raw_line in list_src.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        world::load_file(vm, &dir.join(line)).unwrap_or_else(|e| panic!("{line}: {e}"));
+        if vm.exit_requested {
+            break;
+        }
+    }
+}
+
+#[test]
+fn boots_clean() {
+    let mut vm = common::test_vm();
+    let buf = OutputBuffer::new();
+    vm.out = Box::new(buf.clone());
+    let loaded = world::load_world(&mut vm, &world_dir()).expect("load_world");
+    assert!(loaded);
+    assert_eq!(
+        buf.as_string(),
+        "",
+        "world.list alone must produce no output"
+    );
+}
+
+/// Gate item 1 (`tests_s06.md`): boot, load world.list + tests.list, run
+/// SUnit-lite, exit 0 with a `/^\d+ run, 0 failed$/` report line, total
+/// assertions >= 200.
+#[test]
+fn suite_green() {
+    let mut vm = common::test_vm();
+    let buf = OutputBuffer::new();
+    vm.out = Box::new(buf.clone());
+    world::load_world(&mut vm, &world_dir()).expect("load_world");
+    load_tests_list(&mut vm);
+
+    assert_eq!(vm.exit_code, Some(0), "stdout so far:\n{}", buf.as_string());
+    let out = buf.as_string();
+    let report_line = out
+        .lines()
+        .find(|l| l.ends_with("failed"))
+        .unwrap_or_else(|| panic!("no '... failed' report line in:\n{out}"));
+    assert!(
+        report_line.ends_with(", 0 failed"),
+        "expected 0 failures, got: {report_line}"
+    );
+    let run_count: u64 = report_line
+        .split(' ')
+        .next()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| panic!("couldn't parse run count from: {report_line}"));
+    assert!(
+        run_count >= 200,
+        "expected >= 200 assertions run, got {run_count}"
+    );
+}
+
+/// Load-order torture: swapping files 12 (Dictionary, needs OrderedCollection
+/// from 15... actually here we swap 12_string.mst and 19_printing.mst, which
+/// both genuinely depend on earlier files) must fail fast with an
+/// "undeclared variable" error — proves the ordering law is real.
+#[test]
+fn order_is_load_bearing() {
+    let tmp = std::env::temp_dir().join(format!("macvm_order_torture_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).ok();
+    // Copy the real world files, but list 19_printing.mst (which needs
+    // WriteStream from 18 and OrderedCollection from 15) before them.
+    for entry in std::fs::read_dir(world_dir()).unwrap() {
+        let entry = entry.unwrap();
+        if entry.path().extension().and_then(|e| e.to_str()) == Some("mst") {
+            std::fs::copy(entry.path(), tmp.join(entry.file_name())).unwrap();
+        }
+    }
+    std::fs::write(
+        tmp.join("world.list"),
+        "19_printing.mst\n01_object.mst\n02_nil_boolean.mst\n04a_blockclosure.mst\n\
+         04_transcript.mst\n03_behavior.mst\n05_magnitude.mst\n06_smallinteger.mst\n\
+         07_largeinteger.mst\n08_double.mst\n10_array.mst\n09_character.mst\n\
+         11_bytearray.mst\n12_string.mst\n13_symbol.mst\n14_association.mst\n\
+         15_ordered.mst\n16_dictionary.mst\n17_interval.mst\n18_writestream.mst\n\
+         20_system.mst\n",
+    )
+    .unwrap();
+
+    let mut vm = common::test_vm();
+    let err = world::load_world(&mut vm, &tmp).expect_err("swapped load order must fail");
+    assert!(
+        err.msg.contains("undeclared variable") || err.msg.contains("not understand"),
+        "expected an undeclared-variable-shaped failure, got: {}",
+        err.msg
+    );
+
+    std::fs::remove_dir_all(&tmp).ok();
+}
+
+/// Reopen misuse: declaring an existing class's superclass differently on
+/// reopen must fail with a shape/superclass-mismatch error, not silently
+/// succeed or corrupt the klass.
+#[test]
+fn reopen_misuse_wrong_superclass_fails() {
+    let mut vm = common::test_vm();
+    world::load_world(&mut vm, &world_dir()).expect("load_world");
+    let items = macvm::frontend::parser::parse_file("Object subclass: Integer [ ]\n").unwrap();
+    let mut saw_error = false;
+    for item in items {
+        if let Err(e) = macvm::frontend::classdef::execute_top_item(&mut vm, item) {
+            saw_error = true;
+            assert!(
+                e.msg.contains("shape") || e.msg.contains("superclass"),
+                "expected a shape/superclass-mismatch message, got: {}",
+                e.msg
+            );
+        }
+    }
+    assert!(
+        saw_error,
+        "reopening Integer under the wrong superclass must fail"
+    );
+}
+
+/// A deliberately-failing test class proves the suite can actually fail
+/// (guards against a vacuously-green runner) — exit code 1, failure line
+/// names the test.
+#[test]
+fn deliberately_failing_assertion_fails_the_run() {
+    let mut vm = common::test_vm();
+    let buf = OutputBuffer::new();
+    vm.out = Box::new(buf.clone());
+    world::load_world(&mut vm, &world_dir()).expect("load_world");
+    let dir = world_dir().join("tests");
+    world::load_file(&mut vm, &dir.join("00_sunit.mst")).expect("load 00_sunit.mst");
+
+    let src = "TestCase subclass: DeliberatelyFailingTests [\n\
+        runAll [ self runTest: #testBoom do: [ self testBoom ] ]\n\
+        testBoom [ self assert: 1 = 2 ]\n\
+    ]\n\
+    TestRunner start.\n\
+    TestRunner run: DeliberatelyFailingTests.\n\
+    TestRunner report.\n";
+    let items = macvm::frontend::parser::parse_file(src).unwrap();
+    for item in items {
+        macvm::frontend::classdef::execute_top_item(&mut vm, item).expect("execute");
+        if vm.exit_requested {
+            break;
+        }
+    }
+    assert_eq!(vm.exit_code, Some(1));
+    let out = buf.as_string();
+    assert!(
+        out.contains("testBoom"),
+        "failure line must name the failing test, got:\n{out}"
+    );
+}
+
+fn bin_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_BIN_EXE_macvm"))
+}
+
+/// `error:`'s primitive calls `std::process::exit` directly — the only
+/// case in this file that genuinely needs a subprocess rather than
+/// in-process `VmState` inspection.
+#[test]
+fn error_kills_with_trace() {
+    let dir = std::env::temp_dir().join(format!("macvm_error_trace_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let script = dir.join("boom.mst");
+    std::fs::write(&script, "nil foo.\n").unwrap();
+
+    let out = Command::new(bin_path())
+        .args([
+            "run",
+            script.to_str().unwrap(),
+            "--world",
+            world_dir().to_str().unwrap(),
+        ])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("spawn macvm");
+
+    assert_ne!(out.status.code().unwrap_or(-1), 0);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("foo"),
+        "expected the selector name in the error, got stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.lines().count() >= 2,
+        "expected the message line plus >=1 stack-trace line, got:\n{stdout}"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}

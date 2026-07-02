@@ -74,6 +74,24 @@ fn run_ok() {
     assert_eq!(out.stdout, expected);
 }
 
+/// sprint_s06_detail.md step 6: "point_demo.mst now prints via
+/// printString" — a separate fixture from `point_demo.mst` (which must
+/// stay runnable with NO world at all, see `world_missing`) exercised
+/// against the real `world/world.list`.
+#[test]
+fn run_ok_real_world_printstring() {
+    let out = run(&[
+        "run",
+        "tests/golden/point_demo_real_world.mst",
+        "--world",
+        "world",
+    ]);
+    assert_eq!(out.status, 0, "stderr: {}", out.stderr);
+    let expected = std::fs::read_to_string(golden_dir().join("point_demo_real_world.expected"))
+        .expect("read golden");
+    assert_eq!(out.stdout, expected);
+}
+
 #[test]
 fn run_compile_err() {
     let dir = std::env::temp_dir().join(format!("macvm_cli_err_{}", std::process::id()));

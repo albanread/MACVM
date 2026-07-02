@@ -22,6 +22,12 @@ pub fn load_file(vm: &mut VmState, path: &Path) -> Result<(), CompileError> {
     let items = super::parser::parse_file(&src).map_err(|e| e.with_path(path.to_path_buf()))?;
     for item in items {
         super::classdef::execute_top_item(vm, item).map_err(|e| e.with_path(path.to_path_buf()))?;
+        // `quit`/`quit:` (S6, SPEC §10 system group) — stop loading further
+        // items/files immediately rather than continuing past a guest's
+        // explicit exit request (e.g. `TestRunner report`'s final `quit:`).
+        if vm.exit_requested {
+            break;
+        }
     }
     Ok(())
 }
@@ -57,6 +63,9 @@ pub fn load_world(vm: &mut VmState, dir: &Path) -> Result<bool, CompileError> {
             });
         }
         load_file(vm, &dir.join(line))?;
+        if vm.exit_requested {
+            return Ok(true);
+        }
     }
 
     vm.universe.world_loaded = true;

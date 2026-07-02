@@ -72,22 +72,22 @@ impl MemOop {
 
     // --- body (crate-internal, unchecked — see instance_size_words) ---
 
-    /// Read body word `index` with no bounds check beyond a broad sanity
-    /// ceiling. Used only by [`KlassOop`]'s statically-bounded accessors
-    /// (`oops::klass`) and by this module's own `instance_size_words` when
-    /// reading an object's own trailing size slot — both cases are known
-    /// in-bounds by construction; see the module doc for why the general,
-    /// dynamically-bounded accessors below cannot be used here without
-    /// infinite recursion.
+    /// Read body word `index` with no bounds check of its own — every
+    /// caller already guarantees the word exists before reaching here:
+    /// [`KlassOop`]'s statically-bounded accessors (`oops::klass`), this
+    /// module's own `instance_size_words` size-slot read, and `body_oop`/
+    /// `set_body_oop` below (their own `index < body_word_count()` check
+    /// runs first). A fixed sanity ceiling used to live here too, but S6's
+    /// Array/OrderedCollection/Dictionary workloads routinely exceed a few
+    /// thousand elements — a ceiling low enough to catch a wild index would
+    /// also reject legitimate large bodies, so bounds-checking is left
+    /// entirely to each caller instead.
     pub(crate) fn raw_body_word(self, index: usize) -> u64 {
-        debug_assert!(index < 4096, "raw_body_word: implausible index {index}");
-        // SAFETY: caller (klass.rs's fixed-shape accessors, or this
-        // module's own size-slot read) guarantees the word exists.
+        // SAFETY: caller guarantees the word exists (see above).
         unsafe { self.body_ptr(index).read() }
     }
 
     pub(crate) fn set_raw_body_word(self, index: usize, w: u64) {
-        debug_assert!(index < 4096, "set_raw_body_word: implausible index {index}");
         // SAFETY: as above.
         unsafe { self.body_ptr(index).write(w) }
     }

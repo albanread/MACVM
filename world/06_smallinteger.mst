@@ -1,0 +1,125 @@
+"06_smallinteger.mst — Integer (shared) + SmallInteger
+ (sprint_s06_detail.md #06). Every arithmetic/comparison selector binds its
+ primitive with a Large/Double-coercing fallback."
+
+Number subclass: Integer [
+    isInteger [
+        ^true
+    ]
+    asInteger [
+        ^self
+    ]
+    hash [
+        ^self
+    ]
+    even [
+        ^self \\ 2 = 0
+    ]
+    odd [
+        ^self even not
+    ]
+    timesRepeat: aBlock [
+        | i |
+        i := 0.
+        [ i < self ] whileTrue: [ aBlock value. i := i + 1 ]
+    ]
+    gcd: anInteger [
+        | a b t |
+        a := self abs.
+        b := anInteger abs.
+        [ b = 0 ] whileFalse: [ t := b. b := a \\ b. a := t ].
+        ^a
+    ]
+]
+
+Integer subclass: SmallInteger [
+    SmallInteger class >> maxVal [
+        ^2305843009213693951
+    ]
+    SmallInteger class >> minVal [
+        ^-2305843009213693952
+    ]
+    asDouble [
+        <primitive: 108>
+    ]
+    asCharacter [
+        ^Character value: self
+    ]
+    asLargeInteger [
+        ^LargeInteger fromSmallInteger: self
+    ]
+    identityHash [
+        ^self
+    ]
+    hash [
+        ^self
+    ]
+    + aNumber [
+        <primitive: 1>
+        aNumber isDouble ifTrue: [ ^self asDouble + aNumber ].
+        ^self asLargeInteger + aNumber asLargeInteger
+    ]
+    - aNumber [
+        <primitive: 2>
+        aNumber isDouble ifTrue: [ ^self asDouble - aNumber ].
+        ^self asLargeInteger - aNumber asLargeInteger
+    ]
+    * aNumber [
+        <primitive: 3>
+        aNumber isDouble ifTrue: [ ^self asDouble * aNumber ].
+        ^self asLargeInteger * aNumber asLargeInteger
+    ]
+    // aNumber [
+        <primitive: 4>
+        aNumber isDouble ifTrue: [ ^(self asDouble / aNumber) floor ].
+        ^self error: 'large division unimplemented'
+    ]
+    \\ aNumber [
+        <primitive: 5>
+        aNumber isDouble ifTrue: [ ^self error: 'not implemented' ].
+        ^self error: 'large division unimplemented'
+    ]
+    bitAnd: aNumber [
+        <primitive: 6>
+    ]
+    bitOr: aNumber [
+        <primitive: 7>
+    ]
+    bitXor: aNumber [
+        <primitive: 8>
+    ]
+    bitShift: aNumber [
+        <primitive: 9>
+    ]
+    < aNumber [
+        <primitive: 10>
+        aNumber isDouble ifTrue: [ ^self asDouble < aNumber ].
+        ^(self asLargeInteger < aNumber asLargeInteger)
+    ]
+    <= aNumber [
+        <primitive: 11>
+        aNumber isDouble ifTrue: [ ^self asDouble <= aNumber ].
+        ^(self < aNumber) or: [ self = aNumber ]
+    ]
+    > aNumber [
+        <primitive: 12>
+        aNumber isDouble ifTrue: [ ^self asDouble > aNumber ].
+        ^aNumber < self
+    ]
+    >= aNumber [
+        <primitive: 13>
+        aNumber isDouble ifTrue: [ ^self asDouble >= aNumber ].
+        ^(self > aNumber) or: [ self = aNumber ]
+    ]
+    = aNumber [
+        <primitive: 14>
+        "primitive 14 only fails when aNumber is not itself a SmallInteger."
+        aNumber isDouble ifTrue: [ ^self asDouble = aNumber ].
+        (aNumber isKindOf: LargeInteger) ifTrue: [ ^self asLargeInteger = aNumber ].
+        ^false
+    ]
+    ~= aNumber [
+        <primitive: 15>
+        ^(self = aNumber) not
+    ]
+]

@@ -1,0 +1,112 @@
+"02_nil_boolean.mst — UndefinedObject/Boolean/True/False (sprint_s06_detail.md
+ #02). True/False's ifTrue:/ifFalse:/and:/or: are the REAL-SEND fallbacks
+ for S5's inlined selectors (Pitfalls P6) — semantics must match the
+ inlined patterns exactly, incl. ifTrue: answering nil on the untaken leg."
+
+Object subclass: UndefinedObject [
+    isNil [
+        ^true
+    ]
+    notNil [
+        ^false
+    ]
+]
+
+Object subclass: Boolean [
+]
+
+Boolean subclass: True [
+    not [
+        ^false
+    ]
+    and: aBlock [
+        ^aBlock value
+    ]
+    or: aBlock [
+        ^true
+    ]
+    ifTrue: aBlock [
+        ^aBlock value
+    ]
+    ifFalse: aBlock [
+        ^nil
+    ]
+    ifTrue: aBlock ifFalse: cBlock [
+        ^aBlock value
+    ]
+    ifFalse: aBlock ifTrue: cBlock [
+        ^cBlock value
+    ]
+    & aBoolean [
+        ^aBoolean
+    ]
+    | aBoolean [
+        ^true
+    ]
+]
+
+Boolean subclass: False [
+    not [
+        ^true
+    ]
+    and: aBlock [
+        ^false
+    ]
+    or: aBlock [
+        ^aBlock value
+    ]
+    ifTrue: aBlock [
+        ^nil
+    ]
+    ifFalse: aBlock [
+        ^aBlock value
+    ]
+    ifTrue: aBlock ifFalse: cBlock [
+        ^cBlock value
+    ]
+    ifFalse: aBlock ifTrue: cBlock [
+        ^aBlock value
+    ]
+    & aBoolean [
+        ^false
+    ]
+    | aBoolean [
+        ^aBoolean
+    ]
+]
+
+nil subclass: Object [
+    = anObject [
+        ^self == anObject
+    ]
+    ~= anObject [
+        ^(self = anObject) not
+    ]
+    ~~ anObject [
+        ^(self == anObject) not
+    ]
+    isNil [
+        ^false
+    ]
+    notNil [
+        ^true
+    ]
+    isString [
+        ^false
+    ]
+    isSymbol [
+        ^false
+    ]
+    isInteger [
+        ^false
+    ]
+    isDouble [
+        ^false
+    ]
+    isCharacter [
+        ^false
+    ]
+    isClass [
+        ^false
+    ]
+]

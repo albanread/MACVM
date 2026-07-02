@@ -1,0 +1,76 @@
+"13_interval_controlflow_tests.mst — IntervalTests + ControlFlowTests
+ (tests_s06.md '13')."
+
+TestCase subclass: IntervalTests [
+    runAll [
+        self runTest: #testBasics do: [ self testBasics ].
+        self runTest: #testStep do: [ self testStep ].
+        self runTest: #testToDoEquivalence do: [ self testToDoEquivalence ].
+        self runTest: #testToDoResult do: [ self testToDoResult ].
+        self runTest: #testLoopVarCapture do: [ self testLoopVarCapture ].
+        self runTest: #testWhileLoops do: [ self testWhileLoops ].
+        self runTest: #testTimesRepeat do: [ self testTimesRepeat ].
+        self runTest: #testNlrThroughToDo do: [ self testNlrThroughToDo ].
+    ]
+
+    testBasics [
+        self assert: (1 to: 5) size = 5.
+        self assert: (1 to: 5) asArray = #(1 2 3 4 5).
+        self assert: ((1 to: 5) includes: 3).
+    ]
+    testStep [
+        self assert: (2 to: 10 by: 2) asArray = #(2 4 6 8 10).
+        self assert: (10 to: 1 by: -3) asArray = #(10 7 4 1).
+        self assert: (2 to: 10 by: 2) size = 5.
+    ]
+    "1..100 summed via the inlined to:do: vs the real Interval>>do: (through
+     inject:into:) must agree — both compute Gauss's 5050."
+    testToDoEquivalence [
+        | sumInlined sumReal |
+        sumInlined := 0.
+        1 to: 100 do: [:i | sumInlined := sumInlined + i ].
+        sumReal := (1 to: 100) inject: 0 into: [:acc :x | acc + x ].
+        self assert: sumInlined = 5050.
+        self assert: sumReal = 5050.
+    ]
+    testToDoResult [
+        self assert: (2 to: 10 do: [:i | i ]) = 2.
+    ]
+    "Interval>>do: is a real send (not inlined) — each iteration's block
+     parameter must be its own binding, not one shared mutable slot."
+    testLoopVarCapture [
+        | blocks results |
+        blocks := OrderedCollection new.
+        (1 to: 3) do: [:i | blocks add: [ i ] ].
+        results := (blocks collect: [:b | b value ]) asArray.
+        self assert: results = #(1 2 3).
+    ]
+    testWhileLoops [
+        | i n |
+        i := 0.
+        [ i < 5 ] whileTrue: [ i := i + 1 ].
+        self assert: i = 5.
+        n := 0.
+        [ n >= 5 ] whileFalse: [ n := n + 1 ].
+        self assert: n = 5.
+    ]
+    testTimesRepeat [
+        | n |
+        n := 0.
+        4 timesRepeat: [ n := n + 1 ].
+        self assert: n = 4.
+    ]
+    testNlrThroughToDo [
+        self assert: (IntervalTests findFirst: [:x | x > 3 ] in: #(1 2 3 4 5)) = 4.
+        self assert: IntervalTests viaToDo = 6.
+    ]
+
+    IntervalTests class >> findFirst: aBlock in: coll [
+        coll do: [:x | (aBlock value: x) ifTrue: [ ^x ] ].
+        ^nil
+    ]
+    IntervalTests class >> viaToDo [
+        1 to: 10 do: [:i | i > 5 ifTrue: [ ^i ] ].
+        ^-1
+    ]
+]

@@ -1,0 +1,58 @@
+"11_bytearray.mst — ByteArray (sprint_s06_detail.md #11). byteAt:/byteAt:put:/
+ size/replaceFrom:to:with:/hashBytes/compare: are the same IndexableBytes
+ primitives 07_largeinteger.mst already binds under different selector
+ names; ByteArray exposes them under their own names directly."
+
+ArrayedCollection subclass: ByteArray [
+    at: i [
+        <primitive: 40>
+    ]
+    at: i put: v [
+        <primitive: 41>
+    ]
+    size [
+        <primitive: 28>
+    ]
+    at: i ifAbsent: absentBlock [
+        (i between: 1 and: self size) ifFalse: [ ^absentBlock value ].
+        ^self at: i
+    ]
+    "Loop-based, not primitive 43: that primitive always reads its source
+     from index 1, which only helps when copying a WHOLE other collection
+     in (see `,`) — not when slicing an arbitrary from..to out of self."
+    copyFrom: from to: to [
+        | r n |
+        n := to - from + 1.
+        r := self class new: n.
+        1 to: n do: [:i | r at: i put: (self at: from + i - 1) ].
+        ^r
+    ]
+    "Copies ALL of src (read from src's own index 1) into self[from..to]."
+    replaceFrom: from to: to with: src [
+        <primitive: 43>
+    ]
+    , other [
+        | r |
+        r := self class new: self size + other size.
+        r replaceFrom: 1 to: self size with: self.
+        r replaceFrom: self size + 1 to: self size + other size with: other.
+        ^r
+    ]
+    collect: aBlock [
+        | r |
+        r := Array new: self size.
+        1 to: self size do: [:i | r at: i put: (aBlock value: (self at: i)) ].
+        ^r
+    ]
+    hash [
+        <primitive: 44>
+    ]
+    = other [
+        (other isKindOf: ByteArray) ifFalse: [ ^false ].
+        self size = other size ifFalse: [ ^false ].
+        ^(self compare: other) = 0
+    ]
+    compare: other [
+        <primitive: 45>
+    ]
+]

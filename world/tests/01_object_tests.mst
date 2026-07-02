@@ -1,0 +1,66 @@
+"01_object_tests.mst — ObjectTests (tests_s06.md '01 ObjectTests')."
+
+TestCase subclass: ObjectTests [
+    runAll [
+        self runTest: #testIdentity do: [ self testIdentity ].
+        self runTest: #testEqualityDefault do: [ self testEqualityDefault ].
+        self runTest: #testHash do: [ self testHash ].
+        self runTest: #testNilChecks do: [ self testNilChecks ].
+        self runTest: #testYourself do: [ self testYourself ].
+        self runTest: #testClass do: [ self testClass ].
+        self runTest: #testKindOf do: [ self testKindOf ].
+        self runTest: #testAssociation do: [ self testAssociation ].
+    ]
+
+    testIdentity [
+        | a b |
+        a := Object new.
+        b := a.
+        self assert: a == b.
+        self deny: a == Object new.
+        self assert: a ~~ Object new.
+        self deny: a ~~ b.
+    ]
+    testEqualityDefault [
+        | a b |
+        a := Object new.
+        b := Object new.
+        self assert: a = a.
+        self deny: a = b.
+    ]
+    testHash [
+        | a |
+        a := Object new.
+        self assert: a hash = a identityHash.
+    ]
+    testNilChecks [
+        self assert: nil isNil.
+        self deny: nil notNil.
+        self deny: 3 isNil.
+        self assert: 3 notNil.
+    ]
+    testYourself [
+        | a |
+        a := Object new.
+        self assert: a yourself == a.
+    ]
+    testClass [
+        self assert: 3 class == SmallInteger.
+        self assert: 'x' class == String.
+        self assert: nil class == UndefinedObject.
+    ]
+    testKindOf [
+        self assert: (3 isKindOf: SmallInteger).
+        self assert: (3 isKindOf: Integer).
+        self assert: (3 isKindOf: Number).
+        self assert: (3 isMemberOf: SmallInteger).
+        self deny: (3 isMemberOf: Integer).
+    ]
+    testAssociation [
+        | assoc |
+        assoc := 3 -> 4.
+        self assert: assoc key = 3.
+        self assert: assoc value = 4.
+        self assert: assoc class == Association.
+    ]
+]

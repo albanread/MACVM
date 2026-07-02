@@ -1,0 +1,41 @@
+"sieve.mst — sprint_s06_detail.md 'Benchmarks'. Classic BYTE-benchmark
+ flags sieve (the odd-skip variant: flags at: i tracks whether i+i+1 is
+ prime, not i+1 — that's what makes the expected count come out to 1899
+ rather than some other number for size 8190): 10 iterations, count
+ primes, print count. Exercises Array at:/at:put:, whileTrue:/to:do:,
+ comparison sends, allocation. Brackets the run with millisecondClock.
+ Not in world.list; `macvm run world/bench/sieve.mst --world world` loads
+ it explicitly."
+
+Object subclass: Sieve [
+    Sieve class >> run [
+        | flags count k prime size |
+        size := 8190.
+        10 timesRepeat: [
+            flags := Array new: size.
+            1 to: size do: [:x | flags at: x put: true ].
+            count := 0.
+            1 to: size do: [:i |
+                (flags at: i) ifTrue: [
+                    prime := i + i + 1.
+                    k := i + prime.
+                    [ k <= size ] whileTrue: [
+                        flags at: k put: false.
+                        k := k + prime ].
+                    count := count + 1 ] ] ].
+        ^count
+    ]
+    Sieve class >> runTimed [
+        | startMs endMs result |
+        startMs := Smalltalk millisecondClock.
+        result := self run.
+        endMs := Smalltalk millisecondClock.
+        Transcript show: 'ms: '.
+        Transcript show: (endMs - startMs) printString.
+        Transcript cr.
+        ^result
+    ]
+]
+
+Transcript show: Sieve runTimed printString.
+Transcript cr.

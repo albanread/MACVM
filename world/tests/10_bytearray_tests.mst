@@ -1,0 +1,43 @@
+"10_bytearray_tests.mst — ByteArrayTests (tests_s06.md '10 ByteArrayTests')."
+
+TestCase subclass: ByteArrayTests [
+    runAll [
+        self runTest: #testLiteral do: [ self testLiteral ].
+        self runTest: #testAtAndPut do: [ self testAtAndPut ].
+        self runTest: #testCopyFromTo do: [ self testCopyFromTo ].
+        self runTest: #testHashEquality do: [ self testHashEquality ].
+        self runTest: #testCollect do: [ self testCollect ].
+        self runTest: #testPrintString do: [ self testPrintString ].
+    ]
+
+    testLiteral [
+        self assert: #[1 2 255] size = 3.
+        self assert: (#[1 2 255] at: 3) = 255.
+    ]
+    testAtAndPut [
+        | b |
+        b := ByteArray new: 3.
+        b at: 1 put: 10.
+        b at: 2 put: 20.
+        self assert: (b at: 1) = 10.
+        self assert: (b at: 2) = 20.
+        self assert: (b at: 10 ifAbsent: [ -1 ]) = -1.
+    ]
+    testCopyFromTo [
+        self assert: (#[1 2 3 4] copyFrom: 2 to: 3) = #[2 3].
+    ]
+    testHashEquality [
+        self assert: #[1 2 3] = #[1 2 3].
+        self deny: #[1 2 3] = #[1 2 4].
+        self assert: #[1 2 3] hash = #[1 2 3] hash.
+    ]
+    testCollect [
+        | r |
+        r := #[1 2 3] collect: [:x | x * 2 ].
+        self assert: r class == Array.
+        self assert: r = #(2 4 6).
+    ]
+    testPrintString [
+        self assert: #[1 2 3] printString = '#[1 2 3]'.
+    ]
+]

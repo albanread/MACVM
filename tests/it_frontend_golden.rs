@@ -286,3 +286,19 @@ fn s4_nlr_ensure_reexpressed() {
         "ensure: handlers must run innermost-first, before the NLR value is delivered"
     );
 }
+
+/// S6: `Object`'s real superclass is the `nil` oop itself (root of the
+/// hierarchy) — reopening it must accept the special `nil subclass:
+/// Object [...]` spelling and correctly compare against that nil
+/// superclass, not attempt to resolve "nil" as a bound klass global.
+#[test]
+fn reopen_object_via_nil_superclass() {
+    let mut vm = common::test_vm();
+    load_source(&mut vm, "nil subclass: Object [ answer [ ^42 ] ]\n");
+    let object_klass = klass_named(&mut vm, "Object");
+    let sel = vm.universe.intern(b"answer");
+    let m = macvm::runtime::lookup::lookup(&mut vm, object_klass, sel).unwrap();
+    let recv = macvm::memory::alloc::alloc_slots(&mut vm, object_klass).oop();
+    let result = macvm::interpreter::run_method(&mut vm, m, recv, &[]);
+    assert_eq!(result, macvm::oops::smi::SmallInt::new(42).oop());
+}

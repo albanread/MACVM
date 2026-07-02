@@ -91,12 +91,23 @@ fn cmd_run(args: &[String]) {
         &world_dir.unwrap_or_else(|| PathBuf::from("world")),
     );
 
-    match macvm::frontend::world::load_file(&mut vm, Path::new(file)) {
-        Ok(()) => std::process::exit(0),
+    let result = macvm::frontend::world::load_file(&mut vm, Path::new(file));
+    print_bytecode_count(&vm);
+    match result {
+        Ok(()) => std::process::exit(vm.exit_code.unwrap_or(0)),
         Err(e) => {
             eprintln!("{e}");
             std::process::exit(1);
         }
+    }
+}
+
+/// `MACVM_TRACE=count` (S6 PERF procedure) — printed to stderr so golden
+/// stdout transcripts (fib/sieve/point_demo) stay exact regardless of
+/// whether the flag is set.
+fn print_bytecode_count(vm: &VmState) {
+    if vm.options.trace.is_enabled("count") {
+        eprintln!("bytecodes: {}", vm.bytecode_count);
     }
 }
 

@@ -1,0 +1,38 @@
+"point_demo_real_world.mst — like point_demo.mst, but loaded against the
+ REAL world/world.list (sprint_s06_detail.md step 6: 'point_demo.mst now
+ prints via printString'). point_demo.mst itself stays untouched — it's
+ also exercised with NO world loaded at all (it_cli.rs's world_missing),
+ which this variant can't be since it needs Transcript/printString/+."
+
+Object subclass: Point [
+    | x y |
+    Point class >> new [
+        <primitive: 23>
+        ^self
+    ]
+    setX: ax y: ay [
+        x := ax.
+        y := ay
+    ]
+    x [ ^x ]
+    y [ ^y ]
+    + p [
+        ^(Point new) setX: x + p x y: y + p y
+    ]
+    printOn: s [
+        s nextPut: $(.
+        x printOn: s.
+        s nextPutAll: ', '.
+        y printOn: s.
+        s nextPut: $)
+    ]
+]
+
+P1 := Point new.
+P1 setX: 1 y: 2.
+Transcript show: 'Point creation ok'; cr.
+P2 := Point new.
+P2 setX: 3 y: 4.
+P3 := P1 + P2.
+Transcript show: 'Point + ok'; cr.
+Transcript show: P3 printString; cr.

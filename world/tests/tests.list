@@ -1,0 +1,20 @@
+# SUnit-lite + in-language test suite load order (sprint_s06_detail.md
+# 'SUnit-lite'). Appended after world/world.list by tests/it_world.rs only
+# — macvm run/repl never load this directory.
+00_sunit.mst
+01_object_tests.mst
+02_boolean_tests.mst
+03_integer_tests.mst
+04_large_integer_tests.mst
+05_double_tests.mst
+06_character_tests.mst
+07_string_tests.mst
+08_symbol_tests.mst
+09_array_tests.mst
+10_bytearray_tests.mst
+11_orderedcollection_tests.mst
+12_dictionary_tests.mst
+13_interval_controlflow_tests.mst
+14_stream_print_tests.mst
+15_block_tests.mst
+99_run_all.mst

@@ -1,0 +1,67 @@
+"17_interval.mst — Interval (sprint_s06_detail.md #17). NEW class. do: uses
+ a manual whileTrue: loop, deliberately not the inlined to:do: (which has
+ no notion of a non-1 step)."
+
+SequenceableCollection subclass: Interval [
+    | start stop step |
+
+    Interval class >> from: a to: b [
+        ^self from: a to: b by: 1
+    ]
+    Interval class >> from: a to: b by: s [
+        | r |
+        r := self basicNew.
+        r setStart: a stop: b step: s.
+        ^r
+    ]
+    setStart: a stop: b step: s [
+        start := a.
+        stop := b.
+        step := s.
+    ]
+    size [
+        step > 0
+            ifTrue: [ ^((stop - start) // step) + 1 max: 0 ]
+            ifFalse: [ ^((start - stop) // (0 - step)) + 1 max: 0 ]
+    ]
+    isEmpty [
+        ^self size = 0
+    ]
+    at: i [
+        (i between: 1 and: self size) ifFalse: [ ^self error: 'index out of range' ].
+        ^start + (i - 1 * step)
+    ]
+    first [
+        ^start
+    ]
+    last [
+        ^self at: self size
+    ]
+    do: aBlock [
+        | v i n |
+        n := self size.
+        v := start.
+        i := 0.
+        [ i < n ] whileTrue: [ aBlock value: v. v := v + step. i := i + 1 ]
+    ]
+    includes: anObject [
+        step > 0
+            ifTrue: [ ^(anObject >= start) and: [ (anObject <= stop) and: [ (anObject - start) \\ step = 0 ] ] ]
+            ifFalse: [ ^(anObject <= start) and: [ (anObject >= stop) and: [ (anObject - start) \\ step = 0 ] ] ]
+    ]
+    collect: aBlock [
+        | r |
+        r := Array new: self size.
+        1 to: self size do: [:i | r at: i put: (aBlock value: (self at: i)) ].
+        ^r
+    ]
+]
+
+Magnitude subclass: Number [
+    to: stop [
+        ^Interval from: self to: stop
+    ]
+    to: stop by: step [
+        ^Interval from: self to: stop by: step
+    ]
+]

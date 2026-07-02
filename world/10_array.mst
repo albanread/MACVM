@@ -1,0 +1,158 @@
+"10_array.mst — Collection/SequenceableCollection/Array (sprint_s06_detail.md
+ #10). Loaded before 09_character.mst (deviates from the doc's listed 09/10
+ order): Character class>>initTable needs Array>>at:put: to already be
+ installed by the time its top-level doIt runs (world.list is the actual
+ load order; filenames keep the doc's numbering for cross-reference)."
+
+Object subclass: Collection [
+    do: aBlock [
+        self subclassResponsibility
+    ]
+    isEmpty [
+        ^self size = 0
+    ]
+    notEmpty [
+        ^self isEmpty not
+    ]
+    size [
+        | n |
+        n := 0.
+        self do: [:each | n := n + 1 ].
+        ^n
+    ]
+    includes: anObject [
+        self do: [:each | each = anObject ifTrue: [ ^true ] ].
+        ^false
+    ]
+    detect: aBlock [
+        ^self detect: aBlock ifNone: [ self error: 'element not found' ]
+    ]
+    detect: aBlock ifNone: exceptionBlock [
+        self do: [:each | (aBlock value: each) ifTrue: [ ^each ] ].
+        ^exceptionBlock value
+    ]
+    inject: thisValue into: aBinaryBlock [
+        | result |
+        result := thisValue.
+        self do: [:each | result := aBinaryBlock value: result value: each ].
+        ^result
+    ]
+    do: aBlock separatedBy: sepBlock [
+        | first |
+        first := true.
+        self do: [:each |
+            first ifTrue: [ first := false ] ifFalse: [ sepBlock value ].
+            aBlock value: each ]
+    ]
+    addAll: aCollection [
+        aCollection do: [:each | self add: each ].
+        ^aCollection
+    ]
+    asArray [
+        | r i |
+        r := Array new: self size.
+        i := 1.
+        self do: [:each | r at: i put: each. i := i + 1 ].
+        ^r
+    ]
+]
+
+Collection subclass: SequenceableCollection [
+    do: aBlock [
+        1 to: self size do: [:i | aBlock value: (self at: i) ]
+    ]
+    doWithIndex: aBlock [
+        | i |
+        i := 1.
+        self do: [:each | aBlock value: each value: i. i := i + 1 ]
+    ]
+    keysAndValuesDo: aBlock [
+        | i |
+        i := 1.
+        self do: [:each | aBlock value: i value: each. i := i + 1 ]
+    ]
+    first [
+        ^self at: 1
+    ]
+    last [
+        ^self at: self size
+    ]
+    copyFrom: from to: to [
+        | r n |
+        n := to - from + 1.
+        r := self class new: n.
+        1 to: n do: [:i | r at: i put: (self at: from + i - 1) ].
+        ^r
+    ]
+    reversed [
+        | r n |
+        n := self size.
+        r := self class new: n.
+        1 to: n do: [:i | r at: i put: (self at: n - i + 1) ].
+        ^r
+    ]
+    indexOf: anObject ifAbsent: absentBlock [
+        1 to: self size do: [:i | (self at: i) = anObject ifTrue: [ ^i ] ].
+        ^absentBlock value
+    ]
+    indexOf: anObject [
+        ^self indexOf: anObject ifAbsent: [ 0 ]
+    ]
+    = other [
+        self class == other class ifFalse: [ ^false ].
+        self size = other size ifFalse: [ ^false ].
+        1 to: self size do: [:i | (self at: i) = (other at: i) ifFalse: [ ^false ] ].
+        ^true
+    ]
+    , other [
+        | r n |
+        n := self size + other size.
+        r := self class new: n.
+        1 to: self size do: [:i | r at: i put: (self at: i) ].
+        1 to: other size do: [:i | r at: self size + i put: (other at: i) ].
+        ^r
+    ]
+]
+
+ArrayedCollection subclass: Array [
+    Array class >> with: a [
+        | r |
+        r := self new: 1.
+        r at: 1 put: a.
+        ^r
+    ]
+    Array class >> with: a with: b [
+        | r |
+        r := self new: 2.
+        r at: 1 put: a.
+        r at: 2 put: b.
+        ^r
+    ]
+    Array class >> with: a with: b with: c [
+        | r |
+        r := self new: 3.
+        r at: 1 put: a.
+        r at: 2 put: b.
+        r at: 3 put: c.
+        ^r
+    ]
+    at: i [
+        <primitive: 26>
+    ]
+    at: i put: v [
+        <primitive: 27>
+    ]
+    size [
+        <primitive: 28>
+    ]
+    at: i ifAbsent: absentBlock [
+        (i between: 1 and: self size) ifFalse: [ ^absentBlock value ].
+        ^self at: i
+    ]
+    collect: aBlock [
+        | r |
+        r := Array new: self size.
+        1 to: self size do: [:i | r at: i put: (aBlock value: (self at: i)) ].
+        ^r
+    ]
+]

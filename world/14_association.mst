@@ -1,0 +1,35 @@
+"14_association.mst — Association (sprint_s06_detail.md #14). key/value are
+ genesis-declared named instvars (01/02 order) — plain instvar syntax reads
+ and writes them directly, no instVarAt: needed."
+
+Object subclass: Association [
+    Association class >> key: k value: v [
+        | a |
+        a := self basicNew.
+        a setKey: k value: v.
+        ^a
+    ]
+    setKey: k value: v [
+        key := k.
+        value := v.
+    ]
+    key [
+        ^key
+    ]
+    value [
+        ^value
+    ]
+    key: k [
+        key := k
+    ]
+    value: v [
+        value := v
+    ]
+    = other [
+        (other isKindOf: Association) ifFalse: [ ^false ].
+        ^key = other key
+    ]
+    hash [
+        ^key hash
+    ]
+]

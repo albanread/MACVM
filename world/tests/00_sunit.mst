@@ -1,0 +1,99 @@
+"00_sunit.mst — SUnit-lite (sprint_s06_detail.md 'SUnit-lite'). No
+ exceptions in v1 (SPEC §1.3): error:/DNU kills the whole process, so
+ assertion failures are RECORDED via TestResult, not raised — only a
+ genuinely erroneous test aborts the run outright (acceptable; the runner
+ prints each test's name before running it so the culprit is identifiable
+ from stdout even then). Loaded from world/tests/tests.list, which is only
+ read by tests/it_world.rs — macvm run/repl never load this directory."
+
+Object subclass: TestResult [
+    | runCount failCount failures |
+    init [
+        runCount := 0.
+        failCount := 0.
+        failures := OrderedCollection new.
+    ]
+    ranOne [
+        runCount := runCount + 1
+    ]
+    fail: aString [
+        failCount := failCount + 1.
+        failures add: aString.
+    ]
+    runCount [
+        ^runCount
+    ]
+    failCount [
+        ^failCount
+    ]
+    failures [
+        ^failures
+    ]
+    isSuccess [
+        ^failCount = 0
+    ]
+    printOn: s [
+        s nextPutAll: runCount printString.
+        s nextPutAll: ' run, '.
+        s nextPutAll: failCount printString.
+        s nextPutAll: ' failed'
+    ]
+]
+
+Object subclass: TestCase [
+    | result current |
+    result: r [
+        result := r
+    ]
+    "Hook for subclasses that need per-instance setup; no-op by default."
+    init [
+    ]
+    "ranOne counts ASSERTIONS, not test methods (tests_s06.md's target
+     '~215 assertions'/'report prints the assertion count' — the pinned
+     pseudocode's `ranOne` placement inside runTest:do: would only count
+     ~70 methods across the 15 classes, well under the >= 200 gate).
+     Counts on both pass and fail, mirroring 'N run, M failed' where M<=N."
+    assert: aBool [
+        result ranOne.
+        aBool == true ifFalse: [ result fail: current , ': assertion failed' ]
+    ]
+    assert: a equals: b [
+        result ranOne.
+        a = b ifFalse: [
+            result fail: current , ': expected ' , b printString , ' got ' , a printString ]
+    ]
+    deny: aBool [
+        self assert: aBool == false
+    ]
+    runTest: name do: aBlock [
+        current := name asString.
+        Transcript show: '  ' , current.
+        Transcript cr.
+        [ aBlock value ] ensure: [ ]
+    ]
+    TestCase class >> runWith: aResult [
+        | c |
+        c := self new.
+        c result: aResult.
+        c init.
+        c runAll.
+        ^c
+    ]
+]
+
+Object subclass: TestRunner [
+    <classVars: Total>
+    TestRunner class >> start [
+        Total := TestResult new.
+        Total init.
+    ]
+    TestRunner class >> run: aClass [
+        Transcript show: aClass name asString; cr.
+        aClass runWith: Total.
+    ]
+    TestRunner class >> report [
+        Transcript show: Total printString; cr.
+        Total failures do: [:f | Transcript show: f; cr ].
+        Smalltalk quit: (Total isSuccess ifTrue: [ 0 ] ifFalse: [ 1 ])
+    ]
+]

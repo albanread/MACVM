@@ -1,0 +1,58 @@
+"08_double.mst — Double (sprint_s06_detail.md #08). Division by zero never
+ fails the primitive (IEEE inf/nan) — only a non-Double arg does."
+
+Number subclass: Double [
+    isDouble [
+        ^true
+    ]
+    + aNumber [
+        <primitive: 100>
+        ^self + aNumber asDouble
+    ]
+    - aNumber [
+        <primitive: 101>
+        ^self - aNumber asDouble
+    ]
+    * aNumber [
+        <primitive: 102>
+        ^self * aNumber asDouble
+    ]
+    / aNumber [
+        <primitive: 103>
+        ^self / aNumber asDouble
+    ]
+    < aNumber [
+        <primitive: 104>
+        ^self < aNumber asDouble
+    ]
+    = aNumber [
+        <primitive: 105>
+        "primitive 105 only fails when aNumber is not itself a Double."
+        aNumber isInteger ifTrue: [ ^self = aNumber asDouble ].
+        ^false
+    ]
+    ~= aNumber [
+        ^(self = aNumber) not
+    ]
+    sqrt [
+        <primitive: 106>
+    ]
+    floor [
+        <primitive: 107>
+    ]
+    ceiling [
+        ^(0 - self) floor negated
+    ]
+    truncated [
+        ^self < 0 ifTrue: [ self ceiling ] ifFalse: [ self floor ]
+    ]
+    rounded [
+        ^(self + 0.5) floor
+    ]
+    printDigits [
+        <primitive: 109>
+    ]
+    hash [
+        ^self floor hash
+    ]
+]

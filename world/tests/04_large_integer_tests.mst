@@ -1,0 +1,66 @@
+"04_large_integer_tests.mst — LargeIntegerTests (tests_s06.md
+ '04 LargeIntegerTests'). 2^100/2^200 are spelled as decimal literals
+ (verified against Python's `2**100`/`2**200`) rather than hex, to avoid
+ hand-counting hex zeros."
+
+TestCase subclass: LargeIntegerTests [
+    runAll [
+        self runTest: #testOverflowBoundary do: [ self testOverflowBoundary ].
+        self runTest: #testUnderflowBoundary do: [ self testUnderflowBoundary ].
+        self runTest: #testRoundTripDemotion do: [ self testRoundTripDemotion ].
+        self runTest: #testAddSubDigitBoundary do: [ self testAddSubDigitBoundary ].
+        self runTest: #testMultiplication do: [ self testMultiplication ].
+        self runTest: #testComparisonMatrix do: [ self testComparisonMatrix ].
+        self runTest: #testPrintString do: [ self testPrintString ].
+        self runTest: #testEqualityAcrossDemotion do: [ self testEqualityAcrossDemotion ].
+    ]
+
+    testOverflowBoundary [
+        | big |
+        big := SmallInteger maxVal + 1.
+        self assert: big class == LargePositiveInteger.
+        self assert: big > SmallInteger maxVal.
+    ]
+    testUnderflowBoundary [
+        self assert: (SmallInteger minVal - 1) class == LargeNegativeInteger.
+        self assert: SmallInteger minVal negated = (SmallInteger maxVal + 1).
+        self assert: SmallInteger minVal abs = (SmallInteger maxVal + 1).
+    ]
+    testRoundTripDemotion [
+        self assert: (SmallInteger maxVal + 1) - 1 == SmallInteger maxVal.
+        self assert: ((SmallInteger maxVal + 1) - 1) class == SmallInteger.
+    ]
+    "256^k +/- 1 crosses a digit (byte) boundary in the base-256 magnitude."
+    testAddSubDigitBoundary [
+        | k |
+        k := 256 * 256 * 256 * 256 * 256 * 256 * 256 * 256.
+        self assert: (SmallInteger maxVal + k) - k = SmallInteger maxVal.
+        self assert: ((SmallInteger maxVal + 1) + k - k) = (SmallInteger maxVal + 1).
+        self assert: (0 - (SmallInteger maxVal + 1)) + k - k = (0 - (SmallInteger maxVal + 1)).
+    ]
+    testMultiplication [
+        | two100 two200 |
+        two100 := 1267650600228229401496703205376.
+        two200 := 1606938044258990275541962092341162602522202993782792835301376.
+        self assert: (two100 * two100) = two200.
+        self assert: two100 class == LargePositiveInteger.
+        self assert: two100 negated * two100 negated = two200.
+    ]
+    testComparisonMatrix [
+        self assert: 1000000000000000000000 > 5.
+        self assert: 5 < 1000000000000000000000.
+        self assert: (0 - 1000000000000000000000) < 5.
+        self assert: 1000000000000000000000 < 2000000000000000000000.
+        self assert: (0 - 2000000000000000000000) < (0 - 1000000000000000000000).
+        self assert: 1000000000000000000000 > (0 - 1000000000000000000000).
+    ]
+    testPrintString [
+        self assert: 18446744073709551616 printString = '18446744073709551616'.
+        self assert: (0 - 18446744073709551616) printString = '-18446744073709551616'.
+        self assert: SmallInteger minVal negated printString = '2305843009213693952'.
+    ]
+    testEqualityAcrossDemotion [
+        self assert: 1000000000000000000000 = 1000000000000000000000.
+        self assert: 1000000000000000000000 hash = 1000000000000000000000 hash.
+    ]
+]

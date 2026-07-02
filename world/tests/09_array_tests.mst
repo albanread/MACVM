@@ -1,0 +1,49 @@
+"09_array_tests.mst — ArrayTests (tests_s06.md '09 ArrayTests')."
+
+TestCase subclass: ArrayTests [
+    runAll [
+        self runTest: #testLiterals do: [ self testLiterals ].
+        self runTest: #testAtAndBounds do: [ self testAtAndBounds ].
+        self runTest: #testIteration do: [ self testIteration ].
+        self runTest: #testCopyConcatEquality do: [ self testCopyConcatEquality ].
+        self runTest: #testPrintOn do: [ self testPrintOn ].
+    ]
+
+    testLiterals [
+        self assert: #(1 2 3) size = 3.
+        self assert: (#(1 #(2 3) 4) at: 2) = #(2 3).
+        self assert: (#(foo bar) at: 1) == #foo.
+        self assert: (#(-1 -2 3) at: 1) = -1.
+    ]
+    testAtAndBounds [
+        | a |
+        a := Array with: 10 with: 20 with: 30.
+        self assert: (a at: 2) = 20.
+        a at: 2 put: 99.
+        self assert: (a at: 2) = 99.
+        self assert: a size = 3.
+        self assert: (a at: 10 ifAbsent: [ -1 ]) = -1.
+    ]
+    testIteration [
+        | sum coll |
+        sum := 0.
+        #(1 2 3 4) do: [:x | sum := sum + x ].
+        self assert: sum = 10.
+        coll := #(1 2 3) collect: [:x | x * x ].
+        self assert: coll = #(1 4 9).
+        self assert: (#(1 2 3) detect: [:x | x > 1 ] ifNone: [ -1 ]) = 2.
+        self assert: (#(1 2 3) detect: [:x | x > 9 ] ifNone: [ -1 ]) = -1.
+        self assert: (#(1 2 3 4) inject: 0 into: [:acc :x | acc + x ]) = 10.
+    ]
+    testCopyConcatEquality [
+        self assert: (#(1 2 3 4) copyFrom: 2 to: 3) = #(2 3).
+        self assert: (#(1 2) , #(3 4)) = #(1 2 3 4).
+        self assert: #(1 2 3) = #(1 2 3).
+        self deny: #(1 2 3) = #(1 2 4).
+        self assert: #(1 2 3) first = 1.
+        self assert: #(1 2 3) last = 3.
+    ]
+    testPrintOn [
+        self assert: #(1 2 3) printString = '#(1 2 3)'.
+    ]
+]

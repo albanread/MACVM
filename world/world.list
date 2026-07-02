@@ -1,0 +1,28 @@
+# MACVM core library load order (sprint_s06_detail.md "Load order").
+# Name resolution happens at method-compile time: a file may only
+# *reference* globals bound earlier (or in genesis).
+01_object.mst
+02_nil_boolean.mst
+03_behavior.mst
+04_transcript.mst
+# BlockClosure isn't in the doc's numbered per-class list (a doc gap) but
+# must load before any file that sends value/value: for real (05, 06).
+04a_blockclosure.mst
+05_magnitude.mst
+06_smallinteger.mst
+07_largeinteger.mst
+08_double.mst
+# 10 before 09: Character class>>initTable (09's doIt) needs Array>>at:put:
+# already installed. See 10_array.mst's header comment.
+10_array.mst
+09_character.mst
+11_bytearray.mst
+12_string.mst
+13_symbol.mst
+14_association.mst
+15_ordered.mst
+16_dictionary.mst
+17_interval.mst
+18_writestream.mst
+19_printing.mst
+20_system.mst

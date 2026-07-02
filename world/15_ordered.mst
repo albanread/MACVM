@@ -1,0 +1,105 @@
+"15_ordered.mst — OrderedCollection (sprint_s06_detail.md #15). NEW class
+ (not genesis-pinned): instvars declared here via the parser's create-path,
+ not Universe::genesis(). array/firstIndex/lastIndex: elements live at
+ firstIndex..lastIndex in array; empty iff lastIndex < firstIndex."
+
+SequenceableCollection subclass: OrderedCollection [
+    | array firstIndex lastIndex |
+
+    OrderedCollection class >> new [
+        ^self basicNew init
+    ]
+    init [
+        array := Array new: 8.
+        firstIndex := 1.
+        lastIndex := 0.
+    ]
+    size [
+        ^lastIndex - firstIndex + 1
+    ]
+    isEmpty [
+        ^lastIndex < firstIndex
+    ]
+    "Preserves the current elements while doubling capacity, resetting to a
+     firstIndex of 1 (also reclaims any front slack)."
+    makeRoomAtEnd [
+        | newArray n |
+        n := self size.
+        newArray := Array new: (array size max: 1) * 2.
+        1 to: n do: [:i | newArray at: i put: (array at: firstIndex + i - 1) ].
+        array := newArray.
+        firstIndex := 1.
+        lastIndex := n.
+    ]
+    "Mirrors makeRoomAtEnd but leaves slack at the FRONT (elements pushed
+     to the high end of the new array) so addFirst: has room to grow into."
+    makeRoomAtFront [
+        | newArray n cap extra |
+        n := self size.
+        cap := (array size max: 1) * 2.
+        newArray := Array new: cap.
+        extra := cap - n.
+        1 to: n do: [:i | newArray at: extra + i put: (array at: firstIndex + i - 1) ].
+        array := newArray.
+        firstIndex := extra + 1.
+        lastIndex := cap.
+    ]
+    addLast: v [
+        lastIndex = array size ifTrue: [ self makeRoomAtEnd ].
+        lastIndex := lastIndex + 1.
+        array at: lastIndex put: v.
+        ^v
+    ]
+    add: v [
+        ^self addLast: v
+    ]
+    addFirst: v [
+        firstIndex = 1 ifTrue: [ self makeRoomAtFront ].
+        firstIndex := firstIndex - 1.
+        array at: firstIndex put: v.
+        ^v
+    ]
+    removeFirst [
+        | v |
+        self isEmpty ifTrue: [ ^self error: 'collection is empty' ].
+        v := array at: firstIndex.
+        array at: firstIndex put: nil.
+        firstIndex := firstIndex + 1.
+        ^v
+    ]
+    removeLast [
+        | v |
+        self isEmpty ifTrue: [ ^self error: 'collection is empty' ].
+        v := array at: lastIndex.
+        array at: lastIndex put: nil.
+        lastIndex := lastIndex - 1.
+        ^v
+    ]
+    at: i [
+        (i between: 1 and: self size) ifFalse: [ ^self error: 'index out of range' ].
+        ^array at: firstIndex + i - 1
+    ]
+    at: i put: v [
+        (i between: 1 and: self size) ifFalse: [ ^self error: 'index out of range' ].
+        array at: firstIndex + i - 1 put: v.
+        ^v
+    ]
+    do: aBlock [
+        firstIndex to: lastIndex do: [:i | aBlock value: (array at: i) ]
+    ]
+    collect: aBlock [
+        | r |
+        r := OrderedCollection new.
+        self do: [:each | r add: (aBlock value: each) ].
+        ^r
+    ]
+]
+
+Object subclass: Collection [
+    asOrderedCollection [
+        | r |
+        r := OrderedCollection new.
+        self do: [:each | r add: each ].
+        ^r
+    ]
+]

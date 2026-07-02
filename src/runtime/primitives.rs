@@ -10,7 +10,7 @@
 
 use crate::memory::alloc;
 use crate::oops::klass::Format;
-use crate::oops::layout::HEADER_WORDS;
+use crate::oops::layout::{HEADER_WORDS, SMI_MAX, SMI_MIN};
 use crate::oops::smi::SmallInt;
 use crate::oops::wrappers::{ArrayOop, ByteArrayOop, KlassOop, MemOop};
 use crate::oops::Oop;
@@ -364,6 +364,128 @@ pub static PRIMITIVES: &[PrimDesc] = &[
         argc: 0,
         can_allocate: false,
         can_fail: false,
+    },
+    PrimDesc {
+        id: 93,
+        name: "gcScavenge",
+        f: prim_gc_scavenge,
+        argc: 0,
+        can_allocate: false,
+        can_fail: false,
+    },
+    PrimDesc {
+        id: 94,
+        name: "gcFull",
+        f: prim_gc_full,
+        argc: 0,
+        can_allocate: false,
+        can_fail: false,
+    },
+    PrimDesc {
+        id: 95,
+        name: "error:",
+        f: prim_error,
+        argc: 1,
+        can_allocate: false,
+        can_fail: false,
+    },
+    PrimDesc {
+        id: 96,
+        name: "quit:",
+        f: prim_quit_colon,
+        argc: 1,
+        can_allocate: false,
+        can_fail: false,
+    },
+    // --- Double group (S6, SPEC §1.3) ------------------------------------
+    PrimDesc {
+        id: 100,
+        name: "+",
+        f: prim_double_add,
+        argc: 1,
+        can_allocate: true,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 101,
+        name: "-",
+        f: prim_double_sub,
+        argc: 1,
+        can_allocate: true,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 102,
+        name: "*",
+        f: prim_double_mul,
+        argc: 1,
+        can_allocate: true,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 103,
+        name: "/",
+        f: prim_double_div,
+        argc: 1,
+        can_allocate: true,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 104,
+        name: "<",
+        f: prim_double_lt,
+        argc: 1,
+        can_allocate: false,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 105,
+        name: "=",
+        f: prim_double_eq,
+        argc: 1,
+        can_allocate: false,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 106,
+        name: "sqrt",
+        f: prim_double_sqrt,
+        argc: 0,
+        can_allocate: true,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 107,
+        name: "floor",
+        f: prim_double_floor,
+        argc: 0,
+        can_allocate: false,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 108,
+        name: "asDouble",
+        f: prim_smi_as_double,
+        argc: 0,
+        can_allocate: true,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 109,
+        name: "printDigits",
+        f: prim_double_print_digits,
+        argc: 0,
+        can_allocate: true,
+        can_fail: true,
+    },
+    // --- Symbol group (S6) -------------------------------------------------
+    PrimDesc {
+        id: 110,
+        name: "asSymbol",
+        f: prim_string_as_symbol,
+        argc: 0,
+        can_allocate: true,
+        can_fail: true,
     },
 ];
 
@@ -854,6 +976,170 @@ fn prim_millisecond_clock(vm: &mut VmState, _args: &[Oop]) -> PrimResult {
     PrimResult::Ok(SmallInt::new(millis).oop())
 }
 
+/// No-op until S7's real collector exists — S6's library only needs these
+/// selectors to resolve (`Smalltalk gcFull` in test/bench code), not to
+/// actually reclaim anything yet.
+fn prim_gc_scavenge(_vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    PrimResult::Ok(args[0])
+}
+
+fn prim_gc_full(_vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    PrimResult::Ok(args[0])
+}
+
+/// SPEC §6.3: prints the message + a VM stack trace, terminates. Never
+/// returns (its Rust return type is only `PrimResult` so it fits the
+/// `PrimFn` signature — `std::process::exit`'s `!` unifies with it).
+fn prim_error(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    let text = match ByteArrayOop::try_from(args[1]) {
+        Some(b) => {
+            let mut buf = Vec::new();
+            b.copy_bytes_out(&mut buf);
+            String::from_utf8_lossy(&buf).into_owned()
+        }
+        None => "(non-string error message)".to_string(),
+    };
+    let _ = writeln!(vm.out, "Error: {text}");
+    crate::runtime::error::print_stack_trace(vm);
+    let _ = vm.out.flush();
+    std::process::exit(1)
+}
+
+fn prim_quit_colon(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    let code = SmallInt::try_from(args[1])
+        .map(|s| s.value() as i32)
+        .unwrap_or(0);
+    vm.exit_requested = true;
+    vm.exit_code = Some(code);
+    PrimResult::Ok(args[0])
+}
+
+// --- Double group (S6, SPEC §1.3) --------------------------------------------
+
+fn double2(
+    args: &[Oop],
+) -> Option<(
+    crate::oops::wrappers::DoubleOop,
+    crate::oops::wrappers::DoubleOop,
+)> {
+    Some((
+        crate::oops::wrappers::DoubleOop::try_from(args[0])?,
+        crate::oops::wrappers::DoubleOop::try_from(args[1])?,
+    ))
+}
+
+fn prim_double_add(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    match double2(args) {
+        Some((a, b)) => PrimResult::Ok(alloc::alloc_double(vm, a.value() + b.value()).oop()),
+        None => PrimResult::Fail,
+    }
+}
+
+fn prim_double_sub(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    match double2(args) {
+        Some((a, b)) => PrimResult::Ok(alloc::alloc_double(vm, a.value() - b.value()).oop()),
+        None => PrimResult::Fail,
+    }
+}
+
+fn prim_double_mul(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    match double2(args) {
+        Some((a, b)) => PrimResult::Ok(alloc::alloc_double(vm, a.value() * b.value()).oop()),
+        None => PrimResult::Fail,
+    }
+}
+
+fn prim_double_div(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    match double2(args) {
+        // IEEE division by zero yields inf/nan, never fails (pinned,
+        // sprint_s06_detail.md §08 Double) — only a non-Double arg fails.
+        Some((a, b)) => PrimResult::Ok(alloc::alloc_double(vm, a.value() / b.value()).oop()),
+        None => PrimResult::Fail,
+    }
+}
+
+fn prim_double_lt(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    match double2(args) {
+        Some((a, b)) => PrimResult::Ok(bool_oop(vm, a.value() < b.value())),
+        None => PrimResult::Fail,
+    }
+}
+
+fn prim_double_eq(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    match double2(args) {
+        Some((a, b)) => PrimResult::Ok(bool_oop(vm, a.value() == b.value())),
+        None => PrimResult::Fail,
+    }
+}
+
+fn prim_double_sqrt(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    match crate::oops::wrappers::DoubleOop::try_from(args[0]) {
+        Some(a) => PrimResult::Ok(alloc::alloc_double(vm, a.value().sqrt()).oop()),
+        None => PrimResult::Fail,
+    }
+}
+
+fn prim_double_floor(_vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    match crate::oops::wrappers::DoubleOop::try_from(args[0]) {
+        Some(a) => {
+            let f = a.value().floor();
+            if !f.is_finite() || f < SMI_MIN as f64 || f > SMI_MAX as f64 {
+                return PrimResult::Fail;
+            }
+            PrimResult::Ok(SmallInt::new(f as i64).oop())
+        }
+        None => PrimResult::Fail,
+    }
+}
+
+fn prim_smi_as_double(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    match SmallInt::try_from(args[0]) {
+        Some(s) => PrimResult::Ok(alloc::alloc_double(vm, s.value() as f64).oop()),
+        None => PrimResult::Fail,
+    }
+}
+
+/// Shortest round-trip decimal text for a Double (SPEC §1.3's `printOn:`
+/// support) — mirrors `memory::print::print_f64` but without that
+/// function's debug-printer framing (no `nan`/`inf` word wrapping beyond
+/// what Rust's own `Display` gives; String result, not a Rust `String`
+/// consumed by a printer).
+fn prim_double_print_digits(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    let Some(d) = crate::oops::wrappers::DoubleOop::try_from(args[0]) else {
+        return PrimResult::Fail;
+    };
+    let v = d.value();
+    let text = if v.is_nan() {
+        "nan".to_string()
+    } else if v.is_infinite() {
+        if v > 0.0 { "inf" } else { "-inf" }.to_string()
+    } else {
+        let s = format!("{v}");
+        if s.contains('.') || s.contains('e') || s.contains('E') {
+            s
+        } else {
+            format!("{s}.0")
+        }
+    };
+    let klass = vm.universe.string_klass;
+    let b = alloc::alloc_indexable_bytes(vm, klass, text.len());
+    for (i, byte) in text.bytes().enumerate() {
+        b.byte_at_put(i, byte);
+    }
+    PrimResult::Ok(b.oop())
+}
+
+// --- Symbol group (S6) -----------------------------------------------------
+
+fn prim_string_as_symbol(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    let Some(b) = ByteArrayOop::try_from(args[0]) else {
+        return PrimResult::Fail;
+    };
+    let mut buf = Vec::new();
+    b.copy_bytes_out(&mut buf);
+    PrimResult::Ok(vm.universe.intern(&buf).oop())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -873,6 +1159,83 @@ mod tests {
 
     fn call(id: u16, vm: &mut VmState, args: &[Oop]) -> PrimResult {
         (prim_by_id(id).unwrap().f)(vm, args)
+    }
+
+    /// `tests_s06.md`'s `prim_ids_frozen`: a regression lock on the id→name
+    /// map every `.mst` `<primitive: N>` binds against. This registry
+    /// deliberately diverges from `sprint_s06_detail.md`'s suggested
+    /// numbering (S3/S4 pinned ids 1-61/90-96 first; the doc's own text
+    /// permits this) — the table below is MY pinned numbering, not the
+    /// doc's. Adding/renumbering a primitive must update this table
+    /// deliberately, not silently.
+    #[test]
+    fn prim_ids_frozen() {
+        let expected: &[(u16, &str)] = &[
+            (1, "+"),
+            (2, "-"),
+            (3, "*"),
+            (4, "//"),
+            (5, "\\\\"),
+            (6, "bitAnd:"),
+            (7, "bitOr:"),
+            (8, "bitXor:"),
+            (9, "bitShift:"),
+            (10, "<"),
+            (11, "<="),
+            (12, ">"),
+            (13, ">="),
+            (14, "="),
+            (15, "~="),
+            (20, "identityHash"),
+            (21, "class"),
+            (22, "=="),
+            (23, "basicNew"),
+            (24, "basicNew:"),
+            (25, "instVarAt:"),
+            (26, "at:"),
+            (27, "at:put:"),
+            (28, "size"),
+            (40, "byteAt:"),
+            (41, "byteAt:put:"),
+            (42, "byteSize"),
+            (43, "replaceFrom:to:with:"),
+            (44, "hashBytes"),
+            (45, "compare:"),
+            (50, "value"),
+            (51, "value:"),
+            (52, "value:value:"),
+            (53, "value:value:value:"),
+            (54, "valueWithArguments:"),
+            (60, "ensure:"),
+            (61, "ifCurtailed:"),
+            (90, "quit"),
+            (91, "printOnStdout:"),
+            (92, "millisecondClock"),
+            (93, "gcScavenge"),
+            (94, "gcFull"),
+            (95, "error:"),
+            (96, "quit:"),
+            (100, "+"),
+            (101, "-"),
+            (102, "*"),
+            (103, "/"),
+            (104, "<"),
+            (105, "="),
+            (106, "sqrt"),
+            (107, "floor"),
+            (108, "asDouble"),
+            (109, "printDigits"),
+            (110, "asSymbol"),
+        ];
+        assert_eq!(
+            PRIMITIVES.len(),
+            expected.len(),
+            "PRIMITIVES table grew/shrank without updating prim_ids_frozen"
+        );
+        for (d, (id, name)) in PRIMITIVES.iter().zip(expected.iter()) {
+            assert_eq!(d.id, *id, "id mismatch at {}", d.name);
+            assert_eq!(d.name, *name, "name mismatch at id {}", d.id);
+        }
     }
 
     #[test]
@@ -1178,5 +1541,121 @@ mod tests {
         let closure_oop3 = make_block_closure(&mut vm3, 1);
         let buf3 = [closure_oop3, smi(5)];
         assert_eq!(call(54, &mut vm3, &buf3), PrimResult::Fail);
+    }
+
+    /// S6: `instVarAt:` (p25) on a `Klass`-format receiver reads its 8
+    /// named fields 1-based (SPEC §2.4 order) — Behavior's accessors
+    /// (`name`, `superclass`, `instVarNames`, …) depend on this.
+    #[test]
+    fn prim_instvarat_klass() {
+        let mut vm = test_vm();
+        let object_klass = vm.universe.object_klass;
+        let sym = object_klass.name();
+        assert_eq!(
+            call(25, &mut vm, &[object_klass.oop(), smi(5)]),
+            PrimResult::Ok(sym)
+        );
+        let sup = object_klass.superclass();
+        assert_eq!(
+            call(25, &mut vm, &[object_klass.oop(), smi(3)]),
+            PrimResult::Ok(sup)
+        );
+    }
+
+    #[test]
+    fn prim_double_matrix() {
+        let mut vm = test_vm();
+        let d1 = alloc::alloc_double(&mut vm, 1.5).oop();
+        let d2 = alloc::alloc_double(&mut vm, 2.5).oop();
+        let true_obj = vm.universe.true_obj;
+        match call(100, &mut vm, &[d1, d2]) {
+            PrimResult::Ok(o) => {
+                assert_eq!(
+                    crate::oops::wrappers::DoubleOop::try_from(o)
+                        .unwrap()
+                        .value(),
+                    4.0
+                )
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        }
+        assert_eq!(call(104, &mut vm, &[d1, d2]), PrimResult::Ok(true_obj));
+        assert_eq!(call(105, &mut vm, &[d1, d1]), PrimResult::Ok(true_obj));
+        // Non-Double arg fails (Smalltalk fallback coerces, SPEC §1.3).
+        assert_eq!(call(100, &mut vm, &[d1, smi(1)]), PrimResult::Fail);
+
+        let big = alloc::alloc_double(&mut vm, 1e10).oop();
+        let dgt = call(109, &mut vm, &[big]);
+        match dgt {
+            PrimResult::Ok(o) => {
+                let b = ByteArrayOop::try_from(o).unwrap();
+                let mut buf = Vec::new();
+                b.copy_bytes_out(&mut buf);
+                assert_eq!(String::from_utf8(buf).unwrap(), "10000000000.0");
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        }
+
+        match call(108, &mut vm, &[smi(3)]) {
+            PrimResult::Ok(o) => {
+                assert_eq!(
+                    crate::oops::wrappers::DoubleOop::try_from(o)
+                        .unwrap()
+                        .value(),
+                    3.0
+                )
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    /// `tests_s06.md`'s `prim_double_print`: p109 round-trips the shortest
+    /// decimal form for a handful of adversarial values (`prim_error`'s own
+    /// trace/exit-1 path can't be unit-tested in-process — it calls
+    /// `std::process::exit`, so that requirement is covered at the CLI
+    /// integration layer instead, e.g. `tests/it_world.rs`).
+    #[test]
+    fn prim_double_print() {
+        let mut vm = test_vm();
+        let cases: &[(f64, &str)] = &[
+            (0.1, "0.1"),
+            (1e10, "10000000000.0"),
+            (1.5e-3, "0.0015"),
+            (-0.0, "-0.0"),
+        ];
+        for (v, expected) in cases {
+            let d = alloc::alloc_double(&mut vm, *v).oop();
+            match call(109, &mut vm, &[d]) {
+                PrimResult::Ok(o) => {
+                    let b = ByteArrayOop::try_from(o).unwrap();
+                    let mut buf = Vec::new();
+                    b.copy_bytes_out(&mut buf);
+                    assert_eq!(String::from_utf8(buf).unwrap(), *expected, "for {v}");
+                }
+                other => panic!("expected Ok for {v}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn prim_quit_colon_sets_exit_code() {
+        let mut vm = test_vm();
+        let recv = vm.universe.nil_obj;
+        assert_eq!(call(96, &mut vm, &[recv, smi(7)]), PrimResult::Ok(recv));
+        assert!(vm.exit_requested);
+        assert_eq!(vm.exit_code, Some(7));
+    }
+
+    #[test]
+    fn prim_string_as_symbol_interns() {
+        let mut vm = test_vm();
+        let bytearray_klass = vm.universe.bytearray_klass;
+        let s = alloc::alloc_indexable_bytes(&mut vm, bytearray_klass, 3);
+        s.byte_at_put(0, b'f');
+        s.byte_at_put(1, b'o');
+        s.byte_at_put(2, b'o');
+        let result = call(110, &mut vm, &[s.oop()]);
+        let expected = vm.universe.intern(b"foo").oop();
+        assert_eq!(result, PrimResult::Ok(expected));
     }
 }

@@ -1,0 +1,206 @@
+"19_printing.mst — Printing reopens across the world (sprint_s06_detail.md
+ #19). Object>>printOn: has NO article (`Object new printString` = 'Object',
+ not 'an Object') — pinned deviation from tradition. Every class below
+ overrides printOn:; printString/displayString stay Object-level."
+
+nil subclass: Object [
+    printOn: s [
+        s nextPutAll: self class name asString
+    ]
+    printString [
+        | s |
+        s := WriteStream on: (String new: 16).
+        self printOn: s.
+        ^s contents
+    ]
+    displayString [
+        ^self printString
+    ]
+    inspect [
+        | names |
+        names := self class instVarNames.
+        Transcript show: self class name asString; cr.
+        1 to: names size do: [:i |
+            Transcript show: '  '; show: (names at: i) asString; show: ': ';
+                show: (self instVarAt: i) printString; cr ]
+    ]
+]
+
+Object subclass: UndefinedObject [
+    printOn: s [
+        s nextPutAll: 'nil'
+    ]
+]
+
+Boolean subclass: True [
+    printOn: s [
+        s nextPutAll: 'true'
+    ]
+]
+
+Boolean subclass: False [
+    printOn: s [
+        s nextPutAll: 'false'
+    ]
+]
+
+"SmallInteger>>minVal negated overflows into a LargePositiveInteger, whose
+ own printOn: (divMod: 10 loop, 07_largeinteger.mst) picks up from there —
+ no minVal special case needed here."
+Integer subclass: SmallInteger [
+    printOn: s [
+        | n digits |
+        self < 0 ifTrue: [ s nextPut: $-. ^self negated printOn: s ].
+        self = 0 ifTrue: [ ^s nextPut: $0 ].
+        digits := OrderedCollection new.
+        n := self.
+        [ n = 0 ] whileFalse: [ digits addFirst: n \\ 10. n := n // 10 ].
+        digits do: [:d | s nextPut: (Character value: 48 + d) ]
+    ]
+]
+
+LargeInteger subclass: LargePositiveInteger [
+    printOn: s [
+        self printMagnitudeOn: s
+    ]
+]
+
+LargeInteger subclass: LargeNegativeInteger [
+    printOn: s [
+        s nextPut: $-.
+        self printMagnitudeOn: s
+    ]
+]
+
+Integer subclass: LargeInteger [
+    "q starts Large but negated/normalize can collapse it to a SmallInteger
+     partway through (as soon as the remaining magnitude fits) — LargeInteger
+     only has divMod:, SmallInteger only has \\//, so branch on which one q
+     currently is rather than picking one peeling method for the whole loop."
+    printMagnitudeOn: s [
+        | pair q digits |
+        digits := OrderedCollection new.
+        q := self classSign = 1 ifTrue: [ self ] ifFalse: [ self negated ].
+        [ q = 0 ] whileFalse: [
+            (q isKindOf: SmallInteger)
+                ifTrue: [ digits addFirst: q \\ 10. q := q // 10 ]
+                ifFalse: [
+                    pair := q divMod: 10.
+                    digits addFirst: pair value.
+                    q := pair key ] ].
+        digits isEmpty ifTrue: [ digits add: 0 ].
+        digits do: [:d | s nextPut: (Character value: 48 + d) ]
+    ]
+]
+
+Number subclass: Double [
+    printOn: s [
+        s nextPutAll: self printDigits
+    ]
+]
+
+Magnitude subclass: Character [
+    printOn: s [
+        s nextPut: $$.
+        s nextPut: self
+    ]
+]
+
+ArrayedCollection subclass: String [
+    displayString [
+        ^self
+    ]
+    printOn: s [
+        s nextPut: $'.
+        1 to: self size do: [:i |
+            | c |
+            c := self at: i.
+            c = $' ifTrue: [ s nextPut: $'. s nextPut: $' ] ifFalse: [ s nextPut: c ] ].
+        s nextPut: $'
+    ]
+]
+
+String subclass: Symbol [
+    printOn: s [
+        s nextPut: $#.
+        s nextPutAll: self asString
+    ]
+]
+
+ArrayedCollection subclass: Array [
+    printOn: s [
+        s nextPutAll: '#('.
+        1 to: self size do: [:i |
+            (self at: i) printOn: s.
+            i < self size ifTrue: [ s nextPut: $  ] ].
+        s nextPut: $)
+    ]
+]
+
+ArrayedCollection subclass: ByteArray [
+    printOn: s [
+        s nextPutAll: '#['.
+        1 to: self size do: [:i |
+            (self at: i) printOn: s.
+            i < self size ifTrue: [ s nextPut: $  ] ].
+        s nextPut: $]
+    ]
+]
+
+SequenceableCollection subclass: OrderedCollection [
+    printOn: s [
+        s nextPutAll: 'OrderedCollection ('.
+        self do: [:each | each printOn: s. s nextPut: $  ].
+        s nextPut: $)
+    ]
+]
+
+HashedCollection subclass: Dictionary [
+    printOn: s [
+        s nextPutAll: 'Dictionary ('.
+        self keysAndValuesDo: [:k :v |
+            k printOn: s.
+            s nextPutAll: '->'.
+            v printOn: s.
+            s nextPut: $  ].
+        s nextPut: $)
+    ]
+]
+
+Object subclass: Association [
+    printOn: s [
+        key printOn: s.
+        s nextPutAll: '->'.
+        value printOn: s
+    ]
+]
+
+SequenceableCollection subclass: Interval [
+    printOn: s [
+        s nextPut: $(.
+        start printOn: s.
+        s nextPutAll: ' to: '.
+        stop printOn: s.
+        step = 1 ifFalse: [ s nextPutAll: ' by: '. step printOn: s ].
+        s nextPut: $)
+    ]
+]
+
+Object subclass: Behavior [
+    printOn: s [
+        s nextPutAll: self name asString
+    ]
+]
+
+Object subclass: TranscriptStream [
+    show: anObject [
+        anObject isString ifTrue: [ ^self basicPrint: anObject ].
+        ^self show: anObject printString
+    ]
+    << anObject [
+        anObject isString ifTrue: [ self show: anObject. ^self ].
+        anObject isCharacter ifTrue: [ self show: (String with: anObject). ^self ].
+        self show: anObject printString.
+        ^self
+    ]
+]

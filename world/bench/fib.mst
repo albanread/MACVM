@@ -1,0 +1,14 @@
+"fib.mst — sprint_s06_detail.md 'Benchmarks'. Reopens Integer under its
+ TRUE superclass Number (Pitfall P2 — Integer's actual genesis superclass,
+ not Object). Not in world.list; `macvm run world/bench/fib.mst --world
+ world` loads it explicitly."
+
+Number subclass: Integer [
+    fib [
+        self < 2 ifTrue: [ ^self ].
+        ^(self - 1) fib + (self - 2) fib
+    ]
+]
+
+Transcript show: 25 fib printString.
+Transcript cr.

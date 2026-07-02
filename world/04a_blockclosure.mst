@@ -1,0 +1,30 @@
+"04a_blockclosure.mst — BlockClosure (sprint_s06_detail.md's genesis tree
+ lists BlockClosure and pins primitives 50-54 for it, but the doc's
+ numbered 01-20 per-class list has no BlockClosure section — a gap in the
+ doc. Every real (non-inlined) block send needs this early: 06's
+ Integer>>timesRepeat: and 05's Number>>to:stop:do: already call aBlock
+ value/value: for real, so this must load before 05."
+
+Object subclass: BlockClosure [
+    value [
+        <primitive: 50>
+    ]
+    value: a1 [
+        <primitive: 51>
+    ]
+    value: a1 value: a2 [
+        <primitive: 52>
+    ]
+    value: a1 value: a2 value: a3 [
+        <primitive: 53>
+    ]
+    valueWithArguments: anArray [
+        <primitive: 54>
+    ]
+    ensure: aBlock [
+        <primitive: 60>
+    ]
+    ifCurtailed: aBlock [
+        <primitive: 61>
+    ]
+]

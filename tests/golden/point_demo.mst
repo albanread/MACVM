@@ -1,4 +1,4 @@
-Object subclass: SmallInteger [
+Integer subclass: SmallInteger [
     + other [
         <primitive: 1>
         ^self

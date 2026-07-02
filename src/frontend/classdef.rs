@@ -88,10 +88,10 @@ fn append_class_var(vm: &mut VmState, klass: KlassOop, sym: SymbolOop) {
 fn reopen_klass(
     vm: &mut VmState,
     klass: KlassOop,
-    super_klass: KlassOop,
+    declared_super: Oop,
     node: &ClassDefNode,
 ) -> Result<(), CompileError> {
-    if klass.superclass().raw() != super_klass.oop().raw() {
+    if klass.superclass().raw() != declared_super.raw() {
         return Err(err(
             node.span,
             format!(
@@ -118,7 +118,18 @@ fn reopen_klass(
 /// method (instance-side into `klass`'s own `MethodDictionary`, class-side
 /// into its metaclass's — `runtime::lookup::install_method` already flushes
 /// the lookup cache and bumps `ic_epoch`, SPEC §6.2).
-pub fn install_class_def(vm: &mut VmState, node: &mut ClassDefNode) -> Result<(), CompileError> {
+/// Resolves `name` as an already-bound klass global. `"nil"` is accepted
+/// specially — `Object`'s REAL superclass is the nil oop itself (it is the
+/// root of the hierarchy, not a klass), so a reopen naming its true
+/// superclass must be able to say `nil subclass: Object [...]` and have
+/// that compare equal to `Object.superclass()` (which is nil, not a
+/// `KlassOop`). Only meaningful for reopen's superclass-match check —
+/// `create_klass` never receives a nil target (creating a NEW root class
+/// alongside Object is out of scope for source-level `subclass:`).
+fn resolve_super_target(vm: &mut VmState, node: &ClassDefNode) -> Result<Oop, CompileError> {
+    if node.superclass == "nil" {
+        return Ok(vm.universe.nil_obj);
+    }
     let super_sym = vm.universe.intern(node.superclass.as_bytes());
     let super_assoc = crate::runtime::globals::global_lookup(vm, super_sym).ok_or_else(|| {
         err(
@@ -126,15 +137,20 @@ pub fn install_class_def(vm: &mut VmState, node: &mut ClassDefNode) -> Result<()
             format!("superclass '{}' not found", node.superclass),
         )
     })?;
-    let super_val = MemOop::try_from(super_assoc)
+    Ok(MemOop::try_from(super_assoc)
         .expect("global association is a mem oop")
-        .body_oop(1);
-    let super_klass = KlassOop::try_from(super_val)
-        .ok_or_else(|| err(node.span, format!("'{}' is not a class", node.superclass)))?;
+        .body_oop(1))
+}
 
+pub fn install_class_def(vm: &mut VmState, node: &mut ClassDefNode) -> Result<(), CompileError> {
     let name_sym = vm.universe.intern(node.name.as_bytes());
     let klass = match crate::runtime::globals::global_lookup(vm, name_sym) {
-        None => create_klass(vm, super_klass, node),
+        None => {
+            let super_target = resolve_super_target(vm, node)?;
+            let super_klass = KlassOop::try_from(super_target)
+                .ok_or_else(|| err(node.span, format!("'{}' is not a class", node.superclass)))?;
+            create_klass(vm, super_klass, node)
+        }
         Some(assoc) => {
             let val = MemOop::try_from(assoc)
                 .expect("global association is a mem oop")
@@ -145,7 +161,8 @@ pub fn install_class_def(vm: &mut VmState, node: &mut ClassDefNode) -> Result<()
                     format!("'{}' is already bound to a non-class value", node.name),
                 )
             })?;
-            reopen_klass(vm, existing, super_klass, node)?;
+            let super_target = resolve_super_target(vm, node)?;
+            reopen_klass(vm, existing, super_target, node)?;
             existing
         }
     };

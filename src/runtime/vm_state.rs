@@ -147,11 +147,20 @@ pub struct VmState {
     /// transcript assertions don't need a subprocess before S5's golden
     /// runner exists.
     pub out: Box<dyn Write>,
-    /// Set by the `quit` primitive; the dispatch loop exits (after the
-    /// current activation returns) once this is true.
+    /// Set by the `quit`/`quit:` primitive; the dispatch loop exits (after
+    /// the current activation returns) once this is true.
     pub exit_requested: bool,
+    /// The process exit code `quit:` (S6) requested, if any — `None` means
+    /// `quit` (0-arg) or no `quit` at all, both of which exit 0. Read by
+    /// `main.rs`'s `cmd_run` after `world::load_file` returns.
+    pub exit_code: Option<i32>,
     /// VM boot time, for the `millisecondClock` primitive.
     pub start_instant: Instant,
+    /// Total bytecodes dispatched, counted only while `MACVM_TRACE=count` is
+    /// enabled (S6 PERF procedure: cost is one `add` per dispatch,
+    /// unconditionally compiled in — CONVENTIONS §3's channel list). Printed
+    /// to stderr at process exit by `main.rs`.
+    pub bytecode_count: u64,
     /// The next frame serial to hand out (SPEC §5.4, S4) — monotonic,
     /// post-incremented at every `push_frame`. Never reused, which is what
     /// makes a `HomeRef`'s `(fp, serial)` pair a reliable dead-home check:
@@ -182,7 +191,9 @@ impl VmState {
             prim_arg_base: 0,
             out: Box::new(std::io::stdout()),
             exit_requested: false,
+            exit_code: None,
             start_instant: Instant::now(),
+            bytecode_count: 0,
             next_frame_serial: 0,
         };
         crate::runtime::globals::bootstrap_well_known(&mut vm);

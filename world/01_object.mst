@@ -1,0 +1,53 @@
+"01_object.mst — Object core (sprint_s06_detail.md #01). Only methods that
+ need no other class's methods: identityHash/class/==/basicNew(:)/
+ instVarAt:/error:/doesNotUnderstand:. Boolean-dependent methods (=, ~=,
+ ~~, isNil, notNil) and printing (printOn:, printString) land later (02,
+ 19) once their dependencies exist."
+
+nil subclass: Object [
+    class [
+        <primitive: 21>
+    ]
+    == anObject [
+        <primitive: 22>
+    ]
+    identityHash [
+        <primitive: 20>
+    ]
+    hash [
+        ^self identityHash
+    ]
+    yourself [
+        ^self
+    ]
+    basicNew [
+        <primitive: 23>
+    ]
+    basicNew: n [
+        <primitive: 24>
+    ]
+    instVarAt: i [
+        <primitive: 25>
+    ]
+    -> v [
+        ^Association key: self value: v
+    ]
+    error: aString [
+        <primitive: 95>
+    ]
+    subclassResponsibility [
+        self error: 'subclass responsibility'
+    ]
+    doesNotUnderstand: aMessage [
+        self error: 'does not understand ' , aMessage selector asString
+    ]
+]
+
+Object subclass: Message [
+    selector [
+        ^self instVarAt: 1
+    ]
+    arguments [
+        ^self instVarAt: 2
+    ]
+]

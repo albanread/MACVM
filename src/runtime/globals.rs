@@ -50,6 +50,15 @@ pub(crate) fn bootstrap_well_known(vm: &mut VmState) {
         vm.universe.message_klass,
         vm.universe.large_pos_int_klass,
         vm.universe.large_neg_int_klass,
+        vm.universe.behavior_klass,
+        vm.universe.magnitude_klass,
+        vm.universe.number_klass,
+        vm.universe.integer_klass,
+        vm.universe.large_integer_klass,
+        vm.universe.collection_klass,
+        vm.universe.sequenceable_collection_klass,
+        vm.universe.arrayed_collection_klass,
+        vm.universe.system_dictionary_klass,
     ];
     for k in klasses {
         let name_sym =
@@ -59,6 +68,16 @@ pub(crate) fn bootstrap_well_known(vm: &mut VmState) {
             .expect("global association is a mem oop")
             .set_body_oop(1, k.oop());
     }
+
+    // `Smalltalk` itself (SPEC §3.2 step 3's `Smalltalk startUp` send target)
+    // — bound last, once the namespace's own backing array definitely
+    // exists (any `global_declare` call above already forced it).
+    let smalltalk_sym = vm.universe.intern(b"Smalltalk");
+    let assoc = global_declare(vm, smalltalk_sym);
+    let smalltalk_obj = vm.universe.smalltalk;
+    MemOop::try_from(assoc)
+        .expect("global association is a mem oop")
+        .set_body_oop(1, smalltalk_obj);
 }
 
 /// The bound `Association` for `name`, if declared.
@@ -100,10 +119,14 @@ pub fn global_declare(vm: &mut VmState, name: SymbolOop) -> Oop {
 /// Grows (or allocates for the first time) so at least one more slot is
 /// free past the current tally.
 fn ensure_capacity(vm: &mut VmState) {
-    let array_klass = vm.universe.array_klass;
+    // Same `[tally][assoc-or-nil…]` `IndexableOops` layout `array_klass`
+    // itself uses — `system_dictionary_klass` just reclassifies the object
+    // (SPEC-QUESTION A5: `smalltalk` is a SystemDictionary, not a bare
+    // Array), no representation change.
+    let sysdict_klass = vm.universe.system_dictionary_klass;
     match ArrayOop::try_from(vm.universe.smalltalk) {
         None => {
-            let arr = alloc::alloc_indexable_oops(vm, array_klass, 1 + INITIAL_CAPACITY);
+            let arr = alloc::alloc_indexable_oops(vm, sysdict_klass, 1 + INITIAL_CAPACITY);
             arr.at_put(0, SmallInt::new(0).oop());
             vm.universe.smalltalk = arr.oop();
         }
@@ -114,7 +137,7 @@ fn ensure_capacity(vm: &mut VmState) {
                 return;
             }
             let new_cap = cap * 2;
-            let grown = alloc::alloc_indexable_oops(vm, array_klass, 1 + new_cap);
+            let grown = alloc::alloc_indexable_oops(vm, sysdict_klass, 1 + new_cap);
             let arr = ArrayOop::try_from(vm.universe.smalltalk).unwrap();
             grown.at_put(0, SmallInt::new(tally as i64).oop());
             for i in 0..tally {

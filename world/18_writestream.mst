@@ -1,0 +1,58 @@
+"18_writestream.mst — WriteStream (sprint_s06_detail.md #18). NEW class.
+ `on:` works over both String and Array collections — every write goes
+ through the receiver's own at:put:, so bytes vs. oops dispatch naturally.
+ `<<` on non-String/Character objects needs printString (19) to be useful;
+ it compiles fine now (just a runtime send) but only works after 19 loads."
+
+Object subclass: WriteStream [
+    | collection position |
+
+    WriteStream class >> on: aCollection [
+        | s |
+        s := self basicNew.
+        s setOn: aCollection.
+        ^s
+    ]
+    setOn: aCollection [
+        collection := aCollection.
+        position := 0.
+    ]
+    grow [
+        | newSize newColl |
+        newSize := (collection size max: 4) * 2.
+        newColl := collection class new: newSize.
+        1 to: position do: [:i | newColl at: i put: (collection at: i) ].
+        collection := newColl.
+    ]
+    nextPut: e [
+        position = collection size ifTrue: [ self grow ].
+        position := position + 1.
+        collection at: position put: e.
+        ^e
+    ]
+    nextPutAll: aColl [
+        aColl do: [:e | self nextPut: e ].
+        ^aColl
+    ]
+    contents [
+        ^collection copyFrom: 1 to: position
+    ]
+    << anObject [
+        anObject isString ifTrue: [ self nextPutAll: anObject. ^self ].
+        anObject isCharacter ifTrue: [ self nextPut: anObject. ^self ].
+        self nextPutAll: anObject printString.
+        ^self
+    ]
+    cr [
+        self nextPut: Character cr
+    ]
+    nl [
+        self nextPut: Character nl
+    ]
+    tab [
+        self nextPut: Character tab
+    ]
+    space [
+        self nextPut: Character space
+    ]
+]

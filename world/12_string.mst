@@ -1,0 +1,112 @@
+"12_string.mst — String (sprint_s06_detail.md #12). at:/at:put: wrap the raw
+ byte primitives through Character; = pins Symbol *is* a String from
+ String's side (byte-compare via compare:) while Symbol overrides = to
+ identity — the asymmetry is intentional (13_symbol.mst, tested in
+ tests/it_world.rs later)."
+
+ArrayedCollection subclass: String [
+    isString [
+        ^true
+    ]
+    basicByteAt: i [
+        <primitive: 40>
+    ]
+    basicByteAt: i put: v [
+        <primitive: 41>
+    ]
+    at: i [
+        ^Character value: (self basicByteAt: i)
+    ]
+    at: i put: v [
+        | b |
+        b := (v isKindOf: Character) ifTrue: [ v asInteger ] ifFalse: [ v ].
+        self basicByteAt: i put: b.
+        ^v
+    ]
+    size [
+        <primitive: 28>
+    ]
+    at: i ifAbsent: absentBlock [
+        (i between: 1 and: self size) ifFalse: [ ^absentBlock value ].
+        ^self at: i
+    ]
+    hash [
+        <primitive: 44>
+    ]
+    compare: other [
+        <primitive: 45>
+    ]
+    = other [
+        other isString ifFalse: [ ^false ].
+        ^(self compare: other) = 0
+    ]
+    < other [
+        ^(self compare: other) < 0
+    ]
+    <= other [
+        ^(self compare: other) <= 0
+    ]
+    > other [
+        ^(self compare: other) > 0
+    ]
+    >= other [
+        ^(self compare: other) >= 0
+    ]
+    "Copies ALL of src (read from src's own index 1) into self[from..to]."
+    replaceFrom: from to: to with: src [
+        <primitive: 43>
+    ]
+    , other [
+        | r |
+        r := self class new: self size + other size.
+        r replaceFrom: 1 to: self size with: self.
+        r replaceFrom: self size + 1 to: self size + other size with: other.
+        ^r
+    ]
+    copyFrom: from to: to [
+        | r n |
+        n := to - from + 1.
+        r := self class new: n.
+        1 to: n do: [:i | r at: i put: (self at: from + i - 1) ].
+        ^r
+    ]
+    asString [
+        ^self
+    ]
+    asSymbol [
+        <primitive: 110>
+    ]
+    asUppercase [
+        | r |
+        r := self class new: self size.
+        1 to: self size do: [:i | r at: i put: (self at: i) asUppercase ].
+        ^r
+    ]
+    asLowercase [
+        | r |
+        r := self class new: self size.
+        1 to: self size do: [:i | r at: i put: (self at: i) asLowercase ].
+        ^r
+    ]
+    reverse [
+        | r n |
+        n := self size.
+        r := self class new: n.
+        1 to: n do: [:i | r at: i put: (self at: n - i + 1) ].
+        ^r
+    ]
+    includesChar: aChar [
+        1 to: self size do: [:i | (self at: i) = aChar ifTrue: [ ^true ] ].
+        ^false
+    ]
+    indexOf: aChar [
+        1 to: self size do: [:i | (self at: i) = aChar ifTrue: [ ^i ] ].
+        ^0
+    ]
+    String class >> with: aChar [
+        | r |
+        r := self new: 1.
+        r at: 1 put: aChar.
+        ^r
+    ]
+]

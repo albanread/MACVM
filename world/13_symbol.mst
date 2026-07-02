@@ -1,0 +1,24 @@
+"13_symbol.mst — Symbol (sprint_s06_detail.md #13). Interned, so = is
+ identity (faster than and consistent with hash [^self identityHash]) —
+ this is what makes 12_string.mst's String>>= asymmetric against Symbol."
+
+String subclass: Symbol [
+    asSymbol [
+        ^self
+    ]
+    isSymbol [
+        ^true
+    ]
+    asString [
+        ^(String new: self size) replaceFrom: 1 to: self size with: self
+    ]
+    = other [
+        ^self == other
+    ]
+    hash [
+        ^self identityHash
+    ]
+    at: i put: v [
+        self error: 'symbols are immutable'
+    ]
+]

@@ -1,0 +1,45 @@
+"03_behavior.mst — Behavior/Class/Metaclass (sprint_s06_detail.md #03).
+ instVarAt: indices follow oops/layout.rs's KLASS_*_INDEX order, 1-based:
+ 1 format, 2 non_indexable_size, 3 superclass, 4 methods, 5 name,
+ 6 inst_var_names, 7 class_vars, 8 mixin."
+
+Object subclass: Behavior [
+    name [
+        ^self instVarAt: 5
+    ]
+    superclass [
+        ^self instVarAt: 3
+    ]
+    instVarNames [
+        ^self instVarAt: 6
+    ]
+    new [
+        ^self basicNew
+    ]
+    new: n [
+        ^self basicNew: n
+    ]
+    inheritsFrom: aClass [
+        | s |
+        s := self superclass.
+        [ s notNil ] whileTrue: [
+            s == aClass ifTrue: [ ^true ].
+            s := s superclass ].
+        ^false
+    ]
+]
+
+Behavior subclass: Class [
+]
+
+Behavior subclass: Metaclass [
+]
+
+nil subclass: Object [
+    isKindOf: aClass [
+        ^self class == aClass or: [ self class inheritsFrom: aClass ]
+    ]
+    isMemberOf: aClass [
+        ^self class == aClass
+    ]
+]

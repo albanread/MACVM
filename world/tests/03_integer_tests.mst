@@ -1,0 +1,63 @@
+"03_integer_tests.mst — IntegerTests (tests_s06.md '03 IntegerTests')."
+
+TestCase subclass: IntegerTests [
+    runAll [
+        self runTest: #testArith do: [ self testArith ].
+        self runTest: #testComparisons do: [ self testComparisons ].
+        self runTest: #testBitOps do: [ self testBitOps ].
+        self runTest: #testEvenOddGcdTimes do: [ self testEvenOddGcdTimes ].
+        self runTest: #testRadixLiterals do: [ self testRadixLiterals ].
+        self runTest: #testPrintString do: [ self testPrintString ].
+        self runTest: #testHash do: [ self testHash ].
+    ]
+
+    testArith [
+        self assert: 3 + 4 = 7.
+        self assert: 3 - 4 = -1.
+        self assert: 3 * 4 = 12.
+        self assert: -7 // 2 = -4.
+        self assert: -7 \\ 2 = 1.
+        self assert: 7 // -2 = -4.
+        self assert: 7 \\ -2 = -1.
+        self assert: -7 // -2 = 3.
+    ]
+    testComparisons [
+        self assert: 3 < 4.
+        self assert: 4 > 3.
+        self assert: (3 max: 5) = 5.
+        self assert: (3 min: 5) = 3.
+        self assert: (3 between: 1 and: 10).
+        self deny: (30 between: 1 and: 10).
+    ]
+    testBitOps [
+        self assert: (12 bitAnd: 10) = 8.
+        self assert: (12 bitOr: 3) = 15.
+        self assert: (12 bitXor: 10) = 6.
+        self assert: (1 bitShift: 4) = 16.
+        self assert: (16 bitShift: -2) = 4.
+    ]
+    testEvenOddGcdTimes [
+        | n |
+        self assert: 4 even.
+        self assert: 5 odd.
+        self assert: (12 gcd: 18) = 6.
+        n := 0.
+        5 timesRepeat: [ n := n + 1 ].
+        self assert: n = 5.
+    ]
+    testRadixLiterals [
+        self assert: 16rFF = 255.
+        self assert: 2r101 = 5.
+        self assert: 8r17 = 15.
+    ]
+    testPrintString [
+        self assert: 0 printString = '0'.
+        self assert: 7 printString = '7'.
+        self assert: -7 printString = '-7'.
+        self assert: SmallInteger minVal printString = '-2305843009213693952'.
+        self assert: SmallInteger maxVal printString = '2305843009213693951'.
+    ]
+    testHash [
+        self assert: 42 hash = 42.
+    ]
+]

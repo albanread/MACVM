@@ -1,0 +1,70 @@
+"11_orderedcollection_tests.mst — OrderedCollectionTests (tests_s06.md
+ '11 OrderedCollectionTests'). Empty-collection removeFirst/removeLast
+ error is skipped (would kill the run; no should:raise: until S18)."
+
+TestCase subclass: OrderedCollectionTests [
+    runAll [
+        self runTest: #testAddOrdering do: [ self testAddOrdering ].
+        self runTest: #testGrowthPastCapacity do: [ self testGrowthPastCapacity ].
+        self runTest: #testRemove do: [ self testRemove ].
+        self runTest: #testProtocol do: [ self testProtocol ].
+        self runTest: #testFirstLast do: [ self testFirstLast ].
+        self runTest: #testPrintString do: [ self testPrintString ].
+    ]
+
+    testAddOrdering [
+        | oc |
+        oc := OrderedCollection new.
+        oc add: 1.
+        oc addLast: 2.
+        oc addFirst: 0.
+        self assert: oc asArray = #(0 1 2).
+    ]
+    testGrowthPastCapacity [
+        | oc |
+        oc := OrderedCollection new.
+        1 to: 100 do: [:i | oc add: i ].
+        self assert: oc size = 100.
+        self assert: (oc at: 1) = 1.
+        self assert: (oc at: 100) = 100.
+        oc := OrderedCollection new.
+        1 to: 20 do: [:i | oc addFirst: i ].
+        self assert: oc size = 20.
+        self assert: (oc at: 1) = 20.
+        self assert: (oc at: 20) = 1.
+    ]
+    testRemove [
+        | oc |
+        oc := OrderedCollection new.
+        oc add: 1; add: 2; add: 3.
+        self assert: oc removeFirst = 1.
+        self assert: oc removeLast = 3.
+        self assert: oc size = 1.
+        self assert: (oc at: 1) = 2.
+    ]
+    testProtocol [
+        | oc |
+        oc := OrderedCollection new.
+        oc add: 1; add: 2; add: 3.
+        self assert: oc size = 3.
+        self assert: (oc detect: [:x | x > 1 ] ifNone: [ -1 ]) = 2.
+        self assert: (oc includes: 2).
+        self deny: (oc includes: 9).
+        self assert: (oc collect: [:x | x * 2 ]) asArray = #(2 4 6).
+        self assert: oc asArray = #(1 2 3).
+        self assert: (oc inject: 0 into: [:acc :x | acc + x ]) = 6.
+    ]
+    testFirstLast [
+        | oc |
+        oc := OrderedCollection new.
+        oc add: 5; add: 6; add: 7.
+        self assert: oc first = 5.
+        self assert: oc last = 7.
+    ]
+    testPrintString [
+        | oc |
+        oc := OrderedCollection new.
+        oc add: 1; add: 2.
+        self assert: oc printString = 'OrderedCollection (1 2 )'.
+    ]
+]

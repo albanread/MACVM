@@ -1,0 +1,53 @@
+"05_magnitude.mst — Magnitude/Number (sprint_s06_detail.md #05). Number>>
+ to:do: is the real-send twin of S5's inlined to:do: (Pitfall P6) — must
+ match the inlined pattern's result (the receiver) exactly."
+
+Object subclass: Magnitude [
+    < aMagnitude [
+        self subclassResponsibility
+    ]
+    > aMagnitude [
+        ^aMagnitude < self
+    ]
+    <= aMagnitude [
+        ^(aMagnitude < self) not
+    ]
+    >= aMagnitude [
+        ^(self < aMagnitude) not
+    ]
+    max: aMagnitude [
+        ^self < aMagnitude ifTrue: [ aMagnitude ] ifFalse: [ self ]
+    ]
+    min: aMagnitude [
+        ^self < aMagnitude ifTrue: [ self ] ifFalse: [ aMagnitude ]
+    ]
+    between: lo and: hi [
+        ^(self >= lo) and: [ self <= hi ]
+    ]
+]
+
+Magnitude subclass: Number [
+    abs [
+        ^self < 0 ifTrue: [ self negated ] ifFalse: [ self ]
+    ]
+    negated [
+        ^0 - self
+    ]
+    isZero [
+        ^self = 0
+    ]
+    sign [
+        self < 0 ifTrue: [ ^-1 ].
+        self > 0 ifTrue: [ ^1 ].
+        ^0
+    ]
+    squared [
+        ^self * self
+    ]
+    to: stop do: aBlock [
+        | i |
+        i := self.
+        [ i <= stop ] whileTrue: [ aBlock value: i. i := i + 1 ].
+        ^self
+    ]
+]

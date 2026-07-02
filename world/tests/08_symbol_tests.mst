@@ -1,0 +1,33 @@
+"08_symbol_tests.mst — SymbolTests (tests_s06.md '08 SymbolTests'). `copy`
+ is out of scope for S6 (sprint_s06_detail.md 'Out of scope': 'copy
+ protocols beyond copyFrom:to:') — the asymmetry case below builds a
+ non-identical-but-equal String via `,` instead of `'foo' copy`.
+ at:put:-on-a-Symbol-errors is skipped (would kill the whole run; no
+ should:raise: until S18, same as StringTests' skip)."
+
+TestCase subclass: SymbolTests [
+    runAll [
+        self runTest: #testInterningIdentity do: [ self testInterningIdentity ].
+        self runTest: #testEqualityAsymmetry do: [ self testEqualityAsymmetry ].
+        self runTest: #testStringRoundTrip do: [ self testStringRoundTrip ].
+        self runTest: #testPrintString do: [ self testPrintString ].
+    ]
+
+    testInterningIdentity [
+        self assert: #foo == #foo.
+        self assert: 'foo' asSymbol == #foo.
+        self assert: ('fo' , 'o') asSymbol == #foo.
+    ]
+    testEqualityAsymmetry [
+        self deny: #foo = ('fo' , 'o').
+        self assert: ('fo' , 'o') = #foo.
+    ]
+    testStringRoundTrip [
+        self assert: #foo asString asSymbol == #foo.
+        self assert: #foo asString = 'foo'.
+    ]
+    testPrintString [
+        self assert: #foo printString = '#foo'.
+        self assert: #at:put: printString = '#at:put:'.
+    ]
+]

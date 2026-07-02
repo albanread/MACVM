@@ -1,0 +1,78 @@
+"09_character.mst — Character (sprint_s06_detail.md #09). Flyweight per
+ SPEC §1.3: value: answers the shared Latin-1 instance out of Table for
+ 0..255, else a fresh instance. Loaded AFTER 10_array.mst in world.list
+ (Table's construction needs Array>>at:put: already installed) even though
+ the doc numbers this file 09 and Array 10 — see 10_array.mst's header."
+
+Magnitude subclass: Character [
+    <classVars: Table>
+
+    Character class >> value: v [
+        (v >= 0 and: [ v < 256 ]) ifTrue: [ ^Table at: v + 1 ].
+        ^self basicNew setValue: v
+    ]
+    Character class >> initTable [
+        Table := Array new: 256.
+        0 to: 255 do: [:i | Table at: i + 1 put: (self basicNew setValue: i) ]
+    ]
+    Character class >> nl [
+        ^self value: 10
+    ]
+    Character class >> cr [
+        ^self value: 13
+    ]
+    Character class >> tab [
+        ^self value: 9
+    ]
+    Character class >> space [
+        ^self value: 32
+    ]
+
+    setValue: v [
+        value := v.
+        ^self
+    ]
+    value [
+        ^value
+    ]
+    asInteger [
+        ^value
+    ]
+    asCharacter [
+        ^self
+    ]
+    isCharacter [
+        ^true
+    ]
+    = other [
+        (other isKindOf: Character) ifFalse: [ ^false ].
+        ^value = other asInteger
+    ]
+    hash [
+        ^value
+    ]
+    < other [
+        ^value < other asInteger
+    ]
+    isDigit [
+        ^value >= 48 and: [ value <= 57 ]
+    ]
+    isLetter [
+        ^(value >= 65 and: [ value <= 90 ]) or: [ value >= 97 and: [ value <= 122 ] ]
+    ]
+    isVowel [
+        | u |
+        u := self asUppercase asInteger.
+        ^u = 65 or: [ u = 69 or: [ u = 73 or: [ u = 79 or: [ u = 85 ] ] ] ]
+    ]
+    asUppercase [
+        (value >= 97 and: [ value <= 122 ]) ifTrue: [ ^Character value: value - 32 ].
+        ^self
+    ]
+    asLowercase [
+        (value >= 65 and: [ value <= 90 ]) ifTrue: [ ^Character value: value + 32 ].
+        ^self
+    ]
+]
+
+Character initTable.

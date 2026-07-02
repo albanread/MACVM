@@ -1,0 +1,41 @@
+"02_boolean_tests.mst — BooleanTests (tests_s06.md '02 BooleanTests')."
+
+TestCase subclass: BooleanTests [
+    runAll [
+        self runTest: #testAndOr do: [ self testAndOr ].
+        self runTest: #testNot do: [ self testNot ].
+        self runTest: #testIfTrueFamily do: [ self testIfTrueFamily ].
+        self runTest: #testRealSends do: [ self testRealSends ].
+    ]
+
+    testAndOr [
+        self assert: (true and: [ true ]) = true.
+        self deny: (true and: [ false ]) = true.
+        self deny: (false and: [ true ]) = true.
+        self deny: (false and: [ false ]) = true.
+        self assert: (true or: [ true ]) = true.
+        self assert: (true or: [ false ]) = true.
+        self assert: (false or: [ true ]) = true.
+        self deny: (false or: [ false ]) = true.
+        self assert: (true & true) = true.
+        self deny: (true & false) = true.
+        self assert: (true | false) = true.
+        self deny: (false | false) = true.
+    ]
+    testNot [
+        self assert: true not = false.
+        self assert: false not = true.
+    ]
+    testIfTrueFamily [
+        self assert: (true ifTrue: [ 1 ]) = 1.
+        self assert: (true ifFalse: [ 1 ]) = nil.
+        self assert: (false ifTrue: [ 1 ]) = nil.
+        self assert: (false ifFalse: [ 1 ]) = 1.
+    ]
+    testRealSends [
+        | b |
+        b := [ true ].
+        self assert: (true and: [ b value ]) = true.
+        self assert: (b value ifTrue: [ 42 ]) = 42.
+    ]
+]

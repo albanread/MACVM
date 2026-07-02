@@ -1,0 +1,20 @@
+"04_transcript.mst — TranscriptStream + Transcript global
+ (sprint_s06_detail.md #04). Speaks primitive-only (no streams/printString
+ exist yet) — 19_printing.mst reopens `cr` to use Character nl and adds
+ `<<`/`tab`/`space`. Pitfall P8: the raw-newline string literal below must
+ stay alone on its own lines."
+
+Object subclass: TranscriptStream [
+    basicPrint: aString [
+        <primitive: 91>
+    ]
+    show: aString [
+        self basicPrint: aString
+    ]
+    cr [
+        self basicPrint: '
+'
+    ]
+]
+
+Transcript := TranscriptStream new.

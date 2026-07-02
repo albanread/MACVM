@@ -155,6 +155,9 @@ fn dispatch(vm: &mut VmState) -> Oop {
         if vm.options.trace.is_enabled("bytecode") {
             trace_bc(vm, method, bci, op);
         }
+        if vm.options.trace.is_enabled("count") {
+            vm.bytecode_count += 1;
+        }
         match op {
             OP_PUSH_SELF => {
                 let r = frame_receiver(vm);
@@ -468,6 +471,32 @@ mod tests {
         b.ret_self();
         let sel = vm.universe.intern(b"m");
         b.finish(vm, sel, argc, ntemps)
+    }
+
+    /// `tests_s06.md`'s `trace_count_flag`: `MACVM_TRACE=count` (enabled
+    /// here by constructing `TraceFlags` directly, not via env var — tests
+    /// run multi-threaded) counts a stable, deterministic bytecode total
+    /// for a fixed doIt-equivalent method (S6 PERF procedure determinism).
+    #[test]
+    fn trace_count_flag() {
+        let mut vm = VmState::with_options(VmOptions {
+            heap_mib: 64,
+            trace: crate::runtime::vm_state::TraceFlags::parse("count"),
+        });
+        let mut b = BytecodeBuilder::new();
+        b.push_smi_i8(42);
+        b.ret_tos();
+        let sel = vm.universe.intern(b"m");
+        let method = b.finish(&mut vm, sel, 0, 0);
+        let recv = vm.universe.nil_obj;
+        let before = vm.bytecode_count;
+        let result = run_method(&mut vm, method, recv, &[]);
+        assert_eq!(SmallInt::try_from(result).unwrap().value(), 42);
+        assert_eq!(
+            vm.bytecode_count - before,
+            2,
+            "push_smi_i8 + ret_tos = 2 bytecodes"
+        );
     }
 
     #[test]

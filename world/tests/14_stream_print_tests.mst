@@ -1,0 +1,51 @@
+"14_stream_print_tests.mst — StreamAndPrintTests (tests_s06.md '14')."
+
+TestCase subclass: StreamAndPrintTests [
+    runAll [
+        self runTest: #testWriteStreamOnString do: [ self testWriteStreamOnString ].
+        self runTest: #testWriteStreamGrowth do: [ self testWriteStreamGrowth ].
+        self runTest: #testStreamShovel do: [ self testStreamShovel ].
+        self runTest: #testWriteStreamOnArray do: [ self testWriteStreamOnArray ].
+        self runTest: #testCompoundPrintString do: [ self testCompoundPrintString ].
+        self runTest: #testTranscriptSmoke do: [ self testTranscriptSmoke ].
+    ]
+
+    testWriteStreamOnString [
+        | s |
+        s := WriteStream on: (String new: 0).
+        s nextPut: $h.
+        s nextPutAll: 'ello'.
+        self assert: s contents = 'hello'.
+    ]
+    testWriteStreamGrowth [
+        | s |
+        s := WriteStream on: (String new: 0).
+        1 to: 50 do: [:i | s nextPut: $x ].
+        self assert: s contents size = 50.
+    ]
+    testStreamShovel [
+        | s |
+        s := WriteStream on: (String new: 0).
+        s << 'abc'.
+        s << $!.
+        s << 42.
+        self assert: s contents = 'abc!42'.
+    ]
+    testWriteStreamOnArray [
+        | s |
+        s := WriteStream on: (Array new: 0).
+        s nextPut: 1.
+        s nextPut: 2.
+        s nextPut: 3.
+        self assert: s contents asArray = #(1 2 3).
+        self assert: s contents class == Array.
+    ]
+    testCompoundPrintString [
+        self assert: #(1 $a 'hi' #sym) printString = '#(1 $a ''hi'' #sym)'.
+    ]
+    testTranscriptSmoke [
+        Transcript show: '  (transcript smoke ok)'.
+        Transcript cr.
+        self assert: true.
+    ]
+]

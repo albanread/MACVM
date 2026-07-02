@@ -1,0 +1,255 @@
+"07_largeinteger.mst — LargeInteger (sprint_s06_detail.md #07). Representation
+ (pinned): the object's OWN IndexableBytes body IS the magnitude — base-256
+ digits, little-endian, index 1 = least significant (byteAt:/byteAt:put:/
+ size bind directly to the raw bytes primitives). Sign = the concrete class.
+ fromSmallInteger: never takes an absolute value (Pitfall P3: SmallInteger
+ minVal's negation overflows) — it peels two's-complement digits directly."
+
+Integer subclass: LargeInteger [
+    isInteger [
+        ^true
+    ]
+    byteAt: i [
+        <primitive: 40>
+    ]
+    byteAt: i put: v [
+        <primitive: 41>
+    ]
+    size [
+        <primitive: 28>
+    ]
+    asLargeInteger [
+        ^self
+    ]
+    classSign [
+        ^self class == LargePositiveInteger ifTrue: [ 1 ] ifFalse: [ -1 ]
+    ]
+
+    LargeInteger class >> copyDigitsFrom: aLarge [
+        | r n |
+        n := aLarge size.
+        r := self basicNew: n.
+        1 to: n do: [:i | r byteAt: i put: (aLarge byteAt: i) ].
+        ^r
+    ]
+
+    "n >= 0: peel magnitude digits directly. n < 0: peel via floored //,\\
+     (never overflows, even at minVal) collecting the low bytes of the
+     two's-complement of |n|, then invert+add-1 to recover the magnitude."
+    LargeInteger class >> fromSmallInteger: n [
+        | count v result i more q d carry j inv s |
+        n >= 0
+            ifTrue: [
+                count := 0. v := n.
+                [ v = 0 ] whileFalse: [ count := count + 1. v := v // 256 ].
+                count = 0 ifTrue: [ count := 1 ].
+                result := LargePositiveInteger basicNew: count.
+                v := n. i := 1.
+                [ v = 0 ] whileFalse: [
+                    result byteAt: i put: (v \\ 256).
+                    v := v // 256.
+                    i := i + 1 ].
+                ^result ]
+            ifFalse: [
+                count := 0. v := n. more := true.
+                [ more ] whileTrue: [
+                    v := v // 256.
+                    count := count + 1.
+                    v = -1 ifTrue: [ more := false ] ].
+                result := LargePositiveInteger basicNew: count.
+                v := n. i := 1. more := true.
+                [ more ] whileTrue: [
+                    q := v // 256.
+                    d := v - (q * 256).
+                    result byteAt: i put: d.
+                    v := q.
+                    i := i + 1.
+                    v = -1 ifTrue: [ more := false ] ].
+                carry := 1. j := 1.
+                [ j <= count ] whileTrue: [
+                    inv := 255 - (result byteAt: j).
+                    s := inv + carry.
+                    result byteAt: j put: (s \\ 256).
+                    carry := s // 256.
+                    j := j + 1 ].
+                "No normalize: fromSmallInteger: must always answer a real
+                 LargeInteger (arithmetic fallbacks rely on its classSign/
+                 size/byteAt: protocol), matching the positive branch."
+                ^LargeNegativeInteger copyDigitsFrom: result ]
+    ]
+
+    "Trim a padded/over-allocated magnitude down to n significant bytes,
+     preserving concrete class (sign). addMagnitude:/* always over-allocate
+     by a carry byte, so results need re-canonicalizing before any
+     size-sensitive comparison (compareMagnitude:) can trust them."
+    trimmedTo: n [
+        | r i |
+        n = self size ifTrue: [ ^self ].
+        r := self class basicNew: n.
+        i := 1.
+        [ i <= n ] whileTrue: [ r byteAt: i put: (self byteAt: i). i := i + 1 ].
+        ^r
+    ]
+
+    "Fold high-to-low with a pre-shift bound check so the fold itself
+     never overflows a smi; track the highest nonzero byte along the way
+     so a too-big-for-smi result can still be trimmed to its canonical
+     (no leading zero byte) size. Answer the demoted SmallInteger if it fits."
+    normalize [
+        | v i sz |
+        v := 0.
+        i := self size.
+        sz := 0.
+        [ i >= 1 ] whileTrue: [
+            (sz = 0 and: [ (self byteAt: i) ~= 0 ]) ifTrue: [ sz := i ].
+            v > (SmallInteger maxVal bitShift: -8) ifTrue: [ ^self trimmedTo: sz ].
+            v := (v bitShift: 8) + (self byteAt: i).
+            i := i - 1 ].
+        self classSign = 1
+            ifTrue: [ ^v <= SmallInteger maxVal ifTrue: [ v ] ifFalse: [ self trimmedTo: sz ] ]
+            ifFalse: [ ^(0 - v) >= SmallInteger minVal ifTrue: [ 0 - v ] ifFalse: [ self trimmedTo: sz ] ]
+    ]
+
+    addMagnitude: b [
+        | m n r i da db s c |
+        m := self size. n := b size.
+        r := LargePositiveInteger basicNew: (m max: n) + 1.
+        c := 0. i := 1.
+        [ i <= r size ] whileTrue: [
+            da := i <= m ifTrue: [ self byteAt: i ] ifFalse: [ 0 ].
+            db := i <= n ifTrue: [ b byteAt: i ] ifFalse: [ 0 ].
+            s := da + db + c.
+            r byteAt: i put: (s \\ 256).
+            c := s // 256.
+            i := i + 1 ].
+        ^r
+    ]
+
+    "self magnitude - b magnitude; requires |self| >= |b|."
+    subMagnitude: b [
+        | m n r i da db s borrow |
+        m := self size. n := b size.
+        r := LargePositiveInteger basicNew: m.
+        borrow := 0. i := 1.
+        [ i <= m ] whileTrue: [
+            da := self byteAt: i.
+            db := i <= n ifTrue: [ b byteAt: i ] ifFalse: [ 0 ].
+            s := da - db - borrow.
+            s < 0 ifTrue: [ s := s + 256. borrow := 1 ] ifFalse: [ borrow := 0 ].
+            r byteAt: i put: s.
+            i := i + 1 ].
+        ^r
+    ]
+
+    compareMagnitude: b [
+        | m n i |
+        m := self size. n := b size.
+        m > n ifTrue: [ ^1 ].
+        m < n ifTrue: [ ^-1 ].
+        i := m.
+        [ i >= 1 ] whileTrue: [
+            (self byteAt: i) > (b byteAt: i) ifTrue: [ ^1 ].
+            (self byteAt: i) < (b byteAt: i) ifTrue: [ ^-1 ].
+            i := i - 1 ].
+        ^0
+    ]
+
+    "self must be a magnitude-only (LargePositiveInteger-class) scratch
+     value; wraps it in the requested sign's class and normalizes."
+    withSign: s [
+        s = 1 ifTrue: [ ^self normalize ].
+        ^(LargeNegativeInteger copyDigitsFrom: self) normalize
+    ]
+
+    + other [
+        | b |
+        other isDouble ifTrue: [ ^self asDouble + other ].
+        b := other asLargeInteger.
+        self classSign = b classSign
+            ifTrue: [ ^(self addMagnitude: b) withSign: self classSign ]
+            ifFalse: [
+                (self compareMagnitude: b) >= 0
+                    ifTrue: [ ^(self subMagnitude: b) withSign: self classSign ]
+                    ifFalse: [ ^(b subMagnitude: self) withSign: b classSign ] ]
+    ]
+    - other [
+        other isDouble ifTrue: [ ^self asDouble - other ].
+        ^self + other asLargeInteger negated
+    ]
+    * other [
+        | b m n r i j t c |
+        other isDouble ifTrue: [ ^self asDouble * other ].
+        b := other asLargeInteger.
+        m := self size. n := b size.
+        r := LargePositiveInteger basicNew: m + n.
+        i := 1.
+        [ i <= m ] whileTrue: [
+            c := 0. j := 1.
+            [ j <= n ] whileTrue: [
+                t := (r byteAt: i + j - 1) + ((self byteAt: i) * (b byteAt: j)) + c.
+                r byteAt: (i + j - 1) put: (t \\ 256).
+                c := t // 256.
+                j := j + 1 ].
+            [ c > 0 ] whileTrue: [
+                t := (r byteAt: i + j - 1) + c.
+                r byteAt: (i + j - 1) put: (t \\ 256).
+                c := t // 256.
+                j := j + 1 ].
+            i := i + 1 ].
+        ^r withSign: self classSign * b classSign
+    ]
+    negated [
+        self classSign = 1
+            ifTrue: [ ^(LargeNegativeInteger copyDigitsFrom: self) normalize ]
+            ifFalse: [ ^(LargePositiveInteger copyDigitsFrom: self) normalize ]
+    ]
+    < other [
+        | b |
+        other isDouble ifTrue: [ ^self asDouble < other ].
+        b := other asLargeInteger.
+        self classSign ~= b classSign ifTrue: [ ^self classSign < b classSign ].
+        self classSign = 1
+            ifTrue: [ ^(self compareMagnitude: b) < 0 ]
+            ifFalse: [ ^(self compareMagnitude: b) > 0 ]
+    ]
+    = other [
+        other isDouble ifTrue: [ ^self asDouble = other ].
+        (other isKindOf: LargeInteger) ifFalse: [
+            other isInteger ifTrue: [ ^self = other asLargeInteger ].
+            ^false ].
+        ^(self classSign = other classSign) and: [ (self compareMagnitude: other) = 0 ]
+    ]
+    hash [
+        <primitive: 44>
+    ]
+    asDouble [
+        | v i |
+        v := 0.0.
+        i := self size.
+        [ i >= 1 ] whileTrue: [
+            v := (v * 256.0) + (self byteAt: i) asDouble.
+            i := i - 1 ].
+        ^self classSign = 1 ifTrue: [ v ] ifFalse: [ v negated ]
+    ]
+
+    "Magnitude-only divmod by a smi divisor 1 < d <= 255 — printOn:'s only
+     consumer (repeated /10); self must already be non-negative."
+    divMod: d [
+        | q rem i part |
+        q := LargePositiveInteger basicNew: self size.
+        rem := 0.
+        i := self size.
+        [ i >= 1 ] whileTrue: [
+            part := (rem * 256) + (self byteAt: i).
+            q byteAt: i put: (part // d).
+            rem := part \\ d.
+            i := i - 1 ].
+        ^Association key: q normalize value: rem
+    ]
+]
+
+LargeInteger subclass: LargePositiveInteger [
+]
+
+LargeInteger subclass: LargeNegativeInteger [
+]

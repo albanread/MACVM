@@ -821,11 +821,23 @@ impl<'a> Parser<'a> {
                 Tok::Eof => {
                     return Err(self.error(self.cur.1, "unexpected end of input in class body"))
                 }
-                Tok::BinarySel(s) if s == "<" => match self.parse_class_pragma()? {
-                    ClassPragma::Indexable(ind) => indexable = Some(ind),
-                    ClassPragma::ClassVars(names) => class_vars.extend(names),
-                    ClassPragma::Ignored => {}
-                },
+                Tok::BinarySel(s) if s == "<" => {
+                    // Disambiguate a class pragma (`<indexable: ...>`,
+                    // `<classVars: ...>`) from a binary method named `<`
+                    // (e.g. `Magnitude>><`): both real pragma forms open
+                    // with a keyword, so an ident right after `<` means
+                    // this is a method pattern, not a pragma.
+                    let is_binary_method = matches!(self.peek2()?, Tok::Ident(_));
+                    if is_binary_method {
+                        methods.push(self.parse_method(false)?);
+                    } else {
+                        match self.parse_class_pragma()? {
+                            ClassPragma::Indexable(ind) => indexable = Some(ind),
+                            ClassPragma::ClassVars(names) => class_vars.extend(names),
+                            ClassPragma::Ignored => {}
+                        }
+                    }
+                }
                 Tok::VBar => {
                     self.bump()?;
                     let is_binary_method = matches!(self.cur.0, Tok::Ident(_))

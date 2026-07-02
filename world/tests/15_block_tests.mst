@@ -1,0 +1,72 @@
+"15_block_tests.mst — BlockTests (tests_s06.md '15 BlockTests'). Re-expresses
+ S4's Rust-level closure/NLR goldens (tests/it_blocks.rs, tests/it_nlr.rs)
+ as source-compiled assertions."
+
+TestCase subclass: BlockTests [
+    runAll [
+        self runTest: #testSharedCounter do: [ self testSharedCounter ].
+        self runTest: #testCapturedParam do: [ self testCapturedParam ].
+        self runTest: #testThreeDeepChain do: [ self testThreeDeepChain ].
+        self runTest: #testBlockReentryAfterHomeReturn
+            do: [ self testBlockReentryAfterHomeReturn ].
+        self runTest: #testValueArity do: [ self testValueArity ].
+        self runTest: #testEnsureNormalAndNlr do: [ self testEnsureNormalAndNlr ].
+    ]
+
+    "Two blocks closing over the SAME enclosing temp must share mutations."
+    testSharedCounter [
+        | counter inc dec |
+        counter := 0.
+        inc := [ counter := counter + 1 ].
+        dec := [ counter := counter - 1 ].
+        inc value. inc value. inc value.
+        dec value.
+        self assert: counter = 2.
+    ]
+    testCapturedParam [
+        | makeAdder add5 |
+        makeAdder := [:n | [:x | x + n ] ].
+        add5 := makeAdder value: 5.
+        self assert: (add5 value: 10) = 15.
+    ]
+    testThreeDeepChain [
+        | outer |
+        outer := [:a | [:b | [:c | a + b + c ] ] ].
+        self assert: (((outer value: 1) value: 2) value: 3) = 6.
+    ]
+    "A block returned from a method whose home context has already
+     returned must still work (non-NLR: it never sends ^, just reads and
+     mutates its captured temp) across repeated re-entry."
+    testBlockReentryAfterHomeReturn [
+        | b |
+        b := BlockTests makeCounterBlock.
+        self assert: b value = 1.
+        self assert: b value = 2.
+        self assert: b value = 3.
+    ]
+    testValueArity [
+        self assert: ([:a :b | a + b ] value: 3 value: 4) = 7.
+        self assert: ([:a :b :c | a + b + c ] value: 1 value: 2 value: 3) = 6.
+    ]
+    testEnsureNormalAndNlr [
+        | ranNormal ranNlr result |
+        ranNormal := false.
+        [ 42 ] ensure: [ ranNormal := true ].
+        self assert: ranNormal.
+
+        ranNlr := false.
+        result := BlockTests nlrThroughEnsure: [ ranNlr := true ].
+        self assert: ranNlr.
+        self assert: result = 99.
+    ]
+
+    BlockTests class >> makeCounterBlock [
+        | n |
+        n := 0.
+        ^[ n := n + 1. n ]
+    ]
+    BlockTests class >> nlrThroughEnsure: markBlock [
+        [ ^99 ] ensure: [ markBlock value ].
+        ^-1
+    ]
+]

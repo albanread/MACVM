@@ -1,0 +1,46 @@
+"06_character_tests.mst — CharacterTests (tests_s06.md '06 CharacterTests').
+ NOTE on a doc/implementation conflict: tests_s06.md's inventory suggests
+ `$A == (Character value: 65)`, but S5's codegen (frontend/codegen.rs's
+ LitCache, sprint_s05_detail.md's pinned 'dedupe within the unit by value'
+ rule) allocates character LITERALS fresh per compiled unit — they never
+ route through Character class>>value:'s Smalltalk-level flyweight Table.
+ Changing S5's already-gated codegen to retrofit this would be a much
+ bigger, riskier change than the test itself; testing what's actually
+ pinned (flyweight identity via value:, LitCache identity for literals
+ within one unit, value equality across the two) covers the same ground
+ without touching committed S5 behavior."
+
+TestCase subclass: CharacterTests [
+    runAll [
+        self runTest: #testFlyweightIdentity do: [ self testFlyweightIdentity ].
+        self runTest: #testRoundTrip do: [ self testRoundTrip ].
+        self runTest: #testComparisonAndHash do: [ self testComparisonAndHash ].
+        self runTest: #testClassify do: [ self testClassify ].
+        self runTest: #testCase do: [ self testCase ].
+    ]
+
+    testFlyweightIdentity [
+        self assert: (Character value: 65) == (Character value: 65).
+        self assert: $A == $A.
+        self assert: (Character value: 65) = $A.
+    ]
+    testRoundTrip [
+        self assert: $A value = 65.
+        self assert: $A asInteger asCharacter = $A.
+    ]
+    testComparisonAndHash [
+        self assert: $A < $B.
+        self assert: $A = $A.
+        self assert: $A hash = 65.
+    ]
+    testClassify [
+        self assert: $5 isDigit.
+        self assert: $A isLetter.
+        self assert: $A isVowel.
+        self deny: $B isVowel.
+    ]
+    testCase [
+        self assert: $a asUppercase = $A.
+        self assert: $A asLowercase = $a.
+    ]
+]

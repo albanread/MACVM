@@ -69,10 +69,30 @@ pub struct Universe {
     pub large_pos_int_klass: KlassOop,
     pub large_neg_int_klass: KlassOop,
 
-    /// The global namespace (SPEC §3.1: "a Dictionary of Association"). `nil`
-    /// until the first `runtime::globals::global_declare` call; from then on
-    /// an `ArrayOop` laid out `[tally][assoc-or-nil…]` (dense, append-only —
-    /// S6's real `SystemDictionary` replaces this representation, A5).
+    // --- S6 genesis skeleton (SPEC §3.1 amendment, A5's pinned tree) -------
+    /// Superclass of `class_klass`/`metaclass_klass` (Smalltalk-80's
+    /// Behavior/ClassDescription layer, collapsed to one klass in v1).
+    pub behavior_klass: KlassOop,
+    pub magnitude_klass: KlassOop,
+    pub number_klass: KlassOop,
+    pub integer_klass: KlassOop,
+    /// Abstract; `large_pos_int_klass`/`large_neg_int_klass` are its only
+    /// concrete subclasses, same `IndexableBytes` shape.
+    pub large_integer_klass: KlassOop,
+    pub collection_klass: KlassOop,
+    pub sequenceable_collection_klass: KlassOop,
+    pub arrayed_collection_klass: KlassOop,
+    /// The klass of the `smalltalk` global-namespace object itself (format
+    /// `IndexableOops`, same `[tally][assoc-or-nil…]` layout
+    /// `runtime::globals` already used under `array_klass` — S6 only
+    /// reclassifies it, no representation change, SPEC-QUESTION A5).
+    pub system_dictionary_klass: KlassOop,
+
+    /// The global namespace (SPEC §3.1: "a Dictionary of Association", A5:
+    /// "a SystemDictionary, VM-managed layout"). `nil` until the first
+    /// `runtime::globals::global_declare` call; from then on a
+    /// `system_dictionary_klass` `ArrayOop`-shaped object laid out
+    /// `[tally][assoc-or-nil…]` (dense, append-only).
     pub smalltalk: Oop,
     /// Set once `frontend::world::load_world` finishes (SPEC §3.2 step 2).
     pub world_loaded: bool,
@@ -232,6 +252,88 @@ impl Universe {
             }};
         }
 
+        // --- step 9a: S6 genesis skeleton scaffold (pure hierarchy, no
+        // instances of their own — superclass targets for the well-known
+        // oops below and for world/*.mst reopens) --------------------------
+        let behavior_klass = remaining_klass!(
+            "Behavior",
+            object_klass.oop(),
+            Format::Klass,
+            false,
+            KLASS_SIZE_WORDS
+        );
+        let magnitude_klass = remaining_klass!(
+            "Magnitude",
+            object_klass.oop(),
+            Format::Slots,
+            false,
+            HEADER_WORDS
+        );
+        let number_klass = remaining_klass!(
+            "Number",
+            magnitude_klass.oop(),
+            Format::Slots,
+            false,
+            HEADER_WORDS
+        );
+        let integer_klass = remaining_klass!(
+            "Integer",
+            number_klass.oop(),
+            Format::Slots,
+            false,
+            HEADER_WORDS
+        );
+        let large_integer_klass = remaining_klass!(
+            "LargeInteger",
+            integer_klass.oop(),
+            Format::IndexableBytes,
+            true,
+            HEADER_WORDS
+        );
+        let collection_klass = remaining_klass!(
+            "Collection",
+            object_klass.oop(),
+            Format::Slots,
+            false,
+            HEADER_WORDS
+        );
+        let sequenceable_collection_klass = remaining_klass!(
+            "SequenceableCollection",
+            collection_klass.oop(),
+            Format::Slots,
+            false,
+            HEADER_WORDS
+        );
+        let arrayed_collection_klass = remaining_klass!(
+            "ArrayedCollection",
+            sequenceable_collection_klass.oop(),
+            Format::Slots,
+            false,
+            HEADER_WORDS
+        );
+        let system_dictionary_klass = remaining_klass!(
+            "SystemDictionary",
+            object_klass.oop(),
+            Format::IndexableOops,
+            false,
+            HEADER_WORDS
+        );
+
+        // Reparent the well-known klasses genesis already built (S1-S5)
+        // whose FINAL superclass wasn't known until the scaffold above
+        // existed — never re-created (they're well-known oops baked into
+        // Rust code), just their `superclass`/metaclass-`superclass`
+        // fields patched in place.
+        macro_rules! reparent {
+            ($k:expr, $new_super:expr) => {{
+                $k.set_superclass($new_super.oop());
+                $k.klass().set_superclass($new_super.klass().oop());
+            }};
+        }
+        reparent!(class_klass, behavior_klass);
+        reparent!(metaclass_klass, behavior_klass);
+        reparent!(string_klass, arrayed_collection_klass);
+
         let boolean_klass = remaining_klass!(
             "Boolean",
             object_klass.oop(),
@@ -255,35 +357,35 @@ impl Universe {
         );
         let smi_klass = remaining_klass!(
             "SmallInteger",
-            object_klass.oop(),
+            integer_klass.oop(),
             Format::Slots,
             false,
             HEADER_WORDS
         );
         let character_klass = remaining_klass!(
             "Character",
-            object_klass.oop(),
+            magnitude_klass.oop(),
             Format::Slots,
             false,
             HEADER_WORDS + 1
         );
         let double_klass = remaining_klass!(
             "Double",
-            object_klass.oop(),
+            number_klass.oop(),
             Format::Double,
             true,
             HEADER_WORDS + 1
         );
         let array_klass = remaining_klass!(
             "Array",
-            object_klass.oop(),
+            arrayed_collection_klass.oop(),
             Format::IndexableOops,
             false,
             HEADER_WORDS
         );
         let bytearray_klass = remaining_klass!(
             "ByteArray",
-            object_klass.oop(),
+            arrayed_collection_klass.oop(),
             Format::IndexableBytes,
             true,
             HEADER_WORDS
@@ -341,14 +443,14 @@ impl Universe {
         );
         let large_pos_int_klass = remaining_klass!(
             "LargePositiveInteger",
-            object_klass.oop(),
+            large_integer_klass.oop(),
             Format::IndexableBytes,
             true,
             HEADER_WORDS
         );
         let large_neg_int_klass = remaining_klass!(
             "LargeNegativeInteger",
-            large_pos_int_klass.oop(),
+            large_integer_klass.oop(),
             Format::IndexableBytes,
             true,
             HEADER_WORDS
@@ -446,6 +548,15 @@ impl Universe {
             message_klass,
             large_pos_int_klass,
             large_neg_int_klass,
+            behavior_klass,
+            magnitude_klass,
+            number_klass,
+            integer_klass,
+            large_integer_klass,
+            collection_klass,
+            sequenceable_collection_klass,
+            arrayed_collection_klass,
+            system_dictionary_klass,
             smalltalk,
             world_loaded: false,
             symbols,
@@ -691,16 +802,109 @@ mod tests {
             u.object_klass.klass().superclass().raw(),
             u.class_klass.oop().raw()
         );
-        assert_eq!(u.class_klass.superclass().raw(), u.object_klass.oop().raw());
+        // S6: Class/Metaclass both sit under Behavior (Smalltalk-80's
+        // Behavior/ClassDescription layer, collapsed to one klass in v1),
+        // not directly under Object.
+        assert_eq!(
+            u.class_klass.superclass().raw(),
+            u.behavior_klass.oop().raw()
+        );
+        assert_eq!(
+            u.behavior_klass.superclass().raw(),
+            u.object_klass.oop().raw()
+        );
         assert_eq!(
             u.metaclass_klass.superclass().raw(),
-            u.class_klass.oop().raw()
+            u.behavior_klass.oop().raw()
         );
         assert_eq!(u.true_klass.superclass().raw(), u.boolean_klass.oop().raw());
         assert_eq!(
             u.true_klass.klass().superclass().raw(),
             u.boolean_klass.klass().oop().raw()
         );
+    }
+
+    /// S6's pinned genesis skeleton (sprint_s06_detail.md §Design tree):
+    /// every listed superclass link, exact.
+    #[test]
+    fn genesis_skeleton() {
+        let u = boot();
+        let links: &[(KlassOop, KlassOop)] = &[
+            (u.magnitude_klass, u.object_klass),
+            (u.character_klass, u.magnitude_klass),
+            (u.number_klass, u.magnitude_klass),
+            (u.double_klass, u.number_klass),
+            (u.integer_klass, u.number_klass),
+            (u.smi_klass, u.integer_klass),
+            (u.large_integer_klass, u.integer_klass),
+            (u.large_pos_int_klass, u.large_integer_klass),
+            (u.large_neg_int_klass, u.large_integer_klass),
+            (u.collection_klass, u.object_klass),
+            (u.sequenceable_collection_klass, u.collection_klass),
+            (u.arrayed_collection_klass, u.sequenceable_collection_klass),
+            (u.array_klass, u.arrayed_collection_klass),
+            (u.bytearray_klass, u.arrayed_collection_klass),
+            (u.string_klass, u.arrayed_collection_klass),
+            (u.symbol_klass, u.string_klass),
+            (u.behavior_klass, u.object_klass),
+            (u.class_klass, u.behavior_klass),
+            (u.metaclass_klass, u.behavior_klass),
+            (u.association_klass, u.object_klass),
+            (u.message_klass, u.object_klass),
+            (u.closure_klass, u.object_klass),
+            (u.method_klass, u.object_klass),
+            (u.system_dictionary_klass, u.object_klass),
+        ];
+        for (k, expected_super) in links {
+            assert_eq!(
+                k.superclass().raw(),
+                expected_super.oop().raw(),
+                "{}'s superclass must be {}",
+                crate::memory::print_oop(&u, k.name()),
+                crate::memory::print_oop(&u, expected_super.name())
+            );
+        }
+    }
+
+    /// `Object class superclass == Class`, `Class superclass == Behavior` —
+    /// the class-side lookup path S6's Behavior accessors depend on.
+    #[test]
+    fn genesis_metaclass_chain() {
+        let u = boot();
+        assert_eq!(
+            u.object_klass.klass().superclass().raw(),
+            u.class_klass.oop().raw()
+        );
+        assert_eq!(
+            u.class_klass.superclass().raw(),
+            u.behavior_klass.oop().raw()
+        );
+        assert_eq!(
+            u.class_klass.klass().superclass().raw(),
+            u.behavior_klass.klass().oop().raw()
+        );
+    }
+
+    /// `tests_s06.md`'s `instvar_layouts` entry: Character/Message's
+    /// genesis-declared named instvars match the doc exactly (Association's
+    /// own case is covered separately by `association_ivar_names`). The
+    /// other classes in that inventory row (OrderedCollection/Dictionary/
+    /// Interval/WriteStream/TestResult/TestCase) are declared at the
+    /// parser level, not genesis, so they have no Rust-side counterpart.
+    #[test]
+    fn instvar_layouts() {
+        let mut u = boot();
+        let char_ivn =
+            crate::oops::wrappers::ArrayOop::try_from(u.character_klass.inst_var_names())
+                .expect("Character inst_var_names is an Array");
+        assert_eq!(char_ivn.len(), 1);
+        assert_eq!(char_ivn.at(0), u.intern(b"value").oop());
+
+        let msg_ivn = crate::oops::wrappers::ArrayOop::try_from(u.message_klass.inst_var_names())
+            .expect("Message inst_var_names is an Array");
+        assert_eq!(msg_ivn.len(), 2);
+        assert_eq!(msg_ivn.at(0), u.intern(b"selector").oop());
+        assert_eq!(msg_ivn.at(1), u.intern(b"arguments").oop());
     }
 
     #[test]
@@ -744,6 +948,15 @@ mod tests {
             u.message_klass,
             u.large_pos_int_klass,
             u.large_neg_int_klass,
+            u.behavior_klass,
+            u.magnitude_klass,
+            u.number_klass,
+            u.integer_klass,
+            u.large_integer_klass,
+            u.collection_klass,
+            u.sequenceable_collection_klass,
+            u.arrayed_collection_klass,
+            u.system_dictionary_klass,
         ];
         for k in klasses {
             assert!(k.oop().is_mem());

@@ -22,3 +22,4 @@ gate-s02: ci
 gate-s03: ci
 gate-s04: ci
 gate-s05: ci
+gate-s06: ci

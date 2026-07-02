@@ -1,0 +1,94 @@
+"12_dictionary_tests.mst — DictionaryTests (tests_s06.md '12
+ DictionaryTests', including the required probe-wrap stress case)."
+
+TestCase subclass: DictionaryTests [
+    runAll [
+        self runTest: #testBasicAtPut do: [ self testBasicAtPut ].
+        self runTest: #testOverwriteKeepsTally do: [ self testOverwriteKeepsTally ].
+        self runTest: #testAbsentVariants do: [ self testAbsentVariants ].
+        self runTest: #testGrowthAndReadback do: [ self testGrowthAndReadback ].
+        self runTest: #testMixedKeyTypes do: [ self testMixedKeyTypes ].
+        self runTest: #testKeysAndValuesDo do: [ self testKeysAndValuesDo ].
+        self runTest: #testIncludesKeyAndSize do: [ self testIncludesKeyAndSize ].
+        self runTest: #testProbeWrap do: [ self testProbeWrap ].
+    ]
+
+    testBasicAtPut [
+        | d |
+        d := Dictionary new.
+        d at: #a put: 1.
+        d at: #b put: 2.
+        self assert: (d at: #a) = 1.
+        self assert: (d at: #b) = 2.
+    ]
+    testOverwriteKeepsTally [
+        | d |
+        d := Dictionary new.
+        d at: #a put: 1.
+        d at: #a put: 2.
+        self assert: (d at: #a) = 2.
+        self assert: d size = 1.
+    ]
+    testAbsentVariants [
+        | d |
+        d := Dictionary new.
+        d at: #a put: 1.
+        self assert: (d at: #z ifAbsent: [ -1 ]) = -1.
+        self assert: (d at: #a ifAbsent: [ -1 ]) = 1.
+        self assert: (d at: #z ifAbsentPut: [ 42 ]) = 42.
+        self assert: (d at: #z) = 42.
+    ]
+    testGrowthAndReadback [
+        | d ok |
+        d := Dictionary new.
+        1 to: 50 do: [:i | d at: i put: i * i ].
+        self assert: d size = 50.
+        ok := true.
+        1 to: 50 do: [:i | (d at: i) = (i * i) ifFalse: [ ok := false ] ].
+        self assert: ok.
+    ]
+    testMixedKeyTypes [
+        | d |
+        d := Dictionary new.
+        d at: #sym put: 1.
+        d at: 'str' put: 2.
+        d at: $c put: 3.
+        self assert: (d at: #sym) = 1.
+        self assert: (d at: 'str') = 2.
+        self assert: (d at: $c) = 3.
+    ]
+    testKeysAndValuesDo [
+        | d n |
+        d := Dictionary new.
+        d at: #a put: 1.
+        d at: #b put: 2.
+        d at: #c put: 3.
+        n := 0.
+        d keysAndValuesDo: [:k :v | n := n + 1 ].
+        self assert: n = d size.
+    ]
+    testIncludesKeyAndSize [
+        | d |
+        d := Dictionary new.
+        d at: #a put: 1.
+        self assert: (d includesKey: #a).
+        self deny: (d includesKey: #z).
+        self assert: d size = 1.
+    ]
+    "Keys 7/15/23/31 all hash-mod-8 to the same initial probe slot (the
+     dictionary's initial capacity is 8), forcing scanFor: to wrap from
+     the end of the array back to the start."
+    testProbeWrap [
+        | d ok |
+        d := Dictionary new.
+        d at: 7 put: 'a'.
+        d at: 15 put: 'b'.
+        d at: 23 put: 'c'.
+        d at: 31 put: 'd'.
+        ok := (d at: 7) = 'a' and: [
+            (d at: 15) = 'b' and: [
+                (d at: 23) = 'c' and: [ (d at: 31) = 'd' ] ] ].
+        self assert: ok.
+        self assert: d size = 4.
+    ]
+]

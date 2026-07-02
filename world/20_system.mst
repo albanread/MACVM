@@ -1,0 +1,25 @@
+"20_system.mst — System (sprint_s06_detail.md #20). SystemDictionary reopen:
+ startUp is a no-op hook (Character's table etc. are already initialized by
+ their own files' doIts, well before this loads); quit:/gcScavenge/gcFull
+ install onto Smalltalk itself so scripts can say `Smalltalk gcFull`."
+
+Object subclass: SystemDictionary [
+    startUp [
+        ^self
+    ]
+    quit: code [
+        <primitive: 96>
+    ]
+    quit [
+        ^self quit: 0
+    ]
+    gcScavenge [
+        <primitive: 93>
+    ]
+    gcFull [
+        <primitive: 94>
+    ]
+    millisecondClock [
+        <primitive: 92>
+    ]
+]
