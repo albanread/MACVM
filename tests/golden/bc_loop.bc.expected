@@ -1,0 +1,7 @@
+method #loop argc=0 ntemps=0 prim=0 flags=
+  0: push_nil
+  1: pop
+  2: jump_back 5 -> 0
+  5: return_self
+literals:
+ics: 0

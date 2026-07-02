@@ -1,0 +1,483 @@
+//! `BytecodeBuilder` — the bytecode assembler (SPEC §4). Test-only in
+//! spirit for S2 (all bytecode comes from hand-built kernels), but S5's
+//! source compiler reuses it directly, so it lives in the lib rather than
+//! behind `#[cfg(test)]`.
+//!
+//! **Jump base convention (pinned, SPEC §4.2 gives widths not the base):**
+//! all jump distances are measured from `next_bci` (the bci immediately
+//! after the whole 3-byte instruction). `jump_fwd`/`br_*_fwd`:
+//! `target = next_bci + distance` (distance 0 = fall straight through).
+//! `jump_back`: `target = next_bci - distance`.
+
+use std::collections::HashMap;
+
+use crate::oops::layout::{METHOD_ARGC_MAX, METHOD_NTEMPS_MAX};
+use crate::oops::wrappers::{ArrayOop, MethodOop, SymbolOop};
+use crate::oops::Oop;
+use crate::runtime::vm_state::VmState;
+
+use super::opcode::*;
+use super::Instr;
+
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub struct Label(usize);
+
+enum LabelState {
+    Bound(usize),
+    Unbound(Vec<usize>), // byte offsets of the u16 operand to patch
+}
+
+pub struct BytecodeBuilder {
+    code: Vec<u8>,
+    literals: Vec<Oop>,
+    literal_index: HashMap<u64, usize>,
+    n_ics: usize,
+    labels: Vec<LabelState>,
+}
+
+impl Default for BytecodeBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BytecodeBuilder {
+    pub fn new() -> Self {
+        BytecodeBuilder {
+            code: Vec::new(),
+            literals: Vec::new(),
+            literal_index: HashMap::new(),
+            n_ics: 0,
+            labels: Vec::new(),
+        }
+    }
+
+    #[inline]
+    fn emit_u8(&mut self, b: u8) {
+        self.code.push(b);
+    }
+
+    #[inline]
+    fn emit_u16(&mut self, v: u16) {
+        self.code.push((v & 0xFF) as u8);
+        self.code.push((v >> 8) as u8);
+    }
+
+    // --- straight-line opcodes ------------------------------------------
+
+    pub fn push_self(&mut self) -> &mut Self {
+        self.emit_u8(OP_PUSH_SELF);
+        self
+    }
+    pub fn push_nil(&mut self) -> &mut Self {
+        self.emit_u8(OP_PUSH_NIL);
+        self
+    }
+    pub fn push_true(&mut self) -> &mut Self {
+        self.emit_u8(OP_PUSH_TRUE);
+        self
+    }
+    pub fn push_false(&mut self) -> &mut Self {
+        self.emit_u8(OP_PUSH_FALSE);
+        self
+    }
+
+    pub fn push_smi_i8(&mut self, v: i8) -> &mut Self {
+        self.emit_u8(OP_PUSH_SMI_I8);
+        self.emit_u8(v as u8);
+        self
+    }
+
+    /// Interns `o` into the literal frame (deduplicating by raw oop
+    /// identity) and emits `push_literal`, auto-widening to the `u16` form
+    /// (0x12) when the literal's index exceeds `u8::MAX`.
+    pub fn push_literal(&mut self, o: Oop) -> &mut Self {
+        let idx = self.intern_literal(o);
+        self.emit_literal_ref(idx);
+        self
+    }
+
+    fn intern_literal(&mut self, o: Oop) -> usize {
+        if let Some(&idx) = self.literal_index.get(&o.raw()) {
+            return idx;
+        }
+        let idx = self.literals.len();
+        self.literals.push(o);
+        self.literal_index.insert(o.raw(), idx);
+        idx
+    }
+
+    fn emit_literal_ref(&mut self, idx: usize) {
+        if idx <= u8::MAX as usize {
+            self.emit_u8(OP_PUSH_LITERAL);
+            self.emit_u8(idx as u8);
+        } else {
+            self.emit_u8(OP_PUSH_LITERAL_W);
+            self.emit_u16(idx as u16);
+        }
+    }
+
+    pub fn push_temp(&mut self, t: u8) -> &mut Self {
+        self.emit_u8(OP_PUSH_TEMP);
+        self.emit_u8(t);
+        self
+    }
+    pub fn store_temp(&mut self, t: u8) -> &mut Self {
+        self.emit_u8(OP_STORE_TEMP);
+        self.emit_u8(t);
+        self
+    }
+    pub fn store_temp_pop(&mut self, t: u8) -> &mut Self {
+        self.emit_u8(OP_STORE_TEMP_POP);
+        self.emit_u8(t);
+        self
+    }
+
+    pub fn push_instvar(&mut self, i: u8) -> &mut Self {
+        self.emit_u8(OP_PUSH_INSTVAR);
+        self.emit_u8(i);
+        self
+    }
+    pub fn store_instvar_pop(&mut self, i: u8) -> &mut Self {
+        self.emit_u8(OP_STORE_INSTVAR_POP);
+        self.emit_u8(i);
+        self
+    }
+
+    /// `assoc` is an Association literal (SPEC §4.1: index 0 = key, index 1
+    /// = value, pinned in `sprint_s01`'s genesis); `push_global` pushes its
+    /// value, `store_global_pop` writes it.
+    pub fn push_global(&mut self, assoc: Oop) -> &mut Self {
+        let idx = self.intern_literal(assoc);
+        self.emit_u8(OP_PUSH_GLOBAL);
+        self.emit_u8(idx as u8);
+        self
+    }
+    pub fn store_global_pop(&mut self, assoc: Oop) -> &mut Self {
+        let idx = self.intern_literal(assoc);
+        self.emit_u8(OP_STORE_GLOBAL_POP);
+        self.emit_u8(idx as u8);
+        self
+    }
+
+    pub fn pop(&mut self) -> &mut Self {
+        self.emit_u8(OP_POP);
+        self
+    }
+    pub fn dup(&mut self) -> &mut Self {
+        self.emit_u8(OP_DUP);
+        self
+    }
+
+    pub fn ret_tos(&mut self) -> &mut Self {
+        self.emit_u8(OP_RETURN_TOS);
+        self
+    }
+    pub fn ret_self(&mut self) -> &mut Self {
+        self.emit_u8(OP_RETURN_SELF);
+        self
+    }
+
+    // --- control flow -----------------------------------------------------
+
+    pub fn new_label(&mut self) -> Label {
+        let idx = self.labels.len();
+        self.labels.push(LabelState::Unbound(Vec::new()));
+        Label(idx)
+    }
+
+    /// Binds `l` to the current position (`here`). Patches every forward
+    /// reference recorded against it.
+    pub fn bind(&mut self, l: Label) {
+        let bci = self.code.len();
+        let prev = std::mem::replace(&mut self.labels[l.0], LabelState::Bound(bci));
+        match prev {
+            LabelState::Bound(_) => panic!("BytecodeBuilder::bind: label {} already bound", l.0),
+            LabelState::Unbound(sites) => {
+                for site in sites {
+                    let next_bci = site + 2;
+                    assert!(
+                        bci >= next_bci,
+                        "bind: forward-patch site resolves backward — use jump_back"
+                    );
+                    let distance = bci - next_bci;
+                    assert!(distance <= u16::MAX as usize, "jump distance overflows u16");
+                    self.code[site] = (distance & 0xFF) as u8;
+                    self.code[site + 1] = (distance >> 8) as u8;
+                }
+            }
+        }
+    }
+
+    fn emit_fwd_jump(&mut self, op: u8, l: Label) {
+        self.emit_u8(op);
+        let operand_pos = self.code.len();
+        self.emit_u16(0xFFFF); // placeholder, patched by `bind` or below
+        match &mut self.labels[l.0] {
+            LabelState::Unbound(sites) => sites.push(operand_pos),
+            LabelState::Bound(target) => {
+                let target = *target;
+                let next_bci = operand_pos + 2;
+                assert!(
+                    target >= next_bci,
+                    "emit_fwd_jump: label already bound behind this site — use jump_back"
+                );
+                let distance = target - next_bci;
+                assert!(distance <= u16::MAX as usize, "jump distance overflows u16");
+                self.code[operand_pos] = (distance & 0xFF) as u8;
+                self.code[operand_pos + 1] = (distance >> 8) as u8;
+            }
+        }
+    }
+
+    pub fn jump_fwd(&mut self, l: Label) -> &mut Self {
+        self.emit_fwd_jump(OP_JUMP_FWD, l);
+        self
+    }
+    pub fn br_true_fwd(&mut self, l: Label) -> &mut Self {
+        self.emit_fwd_jump(OP_BR_TRUE_FWD, l);
+        self
+    }
+    pub fn br_false_fwd(&mut self, l: Label) -> &mut Self {
+        self.emit_fwd_jump(OP_BR_FALSE_FWD, l);
+        self
+    }
+
+    /// `l` must already be bound (a backward reference into code already
+    /// emitted).
+    pub fn jump_back(&mut self, l: Label) -> &mut Self {
+        let target = match self.labels[l.0] {
+            LabelState::Bound(bci) => bci,
+            LabelState::Unbound(_) => panic!("jump_back: label {} not yet bound", l.0),
+        };
+        let opcode_pos = self.code.len();
+        let next_bci = opcode_pos + 3;
+        assert!(
+            target <= next_bci,
+            "jump_back: target is ahead of this site"
+        );
+        let distance = next_bci - target;
+        assert!(distance <= u16::MAX as usize, "jump distance overflows u16");
+        self.emit_u8(OP_JUMP_BACK);
+        self.emit_u16(distance as u16);
+        self
+    }
+
+    // --- finishing ----------------------------------------------------------
+
+    /// Builds the heap objects: literal Array, empty-but-sized IC Array (S2
+    /// methods have `n_ics == 0`; S3's `send`/`send_super` emitters bump
+    /// it), and the bytecode bytes. Panics (builder misuse = VM bug) if any
+    /// label is unbound, the code does not end in a return, `argc > 15`, or
+    /// `ntemps > 255`.
+    pub fn finish(
+        self,
+        vm: &mut VmState,
+        selector: SymbolOop,
+        argc: usize,
+        ntemps: usize,
+    ) -> MethodOop {
+        assert!(
+            argc <= METHOD_ARGC_MAX,
+            "argc {argc} exceeds the 4-bit field"
+        );
+        assert!(
+            ntemps <= METHOD_NTEMPS_MAX,
+            "ntemps {ntemps} exceeds the 8-bit field"
+        );
+        for (i, l) in self.labels.iter().enumerate() {
+            if let LabelState::Unbound(_) = l {
+                panic!("BytecodeBuilder::finish: label {i} was never bound");
+            }
+        }
+        assert!(
+            !self.code.is_empty(),
+            "BytecodeBuilder::finish: empty method body"
+        );
+
+        let method = crate::memory::alloc::alloc_method(vm, self.code.len());
+        for (i, &b) in self.code.iter().enumerate() {
+            method.set_bytecode_byte(i, b);
+        }
+
+        // Verify the stream ends in a return by decode-walking it — the
+        // only reliable way; the raw last BYTE could be an operand of an
+        // earlier instruction that coincidentally equals a return opcode.
+        let mut bci = 0usize;
+        let mut last_instr = None;
+        while bci < method.bytecode_len() {
+            let (instr, next) = super::opcode::decode_at(method, bci);
+            last_instr = Some(instr);
+            bci = next;
+        }
+        match last_instr {
+            Some(Instr::ReturnTos)
+            | Some(Instr::ReturnSelf)
+            | Some(Instr::BlockReturnTos)
+            | Some(Instr::NlrTos) => {}
+            _ => panic!("BytecodeBuilder::finish: method does not end in a return"),
+        }
+
+        let array_klass = vm.universe.array_klass;
+        let literals =
+            crate::memory::alloc::alloc_indexable_oops(vm, array_klass, self.literals.len());
+        for (i, &lit) in self.literals.iter().enumerate() {
+            literals.at_put(i, lit);
+        }
+
+        let ics: ArrayOop =
+            crate::memory::alloc::alloc_indexable_oops(vm, array_klass, self.n_ics * 4);
+
+        let nil = vm.universe.nil_obj;
+        method.set_selector(selector.oop());
+        method.set_holder(nil); // nil until S3 install
+        method.set_flags(argc, ntemps, false, false, false);
+        method.set_primitive(0);
+        method.set_counters(0);
+        method.set_literals(literals);
+        method.set_ics(ics);
+
+        method
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::oops::smi::SmallInt;
+    use crate::runtime::vm_state::VmOptions;
+
+    fn test_vm() -> VmState {
+        VmState::with_options(VmOptions {
+            heap_mib: 64,
+            trace: Default::default(),
+        })
+    }
+
+    #[test]
+    fn builder_dedup_literals() {
+        let mut vm = test_vm();
+        let sym = vm.universe.intern(b"foo");
+        let mut b = BytecodeBuilder::new();
+        b.push_literal(sym.oop());
+        b.push_literal(sym.oop());
+        b.ret_self();
+        let sel = vm.universe.intern(b"test");
+
+        let m = b.finish(&mut vm, sel, 0, 0);
+        assert_eq!(m.literals().len(), 1);
+        // Both operand bytes reference literal index 0.
+        assert_eq!(m.bytecode_byte(1), 0);
+        assert_eq!(m.bytecode_byte(3), 0);
+    }
+
+    #[test]
+    fn builder_wide_literal() {
+        let mut vm = test_vm();
+        let mut b = BytecodeBuilder::new();
+        for i in 0..300i64 {
+            b.push_literal(SmallInt::new(i).oop());
+        }
+        b.ret_self();
+        let sel = vm.universe.intern(b"test");
+
+        let m = b.finish(&mut vm, sel, 0, 0);
+        assert_eq!(m.literals().len(), 300);
+
+        // Entry 5: narrow form (0x05, u8 operand) at bci 5*2 = 10.
+        assert_eq!(m.bytecode_byte(10), OP_PUSH_LITERAL);
+        assert_eq!(m.bytecode_byte(11), 5);
+
+        // Entries 0..256 are 2 bytes each (512 bytes); entry 256 onward is
+        // 3 bytes each (wide form). Entry 299 is the 44th wide entry.
+        let wide_start_bci = 256 * 2;
+        let entry_299_bci = wide_start_bci + (299 - 256) * 3;
+        assert_eq!(m.bytecode_byte(entry_299_bci), OP_PUSH_LITERAL_W);
+        let lo = m.bytecode_byte(entry_299_bci + 1) as u16;
+        let hi = m.bytecode_byte(entry_299_bci + 2) as u16;
+        assert_eq!(lo | (hi << 8), 299);
+    }
+
+    #[test]
+    fn builder_forward_patch() {
+        let mut vm = test_vm();
+        let mut b = BytecodeBuilder::new();
+        let l = b.new_label();
+        b.jump_fwd(l); // bci 0..3, next_bci = 3
+        b.push_smi_i8(1); // bci 3..5
+        b.push_smi_i8(2); // bci 5..7
+        b.bind(l); // target bci = 7
+        b.ret_self();
+        let sel = vm.universe.intern(b"test");
+
+        let m = b.finish(&mut vm, sel, 0, 0);
+        // operand at bci 1..3 should be 7 - 3 = 4.
+        let lo = m.bytecode_byte(1) as u16;
+        let hi = m.bytecode_byte(2) as u16;
+        assert_eq!(lo | (hi << 8), 4);
+    }
+
+    #[test]
+    fn builder_backward_distance() {
+        let mut vm = test_vm();
+        let mut b = BytecodeBuilder::new();
+        let l = b.new_label();
+        b.bind(l); // target bci = 0
+        b.push_smi_i8(1); // bci 0..2
+        b.jump_back(l); // opcode_pos = 2, next_bci = 5
+        b.ret_self();
+        let sel = vm.universe.intern(b"test");
+
+        let m = b.finish(&mut vm, sel, 0, 0);
+        let lo = m.bytecode_byte(3) as u16;
+        let hi = m.bytecode_byte(4) as u16;
+        assert_eq!(lo | (hi << 8), 5);
+    }
+
+    #[test]
+    #[should_panic(expected = "was never bound")]
+    fn builder_unbound_label_panics() {
+        let mut vm = test_vm();
+        let mut b = BytecodeBuilder::new();
+        let l = b.new_label();
+        b.jump_fwd(l);
+        b.ret_self();
+        let sel = vm.universe.intern(b"test");
+
+        let _ = b.finish(&mut vm, sel, 0, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "does not end in a return")]
+    fn builder_requires_return() {
+        let mut vm = test_vm();
+        let mut b = BytecodeBuilder::new();
+        b.push_nil();
+        b.pop();
+        let sel = vm.universe.intern(b"test");
+
+        let _ = b.finish(&mut vm, sel, 0, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "argc")]
+    fn builder_argc_limit() {
+        let mut vm = test_vm();
+        let mut b = BytecodeBuilder::new();
+        b.ret_self();
+        let sel = vm.universe.intern(b"test");
+
+        let _ = b.finish(&mut vm, sel, 16, 0);
+    }
+
+    #[test]
+    fn ics_empty_but_present() {
+        let mut vm = test_vm();
+        let mut b = BytecodeBuilder::new();
+        b.ret_self();
+        let sel = vm.universe.intern(b"test");
+
+        let m = b.finish(&mut vm, sel, 0, 0);
+        assert_eq!(m.ics().len(), 0);
+    }
+}

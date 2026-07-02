@@ -1,0 +1,4 @@
+method #minimal argc=0 ntemps=0 prim=0 flags=
+  0: return_self
+literals:
+ics: 0

@@ -1,0 +1,9 @@
+method #straightline argc=0 ntemps=1 prim=0 flags=
+  0: push_smi 5
+  2: store_temp_pop 0
+  4: push_temp 0
+  6: dup
+  7: pop
+  8: return_tos
+literals:
+ics: 0

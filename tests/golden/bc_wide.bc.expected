@@ -1,0 +1,524 @@
+method #wide argc=0 ntemps=0 prim=0 flags=
+  0: push_literal 0; 0
+  2: push_literal 1; 1
+  4: push_literal 2; 2
+  6: push_literal 3; 3
+  8: push_literal 4; 4
+  10: push_literal 5; 5
+  12: push_literal 6; 6
+  14: push_literal 7; 7
+  16: push_literal 8; 8
+  18: push_literal 9; 9
+  20: push_literal 10; 10
+  22: push_literal 11; 11
+  24: push_literal 12; 12
+  26: push_literal 13; 13
+  28: push_literal 14; 14
+  30: push_literal 15; 15
+  32: push_literal 16; 16
+  34: push_literal 17; 17
+  36: push_literal 18; 18
+  38: push_literal 19; 19
+  40: push_literal 20; 20
+  42: push_literal 21; 21
+  44: push_literal 22; 22
+  46: push_literal 23; 23
+  48: push_literal 24; 24
+  50: push_literal 25; 25
+  52: push_literal 26; 26
+  54: push_literal 27; 27
+  56: push_literal 28; 28
+  58: push_literal 29; 29
+  60: push_literal 30; 30
+  62: push_literal 31; 31
+  64: push_literal 32; 32
+  66: push_literal 33; 33
+  68: push_literal 34; 34
+  70: push_literal 35; 35
+  72: push_literal 36; 36
+  74: push_literal 37; 37
+  76: push_literal 38; 38
+  78: push_literal 39; 39
+  80: push_literal 40; 40
+  82: push_literal 41; 41
+  84: push_literal 42; 42
+  86: push_literal 43; 43
+  88: push_literal 44; 44
+  90: push_literal 45; 45
+  92: push_literal 46; 46
+  94: push_literal 47; 47
+  96: push_literal 48; 48
+  98: push_literal 49; 49
+  100: push_literal 50; 50
+  102: push_literal 51; 51
+  104: push_literal 52; 52
+  106: push_literal 53; 53
+  108: push_literal 54; 54
+  110: push_literal 55; 55
+  112: push_literal 56; 56
+  114: push_literal 57; 57
+  116: push_literal 58; 58
+  118: push_literal 59; 59
+  120: push_literal 60; 60
+  122: push_literal 61; 61
+  124: push_literal 62; 62
+  126: push_literal 63; 63
+  128: push_literal 64; 64
+  130: push_literal 65; 65
+  132: push_literal 66; 66
+  134: push_literal 67; 67
+  136: push_literal 68; 68
+  138: push_literal 69; 69
+  140: push_literal 70; 70
+  142: push_literal 71; 71
+  144: push_literal 72; 72
+  146: push_literal 73; 73
+  148: push_literal 74; 74
+  150: push_literal 75; 75
+  152: push_literal 76; 76
+  154: push_literal 77; 77
+  156: push_literal 78; 78
+  158: push_literal 79; 79
+  160: push_literal 80; 80
+  162: push_literal 81; 81
+  164: push_literal 82; 82
+  166: push_literal 83; 83
+  168: push_literal 84; 84
+  170: push_literal 85; 85
+  172: push_literal 86; 86
+  174: push_literal 87; 87
+  176: push_literal 88; 88
+  178: push_literal 89; 89
+  180: push_literal 90; 90
+  182: push_literal 91; 91
+  184: push_literal 92; 92
+  186: push_literal 93; 93
+  188: push_literal 94; 94
+  190: push_literal 95; 95
+  192: push_literal 96; 96
+  194: push_literal 97; 97
+  196: push_literal 98; 98
+  198: push_literal 99; 99
+  200: push_literal 100; 100
+  202: push_literal 101; 101
+  204: push_literal 102; 102
+  206: push_literal 103; 103
+  208: push_literal 104; 104
+  210: push_literal 105; 105
+  212: push_literal 106; 106
+  214: push_literal 107; 107
+  216: push_literal 108; 108
+  218: push_literal 109; 109
+  220: push_literal 110; 110
+  222: push_literal 111; 111
+  224: push_literal 112; 112
+  226: push_literal 113; 113
+  228: push_literal 114; 114
+  230: push_literal 115; 115
+  232: push_literal 116; 116
+  234: push_literal 117; 117
+  236: push_literal 118; 118
+  238: push_literal 119; 119
+  240: push_literal 120; 120
+  242: push_literal 121; 121
+  244: push_literal 122; 122
+  246: push_literal 123; 123
+  248: push_literal 124; 124
+  250: push_literal 125; 125
+  252: push_literal 126; 126
+  254: push_literal 127; 127
+  256: push_literal 128; 128
+  258: push_literal 129; 129
+  260: push_literal 130; 130
+  262: push_literal 131; 131
+  264: push_literal 132; 132
+  266: push_literal 133; 133
+  268: push_literal 134; 134
+  270: push_literal 135; 135
+  272: push_literal 136; 136
+  274: push_literal 137; 137
+  276: push_literal 138; 138
+  278: push_literal 139; 139
+  280: push_literal 140; 140
+  282: push_literal 141; 141
+  284: push_literal 142; 142
+  286: push_literal 143; 143
+  288: push_literal 144; 144
+  290: push_literal 145; 145
+  292: push_literal 146; 146
+  294: push_literal 147; 147
+  296: push_literal 148; 148
+  298: push_literal 149; 149
+  300: push_literal 150; 150
+  302: push_literal 151; 151
+  304: push_literal 152; 152
+  306: push_literal 153; 153
+  308: push_literal 154; 154
+  310: push_literal 155; 155
+  312: push_literal 156; 156
+  314: push_literal 157; 157
+  316: push_literal 158; 158
+  318: push_literal 159; 159
+  320: push_literal 160; 160
+  322: push_literal 161; 161
+  324: push_literal 162; 162
+  326: push_literal 163; 163
+  328: push_literal 164; 164
+  330: push_literal 165; 165
+  332: push_literal 166; 166
+  334: push_literal 167; 167
+  336: push_literal 168; 168
+  338: push_literal 169; 169
+  340: push_literal 170; 170
+  342: push_literal 171; 171
+  344: push_literal 172; 172
+  346: push_literal 173; 173
+  348: push_literal 174; 174
+  350: push_literal 175; 175
+  352: push_literal 176; 176
+  354: push_literal 177; 177
+  356: push_literal 178; 178
+  358: push_literal 179; 179
+  360: push_literal 180; 180
+  362: push_literal 181; 181
+  364: push_literal 182; 182
+  366: push_literal 183; 183
+  368: push_literal 184; 184
+  370: push_literal 185; 185
+  372: push_literal 186; 186
+  374: push_literal 187; 187
+  376: push_literal 188; 188
+  378: push_literal 189; 189
+  380: push_literal 190; 190
+  382: push_literal 191; 191
+  384: push_literal 192; 192
+  386: push_literal 193; 193
+  388: push_literal 194; 194
+  390: push_literal 195; 195
+  392: push_literal 196; 196
+  394: push_literal 197; 197
+  396: push_literal 198; 198
+  398: push_literal 199; 199
+  400: push_literal 200; 200
+  402: push_literal 201; 201
+  404: push_literal 202; 202
+  406: push_literal 203; 203
+  408: push_literal 204; 204
+  410: push_literal 205; 205
+  412: push_literal 206; 206
+  414: push_literal 207; 207
+  416: push_literal 208; 208
+  418: push_literal 209; 209
+  420: push_literal 210; 210
+  422: push_literal 211; 211
+  424: push_literal 212; 212
+  426: push_literal 213; 213
+  428: push_literal 214; 214
+  430: push_literal 215; 215
+  432: push_literal 216; 216
+  434: push_literal 217; 217
+  436: push_literal 218; 218
+  438: push_literal 219; 219
+  440: push_literal 220; 220
+  442: push_literal 221; 221
+  444: push_literal 222; 222
+  446: push_literal 223; 223
+  448: push_literal 224; 224
+  450: push_literal 225; 225
+  452: push_literal 226; 226
+  454: push_literal 227; 227
+  456: push_literal 228; 228
+  458: push_literal 229; 229
+  460: push_literal 230; 230
+  462: push_literal 231; 231
+  464: push_literal 232; 232
+  466: push_literal 233; 233
+  468: push_literal 234; 234
+  470: push_literal 235; 235
+  472: push_literal 236; 236
+  474: push_literal 237; 237
+  476: push_literal 238; 238
+  478: push_literal 239; 239
+  480: push_literal 240; 240
+  482: push_literal 241; 241
+  484: push_literal 242; 242
+  486: push_literal 243; 243
+  488: push_literal 244; 244
+  490: push_literal 245; 245
+  492: push_literal 246; 246
+  494: push_literal 247; 247
+  496: push_literal 248; 248
+  498: push_literal 249; 249
+  500: push_literal 250; 250
+  502: push_literal 251; 251
+  504: push_literal 252; 252
+  506: push_literal 253; 253
+  508: push_literal 254; 254
+  510: push_literal 255; 255
+  512: push_literal_w 256; 256
+  515: push_literal_w 257; 257
+  518: push_literal_w 258; 258
+  521: push_literal_w 259; 259
+  524: return_self
+literals:
+  0: 0
+  1: 1
+  2: 2
+  3: 3
+  4: 4
+  5: 5
+  6: 6
+  7: 7
+  8: 8
+  9: 9
+  10: 10
+  11: 11
+  12: 12
+  13: 13
+  14: 14
+  15: 15
+  16: 16
+  17: 17
+  18: 18
+  19: 19
+  20: 20
+  21: 21
+  22: 22
+  23: 23
+  24: 24
+  25: 25
+  26: 26
+  27: 27
+  28: 28
+  29: 29
+  30: 30
+  31: 31
+  32: 32
+  33: 33
+  34: 34
+  35: 35
+  36: 36
+  37: 37
+  38: 38
+  39: 39
+  40: 40
+  41: 41
+  42: 42
+  43: 43
+  44: 44
+  45: 45
+  46: 46
+  47: 47
+  48: 48
+  49: 49
+  50: 50
+  51: 51
+  52: 52
+  53: 53
+  54: 54
+  55: 55
+  56: 56
+  57: 57
+  58: 58
+  59: 59
+  60: 60
+  61: 61
+  62: 62
+  63: 63
+  64: 64
+  65: 65
+  66: 66
+  67: 67
+  68: 68
+  69: 69
+  70: 70
+  71: 71
+  72: 72
+  73: 73
+  74: 74
+  75: 75
+  76: 76
+  77: 77
+  78: 78
+  79: 79
+  80: 80
+  81: 81
+  82: 82
+  83: 83
+  84: 84
+  85: 85
+  86: 86
+  87: 87
+  88: 88
+  89: 89
+  90: 90
+  91: 91
+  92: 92
+  93: 93
+  94: 94
+  95: 95
+  96: 96
+  97: 97
+  98: 98
+  99: 99
+  100: 100
+  101: 101
+  102: 102
+  103: 103
+  104: 104
+  105: 105
+  106: 106
+  107: 107
+  108: 108
+  109: 109
+  110: 110
+  111: 111
+  112: 112
+  113: 113
+  114: 114
+  115: 115
+  116: 116
+  117: 117
+  118: 118
+  119: 119
+  120: 120
+  121: 121
+  122: 122
+  123: 123
+  124: 124
+  125: 125
+  126: 126
+  127: 127
+  128: 128
+  129: 129
+  130: 130
+  131: 131
+  132: 132
+  133: 133
+  134: 134
+  135: 135
+  136: 136
+  137: 137
+  138: 138
+  139: 139
+  140: 140
+  141: 141
+  142: 142
+  143: 143
+  144: 144
+  145: 145
+  146: 146
+  147: 147
+  148: 148
+  149: 149
+  150: 150
+  151: 151
+  152: 152
+  153: 153
+  154: 154
+  155: 155
+  156: 156
+  157: 157
+  158: 158
+  159: 159
+  160: 160
+  161: 161
+  162: 162
+  163: 163
+  164: 164
+  165: 165
+  166: 166
+  167: 167
+  168: 168
+  169: 169
+  170: 170
+  171: 171
+  172: 172
+  173: 173
+  174: 174
+  175: 175
+  176: 176
+  177: 177
+  178: 178
+  179: 179
+  180: 180
+  181: 181
+  182: 182
+  183: 183
+  184: 184
+  185: 185
+  186: 186
+  187: 187
+  188: 188
+  189: 189
+  190: 190
+  191: 191
+  192: 192
+  193: 193
+  194: 194
+  195: 195
+  196: 196
+  197: 197
+  198: 198
+  199: 199
+  200: 200
+  201: 201
+  202: 202
+  203: 203
+  204: 204
+  205: 205
+  206: 206
+  207: 207
+  208: 208
+  209: 209
+  210: 210
+  211: 211
+  212: 212
+  213: 213
+  214: 214
+  215: 215
+  216: 216
+  217: 217
+  218: 218
+  219: 219
+  220: 220
+  221: 221
+  222: 222
+  223: 223
+  224: 224
+  225: 225
+  226: 226
+  227: 227
+  228: 228
+  229: 229
+  230: 230
+  231: 231
+  232: 232
+  233: 233
+  234: 234
+  235: 235
+  236: 236
+  237: 237
+  238: 238
+  239: 239
+  240: 240
+  241: 241
+  242: 242
+  243: 243
+  244: 244
+  245: 245
+  246: 246
+  247: 247
+  248: 248
+  249: 249
+  250: 250
+  251: 251
+  252: 252
+  253: 253
+  254: 254
+  255: 255
+  256: 256
+  257: 257
+  258: 258
+  259: 259
+ics: 0

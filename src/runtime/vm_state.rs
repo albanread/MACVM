@@ -4,6 +4,7 @@
 
 use std::collections::HashSet;
 
+use crate::interpreter::stack::{ProcessStack, DEFAULT_STACK_CAPACITY};
 use crate::memory::Universe;
 
 /// Which `MACVM_TRACE` channels are enabled. The channel set is open-ended
@@ -64,6 +65,18 @@ impl Default for VmOptions {
 pub struct VmState {
     pub universe: Universe,
     pub options: VmOptions,
+    pub stack: ProcessStack,
+    /// GC/interrupt poll flag, checked at `jump_back` (SPEC §5.5). A no-op
+    /// hook in S2 (never set) so the dispatch loop's shape never changes
+    /// once S7 wires a real poll behind it.
+    pub pending: bool,
+    /// Scratch: the bci the caller should resume at, set by
+    /// `return_from_frame` on a non-entry return and read by
+    /// `interpreter::resume_bci`. S2 never exercises the non-entry path
+    /// (S2's activate/return discipline is single-frame only); this exists
+    /// so the signature `return_from_frame(vm, result) -> Option<Oop>` the
+    /// interfaces doc pins doesn't need to carry the resume bci itself.
+    pub(crate) resume_bci: usize,
 }
 
 impl VmState {
@@ -76,7 +89,13 @@ impl VmState {
     /// cannot race on process-wide env vars) and by any later embedder.
     pub fn with_options(options: VmOptions) -> VmState {
         let universe = Universe::genesis(&options);
-        VmState { universe, options }
+        VmState {
+            universe,
+            options,
+            stack: ProcessStack::with_capacity(DEFAULT_STACK_CAPACITY),
+            pending: false,
+            resume_bci: 0,
+        }
     }
 }
 

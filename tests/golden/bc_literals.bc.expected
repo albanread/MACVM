@@ -1,0 +1,10 @@
+method #literals argc=0 ntemps=0 prim=0 flags=
+  0: push_literal 0; #foo
+  2: push_literal 1; 'bar'
+  4: push_global 2; a Association
+  6: return_tos
+literals:
+  0: #foo
+  1: 'bar'
+  2: a Association
+ics: 0

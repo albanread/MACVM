@@ -5,4 +5,4 @@
 
 pub mod vm_state;
 
-pub use vm_state::{VmOptions, VmState};
+pub use vm_state::{TraceFlags, VmOptions, VmState};

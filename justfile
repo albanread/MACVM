@@ -18,3 +18,4 @@ ci: lint test
 # (e.g. `MACVM_GC_STRESS=1 just test` from S7 on).
 gate-s00: ci
 gate-s01: ci
+gate-s02: ci

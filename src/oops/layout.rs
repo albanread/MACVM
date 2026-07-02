@@ -74,6 +74,40 @@ pub const KLASS_SIZE_WORDS: usize = HEADER_WORDS + KLASS_BODY_WORDS; // 10
 pub const FORMAT_KIND_MASK: i64 = 0xFF;
 pub const FORMAT_UNTAGGED_BIT: i64 = 1 << 8;
 
+// --- CompiledMethod body layout (SPEC §4.4) --------------------------------
+
+pub const METHOD_SELECTOR_INDEX: usize = 0; // Symbol
+pub const METHOD_HOLDER_INDEX: usize = 1; // klassOop | nil (nil until S3 install)
+pub const METHOD_FLAGS_INDEX: usize = 2; // smi, packing below
+pub const METHOD_PRIMITIVE_INDEX: usize = 3; // smi, 0 = none
+pub const METHOD_COUNTERS_INDEX: usize = 4; // smi (invocation:16 | reserved)
+pub const METHOD_LITERALS_INDEX: usize = 5; // Array
+pub const METHOD_ICS_INDEX: usize = 6; // Array (stride 4, SPEC §4.3)
+pub const METHOD_NAMED_WORDS: usize = 7; // => klass nis = 9
+pub const METHOD_SIZE_INDEX: usize = 7; // smi: bytecode byte count
+/// Absolute byte offset of the first bytecode byte.
+pub const METHOD_BYTECODE_BYTE_OFFSET: usize = BODY_OFFSET + 8 * (METHOD_SIZE_INDEX + 1); // 80
+
+// flags packing — SPEC §4.4 "argc:4 | ntemps:8 | has_ctx:1 | is_block:1 | prim_fails:1"
+pub const METHOD_FLAGS_ARGC_SHIFT: u32 = 0;
+pub const METHOD_FLAGS_ARGC_BITS: u32 = 4;
+pub const METHOD_FLAGS_NTEMPS_SHIFT: u32 = 4;
+pub const METHOD_FLAGS_NTEMPS_BITS: u32 = 8;
+pub const METHOD_FLAGS_HAS_CTX_SHIFT: u32 = 12;
+pub const METHOD_FLAGS_IS_BLOCK_SHIFT: u32 = 13;
+pub const METHOD_FLAGS_PRIM_FAILS_SHIFT: u32 = 14;
+
+pub const METHOD_FLAGS_ARGC_MASK: i64 =
+    ((1i64 << METHOD_FLAGS_ARGC_BITS) - 1) << METHOD_FLAGS_ARGC_SHIFT;
+pub const METHOD_FLAGS_NTEMPS_MASK: i64 =
+    ((1i64 << METHOD_FLAGS_NTEMPS_BITS) - 1) << METHOD_FLAGS_NTEMPS_SHIFT;
+pub const METHOD_FLAGS_HAS_CTX_MASK: i64 = 1 << METHOD_FLAGS_HAS_CTX_SHIFT;
+pub const METHOD_FLAGS_IS_BLOCK_MASK: i64 = 1 << METHOD_FLAGS_IS_BLOCK_SHIFT;
+pub const METHOD_FLAGS_PRIM_FAILS_MASK: i64 = 1 << METHOD_FLAGS_PRIM_FAILS_SHIFT;
+
+pub const METHOD_ARGC_MAX: usize = (1 << METHOD_FLAGS_ARGC_BITS) - 1; // 15
+pub const METHOD_NTEMPS_MAX: usize = (1 << METHOD_FLAGS_NTEMPS_BITS) - 1; // 255
+
 #[cfg(test)]
 mod tests {
     use super::*;

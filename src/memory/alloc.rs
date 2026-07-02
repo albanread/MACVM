@@ -8,10 +8,14 @@
 //! it will contain is still being constructed). The public, `VmState`-based
 //! functions below them are what every later sprint allocates through.
 
-use crate::oops::layout::{HEADER_WORDS, KLASS_SIZE_WORDS, MEM_TAG, WORD_SIZE};
+use crate::oops::layout::{
+    HEADER_WORDS, KLASS_SIZE_WORDS, MEM_TAG, METHOD_COUNTERS_INDEX, METHOD_FLAGS_INDEX,
+    METHOD_HOLDER_INDEX, METHOD_ICS_INDEX, METHOD_LITERALS_INDEX, METHOD_PRIMITIVE_INDEX,
+    METHOD_SELECTOR_INDEX, METHOD_SIZE_INDEX, WORD_SIZE,
+};
 use crate::oops::mark::Mark;
 use crate::oops::smi::SmallInt;
-use crate::oops::wrappers::{ArrayOop, ByteArrayOop, DoubleOop, KlassOop, MemOop};
+use crate::oops::wrappers::{ArrayOop, ByteArrayOop, DoubleOop, KlassOop, MemOop, MethodOop};
 use crate::oops::Oop;
 use crate::runtime::vm_state::VmState;
 
@@ -158,6 +162,39 @@ pub fn alloc_double(vm: &mut VmState, v: f64) -> DoubleOop {
 pub fn alloc_klass(vm: &mut VmState, meta: Oop) -> KlassOop {
     let nil_fill = vm.universe.nil_obj;
     alloc_klass_raw(&mut vm.universe.eden, nil_fill, meta)
+}
+
+/// A `CompiledMethod` with `nbytes` of bytecode (SPEC §4.4): 9 named-part
+/// words (7 fields + the size slot) then `ceil(nbytes/8)` byte words.
+/// `tagged_contents = false` (Method objects have a byte tail — S7's
+/// scavenger must scan only the 7 named oop slots, not the whole body), so
+/// this is deliberately NOT built via `alloc_indexable_bytes`: that
+/// zero-fills the entire body, which would leave `selector`/`holder`/
+/// `literals`/`ics` holding smi 0 instead of nil. Named oop fields are
+/// nil-filled explicitly; `flags`/`primitive`/`counters` are smi 0 either
+/// way (raw zero bits already encode smi 0, SPEC §2.1).
+pub fn alloc_method(vm: &mut VmState, nbytes: usize) -> MethodOop {
+    let klass = vm.universe.method_klass;
+    let nis = klass.non_indexable_size();
+    let padded_words = nbytes.div_ceil(8);
+    let words = nis
+        .checked_add(1)
+        .and_then(|w| w.checked_add(padded_words))
+        .expect("alloc_method: size overflow");
+
+    let obj = alloc_words(vm, words, klass.oop(), false);
+    let nil = vm.universe.nil_obj;
+    let zero_smi = SmallInt::new(0).oop().raw();
+    obj.set_raw_body_word(METHOD_SELECTOR_INDEX, nil.raw());
+    obj.set_raw_body_word(METHOD_HOLDER_INDEX, nil.raw());
+    obj.set_raw_body_word(METHOD_FLAGS_INDEX, zero_smi);
+    obj.set_raw_body_word(METHOD_PRIMITIVE_INDEX, zero_smi);
+    obj.set_raw_body_word(METHOD_COUNTERS_INDEX, zero_smi);
+    obj.set_raw_body_word(METHOD_LITERALS_INDEX, nil.raw());
+    obj.set_raw_body_word(METHOD_ICS_INDEX, nil.raw());
+    obj.set_raw_body_word(METHOD_SIZE_INDEX, SmallInt::new(nbytes as i64).oop().raw());
+    // SAFETY: freshly allocated with klass's Method shape.
+    unsafe { MethodOop::from_oop_unchecked(obj.oop()) }
 }
 
 #[cfg(test)]

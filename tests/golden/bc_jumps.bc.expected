@@ -1,0 +1,9 @@
+method #jumps argc=0 ntemps=0 prim=0 flags=
+  0: push_true
+  1: br_false_fwd 5 -> 9
+  4: push_smi 1
+  6: jump_fwd 2 -> 11
+  9: push_smi 2
+  11: return_tos
+literals:
+ics: 0

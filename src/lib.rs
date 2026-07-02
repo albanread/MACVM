@@ -12,6 +12,7 @@
 
 #![deny(unsafe_code)]
 
+pub mod bytecode; // opcode set, CompiledMethod, builder, disassembler
 pub mod compiler; // adaptive optimizing compiler + abstract codegen
 pub mod interpreter; // baseline threaded-code interpreter
 pub mod lookup; // method lookup, inline caches, PICs, type feedback
