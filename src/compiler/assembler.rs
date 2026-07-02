@@ -23,6 +23,9 @@ impl Label {
     pub fn pos(&self) -> Option<usize> {
         self.pos
     }
+    // Unused until a concrete Assembler backend calls it (S9 rewrites this
+    // trait's shape entirely — see docs/sprints/sprint_s09_detail.md).
+    #[allow(dead_code)]
     pub(crate) fn bind_at(&mut self, offset: usize) {
         self.pos = Some(offset);
     }

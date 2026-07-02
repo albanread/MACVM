@@ -1,0 +1,95 @@
+//! Bit/offset constants for the tagged-oop and mark-word representation.
+//!
+//! Single source of truth (CONVENTIONS §2): nothing outside `oops::layout`
+//! may name a tag value, shift, or mask directly. SPEC §2.1 (tags), §2.2
+//! (mark word).
+
+// --- oop tag scheme (SPEC §2.1) --------------------------------------------
+
+pub const TAG_BITS: u32 = 2;
+pub const TAG_MASK: u64 = 0b11;
+pub const INT_TAG: u64 = 0b00; // smi
+pub const MEM_TAG: u64 = 0b01; // heap oop; address = word - MEM_TAG
+pub const RESERVED_TAG: u64 = 0b10; // future immediate Character; illegal in v1
+pub const MARK_TAG: u64 = 0b11; // only as header word 0
+
+pub const SMI_SHIFT: u32 = 2;
+pub const SMI_BITS: u32 = 62;
+pub const SMI_MAX: i64 = (1i64 << 61) - 1; //  2_305_843_009_213_693_951
+pub const SMI_MIN: i64 = -(1i64 << 61); // -2_305_843_009_213_693_952
+
+// --- heap layout (SPEC §2.2) ------------------------------------------------
+
+pub const WORD_SIZE: usize = 8;
+pub const ALLOC_ALIGN: usize = 8; // SPEC §2.1: objects 8-byte aligned (NOT 16)
+pub const MARK_OFFSET: usize = 0; // header word 0
+pub const KLASS_OFFSET: usize = 8; // header word 1
+pub const BODY_OFFSET: usize = 16; // first body word
+pub const HEADER_WORDS: usize = 2;
+
+// --- mark word fields (SPEC §2.2) — bit positions, low to high -------------
+
+pub const MARK_SENTINEL_SHIFT: u32 = 2; // always 1 in a real mark
+pub const MARK_NEAR_DEATH_SHIFT: u32 = 3;
+pub const MARK_TAGGED_CONTENTS_SHIFT: u32 = 4;
+pub const MARK_AGE_SHIFT: u32 = 5; // bits 11:5
+pub const MARK_AGE_BITS: u32 = 7;
+pub const MARK_AGE_MAX: u8 = 127;
+pub const MARK_HASH_SHIFT: u32 = 12; // bits 43:12
+pub const MARK_HASH_BITS: u32 = 32;
+// bits 63:44 reserved, must stay zero in v1.
+
+pub const MARK_SENTINEL_MASK: u64 = 1 << MARK_SENTINEL_SHIFT;
+pub const MARK_NEAR_DEATH_MASK: u64 = 1 << MARK_NEAR_DEATH_SHIFT;
+pub const MARK_TAGGED_CONTENTS_MASK: u64 = 1 << MARK_TAGGED_CONTENTS_SHIFT;
+pub const MARK_AGE_MASK: u64 = ((1u64 << MARK_AGE_BITS) - 1) << MARK_AGE_SHIFT;
+pub const MARK_HASH_MASK: u64 = ((1u64 << MARK_HASH_BITS) - 1) << MARK_HASH_SHIFT;
+
+/// Bit 44: the full-GC mark bit (SPEC §2.2, amendment A: added at S8 review).
+/// Always clear outside a collection.
+pub const MARK_GC_MARK_SHIFT: u32 = 44;
+pub const MARK_GC_MARK_MASK: u64 = 1 << MARK_GC_MARK_SHIFT;
+
+/// The mark word of a freshly allocated object: tag=MARK_TAG, sentinel=1,
+/// every other field zero. `0b111` = 7.
+pub const MARK_PRISTINE: u64 = MARK_TAG | MARK_SENTINEL_MASK;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn layout_relations() {
+        assert_eq!(MARK_HASH_SHIFT, MARK_AGE_SHIFT + MARK_AGE_BITS);
+        assert_eq!(MARK_AGE_SHIFT, MARK_TAGGED_CONTENTS_SHIFT + 1);
+        assert_eq!(SMI_MAX, -(SMI_MIN + 1));
+        assert_eq!(SMI_BITS, 64 - TAG_BITS);
+    }
+
+    #[test]
+    fn layout_values_pinned() {
+        assert_eq!(INT_TAG, 0);
+        assert_eq!(MEM_TAG, 1);
+        assert_eq!(RESERVED_TAG, 2);
+        assert_eq!(MARK_TAG, 3);
+        assert_eq!(SMI_MAX, 2_305_843_009_213_693_951);
+        assert_eq!(ALLOC_ALIGN, 8);
+        assert_eq!(BODY_OFFSET, 16);
+    }
+
+    #[test]
+    fn mask_disjointness() {
+        assert_eq!(MARK_AGE_MASK & MARK_HASH_MASK, 0);
+        let flag_bits = MARK_SENTINEL_MASK | MARK_NEAR_DEATH_MASK | MARK_TAGGED_CONTENTS_MASK;
+        assert_eq!(MARK_AGE_MASK & flag_bits, 0);
+        assert_eq!(MARK_HASH_MASK & flag_bits, 0);
+        assert_eq!(MARK_AGE_MASK & TAG_MASK, 0);
+        assert_eq!(MARK_HASH_MASK & TAG_MASK, 0);
+        assert_eq!(flag_bits & TAG_MASK, 0);
+        // fields partition bits 43:0 with no overlap and leave 63:44 reserved
+        // (the gc_mark bit at 44 is the one exception, checked separately).
+        let used = MARK_AGE_MASK | MARK_HASH_MASK | TAG_MASK | flag_bits;
+        assert_eq!(used >> 44, 0);
+        assert_eq!(MARK_GC_MARK_MASK & used, 0);
+    }
+}
