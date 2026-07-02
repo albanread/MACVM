@@ -685,7 +685,11 @@ impl Universe {
     /// so the private `reservation` stays encapsulated; `self.old` and
     /// `self.reservation` are disjoint fields, so this borrows cleanly.
     pub fn grow_old(&mut self, segment: usize) -> usize {
-        self.old.grow(&self.reservation, segment)
+        let grown = self.old.grow(&self.reservation, segment);
+        if grown > 0 {
+            self.gc_stats.old_grow_count += 1;
+        }
+        grown
     }
 
     /// Interning entry point (SPEC §3.1). Probes by content; on miss

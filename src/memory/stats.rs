@@ -8,7 +8,6 @@ use std::time::Duration;
 #[derive(Debug, Default)]
 pub struct GcStats {
     pub scavenge_count: u64,
-    /// Always 0 until S8 — a full (old-gen) collector doesn't exist yet.
     pub full_gc_count: u64,
     pub total_scavenge_pause: Duration,
     pub bytes_allocated: u64,
@@ -22,6 +21,15 @@ pub struct GcStats {
     /// Reclaimed bytes from the most recently completed scavenge — one of
     /// `GcStallError`'s "is GC actually helping" progress numbers.
     pub last_reclaimed_bytes: u64,
+    /// S8: bytes phase A found reachable in the most recent full GC —
+    /// `gcStats`'s `markedBytesLast` and lesson 15's "measure marked bytes
+    /// vs expected working set before touching policy" diagnostic.
+    pub marked_bytes_last: u64,
+    /// S8: cumulative full-GC pause time, alongside `total_scavenge_pause`.
+    pub full_pause_total: Duration,
+    /// S8: `OldGen::grow` calls that actually committed a segment (0 return
+    /// excluded — that's a no-op at the reservation ceiling, not growth).
+    pub old_grow_count: u64,
 }
 
 impl GcStats {

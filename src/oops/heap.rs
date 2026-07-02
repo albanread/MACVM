@@ -212,14 +212,33 @@ impl MemOop {
     /// capture the klass BEFORE overwriting the klass field — nothing has
     /// been copied yet at that point, so the OLD klass body is what's still
     /// valid to read format from (SPEC §7.5 phase C, invariant F3).
+    ///
+    /// Deliberately uses [`raw_body_word`](MemOop::raw_body_word)/
+    /// [`set_raw_body_word`](MemOop::set_raw_body_word) — pure offset
+    /// arithmetic — rather than [`body_oop`](MemOop::body_oop)/
+    /// [`set_body_oop`](MemOop::set_body_oop), which bounds-check via
+    /// `self.body_word_count()` → `self.instance_size_words()` →
+    /// `self.klass()`, RE-DERIVING the klass from `self`'s OWN klass field
+    /// regardless of the `klass` parameter already passed in here. During a
+    /// full GC's reference-rewrite phase that re-derivation is actively
+    /// unsafe (not just redundant): `self`'s klass field, or — through
+    /// `KlassOop::try_from`'s own one-hop validation of ITS klass field —
+    /// some other, already-processed object's klass field, may already
+    /// have been rewritten to a NEW address phase D hasn't populated yet,
+    /// so the re-derivation can read format bits from unpopulated memory
+    /// (found via `MACVM_GC_STRESS`-style testing of S8's own mark-compact
+    /// pass — the cross-object sibling of invariant F3, one layer deeper
+    /// than "don't rewrite THIS object's own klass field before sizing
+    /// it"). This function already receives a `klass` its caller vouches
+    /// for; it has no need to ask `self` again, checked or not.
     pub(crate) fn for_each_oop_field(self, klass: KlassOop, mut f: impl FnMut(Oop) -> Oop) {
         let nis = klass.non_indexable_size();
         let named = nis - HEADER_WORDS;
         match klass.format() {
             Format::Slots | Format::Klass => {
                 for i in 0..named {
-                    let v = self.body_oop(i);
-                    self.set_body_oop(i, f(v));
+                    let v = Oop::from_raw(self.raw_body_word(i));
+                    self.set_raw_body_word(i, f(v).raw());
                 }
             }
             Format::Double | Format::Process => {
@@ -227,20 +246,20 @@ impl MemOop {
             }
             Format::IndexableOops | Format::Closure | Format::Context => {
                 for i in 0..named {
-                    let v = self.body_oop(i);
-                    self.set_body_oop(i, f(v));
+                    let v = Oop::from_raw(self.raw_body_word(i));
+                    self.set_raw_body_word(i, f(v).raw());
                 }
                 let len = self.raw_size_slot(nis);
                 let tail_start = named + 1;
                 for i in 0..len {
-                    let v = self.body_oop(tail_start + i);
-                    self.set_body_oop(tail_start + i, f(v));
+                    let v = Oop::from_raw(self.raw_body_word(tail_start + i));
+                    self.set_raw_body_word(tail_start + i, f(v).raw());
                 }
             }
             Format::IndexableBytes | Format::Method => {
                 for i in 0..named {
-                    let v = self.body_oop(i);
-                    self.set_body_oop(i, f(v));
+                    let v = Oop::from_raw(self.raw_body_word(i));
+                    self.set_raw_body_word(i, f(v).raw());
                 }
                 // Byte tail (or Method's bytecode bytes): never oop-scanned.
             }

@@ -484,8 +484,11 @@ pub fn scavenge(vm: &mut VmState) -> Result<ScavengeReport, GcStallError> {
 /// reading whatever the NEXT cycle's copy happens to land on, which is
 /// what let a stale-handle bug masquerade as an unrelated GC panic
 /// multiple cycles downstream (S7-11).
+///
+/// `pub(crate)`, not private: S8's full GC poisons its own reclaimed tails
+/// after the slide (same hazard, same fix) — shared rather than re-copied.
 #[cfg(debug_assertions)]
-fn poison_range(start: usize, end: usize) {
+pub(crate) fn poison_range(start: usize, end: usize) {
     debug_assert!(
         start <= end && (end - start).is_multiple_of(crate::oops::layout::WORD_SIZE),
         "poison_range: [{start:#x}, {end:#x}) is not a valid word-aligned range"

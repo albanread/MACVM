@@ -14,6 +14,7 @@
 
 pub mod alloc;
 pub mod cards;
+pub mod fullgc;
 pub mod handles;
 pub mod layout;
 pub mod offsets;

@@ -80,6 +80,19 @@ impl OffsetTable {
         self.old_start + (i << CARD_SHIFT)
     }
 
+    /// Zero every entry (S8 phase D: full GC rebuilds the whole table from
+    /// scratch as it places compacted objects, rather than patching the
+    /// pre-compaction one — old.top can shrink, and every surviving object's
+    /// address changes, so nothing in the old table is trustworthy). Only
+    /// cards below the (possibly new, smaller) `old.top` are ever consulted
+    /// (`dirty_card_scan`/`resolve` callers all stop there), so a zeroed
+    /// entry past it is inert, never misread as a real header distance.
+    pub fn clear(&mut self) {
+        for i in 0..self.n_cards {
+            self.set_entry(i, 0);
+        }
+    }
+
     /// Maintenance, called by `OldGen::allocate` for every freshly
     /// allocated object: records entries for every card whose base falls
     /// inside `[addr, addr + size_bytes)`, per this module's encoding.
