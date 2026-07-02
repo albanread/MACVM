@@ -16,6 +16,14 @@ pub const SURVIVOR_SIZE: usize = 512 << 10;
 /// heap once eden + 2 survivors are carved out).
 pub const OLD_INITIAL_SEGMENT: usize = 16 << 20;
 
+/// Old-gen growth increment (`OldGen::grow`, S8): one 16 MiB *(tunable)*
+/// contiguous segment is committed at a time when direct large allocation
+/// outruns the committed prefix (and, later, when the S8 promotion guarantee
+/// / post-full-GC headroom policy demands it). Same size as the initial
+/// segment. Card and offset tables are already committed for old's full
+/// reserved range at genesis, so growth extends only the heap commit.
+pub const OLD_GROWTH_SEGMENT: usize = 16 << 20;
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct SpaceBounds {
     pub start: usize,

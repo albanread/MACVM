@@ -680,6 +680,14 @@ impl Universe {
         k
     }
 
+    /// Commit one more old-gen segment (S8 step 2), returning bytes newly
+    /// committed (0 iff the reservation is exhausted). Wraps `OldGen::grow`
+    /// so the private `reservation` stays encapsulated; `self.old` and
+    /// `self.reservation` are disjoint fields, so this borrows cleanly.
+    pub fn grow_old(&mut self, segment: usize) -> usize {
+        self.old.grow(&self.reservation, segment)
+    }
+
     /// Interning entry point (SPEC §3.1). Probes by content; on miss
     /// allocates a Symbol and inserts. Rehashes ×2 at 75% load.
     pub fn intern(&mut self, bytes: &[u8]) -> SymbolOop {

@@ -90,6 +90,41 @@ impl OldGen {
         self.committed_end - self.top
     }
 
+    /// Free committed bytes below `committed_end` — what a promotion or direct
+    /// large allocation can still take without growing (S8 promotion guarantee
+    /// / post-full-GC headroom policy read this).
+    #[inline]
+    pub fn free_bytes(&self) -> usize {
+        self.committed_end - self.top
+    }
+
+    /// Commit the next `segment`-byte slice of the reserved old range (S8 step
+    /// 2), advancing `committed_end`. Returns the number of bytes newly
+    /// committed — 0 iff the reservation is already exhausted (`committed_end
+    /// == bounds.end`), at which point the caller escalates to the cascade's
+    /// terminal `GcStallError`. Growth clamps to `bounds.end`, so the last
+    /// segment may be short.
+    ///
+    /// `is_old` is untouched — the young/old boundary is the reservation slice
+    /// (`bounds`), never `committed_end`. The card and offset tables already
+    /// cover old's FULL reserved range (committed in full at genesis, not
+    /// per-segment), so growth extends only the heap commit here; a
+    /// freshly-committed segment is zero-filled by the OS and `OldGen::allocate`
+    /// fills each object body before use, so no stale bytes are ever read.
+    pub fn grow(&mut self, reservation: &super::reservation::Reservation, segment: usize) -> usize {
+        let new_end = self
+            .committed_end
+            .saturating_add(segment.max(1))
+            .min(self.bounds.end);
+        let grown = new_end - self.committed_end;
+        if grown == 0 {
+            return 0; // reservation exhausted — terminal stall upstream
+        }
+        reservation.commit(self.committed_end - reservation.base(), grown);
+        self.committed_end = new_end;
+        grown
+    }
+
     /// The ONLY way memory enters old gen (direct large alloc + promotion,
     /// S7-7). `fill` initializes the freshly bumped body (nil-oop fill or
     /// byte-zero fill, per the object's own format — never trust reclaimed
@@ -128,6 +163,49 @@ mod tests {
             end: 0x30_0000 + len,
         };
         (OldGen::new(bounds, bounds.end), OffsetTable::new(bounds))
+    }
+
+    /// S8 step 2: `OldGen::grow` commits successive segments up to the
+    /// reservation ceiling, then returns 0 (the cascade's terminal stall),
+    /// and a grown region is real, writable memory.
+    #[test]
+    fn oldgen_grows_and_exhausts() {
+        use crate::memory::reservation::Reservation;
+        const SEG: usize = 64 * 1024; // a multiple of any target's page size
+
+        let backing = Reservation::reserve(4 * SEG);
+        let base = backing.base();
+        let bounds = SpaceBounds {
+            start: base,
+            end: base + 4 * SEG,
+        };
+        backing.commit(0, SEG); // only the first segment committed at boot
+        let mut old = OldGen::new(bounds, base + SEG);
+        let mut offsets = OffsetTable::new(bounds);
+
+        // Fill the committed first segment exactly; the next bump misses.
+        assert_eq!(old.free_bytes(), SEG);
+        assert!(old.allocate(&mut offsets, SEG, |_| {}).is_some());
+        assert!(old.allocate(&mut offsets, 8, |_| {}).is_none());
+
+        // Grow one segment; the retry now fits AND the memory is writable
+        // (proves the freshly-committed range is backed, not just bookkept).
+        assert_eq!(old.grow(&backing, SEG), SEG);
+        assert_eq!(old.committed_end, base + 2 * SEG);
+        let addr = old
+            .allocate(&mut offsets, 4096, |a| unsafe {
+                (a as *mut u64).write(0xDEAD_BEEF)
+            })
+            .expect("alloc into the grown segment fits");
+        assert!(addr >= base + SEG && addr < old.committed_end);
+        assert_eq!(unsafe { (addr as *const u64).read() }, 0xDEAD_BEEF);
+
+        // Grow to the reservation ceiling; the last grow clamps, then 0.
+        assert_eq!(old.grow(&backing, SEG), SEG); // -> 3*SEG
+        assert_eq!(old.grow(&backing, 10 * SEG), SEG); // clamped to bounds.end
+        assert_eq!(old.committed_end, bounds.end);
+        assert_eq!(old.grow(&backing, SEG), 0); // reservation exhausted
+        assert_eq!(old.committed_end, bounds.end); // unchanged after a 0-grow
     }
 
     /// `tests_s07.md`'s `oldgen_alloc_none_when_full`: returns `None`, not

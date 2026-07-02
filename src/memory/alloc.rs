@@ -206,26 +206,22 @@ pub fn alloc_words(vm: &mut VmState, words: usize, klass: Oop, tagged: bool) -> 
         }
     }
 
-    let nil_fill = vm.universe.nil_obj;
-    let old_addr = {
-        let offsets = &mut vm.universe.offsets;
-        let old = &mut vm.universe.old;
-        old.allocate(offsets, size_bytes, |_| {})
-    };
-    if let Some(addr) = old_addr {
-        let obj = init_object_at(addr, words, klass_h.get(vm), tagged, nil_fill);
-        // This object is being born directly in old gen (unlike a
-        // promotion, which copies an already-scanned body): its klass
-        // field — and, for a caller that fills the body itself right
-        // after this call returns, potentially its body too — may point
-        // into new gen. Mirror A4 step 8's promotion-path policy: mark the
-        // whole range dirty unconditionally; the next dirty-card scan
-        // clears cards that turn out to hold nothing new-gen
-        // (self-correcting, A6).
-        vm.universe
-            .cards
-            .record_multistores(addr, addr + size_bytes);
+    // Direct old-gen allocation for objects eden can't hold (or that survived
+    // both scavenges). S8 step 2: on a committed-prefix miss, grow one segment
+    // and retry once. The full cascade — promotion guarantee + `full_gc`
+    // before the stall — is S8 step 7; until then a persistent miss is still
+    // the designed terminal `GcStallError`.
+    if let Some(obj) = try_old_alloc(vm, words, size_bytes, klass_h.get(vm), tagged) {
         return obj;
+    }
+    if vm
+        .universe
+        .grow_old(crate::memory::layout::OLD_GROWTH_SEGMENT)
+        > 0
+    {
+        if let Some(obj) = try_old_alloc(vm, words, size_bytes, klass_h.get(vm), tagged) {
+            return obj;
+        }
     }
 
     let err = crate::memory::stall::GcStallError::snapshot(
@@ -234,6 +230,32 @@ pub fn alloc_words(vm: &mut VmState, words: usize, klass: Oop, tagged: bool) -> 
         crate::memory::stall::GcPhase::Mutator,
     );
     stall_exit(err);
+}
+
+/// One direct old-gen allocation attempt: bump the committed prefix, init the
+/// header/body, and dirty the object's card range. `None` iff the committed
+/// prefix is full (caller decides grow/stall). Born-in-old objects get their
+/// whole range dirtied unconditionally (mirrors A4 step 8's promotion policy):
+/// the klass field, and a body the caller fills right after, may point into
+/// new gen; the next dirty-card scan clears cards that turn out clean (A6).
+fn try_old_alloc(
+    vm: &mut VmState,
+    words: usize,
+    size_bytes: usize,
+    klass: Oop,
+    tagged: bool,
+) -> Option<MemOop> {
+    let nil_fill = vm.universe.nil_obj;
+    let addr = {
+        let offsets = &mut vm.universe.offsets;
+        let old = &mut vm.universe.old;
+        old.allocate(offsets, size_bytes, |_| {})?
+    };
+    let obj = init_object_at(addr, words, klass, tagged, nil_fill);
+    vm.universe
+        .cards
+        .record_multistores(addr, addr + size_bytes);
+    Some(obj)
 }
 
 pub fn alloc_slots(vm: &mut VmState, klass: KlassOop) -> MemOop {
