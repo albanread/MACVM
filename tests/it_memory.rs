@@ -60,6 +60,11 @@ fn eden_exhaustion_aborts() {
     let output = std::process::Command::new(exe)
         .arg("--selftest-alloc-loop")
         .env("MACVM_HEAP", "16")
+        // This self-test loop doesn't root its allocations via Handles, so
+        // an inherited `MACVM_GC_STRESS=1` would let a mid-loop scavenge
+        // reclaim eden back to empty every time — exhaustion would never
+        // actually happen. Force it off regardless of the parent env.
+        .env_remove("MACVM_GC_STRESS")
         .output()
         .expect("failed to spawn macvm binary");
 
@@ -79,7 +84,18 @@ fn eden_exhaustion_aborts() {
 
 #[test]
 fn alloc_torture_fill() {
-    let mut vm = VmState::new();
+    // Deliberately keeps allocated objects reachable only via a raw
+    // `Vec<Oop>` (not `Handle`s), so it must force `gc_stress: false` here
+    // rather than inheriting the ambient `MACVM_GC_STRESS` env var: under
+    // stress-every-alloc, a scavenge mid-loop would find these objects
+    // unrooted and reclaim eden right back to empty, so `target` is never
+    // reached and the loop never terminates.
+    let mut vm = VmState::with_options(VmOptions {
+        heap_mib: VmOptions::DEFAULT_HEAP_MIB,
+        trace: Default::default(),
+        gc_stress: false,
+        eden_kb: None,
+    });
     let target = vm.universe.eden.end - (1 << 20); // stop ~1 MiB below capacity
     let mut rng = Xorshift(0x5EED_1234_ABCD_EF01);
 
