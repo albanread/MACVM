@@ -169,7 +169,9 @@ fn bc_store_temp_nonpop() {
 /// Narrow `send`(0x20)/`send_super`(0x21) — S3's own goldens exercise real
 /// dispatch semantics; this one just pins the disassembly shape (and gives
 /// the opcode-coverage meta-test a `send_super` narrow-form hit alongside
-/// `tests/it_sends.rs`'s behavioral coverage).
+/// the behavioral dispatch/super coverage in
+/// `world/tests/16_dispatch_tests.mst` (S7.5 re-expressed the deleted,
+/// GC-unsafe `tests/it_sends.rs` there)).
 #[test]
 fn bc_send_narrow() {
     let mut vm = common::test_vm();

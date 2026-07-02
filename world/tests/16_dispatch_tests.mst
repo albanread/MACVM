@@ -1,0 +1,104 @@
+"16_dispatch_tests.mst — DispatchTests. Re-expresses the GC-unsafe,
+ hand-assembled Rust goldens deleted in S7.5 (tests/it_sends.rs super-send
+ chain + doesNotUnderstand: handler, tests/it_nlr.rs two-frame ensure:
+ ordering) as source-compiled, GC-safe assertions — the SPEC's intended home
+ for semantics (in-language suite = primary regression net, §12.3), and the
+ form that runs through the production allocator under MACVM_GC_STRESS=1.
+
+ Helper classes are defined BEFORE DispatchTests so their globals resolve
+ when DispatchTests's method bodies are compiled."
+
+"--- super-send chain: C>>foo = super + 100, B>>foo = super + 10, A>>foo = 1
+ so DispatchC new foo = 111 (each level adds to its superclass's result)."
+Object subclass: DispatchA [
+    foo [ ^1 ]
+]
+DispatchA subclass: DispatchB [
+    foo [ ^(super foo) + 10 ]
+]
+DispatchB subclass: DispatchC [
+    foo [ ^(super foo) + 100 ]
+]
+
+"--- doesNotUnderstand:: an unknown selector routes to the receiver's own
+ handler, which records the selector and returns a value (overriding Object's
+ default error:-raising handler)."
+Object subclass: DnuCatcher [
+    | lastSelector |
+    doesNotUnderstand: aMessage [
+        lastSelector := aMessage selector.
+        ^42
+    ]
+    lastSelector [ ^lastSelector ]
+]
+
+TestCase subclass: DispatchTests [
+    runAll [
+        self runTest: #testSuperChain do: [ self testSuperChain ].
+        self runTest: #testDnuHandler do: [ self testDnuHandler ].
+        self runTest: #testEnsureOrderThroughTwoFrames
+            do: [ self testEnsureOrderThroughTwoFrames ].
+        self runTest: #testIfCurtailedBothPaths
+            do: [ self testIfCurtailedBothPaths ].
+    ]
+
+    "Each override adds its increment to the inherited result — proves super
+     binds to the DEFINING class's superclass, not the receiver's."
+    testSuperChain [
+        self assert: DispatchA new foo equals: 1.
+        self assert: DispatchB new foo equals: 11.
+        self assert: DispatchC new foo equals: 111.
+    ]
+
+    "A message the receiver doesn't implement is reified and handed to
+     doesNotUnderstand:, whose result becomes the send's value."
+    testDnuHandler [
+        | c |
+        c := DnuCatcher new.
+        self assert: c bogusMessage equals: 42.
+        self assert: c lastSelector equals: #bogusMessage.
+    ]
+
+    "A ^ from a block whose home is `nlrThroughTwoEnsures:` unwinds through
+     BOTH ensure:-marked frames (the inner `callWith:log:` and the home
+     itself); the handlers must run innermost-first."
+    testEnsureOrderThroughTwoFrames [
+        | log r |
+        log := OrderedCollection new.
+        r := DispatchTests nlrThroughTwoEnsures: log.
+        self assert: r equals: 7.
+        self assert: log size equals: 2.
+        self assert: (log at: 1) equals: #inner.
+        self assert: (log at: 2) equals: #outer.
+    ]
+
+    "ifCurtailed:'s handler runs ONLY when the protected block is abandoned
+     by an unwind (NLR), never on normal completion."
+    testIfCurtailedBothPaths [
+        | ranOnNormal ranOnUnwind |
+        ranOnNormal := false.
+        [ 42 ] ifCurtailed: [ ranOnNormal := true ].
+        self deny: ranOnNormal.
+
+        ranOnUnwind := false.
+        self assert: (DispatchTests curtailViaNlr: [ ranOnUnwind := true ]) equals: 0.
+        self assert: ranOnUnwind.
+    ]
+
+    DispatchTests class >> curtailViaNlr: markBlock [
+        "`[ ^0 ]`'s NLR abandons the ifCurtailed:-protected block, so its
+         handler fires; the home returns 0."
+        [ ^0 ] ifCurtailed: [ markBlock value ].
+        ^-1
+    ]
+    DispatchTests class >> nlrThroughTwoEnsures: log [
+        "`[ ^7 ]`'s home is THIS method; value'd two frames down, its NLR
+         unwinds callWith:log:'s ensure (#inner) then this one (#outer)."
+        [ self callWith: [ ^7 ] log: log ] ensure: [ log add: #outer ].
+        ^-1
+    ]
+    DispatchTests class >> callWith: aBlock log: log [
+        [ aBlock value ] ensure: [ log add: #inner ].
+        ^-2
+    ]
+]

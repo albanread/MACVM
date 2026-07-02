@@ -17,4 +17,5 @@
 13_interval_controlflow_tests.mst
 14_stream_print_tests.mst
 15_block_tests.mst
+16_dispatch_tests.mst
 99_run_all.mst

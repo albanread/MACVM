@@ -251,22 +251,27 @@ fn bytearray_byte_at_out_of_bounds_panics() {
 #[test]
 fn wrapper_format_checks() {
     let mut vm = VmState::new();
+    // Each object is allocated and immediately checked with NO allocation in
+    // between, and each klass is fetched from the universe right before its
+    // use: under MACVM_GC_STRESS=1 every alloc scavenges, so caching klasses
+    // up front or holding an earlier result oop across a later alloc would
+    // dangle it (SPEC §7.6.1).
     let array_klass = vm.universe.array_klass;
-    let bytearray_klass = vm.universe.bytearray_klass;
-    let string_klass = vm.universe.string_klass;
-    let symbol_klass = vm.universe.symbol_klass;
-
     let array_oop = macvm::memory::alloc::alloc_indexable_oops(&mut vm, array_klass, 1).oop();
+    assert!(ArrayOop::try_from(array_oop).is_some());
+    assert!(KlassOop::try_from(vm.universe.array_klass.oop()).is_some());
+
+    let bytearray_klass = vm.universe.bytearray_klass;
     let bytearray_oop =
         macvm::memory::alloc::alloc_indexable_bytes(&mut vm, bytearray_klass, 1).oop();
-    let string_oop = macvm::memory::alloc::alloc_indexable_bytes(&mut vm, string_klass, 3).oop();
-
     assert!(ArrayOop::try_from(bytearray_oop).is_none());
-    assert!(KlassOop::try_from(array_klass.oop()).is_some());
+
     // A String shares IndexableBytes format with Symbol but must not pass
     // the exact-klass Symbol check.
+    let string_klass = vm.universe.string_klass;
+    let string_oop = macvm::memory::alloc::alloc_indexable_bytes(&mut vm, string_klass, 3).oop();
+    let symbol_klass = vm.universe.symbol_klass;
     assert!(macvm::oops::wrappers::SymbolOop::try_from_exact(string_oop, symbol_klass).is_none());
-    let _ = array_oop;
 }
 
 #[test]

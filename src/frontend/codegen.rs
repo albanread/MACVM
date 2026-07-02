@@ -1479,8 +1479,7 @@ mod tests {
 
     /// No image/library is loaded in these unit tests (that's S6+), so
     /// inlined `to:do:`/`whileTrue:` goldens that emit real `<=`/`+` sends
-    /// need those primitives installed by hand on `smi_klass` (mirrors
-    /// `tests/it_sends.rs::mixed_arity_sends`).
+    /// need those primitives installed by hand on `smi_klass`.
     fn install_smi_arith(vm: &mut VmState) {
         let smi_klass = vm.universe.smi_klass;
         let mk = |vm: &mut VmState, name: &[u8], prim: i64| {

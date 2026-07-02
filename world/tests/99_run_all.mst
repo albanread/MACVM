@@ -18,4 +18,5 @@ TestRunner run: DictionaryTests.
 TestRunner run: IntervalTests.
 TestRunner run: StreamAndPrintTests.
 TestRunner run: BlockTests.
+TestRunner run: DispatchTests.
 TestRunner report.

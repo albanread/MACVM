@@ -266,10 +266,12 @@ fn s4_counter_closure_reexpressed() {
     );
 }
 
-/// Acceptance gate item 4: S4's gate-3 golden (`nlr_two_frames_ensure_order`
-/// in `tests/it_nlr.rs`) — an NLR through two nested `ensure:`-marked
-/// frames, handlers running innermost-first before the value is delivered —
-/// re-expressed in source.
+/// Acceptance gate item 4: S4's gate-3 golden — an NLR through two nested
+/// `ensure:`-marked frames, handlers running innermost-first before the value
+/// is delivered — re-expressed in source. (The original hand-assembled
+/// `tests/it_nlr.rs` was deleted in S7.5 as GC-unsafe; this source form and
+/// `world/tests/16_dispatch_tests.mst`'s `testEnsureOrderThroughTwoFrames`
+/// are its GC-safe replacements.)
 #[test]
 fn s4_nlr_ensure_reexpressed() {
     let mut vm = common::test_vm();

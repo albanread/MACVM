@@ -12,7 +12,7 @@
 //! (`tests/it_interp.rs::trace_mode_line_count`); `--selftest-dnu-fallback`
 //! sends an unrecognized selector with no `doesNotUnderstand:` installed
 //! anywhere, exercising `runtime::error::dnu_fallback`'s pinned stdout
-//! format and its real `exit(1)` (`tests/it_sends.rs::dnu_trace_golden`).
+//! format and its real `exit(1)`.
 
 use std::io::{BufRead, Write as _};
 use std::path::{Path, PathBuf};
