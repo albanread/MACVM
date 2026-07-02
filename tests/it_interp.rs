@@ -39,6 +39,8 @@ fn k_push_const_matrix() {
     b.ret_tos();
     let sel = vm.universe.intern(b"push_nil");
     let m = b.finish(&mut vm, sel, 0, 0);
+    // `nil` is re-read before every run below: a cached copy is stale
+    // after each intervening `finish` under MACVM_GC_STRESS.
     let recv = vm.universe.nil_obj;
     let r = run_method(&mut vm, m, recv, &[]);
     assert_eq!(r, vm.universe.nil_obj);
@@ -48,6 +50,7 @@ fn k_push_const_matrix() {
     b.ret_tos();
     let sel = vm.universe.intern(b"push_true");
     let m = b.finish(&mut vm, sel, 0, 0);
+    let recv = vm.universe.nil_obj;
     let r = run_method(&mut vm, m, recv, &[]);
     assert_eq!(r, vm.universe.true_obj);
 
@@ -56,6 +59,7 @@ fn k_push_const_matrix() {
     b.ret_tos();
     let sel = vm.universe.intern(b"push_false");
     let m = b.finish(&mut vm, sel, 0, 0);
+    let recv = vm.universe.nil_obj;
     let r = run_method(&mut vm, m, recv, &[]);
     assert_eq!(r, vm.universe.false_obj);
 
@@ -65,6 +69,7 @@ fn k_push_const_matrix() {
         b.ret_tos();
         let sel = vm.universe.intern(b"push_smi");
         let m = b.finish(&mut vm, sel, 0, 0);
+        let recv = vm.universe.nil_obj;
         let r = run_method(&mut vm, m, recv, &[]);
         assert_eq!(r, SmallInt::new(v as i64).oop());
     }
@@ -75,7 +80,9 @@ fn k_push_const_matrix() {
     b.ret_tos();
     let sel = vm.universe.intern(b"push_lit");
     let m = b.finish(&mut vm, sel, 0, 0);
+    let recv = vm.universe.nil_obj;
     let r = run_method(&mut vm, m, recv, &[]);
+    let sym = vm.universe.intern(b"probe"); // re-intern: fresh address post-run
     assert_eq!(r, sym.oop());
 
     assert_eq!(vm.stack.sp, 0);
@@ -125,8 +132,12 @@ fn k_temps() {
 #[test]
 fn k_instvar() {
     let mut vm = common::test_vm();
+    // `recv` rides in a handle: it crosses `finish` (and the run itself)
+    // under MACVM_GC_STRESS.
+    let scope = macvm::memory::handles::HandleScope::enter(&mut vm);
     let assoc_klass = vm.universe.association_klass;
     let recv = alloc::alloc_slots(&mut vm, assoc_klass).oop();
+    let recv_h = scope.handle(&mut vm, recv);
     let value_lit = SmallInt::new(99).oop();
 
     let mut b = BytecodeBuilder::new();
@@ -137,9 +148,11 @@ fn k_instvar() {
     let sel = vm.universe.intern(b"k_instvar");
     let m = b.finish(&mut vm, sel, 0, 0);
 
+    let recv = recv_h.get(&vm);
     let result = run_method(&mut vm, m, recv, &[]);
     assert_eq!(result, value_lit);
 
+    let recv = recv_h.get(&vm);
     let mem = macvm::oops::wrappers::MemOop::try_from(recv).unwrap();
     assert_eq!(
         mem.body_oop(1),
@@ -152,12 +165,17 @@ fn k_instvar() {
 #[test]
 fn k_global() {
     let mut vm = common::test_vm();
+    // `assoc` rides in a handle: it crosses two whole finish+run cycles
+    // under MACVM_GC_STRESS.
+    let scope = macvm::memory::handles::HandleScope::enter(&mut vm);
     let assoc_klass = vm.universe.association_klass;
     let assoc = alloc::alloc_slots(&mut vm, assoc_klass);
     assoc.set_body_oop(1, SmallInt::new(5).oop());
+    let assoc_h = scope.handle(&mut vm, assoc);
 
     let mut b = BytecodeBuilder::new();
-    b.push_global(&mut vm, assoc.oop());
+    let assoc_oop = assoc_h.get(&vm).oop();
+    b.push_global(&mut vm, assoc_oop);
     b.ret_tos();
     let sel = vm.universe.intern(b"k_global_read");
     let m = b.finish(&mut vm, sel, 0, 0);
@@ -167,11 +185,14 @@ fn k_global() {
 
     let mut b = BytecodeBuilder::new();
     b.push_smi_i8(9);
-    b.store_global_pop(&mut vm, assoc.oop());
-    b.push_global(&mut vm, assoc.oop());
+    let assoc_oop = assoc_h.get(&vm).oop();
+    b.store_global_pop(&mut vm, assoc_oop);
+    let assoc_oop = assoc_h.get(&vm).oop();
+    b.push_global(&mut vm, assoc_oop);
     b.ret_tos();
     let sel = vm.universe.intern(b"k_global_write");
     let m = b.finish(&mut vm, sel, 0, 0);
+    let recv = vm.universe.nil_obj;
     let r = run_method(&mut vm, m, recv, &[]);
     assert_eq!(r, SmallInt::new(9).oop());
 

@@ -132,7 +132,17 @@ impl BytecodeBuilder {
 
     fn intern_literal(&mut self, vm: &mut VmState, o: Oop) -> usize {
         if let Some(&idx) = self.literal_index.get(&o.raw()) {
-            return idx;
+            // VALIDATE the hit against the handle-backed truth: the map is
+            // keyed by raw addresses as of insert time, and a moving GC can
+            // recycle a dead literal's old address for a DIFFERENT object —
+            // an unvalidated hit then aliases two distinct literals into
+            // one slot (S7-10, found via `MACVM_GC_STRESS=1`: a method's
+            // `$)` char literal resolved to its `$(`, printing "(4, 6(").
+            // A stale entry that merely MISSES costs one duplicate slot;
+            // a false HIT is a miscompile.
+            if self.literals[idx].get(vm).raw() == o.raw() {
+                return idx;
+            }
         }
         let h = self.make_handle(vm, o);
         let idx = self.literals.len();

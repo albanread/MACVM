@@ -108,14 +108,22 @@ fn build_string(vm: &mut VmState, s: &str) -> macvm::oops::Oop {
 #[test]
 fn bc_literals() {
     let mut vm = common::test_vm();
-    let foo = vm.universe.intern(b"foo").oop();
+    // Handles across the allocations (MACVM_GC_STRESS moves everything on
+    // each): `bar` crosses the assoc allocation, so it rides in a handle;
+    // `foo` is interned LAST (interning never scavenges) and used at once.
+    let scope = macvm::memory::handles::HandleScope::enter(&mut vm);
     let bar = build_string(&mut vm, "bar");
+    let bar_h = scope.handle(&mut vm, bar);
     let assoc_klass = vm.universe.association_klass;
     let assoc = alloc::alloc_slots(&mut vm, assoc_klass).oop();
+    let assoc_h = scope.handle(&mut vm, assoc);
+    let foo = vm.universe.intern(b"foo").oop();
 
     let mut b = BytecodeBuilder::new();
     b.push_literal(&mut vm, foo);
+    let bar = bar_h.get(&vm);
     b.push_literal(&mut vm, bar);
+    let assoc = assoc_h.get(&vm);
     b.push_global(&mut vm, assoc);
     b.ret_tos();
     let sel = vm.universe.intern(b"literals");

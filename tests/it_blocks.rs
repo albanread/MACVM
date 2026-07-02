@@ -13,17 +13,21 @@ use macvm::runtime::lookup::install_method;
 use macvm::runtime::vm_state::VmState;
 
 /// Installs the smi `+` primitive (id 1) on `smi_klass` and `value` (50)
-/// on `closure_klass` — everything these goldens need.
+/// on `closure_klass` — everything these goldens need. Every klass/
+/// selector is (re-)read right before use, never cached across a
+/// `finish()`: under MACVM_GC_STRESS each `finish` scavenges, and a stale
+/// cached oop handed to `install_method` gets faithfully handle-protected
+/// as a stale pointer — which the next scavenge then chases into recycled
+/// survivor space, corrupting the heap.
 fn install_block_prims(vm: &mut VmState) {
-    let closure_klass = vm.universe.closure_klass;
-    let smi_klass = vm.universe.smi_klass;
-
     let value_sel = vm.universe.intern(b"value");
     let mut value_b = BytecodeBuilder::new();
     value_b.push_self();
     value_b.ret_self();
     let value_method = value_b.finish(vm, value_sel, 0, 0);
     value_method.set_primitive(50);
+    let closure_klass = vm.universe.closure_klass;
+    let value_sel = vm.universe.intern(b"value");
     install_method(vm, closure_klass, value_sel, value_method);
 
     let plus_sel = vm.universe.intern(b"+");
@@ -32,6 +36,8 @@ fn install_block_prims(vm: &mut VmState) {
     plus_b.ret_self();
     let plus_method = plus_b.finish(vm, plus_sel, 1, 0);
     plus_method.set_primitive(1);
+    let smi_klass = vm.universe.smi_klass;
+    let plus_sel = vm.universe.intern(b"+");
     install_method(vm, smi_klass, plus_sel, plus_method);
 }
 
@@ -42,7 +48,7 @@ fn install_block_prims(vm: &mut VmState) {
 fn counter_closure() {
     let mut vm = common::test_vm();
     install_block_prims(&mut vm);
-    let value_sel = vm.universe.intern(b"value");
+    let _ = vm.universe.intern(b"value"); // pre-intern; re-interned fresh at each use below
     let plus_sel = vm.universe.intern(b"+");
 
     let mut home = BytecodeBuilder::new();
@@ -73,6 +79,12 @@ fn counter_closure() {
         "home must have fully returned before the closure is ever value'd"
     );
     let closure = ClosureOop::try_from(closure_oop).expect("home must return the closure");
+    // Under MACVM_GC_STRESS every builder/run step below scavenges: the
+    // closure must ride in a handle across iterations, and the selector/
+    // nil locals cached above are re-derived fresh per use (re-interning
+    // is dedup — it returns the same Symbol at its current address).
+    let scope = macvm::memory::handles::HandleScope::enter(&mut vm);
+    let closure_h = scope.handle(&mut vm, closure);
 
     // `value` the closure 3 times, each via a fresh top-level activation —
     // proving the shared Context outlives `home`'s own (long-dead) frame.
@@ -80,11 +92,14 @@ fn counter_closure() {
     for _ in 0..3 {
         let mut caller = BytecodeBuilder::new();
         caller.push_temp(0);
+        let value_sel = vm.universe.intern(b"value");
         caller.send(&mut vm, value_sel, 0);
         caller.ret_tos();
         let caller_sel = vm.universe.intern(b"caller");
         let caller_method = caller.finish(&mut vm, caller_sel, 1, 0);
-        let r = run_method(&mut vm, caller_method, recv, &[closure.oop()]);
+        let recv = vm.universe.nil_obj;
+        let arg = closure_h.get(&vm).oop();
+        let r = run_method(&mut vm, caller_method, recv, &[arg]);
         results.push(
             SmallInt::try_from(r)
                 .expect("counter must return a smi")
@@ -102,7 +117,7 @@ fn counter_closure() {
 fn nested_blocks_3deep() {
     let mut vm = common::test_vm();
     install_block_prims(&mut vm);
-    let value_sel = vm.universe.intern(b"value");
+    let _ = vm.universe.intern(b"value"); // pre-intern; re-interned fresh at each use below
     let plus_sel = vm.universe.intern(b"+");
 
     // B3 = [a + b + c. a := 99. a] — has no ctx of its own; captures the
@@ -121,13 +136,17 @@ fn nested_blocks_3deep() {
     b3_blk.set_flags(0, 1, false, true, false, true, 0);
 
     // B2(ctx: b=20) ⊃ [B3] — captures the enclosing (B1-aliased-M's) ctx,
-    // has its own ctx (nctx=1) for `b`.
+    // has its own ctx (nctx=1) for `b`. `value` is RE-interned before each
+    // builder use below: under MACVM_GC_STRESS the `value_sel` local cached
+    // at the top goes stale across every intervening `finish` (re-interning
+    // is dedup — same Symbol, current address).
     let mut b2_builder = BytecodeBuilder::new();
     b2_builder.push_smi_i8(20);
     b2_builder.store_ctx_temp_pop(0, 0); // b := 20
     let b3_lit = b2_builder.intern_block_literal(&mut vm, b3_blk);
     b2_builder.push_smi_i8(30); // value-capture c
     b2_builder.push_closure(b3_lit, 1);
+    let value_sel = vm.universe.intern(b"value");
     b2_builder.send(&mut vm, value_sel, 0);
     b2_builder.ret_tos();
     let b2_sel = vm.universe.intern(b"aBlock");
@@ -138,6 +157,7 @@ fn nested_blocks_3deep() {
     let mut b1_builder = BytecodeBuilder::new();
     let b2_lit = b1_builder.intern_block_literal(&mut vm, b2_method);
     b1_builder.push_closure(b2_lit, 0);
+    let value_sel = vm.universe.intern(b"value");
     b1_builder.send(&mut vm, value_sel, 0);
     b1_builder.ret_tos();
     let b1_sel = vm.universe.intern(b"aBlock");
@@ -150,6 +170,7 @@ fn nested_blocks_3deep() {
     m.store_ctx_temp_pop(0, 0); // a := 10
     let b1_lit = m.intern_block_literal(&mut vm, b1_method);
     m.push_closure(b1_lit, 0);
+    let value_sel = vm.universe.intern(b"value");
     m.send(&mut vm, value_sel, 0);
     m.pop();
     m.push_ctx_temp(0, 0); // read `a` back after the store-through
@@ -174,7 +195,7 @@ fn nested_blocks_3deep() {
 fn block_reentry_after_home_return() {
     let mut vm = common::test_vm();
     install_block_prims(&mut vm);
-    let value_sel = vm.universe.intern(b"value");
+    let _ = vm.universe.intern(b"value"); // pre-intern; re-interned fresh at each use below
     let plus_sel = vm.universe.intern(b"+");
 
     let mut home = BytecodeBuilder::new();
@@ -197,16 +218,23 @@ fn block_reentry_after_home_return() {
     let closure_oop = run_method(&mut vm, home_method, recv, &[]);
     assert!(common::stack_clean(&vm), "home must have fully returned");
     let closure = ClosureOop::try_from(closure_oop).unwrap();
+    // Handle + fresh re-reads per iteration, same as `counter_closure` —
+    // every step below scavenges under MACVM_GC_STRESS.
+    let scope = macvm::memory::handles::HandleScope::enter(&mut vm);
+    let closure_h = scope.handle(&mut vm, closure);
 
     let mut results = Vec::new();
     for _ in 0..3 {
         let mut caller = BytecodeBuilder::new();
         caller.push_temp(0);
+        let value_sel = vm.universe.intern(b"value");
         caller.send(&mut vm, value_sel, 0);
         caller.ret_tos();
         let caller_sel = vm.universe.intern(b"caller");
         let caller_method = caller.finish(&mut vm, caller_sel, 1, 0);
-        let r = run_method(&mut vm, caller_method, recv, &[closure.oop()]);
+        let recv = vm.universe.nil_obj;
+        let arg = closure_h.get(&vm).oop();
+        let r = run_method(&mut vm, caller_method, recv, &[arg]);
         results.push(SmallInt::try_from(r).expect("must return a smi").value());
         assert!(common::stack_clean(&vm));
     }

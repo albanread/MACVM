@@ -35,6 +35,13 @@ pub(crate) fn bump_invocation(m: MethodOop) {
 pub fn activate_method(vm: &mut VmState, m: MethodOop, argc: u8) {
     bump_invocation(m);
 
+    // `m` is held across two allocation-capable steps below: the primitive
+    // call (a `can_allocate` primitive that then Fails falls through to the
+    // frame push, which reads `m`) and `maybe_alloc_context` (after which
+    // `m` is stamped into `vm.regs.method`) — S7-10 GC_STRESS audit.
+    let scope = crate::memory::handles::HandleScope::enter(vm);
+    let m_h = scope.handle(vm, m);
+
     let prim_id = m.primitive();
     if prim_id != 0 {
         let desc = crate::runtime::primitives::prim_by_id(prim_id as u16)
@@ -55,7 +62,7 @@ pub fn activate_method(vm: &mut VmState, m: MethodOop, argc: u8) {
             }
             PrimResult::Fail => {
                 debug_assert!(
-                    m.prim_fails(),
+                    m_h.get(vm).prim_fails(),
                     "activate_method: primitive {} Failed but the method's prim_fails flag is unset",
                     desc.name
                 );
@@ -72,13 +79,14 @@ pub fn activate_method(vm: &mut VmState, m: MethodOop, argc: u8) {
 
     let saved_fp = vm.stack.fp as i64;
     let saved_bci = vm.regs.bci;
+    let m = m_h.get(vm); // fresh: the failed primitive above may have allocated
     super::push_frame(vm, m, argc as usize, saved_fp, saved_bci);
     // A plain method's own Context has no enclosing chain (SPEC §5.4);
     // block activation (`activate_block`) passes its inherited context
     // instead.
     let nil = vm.universe.nil_obj;
     super::blocks::maybe_alloc_context(vm, m, vm.stack.fp, nil);
-    vm.regs.method = Some(m);
+    vm.regs.method = Some(m_h.get(vm)); // fresh again: the context alloc may have moved it
     vm.regs.bci = 0;
 }
 
@@ -105,7 +113,18 @@ pub fn send_generic(vm: &mut VmState, argc: u8, ic_idx: u16, is_super: bool) {
 
     match ic_transition(vm, caller, ic_idx, k, is_super) {
         Some(m) => activate_method(vm, m, argc),
-        None => dnu(vm, k, ic.selector(), argc),
+        None => {
+            // Re-derive everything: `ic_transition` may have allocated (the
+            // poly-pairs array), so the cached `ic` view (its `ics` array
+            // address), `k`, and even `caller` may all be stale. `vm.regs.
+            // method` is a scanned GC root and still names this caller;
+            // the receiver is re-read from its (scanned) stack slot.
+            let caller = vm.regs.method.expect("send_generic: no active method");
+            let ic = InterpreterIc::at(caller, ic_idx);
+            let rcvr = vm.stack.get(vm.stack.sp - argc as usize - 1);
+            let k = klass_of(vm, rcvr);
+            dnu(vm, k, ic.selector(), argc)
+        }
     }
 }
 
@@ -124,6 +143,14 @@ fn dnu(vm: &mut VmState, rcvr_klass: KlassOop, selector: SymbolOop, argc: u8) {
     let sp = vm.stack.sp;
     let args_start = sp - argc_usize;
 
+    // The args array is parked on the operand stack across the Message
+    // allocation (the S3-era choke-point pattern), but `selector` and
+    // `rcvr_klass` are bare parameters held across BOTH allocations below
+    // and used after — they need handles (S7-10 GC_STRESS audit).
+    let scope = crate::memory::handles::HandleScope::enter(vm);
+    let selector_h = scope.handle(vm, selector);
+    let rcvr_klass_h = scope.handle(vm, rcvr_klass);
+
     let array_klass = vm.universe.array_klass;
     let args_array = crate::memory::alloc::alloc_indexable_oops(vm, array_klass, argc_usize);
     for i in 0..argc_usize {
@@ -138,14 +165,14 @@ fn dnu(vm: &mut VmState, rcvr_klass: KlassOop, selector: SymbolOop, argc: u8) {
     let message_klass = vm.universe.message_klass;
     let msg = crate::memory::alloc::alloc_slots(vm, message_klass);
     let parked_array = pop(vm);
-    msg.set_body_oop(0, selector.oop());
+    msg.set_body_oop(0, selector_h.get(vm).oop());
     msg.set_body_oop(1, parked_array);
     push(vm, msg.oop()); // stack: ..., receiver, message
 
     let sel_dnu = vm.universe.sel_does_not_understand;
-    match crate::runtime::lookup::lookup(vm, rcvr_klass, sel_dnu) {
+    match crate::runtime::lookup::lookup(vm, rcvr_klass_h.get(vm), sel_dnu) {
         Some(dnu_method) => activate_method(vm, dnu_method, 1),
-        None => crate::runtime::error::dnu_fallback(vm, selector, rcvr_klass),
+        None => crate::runtime::error::dnu_fallback(vm, selector_h.get(vm), rcvr_klass_h.get(vm)),
     }
 }
 

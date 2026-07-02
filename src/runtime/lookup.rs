@@ -169,6 +169,13 @@ pub fn install_method(vm: &mut VmState, klass: KlassOop, selector: SymbolOop, m:
     klass.set_methods(dict.oop());
     m.set_holder(klass.oop());
     patch_block_holders(klass.oop(), m);
+    // `klass` is typically an early-promoted (old-gen) genesis klass and
+    // `dict` a young object — the raw setters above bypass the per-slot
+    // store barrier, so the old→new edge must be recorded here (S7-10).
+    // `m` is young at install time (freshly compiled), but the barrier is
+    // an old-check no-op then, so cover it uniformly.
+    crate::memory::store::post_write_barrier(vm, klass.as_mem());
+    crate::memory::store::post_write_barrier(vm, m.as_mem());
 
     vm.lookup_cache.flush();
     vm.ic_epoch += 1;

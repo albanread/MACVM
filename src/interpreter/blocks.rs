@@ -29,8 +29,14 @@ pub fn maybe_alloc_context(
         return;
     }
     let nctx = method.nctx();
+    // `enclosing` (nil for a plain method, the captured enclosing Context
+    // for a block) is a bare parameter held across the allocation below —
+    // storing it un-refreshed writes a stale from-space pointer into the
+    // fresh Context's home_hint (S7-10 GC_STRESS audit).
+    let scope = crate::memory::handles::HandleScope::enter(vm);
+    let enclosing_h = scope.handle(vm, enclosing);
     let ctx = crate::memory::alloc::alloc_context(vm, nctx);
-    ctx.set_home_hint(enclosing);
+    ctx.set_home_hint(enclosing_h.get(vm));
     Frame { fp }.set_context(&mut vm.stack, ctx.oop());
 }
 
@@ -88,13 +94,24 @@ pub fn activate_block(vm: &mut VmState, closure: ClosureOop, argc: usize) -> Pri
         Frame { fp: fp_new }.set_context(&mut vm.stack, enclosing);
     }
 
+    // Re-read the closure from the frame's receiver-arg slot (a scanned
+    // stack slot, always current) rather than trusting the bare `closure`/
+    // `blk` parameters: the has_ctx branch above allocates, so both locals
+    // may name from-space images by now — copying value captures out of a
+    // stale from-space body stores stale oops into the live frame, and
+    // stamping a stale `blk` into `vm.regs.method` hands the dispatch loop
+    // dead bytecode (S7-10 GC_STRESS audit).
+    let frame = Frame { fp: fp_new };
+    let closure = ClosureOop::try_from(vm.stack.get(frame.receiver_slot(&vm.stack)))
+        .expect("activate_block: receiver-arg slot must hold the closure");
+    let blk = closure.method();
+
     // Value captures land in the first LOCAL temp slots — `ntemps` counts
     // value-captures-then-block-locals, and unified indexing already puts
     // local temp `t` (`t >= argc`) at `fp + FRAME_TEMPS_BASE + (t - argc)`,
     // so writing at unified index `argc + i` lands exactly there.
     let value_base = 1 + captures_ctx as usize;
     let n_value_captures = closure.ncopied() - value_base;
-    let frame = Frame { fp: fp_new };
     for i in 0..n_value_captures {
         let v = closure.copied(value_base + i);
         frame.set_temp(&mut vm.stack, argc + i, v);
@@ -133,6 +150,12 @@ pub fn make_closure(vm: &mut VmState, blk: MethodOop, n_value_captures: usize) -
 
     // Allocate BEFORE popping — the value captures stay live as GC roots on
     // the operand stack during the allocation (S7 choke-point pattern).
+    // `blk` itself is a bare parameter held across that same allocation
+    // (it IS reachable — it's a literal of the current frame's method — but
+    // this local copy of its address is not updated by the scavenge), so
+    // it needs a handle before it can be stored into the fresh closure.
+    let scope = crate::memory::handles::HandleScope::enter(vm);
+    let blk_h = scope.handle(vm, blk);
     let closure = crate::memory::alloc::alloc_closure(vm, total);
     let sp = vm.stack.sp;
     let base = sp - n_value_captures;
@@ -141,7 +164,7 @@ pub fn make_closure(vm: &mut VmState, blk: MethodOop, n_value_captures: usize) -
     }
     vm.stack.sp = base;
 
-    closure.set_method(blk);
+    closure.set_method(blk_h.get(vm));
     let current = Frame { fp: vm.stack.fp };
     closure.set_copied(0, current.receiver(&vm.stack));
     if captures_ctx {

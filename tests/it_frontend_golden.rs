@@ -197,14 +197,21 @@ fn point_demo_transcript() {
     assert_eq!(buf.as_string(), expected);
 }
 
+/// `klass` must be freshly derived at the call site (not cached across a
+/// previous `install_prim` call — under MACVM_GC_STRESS every `finish`
+/// inside moves it). It rides in a handle across this function's own
+/// allocations, and the selector is re-interned after them.
 fn install_prim(vm: &mut VmState, klass: KlassOop, name: &[u8], argc: usize, prim: i64) {
+    let scope = macvm::memory::handles::HandleScope::enter(vm);
+    let klass_h = scope.handle(vm, klass);
     let sel = vm.universe.intern(name);
     let mut b = macvm::bytecode::BytecodeBuilder::new();
     b.push_self();
     b.ret_self();
     let m = b.finish(vm, sel, argc, 0);
     m.set_primitive(prim);
-    macvm::runtime::lookup::install_method(vm, klass, sel, m);
+    let sel = vm.universe.intern(name);
+    macvm::runtime::lookup::install_method(vm, klass_h.get(vm), sel, m);
 }
 
 /// Acceptance gate item 4: an S4 golden program (the "counter closure" —
@@ -223,23 +230,35 @@ fn s4_counter_closure_reexpressed() {
          \x20   run: aCounter [ | a b c | a := aCounter value. b := aCounter value. c := aCounter value. ^(a * 100) + (b * 10) + c ]\n\
          ]\n",
     );
+    // Universe klass fields are re-read before EACH call — a local cached
+    // across a previous install_prim is stale under MACVM_GC_STRESS.
     let smi_klass = vm.universe.smi_klass;
     install_prim(&mut vm, smi_klass, b"+", 1, 1);
+    let smi_klass = vm.universe.smi_klass;
     install_prim(&mut vm, smi_klass, b"*", 1, 3);
     let closure_klass = vm.universe.closure_klass;
     install_prim(&mut vm, closure_klass, b"value", 0, 50);
 
+    // Every oop that crosses an allocating call below rides in a handle
+    // (MACVM_GC_STRESS moves everything on every allocation).
+    let scope = macvm::memory::handles::HandleScope::enter(&mut vm);
     let counter_klass = klass_named(&mut vm, "S4Counter");
     let make_sel = vm.universe.intern(b"make");
     let make_m = macvm::runtime::lookup::lookup(&mut vm, counter_klass, make_sel).unwrap();
+    let make_m_h = scope.handle(&mut vm, make_m);
     let recv = macvm::memory::alloc::alloc_slots(&mut vm, counter_klass).oop();
+    let make_m = make_m_h.get(&vm);
     let counter = macvm::interpreter::run_method(&mut vm, make_m, recv, &[]);
+    let counter_h = scope.handle(&mut vm, counter);
 
     let use_klass = klass_named(&mut vm, "S4CounterUse");
     let run_sel = vm.universe.intern(b"run:");
     let run_m = macvm::runtime::lookup::lookup(&mut vm, use_klass, run_sel).unwrap();
+    let run_m_h = scope.handle(&mut vm, run_m);
     let use_recv = macvm::memory::alloc::alloc_slots(&mut vm, use_klass).oop();
-    let result = macvm::interpreter::run_method(&mut vm, run_m, use_recv, &[counter]);
+    let arg = counter_h.get(&vm);
+    let run_m = run_m_h.get(&vm);
+    let result = macvm::interpreter::run_method(&mut vm, run_m, use_recv, &[arg]);
     assert_eq!(
         result,
         macvm::oops::smi::SmallInt::new(123).oop(),
@@ -268,16 +287,23 @@ fn s4_nlr_ensure_reexpressed() {
     let closure_klass = vm.universe.closure_klass;
     install_prim(&mut vm, closure_klass, b"ensure:", 1, 60);
 
+    // Handles for everything crossing an allocation (MACVM_GC_STRESS).
+    let scope = macvm::memory::handles::HandleScope::enter(&mut vm);
     let nlr_klass = klass_named(&mut vm, "S4Nlr");
-    let driver_klass = klass_named(&mut vm, "S4NlrDriver");
     let nlr_recv = macvm::memory::alloc::alloc_slots(&mut vm, nlr_klass).oop();
+    let nlr_recv_h = scope.handle(&mut vm, nlr_recv);
+    let driver_klass = klass_named(&mut vm, "S4NlrDriver");
     let driver_recv = macvm::memory::alloc::alloc_slots(&mut vm, driver_klass).oop();
+    let driver_recv_h = scope.handle(&mut vm, driver_recv);
 
     let buf = OutputBuffer::new();
     vm.out = Box::new(buf.clone());
+    let driver_klass = klass_named(&mut vm, "S4NlrDriver");
     let go_sel = vm.universe.intern(b"go:");
     let go_m = macvm::runtime::lookup::lookup(&mut vm, driver_klass, go_sel).unwrap();
-    let result = macvm::interpreter::run_method(&mut vm, go_m, driver_recv, &[nlr_recv]);
+    let recv = driver_recv_h.get(&vm);
+    let arg = nlr_recv_h.get(&vm);
+    let result = macvm::interpreter::run_method(&mut vm, go_m, recv, &[arg]);
 
     assert_eq!(result, macvm::oops::smi::SmallInt::new(42).oop());
     assert_eq!(

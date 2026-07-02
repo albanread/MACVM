@@ -66,12 +66,18 @@ fn alloc_method_shape() {
 #[test]
 fn method_size_math() {
     let mut vm = common::test_vm();
+    // Under MACVM_GC_STRESS the allocator scavenges (resetting eden.top)
+    // before every bump, so a top-delta measurement is meaningless there —
+    // the shape/content assertions below still run either way.
+    let stressed = vm.options.gc_stress;
     for n in [0usize, 1, 7, 8, 9, 16] {
         let before = vm.universe.eden.top;
         let m = macvm::memory::alloc::alloc_method(&mut vm, n);
-        let consumed = (vm.universe.eden.top - before) / 8;
-        let nis = vm.universe.method_klass.non_indexable_size();
-        assert_eq!(consumed, nis + 1 + n.div_ceil(8), "n={n}");
+        if !stressed {
+            let consumed = (vm.universe.eden.top - before) / 8;
+            let nis = vm.universe.method_klass.non_indexable_size();
+            assert_eq!(consumed, nis + 1 + n.div_ceil(8), "n={n}");
+        }
         assert_eq!(m.bytecode_len(), n);
         for i in 0..n {
             assert_eq!(m.bytecode_byte(i), 0, "n={n} i={i}");

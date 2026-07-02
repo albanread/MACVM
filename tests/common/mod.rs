@@ -1,6 +1,8 @@
 //! Shared test scaffolding (tests_s02.md §Unit tests scaffolding note).
 //! `test_vm()` never uses `std::env::set_var` — the test runner is
-//! multi-threaded, and env mutation across parallel tests races.
+//! multi-threaded, and env mutation across parallel tests races. READING
+//! the environment is race-free, though, which is what lets the S7 gate's
+//! `MACVM_GC_STRESS=1 cargo test` reach every in-process test VM here.
 
 use macvm::runtime::{VmOptions, VmState};
 
@@ -9,7 +11,7 @@ pub fn test_vm() -> VmState {
     VmState::with_options(VmOptions {
         heap_mib: 64,
         trace: Default::default(),
-        gc_stress: false,
+        gc_stress: std::env::var("MACVM_GC_STRESS").ok().as_deref() == Some("1"),
         eden_kb: None,
     })
 }

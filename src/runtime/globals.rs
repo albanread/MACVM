@@ -107,6 +107,25 @@ pub fn global_lookup(vm: &VmState, name: SymbolOop) -> Option<Oop> {
             return Some(assoc);
         }
     }
+    if std::env::var("MACVM_DBG_GLOBALS").is_ok() {
+        eprintln!(
+            "GDBG lookup MISS for {:?} (sym {:#x}); table tally={tally}:",
+            name.as_string(),
+            name.oop().raw()
+        );
+        for i in 0..tally {
+            let assoc = arr.at(1 + i);
+            let k = assoc_key(assoc);
+            let ks = crate::oops::wrappers::SymbolOop::try_from(k)
+                .map(|s| s.as_string())
+                .unwrap_or_else(|| format!("<non-symbol {:#x}>", k.raw()));
+            eprintln!(
+                "GDBG   [{i}] assoc={:#x} key={:#x} {ks:?}",
+                assoc.raw(),
+                k.raw()
+            );
+        }
+    }
     None
 }
 
@@ -135,6 +154,11 @@ pub fn global_declare(vm: &mut VmState, name: SymbolOop) -> Oop {
     let tally = SmallInt::try_from(arr.at(0)).unwrap().value() as usize;
     arr.at_put(1 + tally, assoc.oop());
     arr.at_put(0, SmallInt::new((tally + 1) as i64).oop());
+    // The globals array is long-lived (promoted early); appending a fresh
+    // (young) Association through the raw `at_put` creates an unbarriered
+    // old→new edge (S7-10 — this exact write was the first clean-card
+    // violation the A9 verifier caught during a GC_STRESS world load).
+    crate::memory::store::post_write_barrier(vm, arr.as_mem());
     assoc.oop()
 }
 

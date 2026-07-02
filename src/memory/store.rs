@@ -46,6 +46,30 @@ pub fn store_tail_oop(vm: &mut VmState, obj: MemOop, i: usize, val: Oop) {
     store(vm, obj, obj.tail_start_word() + i, val);
 }
 
+/// Conservative POST-write barrier for Rust-side runtime writers (method
+/// installation, method-dictionary inserts, IC transitions, the globals
+/// array, class reopening…) that mutate a possibly-OLD object through the
+/// raw `set_body_oop`/`at_put` accessors: marks every card the object
+/// overlaps dirty when it lives in old gen, no-op otherwise.
+///
+/// Exists because the per-slot [`store`] barrier was scoped (S7-5) to the
+/// guest-visible mutator stores only, on the then-true assumption that
+/// runtime code always writes into freshly allocated (young) objects —
+/// which stops holding the moment long-lived runtime structures (a klass's
+/// method dictionary, an ics array, the `smalltalk` globals array) get
+/// promoted and are then mutated in place. Coarseness is fine: the
+/// dirty-card scan is self-correcting (a card with no old→new slot is
+/// re-cleaned on the next scavenge), so over-dirtying costs one rescan,
+/// never correctness — while a MISSED dirty card is a dangling reference
+/// (exactly what the A9 verifier caught to motivate this, S7-10).
+pub fn post_write_barrier(vm: &mut VmState, obj: MemOop) {
+    let addr = obj.addr();
+    if vm.universe.layout.is_old(addr) {
+        let bytes = obj.instance_size_words() * crate::oops::layout::WORD_SIZE;
+        vm.universe.cards.record_multistores(addr, addr + bytes);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

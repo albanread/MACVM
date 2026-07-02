@@ -110,15 +110,17 @@ impl MethodDictOop {
         let nil = vm.universe.nil_obj;
 
         // Reopening an existing selector overwrites in place — no growth,
-        // no allocation, so no staleness risk on this path.
+        // no allocation, so no staleness risk on this path. The dict may
+        // be old and the method young, hence the barrier (S7-10).
         if let Some(slot) = self.probe_slot(nil, selector) {
             self.set_value_at(slot, method.oop());
+            crate::memory::store::post_write_barrier(vm, self.0);
             return self;
         }
 
         let capacity = self.capacity();
         let tally = self.tally();
-        let (dict, selector, method) = if capacity == 0 || 4 * (tally + 1) > 3 * capacity {
+        let (dict, selector, method, nil) = if capacity == 0 || 4 * (tally + 1) > 3 * capacity {
             // `self`/`selector`/`method` are bare locals held across
             // `alloc_method_dict`'s allocation below — this exact spot was
             // flagged back in S1/S3 ("S7 wraps this in a HandleScope") but
@@ -132,6 +134,19 @@ impl MethodDictOop {
             let new_capacity = (capacity * 2).max(8);
             let grown = alloc_method_dict(vm, new_capacity);
 
+            // Re-read nil: the allocation above can scavenge, and nil
+            // itself is an ordinary young-gen object early in a VM's life
+            // (the age-based tenuring policy keeps a small live set young
+            // for up to ~126 scavenges), so the `nil` captured at this
+            // function's entry may now be a stale from-space address.
+            // Probing `grown` (just nil-filled with the CURRENT nil) for
+            // the STALE nil never finds an empty slot — an unterminated
+            // probe loop, not a crash. This was S7-10's "GC_STRESS
+            // performance pathology": not slow GC, an infinite spin —
+            // which is also why the branch result carries `nil` out to
+            // the shared insert below, not just the growth-local rehash.
+            let nil = vm.universe.nil_obj;
+
             let old = self_h.get(vm);
             for i in 0..old.capacity() {
                 let k = old.key_at(i);
@@ -143,13 +158,17 @@ impl MethodDictOop {
                 }
             }
             grown.set_tally(tally);
-            (grown, selector_h.get(vm), method_h.get(vm))
+            (grown, selector_h.get(vm), method_h.get(vm), nil)
         } else {
-            (self, selector, method)
+            (self, selector, method, nil)
         };
 
         dict.raw_insert_new(nil, selector, method);
         dict.set_tally(dict.tally() + 1);
+        // A non-growth insert writes a young (selector, method) pair into a
+        // dict that may itself be old (the growth path's `grown` is always
+        // young, making this a no-op there) — S7-10.
+        crate::memory::store::post_write_barrier(vm, dict.0);
         dict
     }
 
@@ -160,6 +179,7 @@ impl MethodDictOop {
         let mask = capacity - 1;
         let hash = selector.as_mem().mark().hash();
         let mut i = (hash as usize) & mask;
+        let mut probes = 0usize;
         loop {
             if self.key_at(i).raw() == nil.raw() {
                 self.set_key_at(i, selector.oop());
@@ -167,6 +187,20 @@ impl MethodDictOop {
                 return;
             }
             i = (i + 1) & mask;
+            probes += 1;
+            if probes > capacity {
+                let keys: Vec<String> = (0..capacity)
+                    .map(|s| format!("{:#x}", self.key_at(s).raw()))
+                    .collect();
+                panic!(
+                    "raw_insert_new: no nil slot after a full lap — capacity={capacity} \
+                     tally={} nil={:#x} selector={:#x} hash={hash:#x} keys=[{}]",
+                    self.tally(),
+                    nil.raw(),
+                    selector.oop().raw(),
+                    keys.join(", ")
+                );
+            }
         }
     }
 }

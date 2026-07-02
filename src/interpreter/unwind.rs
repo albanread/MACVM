@@ -178,7 +178,15 @@ pub fn continue_unwind(vm: &mut VmState, home: HomeRef, value: Oop) -> UnwindSte
         }
         Some((mfp, handler)) => {
             pop_frames_above(vm, mfp);
+            // `handler` (pulled off the marked frame) and `value` are bare
+            // locals held across the token allocation — both need handles
+            // (S7-10 GC_STRESS audit). `alloc_unwind_token` protects
+            // `value` internally for its own store; this re-read covers
+            // the uses AFTER it here.
+            let scope = crate::memory::handles::HandleScope::enter(vm);
+            let handler_h = scope.handle(vm, handler);
             let token = alloc_unwind_token(vm, home, value);
+            let handler = handler_h.get(vm);
             Frame { fp: mfp }.set_marker(&mut vm.stack, token.oop(), MarkerKind::Ensure);
             // `activate_block` reads its receiver-arg slot as `sp - 1` —
             // the closure must actually be on the stack there (matching a

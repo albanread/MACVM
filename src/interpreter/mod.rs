@@ -292,6 +292,8 @@ fn dispatch(vm: &mut VmState) -> Oop {
                     } else {
                         // A primitive-backed #mustBeBoolean returned without
                         // pushing a frame — re-examine the same branch.
+                        // Re-read: the send may have allocated (S7).
+                        method = current_method(vm);
                         bci = vm.regs.bci;
                     }
                 }
@@ -311,6 +313,8 @@ fn dispatch(vm: &mut VmState) -> Oop {
                         method = current_method(vm);
                         bci = 0;
                     } else {
+                        // Re-read: the send may have allocated (S7).
+                        method = current_method(vm);
                         bci = vm.regs.bci;
                     }
                 }
@@ -365,7 +369,11 @@ fn dispatch(vm: &mut VmState) -> Oop {
                     bci = 0;
                 } else {
                     // Primitive fast path: no new frame, resume right after
-                    // the send in the SAME method.
+                    // the send in the SAME method — but through a re-read:
+                    // a `can_allocate` primitive may have scavenged, moving
+                    // the method this local still points at (the frame's
+                    // method slot is a scanned root; this local is not).
+                    method = current_method(vm);
                     bci = next;
                 }
             }
@@ -382,6 +390,10 @@ fn dispatch(vm: &mut VmState) -> Oop {
                 let ctx = ctx_temp_walk(vm, depth);
                 let v = pop(vm);
                 ctx.set_slot(idx, v);
+                // A guest mutator store the S7-5 barrier sweep missed: a
+                // long-lived closure's Context is routinely old while `v`
+                // is young (S7-10).
+                crate::memory::store::post_write_barrier(vm, ctx.as_mem());
                 bci += 3;
             }
             OP_PUSH_CLOSURE => {
@@ -391,6 +403,9 @@ fn dispatch(vm: &mut VmState) -> Oop {
                     .expect("push_closure: literal is not a CompiledBlock");
                 let closure = blocks::make_closure(vm, blk, n_value_captures);
                 push(vm, closure.oop());
+                // make_closure allocates — re-read the (possibly moved)
+                // current method before fetching the next opcode.
+                method = current_method(vm);
                 bci += 3;
             }
             OP_BLOCK_RETURN_TOS => {

@@ -15,9 +15,11 @@ use crate::oops::wrappers::{ArrayOop, KlassOop, MethodOop, SymbolOop};
 use crate::oops::Oop;
 use crate::runtime::vm_state::VmState;
 
-/// A `Copy` view onto one 4-word IC site — holds no oops itself (just an
-/// `ArrayOop` + an index), so it never goes stale across an allocation the
-/// way a cached field value would.
+/// A `Copy` view onto one 4-word IC site. NOTE (S7): the cached `ics`
+/// field is an `ArrayOop` — an address — so this view DOES go stale
+/// across any allocation, exactly like a cached field value (the original
+/// S3-era comment claimed otherwise; that predates a moving GC).
+/// Re-derive via [`InterpreterIc::at`] after anything that can scavenge.
 #[derive(Copy, Clone)]
 pub struct InterpreterIc {
     pub ics: ArrayOop,
@@ -66,19 +68,28 @@ impl InterpreterIc {
         self.ics.at(self.base + IC_TARGET_OFFSET)
     }
 
-    pub fn set_mono(&self, k: KlassOop, m: MethodOop, epoch: u32) {
+    // Every setter below takes `vm` and ends with a post-write barrier:
+    // a method's ics array is as long-lived as the method itself, so by
+    // the time an IC transitions it is routinely OLD while the klass/
+    // method/pairs being written are young — raw `at_put`s here were one
+    // of the unbarriered old→new writer families the A9 verifier caught
+    // under `MACVM_GC_STRESS=1` (S7-10).
+
+    pub fn set_mono(&self, vm: &mut VmState, k: KlassOop, m: MethodOop, epoch: u32) {
         self.ics.at_put(self.base + IC_GUARD_OFFSET, k.oop());
         self.ics.at_put(self.base + IC_TARGET_OFFSET, m.oop());
         self.set_meta(epoch);
+        crate::memory::store::post_write_barrier(vm, self.ics.as_mem());
     }
 
-    pub fn set_poly(&self, pairs: ArrayOop, epoch: u32) {
+    pub fn set_poly(&self, vm: &mut VmState, pairs: ArrayOop, epoch: u32) {
         self.ics.at_put(
             self.base + IC_GUARD_OFFSET,
             SmallInt::new(IC_GUARD_POLY).oop(),
         );
         self.ics.at_put(self.base + IC_TARGET_OFFSET, pairs.oop());
         self.set_meta(epoch);
+        crate::memory::store::post_write_barrier(vm, self.ics.as_mem());
     }
 
     /// Mega is a sink: no transition back exists in v1, so its epoch is
@@ -86,17 +97,19 @@ impl InterpreterIc {
     /// `nil` must be passed explicitly (SPEC's pseudocode elides it):
     /// `InterpreterIc` carries no `Universe` handle, so the caller (which
     /// has a `&VmState`) supplies it.
-    pub fn set_mega(&self, nil: Oop) {
+    pub fn set_mega(&self, vm: &mut VmState, nil: Oop) {
         self.ics.at_put(
             self.base + IC_GUARD_OFFSET,
             SmallInt::new(IC_GUARD_MEGA).oop(),
         );
         self.ics.at_put(self.base + IC_TARGET_OFFSET, nil);
+        crate::memory::store::post_write_barrier(vm, self.ics.as_mem());
     }
 
-    pub fn set_empty(&self, nil: Oop) {
+    pub fn set_empty(&self, vm: &mut VmState, nil: Oop) {
         self.ics.at_put(self.base + IC_GUARD_OFFSET, nil);
         self.ics.at_put(self.base + IC_TARGET_OFFSET, nil);
+        crate::memory::store::post_write_barrier(vm, self.ics.as_mem());
     }
 }
 
@@ -200,6 +213,9 @@ fn reverify_poly(
         pairs.at_put(2 * i, nil);
         pairs.at_put(2 * i + 1, nil);
     }
+    // `pairs` is as long-lived as its IC — routinely old by reverify time,
+    // while the re-resolved methods may be young (S7-10).
+    crate::memory::store::post_write_barrier(vm, pairs.as_mem());
     pairs
 }
 
@@ -226,7 +242,7 @@ pub fn ic_transition(
     if guard.raw() == nil.raw() {
         return match resolve(vm, caller, selector, is_super, rcvr_klass) {
             Some(m) => {
-                ic.set_mono(rcvr_klass, m, epoch);
+                ic.set_mono(vm, rcvr_klass, m, epoch);
                 Some(m)
             }
             None => None,
@@ -240,11 +256,11 @@ pub fn ic_transition(
             // row-3 fast path the caller already handled).
             return match resolve(vm, caller, selector, is_super, k0) {
                 Some(m) => {
-                    ic.set_mono(k0, m, epoch);
+                    ic.set_mono(vm, k0, m, epoch);
                     Some(m)
                 }
                 None => {
-                    ic.set_empty(nil);
+                    ic.set_empty(vm, nil);
                     None
                 }
             };
@@ -252,19 +268,35 @@ pub fn ic_transition(
         // Rows 5, 6: different klass.
         return match resolve(vm, caller, selector, is_super, rcvr_klass) {
             Some(m) => {
-                // S7 choke-point pattern: allocate the pairs array BEFORE
-                // re-reading k0/m0 off the IC, so a future moving GC during
-                // allocation cannot leave them stale.
+                // The pairs allocation below can scavenge, which moves
+                // BOTH the values this arm still needs (`rcvr_klass`, `m`
+                // — handle-protected) AND the ics array the cached `ic`
+                // view points into (`InterpreterIc` caches an `ArrayOop`,
+                // which is an address like any other — the S3-era claim
+                // that the view "never goes stale" predates a moving GC).
+                // `ic` is re-derived afterwards through `vm.regs.method`,
+                // a scanned root that names this same caller; k0/m0 are
+                // then read through the FRESH view — reading them through
+                // the stale one would hand back from-space images whose
+                // body slots hold pre-scavenge addresses.
+                let scope = crate::memory::handles::HandleScope::enter(vm);
+                let rcvr_klass_h = scope.handle(vm, rcvr_klass);
+                let m_h = scope.handle(vm, m);
+
                 let pairs = alloc_poly_pairs(vm);
+
+                let caller = vm.regs.method.expect("ic_transition: no active method");
+                let ic = InterpreterIc::at(caller, ic_idx);
                 let k0 =
                     KlassOop::try_from(ic.guard()).expect("ic_transition: guard changed under us");
                 let m0 = MethodOop::try_from(ic.target())
                     .expect("ic_transition: mono target is not a CompiledMethod");
+                let m = m_h.get(vm);
                 pairs.at_put(0, k0.oop());
                 pairs.at_put(1, m0.oop());
-                pairs.at_put(2, rcvr_klass.oop());
+                pairs.at_put(2, rcvr_klass_h.get(vm).oop());
                 pairs.at_put(3, m.oop());
-                ic.set_poly(pairs, epoch);
+                ic.set_poly(vm, pairs, epoch);
                 Some(m)
             }
             None => None,
@@ -283,16 +315,16 @@ pub fn ic_transition(
                 // after healing only the hit pair (stale-dispatch bug).
                 pairs = reverify_poly(vm, caller, selector, is_super, pairs);
                 if poly_arity(pairs) == 0 {
-                    ic.set_empty(nil);
+                    ic.set_empty(vm, nil);
                     return match resolve(vm, caller, selector, is_super, rcvr_klass) {
                         Some(m) => {
-                            ic.set_mono(rcvr_klass, m, epoch);
+                            ic.set_mono(vm, rcvr_klass, m, epoch);
                             Some(m)
                         }
                         None => None,
                     };
                 }
-                ic.set_poly(pairs, epoch);
+                ic.set_poly(vm, pairs, epoch);
             }
             let arity = poly_arity(pairs);
             for i in 0..arity as usize {
@@ -306,9 +338,11 @@ pub fn ic_transition(
                     if (arity as usize) < IC_POLY_MAX_PAIRS {
                         pairs.at_put(2 * arity as usize, rcvr_klass.oop());
                         pairs.at_put(2 * arity as usize + 1, m.oop());
-                        ic.set_poly(pairs, epoch); // row 9
+                        // `pairs` itself may be old, the new pair young.
+                        crate::memory::store::post_write_barrier(vm, pairs.as_mem());
+                        ic.set_poly(vm, pairs, epoch); // row 9
                     } else {
-                        ic.set_mega(nil); // row 10
+                        ic.set_mega(vm, nil); // row 10
                     }
                     Some(m)
                 }
@@ -522,7 +556,7 @@ mod tests {
 
         let ic = InterpreterIc::at(caller, 0);
         let stale_epoch = vm.ic_epoch;
-        ic.set_mono(a, stale_method, stale_epoch);
+        ic.set_mono(&mut vm, a, stale_method, stale_epoch);
         vm.ic_epoch += 1; // now stale relative to the IC's stamped epoch
 
         let result = ic_transition(&mut vm, caller, 0, a, false);
@@ -727,7 +761,7 @@ mod tests {
         pairs.at_put(3, stale_method.oop());
         let ic = InterpreterIc::at(caller, 0);
         let stale_epoch = vm.ic_epoch;
-        ic.set_poly(pairs, stale_epoch);
+        ic.set_poly(&mut vm, pairs, stale_epoch);
         vm.ic_epoch += 1;
 
         let result = ic_transition(&mut vm, caller, 0, a, false);
@@ -823,7 +857,7 @@ mod tests {
             let ic = InterpreterIc::at(holder_method, ic_idx);
             assert_eq!(ic.argc(), argc, "argc round-trip for argc={argc}");
             for epoch in [0u32, 1, (1 << crate::oops::layout::IC_META_EPOCH_BITS) - 1] {
-                ic.set_mono(a, m, epoch);
+                ic.set_mono(&mut vm, a, m, epoch);
                 assert_eq!(ic.epoch(), epoch, "epoch round-trip for argc={argc}");
                 assert_eq!(ic.argc(), argc, "argc must survive an epoch/guard rewrite");
             }

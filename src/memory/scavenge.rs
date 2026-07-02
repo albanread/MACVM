@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use crate::oops::klass::Format;
 use crate::oops::layout::HEADER_WORDS;
-use crate::oops::wrappers::{KlassOop, MemOop};
+use crate::oops::wrappers::{KlassOop, MemOop, MethodOop};
 use crate::oops::Oop;
 use crate::runtime::vm_state::VmState;
 
@@ -135,6 +135,15 @@ pub fn scavenge_oop(vm: &mut VmState, oop: Oop) -> Oop {
     let addr = oop.mem_addr();
     if vm.universe.layout.is_old(addr) {
         return oop; // old-gen objects aren't scavenge targets in v1
+    }
+    if addr >= vm.universe.to.start && addr < vm.universe.to.top {
+        panic!(
+            "scavenge_oop: handed a TO-SPACE address {addr:#x} mid-cycle \
+             (to=[{:#x},{:#x})) — double-copy imminent\n{}",
+            vm.universe.to.start,
+            vm.universe.to.top,
+            std::backtrace::Backtrace::force_capture()
+        );
     }
     let obj = MemOop::try_from(oop).expect("new-gen mem oop must be a valid MemOop");
     if obj.is_forwarded() {
@@ -294,7 +303,18 @@ fn dirty_card_scan(vm: &mut VmState, old_top_before: usize) {
             }
             addr = obj_end;
         }
-        if !still_points_new {
+        // Clean ONLY a card lying entirely below `old_top_before`: this
+        // scan examines slots up to that boundary and nothing else, but a
+        // this-cycle promotion (which always lands AT or ABOVE it — old.top
+        // only grows) can share the boundary card when `old_top_before`
+        // isn't card-aligned. Cleaning that card here would wipe the
+        // promotion's own `record_multistores` mark for slots this scan
+        // never looked at — the freshly promoted object's young refs would
+        // silently vanish from the remembered set (caught by the A9
+        // verifier's card-vs-heap cross-check under `MACVM_GC_STRESS=1`,
+        // S7-10: a just-promoted MethodDictionary's young method values on
+        // a wrongly-cleaned boundary card).
+        if !still_points_new && card_end <= old_top_before {
             vm.universe.cards.set_clean(i);
         }
     }
@@ -396,10 +416,14 @@ pub fn scavenge(vm: &mut VmState) -> Result<ScavengeReport, GcStallError> {
     vm.universe.to.reset();
 
     // --- root scan (A3 step 3) ------------------------------------------
+    if std::env::var("MACVM_DBG_ROOTS").is_ok() {
+        audit_roots(vm);
+    }
     scavenge_well_known_roots(vm);
     scavenge_symbol_table_roots(vm);
     scavenge_process_stack_roots(vm);
     scavenge_handle_arena_roots(vm);
+    scavenge_interp_regs_roots(vm);
     dirty_card_scan(vm, old_top_before);
 
     if let Some(err) = vm.universe.pending_stall.take() {
@@ -444,6 +468,14 @@ pub fn scavenge(vm: &mut VmState) -> Result<ScavengeReport, GcStallError> {
     vm.universe.eden.top = vm.universe.eden.start;
     vm.universe.to.reset();
 
+    // The LookupCache is address-keyed Rust-side state the root scan never
+    // touches: after a scavenge its keys are stale, and worse, a recycled
+    // address can FALSE-HIT for a different (klass, selector) pair —
+    // returning the wrong method. `gc_epilogue` was written for exactly
+    // this back in S3 ("flush on GC") but never called until S7-10 wired
+    // it here.
+    crate::runtime::lookup::gc_epilogue(vm);
+
     let survivor_capacity = vm.universe.from.end - vm.universe.from.start;
     let new_threshold = vm.universe.age_table.compute_threshold(survivor_capacity);
     vm.universe.tenuring_threshold = new_threshold;
@@ -473,6 +505,27 @@ fn scavenge_well_known_roots(vm: &mut VmState) {
     vm.universe.true_obj = scavenge_oop(vm, vm.universe.true_obj);
     vm.universe.false_obj = scavenge_oop(vm, vm.universe.false_obj);
     vm.universe.smalltalk = scavenge_oop(vm, vm.universe.smalltalk);
+
+    // The well-known SELECTOR fields are roots too (S7-10 root-scan gap):
+    // the Symbols themselves survive via the symbol-table root, but these
+    // are separate Universe-field copies of their addresses — unscanned,
+    // they dangle after the first scavenge and every DNU/mustBeBoolean/
+    // cannotReturn send thereafter reads a garbage selector.
+    macro_rules! scav_sel {
+        ($($f:ident),* $(,)?) => {
+            $(
+                let s = vm.universe.$f.oop();
+                let ns = scavenge_oop(vm, s);
+                vm.universe.$f = crate::oops::wrappers::SymbolOop::try_from(ns)
+                    .expect(concat!(stringify!($f), " must stay symbol-shaped"));
+            )*
+        };
+    }
+    scav_sel!(
+        sel_does_not_understand,
+        sel_must_be_boolean,
+        sel_cannot_return
+    );
 
     macro_rules! scav_klass {
         ($($f:ident),* $(,)?) => {
@@ -547,10 +600,83 @@ fn scavenge_process_stack_roots(vm: &mut VmState) {
 /// place, never truncates.
 fn scavenge_handle_arena_roots(vm: &mut VmState) {
     let n = vm.handle_arena.len();
+    let dbg = std::env::var("MACVM_DBG_ROOTS").is_ok();
     for i in 0..n {
         let v = vm.handle_arena.slots_mut()[i];
+        if dbg {
+            eprintln!("RDBG scanning handle[{i}] = {:#x}", v.raw());
+        }
         let nv = scavenge_oop(vm, v);
         vm.handle_arena.slots_mut()[i] = nv;
+    }
+}
+
+/// `MACVM_DBG_ROOTS=1`: pre-scan sanity audit — every root must point at
+/// something with a plausible (mark-tagged, sentinel-set, unforwarded)
+/// header at scavenge entry. A failure here names the STALE ROOT SOURCE
+/// directly, which the exit verifier (seeing only the wreckage the chase
+/// left behind) cannot.
+fn audit_roots(vm: &mut VmState) {
+    let plausible = |o: Oop| -> bool {
+        if !o.is_mem() {
+            return true;
+        }
+        let m = MemOop::try_from(o).unwrap();
+        let w = m.mark_word_raw();
+        w & crate::oops::layout::TAG_MASK == crate::oops::layout::MARK_TAG && w & 0b100 != 0
+    };
+    let bad = |src: String, o: Oop| {
+        if !plausible(o) {
+            eprintln!("RDBG STALE ROOT {src} = {:#x}", o.raw());
+        }
+    };
+    bad("nil".into(), vm.universe.nil_obj);
+    bad("true".into(), vm.universe.true_obj);
+    bad("false".into(), vm.universe.false_obj);
+    bad("smalltalk".into(), vm.universe.smalltalk);
+    bad("sel_dnu".into(), vm.universe.sel_does_not_understand.oop());
+    bad("sel_mbb".into(), vm.universe.sel_must_be_boolean.oop());
+    bad("sel_cr".into(), vm.universe.sel_cannot_return.oop());
+    for (i, b) in vm.universe.symbols.buckets.iter().enumerate() {
+        if let Some(s) = b {
+            if !plausible(*s) {
+                eprintln!("RDBG STALE ROOT symbols[{i}] = {:#x}", s.raw());
+            }
+        }
+    }
+    for i in 0..vm.stack.sp {
+        let v = vm.stack.get(i);
+        if !plausible(v) {
+            eprintln!("RDBG STALE ROOT stack[{i}] = {:#x}", v.raw());
+        }
+    }
+    for i in 0..vm.handle_arena.len() {
+        let v = vm.handle_arena.slots_mut()[i];
+        if !plausible(v) {
+            eprintln!("RDBG STALE ROOT handle[{i}] = {:#x}", v.raw());
+        }
+    }
+    if let Some(m) = vm.regs.method {
+        if !plausible(m.oop()) {
+            eprintln!("RDBG STALE ROOT regs.method = {:#x}", m.oop().raw());
+        }
+    }
+}
+
+/// `vm.regs.method` — the interpreter's "currently executing method"
+/// mirror — is a root in its own right: the dispatch loop fetches
+/// bytecode through it (via its own local copy, re-read at every
+/// boundary), and `send_generic`/`ic_transition`/the unwind machinery
+/// read it directly between allocations. The FRAME's method slot is
+/// already covered by the process-stack scan, but the mirror is a
+/// separate copy the stack scan never touches — without this it dangles
+/// into from-space after the first mid-dispatch scavenge (found by the
+/// S7-10 `MACVM_GC_STRESS=1` audit).
+fn scavenge_interp_regs_roots(vm: &mut VmState) {
+    if let Some(m) = vm.regs.method {
+        let nm = scavenge_oop(vm, m.oop());
+        vm.regs.method =
+            Some(MethodOop::try_from(nm).expect("regs.method must stay method-shaped"));
     }
 }
 

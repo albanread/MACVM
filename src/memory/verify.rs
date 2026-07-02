@@ -316,8 +316,11 @@ fn verify_cards_vs_heap(vm: &VmState, at: VerifyPoint) -> Result<(), VerifyError
                 let card = u.cards.card_index(slot_addr);
                 if !u.cards.is_dirty(card) {
                     return Err(VerifyError(format!(
-                        "[{at}] old slot {slot_addr:#x} holds new-gen oop {:#x} but card {card} \
-                         is clean",
+                        "[{at}] old slot {slot_addr:#x} (in a {:?}-format object at {addr:#x}, \
+                         nis {nis}, slot word #{}) holds new-gen oop {:#x} but card {card} is \
+                         clean — an unbarriered old-gen writer",
+                        klass.format(),
+                        (slot_addr - addr) / crate::oops::layout::WORD_SIZE,
                         v.raw()
                     )));
                 }

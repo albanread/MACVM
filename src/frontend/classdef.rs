@@ -48,12 +48,18 @@ fn create_klass(vm: &mut VmState, super_klass: KlassOop, node: &ClassDefNode) ->
     let scope = HandleScope::enter(vm);
     let klass_h = scope.handle(vm, klass);
 
-    let array_klass = vm.universe.array_klass;
+    // `vm.universe.array_klass` is re-read before EACH allocation, never
+    // cached across one: a universe klass field is kept current by the
+    // root scan, but a Rust local copy of it is not — under GC_STRESS the
+    // first alloc below moves the klass and a cached local hands the
+    // second alloc a one-cycle-stale address (S7-10: this exact line was
+    // the double-copy panic's origin).
     // Interned directly into `ivn` rather than collected into a `Vec<Oop>`
     // first: `Universe::intern` never allocates through the scavenge-aware
     // choke point (SPEC §7.2's genesis-era raw eden path), so nothing here
     // needs its own handle as long as each symbol is consumed before the
     // next allocating call.
+    let array_klass = vm.universe.array_klass;
     let ivn = alloc::alloc_indexable_oops(vm, array_klass, node.inst_vars.len());
     for (i, n) in node.inst_vars.iter().enumerate() {
         let s = vm.universe.intern(n.as_bytes());
@@ -61,6 +67,7 @@ fn create_klass(vm: &mut VmState, super_klass: KlassOop, node: &ClassDefNode) ->
     }
     klass_h.get(vm).set_inst_var_names(ivn.oop());
 
+    let array_klass = vm.universe.array_klass;
     let cvs = alloc::alloc_indexable_oops(vm, array_klass, 0);
     klass_h.get(vm).set_class_vars(cvs.oop());
     for name in &node.class_vars {
@@ -74,26 +81,27 @@ fn append_class_var(vm: &mut VmState, klass: KlassOop, sym: SymbolOop) {
     if find_class_var(klass, sym.oop()).is_some() {
         return; // re-declaring an existing class var is a no-op
     }
-    let array_klass = vm.universe.array_klass;
-    let association_klass = vm.universe.association_klass;
-    let nil = vm.universe.nil_obj;
-
     let scope = HandleScope::enter(vm);
     // `klass` may itself still be unlinked eden garbage (see
     // `create_klass`'s caller-side handle) and `sym`, though reachable via
     // the symbol table root, is a separate unrooted copy in this bare
-    // parameter — both need protecting across the allocations below.
+    // parameter — both need protecting across the allocations below. The
+    // universe fields (`association_klass`/`array_klass`/`nil_obj`) are
+    // instead re-read fresh before each use — a Rust local copy of a
+    // root-scanned field is NOT kept current by the root scan (S7-10).
     let klass_h = scope.handle(vm, klass);
     let sym_h = scope.handle(vm, sym);
 
+    let association_klass = vm.universe.association_klass;
     let assoc = alloc::alloc_slots(vm, association_klass);
     assoc.set_body_oop(0, sym_h.get(vm).oop());
-    assoc.set_body_oop(1, nil);
+    assoc.set_body_oop(1, vm.universe.nil_obj);
     let assoc_h = scope.handle(vm, assoc);
 
     let old_len = ArrayOop::try_from(klass_h.get(vm).class_vars())
         .map(|a| a.len())
         .unwrap_or(0);
+    let array_klass = vm.universe.array_klass;
     let new_arr = alloc::alloc_indexable_oops(vm, array_klass, old_len + 1);
     if let Some(old) = ArrayOop::try_from(klass_h.get(vm).class_vars()) {
         for i in 0..old_len {
@@ -101,7 +109,10 @@ fn append_class_var(vm: &mut VmState, klass: KlassOop, sym: SymbolOop) {
         }
     }
     new_arr.at_put(old_len, assoc_h.get(vm).oop());
-    klass_h.get(vm).set_class_vars(new_arr.oop());
+    let klass = klass_h.get(vm);
+    klass.set_class_vars(new_arr.oop());
+    // On a reopen `klass` is old while `new_arr` is young (S7-10).
+    crate::memory::store::post_write_barrier(vm, klass.as_mem());
 }
 
 fn reopen_klass(
@@ -169,7 +180,19 @@ fn resolve_super_target(vm: &mut VmState, node: &ClassDefNode) -> Result<Oop, Co
 }
 
 pub fn install_class_def(vm: &mut VmState, node: &mut ClassDefNode) -> Result<(), CompileError> {
+    // The scope is entered — and `name_sym` handled — BEFORE the
+    // create/reopen below: both arms allocate heavily, and a bare
+    // `name_sym` held across them can end up aliasing a DIFFERENT symbol
+    // that later gets interned into the recycled space (S7-10's nastiest
+    // GC_STRESS find: `OrderedCollection`'s stale name symbol aliased the
+    // freshly interned `"firstIndex"` instvar name, so the class was
+    // silently global-declared under the wrong key — every pointer valid,
+    // nothing for the heap verifier to object to, pure semantic
+    // corruption).
+    let scope = HandleScope::enter(vm);
     let name_sym = vm.universe.intern(node.name.as_bytes());
+    let name_sym_h = scope.handle(vm, name_sym);
+
     let klass = match crate::runtime::globals::global_lookup(vm, name_sym) {
         None => {
             let super_target = resolve_super_target(vm, node)?;
@@ -187,25 +210,26 @@ pub fn install_class_def(vm: &mut VmState, node: &mut ClassDefNode) -> Result<()
                     format!("'{}' is already bound to a non-class value", node.name),
                 )
             })?;
+            // `reopen_klass` allocates (class-var appends); `existing`
+            // must ride in a handle across it.
+            let existing_h = scope.handle(vm, existing);
             let super_target = resolve_super_target(vm, node)?;
             reopen_klass(vm, existing, super_target, node)?;
-            existing
+            existing_h.get(vm)
         }
     };
 
     // `klass` (freshly created, in the `None` arm) isn't linked into the
     // globals until `global_declare` below runs, and both that call and
-    // every `compile_method` in the loop allocate — protect `klass` and
-    // `name_sym` (a bare, unrooted copy of an otherwise-rooted symbol) for
-    // the rest of this function.
-    let scope = HandleScope::enter(vm);
+    // every `compile_method` in the loop allocate — protect it for the
+    // rest of this function.
     let klass_h = scope.handle(vm, klass);
-    let name_sym_h = scope.handle(vm, name_sym);
 
     let assoc = crate::runtime::globals::global_declare(vm, name_sym_h.get(vm));
-    MemOop::try_from(assoc)
-        .expect("global association is a mem oop")
-        .set_body_oop(1, klass_h.get(vm).oop());
+    let assoc_mem = MemOop::try_from(assoc).expect("global association is a mem oop");
+    // Barriered store: on a REOPEN the association is long-lived (old gen)
+    // while the klass value may still be young (S7-10).
+    crate::memory::store::store(vm, assoc_mem, 1, klass_h.get(vm).oop());
 
     for method in &mut node.methods {
         let compiled =
