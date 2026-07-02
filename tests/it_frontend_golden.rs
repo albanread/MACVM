@@ -321,10 +321,18 @@ fn s4_nlr_ensure_reexpressed() {
 fn reopen_object_via_nil_superclass() {
     let mut vm = common::test_vm();
     load_source(&mut vm, "nil subclass: Object [ answer [ ^42 ] ]\n");
+    // Allocate the receiver first, then re-fetch every oop the run needs
+    // AFTER it: under `MACVM_GC_STRESS=1` every allocation scavenges and moves
+    // young objects, so any bare `KlassOop`/`MethodOop` captured before
+    // `alloc_slots` dangles (the bare-oop-across-an-allocation bug class, SPEC
+    // §7.6.1). `klass_named`/`intern`/`lookup` don't allocate (the names were
+    // interned by `load_source`), so nothing moves between here and
+    // `run_method`, and `recv` (allocated last among heap ops) stays valid.
     let object_klass = klass_named(&mut vm, "Object");
+    let recv = macvm::memory::alloc::alloc_slots(&mut vm, object_klass).oop();
+    let object_klass = klass_named(&mut vm, "Object"); // re-fetch: the alloc moved it
     let sel = vm.universe.intern(b"answer");
     let m = macvm::runtime::lookup::lookup(&mut vm, object_klass, sel).unwrap();
-    let recv = macvm::memory::alloc::alloc_slots(&mut vm, object_klass).oop();
     let result = macvm::interpreter::run_method(&mut vm, m, recv, &[]);
     assert_eq!(result, macvm::oops::smi::SmallInt::new(42).oop());
 }

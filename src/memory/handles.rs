@@ -88,6 +88,18 @@ oop_repr!(MethodDictOop);
 #[derive(Default)]
 pub struct HandleArena {
     slots: Vec<Oop>,
+    /// Per-slot generation, parallel to `slots` but **persistent**: never
+    /// truncated when a scope drops (only `slots` is). A slot's generation is
+    /// bumped when its owning scope drops (vacate-bump, `HandleScope::drop`),
+    /// so any `Handle` that outlives its scope carries an obsolete generation
+    /// and fails validation in `Handle::slot` — a use-after-scope becomes a
+    /// precise panic at the misuse site instead of a silent foreign-oop read
+    /// (SPEC §7.6.1 change 1). MACVM has no free-list/tombstone like the Locus
+    /// reference this is ported from, so vacate-bump is what gives a vacated
+    /// slot the "reused ⇒ prior handles invalid" property Locus gets from
+    /// tombstones. `gen.len()` only ever grows, to the arena's high-water
+    /// depth, so `gen[i]` is always readable for any minted handle's `i`.
+    gen: Vec<u32>,
 }
 
 impl HandleArena {
@@ -139,10 +151,21 @@ impl HandleScope {
             ),
             "HandleScope used with a different VmState than it was entered from"
         );
-        let index = vm.handle_arena.slots.len() as u32;
+        let index = vm.handle_arena.slots.len();
+        let generation = if index < vm.handle_arena.gen.len() {
+            // Reusing a slot position a prior scope vacated: its generation was
+            // already bumped on that scope's drop, so it differs from anything
+            // the prior occupant minted. Use it as-is.
+            vm.handle_arena.gen[index]
+        } else {
+            debug_assert!(index == vm.handle_arena.gen.len());
+            vm.handle_arena.gen.push(0);
+            0
+        };
         vm.handle_arena.slots.push(val.as_oop());
         Handle {
-            index,
+            index: index as u32,
+            generation,
             _t: PhantomData,
         }
     }
@@ -161,34 +184,74 @@ impl Drop for HandleScope {
             "HandleScope dropped out of LIFO order (arena shrank below its own saved_len \
              before this scope's own drop ran)"
         );
+        // Vacate-bump (SPEC §7.6.1 change 1): bump the generation of every slot
+        // this scope is about to drop, so any `Handle` still naming one is
+        // immediately stale — the next `Handle::slot` on it sees the mismatch
+        // and panics at the misuse site. Cheap (one increment per handle in the
+        // scope, ~1 on the send path) and always-on so debug and release keep
+        // identical `gen` state; only the *check* in `Handle::slot` is
+        // debug-gated. `gen` is not truncated with `slots`, so it persists.
+        let live_top = arena.slots.len();
+        for g in &mut arena.gen[self.saved_len..live_top] {
+            *g = g.wrapping_add(1);
+        }
         arena.slots.truncate(self.saved_len);
     }
 }
 
 /// An index into the handle arena — never a pointer, so `Vec` growth
-/// (reallocating the backing storage) never invalidates it.
+/// (reallocating the backing storage) never invalidates it — plus the
+/// generation the slot carried when this handle was minted (SPEC §7.6.1).
 #[derive(Copy, Clone)]
 pub struct Handle<T> {
     index: u32,
+    generation: u32,
     _t: PhantomData<T>,
 }
 
 impl<T: OopRepr> Handle<T> {
+    /// Resolve to a validated live slot index. Two guards (SPEC §7.6.1):
+    /// (i) `index < slots.len()` — enforced in *all* builds by the `Vec`
+    /// index in the callers below (a vacated slot is truncated away, so a
+    /// dropped-scope handle is out of range); (ii) `gen[index] == generation`
+    /// — catches an *in-range* slot that a later scope re-occupied, and is
+    /// **debug-gated**, because handles are on the send hot path
+    /// (`activate_method` mints one per activation) and this is a validation
+    /// backstop, not a release-mode invariant. A pure-LIFO arena has no holes,
+    /// so these two subsume Locus's three-guard (bounds/tombstone/gen) resolve:
+    /// "in range" here *is* "not vacated".
+    #[inline(always)]
+    fn slot(self, vm: &VmState) -> usize {
+        let i = self.index as usize;
+        debug_assert!(
+            i < vm.handle_arena.slots.len() && vm.handle_arena.gen[i] == self.generation,
+            "stale handle: slot {i} is now generation {}, handle is {} (use-after-scope — \
+             the handle outlived the HandleScope that minted it)",
+            vm.handle_arena.gen.get(i).copied().unwrap_or(u32::MAX),
+            self.generation,
+        );
+        i
+    }
+
     /// Always re-read after any call that can allocate — the arena slot
     /// may have been rewritten in place by an intervening scavenge.
     pub fn get(self, vm: &VmState) -> T {
-        let o = vm.handle_arena.slots[self.index as usize];
+        let o = vm.handle_arena.slots[self.slot(vm)];
         // SAFETY: this slot was populated by `HandleScope::handle::<T>`
-        // (or later overwritten by `set::<T>`) — always `T`-shaped.
+        // (or later overwritten by `set::<T>`) — always `T`-shaped. The
+        // generation guard in `slot` upholds this once handles cross API
+        // boundaries (SPEC §7.6.1 change 2): a stale handle whose slot was
+        // reused for a different `T` panics rather than mis-transmuting.
         unsafe { T::from_oop_unchecked(o) }
     }
 
     pub fn set(self, vm: &mut VmState, val: T) {
-        vm.handle_arena.slots[self.index as usize] = val.as_oop();
+        let i = self.slot(vm);
+        vm.handle_arena.slots[i] = val.as_oop();
     }
 
     pub fn oop(self, vm: &VmState) -> Oop {
-        vm.handle_arena.slots[self.index as usize]
+        vm.handle_arena.slots[self.slot(vm)]
     }
 }
 
@@ -266,5 +329,36 @@ mod tests {
         let moved = h.get(&vm);
         assert_ne!(moved.oop().raw(), old_addr, "the object must have moved");
         assert_eq!(moved.at(0), SmallInt::new(77).oop());
+    }
+
+    /// SPEC §7.6.1 change 1: a `Handle` used after its originating scope drops
+    /// (its slot since reused by a later scope) panics precisely at the misuse
+    /// site via the generation guard — instead of silently reading the foreign
+    /// oop the reusing scope stored there. This is the deterministic
+    /// regression the S7.5 gate calls for; it is the exact shape of the
+    /// stale-handle bugs S7-9/10/11 hit, now caught at the source. Debug-gated
+    /// because the guard is (handles are on the send hot path).
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "stale handle")]
+    fn stale_handle_panics() {
+        let mut vm = test_vm();
+        let stale = {
+            let s = HandleScope::enter(&mut vm);
+            s.handle(&mut vm, SmallInt::new(1).oop())
+        }; // `s` drops here: slot 0 vacated, its generation bumped.
+
+        // A new scope reuses slot 0 for a different value at the bumped
+        // generation — a valid, live handle.
+        let s2 = HandleScope::enter(&mut vm);
+        let fresh = s2.handle(&mut vm, SmallInt::new(2).oop());
+        assert_eq!(
+            fresh.get(&vm).raw(),
+            SmallInt::new(2).oop().raw(),
+            "the reusing scope's own handle must resolve fine"
+        );
+
+        // `stale` names slot 0 at the OLD generation → must panic, not read 2.
+        let _ = stale.get(&vm);
     }
 }
