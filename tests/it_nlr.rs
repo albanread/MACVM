@@ -8,6 +8,7 @@ mod common;
 use macvm::bytecode::BytecodeBuilder;
 use macvm::interpreter::run_method;
 use macvm::oops::smi::SmallInt;
+use macvm::oops::wrappers::SymbolOop;
 use macvm::oops::Oop;
 use macvm::runtime::lookup::install_method;
 use macvm::runtime::vm_state::{OutputBuffer, VmState};
@@ -25,29 +26,44 @@ fn string_literal(vm: &mut VmState, s: &str) -> Oop {
 /// `closure_klass`, and `print:` (91, `printOnStdout:`)/`quit` (90) on
 /// `object_klass` — everything these goldens need.
 fn install_prims(vm: &mut VmState) {
-    let closure_klass = vm.universe.closure_klass;
-    let object_klass = vm.universe.object_klass;
-
     let mk = |vm: &mut VmState, name: &[u8], argc: usize, prim: i64| {
         let mut b = BytecodeBuilder::new();
         b.push_self();
         b.ret_self();
+        // `vm.universe.intern` bump-allocates directly on eden (the
+        // genesis-only `_raw` layer `Universe::intern` calls into) rather
+        // than through `alloc_words`, so its result is a bare, completely
+        // unprotected `Oop` — unlike everything allocated through the
+        // public `VmState` layer, nothing re-derives it across a scavenge.
+        // `finish()` immediately wraps ITS OWN copy of `sel` in a handle,
+        // but `finish()` allocates several more times before returning
+        // (method, literals, ics), each a scavenge point under
+        // `MACVM_GC_STRESS=1` — so returning this closure's own pre-`finish`
+        // `sel` local was returning an already-stale symbol reference. Read
+        // it back off the finished method instead, which is always current.
         let sel = vm.universe.intern(name);
         let m = b.finish(vm, sel, argc, 0);
         m.set_primitive(prim);
+        let sel = SymbolOop::try_from(m.selector()).expect("method selector is a Symbol");
         (sel, m)
     };
 
+    // `closure_klass`/`object_klass` are fetched fresh at each call site
+    // rather than cached once at the top: `install_method` (and `mk`'s own
+    // `BytecodeBuilder::finish`) allocates, so a klass cached across
+    // several such calls is exactly the invisible-root bug `MACVM_GC_STRESS
+    // =1` exists to catch (S7-9/S7-10's fix inside `install_method` itself
+    // never covered this test helper's own bare locals).
     let (sel, m) = mk(vm, b"value", 0, 50);
-    install_method(vm, closure_klass, sel, m);
+    install_method(vm, vm.universe.closure_klass, sel, m);
     let (sel, m) = mk(vm, b"ensure:", 1, 60);
-    install_method(vm, closure_klass, sel, m);
+    install_method(vm, vm.universe.closure_klass, sel, m);
     let (sel, m) = mk(vm, b"ifCurtailed:", 1, 61);
-    install_method(vm, closure_klass, sel, m);
+    install_method(vm, vm.universe.closure_klass, sel, m);
     let (sel, m) = mk(vm, b"print:", 1, 91);
-    install_method(vm, object_klass, sel, m);
+    install_method(vm, vm.universe.object_klass, sel, m);
     let (sel, m) = mk(vm, b"quit", 0, 90);
-    install_method(vm, object_klass, sel, m);
+    install_method(vm, vm.universe.object_klass, sel, m);
 }
 
 /// `[T print: 'body'. 7] ensure: [T print: 'cleanup']` — the handler runs
@@ -236,20 +252,28 @@ fn nlr_two_frames_ensure_order() {
 fn cannot_return_escaped() {
     let mut vm = common::test_vm();
     install_prims(&mut vm);
-    let value_sel = vm.universe.intern(b"value");
-    let print_sel = vm.universe.intern(b"print:");
-    let quit_sel = vm.universe.intern(b"quit");
-    let cannot_return_sel = vm.universe.sel_cannot_return;
-    let object_klass = vm.universe.object_klass;
+    // Every symbol/klass below is fetched fresh at (or immediately before)
+    // its point of use rather than cached in an outer local: `intern` is
+    // idempotent (always returns the current, correct symbol) and
+    // `vm.universe.*` fields are scavenged as roots every cycle, but a
+    // bare local COPY of either is exactly the invisible-root bug
+    // `MACVM_GC_STRESS=1` exists to catch the moment any allocating call
+    // (a builder's own literal/method/ics allocation, `string_literal`,
+    // `alloc_slots`, `run_method`, ...) happens in between.
     let msg_str = string_literal(&mut vm, "cannotReturn");
 
     let mut cr = BytecodeBuilder::new();
     cr.push_self();
     cr.push_literal(&mut vm, msg_str);
+    let print_sel = vm.universe.intern(b"print:");
     cr.send(&mut vm, print_sel, 1);
+    let quit_sel = vm.universe.intern(b"quit");
     cr.send(&mut vm, quit_sel, 0);
     cr.ret_tos();
+    let cannot_return_sel = vm.universe.sel_cannot_return;
     let cr_method = cr.finish(&mut vm, cannot_return_sel, 1, 0);
+    let object_klass = vm.universe.object_klass;
+    let cannot_return_sel = vm.universe.sel_cannot_return;
     install_method(&mut vm, object_klass, cannot_return_sel, cr_method);
 
     let mut home = BytecodeBuilder::new();
@@ -262,6 +286,7 @@ fn cannot_return_escaped() {
     let home_sel = vm.universe.intern(b"home");
     let home_method = home.finish(&mut vm, home_sel, 0, 0);
 
+    let object_klass = vm.universe.object_klass;
     let recv = macvm::memory::alloc::alloc_slots(&mut vm, object_klass).oop();
     let closure_oop = run_method(&mut vm, home_method, recv, &[]);
     assert!(
@@ -271,6 +296,7 @@ fn cannot_return_escaped() {
 
     let mut driver = BytecodeBuilder::new();
     driver.push_temp(0);
+    let value_sel = vm.universe.intern(b"value");
     driver.send(&mut vm, value_sel, 0);
     driver.ret_tos();
     let driver_sel = vm.universe.intern(b"driver");

@@ -464,9 +464,22 @@ pub fn scavenge(vm: &mut VmState) -> Result<ScavengeReport, GcStallError> {
     }
 
     // --- swap + tenuring (A3 steps 5-6) -----------------------------------
+    // Snapshot the two ranges this cycle just fully copied OUT of — every
+    // live object eden and `from` held has a forwarding pointer installed
+    // and a fresh copy in `to` by now, so nothing legitimate points into
+    // either range anymore (SPEC §7.6 poisoning).
+    let vacated_eden = (vm.universe.eden.start, vm.universe.eden.top);
+    let vacated_from = (vm.universe.from.start, vm.universe.from.top);
+
     std::mem::swap(&mut vm.universe.from, &mut vm.universe.to);
     vm.universe.eden.top = vm.universe.eden.start;
     vm.universe.to.reset();
+
+    #[cfg(debug_assertions)]
+    {
+        poison_range(vacated_eden.0, vacated_eden.1);
+        poison_range(vacated_from.0, vacated_from.1);
+    }
 
     // The LookupCache is address-keyed Rust-side state the root scan never
     // touches: after a scavenge its keys are stale, and worse, a recycled
@@ -498,6 +511,32 @@ pub fn scavenge(vm: &mut VmState) -> Result<ScavengeReport, GcStallError> {
         new_threshold,
         pause: start.elapsed(),
     })
+}
+
+/// SPEC §7.6: fills a range this cycle fully copied out of with `POISON`,
+/// so any stale `Handle`/raw `Oop` still pointing into it fails fast — the
+/// existing `Mark::from_word` sentinel-bit `debug_assert!` trips the
+/// instant something tries to read a header there — instead of silently
+/// reading whatever the NEXT cycle's copy happens to land on, which is
+/// what let a stale-handle bug masquerade as an unrelated GC panic
+/// multiple cycles downstream (S7-11).
+#[cfg(debug_assertions)]
+fn poison_range(start: usize, end: usize) {
+    debug_assert!(
+        start <= end && (end - start).is_multiple_of(crate::oops::layout::WORD_SIZE),
+        "poison_range: [{start:#x}, {end:#x}) is not a valid word-aligned range"
+    );
+    let mut addr = start;
+    while addr < end {
+        // SAFETY: `[start, end)` was just vacated by this cycle's own copy
+        // phase (every live object in it now has a forwarding pointer and
+        // a fresh copy elsewhere) — nothing reads through this range as a
+        // real object again before it's bump-allocated over.
+        unsafe {
+            (addr as *mut u64).write(crate::oops::layout::POISON);
+        }
+        addr += crate::oops::layout::WORD_SIZE;
+    }
 }
 
 fn scavenge_well_known_roots(vm: &mut VmState) {
@@ -925,6 +964,13 @@ mod tests {
         let per_obj_bytes = per_obj_words * 8;
         let count = remaining / per_obj_bytes;
         for _ in 0..count {
+            // Re-fetch each iteration: filling eden triggers scavenges that
+            // move `array_klass` (a young genesis klass), so a `klass`
+            // captured once before the loop goes stale — the bare-oop-across-
+            // a-collection hazard the debug poison-fill now panics on
+            // immediately (SPEC §7.6.1). `per_obj_*` above are sizes (usize),
+            // computed once and unaffected.
+            let klass = vm.universe.array_klass;
             let o = alloc::alloc_indexable_oops(&mut vm, klass, 0).oop();
             vm.stack.push(o); // must be rooted to actually land in to-space
         }
@@ -939,6 +985,8 @@ mod tests {
         assert!(vm.universe.from.end - vm.universe.from.top < per_obj_bytes);
 
         // One more object must overflow into promotion, not corrupt to-space.
+        // Re-fetch `klass`: the fill `scavenge` above moved it.
+        let klass = vm.universe.array_klass;
         let overflow = alloc::alloc_indexable_oops(&mut vm, klass, 0).oop();
         vm.stack.push(overflow);
         let report2 = scavenge(&mut vm).expect("overflow scavenge must succeed");

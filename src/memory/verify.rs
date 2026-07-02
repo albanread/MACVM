@@ -491,6 +491,13 @@ mod tests {
         // the scavenger's own copy) of a fresh new-gen value into the
         // now-old holder — exactly the scenario the write barrier exists
         // for. This must correctly dirty holder's card.
+        //
+        // Re-fetch `array_klass`: the `scavenge` above moved it (it's a
+        // young-gen genesis klass early in a VM's life), so the `klass`
+        // captured before the scavenge is now a stale from-space address —
+        // exactly the bare-oop-across-a-collection hazard the poison-fill
+        // (debug builds) turns into an immediate panic here (SPEC §7.6.1).
+        let klass = vm.universe.array_klass;
         let referenced = crate::memory::alloc::alloc_indexable_oops(&mut vm, klass, 0);
         let tail0 = holder_mem.tail_start_word();
         crate::memory::store::store(&mut vm, holder_mem, tail0, referenced.oop());

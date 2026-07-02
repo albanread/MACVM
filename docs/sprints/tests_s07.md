@@ -135,6 +135,18 @@ language workloads through the production allocator, not mechanics tests).
 
 Failure modes deliberately provoked (debug builds):
 
+**Status check (S7-11, 2026-07-02): none of the six rows below exist as
+actual tests in `src`/`tests` as of this note** — grepping for every test
+name here returns nothing. `poison_trips_stale_oop`'s underlying mechanism
+(`POISON`/`poison_range`) was only actually implemented in S7-11, a full
+project-age after this doc specified it (see SPEC.md §7.6's S7-11 amendment);
+the dedicated regression test for it was never written even now. The
+`verifier_catches_*` row implies `verify_heap` cross-checks the handle arena
+for staleness — it doesn't; `memory::verify::verify_heap` takes `&Universe`
+only and has no access to `vm.handle_arena` at all, so that cross-check
+cannot exist as specced. Leaving this table as-is (rather than deleting the
+unimplemented rows) so it stays visible as owed work, not silently dropped.
+
 | Test | Provocation | Expected |
 |---|---|---|
 | `verifier_catches_undirtied_card` | tests-only backdoor writes an old→new ref bypassing `memory::store` | `verify_heap(ScavengeEntry)` returns `VerifyError` naming the card (lesson 8 cross-check a) |

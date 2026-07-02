@@ -138,6 +138,23 @@ pub(crate) fn alloc_indexable_bytes_raw(
     unsafe { ByteArrayOop::from_oop_unchecked(obj.oop()) }
 }
 
+/// A `GcStallError` from `scavenge()` (old gen's committed prefix full mid-
+/// cycle, S7's designed cascade endpoint — growth is S8) can NEVER be
+/// silently discarded and retried: by the time it's returned, the root
+/// scan has already rewritten some roots (handles, well-known oops, ...)
+/// in place to point at their `to`-space/promoted copies, but the from→to
+/// swap that would make those addresses valid never ran. A caller that
+/// ignores the `Err` and calls `scavenge()` again reuses that same `to`
+/// region for a fresh copy pass, silently corrupting every root the first,
+/// aborted pass had already rewritten (a live handle ends up pointing at
+/// whatever the retry happened to copy to that address instead). So this
+/// is always fatal, matching the pre-existing "old gen truly out of room"
+/// exit path one step down in the same cascade.
+fn stall_exit(err: crate::memory::stall::GcStallError) -> ! {
+    eprintln!("{err}");
+    std::process::exit(70);
+}
+
 // --- public layer: VmState-based, used from S2 onward -----------------------
 
 /// Every heap object allocates through here (SPEC §7.2 A2's designed
@@ -169,7 +186,9 @@ pub fn alloc_words(vm: &mut VmState, words: usize, klass: Oop, tagged: bool) -> 
     let klass_h = scope.handle(vm, klass);
 
     if vm.options.gc_stress && vm.universe.gc_enabled {
-        let _ = crate::memory::scavenge::scavenge(vm);
+        if let Err(err) = crate::memory::scavenge::scavenge(vm) {
+            stall_exit(err);
+        }
     }
 
     let nil_fill = vm.universe.nil_obj;
@@ -178,7 +197,9 @@ pub fn alloc_words(vm: &mut VmState, words: usize, klass: Oop, tagged: bool) -> 
     }
 
     if vm.universe.gc_enabled {
-        let _ = crate::memory::scavenge::scavenge(vm);
+        if let Err(err) = crate::memory::scavenge::scavenge(vm) {
+            stall_exit(err);
+        }
         let nil_fill = vm.universe.nil_obj;
         if let Some(addr) = try_bump_eden(&mut vm.universe.eden, words) {
             return init_object_at(addr, words, klass_h.get(vm), tagged, nil_fill);
@@ -212,8 +233,7 @@ pub fn alloc_words(vm: &mut VmState, words: usize, klass: Oop, tagged: bool) -> 
         size_bytes,
         crate::memory::stall::GcPhase::Mutator,
     );
-    eprintln!("{err}");
-    std::process::exit(70);
+    stall_exit(err);
 }
 
 pub fn alloc_slots(vm: &mut VmState, klass: KlassOop) -> MemOop {

@@ -18,6 +18,51 @@ Sizing: S = a focused day or two, M = up to a week, L = 1–2 weeks of part-time
 research pace. Order is dependency-driven; A and the JASM spike (S9) can
 overlap if desired.
 
+### S7.5 — Handle hardening (generational, validated, currency-level) `M`
+Goal: close a **structural** flaw in the Handle/GC contract before S8 builds
+more moving-GC machinery on top of it. Discovered S7-11 (2026-07-02): the
+`Handle<T>` bug class (a bare oop-wrapper held across an allocation) was being
+independently reintroduced across S7-9/S7-10/S7-11 — including inside fixes for
+earlier instances and in the GC's own unit tests — because the *unsafe* type
+(`Oop`/`KlassOop`/…) is the pervasive currency and `Handle<T>` an opt-in,
+unvalidated, function-internal convenience (one `pub fn` signature total). No
+amount of care fixes a bug class the API shape regenerates. Design of record:
+**SPEC §7.6.1**, adopting the **Locus** sister VM's proven handle layer.
+Which change fixes what (adversarial review, 2026-07-02 — do not repeat the
+first draft's overclaim): the bugs actually hit were **bare oops, not misused
+`Handle`s**, so **change 2 is the primary fix**; change 1 is a soundness
+backstop + the prerequisite for change 2's type-safety, and catches only
+handle-use-after-scope.
+- Change 1 (do first — isolated to `memory/handles.rs`): persistent `gen`
+  vector + `generation` field + **three-guard access** (in-range, not-vacated,
+  gen-match) + **bump `gen` on vacate** (scope drop), not only on re-push —
+  MACVM has no free-list/tombstone like Locus, so vacate-bump is what closes
+  the false-negative. Debug-gated assert (handles are on the send hot path).
+- Regression test (before change 2): reproduce the real failure — a helper that
+  returns a bare oop past its scope no longer compiles once reshaped; a
+  deterministic `stale_handle_panics`. A21's premise is that tests+stress alone
+  were insufficient, so pin the fixed behavior with a test.
+- Change 2 (the invasive part): reshape allocating functions
+  (`install_method`, `MethodDictOop::insert`, `alloc_*`, `BytecodeBuilder`
+  public surface) to take/return `Handle<T>`; ripple through **every** call
+  site + tests. Ship an ergonomic klass-handle minting helper or the reshape
+  gets resisted the way opt-in `Handle` was. **Reshape leaf allocators last**
+  (they're called by `handles.rs`'s own machinery — circular otherwise).
+- Change 4: primitives are a third, currently-unprotected surface
+  (`prim_basic_new` holds `args[0]` across `alloc_slots`, safe only by the
+  accident that klasses are old-gen). Bring them into the contract (hand
+  `can_allocate` primitives handles, or enforce `prim_arg` re-read + lint).
+- Explicitly NOT in scope: Locus's `newgc-core` collector (rejected,
+  ref-analysis §5) and its conservative-scan MAGIC tag (MACVM uses precise
+  oop-maps). See §7.6.1's "deliberately NOT imported."
+- **Gate:** full suite green under `MACVM_GC_STRESS=1` *to completion* (the two
+  hang-forever tests fixed in S7-11 were why this stress run had never actually
+  finished — the precondition for trusting any GC gate); no `pub fn` that
+  allocates internally takes/returns a bare oop-wrapper for a value held across
+  the allocation; no `can_allocate` primitive reads its `args` copy after an
+  alloc; `stale_handle_panics` + the bare-return-won't-compile test both
+  present. Full reasoning: SPEC §7.6.1 + A21.
+
 ---
 
 ## Phase A — object world & interpreter

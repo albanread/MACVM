@@ -272,20 +272,27 @@ fn wrapper_format_checks() {
 #[test]
 fn klass_reopened_as_wrong_format() {
     let mut vm = VmState::new();
-    let klass = vm.universe.array_klass;
-    let a = macvm::memory::alloc::alloc_indexable_oops(&mut vm, klass, 0).oop();
+    let array_klass = vm.universe.array_klass;
+    let a = macvm::memory::alloc::alloc_indexable_oops(&mut vm, array_klass, 0).oop();
     assert!(ArrayOop::try_from(a).is_some());
 
     // Hand-flip the klass's format (a legitimate, non-test-only API — no
     // special backdoor needed): wrappers must re-check at every
-    // construction, never cache.
+    // construction, never cache. Fetch `array_klass` fresh here rather than
+    // reusing a copy taken before the allocation above: under
+    // MACVM_GC_STRESS that alloc scavenges, and array_klass is a new-gen
+    // object that can move — a pre-GC copy would flip the format on a
+    // vacated from-space address while the live klass stays untouched.
+    let klass = vm.universe.array_klass;
     klass.set_format(macvm::oops::Format::IndexableBytes, true);
     assert!(ArrayOop::try_from(a).is_none());
     assert!(ByteArrayOop::try_from(a).is_some());
 
     // Restore, so any later assertions in the same process aren't confused
     // (defensive; each #[test] gets a fresh VmState in this crate anyway).
-    klass.set_format(macvm::oops::Format::IndexableOops, false);
+    vm.universe
+        .array_klass
+        .set_format(macvm::oops::Format::IndexableOops, false);
 }
 
 #[test]

@@ -269,6 +269,26 @@ roots; **GC never truncates the arena** (only scope Drop does — lesson 9).
 > wrappers' `debug_assert!` tag checks immediately and deterministically under
 > `MACVM_GC_STRESS=1`. Suggest amending §7.6 wording to "the spaces a stale
 > oop points into are poison-filled".
+>
+> **RESOLUTION (S7-11, 2026-07-02): this was never actually built.** "S7
+> implements" above describes the intended design, not committed code —
+> `POISON` did not exist anywhere in `src/` until S7-11 added it
+> (`oops::layout::POISON`, `memory::scavenge::poison_range`), a full
+> project-age later. In its absence, every stale-handle bug in the interim
+> (S7-9, S7-10) was found as an actionable-but-confusing `to`-space bounds
+> panic several calls removed from the real misuse, not the immediate,
+> pinpointed failure this section promises. Wording is amended in SPEC.md
+> §7.6 as suggested, plus a longer post-mortem: poisoning alone is a
+> detection backstop, and once it actually ran it immediately surfaced that
+> the same "bare oop-wrapper local held across an allocation" bug is
+> structural, not a one-off — `Handle<T>` is used as a function-internal
+> convenience throughout this codebase (one `pub fn` signature total: its
+> own constructor) rather than as API-boundary currency the way V8/JNI use
+> their handle types, so allocating functions' own signatures (starting
+> with `install_method` right below) invite the exact bug this section
+> warns about at every call site. See SPEC.md §7.6's S7-11 amendment (A21)
+> for the full finding and the corrective direction — reshaping allocating
+> functions to take/return `Handle<T>` at their boundary, not yet scheduled.
 
 ```rust
 // src/memory/verify.rs — debug cross-check verifier (lesson 8).

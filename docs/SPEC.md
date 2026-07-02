@@ -532,6 +532,252 @@ fast — combined with the GC-stress mode (§12.3), violations surface
 deterministically. *(Amended per S7 review: Rust cannot rewrite locals; the
 enforcement is borrow-shape + space poisoning + stress.)*
 
+**Post-mortem amendment (S7-11, 2026-07-02 — see A21): the above is an
+incomplete description of the actual risk, and following it as written
+produces recurring bugs, not a one-off oversight.** Two findings from
+actually running the enforcement this paragraph promises:
+
+1. **The poison-filling this section specifies was never implemented.**
+   `sprint_s07_detail.md`'s own SPEC-QUESTION flagged the exact wording
+   change ("the spaces a stale oop points into are poison-filled") back
+   when S7 was written, but no code ever wrote a `POISON` pattern into
+   vacated eden/from-space. Every stale-handle bug in the S7-9/S7-10/S7-11
+   line was instead being found (when it was found at all) as a confusing,
+   action-at-a-distance panic — a `to`-space bounds guard tripping cycles
+   after the actual misuse, with no trace back to the responsible call
+   site. This is a plain implementation gap against this section, now
+   closed (`oops::layout::POISON`, `memory::scavenge::poison_range`).
+
+2. **The deeper problem, which poisoning only makes legible rather than
+   fixes: `Handle<T>` is not actually used as this section implies.** As of
+   this writing it appears in exactly **one** `pub fn` signature in the
+   entire codebase — its own constructor. Every other use, including in
+   the very functions this section is trying to protect (`install_method`,
+   `MethodDictOop::insert`, `BytecodeBuilder::finish`, `alloc_words` and
+   its callers), creates and consumes a `Handle` entirely *inside* one
+   function body. Not one allocating function's public signature takes or
+   returns `Handle<T>` — they take/return bare `KlassOop`/`SymbolOop`/
+   `MethodOop`/`Oop`, which are `Copy` and carry no signal, syntactic or
+   type-level, that holding one across a call is dangerous. A function
+   like `install_method` wraps its *own* parameters in handles internally
+   (with a comment explaining exactly why), which protects them for the
+   duration of that function's body — and does nothing about the identical
+   danger one level up, at the call site, for the expression that computed
+   the argument. This inverts how the prior art this design is modeled on
+   (V8's `HandleScope`, JNI local refs) actually works: there, the *safe*
+   handle type is the default currency for anything crossing a safepoint,
+   and the raw/unsafe pointer is the deliberately awkward, tightly-scoped
+   exception. Here it is backwards — the unsafe type is the pervasive
+   default, including at allocating functions' boundaries, and `Handle` is
+   an opt-in exception that only the callee remembers to reach for, too
+   late to help the caller.
+   
+   This is why the same bug class — a bare oop-wrapper local read after an
+   intervening allocation — kept being independently reintroduced across
+   S7-9, S7-10, and S7-11, *including inside code written specifically to
+   fix earlier instances of it*, and including in the GC's own unit test
+   suite (`memory::scavenge::tests::copy_exact_fill_survivor`), not just
+   hastily written test helpers. It is not a diligence failure by whoever
+   wrote that code sprint over sprint: no amount of care fixes a bug class
+   the API shape itself continuously regenerates. Detection (poisoning +
+   `MACVM_GC_STRESS=1`) is a necessary backstop for genuine one-off
+   mistakes, but it cannot be the *only* defense against a source that
+   manufactures new instances at a rate proportional to how much allocating
+   code gets written — a backstop with no upstream prevention just means
+   the same class of bug fires forever, one newly written function at a
+   time.
+   
+   **Corrective direction:** the two structural gaps above (the unsafe type
+   is the default currency; handles carry no validation) are resolved by the
+   revised handle contract specified in **§7.6.1**, adopted from the Locus
+   sister VM's proven handle layer. That section is the design of record;
+   this paragraph's earlier "not yet implemented" wording is superseded by
+   it.
+
+### 7.6.1 Revised handle contract — generational, validated, currency-level
+*(S7-11, 2026-07-02 — the design of record; supersedes §7.6's "opt-in,
+internal-only, unvalidated `Handle`" as the target. Adopted from the **Locus**
+sister VM, `../locus/locus-gc`, same author, whose handle layer solves this
+exact problem in production.)*
+
+**Provenance and scope of the import.** Locus's collector *engine* is
+`newgc-core` — the page-based, cohort-promoting, conservatively-pinning
+mark-evacuate GC already assessed and **rejected** for MACVM in
+[`reference-vm-analysis.md`](reference-vm-analysis.md) §5 (five still-valid
+mismatches: page/cohort geometry vs. contiguous eden+survivors+7-bit age; no
+slide compactor; header-self-describing vs. MACVM's klassOop-chase sizing; no
+single `is_old` boundary). **That rejection stands — MACVM keeps its own
+collector (§7.3, §7.5).** What transfers is strictly the *handle layer* that
+Locus builds *above* the collector, which is engine-independent. The mistake
+being corrected was never "MACVM shouldn't use newgc-core"; it was
+"having (correctly) rolled its own collector, MACVM then rolled a *weak* handle
+layer instead of copying the strong one sitting in the author's own Locus
+repo." Three concrete changes bring MACVM's handle layer to Locus's model:
+
+**Which change fixes what — stated honestly, because the first draft of this
+section overclaimed it (adversarial review, 2026-07-02).** The bug class has
+two halves and they need different fixes:
+- The bugs actually hit in S7-9/10/11 (`mk` returning a bare `SymbolOop` past
+  its scope; `install_prims` caching bare `KlassOop` locals across allocations;
+  `copy_exact_fill_survivor` rooting via `vm.stack.push`) were **bare oops,
+  never `Handle`s**. Generation validation (change 1) fires only on `Handle`
+  access, so it catches *none* of these. **Change 2 is the actual fix for that
+  half** — once a boundary takes `Handle<T>`, the bare oop is unspellable there.
+- Change 1 catches the *other* half: misuse of an existing `Handle` after its
+  scope dropped (the arena-staleness we also hit). It is a soundness backstop,
+  not the primary fix, and it is what upholds change 2's type-safety (below).
+- Everything not yet reshaped by change 2 stays covered **only** by poison +
+  stress. That is the honest coverage map; do not read change 1 as "makes every
+  latent instance loud" — it only makes *handle* misuse loud.
+
+1. **Handles carry a generation; the arena validates every access.**
+   `HandleArena` gains a `gen: Vec<u32>` parallel to `slots` but
+   **persistent** — never truncated (only `slots` is, on scope `leave`).
+   `Handle<T>` gains a `generation: u32` stamped at mint. **`get`/`set`/`oop`
+   apply Locus's *three* guards in order** (`lib.rs:500` `resolve`), not just
+   the generation compare: (i) index `< slots.len()` (in the live region);
+   (ii) the slot is not vacated; (iii) `gen[index] == handle.generation`.
+   All three matter — the generation compare alone is unsound, because a bare
+   generation field with no bounds/vacancy guard still index-panics or reads a
+   stale `gen` entry out of the live region.
+   
+   **Divergence from Locus, required because MACVM drops Locus's free-list +
+   tombstone:** Locus tombstones a freed slot and its `resolve` rejects a
+   tombstoned slot outright, so its generation only needs to bump on *re-push*.
+   MACVM's pure-LIFO arena has no tombstone — a truncated slot just retains its
+   last value until overwritten — so bumping only on re-push leaves a
+   **false-negative**: a handle whose scope dropped, but whose exact index is
+   never re-pushed before the stale use, would still validate and read a
+   foreign oop. MACVM therefore **bumps `gen[i]` on *vacate*** — on scope drop,
+   `for i in saved_len..len { gen[i] = gen[i].wrapping_add(1) }` (~2 lines in
+   `HandleScope::drop`). Then *any* handle outliving its scope is stale the
+   instant the scope drops, regardless of later push traffic, and guard (i)
+   alone catches the common case while (iii) catches index-in-range reuse. This
+   is the property Locus gets from tombstones; MACVM gets it from vacate-bump.
+   
+   `gen` is `u32`; bump is `wrapping_add`. Aliasing a *specific* live-but-stale
+   handle requires 2^32 reuses of one slot between that handle's mint and its
+   stale use — accepted (Locus accepts the same at 2^22). The collector **never
+   touches `gen`** (it rewrites `slots[..len]` in place), so a *correctly live*
+   handle across a scavenge still resolves — same index, same generation, slot
+   repointed. Relocation stays invisible; only staleness is caught. The assert
+   is gated `#[cfg(debug_assertions)]` (like the poison machinery): handles are
+   on the **send hot path** (`activate_method` enters a scope + mints a handle
+   every activation, `send.rs:42`), so release builds pay only the extra field,
+   not the compare.
+
+2. **`Handle<T>` is the currency at allocating-function boundaries — the
+   primary structural fix.** Any function that (a) allocates internally, or (b)
+   returns a value the caller holds across a further allocation, **takes and/or
+   returns `Handle<T>`**, never a bare `Oop`/`KlassOop`/`SymbolOop`/`MethodOop`.
+   `install_method`, `MethodDictOop::insert`, `alloc_*`, and `BytecodeBuilder`'s
+   public surface reshape accordingly. This pushes rooting to where the caller
+   *computes* the value, enforced by the signature.
+   
+   **Ergonomics — the friction relocates to the caller, it does not vanish
+   (review M2).** `Handle<T>` being lifetime-free avoids the borrow-checker
+   *wall* that killed the `Handle<'s,T>` sketch, but the E0503 seen in practice
+   (`install_method(vm, vm.universe.closure_klass, …)` — reading `vm.universe.X`
+   while `vm` is `&mut`-borrowed by the call) comes from the *argument
+   expression*, and reshaping the signature just moves the mint up one frame:
+   ```rust
+   // before:  install_method(vm, vm.universe.closure_klass, sel, m);
+   // after:
+   let s  = HandleScope::enter(vm);
+   let k  = s.handle(vm, vm.universe.closure_klass);   // read happens before the &mut call
+   install_method(vm, k, sel_h, m_h);
+   ```
+   That is *more* ceremony per call site and pushes a `HandleScope` into callers
+   that lack one — including the send path. To keep this from being resisted the
+   way opt-in `Handle` already was, S7.5 must ship an ergonomic minting helper
+   (e.g. a `Universe`/`VmState` accessor returning a `Handle<KlassOop>` for
+   well-known klasses directly, so "root a well-known klass" is one call, not a
+   three-line prologue). Budget the reshape as touching **every** `install_method`
+   call site (`interpreter/ic.rs`, `send.rs`, `unwind.rs`, `blocks.rs`) plus the
+   allocator and builder callers — this is the invasive bulk of S7.5, not a
+   type-swap.
+   
+   **Type-safety note (review m4):** once `Handle<KlassOop>` etc. cross public
+   boundaries, `Handle::get`'s `from_oop_unchecked` (`handles.rs:179`) trusts the
+   slot was last written as `T`. The three-guard + vacate-bump validation from
+   change 1 is what upholds that contract — without it, a `Handle<KlassOop>`
+   aliasing a slot later reused for a `Handle<MethodOop>` is an unchecked
+   wrong-type transmute, a soundness hole. Change 1 is therefore a *prerequisite*
+   for change 2, not merely a backstop.
+
+3. **The handle arena IS the precise Rust-side root set — stated as
+   load-bearing, not incidental.** (Already true in `scavenge_handle_arena_
+   roots`; §7.3 step 1 and this section now name it as a designed invariant so
+   future code treats "in the arena ⇔ rooted" as the contract, and the scoped
+   stack — `enter`/`handle`/scope-drop-truncates, already implemented — as the
+   sole lifetime model. A LIFO scope stack means every slot below the top is a
+   live root by construction, so scanning the whole arena *is* the precise
+   collection; no per-handle liveness marking is needed.)
+
+4. **Primitives are a *third* rooting surface — the "confined to" boundary
+   below does NOT cover them, and they are currently unprotected (review C2).**
+   A primitive body is Rust runtime code holding oops across an allocation
+   (`prim_basic_new` reads `klass` from `args[0]` and holds it across
+   `alloc_slots`, `primitives.rs:641`), but `args` is a copy in a Rust-local
+   `[Oop; 6]` buffer (`send.rs:52`), *not* the operand stack — so a scavenge
+   inside the alloc rewrites the stack and `vm.regs` but not `buf`. It is safe
+   today only by the unstated accident that klass oops are old-gen/immobile
+   under a scavenge; the first `can_allocate` primitive holding a *young* heap
+   arg across its allocation breaks silently. The rule (make it explicit here
+   and in §10): **a primitive re-reads live arguments via `prim_arg(i)`
+   (`vm_state.rs:248`, which reads the scanned operand-stack slot) after any
+   allocating call, and never touches the `args` copy afterward.** Better,
+   S7.5 should hand `can_allocate` primitives `Handle`s (or `&[Handle]`) so
+   they share the same validated currency; §10's existing "needs
+   handles/safepoint" label for `can_allocate` becomes true rather than
+   aspirational.
+
+**Deliberately NOT imported from Locus** (recorded so the reviewer doesn't
+flag their absence as an oversight):
+- **`newgc-core` (the collector engine)** — see provenance above.
+- **Locus's 16-bit self-identifying `MAGIC` tag on handles.** That exists so a
+  *conservative* scan of a GC-oblivious compiled machine stack can tell a
+  handle from an int/pointer. MACVM's compiled-frame plan (S12+) is *precise*
+  oop-maps at safepoints — strictly better (no false retention), so the magic
+  is unnecessary. MACVM's on-stack / in-object interpreter currency stays the
+  raw `Oop` (walked exactly as roots via frame maps, §7.3); the `Handle`
+  currency covers *Rust runtime code holding oops between allocations* — with
+  the explicit exception of primitive bodies (change 4 above), which root by
+  live-arg re-read, not handles, until S7.5 optionally unifies them.
+  (`is_well_formed`, which Locus derives from the magic to answer "is this
+  value a live handle?", goes too; MACVM never needs that at runtime. If it
+  ever does — a bare index can't self-identify — revisit.)
+- **Locus's `leave_with`/escape idiom** is optional — adopt only if a
+  reshaped allocating function needs to return an in-scope freshly-built object
+  (the common `alloc → return Handle` case); otherwise plain scope drop
+  suffices.
+
+**Scheduling.** This lands as a dedicated hardening pass (**S7.5**) *before*
+S8 builds more moving-GC machinery on the current model. Order within it:
+1. **Change 1 first** — small, isolated to `handles.rs` (persistent `gen`,
+   three-guard access, vacate-bump, debug-gated assert). A *soundness backstop*
+   and the prerequisite for change 2's type-safety; do **not** expect it to
+   surface the cited bare-oop bugs (it can't — see the honesty note above).
+2. **A regression test that reproduces the actual failure**, both directions:
+   one that reshapes a helper like `mk` to return `Handle` and asserts the old
+   bare-oop return no longer type-checks; one that deterministically trips the
+   stale-handle assert. The whole premise of A21 is that tests+stress were an
+   insufficient backstop — shipping the fix without a test pinning the fixed
+   behavior repeats the pattern.
+3. **Change 2** — the invasive currency reshape. **Migration ordering matters**
+   (review): the allocator/builder surface change 2 reshapes is called *by*
+   `handles.rs`'s own machinery, so reshape leaf allocators **last**, or the
+   ripple deadlocks on itself.
+4. **Change 4** — bring primitives into the contract (or at minimum a
+   `debug_assert`/lint that a `can_allocate` primitive never reads `args[k]`
+   after an alloc).
+
+See amendment **A21**. *(This scheduling and the honesty note reflect an
+adversarial design review of the first draft of §7.6.1, 2026-07-02, which
+caught that the draft (a) overclaimed change 1, (b) specified an unsound
+generation-only guard, and (c) wrongly excluded primitives from the bug
+surface. All three are corrected above.)*
+
 ---
 
 ## 8. Adaptive compilation (tier 1)
@@ -806,6 +1052,7 @@ FP+5 serial / FP+6 marker; §5.3 rcvr index; §5.4 closure copied[] convention;
 | A18 | Repo becomes a cargo workspace (`macvm` + `gui/` = `macvm-gui`); VM on worker thread, AppKit on main, channel bridge | §16.1 |
 | A19 | §16.3 revised: mirrors are **Smalltalk-side** over VM primitive groups R1–R5; HtmlWriter fragment rendering is Smalltalk-side; gui crate = shell + transport only | APPS.md §1–§3, §6 |
 | A20 | Eval/accept error contract: compile-service errors return **(message, character position)** for in-editor display; `evaluate:receiver:ifError:` and the deferred `blockToEvaluateFor:` forms pinned | APPS.md §4 |
+| A21 | **Design flaw, not just a bug backlog**: §7.6's poison-fill was never implemented (now fixed, S7-11); more importantly, `Handle<T>` is used as a purely function-internal convenience everywhere (one `pub fn` signature total, its own constructor) instead of as API-boundary currency, so the "hold an oop across an allocation" bug this section warns about is structurally regenerated by every new allocating function, not a diligence lapse. **Resolved by a specified revised design (§7.6.1)** adopting the Locus sister VM's handle layer: (1) generation-validated handles → use-after-scope panics at the misuse site; (2) `Handle<T>` as boundary currency for allocating fns; (3) arena-as-precise-root-set stated as invariant. Explicitly does **not** adopt Locus's `newgc-core` collector (already rejected, ref-analysis §5) or its conservative-scan MAGIC tag (MACVM uses precise oop-maps). Scheduled as pass **S7.5**, before S8 | §7.6.1 |
 
 ---
 

@@ -13,6 +13,18 @@ pub const MEM_TAG: u64 = 0b01; // heap oop; address = word - MEM_TAG
 pub const RESERVED_TAG: u64 = 0b10; // future immediate Character; illegal in v1
 pub const MARK_TAG: u64 = 0b11; // only as header word 0
 
+/// SPEC §7.6 (amended per S7 review, `sprint_s07_detail.md` "SPEC-QUESTION"):
+/// Rust can't rewrite live stale locals/handles the way a moving GC does in
+/// a language with a rewritable-roots runtime, so the enforceable
+/// equivalent is poisoning the memory a stale reference would land on. This
+/// pattern is MARK_TAG-shaped (low 2 bits `0b11`) so it parses as a header
+/// tag, but bit 2 (`MARK_SENTINEL_MASK`) is 0 — a mark word with sentinel=0
+/// is otherwise impossible (`Mark::pristine()` always sets it), so
+/// `Mark::from_word`'s existing `debug_assert!` on that bit trips
+/// immediately and deterministically on any stale dereference, with no new
+/// checking mechanism needed.
+pub const POISON: u64 = 0xF0F0_F0F0_F0F0_F0F3;
+
 pub const SMI_SHIFT: u32 = 2;
 pub const SMI_BITS: u32 = 62;
 pub const SMI_MAX: i64 = (1i64 << 61) - 1; //  2_305_843_009_213_693_951
