@@ -17,7 +17,9 @@ use super::{pop, push};
 /// (also used by `runtime::primitives`).
 pub use crate::runtime::lookup::klass_of;
 
-fn bump_invocation(m: MethodOop) {
+/// `pub(crate)`: also bumped by `interpreter::blocks::activate_block` —
+/// blocks have counters too (SPEC §5.4, S14 feedback).
+pub(crate) fn bump_invocation(m: MethodOop) {
     let c = m.counters();
     let inv = c & COUNTERS_INVOCATION_MASK;
     let bumped = (inv + 1).min(COUNTERS_INVOCATION_MAX);
@@ -59,13 +61,23 @@ pub fn activate_method(vm: &mut VmState, m: MethodOop, argc: u8) {
                 );
                 // Falls through: the method's bytecode body is the fallback.
             }
+            PrimResult::Activated => {
+                // The primitive already pushed a real frame and set
+                // `vm.regs` itself (the `value` family, `ensure:`,
+                // `ifCurtailed:`) — push NO result, just resume dispatch.
+                return;
+            }
         }
     }
 
-    debug_assert!(!m.has_ctx(), "activate_method: Context push lands in S4");
     let saved_fp = vm.stack.fp as i64;
     let saved_bci = vm.regs.bci;
     super::push_frame(vm, m, argc as usize, saved_fp, saved_bci);
+    // A plain method's own Context has no enclosing chain (SPEC §5.4);
+    // block activation (`activate_block`) passes its inherited context
+    // instead.
+    let nil = vm.universe.nil_obj;
+    super::blocks::maybe_alloc_context(vm, m, vm.stack.fp, nil);
     vm.regs.method = Some(m);
     vm.regs.bci = 0;
 }
@@ -257,7 +269,7 @@ mod tests {
         let name = vm.universe.intern(b"foo");
         let m = b.finish(&mut vm, name, 1, 0); // argc=1: smi `+`'s shape
         m.set_primitive(1); // smi group `+`
-        m.set_flags(1, 0, false, false, true); // prim_fails = true
+        m.set_flags(1, 0, false, false, true, false, 0); // prim_fails = true
         install_method(&mut vm, a, sel, m);
         let caller = build_caller(&mut vm, sel, 1);
         // The receiver is not a smi, so primitive 1 (`+`) always Fails.
@@ -287,5 +299,43 @@ mod tests {
         let argc = 2usize;
         let receiver_index = vm.stack.sp - argc - 1;
         assert_eq!(vm.stack.get(receiver_index), recv);
+    }
+
+    /// The primitive call site's 3rd arm (`PrimResult::Activated`, S4) must
+    /// push NO result — an off-by-one there would corrupt the new (block)
+    /// frame's first temp slot with a stray value instead of leaving it
+    /// `nil`.
+    #[test]
+    fn activated_no_result_push() {
+        let mut vm = test_vm();
+        let closure_klass = vm.universe.closure_klass;
+        let value_sel = vm.universe.intern(b"value");
+        let mut value_body = BytecodeBuilder::new();
+        value_body.push_self();
+        value_body.ret_self(); // unreachable: the primitive never Fails here
+        let value_method = value_body.finish(&mut vm, value_sel, 0, 0);
+        value_method.set_primitive(50);
+        install_method(&mut vm, closure_klass, value_sel, value_method);
+
+        let mut home = BytecodeBuilder::new();
+        // The block itself has 1 local temp, never explicitly stored to —
+        // if `Activated` handling pushed a stray result, it would land
+        // exactly here.
+        let lit = home.build_block(&mut vm, 0, 1, false, 0, false, |b| {
+            b.push_temp(0);
+            b.ret_tos();
+        });
+        home.push_closure(lit, 0);
+        home.send(value_sel, 0);
+        home.ret_tos();
+        let sel = vm.universe.intern(b"m");
+        let method = home.finish(&mut vm, sel, 0, 0);
+
+        let recv = vm.universe.nil_obj;
+        let result = crate::interpreter::run_method(&mut vm, method, recv, &[]);
+        assert_eq!(
+            result, recv,
+            "the block's untouched temp[0] must be nil, not a stray pushed result"
+        );
     }
 }

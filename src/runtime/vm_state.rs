@@ -123,13 +123,6 @@ pub struct VmState {
     /// hook in S2 (never set) so the dispatch loop's shape never changes
     /// once S7 wires a real poll behind it.
     pub pending: bool,
-    /// Scratch: the bci the caller should resume at, set by
-    /// `return_from_frame` on a non-entry return and read by
-    /// `interpreter::resume_bci`. S2 never exercises the non-entry path
-    /// (S2's activate/return discipline is single-frame only); this exists
-    /// so the signature `return_from_frame(vm, result) -> Option<Oop>` the
-    /// interfaces doc pins doesn't need to carry the resume bci itself.
-    pub(crate) resume_bci: usize,
     /// The active send/DNU's view of "where execution currently is" (SPEC
     /// §5.3, S3). Written by the dispatch loop immediately before every
     /// `send`/`send_super`; read by `interpreter::send`'s super-lookup
@@ -159,6 +152,13 @@ pub struct VmState {
     pub exit_requested: bool,
     /// VM boot time, for the `millisecondClock` primitive.
     pub start_instant: Instant,
+    /// The next frame serial to hand out (SPEC §5.4, S4) — monotonic,
+    /// post-incremented at every `push_frame`. Never reused, which is what
+    /// makes a `HomeRef`'s `(fp, serial)` pair a reliable dead-home check:
+    /// a frame popped and later replaced by a different activation at the
+    /// same `fp` always has a different serial. u32 wrap after 4G pushes is
+    /// an accepted, `debug_assert`-guarded risk.
+    next_frame_serial: u32,
 }
 
 impl VmState {
@@ -176,7 +176,6 @@ impl VmState {
             options,
             stack: ProcessStack::with_capacity(DEFAULT_STACK_CAPACITY),
             pending: false,
-            resume_bci: 0,
             regs: InterpRegs::default(),
             ic_epoch: 0,
             lookup_cache: LookupCache::new(),
@@ -184,6 +183,7 @@ impl VmState {
             out: Box::new(std::io::stdout()),
             exit_requested: false,
             start_instant: Instant::now(),
+            next_frame_serial: 0,
         }
     }
 
@@ -192,6 +192,26 @@ impl VmState {
     /// any allocating call (SPEC §10 Pitfalls).
     pub fn prim_arg(&self, i: usize) -> crate::oops::Oop {
         self.stack.get(self.prim_arg_base + i)
+    }
+
+    /// Hands out the next frame serial, post-incrementing the counter.
+    pub fn alloc_frame_serial(&mut self) -> u32 {
+        let s = self.next_frame_serial;
+        let (next, wrapped) = self.next_frame_serial.overflowing_add(1);
+        debug_assert!(
+            !wrapped,
+            "alloc_frame_serial: wrapped past u32::MAX (accepted risk, 4G pushes)"
+        );
+        self.next_frame_serial = next;
+        s
+    }
+
+    /// The serial `alloc_frame_serial` will hand out *next*, without
+    /// consuming it — test-only, for predicting a to-be-pushed frame's
+    /// serial before triggering the push.
+    #[cfg(test)]
+    pub(crate) fn peek_next_frame_serial(&self) -> u32 {
+        self.next_frame_serial
     }
 }
 

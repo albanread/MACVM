@@ -11,3 +11,11 @@ pub fn test_vm() -> VmState {
         trace: Default::default(),
     })
 }
+
+/// Post-run walker (S4, tests_s04.md's golden epilogue helper): a fully
+/// unwound `VmState` — no residual frames, markers, or tokens — has its
+/// operand stack truncated all the way back to empty.
+#[allow(dead_code)]
+pub fn stack_clean(vm: &VmState) -> bool {
+    vm.stack.sp == 0
+}

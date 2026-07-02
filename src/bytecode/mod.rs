@@ -12,6 +12,6 @@ pub mod disasm;
 pub mod method;
 pub mod opcode;
 
-pub use builder::BytecodeBuilder;
+pub use builder::{build_standalone_block, BytecodeBuilder};
 pub use disasm::disassemble;
 pub use opcode::{decode_at, Instr};

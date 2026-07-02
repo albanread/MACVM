@@ -5,14 +5,16 @@
 //! before S4 is a VM bug, since only `BytecodeBuilder` produces bytecode
 //! and nothing before S4 emits those opcodes).
 
+pub mod blocks;
 pub mod ic;
 pub mod send;
 pub mod stack;
+pub mod unwind;
 
 use crate::bytecode::opcode::*;
 use crate::oops::layout::ENTRY_FRAME_SENTINEL;
 use crate::oops::smi::SmallInt;
-use crate::oops::wrappers::MethodOop;
+use crate::oops::wrappers::{ContextOop, MethodOop};
 use crate::oops::Oop;
 use crate::runtime::vm_state::VmState;
 
@@ -40,16 +42,43 @@ fn frame_receiver(vm: &VmState) -> Oop {
     current_frame(vm).receiver(&vm.stack)
 }
 
-/// The bci the caller should resume at, after a non-entry
-/// `return_from_frame`. See the `resume_bci` field doc on `VmState`.
-fn resume_bci(vm: &VmState) -> usize {
-    vm.resume_bci
+/// SPEC §5.4 step 4: walks `depth` `home_hint` hops from the current
+/// frame's own Context — depth counts only `has_ctx` scopes, never lexical
+/// block nesting (a ctx-less block's frame *aliases* its enclosing Context
+/// directly, so no hop is spent on it). A hop that doesn't land on a real
+/// Context is a compiler bug (wrong depth), never a guest error.
+fn ctx_temp_walk(vm: &VmState, depth: u8) -> ContextOop {
+    let mut c = current_frame(vm).context(&vm.stack);
+    for _ in 0..depth {
+        let ctx = ContextOop::try_from(c)
+            .expect("ctx_temp_walk: hop landed on a non-Context (compiler bug: wrong depth)");
+        c = ctx.home_hint();
+    }
+    ContextOop::try_from(c)
+        .expect("ctx_temp_walk: final hop is not a Context (compiler bug: wrong depth)")
+}
+
+/// The method dispatch should resume in after a `None`-returning
+/// `unwind::do_return`/`unwind::continue_unwind` call — always
+/// `vm.regs.method`, the single source of truth every such path stamps
+/// (see `unwind::pop_and_deliver`'s doc for why this can't be re-derived
+/// from `vm.stack.fp` alone: a nested resume sentinel may have activated a
+/// fresh handler frame rather than merely restoring a caller's).
+fn regs_method(vm: &VmState) -> MethodOop {
+    vm.regs
+        .method
+        .expect("regs_method: no active method after a return")
 }
 
 /// Pushes a new frame for `method`. Receiver + `argc` args must already be
 /// on the stack (SPEC §5.1's activation algorithm, step-numbered there).
-/// `saved_fp`/`saved_bci` are the caller's resume link; S3's sends will
-/// pass the current frame's fp/bci, `activate_entry` passes the sentinel.
+/// `saved_fp`/`saved_bci` are the caller's resume link; sends pass the
+/// current frame's fp/bci, `activate_entry` passes the sentinel. `FRAME_
+/// CONTEXT` is left `nil` here — a `has_ctx` method's real Context is
+/// allocated by a separate step right after this returns (SPEC §5.4's
+/// "frame fully formed before the allocation" rule), never inline in this
+/// function. Stamps a fresh, never-reused frame serial (SPEC §5.4 dead-home
+/// detection) and an empty marker.
 pub fn push_frame(
     vm: &mut VmState,
     method: MethodOop,
@@ -61,9 +90,12 @@ pub fn push_frame(
     push(vm, method.oop());
     push(vm, SmallInt::new(saved_fp).oop());
     push(vm, SmallInt::new(saved_bci as i64).oop());
-    push(vm, vm.universe.nil_obj); // context: nil in S2, Contexts are S4
+    push(vm, vm.universe.nil_obj); // context: patched by the caller for has_ctx methods
     let receiver = vm.stack.get(fp_new - argc - 1);
     push(vm, receiver);
+    let serial = vm.alloc_frame_serial();
+    push(vm, SmallInt::new(serial as i64).oop());
+    push(vm, vm.universe.nil_obj); // marker: none
     let ntemps = method.ntemps();
     let nil = vm.universe.nil_obj;
     for _ in 0..ntemps {
@@ -73,35 +105,12 @@ pub fn push_frame(
 }
 
 /// The entry-frame variant `run_method` uses: no caller exists yet, so the
-/// saved link is the sentinel.
+/// saved link is the sentinel. An entry method's own Context (if any) has
+/// no enclosing chain, same as any other plain method activation.
 pub fn activate_entry(vm: &mut VmState, method: MethodOop, argc: usize) {
     push_frame(vm, method, argc, ENTRY_FRAME_SENTINEL, 0);
-}
-
-/// Pops the current frame, writing `result` into the canonical receiver
-/// slot (`fp - argc - 1`) and truncating `sp` to just past it (SPEC §5.1).
-/// `Some(result)` when the entry frame returns (the interpreter loop should
-/// stop and hand `result` back to `run_method`'s caller); `None` when a
-/// caller frame was restored (the loop should reload `method`/`bci` — via
-/// `current_method`/`resume_bci` — and continue).
-pub fn return_from_frame(vm: &mut VmState, result: Oop) -> Option<Oop> {
-    let frame = current_frame(vm);
-    let argc = frame.method(&vm.stack).argc();
-    let base = vm.stack.fp - argc - 1;
-    let saved_fp = frame.saved_fp(&vm.stack);
-    let saved_bci = frame.saved_bci(&vm.stack);
-
-    vm.stack.set(base, result);
-    vm.stack.sp = base + 1;
-
-    if saved_fp == ENTRY_FRAME_SENTINEL {
-        vm.stack.sp = base;
-        vm.stack.deactivate();
-        return Some(result);
-    }
-    vm.stack.activate_frame(saved_fp as usize);
-    vm.resume_bci = saved_bci;
-    None
+    let nil = vm.universe.nil_obj;
+    blocks::maybe_alloc_context(vm, method, vm.stack.fp, nil);
 }
 
 /// Reads and executes bytecode from a fresh entry frame until it returns.
@@ -114,12 +123,24 @@ pub fn run_method(vm: &mut VmState, method: MethodOop, receiver: Oop, args: &[Oo
     dispatch(vm)
 }
 
-/// `S2: panic; S3: send` (SPEC §4.2 requires a real `#mustBeBoolean` send,
-/// impossible before lookup exists — sprint_s02_detail.md's pinned
-/// resolution). Diverges, so it type-checks as any branch's result.
-fn must_be_boolean(vm: &VmState, t: Oop) -> ! {
-    let s = crate::memory::print_oop(&vm.universe, t);
-    panic!("mustBeBoolean: non-boolean receiver {s} in a branch (S3 replaces this with a send)");
+/// SPEC §5.4 Algorithm 11: a branch popped a non-`true`/`false` value.
+/// Pushes it back, rolls `vm.regs.bci` back to the *branch opcode itself*
+/// (not its operand) so a normal-returning handler makes the branch
+/// re-examine its (hopefully now boolean) result, and sends `#mustBeBoolean`
+/// (unary) via a full lookup — no dedicated IC site (SPEC: "not worth a
+/// site"). No handler installed → the S3 DNU fallback prints and
+/// terminates (never returns). A handler that keeps returning non-booleans
+/// livelocks by construction — same as real Smalltalk, not a VM bug.
+fn must_be_boolean_send(vm: &mut VmState, method: MethodOop, branch_bci: usize, t: Oop) {
+    push(vm, t);
+    vm.regs.method = Some(method);
+    vm.regs.bci = branch_bci;
+    let klass = send::klass_of(vm, t);
+    let sel = vm.universe.sel_must_be_boolean;
+    match crate::runtime::lookup::lookup(vm, klass, sel) {
+        Some(m) => send::activate_method(vm, m, 0),
+        None => crate::runtime::error::dnu_fallback(vm, sel, klass), // never returns
+    }
 }
 
 fn dispatch(vm: &mut VmState) -> Oop {
@@ -255,43 +276,59 @@ fn dispatch(vm: &mut VmState) -> Oop {
                 let d = read_u16(method, bci + 1);
                 let next = bci + 3;
                 let t = pop(vm);
-                bci = if t.raw() == vm.universe.true_obj.raw() {
-                    next + d as usize
+                if t.raw() == vm.universe.true_obj.raw() {
+                    bci = next + d as usize;
                 } else if t.raw() == vm.universe.false_obj.raw() {
-                    next
+                    bci = next;
                 } else {
-                    must_be_boolean(vm, t)
-                };
+                    let fp_before = vm.stack.fp;
+                    must_be_boolean_send(vm, method, bci, t);
+                    if vm.stack.fp != fp_before {
+                        method = current_method(vm);
+                        bci = 0;
+                    } else {
+                        // A primitive-backed #mustBeBoolean returned without
+                        // pushing a frame — re-examine the same branch.
+                        bci = vm.regs.bci;
+                    }
+                }
             }
             OP_BR_FALSE_FWD => {
                 let d = read_u16(method, bci + 1);
                 let next = bci + 3;
                 let t = pop(vm);
-                bci = if t.raw() == vm.universe.false_obj.raw() {
-                    next + d as usize
+                if t.raw() == vm.universe.false_obj.raw() {
+                    bci = next + d as usize;
                 } else if t.raw() == vm.universe.true_obj.raw() {
-                    next
+                    bci = next;
                 } else {
-                    must_be_boolean(vm, t)
-                };
+                    let fp_before = vm.stack.fp;
+                    must_be_boolean_send(vm, method, bci, t);
+                    if vm.stack.fp != fp_before {
+                        method = current_method(vm);
+                        bci = 0;
+                    } else {
+                        bci = vm.regs.bci;
+                    }
+                }
             }
             OP_RETURN_TOS => {
                 let r = pop(vm);
-                match return_from_frame(vm, r) {
+                match unwind::do_return(vm, r) {
                     Some(result) => return result,
                     None => {
-                        method = current_method(vm);
-                        bci = resume_bci(vm);
+                        method = regs_method(vm);
+                        bci = vm.regs.bci;
                     }
                 }
             }
             OP_RETURN_SELF => {
                 let r = frame_receiver(vm);
-                match return_from_frame(vm, r) {
+                match unwind::do_return(vm, r) {
                     Some(result) => return result,
                     None => {
-                        method = current_method(vm);
-                        bci = resume_bci(vm);
+                        method = regs_method(vm);
+                        bci = vm.regs.bci;
                     }
                 }
             }
@@ -329,12 +366,72 @@ fn dispatch(vm: &mut VmState) -> Oop {
                     bci = next;
                 }
             }
-            OP_PUSH_CTX_TEMP
-            | OP_STORE_CTX_TEMP_POP
-            | OP_PUSH_CLOSURE
-            | OP_BLOCK_RETURN_TOS
-            | OP_NLR_TOS => {
-                unimplemented!("closures/contexts land in S4")
+            OP_PUSH_CTX_TEMP => {
+                let depth = method.bytecode_byte(bci + 1);
+                let idx = method.bytecode_byte(bci + 2) as usize;
+                let ctx = ctx_temp_walk(vm, depth);
+                push(vm, ctx.slot(idx));
+                bci += 3;
+            }
+            OP_STORE_CTX_TEMP_POP => {
+                let depth = method.bytecode_byte(bci + 1);
+                let idx = method.bytecode_byte(bci + 2) as usize;
+                let ctx = ctx_temp_walk(vm, depth);
+                let v = pop(vm);
+                ctx.set_slot(idx, v);
+                bci += 3;
+            }
+            OP_PUSH_CLOSURE => {
+                let lit = method.bytecode_byte(bci + 1) as usize;
+                let n_value_captures = method.bytecode_byte(bci + 2) as usize;
+                let blk = crate::oops::wrappers::MethodOop::try_from(method.literals().at(lit))
+                    .expect("push_closure: literal is not a CompiledBlock");
+                let closure = blocks::make_closure(vm, blk, n_value_captures);
+                push(vm, closure.oop());
+                bci += 3;
+            }
+            OP_BLOCK_RETURN_TOS => {
+                // A block's implicit fall-off-the-end return: identical
+                // pop/deliver mechanics to `return_tos` — this is a LOCAL
+                // return from just the block's own activation (delivered
+                // to whoever sent it `value`/`value:`/…), not a non-local
+                // return to the block's lexical home (that's `nlr_tos`).
+                let r = pop(vm);
+                match unwind::do_return(vm, r) {
+                    Some(result) => return result,
+                    None => {
+                        method = regs_method(vm);
+                        bci = vm.regs.bci;
+                    }
+                }
+            }
+            OP_NLR_TOS => {
+                let value = pop(vm);
+                debug_assert!(
+                    method.is_block(),
+                    "nlr_tos: only a block's own bytecode ever emits this (`^` in a method compiles to return_tos)"
+                );
+                vm.regs.method = Some(method);
+                vm.regs.bci = bci;
+                let frame = current_frame(vm);
+                let closure_oop = vm.stack.get(frame.receiver_slot(&vm.stack));
+                let closure = crate::oops::wrappers::ClosureOop::try_from(closure_oop)
+                    .expect("nlr_tos: block frame's receiver slot is not a Closure");
+                let home = crate::oops::home_ref::unpack_home_ref(closure.home());
+                match unwind::continue_unwind(vm, home, value) {
+                    unwind::UnwindStep::ReturnedFromHome(Some(result)) => return result,
+                    unwind::UnwindStep::ReturnedFromHome(None)
+                    | unwind::UnwindStep::RanHandler
+                    | unwind::UnwindStep::CannotReturn => {
+                        // In every case, whichever activation is now current
+                        // (a restored caller, a fresh handler, or a fresh
+                        // #cannotReturn: activation) already stamped
+                        // `vm.regs` as the single source of truth — see
+                        // `unwind::pop_and_deliver`'s doc.
+                        method = regs_method(vm);
+                        bci = vm.regs.bci;
+                    }
+                }
             }
             bad => panic!("undefined opcode {bad:#04x} at bci {bci}"),
         }
@@ -387,7 +484,7 @@ mod tests {
         push_frame(&mut vm, method, 2, ENTRY_FRAME_SENTINEL, 0);
 
         let result = SmallInt::new(9).oop();
-        let ret = return_from_frame(&mut vm, result);
+        let ret = unwind::do_return(&mut vm, result);
         assert_eq!(ret, Some(result));
         assert_eq!(vm.stack.sp, pre_sp, "no residue above the pre-push sp");
     }
@@ -506,35 +603,41 @@ mod tests {
         let _ = run_method(&mut vm, method, recv, &[]);
     }
 
+    /// SPEC §5.4 Algorithm 11: a non-boolean branch operand sends
+    /// `#mustBeBoolean`, and the branch re-executes with the handler's
+    /// result once it returns.
     #[test]
-    #[should_panic(expected = "closures/contexts land in S4")]
-    fn closure_opcode_unimplemented() {
+    fn must_be_boolean_handler_reexecutes_branch() {
         let mut vm = test_vm();
+        let smi_klass = vm.universe.smi_klass;
+        let mb_sel = vm.universe.sel_must_be_boolean;
+        let mut h = BytecodeBuilder::new();
+        h.push_true();
+        h.ret_tos();
+        let handler = h.finish(&mut vm, mb_sel, 0, 0);
+        crate::runtime::lookup::install_method(&mut vm, smi_klass, mb_sel, handler);
+
         let mut b = BytecodeBuilder::new();
-        b.ret_self();
+        let true_branch = b.new_label();
+        let end = b.new_label();
+        b.push_smi_i8(5); // non-boolean
+        b.br_true_fwd(true_branch);
+        b.push_smi_i8(0); // false-branch value
+        b.jump_fwd(end);
+        b.bind(true_branch);
+        b.push_smi_i8(1); // true-branch value
+        b.bind(end);
+        b.ret_tos();
         let sel = vm.universe.intern(b"m");
         let method = b.finish(&mut vm, sel, 0, 0);
-        method.set_bytecode_byte(0, crate::bytecode::opcode::OP_PUSH_CLOSURE);
         let recv = vm.universe.nil_obj;
 
-        let _ = run_method(&mut vm, method, recv, &[]);
-    }
-
-    #[test]
-    #[should_panic(expected = "mustBeBoolean")]
-    fn non_boolean_branch_panics() {
-        let mut vm = test_vm();
-        let mut b = BytecodeBuilder::new();
-        let l = b.new_label();
-        b.push_smi_i8(0);
-        b.br_true_fwd(l);
-        b.bind(l);
-        b.ret_self();
-        let sel = vm.universe.intern(b"m");
-        let method = b.finish(&mut vm, sel, 0, 0);
-        let recv = vm.universe.nil_obj;
-
-        let _ = run_method(&mut vm, method, recv, &[]);
+        let result = run_method(&mut vm, method, recv, &[]);
+        assert_eq!(
+            result,
+            SmallInt::new(1).oop(),
+            "the handler returned true: the true-branch must run"
+        );
     }
 
     // `process_stack_overflow_exits_cleanly` lives in tests/it_interp.rs:
@@ -569,5 +672,79 @@ mod tests {
         st.push(a);
         // With no frame active, pop's floor is 0 — this must not panic.
         assert_eq!(st.pop(), a);
+    }
+
+    #[test]
+    fn ctx_temp_rw_depth0() {
+        let mut vm = test_vm();
+        let mut b = BytecodeBuilder::new();
+        b.push_smi_i8(9);
+        b.store_ctx_temp_pop(0, 0);
+        b.push_ctx_temp(0, 0);
+        b.ret_tos();
+        let sel = vm.universe.intern(b"m");
+        let method = b.finish(&mut vm, sel, 0, 0);
+        method.set_flags(0, 0, true, false, false, false, 1); // has_ctx, nctx=1
+
+        let recv = vm.universe.nil_obj;
+        let result = run_method(&mut vm, method, recv, &[]);
+        assert_eq!(result, SmallInt::new(9).oop());
+    }
+
+    #[test]
+    fn ctx_temp_depth_walk() {
+        let mut vm = test_vm();
+        // M's own context (home_hint nil): slot 0 = a (10).
+        let ctx_m = crate::memory::alloc::alloc_context(&mut vm, 1);
+        ctx_m.set_slot(0, SmallInt::new(10).oop());
+        // B2's own context (home_hint = M's ctx, one has_ctx hop up): slot 0 = b (20).
+        let ctx_b2 = crate::memory::alloc::alloc_context(&mut vm, 1);
+        ctx_b2.set_home_hint(ctx_m.oop());
+        ctx_b2.set_slot(0, SmallInt::new(20).oop());
+
+        // B3 has no Context of its own — its frame aliases ctx_b2 directly
+        // at FP+3 (B1, likewise ctx-less, is elided here since depth-walk
+        // only cares about `has_ctx` hops, never lexical nesting).
+        let method = method_returning_self(&mut vm, 0, 0);
+        let recv = vm.universe.nil_obj;
+        push(&mut vm, recv);
+        let fp = vm.stack.sp;
+        push_frame(&mut vm, method, 0, ENTRY_FRAME_SENTINEL, 0);
+        Frame { fp }.set_context(&mut vm.stack, ctx_b2.oop());
+
+        assert_eq!(ctx_temp_walk(&vm, 0).slot(0), SmallInt::new(20).oop());
+        assert_eq!(ctx_temp_walk(&vm, 1).slot(0), SmallInt::new(10).oop());
+    }
+
+    #[test]
+    fn frame_serial_monotonic() {
+        let mut vm = test_vm();
+        let method = method_returning_self(&mut vm, 0, 0);
+        let recv = vm.universe.nil_obj;
+
+        // 100 nested activations (never popped): serials strictly increase.
+        let mut serials = Vec::new();
+        for _ in 0..100 {
+            push(&mut vm, recv);
+            push_frame(&mut vm, method, 0, ENTRY_FRAME_SENTINEL, 0);
+            serials.push(current_frame(&vm).serial(&vm.stack));
+        }
+        for w in serials.windows(2) {
+            assert!(w[1] > w[0], "serials must strictly increase: {w:?}");
+        }
+
+        // Pop back to before the last frame's receiver, then push a fresh
+        // frame at the exact same fp: the index is reused, the serial is
+        // not.
+        let last_fp = current_frame(&vm).fp;
+        let last_serial = current_frame(&vm).serial(&vm.stack);
+        vm.stack.sp = last_fp - 1; // drop the frame and its receiver
+        push(&mut vm, recv);
+        let reused_fp = vm.stack.sp;
+        assert_eq!(reused_fp, last_fp, "must reuse the same stack index");
+        push_frame(&mut vm, method, 0, ENTRY_FRAME_SENTINEL, 0);
+        let new_serial = current_frame(&vm).serial(&vm.stack);
+        assert_ne!(new_serial, last_serial);
+        assert!(new_serial > last_serial);
     }
 }

@@ -4,7 +4,8 @@
 //! included), which is what makes S7's exact stack scan free.
 
 use crate::oops::layout::{
-    FRAME_CONTEXT, FRAME_METHOD, FRAME_RECEIVER, FRAME_SAVED_BCI, FRAME_SAVED_FP, FRAME_TEMPS_BASE,
+    FRAME_CONTEXT, FRAME_MARKER, FRAME_MARKER_KIND_MASK, FRAME_METHOD, FRAME_RECEIVER,
+    FRAME_SAVED_BCI, FRAME_SAVED_FP, FRAME_SERIAL, FRAME_SERIAL_MASK, FRAME_TEMPS_BASE,
 };
 use crate::oops::smi::SmallInt;
 use crate::oops::wrappers::MethodOop;
@@ -123,6 +124,16 @@ impl ProcessStack {
     }
 }
 
+/// The kind of an armed `ensure:`/`ifCurtailed:` handler, packed into
+/// `FRAME_SERIAL`'s bit 32 (SPEC §5.4, S4) — meaningful only while
+/// `FRAME_MARKER` holds a `ClosureOop` (an armed handler), not while it
+/// holds `nil` or an `UnwindToken` (`ArrayOop`).
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum MarkerKind {
+    Ensure,
+    IfCurtailed,
+}
+
 /// A lightweight, `Copy` view onto one frame — holds no oops itself, so it
 /// cannot go stale across a push/pop that reallocates `ProcessStack`'s
 /// backing `Vec`.
@@ -151,6 +162,56 @@ impl Frame {
 
     pub fn context(self, st: &ProcessStack) -> Oop {
         st.get(self.fp + FRAME_CONTEXT)
+    }
+
+    pub fn set_context(self, st: &mut ProcessStack, c: Oop) {
+        st.set(self.fp + FRAME_CONTEXT, c);
+    }
+
+    fn serial_word(self, st: &ProcessStack) -> i64 {
+        SmallInt::try_from(st.get(self.fp + FRAME_SERIAL))
+            .expect("Frame::serial_word: not a smi")
+            .value()
+    }
+
+    /// The frame-serial this activation was pushed with (SPEC §5.4's
+    /// dead-home detection).
+    pub fn serial(self, st: &ProcessStack) -> u32 {
+        (self.serial_word(st) & FRAME_SERIAL_MASK) as u32
+    }
+
+    /// `nil` (no marker) | `ClosureOop` (an armed handler) | `ArrayOop` (an
+    /// `UnwindToken`, while that handler runs during an unwind).
+    pub fn marker(self, st: &ProcessStack) -> Oop {
+        st.get(self.fp + FRAME_MARKER)
+    }
+
+    /// Only meaningful while `marker()` is an armed handler closure.
+    pub fn marker_kind(self, st: &ProcessStack) -> MarkerKind {
+        if self.serial_word(st) & FRAME_MARKER_KIND_MASK != 0 {
+            MarkerKind::IfCurtailed
+        } else {
+            MarkerKind::Ensure
+        }
+    }
+
+    /// Read-modify-write: the serial slot's low 32 bits (the actual serial)
+    /// must survive — only the kind bit changes.
+    pub fn set_marker(self, st: &mut ProcessStack, m: Oop, kind: MarkerKind) {
+        let serial_bits = self.serial_word(st) & FRAME_SERIAL_MASK;
+        let kind_bit = match kind {
+            MarkerKind::Ensure => 0,
+            MarkerKind::IfCurtailed => FRAME_MARKER_KIND_MASK,
+        };
+        st.set(
+            self.fp + FRAME_SERIAL,
+            SmallInt::new(serial_bits | kind_bit).oop(),
+        );
+        st.set(self.fp + FRAME_MARKER, m);
+    }
+
+    pub fn clear_marker(self, st: &mut ProcessStack, nil: Oop) {
+        st.set(self.fp + FRAME_MARKER, nil);
     }
 
     /// The canonical receiver: the fast copy at `fp+4`. Distinct from the
@@ -260,6 +321,8 @@ mod tests {
         st.push(SmallInt::new(0).oop());
         st.push(vm.universe.nil_obj);
         st.push(recv);
+        st.push(SmallInt::new(0).oop()); // serial
+        st.push(vm.universe.nil_obj); // marker
         st.push(vm.universe.nil_obj); // temp index 2
         st.push(vm.universe.nil_obj); // temp index 3
 
@@ -273,6 +336,8 @@ mod tests {
         assert_eq!(fp - 1, frame.temp_index(&st, 1));
         assert_eq!(fp + FRAME_TEMPS_BASE, frame.temp_index(&st, 2));
         assert_eq!(fp + FRAME_TEMPS_BASE + 1, frame.temp_index(&st, 3));
+        assert_eq!(frame.serial(&st), 0);
+        assert_eq!(frame.marker(&st), vm.universe.nil_obj);
     }
 
     #[test]
@@ -305,8 +370,60 @@ mod tests {
         st.push(SmallInt::new(0).oop());
         st.push(vm.universe.nil_obj);
         st.push(recv);
+        st.push(SmallInt::new(0).oop()); // serial
+        st.push(vm.universe.nil_obj); // marker
         st.activate_frame(fp);
         // No temps, no operand pushes — sp == fp+FRAME_TEMPS_BASE exactly.
         let _ = st.pop();
+    }
+
+    #[test]
+    fn marker_accessors() {
+        let mut vm = test_vm();
+        let method = trivial_method(&mut vm, 0, 0);
+        let mut st = ProcessStack::with_capacity(64);
+        let recv = vm.universe.nil_obj;
+        st.push(recv);
+        let fp = st.sp;
+        st.push(method.oop());
+        st.push(SmallInt::new(ENTRY_FRAME_SENTINEL).oop());
+        st.push(SmallInt::new(0).oop());
+        st.push(vm.universe.nil_obj);
+        st.push(recv);
+        st.push(SmallInt::new(0xDEAD_u32 as i64).oop()); // serial
+        st.push(vm.universe.nil_obj); // marker
+        st.activate_frame(fp);
+
+        let frame = Frame { fp };
+        assert_eq!(frame.serial(&st), 0xDEAD);
+        assert_eq!(frame.marker(&st), vm.universe.nil_obj);
+
+        // A dummy "handler" Oop — set_marker/marker/marker_kind don't care
+        // what it actually is, just round-trip it.
+        let handler = SmallInt::new(42).oop();
+        frame.set_marker(&mut st, handler, MarkerKind::Ensure);
+        assert_eq!(frame.marker(&st), handler);
+        assert_eq!(frame.marker_kind(&st), MarkerKind::Ensure);
+        assert_eq!(
+            frame.serial(&st),
+            0xDEAD,
+            "serial bits must survive set_marker"
+        );
+
+        frame.set_marker(&mut st, handler, MarkerKind::IfCurtailed);
+        assert_eq!(frame.marker_kind(&st), MarkerKind::IfCurtailed);
+        assert_eq!(
+            frame.serial(&st),
+            0xDEAD,
+            "serial bits must survive a kind change"
+        );
+
+        frame.clear_marker(&mut st, vm.universe.nil_obj);
+        assert_eq!(frame.marker(&st), vm.universe.nil_obj);
+        assert_eq!(
+            frame.serial(&st),
+            0xDEAD,
+            "serial bits must survive clear_marker"
+        );
     }
 }

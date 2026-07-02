@@ -88,7 +88,8 @@ pub const METHOD_SIZE_INDEX: usize = 7; // smi: bytecode byte count
 /// Absolute byte offset of the first bytecode byte.
 pub const METHOD_BYTECODE_BYTE_OFFSET: usize = BODY_OFFSET + 8 * (METHOD_SIZE_INDEX + 1); // 80
 
-// flags packing — SPEC §4.4 "argc:4 | ntemps:8 | has_ctx:1 | is_block:1 | prim_fails:1"
+// flags packing — SPEC §4.4 (S4-extended) "argc:4 | ntemps:8 | has_ctx:1 |
+// is_block:1 | prim_fails:1 | captures_ctx:1 | nctx:8"
 pub const METHOD_FLAGS_ARGC_SHIFT: u32 = 0;
 pub const METHOD_FLAGS_ARGC_BITS: u32 = 4;
 pub const METHOD_FLAGS_NTEMPS_SHIFT: u32 = 4;
@@ -96,6 +97,9 @@ pub const METHOD_FLAGS_NTEMPS_BITS: u32 = 8;
 pub const METHOD_FLAGS_HAS_CTX_SHIFT: u32 = 12;
 pub const METHOD_FLAGS_IS_BLOCK_SHIFT: u32 = 13;
 pub const METHOD_FLAGS_PRIM_FAILS_SHIFT: u32 = 14;
+pub const METHOD_FLAGS_CAPTURES_CTX_SHIFT: u32 = 15;
+pub const METHOD_FLAGS_NCTX_SHIFT: u32 = 16;
+pub const METHOD_FLAGS_NCTX_BITS: u32 = 8;
 
 pub const METHOD_FLAGS_ARGC_MASK: i64 =
     ((1i64 << METHOD_FLAGS_ARGC_BITS) - 1) << METHOD_FLAGS_ARGC_SHIFT;
@@ -104,21 +108,75 @@ pub const METHOD_FLAGS_NTEMPS_MASK: i64 =
 pub const METHOD_FLAGS_HAS_CTX_MASK: i64 = 1 << METHOD_FLAGS_HAS_CTX_SHIFT;
 pub const METHOD_FLAGS_IS_BLOCK_MASK: i64 = 1 << METHOD_FLAGS_IS_BLOCK_SHIFT;
 pub const METHOD_FLAGS_PRIM_FAILS_MASK: i64 = 1 << METHOD_FLAGS_PRIM_FAILS_SHIFT;
+pub const METHOD_FLAGS_CAPTURES_CTX_MASK: i64 = 1 << METHOD_FLAGS_CAPTURES_CTX_SHIFT;
+pub const METHOD_FLAGS_NCTX_MASK: i64 =
+    ((1i64 << METHOD_FLAGS_NCTX_BITS) - 1) << METHOD_FLAGS_NCTX_SHIFT;
 
 pub const METHOD_ARGC_MAX: usize = (1 << METHOD_FLAGS_ARGC_BITS) - 1; // 15
 pub const METHOD_NTEMPS_MAX: usize = (1 << METHOD_FLAGS_NTEMPS_BITS) - 1; // 255
+pub const METHOD_NCTX_MAX: usize = (1 << METHOD_FLAGS_NCTX_BITS) - 1; // 255
 
-// --- frame layout (SPEC §5.1, S2/S3) ----------------------------------------
-// S4 inserts two slots (serial, marker) and moves FRAME_TEMPS_BASE to 7 —
-// never hard-code 5 outside this constant.
+// --- frame layout (SPEC §5.1, S2/S3, extended S4) ---------------------------
+// S4 inserts two slots (serial, marker); FRAME_TEMPS_BASE moved from 5 to 7 —
+// never hard-code either value outside this constant.
 
 pub const FRAME_METHOD: usize = 0;
 pub const FRAME_SAVED_FP: usize = 1;
 pub const FRAME_SAVED_BCI: usize = 2;
 pub const FRAME_CONTEXT: usize = 3;
 pub const FRAME_RECEIVER: usize = 4;
-pub const FRAME_TEMPS_BASE: usize = 5;
+/// Smi: bits 31:0 = the per-push frame serial (dead-home detection, SPEC
+/// §5.4); bit 32 = marker kind (0 = Ensure, 1 = IfCurtailed), meaningful
+/// only while `FRAME_MARKER` holds an armed handler closure. Read-modify-
+/// write only — `set_marker` must preserve bits 31:0.
+pub const FRAME_SERIAL: usize = 5;
+/// `nil` (no marker) | `ClosureOop` (an armed `ensure:`/`ifCurtailed:`
+/// handler) | `ArrayOop` (an `UnwindToken`, while a suspended NLR's handler
+/// runs) — SPEC §5.4.
+pub const FRAME_MARKER: usize = 6;
+pub const FRAME_TEMPS_BASE: usize = 7;
 pub const ENTRY_FRAME_SENTINEL: i64 = -1;
+
+pub const FRAME_SERIAL_BITS: u32 = 32;
+pub const FRAME_SERIAL_MASK: i64 = (1i64 << FRAME_SERIAL_BITS) - 1;
+pub const FRAME_MARKER_KIND_SHIFT: u32 = FRAME_SERIAL_BITS; // bit 32
+pub const FRAME_MARKER_KIND_MASK: i64 = 1i64 << FRAME_MARKER_KIND_SHIFT;
+
+// --- home reference packing (SPEC §5.4, S4) ---------------------------------
+// `proc:8 | serial:32 | fp:22` packed into one smi's 62-bit two's-complement
+// value space (SMI_BITS=62, i.e. SMI_MIN=-(2^61)..SMI_MAX=2^61-1 — the SAME
+// range a 62-bit signed integer covers). Field values with the top bit set
+// (e.g. proc=255) legitimately produce a *negative* smi; pack/unpack must
+// round-trip via sign-extension, never via a plain unsigned OR-then-hope-it-
+// fits (that silently exceeds SMI_MAX and panics `SmallInt::new` for proc
+// >= ~73).
+pub const HOME_REF_FP_BITS: u32 = 22;
+pub const HOME_REF_SERIAL_BITS: u32 = 32;
+pub const HOME_REF_PROC_BITS: u32 = 8;
+pub const HOME_REF_FP_SHIFT: u32 = 0;
+pub const HOME_REF_SERIAL_SHIFT: u32 = HOME_REF_FP_SHIFT + HOME_REF_FP_BITS; // 22
+pub const HOME_REF_PROC_SHIFT: u32 = HOME_REF_SERIAL_SHIFT + HOME_REF_SERIAL_BITS; // 54
+pub const HOME_REF_FP_MAX: usize = (1 << HOME_REF_FP_BITS) - 1;
+pub const HOME_REF_FP_MASK: u64 = ((1u64 << HOME_REF_FP_BITS) - 1) << HOME_REF_FP_SHIFT;
+pub const HOME_REF_SERIAL_MASK: u64 = ((1u64 << HOME_REF_SERIAL_BITS) - 1) << HOME_REF_SERIAL_SHIFT;
+pub const HOME_REF_PROC_MASK: u64 = ((1u64 << HOME_REF_PROC_BITS) - 1) << HOME_REF_PROC_SHIFT;
+/// All 62 packed bits — used to strip the sign-extension bits back off on
+/// unpack.
+pub const HOME_REF_ALL_MASK: u64 = HOME_REF_FP_MASK | HOME_REF_SERIAL_MASK | HOME_REF_PROC_MASK;
+
+// --- resume sentinels (SPEC §5.4, S4) ----------------------------------------
+// A `saved_bci` above any real bci — `debug_assert!(bytecode_len <
+// BCI_SENTINEL_BASE)` at method creation guarantees these can never collide
+// with a real bytecode index.
+pub const BCI_SENTINEL_BASE: usize = 0x7FFF_0000;
+pub const BCI_RESUME_ENSURE_RET: usize = 0x7FFF_0001;
+pub const BCI_RESUME_UNWIND: usize = 0x7FFF_0002;
+/// Not itself in SPEC's pseudocode, but required to detect "a
+/// `#cannotReturn:` handler returned normally" (SPEC §5.4 Algorithm 12: "if
+/// a user handler *returns*, the failed NLR cannot be resumed... print
+/// trace, terminate process") — without this sentinel, that return would
+/// silently resume wherever the escaping block happened to be.
+pub const BCI_RESUME_CANNOT_RETURN: usize = 0x7FFF_0003;
 
 // --- IC side table (SPEC §4.3) ----------------------------------------------
 // Stride 4 per site: [sel: Symbol][meta: smi argc:8|epoch:24][guard][target].
@@ -155,6 +213,21 @@ pub const COUNTERS_INVOCATION_MAX: i64 = 0xFFFF;
 // One named field (tally) then an indexable [k0,v0,k1,v1,...] tail.
 
 pub const METHODDICT_TALLY_INDEX: usize = 0;
+
+// --- BlockClosure (SPEC §2.3, S4) --------------------------------------------
+// 2 named fields (method, home) then an indexable [ncopied: smi][copied...]
+// tail (the generic Format::Closure size-slot shape from oops::heap).
+
+pub const CLOSURE_METHOD_INDEX: usize = 0;
+pub const CLOSURE_HOME_INDEX: usize = 1;
+pub const CLOSURE_NAMED_WORDS: usize = 2;
+
+// --- Context (SPEC §2.3, S4) -------------------------------------------------
+// 1 named field (home_hint) then an indexable [size: smi][slot...] tail (the
+// generic Format::Context size-slot shape from oops::heap).
+
+pub const CONTEXT_HOME_HINT_INDEX: usize = 0;
+pub const CONTEXT_NAMED_WORDS: usize = 1;
 
 #[cfg(test)]
 mod tests {

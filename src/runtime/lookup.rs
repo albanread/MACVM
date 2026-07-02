@@ -158,6 +158,7 @@ pub fn install_method(vm: &mut VmState, klass: KlassOop, selector: SymbolOop, m:
     let dict = dict.insert(vm, selector, m);
     klass.set_methods(dict.oop());
     m.set_holder(klass.oop());
+    patch_block_holders(klass.oop(), m);
 
     vm.lookup_cache.flush();
     vm.ic_epoch += 1;
@@ -165,6 +166,24 @@ pub fn install_method(vm: &mut VmState, klass: KlassOop, selector: SymbolOop, m:
         vm.ic_epoch < (1 << crate::oops::layout::IC_META_EPOCH_BITS),
         "install_method: ic_epoch wrapped past 24 bits"
     );
+}
+
+/// A `CompiledBlock` literal has no holder of its own at build time (its
+/// enclosing method isn't installed yet) — `install_method` patches every
+/// block transitively reachable through `m`'s literal pool (blocks can
+/// nest) so that a super send *inside* a block resolves against the right
+/// holder (`interpreter::ic::resolve` reads `caller.holder()`, and `caller`
+/// is the executing `CompiledBlock` itself for a send inside a block).
+fn patch_block_holders(klass_oop: Oop, m: MethodOop) {
+    let literals = m.literals();
+    for i in 0..literals.len() {
+        if let Some(blk) = MethodOop::try_from(literals.at(i)) {
+            if blk.is_block() {
+                blk.set_holder(klass_oop);
+                patch_block_holders(klass_oop, blk);
+            }
+        }
+    }
 }
 
 /// S7/S8's full-GC hook (Pitfalls: "LookupCache is address-keyed"). A moving

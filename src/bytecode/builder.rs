@@ -12,8 +12,8 @@
 use std::collections::HashMap;
 
 use crate::oops::layout::{
-    IC_GUARD_OFFSET, IC_META_ARGC_SHIFT, IC_META_OFFSET, IC_SEL_OFFSET, IC_STRIDE,
-    IC_TARGET_OFFSET, METHOD_ARGC_MAX, METHOD_NTEMPS_MAX,
+    BCI_SENTINEL_BASE, IC_GUARD_OFFSET, IC_META_ARGC_SHIFT, IC_META_OFFSET, IC_SEL_OFFSET,
+    IC_STRIDE, IC_TARGET_OFFSET, METHOD_ARGC_MAX, METHOD_NTEMPS_MAX,
 };
 use crate::oops::wrappers::{ArrayOop, MethodOop, SymbolOop};
 use crate::oops::Oop;
@@ -149,6 +149,21 @@ impl BytecodeBuilder {
         self
     }
 
+    /// `depth` counts `home_hint` hops (SPEC §5.4) — only `has_ctx` scopes,
+    /// never lexical block nesting.
+    pub fn push_ctx_temp(&mut self, depth: u8, idx: u8) -> &mut Self {
+        self.emit_u8(OP_PUSH_CTX_TEMP);
+        self.emit_u8(depth);
+        self.emit_u8(idx);
+        self
+    }
+    pub fn store_ctx_temp_pop(&mut self, depth: u8, idx: u8) -> &mut Self {
+        self.emit_u8(OP_STORE_CTX_TEMP_POP);
+        self.emit_u8(depth);
+        self.emit_u8(idx);
+        self
+    }
+
     /// `assoc` is an Association literal (SPEC §4.1: index 0 = key, index 1
     /// = value, pinned in `sprint_s01`'s genesis); `push_global` pushes its
     /// value, `store_global_pop` writes it.
@@ -180,6 +195,21 @@ impl BytecodeBuilder {
     }
     pub fn ret_self(&mut self) -> &mut Self {
         self.emit_u8(OP_RETURN_SELF);
+        self
+    }
+
+    /// A block's implicit fall-off-the-end return (SPEC §5.4, S4) — pops
+    /// TOS and delivers it to whoever `value`d the block; NOT a non-local
+    /// return (that's [`Self::nlr_tos`]).
+    pub fn block_return_tos(&mut self) -> &mut Self {
+        self.emit_u8(OP_BLOCK_RETURN_TOS);
+        self
+    }
+
+    /// `^expr` inside a block (SPEC §5.4, S4): pops TOS and non-locally
+    /// returns it to the block's *home* method activation.
+    pub fn nlr_tos(&mut self) -> &mut Self {
+        self.emit_u8(OP_NLR_TOS);
         self
     }
 
@@ -219,6 +249,56 @@ impl BytecodeBuilder {
 
     pub fn send_super(&mut self, selector: SymbolOop, argc: u8) -> &mut Self {
         self.emit_send(OP_SEND_SUPER, OP_SEND_SUPER_W, selector, argc)
+    }
+
+    // --- closures (SPEC §2.3, §4.2, §5.4, S4) -------------------------------
+
+    /// Builds a `CompiledBlock` (a `MethodOop` with `is_block=true`) via a
+    /// fresh nested builder session (`body` emits the block's own
+    /// bytecode), and interns it as a literal in `self` — the *enclosing*
+    /// (home) builder — returning its literal index for [`Self::push_closure`].
+    /// `holder` is patched later, transitively, by `install_method`
+    /// (`runtime::lookup`) once the enclosing method itself is installed —
+    /// never set here, since the enclosing method has no holder yet.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_block(
+        &mut self,
+        vm: &mut VmState,
+        argc: usize,
+        ntemps: usize,
+        has_ctx: bool,
+        nctx: usize,
+        captures_ctx: bool,
+        body: impl FnOnce(&mut BytecodeBuilder),
+    ) -> usize {
+        let blk = build_standalone_block(vm, argc, ntemps, has_ctx, nctx, captures_ctx, body);
+        self.intern_block_literal(blk)
+    }
+
+    /// Interns an already-built `CompiledBlock` (e.g. from
+    /// [`build_standalone_block`]) as a literal in `self`, returning its
+    /// index for [`Self::push_closure`]. The escape hatch nested block
+    /// building needs: [`Self::build_block`] cannot itself be called
+    /// re-entrantly (its `body` closure would need a second concurrent
+    /// `&mut VmState`) — build inner blocks standalone first, then intern
+    /// them into the outer block's own builder from *within* its `body`.
+    pub fn intern_block_literal(&mut self, blk: MethodOop) -> usize {
+        self.intern_literal(blk.oop())
+    }
+
+    /// `lit` must fit the opcode's `u8` literal-index operand (SPEC §4.2
+    /// pins `push_closure` narrow-only, no wide form) — methods with more
+    /// than 256 literals total and a block among the high ones are out of
+    /// scope for v1's hand-built/S5-compiled programs.
+    pub fn push_closure(&mut self, lit: usize, n_value_captures: u8) -> &mut Self {
+        debug_assert!(
+            lit <= u8::MAX as usize,
+            "push_closure: literal index {lit} exceeds the u8 operand"
+        );
+        self.emit_u8(OP_PUSH_CLOSURE);
+        self.emit_u8(lit as u8);
+        self.emit_u8(n_value_captures);
+        self
     }
 
     // --- control flow -----------------------------------------------------
@@ -328,6 +408,7 @@ impl BytecodeBuilder {
             ntemps <= METHOD_NTEMPS_MAX,
             "ntemps {ntemps} exceeds the 8-bit field"
         );
+        debug_assert_bci_sentinel_headroom(self.code.len());
         for (i, l) in self.labels.iter().enumerate() {
             if let LabelState::Unbound(_) = l {
                 panic!("BytecodeBuilder::finish: label {i} was never bound");
@@ -387,7 +468,7 @@ impl BytecodeBuilder {
 
         method.set_selector(selector.oop());
         method.set_holder(nil); // nil until S3 install
-        method.set_flags(argc, ntemps, false, false, false);
+        method.set_flags(argc, ntemps, false, false, false, false, 0);
         method.set_primitive(0);
         method.set_counters(0);
         method.set_literals(literals);
@@ -395,6 +476,41 @@ impl BytecodeBuilder {
 
         method
     }
+}
+
+/// Builds a `CompiledBlock` (a `MethodOop` with `is_block=true`) via a
+/// fresh nested builder session, WITHOUT interning it into any enclosing
+/// builder's literal pool — the caller does that separately (`build_block`
+/// does it immediately; nested block building does it from within an
+/// outer block's own `body` closure, see [`BytecodeBuilder::intern_block_literal`]).
+#[allow(clippy::too_many_arguments)]
+pub fn build_standalone_block(
+    vm: &mut VmState,
+    argc: usize,
+    ntemps: usize,
+    has_ctx: bool,
+    nctx: usize,
+    captures_ctx: bool,
+    body: impl FnOnce(&mut BytecodeBuilder),
+) -> MethodOop {
+    let mut inner = BytecodeBuilder::new();
+    body(&mut inner);
+    let sel = vm.universe.intern(b"aBlock"); // CompiledBlocks are never looked up by selector; a fixed placeholder.
+    let blk = inner.finish(vm, sel, argc, ntemps);
+    blk.set_flags(argc, ntemps, has_ctx, true, false, captures_ctx, nctx);
+    blk
+}
+
+/// A method's bytecode must never reach the BCI sentinel range
+/// (`oops::layout::BCI_SENTINEL_BASE`, S4) — those values are reserved to
+/// mark a suspended ensure/unwind resume point in a frame's `saved_bci`
+/// slot. Split out from `finish()` so the guard is testable without
+/// actually allocating a multi-GB bytecode stream.
+fn debug_assert_bci_sentinel_headroom(bytecode_len: usize) {
+    debug_assert!(
+        bytecode_len < BCI_SENTINEL_BASE,
+        "BytecodeBuilder::finish: bytecode_len {bytecode_len} reaches the BCI sentinel range"
+    );
 }
 
 #[cfg(test)]
@@ -535,5 +651,17 @@ mod tests {
 
         let m = b.finish(&mut vm, sel, 0, 0);
         assert_eq!(m.ics().len(), 0);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "reaches the BCI sentinel range")]
+    fn sentinel_bci_guard() {
+        debug_assert_bci_sentinel_headroom(crate::oops::layout::BCI_SENTINEL_BASE);
+    }
+
+    #[test]
+    fn sentinel_bci_guard_headroom_ok() {
+        debug_assert_bci_sentinel_headroom(crate::oops::layout::BCI_SENTINEL_BASE - 1);
     }
 }

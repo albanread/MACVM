@@ -12,7 +12,10 @@
 
 #![allow(unsafe_code)]
 
+pub mod closure;
+pub mod context;
 pub mod heap;
+pub mod home_ref;
 pub mod klass;
 pub mod layout;
 pub mod mark;

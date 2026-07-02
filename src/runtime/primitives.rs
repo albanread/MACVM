@@ -22,6 +22,12 @@ use std::io::Write;
 pub enum PrimResult {
     Ok(Oop),
     Fail,
+    /// The primitive already replaced the sender's continuation — pushed a
+    /// real frame and set `vm.regs` itself (SPEC §10, S4: the `value`
+    /// family, `ensure:`, `ifCurtailed:`). The interpreter's primitive-call
+    /// site must push NO result and just return to dispatch; pushing one
+    /// would corrupt the new frame's temp area by one slot.
+    Activated,
 }
 
 pub type PrimFn = fn(vm: &mut VmState, args: &[Oop]) -> PrimResult;
@@ -275,6 +281,62 @@ pub static PRIMITIVES: &[PrimDesc] = &[
         id: 45,
         name: "compare:",
         f: prim_compare,
+        argc: 1,
+        can_allocate: false,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 50,
+        name: "value",
+        f: prim_value0,
+        argc: 0,
+        can_allocate: false,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 51,
+        name: "value:",
+        f: prim_value1,
+        argc: 1,
+        can_allocate: false,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 52,
+        name: "value:value:",
+        f: prim_value2,
+        argc: 2,
+        can_allocate: false,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 53,
+        name: "value:value:value:",
+        f: prim_value3,
+        argc: 3,
+        can_allocate: false,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 54,
+        name: "valueWithArguments:",
+        f: prim_value_with_arguments,
+        argc: 1,
+        can_allocate: false,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 60,
+        name: "ensure:",
+        f: prim_ensure,
+        argc: 1,
+        can_allocate: false,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 61,
+        name: "ifCurtailed:",
+        f: prim_if_curtailed,
         argc: 1,
         can_allocate: false,
         can_fail: true,
@@ -670,6 +732,106 @@ fn prim_compare(_vm: &mut VmState, args: &[Oop]) -> PrimResult {
     PrimResult::Ok(SmallInt::new(r).oop())
 }
 
+// --- block-value group (SPEC §10, S4) ----------------------------------------
+// Layer boundary (sprint_s04_detail.md §Layer boundaries): the arrow from
+// runtime/ into interpreter/ is allowed ONLY for this Activated family —
+// these primitives never touch InterpRegs directly, they just delegate to
+// `interpreter::blocks::activate_block`.
+
+fn prim_value0(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    let Some(cl) = crate::oops::wrappers::ClosureOop::try_from(args[0]) else {
+        return PrimResult::Fail;
+    };
+    crate::interpreter::blocks::activate_block(vm, cl, 0)
+}
+
+fn prim_value1(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    let Some(cl) = crate::oops::wrappers::ClosureOop::try_from(args[0]) else {
+        return PrimResult::Fail;
+    };
+    crate::interpreter::blocks::activate_block(vm, cl, 1)
+}
+
+fn prim_value2(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    let Some(cl) = crate::oops::wrappers::ClosureOop::try_from(args[0]) else {
+        return PrimResult::Fail;
+    };
+    crate::interpreter::blocks::activate_block(vm, cl, 2)
+}
+
+fn prim_value3(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    let Some(cl) = crate::oops::wrappers::ClosureOop::try_from(args[0]) else {
+        return PrimResult::Fail;
+    };
+    crate::interpreter::blocks::activate_block(vm, cl, 3)
+}
+
+/// Spreads `args[1]` (an `Array` whose size must equal the block's argc) in
+/// place on the operand stack — pure stack surgery, no allocation. Checks
+/// the size *before* popping the array (Pitfalls: never allocate/mutate on
+/// a still-unvalidated argument).
+fn prim_value_with_arguments(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    let Some(cl) = crate::oops::wrappers::ClosureOop::try_from(args[0]) else {
+        return PrimResult::Fail;
+    };
+    let Some(arr) = ArrayOop::try_from(args[1]) else {
+        return PrimResult::Fail;
+    };
+    let n = arr.len();
+    if n != cl.method().argc() {
+        return PrimResult::Fail;
+    }
+    let array_slot = vm.prim_arg_base + 1;
+    vm.stack.sp = array_slot; // drop the Array argument itself
+    for i in 0..n {
+        vm.stack.push(arr.at(i));
+    }
+    crate::interpreter::blocks::activate_block(vm, cl, n)
+}
+
+/// SPEC §5.4 Algorithm 6: `ensure:`/`ifCurtailed:` both activate the
+/// receiver (the protected block, argc 0), then arm the handler as that
+/// *new* activation's marker — the marker lives on the protected block's
+/// own frame, never on a frame of its own for `ensure:` itself.
+fn prim_ensure_like(
+    vm: &mut VmState,
+    args: &[Oop],
+    kind: crate::interpreter::stack::MarkerKind,
+) -> PrimResult {
+    let Some(protected) = crate::oops::wrappers::ClosureOop::try_from(args[0]) else {
+        return PrimResult::Fail;
+    };
+    let Some(handler) = crate::oops::wrappers::ClosureOop::try_from(args[1]) else {
+        return PrimResult::Fail;
+    };
+    if protected.method().argc() != 0 || handler.method().argc() != 0 {
+        return PrimResult::Fail;
+    }
+    // `activate_block` computes the new frame's receiver-arg slot as
+    // `sp - argc - 1` on the CALLER's stack — but the caller's stack here
+    // still holds the handler as `ensure:`'s own keyword argument, one
+    // slot above `protected`. Drop it (already captured in `handler`
+    // above) so `sp - 1` lands on `protected`, matching a plain `value`
+    // send's stack shape exactly.
+    vm.stack.sp -= 1;
+    match crate::interpreter::blocks::activate_block(vm, protected, 0) {
+        PrimResult::Activated => {
+            let frame = crate::interpreter::stack::Frame { fp: vm.stack.fp };
+            frame.set_marker(&mut vm.stack, handler.oop(), kind);
+            PrimResult::Activated
+        }
+        other => other, // unreachable given the argc pre-check above; propagate defensively
+    }
+}
+
+fn prim_ensure(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    prim_ensure_like(vm, args, crate::interpreter::stack::MarkerKind::Ensure)
+}
+
+fn prim_if_curtailed(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    prim_ensure_like(vm, args, crate::interpreter::stack::MarkerKind::IfCurtailed)
+}
+
 // --- system group (dev hooks) --------------------------------------------------
 
 fn prim_quit(vm: &mut VmState, args: &[Oop]) -> PrimResult {
@@ -846,6 +1008,7 @@ mod tests {
                 assert_eq!(a.len(), 0);
             }
             PrimResult::Fail => panic!("basicNew on Array must not fail"),
+            PrimResult::Activated => unreachable!("basicNew never activates"),
         }
         assert_eq!(call(23, &mut vm, &[double_klass.oop()]), PrimResult::Fail);
 
@@ -927,5 +1090,93 @@ mod tests {
         assert_eq!(call(45, &mut vm, &[ab, abc]), PrimResult::Ok(smi(-1)));
         assert_eq!(call(45, &mut vm, &[abc, ab]), PrimResult::Ok(smi(1)));
         assert_eq!(call(45, &mut vm, &[ab, ab]), PrimResult::Ok(smi(0)));
+    }
+
+    /// A trivial `CompiledBlock` closure with `argc` args and no captures —
+    /// enough shape to drive `activate_block`'s argc check and frame push
+    /// without needing any real computation inside the block body.
+    fn make_block_closure(vm: &mut VmState, argc: usize) -> Oop {
+        let mut home = crate::bytecode::BytecodeBuilder::new();
+        let lit = home.build_block(vm, argc, argc, false, 0, false, |b| {
+            b.ret_self();
+        });
+        home.push_closure(lit, 0);
+        home.ret_tos();
+        let sel = vm.universe.intern(format!("mk{argc}").as_bytes());
+        let method = home.finish(vm, sel, 0, 0);
+        let recv = vm.universe.nil_obj;
+        crate::interpreter::run_method(vm, method, recv, &[])
+    }
+
+    #[test]
+    fn value_family_matrix() {
+        for argc in 0usize..=3 {
+            let mut vm = test_vm();
+            let closure_oop = make_block_closure(&mut vm, argc);
+            vm.stack.push(closure_oop);
+            for _ in 0..argc {
+                vm.stack.push(vm.universe.nil_obj);
+            }
+            vm.prim_arg_base = vm.stack.sp - argc - 1;
+            let mut buf = [vm.universe.nil_obj; 6];
+            for (i, slot) in buf.iter_mut().enumerate().take(argc + 1) {
+                *slot = vm.stack.get(vm.prim_arg_base + i);
+            }
+            let prim_id = 50 + argc as u16;
+            let result = call(prim_id, &mut vm, &buf[..=argc]);
+            assert_eq!(result, PrimResult::Activated, "argc={argc}");
+        }
+
+        // Non-closure receiver -> Fail, for every arity in the family.
+        for argc in 0usize..=3 {
+            let mut vm = test_vm();
+            let prim_id = 50 + argc as u16;
+            let mut buf = [smi(1); 4];
+            buf[0] = vm.universe.nil_obj; // not a Closure
+            let result = call(prim_id, &mut vm, &buf[..=argc]);
+            assert_eq!(result, PrimResult::Fail, "argc={argc}");
+        }
+    }
+
+    #[test]
+    fn value_with_arguments() {
+        let mut vm = test_vm();
+        let closure_oop = make_block_closure(&mut vm, 2);
+        let array_klass = vm.universe.array_klass;
+        let arr = crate::memory::alloc::alloc_indexable_oops(&mut vm, array_klass, 2);
+        arr.at_put(0, smi(10));
+        arr.at_put(1, smi(20));
+
+        vm.stack.push(closure_oop);
+        vm.stack.push(arr.oop());
+        vm.prim_arg_base = vm.stack.sp - 2;
+        let buf = [closure_oop, arr.oop()];
+        let result = call(54, &mut vm, &buf);
+        assert_eq!(result, PrimResult::Activated);
+        // The array's 2 elements must have been spread onto the stack in
+        // place of the array itself.
+        let fp = vm.stack.fp;
+        let frame = crate::interpreter::stack::Frame { fp };
+        assert_eq!(frame.temp(&vm.stack, 0), smi(10));
+        assert_eq!(frame.temp(&vm.stack, 1), smi(20));
+
+        // Size mismatch -> Fail, no stack surgery.
+        let mut vm2 = test_vm();
+        let closure_oop2 = make_block_closure(&mut vm2, 2);
+        let array_klass2 = vm2.universe.array_klass;
+        let arr2 = crate::memory::alloc::alloc_indexable_oops(&mut vm2, array_klass2, 3);
+        vm2.stack.push(closure_oop2);
+        vm2.stack.push(arr2.oop());
+        vm2.prim_arg_base = vm2.stack.sp - 2;
+        let sp_before = vm2.stack.sp;
+        let buf2 = [closure_oop2, arr2.oop()];
+        assert_eq!(call(54, &mut vm2, &buf2), PrimResult::Fail);
+        assert_eq!(vm2.stack.sp, sp_before, "Fail must not touch the stack");
+
+        // Non-Array argument -> Fail.
+        let mut vm3 = test_vm();
+        let closure_oop3 = make_block_closure(&mut vm3, 1);
+        let buf3 = [closure_oop3, smi(5)];
+        assert_eq!(call(54, &mut vm3, &buf3), PrimResult::Fail);
     }
 }

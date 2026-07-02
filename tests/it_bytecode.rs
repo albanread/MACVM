@@ -38,12 +38,14 @@ fn method_flags_pack() {
     b.ret_self();
     let sel = vm.universe.intern(b"m");
     let m = b.finish(&mut vm, sel, 15, 255);
-    m.set_flags(15, 255, true, true, true);
+    m.set_flags(15, 255, true, true, true, true, 255);
     assert_eq!(m.argc(), 15);
     assert_eq!(m.ntemps(), 255);
     assert!(m.has_ctx());
     assert!(m.is_block());
     assert!(m.prim_fails());
+    assert!(m.captures_ctx());
+    assert_eq!(m.nctx(), 255);
 }
 
 #[test]

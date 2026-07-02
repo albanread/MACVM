@@ -15,7 +15,9 @@ use crate::oops::layout::{
 };
 use crate::oops::mark::Mark;
 use crate::oops::smi::SmallInt;
-use crate::oops::wrappers::{ArrayOop, ByteArrayOop, DoubleOop, KlassOop, MemOop, MethodOop};
+use crate::oops::wrappers::{
+    ArrayOop, ByteArrayOop, ClosureOop, ContextOop, DoubleOop, KlassOop, MemOop, MethodOop,
+};
 use crate::oops::Oop;
 use crate::runtime::vm_state::VmState;
 
@@ -145,6 +147,41 @@ pub fn alloc_indexable_bytes(vm: &mut VmState, klass: KlassOop, nbytes: usize) -
     let nis = klass.non_indexable_size();
     let nil_fill = vm.universe.nil_obj;
     alloc_indexable_bytes_raw(&mut vm.universe.eden, nil_fill, klass.oop(), nis, nbytes)
+}
+
+/// A `BlockClosure` with `ncopied` captures, all initially `nil` (SPEC
+/// §2.3, S4). `method`/`home` are left `nil` too — the caller (`push_closure`)
+/// sets them immediately after, before any further allocation, per the S7
+/// choke-point pattern.
+pub fn alloc_closure(vm: &mut VmState, ncopied: usize) -> ClosureOop {
+    let klass = vm.universe.closure_klass;
+    let nis = klass.non_indexable_size();
+    let words = nis
+        .checked_add(1)
+        .and_then(|w| w.checked_add(ncopied))
+        .expect("alloc_closure: size overflow");
+    let obj = alloc_words(vm, words, klass.oop(), true);
+    let size_idx = nis - HEADER_WORDS;
+    obj.set_raw_body_word(size_idx, SmallInt::new(ncopied as i64).oop().raw());
+    // SAFETY: freshly allocated with klass's Closure shape.
+    unsafe { ClosureOop::from_oop_unchecked(obj.oop()) }
+}
+
+/// A `Context` with `nctx` slots, all initially `nil`, and `home_hint` nil
+/// (SPEC §2.3, §5.4, S4) — the caller sets `home_hint` explicitly when the
+/// enclosing chain is non-empty.
+pub fn alloc_context(vm: &mut VmState, nctx: usize) -> ContextOop {
+    let klass = vm.universe.context_klass;
+    let nis = klass.non_indexable_size();
+    let words = nis
+        .checked_add(1)
+        .and_then(|w| w.checked_add(nctx))
+        .expect("alloc_context: size overflow");
+    let obj = alloc_words(vm, words, klass.oop(), true);
+    let size_idx = nis - HEADER_WORDS;
+    obj.set_raw_body_word(size_idx, SmallInt::new(nctx as i64).oop().raw());
+    // SAFETY: freshly allocated with klass's Context shape.
+    unsafe { ContextOop::from_oop_unchecked(obj.oop()) }
 }
 
 pub fn alloc_double(vm: &mut VmState, v: f64) -> DoubleOop {
