@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use crate::oops::klass::Format;
 use crate::oops::layout::HEADER_WORDS;
-use crate::oops::wrappers::{KlassOop, MemOop, MethodOop};
+use crate::oops::wrappers::{KlassOop, MemOop};
 use crate::oops::Oop;
 use crate::runtime::vm_state::VmState;
 
@@ -419,11 +419,7 @@ pub fn scavenge(vm: &mut VmState) -> Result<ScavengeReport, GcStallError> {
     if std::env::var("MACVM_DBG_ROOTS").is_ok() {
         audit_roots(vm);
     }
-    scavenge_well_known_roots(vm);
-    scavenge_symbol_table_roots(vm);
-    scavenge_process_stack_roots(vm);
-    scavenge_handle_arena_roots(vm);
-    scavenge_interp_regs_roots(vm);
+    super::roots::for_each_root(vm, scavenge_oop);
     dirty_card_scan(vm, old_top_before);
 
     if let Some(err) = vm.universe.pending_stall.take() {
@@ -539,122 +535,21 @@ fn poison_range(start: usize, end: usize) {
     }
 }
 
-fn scavenge_well_known_roots(vm: &mut VmState) {
-    vm.universe.nil_obj = scavenge_oop(vm, vm.universe.nil_obj);
-    vm.universe.true_obj = scavenge_oop(vm, vm.universe.true_obj);
-    vm.universe.false_obj = scavenge_oop(vm, vm.universe.false_obj);
-    vm.universe.smalltalk = scavenge_oop(vm, vm.universe.smalltalk);
-
-    // The well-known SELECTOR fields are roots too (S7-10 root-scan gap):
-    // the Symbols themselves survive via the symbol-table root, but these
-    // are separate Universe-field copies of their addresses — unscanned,
-    // they dangle after the first scavenge and every DNU/mustBeBoolean/
-    // cannotReturn send thereafter reads a garbage selector.
-    macro_rules! scav_sel {
-        ($($f:ident),* $(,)?) => {
-            $(
-                let s = vm.universe.$f.oop();
-                let ns = scavenge_oop(vm, s);
-                vm.universe.$f = crate::oops::wrappers::SymbolOop::try_from(ns)
-                    .expect(concat!(stringify!($f), " must stay symbol-shaped"));
-            )*
-        };
-    }
-    scav_sel!(
-        sel_does_not_understand,
-        sel_must_be_boolean,
-        sel_cannot_return
-    );
-
-    macro_rules! scav_klass {
-        ($($f:ident),* $(,)?) => {
-            $(
-                let k = vm.universe.$f.oop();
-                let nk = scavenge_oop(vm, k);
-                vm.universe.$f = KlassOop::try_from(nk).expect(concat!(stringify!($f), " must stay klass-shaped"));
-            )*
-        };
-    }
-    scav_klass!(
-        metaclass_klass,
-        class_klass,
-        object_klass,
-        undefined_object_klass,
-        boolean_klass,
-        true_klass,
-        false_klass,
-        smi_klass,
-        character_klass,
-        double_klass,
-        string_klass,
-        symbol_klass,
-        array_klass,
-        bytearray_klass,
-        association_klass,
-        methoddict_klass,
-        method_klass,
-        closure_klass,
-        context_klass,
-        process_klass,
-        message_klass,
-        large_pos_int_klass,
-        large_neg_int_klass,
-        behavior_klass,
-        magnitude_klass,
-        number_klass,
-        integer_klass,
-        large_integer_klass,
-        collection_klass,
-        sequenceable_collection_klass,
-        arrayed_collection_klass,
-        system_dictionary_klass,
-    );
-}
-
-fn scavenge_symbol_table_roots(vm: &mut VmState) {
-    let n = vm.universe.symbols.buckets.len();
-    for i in 0..n {
-        if let Some(sym) = vm.universe.symbols.buckets[i] {
-            vm.universe.symbols.buckets[i] = Some(scavenge_oop(vm, sym));
-        }
-    }
-}
-
-/// Every live slot `0..sp` of the process stack — smi-encoded fp/bci
-/// links pass through `scavenge_oop` unchanged (SPEC §5.1's exact-stack
-/// invariant, `interpreter::stack`'s own doc comment: "every slot is a
-/// valid oop at all times", which is what makes this scan free of any
-/// frame-shape knowledge).
-fn scavenge_process_stack_roots(vm: &mut VmState) {
-    let sp = vm.stack.sp;
-    for i in 0..sp {
-        let v = vm.stack.get(i);
-        let nv = scavenge_oop(vm, v);
-        vm.stack.set(i, nv);
-    }
-}
-
-/// S7-9 / SPEC §7.6: every live `handles::Handle` root. The arena is only
-/// ever shrunk by `HandleScope::drop` (lesson 9) — GC rewrites slots in
-/// place, never truncates.
-fn scavenge_handle_arena_roots(vm: &mut VmState) {
-    let n = vm.handle_arena.len();
-    let dbg = std::env::var("MACVM_DBG_ROOTS").is_ok();
-    for i in 0..n {
-        let v = vm.handle_arena.slots_mut()[i];
-        if dbg {
-            eprintln!("RDBG scanning handle[{i}] = {:#x}", v.raw());
-        }
-        let nv = scavenge_oop(vm, v);
-        vm.handle_arena.slots_mut()[i] = nv;
-    }
-}
-
 /// `MACVM_DBG_ROOTS=1`: pre-scan sanity audit — every root must point at
 /// something with a plausible (mark-tagged, sentinel-set, unforwarded)
 /// header at scavenge entry. A failure here names the STALE ROOT SOURCE
 /// directly, which the exit verifier (seeing only the wreckage the chase
 /// left behind) cannot.
+///
+/// Deliberately NOT built on `for_each_root` despite enumerating the same
+/// sources: this is a debug-only diagnostic that needs a source LABEL per
+/// root ("nil", "sel_dnu", "handle[3]", ...) to name the offender, and
+/// `for_each_root`'s generic transform has no slot for that without adding
+/// complexity to the correctness-critical shared path for a developer
+/// convenience. This is therefore the one place still hand-listing roots —
+/// low risk (read-only, opt-in, never gates correctness) but a source added
+/// to `for_each_root` should ideally be mirrored here too or this audit
+/// silently stops covering it.
 fn audit_roots(vm: &mut VmState) {
     let plausible = |o: Oop| -> bool {
         if !o.is_mem() {
@@ -699,23 +594,6 @@ fn audit_roots(vm: &mut VmState) {
         if !plausible(m.oop()) {
             eprintln!("RDBG STALE ROOT regs.method = {:#x}", m.oop().raw());
         }
-    }
-}
-
-/// `vm.regs.method` — the interpreter's "currently executing method"
-/// mirror — is a root in its own right: the dispatch loop fetches
-/// bytecode through it (via its own local copy, re-read at every
-/// boundary), and `send_generic`/`ic_transition`/the unwind machinery
-/// read it directly between allocations. The FRAME's method slot is
-/// already covered by the process-stack scan, but the mirror is a
-/// separate copy the stack scan never touches — without this it dangles
-/// into from-space after the first mid-dispatch scavenge (found by the
-/// S7-10 `MACVM_GC_STRESS=1` audit).
-fn scavenge_interp_regs_roots(vm: &mut VmState) {
-    if let Some(m) = vm.regs.method {
-        let nm = scavenge_oop(vm, m.oop());
-        vm.regs.method =
-            Some(MethodOop::try_from(nm).expect("regs.method must stay method-shaped"));
     }
 }
 

@@ -19,6 +19,7 @@ pub mod layout;
 pub mod offsets;
 pub mod print;
 pub mod reservation;
+pub mod roots;
 pub mod scavenge;
 pub mod spaces;
 pub mod stall;
