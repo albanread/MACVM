@@ -11,9 +11,9 @@
 //! forwarded.
 
 use super::layout::{
-    MARK_AGE_MASK, MARK_AGE_MAX, MARK_AGE_SHIFT, MARK_HASH_MASK, MARK_HASH_SHIFT,
-    MARK_NEAR_DEATH_MASK, MARK_PRISTINE, MARK_SENTINEL_MASK, MARK_TAG, MARK_TAGGED_CONTENTS_MASK,
-    MEM_TAG, TAG_MASK,
+    MARK_AGE_MASK, MARK_AGE_MAX, MARK_AGE_SHIFT, MARK_GC_MARK_MASK, MARK_HASH_MASK,
+    MARK_HASH_SHIFT, MARK_NEAR_DEATH_MASK, MARK_PRISTINE, MARK_SENTINEL_MASK, MARK_TAG,
+    MARK_TAGGED_CONTENTS_MASK, MEM_TAG, TAG_MASK,
 };
 use super::Oop;
 
@@ -106,6 +106,27 @@ impl Mark {
         }
     }
 
+    /// The full-GC mark bit (SPEC §2.2 bit 44, S8). Set only *between* the
+    /// mark and forwarding-compute phases of a full GC to record liveness;
+    /// **INVARIANT 0** for the mutator and at every other time — `verify_heap`
+    /// and the mark-word field-isolation unit test assert it stays clear
+    /// outside a collection, and `is_pristine` (a freshly allocated header)
+    /// implies it is clear.
+    #[inline]
+    pub fn gc_mark(self) -> bool {
+        self.0 & MARK_GC_MARK_MASK != 0
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn with_gc_mark(self, v: bool) -> Mark {
+        if v {
+            Mark(self.0 | MARK_GC_MARK_MASK)
+        } else {
+            Mark(self.0 & !MARK_GC_MARK_MASK)
+        }
+    }
+
     #[inline]
     pub fn is_pristine(self) -> bool {
         self.0 == MARK_PRISTINE
@@ -192,6 +213,37 @@ mod tests {
         assert!(m2.tagged_contents());
         assert_eq!(m2.age(), 64);
         assert_eq!(m2.hash(), 1);
+    }
+
+    #[test]
+    fn mark_gc_mark_bit() {
+        // Pristine (freshly allocated) is unmarked.
+        assert!(!Mark::pristine().gc_mark());
+
+        // Set/clear round-trips, and setting it disturbs no other field —
+        // even a fully-populated mark word.
+        let base = Mark::pristine()
+            .with_age(127)
+            .with_hash(0xDEAD_BEEF)
+            .with_near_death(true)
+            .with_tagged_contents(true);
+        let marked = base.with_gc_mark(true);
+        assert!(marked.gc_mark());
+        assert_eq!(marked.age(), 127);
+        assert_eq!(marked.hash(), 0xDEAD_BEEF);
+        assert!(marked.near_death());
+        assert!(marked.tagged_contents());
+        assert_eq!(marked.word() & TAG_MASK, MARK_TAG);
+        assert_ne!(marked.word() & MARK_SENTINEL_MASK, 0);
+
+        // Clearing restores the exact pre-mark word (invariant-0 outside GC).
+        let cleared = marked.with_gc_mark(false);
+        assert!(!cleared.gc_mark());
+        assert_eq!(cleared.word(), base.word());
+
+        // The other setters never touch bit 44 (mirrors the `>> 44 == 0`
+        // assertions in the field-isolation tests).
+        assert!(!base.gc_mark());
     }
 
     #[test]
