@@ -19,3 +19,4 @@ ci: lint test
 gate-s00: ci
 gate-s01: ci
 gate-s02: ci
+gate-s03: ci

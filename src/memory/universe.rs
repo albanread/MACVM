@@ -58,12 +58,20 @@ pub struct Universe {
     pub closure_klass: KlassOop,
     pub context_klass: KlassOop,
     pub process_klass: KlassOop,
+    /// 2 named slots: `selector`, `arguments` — built by the DNU path
+    /// (`interpreter::send`, S3) and handed to `#doesNotUnderstand:`.
+    pub message_klass: KlassOop,
 
     /// The global namespace. `nil` until S5's loader populates it.
     pub smalltalk: Oop,
 
     pub symbols: SymbolTable,
     hash_counter: u32,
+
+    // --- well-known selectors (S3, SPEC §6.3/§4.2) --------------------------
+    pub sel_does_not_understand: SymbolOop,
+    pub sel_must_be_boolean: SymbolOop,
+    pub sel_cannot_return: SymbolOop,
 }
 
 /// Default eden size *(tunable)* — SPEC §7.1.
@@ -275,12 +283,14 @@ impl Universe {
             false,
             HEADER_WORDS + 2
         );
+        // One named field (tally: smi) before the indexable [k,v,k,v,...]
+        // tail (S3's MethodDictOop).
         let methoddict_klass = remaining_klass!(
             "MethodDictionary",
             object_klass.oop(),
             Format::IndexableOops,
             false,
-            HEADER_WORDS
+            HEADER_WORDS + 1
         );
         let method_klass = remaining_klass!(
             "CompiledMethod",
@@ -309,6 +319,13 @@ impl Universe {
             Format::Process,
             true,
             HEADER_WORDS
+        );
+        let message_klass = remaining_klass!(
+            "Message",
+            object_klass.oop(),
+            Format::Slots,
+            false,
+            HEADER_WORDS + 2
         );
 
         // Association's named instance variables: #key #value.
@@ -341,6 +358,27 @@ impl Universe {
             ivn.set_raw_body_word(1, value_sym.oop().raw());
             character_klass.set_inst_var_names(ivn.oop());
         }
+        // Message's named instance variables: #selector #arguments.
+        {
+            let selector_sym = name_of(&mut eden, &mut symbols, "selector");
+            let arguments_sym = name_of(&mut eden, &mut symbols, "arguments");
+            let ivn = alloc::alloc_words_raw(
+                &mut eden,
+                nil,
+                HEADER_WORDS + 1 + 2,
+                array_klass.oop(),
+                true,
+            );
+            ivn.set_raw_body_word(0, SmallInt::new(2).oop().raw());
+            ivn.set_raw_body_word(1, selector_sym.oop().raw());
+            ivn.set_raw_body_word(2, arguments_sym.oop().raw());
+            message_klass.set_inst_var_names(ivn.oop());
+        }
+
+        // --- step 9b: well-known selectors (S3, SPEC §6.3/§4.2) -------------------
+        let sel_does_not_understand = name_of(&mut eden, &mut symbols, "doesNotUnderstand:");
+        let sel_must_be_boolean = name_of(&mut eden, &mut symbols, "mustBeBoolean");
+        let sel_cannot_return = name_of(&mut eden, &mut symbols, "cannotReturn:");
 
         // --- step 10: true/false --------------------------------------------------
         let true_obj = alloc::alloc_words_raw(&mut eden, nil, HEADER_WORDS, true_klass.oop(), true);
@@ -379,9 +417,13 @@ impl Universe {
             closure_klass,
             context_klass,
             process_klass,
+            message_klass,
             smalltalk,
             symbols,
             hash_counter,
+            sel_does_not_understand,
+            sel_must_be_boolean,
+            sel_cannot_return,
         };
 
         // --- step 12: verify -------------------------------------------------------
@@ -394,10 +436,10 @@ impl Universe {
     /// superclass's metaclass chain, and intern+patch its name. The helper
     /// genesis itself uses (`new_klass_core`) taking explicit pieces rather
     /// than `&mut Universe` — genesis has no live `Universe` to borrow yet.
-    /// This method is the crate-visible, post-genesis entry point S5's
-    /// `subclass:` (and this sprint's `new_klass_regular_path` test) drive.
-    #[allow(dead_code)] // exercised by tests now; S5's subclass: calls it for real
-    pub(crate) fn new_klass(
+    /// This is the post-genesis entry point S5's `subclass:` drives; `pub`
+    /// (not `pub(crate)`) so S3's integration tests can build fresh test
+    /// hierarchies too, without waiting on the real `subclass:` bytecode.
+    pub fn new_klass(
         &mut self,
         superclass: KlassOop,
         name: &str,
@@ -522,6 +564,13 @@ fn intern_core(
     }
     // SAFETY: freshly allocated with klass = symbol_klass.
     let sym = unsafe { SymbolOop::from_oop_unchecked(sym.oop()) };
+
+    // Eager identity hash (S3's MethodDictionary/LookupCache probing must
+    // never mutate a mark word mid-probe): derived from the content hash
+    // already computed above, `| 1` guarantees nonzero (0 = unassigned,
+    // SPEC §2.2) unconditionally regardless of the input.
+    let mem = sym.as_mem();
+    mem.set_mark(mem.mark().with_hash((hash as u32) | 1));
 
     insert(symbols, hash, sym.oop());
 
@@ -663,6 +712,7 @@ mod tests {
             u.closure_klass,
             u.context_klass,
             u.process_klass,
+            u.message_klass,
         ];
         for k in klasses {
             assert!(k.oop().is_mem());

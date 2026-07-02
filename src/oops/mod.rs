@@ -16,6 +16,7 @@ pub mod heap;
 pub mod klass;
 pub mod layout;
 pub mod mark;
+pub mod method_dict;
 pub mod smi;
 pub mod wrappers;
 

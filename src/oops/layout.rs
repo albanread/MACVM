@@ -108,6 +108,54 @@ pub const METHOD_FLAGS_PRIM_FAILS_MASK: i64 = 1 << METHOD_FLAGS_PRIM_FAILS_SHIFT
 pub const METHOD_ARGC_MAX: usize = (1 << METHOD_FLAGS_ARGC_BITS) - 1; // 15
 pub const METHOD_NTEMPS_MAX: usize = (1 << METHOD_FLAGS_NTEMPS_BITS) - 1; // 255
 
+// --- frame layout (SPEC §5.1, S2/S3) ----------------------------------------
+// S4 inserts two slots (serial, marker) and moves FRAME_TEMPS_BASE to 7 —
+// never hard-code 5 outside this constant.
+
+pub const FRAME_METHOD: usize = 0;
+pub const FRAME_SAVED_FP: usize = 1;
+pub const FRAME_SAVED_BCI: usize = 2;
+pub const FRAME_CONTEXT: usize = 3;
+pub const FRAME_RECEIVER: usize = 4;
+pub const FRAME_TEMPS_BASE: usize = 5;
+pub const ENTRY_FRAME_SENTINEL: i64 = -1;
+
+// --- IC side table (SPEC §4.3) ----------------------------------------------
+// Stride 4 per site: [sel: Symbol][meta: smi argc:8|epoch:24][guard][target].
+
+pub const IC_STRIDE: usize = 4;
+pub const IC_SEL_OFFSET: usize = 0;
+pub const IC_META_OFFSET: usize = 1;
+pub const IC_GUARD_OFFSET: usize = 2;
+pub const IC_TARGET_OFFSET: usize = 3;
+
+pub const IC_META_ARGC_SHIFT: u32 = 0;
+pub const IC_META_ARGC_BITS: u32 = 8;
+pub const IC_META_EPOCH_SHIFT: u32 = 8;
+pub const IC_META_EPOCH_BITS: u32 = 24;
+pub const IC_META_ARGC_MASK: i64 = ((1i64 << IC_META_ARGC_BITS) - 1) << IC_META_ARGC_SHIFT;
+pub const IC_META_EPOCH_MASK: i64 = ((1i64 << IC_META_EPOCH_BITS) - 1) << IC_META_EPOCH_SHIFT;
+pub const IC_EPOCH_MAX: u32 = (1 << IC_META_EPOCH_BITS) - 1;
+
+/// Guard-slot sentinels distinguishing poly/mega from a mono `KlassOop`
+/// guard (a real klass oop is always mem-tagged, tag 01; these are smis,
+/// tag 00, so the two families can never collide).
+pub const IC_GUARD_POLY: i64 = 1;
+pub const IC_GUARD_MEGA: i64 = 2;
+
+pub const IC_POLY_MAX_PAIRS: usize = 4;
+pub const IC_POLY_ARRAY_LEN: usize = IC_POLY_MAX_PAIRS * 2;
+
+// --- method counters (SPEC §4.4) --------------------------------------------
+
+pub const COUNTERS_INVOCATION_MASK: i64 = 0xFFFF;
+pub const COUNTERS_INVOCATION_MAX: i64 = 0xFFFF;
+
+// --- MethodDictionary (SPEC §2.4, S3) ---------------------------------------
+// One named field (tally) then an indexable [k0,v0,k1,v1,...] tail.
+
+pub const METHODDICT_TALLY_INDEX: usize = 0;
+
 #[cfg(test)]
 mod tests {
     use super::*;

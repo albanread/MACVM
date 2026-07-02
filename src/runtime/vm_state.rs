@@ -3,9 +3,13 @@
 //! options env parsing produces; later sprints add process/stack state.
 
 use std::collections::HashSet;
+use std::io::Write;
+use std::time::Instant;
 
 use crate::interpreter::stack::{ProcessStack, DEFAULT_STACK_CAPACITY};
 use crate::memory::Universe;
+use crate::oops::wrappers::MethodOop;
+use crate::runtime::lookup::LookupCache;
 
 /// Which `MACVM_TRACE` channels are enabled. The channel set is open-ended
 /// (CONVENTIONS §3); S1 only stores membership, nothing reads it yet.
@@ -27,6 +31,39 @@ impl TraceFlags {
 
     pub fn is_enabled(&self, channel: &str) -> bool {
         self.channels.contains(channel)
+    }
+}
+
+/// A `Write` sink backed by a shared `Vec<u8>` — what tests substitute for
+/// `VmState::out` (stdout by default) so transcript assertions work without
+/// a subprocess, before S5's golden-transcript runner exists. `Clone`s share
+/// the same buffer (an `Arc<Mutex<_>>`), so a test can install one half via
+/// `vm.out = Box::new(buf.clone())` and read the other after running.
+#[derive(Clone, Default)]
+pub struct OutputBuffer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl OutputBuffer {
+    pub fn new() -> OutputBuffer {
+        OutputBuffer::default()
+    }
+
+    pub fn contents(&self) -> Vec<u8> {
+        self.0.lock().unwrap().clone()
+    }
+
+    pub fn as_string(&self) -> String {
+        String::from_utf8_lossy(&self.contents()).into_owned()
+    }
+}
+
+impl Write for OutputBuffer {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 
@@ -62,6 +99,22 @@ impl Default for VmOptions {
     }
 }
 
+/// The currently executing activation's bytecode position and method,
+/// mirrored into `VmState` (S3, SPEC §5.3 design) so `interpreter::send`,
+/// `runtime::lookup`, and `runtime::error` can read/write it without the
+/// dispatch loop threading `method`/`bci` through every call. `fp`/`sp`
+/// deliberately stay OUT of this struct and live only on `VmState::stack`
+/// (`ProcessStack::fp`/`sp`) — mirroring them here would be a second source
+/// of truth for the same state. `method` is `None` only before the first
+/// activation of a freshly booted `VmState`; every send/DNU helper that
+/// reads it is called while dispatch is active, so `.expect(...)` at the
+/// read site documents that invariant.
+#[derive(Copy, Clone, Default)]
+pub struct InterpRegs {
+    pub bci: usize,
+    pub method: Option<MethodOop>,
+}
+
 pub struct VmState {
     pub universe: Universe,
     pub options: VmOptions,
@@ -77,6 +130,35 @@ pub struct VmState {
     /// so the signature `return_from_frame(vm, result) -> Option<Oop>` the
     /// interfaces doc pins doesn't need to carry the resume bci itself.
     pub(crate) resume_bci: usize,
+    /// The active send/DNU's view of "where execution currently is" (SPEC
+    /// §5.3, S3). Written by the dispatch loop immediately before every
+    /// `send`/`send_super`; read by `interpreter::send`'s super-lookup
+    /// (`regs.method.holder()`) and by `runtime::error::print_stack_trace`
+    /// for the top frame's `@<bci>`.
+    pub regs: InterpRegs,
+    /// The global IC dependency-versioning counter (SPEC §6.2, coarsened —
+    /// see `sprint_s03_detail.md`'s SPEC-QUESTION). Bumped by every
+    /// `install_method`; an IC entry is current iff its stamped epoch
+    /// equals this. `debug_assert!(ic_epoch < 1 << 24)` at the bump site —
+    /// wraparound is an accepted, unreachable-in-v1 ABA risk.
+    pub ic_epoch: u32,
+    pub lookup_cache: LookupCache,
+    /// `sp - argc - 1` at the moment a primitive was entered — lets
+    /// `VmState::prim_arg` re-read a live stack slot instead of the
+    /// `[Oop; 6]` copy handed to the `PrimFn`, which primitives with
+    /// `can_allocate = true` must do after their first allocating call
+    /// (SPEC §10, the S7 choke-point pattern).
+    pub prim_arg_base: usize,
+    /// Where guest-visible output goes (`printOnStdout:`, S3's dev-hook
+    /// primitive group). Stdout by default; tests substitute a `Vec<u8>` so
+    /// transcript assertions don't need a subprocess before S5's golden
+    /// runner exists.
+    pub out: Box<dyn Write>,
+    /// Set by the `quit` primitive; the dispatch loop exits (after the
+    /// current activation returns) once this is true.
+    pub exit_requested: bool,
+    /// VM boot time, for the `millisecondClock` primitive.
+    pub start_instant: Instant,
 }
 
 impl VmState {
@@ -95,7 +177,21 @@ impl VmState {
             stack: ProcessStack::with_capacity(DEFAULT_STACK_CAPACITY),
             pending: false,
             resume_bci: 0,
+            regs: InterpRegs::default(),
+            ic_epoch: 0,
+            lookup_cache: LookupCache::new(),
+            prim_arg_base: 0,
+            out: Box::new(std::io::stdout()),
+            exit_requested: false,
+            start_instant: Instant::now(),
         }
+    }
+
+    /// Re-reads live stack slot `prim_arg_base + i` — the choke-point a
+    /// `can_allocate` primitive must use instead of its `args` copy after
+    /// any allocating call (SPEC §10 Pitfalls).
+    pub fn prim_arg(&self, i: usize) -> crate::oops::Oop {
+        self.stack.get(self.prim_arg_base + i)
     }
 }
 

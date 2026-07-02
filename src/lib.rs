@@ -15,8 +15,7 @@
 pub mod bytecode; // opcode set, CompiledMethod, builder, disassembler
 pub mod compiler; // adaptive optimizing compiler + abstract codegen
 pub mod interpreter; // baseline threaded-code interpreter
-pub mod lookup; // method lookup, inline caches, PICs, type feedback
 pub mod memory; // object memory, allocation, garbage collection
 pub mod oops; // object references, tagging, 2-word headers, classes
-pub mod runtime; // stacks, activation frames, deoptimization
+pub mod runtime; // stacks, activation frames, method lookup, inline caches, primitives
 pub mod utils; // shared utilities

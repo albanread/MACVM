@@ -11,7 +11,10 @@
 
 use std::collections::HashMap;
 
-use crate::oops::layout::{METHOD_ARGC_MAX, METHOD_NTEMPS_MAX};
+use crate::oops::layout::{
+    IC_GUARD_OFFSET, IC_META_ARGC_SHIFT, IC_META_OFFSET, IC_SEL_OFFSET, IC_STRIDE,
+    IC_TARGET_OFFSET, METHOD_ARGC_MAX, METHOD_NTEMPS_MAX,
+};
 use crate::oops::wrappers::{ArrayOop, MethodOop, SymbolOop};
 use crate::oops::Oop;
 use crate::runtime::vm_state::VmState;
@@ -32,6 +35,7 @@ pub struct BytecodeBuilder {
     literals: Vec<Oop>,
     literal_index: HashMap<u64, usize>,
     n_ics: usize,
+    ic_sites: Vec<(SymbolOop, u8)>,
     labels: Vec<LabelState>,
 }
 
@@ -48,6 +52,7 @@ impl BytecodeBuilder {
             literals: Vec::new(),
             literal_index: HashMap::new(),
             n_ics: 0,
+            ic_sites: Vec::new(),
             labels: Vec::new(),
         }
     }
@@ -176,6 +181,44 @@ impl BytecodeBuilder {
     pub fn ret_self(&mut self) -> &mut Self {
         self.emit_u8(OP_RETURN_SELF);
         self
+    }
+
+    // --- sends (SPEC §5.3, S3) ---------------------------------------------
+
+    /// Appends a new 4-word IC site for `(selector, argc)` and returns its
+    /// index — the low-level primitive `send`/`send_super` build on.
+    pub fn add_send(&mut self, selector: SymbolOop, argc: u8) -> u16 {
+        let idx = self.n_ics;
+        assert!(idx <= u16::MAX as usize, "add_send: too many send sites");
+        self.n_ics += 1;
+        self.ic_sites.push((selector, argc));
+        idx as u16
+    }
+
+    fn emit_send(
+        &mut self,
+        op_narrow: u8,
+        op_wide: u8,
+        selector: SymbolOop,
+        argc: u8,
+    ) -> &mut Self {
+        let ic_idx = self.add_send(selector, argc);
+        if ic_idx <= u8::MAX as u16 {
+            self.emit_u8(op_narrow);
+            self.emit_u8(ic_idx as u8);
+        } else {
+            self.emit_u8(op_wide);
+            self.emit_u16(ic_idx);
+        }
+        self
+    }
+
+    pub fn send(&mut self, selector: SymbolOop, argc: u8) -> &mut Self {
+        self.emit_send(OP_SEND, OP_SEND_W, selector, argc)
+    }
+
+    pub fn send_super(&mut self, selector: SymbolOop, argc: u8) -> &mut Self {
+        self.emit_send(OP_SEND_SUPER, OP_SEND_SUPER_W, selector, argc)
     }
 
     // --- control flow -----------------------------------------------------
@@ -326,9 +369,22 @@ impl BytecodeBuilder {
         }
 
         let ics: ArrayOop =
-            crate::memory::alloc::alloc_indexable_oops(vm, array_klass, self.n_ics * 4);
-
+            crate::memory::alloc::alloc_indexable_oops(vm, array_klass, self.n_ics * IC_STRIDE);
         let nil = vm.universe.nil_obj;
+        for (i, &(selector, argc)) in self.ic_sites.iter().enumerate() {
+            let base = i * IC_STRIDE;
+            // Epoch 0 matches a fresh `VmState::ic_epoch` — harmless for an
+            // empty-guard IC, since rows 1/2 never check the epoch.
+            let meta = (argc as i64) << IC_META_ARGC_SHIFT;
+            ics.at_put(base + IC_SEL_OFFSET, selector.oop());
+            ics.at_put(
+                base + IC_META_OFFSET,
+                crate::oops::smi::SmallInt::new(meta).oop(),
+            );
+            ics.at_put(base + IC_GUARD_OFFSET, nil);
+            ics.at_put(base + IC_TARGET_OFFSET, nil);
+        }
+
         method.set_selector(selector.oop());
         method.set_holder(nil); // nil until S3 install
         method.set_flags(argc, ntemps, false, false, false);

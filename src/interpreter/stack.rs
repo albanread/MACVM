@@ -3,20 +3,15 @@
 //! and every slot is a valid oop at all times (smi-encoded fp/bci links
 //! included), which is what makes S7's exact stack scan free.
 
+use crate::oops::layout::{
+    FRAME_CONTEXT, FRAME_METHOD, FRAME_RECEIVER, FRAME_SAVED_BCI, FRAME_SAVED_FP, FRAME_TEMPS_BASE,
+};
 use crate::oops::smi::SmallInt;
 use crate::oops::wrappers::MethodOop;
 use crate::oops::Oop;
 
 /// Default operand-stack capacity, in oop slots *(tunable)*.
 pub const DEFAULT_STACK_CAPACITY: usize = 64 * 1024;
-
-pub const FRAME_METHOD: usize = 0; // CompiledMethod oop
-pub const FRAME_SAVED_FP: usize = 1; // smi(caller fp index); smi(-1) = entry frame
-pub const FRAME_SAVED_BCI: usize = 2; // smi(caller resume bci); smi(0) at entry
-pub const FRAME_CONTEXT: usize = 3; // nil in S2 (Contexts are S4)
-pub const FRAME_RECEIVER: usize = 4; // copy of stack[fp - argc - 1]
-pub const FRAME_FIXED_SLOTS: usize = 5; // temps at fp+5 …, operand stack after
-pub const ENTRY_FRAME_SENTINEL: i64 = -1;
 
 /// The process stack is full — `try_push`'s error, so overflow can be
 /// tested without a real `exit(70)` subprocess.
@@ -101,7 +96,7 @@ impl ProcessStack {
     #[inline]
     pub fn pop(&mut self) -> Oop {
         let floor = if self.has_frame {
-            self.fp + FRAME_FIXED_SLOTS + self.ntemps_at_fp()
+            self.fp + FRAME_TEMPS_BASE + self.ntemps_at_fp()
         } else {
             // No frame activated yet — bare stack mechanics (S2's
             // `stack_push_pop`-style tests): the only sane floor is 0.
@@ -169,7 +164,7 @@ impl Frame {
 
     /// Unified arg/temp index: `t < argc` addresses the caller's pushed
     /// argument area (`fp - argc + t`); `t >= argc` addresses a fixed local
-    /// temp slot (`fp + FRAME_FIXED_SLOTS + (t - argc)`).
+    /// temp slot (`fp + FRAME_TEMPS_BASE + (t - argc)`).
     fn temp_index(self, st: &ProcessStack, t: usize) -> usize {
         let argc = self.method(st).argc();
         debug_assert!(
@@ -179,7 +174,7 @@ impl Frame {
         if t < argc {
             self.fp - argc + t
         } else {
-            self.fp + FRAME_FIXED_SLOTS + (t - argc)
+            self.fp + FRAME_TEMPS_BASE + (t - argc)
         }
     }
 
@@ -204,6 +199,7 @@ impl Frame {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::oops::layout::ENTRY_FRAME_SENTINEL;
     use crate::runtime::vm_state::{VmOptions, VmState};
 
     fn test_vm() -> VmState {
@@ -275,8 +271,8 @@ mod tests {
 
         assert_eq!(fp - 3, frame.receiver_slot(&st));
         assert_eq!(fp - 1, frame.temp_index(&st, 1));
-        assert_eq!(fp + FRAME_FIXED_SLOTS, frame.temp_index(&st, 2));
-        assert_eq!(fp + FRAME_FIXED_SLOTS + 1, frame.temp_index(&st, 3));
+        assert_eq!(fp + FRAME_TEMPS_BASE, frame.temp_index(&st, 2));
+        assert_eq!(fp + FRAME_TEMPS_BASE + 1, frame.temp_index(&st, 3));
     }
 
     #[test]
@@ -310,7 +306,7 @@ mod tests {
         st.push(vm.universe.nil_obj);
         st.push(recv);
         st.activate_frame(fp);
-        // No temps, no operand pushes — sp == fp+FRAME_FIXED_SLOTS exactly.
+        // No temps, no operand pushes — sp == fp+FRAME_TEMPS_BASE exactly.
         let _ = st.pop();
     }
 }

@@ -243,6 +243,18 @@ impl DoubleOop {
     }
 }
 
+/// Test-only fixture: a `SymbolOop` at a caller-chosen raw address, `unsafe`
+/// confined here (CONVENTIONS §1) since it never needs to point at a real
+/// object — `runtime::lookup`'s `LookupCache` tests need this to construct
+/// an address that collides with a chosen cache slot, and the cache never
+/// dereferences its keys (only compares raw bits).
+#[cfg(test)]
+pub(crate) fn fake_symbol_for_test(addr_index: u64) -> SymbolOop {
+    let raw = (addr_index << 3) | super::layout::MEM_TAG;
+    // SAFETY: as above.
+    unsafe { SymbolOop::from_oop_unchecked(Oop::from_raw_unchecked(raw)) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,0 +1,171 @@
+//! The last-resort `doesNotUnderstand:` fallback (SPEC §6.3, S3): reached
+//! only when `#doesNotUnderstand:` itself cannot be found (no library
+//! loaded yet, or a broken image) — the ordinary DNU path
+//! (`interpreter::send`) instead constructs a `Message` and sends it.
+//! **Must never recurse**: this prints and terminates the process, and may
+//! not send anything.
+
+use std::io::Write;
+
+use crate::interpreter::stack::Frame;
+use crate::oops::layout::ENTRY_FRAME_SENTINEL;
+use crate::oops::wrappers::{KlassOop, MethodOop, SymbolOop};
+use crate::runtime::vm_state::VmState;
+
+fn name_of(o: crate::oops::Oop) -> String {
+    SymbolOop::try_from(o)
+        .map(|s| s.as_string())
+        .unwrap_or_else(|| "?".to_string())
+}
+
+fn print_frame_line(vm: &mut VmState, method: MethodOop, bci: usize) {
+    let sel = name_of(method.selector());
+    let holder = match KlassOop::try_from(method.holder()) {
+        Some(k) => name_of(k.name()),
+        None => "?".to_string(),
+    };
+    let _ = writeln!(vm.out, "  {holder}>>{sel} @{bci}");
+}
+
+/// One line per frame, top (currently executing) frame first — pinned
+/// format for golden tests (`sprint_s03_detail.md` §Algorithms-6):
+/// `  <Holder>>><selector> @<bci>`. The top frame's bci comes from
+/// `vm.regs` (not yet saved into any frame slot); every ancestor's comes
+/// from its child frame's `saved_bci` (where that ancestor resumes).
+pub fn print_stack_trace(vm: &mut VmState) {
+    let top_method = vm.regs.method.expect("print_stack_trace: no active method");
+    let top_bci = vm.regs.bci;
+    print_frame_line(vm, top_method, top_bci);
+
+    let mut fp = vm.stack.fp;
+    loop {
+        let frame = Frame { fp };
+        let saved_fp = frame.saved_fp(&vm.stack);
+        if saved_fp == ENTRY_FRAME_SENTINEL {
+            break;
+        }
+        let caller_bci = frame.saved_bci(&vm.stack);
+        fp = saved_fp as usize;
+        let caller_method = Frame { fp }.method(&vm.stack);
+        print_frame_line(vm, caller_method, caller_bci);
+    }
+}
+
+/// `selector` was not understood by `receiver_klass`, AND
+/// `#doesNotUnderstand:` itself could not be found from `receiver_klass`
+/// (only reachable before the library installs a root `doesNotUnderstand:`
+/// on `Object`, or with a broken image). Prints the pinned fallback format
+/// and terminates with exit code 1 — never returns, never sends.
+pub fn dnu_fallback(vm: &mut VmState, selector: SymbolOop, receiver_klass: KlassOop) -> ! {
+    let sel_str = selector.as_string();
+    let klass_name = name_of(receiver_klass.name());
+    let _ = writeln!(vm.out, "DNU #{sel_str} (receiver class {klass_name})");
+    print_stack_trace(vm);
+    let _ = vm.out.flush();
+    std::process::exit(1);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime::vm_state::{OutputBuffer, VmOptions, VmState};
+
+    fn sym_of(method: MethodOop) -> SymbolOop {
+        SymbolOop::try_from(method.selector()).expect("method selector is not a Symbol")
+    }
+
+    fn test_vm() -> VmState {
+        VmState::with_options(VmOptions {
+            heap_mib: 64,
+            trace: Default::default(),
+        })
+    }
+
+    fn trivial_method(vm: &mut VmState, name: &[u8]) -> MethodOop {
+        let mut b = crate::bytecode::BytecodeBuilder::new();
+        b.ret_self();
+        let sel = vm.universe.intern(name);
+        b.finish(vm, sel, 0, 0)
+    }
+
+    #[test]
+    fn message_shape() {
+        // Exercises the Message klass layout independent of a real DNU
+        // send: allocate one by hand and confirm the pinned 2-slot shape.
+        let mut vm = test_vm();
+        let message_klass = vm.universe.message_klass;
+        let array_klass = vm.universe.array_klass;
+        let msg = crate::memory::alloc::alloc_slots(&mut vm, message_klass);
+        let sel = vm.universe.intern(b"foo:");
+        let args = crate::memory::alloc::alloc_indexable_oops(&mut vm, array_klass, 1);
+        msg.set_body_oop(0, sel.oop());
+        msg.set_body_oop(1, args.oop());
+        assert_eq!(msg.body_oop(0), sel.oop());
+        let got_args = crate::oops::wrappers::ArrayOop::try_from(msg.body_oop(1))
+            .expect("arguments is an Array");
+        assert_eq!(got_args.len(), 1);
+    }
+
+    #[test]
+    fn stack_trace_top_frame_only() {
+        let mut vm = test_vm();
+        let buf = OutputBuffer::new();
+        vm.out = Box::new(buf.clone());
+
+        let object_klass = vm.universe.object_klass;
+        let method = trivial_method(&mut vm, b"top");
+        let sel = sym_of(method);
+        crate::runtime::lookup::install_method(&mut vm, object_klass, sel, method);
+        let recv = vm.universe.nil_obj;
+        vm.stack.push(recv);
+        crate::interpreter::activate_entry(&mut vm, method, 0);
+        vm.regs.method = Some(method);
+        vm.regs.bci = 3;
+
+        print_stack_trace(&mut vm);
+        let out = buf.as_string();
+        assert!(out.contains("Object>>top @3"), "unexpected trace: {out}");
+    }
+
+    #[test]
+    fn stack_trace_multi_frame() {
+        let mut vm = test_vm();
+        let buf = OutputBuffer::new();
+        vm.out = Box::new(buf.clone());
+
+        let object_klass = vm.universe.object_klass;
+        let caller = trivial_method(&mut vm, b"caller");
+        let callee = trivial_method(&mut vm, b"callee");
+        let caller_sel = sym_of(caller);
+        let callee_sel = sym_of(callee);
+        crate::runtime::lookup::install_method(&mut vm, object_klass, caller_sel, caller);
+        crate::runtime::lookup::install_method(&mut vm, object_klass, callee_sel, callee);
+
+        let recv = vm.universe.nil_obj;
+        vm.stack.push(recv);
+        crate::interpreter::activate_entry(&mut vm, caller, 0);
+        // Simulate a send from `caller` at bci 5 into `callee`.
+        vm.regs.method = Some(caller);
+        vm.regs.bci = 5;
+        let saved_fp = vm.stack.fp as i64;
+        let saved_bci = vm.regs.bci;
+        vm.stack.push(recv); // callee's receiver
+        crate::interpreter::push_frame(&mut vm, callee, 0, saved_fp, saved_bci);
+        vm.regs.method = Some(callee);
+        vm.regs.bci = 1;
+
+        print_stack_trace(&mut vm);
+        let out = buf.as_string();
+        assert!(
+            out.contains("Object>>callee @1"),
+            "missing top frame: {out}"
+        );
+        assert!(
+            out.contains("Object>>caller @5"),
+            "missing caller frame: {out}"
+        );
+        let callee_line = out.find("callee").unwrap();
+        let caller_line = out.find("caller").unwrap();
+        assert!(callee_line < caller_line, "top frame must print first");
+    }
+}

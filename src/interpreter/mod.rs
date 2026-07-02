@@ -1,20 +1,22 @@
 //! The tier-0 interpreter (SPEC §5): activation/return discipline and the
 //! dispatch loop. No `unsafe`; nothing outside `stack.rs` manipulates
-//! `sp`/`fp` directly. S2 executes the non-send, non-closure opcode subset
-//! (hex 00–12 minus 0F/10/11, 30–33, 40–41); sends land in S3, closures and
-//! contexts in S4 — their arms are `unimplemented!` (reaching them in S2 is
-//! a VM bug, since only `BytecodeBuilder` produces bytecode and nothing in
-//! S2 emits those opcodes).
+//! `sp`/`fp` directly. S3 adds real sends (`send.rs`, `ic.rs`); closures and
+//! contexts remain S4 — their arms are `unimplemented!` (reaching them
+//! before S4 is a VM bug, since only `BytecodeBuilder` produces bytecode
+//! and nothing before S4 emits those opcodes).
 
+pub mod ic;
+pub mod send;
 pub mod stack;
 
 use crate::bytecode::opcode::*;
+use crate::oops::layout::ENTRY_FRAME_SENTINEL;
 use crate::oops::smi::SmallInt;
 use crate::oops::wrappers::MethodOop;
 use crate::oops::Oop;
 use crate::runtime::vm_state::VmState;
 
-use stack::{Frame, ENTRY_FRAME_SENTINEL};
+use stack::Frame;
 
 #[inline]
 fn push(vm: &mut VmState, v: Oop) {
@@ -48,7 +50,7 @@ fn resume_bci(vm: &VmState) -> usize {
 /// on the stack (SPEC §5.1's activation algorithm, step-numbered there).
 /// `saved_fp`/`saved_bci` are the caller's resume link; S3's sends will
 /// pass the current frame's fp/bci, `activate_entry` passes the sentinel.
-pub fn activate_method(
+pub fn push_frame(
     vm: &mut VmState,
     method: MethodOop,
     argc: usize,
@@ -73,7 +75,7 @@ pub fn activate_method(
 /// The entry-frame variant `run_method` uses: no caller exists yet, so the
 /// saved link is the sentinel.
 pub fn activate_entry(vm: &mut VmState, method: MethodOop, argc: usize) {
-    activate_method(vm, method, argc, ENTRY_FRAME_SENTINEL, 0);
+    push_frame(vm, method, argc, ENTRY_FRAME_SENTINEL, 0);
 }
 
 /// Pops the current frame, writing `result` into the canonical receiver
@@ -294,7 +296,38 @@ fn dispatch(vm: &mut VmState) -> Oop {
                 }
             }
             OP_SEND | OP_SEND_SUPER | OP_SEND_W | OP_SEND_SUPER_W => {
-                unimplemented!("sends land in S3")
+                let is_super = op == OP_SEND_SUPER || op == OP_SEND_SUPER_W;
+                let (ic_idx, next) = if op == OP_SEND_W || op == OP_SEND_SUPER_W {
+                    (read_u16(method, bci + 1), bci + 3)
+                } else {
+                    (method.bytecode_byte(bci + 1) as u16, bci + 2)
+                };
+                let argc = ic::InterpreterIc::at(method, ic_idx).argc();
+
+                let fp_before = vm.stack.fp;
+                vm.regs.method = Some(method);
+                vm.regs.bci = next;
+                send::send_generic(vm, argc, ic_idx, is_super);
+
+                if vm.exit_requested {
+                    // `quit` (SPEC §10 system group): stop dispatch right
+                    // here rather than unwinding every frame normally.
+                    return if vm.stack.sp > 0 {
+                        vm.stack.top()
+                    } else {
+                        vm.universe.nil_obj
+                    };
+                }
+                if vm.stack.fp != fp_before {
+                    // A real frame was pushed for the callee's bytecode
+                    // body (no primitive short-circuit) — resume there.
+                    method = current_method(vm);
+                    bci = 0;
+                } else {
+                    // Primitive fast path: no new frame, resume right after
+                    // the send in the SAME method.
+                    bci = next;
+                }
             }
             OP_PUSH_CTX_TEMP
             | OP_STORE_CTX_TEMP_POP
@@ -351,7 +384,7 @@ mod tests {
         push(&mut vm, recv);
         push(&mut vm, a0);
         push(&mut vm, a1);
-        activate_method(&mut vm, method, 2, ENTRY_FRAME_SENTINEL, 0);
+        push_frame(&mut vm, method, 2, ENTRY_FRAME_SENTINEL, 0);
 
         let result = SmallInt::new(9).oop();
         let ret = return_from_frame(&mut vm, result);
@@ -365,29 +398,32 @@ mod tests {
         let method = method_returning_self(&mut vm, 0, 2);
         let recv = SmallInt::new(7).oop();
         push(&mut vm, recv);
-        activate_method(&mut vm, method, 0, ENTRY_FRAME_SENTINEL, 0);
+        push_frame(&mut vm, method, 0, ENTRY_FRAME_SENTINEL, 0);
 
         let fp = vm.stack.fp;
         assert_eq!(
-            SmallInt::try_from(vm.stack.get(fp + stack::FRAME_SAVED_FP))
+            SmallInt::try_from(vm.stack.get(fp + crate::oops::layout::FRAME_SAVED_FP))
                 .unwrap()
                 .value(),
             ENTRY_FRAME_SENTINEL
         );
         assert_eq!(
-            SmallInt::try_from(vm.stack.get(fp + stack::FRAME_SAVED_BCI))
+            SmallInt::try_from(vm.stack.get(fp + crate::oops::layout::FRAME_SAVED_BCI))
                 .unwrap()
                 .value(),
             0
         );
-        assert_eq!(vm.stack.get(fp + stack::FRAME_CONTEXT), vm.universe.nil_obj);
-        assert_eq!(vm.stack.get(fp + stack::FRAME_RECEIVER), recv);
         assert_eq!(
-            vm.stack.get(fp + stack::FRAME_FIXED_SLOTS),
+            vm.stack.get(fp + crate::oops::layout::FRAME_CONTEXT),
+            vm.universe.nil_obj
+        );
+        assert_eq!(vm.stack.get(fp + crate::oops::layout::FRAME_RECEIVER), recv);
+        assert_eq!(
+            vm.stack.get(fp + crate::oops::layout::FRAME_TEMPS_BASE),
             vm.universe.nil_obj
         );
         assert_eq!(
-            vm.stack.get(fp + stack::FRAME_FIXED_SLOTS + 1),
+            vm.stack.get(fp + crate::oops::layout::FRAME_TEMPS_BASE + 1),
             vm.universe.nil_obj
         );
     }
@@ -400,10 +436,10 @@ mod tests {
         push(&mut vm, recv);
         push(&mut vm, SmallInt::new(1).oop());
         push(&mut vm, SmallInt::new(2).oop());
-        activate_method(&mut vm, method, 2, ENTRY_FRAME_SENTINEL, 0);
+        push_frame(&mut vm, method, 2, ENTRY_FRAME_SENTINEL, 0);
 
         let fp = vm.stack.fp;
-        let via_fast_copy = vm.stack.get(fp + stack::FRAME_RECEIVER);
+        let via_fast_copy = vm.stack.get(fp + crate::oops::layout::FRAME_RECEIVER);
         let via_caller_slot = current_frame(&vm).receiver_slot(&vm.stack);
         assert_eq!(via_fast_copy, vm.stack.get(via_caller_slot));
         assert_eq!(via_fast_copy, recv);
@@ -465,20 +501,6 @@ mod tests {
         let method = b.finish(&mut vm, sel, 0, 0);
         // Patch bci 0 to an undefined opcode, bypassing the builder.
         method.set_bytecode_byte(0, 0x7F);
-        let recv = vm.universe.nil_obj;
-
-        let _ = run_method(&mut vm, method, recv, &[]);
-    }
-
-    #[test]
-    #[should_panic(expected = "sends land in S3")]
-    fn send_opcode_unimplemented() {
-        let mut vm = test_vm();
-        let mut b = BytecodeBuilder::new();
-        b.ret_self();
-        let sel = vm.universe.intern(b"m");
-        let method = b.finish(&mut vm, sel, 0, 0);
-        method.set_bytecode_byte(0, crate::bytecode::opcode::OP_SEND);
         let recv = vm.universe.nil_obj;
 
         let _ = run_method(&mut vm, method, recv, &[]);
