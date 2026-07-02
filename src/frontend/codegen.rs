@@ -219,7 +219,14 @@ struct HoistScope {
 
 struct Ctx<'v> {
     vm: &'v mut VmState,
-    holder: KlassOop,
+    /// A `Handle`, not a bare `KlassOop`: the class being compiled is read
+    /// (via `find_class_var` in `resolve_var`) throughout a compile unit that
+    /// spans many intervening allocations (literals, nested block compiles),
+    /// any of which can move it. A bare `KlassOop` here was a live production
+    /// GC bug — a class-variable reference in an `.mst` method compiled it into
+    /// a stale klass under `MACVM_GC_STRESS=1` (SPEC §7.6.1; found via the
+    /// in-language suite). Rooted in `scope`, same as `inst_var_names`.
+    holder: Handle<KlassOop>,
     class_side: bool,
     top_level: bool,
     capture: CaptureInfo,
@@ -284,7 +291,10 @@ impl Ctx<'_> {
                 return Ok(VarRef::InstVar(idx as u8));
             }
         }
-        if let Some(assoc) = find_class_var(self.holder, sym.oop()) {
+        // Read `holder` fresh through its handle: `intern` above (and the
+        // whole compile unit before this) can have scavenged and moved it.
+        let holder = self.holder.get(self.vm);
+        if let Some(assoc) = find_class_var(holder, sym.oop()) {
             return Ok(VarRef::Global(assoc));
         }
         if let Some(assoc) = crate::runtime::globals::global_lookup(self.vm, sym) {
@@ -1012,6 +1022,7 @@ fn compile_method_inner(
     // but every symbol it returns needs handle protection before codegen's
     // many subsequent allocations can move it (S7-9).
     let scope = HandleScope::enter(vm);
+    let holder = scope.handle(vm, holder);
     let inst_var_names: Vec<Handle<Oop>> = raw_inst_var_names
         .into_iter()
         .map(|o| scope.handle(vm, o))
