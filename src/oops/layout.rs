@@ -54,6 +54,26 @@ pub const MARK_GC_MARK_MASK: u64 = 1 << MARK_GC_MARK_SHIFT;
 /// every other field zero. `0b111` = 7.
 pub const MARK_PRISTINE: u64 = MARK_TAG | MARK_SENTINEL_MASK;
 
+// --- klass body layout (SPEC §2.4), in declaration order -------------------
+// `*_INDEX` constants are body-word indexes (word 0 = byte offset
+// BODY_OFFSET); byte offset = BODY_OFFSET + 8*index.
+
+pub const KLASS_FORMAT_INDEX: usize = 0; // smi: format enum + flags
+pub const KLASS_NON_INDEXABLE_SIZE_INDEX: usize = 1; // smi: words incl. header
+pub const KLASS_SUPERCLASS_INDEX: usize = 2; // klassOop | nil
+pub const KLASS_METHODS_INDEX: usize = 3; // MethodDictionary | nil (nil until S3)
+pub const KLASS_NAME_INDEX: usize = 4; // Symbol | nil (during genesis)
+pub const KLASS_INST_VAR_NAMES_INDEX: usize = 5; // Array | nil
+pub const KLASS_CLASS_VARS_INDEX: usize = 6; // Array | nil
+pub const KLASS_MIXIN_INDEX: usize = 7; // always nil in v1 (SPEC §2.4 Δ)
+pub const KLASS_BODY_WORDS: usize = 8;
+pub const KLASS_SIZE_WORDS: usize = HEADER_WORDS + KLASS_BODY_WORDS; // 10
+
+// Format smi encoding: bits 7:0 = Format discriminant,
+// bit 8 = has_untagged_contents (SPEC §2.4 "format enum + flags").
+pub const FORMAT_KIND_MASK: i64 = 0xFF;
+pub const FORMAT_UNTAGGED_BIT: i64 = 1 << 8;
+
 #[cfg(test)]
 mod tests {
     use super::*;

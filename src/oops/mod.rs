@@ -12,11 +12,14 @@
 
 #![allow(unsafe_code)]
 
+pub mod heap;
+pub mod klass;
 pub mod layout;
 pub mod mark;
 pub mod smi;
 pub mod wrappers;
 
+pub use klass::Format;
 pub use mark::Mark;
 pub use smi::SmallInt;
 pub use wrappers::{
