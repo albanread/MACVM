@@ -1,0 +1,68 @@
+"17_gc_full_tests.mst — GcFullTest (tests_s08.md §In-language tests, S8
+ gate items 2-3). Adapted from the doc's own sketch: `Smalltalk gcFull` (not
+ `System gcFull` — `Smalltalk` is the actual bound global, world/20_system.mst)
+ and a plain identity-keyed `Dictionary` (not `IdentityDictionary`, which
+ doesn't exist in this world — `Object>>hash` is `^self identityHash` and
+ `Object>>=` is `^self == anObject`, so a plain Dictionary already IS
+ identity-keyed for any object that doesn't override them, exactly the
+ doc's own noted fallback)."
+
+TestCase subclass: GcFullTest [
+    runAll [
+        self runTest: #testChurnWithGrowthAndRelease
+            do: [ self testChurnWithGrowthAndRelease ].
+        self runTest: #testLiveGraphIntactAfterGcFull
+            do: [ self testLiveGraphIntactAfterGcFull ].
+        self runTest: #testIdentityDictionaryAfterGcFull
+            do: [ self testIdentityDictionaryAfterGcFull ].
+    ]
+
+    "Sustained churn (each batch of 100 abandoned wholesale) interleaved
+     with growth, then a full GC — the surviving batch's own content must
+     still be intact and reachable afterward. Deliberately small (300
+     total, not thousands): this suite also runs under
+     MACVM_GC_STRESS=1, where EVERY allocation scavenges, and debug
+     builds run a full O(heap) verify pass on every scavenge's entry AND
+     exit — late in this suite (after the whole world plus 16 other test
+     classes have loaded), that heap is already substantial, so even a
+     few hundred allocations here is enough coverage; a few thousand
+     turned this one test into multiple minutes by itself."
+    testChurnWithGrowthAndRelease [
+        | keep sum |
+        keep := OrderedCollection new.
+        1 to: 300 do: [:i |
+            (i \\ 100) = 1 ifTrue: [ keep := OrderedCollection new ].
+            keep add: (Array with: i with: i * 2) ].
+        Smalltalk gcFull.
+        sum := 0.
+        keep do: [:a | sum := sum + (a at: 1) ].
+        self assert: sum > 0
+    ]
+
+    "A Dictionary's whole structure (backing key/value Arrays, every
+     String value) must relocate consistently under compaction — every
+     key must still resolve to its matching value, not a neighbor's."
+    testLiveGraphIntactAfterGcFull [
+        | d |
+        d := Dictionary new.
+        1 to: 100 do: [:i | d at: i put: i printString ].
+        Smalltalk gcFull.
+        Smalltalk gcFull.
+        1 to: 100 do: [:i | self assert: (d at: i) equals: i printString ]
+    ]
+
+    "Identity, not equality: distinct Object instances used as Dictionary
+     keys must still resolve to their own associated value after
+     compaction moves them — this only works if identityHash truly
+     survives (side-map channel, same as Smalltalk-level identityHash)
+     and the Dictionary's own backing storage relocates in step with its
+     keys."
+    testIdentityDictionaryAfterGcFull [
+        | keys d |
+        keys := (1 to: 30) collect: [:i | Object new ].
+        d := Dictionary new.
+        keys doWithIndex: [:k :i | d at: k put: i ].
+        Smalltalk gcFull.
+        keys doWithIndex: [:k :i | self assert: (d at: k) equals: i ]
+    ]
+]

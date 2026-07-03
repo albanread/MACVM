@@ -19,4 +19,5 @@ TestRunner run: IntervalTests.
 TestRunner run: StreamAndPrintTests.
 TestRunner run: BlockTests.
 TestRunner run: DispatchTests.
+TestRunner run: GcFullTest.
 TestRunner report.

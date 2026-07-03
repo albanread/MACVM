@@ -86,9 +86,21 @@ impl OffsetTable {
     /// address changes, so nothing in the old table is trustworthy). Only
     /// cards below the (possibly new, smaller) `old.top` are ever consulted
     /// (`dirty_card_scan`/`resolve` callers all stop there), so a zeroed
-    /// entry past it is inert, never misread as a real header distance.
-    pub fn clear(&mut self) {
-        for i in 0..self.n_cards {
+    /// entry past it is inert, never misread as a real header distance —
+    /// which is also why zeroing only needs to reach `old_top_before`
+    /// (the PRE-compaction top, an upper bound on the new one, is what the
+    /// caller has on hand before the slide moves anything), not every card
+    /// in the whole reservation: a real VM's default heap reserves 8 GiB
+    /// of old gen, ~16.7M cards, and this ran on every single full GC
+    /// (found via a genuine multi-minute full_gc on the actual CLI
+    /// binary's default heap — a 64 MiB test heap's ~120K cards hid it
+    /// completely, same as `fullgc::post`'s matching card-table bug).
+    pub fn clear_through(&mut self, old_top_before: usize) {
+        if old_top_before <= self.old_start {
+            return;
+        }
+        let last = self.card_index(old_top_before - 1);
+        for i in 0..=last {
             self.set_entry(i, 0);
         }
     }

@@ -255,7 +255,7 @@ fn slide_young(plan: &CompactPlan) {
 /// (every surviving object's address changed, and `old.top` can shrink),
 /// so it is cleared first rather than patched.
 fn slide_old(vm: &mut VmState, plan: &CompactPlan) {
-    vm.universe.offsets.clear();
+    vm.universe.offsets.clear_through(vm.universe.old.top);
     for e in plan {
         let words = e.size_words as usize;
         // SAFETY: as `slide_young`.
@@ -333,9 +333,24 @@ fn debug_assert_clean(vm: &VmState) {
 /// here). Old-gen growth policy is deliberately NOT checked here — that is
 /// the cascade's job (S8 step 7), not a bare `full_gc` call's.
 fn post(vm: &mut VmState) {
-    let n = vm.universe.cards.n_cards();
-    for i in 0..n {
-        vm.universe.cards.set_clean(i);
+    // Bounded to the live range, not `cards.n_cards()` (every card in the
+    // WHOLE reservation): a real VM's default heap reserves 8 GiB, ~16.7M
+    // cards, and this ran on every single full GC — found via a genuine
+    // multi-minute full_gc under MACVM_GC_STRESS=full:1 on the actual CLI
+    // binary's default heap (a 64 MiB test heap's ~120K cards hid this
+    // completely). Nothing beyond `old.top` is ever dirtied (nothing is
+    // ever written past the allocation frontier) and `dirty_card_scan`
+    // itself never looks past it either, so cleaning only up to there is
+    // both correct and exactly what "reset" needs. Same inclusive-last-
+    // card pattern as `record_multistores` right below (an exclusive
+    // `card_index(top)` would floor-round away the card actually
+    // containing `top` whenever `top` isn't itself card-aligned).
+    let old = &vm.universe.old;
+    if old.top > old.bounds.start {
+        let last = vm.universe.cards.card_index(old.top - 1);
+        for i in 0..=last {
+            vm.universe.cards.set_clean(i);
+        }
     }
     vm.universe
         .cards
@@ -605,10 +620,134 @@ mod tests {
         );
     }
 
+    /// A ByteArray's body is raw bytes, never oop slots (SPEC §7.3 A5
+    /// format dispatch) — even when those bytes happen to hold the exact
+    /// bit pattern of a live object's mem-tagged oop. Planting one proves
+    /// `for_each_oop_field`'s format dispatch, not just convention, is what
+    /// keeps `mark` from treating arbitrary bytes as pointers (tests_s08.md
+    /// `mark_skips_raw_bodies`: a corruption guard, not an edge case).
+    #[test]
+    fn mark_skips_raw_bodies() {
+        let mut vm = test_vm();
+        let array_klass = vm.universe.array_klass;
+        let bytes_klass = vm.universe.bytearray_klass;
+
+        // Never rooted except via the planted raw bytes below.
+        let victim = alloc::alloc_indexable_oops(&mut vm, array_klass, 0);
+        let holder = alloc::alloc_indexable_bytes(&mut vm, bytes_klass, 8);
+        // Body word 0 of an IndexableBytes object is its own size slot
+        // (`raw_size_slot`) — the actual byte payload starts at word 1, so
+        // the fake pointer must land there, not overwrite the size slot.
+        for (i, b) in victim.oop().raw().to_le_bytes().into_iter().enumerate() {
+            holder.byte_at_put(i, b);
+        }
+        vm.stack.push(holder.oop());
+
+        mark(&mut vm);
+
+        assert!(is_marked(holder.oop()));
+        assert!(
+            !is_marked(victim.oop()),
+            "a byte pattern matching a live oop must not be scanned as a pointer"
+        );
+    }
+
     // ======================================================================
     // Phases B + E (implementation-order step 4): forwarding arithmetic,
     // side-map save/restore, on a single hand-placed range (no references).
     // ======================================================================
+
+    #[test]
+    fn forward_compute_all_live_self_forwards_with_no_gaps() {
+        let mut vm = test_vm();
+        let klass = vm.universe.array_klass;
+        let range_start = vm.universe.eden.top;
+
+        let a = alloc::alloc_indexable_oops(&mut vm, klass, 0);
+        let b = alloc::alloc_indexable_oops(&mut vm, klass, 1);
+        let range_end = vm.universe.eden.top;
+        for o in [a.oop(), b.oop()] {
+            let m = MemOop::try_from(o).unwrap();
+            m.set_mark(m.mark().with_gc_mark(true));
+        }
+
+        let mut side_marks = HashMap::new();
+        let (plan, new_top) = forwarding_compute(range_start, range_end, &mut side_marks);
+
+        assert_eq!(plan.len(), 2);
+        for e in &plan {
+            assert_eq!(e.old, e.new, "zero dead bytes ⇒ every entry self-forwards");
+        }
+        assert_eq!(
+            new_top, range_end,
+            "no reclamation ⇒ the space's new top is unchanged"
+        );
+    }
+
+    #[test]
+    fn forward_compute_empty_space_yields_no_entries() {
+        let vm = test_vm();
+        let start = vm.universe.eden.top;
+
+        let mut side_marks = HashMap::new();
+        let (plan, new_top) = forwarding_compute(start, start, &mut side_marks);
+
+        assert!(plan.is_empty());
+        assert_eq!(new_top, start);
+        assert!(side_marks.is_empty());
+    }
+
+    /// The memmove trap (SPEC §7.5 step 2's `ptr::copy`, not
+    /// `copy_nonoverlapping`): a live object big enough that its downward
+    /// shift is SMALLER than its own size has old/new byte ranges that
+    /// genuinely overlap. `std::ptr::copy` must still carry every body word
+    /// across intact.
+    #[test]
+    fn slide_overlap_safe() {
+        let mut vm = test_vm();
+        let klass = vm.universe.array_klass;
+        let range_start = vm.universe.eden.top;
+
+        let dead = alloc::alloc_indexable_oops(&mut vm, klass, 0); // small — shift distance
+        let live = alloc::alloc_indexable_oops(&mut vm, klass, 4); // bigger than the shift
+        let vals = [11i64, 22, 33, 44];
+        for (i, &v) in vals.iter().enumerate() {
+            live.at_put(i, SmallInt::new(v).oop());
+        }
+        let range_end = vm.universe.eden.top;
+        let _ = dead; // never marked below — this is what creates the shift
+
+        let m = MemOop::try_from(live.oop()).unwrap();
+        m.set_mark(m.mark().with_gc_mark(true));
+
+        let mut side_marks = HashMap::new();
+        let (plan, _new_top) = forwarding_compute(range_start, range_end, &mut side_marks);
+        assert_eq!(plan.len(), 1);
+        let entry = plan[0];
+        let shift = entry.old - entry.new;
+        assert!(
+            shift > 0 && shift < entry.size_words as usize * WORD_SIZE,
+            "test must actually exercise overlapping old/new ranges, not merely adjacent ones"
+        );
+
+        slide_young(&plan);
+
+        // `array_klass` itself never moved (outside the tested range), so
+        // the copied-but-not-yet-rewritten klass field at the new address
+        // is still valid — safe to use the typed accessor rather than
+        // hand-computing body-word offsets (body word 0 is the size slot,
+        // not element 0; `at()` already knows that).
+        let moved =
+            crate::oops::wrappers::ArrayOop::try_from(Oop::from_raw(entry.new as u64 + MEM_TAG))
+                .unwrap();
+        for (i, &v) in vals.iter().enumerate() {
+            assert_eq!(
+                moved.at(i),
+                SmallInt::new(v).oop(),
+                "element {i} must survive an overlapping ptr::copy intact"
+            );
+        }
+    }
 
     #[test]
     fn forwarding_compute_skips_dead_compacts_live_downward() {
@@ -912,6 +1051,121 @@ mod tests {
             Some(moved.mem_addr()),
             "dbg_oop must follow the object to its new address"
         );
+    }
+
+    /// Age travels the same channel as identity hash (the displaced-mark
+    /// side map, SPEC §2.2 Δ) — a survivor's age must be intact after a
+    /// full GC, the same way `full_gc_preserves_identity_hash` proves hash
+    /// is (tests_s08.md `ages_survive_full_gc`).
+    #[test]
+    fn ages_survive_full_gc() {
+        let mut vm = test_vm();
+        let klass = vm.universe.array_klass;
+        let dead = alloc::alloc_indexable_oops(&mut vm, klass, 0); // forces an actual move
+        let obj = alloc::alloc_indexable_oops(&mut vm, klass, 0);
+        let _ = dead;
+        let m = MemOop::try_from(obj.oop()).unwrap();
+        m.set_mark(m.mark().with_age(5));
+        vm.stack.push(obj.oop());
+
+        full_gc(&mut vm).expect("full_gc must succeed");
+
+        let moved = vm.stack.get(vm.stack.sp - 1);
+        assert_ne!(
+            moved.raw(),
+            obj.oop().raw(),
+            "the object must have actually moved"
+        );
+        assert_eq!(
+            MemOop::try_from(moved).unwrap().mark().age(),
+            5,
+            "age must survive via the side map, same channel as identity hash"
+        );
+    }
+
+    /// SPEC §7.5 phase D step 2 / F2: after compaction, every card covering
+    /// a surviving object resolves to that object's NEW header — including
+    /// cards in the MIDDLE of an object spanning more than one card, the
+    /// case direct per-allocation bookkeeping and a full rebuild both have
+    /// to get right independently (tests_s08.md `offset_table_rebuilt`).
+    #[test]
+    fn offset_table_rebuilt_covers_a_multi_card_object() {
+        let mut vm = test_vm();
+        vm.universe.tenuring_threshold = 0;
+        let klass = vm.universe.array_klass;
+
+        let dead = alloc::alloc_indexable_oops(&mut vm, klass, 0);
+        let big = alloc::alloc_indexable_oops(&mut vm, klass, 100); // spans multiple cards
+        vm.stack.push(dead.oop());
+        vm.stack.push(big.oop());
+        crate::memory::scavenge::scavenge(&mut vm).expect("scavenge must promote both");
+
+        // Abandon `dead`: pop both promoted addresses, keep only `big`'s.
+        let big_promoted = vm.stack.get(vm.stack.sp - 1);
+        vm.stack.sp -= 2;
+        vm.stack.push(big_promoted);
+
+        full_gc(&mut vm).expect("full_gc must succeed");
+
+        let moved = vm.stack.get(vm.stack.sp - 1);
+        let moved_addr = moved.mem_addr();
+        let size_bytes = MemOop::try_from(moved).unwrap().instance_size_words() * WORD_SIZE;
+        assert!(
+            size_bytes > crate::memory::cards::CARD_SIZE,
+            "test must actually exercise an object spanning multiple cards"
+        );
+
+        let c0 = vm.universe.offsets.card_index(moved_addr);
+        let c_last = vm.universe.offsets.card_index(moved_addr + size_bytes - 1);
+        assert!(c_last > c0, "must span at least 2 cards");
+        // Card c0 only carries an entry (and thus resolves to `moved_addr`)
+        // if the header sits exactly at that card's base (offsets.rs's own
+        // module doc) — otherwise card_base(c0) is covered by whatever
+        // object precedes `moved` in old gen, by design, so only the
+        // interior/tail cards are unambiguous.
+        for c in (c0 + 1)..=c_last {
+            assert_eq!(
+                vm.universe.offsets.resolve(c),
+                moved_addr,
+                "card {c} must resolve to the moved object's new header"
+            );
+        }
+        if moved_addr == vm.universe.offsets.card_base(c0) {
+            assert_eq!(vm.universe.offsets.resolve(c0), moved_addr);
+        }
+    }
+
+    /// SPEC §7.5 phase F step 1: after a full GC, every card over the live
+    /// old-gen range `[old.bounds.start, old.top)` is dirty (the
+    /// deliberately-conservative "next scavenge self-corrects" reset) and
+    /// every card above `old.top` is clean (tests_s08.md
+    /// `card_reset_semantics`).
+    #[test]
+    fn card_reset_semantics_dirties_live_range_and_cleans_the_rest() {
+        let mut vm = test_vm();
+        vm.universe.tenuring_threshold = 0;
+        let klass = vm.universe.array_klass;
+        let obj = alloc::alloc_indexable_oops(&mut vm, klass, 0);
+        vm.stack.push(obj.oop());
+        crate::memory::scavenge::scavenge(&mut vm).expect("scavenge must promote");
+
+        full_gc(&mut vm).expect("full_gc must succeed");
+
+        let c0 = vm.universe.cards.card_index(vm.universe.old.bounds.start);
+        let c_last = vm.universe.cards.card_index(vm.universe.old.top - 1);
+        for c in c0..=c_last {
+            assert!(
+                vm.universe.cards.is_dirty(c),
+                "card {c} over the live old range must be dirty"
+            );
+        }
+        let n = vm.universe.cards.n_cards();
+        for c in (c_last + 1)..n {
+            assert!(
+                !vm.universe.cards.is_dirty(c),
+                "card {c} above old.top must be clean"
+            );
+        }
     }
 
     /// A real, previously-undetected bug (found running `Smalltalk gcFull`

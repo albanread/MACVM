@@ -1,0 +1,115 @@
+"soak.mst — S8 gate item 4 soak harness (tests_s08.md §Soak test design).
+ Parameterized by cycle count via the literal in the last line — `just`'s
+ soak-s08/soak-s08-ci recipes substitute it via sed (world/bench/fib.mst's
+ own convention: a hardcoded literal at the call site, not a runtime
+ parameter — there is no Smalltalk-level hook for reading an environment
+ variable or CLI argument yet).
+
+ Workload mix per cycle: (a) short-lived churn, (b) a medium-lived cache
+ with LCG-seeded random insertion (reproducible — fixed seed), (c) a
+ long-lived symbol population that grows for the first 2000 cycles then
+ plateaus, (d) byte-heavy String churn, (e) a full GC checkpoint every 50
+ cycles. Every cycle re-verifies the cache against a shadow model BEFORE
+ moving on — corruption is caught the cycle it happens, not at the end
+ (self error: aborts the whole run immediately, loud and specific, per
+ 00_sunit.mst's 'no exceptions in v1' convention). Each checkpoint prints
+ gcStats to Transcript so a MACVM_TRACE=gc run's [gc] lines plus these
+ printouts together tell the whole story if something goes wrong."
+
+Object subclass: Soak [
+    | cache cacheShadow longLived rngState |
+
+    Soak class >> run: nCycles [
+        | s |
+        s := self new.
+        s init.
+        s runCycles: nCycles.
+        Transcript show: 'soak: '; show: nCycles printString;
+            show: ' cycles clean'; cr.
+    ]
+
+    init [
+        cache := Array new: 5000.
+        cacheShadow := Array new: 5000.
+        longLived := OrderedCollection new.
+        "Must start well under 2^30 (16r3FFFFFFF+1): nextRand's own mask
+         keeps every STEADY-STATE value there, safely under SmallInteger's
+         ~2^61 range even multiplied by the LCG's ~2^30 constant, but the
+         seed itself is unmasked on this first use -- a bigger one (a
+         64-bit-scale value, sized for an xorshift generator this ended up
+         not using) overflows into LargePositiveInteger on the very first
+         multiply, and LargeInteger has no bitAnd: (found by actually
+         running this, not by inspection)."
+        rngState := 123456789.
+    ]
+
+    "A small seeded LCG (glibc-style constants) — reproducible, not
+     cryptographic: this only needs to vary cache access patterns enough
+     to fragment realistically, run to run and build to build alike."
+    nextRand [
+        rngState := (rngState * 1103515245 + 12345) bitAnd: 16r3FFFFFFF.
+        ^rngState
+    ]
+    nextRandBetween: lo and: hi [
+        ^lo + (self nextRand \\ (hi - lo + 1))
+    ]
+
+    runCycles: nCycles [
+        1 to: nCycles do: [:cycle |
+            self churnShortLived.
+            self touchCache.
+            self growLongLived: cycle.
+            self churnBytes.
+            self verifyShadow.
+            (cycle \\ 50) = 0 ifTrue: [ self fullGcCheckpoint: cycle ] ]
+    ]
+
+    "(a) short-lived: 10K temp 3-element Arrays, immediately abandoned."
+    churnShortLived [
+        | tmp |
+        1 to: 10000 do: [:i |
+            tmp := Array with: i with: i * 2 with: i * 3 ]
+    ]
+
+    "(b) medium-lived: a 5K-entry cache, random writes mirrored into
+     cacheShadow — verifyShadow's cross-check catches any divergence."
+    touchCache [
+        | slot val |
+        1 to: 500 do: [:i |
+            slot := self nextRandBetween: 1 and: 5000.
+            val := self nextRand \\ 1000000.
+            cache at: slot put: val.
+            cacheShadow at: slot put: val ]
+    ]
+
+    "(c) long-lived: grows for the first 2000 cycles, then plateaus —
+     the interesting old-gen-occupancy shape a flat-ceiling check needs."
+    growLongLived: cycle [
+        cycle <= 2000 ifTrue: [
+            longLived add: ('sym_' , cycle printString) asSymbol ]
+    ]
+
+    "(d) byte-heavy: Strings built a character at a time and discarded."
+    churnBytes [
+        | s |
+        1 to: 200 do: [:i |
+            s := String new: 200.
+            1 to: 200 do: [:j |
+                s at: j put: (Character value: ((i + j) \\ 95) + 32) ] ]
+    ]
+
+    "Continuous integrity check: every cycle, not just at the end."
+    verifyShadow [
+        1 to: 5000 do: [:i |
+            (cache at: i) = (cacheShadow at: i) ifFalse: [
+                self error: 'soak: cache/shadow mismatch at slot ' , i printString ] ]
+    ]
+
+    fullGcCheckpoint: cycle [
+        Smalltalk gcFull.
+        Transcript show: 'soak: cycle '; show: cycle printString;
+            show: ' gcStats='; show: Smalltalk gcStats printString; cr.
+    ]
+]
+
+Soak run: 100.

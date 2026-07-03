@@ -360,10 +360,27 @@ pub fn alloc_indexable_oops(vm: &mut VmState, klass: KlassOop, n: usize) -> Arra
     unsafe { ArrayOop::from_oop_unchecked(obj.oop()) }
 }
 
+/// SPEC §7.2 A2's cascade, not `alloc_indexable_bytes_raw`'s bare eden bump
+/// (found via a real crash, not inspection: a ByteArray/String request that
+/// merely didn't fit eden's CURRENT free space was killing the whole
+/// process with "eden exhausted" instead of falling back to scavenge/
+/// old-gen/growth like every other indexable allocator — `_raw` is a
+/// genesis-adjacent helper, `non_indexable_size` may still be under
+/// construction there, per its own doc comment; this, the general-purpose
+/// public entry point, must go through the same `alloc_words` cascade
+/// `alloc_indexable_oops` does).
 pub fn alloc_indexable_bytes(vm: &mut VmState, klass: KlassOop, nbytes: usize) -> ByteArrayOop {
     let nis = klass.non_indexable_size();
-    let nil_fill = vm.universe.nil_obj;
-    alloc_indexable_bytes_raw(&mut vm.universe.eden, nil_fill, klass.oop(), nis, nbytes)
+    let padded_words = nbytes.div_ceil(8);
+    let words = nis
+        .checked_add(1)
+        .and_then(|w| w.checked_add(padded_words))
+        .expect("alloc_indexable_bytes: size overflow");
+    let obj = alloc_words(vm, words, klass.oop(), false);
+    let size_idx = nis - HEADER_WORDS;
+    obj.set_raw_body_word(size_idx, SmallInt::new(nbytes as i64).oop().raw());
+    // SAFETY: freshly allocated with klass's IndexableBytes shape.
+    unsafe { ByteArrayOop::from_oop_unchecked(obj.oop()) }
 }
 
 /// A `BlockClosure` with `ncopied` captures, all initially `nil` (SPEC
@@ -586,14 +603,14 @@ mod tests {
     #[test]
     #[should_panic(expected = "size overflow")]
     fn oversized_alloc_request_panics() {
-        // usize::MAX bytes overflows `words * WORD_SIZE` in the checked
-        // arithmetic (`alloc_words_raw`) — this must panic via `.expect`,
-        // which fires in both debug and release (unlike a debug_assert),
-        // NOT silently wrap into a small allocation. Deliberately NOT
+        // usize::MAX bytes overflows `words * WORD_SIZE` in `alloc_words`'s
+        // own checked arithmetic — this must panic via `.expect`, which
+        // fires in both debug and release (unlike a debug_assert), NOT
+        // silently wrap into a small allocation. Deliberately NOT
         // usize::MAX/2: that magnitude doesn't actually overflow the
-        // checked chain, so it would instead reach the real eden-exhaustion
-        // branch and call `std::process::exit(70)` — fatal to the whole
-        // test harness, not a panic `#[should_panic]` can observe.
+        // checked chain, so it would instead reach the real cascade's
+        // terminal stall and call `std::process::exit(70)` — fatal to the
+        // whole test harness, not a panic `#[should_panic]` can observe.
         let mut vm = boot();
         let bytearray_klass = vm.universe.bytearray_klass;
         let _ = alloc_indexable_bytes(&mut vm, bytearray_klass, usize::MAX);

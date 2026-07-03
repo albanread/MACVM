@@ -5,7 +5,7 @@
 use std::time::{Duration, Instant};
 
 use crate::oops::klass::Format;
-use crate::oops::layout::HEADER_WORDS;
+use crate::oops::layout::{HEADER_WORDS, WORD_SIZE};
 use crate::oops::wrappers::{KlassOop, MemOop};
 use crate::oops::Oop;
 use crate::runtime::vm_state::VmState;
@@ -362,11 +362,41 @@ fn scan_slots_in_window(
                 touch(vm, addr, old, &mut |v| obj.set_body_oop(i, v));
             }
             let len = obj.indexable_len();
-            let tail0 = obj.tail_start_word();
-            for i in 0..len {
-                let addr = obj.body_addr(tail0 + i);
-                let old = obj.tail_oop_at(i);
-                touch(vm, addr, old, &mut |v| obj.set_tail_oop_at(i, v));
+            // `body_addr` bounds-checks against the object's actual word
+            // count, so an empty tail (len 0) has no valid index to even
+            // compute a base address from — nothing to scan either way.
+            if len > 0 {
+                let tail0 = obj.tail_start_word();
+                // Bound the loop to the window directly rather than
+                // scanning the WHOLE tail and filtering per-element inside
+                // `touch`: an object spanning C cards would otherwise cost
+                // O(C * len) to rescan (each of its C cards separately
+                // re-walking every one of its `len` elements) instead of
+                // O(len) total — for a large array this turns one
+                // dirty-card scan into billions of redundant slot visits
+                // (found via a real hang under MACVM_GC_STRESS=1 on
+                // ordinary OrderedCollection growth, not a synthetic
+                // case). `body_addr` is affine in its index (`heap.rs`'s
+                // `body_ptr`), so the in-window sub-range of `i` is a
+                // direct computation, not a search.
+                let tail_base = obj.body_addr(tail0);
+                // Both bounds use ceiling division: `addr(i) = tail_base +
+                // WORD_SIZE*i`, and the smallest `i` with `addr(i) >=
+                // window_start` is `ceil((window_start - tail_base) /
+                // WORD_SIZE)`, not the floor — e.g. tail_base=0,
+                // WORD_SIZE=8, window_start=17 must exclude i=2 (addr 16,
+                // outside the window) and start at i=3 (addr 24);
+                // floor(17/8)=2 would wrongly include it.
+                let lo = window_start.saturating_sub(tail_base).div_ceil(WORD_SIZE);
+                let hi = window_end
+                    .saturating_sub(tail_base)
+                    .div_ceil(WORD_SIZE)
+                    .min(len);
+                for i in lo..hi {
+                    let addr = obj.body_addr(tail0 + i);
+                    let old = obj.tail_oop_at(i);
+                    touch(vm, addr, old, &mut |v| obj.set_tail_oop_at(i, v));
+                }
             }
         }
         Format::IndexableBytes | Format::Method => {
@@ -907,5 +937,66 @@ mod tests {
             "referenced object must resolve to a live address"
         );
         assert_ne!(referenced_now.raw(), referenced.oop().raw());
+    }
+
+    /// `scan_slots_in_window`'s IndexableOops branch used to loop over an
+    /// object's ENTIRE tail on every dirty card it was asked to scan
+    /// (window membership filtered inside the loop body, not by bounding
+    /// the loop itself) — an object spanning C cards cost O(C * length) to
+    /// rescan, not O(length) (found via a real multi-minute hang under
+    /// MACVM_GC_STRESS=1 on ordinary OrderedCollection growth, not
+    /// inspection). Fixed to compute the in-window index range directly.
+    /// This pins the CORRECTNESS side of that fix: a young reference
+    /// planted in the LAST card of a large old-gen array — far from
+    /// index 0 — must still be found and updated, not just a reference in
+    /// the first card (which every other scavenge test here happens to
+    /// use, since none of them are big enough to span more than one card).
+    #[test]
+    fn multi_card_object_dirty_card_scan_finds_a_late_slot() {
+        let mut vm = test_vm();
+        vm.universe.tenuring_threshold = 0; // promote immediately
+        let klass = vm.universe.array_klass;
+
+        // 1000 elements is comfortably more than one card (CARD_SIZE=512
+        // bytes = 64 words; this tail alone is 1000 words).
+        let holder = alloc::alloc_indexable_oops(&mut vm, klass, 1000);
+        vm.stack.push(holder.oop());
+        scavenge(&mut vm).expect("scavenge must promote the holder");
+        vm.universe.tenuring_threshold = 0;
+
+        let holder_now =
+            crate::oops::wrappers::ArrayOop::try_from(vm.stack.get(vm.stack.sp - 1)).unwrap();
+        assert!(vm.universe.layout.is_old(holder_now.oop().mem_addr()));
+
+        // A fresh eden object, planted at the LAST slot via the real
+        // barriered store — the only thing that should ever dirty an
+        // old-gen card in production code, and exactly what needs the
+        // dirty-card scan to actually reach that card's own window.
+        // `klass` re-fetched: the scavenge above is the first one this
+        // fresh VM has ever run, so it's also the first chance
+        // `array_klass` itself has had to move (out of eden, same as
+        // anything else) — the `klass` local captured before it is stale.
+        let klass = vm.universe.array_klass;
+        let referenced = alloc::alloc_indexable_oops(&mut vm, klass, 0);
+        let last = holder_now.len() - 1;
+        let holder_mem = MemOop::try_from(holder_now.oop()).unwrap();
+        crate::memory::store::store_tail_oop(&mut vm, holder_mem, last, referenced.oop());
+        assert!(
+            vm.universe.layout.is_new(referenced.oop().mem_addr()),
+            "test must actually plant a young reference to exercise the scan"
+        );
+
+        vm.universe.tenuring_threshold = 0;
+        scavenge(&mut vm).expect("scavenge must succeed");
+
+        let holder_after =
+            crate::oops::wrappers::ArrayOop::try_from(vm.stack.get(vm.stack.sp - 1)).unwrap();
+        let referenced_now = holder_after.at(last);
+        assert_ne!(
+            referenced_now.raw(),
+            referenced.oop().raw(),
+            "the dirty-card scan must have found the late slot and scavenged/promoted it, \
+             not left it pointing at a stale (by now poisoned) eden address"
+        );
     }
 }

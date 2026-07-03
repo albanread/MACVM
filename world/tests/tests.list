@@ -18,4 +18,5 @@
 14_stream_print_tests.mst
 15_block_tests.mst
 16_dispatch_tests.mst
+17_gc_full_tests.mst
 99_run_all.mst
