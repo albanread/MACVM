@@ -10,8 +10,11 @@ use crate::compiler::jasm_assembler::JasmAssembler;
 use crate::oops::layout::{
     ROOTSPILL_BYTES, VMREG_LAST_COMPILED_FP_OFFSET, VMREG_LAST_COMPILED_PC_OFFSET,
 };
+use crate::oops::Oop;
+use crate::runtime::lookup::{klass_of, lookup};
 use crate::runtime::vm_state::VmState;
 
+use super::nmethod::IcState;
 use super::{CodeCache, CodeHandle};
 
 /// D5's shared stub skeleton, part 1: anchor + AAPCS frame + RootSpill
@@ -246,17 +249,6 @@ fn build_stub_poll() -> CodeBlob {
 /// naturally sets it; a guard's `b` doesn't touch it) — captured into x1
 /// (`rt_resolve_send`'s `ret_addr` argument) before `call_far`'s own `blr`
 /// would otherwise clobber it.
-///
-/// This step's `rt_resolve_send` is a placeholder (S11 step 3 replaces the
-/// body with the real lookup+patch logic — it needs `IcSite`'s `selector`/
-/// `argc`/`state` fields, which don't exist until S11 step 2): it proves
-/// the skeleton's own round trip — anchor set, RootSpill written and
-/// readable from Rust, the call reaches Rust and returns, anchor cleared,
-/// RootSpill reloaded, tail-jump happens to a real, safe address — by
-/// echoing `ret_addr` straight back as the address to jump to. For a real
-/// site that's exactly the send's own continuation, i.e. a correct (if
-/// pointless) no-op; it's what makes the skeleton itself testable before
-/// any real target resolution exists to jump to instead.
 fn build_stub_resolve() -> CodeBlob {
     let mut a = JasmAssembler::new();
 
@@ -283,7 +275,25 @@ fn build_stub_resolve() -> CodeBlob {
 /// live `u64`s, receiver + up to 5 args); valid for the duration of this
 /// call only (the stub reloads and may clobber that memory immediately
 /// after, on its way to the tail-jump).
-pub unsafe extern "C" fn rt_resolve_send(vm: *mut VmState, ret_addr: u64, _argv: *mut u64) -> u64 {
+///
+/// D4.1's mono path: finds the caller nmethod and its `IcSite` from
+/// `ret_addr` (`ret_addr - 4` is always the `bl`/guard-miss site itself —
+/// D4.1's own invariant, true through EITHER door), resolves the real
+/// target via the SAME two-step lookup a normal interpreted send does
+/// (`klass_of` + `runtime::lookup::lookup`, so a compiled call sees
+/// exactly the method an interpreted send to the same receiver would),
+/// then patches the site directly to the target's `entry` and records
+/// `Mono{klass, target}`.
+///
+/// DNU (`lookup` finds nothing), an interpreted-only target (`code_table
+/// .lookup` finds no nmethod), and every transition out of `Mono`/`Pic`/
+/// `Mega` besides "same klass, repatch" are S11 steps 4/5/6's own scope —
+/// deliberately loud (`todo!`/`unreachable!`) rather than silently wrong:
+/// nothing in the codebase can drive them yet (S10's `convert()` never
+/// constructs `Ir::CallSend` at all; every real call site is hand-built by
+/// this step's own tests, against selectors that exist and targets that
+/// are already compiled).
+pub unsafe extern "C" fn rt_resolve_send(vm: *mut VmState, ret_addr: u64, argv: *mut u64) -> u64 {
     // SAFETY: this function's own contract, guaranteed by `stub_resolve`.
     let vm = unsafe { &mut *vm };
     // P9, checked from the inside: any stub reaching Rust must have set
@@ -296,7 +306,67 @@ pub unsafe extern "C" fn rt_resolve_send(vm: *mut VmState, ret_addr: u64, _argv:
         vm.reg_block.last_compiled_fp, 0,
         "rt_resolve_send: anchor must be set by stub_resolve's prologue before this call"
     );
-    ret_addr
+
+    let caller_id = vm
+        .code_table
+        .find_by_pc(ret_addr)
+        .expect("rt_resolve_send: ret_addr must fall inside a published nmethod (D4.1)");
+    let caller_nm = vm
+        .code_table
+        .get(caller_id)
+        .expect("find_by_pc just returned this id");
+    let caller_code = caller_nm.code;
+    let site_off = (ret_addr - 4 - caller_code.base as u64) as u32;
+    let site_idx = caller_nm
+        .ic_sites
+        .iter()
+        .position(|s| s.off == site_off)
+        .unwrap_or_else(|| {
+            panic!("rt_resolve_send: no IcSite at offset {site_off} in nmethod {caller_id:?}")
+        });
+    let selector = caller_nm.ic_sites[site_idx].selector;
+    let prev_state = caller_nm.ic_sites[site_idx].state;
+
+    // SAFETY: this function's own contract above -- `argv[0]` is always
+    // the receiver, D4.1's register protocol.
+    let receiver = Oop::from_raw(unsafe { *argv });
+    let k = klass_of(vm, receiver);
+
+    let Some(_method) = lookup(vm, k, selector) else {
+        todo!("S11 step 6: DNU from compiled code (stubs.dnu / rt_dnu)")
+    };
+    let Some(target_id) = vm.code_table.lookup(k, selector) else {
+        todo!("S11 step 4: c2i adapter for an interpreted-only target")
+    };
+    let target_nm = vm
+        .code_table
+        .get(target_id)
+        .expect("code_table.lookup just returned this id");
+    let target_entry = target_nm.code.base as u64 + target_nm.entry_off as u64;
+
+    match prev_state {
+        IcState::Unresolved => {}
+        IcState::Mono { klass, .. } if klass == k => {}
+        IcState::Mono { .. } => {
+            todo!("S11 step 5: Mono -> Pic promotion on a differing receiver klass")
+        }
+        IcState::Pic { .. } | IcState::Mega { .. } => unreachable!(
+            "rt_resolve_send: nothing in this codebase yet constructs Pic/Mega (S11 step 5)"
+        ),
+    }
+
+    vm.code_cache
+        .patch_branch26_at(caller_code, site_off, target_entry);
+    vm.code_table
+        .get_mut(caller_id)
+        .expect("caller nmethod is still installed -- this call is running ON it")
+        .ic_sites[site_idx]
+        .state = IcState::Mono {
+        klass: k,
+        target: target_entry,
+    };
+
+    target_entry
 }
 
 /// S10: nothing sets `VmRegBlock::poll_flag` nonzero yet (mirrors
@@ -383,67 +453,15 @@ mod tests {
         assert!(cache.contains(stubs.resolve_addr()));
     }
 
-    fn test_vm() -> VmState {
-        VmState::with_options(crate::runtime::vm_state::VmOptions {
-            heap_mib: 64,
-            trace: Default::default(),
-            gc_stress: false,
-            gc_stress_full_period: None,
-            eden_kb: None,
-            jit: crate::runtime::JitMode::Off,
-        })
-    }
-
-    /// S11 step 1's own scoped claim: `stub_resolve`'s skeleton round-trips
-    /// safely all the way out to Rust and back, without yet resolving
-    /// anything real. Calling it directly via `call_stub` (`entry` =
-    /// `resolve_addr()`, bypassing the `bl_patchable`/`IcSite` machinery
-    /// S11 step 2 adds) puts `x30` at *`call_stub`'s own* post-`blr`
-    /// continuation when the stub captures `ret_addr` — so the placeholder
-    /// `rt_resolve_send` (which just echoes `ret_addr` back as the
-    /// tail-jump target) lands `stub_resolve`'s own `br x16` right back
-    /// where a normal `ret` would have gone, and `call_stub` finishes
-    /// completely normally. The one meaningful thing this proves: x0..x5
-    /// survive the round trip through RootSpill (spilled before the call,
-    /// reloaded after) even though real Rust code ran and could easily
-    /// have corrupted them if the offsets were wrong.
-    #[test]
-    fn resolve_stub_round_trips_and_preserves_regs() {
-        let mut vm = test_vm();
-        let mut cache = test_cache();
-        let stubs = install(&mut cache);
-
-        let call: CallStubFn = unsafe { std::mem::transmute(stubs.call_stub_entry()) };
-        let vm_ptr: *mut VmState = &mut vm;
-        let argv = [0x1000_0042u64, 0x2000_0007u64];
-        let result = unsafe { call(stubs.resolve_addr(), vm_ptr, argv.as_ptr(), 2) };
-        assert_eq!(
-            result, argv[0],
-            "x0 (receiver) must survive the RootSpill round trip through stub_resolve unchanged"
-        );
-        assert_eq!(
-            vm.reg_block.last_compiled_fp, 0,
-            "the anchor must be cleared again once the stub has returned (P9)"
-        );
-    }
-
-    /// `rt_resolve_send`'s placeholder body, checked directly as a plain
-    /// Rust function call (no assembly involved) — the narrowest possible
-    /// test of "does this echo ret_addr", independent of the stub skeleton
-    /// working correctly around it (that's the job of the test above). The
-    /// function's own contract requires the anchor already be set (checked
-    /// by its own `debug_assert_ne!`, P9) — a direct call bypasses
-    /// `stub_resolve`'s prologue, which is the only thing that normally
-    /// sets it, so this test fakes that precondition by hand rather than
-    /// going through real assembly for a check that doesn't need it.
-    #[test]
-    fn rt_resolve_send_placeholder_echoes_ret_addr() {
-        let mut vm = test_vm();
-        vm.reg_block.last_compiled_fp = 0xFACE_u64; // fake anchor, satisfies the precondition
-        let mut argv = [0u64; 6];
-        let ret_addr = 0xDEAD_BEEFu64;
-        let vm_ptr: *mut VmState = &mut vm;
-        let result = unsafe { rt_resolve_send(vm_ptr, ret_addr, argv.as_mut_ptr()) };
-        assert_eq!(result, ret_addr);
-    }
+    // S11 step 1 had a placeholder `rt_resolve_send` (echoed `ret_addr`
+    // straight back) and two tests scoped to exactly that: a round trip
+    // through real assembly, and a direct Rust-level call. S11 step 3
+    // replaces the placeholder with the real D4.1 lookup+patch logic,
+    // which requires `ret_addr` to fall inside a genuinely installed
+    // `Nmethod` with a matching `IcSite` — neither placeholder test's
+    // fabricated `ret_addr`/bare `VmState` satisfies that anymore, and
+    // both are superseded by `tests/it_tier1.rs`'s
+    // `mono_resolve_patches_call_site_and_dispatches`, a strictly stronger
+    // claim (real dispatch reaches the right target and returns the right
+    // value, not just "some bytes came back unchanged").
 }

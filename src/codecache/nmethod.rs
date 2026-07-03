@@ -52,13 +52,16 @@ pub struct PcDesc {
 /// A compiled call site's own IC lattice state (S11 D3/D4) — mirrors the
 /// interpreter IC's mono→poly→mega shape (SPEC §5.3) but lives entirely on
 /// the Rust side (compiled code itself only ever sees "call whatever the
-/// patched `bl` currently targets"). `Pic`/`Mega` carry the generated
-/// stub's own handle so a later transition knows what to free (P1/P2:
-/// rebuild-and-swing, never an in-place edit).
+/// patched `bl` currently targets"). `Mono` records the klass/target pair
+/// it was resolved for — D4.1's own state table needs the OLD pair on a
+/// later "different klass" resolve, to seed a fresh PIC alongside the new
+/// one. `Pic`/`Mega` carry the generated stub's own handle so a later
+/// transition knows what to free (P1/P2: rebuild-and-swing, never an
+/// in-place edit).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum IcState {
     Unresolved,
-    Mono,
+    Mono { klass: KlassOop, target: u64 },
     Pic { stub: CodeHandle, n: u8 },
     Mega { stub: CodeHandle },
 }
@@ -168,6 +171,15 @@ impl CodeTable {
 
     pub fn get(&self, id: NmethodId) -> Option<&Nmethod> {
         self.slots.get(id.0 as usize)?.as_ref()
+    }
+
+    /// D4.1: `rt_resolve_send` needs this to patch the CALLER's own
+    /// `ic_sites[i].state` after `patch_branch26_at` repoints its `bl` —
+    /// `get`'s `&self` can't do that, and the two are never live at once
+    /// (every caller reads what it needs from `get`'s borrow into owned
+    /// locals before reaching for this one).
+    pub fn get_mut(&mut self, id: NmethodId) -> Option<&mut Nmethod> {
+        self.slots.get_mut(id.0 as usize)?.as_mut()
     }
 
     /// Binary-searches `by_addr` for the nmethod whose published range

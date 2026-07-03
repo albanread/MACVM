@@ -5,20 +5,25 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 use macvm::bytecode::builder::BytecodeBuilder;
+use macvm::codecache::nmethod::{IcSite, IcState, NmState, Nmethod, NmethodId};
 use macvm::codecache::stubs::{self, CallStubFn};
 use macvm::codecache::CodeCache;
 use macvm::compiler::driver;
 use macvm::compiler::emit;
 use macvm::compiler::ir::{
-    BailoutReason, BlockId, CmpOp, Ir, IrBlock, IrMethod, PoolLit, SmiOp, VReg, VRegInfo,
+    BailoutReason, BlockId, CallSiteInfo, CmpOp, Ir, IrBlock, IrMethod, PoolLit, SmiOp, VReg,
+    VRegInfo,
 };
 use macvm::compiler::jasm_assembler::JasmAssembler;
 use macvm::compiler::regalloc;
 use macvm::frontend::{classdef, parser};
 use macvm::interpreter::ic::InterpreterIc;
+use macvm::memory::alloc;
+use macvm::oops::layout::HEADER_WORDS;
 use macvm::oops::smi::SmallInt;
 use macvm::oops::wrappers::{KlassOop, MemOop, MethodOop, SymbolOop};
-use macvm::oops::Oop;
+use macvm::oops::{Format, Oop};
+use macvm::runtime::lookup::install_method;
 use macvm::runtime::{JitMode, VmOptions, VmState};
 
 fn test_vm() -> VmState {
@@ -1329,5 +1334,178 @@ fn compiled_entry_stack_discipline_across_argc() {
             recv,
             "argc={argc}: ^self must return the receiver"
         );
+    }
+}
+
+/// S11 step 3's own explicit test target (`sprint_s11_detail.md`'s
+/// implementation order, item 3): "C->C mono calls work (test: two
+/// compiled methods)". The callee (`S11Target>>foo:with:`) is compiled
+/// through the REAL front door (`BytecodeBuilder` + `driver::
+/// compile_method`, same as `compiled_plus_arg_executes_correctly`) and
+/// genuinely `install_method`-ed first, so `rt_resolve_send`'s own
+/// `runtime::lookup::lookup` call finds it exactly the way an interpreted
+/// send would. The caller is hand-built `Ir` (S10's `convert()` never
+/// constructs `Ir::CallSend` -- that's S11 step 7's job), published and
+/// installed directly, its one `IcSite` starting `Unresolved` (its `bl`
+/// pointed at `stub_resolve` -- S11 step 2's own patch loop, replicated
+/// here by hand since there's no `driver::compile_method` front door for
+/// hand-built `Ir` yet).
+///
+/// `foo:with:` returns its SECOND real argument unchanged -- deliberately
+/// not the receiver and not the first argument, so a correct result can
+/// only come from x2 (the third RootSpill slot) having survived
+/// `stub_resolve`'s own spill/reload AND landed in the right register at
+/// the callee's own entry; any bug in either would either crash or return
+/// a wrong/unrelated value, never accidentally the right one.
+#[test]
+fn mono_resolve_patches_call_site_and_dispatches() {
+    let mut vm = test_vm();
+
+    let target_klass = vm.universe.new_klass(
+        vm.universe.object_klass,
+        "S11Target",
+        Format::Slots,
+        false,
+        HEADER_WORDS,
+    );
+    let foo_sel = vm.universe.intern(b"foo:with:");
+    let mut fb = BytecodeBuilder::new();
+    fb.push_temp(1); // second real arg
+    fb.ret_tos();
+    let foo_method = fb.finish(&mut vm, foo_sel, 2, 0);
+    install_method(&mut vm, target_klass, foo_sel, foo_method);
+    assert!(
+        driver::eligible(&vm, foo_method),
+        "push_temp+ret_tos has no sends, trivially eligible"
+    );
+    let callee_id = driver::compile_method(&mut vm, target_klass, foo_method)
+        .expect("eligible method must compile");
+    let callee_nm = vm.code_table.get(callee_id).unwrap();
+    let callee_entry = unsafe { callee_nm.code.base.add(callee_nm.entry_off as usize) } as u64;
+
+    // Caller: one param (the target receiver), one send of `foo:with:`
+    // against two fresh smi constants -- self=x0, arg0=x1, arg1=x2.
+    let vregs: Vec<VRegInfo> = (0..4).map(|_| VRegInfo { is_oop: true }).collect();
+    let block0 = IrBlock {
+        id: BlockId(0),
+        bci: 0,
+        code: vec![
+            Ir::Param {
+                dst: VReg(0),
+                index: 0,
+            },
+            Ir::ConstSmi {
+                dst: VReg(1),
+                value: 111,
+            },
+            Ir::ConstSmi {
+                dst: VReg(2),
+                value: 222,
+            },
+            Ir::CallSend {
+                dst: VReg(3),
+                site: 0,
+                args: vec![VReg(0), VReg(1), VReg(2)],
+            },
+            Ir::Ret { val: VReg(3) },
+        ],
+        entry_stack: Vec::new(),
+    };
+    let caller_method = IrMethod {
+        blocks: vec![block0],
+        vregs,
+        pool: Vec::new(),
+        argc: 1,
+        ntemps: 0,
+        safepoints: Vec::new(),
+        true_lit: PoolLit(0),
+        false_lit: PoolLit(0),
+        call_sites: vec![CallSiteInfo {
+            selector: foo_sel,
+            argc: 3,
+        }],
+    };
+    let ra = regalloc::regalloc(&caller_method);
+    let mut asm = JasmAssembler::new();
+    let (blob, _pcs, _verified_entry_off, emitted_ic_sites) = emit::emit(
+        &mut asm,
+        &caller_method,
+        &ra,
+        vm.stubs.stub_poll_addr(),
+        None,
+    );
+    assert_eq!(emitted_ic_sites.len(), 1, "exactly one Ir::CallSend");
+
+    let h = vm.code_cache.alloc(blob.code.len()).unwrap();
+    vm.code_cache.publish(h, &blob);
+    let resolve_addr = vm.stubs.resolve_addr();
+    for site in &emitted_ic_sites {
+        vm.code_cache.patch_branch26_at(h, site.off, resolve_addr);
+    }
+    let caller_probe_sel = vm.universe.intern(b"s11CallerProbe");
+    let ic_sites: Vec<IcSite> = emitted_ic_sites
+        .iter()
+        .map(|s| IcSite {
+            off: s.off,
+            selector: s.selector,
+            argc: s.argc,
+            state: IcState::Unresolved,
+        })
+        .collect();
+    let caller_nm = Nmethod {
+        id: NmethodId(0),
+        key_klass: target_klass,
+        key_selector: caller_probe_sel,
+        code: h,
+        entry_off: 0,
+        verified_entry_off: 0,
+        state: NmState::Alive,
+        level: 1,
+        version: 0,
+        literal_off: blob.literal_off,
+        relocs: blob.relocs.clone(),
+        frame_slots: ra.frame_slots,
+        pcdescs: Vec::new(),
+        oopmaps: Vec::new(),
+        ic_sites,
+        poll_bci: None,
+    };
+    let caller_id = vm.code_table.install(caller_nm);
+    let caller_entry = h.base as u64; // entry_off == verified_entry_off == 0 (no guard, `None`)
+
+    let receiver = alloc::alloc_slots(&mut vm, target_klass).oop();
+    let call: CallStubFn = unsafe { std::mem::transmute(vm.stubs.call_stub_entry()) };
+    let vm_ptr: *mut VmState = &mut vm;
+    let argv = [receiver.raw()];
+
+    let result = unsafe { call(caller_entry, vm_ptr, argv.as_ptr(), 1) };
+    assert_eq!(
+        result,
+        SmallInt::new(222).oop().raw(),
+        "first dispatch (through stub_resolve) must reach foo:with: and return its 2nd arg"
+    );
+
+    let nm_after = vm.code_table.get(caller_id).unwrap();
+    match nm_after.ic_sites[0].state {
+        IcState::Mono { klass, target } => {
+            assert_eq!(klass, target_klass, "must record the receiver's own klass");
+            assert_eq!(target, callee_entry, "must record foo:with:'s own entry");
+        }
+        other => panic!("expected Mono after the first resolve, got {other:?}"),
+    }
+
+    // Second call through the NOW-PATCHED site (same klass): must reach
+    // foo:with: directly, never touching stub_resolve/rt_resolve_send's
+    // Unresolved arm again -- exercises the "Mono, same klass" repatch
+    // arm instead.
+    let result2 = unsafe { call(caller_entry, vm_ptr, argv.as_ptr(), 1) };
+    assert_eq!(result2, SmallInt::new(222).oop().raw());
+    let nm_after2 = vm.code_table.get(caller_id).unwrap();
+    match nm_after2.ic_sites[0].state {
+        IcState::Mono { klass, target } => {
+            assert_eq!(klass, target_klass);
+            assert_eq!(target, callee_entry);
+        }
+        other => panic!("expected still-Mono after the second (same-klass) resolve, got {other:?}"),
     }
 }
