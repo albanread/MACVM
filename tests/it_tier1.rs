@@ -15,6 +15,7 @@ use macvm::frontend::{classdef, parser};
 use macvm::interpreter::ic::InterpreterIc;
 use macvm::oops::smi::SmallInt;
 use macvm::oops::wrappers::{KlassOop, MemOop, MethodOop, SymbolOop};
+use macvm::oops::Oop;
 use macvm::runtime::{JitMode, VmOptions, VmState};
 
 fn test_vm() -> VmState {
@@ -704,4 +705,310 @@ fn golden_bits_of() {
     let method = method_named(&mut vm, klass, "bitsOf:");
     let listing = compile_and_get_listing(&vm, method);
     check_golden_lst("s10_bitsOf", &listing);
+}
+
+// ── compiled_result_equals_interpreted (tests_s10.md gate item 2, ─────────
+// integration item 2): "the micro-differential harness".
+
+/// A `VmState` with every smi binary op the differential methods below
+/// need, real `SMI_INLINE` primitive ids (`compiler::driver::SMI_INLINE`)
+/// so each inner send can actually classify as mono-smi-inlinable once
+/// warm.
+fn diff_vm() -> VmState {
+    let mut vm = test_vm();
+    install_smi_prim(&mut vm, b"+", 1, 1);
+    install_smi_prim(&mut vm, b"-", 1, 2);
+    install_smi_prim(&mut vm, b"*", 1, 3);
+    install_smi_prim(&mut vm, b"<", 1, 10);
+    install_smi_prim(&mut vm, b">=", 1, 13);
+    install_smi_prim(&mut vm, b"=", 1, 14);
+    vm
+}
+
+/// `^a with: b` for a single binary smi selector already installed by
+/// [`diff_vm`] -- argc=2, no temps, `self` untouched (every differential
+/// method here ignores its own receiver, matching `bitsOf:`/`sumTo:`'s own
+/// convention above).
+fn build_binop_method(vm: &mut VmState, method_name: &[u8], sel_name: &[u8]) -> MethodOop {
+    let sel = vm.universe.intern(sel_name);
+    let mut b = BytecodeBuilder::new();
+    b.push_temp(0);
+    b.push_temp(1);
+    b.send(vm, sel, 1);
+    b.ret_tos();
+    let m_sel = vm.universe.intern(method_name);
+    b.finish(vm, m_sel, 2, 0)
+}
+
+/// `compareChain: a with: b with: c` ==
+/// `(a < b) ifTrue: [1] ifFalse: [(b < c) ifTrue: [2] ifFalse: [3]]` --
+/// argc=3, two distinct `<` send sites (real Smalltalk source's own
+/// ifTrue:ifFalse: inlining produces exactly this branch shape --
+/// `decode.rs`'s `leaders_if_else` test's own convention -- so raw
+/// `br_false_fwd`/`jump_fwd` here matches what the real frontend would
+/// have emitted, not a synthetic shortcut).
+fn build_compare_chain_method(vm: &mut VmState) -> MethodOop {
+    let lt_sel = vm.universe.intern(b"<");
+    let mut b = BytecodeBuilder::new();
+    b.push_temp(0);
+    b.push_temp(1);
+    b.send(vm, lt_sel, 1);
+    let else1 = b.new_label();
+    let end = b.new_label();
+    b.br_false_fwd(else1);
+    b.push_smi_i8(1);
+    b.jump_fwd(end);
+    b.bind(else1);
+    b.push_temp(1);
+    b.push_temp(2);
+    b.send(vm, lt_sel, 1);
+    let else2 = b.new_label();
+    b.br_false_fwd(else2);
+    b.push_smi_i8(2);
+    b.jump_fwd(end);
+    b.bind(else2);
+    b.push_smi_i8(3);
+    b.bind(end);
+    b.ret_tos();
+    let m_sel = vm.universe.intern(b"compareChain:with:with:");
+    b.finish(vm, m_sel, 3, 0)
+}
+
+/// `rank: a with: b` ==
+/// `(a >= b) ifTrue: [(a = b) ifTrue: [0] ifFalse: [1]] ifFalse: [-1]` --
+/// argc=2, `>=`/`=` (a second, distinct pair of `SMI_INLINE` comparison
+/// ops from `compareChain:with:with:`'s `<`); `=`'s send site sits
+/// strictly inside `>=`'s true branch.
+fn build_rank_method(vm: &mut VmState) -> MethodOop {
+    let ge_sel = vm.universe.intern(b">=");
+    let eq_sel = vm.universe.intern(b"=");
+    let mut b = BytecodeBuilder::new();
+    b.push_temp(0);
+    b.push_temp(1);
+    b.send(vm, ge_sel, 1);
+    let else1 = b.new_label();
+    let end = b.new_label();
+    b.br_false_fwd(else1);
+    b.push_temp(0);
+    b.push_temp(1);
+    b.send(vm, eq_sel, 1);
+    let else2 = b.new_label();
+    b.br_false_fwd(else2);
+    b.push_smi_i8(0);
+    b.jump_fwd(end);
+    b.bind(else2);
+    b.push_smi_i8(1);
+    b.jump_fwd(end);
+    b.bind(else1);
+    b.push_smi_i8(-1);
+    b.bind(end);
+    b.ret_tos();
+    let m_sel = vm.universe.intern(b"rank:with:");
+    b.finish(vm, m_sel, 2, 0)
+}
+
+/// `tempShuffle: a with: b with: c` ==
+/// `| t | t := a + b. a := b. b := t + c. ^(a * 100) + b` -- argc=3 plus
+/// one true local (temp index 3), reassigning argument slots 0/1 as if
+/// they were locals too. The "temp shuffle" case: several vregs whose
+/// values get reordered/renamed in straight-line code, stressing the same
+/// "one persistent vreg per source temp" interval tracking this sprint's
+/// loop-carried-interval regalloc bugfix had to widen (`regalloc.rs`'s
+/// `compute_intervals`).
+fn build_temp_shuffle_method(vm: &mut VmState) -> MethodOop {
+    let plus_sel = vm.universe.intern(b"+");
+    let mul_sel = vm.universe.intern(b"*");
+    let mut b = BytecodeBuilder::new();
+    b.push_temp(0); // a
+    b.push_temp(1); // b
+    b.send(vm, plus_sel, 1); // a+b
+    b.store_temp_pop(3); // t := a+b
+    b.push_temp(1); // b
+    b.store_temp_pop(0); // a := b
+    b.push_temp(3); // t
+    b.push_temp(2); // c
+    b.send(vm, plus_sel, 1); // t+c
+    b.store_temp_pop(1); // b := t+c
+    b.push_temp(0); // a (= old b)
+    b.push_smi_i8(100);
+    b.send(vm, mul_sel, 1); // a*100
+    b.push_temp(1); // b (= old (a+b)+c)
+    b.send(vm, plus_sel, 1); // (a*100)+b
+    b.ret_tos();
+    let m_sel = vm.universe.intern(b"tempShuffle:with:with:");
+    b.finish(vm, m_sel, 3, 1)
+}
+
+/// Warms `method` interpreted with every arg tuple in `warmups` (enough of
+/// them, with the right truth values, to reach and warm EVERY send site --
+/// a method with two mutually exclusive branches needs one warmup call
+/// down each side, same requirement `golden_abs_diff` documents above),
+/// compiles it once, then for every `(args, expected)` in `cases` checks
+/// three independent computations of the same call agree: a fresh
+/// interpreted `run_method`, a direct invocation of the compiled entry,
+/// and `expected` itself -- a hand-derived answer, not just whatever the
+/// two paths happened to agree on (a bug shared by both would otherwise
+/// slip through a pure interpreted-vs-compiled diff).
+///
+/// `method` is the one value here that must survive multiple allocating
+/// `run_method` calls, so it's handle-protected for this whole call
+/// (`memory::handles`'s documented purpose) -- there's no klass/selector
+/// install to re-derive it from the way the golden tests above do, since
+/// these methods are built directly via `BytecodeBuilder`, never installed
+/// on any class. `dummy_recv` needs no such protection: a `SmallInt` is an
+/// immediate value, never a heap oop, so it can never move -- and every
+/// method built above ignores its own receiver anyway.
+fn assert_tier1_diff(
+    vm: &mut VmState,
+    method: MethodOop,
+    warmups: &[&[i64]],
+    cases: &[(&[i64], i64)],
+) {
+    let scope = macvm::memory::handles::HandleScope::enter(vm);
+    let method_h = scope.handle(vm, method);
+    let dummy_recv = SmallInt::new(0).oop();
+
+    for w in warmups {
+        let method = method_h.get(vm);
+        let arg_oops: Vec<Oop> = w.iter().map(|&v| SmallInt::new(v).oop()).collect();
+        macvm::interpreter::run_method(vm, method, dummy_recv, &arg_oops);
+    }
+
+    let method = method_h.get(vm);
+    let smi_klass = vm.universe.smi_klass;
+    let id = driver::compile_method(vm, smi_klass, method)
+        .unwrap_or_else(|| panic!("differential method must be eligible+compilable once warm"));
+    let nm = vm.code_table.get(id).expect("installed");
+    let entry = unsafe { nm.code.base.add(nm.entry_off as usize) } as u64;
+    let stubs = vm.stubs;
+
+    for &(args, expected) in cases {
+        let expected_oop = SmallInt::new(expected).oop();
+
+        let method = method_h.get(vm);
+        let arg_oops: Vec<Oop> = args.iter().map(|&v| SmallInt::new(v).oop()).collect();
+        let interp_result = macvm::interpreter::run_method(vm, method, dummy_recv, &arg_oops);
+        assert_eq!(
+            interp_result,
+            expected_oop,
+            "interpreted{args:?}: expected {expected}, got raw {:#x}",
+            interp_result.raw()
+        );
+
+        let mut argv: Vec<u64> = vec![dummy_recv.raw()];
+        argv.extend(args.iter().map(|&v| SmallInt::new(v).oop().raw()));
+        let compiled_result = stubs.invoke(entry, vm, &argv);
+        assert_eq!(
+            compiled_result,
+            expected_oop.raw(),
+            "compiled{args:?}: expected {expected} ({:#x}), got raw {compiled_result:#x}",
+            expected_oop.raw()
+        );
+    }
+}
+
+/// tests_s10.md's `compiled_result_equals_interpreted`: ~10 arithmetic
+/// methods (add/sub/mul right at the +/-2^61 smi boundary, comparison
+/// chains, temp shuffles), each run interpreted and compiled, checked
+/// against each other and an independently hand-computed value.
+/// Deliberately stays within `[SMI_MIN, SMI_MAX]` throughout -- genuine
+/// overflow-then-bailout-then-reinterpret coverage belongs to
+/// `bailout_falls_back_correctly` instead: a real overflow's interpreted
+/// answer is a heap `LargeInteger`, which "assert identical result oops
+/// (smi equality)" (tests_s10.md's own words for this test) doesn't
+/// describe.
+#[test]
+fn compiled_result_equals_interpreted() {
+    let mut vm = diff_vm();
+
+    let add_max = build_binop_method(&mut vm, b"addNearMax:with:", b"+");
+    assert_tier1_diff(
+        &mut vm,
+        add_max,
+        &[&[1, 1]],
+        &[(&[SmallInt::MAX - 1, 1], SmallInt::MAX)],
+    );
+
+    let add_min = build_binop_method(&mut vm, b"addNearMin:with:", b"+");
+    assert_tier1_diff(
+        &mut vm,
+        add_min,
+        &[&[1, 1]],
+        &[(&[SmallInt::MIN + 1, -1], SmallInt::MIN)],
+    );
+
+    let sub_max = build_binop_method(&mut vm, b"subNearMax:with:", b"-");
+    assert_tier1_diff(
+        &mut vm,
+        sub_max,
+        &[&[1, 1]],
+        &[(&[SmallInt::MAX - 1, -1], SmallInt::MAX)],
+    );
+
+    let sub_min = build_binop_method(&mut vm, b"subNearMin:with:", b"-");
+    assert_tier1_diff(
+        &mut vm,
+        sub_min,
+        &[&[1, 1]],
+        &[(&[SmallInt::MIN + 1, 1], SmallInt::MIN)],
+    );
+
+    let sub_zero_max = build_binop_method(&mut vm, b"subZeroMinusMax:with:", b"-");
+    assert_tier1_diff(
+        &mut vm,
+        sub_zero_max,
+        &[&[1, 1]],
+        &[(&[0, SmallInt::MAX], -SmallInt::MAX)],
+    );
+
+    let mul_pos = build_binop_method(&mut vm, b"mulLargePos:with:", b"*");
+    assert_tier1_diff(
+        &mut vm,
+        mul_pos,
+        &[&[2, 3]],
+        &[(&[1_500_000_000, 1_500_000_000], 2_250_000_000_000_000_000)],
+    );
+
+    let mul_neg = build_binop_method(&mut vm, b"mulLargeNeg:with:", b"*");
+    assert_tier1_diff(
+        &mut vm,
+        mul_neg,
+        &[&[2, 3]],
+        &[(&[-1_500_000_000, 1_500_000_000], -2_250_000_000_000_000_000)],
+    );
+
+    // `compareChain:with:with:`'s two `<` sites: one warmup with the first
+    // true (site 1 only), one with it false (reaches and warms site 2).
+    let compare_chain = build_compare_chain_method(&mut vm);
+    assert_tier1_diff(
+        &mut vm,
+        compare_chain,
+        &[&[1, 2, 3], &[5, 2, 3]],
+        &[
+            (&[10, 20, 5], 1), // a < b
+            (&[10, 5, 9], 2),  // a >= b, b < c
+            (&[10, 5, 1], 3),  // a >= b, b >= c
+        ],
+    );
+
+    // `rank:with:`'s `=` site sits strictly inside `>=`'s true branch -- a
+    // single warmup with a>=b true already reaches and warms both.
+    let rank = build_rank_method(&mut vm);
+    assert_tier1_diff(
+        &mut vm,
+        rank,
+        &[&[5, 5]],
+        &[(&[5, 5], 0), (&[5, 2], 1), (&[2, 5], -1)],
+    );
+
+    // t := a+b; a := b; b := t+c; ^(a*100)+b.
+    // a=7,b=13,c=5:    t=20,  a=13, b=25,  result=13*100+25=1325.
+    // a=100,b=1,c=1:   t=101, a=1,  b=102, result=1*100+102=202.
+    let shuffle = build_temp_shuffle_method(&mut vm);
+    assert_tier1_diff(
+        &mut vm,
+        shuffle,
+        &[&[1, 2, 3]],
+        &[(&[7, 13, 5], 1325), (&[100, 1, 1], 202)],
+    );
 }
