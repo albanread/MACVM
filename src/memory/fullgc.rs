@@ -344,6 +344,22 @@ fn post(vm: &mut VmState) {
     vm.universe.age_table.clear();
 }
 
+/// `MACVM_DBG_OOP` (S8 phase-C table item, `sprint_s08_detail.md`'s "table
+/// inventory sweep"): retarget the traced address if phase B just gave its
+/// object a new home — mirrors `scavenge_oop`'s own inline retarget.
+/// `dbg_oop_trace` is deliberately read-only and never chases forwarding
+/// itself (see its own doc comment); the mover is responsible for keeping
+/// the traced address current, and here that's one step removed from the
+/// per-object copy (full GC computes the whole plan before moving anything,
+/// unlike the scavenger's eager per-object copy), so it's a small pass over
+/// the finished `CompactPlan` rather than an inline check during the walk.
+fn retarget_dbg_oop(vm: &mut VmState, plan: &CompactPlan) {
+    let Some(addr) = vm.dbg_oop else { return };
+    if let Some(e) = plan.iter().find(|e| e.old == addr) {
+        vm.dbg_oop = Some(e.new);
+    }
+}
+
 /// The full mark-slide-compact collection (SPEC §7.5). Traces and compacts
 /// eden, from, and old, each toward its own space's bottom; `to` is
 /// untouched and must be empty (asserted — full GC never runs mid-scavenge,
@@ -367,6 +383,7 @@ pub fn full_gc(vm: &mut VmState) -> Result<FullGcReport, GcStallError> {
     }
     #[cfg(debug_assertions)]
     debug_assert_clean(vm);
+    super::verify::dbg_oop_trace(vm, "full-gc-entry");
 
     let start = Instant::now();
     let eden_top_before = vm.universe.eden.top;
@@ -375,6 +392,7 @@ pub fn full_gc(vm: &mut VmState) -> Result<FullGcReport, GcStallError> {
 
     // --- A ---------------------------------------------------------------
     let marked_bytes = mark(vm);
+    super::verify::dbg_oop_trace(vm, "full-gc-mark");
 
     // --- B ----------------------------------------------------------------
     let mut side_marks: SideMarks = HashMap::new();
@@ -387,6 +405,10 @@ pub fn full_gc(vm: &mut VmState) -> Result<FullGcReport, GcStallError> {
         old_top_before,
         &mut side_marks,
     );
+    retarget_dbg_oop(vm, &eden_plan);
+    retarget_dbg_oop(vm, &from_plan);
+    retarget_dbg_oop(vm, &old_plan);
+    super::verify::dbg_oop_trace(vm, "full-gc-forwarding-compute");
 
     // --- C ------------------------------------------------------------
     super::roots::for_each_root(vm, |_vm, oop| forward_chase(oop));
@@ -397,6 +419,7 @@ pub fn full_gc(vm: &mut VmState) -> Result<FullGcReport, GcStallError> {
     {
         rewrite_entry(e);
     }
+    super::verify::dbg_oop_trace(vm, "full-gc-rewrite");
 
     // --- D ------------------------------------------------------------
     slide_young(&eden_plan);
@@ -413,6 +436,7 @@ pub fn full_gc(vm: &mut VmState) -> Result<FullGcReport, GcStallError> {
         super::scavenge::poison_range(from_new_top, from_top_before);
         super::scavenge::poison_range(old_new_top, old_top_before);
     }
+    super::verify::dbg_oop_trace(vm, "full-gc-slide");
 
     // --- E ------------------------------------------------------------
     restore_marks(&eden_plan, &side_marks);
@@ -422,6 +446,7 @@ pub fn full_gc(vm: &mut VmState) -> Result<FullGcReport, GcStallError> {
 
     #[cfg(debug_assertions)]
     debug_assert_clean(vm);
+    super::verify::dbg_oop_trace(vm, "full-gc-restore");
 
     // --- F ------------------------------------------------------------
     post(vm);
@@ -447,6 +472,7 @@ pub fn full_gc(vm: &mut VmState) -> Result<FullGcReport, GcStallError> {
         super::verify::verify_heap_at(vm, VerifyPoint::FullGcExit)
             .expect("heap invalid at full-gc exit");
     }
+    super::verify::dbg_oop_trace(vm, "full-gc-exit");
 
     Ok(FullGcReport {
         marked_bytes,
@@ -841,5 +867,36 @@ mod tests {
 
         full_gc(&mut vm).expect("first full_gc must succeed");
         full_gc(&mut vm).expect("second full_gc must succeed");
+    }
+
+    /// S8 table-inventory item: `MACVM_DBG_OOP` must follow its traced
+    /// object through compaction, same as it already does through a
+    /// scavenge — otherwise it silently traces a dead (POISONed, in debug
+    /// builds) address for the rest of the run.
+    #[test]
+    fn full_gc_retargets_dbg_oop_to_the_moved_object() {
+        let mut vm = test_vm();
+        let klass = vm.universe.array_klass;
+        // A dead object ahead of it in address order forces an actual move
+        // (compaction slides `obj` down into the reclaimed gap).
+        let dead = alloc::alloc_indexable_oops(&mut vm, klass, 0);
+        let obj = alloc::alloc_indexable_oops(&mut vm, klass, 0);
+        let _ = dead;
+        vm.stack.push(obj.oop());
+        vm.dbg_oop = Some(obj.oop().mem_addr());
+
+        full_gc(&mut vm).expect("full_gc must succeed");
+
+        let moved = vm.stack.get(vm.stack.sp - 1);
+        assert_ne!(
+            moved.raw(),
+            obj.oop().raw(),
+            "the object must have actually moved"
+        );
+        assert_eq!(
+            vm.dbg_oop,
+            Some(moved.mem_addr()),
+            "dbg_oop must follow the object to its new address"
+        );
     }
 }
