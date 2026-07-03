@@ -142,6 +142,19 @@ impl MethodOop {
             .set_body_oop(METHOD_COUNTERS_INDEX, SmallInt::new(v).oop());
     }
 
+    /// S10 D1: set once `driver::eligible` rejects this method, so the
+    /// counter-overflow trigger stops re-attempting it.
+    pub fn compile_disabled(self) -> bool {
+        self.counters() & crate::oops::layout::COUNTERS_COMPILE_DISABLED_BIT != 0
+    }
+
+    /// Sets the compile-disabled bit and resets the invocation count to 0
+    /// (D1: "Ineligible methods set a dont-compile bit... and reset the
+    /// invocation count") — one write, since both live in the same smi.
+    pub fn set_compile_disabled(self) {
+        self.set_counters(crate::oops::layout::COUNTERS_COMPILE_DISABLED_BIT);
+    }
+
     pub fn literals(self) -> ArrayOop {
         ArrayOop::try_from(self.as_mem().body_oop(METHOD_LITERALS_INDEX))
             .expect("method literals field is not an Array")

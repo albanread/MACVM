@@ -324,10 +324,18 @@ fn instr_stack_delta(method: MethodOop, instr: &Instr) -> i32 {
 /// reached the compiler, not merely an internal invariant). Unreached
 /// blocks (`unreachable_after_return`'s dead tail) are left at depth 0 —
 /// harmless, since nothing ever reads an unreached block's entry_stack.
-fn compute_entry_depths(method: MethodOop, cfg: &Cfg) -> Vec<i32> {
+///
+/// Also returns the highest operand-stack depth reached anywhere (block
+/// entries and every point strictly inside a block's body) — `driver.rs`'s
+/// `eligible` reuses this same traversal for D1's frame-budget check
+/// (`ntemps + max_stack <= 60`) rather than re-deriving it with a second,
+/// separately-maintained scan; `convert` itself has no use for the value,
+/// it just threads it back out.
+pub(crate) fn compute_entry_depths(method: MethodOop, cfg: &Cfg) -> (Vec<i32>, i32) {
     let mut entry_depth: Vec<Option<i32>> = vec![None; cfg.blocks.len()];
     entry_depth[0] = Some(0);
     let mut worklist = vec![0usize];
+    let mut max_depth = 0i32;
 
     fn record(
         entry_depth: &mut [Option<i32>],
@@ -352,10 +360,12 @@ fn compute_entry_depths(method: MethodOop, cfg: &Cfg) -> Vec<i32> {
     while let Some(b) = worklist.pop() {
         let block = &cfg.blocks[b];
         let mut depth = entry_depth[b].expect("worklist entries always have a known depth");
+        max_depth = max_depth.max(depth);
         let mut bci = block.bci_start;
         while bci < block.bci_end {
             let (instr, next) = decode_at(method, bci);
             depth += instr_stack_delta(method, &instr);
+            max_depth = max_depth.max(depth);
             bci = next;
         }
         debug_assert!(
@@ -373,7 +383,10 @@ fn compute_entry_depths(method: MethodOop, cfg: &Cfg) -> Vec<i32> {
             Terminator::Return => {}
         }
     }
-    entry_depth.into_iter().map(|d| d.unwrap_or(0)).collect()
+    (
+        entry_depth.into_iter().map(|d| d.unwrap_or(0)).collect(),
+        max_depth,
+    )
 }
 
 /// D3.2's merge rule, evaluated once every block's `entry_depth` is known.
@@ -702,7 +715,7 @@ fn emit_merges(
 /// an [`IrMethod`]. `vm` supplies well-known oops (`nil`/`true`/`false`)
 /// and the smi klass every inlined send's IC is checked against.
 pub fn convert(vm: &VmState, method: MethodOop, cfg: &Cfg) -> IrMethod {
-    let entry_depth = compute_entry_depths(method, cfg);
+    let (entry_depth, _max_stack_depth) = compute_entry_depths(method, cfg);
     let sources = entry_stack_sources(cfg, &entry_depth);
 
     // Known before any translation starts (D2's bailout block sits right

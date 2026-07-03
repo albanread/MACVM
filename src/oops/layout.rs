@@ -224,6 +224,12 @@ pub const IC_POLY_ARRAY_LEN: usize = IC_POLY_MAX_PAIRS * 2;
 
 pub const COUNTERS_INVOCATION_MASK: i64 = 0xFFFF;
 pub const COUNTERS_INVOCATION_MAX: i64 = 0xFFFF;
+/// S10 D1: set by `compiler::driver::compile_method` when `eligible`
+/// rejects a method, so the interpreter's counter-overflow trigger doesn't
+/// re-attempt (and re-reject) the same never-compilable method every 10k
+/// sends. Bit 16 — the lowest of SPEC §4.4's reserved range, disjoint from
+/// `COUNTERS_INVOCATION_MASK`'s bits 0-15.
+pub const COUNTERS_COMPILE_DISABLED_BIT: i64 = 1 << 16;
 
 // --- MethodDictionary (SPEC §2.4, S3) ---------------------------------------
 // One named field (tally) then an indexable [k0,v0,k1,v1,...] tail.

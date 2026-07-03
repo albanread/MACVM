@@ -1,15 +1,19 @@
 //! Sprint S10 integration tests (`tests_s10.md`). This file is allowed
 //! `unsafe` (it lives in `tests/`, a separate crate from `macvm` itself).
 
+use macvm::bytecode::builder::BytecodeBuilder;
 use macvm::codecache::stubs::{self, CallStubFn};
 use macvm::codecache::CodeCache;
+use macvm::compiler::driver;
 use macvm::compiler::emit;
 use macvm::compiler::ir::{
     BailoutReason, BlockId, CmpOp, Ir, IrBlock, IrMethod, PoolLit, SmiOp, VReg, VRegInfo,
 };
 use macvm::compiler::jasm_assembler::JasmAssembler;
 use macvm::compiler::regalloc;
+use macvm::interpreter::ic::InterpreterIc;
 use macvm::oops::smi::SmallInt;
+use macvm::oops::wrappers::SymbolOop;
 use macvm::runtime::{JitMode, VmOptions, VmState};
 
 fn test_vm() -> VmState {
@@ -350,5 +354,85 @@ fn run_ir_raw_forces_spill() {
         r,
         SmallInt::new(expected).oop().raw(),
         "1+2+...+20 = 210, spilled operands included"
+    );
+}
+
+/// A throwaway method standing in for a real SmallInteger primitive —
+/// `driver::eligible` only ever reads its `primitive()` field.
+fn primitive_stub(
+    vm: &mut VmState,
+    sel: SymbolOop,
+    prim_id: i64,
+) -> macvm::oops::wrappers::MethodOop {
+    let mut b = BytecodeBuilder::new();
+    b.ret_self();
+    let m = b.finish(vm, sel, 1, 0);
+    m.set_primitive(prim_id);
+    m
+}
+
+/// S10 step 7's `driver::compile_method`, run through its *real* front
+/// door: real bytecode (`self + arg`, built via `BytecodeBuilder`, not a
+/// hand-assembled `IrMethod`), a real mono-smi IC, `driver::eligible`
+/// itself deciding this method qualifies, then the full decode -> convert
+/// -> regalloc -> emit -> publish -> install pipeline, then a real
+/// `call_stub` invocation of the result. `run_ir_raw` and its siblings
+/// above prove the back half of the pipeline (regalloc/emit/publish/call)
+/// in isolation; this is the one test in the suite that also exercises the
+/// front half (`eligible`, `decode`, `convert`, real `InterpreterIc`
+/// classification) and checks they all agree with each other on argument
+/// layout by actually running the result.
+#[test]
+fn compiled_plus_arg_executes_correctly() {
+    let mut vm = test_vm();
+    let plus_sel = vm.universe.intern(b"+");
+
+    let mut b = BytecodeBuilder::new();
+    b.push_self();
+    b.push_temp(0);
+    b.send(&mut vm, plus_sel, 1);
+    b.ret_tos();
+    let m_sel = vm.universe.intern(b"plusArg:");
+    let method = b.finish(&mut vm, m_sel, 1, 0);
+
+    let plus_target = primitive_stub(&mut vm, plus_sel, 1);
+    let smi_klass = vm.universe.smi_klass;
+    let epoch = vm.ic_epoch;
+    InterpreterIc::at(method, 0).set_mono(&mut vm, smi_klass, plus_target, epoch);
+    assert!(
+        driver::eligible(&vm, method),
+        "self + arg, mono smi IC, must be eligible"
+    );
+
+    let id =
+        driver::compile_method(&mut vm, smi_klass, method).expect("eligible method must compile");
+    let nm = vm
+        .code_table
+        .get(id)
+        .expect("installed nmethod must be gettable");
+    let entry = unsafe { nm.code.base.add(nm.entry_off as usize) } as u64;
+
+    let call: CallStubFn = unsafe { std::mem::transmute(vm.stubs.call_stub_entry()) };
+    let vm_ptr: *mut VmState = &mut vm;
+    // argv[0] = receiver (self), argv[1] = the one real Smalltalk arg —
+    // Ir::Param{index: 0} / Param{index: 1}, per ir::convert's entry block.
+    let argv = [SmallInt::new(5).oop().raw(), SmallInt::new(37).oop().raw()];
+    let result = unsafe { call(entry, vm_ptr, argv.as_ptr(), 2) };
+    assert_eq!(result, SmallInt::new(42).oop().raw(), "5 + 37 = 42");
+
+    // Overflowing operands must bail out to the sentinel, not crash or
+    // silently wrap — the interpreter fallback (S10 step 8) isn't wired up
+    // yet, so this just checks the compiled entry itself does the right
+    // thing at its own boundary.
+    // Both individually valid smis (SMI_MAX itself), but their sum isn't.
+    let big = macvm::oops::smi::SmallInt::MAX;
+    let argv_overflow = [
+        SmallInt::new(big).oop().raw(),
+        SmallInt::new(big).oop().raw(),
+    ];
+    let overflow_result = unsafe { call(entry, vm_ptr, argv_overflow.as_ptr(), 2) };
+    assert_eq!(
+        overflow_result, 0b10,
+        "overflowing smi add must return the BAILOUT sentinel"
     );
 }

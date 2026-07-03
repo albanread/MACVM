@@ -352,6 +352,11 @@ pub struct VmState {
     /// Installed nmethods, keyed by `(receiver klass, selector)` (S10 D6,
     /// D8). Empty for the lifetime of a `JitMode::Off` run.
     pub code_table: CodeTable,
+    /// `call_stub`/`stub_poll` (S10 D4/D5.6) — published into `code_cache`
+    /// once, here, at boot. `compile_method` needs `stub_poll_addr()` to
+    /// embed as a pool constant in any method that emits `Ir::Poll`;
+    /// `enter_compiled` (S10 step 8) needs `call_stub_entry()`.
+    pub stubs: crate::codecache::stubs::Stubs,
 }
 
 impl VmState {
@@ -370,6 +375,14 @@ impl VmState {
     /// cannot race on process-wide env vars) and by any later embedder.
     pub fn with_options(options: VmOptions) -> VmState {
         let universe = Universe::genesis(&options);
+        // Stubs are installed unconditionally (regardless of `options.jit`)
+        // so `compile_method` (S10 D4) never has to lazily bootstrap them
+        // mid-compile — one small, fixed, one-time cost per VM, matching
+        // `Universe::genesis` itself always building well-knowns a given
+        // script may never touch.
+        let mut code_cache = CodeCache::new(DEFAULT_CODE_CACHE_CAPACITY)
+            .expect("VmState::with_options: failed to reserve JIT code cache");
+        let stubs = crate::codecache::stubs::install(&mut code_cache);
         let mut vm = VmState {
             reg_block: VmRegBlock::new(),
             universe,
@@ -387,9 +400,9 @@ impl VmState {
             next_frame_serial: 0,
             dbg_oop: None,
             handle_arena: Box::new(crate::memory::handles::HandleArena::new()),
-            code_cache: CodeCache::new(DEFAULT_CODE_CACHE_CAPACITY)
-                .expect("VmState::with_options: failed to reserve JIT code cache"),
+            code_cache,
             code_table: CodeTable::new(),
+            stubs,
         };
         crate::runtime::globals::bootstrap_well_known(&mut vm);
         vm
