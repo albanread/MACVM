@@ -21,6 +21,10 @@ libc = "0.2"
 # "minimal diff against upstream" rule rather than re-threaded onto MACVM's
 # own error types.
 anyhow = "1"
+# codecache::guard::JitWriteGuard's flush-range list (sprint_s09_detail.md
+# D2.4) — almost always 1-2 entries per publish/patch, so the inline
+# capacity avoids a heap allocation on the common path.
+smallvec = "1"
 
 # Codegen backend is an OPEN DECISION (see docs/DESIGN.md §4). Backends are
 # selected by feature so the compiler front end never hard-depends on one.

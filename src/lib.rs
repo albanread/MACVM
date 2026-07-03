@@ -13,6 +13,7 @@
 #![deny(unsafe_code)]
 
 pub mod bytecode; // opcode set, CompiledMethod, builder, disassembler
+pub mod codecache; // nmethod code cache: CodeCache, CodeHandle, JitWriteGuard
 pub mod compiler; // adaptive optimizing compiler + abstract codegen
 pub mod frontend; // lexer, parser, AST, capture analysis, codegen, class loader
 pub mod interpreter; // baseline threaded-code interpreter
