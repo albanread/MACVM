@@ -91,3 +91,44 @@ pub fn enter_compiled(vm: &mut VmState, nm_id: NmethodId, argc: u8) -> EnterResu
     push(vm, Oop::from_raw(result_bits));
     EnterResult::Completed
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::oops::smi::SmallInt;
+    use crate::oops::wrappers::{ArrayOop, KlassOop, MemOop, MethodOop, SymbolOop};
+
+    /// tests_s10.md: `0b10` fails every typed-wrapper `try_from` — the
+    /// defense-in-depth half of this guarantee (`Oop::from_raw`'s own
+    /// `debug_assert!` is the primary one: it panics before this bit
+    /// pattern can even become an `Oop` through the normal, safe
+    /// constructor, which `enter_compiled` itself relies on by checking
+    /// `result_bits == BAILOUT_SENTINEL` on the raw `u64` BEFORE ever
+    /// calling `Oop::from_raw` on it). `from_raw_unchecked` — documented
+    /// as existing "for the mark-word slot and tests" — is what lets this
+    /// test construct the value at all.
+    #[test]
+    fn bailout_sentinel_not_oop() {
+        let sentinel = Oop::from_raw_unchecked(BAILOUT_SENTINEL);
+        assert!(!sentinel.is_mem(), "0b10 must not read as mem-tagged");
+        assert!(
+            MemOop::try_from(sentinel).is_none(),
+            "MemOop::try_from must reject the bailout sentinel"
+        );
+        assert!(SmallInt::try_from(sentinel).is_none());
+        assert!(KlassOop::try_from(sentinel).is_none());
+        assert!(ArrayOop::try_from(sentinel).is_none());
+        assert!(MethodOop::try_from(sentinel).is_none());
+        assert!(SymbolOop::try_from(sentinel).is_none());
+    }
+
+    /// The primary defense: constructing the sentinel through the normal,
+    /// safe `Oop` constructor panics outright in a debug build, rather
+    /// than silently producing a value the typed wrappers merely happen
+    /// to reject.
+    #[test]
+    #[should_panic(expected = "reserved tag")]
+    fn bailout_sentinel_panics_via_normal_from_raw() {
+        let _ = Oop::from_raw(BAILOUT_SENTINEL);
+    }
+}

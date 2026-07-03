@@ -412,6 +412,107 @@ mod tests {
         assert!(!eligible(&vm, method));
     }
 
+    /// D1 point 1: a `PushClosure` opcode (a literal block argument) is
+    /// excluded outright — never inlined by S10, unlike `to:do:`/
+    /// `whileTrue:`'s own frontend-level inlining (which emits no
+    /// `PushClosure` at all, see `world/tests/tier1.mst`'s own doc).
+    #[test]
+    fn eligible_rejects_closure_op() {
+        let mut vm = test_vm();
+        let mut b = BytecodeBuilder::new();
+        let lit = b.build_block(&mut vm, 0, 0, false, 0, false, |blk, _vm| {
+            blk.push_self();
+            blk.ret_tos();
+        });
+        b.push_closure(lit, 0);
+        b.pop();
+        b.ret_self();
+        let sel = vm.universe.intern(b"withBlock");
+        let method = b.finish(&mut vm, sel, 0, 0);
+        assert!(!eligible(&vm, method));
+    }
+
+    /// D1 point 1: `has_ctx` (a heap `Context` needed because some inner
+    /// block captures this activation's own temps/self) is excluded —
+    /// S10 compiled frames have no heap Context at all.
+    #[test]
+    fn eligible_rejects_has_ctx() {
+        let mut vm = test_vm();
+        let mut b = BytecodeBuilder::new();
+        b.ret_self();
+        let sel = vm.universe.intern(b"m");
+        let method = b.finish(&mut vm, sel, 0, 0);
+        method.set_flags(0, 0, true, false, false, false, 1); // has_ctx = true
+        assert!(!eligible(&vm, method));
+    }
+
+    /// D1 point 1: `StoreInstvarPop` is excluded (needs the write barrier
+    /// + real slow-path sends, S11 — this sprint's own text on the point).
+    #[test]
+    fn eligible_rejects_instvar_store() {
+        let mut vm = test_vm();
+        let mut b = BytecodeBuilder::new();
+        b.push_self();
+        b.store_instvar_pop(0);
+        b.ret_self();
+        let sel = vm.universe.intern(b"m");
+        let method = b.finish(&mut vm, sel, 0, 0);
+        assert!(!eligible(&vm, method));
+    }
+
+    /// D1 point 2: a polymorphic IC (more than one klass seen at a send
+    /// site) is ineligible — and, unlike an `Empty` IC, permanently so
+    /// (`Eligibility::NoPermanent`, not `NoRetryLater`): a poly site
+    /// doesn't spontaneously narrow back down to mono on a later call.
+    #[test]
+    fn eligible_rejects_poly_ic() {
+        let mut vm = test_vm();
+        let plus_sel = vm.universe.intern(b"+");
+        let plus_target = primitive_stub(&mut vm, plus_sel, 1);
+
+        let mut b = BytecodeBuilder::new();
+        b.push_self();
+        b.push_temp(0);
+        b.send(&mut vm, plus_sel, 1);
+        b.ret_tos();
+        let sel = vm.universe.intern(b"m");
+        let method = b.finish(&mut vm, sel, 1, 0);
+
+        let smi_klass = vm.universe.smi_klass;
+        let other_klass = vm.universe.object_klass;
+        let array_klass = vm.universe.array_klass;
+        let pairs = crate::memory::alloc::alloc_indexable_oops(
+            &mut vm,
+            array_klass,
+            crate::oops::layout::IC_POLY_ARRAY_LEN,
+        );
+        pairs.at_put(0, smi_klass.oop());
+        pairs.at_put(1, plus_target.oop());
+        pairs.at_put(2, other_klass.oop());
+        pairs.at_put(3, plus_target.oop());
+        let epoch = vm.ic_epoch;
+        InterpreterIc::at(method, 0).set_poly(&mut vm, pairs, epoch);
+
+        assert!(!eligible(&vm, method));
+    }
+
+    /// D1 point 3: a method with a primitive attached stays interpreted —
+    /// its own Rust fast path is already fast, and S10's bailout-by-
+    /// restart soundness argument doesn't extend to primitives (which
+    /// really do call into Rust and can allocate).
+    #[test]
+    fn eligible_rejects_primitive_method() {
+        let mut vm = test_vm();
+        let mut b = BytecodeBuilder::new();
+        b.push_self();
+        b.push_temp(0);
+        b.ret_tos();
+        let sel = vm.universe.intern(b"+");
+        let method = b.finish(&mut vm, sel, 1, 0);
+        method.set_primitive(1);
+        assert!(!eligible(&vm, method));
+    }
+
     /// D1's `NoPermanent` path: a STRUCTURALLY ineligible method (here,
     /// argc > 5 — never becomes eligible no matter how many times it's
     /// called) gets `compile_disabled` set (and its invocation count reset

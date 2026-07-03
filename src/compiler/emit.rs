@@ -557,3 +557,293 @@ fn emit_ir(e: &mut Emitter, ir: &Ir, next_in_order: Option<BlockId>) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::compiler::ir::{IrBlock, VRegInfo};
+    use crate::compiler::jasm_assembler::JasmAssembler;
+    use crate::compiler::regalloc;
+
+    fn hand_method(blocks: Vec<IrBlock>, vregs: Vec<VRegInfo>, argc: u8) -> IrMethod {
+        IrMethod {
+            blocks,
+            vregs,
+            pool: Vec::new(),
+            argc,
+            ntemps: 0,
+            safepoints: Vec::new(),
+            true_lit: PoolLit(0),
+            false_lit: PoolLit(0),
+        }
+    }
+
+    /// `(a + b) < 10 ? 1 : 0` — `run_ir_raw`'s own shape (`tests/it_tier1.rs`),
+    /// four blocks with distinct `bci`s, reused here since it's already
+    /// proven correct end to end and gives `pcdesc_block_starts` a real
+    /// multi-block method to check without re-deriving one.
+    fn branchy_method() -> IrMethod {
+        let vregs: Vec<VRegInfo> = (0..7).map(|_| VRegInfo { is_oop: true }).collect();
+        let block0 = IrBlock {
+            id: BlockId(0),
+            bci: 0,
+            code: vec![
+                Ir::Param {
+                    dst: VReg(0),
+                    index: 0,
+                },
+                Ir::Param {
+                    dst: VReg(1),
+                    index: 1,
+                },
+                Ir::Param {
+                    dst: VReg(2),
+                    index: 2,
+                },
+                Ir::SmiArith {
+                    op: SmiOp::Add,
+                    dst: VReg(3),
+                    a: VReg(1),
+                    b: VReg(2),
+                    fail: BlockId(3),
+                },
+                Ir::ConstSmi {
+                    dst: VReg(4),
+                    value: 10,
+                },
+                Ir::SmiCmpBr {
+                    op: CmpOp::Lt,
+                    a: VReg(3),
+                    b: VReg(4),
+                    if_true: BlockId(1),
+                    if_false: BlockId(2),
+                    fail: BlockId(3),
+                },
+            ],
+            entry_stack: Vec::new(),
+        };
+        let block1 = IrBlock {
+            id: BlockId(1),
+            bci: 10,
+            code: vec![
+                Ir::ConstSmi {
+                    dst: VReg(5),
+                    value: 1,
+                },
+                Ir::Ret { val: VReg(5) },
+            ],
+            entry_stack: Vec::new(),
+        };
+        let block2 = IrBlock {
+            id: BlockId(2),
+            bci: 20,
+            code: vec![
+                Ir::ConstSmi {
+                    dst: VReg(6),
+                    value: 0,
+                },
+                Ir::Ret { val: VReg(6) },
+            ],
+            entry_stack: Vec::new(),
+        };
+        let block3 = IrBlock {
+            id: BlockId(3),
+            bci: 30,
+            code: vec![Ir::Bailout {
+                reason: BailoutReason::SmiOpFailed,
+            }],
+            entry_stack: Vec::new(),
+        };
+        hand_method(vec![block0, block1, block2, block3], vregs, 2)
+    }
+
+    /// tests_s10.md: pcdescs sorted by pc_off, bcis match block bcis.
+    #[test]
+    fn pcdesc_block_starts() {
+        let method = branchy_method();
+        let ra = regalloc::regalloc(&method);
+        let mut asm = JasmAssembler::new();
+        let (_blob, block_pcs) = emit(&mut asm, &method, &ra, 0);
+
+        assert_eq!(
+            block_pcs.len(),
+            4,
+            "one BlockPc per block, including the bailout block"
+        );
+        let mut sorted = block_pcs.clone();
+        sorted.sort_by_key(|bp| bp.pc_off);
+        assert_eq!(
+            block_pcs.iter().map(|bp| bp.pc_off).collect::<Vec<_>>(),
+            sorted.iter().map(|bp| bp.pc_off).collect::<Vec<_>>(),
+            "block_pcs must already be sorted by pc_off (emission-order == \
+             address-order, since code only ever grows as blocks emit)"
+        );
+        // Every recorded bci matches the IR block it was taken from,
+        // regardless of `block_order`'s own (possibly reshuffled, S10 step
+        // 9's own bug) emission sequence.
+        let bci_by_block: std::collections::HashMap<usize, usize> = block_pcs
+            .iter()
+            .enumerate()
+            .map(|(i, bp)| (i, bp.bci))
+            .collect();
+        for (i, &bid) in ra.block_order.iter().enumerate() {
+            let expected_bci = method.blocks[bid.0 as usize].bci;
+            assert_eq!(
+                bci_by_block[&i], expected_bci,
+                "block_pcs[{i}] (block_order[{i}]={bid:?}) must report that block's own bci"
+            );
+        }
+    }
+
+    /// tests_s10.md: Mul listing contains asr/mul/smulh/cmp-asr63 exactly
+    /// (P5 — `b.vs` does not exist for a 64x64->128 overflow check the way
+    /// it does for add/sub, so this sequence is the only correct one).
+    #[test]
+    fn emit_smi_mul_overflow_seq() {
+        let vregs: Vec<VRegInfo> = (0..4).map(|_| VRegInfo { is_oop: true }).collect();
+        let block0 = IrBlock {
+            id: BlockId(0),
+            bci: 0,
+            code: vec![
+                Ir::Param {
+                    dst: VReg(0),
+                    index: 0,
+                },
+                Ir::Param {
+                    dst: VReg(1),
+                    index: 1,
+                },
+                Ir::Param {
+                    dst: VReg(2),
+                    index: 2,
+                },
+                Ir::SmiArith {
+                    op: SmiOp::Mul,
+                    dst: VReg(3),
+                    a: VReg(1),
+                    b: VReg(2),
+                    fail: BlockId(1),
+                },
+                Ir::Ret { val: VReg(3) },
+            ],
+            entry_stack: Vec::new(),
+        };
+        let block1 = IrBlock {
+            id: BlockId(1),
+            bci: 10,
+            code: vec![Ir::Bailout {
+                reason: BailoutReason::SmiOpFailed,
+            }],
+            entry_stack: Vec::new(),
+        };
+        let method = hand_method(vec![block0, block1], vregs, 2);
+        let ra = regalloc::regalloc(&method);
+        let mut asm = JasmAssembler::new();
+        let (blob, _pcs) = emit(&mut asm, &method, &ra, 0);
+
+        fn mnemonic(l: &str) -> &str {
+            // Listing format: "<pc_off>  <hex_word>  <mnemonic> [<operands>]".
+            l.split_whitespace().nth(2).unwrap_or("")
+        }
+        let mnemonics: Vec<&str> = blob.listing.iter().map(|l| mnemonic(l)).collect();
+        let asr_pos = mnemonics.iter().position(|&m| m == "asr");
+        let mul_pos = mnemonics.iter().position(|&m| m == "mul");
+        let smulh_pos = mnemonics.iter().position(|&m| m == "smulh");
+        let cmp_pos = mnemonics.iter().position(|&m| m == "cmp");
+        assert!(
+            asr_pos.is_some() && mul_pos.is_some() && smulh_pos.is_some() && cmp_pos.is_some(),
+            "Mul must emit asr, mul, smulh, and cmp -- got listing:\n{}",
+            blob.listing.join("\n")
+        );
+        assert!(asr_pos < mul_pos, "asr (shift off the tag) before mul");
+        assert!(
+            mul_pos < smulh_pos,
+            "mul (low 64 bits) before smulh (high 64 bits)"
+        );
+        assert!(smulh_pos < cmp_pos, "smulh before the overflow cmp");
+        let cmp_line = &blob.listing[cmp_pos.unwrap()];
+        assert!(
+            cmp_line.contains("Asr") && cmp_line.contains("63"),
+            "the overflow check must compare against the low word's own arithmetic-shift-right-63 \
+             (sign extension), the only correct 64x64->128 overflow test -- got: {cmp_line}"
+        );
+        assert!(
+            !mnemonics.contains(&"b.vs") && !blob.listing.iter().any(|l| l.contains("Vs")),
+            "P5: b.vs is an add/sub-only overflow-flag branch, meaningless for mul's 128-bit \
+             overflow check -- must not appear in a Mul sequence"
+        );
+    }
+
+    /// tests_s10.md: instvar index boundary — `ldur` while `byte_off - 1`
+    /// fits ldur's imm9 (±255), `sub x16,·,#1; ldr ·,[x16,#byte_off]`
+    /// once it doesn't. `byte_off = BODY_OFFSET(16) + 8*index`, so the
+    /// boundary is `index == 30` (biased=255, still ldur) vs `index == 31`
+    /// (biased=263, sub+ldr) — computed from `oops::layout::BODY_OFFSET`
+    /// directly rather than copying tests_s10.md's own example numbers,
+    /// which were written before this offset's exact value was pinned
+    /// down (verified cross-checked against `MemOop::body_ptr`'s own
+    /// formula in this sprint's own commit history).
+    #[test]
+    fn emit_ldur_vs_untag_split() {
+        let make = |index: u8| {
+            let vregs: Vec<VRegInfo> = (0..2).map(|_| VRegInfo { is_oop: true }).collect();
+            let byte_off = crate::oops::layout::BODY_OFFSET as i32 + 8 * index as i32;
+            let block0 = IrBlock {
+                id: BlockId(0),
+                bci: 0,
+                code: vec![
+                    Ir::Param {
+                        dst: VReg(0),
+                        index: 0,
+                    },
+                    Ir::LoadField {
+                        dst: VReg(1),
+                        obj: VReg(0),
+                        byte_off,
+                    },
+                    Ir::Ret { val: VReg(1) },
+                ],
+                entry_stack: Vec::new(),
+            };
+            hand_method(vec![block0], vregs, 1)
+        };
+
+        let mnemonic = |l: &str| l.split_whitespace().nth(2).unwrap_or("").to_string();
+
+        let near = make(30);
+        let ra = regalloc::regalloc(&near);
+        let mut asm = JasmAssembler::new();
+        let (blob, _pcs) = emit(&mut asm, &near, &ra, 0);
+        let near_mnemonics: Vec<String> = blob.listing.iter().map(|l| mnemonic(l)).collect();
+        assert!(
+            near_mnemonics.iter().any(|m| m == "ldur"),
+            "index 30 (biased offset 255, within ldur's imm9) must use ldur -- got:\n{}",
+            blob.listing.join("\n")
+        );
+        assert!(
+            !near_mnemonics.iter().any(|m| m == "sub"),
+            "index 30 must not need the untag-then-ldr split -- got:\n{}",
+            blob.listing.join("\n")
+        );
+
+        let far = make(31);
+        let ra2 = regalloc::regalloc(&far);
+        let mut asm2 = JasmAssembler::new();
+        let (blob2, _pcs2) = emit(&mut asm2, &far, &ra2, 0);
+        let mnemonics: Vec<String> = blob2.listing.iter().map(|l| mnemonic(l)).collect();
+        assert!(
+            mnemonics.iter().any(|m| m == "sub"),
+            "index 31 (biased offset 263, past ldur's imm9) must untag via sub first -- got:\n{}",
+            blob2.listing.join("\n")
+        );
+        assert!(
+            mnemonics.iter().any(|m| m == "ldr"),
+            "index 31 must follow the sub with a plain ldr (not ldur) at the untagged base"
+        );
+        assert!(
+            !blob2.listing.iter().any(|l| l.contains("ldur")),
+            "index 31 must NOT use ldur at all -- got:\n{}",
+            blob2.listing.join("\n")
+        );
+    }
+}
