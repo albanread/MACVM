@@ -1,0 +1,19 @@
+[package]
+name = "qbejit"
+version = "0.0.0"
+edition = "2021"
+description = "Rust port of FasterBASIC's in-process QBE-based ARM64 JIT, driving the vendored C QBE backend. Evaluation crate for MACVM's docs/DESIGN.md §5 (D6); not wired into the MACVM build."
+license = "MIT"
+publish = false
+
+[lib]
+name = "qbejit"
+path = "src/lib.rs"
+
+[dependencies]
+libc = "0.2"
+
+[build-dependencies]
+cc = "1"
+
+[dev-dependencies]
