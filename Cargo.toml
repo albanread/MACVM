@@ -16,6 +16,11 @@ path = "src/lib.rs"
 
 [dependencies]
 libc = "0.2"
+# Vendored wfasm (S9, src/vendor/wfasm/) uses anyhow for its own error
+# plumbing (Result/Context/bail!) — kept as-is per the vendoring procedure's
+# "minimal diff against upstream" rule rather than re-threaded onto MACVM's
+# own error types.
+anyhow = "1"
 
 # Codegen backend is an OPEN DECISION (see docs/DESIGN.md §4). Backends are
 # selected by feature so the compiler front end never hard-depends on one.

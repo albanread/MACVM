@@ -20,3 +20,4 @@ pub mod memory; // object memory, allocation, garbage collection
 pub mod oops; // object references, tagging, 2-word headers, classes
 pub mod runtime; // stacks, activation frames, method lookup, inline caches, primitives
 pub mod utils; // shared utilities
+pub mod vendor; // vendored third-party source (S9: JASM's wfasm AArch64 encoder)
