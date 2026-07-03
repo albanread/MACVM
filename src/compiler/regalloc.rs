@@ -298,6 +298,8 @@ mod tests {
             argc: 0,
             ntemps: 0,
             safepoints: Vec::new(),
+            true_lit: PoolLit(0),
+            false_lit: PoolLit(0),
         }
     }
 

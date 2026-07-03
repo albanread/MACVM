@@ -275,6 +275,12 @@ pub struct IrMethod {
     pub argc: u8,
     pub ntemps: u8,
     pub safepoints: Vec<SafepointId>,
+    /// Always present (`convert` interns them unconditionally) — `emit.rs`
+    /// has no `VmState` of its own to intern `true_obj`/`false_obj` on
+    /// demand for `SmiCmpVal`/`BoolBr`'s sequences (D5.3), so it reads
+    /// these instead of relying on a fixed pool-index convention.
+    pub true_lit: PoolLit,
+    pub false_lit: PoolLit,
 }
 
 // ── conversion ───────────────────────────────────────────────────────────
@@ -748,6 +754,20 @@ pub fn convert(vm: &VmState, method: MethodOop, cfg: &Cfg) -> IrMethod {
     let nil_lit = t
         .pool
         .intern(vm.universe.nil_obj.raw(), Some(RelocKind::Oop));
+    // `SmiCmpVal`/`BoolBr`'s own emit sequences (D5.3) need true_obj/
+    // false_obj as pool constants regardless of whether this method's
+    // bytecode happens to contain an explicit push_true/push_false —
+    // eagerly interning them here (not gated on the fused-comparison rule
+    // that produces those Ir ops needing them) guarantees `emit.rs`, which
+    // has no VmState access of its own, always finds them via
+    // `IrMethod::true_lit`/`false_lit` rather than a fragile fixed-index
+    // convention.
+    let true_lit = t
+        .pool
+        .intern(vm.universe.true_obj.raw(), Some(RelocKind::Oop));
+    let false_lit = t
+        .pool
+        .intern(vm.universe.false_obj.raw(), Some(RelocKind::Oop));
 
     let mut exit_stacks: Vec<Option<Vec<VReg>>> = vec![None; cfg.blocks.len()];
     let mut ir_blocks: Vec<IrBlock> = Vec::with_capacity(cfg.blocks.len() + 1);
@@ -876,6 +896,8 @@ pub fn convert(vm: &VmState, method: MethodOop, cfg: &Cfg) -> IrMethod {
         argc: method.argc() as u8,
         ntemps: method.ntemps() as u8,
         safepoints: Vec::new(),
+        true_lit,
+        false_lit,
     }
 }
 

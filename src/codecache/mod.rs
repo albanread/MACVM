@@ -6,13 +6,18 @@
 //! `src/compiler/` may not call `mmap`/`pthread_jit_write_protect_np`
 //! directly — this module (plus [`crate::vendor::wfasm::native_macos`],
 //! which owns the actual FFI) is the only place those calls happen (D4).
-//! This module in turn knows nothing about IR, bytecode, or the
+//! `CodeCache` itself knows nothing about IR, bytecode, or the
 //! interpreter — it only ever sees byte lengths, addresses, and
-//! [`crate::compiler::assembler::CodeBlob`].
+//! [`crate::compiler::assembler::CodeBlob`]. [`stubs`] is the one
+//! exception (S10 D4/D5.6): `call_stub`/`stub_poll` are hand-assembled
+//! Rust↔compiled trampolines, so they necessarily know `VmState`'s shape
+//! and use `JasmAssembler` directly — everything else in this module
+//! stays oblivious to both.
 
 #![allow(unsafe_code)]
 
 pub mod guard;
+pub mod stubs;
 
 use std::collections::BTreeMap;
 

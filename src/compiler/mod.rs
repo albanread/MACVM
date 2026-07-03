@@ -11,6 +11,7 @@
 
 pub mod assembler;
 pub mod decode;
+pub mod emit;
 pub mod ir;
 pub mod jasm_assembler;
 pub mod regalloc;
