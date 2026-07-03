@@ -6,6 +6,7 @@
 //! and nothing before S4 emits those opcodes).
 
 pub mod blocks;
+pub mod compiled_call;
 pub mod ic;
 pub mod send;
 pub mod stack;
@@ -138,7 +139,7 @@ fn must_be_boolean_send(vm: &mut VmState, method: MethodOop, branch_bci: usize, 
     let klass = send::klass_of(vm, t);
     let sel = vm.universe.sel_must_be_boolean;
     match crate::runtime::lookup::lookup(vm, klass, sel) {
-        Some(m) => send::activate_method(vm, m, 0),
+        Some(m) => send::activate_method(vm, m, 0, None),
         None => crate::runtime::error::dnu_fallback(vm, sel, klass), // never returns
     }
 }

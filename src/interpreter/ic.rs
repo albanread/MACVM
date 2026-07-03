@@ -5,6 +5,7 @@
 //! (SPEC §4, Δ): all dispatch state lives here, in ordinary heap `Array`s
 //! GC can scan for free — never in the bytecode stream.
 
+use crate::codecache::nmethod::NmethodId;
 use crate::oops::layout::{
     IC_GUARD_MEGA, IC_GUARD_OFFSET, IC_GUARD_POLY, IC_META_ARGC_MASK, IC_META_ARGC_SHIFT,
     IC_META_EPOCH_MASK, IC_META_EPOCH_SHIFT, IC_META_OFFSET, IC_POLY_ARRAY_LEN, IC_POLY_MAX_PAIRS,
@@ -78,6 +79,21 @@ impl InterpreterIc {
     pub fn set_mono(&self, vm: &mut VmState, k: KlassOop, m: MethodOop, epoch: u32) {
         self.ics.at_put(self.base + IC_GUARD_OFFSET, k.oop());
         self.ics.at_put(self.base + IC_TARGET_OFFSET, m.oop());
+        self.set_meta(epoch);
+        crate::memory::store::post_write_barrier(vm, self.ics.as_mem());
+    }
+
+    /// S10 D4: still mono state (SPEC §4.3's lattice gains no new top-level
+    /// state for this) — same guard write as [`Self::set_mono`], but the
+    /// target is a smi `NmethodId` instead of a `MethodOop`'s oop. The send
+    /// fast path's `target.is_smi()` check is what tells the two apart at
+    /// dispatch time.
+    pub fn set_mono_compiled(&self, vm: &mut VmState, k: KlassOop, id: NmethodId, epoch: u32) {
+        self.ics.at_put(self.base + IC_GUARD_OFFSET, k.oop());
+        self.ics.at_put(
+            self.base + IC_TARGET_OFFSET,
+            SmallInt::new(id.0 as i64).oop(),
+        );
         self.set_meta(epoch);
         crate::memory::store::post_write_barrier(vm, self.ics.as_mem());
     }
@@ -289,8 +305,20 @@ pub fn ic_transition(
                 let ic = InterpreterIc::at(caller, ic_idx);
                 let k0 =
                     KlassOop::try_from(ic.guard()).expect("ic_transition: guard changed under us");
-                let m0 = MethodOop::try_from(ic.target())
-                    .expect("ic_transition: mono target is not a CompiledMethod");
+                // S10 D4: the mono entry being demoted to poly may itself
+                // be compiled (`set_mono_compiled`'s smi target, not a
+                // MethodOop) — the poly array only ever stores interpreted
+                // MethodOops (`reverify_poly` always re-derives via a
+                // fresh `resolve`, never preserves a compiled id), so
+                // re-derive k0's interpreted method the same way rather
+                // than reading the smi as if it were one.
+                let m0 = match MethodOop::try_from(ic.target()) {
+                    Some(m0) => m0,
+                    None => resolve(vm, caller, selector, is_super, k0).expect(
+                        "ic_transition: klass k0 must still resolve selector \
+                         (it did when its compiled entry was installed)",
+                    ),
+                };
                 let m = m_h.get(vm);
                 pairs.at_put(0, k0.oop());
                 pairs.at_put(1, m0.oop());

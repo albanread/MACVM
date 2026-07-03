@@ -338,7 +338,7 @@ pub fn cannot_return(vm: &mut VmState, closure: ClosureOop, value: Oop) {
     match crate::runtime::lookup::lookup(vm, klass, sel) {
         Some(m) => {
             vm.regs.bci = BCI_RESUME_CANNOT_RETURN; // consumed by activate_method as the new frame's saved_bci
-            super::send::activate_method(vm, m, 1);
+            super::send::activate_method(vm, m, 1, None);
         }
         None => crate::runtime::error::dnu_fallback(vm, sel, klass), // never returns
     }

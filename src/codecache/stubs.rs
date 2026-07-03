@@ -15,6 +15,12 @@ use super::{CodeCache, CodeHandle};
 pub type CallStubFn =
     unsafe extern "C" fn(entry: u64, vm: *mut VmState, argv: *const u64, argc: u64) -> u64;
 
+/// `Copy`: both fields are just a pointer+len (`CodeHandle` itself is
+/// `Copy`) — copying a `Stubs` duplicates no real resource, and lets
+/// `enter_compiled` read it out of `vm.stubs` before also needing `&mut
+/// VmState` for the call itself (`vm.stubs.invoke(entry, vm, ...)` would
+/// otherwise borrow `vm.stubs` and all of `vm` at once).
+#[derive(Clone, Copy)]
 pub struct Stubs {
     pub call_stub: CodeHandle,
     pub stub_poll: CodeHandle,
@@ -26,6 +32,27 @@ impl Stubs {
     }
     pub fn stub_poll_addr(&self) -> u64 {
         self.stub_poll.base as u64
+    }
+
+    /// Invokes `entry` (a compiled method's own entry point — an `Nmethod`'s
+    /// `code.base + entry_off`) through the real, published `call_stub`,
+    /// exactly as if it were an ordinary `extern "C"` function taking
+    /// `(vm, argv, argc)`. `argv[0]` is the receiver, `argv[1..]` the real
+    /// Smalltalk arguments (`ir::convert`'s own `Param{index}` convention).
+    ///
+    /// The one place `interpreter::compiled_call::enter_compiled` needs
+    /// unsafe FFI, tucked in here instead of allowed at that call site —
+    /// this module (`codecache`) is `crate`'s one designated owner of every
+    /// raw pointer call into `MAP_JIT` memory (this file's own module doc),
+    /// so `interpreter` stays covered by the crate-root `#![deny(unsafe_code)]`.
+    /// Takes `&mut VmState`, not a raw pointer, so the public signature
+    /// itself stays safe (clippy's `not_unsafe_ptr_arg_deref`) — the
+    /// reference-to-pointer conversion `call_stub`'s own FFI shape needs is
+    /// done internally instead.
+    pub fn invoke(&self, entry: u64, vm: &mut VmState, argv: &[u64]) -> u64 {
+        let call: CallStubFn = unsafe { std::mem::transmute(self.call_stub_entry()) };
+        let vm_ptr: *mut VmState = vm;
+        unsafe { call(entry, vm_ptr, argv.as_ptr(), argv.len() as u64) }
     }
 }
 

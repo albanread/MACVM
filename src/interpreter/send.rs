@@ -4,11 +4,15 @@
 //! `doesNotUnderstand:` path. The only module that mutates `InterpRegs` or
 //! pushes frames on a send (`sprint_s03_detail.md` §Layer boundaries).
 
+use crate::codecache::nmethod::{NmState, NmethodId};
 use crate::oops::layout::{COUNTERS_INVOCATION_MASK, COUNTERS_INVOCATION_MAX};
+use crate::oops::smi::SmallInt;
 use crate::oops::wrappers::{KlassOop, MethodOop, SymbolOop};
 use crate::runtime::primitives::PrimResult;
 use crate::runtime::vm_state::VmState;
+use crate::runtime::JitMode;
 
+use super::compiled_call::{enter_compiled, EnterResult};
 use super::ic::{ic_transition, InterpreterIc};
 use super::{pop, push};
 
@@ -18,12 +22,16 @@ use super::{pop, push};
 pub use crate::runtime::lookup::klass_of;
 
 /// `pub(crate)`: also bumped by `interpreter::blocks::activate_block` —
-/// blocks have counters too (SPEC §5.4, S14 feedback).
-pub(crate) fn bump_invocation(m: MethodOop) {
+/// blocks have counters too (SPEC §5.4, S14 feedback). Returns the
+/// post-bump invocation count, so `activate_method`'s S10 D4 compile
+/// trigger can check for the exact threshold crossing without a second,
+/// separately maintained read of the same field.
+pub(crate) fn bump_invocation(m: MethodOop) -> i64 {
     let c = m.counters();
     let inv = c & COUNTERS_INVOCATION_MASK;
     let bumped = (inv + 1).min(COUNTERS_INVOCATION_MAX);
     m.set_counters((c & !COUNTERS_INVOCATION_MASK) | bumped);
+    bumped
 }
 
 /// SPEC §5.3 step 5. Bumps the invocation counter (every arrival, including
@@ -32,8 +40,44 @@ pub(crate) fn bump_invocation(m: MethodOop) {
 /// updated on the frame-push path only — a primitive success leaves it
 /// exactly as the dispatch loop set it before the send (the resume point in
 /// the *same*, unpushed, calling method).
-pub fn activate_method(vm: &mut VmState, m: MethodOop, argc: u8) {
-    bump_invocation(m);
+///
+/// `ic_site`, S10 D4: `Some((caller, ic_idx))` when this activation came
+/// through a genuine IC send site (`send_generic`'s fast or slow path) —
+/// the one piece of information the compile trigger below needs in order
+/// to rewrite that site to dispatch through the fresh nmethod on every
+/// later call, not just this one. `None` from every other caller (`dnu`,
+/// `must_be_boolean_send`, `cannot_return`): each of those reaches a
+/// method via a full lookup, never an IC, so there is nothing to rewrite —
+/// the compile trigger still fires for them (S10 D4 doesn't carve out an
+/// exception), it just can't speed up their own dispatch next time.
+pub fn activate_method(
+    vm: &mut VmState,
+    m: MethodOop,
+    argc: u8,
+    ic_site: Option<(MethodOop, u16)>,
+) {
+    let bumped = bump_invocation(m);
+
+    if let JitMode::Threshold(n) = vm.options.jit {
+        if bumped == n as i64 && !m.compile_disabled() {
+            let rcvr = vm.stack.get(vm.stack.sp - argc as usize - 1);
+            let k = klass_of(vm, rcvr);
+            if let Some(id) = crate::compiler::driver::compile_method(vm, k, m) {
+                if let Some((caller, ic_idx)) = ic_site {
+                    let epoch = vm.ic_epoch;
+                    InterpreterIc::at(caller, ic_idx).set_mono_compiled(vm, k, id, epoch);
+                }
+                match enter_compiled(vm, id, argc) {
+                    EnterResult::Completed => return,
+                    EnterResult::Bailout => {
+                        // D1: sound to just fall through to the normal
+                        // interpreted body below, for this one call — no
+                        // observable effect could have preceded a bailout.
+                    }
+                }
+            }
+        }
+    }
 
     // `m` is held across two allocation-capable steps below: the primitive
     // call (a `can_allocate` primitive that then Fails falls through to the
@@ -103,16 +147,52 @@ pub fn send_generic(vm: &mut VmState, argc: u8, ic_idx: u16, is_super: bool) {
     let rcvr = vm.stack.get(vm.stack.sp - argc as usize - 1);
     let k = klass_of(vm, rcvr);
 
-    // Fast path: mono guard, current epoch — read-only, no IC write.
+    // Fast path: mono guard, current epoch.
     if ic.guard().raw() == k.oop().raw() && ic.epoch() == vm.ic_epoch {
-        let m = MethodOop::try_from(ic.target())
-            .expect("send_generic: mono target is not a CompiledMethod");
-        activate_method(vm, m, argc);
-        return;
+        // S10 D4: a smi target means mono-compiled (`set_mono_compiled`),
+        // not the ordinary mono-interpreted `MethodOop` target below.
+        if let Some(target_smi) = SmallInt::try_from(ic.target()) {
+            let nm_id = NmethodId(target_smi.value() as u32);
+            // Stale-id self-heal (D4): a freed/reused id can never
+            // dispatch wrongly, since S12 flushing is checked against here
+            // by identity (klass/selector), not just presence in the
+            // table. S10 never frees a slot, so this is always true today
+            // — implemented now so S12 doesn't have to touch this site.
+            let valid = vm.code_table.get(nm_id).is_some_and(|nm| {
+                matches!(nm.state, NmState::Alive)
+                    && nm.key_klass.oop().raw() == ic.guard().raw()
+                    && nm.key_selector.oop().raw() == ic.selector().oop().raw()
+            });
+            if valid {
+                match enter_compiled(vm, nm_id, argc) {
+                    EnterResult::Completed => return,
+                    EnterResult::Bailout => {
+                        // D1: this one call falls back to the interpreter;
+                        // the compiled entry is still valid for the next
+                        // one, so the IC itself is left untouched (no
+                        // `ic_site` — nothing to heal or rewrite).
+                        let sel = ic.selector();
+                        let m = crate::runtime::lookup::lookup(vm, k, sel).expect(
+                            "send_generic: bailout method must still resolve \
+                             (it did when its compiled entry was installed)",
+                        );
+                        activate_method(vm, m, argc, None);
+                        return;
+                    }
+                }
+            }
+            // Stale id: fall through to ic_transition below to self-heal,
+            // same as an ordinary guard/epoch miss.
+        } else {
+            let m = MethodOop::try_from(ic.target())
+                .expect("send_generic: mono target is not a CompiledMethod");
+            activate_method(vm, m, argc, Some((caller, ic_idx)));
+            return;
+        }
     }
 
     match ic_transition(vm, caller, ic_idx, k, is_super) {
-        Some(m) => activate_method(vm, m, argc),
+        Some(m) => activate_method(vm, m, argc, Some((caller, ic_idx))),
         None => {
             // Re-derive everything: `ic_transition` may have allocated (the
             // poly-pairs array), so the cached `ic` view (its `ics` array
@@ -171,7 +251,7 @@ fn dnu(vm: &mut VmState, rcvr_klass: KlassOop, selector: SymbolOop, argc: u8) {
 
     let sel_dnu = vm.universe.sel_does_not_understand;
     match crate::runtime::lookup::lookup(vm, rcvr_klass_h.get(vm), sel_dnu) {
-        Some(dnu_method) => activate_method(vm, dnu_method, 1),
+        Some(dnu_method) => activate_method(vm, dnu_method, 1, None),
         None => crate::runtime::error::dnu_fallback(vm, selector_h.get(vm), rcvr_klass_h.get(vm)),
     }
 }
@@ -263,6 +343,199 @@ mod tests {
         assert_eq!(
             m.counters() & COUNTERS_INVOCATION_MASK,
             COUNTERS_INVOCATION_MAX
+        );
+    }
+
+    /// A minimal but functionally real `SmallInteger>>+`: primitive 1
+    /// (`prim_add`), `prim_fails=true` (required — `activate_method`'s own
+    /// `debug_assert!` on a `Fail`ed primitive whose method doesn't declare
+    /// it can fail), fallback body returns a fixed sentinel rather than a
+    /// real LargeInteger promotion — a bare, `.mst`-free `test_vm()` has no
+    /// real `SmallInteger>>+` installed at all (that lives in
+    /// `world/06_smallinteger.mst`, loaded only by the real VM/world
+    /// tests), and real bignum promotion isn't needed to prove this
+    /// module's own bailout-fallback plumbing works.
+    const OVERFLOW_SENTINEL: i64 = -1;
+    fn install_smi_plus(vm: &mut VmState) -> SymbolOop {
+        let smi_klass = vm.universe.smi_klass;
+        let plus_sel = vm.universe.intern(b"+");
+        let mut b = BytecodeBuilder::new();
+        b.push_smi_i8(OVERFLOW_SENTINEL as i8);
+        b.ret_tos();
+        let m = b.finish(vm, plus_sel, 1, 0);
+        m.set_primitive(1);
+        m.set_flags(1, 0, false, false, true, false, 0); // prim_fails = true
+        install_method(vm, smi_klass, plus_sel, m);
+        plus_sel
+    }
+
+    /// S10 D4 end to end, through the real interpreter dispatch path (not
+    /// a direct `driver::compile_method` call): a smi-eligible method
+    /// (`self + arg`, defined on `SmallInteger`) warms up its own internal
+    /// `#+` IC across a couple of ordinary interpreted calls, its
+    /// invocation counter crosses `JitMode::Threshold`, `activate_method`'s
+    /// trigger fires, and the CALLER's send-site IC gets rewritten to a
+    /// compiled (smi) target — proven by reading it back, not just by the
+    /// result staying correct (which an untouched interpreted IC would
+    /// also produce).
+    #[test]
+    fn compile_trigger_fires_and_rewrites_ic_to_compiled() {
+        let mut vm = VmState::with_options(VmOptions {
+            heap_mib: 64,
+            trace: Default::default(),
+            gc_stress: false,
+            gc_stress_full_period: None,
+            eden_kb: None,
+            jit: crate::runtime::JitMode::Threshold(3),
+        });
+        let smi_klass = vm.universe.smi_klass;
+        let plus_sel = install_smi_plus(&mut vm);
+        let plus_arg_sel = vm.universe.intern(b"plusArg:");
+
+        let mut b = BytecodeBuilder::new();
+        b.push_self();
+        b.push_temp(0);
+        b.send(&mut vm, plus_sel, 1);
+        b.ret_tos();
+        let plus_arg_method = b.finish(&mut vm, plus_arg_sel, 1, 0);
+        install_method(&mut vm, smi_klass, plus_arg_sel, plus_arg_method);
+
+        let caller = build_caller(&mut vm, plus_arg_sel, 1);
+
+        for i in 1..=2i64 {
+            let result = send_once(
+                &mut vm,
+                caller,
+                &[SmallInt::new(5).oop(), SmallInt::new(i).oop()],
+            );
+            assert_eq!(result, SmallInt::new(5 + i).oop());
+            assert_eq!(plus_arg_method.counters() & COUNTERS_INVOCATION_MASK, i);
+            let ic = InterpreterIc::at(caller, 0);
+            assert!(
+                MethodOop::try_from(ic.target()).is_some(),
+                "below threshold: caller's IC must still target the interpreted method"
+            );
+        }
+
+        // 3rd call crosses the threshold.
+        let result = send_once(
+            &mut vm,
+            caller,
+            &[SmallInt::new(5).oop(), SmallInt::new(3).oop()],
+        );
+        assert_eq!(result, SmallInt::new(8).oop());
+        assert_eq!(plus_arg_method.counters() & COUNTERS_INVOCATION_MASK, 3);
+
+        let ic = InterpreterIc::at(caller, 0);
+        let nm_id = SmallInt::try_from(ic.target())
+            .expect("at threshold: caller's IC must now target a compiled nmethod id");
+        let nm = vm
+            .code_table
+            .get(NmethodId(nm_id.value() as u32))
+            .expect("the id the IC was rewritten to must be installed");
+        assert_eq!(nm.key_klass.oop().raw(), smi_klass.oop().raw());
+
+        // 4th call: dispatches through the compiled fast path.
+        let result4 = send_once(
+            &mut vm,
+            caller,
+            &[SmallInt::new(100).oop(), SmallInt::new(23).oop()],
+        );
+        assert_eq!(result4, SmallInt::new(123).oop());
+    }
+
+    /// As above, but exercises overflow/bailout from both directions: the
+    /// very call that triggers compilation itself overflows (`activate_method`'s
+    /// own fallback-to-interpreter path), and — once the IC is rewritten —
+    /// a *later* call also overflows (`send_generic`'s own fast-path
+    /// bailout fallback). Both must reach `install_smi_plus`'s interpreted
+    /// fallback (the [`OVERFLOW_SENTINEL`]) without disturbing the
+    /// still-valid compiled IC entry.
+    #[test]
+    fn compile_trigger_bailout_falls_back_correctly() {
+        let mut vm = VmState::with_options(VmOptions {
+            heap_mib: 64,
+            trace: Default::default(),
+            gc_stress: false,
+            gc_stress_full_period: None,
+            eden_kb: None,
+            jit: crate::runtime::JitMode::Threshold(2),
+        });
+        let smi_klass = vm.universe.smi_klass;
+        let plus_sel = install_smi_plus(&mut vm);
+        let plus_arg_sel = vm.universe.intern(b"plusArg:");
+
+        let mut b = BytecodeBuilder::new();
+        b.push_self();
+        b.push_temp(0);
+        b.send(&mut vm, plus_sel, 1);
+        b.ret_tos();
+        let plus_arg_method = b.finish(&mut vm, plus_arg_sel, 1, 0);
+        install_method(&mut vm, smi_klass, plus_arg_sel, plus_arg_method);
+        let caller = build_caller(&mut vm, plus_arg_sel, 1);
+
+        // Call 1 (bumped=1, below threshold=2): plain interpreted run,
+        // whose only real job is warming plusArg:'s own internal `#+` IC
+        // to mono/smi so call 2's `eligible()` check has something to see
+        // — a method's inner sends are cold until its body has actually
+        // run at least once (this is what the earlier, threshold=1 draft
+        // of this test got wrong: the triggering call and the warming
+        // call cannot be the same call for any method with an inner send).
+        let r1 = send_once(
+            &mut vm,
+            caller,
+            &[SmallInt::new(1).oop(), SmallInt::new(1).oop()],
+        );
+        assert_eq!(r1, SmallInt::new(2).oop());
+
+        // Call 2 (bumped=2 == threshold): triggers compile_method (now
+        // eligible — the inner IC warmed by call 1), rewrites the IC, and
+        // immediately runs THIS call's own (overflowing) args through the
+        // freshly compiled entry — bailing out to `activate_method`'s own
+        // interpreted fallback.
+        let big = SmallInt::new(SmallInt::MAX);
+        let r2 = send_once(&mut vm, caller, &[big.oop(), big.oop()]);
+        assert_eq!(
+            r2,
+            SmallInt::new(OVERFLOW_SENTINEL).oop(),
+            "an overflowing add at the exact trigger call must still reach the interpreted \
+             fallback body via activate_method's own bailout handling"
+        );
+
+        let ic = InterpreterIc::at(caller, 0);
+        let nm_id = SmallInt::try_from(ic.target())
+            .expect("call 2 must have rewritten the IC to a compiled nmethod id");
+
+        // Call 3, small operands: exercises send_generic's fast smi-IC
+        // dispatch (EnterResult::Completed) — confirms the compiled entry
+        // survived call 2's bailout and works correctly on its own.
+        let r3 = send_once(
+            &mut vm,
+            caller,
+            &[SmallInt::new(10).oop(), SmallInt::new(32).oop()],
+        );
+        assert_eq!(r3, SmallInt::new(42).oop());
+
+        // Call 4, overflowing again: exercises send_generic's OWN
+        // bailout fallback (the already-rewritten-smi-IC path, distinct
+        // from call 2's activate_method-triggered one).
+        let r4 = send_once(&mut vm, caller, &[big.oop(), big.oop()]);
+        assert_eq!(r4, SmallInt::new(OVERFLOW_SENTINEL).oop());
+
+        // Neither bailout may have healed/demoted the site: the IC must
+        // still name the exact same compiled entry throughout.
+        let ic_after = InterpreterIc::at(caller, 0);
+        let nm_id_after = SmallInt::try_from(ic_after.target())
+            .expect("bailouts must not disturb the IC -- the compiled entry is still valid");
+        assert_eq!(nm_id_after.value(), nm_id.value());
+        assert_eq!(
+            vm.code_table
+                .get(NmethodId(nm_id.value() as u32))
+                .unwrap()
+                .key_klass
+                .oop()
+                .raw(),
+            smi_klass.oop().raw()
         );
     }
 

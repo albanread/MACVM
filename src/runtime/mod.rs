@@ -9,7 +9,7 @@ pub mod lookup;
 pub mod primitives;
 pub mod vm_state;
 
-pub use vm_state::{InterpRegs, JitMode, TraceFlags, VmOptions, VmRegBlock, VmState};
+pub use vm_state::{InterpRegs, JitMode, TierLink, TraceFlags, VmOptions, VmRegBlock, VmState};
 
 /// A guest-execution failure (SPEC §3.2 bootstrap, `sprint_s05_detail.md`
 /// §Interfaces for later sprints). No Rust-level failure path exists yet

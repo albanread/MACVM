@@ -82,6 +82,33 @@ impl JitMode {
     pub const DEFAULT_THRESHOLD: u32 = 1000;
 }
 
+/// S10 D6: a side-channel record of one tier transition, pushed/popped
+/// around `interpreter::compiled_call::enter_compiled` — `vm.stack` itself
+/// never grows for a compiled call (S10 compiled code pushes no frame of
+/// its own, D1), so this `Vec` is the only record that a compiled
+/// activation is (or was) live between two interpreted frames; a
+/// mixed-tier stack-trace walker consults it to know where to print a
+/// compiled frame's line.
+#[derive(Clone, Copy, Debug)]
+pub enum TierLink {
+    /// I→C: pushed by `enter_compiled` before invoking the call stub.
+    /// `interp_frame` is the interpreted caller's own `Frame.fp` (compiled
+    /// code runs "underneath" it, not as a new `vm.stack` frame);
+    /// `entry_sp` is `vm.stack.sp` at the moment of entry, for a stack
+    /// walker to anchor against and for the debug assertion that a
+    /// completed (non-bailout) compiled call left `vm.stack.sp` exactly
+    /// where a primitive's direct return would have.
+    IntoCompiled { interp_frame: usize, entry_sp: u64 },
+    /// C→I: compiled code calling back into the interpreter (a runtime
+    /// send, an allocation slow path). S10 never constructs this — D1's
+    /// eligibility rules out every op that could need it — S11's own
+    /// `CallSend`/`CallRuntime`/`Alloc` Ir ops are what will.
+    IntoInterpreter {
+        compiled_fp: u64,
+        compiled_ret_pc: u64,
+    },
+}
+
 /// Which `MACVM_TRACE` channels are enabled. The channel set is open-ended
 /// (CONVENTIONS §3); S1 only stores membership, nothing reads it yet.
 #[derive(Clone, Default, Debug, PartialEq, Eq)]
@@ -357,6 +384,15 @@ pub struct VmState {
     /// embed as a pool constant in any method that emits `Ir::Poll`;
     /// `enter_compiled` (S10 step 8) needs `call_stub_entry()`.
     pub stubs: crate::codecache::stubs::Stubs,
+    /// S10 D6/step 8: one entry per currently-live compiled activation,
+    /// pushed/popped around `enter_compiled`. Always empty under
+    /// `JitMode::Off`.
+    pub tier_links: Vec<TierLink>,
+    /// How many compiled activations are currently nested (== `tier_links
+    /// .len()` whenever only `IntoCompiled` links exist, which is every
+    /// case in S10 — S11's `IntoInterpreter` links are what would make
+    /// this something other than a redundant count).
+    pub compiled_depth: u32,
 }
 
 impl VmState {
@@ -403,6 +439,8 @@ impl VmState {
             code_cache,
             code_table: CodeTable::new(),
             stubs,
+            tier_links: Vec::new(),
+            compiled_depth: 0,
         };
         crate::runtime::globals::bootstrap_well_known(&mut vm);
         vm
