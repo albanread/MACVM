@@ -19,4 +19,5 @@
 15_block_tests.mst
 16_dispatch_tests.mst
 17_gc_full_tests.mst
+tier1.mst
 99_run_all.mst

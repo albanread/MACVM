@@ -20,4 +20,5 @@ TestRunner run: StreamAndPrintTests.
 TestRunner run: BlockTests.
 TestRunner run: DispatchTests.
 TestRunner run: GcFullTest.
+TestRunner run: Tier1Tests.
 TestRunner report.

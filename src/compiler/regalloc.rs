@@ -31,6 +31,7 @@ pub struct SpillSlot(pub u16);
 /// SSA-lite's multiple-defs-per-temp-vreg shape, not merely convenient for
 /// it: `interval_multi_def_union` is the intended behavior, not a
 /// tolerated approximation).
+#[derive(Debug)]
 pub struct LiveInterval {
     pub vreg: VReg,
     pub start: u32,
@@ -94,6 +95,24 @@ fn successors(block: &IrBlock) -> Vec<BlockId> {
 /// still needs a position, so any DFS root left unvisited afterward is
 /// walked too, appended in index order (dead code never affects real
 /// blocks' relative order, only its own).
+/// D3.4/D5's own hard requirement: block 0 (the method's real entry) MUST
+/// come first in the returned order, unconditionally — `emit.rs`'s prologue
+/// falls straight through into whichever block is emitted first, with no
+/// guard, so anything else there runs before the method's own body ever
+/// does. Standard reverse-postorder-of-a-single-DFS-tree guarantees the
+/// root is last in postorder (hence first after reversing THAT tree's own
+/// segment) — but block 0 frequently has NO graph successors at all (any
+/// straight-line method with no inlined branch/smi-arith fail edge, e.g. a
+/// bare accessor like `^value` or `^false` — LoadField/Ret/RetSelf/Bailout
+/// aren't matched in `successors` at all), making it its own singleton DFS
+/// component. A version of this function that looped over every root
+/// in order but reversed the WHOLE accumulated postorder only ONCE, at the
+/// end, inverted the relative order BETWEEN components too, not just
+/// within each one — block 0's tiny (or singleton) component, visited and
+/// pushed first, ended up LAST after a single global reversal. Reversing
+/// each root's own segment separately, then concatenating the segments in
+/// root order, is what actually preserves "block 0's component comes
+/// first" for a forest, not just for one connected tree.
 fn reverse_postorder(method: &IrMethod) -> Vec<BlockId> {
     fn dfs(b: usize, blocks: &[IrBlock], visited: &mut [bool], postorder: &mut Vec<BlockId>) {
         if visited[b] {
@@ -108,12 +127,17 @@ fn reverse_postorder(method: &IrMethod) -> Vec<BlockId> {
 
     let n = method.blocks.len();
     let mut visited = vec![false; n];
-    let mut postorder = Vec::with_capacity(n);
+    let mut order = Vec::with_capacity(n);
     for b in 0..n {
+        if visited[b] {
+            continue;
+        }
+        let mut postorder = Vec::new();
         dfs(b, &method.blocks, &mut visited, &mut postorder);
+        postorder.reverse();
+        order.extend(postorder);
     }
-    postorder.reverse();
-    postorder
+    order
 }
 
 /// D3.4: number every instruction sequentially (walking blocks in
@@ -122,6 +146,29 @@ fn reverse_postorder(method: &IrMethod) -> Vec<BlockId> {
 /// per-block live-in/live-out fixpoint (every def and use is already
 /// explicit in the Ir stream — `ir.rs`'s own Move-based merge handling
 /// means nothing needs inferring across a block boundary).
+///
+/// That last claim is true for values that flow through the explicit
+/// merge-vreg mechanism at a join — but a temp vreg (`ir.rs`'s "SSA-lite
+/// temp rule": one persistent vreg per source temp, reused directly, never
+/// re-merged) that's both defined AND used inside the SAME loop body block
+/// is a real gap in it: the body block appears exactly once in this linear
+/// position space even though it runs many times at runtime, so a def near
+/// the block's own end feeding a use near its own start (the next
+/// iteration, via the back-edge) has its def position AFTER its use
+/// position in linear terms — invisible to a plain `[min_def, max_use]`
+/// fold, which would let some OTHER vreg's interval start immediately
+/// after that "last" use and steal the same register out from under a
+/// value the loop is still very much using. `reverse_postorder` itself
+/// only promises block 0 first (S10 step 9's own bug) and every
+/// predecessor-except-back-edges before its successors — it does not, and
+/// for an if/else-vs-loop-body sibling pair generally cannot, promise a
+/// loop body's blocks all precede whatever follows the loop. The fix below
+/// doesn't try to fix the linearization further; it widens intervals after
+/// the fact: any back edge B->A (A's block starting at or before B's own
+/// start, by position) defines a loop range `[start of A, end of B]`, and
+/// every interval touching that range at all gets conservatively widened
+/// to cover the whole thing — sound (if pessimistic) for nested loops too,
+/// via a fixpoint over every back edge found.
 pub fn compute_intervals(method: &IrMethod) -> (Vec<BlockId>, Vec<LiveInterval>) {
     let block_order = reverse_postorder(method);
 
@@ -129,9 +176,12 @@ pub fn compute_intervals(method: &IrMethod) -> (Vec<BlockId>, Vec<LiveInterval>)
     let mut safepoint_positions: Vec<u32> = Vec::new();
     let mut min_def: HashMap<u32, u32> = HashMap::new();
     let mut max_use: HashMap<u32, u32> = HashMap::new();
+    let mut block_start_pos: HashMap<u32, u32> = HashMap::new();
+    let mut block_end_pos: HashMap<u32, u32> = HashMap::new();
 
     for &bid in &block_order {
         let block = &method.blocks[bid.0 as usize];
+        block_start_pos.insert(bid.0, pos);
         for ir in &block.code {
             if is_safepoint(ir) {
                 safepoint_positions.push(pos);
@@ -151,6 +201,61 @@ pub fn compute_intervals(method: &IrMethod) -> (Vec<BlockId>, Vec<LiveInterval>)
                 max_use.entry(v.0).or_insert(pos);
             });
             pos += 1;
+        }
+        // `pos - 1`: the position of this block's own last instruction (a
+        // block always has at least one instruction — every terminator is
+        // itself an Ir op); every block gets a position above, so `pos`
+        // has advanced past `block_start_pos[bid]` by the time we get here.
+        block_end_pos.insert(bid.0, pos.saturating_sub(1));
+    }
+
+    // Back-edge loop-range widening (see this function's own doc above).
+    let mut loop_ranges: Vec<(u32, u32)> = Vec::new();
+    for &bid in &block_order {
+        let b = bid.0 as usize;
+        let b_start = block_start_pos[&bid.0];
+        for succ in successors(&method.blocks[b]) {
+            if let Some(&a_start) = block_start_pos.get(&succ.0) {
+                if a_start <= b_start {
+                    let loop_end = block_end_pos[&bid.0];
+                    loop_ranges.push((a_start, loop_end));
+                }
+            }
+        }
+    }
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for &(loop_start, loop_end) in &loop_ranges {
+            // Any vreg with EITHER endpoint inside the loop range gets
+            // both endpoints widened to at least cover it — a vreg used
+            // only once near a loop's start but never redefined inside it
+            // is still safe to widen (widening an interval never makes it
+            // wrong, only more conservative).
+            let touched: Vec<u32> = min_def
+                .keys()
+                .chain(max_use.keys())
+                .copied()
+                .collect::<std::collections::HashSet<_>>()
+                .into_iter()
+                .filter(|&v| {
+                    let s = *min_def.get(&v).unwrap_or(&u32::MAX);
+                    let e = *max_use.get(&v).unwrap_or(&0);
+                    s <= loop_end && e >= loop_start
+                })
+                .collect();
+            for v in touched {
+                let s = min_def.entry(v).or_insert(loop_start);
+                if *s > loop_start {
+                    *s = loop_start;
+                    changed = true;
+                }
+                let e = max_use.entry(v).or_insert(loop_end);
+                if *e < loop_end {
+                    *e = loop_end;
+                    changed = true;
+                }
+            }
         }
     }
 
@@ -288,7 +393,7 @@ pub fn regalloc(method: &IrMethod) -> RegallocResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compiler::ir::{BailoutReason, PoolLit, StubId, VRegInfo};
+    use crate::compiler::ir::{BailoutReason, CmpOp, PoolLit, SmiOp, StubId, VRegInfo};
 
     fn hand_method(blocks: Vec<IrBlock>, vregs: Vec<VRegInfo>) -> IrMethod {
         IrMethod {
@@ -522,6 +627,164 @@ mod tests {
             order.len(),
             2,
             "both blocks get a position, reachable or not"
+        );
+        // The real bug this hand-built shape once caught (S10 step 9): with
+        // NO graph edge from block 0 to `dead` (RetSelf/Bailout are both
+        // absent from `successors`' match), block 0 is its own singleton
+        // DFS component — a version of `reverse_postorder` that reversed
+        // the whole accumulated postorder only once, at the end, put block
+        // 0 SECOND, meaning emit.rs's prologue fell straight through into
+        // the OTHER block first. `emit.rs` has no guard against this: it
+        // just emits `block_order` in order, right after the prologue.
+        assert_eq!(
+            order[0],
+            BlockId(0),
+            "block 0 (the method's real entry) must always be emitted first"
+        );
+    }
+
+    /// The second, deeper S10 step 9 bug this hand-built shape catches: an
+    /// accumulator vreg (`s`, matching `sumTo:`'s own `s := s + i` loop)
+    /// that is both defined AND used inside the loop body block, and ALSO
+    /// read once more after the loop, at the exit block. `reverse_postorder`
+    /// only promises block 0 first and predecessors-before-successors
+    /// except across back edges — for a loop header with two successors
+    /// (body, exit), it does not promise the body block comes before the
+    /// exit block in the LINEAR position space (and for this exact shape,
+    /// it doesn't: the exit block, a DFS dead end, finishes and gets
+    /// pushed to postorder before the body block's own back-edge-laden
+    /// subtree does). A `[min_def, max_use]` fold that never widens for
+    /// back edges puts `s`'s LAST use at the exit block's read — entirely
+    /// missing that the body block, which the linearization places AFTER
+    /// the exit block, both reads AND redefines `s` on every iteration.
+    /// Without the loop-range widening this test checks for, `s`'s
+    /// register could be (and, before this fix, was) handed to some other
+    /// vreg live only in the "later" body block, silently corrupting the
+    /// accumulator — `sumTo: 10` returned 11 (the loop counter's own final
+    /// value) instead of 55 the first time this ran through the real
+    /// compiler, in `world/tests/tier1.mst`.
+    #[test]
+    fn loop_carried_vreg_interval_spans_whole_loop() {
+        let s = VReg(0); // accumulator, live across the back edge
+        let i = VReg(1); // loop counter
+        let bound = VReg(2);
+        let tmp = VReg(3);
+        let one = VReg(4);
+        let result = VReg(5);
+
+        let entry = IrBlock {
+            id: BlockId(0),
+            bci: 0,
+            code: vec![
+                Ir::ConstSmi { dst: s, value: 0 },
+                Ir::ConstSmi { dst: i, value: 1 },
+                Ir::ConstSmi {
+                    dst: bound,
+                    value: 10,
+                },
+                Ir::Jump { target: BlockId(1) },
+            ],
+            entry_stack: Vec::new(),
+        };
+        let header = IrBlock {
+            id: BlockId(1),
+            bci: 10,
+            code: vec![Ir::SmiCmpBr {
+                op: CmpOp::Le,
+                a: i,
+                b: bound,
+                if_true: BlockId(2),
+                if_false: BlockId(3),
+                fail: BlockId(4),
+            }],
+            entry_stack: Vec::new(),
+        };
+        let body = IrBlock {
+            id: BlockId(2),
+            bci: 20,
+            code: vec![
+                Ir::SmiArith {
+                    op: SmiOp::Add,
+                    dst: tmp,
+                    a: s,
+                    b: i,
+                    fail: BlockId(4),
+                },
+                Ir::Move { dst: s, src: tmp }, // redefines s, deep in the body
+                Ir::ConstSmi { dst: one, value: 1 },
+                Ir::SmiArith {
+                    op: SmiOp::Add,
+                    dst: tmp,
+                    a: i,
+                    b: one,
+                    fail: BlockId(4),
+                },
+                Ir::Move { dst: i, src: tmp },
+                Ir::Jump { target: BlockId(1) }, // the back edge
+            ],
+            entry_stack: Vec::new(),
+        };
+        let exit = IrBlock {
+            id: BlockId(3),
+            bci: 30,
+            code: vec![
+                Ir::Move {
+                    dst: result,
+                    src: s,
+                }, // reads s once, "before" the body in linear position
+                Ir::Ret { val: result },
+            ],
+            entry_stack: Vec::new(),
+        };
+        let bailout = IrBlock {
+            id: BlockId(4),
+            bci: 40,
+            code: vec![Ir::Bailout {
+                reason: BailoutReason::SmiOpFailed,
+            }],
+            entry_stack: Vec::new(),
+        };
+
+        let method = hand_method(
+            vec![entry, header, body, exit, bailout],
+            (0..6).map(|_| VRegInfo { is_oop: true }).collect(),
+        );
+        let (order, intervals) = compute_intervals(&method);
+
+        // Confirms this hand-built shape actually reproduces the bug's own
+        // precondition: the exit block linearized before the body block.
+        let pos_of = |bid: BlockId| order.iter().position(|&b| b == bid).unwrap();
+        assert!(
+            pos_of(BlockId(3)) < pos_of(BlockId(2)),
+            "this test's whole point is a linearization where the loop exit \
+             precedes the loop body — order was {order:?}"
+        );
+
+        let s_iv = intervals
+            .iter()
+            .find(|iv| iv.vreg == s)
+            .expect("s has an interval");
+        let body_last_pos = {
+            // Sum instruction counts for every block up to and including
+            // the body block (BlockId(2)), in `order`'s own sequence, then
+            // back off one for its own LAST instruction's position (not
+            // one-past-the-end).
+            let mut pos = 0u32;
+            for &bid in &order {
+                let blk = &method.blocks[bid.0 as usize];
+                pos += blk.code.len() as u32;
+                if bid == BlockId(2) {
+                    break;
+                }
+            }
+            pos - 1
+        };
+        assert!(
+            s_iv.end >= body_last_pos,
+            "s's interval (end={}) must extend at least through the loop \
+             body's own last position ({body_last_pos}) -- otherwise its \
+             register is free to be handed to something else mid-loop",
+            s_iv.end
         );
     }
 }

@@ -23,19 +23,65 @@ const FRAME_BUDGET_SLOTS: i32 = 60;
 /// D1 point 4, "tunable".
 const MAX_BYTECODE_LEN: usize = 2048;
 
+/// D1's own linear scan, at a finer grain than the `bool` its text
+/// describes: an ELIGIBLE method compiles now; a `NoPermanent` one never
+/// will (a structural property of its bytecode/flags, or a send site
+/// that's already resolved to something D1 doesn't cover) and gets
+/// `compile_disabled`; a `NoRetryLater` one has EVERY check passing
+/// except that some send site's IC is still `Empty` — the site simply
+/// hasn't been reached yet, not "reached and rejected". This distinction
+/// exists because `activate_method`'s trigger fires from OUTSIDE the
+/// method, before its own body has ever run: on `MACVM_JIT=threshold=1`
+/// specifically, the very first call is ALSO the trigger, so any method
+/// with an inner send is *guaranteed* cold on that first attempt — an
+/// early draft of this scan treated that as permanent and disabled every
+/// such method forever after one failed attempt, which silently defeated
+/// `threshold=1`'s own stated purpose ("every eligible method compiles on
+/// first send", tests_s10.md gate item 1) for anything but the rare
+/// method with zero internal sends. `NoRetryLater` leaves the counter
+/// alone instead of disabling, so the method's *next* call — after this
+/// one has actually run its body interpreted and warmed its own sites —
+/// gets a fresh attempt.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Eligibility {
+    Yes,
+    NoPermanent,
+    NoRetryLater,
+}
+
+impl Eligibility {
+    fn worse(self, other: Eligibility) -> Eligibility {
+        use Eligibility::*;
+        match (self, other) {
+            (NoPermanent, _) | (_, NoPermanent) => NoPermanent,
+            (NoRetryLater, _) | (_, NoRetryLater) => NoRetryLater,
+            (Yes, Yes) => Yes,
+        }
+    }
+}
+
 /// D1: a single linear scan of `method`'s bytecode — ALL of opcode
 /// allowlist, per-send IC shape, method flags, and frame-budget bound must
-/// hold for `compile_method` to attempt compiling `method`.
+/// hold for `compile_method` to attempt compiling `method`. Thin `bool`
+/// wrapper over [`eligibility_detail`] matching D1's own documented
+/// signature (and what this module's existing tests call) — `compile_method`
+/// itself calls `eligibility_detail` directly, since it needs the
+/// permanent-vs-retry distinction `bool` collapses away.
 pub fn eligible(vm: &VmState, method: MethodOop) -> bool {
+    eligibility_detail(vm, method) == Eligibility::Yes
+}
+
+fn eligibility_detail(vm: &VmState, method: MethodOop) -> Eligibility {
     if method.is_block()
         || method.has_ctx()
         || method.argc() > 5
         || method.primitive() != 0
         || method.bytecode_len() > MAX_BYTECODE_LEN
     {
-        return false;
+        return Eligibility::NoPermanent;
     }
 
+    let mut verdict = Eligibility::Yes;
     let mut bci = 0usize;
     while bci < method.bytecode_len() {
         let (instr, next) = decode_at(method, bci);
@@ -60,8 +106,12 @@ pub fn eligible(vm: &VmState, method: MethodOop) -> bool {
             | Instr::ReturnTos
             | Instr::ReturnSelf => {}
             Instr::Send { ic, super_ } => {
-                if super_ || !mono_smi_inline_send(vm, method, ic) {
-                    return false;
+                if super_ {
+                    return Eligibility::NoPermanent; // D1 point 1: super sends excluded
+                }
+                verdict = verdict.worse(mono_smi_inline_send(vm, method, ic));
+                if verdict == Eligibility::NoPermanent {
+                    return Eligibility::NoPermanent; // short-circuit: nothing later can undo this
                 }
             }
             // Excluded (D1 point 1): instvar/global/ctx stores, closures,
@@ -72,9 +122,12 @@ pub fn eligible(vm: &VmState, method: MethodOop) -> bool {
             | Instr::StoreCtxTempPop { .. }
             | Instr::PushClosure { .. }
             | Instr::BlockReturnTos
-            | Instr::NlrTos => return false,
+            | Instr::NlrTos => return Eligibility::NoPermanent,
         }
         bci = next;
+    }
+    if verdict != Eligibility::Yes {
+        return verdict; // NoRetryLater: some site was Empty, nothing else disqualified
     }
 
     // Frame budget (D1 point 3): reuses ir.rs's own CFG-aware stack-depth
@@ -86,26 +139,36 @@ pub fn eligible(vm: &VmState, method: MethodOop) -> bool {
     let cfg = decode::decode(method);
     let (_, max_stack) = ir::compute_entry_depths(method, &cfg);
     if method.ntemps() as i32 + max_stack > FRAME_BUDGET_SLOTS {
-        return false;
+        return Eligibility::NoPermanent;
     }
 
-    true
+    Eligibility::Yes
 }
 
 /// D1 point 2: `ic_idx`'s site is monomorphic, guarded on `smi_klass`, and
-/// its cached target's primitive is in [`SMI_INLINE`].
-fn mono_smi_inline_send(vm: &VmState, method: MethodOop, ic_idx: u16) -> bool {
-    if ic_state(method, ic_idx) != IcState::Mono {
-        return false; // empty/poly/mega -> ineligible
+/// its cached target's primitive is in [`SMI_INLINE`]. `Empty` is the one
+/// `NoRetryLater` case — see [`Eligibility`]'s own doc; every other
+/// non-eligible shape (poly, mega, mono-but-non-smi, mono-smi-but-not-an-
+/// inlinable-primitive) is treated as permanent: none of those states
+/// un-happen on their own the way a cold, not-yet-reached site does.
+fn mono_smi_inline_send(vm: &VmState, method: MethodOop, ic_idx: u16) -> Eligibility {
+    match ic_state(method, ic_idx) {
+        IcState::Empty => return Eligibility::NoRetryLater,
+        IcState::Mono => {}
+        IcState::Poly(_) | IcState::Mega => return Eligibility::NoPermanent,
     }
     let site = InterpreterIc::at(method, ic_idx);
     if site.guard().raw() != vm.universe.smi_klass.oop().raw() {
-        return false; // mono but non-smi guard -> ineligible
+        return Eligibility::NoPermanent; // mono but non-smi guard
     }
     let Some(target) = MethodOop::try_from(site.target()) else {
-        return false;
+        return Eligibility::NoPermanent;
     };
-    SMI_INLINE.contains(&target.primitive())
+    if SMI_INLINE.contains(&target.primitive()) {
+        Eligibility::Yes
+    } else {
+        Eligibility::NoPermanent
+    }
 }
 
 /// D4: `eligible`? -> decode -> convert -> regalloc -> emit -> publish ->
@@ -124,15 +187,31 @@ pub fn compile_method(
     rcvr_klass: KlassOop,
     method: MethodOop,
 ) -> Option<NmethodId> {
-    if !eligible(vm, method) {
-        method.set_compile_disabled();
-        if vm.options.trace.is_enabled("jit") {
-            eprintln!(
-                "[jit] ineligible, compile_disabled: {}",
-                selector_string(method)
-            );
+    match eligibility_detail(vm, method) {
+        Eligibility::Yes => {}
+        Eligibility::NoPermanent => {
+            method.set_compile_disabled();
+            if vm.options.trace.is_enabled("jit") {
+                eprintln!(
+                    "[jit] ineligible, compile_disabled: {}",
+                    selector_string(method)
+                );
+            }
+            return None;
         }
-        return None;
+        Eligibility::NoRetryLater => {
+            // Counter left as-is (D1's own dont-compile-bit rationale is
+            // about a permanently ineligible method re-firing every 10k
+            // sends — a cold IC isn't that; it's warm by the time this
+            // same method is next called, see Eligibility's own doc).
+            if vm.options.trace.is_enabled("jit") {
+                eprintln!(
+                    "[jit] not yet eligible (cold inner IC), retry next call: {}",
+                    selector_string(method)
+                );
+            }
+            return None;
+        }
     }
 
     let cfg = decode::decode(method);
@@ -333,15 +412,19 @@ mod tests {
         assert!(!eligible(&vm, method));
     }
 
-    /// D1: an ineligible method gets `compile_disabled` set (and its
-    /// invocation count reset to 0 as a side effect of sharing the smi)
-    /// rather than being silently skipped, so the interpreter's
-    /// counter-overflow trigger (S10 step 8) doesn't re-attempt it forever.
+    /// D1's `NoPermanent` path: a STRUCTURALLY ineligible method (here,
+    /// argc > 5 — never becomes eligible no matter how many times it's
+    /// called) gets `compile_disabled` set (and its invocation count reset
+    /// to 0 as a side effect of sharing the smi) rather than being
+    /// silently skipped, so the interpreter's counter-overflow trigger
+    /// (S10 step 8) doesn't re-attempt it forever.
     #[test]
-    fn compile_method_disables_ineligible_method() {
+    fn compile_method_disables_permanently_ineligible_method() {
         let mut vm = test_vm();
-        let method = plus_method(&mut vm);
-        // Left with an empty IC -> ineligible.
+        let mut b = BytecodeBuilder::new();
+        b.ret_self();
+        let sel = vm.universe.intern(b"sixArgs:x:x:x:x:x:");
+        let method = b.finish(&mut vm, sel, 6, 0);
         assert!(!method.compile_disabled());
         let smi_klass = vm.universe.smi_klass;
         let id = compile_method(&mut vm, smi_klass, method);
@@ -350,6 +433,35 @@ mod tests {
         assert_eq!(
             method.counters() & crate::oops::layout::COUNTERS_INVOCATION_MASK,
             0
+        );
+    }
+
+    /// D1's `NoRetryLater` path (the fix in this same commit): a method
+    /// whose only problem is a still-cold inner send site must NOT be
+    /// permanently disabled — the counter is left exactly as the caller
+    /// set it, so a later call (after this method's own body has actually
+    /// run and warmed that site) gets a fresh attempt. See `Eligibility`'s
+    /// own doc for why this distinction exists at all.
+    #[test]
+    fn compile_method_leaves_cold_ic_method_retryable() {
+        let mut vm = test_vm();
+        let method = plus_method(&mut vm);
+        // Left with an empty inner IC -> not yet eligible, but not
+        // permanently so either.
+        assert!(!method.compile_disabled());
+        method.set_counters(41); // as if bump_invocation had already run once
+        let smi_klass = vm.universe.smi_klass;
+        let id = compile_method(&mut vm, smi_klass, method);
+        assert!(id.is_none());
+        assert!(
+            !method.compile_disabled(),
+            "a cold inner IC must not permanently disable the method"
+        );
+        assert_eq!(
+            method.counters() & crate::oops::layout::COUNTERS_INVOCATION_MASK,
+            41,
+            "the counter must be left untouched, not reset, so a later call still crosses \
+             threshold and retries"
         );
     }
 

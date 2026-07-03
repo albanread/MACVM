@@ -59,7 +59,14 @@ pub fn activate_method(
     let bumped = bump_invocation(m);
 
     if let JitMode::Threshold(n) = vm.options.jit {
-        if bumped == n as i64 && !m.compile_disabled() {
+        // `>=`, not `==`: a compile attempt that comes back
+        // `Eligibility::NoRetryLater` (driver.rs) leaves the counter
+        // untouched rather than disabling the method, specifically so the
+        // *next* call — now that this one has actually run the method's
+        // body and warmed whatever inner IC was still cold — gets another
+        // attempt. An `==` check would only ever fire once at the exact
+        // crossing and then never again, silently defeating that retry.
+        if bumped >= n as i64 && !m.compile_disabled() {
             let rcvr = vm.stack.get(vm.stack.sp - argc as usize - 1);
             let k = klass_of(vm, rcvr);
             if let Some(id) = crate::compiler::driver::compile_method(vm, k, m) {

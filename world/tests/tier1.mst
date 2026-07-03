@@ -1,0 +1,158 @@
+"tier1.mst — Tier1Tests (sprint_s10_detail.md, tests_s10.md 'In-language
+ tests'). Runs under both `MACVM_JIT=off` and `MACVM_JIT=threshold=1` in
+ the gate (`just gate-s10`) — every assertion here must be JIT-mode-
+ agnostic, i.e. compiled and interpreted execution must be
+ indistinguishable from Smalltalk's own point of view. All the arithmetic
+ in this file re-runs S6-era assertions (03_integer_tests.mst already
+ covers `+`/`-`/`*`/comparisons/bit-ops on their own — this file adds
+ nothing new about SmallInteger correctness); its OWN job is to give the
+ S10 compile trigger something to fire on: `runAll` calls `sumTo:`/
+ `absDiff:`/`bitsOf:` (D1-eligible: send-free but for inlined mono-smi
+ sends) enough times that their own invocation counters cross even the
+ DEFAULT threshold (`JitMode::DEFAULT_THRESHOLD` = 1000), not just the
+ differential run's `threshold=1`.
+
+ SPEC-NOTE: sprint_s10_detail.md's D4 also describes a loop-back-edge
+ counter ('loop-counter overflow also calls compile_method... only
+ benefits the next invocation') as a second trigger, independent of the
+ method-invocation counter this VM actually implements. That second
+ mechanism is not built in this sprint (deferred, undocumented gap in the
+ implementation, not a correctness concern: an unrewritten IC just keeps
+ dispatching interpreted, forever safe, only ever a missed optimization) —
+ so this file deliberately drives the counter via REPEATED CALLS (the
+ mechanism that exists), not via one huge loop iteration count (the
+ mechanism that doesn't)."
+
+TestCase subclass: Tier1Tests [
+    runAll [
+        self runTest: #testSumToBoundary do: [ self testSumToBoundary ].
+        self runTest: #testAbsDiffBoundary do: [ self testAbsDiffBoundary ].
+        self runTest: #testBitsOfBoundary do: [ self testBitsOfBoundary ].
+        self runTest: #testOverflowPromotesToLargeInteger do: [
+            self testOverflowPromotesToLargeInteger ].
+        self runTest: #testComparisonLadder do: [ self testComparisonLadder ].
+        self runTest: #testBitOpIdentities do: [ self testBitOpIdentities ].
+        self runTest: #testWhileTrueCountdown do: [ self testWhileTrueCountdown ].
+        self runTest: #testToDoAccumulation do: [ self testToDoAccumulation ].
+        self runTest: #testTriggerAcrossRepeatedCalls do: [
+            self testTriggerAcrossRepeatedCalls ].
+    ]
+
+    "D1-eligible: send-free but for `+` (loop increment) and `<=`
+     (inlined to:do: condition), both mono-smi once warm."
+    sumTo: n [
+        | s |
+        s := 0.
+        1 to: n do: [:i | s := s + i].
+        ^s
+    ]
+
+    "D1-eligible: nested ifTrue:ifFalse: (BoolBr/merge vregs) + `-`."
+    absDiff: a with: b [
+        ^(a > b)
+            ifTrue: [ a - b ]
+            ifFalse: [ b - a ]
+    ]
+
+    "D1-eligible: bitAnd:/bitOr:/bitXor: chain + a ConstSmi literal."
+    bitsOf: x [
+        ^((x bitAnd: 16r0F) bitOr: (x bitXor: 16rFF)) bitAnd: 16rFF
+    ]
+
+    testSumToBoundary [
+        self assert: (self sumTo: 1000) = 500500.
+        self assert: (self sumTo: 0) = 0.
+        self assert: (self sumTo: 1) = 1.
+    ]
+
+    testAbsDiffBoundary [
+        self assert: (self absDiff: 10 with: 3) = 7.
+        self assert: (self absDiff: 3 with: 10) = 7.
+        self assert: (self absDiff: 5 with: 5) = 0.
+    ]
+
+    testBitsOfBoundary [
+        self assert: (self bitsOf: 16rA5) = ((16rA5 bitAnd: 16r0F) bitOr: (16rA5 bitXor: 16rFF)).
+        self assert: (self bitsOf: 0) = 16rFF.
+    ]
+
+    "The smi/LargeInteger boundary: SMI_MAX = (1 bitShift: 61) - 1
+     (oops::layout::SMI_MAX) — one past it must promote, not wrap or
+     truncate, whichever tier actually ran the `+`."
+    testOverflowPromotesToLargeInteger [
+        | half smiMax justOver |
+        "(1 bitShift: 61) alone overflows smi range (SMI_MAX = 2^61-1) --
+         build it from two in-range halves instead: 2^60-1 + 2^60 = 2^61-1."
+        half := 1 bitShift: 60.
+        smiMax := half - 1 + half.
+        justOver := smiMax + 1.
+        self assert: justOver > smiMax.
+        self assert: (justOver - 1) = smiMax.
+        self assert: (smiMax + smiMax) > smiMax.
+        self assert: (smiMax + smiMax) - smiMax = smiMax.
+    ]
+
+    testComparisonLadder [
+        | vals |
+        vals := #(-5 -1 0 1 5 100).
+        vals doWithIndex: [:v :i |
+            i < vals size ifTrue: [
+                | next |
+                next := vals at: i + 1.
+                self assert: v < next.
+                self assert: next > v.
+                self assert: v <= next.
+                self assert: next >= v.
+                self assert: v ~= next.
+                self deny: v = next.
+            ]
+        ].
+        self assert: 42 = 42.
+        self deny: 42 ~= 42.
+    ]
+
+    testBitOpIdentities [
+        #(-1 0 1 7 42 255 65535) do: [:x |
+            self assert: (x bitXor: x) = 0.
+            self assert: (x bitAnd: x) = x.
+            self assert: (x bitOr: x) = x.
+            self assert: (x bitAnd: 0) = 0.
+            self assert: (x bitOr: 0) = x.
+        ].
+    ]
+
+    "S5's inlined whileTrue: (real <=/+ sends underneath, D1-eligible once
+     warm) -- a plain countdown, not a >=1000-iteration loop: this file
+     drives the compile trigger via repeated CALLS (testTriggerAcrossRepeatedCalls
+     below), not via iteration count (see this file's own header note)."
+    testWhileTrueCountdown [
+        | i steps |
+        i := 20.
+        steps := 0.
+        [ i > 0 ] whileTrue: [ i := i - 1. steps := steps + 1 ].
+        self assert: i = 0.
+        self assert: steps = 20.
+    ]
+
+    testToDoAccumulation [
+        | acc |
+        acc := 0.
+        1 to: 50 do: [:i | acc := acc + i].
+        self assert: acc = 1275.
+    ]
+
+    "Calls sumTo:/absDiff:/bitsOf: enough times that their OWN invocation
+     counters cross even the production default threshold (1000), not
+     just the differential run's threshold=1 -- the actual mechanism this
+     VM implements (see this file's header). Every call's result is
+     checked every time: if the Nth call (wherever the trigger lands)
+     silently produced a wrong answer, this would catch it immediately
+     rather than only on a later, separate assertion."
+    testTriggerAcrossRepeatedCalls [
+        1 to: 1100 do: [:i |
+            self assert: (self sumTo: 10) = 55.
+            self assert: (self absDiff: 7 with: 2) = 5.
+            self assert: (self bitsOf: 16r3C) = ((16r3C bitAnd: 16r0F) bitOr: (16r3C bitXor: 16rFF)).
+        ].
+    ]
+]

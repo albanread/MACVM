@@ -88,6 +88,7 @@ pub struct PoolEntry {
 /// translation rows or D5.3's emit table either) are defined here for the
 /// C+D-phase enum shape but never *constructed* by S10's `convert` —
 /// they're S11's to emit.
+#[derive(Debug)]
 pub enum Ir {
     ConstSmi {
         dst: VReg,

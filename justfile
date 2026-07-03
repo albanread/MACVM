@@ -75,6 +75,19 @@ soak-s08-ci:
     sed '$s/.*/Soak run: 400./' world/bench/soak.mst > /tmp/macvm_soak_ci.mst
     cargo run --release --quiet -- run /tmp/macvm_soak_ci.mst --world world
 
+# S10 gate item 1 (differential): concatenate world/tests/tests.list's
+# files (in order) into one temp .mst — TestRunner's SUnit-lite state
+# (start/run:/report) must accumulate across them within ONE VM session,
+# which `macvm run <one-file>` gives for free but N separate CLI
+# invocations wouldn't. Plain concatenation is sound because each listed
+# file is already independently well-formed top-level Smalltalk source
+# (same reasoning `it_world.rs`'s own `load_tests_list` loop relies on,
+# just done in the shell instead of in Rust so this is CLI/stdout-diffable
+# under different MACVM_JIT values, not only assertable in-process).
+run-world-tests:
+    grep -v '^#' world/tests/tests.list | grep -v '^$' | sed 's|^|world/tests/|' | xargs cat > /tmp/macvm_world_tests.mst
+    cargo run --quiet -- run /tmp/macvm_world_tests.mst --world world
+
 soak-s08:
     sed '$s/.*/Soak run: 200000./' world/bench/soak.mst > /tmp/macvm_soak_1hr.mst
     MACVM_TRACE=gc cargo run --release --quiet -- run /tmp/macvm_soak_1hr.mst --world world
