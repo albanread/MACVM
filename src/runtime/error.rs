@@ -10,7 +10,7 @@ use std::io::Write;
 use crate::interpreter::stack::Frame;
 use crate::oops::layout::ENTRY_FRAME_SENTINEL;
 use crate::oops::wrappers::{KlassOop, MethodOop, SymbolOop};
-use crate::runtime::vm_state::VmState;
+use crate::runtime::vm_state::{TierLink, VmState};
 
 fn name_of(o: crate::oops::Oop) -> String {
     SymbolOop::try_from(o)
@@ -27,12 +27,43 @@ fn print_frame_line(vm: &mut VmState, method: MethodOop, bci: usize) {
     let _ = writeln!(vm.out, "  {holder}>>{sel} @{bci}");
 }
 
+/// The one compiled frame a mixed-tier trace can ever show in S10 (D1's
+/// send-free compiled methods can't nest — `vm.tier_links` never holds
+/// more than one entry, see its own doc). Prints nothing if the id is
+/// somehow no longer installed (defensive; not reachable from a live
+/// `enter_compiled` call, which only ever names a slot it just installed
+/// or already validated).
+fn print_compiled_frame_line(vm: &mut VmState, nm_id: crate::codecache::nmethod::NmethodId) {
+    let Some(nm) = vm.code_table.get(nm_id) else {
+        return;
+    };
+    let sel = nm.key_selector.as_string();
+    let holder = name_of(nm.key_klass.name());
+    let bci = nm.poll_bci;
+    let _ = match bci {
+        Some(b) => writeln!(vm.out, "  {holder}>>{sel} @{b} (compiled)"),
+        None => writeln!(vm.out, "  {holder}>>{sel} @? (compiled)"),
+    };
+}
+
 /// One line per frame, top (currently executing) frame first — pinned
 /// format for golden tests (`sprint_s03_detail.md` §Algorithms-6):
 /// `  <Holder>>><selector> @<bci>`. The top frame's bci comes from
 /// `vm.regs` (not yet saved into any frame slot); every ancestor's comes
 /// from its child frame's `saved_bci` (where that ancestor resumes).
+///
+/// S10 D4 addition: if a compiled activation is currently live
+/// (`vm.tier_links` non-empty), its line prints FIRST, above
+/// `vm.regs.method`'s own — compiled code never pushes a `vm.stack` frame
+/// or touches `vm.regs` (D1), so without consulting `tier_links` this walk
+/// would show only the interpreted caller and miss the compiled callee
+/// running "underneath" it entirely (tests_s10.md's `mixed_trace_golden`,
+/// gate item 4).
 pub fn print_stack_trace(vm: &mut VmState) {
+    if let Some(TierLink::IntoCompiled { nm_id, .. }) = vm.tier_links.last().copied() {
+        print_compiled_frame_line(vm, nm_id);
+    }
+
     let top_method = vm.regs.method.expect("print_stack_trace: no active method");
     let top_bci = vm.regs.bci;
     print_frame_line(vm, top_method, top_bci);

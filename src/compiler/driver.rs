@@ -252,6 +252,17 @@ pub fn compile_method(
     let key_selector = SymbolOop::try_from(method.selector())
         .expect("compile_method: method selector is not a Symbol");
 
+    // Block-bci granularity (matching pcdescs' own precision): the block
+    // containing this method's Ir::Poll, if it has one. A mixed-tier
+    // stack-trace walker has no exact native pc to work from at a poll
+    // callback (S11's last_compiled_pc anchor isn't wired up yet), so this
+    // is the IR-derived approximation `Nmethod::poll_bci` documents.
+    let poll_bci = ir_method
+        .blocks
+        .iter()
+        .find(|b| b.code.iter().any(|instr| matches!(instr, ir::Ir::Poll)))
+        .map(|b| b.bci);
+
     let nm = Nmethod {
         id: NmethodId(0), // overwritten by CodeTable::install
         key_klass: rcvr_klass,
@@ -268,6 +279,7 @@ pub fn compile_method(
         pcdescs,
         oopmaps,
         ic_sites: Vec::new(),
+        poll_bci,
     };
     let id = vm.code_table.install(nm);
     if vm.options.trace.is_enabled("jit") {

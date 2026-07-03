@@ -170,12 +170,32 @@ fn build_stub_poll() -> CodeBlob {
     a.finish()
 }
 
-/// S10: a no-op placeholder — nothing sets `VmRegBlock::poll_flag`
-/// nonzero yet (mirrors `interpreter::poll`'s own S2-era status), so this
-/// is rarely even reached. Exists so `Poll`'s codegen and the whole
-/// call-through-`bl`-into-Rust path are exercised and final now; a real
-/// interrupt/trace producer is a later sprint's job (D5.6).
-pub extern "C" fn rt_poll(_vm: *mut VmState) {}
+/// S10: nothing sets `VmRegBlock::poll_flag` nonzero yet (mirrors
+/// `interpreter::poll`'s own S2-era status), so this is rarely even
+/// reached in a normal run — a real interrupt/trace producer is a later
+/// sprint's job (D5.6). The one thing wired up now is
+/// `VmState::trace_on_poll`, tests_s10.md's `mixed_trace_golden` (gate
+/// item 4) hook: a test sets it before calling into compiled code whose
+/// own loop will reach a `Poll`, since compiled code is send-free (D1)
+/// and so has no other way to invoke a `printStackTrace` primitive from
+/// the inside. One-shot: cleared immediately, so a loop with several
+/// back-edge crossings prints exactly once.
+///
+/// # Safety
+/// Only ever reached via `bl rt_poll` from `stub_poll`'s own hand-assembled
+/// listing above, never called directly from Rust — `vm` must be `x28`,
+/// established once by `call_stub` and never null for the lifetime of any
+/// compiled call (D4's own invariant), the same pointer `Stubs::invoke`'s
+/// own `call` already trusts.
+pub unsafe extern "C" fn rt_poll(vm: *mut VmState) {
+    // SAFETY: this function's own contract, guaranteed by every caller
+    // (`stub_poll`'s assembly, the only one there is).
+    let vm = unsafe { &mut *vm };
+    if vm.trace_on_poll {
+        vm.trace_on_poll = false;
+        crate::runtime::error::print_stack_trace(vm);
+    }
+}
 
 #[cfg(test)]
 mod tests {

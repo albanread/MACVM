@@ -68,6 +68,7 @@ pub fn enter_compiled(vm: &mut VmState, nm_id: NmethodId, argc: u8) -> EnterResu
     vm.tier_links.push(TierLink::IntoCompiled {
         interp_frame: vm.stack.fp,
         entry_sp: vm.stack.sp as u64,
+        nm_id,
     });
     vm.compiled_depth += 1;
 

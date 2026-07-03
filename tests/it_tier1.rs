@@ -1012,3 +1012,98 @@ fn compiled_result_equals_interpreted() {
         &[(&[7, 13, 5], 1325), (&[100, 1, 1], 202)],
     );
 }
+
+// ── mixed_trace_golden (tests_s10.md gate item 4, integration item 6) ─────
+
+fn check_golden_trace(name: &str, actual: &str) {
+    let path = golden_dir().join(format!("{name}.trace.expected"));
+    if std::env::var("UPDATE_GOLDEN").is_ok() {
+        std::fs::write(&path, actual).expect("write golden");
+        return;
+    }
+    let expected = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("reading golden {}: {e}", path.display()));
+    assert_eq!(
+        actual, expected,
+        "golden {name} mismatch (run with UPDATE_GOLDEN=1 to inspect/regenerate)"
+    );
+}
+
+const MIXED_TRACE_SOURCE: &str = "\
+Object subclass: Tier1Trace [\n\
+\x20   callB: n [\n\
+\x20       ^self sumHelper: n\n\
+\x20   ]\n\
+\x20   sumHelper: n [\n\
+\x20       | s |\n\
+\x20       s := 0.\n\
+\x20       1 to: n do: [:i | s := s + i].\n\
+\x20       ^s\n\
+\x20   ]\n\
+]\n";
+
+/// `callB:`'s own body is a single opaque send to a non-primitive,
+/// non-`SMI_INLINE` method (`sumHelper:`) — structurally `NoPermanent`
+/// under `driver::eligibility_detail` (D1's own opcode allowlist), so
+/// `callB:` itself can never become eligible no matter how many times
+/// it's called. That's exactly the shape this test needs: an interpreted
+/// caller `a` (`callB:`) that stays interpreted forever, sending to a
+/// compiled callee `b` (`sumHelper:`, `sumTo:`'s own loop shape, so it
+/// gets a real `Poll` at its back-edge).
+#[test]
+fn mixed_trace_golden() {
+    let mut vm = VmState::with_options(VmOptions {
+        heap_mib: 64,
+        trace: Default::default(),
+        gc_stress: false,
+        gc_stress_full_period: None,
+        eden_kb: None,
+        jit: JitMode::Threshold(2),
+    });
+    install_smi_prim(&mut vm, b"+", 1, 1);
+    install_smi_prim(&mut vm, b"<=", 1, 11);
+    load_source(&mut vm, MIXED_TRACE_SOURCE);
+
+    // Calls 1-2 (small, safe n): call 1 warms sumHelper:'s own inner `+`/
+    // `<=` ICs interpreted; call 2 crosses sumHelper:'s invocation
+    // threshold (driven through callB:'s own real send site, exactly like
+    // send.rs's compile_trigger_fires_and_rewrites_ic_to_compiled), so by
+    // the time it returns callB:'s inner send site targets a real
+    // compiled nmethod.
+    for _ in 0..2 {
+        let klass = klass_named(&mut vm, "Tier1Trace");
+        let method = method_named(&mut vm, klass, "callB:");
+        let recv = macvm::memory::alloc::alloc_slots(&mut vm, klass).oop();
+        macvm::interpreter::run_method(&mut vm, method, recv, &[SmallInt::new(1).oop()]);
+    }
+
+    let buf = macvm::runtime::vm_state::OutputBuffer::new();
+    vm.out = Box::new(buf.clone());
+
+    // poll_flag gates whether the compiled loop's back-edge bothers
+    // calling stub_poll at all (nothing else in S10 ever sets it,
+    // `codecache::stubs::rt_poll`'s own doc); trace_on_poll gates what
+    // rt_poll does once actually reached. n=3 gives two back-edge
+    // crossings (i: 1->2, 2->3) -- trace_on_poll is one-shot, so only the
+    // first one prints.
+    vm.reg_block.poll_flag = 1;
+    vm.trace_on_poll = true;
+
+    let klass = klass_named(&mut vm, "Tier1Trace");
+    let method = method_named(&mut vm, klass, "callB:");
+    let recv = macvm::memory::alloc::alloc_slots(&mut vm, klass).oop();
+    let result = macvm::interpreter::run_method(&mut vm, method, recv, &[SmallInt::new(3).oop()]);
+    assert_eq!(
+        result,
+        SmallInt::new(6).oop(),
+        "1+2+3 = 6, unaffected by the poll firing"
+    );
+
+    assert!(
+        !vm.trace_on_poll,
+        "the poll must actually have fired and consumed the one-shot flag \
+         (otherwise this test isn't exercising rt_poll at all)"
+    );
+
+    check_golden_trace("s10_mixed_trace", &buf.as_string());
+}

@@ -97,8 +97,15 @@ pub enum TierLink {
     /// `entry_sp` is `vm.stack.sp` at the moment of entry, for a stack
     /// walker to anchor against and for the debug assertion that a
     /// completed (non-bailout) compiled call left `vm.stack.sp` exactly
-    /// where a primitive's direct return would have.
-    IntoCompiled { interp_frame: usize, entry_sp: u64 },
+    /// where a primitive's direct return would have. `nm_id` is which
+    /// nmethod is running "underneath" — the only way a mixed-tier stack
+    /// trace can name it (`key_klass`/`key_selector`) and locate its own
+    /// `poll_bci`, since nothing else records a compiled activation at all.
+    IntoCompiled {
+        interp_frame: usize,
+        entry_sp: u64,
+        nm_id: crate::codecache::nmethod::NmethodId,
+    },
     /// C→I: compiled code calling back into the interpreter (a runtime
     /// send, an allocation slow path). S10 never constructs this — D1's
     /// eligibility rules out every op that could need it — S11's own
@@ -393,6 +400,17 @@ pub struct VmState {
     /// case in S10 — S11's `IntoInterpreter` links are what would make
     /// this something other than a redundant count).
     pub compiled_depth: u32,
+    /// Test-only one-shot hook (tests_s10.md's `mixed_trace_golden`, gate
+    /// item 4): compiled code is send-free (D1), so nothing inside it can
+    /// call a `printStackTrace` primitive directly — a test sets this
+    /// before entering a call whose compiled callee has a loop, and
+    /// `codecache::stubs::rt_poll` (reached when that loop's back-edge
+    /// `Poll` actually fires) checks it, prints via
+    /// `runtime::error::print_stack_trace`, and clears it. Always `false`
+    /// outside tests — a normal run never sets it, so this is a dormant
+    /// field rather than a `#[cfg(test)]` one, matching `poll_flag`'s own
+    /// "wired but usually inert" status.
+    pub trace_on_poll: bool,
 }
 
 impl VmState {
@@ -441,6 +459,7 @@ impl VmState {
             stubs,
             tier_links: Vec::new(),
             compiled_depth: 0,
+            trace_on_poll: false,
         };
         crate::runtime::globals::bootstrap_well_known(&mut vm);
         vm

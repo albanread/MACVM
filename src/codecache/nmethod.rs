@@ -79,6 +79,16 @@ pub struct Nmethod {
     pub pcdescs: Vec<PcDesc>,
     pub oopmaps: Vec<OopMap>,
     pub ic_sites: Vec<IcSite>,
+    /// The bci of the block containing this method's `Ir::Poll`, if any
+    /// (D5.3: at most one loop back-edge site matters for S10 — a method
+    /// with none has no loop at all). Block-bci granularity, matching
+    /// `pcdescs`' own precision — a mixed-tier stack-trace walker
+    /// (`runtime::error::print_stack_trace`) has no exact native pc to
+    /// work from at a poll callback (S11's `last_compiled_pc` anchor isn't
+    /// wired up yet), so this is computed once at compile time from the IR
+    /// directly instead, purely as Rust-side bookkeeping alongside the
+    /// unchanged emitted code.
+    pub poll_bci: Option<usize>,
 }
 
 impl Nmethod {
@@ -317,6 +327,7 @@ mod tests {
             pcdescs: Vec::new(),
             oopmaps: Vec::new(),
             ic_sites: Vec::new(),
+            poll_bci: None,
         }
     }
 
