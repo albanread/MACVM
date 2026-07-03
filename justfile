@@ -43,6 +43,24 @@ gate-s08: gate-s07
     MACVM_GC_STRESS=full cargo test
     MACVM_GC_STRESS=full:1 cargo test --test it_world -- --test-threads=1
 
+# S9: vendored JASM wfasm + Assembler/JasmAssembler/CodeCache (tests_s09.md's
+# acceptance gate). The no-LLVM check is warn-only (documents the corpus-
+# replay-without-an-oracle claim; CI images without llvm make a hard fail
+# impractical, and this dev machine has llvm via homebrew regardless). The
+# P1 lint is a hard fail: a literal, comment-blind grep, so it also catches
+# an explanatory comment that quotes its own trigger strings, not just a
+# real re-introduced oracle dependency. it_codecache runs under --release
+# specifically (not just via `ci`'s debug-mode `cargo test`) because W^X/
+# icache bugs can hide in debug — this sprint found one exactly that way
+# before this gate existed (patch_branch26's guard-ordering bug, only
+# caught by actually running the integration tests, not by review).
+gate-s09: gate-s08
+    -command -v llvm-mc && echo "note: llvm-mc present -- no-LLVM claim not exercised this run"
+    ! grep -rn 'crate::oracle\|feature = "llvm"' src/vendor/
+    cargo test -p macvm
+    cargo test -p macvm --release --test it_codecache
+    cargo clippy --all-targets -- -D warnings
+
 # S8 gate item 4: soak the full GC under sustained realistic churn with a
 # continuous shadow-model integrity check (world/bench/soak.mst). The
 # 2-minute CI variant runs routinely; the 1-hour variant is executed once

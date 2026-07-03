@@ -480,8 +480,11 @@ pub fn scavenge(vm: &mut VmState) -> Result<ScavengeReport, GcStallError> {
     // live object eden and `from` held has a forwarding pointer installed
     // and a fresh copy in `to` by now, so nothing legitimate points into
     // either range anymore (SPEC §7.6 poisoning).
-    let vacated_eden = (vm.universe.eden.start, vm.universe.eden.top);
-    let vacated_from = (vm.universe.from.start, vm.universe.from.top);
+    #[cfg(debug_assertions)]
+    let (vacated_eden, vacated_from) = (
+        (vm.universe.eden.start, vm.universe.eden.top),
+        (vm.universe.from.start, vm.universe.from.top),
+    );
 
     std::mem::swap(&mut vm.universe.from, &mut vm.universe.to);
     vm.universe.eden.top = vm.universe.eden.start;

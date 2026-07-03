@@ -148,6 +148,12 @@ impl CodeCache {
         addr >= base && addr < base + self.cap as u64
     }
 
+    /// Bytes reserved so far (bump-pointer position) — diagnostics/stats
+    /// only, never consulted by an allocation decision.
+    pub fn used_bytes(&self) -> usize {
+        self.top
+    }
+
     /// Copy `blob`'s code into `h` and make it executable (D3.5): flip
     /// writable, copy, flip back to executable, flush the icache over the
     /// whole handle — in that order, all inside one [`JitWriteGuard`]. Only
