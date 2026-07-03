@@ -382,6 +382,7 @@ mod tests {
             gc_stress: false,
             gc_stress_full_period: None,
             eden_kb: None,
+            jit: crate::runtime::JitMode::Off,
         });
         let count = verify_heap(&u).expect("post-genesis heap must verify");
         assert!(count > 0);
@@ -396,6 +397,7 @@ mod tests {
             gc_stress: false,
             gc_stress_full_period: None,
             eden_kb: None,
+            jit: crate::runtime::JitMode::Off,
         });
         // Corrupt object_klass's own klass field ("Object class"'s klass,
         // normally metaclass_klass) to a smi placeholder via the raw
@@ -421,6 +423,7 @@ mod tests {
             gc_stress: false,
             gc_stress_full_period: None,
             eden_kb: None,
+            jit: crate::runtime::JitMode::Off,
         });
         dbg_oop_trace(&vm, "unset"); // vm.dbg_oop is None: no-op
 
@@ -444,6 +447,7 @@ mod tests {
             gc_stress: false,
             gc_stress_full_period: None,
             eden_kb: None,
+            jit: crate::runtime::JitMode::Off,
         });
         verify_heap_at(&vm, VerifyPoint::Manual).expect("fresh boot must verify");
     }
@@ -460,6 +464,7 @@ mod tests {
             gc_stress: false,
             gc_stress_full_period: None,
             eden_kb: None,
+            jit: crate::runtime::JitMode::Off,
         });
         let object_meta = vm.universe.object_klass.klass();
         object_meta
@@ -480,6 +485,7 @@ mod tests {
             gc_stress: false,
             gc_stress_full_period: None,
             eden_kb: None,
+            jit: crate::runtime::JitMode::Off,
         });
         vm.universe.tenuring_threshold = 0; // promote immediately
         let klass = vm.universe.array_klass;

@@ -480,6 +480,7 @@ mod tests {
             gc_stress: false,
             gc_stress_full_period: None,
             eden_kb: None,
+            jit: crate::runtime::JitMode::Off,
         })
     }
 
@@ -635,6 +636,7 @@ mod tests {
             gc_stress: false,
             gc_stress_full_period: None,
             eden_kb: Some(20 * 1024), // > OLD_INITIAL_SEGMENT's 16 MiB
+            jit: crate::runtime::JitMode::Off,
         });
         assert!(
             vm.universe.old.free_bytes() < vm.universe.eden.end - vm.universe.eden.start,

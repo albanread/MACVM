@@ -11,6 +11,75 @@ use crate::memory::Universe;
 use crate::oops::wrappers::MethodOop;
 use crate::runtime::lookup::LookupCache;
 
+/// `VmState`'s fixed-offset prefix (S10 D6) — see `oops::layout`'s
+/// `VMREG_*_OFFSET` consts, the single source of truth compiled code's
+/// direct `[x28, #N]` loads/stores bake in (`vmregblock_offsets_pinned`
+/// below asserts the two never drift apart). Only `poll_flag` is live in
+/// S10 (the `Poll` Ir op reads it, D5.3); the rest are laid out now so the
+/// offsets S11 compiles against are already stable.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct VmRegBlock {
+    /// S11 inline alloc.
+    pub eden_top: u64,
+    /// S11 inline alloc.
+    pub eden_end: u64,
+    /// S11 write barrier.
+    pub old_start: u64,
+    /// S11 write barrier: `cards − (old_start >> 9)`.
+    pub card_base_biased: u64,
+    /// Nonzero => an interrupt/trace poll is due (S10 `Poll` Ir op reads
+    /// this; nothing sets it nonzero yet — mirrors `VmState::pending`'s own
+    /// pre-S10 status as a wired-but-inert hook). nonzero comparison, not a
+    /// specific sentinel value, so `cbnz` (not a full compare) suffices.
+    pub poll_flag: u32,
+    _pad: u32,
+    /// S11 runtime entries: the anchor frame-pointer/return-pc pair native
+    /// stack-walking code reads when re-entering Rust from compiled code.
+    pub last_compiled_fp: u64,
+    pub last_compiled_pc: u64,
+}
+
+impl VmRegBlock {
+    pub fn new() -> VmRegBlock {
+        VmRegBlock {
+            eden_top: 0,
+            eden_end: 0,
+            old_start: 0,
+            card_base_biased: 0,
+            poll_flag: 0,
+            _pad: 0,
+            last_compiled_fp: 0,
+            last_compiled_pc: 0,
+        }
+    }
+}
+
+impl Default for VmRegBlock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// `MACVM_JIT` (CONVENTIONS §3). `Off` never triggers `compile_method`
+/// regardless of invocation counts; `Threshold(n)` compiles a method the
+/// moment its invocation counter reaches `n` (SPEC §8.1's
+/// `InvocationCounterLimit`) — `n = 1` is the differential-testing gate
+/// (tests_s10.md gate item 1): every eligible method compiles on its first
+/// send.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JitMode {
+    Off,
+    Threshold(u32),
+}
+
+impl JitMode {
+    /// Provisional (SPRINTS.md standing rule 3: S10 has no perf gate beyond
+    /// a 2× tripwire) — plausible enough to exercise real compilation in an
+    /// ordinary run without recompiling on every send; not perf-tuned.
+    pub const DEFAULT_THRESHOLD: u32 = 1000;
+}
+
 /// Which `MACVM_TRACE` channels are enabled. The channel set is open-ended
 /// (CONVENTIONS §3); S1 only stores membership, nothing reads it yet.
 #[derive(Clone, Default, Debug, PartialEq, Eq)]
@@ -92,6 +161,15 @@ pub struct VmOptions {
     /// default — used to shrink eden in tests so a scavenge is reachable
     /// without allocating megabytes of filler first.
     pub eden_kb: Option<usize>,
+    /// `MACVM_JIT=off|threshold=N` (S10, CONVENTIONS §3). Unset => `Off` —
+    /// deliberately NOT the SPEC-intent "on by default" reading: hundreds
+    /// of pre-S10 tests were written and verified against pure-interpreter
+    /// behavior, and `tests/common/mod.rs`'s `test_vm()` starts from
+    /// `VmOptions::from_env()` precisely so a gate script's env var (same
+    /// pattern as `MACVM_GC_STRESS`) reaches every in-process test VM —
+    /// defaulting this on would silently let ambient shell state change
+    /// unrelated test behavior. `just gate-s10` opts in explicitly.
+    pub jit: JitMode,
 }
 
 impl VmOptions {
@@ -120,6 +198,27 @@ impl VmOptions {
         (false, period)
     }
 
+    /// Pure parse of `MACVM_JIT`'s raw value (same testability rationale as
+    /// `parse_gc_stress`). Unset => `Off` (see `jit`'s own doc comment for
+    /// why). An unrecognized value warns and falls back to `Off` too — a
+    /// typo'd flag must never silently turn compilation on.
+    fn parse_jit(raw: Option<&str>) -> JitMode {
+        let Some(s) = raw.map(str::trim) else {
+            return JitMode::Off;
+        };
+        if s == "off" {
+            return JitMode::Off;
+        }
+        if let Some(n) = s
+            .strip_prefix("threshold=")
+            .and_then(|n| n.parse::<u32>().ok())
+        {
+            return JitMode::Threshold(n);
+        }
+        eprintln!("MACVM_JIT: unrecognized value {s:?}, defaulting to off");
+        JitMode::Off
+    }
+
     pub fn from_env() -> VmOptions {
         let heap_mib = std::env::var("MACVM_HEAP")
             .ok()
@@ -134,12 +233,14 @@ impl VmOptions {
         let eden_kb = std::env::var("MACVM_EDEN")
             .ok()
             .and_then(|s| s.parse::<usize>().ok());
+        let jit = Self::parse_jit(std::env::var("MACVM_JIT").ok().as_deref());
         VmOptions {
             heap_mib,
             trace,
             gc_stress,
             gc_stress_full_period,
             eden_kb,
+            jit,
         }
     }
 }
@@ -152,6 +253,7 @@ impl Default for VmOptions {
             gc_stress: false,
             gc_stress_full_period: None,
             eden_kb: None,
+            jit: JitMode::Off,
         }
     }
 }
@@ -172,14 +274,17 @@ pub struct InterpRegs {
     pub method: Option<MethodOop>,
 }
 
+/// `#[repr(C)]` (S10 D6): `reg_block` MUST be the first field, at
+/// `VmState`'s own byte offset 0, so x28 (established `&VmState` by the
+/// call stub) reaches its fields directly — see `VmRegBlock`'s own doc.
+/// Every other field keeps ordinary (unspecified) layout; only the prefix
+/// is pinned.
+#[repr(C)]
 pub struct VmState {
+    pub reg_block: VmRegBlock,
     pub universe: Universe,
     pub options: VmOptions,
     pub stack: ProcessStack,
-    /// GC/interrupt poll flag, checked at `jump_back` (SPEC §5.5). A no-op
-    /// hook in S2 (never set) so the dispatch loop's shape never changes
-    /// once S7 wires a real poll behind it.
-    pub pending: bool,
     /// The active send/DNU's view of "where execution currently is" (SPEC
     /// §5.3, S3). Written by the dispatch loop immediately before every
     /// `send`/`send_super`; read by `interpreter::send`'s super-lookup
@@ -256,10 +361,10 @@ impl VmState {
     pub fn with_options(options: VmOptions) -> VmState {
         let universe = Universe::genesis(&options);
         let mut vm = VmState {
+            reg_block: VmRegBlock::new(),
             universe,
             options,
             stack: ProcessStack::with_capacity(DEFAULT_STACK_CAPACITY),
-            pending: false,
             regs: InterpRegs::default(),
             ic_epoch: 0,
             lookup_cache: LookupCache::new(),
@@ -387,5 +492,72 @@ mod tests {
             (false, Some(12))
         );
         assert_eq!(VmOptions::parse_gc_stress(Some(" 1 ")), (true, None));
+    }
+
+    /// tests_s10.md's `jit_flag_parsing`: `off`, `threshold=1`,
+    /// `threshold=10000`, absent, and garbage all resolve to the correct
+    /// `JitMode` (garbage falls back to `Off`, same as `parse_gc_stress`'s
+    /// own precedent — never silently pick a mode the user didn't ask for).
+    #[test]
+    fn jit_flag_parsing() {
+        assert_eq!(VmOptions::parse_jit(None), JitMode::Off);
+        assert_eq!(VmOptions::parse_jit(Some("off")), JitMode::Off);
+        assert_eq!(
+            VmOptions::parse_jit(Some("threshold=1")),
+            JitMode::Threshold(1)
+        );
+        assert_eq!(
+            VmOptions::parse_jit(Some("threshold=10000")),
+            JitMode::Threshold(10000)
+        );
+        assert_eq!(VmOptions::parse_jit(Some("nonsense")), JitMode::Off);
+        assert_eq!(VmOptions::parse_jit(Some("threshold=")), JitMode::Off);
+        assert_eq!(VmOptions::parse_jit(Some("threshold=abc")), JitMode::Off);
+    }
+
+    /// S10 D6: every `VmRegBlock` field's real, compiler-computed offset
+    /// matches the `oops::layout::VMREG_*_OFFSET` constant compiled code's
+    /// direct `[x28, #N]` accesses bake in — the two are hand-kept in sync
+    /// (there's no `#[derive(offset_consts)]`), so this is the tripwire
+    /// that catches them drifting apart.
+    #[test]
+    fn vmregblock_offsets_pinned() {
+        use crate::oops::layout::{
+            VMREG_BLOCK_SIZE, VMREG_CARD_BASE_BIASED_OFFSET, VMREG_EDEN_END_OFFSET,
+            VMREG_EDEN_TOP_OFFSET, VMREG_LAST_COMPILED_FP_OFFSET, VMREG_LAST_COMPILED_PC_OFFSET,
+            VMREG_OLD_START_OFFSET, VMREG_POLL_FLAG_OFFSET,
+        };
+        assert_eq!(
+            std::mem::offset_of!(VmRegBlock, eden_top),
+            VMREG_EDEN_TOP_OFFSET
+        );
+        assert_eq!(
+            std::mem::offset_of!(VmRegBlock, eden_end),
+            VMREG_EDEN_END_OFFSET
+        );
+        assert_eq!(
+            std::mem::offset_of!(VmRegBlock, old_start),
+            VMREG_OLD_START_OFFSET
+        );
+        assert_eq!(
+            std::mem::offset_of!(VmRegBlock, card_base_biased),
+            VMREG_CARD_BASE_BIASED_OFFSET
+        );
+        assert_eq!(
+            std::mem::offset_of!(VmRegBlock, poll_flag),
+            VMREG_POLL_FLAG_OFFSET
+        );
+        assert_eq!(
+            std::mem::offset_of!(VmRegBlock, last_compiled_fp),
+            VMREG_LAST_COMPILED_FP_OFFSET
+        );
+        assert_eq!(
+            std::mem::offset_of!(VmRegBlock, last_compiled_pc),
+            VMREG_LAST_COMPILED_PC_OFFSET
+        );
+        assert_eq!(std::mem::size_of::<VmRegBlock>(), VMREG_BLOCK_SIZE);
+        // D6's other half: reg_block must sit at VmState's own offset 0, or
+        // x28 == &VmState would not equal x28 == &VmState.reg_block.
+        assert_eq!(std::mem::offset_of!(VmState, reg_block), 0);
     }
 }

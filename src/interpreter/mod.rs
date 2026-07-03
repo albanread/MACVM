@@ -270,7 +270,7 @@ fn dispatch(vm: &mut VmState) -> Oop {
             OP_JUMP_BACK => {
                 let d = read_u16(method, bci + 1);
                 let next = bci + 3;
-                if vm.pending {
+                if vm.reg_block.poll_flag != 0 {
                     poll(vm);
                 }
                 bci = next - d as usize;
@@ -456,8 +456,13 @@ fn dispatch(vm: &mut VmState) -> Oop {
     }
 }
 
-/// SPEC §5.5's poll point. A no-op hook in S2 (`vm.pending` is never set) so
-/// the loop's shape never changes once S7 wires a real GC poll behind it.
+/// SPEC §5.5's poll point, checked at `jump_back` — same flag
+/// (`reg_block.poll_flag`) the compiled `Poll` Ir op reads directly via
+/// `[x28, #VMREG_POLL_FLAG_OFFSET]` (S10 D5.3/D6), so an interrupt/trace
+/// request is visible to both tiers with no separate synchronization. A
+/// no-op hook still (nothing sets `poll_flag` nonzero yet — S2's original
+/// status, just relocated) so the loop's shape never changes once a real
+/// poll producer exists behind it.
 fn poll(_vm: &mut VmState) {}
 
 fn trace_bc(vm: &VmState, method: MethodOop, bci: usize, op: u8) {
@@ -481,6 +486,7 @@ mod tests {
             gc_stress: false,
             gc_stress_full_period: None,
             eden_kb: None,
+            jit: crate::runtime::JitMode::Off,
         })
     }
 
@@ -503,6 +509,7 @@ mod tests {
             gc_stress: false,
             gc_stress_full_period: None,
             eden_kb: None,
+            jit: crate::runtime::JitMode::Off,
         });
         let mut b = BytecodeBuilder::new();
         b.push_smi_i8(42);
@@ -702,6 +709,7 @@ mod tests {
             gc_stress: false,
             gc_stress_full_period: None,
             eden_kb: None,
+            jit: crate::runtime::JitMode::Off,
         });
         let mut b = BytecodeBuilder::new();
         b.push_true();

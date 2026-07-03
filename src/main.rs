@@ -201,6 +201,7 @@ fn selftest_trace_diamond() -> ! {
         gc_stress: false,
         gc_stress_full_period: None,
         eden_kb: None,
+        jit: macvm::runtime::JitMode::Off,
     });
     let mut b = BytecodeBuilder::new();
     let l1 = b.new_label();

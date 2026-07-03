@@ -322,6 +322,7 @@ fn trace_mode_smoke() {
         gc_stress: false,
         gc_stress_full_period: None,
         eden_kb: None,
+        jit: macvm::runtime::JitMode::Off,
     });
     let m = build_diamond(&mut vm);
     let true_obj = vm.universe.true_obj;

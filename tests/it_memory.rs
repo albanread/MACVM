@@ -51,6 +51,7 @@ fn small_heap_boot() {
         gc_stress: false,
         gc_stress_full_period: None,
         eden_kb: None,
+        jit: macvm::runtime::JitMode::Off,
     });
     verify::verify_heap(&vm.universe).expect("genesis must succeed in a 16 MiB reservation");
 }
@@ -97,6 +98,7 @@ fn alloc_torture_fill() {
         gc_stress: false,
         gc_stress_full_period: None,
         eden_kb: None,
+        jit: macvm::runtime::JitMode::Off,
     });
     let target = vm.universe.eden.end - (1 << 20); // stop ~1 MiB below capacity
     let mut rng = Xorshift(0x5EED_1234_ABCD_EF01);
@@ -160,6 +162,7 @@ fn genesis_is_deterministic() {
         gc_stress: false,
         gc_stress_full_period: None,
         eden_kb: None,
+        jit: macvm::runtime::JitMode::Off,
     });
     let vm2 = VmState::with_options(VmOptions {
         heap_mib: 64,
@@ -167,6 +170,7 @@ fn genesis_is_deterministic() {
         gc_stress: false,
         gc_stress_full_period: None,
         eden_kb: None,
+        jit: macvm::runtime::JitMode::Off,
     });
 
     let klasses1: Vec<KlassOop> = well_known(&vm1);

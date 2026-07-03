@@ -1,4 +1,8 @@
-//! Bit/offset constants for the tagged-oop and mark-word representation.
+//! Bit/offset constants for the tagged-oop and mark-word representation,
+//! plus (S10) the analogous fixed-offset contract for [`VmRegBlock`] — not
+//! an oop layout, but the same "single source of truth for an offset
+//! compiled/hand-written code bakes in" role, so it lives here rather than
+//! starting a second such file.
 //!
 //! Single source of truth (CONVENTIONS §2): nothing outside `oops::layout`
 //! may name a tag value, shift, or mask directly. SPEC §2.1 (tags), §2.2
@@ -240,6 +244,27 @@ pub const CLOSURE_NAMED_WORDS: usize = 2;
 
 pub const CONTEXT_HOME_HINT_INDEX: usize = 0;
 pub const CONTEXT_NAMED_WORDS: usize = 1;
+
+// --- VmState register block (S10 D6) ----------------------------------------
+// A #[repr(C)] prefix struct embedded as VmState's own first field (see
+// `runtime::vm_state::VmRegBlock`), so x28 (== &VmState, established by the
+// call stub — SPEC §8.1/S10 D5.1) reaches these fields via fixed-offset
+// loads/stores with no Rust-level indirection. `eden_top`/`eden_end`
+// (S11 inline alloc) and `old_start`/`card_base_biased` (S11 barrier) and
+// `last_compiled_{fp,pc}` (S11 runtime entries) are laid out now, ahead of
+// any S10 code depending on them, so the layout — and every offset compiled
+// code bakes in — never has to move once real code starts depending on it.
+// `poll_flag` is live from S10: the `Poll` Ir op (D5.3) reads it directly.
+
+pub const VMREG_EDEN_TOP_OFFSET: usize = 0;
+pub const VMREG_EDEN_END_OFFSET: usize = 8;
+pub const VMREG_OLD_START_OFFSET: usize = 16;
+pub const VMREG_CARD_BASE_BIASED_OFFSET: usize = 24;
+/// `POLL_OFF` (D5.3): `ldr w16, [x28, #VMREG_POLL_FLAG_OFFSET]; cbnz w16, poll_slow`.
+pub const VMREG_POLL_FLAG_OFFSET: usize = 32;
+pub const VMREG_LAST_COMPILED_FP_OFFSET: usize = 40;
+pub const VMREG_LAST_COMPILED_PC_OFFSET: usize = 48;
+pub const VMREG_BLOCK_SIZE: usize = 56;
 
 #[cfg(test)]
 mod tests {

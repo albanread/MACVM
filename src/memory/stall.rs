@@ -133,6 +133,7 @@ mod tests {
             gc_stress: false,
             gc_stress_full_period: None,
             eden_kb: None,
+            jit: crate::runtime::JitMode::Off,
         });
         let err = GcStallError::snapshot(&vm.universe, 4096, GcPhase::Mutator);
         assert_eq!(err.requested_bytes, 4096);

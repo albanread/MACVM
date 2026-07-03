@@ -236,6 +236,7 @@ mod tests {
             gc_stress: false,
             gc_stress_full_period: None,
             eden_kb: None,
+            jit: crate::runtime::JitMode::Off,
         })
     }
 
