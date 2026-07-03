@@ -19,6 +19,14 @@ pub const DEFAULT_STACK_CAPACITY: usize = 64 * 1024;
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub struct StackOverflow;
 
+/// Opaque snapshot returned by [`ProcessStack::save_activation`] — see that
+/// method's own doc.
+#[derive(Copy, Clone, Debug)]
+pub struct FrameActivation {
+    fp: usize,
+    has_frame: bool,
+}
+
 pub struct ProcessStack {
     slots: Vec<Oop>,
     pub sp: usize,
@@ -51,10 +59,49 @@ impl ProcessStack {
         self.has_frame = true;
     }
 
+    /// Whether a frame is currently active — see the field's own doc.
+    /// Mainly for tests: real code either already knows (it just called
+    /// `activate_frame`/`deactivate` itself) or goes through
+    /// `save_activation`/`restore_activation`, neither of which needs to
+    /// read this directly.
+    #[inline]
+    pub fn has_frame(&self) -> bool {
+        self.has_frame
+    }
+
     /// Marks no frame as active — called when the entry frame returns.
     #[inline]
     pub fn deactivate(&mut self) {
         self.has_frame = false;
+    }
+
+    /// S11 D6.1: snapshots "is a frame active, and if so where" —
+    /// `interpreter::run_method_reentrant`'s own save/restore pair around
+    /// a nested re-entrant call (compiled code calling back into an
+    /// interpreted method, C→I). `run_method`'s own completion always
+    /// [`Self::deactivate`]s unconditionally (`unwind::pop_and_deliver`'s
+    /// `ENTRY_FRAME_SENTINEL` case) — correct for the genuine top-level
+    /// entry point it was designed for, but wrong for a NESTED call: if an
+    /// outer interpreter activation is currently paused (a compiled frame
+    /// running above it, itself reached via a normal send), the nested
+    /// call's own completion would silently drop that outer activation's
+    /// `fp`/`has_frame` bookkeeping even though its frame data is still
+    /// sitting untouched in `slots`. `sp` needs no equivalent treatment —
+    /// `run_method`'s own push/pop nets to exactly zero stack effect once
+    /// its entry frame returns, by construction.
+    #[inline]
+    pub fn save_activation(&self) -> FrameActivation {
+        FrameActivation {
+            fp: self.fp,
+            has_frame: self.has_frame,
+        }
+    }
+
+    /// The other half of [`Self::save_activation`].
+    #[inline]
+    pub fn restore_activation(&mut self, saved: FrameActivation) {
+        self.fp = saved.fp;
+        self.has_frame = saved.has_frame;
     }
 
     #[inline]

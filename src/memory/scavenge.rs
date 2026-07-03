@@ -453,6 +453,16 @@ pub fn scavenge(vm: &mut VmState) -> Result<ScavengeReport, GcStallError> {
     });
     vm.code_table = code_table;
 
+    // S11 D6.1: c2i adapters' own embedded method-oop pool words are the
+    // same kind of root — same take-and-restore shape as `code_table`
+    // just above, same reason (`scavenge_oop` needs the whole `vm`).
+    let mut adapters = std::mem::take(&mut vm.adapters);
+    adapters.oops_do(&mut |word| {
+        let oop = Oop::from_raw(*word);
+        *word = scavenge_oop(vm, oop).raw();
+    });
+    vm.adapters = adapters;
+
     if let Some(err) = vm.universe.pending_stall.take() {
         return Err(err);
     }

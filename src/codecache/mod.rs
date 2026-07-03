@@ -16,6 +16,7 @@
 
 #![allow(unsafe_code)]
 
+pub mod adapters;
 pub mod guard;
 pub mod nmethod;
 pub mod stubs;

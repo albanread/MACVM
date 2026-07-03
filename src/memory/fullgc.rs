@@ -98,6 +98,12 @@ fn mark(vm: &mut VmState) -> usize {
         let oop = Oop::from_raw(*word);
         mark_push(oop, &mut stack, &mut marked_bytes);
     });
+    // S11 D6.1: c2i adapters' own embedded method-oop pool words, same
+    // treatment as `code_table` just above.
+    vm.adapters.oops_do(&mut |word| {
+        let oop = Oop::from_raw(*word);
+        mark_push(oop, &mut stack, &mut marked_bytes);
+    });
 
     while let Some(obj) = stack.pop() {
         let klass_field = obj.klass_oop();
@@ -457,6 +463,16 @@ pub fn full_gc(vm: &mut VmState) -> Result<FullGcReport, GcStallError> {
     });
     vm.code_table.update_keys(&mut forward_chase);
     vm.code_table.rehash();
+    // S11 D6.1: c2i adapters' own embedded method-oop pool words, same
+    // phase-C treatment as `code_table` just above. Unlike `code_table`,
+    // `AdapterTable::by_method`'s own HashMap key (also the method oop's
+    // raw bits) is NOT rehashed here — deferred (`codecache::adapters`'
+    // own doc): a stale key only costs a redundant-but-correct rebuilt
+    // adapter on the next `get_or_make` for that method, never a
+    // correctness violation the way a stale pool word would be.
+    vm.adapters.oops_do(&mut |word| {
+        *word = forward_chase(Oop::from_raw(*word)).raw();
+    });
     super::verify::dbg_oop_trace(vm, "full-gc-rewrite");
 
     // --- D ------------------------------------------------------------

@@ -386,6 +386,10 @@ pub struct VmState {
     /// Installed nmethods, keyed by `(receiver klass, selector)` (S10 D6,
     /// D8). Empty for the lifetime of a `JitMode::Off` run.
     pub code_table: CodeTable,
+    /// c2i adapters (S11 D6.1), one per interpreted `MethodOop` a compiled
+    /// call site has resolved to. Empty for the lifetime of a
+    /// `JitMode::Off` run, same as `code_table`.
+    pub adapters: crate::codecache::adapters::AdapterTable,
     /// `call_stub`/`stub_poll` (S10 D4/D5.6) — published into `code_cache`
     /// once, here, at boot. `compile_method` needs `stub_poll_addr()` to
     /// embed as a pool constant in any method that emits `Ir::Poll`;
@@ -456,6 +460,7 @@ impl VmState {
             handle_arena: Box::new(crate::memory::handles::HandleArena::new()),
             code_cache,
             code_table: CodeTable::new(),
+            adapters: crate::codecache::adapters::AdapterTable::new(),
             stubs,
             tier_links: Vec::new(),
             compiled_depth: 0,

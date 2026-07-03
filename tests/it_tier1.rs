@@ -1509,3 +1509,209 @@ fn mono_resolve_patches_call_site_and_dispatches() {
         other => panic!("expected still-Mono after the second (same-klass) resolve, got {other:?}"),
     }
 }
+
+/// Builds a target klass with an UNCOMPILED `foo:with:` method (returns
+/// its 2nd real arg, same shape as `mono_resolve_patches_call_site_and_
+/// dispatches`'s own callee) plus a hand-built caller sending to it,
+/// published and installed with one `Unresolved` `IcSite` -- the setup
+/// both S11 step 4 (c2i) tests below share. `foo_method` is deliberately
+/// NEVER passed to `driver::compile_method`, so `code_table.lookup` must
+/// miss and `rt_resolve_send` must fall back to a c2i adapter (D6.1).
+/// Returns `(caller_entry, target_klass, caller_id)`.
+fn build_c2i_scenario(vm: &mut VmState) -> (u64, KlassOop, NmethodId) {
+    let target_klass = vm.universe.new_klass(
+        vm.universe.object_klass,
+        "S11C2ITarget",
+        Format::Slots,
+        false,
+        HEADER_WORDS,
+    );
+    let foo_sel = vm.universe.intern(b"foo:with:");
+    let mut fb = BytecodeBuilder::new();
+    fb.push_temp(1); // second real arg
+    fb.ret_tos();
+    let foo_method = fb.finish(vm, foo_sel, 2, 0);
+    install_method(vm, target_klass, foo_sel, foo_method);
+
+    let vregs: Vec<VRegInfo> = (0..4).map(|_| VRegInfo { is_oop: true }).collect();
+    let block0 = IrBlock {
+        id: BlockId(0),
+        bci: 0,
+        code: vec![
+            Ir::Param {
+                dst: VReg(0),
+                index: 0,
+            },
+            Ir::ConstSmi {
+                dst: VReg(1),
+                value: 111,
+            },
+            Ir::ConstSmi {
+                dst: VReg(2),
+                value: 222,
+            },
+            Ir::CallSend {
+                dst: VReg(3),
+                site: 0,
+                args: vec![VReg(0), VReg(1), VReg(2)],
+            },
+            Ir::Ret { val: VReg(3) },
+        ],
+        entry_stack: Vec::new(),
+    };
+    let caller_method = IrMethod {
+        blocks: vec![block0],
+        vregs,
+        pool: Vec::new(),
+        argc: 1,
+        ntemps: 0,
+        safepoints: Vec::new(),
+        true_lit: PoolLit(0),
+        false_lit: PoolLit(0),
+        call_sites: vec![CallSiteInfo {
+            selector: foo_sel,
+            argc: 3,
+        }],
+    };
+    let ra = regalloc::regalloc(&caller_method);
+    let mut asm = JasmAssembler::new();
+    let (blob, _pcs, _verified_entry_off, emitted_ic_sites) = emit::emit(
+        &mut asm,
+        &caller_method,
+        &ra,
+        vm.stubs.stub_poll_addr(),
+        None,
+    );
+    assert_eq!(emitted_ic_sites.len(), 1, "exactly one Ir::CallSend");
+
+    let h = vm.code_cache.alloc(blob.code.len()).unwrap();
+    vm.code_cache.publish(h, &blob);
+    let resolve_addr = vm.stubs.resolve_addr();
+    for site in &emitted_ic_sites {
+        vm.code_cache.patch_branch26_at(h, site.off, resolve_addr);
+    }
+    let caller_probe_sel = vm.universe.intern(b"s11C2ICallerProbe");
+    let ic_sites: Vec<IcSite> = emitted_ic_sites
+        .iter()
+        .map(|s| IcSite {
+            off: s.off,
+            selector: s.selector,
+            argc: s.argc,
+            state: IcState::Unresolved,
+        })
+        .collect();
+    let caller_nm = Nmethod {
+        id: NmethodId(0),
+        key_klass: target_klass,
+        key_selector: caller_probe_sel,
+        code: h,
+        entry_off: 0,
+        verified_entry_off: 0,
+        state: NmState::Alive,
+        level: 1,
+        version: 0,
+        literal_off: blob.literal_off,
+        relocs: blob.relocs.clone(),
+        frame_slots: ra.frame_slots,
+        pcdescs: Vec::new(),
+        oopmaps: Vec::new(),
+        ic_sites,
+        poll_bci: None,
+    };
+    let caller_id = vm.code_table.install(caller_nm);
+    let caller_entry = h.base as u64; // entry_off == verified_entry_off == 0 (no guard, `None`)
+    (caller_entry, target_klass, caller_id)
+}
+
+/// S11 step 4's own explicit test target (`sprint_s11_detail.md`'s
+/// implementation order, item 4): "C->I works". `foo:with:` is
+/// deliberately left uncompiled (see `build_c2i_scenario`'s own doc) --
+/// `rt_resolve_send` must fall back to a c2i adapter, and
+/// `rt_interpret_call` must genuinely re-enter the bytecode interpreter
+/// and hand back the right result.
+#[test]
+fn c2i_adapter_dispatches_to_interpreted_method() {
+    let mut vm = test_vm();
+    let (caller_entry, target_klass, caller_id) = build_c2i_scenario(&mut vm);
+
+    let receiver = alloc::alloc_slots(&mut vm, target_klass).oop();
+    let call: CallStubFn = unsafe { std::mem::transmute(vm.stubs.call_stub_entry()) };
+    let vm_ptr: *mut VmState = &mut vm;
+    let argv = [receiver.raw()];
+
+    let result = unsafe { call(caller_entry, vm_ptr, argv.as_ptr(), 1) };
+    assert_eq!(
+        result,
+        SmallInt::new(222).oop().raw(),
+        "compiled caller -> c2i adapter -> interpreted foo:with: must return its 2nd arg"
+    );
+    assert!(
+        vm.tier_links.is_empty(),
+        "TierLink::IntoInterpreter must be popped again once rt_interpret_call returns"
+    );
+
+    let nm_after = vm.code_table.get(caller_id).unwrap();
+    match nm_after.ic_sites[0].state {
+        IcState::Mono { klass, target } => {
+            assert_eq!(klass, target_klass, "must record the receiver's own klass");
+            // `target` really is a directly-callable adapter entry --
+            // invoking it a SECOND time, bypassing the caller entirely,
+            // with FRESH args must independently reach foo:with: too.
+            let argv2 = [
+                receiver.raw(),
+                SmallInt::new(1).oop().raw(),
+                SmallInt::new(999).oop().raw(),
+            ];
+            let direct = unsafe { call(target, vm_ptr, argv2.as_ptr(), 3) };
+            assert_eq!(
+                direct,
+                SmallInt::new(999).oop().raw(),
+                "the recorded target address must itself be a valid, independently callable \
+                 c2i adapter entry"
+            );
+        }
+        other => panic!("expected Mono after resolving to a c2i adapter, got {other:?}"),
+    }
+}
+
+/// The reentrancy hazard `interpreter::run_method_reentrant`'s own doc
+/// warns about: `run_method` unconditionally deactivates `vm.stack` when
+/// ITS OWN entry frame returns, which would silently corrupt an OUTER,
+/// currently-paused interpreter activation's `fp`/`has_frame` bookkeeping
+/// if this C->I call happens to be nested inside one (a real I->C->I
+/// round trip). Fabricates that outer state directly (an arbitrary `fp`,
+/// `has_frame=true`) rather than building a full 3-tier round trip by
+/// hand -- the c2i path never dereferences `vm.stack`'s own slot contents
+/// at that `fp`, only copies the `fp`/`has_frame` VALUES themselves
+/// (`ProcessStack::save_activation`/`restore_activation`), so a
+/// fabricated, never-pushed-to `fp` exercises exactly the same code path
+/// a real nested activation would.
+#[test]
+fn c2i_call_preserves_outer_interpreter_activation() {
+    let mut vm = test_vm();
+    let (caller_entry, target_klass, _caller_id) = build_c2i_scenario(&mut vm);
+    let receiver = alloc::alloc_slots(&mut vm, target_klass).oop();
+
+    vm.stack.activate_frame(12345);
+    let sp_before = vm.stack.sp;
+
+    let call: CallStubFn = unsafe { std::mem::transmute(vm.stubs.call_stub_entry()) };
+    let vm_ptr: *mut VmState = &mut vm;
+    let argv = [receiver.raw()];
+    let result = unsafe { call(caller_entry, vm_ptr, argv.as_ptr(), 1) };
+    assert_eq!(result, SmallInt::new(222).oop().raw());
+
+    assert_eq!(
+        vm.stack.fp, 12345,
+        "an outer (fabricated) interpreter activation's own fp must survive a nested C->I \
+         round trip"
+    );
+    assert!(
+        vm.stack.has_frame(),
+        "the outer activation must still be considered active after the nested call returns"
+    );
+    assert_eq!(
+        vm.stack.sp, sp_before,
+        "sp must net to exactly zero effect too"
+    );
+}

@@ -10,9 +10,10 @@ use crate::compiler::jasm_assembler::JasmAssembler;
 use crate::oops::layout::{
     ROOTSPILL_BYTES, VMREG_LAST_COMPILED_FP_OFFSET, VMREG_LAST_COMPILED_PC_OFFSET,
 };
+use crate::oops::wrappers::MethodOop;
 use crate::oops::Oop;
 use crate::runtime::lookup::{klass_of, lookup};
-use crate::runtime::vm_state::VmState;
+use crate::runtime::vm_state::{TierLink, VmState};
 
 use super::nmethod::IcState;
 use super::{CodeCache, CodeHandle};
@@ -86,6 +87,10 @@ pub struct Stubs {
     /// embeds its address as every `IcSite`'s initial `bl` target (S11
     /// step 2).
     pub resolve: CodeHandle,
+    /// D6.1: the shared c2i adapter tail — every per-method `c2i_<method>`
+    /// trampoline (`codecache::adapters::build_c2i_adapter`) `br`s here
+    /// with the target method's own oop already in x17 (S11 step 4).
+    pub c2i_shared: CodeHandle,
 }
 
 impl Stubs {
@@ -97,6 +102,9 @@ impl Stubs {
     }
     pub fn resolve_addr(&self) -> u64 {
         self.resolve.base as u64
+    }
+    pub fn c2i_shared_addr(&self) -> u64 {
+        self.c2i_shared.base as u64
     }
 
     /// Invokes `entry` (a compiled method's own entry point — an `Nmethod`'s
@@ -144,10 +152,17 @@ pub fn install(cache: &mut CodeCache) -> Stubs {
         .expect("stubs::install: code cache too small for stub_resolve");
     cache.publish(h3, &stub_resolve_blob);
 
+    let c2i_shared_blob = build_c2i_shared();
+    let h4 = cache
+        .alloc(c2i_shared_blob.code.len())
+        .expect("stubs::install: code cache too small for c2i_shared");
+    cache.publish(h4, &c2i_shared_blob);
+
     Stubs {
         call_stub: h1,
         stub_poll: h2,
         resolve: h3,
+        c2i_shared: h4,
     }
 }
 
@@ -285,14 +300,17 @@ fn build_stub_resolve() -> CodeBlob {
 /// then patches the site directly to the target's `entry` and records
 /// `Mono{klass, target}`.
 ///
-/// DNU (`lookup` finds nothing), an interpreted-only target (`code_table
-/// .lookup` finds no nmethod), and every transition out of `Mono`/`Pic`/
-/// `Mega` besides "same klass, repatch" are S11 steps 4/5/6's own scope —
-/// deliberately loud (`todo!`/`unreachable!`) rather than silently wrong:
-/// nothing in the codebase can drive them yet (S10's `convert()` never
-/// constructs `Ir::CallSend` at all; every real call site is hand-built by
-/// this step's own tests, against selectors that exist and targets that
-/// are already compiled).
+/// An interpreted-only target (`code_table.lookup` finds no nmethod) falls
+/// back to a c2i adapter (D6.1, `codecache::adapters::AdapterTable::
+/// get_or_make`) — from `IcState::Mono`'s own perspective this is no
+/// different from a real nmethod's `entry`, just a different source for
+/// `target_entry`. DNU (`lookup` finds nothing) and every transition out
+/// of `Mono`/`Pic`/`Mega` besides "same klass, repatch" remain S11 steps
+/// 5/6's own scope — deliberately loud (`todo!`/`unreachable!`) rather
+/// than silently wrong: nothing in the codebase can drive them yet (S10's
+/// `convert()` never constructs `Ir::CallSend` at all; every real call
+/// site is hand-built by this sprint's own tests, against selectors that
+/// exist).
 pub unsafe extern "C" fn rt_resolve_send(vm: *mut VmState, ret_addr: u64, argv: *mut u64) -> u64 {
     // SAFETY: this function's own contract, guaranteed by `stub_resolve`.
     let vm = unsafe { &mut *vm };
@@ -332,17 +350,26 @@ pub unsafe extern "C" fn rt_resolve_send(vm: *mut VmState, ret_addr: u64, argv: 
     let receiver = Oop::from_raw(unsafe { *argv });
     let k = klass_of(vm, receiver);
 
-    let Some(_method) = lookup(vm, k, selector) else {
+    let Some(method) = lookup(vm, k, selector) else {
         todo!("S11 step 6: DNU from compiled code (stubs.dnu / rt_dnu)")
     };
-    let Some(target_id) = vm.code_table.lookup(k, selector) else {
-        todo!("S11 step 4: c2i adapter for an interpreted-only target")
+    let target_entry = match vm.code_table.lookup(k, selector) {
+        Some(target_id) => {
+            let target_nm = vm
+                .code_table
+                .get(target_id)
+                .expect("code_table.lookup just returned this id");
+            target_nm.code.base as u64 + target_nm.entry_off as u64
+        }
+        // D6.1: no compiled nmethod yet -- a c2i adapter, callable exactly
+        // like a real nmethod's own `entry` (`bl`, x0=result on return),
+        // stands in until (if ever) `method` gets compiled for real.
+        None => {
+            let c2i_shared_addr = vm.stubs.c2i_shared_addr();
+            vm.adapters
+                .get_or_make(&mut vm.code_cache, c2i_shared_addr, method)
+        }
     };
-    let target_nm = vm
-        .code_table
-        .get(target_id)
-        .expect("code_table.lookup just returned this id");
-    let target_entry = target_nm.code.base as u64 + target_nm.entry_off as u64;
 
     match prev_state {
         IcState::Unresolved => {}
@@ -367,6 +394,103 @@ pub unsafe extern "C" fn rt_resolve_send(vm: *mut VmState, ret_addr: u64, argv: 
     };
 
     target_entry
+}
+
+/// D6.1: the shared c2i adapter tail. Reused unchanged from
+/// [`emit_stub_prologue`]/[`emit_stub_epilogue`] rather than a hand-rolled
+/// frame — "every stub that can reach Rust follows the same skeleton"
+/// ([`Stubs`]'s own doc) holds for this one too, and RootSpill (x0..x5,
+/// `sp`-relative, contiguous ascending once the prologue's `sub sp` runs)
+/// is exactly the `argv` shape [`rt_interpret_call`] needs, for free. The
+/// ONE thing that differs from `stub_resolve`'s shape: this is a
+/// callee-shaped stub (a plain `ret` with x0=result, matching how the
+/// ORIGINAL compiled call site's own `bl` expects an ordinary nmethod
+/// `entry` to behave), not a tail-jumper — so the real result is parked in
+/// x16 (spared by the epilogue, same reasoning as `stub_resolve`'s own use
+/// of it, P4) across the epilogue's own x0..x5 reload, which would
+/// otherwise clobber it right back to the pre-call receiver.
+///
+/// `c2i_<method>` (`codecache::adapters::build_c2i_adapter`) is what
+/// carries the target method's own oop here, already loaded into x17 by
+/// the time its own `br` lands — moved straight into x1
+/// (`rt_interpret_call`'s `method_bits` argument) rather than spilled to a
+/// stack slot: it only needs to survive the few instructions between
+/// `c2i_<method>`'s own `ldr x17,<pool>` and this stub's `mov x1,x17`,
+/// which nothing in between touches.
+fn build_c2i_shared() -> CodeBlob {
+    let mut a = JasmAssembler::new();
+
+    emit_stub_prologue(&mut a);
+    a.emit("mov", &[x(0), x(28)]); // vm
+    a.emit("mov", &[x(1), x(17)]); // method_bits, carried through from c2i_<method>
+    a.emit("mov", &[x(2), sp()]); // argv = &RootSpill (x0..x5, contiguous)
+    let rt_interpret_call_lit = a.literal_u64(
+        rt_interpret_call as *const () as u64,
+        Some(RelocKind::RuntimeAddr),
+    );
+    a.call_far(rt_interpret_call_lit);
+    a.emit("mov", &[x(16), x(0)]); // result -> x16, survives the epilogue's own x0 reload
+    emit_stub_epilogue(&mut a);
+    a.emit("mov", &[x(0), x(16)]); // restore the real result
+    a.emit("ret", &[]);
+
+    a.finish()
+}
+
+/// # Safety
+/// Only ever reached via `blr`/`bl` from `c2i_shared`'s own hand-assembled
+/// listing above (through `call_far`), never called directly from Rust —
+/// same contract as [`rt_poll`]/[`rt_resolve_send`]. `argv` points at
+/// `c2i_shared`'s own RootSpill area (6 live `u64`s, receiver + up to 5
+/// args, contiguous ascending); valid for the duration of this call only.
+///
+/// D6.1's C→I path: resolves `method_bits` to a real `MethodOop` (trusted
+/// — it came from the adapter's own `RelocKind::Oop` pool word, which
+/// `AdapterTable::get_or_make` only ever populates from a genuine
+/// `MethodOop`), reads exactly `method.argc()` real args off `argv`
+/// (deliberately NOT a separately-passed argc parameter — D5's own
+/// pseudocode signature suggests one, but a method's own arity is a fixed
+/// property of the method oop, always the SAME value this call's own
+/// adapter was generated for, so there is nothing independent for a
+/// second value to cross-check), pushes `TierLink::IntoInterpreter` (the
+/// anchor D6.3's later NLR unwinder will need to find this boundary),
+/// runs the method via `interpreter::run_method_reentrant` (NOT plain
+/// `run_method` — this call may itself be nested inside an OUTER,
+/// currently-paused interpreter activation reached via an earlier I→C
+/// transition; `run_method_reentrant`'s own doc explains why that
+/// distinction matters), pops the `TierLink`, and returns the raw result.
+pub unsafe extern "C" fn rt_interpret_call(
+    vm: *mut VmState,
+    method_bits: u64,
+    argv: *const u64,
+) -> u64 {
+    // SAFETY: this function's own contract, guaranteed by `c2i_shared`.
+    let vm = unsafe { &mut *vm };
+    debug_assert_ne!(
+        vm.reg_block.last_compiled_fp, 0,
+        "rt_interpret_call: anchor must be set by c2i_shared's prologue before this call"
+    );
+
+    let method = MethodOop::try_from(Oop::from_raw(method_bits)).expect(
+        "rt_interpret_call: method_bits must be a genuine MethodOop -- AdapterTable::get_or_make's own RelocKind::Oop pool word",
+    );
+    let real_argc = method.argc();
+    // SAFETY: this function's own contract above -- argv[0] is the
+    // receiver, argv[1..=real_argc] the real Smalltalk args, D4.1's
+    // register protocol (shared with `rt_resolve_send`'s own argv).
+    let receiver = Oop::from_raw(unsafe { *argv });
+    let args: Vec<Oop> = (0..real_argc)
+        .map(|i| Oop::from_raw(unsafe { *argv.add(1 + i) }))
+        .collect();
+
+    vm.tier_links.push(TierLink::IntoInterpreter {
+        compiled_fp: vm.reg_block.last_compiled_fp,
+        compiled_ret_pc: vm.reg_block.last_compiled_pc,
+    });
+    let result = crate::interpreter::run_method_reentrant(vm, method, receiver, &args);
+    vm.tier_links.pop();
+
+    result.raw()
 }
 
 /// S10: nothing sets `VmRegBlock::poll_flag` nonzero yet (mirrors

@@ -124,6 +124,29 @@ pub fn run_method(vm: &mut VmState, method: MethodOop, receiver: Oop, args: &[Oo
     dispatch(vm)
 }
 
+/// S11 D6.1's C→I entry point: like [`run_method`], but safe to call from
+/// WITHIN an already-active interpreter activation that's currently paused
+/// (a compiled frame running above it — an I→C→I round trip). `run_method`
+/// itself is only ever a genuine top-level entry elsewhere in this
+/// codebase (`main.rs`, bootstrap code, or a fresh-`vm` test) — its own
+/// completion unconditionally clears `vm.stack`'s "is a frame active"
+/// bookkeeping (`ProcessStack::deactivate`, via
+/// `unwind::pop_and_deliver`'s `ENTRY_FRAME_SENTINEL` case), which would
+/// silently drop an OUTER activation's own `fp` if one exists. Saving and
+/// restoring that snapshot around the call is what makes nesting safe
+/// without touching `run_method`/`dispatch`/`do_return` themselves.
+pub fn run_method_reentrant(
+    vm: &mut VmState,
+    method: MethodOop,
+    receiver: Oop,
+    args: &[Oop],
+) -> Oop {
+    let saved = vm.stack.save_activation();
+    let result = run_method(vm, method, receiver, args);
+    vm.stack.restore_activation(saved);
+    result
+}
+
 /// SPEC §5.4 Algorithm 11: a branch popped a non-`true`/`false` value.
 /// Pushes it back, rolls `vm.regs.bci` back to the *branch opcode itself*
 /// (not its operand) so a normal-returning handler makes the branch
