@@ -227,6 +227,23 @@ impl CodeCache {
         patch_branch26_field(site, veneer_disp);
     }
 
+    /// As [`Self::patch_branch26`], but addressed as `(nmethod's own
+    /// CodeHandle, byte offset within it)` rather than a raw pointer —
+    /// `codecache` is `crate`'s one designated owner of raw pointer/`MAP_JIT`
+    /// arithmetic (this module's own doc), so callers outside it (`driver.rs`,
+    /// under the crate-root `#![deny(unsafe_code)]`) that only ever have an
+    /// `Nmethod`'s `(code, ic_site.off)` pair — never a raw address of their
+    /// own — go through this instead of computing the pointer themselves.
+    pub fn patch_branch26_at(&mut self, handle: CodeHandle, off: u32, target: u64) {
+        debug_assert!(
+            (off as usize) + 4 <= handle.len,
+            "patch_branch26_at: offset {off} + 4 exceeds the handle's own length {}",
+            handle.len
+        );
+        let site = unsafe { handle.base.add(off as usize) };
+        self.patch_branch26(site, target);
+    }
+
     /// Overwrite an 8-byte literal-pool word in place (GC relocation, or an
     /// inline cache's cached klass — S12). No re-publish, no separate flush
     /// call needed beyond the guard's own.

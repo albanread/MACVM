@@ -405,6 +405,7 @@ mod tests {
             safepoints: Vec::new(),
             true_lit: PoolLit(0),
             false_lit: PoolLit(0),
+            call_sites: Vec::new(),
         }
     }
 

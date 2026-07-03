@@ -5,13 +5,19 @@
 //! callable directly, independent of the interpreter trigger (S10 step 8).
 
 use crate::bytecode::opcode::{decode_at, Instr};
-use crate::codecache::nmethod::{NmState, Nmethod, NmethodId, OopMap, PcDesc};
+use crate::codecache::nmethod::{IcSite, NmState, Nmethod, NmethodId, OopMap, PcDesc};
 use crate::compiler::jasm_assembler::JasmAssembler;
 use crate::compiler::{decode, emit, ir, regalloc};
 use crate::interpreter::ic::{ic_state, IcState, InterpreterIc};
 use crate::oops::wrappers::{KlassOop, MethodOop, SymbolOop};
 use crate::runtime::vm_state::VmState;
 use crate::runtime::JitMode;
+
+/// `codecache::nmethod::IcState` — spelled out at every use site rather
+/// than imported under its own name: `interpreter::ic::IcState` (the
+/// UNRELATED interpreter-IC lattice, already imported above under that
+/// exact name) would collide with it.
+type CompiledIcState = crate::codecache::nmethod::IcState;
 
 /// D1 point 2: `primitives.rs`'s own pinned ids for
 /// `{ +, -, *, bitAnd:, bitOr:, bitXor:, <, <=, >, >=, =, ~= }` — division
@@ -220,7 +226,18 @@ pub fn compile_method(
 
     let mut asm = JasmAssembler::new();
     let stub_poll_addr = vm.stubs.stub_poll_addr();
-    let (blob, block_pcs) = emit::emit(&mut asm, &ir_method, &regalloc_result, stub_poll_addr);
+    let guard = emit::EntryGuard {
+        smi_klass_bits: vm.universe.smi_klass.oop().raw(),
+        key_klass_bits: rcvr_klass.oop().raw(),
+        resolve_addr: vm.stubs.resolve_addr(),
+    };
+    let (blob, block_pcs, verified_entry_off, emitted_ic_sites) = emit::emit(
+        &mut asm,
+        &ir_method,
+        &regalloc_result,
+        stub_poll_addr,
+        Some(guard),
+    );
 
     let Some(h) = vm.code_cache.alloc(blob.code.len()) else {
         vm.options.jit = JitMode::Off;
@@ -263,13 +280,27 @@ pub fn compile_method(
         .find(|b| b.code.iter().any(|instr| matches!(instr, ir::Ir::Poll)))
         .map(|b| b.bci);
 
+    // S11 D3: every fresh site starts Unresolved -- its `bl` still
+    // self-targets (`bl_patchable`'s own placeholder) until the patch pass
+    // just below aims it at `stub_resolve` (D3: "no per-site
+    // pre-resolution", exactly like an empty interpreter IC).
+    let ic_sites: Vec<IcSite> = emitted_ic_sites
+        .iter()
+        .map(|s| IcSite {
+            off: s.off,
+            selector: s.selector,
+            argc: s.argc,
+            state: CompiledIcState::Unresolved,
+        })
+        .collect();
+
     let nm = Nmethod {
         id: NmethodId(0), // overwritten by CodeTable::install
         key_klass: rcvr_klass,
         key_selector,
         code: h,
         entry_off: 0,
-        verified_entry_off: 0,
+        verified_entry_off,
         state: NmState::Alive,
         level: 1,
         version: 0,
@@ -278,9 +309,13 @@ pub fn compile_method(
         frame_slots: regalloc_result.frame_slots,
         pcdescs,
         oopmaps,
-        ic_sites: Vec::new(),
+        ic_sites,
         poll_bci,
     };
+    let resolve_addr = vm.stubs.resolve_addr();
+    for site in &emitted_ic_sites {
+        vm.code_cache.patch_branch26_at(h, site.off, resolve_addr);
+    }
     let id = vm.code_table.install(nm);
     if vm.options.trace.is_enabled("jit") {
         eprintln!(

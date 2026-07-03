@@ -18,7 +18,7 @@ use crate::compiler::assembler::RelocKind;
 use crate::compiler::decode::{BlockIndex, Cfg, Terminator};
 use crate::interpreter::ic::InterpreterIc;
 use crate::oops::layout::BODY_OFFSET;
-use crate::oops::wrappers::MethodOop;
+use crate::oops::wrappers::{MethodOop, SymbolOop};
 use crate::runtime::vm_state::VmState;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -294,6 +294,20 @@ pub struct IrMethod {
     /// these instead of relying on a fixed pool-index convention.
     pub true_lit: PoolLit,
     pub false_lit: PoolLit,
+    /// S11 D3: one entry per `Ir::CallSend` site, indexed by its own
+    /// `site: u16` — mirrors `pool`'s own "small side table, indexed by a
+    /// compact id embedded in the `Ir`" shape. `emit.rs` has no `VmState`/
+    /// `MethodOop` of its own to pull a selector from at emit time (same
+    /// reasoning as `true_lit`/`false_lit` above), so `convert()` resolves
+    /// it once, here.
+    pub call_sites: Vec<CallSiteInfo>,
+}
+
+/// One `Ir::CallSend` site's selector/argc — see `IrMethod::call_sites`.
+#[derive(Clone, Copy, Debug)]
+pub struct CallSiteInfo {
+    pub selector: SymbolOop,
+    pub argc: u8,
 }
 
 // ── conversion ───────────────────────────────────────────────────────────
@@ -924,6 +938,9 @@ pub fn convert(vm: &VmState, method: MethodOop, cfg: &Cfg) -> IrMethod {
         safepoints: Vec::new(),
         true_lit,
         false_lit,
+        // S10's convert() never constructs Ir::CallSend (S11-only variant,
+        // see Ir::uses/defs' own doc) — no sites to record yet.
+        call_sites: Vec::new(),
     }
 }
 

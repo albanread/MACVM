@@ -129,12 +129,19 @@ fn run_ir_raw() {
         // dereferences these against the (also empty) pool.
         true_lit: PoolLit(0),
         false_lit: PoolLit(0),
+        call_sites: Vec::new(),
     };
 
     let regalloc_result = regalloc::regalloc(&method);
 
     let mut asm = JasmAssembler::new();
-    let (blob, pcs) = emit::emit(&mut asm, &method, &regalloc_result, stubs.stub_poll_addr());
+    let (blob, pcs, _verified_entry_off, _ic_sites) = emit::emit(
+        &mut asm,
+        &method,
+        &regalloc_result,
+        stubs.stub_poll_addr(),
+        None,
+    );
     assert_eq!(
         pcs.len(),
         4,
@@ -175,7 +182,8 @@ fn run_ir_raw() {
 fn build_and_publish(cache: &mut CodeCache, stub_poll_addr: u64, method: &IrMethod) -> *const u8 {
     let regalloc_result = regalloc::regalloc(method);
     let mut asm = JasmAssembler::new();
-    let (blob, _pcs) = emit::emit(&mut asm, method, &regalloc_result, stub_poll_addr);
+    let (blob, _pcs, _verified_entry_off, _ic_sites) =
+        emit::emit(&mut asm, method, &regalloc_result, stub_poll_addr, None);
     let h = cache.alloc(blob.code.len()).unwrap();
     cache.publish(h, &blob)
 }
@@ -226,6 +234,7 @@ fn mul_method() -> IrMethod {
         safepoints: Vec::new(),
         true_lit: PoolLit(0),
         false_lit: PoolLit(0),
+        call_sites: Vec::new(),
     }
 }
 
@@ -338,6 +347,7 @@ fn run_ir_raw_forces_spill() {
         safepoints: Vec::new(),
         true_lit: PoolLit(0),
         false_lit: PoolLit(0),
+        call_sites: Vec::new(),
     };
 
     let regalloc_result = regalloc::regalloc(&method);
@@ -347,7 +357,13 @@ fn run_ir_raw_forces_spill() {
     );
 
     let mut asm = JasmAssembler::new();
-    let (blob, _pcs) = emit::emit(&mut asm, &method, &regalloc_result, stubs.stub_poll_addr());
+    let (blob, _pcs, _verified_entry_off, _ic_sites) = emit::emit(
+        &mut asm,
+        &method,
+        &regalloc_result,
+        stubs.stub_poll_addr(),
+        None,
+    );
     let h = cache.alloc(blob.code.len()).unwrap();
     let entry = cache.publish(h, &blob);
 
@@ -600,7 +616,12 @@ fn compile_and_get_listing(vm: &VmState, method: MethodOop) -> String {
     let ir = macvm::compiler::ir::convert(vm, method, &cfg);
     let ra = regalloc::regalloc(&ir);
     let mut asm = JasmAssembler::new();
-    let (blob, _pcs) = emit::emit(&mut asm, &ir, &ra, 0xDEAD_BEEF_0000_0000);
+    // None: this helper predates S11's guard and backs the already-committed
+    // S10 listing goldens (s10_sumTo/absDiff/bitsOf) -- keeping their output
+    // unchanged is the point, not something to revisit as a side effect of
+    // step 2's own scope.
+    let (blob, _pcs, _verified_entry_off, _ic_sites) =
+        emit::emit(&mut asm, &ir, &ra, 0xDEAD_BEEF_0000_0000, None);
     blob.listing.join("\n") + "\n"
 }
 
@@ -1128,7 +1149,14 @@ fn threshold1_tiny_code_cache_exhausts_gracefully() {
     let mut vm = diff_vm();
     vm.options.jit = JitMode::Threshold(1);
 
-    let leave_free = 512usize;
+    // S11 step 2 added the klass-guard prologue to every compiled method
+    // (bigger than S10's own bare verified_entry-only shape), so this
+    // budget needs headroom for at least a few full method-sizes, not just
+    // one -- tuned empirically against the actual current size rather than
+    // hand-estimated, and re-tune again whenever emit.rs's own prologue
+    // shape changes enough to matter (a golden-test-like maintenance cost,
+    // not a correctness one).
+    let leave_free = 2048usize;
     let prefill = macvm::codecache::DEFAULT_CODE_CACHE_CAPACITY.saturating_sub(leave_free);
     vm.code_cache
         .alloc(prefill)

@@ -50,8 +50,11 @@
 use crate::compiler::assembler::{
     imm, mem, sp, x, xr, Assembler, CodeBlob, Cond, Label, LiteralId, Operand, Reg, RelocKind,
 };
-use crate::compiler::ir::{BailoutReason, BlockId, CmpOp, Ir, IrMethod, PoolLit, SmiOp, VReg};
+use crate::compiler::ir::{
+    BailoutReason, BlockId, CallSiteInfo, CmpOp, Ir, IrMethod, PoolLit, SmiOp, VReg,
+};
 use crate::compiler::regalloc::{Assignment, RegallocResult};
+use crate::oops::wrappers::SymbolOop;
 use crate::vendor::wfasm::a64::parse::Shift;
 
 /// Byte offset a spilled `pos`'th slot lives at, relative to `x29` (D3.4:
@@ -127,6 +130,43 @@ pub struct BlockPc {
     pub bci: usize,
 }
 
+/// One `Ir::CallSend`'s emitted `bl` site, for the caller (`driver.rs`) to
+/// build real `codecache::nmethod::IcSite`s from — a minimal, self-
+/// contained stand-in rather than a forward dependency on `codecache`
+/// (same reasoning as [`BlockPc`] for `PcDesc`): every fresh site starts
+/// `Unresolved`, which only `driver.rs` (the module that actually knows
+/// about `IcState`) needs to say explicitly.
+#[derive(Clone, Copy, Debug)]
+pub struct EmittedIcSite {
+    pub off: u32,
+    pub selector: SymbolOop,
+    pub argc: u8,
+}
+
+/// S11 D2: parameters for the klass-guard prologue (`entry`, checking the
+/// receiver against this nmethod's own customization key, falling through
+/// to `verified_entry` on a match or bailing out to `stub_resolve` — acting
+/// as `stub_ic_miss`'s other door, D4.1 — on a mismatch). `None` skips the
+/// guard entirely, producing exactly S10's old bare-`verified_entry`-only
+/// shape: unit tests that aren't about the guard itself (regalloc/spill/
+/// overflow-sequencing tests predating S11) pass `None` to keep their own
+/// focus narrow, unchanged from before this struct existed.
+pub struct EntryGuard {
+    pub smi_klass_bits: u64,
+    pub key_klass_bits: u64,
+    /// `stub_resolve`'s published address (`codecache::stubs::Stubs::
+    /// resolve_addr`) — the guard's own miss path reaches it via `ldr
+    /// x16,<pool>; br x16` rather than D2's own suggested `b.eq
+    /// verified_entry; b stub_ic_miss` (Branch26) form: an indirect branch
+    /// through a pool-embedded address sidesteps Branch26/Branch19 range
+    /// reasoning entirely (the same reason `Poll`'s own far call already
+    /// does this for `stub_poll`), and critically still never touches
+    /// x30 the way `blr`/`bl` would (D4.1's own invariant: the guard's
+    /// miss path must leave x30 as the ORIGINAL send site's return
+    /// address).
+    pub resolve_addr: u64,
+}
+
 struct Emitter<'a> {
     asm: &'a mut dyn Assembler,
     assignment: Vec<Option<Assignment>>,
@@ -141,6 +181,14 @@ struct Emitter<'a> {
     /// its address isn't known until stub publish time (before any real
     /// method is compiled, but still not a compile-time constant).
     stub_poll_lit: LiteralId,
+    /// `IrMethod.call_sites`, indexed by `Ir::CallSend.site` — see that
+    /// field's own doc.
+    call_sites: &'a [CallSiteInfo],
+    /// Accumulates one entry per `Ir::CallSend` emitted so far, in
+    /// encounter order — handed back to the caller alongside the
+    /// `CodeBlob` (mirrors `block_pcs`' own "accumulate during the walk,
+    /// return at the end" shape, D3).
+    ic_sites: Vec<EmittedIcSite>,
 }
 
 impl<'a> Emitter<'a> {
@@ -349,6 +397,89 @@ impl<'a> Emitter<'a> {
         self.asm.call_far(self.stub_poll_lit);
         self.asm.bind(skip);
     }
+
+    /// D3 step 1-4: marshal receiver+args into x0..x5, `bl_patchable` the
+    /// site, record it, land the result in `dst`. Every fresh site's `bl`
+    /// self-targets (D3: "no per-site pre-resolution") — `driver.rs`
+    /// patches it to `stub_resolve` once the blob is published (the
+    /// address isn't known here, at emit time, any more than a real send
+    /// target would be).
+    ///
+    /// The marshaling is a REAL parallel move, not a naive sequential
+    /// `resolve(args[i], i)` per slot: regalloc's spill-all-at-safepoint
+    /// policy (`LiveInterval::crosses_safepoint`'s own doc, regalloc.rs)
+    /// only forces `Spill` on a vreg whose interval EXTENDS PAST the
+    /// safepoint — an arg whose only use IS this call ends exactly here,
+    /// so it can legitimately still be plain `Assignment::Reg`, including
+    /// in a DIFFERENT x{j} another arg also needs to land in. A sequential
+    /// per-slot move can clobber one arg's source register before it's
+    /// read — the RetSelf bug's exact failure shape, in a different
+    /// instruction — which is exactly what a first draft of this function
+    /// did, caught by its own now-removed debug assert once a real
+    /// register-pressure test (not just a spilled one) exercised it.
+    fn emit_call_send(&mut self, dst: VReg, site: u16, args: &[VReg]) {
+        let sources: Vec<Assignment> = args.iter().map(|&a| self.assignment_of(a)).collect();
+
+        // Spilled sources: plain memory reads, straight into x{i}. Never
+        // conflict with anything -- spill slots and x0..x5 are disjoint
+        // address spaces, so these can all happen first, in any order.
+        for (i, src) in sources.iter().enumerate() {
+            if let Assignment::Spill(slot) = src {
+                self.asm.emit("ldr", &[x(i as u8), spill_mem(*slot)]);
+            }
+        }
+
+        // Register-assigned sources: a bounded (<=6-node) parallel-move
+        // shuffle. `pending`: (dest, src) pairs still needing `mov
+        // x{dest}, x{src}`, skipping any already in place (src == dest).
+        let mut pending: Vec<(u8, u8)> = sources
+            .iter()
+            .enumerate()
+            .filter_map(|(i, src)| match *src {
+                Assignment::Reg(r) if r != i as u8 => Some((i as u8, r)),
+                _ => None,
+            })
+            .collect();
+        while !pending.is_empty() {
+            // A move is safe to emit now iff no OTHER pending move still
+            // needs to READ from this one's destination (emitting it
+            // first would clobber that other move's own source).
+            if let Some(pos) = pending
+                .iter()
+                .position(|&(i, _)| !pending.iter().any(|&(_, r)| r == i))
+            {
+                let (i, r) = pending.remove(pos);
+                self.asm.emit("mov", &[x(i), x(r)]);
+            } else {
+                // A genuine cycle (e.g. x0<-x1, x1<-x0): break it via x16,
+                // preserving the about-to-be-overwritten destination's
+                // current value for whichever other pending move still
+                // needs to read it.
+                let (i0, r0) = pending[0];
+                self.asm.emit("mov", &[x(16), x(i0)]);
+                for (_, r) in pending.iter_mut() {
+                    if *r == i0 {
+                        *r = 16;
+                    }
+                }
+                self.asm.emit("mov", &[x(i0), x(r0)]);
+                pending.remove(0);
+            }
+        }
+
+        let off = self.asm.bl_patchable(RelocKind::InlineCache);
+        let info = self.call_sites[site as usize];
+        self.ic_sites.push(EmittedIcSite {
+            off,
+            selector: info.selector,
+            argc: info.argc,
+        });
+        let d = self.dest_target(dst);
+        if d.num != 0 {
+            self.asm.emit("mov", &[Operand::Reg(d), x(0)]);
+        }
+        self.commit(dst, d);
+    }
 }
 
 /// D3.4: pull `IrMethod.pool` into the vendored assembler's own literal
@@ -362,18 +493,62 @@ fn intern_pool(asm: &mut dyn Assembler, method: &IrMethod) -> Vec<LiteralId> {
         .collect()
 }
 
-/// D3.6/D5: emit `method`'s whole body — prologue, every block in
-/// `regalloc`'s linearized order, shared epilogue — and finish into a
-/// `CodeBlob`. `stub_poll_addr` is `stub_poll`'s already-published address
-/// (irrelevant if `method` has no `Poll` op at all, but always required by
-/// this signature — S10's own methods are simple enough that threading an
-/// `Option` through for the rare case wasn't worth it).
+/// S11 D2: the klass-guard prologue (`entry`, checking the receiver
+/// against `guard.key_klass_bits`, falling through to `verified_entry` on
+/// a match or bailing out to `stub_resolve` — `stub_ic_miss`'s other door,
+/// D4.1 — on a mismatch). Emits nothing else; the caller's own next
+/// instruction IS `verified_entry` (no label needed for that side — the
+/// guard's `b.eq` target is bound at the very end of this function, which
+/// is exactly that point).
+fn emit_entry_guard(asm: &mut dyn Assembler, guard: &EntryGuard) {
+    let smi_lit = asm.literal_u64(guard.smi_klass_bits, Some(RelocKind::Oop));
+    let key_lit = asm.literal_u64(guard.key_klass_bits, Some(RelocKind::KeyKlassOop));
+    let resolve_lit = asm.literal_u64(guard.resolve_addr, Some(RelocKind::RuntimeAddr));
+
+    let smi_case = asm.new_label();
+    let after_klass_load = asm.new_label();
+    let matched = asm.new_label();
+
+    asm.emit("tst", &[x(0), imm(3)]);
+    asm.b_cond(Cond::Eq, smi_case);
+    // Heap case: klass word is at untagged-address + KLASS_OFFSET(8), and
+    // MEM_TAG(1) biases x0 by -1 -- ldur (unscaled) since 7 isn't 8-aligned.
+    asm.emit("ldur", &[x(17), mem(0, 7)]);
+    asm.b(after_klass_load);
+    asm.bind(smi_case);
+    asm.ldr_literal(xr(17), smi_lit);
+    asm.bind(after_klass_load);
+    asm.ldr_literal(xr(16), key_lit);
+    asm.emit("cmp", &[x(17), x(16)]);
+    asm.b_cond(Cond::Eq, matched);
+    // Miss: an indirect branch through a pool-embedded address, not D2's
+    // own suggested `b.eq verified_entry; b stub_ic_miss` (Branch26) form
+    // -- sidesteps Branch26/19 range reasoning entirely (same reason
+    // Poll's own far call already does this for stub_poll) while still
+    // never touching x30 the way `blr`/`bl` would (D4.1's own invariant:
+    // this path must leave x30 as the send site's own return address).
+    asm.ldr_literal(xr(16), resolve_lit);
+    asm.emit("br", &[x(16)]);
+    asm.bind(matched);
+}
+
+/// D3.6/D5: emit `method`'s whole body — the klass-guard prologue (S11 D2,
+/// when `guard` is `Some`), the S10-era `verified_entry` prologue, every
+/// block in `regalloc`'s linearized order, shared epilogue — and finish
+/// into a `CodeBlob`. `stub_poll_addr` is `stub_poll`'s already-published
+/// address (irrelevant if `method` has no `Poll` op at all, but always
+/// required by this signature — S10's own methods are simple enough that
+/// threading an `Option` through for the rare case wasn't worth it).
+/// Returns `verified_entry_off` (== 0 when `guard` is `None`, matching
+/// S10's own `entry_off == verified_entry_off` convention) and one
+/// [`EmittedIcSite`] per `Ir::CallSend` encountered, in encounter order.
 pub fn emit(
     asm: &mut dyn Assembler,
     method: &IrMethod,
     regalloc: &RegallocResult,
     stub_poll_addr: u64,
-) -> (CodeBlob, Vec<BlockPc>) {
+    guard: Option<EntryGuard>,
+) -> (CodeBlob, Vec<BlockPc>, u32, Vec<EmittedIcSite>) {
     let literal_ids = intern_pool(asm, method);
 
     let mut assignment: Vec<Option<Assignment>> = vec![None; method.vregs.len()];
@@ -385,6 +560,11 @@ pub fn emit(
     let epilogue = asm.new_label();
     let stub_poll_lit = asm.literal_u64(stub_poll_addr, Some(RelocKind::RuntimeAddr));
 
+    if let Some(g) = &guard {
+        emit_entry_guard(asm, g);
+    }
+    let verified_entry_off = asm.offset();
+
     let mut e = Emitter {
         asm,
         assignment,
@@ -394,6 +574,8 @@ pub fn emit(
         true_lit: method.true_lit,
         false_lit: method.false_lit,
         stub_poll_lit,
+        call_sites: &method.call_sites,
+        ic_sites: Vec::new(),
     };
 
     // Prologue (D5.2): frame_bytes = 8*frame_slots, rounded to 16.
@@ -430,7 +612,8 @@ pub fn emit(
     );
     e.asm.emit("ret", &[]);
 
-    (e.asm.finish(), block_pcs)
+    let ic_sites = e.ic_sites;
+    (e.asm.finish(), block_pcs, verified_entry_off, ic_sites)
 }
 
 fn emit_ir(e: &mut Emitter, ir: &Ir, next_in_order: Option<BlockId>) {
@@ -516,8 +699,13 @@ fn emit_ir(e: &mut Emitter, ir: &Ir, next_in_order: Option<BlockId>) {
             if_false,
             not_bool,
         } => e.emit_bool_br(val, if_true, if_false, not_bool),
-        Ir::CallSend { .. } | Ir::CallRuntime { .. } | Ir::Alloc { .. } => {
-            unreachable!("S11-only Ir variant; S10's convert() never constructs one")
+        Ir::CallSend {
+            dst,
+            site,
+            ref args,
+        } => e.emit_call_send(dst, site, args),
+        Ir::CallRuntime { .. } | Ir::Alloc { .. } => {
+            unreachable!("S11-later-step Ir variant; not constructed until steps 6/8")
         }
         Ir::Poll => e.emit_poll(),
         Ir::Ret { val } => {
@@ -564,6 +752,44 @@ mod tests {
     use crate::compiler::ir::{IrBlock, VRegInfo};
     use crate::compiler::jasm_assembler::JasmAssembler;
     use crate::compiler::regalloc;
+    use crate::runtime::vm_state::{VmOptions, VmState};
+    use crate::runtime::JitMode;
+
+    /// Listing format: "<pc_off>  <hex_word>  <mnemonic> [<operands>]".
+    fn mnemonic(l: &str) -> &str {
+        l.split_whitespace().nth(2).unwrap_or("")
+    }
+
+    /// `pc_off` field is hex, zero-padded to 6 digits (`JasmAssembler::
+    /// push_listing`'s own `{offset:06x}`) -- NOT decimal.
+    fn line_pc_off(l: &str) -> u32 {
+        u32::from_str_radix(
+            l.split_whitespace()
+                .next()
+                .expect("listing line must start with a pc_off field"),
+            16,
+        )
+        .expect("pc_off field must be a hex u32")
+    }
+
+    /// A real interned `SymbolOop` for tests that need a genuine selector.
+    /// `emit.rs` sits outside `codecache`'s `#![allow(unsafe_code)]`
+    /// exemption, so `nmethod.rs`'s own `from_oop_unchecked` shortcut isn't
+    /// available here -- a bare throwaway `VmState` + real `intern` is.
+    /// Callers only ever move/compare the returned `SymbolOop`'s raw bits
+    /// (never dereference through it once this function returns), so the
+    /// backing `VmState` going out of scope here is fine.
+    fn test_selector(name: &[u8]) -> SymbolOop {
+        let mut vm = VmState::with_options(VmOptions {
+            heap_mib: 64,
+            trace: Default::default(),
+            gc_stress: false,
+            gc_stress_full_period: None,
+            eden_kb: None,
+            jit: JitMode::Off,
+        });
+        vm.universe.intern(name)
+    }
 
     fn hand_method(blocks: Vec<IrBlock>, vregs: Vec<VRegInfo>, argc: u8) -> IrMethod {
         IrMethod {
@@ -575,6 +801,7 @@ mod tests {
             safepoints: Vec::new(),
             true_lit: PoolLit(0),
             false_lit: PoolLit(0),
+            call_sites: Vec::new(),
         }
     }
 
@@ -663,7 +890,8 @@ mod tests {
         let method = branchy_method();
         let ra = regalloc::regalloc(&method);
         let mut asm = JasmAssembler::new();
-        let (_blob, block_pcs) = emit(&mut asm, &method, &ra, 0);
+        let (_blob, block_pcs, _verified_entry_off, _ic_sites) =
+            emit(&mut asm, &method, &ra, 0, None);
 
         assert_eq!(
             block_pcs.len(),
@@ -739,12 +967,8 @@ mod tests {
         let method = hand_method(vec![block0, block1], vregs, 2);
         let ra = regalloc::regalloc(&method);
         let mut asm = JasmAssembler::new();
-        let (blob, _pcs) = emit(&mut asm, &method, &ra, 0);
+        let (blob, _pcs, _verified_entry_off, _ic_sites) = emit(&mut asm, &method, &ra, 0, None);
 
-        fn mnemonic(l: &str) -> &str {
-            // Listing format: "<pc_off>  <hex_word>  <mnemonic> [<operands>]".
-            l.split_whitespace().nth(2).unwrap_or("")
-        }
         let mnemonics: Vec<&str> = blob.listing.iter().map(|l| mnemonic(l)).collect();
         let asr_pos = mnemonics.iter().position(|&m| m == "asr");
         let mul_pos = mnemonics.iter().position(|&m| m == "mul");
@@ -813,7 +1037,7 @@ mod tests {
         let near = make(30);
         let ra = regalloc::regalloc(&near);
         let mut asm = JasmAssembler::new();
-        let (blob, _pcs) = emit(&mut asm, &near, &ra, 0);
+        let (blob, _pcs, _verified_entry_off, _ic_sites) = emit(&mut asm, &near, &ra, 0, None);
         let near_mnemonics: Vec<String> = blob.listing.iter().map(|l| mnemonic(l)).collect();
         assert!(
             near_mnemonics.iter().any(|m| m == "ldur"),
@@ -829,7 +1053,7 @@ mod tests {
         let far = make(31);
         let ra2 = regalloc::regalloc(&far);
         let mut asm2 = JasmAssembler::new();
-        let (blob2, _pcs2) = emit(&mut asm2, &far, &ra2, 0);
+        let (blob2, _pcs2, _verified_entry_off2, _ic_sites2) = emit(&mut asm2, &far, &ra2, 0, None);
         let mnemonics: Vec<String> = blob2.listing.iter().map(|l| mnemonic(l)).collect();
         assert!(
             mnemonics.iter().any(|m| m == "sub"),
@@ -844,6 +1068,208 @@ mod tests {
             !blob2.listing.iter().any(|l| l.contains("ldur")),
             "index 31 must NOT use ldur at all -- got:\n{}",
             blob2.listing.join("\n")
+        );
+    }
+
+    /// D2: `entry`'s klass-guard prologue is exactly the bytes before
+    /// `verified_entry_off` -- checked structurally (mnemonic shape), not
+    /// against a fixed byte count (both the smi and heap paths are always
+    /// emitted, so the guard's encoded length doesn't depend on which
+    /// branch a real receiver would take).
+    #[test]
+    fn entry_guard_smi_and_heap() {
+        let vregs = vec![VRegInfo { is_oop: true }];
+        let block0 = IrBlock {
+            id: BlockId(0),
+            bci: 0,
+            code: vec![
+                Ir::Param {
+                    dst: VReg(0),
+                    index: 0,
+                },
+                Ir::RetSelf,
+            ],
+            entry_stack: Vec::new(),
+        };
+        let method = hand_method(vec![block0], vregs, 1);
+        let ra = regalloc::regalloc(&method);
+        let mut asm = JasmAssembler::new();
+        let guard = EntryGuard {
+            smi_klass_bits: 0x1000,
+            key_klass_bits: 0x2000,
+            resolve_addr: 0x3000,
+        };
+        let (blob, _pcs, verified_entry_off, _ic_sites) =
+            emit(&mut asm, &method, &ra, 0, Some(guard));
+
+        // `verified_entry_off` must land exactly on the S10-era prologue's
+        // own first instruction (`stp x29,x30,...`) -- found empirically in
+        // the listing, not assumed from a guessed byte count.
+        let stp_line = blob
+            .listing
+            .iter()
+            .find(|l| mnemonic(l) == "stp")
+            .unwrap_or_else(|| panic!("no stp in listing:\n{}", blob.listing.join("\n")));
+        assert_eq!(
+            verified_entry_off,
+            line_pc_off(stp_line),
+            "verified_entry_off must be exactly the guard's own first prologue instruction \
+             (stp x29,x30,...) -- got listing:\n{}",
+            blob.listing.join("\n")
+        );
+
+        let guard_lines: Vec<&str> = blob
+            .listing
+            .iter()
+            .filter(|l| line_pc_off(l) < verified_entry_off)
+            .map(|s| s.as_str())
+            .collect();
+        let guard_mnemonics: Vec<&str> = guard_lines.iter().map(|l| mnemonic(l)).collect();
+        assert_eq!(
+            guard_mnemonics.first(),
+            Some(&"tst"),
+            "guard must open by testing the receiver's tag bits -- got:\n{}",
+            guard_lines.join("\n")
+        );
+        assert!(
+            guard_mnemonics.contains(&"ldur"),
+            "guard's heap case must load the klass word via ldur (unscaled, MEM_TAG bias) -- \
+             got:\n{}",
+            guard_lines.join("\n")
+        );
+        assert!(
+            guard_mnemonics.iter().filter(|&&m| m == "ldr").count() >= 3,
+            "guard must load smi_klass, key_klass, and resolve_addr as literals (>=3 ldr) -- \
+             got:\n{}",
+            guard_lines.join("\n")
+        );
+        assert!(
+            guard_mnemonics.contains(&"cmp"),
+            "guard must compare the actual klass against key_klass -- got:\n{}",
+            guard_lines.join("\n")
+        );
+        assert!(
+            guard_mnemonics.contains(&"br"),
+            "guard's miss path must reach stub_resolve via an indirect br -- got:\n{}",
+            guard_lines.join("\n")
+        );
+        assert!(
+            !guard_mnemonics.contains(&"blr") && !guard_mnemonics.contains(&"bl"),
+            "guard must NEVER touch x30 (blr/bl) -- D4.1's invariant that the send site's own \
+             return address survives a guard miss untouched -- got:\n{}",
+            guard_lines.join("\n")
+        );
+    }
+
+    /// D3/D4: one `EmittedIcSite` per `Ir::CallSend`, in encounter order.
+    /// This is also the test that originally caught `emit_call_send`'s
+    /// false "every arg is spilled" assumption (see that method's own doc
+    /// comment): `foo`'s two args are fresh off `Param`, each used exactly
+    /// once (at this very call) and so legitimately register-assigned, not
+    /// spilled, per `crosses_safepoint`'s documented semantics -- building
+    /// a real method and regalloc'ing it for real is what makes that case
+    /// actually occur, rather than merely being reasoned about.
+    #[test]
+    fn ic_site_recorded_per_send() {
+        let vregs: Vec<VRegInfo> = (0..6).map(|_| VRegInfo { is_oop: true }).collect();
+        let block0 = IrBlock {
+            id: BlockId(0),
+            bci: 0,
+            code: vec![
+                Ir::Param {
+                    dst: VReg(0),
+                    index: 0,
+                },
+                Ir::Param {
+                    dst: VReg(1),
+                    index: 1,
+                },
+                Ir::Param {
+                    dst: VReg(2),
+                    index: 2,
+                },
+                Ir::CallSend {
+                    dst: VReg(3),
+                    site: 0,
+                    args: vec![VReg(0), VReg(1)],
+                },
+                Ir::CallSend {
+                    dst: VReg(4),
+                    site: 1,
+                    args: vec![VReg(3), VReg(2)],
+                },
+                Ir::CallSend {
+                    dst: VReg(5),
+                    site: 2,
+                    args: vec![VReg(2), VReg(4)],
+                },
+                Ir::Ret { val: VReg(5) },
+            ],
+            entry_stack: Vec::new(),
+        };
+        let method = IrMethod {
+            blocks: vec![block0],
+            vregs,
+            pool: Vec::new(),
+            argc: 3,
+            ntemps: 0,
+            safepoints: Vec::new(),
+            true_lit: PoolLit(0),
+            false_lit: PoolLit(0),
+            call_sites: vec![
+                CallSiteInfo {
+                    selector: test_selector(b"foo"),
+                    argc: 2,
+                },
+                CallSiteInfo {
+                    selector: test_selector(b"bar"),
+                    argc: 2,
+                },
+                CallSiteInfo {
+                    selector: test_selector(b"baz"),
+                    argc: 2,
+                },
+            ],
+        };
+        let ra = regalloc::regalloc(&method);
+        let mut asm = JasmAssembler::new();
+        let (blob, _pcs, _verified_entry_off, ic_sites) = emit(&mut asm, &method, &ra, 0, None);
+
+        assert_eq!(
+            ic_sites.len(),
+            3,
+            "one EmittedIcSite per CallSend -- got {ic_sites:?}"
+        );
+
+        for (i, site) in ic_sites.iter().enumerate() {
+            let expected = method.call_sites[i].selector;
+            assert_eq!(
+                site.selector.oop().raw(),
+                expected.oop().raw(),
+                "ic_sites[{i}] selector must match call_sites[{i}]'s own"
+            );
+            assert_eq!(site.argc, 2, "ic_sites[{i}] must carry its site's own argc");
+            let line = blob
+                .listing
+                .iter()
+                .find(|l| line_pc_off(l) == site.off)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "ic_sites[{i}].off {} has no matching listing line:\n{}",
+                        site.off,
+                        blob.listing.join("\n")
+                    )
+                });
+            assert_eq!(
+                mnemonic(line),
+                "bl",
+                "ic_sites[{i}].off must point at the CallSend's own bl -- got: {line}"
+            );
+        }
+
+        assert!(
+            ic_sites[0].off < ic_sites[1].off && ic_sites[1].off < ic_sites[2].off,
+            "ic_sites must be in encounter order with strictly ascending offsets -- got {ic_sites:?}"
         );
     }
 }

@@ -49,11 +49,33 @@ pub struct PcDesc {
     pub oopmap: u16,
 }
 
-/// A monomorphic inline-cache call site — S11 populates this; the field
-/// exists on `Nmethod` now so its shape doesn't change layout later.
+/// A compiled call site's own IC lattice state (S11 D3/D4) — mirrors the
+/// interpreter IC's mono→poly→mega shape (SPEC §5.3) but lives entirely on
+/// the Rust side (compiled code itself only ever sees "call whatever the
+/// patched `bl` currently targets"). `Pic`/`Mega` carry the generated
+/// stub's own handle so a later transition knows what to free (P1/P2:
+/// rebuild-and-swing, never an in-place edit).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum IcState {
+    Unresolved,
+    Mono,
+    Pic { stub: CodeHandle, n: u8 },
+    Mega { stub: CodeHandle },
+}
+
+/// A compiled inline-cache call site (S11 D3): one per `Ir::CallSend` in a
+/// compiled method's body. `off` is the `bl` instruction's own byte offset
+/// within `Nmethod::code` (matches `Reloc::offset`'s convention for
+/// `InlineCache` relocs — `bl_patchable`'s own doc). `selector`/`argc`
+/// identify the send; `state` starts `Unresolved` at publish (every fresh
+/// site's `bl` targets `stub_resolve`, D3) and evolves as real receivers
+/// arrive (D4.1's state machine).
 #[derive(Clone, Copy, Debug)]
 pub struct IcSite {
-    pub site_off: u32,
+    pub off: u32,
+    pub selector: SymbolOop,
+    pub argc: u8,
+    pub state: IcState,
 }
 
 pub struct Nmethod {
@@ -237,6 +259,16 @@ impl CodeTable {
             nm.key_klass = unsafe { KlassOop::from_oop_unchecked(nk) };
             let ns = f(nm.key_selector.oop());
             nm.key_selector = unsafe { SymbolOop::from_oop_unchecked(ns) };
+            // S11 D3: each IcSite's own selector is the SAME kind of
+            // Rust-side (not MAP_JIT) oop field as key_selector above —
+            // the machine-code pool word carrying the same selector
+            // (RelocKind::Oop, emitted alongside the InlineCache reloc)
+            // is handled by `oops_do` already; this is purely the
+            // Rust-struct-field half.
+            for site in &mut nm.ic_sites {
+                let ss = f(site.selector.oop());
+                site.selector = unsafe { SymbolOop::from_oop_unchecked(ss) };
+            }
         }
     }
 
