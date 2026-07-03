@@ -272,6 +272,19 @@ pub const VMREG_LAST_COMPILED_FP_OFFSET: usize = 40;
 pub const VMREG_LAST_COMPILED_PC_OFFSET: usize = 48;
 pub const VMREG_BLOCK_SIZE: usize = 56;
 
+/// S11 D4.1/D5/P8: the RootSpill area every runtime-reaching stub uses to
+/// park x0..x5 (receiver + up to 5 args) as GC roots while control is in
+/// Rust — "RootSpill offsets are ABI" (P8): the pre-S12 bridge (D8) and
+/// S12's own root enumeration both read these slots by fixed offset from
+/// the stub's own `x29`, so a change here needs a matching `FrameView`
+/// decoder update, not just a recompile. 6 slots, 8 bytes each — already
+/// 16-byte aligned (AArch64's hard SP-alignment invariant), so no padding
+/// is needed for this area specifically (per-stub frames that add their
+/// own fields on top, e.g. the c2i adapter's extra method-oop slot, pad
+/// themselves).
+pub const ROOTSPILL_SLOTS: usize = 6;
+pub const ROOTSPILL_BYTES: usize = ROOTSPILL_SLOTS * 8;
+
 #[cfg(test)]
 mod tests {
     use super::*;

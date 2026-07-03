@@ -1,14 +1,69 @@
-//! `call_stub` (Rust↔compiled trampoline) and `stub_poll` (S10 D5.6) —
-//! hand-assembled once at startup, not derived from any `Ir`. Both are
+//! `call_stub`/`stub_poll` (S10 D5.6) and, from S11, the runtime-stub
+//! table's growing collection of anchor-and-call-into-Rust trampolines
+//! (D5) — hand-assembled once at startup, not derived from any `Ir`. All
 //! published into the same [`CodeCache`] real compiled methods live in.
 
 use crate::compiler::assembler::{
     imm, mem, mem_post, mem_pre, sp, x, Assembler, CodeBlob, Cond, RelocKind,
 };
 use crate::compiler::jasm_assembler::JasmAssembler;
+use crate::oops::layout::{
+    ROOTSPILL_BYTES, VMREG_LAST_COMPILED_FP_OFFSET, VMREG_LAST_COMPILED_PC_OFFSET,
+};
 use crate::runtime::vm_state::VmState;
 
 use super::{CodeCache, CodeHandle};
+
+/// D5's shared stub skeleton, part 1: anchor + AAPCS frame + RootSpill
+/// (x0..x5). Every stub that calls into Rust starts with this; follow with
+/// the stub's own `call_far`, then [`emit_stub_epilogue`]. `x28` must
+/// already be `&VmState` (established once by `call_stub`, D5.1) — every
+/// site this is used from is reached with that invariant already holding.
+/// A free function taking `&mut dyn Assembler`, not a method, so it stays
+/// reusable across every stub builder in this module without any of them
+/// needing to share a common base type beyond the trait itself.
+pub fn emit_stub_prologue(a: &mut dyn Assembler) {
+    a.emit("stp", &[x(29), x(30), mem_pre(31, -16)]);
+    a.emit("mov", &[x(29), sp()]);
+    a.emit("sub", &[sp(), sp(), imm(ROOTSPILL_BYTES as i64)]);
+    a.emit("stp", &[x(0), x(1), mem(31, 0)]);
+    a.emit("stp", &[x(2), x(3), mem(31, 16)]);
+    a.emit("stp", &[x(4), x(5), mem(31, 32)]);
+    // Anchor (D4.1): last_compiled_fp/pc so a stack walker (S12) can find
+    // this stub's own frame, and everything above it, while control is in
+    // Rust.
+    a.emit(
+        "str",
+        &[x(29), mem(28, VMREG_LAST_COMPILED_FP_OFFSET as i64)],
+    );
+    a.emit(
+        "str",
+        &[x(30), mem(28, VMREG_LAST_COMPILED_PC_OFFSET as i64)],
+    );
+}
+
+/// Part 2: clears the anchor (P9 — a stale anchor makes S12's walker walk
+/// freed frames), reloads x0..x5 from RootSpill, tears down the frame.
+/// Does NOT emit the final `ret`/`br`/`b` — callers differ on that (plain
+/// `ret` for a callee-shaped stub like `dnu`, `br x16` tail-jump for
+/// `resolve`/`mega`, P4) — and does not touch whatever scratch register
+/// the caller is about to jump through (typically x16), matching the same
+/// per-caller variation.
+pub fn emit_stub_epilogue(a: &mut dyn Assembler) {
+    // x(31) here means xzr, not sp: register 31 in a store's *data* (Rt)
+    // position is unconditionally the zero register on this ISA — `is_sp`
+    // only disambiguates ALU/move *operand* positions (`assembler.rs`'s
+    // own `sp()` doc comment), which this is not.
+    a.emit(
+        "str",
+        &[x(31), mem(28, VMREG_LAST_COMPILED_FP_OFFSET as i64)],
+    );
+    a.emit("ldp", &[x(0), x(1), mem(31, 0)]);
+    a.emit("ldp", &[x(2), x(3), mem(31, 16)]);
+    a.emit("ldp", &[x(4), x(5), mem(31, 32)]);
+    a.emit("add", &[sp(), sp(), imm(ROOTSPILL_BYTES as i64)]);
+    a.emit("ldp", &[x(29), x(30), mem_post(31, 16)]);
+}
 
 /// `extern "C" fn(entry, vm, argv, argc) -> u64` (D4) — the shape every
 /// call through `call_stub` must be transmuted to.
@@ -24,6 +79,10 @@ pub type CallStubFn =
 pub struct Stubs {
     pub call_stub: CodeHandle,
     pub stub_poll: CodeHandle,
+    /// D4.1: the shared `stub_resolve`/`stub_ic_miss` door — `emit.rs`
+    /// embeds its address as every `IcSite`'s initial `bl` target (S11
+    /// step 2).
+    pub resolve: CodeHandle,
 }
 
 impl Stubs {
@@ -32,6 +91,9 @@ impl Stubs {
     }
     pub fn stub_poll_addr(&self) -> u64 {
         self.stub_poll.base as u64
+    }
+    pub fn resolve_addr(&self) -> u64 {
+        self.resolve.base as u64
     }
 
     /// Invokes `entry` (a compiled method's own entry point — an `Nmethod`'s
@@ -73,9 +135,16 @@ pub fn install(cache: &mut CodeCache) -> Stubs {
         .expect("stubs::install: code cache too small for stub_poll");
     cache.publish(h2, &stub_poll_blob);
 
+    let stub_resolve_blob = build_stub_resolve();
+    let h3 = cache
+        .alloc(stub_resolve_blob.code.len())
+        .expect("stubs::install: code cache too small for stub_resolve");
+    cache.publish(h3, &stub_resolve_blob);
+
     Stubs {
         call_stub: h1,
         stub_poll: h2,
+        resolve: h3,
     }
 }
 
@@ -170,6 +239,66 @@ fn build_stub_poll() -> CodeBlob {
     a.finish()
 }
 
+/// D4.1: `stub_resolve`/`stub_ic_miss` — one shared stub, two doors, same
+/// tail (S11 step 2 wires the `bl`-initial door as every fresh `IcSite`'s
+/// target; the guard-miss `b` door lands S11 step 5 alongside PICs). x30 on
+/// entry is the ORIGINAL send site's own return address either way (a `bl`
+/// naturally sets it; a guard's `b` doesn't touch it) — captured into x1
+/// (`rt_resolve_send`'s `ret_addr` argument) before `call_far`'s own `blr`
+/// would otherwise clobber it.
+///
+/// This step's `rt_resolve_send` is a placeholder (S11 step 3 replaces the
+/// body with the real lookup+patch logic — it needs `IcSite`'s `selector`/
+/// `argc`/`state` fields, which don't exist until S11 step 2): it proves
+/// the skeleton's own round trip — anchor set, RootSpill written and
+/// readable from Rust, the call reaches Rust and returns, anchor cleared,
+/// RootSpill reloaded, tail-jump happens to a real, safe address — by
+/// echoing `ret_addr` straight back as the address to jump to. For a real
+/// site that's exactly the send's own continuation, i.e. a correct (if
+/// pointless) no-op; it's what makes the skeleton itself testable before
+/// any real target resolution exists to jump to instead.
+fn build_stub_resolve() -> CodeBlob {
+    let mut a = JasmAssembler::new();
+
+    emit_stub_prologue(&mut a);
+    a.emit("mov", &[x(0), x(28)]); // vm
+    a.emit("mov", &[x(1), x(30)]); // ret_addr (captured before call_far clobbers x30)
+    a.emit("sub", &[x(2), x(29), imm(ROOTSPILL_BYTES as i64)]); // argv = &RootSpill
+    let rt_resolve_lit = a.literal_u64(
+        rt_resolve_send as *const () as u64,
+        Some(RelocKind::RuntimeAddr),
+    );
+    a.call_far(rt_resolve_lit);
+    a.emit("mov", &[x(16), x(0)]); // result -> x16 (P4: survives the epilogue's own x0 reload)
+    emit_stub_epilogue(&mut a);
+    a.emit("br", &[x(16)]);
+
+    a.finish()
+}
+
+/// # Safety
+/// Only ever reached via `bl`/`b` from `stub_resolve`'s own hand-assembled
+/// listing above, never called directly from Rust — same contract as
+/// [`rt_poll`]. `argv` points at `stub_resolve`'s own RootSpill area (6
+/// live `u64`s, receiver + up to 5 args); valid for the duration of this
+/// call only (the stub reloads and may clobber that memory immediately
+/// after, on its way to the tail-jump).
+pub unsafe extern "C" fn rt_resolve_send(vm: *mut VmState, ret_addr: u64, _argv: *mut u64) -> u64 {
+    // SAFETY: this function's own contract, guaranteed by `stub_resolve`.
+    let vm = unsafe { &mut *vm };
+    // P9, checked from the inside: any stub reaching Rust must have set
+    // the anchor before the call (a bare `VmState::reg_block` starts at
+    // 0, and `enter_compiled` debug-asserts it's clear on ENTRY — this is
+    // the complementary check, that it's genuinely non-zero while a
+    // runtime call is actually in flight, not just cleared again on the
+    // way out).
+    debug_assert_ne!(
+        vm.reg_block.last_compiled_fp, 0,
+        "rt_resolve_send: anchor must be set by stub_resolve's prologue before this call"
+    );
+    ret_addr
+}
+
 /// S10: nothing sets `VmRegBlock::poll_flag` nonzero yet (mirrors
 /// `interpreter::poll`'s own S2-era status), so this is rarely even
 /// reached in a normal run — a real interrupt/trace producer is a later
@@ -251,5 +380,70 @@ mod tests {
         let stubs = install(&mut cache);
         assert!(cache.contains(stubs.call_stub_entry() as u64));
         assert!(cache.contains(stubs.stub_poll_addr()));
+        assert!(cache.contains(stubs.resolve_addr()));
+    }
+
+    fn test_vm() -> VmState {
+        VmState::with_options(crate::runtime::vm_state::VmOptions {
+            heap_mib: 64,
+            trace: Default::default(),
+            gc_stress: false,
+            gc_stress_full_period: None,
+            eden_kb: None,
+            jit: crate::runtime::JitMode::Off,
+        })
+    }
+
+    /// S11 step 1's own scoped claim: `stub_resolve`'s skeleton round-trips
+    /// safely all the way out to Rust and back, without yet resolving
+    /// anything real. Calling it directly via `call_stub` (`entry` =
+    /// `resolve_addr()`, bypassing the `bl_patchable`/`IcSite` machinery
+    /// S11 step 2 adds) puts `x30` at *`call_stub`'s own* post-`blr`
+    /// continuation when the stub captures `ret_addr` — so the placeholder
+    /// `rt_resolve_send` (which just echoes `ret_addr` back as the
+    /// tail-jump target) lands `stub_resolve`'s own `br x16` right back
+    /// where a normal `ret` would have gone, and `call_stub` finishes
+    /// completely normally. The one meaningful thing this proves: x0..x5
+    /// survive the round trip through RootSpill (spilled before the call,
+    /// reloaded after) even though real Rust code ran and could easily
+    /// have corrupted them if the offsets were wrong.
+    #[test]
+    fn resolve_stub_round_trips_and_preserves_regs() {
+        let mut vm = test_vm();
+        let mut cache = test_cache();
+        let stubs = install(&mut cache);
+
+        let call: CallStubFn = unsafe { std::mem::transmute(stubs.call_stub_entry()) };
+        let vm_ptr: *mut VmState = &mut vm;
+        let argv = [0x1000_0042u64, 0x2000_0007u64];
+        let result = unsafe { call(stubs.resolve_addr(), vm_ptr, argv.as_ptr(), 2) };
+        assert_eq!(
+            result, argv[0],
+            "x0 (receiver) must survive the RootSpill round trip through stub_resolve unchanged"
+        );
+        assert_eq!(
+            vm.reg_block.last_compiled_fp, 0,
+            "the anchor must be cleared again once the stub has returned (P9)"
+        );
+    }
+
+    /// `rt_resolve_send`'s placeholder body, checked directly as a plain
+    /// Rust function call (no assembly involved) — the narrowest possible
+    /// test of "does this echo ret_addr", independent of the stub skeleton
+    /// working correctly around it (that's the job of the test above). The
+    /// function's own contract requires the anchor already be set (checked
+    /// by its own `debug_assert_ne!`, P9) — a direct call bypasses
+    /// `stub_resolve`'s prologue, which is the only thing that normally
+    /// sets it, so this test fakes that precondition by hand rather than
+    /// going through real assembly for a check that doesn't need it.
+    #[test]
+    fn rt_resolve_send_placeholder_echoes_ret_addr() {
+        let mut vm = test_vm();
+        vm.reg_block.last_compiled_fp = 0xFACE_u64; // fake anchor, satisfies the precondition
+        let mut argv = [0u64; 6];
+        let ret_addr = 0xDEAD_BEEFu64;
+        let vm_ptr: *mut VmState = &mut vm;
+        let result = unsafe { rt_resolve_send(vm_ptr, ret_addr, argv.as_mut_ptr()) };
+        assert_eq!(result, ret_addr);
     }
 }
