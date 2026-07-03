@@ -11,9 +11,10 @@ use macvm::compiler::ir::{
 };
 use macvm::compiler::jasm_assembler::JasmAssembler;
 use macvm::compiler::regalloc;
+use macvm::frontend::{classdef, parser};
 use macvm::interpreter::ic::InterpreterIc;
 use macvm::oops::smi::SmallInt;
-use macvm::oops::wrappers::SymbolOop;
+use macvm::oops::wrappers::{KlassOop, MemOop, MethodOop, SymbolOop};
 use macvm::runtime::{JitMode, VmOptions, VmState};
 
 fn test_vm() -> VmState {
@@ -520,4 +521,187 @@ fn compiled_frame_teardown_exact() {
     // Bailout leaves vm.stack untouched (still [receiver, arg]).
     assert_eq!(vm.stack.pop(), big.oop());
     assert_eq!(vm.stack.pop(), big.oop());
+}
+
+// ── Listing goldens (tests_s10.md gate item 2, integration item 1) ────────
+
+fn golden_dir() -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/golden")
+}
+
+fn check_golden_lst(name: &str, actual: &str) {
+    let path = golden_dir().join(format!("{name}.lst.expected"));
+    if std::env::var("UPDATE_GOLDEN").is_ok() {
+        std::fs::write(&path, actual).expect("write golden");
+        return;
+    }
+    let expected = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("reading golden {}: {e}", path.display()));
+    assert_eq!(
+        actual, expected,
+        "golden {name} mismatch (run with UPDATE_GOLDEN=1 to inspect/regenerate)"
+    );
+}
+
+fn load_source(vm: &mut VmState, src: &str) {
+    let items = parser::parse_file(src).expect("parse");
+    for item in items {
+        classdef::execute_top_item(vm, item).expect("execute");
+    }
+}
+
+fn klass_named(vm: &mut VmState, name: &str) -> KlassOop {
+    let sym = vm.universe.intern(name.as_bytes());
+    let assoc = macvm::runtime::globals::global_lookup(vm, sym)
+        .unwrap_or_else(|| panic!("global '{name}' not found"));
+    KlassOop::try_from(MemOop::try_from(assoc).unwrap().body_oop(1))
+        .unwrap_or_else(|| panic!("'{name}' is not a class"))
+}
+
+fn method_named(vm: &mut VmState, klass: KlassOop, selector: &str) -> MethodOop {
+    let sel = vm.universe.intern(selector.as_bytes());
+    macvm::runtime::lookup::lookup(vm, klass, sel)
+        .unwrap_or_else(|| panic!("'{selector}' not installed on the given class"))
+}
+
+/// A minimal but functionally real `SmallInteger` primitive method (a
+/// bare-bones fallback body, never actually reached since these goldens'
+/// own arguments never overflow) — a bare `VmState` has no real
+/// `SmallInteger` methods at all (`world/06_smallinteger.mst` isn't
+/// loaded), matching every other real-arithmetic test in this session.
+fn install_smi_prim(vm: &mut VmState, name: &[u8], argc: usize, prim: i64) {
+    let smi_klass = vm.universe.smi_klass;
+    let sel = vm.universe.intern(name);
+    let mut b = BytecodeBuilder::new();
+    b.push_self();
+    b.ret_self();
+    let m = b.finish(vm, sel, argc, 0);
+    m.set_primitive(prim);
+    let sel = vm.universe.intern(name); // re-intern: finish may have moved things
+    macvm::runtime::lookup::install_method(vm, smi_klass, sel, m);
+}
+
+/// Compiles `method` via the real pipeline (`driver::eligible` — the same
+/// gate `driver::compile_method` itself uses — then decode/convert/
+/// regalloc/emit directly, since `compile_method`'s own `Nmethod` doesn't
+/// carry its `CodeBlob`'s listing around; production nmethods have no use
+/// for keeping their own disassembly alive). Panics if `method` turns out
+/// ineligible — every golden here is chosen to be eligible once warm.
+fn compile_and_get_listing(vm: &VmState, method: MethodOop) -> String {
+    assert!(
+        driver::eligible(vm, method),
+        "golden method must be eligible (was it called enough times to warm its own inner ICs?)"
+    );
+    let cfg = macvm::compiler::decode::decode(method);
+    let ir = macvm::compiler::ir::convert(vm, method, &cfg);
+    let ra = regalloc::regalloc(&ir);
+    let mut asm = JasmAssembler::new();
+    let (blob, _pcs) = emit::emit(&mut asm, &ir, &ra, 0xDEAD_BEEF_0000_0000);
+    blob.listing.join("\n") + "\n"
+}
+
+const GOLDEN_SOURCE: &str = "\
+Object subclass: Tier1Golden [\n\
+\x20   sumTo: n [\n\
+\x20       | s |\n\
+\x20       s := 0.\n\
+\x20       1 to: n do: [:i | s := s + i].\n\
+\x20       ^s\n\
+\x20   ]\n\
+\x20   absDiff: a with: b [\n\
+\x20       ^(a > b)\n\
+\x20           ifTrue: [ a - b ]\n\
+\x20           ifFalse: [ b - a ]\n\
+\x20   ]\n\
+\x20   bitsOf: x [\n\
+\x20       ^((x bitAnd: 16r0F) bitOr: (x bitXor: 16rFF)) bitAnd: 16rFF\n\
+\x20   ]\n\
+]\n";
+
+/// Common setup for all three listing goldens: a bare `VmState` (no
+/// `.mst` world load needed — these methods only ever touch
+/// `SmallInteger`), `Tier1Golden`'s three methods loaded from real
+/// source via the real frontend (not `BytecodeBuilder`), and every smi
+/// primitive they transitively need installed directly (D1-eligible
+/// inlining needs each inner send's own IC to be mono-smi-warm, which
+/// only happens by actually running the method body at least once
+/// interpreted first).
+fn golden_vm() -> (VmState, KlassOop) {
+    let mut vm = test_vm();
+    install_smi_prim(&mut vm, b"+", 1, 1);
+    install_smi_prim(&mut vm, b"-", 1, 2);
+    install_smi_prim(&mut vm, b">", 1, 12);
+    install_smi_prim(&mut vm, b"<=", 1, 11);
+    install_smi_prim(&mut vm, b"bitAnd:", 1, 6);
+    install_smi_prim(&mut vm, b"bitOr:", 1, 7);
+    install_smi_prim(&mut vm, b"bitXor:", 1, 8);
+    load_source(&mut vm, GOLDEN_SOURCE);
+    let klass = klass_named(&mut vm, "Tier1Golden");
+    (vm, klass)
+}
+
+/// `run_method` (a real send-warmup call) can allocate — so `method`,
+/// a heap oop, must be re-derived fresh afterward rather than reused from
+/// before the call (which a `MACVM_GC_STRESS=1` run of this same suite
+/// would have moved). `klass` itself is re-derived via `klass_named`'s own
+/// global-dictionary lookup (a root, so always current) rather than reused
+/// too, for the same reason — this codebase's own established convention
+/// (see e.g. `it_frontend_golden.rs`'s `install_prim` doc comment) for
+/// anything that must survive an allocating call in between.
+#[test]
+fn golden_sum_to() {
+    let (mut vm, klass) = golden_vm();
+    let recv = macvm::memory::alloc::alloc_slots(&mut vm, klass).oop();
+    let warmup_method = method_named(&mut vm, klass, "sumTo:");
+    // Warm sumTo:'s own inner sends (+ and the inlined to:do:'s <=) by
+    // actually running it interpreted once first.
+    macvm::interpreter::run_method(&mut vm, warmup_method, recv, &[SmallInt::new(3).oop()]);
+    let klass = klass_named(&mut vm, "Tier1Golden");
+    let method = method_named(&mut vm, klass, "sumTo:");
+    let listing = compile_and_get_listing(&vm, method);
+    check_golden_lst("s10_sumTo", &listing);
+}
+
+#[test]
+fn golden_abs_diff() {
+    let (mut vm, klass) = golden_vm();
+    // ifTrue: and ifFalse: each have their OWN `-` send site (distinct
+    // bytecode positions, distinct ICs) -- a single call only ever takes
+    // one branch, leaving the other's IC empty. Both need warming before
+    // `eligible` sees every site as mono-smi. `recv` is re-allocated fresh
+    // for each call (not reused across it) since it's a heap oop an
+    // allocating call could move.
+    let recv1 = macvm::memory::alloc::alloc_slots(&mut vm, klass).oop();
+    let warmup_method = method_named(&mut vm, klass, "absDiff:with:");
+    macvm::interpreter::run_method(
+        &mut vm,
+        warmup_method,
+        recv1,
+        &[SmallInt::new(10).oop(), SmallInt::new(3).oop()], // a > b: ifTrue:
+    );
+    let klass2 = klass_named(&mut vm, "Tier1Golden");
+    let recv2 = macvm::memory::alloc::alloc_slots(&mut vm, klass2).oop();
+    let warmup_method2 = method_named(&mut vm, klass2, "absDiff:with:");
+    macvm::interpreter::run_method(
+        &mut vm,
+        warmup_method2,
+        recv2,
+        &[SmallInt::new(3).oop(), SmallInt::new(10).oop()], // a < b: ifFalse:
+    );
+    let klass = klass_named(&mut vm, "Tier1Golden");
+    let method = method_named(&mut vm, klass, "absDiff:with:");
+    let listing = compile_and_get_listing(&vm, method);
+    check_golden_lst("s10_absDiff", &listing);
+}
+
+#[test]
+fn golden_bits_of() {
+    let (mut vm, klass) = golden_vm();
+    let recv = macvm::memory::alloc::alloc_slots(&mut vm, klass).oop();
+    let warmup_method = method_named(&mut vm, klass, "bitsOf:");
+    macvm::interpreter::run_method(&mut vm, warmup_method, recv, &[SmallInt::new(0xA5).oop()]);
+    let klass = klass_named(&mut vm, "Tier1Golden");
+    let method = method_named(&mut vm, klass, "bitsOf:");
+    let listing = compile_and_get_listing(&vm, method);
+    check_golden_lst("s10_bitsOf", &listing);
 }
