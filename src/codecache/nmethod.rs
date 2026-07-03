@@ -241,6 +241,17 @@ impl CodeTable {
             self.by_key.insert(key, nm.id);
         }
     }
+
+    /// Test-only hook standing in for S12 flushing (the real way a slot an
+    /// IC still names can go away — S10 never frees one organically):
+    /// simulates a stale id by clearing `id`'s slot out from under any IC
+    /// that still holds it, so `send_generic`'s own re-validate-before-
+    /// `enter_compiled` check (`code_table.get(nm_id).is_some_and(...)`)
+    /// has a real gap to catch (tests_s10.md's `stale_id_self_heals`).
+    #[cfg(test)]
+    pub(crate) fn test_clear_slot(&mut self, id: NmethodId) {
+        self.slots[id.0 as usize] = None;
+    }
 }
 
 #[cfg(test)]

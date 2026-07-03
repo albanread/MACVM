@@ -546,6 +546,230 @@ mod tests {
         );
     }
 
+    /// tests_s10.md's `bailout_falls_back_correctly`, the OTHER half not
+    /// covered by `compile_trigger_bailout_falls_back_correctly` above: a
+    /// receiver of a klass the compiled entry was never installed for.
+    /// `send_generic`'s own guard check (`ic.guard().raw() == k.oop().raw()`,
+    /// this file's fast path) must reject the mismatch BEFORE ever calling
+    /// `enter_compiled` — a Double's bits are a heap pointer, not a tagged
+    /// smi, so blindly running the smi entry's own tag-checked add on it
+    /// would be a memory-safety bug, not just a wrong answer.
+    ///
+    /// This deliberately does NOT then assert a following smi call still
+    /// hits the compiled entry: SPEC's inline-cache lattice demotes a
+    /// second-klass sighting to poly, and `ic_transition`'s own poly path
+    /// (`ic.rs`) always re-derives an *interpreted* target — "the poly
+    /// array only ever stores interpreted MethodOops" is that function's
+    /// own documented design, not a bug this test should fight. The
+    /// still-uses-the-nmethod guarantee tests_s10.md describes belongs to
+    /// the overflow/bailout scenario above, where the IC never leaves mono.
+    #[test]
+    fn compile_trigger_double_receiver_is_ic_miss_not_compiled_entry() {
+        let mut vm = VmState::with_options(VmOptions {
+            heap_mib: 64,
+            trace: Default::default(),
+            gc_stress: false,
+            gc_stress_full_period: None,
+            eden_kb: None,
+            jit: crate::runtime::JitMode::Threshold(2),
+        });
+        let smi_klass = vm.universe.smi_klass;
+        let double_klass = vm.universe.double_klass;
+        let plus_sel = install_smi_plus(&mut vm);
+        let plus_arg_sel = vm.universe.intern(b"plusArg:");
+
+        let mut b = BytecodeBuilder::new();
+        b.push_self();
+        b.push_temp(0);
+        b.send(&mut vm, plus_sel, 1);
+        b.ret_tos();
+        let plus_arg_method = b.finish(&mut vm, plus_arg_sel, 1, 0);
+        install_method(&mut vm, smi_klass, plus_arg_sel, plus_arg_method);
+
+        // A second, completely distinct `plusArg:` on Double — its return
+        // value could never be confused with the smi version's, or with a
+        // misinterpreted compiled-entry crash/garbage result.
+        const DOUBLE_SENTINEL: i64 = -77;
+        let mut db = BytecodeBuilder::new();
+        db.push_smi_i8(DOUBLE_SENTINEL as i8);
+        db.ret_tos();
+        let double_plus_arg_method = db.finish(&mut vm, plus_arg_sel, 1, 0);
+        install_method(&mut vm, double_klass, plus_arg_sel, double_plus_arg_method);
+
+        let caller = build_caller(&mut vm, plus_arg_sel, 1);
+
+        // Calls 1-2: warm plusArg:'s own inner `#+` IC, then cross the
+        // threshold — same shape as compile_trigger_fires_and_rewrites_ic_to_compiled.
+        let r1 = send_once(
+            &mut vm,
+            caller,
+            &[SmallInt::new(1).oop(), SmallInt::new(1).oop()],
+        );
+        assert_eq!(r1, SmallInt::new(2).oop());
+        let r2 = send_once(
+            &mut vm,
+            caller,
+            &[SmallInt::new(5).oop(), SmallInt::new(3).oop()],
+        );
+        assert_eq!(r2, SmallInt::new(8).oop());
+
+        let ic = InterpreterIc::at(caller, 0);
+        SmallInt::try_from(ic.target())
+            .expect("call 2 must have rewritten the IC to a compiled nmethod id");
+        assert_eq!(
+            ic.guard().raw(),
+            smi_klass.oop().raw(),
+            "mono-compiled still stores a plain klass guard, same as mono-interpreted"
+        );
+
+        // Call 3: a Double receiver. Guard mismatch (double_klass !=
+        // smi_klass) must route through ic_transition's normal lookup +
+        // interpreted activate_method, landing on double_plus_arg_method —
+        // never anywhere near enter_compiled (which would read the Double's
+        // heap pointer bits as if they were a tagged smi operand).
+        let d = crate::memory::alloc::alloc_double(&mut vm, 3.5);
+        let r3 = send_once(&mut vm, caller, &[d.oop(), SmallInt::new(999).oop()]);
+        assert_eq!(
+            r3,
+            SmallInt::new(DOUBLE_SENTINEL).oop(),
+            "a Double receiver must dispatch to Double's own plusArg: via the IC-miss path"
+        );
+
+        // Call 4: back to a smi receiver. Whatever the IC now looks like
+        // (mono-compiled still, or poly-demoted), the call must still
+        // produce the right VALUE — resolving correctly is the property
+        // that matters, not which of the two valid mechanisms got there.
+        let r4 = send_once(
+            &mut vm,
+            caller,
+            &[SmallInt::new(10).oop(), SmallInt::new(32).oop()],
+        );
+        assert_eq!(r4, SmallInt::new(42).oop());
+    }
+
+    /// tests_s10.md's `stale_id_self_heals`: a compiled id an IC still
+    /// names can stop being valid (S12 flushing will do this for real —
+    /// S10 itself never frees a slot organically, hence the test-only
+    /// `CodeTable::test_clear_slot` hook standing in for it here).
+    /// `send_generic`'s own re-validate-before-`enter_compiled` check
+    /// (`code_table.get(nm_id).is_some_and(...)`) must catch the gap and
+    /// fall through to `ic_transition`'s ordinary self-heal — re-resolving
+    /// and re-installing a plain interpreted target — rather than calling
+    /// `enter_compiled` on a dangling id.
+    #[test]
+    fn stale_id_self_heals() {
+        let mut vm = VmState::with_options(VmOptions {
+            heap_mib: 64,
+            trace: Default::default(),
+            gc_stress: false,
+            gc_stress_full_period: None,
+            eden_kb: None,
+            jit: crate::runtime::JitMode::Threshold(2),
+        });
+        let smi_klass = vm.universe.smi_klass;
+        let plus_sel = install_smi_plus(&mut vm);
+        let plus_arg_sel = vm.universe.intern(b"plusArg:");
+
+        let mut b = BytecodeBuilder::new();
+        b.push_self();
+        b.push_temp(0);
+        b.send(&mut vm, plus_sel, 1);
+        b.ret_tos();
+        let plus_arg_method = b.finish(&mut vm, plus_arg_sel, 1, 0);
+        install_method(&mut vm, smi_klass, plus_arg_sel, plus_arg_method);
+        let caller = build_caller(&mut vm, plus_arg_sel, 1);
+
+        // Calls 1-2: warm + cross the threshold, exactly like
+        // compile_trigger_fires_and_rewrites_ic_to_compiled.
+        let r1 = send_once(
+            &mut vm,
+            caller,
+            &[SmallInt::new(1).oop(), SmallInt::new(1).oop()],
+        );
+        assert_eq!(r1, SmallInt::new(2).oop());
+        let r2 = send_once(
+            &mut vm,
+            caller,
+            &[SmallInt::new(5).oop(), SmallInt::new(3).oop()],
+        );
+        assert_eq!(r2, SmallInt::new(8).oop());
+
+        let ic = InterpreterIc::at(caller, 0);
+        let nm_id = NmethodId(
+            SmallInt::try_from(ic.target())
+                .expect("call 2 must have rewritten the IC to a compiled nmethod id")
+                .value() as u32,
+        );
+        assert!(vm.code_table.get(nm_id).is_some());
+
+        // Call 3: dispatch once through the still-valid compiled entry.
+        let r3 = send_once(
+            &mut vm,
+            caller,
+            &[SmallInt::new(10).oop(), SmallInt::new(1).oop()],
+        );
+        assert_eq!(r3, SmallInt::new(11).oop());
+
+        // Forcibly clear the slot -- simulating S12 flushing reclaiming
+        // it, with the IC still (stalely) naming this exact id.
+        vm.code_table.test_clear_slot(nm_id);
+        assert!(vm.code_table.get(nm_id).is_none());
+
+        // Call 4: the IC's guard/epoch still match (still smi_klass,
+        // still the same epoch), so send_generic takes its fast-path
+        // branch and reaches the smi-target arm -- but the code_table
+        // re-check now fails, so it falls through to ic_transition's
+        // self-heal: resolve() re-finds plusArg:'s interpreted method and
+        // ic.set_mono installs it as a plain interpreted target, and
+        // send_generic then runs it through activate_method like any
+        // other mono-interpreted dispatch. THAT is where this particular
+        // setup gets interesting: plusArg:'s own invocation counter is
+        // bumped a 3rd time right there (calls 1-2 bumped it to 2; call 3
+        // went straight through enter_compiled and never touched
+        // activate_method at all), crosses JitMode::Threshold(2) again,
+        // and activate_method's own trigger recompiles and reinstalls a
+        // FRESH compiled target on the spot -- so by the time call 4
+        // returns the site is mono-compiled again, not stuck
+        // interpreted. That chain reaction (stale id -> self-heal ->
+        // immediate re-trigger -> fresh compiled reinstall, all inside
+        // one send) is exactly what tests_s10.md's "reinstalls a
+        // CompiledMethod target" describes, and is the real thing worth
+        // checking here: that it resolves cleanly rather than reusing the
+        // freed slot incorrectly or looping.
+        let r4 = send_once(
+            &mut vm,
+            caller,
+            &[SmallInt::new(20).oop(), SmallInt::new(4).oop()],
+        );
+        assert_eq!(
+            r4,
+            SmallInt::new(24).oop(),
+            "a stale compiled id must self-heal to a correct dispatch, not misbehave"
+        );
+
+        let ic_after = InterpreterIc::at(caller, 0);
+        let new_id = NmethodId(
+            SmallInt::try_from(ic_after.target())
+                .expect("self-heal's own re-trigger must have reinstalled a fresh compiled target")
+                .value() as u32,
+        );
+        let new_nm = vm
+            .code_table
+            .get(new_id)
+            .expect("the reinstalled id must be installed and alive");
+        assert_eq!(new_nm.key_klass.oop().raw(), smi_klass.oop().raw());
+        assert_eq!(new_nm.key_selector.oop().raw(), plus_arg_sel.oop().raw());
+
+        // Call 5: dispatches through the freshly reinstalled compiled
+        // entry, confirming it works normally afterward.
+        let r5 = send_once(
+            &mut vm,
+            caller,
+            &[SmallInt::new(1).oop(), SmallInt::new(2).oop()],
+        );
+        assert_eq!(r5, SmallInt::new(3).oop());
+    }
+
     #[test]
     fn counter_bumped_on_prim_success() {
         let mut vm = test_vm();
