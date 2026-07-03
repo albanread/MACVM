@@ -75,6 +75,17 @@ pub struct Universe {
     /// into a returned `Err` rather than silently leaving a root pointed
     /// at an un-copied from-space object. `None` the rest of the time.
     pub pending_stall: Option<super::stall::GcStallError>,
+    /// S8 step 7: whether `alloc::ensure_promotion_guarantee` believes old
+    /// gen has enough committed room to promote the entire young generation
+    /// in the worst case, as of the last time it was checked (right before
+    /// the scavenge about to run). `true` by construction whenever the
+    /// guarantee holds; `false` only when the reservation is genuinely
+    /// exhausted even after a full GC and growth — a real, bounded-memory
+    /// terminal condition (`eden_exhaustion_aborts` deliberately drives a
+    /// 16 MiB heap into exactly this), not a cascade bug. `record_stall`
+    /// reads this to tell the two apart: a `ScavengePromote` stall is only
+    /// a guarantee VIOLATION (debug-assert-worthy) when this was `true`.
+    pub promotion_guarantee_met: bool,
 
     pub nil_obj: Oop,
     pub true_obj: Oop,
@@ -594,6 +605,7 @@ impl Universe {
             tenuring_threshold,
             gc_enabled: false, // flipped true just before genesis() returns (SPEC §7.3 A1)
             pending_stall: None,
+            promotion_guarantee_met: true,
             nil_obj: nil,
             true_obj: true_obj.oop(),
             false_obj: false_obj.oop(),

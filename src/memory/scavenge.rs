@@ -118,6 +118,23 @@ fn object_size_for_copy(obj: MemOop) -> usize {
 /// `pending_stall` between phases and turns it into a returned `Err`
 /// rather than ever treating this half-copied oop as real progress.
 fn record_stall(vm: &mut VmState, requested_bytes: usize, phase: GcPhase, oop: Oop) -> Oop {
+    // S8 step 7: the allocation cascade's promotion guarantee
+    // (`alloc::ensure_promotion_guarantee`, checked before every scavenge
+    // call) commits enough old-gen room for the worst-case promotion of the
+    // ENTIRE young generation before a scavenge is allowed to start. A
+    // ScavengePromote stall despite that is a genuine guarantee VIOLATION
+    // (debug-assert it loudly) — but only when the guarantee actually
+    // reported success going in. With a bounded reservation the guarantee
+    // can legitimately fail to be established (`eden_exhaustion_aborts`
+    // deliberately drives a 16 MiB heap into exactly this); that is real
+    // memory exhaustion, correctly falling through to the ordinary
+    // GcStallError path below, not a bug to assert on.
+    debug_assert!(
+        phase != GcPhase::ScavengePromote || !vm.universe.promotion_guarantee_met,
+        "scavenge stalled trying to promote even though the allocation cascade's \
+         promotion guarantee reported success going in — a real guarantee violation, \
+         not bounded-memory exhaustion (which clears promotion_guarantee_met first)"
+    );
     if vm.universe.pending_stall.is_none() {
         let err = GcStallError::snapshot(&vm.universe, requested_bytes, phase);
         vm.universe.pending_stall = Some(err);

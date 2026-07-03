@@ -157,16 +157,55 @@ fn stall_exit(err: crate::memory::stall::GcStallError) -> ! {
 
 // --- public layer: VmState-based, used from S2 onward -----------------------
 
+/// SPEC §7.2 step 4's promotion guarantee (S8 step 7), checked before EVERY
+/// scavenge call in the cascade below (including the `MACVM_GC_STRESS=1`
+/// one, which under stress mode runs on literally every allocation): commit
+/// enough old-gen room to promote the ENTIRE young generation in the worst
+/// case (every eden+from byte ages past threshold, or overflows survivor
+/// space) before the scavenge is allowed to start. This is what makes a
+/// scavenge's own `ScavengePromote` stall a guarantee VIOLATION rather than
+/// a legitimate outcome — but only when this actually succeeds
+/// (`vm.universe.promotion_guarantee_met`, read by `scavenge::record_stall`):
+/// with a bounded reservation, the guarantee can genuinely be unmeetable
+/// (`eden_exhaustion_aborts` deliberately drives a tiny heap into exactly
+/// this), and that is real, terminal memory exhaustion, not a bug — so it
+/// must still fall through to the ordinary `GcStallError` path, not a
+/// hard-coded "impossible". A full GC is tried first — compaction alone may
+/// free enough room without growing at all; growth is the fallback.
+fn ensure_promotion_guarantee(vm: &mut VmState) {
+    let worst_case = (vm.universe.eden.top - vm.universe.eden.start)
+        + (vm.universe.from.top - vm.universe.from.start);
+    if vm.universe.old.free_bytes() < worst_case {
+        crate::memory::fullgc::full_gc(vm)
+            .expect("full_gc: pure compaction never returns Err (see its own doc)");
+        while vm.universe.old.free_bytes() < worst_case {
+            if vm
+                .universe
+                .grow_old(crate::memory::layout::OLD_GROWTH_SEGMENT)
+                == 0
+            {
+                // Reservation exhausted: the guarantee genuinely cannot be
+                // met. Let the scavenge run anyway and stall for real if it
+                // actually needs the room — recorded below so record_stall
+                // can tell this apart from a guarantee VIOLATION.
+                break;
+            }
+        }
+    }
+    vm.universe.promotion_guarantee_met = vm.universe.old.free_bytes() >= worst_case;
+}
+
 /// Every heap object allocates through here (SPEC §7.2 A2's designed
-/// cascade, S7-10): (1) `MACVM_GC_STRESS=1` scavenges before every
-/// allocation once the universe is past genesis — the harness that flushes
-/// out invisible-root bugs (S7-9's `Handle` discipline) deterministically
-/// instead of waiting for an unlucky eden-boundary allocation; (2) bump
-/// eden; (3) on failure, scavenge and retry the bump; (4) on failure,
-/// allocate directly into old gen (also covers objects too big for eden to
-/// ever hold); (5) still nothing → a structured `GcStallError` report, then
-/// exit non-zero (lesson 7: never panic on OOM). Old-gen growth and full GC
-/// (the cascade's remaining stages) are S8.
+/// cascade, complete as of S8 step 7): (1) `MACVM_GC_STRESS=1` scavenges
+/// before every allocation once the universe is past genesis, guarantee-
+/// checked first; (2) bump eden; (3) on failure, guarantee-check, scavenge,
+/// retry the bump; (4) on failure, allocate directly into old gen (also
+/// covers objects too big for eden to ever hold), growing one segment and
+/// retrying once if the committed prefix is full; (5) still nothing → a
+/// full GC (may free enough room via compaction alone), grow old gen if
+/// that still isn't enough, retry both eden and old; (6) still nothing → a
+/// structured `GcStallError` report, then exit non-zero (lesson 7: never
+/// panic on OOM) — the designed end of the cascade, not a bug.
 ///
 /// `klass` is handle-protected for the whole call: once this function can
 /// itself trigger a scavenge, its own `klass` parameter is exactly the kind
@@ -186,6 +225,7 @@ pub fn alloc_words(vm: &mut VmState, words: usize, klass: Oop, tagged: bool) -> 
     let klass_h = scope.handle(vm, klass);
 
     if vm.options.gc_stress && vm.universe.gc_enabled {
+        ensure_promotion_guarantee(vm);
         if let Err(err) = crate::memory::scavenge::scavenge(vm) {
             stall_exit(err);
         }
@@ -197,6 +237,7 @@ pub fn alloc_words(vm: &mut VmState, words: usize, klass: Oop, tagged: bool) -> 
     }
 
     if vm.universe.gc_enabled {
+        ensure_promotion_guarantee(vm);
         if let Err(err) = crate::memory::scavenge::scavenge(vm) {
             stall_exit(err);
         }
@@ -206,11 +247,32 @@ pub fn alloc_words(vm: &mut VmState, words: usize, klass: Oop, tagged: bool) -> 
         }
     }
 
-    // Direct old-gen allocation for objects eden can't hold (or that survived
-    // both scavenges). S8 step 2: on a committed-prefix miss, grow one segment
-    // and retry once. The full cascade — promotion guarantee + `full_gc`
-    // before the stall — is S8 step 7; until then a persistent miss is still
-    // the designed terminal `GcStallError`.
+    // Direct old-gen allocation for objects eden can't hold (or that
+    // survived both scavenges). On a committed-prefix miss, grow one
+    // segment and retry once.
+    if let Some(obj) = try_old_alloc(vm, words, size_bytes, klass_h.get(vm), tagged) {
+        return obj;
+    }
+    if vm
+        .universe
+        .grow_old(crate::memory::layout::OLD_GROWTH_SEGMENT)
+        > 0
+    {
+        if let Some(obj) = try_old_alloc(vm, words, size_bytes, klass_h.get(vm), tagged) {
+            return obj;
+        }
+    }
+
+    // Full GC: the last resort before stalling. Compaction alone may free
+    // enough contiguous room in either generation without growing at all;
+    // if not, one more growth segment closes the gap. Eden is retried
+    // first (the common case — most allocations are eden-sized), then old.
+    crate::memory::fullgc::full_gc(vm)
+        .expect("full_gc: pure compaction never returns Err (see its own doc)");
+    let nil_fill = vm.universe.nil_obj;
+    if let Some(addr) = try_bump_eden(&mut vm.universe.eden, words) {
+        return init_object_at(addr, words, klass_h.get(vm), tagged, nil_fill);
+    }
     if let Some(obj) = try_old_alloc(vm, words, size_bytes, klass_h.get(vm), tagged) {
         return obj;
     }
@@ -512,5 +574,64 @@ mod tests {
         let mut vm = boot();
         let bytearray_klass = vm.universe.bytearray_klass;
         let _ = alloc_indexable_bytes(&mut vm, bytearray_klass, usize::MAX);
+    }
+
+    /// S8 step 7's actual point: not just that `full_gc` works in isolation
+    /// (`fullgc.rs`'s own 14 tests already prove that), but that the
+    /// allocation cascade genuinely REACHES it. With the default 8 GiB heap
+    /// and small test workloads, `ensure_promotion_guarantee`'s `full_gc()`
+    /// branch would never fire in practice — old gen's free room always
+    /// dwarfs any test's worst-case young-gen usage, so every other test in
+    /// this suite passing proves nothing about this wiring specifically.
+    /// This test forces the actual trigger: an eden bigger than old gen's
+    /// fixed 16 MiB initial segment, filled close to capacity, so the next
+    /// allocation's promotion-guarantee check genuinely finds old gen too
+    /// small for the worst case and must call `full_gc` for real.
+    #[test]
+    fn cascade_actually_invokes_full_gc_when_promotion_guarantee_is_short() {
+        let mut vm = VmState::with_options(VmOptions {
+            heap_mib: 64,
+            trace: Default::default(),
+            gc_stress: false,
+            eden_kb: Some(20 * 1024), // > OLD_INITIAL_SEGMENT's 16 MiB
+        });
+        assert!(
+            vm.universe.old.free_bytes() < vm.universe.eden.end - vm.universe.eden.start,
+            "test setup: eden's capacity must exceed old gen's free room, or the \
+             promotion guarantee below never actually gets exercised"
+        );
+        let klass = vm.universe.array_klass;
+        // 60-element arrays via the real allocator (not a raw alloc_words
+        // call with an IndexableOops-format klass, which would skip the
+        // size-slot write `instance_size_words`/`for_each_oop_field` both
+        // depend on to size the object correctly during the coming GC).
+        const CHUNK_ELEMS: usize = 60;
+        let chunk_bytes = (klass.non_indexable_size() + 1 + CHUNK_ELEMS) * WORD_SIZE;
+        // Precisely drain eden to under one more chunk's worth: the loop
+        // only fires while a full chunk still fits, so afterward
+        // `remaining() < chunk_bytes` is guaranteed — the trigger
+        // allocation below (the SAME size) is then certain to miss its
+        // first bump attempt, not just likely to.
+        while vm.universe.eden.remaining() >= chunk_bytes {
+            alloc_indexable_oops(&mut vm, klass, CHUNK_ELEMS);
+        }
+        assert!(
+            vm.universe.eden.remaining() < chunk_bytes,
+            "test setup: eden must be drained below one more chunk"
+        );
+        let full_gc_count_before = vm.universe.gc_stats.full_gc_count;
+
+        // Eden's first bump attempt now certainly fails; this falls into
+        // the "on failure" branch, which calls ensure_promotion_guarantee
+        // before scavenging.
+        alloc_indexable_oops(&mut vm, klass, CHUNK_ELEMS);
+
+        assert!(
+            vm.universe.gc_stats.full_gc_count > full_gc_count_before,
+            "ensure_promotion_guarantee must have actually invoked full_gc: old \
+             gen's free room ({} bytes) was smaller than eden's worst case ({} bytes)",
+            vm.universe.old.free_bytes(),
+            vm.universe.eden.end - vm.universe.eden.start,
+        );
     }
 }
