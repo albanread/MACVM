@@ -11,4 +11,5 @@
 
 pub mod assembler;
 pub mod decode;
+pub mod ir;
 pub mod jasm_assembler;
