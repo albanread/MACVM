@@ -120,3 +120,18 @@ bench-s10:
     if [ "$below5" = "1" ]; then
         echo "WARN: compiled speedup ${ratio}x is below the 5x target (tracking only, not gating)"
     fi
+
+# S10: tier-1 JIT compiler (tests_s10.md's acceptance gate). gate-s09
+# already covers "cargo test" + "cargo clippy -- -D warnings" (tests_s10.md
+# gate script's own first/last lines) via the dependency chain, so this
+# recipe is just the S10-specific middle: the off-vs-threshold=1
+# differential byte-identical (gate item 1), GC-stress regression under the
+# JIT's default (off) mode -- S10 never combines jit+stress, that's S12's
+# flagship, not tested here -- and the perf marker recorded (gate item 3).
+gate-s10: gate-s09
+    MACVM_JIT=off just run-world-tests > /tmp/s10_off.txt
+    MACVM_JIT=threshold=1 just run-world-tests > /tmp/s10_t1.txt
+    diff /tmp/s10_off.txt /tmp/s10_t1.txt
+    MACVM_GC_STRESS=1 just run-world-tests
+    MACVM_GC_STRESS=full:64 just run-world-tests
+    just bench-s10

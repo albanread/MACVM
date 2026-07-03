@@ -70,3 +70,4 @@ below 2x (an architectural-mistake tripwire, not a perf gate — gate item
 | Date | Commit | interp_ms | jit_ms | ratio |
 |---|---|---|---|---|
 | 2026-07-03 | 177abf1 | 1221 | 9 | 135.66x |
+| 2026-07-03 | 353db27 | 1233 | 10 | 123.30x |

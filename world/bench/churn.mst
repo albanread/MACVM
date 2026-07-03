@@ -1,0 +1,32 @@
+"churn.mst — sprint_s10_detail.md 'Stress/negative tests': compile_disabled
+ churn. ChurnIneligible>>tooManyArgs:bar:baz:qux:quux:corge: has 6 explicit
+ args -- D1's own argc>5 rule, so eligibility_detail returns NoPermanent on
+ its very first attempt and compile_disabled() latches permanently.
+ Calling it 100,000 times under MACVM_JIT=threshold=1 exercises
+ activate_method's own `!m.compile_disabled()` gate at stress scale: if
+ that gate ever let a disabled method back through eligibility_detail,
+ MACVM_TRACE=jit would print its own '[jit] ineligible, compile_disabled:
+ ...' line for this selector more than once. That property is what
+ `just`/tests/it_tier1.rs's own compile_disabled_churn scrapes captured
+ stderr for -- not something this script itself can assert. Not in
+ world.list; `macvm run world/bench/churn.mst --world world` loads it
+ explicitly."
+
+Object subclass: ChurnIneligible [
+    tooManyArgs: a bar: b baz: c qux: d quux: e corge: f [
+        ^a + b + c + d + e + f
+    ]
+    ChurnIneligible class >> run [
+        | r |
+        r := 0.
+        100000 timesRepeat: [
+            r := self new
+                tooManyArgs: 1 bar: 2 baz: 3 qux: 4 quux: 5 corge: 6.
+        ].
+        ^r
+    ]
+]
+
+Transcript show: 'result: '.
+Transcript show: ChurnIneligible run printString.
+Transcript cr.

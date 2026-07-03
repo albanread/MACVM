@@ -1,6 +1,9 @@
 //! Sprint S10 integration tests (`tests_s10.md`). This file is allowed
 //! `unsafe` (it lives in `tests/`, a separate crate from `macvm` itself).
 
+use std::path::PathBuf;
+use std::process::{Command, Stdio};
+
 use macvm::bytecode::builder::BytecodeBuilder;
 use macvm::codecache::stubs::{self, CallStubFn};
 use macvm::codecache::CodeCache;
@@ -1106,4 +1109,197 @@ fn mixed_trace_golden() {
     );
 
     check_golden_trace("s10_mixed_trace", &buf.as_string());
+}
+
+// ── Stress/negative tests (tests_s10.md's own section) ─────────────────────
+
+/// tests_s10.md: "`threshold=1` + tiny code cache (test hook: 64 KiB) --
+/// cache exhausts mid-suite; compilation stops gracefully (log line, no
+/// panic), suite still passes interpreted." `compile_method` has no
+/// cache-size knob on `VmOptions`, and adding one would mean touching
+/// every existing `VmOptions{...}` literal across the whole suite for a
+/// test-only need -- the simpler hook is that `vm.code_cache` is already
+/// a public field with a public `alloc`, so pre-consuming most of a
+/// freshly-constructed (still normally-sized, stubs still valid) cache
+/// directly reproduces the same "nearly exhausted" starting condition
+/// without touching production code at all.
+#[test]
+fn threshold1_tiny_code_cache_exhausts_gracefully() {
+    let mut vm = diff_vm();
+    vm.options.jit = JitMode::Threshold(1);
+
+    let leave_free = 512usize;
+    let prefill = macvm::codecache::DEFAULT_CODE_CACHE_CAPACITY.saturating_sub(leave_free);
+    vm.code_cache
+        .alloc(prefill)
+        .expect("prefilling most of a freshly-constructed cache must itself succeed");
+
+    let methods: Vec<MethodOop> = (0..12)
+        .map(|i| build_binop_method(&mut vm, format!("exCache{i}:with:").as_bytes(), b"+"))
+        .collect();
+
+    let dummy_recv = SmallInt::new(0).oop();
+    let mut successes = 0usize;
+    let mut failures = 0usize;
+    for &m in &methods {
+        // Warms the inner `+` send's own IC via one ordinary interpreted
+        // run -- driver::compile_method is called directly below (not
+        // through activate_method's counter trigger), so nothing here
+        // needs to "cross a threshold", only make the method eligible.
+        macvm::interpreter::run_method(
+            &mut vm,
+            m,
+            dummy_recv,
+            &[SmallInt::new(1).oop(), SmallInt::new(1).oop()],
+        );
+        let smi_klass = vm.universe.smi_klass;
+        match driver::compile_method(&mut vm, smi_klass, m) {
+            Some(_) => successes += 1,
+            None => failures += 1,
+        }
+    }
+
+    assert!(
+        successes > 0,
+        "a nearly-full (not literally empty) cache must still grant a few compiles \
+         before exhausting"
+    );
+    assert!(
+        failures > 0,
+        "the prefill must actually have driven the cache to exhaustion partway through \
+         -- otherwise this test isn't exercising the exhaustion path at all"
+    );
+    assert_eq!(
+        vm.options.jit,
+        JitMode::Off,
+        "compile_method's own cache-exhaustion handling must disable the JIT \
+         for the rest of the run"
+    );
+
+    // "suite still passes interpreted": every method -- including ones
+    // that successfully compiled before exhaustion -- still gives the
+    // right answer on a fresh call afterward.
+    for &m in &methods {
+        let r = macvm::interpreter::run_method(
+            &mut vm,
+            m,
+            dummy_recv,
+            &[SmallInt::new(3).oop(), SmallInt::new(4).oop()],
+        );
+        assert_eq!(r, SmallInt::new(7).oop());
+    }
+}
+
+/// tests_s10.md's `compile_disabled` churn, driven through the real CLI
+/// (`world/bench/churn.mst`, `just bench-s10`'s sibling target for this):
+/// `MACVM_TRACE=jit`'s `[jit] ineligible, compile_disabled: ...` line is
+/// written via `eprintln!`, not `vm.out` -- a real process-stderr capture
+/// is the only way to scrape it (matching `it_world.rs`'s own
+/// `error_kills_with_trace`, the established precedent in this suite for
+/// "genuinely needs a subprocess" cases). `ChurnIneligible>>
+/// tooManyArgs:bar:baz:qux:quux:corge:` has 6 explicit args -- D1's own
+/// `argc>5` rule -- so `eligibility_detail` returns `NoPermanent` on its
+/// very first attempt and `compile_disabled()` latches permanently;
+/// `activate_method`'s own `!m.compile_disabled()` gate must then prevent
+/// every one of the other 99,999 calls from ever reaching
+/// `eligibility_detail` again.
+#[test]
+fn compile_disabled_churn() {
+    let bin = PathBuf::from(env!("CARGO_BIN_EXE_macvm"));
+    let world_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("world");
+    let script = world_dir.join("bench").join("churn.mst");
+
+    let out = Command::new(bin)
+        .args([
+            "run",
+            script.to_str().unwrap(),
+            "--world",
+            world_dir.to_str().unwrap(),
+        ])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .env("MACVM_JIT", "threshold=1")
+        .env("MACVM_TRACE", "jit")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("spawn macvm");
+
+    assert!(
+        out.status.success(),
+        "churn.mst must run to completion, got status {:?}\nstderr:\n{}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("result: 21"),
+        "1+2+3+4+5+6 = 21, unaffected by the compile attempts, got stdout:\n{stdout}"
+    );
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let disabled_lines = stderr
+        .lines()
+        .filter(|l| l.contains("tooManyArgs:bar:baz:qux:quux:corge:"))
+        .count();
+    assert_eq!(
+        disabled_lines, 1,
+        "eligibility_detail must run exactly once across all 100,000 calls -- \
+         activate_method's own compile_disabled() gate must prevent every \
+         later call from re-attempting it, got {disabled_lines} occurrences \
+         in stderr:\n{stderr}"
+    );
+}
+
+/// tests_s10.md's "Debug-build frame asserts": process-stack sp unchanged
+/// by a compiled call except the argc+1->1 replacement. The assertion
+/// itself already lives in `enter_compiled` (`compiled_call.rs`'s own
+/// `debug_assert_eq!`, exercised by every debug-build test in this whole
+/// suite that ever takes the `Completed` path) -- this test exists to
+/// give that property an explicit, named, findable regression home rather
+/// than leaving it purely incidental, and to check it across more than
+/// one argc (0, 1, 3), not just the argc=1 shape every other test in this
+/// file happens to use.
+#[test]
+fn compiled_entry_stack_discipline_across_argc() {
+    for argc in [0u8, 1, 3] {
+        let mut vm = test_vm();
+        let mut b = BytecodeBuilder::new();
+        b.push_self();
+        b.ret_self();
+        let sel = vm.universe.intern(format!("argc{argc}Method").as_bytes());
+        let method = b.finish(&mut vm, sel, argc as usize, 0);
+        assert!(
+            driver::eligible(&vm, method),
+            "argc={argc}: ^self must be eligible (no sends, no closures, argc<=5)"
+        );
+
+        let smi_klass = vm.universe.smi_klass;
+        let id = driver::compile_method(&mut vm, smi_klass, method)
+            .unwrap_or_else(|| panic!("argc={argc}: must compile"));
+
+        let recv = SmallInt::new(argc as i64).oop();
+        vm.stack.push(recv);
+        for a in 0..argc {
+            vm.stack.push(SmallInt::new(a as i64).oop());
+        }
+
+        let sp_before = vm.stack.sp;
+        let result = macvm::interpreter::compiled_call::enter_compiled(&mut vm, id, argc);
+        assert_eq!(
+            result,
+            macvm::interpreter::compiled_call::EnterResult::Completed,
+            "argc={argc}"
+        );
+        assert_eq!(
+            vm.stack.sp,
+            sp_before - argc as usize,
+            "argc={argc}: net stack effect must be exactly argc+1 -> 1 \
+             (popped receiver+args, pushed one result)"
+        );
+        assert_eq!(
+            vm.stack.pop(),
+            recv,
+            "argc={argc}: ^self must return the receiver"
+        );
+    }
 }

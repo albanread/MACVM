@@ -219,13 +219,25 @@ impl Ir {
                 }
             }
             Ir::Ret { val } => f(*val),
+            // `self` is always `VReg(0)` by this module's own construction
+            // (`convert()`'s `let self_vreg = VReg(0);` below) -- RetSelf
+            // reads it exactly like `Ret{val}` reads `val`. Omitting this
+            // use let regalloc's `compute_intervals` treat self as
+            // dead-on-arrival (a trivial `[def,def]` interval) whenever a
+            // later argc param's own `Param` vreg outlived it and got
+            // handed the same register on retire -- emit.rs's sequential
+            // (not parallel) ABI-register shuffle would then clobber that
+            // register before `RetSelf`'s own "nothing to do" handler ever
+            // ran, so a compiled `^self` could return the wrong value
+            // whenever an explicit argument went unused (found via
+            // `compiled_entry_stack_discipline_across_argc`).
+            Ir::RetSelf => f(VReg(0)),
             Ir::ConstSmi { .. }
             | Ir::ConstPool { .. }
             | Ir::Param { .. }
             | Ir::Jump { .. }
             | Ir::Alloc { .. }
             | Ir::Poll
-            | Ir::RetSelf
             | Ir::Bailout { .. } => {}
         }
     }
