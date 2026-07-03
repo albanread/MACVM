@@ -438,6 +438,21 @@ pub fn scavenge(vm: &mut VmState) -> Result<ScavengeReport, GcStallError> {
     super::roots::for_each_root(vm, scavenge_oop);
     dirty_card_scan(vm, old_top_before);
 
+    // S10 D8: nmethod literal-pool oops are roots too (method literals are
+    // usually tenured by compile time but not guaranteed) — scanned here,
+    // still within the root-scan step, so anything reachable only from a
+    // compiled method's pool is copied before the Cheney loop below starts
+    // consuming `to`-space. `code_table` is taken out for the duration so
+    // the closure can hold `vm` mutably (`scavenge_oop` needs the whole
+    // state); empty for every run until S10 step 7 ever installs an
+    // nmethod, so this is a no-op loop over an empty `Vec` until then.
+    let mut code_table = std::mem::take(&mut vm.code_table);
+    code_table.oops_do(&mut |word| {
+        let oop = Oop::from_raw(*word);
+        *word = scavenge_oop(vm, oop).raw();
+    });
+    vm.code_table = code_table;
+
     if let Some(err) = vm.universe.pending_stall.take() {
         return Err(err);
     }

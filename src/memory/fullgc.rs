@@ -90,6 +90,15 @@ fn mark(vm: &mut VmState) -> usize {
         oop
     });
 
+    // S10 D8: nmethod literal-pool oops are roots too. `mark_push` needs no
+    // `vm` (unlike `scavenge_oop`), so unlike scavenge.rs's integration this
+    // needs no `std::mem::take` — `vm.code_table` and the rest of `vm` are
+    // never touched at the same time.
+    vm.code_table.oops_do(&mut |word| {
+        let oop = Oop::from_raw(*word);
+        mark_push(oop, &mut stack, &mut marked_bytes);
+    });
+
     while let Some(obj) = stack.pop() {
         let klass_field = obj.klass_oop();
         mark_push(klass_field, &mut stack, &mut marked_bytes);
@@ -434,6 +443,20 @@ pub fn full_gc(vm: &mut VmState) -> Result<FullGcReport, GcStallError> {
     {
         rewrite_entry(e);
     }
+    // S10 D8: nmethod literal-pool oops, same treatment as every other
+    // root — `forward_chase` reads phase B's already-computed (not yet
+    // applied) forwarding addresses, so this belongs in phase C alongside
+    // `for_each_root` above, ahead of phase D's actual slide. `forward_chase`
+    // needs no `vm` (like `mark_push`, unlike `scavenge_oop`), so this is a
+    // direct call, no `std::mem::take` needed. `key_klass`/`key_selector`
+    // are Rust-side root oops too (strong until S12, D8's own
+    // SPEC-QUESTION) — `rehash` afterward is mandatory: it rebuilds
+    // `by_key` from the post-forwarding values `update_keys` just wrote.
+    vm.code_table.oops_do(&mut |word| {
+        *word = forward_chase(Oop::from_raw(*word)).raw();
+    });
+    vm.code_table.update_keys(&mut forward_chase);
+    vm.code_table.rehash();
     super::verify::dbg_oop_trace(vm, "full-gc-rewrite");
 
     // --- D ------------------------------------------------------------

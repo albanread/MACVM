@@ -17,6 +17,7 @@
 #![allow(unsafe_code)]
 
 pub mod guard;
+pub mod nmethod;
 pub mod stubs;
 
 use std::collections::BTreeMap;
@@ -31,6 +32,11 @@ use guard::JitWriteGuard;
 fn round_up16(n: usize) -> usize {
     (n + 15) & !15
 }
+
+/// `VmState::with_options`'s unconditional reservation (S10 D6) — paid even
+/// under `JitMode::Off`, since it's one `mmap` reservation, not a working
+/// set: nothing is written until the first real `publish`.
+pub const DEFAULT_CODE_CACHE_CAPACITY: usize = 1 << 20;
 
 /// A reservation within a [`CodeCache`]'s region. `len` is how much space
 /// this handle actually owns — which may exceed what was requested from

@@ -6,6 +6,8 @@ use std::collections::HashSet;
 use std::io::Write;
 use std::time::Instant;
 
+use crate::codecache::nmethod::CodeTable;
+use crate::codecache::{CodeCache, DEFAULT_CODE_CACHE_CAPACITY};
 use crate::interpreter::stack::{ProcessStack, DEFAULT_STACK_CAPACITY};
 use crate::memory::Universe;
 use crate::oops::wrappers::MethodOop;
@@ -342,6 +344,14 @@ pub struct VmState {
     /// this struct moving; `HandleScope` points directly at the box's
     /// pointee.
     pub handle_arena: Box<crate::memory::handles::HandleArena>,
+    /// The one `MAP_JIT` region tier-1 compiled methods and their stubs
+    /// live in (S10 D6). Reserved unconditionally in [`VmState::with_options`]
+    /// regardless of `options.jit` — one `mmap`, nothing written until the
+    /// first real `publish`.
+    pub code_cache: CodeCache,
+    /// Installed nmethods, keyed by `(receiver klass, selector)` (S10 D6,
+    /// D8). Empty for the lifetime of a `JitMode::Off` run.
+    pub code_table: CodeTable,
 }
 
 impl VmState {
@@ -377,6 +387,9 @@ impl VmState {
             next_frame_serial: 0,
             dbg_oop: None,
             handle_arena: Box::new(crate::memory::handles::HandleArena::new()),
+            code_cache: CodeCache::new(DEFAULT_CODE_CACHE_CAPACITY)
+                .expect("VmState::with_options: failed to reserve JIT code cache"),
+            code_table: CodeTable::new(),
         };
         crate::runtime::globals::bootstrap_well_known(&mut vm);
         vm
