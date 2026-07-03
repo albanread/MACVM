@@ -436,3 +436,88 @@ fn compiled_plus_arg_executes_correctly() {
         "overflowing smi add must return the BAILOUT sentinel"
     );
 }
+
+/// The current AArch64 native stack pointer — `sp` never appears as an
+/// ordinary register operand (AArch64 requires `mov`/add-immediate forms
+/// for it), so reading it needs one inline-asm instruction; this whole
+/// file already carries the crate's "allowed unsafe" exemption for exactly
+/// this kind of raw-machine-state check.
+fn native_sp() -> u64 {
+    let sp: u64;
+    unsafe {
+        std::arch::asm!("mov {}, sp", out(reg) sp);
+    }
+    sp
+}
+
+/// tests_s10.md's `compiled_frame_teardown_exact`: the native stack
+/// pointer must be EXACTLY where it was before `enter_compiled`, both
+/// after a normal (non-bailout) return and after a bailout — the call
+/// stub's own prologue/epilogue and the compiled method's own frame
+/// (`sub sp,sp,#frame_bytes` / `mov sp,x29`) must net to zero either way,
+/// since both paths share the same epilogue (emit.rs's own `Ret`/
+/// `Bailout` handling both just `b` to it). An imbalance here would
+/// silently corrupt the REST of this process's native call stack — not
+/// just this one call — so this is checked directly rather than inferred
+/// from "the test suite didn't crash".
+#[test]
+fn compiled_frame_teardown_exact() {
+    let mut vm = test_vm();
+    let plus_sel = vm.universe.intern(b"+");
+
+    let mut b = BytecodeBuilder::new();
+    b.push_self();
+    b.push_temp(0);
+    b.send(&mut vm, plus_sel, 1);
+    b.ret_tos();
+    let m_sel = vm.universe.intern(b"plusArg:");
+    let method = b.finish(&mut vm, m_sel, 1, 0);
+
+    let plus_target_body = {
+        let mut pb = BytecodeBuilder::new();
+        pb.ret_self();
+        let m = pb.finish(&mut vm, plus_sel, 1, 0);
+        m.set_primitive(1);
+        m
+    };
+    let smi_klass = vm.universe.smi_klass;
+    let epoch = vm.ic_epoch;
+    InterpreterIc::at(method, 0).set_mono(&mut vm, smi_klass, plus_target_body, epoch);
+
+    let id = driver::compile_method(&mut vm, smi_klass, method).expect("must compile");
+
+    // Normal (non-bailout) call.
+    vm.stack.push(SmallInt::new(5).oop());
+    vm.stack.push(SmallInt::new(37).oop());
+    let sp_before = native_sp();
+    let result = macvm::interpreter::compiled_call::enter_compiled(&mut vm, id, 1);
+    let sp_after = native_sp();
+    assert_eq!(
+        sp_before, sp_after,
+        "native sp must be exactly restored after a normal compiled return"
+    );
+    assert_eq!(
+        result,
+        macvm::interpreter::compiled_call::EnterResult::Completed
+    );
+    assert_eq!(vm.stack.pop(), SmallInt::new(42).oop());
+
+    // Bailout call (overflowing operands).
+    let big = SmallInt::new(SmallInt::MAX);
+    vm.stack.push(big.oop());
+    vm.stack.push(big.oop());
+    let sp_before2 = native_sp();
+    let result2 = macvm::interpreter::compiled_call::enter_compiled(&mut vm, id, 1);
+    let sp_after2 = native_sp();
+    assert_eq!(
+        sp_before2, sp_after2,
+        "native sp must be exactly restored after a bailout too -- same shared epilogue"
+    );
+    assert_eq!(
+        result2,
+        macvm::interpreter::compiled_call::EnterResult::Bailout
+    );
+    // Bailout leaves vm.stack untouched (still [receiver, arg]).
+    assert_eq!(vm.stack.pop(), big.oop());
+    assert_eq!(vm.stack.pop(), big.oop());
+}
