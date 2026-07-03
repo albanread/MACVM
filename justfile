@@ -91,3 +91,32 @@ run-world-tests:
 soak-s08:
     sed '$s/.*/Soak run: 200000./' world/bench/soak.mst > /tmp/macvm_soak_1hr.mst
     MACVM_TRACE=gc cargo run --release --quiet -- run /tmp/macvm_soak_1hr.mst --world world
+
+# S10 gate item 3 (perf marker, tracking not gating): world/bench/arith.mst's
+# sumTo: 5_000_000 timed under MACVM_JIT=off vs threshold=1, --release (debug
+# timing is noise, not signal). A shebang recipe, not just's default
+# line-per-subprocess execution (each line of a plain recipe runs in its own
+# shell, so a variable set on one line isn't visible on the next) -- needed
+# here since interp_ms and jit_ms both have to survive to the same final
+# append line.
+bench-s10:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    interp_out=$(MACVM_JIT=off cargo run --release --quiet -- run world/bench/arith.mst --world world)
+    jit_out=$(MACVM_JIT=threshold=1 cargo run --release --quiet -- run world/bench/arith.mst --world world)
+    interp_ms=$(echo "$interp_out" | grep -o 'ms: [0-9]*' | grep -o '[0-9]*')
+    jit_ms=$(echo "$jit_out" | grep -o 'ms: [0-9]*' | grep -o '[0-9]*')
+    ratio=$(echo "scale=2; $interp_ms / $jit_ms" | bc)
+    date_str=$(date +%Y-%m-%d)
+    commit=$(git rev-parse --short HEAD)
+    echo "| $date_str | $commit | $interp_ms | $jit_ms | ${ratio}x |" >> docs/PERF.md
+    echo "arith bench: interp_ms=$interp_ms jit_ms=$jit_ms ratio=${ratio}x"
+    below2=$(echo "$ratio < 2" | bc)
+    below5=$(echo "$ratio < 5" | bc)
+    if [ "$below2" = "1" ]; then
+        echo "FAIL: compiled speedup ${ratio}x is below the 2x architectural-mistake tripwire" >&2
+        exit 1
+    fi
+    if [ "$below5" = "1" ]; then
+        echo "WARN: compiled speedup ${ratio}x is below the 5x target (tracking only, not gating)"
+    fi

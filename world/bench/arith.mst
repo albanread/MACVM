@@ -1,0 +1,51 @@
+"arith.mst — sprint_s10_detail.md perf marker (tests_s10.md gate item 3):
+ sumTo: 1 to: n do: [:i | s := s + i], a send-free (once compiled) smi
+ arithmetic kernel exercising SmiArith Add, the inlined to:do: SmiCmpBr,
+ and Poll at the loop back-edge -- D1's own point.
+
+ callSumTo: exists so all three sumTo: invocations below (two warm-up,
+ one timed) share the exact same call site/IC slot, not three textually
+ separate ones: under MACVM_JIT=threshold=1 a send site's own compile
+ trigger only fires once its target's inner ICs are already warm (an
+ eligibility fact interpreter::send's own tests establish, not specific
+ to this benchmark), so the FIRST call through any given site always
+ declines and runs interpreted, and a site that had never been used
+ before would do that even if the same underlying method were already
+ compiled via some other site. Sharing one site means: call 1 warms
+ sumTo:'s own inner `+`/`<=` ICs; call 2's trigger fires (those ICs are
+ warm now), compiles, and rewrites this shared site to the compiled
+ entry; call 3 -- the timed one -- hits that already-compiled entry
+ directly, with no compile overhead mixed into the measurement. Under
+ MACVM_JIT=off callSumTo: costs one extra negligible interpreted dispatch
+ either way, so it does not bias the comparison.
+
+ Brackets the timed run with millisecondClock, matching sieve.mst's own
+ convention. Not in world.list; `macvm run world/bench/arith.mst --world
+ world` loads it explicitly."
+
+Object subclass: Arith [
+    Arith class >> sumTo: n [
+        | s |
+        s := 0.
+        1 to: n do: [:i | s := s + i].
+        ^s
+    ]
+    Arith class >> callSumTo: n [
+        ^self sumTo: n
+    ]
+    Arith class >> runTimed [
+        | startMs endMs result |
+        self callSumTo: 3.
+        self callSumTo: 3.
+        startMs := Smalltalk millisecondClock.
+        result := self callSumTo: 5000000.
+        endMs := Smalltalk millisecondClock.
+        Transcript show: 'ms: '.
+        Transcript show: (endMs - startMs) printString.
+        Transcript cr.
+        ^result
+    ]
+]
+
+Transcript show: Arith runTimed printString.
+Transcript cr.

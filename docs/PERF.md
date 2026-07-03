@@ -53,3 +53,20 @@ library sprint, not an interpreter-optimization one.
   this baseline is "fails as measured, passes with the counter removed
   from the hot path" — recorded for whoever picks up interpreter
   throughput work later.
+
+# S10 tier-1 JIT — perf marker
+
+Recorded per `tests_s10.md`'s "Perf marker" procedure (SPRINTS standing
+rule 3: **tracking, not gating**). `world/bench/arith.mst`'s
+`sumTo: 5_000_000` — a send-free, once-compiled smi arithmetic kernel
+(`SmiArith Add`, the inlined `to:do:`'s `SmiCmpBr`, `Poll` at the loop
+back-edge) — timed via `millisecondClock` after two small warm-up calls
+through the same call site (so the compile itself never lands inside the
+timed window), under `MACVM_JIT=off` vs `MACVM_JIT=threshold=1`, via
+`just bench-s10` (`--release`). The gate WARNS below 5x and FAILS only
+below 2x (an architectural-mistake tripwire, not a perf gate — gate item
+3 of tests_s10.md's acceptance gate).
+
+| Date | Commit | interp_ms | jit_ms | ratio |
+|---|---|---|---|---|
+| 2026-07-03 | 177abf1 | 1221 | 9 | 135.66x |
