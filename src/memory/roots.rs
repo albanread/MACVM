@@ -47,13 +47,28 @@ where
     // --- well-known selectors (separate Universe-field copies of Symbols
     // already covered by the symbol-table root below — S7-10 root-scan gap:
     // these dangle on their own after the first collection otherwise) ------
+    //
+    // Rewrapped via `from_oop_unchecked`, not the validating `try_from`
+    // (found via a genuine full-GC bug running real source, not a defensive
+    // guess): `try_from` confirms shape by reading the CANDIDATE'S OWN
+    // klass field's format — a second hop. For the scavenger's transform
+    // that's harmless (an eagerly-copied object's new address is already
+    // fully populated), but for full GC's phase C the transform is
+    // forward-chase, which can return an address phase D hasn't copied
+    // ANY bytes to yet — reading through it is invariant F3's exact trap,
+    // one more call site than `fullgc::rewrite_entry` already covered.
+    // The unchecked cast is sound regardless: this root was symbol/klass/
+    // method-shaped before the collection, and a collector transform never
+    // changes an object's TYPE, only (at most) its address — re-deriving
+    // that already-known shape by reading memory is pure redundancy that
+    // happens to be unsafe in exactly this one case.
     macro_rules! root_sel {
         ($($field:ident),* $(,)?) => {
             $(
                 let s = vm.universe.$field.oop();
                 let ns = f(vm, s);
-                vm.universe.$field = SymbolOop::try_from(ns)
-                    .expect(concat!(stringify!($field), " must stay symbol-shaped"));
+                // SAFETY: see the comment above this macro.
+                vm.universe.$field = unsafe { SymbolOop::from_oop_unchecked(ns) };
             )*
         };
     }
@@ -69,8 +84,8 @@ where
             $(
                 let k = vm.universe.$field.oop();
                 let nk = f(vm, k);
-                vm.universe.$field = KlassOop::try_from(nk)
-                    .expect(concat!(stringify!($field), " must stay klass-shaped"));
+                // SAFETY: see root_sel!'s comment above — identical reasoning.
+                vm.universe.$field = unsafe { KlassOop::from_oop_unchecked(nk) };
             )*
         };
     }
@@ -148,7 +163,10 @@ where
     // (S7-10) --------------------------------------------------------------
     if let Some(m) = vm.regs.method {
         let nm = f(vm, m.oop());
-        vm.regs.method =
-            Some(MethodOop::try_from(nm).expect("regs.method must stay method-shaped"));
+        // SAFETY: see root_sel!'s comment above (same reasoning) — found by
+        // this EXACT root, running `Smalltalk gcFull` from real source with
+        // a genuine executing frame: the synthetic fullgc.rs unit tests
+        // never set vm.regs.method, so they could never have caught this.
+        vm.regs.method = Some(unsafe { MethodOop::from_oop_unchecked(nm) });
     }
 }

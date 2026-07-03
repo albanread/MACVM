@@ -1,7 +1,11 @@
 "20_system.mst — System (sprint_s06_detail.md #20). SystemDictionary reopen:
  startUp is a no-op hook (Character's table etc. are already initialized by
- their own files' doIts, well before this loads); quit:/gcScavenge/gcFull
- install onto Smalltalk itself so scripts can say `Smalltalk gcFull`."
+ their own files' doIts, well before this loads); quit:/gcScavenge/gcFull/
+ gcStats install onto Smalltalk itself so scripts can say `Smalltalk gcFull`.
+ gcStats (S8) answers an Array of 8 smis, SPEC-pinned order: scavengeCount,
+ fullGcCount, edenUsed, oldUsed, oldCommitted, bytesPromoted,
+ markedBytesLast, contextAllocs — the soak harness and S14's Context-
+ elision gate both index into it by position."
 
 Object subclass: SystemDictionary [
     startUp [
@@ -18,6 +22,9 @@ Object subclass: SystemDictionary [
     ]
     gcFull [
         <primitive: 94>
+    ]
+    gcStats [
+        <primitive: 97>
     ]
     millisecondClock [
         <primitive: 92>

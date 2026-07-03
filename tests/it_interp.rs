@@ -320,6 +320,7 @@ fn trace_mode_smoke() {
         heap_mib: 64,
         trace: macvm::runtime::TraceFlags::parse("bytecode"),
         gc_stress: false,
+        gc_stress_full_period: None,
         eden_kb: None,
     });
     let m = build_diamond(&mut vm);

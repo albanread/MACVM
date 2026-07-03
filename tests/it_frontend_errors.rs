@@ -11,6 +11,7 @@ fn test_vm() -> VmState {
         heap_mib: 64,
         trace: Default::default(),
         gc_stress: false,
+        gc_stress_full_period: None,
         eden_kb: None,
     })
 }

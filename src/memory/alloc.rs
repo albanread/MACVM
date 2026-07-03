@@ -150,7 +150,11 @@ pub(crate) fn alloc_indexable_bytes_raw(
 /// whatever the retry happened to copy to that address instead). So this
 /// is always fatal, matching the pre-existing "old gen truly out of room"
 /// exit path one step down in the same cascade.
-fn stall_exit(err: crate::memory::stall::GcStallError) -> ! {
+///
+/// `pub(crate)`, not private: `runtime::primitives`' `gcScavenge` calls a
+/// scavenge directly (not through the allocation cascade), so it needs the
+/// exact same terminal handling on a stall rather than a second copy.
+pub(crate) fn stall_exit(err: crate::memory::stall::GcStallError) -> ! {
     eprintln!("{err}");
     std::process::exit(70);
 }
@@ -228,6 +232,24 @@ pub fn alloc_words(vm: &mut VmState, words: usize, klass: Oop, tagged: bool) -> 
         ensure_promotion_guarantee(vm);
         if let Err(err) = crate::memory::scavenge::scavenge(vm) {
             stall_exit(err);
+        }
+    }
+
+    // `MACVM_GC_STRESS=full[:N]` (S8 step 8): mutually exclusive with the
+    // `=1` scavenge-stress hook above (env parsing only ever sets one of
+    // `gc_stress`/`gc_stress_full_period`) — a full GC every Nth allocation
+    // through this same choke point, the harness that exercises phase C's
+    // reference-rewrite path (and found the `for_each_root` bug fixed in
+    // this same sprint pass: the scavenger-only `=1` mode never calls
+    // `full_gc` at all, so it could never have caught it).
+    if let Some(period) = vm.options.gc_stress_full_period {
+        if vm.universe.gc_enabled {
+            vm.universe.full_stress_alloc_count += 1;
+            if vm.universe.full_stress_alloc_count >= period {
+                vm.universe.full_stress_alloc_count = 0;
+                crate::memory::fullgc::full_gc(vm)
+                    .expect("full_gc: pure compaction never returns Err (see its own doc)");
+            }
         }
     }
 
@@ -439,6 +461,7 @@ mod tests {
             heap_mib: 64,
             trace: Default::default(),
             gc_stress: false,
+            gc_stress_full_period: None,
             eden_kb: None,
         })
     }
@@ -593,6 +616,7 @@ mod tests {
             heap_mib: 64,
             trace: Default::default(),
             gc_stress: false,
+            gc_stress_full_period: None,
             eden_kb: Some(20 * 1024), // > OLD_INITIAL_SEGMENT's 16 MiB
         });
         assert!(

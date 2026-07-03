@@ -86,6 +86,11 @@ pub struct Universe {
     /// reads this to tell the two apart: a `ScavengePromote` stall is only
     /// a guarantee VIOLATION (debug-assert-worthy) when this was `true`.
     pub promotion_guarantee_met: bool,
+    /// S8 step 8: allocations through `alloc_words` since the last
+    /// `MACVM_GC_STRESS=full[:N]` trigger — compared against
+    /// `VmOptions::gc_stress_full_period` to decide when to run one. Plain
+    /// count, not bytes (matches the doc's "every N allocations" wording).
+    pub full_stress_alloc_count: u64,
 
     pub nil_obj: Oop,
     pub true_obj: Oop,
@@ -606,6 +611,7 @@ impl Universe {
             gc_enabled: false, // flipped true just before genesis() returns (SPEC §7.3 A1)
             pending_stall: None,
             promotion_guarantee_met: true,
+            full_stress_alloc_count: 0,
             nil_obj: nil,
             true_obj: true_obj.oop(),
             false_obj: false_obj.oop(),
@@ -882,6 +888,7 @@ mod tests {
             heap_mib: 64,
             trace: Default::default(),
             gc_stress: false,
+            gc_stress_full_period: None,
             eden_kb: None,
         })
     }

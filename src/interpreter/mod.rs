@@ -479,6 +479,7 @@ mod tests {
             heap_mib: 64,
             trace: Default::default(),
             gc_stress: false,
+            gc_stress_full_period: None,
             eden_kb: None,
         })
     }
@@ -500,6 +501,7 @@ mod tests {
             heap_mib: 64,
             trace: crate::runtime::vm_state::TraceFlags::parse("count"),
             gc_stress: false,
+            gc_stress_full_period: None,
             eden_kb: None,
         });
         let mut b = BytecodeBuilder::new();
@@ -698,6 +700,7 @@ mod tests {
             heap_mib: 64,
             trace: crate::runtime::vm_state::TraceFlags::parse("bytecode"),
             gc_stress: false,
+            gc_stress_full_period: None,
             eden_kb: None,
         });
         let mut b = BytecodeBuilder::new();

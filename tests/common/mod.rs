@@ -8,11 +8,17 @@ use macvm::runtime::{VmOptions, VmState};
 
 #[allow(dead_code)] // not every integration test file uses every helper here
 pub fn test_vm() -> VmState {
+    // Starts from VmOptions::from_env() rather than hand-parsing
+    // MACVM_GC_STRESS here: that's what lets `MACVM_GC_STRESS=1` AND
+    // `MACVM_GC_STRESS=full[:N]` both reach every in-process test VM (S8
+    // step 8), and keeps this helper automatically correct for any future
+    // VmOptions field without needing a matching hand-rolled parse here.
+    // heap_mib/eden_kb are still fixed at test-friendly values regardless
+    // of MACVM_HEAP/MACVM_EDEN in the ambient environment.
     VmState::with_options(VmOptions {
         heap_mib: 64,
-        trace: Default::default(),
-        gc_stress: std::env::var("MACVM_GC_STRESS").ok().as_deref() == Some("1"),
         eden_kb: None,
+        ..VmOptions::from_env()
     })
 }
 

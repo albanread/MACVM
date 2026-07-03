@@ -370,7 +370,7 @@ pub static PRIMITIVES: &[PrimDesc] = &[
         name: "gcScavenge",
         f: prim_gc_scavenge,
         argc: 0,
-        can_allocate: false,
+        can_allocate: true,
         can_fail: false,
     },
     PrimDesc {
@@ -378,7 +378,7 @@ pub static PRIMITIVES: &[PrimDesc] = &[
         name: "gcFull",
         f: prim_gc_full,
         argc: 0,
-        can_allocate: false,
+        can_allocate: true,
         can_fail: false,
     },
     PrimDesc {
@@ -395,6 +395,14 @@ pub static PRIMITIVES: &[PrimDesc] = &[
         f: prim_quit_colon,
         argc: 1,
         can_allocate: false,
+        can_fail: false,
+    },
+    PrimDesc {
+        id: 97,
+        name: "gcStats",
+        f: prim_gc_stats,
+        argc: 0,
+        can_allocate: true,
         can_fail: false,
     },
     // --- Double group (S6, SPEC §1.3) ------------------------------------
@@ -976,15 +984,56 @@ fn prim_millisecond_clock(vm: &mut VmState, _args: &[Oop]) -> PrimResult {
     PrimResult::Ok(SmallInt::new(millis).oop())
 }
 
-/// No-op until S7's real collector exists — S6's library only needs these
-/// selectors to resolve (`Smalltalk gcFull` in test/bench code), not to
-/// actually reclaim anything yet.
-fn prim_gc_scavenge(_vm: &mut VmState, args: &[Oop]) -> PrimResult {
+/// `Smalltalk gcScavenge` (SPEC §10 system group): runs one young-gen
+/// collection, answers the receiver. A stall here is handled exactly like
+/// the allocation cascade's own terminal stall (`alloc::stall_exit`) — an
+/// explicit `gcScavenge` call finding no way forward is just as fatal as
+/// one the allocator triggered itself, not a different situation.
+fn prim_gc_scavenge(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    if let Err(err) = crate::memory::scavenge::scavenge(vm) {
+        alloc::stall_exit(err);
+    }
     PrimResult::Ok(args[0])
 }
 
-fn prim_gc_full(_vm: &mut VmState, args: &[Oop]) -> PrimResult {
+/// `Smalltalk gcFull` (SPEC §10 system group): runs the full mark-slide-
+/// compact collection, answers the receiver. `full_gc` never actually
+/// returns `Err` (pure compaction needs no new memory — see its own doc);
+/// the `expect` documents that rather than silently discarding a `Result`.
+fn prim_gc_full(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    crate::memory::fullgc::full_gc(vm)
+        .expect("full_gc: pure compaction never returns Err (see its own doc)");
     PrimResult::Ok(args[0])
+}
+
+/// `Smalltalk gcStats` (SPEC §10 dev hook, S8): answers an 8-element Array
+/// of smis in the SPEC-pinned order `(scavengeCount fullGcCount edenUsed
+/// oldUsed oldCommitted bytesPromoted markedBytesLast contextAllocs)` —
+/// used by the soak harness and S14's Context-elision gate, which both
+/// index into it by POSITION, so this order is load-bearing, not
+/// cosmetic. `can_allocate: true` (the result Array itself allocates); no
+/// arg oops are read after the allocation, so there is nothing here for
+/// that to invalidate.
+fn prim_gc_stats(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    let smi = |v: u64| SmallInt::new(v as i64).oop();
+    let u = &vm.universe;
+    let fields = [
+        smi(u.gc_stats.scavenge_count),
+        smi(u.gc_stats.full_gc_count),
+        smi((u.eden.top - u.eden.start) as u64),
+        smi((u.old.top - u.old.bounds.start) as u64),
+        smi((u.old.committed_end - u.old.bounds.start) as u64),
+        smi(u.gc_stats.bytes_promoted),
+        smi(u.gc_stats.marked_bytes_last),
+        smi(u.gc_stats.context_allocs),
+    ];
+    let array_klass = vm.universe.array_klass;
+    let result = alloc::alloc_indexable_oops(vm, array_klass, fields.len());
+    for (i, &v) in fields.iter().enumerate() {
+        result.at_put(i, v);
+    }
+    let _ = args;
+    PrimResult::Ok(result.oop())
 }
 
 /// SPEC §6.3: prints the message + a VM stack trace, terminates. Never
@@ -1151,6 +1200,7 @@ mod tests {
             heap_mib: 64,
             trace: Default::default(),
             gc_stress: false,
+            gc_stress_full_period: None,
             eden_kb: None,
         })
     }
@@ -1217,6 +1267,7 @@ mod tests {
             (94, "gcFull"),
             (95, "error:"),
             (96, "quit:"),
+            (97, "gcStats"),
             (100, "+"),
             (101, "-"),
             (102, "*"),
@@ -1659,5 +1710,77 @@ mod tests {
         let result = call(110, &mut vm, &[s.oop()]);
         let expected = vm.universe.intern(b"foo").oop();
         assert_eq!(result, PrimResult::Ok(expected));
+    }
+
+    /// `Smalltalk gcScavenge` must run a REAL scavenge (id 93), not the old
+    /// no-op stub — proven by the counter it bumps, not just "didn't crash".
+    #[test]
+    fn prim_gc_scavenge_runs_a_real_scavenge() {
+        let mut vm = test_vm();
+        let recv = vm.universe.nil_obj;
+        let before = vm.universe.gc_stats.scavenge_count;
+        assert_eq!(call(93, &mut vm, &[recv]), PrimResult::Ok(recv));
+        assert_eq!(vm.universe.gc_stats.scavenge_count, before + 1);
+    }
+
+    /// `Smalltalk gcFull` must run a REAL full GC (id 94) — same shape as
+    /// the scavenge test above, this time against `fullGcCount`.
+    #[test]
+    fn prim_gc_full_runs_a_real_full_gc() {
+        let mut vm = test_vm();
+        let recv = vm.universe.nil_obj;
+        let before = vm.universe.gc_stats.full_gc_count;
+        assert_eq!(call(94, &mut vm, &[recv]), PrimResult::Ok(recv));
+        assert_eq!(vm.universe.gc_stats.full_gc_count, before + 1);
+    }
+
+    /// `Smalltalk gcStats` (id 97) answers an 8-smi Array in the SPEC-pinned
+    /// order — checked both structurally (an Array of exactly 8 smis) and
+    /// against the actual counters after a real scavenge + full GC, so a
+    /// field silently swapped to the wrong position would fail this, not
+    /// just "returns something array-shaped".
+    #[test]
+    fn prim_gc_stats_reports_pinned_fields_in_order() {
+        let mut vm = test_vm();
+        let recv = vm.universe.nil_obj;
+        call(93, &mut vm, &[recv]); // one scavenge
+        call(94, &mut vm, &[recv]); // one full GC
+
+        // Snapshot expectations BEFORE calling gcStats: the primitive
+        // itself allocates its own result Array (in eden), so reading
+        // eden's usage back out AFTER the call would include that very
+        // allocation — gcStats correctly reports the state as of the
+        // moment it was called, not after its own side effect.
+        let expected = (
+            vm.universe.gc_stats.scavenge_count as i64,
+            vm.universe.gc_stats.full_gc_count as i64,
+            (vm.universe.eden.top - vm.universe.eden.start) as i64,
+            (vm.universe.old.top - vm.universe.old.bounds.start) as i64,
+            (vm.universe.old.committed_end - vm.universe.old.bounds.start) as i64,
+            vm.universe.gc_stats.bytes_promoted as i64,
+            vm.universe.gc_stats.marked_bytes_last as i64,
+            vm.universe.gc_stats.context_allocs as i64,
+        );
+
+        let result = call(97, &mut vm, &[recv]);
+        let PrimResult::Ok(oop) = result else {
+            panic!("gcStats must succeed, got {result:?}")
+        };
+        let arr = ArrayOop::try_from(oop).expect("gcStats must answer an Array");
+        assert_eq!(arr.len(), 8);
+        let as_i64 = |i: usize| {
+            SmallInt::try_from(arr.at(i))
+                .expect("every field is a smi")
+                .value()
+        };
+
+        assert_eq!(as_i64(0), expected.0, "scavengeCount");
+        assert_eq!(as_i64(1), expected.1, "fullGcCount");
+        assert_eq!(as_i64(2), expected.2, "edenUsed");
+        assert_eq!(as_i64(3), expected.3, "oldUsed");
+        assert_eq!(as_i64(4), expected.4, "oldCommitted");
+        assert_eq!(as_i64(5), expected.5, "bytesPromoted");
+        assert_eq!(as_i64(6), expected.6, "markedBytesLast");
+        assert_eq!(as_i64(7), expected.7, "contextAllocs");
     }
 }

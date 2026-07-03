@@ -395,6 +395,7 @@ pub fn scavenge(vm: &mut VmState) -> Result<ScavengeReport, GcStallError> {
     }
     super::verify::dbg_oop_trace(vm, "scavenge-entry");
     let start = Instant::now();
+    let eden_used_before = vm.universe.eden.top - vm.universe.eden.start;
     vm.universe.age_table.clear();
 
     let old_top_before = vm.universe.old.top;
@@ -485,12 +486,27 @@ pub fn scavenge(vm: &mut VmState) -> Result<ScavengeReport, GcStallError> {
             .expect("heap invalid at scavenge exit");
     }
     super::verify::dbg_oop_trace(vm, "scavenge-exit");
+    let pause = start.elapsed();
+
+    if vm.options.trace.is_enabled("gc") {
+        let eden_after = vm.universe.eden.top - vm.universe.eden.start;
+        eprintln!(
+            "[gc] scavenge #{}: eden {}K->{}K, copied {}K, promoted {}K, thr {}, {:.1}ms",
+            vm.universe.gc_stats.scavenge_count,
+            eden_used_before / 1024,
+            eden_after / 1024,
+            survivor_bytes / 1024,
+            promoted_bytes / 1024,
+            new_threshold,
+            pause.as_secs_f64() * 1000.0,
+        );
+    }
 
     Ok(ScavengeReport {
         survivor_bytes,
         promoted_bytes,
         new_threshold,
-        pause: start.elapsed(),
+        pause,
     })
 }
 
@@ -598,6 +614,7 @@ mod tests {
             heap_mib: 64,
             trace: Default::default(),
             gc_stress: false,
+            gc_stress_full_period: None,
             eden_kb: None,
         })
     }

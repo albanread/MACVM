@@ -474,6 +474,19 @@ pub fn full_gc(vm: &mut VmState) -> Result<FullGcReport, GcStallError> {
     }
     super::verify::dbg_oop_trace(vm, "full-gc-exit");
 
+    if vm.options.trace.is_enabled("gc") {
+        let old_committed = vm.universe.old.committed_end - vm.universe.old.bounds.start;
+        eprintln!(
+            "[gc] full #{}: marked {}M, live {}M, reclaimed {}M, old {}M, {:.1}ms",
+            vm.universe.gc_stats.full_gc_count,
+            marked_bytes / (1 << 20),
+            live_after / (1 << 20),
+            reclaimed_bytes / (1 << 20),
+            old_committed / (1 << 20),
+            pause.as_secs_f64() * 1000.0,
+        );
+    }
+
     Ok(FullGcReport {
         marked_bytes,
         live_after,
@@ -494,6 +507,7 @@ mod tests {
             heap_mib: 64,
             trace: Default::default(),
             gc_stress: false,
+            gc_stress_full_period: None,
             eden_kb: None,
         })
     }
@@ -897,6 +911,50 @@ mod tests {
             vm.dbg_oop,
             Some(moved.mem_addr()),
             "dbg_oop must follow the object to its new address"
+        );
+    }
+
+    /// A real, previously-undetected bug (found running `Smalltalk gcFull`
+    /// from actual source, not by inspection): `for_each_root` rewrapped a
+    /// forward-chased root via the VALIDATING `KlassOop`/`SymbolOop`/
+    /// `MethodOop::try_from`, which checks shape by reading through the
+    /// candidate's OWN klass field — a second hop that, during phase C, can
+    /// land on an address phase D hasn't copied any bytes to yet. Every
+    /// fullgc.rs test above sets `vm.regs.method` to `None` (none of them
+    /// run the interpreter), so none could have caught this — the method
+    /// mirror root was silently untested for the one property that
+    /// actually matters: what happens when the traced object MOVES.
+    #[test]
+    fn full_gc_moves_interp_regs_method_correctly() {
+        let mut vm = test_vm();
+        let klass = vm.universe.array_klass;
+        // A dead object ahead of it forces an actual move, same as the
+        // dbg_oop test above.
+        let dead = alloc::alloc_indexable_oops(&mut vm, klass, 0);
+        let method = alloc::alloc_method(&mut vm, 8);
+        let _ = dead;
+        let sel = vm.universe.intern(b"probe");
+        method.set_selector(sel.oop());
+        vm.regs.method = Some(method);
+
+        full_gc(&mut vm).expect("full_gc must succeed");
+
+        let moved = vm.regs.method.expect("regs.method must survive a full GC");
+        assert_ne!(
+            moved.oop().raw(),
+            method.oop().raw(),
+            "the method must have actually moved"
+        );
+        // Compare against the symbol's OWN current (post-GC) address, not
+        // `sel`'s stale pre-GC value — the symbol moved too. `intern` is
+        // idempotent, so re-interning the same name is the correct way to
+        // get its live address.
+        let sel_now = vm.universe.intern(b"probe");
+        assert_eq!(
+            moved.selector(),
+            sel_now.oop(),
+            "the moved method must still be readable — a stale reconstruction \
+             would have read garbage from an unpopulated address"
         );
     }
 }

@@ -380,6 +380,7 @@ mod tests {
             heap_mib: 64,
             trace: Default::default(),
             gc_stress: false,
+            gc_stress_full_period: None,
             eden_kb: None,
         });
         let count = verify_heap(&u).expect("post-genesis heap must verify");
@@ -393,6 +394,7 @@ mod tests {
             heap_mib: 64,
             trace: Default::default(),
             gc_stress: false,
+            gc_stress_full_period: None,
             eden_kb: None,
         });
         // Corrupt object_klass's own klass field ("Object class"'s klass,
@@ -417,6 +419,7 @@ mod tests {
             heap_mib: 64,
             trace: Default::default(),
             gc_stress: false,
+            gc_stress_full_period: None,
             eden_kb: None,
         });
         dbg_oop_trace(&vm, "unset"); // vm.dbg_oop is None: no-op
@@ -439,6 +442,7 @@ mod tests {
             heap_mib: 64,
             trace: Default::default(),
             gc_stress: false,
+            gc_stress_full_period: None,
             eden_kb: None,
         });
         verify_heap_at(&vm, VerifyPoint::Manual).expect("fresh boot must verify");
@@ -454,6 +458,7 @@ mod tests {
             heap_mib: 64,
             trace: Default::default(),
             gc_stress: false,
+            gc_stress_full_period: None,
             eden_kb: None,
         });
         let object_meta = vm.universe.object_klass.klass();
@@ -473,6 +478,7 @@ mod tests {
             heap_mib: 64,
             trace: Default::default(),
             gc_stress: false,
+            gc_stress_full_period: None,
             eden_kb: None,
         });
         vm.universe.tenuring_threshold = 0; // promote immediately

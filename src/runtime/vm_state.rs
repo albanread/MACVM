@@ -78,6 +78,15 @@ pub struct VmOptions {
     /// out invisible-root bugs (S7-9's `Handle` discipline) deterministically
     /// instead of waiting for an unlucky eden-boundary allocation.
     pub gc_stress: bool,
+    /// `MACVM_GC_STRESS=full[:N]` (S8 step 8, SPEC §12.3 item 4): run a full
+    /// mark-slide-compact collection every `N` allocations through the same
+    /// choke point (default `N` = 100 — `Some(100)` when the env var is
+    /// exactly `"full"` with no suffix). Mutually exclusive with `gc_stress`
+    /// (`=1` scavenges every allocation; `=full` full-GCs every Nth) — the
+    /// harness that flushes out the reference-rewrite class of bug
+    /// `for_each_root`'s S8-8 fix closed (found by running real source, not
+    /// by the scavenger-only `=1` mode, which never calls `full_gc` at all).
+    pub gc_stress_full_period: Option<u64>,
     /// `MACVM_EDEN=<KiB>` (S7 A1 step 3's "tests" override): eden size in
     /// KiB, overriding `layout::DEFAULT_EDEN_SIZE`. `None` keeps the
     /// default — used to shrink eden in tests so a scavenge is reachable
@@ -87,6 +96,29 @@ pub struct VmOptions {
 
 impl VmOptions {
     pub const DEFAULT_HEAP_MIB: usize = 8192;
+    /// `MACVM_GC_STRESS=full` with no `:N` suffix — SPEC §12.3's own
+    /// tunable default period.
+    pub const DEFAULT_FULL_STRESS_PERIOD: u64 = 100;
+
+    /// Pure parse of `MACVM_GC_STRESS`'s raw value into the mutually-
+    /// exclusive `(gc_stress, gc_stress_full_period)` pair — split out from
+    /// `from_env` so it's unit-testable without touching the real
+    /// environment (`tests/common/mod.rs`'s own doc comment: env mutation
+    /// races across the multi-threaded test runner, so tests only ever
+    /// READ it). `None` (the var unset) yields `(false, None)`: stress off.
+    fn parse_gc_stress(raw: Option<&str>) -> (bool, Option<u64>) {
+        let Some(s) = raw.map(str::trim) else {
+            return (false, None);
+        };
+        if s == "1" {
+            return (true, None);
+        }
+        let period = s.strip_prefix("full").and_then(|rest| match rest {
+            "" => Some(Self::DEFAULT_FULL_STRESS_PERIOD),
+            _ => rest.strip_prefix(':').and_then(|n| n.parse::<u64>().ok()),
+        });
+        (false, period)
+    }
 
     pub fn from_env() -> VmOptions {
         let heap_mib = std::env::var("MACVM_HEAP")
@@ -97,10 +129,8 @@ impl VmOptions {
             .ok()
             .map(|s| TraceFlags::parse(&s))
             .unwrap_or_default();
-        let gc_stress = std::env::var("MACVM_GC_STRESS")
-            .ok()
-            .map(|s| s.trim() == "1")
-            .unwrap_or(false);
+        let raw_gc_stress = std::env::var("MACVM_GC_STRESS").ok();
+        let (gc_stress, gc_stress_full_period) = Self::parse_gc_stress(raw_gc_stress.as_deref());
         let eden_kb = std::env::var("MACVM_EDEN")
             .ok()
             .and_then(|s| s.parse::<usize>().ok());
@@ -108,6 +138,7 @@ impl VmOptions {
             heap_mib,
             trace,
             gc_stress,
+            gc_stress_full_period,
             eden_kb,
         }
     }
@@ -119,6 +150,7 @@ impl Default for VmOptions {
             heap_mib: Self::DEFAULT_HEAP_MIB,
             trace: TraceFlags::default(),
             gc_stress: false,
+            gc_stress_full_period: None,
             eden_kb: None,
         }
     }
@@ -296,5 +328,64 @@ mod tests {
     fn vm_options_default_heap() {
         let o = VmOptions::default();
         assert_eq!(o.heap_mib, VmOptions::DEFAULT_HEAP_MIB);
+    }
+
+    #[test]
+    fn gc_stress_unset_means_off() {
+        assert_eq!(VmOptions::parse_gc_stress(None), (false, None));
+    }
+
+    #[test]
+    fn gc_stress_1_scavenges_every_alloc() {
+        assert_eq!(VmOptions::parse_gc_stress(Some("1")), (true, None));
+    }
+
+    #[test]
+    fn gc_stress_full_uses_default_period() {
+        assert_eq!(
+            VmOptions::parse_gc_stress(Some("full")),
+            (false, Some(VmOptions::DEFAULT_FULL_STRESS_PERIOD))
+        );
+    }
+
+    #[test]
+    fn gc_stress_full_with_explicit_period() {
+        assert_eq!(
+            VmOptions::parse_gc_stress(Some("full:50")),
+            (false, Some(50))
+        );
+    }
+
+    #[test]
+    fn gc_stress_modes_are_mutually_exclusive() {
+        // "1" never also sets a full-GC period, and "full[:N]" never also
+        // sets the scavenge-every-alloc bool -- every valid value picks
+        // exactly one mode, matching alloc_words' cascade (which checks
+        // both but only one is ever Some/true for a given env value).
+        let (scavenge, full) = VmOptions::parse_gc_stress(Some("full:7"));
+        assert!(!scavenge);
+        assert_eq!(full, Some(7));
+    }
+
+    #[test]
+    fn gc_stress_garbage_value_is_off() {
+        // Neither "1" nor "full"-prefixed, and "full:" with an unparseable
+        // suffix -- both must fail closed (stress off), never panic or
+        // silently pick a default the user didn't ask for.
+        assert_eq!(VmOptions::parse_gc_stress(Some("nonsense")), (false, None));
+        assert_eq!(
+            VmOptions::parse_gc_stress(Some("full:notanumber")),
+            (false, None)
+        );
+        assert_eq!(VmOptions::parse_gc_stress(Some("")), (false, None));
+    }
+
+    #[test]
+    fn gc_stress_trims_whitespace() {
+        assert_eq!(
+            VmOptions::parse_gc_stress(Some(" full:12 ")),
+            (false, Some(12))
+        );
+        assert_eq!(VmOptions::parse_gc_stress(Some(" 1 ")), (true, None));
     }
 }

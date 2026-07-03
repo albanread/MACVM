@@ -49,6 +49,7 @@ fn small_heap_boot() {
         heap_mib: 16,
         trace: Default::default(),
         gc_stress: false,
+        gc_stress_full_period: None,
         eden_kb: None,
     });
     verify::verify_heap(&vm.universe).expect("genesis must succeed in a 16 MiB reservation");
@@ -94,6 +95,7 @@ fn alloc_torture_fill() {
         heap_mib: VmOptions::DEFAULT_HEAP_MIB,
         trace: Default::default(),
         gc_stress: false,
+        gc_stress_full_period: None,
         eden_kb: None,
     });
     let target = vm.universe.eden.end - (1 << 20); // stop ~1 MiB below capacity
@@ -156,12 +158,14 @@ fn genesis_is_deterministic() {
         heap_mib: 64,
         trace: Default::default(),
         gc_stress: false,
+        gc_stress_full_period: None,
         eden_kb: None,
     });
     let vm2 = VmState::with_options(VmOptions {
         heap_mib: 64,
         trace: Default::default(),
         gc_stress: false,
+        gc_stress_full_period: None,
         eden_kb: None,
     });
 
