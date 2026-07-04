@@ -13,16 +13,22 @@ Target: **AArch64, macOS, Apple Silicon (M-series), little-endian, 16 KiB pages.
 ## 1. Value representation on 64-bit AArch64
 
 ### 1.1 Tagged oops
-A 64-bit word, low-bit tagged (Strongtalk scheme widened, `DESIGN.md` §3.1):
+A 64-bit word, low-bit tagged (Strongtalk scheme widened, `DESIGN.md` §3.1).
+**As implemented** (`src/oops/layout.rs` — resolves the 1-bit-vs-3-bit
+question this section used to leave open; the shipped answer is 2 bits):
 
 | Low bits | Kind | Notes |
 |----------|------|-------|
-| `xxx…0` | **smi** | tag 0 ⇒ `add`/`sub`/`cmp` work directly on tagged ints; 62-bit range if tag is 1 bit, 61-bit if 3-bit tag |
-| `xxx…1` | **heap oop** | pointer, biased by the tag; recovered as `ptr = word - tag` |
+| `00` | **smi** (`INT_TAG`) | tagged word is exactly `value << 2` (`smi.rs`: "no OR is needed"); `add`/`sub`/`cmp` work directly on tagged ints; 62-bit signed range (`SMI_MAX`/`SMI_MIN`) |
+| `01` | **heap oop** (`MEM_TAG`) | pointer, biased by the tag; recovered as `ptr = word - 1` |
+| `10` | **reserved** (`RESERVED_TAG`) | future immediate (e.g. `Character`); illegal in v1 |
+| `11` | **mark tag** (`MARK_TAG`) | header word 0 only, never a value tag |
 
 Heap objects are 16-byte aligned (two 8-byte header words, and alignment aids
-the allocator), so ≥3 low bits are free for tagging if we want more immediate
-kinds (chars, `nil`/`true`/`false`). **Open:** 1-bit vs. 3-bit tag.
+the allocator), so more low bits were available for a wider immediate-kind
+tag; the 2-bit scheme above shipped instead — 62 bits of smi range won out
+over encoding `Character`/`nil`/`true`/`false` as immediates. Revisit only if
+boxed-immediate overhead is later measured to matter.
 
 ### 1.2 Top-Byte-Ignore (TBI)
 AArch64 **TBI** makes the CPU ignore bits [63:56] of a pointer on load/store.

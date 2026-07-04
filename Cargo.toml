@@ -13,10 +13,20 @@ edition = "2021"
 description = "A Self/Strongtalk-lineage adaptive research VM for macOS on Apple Silicon (arm64)."
 license = "BSD-2-Clause"
 publish = false
+# A second [[bin]] (asm_preview, S23) makes a bare `cargo run` ambiguous —
+# every Justfile recipe and doc that says `cargo run -- run …` means the VM.
+default-run = "macvm"
 
 [[bin]]
 name = "macvm"
 path = "src/main.rs"
+
+# S23 (docs/ASM.md) preview tool: extracts a `<asm: '...'>` method body and
+# runs it through the vendored JASM assembler (src/vendor/wfasm), standing
+# alone from the real compiler pipeline — see docs/ASM.md §7.
+[[bin]]
+name = "asm_preview"
+path = "src/bin/asm_preview.rs"
 
 [lib]
 name = "macvm"

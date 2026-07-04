@@ -315,6 +315,22 @@ interleaves with it; every wave lands with in-language tests.
   (`gui/src/objc.rs`) and needs none of this.
 - **S21 Mixins** — Strongtalk's mixin model on the reserved klass slot.
 - **S22 Weak refs + finalization; weak symbol table.**
+- **S23 ASM methods** — a method whose entire body is hand-written native
+  AArch64, not compiled Smalltalk. Full design in [`docs/ASM.md`](ASM.md)
+  (written as a non-disruptive side track, same posture as S20): a new
+  `<asm: 'text'>` pragma (string-wrapped so `.mst`'s bracket-matcher never
+  sees ARM64 addressing-mode `[`/`]` unescaped), a precise register contract
+  reusing the calling convention `docs/arm64.md` §3 already defines for
+  compiled code, and a v1 restriction to leaf routines only (no allocation,
+  no calls, no safepoints — what licenses skipping oop-maps entirely).
+  Reuses the existing `Nmethod`/`CodeTable` install mechanism verbatim, just
+  fed bytes from JASM's real text assembler (`wfasm::a64::assemble`,
+  vendored S9, otherwise unused in the current codebase) instead of the
+  tier-1 compiler's own pipeline. No Strongtalk precedent exists for this
+  (checked directly against the source) — genuinely novel for this lineage.
+  A working, tested preview tool (`asm_preview`, already built) proves the
+  mechanism against real worked examples; the frontend parser and installer
+  themselves are this sprint's still-to-build work.
 
 ---
 
