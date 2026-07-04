@@ -104,6 +104,16 @@ fn mark(vm: &mut VmState) -> usize {
         let oop = Oop::from_raw(*word);
         mark_push(oop, &mut stack, &mut marked_bytes);
     });
+    // S11 D4.3/D4.4: PIC/mega stubs' own embedded pool words, same
+    // treatment.
+    vm.pic_table.oops_do(&mut |word| {
+        let oop = Oop::from_raw(*word);
+        mark_push(oop, &mut stack, &mut marked_bytes);
+    });
+    vm.mega_table.oops_do(&mut |word| {
+        let oop = Oop::from_raw(*word);
+        mark_push(oop, &mut stack, &mut marked_bytes);
+    });
 
     while let Some(obj) = stack.pop() {
         let klass_field = obj.klass_oop();
@@ -473,6 +483,25 @@ pub fn full_gc(vm: &mut VmState) -> Result<FullGcReport, GcStallError> {
     vm.adapters.oops_do(&mut |word| {
         *word = forward_chase(Oop::from_raw(*word)).raw();
     });
+    // S11 D4.3: PIC stubs' own embedded klass pool words, same phase-C
+    // treatment. `pairs`' own Rust-side `KlassOop` mirror also needs
+    // `update_keys` (same reasoning as `code_table`'s own `key_klass`) --
+    // no `rehash` equivalent needed, `PicTable` has no oop-keyed HashMap
+    // at all (it's keyed by the stub's own stable address).
+    vm.pic_table.oops_do(&mut |word| {
+        *word = forward_chase(Oop::from_raw(*word)).raw();
+    });
+    vm.pic_table.update_keys(&mut forward_chase);
+    // S11 D4.4: mega trampolines' own embedded selector pool words, same
+    // phase-C treatment. Unlike `AdapterTable`, `MegaTable::by_selector`
+    // IS rehashed here -- D4.4's own explicit ask ("rehashed after full
+    // GC like CodeTable"), and `rehash` itself just re-reads each entry's
+    // own (already-relocated, by `oops_do` just above) pool word rather
+    // than needing its own `forward_chase` pass.
+    vm.mega_table.oops_do(&mut |word| {
+        *word = forward_chase(Oop::from_raw(*word)).raw();
+    });
+    vm.mega_table.rehash();
     super::verify::dbg_oop_trace(vm, "full-gc-rewrite");
 
     // --- D ------------------------------------------------------------

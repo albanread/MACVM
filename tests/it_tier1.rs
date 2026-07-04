@@ -6,6 +6,7 @@ use std::process::{Command, Stdio};
 
 use macvm::bytecode::builder::BytecodeBuilder;
 use macvm::codecache::nmethod::{IcSite, IcState, NmState, Nmethod, NmethodId};
+use macvm::codecache::pics::PIC_MAX_ENTRIES;
 use macvm::codecache::stubs::{self, CallStubFn};
 use macvm::codecache::CodeCache;
 use macvm::compiler::driver;
@@ -1714,4 +1715,213 @@ fn c2i_call_preserves_outer_interpreter_activation() {
         vm.stack.sp, sp_before,
         "sp must net to exactly zero effect too"
     );
+}
+
+/// S11 step 5's own explicit test target (implementation order, item 5):
+/// "full lattice". Builds `PIC_MAX_ENTRIES + 1` distinct klasses, each
+/// with its OWN real compiled `foo` returning a distinct constant, then
+/// sends the SAME hand-built call site to a fresh instance of each in
+/// turn -- driving Unresolved -> Mono -> Pic{2} -> Pic{3} -> Pic{4} ->
+/// Mega across consecutive calls, checking BOTH the dispatched result
+/// AND the recorded `IcState` after every single one. Finishes by
+/// re-dispatching to the FIRST klass through the now-`Mega` site, proving
+/// `rt_mega_lookup` genuinely re-resolves per call (not just "whichever
+/// klass triggered the promotion") and that `Mega` never regresses.
+#[test]
+fn full_ic_lattice_mono_to_pic_to_mega() {
+    let mut vm = test_vm();
+    let foo_sel = vm.universe.intern(b"foo");
+    let n = PIC_MAX_ENTRIES + 1;
+
+    // One real compiled `foo` per klass, each returning `100*(i+1)`.
+    let mut klasses = Vec::with_capacity(n);
+    for i in 0..n {
+        let klass = vm.universe.new_klass(
+            vm.universe.object_klass,
+            &format!("S11Lattice{i}"),
+            Format::Slots,
+            false,
+            HEADER_WORDS,
+        );
+        let mut fb = BytecodeBuilder::new();
+        fb.push_literal(&mut vm, SmallInt::new(((i + 1) * 100) as i64).oop());
+        fb.ret_tos();
+        let m = fb.finish(&mut vm, foo_sel, 0, 0);
+        install_method(&mut vm, klass, foo_sel, m);
+        assert!(driver::eligible(&vm, m), "push_smi+ret has no sends");
+        driver::compile_method(&mut vm, klass, m).expect("eligible method must compile");
+        klasses.push(klass);
+    }
+
+    // Caller: one param (the target receiver), one send of `foo`.
+    let vregs: Vec<VRegInfo> = (0..2).map(|_| VRegInfo { is_oop: true }).collect();
+    let block0 = IrBlock {
+        id: BlockId(0),
+        bci: 0,
+        code: vec![
+            Ir::Param {
+                dst: VReg(0),
+                index: 0,
+            },
+            Ir::CallSend {
+                dst: VReg(1),
+                site: 0,
+                args: vec![VReg(0)],
+            },
+            Ir::Ret { val: VReg(1) },
+        ],
+        entry_stack: Vec::new(),
+    };
+    let caller_method = IrMethod {
+        blocks: vec![block0],
+        vregs,
+        pool: Vec::new(),
+        argc: 1,
+        ntemps: 0,
+        safepoints: Vec::new(),
+        true_lit: PoolLit(0),
+        false_lit: PoolLit(0),
+        call_sites: vec![CallSiteInfo {
+            selector: foo_sel,
+            argc: 1,
+        }],
+    };
+    let ra = regalloc::regalloc(&caller_method);
+    let mut asm = JasmAssembler::new();
+    let (blob, _pcs, _verified_entry_off, emitted_ic_sites) = emit::emit(
+        &mut asm,
+        &caller_method,
+        &ra,
+        vm.stubs.stub_poll_addr(),
+        None,
+    );
+    assert_eq!(emitted_ic_sites.len(), 1);
+
+    let h = vm.code_cache.alloc(blob.code.len()).unwrap();
+    vm.code_cache.publish(h, &blob);
+    let resolve_addr = vm.stubs.resolve_addr();
+    for site in &emitted_ic_sites {
+        vm.code_cache.patch_branch26_at(h, site.off, resolve_addr);
+    }
+    let caller_probe_sel = vm.universe.intern(b"s11LatticeCallerProbe");
+    let ic_sites: Vec<IcSite> = emitted_ic_sites
+        .iter()
+        .map(|s| IcSite {
+            off: s.off,
+            selector: s.selector,
+            argc: s.argc,
+            state: IcState::Unresolved,
+        })
+        .collect();
+    let caller_nm = Nmethod {
+        id: NmethodId(0),
+        key_klass: klasses[0],
+        key_selector: caller_probe_sel,
+        code: h,
+        entry_off: 0,
+        verified_entry_off: 0,
+        state: NmState::Alive,
+        level: 1,
+        version: 0,
+        literal_off: blob.literal_off,
+        relocs: blob.relocs.clone(),
+        frame_slots: ra.frame_slots,
+        pcdescs: Vec::new(),
+        oopmaps: Vec::new(),
+        ic_sites,
+        poll_bci: None,
+    };
+    let caller_id = vm.code_table.install(caller_nm);
+    let caller_entry = h.base as u64;
+
+    let call: CallStubFn = unsafe { std::mem::transmute(vm.stubs.call_stub_entry()) };
+    let vm_ptr: *mut VmState = &mut vm;
+
+    let dispatch = |vm_ptr: *mut VmState, klass: KlassOop| -> u64 {
+        let recv = alloc::alloc_slots(unsafe { &mut *vm_ptr }, klass).oop();
+        let argv = [recv.raw()];
+        unsafe { call(caller_entry, vm_ptr, argv.as_ptr(), 1) }
+    };
+
+    // Unresolved -> Mono.
+    let r0 = dispatch(vm_ptr, klasses[0]);
+    assert_eq!(r0, SmallInt::new(100).oop().raw());
+    match vm.code_table.get(caller_id).unwrap().ic_sites[0].state {
+        IcState::Mono { klass, .. } => assert_eq!(klass, klasses[0]),
+        other => panic!("expected Mono after the 1st dispatch, got {other:?}"),
+    }
+
+    // Mono -> Pic{2}, then Pic{2} -> Pic{3} -> ... -> Pic{PIC_MAX_ENTRIES}.
+    for (i, &klass) in klasses.iter().enumerate().take(PIC_MAX_ENTRIES).skip(1) {
+        let r = dispatch(vm_ptr, klass);
+        assert_eq!(r, SmallInt::new(((i + 1) * 100) as i64).oop().raw());
+        match vm.code_table.get(caller_id).unwrap().ic_sites[0].state {
+            IcState::Pic { stub } => {
+                assert_eq!(
+                    vm.pic_table.pairs_of(stub).len(),
+                    i + 1,
+                    "after {} distinct klasses, the PIC must carry exactly that many pairs",
+                    i + 1
+                );
+            }
+            other => panic!("expected Pic after dispatch #{}, got {other:?}", i + 1),
+        }
+    }
+
+    // Precisely verify `resolve_target_entry`'s own `use_verified` choice
+    // (D4.3: "PIC targets that are nmethod entries use verified_entry") --
+    // a target using `entry_off` instead would STILL dispatch correctly
+    // (the target's own guard would just re-verify and match), so nothing
+    // above this point would have caught a bug swapping the two. Checked
+    // by directly comparing each recorded pair's own target address
+    // against `code.base + verified_entry_off` for its klass's compiled
+    // method.
+    match vm.code_table.get(caller_id).unwrap().ic_sites[0].state {
+        IcState::Pic { stub } => {
+            for (k, t) in vm.pic_table.pairs_of(stub) {
+                let nm_id = vm
+                    .code_table
+                    .lookup(*k, foo_sel)
+                    .expect("every klass in the PIC must have a real compiled nmethod");
+                let nm = vm.code_table.get(nm_id).unwrap();
+                let expected = nm.code.base as u64 + nm.verified_entry_off as u64;
+                assert_eq!(
+                    *t, expected,
+                    "PIC pair for {k:?} must use verified_entry, not entry, as its target"
+                );
+                assert_ne!(
+                    nm.verified_entry_off, nm.entry_off,
+                    "this check is only meaningful if verified_entry_off and entry_off actually \
+                     differ for this method -- they don't, so it can't distinguish anything"
+                );
+            }
+        }
+        other => panic!("expected still-Pic just before the Mega promotion, got {other:?}"),
+    }
+
+    // Pic{PIC_MAX_ENTRIES} -> Mega on the (PIC_MAX_ENTRIES+1)-th distinct
+    // klass.
+    let last = PIC_MAX_ENTRIES;
+    let r_last = dispatch(vm_ptr, klasses[last]);
+    assert_eq!(r_last, SmallInt::new(((last + 1) * 100) as i64).oop().raw());
+    match vm.code_table.get(caller_id).unwrap().ic_sites[0].state {
+        IcState::Mega { .. } => {}
+        other => panic!(
+            "expected Mega after the {}th distinct klass, got {other:?}",
+            last + 1
+        ),
+    }
+
+    // Re-dispatching to the FIRST klass through the now-Mega site must
+    // still work (rt_mega_lookup re-resolves fresh every time) and must
+    // NOT regress the state back out of Mega.
+    let r_again = dispatch(vm_ptr, klasses[0]);
+    assert_eq!(r_again, SmallInt::new(100).oop().raw());
+    match vm.code_table.get(caller_id).unwrap().ic_sites[0].state {
+        IcState::Mega { .. } => {}
+        other => panic!("Mega must never regress, got {other:?}"),
+    }
+    // And a middle one, for good measure.
+    let r_mid = dispatch(vm_ptr, klasses[2]);
+    assert_eq!(r_mid, SmallInt::new(300).oop().raw());
 }

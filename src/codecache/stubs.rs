@@ -10,12 +10,13 @@ use crate::compiler::jasm_assembler::JasmAssembler;
 use crate::oops::layout::{
     ROOTSPILL_BYTES, VMREG_LAST_COMPILED_FP_OFFSET, VMREG_LAST_COMPILED_PC_OFFSET,
 };
-use crate::oops::wrappers::MethodOop;
+use crate::oops::wrappers::{KlassOop, MethodOop, SymbolOop};
 use crate::oops::Oop;
 use crate::runtime::lookup::{klass_of, lookup};
 use crate::runtime::vm_state::{TierLink, VmState};
 
 use super::nmethod::IcState;
+use super::pics::PIC_MAX_ENTRIES;
 use super::{CodeCache, CodeHandle};
 
 /// D5's shared stub skeleton, part 1: anchor + AAPCS frame + RootSpill
@@ -91,6 +92,10 @@ pub struct Stubs {
     /// trampoline (`codecache::adapters::build_c2i_adapter`) `br`s here
     /// with the target method's own oop already in x17 (S11 step 4).
     pub c2i_shared: CodeHandle,
+    /// D4.4: the shared megamorphic-lookup tail — every per-selector
+    /// `mega_<sel>` trampoline (`codecache::mega::build_mega_trampoline`)
+    /// `br`s here with the selector's own oop already in x16 (S11 step 5).
+    pub mega_shared: CodeHandle,
 }
 
 impl Stubs {
@@ -105,6 +110,9 @@ impl Stubs {
     }
     pub fn c2i_shared_addr(&self) -> u64 {
         self.c2i_shared.base as u64
+    }
+    pub fn mega_shared_addr(&self) -> u64 {
+        self.mega_shared.base as u64
     }
 
     /// Invokes `entry` (a compiled method's own entry point — an `Nmethod`'s
@@ -158,11 +166,18 @@ pub fn install(cache: &mut CodeCache) -> Stubs {
         .expect("stubs::install: code cache too small for c2i_shared");
     cache.publish(h4, &c2i_shared_blob);
 
+    let mega_shared_blob = build_mega_shared();
+    let h5 = cache
+        .alloc(mega_shared_blob.code.len())
+        .expect("stubs::install: code cache too small for mega_shared");
+    cache.publish(h5, &mega_shared_blob);
+
     Stubs {
         call_stub: h1,
         stub_poll: h2,
         resolve: h3,
         c2i_shared: h4,
+        mega_shared: h5,
     }
 }
 
@@ -283,6 +298,50 @@ fn build_stub_resolve() -> CodeBlob {
     a.finish()
 }
 
+/// D4.1/D4.3/D4.4's shared target-resolution step, used by `rt_resolve_send`
+/// (both the mono path and every Pic/Mega transition) and `rt_mega_lookup`.
+///
+/// `use_verified` picks between a real nmethod's `entry` and its
+/// `verified_entry`: a MONO site's `bl` is a static patch that could later
+/// see a DIFFERENT receiver klass through the SAME site, so its target
+/// must re-verify (`entry`, `use_verified=false`) — but a PIC's own guard
+/// chain, or `rt_mega_lookup`'s own fresh `klass_of`+`lookup`, has ALREADY
+/// verified this exact (klass, method) pair by the time it's about to
+/// jump, so re-checking would be pure redundant overhead (`verified_entry`,
+/// `use_verified=true`, D4.3's own "the pair's klass was just compared").
+/// A c2i adapter has no guard of its own either way (D6.1), so the
+/// distinction is moot there.
+fn resolve_target_entry(
+    vm: &mut VmState,
+    k: KlassOop,
+    selector: SymbolOop,
+    method: MethodOop,
+    use_verified: bool,
+) -> u64 {
+    match vm.code_table.lookup(k, selector) {
+        Some(target_id) => {
+            let target_nm = vm
+                .code_table
+                .get(target_id)
+                .expect("code_table.lookup just returned this id");
+            let off = if use_verified {
+                target_nm.verified_entry_off
+            } else {
+                target_nm.entry_off
+            };
+            target_nm.code.base as u64 + off as u64
+        }
+        // D6.1: no compiled nmethod yet -- a c2i adapter, callable exactly
+        // like a real nmethod's own `entry` (`bl`, x0=result on return),
+        // stands in until (if ever) `method` gets compiled for real.
+        None => {
+            let c2i_shared_addr = vm.stubs.c2i_shared_addr();
+            vm.adapters
+                .get_or_make(&mut vm.code_cache, c2i_shared_addr, method)
+        }
+    }
+}
+
 /// # Safety
 /// Only ever reached via `bl`/`b` from `stub_resolve`'s own hand-assembled
 /// listing above, never called directly from Rust — same contract as
@@ -291,26 +350,32 @@ fn build_stub_resolve() -> CodeBlob {
 /// call only (the stub reloads and may clobber that memory immediately
 /// after, on its way to the tail-jump).
 ///
-/// D4.1's mono path: finds the caller nmethod and its `IcSite` from
-/// `ret_addr` (`ret_addr - 4` is always the `bl`/guard-miss site itself —
-/// D4.1's own invariant, true through EITHER door), resolves the real
-/// target via the SAME two-step lookup a normal interpreted send does
-/// (`klass_of` + `runtime::lookup::lookup`, so a compiled call sees
-/// exactly the method an interpreted send to the same receiver would),
-/// then patches the site directly to the target's `entry` and records
-/// `Mono{klass, target}`.
+/// D4.1's full state machine: finds the caller nmethod and its `IcSite`
+/// from `ret_addr` (`ret_addr - 4` is always the `bl`/guard-miss site
+/// itself — D4.1's own invariant, true through EITHER door), resolves the
+/// real target the SAME two-step way an interpreted send does (`klass_of`
+/// + `runtime::lookup::lookup`), then transitions:
+/// - `Unresolved` / `Mono` (same klass): patch directly, stay/become
+///   `Mono{klass, target}` (`resolve_target_entry`'s own `entry`, not
+///   `verified_entry` — see that function's doc).
+/// - `Mono` (different klass): promote to a fresh 2-entry PIC (D4.3).
+///   The OLD pair is re-resolved via `verified_entry` rather than reusing
+///   its stored MONO-era target — consistent with the "same klass" arm
+///   just above, which ALSO always re-resolves fresh rather than trusting
+///   a stale stored value (a redefinition could have moved it since).
+/// - `Pic`, room for one more: rebuild with `n+1` pairs (D3.4: PICs are
+///   immutable once published, no in-place growth), free the old stub.
+/// - `Pic`, already at `PIC_MAX_ENTRIES`: free the PIC, promote to the
+///   selector's own (possibly newly-built, possibly shared with other
+///   sites) megamorphic trampoline (D4.4) — which never patches anything
+///   itself again, so `Mega` can never reach this function (D4.1: "unreachable").
 ///
 /// An interpreted-only target (`code_table.lookup` finds no nmethod) falls
-/// back to a c2i adapter (D6.1, `codecache::adapters::AdapterTable::
-/// get_or_make`) — from `IcState::Mono`'s own perspective this is no
-/// different from a real nmethod's `entry`, just a different source for
-/// `target_entry`. DNU (`lookup` finds nothing) and every transition out
-/// of `Mono`/`Pic`/`Mega` besides "same klass, repatch" remain S11 steps
-/// 5/6's own scope — deliberately loud (`todo!`/`unreachable!`) rather
-/// than silently wrong: nothing in the codebase can drive them yet (S10's
-/// `convert()` never constructs `Ir::CallSend` at all; every real call
-/// site is hand-built by this sprint's own tests, against selectors that
-/// exist).
+/// back to a c2i adapter (D6.1) at every one of the above — from
+/// `IcState`'s own perspective this is no different from a real nmethod's
+/// entry, just a different source for a target address. DNU (`lookup`
+/// finds nothing) remains S11 step 6's own scope — deliberately loud
+/// (`todo!`) rather than silently wrong.
 pub unsafe extern "C" fn rt_resolve_send(vm: *mut VmState, ret_addr: u64, argv: *mut u64) -> u64 {
     // SAFETY: this function's own contract, guaranteed by `stub_resolve`.
     let vm = unsafe { &mut *vm };
@@ -353,47 +418,97 @@ pub unsafe extern "C" fn rt_resolve_send(vm: *mut VmState, ret_addr: u64, argv: 
     let Some(method) = lookup(vm, k, selector) else {
         todo!("S11 step 6: DNU from compiled code (stubs.dnu / rt_dnu)")
     };
-    let target_entry = match vm.code_table.lookup(k, selector) {
-        Some(target_id) => {
-            let target_nm = vm
-                .code_table
-                .get(target_id)
-                .expect("code_table.lookup just returned this id");
-            target_nm.code.base as u64 + target_nm.entry_off as u64
+
+    // `patch_target`: what the SITE's own `bl` gets repointed to (governs
+    // every FUTURE call through it). `ret_target`: the address THIS
+    // dispatch tail-jumps to right now -- the two differ only on
+    // promotion to Mega (the site is patched to the shared trampoline,
+    // but this call already has (k, method) in hand, so it skips straight
+    // to the real target instead of bouncing through the trampoline's own
+    // fresh lookup).
+    let (patch_target, ret_target, new_state) = match prev_state {
+        IcState::Unresolved => {
+            let t = resolve_target_entry(vm, k, selector, method, false);
+            (
+                t,
+                t,
+                IcState::Mono {
+                    klass: k,
+                    target: t,
+                },
+            )
         }
-        // D6.1: no compiled nmethod yet -- a c2i adapter, callable exactly
-        // like a real nmethod's own `entry` (`bl`, x0=result on return),
-        // stands in until (if ever) `method` gets compiled for real.
-        None => {
-            let c2i_shared_addr = vm.stubs.c2i_shared_addr();
-            vm.adapters
-                .get_or_make(&mut vm.code_cache, c2i_shared_addr, method)
+        IcState::Mono { klass, .. } if klass == k => {
+            let t = resolve_target_entry(vm, k, selector, method, false);
+            (
+                t,
+                t,
+                IcState::Mono {
+                    klass: k,
+                    target: t,
+                },
+            )
         }
+        IcState::Mono { klass: old_k, .. } => {
+            let old_method = lookup(vm, old_k, selector)
+                .expect("a klass that was already Mono-resolved must still resolve to a method");
+            let old_t = resolve_target_entry(vm, old_k, selector, old_method, true);
+            let new_t = resolve_target_entry(vm, k, selector, method, true);
+            let resolve_addr = vm.stubs.resolve_addr();
+            let smi_klass_bits = vm.universe.smi_klass.oop().raw();
+            let stub = vm.pic_table.build(
+                &mut vm.code_cache,
+                smi_klass_bits,
+                resolve_addr,
+                (caller_id, site_off),
+                vec![(old_k, old_t), (k, new_t)],
+            );
+            (stub.base as u64, new_t, IcState::Pic { stub })
+        }
+        IcState::Pic { stub } => {
+            let mut pairs = vm.pic_table.pairs_of(stub).to_vec();
+            let new_t = resolve_target_entry(vm, k, selector, method, true);
+            if pairs.len() < PIC_MAX_ENTRIES {
+                pairs.push((k, new_t));
+                let resolve_addr = vm.stubs.resolve_addr();
+                let smi_klass_bits = vm.universe.smi_klass.oop().raw();
+                let new_stub = vm.pic_table.build(
+                    &mut vm.code_cache,
+                    smi_klass_bits,
+                    resolve_addr,
+                    (caller_id, site_off),
+                    pairs,
+                );
+                vm.pic_table.free(&mut vm.code_cache, stub);
+                (new_stub.base as u64, new_t, IcState::Pic { stub: new_stub })
+            } else {
+                vm.pic_table.free(&mut vm.code_cache, stub);
+                let mega_shared_addr = vm.stubs.mega_shared_addr();
+                let mega_stub =
+                    vm.mega_table
+                        .get_or_make(&mut vm.code_cache, mega_shared_addr, selector);
+                (
+                    mega_stub.base as u64,
+                    new_t,
+                    IcState::Mega { stub: mega_stub },
+                )
+            }
+        }
+        IcState::Mega { .. } => unreachable!(
+            "rt_resolve_send: a Mega site's own rt_mega_lookup never patches, so a site can \
+             never return to stub_resolve once megamorphic (D4.4)"
+        ),
     };
 
-    match prev_state {
-        IcState::Unresolved => {}
-        IcState::Mono { klass, .. } if klass == k => {}
-        IcState::Mono { .. } => {
-            todo!("S11 step 5: Mono -> Pic promotion on a differing receiver klass")
-        }
-        IcState::Pic { .. } | IcState::Mega { .. } => unreachable!(
-            "rt_resolve_send: nothing in this codebase yet constructs Pic/Mega (S11 step 5)"
-        ),
-    }
-
     vm.code_cache
-        .patch_branch26_at(caller_code, site_off, target_entry);
+        .patch_branch26_at(caller_code, site_off, patch_target);
     vm.code_table
         .get_mut(caller_id)
         .expect("caller nmethod is still installed -- this call is running ON it")
         .ic_sites[site_idx]
-        .state = IcState::Mono {
-        klass: k,
-        target: target_entry,
-    };
+        .state = new_state;
 
-    target_entry
+    ret_target
 }
 
 /// D6.1: the shared c2i adapter tail. Reused unchanged from
@@ -491,6 +606,77 @@ pub unsafe extern "C" fn rt_interpret_call(
     vm.tier_links.pop();
 
     result.raw()
+}
+
+/// D4.4: the shared megamorphic-lookup tail. Tail-jump-shaped, like
+/// `stub_resolve` (NOT callee-shaped like `c2i_shared`/`rt_interpret_call`)
+/// — `rt_mega_lookup` never patches anything, so there is no "this call's
+/// own result" to distinguish from "what a FUTURE call through the same
+/// site should reach"; it's always the same address, tail-jumped to
+/// directly with the ORIGINAL send site's own x30 still intact.
+fn build_mega_shared() -> CodeBlob {
+    let mut a = JasmAssembler::new();
+
+    emit_stub_prologue(&mut a);
+    a.emit("mov", &[x(0), x(28)]); // vm
+    a.emit("mov", &[x(1), x(16)]); // selector_bits, carried through from mega_<sel>
+    a.emit("mov", &[x(2), sp()]); // argv = &RootSpill (x0..x5, contiguous)
+    let rt_mega_lookup_lit = a.literal_u64(
+        rt_mega_lookup as *const () as u64,
+        Some(RelocKind::RuntimeAddr),
+    );
+    a.call_far(rt_mega_lookup_lit);
+    a.emit("mov", &[x(16), x(0)]); // result -> x16, survives the epilogue's own x0 reload
+    emit_stub_epilogue(&mut a);
+    a.emit("br", &[x(16)]);
+
+    a.finish()
+}
+
+/// # Safety
+/// Only ever reached via `blr`/`bl` from `stub_mega_shared`'s own
+/// hand-assembled listing above (through `call_far`), never called
+/// directly from Rust — same contract as [`rt_resolve_send`]. `argv`
+/// points at `stub_mega_shared`'s own RootSpill area (6 live `u64`s,
+/// receiver + up to 5 args, contiguous ascending); valid for the duration
+/// of this call only.
+///
+/// D4.4's own words: "probes lookup cache (SPEC §6.1), full lookup on
+/// miss, NEVER patches the site" -- `runtime::lookup::lookup` already IS
+/// that probe-then-full-walk (`LookupCache` is its own first stop), so
+/// this is a thin wrapper around the SAME `resolve_target_entry` helper
+/// `rt_resolve_send` itself uses, with `use_verified=true` (this
+/// function's own fresh `klass_of`+`lookup` IS the verification a PIC's
+/// guard chain would otherwise have done, `resolve_target_entry`'s own
+/// doc) -- and, critically, no patch call anywhere: once a site is
+/// `Mega`, it stays `Mega` forever (D4.1's own state table has no exit
+/// from it).
+pub unsafe extern "C" fn rt_mega_lookup(
+    vm: *mut VmState,
+    selector_bits: u64,
+    argv: *mut u64,
+) -> u64 {
+    // SAFETY: this function's own contract, guaranteed by `stub_mega_shared`.
+    let vm = unsafe { &mut *vm };
+    debug_assert_ne!(
+        vm.reg_block.last_compiled_fp, 0,
+        "rt_mega_lookup: anchor must be set by stub_mega_shared's prologue before this call"
+    );
+
+    let selector = SymbolOop::try_from(Oop::from_raw(selector_bits)).expect(
+        "rt_mega_lookup: selector_bits must be a genuine SymbolOop -- MegaTable::get_or_make's \
+         own RelocKind::Oop pool word",
+    );
+    // SAFETY: this function's own contract above -- argv[0] is the
+    // receiver, D4.1's register protocol (shared with `rt_resolve_send`'s
+    // own argv).
+    let receiver = Oop::from_raw(unsafe { *argv });
+    let k = klass_of(vm, receiver);
+
+    let Some(method) = lookup(vm, k, selector) else {
+        todo!("S11 step 6: DNU from compiled code (stubs.dnu / rt_dnu)")
+    };
+    resolve_target_entry(vm, k, selector, method, true)
 }
 
 /// S10: nothing sets `VmRegBlock::poll_flag` nonzero yet (mirrors

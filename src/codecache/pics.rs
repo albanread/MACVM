@@ -1,0 +1,342 @@
+//! `PicTable` (S11 D4.3) — per-call-site polymorphic inline caches. Unlike
+//! `adapters::AdapterTable`/`mega::MegaTable` (keyed for reuse across many
+//! call sites), a PIC is 1:1 with the specific call site that outgrew
+//! mono — keyed by its own stub handle so `stubs::rt_resolve_send`'s
+//! rebuild-on-grow path can find "the pairs I was built with" without
+//! re-parsing published machine code.
+
+use std::collections::HashMap;
+
+use crate::compiler::assembler::{imm, mem, x, xr, Assembler, CodeBlob, Cond, RelocKind};
+use crate::compiler::jasm_assembler::JasmAssembler;
+use crate::oops::wrappers::KlassOop;
+use crate::oops::Oop;
+
+use super::guard::JitWriteGuard;
+use super::nmethod::NmethodId;
+use super::{CodeCache, CodeHandle};
+
+/// SPEC §4.3's tunable, shared with the interpreter's own PICs — the 5th
+/// distinct klass at a site promotes straight to megamorphic rather than
+/// growing a 5th time (D4.1's own state table).
+pub const PIC_MAX_ENTRIES: usize = 4;
+
+struct PicDesc {
+    handle: CodeHandle,
+    /// For a future S12 flush pass to find PICs referencing a dead
+    /// nmethod (D4.3's own doc) — not read by anything in S11 itself.
+    #[allow(dead_code)]
+    site: (NmethodId, u32),
+    pairs: Vec<(KlassOop, u64)>,
+    /// Byte offsets of each pair's own klass pool word, parallel to
+    /// `pairs` — what `oops_do` walks.
+    klass_pool_offs: Vec<u32>,
+}
+
+#[derive(Default)]
+pub struct PicTable {
+    by_handle: HashMap<u64, PicDesc>,
+}
+
+impl PicTable {
+    pub fn new() -> PicTable {
+        PicTable::default()
+    }
+
+    /// Builds and publishes a fresh PIC stub for `pairs`, registers it
+    /// under `site`, returns its own entry address (a PIC has no separate
+    /// verified-entry — its whole body IS the guard).
+    pub fn build(
+        &mut self,
+        cache: &mut CodeCache,
+        smi_klass_bits: u64,
+        resolve_addr: u64,
+        site: (NmethodId, u32),
+        pairs: Vec<(KlassOop, u64)>,
+    ) -> CodeHandle {
+        debug_assert!(
+            !pairs.is_empty() && pairs.len() <= PIC_MAX_ENTRIES,
+            "PicTable::build: {} pairs (must be 1..={PIC_MAX_ENTRIES})",
+            pairs.len()
+        );
+        let (blob, klass_pool_offs) = build_pic_stub(&pairs, smi_klass_bits, resolve_addr);
+        let h = cache
+            .alloc(blob.code.len())
+            .expect("PicTable::build: code cache too small for a PIC stub");
+        cache.publish(h, &blob);
+        self.by_handle.insert(
+            h.base as u64,
+            PicDesc {
+                handle: h,
+                site,
+                pairs,
+                klass_pool_offs,
+            },
+        );
+        h
+    }
+
+    /// The pairs a currently-live PIC (found by its own stub handle) was
+    /// built with — `rt_resolve_send`'s own `IcState::Pic` arm reads this
+    /// to seed the next rebuild with one more pair.
+    pub fn pairs_of(&self, stub: CodeHandle) -> &[(KlassOop, u64)] {
+        &self
+            .by_handle
+            .get(&(stub.base as u64))
+            .expect(
+                "PicTable::pairs_of: stub not registered -- IcState::Pic named a handle this \
+                 table never built",
+            )
+            .pairs
+    }
+
+    /// Frees `stub`'s own code-cache space and drops its bookkeeping —
+    /// called on both a grow (replaced by a bigger PIC) and a promotion
+    /// to megamorphic (replaced by a mega stub).
+    pub fn free(&mut self, cache: &mut CodeCache, stub: CodeHandle) {
+        cache.free(stub);
+        self.by_handle.remove(&(stub.base as u64));
+    }
+
+    /// D8-adjacent (pre-S12 bridge): visits every live PIC's own embedded
+    /// klass pool words — load-bearing, same reasoning as
+    /// `adapters::AdapterTable::oops_do` (a receiver klass compared
+    /// against can be young).
+    pub fn oops_do(&mut self, f: &mut dyn FnMut(&mut u64)) {
+        let mut guard = JitWriteGuard::new();
+        for d in self.by_handle.values() {
+            guard.note(d.handle.base, d.handle.len);
+            for &off in &d.klass_pool_offs {
+                debug_assert!(
+                    (off as usize) + 8 <= d.handle.len,
+                    "oops_do: klass_pool_off {off} + 8 exceeds this PIC's own length {}",
+                    d.handle.len
+                );
+                // SAFETY: `off` came from this SAME blob's own
+                // `build_pic_stub` return value — live MAP_JIT memory,
+                // 8-byte aligned (D3.3), guarded (this function's own
+                // `guard`, noted for this exact range).
+                let addr = unsafe { d.handle.base.add(off as usize) } as *mut u64;
+                unsafe { f(&mut *addr) };
+            }
+        }
+    }
+
+    /// Full-GC-only: `pairs`' own `KlassOop` values are a Rust-side
+    /// mirror of what `oops_do` already keeps the MACHINE CODE pool words
+    /// current for — same "not MAP_JIT memory, no guard needed" treatment
+    /// as `nmethod::CodeTable::update_keys`'s own `key_klass`.
+    pub fn update_keys(&mut self, f: &mut dyn FnMut(Oop) -> Oop) {
+        for d in self.by_handle.values_mut() {
+            for pair in &mut d.pairs {
+                let nk = f(pair.0.oop());
+                // SAFETY: a collector transform never changes an oop's
+                // shape, only (at most) its address — same reasoning as
+                // `CodeTable::update_keys`'s own `key_klass`/
+                // `key_selector`.
+                pair.0 = unsafe { KlassOop::from_oop_unchecked(nk) };
+            }
+        }
+    }
+}
+
+/// D4.3: the guard-chain sequence. The klass-load prefix mirrors
+/// `compiler::emit::emit_entry_guard`'s own 5-word sequence (can't call it
+/// directly — private, and shaped for exactly one klass with a
+/// fall-through match rather than N klasses each with their own target),
+/// then one guarded indirect tail-call per pair.
+///
+/// Deviates from D4.3's own literal pseudocode the SAME way S11 steps 2/4
+/// already did for similar cases: each pair's own match reaches its
+/// target via an indirect `ldr x16,<pool:t_i>; br x16` rather than a
+/// direct Branch26 `b t_i` — avoids needing a NEW "emit placeholder now,
+/// patch immediately after publish" mechanism just for this one case (the
+/// nmethod entry guard's own miss path and the c2i adapter's own jump to
+/// `c2i_shared` both already chose the same tradeoff). Costs one extra
+/// pool word and one extra code word per entry versus the doc's own
+/// "4 words + 1 pool word" budget — immaterial at n≤4.
+///
+/// Returns the built blob plus each pair's own klass pool word's byte
+/// offset (parallel to `pairs`), for `PicTable::build` to hand to
+/// `oops_do`.
+fn build_pic_stub(
+    pairs: &[(KlassOop, u64)],
+    smi_klass_bits: u64,
+    resolve_addr: u64,
+) -> (CodeBlob, Vec<u32>) {
+    let mut a = JasmAssembler::new();
+    let smi_lit = a.literal_u64(smi_klass_bits, Some(RelocKind::Oop));
+
+    let smi_case = a.new_label();
+    let after_klass_load = a.new_label();
+
+    a.emit("tst", &[x(0), imm(3)]);
+    a.b_cond(Cond::Eq, smi_case);
+    // Heap case: klass word at untagged-address + KLASS_OFFSET(8),
+    // MEM_TAG(1)-biased — same sequence as `emit_entry_guard`.
+    a.emit("ldur", &[x(17), mem(0, 7)]);
+    a.b(after_klass_load);
+    a.bind(smi_case);
+    a.ldr_literal(xr(17), smi_lit);
+    a.bind(after_klass_load);
+
+    let mut klass_lits = Vec::with_capacity(pairs.len());
+    for &(k, t) in pairs {
+        let next = a.new_label();
+        let k_lit = a.literal_u64(k.oop().raw(), Some(RelocKind::Oop));
+        klass_lits.push(k_lit);
+        let t_lit = a.literal_u64(t, Some(RelocKind::RuntimeAddr));
+        a.ldr_literal(xr(16), k_lit);
+        a.emit("cmp", &[x(17), x(16)]);
+        a.b_cond(Cond::Ne, next);
+        a.ldr_literal(xr(16), t_lit);
+        a.emit("br", &[x(16)]);
+        a.bind(next);
+    }
+    // All miss: the SAME `stub_resolve`/`stub_ic_miss` door the nmethod
+    // entry guard's own miss path reaches (D4.1: "one shared stub, two
+    // doors") — x30 is still the ORIGINAL send site's own return address,
+    // untouched by anything above.
+    let resolve_lit = a.literal_u64(resolve_addr, Some(RelocKind::RuntimeAddr));
+    a.ldr_literal(xr(16), resolve_lit);
+    a.emit("br", &[x(16)]);
+
+    let blob = a.finish();
+    let klass_pool_offs = klass_lits
+        .iter()
+        .map(|l| blob.literal_off + 8 * l.0)
+        .collect();
+    (blob, klass_pool_offs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::oops::layout::MEM_TAG;
+    use crate::oops::Format;
+    use crate::runtime::vm_state::{VmOptions, VmState};
+
+    fn test_vm() -> VmState {
+        VmState::with_options(VmOptions {
+            heap_mib: 64,
+            trace: Default::default(),
+            gc_stress: false,
+            gc_stress_full_period: None,
+            eden_kb: None,
+            jit: crate::runtime::JitMode::Off,
+        })
+    }
+
+    fn new_klass(vm: &mut VmState, name: &str) -> KlassOop {
+        let object_klass = vm.universe.object_klass;
+        vm.universe.new_klass(
+            object_klass,
+            name,
+            Format::Slots,
+            false,
+            crate::oops::layout::HEADER_WORDS,
+        )
+    }
+
+    #[test]
+    fn build_two_entry_pic_listing_shape() {
+        let mut vm = test_vm();
+        let k1 = new_klass(&mut vm, "PicA");
+        let k2 = new_klass(&mut vm, "PicB");
+        let (blob, offs) = build_pic_stub(&[(k1, 0x1000), (k2, 0x2000)], 0x9000, 0xDEAD_0000);
+        assert_eq!(offs.len(), 2, "one klass pool offset per pair");
+
+        let mnemonics: Vec<&str> = blob
+            .listing
+            .iter()
+            .map(|l| l.split_whitespace().nth(2).unwrap_or(""))
+            .collect();
+        assert_eq!(mnemonics.first(), Some(&"tst"), "opens with the tag check");
+        assert_eq!(
+            mnemonics.iter().filter(|&&m| m == "br").count(),
+            3,
+            "one br per pair's own match (2) plus the final all-miss door -- got:\n{}",
+            blob.listing.join("\n")
+        );
+        assert!(
+            !mnemonics.contains(&"bl") && !mnemonics.contains(&"blr"),
+            "a PIC must never touch x30 -- got:\n{}",
+            blob.listing.join("\n")
+        );
+    }
+
+    #[test]
+    fn pic_table_build_pairs_of_free_round_trip() {
+        let mut vm = test_vm();
+        let mut cache = CodeCache::new(1 << 20).unwrap();
+        let mut pics = PicTable::new();
+        let k1 = new_klass(&mut vm, "PicC");
+        let k2 = new_klass(&mut vm, "PicD");
+        let pairs = vec![(k1, 0x1000u64), (k2, 0x2000u64)];
+
+        let h = pics.build(
+            &mut cache,
+            0x9000,
+            0xDEAD_0000,
+            (NmethodId(0), 4),
+            pairs.clone(),
+        );
+        assert_eq!(pics.pairs_of(h), pairs.as_slice());
+        assert!(cache.contains(h.base as u64));
+
+        pics.free(&mut cache, h);
+        // `CodeCache::contains` only checks the mmap'd RANGE (never
+        // shrinks), so it stays true regardless of free/publish state --
+        // what `PicTable::free` is actually responsible for is dropping
+        // ITS OWN bookkeeping, and returning the space to `cache`'s own
+        // freelist for reuse (checked here by immediately re-allocating
+        // exactly `h`'s own size and confirming it lands at `h`'s own
+        // base -- `CodeCache::free`'s own doc: "always reclaims exactly
+        // what was carved out").
+        let h2 = cache.alloc(h.len).expect("freed space must be reusable");
+        assert_eq!(
+            h2.base, h.base,
+            "the freed space must be exactly what's reused"
+        );
+    }
+
+    #[test]
+    fn oops_do_relocates_pic_klass_words() {
+        let mut vm = test_vm();
+        let mut cache = CodeCache::new(1 << 20).unwrap();
+        let mut pics = PicTable::new();
+        let k1 = new_klass(&mut vm, "PicE");
+        let old_bits = k1.oop().raw();
+
+        let h = pics.build(
+            &mut cache,
+            0x9000,
+            0xDEAD_0000,
+            (NmethodId(0), 0),
+            vec![(k1, 0x1000)],
+        );
+
+        let new_bits = old_bits ^ 0x1000;
+        pics.oops_do(&mut |w| {
+            if *w == old_bits {
+                *w = new_bits;
+            }
+        });
+
+        let pool_addr = pics
+            .by_handle
+            .get(&(h.base as u64))
+            .unwrap()
+            .klass_pool_offs[0];
+        let read_back = unsafe { *(h.base.add(pool_addr as usize) as *const u64) };
+        assert_eq!(read_back, new_bits);
+    }
+
+    #[test]
+    fn fake_klass_tag_sanity() {
+        // Guards against accidentally testing against an address that
+        // isn't even mem-tagged -- would make every assertion above
+        // vacuous.
+        assert_eq!(MEM_TAG, 1);
+    }
+}

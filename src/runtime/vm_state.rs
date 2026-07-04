@@ -390,6 +390,14 @@ pub struct VmState {
     /// call site has resolved to. Empty for the lifetime of a
     /// `JitMode::Off` run, same as `code_table`.
     pub adapters: crate::codecache::adapters::AdapterTable,
+    /// Polymorphic inline caches (S11 D4.3), one per compiled call site
+    /// that outgrew `Mono`. Empty for the lifetime of a `JitMode::Off`
+    /// run, same as `code_table`.
+    pub pic_table: crate::codecache::pics::PicTable,
+    /// Megamorphic trampolines (S11 D4.4), one per selector shared across
+    /// every call site that outgrew its own PIC. Empty for the lifetime
+    /// of a `JitMode::Off` run, same as `code_table`.
+    pub mega_table: crate::codecache::mega::MegaTable,
     /// `call_stub`/`stub_poll` (S10 D4/D5.6) — published into `code_cache`
     /// once, here, at boot. `compile_method` needs `stub_poll_addr()` to
     /// embed as a pool constant in any method that emits `Ir::Poll`;
@@ -461,6 +469,8 @@ impl VmState {
             code_cache,
             code_table: CodeTable::new(),
             adapters: crate::codecache::adapters::AdapterTable::new(),
+            pic_table: crate::codecache::pics::PicTable::new(),
+            mega_table: crate::codecache::mega::MegaTable::new(),
             stubs,
             tier_links: Vec::new(),
             compiled_depth: 0,

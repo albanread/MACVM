@@ -463,6 +463,27 @@ pub fn scavenge(vm: &mut VmState) -> Result<ScavengeReport, GcStallError> {
     });
     vm.adapters = adapters;
 
+    // S11 D4.3: PIC stubs' own embedded klass pool words -- same
+    // treatment (a receiver klass compared against a PIC's own guard
+    // chain can be young).
+    let mut pic_table = std::mem::take(&mut vm.pic_table);
+    pic_table.oops_do(&mut |word| {
+        let oop = Oop::from_raw(*word);
+        *word = scavenge_oop(vm, oop).raw();
+    });
+    vm.pic_table = pic_table;
+
+    // S11 D4.4: mega trampolines' own embedded selector pool words --
+    // same treatment. `by_selector`'s own HashMap key is NOT rehashed
+    // here (mirrors `code_table`'s own by_key -- rehashed only after a
+    // full GC, `codecache::mega`'s own doc).
+    let mut mega_table = std::mem::take(&mut vm.mega_table);
+    mega_table.oops_do(&mut |word| {
+        let oop = Oop::from_raw(*word);
+        *word = scavenge_oop(vm, oop).raw();
+    });
+    vm.mega_table = mega_table;
+
     if let Some(err) = vm.universe.pending_stall.take() {
         return Err(err);
     }

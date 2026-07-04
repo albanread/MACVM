@@ -55,14 +55,19 @@ pub struct PcDesc {
 /// patched `bl` currently targets"). `Mono` records the klass/target pair
 /// it was resolved for — D4.1's own state table needs the OLD pair on a
 /// later "different klass" resolve, to seed a fresh PIC alongside the new
-/// one. `Pic`/`Mega` carry the generated stub's own handle so a later
-/// transition knows what to free (P1/P2: rebuild-and-swing, never an
-/// in-place edit).
+/// one. `Pic`/`Mega` carry only the generated stub's own handle — NOT a
+/// pair count or the pairs themselves: `codecache::pics::PicTable`/
+/// `codecache::mega::MegaTable` are the single source of truth for both
+/// (keyed by the stub's own handle/selector respectively), so there is
+/// nothing here that could drift out of sync with them. A later
+/// transition (grow, or promote to mega) reads the OLD stub's own pairs
+/// from there, then frees it there too (P1/P2: rebuild-and-swing, never
+/// an in-place edit).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum IcState {
     Unresolved,
     Mono { klass: KlassOop, target: u64 },
-    Pic { stub: CodeHandle, n: u8 },
+    Pic { stub: CodeHandle },
     Mega { stub: CodeHandle },
 }
 

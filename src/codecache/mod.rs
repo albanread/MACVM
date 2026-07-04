@@ -18,7 +18,9 @@
 
 pub mod adapters;
 pub mod guard;
+pub mod mega;
 pub mod nmethod;
+pub mod pics;
 pub mod stubs;
 
 use std::collections::BTreeMap;
