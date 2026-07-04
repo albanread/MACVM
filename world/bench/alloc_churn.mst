@@ -1,0 +1,65 @@
+"alloc_churn.mst — tests_s12.md flagship-gate step 7's soak: 10M
+ short-lived objects through a COMPILED allocation loop (run under
+ MACVM_JIT=threshold=1 — `churn: n`'s only send is a mono `AllocChurn
+ basicNew`, which ir.rs compiles to an inline Ir::Alloc, and the frontend
+ lowers `to:do:` to plain jumps, so the whole loop body is tier-1 native:
+ eden bumps through reg_block.eden_top_addr, slow edges through
+ rt_alloc_slow, and every scavenge those trigger runs with the compiled
+ frame live on the native stack — S12 step 7's whole point). Named
+ alloc_churn.mst, not the doc's own churn.mst: S10 had already taken that
+ name for its compile-disabled churn stress.
+
+ Flat-memory-ceiling assertion, exact by design: after a warm-up phase
+ (lets genesis/world objects and this class's own metadata tenure, and
+ the tenuring threshold recompute against real survivor sizes), NOTHING
+ in the steady-state loop may promote — every AllocChurn instance dies
+ before its first scavenge even sees it live (its dst vreg is dead the
+ instruction after the alloc), so oldUsed and oldCommitted must both
+ come back from `Smalltalk gcStats` EXACTLY unchanged across the whole
+ 10M-allocation run. `self error:` aborts loud and specific on any
+ drift, per 00_sunit.mst's own no-exceptions convention. Not in
+ world.list; the `just soak-s12` recipe loads it explicitly."
+
+Object subclass: AllocChurn [
+    | a b |
+
+    AllocChurn class >> churn: n [
+        1 to: n do: [:i | AllocChurn basicNew ]
+    ]
+
+    AllocChurn class >> run: nTotal [
+        | stats oldUsedBefore oldCommittedBefore oldUsedAfter oldCommittedAfter |
+        "Warm-up: enough allocations to force several scavenges (default
+         4 MiB eden / 32-byte instances ~= 131k allocs per scavenge), so
+         everything long-lived has tenured and the threshold has settled
+         BEFORE the measured window opens. Also warms churn:'s own send
+         site mono so threshold=1 compiles it on the next call."
+        AllocChurn churn: 500000.
+        Smalltalk gcScavenge.
+
+        stats := Smalltalk gcStats.
+        oldUsedBefore := stats at: 4.
+        oldCommittedBefore := stats at: 5.
+
+        AllocChurn churn: nTotal.
+
+        stats := Smalltalk gcStats.
+        oldUsedAfter := stats at: 4.
+        oldCommittedAfter := stats at: 5.
+
+        oldUsedAfter = oldUsedBefore ifFalse: [
+            self error: 'alloc_churn: oldUsed drifted (steady-state promotion): ',
+                oldUsedBefore printString, ' -> ', oldUsedAfter printString ].
+        oldCommittedAfter = oldCommittedBefore ifFalse: [
+            self error: 'alloc_churn: old gen GREW under pure short-lived churn: ',
+                oldCommittedBefore printString, ' -> ', oldCommittedAfter printString ].
+
+        Transcript show: 'alloc_churn: '; show: nTotal printString;
+            show: ' compiled allocations, flat ceiling (oldUsed ';
+            show: oldUsedAfter printString; show: ', oldCommitted ';
+            show: oldCommittedAfter printString; show: '), ';
+            show: (stats at: 1) printString; show: ' scavenges'; cr.
+    ]
+]
+
+AllocChurn run: 10000000.

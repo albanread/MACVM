@@ -212,3 +212,35 @@ gate-s11: gate-s10
     MACVM_GC_STRESS=full:64 MACVM_JIT=threshold=1 just run-world-tests
     just bridge-stats-s11
     just bench-s11
+
+# S12 flagship soak (tests_s12.md gate step 7): 10M short-lived objects
+# through a COMPILED allocation loop (threshold=1, default GC), flat memory
+# ceiling asserted EXACTLY by the script itself (oldUsed/oldCommitted
+# byte-identical before/after the measured window -- steady-state churn
+# promotes nothing). The file is alloc_churn.mst, not the doc's own
+# "churn.mst": S10 had already taken that name for its compile-disabled
+# churn stress.
+soak-s12:
+    MACVM_JIT=threshold=1 cargo run --release --quiet -- run world/bench/alloc_churn.mst --world world
+
+# S12: moving GC under compiled frames -- THE flagship gate (tests_s12.md
+# "Acceptance gate" + its step-by-step procedure). gate-s11 (chained) already
+# reruns the combined-stress suites and bridge-stats-s11 -- which S12 step 7
+# INVERTED: it now asserts gc_under_compiled > 0, i.e. real collections ran
+# with live compiled frames on the native stack (P10). What this recipe adds
+# on top: the BYTE-IDENTICAL requirement across both combined-stress modes
+# (gate item 1 -- gate-s11 only checked they pass; the diff is the flagship's
+# actual claim), the S7 torture harness re-run with tier 1 ON, and the
+# compiled-allocation-loop soak. bridge_old_allocs' deletion is enforced at
+# compile time (the field is gone -- gate item "counter DELETED, compile
+# error if referenced"); oopmap_at exactness needs no separate check (a miss
+# panics, so any of these runs would die loudly, P1).
+gate-s12: gate-s11
+    MACVM_JIT=off just run-world-tests > /tmp/s12_gate_base.txt
+    MACVM_GC_STRESS=1 MACVM_JIT=threshold=1 just run-world-tests > /tmp/s12_gate_a.txt
+    MACVM_GC_STRESS=full:64 MACVM_JIT=threshold=1 just run-world-tests > /tmp/s12_gate_b.txt
+    diff /tmp/s12_gate_base.txt /tmp/s12_gate_a.txt
+    diff /tmp/s12_gate_base.txt /tmp/s12_gate_b.txt
+    sed '$s/.*/Soak run: 400./' world/bench/soak.mst > /tmp/macvm_soak_s12.mst
+    MACVM_JIT=threshold=1 cargo run --release --quiet -- run /tmp/macvm_soak_s12.mst --world world
+    just soak-s12
