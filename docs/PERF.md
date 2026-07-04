@@ -114,3 +114,4 @@ cost, it doesn't erase it.
 | Date | Commit | interp_ms | jit_ms | ratio |
 |---|---|---|---|---|
 | 2026-07-04 | 7ac7b53 | 1834 | 472 | 3.88x |
+| 2026-07-04 | abe4f2e | 110 | 0 |

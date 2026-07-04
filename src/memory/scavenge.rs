@@ -419,20 +419,33 @@ pub fn scavenge(vm: &mut VmState) -> Result<ScavengeReport, GcStallError> {
         vm.universe.gc_enabled,
         "scavenge called before genesis finished (SPEC §7.3 A1)"
     );
-    // S11 D8: moving GC is FORBIDDEN while a compiled frame is live — its
-    // spill-slot oops are invisible to the scavenger until S12, so
-    // evacuating would leave them dangling. Enforced at the collector (not
-    // just its callers) so every door is covered: `alloc::alloc_words`'
-    // bridge arm diverts to old-direct under `compiled_depth > 0`, never
-    // reaching here, and `prim_gc_scavenge` now defers (`gc_pending`)
-    // instead of calling straight in — this assert (plus `gc_under_compiled`
-    // just below, which stays live in `--release` too) catches any future
-    // third caller before it can corrupt.
+    // S11 D8 bridge (pre-S12 window; production doors, still all standing):
+    // `alloc::alloc_words`'s bridge arm diverts to old-direct under
+    // `compiled_depth > 0`, never reaching here; `prim_gc_scavenge` defers
+    // (`gc_pending`) instead of calling straight in. `gc_under_compiled`
+    // (stays live in `--release` too) counts any caller that DOES reach
+    // here anyway.
+    //
+    // S12 step 4: `each_code_root` (just above, in the root scan) now makes
+    // THIS function itself genuinely correct under a live compiled frame —
+    // it is only the production-facing doors (both still fully intact,
+    // above) that keep ordinary allocation/`Gc scavenge` sends from ever
+    // relying on that yet, deliberately: full GC isn't compiled-frame-aware
+    // until step 5, and nmethod flushing (step 6) doesn't exist yet, so
+    // opening every door at once before those land would let ordinary code
+    // reach a still-incomplete system. `test_allow_moving_gc_under_compiled`
+    // is the one narrow, default-off exception (mirrors `test_walk_capture`/
+    // `test_tear_tier_links_before_walk`'s own established shape) — it lets
+    // a test call THIS function directly to prove the new root-scanning
+    // mechanism for real, without touching any of the three production
+    // doors, which is why this is a step-4-scoped relaxation rather than
+    // "the S11 bridge is deleted" (that's step 7, all three doors at once,
+    // once step 5/6 have made the rest of the system ready for it too).
     if vm.compiled_depth > 0 {
         vm.universe.gc_stats.gc_under_compiled += 1;
     }
-    debug_assert_eq!(
-        vm.compiled_depth, 0,
+    debug_assert!(
+        vm.compiled_depth == 0 || vm.test_allow_moving_gc_under_compiled,
         "scavenge under a live compiled frame (compiled_depth={}) — S11 D8 bridge violated",
         vm.compiled_depth
     );
@@ -455,70 +468,17 @@ pub fn scavenge(vm: &mut VmState) -> Result<ScavengeReport, GcStallError> {
     super::roots::for_each_root(vm, scavenge_oop);
     dirty_card_scan(vm, old_top_before);
 
-    // S10 D8: nmethod literal-pool oops are roots too (method literals are
-    // usually tenured by compile time but not guaranteed) — scanned here,
-    // still within the root-scan step, so anything reachable only from a
-    // compiled method's pool is copied before the Cheney loop below starts
-    // consuming `to`-space. `code_table` is taken out for the duration so
-    // the closure can hold `vm` mutably (`scavenge_oop` needs the whole
-    // state); empty for every run until S10 step 7 ever installs an
-    // nmethod, so this is a no-op loop over an empty `Vec` until then.
-    let mut code_table = std::mem::take(&mut vm.code_table);
-    code_table.oops_do(&mut |word| {
-        let oop = Oop::from_raw(*word);
-        *word = scavenge_oop(vm, oop).raw();
-    });
-    // S11: `key_klass`/`key_selector` are Rust-side identity oops, NOT in
-    // the code pool `oops_do` walks — so a scavenge that promotes a young
-    // `key_selector` symbol (or `key_klass`) updates the interning
-    // symbol/class table's own reference but would leave this SEPARATE nmethod
-    // copy dangling at the vacated address. The full GC already does this
-    // (`update_keys` + `rehash`); the scavenge must too. Found via
-    // `MACVM_GC_STRESS=1 + MACVM_JIT=threshold=1` (a combination the gate
-    // never ran together before S11 step 8) -- a real pre-existing
-    // use-after-free, latent since these keys were added (S11 step 2/6).
-    code_table.update_keys(&mut |oop| scavenge_oop(vm, oop));
-    code_table.rehash();
-    vm.code_table = code_table;
-
-    // S11 D6.1: c2i adapters' own embedded method-oop pool words are the
-    // same kind of root — same take-and-restore shape as `code_table`
-    // just above, same reason (`scavenge_oop` needs the whole `vm`).
-    let mut adapters = std::mem::take(&mut vm.adapters);
-    adapters.oops_do(&mut |word| {
-        let oop = Oop::from_raw(*word);
-        *word = scavenge_oop(vm, oop).raw();
-    });
-    vm.adapters = adapters;
-
-    // S11 D4.3: PIC stubs' own embedded klass pool words -- same
-    // treatment (a receiver klass compared against a PIC's own guard
-    // chain can be young).
-    let mut pic_table = std::mem::take(&mut vm.pic_table);
-    pic_table.oops_do(&mut |word| {
-        let oop = Oop::from_raw(*word);
-        *word = scavenge_oop(vm, oop).raw();
-    });
-    // Same Rust-side-key hazard as `code_table` above -- `PicTable`'s own
-    // `pairs` mirror of each guard `KlassOop` is not in the pool `oops_do`
-    // walks. (No `rehash`: `PicTable` is keyed by stub address, not an oop.)
-    pic_table.update_keys(&mut |oop| scavenge_oop(vm, oop));
-    vm.pic_table = pic_table;
-
-    // S11 D4.4: mega trampolines' own embedded selector pool words --
-    // same treatment. `by_selector`'s own HashMap key is NOT rehashed
-    // here (mirrors `code_table`'s own by_key -- rehashed only after a
-    // full GC, `codecache::mega`'s own doc).
-    let mut mega_table = std::mem::take(&mut vm.mega_table);
-    mega_table.oops_do(&mut |word| {
-        let oop = Oop::from_raw(*word);
-        *word = scavenge_oop(vm, oop).raw();
-    });
-    // `MegaTable::by_selector`'s HashMap key is the selector oop's raw bits;
-    // `rehash` re-reads each entry's (now-relocated) pool word, so the map
-    // stays keyed by the live address -- same as the full GC does.
-    mega_table.rehash();
-    vm.mega_table = mega_table;
+    // S10/S11/S12 D4.1: nmethod/adapter/PIC/mega pool oops, AND (S12) any
+    // live compiled/adapter frame's own spill/RootSpill slots, are roots
+    // too — scanned here, still within the root-scan step, so anything
+    // reachable only from one of them is copied before the Cheney loop
+    // below starts consuming `to`-space. `each_code_root` is the single
+    // visitor for all of this (`memory::roots`'s own "one list, every
+    // collector" rationale, extended to the code side) — see its own doc
+    // comment for why `scavenge_oop` can be passed directly here (matching
+    // `for_each_root`'s call just above) even though the four embedded-pool
+    // tables' own `oops_do` still wants a raw-`u64` closure internally.
+    super::roots::each_code_root(vm, scavenge_oop);
 
     if let Some(err) = vm.universe.pending_stall.take() {
         return Err(err);

@@ -16,8 +16,10 @@
 //! marking (SPEC §7.5: "old gen is traced, not card-scanned"). It stays in
 //! `scavenge.rs`, called separately after `for_each_root`.
 
+use crate::oops::layout::ROOTSPILL_BYTES;
 use crate::oops::wrappers::{KlassOop, MethodOop, SymbolOop};
 use crate::oops::Oop;
+use crate::runtime::frames::{walk_frames, AdapterKind, FrameView};
 use crate::runtime::vm_state::VmState;
 
 /// Visits every live root oop, replacing each in place with `f`'s result.
@@ -168,5 +170,209 @@ where
         // a genuine executing frame: the synthetic fullgc.rs unit tests
         // never set vm.regs.method, so they could never have caught this.
         vm.regs.method = Some(unsafe { MethodOop::from_oop_unchecked(nm) });
+    }
+}
+
+/// S12 D4.1: the CODE side of root enumeration — every oop reachable only
+/// through a live compiled/adapter frame's own registers-parked-to-memory,
+/// or through the code cache's own embedded literal pools, none of which
+/// `for_each_root` above ever reaches (that one walks `vm.stack`/handles/
+/// well-knowns; nothing there touches `codecache` at all). Called
+/// separately from `for_each_root`, not folded into it, because it needs a
+/// DIFFERENT walk (`runtime::frames::walk_frames`, native-stack-aware) as
+/// its first data source — S12 step 4 wires this into `scavenge` only
+/// (`memory::scavenge::scavenge`'s own "strong everything" pass); full-GC's
+/// own mark/update phases keep their existing direct table calls until step
+/// 5 adds weak key-klass filtering on top of this same shape.
+///
+/// Deliberately DEVIATES from `sprint_s12_detail.md`'s own D4.1 pseudocode
+/// signature (`fn each_code_root(vm: &mut VmState, f: &mut dyn FnMut(&mut
+/// u64))`, `f` untyped over raw words): that shape cannot actually be
+/// called with a transform that needs `&mut VmState` (`scavenge_oop`,
+/// exactly the transform `scavenge` itself needs) — a closure built to
+/// capture `vm` mutably, then passed alongside `vm` itself as this
+/// function's own first argument, is two live mutable borrows of the same
+/// value for the whole call, rejected unconditionally regardless of what
+/// either function body does internally. `for_each_root` above sidesteps
+/// this exact trap by threading `vm` as an explicit PER-CALL argument to
+/// `f` rather than letting `f` capture it — this function copies that same
+/// convention (`F: FnMut(&mut VmState, Oop) -> Oop`, matching
+/// `for_each_root`'s own signature exactly) for the same reason, and
+/// bridges to the four embedded-pool tables' own fixed `&mut dyn
+/// FnMut(&mut u64)` signature internally, via the identical
+/// `std::mem::take`-then-restore dance `scavenge.rs` already used at each
+/// of those four call sites before this function existed (moving a table
+/// out of `vm` first so a `vm`-capturing closure over the REST of `vm`
+/// never aliases the field being called through).
+pub fn each_code_root<F>(vm: &mut VmState, mut f: F)
+where
+    F: FnMut(&mut VmState, Oop) -> Oop,
+{
+    // --- 1. native frame roots: compiled spill slots + adapter RootSpill
+    // slots. Collected into an owned `Vec` FIRST, exactly like
+    // `frames.rs`'s own test module does: `walk_frames` only ever hands out
+    // `&VmState` (it has no reason to need more — classifying a frame never
+    // mutates anything), so its own borrow of `vm` must fully end before
+    // any `f(vm, oop)` call below can reborrow `vm` mutably. -------------
+    let mut frames = Vec::new();
+    walk_frames(vm, |fv| frames.push(fv));
+
+    for fv in frames {
+        match fv {
+            FrameView::Compiled { fp, ret_pc, nm } => {
+                // Collected to an owned `Vec` for the same reason `frames`
+                // itself was above: `iter_slots()` borrows the `OopMap`,
+                // which borrows `nmethod`, which borrows `vm.code_table` —
+                // that whole chain must end before `f(vm, ..)` can reborrow
+                // `vm` mutably inside the loop below.
+                let slots: Vec<u16> = vm
+                    .code_table
+                    .get(nm)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "each_code_root: a live compiled frame's own nmethod {nm:?} is no \
+                             longer installed -- a moving GC must never outlive the code it's \
+                             currently executing (D4.2: code never moves, but it can still be \
+                             FLUSHED — S12 step 6 — which must first prove no live activation \
+                             remains, exactly so this can never fire)"
+                        )
+                    })
+                    .oopmap_at(ret_pc)
+                    .iter_slots()
+                    .collect();
+                for slot in slots {
+                    // SAFETY: `fp` is a live compiled frame's own x29
+                    // (`walk_frames`'s own invariant — established by
+                    // `emit()`'s `stp x29,x30,...; mov x29,sp` prologue,
+                    // shared by every published nmethod). Slot addresses
+                    // are `fp − 8·(slot+1)`, exactly `compiler::emit::
+                    // spill_offset`'s own formula; `oopmap_at`'s map only
+                    // ever sets bits for slots the emitter reserved frame
+                    // space for (`frame_slots`, checked by `oopmap::
+                    // verify` at compile time).
+                    let addr = (fp - 8 * (slot as u64 + 1)) as *mut u64;
+                    let old = Oop::from_raw(unsafe { *addr });
+                    let new = f(vm, old);
+                    unsafe { *addr = new.raw() };
+                }
+            }
+            FrameView::Adapter {
+                fp,
+                kind,
+                caller_pc,
+            } => {
+                let n = real_oop_rootspill_slots(vm, kind, caller_pc);
+                for i in 0..n {
+                    // SAFETY: `fp` is a live anchor-setting stub's own x29;
+                    // RootSpill occupies `[fp − ROOTSPILL_BYTES, fp)`
+                    // (`emit_stub_prologue`'s own `sub sp,sp,#48` executed
+                    // AFTER `mov x29,sp`, so `x29` stays above the area
+                    // while `sp`/the `stp`s address into it) — slot `i`
+                    // (x_i) lives at `fp − ROOTSPILL_BYTES + 8·i`, P8's
+                    // pinned ABI.
+                    let addr = (fp - ROOTSPILL_BYTES as u64 + 8 * i as u64) as *mut u64;
+                    let old = Oop::from_raw(unsafe { *addr });
+                    let new = f(vm, old);
+                    unsafe { *addr = new.raw() };
+                }
+            }
+            FrameView::CallStub { .. } | FrameView::Interpreted { .. } => {
+                // `call_stub` keeps no live oop of its own past the marshal
+                // that already happened before this walk (`compiled_call`'s
+                // own doc); an interpreted activation's slots are already
+                // roots via `for_each_root`'s process-stack scan above.
+            }
+        }
+    }
+
+    // --- 2. code-embedded oops: the four tables' own existing `oops_do`/
+    // `update_keys`/`rehash` methods (S10/S11, already correct for both
+    // collectors since S11 step 10's scavenge-key fix) — bridged to `f`'s
+    // `(vm, Oop) -> Oop` shape via the take-and-restore dance explained in
+    // this function's own doc comment above. --------------------------
+    let mut code_table = std::mem::take(&mut vm.code_table);
+    code_table.oops_do(&mut |word| {
+        *word = f(vm, Oop::from_raw(*word)).raw();
+    });
+    code_table.update_keys(&mut |oop| f(vm, oop));
+    code_table.rehash();
+    vm.code_table = code_table;
+
+    let mut adapters = std::mem::take(&mut vm.adapters);
+    adapters.oops_do(&mut |word| {
+        *word = f(vm, Oop::from_raw(*word)).raw();
+    });
+    vm.adapters = adapters;
+
+    let mut pic_table = std::mem::take(&mut vm.pic_table);
+    pic_table.oops_do(&mut |word| {
+        *word = f(vm, Oop::from_raw(*word)).raw();
+    });
+    pic_table.update_keys(&mut |oop| f(vm, oop));
+    vm.pic_table = pic_table;
+
+    let mut mega_table = std::mem::take(&mut vm.mega_table);
+    mega_table.oops_do(&mut |word| {
+        *word = f(vm, Oop::from_raw(*word)).raw();
+    });
+    mega_table.rehash();
+    vm.mega_table = mega_table;
+}
+
+/// D4.1's per-kind RootSpill interpretation: how many of the SIX
+/// generically-spilled `x0..x5` words (starting from slot 0) are genuinely
+/// live oops for `kind` — the rest may hold stale, non-oop register content
+/// from the compiled caller's own unrelated register allocation (a dead
+/// value regalloc never bothered to clear) or a raw non-oop argument
+/// (`AllocSlow`'s own `size_bytes`), and must NOT be traced as a possible
+/// oop: an adversarial-review finding from step 3's own design pass —
+/// blindly scanning all 6 for every kind risks tracing garbage bits as a
+/// pointer, corrupting unrelated heap memory the moment anything moves.
+///
+/// `MustBeBoolean`/`AllocSlow` are FIXED (their own call shape never
+/// varies): `MustBeBoolean` has exactly one real argument (`val`, x0).
+/// `AllocSlow` has `klass` (x0, an oop) then `size_bytes` (x1) — a raw byte
+/// count computed by the emitter's own arithmetic (`emit_mov_imm64`/size
+/// folding), never smi-tagged, so treating it as a possible oop is
+/// actively unsafe, not merely imprecise. `Resolve`/`C2i`/`Mega`/`Dnu` are
+/// all reached from an ordinary `Ir::CallSend` site, whose own real arg
+/// count varies per call site — recovered by looking up the ORIGINAL
+/// compiled caller (`caller_pc`, `FrameView::Adapter`'s own field, exactly
+/// why it exists) and reading that site's own recorded `IcSite::argc`
+/// (receiver + argc args = `argc + 1` real oop slots). `Poll` can never
+/// reach here at all — `walk_frames`'s own documented invariant is that it
+/// never produces `FrameView::Adapter { kind: Poll, .. }` (`stub_poll`
+/// never tags the anchor), so this arm defends a static impossibility
+/// rather than checking a real runtime condition, matching `AdapterKind::
+/// from_raw`'s own "panic on can't-happen" posture.
+fn real_oop_rootspill_slots(vm: &VmState, kind: AdapterKind, caller_pc: u64) -> usize {
+    match kind {
+        AdapterKind::MustBeBoolean => 1,
+        AdapterKind::AllocSlow => 1,
+        AdapterKind::Poll => unreachable!(
+            "each_code_root: stub_poll never tags the anchor (S10 D5.6) -- walk_frames must \
+             never produce FrameView::Adapter{{kind: Poll, ..}} (see its own module doc)"
+        ),
+        AdapterKind::Resolve | AdapterKind::C2i | AdapterKind::Mega | AdapterKind::Dnu => {
+            let nm_id = vm.code_table.find_by_pc(caller_pc).unwrap_or_else(|| {
+                panic!(
+                    "each_code_root: {kind:?}'s own caller_pc {caller_pc:#x} is not inside any \
+                     alive nmethod -- the anchor/tier-link chain and the code table disagree"
+                )
+            });
+            let nmethod = vm.code_table.get(nm_id).expect("just found by find_by_pc");
+            let off = (caller_pc - nmethod.code.base as u64) as u32;
+            let site = nmethod
+                .ic_sites
+                .iter()
+                .find(|s| s.off + 4 == off)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "each_code_root: {kind:?}'s own caller_pc {caller_pc:#x} (blob offset \
+                         {off:#x}) doesn't match any of nmethod {nm_id:?}'s own IcSites"
+                    )
+                });
+            1 + site.argc as usize
+        }
     }
 }

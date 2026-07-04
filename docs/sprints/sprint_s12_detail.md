@@ -344,6 +344,90 @@ is kept alive by its nmethod — acceptable float, gone at the next full GC).
 > `catch_unwind` INSIDE the stub's `extern "C"` function, never letting one
 > unwind across that boundary into hand-assembled native frames (UB).
 
+> **STEP-4 NOTES (as-built).** (a) **`each_code_root`'s own signature
+> deviates from this doc's D4.1 pseudocode** (`fn each_code_root(vm: &mut
+> VmState, f: &mut dyn FnMut(&mut u64))`). That literal shape cannot be
+> called with a transform that itself needs `&mut VmState` (`scavenge_oop`
+> — exactly what scavenge integration requires): a closure built to capture
+> `vm` mutably, then passed alongside `vm` itself as this function's own
+> first argument, is two live mutable borrows of the same value for the
+> whole call — rejected unconditionally, regardless of what either
+> function body does internally. Fixed by copying `for_each_root`'s own
+> convention instead: `F: FnMut(&mut VmState, Oop) -> Oop`, threading `vm`
+> as an explicit PER-CALL argument to `f` rather than letting `f` capture
+> it. The four embedded-pool tables' own `oops_do`/`update_keys` methods
+> keep their existing `&mut dyn FnMut(&mut u64)` signature unchanged
+> (untouched, already correct since S10/S11) — `each_code_root` bridges to
+> them internally via the same `std::mem::take`-then-restore dance
+> `scavenge.rs` already used at each of those four call sites before this
+> function existed, now consolidated into one place. (b) **Scope is
+> scavenge-only, matching the Implementation order's own "strong
+> everything" phrase** — `fullgc.rs`'s mark/phase-C sections are
+> UNTOUCHED this step (still their own direct table calls), deliberately:
+> full-GC integration (weak key-klass filtering) is step 5's job, and the
+> D8 bridge still forbids full GC under a live compiled frame regardless,
+> so there is nothing for `each_code_root` to do there yet. (c) **The
+> flagship `mid_loop_forced_scavenge` test (tests_s12.md gate item 2), AS
+> LITERALLY DESIGNED, cannot go green until step 7.** Tracing the actual
+> D8 bridge code (not just this doc's own prose) shows it is a genuine
+> THREE-part interlock: `alloc::alloc_words`'s diversion arm, BOTH
+> `prim_gc_scavenge`/`prim_gc_full`'s own `gc_pending` defer (`alloc.rs`'s
+> own doc comment already treats all three, plus both collectors'
+> `debug_assert`s, as one interlock, deleted together in step 7) — and the
+> test's own design sends the REAL `Gc scavenge` primitive from inside a
+> compiled loop 100 times, expecting it to run for real each time. That
+> needs `prim_gc_scavenge`'s OWN defer-guard lifted, which is step 7's
+> work, not step 4's. Rather than silently skip proving the mechanism,
+> added a narrow, default-off, dormant-not-`#[cfg(test)]` field
+> (`VmState::test_allow_moving_gc_under_compiled`, mirroring
+> `test_walk_capture`'s own established shape) that bypasses ONLY
+> `scavenge`'s own internal `debug_assert` — none of the three PRODUCTION
+> doors are touched, so ordinary Smalltalk code still cannot reach a
+> moving collector under a live compiled frame until step 7 opens all
+> three together. `tests/it_gc_jit.rs`'s
+> `compiled_frame_spill_slot_survives_forced_scavenge` proves the SAME
+> underlying mechanism today — a real scavenge, a real live compiled
+> frame, a real relocation — via a direct `scavenge()` call from a new
+> `rt_alloc_slow` test hook (`test_force_scavenge_in_alloc_slow` +
+> `test_scavenge_probe`, same `catch_unwind`-inside-the-`extern "C"`-
+> boundary shape as `test_walk_capture`) instead of a Smalltalk send. The
+> full loop-based golden (100 iterations, real `Gc scavenge` sends,
+> `gc_under_compiled >= 100`) is deferred to step 7/8. (d) **A systemic
+> hazard found while designing that test, NOT yet fixed anywhere:** every
+> one of the six anchor-setting stubs' Rust handlers copies an oop out of
+> its own RootSpill slot into a plain Rust local BEFORE doing its own
+> "business logic" call (`rt_alloc_slow`'s `klass_bits`/`klass`, `stub_
+> alloc_slow`'s own `mov x1,x0` running AFTER `emit_stub_prologue`'s `stp`
+> already parked the ORIGINAL x0 to RootSpill, so a native memory copy and
+> a separate Rust copy coexist). `each_code_root` correctly updates the
+> NATIVE copy if a scavenge relocates it, but nothing re-derives any of
+> the six handlers' OWN Rust locals from it afterward — moot today (no
+> caller reaches a real GC from inside any of the six before step 7 opens
+> the other two bridge doors) but a real latent hazard the moment it does.
+> Tracked here rather than fixed now: fixing it needs a systematic pass
+> across all six handlers, not a one-off patch to `rt_alloc_slow` alone,
+> and nothing can exercise it for real before step 7 regardless. The new
+> integration test sidesteps it locally by tenuring `AllocTarget`'s own
+> klass before compiling/running anything (old gen is never touched by a
+> scavenge), which also surfaced the identical shape one level up, in the
+> TEST's own setup code (a `KlassOop` local captured before a tenuring
+> scavenge that then promoted/relocated it) — fixed there by deriving the
+> Rust-local `KlassOop` only AFTER the tenuring scavenge runs. (e) **A
+> second, unrelated setup bug found empirically, not by inspection:** forcing
+> the Alloc slow edge by lying about `eden.top` (`vm.universe.eden.top =
+> vm.universe.eden.end`, `it_tier1.rs`'s own established
+> `allocation_fast_and_slow` idiom) is safe only as long as nothing walks
+> the heap afterward — that test never scavenges, so the gap of
+> never-initialized memory between the real frontier and the lied-about
+> `top` is never read. This step's own test DOES scavenge (that's the
+> point), and `scavenge`'s entry-verify (`verify::verify_enabled`, always
+> on in debug builds) walks eden up to `eden.top` — reading straight into
+> that gap and panicking on a malformed mark word. Fixed by topping up
+> eden HONESTLY instead: a loop allocating real, fully-valid throwaway
+> instances until less than one more fits, so every byte up to the true
+> `eden.top` is a genuine walkable object at every point, including inside
+> the forced scavenge.
+
 ## Pitfalls
 
 - **P1 — exact PcDesc match or die.** The GC-path `oopmap_at` must panic on

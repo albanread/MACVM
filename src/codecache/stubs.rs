@@ -1079,6 +1079,69 @@ pub unsafe extern "C" fn rt_alloc_slow(vm: *mut VmState, klass_bits: u64, size_b
         });
         vm.test_walk_capture = Some(result);
     }
+    // S12 step 4 test hook (`VmState::test_scavenge_probe`'s own doc):
+    // same rationale as `test_walk_capture` just above — this is the one
+    // place a test can force a REAL `scavenge` to run against a REAL live
+    // compiled frame's own spill slot, which is the only honest way to
+    // prove `memory::roots::each_code_root`'s new frame-scanning code
+    // actually relocates it correctly. `catch_unwind` here for the same
+    // not-safe-to-unwind-across-`extern "C"` reason as `test_walk_capture`.
+    if vm.test_force_scavenge_in_alloc_slow {
+        vm.test_force_scavenge_in_alloc_slow = false;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut frames = Vec::new();
+            crate::runtime::frames::walk_frames(vm, |fv| frames.push(fv));
+            let (fp, ret_pc, nm) = frames
+                .iter()
+                .find_map(|fv| match fv {
+                    crate::runtime::frames::FrameView::Compiled { fp, ret_pc, nm } => {
+                        Some((*fp, *ret_pc, *nm))
+                    }
+                    _ => None,
+                })
+                .expect(
+                    "test_force_scavenge_in_alloc_slow: caller must have a live compiled frame \
+                     beneath rt_alloc_slow",
+                );
+            let slot = {
+                let nmethod = vm.code_table.get(nm).expect("just walked through it");
+                let mut slots = nmethod.oopmap_at(ret_pc).iter_slots();
+                let slot = slots.next().expect(
+                    "test_force_scavenge_in_alloc_slow: the caller's compiled frame must have \
+                     exactly one live oop slot (its own receiver, kept alive across the Alloc \
+                     safepoint) -- zero found",
+                );
+                assert!(
+                    slots.next().is_none(),
+                    "test_force_scavenge_in_alloc_slow: expected exactly one live oop slot, \
+                     found more than one"
+                );
+                slot
+            };
+            let addr = (fp - 8 * (slot as u64 + 1)) as *mut u64;
+            // SAFETY: `fp`/`slot` are exactly `memory::roots::
+            // each_code_root`'s own compiled-frame formula, just derived
+            // independently here so the test can read the slot BEFORE and
+            // AFTER without going through that function itself.
+            let before = unsafe { *addr };
+            vm.test_allow_moving_gc_under_compiled = true;
+            let scavenge_result = crate::memory::scavenge::scavenge(vm);
+            vm.test_allow_moving_gc_under_compiled = false;
+            scavenge_result.expect("test_force_scavenge_in_alloc_slow: scavenge must not stall");
+            let after = unsafe { *addr };
+            (before, after)
+        }))
+        .map_err(|e| {
+            e.downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| e.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| {
+                    "test_force_scavenge_in_alloc_slow panicked with a non-string payload"
+                        .to_string()
+                })
+        });
+        vm.test_scavenge_probe = Some(result);
+    }
     crate::memory::alloc::alloc_slots(vm, klass).oop().raw()
 }
 

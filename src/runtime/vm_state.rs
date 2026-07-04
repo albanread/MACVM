@@ -508,6 +508,39 @@ pub struct VmState {
     /// own cross-check invariant (a native boundary always has a matching
     /// tier link) breaks.
     pub test_tear_tier_links_before_walk: bool,
+    /// S12 step 4, same "dormant, not `#[cfg(test)]`" status as
+    /// `test_walk_capture`: lets a test call `memory::scavenge::scavenge`
+    /// DIRECTLY while a live compiled frame is genuinely on the native
+    /// stack, bypassing only THIS function's own internal
+    /// `debug_assert!(compiled_depth == 0, ..)` — none of the three
+    /// production-facing S11 D8 bridge doors (`alloc::alloc_words`'s
+    /// diversion arm, `prim_gc_scavenge`/`prim_gc_full`'s own `gc_pending`
+    /// defer) are affected by this flag at all, so ordinary Smalltalk code
+    /// still cannot reach a moving collector under a live compiled frame
+    /// until step 7 opens all three doors together (deliberately grouped:
+    /// full GC isn't compiled-frame-aware until step 5, nmethod flushing
+    /// doesn't exist until step 6, so opening every door this early would
+    /// let ordinary code depend on a still-incomplete mechanism). Exists
+    /// because proving `memory::roots::each_code_root`'s new frame-scanning
+    /// path correct needs a REAL scavenge to run against a REAL live
+    /// compiled/adapter frame — the same "no honest way to test this
+    /// without a genuine in-flight native chain" reasoning as
+    /// `test_walk_capture` itself.
+    pub test_allow_moving_gc_under_compiled: bool,
+    /// Companion to `test_allow_moving_gc_under_compiled`: if set,
+    /// `rt_alloc_slow` runs a REAL `memory::scavenge::scavenge` (with that
+    /// flag flipped on for just the duration of the call) before doing its
+    /// own normal allocation, and overwrites this with `Ok((before, after))`
+    /// — the raw bits of the SOLE live oop slot `runtime::frames::
+    /// walk_frames` finds in the compiled frame beneath it, read
+    /// immediately before and after the forced scavenge — or (`Err`) the
+    /// message of a panic either the walk or the scavenge itself raised.
+    /// Same `catch_unwind`-inside-the-`extern "C"`-boundary reasoning as
+    /// `test_walk_capture`: a panic here must never unwind into the
+    /// hand-assembled native frames below. One-shot (cleared immediately),
+    /// matching `trace_on_poll`'s convention.
+    pub test_force_scavenge_in_alloc_slow: bool,
+    pub test_scavenge_probe: Option<Result<(u64, u64), String>>,
 }
 
 impl VmState {
@@ -639,6 +672,9 @@ impl VmState {
             trace_on_poll: false,
             test_walk_capture: None,
             test_tear_tier_links_before_walk: false,
+            test_allow_moving_gc_under_compiled: false,
+            test_force_scavenge_in_alloc_slow: false,
+            test_scavenge_probe: None,
         };
         crate::runtime::globals::bootstrap_well_known(&mut vm);
         vm
