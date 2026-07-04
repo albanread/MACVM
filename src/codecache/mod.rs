@@ -275,6 +275,18 @@ impl CodeCache {
     }
 }
 
+impl Drop for CodeCache {
+    /// S13: retire this cache's `deopt_trap` registry entry (if any) BEFORE the
+    /// `_jit: MacJit` field's own `Drop` unmaps the region (fields drop after
+    /// the struct's own `Drop::drop`). Without this, the SIGTRAP handler could
+    /// keep a live registry range pointing at freed memory and redirect a trap
+    /// into a dangling trampoline. A no-op for a cache that was never
+    /// registered (a non-JIT `VmState`, or a bare test cache).
+    fn drop(&mut self) {
+        deopt_trap::deregister(self.base as u64);
+    }
+}
+
 fn in_branch26_range(disp: i64) -> bool {
     (-(1i64 << 27)..(1i64 << 27)).contains(&disp)
 }

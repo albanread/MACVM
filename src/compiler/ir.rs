@@ -371,6 +371,18 @@ pub struct IrMethod {
     /// reasoning as `true_lit`/`false_lit` above), so `convert()` resolves
     /// it once, here.
     pub call_sites: Vec<CallSiteInfo>,
+    /// S13: the physical oop-pool index holding THIS method's own compiled
+    /// `MethodOop`, interned (as `RelocKind::Oop`, so a moving GC keeps it
+    /// current) at the end of `convert` — but ONLY when the method has at
+    /// least one deopt site (a real `CallSend`/`Alloc` safepoint). A deopt
+    /// materializer (`runtime::deopt`) reads it via `read_pool_oop` to fill a
+    /// reconstructed frame's `FRAME_METHOD` slot (D5 M3); every S13 scope is
+    /// this same method (depth-1), so `driver::build_deopt_metadata` stamps
+    /// every scope record with this one index. `None` for a method with no
+    /// deopt sites (all-smi-inline / no sends) — it never deopts, so it needs
+    /// no method-oop pool word, which keeps such methods' listing goldens
+    /// byte-stable (the reason step 3b left `method_pool_ix` a placeholder).
+    pub method_pool_ix: Option<u32>,
 }
 
 /// One `Ir::CallSend` site's selector/argc — see `IrMethod::call_sites`.
@@ -1532,6 +1544,19 @@ pub fn convert(vm: &VmState, method: MethodOop, cfg: &Cfg) -> IrMethod {
         })
         .collect();
 
+    // S13: if this method has any deopt site, intern its own compiled
+    // `MethodOop` into the pool (as an `Oop` reloc, so `oops_do`/GC keeps the
+    // pool word current) so the deopt materializer can name the method for a
+    // reconstructed frame's `FRAME_METHOD` slot. Interned LAST (highest pool
+    // index) — existing `PoolLit` references keep their indices — and only
+    // when needed, so an all-smi-inline method's pool (and its listing golden)
+    // is untouched.
+    let method_pool_ix = if ir_blocks.iter().any(|b| !b.deopt_sites.is_empty()) {
+        Some(t.pool.intern(method.oop().raw(), Some(RelocKind::Oop)).0)
+    } else {
+        None
+    };
+
     IrMethod {
         blocks: ir_blocks,
         vregs: t.vregs,
@@ -1544,6 +1569,7 @@ pub fn convert(vm: &VmState, method: MethodOop, cfg: &Cfg) -> IrMethod {
         nil_lit,
         mark_slots_lit,
         call_sites: t.call_sites,
+        method_pool_ix,
     }
 }
 

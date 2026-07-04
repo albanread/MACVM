@@ -532,7 +532,12 @@ fn build_deopt_metadata(
                     .map(|i| resolve_frame_loc(ir::VReg(i as u32 + 1), position, intervals))
                     .collect();
                 let scope = rec.begin_scope(ScopeDescData {
-                    method_pool_ix: 0,
+                    // S13: this method's own compiled MethodOop, interned by
+                    // `ir::convert` iff the method has deopt sites — which it
+                    // does (we are recording one now), so this is always Some.
+                    method_pool_ix: ir_method
+                        .method_pool_ix
+                        .expect("a method with a deopt site interned its own method oop"),
                     is_block: false,
                     sender: None,
                     receiver,
@@ -975,9 +980,20 @@ mod tests {
             vec![expect_slot(VReg(1), p0)],
             "the arg `a` (VReg 1), used again at the box:with: send, is a frame slot"
         );
+        // S13: a method with deopt sites interns its own compiled MethodOop
+        // into the pool (`ir::convert`), and every scope record names that
+        // real pool index — no longer the 3b `0` placeholder.
+        let expected_ix = ir_method
+            .method_pool_ix
+            .expect("a method with deopt sites interned its method oop");
         assert_eq!(
-            scope0.method_pool_ix, 0,
-            "3b placeholder until step 6 materialization interns the method oop"
+            scope0.method_pool_ix, expected_ix,
+            "scope names the real interned method-oop pool index"
+        );
+        assert_eq!(
+            ir_method.pool[expected_ix as usize].value,
+            method.oop().raw(),
+            "that pool word holds this method's own oop"
         );
         assert_eq!(scope0.sender, None, "S13 emits depth-1 chains only");
 

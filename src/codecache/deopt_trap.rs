@@ -27,7 +27,8 @@
 
 #![allow(unsafe_code)]
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 #[cfg(test)]
 use crate::compiler::assembler::xr;
@@ -94,33 +95,107 @@ pub fn emit_brk(a: &mut dyn Assembler, imm16: u16) {
     a.emit_u32(brk_word(imm16));
 }
 
-// ── Code-cache bounds: the ONE permitted global (D3 step 2) ───────────────
+// ── The code-cache registry (D3 step 2, multi-VmState-safe) ───────────────
 //
-// The handler cannot safely reach a `&CodeCache` from signal context, so the
-// region's `[lo, hi)` is cached in two write-once atomics at `install`. Two
-// `u64` compares against these is the whole "is this pc ours?" test before we
-// even look at the instruction word. `Relaxed` is sufficient: they are
-// written once, before any compiled code (and therefore any trap) can run,
-// and the SIGTRAP that reads them is delivered to a thread that has, by
-// definition, already executed past that startup barrier.
+// The handler cannot safely reach a `&CodeCache` from signal context, so each
+// registered code cache's `[lo, hi)` range and its OWN trampolines are cached
+// here. A trapping pc is looked up against this registry: the entry whose
+// range contains it names the cache the brk came from, and that cache's own
+// (guaranteed-live — the brk fired from inside it) uncommon trampoline / assert
+// stub. This replaces an earlier single-range/single-trampoline pair whose
+// last-writer-wins semantics silently misdirected a brk once a SECOND JIT
+// `VmState` (each with its own `CodeCache` at a different address) was created
+// — a real hazard in the test suite and any multi-VM host, not just theory.
+//
+// Signal-safety: the handler only READS these atomics (a fixed-size array
+// scan, no allocation/lock), which is async-signal-safe. Mutation
+// (`register`/`deregister`, at `install`/`CodeCache::drop`, never in signal
+// context) is serialized by `REGISTRY_LOCK`; the handler never takes it. A
+// slot's `lo` is the match key and is written LAST (Release) / read FIRST
+// (Acquire), so the handler sees either a fully-populated entry or none.
+//
+// `lo == 0` marks an empty/retired slot (a real code-cache base is never 0).
 
-static CODE_LO: AtomicU64 = AtomicU64::new(0);
-static CODE_HI: AtomicU64 = AtomicU64::new(0);
+const REGISTRY_CAP: usize = 128;
+static REG_LO: [AtomicU64; REGISTRY_CAP] = [const { AtomicU64::new(0) }; REGISTRY_CAP];
+static REG_HI: [AtomicU64; REGISTRY_CAP] = [const { AtomicU64::new(0) }; REGISTRY_CAP];
+static REG_TRAMP: [AtomicU64; REGISTRY_CAP] = [const { AtomicU64::new(0) }; REGISTRY_CAP];
+static REG_ASSERT: [AtomicU64; REGISTRY_CAP] = [const { AtomicU64::new(0) }; REGISTRY_CAP];
+/// High-water mark of slots ever used (the handler scans `0..REG_LEN`; retired
+/// slots within it have `lo == 0` and are skipped / reused).
+static REG_LEN: AtomicUsize = AtomicUsize::new(0);
+static REGISTRY_LOCK: Mutex<()> = Mutex::new(());
 
-/// Absolute address of the generated `deopt_uncommon_trampoline` (D4). The
-/// handler sets `__pc` to this to resume there after sigreturn. Write-once at
-/// `install`; a value of 0 means "not installed", which the handler treats as
-/// "not ours" (so a stray trap before install cannot jump through a null).
-static UNCOMMON_TRAMPOLINE: AtomicU64 = AtomicU64::new(0);
+/// `true` once a SIGTRAP handler has been armed (by the first `install`).
+/// Arming is process-global and idempotent — later caches only add registry
+/// entries, they do not re-`sigaction`.
+static HANDLER_ARMED: AtomicBool = AtomicBool::new(false);
 
-/// Absolute address of the tiny assert stub the handler redirects `0xDE02`
-/// traps to (D3 step 4 — still "no work in-handler"; the stub calls
-/// [`rt_compiled_assert_failed`], which panics off-signal). Write-once.
-static ASSERT_STUB: AtomicU64 = AtomicU64::new(0);
+/// Register one code cache's `[lo, hi)` range + its own trampolines. Reuses a
+/// retired slot or dedups an existing same-`lo` entry (a re-install of a live
+/// cache) before appending; panics only if `REGISTRY_CAP` distinct LIVE caches
+/// coexist (absurd — deregistration on drop keeps this bounded by peak
+/// concurrency, not total caches ever created).
+fn register(lo: u64, hi: u64, tramp: u64, assert: u64) {
+    let _g = REGISTRY_LOCK.lock().unwrap();
+    let n = REG_LEN.load(Ordering::Acquire);
+    // Prefer an existing same-lo entry (re-install), then any retired slot.
+    let slot = (0..n)
+        .find(|&i| REG_LO[i].load(Ordering::Acquire) == lo)
+        .or_else(|| (0..n).find(|&i| REG_LO[i].load(Ordering::Acquire) == 0));
+    let i = match slot {
+        Some(i) => i,
+        None => {
+            assert!(
+                n < REGISTRY_CAP,
+                "deopt_trap: code-cache registry overflow ({REGISTRY_CAP} live caches)"
+            );
+            REG_LEN.store(n + 1, Ordering::Release);
+            n
+        }
+    };
+    // Fields first, then `lo` (the match key) last with Release.
+    REG_HI[i].store(hi, Ordering::Relaxed);
+    REG_TRAMP[i].store(tramp, Ordering::Relaxed);
+    REG_ASSERT[i].store(assert, Ordering::Relaxed);
+    REG_LO[i].store(lo, Ordering::Release);
+}
 
-/// `true` once [`install`] has run. Guards against a double `sigaction` and
-/// lets the handler cheaply reject traps that predate installation.
-static INSTALLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Retire the entry whose base is `lo` (called from `CodeCache::drop`, so a
+/// freed/unmapped cache's stale range never misdirects a later trap). A no-op
+/// for a cache that was never registered (a non-JIT `VmState`, or a bare test
+/// cache).
+pub(crate) fn deregister(lo: u64) {
+    let _g = REGISTRY_LOCK.lock().unwrap();
+    let n = REG_LEN.load(Ordering::Acquire);
+    for slot in REG_LO.iter().take(n) {
+        if slot.load(Ordering::Acquire) == lo {
+            slot.store(0, Ordering::Release);
+        }
+    }
+}
+
+/// Look up the registry entry owning `pc` (async-signal-safe: a fixed-array
+/// atomic scan, no lock/alloc). Returns `(tramp, assert)` of the owning cache,
+/// or `None` if `pc` is in no registered cache. Reads `lo` with Acquire (the
+/// publish key) before the rest of the entry.
+fn lookup_pc(pc: u64) -> Option<(u64, u64)> {
+    let n = REG_LEN.load(Ordering::Acquire);
+    for i in 0..n {
+        let lo = REG_LO[i].load(Ordering::Acquire);
+        if lo == 0 {
+            continue;
+        }
+        let hi = REG_HI[i].load(Ordering::Relaxed);
+        if pc >= lo && pc < hi {
+            return Some((
+                REG_TRAMP[i].load(Ordering::Relaxed),
+                REG_ASSERT[i].load(Ordering::Relaxed),
+            ));
+        }
+    }
+    None
+}
 
 // ── The macOS arm64 ucontext, laid out by hand (D3 step 1) ────────────────
 //
@@ -238,27 +313,24 @@ extern "C" fn sigtrap_handler(_sig: i32, _info: *mut libc::siginfo_t, ctx: *mut 
         let ss = &mut (*mc).__ss;
         let pc = ss.__pc;
 
-        // (2) bounds + our-trap decode. Reject if not installed, out of the
-        // code cache, or not one of our reserved brk imms.
-        if !INSTALLED.load(Ordering::Relaxed) {
-            restore_default_and_return();
-            return;
-        }
-        let lo = CODE_LO.load(Ordering::Relaxed);
-        let hi = CODE_HI.load(Ordering::Relaxed);
-        if pc < lo || pc >= hi {
-            // Not in our code cache — a foreign brk (e.g. a Rust abort in
-            // ordinary Rust text). (3) Make it fatal.
-            restore_default_and_return();
-            return;
-        }
+        // (2) Which registered code cache owns this pc? The owning entry names
+        // that cache's OWN (guaranteed-live — the brk fired from inside it)
+        // trampoline + assert stub. A pc in NO registered cache is a foreign
+        // brk (a Rust abort in ordinary text, etc.) → (3) make it fatal.
+        let (tramp, assert) = match lookup_pc(pc) {
+            Some(pair) => pair,
+            None => {
+                restore_default_and_return();
+                return;
+            }
+        };
         // The code cache is always readable — this load cannot fault.
         let word = core::ptr::read(pc as *const u32);
         let imm = match decode_deopt_brk(word) {
             Some(imm) => imm,
             None => {
-                // A brk inside the cache we don't recognise (should not
-                // happen, but treat as foreign — (3), stay honest/fatal).
+                // A brk inside a cache we don't recognise (should not happen,
+                // but treat as foreign — (3), stay honest/fatal).
                 restore_default_and_return();
                 return;
             }
@@ -266,19 +338,18 @@ extern "C" fn sigtrap_handler(_sig: i32, _info: *mut libc::siginfo_t, ctx: *mut 
 
         if imm == TRAP_ASSERT {
             // (4) Redirect to the assert stub, which panics off-signal.
-            let stub = ASSERT_STUB.load(Ordering::Relaxed);
-            if stub != 0 {
+            if assert != 0 {
                 ss.__x[16] = pc;
-                ss.__pc = stub;
+                ss.__pc = assert;
             } else {
                 restore_default_and_return();
             }
             return;
         }
 
-        // (5) 0xDE00 / 0xDE01 — redirect into the uncommon trampoline with the
-        // trap pc stashed in x16 (IP0). PAC is off, so no signing needed.
-        let tramp = UNCOMMON_TRAMPOLINE.load(Ordering::Relaxed);
+        // (5) 0xDE00 / 0xDE01 — redirect into the owning cache's uncommon
+        // trampoline with the trap pc stashed in x16 (IP0). PAC is off, so no
+        // signing needed.
         if tramp == 0 {
             restore_default_and_return();
             return;
@@ -569,22 +640,18 @@ pub fn read_pool_oop(nm: &crate::codecache::nmethod::Nmethod, pool_ix: u32) -> O
 /// Call once at startup, after the code cache exists but before running any
 /// compiled code (the same window `stubs::install` runs in).
 ///
-/// Order matters: the trampolines and their target statics MUST be published
-/// and stored *before* `sigaction` arms the handler, so the very first trap
-/// can never see a half-installed state (a `tramp == 0` handler falls through
-/// to SIG_DFL, but publishing first removes even that transient).
+/// Order matters: the trampolines are published and this cache's registry
+/// entry is stored *before* `sigaction` arms the handler, so the very first
+/// trap can never see a half-installed state. Called once per JIT `VmState`;
+/// the handler is armed on the FIRST call only (`HANDLER_ARMED`), every call
+/// registers its own cache's range + trampolines (multi-VmState-safe).
 ///
 /// Debugger caveat (D3, documented loudly): under lldb, Mach `EXC_BREAKPOINT`
 /// is claimed *before* POSIX SIGTRAP conversion, so every deopt trap stops the
 /// debugger. Mach exception ports are the v2 fix; v1 accepts the caveat
 /// (README: `MACVM_JIT=off` for lldb sessions).
 pub fn install(cache: &mut CodeCache) -> DeoptTrampolines {
-    // 1. Cache the code-cache bounds for the handler's pc check.
-    let (lo, hi) = cache.bounds();
-    CODE_LO.store(lo, Ordering::Relaxed);
-    CODE_HI.store(hi, Ordering::Relaxed);
-
-    // 2. Generate + publish the trampolines.
+    // 1. Generate + publish this cache's own trampolines.
     let uncommon_blob = build_uncommon_trampoline();
     let hu = cache
         .alloc(uncommon_blob.code.len())
@@ -597,24 +664,27 @@ pub fn install(cache: &mut CodeCache) -> DeoptTrampolines {
         .expect("deopt_trap::install: code cache too small for assert stub");
     cache.publish(ha, &assert_blob);
 
-    UNCOMMON_TRAMPOLINE.store(hu.base as u64, Ordering::Relaxed);
-    ASSERT_STUB.store(ha.base as u64, Ordering::Relaxed);
+    // 2. Register this cache's range + trampolines so the handler can map a
+    //    trapping pc back to THIS cache (retired by `CodeCache::drop`).
+    let (lo, hi) = cache.bounds();
+    register(lo, hi, hu.base as u64, ha.base as u64);
 
-    // 3. Arm the handler (last — see the doc above). SA_SIGINFO for the
-    //    3-arg form; SA_ONSTACK so a trap on a nearly-exhausted stack still
-    //    delivers on the alt stack if one is set up (harmless if not).
-    // SAFETY: `sigtrap_handler` matches the SA_SIGINFO 3-arg ABI; we install
-    // it exactly once (guarded by INSTALLED) with a zeroed, fully-initialized
-    // `sigaction`.
-    unsafe {
-        let mut sa: libc::sigaction = core::mem::zeroed();
-        sa.sa_sigaction = sigtrap_handler as *const () as usize;
-        sa.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
-        libc::sigemptyset(&mut sa.sa_mask);
-        let rc = libc::sigaction(libc::SIGTRAP, &sa, core::ptr::null_mut());
-        assert_eq!(rc, 0, "deopt_trap::install: sigaction(SIGTRAP) failed");
+    // 3. Arm the handler on the first install only (process-global, idempotent).
+    //    SA_SIGINFO for the 3-arg form; SA_ONSTACK so a trap on a nearly-
+    //    exhausted stack still delivers on the alt stack if one is set up.
+    if !HANDLER_ARMED.swap(true, Ordering::AcqRel) {
+        // SAFETY: `sigtrap_handler` matches the SA_SIGINFO 3-arg ABI; armed
+        // exactly once (the swap above) with a zeroed, fully-initialized
+        // `sigaction`.
+        unsafe {
+            let mut sa: libc::sigaction = core::mem::zeroed();
+            sa.sa_sigaction = sigtrap_handler as *const () as usize;
+            sa.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
+            libc::sigemptyset(&mut sa.sa_mask);
+            let rc = libc::sigaction(libc::SIGTRAP, &sa, core::ptr::null_mut());
+            assert_eq!(rc, 0, "deopt_trap::install: sigaction(SIGTRAP) failed");
+        }
     }
-    INSTALLED.store(true, Ordering::Relaxed);
 
     DeoptTrampolines {
         uncommon: hu,
@@ -631,16 +701,14 @@ pub fn install(cache: &mut CodeCache) -> DeoptTrampolines {
 // capture stub that records (pc, x16) and returns, then restore state.
 
 /// # Safety
-/// Test-only. Overrides the handler's redirect target and code-cache bounds
-/// so a test can drive the whole signal path against a hand-built stub.
-/// Serialize test use (`#[serial]`-style single-threaded runner) — these are
-/// process-global statics shared with the real handler.
+/// Test-only. Registers a single `[lo, hi)` range → `uncommon_tramp` and arms
+/// the handler, so a test can drive the whole signal path against a hand-built
+/// stub. Serialize test use (`#[serial]`-style single-threaded runner) — the
+/// registry + SIGTRAP disposition are process-global, shared with the real
+/// handler. `test_disarm_handler` restores `SIG_DFL` + retires the entry.
 #[cfg(test)]
 unsafe fn test_arm_handler(lo: u64, hi: u64, uncommon_tramp: u64) {
-    CODE_LO.store(lo, Ordering::Relaxed);
-    CODE_HI.store(hi, Ordering::Relaxed);
-    UNCOMMON_TRAMPOLINE.store(uncommon_tramp, Ordering::Relaxed);
-    INSTALLED.store(true, Ordering::Relaxed);
+    register(lo, hi, uncommon_tramp, 0);
     // SAFETY: same contract as `install`'s sigaction arm.
     unsafe {
         let mut sa: libc::sigaction = core::mem::zeroed();
@@ -650,6 +718,7 @@ unsafe fn test_arm_handler(lo: u64, hi: u64, uncommon_tramp: u64) {
         let rc = libc::sigaction(libc::SIGTRAP, &sa, core::ptr::null_mut());
         assert_eq!(rc, 0, "test_arm_handler: sigaction failed");
     }
+    HANDLER_ARMED.store(true, Ordering::Release);
 }
 
 #[cfg(test)]
@@ -808,13 +877,15 @@ mod tests {
             "x16 must hold the trap pc = the brk-stub's first (and only trapping) instruction"
         );
 
-        // Restore SIG_DFL so no later test sees our handler.
+        // Restore SIG_DFL + retire this test's registry entry so no later
+        // test sees our handler or its stale range.
         unsafe {
             let mut sa: libc::sigaction = core::mem::zeroed();
             sa.sa_sigaction = libc::SIG_DFL;
             libc::sigaction(libc::SIGTRAP, &sa, core::ptr::null_mut());
         }
-        INSTALLED.store(false, Ordering::Relaxed);
+        deregister(lo);
+        HANDLER_ARMED.store(false, Ordering::Release);
     }
 
     /// `read_frame_slot` reads the 8-byte oop at `fp + off` (the one licensed

@@ -376,29 +376,24 @@ fn nmethod_ref(vm: &VmState, id: NmethodId) -> &Nmethod {
 
 /// Resolve a scope's `method_pool_ix` to its `MethodOop` (D5 M3: the OLD
 /// compile-time method — a mid-activation redefinition completes under old
-/// code).
+/// code). Reads the LIVE oop-pool word, so a moving GC that relocated the
+/// method oop is transparently accounted for (`oops_do` keeps the pool word
+/// current).
 ///
-/// **S13 gap (step-7 blocker).** Real S13 compiles record `method_pool_ix`
-/// as a `0` PLACEHOLDER (step 3b deferred interning the compiled method oop
-/// into the pool to avoid perturbing driver listing goldens). So for a
-/// PRODUCTION nmethod, pool word 0 is NOT the method — reading it here would
-/// return the wrong oop. Until that interning lands, a production deopt has
-/// no reliable way to name its method via `method_pool_ix`; the hand-built
-/// test sets a REAL interned index so this path is exercised honestly. The
-/// depth-1 S13 fact "the scope's method IS the nmethod's own compiled
-/// method" is the intended production fallback, but the nmethod carries no
-/// direct method-oop field (only `key_klass`/`key_selector`, whose CURRENT
-/// dict lookup can differ from the compiled method after redefinition), so
-/// resolving it correctly is left to whichever step wires real interning.
-/// This is flagged loudly in the step-6 report as the one open production
-/// gap.
+/// `method_pool_ix` is a REAL interned index: `ir::convert` interns a
+/// deopt-having method's own compiled `MethodOop` into its pool (as an `Oop`
+/// reloc) and `driver::build_deopt_metadata` records that index in every
+/// scope. Because the metadata holds the compile-time oop directly, a
+/// mid-activation redefinition (a later step's `NotEntrant`) still deopts to
+/// the OLD method, exactly as D5 requires — the reason the method lives in
+/// the GC-visited pool rather than being re-derived from `key_klass`/
+/// `key_selector` (whose current dict lookup would see the NEW method).
 fn pool_method(vm: &VmState, id: NmethodId, method_pool_ix: u32) -> MethodOop {
     let nm = nmethod_ref(vm, id);
     let oop = read_pool_oop(nm, method_pool_ix);
     MethodOop::try_from(oop).expect(
         "deoptimize_frame: scope method_pool_ix does not resolve to a CompiledMethod \
-         (S13 records method_pool_ix as a 0 placeholder — a production deopt needs real \
-         method interning, step-7 blocker; the test sets a real index)",
+         (ir::convert interns a deopt-having method's own oop; a mismatch is a compiler bug)",
     )
 }
 

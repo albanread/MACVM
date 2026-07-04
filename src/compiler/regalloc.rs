@@ -439,6 +439,7 @@ mod tests {
             nil_lit: PoolLit(0),
             mark_slots_lit: PoolLit(0),
             call_sites: Vec::new(),
+            method_pool_ix: None,
         }
     }
 

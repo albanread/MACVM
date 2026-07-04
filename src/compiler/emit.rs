@@ -1206,6 +1206,7 @@ mod tests {
             nil_lit: PoolLit(0),
             mark_slots_lit: PoolLit(0),
             call_sites: Vec::new(),
+            method_pool_ix: None,
         }
     }
 
@@ -1607,6 +1608,7 @@ mod tests {
             nil_lit: PoolLit(0),
             mark_slots_lit: PoolLit(1),
             call_sites: Vec::new(),
+            method_pool_ix: None,
         };
         let ra = regalloc::regalloc(&method);
         let mut asm = JasmAssembler::new();
@@ -1897,6 +1899,7 @@ mod tests {
                     static_klass: None,
                 },
             ],
+            method_pool_ix: None,
         };
         let ra = regalloc::regalloc(&method);
         let mut asm = JasmAssembler::new();
