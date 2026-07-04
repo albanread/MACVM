@@ -359,7 +359,7 @@ impl Default for VmOptions {
 /// activation of a freshly booted `VmState`; every send/DNU helper that
 /// reads it is called while dispatch is active, so `.expect(...)` at the
 /// read site documents that invariant.
-#[derive(Copy, Clone, Default)]
+#[derive(Copy, Clone, Default, Debug)]
 pub struct InterpRegs {
     pub bci: usize,
     pub method: Option<MethodOop>,

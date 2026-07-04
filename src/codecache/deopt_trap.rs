@@ -498,18 +498,25 @@ fn build_assert_stub() -> crate::compiler::assembler::CodeBlob {
 
 // ── Runtime entry points reached from the trampolines ─────────────────────
 
-/// **STEP 6 SEAM.** D4/D5: the `extern "C"` entry `deopt_uncommon_trampoline`
-/// calls after sigreturn. Its full body (D5 M0–M8: materialize interpreter
-/// frames from the resolved `DeoptState`, `Frame::verify` them, then nest an
-/// interpreter run) is S13 step 6, in `runtime/deopt.rs`.
+/// D4/D5: the `extern "C"` entry `deopt_uncommon_trampoline` calls after
+/// sigreturn. A THIN FORWARDER across the `codecache → runtime → interpreter`
+/// deopt seam (the designed crossing D4/D5 place `rt_uncommon_trap`'s
+/// materialization in `runtime`, so it may reach into `runtime`/`interpreter`
+/// here even though this module otherwise "must not touch the interpreter"):
 ///
-/// Step 5 goes exactly as far as the boundary allows and no further: it maps
-/// `trap_pc → nmethod` ([`super::CodeTable::find_by_pc`]), resolves the
-/// `DeoptState` for `pc - code_base` (proving the whole trap→state chain is
-/// wired), then **stops** at the materialization handoff with a loud,
-/// obvious "step 6" abort. Resolving here (rather than in step 6) keeps the
-/// seam honest: the resolve must compile and be reachable now, so step 6
-/// only has to fill in the `deoptimize_frame` call that consumes it.
+/// 1. map `trap_pc → owning nmethod` ([`super::CodeTable::find_by_pc`]),
+/// 2. build the [`FrameView`] naming the trapped physical frame,
+/// 3. hand it to [`crate::runtime::deopt::deoptimize_frame`] — which owns ALL
+///    materialization logic (re-resolving the `DeoptState` itself, D5 M0), so
+///    no `DeoptState` resolve happens here (avoids resolving twice),
+/// 4. run the materialized frame(s) to completion via
+///    [`crate::interpreter::interpret_active`] (D5 M8),
+/// 5. return the result oop's raw bits — the trampoline epilogue hands them to
+///    the trapped method's native caller as if it had returned normally.
+///
+/// This is an uncommon-trap site (`0xDE00`/`0xDE01`), so `reexecute == true`
+/// and `incoming_result` is `None` (the recorded stack holds the re-executing
+/// op's inputs — see [`FrameView::incoming_result`]).
 ///
 /// # Safety
 /// Only reached via `blr` from `deopt_uncommon_trampoline`; `vm` is `x28`
@@ -532,31 +539,21 @@ pub unsafe extern "C" fn rt_uncommon_trap(
              (a deopt brk must belong to a compiled method)"
         )
     });
-    let nm = vm
-        .code_table
-        .get(nm_id)
-        .expect("rt_uncommon_trap: find_by_pc returned a live id");
-    let code_off = (trap_pc - nm.code.base as u64) as u32;
 
-    // Resolve the deopt state at this site (step 4's decode side). Panics on a
-    // pc that was not recorded at compile time (P1) — every deopt-relevant pc
-    // is, by construction.
-    let deopt = crate::compiler::scopes::DeoptState::at(nm, code_off);
-
-    // ─────────────────────────── STEP 6 SEAM ────────────────────────────
-    // Everything above is step 5: trap → nmethod → resolved DeoptState. The
-    // next line is where step 6 (`runtime::deopt::deoptimize_frame` + nested
-    // `interpret_active`, D5 M0–M8) takes over, consuming `deopt`, `fp`, and
-    // `nm_id`. Until then, stop loudly rather than fabricate a result.
-    unimplemented!(
-        "S13 step 6: materialize interpreter frames from this DeoptState and run them. \
-         Resolved at nmethod {nm_id:?}, code_off {code_off:#x}, fp {fp:#x}, \
-         site kind {:?}, reexecute {}, {} innermost-stack entries. \
-         (Step 5 wires trap→state; step 6 fills in deoptimize_frame + interpret_active.)",
-        deopt.site.kind,
-        deopt.site.reexecute,
-        deopt.site.stack.len(),
+    // Materialize the interpreter frame(s) for this trap, then run them to
+    // completion. `deoptimize_frame` re-resolves the DeoptState (D5 M0) and
+    // repoints `vm.stack.fp` at the innermost frame; `interpret_active`
+    // (M8) runs from the resume bci and returns the activation's result.
+    let resume = crate::runtime::deopt::deoptimize_frame(
+        vm,
+        crate::runtime::deopt::FrameView {
+            fp: fp as usize,
+            pc: trap_pc as usize,
+            nm: nm_id,
+            incoming_result: None, // uncommon-trap: reexecute site (no call result)
+        },
     );
+    crate::interpreter::interpret_active(vm, resume).raw()
 }
 
 /// D3 step 4: the off-signal landing for a `0xDE02` compiled-assertion trap —
@@ -724,6 +721,104 @@ unsafe fn test_arm_handler(lo: u64, hi: u64, uncommon_tramp: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// S13 step 7a END-TO-END through `rt_uncommon_trap` itself (the codecache
+    /// entry the trampoline `blr`s), NOT via the safe runtime wrapper: install
+    /// a real nmethod carrying a recorder scope blob + PcDesc, hand-build the
+    /// trapped physical frame, and call `rt_uncommon_trap(vm, trap_pc, fp)`
+    /// directly — simulating exactly what `deopt_uncommon_trampoline` does
+    /// after sigreturn (minus the actual signal, which 7b's signal-driven
+    /// differential test adds). Asserts the whole forwarder chain
+    /// (`find_by_pc` → `deoptimize_frame` → `interpret_active`) runs the
+    /// deoptee to completion and returns its result oop's raw bits.
+    ///
+    /// Deoptee: `push_smi_i8(0x2A); return_tos`; a re-execute uncommon-trap
+    /// site at bci 0 with an empty operand stack, so the nested run starts at
+    /// bci 0 and delivers the smi 42.
+    #[test]
+    fn rt_uncommon_trap_runs_to_completion() {
+        use crate::bytecode::BytecodeBuilder;
+        use crate::compiler::scopes::{
+            CtxLoc, SafepointKind, SafepointState, ScopeDescData, ValueLoc,
+        };
+        use crate::oops::smi::SmallInt;
+        use crate::runtime::deopt::test_support::install_deopt_nmethod;
+        use crate::runtime::vm_state::{VmOptions, VmState};
+
+        let mut vm = VmState::with_options(VmOptions {
+            heap_mib: 64,
+            trace: Default::default(),
+            gc_stress: false,
+            gc_stress_full_period: None,
+            eden_kb: None,
+            jit: crate::runtime::JitMode::Off,
+        });
+
+        let known: i64 = 0x2A;
+        let method = {
+            let mut b = BytecodeBuilder::new();
+            b.push_smi_i8(known as i8); // bci 0
+            b.ret_tos(); // bci 2
+            let sel = vm.universe.intern(b"deoptee_trap_e2e");
+            b.finish(&mut vm, sel, 0, 0)
+        };
+
+        let nil = vm.universe.nil_obj;
+        let (_nm_id, pc) = install_deopt_nmethod(
+            &mut vm,
+            method,
+            nil, // pool word 1 (unreferenced here)
+            ScopeDescData {
+                method_pool_ix: 0, // pool word 0 = the method oop
+                is_block: false,
+                sender: None,
+                receiver: ValueLoc::FrameSlot(-8),
+                slots: vec![],
+                ctx: CtxLoc::None,
+            },
+            // Site code offset. `find_by_pc` requires `pc < code.base +
+            // code.len`, and the hand-built nmethod's code blob is exactly the
+            // 16-byte pool, so keep the trap offset inside it (0x8 < 16); the
+            // PcDesc metadata is independent of the pool bytes at that offset.
+            0x8,
+            SafepointState {
+                scope: 0, // placeholder; overridden by install_deopt_nmethod
+                bci: 0,
+                kind: SafepointKind::UncommonTrap,
+                reexecute: true,
+                stack: vec![],
+            },
+        );
+
+        // The trapped physical frame: receiver at FrameSlot -8.
+        let receiver_val = SmallInt::new(0x11).oop();
+        let phys: [u64; 2] = [receiver_val.raw(), 0];
+        let fp = (&phys[1]) as *const u64 as usize;
+
+        let sp_before = vm.stack.sp;
+        let deopt_before = vm.stats.deopt_count;
+
+        // Drive the codecache entry exactly as the trampoline would.
+        // SAFETY: `vm` is a live &mut VmState; `pc` is inside the published
+        // nmethod; `fp` names the hand-built physical frame. This is the
+        // trampoline's own call, made directly from the test.
+        let raw = unsafe { rt_uncommon_trap(&mut vm as *mut VmState, pc as u64, fp as u64) };
+
+        assert_eq!(
+            raw,
+            SmallInt::new(known).oop().raw(),
+            "rt_uncommon_trap returns the deoptee's computed result as raw bits"
+        );
+        assert_eq!(vm.stats.deopt_count, deopt_before + 1, "one deopt counted");
+        assert_eq!(
+            vm.stack.sp, sp_before,
+            "the nested run unwound back to the pre-trap watermark"
+        );
+        assert!(
+            !vm.stack.has_frame(),
+            "the ambient (no-frame) outer activation was restored"
+        );
+    }
 
     /// `brk_imm_decode` (tests_s13.md): the encoder for `brk #0xDE00..02`
     /// round-trips through the handler's decode mask, and foreign brks —

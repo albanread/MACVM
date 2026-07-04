@@ -27,6 +27,17 @@ pub struct FrameActivation {
     has_frame: bool,
 }
 
+impl FrameActivation {
+    /// Whether a frame was active at the moment this snapshot was taken. The
+    /// snapshot is otherwise opaque (only `restore_activation` consumes it);
+    /// this is exposed for S13 deopt's `DeoptResume` cross-checks — the
+    /// ambient outer activation the nested run must preserve.
+    #[inline]
+    pub fn was_active(self) -> bool {
+        self.has_frame
+    }
+}
+
 pub struct ProcessStack {
     slots: Vec<Oop>,
     pub sp: usize,

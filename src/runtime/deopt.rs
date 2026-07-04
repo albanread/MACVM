@@ -29,11 +29,33 @@
 use crate::codecache::deopt_trap::{read_frame_slot, read_pool_oop};
 use crate::codecache::nmethod::{Nmethod, NmethodId};
 use crate::compiler::scopes::{CtxLoc, DecodedScope, DeoptState, ValueLoc};
-use crate::interpreter::stack::Frame;
+use crate::interpreter::stack::{Frame, FrameActivation};
 use crate::oops::smi::SmallInt;
 use crate::oops::wrappers::MethodOop;
 use crate::oops::Oop;
-use crate::runtime::vm_state::VmState;
+use crate::runtime::vm_state::{InterpRegs, VmState};
+
+/// What [`deoptimize_frame`] hands the nested interpreter run (D5 M8). The
+/// materializer builds the frames and repoints `vm.stack.fp`/`sp`; this
+/// carries the three facts the resume (`interpreter::interpret_active`) needs
+/// that are NOT recoverable from `vm.stack` after materialization:
+/// - `base_sp` — the M2 watermark; the run pops back to here when the
+///   outermost frame returns through its `ENTRY_FRAME_SENTINEL` link (a
+///   debug cross-check on the sentinel-driven stop).
+/// - `resume_bci` — the innermost frame's M5 resume bci, the bci the nested
+///   `dispatch` picks up at (same value as that frame's `saved_bci` header).
+/// - `saved_activation` / `saved_regs` — the AMBIENT outer interpreter state
+///   snapshotted at M2, BEFORE the M3 pushes clobbered `vm.stack.fp`/`sp`;
+///   `interpret_active` restores them after the run so a paused outer
+///   activation (the I→C→deopt case) resumes intact — the same reentrancy
+///   guard `run_method_reentrant` performs at the C→I seam.
+#[derive(Copy, Clone, Debug)]
+pub struct DeoptResume {
+    pub base_sp: usize,
+    pub resume_bci: usize,
+    pub saved_activation: FrameActivation,
+    pub saved_regs: InterpRegs,
+}
 
 /// The compiled physical frame to deoptimize (`sprint_s13_detail.md` D5).
 /// Holds no oops — just the coordinates the materializer reads slots against
@@ -130,11 +152,20 @@ fn interpreter_model_height(method: MethodOop, resume_bci: usize) -> Option<i32>
     }
 }
 
-/// Materialize interpreter frame(s) for `frame` onto `vm.stack` (D5 M0–M7).
-/// Does NOT run them — the caller (step 7's `rt_uncommon_trap`) drives the
-/// nested interpreter resume afterward. Allocates (Contexts, M6); holds no
-/// bare oop across an allocating call.
-pub fn deoptimize_frame(vm: &mut VmState, frame: FrameView) {
+/// Materialize interpreter frame(s) for `frame` onto `vm.stack` (D5 M0–M7)
+/// and return the [`DeoptResume`] that drives the nested run (D5 M8). Does
+/// NOT run the frames — the caller (`interpreter::interpret_active`, invoked
+/// by `rt_uncommon_trap`) drives the nested interpreter resume afterward.
+/// Allocates (Contexts, M6); holds no bare oop across an allocating call.
+///
+/// The returned `DeoptResume` carries the M2 `base_sp` watermark, the
+/// innermost M5 `resume_bci`, and the AMBIENT outer `vm.stack` activation +
+/// `vm.regs` snapshot captured at M2 (before the M3 pushes repoint
+/// `vm.stack.fp`/`sp`) — everything the nested run needs that it can no longer
+/// read off `vm.stack` once the materialized frames are in place.
+#[must_use = "the DeoptResume drives the nested interpret_active run; dropping it \
+              materializes frames that are never run"]
+pub fn deoptimize_frame(vm: &mut VmState, frame: FrameView) -> DeoptResume {
     // ── M0: resolve + decode the scope chain, innermost → outermost, then
     //    reverse so the physical push order is outermost-first (a caller
     //    frame must sit BELOW its callee on the stack). ──────────────────
@@ -210,9 +241,17 @@ pub fn deoptimize_frame(vm: &mut VmState, frame: FrameView) {
         );
     }
 
-    // ── M2: record the ProcessStack watermark. The nested run (step 7)
-    //    ends when the stack pops back below this. ────────────────────────
-    let _base_sp = vm.stack.sp;
+    // ── M2: record the ProcessStack watermark. The nested run (M8) ends
+    //    when the outermost frame's ENTRY_FRAME_SENTINEL return pops the
+    //    stack back to here. Snapshot the AMBIENT outer interpreter state
+    //    (activation + regs) NOW, before the M3 pushes repoint
+    //    `vm.stack.fp`/`sp` — `interpret_active` restores it after the run so
+    //    a paused outer activation (I→C→deopt) survives, the same reentrancy
+    //    guard `run_method_reentrant` applies at the C→I seam. `vm.regs`
+    //    holds `method` as a bare oop, re-rooted across the run there. ──────
+    let base_sp = vm.stack.sp;
+    let saved_activation = vm.stack.save_activation();
+    let saved_regs = vm.regs;
 
     // ── M3: push each virtual frame, outermost → innermost. ──────────────
     // `saved_fp` links each frame to the previous materialized frame's FP;
@@ -224,6 +263,10 @@ pub fn deoptimize_frame(vm: &mut VmState, frame: FrameView) {
     // pushes (a later `push_frame` cannot move an earlier frame — the stack
     // only grows — so this stays valid).
     let mut innermost_fp: usize = 0;
+    // The innermost frame's M5 resume bci — the bci `interpret_active` enters
+    // the nested `dispatch` at. Identical to that frame's `saved_bci` header
+    // (both are M5's value); captured here to hand back in `DeoptResume`.
+    let mut resume_bci: usize = 0;
     for vf in virtual_frames.iter() {
         let method = pool_method(vm, frame.nm, vf.scope.method_pool_ix);
         let argc = method.argc();
@@ -301,6 +344,7 @@ pub fn deoptimize_frame(vm: &mut VmState, frame: FrameView) {
 
         if vf.is_innermost {
             innermost_fp = fp_new;
+            resume_bci = saved_bci;
             // ── M3.3 innermost operand stack: the site's recorded values,
             //    plus `incoming_result` iff the site is a call-return. ─────
             for &loc in &site_stack {
@@ -353,6 +397,15 @@ pub fn deoptimize_frame(vm: &mut VmState, frame: FrameView) {
             break;
         }
         fp = saved as usize;
+    }
+
+    // `vm.stack.fp` is now the innermost materialized frame (the last
+    // `push_frame` activated it); the nested run picks up from there.
+    DeoptResume {
+        base_sp,
+        resume_bci,
+        saved_activation,
+        saved_regs,
     }
 }
 
@@ -442,13 +495,119 @@ fn materialize_context(
     }
 }
 
+/// Test-only helpers shared with `codecache::deopt_trap`'s own end-to-end
+/// `rt_uncommon_trap` test (which lives in the unsafe island where the raw
+/// `find_by_pc` deref is allowed). Kept `pub(crate)` and outside the private
+/// `tests` module below so both call sites reuse one nmethod-building path
+/// rather than duplicating the pool-packing / scope-recording scaffolding.
+/// All-safe (the `#![deny(unsafe_code)]` module invariant holds).
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+    use crate::codecache::nmethod::{NmState, Nmethod, NmethodId};
+    use crate::compiler::scopes::{PcDesc, SafepointState, ScopeDescData, ScopeDescRecorder};
+
+    /// Publish a code blob whose bytes ARE the oop pool ([method, extra] at
+    /// `literal_off = 0`), so `read_pool_oop` reads live MAP_JIT words.
+    pub(crate) fn publish_pool(
+        vm: &mut VmState,
+        method: MethodOop,
+        extra: Oop,
+    ) -> crate::codecache::CodeHandle {
+        use crate::compiler::assembler::CodeBlob;
+        let mut bytes = Vec::with_capacity(16);
+        bytes.extend_from_slice(&method.oop().raw().to_le_bytes());
+        bytes.extend_from_slice(&extra.raw().to_le_bytes());
+        let blob = CodeBlob {
+            code: bytes,
+            literal_off: 0,
+            relocs: Vec::new(),
+            listing: Vec::new(),
+        };
+        let handle = vm
+            .code_cache
+            .alloc(blob.code.len())
+            .expect("test code cache room");
+        vm.code_cache.publish(handle, &blob);
+        handle
+    }
+
+    /// Build (not yet install) a full inert `Nmethod` around a published pool
+    /// handle. Only its pool + scopes are ever read (deopt); the rest is
+    /// placeholder shape, with a distinct real selector per `code.base` so
+    /// `CodeTable::by_key` never collides across installs.
+    pub(crate) fn build_nmethod_with_pool(
+        vm: &mut VmState,
+        method: MethodOop,
+        extra: Oop,
+    ) -> Nmethod {
+        let code = publish_pool(vm, method, extra);
+        let sel = format!("s{:x}", code.base as usize);
+        let sel_sym = vm.universe.intern(sel.as_bytes());
+        Nmethod {
+            id: NmethodId(0),
+            key_klass: vm.universe.object_klass,
+            key_selector: sel_sym,
+            code,
+            entry_off: 0,
+            verified_entry_off: 0,
+            state: NmState::Alive,
+            level: 1,
+            version: 0,
+            literal_off: 0,
+            relocs: Vec::new(),
+            frame_slots: 0,
+            slot_is_oop: Vec::new(),
+            pcdescs: Vec::new(),
+            oopmaps: Vec::new(),
+            ic_sites: Vec::new(),
+            poll_bci: None,
+            deopt_scopes: Vec::new(),
+            deopt_pcdescs: Vec::new(),
+        }
+    }
+
+    pub(crate) fn install_nmethod(
+        vm: &mut VmState,
+        mut nm: Nmethod,
+        blob: Vec<u8>,
+        pcdescs: Vec<PcDesc>,
+    ) -> NmethodId {
+        nm.deopt_scopes = blob;
+        nm.deopt_pcdescs = pcdescs;
+        vm.code_table.install(nm)
+    }
+
+    /// One-shot: build + install an nmethod for `method` (pool word 1 =
+    /// `extra`) carrying a single depth-1 scope described by `scope_data` and
+    /// one recorded `site` at code offset `site_off`. Returns the installed
+    /// `NmethodId` and the absolute trap pc (`code.base + site_off`) — exactly
+    /// the two inputs `rt_uncommon_trap` derives a `FrameView` from.
+    pub(crate) fn install_deopt_nmethod(
+        vm: &mut VmState,
+        method: MethodOop,
+        extra: Oop,
+        scope_data: ScopeDescData,
+        site_off: u32,
+        site: SafepointState,
+    ) -> (NmethodId, usize) {
+        let nm = build_nmethod_with_pool(vm, method, extra);
+        let mut rec = ScopeDescRecorder::new();
+        let scope = rec.begin_scope(scope_data);
+        rec.record_site(site_off, SafepointState { scope, ..site });
+        let (blob, pcdescs) = rec.pack();
+        let nm_id = install_nmethod(vm, nm, blob, pcdescs);
+        let pc = vm.code_table.get(nm_id).unwrap().code.base as usize + site_off as usize;
+        (nm_id, pc)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::bytecode::BytecodeBuilder;
-    use crate::codecache::nmethod::Nmethod;
     use crate::compiler::scopes::{
-        CtxLoc, PcDesc, SafepointKind, SafepointState, ScopeDescData, ScopeDescRecorder, ValueLoc,
+        CtxLoc, SafepointKind, SafepointState, ScopeDescData, ScopeDescRecorder, ValueLoc,
     };
     use crate::interpreter::stack::Frame;
     use crate::oops::layout::{
@@ -584,7 +743,7 @@ mod tests {
         let sp_before = vm.stack.sp;
         let deopt_before = vm.stats.deopt_count;
 
-        deoptimize_frame(
+        let resume = deoptimize_frame(
             &mut vm,
             FrameView {
                 fp,
@@ -592,6 +751,20 @@ mod tests {
                 nm: nm_id,
                 incoming_result: None, // reexecute site
             },
+        );
+
+        // The DeoptResume the nested run consumes: base_sp is the pre-push
+        // watermark, resume_bci is the innermost M5 bci (reexecute → the
+        // recorded bci 3), and the ambient outer state is the pre-deopt
+        // snapshot (no frame active in this bare test).
+        assert_eq!(resume.base_sp, sp_before, "base_sp is the M2 watermark");
+        assert_eq!(
+            resume.resume_bci, 3,
+            "reexecute resume bci is the recorded bci"
+        );
+        assert!(
+            !resume.saved_activation.was_active(),
+            "the bare test had no ambient frame active before deopt"
         );
 
         // M1: counter bumped exactly once.
@@ -747,7 +920,7 @@ mod tests {
         let pc = vm.code_table.get(nm_id).unwrap().code.base as usize + 0x20;
 
         let sp_before = vm.stack.sp;
-        deoptimize_frame(
+        let resume = deoptimize_frame(
             &mut vm,
             FrameView {
                 fp,
@@ -756,6 +929,12 @@ mod tests {
                 incoming_result: Some(result_val),
             },
         );
+        // Call-return resume bci is PAST the 2-byte send (bci 1 → bci 3).
+        assert_eq!(
+            resume.resume_bci, 3,
+            "call-return resume bci is past the send"
+        );
+        assert_eq!(resume.base_sp, sp_before, "base_sp is the M2 watermark");
 
         let fp_new = sp_before + 1; // receiver only (argc 0)
         let f = Frame { fp: fp_new };
@@ -809,7 +988,7 @@ mod tests {
         let pc = vm.code_table.get(nm_id).unwrap().code.base as usize + 0x10;
 
         assert_eq!(vm.stats.deopt_count, 0);
-        deoptimize_frame(
+        let _resume = deoptimize_frame(
             &mut vm,
             FrameView {
                 fp,
@@ -821,83 +1000,114 @@ mod tests {
         assert_eq!(vm.stats.deopt_count, 1);
     }
 
-    // ── Test scaffolding: publish a real code blob whose bytes ARE the oop
-    //    pool ([method_oop, extra_const] at literal_off = 0), so
-    //    `read_pool_oop` reads live MAP_JIT words. ──────────────────────────
+    /// S13 step 7a END-TO-END (runtime path, no real brk): hand-build a
+    /// compiled frame + a recorder-produced scope blob, then drive the same
+    /// two calls `rt_uncommon_trap` makes — `deoptimize_frame` (materialize)
+    /// then `interpret_active` (run) — and assert the interpreter runs the
+    /// deoptee from the resume bci to completion and returns the known result.
+    /// This is `rt_uncommon_trap`'s body minus the raw-pointer `find_by_pc`
+    /// deref (which `deopt_trap.rs`'s own `rt_uncommon_trap_runs_to_completion`
+    /// covers), so it exercises the whole safe runtime path here where the
+    /// `#![deny(unsafe_code)]` materializer lives.
+    ///
+    /// Deoptee: `push_smi_i8(0x5A); return_tos` (argc 0, ntemps 0). We deopt at
+    /// a re-execute site keyed at bci 0 with an EMPTY recorded operand stack —
+    /// so the nested run starts at bci 0, executes both bytecodes, and delivers
+    /// the smi `0x5A` as the activation's result. A known value produced purely
+    /// by interpreting from the resume point.
+    #[test]
+    fn rt_uncommon_trap_runtime_path_runs_to_completion() {
+        let mut vm = test_vm();
 
-    /// A published nmethod handle whose oop pool (at `literal_off = 0`) holds
-    /// word 0 = `method` oop, word 1 = `extra` oop. Returns the code handle;
-    /// the caller builds the `Nmethod` around it (so the same handle's
-    /// `base`/`len` feed both the nmethod's `code` field and the pc the deopt
-    /// resolves against).
-    fn publish_pool(
-        vm: &mut VmState,
-        method: MethodOop,
-        extra: Oop,
-    ) -> crate::codecache::CodeHandle {
-        use crate::compiler::assembler::CodeBlob;
-        let mut bytes = Vec::with_capacity(16);
-        bytes.extend_from_slice(&method.oop().raw().to_le_bytes());
-        bytes.extend_from_slice(&extra.raw().to_le_bytes());
-        let blob = CodeBlob {
-            code: bytes,
-            literal_off: 0,
-            relocs: Vec::new(),
-            listing: Vec::new(),
+        // The deoptee body: push a known smi, return it.
+        let known: i64 = 0x5A;
+        let method = {
+            let mut b = BytecodeBuilder::new();
+            b.push_smi_i8(known as i8); // bci 0
+            b.ret_tos(); // bci 2
+            let sel = vm.universe.intern(b"deoptee_e2e");
+            b.finish(&mut vm, sel, 0, 0)
         };
-        let handle = vm
-            .code_cache
-            .alloc(blob.code.len())
-            .expect("test code cache room");
-        vm.code_cache.publish(handle, &blob);
-        handle
+
+        let nil = vm.universe.nil_obj;
+        let nm = build_nmethod_with_pool(&mut vm, method, nil);
+
+        // Physical frame: just the receiver at FrameSlot -8 (argc 0, no temps).
+        let receiver_val = SmallInt::new(0x11).oop();
+        let phys: [u64; 2] = [receiver_val.raw(), 0];
+        let fp = (&phys[1]) as *const u64 as usize;
+
+        // Recorder: one depth-1 scope, no slots, receiver from a FrameSlot,
+        // Context None. A re-execute uncommon-trap site at bci 0 with an empty
+        // operand stack (the interpreter rebuilds it from bci 0).
+        let mut rec = ScopeDescRecorder::new();
+        let scope = rec.begin_scope(ScopeDescData {
+            method_pool_ix: 0, // word 0 of the pool is the method oop
+            is_block: false,
+            sender: None,
+            receiver: ValueLoc::FrameSlot(-8),
+            slots: vec![],
+            ctx: CtxLoc::None,
+        });
+        rec.record_site(
+            0x10,
+            SafepointState {
+                scope,
+                bci: 0,
+                kind: SafepointKind::UncommonTrap,
+                reexecute: true,
+                stack: vec![],
+            },
+        );
+        let (blob, pcdescs) = rec.pack();
+        let nm_id = install_nmethod(&mut vm, nm, blob, pcdescs);
+        let pc = vm.code_table.get(nm_id).unwrap().code.base as usize + 0x10;
+
+        let sp_before = vm.stack.sp;
+        let deopt_before = vm.stats.deopt_count;
+
+        // ── The two calls `rt_uncommon_trap` makes (safe path): materialize,
+        //    then run. ──────────────────────────────────────────────────────
+        let resume = deoptimize_frame(
+            &mut vm,
+            FrameView {
+                fp,
+                pc,
+                nm: nm_id,
+                incoming_result: None, // reexecute site
+            },
+        );
+        assert_eq!(resume.resume_bci, 0, "reexecute at bci 0 resumes at bci 0");
+        assert_eq!(
+            resume.base_sp, sp_before,
+            "base_sp is the pre-push watermark"
+        );
+        // deoptimize_frame left vm.stack.fp at the innermost materialized frame.
+        assert!(vm.stack.has_frame(), "a materialized frame is active");
+
+        let result = crate::interpreter::interpret_active(&mut vm, resume);
+
+        // The interpreter ran `push_smi 0x5A; return_tos` from bci 0 and
+        // delivered the smi.
+        assert_eq!(
+            result,
+            SmallInt::new(known).oop(),
+            "the nested run returns the deoptee's computed value"
+        );
+        // The deopt counter bumped once (M1).
+        assert_eq!(vm.stats.deopt_count, deopt_before + 1);
+        // The nested run popped back to the pre-deopt watermark (the outermost
+        // frame's ENTRY_FRAME_SENTINEL stop) and restored the ambient (empty)
+        // activation — vm.stack is exactly as it was before deopt.
+        assert_eq!(vm.stack.sp, sp_before, "stack unwound back to base_sp");
+        assert!(
+            !vm.stack.has_frame(),
+            "the ambient (no-frame) outer activation was restored"
+        );
     }
 
-    /// Build (not yet install) a full `Nmethod` around a real published pool
-    /// handle. Everything except `code`/`deopt_*` is inert placeholder shape
-    /// (this stub is never executed — deopt only reads its pool + scopes). The
-    /// key klass/selector are real interned symbols (valid oops, distinct per
-    /// `code.base`) so `CodeTable::by_key` never collides across installs and
-    /// this test module needs no `unsafe` (the module denies it).
-    fn build_nmethod_with_pool(vm: &mut VmState, method: MethodOop, extra: Oop) -> Nmethod {
-        use crate::codecache::nmethod::{NmState, NmethodId};
-        let code = publish_pool(vm, method, extra);
-        // A real klass + a distinct real selector per published base, so
-        // `CodeTable::by_key` never collides across this module's installs
-        // (only `.oop().raw()` is read from either).
-        let sel = format!("s{:x}", code.base as usize);
-        let sel_sym = vm.universe.intern(sel.as_bytes());
-        Nmethod {
-            id: NmethodId(0),
-            key_klass: vm.universe.object_klass,
-            key_selector: sel_sym,
-            code,
-            entry_off: 0,
-            verified_entry_off: 0,
-            state: NmState::Alive,
-            level: 1,
-            version: 0,
-            literal_off: 0,
-            relocs: Vec::new(),
-            frame_slots: 0,
-            slot_is_oop: Vec::new(),
-            pcdescs: Vec::new(),
-            oopmaps: Vec::new(),
-            ic_sites: Vec::new(),
-            poll_bci: None,
-            deopt_scopes: Vec::new(),
-            deopt_pcdescs: Vec::new(),
-        }
-    }
-
-    fn install_nmethod(
-        vm: &mut VmState,
-        mut nm: Nmethod,
-        blob: Vec<u8>,
-        pcdescs: Vec<PcDesc>,
-    ) -> NmethodId {
-        nm.deopt_scopes = blob;
-        nm.deopt_pcdescs = pcdescs;
-        vm.code_table.install(nm)
-    }
+    // Test scaffolding (nmethod-building) is shared with
+    // `codecache::deopt_trap`'s own `rt_uncommon_trap` end-to-end test — see
+    // `super::test_support`.
+    use super::test_support::{build_nmethod_with_pool, install_nmethod};
 }

@@ -17,6 +17,7 @@ use crate::oops::layout::ENTRY_FRAME_SENTINEL;
 use crate::oops::smi::SmallInt;
 use crate::oops::wrappers::{ContextOop, MethodOop};
 use crate::oops::Oop;
+use crate::runtime::deopt::DeoptResume;
 use crate::runtime::vm_state::VmState;
 
 use stack::Frame;
@@ -257,6 +258,73 @@ pub fn run_method_reentrant(
     result
 }
 
+/// S13 D5 M8: the nested interpreter run that finishes a deoptimized
+/// activation. [`crate::runtime::deopt::deoptimize_frame`] has already pushed
+/// the materialized interpreter frame(s) onto `vm.stack`, left `vm.stack.fp`
+/// at the INNERMOST one, and stamped that frame's `saved_bci` header to the
+/// resume point; this runs them to completion and returns the activation's
+/// result oop (which `rt_uncommon_trap` hands back to the compiled method's
+/// native caller as if the method had returned normally).
+///
+/// **Modeled on [`run_method_reentrant`]** (S11's C→I nested-run entry): it is
+/// entered while an OUTER interpreter activation may be paused below one or
+/// more native compiled frames (the I→C→deopt case), so the exact same
+/// reentrancy hazards apply, and the exact same guard: snapshot the ambient
+/// `vm.stack` activation + `vm.regs` and restore them after the nested
+/// dispatch, re-rooting the saved outer `method` across the run through a
+/// `HandleScope` (the nested run may GC and relocate it). The snapshot is
+/// taken BEFORE materialization — `deoptimize_frame` captured it at its M2
+/// watermark and threaded it here via `DeoptResume`, since by the time this
+/// runs `vm.stack.fp`/`sp` already name the materialized frames, not the outer
+/// activation.
+///
+/// **How the run stops** is the SAME sentinel-stop `run_method`/entry frames
+/// use: `deoptimize_frame` set the OUTERMOST materialized frame's
+/// `saved_fp = ENTRY_FRAME_SENTINEL`, so when that frame executes its return,
+/// `unwind::pop_and_deliver` hits the `ENTRY_FRAME_SENTINEL` arm — it truncates
+/// `sp` back to `base_sp`, `deactivate()`s, and returns `Some(result)`, which
+/// unwinds `dispatch_from` right back here. `base_sp` therefore only needs a
+/// debug cross-check (the sentinel drives the actual stop), which this asserts.
+///
+/// **How the resume bci reaches `dispatch`**: `vm.stack.fp` is the innermost
+/// frame and its method comes straight from that frame's header, so this reads
+/// `current_method(vm)` and enters [`dispatch_from`] at `resume_bci` directly
+/// — the deopt materializer's M5 resume bci, identical to the value it also
+/// wrote into the frame's `saved_bci` header (the header copy is what a LATER
+/// return back INTO this frame would read; the live `dispatch_from` entry is
+/// what starts it running NOW — the two must agree, and both are M5's value).
+pub fn interpret_active(vm: &mut VmState, resume: DeoptResume) -> Oop {
+    let scope = crate::memory::handles::HandleScope::enter(vm);
+    let saved_method_h = resume.saved_regs.method.map(|m| scope.handle(vm, m.oop()));
+
+    // `vm.stack.fp` is the innermost materialized frame (deopt left it there);
+    // its method is the frame header's own, and `resume.resume_bci` is M5's
+    // resume point. Enter the loop there.
+    let method = current_method(vm);
+    let result = dispatch_from(vm, method, resume.resume_bci);
+
+    // The sentinel-stop above truncated sp back to the outermost frame's
+    // receiver slot == `base_sp` and deactivated. Cross-check, then restore the
+    // ambient outer activation this deopt interrupted.
+    debug_assert_eq!(
+        vm.stack.sp, resume.base_sp,
+        "interpret_active: the nested run must pop back to the base_sp watermark \
+         (the ENTRY_FRAME_SENTINEL stop), not {} (a materializer/height bug)",
+        vm.stack.sp
+    );
+    vm.stack.restore_activation(resume.saved_activation);
+    vm.regs = resume.saved_regs;
+    if let Some(h) = saved_method_h {
+        // Post-run the heap is coherent (any nested collection has completed),
+        // so validating `try_from` is fine here — same as `run_method_reentrant`.
+        vm.regs.method = Some(
+            MethodOop::try_from(h.get(vm))
+                .expect("interpret_active: saved outer method survived the nested deopt run"),
+        );
+    }
+    result
+}
+
 /// SPEC §5.4 Algorithm 11: a branch popped a non-`true`/`false` value.
 /// Pushes it back, rolls `vm.regs.bci` back to the *branch opcode itself*
 /// (not its operand) so a normal-returning handler makes the branch
@@ -282,9 +350,25 @@ fn must_be_boolean_send(
     }
 }
 
+/// The dispatch loop's ordinary entry: run the current frame's method from
+/// bci 0. Thin wrapper over [`dispatch_from`] — the only caller that starts a
+/// fresh activation (`run_method`, and every send that pushes a body frame
+/// resumes through `dispatch`'s own `bci = 0` re-read, not this entry).
 fn dispatch(vm: &mut VmState) -> Oop {
-    let mut method: MethodOop = current_method(vm);
-    let mut bci: usize = 0;
+    let method = current_method(vm);
+    dispatch_from(vm, method, 0)
+}
+
+/// The dispatch loop parameterized on its entry `(method, bci)`. `dispatch`
+/// enters it at bci 0 for a just-activated frame; S13 deopt's
+/// [`interpret_active`] enters it at an arbitrary *resume* bci of the
+/// innermost materialized frame (D5 M8) — the interpreter can pick up
+/// mid-method exactly because nothing in the loop body assumes it started at
+/// bci 0 (every `bci`/`method` write inside is relative, and the frame header
+/// the accessors read is already the resumed frame). The two entries are the
+/// ONLY callers; the loop's internal resumes (post-send, post-return) reload
+/// `method`/`bci` themselves and never re-enter here.
+fn dispatch_from(vm: &mut VmState, mut method: MethodOop, mut bci: usize) -> Oop {
     loop {
         debug_assert!(
             bci < method.bytecode_len(),
