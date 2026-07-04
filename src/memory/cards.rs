@@ -74,6 +74,22 @@ impl CardTable {
         self.old_start + (i << CARD_SHIFT)
     }
 
+    /// S11 P7/D3: the biased base compiled code loads into
+    /// `VmRegBlock::card_base_biased` — `base_biased() + (slot_addr >>
+    /// CARD_SHIFT) == backing.base() + card_index(slot_addr)` for any
+    /// `slot_addr >= old_start`, because `old_start` is always a
+    /// `Reservation`'s own base (page-aligned, hence CARD_SIZE-aligned
+    /// too), so shifting distributes cleanly over the subtraction. Lets a
+    /// compiled store's barrier dirty a card with just `lsr
+    /// xtmp,xslot,#9; strb wzr,[xcard_base_biased,xtmp]` — no separate
+    /// subtraction of `old_start` needed at the call site, matching
+    /// `is_old`/`is_new`'s own "tagged addresses compare directly" trick
+    /// (`memory::layout::HeapLayout`'s doc).
+    #[inline]
+    pub fn base_biased(&self) -> u64 {
+        (self.backing.base() as u64).wrapping_sub((self.old_start >> CARD_SHIFT) as u64)
+    }
+
     #[inline]
     pub fn dirty_for_slot(&self, slot_addr: usize) {
         self.entry(self.card_index(slot_addr))
@@ -150,6 +166,32 @@ mod tests {
         assert!(t.is_dirty(5));
         t.set_clean(5);
         assert!(!t.is_dirty(5));
+    }
+
+    /// S11 P7/D3: `base_biased() + (slot >> CARD_SHIFT)` must land on the
+    /// exact same byte the existing, already-trusted `dirty_for_slot`
+    /// (`card_index` + `entry`, verified independently by
+    /// `card_index_math` above) would flip — not a circular check:
+    /// this observes the SAME memory byte change through the NEW,
+    /// compiled-code-shaped arithmetic path, rather than re-deriving the
+    /// same formula twice.
+    #[test]
+    fn base_biased_lands_on_same_card_as_dirty_for_slot() {
+        let t = table(4 << 20);
+        let base = 0x10_0000;
+        let slot = base + 3 * CARD_SIZE + 17; // arbitrary, mid-card offset
+        let biased_addr = t.base_biased() + ((slot as u64) >> CARD_SHIFT);
+        assert_eq!(
+            unsafe { *(biased_addr as *const u8) },
+            CARD_CLEAN,
+            "fresh table: the biased address must read back as clean before any dirty"
+        );
+        t.dirty_for_slot(slot);
+        assert_eq!(
+            unsafe { *(biased_addr as *const u8) },
+            CARD_DIRTY,
+            "base_biased()'s own arithmetic must land on the exact byte dirty_for_slot flips"
+        );
     }
 
     /// `tests_s07.md`'s `record_multistores_range`: ranges spanning

@@ -9,7 +9,8 @@ use crate::codecache::nmethod::{IcSite, NmState, Nmethod, NmethodId, OopMap, PcD
 use crate::codecache::stubs::resolve_target_entry;
 use crate::compiler::jasm_assembler::JasmAssembler;
 use crate::compiler::{decode, emit, ir, regalloc};
-use crate::interpreter::ic::{ic_state, IcState, InterpreterIc};
+use crate::interpreter::ic::InterpreterIc;
+use crate::interpreter::ic::{ic_state, IcState};
 use crate::oops::wrappers::{KlassOop, MethodOop, SymbolOop};
 use crate::runtime::lookup::lookup;
 use crate::runtime::vm_state::VmState;
@@ -23,8 +24,13 @@ type CompiledIcState = crate::codecache::nmethod::IcState;
 
 /// D1 point 2: `primitives.rs`'s own pinned ids for
 /// `{ +, -, *, bitAnd:, bitOr:, bitXor:, <, <=, >, >=, =, ~= }` — division
-/// (`//`, `\\`, `bitShift:`: ids 4, 5, 9) excluded in v1.
-const SMI_INLINE: [i64; 12] = [1, 2, 3, 6, 7, 8, 10, 11, 12, 13, 14, 15];
+/// (`//`, `\\`, `bitShift:`: ids 4, 5, 9) excluded in v1. `pub(crate)`: also
+/// read directly by `ir::Translator::is_smi_inlinable` (S11 step 7) — both
+/// readers must agree on exactly the same set, since `eligibility_detail`'s
+/// own `mono_smi_inline_send` below is what decides a method compiles AT
+/// ALL, while `is_smi_inlinable` (ir.rs) decides, per send site within an
+/// already-eligible method, fused fast path vs. a real `CallSend`.
+pub(crate) const SMI_INLINE: [i64; 12] = [1, 2, 3, 6, 7, 8, 10, 11, 12, 13, 14, 15];
 
 /// D1 point 3, "tunable".
 const FRAME_BUDGET_SLOTS: i32 = 60;
@@ -79,6 +85,24 @@ pub fn eligible(vm: &VmState, method: MethodOop) -> bool {
     eligibility_detail(vm, method) == Eligibility::Yes
 }
 
+/// D1 point 2 (mono-smi-inline gate): a `Send` site only clears eligibility
+/// when its own IC is already `Mono`, guarded on `SmallInteger`, targeting a
+/// method whose primitive is in [`SMI_INLINE`] — this is deliberately
+/// NARROWER than what a compiled site can actually reach at runtime (a
+/// generic, non-smi, or polymorphic send): S11 step 7 experimented with
+/// widening this to "arbitrary send in ANY IC state" (D1's own text) and
+/// found the C2I/reentrant-call machinery underneath (S11 step 4/5) isn't
+/// robust enough yet for the much larger surface that unlocks —
+/// specifically, deep block-activation nesting reached through a compiled
+/// caller's own generic `CallSend` (see the fixes alongside this one:
+/// `emit::Emitter::emit_call_send`'s spill/register hazard,
+/// `interpreter::send::try_primitive`, `run_method_reentrant`'s `vm.regs`
+/// snapshot, and `run_method`'s entry-sentinel spoof around an `Activated`
+/// primitive). Those four fixes are real, verified bugs in their own right
+/// and stay; this gate stays at its ORIGINAL, conservative shape until a
+/// later step gives C2I reentrancy the depth of testing D1's fuller text
+/// deserves — `docs/sprints/sprint_s11_detail.md` has a SPEC-QUESTION on
+/// this gap.
 fn eligibility_detail(vm: &VmState, method: MethodOop) -> Eligibility {
     if method.is_block()
         || method.has_ctx()
@@ -128,11 +152,15 @@ fn eligibility_detail(vm: &VmState, method: MethodOop) -> Eligibility {
                     }
                 }
             }
-            // Excluded (D1 point 1): instvar/global/ctx stores, closures,
-            // ctx temps, super sends (handled above), block returns, NLR.
-            Instr::StoreInstvarPop(_)
-            | Instr::StoreGlobalPop(_)
-            | Instr::PushCtxTemp { .. }
+            // S11 step 7 (D1): instvar/global stores are now allowed --
+            // `ir.rs`'s own `StoreField{barrier:true}` conversion handles
+            // both (mirrors `PushInstvar`/`PushGlobal`'s existing
+            // read-side handling exactly).
+            Instr::StoreInstvarPop(_) | Instr::StoreGlobalPop(_) => {}
+            // Still excluded (D1 point 1): ctx stores, closures, ctx
+            // temps, super sends (handled above), block returns, NLR --
+            // blocks/contexts compile in S14 with inlining.
+            Instr::PushCtxTemp { .. }
             | Instr::StoreCtxTempPop { .. }
             | Instr::PushClosure { .. }
             | Instr::BlockReturnTos
@@ -159,12 +187,12 @@ fn eligibility_detail(vm: &VmState, method: MethodOop) -> Eligibility {
     Eligibility::Yes
 }
 
-/// D1 point 2: `ic_idx`'s site is monomorphic, guarded on `smi_klass`, and
-/// its cached target's primitive is in [`SMI_INLINE`]. `Empty` is the one
-/// `NoRetryLater` case — see [`Eligibility`]'s own doc; every other
-/// non-eligible shape (poly, mega, mono-but-non-smi, mono-smi-but-not-an-
-/// inlinable-primitive) is treated as permanent: none of those states
-/// un-happen on their own the way a cold, not-yet-reached site does.
+/// D1 point 2: `ic_idx`'s own site must already be `Mono`, guarded on
+/// `SmallInteger`, targeting a method whose primitive is in [`SMI_INLINE`]
+/// — anything else (`Empty`, `Poly`, `Mega`, a non-smi guard, or a mono-smi
+/// target whose primitive isn't fusable) keeps this method interpreted.
+/// See `eligibility_detail`'s own doc for why this stays narrower than D1's
+/// full "arbitrary send in any IC state" text for now.
 fn mono_smi_inline_send(vm: &VmState, method: MethodOop, ic_idx: u16) -> Eligibility {
     match ic_state(method, ic_idx) {
         IcState::Empty => return Eligibility::NoRetryLater,
@@ -234,6 +262,7 @@ pub fn compile_method(
 
     let mut asm = JasmAssembler::new();
     let stub_poll_addr = vm.stubs.stub_poll_addr();
+    let must_be_boolean_addr = vm.stubs.must_be_boolean_addr();
     let guard = emit::EntryGuard {
         smi_klass_bits: vm.universe.smi_klass.oop().raw(),
         key_klass_bits: rcvr_klass.oop().raw(),
@@ -244,6 +273,7 @@ pub fn compile_method(
         &ir_method,
         &regalloc_result,
         stub_poll_addr,
+        must_be_boolean_addr,
         Some(guard),
     );
 
@@ -470,6 +500,8 @@ mod tests {
         assert!(!eligible(&vm, method));
     }
 
+    /// A Mono IC guarded on something OTHER than SmallInteger's own klass
+    /// keeps this method interpreted (D1 point 2's own mono-SMI gate).
     #[test]
     fn eligible_rejects_non_smi_guard() {
         let mut vm = test_vm();
@@ -483,6 +515,7 @@ mod tests {
         assert!(!eligible(&vm, method));
     }
 
+    /// Same gate, for a Mono-but-non-inlinable-primitive target.
     #[test]
     fn eligible_rejects_non_inline_primitive() {
         let mut vm = test_vm();
@@ -561,10 +594,11 @@ mod tests {
         assert!(!eligible(&vm, method));
     }
 
-    /// D1 point 1: `StoreInstvarPop` is excluded (needs the write barrier
-    /// + real slow-path sends, S11 — this sprint's own text on the point).
+    /// S11 step 7 (D1): `StoreInstvarPop` is now allowed — the write
+    /// barrier (`ir::Ir::StoreField{barrier:true}`) and real slow-path
+    /// sends this needed are exactly this step's own deliverables.
     #[test]
-    fn eligible_rejects_instvar_store() {
+    fn eligible_allows_instvar_store() {
         let mut vm = test_vm();
         let mut b = BytecodeBuilder::new();
         b.push_self();
@@ -572,13 +606,11 @@ mod tests {
         b.ret_self();
         let sel = vm.universe.intern(b"m");
         let method = b.finish(&mut vm, sel, 0, 0);
-        assert!(!eligible(&vm, method));
+        assert!(eligible(&vm, method));
     }
 
-    /// D1 point 2: a polymorphic IC (more than one klass seen at a send
-    /// site) is ineligible — and, unlike an `Empty` IC, permanently so
-    /// (`Eligibility::NoPermanent`, not `NoRetryLater`): a poly site
-    /// doesn't spontaneously narrow back down to mono on a later call.
+    /// A polymorphic IC (more than one klass seen at a send site) keeps
+    /// this method interpreted too — same gate as `Mega`.
     #[test]
     fn eligible_rejects_poly_ic() {
         let mut vm = test_vm();

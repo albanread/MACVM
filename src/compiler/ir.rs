@@ -38,6 +38,15 @@ pub struct PoolLit(pub u32);
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct StubId(pub u32);
 
+impl StubId {
+    /// D1/D5: `codecache::stubs::Stubs::must_be_boolean` (S11 step 6) —
+    /// the only `CallRuntime` target step 7 wires up; `emit.rs`'s own
+    /// `Ir::CallRuntime` dispatch asserts this is the only value it ever
+    /// sees, since `rt_alloc_slow`/`stub_nlr_unwind` (steps 8/9) don't
+    /// exist as `CallRuntime` targets yet either.
+    pub const MUST_BE_BOOLEAN: StubId = StubId(0);
+}
+
 /// A position `regalloc.rs`'s `linearize` (S11+) records as needing an
 /// oop map. Always empty in S10 (D1: compiled code never allocates or
 /// calls Rust, so it has no safepoints) — the field exists now so S11 only
@@ -545,16 +554,37 @@ struct Translator<'a> {
     pool: PoolBuilder,
     self_vreg: VReg,
     temp_vregs: Vec<VReg>,
-    /// The one shared bailout block's id — known from `cfg.blocks.len()`
-    /// before any translation starts, so every `SmiArith`/`SmiCmpVal`'s
-    /// `fail` field can reference it directly.
-    bailout_id: BlockId,
-    /// D4.6: accumulates one entry per `send_super` translated so far, in
-    /// encounter order — `Ir::CallSend.site` indexes into this, same
-    /// shape as `pool`'s own accumulate-then-hand-to-`IrMethod` pattern.
-    /// S10's own eligibility rules out every OTHER send reaching here
-    /// (D1, until S11 step 7's own relaxation), so `send_super` is the
-    /// only source of entries today.
+    /// S11 step 7 (D1): a smi-inlined fail edge, or a `not_bool` edge, no
+    /// longer bails the whole method out to the interpreter — it computes
+    /// a real fallback value (`CallSend`/`CallRuntime`) and REJOINS normal
+    /// control flow, so each one needs its OWN fresh synthetic `IrBlock`
+    /// (a fail block can't share the single "restart from scratch" target
+    /// `Ir::Bailout` used to, since it has to rejoin at a SPECIFIC point
+    /// with a SPECIFIC value). `next_extra_block` hands out ids starting
+    /// right after every real CFG block (mirrors the old single
+    /// `bailout_id`'s own "`cfg.blocks.len()`" starting point).
+    ///
+    /// `blocks_by_id[k]` holds `BlockId(k)`'s own finished `IrBlock` once
+    /// known, `None` until then — indexed by id, NOT creation order. This
+    /// matters: a fail block and its own continuation are allocated
+    /// out-of-order relative to when each one's CODE is actually finished
+    /// (`fail_and_continue` mints the CONTINUATION's id before the FAIL
+    /// block's own, but the fail block's own code is complete immediately
+    /// while the continuation's is only finished later, possibly after
+    /// ANOTHER split narrows in first) — `emit.rs`'s own `method.blocks
+    /// [bid.0 as usize]` (and its parallel per-index `labels` vec) both
+    /// assume `IrMethod.blocks[i].id == BlockId(i)` for every `i`, a
+    /// (previously implicit, only just discovered to be load-bearing)
+    /// invariant a plain "push whatever finishes, in whatever order it
+    /// finishes" `Vec` cannot uphold once more than one block can still be
+    /// "in flight" at once. Resized to fit whenever `fresh_block_id` mints
+    /// an id beyond the current length.
+    next_extra_block: u32,
+    blocks_by_id: Vec<Option<IrBlock>>,
+    /// D4.6: accumulates one entry per `send_super`/generic/smi-fallback
+    /// send translated so far, in encounter order — `Ir::CallSend.site`
+    /// indexes into this, same shape as `pool`'s own accumulate-then-hand-
+    /// to-`IrMethod` pattern.
     call_sites: Vec<CallSiteInfo>,
 }
 
@@ -563,6 +593,178 @@ impl<'a> Translator<'a> {
         let id = self.vregs.len() as u32;
         self.vregs.push(VRegInfo { is_oop });
         VReg(id)
+    }
+
+    fn fresh_block_id(&mut self) -> BlockId {
+        let id = BlockId(self.next_extra_block);
+        self.next_extra_block += 1;
+        if self.blocks_by_id.len() <= id.0 as usize {
+            self.blocks_by_id.resize_with(id.0 as usize + 1, || None);
+        }
+        id
+    }
+
+    /// The ONLY way a finished `IrBlock` ever enters `blocks_by_id` —
+    /// indexed by `block.id`, never appended, so a block whose id was
+    /// minted early but whose own code is finished late (or vice versa)
+    /// always lands in its own correct slot regardless of finishing order.
+    fn finish_block(&mut self, block: IrBlock) {
+        let idx = block.id.0 as usize;
+        if self.blocks_by_id.len() <= idx {
+            self.blocks_by_id.resize_with(idx + 1, || None);
+        }
+        self.blocks_by_id[idx] = Some(block);
+    }
+
+    /// A smi-inlined op's fail edge (`SmiArith`/`SmiCmpVal`, both mid-block,
+    /// VALUE-PRODUCING ops with no terminator of their own): synthesizes a
+    /// fresh block computing the SAME `dst` via a real, generic `CallSend`
+    /// of `ic_idx`'s own selector (D1: "generic send does the LargeInteger/
+    /// Double fallback via the interpreter callee") over `args`, then
+    /// jumping to a freshly-allocated CONTINUATION block — the caller
+    /// (`convert`'s own per-block loop) is responsible for actually
+    /// finishing the current code vec with a matching `Jump` and starting
+    /// the continuation's own accumulation, since only it holds `code`.
+    /// Returns `(fail_block_id, continuation_block_id)`.
+    ///
+    /// Deliberately builds a FRESH `CallSiteInfo` (no memoization by
+    /// `ic_idx`, unlike this fn's own name might suggest a cache):
+    /// different occurrences of the same `ic_idx` (vanishingly rare in
+    /// straight-line bytecode with no loop unrolling, but not structurally
+    /// impossible) would need DIFFERENT `a`/`b`/`dst` vregs baked into
+    /// their own fail block regardless, so a shared block wouldn't be
+    /// reusable anyway — a second, harmless, duplicate `CallSiteInfo` costs
+    /// nothing a real program would ever notice.
+    fn fail_and_continue(
+        &mut self,
+        ic_idx: u16,
+        args: Vec<VReg>,
+        dst: VReg,
+        fail_bci: usize,
+    ) -> (BlockId, BlockId) {
+        let ic_view = InterpreterIc::at(self.method, ic_idx);
+        let site = self.call_sites.len() as u16;
+        self.call_sites.push(CallSiteInfo {
+            selector: ic_view.selector(),
+            argc: ic_view.argc() + 1,
+            static_klass: None,
+        });
+        let continuation_id = self.fresh_block_id();
+        let fail_id = self.fresh_block_id();
+        self.finish_block(IrBlock {
+            id: fail_id,
+            bci: fail_bci,
+            code: vec![
+                Ir::CallSend { dst, site, args },
+                Ir::Jump {
+                    target: continuation_id,
+                },
+            ],
+            entry_stack: Vec::new(),
+        });
+        (fail_id, continuation_id)
+    }
+
+    /// D1's `BoolBr.not_bool` replacement: `rt_must_be_boolean` (S11 step
+    /// 6) then re-tests its own result — a self-loop, exactly mirroring
+    /// the interpreter's own documented "a handler that keeps returning
+    /// non-booleans livelocks by construction, same as real Smalltalk, not
+    /// a VM bug" (`interpreter::mod::must_be_boolean_send`'s doc). Reuses
+    /// `val` as BOTH the `CallRuntime`'s arg AND its own `dst` — the
+    /// block's only live value is "whatever we're testing this iteration",
+    /// so no second vreg is needed, and every caller (an ordinary
+    /// `BoolBr`'s own `not_bool` edge, or a fused `SmiCmpBr`'s synthesized
+    /// fallback) can hand this whatever vreg already holds the value that
+    /// failed the FIRST check, unchanged.
+    fn fresh_not_bool_block(&mut self, val: VReg, if_true: BlockId, if_false: BlockId) -> BlockId {
+        let not_bool_id = self.fresh_block_id();
+        self.finish_block(IrBlock {
+            id: not_bool_id,
+            bci: 0, // not a real bytecode position, same as the old bailout block's own bci:0
+            code: vec![
+                Ir::CallRuntime {
+                    dst: Some(val),
+                    stub: StubId::MUST_BE_BOOLEAN,
+                    args: vec![val],
+                },
+                Ir::BoolBr {
+                    val,
+                    if_true,
+                    if_false,
+                    not_bool: not_bool_id,
+                },
+            ],
+            entry_stack: Vec::new(),
+        });
+        not_bool_id
+    }
+
+    /// `SmiCmpBr`'s own fail edge (the FUSED compare+branch case): unlike
+    /// `fail_and_continue`, `if_true`/`if_false` are already real CFG
+    /// targets (this fires only at a block's own Branch terminator), so no
+    /// continuation split is needed — just a fresh block sending the real
+    /// comparison selector, then branching on ITS result exactly like an
+    /// ordinary `BoolBr` (including the SAME `not_bool` retry-loop
+    /// treatment, via [`Self::fresh_not_bool_block`], if the receiver's own
+    /// `<`/`=`/etc. override doesn't return a real boolean either).
+    fn fail_and_branch(
+        &mut self,
+        ic_idx: u16,
+        args: Vec<VReg>,
+        if_true: BlockId,
+        if_false: BlockId,
+        fail_bci: usize,
+    ) -> BlockId {
+        let ic_view = InterpreterIc::at(self.method, ic_idx);
+        let site = self.call_sites.len() as u16;
+        self.call_sites.push(CallSiteInfo {
+            selector: ic_view.selector(),
+            argc: ic_view.argc() + 1,
+            static_klass: None,
+        });
+        let dst = self.fresh(true);
+        let not_bool_id = self.fresh_not_bool_block(dst, if_true, if_false);
+        let fail_id = self.fresh_block_id();
+        self.finish_block(IrBlock {
+            id: fail_id,
+            bci: fail_bci,
+            code: vec![
+                Ir::CallSend { dst, site, args },
+                Ir::BoolBr {
+                    val: dst,
+                    if_true,
+                    if_false,
+                    not_bool: not_bool_id,
+                },
+            ],
+            entry_stack: Vec::new(),
+        });
+        fail_id
+    }
+
+    /// D1's "arbitrary send in ANY IC state" relaxation vs. D3.2's own
+    /// mono-smi-inline fast path: TRUE iff `ic_idx`'s site is monomorphic,
+    /// smi-guarded, and its cached target's primitive is smi-inlinable —
+    /// the EXACT condition `driver::eligibility_detail`'s own
+    /// `mono_smi_inline_send` allows through as `Eligibility::Yes` via the
+    /// fast-path arm (kept in sync by hand, cross-referenced doc comments
+    /// on both sides, same as this module's own established tolerance for
+    /// controlled duplication over a cross-module coupling for a
+    /// three-line predicate — `project_s11_step4_design`'s own "two
+    /// conventions, kept intentionally separate" precedent). Every OTHER
+    /// IC state (Empty at compile time can't happen — `driver.rs`'s own
+    /// `NoRetryLater` keeps a cold site from ever reaching a real compile;
+    /// Poly, Mega, mono-but-non-smi, mono-smi-but-not-inlinable) still
+    /// compiles now, just as an ordinary generic `Ir::CallSend` instead.
+    fn is_smi_inlinable(&self, ic_idx: u16) -> bool {
+        let ic = InterpreterIc::at(self.method, ic_idx);
+        if ic.guard().raw() != self.vm.universe.smi_klass.oop().raw() {
+            return false;
+        }
+        let Some(target) = MethodOop::try_from(ic.target()) else {
+            return false;
+        };
+        crate::compiler::driver::SMI_INLINE.contains(&target.primitive())
     }
 
     /// Translates every instruction except a block's own terminator
@@ -578,15 +780,26 @@ impl<'a> Translator<'a> {
     /// comparison can just as easily be immediately followed by a `Jump`
     /// or `Return` instead — `^ x < y` returns the plain boolean, no
     /// branch at all — so both conditions matter, not just position).
+    /// Returns `Some(continuation_id)` exactly when this instruction just
+    /// split the CURRENT block (a smi-inlined `SmiArith`/`SmiCmpVal` fail
+    /// edge, S11 step 7's own `fail_and_continue`) — the caller (`convert`'s
+    /// own per-CFG-block loop) must then finish its accumulating `code` vec
+    /// with a `Jump { target: continuation_id }` and start a fresh one for
+    /// the returned id. `None` for every other instruction, including
+    /// `SmiCmpBr`'s own fused fail (handled entirely at the BRANCH
+    /// terminator, which already has its own real targets — no split
+    /// needed there) and the fast, non-failing smi-inline path.
     #[allow(clippy::too_many_arguments)]
     fn translate_instr(
         &mut self,
         instr: &Instr,
         fusable: bool,
+        bci: usize,
         stack: &mut Vec<VReg>,
         code: &mut Vec<Ir>,
-        pending_cmp: &mut Option<(CmpOp, VReg, VReg)>,
-    ) {
+        pending_cmp: &mut Option<(CmpOp, VReg, VReg, u16)>,
+    ) -> Option<BlockId> {
+        let mut split: Option<BlockId> = None;
         match *instr {
             Instr::PushSelf => stack.push(self.self_vreg),
             Instr::PushNil => {
@@ -702,38 +915,72 @@ impl<'a> Translator<'a> {
                 code.push(Ir::CallSend { dst, site, args });
                 stack.push(dst);
             }
-            Instr::Send { ic, .. } => {
+            Instr::Send { ic, .. } if self.is_smi_inlinable(ic) => {
                 let b = stack.pop().expect("send: missing arg operand");
                 let a = stack.pop().expect("send: missing receiver operand");
                 match classify_smi_send(self.vm, self.method, ic) {
                     SmiSendKind::Cmp(op) if fusable => {
                         // `fusable` already confirms the terminator is a
                         // Branch -- `convert` consumes `pending_cmp` there.
-                        *pending_cmp = Some((op, a, b));
+                        *pending_cmp = Some((op, a, b, ic));
                     }
                     SmiSendKind::Cmp(op) => {
                         let dst = self.fresh(true);
+                        let (fail_id, continuation_id) =
+                            self.fail_and_continue(ic, vec![a, b], dst, bci);
                         code.push(Ir::SmiCmpVal {
                             op,
                             dst,
                             a,
                             b,
-                            fail: self.bailout_id,
+                            fail: fail_id,
                         });
                         stack.push(dst);
+                        split = Some(continuation_id);
                     }
                     SmiSendKind::Arith(op) => {
                         let dst = self.fresh(true);
+                        let (fail_id, continuation_id) =
+                            self.fail_and_continue(ic, vec![a, b], dst, bci);
                         code.push(Ir::SmiArith {
                             op,
                             dst,
                             a,
                             b,
-                            fail: self.bailout_id,
+                            fail: fail_id,
                         });
                         stack.push(dst);
+                        split = Some(continuation_id);
                     }
                 }
+            }
+            // D1's "arbitrary send/send_w in ANY IC state": every send this
+            // step's own smi-inline guard above doesn't handle (Poly, Mega,
+            // mono-but-non-smi, mono-smi-but-not-inlinable) still compiles
+            // now, as an ordinary generic `Ir::CallSend` -- no fast path
+            // attempted, `stub_resolve` sorts out Unresolved/Mono/Pic/Mega
+            // from here exactly like any other real send site.
+            Instr::Send { ic, .. } => {
+                let ic_view = InterpreterIc::at(self.method, ic);
+                let real_argc = ic_view.argc();
+                let mut real_args: Vec<VReg> = (0..real_argc)
+                    .map(|_| stack.pop().expect("send: missing arg operand"))
+                    .collect();
+                real_args.reverse();
+                let receiver = stack.pop().expect("send: missing receiver operand");
+                let mut args = vec![receiver];
+                args.append(&mut real_args);
+
+                let site = self.call_sites.len() as u16;
+                self.call_sites.push(CallSiteInfo {
+                    selector: ic_view.selector(),
+                    argc: real_argc + 1,
+                    static_klass: None,
+                });
+
+                let dst = self.fresh(true);
+                code.push(Ir::CallSend { dst, site, args });
+                stack.push(dst);
             }
             Instr::JumpFwd(_) | Instr::JumpBack(_) | Instr::BrTrueFwd(_) | Instr::BrFalseFwd(_) => {
                 // Deferred to `convert` (see this fn's own doc).
@@ -743,9 +990,40 @@ impl<'a> Translator<'a> {
                 code.push(Ir::Ret { val });
             }
             Instr::ReturnSelf => code.push(Ir::RetSelf),
-            Instr::StoreInstvarPop(_)
-            | Instr::StoreGlobalPop(_)
-            | Instr::PushCtxTemp { .. }
+            Instr::StoreInstvarPop(n) => {
+                // Mirrors `PushInstvar`'s own `byte_off` exactly (D1's
+                // store-relaxation is the write-side of that same field
+                // access) -- `barrier: true` unconditionally: `val` could
+                // be any heap oop at runtime regardless of what this
+                // specific store site happens to see in practice, exactly
+                // like `memory::store::store`'s own barrier, which never
+                // skips the check based on the STATIC shape of a store.
+                let val = stack
+                    .pop()
+                    .expect("store_instvar_pop: empty simulated stack");
+                code.push(Ir::StoreField {
+                    obj: self.self_vreg,
+                    byte_off: (BODY_OFFSET + 8 * n as usize) as i32,
+                    val,
+                    barrier: true,
+                });
+            }
+            Instr::StoreGlobalPop(idx) => {
+                // Mirrors `PushGlobal`'s own association-value convention
+                // exactly (word 1 = value, word 0 = key).
+                let assoc = self.method.literals().at(idx as usize);
+                let assoc_vreg = self.push_well_known(assoc.raw(), code);
+                let val = stack
+                    .pop()
+                    .expect("store_global_pop: empty simulated stack");
+                code.push(Ir::StoreField {
+                    obj: assoc_vreg,
+                    byte_off: (BODY_OFFSET + 8) as i32,
+                    val,
+                    barrier: true,
+                });
+            }
+            Instr::PushCtxTemp { .. }
             | Instr::StoreCtxTempPop { .. }
             | Instr::PushClosure { .. }
             | Instr::BlockReturnTos
@@ -756,6 +1034,7 @@ impl<'a> Translator<'a> {
                 )
             }
         }
+        split
     }
 
     fn push_well_known(&mut self, raw: u64, code: &mut Vec<Ir>) -> VReg {
@@ -795,9 +1074,6 @@ pub fn convert(vm: &VmState, method: MethodOop, cfg: &Cfg) -> IrMethod {
     let (entry_depth, _max_stack_depth) = compute_entry_depths(method, cfg);
     let sources = entry_stack_sources(cfg, &entry_depth);
 
-    // Known before any translation starts (D2's bailout block sits right
-    // after every real CFG block, 1:1 by position).
-    let bailout_id = BlockId(cfg.blocks.len() as u32);
     let block_id = |i: BlockIndex| BlockId(i as u32);
 
     let self_vreg = VReg(0);
@@ -821,7 +1097,8 @@ pub fn convert(vm: &VmState, method: MethodOop, cfg: &Cfg) -> IrMethod {
         pool: PoolBuilder::new(),
         self_vreg,
         temp_vregs: temp_vregs.clone(),
-        bailout_id,
+        next_extra_block: cfg.blocks.len() as u32,
+        blocks_by_id: (0..cfg.blocks.len()).map(|_| None).collect(),
         call_sites: Vec::new(),
     };
 
@@ -861,7 +1138,6 @@ pub fn convert(vm: &VmState, method: MethodOop, cfg: &Cfg) -> IrMethod {
         .intern(vm.universe.false_obj.raw(), Some(RelocKind::Oop));
 
     let mut exit_stacks: Vec<Option<Vec<VReg>>> = vec![None; cfg.blocks.len()];
-    let mut ir_blocks: Vec<IrBlock> = Vec::with_capacity(cfg.blocks.len() + 1);
 
     for (b, cfg_block) in cfg.blocks.iter().enumerate() {
         let entry_stack = match sources[b] {
@@ -896,7 +1172,17 @@ pub fn convert(vm: &VmState, method: MethodOop, cfg: &Cfg) -> IrMethod {
 
         let is_branch_terminator = matches!(cfg_block.terminator, Terminator::Branch { .. });
         let mut stack = entry_stack.clone();
-        let mut pending_cmp: Option<(CmpOp, VReg, VReg)> = None;
+        let mut pending_cmp: Option<(CmpOp, VReg, VReg, u16)> = None;
+        // S11 step 7: a fallible smi-inline op mid-block (SmiArith/
+        // SmiCmpVal, never a terminator) now needs a REAL fallback that
+        // REJOINS this same block's own continuation, not a bailout-and-
+        // restart -- so a single `cfg_block` can now emit SEVERAL `IrBlock`s
+        // (this one, then one per split), not just one. `cur_id`/`cur_bci`
+        // track whichever one is CURRENTLY accumulating into `code`;
+        // finished ones are pushed to `ir_blocks` immediately, same as the
+        // final one still is after this loop.
+        let mut cur_id = block_id(b);
+        let mut cur_bci = cfg_block.bci_start;
         let mut bci = cfg_block.bci_start;
         while bci < cfg_block.bci_end {
             let (instr, next) = decode_at(method, bci);
@@ -911,7 +1197,31 @@ pub fn convert(vm: &VmState, method: MethodOop, cfg: &Cfg) -> IrMethod {
             let fusable = is_branch_terminator
                 && next < cfg_block.bci_end
                 && decode_at(method, next).1 == cfg_block.bci_end;
-            t.translate_instr(&instr, fusable, &mut stack, &mut code, &mut pending_cmp);
+            let split = t.translate_instr(
+                &instr,
+                fusable,
+                bci,
+                &mut stack,
+                &mut code,
+                &mut pending_cmp,
+            );
+            if let Some(continuation_id) = split {
+                code.push(Ir::Jump {
+                    target: continuation_id,
+                });
+                t.finish_block(IrBlock {
+                    id: cur_id,
+                    bci: cur_bci,
+                    code: std::mem::take(&mut code),
+                    entry_stack: if cur_id == block_id(b) {
+                        entry_stack.clone()
+                    } else {
+                        Vec::new() // a split-off continuation's own entry_stack is never consulted (only real merge points are)
+                    },
+                });
+                cur_id = continuation_id;
+                cur_bci = next;
+            }
             bci = next;
         }
         let local_exit = stack;
@@ -939,46 +1249,64 @@ pub fn convert(vm: &VmState, method: MethodOop, cfg: &Cfg) -> IrMethod {
             Terminator::Branch { if_true, if_false } => {
                 emit_merges(&sources, &entry_stacks, if_true, &local_exit, &mut code);
                 emit_merges(&sources, &entry_stacks, if_false, &local_exit, &mut code);
-                if let Some((op, a, b_)) = pending_cmp.take() {
+                if let Some((op, a, b_, ic_idx)) = pending_cmp.take() {
+                    let fail_id = t.fail_and_branch(
+                        ic_idx,
+                        vec![a, b_],
+                        block_id(if_true),
+                        block_id(if_false),
+                        cfg_block.bci_start,
+                    );
                     code.push(Ir::SmiCmpBr {
                         op,
                         a,
                         b: b_,
                         if_true: block_id(if_true),
                         if_false: block_id(if_false),
-                        fail: bailout_id,
+                        fail: fail_id,
                     });
                 } else {
                     let val = *local_exit
                         .last()
                         .expect("branch terminator with an empty simulated stack (compiler bug)");
+                    let not_bool_id =
+                        t.fresh_not_bool_block(val, block_id(if_true), block_id(if_false));
                     code.push(Ir::BoolBr {
                         val,
                         if_true: block_id(if_true),
                         if_false: block_id(if_false),
-                        not_bool: bailout_id,
+                        not_bool: not_bool_id,
                     });
                 }
             }
         }
 
         exit_stacks[b] = Some(local_exit);
-        ir_blocks.push(IrBlock {
-            id: block_id(b),
-            bci: cfg_block.bci_start,
+        t.finish_block(IrBlock {
+            id: cur_id,
+            bci: cur_bci,
             code,
-            entry_stack,
+            entry_stack: if cur_id == block_id(b) {
+                entry_stack
+            } else {
+                Vec::new()
+            },
         });
     }
 
-    ir_blocks.push(IrBlock {
-        id: bailout_id,
-        bci: 0,
-        code: vec![Ir::Bailout {
-            reason: BailoutReason::SmiOpFailed,
-        }],
-        entry_stack: Vec::new(),
-    });
+    // Indexed by id (`finish_block`'s own doc), never append order --
+    // required so `emit.rs`'s own `method.blocks[bid.0 as usize]` (and its
+    // parallel per-index `labels` vec) actually find the right block.
+    let ir_blocks: Vec<IrBlock> = t
+        .blocks_by_id
+        .into_iter()
+        .enumerate()
+        .map(|(i, slot)| {
+            slot.unwrap_or_else(|| {
+                panic!("block {i} was allocated an id but never finished (compiler bug)")
+            })
+        })
+        .collect();
 
     IrMethod {
         blocks: ir_blocks,
@@ -1029,8 +1357,11 @@ mod tests {
 
     /// `send site with mono smi IC + prim '+'` (D1 item 2): a monomorphic,
     /// smi-guarded send whose target's primitive is `+` (id 1) translates
-    /// to `SmiArith{Add}` whose `fail` is the method's shared bailout
-    /// block.
+    /// to `SmiArith{Add}`. S11 step 7: `fail` is no longer the method's
+    /// shared bailout block -- it's a freshly synthesized block computing
+    /// the SAME fallback via a real, generic `CallSend` of `+` (D1: "the
+    /// LargeInteger/Double fallback via the interpreter callee"), then
+    /// jumping to a continuation (no `Ir::Bailout` anywhere in the method).
     #[test]
     fn smi_send_inlined_mono() {
         let mut vm = test_vm();
@@ -1053,7 +1384,6 @@ mod tests {
         let cfg = decode::decode(method);
         let ir = convert(&vm, method, &cfg);
 
-        let bailout_id = ir.blocks.last().unwrap().id;
         let fail = ir.blocks[0]
             .code
             .iter()
@@ -1066,13 +1396,22 @@ mod tests {
                 _ => None,
             })
             .expect("send site must translate to SmiArith{Add}");
-        assert_eq!(fail, bailout_id);
-        assert!(matches!(
-            ir.blocks.last().unwrap().code[..],
-            [Ir::Bailout {
-                reason: BailoutReason::SmiOpFailed
-            }]
-        ));
+        let fail_block = ir
+            .blocks
+            .iter()
+            .find(|b| b.id == fail)
+            .expect("fail must name a real synthesized block");
+        assert!(
+            matches!(fail_block.code[..], [Ir::CallSend { .. }, Ir::Jump { .. }]),
+            "the fail block must send '+' generically then jump to a continuation, got {:?}",
+            fail_block.code
+        );
+        assert!(
+            !ir.blocks
+                .iter()
+                .any(|b| b.code.iter().any(|op| matches!(op, Ir::Bailout { .. }))),
+            "S11 step 7: Ir::Bailout must never be constructed by convert() anymore"
+        );
     }
 
     /// The fusion peephole (D3.2): a comparison send immediately consumed
@@ -1189,9 +1528,11 @@ mod tests {
         let cfg = decode::decode(method);
         let ir = convert(&vm, method, &cfg);
 
-        // 2 real blocks (push+jump, then the target) plus the one always-
-        // appended synthetic bailout block.
-        assert_eq!(ir.blocks.len(), 3);
+        // 2 real blocks (push+jump, then the target) -- S11 step 7: no
+        // extra synthetic block anymore unless one is actually NEEDED (a
+        // fallible smi-inline op or a Boolean branch), and this method's
+        // bytecode has neither.
+        assert_eq!(ir.blocks.len(), 2);
         let const_dst = ir.blocks[0]
             .code
             .iter()

@@ -115,10 +115,47 @@ pub fn activate_entry(vm: &mut VmState, method: MethodOop, argc: usize) {
 }
 
 /// Reads and executes bytecode from a fresh entry frame until it returns.
+/// Tries `method`'s own primitive first (`send::try_primitive`, shared with
+/// `send::activate_method`) — `activate_entry`'s bare `push_frame` has no
+/// primitive step of its own, which is only safe for a target that never
+/// carries one (see `try_primitive`'s own doc for why that stopped being
+/// true once S11 D6.1's `rt_interpret_call` started reusing this function
+/// for C2I).
+///
+/// The `Activated` family (`value`/`ensure:`/`ifCurtailed:`, via
+/// `blocks::activate_block`) is its own hazard even with `try_primitive` in
+/// place: unlike `push_frame` (which takes its `saved_fp`/`saved_bci`
+/// linkage as plain parameters — `activate_entry` hardcodes
+/// `ENTRY_FRAME_SENTINEL`/0 for exactly this reason), `activate_block`
+/// reads `vm.stack.fp`/`vm.regs.bci` DIRECTLY, assuming they already mean
+/// "resume here" — true at an ordinary send site (`OP_SEND` stamps both
+/// right before calling in), false here: this is a FRESH entry, and in the
+/// C2I case (`run_method_reentrant`) `vm.stack.fp`/`vm.regs.bci` are
+/// whatever the OUTER, currently-paused interpreter activation left
+/// behind, with an unknown number of native COMPILED frames in between
+/// that `do_return`'s own frame-linked unwinding can never see through.
+/// Presenting the same sentinel shape `activate_entry` itself would have
+/// used — for exactly the duration of the primitive attempt — makes an
+/// Activated frame link back to "this `run_method` call is done, return to
+/// Rust" instead of aliasing that outer activation directly.
 pub fn run_method(vm: &mut VmState, method: MethodOop, receiver: Oop, args: &[Oop]) -> Oop {
     push(vm, receiver);
     for &a in args {
         push(vm, a);
+    }
+    let argc = args.len() as u8;
+
+    let saved_fp = vm.stack.fp;
+    let saved_bci = vm.regs.bci;
+    vm.stack.fp = ENTRY_FRAME_SENTINEL as usize;
+    vm.regs.bci = 0;
+    let outcome = send::try_primitive(vm, method, argc);
+    vm.stack.fp = saved_fp;
+    vm.regs.bci = saved_bci;
+    match outcome {
+        send::PrimitiveOutcome::Result(v) => return v,
+        send::PrimitiveOutcome::Activated => return dispatch(vm),
+        send::PrimitiveOutcome::Fallthrough => {}
     }
     activate_entry(vm, method, args.len());
     dispatch(vm)
@@ -135,6 +172,25 @@ pub fn run_method(vm: &mut VmState, method: MethodOop, receiver: Oop, args: &[Oo
 /// silently drop an OUTER activation's own `fp` if one exists. Saving and
 /// restoring that snapshot around the call is what makes nesting safe
 /// without touching `run_method`/`dispatch`/`do_return` themselves.
+///
+/// `vm.regs` is snapshotted too, alongside `vm.stack`'s own activation:
+/// `vm.regs.method`/`bci` are a single, global handoff slot the dispatch
+/// loop stamps before every send and re-reads after one returns (`OP_SEND`'s
+/// own doc above) — NOT part of any per-frame state, so a NESTED `dispatch`
+/// call (this function's own, run to completion for the C2I target) freely
+/// overwrites it and, on returning through its own `ENTRY_FRAME_SENTINEL`
+/// (a "no real caller frame to resume" top-level marker, `do_return`'s own
+/// convention), never has a reason to restore it to whatever the OUTER,
+/// paused-in-compiled-code activation had left there. Left unsaved, the
+/// OUTER interpreter loop — once the compiled frame above it eventually
+/// returns control back to it — reads `vm.regs.bci` (`OP_RETURN_TOS`'s
+/// "resume the real caller" arm, `must_be_boolean_send`'s retry arm) and
+/// gets the NESTED call's own leftover value instead of its own resume
+/// point: found via a `doesNotUnderstand:`-adjacent recursion (S11 step 7's
+/// own eligibility relaxation was the first thing to ever nest a REAL
+/// interpreted frame beneath a compiled one this way) that, once fixed,
+/// surfaced this as a *different* method resuming at a wildly
+/// out-of-range bci belonging to whatever the nested call had run last.
 pub fn run_method_reentrant(
     vm: &mut VmState,
     method: MethodOop,
@@ -142,8 +198,10 @@ pub fn run_method_reentrant(
     args: &[Oop],
 ) -> Oop {
     let saved = vm.stack.save_activation();
+    let saved_regs = vm.regs;
     let result = run_method(vm, method, receiver, args);
     vm.stack.restore_activation(saved);
+    vm.regs = saved_regs;
     result
 }
 

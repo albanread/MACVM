@@ -53,6 +53,45 @@ From S11, slow paths are REAL calls, and eligibility becomes:
   `stub_dnu`-style runtime `rt_must_be_boolean` which raises the Smalltalk
   send and never returns normally).
 
+> **SPEC-QUESTION:** step 7 tried widening eligibility exactly as this
+> section's own text says — "arbitrary `send`/`send_w` in ANY IC state" —
+> and found the C2I/reentrant-call machinery underneath (D5/D6, steps 4-5)
+> isn't robust enough yet for the much larger surface that unlocks: a
+> compiled method's own generic `CallSend` can now reach, via C2I, a target
+> that ITSELF activates a real interpreted frame several native call-stack
+> levels below an unrelated, currently-paused OUTER interpreter activation
+> (deep block/iteration nesting, in particular — `do:`/`to:do:`-style
+> callers reaching `value:` this way). Four real, narrower bugs got found
+> and fixed along the way and stay in the tree regardless of this
+> question's answer: `emit::Emitter::emit_call_send`'s spill/register
+> parallel-move hazard (a spilled arg's own destination register can alias
+> a DIFFERENT arg's current register, silently swapping/losing a value —
+> found via `Message>>selector`'s `self instVarAt: 1` returning the
+> `Message` itself instead of the real selector), `run_method`'s missing
+> primitive-try step (a C2I target with its own primitive always fell
+> straight to its bytecode fallback body, silently skipping the primitive
+> — S11 step 4's own `rt_interpret_call` never exercised a genuinely
+> primitive-bearing target until step 7's relaxation reached one),
+> `run_method_reentrant`'s missing `vm.regs` snapshot (`vm.stack`'s own
+> `fp`/`has_frame` were already saved/restored around a reentrant call;
+> `vm.regs.method`/`bci` — the SAME kind of single, global handoff slot —
+> were not, so a nested `dispatch` call's own leftover value could resume
+> the WRONG method at a wildly out-of-range bci once the outer, paused
+> activation resumed), and `run_method`'s entry-sentinel spoof around an
+> `Activated` primitive (`blocks::activate_block`, reached via the
+> `value`/`ensure:`/`ifCurtailed:` family, reads `vm.stack.fp`/`vm.regs.bci`
+> directly as its OWN return linkage — correct at an ordinary send site,
+> wrong for a fresh `run_method` entry with an unknown number of native
+> COMPILED frames between it and whatever those fields last pointed at).
+> Given the DEPTH of what's still being found this way, step 7 shipped
+> with eligibility reverted to its ORIGINAL, narrower shape (D1 point 2's
+> mono-smi-inline gate, `driver::mono_smi_inline_send`) — `store_instvar_
+> pop`/`store_global_pop` and `send_super` (D4.6) ARE still allowed, and
+> the smi-fail-edge real-`CallSend` machinery (`fail_and_continue`/
+> `fail_and_branch`) is real and tested — but the broader "any IC state"
+> widening is deferred to whichever step gives C2I reentrancy the depth of
+> testing this section's own text deserves.
+
 ### D2. Entry points and the klass-guard prologue
 
 Layout of every nmethod from S11 (offsets recorded in the header):

@@ -51,7 +51,7 @@ use crate::compiler::assembler::{
     imm, mem, sp, x, xr, Assembler, CodeBlob, Cond, Label, LiteralId, Operand, Reg, RelocKind,
 };
 use crate::compiler::ir::{
-    BailoutReason, BlockId, CallSiteInfo, CmpOp, Ir, IrMethod, PoolLit, SmiOp, VReg,
+    BailoutReason, BlockId, CallSiteInfo, CmpOp, Ir, IrMethod, PoolLit, SmiOp, StubId, VReg,
 };
 use crate::compiler::regalloc::{Assignment, RegallocResult};
 use crate::oops::wrappers::SymbolOop;
@@ -190,6 +190,10 @@ struct Emitter<'a> {
     /// its address isn't known until stub publish time (before any real
     /// method is compiled, but still not a compile-time constant).
     stub_poll_lit: LiteralId,
+    /// Same reasoning as `stub_poll_lit`, for `codecache::stubs::Stubs::
+    /// must_be_boolean` (S11 step 6) — `Ir::CallRuntime{stub:
+    /// StubId::MUST_BE_BOOLEAN}`'s own far call embeds this (S11 step 7).
+    must_be_boolean_lit: LiteralId,
     /// `IrMethod.call_sites`, indexed by `Ir::CallSend.site` — see that
     /// field's own doc.
     call_sites: &'a [CallSiteInfo],
@@ -327,6 +331,90 @@ impl<'a> Emitter<'a> {
         self.commit(dst, d);
     }
 
+    /// D3/P7: mirrors [`Self::emit_load_field`]'s own MEM_TAG-bias split
+    /// (`ldur`/±255 vs `sub`+`ldr`) for the STORE direction (`stur`/`str`),
+    /// then, if `barrier`, appends the write barrier AFTER the store
+    /// (`memory::store::store`'s own order: `*slot = val;` first, THEN the
+    /// conditional dirty — SPEC §7.4).
+    ///
+    /// Every comparison here is on raw ADDRESSES, so uses the UNSIGNED
+    /// conditions (`Lo`/`Hs`, never `Lt`/`Ge`) — matching
+    /// `memory::layout::HeapLayout::is_old`/`is_new`'s own plain `usize`
+    /// `>=`/`<`, which is unsigned by construction (same reasoning:
+    /// `is_old`/`is_new`'s own doc notes tagged oops compare directly
+    /// against `old_start` unchanged, no untagging needed, since MEM_TAG's
+    /// +1 bias can never cross a page-aligned boundary — used here too:
+    /// `robj`/`rval` are compared TAGGED, exactly as `resolve` hands them
+    /// back).
+    ///
+    /// Register discipline: `robj`/`rval` (`x16`/`x17` if their vregs are
+    /// spilled) must stay valid from the store through the LAST barrier
+    /// check that reads each — so unlike `emit_load_field`'s own far-store
+    /// case (which safely clobbers `x16` since `ra` is never read again
+    /// after the load), the far-STORE case here uses `x19` for the
+    /// untagged base instead, leaving `x16`/`x17` untouched for the
+    /// barrier. `x19`/`x20` (regalloc's own "unused" range, never assigned
+    /// a real vreg — `regalloc.rs`'s module doc) are the two extra scratch
+    /// temps the barrier itself needs (`old_start`, then the slot/card
+    /// computation once `old_start`'s own last read has passed);
+    /// recomputing the untagged slot address fresh here (rather than
+    /// trying to reuse whatever the near/far store path above left behind)
+    /// trades one redundant `add` in the far case for not having to reason
+    /// about two different leftover-register shapes.
+    fn emit_store_field(&mut self, obj: VReg, byte_off: i32, val: VReg, barrier: bool) {
+        let robj = self.resolve(obj, 16);
+        let rval = self.resolve(val, 17);
+        let biased = byte_off as i64 - 1;
+        if (-256..=255).contains(&biased) {
+            self.asm
+                .emit("stur", &[Operand::Reg(rval), mem(robj.num, biased)]);
+        } else {
+            self.asm
+                .emit("add", &[x(19), Operand::Reg(robj), imm(biased)]);
+            self.asm.emit("str", &[Operand::Reg(rval), mem(19, 0)]);
+        }
+
+        if !barrier {
+            return;
+        }
+
+        let skip = self.asm.new_label();
+        self.asm.emit(
+            "ldr",
+            &[
+                x(20),
+                mem(28, crate::oops::layout::VMREG_OLD_START_OFFSET as i64),
+            ],
+        );
+        self.asm.emit("cmp", &[Operand::Reg(robj), x(20)]);
+        self.asm.b_cond(Cond::Lo, skip); // obj < old_start -> young -> no barrier
+        self.asm.emit("tst", &[Operand::Reg(rval), imm(3)]);
+        self.asm.b_cond(Cond::Eq, skip); // val is smi -> no barrier
+        self.asm.emit("cmp", &[Operand::Reg(rval), x(20)]);
+        self.asm.b_cond(Cond::Hs, skip); // val >= old_start -> old, not new -> no barrier
+
+        self.asm
+            .emit("add", &[x(19), Operand::Reg(robj), imm(biased)]);
+        self.asm.emit(
+            "lsr",
+            &[x(19), x(19), imm(crate::memory::cards::CARD_SHIFT as i64)],
+        );
+        self.asm.emit(
+            "ldr",
+            &[
+                x(20),
+                mem(
+                    28,
+                    crate::oops::layout::VMREG_CARD_BASE_BIASED_OFFSET as i64,
+                ),
+            ],
+        );
+        self.asm.emit("add", &[x(20), x(20), x(19)]);
+        self.asm.emit("strb", &[x(31), mem(20, 0)]); // xzr: CARD_DIRTY == 0
+
+        self.asm.bind(skip);
+    }
+
     fn emit_smi_cmp_br(
         &mut self,
         op: CmpOp,
@@ -429,46 +517,72 @@ impl<'a> Emitter<'a> {
     fn emit_call_send(&mut self, dst: VReg, site: u16, args: &[VReg]) {
         let sources: Vec<Assignment> = args.iter().map(|&a| self.assignment_of(a)).collect();
 
-        // Spilled sources: plain memory reads, straight into x{i}. Never
-        // conflict with anything -- spill slots and x0..x5 are disjoint
-        // address spaces, so these can all happen first, in any order.
-        for (i, src) in sources.iter().enumerate() {
-            if let Assignment::Spill(slot) = src {
-                self.asm.emit("ldr", &[x(i as u8), spill_mem(*slot)]);
-            }
+        // A single parallel-move problem over ALL args, register- and
+        // spill-assigned alike -- NOT spill-loads-first-then-register-
+        // shuffle (an earlier draft's bug): a spilled arg's destination
+        // x{i} can alias a DIFFERENT arg's CURRENT register (e.g. arg 0
+        // spilled, arg 1 presently sitting in x0 because its whole live
+        // range ends at this call, D3.6's own "spill-all-at-safepoint only
+        // forces `Spill` on a vreg whose interval extends PAST the
+        // safepoint" -- see this fn's own doc above). Loading arg 0's
+        // spill straight into x0 first would clobber arg 1's value before
+        // its own move ever reads it -- the exact hazard the register-only
+        // shuffle below already guards against, just not (until now) for a
+        // spill-load's write. `pending`: (dest, source) pairs still
+        // needing a move, skipping any register source already in place
+        // (src reg == dest).
+        #[derive(Clone, Copy)]
+        enum Src {
+            Reg(u8),
+            Mem(crate::compiler::regalloc::SpillSlot),
         }
-
-        // Register-assigned sources: a bounded (<=6-node) parallel-move
-        // shuffle. `pending`: (dest, src) pairs still needing `mov
-        // x{dest}, x{src}`, skipping any already in place (src == dest).
-        let mut pending: Vec<(u8, u8)> = sources
+        let mut pending: Vec<(u8, Src)> = sources
             .iter()
             .enumerate()
             .filter_map(|(i, src)| match *src {
-                Assignment::Reg(r) if r != i as u8 => Some((i as u8, r)),
-                _ => None,
+                Assignment::Reg(r) if r != i as u8 => Some((i as u8, Src::Reg(r))),
+                Assignment::Reg(_) => None,
+                Assignment::Spill(slot) => Some((i as u8, Src::Mem(slot))),
             })
             .collect();
         while !pending.is_empty() {
-            // A move is safe to emit now iff no OTHER pending move still
-            // needs to READ from this one's destination (emitting it
-            // first would clobber that other move's own source).
-            if let Some(pos) = pending
-                .iter()
-                .position(|&(i, _)| !pending.iter().any(|&(_, r)| r == i))
-            {
-                let (i, r) = pending.remove(pos);
-                self.asm.emit("mov", &[x(i), x(r)]);
+            // An entry is safe to emit now iff no OTHER pending entry
+            // still needs to READ x{i} as ITS OWN register source
+            // (emitting this one first -- register move or spill load
+            // alike -- would clobber that other entry's source). A `Mem`
+            // source is never itself a reader of anyone else's
+            // destination, so it can block others but can never sit in a
+            // genuine cycle (see the cycle-break branch below).
+            if let Some(pos) = pending.iter().position(|&(i, _)| {
+                !pending
+                    .iter()
+                    .any(|&(_, s)| matches!(s, Src::Reg(r) if r == i))
+            }) {
+                let (i, s) = pending.remove(pos);
+                match s {
+                    Src::Reg(r) => self.asm.emit("mov", &[x(i), x(r)]),
+                    Src::Mem(slot) => self.asm.emit("ldr", &[x(i), spill_mem(slot)]),
+                }
             } else {
-                // A genuine cycle (e.g. x0<-x1, x1<-x0): break it via x16,
-                // preserving the about-to-be-overwritten destination's
-                // current value for whichever other pending move still
-                // needs to read it.
-                let (i0, r0) = pending[0];
+                // A genuine cycle (e.g. x0<-x1, x1<-x0): only possible
+                // among `Reg` entries -- a `Mem` entry has no register
+                // source of its own to need reading, so it can be BLOCKED
+                // but never a participant in the mutual-block that makes
+                // this branch necessary. Break it via x16, preserving the
+                // about-to-be-overwritten destination's current value for
+                // whichever other pending move still needs to read it.
+                let (i0, r0) = match pending[0] {
+                    (i, Src::Reg(r)) => (i, r),
+                    (_, Src::Mem(_)) => {
+                        unreachable!("a Mem source is never part of a genuine cycle")
+                    }
+                };
                 self.asm.emit("mov", &[x(16), x(i0)]);
-                for (_, r) in pending.iter_mut() {
-                    if *r == i0 {
-                        *r = 16;
+                for (_, s) in pending.iter_mut() {
+                    if let Src::Reg(r) = s {
+                        if *r == i0 {
+                            *r = 16;
+                        }
                     }
                 }
                 self.asm.emit("mov", &[x(i0), x(r0)]);
@@ -484,6 +598,40 @@ impl<'a> Emitter<'a> {
             selector: info.selector,
             argc: info.argc,
         });
+        let d = self.dest_target(dst);
+        if d.num != 0 {
+            self.asm.emit("mov", &[Operand::Reg(d), x(0)]);
+        }
+        self.commit(dst, d);
+    }
+
+    /// S11 step 7 (D1/D5): calls a FIXED runtime stub address (no IC state
+    /// machine, no site table — unlike `emit_call_send`, this target never
+    /// changes). Only ever `StubId::MUST_BE_BOOLEAN` today (one argument,
+    /// arriving in x0 — `codecache::stubs::build_stub_must_be_boolean`'s
+    /// own callee-shaped, plain-`ret` contract, so this is a completely
+    /// ordinary call from the emitted code's own perspective: marshal into
+    /// x0, `bl`, result in x0). No parallel-move shuffle needed the way
+    /// `emit_call_send` requires: with exactly one argument there is
+    /// nothing for it to collide with.
+    fn emit_call_runtime(&mut self, dst: Option<VReg>, stub: StubId, args: &[VReg]) {
+        assert_eq!(
+            stub,
+            StubId::MUST_BE_BOOLEAN,
+            "emit_call_runtime: only MUST_BE_BOOLEAN is wired up (S11 step 7) -- \
+             rt_alloc_slow/stub_nlr_unwind aren't CallRuntime targets yet (steps 8/9)"
+        );
+        assert_eq!(
+            args.len(),
+            1,
+            "emit_call_runtime: MUST_BE_BOOLEAN takes exactly one argument"
+        );
+        let ra = self.resolve(args[0], 16);
+        if ra.num != 0 {
+            self.asm.emit("mov", &[x(0), Operand::Reg(ra)]);
+        }
+        self.asm.call_far(self.must_be_boolean_lit);
+        let dst = dst.expect("MUST_BE_BOOLEAN always produces a result (a coerced boolean)");
         let d = self.dest_target(dst);
         if d.num != 0 {
             self.asm.emit("mov", &[Operand::Reg(d), x(0)]);
@@ -557,6 +705,7 @@ pub fn emit(
     method: &IrMethod,
     regalloc: &RegallocResult,
     stub_poll_addr: u64,
+    must_be_boolean_addr: u64,
     guard: Option<EntryGuard>,
 ) -> (CodeBlob, Vec<BlockPc>, u32, Vec<EmittedIcSite>) {
     let literal_ids = intern_pool(asm, method);
@@ -569,6 +718,7 @@ pub fn emit(
     let labels: Vec<Label> = (0..method.blocks.len()).map(|_| asm.new_label()).collect();
     let epilogue = asm.new_label();
     let stub_poll_lit = asm.literal_u64(stub_poll_addr, Some(RelocKind::RuntimeAddr));
+    let must_be_boolean_lit = asm.literal_u64(must_be_boolean_addr, Some(RelocKind::RuntimeAddr));
 
     if let Some(g) = &guard {
         emit_entry_guard(asm, g);
@@ -584,6 +734,7 @@ pub fn emit(
         true_lit: method.true_lit,
         false_lit: method.false_lit,
         stub_poll_lit,
+        must_be_boolean_lit,
         call_sites: &method.call_sites,
         ic_sites: Vec::new(),
     };
@@ -664,10 +815,19 @@ fn emit_ir(e: &mut Emitter, ir: &Ir, next_in_order: Option<BlockId>) {
                 }
             }
         }
-        Ir::LoadKlass { .. } | Ir::StoreField { .. } | Ir::GuardKlass { .. } => {
-            unreachable!("S11-only Ir variant; S10's convert() never constructs one")
+        Ir::LoadKlass { .. } | Ir::GuardKlass { .. } => {
+            unreachable!(
+                "S11-only Ir variant; nothing constructs one yet (LoadKlass: needed by \
+                          no D3.2 row; GuardKlass: S14+ inlining guards)"
+            )
         }
         Ir::LoadField { dst, obj, byte_off } => e.emit_load_field(dst, obj, byte_off),
+        Ir::StoreField {
+            obj,
+            byte_off,
+            val,
+            barrier,
+        } => e.emit_store_field(obj, byte_off, val, barrier),
         Ir::SmiArith {
             op: SmiOp::Mul,
             dst,
@@ -714,8 +874,13 @@ fn emit_ir(e: &mut Emitter, ir: &Ir, next_in_order: Option<BlockId>) {
             site,
             ref args,
         } => e.emit_call_send(dst, site, args),
-        Ir::CallRuntime { .. } | Ir::Alloc { .. } => {
-            unreachable!("S11-later-step Ir variant; not constructed until steps 6/8")
+        Ir::CallRuntime {
+            dst,
+            stub,
+            ref args,
+        } => e.emit_call_runtime(dst, stub, args),
+        Ir::Alloc { .. } => {
+            unreachable!("S11 step 8's own Ir variant; not constructed until then")
         }
         Ir::Poll => e.emit_poll(),
         Ir::Ret { val } => {
@@ -901,7 +1066,7 @@ mod tests {
         let ra = regalloc::regalloc(&method);
         let mut asm = JasmAssembler::new();
         let (_blob, block_pcs, _verified_entry_off, _ic_sites) =
-            emit(&mut asm, &method, &ra, 0, None);
+            emit(&mut asm, &method, &ra, 0, 0, None);
 
         assert_eq!(
             block_pcs.len(),
@@ -977,7 +1142,7 @@ mod tests {
         let method = hand_method(vec![block0, block1], vregs, 2);
         let ra = regalloc::regalloc(&method);
         let mut asm = JasmAssembler::new();
-        let (blob, _pcs, _verified_entry_off, _ic_sites) = emit(&mut asm, &method, &ra, 0, None);
+        let (blob, _pcs, _verified_entry_off, _ic_sites) = emit(&mut asm, &method, &ra, 0, 0, None);
 
         let mnemonics: Vec<&str> = blob.listing.iter().map(|l| mnemonic(l)).collect();
         let asr_pos = mnemonics.iter().position(|&m| m == "asr");
@@ -1047,7 +1212,7 @@ mod tests {
         let near = make(30);
         let ra = regalloc::regalloc(&near);
         let mut asm = JasmAssembler::new();
-        let (blob, _pcs, _verified_entry_off, _ic_sites) = emit(&mut asm, &near, &ra, 0, None);
+        let (blob, _pcs, _verified_entry_off, _ic_sites) = emit(&mut asm, &near, &ra, 0, 0, None);
         let near_mnemonics: Vec<String> = blob.listing.iter().map(|l| mnemonic(l)).collect();
         assert!(
             near_mnemonics.iter().any(|m| m == "ldur"),
@@ -1063,7 +1228,8 @@ mod tests {
         let far = make(31);
         let ra2 = regalloc::regalloc(&far);
         let mut asm2 = JasmAssembler::new();
-        let (blob2, _pcs2, _verified_entry_off2, _ic_sites2) = emit(&mut asm2, &far, &ra2, 0, None);
+        let (blob2, _pcs2, _verified_entry_off2, _ic_sites2) =
+            emit(&mut asm2, &far, &ra2, 0, 0, None);
         let mnemonics: Vec<String> = blob2.listing.iter().map(|l| mnemonic(l)).collect();
         assert!(
             mnemonics.iter().any(|m| m == "sub"),
@@ -1077,6 +1243,80 @@ mod tests {
         assert!(
             !blob2.listing.iter().any(|l| l.contains("ldur")),
             "index 31 must NOT use ldur at all -- got:\n{}",
+            blob2.listing.join("\n")
+        );
+    }
+
+    /// tests_s11.md's `barrier_emitted_conditions`: `StoreField{barrier:
+    /// true}`'s listing contains the card-marking sequence (P7); `barrier:
+    /// false` emits only the bare store, no barrier at all.
+    #[test]
+    fn barrier_emitted_conditions() {
+        let make = |barrier: bool| {
+            let vregs: Vec<VRegInfo> = (0..2).map(|_| VRegInfo { is_oop: true }).collect();
+            let block0 = IrBlock {
+                id: BlockId(0),
+                bci: 0,
+                code: vec![
+                    Ir::Param {
+                        dst: VReg(0),
+                        index: 0,
+                    },
+                    Ir::Param {
+                        dst: VReg(1),
+                        index: 1,
+                    },
+                    Ir::StoreField {
+                        obj: VReg(0),
+                        byte_off: crate::oops::layout::BODY_OFFSET as i32,
+                        val: VReg(1),
+                        barrier,
+                    },
+                    Ir::RetSelf,
+                ],
+                entry_stack: Vec::new(),
+            };
+            hand_method(vec![block0], vregs, 2)
+        };
+
+        let mnemonic = |l: &str| l.split_whitespace().nth(2).unwrap_or("").to_string();
+
+        let with_barrier = make(true);
+        let ra = regalloc::regalloc(&with_barrier);
+        let mut asm = JasmAssembler::new();
+        let (blob, _pcs, _verified_entry_off, _ic_sites) =
+            emit(&mut asm, &with_barrier, &ra, 0, 0, None);
+        let mnemonics: Vec<String> = blob.listing.iter().map(|l| mnemonic(l)).collect();
+        assert!(
+            mnemonics.iter().any(|m| m == "stur" || m == "str"),
+            "barrier:true must still emit the store itself -- got:\n{}",
+            blob.listing.join("\n")
+        );
+        assert!(
+            mnemonics.iter().any(|m| m == "strb"),
+            "barrier:true must emit the card-dirtying strb -- got:\n{}",
+            blob.listing.join("\n")
+        );
+        assert!(
+            mnemonics.iter().any(|m| m == "lsr"),
+            "barrier:true must emit the card-index shift -- got:\n{}",
+            blob.listing.join("\n")
+        );
+
+        let without_barrier = make(false);
+        let ra2 = regalloc::regalloc(&without_barrier);
+        let mut asm2 = JasmAssembler::new();
+        let (blob2, _pcs2, _verified_entry_off2, _ic_sites2) =
+            emit(&mut asm2, &without_barrier, &ra2, 0, 0, None);
+        let mnemonics2: Vec<String> = blob2.listing.iter().map(|l| mnemonic(l)).collect();
+        assert!(
+            mnemonics2.iter().any(|m| m == "stur" || m == "str"),
+            "barrier:false must still emit the store itself -- got:\n{}",
+            blob2.listing.join("\n")
+        );
+        assert!(
+            !mnemonics2.iter().any(|m| m == "strb"),
+            "barrier:false must NOT emit any card-dirtying strb -- got:\n{}",
             blob2.listing.join("\n")
         );
     }
@@ -1110,7 +1350,7 @@ mod tests {
             resolve_addr: 0x3000,
         };
         let (blob, _pcs, verified_entry_off, _ic_sites) =
-            emit(&mut asm, &method, &ra, 0, Some(guard));
+            emit(&mut asm, &method, &ra, 0, 0, Some(guard));
 
         // `verified_entry_off` must land exactly on the S10-era prologue's
         // own first instruction (`stp x29,x30,...`) -- found empirically in
@@ -1246,7 +1486,7 @@ mod tests {
         };
         let ra = regalloc::regalloc(&method);
         let mut asm = JasmAssembler::new();
-        let (blob, _pcs, _verified_entry_off, ic_sites) = emit(&mut asm, &method, &ra, 0, None);
+        let (blob, _pcs, _verified_entry_off, ic_sites) = emit(&mut asm, &method, &ra, 0, 0, None);
 
         assert_eq!(
             ic_sites.len(),

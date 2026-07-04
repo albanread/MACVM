@@ -20,6 +20,7 @@ use macvm::compiler::regalloc;
 use macvm::frontend::{classdef, parser};
 use macvm::interpreter::ic::InterpreterIc;
 use macvm::memory::alloc;
+use macvm::memory::scavenge::scavenge;
 use macvm::oops::layout::HEADER_WORDS;
 use macvm::oops::smi::SmallInt;
 use macvm::oops::wrappers::{KlassOop, MemOop, MethodOop, SymbolOop};
@@ -146,6 +147,7 @@ fn run_ir_raw() {
         &method,
         &regalloc_result,
         stubs.stub_poll_addr(),
+        stubs.must_be_boolean_addr(),
         None,
     );
     assert_eq!(
@@ -189,7 +191,7 @@ fn build_and_publish(cache: &mut CodeCache, stub_poll_addr: u64, method: &IrMeth
     let regalloc_result = regalloc::regalloc(method);
     let mut asm = JasmAssembler::new();
     let (blob, _pcs, _verified_entry_off, _ic_sites) =
-        emit::emit(&mut asm, method, &regalloc_result, stub_poll_addr, None);
+        emit::emit(&mut asm, method, &regalloc_result, stub_poll_addr, 0, None);
     let h = cache.alloc(blob.code.len()).unwrap();
     cache.publish(h, &blob)
 }
@@ -368,6 +370,7 @@ fn run_ir_raw_forces_spill() {
         &method,
         &regalloc_result,
         stubs.stub_poll_addr(),
+        stubs.must_be_boolean_addr(),
         None,
     );
     let h = cache.alloc(blob.code.len()).unwrap();
@@ -395,6 +398,13 @@ fn primitive_stub(
     b.ret_self();
     let m = b.finish(vm, sel, 1, 0);
     m.set_primitive(prim_id);
+    // `run_method`'s own `try_primitive` step (S11 step 7) genuinely tries
+    // this primitive before ever falling to `^self` -- a caller that
+    // drives it with Fail-inducing args (an overflowing smi add, say)
+    // needs `prim_fails` set, or `try_primitive`'s own invariant check
+    // panics. Harmless for callers that only ever check eligibility and
+    // never actually invoke this stub.
+    m.set_flags(1, 0, false, false, true, false, 0);
     m
 }
 
@@ -426,6 +436,11 @@ fn compiled_plus_arg_executes_correctly() {
     let smi_klass = vm.universe.smi_klass;
     let epoch = vm.ic_epoch;
     InterpreterIc::at(method, 0).set_mono(&mut vm, smi_klass, plus_target, epoch);
+    // S11 step 7: the overflow check's own fail edge is a real generic
+    // send now, which needs a REAL method in smi_klass's own dictionary
+    // (`set_mono` above only seeds this call site's own inline cache, a
+    // separate thing from what `lookup` actually walks at runtime).
+    install_method(&mut vm, smi_klass, plus_sel, plus_target);
     assert!(
         driver::eligible(&vm, method),
         "self + arg, mono smi IC, must be eligible"
@@ -447,10 +462,10 @@ fn compiled_plus_arg_executes_correctly() {
     let result = unsafe { call(entry, vm_ptr, argv.as_ptr(), 2) };
     assert_eq!(result, SmallInt::new(42).oop().raw(), "5 + 37 = 42");
 
-    // Overflowing operands must bail out to the sentinel, not crash or
-    // silently wrap — the interpreter fallback (S10 step 8) isn't wired up
-    // yet, so this just checks the compiled entry itself does the right
-    // thing at its own boundary.
+    // Overflowing operands must not crash or silently wrap. S11 step 7:
+    // the overflow check's fail edge is a real generic send now (not a
+    // bailout sentinel) -- it reaches the installed '+' fallback (`^self`),
+    // so the compiled entry returns normally with the receiver's own value.
     // Both individually valid smis (SMI_MAX itself), but their sum isn't.
     let big = macvm::oops::smi::SmallInt::MAX;
     let argv_overflow = [
@@ -459,8 +474,9 @@ fn compiled_plus_arg_executes_correctly() {
     ];
     let overflow_result = unsafe { call(entry, vm_ptr, argv_overflow.as_ptr(), 2) };
     assert_eq!(
-        overflow_result, 0b10,
-        "overflowing smi add must return the BAILOUT sentinel"
+        overflow_result,
+        SmallInt::new(big).oop().raw(),
+        "overflowing smi add falls back to the real '+' send, which returns self here"
     );
 }
 
@@ -479,14 +495,15 @@ fn native_sp() -> u64 {
 
 /// tests_s10.md's `compiled_frame_teardown_exact`: the native stack
 /// pointer must be EXACTLY where it was before `enter_compiled`, both
-/// after a normal (non-bailout) return and after a bailout — the call
-/// stub's own prologue/epilogue and the compiled method's own frame
-/// (`sub sp,sp,#frame_bytes` / `mov sp,x29`) must net to zero either way,
-/// since both paths share the same epilogue (emit.rs's own `Ret`/
-/// `Bailout` handling both just `b` to it). An imbalance here would
-/// silently corrupt the REST of this process's native call stack — not
-/// just this one call — so this is checked directly rather than inferred
-/// from "the test suite didn't crash".
+/// after a normal smi-fast-path return and after the smi-inline op's own
+/// FAIL edge fires (an overflowing add). S11 step 7 replaced the old
+/// bailout-sentinel-and-restart mechanism with a real generic send that
+/// stays inside the SAME compiled call (D1) — so the second case is no
+/// longer `EnterResult::Bailout` either, just an ordinary `Completed` whose
+/// result came from the fallback method instead of the fused fast path.
+/// Still worth checking directly: an imbalance here would silently corrupt
+/// the REST of this process's native call stack, not just this one call,
+/// regardless of which path produced the result.
 #[test]
 fn compiled_frame_teardown_exact() {
     let mut vm = test_vm();
@@ -505,11 +522,26 @@ fn compiled_frame_teardown_exact() {
         pb.ret_self();
         let m = pb.finish(&mut vm, plus_sel, 1, 0);
         m.set_primitive(1);
+        // `run_method`'s own `try_primitive` step (S11 step 7) now tries
+        // this primitive for real before ever falling to `^self` -- an
+        // overflowing `+` genuinely Fails it, so `prim_fails` must be set
+        // (previously masked by `run_method`'s own missing primitive step,
+        // which silently skipped straight to the bytecode body).
+        m.set_flags(1, 0, false, false, true, false, 0);
         m
     };
     let smi_klass = vm.universe.smi_klass;
     let epoch = vm.ic_epoch;
     InterpreterIc::at(method, 0).set_mono(&mut vm, smi_klass, plus_target_body, epoch);
+    // S11 step 7: an overflowing smi-add no longer bails out -- it sends
+    // '+' generically (D1: "the LargeInteger/Double fallback via the
+    // interpreter callee"), which needs a REAL method in smi_klass's own
+    // dictionary to find (the `set_mono` above only seeds this SITE's
+    // inline-cache for eligibility/inlining purposes, a separate thing
+    // from the klass's real method dictionary `lookup` actually walks).
+    // Reusing `plus_target_body` (`^self`) here too keeps this test's
+    // fallback trivially predictable.
+    install_method(&mut vm, smi_klass, plus_sel, plus_target_body);
 
     let id = driver::compile_method(&mut vm, smi_klass, method).expect("must compile");
 
@@ -529,7 +561,9 @@ fn compiled_frame_teardown_exact() {
     );
     assert_eq!(vm.stack.pop(), SmallInt::new(42).oop());
 
-    // Bailout call (overflowing operands).
+    // Overflowing operands -- the smi-add fails its own overflow check and
+    // falls through to the installed '+' fallback (`^self`) via a real
+    // generic send, S11 step 7 -- NOT a bailout anymore.
     let big = SmallInt::new(SmallInt::MAX);
     vm.stack.push(big.oop());
     vm.stack.push(big.oop());
@@ -538,15 +572,18 @@ fn compiled_frame_teardown_exact() {
     let sp_after2 = native_sp();
     assert_eq!(
         sp_before2, sp_after2,
-        "native sp must be exactly restored after a bailout too -- same shared epilogue"
+        "native sp must be exactly restored via the fail-edge's real send too -- same shared epilogue"
     );
     assert_eq!(
         result2,
-        macvm::interpreter::compiled_call::EnterResult::Bailout
+        macvm::interpreter::compiled_call::EnterResult::Completed,
+        "S11 step 7: the fail edge completes normally (a real send), it never bails out"
     );
-    // Bailout leaves vm.stack untouched (still [receiver, arg]).
-    assert_eq!(vm.stack.pop(), big.oop());
-    assert_eq!(vm.stack.pop(), big.oop());
+    assert_eq!(
+        vm.stack.pop(),
+        big.oop(),
+        "the fallback '+' (^self) returns the receiver -- the same value pushed twice above"
+    );
 }
 
 // ── Listing goldens (tests_s10.md gate item 2, integration item 1) ────────
@@ -626,8 +663,14 @@ fn compile_and_get_listing(vm: &VmState, method: MethodOop) -> String {
     // S10 listing goldens (s10_sumTo/absDiff/bitsOf) -- keeping their output
     // unchanged is the point, not something to revisit as a side effect of
     // step 2's own scope.
-    let (blob, _pcs, _verified_entry_off, _ic_sites) =
-        emit::emit(&mut asm, &ir, &ra, 0xDEAD_BEEF_0000_0000, None);
+    let (blob, _pcs, _verified_entry_off, _ic_sites) = emit::emit(
+        &mut asm,
+        &ir,
+        &ra,
+        0xDEAD_BEEF_0000_0000,
+        0xDEAD_BEEF_0000_0001,
+        None,
+    );
     blob.listing.join("\n") + "\n"
 }
 
@@ -1434,6 +1477,7 @@ fn mono_resolve_patches_call_site_and_dispatches() {
         &caller_method,
         &ra,
         vm.stubs.stub_poll_addr(),
+        vm.stubs.must_be_boolean_addr(),
         None,
     );
     assert_eq!(emitted_ic_sites.len(), 1, "exactly one Ir::CallSend");
@@ -1583,6 +1627,7 @@ fn build_c2i_scenario(vm: &mut VmState) -> (u64, KlassOop, NmethodId) {
         &caller_method,
         &ra,
         vm.stubs.stub_poll_addr(),
+        vm.stubs.must_be_boolean_addr(),
         None,
     );
     assert_eq!(emitted_ic_sites.len(), 1, "exactly one Ir::CallSend");
@@ -1796,6 +1841,7 @@ fn full_ic_lattice_mono_to_pic_to_mega() {
         &caller_method,
         &ra,
         vm.stubs.stub_poll_addr(),
+        vm.stubs.must_be_boolean_addr(),
         None,
     );
     assert_eq!(emitted_ic_sites.len(), 1);
@@ -2003,6 +2049,7 @@ fn dnu_from_compiled_code_reaches_does_not_understand() {
         &caller_method,
         &ra,
         vm.stubs.stub_poll_addr(),
+        vm.stubs.must_be_boolean_addr(),
         None,
     );
     assert_eq!(emitted_ic_sites.len(), 1);
@@ -2185,5 +2232,89 @@ fn send_super_resolves_at_compile_time_and_dispatches() {
         SmallInt::new(200).oop().raw(),
         "super foo from a method on Leaf must reach Mid's own foo (200) -- not Leaf's own \
          override (300, what an ORDINARY send would reach) and not Root's (100)"
+    );
+}
+
+/// tests_s11.md's `card_dirtied_by_compiled_store`: a compiled
+/// `store_instvar_pop` storing a YOUNG value into an OLD receiver dirties
+/// exactly the receiver's own card -- the full pipeline (decode -> convert
+/// -> regalloc -> emit -> publish -> run), not just a listing check
+/// (`emit::tests::barrier_emitted_conditions` already covers that half).
+#[test]
+fn card_dirtied_by_compiled_store() {
+    let mut vm = test_vm();
+    let recv_klass = vm.universe.new_klass(
+        vm.universe.object_klass,
+        "S11StoreBarrierRecv",
+        Format::Slots,
+        false,
+        HEADER_WORDS + 1,
+    );
+    let set_field_sel = vm.universe.intern(b"setField:");
+    let mut b = BytecodeBuilder::new();
+    b.push_self();
+    b.push_temp(0);
+    b.store_instvar_pop(0);
+    b.ret_self();
+    let set_field = b.finish(&mut vm, set_field_sel, 1, 0);
+    install_method(&mut vm, recv_klass, set_field_sel, set_field);
+
+    assert!(
+        driver::eligible(&vm, set_field),
+        "an instvar-store method must be eligible from S11 step 7 on"
+    );
+    let id =
+        driver::compile_method(&mut vm, recv_klass, set_field).expect("setField: must compile");
+    let nm = vm
+        .code_table
+        .get(id)
+        .expect("installed nmethod must be gettable");
+    let entry = unsafe { nm.code.base.add(nm.entry_off as usize) } as u64;
+
+    // Promote `recv` into old gen (tests/it_gc_full.rs's own established
+    // "threshold=0, one scavenge" idiom).
+    let recv = alloc::alloc_slots(&mut vm, recv_klass).oop();
+    vm.stack.push(recv);
+    vm.universe.tenuring_threshold = 0;
+    scavenge(&mut vm).expect("scavenge must promote recv into old gen");
+    let recv = vm.stack.get(vm.stack.sp - 1); // post-scavenge address
+    assert!(
+        vm.universe.layout.is_old(recv.mem_addr()),
+        "recv must actually be in old gen for this test to mean anything"
+    );
+
+    // A fresh YOUNG value -- reset the tenuring threshold back up first,
+    // so an allocation-triggered scavenge (MACVM_GC_STRESS=1) doesn't
+    // immediately re-promote this one too.
+    vm.universe.tenuring_threshold = 127;
+    let array_klass = vm.universe.array_klass;
+    let young_val = alloc::alloc_indexable_oops(&mut vm, array_klass, 0).oop();
+    assert!(
+        vm.universe.layout.is_new(young_val.mem_addr()),
+        "young_val must actually be young for this test to mean anything"
+    );
+
+    let slot_addr = recv.mem_addr() + macvm::oops::layout::BODY_OFFSET;
+    let card = vm.universe.cards.card_index(slot_addr);
+    // `scavenge`'s own promotion just dirtied recv's WHOLE card
+    // unconditionally (`record_multistores`, SPEC §7.3 step 2 -- a
+    // promoted object's body may reference young survivors regardless of
+    // its actual field contents) -- clean it explicitly first, exactly
+    // matching what a later real card-scan would have done, so this test
+    // isolates the COMPILED STORE's own dirtying from that unrelated,
+    // already-covered promotion behavior (`tests_s07.md`'s own card
+    // tests).
+    vm.universe.cards.set_clean(card);
+    assert!(!vm.universe.cards.is_dirty(card), "card must start clean");
+
+    let call: CallStubFn = unsafe { std::mem::transmute(vm.stubs.call_stub_entry()) };
+    let vm_ptr: *mut VmState = &mut vm;
+    let argv = [recv.raw(), young_val.raw()];
+    unsafe { call(entry, vm_ptr, argv.as_ptr(), 2) };
+
+    assert!(
+        vm.universe.cards.is_dirty(card),
+        "a compiled store_instvar_pop of a young value into an old receiver \
+         must dirty the receiver's own card"
     );
 }

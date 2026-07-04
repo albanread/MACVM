@@ -441,6 +441,17 @@ impl VmState {
     /// cannot race on process-wide env vars) and by any later embedder.
     pub fn with_options(options: VmOptions) -> VmState {
         let universe = Universe::genesis(&options);
+        // S11 D3/P7: `old_start`/`card_base_biased` are fixed for the
+        // whole process lifetime, set ONCE here — unlike `eden_top`/
+        // `eden_end` (S11 step 8, refreshed every scavenge), old gen's own
+        // `bounds.start` never moves (`OldGen::grow` only advances
+        // `committed_end`, never `bounds.start` itself, `spaces.rs`'s own
+        // doc), and the card table is sized for old's FULL reserved range
+        // at genesis (never regrown either) — so there is no later point
+        // that ever needs to redo this.
+        let mut reg_block = VmRegBlock::new();
+        reg_block.old_start = universe.layout.old_start as u64;
+        reg_block.card_base_biased = universe.cards.base_biased();
         // Stubs are installed unconditionally (regardless of `options.jit`)
         // so `compile_method` (S10 D4) never has to lazily bootstrap them
         // mid-compile — one small, fixed, one-time cost per VM, matching
@@ -450,7 +461,7 @@ impl VmState {
             .expect("VmState::with_options: failed to reserve JIT code cache");
         let stubs = crate::codecache::stubs::install(&mut code_cache);
         let mut vm = VmState {
-            reg_block: VmRegBlock::new(),
+            reg_block,
             universe,
             options,
             stack: ProcessStack::with_capacity(DEFAULT_STACK_CAPACITY),
@@ -657,5 +668,28 @@ mod tests {
         // D6's other half: reg_block must sit at VmState's own offset 0, or
         // x28 == &VmState would not equal x28 == &VmState.reg_block.
         assert_eq!(std::mem::offset_of!(VmState, reg_block), 0);
+    }
+
+    /// S11 D3/P7: `with_options` must populate `old_start`/
+    /// `card_base_biased` with real values (not `VmRegBlock::new()`'s own
+    /// all-zero default) — a compiled write barrier reading zero here
+    /// would treat EVERY object as old-gen (`obj >= 0` always true) and
+    /// dirty cards at nonsense addresses.
+    #[test]
+    fn reg_block_gc_fields_populated_from_real_universe() {
+        let vm = VmState::with_options(VmOptions::default());
+        assert_eq!(
+            vm.reg_block.old_start, vm.universe.layout.old_start as u64,
+            "old_start must mirror the real, fixed old-gen boundary"
+        );
+        assert_ne!(
+            vm.reg_block.old_start, 0,
+            "a zero old_start would be a genesis-ordering bug"
+        );
+        assert_eq!(
+            vm.reg_block.card_base_biased,
+            vm.universe.cards.base_biased(),
+            "card_base_biased must mirror CardTable's own bias formula exactly"
+        );
     }
 }

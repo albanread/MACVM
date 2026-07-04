@@ -8,6 +8,7 @@ use crate::codecache::nmethod::{NmState, NmethodId};
 use crate::oops::layout::{COUNTERS_INVOCATION_MASK, COUNTERS_INVOCATION_MAX};
 use crate::oops::smi::SmallInt;
 use crate::oops::wrappers::{KlassOop, MethodOop, SymbolOop};
+use crate::oops::Oop;
 use crate::runtime::primitives::PrimResult;
 use crate::runtime::vm_state::VmState;
 use crate::runtime::JitMode;
@@ -32,6 +33,83 @@ pub(crate) fn bump_invocation(m: MethodOop) -> i64 {
     let bumped = (inv + 1).min(COUNTERS_INVOCATION_MAX);
     m.set_counters((c & !COUNTERS_INVOCATION_MASK) | bumped);
     bumped
+}
+
+/// [`try_primitive`]'s own result: `Fallthrough` when there's no primitive
+/// or it Failed (the bytecode body is the fallback, receiver/args left in
+/// place on `vm.stack` exactly as before), `Result` when it computed a real
+/// value (already popped back to `base` — nothing else needs to touch
+/// `vm.stack`), `Activated` when the primitive itself already pushed a real
+/// frame and set `vm.regs` (the `value`/`ensure:`/`ifCurtailed:` family) —
+/// resume dispatch, don't push another frame.
+pub(crate) enum PrimitiveOutcome {
+    Fallthrough,
+    Result(Oop),
+    Activated,
+}
+
+/// The primitive half of SPEC §5.3 step 5 — factored out of
+/// `activate_method` so [`crate::interpreter::run_method`] (a fresh
+/// top-level entry, not a send-site activation: `main.rs`'s doIt, the REPL,
+/// and S11 D6.1's own `rt_interpret_call`) can try a target's primitive
+/// too, instead of unconditionally pushing a frame and running straight
+/// into its bytecode body. `run_method`'s own `activate_entry` had no
+/// primitive step of its own — harmless for its ORIGINAL callers (a
+/// synthetic doIt/REPL wrapper never carries a primitive), but S11 step 7's
+/// own eligibility relaxation ("arbitrary send... in ANY IC state") made
+/// `rt_interpret_call` the first caller to ever reach a genuinely
+/// primitive-bearing target this way (a compiled method's own generic
+/// `CallSend` to a permanently-uncompilable primitive method, C2I) — every
+/// such call silently skipped the primitive and ran its bytecode fallback
+/// body instead (typically just the implicit "return self" a primitive-only
+/// method gets when it has no other statements), always returning `self`
+/// unchanged regardless of what the primitive would have computed. Found by
+/// tracing a `doesNotUnderstand:` recursion that never should have started:
+/// `Message>>selector`'s `self instVarAt: 1` kept returning the `Message`
+/// itself instead of the real selector `Symbol`.
+pub(crate) fn try_primitive(vm: &mut VmState, m: MethodOop, argc: u8) -> PrimitiveOutcome {
+    let prim_id = m.primitive();
+    if prim_id == 0 {
+        return PrimitiveOutcome::Fallthrough;
+    }
+
+    // `m` is held across this allocation-capable step (a `can_allocate`
+    // primitive) purely for the `Fail` arm's own debug_assert below —
+    // S7-10 GC_STRESS audit.
+    let scope = crate::memory::handles::HandleScope::enter(vm);
+    let m_h = scope.handle(vm, m);
+
+    let desc = crate::runtime::primitives::prim_by_id(prim_id as u16)
+        .unwrap_or_else(|| panic!("try_primitive: unknown primitive id {prim_id}"));
+    let argc_usize = argc as usize;
+    let sp = vm.stack.sp;
+    let base = sp - argc_usize - 1;
+    let mut buf = [vm.universe.nil_obj; 6];
+    for (i, slot) in buf.iter_mut().enumerate().take(argc_usize + 1) {
+        *slot = vm.stack.get(base + i);
+    }
+    vm.prim_arg_base = base;
+    match (desc.f)(vm, &buf[..=argc_usize]) {
+        PrimResult::Ok(v) => {
+            vm.stack.sp = base;
+            PrimitiveOutcome::Result(v)
+        }
+        PrimResult::Fail => {
+            debug_assert!(
+                m_h.get(vm).prim_fails(),
+                "try_primitive: primitive {} Failed but the method's prim_fails flag is unset",
+                desc.name
+            );
+            // Falls through: the method's bytecode body is the fallback.
+            PrimitiveOutcome::Fallthrough
+        }
+        PrimResult::Activated => {
+            // The primitive already pushed a real frame and set `vm.regs`
+            // itself (the `value` family, `ensure:`, `ifCurtailed:`) —
+            // resume dispatch, push no result.
+            PrimitiveOutcome::Activated
+        }
+    }
 }
 
 /// SPEC §5.3 step 5. Bumps the invocation counter (every arrival, including
@@ -86,47 +164,20 @@ pub fn activate_method(
         }
     }
 
-    // `m` is held across two allocation-capable steps below: the primitive
-    // call (a `can_allocate` primitive that then Fails falls through to the
-    // frame push, which reads `m`) and `maybe_alloc_context` (after which
-    // `m` is stamped into `vm.regs.method`) — S7-10 GC_STRESS audit.
+    match try_primitive(vm, m, argc) {
+        PrimitiveOutcome::Result(v) => {
+            push(vm, v);
+            return;
+        }
+        PrimitiveOutcome::Activated => return,
+        PrimitiveOutcome::Fallthrough => {}
+    }
+
+    // `m` is held across an allocation-capable step below (`maybe_alloc_
+    // context`, after which `m` is stamped into `vm.regs.method`) — S7-10
+    // GC_STRESS audit.
     let scope = crate::memory::handles::HandleScope::enter(vm);
     let m_h = scope.handle(vm, m);
-
-    let prim_id = m.primitive();
-    if prim_id != 0 {
-        let desc = crate::runtime::primitives::prim_by_id(prim_id as u16)
-            .unwrap_or_else(|| panic!("activate_method: unknown primitive id {prim_id}"));
-        let argc_usize = argc as usize;
-        let sp = vm.stack.sp;
-        let base = sp - argc_usize - 1;
-        let mut buf = [vm.universe.nil_obj; 6];
-        for (i, slot) in buf.iter_mut().enumerate().take(argc_usize + 1) {
-            *slot = vm.stack.get(base + i);
-        }
-        vm.prim_arg_base = base;
-        match (desc.f)(vm, &buf[..=argc_usize]) {
-            PrimResult::Ok(v) => {
-                vm.stack.sp = base;
-                push(vm, v);
-                return;
-            }
-            PrimResult::Fail => {
-                debug_assert!(
-                    m_h.get(vm).prim_fails(),
-                    "activate_method: primitive {} Failed but the method's prim_fails flag is unset",
-                    desc.name
-                );
-                // Falls through: the method's bytecode body is the fallback.
-            }
-            PrimResult::Activated => {
-                // The primitive already pushed a real frame and set
-                // `vm.regs` itself (the `value` family, `ensure:`,
-                // `ifCurtailed:`) — push NO result, just resume dispatch.
-                return;
-            }
-        }
-    }
 
     let saved_fp = vm.stack.fp as i64;
     let saved_bci = vm.regs.bci;
