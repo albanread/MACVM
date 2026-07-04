@@ -436,6 +436,12 @@ pub fn compile_method(
         oopmaps,
         ic_sites,
         poll_bci,
+        // S13 step 3 (recording) not wired yet: a real compiled method
+        // carries NO deopt metadata until emit records sites. Empty is
+        // correct, not a stub -- deopt simply cannot fire on this nmethod
+        // until the recorder is threaded through emit.
+        deopt_scopes: Vec::new(),
+        deopt_pcdescs: Vec::new(),
     };
     // S12 D1 enforcement point 2: "debug + stress" — reuses the existing
     // heap-verifier's own gate (`MACVM_GC_VERIFY=1` opts a release build

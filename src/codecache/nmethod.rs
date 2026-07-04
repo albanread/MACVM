@@ -189,6 +189,16 @@ pub struct Nmethod {
     /// directly instead, purely as Rust-side bookkeeping alongside the
     /// unchanged emitted code.
     pub poll_bci: Option<usize>,
+    /// S13: the packed deopt scope-descriptor blob (`compiler::scopes`
+    /// format — LEB128 scope records + safepoint records). Empty until S13
+    /// step 3 records real sites from emit. The GC never scans this: every
+    /// oop it references lives only as a `ConstPool` index into this
+    /// nmethod's own oop pool, which `oops_do` already keeps current.
+    pub deopt_scopes: Vec<u8>,
+    /// S13: `code_off`-sorted deopt PcDescs indexing into `deopt_scopes`
+    /// (DISTINCT from S12's oopmap `pcdescs` above — different key
+    /// convention and payload). Empty until step 3.
+    pub deopt_pcdescs: Vec<crate::compiler::scopes::PcDesc>,
 }
 
 impl Nmethod {
@@ -285,6 +295,8 @@ impl Nmethod {
             oopmaps,
             ic_sites: Vec::new(),
             poll_bci: None,
+            deopt_scopes: Vec::new(),
+            deopt_pcdescs: Vec::new(),
         }
     }
 }
@@ -650,6 +662,8 @@ mod tests {
             oopmaps: Vec::new(),
             ic_sites: Vec::new(),
             poll_bci: None,
+            deopt_scopes: Vec::new(),
+            deopt_pcdescs: Vec::new(),
         }
     }
 

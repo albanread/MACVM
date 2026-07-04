@@ -193,6 +193,8 @@ mod tests {
             oopmaps: Vec::new(),
             ic_sites: Vec::new(),
             poll_bci: None,
+            deopt_scopes: Vec::new(),
+            deopt_pcdescs: Vec::new(),
         }
     }
 

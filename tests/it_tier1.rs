@@ -1536,6 +1536,8 @@ fn mono_resolve_patches_call_site_and_dispatches() {
         oopmaps: Vec::new(),
         ic_sites,
         poll_bci: None,
+        deopt_scopes: Vec::new(),
+        deopt_pcdescs: Vec::new(),
     };
     let caller_id = vm.code_table.install(caller_nm);
     let caller_entry = h.base as u64; // entry_off == verified_entry_off == 0 (no guard, `None`)
@@ -1690,6 +1692,8 @@ fn build_c2i_scenario(vm: &mut VmState) -> (u64, KlassOop, NmethodId) {
         oopmaps: Vec::new(),
         ic_sites,
         poll_bci: None,
+        deopt_scopes: Vec::new(),
+        deopt_pcdescs: Vec::new(),
     };
     let caller_id = vm.code_table.install(caller_nm);
     let caller_entry = h.base as u64; // entry_off == verified_entry_off == 0 (no guard, `None`)
@@ -1908,6 +1912,8 @@ fn full_ic_lattice_mono_to_pic_to_mega() {
         oopmaps: Vec::new(),
         ic_sites,
         poll_bci: None,
+        deopt_scopes: Vec::new(),
+        deopt_pcdescs: Vec::new(),
     };
     let caller_id = vm.code_table.install(caller_nm);
     let caller_entry = h.base as u64;
@@ -2120,6 +2126,8 @@ fn dnu_from_compiled_code_reaches_does_not_understand() {
         oopmaps: Vec::new(),
         ic_sites,
         poll_bci: None,
+        deopt_scopes: Vec::new(),
+        deopt_pcdescs: Vec::new(),
     };
     let caller_id = vm.code_table.install(caller_nm);
     let caller_entry = h.base as u64;
