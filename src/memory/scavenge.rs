@@ -463,6 +463,17 @@ pub fn scavenge(vm: &mut VmState) -> Result<ScavengeReport, GcStallError> {
         let oop = Oop::from_raw(*word);
         *word = scavenge_oop(vm, oop).raw();
     });
+    // S11: `key_klass`/`key_selector` are Rust-side identity oops, NOT in
+    // the code pool `oops_do` walks — so a scavenge that promotes a young
+    // `key_selector` symbol (or `key_klass`) updates the interning
+    // symbol/class table's own reference but would leave this SEPARATE nmethod
+    // copy dangling at the vacated address. The full GC already does this
+    // (`update_keys` + `rehash`); the scavenge must too. Found via
+    // `MACVM_GC_STRESS=1 + MACVM_JIT=threshold=1` (a combination the gate
+    // never ran together before S11 step 8) -- a real pre-existing
+    // use-after-free, latent since these keys were added (S11 step 2/6).
+    code_table.update_keys(&mut |oop| scavenge_oop(vm, oop));
+    code_table.rehash();
     vm.code_table = code_table;
 
     // S11 D6.1: c2i adapters' own embedded method-oop pool words are the
@@ -483,6 +494,10 @@ pub fn scavenge(vm: &mut VmState) -> Result<ScavengeReport, GcStallError> {
         let oop = Oop::from_raw(*word);
         *word = scavenge_oop(vm, oop).raw();
     });
+    // Same Rust-side-key hazard as `code_table` above -- `PicTable`'s own
+    // `pairs` mirror of each guard `KlassOop` is not in the pool `oops_do`
+    // walks. (No `rehash`: `PicTable` is keyed by stub address, not an oop.)
+    pic_table.update_keys(&mut |oop| scavenge_oop(vm, oop));
     vm.pic_table = pic_table;
 
     // S11 D4.4: mega trampolines' own embedded selector pool words --
@@ -494,6 +509,10 @@ pub fn scavenge(vm: &mut VmState) -> Result<ScavengeReport, GcStallError> {
         let oop = Oop::from_raw(*word);
         *word = scavenge_oop(vm, oop).raw();
     });
+    // `MegaTable::by_selector`'s HashMap key is the selector oop's raw bits;
+    // `rehash` re-reads each entry's (now-relocated) pool word, so the map
+    // stays keyed by the live address -- same as the full GC does.
+    mega_table.rehash();
     vm.mega_table = mega_table;
 
     if let Some(err) = vm.universe.pending_stall.take() {

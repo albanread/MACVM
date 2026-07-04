@@ -259,13 +259,21 @@ impl CodeTable {
         }
     }
 
-    /// Full-GC-only (D8): `key_klass`/`key_selector` are plain Rust struct
-    /// fields, not `MAP_JIT` memory — no guard needed, just `f`'s
-    /// transform applied in place. Call [`Self::rehash`] afterward; `f`
-    /// here is expected to be address-preserving-or-not (`forward_chase`),
-    /// never one that also needs `&mut VmState` (scavenge never calls
-    /// this at all — see this module's own doc for why key_klass/
-    /// key_selector are treated as strong-until-S12 full-GC-only roots).
+    /// `key_klass`/`key_selector` are plain Rust struct fields, not
+    /// `MAP_JIT` memory — no guard needed, just `f`'s transform applied in
+    /// place. Call [`Self::rehash`] afterward. Called by BOTH collectors:
+    /// the full GC passes `forward_chase`, and the SCAVENGE passes a
+    /// `|oop| scavenge_oop(vm, oop)` closure (so `f` may capture `&mut
+    /// VmState` — that's fine, `code_table` is taken out via
+    /// `std::mem::take` for the duration so the borrow doesn't conflict).
+    /// An earlier draft treated these as full-GC-only "strong-until-S12"
+    /// roots and had the scavenge skip them entirely — a real
+    /// use-after-free: a scavenge that relocates a YOUNG `key_selector`
+    /// symbol (or `key_klass`) updated the interning symbol/class table's
+    /// own reference but left this SEPARATE nmethod copy dangling at the
+    /// vacated address, which a later full GC would then chase into poisoned
+    /// memory. Found via `MACVM_GC_STRESS=1 + MACVM_JIT=threshold=1`
+    /// together (see `Justfile`'s `gate-s11`).
     pub fn update_keys(&mut self, f: &mut dyn FnMut(Oop) -> Oop) {
         for nm in self.slots.iter_mut().flatten() {
             let nk = f(nm.key_klass.oop());
@@ -285,6 +293,20 @@ impl CodeTable {
             for site in &mut nm.ic_sites {
                 let ss = f(site.selector.oop());
                 site.selector = unsafe { SymbolOop::from_oop_unchecked(ss) };
+                // A resolved-mono site also mirrors its guard `klass` as a
+                // Rust-side oop (the machine-code guard's own klass pool word
+                // is `oops_do`'s job; this is the Rust-struct half). Same
+                // relocation hazard as `key_selector`: `rt_resolve_send`'s
+                // poly-transition path derefs this `klass`
+                // (`lookup(vm, old_k, ..)`), so a stale one is a
+                // use-after-free once a moving GC relocates that klass.
+                if let IcState::Mono { klass, target } = site.state {
+                    let nk = f(klass.oop());
+                    site.state = IcState::Mono {
+                        klass: unsafe { KlassOop::from_oop_unchecked(nk) },
+                        target,
+                    };
+                }
             }
         }
     }
@@ -555,6 +577,60 @@ mod tests {
             vm.code_table.lookup(vm.universe.array_klass, sel2),
             Some(id),
             "by_key must be rehashed to the post-GC key"
+        );
+    }
+
+    /// The SCAVENGE counterpart: a young `key_selector` symbol that a
+    /// scavenge relocates must have the nmethod's own Rust-side copy updated
+    /// too — not just the interning symbol table's reference. Regression for
+    /// the use-after-free `gate-s11`'s combined gc-stress + JIT run exposed
+    /// (the scavenge updated code-pool oops via `oops_do` but skipped
+    /// `update_keys`, leaving this copy dangling at the vacated address).
+    #[test]
+    fn scavenge_updates_nmethod_key_selector() {
+        let mut vm = test_vm();
+        // The selector is freshly interned -> young -> relocated by the
+        // scavenge. (`array_klass` itself is also young in this tiny genesis
+        // heap and moves too -- so the lookup below re-reads
+        // `vm.universe.array_klass` post-scavenge, never a stale local.)
+        let klass = vm.universe.array_klass;
+        let sel = vm.universe.intern(b"aFreshYoungKeySelectorForScavengeTest");
+        let old_sel_bits = sel.oop().raw();
+
+        let h = vm
+            .code_cache
+            .alloc(16)
+            .expect("code cache alloc for test blob");
+        let blob = CodeBlob {
+            code: vec![0u8; 16],
+            literal_off: 8,
+            relocs: Vec::new(),
+            listing: Vec::new(),
+        };
+        vm.code_cache.publish(h, &blob);
+        let nm = fake_nmethod(klass, sel, h.base as usize, h.len);
+        let id = vm.code_table.install(nm);
+
+        scavenge::scavenge(&mut vm).expect("scavenge must succeed");
+
+        let nm2 = vm.code_table.get(id).unwrap();
+        assert_ne!(
+            nm2.key_selector.oop().raw(),
+            old_sel_bits,
+            "scavenge must relocate the nmethod's Rust-side key_selector (the young symbol moved)"
+        );
+        // ...and it must still name the SAME interned symbol (an idempotent
+        // re-intern returns it at its post-scavenge address).
+        let sel2 = vm.universe.intern(b"aFreshYoungKeySelectorForScavengeTest");
+        assert_eq!(
+            nm2.key_selector.oop().raw(),
+            sel2.oop().raw(),
+            "the updated key_selector must resolve to the same symbol"
+        );
+        assert_eq!(
+            vm.code_table.lookup(vm.universe.array_klass, sel2),
+            Some(id),
+            "by_key must be rehashed after the scavenge relocated key_selector (and key_klass)"
         );
     }
 }

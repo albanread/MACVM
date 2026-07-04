@@ -135,3 +135,16 @@ gate-s10: gate-s09
     MACVM_GC_STRESS=1 just run-world-tests
     MACVM_GC_STRESS=full:64 just run-world-tests
     just bench-s10
+
+# S11: compiled sends + inline alloc + the D8 GC bridge. UNLIKE gate-s10 (which
+# deliberately kept GC-stress and the JIT apart, deferring the combo to "S12's
+# flagship"), this gate COMBINES them: MACVM_GC_STRESS + MACVM_JIT=threshold=1
+# TOGETHER. That is the only way to actually stress-test the collector against
+# compiled code + inline allocation, and it is now sound because (a) the D8
+# bridge suppresses moving GC while a compiled frame is live and (b) the
+# scavenge updates nmethod/PIC/mega Rust-side keys (key_klass/key_selector),
+# not just their code-pool oops. Running these two combined for the first time
+# is exactly what surfaced that pre-existing scavenge-key use-after-free.
+gate-s11: gate-s10
+    MACVM_GC_STRESS=1 MACVM_JIT=threshold=1 just run-world-tests
+    MACVM_GC_STRESS=full:64 MACVM_JIT=threshold=1 just run-world-tests
