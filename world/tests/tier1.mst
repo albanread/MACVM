@@ -23,6 +23,27 @@
  mechanism that exists), not via one huge loop iteration count (the
  mechanism that doesn't)."
 
+"S11 step 9 (D6.3): the mixed-tier NLR probe. `nlrMid:` is a single super
+ send -- unconditionally compile-eligible (D4.6), and under S11's
+ conservative eligibility gate the one production shape that puts a
+ COMPILED frame between an interpreted block and its interpreted home.
+ `nlrOuter`/`nlrOuterEnsured:` contain block literals (push_closure), so
+ they stay interpreted forever and serve as the NLR's home. Under
+ MACVM_JIT=off this is the plain S4 interpreter NLR; under threshold=1 the
+ very same sends cross a real compiled frame + c2i adapter -- the
+ differential (and gate-s11's combined GC stress) must not be able to tell
+ the difference."
+Object subclass: NlrTierBase [
+    nlrInner: aBlock [ ^aBlock value ]
+]
+NlrTierBase subclass: NlrTierProbe [
+    nlrMid: aBlock [ ^super nlrInner: aBlock ]
+    nlrOuter [ | r | r := self nlrMid: [ ^42 ]. ^r + 1000 ]
+    nlrOuterEnsured: aCollector [
+        ^[ self nlrMid: [ ^7 ] ] ensure: [ aCollector add: 1 ]
+    ]
+]
+
 TestCase subclass: Tier1Tests [
     runAll [
         self runTest: #testSumToBoundary do: [ self testSumToBoundary ].
@@ -36,6 +57,8 @@ TestCase subclass: Tier1Tests [
         self runTest: #testToDoAccumulation do: [ self testToDoAccumulation ].
         self runTest: #testTriggerAcrossRepeatedCalls do: [
             self testTriggerAcrossRepeatedCalls ].
+        self runTest: #testNlrThroughCompiledFrame do: [
+            self testNlrThroughCompiledFrame ].
     ]
 
     "D1-eligible: send-free but for `+` (loop increment) and `<=`
@@ -154,5 +177,20 @@ TestCase subclass: Tier1Tests [
             self assert: (self absDiff: 7 with: 2) = 5.
             self assert: (self bitsOf: 16r3C) = ((16r3C bitAnd: 16r0F) bitOr: (16r3C bitXor: 16rFF)).
         ].
+    ]
+
+    "S11 step 9: 30 iterations so that, under threshold=1, the FIRST call
+     already compiles nlrMid: (a super-send site needs no IC warmup) and
+     every later call re-enters through the warm mono-compiled IC -- both
+     enter_compiled doors cross the NLR. The ensure: variant additionally
+     checks the home-side handler runs exactly once per unwind, counted
+     for real in a collection rather than trusted."
+    testNlrThroughCompiledFrame [
+        | p log |
+        p := NlrTierProbe new.
+        1 to: 30 do: [:i | self assert: p nlrOuter = 42 ].
+        log := OrderedCollection new.
+        1 to: 30 do: [:i | self assert: (p nlrOuterEnsured: log) = 7 ].
+        self assert: log size = 30.
     ]
 ]

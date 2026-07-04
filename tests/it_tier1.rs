@@ -2461,3 +2461,135 @@ fn allocation_fast_and_slow() {
         "the forced-overflow slow path must divert old-direct via the D8 bridge"
     );
 }
+
+/// A bare `test_vm()` has no world loaded, so the block/arith primitives
+/// the NLR scenarios need (`value`/`ensure:` on BlockClosure, `+` on
+/// SmallInteger) aren't installed — install a real primitive-backed method
+/// by pinned id, mirroring `primitive_stub` but with the right argc per
+/// selector.
+fn install_prim(vm: &mut VmState, klass: KlassOop, name: &[u8], argc: usize, prim_id: i64) {
+    let sel = vm.universe.intern(name);
+    let mut b = BytecodeBuilder::new();
+    b.ret_self();
+    let m = b.finish(vm, sel, argc, 0);
+    m.set_primitive(prim_id);
+    m.set_flags(argc, 0, false, false, true, false, 0);
+    install_method(vm, klass, sel, m);
+}
+
+/// tests_s11.md integration item 3, `nlr_through_compiled_frame` (S11 D6.3,
+/// as CORRECTED by this step — see the sprint doc's D6.3 SPEC-QUESTION):
+/// interpreted `outer` (the block's home, permanently ineligible via its
+/// `push_closure`) calls compiled `mid:` (a single super send —
+/// unconditionally eligible, D4.6, and under step 7's conservative gate the
+/// ONE production shape that gives a compiled frame an interpreted, c2i-
+/// reached callee), which reaches interpreted `NlrBase>>inner:` via a c2i
+/// adapter; `inner:` runs the block, which NLRs to `outer`. The escape must
+/// cross BOTH the c2i boundary (interpreter-side escape, `vm.nlr_state`
+/// parked) and the compiled frame (the send-site `sub/cbz` check routing
+/// the sentinel through `mid:`'s own epilogue), then resume in
+/// `enter_compiled` and deliver at home. Asserts: the NLR value (42, NOT
+/// 1042 — the post-NLR tail of `outer` must never run), `compiled_depth`
+/// back to 0, `nlr_state` fully consumed, and that `mid:` really was
+/// compiled (so the test can't silently pass all-interpreted).
+#[test]
+fn nlr_through_compiled_frame() {
+    let mut vm = test_vm();
+    vm.options.jit = JitMode::Threshold(1);
+    let closure_klass = vm.universe.closure_klass;
+    install_prim(&mut vm, closure_klass, b"value", 0, 50);
+    load_source(
+        &mut vm,
+        "Object subclass: NlrBase [\n\
+        \x20   inner: aBlock [ ^aBlock value ]\n\
+         ]\n\
+         NlrBase subclass: NlrProbe [\n\
+        \x20   mid: aBlock [ ^super inner: aBlock ]\n\
+        \x20   outer [ | r | r := self mid: [ ^42 ]. ^r + 1000 ]\n\
+         ]\n",
+    );
+    let probe_klass = klass_named(&mut vm, "NlrProbe");
+    let outer = method_named(&mut vm, probe_klass, "outer");
+    let recv = alloc::alloc_slots(&mut vm, probe_klass).oop();
+
+    // Twice: the first call compiles mid: (threshold=1, super-send sites
+    // need no IC warmup) and already takes the full mixed-tier NLR path;
+    // the second re-enters through the now-warm mono-compiled IC.
+    for pass in 0..2 {
+        let result = macvm::interpreter::run_method(&mut vm, outer, recv, &[]);
+        assert_eq!(
+            result,
+            SmallInt::new(42).oop(),
+            "pass {pass}: the NLR must deliver 42 at home (1042 would mean \
+             outer's post-NLR tail ran)"
+        );
+        assert_eq!(
+            vm.compiled_depth, 0,
+            "pass {pass}: every compiled frame the NLR crossed must have been \
+             unwound through enter_compiled's own depth bookkeeping"
+        );
+        assert!(
+            vm.nlr_state.is_none(),
+            "pass {pass}: the in-flight NLR state must be fully consumed"
+        );
+    }
+
+    let mid_sel = vm.universe.intern(b"mid:");
+    assert!(
+        vm.code_table.lookup(probe_klass, mid_sel).is_some(),
+        "mid: must actually have compiled -- otherwise this test silently \
+         degraded to the pure-interpreter NLR path"
+    );
+}
+
+/// The `ensure:`-straddling variant (adversarial-review HOLE D territory):
+/// an `ensure:` armed on the HOME side of the compiled frame must run
+/// exactly once when the NLR unwinds across it — on the resume side, after
+/// the sentinel bounce, via the ordinary marked-frame walk.
+#[test]
+fn nlr_through_compiled_frame_runs_home_side_ensure() {
+    let mut vm = test_vm();
+    vm.options.jit = JitMode::Threshold(1);
+    let closure_klass = vm.universe.closure_klass;
+    install_prim(&mut vm, closure_klass, b"value", 0, 50);
+    install_prim(&mut vm, closure_klass, b"ensure:", 1, 60);
+    let smi_klass = vm.universe.smi_klass;
+    install_prim(&mut vm, smi_klass, b"+", 1, 1);
+    load_source(
+        &mut vm,
+        "Object subclass: NlrEnsBase [\n\
+        \x20   inner: aBlock [ ^aBlock value ]\n\
+         ]\n\
+         NlrEnsBase subclass: NlrEnsProbe [\n\
+        \x20   | tally |\n\
+        \x20   setUp [ tally := 0 ]\n\
+        \x20   tally [ ^tally ]\n\
+        \x20   outerEnsured [\n\
+        \x20       ^[ self mid: [ ^7 ] ] ensure: [ tally := tally + 1 ]\n\
+        \x20   ]\n\
+        \x20   mid: aBlock [ ^super inner: aBlock ]\n\
+         ]\n",
+    );
+    let probe_klass = klass_named(&mut vm, "NlrEnsProbe");
+    let set_up = method_named(&mut vm, probe_klass, "setUp");
+    let outer_ensured = method_named(&mut vm, probe_klass, "outerEnsured");
+    let tally = method_named(&mut vm, probe_klass, "tally");
+    let recv = alloc::alloc_slots(&mut vm, probe_klass).oop();
+
+    macvm::interpreter::run_method(&mut vm, set_up, recv, &[]);
+    let result = macvm::interpreter::run_method(&mut vm, outer_ensured, recv, &[]);
+    assert_eq!(
+        result,
+        SmallInt::new(7).oop(),
+        "the NLR value must arrive at home through the ensure: interception"
+    );
+    let t = macvm::interpreter::run_method(&mut vm, tally, recv, &[]);
+    assert_eq!(
+        t,
+        SmallInt::new(1).oop(),
+        "the home-side ensure: handler must run exactly once during the \
+         cross-tier unwind"
+    );
+    assert_eq!(vm.compiled_depth, 0);
+    assert!(vm.nlr_state.is_none());
+}

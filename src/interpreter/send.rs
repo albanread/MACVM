@@ -112,6 +112,25 @@ pub(crate) fn try_primitive(vm: &mut VmState, m: MethodOop, argc: u8) -> Primiti
     }
 }
 
+/// S11 D6.3: what a send actually did, from its dispatch-loop caller's
+/// point of view. `Normal` is the entire pre-step-9 contract — a result was
+/// pushed (primitive short-circuit / completed compiled call) or a frame
+/// was activated, and the dispatch loop discriminates the two exactly as it
+/// always has (its own `fp_before` comparison). `Nlr` is new: the send's
+/// COMPILED target was unwound by a non-local return and
+/// `enter_compiled`'s own resumption of that unwind produced the carried
+/// [`UnwindStep`] — neither a result nor an activation; the caller maps it
+/// onto the dispatch loop's continuation exactly like `OP_NLR_TOS` maps its
+/// own `continue_unwind` outcome (`Escaped` → return the `NLR_SENTINEL`
+/// from `dispatch` so the escape keeps propagating outward;
+/// `ReturnedFromHome(Some(v))` → this dispatch's entry frame returned;
+/// everything else → `vm.regs` is already stamped, reload and continue).
+#[derive(Clone, Copy, Debug)]
+pub enum SendOutcome {
+    Normal,
+    Nlr(crate::interpreter::unwind::UnwindStep),
+}
+
 /// SPEC §5.3 step 5. Bumps the invocation counter (every arrival, including
 /// primitive short-circuits), tries the primitive if one is attached, and
 /// otherwise pushes a real frame for the bytecode body. `vm.regs` is
@@ -133,7 +152,7 @@ pub fn activate_method(
     m: MethodOop,
     argc: u8,
     ic_site: Option<(MethodOop, u16)>,
-) {
+) -> SendOutcome {
     let bumped = bump_invocation(m);
 
     if let JitMode::Threshold(n) = vm.options.jit {
@@ -153,7 +172,8 @@ pub fn activate_method(
                     InterpreterIc::at(caller, ic_idx).set_mono_compiled(vm, k, id, epoch);
                 }
                 match enter_compiled(vm, id, argc) {
-                    EnterResult::Completed => return,
+                    EnterResult::Completed => return SendOutcome::Normal,
+                    EnterResult::Nlr(step) => return SendOutcome::Nlr(step),
                     EnterResult::Bailout => {
                         // D1: sound to just fall through to the normal
                         // interpreted body below, for this one call — no
@@ -167,9 +187,9 @@ pub fn activate_method(
     match try_primitive(vm, m, argc) {
         PrimitiveOutcome::Result(v) => {
             push(vm, v);
-            return;
+            return SendOutcome::Normal;
         }
-        PrimitiveOutcome::Activated => return,
+        PrimitiveOutcome::Activated => return SendOutcome::Normal,
         PrimitiveOutcome::Fallthrough => {}
     }
 
@@ -190,6 +210,7 @@ pub fn activate_method(
     super::blocks::maybe_alloc_context(vm, m, vm.stack.fp, nil);
     vm.regs.method = Some(m_h.get(vm)); // fresh again: the context alloc may have moved it
     vm.regs.bci = 0;
+    SendOutcome::Normal
 }
 
 /// Steps 1–4 of SPEC §5.3's `send` algorithm plus the transition-table
@@ -197,7 +218,7 @@ pub fn activate_method(
 /// (the dispatch loop reads both from the same place, so this is always
 /// true — the assert documents the invariant rather than guarding against a
 /// real divergence).
-pub fn send_generic(vm: &mut VmState, argc: u8, ic_idx: u16, is_super: bool) {
+pub fn send_generic(vm: &mut VmState, argc: u8, ic_idx: u16, is_super: bool) -> SendOutcome {
     let caller = vm.regs.method.expect("send_generic: no active method");
     let ic = InterpreterIc::at(caller, ic_idx);
     debug_assert_eq!(argc, ic.argc(), "send_generic: argc/IC mismatch");
@@ -223,7 +244,8 @@ pub fn send_generic(vm: &mut VmState, argc: u8, ic_idx: u16, is_super: bool) {
             });
             if valid {
                 match enter_compiled(vm, nm_id, argc) {
-                    EnterResult::Completed => return,
+                    EnterResult::Completed => return SendOutcome::Normal,
+                    EnterResult::Nlr(step) => return SendOutcome::Nlr(step),
                     EnterResult::Bailout => {
                         // D1: this one call falls back to the interpreter;
                         // the compiled entry is still valid for the next
@@ -234,8 +256,7 @@ pub fn send_generic(vm: &mut VmState, argc: u8, ic_idx: u16, is_super: bool) {
                             "send_generic: bailout method must still resolve \
                              (it did when its compiled entry was installed)",
                         );
-                        activate_method(vm, m, argc, None);
-                        return;
+                        return activate_method(vm, m, argc, None);
                     }
                 }
             }
@@ -244,8 +265,7 @@ pub fn send_generic(vm: &mut VmState, argc: u8, ic_idx: u16, is_super: bool) {
         } else {
             let m = MethodOop::try_from(ic.target())
                 .expect("send_generic: mono target is not a CompiledMethod");
-            activate_method(vm, m, argc, Some((caller, ic_idx)));
-            return;
+            return activate_method(vm, m, argc, Some((caller, ic_idx)));
         }
     }
 
@@ -266,8 +286,8 @@ pub fn send_generic(vm: &mut VmState, argc: u8, ic_idx: u16, is_super: bool) {
     }
 }
 
-pub fn send_super_generic(vm: &mut VmState, argc: u8, ic_idx: u16) {
-    send_generic(vm, argc, ic_idx, true);
+pub fn send_super_generic(vm: &mut VmState, argc: u8, ic_idx: u16) -> SendOutcome {
+    send_generic(vm, argc, ic_idx, true)
 }
 
 /// SPEC §5.3 step 6: `#doesNotUnderstand:` resolution. Builds the `Message`
@@ -276,7 +296,7 @@ pub fn send_super_generic(vm: &mut VmState, argc: u8, ic_idx: u16) {
 /// `Message` argument, and re-sends through a full lookup (never through
 /// the original site's IC — that IC's state describes the *original*
 /// selector, not `#doesNotUnderstand:`).
-fn dnu(vm: &mut VmState, rcvr_klass: KlassOop, selector: SymbolOop, argc: u8) {
+fn dnu(vm: &mut VmState, rcvr_klass: KlassOop, selector: SymbolOop, argc: u8) -> SendOutcome {
     let argc_usize = argc as usize;
     let sp = vm.stack.sp;
     let args_start = sp - argc_usize;

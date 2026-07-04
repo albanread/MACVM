@@ -688,11 +688,38 @@ impl<'a> Emitter<'a> {
             selector: info.selector,
             argc: info.argc,
         });
+        self.emit_nlr_check();
         let d = self.dest_target(dst);
         if d.num != 0 {
             self.asm.emit("mov", &[Operand::Reg(d), x(0)]);
         }
         self.commit(dst, d);
+    }
+
+    /// S11 D6.3: the per-call-site NLR-escape check (P10's "2 words per
+    /// site", v1: after EVERY send/runtime call unconditionally). A callee
+    /// that was unwound by a non-local return hands back the `NLR_SENTINEL`
+    /// (a RESERVED_TAG word no real oop can equal) instead of a result;
+    /// this method must then IMMEDIATELY return the sentinel to ITS caller
+    /// — via its own ordinary epilogue, x0 untouched — so the escape
+    /// propagates one native frame at a time all the way back to
+    /// `enter_compiled`, which resumes the interpreter-side unwind. The
+    /// sprint doc's original mechanism (a `stub_nlr_unwind` "restoring
+    /// sp/fp from the tier link") was unimplementable as written — the
+    /// tier link holds PROCESS-stack indices, not native registers, and a
+    /// `bl`'d stub would `ret` right back into this site (see the D6.3
+    /// SPEC-QUESTION); branching to the epilogue needs no native-frame
+    /// surgery at all. `sub`+`cbz` rather than `cmp #imm; b.eq` — both
+    /// encodings are already proven in this backend (`emit_alloc`'s own
+    /// `sub`, `emit_poll`'s own `cbz`), and x17 is free scratch right
+    /// after any call.
+    fn emit_nlr_check(&mut self) {
+        self.asm.emit(
+            "sub",
+            &[x(17), x(0), imm(crate::oops::layout::NLR_SENTINEL as i64)],
+        );
+        let epi = self.epilogue;
+        self.asm.cbz(xr(17), epi);
     }
 
     /// S11 step 7 (D1/D5): calls a FIXED runtime stub address (no IC state
@@ -721,6 +748,10 @@ impl<'a> Emitter<'a> {
             self.asm.emit("mov", &[x(0), Operand::Reg(ra)]);
         }
         self.asm.call_far(self.must_be_boolean_lit);
+        // S11 D6.3: a #mustBeBoolean handler is guest code too — if it (or
+        // anything it re-enters) NLRs past this frame, the sentinel comes
+        // back here exactly like at a send site.
+        self.emit_nlr_check();
         let dst = dst.expect("MUST_BE_BOOLEAN always produces a result (a coerced boolean)");
         let d = self.dest_target(dst);
         if d.num != 0 {

@@ -33,6 +33,17 @@ pub enum EnterResult {
     /// of the same method, from bci 0 (D1: sound because no observable
     /// effect can precede a bailout).
     Bailout,
+    /// S11 D6.3: the compiled call was unwound by a non-local return — the
+    /// callee (transitively, through a c2i re-entry) escaped rather than
+    /// returning, the compiled frame is already gone (it returned the
+    /// `NLR_SENTINEL` through its own ordinary epilogue), and
+    /// `enter_compiled` has ALREADY RESUMED the unwind on this (home-ward)
+    /// side. The payload is that resumption's outcome; the caller maps it
+    /// onto the dispatch loop's own continuation exactly like `OP_NLR_TOS`
+    /// does (`Escaped` → keep propagating the sentinel outward;
+    /// `ReturnedFromHome(Some(v))` → this dispatch's entry frame returned;
+    /// everything else → `vm.regs` is the stamped source of truth).
+    Nlr(crate::interpreter::unwind::UnwindStep),
 }
 
 /// D4: invokes `nm_id`'s nmethod directly through the real call stub.
@@ -48,6 +59,13 @@ pub enum EnterResult {
 /// only call this with an id they just got back from `CodeTable::install`
 /// or already validated via `CodeTable::get`.
 pub fn enter_compiled(vm: &mut VmState, nm_id: NmethodId, argc: u8) -> EnterResult {
+    // S11 D6.3 (P9-style): no NLR may be in flight when a FRESH compiled
+    // call starts — a leaked `nlr_state` from an aborted unwind must be
+    // caught here, not silently consumed by this call's own sentinel arm.
+    debug_assert!(
+        vm.nlr_state.is_none(),
+        "enter_compiled: entering compiled code with a parked NLR still in flight"
+    );
     let entry = {
         let nm = vm
             .code_table
@@ -103,6 +121,32 @@ pub fn enter_compiled(vm: &mut VmState, nm_id: NmethodId, argc: u8) -> EnterResu
 
     if result_bits == BAILOUT_SENTINEL {
         return EnterResult::Bailout;
+    }
+
+    // S11 D6.3: an NLR escaped through the compiled frame we just called —
+    // the sentinel propagated back through the frame's own ordinary
+    // epilogue (each compiled send site's `sub x17, x0, #NLR_SENTINEL;
+    // cbz x17, <epilogue>` check, `emit::emit_nlr_check`), so by the time it reaches
+    // here the native frame is already unwound and this function's own
+    // depth-decrement/eden-adopt above has already run — no separate native
+    // fixup exists or is needed (the sprint doc's original `stub_nlr_unwind`
+    // mechanism was unimplementable as written; see the D6.3 SPEC-QUESTION).
+    // Resume the suspended unwind HERE, on the home-ward side, where the
+    // parked home is one activation closer: the resumption either delivers
+    // (home is in this activation), runs a handler, or escapes AGAIN
+    // (re-parking `nlr_state`) if yet another compiled frame separates us
+    // from home — the caller propagates that exactly like `OP_NLR_TOS`.
+    // Checked BEFORE the sp-assert and `Oop::from_raw` below: the sentinel
+    // is a RESERVED_TAG word `from_raw` rejects by design, and the escape
+    // already popped this side's operand stack.
+    if result_bits == crate::oops::layout::NLR_SENTINEL {
+        let st = vm
+            .nlr_state
+            .take()
+            .expect("enter_compiled: NLR sentinel returned but no NlrState is parked");
+        return EnterResult::Nlr(crate::interpreter::unwind::continue_unwind(
+            vm, st.home, st.value,
+        ));
     }
 
     debug_assert_eq!(

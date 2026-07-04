@@ -399,6 +399,32 @@ compiled frames + adapters:
   the interpreter's own unwinder on each side; compiled frames contribute
   none.
 
+> **SPEC-QUESTION (step 9, as built):** the `stub_nlr_unwind` mechanism
+> above is UNIMPLEMENTABLE as written and was replaced. Two category
+> errors, found by adversarial review before implementation: (a)
+> `TierLink::IntoCompiled`'s `interp_frame`/`entry_sp` (and the proposed
+> `entry_fp`) are PROCESS-stack indices (`vm.stack.fp`/`sp`), not native
+> aarch64 `sp`/`x29` — there is no native call_stub-frame anchor anywhere
+> in the tier link or reg block for a stub to "restore", and the only
+> native fp ever recorded (`reg_block.last_compiled_fp`) is the most
+> recent RUNTIME STUB's own x29, overwritten on every stub entry; (b) a
+> `bl stub_nlr_unwind` would `ret` straight back into the send site's own
+> check (P4's off-by-one hazard) — an infinite bounce. The as-built
+> replacement needs NO native-frame surgery at all: each compiled send
+> site's check (`emit::emit_nlr_check`, `sub x17, x0, #6; cbz x17,
+> <epilogue>` — 2 words, P10 unchanged) TAIL-BRANCHES to the method's own
+> epilogue with x0 still holding the sentinel, so the frame unwinds
+> through its ordinary epilogue → its caller's identical check → ... →
+> `call_stub` → `enter_compiled`, one native frame per bounce, C→C chains
+> included, with `enter_compiled`'s own existing per-boundary
+> `compiled_depth`/eden bookkeeping running unchanged on every bounce (the
+> step-8 HOLE-2 fixup comes for free; nothing to strand). `enter_compiled`
+> then takes `vm.nlr_state` and RESUMES `continue_unwind` on the home-ward
+> side; a still-farther home simply re-escapes (one bounce per compiled
+> frame). `stub_nlr_unwind` and the `entry_fp` extension were never built;
+> `RuntimeStubs.nlr_unwind` (D5's table) is likewise vestigial. SPEC §8's
+> NLR text should be amended to the epilogue-propagation design.
+
 ### D7. Allocation fast path in compiled code
 
 Emitted when a send site is monomorphic to a metaclass whose cached target

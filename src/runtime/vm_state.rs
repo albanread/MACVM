@@ -116,6 +116,20 @@ pub enum TierLink {
     },
 }
 
+/// S11 D6.3: a non-local return in flight across compiled frames — the
+/// `home` it targets and the `value` to deliver there, parked in
+/// `VmState::nlr_state` while the `NLR_SENTINEL` propagates back through the
+/// compiled frame(s) between the escaping block and its home. `home` is a
+/// plain `HomeRef` (proc/serial/fp — an interpreter-frame coordinate, S4);
+/// `value` is a bare `Oop` held across NO allocation (the escape parks it
+/// and the resume delivers it, with only frame pops in between), so it needs
+/// no handle.
+#[derive(Clone, Copy, Debug)]
+pub struct NlrState {
+    pub home: crate::oops::home_ref::HomeRef,
+    pub value: crate::oops::Oop,
+}
+
 /// Which `MACVM_TRACE` channels are enabled. The channel set is open-ended
 /// (CONVENTIONS §3); S1 only stores membership, nothing reads it yet.
 #[derive(Clone, Default, Debug, PartialEq, Eq)]
@@ -412,6 +426,18 @@ pub struct VmState {
     /// case in S10 — S11's `IntoInterpreter` links are what would make
     /// this something other than a redundant count).
     pub compiled_depth: u32,
+    /// S11 D6.3: the parked target+value of a non-local return currently
+    /// ESCAPING through one or more compiled frames. `continue_unwind` sets
+    /// it (`Some`) when a block's home is on the far side of a c2i boundary
+    /// and returns the `NLR_SENTINEL` instead of unwinding across the
+    /// native gap; `enter_compiled`'s own sentinel arm, once the sentinel
+    /// has propagated back up through the compiled frame's normal epilogue,
+    /// reads it to RESUME the unwind on the home side. `None` at every
+    /// `enter_compiled` ENTRY (asserted — a leaked state from an aborted
+    /// unwind must be caught, P9-style, not silently consumed by the next
+    /// unrelated compiled call); cleared only when the unwind finally
+    /// returns from home.
+    pub nlr_state: Option<NlrState>,
     /// Test-only one-shot hook (tests_s10.md's `mixed_trace_golden`, gate
     /// item 4): compiled code is send-free (D1), so nothing inside it can
     /// call a `printStackTrace` primitive directly — a test sets this
@@ -510,6 +536,7 @@ impl VmState {
             stubs,
             tier_links: Vec::new(),
             compiled_depth: 0,
+            nlr_state: None,
             trace_on_poll: false,
         };
         crate::runtime::globals::bootstrap_well_known(&mut vm);

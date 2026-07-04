@@ -150,12 +150,25 @@ pub fn run_method(vm: &mut VmState, method: MethodOop, receiver: Oop, args: &[Oo
     vm.stack.fp = ENTRY_FRAME_SENTINEL as usize;
     vm.regs.bci = 0;
     let outcome = send::try_primitive(vm, method, argc);
-    vm.stack.fp = saved_fp;
-    vm.regs.bci = saved_bci;
     match outcome {
-        send::PrimitiveOutcome::Result(v) => return v,
+        send::PrimitiveOutcome::Result(v) => {
+            vm.stack.fp = saved_fp;
+            vm.regs.bci = saved_bci;
+            return v;
+        }
+        // The primitive ACTIVATED a real frame (`value`/`ensure:` family):
+        // `activate_block` already set `vm.stack.fp` to that frame — whose
+        // own saved_fp captured the sentinel we spoofed above, making it a
+        // genuine entry frame — so fp must NOT be "restored" here (that
+        // would clobber the live frame linkage `dispatch`'s first
+        // `current_method` read depends on). Found while walking S11 step
+        // 9's NLR scenario; latent until then because no c2i target could
+        // BE a value-family primitive under the step-7 eligibility gate.
         send::PrimitiveOutcome::Activated => return dispatch(vm),
-        send::PrimitiveOutcome::Fallthrough => {}
+        send::PrimitiveOutcome::Fallthrough => {
+            vm.stack.fp = saved_fp;
+            vm.regs.bci = saved_bci;
+        }
     }
     activate_entry(vm, method, args.len());
     dispatch(vm)
@@ -213,7 +226,12 @@ pub fn run_method_reentrant(
 /// site"). No handler installed → the S3 DNU fallback prints and
 /// terminates (never returns). A handler that keeps returning non-booleans
 /// livelocks by construction — same as real Smalltalk, not a VM bug.
-fn must_be_boolean_send(vm: &mut VmState, method: MethodOop, branch_bci: usize, t: Oop) {
+fn must_be_boolean_send(
+    vm: &mut VmState,
+    method: MethodOop,
+    branch_bci: usize,
+    t: Oop,
+) -> send::SendOutcome {
     push(vm, t);
     vm.regs.method = Some(method);
     vm.regs.bci = branch_bci;
@@ -367,8 +385,21 @@ fn dispatch(vm: &mut VmState) -> Oop {
                     bci = next;
                 } else {
                     let fp_before = vm.stack.fp;
-                    must_be_boolean_send(vm, method, bci, t);
-                    if vm.stack.fp != fp_before {
+                    let outcome = must_be_boolean_send(vm, method, bci, t);
+                    if let send::SendOutcome::Nlr(step) = outcome {
+                        // S11 D6.3: a compiled #mustBeBoolean handler was
+                        // unwound by an NLR — same mapping as OP_SEND's.
+                        match step {
+                            unwind::UnwindStep::ReturnedFromHome(Some(result)) => return result,
+                            unwind::UnwindStep::Escaped => {
+                                return Oop::from_raw_unchecked(crate::oops::layout::NLR_SENTINEL)
+                            }
+                            _ => {
+                                method = regs_method(vm);
+                                bci = vm.regs.bci;
+                            }
+                        }
+                    } else if vm.stack.fp != fp_before {
                         method = current_method(vm);
                         bci = 0;
                     } else {
@@ -390,8 +421,20 @@ fn dispatch(vm: &mut VmState) -> Oop {
                     bci = next;
                 } else {
                     let fp_before = vm.stack.fp;
-                    must_be_boolean_send(vm, method, bci, t);
-                    if vm.stack.fp != fp_before {
+                    let outcome = must_be_boolean_send(vm, method, bci, t);
+                    if let send::SendOutcome::Nlr(step) = outcome {
+                        // S11 D6.3: same mapping as the true-branch arm.
+                        match step {
+                            unwind::UnwindStep::ReturnedFromHome(Some(result)) => return result,
+                            unwind::UnwindStep::Escaped => {
+                                return Oop::from_raw_unchecked(crate::oops::layout::NLR_SENTINEL)
+                            }
+                            _ => {
+                                method = regs_method(vm);
+                                bci = vm.regs.bci;
+                            }
+                        }
+                    } else if vm.stack.fp != fp_before {
                         method = current_method(vm);
                         bci = 0;
                     } else {
@@ -433,7 +476,7 @@ fn dispatch(vm: &mut VmState) -> Oop {
                 let fp_before = vm.stack.fp;
                 vm.regs.method = Some(method);
                 vm.regs.bci = next;
-                send::send_generic(vm, argc, ic_idx, is_super);
+                let outcome = send::send_generic(vm, argc, ic_idx, is_super);
 
                 if vm.exit_requested {
                     // `quit` (SPEC §10 system group): stop dispatch right
@@ -444,19 +487,38 @@ fn dispatch(vm: &mut VmState) -> Oop {
                         vm.universe.nil_obj
                     };
                 }
-                if vm.stack.fp != fp_before {
-                    // A real frame was pushed for the callee's bytecode
-                    // body (no primitive short-circuit) — resume there.
-                    method = current_method(vm);
-                    bci = 0;
-                } else {
-                    // Primitive fast path: no new frame, resume right after
-                    // the send in the SAME method — but through a re-read:
-                    // a `can_allocate` primitive may have scavenged, moving
-                    // the method this local still points at (the frame's
-                    // method slot is a scanned root; this local is not).
-                    method = current_method(vm);
-                    bci = next;
+                match outcome {
+                    // S11 D6.3: the send's compiled target was unwound by
+                    // an NLR — mapped exactly like OP_NLR_TOS maps its own
+                    // continue_unwind outcome below.
+                    send::SendOutcome::Nlr(step) => match step {
+                        unwind::UnwindStep::ReturnedFromHome(Some(result)) => return result,
+                        unwind::UnwindStep::Escaped => {
+                            return Oop::from_raw_unchecked(crate::oops::layout::NLR_SENTINEL)
+                        }
+                        unwind::UnwindStep::ReturnedFromHome(None)
+                        | unwind::UnwindStep::RanHandler
+                        | unwind::UnwindStep::CannotReturn => {
+                            method = regs_method(vm);
+                            bci = vm.regs.bci;
+                        }
+                    },
+                    send::SendOutcome::Normal => {
+                        if vm.stack.fp != fp_before {
+                            // A real frame was pushed for the callee's bytecode
+                            // body (no primitive short-circuit) — resume there.
+                            method = current_method(vm);
+                            bci = 0;
+                        } else {
+                            // Primitive fast path: no new frame, resume right after
+                            // the send in the SAME method — but through a re-read:
+                            // a `can_allocate` primitive may have scavenged, moving
+                            // the method this local still points at (the frame's
+                            // method slot is a scanned root; this local is not).
+                            method = current_method(vm);
+                            bci = next;
+                        }
+                    }
                 }
             }
             OP_PUSH_CTX_TEMP => {
@@ -520,6 +582,14 @@ fn dispatch(vm: &mut VmState) -> Oop {
                 let home = crate::oops::home_ref::unpack_home_ref(closure.home());
                 match unwind::continue_unwind(vm, home, value) {
                     unwind::UnwindStep::ReturnedFromHome(Some(result)) => return result,
+                    // S11 D6.3: `home` is beyond a compiled frame — this
+                    // interpreter activation was discarded and `vm.nlr_state`
+                    // parked; hand the NLR sentinel back so `run_method`→
+                    // `rt_interpret_call`→the compiled caller→`enter_compiled`
+                    // can resume the unwind on the home side.
+                    unwind::UnwindStep::Escaped => {
+                        return Oop::from_raw_unchecked(crate::oops::layout::NLR_SENTINEL)
+                    }
                     unwind::UnwindStep::ReturnedFromHome(None)
                     | unwind::UnwindStep::RanHandler
                     | unwind::UnwindStep::CannotReturn => {

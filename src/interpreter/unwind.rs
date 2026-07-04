@@ -146,6 +146,7 @@ fn resume_ensure_ret(vm: &mut VmState) -> Option<Oop> {
     do_return(vm, result)
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum UnwindStep {
     /// A handler is now the active frame (`vm.regs` already points at it);
     /// the dispatch loop should reload method/bci (fresh activation, bci 0)
@@ -159,6 +160,12 @@ pub enum UnwindStep {
     /// exited via the DNU fallback); the dispatch loop should reload
     /// method/bci (fresh activation, bci 0) and continue.
     CannotReturn,
+    /// S11 D6.3: `home` is on the far side of a compiled frame. This whole
+    /// interpreter activation (the one a c2i `rt_interpret_call` entered) has
+    /// been discarded, `vm.nlr_state` parked; the dispatch loop must return
+    /// the `NLR_SENTINEL` so `rt_interpret_call`→the compiled caller→
+    /// `enter_compiled` can resume the unwind on the home side.
+    Escaped,
 }
 
 /// SPEC §5.4 Algorithm 9: walk from the current frame toward `home`,
@@ -167,16 +174,41 @@ pub enum UnwindStep {
 /// re-entered via `RESUME_UNWIND`).
 pub fn continue_unwind(vm: &mut VmState, home: HomeRef, value: Oop) -> UnwindStep {
     if !home_is_live(vm, home) {
-        cannot_return_current_closure(vm, value);
-        return UnwindStep::CannotReturn;
+        // `Some(step)`: the `cannotReturn:` handler was compiled and itself
+        // unwound by a further NLR (see `cannot_return`'s own doc) — the
+        // nested unwind's outcome supersedes the plain `CannotReturn`.
+        return match cannot_return_current_closure(vm, value) {
+            None => UnwindStep::CannotReturn,
+            Some(step) => step,
+        };
     }
     match innermost_marked_frame(vm, vm.stack.fp, home.fp) {
-        None => {
+        ScanResult::ReachedHome => {
             pop_frames_above(vm, home.fp);
             let r = do_return(vm, value);
             UnwindStep::ReturnedFromHome(r)
         }
-        Some((mfp, handler)) => {
+        ScanResult::CrossedBoundary(entry_fp) => {
+            // S11 D6.3: `home` is beyond a c2i boundary. Every armed handler
+            // between here and `entry_fp` has already run (the scan reports
+            // `Marked` before `CrossedBoundary`), so the whole interpreter
+            // activation this c2i entered is now just dead frames. Discard it
+            // exactly the way `pop_and_deliver`'s ENTRY_FRAME_SENTINEL path
+            // does — `sp` back to the c2i receiver slot, deactivated — but
+            // deliver NO value here (it's parked for the home-side resume).
+            let entry = Frame { fp: entry_fp };
+            let argc = entry.method(&vm.stack).argc();
+            let base = entry_fp - argc - 1;
+            vm.stack.sp = base;
+            vm.stack.deactivate();
+            debug_assert!(
+                vm.nlr_state.is_none(),
+                "continue_unwind: an NLR is escaping while one is already parked"
+            );
+            vm.nlr_state = Some(crate::runtime::vm_state::NlrState { home, value });
+            UnwindStep::Escaped
+        }
+        ScanResult::Marked(mfp, handler) => {
             pop_frames_above(vm, mfp);
             // `handler` (pulled off the marked frame) and `value` are bare
             // locals held across the token allocation — both need handles
@@ -227,6 +259,10 @@ fn resume_unwind(vm: &mut VmState) -> Option<Oop> {
     match continue_unwind(vm, home, value) {
         UnwindStep::ReturnedFromHome(r) => r,
         UnwindStep::RanHandler | UnwindStep::CannotReturn => None,
+        // S11 D6.3: the resumed unwind crossed a c2i boundary — propagate
+        // the sentinel up as the "return value" so `dispatch`→`run_method`→
+        // `rt_interpret_call` hand it to the compiled caller.
+        UnwindStep::Escaped => Some(Oop::from_raw_unchecked(crate::oops::layout::NLR_SENTINEL)),
     }
 }
 
@@ -256,27 +292,40 @@ pub fn home_is_live(vm: &VmState, home: HomeRef) -> bool {
     }
 }
 
-/// Scans the fp chain from `from_fp` toward (exclusive of) `home_fp` for
-/// the innermost (closest to `from_fp`) frame with an armed handler
-/// marker — `from_fp` itself is included in the scan.
-fn innermost_marked_frame(
-    vm: &VmState,
-    from_fp: usize,
-    home_fp: usize,
-) -> Option<(usize, ClosureOop)> {
+/// The outcome of scanning the fp chain from `from_fp` toward `home_fp`
+/// (S11 D6.3 generalizes the old `Option<(fp, handler)>`).
+enum ScanResult {
+    /// The innermost armed handler between `from_fp` and `home_fp`.
+    Marked(usize, ClosureOop),
+    /// `home_fp` was reached with no armed handler in between — the ordinary
+    /// same-activation NLR: pop to home and deliver.
+    ReachedHome,
+    /// An `ENTRY_FRAME_SENTINEL` (a c2i activation base) was reached before
+    /// `home_fp`, with no armed handler in between — `home` is on the FAR
+    /// side of a compiled frame (S11 D6.3). The `usize` is that entry
+    /// frame's own fp. The NLR must ESCAPE this activation and propagate the
+    /// sentinel up through the compiled frame(s).
+    CrossedBoundary(usize),
+}
+
+/// Scans the fp chain from `from_fp` toward `home_fp` for the innermost
+/// (closest to `from_fp`) frame with an armed handler marker — `from_fp`
+/// itself is included. The marker check precedes the boundary check, so an
+/// `ensure:`/`ifCurtailed:` handler ON the c2i entry frame is reported as
+/// `Marked` (run first), not swallowed by `CrossedBoundary`.
+fn innermost_marked_frame(vm: &VmState, from_fp: usize, home_fp: usize) -> ScanResult {
     let mut fp = from_fp;
     loop {
         if fp == home_fp {
-            return None;
+            return ScanResult::ReachedHome;
         }
         if let MarkerClass::Handler(h) = marker_class(vm, Frame { fp }) {
-            return Some((fp, h));
+            return ScanResult::Marked(fp, h);
         }
         let saved_fp = Frame { fp }.saved_fp(&vm.stack);
-        debug_assert_ne!(
-            saved_fp, ENTRY_FRAME_SENTINEL,
-            "innermost_marked_frame: walked past the entry frame without reaching home_fp {home_fp}"
-        );
+        if saved_fp == ENTRY_FRAME_SENTINEL {
+            return ScanResult::CrossedBoundary(fp);
+        }
         fp = saved_fp as usize;
     }
 }
@@ -322,15 +371,24 @@ fn alloc_unwind_token(vm: &mut VmState, home: HomeRef, value: Oop) -> ArrayOop {
 /// (never returns). A handler that itself returns normally is a VM error
 /// (`BCI_RESUME_CANNOT_RETURN`, `pop_and_deliver`) — the failed NLR cannot
 /// be resumed.
-fn cannot_return_current_closure(vm: &mut VmState, value: Oop) {
+fn cannot_return_current_closure(vm: &mut VmState, value: Oop) -> Option<UnwindStep> {
     let frame = current_frame(vm);
     let closure_oop = vm.stack.get(frame.receiver_slot(&vm.stack));
     let closure = ClosureOop::try_from(closure_oop)
         .expect("cannot_return_current_closure: current frame's receiver slot is not a Closure");
-    cannot_return(vm, closure, value);
+    cannot_return(vm, closure, value)
 }
 
-pub fn cannot_return(vm: &mut VmState, closure: ClosureOop, value: Oop) {
+/// Returns `None` in the ordinary case (the `cannotReturn:` handler is now
+/// the active frame, `vm.regs` stamped — the caller reports `CannotReturn`).
+/// `Some(step)` is S11 D6.3's exotic corner: the handler itself got
+/// COMPILED (the S10 trigger fires for full-lookup activations too) and was
+/// then unwound by a further NLR from within it — the nested unwind already
+/// redirected control, and `step` describes where; the caller propagates it
+/// INSTEAD of `CannotReturn` (both belong to the same "reload `vm.regs` and
+/// continue" family for every non-return variant, so the mapping is exact,
+/// not a compromise).
+pub fn cannot_return(vm: &mut VmState, closure: ClosureOop, value: Oop) -> Option<UnwindStep> {
     vm.stack.push(closure.oop());
     vm.stack.push(value);
     let klass = super::send::klass_of(vm, closure.oop());
@@ -338,7 +396,10 @@ pub fn cannot_return(vm: &mut VmState, closure: ClosureOop, value: Oop) {
     match crate::runtime::lookup::lookup(vm, klass, sel) {
         Some(m) => {
             vm.regs.bci = BCI_RESUME_CANNOT_RETURN; // consumed by activate_method as the new frame's saved_bci
-            super::send::activate_method(vm, m, 1, None);
+            match super::send::activate_method(vm, m, 1, None) {
+                super::send::SendOutcome::Normal => None,
+                super::send::SendOutcome::Nlr(step) => Some(step),
+            }
         }
         None => crate::runtime::error::dnu_fallback(vm, sel, klass), // never returns
     }
@@ -466,15 +527,20 @@ mod tests {
 
         // Scanning from the top (#4) toward home=#1 (exclusive): #4 itself
         // is checked first (the scan is inclusive of the starting frame).
-        let (found_fp, _) =
-            innermost_marked_frame(&vm, fp4, fp1).expect("must find a marked frame");
+        let found_fp = match innermost_marked_frame(&vm, fp4, fp1) {
+            ScanResult::Marked(fp, _) => fp,
+            _ => panic!("must find a marked frame"),
+        };
         assert_eq!(found_fp, fp4);
 
         // With #4 unmarked, the same scan must skip #3 (unmarked) and land
         // on #2 — never on #1 (home is excluded from the scan).
         let nil = vm.universe.nil_obj;
         Frame { fp: fp4 }.clear_marker(&mut vm.stack, nil);
-        let (found_fp2, _) = innermost_marked_frame(&vm, fp4, fp1).expect("must find #2");
+        let found_fp2 = match innermost_marked_frame(&vm, fp4, fp1) {
+            ScanResult::Marked(fp, _) => fp,
+            _ => panic!("must find #2"),
+        };
         assert_eq!(found_fp2, fp2);
     }
 

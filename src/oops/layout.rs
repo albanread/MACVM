@@ -17,6 +17,15 @@ pub const MEM_TAG: u64 = 0b01; // heap oop; address = word - MEM_TAG
 pub const RESERVED_TAG: u64 = 0b10; // future immediate Character; illegal in v1
 pub const MARK_TAG: u64 = 0b11; // only as header word 0
 
+/// S11 D6.3: the two RESERVED_TAG sentinel values a compiled call can return
+/// in x0 that are NOT real oops (both have `& TAG_MASK == RESERVED_TAG`, so
+/// `Oop::from_raw` rejects them and no real oop can collide). `BAILOUT`
+/// (`interpreter::compiled_call`, S10 D1) means "fall back to interpreted";
+/// `NLR_SENTINEL` (S11 step 9) means "a non-local return is escaping through
+/// this compiled frame — target/value are parked in `VmState::nlr_state`".
+/// Distinct full values, so a single exact `cmp x0, #6` never confuses them.
+pub const NLR_SENTINEL: u64 = 0b0110; // = 6
+
 /// SPEC §7.6 (amended per S7 review, `sprint_s07_detail.md` "SPEC-QUESTION"):
 /// Rust can't rewrite live stale locals/handles the way a moving GC does in
 /// a language with a rewritable-roots runtime, so the enforceable
