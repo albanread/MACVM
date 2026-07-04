@@ -635,6 +635,43 @@ is kept alive by its nmethod — acceptable float, gone at the next full GC).
 > made every bare `cargo run` recipe ambiguous — left uncommitted here to
 > ride with that session's own work.)
 
+> **STEP-8 NOTES (as-built) — the gate, plus one more real bug it caught.**
+> (a) **A latent oop-map correctness bug, surfaced by `GC_STRESS=1 cargo
+> test` (a SIGSEGV in `mark_word_raw`).** `compiler::oopmap::
+> build_for_position` used `iv.start <= position`, which included an
+> interval that STARTS at the safepoint — i.e. the value DEFINED by the
+> `CallSend`/`CallRuntime`/`Alloc` instruction itself. That value is
+> produced by the call's RETURN, so during the call — exactly when a GC
+> can walk the frame — its spill slot still holds uninitialized native-
+> stack garbage. Tracing it dereferences junk. Latent until step 7 (no GC
+> ran inside a compiled alloc under the old bridge); even the mid-loop
+> flagships passed only because THEIR dead dst slots happened to hold
+> zeros (a zero reads as smi 0, no deref), while `allocation_fast_and_
+> slow`'s slot held nonzero mem-tagged junk and crashed the instant its
+> slow edge scavenged. Fix: `iv.start < position` (strictly-inside on the
+> left) excludes exactly the instruction's own def — provably always the
+> return value, never a live oop DURING the call, so the map only ever
+> SHRINKS and can never drop a real root; the next safepoint (by then
+> `start < position`) covers the value normally. Crucially this touches
+> ONLY the map (what's TRACED at a safepoint), NOT the spill POLICY
+> (`crosses_safepoint`/`verify_spill_all` keep `<=`, so dst still gets its
+> slot) — the two answer different questions and the bug was conflating
+> them. `oopmap_excludes_interval_starting_at_position` pins it. (b) A
+> pure debugging-discipline note the user enforced mid-fix: this was
+> diagnosed and fixed by LOGIC (reasoning about what a `start == position`
+> interval means at a call safepoint), not by a debugger — the lldb
+> probing that preceded it was thrashing and got cut off. (c) `gate-s12`
+> (chains `gate-s11`) adds the byte-identical diff across both
+> combined-stress modes (the flagship's actual claim — `gate-s11` only
+> checked they PASS) + the S8 soak under tier 1 + `soak-s12`
+> (`world/bench/alloc_churn.mst`: 10M short-lived objects through a
+> COMPILED alloc loop, flat-ceiling asserted exactly by the script). The
+> `it_tier1` `allocation_fast_and_slow` test was scaled to a 32 KiB eden
+> (its honest fill was minutes of full-heap verify walks on a default
+> eden in debug) and tenures `AllocTarget`'s klass up front (step 7's real
+> slow-path scavenge relocates a young klass, staling the Rust-local
+> `KlassOop` — the same idiom the `it_gc_jit` alloc tests already use).
+
 ## Pitfalls
 
 - **P1 — exact PcDesc match or die.** The GC-path `oopmap_at` must panic on
