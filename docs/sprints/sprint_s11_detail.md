@@ -471,6 +471,44 @@ without S12's machinery; S12's first commit deletes it.
 9. NLR sentinel + `stub_nlr_unwind` + send-site check.
 10. GC bridge (D8) + trace/stat hooks. Gates.
 
+> **STEP-8 NOTES (as-built).** (a) `Ir::Alloc` is emitted SELF-CONTAINED
+> (fast path + internal `bl stub_alloc_slow`, its own `Lslow`/`Ldone`
+> labels — like `StoreField`'s barrier), so the dormant `slow: BlockId`
+> field was dropped; it's still a regalloc safepoint. Detection fires only
+> for `X basicNew` where `X` is a compile-time `push_global` class constant
+> of `Format::Slots` with a fixed size fitting a 12-bit immediate
+> (`ir::Translator::alloc_site_klass`); anything else stays a generic send.
+> The class oop is baked at compile time — a deliberate S13-deferred
+> staleness hole (`Nmethod.deps` not built yet), same class as
+> `stale_mono_documented_hole`. (b) **The D8 bridge's CORE landed here, not
+> in step 10**, because `rt_alloc_slow` (and every interpreter allocation
+> reached through a runtime stub under a compiled frame) is only sound if
+> moving GC is suppressed while `compiled_depth > 0`. So `alloc::alloc_words`
+> now diverts old-direct under a compiled frame (`gc_stats.bridge_old_allocs`
+> counts it), `scavenge`/`full_gc` `debug_assert!(compiled_depth == 0)`, and
+> `prim_gc_scavenge`/`prim_gc_full` decline under a compiled frame. This also
+> freezes eden for the whole compiled window, which is what lets the inline
+> fast path bump `reg_block.eden_top` directly, synced to `eden.top` only at
+> the OUTERMOST `enter_compiled` (`publish_eden_to_regblock`/
+> `adopt_eden_from_regblock`). Step 10 still owns the REST of D8: the
+> `gc_under_compiled == 0` exit gate, the `gc_pending` deferred-collection
+> upgrade (the primitives currently just no-op), the `MACVM_TRACE=gc`
+> diversion warnings, and `oops_do` over nmethod/PIC/adapter pools.
+> (c) **HOLE 2 (adversarial-review finding), a hard step-9 requirement:**
+> `compiled_depth` is balanced only on the NORMAL return path
+> (`enter_compiled`'s `-= 1`). A step-9 NLR that unwinds PAST a compiled
+> frame MUST fix up `compiled_depth` and re-adopt `reg_block.eden_top` at
+> every compiled boundary it crosses — a stranded `compiled_depth > 0`
+> freezes all allocation old-direct forever and never reclaims the
+> compiled window's eden bumps. (d) **Known pre-existing limitation, NOT a
+> step-8 regression** (verified: step-7's commit `100e830` fails the same
+> combo identically): `MACVM_GC_STRESS=1` + `MACVM_JIT=threshold=1`
+> TOGETHER panics in `full_gc` ("reachable but not forwarded") — the
+> compiled-frame-oop-invisibility issue S12 fixes and the full step-10 D8
+> bridge (`oops_do` over code-cache pools) mitigates. The established gate
+> runs gc-stress with JIT OFF, which passes; the two are not combined until
+> S12.
+
 ## Pitfalls
 
 - **P1 — patch = ONE aligned u32 store + icache flush** (`arm64.md` §4.3).

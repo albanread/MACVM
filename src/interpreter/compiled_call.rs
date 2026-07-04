@@ -70,6 +70,17 @@ pub fn enter_compiled(vm: &mut VmState, nm_id: NmethodId, argc: u8) -> EnterResu
         entry_sp: vm.stack.sp as u64,
         nm_id,
     });
+    // S11 D8: the OUTERMOST I→C boundary publishes the interpreter's live
+    // eden bump pointer + bounds into `reg_block`, so compiled code's
+    // inline-alloc fast path bumps the SAME nursery. A NESTED entry
+    // (compiled_depth already > 0) touches nothing: the D8 bridge has
+    // frozen eden for the whole window (all Rust allocation under a
+    // compiled frame goes old-direct — `alloc::alloc_words`), so
+    // `reg_block.eden_top` already reflects every in-window allocation and
+    // must not be clobbered back to the frozen `eden.top`.
+    if vm.compiled_depth == 0 {
+        vm.publish_eden_to_regblock();
+    }
     vm.compiled_depth += 1;
 
     let stubs = vm.stubs;
@@ -77,6 +88,18 @@ pub fn enter_compiled(vm: &mut VmState, nm_id: NmethodId, argc: u8) -> EnterResu
 
     vm.tier_links.pop();
     vm.compiled_depth -= 1;
+    // S11 D8: the OUTERMOST exit reclaims compiled code's bump progress
+    // into the interpreter's authoritative `eden.top`. Sound because the
+    // bridge froze `eden.top` for the whole window, so `reg_block.eden_top`
+    // is the only party that advanced the nursery. Runs on BOTH the
+    // completed and bailout paths: a compiled method that allocated and
+    // then bailed still produced real eden objects `eden.top` must account
+    // for. (Step 9 must run this same adopt + `compiled_depth` fixup on any
+    // NLR unwind that crosses a compiled frame — an adversarial-review
+    // finding; a stranded `compiled_depth` would freeze eden forever.)
+    if vm.compiled_depth == 0 {
+        vm.adopt_eden_from_regblock();
+    }
 
     if result_bits == BAILOUT_SENTINEL {
         return EnterResult::Bailout;

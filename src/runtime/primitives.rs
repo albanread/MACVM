@@ -990,6 +990,19 @@ fn prim_millisecond_clock(vm: &mut VmState, _args: &[Oop]) -> PrimResult {
 /// explicit `gcScavenge` call finding no way forward is just as fatal as
 /// one the allocator triggered itself, not a different situation.
 fn prim_gc_scavenge(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    // S11 D8 bridge: an explicit `Smalltalk gcScavenge` sent from
+    // interpreted code re-entered UNDER a compiled frame (I→C→I, via a c2i
+    // adapter) would move the heap while the outer compiled frame's
+    // spill-slot oops are still invisible to the collector — heap
+    // corruption. Moving GC is forbidden until `compiled_depth` returns to
+    // 0, so skip (answer the receiver, as if the collection found nothing
+    // to do). Step 10 upgrades this no-op to a proper deferred collection
+    // (`gc_pending`, run at the next `compiled_depth == 0` point); for now
+    // the pre-S12 bridge simply declines. Found by adversarial review — the
+    // `alloc_words` bridge arm alone doesn't cover this direct door.
+    if vm.compiled_depth > 0 {
+        return PrimResult::Ok(args[0]);
+    }
     if let Err(err) = crate::memory::scavenge::scavenge(vm) {
         alloc::stall_exit(err);
     }
@@ -1001,6 +1014,13 @@ fn prim_gc_scavenge(vm: &mut VmState, args: &[Oop]) -> PrimResult {
 /// returns `Err` (pure compaction needs no new memory — see its own doc);
 /// the `expect` documents that rather than silently discarding a `Result`.
 fn prim_gc_full(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    // S11 D8 bridge: same as `prim_gc_scavenge` — a compacting collection
+    // under a live compiled frame would relocate objects the collector
+    // can't yet find via that frame. Decline while `compiled_depth > 0`
+    // (step 10 upgrades to a deferred full GC).
+    if vm.compiled_depth > 0 {
+        return PrimResult::Ok(args[0]);
+    }
     crate::memory::fullgc::full_gc(vm)
         .expect("full_gc: pure compaction never returns Err (see its own doc)");
     PrimResult::Ok(args[0])

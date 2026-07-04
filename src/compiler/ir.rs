@@ -21,6 +21,13 @@ use crate::oops::layout::BODY_OFFSET;
 use crate::oops::wrappers::{KlassOop, MethodOop, SymbolOop};
 use crate::runtime::vm_state::VmState;
 
+/// `primitives.rs`'s pinned id for `basicNew` (`Object>>basicNew`,
+/// `<primitive: 23>`) — the target an inline-allocatable `X basicNew` site
+/// must resolve to (`Translator::alloc_site_klass`, S11 D7). `pub(crate)`:
+/// `driver::mono_smi_inline_send` reads it too, to let a mono basicNew site
+/// clear eligibility (both readers must agree on the same id).
+pub(crate) const PRIM_BASIC_NEW: i64 = 23;
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct VReg(pub u32);
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -186,11 +193,25 @@ pub enum Ir {
         stub: StubId,
         args: Vec<VReg>,
     },
+    /// S11 D7 inline allocation of a fixed-size `Format::Slots` object
+    /// (`X new` where `X` is a compile-time-known class constant). `emit.rs`
+    /// lowers this to a SELF-CONTAINED fast-path-plus-slow-call sequence
+    /// (bump `reg_block.eden_top`, bounds-check `eden_end`, init header +
+    /// nil body, mem-tag; on overflow `bl stub_alloc_slow`) with its own
+    /// internal labels — no separate slow CFG block, mirroring how
+    /// `StoreField`'s barrier is self-contained. Still a regalloc SAFEPOINT
+    /// (`is_safepoint`), so every vreg live across it is already spilled
+    /// before the internal slow call's `bl` can clobber a caller-saved
+    /// register. `klass` is the class oop (`RelocKind::Oop` pool entry, read
+    /// from the `push_global` class constant at the send site); `size_words`
+    /// is `klass.non_indexable_size()`, fixed at compile time (guarded by
+    /// S13 deps — until then a klass-format redefinition is a documented
+    /// stale-code hole flushed by S12's sweep, same class of hole as
+    /// `stale_mono_documented_hole`).
     Alloc {
         dst: VReg,
         klass: PoolLit,
         size_words: u32,
-        slow: BlockId,
     },
     /// Loop back-edge flag check (D5.3); reads `VmRegBlock::poll_flag`.
     Poll,
@@ -303,6 +324,15 @@ pub struct IrMethod {
     /// these instead of relying on a fixed pool-index convention.
     pub true_lit: PoolLit,
     pub false_lit: PoolLit,
+    /// S11 D7 `Alloc`: `nil_lit` is the `nil` oop the inline fast path
+    /// stores into every body slot (nil-init is MANDATORY — a GC at the
+    /// next safepoint would otherwise scan a garbage body); `mark_slots_lit`
+    /// is the pristine `Format::Slots` mark word
+    /// (`Mark::pristine().with_tagged_contents(true)`), stored into the
+    /// object header. Both are `emit.rs`-facing constants with no `VmState`
+    /// to intern on demand, exactly like `true_lit`/`false_lit`.
+    pub nil_lit: PoolLit,
+    pub mark_slots_lit: PoolLit,
     /// S11 D3: one entry per `Ir::CallSend` site, indexed by its own
     /// `site: u16` — mirrors `pool`'s own "small side table, indexed by a
     /// compact id embedded in the `Ir`" shape. `emit.rs` has no `VmState`/
@@ -586,6 +616,16 @@ struct Translator<'a> {
     /// indexes into this, same shape as `pool`'s own accumulate-then-hand-
     /// to-`IrMethod` pattern.
     call_sites: Vec<CallSiteInfo>,
+    /// S11 D7: vregs known at compile time to hold a specific class
+    /// constant, i.e. produced by a `push_global` whose Association value
+    /// is a `KlassOop`. Keyed by `VReg.0`. Used to recognize `X basicNew`
+    /// at a send site (the receiver traces back to a class constant), the
+    /// one shape the inline-allocation fast path (`Ir::Alloc`) fires for.
+    /// The class oop is read at compile time and baked into the pool — a
+    /// deliberate S13-deferred staleness hole (a later `Global := OtherClass`
+    /// isn't observed; a klass-format redefinition flushes via S12's sweep,
+    /// same class of hole as `stale_mono_documented_hole`).
+    const_class: HashMap<u32, KlassOop>,
 }
 
 impl<'a> Translator<'a> {
@@ -767,6 +807,40 @@ impl<'a> Translator<'a> {
         crate::compiler::driver::SMI_INLINE.contains(&target.primitive())
     }
 
+    /// S11 D7: is this send site an inline-allocatable `X basicNew`? Returns
+    /// `Some((klass, size_words))` when: the `receiver` vreg is a known
+    /// compile-time class constant `X` (from a `push_global`, tracked in
+    /// `const_class`); the send takes no arguments; the site's mono target
+    /// really is the `basicNew` primitive (guards against a class that
+    /// overrides `basicNew` — a Poly/Mega/non-method target fails the
+    /// `MethodOop::try_from` exactly as `is_smi_inlinable` relies on); and
+    /// `X` is a fixed-size `Format::Slots` class small enough for the inline
+    /// fast path's 12-bit `add`/`str` immediates. Anything else stays an
+    /// ordinary generic `basicNew` send.
+    fn alloc_site_klass(&self, ic_idx: u16, receiver: VReg) -> Option<(KlassOop, u32)> {
+        let klass = *self.const_class.get(&receiver.0)?;
+        let ic = InterpreterIc::at(self.method, ic_idx);
+        if ic.argc() != 0 {
+            return None;
+        }
+        let target = MethodOop::try_from(ic.target())?;
+        if target.primitive() != PRIM_BASIC_NEW {
+            return None;
+        }
+        if !matches!(klass.format(), crate::oops::klass::Format::Slots) {
+            return None;
+        }
+        let size_words = klass.non_indexable_size();
+        // Header (2 words) .. the 12-bit immediate ceiling emit_alloc's own
+        // debug_assert enforces; a giant class stays a generic send.
+        if size_words < crate::oops::layout::HEADER_WORDS
+            || size_words * crate::oops::layout::WORD_SIZE >= 4096
+        {
+            return None;
+        }
+        Some((klass, size_words as u32))
+    }
+
     /// Translates every instruction except a block's own terminator
     /// (`Jump`/`Branch`-family and `Return`-family are structurally
     /// distinct: `Return` needs nothing beyond what's already on hand and
@@ -868,6 +942,21 @@ impl<'a> Translator<'a> {
                     obj: assoc_vreg,
                     byte_off: (BODY_OFFSET + 8) as i32,
                 });
+                // S11 D7: if this global's CURRENT value is a class, remember
+                // `dst` holds that class constant, so an immediately
+                // following `X basicNew` send can compile to an inline
+                // `Ir::Alloc` (`alloc_site_klass`). Reading the value here at
+                // compile time is the deliberate S13-deferred staleness hole
+                // (see `const_class`' own doc). The `LoadField` above still
+                // emits — it's dead if the send turns into an `Alloc` (which
+                // bakes the klass from the pool), a negligible cost a future
+                // peephole could elide.
+                let value = crate::oops::wrappers::MemOop::try_from(assoc)
+                    .map(|a| a.body_oop(1))
+                    .unwrap_or(assoc);
+                if let Some(klass) = KlassOop::try_from(value) {
+                    self.const_class.insert(dst.0, klass);
+                }
                 stack.push(dst);
             }
             Instr::Pop => {
@@ -961,6 +1050,29 @@ impl<'a> Translator<'a> {
             // attempted, `stub_resolve` sorts out Unresolved/Mono/Pic/Mega
             // from here exactly like any other real send site.
             Instr::Send { ic, .. } => {
+                // S11 D7: a known `X basicNew` (receiver is a compile-time
+                // class constant, target is the basicNew primitive, X a
+                // fixed-size Slots class) compiles to an inline `Ir::Alloc`
+                // instead of a generic send. `stack.last()` is the receiver
+                // exactly when the send takes no arguments -- which
+                // `alloc_site_klass` requires (`ic.argc() == 0`) before it
+                // ever consults `const_class`, so a non-zero-argc send whose
+                // top-of-stack is an arg simply returns `None` here.
+                if let Some(receiver) = stack.last().copied() {
+                    if let Some((klass, size_words)) = self.alloc_site_klass(ic, receiver) {
+                        stack.pop(); // consume the receiver
+                        let klass_lit = self.pool.intern(klass.oop().raw(), Some(RelocKind::Oop));
+                        let dst = self.fresh(true);
+                        code.push(Ir::Alloc {
+                            dst,
+                            klass: klass_lit,
+                            size_words,
+                        });
+                        stack.push(dst);
+                        return split;
+                    }
+                }
+
                 let ic_view = InterpreterIc::at(self.method, ic);
                 let real_argc = ic_view.argc();
                 let mut real_args: Vec<VReg> = (0..real_argc)
@@ -1100,6 +1212,7 @@ pub fn convert(vm: &VmState, method: MethodOop, cfg: &Cfg) -> IrMethod {
         next_extra_block: cfg.blocks.len() as u32,
         blocks_by_id: (0..cfg.blocks.len()).map(|_| None).collect(),
         call_sites: Vec::new(),
+        const_class: HashMap::new(),
     };
 
     // Pre-allocate merge vregs for every block that needs them (D3.2) —
@@ -1136,6 +1249,17 @@ pub fn convert(vm: &VmState, method: MethodOop, cfg: &Cfg) -> IrMethod {
     let false_lit = t
         .pool
         .intern(vm.universe.false_obj.raw(), Some(RelocKind::Oop));
+    // S11 D7: the pristine mark word an inline `Alloc` stamps into a fresh
+    // `Format::Slots` object's header — a raw immediate (NOT a
+    // `RelocKind::Oop`: it's a mark word, not a heap reference the GC
+    // updates), matching `memory::alloc::init_object_at`'s own
+    // `Mark::pristine().with_tagged_contents(true)`.
+    let mark_slots_lit = t.pool.intern(
+        crate::oops::mark::Mark::pristine()
+            .with_tagged_contents(true)
+            .word(),
+        None,
+    );
 
     let mut exit_stacks: Vec<Option<Vec<VReg>>> = vec![None; cfg.blocks.len()];
 
@@ -1317,6 +1441,8 @@ pub fn convert(vm: &VmState, method: MethodOop, cfg: &Cfg) -> IrMethod {
         safepoints: Vec::new(),
         true_lit,
         false_lit,
+        nil_lit,
+        mark_slots_lit,
         call_sites: t.call_sites,
     }
 }

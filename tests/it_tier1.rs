@@ -9,10 +9,11 @@ use macvm::codecache::nmethod::{IcSite, IcState, NmState, Nmethod, NmethodId};
 use macvm::codecache::pics::PIC_MAX_ENTRIES;
 use macvm::codecache::stubs::{self, CallStubFn};
 use macvm::codecache::CodeCache;
+use macvm::compiler::decode;
 use macvm::compiler::driver;
 use macvm::compiler::emit;
 use macvm::compiler::ir::{
-    BailoutReason, BlockId, CallSiteInfo, CmpOp, Ir, IrBlock, IrMethod, PoolLit, SmiOp, VReg,
+    self, BailoutReason, BlockId, CallSiteInfo, CmpOp, Ir, IrBlock, IrMethod, PoolLit, SmiOp, VReg,
     VRegInfo,
 };
 use macvm::compiler::jasm_assembler::JasmAssembler;
@@ -136,6 +137,8 @@ fn run_ir_raw() {
         // dereferences these against the (also empty) pool.
         true_lit: PoolLit(0),
         false_lit: PoolLit(0),
+        nil_lit: PoolLit(0),
+        mark_slots_lit: PoolLit(0),
         call_sites: Vec::new(),
     };
 
@@ -148,6 +151,7 @@ fn run_ir_raw() {
         &regalloc_result,
         stubs.stub_poll_addr(),
         stubs.must_be_boolean_addr(),
+        stubs.alloc_slow_addr(),
         None,
     );
     assert_eq!(
@@ -190,8 +194,15 @@ fn run_ir_raw() {
 fn build_and_publish(cache: &mut CodeCache, stub_poll_addr: u64, method: &IrMethod) -> *const u8 {
     let regalloc_result = regalloc::regalloc(method);
     let mut asm = JasmAssembler::new();
-    let (blob, _pcs, _verified_entry_off, _ic_sites) =
-        emit::emit(&mut asm, method, &regalloc_result, stub_poll_addr, 0, None);
+    let (blob, _pcs, _verified_entry_off, _ic_sites) = emit::emit(
+        &mut asm,
+        method,
+        &regalloc_result,
+        stub_poll_addr,
+        0,
+        0,
+        None,
+    );
     let h = cache.alloc(blob.code.len()).unwrap();
     cache.publish(h, &blob)
 }
@@ -242,6 +253,8 @@ fn mul_method() -> IrMethod {
         safepoints: Vec::new(),
         true_lit: PoolLit(0),
         false_lit: PoolLit(0),
+        nil_lit: PoolLit(0),
+        mark_slots_lit: PoolLit(0),
         call_sites: Vec::new(),
     }
 }
@@ -355,6 +368,8 @@ fn run_ir_raw_forces_spill() {
         safepoints: Vec::new(),
         true_lit: PoolLit(0),
         false_lit: PoolLit(0),
+        nil_lit: PoolLit(0),
+        mark_slots_lit: PoolLit(0),
         call_sites: Vec::new(),
     };
 
@@ -371,6 +386,7 @@ fn run_ir_raw_forces_spill() {
         &regalloc_result,
         stubs.stub_poll_addr(),
         stubs.must_be_boolean_addr(),
+        stubs.alloc_slow_addr(),
         None,
     );
     let h = cache.alloc(blob.code.len()).unwrap();
@@ -669,6 +685,7 @@ fn compile_and_get_listing(vm: &VmState, method: MethodOop) -> String {
         &ra,
         0xDEAD_BEEF_0000_0000,
         0xDEAD_BEEF_0000_0001,
+        0xDEAD_BEEF_0000_0002,
         None,
     );
     blob.listing.join("\n") + "\n"
@@ -1464,6 +1481,8 @@ fn mono_resolve_patches_call_site_and_dispatches() {
         safepoints: Vec::new(),
         true_lit: PoolLit(0),
         false_lit: PoolLit(0),
+        nil_lit: PoolLit(0),
+        mark_slots_lit: PoolLit(0),
         call_sites: vec![CallSiteInfo {
             selector: foo_sel,
             argc: 3,
@@ -1478,6 +1497,7 @@ fn mono_resolve_patches_call_site_and_dispatches() {
         &ra,
         vm.stubs.stub_poll_addr(),
         vm.stubs.must_be_boolean_addr(),
+        vm.stubs.alloc_slow_addr(),
         None,
     );
     assert_eq!(emitted_ic_sites.len(), 1, "exactly one Ir::CallSend");
@@ -1614,6 +1634,8 @@ fn build_c2i_scenario(vm: &mut VmState) -> (u64, KlassOop, NmethodId) {
         safepoints: Vec::new(),
         true_lit: PoolLit(0),
         false_lit: PoolLit(0),
+        nil_lit: PoolLit(0),
+        mark_slots_lit: PoolLit(0),
         call_sites: vec![CallSiteInfo {
             selector: foo_sel,
             argc: 3,
@@ -1628,6 +1650,7 @@ fn build_c2i_scenario(vm: &mut VmState) -> (u64, KlassOop, NmethodId) {
         &ra,
         vm.stubs.stub_poll_addr(),
         vm.stubs.must_be_boolean_addr(),
+        vm.stubs.alloc_slow_addr(),
         None,
     );
     assert_eq!(emitted_ic_sites.len(), 1, "exactly one Ir::CallSend");
@@ -1828,6 +1851,8 @@ fn full_ic_lattice_mono_to_pic_to_mega() {
         safepoints: Vec::new(),
         true_lit: PoolLit(0),
         false_lit: PoolLit(0),
+        nil_lit: PoolLit(0),
+        mark_slots_lit: PoolLit(0),
         call_sites: vec![CallSiteInfo {
             selector: foo_sel,
             argc: 1,
@@ -1842,6 +1867,7 @@ fn full_ic_lattice_mono_to_pic_to_mega() {
         &ra,
         vm.stubs.stub_poll_addr(),
         vm.stubs.must_be_boolean_addr(),
+        vm.stubs.alloc_slow_addr(),
         None,
     );
     assert_eq!(emitted_ic_sites.len(), 1);
@@ -2036,6 +2062,8 @@ fn dnu_from_compiled_code_reaches_does_not_understand() {
         safepoints: Vec::new(),
         true_lit: PoolLit(0),
         false_lit: PoolLit(0),
+        nil_lit: PoolLit(0),
+        mark_slots_lit: PoolLit(0),
         call_sites: vec![CallSiteInfo {
             selector: unknown_sel,
             argc: 1,
@@ -2050,6 +2078,7 @@ fn dnu_from_compiled_code_reaches_does_not_understand() {
         &ra,
         vm.stubs.stub_poll_addr(),
         vm.stubs.must_be_boolean_addr(),
+        vm.stubs.alloc_slow_addr(),
         None,
     );
     assert_eq!(emitted_ic_sites.len(), 1);
@@ -2316,5 +2345,119 @@ fn card_dirtied_by_compiled_store() {
         vm.universe.cards.is_dirty(card),
         "a compiled store_instvar_pop of a young value into an old receiver \
          must dirty the receiver's own card"
+    );
+}
+
+/// tests_s11.md integration item 4, `allocation_fast_and_slow`: `X basicNew`
+/// where `X` is a compile-time Slots class constant compiles to an inline
+/// `Ir::Alloc`. Exercises BOTH edges: (a) the eden fast path (bump, from the
+/// nursery); (b) the forced-overflow slow path (`rt_alloc_slow`), which
+/// under the live compiled frame takes the D8 bridge's old-direct route
+/// (`bridge_old_allocs` bumps). Both must produce a correctly-classed,
+/// nil-bodied instance.
+#[test]
+fn allocation_fast_and_slow() {
+    use macvm::interpreter::compiled_call::{enter_compiled, EnterResult};
+    use macvm::runtime::lookup::klass_of;
+
+    let mut vm = test_vm();
+    // A 2-instance-var Slots class bound to a global (`AllocTarget`).
+    for item in parser::parse_file("Object subclass: AllocTarget [ | a b | ]").expect("parse") {
+        classdef::execute_top_item(&mut vm, item).expect("execute");
+    }
+    let target_sym = vm.universe.intern(b"AllocTarget");
+    let target_assoc =
+        macvm::runtime::globals::global_lookup(&vm, target_sym).expect("AllocTarget global");
+    let target_klass =
+        KlassOop::try_from(MemOop::try_from(target_assoc).unwrap().body_oop(1)).unwrap();
+
+    // A bare `test_vm()` has no world loaded, so `basicNew` (a world method)
+    // isn't installed. Install the real basicNew primitive (id 23) on
+    // AllocTarget's own metaclass so `AllocTarget basicNew` resolves.
+    let basic_new_sel = vm.universe.intern(b"basicNew");
+    let target_meta = klass_of(&vm, target_klass.oop());
+    let basic_new_method = {
+        let mut nb = BytecodeBuilder::new();
+        nb.ret_self(); // fallback body -- never reached (prim always succeeds here)
+        let m = nb.finish(&mut vm, basic_new_sel, 0, 0);
+        m.set_primitive(23);
+        m.set_flags(0, 0, false, false, true, false, 0);
+        m
+    };
+    install_method(&mut vm, target_meta, basic_new_sel, basic_new_method);
+
+    // `spawn [ ^AllocTarget basicNew ]` -- push_global AllocTarget; send
+    // basicNew; ret_tos. Self is ignored, so it can compile for smi_klass.
+    let mut b = BytecodeBuilder::new();
+    b.push_global(&mut vm, target_assoc);
+    b.send(&mut vm, basic_new_sel, 0);
+    b.ret_tos();
+    let spawn_sel = vm.universe.intern(b"spawn");
+    let method = b.finish(&mut vm, spawn_sel, 0, 0);
+
+    // Warm interpreted: mono the basicNew site (guard = AllocTarget's
+    // metaclass, target = Object>>basicNew, prim 23). Receiver is a smi
+    // (ignored by the body; matches the compile target's own smi_klass).
+    let smi_klass = vm.universe.smi_klass;
+    let recv = SmallInt::new(1).oop();
+    let warm = macvm::interpreter::run_method(&mut vm, method, recv, &[]);
+    assert_eq!(
+        klass_of(&vm, warm).oop().raw(),
+        target_klass.oop().raw(),
+        "warmup must produce a real AllocTarget"
+    );
+
+    // The detection must fire: an inline Ir::Alloc, not a generic CallSend.
+    let cfg = decode::decode(method);
+    let ir_method = ir::convert(&vm, method, &cfg);
+    assert!(
+        ir_method
+            .blocks
+            .iter()
+            .any(|bl| bl.code.iter().any(|i| matches!(i, Ir::Alloc { .. }))),
+        "`AllocTarget basicNew` must compile to an inline Ir::Alloc"
+    );
+
+    assert!(
+        driver::eligible(&vm, method),
+        "a mono basicNew site is eligible"
+    );
+    let id = driver::compile_method(&mut vm, smi_klass, method).expect("must compile");
+
+    // (a) Fast path: bump the nursery, no bridge diversion.
+    let eden_top_before = vm.universe.eden.top;
+    let bridge_before = vm.universe.gc_stats.bridge_old_allocs;
+    vm.stack.push(recv);
+    assert_eq!(enter_compiled(&mut vm, id, 0), EnterResult::Completed);
+    let obj = vm.stack.pop();
+    assert_eq!(
+        klass_of(&vm, obj).oop().raw(),
+        target_klass.oop().raw(),
+        "fast-path result must be a fresh AllocTarget"
+    );
+    assert!(
+        vm.universe.eden.top > eden_top_before,
+        "the fast path must bump eden"
+    );
+    assert_eq!(
+        vm.universe.gc_stats.bridge_old_allocs, bridge_before,
+        "the fast path must NOT divert to old gen"
+    );
+
+    // (b) Slow path: fill eden so the inline bump overflows -> rt_alloc_slow
+    // -> D8 bridge old-direct (compiled_depth > 0 during the call).
+    vm.universe.eden.top = vm.universe.eden.end;
+    let bridge_before2 = vm.universe.gc_stats.bridge_old_allocs;
+    vm.stack.push(recv);
+    assert_eq!(enter_compiled(&mut vm, id, 0), EnterResult::Completed);
+    let obj2 = vm.stack.pop();
+    assert_eq!(
+        klass_of(&vm, obj2).oop().raw(),
+        target_klass.oop().raw(),
+        "slow-path result must still be a valid AllocTarget"
+    );
+    assert!(
+        vm.universe.gc_stats.bridge_old_allocs > bridge_before2,
+        "the forced-overflow slow path must divert old-direct via the D8 bridge"
     );
 }

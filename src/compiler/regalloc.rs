@@ -82,7 +82,10 @@ fn successors(block: &IrBlock) -> Vec<BlockId> {
             }
             Ir::SmiArith { fail, .. } | Ir::SmiCmpVal { fail, .. } => succs.push(*fail),
             Ir::GuardKlass { fail, .. } => succs.push(*fail),
-            Ir::Alloc { slow, .. } => succs.push(*slow),
+            // S11 D7: `Alloc` is self-contained (fast path + internal slow
+            // call, `emit::emit_alloc`) — no slow CFG successor. It stays a
+            // safepoint via `is_safepoint` so live-across vregs spill before
+            // the internal `bl`; it just doesn't branch to another block.
             _ => {}
         }
     }
@@ -405,6 +408,8 @@ mod tests {
             safepoints: Vec::new(),
             true_lit: PoolLit(0),
             false_lit: PoolLit(0),
+            nil_lit: PoolLit(0),
+            mark_slots_lit: PoolLit(0),
             call_sites: Vec::new(),
         }
     }

@@ -30,6 +30,13 @@ pub struct GcStats {
     /// S8: `OldGen::grow` calls that actually committed a segment (0 return
     /// excluded — that's a no-op at the reservation ceiling, not growth).
     pub old_grow_count: u64,
+    /// S11 D8 (pre-S12 bridge): allocations diverted straight to old gen
+    /// because a compiled frame was live (`compiled_depth > 0`) and moving
+    /// GC is forbidden until S12 can find compiled-frame oops. The cost S12
+    /// removes — `tests_s11.md`'s bridge-accounting gate reads this, and
+    /// `allocation_fast_and_slow` asserts it is `> 0` on the forced-slow
+    /// path. See `alloc::alloc_words`' own bridge arm.
+    pub bridge_old_allocs: u64,
 }
 
 impl GcStats {

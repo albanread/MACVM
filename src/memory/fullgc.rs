@@ -417,6 +417,16 @@ pub fn full_gc(vm: &mut VmState) -> Result<FullGcReport, GcStallError> {
         vm.universe.to.top, vm.universe.to.start,
         "full_gc: to-space must be empty between collections (never nested inside a scavenge)"
     );
+    // S11 D8: like `scavenge`, a compacting collection moves objects and
+    // must never run while a compiled frame is live (its spill-slot oops
+    // are invisible until S12). The `alloc::alloc_words` bridge arm and the
+    // guarded `prim_gc_full` both keep this at 0; the assert catches a
+    // future third door.
+    debug_assert_eq!(
+        vm.compiled_depth, 0,
+        "full_gc under a live compiled frame (compiled_depth={}) — S11 D8 bridge violated",
+        vm.compiled_depth
+    );
     if super::verify::verify_enabled() {
         super::verify::verify_heap_at(vm, VerifyPoint::FullGcEntry)
             .expect("heap invalid at full-gc entry");

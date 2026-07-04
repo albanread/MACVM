@@ -105,6 +105,11 @@ pub struct Stubs {
     /// method: emitting a call to it from a `not_bool` block is
     /// `Ir::CallRuntime`'s own job, S11 step 7's eligibility relaxation.
     pub must_be_boolean: CodeHandle,
+    /// D7: the inline-allocation slow-path helper — an `Ir::Alloc` fast
+    /// path whose eden bump overflows `bl`s here with the class oop in x0
+    /// and the size in bytes in x1 (S11 step 8). Callee-shaped (plain `ret`,
+    /// result oop in x0), same contract as `must_be_boolean`.
+    pub alloc_slow: CodeHandle,
 }
 
 impl Stubs {
@@ -128,6 +133,9 @@ impl Stubs {
     }
     pub fn must_be_boolean_addr(&self) -> u64 {
         self.must_be_boolean.base as u64
+    }
+    pub fn alloc_slow_addr(&self) -> u64 {
+        self.alloc_slow.base as u64
     }
 
     /// Invokes `entry` (a compiled method's own entry point — an `Nmethod`'s
@@ -199,6 +207,12 @@ pub fn install(cache: &mut CodeCache) -> Stubs {
         .expect("stubs::install: code cache too small for must_be_boolean");
     cache.publish(h7, &must_be_boolean_blob);
 
+    let alloc_slow_blob = build_stub_alloc_slow();
+    let h8 = cache
+        .alloc(alloc_slow_blob.code.len())
+        .expect("stubs::install: code cache too small for alloc_slow");
+    cache.publish(h8, &alloc_slow_blob);
+
     Stubs {
         call_stub: h1,
         stub_poll: h2,
@@ -207,6 +221,7 @@ pub fn install(cache: &mut CodeCache) -> Stubs {
         mega_shared: h5,
         dnu: h6,
         must_be_boolean: h7,
+        alloc_slow: h8,
     }
 }
 
@@ -908,6 +923,74 @@ pub unsafe extern "C" fn rt_must_be_boolean(vm: *mut VmState, val: u64) -> u64 {
         Some(m) => crate::interpreter::run_method_reentrant(vm, m, t, &[]).raw(),
         None => crate::runtime::error::dnu_fallback(vm, sel, k),
     }
+}
+
+/// D7: `stub_alloc_slow` — the inline-allocation fast path's overflow tail.
+/// The compiled `Ir::Alloc` sequence puts the class oop in x0 and the object
+/// size in bytes in x1, then `bl`s here. Same callee-shaped skeleton as
+/// `stub_must_be_boolean` (anchor → frame → RootSpill → `call_far` →
+/// restore → clear anchor → plain `ret`, result oop in x0). Marshals into
+/// `rt_alloc_slow(vm, klass_bits, size_bytes)`: `vm` from x28 into x0, and
+/// x0/x1 shifted up to x1/x2 (size first, so the klass in x0 isn't clobbered
+/// before it's read).
+fn build_stub_alloc_slow() -> CodeBlob {
+    let mut a = JasmAssembler::new();
+
+    emit_stub_prologue(&mut a);
+    a.emit("mov", &[x(2), x(1)]); // size_bytes -> x2 (read x1 before it's overwritten)
+    a.emit("mov", &[x(1), x(0)]); // klass_bits -> x1 (read x0 before it's overwritten)
+    a.emit("mov", &[x(0), x(28)]); // vm
+    let lit = a.literal_u64(
+        rt_alloc_slow as *const () as u64,
+        Some(RelocKind::RuntimeAddr),
+    );
+    a.call_far(lit);
+    a.emit("mov", &[x(16), x(0)]); // result -> x16, survives the epilogue's own x0 reload
+    emit_stub_epilogue(&mut a);
+    a.emit("mov", &[x(0), x(16)]); // restore the real result
+    a.emit("ret", &[]);
+
+    a.finish()
+}
+
+/// # Safety
+/// Only ever reached via `blr` from `stub_alloc_slow`'s own hand-assembled
+/// listing above (through `call_far`), never called directly from Rust —
+/// `vm` must be `x28` (D4's own invariant, established by `call_stub`).
+///
+/// D7's slow edge: an inline eden bump overflowed, so allocate the object
+/// the ordinary way. Because this is reached FROM compiled code,
+/// `compiled_depth > 0`, so `alloc_slots` → `alloc_words` takes the D8
+/// bridge's old-direct path (no moving GC — the outer compiled frame's
+/// spill-slot oops are still invisible to the collector until S12). Returns
+/// the freshly allocated object's tagged oop bits in x0. `klass_bits` came
+/// from the `Alloc` site's own `RelocKind::Oop` pool word (a genuine
+/// `KlassOop`, GC-tracked); `size_bytes` is redundant with the klass's own
+/// `non_indexable_size` and cross-checked in debug.
+pub unsafe extern "C" fn rt_alloc_slow(vm: *mut VmState, klass_bits: u64, size_bytes: u64) -> u64 {
+    // SAFETY: this function's own contract, guaranteed by `stub_alloc_slow`.
+    let vm = unsafe { &mut *vm };
+    debug_assert_ne!(
+        vm.reg_block.last_compiled_fp, 0,
+        "rt_alloc_slow: anchor must be set by stub_alloc_slow's prologue before this call"
+    );
+    debug_assert!(
+        vm.compiled_depth > 0,
+        "rt_alloc_slow: only ever reached from compiled code (compiled_depth must be > 0)"
+    );
+    let klass = KlassOop::try_from(Oop::from_raw(klass_bits)).expect(
+        "rt_alloc_slow: klass_bits must be a genuine KlassOop -- the Alloc site's own RelocKind::Oop pool word",
+    );
+    debug_assert!(
+        matches!(klass.format(), crate::oops::klass::Format::Slots),
+        "rt_alloc_slow: only Format::Slots basicNew is inlined (D7)"
+    );
+    debug_assert_eq!(
+        klass.non_indexable_size() * crate::oops::layout::WORD_SIZE,
+        size_bytes as usize,
+        "rt_alloc_slow: the Alloc site's baked size must match the klass's own non_indexable_size"
+    );
+    crate::memory::alloc::alloc_slots(vm, klass).oop().raw()
 }
 
 /// S10: nothing sets `VmRegBlock::poll_flag` nonzero yet (mirrors

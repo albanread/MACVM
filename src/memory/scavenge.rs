@@ -419,6 +419,18 @@ pub fn scavenge(vm: &mut VmState) -> Result<ScavengeReport, GcStallError> {
         vm.universe.gc_enabled,
         "scavenge called before genesis finished (SPEC §7.3 A1)"
     );
+    // S11 D8: moving GC is FORBIDDEN while a compiled frame is live — its
+    // spill-slot oops are invisible to the scavenger until S12, so
+    // evacuating would leave them dangling. Enforced at the collector (not
+    // just its callers) so every door is covered: `alloc::alloc_words`'
+    // bridge arm diverts to old-direct under `compiled_depth > 0` and never
+    // reaches here, and `prim_gc_scavenge` skips under a compiled frame —
+    // this assert catches any future third caller before it can corrupt.
+    debug_assert_eq!(
+        vm.compiled_depth, 0,
+        "scavenge under a live compiled frame (compiled_depth={}) — S11 D8 bridge violated",
+        vm.compiled_depth
+    );
     if super::verify::verify_enabled() {
         super::verify::verify_heap_at(vm, super::verify::VerifyPoint::ScavengeEntry)
             .expect("heap invalid at scavenge entry");

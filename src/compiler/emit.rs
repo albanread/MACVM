@@ -184,6 +184,10 @@ struct Emitter<'a> {
     epilogue: Label,
     true_lit: PoolLit,
     false_lit: PoolLit,
+    /// S11 D7 `Alloc` header/body constants — see `IrMethod::nil_lit`/
+    /// `mark_slots_lit`.
+    nil_lit: PoolLit,
+    mark_slots_lit: PoolLit,
     /// Absolute address of the once-published `stub_poll` (`codecache::
     /// stubs`) — a runtime value `Poll`'s far call embeds as a pool
     /// constant, since `bl`'s ±128 MB range can't reach it directly and
@@ -194,6 +198,9 @@ struct Emitter<'a> {
     /// must_be_boolean` (S11 step 6) — `Ir::CallRuntime{stub:
     /// StubId::MUST_BE_BOOLEAN}`'s own far call embeds this (S11 step 7).
     must_be_boolean_lit: LiteralId,
+    /// Same reasoning again, for `codecache::stubs::Stubs::alloc_slow` — the
+    /// `Ir::Alloc` fast path's overflow edge `bl`s here (S11 step 8, D7).
+    alloc_slow_lit: LiteralId,
     /// `IrMethod.call_sites`, indexed by `Ir::CallSend.site` — see that
     /// field's own doc.
     call_sites: &'a [CallSiteInfo],
@@ -413,6 +420,89 @@ impl<'a> Emitter<'a> {
         self.asm.emit("strb", &[x(31), mem(20, 0)]); // xzr: CARD_DIRTY == 0
 
         self.asm.bind(skip);
+    }
+
+    /// S11 D7: inline allocation of a fixed-size `Format::Slots` object.
+    /// Self-contained fast-path-plus-slow-call, no separate CFG block
+    /// (mirrors `emit_store_field`'s barrier). Fast path: bump
+    /// `reg_block.eden_top` by `size_bytes`, bounds-check `eden_end`,
+    /// stamp the pristine Slots mark + klass oop + nil body, mem-tag the
+    /// result. Overflow → `bl stub_alloc_slow` (the D8 bridge routes it
+    /// old-direct under the live compiled frame).
+    ///
+    /// Register discipline: `x19` holds the raw object base LIVE across the
+    /// whole header/body init — deliberately NOT x16, which `dest_target`
+    /// hands back for a spilled `dst` and would alias the base. `x17` is the
+    /// store-value scratch (reloaded per constant), `x20` the eden_end
+    /// scratch (dead after the bounds check). Both paths land the tagged
+    /// result in `d`, then one `commit`. `Alloc` is a regalloc SAFEPOINT
+    /// (`regalloc::is_safepoint`), so every vreg live across it is already
+    /// spilled before the slow path's `bl` clobbers a caller-saved register.
+    fn emit_alloc(&mut self, dst: VReg, klass: PoolLit, size_words: u32) {
+        use crate::oops::layout::{
+            HEADER_WORDS, MEM_TAG, VMREG_EDEN_END_OFFSET, VMREG_EDEN_TOP_OFFSET, WORD_SIZE,
+        };
+        let size_bytes = size_words as i64 * WORD_SIZE as i64;
+        // ir.rs's own Alloc detection only fires for a header-plus-body that
+        // fits a 12-bit `add`/`str` immediate; a pathological giant class
+        // stays an ordinary generic `basicNew` send instead.
+        debug_assert!(
+            size_words as usize >= HEADER_WORDS && size_bytes < 4096,
+            "emit_alloc: size_bytes {size_bytes} out of the inline range -- ir.rs must gate this"
+        );
+        let d = self.dest_target(dst);
+        let slow = self.asm.new_label();
+        let done = self.asm.new_label();
+
+        // Fast path: obj = eden_top; new_top = obj + size; if new_top > end
+        // (unsigned) -> slow; else commit the bump.
+        self.asm
+            .emit("ldr", &[x(19), mem(28, VMREG_EDEN_TOP_OFFSET as i64)]);
+        self.asm.emit("add", &[x(17), x(19), imm(size_bytes)]);
+        self.asm
+            .emit("ldr", &[x(20), mem(28, VMREG_EDEN_END_OFFSET as i64)]);
+        self.asm.emit("cmp", &[x(17), x(20)]);
+        self.asm.b_cond(Cond::Hi, slow);
+        self.asm
+            .emit("str", &[x(17), mem(28, VMREG_EDEN_TOP_OFFSET as i64)]);
+
+        // Header: pristine Slots mark at [obj+0], klass oop at [obj+8].
+        self.asm
+            .ldr_literal(xr(17), self.literal_ids[self.mark_slots_lit.0 as usize]);
+        self.asm.emit("str", &[x(17), mem(19, 0)]);
+        self.asm
+            .ldr_literal(xr(17), self.literal_ids[klass.0 as usize]);
+        self.asm.emit("str", &[x(17), mem(19, WORD_SIZE as i64)]);
+
+        // Nil-init the named body (slots 2..size_words) -- MANDATORY (D7):
+        // a GC at the next safepoint would scan a garbage body otherwise.
+        let body_words = size_words as usize - HEADER_WORDS;
+        if body_words > 0 {
+            self.asm
+                .ldr_literal(xr(17), self.literal_ids[self.nil_lit.0 as usize]);
+            for i in 0..body_words {
+                let off = ((HEADER_WORDS + i) * WORD_SIZE) as i64;
+                self.asm.emit("str", &[x(17), mem(19, off)]);
+            }
+        }
+
+        // Mem-tag: d = obj + MEM_TAG.
+        self.asm
+            .emit("add", &[Operand::Reg(d), x(19), imm(MEM_TAG as i64)]);
+        self.asm.b(done);
+
+        // Slow path: bl stub_alloc_slow(klass -> x0, size_bytes -> x1) -> x0.
+        self.asm.bind(slow);
+        self.asm
+            .ldr_literal(xr(0), self.literal_ids[klass.0 as usize]);
+        emit_mov_imm64(self.asm, xr(1), size_bytes as u64);
+        self.asm.call_far(self.alloc_slow_lit);
+        if d.num != 0 {
+            self.asm.emit("mov", &[Operand::Reg(d), x(0)]);
+        }
+
+        self.asm.bind(done);
+        self.commit(dst, d);
     }
 
     fn emit_smi_cmp_br(
@@ -706,6 +796,7 @@ pub fn emit(
     regalloc: &RegallocResult,
     stub_poll_addr: u64,
     must_be_boolean_addr: u64,
+    alloc_slow_addr: u64,
     guard: Option<EntryGuard>,
 ) -> (CodeBlob, Vec<BlockPc>, u32, Vec<EmittedIcSite>) {
     let literal_ids = intern_pool(asm, method);
@@ -719,6 +810,7 @@ pub fn emit(
     let epilogue = asm.new_label();
     let stub_poll_lit = asm.literal_u64(stub_poll_addr, Some(RelocKind::RuntimeAddr));
     let must_be_boolean_lit = asm.literal_u64(must_be_boolean_addr, Some(RelocKind::RuntimeAddr));
+    let alloc_slow_lit = asm.literal_u64(alloc_slow_addr, Some(RelocKind::RuntimeAddr));
 
     if let Some(g) = &guard {
         emit_entry_guard(asm, g);
@@ -733,8 +825,11 @@ pub fn emit(
         epilogue,
         true_lit: method.true_lit,
         false_lit: method.false_lit,
+        nil_lit: method.nil_lit,
+        mark_slots_lit: method.mark_slots_lit,
         stub_poll_lit,
         must_be_boolean_lit,
+        alloc_slow_lit,
         call_sites: &method.call_sites,
         ic_sites: Vec::new(),
     };
@@ -879,9 +974,11 @@ fn emit_ir(e: &mut Emitter, ir: &Ir, next_in_order: Option<BlockId>) {
             stub,
             ref args,
         } => e.emit_call_runtime(dst, stub, args),
-        Ir::Alloc { .. } => {
-            unreachable!("S11 step 8's own Ir variant; not constructed until then")
-        }
+        Ir::Alloc {
+            dst,
+            klass,
+            size_words,
+        } => e.emit_alloc(dst, klass, size_words),
         Ir::Poll => e.emit_poll(),
         Ir::Ret { val } => {
             match e.assignment_of(val) {
@@ -976,6 +1073,8 @@ mod tests {
             safepoints: Vec::new(),
             true_lit: PoolLit(0),
             false_lit: PoolLit(0),
+            nil_lit: PoolLit(0),
+            mark_slots_lit: PoolLit(0),
             call_sites: Vec::new(),
         }
     }
@@ -1066,7 +1165,7 @@ mod tests {
         let ra = regalloc::regalloc(&method);
         let mut asm = JasmAssembler::new();
         let (_blob, block_pcs, _verified_entry_off, _ic_sites) =
-            emit(&mut asm, &method, &ra, 0, 0, None);
+            emit(&mut asm, &method, &ra, 0, 0, 0, None);
 
         assert_eq!(
             block_pcs.len(),
@@ -1142,7 +1241,8 @@ mod tests {
         let method = hand_method(vec![block0, block1], vregs, 2);
         let ra = regalloc::regalloc(&method);
         let mut asm = JasmAssembler::new();
-        let (blob, _pcs, _verified_entry_off, _ic_sites) = emit(&mut asm, &method, &ra, 0, 0, None);
+        let (blob, _pcs, _verified_entry_off, _ic_sites) =
+            emit(&mut asm, &method, &ra, 0, 0, 0, None);
 
         let mnemonics: Vec<&str> = blob.listing.iter().map(|l| mnemonic(l)).collect();
         let asr_pos = mnemonics.iter().position(|&m| m == "asr");
@@ -1212,7 +1312,8 @@ mod tests {
         let near = make(30);
         let ra = regalloc::regalloc(&near);
         let mut asm = JasmAssembler::new();
-        let (blob, _pcs, _verified_entry_off, _ic_sites) = emit(&mut asm, &near, &ra, 0, 0, None);
+        let (blob, _pcs, _verified_entry_off, _ic_sites) =
+            emit(&mut asm, &near, &ra, 0, 0, 0, None);
         let near_mnemonics: Vec<String> = blob.listing.iter().map(|l| mnemonic(l)).collect();
         assert!(
             near_mnemonics.iter().any(|m| m == "ldur"),
@@ -1229,7 +1330,7 @@ mod tests {
         let ra2 = regalloc::regalloc(&far);
         let mut asm2 = JasmAssembler::new();
         let (blob2, _pcs2, _verified_entry_off2, _ic_sites2) =
-            emit(&mut asm2, &far, &ra2, 0, 0, None);
+            emit(&mut asm2, &far, &ra2, 0, 0, 0, None);
         let mnemonics: Vec<String> = blob2.listing.iter().map(|l| mnemonic(l)).collect();
         assert!(
             mnemonics.iter().any(|m| m == "sub"),
@@ -1285,7 +1386,7 @@ mod tests {
         let ra = regalloc::regalloc(&with_barrier);
         let mut asm = JasmAssembler::new();
         let (blob, _pcs, _verified_entry_off, _ic_sites) =
-            emit(&mut asm, &with_barrier, &ra, 0, 0, None);
+            emit(&mut asm, &with_barrier, &ra, 0, 0, 0, None);
         let mnemonics: Vec<String> = blob.listing.iter().map(|l| mnemonic(l)).collect();
         assert!(
             mnemonics.iter().any(|m| m == "stur" || m == "str"),
@@ -1307,7 +1408,7 @@ mod tests {
         let ra2 = regalloc::regalloc(&without_barrier);
         let mut asm2 = JasmAssembler::new();
         let (blob2, _pcs2, _verified_entry_off2, _ic_sites2) =
-            emit(&mut asm2, &without_barrier, &ra2, 0, 0, None);
+            emit(&mut asm2, &without_barrier, &ra2, 0, 0, 0, None);
         let mnemonics2: Vec<String> = blob2.listing.iter().map(|l| mnemonic(l)).collect();
         assert!(
             mnemonics2.iter().any(|m| m == "stur" || m == "str"),
@@ -1318,6 +1419,96 @@ mod tests {
             !mnemonics2.iter().any(|m| m == "strb"),
             "barrier:false must NOT emit any card-dirtying strb -- got:\n{}",
             blob2.listing.join("\n")
+        );
+    }
+
+    /// S11 D7: `alloc_fast_path_layout` — pins the inline-alloc sequence's
+    /// shape AND its register discipline (the ABI-correctness the whole
+    /// step stands on). A single 4-word (2 header + 2 body) `Slots` alloc,
+    /// dst kept live by a `Ret`.
+    #[test]
+    fn alloc_fast_path_layout() {
+        use crate::compiler::assembler::RelocKind;
+        use crate::compiler::ir::PoolEntry;
+        // pool[0]=nil, [1]=mark(raw imm), [2]=klass oop.
+        let method = IrMethod {
+            blocks: vec![IrBlock {
+                id: BlockId(0),
+                bci: 0,
+                code: vec![
+                    Ir::Alloc {
+                        dst: VReg(0),
+                        klass: PoolLit(2),
+                        size_words: 4,
+                    },
+                    Ir::Ret { val: VReg(0) },
+                ],
+                entry_stack: Vec::new(),
+            }],
+            vregs: vec![VRegInfo { is_oop: true }],
+            pool: vec![
+                PoolEntry {
+                    value: 0x1111,
+                    kind: Some(RelocKind::Oop),
+                },
+                PoolEntry {
+                    value: 0x2222,
+                    kind: None,
+                },
+                PoolEntry {
+                    value: 0x3333,
+                    kind: Some(RelocKind::Oop),
+                },
+            ],
+            argc: 0,
+            ntemps: 0,
+            safepoints: Vec::new(),
+            true_lit: PoolLit(0),
+            false_lit: PoolLit(0),
+            nil_lit: PoolLit(0),
+            mark_slots_lit: PoolLit(1),
+            call_sites: Vec::new(),
+        };
+        let ra = regalloc::regalloc(&method);
+        let mut asm = JasmAssembler::new();
+        let (blob, _pcs, _ve, _ic) = emit(&mut asm, &method, &ra, 0, 0, 0xAABB, None);
+        let listing = blob.listing.join("\n");
+        let mnemonic = |l: &str| l.split_whitespace().nth(2).unwrap_or("").to_string();
+        let mnemonics: Vec<String> = blob.listing.iter().map(|l| mnemonic(l)).collect();
+
+        // Fast path: eden_top + eden_end loads, bounds cmp, conditional
+        // slow branch, the committed str back to eden_top, header+body
+        // stores, mem-tagging add. Slow path ends in a blr (call_far).
+        assert!(
+            mnemonics.iter().filter(|m| *m == "ldr").count() >= 2,
+            "eden_top + eden_end loads:\n{listing}"
+        );
+        assert!(
+            mnemonics.iter().any(|m| m == "cmp"),
+            "bounds cmp:\n{listing}"
+        );
+        assert!(
+            mnemonics.iter().any(|m| m.starts_with("b.")),
+            "conditional slow branch:\n{listing}"
+        );
+        assert!(
+            mnemonics.iter().filter(|m| *m == "str").count() >= 4,
+            "commit + mark + klass + 2 body stores (>=4 str):\n{listing}"
+        );
+        assert!(
+            mnemonics.iter().any(|m| m == "blr"),
+            "slow-path call:\n{listing}"
+        );
+        // ABI: the object base must NOT be x16 (dest_target's spilled-dst
+        // reg) and must be a callee-saved scratch (x19); eden loads/stores
+        // are x28-relative. Assert the base register is x19, never x16/x18.
+        assert!(
+            listing.contains("num: 19"),
+            "obj base must be x19 (callee-saved scratch), never x16/x18:\n{listing}"
+        );
+        assert!(
+            !listing.contains("num: 18"),
+            "x18 is the Darwin platform register -- must never appear:\n{listing}"
         );
     }
 
@@ -1350,7 +1541,7 @@ mod tests {
             resolve_addr: 0x3000,
         };
         let (blob, _pcs, verified_entry_off, _ic_sites) =
-            emit(&mut asm, &method, &ra, 0, 0, Some(guard));
+            emit(&mut asm, &method, &ra, 0, 0, 0, Some(guard));
 
         // `verified_entry_off` must land exactly on the S10-era prologue's
         // own first instruction (`stp x29,x30,...`) -- found empirically in
@@ -1466,6 +1657,8 @@ mod tests {
             safepoints: Vec::new(),
             true_lit: PoolLit(0),
             false_lit: PoolLit(0),
+            nil_lit: PoolLit(0),
+            mark_slots_lit: PoolLit(0),
             call_sites: vec![
                 CallSiteInfo {
                     selector: test_selector(b"foo"),
@@ -1486,7 +1679,8 @@ mod tests {
         };
         let ra = regalloc::regalloc(&method);
         let mut asm = JasmAssembler::new();
-        let (blob, _pcs, _verified_entry_off, ic_sites) = emit(&mut asm, &method, &ra, 0, 0, None);
+        let (blob, _pcs, _verified_entry_off, ic_sites) =
+            emit(&mut asm, &method, &ra, 0, 0, 0, None);
 
         assert_eq!(
             ic_sites.len(),

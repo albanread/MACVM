@@ -189,10 +189,11 @@ fn eligibility_detail(vm: &VmState, method: MethodOop) -> Eligibility {
 
 /// D1 point 2: `ic_idx`'s own site must already be `Mono`, guarded on
 /// `SmallInteger`, targeting a method whose primitive is in [`SMI_INLINE`]
-/// — anything else (`Empty`, `Poly`, `Mega`, a non-smi guard, or a mono-smi
-/// target whose primitive isn't fusable) keeps this method interpreted.
-/// See `eligibility_detail`'s own doc for why this stays narrower than D1's
-/// full "arbitrary send in any IC state" text for now.
+/// — OR (S11 D7) a mono `basicNew` site, which `ir.rs` compiles to an
+/// inline `Ir::Alloc`. Anything else (`Empty`, `Poly`, `Mega`, a non-smi
+/// non-basicNew guard, or a mono-smi target whose primitive isn't fusable)
+/// keeps this method interpreted. See `eligibility_detail`'s own doc for why
+/// this stays narrower than D1's full "arbitrary send in any IC state" text.
 fn mono_smi_inline_send(vm: &VmState, method: MethodOop, ic_idx: u16) -> Eligibility {
     match ic_state(method, ic_idx) {
         IcState::Empty => return Eligibility::NoRetryLater,
@@ -200,12 +201,23 @@ fn mono_smi_inline_send(vm: &VmState, method: MethodOop, ic_idx: u16) -> Eligibi
         IcState::Poly(_) | IcState::Mega => return Eligibility::NoPermanent,
     }
     let site = InterpreterIc::at(method, ic_idx);
-    if site.guard().raw() != vm.universe.smi_klass.oop().raw() {
-        return Eligibility::NoPermanent; // mono but non-smi guard
-    }
     let Some(target) = MethodOop::try_from(site.target()) else {
         return Eligibility::NoPermanent;
     };
+    // S11 D7: a mono `basicNew` site clears eligibility. `ir.rs` turns it
+    // into an inline `Ir::Alloc` when the receiver is a compile-time Slots
+    // class constant, else an ordinary generic send to the basicNew
+    // PRIMITIVE — which allocates and returns WITHOUT re-entering the
+    // interpreter's bytecode (a shallow c2i-to-primitive hop, not the deep
+    // block-activation reentrancy the broader D1 relaxation reverted in
+    // step 7 was tripping on), so admitting it here is safe. `argc == 0`:
+    // `basicNew:` (prim 24, indexable) is a different, non-inlined thing.
+    if target.primitive() == crate::compiler::ir::PRIM_BASIC_NEW && site.argc() == 0 {
+        return Eligibility::Yes;
+    }
+    if site.guard().raw() != vm.universe.smi_klass.oop().raw() {
+        return Eligibility::NoPermanent; // mono but non-smi guard
+    }
     if SMI_INLINE.contains(&target.primitive()) {
         Eligibility::Yes
     } else {
@@ -263,6 +275,7 @@ pub fn compile_method(
     let mut asm = JasmAssembler::new();
     let stub_poll_addr = vm.stubs.stub_poll_addr();
     let must_be_boolean_addr = vm.stubs.must_be_boolean_addr();
+    let alloc_slow_addr = vm.stubs.alloc_slow_addr();
     let guard = emit::EntryGuard {
         smi_klass_bits: vm.universe.smi_klass.oop().raw(),
         key_klass_bits: rcvr_klass.oop().raw(),
@@ -274,6 +287,7 @@ pub fn compile_method(
         &regalloc_result,
         stub_poll_addr,
         must_be_boolean_addr,
+        alloc_slow_addr,
         Some(guard),
     );
 

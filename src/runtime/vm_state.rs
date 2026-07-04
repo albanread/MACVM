@@ -426,6 +426,29 @@ pub struct VmState {
 }
 
 impl VmState {
+    /// S11 D8: hand the interpreter's authoritative eden bump pointer +
+    /// bounds to compiled code (which allocates by bumping
+    /// `reg_block.eden_top` directly in its inline-alloc fast path). Called
+    /// at the OUTERMOST `enter_compiled` (compiled_depth 0→1). Publishes
+    /// BOTH fields because a GC or old-gen growth between compiled windows
+    /// can have moved eden's bounds since the last publish.
+    pub(crate) fn publish_eden_to_regblock(&mut self) {
+        self.reg_block.eden_top = self.universe.eden.top as u64;
+        self.reg_block.eden_end = self.universe.eden.end as u64;
+    }
+
+    /// S11 D8: reclaim compiled code's eden bump progress back into the
+    /// interpreter's authoritative `eden.top`. Called at the OUTERMOST exit
+    /// (compiled_depth 1→0). Sound only because the D8 bridge froze
+    /// `eden.top` for the whole compiled window (every Rust allocation
+    /// under `compiled_depth > 0` went old-direct — `alloc::alloc_words`),
+    /// so `reg_block.eden_top` is the sole party that advanced the nursery.
+    /// `eden_end` is NOT copied back: eden's ceiling can't move while the
+    /// window holds (no GC/growth of the young gen under a compiled frame).
+    pub(crate) fn adopt_eden_from_regblock(&mut self) {
+        self.universe.eden.top = self.reg_block.eden_top as usize;
+    }
+
     /// Parses options from the environment once and boots a fresh universe.
     pub fn new() -> VmState {
         let mut vm = Self::with_options(VmOptions::from_env());
@@ -443,8 +466,10 @@ impl VmState {
         let universe = Universe::genesis(&options);
         // S11 D3/P7: `old_start`/`card_base_biased` are fixed for the
         // whole process lifetime, set ONCE here — unlike `eden_top`/
-        // `eden_end` (S11 step 8, refreshed every scavenge), old gen's own
-        // `bounds.start` never moves (`OldGen::grow` only advances
+        // `eden_end` (S11 step 8, re-published into the reg block at every
+        // outermost `enter_compiled` via `publish_eden_to_regblock`, since
+        // a GC between compiled windows can move eden's bounds), old gen's
+        // own `bounds.start` never moves (`OldGen::grow` only advances
         // `committed_end`, never `bounds.start` itself, `spaces.rs`'s own
         // doc), and the card table is sized for old's FULL reserved range
         // at genesis (never regrown either) — so there is no later point
@@ -690,6 +715,36 @@ mod tests {
             vm.reg_block.card_base_biased,
             vm.universe.cards.base_biased(),
             "card_base_biased must mirror CardTable's own bias formula exactly"
+        );
+    }
+
+    /// S11 D8 eden sync: `publish_eden_to_regblock` copies both eden fields
+    /// out, and `adopt_eden_from_regblock` copies the (compiled-bumped)
+    /// `eden_top` back into the interpreter's authoritative `eden.top`.
+    #[test]
+    fn eden_publish_adopt_round_trip() {
+        let mut vm = VmState::with_options(VmOptions::default());
+
+        // Before the first publish, the reg-block eden fields are dead zeros
+        // (nothing runs compiled at genesis).
+        assert_eq!(vm.reg_block.eden_top, 0);
+        assert_eq!(vm.reg_block.eden_end, 0);
+
+        vm.publish_eden_to_regblock();
+        assert_eq!(vm.reg_block.eden_top, vm.universe.eden.top as u64);
+        assert_eq!(vm.reg_block.eden_end, vm.universe.eden.end as u64);
+        assert_ne!(vm.reg_block.eden_top, 0, "a real eden has a non-zero top");
+
+        // Compiled code bumps eden_top directly (5 four-word objects).
+        let bumped = vm.universe.eden.top as u64 + 5 * 32;
+        vm.reg_block.eden_top = bumped;
+        // The interpreter's own eden.top hasn't moved yet (frozen mid-window).
+        assert_ne!(vm.universe.eden.top as u64, bumped);
+
+        vm.adopt_eden_from_regblock();
+        assert_eq!(
+            vm.universe.eden.top as u64, bumped,
+            "adopt must reclaim compiled code's bump progress into eden.top"
         );
     }
 }
