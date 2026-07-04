@@ -12,6 +12,7 @@
 use std::collections::HashMap;
 
 use crate::compiler::ir::{BlockId, Ir, IrBlock, IrMethod, VReg};
+use crate::compiler::scopes::SafepointKind;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Assignment {
@@ -48,7 +49,13 @@ pub struct LiveInterval {
 fn is_safepoint(ir: &Ir) -> bool {
     matches!(
         ir,
-        Ir::CallSend { .. } | Ir::CallRuntime { .. } | Ir::Alloc { .. }
+        // S13 step 7b: `UncommonTrap` is a safepoint too — every oop live
+        // across it (the re-executing send's `a`/`b`/`self`, kept live by the
+        // fail block's `DeoptRaw.stack`) must be spilled (spill-all) and get
+        // an OopMap, exactly like a call, so the deopt materializer can read
+        // them from the frame. Its position keys BOTH the S12 OopMap and the
+        // S13 deopt scope at the brk offset.
+        Ir::CallSend { .. } | Ir::CallRuntime { .. } | Ir::Alloc { .. } | Ir::UncommonTrap { .. }
     )
 }
 
@@ -188,13 +195,53 @@ pub fn compute_intervals(method: &IrMethod) -> (Vec<BlockId>, Vec<LiveInterval>,
     let mut max_use: HashMap<u32, u32> = HashMap::new();
     let mut block_start_pos: HashMap<u32, u32> = HashMap::new();
     let mut block_end_pos: HashMap<u32, u32> = HashMap::new();
+    // S13 step 7b: every vreg an UNCOMMON-TRAP deopt site reads must be LIVE
+    // ACROSS its safepoint (spilled to a frame slot the materializer can
+    // read), not merely live UP TO it. `driver::build_deopt_metadata` resolves,
+    // for each site: the receiver (VReg 0), every arg/temp slot
+    // (VReg 1..=argc+ntemps), and the recorded operand `stack` — so all three
+    // must cross. This matters for a reexecute UncommonTrap because its fail
+    // block has NO fall-through and is linearized LAST (a DFS dead end), so
+    // NOTHING is naturally live across it: a value "used after the send" is
+    // used in the CONTINUATION block, which linearizes BEFORE the trap, so its
+    // interval ends before the trap position, it keeps a register, and it
+    // would resolve to Nil — a silently-wrong deopt. Collected here (with the
+    // safepoint's own position) and forced to `end > pos` below, so
+    // `crosses_safepoint` fires and spill-all pins them.
+    //
+    // Scoped to `UncommonTrap` ONLY: `Call`/`Alloc` deopt sites (S13 step 3b)
+    // sit inline in a block whose successors run AFTER them, so their recorded
+    // vregs are already naturally live-across (used later) and already spilled;
+    // widening THOSE would spill genuinely-dead values (a call-return site's
+    // popped receiver/args, an Alloc's class const) into their OopMaps,
+    // needlessly enlarging them and disturbing S12's GC-root tests — and is
+    // unnecessary, since natural liveness already covers exactly what those
+    // sites read.
+    let mut deopt_live: Vec<(u32, u32)> = Vec::new(); // (vreg, safepoint pos)
+    let n_slots = method.argc as u32 + method.ntemps as u32;
 
     for &bid in &block_order {
         let block = &method.blocks[bid.0 as usize];
         block_start_pos.insert(bid.0, pos);
-        for ir in &block.code {
+        for (idx, ir) in block.code.iter().enumerate() {
             if is_safepoint(ir) {
                 safepoint_positions.push(pos);
+            }
+            if let Some((_, raw)) = block
+                .deopt_sites
+                .iter()
+                .find(|(ci, raw)| *ci == idx as u32 && raw.kind == SafepointKind::UncommonTrap)
+            {
+                // Receiver (0) + every unified arg/temp slot + the recorded
+                // operand stack are exactly the vregs the driver resolves for
+                // this site.
+                deopt_live.push((0, pos));
+                for s in 1..=n_slots {
+                    deopt_live.push((s, pos));
+                }
+                for &v in &raw.stack {
+                    deopt_live.push((v.0, pos));
+                }
             }
             ir.uses(|v| {
                 max_use
@@ -266,6 +313,23 @@ pub fn compute_intervals(method: &IrMethod) -> (Vec<BlockId>, Vec<LiveInterval>,
                     changed = true;
                 }
             }
+        }
+    }
+
+    // S13 step 7b: force every deopt-referenced vreg to live STRICTLY ACROSS
+    // its safepoint (`end > pos`), so `crosses_safepoint` fires and spill-all
+    // pins it to a canonical frame slot the deopt materializer reads (see
+    // `deopt_live`'s own doc above). Applied AFTER loop-widening (which only
+    // ever extends), so this is the final word on each interval's end. A vreg
+    // referenced only here (never defined by any op — a slot for an argument
+    // that the body never touches) still needs a `min_def`, so seed it at 0
+    // (the entry `Param`/`ConstPool` that establishes every slot always runs
+    // first).
+    for &(v, sp_pos) in &deopt_live {
+        min_def.entry(v).or_insert(0);
+        let e = max_use.entry(v).or_insert(sp_pos + 1);
+        if *e <= sp_pos {
+            *e = sp_pos + 1;
         }
     }
 

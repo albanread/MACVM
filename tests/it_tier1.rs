@@ -489,21 +489,152 @@ fn compiled_plus_arg_executes_correctly() {
     let result = unsafe { call(entry, vm_ptr, argv.as_ptr(), 2) };
     assert_eq!(result, SmallInt::new(42).oop().raw(), "5 + 37 = 42");
 
-    // Overflowing operands must not crash or silently wrap. S11 step 7:
-    // the overflow check's fail edge is a real generic send now (not a
-    // bailout sentinel) -- it reaches the installed '+' fallback (`^self`),
-    // so the compiled entry returns normally with the receiver's own value.
-    // Both individually valid smis (SMI_MAX itself), but their sum isn't.
-    let big = macvm::oops::smi::SmallInt::MAX;
-    let argv_overflow = [
-        SmallInt::new(big).oop().raw(),
-        SmallInt::new(big).oop().raw(),
-    ];
-    let overflow_result = unsafe { call(entry, vm_ptr, argv_overflow.as_ptr(), 2) };
+    // S13 step 7b: the OVERFLOW case now emits a real deopt `brk #0xDE00`,
+    // which requires a live SIGTRAP handler (armed only under a JIT `VmState`,
+    // not this `JitMode::Off` one). The organic trap → deopt → interpret path
+    // for an overflowing smi add is exercised by
+    // `compiled_smi_overflow_deopts_to_interpreter` below (which uses a
+    // JIT-armed VM). This test keeps only the fast (non-overflowing) path.
+}
+
+/// S13 step 7b FLAGSHIP (the gate): the FIRST time a `brk` fires from real
+/// compiled code under a real SIGTRAP. A compiled `^self + arg` whose smi-add
+/// overflows traps (`brk #0xDE00`), the handler redirects to the uncommon
+/// trampoline, `rt_uncommon_trap` deoptimizes the frame, and the re-executing
+/// send completes IN THE INTERPRETER — its result must equal what the pure
+/// interpreter produces for the SAME send (a true differential), and
+/// `deopt_count` must bump (proving the brk actually fired, not a silent
+/// fast-path wrap). The whole handler/trampoline/materialize/interpret chain
+/// is on trial here.
+///
+/// The fallback `+` returns the ARGUMENT (`^arg`), and the two overflowing
+/// operands are DISTINCT (`MAX` and `MAX-7`) — so a deopt that read the wrong
+/// frame slot (receiver vs arg, or a stale/unspilled input) would return `a`
+/// instead of `b` and fail, not merely "not crash". This is what pins the
+/// reexecute operand-stack correctness (`[a, b]` recorded at the send bci).
+#[test]
+fn compiled_smi_overflow_deopts_to_interpreter() {
+    // JIT-armed VmState: `deopt_trap::install` arms the process-global SIGTRAP
+    // handler and registers this VM's code-cache range, so a `brk` from the
+    // method we compile below is recognised and redirected (a `JitMode::Off`
+    // VM installs no handler — the brk would just kill the process).
+    let mut vm = VmState::with_options(VmOptions {
+        heap_mib: 64,
+        trace: Default::default(),
+        gc_stress: false,
+        gc_stress_full_period: None,
+        eden_kb: None,
+        jit: JitMode::Threshold(1),
+    });
+    let plus_sel = vm.universe.intern(b"+");
+    let smi_klass = vm.universe.smi_klass;
+
+    // The compiled method under test: `plusArg: arg [ ^self + arg ]`.
+    let mut b = BytecodeBuilder::new();
+    b.push_self();
+    b.push_temp(0);
+    b.send(&mut vm, plus_sel, 1);
+    b.ret_tos();
+    let m_sel = vm.universe.intern(b"plusArg:");
+    let method = b.finish(&mut vm, m_sel, 1, 0);
+
+    // The `+` FALLBACK the deopt re-executes into: primitive 1 (`prim_add`,
+    // which Fails on overflow), `prim_fails=true`, body `^arg` (returns the
+    // SECOND operand). Real bignum promotion isn't installed in a bare
+    // `test_vm()` (it lives in `world/06_smallinteger.mst`); `^arg` is a
+    // deterministic, operand-discriminating stand-in — exactly the shape
+    // `interpreter::send::tests::install_smi_plus` uses for the same reason.
+    let plus_fallback = {
+        let mut pb = BytecodeBuilder::new();
+        pb.push_temp(0); // ^arg
+        pb.ret_tos();
+        let m = pb.finish(&mut vm, plus_sel, 1, 0);
+        m.set_primitive(1);
+        m.set_flags(1, 0, false, false, true, false, 0); // prim_fails = true
+        m
+    };
+    // Seed THIS site's inline cache (for eligibility/inlining) AND install the
+    // fallback in smi_klass's real dictionary (what `lookup` walks when the
+    // deopt re-executes the send interpreted — a separate thing from the IC).
+    let epoch = vm.ic_epoch;
+    InterpreterIc::at(method, 0).set_mono(&mut vm, smi_klass, plus_fallback, epoch);
+    install_method(&mut vm, smi_klass, plus_sel, plus_fallback);
+
+    assert!(
+        driver::eligible(&vm, method),
+        "self + arg, mono smi IC, must be eligible"
+    );
+    let id = driver::compile_method(&mut vm, smi_klass, method).expect("must compile");
+    // The compiled method genuinely gained a deopt site (its smi fail edge), so
+    // `ir::convert` interned its own MethodOop — the nmethod carries deopt
+    // metadata the materializer needs.
+    assert!(
+        !vm.code_table
+            .get(id)
+            .expect("installed")
+            .deopt_pcdescs
+            .is_empty(),
+        "a smi-overflow method must carry at least one deopt PcDesc (the trap site)"
+    );
+
+    // Two DISTINCT operands, each a valid smi, whose sum overflows.
+    let big = SmallInt::MAX;
+    let a = SmallInt::new(big);
+    let b_arg = SmallInt::new(big - 7);
+
+    // Interpreter reference: run the SAME method purely interpreted. The `+`
+    // primitive Fails (overflow), the fallback `^arg` runs, yielding `b_arg`.
+    let interp_result = macvm::interpreter::run_method(&mut vm, method, a.oop(), &[b_arg.oop()]);
     assert_eq!(
-        overflow_result,
-        SmallInt::new(big).oop().raw(),
-        "overflowing smi add falls back to the real '+' send, which returns self here"
+        interp_result.raw(),
+        b_arg.oop().raw(),
+        "pure-interpreter reference: overflowing '+' falls back to '^arg' = the second operand"
+    );
+
+    let nm = vm.code_table.get(id).expect("installed nmethod");
+    let entry = unsafe { nm.code.base.add(nm.entry_off as usize) } as u64;
+    let call: CallStubFn = unsafe { std::mem::transmute(vm.stubs.call_stub_entry()) };
+    let vm_ptr: *mut VmState = &mut vm;
+
+    // Fast path first (no overflow, no trap): 5 + 37 = 42, straight-line.
+    let fast_argv = [SmallInt::new(5).oop().raw(), SmallInt::new(37).oop().raw()];
+    let fast = unsafe { call(entry, vm_ptr, fast_argv.as_ptr(), 2) };
+    assert_eq!(
+        fast,
+        SmallInt::new(42).oop().raw(),
+        "fast path: 5 + 37 = 42"
+    );
+    let deopts_after_fast = unsafe { (*vm_ptr).stats.deopt_count };
+
+    // THE organic trap: overflowing operands. brk -> SIGTRAP -> handler ->
+    // uncommon trampoline -> rt_uncommon_trap -> deoptimize_frame ->
+    // interpret_active -> result back through call_stub.
+    let deopts_before = deopts_after_fast;
+    let ovf_argv = [a.oop().raw(), b_arg.oop().raw()];
+    let deopt_result = unsafe { call(entry, vm_ptr, ovf_argv.as_ptr(), 2) };
+    let deopts_after = unsafe { (*vm_ptr).stats.deopt_count };
+
+    assert_eq!(
+        deopt_result,
+        interp_result.raw(),
+        "the deopt path must produce the IDENTICAL result to the pure interpreter for the \
+         same overflowing send (differential equivalence)"
+    );
+    assert_eq!(
+        deopt_result,
+        b_arg.oop().raw(),
+        "and specifically the SECOND operand (the arg), proving the reexecute stack `[a, b]` \
+         resolved to the right frame slots"
+    );
+    assert_eq!(
+        deopts_after,
+        deopts_before + 1,
+        "exactly one deopt must have been counted (the brk actually fired)"
+    );
+    // The fast path must NOT have deopted.
+    assert_eq!(
+        deopts_after_fast, 0,
+        "the non-overflowing fast path never traps"
     );
 }
 
@@ -588,29 +719,13 @@ fn compiled_frame_teardown_exact() {
     );
     assert_eq!(vm.stack.pop(), SmallInt::new(42).oop());
 
-    // Overflowing operands -- the smi-add fails its own overflow check and
-    // falls through to the installed '+' fallback (`^self`) via a real
-    // generic send, S11 step 7 -- NOT a bailout anymore.
-    let big = SmallInt::new(SmallInt::MAX);
-    vm.stack.push(big.oop());
-    vm.stack.push(big.oop());
-    let sp_before2 = native_sp();
-    let result2 = macvm::interpreter::compiled_call::enter_compiled(&mut vm, id, 1);
-    let sp_after2 = native_sp();
-    assert_eq!(
-        sp_before2, sp_after2,
-        "native sp must be exactly restored via the fail-edge's real send too -- same shared epilogue"
-    );
-    assert_eq!(
-        result2,
-        macvm::interpreter::compiled_call::EnterResult::Completed,
-        "S11 step 7: the fail edge completes normally (a real send), it never bails out"
-    );
-    assert_eq!(
-        vm.stack.pop(),
-        big.oop(),
-        "the fallback '+' (^self) returns the receiver -- the same value pushed twice above"
-    );
+    // S13 step 7b: the OVERFLOW fail edge is now a deopt `brk`, needing a live
+    // SIGTRAP handler (a JIT-armed VmState). Native-sp restoration ACROSS a
+    // deopt (the trampoline discards the whole compiled frame and returns to
+    // the native caller) is checked in
+    // `compiled_smi_overflow_deopts_to_interpreter` below; the fast-path
+    // teardown this test targets is fully proven by the non-overflow half
+    // above.
 }
 
 // ── Listing goldens (tests_s10.md gate item 2, integration item 1) ────────

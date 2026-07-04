@@ -759,6 +759,30 @@ impl<'a> Emitter<'a> {
         self.commit(dst, d);
     }
 
+    /// S13 step 7b (D3, the first "organic trap client"): lower an
+    /// `Ir::UncommonTrap` to a `brk #0xDE00`. Unlike `emit_call_send`/
+    /// `emit_alloc`, whose safepoint keys on a RETURN address (the pc AFTER
+    /// the `bl`), a trap keys on the `brk` instruction's OWN offset — the
+    /// trapping pc IS the brk (the SIGTRAP handler reads `__pc` = this exact
+    /// offset). So record `pc_off = self.asm.offset()` BEFORE emitting the
+    /// brk (not after). The driver's existing oopmap loop + `build_deopt_
+    /// metadata` both iterate `safepoints`/`deopt_sites` keyed by this same
+    /// `position`, so this one `SafepointPc` push gets the trap BOTH an OopMap
+    /// (S12) and a deopt scope (S13), correlated at the brk offset. No result,
+    /// no fall-through — control leaves the method via the trap.
+    fn emit_uncommon_trap(&mut self) {
+        let pc_off = self.asm.offset();
+        self.safepoints.push(SafepointPc {
+            pc_off,
+            bci: self.current_bci,
+            position: self.pos,
+        });
+        crate::codecache::deopt_trap::emit_brk(
+            self.asm,
+            crate::codecache::deopt_trap::TRAP_UNCOMMON,
+        );
+    }
+
     /// S11 D6.3: the per-call-site NLR-escape check (P10's "2 words per
     /// site", v1: after EVERY send/runtime call unconditionally). A callee
     /// that was unwound by a non-local return hands back the `NLR_SENTINEL`
@@ -1110,6 +1134,7 @@ fn emit_ir(e: &mut Emitter, ir: &Ir, next_in_order: Option<BlockId>) {
             size_words,
         } => e.emit_alloc(dst, klass, size_words),
         Ir::Poll => e.emit_poll(),
+        Ir::UncommonTrap { .. } => e.emit_uncommon_trap(),
         Ir::Ret { val } => {
             match e.assignment_of(val) {
                 Assignment::Reg(r) => {

@@ -216,6 +216,21 @@ pub enum Ir {
     },
     /// Loop back-edge flag check (D5.3); reads `VmRegBlock::poll_flag`.
     Poll,
+    /// S13 step 7b (D3, first "organic trap client"): an uncommon-trap
+    /// terminator — control leaves the compiled method entirely via a
+    /// `brk #0xDE00` (`emit.rs` lowers it), so it has NO `dst` and NO fall-
+    /// through. `emit.rs`'s lowering records ITS OWN offset as a safepoint pc
+    /// (a trap keys on the brk instruction itself, not a return address); the
+    /// SIGTRAP handler → `rt_uncommon_trap` deopts the frame and resumes the
+    /// re-executing send in the interpreter. `bci` is the resume point (the
+    /// failing send's own bci) — carried here so `driver::build_deopt_metadata`
+    /// and the emitted `SafepointPc` agree with the recorded `DeoptRaw.bci`.
+    /// It is a regalloc SAFEPOINT (see `regalloc::is_safepoint`), which is what
+    /// spills every oop live across it (the re-executing send's `a`/`b`/`self`)
+    /// into the frame so the deopt materializer can read them.
+    UncommonTrap {
+        bci: usize,
+    },
     Ret {
         val: VReg,
     },
@@ -269,6 +284,13 @@ impl Ir {
             | Ir::Jump { .. }
             | Ir::Alloc { .. }
             | Ir::Poll
+            // S13 step 7b: an UncommonTrap reads NO vreg directly — the
+            // re-executing send's inputs (`a`/`b`/`self`) are kept live
+            // across it by the fail block's own `DeoptRaw.stack`, not by an
+            // operand of this op, so its liveness comes from `deopt_sites`,
+            // not from `uses` (mirrors how a `CallSend`'s recorded stack, not
+            // its `args`, is what a deopt reads).
+            | Ir::UncommonTrap { .. }
             | Ir::Bailout { .. } => {}
         }
     }
@@ -293,6 +315,7 @@ impl Ir {
             | Ir::GuardKlass { .. }
             | Ir::CallRuntime { dst: None, .. }
             | Ir::Poll
+            | Ir::UncommonTrap { .. }
             | Ir::Ret { .. }
             | Ir::RetSelf
             | Ir::Bailout { .. } => {}
@@ -340,6 +363,20 @@ pub struct DeoptRaw {
     pub bci: usize,
     pub kind: SafepointKind,
     pub reexecute: bool,
+}
+
+/// S13 step 7b: the deopt info a fused comparison (`SmiCmpBr`) carries from
+/// its own smi-inline site (in `translate_instr`) forward to the block's
+/// Branch terminator (in `convert`), where the fail block is actually built.
+/// The fail block's reexecute deopt must resume at the SEND's own `bci` with
+/// `stack` (= `[below..., a, b]`, captured before the send's operand pops)
+/// still present — neither of which is recoverable at the terminator (`bci`
+/// there is the block start, and `a`/`b` were already popped), so both ride
+/// along here.
+#[derive(Clone, Debug)]
+struct PendingCmpDeopt {
+    bci: usize,
+    stack: Vec<VReg>,
 }
 
 pub struct IrMethod {
@@ -700,55 +737,44 @@ impl<'a> Translator<'a> {
     }
 
     /// A smi-inlined op's fail edge (`SmiArith`/`SmiCmpVal`, both mid-block,
-    /// VALUE-PRODUCING ops with no terminator of their own): synthesizes a
-    /// fresh block computing the SAME `dst` via a real, generic `CallSend`
-    /// of `ic_idx`'s own selector (D1: "generic send does the LargeInteger/
-    /// Double fallback via the interpreter callee") over `args`, then
-    /// jumping to a freshly-allocated CONTINUATION block — the caller
-    /// (`convert`'s own per-block loop) is responsible for actually
-    /// finishing the current code vec with a matching `Jump` and starting
-    /// the continuation's own accumulation, since only it holds `code`.
-    /// Returns `(fail_block_id, continuation_block_id)`.
+    /// VALUE-PRODUCING ops with no terminator of their own). S13 step 7b (D3,
+    /// the first "organic trap client"): the fail block is now a single
+    /// `Ir::UncommonTrap{ bci }` — NO `CallSend`, NO jump-to-continuation.
+    /// The deopt transfers control to the interpreter, which re-executes the
+    /// whole send (its LargeInteger/Double fallback) itself, so there is
+    /// nothing to compute back in compiled code and nothing to rejoin.
     ///
-    /// Deliberately builds a FRESH `CallSiteInfo` (no memoization by
-    /// `ic_idx`, unlike this fn's own name might suggest a cache):
-    /// different occurrences of the same `ic_idx` (vanishingly rare in
-    /// straight-line bytecode with no loop unrolling, but not structurally
-    /// impossible) would need DIFFERENT `a`/`b`/`dst` vregs baked into
-    /// their own fail block regardless, so a shared block wouldn't be
-    /// reusable anyway — a second, harmless, duplicate `CallSiteInfo` costs
-    /// nothing a real program would ever notice.
+    /// The FAST-path CONTINUATION block is STILL minted (the `SmiArith`/
+    /// `SmiCmpVal` success falls through to it, exactly as before) — only the
+    /// FAIL block changed. Returns `(fail_block_id, continuation_block_id)`.
+    ///
+    /// The fail block records ONE deopt site (`DeoptRaw`) at its trap op:
+    /// `reexecute = true` at the SEND's bci, with the recorded operand stack
+    /// = `reexec_stack` — the snapshot the caller captured BEFORE popping the
+    /// send's own operands, so `a`/`b` are still on it (see `translate_instr`'s
+    /// smi-inline site). Those live-across vregs are what regalloc spill-all
+    /// pins into the frame for the materializer to read.
     fn fail_and_continue(
         &mut self,
-        ic_idx: u16,
-        args: Vec<VReg>,
-        dst: VReg,
         fail_bci: usize,
+        reexec_stack: Vec<VReg>,
     ) -> (BlockId, BlockId) {
-        let ic_view = InterpreterIc::at(self.method, ic_idx);
-        let site = self.call_sites.len() as u16;
-        self.call_sites.push(CallSiteInfo {
-            selector: ic_view.selector(),
-            argc: ic_view.argc() + 1,
-            static_klass: None,
-        });
         let continuation_id = self.fresh_block_id();
         let fail_id = self.fresh_block_id();
         self.finish_block(IrBlock {
             id: fail_id,
             bci: fail_bci,
-            code: vec![
-                Ir::CallSend { dst, site, args },
-                Ir::Jump {
-                    target: continuation_id,
-                },
-            ],
+            code: vec![Ir::UncommonTrap { bci: fail_bci }],
             entry_stack: Vec::new(),
-            // The synthesized smi-fallback / not-boolean blocks record no
-            // deopt sites in v1 (S13 step 3b): their CallSend/CallRuntime
-            // safepoints can't deopt until step 7 turns them into real trap
-            // clients, so the driver simply finds nothing to attach here.
-            deopt_sites: Vec::new(),
+            deopt_sites: vec![(
+                0,
+                DeoptRaw {
+                    stack: reexec_stack,
+                    bci: fail_bci,
+                    kind: SafepointKind::UncommonTrap,
+                    reexecute: true,
+                },
+            )],
         });
         (fail_id, continuation_id)
     }
@@ -792,50 +818,37 @@ impl<'a> Translator<'a> {
         not_bool_id
     }
 
-    /// `SmiCmpBr`'s own fail edge (the FUSED compare+branch case): unlike
-    /// `fail_and_continue`, `if_true`/`if_false` are already real CFG
-    /// targets (this fires only at a block's own Branch terminator), so no
-    /// continuation split is needed — just a fresh block sending the real
-    /// comparison selector, then branching on ITS result exactly like an
-    /// ordinary `BoolBr` (including the SAME `not_bool` retry-loop
-    /// treatment, via [`Self::fresh_not_bool_block`], if the receiver's own
-    /// `<`/`=`/etc. override doesn't return a real boolean either).
-    fn fail_and_branch(
-        &mut self,
-        ic_idx: u16,
-        args: Vec<VReg>,
-        if_true: BlockId,
-        if_false: BlockId,
-        fail_bci: usize,
-    ) -> BlockId {
-        let ic_view = InterpreterIc::at(self.method, ic_idx);
-        let site = self.call_sites.len() as u16;
-        self.call_sites.push(CallSiteInfo {
-            selector: ic_view.selector(),
-            argc: ic_view.argc() + 1,
-            static_klass: None,
-        });
-        let dst = self.fresh(true);
-        let not_bool_id = self.fresh_not_bool_block(dst, if_true, if_false);
+    /// `SmiCmpBr`'s own fail edge (the FUSED compare+branch case). S13 step
+    /// 7b: like `fail_and_continue`, the whole fail block collapses to a
+    /// single `Ir::UncommonTrap{ bci }` — the CallSend, the BoolBr, AND its
+    /// synthesized `not_bool` retry block are all gone (the deopt re-executes
+    /// the comparison send in the interpreter, which runs both the real
+    /// selector AND its own `mustBeBoolean` handling if the override returns a
+    /// non-boolean). No continuation split is needed here (this fires only at
+    /// a block's own Branch terminator, whose `if_true`/`if_false` are already
+    /// real CFG targets) — but for a smi-cmp fail those targets are simply
+    /// never reached from this fail edge; control leaves via the trap.
+    ///
+    /// Records ONE deopt site: `reexecute = true` at the comparison send's
+    /// bci, recorded stack = `reexec_stack` (captured before the send's
+    /// operand pops, so `a`/`b` are present) — same convention as
+    /// `fail_and_continue`.
+    fn fail_and_branch(&mut self, fail_bci: usize, reexec_stack: Vec<VReg>) -> BlockId {
         let fail_id = self.fresh_block_id();
         self.finish_block(IrBlock {
             id: fail_id,
             bci: fail_bci,
-            code: vec![
-                Ir::CallSend { dst, site, args },
-                Ir::BoolBr {
-                    val: dst,
-                    if_true,
-                    if_false,
-                    not_bool: not_bool_id,
-                },
-            ],
+            code: vec![Ir::UncommonTrap { bci: fail_bci }],
             entry_stack: Vec::new(),
-            // The synthesized smi-fallback / not-boolean blocks record no
-            // deopt sites in v1 (S13 step 3b): their CallSend/CallRuntime
-            // safepoints can't deopt until step 7 turns them into real trap
-            // clients, so the driver simply finds nothing to attach here.
-            deopt_sites: Vec::new(),
+            deopt_sites: vec![(
+                0,
+                DeoptRaw {
+                    stack: reexec_stack,
+                    bci: fail_bci,
+                    kind: SafepointKind::UncommonTrap,
+                    reexecute: true,
+                },
+            )],
         });
         fail_id
     }
@@ -930,7 +943,7 @@ impl<'a> Translator<'a> {
         stack: &mut Vec<VReg>,
         code: &mut Vec<Ir>,
         deopt: &mut Vec<(u32, DeoptRaw)>,
-        pending_cmp: &mut Option<(CmpOp, VReg, VReg, u16)>,
+        pending_cmp: &mut Option<(CmpOp, VReg, VReg, PendingCmpDeopt)>,
     ) -> Option<BlockId> {
         let mut split: Option<BlockId> = None;
         match *instr {
@@ -1080,18 +1093,36 @@ impl<'a> Translator<'a> {
                 stack.push(dst);
             }
             Instr::Send { ic, .. } if self.is_smi_inlinable(ic) => {
+                // S13 step 7b: a smi-overflow deopt is `reexecute=true` at the
+                // SEND's bci — the interpreter re-executes the WHOLE send, so
+                // the recorded operand stack must be the state BEFORE this
+                // op's own pops, with ITS INPUTS (`a`, `b`) still present.
+                // Snapshot `stack` HERE, before the two pops below, so the
+                // snapshot is exactly `[below..., a, b]` = the reexecute stack.
+                let reexec_stack = stack.clone();
                 let b = stack.pop().expect("send: missing arg operand");
                 let a = stack.pop().expect("send: missing receiver operand");
                 match classify_smi_send(self.vm, self.method, ic) {
                     SmiSendKind::Cmp(op) if fusable => {
                         // `fusable` already confirms the terminator is a
                         // Branch -- `convert` consumes `pending_cmp` there.
-                        *pending_cmp = Some((op, a, b, ic));
+                        // Carry the reexecute snapshot AND this send's own bci
+                        // to the branch site, which builds the fail block
+                        // (after a/b are popped, and where `bci` is the block
+                        // start, not this send).
+                        *pending_cmp = Some((
+                            op,
+                            a,
+                            b,
+                            PendingCmpDeopt {
+                                bci,
+                                stack: reexec_stack,
+                            },
+                        ));
                     }
                     SmiSendKind::Cmp(op) => {
                         let dst = self.fresh(true);
-                        let (fail_id, continuation_id) =
-                            self.fail_and_continue(ic, vec![a, b], dst, bci);
+                        let (fail_id, continuation_id) = self.fail_and_continue(bci, reexec_stack);
                         code.push(Ir::SmiCmpVal {
                             op,
                             dst,
@@ -1104,8 +1135,7 @@ impl<'a> Translator<'a> {
                     }
                     SmiSendKind::Arith(op) => {
                         let dst = self.fresh(true);
-                        let (fail_id, continuation_id) =
-                            self.fail_and_continue(ic, vec![a, b], dst, bci);
+                        let (fail_id, continuation_id) = self.fail_and_continue(bci, reexec_stack);
                         code.push(Ir::SmiArith {
                             op,
                             dst,
@@ -1405,7 +1435,7 @@ pub fn convert(vm: &VmState, method: MethodOop, cfg: &Cfg) -> IrMethod {
 
         let is_branch_terminator = matches!(cfg_block.terminator, Terminator::Branch { .. });
         let mut stack = entry_stack.clone();
-        let mut pending_cmp: Option<(CmpOp, VReg, VReg, u16)> = None;
+        let mut pending_cmp: Option<(CmpOp, VReg, VReg, PendingCmpDeopt)> = None;
         // S11 step 7: a fallible smi-inline op mid-block (SmiArith/
         // SmiCmpVal, never a terminator) now needs a REAL fallback that
         // REJOINS this same block's own continuation, not a bailout-and-
@@ -1484,14 +1514,14 @@ pub fn convert(vm: &VmState, method: MethodOop, cfg: &Cfg) -> IrMethod {
             Terminator::Branch { if_true, if_false } => {
                 emit_merges(&sources, &entry_stacks, if_true, &local_exit, &mut code);
                 emit_merges(&sources, &entry_stacks, if_false, &local_exit, &mut code);
-                if let Some((op, a, b_, ic_idx)) = pending_cmp.take() {
-                    let fail_id = t.fail_and_branch(
-                        ic_idx,
-                        vec![a, b_],
-                        block_id(if_true),
-                        block_id(if_false),
-                        cfg_block.bci_start,
-                    );
+                if let Some((op, a, b_, deopt_info)) = pending_cmp.take() {
+                    // S13 step 7b: `deopt_info` was captured at the fused
+                    // comparison's own smi-inline site (before its operand
+                    // pops) — `deopt_info.stack` carries `a`/`b`, and
+                    // `deopt_info.bci` is the comparison SEND's own bci (NOT
+                    // `cfg_block.bci_start`, which is the block's first
+                    // instruction) — the reexecute resume point.
+                    let fail_id = t.fail_and_branch(deopt_info.bci, deopt_info.stack);
                     code.push(Ir::SmiCmpBr {
                         op,
                         a,
@@ -1609,11 +1639,11 @@ mod tests {
 
     /// `send site with mono smi IC + prim '+'` (D1 item 2): a monomorphic,
     /// smi-guarded send whose target's primitive is `+` (id 1) translates
-    /// to `SmiArith{Add}`. S11 step 7: `fail` is no longer the method's
-    /// shared bailout block -- it's a freshly synthesized block computing
-    /// the SAME fallback via a real, generic `CallSend` of `+` (D1: "the
-    /// LargeInteger/Double fallback via the interpreter callee"), then
-    /// jumping to a continuation (no `Ir::Bailout` anywhere in the method).
+    /// to `SmiArith{Add}`. S13 step 7b: `fail` is now a single-op
+    /// `Ir::UncommonTrap` deopt block (a `brk` re-executes the send in the
+    /// interpreter — its LargeInteger/Double fallback), carrying ONE
+    /// reexecute deopt site whose recorded stack holds the send's own inputs
+    /// (`a`, `b`). No `CallSend`, no jump, no `Ir::Bailout`.
     #[test]
     fn smi_send_inlined_mono() {
         let mut vm = test_vm();
@@ -1636,15 +1666,17 @@ mod tests {
         let cfg = decode::decode(method);
         let ir = convert(&vm, method, &cfg);
 
-        let fail = ir.blocks[0]
+        let (fail, a, b_) = ir.blocks[0]
             .code
             .iter()
             .find_map(|op| match op {
                 Ir::SmiArith {
                     op: SmiOp::Add,
                     fail,
+                    a,
+                    b,
                     ..
-                } => Some(*fail),
+                } => Some((*fail, *a, *b)),
                 _ => None,
             })
             .expect("send site must translate to SmiArith{Add}");
@@ -1653,16 +1685,34 @@ mod tests {
             .iter()
             .find(|b| b.id == fail)
             .expect("fail must name a real synthesized block");
+        // S13 step 7b: the fail block is a single-op deopt trap.
         assert!(
-            matches!(fail_block.code[..], [Ir::CallSend { .. }, Ir::Jump { .. }]),
-            "the fail block must send '+' generically then jump to a continuation, got {:?}",
+            matches!(fail_block.code[..], [Ir::UncommonTrap { .. }]),
+            "the fail block must be a single Ir::UncommonTrap, got {:?}",
             fail_block.code
         );
+        // ONE reexecute deopt site, keyed at the trap op (code index 0), whose
+        // recorded stack holds the send's own inputs `a`,`b` (the reexecute
+        // stack `[below.., a, b]`; here `below` is empty).
+        assert_eq!(fail_block.deopt_sites.len(), 1);
+        let (ci, raw) = &fail_block.deopt_sites[0];
+        assert_eq!(*ci, 0);
+        assert!(raw.reexecute);
+        assert_eq!(raw.kind, SafepointKind::UncommonTrap);
+        assert_eq!(raw.stack, vec![a, b_]);
+        // No CallSend/Bailout anywhere in the smi fail path anymore.
         assert!(
             !ir.blocks
                 .iter()
                 .any(|b| b.code.iter().any(|op| matches!(op, Ir::Bailout { .. }))),
-            "S11 step 7: Ir::Bailout must never be constructed by convert() anymore"
+            "Ir::Bailout must never be constructed by convert()"
+        );
+        assert!(
+            !fail_block
+                .code
+                .iter()
+                .any(|op| matches!(op, Ir::CallSend { .. })),
+            "S13 step 7b: the smi fail block no longer emits a CallSend fallback"
         );
     }
 
