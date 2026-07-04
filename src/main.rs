@@ -112,17 +112,19 @@ fn print_bytecode_count(vm: &VmState) {
     }
 }
 
-/// `MACVM_TRACE=gc` (S11 D8 step 10, `tests_s11.md`'s "Bridge accounting"
-/// gate): a grep-friendly one-line summary printed to stderr at process
-/// exit, mirroring `print_bytecode_count`'s own convention — a shell
-/// recipe (`just bridge-stats-s11`) runs a real workload under it,
-/// asserts `gc_under_compiled=0` (the D8 bridge actually held, not just
-/// "no panic"), and logs `bridge_old_allocs` to `docs/PERF.md`.
+/// `MACVM_TRACE=gc`: a grep-friendly one-line counter summary printed to
+/// stderr at process exit, mirroring `print_bytecode_count`'s own
+/// convention. S12 step 7 inverted its meaning (P10): under S11's D8
+/// bridge a shell recipe asserted `gc_under_compiled=0` (the bridge
+/// held); with the bridge deleted the same counter is the proof the hard
+/// case — a collection with live compiled frames on the native stack —
+/// genuinely ran (`just bridge-stats-s11` now asserts it is > 0 under the
+/// combined stress gate). `bridge_old_allocs` is gone with the bridge.
 fn print_gc_bridge_stats(vm: &VmState) {
     if vm.options.trace.is_enabled("gc") {
         eprintln!(
-            "gc: bridge_old_allocs={} gc_under_compiled={}",
-            vm.universe.gc_stats.bridge_old_allocs, vm.universe.gc_stats.gc_under_compiled
+            "gc: gc_under_compiled={}",
+            vm.universe.gc_stats.gc_under_compiled
         );
     }
 }

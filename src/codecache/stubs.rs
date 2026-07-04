@@ -1057,10 +1057,12 @@ pub unsafe extern "C" fn rt_alloc_slow(vm: *mut VmState, klass_bits: u64, size_b
     // exists specifically to exercise, `walker_terminates_on_torn_
     // tierlinks`) are caught and reported back through the Result instead.
     if vm.test_walk_capture.is_some() {
-        if vm.test_tear_tier_links_before_walk {
+        let torn = if vm.test_tear_tier_links_before_walk {
             vm.test_tear_tier_links_before_walk = false;
-            vm.tier_links.pop();
-        }
+            vm.tier_links.pop()
+        } else {
+            None
+        };
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut seen = Vec::new();
             crate::runtime::frames::walk_frames(vm, |fv| seen.push(fv));
@@ -1072,6 +1074,15 @@ pub unsafe extern "C" fn rt_alloc_slow(vm: *mut VmState, klass_bits: u64, size_b
                 .or_else(|| e.downcast_ref::<String>().cloned())
                 .unwrap_or_else(|| "walk_frames panicked with a non-string payload".to_string())
         });
+        // Restore what the tear took: the test's claim is only that the
+        // WALKER fails loudly against torn links — the tear must not
+        // outlive the observed walk, because (S12 step 7, no more D8
+        // bridge) the ordinary `alloc_slots` below can genuinely
+        // scavenge, and THAT walk needs the links intact (a panic there
+        // would unwind across this fn's own `extern "C"` boundary — UB —
+        // exactly what this hook's own `catch_unwind` exists to prevent
+        // for the walk it actually wants to observe).
+        vm.tier_links.extend(torn);
         vm.test_walk_capture = Some(result);
     }
     // S12 step 4 test hook (`VmState::test_scavenge_probe`'s own doc):
@@ -1119,10 +1130,8 @@ pub unsafe extern "C" fn rt_alloc_slow(vm: *mut VmState, klass_bits: u64, size_b
             // independently here so the test can read the slot BEFORE and
             // AFTER without going through that function itself.
             let before = unsafe { *addr };
-            vm.test_allow_moving_gc_under_compiled = true;
-            let scavenge_result = crate::memory::scavenge::scavenge(vm);
-            vm.test_allow_moving_gc_under_compiled = false;
-            scavenge_result.expect("test_force_scavenge_in_alloc_slow: scavenge must not stall");
+            crate::memory::scavenge::scavenge(vm)
+                .expect("test_force_scavenge_in_alloc_slow: scavenge must not stall");
             let after = unsafe { *addr };
             (before, after)
         }))

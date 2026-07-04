@@ -990,30 +990,26 @@ fn prim_millisecond_clock(vm: &mut VmState, _args: &[Oop]) -> PrimResult {
 /// explicit `gcScavenge` call finding no way forward is just as fatal as
 /// one the allocator triggered itself, not a different situation.
 fn prim_gc_scavenge(vm: &mut VmState, args: &[Oop]) -> PrimResult {
-    // S11 D8 bridge: an explicit `Smalltalk gcScavenge` sent from
-    // interpreted code re-entered UNDER a compiled frame (I→C→I, via a c2i
-    // adapter) would move the heap while the outer compiled frame's
-    // spill-slot oops are still invisible to the collector — heap
-    // corruption. Moving GC is forbidden until `compiled_depth` returns to
-    // 0, so defer instead of running it now (step 10: `gc_pending`, run by
-    // `enter_compiled`'s outermost exit via `run_pending_gc_if_due`) —
-    // answer the receiver either way, matching a real scavenge's own
-    // return convention. Found by adversarial review — the `alloc_words`
-    // bridge arm alone doesn't cover this direct door.
-    if vm.compiled_depth > 0 {
-        vm.request_pending_gc(crate::runtime::vm_state::GcPendingKind::Scavenge);
-        if vm.options.trace.is_enabled("gc") {
-            eprintln!(
-                "[gc] scavenge deferred: compiled_depth={} (D8 bridge)",
-                vm.compiled_depth
-            );
-        }
-        return PrimResult::Ok(args[0]);
-    }
+    // S12 step 7: S11 D8's defer arm (`if compiled_depth > 0 {
+    // request_pending_gc(...); return }`) lived here and is DELETED — a
+    // scavenge under a live compiled frame is now an ordinary, fully
+    // rooted collection (`roots::each_code_root`), so this primitive
+    // always collects immediately, at any depth.
+    let _ = args;
     if let Err(err) = crate::memory::scavenge::scavenge(vm) {
         alloc::stall_exit(err);
     }
-    PrimResult::Ok(args[0])
+    // `prim_arg(0)`, NOT `args[0]`: the scavenge above may have MOVED the
+    // receiver, and `args` is a pre-call copy of raw bits (SPEC §10
+    // Pitfalls — re-read every arg through the live stack slot after any
+    // allocating/collecting call). Latent since S8, unreachable until now:
+    // every real sender was `Smalltalk gcScavenge`, and the `smalltalk`
+    // singleton is tenured by the time user code runs, so the stale copy
+    // always happened to equal the live slot. A YOUNG receiver — exactly
+    // what `mid_loop_forced_scavenge`'s own `p scav` sends — moves, and
+    // returning the stale copy would resurrect its vacated address as a
+    // value.
+    PrimResult::Ok(vm.prim_arg(0))
 }
 
 /// `Smalltalk gcFull` (SPEC §10 system group): runs the full mark-slide-
@@ -1021,23 +1017,14 @@ fn prim_gc_scavenge(vm: &mut VmState, args: &[Oop]) -> PrimResult {
 /// returns `Err` (pure compaction needs no new memory — see its own doc);
 /// the `expect` documents that rather than silently discarding a `Result`.
 fn prim_gc_full(vm: &mut VmState, args: &[Oop]) -> PrimResult {
-    // S11 D8 bridge: same as `prim_gc_scavenge` — a compacting collection
-    // under a live compiled frame would relocate objects the collector
-    // can't yet find via that frame. Defer while `compiled_depth > 0`
-    // (step 10: `gc_pending`, run by `enter_compiled`'s outermost exit).
-    if vm.compiled_depth > 0 {
-        vm.request_pending_gc(crate::runtime::vm_state::GcPendingKind::Full);
-        if vm.options.trace.is_enabled("gc") {
-            eprintln!(
-                "[gc] full GC deferred: compiled_depth={} (D8 bridge)",
-                vm.compiled_depth
-            );
-        }
-        return PrimResult::Ok(args[0]);
-    }
+    // S12 step 7: defer arm deleted, receiver re-read live — both for
+    // exactly `prim_gc_scavenge`'s reasons (see its comments; a full GC's
+    // compaction slides young AND old objects, so the stale-`args[0]`
+    // hazard is even broader here).
+    let _ = args;
     crate::memory::fullgc::full_gc(vm)
         .expect("full_gc: pure compaction never returns Err (see its own doc)");
-    PrimResult::Ok(args[0])
+    PrimResult::Ok(vm.prim_arg(0))
 }
 
 /// `Smalltalk gcStats` (SPEC §10 dev hook, S8): answers an 8-element Array
@@ -1747,15 +1734,45 @@ mod tests {
         assert_eq!(result, PrimResult::Ok(expected));
     }
 
+    /// S12 step 7: the GC prims re-read their receiver through
+    /// `vm.prim_arg(0)` after collecting (the `args` copy is stale bits
+    /// once the receiver itself moves — latent since S8, only reachable
+    /// now that a collection can actually run mid-prim with young
+    /// receivers). The bare `call` helper above invokes the prim fn
+    /// directly with an unrooted slice, so these tests must mimic
+    /// `try_primitive`'s own protocol: push the receiver onto the live
+    /// stack and point `prim_arg_base` at it, exactly like a real send.
+    fn call_rooted(id: u16, vm: &mut VmState, recv: Oop) -> PrimResult {
+        let base = vm.stack.sp;
+        vm.stack.push(recv);
+        vm.prim_arg_base = base;
+        let r = (prim_by_id(id).unwrap().f)(vm, &[recv]);
+        vm.stack.sp = base;
+        r
+    }
+
     /// `Smalltalk gcScavenge` must run a REAL scavenge (id 93), not the old
     /// no-op stub — proven by the counter it bumps, not just "didn't crash".
+    /// The answered receiver must be the LIVE (post-scavenge) nil — a young
+    /// receiver moves, and the pre-call `recv` bits are the vacated address.
     #[test]
     fn prim_gc_scavenge_runs_a_real_scavenge() {
         let mut vm = test_vm();
         let recv = vm.universe.nil_obj;
         let before = vm.universe.gc_stats.scavenge_count;
-        assert_eq!(call(93, &mut vm, &[recv]), PrimResult::Ok(recv));
+        let result = call_rooted(93, &mut vm, recv);
         assert_eq!(vm.universe.gc_stats.scavenge_count, before + 1);
+        assert_eq!(
+            result,
+            PrimResult::Ok(vm.universe.nil_obj),
+            "must answer the RELOCATED receiver (nil moved -- it was young)"
+        );
+        assert_ne!(
+            vm.universe.nil_obj.raw(),
+            recv.raw(),
+            "precondition: genesis nil is young, so the scavenge must actually move it \
+             (otherwise this test proves nothing about the stale-args hazard)"
+        );
     }
 
     /// `Smalltalk gcFull` must run a REAL full GC (id 94) — same shape as
@@ -1765,46 +1782,46 @@ mod tests {
         let mut vm = test_vm();
         let recv = vm.universe.nil_obj;
         let before = vm.universe.gc_stats.full_gc_count;
-        assert_eq!(call(94, &mut vm, &[recv]), PrimResult::Ok(recv));
+        let result = call_rooted(94, &mut vm, recv);
         assert_eq!(vm.universe.gc_stats.full_gc_count, before + 1);
+        assert_eq!(result, PrimResult::Ok(vm.universe.nil_obj));
     }
 
-    /// S11 D8 step 10: under a live compiled frame, `gcScavenge` must NOT
-    /// run a real scavenge (moving GC is forbidden — D8 bridge) but must
-    /// defer it (`gc_pending`) rather than silently dropping the request
-    /// (step 8's original decline-and-forget behavior). Still answers the
-    /// receiver either way, matching a real scavenge's own convention.
+    /// S12 step 7 (inverts S11's `prim_gc_scavenge_defers_under_compiled_
+    /// frame`): the D8 defer arm is gone, so `gcScavenge` runs a REAL
+    /// scavenge immediately even with `compiled_depth > 0` (a faked depth
+    /// with an empty native stack is honest here: `walk_frames` starts
+    /// from the anchor, which is 0, so the code-root walk correctly sees
+    /// no native frames). `gc_under_compiled` must count the hard case.
     #[test]
-    fn prim_gc_scavenge_defers_under_compiled_frame() {
+    fn prim_gc_scavenge_runs_immediately_under_compiled_depth() {
         let mut vm = test_vm();
         let recv = vm.universe.nil_obj;
         let before = vm.universe.gc_stats.scavenge_count;
-        vm.compiled_depth = 1; // pretend a compiled frame is on the stack
-        assert_eq!(call(93, &mut vm, &[recv]), PrimResult::Ok(recv));
+        let under_before = vm.universe.gc_stats.gc_under_compiled;
+        vm.compiled_depth = 1;
+        let result = call_rooted(93, &mut vm, recv);
+        vm.compiled_depth = 0;
+        assert_eq!(result, PrimResult::Ok(vm.universe.nil_obj));
         assert_eq!(
-            vm.universe.gc_stats.scavenge_count, before,
-            "must NOT run a real scavenge while compiled_depth > 0"
+            vm.universe.gc_stats.scavenge_count,
+            before + 1,
+            "the defer arm is gone -- gcScavenge collects immediately at any depth"
         );
-        assert_eq!(
-            vm.gc_pending,
-            Some(crate::runtime::vm_state::GcPendingKind::Scavenge),
-            "must remember the request instead of dropping it"
-        );
+        assert_eq!(vm.universe.gc_stats.gc_under_compiled, under_before + 1);
     }
 
     /// Sibling of the scavenge test above, for `gcFull` (id 94).
     #[test]
-    fn prim_gc_full_defers_under_compiled_frame() {
+    fn prim_gc_full_runs_immediately_under_compiled_depth() {
         let mut vm = test_vm();
         let recv = vm.universe.nil_obj;
         let before = vm.universe.gc_stats.full_gc_count;
         vm.compiled_depth = 1;
-        assert_eq!(call(94, &mut vm, &[recv]), PrimResult::Ok(recv));
-        assert_eq!(vm.universe.gc_stats.full_gc_count, before);
-        assert_eq!(
-            vm.gc_pending,
-            Some(crate::runtime::vm_state::GcPendingKind::Full)
-        );
+        let result = call_rooted(94, &mut vm, recv);
+        vm.compiled_depth = 0;
+        assert_eq!(result, PrimResult::Ok(vm.universe.nil_obj));
+        assert_eq!(vm.universe.gc_stats.full_gc_count, before + 1);
     }
 
     /// `Smalltalk gcStats` (id 97) answers an 8-smi Array in the SPEC-pinned
@@ -1816,8 +1833,15 @@ mod tests {
     fn prim_gc_stats_reports_pinned_fields_in_order() {
         let mut vm = test_vm();
         let recv = vm.universe.nil_obj;
-        call(93, &mut vm, &[recv]); // one scavenge
-        call(94, &mut vm, &[recv]); // one full GC
+        call_rooted(93, &mut vm, recv); // one scavenge
+
+        // Re-read the LIVE nil for the second call: the scavenge above
+        // moved it, and pushing the stale pre-scavenge `recv` bits as a
+        // root is exactly the dangling-root shape the full-gc entry
+        // verifier (correctly) rejects — this test tripped it for real
+        // the first time this line reused `recv`.
+        let recv2 = vm.universe.nil_obj;
+        call_rooted(94, &mut vm, recv2); // one full GC
 
         // Snapshot expectations BEFORE calling gcStats: the primitive
         // itself allocates its own result Array (in eden), so reading

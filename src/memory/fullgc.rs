@@ -445,20 +445,13 @@ pub fn full_gc(vm: &mut VmState) -> Result<FullGcReport, GcStallError> {
         vm.universe.to.top, vm.universe.to.start,
         "full_gc: to-space must be empty between collections (never nested inside a scavenge)"
     );
-    // S11 D8: like `scavenge`, a compacting collection moves objects and
-    // must never run while a compiled frame is live (its spill-slot oops
-    // are invisible until S12). The `alloc::alloc_words` bridge arm and
-    // `prim_gc_full`'s deferral (`gc_pending`) both keep this at 0; the
-    // assert (plus `gc_under_compiled`, which stays live in `--release`
-    // too) catches a future third door.
+    // S12 step 7: a full GC under a live compiled frame is an ordinary,
+    // fully rooted collection (same reasoning as `scavenge`'s own comment
+    // at this spot) — the S11 D8 assert is gone; `gc_under_compiled`
+    // stays as the release-mode proof the hard case actually runs.
     if vm.compiled_depth > 0 {
         vm.universe.gc_stats.gc_under_compiled += 1;
     }
-    debug_assert_eq!(
-        vm.compiled_depth, 0,
-        "full_gc under a live compiled frame (compiled_depth={}) — S11 D8 bridge violated",
-        vm.compiled_depth
-    );
     if super::verify::verify_enabled() {
         super::verify::verify_heap_at(vm, VerifyPoint::FullGcEntry)
             .expect("heap invalid at full-gc entry");
@@ -638,21 +631,18 @@ mod tests {
         MemOop::try_from(o).unwrap().mark().gc_mark()
     }
 
-    /// S11 D8 step 10: same reasoning as `scavenge.rs`'s sibling test —
-    /// `gc_under_compiled` is the `--release`-surviving proof the
-    /// `debug_assert_eq!` right after it can't give on its own (it compiles
-    /// out there), so it must count the violation before the assert panics.
+    /// S12 step 7 (inverts S11's sibling — same reasoning as
+    /// `scavenge.rs`'s own `scavenge_completes_and_counts_under_compiled_
+    /// depth`): a full GC with `compiled_depth > 0` runs to normal
+    /// completion AND counts itself; the S11-era abort is gone.
     #[test]
-    fn gc_under_compiled_counts_even_though_the_assert_aborts() {
+    fn full_gc_completes_and_counts_under_compiled_depth() {
         let mut vm = test_vm();
-        vm.compiled_depth = 1; // pretend a compiled frame is on the stack
-        if cfg!(debug_assertions) {
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let _ = full_gc(&mut vm);
-            }));
-            assert!(result.is_err(), "must debug_assert when compiled_depth > 0");
-            assert_eq!(vm.universe.gc_stats.gc_under_compiled, 1);
-        }
+        vm.compiled_depth = 1;
+        full_gc(&mut vm).expect("full GC must simply succeed at any compiled_depth");
+        vm.compiled_depth = 0;
+        assert_eq!(vm.universe.gc_stats.gc_under_compiled, 1);
+        assert_eq!(vm.universe.gc_stats.full_gc_count, 1);
     }
 
     // ======================================================================

@@ -167,30 +167,36 @@ gate-s10: gate-s09
     MACVM_GC_STRESS=full:64 just run-world-tests
     just bench-s10
 
-# S11 step 10 (tests_s11.md "Bridge accounting"): one more full-suite run
-# under the same combined stress as gate-s11's own two lines, this time with
-# MACVM_TRACE=gc so `print_gc_bridge_stats` (main.rs) prints its exit-time
-# "gc: bridge_old_allocs=N gc_under_compiled=M" line to stderr. Asserts M==0
-# — the D8 bridge actually held (not merely "no panic": `gc_under_compiled`
-# stays live in --release, where the collectors' own debug_assert compiles
-# out) — and logs N to docs/PERF.md, the visibility-of-the-cost-S12-removes
-# tests_s11.md itself asks for.
+# INVERTED by S12 step 7 (P10: "the S11 gc_under_compiled == 0 test must be
+# inverted, not deleted — it becomes the proof the bridge is gone"). Same
+# recipe name, same combined-stress run, OPPOSITE assertion: the exit-time
+# "gc: gc_under_compiled=M" line (print_gc_bridge_stats, main.rs) must now
+# show M > 0 — real collections genuinely ran with live compiled frames on
+# the native stack (the hard case S12 exists for), release-mode-visible
+# rather than debug-assert-only. bridge_old_allocs no longer exists (the
+# field is deleted; anything referencing it fails to compile — tests_s12.md
+# gate item 6).
 bridge-stats-s11:
     #!/usr/bin/env bash
     set -euo pipefail
     grep -v '^#' world/tests/tests.list | grep -v '^$' | sed 's|^|world/tests/|' | xargs cat > /tmp/macvm_world_tests.mst
-    out=$(MACVM_GC_STRESS=full:64 MACVM_JIT=threshold=1 MACVM_TRACE=gc cargo run --quiet -- run /tmp/macvm_world_tests.mst --world world 2>&1 >/dev/null)
-    line=$(echo "$out" | grep '^gc: bridge_old_allocs=')
+    # GC_STRESS=1 (scavenge on EVERY allocation), not full:64: the sampled
+    # mode can legitimately land all of its collections outside compiled
+    # windows (1-in-64 across a suite whose compiled stretches are short),
+    # reading 0 without anything being wrong -- the every-allocation mode
+    # is the one that guarantees collections inside compiled windows exist
+    # to count.
+    out=$(MACVM_GC_STRESS=1 MACVM_JIT=threshold=1 MACVM_TRACE=gc cargo run --quiet -- run /tmp/macvm_world_tests.mst --world world 2>&1 >/dev/null)
+    line=$(echo "$out" | grep '^gc: gc_under_compiled=')
     echo "$line"
     under_compiled=$(echo "$line" | sed -n 's/.*gc_under_compiled=\([0-9]*\).*/\1/p')
-    bridge_allocs=$(echo "$line" | sed -n 's/.*bridge_old_allocs=\([0-9]*\).*/\1/p')
-    if [ "$under_compiled" != "0" ]; then
-        echo "FAIL: gc_under_compiled=$under_compiled -- D8 bridge violated (a GC ran while compiled_depth > 0)" >&2
+    if [ "$under_compiled" = "0" ]; then
+        echo "FAIL: gc_under_compiled=0 -- the bridge is gone, so combined stress MUST have run collections under live compiled frames (S12 P10)" >&2
         exit 1
     fi
     date_str=$(date +%Y-%m-%d)
     commit=$(git rev-parse --short HEAD)
-    echo "| $date_str | $commit | $bridge_allocs | $under_compiled |" >> docs/PERF.md
+    echo "| $date_str | $commit | (bridge deleted) | $under_compiled |" >> docs/PERF.md
 
 # S11: compiled sends + inline alloc + the D8 GC bridge. UNLIKE gate-s10 (which
 # deliberately kept GC-stress and the JIT apart, deferring the combo to "S12's

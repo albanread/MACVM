@@ -419,36 +419,17 @@ pub fn scavenge(vm: &mut VmState) -> Result<ScavengeReport, GcStallError> {
         vm.universe.gc_enabled,
         "scavenge called before genesis finished (SPEC §7.3 A1)"
     );
-    // S11 D8 bridge (pre-S12 window; production doors, still all standing):
-    // `alloc::alloc_words`'s bridge arm diverts to old-direct under
-    // `compiled_depth > 0`, never reaching here; `prim_gc_scavenge` defers
-    // (`gc_pending`) instead of calling straight in. `gc_under_compiled`
-    // (stays live in `--release` too) counts any caller that DOES reach
-    // here anyway.
-    //
-    // S12 step 4: `each_code_root` (just above, in the root scan) now makes
-    // THIS function itself genuinely correct under a live compiled frame —
-    // it is only the production-facing doors (both still fully intact,
-    // above) that keep ordinary allocation/`Gc scavenge` sends from ever
-    // relying on that yet, deliberately: full GC isn't compiled-frame-aware
-    // until step 5, and nmethod flushing (step 6) doesn't exist yet, so
-    // opening every door at once before those land would let ordinary code
-    // reach a still-incomplete system. `test_allow_moving_gc_under_compiled`
-    // is the one narrow, default-off exception (mirrors `test_walk_capture`/
-    // `test_tear_tier_links_before_walk`'s own established shape) — it lets
-    // a test call THIS function directly to prove the new root-scanning
-    // mechanism for real, without touching any of the three production
-    // doors, which is why this is a step-4-scoped relaxation rather than
-    // "the S11 bridge is deleted" (that's step 7, all three doors at once,
-    // once step 5/6 have made the rest of the system ready for it too).
+    // S12 step 7: a scavenge under a live compiled frame is an ordinary,
+    // fully rooted collection — compiled-frame spill slots and stub
+    // RootSpill slots via `roots::each_code_root` (in the root scan
+    // below), the eden bump pointer one shared word compiled code reads
+    // through `reg_block.eden_top_addr`. The S11 D8 assert that lived
+    // here (and its step-4 test bypass) is gone; `gc_under_compiled`
+    // stays as the release-mode PROOF the hard case actually runs (the
+    // flagship gate asserts it lands > 0 — P10's inversion).
     if vm.compiled_depth > 0 {
         vm.universe.gc_stats.gc_under_compiled += 1;
     }
-    debug_assert!(
-        vm.compiled_depth == 0 || vm.test_allow_moving_gc_under_compiled,
-        "scavenge under a live compiled frame (compiled_depth={}) — S11 D8 bridge violated",
-        vm.compiled_depth
-    );
     if super::verify::verify_enabled() {
         super::verify::verify_heap_at(vm, super::verify::VerifyPoint::ScavengeEntry)
             .expect("heap invalid at scavenge entry");
@@ -700,24 +681,21 @@ mod tests {
     }
 
     /// S11 D8 step 10: `gc_under_compiled` must record a bridge violation
-    /// even though the `debug_assert_eq!` right after it aborts the call —
-    /// the counter is the independent, `--release`-surviving proof
-    /// `tests_s11.md`'s bridge-accounting gate reads, so it must be bumped
-    /// BEFORE the assert can panic, not after. Mirrors `ic.rs`'s
-    /// `epoch_wrap_debug_assert`'s `catch_unwind` idiom for exactly the
-    /// same reason: a debug build's own defense is a panic, so observing
-    /// what happened right up to that panic needs to catch it.
+    /// S12 step 7 (inverts S11's `gc_under_compiled_counts_even_though_
+    /// the_assert_aborts`, whose assert is deleted): a scavenge with
+    /// `compiled_depth > 0` runs to normal completion AND counts itself.
+    /// A faked depth over an empty native stack is honest here —
+    /// `walk_frames` starts from the anchor, which is 0, so the code-root
+    /// walk correctly finds no native frames; the REAL
+    /// live-compiled-frame case is `it_gc_jit.rs`'s flagship tests.
     #[test]
-    fn gc_under_compiled_counts_even_though_the_assert_aborts() {
+    fn scavenge_completes_and_counts_under_compiled_depth() {
         let mut vm = test_vm();
-        vm.compiled_depth = 1; // pretend a compiled frame is on the stack
-        if cfg!(debug_assertions) {
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let _ = scavenge(&mut vm);
-            }));
-            assert!(result.is_err(), "must debug_assert when compiled_depth > 0");
-            assert_eq!(vm.universe.gc_stats.gc_under_compiled, 1);
-        }
+        vm.compiled_depth = 1;
+        scavenge(&mut vm).expect("scavenge must simply succeed at any compiled_depth");
+        vm.compiled_depth = 0;
+        assert_eq!(vm.universe.gc_stats.gc_under_compiled, 1);
+        assert_eq!(vm.universe.gc_stats.scavenge_count, 1);
     }
 
     /// A scavenge of a freshly booted VM (nothing but genesis's own

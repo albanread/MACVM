@@ -4,17 +4,27 @@
 //! being exercised is `unsafe` internally, not this file's own code.
 
 use macvm::bytecode::builder::BytecodeBuilder;
-use macvm::codecache::nmethod::IcState;
+use macvm::codecache::nmethod::{IcSite, IcState, NmState, Nmethod, NmethodId, OopMap, PcDesc};
+use macvm::compiler::assembler::RelocKind;
 use macvm::compiler::driver;
+use macvm::compiler::ir::{
+    BailoutReason, BlockId, CallSiteInfo, CmpOp, Ir, IrBlock, IrMethod, PoolEntry, PoolLit, SmiOp,
+    VReg, VRegInfo,
+};
+use macvm::compiler::jasm_assembler::JasmAssembler;
+use macvm::compiler::oopmap;
+use macvm::compiler::regalloc::{self, RegallocResult};
+use macvm::compiler::{emit, emit::SafepointPc};
 use macvm::frontend::{classdef, parser};
 use macvm::interpreter::compiled_call::{enter_compiled, EnterResult};
 use macvm::memory::alloc;
 use macvm::memory::fullgc;
 use macvm::memory::scavenge::scavenge;
 use macvm::oops::layout::HEADER_WORDS;
+use macvm::oops::mark::Mark;
 use macvm::oops::smi::SmallInt;
 use macvm::oops::wrappers::{KlassOop, MemOop};
-use macvm::oops::Format;
+use macvm::oops::{Format, Oop};
 use macvm::runtime::lookup::{install_method, klass_of};
 use macvm::runtime::{JitMode, VmOptions, VmState};
 
@@ -471,4 +481,587 @@ fn compiled_mono_caller_guard_keeps_key_klass_alive() {
         ),
         "callHot's own site must be untouched -- nothing was flushed"
     );
+}
+
+// ── The flagship: mid_loop_forced_scavenge (tests_s12.md gate item 2) ─────
+
+/// Shared scaffolding for the two flagship tests below: hand-builds a
+/// compiled loop method (`driver::eligible` still rejects ordinary
+/// non-smi sends outright — the same S11 eligibility gate documented in
+/// step 6's STEP-6 NOTES — so `driver::compile_method` cannot be the
+/// front door; `mono_resolve_patches_call_site_and_dispatches`'s own
+/// hand-built-IrMethod precedent applies), attaches REAL per-safepoint
+/// GC metadata exactly the way `driver::compile_method` does (the same
+/// `oopmap::build_for_position` + `intern` calls over the same
+/// `RegallocResult` — without this, `Nmethod::oopmap_at`'s exact-match
+/// panic is the FIRST thing any scavenge under the loop hits), installs
+/// it, and patches every send site to `stub_resolve`.
+#[allow(clippy::too_many_arguments)]
+fn install_loop_nmethod(
+    vm: &mut VmState,
+    key_klass: KlassOop,
+    blocks: Vec<IrBlock>,
+    vregs: Vec<VRegInfo>,
+    pool: Vec<PoolEntry>,
+    call_sites: Vec<CallSiteInfo>,
+    argc: u8,
+    probe_name: &[u8],
+) -> NmethodId {
+    let ir = IrMethod {
+        blocks,
+        vregs,
+        pool,
+        argc,
+        ntemps: 0,
+        safepoints: Vec::new(),
+        true_lit: PoolLit(1),
+        false_lit: PoolLit(2),
+        nil_lit: PoolLit(0),
+        mark_slots_lit: PoolLit(3),
+        call_sites,
+    };
+    let ra: RegallocResult = regalloc::regalloc(&ir);
+    let mut asm = JasmAssembler::new();
+    let (blob, _pcs, verified_entry_off, emitted_ic_sites, safepoints): (
+        _,
+        _,
+        u32,
+        _,
+        Vec<SafepointPc>,
+    ) = emit::emit(
+        &mut asm,
+        &ir,
+        &ra,
+        vm.stubs.stub_poll_addr(),
+        vm.stubs.must_be_boolean_addr(),
+        vm.stubs.alloc_slow_addr(),
+        None,
+    );
+
+    let h = vm.code_cache.alloc(blob.code.len()).unwrap();
+    vm.code_cache.publish(h, &blob);
+    let resolve_addr = vm.stubs.resolve_addr();
+    for site in &emitted_ic_sites {
+        vm.code_cache.patch_branch26_at(h, site.off, resolve_addr);
+    }
+
+    // REAL GC metadata — the same construction `driver::compile_method`
+    // performs (oopmaps[0] reserved empty; one liveness-intersected,
+    // deduplicated map per real safepoint). Block-start descs are omitted:
+    // they exist only for `bci_at`'s trace path, which nothing here uses.
+    let mut oopmaps: Vec<OopMap> = vec![OopMap::empty()];
+    let mut pcdescs: Vec<PcDesc> = Vec::with_capacity(safepoints.len());
+    for sp in &safepoints {
+        let map = oopmap::build_for_position(&ra.intervals, ra.frame_slots, sp.position);
+        let idx = oopmap::intern(&mut oopmaps, map);
+        pcdescs.push(PcDesc {
+            pc_off: sp.pc_off,
+            bci: sp.bci,
+            oopmap: idx,
+        });
+    }
+    pcdescs.sort_by_key(|d| d.pc_off);
+
+    let probe_sel = vm.universe.intern(probe_name);
+    let ic_sites: Vec<IcSite> = emitted_ic_sites
+        .iter()
+        .map(|s| IcSite {
+            off: s.off,
+            selector: s.selector,
+            argc: s.argc,
+            state: IcState::Unresolved,
+        })
+        .collect();
+    let nm = Nmethod {
+        id: NmethodId(0),
+        key_klass,
+        key_selector: probe_sel,
+        code: h,
+        entry_off: 0,
+        verified_entry_off,
+        state: NmState::Alive,
+        level: 1,
+        version: 0,
+        literal_off: blob.literal_off,
+        relocs: blob.relocs.clone(),
+        frame_slots: ra.frame_slots,
+        slot_is_oop: ra.slot_is_oop.clone(),
+        pcdescs,
+        oopmaps,
+        ic_sites,
+        poll_bci: None,
+    };
+    vm.code_table.install(nm)
+}
+
+/// The standard well-known-literal pool prefix `install_loop_nmethod`'s
+/// own `PoolLit(0..=3)` indices assume: nil, true, false, pristine-Slots
+/// mark — mirroring `ir::convert`'s own interning order for the same four.
+fn base_pool(vm: &VmState) -> Vec<PoolEntry> {
+    vec![
+        PoolEntry {
+            value: vm.universe.nil_obj.raw(),
+            kind: Some(RelocKind::Oop),
+        },
+        PoolEntry {
+            value: vm.universe.true_obj.raw(),
+            kind: Some(RelocKind::Oop),
+        },
+        PoolEntry {
+            value: vm.universe.false_obj.raw(),
+            kind: Some(RelocKind::Oop),
+        },
+        PoolEntry {
+            value: Mark::pristine().with_tagged_contents(true).word(),
+            kind: None,
+        },
+    ]
+}
+
+/// `tests_s12.md` gate item 2, THE FLAGSHIP, full version (step 7 — the
+/// bridge is gone, so the real `gcScavenge` primitive genuinely collects
+/// when sent from inside a compiled loop): ONE compiled activation whose
+/// spill slot holds an eden object across ~100 REAL scavenges, each
+/// triggered by a real `scav` send (compiled `bl` → `stub_resolve` →
+/// c2i adapter → `rt_interpret_call` → interpreter → primitive 93 → a
+/// full scavenge with THIS compiled frame live on the native stack).
+///
+/// Adapted from the doc's own sketch exactly as steps 4/6 already
+/// established (their STEP NOTES document why): the method is hand-built
+/// IR, not `T>>run:` source (`driver::eligible` rejects every non-smi
+/// send — the loop itself is plain `SmiCmpBr`/`SmiArith`/`Jump`, exactly
+/// what source `to:do:` lowers to anyway); the arithmetic accumulator is
+/// dropped (the correctness signal is the OBJECT's own identity/ivars
+/// surviving ~100 relocations, which `s` never strengthened); and the
+/// `vm.test_hooks.on_scavenge` instrumentation the doc imagines doesn't
+/// exist — the frame slot's correctness is proven OBSERVABLY instead:
+/// every iteration's `scav` send reloads the receiver from the same
+/// spill slot each_code_root just rewrote, so ONE stale-slot failure
+/// poisons every subsequent iteration's dispatch (in debug builds the
+/// scavenge-entry verifier also walks the whole heap between every
+/// single pair of iterations — 100 independent full-heap validations).
+///
+/// Assertion (c) of the doc is kept verbatim: `gc_under_compiled`
+/// incremented ≥ 100 — P10's inversion, the proof the hard case ran.
+/// Assertion (d) is implicit and stronger than the doc asks: EVERY
+/// scavenge's own `oopmap_at(ret_pc)` lookup panics on a non-exact
+/// PcDesc match (P1), so a single mis-recorded safepoint fails loudly.
+#[test]
+fn mid_loop_forced_scavenge() {
+    const N: i64 = 100;
+    let mut vm = test_vm();
+    let object_klass = vm.universe.object_klass;
+    let t_klass = vm.universe.new_klass(
+        object_klass,
+        "MidLoopT",
+        Format::Slots,
+        false,
+        HEADER_WORDS + 2,
+    );
+
+    // `scav` on T: the REAL gcScavenge primitive (93), interpreted-only
+    // (primitive methods are never compiled), reached via a real c2i
+    // adapter from the compiled loop's own send site.
+    let scav_sel = vm.universe.intern(b"scav");
+    let mut sb = BytecodeBuilder::new();
+    sb.ret_self(); // fallback body -- never reached (prim always succeeds)
+    let scav_method = sb.finish(&mut vm, scav_sel, 0, 0);
+    scav_method.set_primitive(93);
+    scav_method.set_flags(0, 0, false, false, true, false, 0);
+    install_method(&mut vm, t_klass, scav_sel, scav_method);
+
+    // The loop: i := 0. [i < N] whileTrue: [self scav. i := i + 1]. ^self
+    //   B0: v0=Param(self); v1=0; v2=N; Jump B1
+    //   B1: SmiCmpBr Lt v1 v2 -> B2 / B3, fail B4
+    //   B2: CallSend scav(v0) -> v3 (dead); v4=1; v1 = v1+v4; Jump B1
+    //   B3: Ret v0
+    //   B4: Bailout
+    // `self` (v0) is live across B2's CallSend safepoint on every
+    // iteration -> D1's spill-all forces it into the SAME spill slot for
+    // the whole method, the slot each of the ~100 scavenges must find
+    // and rewrite.
+    let vregs: Vec<VRegInfo> = vec![
+        VRegInfo { is_oop: true },  // v0 self
+        VRegInfo { is_oop: false }, // v1 i
+        VRegInfo { is_oop: false }, // v2 N
+        VRegInfo { is_oop: true },  // v3 send result (dead)
+        VRegInfo { is_oop: false }, // v4 const 1
+    ];
+    let blocks = vec![
+        IrBlock {
+            id: BlockId(0),
+            bci: 0,
+            code: vec![
+                Ir::Param {
+                    dst: VReg(0),
+                    index: 0,
+                },
+                Ir::ConstSmi {
+                    dst: VReg(1),
+                    value: 0,
+                },
+                Ir::ConstSmi {
+                    dst: VReg(2),
+                    value: N,
+                },
+                Ir::Jump { target: BlockId(1) },
+            ],
+            entry_stack: Vec::new(),
+        },
+        IrBlock {
+            id: BlockId(1),
+            bci: 1,
+            code: vec![Ir::SmiCmpBr {
+                op: CmpOp::Lt,
+                a: VReg(1),
+                b: VReg(2),
+                if_true: BlockId(2),
+                if_false: BlockId(3),
+                fail: BlockId(4),
+            }],
+            entry_stack: Vec::new(),
+        },
+        IrBlock {
+            id: BlockId(2),
+            bci: 2,
+            code: vec![
+                Ir::CallSend {
+                    dst: VReg(3),
+                    site: 0,
+                    args: vec![VReg(0)],
+                },
+                Ir::ConstSmi {
+                    dst: VReg(4),
+                    value: 1,
+                },
+                Ir::SmiArith {
+                    op: SmiOp::Add,
+                    dst: VReg(1),
+                    a: VReg(1),
+                    b: VReg(4),
+                    fail: BlockId(4),
+                },
+                Ir::Jump { target: BlockId(1) },
+            ],
+            entry_stack: Vec::new(),
+        },
+        IrBlock {
+            id: BlockId(3),
+            bci: 3,
+            code: vec![Ir::Ret { val: VReg(0) }],
+            entry_stack: Vec::new(),
+        },
+        IrBlock {
+            id: BlockId(4),
+            bci: 4,
+            code: vec![Ir::Bailout {
+                reason: BailoutReason::SmiOpFailed,
+            }],
+            entry_stack: Vec::new(),
+        },
+    ];
+    let call_sites = vec![CallSiteInfo {
+        selector: scav_sel,
+        // Receiver INCLUDED (ir.rs's own `ic_view.argc() + 1` convention)
+        // -- this exact count is what `roots::real_oop_rootspill_slots`
+        // reads to bound the c2i RootSpill scan while the scavenge runs
+        // INSIDE the adapter, so this test also covers the off-by-one its
+        // first draft had (an extra garbage slot scanned as an oop).
+        argc: 1,
+        static_klass: None,
+    }];
+    let pool = base_pool(&vm);
+    let nm_id = install_loop_nmethod(
+        &mut vm,
+        t_klass,
+        blocks,
+        vregs,
+        pool,
+        call_sites,
+        1,
+        b"midLoopRunProbe",
+    );
+
+    // p: a YOUNG T instance with recognizable ivars.
+    let p = alloc::alloc_slots(&mut vm, t_klass);
+    p.set_body_oop(0, SmallInt::new(3).oop());
+    p.set_body_oop(1, SmallInt::new(4).oop());
+    let p_original_bits = p.oop().raw();
+
+    // Root the test's own klass handle UNDER the receiver (enter_compiled
+    // reads [receiver] from the top of stack; deeper slots are ordinary
+    // roots every scavenge rewrites) -- after ~100 collections the
+    // Rust-local `t_klass` is long stale.
+    // Root the klass + p first, THEN run one real interpreted call, THEN
+    // push the receiver copy on top. Ordering is load-bearing:
+    // `enter_compiled`'s TierLink records `vm.stack.fp`, and `walk_frames`
+    // (run by every scavenge under the compiled frame) crosses the
+    // CallStub boundary into THAT frame and reads its `saved_fp`,
+    // expecting a genuine entry-frame layout with the
+    // ENTRY_FRAME_SENTINEL — exactly what every production compiled call
+    // has (compiled code is only ever entered from a real interpreted
+    // send, whose caller frame is LIVE above everything else). A bare
+    // test VM only gets the DEAD REMNANT of a completed warm-up run's
+    // entry frame — which works, but only if nothing overwrites its
+    // slots: pushing test roots AFTER the warm-up plants them exactly
+    // where that dead frame's own header lives (sp rewound to 0), and
+    // the walker then reads a pushed mem oop as `saved_fp` (found the
+    // hard way, twice: "Frame::saved_fp: not a smi" from inside the
+    // first scavenge's own walk). Pushing them FIRST moves the warm-up
+    // frame — and its intact sentinel — safely above them.
+    vm.stack.push(t_klass.oop());
+    vm.stack.push(p.oop());
+    let idle_sel = vm.universe.intern(b"idleWarm");
+    let mut ib = BytecodeBuilder::new();
+    ib.ret_self();
+    let idle_method = ib.finish(&mut vm, idle_sel, 0, 0);
+    let _ = macvm::interpreter::run_method(&mut vm, idle_method, SmallInt::new(0).oop(), &[]);
+    vm.stack.push(p.oop()); // the receiver `enter_compiled` reads from the top
+    let scav_before = vm.universe.gc_stats.scavenge_count;
+    let under_before = vm.universe.gc_stats.gc_under_compiled;
+
+    assert_eq!(enter_compiled(&mut vm, nm_id, 0), EnterResult::Completed);
+
+    let result = vm.stack.pop();
+    let _p_root = vm.stack.pop(); // the slot-1 root copy (live, but done with)
+    let t_klass_now = KlassOop::try_from(vm.stack.pop()).expect("rooted klass survived");
+    assert_eq!(
+        vm.universe.gc_stats.scavenge_count,
+        scav_before + N as u64,
+        "every one of the {N} scav sends must have run a REAL scavenge"
+    );
+    assert!(
+        vm.universe.gc_stats.gc_under_compiled >= under_before + N as u64,
+        "gate item 2(c) / P10: all {N} scavenges ran UNDER the live compiled frame"
+    );
+    assert_ne!(
+        result.raw(),
+        p_original_bits,
+        "p must have MOVED (a young object cannot sit still through {N} scavenges)"
+    );
+    assert_eq!(
+        klass_of(&vm, result).oop().raw(),
+        t_klass_now.oop().raw(),
+        "the returned object must still be a T"
+    );
+    let result_mem = MemOop::try_from(result).expect("result must be a mem oop");
+    assert_eq!(
+        result_mem.body_oop(0),
+        SmallInt::new(3).oop(),
+        "ivar x must survive ~{N} relocations intact"
+    );
+    assert_eq!(
+        result_mem.body_oop(1),
+        SmallInt::new(4).oop(),
+        "ivar y must survive ~{N} relocations intact"
+    );
+    assert!(
+        matches!(
+            vm.code_table.get(nm_id).unwrap().ic_sites[0].state,
+            IcState::Mono { .. }
+        ),
+        "the scav site must have gone mono on iteration 1 and STAYED valid across every \
+         scavenge (update_keys keeps its guard-klass mirror current)"
+    );
+}
+
+/// `tests_s12.md` gate item 2's VARIANT: the scavenges come from the
+/// ALLOC slow edge instead of a send — the loop body is an inline
+/// `Ir::Alloc` (a real compiled eden bump through `eden_top_addr`), with
+/// eden pre-filled so the very first iteration overflows into
+/// `rt_alloc_slow` → the ordinary cascade → a real scavenge under the
+/// live compiled frame; each subsequent fill cycle (~64 iterations of
+/// 510-word objects through a 256 KiB eden) scavenges again. Covers the
+/// `Alloc` safepoint's own oop map (a DIFFERENT safepoint kind than the
+/// send variant's CallSend) plus the post-scavenge inline fast path
+/// re-reading the live (reset) bump pointer through the shared word.
+#[test]
+fn mid_loop_alloc_edge_forced_scavenge() {
+    const N: i64 = 200;
+    const CHUNK_WORDS: u32 = 510; // 4080 bytes -- just under emit's 4096 gate
+    let mut vm = test_vm();
+    let object_klass = vm.universe.object_klass;
+    let t_klass = vm.universe.new_klass(
+        object_klass,
+        "AllocEdgeT",
+        Format::Slots,
+        false,
+        HEADER_WORDS + 2,
+    );
+    let chunk_klass = vm.universe.new_klass(
+        object_klass,
+        "AllocEdgeChunk",
+        Format::Slots,
+        false,
+        CHUNK_WORDS as usize,
+    );
+
+    // Loop: same skeleton as the send flagship, body = inline Alloc.
+    let vregs: Vec<VRegInfo> = vec![
+        VRegInfo { is_oop: true },  // v0 self
+        VRegInfo { is_oop: false }, // v1 i
+        VRegInfo { is_oop: false }, // v2 N
+        VRegInfo { is_oop: true },  // v3 alloc result (dead)
+        VRegInfo { is_oop: false }, // v4 const 1
+    ];
+    let mut pool = base_pool(&vm);
+    let chunk_klass_lit = PoolLit(pool.len() as u32);
+    pool.push(PoolEntry {
+        value: chunk_klass.oop().raw(),
+        kind: Some(RelocKind::Oop),
+    });
+    let blocks = vec![
+        IrBlock {
+            id: BlockId(0),
+            bci: 0,
+            code: vec![
+                Ir::Param {
+                    dst: VReg(0),
+                    index: 0,
+                },
+                Ir::ConstSmi {
+                    dst: VReg(1),
+                    value: 0,
+                },
+                Ir::ConstSmi {
+                    dst: VReg(2),
+                    value: N,
+                },
+                Ir::Jump { target: BlockId(1) },
+            ],
+            entry_stack: Vec::new(),
+        },
+        IrBlock {
+            id: BlockId(1),
+            bci: 1,
+            code: vec![Ir::SmiCmpBr {
+                op: CmpOp::Lt,
+                a: VReg(1),
+                b: VReg(2),
+                if_true: BlockId(2),
+                if_false: BlockId(3),
+                fail: BlockId(4),
+            }],
+            entry_stack: Vec::new(),
+        },
+        IrBlock {
+            id: BlockId(2),
+            bci: 2,
+            code: vec![
+                Ir::Alloc {
+                    dst: VReg(3),
+                    klass: chunk_klass_lit,
+                    size_words: CHUNK_WORDS,
+                },
+                Ir::ConstSmi {
+                    dst: VReg(4),
+                    value: 1,
+                },
+                Ir::SmiArith {
+                    op: SmiOp::Add,
+                    dst: VReg(1),
+                    a: VReg(1),
+                    b: VReg(4),
+                    fail: BlockId(4),
+                },
+                Ir::Jump { target: BlockId(1) },
+            ],
+            entry_stack: Vec::new(),
+        },
+        IrBlock {
+            id: BlockId(3),
+            bci: 3,
+            code: vec![Ir::Ret { val: VReg(0) }],
+            entry_stack: Vec::new(),
+        },
+        IrBlock {
+            id: BlockId(4),
+            bci: 4,
+            code: vec![Ir::Bailout {
+                reason: BailoutReason::SmiOpFailed,
+            }],
+            entry_stack: Vec::new(),
+        },
+    ];
+    let nm_id = install_loop_nmethod(
+        &mut vm,
+        t_klass,
+        blocks,
+        vregs,
+        pool,
+        Vec::new(),
+        1,
+        b"allocEdgeRunProbe",
+    );
+
+    let p = alloc::alloc_slots(&mut vm, t_klass);
+    p.set_body_oop(0, SmallInt::new(3).oop());
+    p.set_body_oop(1, SmallInt::new(4).oop());
+    let p_original_bits = p.oop().raw();
+
+    // Pre-fill eden honestly so iteration 1's inline bump overflows
+    // immediately (same idiom as every other slow-edge test here).
+    let array_klass = vm.universe.array_klass;
+    let chunk_elems = 4096usize;
+    let chunk_bytes = (HEADER_WORDS + chunk_elems) * 8;
+    while vm.universe.eden.end - vm.universe.eden.top >= chunk_bytes {
+        alloc::alloc_indexable_oops(&mut vm, array_klass, chunk_elems);
+    }
+    while vm.universe.eden.end - vm.universe.eden.top >= (CHUNK_WORDS as usize) * 8 {
+        alloc::alloc_slots(&mut vm, chunk_klass);
+    }
+
+    // Root the klass + p first, THEN run one real interpreted call, THEN
+    // push the receiver copy on top. Ordering is load-bearing:
+    // `enter_compiled`'s TierLink records `vm.stack.fp`, and `walk_frames`
+    // (run by every scavenge under the compiled frame) crosses the
+    // CallStub boundary into THAT frame and reads its `saved_fp`,
+    // expecting a genuine entry-frame layout with the
+    // ENTRY_FRAME_SENTINEL — exactly what every production compiled call
+    // has (compiled code is only ever entered from a real interpreted
+    // send, whose caller frame is LIVE above everything else). A bare
+    // test VM only gets the DEAD REMNANT of a completed warm-up run's
+    // entry frame — which works, but only if nothing overwrites its
+    // slots: pushing test roots AFTER the warm-up plants them exactly
+    // where that dead frame's own header lives (sp rewound to 0), and
+    // the walker then reads a pushed mem oop as `saved_fp` (found the
+    // hard way, twice: "Frame::saved_fp: not a smi" from inside the
+    // first scavenge's own walk). Pushing them FIRST moves the warm-up
+    // frame — and its intact sentinel — safely above them.
+    vm.stack.push(t_klass.oop());
+    vm.stack.push(p.oop());
+    let idle_sel = vm.universe.intern(b"idleWarm");
+    let mut ib = BytecodeBuilder::new();
+    ib.ret_self();
+    let idle_method = ib.finish(&mut vm, idle_sel, 0, 0);
+    let _ = macvm::interpreter::run_method(&mut vm, idle_method, SmallInt::new(0).oop(), &[]);
+    vm.stack.push(p.oop()); // the receiver `enter_compiled` reads from the top
+    let scav_before = vm.universe.gc_stats.scavenge_count;
+    let under_before = vm.universe.gc_stats.gc_under_compiled;
+
+    assert_eq!(enter_compiled(&mut vm, nm_id, 0), EnterResult::Completed);
+
+    let result = vm.stack.pop();
+    let _p_root = vm.stack.pop(); // the slot-1 root copy (live, but done with)
+    let t_klass_now = KlassOop::try_from(vm.stack.pop()).expect("rooted klass survived");
+    assert!(
+        vm.universe.gc_stats.scavenge_count >= scav_before + 2,
+        "200 iterations x 4080 bytes through a 256 KiB eden must scavenge repeatedly \
+         (got {} new scavenges)",
+        vm.universe.gc_stats.scavenge_count - scav_before
+    );
+    assert!(
+        vm.universe.gc_stats.gc_under_compiled >= under_before + 2,
+        "every one of those scavenges ran UNDER the live compiled frame (Alloc safepoint)"
+    );
+    assert_ne!(result.raw(), p_original_bits, "p must have moved");
+    assert_eq!(
+        klass_of(&vm, result).oop().raw(),
+        t_klass_now.oop().raw(),
+        "the returned object must still be a T"
+    );
+    let result_mem = MemOop::try_from(result).expect("result must be a mem oop");
+    assert_eq!(result_mem.body_oop(0), SmallInt::new(3).oop());
+    assert_eq!(result_mem.body_oop(1), SmallInt::new(4).oop());
+    let _ = Oop::from_raw(result.raw()); // shape-checkable to the end
 }

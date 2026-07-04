@@ -205,27 +205,30 @@ pub fn run_method(vm: &mut VmState, method: MethodOop, receiver: Oop, args: &[Oo
 /// surfaced this as a *different* method resuming at a wildly
 /// out-of-range bci belonging to whatever the nested call had run last.
 ///
-/// S12 D3 adds a third thing that needs the same save/clear/restore
-/// treatment: `vm.reg_block.last_compiled_{fp,pc,kind}` (the anchor a
-/// runtime stub's own prologue writes before calling into Rust — this
-/// function's OWN caller, `rt_interpret_call`, is reached through exactly
-/// such a stub, `c2i_shared`). Left untouched, the anchor stays pointed at
-/// `c2i_shared`'s own frame for this call's ENTIRE duration — including
-/// while `method`'s own dispatch loop (just below) is genuinely the
-/// innermost activation on the real native stack. `runtime::frames::
-/// walk_frames` decides whether to start walking from the anchor or from
-/// `vm.stack` by checking only whether the anchor is nonzero; left stale
-/// here, a GC triggered by an allocation `method` itself performs (once
-/// S12 step 7 deletes the D8 bridge that currently forbids this
-/// entirely) would incorrectly start the walk from `c2i_shared`'s outer
-/// frame instead of `method`'s own, skipping every real root in between.
-/// Clearing `last_compiled_fp` on entry (mirroring `vm.stack`/`vm.regs`'
-/// own save/restore above) makes the anchor correctly read "no live stub
-/// frame more recent than vm.stack itself" for the whole time `method` is
-/// the true innermost activation, and restoring it afterward correctly
-/// hands the anchor back to whatever stub is still waiting outside this
-/// call (its own epilogue, not this function, is what eventually clears
-/// it for real).
+/// The ANCHOR (`vm.reg_block.last_compiled_{fp,pc,kind}`) is deliberately
+/// NOT touched here — a step-3 draft cleared and restored it (so the
+/// then-anchor-first `walk_frames` wouldn't start from `c2i_shared`'s
+/// outer frame while `method`'s own dispatch loop was the true innermost
+/// activation), but that clear turned out to HIDE the entire native chain
+/// in the one case the interpreter has no frame of its own: a reentrant
+/// send whose target's PRIMITIVE succeeds collects BEFORE any frame is
+/// pushed (`try_primitive` precedes activation), leaving `has_frame`
+/// false AND the anchor zeroed — `walk_frames` saw nothing native at all
+/// and every compiled frame's spill slots were silently skipped (found by
+/// `mid_loop_forced_scavenge` the moment the D8 bridge came down). The
+/// walker now starts from the LIVE interpreter segment whenever one
+/// exists and reaches the native chain through `TierLink::
+/// IntoInterpreter` (which carries the same fp/pc as the anchor), so a
+/// still-set anchor during a nested interpreted call is simply correct —
+/// see `walk_frames`' own start-of-walk comment.
+///
+/// The saved `vm.regs` snapshot IS GC-sensitive though (S12 step 7): it
+/// holds `method` as a bare `MethodOop` COPY for the whole nested call,
+/// and any collection the nested call runs updates the LIVE
+/// `vm.regs.method` root but cannot see this Rust-local copy — blindly
+/// restoring it afterward would resurrect the outer method's PRE-GC
+/// address. Re-rooted through a handle across the call, exactly like
+/// `rt_dnu`'s own locals.
 pub fn run_method_reentrant(
     vm: &mut VmState,
     method: MethodOop,
@@ -234,22 +237,23 @@ pub fn run_method_reentrant(
 ) -> Oop {
     let saved = vm.stack.save_activation();
     let saved_regs = vm.regs;
-    let saved_anchor = (
-        vm.reg_block.last_compiled_fp,
-        vm.reg_block.last_compiled_pc,
-        vm.reg_block.last_compiled_kind,
-    );
-    vm.reg_block.last_compiled_fp = 0;
-    vm.reg_block.last_compiled_pc = 0;
-    vm.reg_block.last_compiled_kind = 0;
+    let scope = crate::memory::handles::HandleScope::enter(vm);
+    let saved_method_h = saved_regs.method.map(|m| scope.handle(vm, m.oop()));
     let result = run_method(vm, method, receiver, args);
     vm.stack.restore_activation(saved);
     vm.regs = saved_regs;
-    (
-        vm.reg_block.last_compiled_fp,
-        vm.reg_block.last_compiled_pc,
-        vm.reg_block.last_compiled_kind,
-    ) = saved_anchor;
+    if let Some(h) = saved_method_h {
+        // Validating `try_from` (not roots.rs's `from_oop_unchecked`
+        // escape hatch) is fine HERE: any collection the nested call ran
+        // has fully completed by this point, so the heap is coherent —
+        // the mid-phase-C "reading through a not-yet-copied forwardee"
+        // hazard that forces the unchecked form inside the collector
+        // itself cannot occur after it returns.
+        vm.regs.method = Some(
+            MethodOop::try_from(h.get(vm))
+                .expect("run_method_reentrant: saved outer method survived the nested call"),
+        );
+    }
     result
 }
 

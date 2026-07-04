@@ -344,11 +344,20 @@ where
 /// count computed by the emitter's own arithmetic (`emit_mov_imm64`/size
 /// folding), never smi-tagged, so treating it as a possible oop is
 /// actively unsafe, not merely imprecise. `Resolve`/`C2i`/`Mega`/`Dnu` are
-/// all reached from an ordinary `Ir::CallSend` site, whose own real arg
+/// all reached from an ordinary `Ir::CallSend` site, whose own live word
 /// count varies per call site — recovered by looking up the ORIGINAL
 /// compiled caller (`caller_pc`, `FrameView::Adapter`'s own field, exactly
-/// why it exists) and reading that site's own recorded `IcSite::argc`
-/// (receiver + argc args = `argc + 1` real oop slots). `Poll` can never
+/// why it exists) and reading that site's own recorded `IcSite::argc`,
+/// which ALREADY INCLUDES the receiver (`ir.rs` builds `CallSiteInfo.argc
+/// = ic_view.argc() + 1`, and `rt_dnu` decodes the same field as
+/// `real_argc = argc_total - 1` — verified at both ends, because this
+/// helper's own first draft wrote `1 + site.argc`, silently re-adding a
+/// receiver the count already contains: one EXTRA RootSpill slot scanned,
+/// i.e. stale caller register content traced as an oop, the precise
+/// corruption this per-kind function exists to prevent. Caught by
+/// re-deriving the convention while designing `mid_loop_forced_scavenge`,
+/// whose real c2i send under a real scavenge is exactly the test that
+/// covers this arm). `Poll` can never
 /// reach here at all — `walk_frames`'s own documented invariant is that it
 /// never produces `FrameView::Adapter { kind: Poll, .. }` (`stub_poll`
 /// never tags the anchor), so this arm defends a static impossibility
@@ -381,7 +390,7 @@ fn real_oop_rootspill_slots(vm: &VmState, kind: AdapterKind, caller_pc: u64) -> 
                          {off:#x}) doesn't match any of nmethod {nm_id:?}'s own IcSites"
                     )
                 });
-            1 + site.argc as usize
+            site.argc as usize
         }
     }
 }

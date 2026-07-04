@@ -22,9 +22,29 @@ use crate::runtime::lookup::LookupCache;
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct VmRegBlock {
-    /// S11 inline alloc.
-    pub eden_top: u64,
-    /// S11 inline alloc.
+    /// S12 step 7 (single-source-of-truth eden): the ADDRESS of
+    /// `vm.universe.eden.top` — NOT a copy of its value. Compiled code's
+    /// inline-alloc fast path dereferences this to read AND write the one
+    /// canonical bump pointer, the same word every Rust-side allocator and
+    /// both collectors already use. Replaces S11's `eden_top` VALUE copy +
+    /// the publish/adopt sync protocol at `enter_compiled`'s outermost
+    /// boundary, which was sound only while the (now-deleted) D8 bridge
+    /// froze `eden.top` for the whole compiled window; with real GC
+    /// running under compiled frames, ANY value copy goes stale the moment
+    /// a nested allocation or collection moves the real pointer — sharing
+    /// the one location makes staleness structurally impossible instead of
+    /// something every current and future tier-crossing must remember to
+    /// prevent. Stable for the whole process lifetime: `Universe::eden` is
+    /// boxed (`Box<Eden>`), so this address survives `VmState`/`Universe`
+    /// being moved by value. Set ONCE in `with_options`, never
+    /// republished.
+    pub eden_top_addr: u64,
+    /// S11 inline alloc's bounds check. A VALUE copy, but of an immutable
+    /// quantity: eden's ceiling is fixed at genesis and never grows or
+    /// moves (only `old` grows — `Universe::grow_old`), so unlike the
+    /// S11-era `eden_top` copy this can never go stale. Set ONCE in
+    /// `with_options`, alongside `old_start`/`card_base_biased` (same
+    /// fixed-at-genesis reasoning).
     pub eden_end: u64,
     /// S11 write barrier.
     pub old_start: u64,
@@ -54,7 +74,7 @@ pub struct VmRegBlock {
 impl VmRegBlock {
     pub fn new() -> VmRegBlock {
         VmRegBlock {
-            eden_top: 0,
+            eden_top_addr: 0,
             eden_end: 0,
             old_start: 0,
             card_base_biased: 0,
@@ -138,23 +158,6 @@ pub enum TierLink {
 pub struct NlrState {
     pub home: crate::oops::home_ref::HomeRef,
     pub value: crate::oops::Oop,
-}
-
-/// S11 D8 step 10: which collection `prim_gc_scavenge`/`prim_gc_full`
-/// deferred because it ran under a live compiled frame (`compiled_depth >
-/// 0`, D8 bridge). `Full` always wins over `Scavenge` — a full GC already
-/// does everything a scavenge would, so downgrading a pending `Full` back
-/// to `Scavenge` on a later, weaker request would silently drop the
-/// stronger one (`VmState::request_pending_gc` enforces this, never set
-/// this field directly). Run at the next point `compiled_depth` actually
-/// reaches 0 (`VmState::run_pending_gc_if_due`, called from
-/// `enter_compiled`'s outermost exit) — this rule is the same "ugly,
-/// memory-hungry, exists precisely so S11 can gate without S12" bridge the
-/// sprint doc's D8 describes; S12 deletes the whole mechanism.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum GcPendingKind {
-    Scavenge,
-    Full,
 }
 
 /// Which `MACVM_TRACE` channels are enabled. The channel set is open-ended
@@ -465,17 +468,6 @@ pub struct VmState {
     /// unrelated compiled call); cleared only when the unwind finally
     /// returns from home.
     pub nlr_state: Option<NlrState>,
-    /// S11 D8 step 10: a collection `prim_gc_scavenge`/`prim_gc_full`
-    /// deferred because `compiled_depth > 0` at the time of the request.
-    /// Set only via `request_pending_gc` (upgrade-only: `Full` beats
-    /// `Scavenge`), run and cleared by `run_pending_gc_if_due` — called
-    /// from `enter_compiled`'s outermost exit, the same `compiled_depth ==
-    /// 0` boundary that already re-adopts eden. `None` most of the time
-    /// (an explicit `Smalltalk gcScavenge`/`gcFull` under a compiled frame
-    /// is rare); left `Some` across the deferral window is the ENTIRE
-    /// point — unlike `nlr_state`, a stranded value here is harmless (just
-    /// a delayed collection), not a correctness hazard.
-    pub gc_pending: Option<GcPendingKind>,
     /// Test-only one-shot hook (tests_s10.md's `mixed_trace_golden`, gate
     /// item 4): compiled code is send-free (D1), so nothing inside it can
     /// call a `printStackTrace` primitive directly — a test sets this
@@ -508,28 +500,11 @@ pub struct VmState {
     /// own cross-check invariant (a native boundary always has a matching
     /// tier link) breaks.
     pub test_tear_tier_links_before_walk: bool,
-    /// S12 step 4, same "dormant, not `#[cfg(test)]`" status as
-    /// `test_walk_capture`: lets a test call `memory::scavenge::scavenge`
-    /// DIRECTLY while a live compiled frame is genuinely on the native
-    /// stack, bypassing only THIS function's own internal
-    /// `debug_assert!(compiled_depth == 0, ..)` — none of the three
-    /// production-facing S11 D8 bridge doors (`alloc::alloc_words`'s
-    /// diversion arm, `prim_gc_scavenge`/`prim_gc_full`'s own `gc_pending`
-    /// defer) are affected by this flag at all, so ordinary Smalltalk code
-    /// still cannot reach a moving collector under a live compiled frame
-    /// until step 7 opens all three doors together (deliberately grouped:
-    /// full GC isn't compiled-frame-aware until step 5, nmethod flushing
-    /// doesn't exist until step 6, so opening every door this early would
-    /// let ordinary code depend on a still-incomplete mechanism). Exists
-    /// because proving `memory::roots::each_code_root`'s new frame-scanning
-    /// path correct needs a REAL scavenge to run against a REAL live
-    /// compiled/adapter frame — the same "no honest way to test this
-    /// without a genuine in-flight native chain" reasoning as
-    /// `test_walk_capture` itself.
-    pub test_allow_moving_gc_under_compiled: bool,
-    /// Companion to `test_allow_moving_gc_under_compiled`: if set,
-    /// `rt_alloc_slow` runs a REAL `memory::scavenge::scavenge` (with that
-    /// flag flipped on for just the duration of the call) before doing its
+    /// S12 step 4 test hook (its step-4-era companion flag,
+    /// `test_allow_moving_gc_under_compiled`, died with the D8 bridge in
+    /// step 7 — a scavenge under a live compiled frame no longer needs any
+    /// bypass, it's simply legal): if set, `rt_alloc_slow` runs a REAL
+    /// `memory::scavenge::scavenge` before doing its
     /// own normal allocation, and overwrites this with `Ok((before, after))`
     /// — the raw bits of the SOLE live oop slot `runtime::frames::
     /// walk_frames` finds in the compiled frame beneath it, read
@@ -544,67 +519,15 @@ pub struct VmState {
 }
 
 impl VmState {
-    /// S11 D8: hand the interpreter's authoritative eden bump pointer +
-    /// bounds to compiled code (which allocates by bumping
-    /// `reg_block.eden_top` directly in its inline-alloc fast path). Called
-    /// at the OUTERMOST `enter_compiled` (compiled_depth 0→1). Publishes
-    /// BOTH fields because a GC or old-gen growth between compiled windows
-    /// can have moved eden's bounds since the last publish.
-    pub(crate) fn publish_eden_to_regblock(&mut self) {
-        self.reg_block.eden_top = self.universe.eden.top as u64;
-        self.reg_block.eden_end = self.universe.eden.end as u64;
-    }
-
-    /// S11 D8: reclaim compiled code's eden bump progress back into the
-    /// interpreter's authoritative `eden.top`. Called at the OUTERMOST exit
-    /// (compiled_depth 1→0). Sound only because the D8 bridge froze
-    /// `eden.top` for the whole compiled window (every Rust allocation
-    /// under `compiled_depth > 0` went old-direct — `alloc::alloc_words`),
-    /// so `reg_block.eden_top` is the sole party that advanced the nursery.
-    /// `eden_end` is NOT copied back: eden's ceiling can't move while the
-    /// window holds (no GC/growth of the young gen under a compiled frame).
-    pub(crate) fn adopt_eden_from_regblock(&mut self) {
-        self.universe.eden.top = self.reg_block.eden_top as usize;
-    }
-
-    /// S11 D8 step 10: record that `kind` was declined under a live
-    /// compiled frame, upgrading (never downgrading) any already-pending
-    /// request — a `Full` covers everything a `Scavenge` would have done,
-    /// so a later, weaker request must not erase an earlier, stronger one.
-    pub(crate) fn request_pending_gc(&mut self, kind: GcPendingKind) {
-        self.gc_pending = Some(match (self.gc_pending, kind) {
-            (Some(GcPendingKind::Full), _) | (_, GcPendingKind::Full) => GcPendingKind::Full,
-            (_, GcPendingKind::Scavenge) => GcPendingKind::Scavenge,
-        });
-    }
-
-    /// S11 D8 step 10: runs (and clears) any collection deferred while
-    /// `compiled_depth > 0`. Callable only once `compiled_depth` has
-    /// actually returned to 0 — both collectors themselves
-    /// `debug_assert_eq!` that, so calling this too early panics in debug
-    /// builds rather than silently re-violating the bridge it exists to
-    /// close. `enter_compiled`'s outermost exit is the only call site (S11):
-    /// the same boundary that already re-adopts eden is the first point a
-    /// deferred collection is safe to actually run.
-    pub(crate) fn run_pending_gc_if_due(&mut self) {
-        let Some(kind) = self.gc_pending.take() else {
-            return;
-        };
-        if self.options.trace.is_enabled("gc") {
-            eprintln!("[gc] running deferred {kind:?} now that compiled_depth == 0 (D8 bridge)");
-        }
-        match kind {
-            GcPendingKind::Scavenge => {
-                if let Err(err) = crate::memory::scavenge::scavenge(self) {
-                    crate::memory::alloc::stall_exit(err);
-                }
-            }
-            GcPendingKind::Full => {
-                crate::memory::fullgc::full_gc(self)
-                    .expect("full_gc: pure compaction never returns Err (see its own doc)");
-            }
-        }
-    }
+    // S12 step 7: the ENTIRE S11 D8 bridge apparatus that lived here is
+    // DELETED, not relocated — `publish_eden_to_regblock`/
+    // `adopt_eden_from_regblock` (the eden-value-copy sync protocol;
+    // superseded by `reg_block.eden_top_addr` sharing the one canonical
+    // `universe.eden.top` word with compiled code directly) and
+    // `GcPendingKind`/`gc_pending`/`request_pending_gc`/
+    // `run_pending_gc_if_due` (the deferred-collection mechanism; a
+    // collection under a live compiled frame is now simply an ordinary,
+    // fully rooted collection, so there is nothing left to defer).
 
     /// Parses options from the environment once and boots a fresh universe.
     pub fn new() -> VmState {
@@ -621,19 +544,25 @@ impl VmState {
     /// cannot race on process-wide env vars) and by any later embedder.
     pub fn with_options(options: VmOptions) -> VmState {
         let universe = Universe::genesis(&options);
-        // S11 D3/P7: `old_start`/`card_base_biased` are fixed for the
-        // whole process lifetime, set ONCE here — unlike `eden_top`/
-        // `eden_end` (S11 step 8, re-published into the reg block at every
-        // outermost `enter_compiled` via `publish_eden_to_regblock`, since
-        // a GC between compiled windows can move eden's bounds), old gen's
-        // own `bounds.start` never moves (`OldGen::grow` only advances
-        // `committed_end`, never `bounds.start` itself, `spaces.rs`'s own
-        // doc), and the card table is sized for old's FULL reserved range
-        // at genesis (never regrown either) — so there is no later point
-        // that ever needs to redo this.
+        // Every reg-block field is fixed for the whole process lifetime and
+        // set ONCE here (S11 D3/P7, extended by S12 step 7): old gen's own
+        // `bounds.start` never moves (`OldGen::grow` only advances
+        // `committed_end`), the card table is sized for old's FULL reserved
+        // range at genesis, eden's ceiling (`eden.end`) never grows or
+        // moves after genesis (only `old` ever grows), and
+        // `eden_top_addr` is the ADDRESS of the one live bump pointer —
+        // stable because `Universe::eden` is boxed (see the field's own
+        // doc), so it survives `universe` being moved into the `VmState`
+        // literal below and every later move of `VmState` itself. Taken
+        // via `&raw const` (never a `&`/`&mut` intermediate) so no
+        // reference's provenance is ever narrowed to the read that created
+        // it — compiled code will WRITE through this address for the
+        // process's whole lifetime.
         let mut reg_block = VmRegBlock::new();
         reg_block.old_start = universe.layout.old_start as u64;
         reg_block.card_base_biased = universe.cards.base_biased();
+        reg_block.eden_top_addr = (&raw const universe.eden.top) as u64;
+        reg_block.eden_end = universe.eden.end as u64;
         // Stubs are installed unconditionally (regardless of `options.jit`)
         // so `compile_method` (S10 D4) never has to lazily bootstrap them
         // mid-compile — one small, fixed, one-time cost per VM, matching
@@ -668,11 +597,9 @@ impl VmState {
             tier_links: Vec::new(),
             compiled_depth: 0,
             nlr_state: None,
-            gc_pending: None,
             trace_on_poll: false,
             test_walk_capture: None,
             test_tear_tier_links_before_walk: false,
-            test_allow_moving_gc_under_compiled: false,
             test_force_scavenge_in_alloc_slow: false,
             test_scavenge_probe: None,
         };
@@ -822,12 +749,13 @@ mod tests {
     fn vmregblock_offsets_pinned() {
         use crate::oops::layout::{
             VMREG_BLOCK_SIZE, VMREG_CARD_BASE_BIASED_OFFSET, VMREG_EDEN_END_OFFSET,
-            VMREG_EDEN_TOP_OFFSET, VMREG_LAST_COMPILED_FP_OFFSET, VMREG_LAST_COMPILED_KIND_OFFSET,
-            VMREG_LAST_COMPILED_PC_OFFSET, VMREG_OLD_START_OFFSET, VMREG_POLL_FLAG_OFFSET,
+            VMREG_EDEN_TOP_ADDR_OFFSET, VMREG_LAST_COMPILED_FP_OFFSET,
+            VMREG_LAST_COMPILED_KIND_OFFSET, VMREG_LAST_COMPILED_PC_OFFSET, VMREG_OLD_START_OFFSET,
+            VMREG_POLL_FLAG_OFFSET,
         };
         assert_eq!(
-            std::mem::offset_of!(VmRegBlock, eden_top),
-            VMREG_EDEN_TOP_OFFSET
+            std::mem::offset_of!(VmRegBlock, eden_top_addr),
+            VMREG_EDEN_TOP_ADDR_OFFSET
         );
         assert_eq!(
             std::mem::offset_of!(VmRegBlock, eden_end),
@@ -863,11 +791,12 @@ mod tests {
         assert_eq!(std::mem::offset_of!(VmState, reg_block), 0);
     }
 
-    /// S11 D3/P7: `with_options` must populate `old_start`/
-    /// `card_base_biased` with real values (not `VmRegBlock::new()`'s own
-    /// all-zero default) — a compiled write barrier reading zero here
-    /// would treat EVERY object as old-gen (`obj >= 0` always true) and
-    /// dirty cards at nonsense addresses.
+    /// S11 D3/P7 + S12 step 7: `with_options` must populate EVERY reg-block
+    /// GC field with real values (not `VmRegBlock::new()`'s own all-zero
+    /// default) — a compiled write barrier reading a zero `old_start` would
+    /// treat every object as old-gen and dirty cards at nonsense addresses;
+    /// a compiled inline-alloc dereferencing a zero `eden_top_addr` would
+    /// fault outright.
     #[test]
     fn reg_block_gc_fields_populated_from_real_universe() {
         let vm = VmState::with_options(VmOptions::default());
@@ -884,107 +813,46 @@ mod tests {
             vm.universe.cards.base_biased(),
             "card_base_biased must mirror CardTable's own bias formula exactly"
         );
-    }
-
-    /// S11 D8 eden sync: `publish_eden_to_regblock` copies both eden fields
-    /// out, and `adopt_eden_from_regblock` copies the (compiled-bumped)
-    /// `eden_top` back into the interpreter's authoritative `eden.top`.
-    #[test]
-    fn eden_publish_adopt_round_trip() {
-        let mut vm = VmState::with_options(VmOptions::default());
-
-        // Before the first publish, the reg-block eden fields are dead zeros
-        // (nothing runs compiled at genesis).
-        assert_eq!(vm.reg_block.eden_top, 0);
-        assert_eq!(vm.reg_block.eden_end, 0);
-
-        vm.publish_eden_to_regblock();
-        assert_eq!(vm.reg_block.eden_top, vm.universe.eden.top as u64);
-        assert_eq!(vm.reg_block.eden_end, vm.universe.eden.end as u64);
-        assert_ne!(vm.reg_block.eden_top, 0, "a real eden has a non-zero top");
-
-        // Compiled code bumps eden_top directly (5 four-word objects).
-        let bumped = vm.universe.eden.top as u64 + 5 * 32;
-        vm.reg_block.eden_top = bumped;
-        // The interpreter's own eden.top hasn't moved yet (frozen mid-window).
-        assert_ne!(vm.universe.eden.top as u64, bumped);
-
-        vm.adopt_eden_from_regblock();
         assert_eq!(
-            vm.universe.eden.top as u64, bumped,
-            "adopt must reclaim compiled code's bump progress into eden.top"
+            vm.reg_block.eden_end, vm.universe.eden.end as u64,
+            "eden_end must mirror the real, genesis-fixed eden ceiling"
         );
-    }
-
-    /// S11 D8 step 10: `Full` always wins — a later, weaker `Scavenge`
-    /// request must never erase an already-pending `Full` one, since a full
-    /// GC already does everything a scavenge would have.
-    #[test]
-    fn request_pending_gc_upgrades_but_never_downgrades() {
-        let mut vm = VmState::with_options(VmOptions::default());
-        assert_eq!(vm.gc_pending, None);
-
-        vm.request_pending_gc(GcPendingKind::Scavenge);
-        assert_eq!(vm.gc_pending, Some(GcPendingKind::Scavenge));
-        vm.request_pending_gc(GcPendingKind::Scavenge);
-        assert_eq!(vm.gc_pending, Some(GcPendingKind::Scavenge));
-
-        vm.request_pending_gc(GcPendingKind::Full);
-        assert_eq!(vm.gc_pending, Some(GcPendingKind::Full));
-        vm.request_pending_gc(GcPendingKind::Scavenge);
         assert_eq!(
-            vm.gc_pending,
-            Some(GcPendingKind::Full),
-            "a later Scavenge request must not downgrade an already-pending Full"
+            vm.reg_block.eden_top_addr,
+            (&raw const vm.universe.eden.top) as u64,
+            "eden_top_addr must be the address of the ONE live bump pointer"
         );
     }
 
-    /// S11 D8 step 10: with nothing pending, `run_pending_gc_if_due` is a
-    /// true no-op (neither counter moves) — the common case, since an
-    /// explicit `Smalltalk gcScavenge`/`gcFull` under a compiled frame is
-    /// rare.
+    /// S12 step 7's single-source-of-truth invariant across a MOVE of the
+    /// whole `VmState` (exactly what `with_options` returning by value does
+    /// to every real VM, and what every test's `let mut vm = test_vm()`
+    /// does again): the once-stored `eden_top_addr` must still be the
+    /// address of `universe.eden.top` afterward — which is the whole
+    /// property, since equal addresses ARE the same memory word; a write
+    /// through one is a write to the other by definition (the real
+    /// through-the-pointer traffic is exercised end-to-end by every
+    /// compiled inline-alloc test, e.g. `allocation_fast_and_slow`). Holds
+    /// because the `Eden` struct itself is boxed; the `VmState`/`Universe`
+    /// shells around it can move freely without moving it.
     #[test]
-    fn run_pending_gc_if_due_is_a_noop_when_nothing_pending() {
-        let mut vm = VmState::with_options(VmOptions::default());
-        let (scav, full) = (
-            vm.universe.gc_stats.scavenge_count,
-            vm.universe.gc_stats.full_gc_count,
-        );
-        vm.run_pending_gc_if_due();
-        assert_eq!(vm.universe.gc_stats.scavenge_count, scav);
-        assert_eq!(vm.universe.gc_stats.full_gc_count, full);
-    }
+    fn eden_top_addr_survives_vmstate_moves() {
+        let vm = VmState::with_options(VmOptions::default());
+        let boxed = Box::new(vm); // deliberate move #1
+        let vm = *boxed; // deliberate move #2
 
-    /// S11 D8 step 10: the deferred-collection upgrade this step's whole
-    /// point — `prim_gc_scavenge`'s decline-under-compiled-frame branch used
-    /// to be a bare no-op (S11 step 8); it must now actually run a REAL
-    /// scavenge once given the chance, not just remember that one was asked
-    /// for.
-    #[test]
-    fn run_pending_gc_if_due_runs_a_real_deferred_scavenge() {
-        let mut vm = VmState::with_options(VmOptions::default());
-        let before = vm.universe.gc_stats.scavenge_count;
-
-        vm.request_pending_gc(GcPendingKind::Scavenge);
+        assert_ne!(vm.reg_block.eden_top_addr, 0);
         assert_eq!(
-            vm.universe.gc_stats.scavenge_count, before,
-            "requesting must not itself run anything"
+            vm.reg_block.eden_top_addr,
+            (&raw const vm.universe.eden.top) as u64,
+            "the stored address must still name eden.top after VmState moves"
         );
-
-        vm.run_pending_gc_if_due();
-        assert_eq!(vm.universe.gc_stats.scavenge_count, before + 1);
-        assert_eq!(vm.gc_pending, None, "must clear the request once serviced");
     }
 
-    /// Sibling of the scavenge test above, for `GcPendingKind::Full`.
-    #[test]
-    fn run_pending_gc_if_due_runs_a_real_deferred_full_gc() {
-        let mut vm = VmState::with_options(VmOptions::default());
-        let before = vm.universe.gc_stats.full_gc_count;
-
-        vm.request_pending_gc(GcPendingKind::Full);
-        vm.run_pending_gc_if_due();
-        assert_eq!(vm.universe.gc_stats.full_gc_count, before + 1);
-        assert_eq!(vm.gc_pending, None);
-    }
+    // S12 step 7: the four `gc_pending`/`request_pending_gc`/
+    // `run_pending_gc_if_due` tests died with the mechanism itself — the
+    // property they guarded ("a collection asked for under a compiled
+    // frame eventually runs") is superseded by the stronger one the
+    // it_gc_jit.rs flagship tests prove: it runs IMMEDIATELY, correctly,
+    // with the compiled frame's own oops as live roots.
 }

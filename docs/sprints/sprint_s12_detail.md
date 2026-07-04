@@ -542,6 +542,99 @@ is kept alive by its nmethod — acceptable float, gone at the next full GC).
 > exactly rather than re-deriving it from `enter_compiled`'s different
 > convention.
 
+> **STEP-7 NOTES (as-built) — the bridge deletion, plus a PERMANENT eden
+> redesign this doc never asked for but S10's own doc marked "preferred".**
+> (a) **Eden's bump pointer became single-source-of-truth BEFORE the
+> bridge came down** (its own prerequisite, adversarially reviewed before
+> implementation): S11's `reg_block.eden_top`/`eden_end` VALUE copies +
+> the publish/adopt sync at `enter_compiled`'s outermost boundary were
+> sound only while the bridge froze `eden.top` for the whole compiled
+> window — any sync-protocol fix would keep the bug class alive at every
+> current and future tier crossing. Replaced with the HotSpot-TLAB shape
+> sprint_s10_detail.md's own D6 text already called "preferred":
+> `Universe::eden` is boxed (stable heap address across `VmState` moves),
+> reg-block slot +0 becomes `eden_top_addr` (the ADDRESS of the one live
+> `universe.eden.top` word, set once at construction), `eden_end` stays a
+> value copy of a genesis-immutable bound, and the inline-alloc fast path
+> dereferences (+2 instructions, x20 carries the address; the
+> `alloc_fast_path_layout` test now pins the exact 8-mnemonic window so
+> the old direct-value shape can't silently reappear). publish/adopt and
+> every depth-gated eden branch are DELETED. The review also confirmed
+> the old protocol was already latently broken under step 4's test flag:
+> an exit-time adopt clobbered a post-scavenge `eden.top` back to its
+> stale pre-GC value, resurrecting poisoned eden. (b) **All bridge doors
+> deleted as one unit**: `alloc_words`' old-direct diversion arm, both
+> GC prims' defer arms, both collectors' asserts, step 4's
+> `test_allow_moving_gc_under_compiled` bypass, and the ENTIRE
+> `gc_pending`/`GcPendingKind`/`request_pending_gc`/`run_pending_gc_if_
+> due` mechanism (+ its four tests). `bridge_old_allocs` is deleted
+> (gate: compile error if referenced); `gc_under_compiled` survives with
+> INVERTED meaning (P10) — `allocation_fast_and_slow`'s `== 0` assert
+> became `> 0`, and the `bridge-stats-s11` recipe now asserts `> 0`,
+> repointed from `full:64` to `GC_STRESS=1` because the sampled mode can
+> legitimately land every collection outside the suite's short compiled
+> windows (it read 0 with nothing wrong; the every-allocation mode
+> guarantees in-window collections exist to count — final run: 110).
+> (c) **A latent stale-receiver bug in BOTH GC prims, found by pure
+> convention-tracing before any test tripped it**: they returned
+> `args[0]` — pre-collection bits — safe historically only because the
+> world always sends `gcScavenge`/`gcFull` to the tenured `smalltalk`
+> singleton. Fixed to re-read `vm.prim_arg(0)` (SPEC §10's own choke
+> point); their unit tests now root the receiver like `try_primitive`
+> does and assert the RELOCATED nil comes back, and the gcStats test
+> promptly tripped the full-gc entry verifier by reusing a pre-scavenge
+> local — fixed by re-reading, the verifier proving its worth twice in
+> one sitting. (d) **The step-4/6 NOTES' "systemic stale-Rust-local
+> hazard across all six stubs" claim is RETRACTED** — an adversarial
+> review (instructed to disprove safety, and it tried) confirmed all six
+> handlers are safe as written: nothing in `rt_resolve_send`/
+> `rt_mega_lookup`'s call tree ever touches the Smalltalk heap
+> (CodeCache is a pure bump/freelist over its own MAP_JIT region),
+> `rt_dnu` already handles everything across its two real allocations
+> (S11), and the remaining three pass their oops as one-shot call
+> arguments never read after the allocating call. (e) **A REAL off-by-one
+> in step 4's own `real_oop_rootspill_slots`, caught by re-deriving the
+> argc convention while designing the flagship**: `IcSite.argc` already
+> INCLUDES the receiver (`ir.rs` writes `ic_view.argc() + 1`; `rt_dnu`
+> reads `argc_total - 1` — verified at three ends), so `1 + site.argc`
+> scanned one extra RootSpill slot of stale caller register content as
+> an oop: precisely the corruption that per-kind function exists to
+> prevent, one flagship run away from being a heap smasher. (f) **The
+> walker's start-of-walk rule was redesigned twice more** once the
+> flagship could actually run: step 3's reentrant anchor-clear HID the
+> whole native chain when the nested target was a frameless successful
+> primitive (`try_primitive` collects before any frame exists), and the
+> interim has-frame-first fix misrouted the opposite case (a live paused
+> interpreted caller beneath an alloc-slow collection). Final rule:
+> `tier_links.last()` — the journal that cannot misorder crossings —
+> decides the innermost side; a frameless C→I consumes its own
+> `IntoInterpreter` link as the starting transition; a live-fp check
+> also treats `run_method`'s temporary ENTRY_FRAME_SENTINEL fp-spoof
+> (usize::MAX — overflowed the first slot read under GC_STRESS=1) as
+> frameless. `run_method_reentrant`'s anchor save/clear/restore is
+> REVERTED (step-3 note (c) superseded), and its saved `vm.regs.method`
+> snapshot — a bare copy held across a now-GC-capable nested call — is
+> re-rooted through a handle. (g) **The FULL flagship tests exist and
+> pass**: `mid_loop_forced_scavenge` (ONE hand-built compiled loop
+> activation — `driver::eligible` still rejects non-smi sends, step 6's
+> precedent — sending the REAL prim-93 `scav` 100×: 100 scavenges under
+> the same live frame, its spill slot relocated and re-consumed every
+> iteration, ivars intact, `gc_under_compiled >= 100`, exact-PcDesc
+> implicitly enforced by `oopmap_at`'s panic) and
+> `mid_loop_alloc_edge_forced_scavenge` (the Alloc-safepoint variant:
+> inline 510-word allocations overflowing a pre-filled 256 KiB eden
+> repeatedly). Test scaffolding earned its own pitfall entry: the
+> dead-warm-frame remnant a TierLink points at must sit ABOVE any
+> test-pushed roots (push roots first, warm second, receiver last), and
+> the `eden.top = eden.end` overflow-forcing lie is retired everywhere a
+> real collection can now follow it (the entry verifier walks the gap).
+> The flagship gate combination — `GC_STRESS=1` + `threshold=1`,
+> byte-identical to `off`, plus `full:64` + `threshold=1` — is green;
+> `just gate-s12` itself is step 8. (Also: `Cargo.toml` gained
+> `default-run = "macvm"` — the concurrent session's new second `[[bin]]`
+> made every bare `cargo run` recipe ambiguous — left uncommitted here to
+> ride with that session's own work.)
+
 ## Pitfalls
 
 - **P1 — exact PcDesc match or die.** The GC-path `oopmap_at` must panic on

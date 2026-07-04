@@ -36,7 +36,16 @@ use super::symbols::SymbolTable;
 pub struct Universe {
     #[allow(dead_code)] // kept alive for its Drop impl; no other field reads it in S1
     reservation: Reservation,
-    pub eden: Eden,
+    /// Boxed (S12 step 7) so `&eden.top` is a STABLE heap address for the
+    /// whole process lifetime, immune to `Universe`/`VmState` moves —
+    /// `VmRegBlock::eden_top_addr` (set once, `VmState::with_options`)
+    /// hands that address to compiled code, whose inline-alloc fast path
+    /// reads and writes the bump pointer THROUGH it. One canonical
+    /// location shared by both worlds, replacing S11's value-copy +
+    /// publish/adopt sync protocol (see `eden_top_addr`'s own doc for the
+    /// full why). Everything Rust-side is unaffected: `Box<Eden>` derefs
+    /// transparently at every existing `vm.universe.eden.*` use.
+    pub eden: Box<Eden>,
     /// Fixed geometry `eden`/`from`/`to`/`old` bounds were carved out of
     /// (SPEC §7.1) — `is_old`/`is_new` are defined here.
     pub layout: HeapLayout,
@@ -598,7 +607,11 @@ impl Universe {
 
         let universe = Universe {
             reservation,
-            eden,
+            // Boxed HERE, at the end of genesis, so the whole bootstrap
+            // above keeps borrowing the plain local `eden` — only the
+            // final, settled struct needs the stable address (`pub eden`'s
+            // own doc).
+            eden: Box::new(eden),
             layout,
             from,
             to,

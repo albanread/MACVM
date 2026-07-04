@@ -88,17 +88,17 @@ pub fn enter_compiled(vm: &mut VmState, nm_id: NmethodId, argc: u8) -> EnterResu
         entry_sp: vm.stack.sp as u64,
         nm_id,
     });
-    // S11 D8: the OUTERMOST I→C boundary publishes the interpreter's live
-    // eden bump pointer + bounds into `reg_block`, so compiled code's
-    // inline-alloc fast path bumps the SAME nursery. A NESTED entry
-    // (compiled_depth already > 0) touches nothing: the D8 bridge has
-    // frozen eden for the whole window (all Rust allocation under a
-    // compiled frame goes old-direct — `alloc::alloc_words`), so
-    // `reg_block.eden_top` already reflects every in-window allocation and
-    // must not be clobbered back to the frozen `eden.top`.
-    if vm.compiled_depth == 0 {
-        vm.publish_eden_to_regblock();
-    }
+    // S12 step 7: NO eden bookkeeping at this boundary, in either
+    // direction, at any depth. Compiled code's inline-alloc fast path
+    // reads and bumps the ONE live `universe.eden.top` word directly,
+    // through `reg_block.eden_top_addr` (set once at VM construction) —
+    // there is no second copy to publish on the way in or adopt back out,
+    // no matter how the compiled window ends (completion, bailout, or an
+    // NLR unwinding past any number of compiled frames). S11's
+    // publish/adopt protocol lived exactly here and was sound only while
+    // the D8 bridge froze eden for the whole window; see
+    // `VmRegBlock::eden_top_addr`'s own doc for the replacement's full
+    // reasoning.
     vm.compiled_depth += 1;
 
     let stubs = vm.stubs;
@@ -106,27 +106,8 @@ pub fn enter_compiled(vm: &mut VmState, nm_id: NmethodId, argc: u8) -> EnterResu
 
     vm.tier_links.pop();
     vm.compiled_depth -= 1;
-    // S11 D8: the OUTERMOST exit reclaims compiled code's bump progress
-    // into the interpreter's authoritative `eden.top`. Sound because the
-    // bridge froze `eden.top` for the whole window, so `reg_block.eden_top`
-    // is the only party that advanced the nursery. Runs on BOTH the
-    // completed and bailout paths: a compiled method that allocated and
-    // then bailed still produced real eden objects `eden.top` must account
-    // for. (Step 9 must run this same adopt + `compiled_depth` fixup on any
-    // NLR unwind that crosses a compiled frame — an adversarial-review
-    // finding; a stranded `compiled_depth` would freeze eden forever.)
-    let outermost_exit = vm.compiled_depth == 0;
-    if outermost_exit {
-        vm.adopt_eden_from_regblock();
-    }
 
     if result_bits == BAILOUT_SENTINEL {
-        // S11 D8 step 10: safe to run a deferred collection right here —
-        // `vm.stack` is untouched (still `[receiver, args...]`, this
-        // variant's own doc), so nothing is unrooted.
-        if outermost_exit {
-            vm.run_pending_gc_if_due();
-        }
         return EnterResult::Bailout;
     }
 
@@ -147,17 +128,14 @@ pub fn enter_compiled(vm: &mut VmState, nm_id: NmethodId, argc: u8) -> EnterResu
     // is a RESERVED_TAG word `from_raw` rejects by design, and the escape
     // already popped this side's operand stack.
     //
-    // S11 D8 step 10: deliberately NOT a `run_pending_gc_if_due` call site,
-    // even when `outermost_exit`. `continue_unwind` can hand back a bare,
-    // UNROOTED `Oop` bubbling up as an ordinary return value
-    // (`UnwindStep::ReturnedFromHome(Some(_))` — `pop_and_deliver`'s own
-    // `ENTRY_FRAME_SENTINEL` case, exactly the shape `nlr_through_compiled_frame`
-    // exercises), safe today only because nothing allocates while it's in
-    // transit up through `activate_method`/`OP_SEND`/`run_method`'s own
-    // return chain — the same pre-existing contract an ordinary (non-NLR)
-    // return value already relies on. Running a collection here would be
-    // the first thing to ever allocate in that window. Any `gc_pending`
-    // request simply waits for the next outermost exit.
+    // NOTE (pre-existing contract, unchanged by S12 step 7):
+    // `continue_unwind` can hand back a bare, UNROOTED `Oop` bubbling up
+    // as an ordinary return value (`UnwindStep::ReturnedFromHome(Some(_))`
+    // — `pop_and_deliver`'s own `ENTRY_FRAME_SENTINEL` case), safe only
+    // because nothing allocates while it's in transit up through
+    // `activate_method`/`OP_SEND`/`run_method`'s own return chain — the
+    // same contract an ordinary (non-NLR) return value already relies on.
+    // Nothing new may allocate on this path.
     if result_bits == crate::oops::layout::NLR_SENTINEL {
         let st = vm
             .nlr_state
@@ -171,16 +149,13 @@ pub fn enter_compiled(vm: &mut VmState, nm_id: NmethodId, argc: u8) -> EnterResu
     debug_assert_eq!(
         vm.stack.sp,
         base + argc_usize + 1,
-        "enter_compiled: a completed (non-bailout) compiled call must never have touched \
-         vm.stack (D1: no allocation, no calls but stub_poll, which itself doesn't touch it)"
+        "enter_compiled: a completed (non-bailout) compiled call must leave vm.stack.sp exactly \
+         where it entered (every runtime-stub re-entry — c2i, dnu, must-be-boolean — restores \
+         the activation it borrowed, and a GC under the frame rewrites slots in place, never \
+         pushes or pops)"
     );
     vm.stack.sp = base;
     push(vm, Oop::from_raw(result_bits));
-    // S11 D8 step 10: safe here — the result is already pushed onto
-    // `vm.stack` (rooted) before a deferred collection could run.
-    if outermost_exit {
-        vm.run_pending_gc_if_due();
-    }
     EnterResult::Completed
 }
 

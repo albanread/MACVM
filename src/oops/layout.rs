@@ -264,14 +264,21 @@ pub const CONTEXT_NAMED_WORDS: usize = 1;
 // A #[repr(C)] prefix struct embedded as VmState's own first field (see
 // `runtime::vm_state::VmRegBlock`), so x28 (== &VmState, established by the
 // call stub — SPEC §8.1/S10 D5.1) reaches these fields via fixed-offset
-// loads/stores with no Rust-level indirection. `eden_top`/`eden_end`
-// (S11 inline alloc) and `old_start`/`card_base_biased` (S11 barrier) and
-// `last_compiled_{fp,pc}` (S11 runtime entries) are laid out now, ahead of
-// any S10 code depending on them, so the layout — and every offset compiled
-// code bakes in — never has to move once real code starts depending on it.
-// `poll_flag` is live from S10: the `Poll` Ir op (D5.3) reads it directly.
+// loads/stores with no Rust-level indirection. `old_start`/
+// `card_base_biased` (S11 barrier) and `last_compiled_{fp,pc,kind}`
+// (S11/S12 runtime entries) are value fields; `poll_flag` is live from S10
+// (the `Poll` Ir op reads it, D5.3).
+//
+// S12 step 7: slot +0 is `eden_top_addr` — the ADDRESS of the one live
+// `universe.eden.top` word (stable: the Eden struct is boxed), which the
+// inline-alloc fast path DEREFERENCES to read/bump the same bump pointer
+// every Rust-side allocator and both collectors use. It replaced S11's
+// `eden_top` VALUE copy + the publish/adopt sync protocol, which was only
+// sound while the (deleted) D8 bridge froze eden for the whole compiled
+// window. `eden_end` (+8) stays a value copy of a genesis-fixed, immutable
+// bound — set once, can never go stale.
 
-pub const VMREG_EDEN_TOP_OFFSET: usize = 0;
+pub const VMREG_EDEN_TOP_ADDR_OFFSET: usize = 0;
 pub const VMREG_EDEN_END_OFFSET: usize = 8;
 pub const VMREG_OLD_START_OFFSET: usize = 16;
 pub const VMREG_CARD_BASE_BIASED_OFFSET: usize = 24;

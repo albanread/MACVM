@@ -2352,13 +2352,18 @@ fn card_dirtied_by_compiled_store() {
     );
 }
 
-/// tests_s11.md integration item 4, `allocation_fast_and_slow`: `X basicNew`
-/// where `X` is a compile-time Slots class constant compiles to an inline
-/// `Ir::Alloc`. Exercises BOTH edges: (a) the eden fast path (bump, from the
-/// nursery); (b) the forced-overflow slow path (`rt_alloc_slow`), which
-/// under the live compiled frame takes the D8 bridge's old-direct route
-/// (`bridge_old_allocs` bumps). Both must produce a correctly-classed,
-/// nil-bodied instance.
+/// tests_s11.md integration item 4, REWRITTEN by S12 step 7 (the D8
+/// bridge is gone): `X basicNew` where `X` is a compile-time Slots class
+/// constant compiles to an inline `Ir::Alloc`. Exercises BOTH edges:
+/// (a) the eden fast path — compiled code bumping the ONE live
+/// `universe.eden.top` word through `reg_block.eden_top_addr`, visible to
+/// Rust with no adopt step; (b) the forced-overflow slow path
+/// (`rt_alloc_slow` → the ordinary alloc cascade), which now runs a REAL
+/// scavenge under the live compiled frame (`gc_under_compiled` bumps —
+/// S12 P10's inversion of this test's original `== 0` assert) and then
+/// allocates in the freshly-emptied EDEN, not old gen (the bridge's
+/// old-direct diversion is deleted). Both edges must produce a
+/// correctly-classed, nil-bodied instance.
 #[test]
 fn allocation_fast_and_slow() {
     use macvm::interpreter::compiled_call::{enter_compiled, EnterResult};
@@ -2428,9 +2433,10 @@ fn allocation_fast_and_slow() {
     );
     let id = driver::compile_method(&mut vm, smi_klass, method).expect("must compile");
 
-    // (a) Fast path: bump the nursery, no bridge diversion.
+    // (a) Fast path: compiled code bumps the ONE live eden.top word
+    // (through reg_block.eden_top_addr) — Rust sees it immediately, no
+    // adopt step.
     let eden_top_before = vm.universe.eden.top;
-    let bridge_before = vm.universe.gc_stats.bridge_old_allocs;
     vm.stack.push(recv);
     assert_eq!(enter_compiled(&mut vm, id, 0), EnterResult::Completed);
     let obj = vm.stack.pop();
@@ -2441,17 +2447,30 @@ fn allocation_fast_and_slow() {
     );
     assert!(
         vm.universe.eden.top > eden_top_before,
-        "the fast path must bump eden"
+        "the fast path's bump-through-the-pointer must be immediately visible in eden.top"
     );
-    assert_eq!(
-        vm.universe.gc_stats.bridge_old_allocs, bridge_before,
-        "the fast path must NOT divert to old gen"
+    assert!(
+        obj.mem_addr() >= vm.universe.eden.start && obj.mem_addr() < vm.universe.eden.end,
+        "the fast-path object must live in eden"
     );
 
-    // (b) Slow path: fill eden so the inline bump overflows -> rt_alloc_slow
-    // -> D8 bridge old-direct (compiled_depth > 0 during the call).
-    vm.universe.eden.top = vm.universe.eden.end;
-    let bridge_before2 = vm.universe.gc_stats.bridge_old_allocs;
+    // (b) Slow path: fill eden HONESTLY (real, walkable objects — the old
+    // `eden.top = eden.end` lie would leave an uninitialized gap the
+    // slow path's own scavenge-entry verify walk now trips over) so the
+    // inline bump overflows -> rt_alloc_slow -> the ordinary alloc
+    // cascade, which runs a REAL scavenge UNDER the live compiled frame
+    // and then allocates in the freshly-emptied eden.
+    let array_klass = vm.universe.array_klass;
+    let chunk_elems = 4096usize;
+    let chunk_bytes = (HEADER_WORDS + chunk_elems) * 8;
+    while vm.universe.eden.end - vm.universe.eden.top >= chunk_bytes {
+        alloc::alloc_indexable_oops(&mut vm, array_klass, chunk_elems);
+    }
+    while vm.universe.eden.end - vm.universe.eden.top >= 32 {
+        alloc::alloc_slots(&mut vm, target_klass);
+    }
+    let gc_under_before = vm.universe.gc_stats.gc_under_compiled;
+    let scav_before = vm.universe.gc_stats.scavenge_count;
     vm.stack.push(recv);
     assert_eq!(enter_compiled(&mut vm, id, 0), EnterResult::Completed);
     let obj2 = vm.stack.pop();
@@ -2461,17 +2480,17 @@ fn allocation_fast_and_slow() {
         "slow-path result must still be a valid AllocTarget"
     );
     assert!(
-        vm.universe.gc_stats.bridge_old_allocs > bridge_before2,
-        "the forced-overflow slow path must divert old-direct via the D8 bridge"
+        vm.universe.gc_stats.scavenge_count > scav_before,
+        "the forced-overflow slow path must have scavenged (no old-direct diversion exists)"
     );
-
-    // S11 D8 step 10: neither the fast nor the forced-slow path may EVER
-    // let a real scavenge/full-GC run while compiled_depth > 0 — the
-    // `gc_under_compiled` counter (independent proof, stays live in
-    // --release too) must read exactly 0 across this whole test.
-    assert_eq!(
-        vm.universe.gc_stats.gc_under_compiled, 0,
-        "the D8 bridge must hold: no collection may ever run under a live compiled frame"
+    assert!(
+        vm.universe.gc_stats.gc_under_compiled > gc_under_before,
+        "S12 P10 (inverts this test's S11-era `== 0` assert): the scavenge must have run \
+         UNDER the live compiled frame -- the hard case genuinely executes now"
+    );
+    assert!(
+        obj2.mem_addr() >= vm.universe.eden.start && obj2.mem_addr() < vm.universe.eden.end,
+        "the slow-path object must land in the freshly-scavenged EDEN, not old gen"
     );
 }
 

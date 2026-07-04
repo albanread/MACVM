@@ -228,49 +228,17 @@ pub fn alloc_words(vm: &mut VmState, words: usize, klass: Oop, tagged: bool) -> 
     let scope = crate::memory::handles::HandleScope::enter(vm);
     let klass_h = scope.handle(vm, klass);
 
-    // S11 D8 bridge (pre-S12 window). A live compiled frame holds oops in
-    // spill slots no collector can find until S12, so ANY moving GC while
-    // `compiled_depth > 0` would treat them as dead → use-after-free. The
-    // entire eden/scavenge/full-GC cascade below can move the heap, so
-    // under a compiled frame we bypass it wholesale and allocate old-direct
-    // (non-moving), growing old gen on fill and stalling only if that
-    // fails. This is the load-bearing invariant the compiled inline-alloc
-    // fast path relies on: because nothing here touches `eden.top` while a
-    // compiled frame is live, eden is FROZEN for the whole compiled window,
-    // which is what lets `reg_block.eden_top` (bumped directly by compiled
-    // code) be the sole active bump pointer, synced back to `eden.top` only
-    // at the outermost `enter_compiled` boundary (compiled_call.rs). The
-    // gc primitives (`prim_gc_scavenge`/`prim_gc_full`) are the OTHER door
-    // into the collectors and are guarded separately — the alloc cascade is
-    // not the only caller (an adversarial-review finding). `scavenge`/
-    // `full_gc` themselves `debug_assert!(compiled_depth == 0)` so any
-    // future third door is caught. `bridge_old_allocs` counts the
-    // diversions (the cost S12 removes). The rest of D8 — `gc_pending`
-    // defer, the `gc_under_compiled == 0` gate, `MACVM_TRACE=gc` warnings —
-    // is step 10; step 8 needs only this core so `rt_alloc_slow` (and every
-    // interpreter allocation reached through a runtime stub under a
-    // compiled frame) is correct.
-    if vm.compiled_depth > 0 {
-        vm.universe.gc_stats.bridge_old_allocs += 1;
-        if let Some(obj) = try_old_alloc(vm, words, size_bytes, klass_h.get(vm), tagged) {
-            return obj;
-        }
-        if vm
-            .universe
-            .grow_old(crate::memory::layout::OLD_GROWTH_SEGMENT)
-            > 0
-        {
-            if let Some(obj) = try_old_alloc(vm, words, size_bytes, klass_h.get(vm), tagged) {
-                return obj;
-            }
-        }
-        let err = crate::memory::stall::GcStallError::snapshot(
-            &vm.universe,
-            size_bytes,
-            crate::memory::stall::GcPhase::Mutator,
-        );
-        stall_exit(err);
-    }
+    // S12 step 7: the S11 D8 bridge's diversion arm (`if compiled_depth >
+    // 0 { allocate old-direct, never touch eden/GC }`) lived exactly here
+    // and is DELETED, not relocated. A live compiled frame's own oops are
+    // now first-class GC roots — spill slots via `Nmethod::oopmap_at`,
+    // stub RootSpill slots per-kind, all through `roots::each_code_root`
+    // (steps 1-5) — and the eden bump pointer is one shared word compiled
+    // code reads through `reg_block.eden_top_addr` (never a stale copy),
+    // so the full cascade below is safe at ANY compiled depth, exactly
+    // like at depth 0. `compiled_depth` itself stays: `gc_under_compiled`
+    // (both collectors) counts the hard case actually running, and
+    // `rt_alloc_slow` still asserts it's positive on entry.
 
     if vm.options.gc_stress && vm.universe.gc_enabled {
         ensure_promotion_guarantee(vm);
@@ -542,61 +510,34 @@ mod tests {
         assert_eq!(vm.universe.eden.top - top_before, 64);
     }
 
-    /// S11 D8 bridge: with a live compiled frame (`compiled_depth > 0`),
-    /// `alloc_words` must divert straight to old gen — eden untouched,
-    /// `bridge_old_allocs` bumped, object outside eden — since moving GC on
-    /// eden would lose the compiled frame's own spill-slot oops.
+    /// S12 step 7 (inverts S11's `bridge_diverts_to_old_under_compiled_
+    /// frame`): with the D8 bridge deleted, `compiled_depth > 0` changes
+    /// NOTHING about where an ordinary allocation lands — eden, exactly
+    /// like depth 0. `compiled_depth = 1` with an EMPTY native stack is
+    /// honest here precisely because nothing on this path consults
+    /// anything BUT the counter anymore (no walker runs — no GC is
+    /// triggered by a plain in-capacity bump).
     #[test]
-    fn bridge_diverts_to_old_under_compiled_frame() {
+    fn alloc_lands_in_eden_under_compiled_depth() {
         let mut vm = boot();
         let klass = vm.universe.object_klass.oop();
-        vm.compiled_depth = 1; // pretend a compiled frame is on the stack
+        vm.compiled_depth = 1;
         let eden_top_before = vm.universe.eden.top;
-        let bridge_before = vm.universe.gc_stats.bridge_old_allocs;
 
         let obj = alloc_words(&mut vm, 4, klass, true);
 
         assert_eq!(
-            vm.universe.eden.top, eden_top_before,
-            "the bridge must not bump eden under a compiled frame"
-        );
-        assert_eq!(
-            vm.universe.gc_stats.bridge_old_allocs,
-            bridge_before + 1,
-            "each diverted allocation bumps bridge_old_allocs"
+            vm.universe.eden.top,
+            eden_top_before + 32,
+            "an in-capacity allocation must bump eden regardless of compiled_depth"
         );
         assert!(
-            obj.addr() < vm.universe.eden.start || obj.addr() >= vm.universe.eden.end,
-            "the diverted object must live outside eden (old-direct)"
+            obj.addr() >= vm.universe.eden.start && obj.addr() < vm.universe.eden.end,
+            "the object must live IN eden -- the old-direct diversion is gone"
         );
-        // Header is still initialized correctly on the old-direct path.
         assert_eq!(obj.klass_oop(), vm.universe.object_klass.oop());
         assert!(obj.mark().tagged_contents());
 
-        vm.compiled_depth = 0;
-    }
-
-    /// S11 D8 bridge: `MACVM_GC_STRESS=1` scavenges before every allocation
-    /// — but NOT under a compiled frame (that would corrupt). The bridge
-    /// arm sits BEFORE the gc_stress hook, so the scavenge count stays put.
-    #[test]
-    fn bridge_suppresses_gc_stress_under_compiled_frame() {
-        let mut vm = VmState::with_options(VmOptions {
-            heap_mib: 64,
-            trace: Default::default(),
-            gc_stress: true,
-            gc_stress_full_period: None,
-            eden_kb: None,
-            jit: crate::runtime::JitMode::Off,
-        });
-        vm.compiled_depth = 1;
-        let klass = vm.universe.object_klass.oop();
-        let scav_before = vm.universe.gc_stats.scavenge_count;
-        let _ = alloc_words(&mut vm, 4, klass, true);
-        assert_eq!(
-            vm.universe.gc_stats.scavenge_count, scav_before,
-            "gc_stress scavenge must be suppressed under a compiled frame"
-        );
         vm.compiled_depth = 0;
     }
 

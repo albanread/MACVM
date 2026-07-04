@@ -456,28 +456,39 @@ impl<'a> Emitter<'a> {
 
     /// S11 D7: inline allocation of a fixed-size `Format::Slots` object.
     /// Self-contained fast-path-plus-slow-call, no separate CFG block
-    /// (mirrors `emit_store_field`'s barrier). Fast path: bump
-    /// `reg_block.eden_top` by `size_bytes`, bounds-check `eden_end`,
+    /// (mirrors `emit_store_field`'s barrier). Fast path: bump the LIVE
+    /// eden bump pointer — dereferenced through `reg_block.eden_top_addr`
+    /// (S12 step 7: the address of `universe.eden.top` itself, the same
+    /// word every Rust-side allocator and both collectors use; a value
+    /// copy here would go stale the moment a nested allocation or a GC
+    /// under this very frame moved the real pointer) — bounds-check
+    /// against `eden_end` (a genesis-fixed bound, safe as a value copy),
     /// stamp the pristine Slots mark + klass oop + nil body, mem-tag the
-    /// result. Overflow → `bl stub_alloc_slow` (the D8 bridge routes it
-    /// old-direct under the live compiled frame).
+    /// result. Overflow → `bl stub_alloc_slow` (a real allocation, which
+    /// post-D8-bridge may itself scavenge — coherent for the SAME reason:
+    /// the next fast-path bump re-reads the live word).
     ///
-    /// Register discipline: `x19` holds the raw object base LIVE across the
+    /// Register discipline: `x20` holds the eden-top ADDRESS live until
+    /// the committing `str`; `x19` holds the raw object base across the
     /// whole header/body init — deliberately NOT x16, which `dest_target`
-    /// hands back for a spilled `dst` and would alias the base. `x17` is the
-    /// store-value scratch (reloaded per constant), `x20` the eden_end
-    /// scratch (dead after the bounds check). Both paths land the tagged
-    /// result in `d`, then one `commit`. `Alloc` is a regalloc SAFEPOINT
-    /// (`regalloc::is_safepoint`), so every vreg live across it is already
-    /// spilled before the slow path's `bl` clobbers a caller-saved register.
+    /// hands back for a spilled `dst` and would alias the base. `x19` is
+    /// briefly clobbered by the bounds check (end loaded into it while
+    /// `x17` holds new_top and `x20` the address — only 3 scratches
+    /// exist) and recovered arithmetically (`obj = new_top − size`).
+    /// `x17` is the store-value scratch afterward (reloaded per
+    /// constant). Both paths land the tagged result in `d`, then one
+    /// `commit`. `Alloc` is a regalloc SAFEPOINT (`regalloc::
+    /// is_safepoint`), so every vreg live across it is already spilled
+    /// before the slow path's `bl` clobbers a caller-saved register.
     fn emit_alloc(&mut self, dst: VReg, klass: PoolLit, size_words: u32) {
         use crate::oops::layout::{
-            HEADER_WORDS, MEM_TAG, VMREG_EDEN_END_OFFSET, VMREG_EDEN_TOP_OFFSET, WORD_SIZE,
+            HEADER_WORDS, MEM_TAG, VMREG_EDEN_END_OFFSET, VMREG_EDEN_TOP_ADDR_OFFSET, WORD_SIZE,
         };
         let size_bytes = size_words as i64 * WORD_SIZE as i64;
         // ir.rs's own Alloc detection only fires for a header-plus-body that
         // fits a 12-bit `add`/`str` immediate; a pathological giant class
-        // stays an ordinary generic `basicNew` send instead.
+        // stays an ordinary generic `basicNew` send instead. (The
+        // recovering `sub` below shares the same 12-bit immediate range.)
         debug_assert!(
             size_words as usize >= HEADER_WORDS && size_bytes < 4096,
             "emit_alloc: size_bytes {size_bytes} out of the inline range -- ir.rs must gate this"
@@ -486,17 +497,18 @@ impl<'a> Emitter<'a> {
         let slow = self.asm.new_label();
         let done = self.asm.new_label();
 
-        // Fast path: obj = eden_top; new_top = obj + size; if new_top > end
-        // (unsigned) -> slow; else commit the bump.
+        // Fast path: addr = &eden.top; obj = *addr; new_top = obj + size;
+        // if new_top > end (unsigned) -> slow; else *addr = new_top.
         self.asm
-            .emit("ldr", &[x(19), mem(28, VMREG_EDEN_TOP_OFFSET as i64)]);
+            .emit("ldr", &[x(20), mem(28, VMREG_EDEN_TOP_ADDR_OFFSET as i64)]);
+        self.asm.emit("ldr", &[x(19), mem(20, 0)]);
         self.asm.emit("add", &[x(17), x(19), imm(size_bytes)]);
         self.asm
-            .emit("ldr", &[x(20), mem(28, VMREG_EDEN_END_OFFSET as i64)]);
-        self.asm.emit("cmp", &[x(17), x(20)]);
+            .emit("ldr", &[x(19), mem(28, VMREG_EDEN_END_OFFSET as i64)]);
+        self.asm.emit("cmp", &[x(17), x(19)]);
         self.asm.b_cond(Cond::Hi, slow);
-        self.asm
-            .emit("str", &[x(17), mem(28, VMREG_EDEN_TOP_OFFSET as i64)]);
+        self.asm.emit("str", &[x(17), mem(20, 0)]);
+        self.asm.emit("sub", &[x(19), x(17), imm(size_bytes)]);
 
         // Header: pristine Slots mark at [obj+0], klass oop at [obj+8].
         self.asm
@@ -1594,20 +1606,29 @@ mod tests {
         let mnemonic = |l: &str| l.split_whitespace().nth(2).unwrap_or("").to_string();
         let mnemonics: Vec<String> = blob.listing.iter().map(|l| mnemonic(l)).collect();
 
-        // Fast path: eden_top + eden_end loads, bounds cmp, conditional
-        // slow branch, the committed str back to eden_top, header+body
-        // stores, mem-tagging add. Slow path ends in a blr (call_far).
+        // Fast path (S12 step 7, single-source-of-truth eden): load the
+        // eden.top ADDRESS from the reg block, load the live top THROUGH
+        // it, bump, load eden_end (clobbering the obj register), bounds
+        // cmp, conditional slow branch, commit the bump back THROUGH the
+        // address, recover obj arithmetically. Pinned as an exact
+        // contiguous mnemonic window — the pre-S12 direct-value sequence
+        // (ldr,add,ldr,cmp,b.,str — no second leading ldr, no recovering
+        // sub) must NOT silently reappear, since it reads a copy that a
+        // GC under this very frame would leave stale.
+        let fast_path_shape = ["ldr", "ldr", "add", "ldr", "cmp", "b.", "str", "sub"];
+        let window_found = mnemonics.windows(fast_path_shape.len()).any(|w| {
+            w.iter().zip(fast_path_shape.iter()).all(|(m, want)| {
+                if *want == "b." {
+                    m.starts_with("b.")
+                } else {
+                    m == want
+                }
+            })
+        });
         assert!(
-            mnemonics.iter().filter(|m| *m == "ldr").count() >= 2,
-            "eden_top + eden_end loads:\n{listing}"
-        );
-        assert!(
-            mnemonics.iter().any(|m| m == "cmp"),
-            "bounds cmp:\n{listing}"
-        );
-        assert!(
-            mnemonics.iter().any(|m| m.starts_with("b.")),
-            "conditional slow branch:\n{listing}"
+            window_found,
+            "the through-the-pointer fast-path shape (ldr addr, ldr top, add, ldr end, cmp, \
+             b.cond, str commit, sub recover) must appear contiguously:\n{listing}"
         );
         assert!(
             mnemonics.iter().filter(|m| *m == "str").count() >= 4,
@@ -1618,11 +1639,16 @@ mod tests {
             "slow-path call:\n{listing}"
         );
         // ABI: the object base must NOT be x16 (dest_target's spilled-dst
-        // reg) and must be a callee-saved scratch (x19); eden loads/stores
-        // are x28-relative. Assert the base register is x19, never x16/x18.
+        // reg) and must be a callee-saved scratch (x19); the eden.top
+        // ADDRESS rides in x20 (also callee-saved, live until the commit
+        // str). Assert both appear, and x18 (Darwin platform reg) never.
         assert!(
             listing.contains("num: 19"),
             "obj base must be x19 (callee-saved scratch), never x16/x18:\n{listing}"
+        );
+        assert!(
+            listing.contains("num: 20"),
+            "the eden.top address must ride in x20:\n{listing}"
         );
         assert!(
             !listing.contains("num: 18"),

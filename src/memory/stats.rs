@@ -30,23 +30,17 @@ pub struct GcStats {
     /// S8: `OldGen::grow` calls that actually committed a segment (0 return
     /// excluded — that's a no-op at the reservation ceiling, not growth).
     pub old_grow_count: u64,
-    /// S11 D8 (pre-S12 bridge): allocations diverted straight to old gen
-    /// because a compiled frame was live (`compiled_depth > 0`) and moving
-    /// GC is forbidden until S12 can find compiled-frame oops. The cost S12
-    /// removes — `tests_s11.md`'s bridge-accounting gate reads this, and
-    /// `allocation_fast_and_slow` asserts it is `> 0` on the forced-slow
-    /// path. See `alloc::alloc_words`' own bridge arm.
-    pub bridge_old_allocs: u64,
-    /// S11 D8 step 10: counts every `scavenge`/`full_gc` entry that
-    /// observed `compiled_depth > 0` — i.e. every time the bridge's
-    /// invariant was actually VIOLATED. Both collectors also
-    /// `debug_assert_eq!(compiled_depth, 0)` at the same point, but that
-    /// compiles out in `--release`; this counter is the independent,
-    /// always-live proof `tests_s11.md`'s "Bridge accounting" gate reads —
-    /// it must be `0` at the end of any run, combined GC-stress +
-    /// `threshold=1` included. Bumped BEFORE the debug_assert so a debug
-    /// build's panic still leaves the violation visible to a
-    /// `catch_unwind`-wrapped test.
+    /// Counts every `scavenge`/`full_gc` entry that ran with a live
+    /// compiled frame on the native stack (`compiled_depth > 0`) — the
+    /// hard case S12 exists for. Under S11's D8 bridge this was the
+    /// always-live proof the bridge HELD (asserted `== 0` at every gate);
+    /// with the bridge deleted (S12 step 7) its meaning INVERTS, per S12
+    /// P10: the flagship gate now asserts it lands `> 0`, proving the
+    /// hard case genuinely executed rather than being silently routed
+    /// around. (`bridge_old_allocs`, this field's S11-era sibling counting
+    /// the bridge's old-direct diversions, died with the bridge itself —
+    /// deliberately removed rather than left at a constant 0, so anything
+    /// still referencing it fails to compile instead of reading a lie.)
     pub gc_under_compiled: u64,
 }
 

@@ -42,17 +42,21 @@
 //! stubs' own preamble, `codecache::stubs::KIND_*`) exists precisely to
 //! answer "which of the six" directly, since no code-range lookup can.
 //!
-//! # Reentrant interpreter calls clear the anchor around themselves
+//! # Where a walk starts: the tier journal decides, not the anchor alone
 //!
-//! `interpreter::run_method_reentrant` (the C2I entry point) saves,
-//! clears, and restores the anchor around its own call — see that
-//! function's own doc for why: without this, the anchor would stay
-//! pointed at the outer `c2i_shared` frame for the ENTIRE duration of a
-//! reentrant interpreted call, even while that call's own dispatch loop
-//! is genuinely the innermost activation — `walk_frames` below decides
-//! where to start walking purely by checking whether the anchor is
-//! nonzero, so a stale-but-nonzero anchor during a live reentrant call
-//! would make it start from the wrong (outer, stale) frame entirely.
+//! During a reentrant C→I call the anchor legitimately stays pointed at
+//! the outer `c2i_shared` frame the whole time — even while the nested
+//! interpreted dispatch is the true innermost activation. Step 3
+//! originally resolved that tension by having `run_method_reentrant`
+//! CLEAR the anchor around itself (and this walker start anchor-first);
+//! step 7 replaced that with the journal-first start rule documented at
+//! `walk_frames`' own head: `vm.tier_links.last()` — the one record that
+//! cannot misorder the crossings — picks the innermost side, and the
+//! anchor is only consulted when the journal says native is innermost
+//! (or as a loud-failure breadcrumb when the journal is empty/torn). The
+//! clearing approach turned out to HIDE the whole native chain whenever
+//! the nested interpreted target was a frameless successful primitive —
+//! see the start-rule comment in `walk_frames` for the full account.
 
 // This module only (not the rest of `runtime`, whose own doc comment
 // still says "no unsafe here") — mirrors `codecache::mod`'s own
@@ -207,16 +211,90 @@ fn call_stub_contains(vm: &VmState, pc: u64) -> bool {
 /// condition guest code can trigger.
 pub fn walk_frames(vm: &VmState, mut f: impl FnMut(FrameView)) {
     let mut link_idx = vm.tier_links.len();
-    let mut mode = if vm.reg_block.last_compiled_fp != 0 {
-        Mode::Anchor(
-            vm.reg_block.last_compiled_fp,
-            vm.reg_block.last_compiled_pc,
-            AdapterKind::from_raw(vm.reg_block.last_compiled_kind),
-        )
-    } else if vm.stack.has_frame() {
-        Mode::Interp(vm.stack.fp)
-    } else {
-        Mode::Done
+    // Start-of-walk rule (S12 step 7, revised twice from step 3 — both
+    // predecessors were wrong in ways only the fallen bridge could
+    // expose): the innermost side is decided by the most recent TIER
+    // CROSSING, i.e. `tier_links.last()` — the one journal that cannot
+    // lie about ordering — never by the anchor alone and never by
+    // `has_frame` alone.
+    //
+    // - Last crossing was C→I (`IntoInterpreter`): the interpreter side
+    //   is innermost. If it has live frames, walk them (its entry
+    //   sentinel consumes that same link on the way back out, as
+    //   always). If it has NO frames — a reentrant send whose target's
+    //   PRIMITIVE succeeded collects BEFORE any frame is pushed
+    //   (`try_primitive` precedes activation) — there is nothing
+    //   interpreted to visit (the receiver/args live in plain `vm.stack`
+    //   slots `for_each_root` already covers), so consume the link HERE
+    //   and enter the native chain it records. Step 3's design instead
+    //   had `run_method_reentrant` clear the anchor and keyed the start
+    //   on anchor-nonzero — which left this exact frameless case with
+    //   NOTHING to start from, silently skipping every compiled frame's
+    //   spill slots (found by `mid_loop_forced_scavenge` the moment the
+    //   bridge came down; the interim "has_frame first" revision fixed
+    //   that but misrouted the opposite case, a live PAUSED interpreted
+    //   caller beneath a compiled frame's own alloc-slow collection).
+    // - Last crossing was I→C (`IntoCompiled`): the native side is
+    //   innermost; the anchor names the stub currently in Rust (it must
+    //   be set — GC only ever starts inside an anchor-setting stub's own
+    //   runtime call).
+    // - No crossings at all: pure single-tier state — a still-set anchor
+    //   (possible only if something upstream tore the journal) is still
+    //   honored so the walk fails LOUDLY at the call_stub boundary
+    //   instead of silently reporting an empty world
+    //   (`walker_terminates_on_torn_tierlinks` pins exactly this); else
+    //   plain interpreter frames or nothing.
+    // "Live interpreted frame" needs BOTH checks: `has_frame`, AND fp not
+    // being `run_method`'s own temporary ENTRY_FRAME_SENTINEL spoof — for
+    // exactly the duration of an entry's `try_primitive` attempt, fp is
+    // deliberately set to the sentinel (see `run_method`'s own doc) while
+    // `has_frame` still reflects the OUTER paused activation. A
+    // `can_allocate` primitive collecting inside that window (every
+    // allocation, under GC_STRESS=1) must be treated exactly like the
+    // frameless case: nothing interpreted is live for THIS entry (its
+    // receiver/args are plain `vm.stack` slots `for_each_root` covers),
+    // and blindly walking `fp == usize::MAX` overflows on the first slot
+    // read (found by the flagship gate the first time a reentrant
+    // allocating primitive scavenged for real).
+    let live_interp =
+        vm.stack.has_frame() && vm.stack.fp != crate::oops::layout::ENTRY_FRAME_SENTINEL as usize;
+    let mut mode = match vm.tier_links.last() {
+        Some(TierLink::IntoInterpreter {
+            compiled_fp,
+            compiled_ret_pc,
+        }) => {
+            if live_interp {
+                Mode::Interp(vm.stack.fp)
+            } else {
+                link_idx -= 1;
+                Mode::Anchor(*compiled_fp, *compiled_ret_pc, AdapterKind::C2i)
+            }
+        }
+        Some(TierLink::IntoCompiled { .. }) => {
+            assert_ne!(
+                vm.reg_block.last_compiled_fp, 0,
+                "walk_frames: innermost side is native (last tier crossing was IntoCompiled) \
+                 but no anchor is set -- GC can only start inside an anchor-setting stub"
+            );
+            Mode::Anchor(
+                vm.reg_block.last_compiled_fp,
+                vm.reg_block.last_compiled_pc,
+                AdapterKind::from_raw(vm.reg_block.last_compiled_kind),
+            )
+        }
+        None => {
+            if vm.reg_block.last_compiled_fp != 0 {
+                Mode::Anchor(
+                    vm.reg_block.last_compiled_fp,
+                    vm.reg_block.last_compiled_pc,
+                    AdapterKind::from_raw(vm.reg_block.last_compiled_kind),
+                )
+            } else if live_interp {
+                Mode::Interp(vm.stack.fp)
+            } else {
+                Mode::Done
+            }
+        }
     };
 
     for _ in 0..MAX_WALK_STEPS {
@@ -388,8 +466,25 @@ mod tests {
         crate::interpreter::run_method(vm, method, recv, &[]);
         let nm_id = compile(vm, smi_klass, method);
 
-        // Force the slow edge: fill eden so the inline bump overflows.
-        vm.universe.eden.top = vm.universe.eden.end;
+        // Force the slow edge by filling eden HONESTLY (real, walkable
+        // objects). The pre-S12-step-7 `eden.top = eden.end` lie is no
+        // longer survivable here: with the D8 bridge gone, `rt_alloc_slow`'s
+        // own ordinary allocation genuinely scavenges, and the scavenge's
+        // entry verify walks eden up to `top` — straight into the lie's
+        // uninitialized gap (the exact failure `it_gc_jit.rs`'s own
+        // step-4 test already hit and documented).
+        let array_klass = vm.universe.array_klass;
+        let chunk_elems = 4096usize;
+        let chunk_bytes = (crate::oops::layout::HEADER_WORDS + chunk_elems) * 8;
+        while vm.universe.eden.end - vm.universe.eden.top >= chunk_bytes {
+            crate::memory::alloc::alloc_indexable_oops(vm, array_klass, chunk_elems);
+        }
+        // Tail-fill until less than ONE MORE AllocTarget fits, so the
+        // compiled inline bump is guaranteed to overflow.
+        let need = target_klass.non_indexable_size() * crate::oops::layout::WORD_SIZE;
+        while vm.universe.eden.end - vm.universe.eden.top >= need {
+            crate::memory::alloc::alloc_slots(vm, target_klass);
+        }
         (nm_id, recv)
     }
 
