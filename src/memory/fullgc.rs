@@ -487,24 +487,17 @@ pub fn full_gc(vm: &mut VmState) -> Result<FullGcReport, GcStallError> {
     let flush_set = vm.code_table.weak_sweep();
     #[cfg(debug_assertions)]
     debug_assert_weak_sweep_invariant(vm, &flush_set);
-    // D6 (`CodeTable::flush` + the compiled-site invalidation sweep +
-    // `cache.free`) is S12 step 6's own deliverable, not yet callable —
-    // nothing in this sprint's test suite kills a klass yet
-    // (`key_klass_death_flushes` is step 6's own gate item), so
-    // `flush_set` is always empty today. This is the loud, honest signal
-    // if that ever stops being true before step 6 actually lands: leaving
-    // a dead-key-klass nmethod un-flushed here would panic anyway, a few
-    // lines down, the first time phase C's `forward_chase` tried to chase
-    // a klass phase B never gave a forwarding entry to (correctly so — it
-    // was never marked) — this just fails at the SOURCE instead of three
-    // phases later.
-    assert!(
-        flush_set.is_empty(),
-        "full_gc: {} nmethod(s) have a dead key_klass but CodeTable::flush doesn't exist yet \
-         (S12 step 6) -- a class was killed with a live nmethod still naming it before this \
-         sprint finished building the mechanism to handle that",
-        flush_set.len()
-    );
+    // D6 (`codecache::flush::flush_nmethod`): BEFORE phase B ever runs, so
+    // no updater downstream can trip over a klass phase B never gave a
+    // forwarding entry to (correctly so — it was never marked). Each
+    // flush independently re-sweeps every STILL-alive nmethod's own sites
+    // (including other, not-yet-processed `flush_set` members), so a
+    // chain of mutually-referencing dying nmethods resolves correctly
+    // regardless of iteration order — no ordering dependency between
+    // members of this loop.
+    for id in flush_set {
+        crate::codecache::flush::flush_nmethod(vm, id);
+    }
 
     // --- B ----------------------------------------------------------------
     let mut side_marks: SideMarks = HashMap::new();

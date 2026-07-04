@@ -4,12 +4,17 @@
 //! being exercised is `unsafe` internally, not this file's own code.
 
 use macvm::bytecode::builder::BytecodeBuilder;
+use macvm::codecache::nmethod::IcState;
 use macvm::compiler::driver;
 use macvm::frontend::{classdef, parser};
 use macvm::interpreter::compiled_call::{enter_compiled, EnterResult};
 use macvm::memory::alloc;
+use macvm::memory::fullgc;
 use macvm::memory::scavenge::scavenge;
+use macvm::oops::layout::HEADER_WORDS;
+use macvm::oops::smi::SmallInt;
 use macvm::oops::wrappers::{KlassOop, MemOop};
+use macvm::oops::Format;
 use macvm::runtime::lookup::{install_method, klass_of};
 use macvm::runtime::{JitMode, VmOptions, VmState};
 
@@ -211,5 +216,259 @@ fn compiled_frame_spill_slot_survives_forced_scavenge() {
     assert!(
         vm.universe.gc_stats.gc_under_compiled > gc_under_compiled_before,
         "the forced scavenge must have counted itself as running under a live compiled frame"
+    );
+}
+
+/// S12 D5/D6 (`tests_s12.md`'s `key_klass_death_flushes`, REDUCED — see
+/// this test's own note, and its companion
+/// `compiled_mono_caller_guard_keeps_key_klass_alive` just below, for why):
+/// a class with NO global binding and NO live instances, referenced ONLY
+/// via a compiled method's own (weakly-treated) `key_klass` field, must
+/// actually die on a real full GC — and that death must actually flush
+/// the nmethod (gone from `code_table`, its own code-cache space
+/// reusable).
+///
+/// NOT literally `key_klass_death_flushes` as `tests_s12.md` describes it
+/// (ALSO driving a compiled caller mono to the dying method, and an
+/// interpreter IC to it): tracing `CodeTable::update_keys`'s own existing,
+/// correct behavior (D4.1's "everything else in pools stays STRONG" —
+/// unconditional, not gated by the weak-key flag at all) shows that ANY
+/// live Mono/PIC caller's own guard-klass mirror — or an interpreter IC's
+/// own `guard()` oop, an ordinary strong heap field — would ALSO
+/// reference the same dying klass, keeping it marked regardless of the
+/// dying nmethod's own `key_klass` being correctly excluded. A klass can
+/// only actually die once EVERYTHING that ever compared against it —
+/// compiled guards, interpreter ICs, the customizing nmethod's own key —
+/// has ALSO become unreachable, not just the one nmethod being tested.
+/// This test proves the achievable core: the customization-only case.
+/// `compiled_mono_caller_guard_keeps_key_klass_alive` proves the OTHER
+/// half directly (a surviving caller genuinely blocks the death) — real
+/// executed evidence for why the fuller scenario doesn't apply here,
+/// documented in `sprint_s12_detail.md`'s own STEP-6 NOTES.
+#[test]
+fn key_klass_death_flushes() {
+    let mut vm = test_vm();
+    let object_klass = vm.universe.object_klass;
+    let tmp_klass = vm
+        .universe
+        .new_klass(object_klass, "Tmp", Format::Slots, false, HEADER_WORDS);
+
+    let hot_sel = vm.universe.intern(b"hot");
+    let mut b = BytecodeBuilder::new();
+    b.push_smi_i8(42);
+    b.ret_tos();
+    let hot_method = b.finish(&mut vm, hot_sel, 0, 0);
+    install_method(&mut vm, tmp_klass, hot_sel, hot_method);
+
+    // Warm interpreted (no sends in `hot`'s own body, so nothing to
+    // resolve -- this just satisfies `compile_method`'s own established
+    // "warm before compiling" idiom).
+    let tmp_instance = alloc::alloc_slots(&mut vm, tmp_klass).oop();
+    let warm = macvm::interpreter::run_method(&mut vm, hot_method, tmp_instance, &[]);
+    assert_eq!(warm, SmallInt::new(42).oop());
+
+    assert!(driver::eligible(&vm, hot_method), "hot must be eligible");
+    let hot_id = driver::compile_method(&mut vm, tmp_klass, hot_method).expect("must compile");
+    assert_eq!(
+        vm.code_table.get(hot_id).unwrap().key_klass.oop().raw(),
+        tmp_klass.oop().raw(),
+        "hot's own nmethod must be customized (keyed) for Tmp"
+    );
+
+    // `tmp_instance`/`tmp_klass` are now Rust locals ONLY -- never pushed
+    // onto `vm.stack`, never stored in a handle, no global binding was
+    // ever created (`Universe::new_klass` doesn't install one, unlike
+    // `Object subclass: ... [...]` -- confirmed directly from its own
+    // source before relying on it here). Nothing but hot's own key_klass
+    // field references Tmp at all by this point.
+    fullgc::full_gc(&mut vm).expect("full gc must succeed");
+
+    assert!(
+        vm.code_table.get(hot_id).is_none(),
+        "hot's own nmethod must have been flushed once Tmp became truly unreachable"
+    );
+    let reused = vm
+        .code_cache
+        .alloc(1)
+        .expect("the code cache must still be able to allocate (no leak/corruption)");
+    let _ = reused;
+}
+
+/// Companion to `key_klass_death_flushes` just above — real executed
+/// proof of the finding that test's own doc explains: a LIVE compiled
+/// Mono caller's own guard-klass mirror (kept unconditionally strong by
+/// `CodeTable::update_keys`, D4.1's "everything else stays STRONG", NOT
+/// gated by S12's weak-key flag at all) is a SEPARATE, independent root
+/// for the same klass — so a class customizing a dying-looking nmethod
+/// does NOT actually die while any such caller survives, regardless of
+/// that nmethod's own `key_klass` being correctly excluded from marking.
+///
+/// `callHot`'s own send to `hot` is built as HAND-CONSTRUCTED `IrMethod`
+/// (an `Ir::CallSend`), bypassing `driver::compile_method`'s own
+/// eligibility gate entirely, exactly like `it_tier1.rs`'s own
+/// `mono_resolve_patches_call_site_and_dispatches` — that gate's own D1
+/// point 2 restricts a compiled `Send` to sites ALREADY interpreter-IC
+/// Mono AND guarded on `SmallInteger` targeting an `SMI_INLINE`
+/// primitive (a real, separate finding from writing this test: an
+/// ordinary dynamic dispatch to a non-smi receiver, like `self hot` here,
+/// can never pass `driver::eligible` at all today — S11's own
+/// conservative gate, not something this test needed to work around by
+/// accident).
+#[test]
+fn compiled_mono_caller_guard_keeps_key_klass_alive() {
+    use macvm::codecache::nmethod::{IcSite, NmState, Nmethod, NmethodId};
+    use macvm::codecache::stubs::CallStubFn;
+    use macvm::compiler::emit;
+    use macvm::compiler::ir::{
+        BlockId, CallSiteInfo, Ir, IrBlock, IrMethod, PoolLit, VReg, VRegInfo,
+    };
+    use macvm::compiler::jasm_assembler::JasmAssembler;
+    use macvm::compiler::regalloc;
+
+    let mut vm = test_vm();
+    let object_klass = vm.universe.object_klass;
+    let tmp_klass = vm
+        .universe
+        .new_klass(object_klass, "Tmp", Format::Slots, false, HEADER_WORDS);
+
+    let hot_sel = vm.universe.intern(b"hot");
+    let mut hb = BytecodeBuilder::new();
+    hb.push_smi_i8(42);
+    hb.ret_tos();
+    let hot_method = hb.finish(&mut vm, hot_sel, 0, 0);
+    install_method(&mut vm, tmp_klass, hot_sel, hot_method);
+    let tmp_instance = alloc::alloc_slots(&mut vm, tmp_klass).oop();
+    let warm = macvm::interpreter::run_method(&mut vm, hot_method, tmp_instance, &[]);
+    assert_eq!(warm, SmallInt::new(42).oop());
+    assert!(driver::eligible(&vm, hot_method));
+    let hot_id = driver::compile_method(&mut vm, tmp_klass, hot_method).expect("hot must compile");
+    let hot_nm = vm.code_table.get(hot_id).unwrap();
+    let hot_entry = unsafe { hot_nm.code.base.add(hot_nm.entry_off as usize) } as u64;
+
+    // `callHot`: one param (the receiver), one send of `hot` against it --
+    // self=x0 -- mirrors `mono_resolve_patches_call_site_and_dispatches`'s
+    // own caller shape exactly.
+    let vregs: Vec<VRegInfo> = (0..2).map(|_| VRegInfo { is_oop: true }).collect();
+    let block0 = IrBlock {
+        id: BlockId(0),
+        bci: 0,
+        code: vec![
+            Ir::Param {
+                dst: VReg(0),
+                index: 0,
+            },
+            Ir::CallSend {
+                dst: VReg(1),
+                site: 0,
+                args: vec![VReg(0)],
+            },
+            Ir::Ret { val: VReg(1) },
+        ],
+        entry_stack: Vec::new(),
+    };
+    let call_hot_method_ir = IrMethod {
+        blocks: vec![block0],
+        vregs,
+        pool: Vec::new(),
+        argc: 1,
+        ntemps: 0,
+        safepoints: Vec::new(),
+        true_lit: PoolLit(0),
+        false_lit: PoolLit(0),
+        nil_lit: PoolLit(0),
+        mark_slots_lit: PoolLit(0),
+        call_sites: vec![CallSiteInfo {
+            selector: hot_sel,
+            argc: 0,
+            static_klass: None,
+        }],
+    };
+    let ra = regalloc::regalloc(&call_hot_method_ir);
+    let mut asm = JasmAssembler::new();
+    let (blob, _pcs, _verified_entry_off, emitted_ic_sites, _safepoints) = emit::emit(
+        &mut asm,
+        &call_hot_method_ir,
+        &ra,
+        vm.stubs.stub_poll_addr(),
+        vm.stubs.must_be_boolean_addr(),
+        vm.stubs.alloc_slow_addr(),
+        None,
+    );
+    assert_eq!(emitted_ic_sites.len(), 1, "exactly one Ir::CallSend");
+
+    let h = vm.code_cache.alloc(blob.code.len()).unwrap();
+    vm.code_cache.publish(h, &blob);
+    let resolve_addr = vm.stubs.resolve_addr();
+    for site in &emitted_ic_sites {
+        vm.code_cache.patch_branch26_at(h, site.off, resolve_addr);
+    }
+    let call_hot_sel = vm.universe.intern(b"callHotProbe");
+    let ic_sites: Vec<IcSite> = emitted_ic_sites
+        .iter()
+        .map(|s| IcSite {
+            off: s.off,
+            selector: s.selector,
+            argc: s.argc,
+            state: IcState::Unresolved,
+        })
+        .collect();
+    let call_hot_nm = Nmethod {
+        id: NmethodId(0),
+        key_klass: tmp_klass,
+        key_selector: call_hot_sel,
+        code: h,
+        entry_off: 0,
+        verified_entry_off: 0,
+        state: NmState::Alive,
+        level: 1,
+        version: 0,
+        literal_off: blob.literal_off,
+        relocs: blob.relocs.clone(),
+        frame_slots: ra.frame_slots,
+        slot_is_oop: ra.slot_is_oop.clone(),
+        pcdescs: Vec::new(),
+        oopmaps: Vec::new(),
+        ic_sites,
+        poll_bci: None,
+    };
+    let call_hot_id = vm.code_table.install(call_hot_nm);
+    let call_hot_entry = h.base as u64; // entry_off == verified_entry_off == 0 (no guard, `None`)
+
+    // First call resolves the site to Mono{klass: Tmp, target: hot_entry}
+    // (through stub_resolve, exactly `mono_resolve_patches_call_site_
+    // and_dispatches`'s own first-dispatch arm).
+    let call: CallStubFn = unsafe { std::mem::transmute(vm.stubs.call_stub_entry()) };
+    let vm_ptr: *mut VmState = &mut vm;
+    let argv = [tmp_instance.raw()];
+    let result = unsafe { call(call_hot_entry, vm_ptr, argv.as_ptr(), 1) };
+    assert_eq!(result, SmallInt::new(42).oop().raw());
+    match vm.code_table.get(call_hot_id).unwrap().ic_sites[0].state {
+        IcState::Mono { klass, target } => {
+            assert_eq!(klass, tmp_klass, "must record the receiver's own klass");
+            assert_eq!(target, hot_entry, "must record hot's own entry");
+        }
+        other => panic!("expected Mono after the first resolve, got {other:?}"),
+    }
+
+    // Same "no global, no live instance" setup as `key_klass_death_
+    // flushes` -- the ONLY difference is callHot's own live Mono guard,
+    // which still names Tmp.
+    fullgc::full_gc(&mut vm).expect("full gc must succeed");
+
+    assert!(
+        vm.code_table.get(hot_id).is_some(),
+        "hot must survive: callHot's own live Mono guard still names Tmp, keeping it \
+         reachable regardless of hot's own key_klass being correctly excluded from marking"
+    );
+    assert!(
+        vm.code_table.get(call_hot_id).is_some(),
+        "callHot must survive too -- its own key_klass is ALSO Tmp, kept alive the same way"
+    );
+    assert!(
+        matches!(
+            vm.code_table.get(call_hot_id).unwrap().ic_sites[0].state,
+            IcState::Mono { .. }
+        ),
+        "callHot's own site must be untouched -- nothing was flushed"
     );
 }

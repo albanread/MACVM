@@ -441,10 +441,7 @@ impl CodeTable {
     /// compute` reaches its address, a MARKED klass's header becomes a
     /// forwarding pointer (no longer a plain mark word at all).
     pub fn weak_sweep(&self) -> Vec<NmethodId> {
-        self.slots
-            .iter()
-            .flatten()
-            .filter(|nm| matches!(nm.state, NmState::Alive))
+        self.iter_alive()
             .filter(|nm| {
                 let obj = MemOop::try_from(nm.key_klass.oop())
                     .expect("weak_sweep: key_klass must always be mem-shaped");
@@ -452,6 +449,51 @@ impl CodeTable {
             })
             .map(|nm| nm.id)
             .collect()
+    }
+
+    /// Every currently-`Alive` nmethod (never `Zombie`/being-flushed one,
+    /// `NotEntrant` isn't produced anywhere in S12/S13 either) — the
+    /// iteration base for `weak_sweep` above and `codecache::flush`'s own
+    /// compiled-site invalidation sweep (S12 D6.2).
+    pub fn iter_alive(&self) -> impl Iterator<Item = &Nmethod> {
+        self.slots
+            .iter()
+            .flatten()
+            .filter(|nm| matches!(nm.state, NmState::Alive))
+    }
+
+    /// S12 D6.1 step 1: marks `id` `Zombie` and removes it from `by_key` —
+    /// `by_addr`/the slot itself deliberately stay put until [`Self::
+    /// remove`] (step 4), so a concurrent walk this cycle still classifies
+    /// any stale return address as belonging to SOME nmethod rather than
+    /// finding a hole (`flush` is only ever called once step 2's
+    /// no-live-activation invariant already holds, but the ordering costs
+    /// nothing and matches D6's own text exactly).
+    pub fn mark_zombie(&mut self, id: NmethodId) {
+        let nm = self.slots[id.0 as usize]
+            .as_mut()
+            .expect("mark_zombie: id must be alive");
+        nm.state = NmState::Zombie;
+        let key = (nm.key_klass.oop().raw(), nm.key_selector.oop().raw());
+        self.by_key.remove(&key);
+    }
+
+    /// S12 D6.1 step 4: removes `id` from `by_addr`, drops its `Nmethod`
+    /// from the slot (`None` — reusable by a future `install`, safe
+    /// because of S10 D4's own id-validation dispatch), and returns it so
+    /// the caller can free its `CodeCache` space — this table doesn't own
+    /// the cache, so it can't do that part itself.
+    pub fn remove(&mut self, id: NmethodId) -> Nmethod {
+        let nm = self.slots[id.0 as usize]
+            .take()
+            .expect("remove: id must still be installed");
+        let pos = self
+            .by_addr
+            .iter()
+            .position(|&(_, i)| i == id)
+            .expect("remove: id must have a by_addr entry");
+        self.by_addr.remove(pos);
+        nm
     }
 
     /// `key_klass`/`key_selector` are plain Rust struct fields, not

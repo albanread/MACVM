@@ -468,6 +468,80 @@ is kept alive by its nmethod — acceptable float, gone at the next full GC).
 > end-to-end scenario to the step that completes it" approach step 4 used
 > for its own flagship test.
 
+> **STEP-6 NOTES (as-built).** (a) **`flush_nmethod` is a free function**
+> (`codecache::flush.rs`, new file), not a `CodeTable` method — same
+> each_code_root-style reasoning (D4.1's own STEP-4 NOTES item (a)): it
+> needs THREE of `VmState`'s own tables (`code_table`, `pic_table`,
+> `code_cache`) at once, and a method receiver borrowing `self` while also
+> wanting `vm` itself is the same double-mutable-borrow this sprint has
+> hit before. (b) **The sweep is single-pass over every alive nmethod's
+> own `ic_sites`**, NOT two passes (nmethods, then separately PICs) —
+> `IcState::Pic{stub}` is resolved via `pic_table.pairs_of(stub)` right
+> from the site's own iteration, so the `(nmethod, offset)` pair needed to
+> reset a hit is already in hand without needing PicTable's own
+> `site: (NmethodId, u32)` field the S11 draft of `PicDesc` carried "for a
+> future S12 flush pass." Confirmed that pass (this one) genuinely doesn't
+> need it and REMOVED the field entirely (plus `PicTable::build`'s own
+> now-unused parameter, 4 call sites) rather than leaving it as permanent
+> speculative dead code — matching this project's own "if you're certain
+> it's unused, delete it" rule now that the future the field was reserved
+> for has actually arrived. (c) **`IcState::Mega` never needs resetting on
+> a flush at all** — confirmed by reading `mega.rs`'s own
+> `build_mega_trampoline` directly: a mega trampoline carries the
+> SELECTOR through to `rt_mega_lookup`, which re-derives its own target
+> fresh on every single call (D4.4's own doc, already noted in step 3);
+> it never embeds or caches a specific nmethod's entry anywhere a flush
+> could leave stale. (d) **P8's "flush ordering vs. update phase" trace-
+> scrape suggestion is deliberately NOT built.** The code's own control
+> flow already makes the wrong order structurally impossible (flush runs
+> in `full_gc`'s own sequential "phase A.5", a straight-line step before
+> `forwarding_compute` is ever called — not a runtime race a trace could
+> catch that the code itself doesn't already prevent), and if it somehow
+> WERE wrong, `forward_chase`'s own existing `debug_assert!(is_forwarded
+> ())` would panic loudly the next phase anyway (P1's own "fail at the
+> source, not silently" philosophy applied one level up) — building a
+> dedicated log-scrape mechanism for an ordering fact the type system and
+> an existing assert already guarantee felt like manufactured busywork,
+> not verification. (e) **A major, empirically-confirmed finding: `tests_
+> s12.md`'s own literal `key_klass_death_flushes` scenario (a surviving
+> compiled Mono caller AND an interpreter IC, alongside the dying
+> customization) cannot actually observe a flush at all.** Tracing
+> `CodeTable::update_keys`'s own existing, correct S11 code (`D4.1`:
+> "everything else in pools stays STRONG") shows it visits a Mono site's
+> own guard klass UNCONDITIONALLY, never gated by the weak-key flag —
+> and `interpreter::ic::InterpreterIc::set_mono`'s own guard klass is
+> just an ordinary strong heap field, marked by ordinary graph traversal
+> like any other. Either one surviving means the "dying" klass gets
+> marked anyway, via a path entirely independent of the customizing
+> nmethod's own (correctly weak) `key_klass` field — a class can only
+> actually die once EVERYTHING that ever compared against it is ALSO
+> unreachable, not just the one nmethod under test. Verified by BUILDING
+> the surviving-caller scenario for real
+> (`compiled_mono_caller_guard_keeps_key_klass_alive`, `it_gc_jit.rs`) and
+> confirming the klass (and both nmethods) demonstrably survive a real
+> full GC — not just reasoned about. `key_klass_death_flushes` itself was
+> narrowed to the achievable core (customization-only reference, nothing
+> else alive) and passes. (f) **Building the confirming test surfaced two
+> more, smaller findings**: `driver::eligible` rejects an ordinary
+> (non-smi-receiver) `Send` outright — D1 point 2's own gate requires a
+> site to be interpreter-IC Mono, SMALLINTEGER-GUARDED, targeting an
+> `SMI_INLINE` primitive, so a ordinary dynamic dispatch like `self hot`
+> against a plain object can never compile via `driver::compile_method`
+> at all today; worked around (matching `it_tier1.rs`'s own established
+> precedent, `mono_resolve_patches_call_site_and_dispatches`) by
+> hand-building the caller as raw `IrMethod`/`Ir::CallSend`, bypassing
+> `driver::eligible` entirely. Separately, the raw `CallStubFn` ABI's own
+> `argc` parameter counts `argv.len()` (receiver INCLUDED) — DIFFERENT
+> from `enter_compiled`'s own `argc` parameter (which excludes the
+> receiver, `compiled_call.rs`'s own `0..=argc_usize` range) — the two
+> compiled-entry paths are genuinely separate conventions, not one
+> mistakenly documented two ways; got this wrong on the first attempt
+> (passed `0` for a receiver-only call), diagnosed via a `rt_dnu`
+> "subtract with overflow" abort, fixed by matching `mono_resolve_
+> patches_call_site_and_dispatches`'s own already-correct `argc: 1`
+> exactly rather than re-deriving it from `enter_compiled`'s different
+> convention.
+
 ## Pitfalls
 
 - **P1 — exact PcDesc match or die.** The GC-path `oopmap_at` must panic on

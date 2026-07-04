@@ -17,6 +17,7 @@
 #![allow(unsafe_code)]
 
 pub mod adapters;
+pub mod flush;
 pub mod guard;
 pub mod mega;
 pub mod nmethod;

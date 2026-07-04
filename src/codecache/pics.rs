@@ -13,7 +13,6 @@ use crate::oops::wrappers::KlassOop;
 use crate::oops::Oop;
 
 use super::guard::JitWriteGuard;
-use super::nmethod::NmethodId;
 use super::{CodeCache, CodeHandle};
 
 /// SPEC §4.3's tunable, shared with the interpreter's own PICs — the 5th
@@ -23,10 +22,6 @@ pub const PIC_MAX_ENTRIES: usize = 4;
 
 struct PicDesc {
     handle: CodeHandle,
-    /// For a future S12 flush pass to find PICs referencing a dead
-    /// nmethod (D4.3's own doc) — not read by anything in S11 itself.
-    #[allow(dead_code)]
-    site: (NmethodId, u32),
     pairs: Vec<(KlassOop, u64)>,
     /// Byte offsets of each pair's own klass pool word, parallel to
     /// `pairs` — what `oops_do` walks.
@@ -43,15 +38,23 @@ impl PicTable {
         PicTable::default()
     }
 
-    /// Builds and publishes a fresh PIC stub for `pairs`, registers it
-    /// under `site`, returns its own entry address (a PIC has no separate
-    /// verified-entry — its whole body IS the guard).
+    /// Builds and publishes a fresh PIC stub for `pairs`, returns its own
+    /// entry address (a PIC has no separate verified-entry — its whole
+    /// body IS the guard). Not registered under its OWNING call site: S12
+    /// D6.2's own flush sweep turned out not to need that (it iterates
+    /// every alive nmethod's own `ic_sites` directly, already getting the
+    /// `(nmethod, offset)` pair for free from the site itself, then
+    /// consults [`Self::pairs_of`] only for sites already known to be
+    /// `IcState::Pic`) — an earlier S11 draft of this struct carried a
+    /// `site: (NmethodId, u32)` field for exactly that future pass, never
+    /// read by anything until now; removed once this pass confirmed it
+    /// really doesn't need it, rather than leaving it as permanent
+    /// speculative dead code.
     pub fn build(
         &mut self,
         cache: &mut CodeCache,
         smi_klass_bits: u64,
         resolve_addr: u64,
-        site: (NmethodId, u32),
         pairs: Vec<(KlassOop, u64)>,
     ) -> CodeHandle {
         debug_assert!(
@@ -68,7 +71,6 @@ impl PicTable {
             h.base as u64,
             PicDesc {
                 handle: h,
-                site,
                 pairs,
                 klass_pool_offs,
             },
@@ -274,13 +276,7 @@ mod tests {
         let k2 = new_klass(&mut vm, "PicD");
         let pairs = vec![(k1, 0x1000u64), (k2, 0x2000u64)];
 
-        let h = pics.build(
-            &mut cache,
-            0x9000,
-            0xDEAD_0000,
-            (NmethodId(0), 4),
-            pairs.clone(),
-        );
+        let h = pics.build(&mut cache, 0x9000, 0xDEAD_0000, pairs.clone());
         assert_eq!(pics.pairs_of(h), pairs.as_slice());
         assert!(cache.contains(h.base as u64));
 
@@ -308,13 +304,7 @@ mod tests {
         let k1 = new_klass(&mut vm, "PicE");
         let old_bits = k1.oop().raw();
 
-        let h = pics.build(
-            &mut cache,
-            0x9000,
-            0xDEAD_0000,
-            (NmethodId(0), 0),
-            vec![(k1, 0x1000)],
-        );
+        let h = pics.build(&mut cache, 0x9000, 0xDEAD_0000, vec![(k1, 0x1000)]);
 
         let new_bits = old_bits ^ 0x1000;
         pics.oops_do(&mut |w| {

@@ -591,7 +591,6 @@ pub unsafe extern "C" fn rt_resolve_send(vm: *mut VmState, ret_addr: u64, argv: 
                 &mut vm.code_cache,
                 smi_klass_bits,
                 resolve_addr,
-                (caller_id, site_off),
                 vec![(old_k, old_t), (k, new_t)],
             );
             (stub.base as u64, new_t, IcState::Pic { stub })
@@ -603,13 +602,9 @@ pub unsafe extern "C" fn rt_resolve_send(vm: *mut VmState, ret_addr: u64, argv: 
                 pairs.push((k, new_t));
                 let resolve_addr = vm.stubs.resolve_addr();
                 let smi_klass_bits = vm.universe.smi_klass.oop().raw();
-                let new_stub = vm.pic_table.build(
-                    &mut vm.code_cache,
-                    smi_klass_bits,
-                    resolve_addr,
-                    (caller_id, site_off),
-                    pairs,
-                );
+                let new_stub =
+                    vm.pic_table
+                        .build(&mut vm.code_cache, smi_klass_bits, resolve_addr, pairs);
                 vm.pic_table.free(&mut vm.code_cache, stub);
                 (new_stub.base as u64, new_t, IcState::Pic { stub: new_stub })
             } else {
