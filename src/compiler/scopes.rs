@@ -13,6 +13,45 @@
 //! spill-slot convention) or is a bare constant. Heap oops NEVER appear raw
 //! in the blob — the GC does not scan it.
 
+use crate::compiler::ir::VReg;
+use crate::compiler::regalloc::{Assignment, LiveInterval};
+
+// ── vreg → ValueLoc resolution (step 3b) ──────────────────────────────────
+
+/// Where `vreg` physically lives at safepoint position `pos`, as deopt
+/// metadata (`sprint_s13_detail.md` M3). The FRAME-slot half only:
+///
+/// - A vreg whose live interval spans `pos` (`start <= pos && end > pos`,
+///   the SAME "survives across the safepoint" test `regalloc::
+///   crosses_safepoint` uses) and is `Assignment::Spill(slot)` → its
+///   canonical `FrameSlot(-8·(slot+1))` (S12's `emit::spill_offset`).
+///   S12's spill-all invariant GUARANTEES every value that survives a
+///   safepoint is spilled there, so a surviving value is always found here
+///   — never left in a register (there is no `Register` `ValueLoc`).
+/// - Otherwise the value is DEAD at this safepoint (its last use was at or
+///   before `pos`) → `Nil`. Safe by the same invariant: anything read
+///   after the resume bci is live-across → spilled → handled above, so a
+///   not-found vreg is exactly one whose materialized value is never read
+///   before being overwritten.
+///
+/// Recorded per-safepoint (NOT a pc-independent per-scope location): the
+/// linear-scan regalloc assigns a spill slot per INTERVAL, so a multi-def
+/// temp has no single canonical slot — resolving at each `pos` against
+/// that pos's own live interval is unambiguous. Constant vregs
+/// (`ConstSmi`/`ConstPool`/`Nil` from the IR) are a separate layer (the
+/// caller knows the IR's constant map); this handles only frame-resident
+/// values.
+pub fn resolve_frame_loc(vreg: VReg, pos: u32, intervals: &[LiveInterval]) -> ValueLoc {
+    for iv in intervals {
+        if iv.vreg == vreg && iv.start <= pos && iv.end > pos {
+            if let Some(Assignment::Spill(slot)) = iv.assignment {
+                return ValueLoc::FrameSlot(-8 * (slot.0 as i32 + 1));
+            }
+        }
+    }
+    ValueLoc::Nil
+}
+
 // ── LEB128 ────────────────────────────────────────────────────────────────
 
 /// Unsigned LEB128 (SPEC §12.1's named round-trip test): 7 payload bits per

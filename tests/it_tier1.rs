@@ -2656,3 +2656,78 @@ fn nlr_through_compiled_frame_runs_home_side_ensure() {
     assert_eq!(vm.compiled_depth, 0);
     assert!(vm.nlr_state.is_none());
 }
+
+// ── S13 step 3b: deopt scope-desc vreg→ValueLoc resolution golden ─────────
+
+/// Golden for `compiler::scopes::resolve_frame_loc` against a REAL
+/// compiled method's regalloc output (not hand-faked intervals): the
+/// load-bearing mapping the whole deopt-metadata recorder is built on.
+/// `foo: a [ self bar. ^ self baz: a ]` — `self` (VReg 0) and the arg `a`
+/// (VReg 1) are BOTH live across the first `self bar` send (each is used
+/// again in `baz: a`), so S12's spill-all forces them to canonical frame
+/// slots there; `resolve_frame_loc` must return exactly those
+/// `FrameSlot`s, and a never-defined vreg must resolve to `Nil` (the dead/
+/// absent case). Fresh method → both sends are generic `CallSend`
+/// safepoints (no warm mono-smi IC to inline).
+#[test]
+fn deopt_resolve_frame_loc_from_real_regalloc() {
+    use macvm::compiler::scopes::{resolve_frame_loc, ValueLoc};
+
+    let mut vm = test_vm();
+    let bar_sel = vm.universe.intern(b"bar");
+    let baz_sel = vm.universe.intern(b"baz:");
+    let foo_sel = vm.universe.intern(b"foo:");
+
+    let mut b = BytecodeBuilder::new();
+    b.push_self();
+    b.send(&mut vm, bar_sel, 0); // self bar
+    b.pop(); // discard its result
+    b.push_self();
+    b.push_temp(0); // the arg `a`
+    b.send(&mut vm, baz_sel, 1); // self baz: a
+    b.ret_tos();
+    let method = b.finish(&mut vm, foo_sel, 1, 0);
+
+    let cfg = decode::decode(method);
+    let ir = ir::convert(&vm, method, &cfg);
+    let ra = regalloc::regalloc(&ir);
+
+    assert!(
+        ra.safepoint_positions.len() >= 2,
+        "two generic sends must produce two safepoints: {:?}",
+        ra.safepoint_positions
+    );
+    let p0 = ra.safepoint_positions[0]; // the `self bar` send
+
+    // Derive the EXPECTED FrameSlot for VReg(0) directly from regalloc's
+    // own assignment covering p0, then confirm resolve_frame_loc agrees --
+    // proving it reads the real slot, not a coincidence.
+    let self_iv = ra
+        .intervals
+        .iter()
+        .find(|iv| iv.vreg == VReg(0) && iv.start <= p0 && iv.end > p0)
+        .expect("self must be live across the first send");
+    let expected_self = match self_iv.assignment {
+        Some(macvm::compiler::regalloc::Assignment::Spill(slot)) => {
+            ValueLoc::FrameSlot(-8 * (slot.0 as i32 + 1))
+        }
+        other => panic!("S12 spill-all: self must be SPILLED across a safepoint, got {other:?}"),
+    };
+    assert_eq!(resolve_frame_loc(VReg(0), p0, &ra.intervals), expected_self);
+
+    // The arg `a` (VReg 1) is likewise live-across → a FrameSlot.
+    assert!(
+        matches!(
+            resolve_frame_loc(VReg(1), p0, &ra.intervals),
+            ValueLoc::FrameSlot(_)
+        ),
+        "the arg `a`, used again after the first send, must resolve to a frame slot"
+    );
+
+    // A vreg that doesn't exist (or is dead at p0) → Nil, the materialize-
+    // nil case for a value never read after the resume bci.
+    assert_eq!(
+        resolve_frame_loc(VReg(9999), p0, &ra.intervals),
+        ValueLoc::Nil
+    );
+}
