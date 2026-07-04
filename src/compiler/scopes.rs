@@ -13,6 +13,7 @@
 //! spill-slot convention) or is a bare constant. Heap oops NEVER appear raw
 //! in the blob — the GC does not scan it.
 
+use crate::codecache::nmethod::Nmethod;
 use crate::compiler::ir::VReg;
 use crate::compiler::regalloc::{Assignment, LiveInterval};
 
@@ -331,6 +332,25 @@ impl PcDesc {
             ),
         }
     }
+
+    /// Step 4: the `&Nmethod` wrapper the sprint doc names — looks the pc up
+    /// in the nmethod's own `deopt_pcdescs` (S13 step 3a's field, distinct
+    /// from the S12 oopmap `pcdescs`). Thin delegation to [`Self::find`];
+    /// same exact-match / panic-on-miss posture (P1), with the nmethod id in
+    /// the message for a real deopt-time miss.
+    pub fn find_in(nm: &Nmethod, code_off: u32) -> &PcDesc {
+        match nm
+            .deopt_pcdescs
+            .binary_search_by_key(&code_off, |d| d.code_off)
+        {
+            Ok(idx) => &nm.deopt_pcdescs[idx],
+            Err(_) => panic!(
+                "PcDesc::find_in: nmethod {:?} has no deopt PcDesc at code_off {code_off:#x} \
+                 -- every deopt-relevant pc must be recorded at compile time",
+                nm.id
+            ),
+        }
+    }
 }
 
 // ── ScopeDescRecorder — the compiler-side producer ────────────────────────
@@ -528,6 +548,74 @@ pub fn decode_site(blob: &[u8], site_off: u32) -> DecodedSite {
         kind,
         reexecute,
         stack,
+    }
+}
+
+// ── ScopeDesc::at — the deopt-time lookup entry point (step 4) ─────────────
+
+/// The decoded deopt state at one native pc: the innermost safepoint record
+/// (`site` — bci/kind/reexecute + the innermost operand stack) plus a
+/// lazily-walked chain of scope records (innermost → outermost, following
+/// `SenderLink` byte offsets). S13 chains are always depth-1; the walk
+/// handles arbitrary depth from day one (S14 inlining). The materializer
+/// (step 6) drives this: `site.reexecute` decides stack height, `scopes()`
+/// yields one interpreter frame to rebuild per scope.
+///
+/// Borrows the nmethod's scopes blob for its lifetime; holds no decoded
+/// scope eagerly (each `scopes()` step decodes on demand).
+pub struct DeoptState<'a> {
+    blob: &'a [u8],
+    pub site: DecodedSite,
+}
+
+impl<'a> DeoptState<'a> {
+    /// Resolve the deopt state at `code_off` (a native pc minus the code
+    /// base) within `nm`. Panics if `code_off` is not a recorded deopt pc
+    /// (P1 — same posture as [`PcDesc::find_in`]).
+    pub fn at(nm: &'a Nmethod, code_off: u32) -> DeoptState<'a> {
+        Self::at_parts(&nm.deopt_scopes, &nm.deopt_pcdescs, code_off)
+    }
+
+    /// The `&Nmethod`-free core (blob + PcDesc slice), so the decode/chain
+    /// logic is unit-testable straight off `ScopeDescRecorder::pack` without
+    /// standing up a whole `Nmethod`.
+    pub fn at_parts(blob: &'a [u8], pcdescs: &[PcDesc], code_off: u32) -> DeoptState<'a> {
+        let pc = PcDesc::find(pcdescs, code_off);
+        let site = decode_site(blob, pc.site_off);
+        DeoptState { blob, site }
+    }
+
+    /// The innermost scope — the one the safepoint record names directly.
+    pub fn innermost(&self) -> DecodedScope {
+        decode_scope(self.blob, self.site.scope_off)
+    }
+
+    /// Scope records innermost → outermost, following `SenderLink` byte-offset
+    /// chains. S13 yields exactly one (depth-1); S14 inlining yields the full
+    /// chain. Decodes each scope on demand.
+    pub fn scopes(&self) -> ScopeChainIter<'a> {
+        ScopeChainIter {
+            blob: self.blob,
+            next_off: Some(self.site.scope_off),
+        }
+    }
+}
+
+/// Innermost → outermost scope-record walk (see [`DeoptState::scopes`]).
+pub struct ScopeChainIter<'a> {
+    blob: &'a [u8],
+    next_off: Option<u32>,
+}
+
+impl Iterator for ScopeChainIter<'_> {
+    type Item = DecodedScope;
+    fn next(&mut self) -> Option<DecodedScope> {
+        let off = self.next_off?;
+        let scope = decode_scope(self.blob, off);
+        // `sender` carries the sender scope record's own byte offset (the
+        // packed form is offset-linked) — follow it, or stop at the root.
+        self.next_off = scope.sender.as_ref().map(|(sender_off, _, _)| *sender_off);
+        Some(scope)
     }
 }
 
@@ -750,5 +838,95 @@ mod tests {
         assert_eq!(outer_dec.method_pool_ix, 1);
         assert_eq!(outer_dec.sender, None);
         assert_eq!(outer_dec.ctx, CtxLoc::None);
+    }
+
+    /// Step 4: `DeoptState::at_parts` resolves a pc to its safepoint record,
+    /// and `.scopes()` walks the `SenderLink` chain innermost → outermost,
+    /// terminating at the root. Uses a depth-2 chain (S14 shape) so the walk
+    /// is exercised past S13's own depth-1 — a depth-1 real compile can't
+    /// prove the iterator actually FOLLOWS a link and STOPS correctly.
+    #[test]
+    fn deopt_state_walks_scope_chain() {
+        let mut rec = ScopeDescRecorder::new();
+        let outer = rec.begin_scope(ScopeDescData {
+            method_pool_ix: 11,
+            is_block: false,
+            sender: None,
+            receiver: ValueLoc::FrameSlot(-8),
+            slots: vec![ValueLoc::FrameSlot(-16)],
+            ctx: CtxLoc::None,
+        });
+        let inner = rec.begin_scope(ScopeDescData {
+            method_pool_ix: 22,
+            is_block: true,
+            sender: Some(SenderLink {
+                sender: outer,
+                sender_bci: 9,
+                pending_stack: vec![ValueLoc::ConstSmi(3)],
+            }),
+            receiver: ValueLoc::FrameSlot(-24),
+            slots: vec![ValueLoc::Nil],
+            ctx: CtxLoc::None,
+        });
+        rec.record_site(
+            0x80,
+            SafepointState {
+                scope: inner,
+                bci: 7,
+                kind: SafepointKind::Call,
+                reexecute: false,
+                stack: vec![ValueLoc::FrameSlot(-24)],
+            },
+        );
+        let (blob, pcdescs) = rec.pack();
+
+        let ds = DeoptState::at_parts(&blob, &pcdescs, 0x80);
+        // The safepoint record itself.
+        assert_eq!(ds.site.bci, 7);
+        assert_eq!(ds.site.kind, SafepointKind::Call);
+        assert!(!ds.site.reexecute);
+        assert_eq!(ds.site.stack, vec![ValueLoc::FrameSlot(-24)]);
+        // Innermost scope names the block activation.
+        assert_eq!(ds.innermost().method_pool_ix, 22);
+
+        // The chain: innermost (block, method 22) then its sender (method 11),
+        // then STOP — exactly two frames, in that order.
+        let chain: Vec<_> = ds.scopes().collect();
+        assert_eq!(chain.len(), 2, "depth-2 chain yields exactly two scopes");
+        assert_eq!(chain[0].method_pool_ix, 22);
+        assert!(chain[0].is_block);
+        assert_eq!(chain[0].receiver, ValueLoc::FrameSlot(-24));
+        assert_eq!(chain[1].method_pool_ix, 11);
+        assert!(!chain[1].is_block);
+        assert_eq!(chain[1].sender, None, "outermost has no sender");
+    }
+
+    /// A pc that was never recorded is a VM bug, not a soft miss — P1 panic
+    /// (mirrors `PcDesc::find`'s own posture, exercised via the parts path).
+    #[test]
+    #[should_panic(expected = "no deopt PcDesc")]
+    fn deopt_state_panics_on_unrecorded_pc() {
+        let mut rec = ScopeDescRecorder::new();
+        let s = rec.begin_scope(ScopeDescData {
+            method_pool_ix: 0,
+            is_block: false,
+            sender: None,
+            receiver: ValueLoc::Nil,
+            slots: vec![],
+            ctx: CtxLoc::None,
+        });
+        rec.record_site(
+            0x40,
+            SafepointState {
+                scope: s,
+                bci: 0,
+                kind: SafepointKind::Call,
+                reexecute: false,
+                stack: vec![],
+            },
+        );
+        let (blob, pcdescs) = rec.pack();
+        // 0x41 was never recorded.
+        let _ = DeoptState::at_parts(&blob, &pcdescs, 0x41);
     }
 }
