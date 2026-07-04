@@ -1424,6 +1424,7 @@ fn mono_resolve_patches_call_site_and_dispatches() {
         call_sites: vec![CallSiteInfo {
             selector: foo_sel,
             argc: 3,
+            static_klass: None,
         }],
     };
     let ra = regalloc::regalloc(&caller_method);
@@ -1572,6 +1573,7 @@ fn build_c2i_scenario(vm: &mut VmState) -> (u64, KlassOop, NmethodId) {
         call_sites: vec![CallSiteInfo {
             selector: foo_sel,
             argc: 3,
+            static_klass: None,
         }],
     };
     let ra = regalloc::regalloc(&caller_method);
@@ -1784,6 +1786,7 @@ fn full_ic_lattice_mono_to_pic_to_mega() {
         call_sites: vec![CallSiteInfo {
             selector: foo_sel,
             argc: 1,
+            static_klass: None,
         }],
     };
     let ra = regalloc::regalloc(&caller_method);
@@ -1924,4 +1927,263 @@ fn full_ic_lattice_mono_to_pic_to_mega() {
     // And a middle one, for good measure.
     let r_mid = dispatch(vm_ptr, klasses[2]);
     assert_eq!(r_mid, SmallInt::new(300).oop().raw());
+}
+
+/// S11 step 6's own DNU target: a compiled call site sending a selector
+/// NOTHING implements must reach a real `#doesNotUnderstand:` -- not
+/// crash, not silently return garbage, not terminate the process. Installs
+/// a stub `#doesNotUnderstand:` on `Object` returning a known sentinel
+/// (mirrors `interpreter::ic`'s own `install_stub_dnu` test helper --
+/// the established, safe way to make DNU observable instead of letting
+/// `runtime::error::dnu_fallback`'s real default, `std::process::exit`,
+/// actually fire). Also confirms a DNU miss leaves the site's own
+/// `IcState` untouched (`Unresolved`) -- `rt_dnu` is reached without
+/// `rt_resolve_send` ever patching or recording anything, since a LATER
+/// call through the same site, with a different receiver klass, might
+/// still resolve successfully.
+#[test]
+fn dnu_from_compiled_code_reaches_does_not_understand() {
+    let mut vm = test_vm();
+    let target_klass = vm.universe.new_klass(
+        vm.universe.object_klass,
+        "S11DnuTarget",
+        Format::Slots,
+        false,
+        HEADER_WORDS,
+    );
+    let unknown_sel = vm.universe.intern(b"totallyUndefinedSelector");
+
+    let object_klass = vm.universe.object_klass;
+    let dnu_sel = vm.universe.sel_does_not_understand;
+    let mut db = BytecodeBuilder::new();
+    db.push_smi_i8(-1);
+    db.ret_tos();
+    let dnu_handler = db.finish(&mut vm, dnu_sel, 1, 0);
+    install_method(&mut vm, object_klass, dnu_sel, dnu_handler);
+
+    // Caller: one param (the target receiver), one send of a selector
+    // nothing anywhere implements -- must genuinely miss and reach rt_dnu.
+    let vregs: Vec<VRegInfo> = (0..2).map(|_| VRegInfo { is_oop: true }).collect();
+    let block0 = IrBlock {
+        id: BlockId(0),
+        bci: 0,
+        code: vec![
+            Ir::Param {
+                dst: VReg(0),
+                index: 0,
+            },
+            Ir::CallSend {
+                dst: VReg(1),
+                site: 0,
+                args: vec![VReg(0)],
+            },
+            Ir::Ret { val: VReg(1) },
+        ],
+        entry_stack: Vec::new(),
+    };
+    let caller_method = IrMethod {
+        blocks: vec![block0],
+        vregs,
+        pool: Vec::new(),
+        argc: 1,
+        ntemps: 0,
+        safepoints: Vec::new(),
+        true_lit: PoolLit(0),
+        false_lit: PoolLit(0),
+        call_sites: vec![CallSiteInfo {
+            selector: unknown_sel,
+            argc: 1,
+            static_klass: None,
+        }],
+    };
+    let ra = regalloc::regalloc(&caller_method);
+    let mut asm = JasmAssembler::new();
+    let (blob, _pcs, _verified_entry_off, emitted_ic_sites) = emit::emit(
+        &mut asm,
+        &caller_method,
+        &ra,
+        vm.stubs.stub_poll_addr(),
+        None,
+    );
+    assert_eq!(emitted_ic_sites.len(), 1);
+
+    let h = vm.code_cache.alloc(blob.code.len()).unwrap();
+    vm.code_cache.publish(h, &blob);
+    let resolve_addr = vm.stubs.resolve_addr();
+    for site in &emitted_ic_sites {
+        vm.code_cache.patch_branch26_at(h, site.off, resolve_addr);
+    }
+    let caller_probe_sel = vm.universe.intern(b"s11DnuCallerProbe");
+    let ic_sites: Vec<IcSite> = emitted_ic_sites
+        .iter()
+        .map(|s| IcSite {
+            off: s.off,
+            selector: s.selector,
+            argc: s.argc,
+            state: IcState::Unresolved,
+        })
+        .collect();
+    let caller_nm = Nmethod {
+        id: NmethodId(0),
+        key_klass: target_klass,
+        key_selector: caller_probe_sel,
+        code: h,
+        entry_off: 0,
+        verified_entry_off: 0,
+        state: NmState::Alive,
+        level: 1,
+        version: 0,
+        literal_off: blob.literal_off,
+        relocs: blob.relocs.clone(),
+        frame_slots: ra.frame_slots,
+        pcdescs: Vec::new(),
+        oopmaps: Vec::new(),
+        ic_sites,
+        poll_bci: None,
+    };
+    let caller_id = vm.code_table.install(caller_nm);
+    let caller_entry = h.base as u64;
+
+    let receiver = alloc::alloc_slots(&mut vm, target_klass).oop();
+    let call: CallStubFn = unsafe { std::mem::transmute(vm.stubs.call_stub_entry()) };
+    let vm_ptr: *mut VmState = &mut vm;
+    let argv = [receiver.raw()];
+
+    let result = unsafe { call(caller_entry, vm_ptr, argv.as_ptr(), 1) };
+    assert_eq!(
+        result,
+        SmallInt::new(-1).oop().raw(),
+        "must reach the installed #doesNotUnderstand: stub"
+    );
+    match vm.code_table.get(caller_id).unwrap().ic_sites[0].state {
+        IcState::Unresolved => {}
+        other => panic!("a DNU miss must not patch or resolve the site, got {other:?}"),
+    }
+
+    // Repeatable: a second dispatch through the SAME still-Unresolved site
+    // must reach DNU again, not crash or behave differently.
+    let result2 = unsafe { call(caller_entry, vm_ptr, argv.as_ptr(), 1) };
+    assert_eq!(result2, SmallInt::new(-1).oop().raw());
+    match vm.code_table.get(caller_id).unwrap().ic_sites[0].state {
+        IcState::Unresolved => {}
+        other => panic!("a second DNU miss must also leave the site Unresolved, got {other:?}"),
+    }
+}
+
+/// S11 step 6's own explicit `send_super` target -- the FIRST test all
+/// S11 (steps 2-6) to compile a `send_super` through the REAL front door
+/// (real bytecode, `driver::compile_method`'s own eligibility+convert+
+/// emit pipeline, not a hand-built `Ir::CallSend` the way every other
+/// S11 test in this file has had to use, since S10's `convert()` never
+/// constructed ANY other kind of send until this step's own D4.6).
+///
+/// Three-klass hierarchy, `foo` overridden at every level (`Root`=100,
+/// `Mid`=200, `Leaf`=300) plus `Leaf>>callSuperFoo` doing `^super foo`.
+/// An ORDINARY send of `foo` to a `Leaf` instance would resolve to
+/// `Leaf`'s own override (300, via normal inheritance) -- the only way
+/// `callSuperFoo` returning 200 (`Mid`'s own, skipping `Leaf`'s own
+/// override) can be explained is genuine super dispatch, starting the
+/// lookup from `Leaf`'s own superclass (`Mid`) rather than `Leaf` itself.
+///
+/// `Mid>>foo` is compiled FIRST (so the super site's own compile-time
+/// resolution finds a real nmethod, not a c2i adapter -- `resolve_target
+/// _entry`'s OTHER branch already has its own coverage from steps 3-5).
+/// Checks the site is `Mono` immediately after compiling `callSuperFoo`,
+/// BEFORE it's ever even called once -- the whole point of D4.6 is
+/// resolving at compile time, not on first runtime miss like every
+/// other site.
+#[test]
+fn send_super_resolves_at_compile_time_and_dispatches() {
+    let mut vm = test_vm();
+    let foo_sel = vm.universe.intern(b"foo");
+
+    let root_klass = vm.universe.new_klass(
+        vm.universe.object_klass,
+        "S11SuperRoot",
+        Format::Slots,
+        false,
+        HEADER_WORDS,
+    );
+    let mid_klass = vm.universe.new_klass(
+        root_klass,
+        "S11SuperMid",
+        Format::Slots,
+        false,
+        HEADER_WORDS,
+    );
+    let leaf_klass = vm.universe.new_klass(
+        mid_klass,
+        "S11SuperLeaf",
+        Format::Slots,
+        false,
+        HEADER_WORDS,
+    );
+
+    let make_foo = |vm: &mut VmState, n: i64| -> MethodOop {
+        let mut b = BytecodeBuilder::new();
+        b.push_literal(vm, SmallInt::new(n).oop());
+        b.ret_tos();
+        b.finish(vm, foo_sel, 0, 0)
+    };
+    let root_foo = make_foo(&mut vm, 100);
+    install_method(&mut vm, root_klass, foo_sel, root_foo);
+    let mid_foo = make_foo(&mut vm, 200);
+    install_method(&mut vm, mid_klass, foo_sel, mid_foo);
+    let leaf_foo = make_foo(&mut vm, 300);
+    install_method(&mut vm, leaf_klass, foo_sel, leaf_foo);
+
+    // Compile Mid>>foo FIRST, so callSuperFoo's own compile-time
+    // resolution finds a real nmethod entry, not a c2i adapter.
+    assert!(driver::eligible(&vm, mid_foo));
+    driver::compile_method(&mut vm, mid_klass, mid_foo).expect("Mid>>foo must compile");
+
+    let call_super_foo_sel = vm.universe.intern(b"callSuperFoo");
+    let mut b = BytecodeBuilder::new();
+    b.push_self();
+    b.send_super(&mut vm, foo_sel, 0);
+    b.ret_tos();
+    let call_super_foo = b.finish(&mut vm, call_super_foo_sel, 0, 0);
+    install_method(&mut vm, leaf_klass, call_super_foo_sel, call_super_foo);
+    assert!(
+        driver::eligible(&vm, call_super_foo),
+        "a super send must be unconditionally eligible (D4.6)"
+    );
+
+    let id = driver::compile_method(&mut vm, leaf_klass, call_super_foo)
+        .expect("callSuperFoo must compile");
+    let nm = vm
+        .code_table
+        .get(id)
+        .expect("installed nmethod must be gettable");
+    assert_eq!(
+        nm.ic_sites.len(),
+        1,
+        "exactly one send (the super send) in this method"
+    );
+    match nm.ic_sites[0].state {
+        IcState::Mono { klass, .. } => {
+            assert_eq!(
+                klass, mid_klass,
+                "the super site's own compile-time-resolved klass must be Leaf's superclass, \
+                 Mid -- not Leaf itself and not Root"
+            );
+        }
+        other => panic!(
+            "a send_super site must be Mono IMMEDIATELY after compiling, before ever being \
+             called -- got {other:?}"
+        ),
+    }
+    let entry = unsafe { nm.code.base.add(nm.entry_off as usize) } as u64;
+
+    let call: CallStubFn = unsafe { std::mem::transmute(vm.stubs.call_stub_entry()) };
+    let vm_ptr: *mut VmState = &mut vm;
+    let receiver = alloc::alloc_slots(unsafe { &mut *vm_ptr }, leaf_klass).oop();
+    let argv = [receiver.raw()];
+    let result = unsafe { call(entry, vm_ptr, argv.as_ptr(), 1) };
+    assert_eq!(
+        result,
+        SmallInt::new(200).oop().raw(),
+        "super foo from a method on Leaf must reach Mid's own foo (200) -- not Leaf's own \
+         override (300, what an ORDINARY send would reach) and not Root's (100)"
+    );
 }

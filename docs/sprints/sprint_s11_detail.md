@@ -233,6 +233,24 @@ emit a direct `bl` to its nmethod entry or c2i adapter with
 `RelocKind::InlineCache` and `IcSite { state: Mono }` (so invalidation can
 repatch it). Record a dependency note in `Nmethod` (`deps` seed for S13).
 
+> **SPEC-QUESTION:** this section's own "bl to its nmethod entry" reads as
+> ordinary `entry`, but implementation plus a failing integration test
+> (`send_super_resolves_at_compile_time_and_dispatches`, a 3-klass override
+> chain) proved that's wrong, the same way D2's own SPEC-QUESTION above
+> caught it for mono sites: `entry`'s klass-guard checks the ACTUAL
+> receiver (whatever subclass `self` really is — e.g. `Leaf`) against the
+> TARGET's own `key_klass` (the super lookup's static holder — e.g.
+> `Mid`). Those essentially never match by construction (that mismatch is
+> the entire point of `super`), so the guard always misses and silently
+> re-resolves from the receiver's REAL klass via `stub_resolve` — quietly
+> collapsing back into an ordinary send and losing `super` semantics
+> entirely, with no crash to flag it. S11 implements **`verified_entry`**
+> for `send_super` targets instead: the send's own static compile-time
+> resolution already IS the verification a guard would otherwise redo
+> (same reasoning as PIC/mega targets in D4.3/D4.4). S13's `Nmethod.deps`
+> work should assume `verified_entry`, not `entry`, for every super-send
+> dependency it seeds from this step.
+
 ### D5. Runtime stubs table (generated at startup, in cache, in this order)
 
 ```rust

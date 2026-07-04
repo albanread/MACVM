@@ -136,9 +136,18 @@ pub struct BlockPc {
 /// (same reasoning as [`BlockPc`] for `PcDesc`): every fresh site starts
 /// `Unresolved`, which only `driver.rs` (the module that actually knows
 /// about `IcState`) needs to say explicitly.
+///
+/// `site` is the SAME `Ir::CallSend.site` index this came from, carried
+/// through so `driver.rs` can look back up `IrMethod.call_sites[site]`
+/// (specifically `static_klass`, D4.6) — `regalloc`'s own linearized
+/// block order (what `emit` actually walks) isn't guaranteed to match
+/// `convert`'s own traversal order (what assigned `call_sites`' own
+/// indices), so `emitted_ic_sites`'s OWN position can't be assumed to
+/// line up with `call_sites`' position; only the shared `site` value can.
 #[derive(Clone, Copy, Debug)]
 pub struct EmittedIcSite {
     pub off: u32,
+    pub site: u16,
     pub selector: SymbolOop,
     pub argc: u8,
 }
@@ -471,6 +480,7 @@ impl<'a> Emitter<'a> {
         let info = self.call_sites[site as usize];
         self.ic_sites.push(EmittedIcSite {
             off,
+            site,
             selector: info.selector,
             argc: info.argc,
         });
@@ -1220,14 +1230,17 @@ mod tests {
                 CallSiteInfo {
                     selector: test_selector(b"foo"),
                     argc: 2,
+                    static_klass: None,
                 },
                 CallSiteInfo {
                     selector: test_selector(b"bar"),
                     argc: 2,
+                    static_klass: None,
                 },
                 CallSiteInfo {
                     selector: test_selector(b"baz"),
                     argc: 2,
+                    static_klass: None,
                 },
             ],
         };

@@ -18,7 +18,7 @@ use crate::compiler::assembler::RelocKind;
 use crate::compiler::decode::{BlockIndex, Cfg, Terminator};
 use crate::interpreter::ic::InterpreterIc;
 use crate::oops::layout::BODY_OFFSET;
-use crate::oops::wrappers::{MethodOop, SymbolOop};
+use crate::oops::wrappers::{KlassOop, MethodOop, SymbolOop};
 use crate::runtime::vm_state::VmState;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -308,6 +308,15 @@ pub struct IrMethod {
 pub struct CallSiteInfo {
     pub selector: SymbolOop,
     pub argc: u8,
+    /// D4.6: `Some(holder.superclass())` for a `send_super` site — the
+    /// STATIC starting klass for lookup, fixed at compile time (method
+    /// holders don't move between klasses in v1) and independent of the
+    /// runtime receiver's own klass. `None` for an ordinary dynamic send,
+    /// whose starting klass is the receiver's own, only known at runtime.
+    /// `driver::compile_method` reads this to pre-resolve a super site's
+    /// own target and seed `IcState::Mono` directly, instead of patching
+    /// to `stub_resolve` and starting `Unresolved` like every other site.
+    pub static_klass: Option<KlassOop>,
 }
 
 // ── conversion ───────────────────────────────────────────────────────────
@@ -540,6 +549,13 @@ struct Translator<'a> {
     /// before any translation starts, so every `SmiArith`/`SmiCmpVal`'s
     /// `fail` field can reference it directly.
     bailout_id: BlockId,
+    /// D4.6: accumulates one entry per `send_super` translated so far, in
+    /// encounter order — `Ir::CallSend.site` indexes into this, same
+    /// shape as `pool`'s own accumulate-then-hand-to-`IrMethod` pattern.
+    /// S10's own eligibility rules out every OTHER send reaching here
+    /// (D1, until S11 step 7's own relaxation), so `send_super` is the
+    /// only source of entries today.
+    call_sites: Vec<CallSiteInfo>,
 }
 
 impl<'a> Translator<'a> {
@@ -648,11 +664,45 @@ impl<'a> Translator<'a> {
                 let tos = *stack.last().expect("dup: empty simulated stack");
                 stack.push(tos);
             }
-            Instr::Send { ic, super_ } => {
-                debug_assert!(
-                    !super_,
-                    "translate: super sends are excluded by eligibility (D1)"
-                );
+            Instr::Send { ic, super_ } if super_ => {
+                // D4.6: the target METHOD is resolved at compile time
+                // (`driver::compile_method`, after this whole IrMethod
+                // comes back) via `holder.superclass()` — fixed here only
+                // as far as WHICH klass to start that lookup from; method
+                // holders don't move between klasses in v1, so this
+                // klass itself never goes stale. Ordinary `Ir::CallSend`,
+                // same as any other send site — `CallSiteInfo::
+                // static_klass` is what tells `compile_method` to
+                // pre-resolve and seed `Mono` instead of patching to
+                // `stub_resolve` and starting `Unresolved`.
+                let ic_view = InterpreterIc::at(self.method, ic);
+                let selector = ic_view.selector();
+                let real_argc = ic_view.argc();
+                let mut real_args: Vec<VReg> = (0..real_argc)
+                    .map(|_| stack.pop().expect("send_super: missing arg operand"))
+                    .collect();
+                real_args.reverse();
+                let receiver = stack.pop().expect("send_super: missing receiver operand");
+                let mut args = vec![receiver];
+                args.append(&mut real_args);
+
+                let holder = KlassOop::try_from(self.method.holder())
+                    .expect("send_super: compiled method with no installed holder");
+                let super_klass = KlassOop::try_from(holder.superclass())
+                    .expect("send_super: holder's own superclass field is not a klass");
+
+                let site = self.call_sites.len() as u16;
+                self.call_sites.push(CallSiteInfo {
+                    selector,
+                    argc: real_argc + 1,
+                    static_klass: Some(super_klass),
+                });
+
+                let dst = self.fresh(true);
+                code.push(Ir::CallSend { dst, site, args });
+                stack.push(dst);
+            }
+            Instr::Send { ic, .. } => {
                 let b = stack.pop().expect("send: missing arg operand");
                 let a = stack.pop().expect("send: missing receiver operand");
                 match classify_smi_send(self.vm, self.method, ic) {
@@ -772,6 +822,7 @@ pub fn convert(vm: &VmState, method: MethodOop, cfg: &Cfg) -> IrMethod {
         self_vreg,
         temp_vregs: temp_vregs.clone(),
         bailout_id,
+        call_sites: Vec::new(),
     };
 
     // Pre-allocate merge vregs for every block that needs them (D3.2) —
@@ -938,9 +989,7 @@ pub fn convert(vm: &VmState, method: MethodOop, cfg: &Cfg) -> IrMethod {
         safepoints: Vec::new(),
         true_lit,
         false_lit,
-        // S10's convert() never constructs Ir::CallSend (S11-only variant,
-        // see Ir::uses/defs' own doc) — no sites to record yet.
-        call_sites: Vec::new(),
+        call_sites: t.call_sites,
     }
 }
 

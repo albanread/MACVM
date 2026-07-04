@@ -6,10 +6,12 @@
 
 use crate::bytecode::opcode::{decode_at, Instr};
 use crate::codecache::nmethod::{IcSite, NmState, Nmethod, NmethodId, OopMap, PcDesc};
+use crate::codecache::stubs::resolve_target_entry;
 use crate::compiler::jasm_assembler::JasmAssembler;
 use crate::compiler::{decode, emit, ir, regalloc};
 use crate::interpreter::ic::{ic_state, IcState, InterpreterIc};
 use crate::oops::wrappers::{KlassOop, MethodOop, SymbolOop};
+use crate::runtime::lookup::lookup;
 use crate::runtime::vm_state::VmState;
 use crate::runtime::JitMode;
 
@@ -112,12 +114,18 @@ fn eligibility_detail(vm: &VmState, method: MethodOop) -> Eligibility {
             | Instr::ReturnTos
             | Instr::ReturnSelf => {}
             Instr::Send { ic, super_ } => {
-                if super_ {
-                    return Eligibility::NoPermanent; // D1 point 1: super sends excluded
-                }
-                verdict = verdict.worse(mono_smi_inline_send(vm, method, ic));
-                if verdict == Eligibility::NoPermanent {
-                    return Eligibility::NoPermanent; // short-circuit: nothing later can undo this
+                // D4.6: a super send's own target is resolved statically
+                // (holder.superclass(), fixed at compile time) rather than
+                // through the interpreter's own IC lattice, so
+                // `mono_smi_inline_send`'s "is this site's own IC already
+                // mono-smi" check is meaningless for it — skip straight to
+                // `Yes` (never worse than the current verdict: `Yes` is
+                // this enum's own best case).
+                if !super_ {
+                    verdict = verdict.worse(mono_smi_inline_send(vm, method, ic));
+                    if verdict == Eligibility::NoPermanent {
+                        return Eligibility::NoPermanent; // short-circuit: nothing later can undo this
+                    }
                 }
             }
             // Excluded (D1 point 1): instvar/global/ctx stores, closures,
@@ -239,6 +247,50 @@ pub fn compile_method(
         Some(guard),
     );
 
+    // D4.6: pre-resolve every `send_super` site's own target BEFORE
+    // publishing anything -- resolving here (not at runtime, via
+    // `stub_resolve`, like every other site) is the whole point of a
+    // super send's own static klass. A lookup failure (the superclass
+    // genuinely doesn't implement this selector) fails the WHOLE method's
+    // own compile, same as any other compile failure here -- falls back
+    // to the interpreter, which already handles a super-send DNU
+    // correctly via its own existing mechanism; no new runtime-DNU-from-
+    // compile-time path is needed. Allocates no Smalltalk heap memory
+    // (`lookup`/`resolve_target_entry`'s own c2i-adapter fallback only
+    // ever touches the CODE cache), so this doesn't disturb this
+    // function's own "no HandleScope needed, no GC can strike mid-
+    // compile" invariant (this function's own doc, above).
+    //
+    // `use_verified=true` here is load-bearing, not a micro-optimization:
+    // a super site's own receiver is whatever `self` actually is at the
+    // call site (`Leaf`, or any further subclass) -- essentially NEVER
+    // the resolved target's own `key_klass` (`super_klass`, the STATIC
+    // holder's superclass), since that's the whole point of `super`. If
+    // the target were reached via its own `entry` (guarded, `use_verified
+    // =false` -- Mono's own convention, since a Mono site's `bl` really
+    // could later see a different RECEIVER klass through the same site),
+    // that guard would almost always MISMATCH and misroute back through
+    // `stub_resolve`, which re-resolves from `klass_of(receiver)` -- the
+    // receiver's own actual klass, NOT `super_klass` -- silently
+    // collapsing back into an ordinary dynamic send and reaching an
+    // override `super` was specifically supposed to skip. Caught by this
+    // step's own integration test (a 3-klass override chain where an
+    // ordinary send and a super send provably reach different methods);
+    // `entry` was the first thing tried and failed exactly this way.
+    let mut super_resolutions: Vec<Option<(KlassOop, u64)>> =
+        Vec::with_capacity(emitted_ic_sites.len());
+    for s in &emitted_ic_sites {
+        let resolved = match ir_method.call_sites[s.site as usize].static_klass {
+            Some(super_klass) => {
+                let target_method = lookup(vm, super_klass, s.selector)?;
+                let target = resolve_target_entry(vm, super_klass, s.selector, target_method, true);
+                Some((super_klass, target))
+            }
+            None => None,
+        };
+        super_resolutions.push(resolved);
+    }
+
     let Some(h) = vm.code_cache.alloc(blob.code.len()) else {
         vm.options.jit = JitMode::Off;
         if vm.options.trace.is_enabled("jit") {
@@ -283,14 +335,24 @@ pub fn compile_method(
     // S11 D3: every fresh site starts Unresolved -- its `bl` still
     // self-targets (`bl_patchable`'s own placeholder) until the patch pass
     // just below aims it at `stub_resolve` (D3: "no per-site
-    // pre-resolution", exactly like an empty interpreter IC).
+    // pre-resolution", exactly like an empty interpreter IC) -- EXCEPT a
+    // `send_super` site (D4.6), already resolved above: it starts
+    // `Mono{klass, target}` directly, its `bl` already pointing at the
+    // real target, never touching `stub_resolve` at all on a normal run.
     let ic_sites: Vec<IcSite> = emitted_ic_sites
         .iter()
-        .map(|s| IcSite {
+        .zip(&super_resolutions)
+        .map(|(s, resolved)| IcSite {
             off: s.off,
             selector: s.selector,
             argc: s.argc,
-            state: CompiledIcState::Unresolved,
+            state: match resolved {
+                Some((klass, target)) => CompiledIcState::Mono {
+                    klass: *klass,
+                    target: *target,
+                },
+                None => CompiledIcState::Unresolved,
+            },
         })
         .collect();
 
@@ -313,8 +375,9 @@ pub fn compile_method(
         poll_bci,
     };
     let resolve_addr = vm.stubs.resolve_addr();
-    for site in &emitted_ic_sites {
-        vm.code_cache.patch_branch26_at(h, site.off, resolve_addr);
+    for (site, resolved) in emitted_ic_sites.iter().zip(&super_resolutions) {
+        let patch_target = resolved.map_or(resolve_addr, |(_, target)| target);
+        vm.code_cache.patch_branch26_at(h, site.off, patch_target);
     }
     let id = vm.code_table.install(nm);
     if vm.options.trace.is_enabled("jit") {
@@ -434,8 +497,14 @@ mod tests {
         assert!(!eligible(&vm, method));
     }
 
+    /// D4.6 (S11 step 6): a `super` send's own target is resolved
+    /// statically at compile time, not through the interpreter's own IC
+    /// lattice — so, unlike an ordinary send, its own site's IC state is
+    /// irrelevant to eligibility. `set_mono_smi_plus_ic` is deliberately
+    /// NOT called here (a super send would ignore it anyway): this method
+    /// must be eligible on the strength of the super send alone.
     #[test]
-    fn eligible_rejects_super_send() {
+    fn eligible_allows_super_send() {
         let mut vm = test_vm();
         let plus_sel = vm.universe.intern(b"+");
         let mut b = BytecodeBuilder::new();
@@ -445,8 +514,7 @@ mod tests {
         b.ret_tos();
         let m_sel = vm.universe.intern(b"m");
         let method = b.finish(&mut vm, m_sel, 1, 0);
-        set_mono_smi_plus_ic(&mut vm, method);
-        assert!(!eligible(&vm, method));
+        assert!(eligible(&vm, method));
     }
 
     #[test]

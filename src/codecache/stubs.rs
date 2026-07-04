@@ -15,7 +15,7 @@ use crate::oops::Oop;
 use crate::runtime::lookup::{klass_of, lookup};
 use crate::runtime::vm_state::{TierLink, VmState};
 
-use super::nmethod::IcState;
+use super::nmethod::{IcState, NmethodId};
 use super::pics::PIC_MAX_ENTRIES;
 use super::{CodeCache, CodeHandle};
 
@@ -96,6 +96,15 @@ pub struct Stubs {
     /// `mega_<sel>` trampoline (`codecache::mega::build_mega_trampoline`)
     /// `br`s here with the selector's own oop already in x16 (S11 step 5).
     pub mega_shared: CodeHandle,
+    /// D5.4: `rt_resolve_send`/`rt_mega_lookup`'s own lookup-failure
+    /// return value — never patched into a site, just tail-jumped to for
+    /// THIS one dispatch (S11 step 6).
+    pub dnu: CodeHandle,
+    /// D1/D5: the `BoolBr.not_bool` runtime helper — built and callable
+    /// now (S11 step 6), but not yet reachable from any REAL compiled
+    /// method: emitting a call to it from a `not_bool` block is
+    /// `Ir::CallRuntime`'s own job, S11 step 7's eligibility relaxation.
+    pub must_be_boolean: CodeHandle,
 }
 
 impl Stubs {
@@ -113,6 +122,12 @@ impl Stubs {
     }
     pub fn mega_shared_addr(&self) -> u64 {
         self.mega_shared.base as u64
+    }
+    pub fn dnu_addr(&self) -> u64 {
+        self.dnu.base as u64
+    }
+    pub fn must_be_boolean_addr(&self) -> u64 {
+        self.must_be_boolean.base as u64
     }
 
     /// Invokes `entry` (a compiled method's own entry point — an `Nmethod`'s
@@ -172,12 +187,26 @@ pub fn install(cache: &mut CodeCache) -> Stubs {
         .expect("stubs::install: code cache too small for mega_shared");
     cache.publish(h5, &mega_shared_blob);
 
+    let dnu_blob = build_stub_dnu();
+    let h6 = cache
+        .alloc(dnu_blob.code.len())
+        .expect("stubs::install: code cache too small for dnu");
+    cache.publish(h6, &dnu_blob);
+
+    let must_be_boolean_blob = build_stub_must_be_boolean();
+    let h7 = cache
+        .alloc(must_be_boolean_blob.code.len())
+        .expect("stubs::install: code cache too small for must_be_boolean");
+    cache.publish(h7, &must_be_boolean_blob);
+
     Stubs {
         call_stub: h1,
         stub_poll: h2,
         resolve: h3,
         c2i_shared: h4,
         mega_shared: h5,
+        dnu: h6,
+        must_be_boolean: h7,
     }
 }
 
@@ -299,7 +328,11 @@ fn build_stub_resolve() -> CodeBlob {
 }
 
 /// D4.1/D4.3/D4.4's shared target-resolution step, used by `rt_resolve_send`
-/// (both the mono path and every Pic/Mega transition) and `rt_mega_lookup`.
+/// (both the mono path and every Pic/Mega transition), `rt_mega_lookup`,
+/// and — `pub(crate)` specifically for this — `compiler::driver::
+/// compile_method`'s own compile-time resolution of a `send_super` site
+/// (D4.6): the same "real nmethod or c2i adapter" choice applies whether
+/// the resolving call happens at runtime or at compile time.
 ///
 /// `use_verified` picks between a real nmethod's `entry` and its
 /// `verified_entry`: a MONO site's `bl` is a static patch that could later
@@ -311,7 +344,7 @@ fn build_stub_resolve() -> CodeBlob {
 /// `use_verified=true`, D4.3's own "the pair's klass was just compared").
 /// A c2i adapter has no guard of its own either way (D6.1), so the
 /// distinction is moot there.
-fn resolve_target_entry(
+pub(crate) fn resolve_target_entry(
     vm: &mut VmState,
     k: KlassOop,
     selector: SymbolOop,
@@ -340,6 +373,46 @@ fn resolve_target_entry(
                 .get_or_make(&mut vm.code_cache, c2i_shared_addr, method)
         }
     }
+}
+
+/// Finds the caller nmethod and its own `IcSite` from a send site's return
+/// address. `ret_addr - 4` is always the `bl`/guard-miss site itself —
+/// D4.1's own invariant, true through every door a compiled send can be
+/// re-entered from (a fresh `bl`, a guard's own `b`, a PIC's own indirect
+/// tail-call): none of them ever touch x30 except the original `bl`
+/// itself. Shared by [`rt_resolve_send`] and [`rt_dnu`] — the latter is
+/// reached from EITHER `rt_resolve_send`'s own `stub_resolve` or
+/// `rt_mega_lookup`'s own `stub_mega_shared`, both of which restore x30 to
+/// the original send's own continuation before tail-jumping onward, so
+/// this same derivation is valid starting from either one.
+fn find_caller_site(
+    vm: &VmState,
+    ret_addr: u64,
+) -> (NmethodId, CodeHandle, u32, usize, SymbolOop, u8) {
+    let caller_id = vm
+        .code_table
+        .find_by_pc(ret_addr)
+        .expect("ret_addr must fall inside a published nmethod (D4.1)");
+    let caller_nm = vm
+        .code_table
+        .get(caller_id)
+        .expect("find_by_pc just returned this id");
+    let caller_code = caller_nm.code;
+    let site_off = (ret_addr - 4 - caller_code.base as u64) as u32;
+    let site_idx = caller_nm
+        .ic_sites
+        .iter()
+        .position(|s| s.off == site_off)
+        .unwrap_or_else(|| panic!("no IcSite at offset {site_off} in nmethod {caller_id:?}"));
+    let site = &caller_nm.ic_sites[site_idx];
+    (
+        caller_id,
+        caller_code,
+        site_off,
+        site_idx,
+        site.selector,
+        site.argc,
+    )
 }
 
 /// # Safety
@@ -374,8 +447,11 @@ fn resolve_target_entry(
 /// back to a c2i adapter (D6.1) at every one of the above — from
 /// `IcState`'s own perspective this is no different from a real nmethod's
 /// entry, just a different source for a target address. DNU (`lookup`
-/// finds nothing) remains S11 step 6's own scope — deliberately loud
-/// (`todo!`) rather than silently wrong.
+/// finds nothing) returns `stubs.dnu`'s own address WITHOUT patching the
+/// site at all or touching its recorded state (D5.4) — a LATER call
+/// through the same site, with a different receiver klass, might still
+/// resolve successfully, so nothing here may assume this klass is
+/// permanent the way a real resolution does.
 pub unsafe extern "C" fn rt_resolve_send(vm: *mut VmState, ret_addr: u64, argv: *mut u64) -> u64 {
     // SAFETY: this function's own contract, guaranteed by `stub_resolve`.
     let vm = unsafe { &mut *vm };
@@ -390,25 +466,9 @@ pub unsafe extern "C" fn rt_resolve_send(vm: *mut VmState, ret_addr: u64, argv: 
         "rt_resolve_send: anchor must be set by stub_resolve's prologue before this call"
     );
 
-    let caller_id = vm
-        .code_table
-        .find_by_pc(ret_addr)
-        .expect("rt_resolve_send: ret_addr must fall inside a published nmethod (D4.1)");
-    let caller_nm = vm
-        .code_table
-        .get(caller_id)
-        .expect("find_by_pc just returned this id");
-    let caller_code = caller_nm.code;
-    let site_off = (ret_addr - 4 - caller_code.base as u64) as u32;
-    let site_idx = caller_nm
-        .ic_sites
-        .iter()
-        .position(|s| s.off == site_off)
-        .unwrap_or_else(|| {
-            panic!("rt_resolve_send: no IcSite at offset {site_off} in nmethod {caller_id:?}")
-        });
-    let selector = caller_nm.ic_sites[site_idx].selector;
-    let prev_state = caller_nm.ic_sites[site_idx].state;
+    let (caller_id, caller_code, site_off, site_idx, selector, _argc) =
+        find_caller_site(vm, ret_addr);
+    let prev_state = vm.code_table.get(caller_id).unwrap().ic_sites[site_idx].state;
 
     // SAFETY: this function's own contract above -- `argv[0]` is always
     // the receiver, D4.1's register protocol.
@@ -416,7 +476,7 @@ pub unsafe extern "C" fn rt_resolve_send(vm: *mut VmState, ret_addr: u64, argv: 
     let k = klass_of(vm, receiver);
 
     let Some(method) = lookup(vm, k, selector) else {
-        todo!("S11 step 6: DNU from compiled code (stubs.dnu / rt_dnu)")
+        return vm.stubs.dnu_addr();
     };
 
     // `patch_target`: what the SITE's own `bl` gets repointed to (governs
@@ -674,9 +734,180 @@ pub unsafe extern "C" fn rt_mega_lookup(
     let k = klass_of(vm, receiver);
 
     let Some(method) = lookup(vm, k, selector) else {
-        todo!("S11 step 6: DNU from compiled code (stubs.dnu / rt_dnu)")
+        return vm.stubs.dnu_addr();
     };
     resolve_target_entry(vm, k, selector, method, true)
+}
+
+/// D5.4: the shared, callee-shaped DNU tail. Tail-jumped to (never
+/// patched into any site — `rt_resolve_send`/`rt_mega_lookup`'s own doc)
+/// from EITHER `stub_resolve`'s or `stub_mega_shared`'s own generic
+/// epilogue, both of which restore x30 to the ORIGINAL send's own
+/// continuation before getting here — same "capture ret_addr before
+/// call_far clobbers it, callee-shaped return" pattern as `c2i_shared`.
+fn build_stub_dnu() -> CodeBlob {
+    let mut a = JasmAssembler::new();
+
+    emit_stub_prologue(&mut a);
+    a.emit("mov", &[x(0), x(28)]); // vm
+    a.emit("mov", &[x(1), x(30)]); // ret_addr, captured before call_far clobbers it
+    a.emit("mov", &[x(2), sp()]); // argv = &RootSpill (x0..x5, contiguous)
+    let rt_dnu_lit = a.literal_u64(rt_dnu as *const () as u64, Some(RelocKind::RuntimeAddr));
+    a.call_far(rt_dnu_lit);
+    a.emit("mov", &[x(16), x(0)]); // result -> x16, survives the epilogue's own x0 reload
+    emit_stub_epilogue(&mut a);
+    a.emit("mov", &[x(0), x(16)]); // restore the real result
+    a.emit("ret", &[]);
+
+    a.finish()
+}
+
+/// # Safety
+/// Only ever reached via `br` from `stub_resolve`'s or `stub_mega_shared`'s
+/// own epilogue (both tail-jumping to whatever `rt_resolve_send`/
+/// `rt_mega_lookup` returned on a lookup miss), never called directly from
+/// Rust. `argv` points at the ORIGINAL send site's own RootSpill area (6
+/// live `u64`s, receiver + up to 5 args, contiguous ascending) — neither
+/// intermediate stub's own epilogue touches it beyond the standard
+/// reload, so it's exactly what the original send set up.
+///
+/// D5.4: builds a `Message` (selector + args array) mirroring
+/// `interpreter::send::dnu`'s own recipe (that function reads its args off
+/// `vm.stack`; this one off the RootSpill argv, matching every other S11
+/// runtime stub) — `find_caller_site` (shared with `rt_resolve_send`)
+/// re-derives the selector/argc this SITE was built with from `ret_addr`,
+/// exactly the same way regardless of which door (`rt_resolve_send` or
+/// `rt_mega_lookup`) led here, since an `IcSite`'s own `selector`/`argc`
+/// never change, only its `state` does. Then sends `#doesNotUnderstand:`
+/// via the same lookup+`run_method_reentrant` pattern `rt_interpret_call`
+/// already uses (this call may be nested inside a paused interpreter
+/// activation just like any other C→I path, for the exact same reason).
+/// Falls back to `runtime::error::dnu_fallback` (prints + exits, `-> !`)
+/// only if EVEN `#doesNotUnderstand:` itself isn't found on the
+/// receiver's klass — unreachable in a real Smalltalk image (`Object`
+/// always implements it), matching how the interpreter's own `dnu()`
+/// treats the identical case.
+pub unsafe extern "C" fn rt_dnu(vm: *mut VmState, ret_addr: u64, argv: *mut u64) -> u64 {
+    // SAFETY: this function's own contract, guaranteed by `stub_dnu`.
+    let vm = unsafe { &mut *vm };
+    debug_assert_ne!(
+        vm.reg_block.last_compiled_fp, 0,
+        "rt_dnu: anchor must be set by stub_dnu's prologue before this call"
+    );
+
+    let (_caller_id, _caller_code, _site_off, _site_idx, selector, argc_total) =
+        find_caller_site(vm, ret_addr);
+    let real_argc = argc_total as usize - 1;
+
+    // SAFETY: this function's own contract above -- argv[0] is the
+    // receiver, argv[1..=real_argc] the real Smalltalk args, D4.1's
+    // register protocol.
+    let receiver = Oop::from_raw(unsafe { *argv });
+    let k = klass_of(vm, receiver);
+
+    // `selector`/`k`/`receiver` are bare parameters held across BOTH
+    // allocations below (the interpreter's own `send::dnu` holds the
+    // same values across the same two allocations, for the same reason —
+    // S7-10 GC_STRESS audit).
+    let scope = crate::memory::handles::HandleScope::enter(vm);
+    let selector_h = scope.handle(vm, selector);
+    let k_h = scope.handle(vm, k);
+    let receiver_h = scope.handle(vm, receiver);
+
+    let array_klass = vm.universe.array_klass;
+    let args_array = crate::memory::alloc::alloc_indexable_oops(vm, array_klass, real_argc);
+    for i in 0..real_argc {
+        // SAFETY: this function's own contract above.
+        args_array.at_put(i, Oop::from_raw(unsafe { *argv.add(1 + i) }));
+    }
+    let array_h = scope.handle(vm, args_array.oop());
+
+    let message_klass = vm.universe.message_klass;
+    let msg = crate::memory::alloc::alloc_slots(vm, message_klass);
+    msg.set_body_oop(0, selector_h.get(vm).oop());
+    msg.set_body_oop(1, array_h.get(vm));
+
+    let sel_dnu = vm.universe.sel_does_not_understand;
+    match lookup(vm, k_h.get(vm), sel_dnu) {
+        Some(dnu_method) => {
+            let result = crate::interpreter::run_method_reentrant(
+                vm,
+                dnu_method,
+                receiver_h.get(vm),
+                &[msg.oop()],
+            );
+            result.raw()
+        }
+        None => crate::runtime::error::dnu_fallback(vm, selector_h.get(vm), k_h.get(vm)),
+    }
+}
+
+/// D1/D5: the shared `BoolBr.not_bool` runtime helper — callee-shaped
+/// (plain `ret`, x0=result), same pattern as `c2i_shared`/`stub_dnu`. Only
+/// one argument (`val`, arriving in x0), so it's copied to x1 (`rt_must_be
+/// _boolean`'s own 2nd parameter) BEFORE x0 gets overwritten with `vm` —
+/// `emit_stub_prologue`'s own `stp x0,x1,...` already spilled val's
+/// original value to RootSpill by this point, so the register itself is
+/// free to reuse.
+///
+/// Built and published now (S11 step 6, completing the `RuntimeStubs`
+/// table's own roster), but not yet reachable from any REAL compiled
+/// method — `Ir::CallRuntime{stub: MustBeBoolean}`'s own emission (a
+/// `not_bool` block calling this instead of the deleted `Ir::Bailout`,
+/// D1's own words) is S11 step 7's job, tied to that step's broader
+/// eligibility relaxation. Testable in isolation now regardless, via a
+/// direct `Stubs::invoke` the same way any nmethod entry would be.
+fn build_stub_must_be_boolean() -> CodeBlob {
+    let mut a = JasmAssembler::new();
+
+    emit_stub_prologue(&mut a);
+    a.emit("mov", &[x(1), x(0)]); // val -> x1, before x0 is overwritten below
+    a.emit("mov", &[x(0), x(28)]); // vm
+    let lit = a.literal_u64(
+        rt_must_be_boolean as *const () as u64,
+        Some(RelocKind::RuntimeAddr),
+    );
+    a.call_far(lit);
+    a.emit("mov", &[x(16), x(0)]); // result -> x16, survives the epilogue's own x0 reload
+    emit_stub_epilogue(&mut a);
+    a.emit("mov", &[x(0), x(16)]); // restore the real result
+    a.emit("ret", &[]);
+
+    a.finish()
+}
+
+/// # Safety
+/// Only ever reached via `blr` from `stub_must_be_boolean`'s own
+/// hand-assembled listing above (through `call_far`), never called
+/// directly from Rust.
+///
+/// Mirrors the interpreter's own `must_be_boolean_send` exactly (same
+/// klass_of + lookup + activate/fallback shape; that function additionally
+/// rolls `vm.regs.bci` back to the branch opcode itself first, which has
+/// no compiled-code equivalent — compiled code has no bci at all): sends
+/// `#mustBeBoolean` (unary) via lookup + `run_method_reentrant`, expected
+/// to return a real boolean the caller's own re-tested branch will
+/// consume (once S11 step 7 wires the caller side). If NOT found, goes
+/// STRAIGHT to `runtime::error::dnu_fallback` (prints + exits, `-> !`) —
+/// deliberately not a full `#doesNotUnderstand:` send-and-fallback the way
+/// [`rt_dnu`] is: the interpreter's own `must_be_boolean_send` makes the
+/// identical choice, since this isn't a real user-level message send in
+/// the first place, just a boolean-coercion protocol step.
+pub unsafe extern "C" fn rt_must_be_boolean(vm: *mut VmState, val: u64) -> u64 {
+    // SAFETY: this function's own contract, guaranteed by `stub_must_be_boolean`.
+    let vm = unsafe { &mut *vm };
+    debug_assert_ne!(
+        vm.reg_block.last_compiled_fp, 0,
+        "rt_must_be_boolean: anchor must be set by stub_must_be_boolean's prologue before this call"
+    );
+
+    let t = Oop::from_raw(val);
+    let k = klass_of(vm, t);
+    let sel = vm.universe.sel_must_be_boolean;
+    match lookup(vm, k, sel) {
+        Some(m) => crate::interpreter::run_method_reentrant(vm, m, t, &[]).raw(),
+        None => crate::runtime::error::dnu_fallback(vm, sel, k),
+    }
 }
 
 /// S10: nothing sets `VmRegBlock::poll_flag` nonzero yet (mirrors
@@ -761,6 +992,48 @@ mod tests {
         assert!(cache.contains(stubs.call_stub_entry() as u64));
         assert!(cache.contains(stubs.stub_poll_addr()));
         assert!(cache.contains(stubs.resolve_addr()));
+        assert!(cache.contains(stubs.c2i_shared_addr()));
+        assert!(cache.contains(stubs.mega_shared_addr()));
+        assert!(cache.contains(stubs.dnu_addr()));
+        assert!(cache.contains(stubs.must_be_boolean_addr()));
+    }
+
+    fn test_vm() -> VmState {
+        VmState::with_options(crate::runtime::vm_state::VmOptions {
+            heap_mib: 64,
+            trace: Default::default(),
+            gc_stress: false,
+            gc_stress_full_period: None,
+            eden_kb: None,
+            jit: crate::runtime::JitMode::Off,
+        })
+    }
+
+    /// S11 step 6's own explicit scope for `must_be_boolean`: the STUB
+    /// itself, testable in isolation via a direct `Stubs::invoke` (same
+    /// shape any nmethod entry uses) -- NOT its wiring into
+    /// `Ir::CallRuntime`, which is S11 step 7's job and has no emission
+    /// path to test through yet.
+    #[test]
+    fn must_be_boolean_sends_and_returns_result() {
+        let mut vm = test_vm();
+        let smi_klass = vm.universe.smi_klass;
+        let sel = vm.universe.sel_must_be_boolean;
+        let mut b = crate::bytecode::builder::BytecodeBuilder::new();
+        b.push_true();
+        b.ret_tos();
+        let handler = b.finish(&mut vm, sel, 0, 0);
+        crate::runtime::lookup::install_method(&mut vm, smi_klass, sel, handler);
+
+        let stubs = vm.stubs;
+        let val = crate::oops::smi::SmallInt::new(42).oop();
+        let true_obj = vm.universe.true_obj;
+        let result = stubs.invoke(stubs.must_be_boolean_addr(), &mut vm, &[val.raw()]);
+        assert_eq!(
+            result,
+            true_obj.raw(),
+            "a non-boolean receiver with a real #mustBeBoolean handler must reach it"
+        );
     }
 
     // S11 step 1 had a placeholder `rt_resolve_send` (echoed `ret_addr`
