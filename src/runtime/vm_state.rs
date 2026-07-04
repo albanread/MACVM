@@ -160,6 +160,17 @@ pub struct NlrState {
     pub value: crate::oops::Oop,
 }
 
+/// S13 deopt counters (`sprint_s13_detail.md` D5 M1). Its own small struct
+/// (reached as `vm.stats.deopt_count`) rather than a bare `VmState` field, so
+/// later deopt steps (stress counting kept separate from the
+/// `UncommonTrapLimit` tally, D7) have a home without reshaping `VmState`.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct DeoptStats {
+    /// Compiled frames materialized back into interpreter frames — bumped
+    /// once per `deoptimize_frame` call (D5 M1).
+    pub deopt_count: u64,
+}
+
 /// Which `MACVM_TRACE` channels are enabled. The channel set is open-ended
 /// (CONVENTIONS §3); S1 only stores membership, nothing reads it yet.
 #[derive(Clone, Default, Debug, PartialEq, Eq)]
@@ -403,6 +414,11 @@ pub struct VmState {
     /// unconditionally compiled in — CONVENTIONS §3's channel list). Printed
     /// to stderr at process exit by `main.rs`.
     pub bytecode_count: u64,
+    /// S13 deopt counters (`sprint_s13_detail.md` D5 M1). Bumped by
+    /// `runtime::deopt::deoptimize_frame` every time a compiled frame is
+    /// materialized back into interpreter frame(s); read by tests and (later)
+    /// the `MACVM_DEOPT_STRESS` differential harness.
+    pub stats: DeoptStats,
     /// The next frame serial to hand out (SPEC §5.4, S4) — monotonic,
     /// post-incremented at every `push_frame`. Never reused, which is what
     /// makes a `HomeRef`'s `(fp, serial)` pair a reliable dead-home check:
@@ -605,6 +621,7 @@ impl VmState {
             exit_code: None,
             start_instant: Instant::now(),
             bytecode_count: 0,
+            stats: DeoptStats::default(),
             next_frame_serial: 0,
             dbg_oop: None,
             handle_arena: Box::new(crate::memory::handles::HandleArena::new()),

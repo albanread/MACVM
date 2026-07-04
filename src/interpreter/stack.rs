@@ -302,6 +302,69 @@ impl Frame {
         let argc = self.method(st).argc();
         self.fp - argc - 1
     }
+
+    /// Assert this frame is structurally indistinguishable from one the
+    /// interpreter's own `push_frame` built (SPEC §5.1 layout): every fixed
+    /// header slot holds a value of the right shape. S13's deopt materializer
+    /// (`runtime::deopt`) runs this on every frame it reconstructs — a
+    /// materialized frame that fails `verify` is a materializer bug, caught
+    /// here rather than three bytecodes into the resumed activation.
+    ///
+    /// The checks mirror exactly what `push_frame` guarantees about a
+    /// freshly-pushed frame and what the `Frame` accessors above already
+    /// `expect` at their use sites:
+    /// - `FRAME_METHOD` is a `CompiledMethod` (`MethodOop`),
+    /// - `FRAME_SAVED_FP`, `FRAME_SAVED_BCI`, `FRAME_SERIAL` are smis,
+    /// - `FRAME_RECEIVER` (the fast copy) equals the caller-pushed receiver
+    ///   at `fp - argc - 1` (`push_frame` copies one from the other),
+    /// - the frame occupies at least its fixed header + `ntemps` slots below
+    ///   `sp`, and `fp` clears the header the args sit below it.
+    ///
+    /// Panics with a precise message on the first violation (debug-oriented,
+    /// so it reads like an `assert`), returns `()` on success.
+    pub fn verify(self, st: &ProcessStack) {
+        // Header slots must land within the live stack region.
+        assert!(
+            self.fp + FRAME_TEMPS_BASE <= st.sp,
+            "Frame::verify: fp {} + header {} exceeds sp {} (truncated frame)",
+            self.fp,
+            FRAME_TEMPS_BASE,
+            st.sp
+        );
+        // FRAME_METHOD: a real CompiledMethod.
+        let method = MethodOop::try_from(st.get(self.fp + FRAME_METHOD))
+            .expect("Frame::verify: FRAME_METHOD slot is not a CompiledMethod");
+        // saved_fp / saved_bci / serial: all smi-encoded.
+        SmallInt::try_from(st.get(self.fp + FRAME_SAVED_FP))
+            .expect("Frame::verify: FRAME_SAVED_FP is not a smi");
+        SmallInt::try_from(st.get(self.fp + FRAME_SAVED_BCI))
+            .expect("Frame::verify: FRAME_SAVED_BCI is not a smi");
+        SmallInt::try_from(st.get(self.fp + FRAME_SERIAL))
+            .expect("Frame::verify: FRAME_SERIAL is not a smi");
+        // The args area must sit fully below fp: the receiver slot
+        // `fp - argc - 1` must be a valid index (>= 0), i.e. `fp > argc`.
+        let argc = method.argc();
+        assert!(
+            self.fp > argc,
+            "Frame::verify: fp {} does not clear its {argc} args + receiver below it",
+            self.fp
+        );
+        // FRAME_RECEIVER is the fast copy of the caller-pushed receiver
+        // (`push_frame` copies `stack[fp - argc - 1]` into `fp + 4`).
+        assert_eq!(
+            self.receiver(st),
+            st.get(self.fp - argc - 1),
+            "Frame::verify: FRAME_RECEIVER copy disagrees with the arg-area receiver"
+        );
+        // The fixed temps must all be present below sp.
+        assert!(
+            self.fp + FRAME_TEMPS_BASE + method.ntemps() <= st.sp,
+            "Frame::verify: fp {} + header + {} temps exceeds sp {}",
+            self.fp,
+            method.ntemps(),
+            st.sp
+        );
+    }
 }
 
 #[cfg(test)]

@@ -395,7 +395,7 @@ pub struct CallSiteInfo {
 /// for `compute_entry_depths`' worklist. `Send`'s effect depends on the
 /// site's own IC (`argc` isn't in the bytecode operand, only the IC index
 /// is), so this needs `method` to look it up.
-fn instr_stack_delta(method: MethodOop, instr: &Instr) -> i32 {
+pub(crate) fn instr_stack_delta(method: MethodOop, instr: &Instr) -> i32 {
     match instr {
         Instr::PushSelf
         | Instr::PushNil

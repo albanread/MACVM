@@ -508,20 +508,58 @@ pub unsafe extern "C" fn rt_compiled_assert_failed(
 // ── A checked native-stack slot read (layer-boundary helper) ──────────────
 
 /// Read the oop at byte offset `off` from a compiled frame's FP. The single
-/// door `runtime/deopt.rs` (step 6, a `#![deny(unsafe_code)]` module) uses to
-/// touch a raw native-stack slot: the safety table pins that `runtime/deopt`
-/// may reach native-stack pointers *only* through this re-exported helper.
-/// Kept here (in `codecache`, the unsafe island) so the raw deref is licensed
-/// where unsafe already lives.
+/// **safe-to-call** door `runtime/deopt.rs` (step 6, a `#![deny(unsafe_code)]`
+/// module) uses to touch a raw native-stack slot: the safety table pins that
+/// `runtime/deopt` may reach native-stack pointers *only* through this
+/// helper. Kept here (in `codecache`, the unsafe island) so the raw deref is
+/// licensed where unsafe already lives — the deref is wrapped internally, so
+/// the caller (which cannot write `unsafe`) needs no `unsafe` block, exactly
+/// what "the single door the deny-unsafe materializer uses" requires.
 ///
-/// # Safety
-/// `fp` must be a live compiled frame's FP and `fp + off` a slot within that
-/// frame (guaranteed by a `DeoptState`'s `FrameSlot` offsets, which the
-/// compiler emitted for exactly this frame). The caller owns that invariant;
-/// this only performs the aligned 8-byte load.
-pub unsafe fn read_frame_slot(fp: usize, off: i32) -> Oop {
-    // SAFETY: caller's contract — `fp + off` is an 8-byte-aligned live slot.
+/// A safe `fn` whose CONTRACT is a plain precondition, not an `unsafe`
+/// obligation: `fp` must be a live compiled frame's FP and `fp + off` a slot
+/// within that frame (guaranteed by a `DeoptState`'s `FrameSlot` offsets,
+/// which the compiler emitted for exactly this frame). A caller that violates
+/// it corrupts memory the same way an out-of-bounds index would — the door is
+/// "safe" in Rust's sense (no `unsafe` at the call site) while still trusting
+/// its input, the standard shape for a licensed low-level primitive.
+pub fn read_frame_slot(fp: usize, off: i32) -> Oop {
     let addr = (fp as isize + off as isize) as *const u64;
+    // SAFETY: contract above — `fp + off` is an 8-byte-aligned live slot.
+    Oop::from_raw(unsafe { core::ptr::read(addr) })
+}
+
+/// Read the live oop at oop-pool index `pool_ix` of `nm` — the second door
+/// (alongside [`read_frame_slot`]) the `#![deny(unsafe_code)]` materializer
+/// (`runtime/deopt.rs`) uses to reach a raw code-cache word. A `ValueLoc::
+/// ConstPool(i)` / scope `method_pool_ix` names an entry in the nmethod's
+/// oop pool, whose physical home is `code.base + literal_off + 8*i` — the
+/// SAME word the S9 assembler laid down (`compiler::emit::intern_pool` maps
+/// IR pool entry `i` 1:1 to assembler `LiteralId(i)`, and the pool is the
+/// FIRST thing interned, so IR index == `LiteralId` == this slot) and the
+/// SAME word S12's GC keeps current (`CodeTable::oops_do` relocates it in
+/// place), so a moving collection never invalidates the index — only the
+/// bits behind it, which is exactly why the read must be LIVE (here), never
+/// a compile-time snapshot. Kept in `codecache` (the unsafe island) so the
+/// raw deref is licensed where unsafe already lives, mirroring
+/// [`read_frame_slot`]'s own layer-boundary rationale. Same "safe `fn` with a
+/// trusted-input precondition" shape as [`read_frame_slot`].
+///
+/// Precondition (a `debug_assert` guards it): `literal_off + 8*(pool_ix+1) <=
+/// code.len` (the slot lies fully inside the nmethod's live MAP_JIT code
+/// region) — guaranteed by a `ValueLoc` the compiler emitted against THIS
+/// nmethod's own pool.
+pub fn read_pool_oop(nm: &crate::codecache::nmethod::Nmethod, pool_ix: u32) -> Oop {
+    let off = nm.literal_off as usize + 8 * pool_ix as usize;
+    debug_assert!(
+        off + 8 <= nm.code.len,
+        "read_pool_oop: pool_ix {pool_ix} (offset {off}) past nmethod {:?}'s code length {}",
+        nm.id,
+        nm.code.len
+    );
+    let addr = (nm.code.base as usize + off) as *const u64;
+    // SAFETY: contract above — `off` is an 8-byte-aligned live pool slot
+    // inside `[code.base, code.base + code.len)`.
     Oop::from_raw(unsafe { core::ptr::read(addr) })
 }
 
@@ -789,13 +827,13 @@ mod tests {
         let slots: [u64; 4] = [0x1110, 0x2220, 0x3330, 0x4440];
         let fp = slots.as_ptr() as usize;
         // off 0, +8, +16 in bytes.
-        assert_eq!(unsafe { read_frame_slot(fp, 0) }.raw(), 0x1110);
-        assert_eq!(unsafe { read_frame_slot(fp, 8) }.raw(), 0x2220);
-        assert_eq!(unsafe { read_frame_slot(fp, 16) }.raw(), 0x3330);
+        assert_eq!(read_frame_slot(fp, 0).raw(), 0x1110);
+        assert_eq!(read_frame_slot(fp, 8).raw(), 0x2220);
+        assert_eq!(read_frame_slot(fp, 16).raw(), 0x3330);
         // Negative offsets (below-FP spill slots, the S12 convention) work too
         // when fp points into the middle of the array.
         let mid = (&slots[2] as *const u64) as usize;
-        assert_eq!(unsafe { read_frame_slot(mid, -8) }.raw(), 0x2220);
-        assert_eq!(unsafe { read_frame_slot(mid, -16) }.raw(), 0x1110);
+        assert_eq!(read_frame_slot(mid, -8).raw(), 0x2220);
+        assert_eq!(read_frame_slot(mid, -16).raw(), 0x1110);
     }
 }
