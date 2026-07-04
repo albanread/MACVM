@@ -17,6 +17,7 @@
 #![allow(unsafe_code)]
 
 pub mod adapters;
+pub mod deopt_trap;
 pub mod flush;
 pub mod guard;
 pub mod mega;
@@ -161,6 +162,18 @@ impl CodeCache {
     pub fn contains(&self, addr: u64) -> bool {
         let base = self.base as u64;
         addr >= base && addr < base + self.cap as u64
+    }
+
+    /// `[lo, hi)` — the region's absolute half-open address range. S13's
+    /// SIGTRAP handler (`deopt_trap`) caches this pair in a write-once static
+    /// at startup and does the *whole* in-signal-handler "is this pc ours?"
+    /// check with two `u64` compares against it (D3 step 2) — the one global
+    /// the honest-handler design permits, because a `&CodeCache` is not
+    /// async-signal-safe to reach from a signal frame. Same bound `contains`
+    /// tests, exposed as the raw pair the handler needs.
+    pub fn bounds(&self) -> (u64, u64) {
+        let base = self.base as u64;
+        (base, base + self.cap as u64)
     }
 
     /// Bytes reserved so far (bump-pointer position) — diagnostics/stats

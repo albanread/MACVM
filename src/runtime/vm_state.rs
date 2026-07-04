@@ -447,6 +447,15 @@ pub struct VmState {
     /// embed as a pool constant in any method that emits `Ir::Poll`;
     /// `enter_compiled` (S10 step 8) needs `call_stub_entry()`.
     pub stubs: crate::codecache::stubs::Stubs,
+    /// S13 step 5: the generated deopt trampolines (the uncommon trampoline
+    /// plus the `0xDE02` assert stub), published into `code_cache` alongside
+    /// `stubs`, and the process-global SIGTRAP handler that redirects into
+    /// them. `Some` only when the JIT is enabled (not `JitMode::Off`) — a pure
+    /// interpreter run neither compiles nor traps, so it installs no handler,
+    /// matching the README's `MACVM_JIT=off` debugger caveat (D3). Later steps
+    /// read the two handles to redirect returns (step 9) and to re-emit stress
+    /// traps (step 11); step 5 only publishes and arms them.
+    pub deopt_trampolines: Option<crate::codecache::deopt_trap::DeoptTrampolines>,
     /// S10 D6/step 8: one entry per currently-live compiled activation,
     /// pushed/popped around `enter_compiled`. Always empty under
     /// `JitMode::Off`.
@@ -571,6 +580,17 @@ impl VmState {
         let mut code_cache = CodeCache::new(DEFAULT_CODE_CACHE_CAPACITY)
             .expect("VmState::with_options: failed to reserve JIT code cache");
         let stubs = crate::codecache::stubs::install(&mut code_cache);
+        // S13 step 5: publish the deopt trampolines and arm the SIGTRAP
+        // handler — but ONLY with the JIT on. Under `JitMode::Off` nothing is
+        // ever compiled, so no deopt `brk` can fire; installing a
+        // process-global handler would only add a debugger caveat (D3) for no
+        // benefit. Doing it here (before any compiled code runs, alongside the
+        // SPEC §9 stubs) matches the sprint's "generated at startup" order.
+        let deopt_trampolines = if matches!(options.jit, JitMode::Off) {
+            None
+        } else {
+            Some(crate::codecache::deopt_trap::install(&mut code_cache))
+        };
         let mut vm = VmState {
             reg_block,
             universe,
@@ -594,6 +614,7 @@ impl VmState {
             pic_table: crate::codecache::pics::PicTable::new(),
             mega_table: crate::codecache::mega::MegaTable::new(),
             stubs,
+            deopt_trampolines,
             tier_links: Vec::new(),
             compiled_depth: 0,
             nlr_state: None,
