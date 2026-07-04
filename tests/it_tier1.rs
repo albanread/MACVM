@@ -145,7 +145,7 @@ fn run_ir_raw() {
     let regalloc_result = regalloc::regalloc(&method);
 
     let mut asm = JasmAssembler::new();
-    let (blob, pcs, _verified_entry_off, _ic_sites) = emit::emit(
+    let (blob, pcs, _verified_entry_off, _ic_sites, _safepoints) = emit::emit(
         &mut asm,
         &method,
         &regalloc_result,
@@ -194,7 +194,7 @@ fn run_ir_raw() {
 fn build_and_publish(cache: &mut CodeCache, stub_poll_addr: u64, method: &IrMethod) -> *const u8 {
     let regalloc_result = regalloc::regalloc(method);
     let mut asm = JasmAssembler::new();
-    let (blob, _pcs, _verified_entry_off, _ic_sites) = emit::emit(
+    let (blob, _pcs, _verified_entry_off, _ic_sites, _safepoints) = emit::emit(
         &mut asm,
         method,
         &regalloc_result,
@@ -380,7 +380,7 @@ fn run_ir_raw_forces_spill() {
     );
 
     let mut asm = JasmAssembler::new();
-    let (blob, _pcs, _verified_entry_off, _ic_sites) = emit::emit(
+    let (blob, _pcs, _verified_entry_off, _ic_sites, _safepoints) = emit::emit(
         &mut asm,
         &method,
         &regalloc_result,
@@ -679,7 +679,7 @@ fn compile_and_get_listing(vm: &VmState, method: MethodOop) -> String {
     // S10 listing goldens (s10_sumTo/absDiff/bitsOf) -- keeping their output
     // unchanged is the point, not something to revisit as a side effect of
     // step 2's own scope.
-    let (blob, _pcs, _verified_entry_off, _ic_sites) = emit::emit(
+    let (blob, _pcs, _verified_entry_off, _ic_sites, _safepoints) = emit::emit(
         &mut asm,
         &ir,
         &ra,
@@ -1491,7 +1491,7 @@ fn mono_resolve_patches_call_site_and_dispatches() {
     };
     let ra = regalloc::regalloc(&caller_method);
     let mut asm = JasmAssembler::new();
-    let (blob, _pcs, _verified_entry_off, emitted_ic_sites) = emit::emit(
+    let (blob, _pcs, _verified_entry_off, emitted_ic_sites, _safepoints) = emit::emit(
         &mut asm,
         &caller_method,
         &ra,
@@ -1531,6 +1531,7 @@ fn mono_resolve_patches_call_site_and_dispatches() {
         literal_off: blob.literal_off,
         relocs: blob.relocs.clone(),
         frame_slots: ra.frame_slots,
+        slot_is_oop: ra.slot_is_oop.clone(),
         pcdescs: Vec::new(),
         oopmaps: Vec::new(),
         ic_sites,
@@ -1644,7 +1645,7 @@ fn build_c2i_scenario(vm: &mut VmState) -> (u64, KlassOop, NmethodId) {
     };
     let ra = regalloc::regalloc(&caller_method);
     let mut asm = JasmAssembler::new();
-    let (blob, _pcs, _verified_entry_off, emitted_ic_sites) = emit::emit(
+    let (blob, _pcs, _verified_entry_off, emitted_ic_sites, _safepoints) = emit::emit(
         &mut asm,
         &caller_method,
         &ra,
@@ -1684,6 +1685,7 @@ fn build_c2i_scenario(vm: &mut VmState) -> (u64, KlassOop, NmethodId) {
         literal_off: blob.literal_off,
         relocs: blob.relocs.clone(),
         frame_slots: ra.frame_slots,
+        slot_is_oop: ra.slot_is_oop.clone(),
         pcdescs: Vec::new(),
         oopmaps: Vec::new(),
         ic_sites,
@@ -1861,7 +1863,7 @@ fn full_ic_lattice_mono_to_pic_to_mega() {
     };
     let ra = regalloc::regalloc(&caller_method);
     let mut asm = JasmAssembler::new();
-    let (blob, _pcs, _verified_entry_off, emitted_ic_sites) = emit::emit(
+    let (blob, _pcs, _verified_entry_off, emitted_ic_sites, _safepoints) = emit::emit(
         &mut asm,
         &caller_method,
         &ra,
@@ -1901,6 +1903,7 @@ fn full_ic_lattice_mono_to_pic_to_mega() {
         literal_off: blob.literal_off,
         relocs: blob.relocs.clone(),
         frame_slots: ra.frame_slots,
+        slot_is_oop: ra.slot_is_oop.clone(),
         pcdescs: Vec::new(),
         oopmaps: Vec::new(),
         ic_sites,
@@ -2072,7 +2075,7 @@ fn dnu_from_compiled_code_reaches_does_not_understand() {
     };
     let ra = regalloc::regalloc(&caller_method);
     let mut asm = JasmAssembler::new();
-    let (blob, _pcs, _verified_entry_off, emitted_ic_sites) = emit::emit(
+    let (blob, _pcs, _verified_entry_off, emitted_ic_sites, _safepoints) = emit::emit(
         &mut asm,
         &caller_method,
         &ra,
@@ -2112,6 +2115,7 @@ fn dnu_from_compiled_code_reaches_does_not_understand() {
         literal_off: blob.literal_off,
         relocs: blob.relocs.clone(),
         frame_slots: ra.frame_slots,
+        slot_is_oop: ra.slot_is_oop.clone(),
         pcdescs: Vec::new(),
         oopmaps: Vec::new(),
         ic_sites,

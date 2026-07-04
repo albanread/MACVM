@@ -8,7 +8,7 @@ use crate::bytecode::opcode::{decode_at, Instr};
 use crate::codecache::nmethod::{IcSite, NmState, Nmethod, NmethodId, OopMap, PcDesc};
 use crate::codecache::stubs::resolve_target_entry;
 use crate::compiler::jasm_assembler::JasmAssembler;
-use crate::compiler::{decode, emit, ir, regalloc};
+use crate::compiler::{decode, emit, ir, oopmap, regalloc};
 use crate::interpreter::ic::InterpreterIc;
 use crate::interpreter::ic::{ic_state, IcState};
 use crate::oops::wrappers::{KlassOop, MethodOop, SymbolOop};
@@ -281,7 +281,7 @@ pub fn compile_method(
         key_klass_bits: rcvr_klass.oop().raw(),
         resolve_addr: vm.stubs.resolve_addr(),
     };
-    let (blob, block_pcs, verified_entry_off, emitted_ic_sites) = emit::emit(
+    let (blob, block_pcs, verified_entry_off, emitted_ic_sites, safepoint_pcs) = emit::emit(
         &mut asm,
         &ir_method,
         &regalloc_result,
@@ -348,20 +348,38 @@ pub fn compile_method(
     };
     vm.code_cache.publish(h, &blob);
 
-    // Block-start-only descs (S10 emits no real safepoints, D1) all point
-    // at the one oopmap this nmethod's own spill slots produce (D7) — never
-    // actually consulted until S11 gives some `PcDesc` a genuine call site.
-    let pcdescs: Vec<PcDesc> = block_pcs
+    // S12 D2: `oopmaps[0]` is always the reserved, always-empty map —
+    // block-start descs (trace path only, never a real safepoint's own
+    // return address, `OopMap::empty`'s own doc) point at it; every REAL
+    // safepoint below gets its own liveness-intersected map, deduplicated
+    // by content (`oopmap_dedup`: two safepoints with identical live sets
+    // share one entry).
+    let mut oopmaps: Vec<OopMap> = vec![OopMap::empty()];
+    let mut safepoint_pcdescs: Vec<PcDesc> = Vec::with_capacity(safepoint_pcs.len());
+    for sp in &safepoint_pcs {
+        let map = oopmap::build_for_position(
+            &regalloc_result.intervals,
+            regalloc_result.frame_slots,
+            sp.position,
+        );
+        let idx = oopmap::intern(&mut oopmaps, map);
+        safepoint_pcdescs.push(PcDesc {
+            pc_off: sp.pc_off,
+            bci: sp.bci,
+            oopmap: idx,
+        });
+    }
+    let mut pcdescs: Vec<PcDesc> = block_pcs
         .iter()
         .map(|bp| PcDesc {
             pc_off: bp.pc_off,
             bci: bp.bci,
             oopmap: 0,
         })
+        .chain(safepoint_pcdescs)
         .collect();
-    let oopmaps = vec![OopMap {
-        bits: regalloc_result.slot_is_oop.clone(),
-    }];
+    // `bci_at`'s nearest-below lookup binary-searches this, ascending.
+    pcdescs.sort_by_key(|d| d.pc_off);
     let key_selector = SymbolOop::try_from(method.selector())
         .expect("compile_method: method selector is not a Symbol");
 
@@ -413,11 +431,18 @@ pub fn compile_method(
         literal_off: blob.literal_off,
         relocs: blob.relocs,
         frame_slots: regalloc_result.frame_slots,
+        slot_is_oop: regalloc_result.slot_is_oop.clone(),
         pcdescs,
         oopmaps,
         ic_sites,
         poll_bci,
     };
+    // S12 D1 enforcement point 2: "debug + stress" — reuses the existing
+    // heap-verifier's own gate (`MACVM_GC_VERIFY=1` opts a release build
+    // in too) rather than a second, parallel env var for the same concept.
+    if crate::memory::verify::verify_enabled() {
+        oopmap::verify(&nm);
+    }
     let resolve_addr = vm.stubs.resolve_addr();
     for (site, resolved) in emitted_ic_sites.iter().zip(&super_resolutions) {
         let patch_target = resolved.map_or(resolve_addr, |(_, target)| target);

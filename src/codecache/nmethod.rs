@@ -10,6 +10,8 @@
 
 use std::collections::HashMap;
 
+use smallvec::SmallVec;
+
 use crate::codecache::guard::JitWriteGuard;
 use crate::codecache::CodeHandle;
 use crate::compiler::assembler::{Reloc, RelocKind};
@@ -27,21 +29,78 @@ pub enum NmState {
     Zombie,
 }
 
-/// Which spill slots hold an oop, for a safepoint's stack scan (D7). S10
-/// builds exactly one per `Nmethod` (regalloc's own `slot_is_oop`, D3.5),
-/// even though nothing consults it yet — S10 emits no safepoints at all
-/// (D1), so the plumbing exists ahead of S11 actually needing it.
-#[derive(Clone, Debug)]
+/// Which spill slots hold a LIVE oop at one specific safepoint (S12 D2) —
+/// a packed bitmap over spill-slot indices, one bit per slot (`bit i set ⇔
+/// frame slot i, at `[fp − 8·(i+1)]`, holds a live oop at the safepoint(s)
+/// this map is attached to via `PcDesc.oopmap`). `SmallVec<[u64; 1]>`
+/// (matching the project's existing `smallvec` use, `codecache::guard`'s
+/// own precedent): `frame_slots <= 60` (S10/S11 eligibility's own frame
+/// budget) means `ceil(60/64) == 1` word in every real case, so the inline
+/// capacity avoids a heap allocation on the common path. Built by
+/// `compiler::oopmap::build_for_position` (liveness ∩ is_oop at one exact
+/// program position — NOT "every slot this method ever uses for an oop
+/// anywhere", which is `Nmethod::slot_is_oop`'s job instead); multiple
+/// safepoints with identical live sets share one entry in `Nmethod::
+/// oopmaps` (deduplicated by content, D2).
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct OopMap {
-    pub bits: Vec<bool>,
+    bits: SmallVec<[u64; 1]>,
 }
 
-/// One block-start (S10) or call-return-address (S11+) position, mapped
-/// back to a bytecode index for mixed-tier stack traces (D3.6). `oopmap`
-/// indexes `Nmethod::oopmaps`; S10's block-start descs don't correspond to
-/// a real safepoint (compiled code never allocates, D1), so they all
-/// point at the same always-present, always-irrelevant map — never
-/// actually read until S11 gives some `PcDesc` a genuine call site.
+impl OopMap {
+    /// An empty map (every bit clear) — `oopmaps[0]`'s reserved slot for
+    /// PcDescs that don't correspond to a real safepoint (S10's block-start
+    /// descs, kept for `bci_at`'s trace-path lookup) and never consulted by
+    /// the GC path (`oopmap_at` only ever reaches a REAL safepoint's own
+    /// entry, D1: every compiled frame at GC time is suspended at one, by
+    /// construction).
+    pub fn empty() -> OopMap {
+        OopMap {
+            bits: SmallVec::new(),
+        }
+    }
+
+    pub fn set(&mut self, slot: u16) {
+        let word = slot as usize / 64;
+        if word >= self.bits.len() {
+            self.bits.resize(word + 1, 0);
+        }
+        self.bits[word] |= 1u64 << (slot as usize % 64);
+    }
+
+    pub fn is_oop(&self, slot: u16) -> bool {
+        let word = slot as usize / 64;
+        match self.bits.get(word) {
+            Some(w) => (w >> (slot as usize % 64)) & 1 != 0,
+            None => false,
+        }
+    }
+
+    /// Every set bit's slot index, ascending — the GC root-scan's own
+    /// iteration order (`each_code_root`, S12 D4.1); order doesn't matter
+    /// for correctness, only for determinism (tests pin exact sequences).
+    pub fn iter_slots(&self) -> impl Iterator<Item = u16> + '_ {
+        self.bits.iter().enumerate().flat_map(|(w, &word)| {
+            (0..64u16)
+                .filter(move |&b| (word >> b) & 1 != 0)
+                .map(move |b| (w * 64) as u16 + b)
+        })
+    }
+}
+
+/// One block-start (S10, trace-path only) or call-return-address (S11+,
+/// GC safepoint) position, mapped back to a bytecode index for mixed-tier
+/// stack traces (D3.6) and — for the latter kind only — an `oopmap` index
+/// (`Nmethod::oopmaps`) the GC root-scan reads via `Nmethod::oopmap_at`'s
+/// EXACT match. A block-start desc's own `oopmap` is always `0`
+/// (`OopMap::empty()`, reserved — see that constructor's own doc): it
+/// exists only so `bci_at`'s nearest-below trace lookup has full pc
+/// coverage, never a real safepoint's own return address (S11's send/
+/// alloc-slow sites always emit at least one more instruction — the NLR
+/// check, or the fast-path merge — before any new block could start, so
+/// the two kinds of entry never collide in practice; even if they did,
+/// `oopmap_at`'s caller only ever passes a genuine suspended-frame return
+/// address, D1).
 #[derive(Clone, Copy, Debug)]
 pub struct PcDesc {
     pub pc_off: u32,
@@ -106,6 +165,17 @@ pub struct Nmethod {
     /// `code.base` for an absolute address (matches S9's own convention).
     pub relocs: Vec<Reloc>,
     pub frame_slots: u16,
+    /// S12 D2's independent ground truth, one bool per spill slot: could
+    /// THIS slot EVER hold an oop, anywhere in the method (copied verbatim
+    /// from `regalloc::RegallocResult::slot_is_oop` at compile time — slots
+    /// are allocated monotonically, one per interval, never reused across
+    /// intervals of different `is_oop`-ness, D3.5 point 3, so this is a
+    /// per-slot, not per-safepoint, fact). `compiler::oopmap::verify`'s own
+    /// cross-check against every `oopmaps[i]`'s bits — independent of
+    /// `oopmaps` itself, so a builder bug that sets a bit for a slot that's
+    /// never actually oop-typed is still caught, not just self-consistent
+    /// by construction.
+    pub slot_is_oop: Vec<bool>,
     pub pcdescs: Vec<PcDesc>,
     pub oopmaps: Vec<OopMap>,
     pub ic_sites: Vec<IcSite>,
@@ -129,6 +199,93 @@ impl Nmethod {
         self.relocs
             .iter()
             .filter(|r| matches!(r.kind, RelocKind::Oop | RelocKind::KeyKlassOop))
+    }
+
+    /// S12 D2/P1: the GC root-scan's own lookup — `ret_pc` is a
+    /// COMPILED FRAME's saved return address (absolute; converted to a
+    /// blob-relative offset here), i.e. exactly where a safepoint's `bl`
+    /// resumes. EXACT match only, never nearest-below: D1's own invariant
+    /// is that every compiled frame at GC time is suspended at a real
+    /// safepoint's return address, by construction (loop polls never
+    /// allocate/GC — S10 D5.6 — so nothing else can be live on the stack
+    /// when a collection starts). A miss means that invariant broke
+    /// somewhere upstream (a safepoint got emitted without its own
+    /// `PcDesc`, or the walker mis-stepped) — panicking here, rather than
+    /// silently falling back to the nearest map, is P1's whole point: a
+    /// near-miss would trace the WRONG slots as oops, corrupting the heap
+    /// three tests later instead of failing loudly at the source.
+    pub fn oopmap_at(&self, ret_pc: u64) -> &OopMap {
+        let off = (ret_pc - self.code.base as u64) as u32;
+        let idx = self
+            .pcdescs
+            .iter()
+            .position(|d| d.pc_off == off)
+            .unwrap_or_else(|| {
+                panic!(
+                    "oopmap_at: nmethod {:?} has no safepoint PcDesc at return-address offset \
+                     {off:#x} (ret_pc {ret_pc:#x}) — D1's invariant broke: every compiled frame \
+                     live at GC time must be suspended at a recorded safepoint",
+                    self.id
+                )
+            });
+        &self.oopmaps[self.pcdescs[idx].oopmap as usize]
+    }
+
+    /// Trace path (`runtime::error::print_stack_trace`, mixed-tier stack
+    /// traces): nearest-below lookup over ALL descs (block-start AND real
+    /// safepoint alike) — any pc inside the method resolves to whichever
+    /// desc most recently preceded it, never panics (a trace is best-effort
+    /// diagnostics, not a GC-correctness path — P1's exact-match
+    /// requirement is `oopmap_at`'s alone). `pcdescs` is sorted by
+    /// `pc_off` ascending (both `pcdescs_sorted_by_pc_off` and driver.rs's
+    /// own construction maintain this).
+    pub fn bci_at(&self, pc: u64) -> usize {
+        let off = (pc - self.code.base as u64) as u32;
+        let idx = self.pcdescs.partition_point(|d| d.pc_off <= off);
+        if idx == 0 {
+            self.pcdescs.first().map(|d| d.bci).unwrap_or(0)
+        } else {
+            self.pcdescs[idx - 1].bci
+        }
+    }
+
+    /// Test-only, minimal fake — shared by this module's own tests and
+    /// `compiler::oopmap`'s (neither cares about `key_klass`/`key_selector`
+    /// /`code` beyond their tag-level shape; both DO care about
+    /// `frame_slots`/`slot_is_oop`/`oopmaps`, which this takes explicitly).
+    #[cfg(test)]
+    pub(crate) fn test_fake(
+        frame_slots: u16,
+        slot_is_oop: Vec<bool>,
+        oopmaps: Vec<OopMap>,
+    ) -> Nmethod {
+        use crate::oops::layout::MEM_TAG;
+        use crate::oops::Oop;
+        Nmethod {
+            id: NmethodId(0),
+            // SAFETY: test-only, tag-level shape is never dereferenced by
+            // anything `test_fake`'s own callers exercise (same reasoning
+            // as this module's own private `fake_klass`/`fake_selector`).
+            key_klass: unsafe { KlassOop::from_oop_unchecked(Oop::from_raw(0x1000 + MEM_TAG)) },
+            key_selector: unsafe { SymbolOop::from_oop_unchecked(Oop::from_raw(0x2000 + MEM_TAG)) },
+            code: CodeHandle {
+                base: 0x1000 as *const u8,
+                len: 0x1000,
+            },
+            entry_off: 0,
+            verified_entry_off: 0,
+            state: NmState::Alive,
+            level: 1,
+            version: 0,
+            literal_off: 0,
+            relocs: Vec::new(),
+            frame_slots,
+            slot_is_oop,
+            pcdescs: Vec::new(),
+            oopmaps,
+            ic_sites: Vec::new(),
+            poll_bci: None,
+        }
     }
 }
 
@@ -395,11 +552,83 @@ mod tests {
             literal_off: 0,
             relocs: Vec::new(),
             frame_slots: 0,
+            slot_is_oop: Vec::new(),
             pcdescs: Vec::new(),
             oopmaps: Vec::new(),
             ic_sites: Vec::new(),
             poll_bci: None,
         }
+    }
+
+    /// `tests_s12.md`'s `oopmap_roundtrip`: slots {0, 5, 63, 64} on a
+    /// 70-slot map — 63 and 64 straddle the word boundary (`SmallVec<[u64;
+    /// 1]>` needs a second word once any bit >= 64 is set), the exact case
+    /// a plain per-bit `Vec<bool>` would never exercise.
+    #[test]
+    fn oopmap_roundtrip() {
+        let mut map = OopMap::empty();
+        for &s in &[0u16, 5, 63, 64] {
+            map.set(s);
+        }
+        let got: Vec<u16> = map.iter_slots().collect();
+        assert_eq!(got, vec![0, 5, 63, 64]);
+        for s in 0..70u16 {
+            assert_eq!(map.is_oop(s), [0u16, 5, 63, 64].contains(&s), "slot {s}");
+        }
+    }
+
+    /// `iter_slots`/`is_oop` on a genuinely empty map (no `set` calls at
+    /// all) must never panic and never report anything live — the
+    /// `oopmaps[0]` reserved-empty-map convention's own correctness
+    /// depends on this.
+    #[test]
+    fn oopmap_empty_reports_nothing() {
+        let map = OopMap::empty();
+        assert_eq!(map.iter_slots().count(), 0);
+        for s in 0..128u16 {
+            assert!(!map.is_oop(s));
+        }
+    }
+
+    /// `tests_s12.md`'s `pcdesc_exact_match_required` (P1): `oopmap_at`
+    /// must hit EXACTLY, never nearest-below — `ret_pc ± 4` (one
+    /// instruction either side of the real safepoint) must panic, not
+    /// silently return a neighboring, WRONG map.
+    #[test]
+    fn pcdesc_exact_match_required() {
+        let base = 0x10000usize;
+        let mut map0 = OopMap::empty();
+        map0.set(2);
+        let nm = Nmethod {
+            frame_slots: 4,
+            slot_is_oop: vec![false, false, true, false],
+            pcdescs: vec![PcDesc {
+                pc_off: 0x20,
+                bci: 3,
+                oopmap: 0,
+            }],
+            oopmaps: vec![map0],
+            ..fake_nmethod(fake_klass(0x1000), fake_selector(0x2000), base, 0x100)
+        };
+
+        let hit = nm.oopmap_at((base + 0x20) as u64);
+        assert!(hit.is_oop(2));
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            nm.oopmap_at((base + 0x20 - 4) as u64)
+        }));
+        assert!(
+            result.is_err(),
+            "4 bytes before the real safepoint must miss"
+        );
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            nm.oopmap_at((base + 0x20 + 4) as u64)
+        }));
+        assert!(
+            result.is_err(),
+            "4 bytes after the real safepoint must miss too"
+        );
     }
 
     /// tests_s10.md: install -> get by id, lookup by key, find_by_pc

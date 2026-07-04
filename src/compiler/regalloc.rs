@@ -172,7 +172,14 @@ fn reverse_postorder(method: &IrMethod) -> Vec<BlockId> {
 /// every interval touching that range at all gets conservatively widened
 /// to cover the whole thing — sound (if pessimistic) for nested loops too,
 /// via a fixpoint over every back edge found.
-pub fn compute_intervals(method: &IrMethod) -> (Vec<BlockId>, Vec<LiveInterval>) {
+///
+/// The third return value, `safepoint_positions`, is S12's own addition:
+/// the exact linear position of every `CallSend`/`CallRuntime`/`Alloc` op,
+/// in this SAME numbering — `compiler::oopmap::build_for_position` (and
+/// `emit.rs`'s own position counter, which walks `block_order` identically)
+/// depend on this being the exact same sequence `crosses_safepoint` above
+/// was computed against, not a re-derivation that could drift out of sync.
+pub fn compute_intervals(method: &IrMethod) -> (Vec<BlockId>, Vec<LiveInterval>, Vec<u32>) {
     let block_order = reverse_postorder(method);
 
     let mut pos: u32 = 0;
@@ -280,7 +287,7 @@ pub fn compute_intervals(method: &IrMethod) -> (Vec<BlockId>, Vec<LiveInterval>)
         })
         .collect();
 
-    (block_order, intervals)
+    (block_order, intervals, safepoint_positions)
 }
 
 /// x0–x15 (`arm64.md` §3); x16/x17 scratch, x18 platform, x19–x23 unused
@@ -360,16 +367,29 @@ pub fn allocate(intervals: &mut [LiveInterval]) -> (u16, Vec<bool>) {
         }
     }
 
-    for iv in intervals.iter() {
-        debug_assert!(
+    verify_spill_all(intervals);
+
+    (slot_is_oop.len() as u16, slot_is_oop)
+}
+
+/// S12 D1's spill-all invariant, enforced HERE — not merely assumed, and
+/// not merely `debug_assert!`ed: this is the exact guarantee S12's oop maps
+/// stand on (registers are never live across a safepoint; maps cover stack
+/// slots only), so it runs ALWAYS, release builds included, per the sprint
+/// doc's own text ("a release-mode-cheap pass... trivial", O(intervals)).
+/// A future regalloc change that lets a `crosses_safepoint` interval keep a
+/// register would otherwise corrupt the heap silently instead of panicking
+/// at the source — exactly the class of bug a debug-only check would only
+/// catch in SOME builds.
+pub fn verify_spill_all(intervals: &[LiveInterval]) {
+    for iv in intervals {
+        assert!(
             !(iv.crosses_safepoint && matches!(iv.assignment, Some(Assignment::Reg(_)))),
             "regalloc: {:?} crosses a safepoint but holds a register (S12's oop-map \
              invariant: registers are all spilled at safepoints)",
             iv.vreg
         );
     }
-
-    (slot_is_oop.len() as u16, slot_is_oop)
 }
 
 pub struct RegallocResult {
@@ -380,16 +400,24 @@ pub struct RegallocResult {
     pub intervals: Vec<LiveInterval>,
     pub frame_slots: u16,
     pub slot_is_oop: Vec<bool>,
+    /// S12: every safepoint's exact linear position, in the SAME numbering
+    /// `intervals`' own `start`/`end`/`crosses_safepoint` were computed
+    /// against — `emit.rs` walks `block_order` identically (its own
+    /// position counter) to correlate each REAL emitted safepoint with one
+    /// of these, and `compiler::oopmap::build_for_position` intersects
+    /// `intervals` against it to build that safepoint's own `OopMap`.
+    pub safepoint_positions: Vec<u32>,
 }
 
 pub fn regalloc(method: &IrMethod) -> RegallocResult {
-    let (block_order, mut intervals) = compute_intervals(method);
+    let (block_order, mut intervals, safepoint_positions) = compute_intervals(method);
     let (frame_slots, slot_is_oop) = allocate(&mut intervals);
     RegallocResult {
         block_order,
         intervals,
         frame_slots,
         slot_is_oop,
+        safepoint_positions,
     }
 }
 
@@ -444,7 +472,7 @@ mod tests {
             vec![VRegInfo { is_oop: true }, VRegInfo { is_oop: true }],
         );
 
-        let (_order, intervals) = compute_intervals(&method);
+        let (_order, intervals, _safepoints) = compute_intervals(&method);
         let iv = intervals
             .iter()
             .find(|iv| iv.vreg == v0)
@@ -476,7 +504,7 @@ mod tests {
         };
         let method = hand_method(vec![block0, block1], vec![VRegInfo { is_oop: true }]);
 
-        let (order, intervals) = compute_intervals(&method);
+        let (order, intervals, _safepoints) = compute_intervals(&method);
         assert_eq!(
             order,
             vec![BlockId(0), BlockId(1)],
@@ -511,7 +539,7 @@ mod tests {
         };
         let method = hand_method(vec![block], vec![VRegInfo { is_oop: true }]);
 
-        let (_order, mut intervals) = compute_intervals(&method);
+        let (_order, mut intervals, _safepoints) = compute_intervals(&method);
         assert!(
             intervals[0].crosses_safepoint,
             "v0 is defined before and used after the call"
@@ -557,6 +585,44 @@ mod tests {
         };
         assert!(slot_is_oop[slot_of(&intervals[0])]);
         assert!(!slot_is_oop[slot_of(&intervals[1])]);
+    }
+
+    /// `tests_s12.md`'s `verify_spill_all_catches_reg` (D1 enforcement
+    /// point 1): a hand-built interval claiming BOTH `crosses_safepoint`
+    /// AND a `Reg` assignment is exactly the invariant violation S12's oop
+    /// maps depend on never happening — `verify_spill_all` must panic on
+    /// it directly, independent of whether `allocate` itself could ever
+    /// actually produce such a state (this test constructs the bad state
+    /// by hand, bypassing `allocate` entirely, to test the CHECK, not the
+    /// policy that normally prevents it).
+    #[test]
+    #[should_panic(expected = "crosses a safepoint but holds a register")]
+    fn verify_spill_all_catches_reg() {
+        let intervals = vec![LiveInterval {
+            vreg: VReg(0),
+            start: 0,
+            end: 10,
+            is_oop: true,
+            crosses_safepoint: true,
+            assignment: Some(Assignment::Reg(3)),
+        }];
+        verify_spill_all(&intervals);
+    }
+
+    /// The same shape, but `Spill`-assigned (the correct outcome) — must
+    /// NOT panic, so the test above is exercising the actual invariant,
+    /// not merely "any crosses_safepoint interval panics".
+    #[test]
+    fn verify_spill_all_accepts_spilled_crossing_interval() {
+        let intervals = vec![LiveInterval {
+            vreg: VReg(0),
+            start: 0,
+            end: 10,
+            is_oop: true,
+            crosses_safepoint: true,
+            assignment: Some(Assignment::Spill(SpillSlot(0))),
+        }];
+        verify_spill_all(&intervals); // must not panic
     }
 
     /// Linear-scan core: with only 16 allocatable registers, 17 mutually
@@ -628,7 +694,7 @@ mod tests {
             entry_stack: Vec::new(),
         };
         let method = hand_method(vec![block0, dead], Vec::new());
-        let (order, _intervals) = compute_intervals(&method);
+        let (order, _intervals, _safepoints) = compute_intervals(&method);
         assert_eq!(
             order.len(),
             2,
@@ -755,7 +821,7 @@ mod tests {
             vec![entry, header, body, exit, bailout],
             (0..6).map(|_| VRegInfo { is_oop: true }).collect(),
         );
-        let (order, intervals) = compute_intervals(&method);
+        let (order, intervals, _safepoints) = compute_intervals(&method);
 
         // Confirms this hand-built shape actually reproduces the bug's own
         // precondition: the exit block linearized before the body block.

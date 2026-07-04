@@ -152,6 +152,22 @@ pub struct EmittedIcSite {
     pub argc: u8,
 }
 
+/// S12 D2: one REAL safepoint's (a `CallSend`/`CallRuntime`/`Alloc`
+/// slow-edge's own `bl`) emitted return-address offset + its enclosing
+/// block's bci (trace-path granularity, matching `poll_bci`'s own
+/// precedent) + regalloc's own linear position — a minimal, self-contained
+/// stand-in for the caller (`driver.rs`) to build a real `OopMap` from
+/// (`compiler::oopmap::build_for_position`, which needs
+/// `RegallocResult::intervals` — data `emit.rs` never touches, only each
+/// vreg's ALREADY-DECIDED assignment), same "accumulate at emit time,
+/// resolve at driver.rs time" split as [`BlockPc`]/[`EmittedIcSite`].
+#[derive(Clone, Copy, Debug)]
+pub struct SafepointPc {
+    pub pc_off: u32,
+    pub bci: usize,
+    pub position: u32,
+}
+
 /// S11 D2: parameters for the klass-guard prologue (`entry`, checking the
 /// receiver against this nmethod's own customization key, falling through
 /// to `verified_entry` on a match or bailing out to `stub_resolve` — acting
@@ -209,6 +225,22 @@ struct Emitter<'a> {
     /// `CodeBlob` (mirrors `block_pcs`' own "accumulate during the walk,
     /// return at the end" shape, D3).
     ic_sites: Vec<EmittedIcSite>,
+    /// S12: the CURRENT `Ir` op's own linear position, in the EXACT same
+    /// numbering `regalloc::compute_intervals` computed
+    /// `LiveInterval::start/end/crosses_safepoint` against — `emit()`'s own
+    /// loop increments this once per op, walking `block_order` identically,
+    /// so a safepoint recorded here always matches the interval data
+    /// `driver.rs` later intersects it against.
+    pos: u32,
+    /// S12: the CURRENT block's own bci — `poll_bci`'s own established
+    /// block-granularity precedent, reused here for every real safepoint's
+    /// `SafepointPc::bci` too (trace-path only; GC correctness only ever
+    /// needs `oopmap`, never `bci`).
+    current_bci: usize,
+    /// S12: accumulates one entry per REAL safepoint (CallSend/
+    /// CallRuntime/Alloc's slow edge) emitted so far — see
+    /// [`SafepointPc`]'s own doc.
+    safepoints: Vec<SafepointPc>,
 }
 
 impl<'a> Emitter<'a> {
@@ -497,6 +529,15 @@ impl<'a> Emitter<'a> {
             .ldr_literal(xr(0), self.literal_ids[klass.0 as usize]);
         emit_mov_imm64(self.asm, xr(1), size_bytes as u64);
         self.asm.call_far(self.alloc_slow_lit);
+        // S12 D2: `Ir::Alloc`'s ONE safepoint position (`is_safepoint`
+        // treats fast+slow paths as a single program point) — only the
+        // slow edge actually calls into Rust, so this is the only place
+        // within this op a real return address exists to record.
+        self.safepoints.push(SafepointPc {
+            pc_off: self.asm.offset(),
+            bci: self.current_bci,
+            position: self.pos,
+        });
         if d.num != 0 {
             self.asm.emit("mov", &[Operand::Reg(d), x(0)]);
         }
@@ -681,6 +722,16 @@ impl<'a> Emitter<'a> {
         }
 
         let off = self.asm.bl_patchable(RelocKind::InlineCache);
+        // S12 D2: the safepoint is THIS call's own return address — read
+        // `asm.offset()` again right here (not `off + 4`) so this doesn't
+        // hardcode `bl`'s own encoding length; sound regardless of how
+        // `bl_patchable` is actually implemented, matching `block_pcs`'
+        // own "current offset" idiom.
+        self.safepoints.push(SafepointPc {
+            pc_off: self.asm.offset(),
+            bci: self.current_bci,
+            position: self.pos,
+        });
         let info = self.call_sites[site as usize];
         self.ic_sites.push(EmittedIcSite {
             off,
@@ -748,6 +799,14 @@ impl<'a> Emitter<'a> {
             self.asm.emit("mov", &[x(0), Operand::Reg(ra)]);
         }
         self.asm.call_far(self.must_be_boolean_lit);
+        // S12 D2: same reasoning as `emit_call_send`'s own safepoint push —
+        // this call's return address, read fresh rather than derived from
+        // `call_far`'s own internal encoding.
+        self.safepoints.push(SafepointPc {
+            pc_off: self.asm.offset(),
+            bci: self.current_bci,
+            position: self.pos,
+        });
         // S11 D6.3: a #mustBeBoolean handler is guest code too — if it (or
         // anything it re-enters) NLRs past this frame, the sentinel comes
         // back here exactly like at a send site.
@@ -819,8 +878,10 @@ fn emit_entry_guard(asm: &mut dyn Assembler, guard: &EntryGuard) {
 /// required by this signature — S10's own methods are simple enough that
 /// threading an `Option` through for the rare case wasn't worth it).
 /// Returns `verified_entry_off` (== 0 when `guard` is `None`, matching
-/// S10's own `entry_off == verified_entry_off` convention) and one
-/// [`EmittedIcSite`] per `Ir::CallSend` encountered, in encounter order.
+/// S10's own `entry_off == verified_entry_off` convention), one
+/// [`EmittedIcSite`] per `Ir::CallSend` encountered in encounter order, and
+/// (S12) one [`SafepointPc`] per real safepoint (`CallSend`/`CallRuntime`/
+/// `Alloc`'s slow edge) encountered, also in encounter order.
 pub fn emit(
     asm: &mut dyn Assembler,
     method: &IrMethod,
@@ -829,7 +890,13 @@ pub fn emit(
     must_be_boolean_addr: u64,
     alloc_slow_addr: u64,
     guard: Option<EntryGuard>,
-) -> (CodeBlob, Vec<BlockPc>, u32, Vec<EmittedIcSite>) {
+) -> (
+    CodeBlob,
+    Vec<BlockPc>,
+    u32,
+    Vec<EmittedIcSite>,
+    Vec<SafepointPc>,
+) {
     let literal_ids = intern_pool(asm, method);
 
     let mut assignment: Vec<Option<Assignment>> = vec![None; method.vregs.len()];
@@ -863,6 +930,9 @@ pub fn emit(
         alloc_slow_lit,
         call_sites: &method.call_sites,
         ic_sites: Vec::new(),
+        pos: 0,
+        current_bci: 0,
+        safepoints: Vec::new(),
     };
 
     // Prologue (D5.2): frame_bytes = 8*frame_slots, rounded to 16.
@@ -884,10 +954,20 @@ pub fn emit(
             pc_off: e.asm.offset(),
             bci: block.bci,
         });
+        // S12: `current_bci` tracks the ENCLOSING block for any safepoint
+        // emitted within it (block-granularity, matching `poll_bci`'s own
+        // precedent — GC correctness never needs bci, only trace does).
+        e.current_bci = block.bci;
 
         let next_in_order = regalloc.block_order.get(i + 1).copied();
         for ir in &block.code {
+            // S12: `e.pos` is THIS ir's own position, in the EXACT same
+            // linear numbering `regalloc::compute_intervals` used —
+            // incremented AFTER emitting (matching that function's own
+            // `pos += 1` placement), never before, so a safepoint recorded
+            // mid-emission reads the position it was actually computed at.
             emit_ir(&mut e, ir, next_in_order);
+            e.pos += 1;
         }
     }
 
@@ -900,7 +980,14 @@ pub fn emit(
     e.asm.emit("ret", &[]);
 
     let ic_sites = e.ic_sites;
-    (e.asm.finish(), block_pcs, verified_entry_off, ic_sites)
+    let safepoints = e.safepoints;
+    (
+        e.asm.finish(),
+        block_pcs,
+        verified_entry_off,
+        ic_sites,
+        safepoints,
+    )
 }
 
 fn emit_ir(e: &mut Emitter, ir: &Ir, next_in_order: Option<BlockId>) {
@@ -1195,7 +1282,7 @@ mod tests {
         let method = branchy_method();
         let ra = regalloc::regalloc(&method);
         let mut asm = JasmAssembler::new();
-        let (_blob, block_pcs, _verified_entry_off, _ic_sites) =
+        let (_blob, block_pcs, _verified_entry_off, _ic_sites, _safepoints) =
             emit(&mut asm, &method, &ra, 0, 0, 0, None);
 
         assert_eq!(
@@ -1272,7 +1359,7 @@ mod tests {
         let method = hand_method(vec![block0, block1], vregs, 2);
         let ra = regalloc::regalloc(&method);
         let mut asm = JasmAssembler::new();
-        let (blob, _pcs, _verified_entry_off, _ic_sites) =
+        let (blob, _pcs, _verified_entry_off, _ic_sites, _safepoints) =
             emit(&mut asm, &method, &ra, 0, 0, 0, None);
 
         let mnemonics: Vec<&str> = blob.listing.iter().map(|l| mnemonic(l)).collect();
@@ -1343,7 +1430,7 @@ mod tests {
         let near = make(30);
         let ra = regalloc::regalloc(&near);
         let mut asm = JasmAssembler::new();
-        let (blob, _pcs, _verified_entry_off, _ic_sites) =
+        let (blob, _pcs, _verified_entry_off, _ic_sites, _safepoints) =
             emit(&mut asm, &near, &ra, 0, 0, 0, None);
         let near_mnemonics: Vec<String> = blob.listing.iter().map(|l| mnemonic(l)).collect();
         assert!(
@@ -1360,7 +1447,7 @@ mod tests {
         let far = make(31);
         let ra2 = regalloc::regalloc(&far);
         let mut asm2 = JasmAssembler::new();
-        let (blob2, _pcs2, _verified_entry_off2, _ic_sites2) =
+        let (blob2, _pcs2, _verified_entry_off2, _ic_sites2, _safepoints) =
             emit(&mut asm2, &far, &ra2, 0, 0, 0, None);
         let mnemonics: Vec<String> = blob2.listing.iter().map(|l| mnemonic(l)).collect();
         assert!(
@@ -1416,7 +1503,7 @@ mod tests {
         let with_barrier = make(true);
         let ra = regalloc::regalloc(&with_barrier);
         let mut asm = JasmAssembler::new();
-        let (blob, _pcs, _verified_entry_off, _ic_sites) =
+        let (blob, _pcs, _verified_entry_off, _ic_sites, _safepoints) =
             emit(&mut asm, &with_barrier, &ra, 0, 0, 0, None);
         let mnemonics: Vec<String> = blob.listing.iter().map(|l| mnemonic(l)).collect();
         assert!(
@@ -1438,7 +1525,7 @@ mod tests {
         let without_barrier = make(false);
         let ra2 = regalloc::regalloc(&without_barrier);
         let mut asm2 = JasmAssembler::new();
-        let (blob2, _pcs2, _verified_entry_off2, _ic_sites2) =
+        let (blob2, _pcs2, _verified_entry_off2, _ic_sites2, _safepoints) =
             emit(&mut asm2, &without_barrier, &ra2, 0, 0, 0, None);
         let mnemonics2: Vec<String> = blob2.listing.iter().map(|l| mnemonic(l)).collect();
         assert!(
@@ -1502,7 +1589,7 @@ mod tests {
         };
         let ra = regalloc::regalloc(&method);
         let mut asm = JasmAssembler::new();
-        let (blob, _pcs, _ve, _ic) = emit(&mut asm, &method, &ra, 0, 0, 0xAABB, None);
+        let (blob, _pcs, _ve, _ic, _safepoints) = emit(&mut asm, &method, &ra, 0, 0, 0xAABB, None);
         let listing = blob.listing.join("\n");
         let mnemonic = |l: &str| l.split_whitespace().nth(2).unwrap_or("").to_string();
         let mnemonics: Vec<String> = blob.listing.iter().map(|l| mnemonic(l)).collect();
@@ -1571,7 +1658,7 @@ mod tests {
             key_klass_bits: 0x2000,
             resolve_addr: 0x3000,
         };
-        let (blob, _pcs, verified_entry_off, _ic_sites) =
+        let (blob, _pcs, verified_entry_off, _ic_sites, _safepoints) =
             emit(&mut asm, &method, &ra, 0, 0, 0, Some(guard));
 
         // `verified_entry_off` must land exactly on the S10-era prologue's
@@ -1631,6 +1718,71 @@ mod tests {
              return address survives a guard miss untouched -- got:\n{}",
             guard_lines.join("\n")
         );
+    }
+
+    /// `tests_s12.md`'s `pool_relocs_after_literal_off` (P4): every
+    /// `Oop`/`KeyKlassOop` reloc must sit at or past `literal_off` — GC
+    /// rewrites ONLY reloc-recorded pool words; one embedded via
+    /// movz/movk or adrp/add INSIDE the instruction stream (before
+    /// `literal_off`) would need re-encoding + an icache flush mid-
+    /// collection, forbidden by S9 P5. Reuses `entry_guard_smi_and_heap`'s
+    /// own setup (its `EntryGuard` embeds one `Oop` reloc, smi_klass, and
+    /// one `KeyKlassOop` reloc, key_klass) plus a body with its own real
+    /// oop literal (`ConstPool`), so this covers BOTH the guard's own
+    /// literals and an ordinary body literal in one method.
+    #[test]
+    fn pool_relocs_after_literal_off() {
+        let vregs = vec![VRegInfo { is_oop: true }];
+        let block0 = IrBlock {
+            id: BlockId(0),
+            bci: 0,
+            code: vec![
+                Ir::ConstPool {
+                    dst: VReg(0),
+                    lit: PoolLit(0),
+                },
+                Ir::Ret { val: VReg(0) },
+            ],
+            entry_stack: Vec::new(),
+        };
+        let mut method = hand_method(vec![block0], vregs, 1);
+        method.pool = vec![crate::compiler::ir::PoolEntry {
+            value: 0x4000,
+            kind: Some(RelocKind::Oop),
+        }];
+        let ra = regalloc::regalloc(&method);
+        let mut asm = JasmAssembler::new();
+        let guard = EntryGuard {
+            smi_klass_bits: 0x1000,
+            key_klass_bits: 0x2000,
+            resolve_addr: 0x3000,
+        };
+        let (blob, _pcs, _verified_entry_off, _ic_sites, _safepoints) =
+            emit(&mut asm, &method, &ra, 0, 0, 0, Some(guard));
+
+        let oop_relocs: Vec<&crate::compiler::assembler::Reloc> = blob
+            .relocs
+            .iter()
+            .filter(|r| matches!(r.kind, RelocKind::Oop | RelocKind::KeyKlassOop))
+            .collect();
+        assert!(
+            oop_relocs.len() >= 3,
+            "expected smi_klass (Oop) + key_klass (KeyKlassOop) + the body's own ConstPool \
+             (Oop), got {}: {:?}",
+            oop_relocs.len(),
+            blob.relocs
+        );
+        for r in &oop_relocs {
+            assert!(
+                r.offset >= blob.literal_off,
+                "reloc at offset {} (kind {:?}) is BEFORE literal_off {} -- an oop embedded \
+                 inside the instruction stream itself, not the pool, which GC must never rewrite \
+                 in place",
+                r.offset,
+                r.kind,
+                blob.literal_off
+            );
+        }
     }
 
     /// D3/D4: one `EmittedIcSite` per `Ir::CallSend`, in encounter order.
@@ -1710,7 +1862,7 @@ mod tests {
         };
         let ra = regalloc::regalloc(&method);
         let mut asm = JasmAssembler::new();
-        let (blob, _pcs, _verified_entry_off, ic_sites) =
+        let (blob, _pcs, _verified_entry_off, ic_sites, _safepoints) =
             emit(&mut asm, &method, &ra, 0, 0, 0, None);
 
         assert_eq!(
