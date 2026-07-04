@@ -93,6 +93,7 @@ fn cmd_run(args: &[String]) {
 
     let result = macvm::frontend::world::load_file(&mut vm, Path::new(file));
     print_bytecode_count(&vm);
+    print_gc_bridge_stats(&vm);
     match result {
         Ok(()) => std::process::exit(vm.exit_code.unwrap_or(0)),
         Err(e) => {
@@ -108,6 +109,21 @@ fn cmd_run(args: &[String]) {
 fn print_bytecode_count(vm: &VmState) {
     if vm.options.trace.is_enabled("count") {
         eprintln!("bytecodes: {}", vm.bytecode_count);
+    }
+}
+
+/// `MACVM_TRACE=gc` (S11 D8 step 10, `tests_s11.md`'s "Bridge accounting"
+/// gate): a grep-friendly one-line summary printed to stderr at process
+/// exit, mirroring `print_bytecode_count`'s own convention — a shell
+/// recipe (`just bridge-stats-s11`) runs a real workload under it,
+/// asserts `gc_under_compiled=0` (the D8 bridge actually held, not just
+/// "no panic"), and logs `bridge_old_allocs` to `docs/PERF.md`.
+fn print_gc_bridge_stats(vm: &VmState) {
+    if vm.options.trace.is_enabled("gc") {
+        eprintln!(
+            "gc: bridge_old_allocs={} gc_under_compiled={}",
+            vm.universe.gc_stats.bridge_old_allocs, vm.universe.gc_stats.gc_under_compiled
+        );
     }
 }
 

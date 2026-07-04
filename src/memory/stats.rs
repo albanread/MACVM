@@ -37,6 +37,17 @@ pub struct GcStats {
     /// `allocation_fast_and_slow` asserts it is `> 0` on the forced-slow
     /// path. See `alloc::alloc_words`' own bridge arm.
     pub bridge_old_allocs: u64,
+    /// S11 D8 step 10: counts every `scavenge`/`full_gc` entry that
+    /// observed `compiled_depth > 0` — i.e. every time the bridge's
+    /// invariant was actually VIOLATED. Both collectors also
+    /// `debug_assert_eq!(compiled_depth, 0)` at the same point, but that
+    /// compiles out in `--release`; this counter is the independent,
+    /// always-live proof `tests_s11.md`'s "Bridge accounting" gate reads —
+    /// it must be `0` at the end of any run, combined GC-stress +
+    /// `threshold=1` included. Bumped BEFORE the debug_assert so a debug
+    /// build's panic still leaves the violation visible to a
+    /// `catch_unwind`-wrapped test.
+    pub gc_under_compiled: u64,
 }
 
 impl GcStats {

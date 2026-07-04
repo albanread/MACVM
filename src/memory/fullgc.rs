@@ -419,9 +419,13 @@ pub fn full_gc(vm: &mut VmState) -> Result<FullGcReport, GcStallError> {
     );
     // S11 D8: like `scavenge`, a compacting collection moves objects and
     // must never run while a compiled frame is live (its spill-slot oops
-    // are invisible until S12). The `alloc::alloc_words` bridge arm and the
-    // guarded `prim_gc_full` both keep this at 0; the assert catches a
-    // future third door.
+    // are invisible until S12). The `alloc::alloc_words` bridge arm and
+    // `prim_gc_full`'s deferral (`gc_pending`) both keep this at 0; the
+    // assert (plus `gc_under_compiled`, which stays live in `--release`
+    // too) catches a future third door.
+    if vm.compiled_depth > 0 {
+        vm.universe.gc_stats.gc_under_compiled += 1;
+    }
     debug_assert_eq!(
         vm.compiled_depth, 0,
         "full_gc under a live compiled frame (compiled_depth={}) — S11 D8 bridge violated",
@@ -608,6 +612,23 @@ mod tests {
 
     fn is_marked(o: Oop) -> bool {
         MemOop::try_from(o).unwrap().mark().gc_mark()
+    }
+
+    /// S11 D8 step 10: same reasoning as `scavenge.rs`'s sibling test —
+    /// `gc_under_compiled` is the `--release`-surviving proof the
+    /// `debug_assert_eq!` right after it can't give on its own (it compiles
+    /// out there), so it must count the violation before the assert panics.
+    #[test]
+    fn gc_under_compiled_counts_even_though_the_assert_aborts() {
+        let mut vm = test_vm();
+        vm.compiled_depth = 1; // pretend a compiled frame is on the stack
+        if cfg!(debug_assertions) {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = full_gc(&mut vm);
+            }));
+            assert!(result.is_err(), "must debug_assert when compiled_depth > 0");
+            assert_eq!(vm.universe.gc_stats.gc_under_compiled, 1);
+        }
     }
 
     // ======================================================================

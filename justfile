@@ -121,6 +121,37 @@ bench-s10:
         echo "WARN: compiled speedup ${ratio}x is below the 5x target (tracking only, not gating)"
     fi
 
+# S11 gate item 4 (perf marker, tracking not gating): world/bench/dispatch.mst's
+# runLoop: 5_000_000 (a real per-iteration super-send dispatch, D4.6 -- see
+# that file's own doc for why it isn't the literal 3-class polymorphic design
+# tests_s11.md sketches) timed under MACVM_JIT=off vs threshold=1, --release.
+# Same shebang-recipe shape as bench-s10, same warn<5x/fail<2x tripwire --
+# expect a SMALLER ratio than arith.mst's ~130x, honestly (a real send still
+# costs a real dispatch even compiled; this measures that cost, not erasing
+# it), so the 5x warn line is more likely to actually fire here than on
+# bench-s10 -- that is expected, not a regression.
+bench-s11:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    interp_out=$(MACVM_JIT=off cargo run --release --quiet -- run world/bench/dispatch.mst --world world)
+    jit_out=$(MACVM_JIT=threshold=1 cargo run --release --quiet -- run world/bench/dispatch.mst --world world)
+    interp_ms=$(echo "$interp_out" | grep -o 'ms: [0-9]*' | grep -o '[0-9]*')
+    jit_ms=$(echo "$jit_out" | grep -o 'ms: [0-9]*' | grep -o '[0-9]*')
+    ratio=$(echo "scale=2; $interp_ms / $jit_ms" | bc)
+    date_str=$(date +%Y-%m-%d)
+    commit=$(git rev-parse --short HEAD)
+    echo "| $date_str | $commit | $interp_ms | $jit_ms | ${ratio}x |" >> docs/PERF.md
+    echo "dispatch bench: interp_ms=$interp_ms jit_ms=$jit_ms ratio=${ratio}x"
+    below2=$(echo "$ratio < 2" | bc)
+    below5=$(echo "$ratio < 5" | bc)
+    if [ "$below2" = "1" ]; then
+        echo "FAIL: compiled speedup ${ratio}x is below the 2x architectural-mistake tripwire" >&2
+        exit 1
+    fi
+    if [ "$below5" = "1" ]; then
+        echo "WARN: compiled speedup ${ratio}x is below the 5x target (tracking only, not gating)"
+    fi
+
 # S10: tier-1 JIT compiler (tests_s10.md's acceptance gate). gate-s09
 # already covers "cargo test" + "cargo clippy -- -D warnings" (tests_s10.md
 # gate script's own first/last lines) via the dependency chain, so this
@@ -136,6 +167,31 @@ gate-s10: gate-s09
     MACVM_GC_STRESS=full:64 just run-world-tests
     just bench-s10
 
+# S11 step 10 (tests_s11.md "Bridge accounting"): one more full-suite run
+# under the same combined stress as gate-s11's own two lines, this time with
+# MACVM_TRACE=gc so `print_gc_bridge_stats` (main.rs) prints its exit-time
+# "gc: bridge_old_allocs=N gc_under_compiled=M" line to stderr. Asserts M==0
+# — the D8 bridge actually held (not merely "no panic": `gc_under_compiled`
+# stays live in --release, where the collectors' own debug_assert compiles
+# out) — and logs N to docs/PERF.md, the visibility-of-the-cost-S12-removes
+# tests_s11.md itself asks for.
+bridge-stats-s11:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    grep -v '^#' world/tests/tests.list | grep -v '^$' | sed 's|^|world/tests/|' | xargs cat > /tmp/macvm_world_tests.mst
+    out=$(MACVM_GC_STRESS=full:64 MACVM_JIT=threshold=1 MACVM_TRACE=gc cargo run --quiet -- run /tmp/macvm_world_tests.mst --world world 2>&1 >/dev/null)
+    line=$(echo "$out" | grep '^gc: bridge_old_allocs=')
+    echo "$line"
+    under_compiled=$(echo "$line" | sed -n 's/.*gc_under_compiled=\([0-9]*\).*/\1/p')
+    bridge_allocs=$(echo "$line" | sed -n 's/.*bridge_old_allocs=\([0-9]*\).*/\1/p')
+    if [ "$under_compiled" != "0" ]; then
+        echo "FAIL: gc_under_compiled=$under_compiled -- D8 bridge violated (a GC ran while compiled_depth > 0)" >&2
+        exit 1
+    fi
+    date_str=$(date +%Y-%m-%d)
+    commit=$(git rev-parse --short HEAD)
+    echo "| $date_str | $commit | $bridge_allocs | $under_compiled |" >> docs/PERF.md
+
 # S11: compiled sends + inline alloc + the D8 GC bridge. UNLIKE gate-s10 (which
 # deliberately kept GC-stress and the JIT apart, deferring the combo to "S12's
 # flagship"), this gate COMBINES them: MACVM_GC_STRESS + MACVM_JIT=threshold=1
@@ -148,3 +204,5 @@ gate-s10: gate-s09
 gate-s11: gate-s10
     MACVM_GC_STRESS=1 MACVM_JIT=threshold=1 just run-world-tests
     MACVM_GC_STRESS=full:64 MACVM_JIT=threshold=1 just run-world-tests
+    just bridge-stats-s11
+    just bench-s11

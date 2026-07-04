@@ -423,9 +423,14 @@ pub fn scavenge(vm: &mut VmState) -> Result<ScavengeReport, GcStallError> {
     // spill-slot oops are invisible to the scavenger until S12, so
     // evacuating would leave them dangling. Enforced at the collector (not
     // just its callers) so every door is covered: `alloc::alloc_words`'
-    // bridge arm diverts to old-direct under `compiled_depth > 0` and never
-    // reaches here, and `prim_gc_scavenge` skips under a compiled frame —
-    // this assert catches any future third caller before it can corrupt.
+    // bridge arm diverts to old-direct under `compiled_depth > 0`, never
+    // reaching here, and `prim_gc_scavenge` now defers (`gc_pending`)
+    // instead of calling straight in — this assert (plus `gc_under_compiled`
+    // just below, which stays live in `--release` too) catches any future
+    // third caller before it can corrupt.
+    if vm.compiled_depth > 0 {
+        vm.universe.gc_stats.gc_under_compiled += 1;
+    }
     debug_assert_eq!(
         vm.compiled_depth, 0,
         "scavenge under a live compiled frame (compiled_depth={}) — S11 D8 bridge violated",
@@ -728,6 +733,27 @@ mod tests {
             eden_kb: None,
             jit: crate::runtime::JitMode::Off,
         })
+    }
+
+    /// S11 D8 step 10: `gc_under_compiled` must record a bridge violation
+    /// even though the `debug_assert_eq!` right after it aborts the call —
+    /// the counter is the independent, `--release`-surviving proof
+    /// `tests_s11.md`'s bridge-accounting gate reads, so it must be bumped
+    /// BEFORE the assert can panic, not after. Mirrors `ic.rs`'s
+    /// `epoch_wrap_debug_assert`'s `catch_unwind` idiom for exactly the
+    /// same reason: a debug build's own defense is a panic, so observing
+    /// what happened right up to that panic needs to catch it.
+    #[test]
+    fn gc_under_compiled_counts_even_though_the_assert_aborts() {
+        let mut vm = test_vm();
+        vm.compiled_depth = 1; // pretend a compiled frame is on the stack
+        if cfg!(debug_assertions) {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = scavenge(&mut vm);
+            }));
+            assert!(result.is_err(), "must debug_assert when compiled_depth > 0");
+            assert_eq!(vm.universe.gc_stats.gc_under_compiled, 1);
+        }
     }
 
     /// A scavenge of a freshly booted VM (nothing but genesis's own

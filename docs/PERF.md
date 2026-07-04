@@ -71,3 +71,46 @@ below 2x (an architectural-mistake tripwire, not a perf gate — gate item
 |---|---|---|---|---|
 | 2026-07-03 | 177abf1 | 1221 | 9 | 135.66x |
 | 2026-07-03 | 353db27 | 1233 | 10 | 123.30x |
+
+# S11 D8 bridge — allocation cost of the pre-S12 GC bridge
+
+Recorded per `tests_s11.md`'s "Bridge accounting" stress/negative test
+(SPRINTS standing rule 3: **tracking, not gating** for `bridge_old_allocs`
+itself — `gc_under_compiled` IS gating: `just bridge-stats-s11` fails the
+run if it's ever nonzero). The full world test suite, under
+`MACVM_GC_STRESS=full:64` combined with `MACVM_JIT=threshold=1` (the same
+combination `gate-s11` stress-tests), traced with `MACVM_TRACE=gc`.
+`bridge_old_allocs` is every allocation the D8 bridge diverted old-direct
+because a compiled frame was live (`compiled_depth > 0`) — non-moving,
+so it costs old-gen space no scavenge can ever reclaim until S12 deletes
+the whole bridge. `gc_under_compiled` is the number of times a
+scavenge/full-GC actually ran while `compiled_depth > 0` — i.e. the
+bridge failing to hold; must always read 0.
+
+| Date | Commit | bridge_old_allocs | gc_under_compiled |
+|---|---|---|---|
+| 2026-07-04 | 7ac7b53 | 110 | 0 |
+
+# S11 dispatch — perf marker (adapted, see world/bench/dispatch.mst's own doc)
+
+Recorded per `tests_s11.md`'s gate item 4 ("Dispatch micro-benchmark"),
+ADAPTED: the literal 3-class polymorphic design that file sketches cannot
+compile at all under S11's as-built eligibility gate (`mono_smi_inline_send`
+rejects any non-super send whose IC guard isn't `SmallInteger`, monomorphic
+or not — see `world/bench/dispatch.mst`'s own header and
+`sprint_s11_detail.md`'s STEP-10 NOTES for the full reasoning). This instead
+times `world/bench/dispatch.mst`'s `runLoop: 5_000_000` — arith.mst's own
+`sumTo:` shape with its inlined `+` replaced by a REAL super-send dispatch
+per iteration (D4.6: the one non-arithmetic, non-`basicNew` send a compiled
+method may contain) — under `MACVM_JIT=off` vs `threshold=1`, via
+`just bench-s11` (`--release`). Same warn<5x/fail<2x tripwire as
+`bench-s10` (tracking, not gating).
+
+A smaller ratio than `bench-s10`'s ~130x is the EXPECTED, honest result: a
+real send still costs a real dispatch even compiled (unlike inlined
+arithmetic, which erases the cost entirely) — this benchmark measures that
+cost, it doesn't erase it.
+
+| Date | Commit | interp_ms | jit_ms | ratio |
+|---|---|---|---|---|
+| 2026-07-04 | 7ac7b53 | 1834 | 472 | 3.88x |

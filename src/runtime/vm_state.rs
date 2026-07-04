@@ -130,6 +130,23 @@ pub struct NlrState {
     pub value: crate::oops::Oop,
 }
 
+/// S11 D8 step 10: which collection `prim_gc_scavenge`/`prim_gc_full`
+/// deferred because it ran under a live compiled frame (`compiled_depth >
+/// 0`, D8 bridge). `Full` always wins over `Scavenge` — a full GC already
+/// does everything a scavenge would, so downgrading a pending `Full` back
+/// to `Scavenge` on a later, weaker request would silently drop the
+/// stronger one (`VmState::request_pending_gc` enforces this, never set
+/// this field directly). Run at the next point `compiled_depth` actually
+/// reaches 0 (`VmState::run_pending_gc_if_due`, called from
+/// `enter_compiled`'s outermost exit) — this rule is the same "ugly,
+/// memory-hungry, exists precisely so S11 can gate without S12" bridge the
+/// sprint doc's D8 describes; S12 deletes the whole mechanism.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GcPendingKind {
+    Scavenge,
+    Full,
+}
+
 /// Which `MACVM_TRACE` channels are enabled. The channel set is open-ended
 /// (CONVENTIONS §3); S1 only stores membership, nothing reads it yet.
 #[derive(Clone, Default, Debug, PartialEq, Eq)]
@@ -438,6 +455,17 @@ pub struct VmState {
     /// unrelated compiled call); cleared only when the unwind finally
     /// returns from home.
     pub nlr_state: Option<NlrState>,
+    /// S11 D8 step 10: a collection `prim_gc_scavenge`/`prim_gc_full`
+    /// deferred because `compiled_depth > 0` at the time of the request.
+    /// Set only via `request_pending_gc` (upgrade-only: `Full` beats
+    /// `Scavenge`), run and cleared by `run_pending_gc_if_due` — called
+    /// from `enter_compiled`'s outermost exit, the same `compiled_depth ==
+    /// 0` boundary that already re-adopts eden. `None` most of the time
+    /// (an explicit `Smalltalk gcScavenge`/`gcFull` under a compiled frame
+    /// is rare); left `Some` across the deferral window is the ENTIRE
+    /// point — unlike `nlr_state`, a stranded value here is harmless (just
+    /// a delayed collection), not a correctness hazard.
+    pub gc_pending: Option<GcPendingKind>,
     /// Test-only one-shot hook (tests_s10.md's `mixed_trace_golden`, gate
     /// item 4): compiled code is send-free (D1), so nothing inside it can
     /// call a `printStackTrace` primitive directly — a test sets this
@@ -473,6 +501,45 @@ impl VmState {
     /// window holds (no GC/growth of the young gen under a compiled frame).
     pub(crate) fn adopt_eden_from_regblock(&mut self) {
         self.universe.eden.top = self.reg_block.eden_top as usize;
+    }
+
+    /// S11 D8 step 10: record that `kind` was declined under a live
+    /// compiled frame, upgrading (never downgrading) any already-pending
+    /// request — a `Full` covers everything a `Scavenge` would have done,
+    /// so a later, weaker request must not erase an earlier, stronger one.
+    pub(crate) fn request_pending_gc(&mut self, kind: GcPendingKind) {
+        self.gc_pending = Some(match (self.gc_pending, kind) {
+            (Some(GcPendingKind::Full), _) | (_, GcPendingKind::Full) => GcPendingKind::Full,
+            (_, GcPendingKind::Scavenge) => GcPendingKind::Scavenge,
+        });
+    }
+
+    /// S11 D8 step 10: runs (and clears) any collection deferred while
+    /// `compiled_depth > 0`. Callable only once `compiled_depth` has
+    /// actually returned to 0 — both collectors themselves
+    /// `debug_assert_eq!` that, so calling this too early panics in debug
+    /// builds rather than silently re-violating the bridge it exists to
+    /// close. `enter_compiled`'s outermost exit is the only call site (S11):
+    /// the same boundary that already re-adopts eden is the first point a
+    /// deferred collection is safe to actually run.
+    pub(crate) fn run_pending_gc_if_due(&mut self) {
+        let Some(kind) = self.gc_pending.take() else {
+            return;
+        };
+        if self.options.trace.is_enabled("gc") {
+            eprintln!("[gc] running deferred {kind:?} now that compiled_depth == 0 (D8 bridge)");
+        }
+        match kind {
+            GcPendingKind::Scavenge => {
+                if let Err(err) = crate::memory::scavenge::scavenge(self) {
+                    crate::memory::alloc::stall_exit(err);
+                }
+            }
+            GcPendingKind::Full => {
+                crate::memory::fullgc::full_gc(self)
+                    .expect("full_gc: pure compaction never returns Err (see its own doc)");
+            }
+        }
     }
 
     /// Parses options from the environment once and boots a fresh universe.
@@ -537,6 +604,7 @@ impl VmState {
             tier_links: Vec::new(),
             compiled_depth: 0,
             nlr_state: None,
+            gc_pending: None,
             trace_on_poll: false,
         };
         crate::runtime::globals::bootstrap_well_known(&mut vm);
@@ -773,5 +841,77 @@ mod tests {
             vm.universe.eden.top as u64, bumped,
             "adopt must reclaim compiled code's bump progress into eden.top"
         );
+    }
+
+    /// S11 D8 step 10: `Full` always wins — a later, weaker `Scavenge`
+    /// request must never erase an already-pending `Full` one, since a full
+    /// GC already does everything a scavenge would have.
+    #[test]
+    fn request_pending_gc_upgrades_but_never_downgrades() {
+        let mut vm = VmState::with_options(VmOptions::default());
+        assert_eq!(vm.gc_pending, None);
+
+        vm.request_pending_gc(GcPendingKind::Scavenge);
+        assert_eq!(vm.gc_pending, Some(GcPendingKind::Scavenge));
+        vm.request_pending_gc(GcPendingKind::Scavenge);
+        assert_eq!(vm.gc_pending, Some(GcPendingKind::Scavenge));
+
+        vm.request_pending_gc(GcPendingKind::Full);
+        assert_eq!(vm.gc_pending, Some(GcPendingKind::Full));
+        vm.request_pending_gc(GcPendingKind::Scavenge);
+        assert_eq!(
+            vm.gc_pending,
+            Some(GcPendingKind::Full),
+            "a later Scavenge request must not downgrade an already-pending Full"
+        );
+    }
+
+    /// S11 D8 step 10: with nothing pending, `run_pending_gc_if_due` is a
+    /// true no-op (neither counter moves) — the common case, since an
+    /// explicit `Smalltalk gcScavenge`/`gcFull` under a compiled frame is
+    /// rare.
+    #[test]
+    fn run_pending_gc_if_due_is_a_noop_when_nothing_pending() {
+        let mut vm = VmState::with_options(VmOptions::default());
+        let (scav, full) = (
+            vm.universe.gc_stats.scavenge_count,
+            vm.universe.gc_stats.full_gc_count,
+        );
+        vm.run_pending_gc_if_due();
+        assert_eq!(vm.universe.gc_stats.scavenge_count, scav);
+        assert_eq!(vm.universe.gc_stats.full_gc_count, full);
+    }
+
+    /// S11 D8 step 10: the deferred-collection upgrade this step's whole
+    /// point — `prim_gc_scavenge`'s decline-under-compiled-frame branch used
+    /// to be a bare no-op (S11 step 8); it must now actually run a REAL
+    /// scavenge once given the chance, not just remember that one was asked
+    /// for.
+    #[test]
+    fn run_pending_gc_if_due_runs_a_real_deferred_scavenge() {
+        let mut vm = VmState::with_options(VmOptions::default());
+        let before = vm.universe.gc_stats.scavenge_count;
+
+        vm.request_pending_gc(GcPendingKind::Scavenge);
+        assert_eq!(
+            vm.universe.gc_stats.scavenge_count, before,
+            "requesting must not itself run anything"
+        );
+
+        vm.run_pending_gc_if_due();
+        assert_eq!(vm.universe.gc_stats.scavenge_count, before + 1);
+        assert_eq!(vm.gc_pending, None, "must clear the request once serviced");
+    }
+
+    /// Sibling of the scavenge test above, for `GcPendingKind::Full`.
+    #[test]
+    fn run_pending_gc_if_due_runs_a_real_deferred_full_gc() {
+        let mut vm = VmState::with_options(VmOptions::default());
+        let before = vm.universe.gc_stats.full_gc_count;
+
+        vm.request_pending_gc(GcPendingKind::Full);
+        vm.run_pending_gc_if_due();
+        assert_eq!(vm.universe.gc_stats.full_gc_count, before + 1);
+        assert_eq!(vm.gc_pending, None);
     }
 }

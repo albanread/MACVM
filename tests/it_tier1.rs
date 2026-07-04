@@ -2460,6 +2460,15 @@ fn allocation_fast_and_slow() {
         vm.universe.gc_stats.bridge_old_allocs > bridge_before2,
         "the forced-overflow slow path must divert old-direct via the D8 bridge"
     );
+
+    // S11 D8 step 10: neither the fast nor the forced-slow path may EVER
+    // let a real scavenge/full-GC run while compiled_depth > 0 — the
+    // `gc_under_compiled` counter (independent proof, stays live in
+    // --release too) must read exactly 0 across this whole test.
+    assert_eq!(
+        vm.universe.gc_stats.gc_under_compiled, 0,
+        "the D8 bridge must hold: no collection may ever run under a live compiled frame"
+    );
 }
 
 /// A bare `test_vm()` has no world loaded, so the block/arith primitives

@@ -1,0 +1,65 @@
+"dispatch.mst -- sprint_s11_detail.md perf marker (tests_s11.md gate item 4,
+ ADAPTED -- see sprint_s11_detail.md's STEP-10 NOTES for the full reasoning).
+
+ tests_s11.md's own gate item 4 sketches a 3-class POLYMORPHIC `area`-
+ summing loop, compiled and timed vs interpreted, expecting >=5x. That
+ shape cannot compile at all under S11's AS-BUILT eligibility gate:
+ `driver.rs`'s `mono_smi_inline_send` rejects a method containing ANY
+ non-super send whose IC guard isn't SmallInteger
+ (`eligible_rejects_non_smi_guard`) -- so it disqualifies not just
+ polymorphic sends but ORDINARY MONO ones too. 'area'-style user-method
+ dispatch, monomorphic or polymorphic, keeps its whole containing method
+ interpreted forever, deliberately (step 7's narrowed gate, kept narrow
+ after the broader D1 widening tripped C2I-reentrancy hazards -- see that
+ step's own SPEC-QUESTION). The ONLY non-smi, non-basicNew send a compiled
+ method may contain is a SUPER send (D4.6: unconditionally eligible,
+ statically resolved at compile time, no IC lookup at all) -- so this file
+ benchmarks THAT shape instead: a real per-iteration super-send dispatch,
+ not just inlined smi arithmetic (which arith.mst already covers and this
+ file deliberately does not repeat).
+
+ runLoop: is arith.mst's own sumTo: with its inner `s := s + i` replaced by
+ `total := total + (super step: i)` -- one real compiled/c2i dispatch per
+ iteration (D4.6's static target resolution) on top of the same inlined
+ to:do: loop shape. callRunLoop:with: shares one call site across warm-up +
+ timed calls, matching arith.mst's own callSumTo: exactly (same rationale:
+ the FIRST call through any site always declines and runs interpreted,
+ regardless of how warm the method's OWN inner sends already are).
+
+ Expect a SMALLER ratio than arith.mst's ~130x, honestly: unlike sumTo:
+ (100% inlined, nothing left interpreted once compiled), a real send still
+ costs a real dispatch even compiled -- this is measuring dispatch
+ overhead, not erasing it. Recorded per SPRINTS standing rule 3: tracking,
+ not gating (same warn<5x/fail<2x tripwire as bench-s10, for the same
+ architectural-mistake-not-perf-gate reason)."
+
+Object subclass: DispBase [
+    step: n [ ^n + 1 ]
+]
+DispBase subclass: DispDerived [
+    runLoop: n [
+        | total |
+        total := 0.
+        1 to: n do: [:i | total := total + (super step: i) ].
+        ^total
+    ]
+    DispDerived class >> callRunLoop: anInstance with: n [
+        ^anInstance runLoop: n
+    ]
+    DispDerived class >> runTimed [
+        | obj startMs endMs result |
+        obj := self new.
+        self callRunLoop: obj with: 3.
+        self callRunLoop: obj with: 3.
+        startMs := Smalltalk millisecondClock.
+        result := self callRunLoop: obj with: 5000000.
+        endMs := Smalltalk millisecondClock.
+        Transcript show: 'ms: '.
+        Transcript show: (endMs - startMs) printString.
+        Transcript cr.
+        ^result
+    ]
+]
+
+Transcript show: DispDerived runTimed printString.
+Transcript cr.

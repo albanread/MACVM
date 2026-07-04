@@ -12,8 +12,17 @@ Restated from SPRINTS.md S11, made checkable:
    forced far target.
 3. Mixed-tier call matrix passes: I→C, C→I, C→C, super-from-compiled, DNU
    from compiled — each verified for result AND for stack-trace shape.
-4. Dispatch micro-benchmark ≥ 5× interpreter (recorded in `docs/PERF.md`;
-   warn <5×, fail <2× — standing rule 3 discipline as in S10).
+4. Dispatch micro-benchmark, recorded in `docs/PERF.md` (warn <5×, fail
+   <2× — standing rule 3 discipline as in S10). **ADAPTED at step 10** (see
+   `world/bench/dispatch.mst`'s own header, and `sprint_s11_detail.md`'s
+   STEP-10 NOTES item (f)): the 3-class polymorphic design sketched below
+   cannot compile at all under the as-built eligibility gate
+   (`mono_smi_inline_send` rejects any non-super send whose IC guard isn't
+   `SmallInteger`, monomorphic OR polymorphic) — benchmarks a real
+   per-iteration `super` send instead (D4.6, the one send shape a compiled
+   method may contain besides smi arithmetic/`basicNew`). First run: 3.88x
+   (WARN, not FAIL — a real send costs a real dispatch even compiled;
+   honestly expected, not a regression).
 5. All existing stress gates green (`MACVM_GC_STRESS` modes still run with
    JIT off; combined mode is S12).
 
@@ -30,10 +39,13 @@ just bench-s11          # dispatch micro → docs/PERF.md
 cargo clippy -- -D warnings
 ```
 
-Dispatch micro (`world/bench/dispatch.mst`): a 3-class polymorphic
-`area`-summing loop over a preallocated 30k-element array (mono per site
-after warm-up in the compiled version — one PIC of 3), timed off vs
-`threshold=1`, ratio appended to `docs/PERF.md` (warn <5×, fail <2×).
+Dispatch micro (`world/bench/dispatch.mst`) — ORIGINAL design, superseded by
+the ADAPTED note under gate item 4 above (kept here for the record, not as
+current instructions): a 3-class polymorphic `area`-summing loop over a
+preallocated 30k-element array (mono per site after warm-up in the compiled
+version — one PIC of 3), timed off vs `threshold=1`, ratio appended to
+`docs/PERF.md` (warn <5×, fail <2×). As-built, `dispatch.mst` instead times
+a real per-iteration `super` send (`runLoop:`), for the reason given above.
 
 Test-only hooks required by this file (behind `#[cfg(any(test,
 feature = "vm-test-hooks"))]`, exposed to `.mst` via dev primitives):

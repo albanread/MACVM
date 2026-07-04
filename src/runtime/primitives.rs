@@ -995,12 +995,19 @@ fn prim_gc_scavenge(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     // adapter) would move the heap while the outer compiled frame's
     // spill-slot oops are still invisible to the collector — heap
     // corruption. Moving GC is forbidden until `compiled_depth` returns to
-    // 0, so skip (answer the receiver, as if the collection found nothing
-    // to do). Step 10 upgrades this no-op to a proper deferred collection
-    // (`gc_pending`, run at the next `compiled_depth == 0` point); for now
-    // the pre-S12 bridge simply declines. Found by adversarial review — the
-    // `alloc_words` bridge arm alone doesn't cover this direct door.
+    // 0, so defer instead of running it now (step 10: `gc_pending`, run by
+    // `enter_compiled`'s outermost exit via `run_pending_gc_if_due`) —
+    // answer the receiver either way, matching a real scavenge's own
+    // return convention. Found by adversarial review — the `alloc_words`
+    // bridge arm alone doesn't cover this direct door.
     if vm.compiled_depth > 0 {
+        vm.request_pending_gc(crate::runtime::vm_state::GcPendingKind::Scavenge);
+        if vm.options.trace.is_enabled("gc") {
+            eprintln!(
+                "[gc] scavenge deferred: compiled_depth={} (D8 bridge)",
+                vm.compiled_depth
+            );
+        }
         return PrimResult::Ok(args[0]);
     }
     if let Err(err) = crate::memory::scavenge::scavenge(vm) {
@@ -1016,9 +1023,16 @@ fn prim_gc_scavenge(vm: &mut VmState, args: &[Oop]) -> PrimResult {
 fn prim_gc_full(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     // S11 D8 bridge: same as `prim_gc_scavenge` — a compacting collection
     // under a live compiled frame would relocate objects the collector
-    // can't yet find via that frame. Decline while `compiled_depth > 0`
-    // (step 10 upgrades to a deferred full GC).
+    // can't yet find via that frame. Defer while `compiled_depth > 0`
+    // (step 10: `gc_pending`, run by `enter_compiled`'s outermost exit).
     if vm.compiled_depth > 0 {
+        vm.request_pending_gc(crate::runtime::vm_state::GcPendingKind::Full);
+        if vm.options.trace.is_enabled("gc") {
+            eprintln!(
+                "[gc] full GC deferred: compiled_depth={} (D8 bridge)",
+                vm.compiled_depth
+            );
+        }
         return PrimResult::Ok(args[0]);
     }
     crate::memory::fullgc::full_gc(vm)
@@ -1753,6 +1767,44 @@ mod tests {
         let before = vm.universe.gc_stats.full_gc_count;
         assert_eq!(call(94, &mut vm, &[recv]), PrimResult::Ok(recv));
         assert_eq!(vm.universe.gc_stats.full_gc_count, before + 1);
+    }
+
+    /// S11 D8 step 10: under a live compiled frame, `gcScavenge` must NOT
+    /// run a real scavenge (moving GC is forbidden — D8 bridge) but must
+    /// defer it (`gc_pending`) rather than silently dropping the request
+    /// (step 8's original decline-and-forget behavior). Still answers the
+    /// receiver either way, matching a real scavenge's own convention.
+    #[test]
+    fn prim_gc_scavenge_defers_under_compiled_frame() {
+        let mut vm = test_vm();
+        let recv = vm.universe.nil_obj;
+        let before = vm.universe.gc_stats.scavenge_count;
+        vm.compiled_depth = 1; // pretend a compiled frame is on the stack
+        assert_eq!(call(93, &mut vm, &[recv]), PrimResult::Ok(recv));
+        assert_eq!(
+            vm.universe.gc_stats.scavenge_count, before,
+            "must NOT run a real scavenge while compiled_depth > 0"
+        );
+        assert_eq!(
+            vm.gc_pending,
+            Some(crate::runtime::vm_state::GcPendingKind::Scavenge),
+            "must remember the request instead of dropping it"
+        );
+    }
+
+    /// Sibling of the scavenge test above, for `gcFull` (id 94).
+    #[test]
+    fn prim_gc_full_defers_under_compiled_frame() {
+        let mut vm = test_vm();
+        let recv = vm.universe.nil_obj;
+        let before = vm.universe.gc_stats.full_gc_count;
+        vm.compiled_depth = 1;
+        assert_eq!(call(94, &mut vm, &[recv]), PrimResult::Ok(recv));
+        assert_eq!(vm.universe.gc_stats.full_gc_count, before);
+        assert_eq!(
+            vm.gc_pending,
+            Some(crate::runtime::vm_state::GcPendingKind::Full)
+        );
     }
 
     /// `Smalltalk gcStats` (id 97) answers an 8-smi Array in the SPEC-pinned

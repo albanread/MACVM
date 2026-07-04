@@ -115,11 +115,18 @@ pub fn enter_compiled(vm: &mut VmState, nm_id: NmethodId, argc: u8) -> EnterResu
     // for. (Step 9 must run this same adopt + `compiled_depth` fixup on any
     // NLR unwind that crosses a compiled frame — an adversarial-review
     // finding; a stranded `compiled_depth` would freeze eden forever.)
-    if vm.compiled_depth == 0 {
+    let outermost_exit = vm.compiled_depth == 0;
+    if outermost_exit {
         vm.adopt_eden_from_regblock();
     }
 
     if result_bits == BAILOUT_SENTINEL {
+        // S11 D8 step 10: safe to run a deferred collection right here —
+        // `vm.stack` is untouched (still `[receiver, args...]`, this
+        // variant's own doc), so nothing is unrooted.
+        if outermost_exit {
+            vm.run_pending_gc_if_due();
+        }
         return EnterResult::Bailout;
     }
 
@@ -139,6 +146,18 @@ pub fn enter_compiled(vm: &mut VmState, nm_id: NmethodId, argc: u8) -> EnterResu
     // Checked BEFORE the sp-assert and `Oop::from_raw` below: the sentinel
     // is a RESERVED_TAG word `from_raw` rejects by design, and the escape
     // already popped this side's operand stack.
+    //
+    // S11 D8 step 10: deliberately NOT a `run_pending_gc_if_due` call site,
+    // even when `outermost_exit`. `continue_unwind` can hand back a bare,
+    // UNROOTED `Oop` bubbling up as an ordinary return value
+    // (`UnwindStep::ReturnedFromHome(Some(_))` — `pop_and_deliver`'s own
+    // `ENTRY_FRAME_SENTINEL` case, exactly the shape `nlr_through_compiled_frame`
+    // exercises), safe today only because nothing allocates while it's in
+    // transit up through `activate_method`/`OP_SEND`/`run_method`'s own
+    // return chain — the same pre-existing contract an ordinary (non-NLR)
+    // return value already relies on. Running a collection here would be
+    // the first thing to ever allocate in that window. Any `gc_pending`
+    // request simply waits for the next outermost exit.
     if result_bits == crate::oops::layout::NLR_SENTINEL {
         let st = vm
             .nlr_state
@@ -157,6 +176,11 @@ pub fn enter_compiled(vm: &mut VmState, nm_id: NmethodId, argc: u8) -> EnterResu
     );
     vm.stack.sp = base;
     push(vm, Oop::from_raw(result_bits));
+    // S11 D8 step 10: safe here — the result is already pushed onto
+    // `vm.stack` (rooted) before a deferred collection could run.
+    if outermost_exit {
+        vm.run_pending_gc_if_due();
+    }
     EnterResult::Completed
 }
 

@@ -540,7 +540,63 @@ without S12's machinery; S12's first commit deletes it.
 > the nmethod copy dangling. `Justfile`'s new `gate-s11` now runs the
 > combined axes (full world suite 3794/0 under both gc-stress modes ×
 > threshold=1), with a `scavenge_updates_nmethod_key_selector` regression
-> test.
+> test. (e) **STEP-10 NOTES (as-built), the rest of D8.** Item (b)'s
+> leftover "`oops_do` over nmethod/PIC/adapter pools" was ALREADY closed by
+> (d) above (`b9a8fad`), not new step-10 work — both collectors have called
+> it correctly (plus `update_keys`/`rehash`) since that fix; nothing further
+> was needed here. What step 10 actually built: `gc_stats.gc_under_compiled`
+> counts every `scavenge`/`full_gc` ENTRY that observes `compiled_depth >
+> 0`, bumped immediately before each collector's own `debug_assert_eq!` so
+> it stays a live, independent proof the bridge held even in `--release`
+> (where the assert compiles out) — `tests_s11.md`'s "Bridge accounting"
+> gate reads it via a new `just bridge-stats-s11` recipe (folded into
+> `gate-s11`), which runs the full world suite under
+> `MACVM_GC_STRESS=full:64 MACVM_JIT=threshold=1 MACVM_TRACE=gc`, fails if
+> `gc_under_compiled != 0`, and logs `bridge_old_allocs` to `docs/PERF.md`
+> via a new exit-time `print_gc_bridge_stats` trace line in `main.rs`
+> (mirrors `print_bytecode_count`'s own `MACVM_TRACE=count` convention — no
+> new Smalltalk-facing primitive: `tests_s11.md`'s own aspirational
+> `vm-test-hooks`/`ic_state_of` infrastructure was never built across steps
+> 1–9 either, so this follows the as-built precedent rather than the
+> planning doc's letter). `prim_gc_scavenge`/`prim_gc_full`'s decline-under-
+> compiled-frame branches now call `VmState::request_pending_gc`
+> (upgrade-only: `Full` beats `Scavenge`, never downgrades) instead of
+> silently dropping the request; `VmState::run_pending_gc_if_due` services
+> it. **Load-bearing subtlety found while wiring the service call site:**
+> `run_pending_gc_if_due` may ONLY run from `enter_compiled`'s outermost
+> exit (`compiled_depth` back to 0) on the `Bailout`/`Completed` arms —
+> deliberately NOT the `Nlr(...)` arm, even though that arm can ALSO be the
+> outermost exit. `continue_unwind` there can hand back a bare, UNROOTED
+> `Oop` bubbling up as an ordinary return value
+> (`UnwindStep::ReturnedFromHome(Some(_))`, `pop_and_deliver`'s own
+> `ENTRY_FRAME_SENTINEL` case — exactly `nlr_through_compiled_frame`'s own
+> shape), which stays safe today only because nothing allocates while it's
+> in transit up through `activate_method`/`OP_SEND`/`run_method`'s return
+> chain; running a deferred collection right there would be the first
+> thing to ever break that pre-existing contract. A `gc_pending` request
+> raised during an NLR-escaping call simply waits for the next ordinary
+> outermost exit — harmless (unlike a stranded `compiled_depth`, this is
+> just a delayed collection, not a correctness hazard). `MACVM_TRACE=gc`
+> diversion warnings added at both primitives' decline points and at
+> `run_pending_gc_if_due`'s own service point. (f) **STEP-10 finding: gate
+> item 4 (dispatch micro-benchmark) is UNBUILDABLE as `tests_s11.md`
+> literally sketches it, discovered while closing out this step.** That
+> file's "3-class polymorphic `area`-summing loop, compiled and timed"
+> cannot compile at all under `mono_smi_inline_send`: the gate rejects
+> ANY non-super send whose IC guard isn't `SmallInteger` — not just
+> polymorphic ones, ORDINARY MONO user-method sends too
+> (`eligible_rejects_non_smi_guard`). The only non-arithmetic, non-
+> `basicNew` send a compiled method may contain is a `super` send (D4.6,
+> unconditionally eligible). `world/bench/dispatch.mst` (new) benchmarks
+> that shape instead — `arith.mst`'s own `sumTo:` with its inlined `+`
+> replaced by a real per-iteration `super step: i` dispatch — via a new
+> `just bench-s11` recipe (folded into `gate-s11`, `docs/PERF.md`'s own
+> new section). First real run: 3.88x (WARN, not FAIL — honestly expected:
+> a real send still costs a real dispatch even compiled, unlike
+> `arith.mst`'s 100%-inlined ~130x). This is a genuine, if narrow, gap in
+> what "dispatch micro-benchmark ≥5x" can mean until a future sprint
+> revisits D1's fuller eligibility text (the same revert this step's item
+> (e) and step 7's own SPEC-QUESTION already track).
 
 ## Pitfalls
 
