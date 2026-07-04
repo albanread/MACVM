@@ -1252,6 +1252,7 @@ mod tests {
                 },
             ],
             entry_stack: Vec::new(),
+            deopt_sites: Vec::new(),
         };
         let block1 = IrBlock {
             id: BlockId(1),
@@ -1264,6 +1265,7 @@ mod tests {
                 Ir::Ret { val: VReg(5) },
             ],
             entry_stack: Vec::new(),
+            deopt_sites: Vec::new(),
         };
         let block2 = IrBlock {
             id: BlockId(2),
@@ -1276,6 +1278,7 @@ mod tests {
                 Ir::Ret { val: VReg(6) },
             ],
             entry_stack: Vec::new(),
+            deopt_sites: Vec::new(),
         };
         let block3 = IrBlock {
             id: BlockId(3),
@@ -1284,6 +1287,7 @@ mod tests {
                 reason: BailoutReason::SmiOpFailed,
             }],
             entry_stack: Vec::new(),
+            deopt_sites: Vec::new(),
         };
         hand_method(vec![block0, block1, block2, block3], vregs, 2)
     }
@@ -1359,6 +1363,7 @@ mod tests {
                 Ir::Ret { val: VReg(3) },
             ],
             entry_stack: Vec::new(),
+            deopt_sites: Vec::new(),
         };
         let block1 = IrBlock {
             id: BlockId(1),
@@ -1367,6 +1372,7 @@ mod tests {
                 reason: BailoutReason::SmiOpFailed,
             }],
             entry_stack: Vec::new(),
+            deopt_sites: Vec::new(),
         };
         let method = hand_method(vec![block0, block1], vregs, 2);
         let ra = regalloc::regalloc(&method);
@@ -1433,6 +1439,7 @@ mod tests {
                     Ir::Ret { val: VReg(1) },
                 ],
                 entry_stack: Vec::new(),
+                deopt_sites: Vec::new(),
             };
             hand_method(vec![block0], vregs, 1)
         };
@@ -1506,6 +1513,7 @@ mod tests {
                     Ir::RetSelf,
                 ],
                 entry_stack: Vec::new(),
+                deopt_sites: Vec::new(),
             };
             hand_method(vec![block0], vregs, 2)
         };
@@ -1574,6 +1582,7 @@ mod tests {
                     Ir::Ret { val: VReg(0) },
                 ],
                 entry_stack: Vec::new(),
+                deopt_sites: Vec::new(),
             }],
             vregs: vec![VRegInfo { is_oop: true }],
             pool: vec![
@@ -1675,6 +1684,7 @@ mod tests {
                 Ir::RetSelf,
             ],
             entry_stack: Vec::new(),
+            deopt_sites: Vec::new(),
         };
         let method = hand_method(vec![block0], vregs, 1);
         let ra = regalloc::regalloc(&method);
@@ -1770,6 +1780,7 @@ mod tests {
                 Ir::Ret { val: VReg(0) },
             ],
             entry_stack: Vec::new(),
+            deopt_sites: Vec::new(),
         };
         let mut method = hand_method(vec![block0], vregs, 1);
         method.pool = vec![crate::compiler::ir::PoolEntry {
@@ -1856,6 +1867,7 @@ mod tests {
                 Ir::Ret { val: VReg(5) },
             ],
             entry_stack: Vec::new(),
+            deopt_sites: Vec::new(),
         };
         let method = IrMethod {
             blocks: vec![block0],

@@ -418,6 +418,14 @@ pub fn compile_method(
         })
         .collect();
 
+    // S13 step 3b: build this method's deopt scope blob + PcDescs from the
+    // safepoints the converter flagged (`ir::IrBlock::deopt_sites`). Every
+    // value read after a resume bci is spilled (S12 spill-all), so
+    // `scopes::resolve_frame_loc` alone resolves receiver/slots/stack; a
+    // value not live at the safepoint is dead -> Nil.
+    let (deopt_scopes, deopt_pcdescs) =
+        build_deopt_metadata(&ir_method, &regalloc_result, &safepoint_pcs);
+
     let nm = Nmethod {
         id: NmethodId(0), // overwritten by CodeTable::install
         key_klass: rcvr_klass,
@@ -436,12 +444,8 @@ pub fn compile_method(
         oopmaps,
         ic_sites,
         poll_bci,
-        // S13 step 3 (recording) not wired yet: a real compiled method
-        // carries NO deopt metadata until emit records sites. Empty is
-        // correct, not a stub -- deopt simply cannot fire on this nmethod
-        // until the recorder is threaded through emit.
-        deopt_scopes: Vec::new(),
-        deopt_pcdescs: Vec::new(),
+        deopt_scopes,
+        deopt_pcdescs,
     };
     // S12 D1 enforcement point 2: "debug + stress" — reuses the existing
     // heap-verifier's own gate (`MACVM_GC_VERIFY=1` opts a release build
@@ -471,6 +475,90 @@ fn selector_string(method: MethodOop) -> String {
     SymbolOop::try_from(method.selector())
         .map(|s| s.as_string())
         .unwrap_or_else(|| "<?>".to_string())
+}
+
+/// S13 step 3b: build a freshly compiled method's deopt scope blob + sorted
+/// `scopes::PcDesc`s from the converter-flagged safepoints
+/// (`ir::IrBlock::deopt_sites`).
+///
+/// Re-walks `block_order` in the SAME linear-position numbering `regalloc`
+/// (`compute_intervals`) and `emit` share, so each deopt site's op position
+/// is re-derived here and matched — via that position — to the emitted
+/// [`emit::SafepointPc`] carrying its return-address `pc_off` (the deopt
+/// `PcDesc.code_off` key, same value the S12 oopmap `PcDesc` uses for a
+/// call). A deopt site is always a safepoint-emitting op, so its position
+/// is always present in the map; a divergence between this walk and emit's
+/// would surface as a hard panic (not a silent wrong-frame deopt), and the
+/// golden decodes the blob to catch a subtler slip.
+///
+/// Every `VReg` resolves via [`scopes::resolve_frame_loc`]: S12's spill-all
+/// invariant puts every value live across a safepoint in its canonical
+/// frame slot, and a value NOT live there is dead → `Nil` (safe — never
+/// read before being overwritten). One scope record PER SITE (undeduped):
+/// linear-scan assigns a spill slot per interval, so a multi-def temp has
+/// no single canonical slot; resolving at each site's own position is
+/// unambiguous. `method_pool_ix` is a `0` placeholder until materialization
+/// (step 6) interns the compile-time method oop — leaving the pool
+/// untouched keeps existing listing goldens byte-stable.
+fn build_deopt_metadata(
+    ir_method: &ir::IrMethod,
+    regalloc_result: &regalloc::RegallocResult,
+    safepoint_pcs: &[emit::SafepointPc],
+) -> (Vec<u8>, Vec<crate::compiler::scopes::PcDesc>) {
+    use crate::compiler::scopes::{
+        resolve_frame_loc, CtxLoc, SafepointState, ScopeDescData, ScopeDescRecorder,
+    };
+
+    let sp_by_pos: std::collections::HashMap<u32, &emit::SafepointPc> =
+        safepoint_pcs.iter().map(|sp| (sp.position, sp)).collect();
+
+    let intervals = &regalloc_result.intervals;
+    let n_slots = ir_method.argc as usize + ir_method.ntemps as usize;
+    let mut rec = ScopeDescRecorder::new();
+    let mut pos = 0u32;
+    for &bid in &regalloc_result.block_order {
+        let block = &ir_method.blocks[bid.0 as usize];
+        for (idx, _ir) in block.code.iter().enumerate() {
+            if let Some((_, raw)) = block.deopt_sites.iter().find(|(ci, _)| *ci == idx as u32) {
+                let sp = sp_by_pos.get(&pos).unwrap_or_else(|| {
+                    panic!(
+                        "build_deopt_metadata: deopt site at position {pos} has no emitted \
+                         safepoint -- emit/regalloc position numbering diverged"
+                    )
+                });
+                let position = sp.position; // == pos (map is keyed by it)
+                let receiver = resolve_frame_loc(ir::VReg(0), position, intervals);
+                let slots = (0..n_slots)
+                    .map(|i| resolve_frame_loc(ir::VReg(i as u32 + 1), position, intervals))
+                    .collect();
+                let scope = rec.begin_scope(ScopeDescData {
+                    method_pool_ix: 0,
+                    is_block: false,
+                    sender: None,
+                    receiver,
+                    slots,
+                    ctx: CtxLoc::None,
+                });
+                let stack = raw
+                    .stack
+                    .iter()
+                    .map(|&v| resolve_frame_loc(v, position, intervals))
+                    .collect();
+                rec.record_site(
+                    sp.pc_off,
+                    SafepointState {
+                        scope,
+                        bci: raw.bci as u16,
+                        kind: raw.kind,
+                        reexecute: raw.reexecute,
+                        stack,
+                    },
+                );
+            }
+            pos += 1;
+        }
+    }
+    rec.pack()
 }
 
 #[cfg(test)]
@@ -786,5 +874,121 @@ mod tests {
             Some(id)
         );
         assert!(!method.compile_disabled());
+    }
+
+    /// S13 step 3b golden: the full deopt-metadata pipeline — capture
+    /// (`ir.rs::translate_instr`) → correlate + resolve + pack
+    /// (`build_deopt_metadata`) → decode — on a method with a NON-EMPTY
+    /// operand stack live across a safepoint, so all three `ValueLoc`
+    /// dimensions (receiver, arg/temp slots, operand stack) are exercised
+    /// against REAL regalloc output, not hand-faked intervals.
+    ///
+    /// `foo: a [ ^self box: (self bar) with: a ]`: at the inner `self bar`
+    /// send, the OUTER `self` (the box:with: receiver) is still on the
+    /// operand stack, and both `self` (used again as the box:with: receiver)
+    /// and `a` (its second arg) are live across it — S12 spill-all forces
+    /// all three to canonical frame slots, and the decoded scope must name
+    /// exactly those. Both sends are generic `CallSend`s (Call,
+    /// reexecute=false). Driven through decode/convert/regalloc/emit
+    /// directly (not `compile_method`, whose eligibility gate rejects
+    /// generic non-smi sends) so the recorder runs on this exact shape.
+    #[test]
+    fn deopt_scope_blob_records_real_valuelocs() {
+        use crate::compiler::scopes::{decode_scope, decode_site, SafepointKind, ValueLoc};
+        use ir::VReg;
+
+        let mut vm = test_vm();
+        let bar_sel = vm.universe.intern(b"bar");
+        let box_sel = vm.universe.intern(b"box:with:");
+        let foo_sel = vm.universe.intern(b"foo:");
+
+        let mut b = BytecodeBuilder::new();
+        b.push_self(); // box:with: receiver
+        b.push_self(); // bar receiver
+        b.send(&mut vm, bar_sel, 0); // (self bar)                    <- SITE 0
+        b.push_temp(0); // the arg `a`
+        b.send(&mut vm, box_sel, 2); // self box: (self bar) with: a  <- SITE 1
+        b.ret_tos();
+        let method = b.finish(&mut vm, foo_sel, 1, 0);
+
+        let cfg = decode::decode(method);
+        let ir_method = ir::convert(&vm, method, &cfg);
+        let ra = regalloc::regalloc(&ir_method);
+
+        let mut asm = JasmAssembler::new();
+        let (_blob, _pcs, _ve, _ic, safepoint_pcs) =
+            emit::emit(&mut asm, &ir_method, &ra, 0, 0, 0, None);
+        assert_eq!(
+            safepoint_pcs.len(),
+            2,
+            "two generic sends -> two safepoints"
+        );
+
+        let (blob, pcdescs) = build_deopt_metadata(&ir_method, &ra, &safepoint_pcs);
+        assert_eq!(
+            pcdescs.len(),
+            2,
+            "two deopt sites recorded (both main CallSends)"
+        );
+
+        // Expected FrameSlot for a vreg at a position, straight from
+        // regalloc's own assignment — proves `resolve_frame_loc` read the
+        // real slot, not a coincidence (same technique as the resolver
+        // golden in it_tier1.rs).
+        let expect_slot = |vreg: VReg, pos: u32| -> ValueLoc {
+            let iv = ra
+                .intervals
+                .iter()
+                .find(|iv| iv.vreg == vreg && iv.start <= pos && iv.end > pos)
+                .unwrap_or_else(|| panic!("{vreg:?} must be live across position {pos}"));
+            match iv.assignment {
+                Some(regalloc::Assignment::Spill(slot)) => {
+                    ValueLoc::FrameSlot(-8 * (slot.0 as i32 + 1))
+                }
+                other => panic!(
+                    "S12 spill-all: {vreg:?} must be SPILLED across a safepoint, got {other:?}"
+                ),
+            }
+        };
+
+        // The `self bar` safepoint is emitted first -> lower return-address
+        // offset -> pcdescs[0] (pack sorts by code_off); its position is
+        // `safepoint_positions[0]` in the same numbering.
+        let p0 = ra.safepoint_positions[0];
+        let site0 = decode_site(&blob, pcdescs[0].site_off);
+        assert_eq!(site0.kind, SafepointKind::Call);
+        assert!(!site0.reexecute, "a call-return site is never reexecute");
+        assert_eq!(
+            site0.stack,
+            vec![expect_slot(VReg(0), p0)],
+            "the box:with: receiver `self` is live on the operand stack across `self bar`"
+        );
+
+        let scope0 = decode_scope(&blob, site0.scope_off);
+        assert_eq!(
+            scope0.receiver,
+            expect_slot(VReg(0), p0),
+            "self live-across"
+        );
+        assert_eq!(
+            scope0.slots,
+            vec![expect_slot(VReg(1), p0)],
+            "the arg `a` (VReg 1), used again at the box:with: send, is a frame slot"
+        );
+        assert_eq!(
+            scope0.method_pool_ix, 0,
+            "3b placeholder until step 6 materialization interns the method oop"
+        );
+        assert_eq!(scope0.sender, None, "S13 emits depth-1 chains only");
+
+        // The outer `self box:with:` safepoint: receiver + both args popped,
+        // so nothing is left on the operand stack below it.
+        let site1 = decode_site(&blob, pcdescs[1].site_off);
+        assert_eq!(site1.kind, SafepointKind::Call);
+        assert!(!site1.reexecute);
+        assert!(
+            site1.stack.is_empty(),
+            "box:with: pops receiver + 2 args -> empty stack below"
+        );
     }
 }

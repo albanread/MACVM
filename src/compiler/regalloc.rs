@@ -466,6 +466,7 @@ mod tests {
                 Ir::Ret { val: v0 }, // pos 9: use
             ],
             entry_stack: Vec::new(),
+            deopt_sites: Vec::new(),
         };
         let method = hand_method(
             vec![block],
@@ -495,12 +496,14 @@ mod tests {
                 Ir::Jump { target: BlockId(1) },
             ],
             entry_stack: Vec::new(),
+            deopt_sites: Vec::new(),
         };
         let block1 = IrBlock {
             id: BlockId(1),
             bci: 10,
             code: vec![Ir::ConstSmi { dst: v0, value: 2 }, Ir::Ret { val: v0 }],
             entry_stack: Vec::new(),
+            deopt_sites: Vec::new(),
         };
         let method = hand_method(vec![block0, block1], vec![VRegInfo { is_oop: true }]);
 
@@ -536,6 +539,7 @@ mod tests {
                 Ir::Ret { val: v0 },
             ],
             entry_stack: Vec::new(),
+            deopt_sites: Vec::new(),
         };
         let method = hand_method(vec![block], vec![VRegInfo { is_oop: true }]);
 
@@ -684,6 +688,7 @@ mod tests {
             bci: 0,
             code: vec![Ir::RetSelf],
             entry_stack: Vec::new(),
+            deopt_sites: Vec::new(),
         };
         let dead = IrBlock {
             id: BlockId(1),
@@ -692,6 +697,7 @@ mod tests {
                 reason: BailoutReason::SmiOpFailed,
             }],
             entry_stack: Vec::new(),
+            deopt_sites: Vec::new(),
         };
         let method = hand_method(vec![block0, dead], Vec::new());
         let (order, _intervals, _safepoints) = compute_intervals(&method);
@@ -757,6 +763,7 @@ mod tests {
                 Ir::Jump { target: BlockId(1) },
             ],
             entry_stack: Vec::new(),
+            deopt_sites: Vec::new(),
         };
         let header = IrBlock {
             id: BlockId(1),
@@ -770,6 +777,7 @@ mod tests {
                 fail: BlockId(4),
             }],
             entry_stack: Vec::new(),
+            deopt_sites: Vec::new(),
         };
         let body = IrBlock {
             id: BlockId(2),
@@ -795,6 +803,7 @@ mod tests {
                 Ir::Jump { target: BlockId(1) }, // the back edge
             ],
             entry_stack: Vec::new(),
+            deopt_sites: Vec::new(),
         };
         let exit = IrBlock {
             id: BlockId(3),
@@ -807,6 +816,7 @@ mod tests {
                 Ir::Ret { val: result },
             ],
             entry_stack: Vec::new(),
+            deopt_sites: Vec::new(),
         };
         let bailout = IrBlock {
             id: BlockId(4),
@@ -815,6 +825,7 @@ mod tests {
                 reason: BailoutReason::SmiOpFailed,
             }],
             entry_stack: Vec::new(),
+            deopt_sites: Vec::new(),
         };
 
         let method = hand_method(

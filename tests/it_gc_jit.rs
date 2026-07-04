@@ -375,6 +375,7 @@ fn compiled_mono_caller_guard_keeps_key_klass_alive() {
             Ir::Ret { val: VReg(1) },
         ],
         entry_stack: Vec::new(),
+        deopt_sites: Vec::new(),
     };
     let call_hot_method_ir = IrMethod {
         blocks: vec![block0],
@@ -711,6 +712,7 @@ fn mid_loop_forced_scavenge() {
                 Ir::Jump { target: BlockId(1) },
             ],
             entry_stack: Vec::new(),
+            deopt_sites: Vec::new(),
         },
         IrBlock {
             id: BlockId(1),
@@ -724,6 +726,7 @@ fn mid_loop_forced_scavenge() {
                 fail: BlockId(4),
             }],
             entry_stack: Vec::new(),
+            deopt_sites: Vec::new(),
         },
         IrBlock {
             id: BlockId(2),
@@ -748,12 +751,14 @@ fn mid_loop_forced_scavenge() {
                 Ir::Jump { target: BlockId(1) },
             ],
             entry_stack: Vec::new(),
+            deopt_sites: Vec::new(),
         },
         IrBlock {
             id: BlockId(3),
             bci: 3,
             code: vec![Ir::Ret { val: VReg(0) }],
             entry_stack: Vec::new(),
+            deopt_sites: Vec::new(),
         },
         IrBlock {
             id: BlockId(4),
@@ -762,6 +767,7 @@ fn mid_loop_forced_scavenge() {
                 reason: BailoutReason::SmiOpFailed,
             }],
             entry_stack: Vec::new(),
+            deopt_sites: Vec::new(),
         },
     ];
     let call_sites = vec![CallSiteInfo {
@@ -934,6 +940,7 @@ fn mid_loop_alloc_edge_forced_scavenge() {
                 Ir::Jump { target: BlockId(1) },
             ],
             entry_stack: Vec::new(),
+            deopt_sites: Vec::new(),
         },
         IrBlock {
             id: BlockId(1),
@@ -947,6 +954,7 @@ fn mid_loop_alloc_edge_forced_scavenge() {
                 fail: BlockId(4),
             }],
             entry_stack: Vec::new(),
+            deopt_sites: Vec::new(),
         },
         IrBlock {
             id: BlockId(2),
@@ -971,12 +979,14 @@ fn mid_loop_alloc_edge_forced_scavenge() {
                 Ir::Jump { target: BlockId(1) },
             ],
             entry_stack: Vec::new(),
+            deopt_sites: Vec::new(),
         },
         IrBlock {
             id: BlockId(3),
             bci: 3,
             code: vec![Ir::Ret { val: VReg(0) }],
             entry_stack: Vec::new(),
+            deopt_sites: Vec::new(),
         },
         IrBlock {
             id: BlockId(4),
@@ -985,6 +995,7 @@ fn mid_loop_alloc_edge_forced_scavenge() {
                 reason: BailoutReason::SmiOpFailed,
             }],
             entry_stack: Vec::new(),
+            deopt_sites: Vec::new(),
         },
     ];
     let nm_id = install_loop_nmethod(

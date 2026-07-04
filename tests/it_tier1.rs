@@ -92,6 +92,7 @@ fn run_ir_raw() {
             },
         ],
         entry_stack: Vec::new(),
+        deopt_sites: Vec::new(),
     };
     let block1 = IrBlock {
         id: BlockId(1),
@@ -104,6 +105,7 @@ fn run_ir_raw() {
             Ir::Ret { val: VReg(5) },
         ],
         entry_stack: Vec::new(),
+        deopt_sites: Vec::new(),
     };
     let block2 = IrBlock {
         id: BlockId(2),
@@ -116,6 +118,7 @@ fn run_ir_raw() {
             Ir::Ret { val: VReg(6) },
         ],
         entry_stack: Vec::new(),
+        deopt_sites: Vec::new(),
     };
     let block3 = IrBlock {
         id: BlockId(3),
@@ -124,6 +127,7 @@ fn run_ir_raw() {
             reason: BailoutReason::SmiOpFailed,
         }],
         entry_stack: Vec::new(),
+        deopt_sites: Vec::new(),
     };
 
     let method = IrMethod {
@@ -235,6 +239,7 @@ fn mul_method() -> IrMethod {
             Ir::Ret { val: VReg(3) },
         ],
         entry_stack: Vec::new(),
+        deopt_sites: Vec::new(),
     };
     let block1 = IrBlock {
         id: BlockId(1),
@@ -243,6 +248,7 @@ fn mul_method() -> IrMethod {
             reason: BailoutReason::SmiOpFailed,
         }],
         entry_stack: Vec::new(),
+        deopt_sites: Vec::new(),
     };
     IrMethod {
         blocks: vec![block0, block1],
@@ -350,6 +356,7 @@ fn run_ir_raw_forces_spill() {
         bci: 0,
         code,
         entry_stack: Vec::new(),
+        deopt_sites: Vec::new(),
     };
     let block1 = IrBlock {
         id: bailout,
@@ -358,6 +365,7 @@ fn run_ir_raw_forces_spill() {
             reason: BailoutReason::SmiOpFailed,
         }],
         entry_stack: Vec::new(),
+        deopt_sites: Vec::new(),
     };
     let method = IrMethod {
         blocks: vec![block0, block1],
@@ -1471,6 +1479,7 @@ fn mono_resolve_patches_call_site_and_dispatches() {
             Ir::Ret { val: VReg(3) },
         ],
         entry_stack: Vec::new(),
+        deopt_sites: Vec::new(),
     };
     let caller_method = IrMethod {
         blocks: vec![block0],
@@ -1627,6 +1636,7 @@ fn build_c2i_scenario(vm: &mut VmState) -> (u64, KlassOop, NmethodId) {
             Ir::Ret { val: VReg(3) },
         ],
         entry_stack: Vec::new(),
+        deopt_sites: Vec::new(),
     };
     let caller_method = IrMethod {
         blocks: vec![block0],
@@ -1847,6 +1857,7 @@ fn full_ic_lattice_mono_to_pic_to_mega() {
             Ir::Ret { val: VReg(1) },
         ],
         entry_stack: Vec::new(),
+        deopt_sites: Vec::new(),
     };
     let caller_method = IrMethod {
         blocks: vec![block0],
@@ -2061,6 +2072,7 @@ fn dnu_from_compiled_code_reaches_does_not_understand() {
             Ir::Ret { val: VReg(1) },
         ],
         entry_stack: Vec::new(),
+        deopt_sites: Vec::new(),
     };
     let caller_method = IrMethod {
         blocks: vec![block0],

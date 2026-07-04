@@ -16,6 +16,7 @@ use std::collections::HashMap;
 use crate::bytecode::opcode::{decode_at, Instr};
 use crate::compiler::assembler::RelocKind;
 use crate::compiler::decode::{BlockIndex, Cfg, Terminator};
+use crate::compiler::scopes::SafepointKind;
 use crate::interpreter::ic::InterpreterIc;
 use crate::oops::layout::BODY_OFFSET;
 use crate::oops::wrappers::{KlassOop, MethodOop, SymbolOop};
@@ -309,6 +310,36 @@ pub struct IrBlock {
     pub code: Vec<Ir>,
     /// Merge vregs (D3.3) this block's predecessor(s) must feed on entry.
     pub entry_stack: Vec<VReg>,
+    /// S13 step 3b: the deopt safepoints WITHIN this block, keyed by the
+    /// `code` index of the op that emits the safepoint (a `CallSend`/`Alloc`)
+    /// — the converter records one here for each of the 3 clean safepoint
+    /// sites (main + super `CallSend`, `Alloc`), carrying the abstract
+    /// operand stack captured at that point plus its bci/kind/reexecute.
+    /// `driver.rs` re-walks `block_order` to correlate each entry's op
+    /// position with the emitted [`crate::compiler::emit::SafepointPc`]
+    /// (hence its return-address `pc_off`) and resolves every `VReg` to a
+    /// [`crate::compiler::scopes::ValueLoc`]. The synthesized smi-fallback /
+    /// not-boolean blocks record NONE (their safepoints can't deopt until
+    /// step 7), so this is empty for them — every safepoint-emitting op
+    /// without an entry here is simply skipped by the driver.
+    pub deopt_sites: Vec<(u32, DeoptRaw)>,
+}
+
+/// S13 step 3b: one deopt-recordable safepoint, as the converter sees it —
+/// the abstract operand stack (`stack`, a list of live `VReg`s below the
+/// safepoint), the resume `bci`, its [`SafepointKind`], and `reexecute`
+/// (THE source of truth for stack height: `false` = a call-return site
+/// whose recorded stack excludes the popped receiver+args and the
+/// materializer pushes the result; `true` = re-execute at `bci` with all
+/// inputs still on the recorded stack). `driver.rs` maps each `VReg` to a
+/// [`crate::compiler::scopes::ValueLoc`] via `resolve_frame_loc` once the
+/// regalloc position is known.
+#[derive(Clone, Debug)]
+pub struct DeoptRaw {
+    pub stack: Vec<VReg>,
+    pub bci: usize,
+    pub kind: SafepointKind,
+    pub reexecute: bool,
 }
 
 pub struct IrMethod {
@@ -701,6 +732,11 @@ impl<'a> Translator<'a> {
                 },
             ],
             entry_stack: Vec::new(),
+            // The synthesized smi-fallback / not-boolean blocks record no
+            // deopt sites in v1 (S13 step 3b): their CallSend/CallRuntime
+            // safepoints can't deopt until step 7 turns them into real trap
+            // clients, so the driver simply finds nothing to attach here.
+            deopt_sites: Vec::new(),
         });
         (fail_id, continuation_id)
     }
@@ -735,6 +771,11 @@ impl<'a> Translator<'a> {
                 },
             ],
             entry_stack: Vec::new(),
+            // The synthesized smi-fallback / not-boolean blocks record no
+            // deopt sites in v1 (S13 step 3b): their CallSend/CallRuntime
+            // safepoints can't deopt until step 7 turns them into real trap
+            // clients, so the driver simply finds nothing to attach here.
+            deopt_sites: Vec::new(),
         });
         not_bool_id
     }
@@ -778,6 +819,11 @@ impl<'a> Translator<'a> {
                 },
             ],
             entry_stack: Vec::new(),
+            // The synthesized smi-fallback / not-boolean blocks record no
+            // deopt sites in v1 (S13 step 3b): their CallSend/CallRuntime
+            // safepoints can't deopt until step 7 turns them into real trap
+            // clients, so the driver simply finds nothing to attach here.
+            deopt_sites: Vec::new(),
         });
         fail_id
     }
@@ -871,6 +917,7 @@ impl<'a> Translator<'a> {
         bci: usize,
         stack: &mut Vec<VReg>,
         code: &mut Vec<Ir>,
+        deopt: &mut Vec<(u32, DeoptRaw)>,
         pending_cmp: &mut Option<(CmpOp, VReg, VReg, u16)>,
     ) -> Option<BlockId> {
         let mut split: Option<BlockId> = None;
@@ -1001,6 +1048,22 @@ impl<'a> Translator<'a> {
                 });
 
                 let dst = self.fresh(true);
+                // S13 step 3b: a call-return safepoint (reexecute=false). The
+                // receiver+args are already popped and `dst` is not yet
+                // pushed, so `stack` is exactly the operand stack the deopt
+                // materializer restores BELOW the send; it pushes the
+                // incoming result itself. `code.len()` is the index the
+                // CallSend is about to occupy (driver correlates it to the
+                // emitted return-address safepoint).
+                deopt.push((
+                    code.len() as u32,
+                    DeoptRaw {
+                        stack: stack.clone(),
+                        bci,
+                        kind: SafepointKind::Call,
+                        reexecute: false,
+                    },
+                ));
                 code.push(Ir::CallSend { dst, site, args });
                 stack.push(dst);
             }
@@ -1060,9 +1123,24 @@ impl<'a> Translator<'a> {
                 // top-of-stack is an arg simply returns `None` here.
                 if let Some(receiver) = stack.last().copied() {
                     if let Some((klass, size_words)) = self.alloc_site_klass(ic, receiver) {
+                        // S13 step 3b: an `Alloc` deopts by RE-EXECUTING the
+                        // `basicNew` send in the interpreter (reexecute=true),
+                        // so its recorded stack must still carry the receiver
+                        // (the class const) that the send consumes — capture
+                        // BEFORE the pop below.
+                        let deopt_stack = stack.clone();
                         stack.pop(); // consume the receiver
                         let klass_lit = self.pool.intern(klass.oop().raw(), Some(RelocKind::Oop));
                         let dst = self.fresh(true);
+                        deopt.push((
+                            code.len() as u32,
+                            DeoptRaw {
+                                stack: deopt_stack,
+                                bci,
+                                kind: SafepointKind::Alloc,
+                                reexecute: true,
+                            },
+                        ));
                         code.push(Ir::Alloc {
                             dst,
                             klass: klass_lit,
@@ -1091,6 +1169,19 @@ impl<'a> Translator<'a> {
                 });
 
                 let dst = self.fresh(true);
+                // S13 step 3b: call-return safepoint (reexecute=false), same
+                // convention as the `send_super` site above — recorded stack
+                // is the frame BELOW the send, result pushed by the deopt
+                // materializer.
+                deopt.push((
+                    code.len() as u32,
+                    DeoptRaw {
+                        stack: stack.clone(),
+                        bci,
+                        kind: SafepointKind::Call,
+                        reexecute: false,
+                    },
+                ));
                 code.push(Ir::CallSend { dst, site, args });
                 stack.push(dst);
             }
@@ -1275,6 +1366,12 @@ pub fn convert(vm: &VmState, method: MethodOop, cfg: &Cfg) -> IrMethod {
         };
 
         let mut code = Vec::new();
+        // S13 step 3b: deopt sites accumulate alongside `code`, keyed by the
+        // op's index in THIS code vec — `std::mem::take`n into the finished
+        // IrBlock in lockstep with `code` at every split/finish so the
+        // indices stay valid against the vec they name (a split resets both
+        // to empty, and the continuation's own ops renumber from 0).
+        let mut deopt: Vec<(u32, DeoptRaw)> = Vec::new();
         if b == 0 {
             code.push(Ir::Param {
                 dst: self_vreg,
@@ -1327,6 +1424,7 @@ pub fn convert(vm: &VmState, method: MethodOop, cfg: &Cfg) -> IrMethod {
                 bci,
                 &mut stack,
                 &mut code,
+                &mut deopt,
                 &mut pending_cmp,
             );
             if let Some(continuation_id) = split {
@@ -1342,6 +1440,7 @@ pub fn convert(vm: &VmState, method: MethodOop, cfg: &Cfg) -> IrMethod {
                     } else {
                         Vec::new() // a split-off continuation's own entry_stack is never consulted (only real merge points are)
                     },
+                    deopt_sites: std::mem::take(&mut deopt),
                 });
                 cur_id = continuation_id;
                 cur_bci = next;
@@ -1415,6 +1514,7 @@ pub fn convert(vm: &VmState, method: MethodOop, cfg: &Cfg) -> IrMethod {
             } else {
                 Vec::new()
             },
+            deopt_sites: deopt,
         });
     }
 
