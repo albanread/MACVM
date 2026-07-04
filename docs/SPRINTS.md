@@ -299,9 +299,20 @@ interleaves with it; every wave lands with in-language tests.
 - **S17 Green processes + scheduler** (§11); `Processor yield`, delays.
 - **S18 Exceptions** — ANSI `Exception` hierarchy over NLR/ensure.
 - **S19 Splitting & advanced opts** — Self-style splitting, better regalloc.
-- **S20 Guest-language Cocoa bridge** — Smalltalk code sending messages to
-  Cocoa objects via `objc_msgSend` (the MacModula2 pattern). Distinct from the
-  Phase G GUI shell, which is Rust-side `objc2` and needs none of this.
+- **S20 Guest-language Cocoa + POSIX/BSD bridge** — Smalltalk code sending
+  messages to Cocoa objects via `objc_msgSend` (the MacModula2 pattern) and
+  calling curated libc functions directly, both ABI-driven by `cocoa_data`
+  (a sibling repo's shared SQLite mirror of the macOS Obj-C + POSIX surface).
+  Full design in [`docs/FFI.md`](FFI.md) (written as a non-disruptive side
+  track, alongside but independent of S11–S14): two tiers (dynamic
+  `doesNotUnderstand:`-based Cocoa dispatch reusing S11's PIC machinery for
+  caching; a direct compiler-primitive path for POSIX calls), an `Alien`-style
+  byte-array-backed representation reusing existing `IndexableBytes`
+  primitives, and a working, tested offline generator crate (`ffi_gen`,
+  already built) that emits real `.mst` bindings — forward-declared against a
+  VM-side primitive this sprint still has to build. Distinct from the Phase G
+  GUI shell, which is Rust-side hand-rolled `dlopen`/`objc_msgSend`
+  (`gui/src/objc.rs`) and needs none of this.
 - **S21 Mixins** — Strongtalk's mixin model on the reserved klass slot.
 - **S22 Weak refs + finalization; weak symbol table.**
 

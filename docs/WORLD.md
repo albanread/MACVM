@@ -184,7 +184,9 @@ shims (SUnitNameResolver etc.) exactly as upstream intended.
   primitives** (`{{<libc ExternalProxy read/write/…>}}`,
   UnixFileDescriptor.dlt:75-149). MACVM's minimal tool surface for now:
   Transcript write, `millisecondClockValue` (both in SPEC §10). When
-  in-image files matter: ~10 primitives or the Alien route (APPS.md §FFI).
+  in-image files matter: ~10 primitives or the Alien route — designed in
+  [`docs/FFI.md`](FFI.md) (S20, extended to POSIX/BSD via `cocoa_data`), not
+  built yet.
 - **Benchmarks** (feeds S15): Richards = 13 classes/1.0 KLOC
   (RichardsBenchmarks.dlt + RB* support), DeltaBlue = 12 classes/1.5 KLOC
   (Planner.dlt etc.), Stanford micro-suite ≈29 benchmarks with a

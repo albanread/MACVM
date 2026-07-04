@@ -1,0 +1,21 @@
+[package]
+name = "ffi_gen"
+version = "0.0.0"
+edition = "2021"
+description = "Offline generator: curated Cocoa/POSIX bindings, emitted as real .mst Smalltalk, ABI-classified by querying a sibling repo's cocoa_data/cocoa.sqlite (docs/FFI.md, S20)."
+license = "BSD-2-Clause"
+publish = false
+
+[[bin]]
+name = "generate_ffi"
+path = "src/bin/generate_ffi.rs"
+
+[dependencies]
+# bundled: same reasoning as image_store's own choice — doesn't depend on
+# whatever libsqlite3 (if any) happens to be on a given machine. This crate
+# only ever opens cocoa.sqlite read-only; it never writes to it.
+rusqlite = { version = "0.31", features = ["bundled"] }
+# So generated .mst text can be round-trip-verified against the exact same
+# parser the real importer (image_store/src/bin/import_world.rs) uses —
+# generated bindings must be indistinguishable from hand-written ones.
+image_store = { path = "../image_store" }
