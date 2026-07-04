@@ -1,0 +1,11 @@
+[package]
+name = "macvm-mock-vm"
+version = "0.0.0"
+edition = "2021"
+description = "A hand-authored stand-in for the real macvm VM/mirror layer (docs/APPS.md), so the GUI's class browser view and GUI<->VM messaging protocol can be built and tested before core eval (S5/S6) and the mirror library (Phase W) exist. Not linked into the real VM; swap gui's dependency on this crate for macvm once VmHandle/mirrors are real."
+license = "BSD-2-Clause"
+publish = false
+
+[lib]
+name = "macvm_mock_vm"
+path = "src/lib.rs"

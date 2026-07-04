@@ -1,0 +1,373 @@
+//! The D-G4 HTML translator (`../PLAN.md` §3): rewrites the two Strongtalk
+//! HTML extensions in memory, at load time, so the original `.html` files
+//! under `reference/` stay byte-identical as a test corpus. Also injects the
+//! in-page toolbar/status-bar chrome (D-G1: those are HTML inside the web
+//! view, not native controls) and the `strongtalk.css`/`smtk.js` links.
+//!
+//! Scope note: ordinary internal cross-page links (`<a href="progenv2.html">`)
+//! are deliberately *not* rewritten here — `smtk.js` intercepts those
+//! generically at click time (any relative `.html` href), so this module
+//! only has to handle the two attributes that don't already mean anything
+//! to a browser: `doit=` and the unclosed `<smappl>` tag.
+
+use std::path::Path;
+
+/// The two visual themes the shell's native Theme menu can switch between
+/// (`main.rs::build_theme_menu`). Both themes reuse the exact same class
+/// names (`.st-toolbar`, `.st-raised`, `.st-lowered`, `.st-transcript`,
+/// `.st-statusbar`, `.st-field`, `.smappl`, `.st-outliner`, …) — see
+/// `assets/hidef.css`'s own doc comment — so switching is just "load a
+/// different stylesheet and a different icon set," never a template change.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Theme {
+    /// The period-accurate Strongtalk (1996) look — `../PLAN.md` §2.
+    Classic,
+    /// A modern flat theme: system fonts, vector icons, no bevels — added
+    /// because the pixel-art/Win95 chrome is true to the original but reads
+    /// as dated for extended use; same layout and semantics, just restyled.
+    HiDef,
+}
+
+impl Theme {
+    fn stylesheet_relative_path(self) -> &'static str {
+        match self {
+            Theme::Classic => "assets/strongtalk.css",
+            Theme::HiDef => "assets/hidef.css",
+        }
+    }
+
+    fn icon_url(self, icon: &str) -> String {
+        match self {
+            Theme::Classic => gui_file_url(&format!("reference/icons-png/{icon}.png")),
+            Theme::HiDef => gui_file_url(&format!("assets/icons-hidef/{icon}.svg")),
+        }
+    }
+}
+
+/// Absolute `file://` URL for a path under the `gui/` crate root
+/// (`CARGO_MANIFEST_DIR`, baked in at build time — fine for a dev/test
+/// shell run via `cargo run`; revisit if this ever ships as an app bundle).
+fn gui_file_url(relative: &str) -> String {
+    let root = env!("CARGO_MANIFEST_DIR");
+    format!("file://{root}/{relative}")
+}
+
+/// Rewrite `<a doit="CODE">` → `<a class="doit" href="javascript:void(0)"
+/// data-code="ESCAPED">`, preserving the link's own text content and
+/// everything else about the tag (in the corpus, `doit=` is always the only
+/// attribute, so there's nothing else to carry over). Handles multi-line
+/// `doit="..."` values (none observed in the corpus, but the scan is the
+/// same either way).
+fn rewrite_doit_links(html: &str) -> String {
+    let needle = "<a doit=\"";
+    let mut out = String::with_capacity(html.len());
+    let mut rest = html;
+    loop {
+        let Some(tag_start) = rest.find(needle) else {
+            out.push_str(rest);
+            break;
+        };
+        out.push_str(&rest[..tag_start]);
+        let code_start = tag_start + needle.len();
+        let Some(code_end_rel) = rest[code_start..].find('"') else {
+            out.push_str(&rest[tag_start..]);
+            break;
+        };
+        let code = &rest[code_start..code_start + code_end_rel];
+        out.push_str(&format!(
+            "<a class=\"doit\" href=\"javascript:void(0)\" data-code=\"{}\"",
+            html_escape_attr(code)
+        ));
+        // Leave the tag's closing `>` (and everything after) for the next
+        // iteration's plain copy — mirrors the closing-`>` handling in
+        // rewrite_smappl_placeholders below.
+        rest = &rest[code_start + code_end_rel + 1..];
+    }
+    out
+}
+
+/// Rewrite `<smappl visual="CODE">` (no closing tag in the corpus — see
+/// this module's doc comment) → a self-contained, styled placeholder
+/// `<span>` naming the code, per G0's scope ("smappl placeholder =
+/// lowered-bevel box naming its code" — `../PLAN.md` §G0). G2 replaces this
+/// with a real server-rendered fragment (D-G5); this function only needs to
+/// exist until then.
+fn rewrite_smappl_placeholders(html: &str) -> String {
+    let mut out = String::with_capacity(html.len());
+    let mut rest = html;
+    loop {
+        let Some(tag_start) = rest.find("<smappl") else {
+            out.push_str(rest);
+            break;
+        };
+        out.push_str(&rest[..tag_start]);
+        let after_tag_name = &rest[tag_start..];
+        let Some(attr_start) = after_tag_name.find("visual=\"") else {
+            // Malformed/unexpected shape — leave it alone rather than guess.
+            out.push_str("<smappl");
+            rest = &after_tag_name[7..];
+            continue;
+        };
+        let code_start = attr_start + "visual=\"".len();
+        let Some(code_end_rel) = after_tag_name[code_start..].find('"') else {
+            out.push_str(&after_tag_name[..code_start]);
+            rest = &after_tag_name[code_start..];
+            continue;
+        };
+        let code = &after_tag_name[code_start..code_start + code_end_rel];
+        let after_close_quote = &after_tag_name[code_start + code_end_rel + 1..];
+        let Some(tag_end_rel) = after_close_quote.find('>') else {
+            // No closing `>` found — bail out on the rest untouched.
+            out.push_str(&after_tag_name[..code_start + code_end_rel + 1]);
+            rest = after_close_quote;
+            continue;
+        };
+
+        // Collapsed for both the attribute and the visible text: this is a
+        // G0 placeholder only (D-G5's real server-rendered fragment lands
+        // in G2), so raw source whitespace fidelity doesn't matter, and a
+        // single-line attribute value is simpler to read/debug either way.
+        let collapsed = code.split_whitespace().collect::<Vec<_>>().join(" ");
+        out.push_str(&format!(
+            "<span class=\"smappl\" data-code=\"{}\">{}</span>",
+            html_escape_attr(&collapsed),
+            html_escape_text(&collapsed)
+        ));
+        rest = &after_close_quote[tag_end_rel + 1..];
+    }
+    out
+}
+
+fn html_escape_attr(s: &str) -> String {
+    s.replace('&', "&amp;").replace('"', "&quot;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
+fn html_escape_text(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
+/// The nine Launcher toolbar buttons (`../PLAN.md` §1) plus back/forward/home
+/// navigation (§G0: "back/forward/home navigation works" — the three icons
+/// exist in the set but aren't part of the documented nine, so they're
+/// placed first as a judgment call, not a source-anchored fact; see
+/// `../PLAN.md` §5 if this needs revisiting).
+const TOOLBAR_BUTTONS: &[(&str, &str, &str)] = &[
+    ("goBack", "goBack", "Back"),
+    ("goForward", "goForward", "Forward"),
+    ("home", "home", "Start page"),
+    ("open", "find", "Find definition"),
+    ("implementors", "implementors", "Implementors"),
+    ("senders", "senders", "Senders"),
+    ("userHierarchy", "userHierarchy", "User hierarchy"),
+    ("hierarchy", "hierarchy", "Full hierarchy"),
+    ("blankSheet", "workspace", "Workspace"),
+    ("texteditor", "editor", "Text editor"),
+    ("documentation", "documentation", "Documentation"),
+    // G5 polish items (`../PLAN.md` §4 G5) — not part of the documented
+    // nine either, same judgment call as goBack/goForward/home above.
+    ("refresh", "refresh", "Refresh"),
+    ("smallerText", "smallerText", "Smaller text"),
+    ("biggerText", "biggerText", "Bigger text"),
+];
+
+fn toolbar_html(theme: Theme) -> String {
+    let buttons: String = TOOLBAR_BUTTONS
+        .iter()
+        .map(|(icon, action, title)| {
+            let icon_url = theme.icon_url(icon);
+            format!(
+                "<button class=\"st-toolbtn\" data-action=\"{action}\" title=\"{title}\">\
+                 <img src=\"{icon_url}\" alt=\"{title}\"></button>"
+            )
+        })
+        .collect();
+    format!("<div class=\"st-toolbar st-raised\" id=\"macvm-toolbar\">{buttons}</div>")
+}
+
+/// `transcript` is the persisted history (`main.rs`'s `TRANSCRIPT`, appended
+/// to by `append_transcript` on every `VmResponse::Transcript`) — every
+/// freshly-built page starts the transcript pane showing real history
+/// instead of always resetting to a blank "Ready." greeting, which used to
+/// make any navigation (even just a theme switch) silently erase it.
+fn statusbar_html(transcript: &str) -> String {
+    format!(
+        "<div class=\"st-transcript st-lowered\" id=\"macvm-transcript\" style=\"height: 72px\">{}</div>\
+         <div class=\"st-statusbar st-raised\"><span class=\"st-field\" id=\"macvm-status\">Ready</span></div>",
+        html_escape_text(transcript)
+    )
+}
+
+/// A `<base href>` for `dir` (with the trailing slash `<base>` needs to be
+/// treated as a directory, not a file). Required because the rendered HTML
+/// is loaded from `gui/.rendered/current.html` (see `main.rs::navigate_to`
+/// for why: `loadFileURL:allowingReadAccessToURL:` needs a real file to
+/// load, and a single wide read-access grant is much simpler than one
+/// scoped per page directory) — without this, the *page's own* relative
+/// links/images would resolve against `.rendered/` instead of wherever the
+/// original file actually lives.
+fn base_href_tag(dir: &Path) -> String {
+    format!("<base href=\"file://{}/\">", dir.display())
+}
+
+/// The `zoom` CSS property (non-standard, but WebKit implements it fully —
+/// this shell only ever runs inside WKWebView) is the simplest way to scale
+/// a whole rendered page uniformly: text, images, and layout together, like
+/// a browser's page zoom. That's exactly what the G5 `biggerText`/
+/// `smallerText` toolbar buttons are for (`../PLAN.md` §4 G5), so there's no
+/// need to touch `strongtalk.css`/`hidef.css`'s own fixed-px sizes at all —
+/// one `<style>` override here covers both themes identically.
+fn font_scale_style(font_scale_percent: u32) -> String {
+    format!("<style>body {{ zoom: {font_scale_percent}%; }}</style>")
+}
+
+fn chrome_head_extra(original_dir: &Path, theme: Theme, font_scale_percent: u32) -> String {
+    // The `<meta charset>` matters even though the original corpus files
+    // don't declare one: none of them use non-ASCII bytes, so the gap was
+    // silent there, but this module's own injected/authored HTML (e.g. the
+    // documentation pages) uses UTF-8 punctuation (em dashes, arrows), and
+    // without an explicit charset WKWebView guessed a Latin-1-ish encoding
+    // and mangled it. Declaring UTF-8 here covers every loaded page.
+    format!(
+        "<meta charset=\"utf-8\">\n{}\n<link rel=\"stylesheet\" href=\"{}\">\n<script src=\"{}\"></script>\n{}",
+        base_href_tag(original_dir),
+        gui_file_url(theme.stylesheet_relative_path()),
+        gui_file_url("assets/smtk.js"),
+        font_scale_style(font_scale_percent),
+    )
+}
+
+/// Insert `extra` right before the first `</head>` (or, failing that,
+/// right before `<body`, for a page with no explicit head section).
+fn inject_before_head_close(html: &str, extra: &str) -> String {
+    if let Some(pos) = html.to_ascii_lowercase().find("</head>") {
+        format!("{}{}{}", &html[..pos], extra, &html[pos..])
+    } else if let Some(pos) = html.to_ascii_lowercase().find("<body") {
+        format!("{}{}{}", &html[..pos], extra, &html[pos..])
+    } else {
+        format!("{extra}{html}")
+    }
+}
+
+/// Insert `extra` right after the opening `<body...>` tag's `>`.
+fn inject_after_body_open(html: &str, extra: &str) -> String {
+    let lower = html.to_ascii_lowercase();
+    let Some(body_start) = lower.find("<body") else {
+        return format!("{extra}{html}");
+    };
+    let Some(tag_close_rel) = html[body_start..].find('>') else {
+        return format!("{extra}{html}");
+    };
+    let insert_at = body_start + tag_close_rel + 1;
+    format!("{}{}{}", &html[..insert_at], extra, &html[insert_at..])
+}
+
+/// Insert `extra` right before `</body>`.
+fn inject_before_body_close(html: &str, extra: &str) -> String {
+    if let Some(pos) = html.to_ascii_lowercase().find("</body>") {
+        format!("{}{}{}", &html[..pos], extra, &html[pos..])
+    } else {
+        format!("{html}{extra}")
+    }
+}
+
+/// Load `path`, apply the full D-G4 transform plus chrome injection, and
+/// return the resulting HTML string ready to be written to a scratch file
+/// (`gui/.rendered/current.html`, see `main.rs::navigate_to`) and loaded via
+/// `loadFileURL:allowingReadAccessToURL:`. Since the loaded file's own
+/// location is then `.rendered/`, not `path`'s directory, an injected
+/// `<base href="file://{path's parent}/">` (see `base_href_tag`) is what
+/// keeps the page's *own* relative links/images resolving exactly as they
+/// do for the original file — the chrome this function injects uses
+/// absolute `file://` URLs regardless (see `gui_file_url`), so it isn't
+/// affected either way.
+pub fn load_and_preprocess(path: &Path, theme: Theme, font_scale_percent: u32, transcript: &str) -> std::io::Result<String> {
+    let raw = std::fs::read_to_string(path)?;
+    let original_dir = path.parent().unwrap_or_else(|| Path::new("."));
+    Ok(preprocess_html(raw, original_dir, theme, font_scale_percent, transcript))
+}
+
+/// The chrome-injection half of [`load_and_preprocess`], factored out so
+/// Rust-generated pages (not loaded from a corpus file — e.g. the class
+/// browser view, `browser_render.rs`) get the exact same toolbar/status
+/// bar/theme/font-scale treatment as any corpus page, via
+/// [`render_generated_page`].
+fn preprocess_html(raw: String, original_dir: &Path, theme: Theme, font_scale_percent: u32, transcript: &str) -> String {
+    let mut html = raw;
+    html = rewrite_doit_links(&html);
+    html = rewrite_smappl_placeholders(&html);
+    html = inject_before_head_close(&html, &chrome_head_extra(original_dir, theme, font_scale_percent));
+    html = inject_after_body_open(&html, &toolbar_html(theme));
+    html = inject_before_body_close(&html, &statusbar_html(transcript));
+    html
+}
+
+/// Wrap `body_content` (already-built HTML, e.g. `browser_render`'s pane
+/// markup) in a minimal page skeleton and run it through the same D-G4
+/// preprocessing/chrome pipeline as a corpus page — for views the GUI
+/// generates itself rather than loads from `reference/pages/`. `base_dir`
+/// only matters if `body_content` has its own relative links/images (the
+/// browser view doesn't, today); pass [`gui_root`]-relative paths there if
+/// that ever changes. There's no original file whose relative links need
+/// preserving, so `base_dir` doubles as the `<base href>` target directly
+/// (contrast `load_and_preprocess`, where that's the corpus file's own
+/// parent directory).
+pub fn render_generated_page(title: &str, body_content: &str, base_dir: &Path, theme: Theme, font_scale_percent: u32, transcript: &str) -> String {
+    let raw = format!("<html><head><title>{}</title></head><body>{body_content}</body></html>", html_escape_text(title));
+    preprocess_html(raw, base_dir, theme, font_scale_percent, transcript)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn doit_link_gets_class_and_data_code() {
+        let input = r#"<a doit="VM collectGarbage">Collect Garbage</a>"#;
+        let out = rewrite_doit_links(input);
+        assert!(out.contains(r#"class="doit""#), "{out}");
+        assert!(out.contains(r#"data-code="VM collectGarbage""#), "{out}");
+        assert!(out.ends_with("Collect Garbage</a>"), "{out}");
+    }
+
+    #[test]
+    fn smappl_multiline_becomes_placeholder_span() {
+        let input = "<smappl visual=\" Button\n\t\t\twithImage: (Image fromFile: 'x')\n\t\t\taction: [ :b | ]\t\">";
+        let out = rewrite_smappl_placeholders(input);
+        assert!(out.starts_with(r#"<span class="smappl""#), "{out}");
+        assert!(out.contains("Button withImage:"), "{out}");
+        assert!(!out.contains('\n'), "collapsed whitespace should have no newlines: {out}");
+    }
+
+    #[test]
+    fn smappl_without_closing_tag_does_not_swallow_following_content() {
+        let input = r#"<li><smappl visual="ClassHierarchyOutliner imbeddedVisualForClass: Object"></li><li>next</li>"#;
+        let out = rewrite_smappl_placeholders(input);
+        assert!(out.contains("</span></li><li>next</li>"), "{out}");
+    }
+
+    #[test]
+    fn plain_links_are_untouched() {
+        let input = r#"<a href="documentation/index.html">Browse Documentation</a>"#;
+        let out = rewrite_doit_links(&rewrite_smappl_placeholders(input));
+        assert_eq!(out, input);
+    }
+
+    #[test]
+    fn themes_pick_distinct_stylesheets_and_icon_formats() {
+        let classic_head = chrome_head_extra(Path::new("."), Theme::Classic, 100);
+        assert!(classic_head.contains("assets/strongtalk.css"), "{classic_head}");
+        let hidef_head = chrome_head_extra(Path::new("."), Theme::HiDef, 100);
+        assert!(hidef_head.contains("assets/hidef.css"), "{hidef_head}");
+
+        let classic_toolbar = toolbar_html(Theme::Classic);
+        assert!(classic_toolbar.contains("reference/icons-png/home.png"), "{classic_toolbar}");
+        let hidef_toolbar = toolbar_html(Theme::HiDef);
+        assert!(hidef_toolbar.contains("assets/icons-hidef/home.svg"), "{hidef_toolbar}");
+    }
+
+    #[test]
+    fn font_scale_is_injected_as_a_zoom_style() {
+        let head = chrome_head_extra(Path::new("."), Theme::Classic, 130);
+        assert!(head.contains("zoom: 130%"), "{head}");
+    }
+}

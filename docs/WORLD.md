@@ -244,6 +244,20 @@ indexing) and anything sending to `Processor`/`Platform` are emitted with a
 - **No image needed**: Strongtalk *had* to boot a prebuilt `.bst` because
   fileIn required a live compiler+mirrors. MACVM's Rust-side compiler boots
   from bare source — keep that advantage; snapshot (S16) stays optional.
+  **Still true** with [`IMAGE.md`](IMAGE.md)'s SQLite container in the
+  picture: that's a versioned *source* database (plus an optional,
+  always-re-derivable bytecode cache) for the GUI browser's interactive
+  edits to land in — not a heap/memory image, and not a replacement for
+  `.mst` files as the git-tracked, hand-authored seed library. The two
+  coexist: `.mst` stays the checked-in source of truth; `image_store`
+  imports it once and is where the browser's own edits actually persist.
+
+## 12.1 The image store — a parallel, no-core-dependency track
+
+Like Phase G (`gui/PLAN.md`), building `image_store` and importing the
+existing `world/*.mst` files into it needs nothing from the core sprints
+still in flight — the `.mst` text already exists, checked in, regardless of
+which core sprint is currently green. Full design: [`IMAGE.md`](IMAGE.md).
 
 ## 12. Phasing — Phase W (see SPRINTS.md)
 

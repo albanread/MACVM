@@ -283,6 +283,7 @@ interleaves with it; every wave lands with in-language tests.
 
 | Wave | Size | Contents | Needs |
 |---|---|---|---|
+| W0 image store | `S` | `image_store` crate: versioned SQLite class/method source database + `.mst` importer + GUI class-browser wiring ([`IMAGE.md`](IMAGE.md)) | nothing — `.mst` text already exists |
 | W1 library wave 1 | `M` | `tools/dlt2mst` converter (WORLD §10); full collections protocol, Fraction, Character tables, ReadStream; two-pass world loader; Strongtalk test-oracle port | S6 |
 | W2 reflection base | `M` | Mirror library (Object/Class/Method mirrors), R1+R2 primitives, HtmlWriter, ToolNode framework (APPS §2–§6) | S6 (+A16) |
 | W3 tools wave 1 | `M` | Inspector, Workspace/eval wiring (R3), find tools (senders/implementors sweeps) | W2; pairs with G2/G3 |

@@ -1,0 +1,31 @@
+[package]
+name = "macvm-gui"
+version = "0.0.0"
+edition = "2021"
+description = "MACVM graphical environment — a native Cocoa/WKWebView recreation of the Strongtalk HTML programming environment (see PLAN.md)."
+license = "BSD-2-Clause"
+publish = false
+
+[[bin]]
+name = "macvm-gui"
+path = "src/main.rs"
+
+[dependencies]
+# Deliberately zero external crates for the Cocoa/AppKit/WebKit bridge: a
+# minimal dlopen/dlsym/objc_msgSend layer (src/objc.rs), the same proven,
+# dependency-free approach already used in the sibling MacModula2 project
+# (src/newm2-runtime/src/objc.rs, shipping in MacM2 IDE.app) instead of the
+# objc2/objc2-app-kit/objc2-web-kit crate ecosystem PLAN.md's D-G2 first
+# considered — same "Rust owns the shell, no Swift/Xcode target" outcome,
+# fewer moving parts, no external API-surface risk from an evolving crate.
+#
+# macvm-mock-vm stands in for the real `macvm` lib (SPEC A18: gui depends on
+# the VM crate) until VmHandle/mirrors exist — see mock_vm/Cargo.toml.
+# Swap this for a real `macvm` path dependency once G2 lands; nothing else
+# in this crate should need to change shape, just what's behind vm_host.rs's
+# request/response handling.
+macvm-mock-vm = { path = "mock_vm" }
+# The real (`docs/IMAGE.md`) versioned SQLite world — mirrored into a
+# `MockWorld` at startup when `MACVM_IMAGE_PATH` is set (`vm_host.rs`),
+# with edits written through to both so they persist across restarts.
+image_store = { path = "../image_store" }

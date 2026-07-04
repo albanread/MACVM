@@ -261,3 +261,69 @@ this document is MACVM Smalltalk in `world/tools/`.
 Each wave lands with in-language tests (mirror facts against known classes;
 HtmlWriter escaping goldens; find-tool sweeps over the seed world) plus a GUI
 gate shared with the corresponding G-phase.
+
+## 11. Prior art: Helios (Amber Smalltalk's browser IDE)
+
+Amber Smalltalk's own modern IDE, Helios (a currently-maintained,
+from-scratch browser-based Smalltalk IDE — architecture surveyed directly
+from its source, not Strongtalk-derived), solves the identical problem this
+document does: class/method/hierarchy browsers, an inspector, find tools,
+and a workspace, all as an HTML/JS UI over a live Smalltalk runtime. Where
+its design overlaps with or extends what's already pinned above, worth
+recording explicitly:
+
+- **Validates §7's update protocol.** Helios's browser panes don't call each
+  other directly — they hold a shared model object and react to
+  announcements it posts (a selected-class announcement updates the
+  methods pane, the source pane, the doc pane, all independently); a
+  `MethodModified` system announcement refreshes *every* open browser tab
+  showing that method, not just the one that triggered the edit. That's
+  the same shape as §7's `ToolRegistry`/dependents design, independently
+  arrived at — good confirmation this pattern holds up in a real, shipping
+  IDE, not just a 1996 one. Worth keeping the `ToolRegistry` keyed broadly
+  enough (by class/method identity, not just per-tab state) to give MACVM
+  the same cross-tab live sync for free.
+- **New idea for §5.2's browsers — composable split-pane layout.** Helios
+  lays out its class browser as nested draggable splitters (packages |
+  classes | protocols | methods, then source below), not a single
+  scrolling outliner page. Strongtalk's own embedded outliners (per
+  `smappl.md` §3-4) are simpler — an indented tree with an inline body,
+  not a multi-pane browser — so this is a genuine upgrade opportunity for
+  G3, cheap to build (CSS flex/resize, no VM work) and worth doing since it
+  makes browsing noticeably more usable than one long page.
+- **New idea for §5.1/§3 R3 — inline parse errors at the exact position,
+  proven in production.** R3's compile service already promises `(message,
+  character position)`; Helios does exactly what that's for — it
+  re-renders the source with an inline `<- message` marker spliced in at
+  the failing column, not a separate error dialog. This is the same
+  "exceeds Strongtalk" opportunity flagged in an earlier design
+  discussion (`smappl.md`'s text-editing notes); Helios is concrete proof
+  it works well in a live Smalltalk browser, not just a nice idea.
+- **New idea for W4's accept path — offer to create a missing instance
+  variable.** When compilation fails specifically because of an unknown
+  variable reference, Helios's browser offers a one-click "add this
+  instance variable?" dialog rather than just failing. Small, concrete,
+  and a natural fit once `ClassMirror`'s definition-mutation primitives
+  (R1) and the accept path (W4) both exist.
+- **New idea for §5.2's `MethodNode` header — override/overridden
+  badges.** A method list showing whether each selector overrides a
+  superclass method, is itself overridden by a subclass, or both — a
+  glance-able inheritance cue, implementable as an `HtmlWriter` CSS class
+  once `ClassMirror` can answer the question (R1/R2), no new VM primitive
+  needed.
+- **New idea for §5.4's find tools — typeahead search, no Strongtalk
+  precedent.** Helios has an incremental fuzzy-search-as-you-type box over
+  every class and selector name (its "Spotlight"). Confirmed in earlier
+  research (`smappl.md`'s `CodeView` deep-dive) that Strongtalk itself has
+  no equivalent — its `ClassHierarchyOutliner` filter is configured once
+  via `filterOn:`, not live. This is a genuine, no-upstream-precedent UX
+  win: cheap to build once a "list all class/selector names" query exists
+  (already covered by R1's `SystemDictionary` enumeration), pure
+  client-side JS/HtmlWriter work otherwise.
+- **Noted for later G4/G5 polish, not scoped yet:** keyboard-first pane
+  navigation (arrow keys move between panes, Tab cycles focus) and a
+  hierarchical command palette (press one key to pick a category, another
+  to pick the action within it) — good ideas for once there are enough
+  tool-specific commands that not all of them deserve a permanent toolbar
+  icon, but no immediate action needed; revisit alongside G5's parity
+  sweep.

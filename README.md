@@ -39,6 +39,7 @@ sprint plan are written ahead of the code:
 | [`docs/reference-vm-analysis.md`](docs/reference-vm-analysis.md) | Source-anchored analysis of Self, Strongtalk, JASM, and the MacNCL GC |
 | [`docs/sprints/`](docs/sprints/README.md) | Per-sprint implementation guidance + test plans (S0–S15) for the implementing agent |
 | [`gui/PLAN.md`](gui/PLAN.md) | The GUI track (Phase G): Strongtalk live-HTML environment in Cocoa+WKWebView; core seam in SPEC §16 |
+| [`gui/smappl.md`](gui/smappl.md) | The `<smappl visual="...">` tag: exact parse/eval semantics, the full `visual=`/`doit=` vocabulary from the Strongtalk corpus, and the Visual→HTML fragment bridge design (D-G5) |
 | [`docs/WORLD.md`](docs/WORLD.md) | The library design (Phase W): what to adopt/reimplement/skip from StrongtalkSource, the `.dlt→.mst` converter, exceptions, SUnit, benchmarks |
 | [`docs/APPS.md`](docs/APPS.md) | The apps design (Phase W): Smalltalk mirrors over VM primitives R1–R5, ToolNode outliners, Inspector/Workspace/find tools, HtmlWriter |
 

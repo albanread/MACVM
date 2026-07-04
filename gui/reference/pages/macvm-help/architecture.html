@@ -1,0 +1,67 @@
+<html>
+<head><title>MACVM Architecture</title></head>
+<body>
+
+<h2 align="center">MACVM Architecture</h2>
+
+<p>MACVM is a research virtual machine for macOS on Apple Silicon, in the
+<strong>Self → Strongtalk</strong> lineage: a class-based object model with
+an adaptive optimizing compiler driven by type feedback.</p>
+
+<p>It is not a port of either VM. It takes the adaptive-optimization
+machinery both share — inline caches, polymorphic inline caches (PICs), type
+feedback, and deoptimization — and combines that with Strongtalk's
+representation: classes with direct tagged pointers and no object table,
+rather than Self's prototype/map model.</p>
+
+<h3 align="left">Goals</h3>
+
+<ul>
+	<li><strong>Class-based object model</strong> — Strongtalk-style classes,
+	direct tagged pointers, a two-word <code>[mark][klass]</code> header, and
+	no object table.</li>
+	<li><strong>Adaptive optimization</strong> — start executing quickly with
+	a baseline interpreter, then recompile hot code using type feedback
+	gathered from polymorphic inline caches, the technique Self pioneered
+	and Strongtalk and HotSpot both inherited.</li>
+	<li><strong>Apple Silicon first</strong> — arm64 calling convention,
+	W^X / JIT hardening (<code>MAP_JIT</code>,
+	<code>pthread_jit_write_protect_np</code>), and pointer-authentication
+	awareness, rather than a portable-first design retrofitted for arm64.</li>
+	<li><strong>Native macOS integration</strong> — this GUI shell is part of
+	that: a direct <code>objc_msgSend</code> bridge to Cocoa/AppKit/WebKit,
+	the same approach already proven in sibling projects, rather than a
+	cross-platform toolkit.</li>
+</ul>
+
+<h3 align="left">Where things live</h3>
+
+<ul>
+	<li><code>src/oops.rs</code> — the object model: tagged pointers, headers,
+	classes.</li>
+	<li><code>src/memory.rs</code> — object memory, allocation, the garbage
+	collector.</li>
+	<li><code>src/lookup.rs</code> — method lookup, inline caches, PICs, type
+	feedback.</li>
+	<li><code>src/interpreter.rs</code> — the threaded-code interpreter (the
+	baseline tier).</li>
+	<li><code>src/compiler/</code> — the adaptive optimizing compiler and its
+	abstract codegen backend.</li>
+	<li><code>src/runtime.rs</code> — stacks, activation frames,
+	deoptimization.</li>
+	<li><code>world/</code> — the object world / image sources.</li>
+	<li><code>gui/</code> — this GUI shell: plan, reference pages, CSS — the
+	very tree these pages live in.</li>
+	<li><code>docs/</code> — the full design record: <code>SPEC.md</code>,
+	<code>SPRINTS.md</code>, <code>DESIGN.md</code>, and more.</li>
+</ul>
+
+<p>For the authoritative, up-to-date version of all of this, see the
+project's own <code>README.md</code> and <code>docs/</code> tree — this page
+is a snapshot written for the GUI's own help viewer, not a substitute for
+those.</p>
+
+<p><a href="index.html">Back to Documentation Index</a></p>
+
+</body>
+</html>

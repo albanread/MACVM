@@ -1,0 +1,24 @@
+[package]
+name = "image_store"
+version = "0.0.0"
+edition = "2021"
+description = "A versioned SQLite class/method source database (docs/IMAGE.md) — not the S16 heap snapshot; a source container + optional recompile-avoidance bytecode cache, for the GUI class browser's interactive edits to persist into."
+license = "BSD-2-Clause"
+publish = false
+
+[lib]
+name = "image_store"
+path = "src/lib.rs"
+
+[[bin]]
+name = "import_world"
+path = "src/bin/import_world.rs"
+
+[dependencies]
+# bundled: compiles SQLite from source, so this doesn't depend on whatever
+# libsqlite3 (if any) happens to be on a given machine — consistent with
+# this project's general "minimize environment-dependent build surface"
+# stance, just via a normal crates.io dependency rather than the GUI
+# crate's zero-dependency Cocoa bridge (that one avoids objc2 specifically
+# for its evolving macro API, not external crates on principle).
+rusqlite = { version = "0.31", features = ["bundled"] }

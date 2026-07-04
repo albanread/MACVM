@@ -25,7 +25,11 @@ HTML files extended with two tags that make pages *live*:
   image instead of navigating (`ElementA.dlt`, `HTMLLink.dlt`).
 - **`<smappl visual="Smalltalk code">`** — evaluates the code and embeds the
   resulting Visual (a button, a class-hierarchy outliner, a live code editor)
-  inline in the page flow (`startPage.html`, tour pages).
+  inline in the page flow (`startPage.html`, tour pages). See
+  [`smappl.md`](smappl.md) for the full grounding: exact parse/eval
+  semantics (`ElementSMAPPL.dlt`), the complete `visual=`/`doit=` vocabulary
+  used across the corpus, and why D-G5's HTML-fragment rendering has no
+  upstream Strongtalk precedent to follow.
 
 The programming tools are **outliners**: indented, bullet-list trees where
 every level expands in place — a class browser shows its categories, a
@@ -117,7 +121,7 @@ circle/ball = collapsed), `openItem` (yellow wedge = expanded).
 │  └ status bar: lowered-bevel strip on #C0C0C0   ┘        │
 └──────────────────────────────────────────────────────────┘
             ▲ webkit.messageHandlers / evaluateJavaScript ▼
-   Rust shell (objc2): NSApplication, NSWindow, WKWebView, NSMenu
+   Rust shell (raw objc_msgSend bridge): NSApplication, NSWindow, WKWebView, NSMenu
             ▲ eval / mirrors / transcript ▼
                     MACVM core (Rust)
 ```
@@ -130,11 +134,19 @@ Decisions (mirroring `docs/DESIGN.md` style):
   view, styled per §2. Only the menu bar is native (macOS owns it anyway);
   Strongtalk's per-window pull-down menus (File / Filtering / Meta …) map to
   NSMenu items populated by the active tool.
-- **D-G2 — Rust owns the shell via `objc2`/`objc2-app-kit`/`objc2-web-kit`.**
-  No Swift/Xcode target; consistent with the sibling projects'
-  `objc_msgSend` bridge story and keeps the GUI in the same cargo workspace.
-  (Fallback seam: the shell talks to the VM through a narrow `GuiHost` trait,
-  so a Swift shell remains possible.)
+- **D-G2 — Rust owns the shell via a hand-rolled `dlopen`/`objc_msgSend`
+  bridge (`src/objc.rs`), not the `objc2` crate ecosystem.** Originally
+  planned as `objc2`/`objc2-app-kit`/`objc2-web-kit`; superseded once
+  implementation started by mirroring the proven, dependency-free pattern
+  already shipping in the sibling MacModula2 project
+  (`src/newm2-runtime/src/objc.rs`). Same outcome — no Swift/Xcode target,
+  GUI stays in the cargo workspace — with zero external crate dependencies
+  and no exposure to an evolving crate's macro API; `objc.rs` resolves
+  `dlopen`/`dlsym(RTLD_DEFAULT, …)` at startup and each message send
+  transmutes `objc_msgSend` to the exact ABI shape (self/`_cmd` + typed args,
+  per AAPCS64) that call site needs. (Fallback seam unchanged: the shell
+  talks to the VM through a narrow `GuiHost` trait, so a Swift shell remains
+  possible.)
 - **D-G3 — Live-page protocol is JSON over `webkit.messageHandlers.macvm`.**
   Page → VM: `{kind:"doit", code}`, `{kind:"navigate", href}`,
   `{kind:"toggle", nodeId}`, `{kind:"toolbar", button}`. VM → page:
@@ -156,11 +168,23 @@ New crate: `gui/` becomes a cargo member (`macvm-gui`), with:
 
 ```
 gui/
-  PLAN.md, README.md          (this plan; folder map)
-  reference/                  (copied Strongtalk artifacts — do not edit)
-  assets/                     (strongtalk.css, smtk.js, icons shipped at runtime)
-  src/                        (shell: app, window, webview, menus, bridge)
-  pages/                      (MACVM's own startPage.html, launcher.html, …)
+  PLAN.md, README.md, smappl.md  (this plan; folder map; the smappl deep-dive)
+  reference/pages/            (copied Strongtalk artifacts — startPage.html,
+                                tour/, documentation/ — kept byte-identical,
+                                per D-G4)
+  reference/pages/macvm-help/  (MACVM's own authored help viewer — not
+                                copied Strongtalk content; deliberately a
+                                separate path from documentation/, since
+                                that path is the *real* Strongtalk docs
+                                corpus startPage.html's own "Browse
+                                Documentation" link and the toolbar's
+                                Documentation button both point at —
+                                reachable instead from the native Help menu)
+  reference/icons-bmp/, icons-png/  (copied Strongtalk icon art)
+  assets/                     (strongtalk.css, hidef.css, smtk.js,
+                                icons-hidef/ shipped at runtime)
+  src/                        (shell: app, window, webview, menus, bridge,
+                                vm_host: the GUI↔VM worker-thread scaffold)
 ```
 
 ## 4. Phases
@@ -182,6 +206,9 @@ with a demo gate.
 - **Gate:** side-by-side eyeball vs the icon art and tour markup: start page
   and `progenv*.html` render in the period style; back/forward/home
   navigation works; status bar live.
+- **Status: done.** Verified by actually running the shell (screenshots +
+  accessibility-tree-driven clicks), not just code review — see the
+  WKWebView note under §5 Risks for two real bugs this caught.
 
 ### G1 — Live-page runtime, stub VM `S`
 - `smtk.js`: doit clicks, toolbar clicks, outliner toggles → JSON messages
@@ -192,6 +219,37 @@ with a demo gate.
   toolbar; "doit → transcript echo" round trip.
 - **Gate:** clicking `Collect Garbage` on the start page produces a
   transcript entry via the full JS↔Rust round trip.
+- **Status: done** for the stub host (no VM yet, so doits echo their source
+  text rather than evaluate — real evaluation is G2). Also went slightly
+  beyond the stub scope: `reference/pages/documentation/` is now the *real*
+  Strongtalk documentation corpus (copied byte-identical, including
+  `keyboard.html`/`internal/`/`mixins/`/`type-system/`), giving "Browse
+  Documentation" and the toolbar's Documentation button somewhere real and
+  faithful to go; a separately-authored MACVM help viewer
+  (`reference/pages/macvm-help/`) covers the shell itself (doit/smappl/
+  Theme menu explanations) and is reachable from the native Help menu, so
+  it doesn't collide with the real corpus's own `documentation/index.html`.
+- **The `../docs/SPEC.md` §16.1 threading model (decision A18) is built,
+  not just pinned on paper**: `src/vm_host.rs` spawns a genuine
+  `std::thread::spawn` worker; doits cross a real channel to it and back
+  (`main.rs` no longer runs the stub inline). Delivery back to the main
+  thread uses `-[NSObject performSelectorOnMainThread:withObject:
+  waitUntilDone:]` (`objc.rs`), the one NSObject entry point documented as
+  safe to call from any thread — chosen specifically because this bridge
+  has no GCD/block-literal ABI to lean on otherwise. Verified against
+  `cocoa_data`'s `cocoa.sqlite` runtime-method index (an earlier version
+  sent the wrong selector, `performSelector:withObject:waitUntilDone:`
+  — nonexistent — which triggered `-doesNotRecognizeSelector:` and
+  crashed the process with "Rust cannot catch foreign exceptions"; the
+  real selector's encoding was confirmed there before re-verifying live).
+  Also pinned for when there's something real to route: discrete events
+  (transcript lines, doit results) use the ordered channel; continuous/bulk
+  updates (a redrawing pixel buffer, a live status string) should use
+  `vm_host::LatestSlot<T>` instead — newest-value-wins rather than queuing
+  stale frames behind a slow UI thread — and a future per-widget click
+  (once smappl builds real closures, `../smappl.md` §4.1) should route by
+  opaque id through the request channel to a handler table owned solely by
+  the worker thread, needing no additional lock beyond the channel itself.
 
 ### G2 — VM bridge `M` — *needs core eval (interpreter sprints) + a
 reflection surface*
@@ -240,11 +298,26 @@ reflection surface*
   tour pages feel right (no pixel-perfect oracle exists — judgement call).
 - **smappl generality:** arbitrary Smalltalk in `visual=` can build any
   Visual. G2 deliberately supports only the vocabulary the shipped pages use
-  (Button withImage:action:, Glue, outliner embeds, CodeView); anything else
-  renders as the G0 placeholder box. Revisit after G3.
+  — `Button withImage:action:`/`labeled:action:`, `Glue`, the
+  `ClassHierarchyOutliner`/`ClassOutliner` filter-chain shapes, `CodeView`
+  — anything else renders as the G0 placeholder box. Revisit after G3. Full
+  vocabulary catalog, exact citations, and evaluation semantics:
+  [`smappl.md`](smappl.md).
 - **WKWebView sandboxing:** local page + icon loading needs
   `loadFileURL:allowingReadAccessToURL:` on the `gui/` root; doit bridge
-  must be registered per-navigation.
+  must be registered per-navigation. Confirmed the hard way in G0:
+  `loadHTMLString:baseURL:` does **not** grant `file://` subresource access
+  outside `baseURL`'s own directory — CSS/JS/icons all silently failed to
+  load, and what rendered looked deceptively like Strongtalk styling because
+  it was actually just WebKit's default stylesheet. Fixed by writing the
+  preprocessed page to `gui/.rendered/current.html` and loading *that* via
+  `loadFileURL:allowingReadAccessToURL:<gui root>`, plus injecting
+  `<base href="file://{original page dir}/">` so the *page's own* relative
+  links still resolve against its real location rather than `.rendered/`.
+  Also hit: no page declares `<meta charset>`, which the original corpus
+  never needed (ASCII-only) but MACVM's own authored HTML does (em dashes,
+  arrows) — fixed by injecting `<meta charset="utf-8">` into the same
+  shared chrome so every loaded page gets it.
 - **VM dependency pacing:** G2+ gates assume interpreter + mirrors exist; if
   the GUI outruns the core, extend the G1 stub host (canned class data) so
   G3's outliner UI can be built and tested against fixtures.

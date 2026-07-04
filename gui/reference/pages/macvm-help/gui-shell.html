@@ -1,0 +1,67 @@
+<html>
+<head><title>About this GUI shell</title></head>
+<body>
+
+<h2 align="center">About this GUI Shell</h2>
+
+<p>MACVM's GUI is a native Cocoa window (<code>NSWindow</code>) holding a
+single <code>WKWebView</code>. Only the menu bar at the top of the screen is
+native; the toolbar and status bar you see inside the window are HTML,
+injected into every page when it loads. This whole page, in fact, was
+written as a plain <code>.html</code> file and had that chrome added the
+same way.</p>
+
+<h3 align="left">The toolbar and status bar</h3>
+
+<p>The row of icon buttons at the top and the bar at the very bottom are not
+part of any Strongtalk page's own markup — they are added at load time, so
+every page gets them for free. See the <a href="toolbar.html">toolbar
+reference</a> for what each button does.</p>
+
+<p>The bar along the bottom shows the target of whatever link or button your
+pointer is currently over, and says "Ready" the rest of the time — hover over
+the link below to see it change:
+<a href="index.html">Documentation Index</a></p>
+
+<h3 align="left"><code>doit=</code> links</h3>
+
+<p>An ordinary Strongtalk page can write <code>&lt;a doit="some Smalltalk
+code"&gt;label&lt;/a&gt;</code> instead of a normal <code>href</code>. Clicking
+it doesn't navigate anywhere — it runs the code. Today, with no VM wired up
+yet, "running the code" means the shell echoes the code's source text into
+the transcript pane, so the click round trip (page → JavaScript → native
+host → transcript) can be built and tested well before there is a VM to
+actually execute it against. Try it:
+<a doit="Transcript show: 'Hello, doit!'">Say hello</a></p>
+
+<h3 align="left">The <code>smappl</code> tag</h3>
+
+<p>A Strongtalk page can also write <code>&lt;smappl visual="some Smalltalk
+code"&gt;</code> (note: no closing tag) to embed a live widget — a class
+hierarchy browser, say — directly inline in the page, built by evaluating
+the given expression. Until MACVM has a VM and a widget layer to back it
+(a later phase), every <code>smappl</code> tag is shown as an inert,
+lowered-bevel box naming the code it would have run:
+<smappl visual="Some Smalltalk expression"></p>
+
+<h3 align="left">Theme</h3>
+
+<p>The native <strong>Theme</strong> menu in the menu bar switches between
+<strong>Classic</strong> (the period-accurate Strongtalk look this page is
+shown in right now — pixel icons, Win95-style bevels) and
+<strong>Hi-Def</strong> (flat modern styling: system fonts, vector icons, no
+bevels). Both themes render the exact same pages — switching just swaps the
+stylesheet and icon set, instantly, without losing your place.</p>
+
+<h3 align="left">Navigation</h3>
+
+<p>Ordinary links between local <code>.html</code> pages (like the ones on
+this page) are intercepted and resolved relative to the page they appear on,
+then loaded the same way as the start page — so back, forward, and the home
+button all work uniformly, no matter how many pages deep you are.</p>
+
+<p><a href="index.html">Back to Documentation Index</a> ·
+<a href="../startPage.html">Back to Start Page</a></p>
+
+</body>
+</html>

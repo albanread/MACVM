@@ -18,3 +18,12 @@
 # VM artifacts
 *.image
 *.snapshot
+
+# GUI runtime scratch file (main.rs::display_html writes the D-G4-preprocessed
+# page here before loadFileURL:; regenerated on every navigation)
+/gui/.rendered/
+
+# image_store's versioned SQLite database — regenerable from world/*.mst via
+# `cargo run -p image_store --bin import_world` (docs/IMAGE.md); not source,
+# and grows with live edits made through the GUI class browser.
+/world/*.sqlite3

@@ -32,6 +32,13 @@
 }
 
 /* ---- page ---- */
+html, body {
+  /* Stop WKWebView's rubber-band bounce at the document level — without
+     this, a wheel scroll that exhausts an inner pane's own scroll range
+     (see .st-browser-pane's overscroll-behavior below) chains up and
+     visibly scrolls/bounces the whole window. */
+  overscroll-behavior: none;
+}
 body {
   margin: 0;
   background: var(--st-white);
@@ -130,6 +137,11 @@ ul { list-style-type: disc; } /* Symbol ch.183 middle-dot bullet */
   font-size: var(--st-size-code);
   padding: var(--st-space-1) var(--st-space-2);
   overflow: auto;
+  overscroll-behavior: contain;
+  /* Without this, the "\n"-joined lines macvmAppendTranscript/main.rs's
+     persisted history both accumulate render as one collapsed line
+     (default HTML whitespace rules) instead of one line per entry. */
+  white-space: pre-wrap;
 }
 
 /* ---- smappl placeholder (G0, inert) ---- */
@@ -159,6 +171,157 @@ ul { list-style-type: disc; } /* Symbol ch.183 middle-dot bullet */
 }
 .st-outliner .st-superclass { font-weight: normal; color: var(--st-black); }
 .st-outliner .st-class { font-weight: bold; }
+
+/* ---- workspace tool (src/workspace_render.rs) ---- */
+.st-workspace { display: flex; flex-direction: column; height: calc(100vh - 120px); }
+.st-workspace-editor { flex: 1; min-height: 0; border-top: 2px solid var(--st-gray); }
+
+/* ---- class browser view (G3 mock, src/browser_render.rs) ---- */
+.st-browser { display: flex; flex-direction: column; height: calc(100vh - 120px); }
+.st-browser-lists { display: flex; flex-direction: row; flex: 2; min-height: 0; }
+.st-browser-pane {
+  flex: 1;
+  overflow: auto;
+  overscroll-behavior: contain;
+  border-right: 1px solid var(--st-gray);
+  background: var(--st-white);
+  font-family: var(--st-font-body);
+  font-size: 14px;
+}
+.st-browser-pane:last-child { border-right: none; }
+.st-browser-item { padding: 2px 6px; white-space: nowrap; cursor: default; }
+.st-browser-item.active { background: var(--st-blue); color: var(--st-white); }
+.st-browser-side-tabs {
+  display: flex;
+  background: var(--st-background-gray);
+  border-bottom: 1px solid var(--st-gray);
+}
+.st-browser-side-tab {
+  flex: 1;
+  text-align: center;
+  padding: 2px 0;
+  font-family: var(--st-font-widget);
+  font-size: var(--st-size-widget);
+  cursor: default;
+}
+.st-browser-side-tab.active { background: var(--st-white); font-weight: bold; }
+.st-browser-source {
+  flex: 1;
+  min-height: 0;
+  border-top: 2px solid var(--st-gray);
+}
+/* ---- class browser create/remove actions ---- */
+/* Pinned to the bottom of its scrolling pane (.st-browser-pane's own
+   overflow:auto) rather than just appended after the list — with 20+
+   packages/methods, "append after the list" meant scrolling all the way
+   down inside a specific narrow pane to find it, which is exactly what
+   made the New Class button real but effectively undiscoverable. */
+.st-browser-action-row {
+  position: sticky;
+  bottom: 0;
+  padding: var(--st-space-1) var(--st-space-2);
+  border-top: 1px solid var(--st-gray);
+  background: var(--st-white);
+}
+.st-browser-new-button, .st-browser-danger-button {
+  font-family: var(--st-font-widget);
+  font-size: var(--st-size-widget);
+  padding: 3px 8px;
+  background: var(--st-background-gray);
+  border: none;
+  box-shadow: inset -1px -1px 0 var(--st-black),
+              inset  1px  1px 0 var(--st-white),
+              inset -2px -2px 0 var(--st-gray),
+              inset  2px  2px 0 var(--st-bevel-light);
+  cursor: default;
+}
+.st-browser-new-button:active, .st-browser-danger-button:active {
+  box-shadow: inset  1px  1px 0 var(--st-black),
+              inset -1px -1px 0 var(--st-white),
+              inset  2px  2px 0 var(--st-gray),
+              inset -2px -2px 0 var(--st-bevel-light);
+  padding: 4px 7px 2px 9px;
+}
+.st-browser-danger-button { color: #a00000; }
+/* Tied to the *absence* of [hidden] rather than an unconditional
+   `display`, so this can't out-specificity the UA stylesheet's own
+   `[hidden] { display: none }` rule and defeat `smtk.js`'s show/hide
+   toggle — see that file's comment on why there's no WKUIDelegate to
+   just use window.confirm() instead. */
+.st-remove-row .st-confirm-strip:not([hidden]) {
+  display: inline-block;
+  margin-left: var(--st-space-2);
+}
+/* Editable .st-code-input stacked exactly on top of the highlighted
+   .st-code-highlight <pre> underneath — see smtk.js's module doc comment
+   for why (native cursor/selection/undo, one tokenizer, not two). */
+.st-code-editor { position: relative; height: 100%; }
+.st-code-highlight, .st-code-input {
+  position: absolute;
+  inset: 0;
+  margin: 0;
+  box-sizing: border-box;
+  font-family: var(--st-font-code);
+  font-size: var(--st-size-code);
+  /* Explicit line-height/tab-size/letter-spacing: a <textarea> and a <pre>
+     don't share a UA-default line-height even at the same declared
+     font-size (it's derived from each element's own font metrics/internal
+     spacing) — leaving it implicit is what let Classic and Hi-Def drift
+     apart despite using the same shared rule; pin every metric that
+     affects glyph position so the two layers can never visually diverge. */
+  line-height: 1.4;
+  tab-size: 4;
+  letter-spacing: normal;
+  padding: var(--st-space-2);
+  white-space: pre-wrap;
+  word-wrap: break-word;
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+.st-code-input {
+  /* WebKit's unstyled <textarea> keeps a bit of native-control text-layout
+     behavior (from the underlying NSTextView-style rendering) that plain
+     CSS `line-height` doesn't fully override — it compounds per line, so
+     line 1 can look aligned while line 2+ visibly drifts. `appearance:
+     none` strips the native chrome entirely and forces pure CSS box-model
+     text layout, which is what actually makes the overlay line up. */
+  appearance: none;
+  -webkit-appearance: none;
+  color: transparent;
+  background: transparent;
+  border: none;
+  resize: none;
+  caret-color: var(--st-black);
+  z-index: 2;
+}
+.st-code-highlight {
+  z-index: 1;
+  pointer-events: none;
+  color: var(--st-black);
+}
+.st-tok-comment { color: var(--st-gray); font-style: italic; }
+.st-tok-string { color: #8b3a3a; }
+.st-tok-symbol { color: var(--st-bluegreen); }
+.st-tok-keyword { color: var(--st-blue); font-weight: bold; }
+.st-tok-pseudo { color: #7a3e9e; }
+.st-tok-number { color: var(--st-black); font-weight: bold; }
+
+/* ---- custom context menu (smtk.js — replaces WKWebView's native one) ---- */
+.st-context-menu {
+  position: fixed;
+  z-index: 1000;
+  min-width: 140px;
+  padding: 2px 0;
+  background: var(--st-background-gray);
+  font-family: var(--st-font-widget);
+  font-size: var(--st-size-widget);
+  box-shadow: inset -1px -1px 0 var(--st-black),
+              inset  1px  1px 0 var(--st-white),
+              inset -2px -2px 0 var(--st-gray),
+              inset  2px  2px 0 var(--st-bevel-light);
+}
+.st-context-menu-item { padding: 4px var(--st-space-2); cursor: default; }
+.st-context-menu-item:hover { background: var(--st-blue); color: var(--st-white); }
 
 /* ---- retro scrollbars ---- */
 ::-webkit-scrollbar { width: 16px; height: 16px; background: #e8e8e8; }
