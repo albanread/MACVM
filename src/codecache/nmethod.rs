@@ -15,7 +15,7 @@ use smallvec::SmallVec;
 use crate::codecache::guard::JitWriteGuard;
 use crate::codecache::CodeHandle;
 use crate::compiler::assembler::{Reloc, RelocKind};
-use crate::oops::wrappers::{KlassOop, SymbolOop};
+use crate::oops::wrappers::{KlassOop, MemOop, SymbolOop};
 use crate::oops::Oop;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -385,7 +385,18 @@ impl CodeTable {
     /// *this nmethod's own* `code.len`, tighter than "is this address
     /// anywhere in the whole cache" (which would miss a reloc that drifted
     /// into a *neighboring* nmethod's bytes).
-    pub fn oops_do(&mut self, f: &mut dyn FnMut(&mut u64)) {
+    /// `include_key_klass` (S12 D5): `false` ONLY during a full GC's own
+    /// MARK pass — the customization key stays unmarked so a truly dead
+    /// receiver klass can be detected (`weak_sweep`) instead of being kept
+    /// artificially alive forever by the nmethod that happens to still
+    /// name it. Every other caller (scavenge, which never flushes and
+    /// treats all code roots strongly; full GC's own later update/rewrite
+    /// pass, which must keep a SURVIVING key's address current — "weak ≠
+    /// unmaintained") passes `true`. Everything else in a pool (method
+    /// literals, selectors, PIC guard klasses, adapter method oops) has no
+    /// such distinction and is unconditionally strong (D5: "only the key
+    /// is weak").
+    pub fn oops_do(&mut self, include_key_klass: bool, f: &mut dyn FnMut(&mut u64)) {
         let mut guard = JitWriteGuard::new();
         for nm in self.slots.iter().flatten() {
             if !matches!(nm.state, NmState::Alive) {
@@ -394,6 +405,9 @@ impl CodeTable {
             guard.note(nm.code.base, nm.code.len);
             let base = nm.code.base as usize;
             for reloc in nm.oop_relocs() {
+                if !include_key_klass && matches!(reloc.kind, RelocKind::KeyKlassOop) {
+                    continue;
+                }
                 debug_assert!(
                     (reloc.offset as usize) + 8 <= nm.code.len,
                     "oops_do: reloc offset {} + 8 exceeds nmethod {:?}'s own code length {}",
@@ -416,6 +430,30 @@ impl CodeTable {
         }
     }
 
+    /// S12 D5 point 2: nmethods whose OWN `key_klass` did NOT get marked by
+    /// the full GC's own just-finished mark pass (`oops_do`/`update_keys`
+    /// called with `include_key_klass: false`) — the receiver klass this
+    /// nmethod was customized for is genuinely dead (nothing else in the
+    /// live graph references it), so this nmethod must be flushed
+    /// (`CodeTable::flush`, S12 step 6). Must run strictly between phase A
+    /// (mark) and phase B (`forwarding_compute`): a klass's plain mark bit
+    /// is only meaningfully readable in that window — once `forwarding_
+    /// compute` reaches its address, a MARKED klass's header becomes a
+    /// forwarding pointer (no longer a plain mark word at all).
+    pub fn weak_sweep(&self) -> Vec<NmethodId> {
+        self.slots
+            .iter()
+            .flatten()
+            .filter(|nm| matches!(nm.state, NmState::Alive))
+            .filter(|nm| {
+                let obj = MemOop::try_from(nm.key_klass.oop())
+                    .expect("weak_sweep: key_klass must always be mem-shaped");
+                !obj.mark().gc_mark()
+            })
+            .map(|nm| nm.id)
+            .collect()
+    }
+
     /// `key_klass`/`key_selector` are plain Rust struct fields, not
     /// `MAP_JIT` memory — no guard needed, just `f`'s transform applied in
     /// place. Call [`Self::rehash`] afterward. Called by BOTH collectors:
@@ -431,14 +469,27 @@ impl CodeTable {
     /// vacated address, which a later full GC would then chase into poisoned
     /// memory. Found via `MACVM_GC_STRESS=1 + MACVM_JIT=threshold=1`
     /// together (see `Justfile`'s `gate-s11`).
-    pub fn update_keys(&mut self, f: &mut dyn FnMut(Oop) -> Oop) {
+    ///
+    /// `include_key_klass` (S12 D5, same rule as [`Self::oops_do`]'s own
+    /// parameter — pass the SAME value at both call sites, one call each
+    /// per collector phase): `false` only during a full GC's own mark
+    /// pass, so `key_klass` is left exactly as `weak_sweep` needs to find
+    /// it (a plain, not-yet-forwarded mark word); `key_selector` and every
+    /// `IcSite` field are ALWAYS visited regardless — D5's own text: only
+    /// the key is weak, everything else stays strong (`key_selector`
+    /// specifically must survive even a dying key_klass, since D6's own
+    /// flush sweep still needs to read it).
+    pub fn update_keys(&mut self, include_key_klass: bool, f: &mut dyn FnMut(Oop) -> Oop) {
         for nm in self.slots.iter_mut().flatten() {
-            let nk = f(nm.key_klass.oop());
-            // SAFETY: a collector transform never changes an oop's shape,
-            // only (at most) its address — this was klass-shaped before,
-            // it's klass-shaped after (same reasoning as `roots.rs`'s own
-            // `root_klass!`/`root_sel!` macros, which this mirrors).
-            nm.key_klass = unsafe { KlassOop::from_oop_unchecked(nk) };
+            if include_key_klass {
+                let nk = f(nm.key_klass.oop());
+                // SAFETY: a collector transform never changes an oop's
+                // shape, only (at most) its address — this was
+                // klass-shaped before, it's klass-shaped after (same
+                // reasoning as `roots.rs`'s own `root_klass!`/`root_sel!`
+                // macros, which this mirrors).
+                nm.key_klass = unsafe { KlassOop::from_oop_unchecked(nk) };
+            }
             let ns = f(nm.key_selector.oop());
             nm.key_selector = unsafe { SymbolOop::from_oop_unchecked(ns) };
             // S11 D3: each IcSite's own selector is the SAME kind of
@@ -669,9 +720,11 @@ mod tests {
         assert_eq!(table.lookup(old_k, s), Some(id));
 
         // Simulate a full-GC move: the klass's address changes, exactly
-        // what `update_keys` would apply via a real `forward_chase`.
+        // what `update_keys` would apply via a real `forward_chase`. `true`
+        // -- this test is about `by_key` staying in sync after a move, not
+        // S12's weak-key mark filtering (a separate, later concern).
         let new_k = fake_klass(0x9000);
-        table.update_keys(&mut |oop| {
+        table.update_keys(true, &mut |oop| {
             if oop.raw() == old_k.oop().raw() {
                 new_k.oop()
             } else {
@@ -742,6 +795,141 @@ mod tests {
         let new_arr = ArrayOop::try_from(new_oop).expect("pool word must still be array-shaped");
         assert_eq!(new_arr.len(), 1);
         assert_eq!(new_arr.at(0), SmallInt::new(42).oop());
+    }
+
+    /// S12 D5 (`tests_s12.md`'s `weak_key_skipped_in_mark`): `include_key_
+    /// klass: false` must skip a `RelocKind::KeyKlassOop` pool word
+    /// entirely (a full GC's own mark-phase visitor must never receive
+    /// it) while still visiting an ordinary `RelocKind::Oop` word right
+    /// next to it; `true` must visit both — proving the filter is real,
+    /// not accidentally always-on or always-off.
+    #[test]
+    fn oops_do_skips_key_klass_reloc_when_excluded() {
+        let mut vm = test_vm();
+        let klass = vm.universe.array_klass;
+
+        let h = vm
+            .code_cache
+            .alloc(32)
+            .expect("code cache alloc for test blob");
+        let blob = CodeBlob {
+            code: vec![0u8; 32],
+            literal_off: 8,
+            relocs: Vec::new(),
+            listing: Vec::new(),
+        };
+        vm.code_cache.publish(h, &blob);
+        let ordinary_addr = unsafe { h.base.add(8) } as *mut u64;
+        let key_addr = unsafe { h.base.add(16) } as *mut u64;
+        vm.code_cache.patch_pool_word(ordinary_addr, 0x1111);
+        vm.code_cache.patch_pool_word(key_addr, 0x2222);
+
+        let sel = vm.universe.intern(b"weakKeyTestSelector");
+        let nm = fake_nmethod(klass, sel, h.base as usize, h.len);
+        let nm = Nmethod {
+            relocs: vec![
+                Reloc {
+                    offset: 8,
+                    kind: RelocKind::Oop,
+                },
+                Reloc {
+                    offset: 16,
+                    kind: RelocKind::KeyKlassOop,
+                },
+            ],
+            ..nm
+        };
+        vm.code_table.install(nm);
+
+        let mut seen: Vec<u64> = Vec::new();
+        vm.code_table.oops_do(false, &mut |word| seen.push(*word));
+        assert_eq!(
+            seen,
+            vec![0x1111],
+            "include_key_klass=false must skip the KeyKlassOop word"
+        );
+
+        seen.clear();
+        vm.code_table.oops_do(true, &mut |word| seen.push(*word));
+        seen.sort();
+        assert_eq!(
+            seen,
+            vec![0x1111, 0x2222],
+            "include_key_klass=true must visit both words"
+        );
+    }
+
+    /// S12 D5's Rust-side half of the same filter: `key_selector` (and, by
+    /// extension, everything else `update_keys` touches) is ALWAYS visited
+    /// — only `key_klass` is conditional on `include_key_klass`.
+    #[test]
+    fn update_keys_skips_key_klass_when_excluded() {
+        let mut table = CodeTable::new();
+        let k = fake_klass(0x1000);
+        let s = fake_selector(0x2000);
+        let nm = fake_nmethod(k, s, 0x4000, 16);
+        let id = table.install(nm);
+
+        let new_k = fake_klass(0x9000);
+        let new_s = fake_selector(0xA000);
+        table.update_keys(false, &mut |oop| {
+            if oop.raw() == k.oop().raw() {
+                new_k.oop()
+            } else if oop.raw() == s.oop().raw() {
+                new_s.oop()
+            } else {
+                oop
+            }
+        });
+        let nm2 = table.get(id).unwrap();
+        assert_eq!(
+            nm2.key_klass.oop().raw(),
+            k.oop().raw(),
+            "include_key_klass=false must leave key_klass untouched"
+        );
+        assert_eq!(
+            nm2.key_selector.oop().raw(),
+            new_s.oop().raw(),
+            "include_key_klass=false must still update key_selector (D5: only the key is weak)"
+        );
+
+        table.update_keys(true, &mut |oop| {
+            if oop.raw() == k.oop().raw() {
+                new_k.oop()
+            } else {
+                oop
+            }
+        });
+        let nm3 = table.get(id).unwrap();
+        assert_eq!(
+            nm3.key_klass.oop().raw(),
+            new_k.oop().raw(),
+            "include_key_klass=true must update key_klass"
+        );
+    }
+
+    /// S12 D5 point 2: a fresh key_klass, never marked this cycle, must
+    /// appear in `weak_sweep`'s own result (outside any full GC, F1's own
+    /// invariant guarantees no mark word has `MARK_GC_BIT` set); marking it
+    /// (mirroring what phase A itself does for a klass ALSO reachable some
+    /// other way) must exclude it.
+    #[test]
+    fn weak_sweep_finds_unmarked_key_klass() {
+        let mut vm = test_vm();
+        let klass = vm.universe.array_klass;
+        let sel = vm.universe.intern(b"weakSweepTestSelector");
+        let nm = fake_nmethod(klass, sel, 0x4000, 16);
+        let id = vm.code_table.install(nm);
+
+        assert_eq!(vm.code_table.weak_sweep(), vec![id]);
+
+        let obj = MemOop::try_from(klass.oop()).unwrap();
+        let m = obj.mark();
+        obj.set_mark(m.with_gc_mark(true));
+        assert_eq!(vm.code_table.weak_sweep(), Vec::<NmethodId>::new());
+
+        // Leave no visible trace on this shared well-known klass's mark.
+        obj.set_mark(m);
     }
 
     /// As above, but drives a real full GC — exercising `oops_do`'s

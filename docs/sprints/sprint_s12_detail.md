@@ -428,6 +428,46 @@ is kept alive by its nmethod — acceptable float, gone at the next full GC).
 > `eden.top` is a genuine walkable object at every point, including inside
 > the forced scavenge.
 
+> **STEP-5 NOTES (as-built).** (a) **`CodeTable::oops_do`/`update_keys`
+> both gained an `include_key_klass: bool` parameter**, threaded through
+> `each_code_root`'s own new second parameter (same name) — the ONLY thing
+> D5's weak-key rule touches. Every other call site (scavenge, always;
+> full GC's own update/rewrite phase) passes `true`; only full GC's OWN
+> mark phase passes `false`. The other three tables (`PicTable`/
+> `AdapterTable`/`MegaTable`) are completely unaffected — no key-klass
+> concept exists there (PIC guard klasses and adapter method oops stay
+> strong unconditionally, D5's own text), so their signatures didn't
+> change at all. (b) **`CodeTable::weak_sweep`** (D5 point 2) reads each
+> alive nmethod's `key_klass`'s plain mark bit — MUST run strictly between
+> phase A (mark) and phase B (`forwarding_compute`), the only window a
+> plain (not-yet-forwarded) mark bit is meaningful; `full_gc` now has an
+> explicit "phase A.5" for exactly this. (c) **D6's own flush mechanism
+> doesn't exist yet (that's step 6) — so `flush_set` is asserted empty
+> with a real (non-debug) `assert!`, not silently ignored.** Reasoned
+> through why: leaving a dead-key-klass nmethod un-flushed and letting
+> phase C's `forward_chase` reach its (never-forwarded, correctly-so)
+> `key_klass` would panic anyway via `forward_chase`'s OWN existing
+> `debug_assert!(is_forwarded())` — three phases later and one step
+> removed from the actual cause. The new `assert!` fails at the source
+> instead, with a message naming exactly what's missing. A companion
+> debug-only `debug_assert_weak_sweep_invariant` (D5 point 2's own
+> "dead key klass implies no live activation" check, walking
+> `runtime::frames::walk_frames`) is real, working code, not a stub —
+> unlike the flush itself, this check needs nothing from step 6 to be
+> meaningful, and costs nothing to build now. Both are moot today (the
+> S11 D8 bridge means `flush_set` is always empty and `walk_frames` never
+> finds a live compiled frame during a full GC at all) and become load-
+> bearing together once step 7 removes the bridge AND step 6 gives the
+> `assert!` something real to replace. (d) **New unit tests, not full
+> integration goldens** (`key_klass_death_flushes`, tests_s12.md gate item
+> 4, needs step 6's real flush to mean anything): `oops_do_skips_key_
+> klass_reloc_when_excluded`, `update_keys_skips_key_klass_when_excluded`,
+> `weak_sweep_finds_unmarked_key_klass` (`codecache::nmethod`) — each
+> proving ONE piece of the filter/sweep machinery directly and cheaply,
+> the same "verify the mechanism in isolation now, defer the full
+> end-to-end scenario to the step that completes it" approach step 4 used
+> for its own flagship test.
+
 ## Pitfalls
 
 - **P1 — exact PcDesc match or die.** The GC-path `oopmap_at` must panic on

@@ -90,29 +90,21 @@ fn mark(vm: &mut VmState) -> usize {
         oop
     });
 
-    // S10 D8: nmethod literal-pool oops are roots too. `mark_push` needs no
-    // `vm` (unlike `scavenge_oop`), so unlike scavenge.rs's integration this
-    // needs no `std::mem::take` — `vm.code_table` and the rest of `vm` are
-    // never touched at the same time.
-    vm.code_table.oops_do(&mut |word| {
-        let oop = Oop::from_raw(*word);
+    // S10/S11/S12 D4.1/D5: nmethod/adapter/PIC/mega pool oops, and (S12)
+    // any live compiled/adapter frame's own spill/RootSpill slots, are
+    // roots too — `each_code_root` is the single visitor for all of this
+    // (`memory::roots`'s own doc, `memory::scavenge`'s identical call
+    // site). `false`: this is full GC's own MARK pass, so the
+    // customization key klass is deliberately left UNMARKED (D5's weak
+    // rule — `weak_sweep`, called right after this function returns, reads
+    // exactly the mark bits this pass leaves behind to find nmethods whose
+    // key klass turned out to be genuinely dead). `mark_push` needs no
+    // `vm` (unlike `scavenge_oop`), so this needs no `std::mem::take`
+    // dance of its own — `each_code_root` already does that internally,
+    // for the ONE table (code_table) that actually needs it.
+    super::roots::each_code_root(vm, false, |_vm, oop| {
         mark_push(oop, &mut stack, &mut marked_bytes);
-    });
-    // S11 D6.1: c2i adapters' own embedded method-oop pool words, same
-    // treatment as `code_table` just above.
-    vm.adapters.oops_do(&mut |word| {
-        let oop = Oop::from_raw(*word);
-        mark_push(oop, &mut stack, &mut marked_bytes);
-    });
-    // S11 D4.3/D4.4: PIC/mega stubs' own embedded pool words, same
-    // treatment.
-    vm.pic_table.oops_do(&mut |word| {
-        let oop = Oop::from_raw(*word);
-        mark_push(oop, &mut stack, &mut marked_bytes);
-    });
-    vm.mega_table.oops_do(&mut |word| {
-        let oop = Oop::from_raw(*word);
-        mark_push(oop, &mut stack, &mut marked_bytes);
+        oop
     });
 
     while let Some(obj) = stack.pop() {
@@ -346,6 +338,42 @@ fn debug_assert_clean(vm: &VmState) {
     }
 }
 
+/// S12 D5 point 2's own invariant: a dead key klass implies no live
+/// activation of that nmethod exists (any live receiver would have marked
+/// the klass via its own header during phase A) — walks every currently
+/// live frame (`runtime::frames::walk_frames`) and asserts none of them is
+/// a `Compiled` activation of an nmethod in `flush_set`. Debug-only, like
+/// `debug_assert_clean` just above (an O(frames) walk, not a release-mode
+/// invariant — the plain `assert!` right at this function's own call site
+/// already gives release builds a real safety net for `flush_set` itself
+/// being non-empty; this is the deeper, diagnostic-only cross-check).
+/// Moot today (the S11 D8 bridge forbids a live compiled frame from ever
+/// coexisting with a running full GC at all, so `walk_frames` can only
+/// ever find interpreted frames here) — genuinely load-bearing the moment
+/// step 7 removes that bridge.
+#[cfg(debug_assertions)]
+fn debug_assert_weak_sweep_invariant(
+    vm: &VmState,
+    flush_set: &[crate::codecache::nmethod::NmethodId],
+) {
+    if flush_set.is_empty() {
+        return;
+    }
+    let mut frames = Vec::new();
+    crate::runtime::frames::walk_frames(vm, |fv| frames.push(fv));
+    for fv in frames {
+        if let crate::runtime::frames::FrameView::Compiled { nm, .. } = fv {
+            debug_assert!(
+                !flush_set.contains(&nm),
+                "weak_sweep: nmethod {nm:?} is in flush_set (its key_klass is unmarked) but a \
+                 live compiled activation of it still exists on the native stack -- a dead key \
+                 klass must imply no live activation (any live receiver would have marked the \
+                 klass via its own header during phase A)"
+            );
+        }
+    }
+}
+
 /// F: post-GC bookkeeping (SPEC §7.5 step 4, second half). Card-table reset
 /// is deliberately conservative — compaction moved old objects that may
 /// reference (also-moved) new-gen objects, and recomputing exact old→new
@@ -448,6 +476,36 @@ pub fn full_gc(vm: &mut VmState) -> Result<FullGcReport, GcStallError> {
     let marked_bytes = mark(vm);
     super::verify::dbg_oop_trace(vm, "full-gc-mark");
 
+    // --- A.5: weak sweep (S12 D5 point 2) --------------------------------
+    // Must run HERE, strictly between phase A and phase B: `weak_sweep`
+    // reads each alive nmethod's `key_klass`'s plain mark bit, which is
+    // only meaningful in this exact window (phase B is about to overwrite
+    // every MARKED object's header with a forwarding pointer; an
+    // UNMARKED/dead one has no such promise at all, so this check would be
+    // meaningless either before phase A finishes or after phase B starts
+    // touching that specific klass's address).
+    let flush_set = vm.code_table.weak_sweep();
+    #[cfg(debug_assertions)]
+    debug_assert_weak_sweep_invariant(vm, &flush_set);
+    // D6 (`CodeTable::flush` + the compiled-site invalidation sweep +
+    // `cache.free`) is S12 step 6's own deliverable, not yet callable —
+    // nothing in this sprint's test suite kills a klass yet
+    // (`key_klass_death_flushes` is step 6's own gate item), so
+    // `flush_set` is always empty today. This is the loud, honest signal
+    // if that ever stops being true before step 6 actually lands: leaving
+    // a dead-key-klass nmethod un-flushed here would panic anyway, a few
+    // lines down, the first time phase C's `forward_chase` tried to chase
+    // a klass phase B never gave a forwarding entry to (correctly so — it
+    // was never marked) — this just fails at the SOURCE instead of three
+    // phases later.
+    assert!(
+        flush_set.is_empty(),
+        "full_gc: {} nmethod(s) have a dead key_klass but CodeTable::flush doesn't exist yet \
+         (S12 step 6) -- a class was killed with a live nmethod still naming it before this \
+         sprint finished building the mechanism to handle that",
+        flush_set.len()
+    );
+
     // --- B ----------------------------------------------------------------
     let mut side_marks: SideMarks = HashMap::new();
     let (eden_plan, eden_new_top) =
@@ -473,49 +531,22 @@ pub fn full_gc(vm: &mut VmState) -> Result<FullGcReport, GcStallError> {
     {
         rewrite_entry(e);
     }
-    // S10 D8: nmethod literal-pool oops, same treatment as every other
-    // root — `forward_chase` reads phase B's already-computed (not yet
-    // applied) forwarding addresses, so this belongs in phase C alongside
-    // `for_each_root` above, ahead of phase D's actual slide. `forward_chase`
-    // needs no `vm` (like `mark_push`, unlike `scavenge_oop`), so this is a
-    // direct call, no `std::mem::take` needed. `key_klass`/`key_selector`
-    // are Rust-side root oops too (strong until S12, D8's own
-    // SPEC-QUESTION) — `rehash` afterward is mandatory: it rebuilds
-    // `by_key` from the post-forwarding values `update_keys` just wrote.
-    vm.code_table.oops_do(&mut |word| {
-        *word = forward_chase(Oop::from_raw(*word)).raw();
-    });
-    vm.code_table.update_keys(&mut forward_chase);
-    vm.code_table.rehash();
-    // S11 D6.1: c2i adapters' own embedded method-oop pool words, same
-    // phase-C treatment as `code_table` just above. Unlike `code_table`,
-    // `AdapterTable::by_method`'s own HashMap key (also the method oop's
-    // raw bits) is NOT rehashed here — deferred (`codecache::adapters`'
-    // own doc): a stale key only costs a redundant-but-correct rebuilt
-    // adapter on the next `get_or_make` for that method, never a
-    // correctness violation the way a stale pool word would be.
-    vm.adapters.oops_do(&mut |word| {
-        *word = forward_chase(Oop::from_raw(*word)).raw();
-    });
-    // S11 D4.3: PIC stubs' own embedded klass pool words, same phase-C
-    // treatment. `pairs`' own Rust-side `KlassOop` mirror also needs
-    // `update_keys` (same reasoning as `code_table`'s own `key_klass`) --
-    // no `rehash` equivalent needed, `PicTable` has no oop-keyed HashMap
-    // at all (it's keyed by the stub's own stable address).
-    vm.pic_table.oops_do(&mut |word| {
-        *word = forward_chase(Oop::from_raw(*word)).raw();
-    });
-    vm.pic_table.update_keys(&mut forward_chase);
-    // S11 D4.4: mega trampolines' own embedded selector pool words, same
-    // phase-C treatment. Unlike `AdapterTable`, `MegaTable::by_selector`
-    // IS rehashed here -- D4.4's own explicit ask ("rehashed after full
-    // GC like CodeTable"), and `rehash` itself just re-reads each entry's
-    // own (already-relocated, by `oops_do` just above) pool word rather
-    // than needing its own `forward_chase` pass.
-    vm.mega_table.oops_do(&mut |word| {
-        *word = forward_chase(Oop::from_raw(*word)).raw();
-    });
-    vm.mega_table.rehash();
+    // S10/S11/S12 D4.1/D5: nmethod/adapter/PIC/mega pool oops, and (S12)
+    // any live compiled/adapter frame's own spill/RootSpill slots, same
+    // treatment as every other root — `forward_chase` reads phase B's
+    // already-computed (not yet applied) forwarding addresses, so this
+    // belongs in phase C alongside `for_each_root` above, ahead of phase
+    // D's actual slide. `true`: unlike phase A's own mark call, the
+    // customization key klass IS rewritten here — D5's own text, "weak ≠
+    // unmaintained": a SURVIVING key's address must still be kept
+    // current, only a genuinely dead one (already asserted impossible
+    // above, pending step 6) is exempt from being marked THROUGH, never
+    // from being maintained. `forward_chase` needs no `vm` (like
+    // `mark_push`, unlike `scavenge_oop`), so `each_code_root`'s own
+    // internal `std::mem::take` dance (needed only for `code_table`, the
+    // one table `scavenge_oop`-style transforms actually require it for)
+    // costs nothing extra here.
+    super::roots::each_code_root(vm, true, |_vm, oop| forward_chase(oop));
     super::verify::dbg_oop_trace(vm, "full-gc-rewrite");
 
     // --- D ------------------------------------------------------------

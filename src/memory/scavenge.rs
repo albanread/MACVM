@@ -478,7 +478,11 @@ pub fn scavenge(vm: &mut VmState) -> Result<ScavengeReport, GcStallError> {
     // comment for why `scavenge_oop` can be passed directly here (matching
     // `for_each_root`'s call just above) even though the four embedded-pool
     // tables' own `oops_do` still wants a raw-`u64` closure internally.
-    super::roots::each_code_root(vm, scavenge_oop);
+    // `true`: scavenge never flushes an nmethod, so it always treats the
+    // customization key klass strongly too (S12 D5's weak rule is a
+    // full-GC-only concept — a young key klass is simply kept alive by its
+    // nmethod, acceptable float until the next full GC).
+    super::roots::each_code_root(vm, true, scavenge_oop);
 
     if let Some(err) = vm.universe.pending_stall.take() {
         return Err(err);

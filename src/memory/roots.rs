@@ -180,10 +180,19 @@ where
 /// well-knowns; nothing there touches `codecache` at all). Called
 /// separately from `for_each_root`, not folded into it, because it needs a
 /// DIFFERENT walk (`runtime::frames::walk_frames`, native-stack-aware) as
-/// its first data source — S12 step 4 wires this into `scavenge` only
-/// (`memory::scavenge::scavenge`'s own "strong everything" pass); full-GC's
-/// own mark/update phases keep their existing direct table calls until step
-/// 5 adds weak key-klass filtering on top of this same shape.
+/// its first data source. S12 step 4 wired this into `scavenge` (which
+/// always passes `include_key_klass: true` — scavenge never flushes, D5's
+/// own text: "treat all code-root kinds strongly at scavenge"); step 5
+/// wires it into full GC's own mark AND update/rewrite phases too, one
+/// call each, with DIFFERENT `include_key_klass` values (`false` for mark,
+/// `true` for update — see that parameter's own doc below).
+///
+/// `include_key_klass` only ever affects `code_table`'s own two calls
+/// below (`CodeTable::oops_do`/`update_keys`, S12 D5's weak-key rule) — the
+/// native-frame roots (receiver/args/self, never a customization key) and
+/// the other three tables (no key-klass concept at all: PIC guard klasses
+/// and adapter method oops stay strong unconditionally, D5's own text)
+/// are completely unaffected by it.
 ///
 /// Deliberately DEVIATES from `sprint_s12_detail.md`'s own D4.1 pseudocode
 /// signature (`fn each_code_root(vm: &mut VmState, f: &mut dyn FnMut(&mut
@@ -204,7 +213,7 @@ where
 /// of those four call sites before this function existed (moving a table
 /// out of `vm` first so a `vm`-capturing closure over the REST of `vm`
 /// never aliases the field being called through).
-pub fn each_code_root<F>(vm: &mut VmState, mut f: F)
+pub fn each_code_root<F>(vm: &mut VmState, include_key_klass: bool, mut f: F)
 where
     F: FnMut(&mut VmState, Oop) -> Oop,
 {
@@ -291,10 +300,10 @@ where
     // `(vm, Oop) -> Oop` shape via the take-and-restore dance explained in
     // this function's own doc comment above. --------------------------
     let mut code_table = std::mem::take(&mut vm.code_table);
-    code_table.oops_do(&mut |word| {
+    code_table.oops_do(include_key_klass, &mut |word| {
         *word = f(vm, Oop::from_raw(*word)).raw();
     });
-    code_table.update_keys(&mut |oop| f(vm, oop));
+    code_table.update_keys(include_key_klass, &mut |oop| f(vm, oop));
     code_table.rehash();
     vm.code_table = code_table;
 
