@@ -17,3 +17,4 @@ pub mod ir;
 pub mod jasm_assembler;
 pub mod oopmap;
 pub mod regalloc;
+pub mod scopes;
