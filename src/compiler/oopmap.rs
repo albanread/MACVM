@@ -19,11 +19,25 @@ use crate::compiler::regalloc::{Assignment, LiveInterval};
 /// `position`" reduces to "does the interval CURRENTLY assigned to slot i
 /// span `position`", checked directly against `intervals`.
 ///
-/// Liveness matches `LiveInterval::crosses_safepoint`'s own comparison
-/// exactly (`start <= position && end > position`, not `>=`): an interval
-/// whose only reference IS this safepoint's own argument list ends AT the
-/// call and does not need to survive it (that value is already consumed
-/// by the time the callee could observe the stack).
+/// Liveness is STRICTLY-INSIDE on both ends (`start < position && end >
+/// position`) — deliberately TIGHTER than `LiveInterval::
+/// crosses_safepoint`'s own `start <= position` spill POLICY comparison,
+/// because the two answer different questions. An interval whose only
+/// reference IS this safepoint's argument list ends AT the call (`end ==
+/// position`) and is already consumed — excluded, as before. But an
+/// interval that STARTS at this safepoint is the call's own DESTINATION:
+/// its value is produced by the RETURN, so for the whole duration of the
+/// call — exactly when a GC can walk this frame — its spill slot still
+/// holds uninitialized native-stack garbage that has never been written.
+/// The original `start <= position` included it, and the flagship gate's
+/// `GC_STRESS=1` run caught that as a real SIGSEGV the first time an
+/// alloc slow edge scavenged in a frame whose dst slot held nonzero
+/// stack junk (`allocation_fast_and_slow`; the mid-loop flagships dodged
+/// it only because THEIR dst slots happened to hold zeros, which read as
+/// a harmless smi). For the spill POLICY the `<=` form stays correct —
+/// the dst does need a slot assigned across the call — it just must not
+/// be TRACED at this particular safepoint; the next safepoint (start <
+/// position by then) covers it normally.
 pub fn build_for_position(intervals: &[LiveInterval], frame_slots: u16, position: u32) -> OopMap {
     let mut map = OopMap::empty();
     for iv in intervals {
@@ -33,7 +47,7 @@ pub fn build_for_position(intervals: &[LiveInterval], frame_slots: u16, position
         let Some(Assignment::Spill(slot)) = iv.assignment else {
             continue;
         };
-        if iv.start <= position && iv.end > position {
+        if iv.start < position && iv.end > position {
             debug_assert!(
                 slot.0 < frame_slots,
                 "build_for_position: slot {} out of range (frame_slots={frame_slots})",
@@ -180,6 +194,30 @@ mod tests {
         let intervals = vec![spilled(0, 0, true, 0, 10)];
         let map = build_for_position(&intervals, 1, 10);
         assert!(!map.is_oop(0));
+    }
+
+    /// An interval STARTING exactly at the safepoint position is the
+    /// call's own DESTINATION — its value is produced by the RETURN, so
+    /// its spill slot holds uninitialized native-stack garbage for the
+    /// whole duration of the call, exactly when a GC can walk the frame.
+    /// Regression for a real SIGSEGV the flagship gate's `GC_STRESS=1`
+    /// run caught (`allocation_fast_and_slow`: the alloc slow edge
+    /// scavenged, the map's original `start <= position` traced the
+    /// unwritten dst slot's stack junk as an oop, and `mark_word_raw`
+    /// dereferenced a 0-page address) — see `build_for_position`'s own
+    /// doc for the full liveness-vs-spill-policy distinction.
+    #[test]
+    fn oopmap_excludes_interval_starting_at_position() {
+        let intervals = vec![spilled(0, 0, true, 10, 20)];
+        let map = build_for_position(&intervals, 1, 10);
+        assert!(
+            !map.is_oop(0),
+            "a call's own dst (def AT the safepoint) must not be traced during the call"
+        );
+        // ...and the very next safepoint, once the value genuinely exists,
+        // covers it normally.
+        let map_later = build_for_position(&intervals, 1, 15);
+        assert!(map_later.is_oop(0));
     }
 
     /// A non-oop interval (e.g. a raw untagged scratch value) sharing the

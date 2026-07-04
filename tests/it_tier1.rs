@@ -2369,11 +2369,35 @@ fn allocation_fast_and_slow() {
     use macvm::interpreter::compiled_call::{enter_compiled, EnterResult};
     use macvm::runtime::lookup::klass_of;
 
-    let mut vm = test_vm();
+    // A DELIBERATELY TINY eden (32 KiB): the slow-path leg below fills eden
+    // honestly with real walkable objects (the old `eden.top = eden.end`
+    // lie can't survive a scavenge now — S12 step 7), and under debug's
+    // always-on scavenge-entry verify a default multi-MiB eden turns that
+    // honest fill into minutes of full-heap verify walks. 32 KiB overflows
+    // in a handful of allocations while still exercising the exact same
+    // slow edge.
+    let mut vm = VmState::with_options(VmOptions {
+        heap_mib: 64,
+        trace: Default::default(),
+        gc_stress: false,
+        gc_stress_full_period: None,
+        eden_kb: Some(32),
+        jit: JitMode::Off,
+    });
     // A 2-instance-var Slots class bound to a global (`AllocTarget`).
     for item in parser::parse_file("Object subclass: AllocTarget [ | a b | ]").expect("parse") {
         classdef::execute_top_item(&mut vm, item).expect("execute");
     }
+    // Tenure the class/metaclass/global NOW (S12 step 7: the slow-path leg
+    // below runs a REAL scavenge that would otherwise relocate a young
+    // AllocTarget klass, leaving every Rust-local KlassOop derived from it
+    // stale). Old gen is never touched by a scavenge, so deriving
+    // target_klass AFTER this keeps it valid through the slow-path
+    // collection -- the same "look up the live post-GC value, not a stale
+    // pre-GC local" idiom it_gc_jit's own alloc tests use.
+    vm.universe.tenuring_threshold = 0;
+    scavenge(&mut vm).expect("tenuring scavenge");
+    vm.universe.tenuring_threshold = 127;
     let target_sym = vm.universe.intern(b"AllocTarget");
     let target_assoc =
         macvm::runtime::globals::global_lookup(&vm, target_sym).expect("AllocTarget global");
@@ -2460,13 +2484,12 @@ fn allocation_fast_and_slow() {
     // inline bump overflows -> rt_alloc_slow -> the ordinary alloc
     // cascade, which runs a REAL scavenge UNDER the live compiled frame
     // and then allocates in the freshly-emptied eden.
-    let array_klass = vm.universe.array_klass;
-    let chunk_elems = 4096usize;
-    let chunk_bytes = (HEADER_WORDS + chunk_elems) * 8;
-    while vm.universe.eden.end - vm.universe.eden.top >= chunk_bytes {
-        alloc::alloc_indexable_oops(&mut vm, array_klass, chunk_elems);
-    }
-    while vm.universe.eden.end - vm.universe.eden.top >= 32 {
+    // Tail-fill with real AllocTarget instances until less than one more
+    // fits — a 32 KiB eden makes this ~a thousand tiny allocations at
+    // most, sub-millisecond, no GC (gc_stress off) until the compiled
+    // slow edge itself forces one.
+    let need = target_klass.non_indexable_size() * macvm::oops::layout::WORD_SIZE;
+    while vm.universe.eden.end - vm.universe.eden.top >= need {
         alloc::alloc_slots(&mut vm, target_klass);
     }
     let gc_under_before = vm.universe.gc_stats.gc_under_compiled;
