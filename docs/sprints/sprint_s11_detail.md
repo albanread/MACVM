@@ -500,14 +500,21 @@ without S12's machinery; S12's first commit deletes it.
 > frame MUST fix up `compiled_depth` and re-adopt `reg_block.eden_top` at
 > every compiled boundary it crosses — a stranded `compiled_depth > 0`
 > freezes all allocation old-direct forever and never reclaims the
-> compiled window's eden bumps. (d) **Known pre-existing limitation, NOT a
-> step-8 regression** (verified: step-7's commit `100e830` fails the same
-> combo identically): `MACVM_GC_STRESS=1` + `MACVM_JIT=threshold=1`
-> TOGETHER panics in `full_gc` ("reachable but not forwarded") — the
-> compiled-frame-oop-invisibility issue S12 fixes and the full step-10 D8
-> bridge (`oops_do` over code-cache pools) mitigates. The established gate
-> runs gc-stress with JIT OFF, which passes; the two are not combined until
-> S12.
+> compiled window's eden bumps. (d) **A real pre-existing use-after-free,
+> found + FIXED as a follow-up (`b9a8fad`), NOT a step-8 regression**
+> (verified: step-7's `100e830` failed identically). Running
+> `MACVM_GC_STRESS=1` + `MACVM_JIT=threshold=1` TOGETHER for the first time
+> (the S10 gate deliberately kept them apart, "S12's flagship") panicked in
+> `full_gc` ("reachable but not forwarded"). Root cause was NOT
+> compiled-frame-oop invisibility (that's the bridge's job, and it holds) —
+> it was that the SCAVENGE updated code-cache POOL oops (`oops_do`) but
+> skipped the Rust-side identity oops (`CodeTable`/`PicTable`
+> `update_keys`/`rehash`, `MegaTable::rehash`, `IcState::Mono` klass) the
+> FULL GC did, so a scavenge relocating a young `key_selector` symbol left
+> the nmethod copy dangling. `Justfile`'s new `gate-s11` now runs the
+> combined axes (full world suite 3794/0 under both gc-stress modes ×
+> threshold=1), with a `scavenge_updates_nmethod_key_selector` regression
+> test.
 
 ## Pitfalls
 
