@@ -1,9 +1,16 @@
 //! Runtime support: the `VmState` god-struct, environment options, method
 //! lookup, primitives, and (later) activation stacks and deoptimization
 //! (SPEC §3, §6, §10). No `unsafe` here — everything above `oops`/`memory`
-//! stays safe Rust (CONVENTIONS §1).
+//! stays safe Rust (CONVENTIONS §1) — with ONE deliberate exception:
+//! `frames` (S12 D3), which walks the NATIVE call stack (compiled/stub
+//! frames have no Rust-visible representation at all) and so needs raw
+//! pointer reads no safe abstraction can provide — the same category of
+//! exception `codecache`'s own "sole owner of raw MAP_JIT pointer calls"
+//! boundary already establishes, just for stack memory instead of code
+//! memory.
 
 pub mod error;
+pub mod frames;
 pub mod globals;
 pub mod lookup;
 pub mod primitives;

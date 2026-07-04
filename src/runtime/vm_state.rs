@@ -40,6 +40,15 @@ pub struct VmRegBlock {
     /// stack-walking code reads when re-entering Rust from compiled code.
     pub last_compiled_fp: u64,
     pub last_compiled_pc: u64,
+    /// S12 D3: which of the 6 anchor-setting stubs wrote the anchor above —
+    /// see `layout::VMREG_LAST_COMPILED_KIND_OFFSET`'s own doc for why
+    /// `last_compiled_pc` alone can't answer this. Raw storage for
+    /// `runtime::frames::AdapterKind` (that module owns the enum <-> u64
+    /// mapping; kept a bare `u64` here rather than the enum itself so this
+    /// struct — laid out to match compiled code's fixed-offset `[x28, #N]`
+    /// stores — never needs `#[repr(C)]` reasoning about a foreign enum's
+    /// own representation).
+    pub last_compiled_kind: u64,
 }
 
 impl VmRegBlock {
@@ -53,6 +62,7 @@ impl VmRegBlock {
             _pad: 0,
             last_compiled_fp: 0,
             last_compiled_pc: 0,
+            last_compiled_kind: 0,
         }
     }
 }
@@ -477,6 +487,27 @@ pub struct VmState {
     /// field rather than a `#[cfg(test)]` one, matching `poll_flag`'s own
     /// "wired but usually inert" status.
     pub trace_on_poll: bool,
+    /// S12 D3 test-only hook, same "dormant, not `#[cfg(test)]`" status as
+    /// `trace_on_poll`: `codecache::stubs::rt_alloc_slow` (one of the six
+    /// anchor-setting stubs, so a real place `runtime::frames::walk_frames`
+    /// has real native frames to walk) checks this, and if armed
+    /// (`Some(Ok(Vec::new()))`), runs a real walk and overwrites it with
+    /// either the captured `FrameView` sequence or (`Err`) the message of a
+    /// panic the walk itself raised — caught with `catch_unwind` INSIDE the
+    /// stub's own Rust function, never allowed to unwind across the
+    /// `extern "C"` boundary back into hand-assembled native code (UB).
+    /// Exists because faking a native fp/pc pair by hand (rather than
+    /// letting a real compiled call establish one) would have
+    /// `walk_frames` dereference bogus stack memory — there is no way to
+    /// test this module honestly without a real in-flight native chain.
+    pub test_walk_capture: Option<Result<Vec<crate::runtime::frames::FrameView>, String>>,
+    /// Companion to `test_walk_capture`: if set, `rt_alloc_slow` pops
+    /// `vm.tier_links` immediately before running the armed walk —
+    /// `tests_s12.md`'s `walker_terminates_on_torn_tierlinks`, proving the
+    /// walker fails loudly (not silently or by looping forever) when its
+    /// own cross-check invariant (a native boundary always has a matching
+    /// tier link) breaks.
+    pub test_tear_tier_links_before_walk: bool,
 }
 
 impl VmState {
@@ -606,6 +637,8 @@ impl VmState {
             nlr_state: None,
             gc_pending: None,
             trace_on_poll: false,
+            test_walk_capture: None,
+            test_tear_tier_links_before_walk: false,
         };
         crate::runtime::globals::bootstrap_well_known(&mut vm);
         vm
@@ -753,8 +786,8 @@ mod tests {
     fn vmregblock_offsets_pinned() {
         use crate::oops::layout::{
             VMREG_BLOCK_SIZE, VMREG_CARD_BASE_BIASED_OFFSET, VMREG_EDEN_END_OFFSET,
-            VMREG_EDEN_TOP_OFFSET, VMREG_LAST_COMPILED_FP_OFFSET, VMREG_LAST_COMPILED_PC_OFFSET,
-            VMREG_OLD_START_OFFSET, VMREG_POLL_FLAG_OFFSET,
+            VMREG_EDEN_TOP_OFFSET, VMREG_LAST_COMPILED_FP_OFFSET, VMREG_LAST_COMPILED_KIND_OFFSET,
+            VMREG_LAST_COMPILED_PC_OFFSET, VMREG_OLD_START_OFFSET, VMREG_POLL_FLAG_OFFSET,
         };
         assert_eq!(
             std::mem::offset_of!(VmRegBlock, eden_top),
@@ -783,6 +816,10 @@ mod tests {
         assert_eq!(
             std::mem::offset_of!(VmRegBlock, last_compiled_pc),
             VMREG_LAST_COMPILED_PC_OFFSET
+        );
+        assert_eq!(
+            std::mem::offset_of!(VmRegBlock, last_compiled_kind),
+            VMREG_LAST_COMPILED_KIND_OFFSET
         );
         assert_eq!(std::mem::size_of::<VmRegBlock>(), VMREG_BLOCK_SIZE);
         // D6's other half: reg_block must sit at VmState's own offset 0, or

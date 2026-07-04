@@ -204,6 +204,28 @@ pub fn run_method(vm: &mut VmState, method: MethodOop, receiver: Oop, args: &[Oo
 /// interpreted frame beneath a compiled one this way) that, once fixed,
 /// surfaced this as a *different* method resuming at a wildly
 /// out-of-range bci belonging to whatever the nested call had run last.
+///
+/// S12 D3 adds a third thing that needs the same save/clear/restore
+/// treatment: `vm.reg_block.last_compiled_{fp,pc,kind}` (the anchor a
+/// runtime stub's own prologue writes before calling into Rust — this
+/// function's OWN caller, `rt_interpret_call`, is reached through exactly
+/// such a stub, `c2i_shared`). Left untouched, the anchor stays pointed at
+/// `c2i_shared`'s own frame for this call's ENTIRE duration — including
+/// while `method`'s own dispatch loop (just below) is genuinely the
+/// innermost activation on the real native stack. `runtime::frames::
+/// walk_frames` decides whether to start walking from the anchor or from
+/// `vm.stack` by checking only whether the anchor is nonzero; left stale
+/// here, a GC triggered by an allocation `method` itself performs (once
+/// S12 step 7 deletes the D8 bridge that currently forbids this
+/// entirely) would incorrectly start the walk from `c2i_shared`'s outer
+/// frame instead of `method`'s own, skipping every real root in between.
+/// Clearing `last_compiled_fp` on entry (mirroring `vm.stack`/`vm.regs`'
+/// own save/restore above) makes the anchor correctly read "no live stub
+/// frame more recent than vm.stack itself" for the whole time `method` is
+/// the true innermost activation, and restoring it afterward correctly
+/// hands the anchor back to whatever stub is still waiting outside this
+/// call (its own epilogue, not this function, is what eventually clears
+/// it for real).
 pub fn run_method_reentrant(
     vm: &mut VmState,
     method: MethodOop,
@@ -212,9 +234,22 @@ pub fn run_method_reentrant(
 ) -> Oop {
     let saved = vm.stack.save_activation();
     let saved_regs = vm.regs;
+    let saved_anchor = (
+        vm.reg_block.last_compiled_fp,
+        vm.reg_block.last_compiled_pc,
+        vm.reg_block.last_compiled_kind,
+    );
+    vm.reg_block.last_compiled_fp = 0;
+    vm.reg_block.last_compiled_pc = 0;
+    vm.reg_block.last_compiled_kind = 0;
     let result = run_method(vm, method, receiver, args);
     vm.stack.restore_activation(saved);
     vm.regs = saved_regs;
+    (
+        vm.reg_block.last_compiled_fp,
+        vm.reg_block.last_compiled_pc,
+        vm.reg_block.last_compiled_kind,
+    ) = saved_anchor;
     result
 }
 

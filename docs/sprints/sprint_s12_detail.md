@@ -285,6 +285,65 @@ is kept alive by its nmethod — acceptable float, gone at the next full GC).
 7. Delete the S11 bridge; flip the S11 bridge-assert test.
 8. Flagship gate runs + soak.
 
+> **STEP-3 NOTES (as-built).** (a) **The anchor needs a FOURTH field,
+> `last_compiled_kind`, this doc never anticipated.** D3's own text implies
+> a native frame's kind is derivable from its pc; it isn't, for the
+> anchor's own first frame specifically. Standard AArch64 convention means
+> x30 at a callee's own prologue is always the CALLER's resume address —
+> so `last_compiled_pc` (x30 captured by `emit_stub_prologue`) describes
+> the anchor-setting stub's own CALLER (a real compiled method), never the
+> stub's own code, and none of the six anchor-setting stubs
+> (`resolve`/`c2i_shared`/`mega_shared`/`dnu`/`must_be_boolean`/
+> `alloc_slow`) is ever reached via a `bl`/`blr` from another stub or
+> adapter (per-instance c2i/mega trampolines and PICs are confirmed
+> tail-jump-only, never touching x30 — S11's own P2 invariant), so there
+> is no pc anywhere "inside" the stub's own code a lookup could classify.
+> Fixed by a new `VMREG_LAST_COMPILED_KIND_OFFSET` (`layout.rs`) + each of
+> the six stubs' own preamble tagging itself (`codecache::stubs::KIND_*`),
+> found via an adversarial-review pass on this exact design BEFORE
+> implementing — the same review also caught (b) below before it could
+> ship. (b) **The kind-tag write must NOT go inside the shared
+> `emit_stub_prologue`** — an earlier draft tried exactly that, using
+> x16/x17 as scratch; `build_c2i_shared`/`build_mega_shared` read x17/x16
+> (the method/selector oop carried through from the per-instance
+> trampoline's own tail-jump) as their OWN first instruction after the
+> prologue returns, so writing through either register there would have
+> clobbered dispatch itself on every c2i/mega call in the system. Fixed:
+> each of the six stubs tags itself, in its OWN preamble, using x9 (free
+> in all six, confirmed by direct inspection, not just the review's own
+> claim). (c) **A second, independently-found bug, NOT from the review:**
+> `interpreter::run_method_reentrant` (S11 D6.1's C2I entry point) didn't
+> save/clear/restore the anchor the way it already does for
+> `vm.stack`/`vm.regs`. Left alone, the anchor would stay pointed at the
+> OUTER `c2i_shared` frame for the whole duration of a reentrant
+> interpreted call — even while THAT call's own dispatch loop is genuinely
+> the innermost activation — so `walk_frames` (which decides where to
+> start purely by checking whether the anchor is nonzero) would have
+> started from the wrong, stale, outer frame for any GC triggered by an
+> allocation inside such a call. Moot today (the S11 D8 bridge this sprint
+> deletes in step 7 forbids exactly this), but would have been a live,
+> `GC_STRESS`-shaped corruption path the moment step 7 landed. Fixed by
+> giving the anchor the identical save/clear/restore treatment
+> `run_method_reentrant` already gives its other two pieces of "which
+> activation is currently innermost" state. (d) **`print_stack_trace` is
+> NOT re-pointed onto `walk_frames`**, despite this file's own text above —
+> see `runtime::frames`'s own module doc for the full reasoning (`stub_poll`
+> never tags the anchor, since GC root-scanning never needs it there, but a
+> `trace_on_poll`-triggered trace does; teaching `stub_poll`'s own
+> hand-rolled, wider-register-set prologue/epilogue to also tag itself is a
+> real, separate, riskier change to an already-working mechanism, deferred
+> rather than folded in here). `AdapterKind::Poll` stays in the enum,
+> documented as unreachable via the CURRENT walker (true for its actual,
+> GC-facing consumer), pending that follow-up. (e) Verified via a REAL
+> executed I→C→(native safepoint) chain (`AllocTarget basicNew`'s slow
+> edge, `walker_classifies_all_kinds`), not hand-faked native memory —
+> faking `last_compiled_fp` to an arbitrary value would have `walk_frames`
+> dereference bogus stack memory, so there is no honest way to test this
+> module without a real in-flight native call; the hook doing this
+> (`VmState::test_walk_capture`) catches the walker's own panics with
+> `catch_unwind` INSIDE the stub's `extern "C"` function, never letting one
+> unwind across that boundary into hand-assembled native frames (UB).
+
 ## Pitfalls
 
 - **P1 — exact PcDesc match or die.** The GC-path `oopmap_at` must panic on

@@ -8,7 +8,8 @@ use crate::compiler::assembler::{
 };
 use crate::compiler::jasm_assembler::JasmAssembler;
 use crate::oops::layout::{
-    ROOTSPILL_BYTES, VMREG_LAST_COMPILED_FP_OFFSET, VMREG_LAST_COMPILED_PC_OFFSET,
+    ROOTSPILL_BYTES, VMREG_LAST_COMPILED_FP_OFFSET, VMREG_LAST_COMPILED_KIND_OFFSET,
+    VMREG_LAST_COMPILED_PC_OFFSET,
 };
 use crate::oops::wrappers::{KlassOop, MethodOop, SymbolOop};
 use crate::oops::Oop;
@@ -19,6 +20,23 @@ use super::nmethod::{IcState, NmethodId};
 use super::pics::PIC_MAX_ENTRIES;
 use super::{CodeCache, CodeHandle};
 
+/// S12 D3: `runtime::frames::AdapterKind`'s raw wire values, written by
+/// [`emit_stub_kind_tag`] and read back by the frame walker via
+/// `VmRegBlock::last_compiled_kind`. Owned HERE (not in `runtime::frames`)
+/// because this is the module that actually emits the `movz`/`str` writing
+/// them — `frames.rs`'s `AdapterKind::from_raw`/`as_raw` just mirror these
+/// same six numbers. `Poll` has no entry: `stub_poll` never calls
+/// `emit_stub_prologue` at all (S10 D5.6: it never allocates/GCs, so it
+/// never needs the anchor), so this kind is never actually written --
+/// `frames.rs` keeps a `Poll` variant only for `AdapterKind`'s own
+/// completeness, provably dead on this specific path.
+pub const KIND_RESOLVE: u64 = 0;
+pub const KIND_C2I: u64 = 1;
+pub const KIND_MEGA: u64 = 2;
+pub const KIND_DNU: u64 = 3;
+pub const KIND_MUST_BE_BOOLEAN: u64 = 4;
+pub const KIND_ALLOC_SLOW: u64 = 5;
+
 /// D5's shared stub skeleton, part 1: anchor + AAPCS frame + RootSpill
 /// (x0..x5). Every stub that calls into Rust starts with this; follow with
 /// the stub's own `call_far`, then [`emit_stub_epilogue`]. `x28` must
@@ -27,6 +45,18 @@ use super::{CodeCache, CodeHandle};
 /// A free function taking `&mut dyn Assembler`, not a method, so it stays
 /// reusable across every stub builder in this module without any of them
 /// needing to share a common base type beyond the trait itself.
+///
+/// Deliberately does NOT also write `last_compiled_kind` (S12): an earlier
+/// draft tried folding that in here too, using x16/x17 as scratch for the
+/// immediate — but `build_c2i_shared`/`build_mega_shared` read x17/x16
+/// (the method/selector oop carried through from the per-instance
+/// adapter/mega trampoline's own tail-jump) as their OWN first instruction
+/// after this prologue returns, so writing through either register here
+/// would clobber it on every c2i/mega call in the system. Each of the 6
+/// callers below calls [`emit_stub_kind_tag`] itself, immediately after
+/// this, using a register IT has independently confirmed is free (x9 —
+/// none of the 6 touch it this early; matches `build_call_stub`'s own
+/// "caller-saved, x9-x11" scratch convention).
 pub fn emit_stub_prologue(a: &mut dyn Assembler) {
     a.emit("stp", &[x(29), x(30), mem_pre(31, -16)]);
     a.emit("mov", &[x(29), sp()]);
@@ -47,6 +77,22 @@ pub fn emit_stub_prologue(a: &mut dyn Assembler) {
     );
 }
 
+/// S12 D3: writes `last_compiled_kind` — called by each of the 6
+/// anchor-setting stubs' own preamble, immediately after
+/// `emit_stub_prologue` returns, using x9 (`build_call_stub`'s own
+/// "caller-saved, x9-x11" scratch precedent; independently confirmed free
+/// at this exact point in all 6 callers — none of them reads x9 before
+/// their own first `mov`/`ldr` off x0-x5/x16/x17/x28/x30). `kind` is one of
+/// this module's own `KIND_*` constants, never `AdapterKind::Poll`'s
+/// value (unwritten by construction — see `emit_stub_prologue`'s own doc).
+fn emit_stub_kind_tag(a: &mut dyn Assembler, kind: u64) {
+    a.emit("movz", &[x(9), imm(kind as i64)]);
+    a.emit(
+        "str",
+        &[x(9), mem(28, VMREG_LAST_COMPILED_KIND_OFFSET as i64)],
+    );
+}
+
 /// Part 2: clears the anchor (P9 — a stale anchor makes S12's walker walk
 /// freed frames), reloads x0..x5 from RootSpill, tears down the frame.
 /// Does NOT emit the final `ret`/`br`/`b` — callers differ on that (plain
@@ -62,6 +108,15 @@ pub fn emit_stub_epilogue(a: &mut dyn Assembler) {
     a.emit(
         "str",
         &[x(31), mem(28, VMREG_LAST_COMPILED_FP_OFFSET as i64)],
+    );
+    // S12: clear the kind tag alongside the fp (defense in depth, not load-
+    // bearing — nothing ever reads it while `last_compiled_fp == 0` — but a
+    // cleared-and-therefore-obviously-wrong value is strictly better than a
+    // stale-but-plausible one if some future bug ever left `last_compiled_fp`
+    // stale too).
+    a.emit(
+        "str",
+        &[x(31), mem(28, VMREG_LAST_COMPILED_KIND_OFFSET as i64)],
     );
     a.emit("ldp", &[x(0), x(1), mem(31, 0)]);
     a.emit("ldp", &[x(2), x(3), mem(31, 16)]);
@@ -327,6 +382,7 @@ fn build_stub_resolve() -> CodeBlob {
     let mut a = JasmAssembler::new();
 
     emit_stub_prologue(&mut a);
+    emit_stub_kind_tag(&mut a, KIND_RESOLVE);
     a.emit("mov", &[x(0), x(28)]); // vm
     a.emit("mov", &[x(1), x(30)]); // ret_addr (captured before call_far clobbers x30)
     a.emit("sub", &[x(2), x(29), imm(ROOTSPILL_BYTES as i64)]); // argv = &RootSpill
@@ -611,6 +667,7 @@ fn build_c2i_shared() -> CodeBlob {
     let mut a = JasmAssembler::new();
 
     emit_stub_prologue(&mut a);
+    emit_stub_kind_tag(&mut a, KIND_C2I);
     a.emit("mov", &[x(0), x(28)]); // vm
     a.emit("mov", &[x(1), x(17)]); // method_bits, carried through from c2i_<method>
     a.emit("mov", &[x(2), sp()]); // argv = &RootSpill (x0..x5, contiguous)
@@ -693,6 +750,7 @@ fn build_mega_shared() -> CodeBlob {
     let mut a = JasmAssembler::new();
 
     emit_stub_prologue(&mut a);
+    emit_stub_kind_tag(&mut a, KIND_MEGA);
     a.emit("mov", &[x(0), x(28)]); // vm
     a.emit("mov", &[x(1), x(16)]); // selector_bits, carried through from mega_<sel>
     a.emit("mov", &[x(2), sp()]); // argv = &RootSpill (x0..x5, contiguous)
@@ -764,6 +822,7 @@ fn build_stub_dnu() -> CodeBlob {
     let mut a = JasmAssembler::new();
 
     emit_stub_prologue(&mut a);
+    emit_stub_kind_tag(&mut a, KIND_DNU);
     a.emit("mov", &[x(0), x(28)]); // vm
     a.emit("mov", &[x(1), x(30)]); // ret_addr, captured before call_far clobbers it
     a.emit("mov", &[x(2), sp()]); // argv = &RootSpill (x0..x5, contiguous)
@@ -876,6 +935,7 @@ fn build_stub_must_be_boolean() -> CodeBlob {
     let mut a = JasmAssembler::new();
 
     emit_stub_prologue(&mut a);
+    emit_stub_kind_tag(&mut a, KIND_MUST_BE_BOOLEAN);
     a.emit("mov", &[x(1), x(0)]); // val -> x1, before x0 is overwritten below
     a.emit("mov", &[x(0), x(28)]); // vm
     let lit = a.literal_u64(
@@ -937,6 +997,7 @@ fn build_stub_alloc_slow() -> CodeBlob {
     let mut a = JasmAssembler::new();
 
     emit_stub_prologue(&mut a);
+    emit_stub_kind_tag(&mut a, KIND_ALLOC_SLOW);
     a.emit("mov", &[x(2), x(1)]); // size_bytes -> x2 (read x1 before it's overwritten)
     a.emit("mov", &[x(1), x(0)]); // klass_bits -> x1 (read x0 before it's overwritten)
     a.emit("mov", &[x(0), x(28)]); // vm
@@ -990,6 +1051,34 @@ pub unsafe extern "C" fn rt_alloc_slow(vm: *mut VmState, klass_bits: u64, size_b
         size_bytes as usize,
         "rt_alloc_slow: the Alloc site's baked size must match the klass's own non_indexable_size"
     );
+    // S12 D3 test hook (`VmState::test_walk_capture`'s own doc): this is
+    // one of the six anchor-setting stubs, so it's a real place a test can
+    // observe `runtime::frames::walk_frames` against a genuine in-flight
+    // native chain rather than hand-faked memory. `catch_unwind` here (not
+    // at the test level) is load-bearing, not defensive style: a panic
+    // must never be allowed to unwind across this function's own
+    // `extern "C"` boundary into the hand-assembled native frames below it
+    // (UB) -- the walker's own panics (a real possibility this hook
+    // exists specifically to exercise, `walker_terminates_on_torn_
+    // tierlinks`) are caught and reported back through the Result instead.
+    if vm.test_walk_capture.is_some() {
+        if vm.test_tear_tier_links_before_walk {
+            vm.test_tear_tier_links_before_walk = false;
+            vm.tier_links.pop();
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut seen = Vec::new();
+            crate::runtime::frames::walk_frames(vm, |fv| seen.push(fv));
+            seen
+        }))
+        .map_err(|e| {
+            e.downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| e.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "walk_frames panicked with a non-string payload".to_string())
+        });
+        vm.test_walk_capture = Some(result);
+    }
     crate::memory::alloc::alloc_slots(vm, klass).oop().raw()
 }
 

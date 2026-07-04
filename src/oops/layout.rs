@@ -279,7 +279,23 @@ pub const VMREG_CARD_BASE_BIASED_OFFSET: usize = 24;
 pub const VMREG_POLL_FLAG_OFFSET: usize = 32;
 pub const VMREG_LAST_COMPILED_FP_OFFSET: usize = 40;
 pub const VMREG_LAST_COMPILED_PC_OFFSET: usize = 48;
-pub const VMREG_BLOCK_SIZE: usize = 56;
+/// S12 D3: which of the 6 anchor-setting runtime stubs (resolve, c2i_shared,
+/// mega_shared, dnu, must_be_boolean, alloc_slow) wrote the anchor —
+/// `last_compiled_pc` alone can't answer this (it's x30 at anchor-write
+/// time, which every one of these stubs sets to the same kind of value:
+/// the address INSIDE ITS OWN CALLER, never an address inside the stub's
+/// own code — none of them are ever reached via a `bl`/`blr` whose return
+/// address could instead be read back out of a deeper frame). Written by
+/// each of the 6 stubs' own preamble (never inside the shared
+/// `emit_stub_prologue` itself — an earlier draft tried that and it
+/// clobbers x16/x17, which `mega_shared`/`c2i_shared` carry a live
+/// selector/method oop through at exactly that point), cleared by
+/// `emit_stub_epilogue` alongside `last_compiled_fp` (defense in depth:
+/// a stale kind paired with a stale-but-nonzero fp should never be able to
+/// happen, but if it somehow did, clearing both make it fail loudly rather
+/// than plausibly).
+pub const VMREG_LAST_COMPILED_KIND_OFFSET: usize = 56;
+pub const VMREG_BLOCK_SIZE: usize = 64;
 
 /// S11 D4.1/D5/P8: the RootSpill area every runtime-reaching stub uses to
 /// park x0..x5 (receiver + up to 5 args) as GC roots while control is in
