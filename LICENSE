@@ -1,17 +1,6 @@
-MACVM — license PLACEHOLDER (to be confirmed by the project owner).
+BSD 2-Clause License
 
-Default intent: a BSD-2-Clause style license, consistent with the Self and
-Strongtalk lineage this project draws on. Replace this file with the final
-chosen text before any public distribution.
-
-Note on provenance: files adapted from Self or Strongtalk retain their original
-BSD-style license headers and are governed by those terms, not by this file.
-See docs/DESIGN.md §7.
-
--------------------------------------------------------------------------------
-BSD 2-Clause License (template)
-
-Copyright (c) 2026, the MACVM authors.
+Copyright (c) 2026, Alban Read
 
 Redistribution and use in source and binary forms, with or without
 modification, are permitted provided that the following conditions are met:
@@ -33,3 +22,9 @@ LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
 ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+-------------------------------------------------------------------------------
+
+Note on provenance: files adapted from Self or Strongtalk retain their original
+BSD-style license headers and are governed by those terms, not by this file.
+See docs/DESIGN.md §7.
