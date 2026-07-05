@@ -84,6 +84,18 @@ pub fn make_not_entrant(vm: &mut VmState, id: NmethodId) {
         vm.code_cache
             .write_branch26_at(code, verified_entry_off, not_entrant_addr);
     }
+
+    // §2c: redirect the saved-LR slot of every in-flight callee whose caller is
+    // an activation of `id` to `deopt_return_trampoline`, so those already-
+    // running activations deopt lazily when their callee returns (§2b only
+    // stops FUTURE entries; this is what handles the IN-FLIGHT ones). Plain
+    // native-stack writes — no JIT toggle / icache flush (unlike §2b's entry
+    // patching, which touches MAP_JIT code). The trampoline only exists with
+    // the JIT on; under `JitMode::Off` there is nothing compiled to invalidate,
+    // so `pending_deopts` stays empty and this is a walk over an empty native
+    // chain regardless.
+    let tramp = vm.stubs.deopt_return_addr();
+    crate::runtime::frames::redirect_returns_into_nm(vm, id, tramp);
 }
 
 /// D6.1/D6.2: flushes `id` — marks it `Zombie` and unhooks it from

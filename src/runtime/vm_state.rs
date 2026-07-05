@@ -2,7 +2,7 @@
 //! VM (CONVENTIONS §2: no statics/globals). S1 gives it a `Universe` and the
 //! options env parsing produces; later sprints add process/stack state.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::time::Instant;
 
@@ -144,6 +144,28 @@ pub enum TierLink {
         compiled_fp: u64,
         compiled_ret_pc: u64,
     },
+}
+
+/// S13 D1 §2c: one in-flight activation of a now-`NotEntrant` nmethod whose
+/// caller's (i.e. this activation's own callee's) saved-LR stack slot has been
+/// redirected to `deopt_return_trampoline` — so when that callee `ret`s, the
+/// trampoline runs a lazy return-path deopt of THIS activation instead of
+/// resuming its old compiled code (`sprint_s13_detail.md` D6).
+///
+/// Keyed in [`VmState::pending_deopts`] by the redirected activation's OWN FP
+/// (the callee's `saved_fp = [callee_fp]`, which is the nm activation's frame
+/// pointer). At trampoline entry, that FP is live in `x29` (the callee's
+/// epilogue `ldp` restored fp to its caller = this activation), so
+/// `rt_deopt_on_return` looks the entry up by it.
+#[derive(Clone, Copy, Debug)]
+pub struct PendingDeopt {
+    /// The ORIGINAL return address into the nm activation the redirected
+    /// saved-LR slot held before being overwritten — the pc whose `PcDesc`
+    /// names the call-return deopt site (`reexecute == false` by construction).
+    pub orig_ret_pc: usize,
+    /// The `NotEntrant` nmethod this activation is running (the deopt scope
+    /// chain + oop pool live here, GC-current).
+    pub nm: crate::codecache::nmethod::NmethodId,
 }
 
 /// S11 D6.3: a non-local return in flight across compiled frames — the
@@ -481,6 +503,22 @@ pub struct VmState {
     /// case in S10 — S11's `IntoInterpreter` links are what would make
     /// this something other than a redundant count).
     pub compiled_depth: u32,
+    /// S13 D1 §2c: in-flight activations of `NotEntrant` nmethods whose
+    /// callee return-address slots have been redirected to
+    /// `deopt_return_trampoline`, keyed by the redirected activation's OWN FP
+    /// (see [`PendingDeopt`]). `make_not_entrant`'s §2c walk inserts one entry
+    /// per redirected slot; `rt_deopt_on_return` `remove`s it when the callee
+    /// finally returns and the return-path deopt fires. Always empty under
+    /// `JitMode::Off` (nothing compiled ⇒ nothing to invalidate). A
+    /// redirected-but-never-returned entry (process exit, or an NLR unwinding
+    /// past the victim frame) is harmless dead data. Consulted by key both on
+    /// an actual trampoline return (`rt_deopt_on_return`) AND by
+    /// `frames::walk_frames`' `resolve_redirected_lr` — which, whenever a live
+    /// walk (a GC root scan, S12) crosses a redirected saved-LR slot, reads
+    /// this map to recover the victim's ORIGINAL return pc so its frame is
+    /// classified/oopmap-scanned at its real safepoint rather than the
+    /// trampoline address.
+    pub pending_deopts: HashMap<usize, PendingDeopt>,
     /// S11 D6.3: the parked target+value of a non-local return currently
     /// ESCAPING through one or more compiled frames. `continue_unwind` sets
     /// it (`Some`) when a block's home is on the far side of a c2i boundary
@@ -634,6 +672,7 @@ impl VmState {
             deopt_trampolines,
             tier_links: Vec::new(),
             compiled_depth: 0,
+            pending_deopts: HashMap::new(),
             nlr_state: None,
             trace_on_poll: false,
             test_walk_capture: None,

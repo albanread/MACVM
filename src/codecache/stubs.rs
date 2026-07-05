@@ -177,6 +177,12 @@ pub struct Stubs {
     /// [`build_not_entrant_stub`] for why this shares the resolve tail
     /// verbatim rather than being its own runtime function.
     pub not_entrant: CodeHandle,
+    /// S13 D6: the `deopt_return_trampoline` — the address §2c
+    /// ([`crate::runtime::frames::redirect_returns_into_nm`]) writes into an
+    /// in-flight `NotEntrant` activation's callee saved-LR slots, so a callee's
+    /// `ret` deopts the caller lazily instead of resuming old compiled code.
+    /// See [`build_deopt_return_trampoline`].
+    pub deopt_return: CodeHandle,
 }
 
 impl Stubs {
@@ -208,6 +214,11 @@ impl Stubs {
     /// nmethod's `entry`/`verified_entry` to branch to.
     pub fn not_entrant_addr(&self) -> u64 {
         self.not_entrant.base as u64
+    }
+    /// S13 D6: the address §2c redirects an in-flight `NotEntrant` activation's
+    /// callee saved-LR slots to (see [`build_deopt_return_trampoline`]).
+    pub fn deopt_return_addr(&self) -> u64 {
+        self.deopt_return.base as u64
     }
 
     /// Invokes `entry` (a compiled method's own entry point — an `Nmethod`'s
@@ -291,6 +302,12 @@ pub fn install(cache: &mut CodeCache) -> Stubs {
         .expect("stubs::install: code cache too small for not_entrant");
     cache.publish(h9, &not_entrant_blob);
 
+    let deopt_return_blob = build_deopt_return_trampoline();
+    let h10 = cache
+        .alloc(deopt_return_blob.code.len())
+        .expect("stubs::install: code cache too small for deopt_return");
+    cache.publish(h10, &deopt_return_blob);
+
     Stubs {
         call_stub: h1,
         stub_poll: h2,
@@ -301,6 +318,7 @@ pub fn install(cache: &mut CodeCache) -> Stubs {
         must_be_boolean: h7,
         alloc_slow: h8,
         not_entrant: h9,
+        deopt_return: h10,
     }
 }
 
@@ -716,6 +734,104 @@ fn build_not_entrant_stub() -> CodeBlob {
     a.emit("mov", &[x(16), x(0)]); // result -> x16 (P4: survives the epilogue's own x0 reload)
     emit_stub_epilogue(&mut a);
     a.emit("br", &[x(16)]);
+
+    a.finish()
+}
+
+/// S13 D6: `deopt_return_trampoline` — the RETURN-path sibling of
+/// `codecache::deopt_trap::build_uncommon_trampoline`. A callee's `ret` lands
+/// here when its saved-LR slot was redirected by §2c
+/// ([`crate::runtime::frames::redirect_returns_into_nm`]) because its caller is
+/// an in-flight activation of a now-`NotEntrant` nmethod.
+///
+/// **Entry state** (established by the returning callee's own epilogue
+/// `ldp x29,x30,[sp],#16; ret`): `x0` = the callee's result oop; `x29` = the
+/// VICTIM (nm-activation) FP — the `ldp` restored fp to the callee's caller,
+/// which IS the victim; `[x29+8]` = the victim's OWN caller's return address
+/// (untouched — §2c redirected the CALLEE's slot, never the victim's own).
+/// `x28` = `&VmState` (preserved across the whole compiled activation, AAPCS64
+/// callee-saved). This is exactly why `fp == victim_fp` holds here.
+///
+/// Shape vs [`crate::codecache::deopt_trap::build_uncommon_trampoline`] (D4):
+/// both build a walker-visible frame record (`[fp]=victim_fp`,
+/// `[fp+8]=<pc in victim nm>`) so a GC during the Rust call sees the victim
+/// compiled frame at its safepoint, and both tear the record + victim frame
+/// down and `ret` the deopt result to the victim's own caller. The RETURN path
+/// differs in two ways: (1) the classifying pc for the record is `orig_ret_pc`
+/// from `pending_deopts` (fetched via
+/// [`crate::codecache::deopt_trap::rt_deopt_return_pc`], a pure lookup), where
+/// D4 had the trap pc in `x16` from the signal handler; and (2) the callee's
+/// result flows THROUGH — saved in a callee-saved reg across the helper call,
+/// then handed to [`crate::codecache::deopt_trap::rt_deopt_on_return`] as
+/// `incoming_result`.
+///
+/// ```text
+///   mov  x19, x0                 // save callee result (x19 callee-saved)
+///   mov  x20, x29                // save victim_fp     (x20 callee-saved)
+///   mov  x0, x28                 // vm
+///   mov  x1, x20                 // victim_fp
+///   ldr  x16,<rt_deopt_return_pc>; blr x16   // x0 := orig_ret_pc (no alloc)
+///   mov  x30, x0                 // saved-lr := orig_ret_pc
+///   stp  x29, x30, [sp,#-16]!    // record: [fp]=victim_fp, [fp+8]=orig_ret_pc
+///   mov  x29, sp                 //   re-root fp onto the record
+///   mov  x0, x28                 // vm
+///   mov  x1, x20                 // victim_fp
+///   mov  x2, x19                 // result
+///   ldr  x16,<rt_deopt_on_return>; blr x16   // x0 := deopt result oop bits
+///   mov  sp, x20                 // tear down record + victim frame
+///   ldp  x29, x30, [sp], #16     // pop the VICTIM's own saved {fp,lr}
+///   ret                          // return the deopt result to the victim's caller
+/// ```
+///
+/// The teardown (`sp := victim_fp`) discards BOTH the trampoline record and the
+/// whole victim compiled frame, landing `sp` on the victim's own saved
+/// `{fp,lr}` pair (its caller's fp + real return address), which the `ldp` pops
+/// so the final `ret` returns the deopt result to the victim's ORIGINAL caller
+/// — the victim activation is gone after a return-path deopt, exactly as D4's
+/// trapped activation is gone after an uncommon-trap deopt. PAC is off
+/// (`arm64.md` §5), so rewriting `x30`/frame surgery needs no signing.
+fn build_deopt_return_trampoline() -> CodeBlob {
+    let mut a = JasmAssembler::new();
+
+    // Save the two live inputs into callee-saved regs so they survive both
+    // calls: x19 = callee result, x20 = victim_fp.
+    a.emit("mov", &[x(19), x(0)]);
+    a.emit("mov", &[x(20), x(29)]);
+
+    // Fetch orig_ret_pc (the victim's original return address into the nm) via
+    // a pure map lookup — no allocation, so safe to call before the walker-
+    // visible record exists.
+    a.emit("mov", &[x(0), x(28)]); // vm
+    a.emit("mov", &[x(1), x(20)]); // victim_fp
+    let pc_lit = a.literal_u64(
+        crate::codecache::deopt_trap::rt_deopt_return_pc as *const () as u64,
+        Some(RelocKind::RuntimeAddr),
+    );
+    a.call_far(pc_lit);
+
+    // Build the D4-shape walker-visible frame record: [fp]=victim_fp,
+    // [fp+8]=orig_ret_pc, then re-root fp onto it so a GC inside
+    // rt_deopt_on_return classifies the victim frame at its return safepoint.
+    a.emit("mov", &[x(30), x(0)]); // saved-lr := orig_ret_pc
+    a.emit("stp", &[x(29), x(30), mem_pre(31, -16)]);
+    a.emit("mov", &[x(29), sp()]);
+
+    // Marshal (vm, victim_fp, result) and run the return-path deopt.
+    a.emit("mov", &[x(0), x(28)]); // vm
+    a.emit("mov", &[x(1), x(20)]); // victim_fp (the pending_deopts key)
+    a.emit("mov", &[x(2), x(19)]); // result (incoming_result)
+    let rt_lit = a.literal_u64(
+        crate::codecache::deopt_trap::rt_deopt_on_return as *const () as u64,
+        Some(RelocKind::RuntimeAddr),
+    );
+    a.call_far(rt_lit);
+
+    // Teardown (D6): sp := victim_fp discards the trampoline record AND the
+    // whole victim frame; the ldp pops the victim's OWN saved {fp,lr}; ret
+    // returns the deopt result (still in x0) to the victim's original caller.
+    a.emit("mov", &[sp(), x(20)]);
+    a.emit("ldp", &[x(29), x(30), mem_post(31, 16)]);
+    a.emit("ret", &[]);
 
     a.finish()
 }

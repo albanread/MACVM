@@ -70,7 +70,7 @@ use crate::codecache::stubs::{
 };
 use crate::interpreter::stack::Frame;
 use crate::oops::layout::ENTRY_FRAME_SENTINEL;
-use crate::runtime::vm_state::{TierLink, VmState};
+use crate::runtime::vm_state::{PendingDeopt, TierLink, VmState};
 
 /// Which of the six anchor-setting runtime stubs a `FrameView::Adapter`
 /// belongs to (module doc above) — plus `Poll`, kept only for this enum's
@@ -195,6 +195,33 @@ fn call_stub_contains(vm: &VmState, pc: u64) -> bool {
     let h = vm.stubs.call_stub;
     let base = h.base as u64;
     pc >= base && pc < base + h.len as u64
+}
+
+/// S13 §2c: translate a native saved-LR read from a frame record back to the
+/// pc it names in the caller nmethod. Normally the identity — a saved-LR IS the
+/// caller's resume pc. But if §2c ([`redirect_returns_into_nm`]) redirected it
+/// to `deopt_return_trampoline` (because the caller `fp_next` is an in-flight
+/// `NotEntrant` activation awaiting a lazy return-path deopt), the raw slot no
+/// longer points inside that caller's nmethod; the ORIGINAL pc lives in
+/// `pending_deopts[fp_next]` (keyed by the victim/caller's own fp). Returning it
+/// keeps `find_by_pc` — and every walk consumer (GC root scan, the step-10
+/// zombie sweep) — classifying the victim frame at its true return safepoint.
+/// A one-`u64`-compare no-op whenever no redirect is pending (the common case).
+fn resolve_redirected_lr(vm: &VmState, fp_next: u64, saved_lr: u64) -> u64 {
+    if saved_lr == vm.stubs.deopt_return_addr() {
+        vm.pending_deopts
+            .get(&(fp_next as usize))
+            .unwrap_or_else(|| {
+                panic!(
+                    "walk_frames: saved-LR at fp {fp_next:#x} is deopt_return_trampoline but no \
+                     pending_deopts entry keys it -- §2c redirected a slot without recording its \
+                     origin (VM-consistency bug)"
+                )
+            })
+            .orig_ret_pc as u64
+    } else {
+        saved_lr
+    }
 }
 
 /// D3: walk every activation of the (single) process, innermost first,
@@ -332,6 +359,18 @@ pub fn walk_frames(vm: &VmState, mut f: impl FnMut(FrameView)) {
                     // every published nmethod.
                     let fp_next = unsafe { read_u64(fp) };
                     let pc_next = unsafe { read_u64(fp + 8) };
+                    // S13 §2c: if this frame's saved-LR was redirected to
+                    // `deopt_return_trampoline` (an in-flight `NotEntrant`
+                    // activation whose callee hasn't yet returned), the raw slot
+                    // no longer names a pc inside the caller (victim) nmethod —
+                    // `find_by_pc` would miss and the walk would panic. The real
+                    // return pc for classifying `fp_next` (the victim frame)
+                    // lives in `pending_deopts[fp_next]`. Translate it back so
+                    // the walk stays valid while a redirect is pending (a GC or
+                    // a later invalidation walk over the SAME chain — and the
+                    // step-10 zombie sweep, which counts a "redirected-LR" as a
+                    // live reference to the victim nm, §2c/D1.3).
+                    let pc_next = resolve_redirected_lr(vm, fp_next, pc_next);
                     Mode::NativeStep(fp_next, pc_next)
                 } else if call_stub_contains(vm, pc) {
                     f(FrameView::CallStub { fp });
@@ -385,6 +424,152 @@ pub fn walk_frames(vm: &VmState, mut f: impl FnMut(FrameView)) {
         "walk_frames: exceeded {MAX_WALK_STEPS} steps -- tier_links or the native fp-chain is \
          corrupt (torn, mismatched, or cyclic), not merely a very deep call stack"
     );
+}
+
+/// S13 D1 §2c — the lazy return-address redirection walk. `make_not_entrant`
+/// calls this AFTER it has patched `nm`'s entries (§2b): it walks the native
+/// stack (reusing [`walk_frames`], which already threads the interpreter↔
+/// compiled boundaries) and, for every NATIVE frame `F` (a `Compiled` nmethod
+/// frame or an `Adapter` runtime-stub frame) whose saved-LR slot `[F.fp + 8]`
+/// points INTO `nm`'s published code range — i.e. `F`'s caller is an in-flight
+/// activation of the now-`NotEntrant` `nm` — it:
+///
+/// - records `PendingDeopt { orig_ret_pc: [F.fp+8], nm }` keyed by
+///   `saved_fp = [F.fp]` (the nm activation's OWN fp), and
+/// - overwrites the saved-LR STACK SLOT at `F.fp + 8` with `tramp` (the
+///   `deopt_return_trampoline` address) — PLAIN NATIVE-STACK DATA, so no JIT
+///   write toggle and no icache flush (contrast §2b's MAP_JIT entry patching:
+///   this is the process stack, not code).
+///
+/// The nm activation's OWN frame is never touched — it keeps running old code
+/// until control next returns into the redirected slot (this path), traps, or
+/// (step 10) polls. `saved_fp`/`saved_lr` follow the standard AArch64 frame
+/// record: `[F.fp] = caller's fp`, `[F.fp+8] = return address into caller`.
+///
+/// **Idempotence / double-invalidation.** A slot already pointing at `tramp`
+/// (an earlier §2c redirect for a DIFFERENT nm, or a re-run for the same one)
+/// is left untouched and not re-inserted — its `PendingDeopt` was recorded when
+/// the redirect first happened, keyed by that activation's own fp; overwriting
+/// `orig_ret_pc` with `tramp` would lose the real return address. Interpreted
+/// and `CallStub` boundary frames carry no native saved-LR into compiled code
+/// and are skipped.
+///
+/// Only reads/writes native-stack slots via this module's own [`read_u64`] /
+/// [`write_u64`], never re-deriving raw offsets elsewhere.
+pub fn redirect_returns_into_nm(vm: &mut VmState, nm: NmethodId, tramp: u64) {
+    // The target nm's published code range. A miss means the caller passed an
+    // uninstalled id — a VM bug, since §2c runs on an nmethod §2a/§2b just
+    // touched.
+    let (lo, hi, pcdescs, scopes_blob) = {
+        let n = vm
+            .code_table
+            .get(nm)
+            .expect("redirect_returns_into_nm: nm must be installed");
+        let base = n.code.base as u64;
+        // Cloned so the closure below can read the deopt metadata without
+        // holding a `&vm` borrow across `walk_frames(vm, ...)` — small, and
+        // §2c is rare (invalidation only).
+        (
+            base,
+            base + n.code.len as u64,
+            n.deopt_pcdescs.clone(),
+            n.deopt_scopes.clone(),
+        )
+    };
+
+    // Read-only walk first (like `flush.rs`'s own frame-walk): collect the
+    // slots to redirect into an owned Vec, because the walk borrows `vm`
+    // immutably while the writes below need `&mut vm.pending_deopts`. Each
+    // entry is `(slot_addr = F.fp+8, saved_fp = [F.fp], orig_ret_pc = [F.fp+8])`.
+    struct Redirect {
+        slot_addr: u64,
+        saved_fp: usize,
+        orig_ret_pc: usize,
+    }
+    let mut to_redirect: Vec<Redirect> = Vec::new();
+    walk_frames(vm, |fv| {
+        // Only NATIVE frames (`Compiled`/`Adapter`) have a native saved-LR slot
+        // at `[fp+8]` that could be a return address into `nm`'s compiled code.
+        // For both, `[fp+8]` is the standard AArch64 saved-lr (the anchor
+        // stubs' `emit_stub_prologue` does `stp x29,x30`, so an `Adapter`'s
+        // `[fp+8]` == its `caller_pc`). Interpreted/CallStub frames are process-
+        // stack / boundary frames — skipped.
+        let fp = match fv {
+            FrameView::Compiled { fp, .. } => fp,
+            FrameView::Adapter { fp, .. } => fp,
+            FrameView::Interpreted { .. } | FrameView::CallStub { .. } => return,
+        };
+        // SAFETY: `fp` is a live native frame's own fp, established by
+        // `walk_frames`' own classification (single-threaded VM, no frame can
+        // be popped mid-walk). `[fp]`/`[fp+8]` are its saved {fp,lr} record.
+        let saved_lr = unsafe { read_u64(fp + 8) };
+        if saved_lr < lo || saved_lr >= hi {
+            return; // caller is not the target nm
+        }
+        // Already redirected (double-invalidation): leave the slot and its
+        // earlier `PendingDeopt` intact.
+        if saved_lr == tramp {
+            return;
+        }
+        // Only a reexecute=FALSE Call return site is a valid return-path deopt:
+        // the materializer pushes the callee's result onto that site's operand
+        // stack (D5 M3.3), which is meaningful only for a call return. Skip
+        // anything else this frame's saved-LR might point at inside `nm`:
+        // - an inline `Alloc`'s `alloc_slow` return is a reexecute=TRUE site
+        //   (re-executes `basicNew`, wants NO pushed result — `deoptimize_frame`
+        //   would assert), and
+        // - a loop-poll return / any non-recorded address has no deopt scope.
+        // A skipped frame just means the NotEntrant victim deopts at its NEXT
+        // call-return boundary instead — still correct (it runs old code until
+        // then, exactly as §2c's own "not touched until a boundary" rule says).
+        let code_off = (saved_lr - lo) as u32;
+        let is_call_return = pcdescs
+            .binary_search_by_key(&code_off, |d: &crate::compiler::scopes::PcDesc| d.code_off)
+            .ok()
+            .is_some_and(|idx| {
+                let site =
+                    crate::compiler::scopes::decode_site(&scopes_blob, pcdescs[idx].site_off);
+                !site.reexecute && matches!(site.kind, crate::compiler::scopes::SafepointKind::Call)
+            });
+        if !is_call_return {
+            return;
+        }
+        // SAFETY: same as above — `[fp]` is this frame's saved caller fp.
+        let saved_fp = unsafe { read_u64(fp) } as usize;
+        to_redirect.push(Redirect {
+            slot_addr: fp + 8,
+            saved_fp,
+            orig_ret_pc: saved_lr as usize,
+        });
+    });
+
+    for r in to_redirect {
+        // Record the pending deopt keyed by the nm activation's OWN fp, then
+        // overwrite the saved-LR stack slot with the trampoline. Plain data —
+        // no JIT toggle / icache flush.
+        vm.pending_deopts.insert(
+            r.saved_fp,
+            PendingDeopt {
+                orig_ret_pc: r.orig_ret_pc,
+                nm,
+            },
+        );
+        // SAFETY: `slot_addr` is `[F.fp+8]`, a live native-stack saved-LR slot
+        // this walk just read; overwriting it with the trampoline address is
+        // the whole point of §2c (single-threaded VM, slot stays live).
+        unsafe { write_u64(r.slot_addr, tramp) };
+    }
+}
+
+/// # Safety
+/// `addr` must be a live, 8-byte-aligned native-stack slot this walker's own
+/// classification just established (a native frame's `[fp+8]` saved-LR slot).
+/// Sound in this single-threaded VM because nothing can pop the frame out from
+/// under a redirect that runs to completion without yielding. Writes plain
+/// process-stack DATA — never MAP_JIT code — so no JIT write toggle or icache
+/// flush applies (contrast the §2b entry patching, which does).
+unsafe fn write_u64(addr: u64, val: u64) {
+    unsafe { *(addr as *mut u64) = val }
 }
 
 #[cfg(test)]
@@ -564,5 +749,350 @@ mod tests {
             err.contains("no matching TierLink::IntoCompiled left"),
             "got: {err}"
         );
+    }
+
+    // ── S13 step 9: `redirect_returns_into_nm` unit tests ─────────────────
+    //
+    // These build a HAND-LAID native fp-chain (a stack-local `[u64]` whose
+    // element addresses stand in for native frame pointers, exactly as
+    // `read_frame_slot_reads_offset` / `deopt.rs`'s materializer tests do) plus
+    // a matching anchor + one `IntoCompiled` tier link, so `walk_frames` walks
+    // it end to end WITHOUT a real compiled call — the redirection logic (which
+    // FrameView's slot gets rewritten, and to what key) is what's under test,
+    // not the (separately-tested) walk classification.
+
+    use crate::codecache::nmethod::{NmState, Nmethod};
+    use crate::codecache::CodeHandle;
+    use crate::compiler::assembler::CodeBlob;
+    use crate::oops::layout::{FRAME_SAVED_FP, MEM_TAG};
+    use crate::oops::Oop;
+
+    fn off_test_vm() -> VmState {
+        VmState::with_options(VmOptions {
+            heap_mib: 64,
+            trace: Default::default(),
+            gc_stress: false,
+            gc_stress_full_period: None,
+            eden_kb: None,
+            jit: crate::runtime::JitMode::Off,
+        })
+    }
+
+    /// Publish a tiny real blob so it has a genuine `[base, base+len)` code
+    /// range `find_by_pc` can classify a hand-built pc against.
+    fn install_blob(vm: &mut VmState, len: usize) -> CodeHandle {
+        let h = vm.code_cache.alloc(len).expect("code cache alloc");
+        let blob = CodeBlob {
+            code: vec![0u8; len],
+            literal_off: len as u32,
+            relocs: Vec::new(),
+            listing: Vec::new(),
+        };
+        vm.code_cache.publish(h, &blob);
+        h
+    }
+
+    fn fake_nmethod(vm: &mut VmState, addr: usize, sel: &[u8], code: CodeHandle) -> NmethodId {
+        // SAFETY: test-only tag-level klass shape, never dereferenced.
+        let klass = unsafe {
+            crate::oops::wrappers::KlassOop::from_oop_unchecked(Oop::from_raw(
+                addr as u64 + MEM_TAG,
+            ))
+        };
+        let selector = vm.universe.intern(sel);
+        vm.code_table.install(Nmethod {
+            id: NmethodId(0),
+            key_klass: klass,
+            key_selector: selector,
+            code,
+            entry_off: 0,
+            verified_entry_off: 0,
+            state: NmState::Alive,
+            level: 1,
+            version: 0,
+            literal_off: 0,
+            relocs: Vec::new(),
+            frame_slots: 0,
+            slot_is_oop: Vec::new(),
+            pcdescs: Vec::new(),
+            oopmaps: Vec::new(),
+            ic_sites: Vec::new(),
+            poll_bci: None,
+            deopt_scopes: Vec::new(),
+            deopt_pcdescs: Vec::new(),
+        })
+    }
+
+    /// `tests_s13.md`'s return-redirection walk: a hand-laid native chain
+    /// adapter → callee(compiled) → victim(compiled, the NotEntrant nm) →
+    /// call_stub → interpreter. Only the CALLEE frame's saved-LR points into
+    /// the victim's range (its caller IS the victim), so `redirect_returns_
+    /// into_nm(victim)` must (1) insert exactly one `pending_deopts` entry
+    /// keyed by the victim's OWN fp (= the callee's `saved_fp`), carrying the
+    /// original return pc, and (2) overwrite ONLY the callee's saved-LR STACK
+    /// SLOT with the trampoline address — leaving the victim's own frame, the
+    /// adapter, and every other slot untouched.
+    #[test]
+    fn redirect_walks_and_rewrites_only_the_callee_slot() {
+        let mut vm = off_test_vm();
+
+        // Two real published nmethods, distinct ranges: the victim (NotEntrant)
+        // and the callee whose return lands in the victim.
+        let victim_code = install_blob(&mut vm, 64);
+        let callee_code = install_blob(&mut vm, 64);
+        let victim = fake_nmethod(&mut vm, 0x1000, b"victim", victim_code);
+        let _callee = fake_nmethod(&mut vm, 0x2000, b"callee", callee_code);
+        // S13 §2c only redirects a return whose site is a reexecute=FALSE Call
+        // deopt scope — give the victim one at code_off 0x10 (the callee's
+        // return-into-victim offset below).
+        {
+            use crate::compiler::scopes;
+            let mut rec = scopes::ScopeDescRecorder::new();
+            let scope = rec.begin_scope(scopes::ScopeDescData {
+                method_pool_ix: 0,
+                is_block: false,
+                sender: None,
+                receiver: scopes::ValueLoc::Nil,
+                slots: vec![],
+                ctx: scopes::CtxLoc::None,
+            });
+            rec.record_site(
+                0x10,
+                scopes::SafepointState {
+                    scope,
+                    bci: 0,
+                    kind: scopes::SafepointKind::Call,
+                    reexecute: false,
+                    stack: vec![],
+                },
+            );
+            let (blob, pcdescs) = rec.pack();
+            let nm = vm.code_table.get_mut(victim).unwrap();
+            nm.deopt_scopes = blob;
+            nm.deopt_pcdescs = pcdescs;
+        }
+        let pc_in_victim = victim_code.base as u64 + 0x10;
+        let pc_in_callee = callee_code.base as u64 + 0x10;
+        let call_stub_pc = vm.stubs.call_stub.base as u64; // inside call_stub range
+
+        // One interpreted frame the walk lands on after the call_stub boundary;
+        // its saved_fp = ENTRY_FRAME_SENTINEL ends the walk. Only slot
+        // `interp_fp + FRAME_SAVED_FP` is read by the Interp arm.
+        let interp_fp = vm.stack.sp;
+        for _ in 0..(FRAME_SAVED_FP + 1) {
+            vm.stack.push(vm.universe.nil_obj);
+        }
+        vm.stack.set(
+            interp_fp + FRAME_SAVED_FP,
+            SmallInt::new(ENTRY_FRAME_SENTINEL).oop(),
+        );
+        vm.tier_links.push(TierLink::IntoCompiled {
+            interp_frame: interp_fp,
+            entry_sp: vm.stack.sp as u64,
+            nm_id: victim,
+        });
+
+        // The hand-laid native fp-chain. Each frame is a {saved_fp, saved_lr}
+        // pair; a frame's fp is the address of its saved_fp slot.
+        //   [0,1] adapter : saved_lr = 0 (harmless, not in victim range)
+        //   [2,3] callee  : saved_fp = victim_fp, saved_lr = pc_in_victim  <-- redirected
+        //   [4,5] victim  : saved_fp = &[6],      saved_lr = call_stub_pc
+        //   [6,7] below   : reached only as the call_stub frame (slots unread)
+        let mut arr = [0u64; 8];
+        let base = arr.as_ptr() as u64;
+        let adapter_fp = base;
+        let callee_fp = base + 16;
+        let victim_fp = base + 32;
+        let below_fp = base + 48;
+        arr[0] = callee_fp; // adapter.saved_fp -> callee
+        arr[1] = 0; // adapter.saved_lr (skip)
+        arr[2] = victim_fp; // callee.saved_fp -> victim (the pending_deopts KEY)
+        arr[3] = pc_in_victim; // callee.saved_lr -> INTO victim (redirect target)
+        arr[4] = below_fp; // victim.saved_fp -> below
+        arr[5] = call_stub_pc; // victim.saved_lr -> call_stub (ends native walk)
+
+        vm.reg_block.last_compiled_fp = adapter_fp;
+        vm.reg_block.last_compiled_pc = pc_in_callee;
+        vm.reg_block.last_compiled_kind = crate::codecache::stubs::KIND_ALLOC_SLOW;
+
+        let tramp = 0xDEAD_BEEF_0000u64;
+        redirect_returns_into_nm(&mut vm, victim, tramp);
+
+        // Exactly one entry, keyed by the victim's own fp, carrying the ORIGINAL
+        // return pc.
+        assert_eq!(vm.pending_deopts.len(), 1, "one redirect");
+        let pd = vm
+            .pending_deopts
+            .get(&(victim_fp as usize))
+            .expect("keyed by the victim (nm-activation) fp = callee.saved_fp");
+        assert_eq!(pd.orig_ret_pc, pc_in_victim as usize, "original return pc");
+        assert_eq!(pd.nm, victim, "the NotEntrant nm");
+
+        // ONLY the callee's saved-LR slot was rewritten to the trampoline.
+        assert_eq!(arr[3], tramp, "callee saved-LR -> trampoline");
+        assert_eq!(arr[1], 0, "adapter saved-LR untouched");
+        assert_eq!(arr[2], victim_fp, "callee saved-FP untouched");
+        assert_eq!(arr[5], call_stub_pc, "victim's OWN saved-LR untouched");
+    }
+
+    /// S13 §2c redirects ONLY reexecute=FALSE Call return sites. A callee whose
+    /// saved-LR lands on a reexecute=TRUE site in the victim (an inline Alloc's
+    /// `alloc_slow` return) is NOT redirected — the return-path deopt would push
+    /// a bogus `incoming_result` onto a re-execute site (`deoptimize_frame`'s own
+    /// assert). Same fp-chain as the test above, but the victim's site at 0x10 is
+    /// a reexecute=TRUE Alloc → zero redirects.
+    #[test]
+    fn redirect_skips_reexecute_true_return_site() {
+        let mut vm = off_test_vm();
+        let victim_code = install_blob(&mut vm, 64);
+        let callee_code = install_blob(&mut vm, 64);
+        let victim = fake_nmethod(&mut vm, 0x1000, b"victimAlloc", victim_code);
+        let _callee = fake_nmethod(&mut vm, 0x2000, b"calleeAlloc", callee_code);
+        {
+            use crate::compiler::scopes;
+            let mut rec = scopes::ScopeDescRecorder::new();
+            let scope = rec.begin_scope(scopes::ScopeDescData {
+                method_pool_ix: 0,
+                is_block: false,
+                sender: None,
+                receiver: scopes::ValueLoc::Nil,
+                slots: vec![],
+                ctx: scopes::CtxLoc::None,
+            });
+            rec.record_site(
+                0x10,
+                scopes::SafepointState {
+                    scope,
+                    bci: 0,
+                    kind: scopes::SafepointKind::Alloc,
+                    reexecute: true, // the Alloc re-execute case — must be skipped
+                    stack: vec![],
+                },
+            );
+            let (blob, pcdescs) = rec.pack();
+            let nm = vm.code_table.get_mut(victim).unwrap();
+            nm.deopt_scopes = blob;
+            nm.deopt_pcdescs = pcdescs;
+        }
+        let pc_in_victim = victim_code.base as u64 + 0x10;
+        let pc_in_callee = callee_code.base as u64 + 0x10;
+        let call_stub_pc = vm.stubs.call_stub.base as u64;
+
+        let interp_fp = vm.stack.sp;
+        for _ in 0..(FRAME_SAVED_FP + 1) {
+            vm.stack.push(vm.universe.nil_obj);
+        }
+        vm.stack.set(
+            interp_fp + FRAME_SAVED_FP,
+            SmallInt::new(ENTRY_FRAME_SENTINEL).oop(),
+        );
+        vm.tier_links.push(TierLink::IntoCompiled {
+            interp_frame: interp_fp,
+            entry_sp: vm.stack.sp as u64,
+            nm_id: victim,
+        });
+
+        let mut arr = [0u64; 8];
+        let base = arr.as_ptr() as u64;
+        let adapter_fp = base;
+        let callee_fp = base + 16;
+        let victim_fp = base + 32;
+        let below_fp = base + 48;
+        arr[0] = callee_fp;
+        arr[1] = 0;
+        arr[2] = victim_fp;
+        arr[3] = pc_in_victim; // callee.saved_lr -> a reexecute=TRUE site
+        arr[4] = below_fp;
+        arr[5] = call_stub_pc;
+
+        vm.reg_block.last_compiled_fp = adapter_fp;
+        vm.reg_block.last_compiled_pc = pc_in_callee;
+        vm.reg_block.last_compiled_kind = crate::codecache::stubs::KIND_ALLOC_SLOW;
+
+        redirect_returns_into_nm(&mut vm, victim, 0xDEAD_BEEF_0000u64);
+        assert!(
+            vm.pending_deopts.is_empty(),
+            "a reexecute=true (Alloc) return site is NOT a valid return-path deopt → skipped"
+        );
+        assert_eq!(
+            arr[3], pc_in_victim,
+            "the callee's saved-LR slot is left intact (not redirected)"
+        );
+    }
+
+    /// Double-invalidation: a re-run over a slot ALREADY pointing at the
+    /// trampoline is a no-op — the slot stays, and no second (wrong) entry is
+    /// inserted (which would clobber `orig_ret_pc` with the trampoline addr).
+    #[test]
+    fn redirect_is_idempotent_on_already_redirected_slot() {
+        let mut vm = off_test_vm();
+
+        let victim_code = install_blob(&mut vm, 64);
+        let callee_code = install_blob(&mut vm, 64);
+        let victim = fake_nmethod(&mut vm, 0x1000, b"victim2", victim_code);
+        let _callee = fake_nmethod(&mut vm, 0x2000, b"callee2", callee_code);
+        let pc_in_callee = callee_code.base as u64 + 0x10;
+        let call_stub_pc = vm.stubs.call_stub.base as u64;
+        // The REAL trampoline address: a live redirect always holds it, and the
+        // walker translates exactly it (via `pending_deopts`) back to the
+        // victim's real return pc as it steps past the redirected slot.
+        let tramp = vm.stubs.deopt_return_addr();
+
+        let interp_fp = vm.stack.sp;
+        for _ in 0..(FRAME_SAVED_FP + 1) {
+            vm.stack.push(vm.universe.nil_obj);
+        }
+        vm.stack.set(
+            interp_fp + FRAME_SAVED_FP,
+            SmallInt::new(ENTRY_FRAME_SENTINEL).oop(),
+        );
+        vm.tier_links.push(TierLink::IntoCompiled {
+            interp_frame: interp_fp,
+            entry_sp: vm.stack.sp as u64,
+            nm_id: victim,
+        });
+
+        let pc_in_victim = victim_code.base as u64 + 0x10;
+        let mut arr = [0u64; 8];
+        let base = arr.as_ptr() as u64;
+        let victim_fp = base + 32;
+        arr[0] = base + 16; // adapter.saved_fp -> callee
+        arr[1] = 0;
+        arr[2] = victim_fp; // callee.saved_fp -> victim
+        arr[3] = tramp; // callee.saved_lr ALREADY the trampoline
+        arr[4] = base + 48; // victim.saved_fp
+        arr[5] = call_stub_pc; // victim.saved_lr -> call_stub
+
+        // A live redirect ALWAYS has its matching pending_deopts entry (they are
+        // inserted together by §2c) — seed it, so the walker can translate the
+        // trampoline slot back to the victim's real return pc.
+        vm.pending_deopts.insert(
+            victim_fp as usize,
+            crate::runtime::vm_state::PendingDeopt {
+                orig_ret_pc: pc_in_victim as usize,
+                nm: victim,
+            },
+        );
+
+        vm.reg_block.last_compiled_fp = base;
+        vm.reg_block.last_compiled_pc = pc_in_callee;
+        vm.reg_block.last_compiled_kind = crate::codecache::stubs::KIND_ALLOC_SLOW;
+
+        redirect_returns_into_nm(&mut vm, victim, tramp);
+
+        assert_eq!(
+            vm.pending_deopts.len(),
+            1,
+            "the already-redirected slot must not insert a (wrong) second entry"
+        );
+        assert_eq!(
+            vm.pending_deopts
+                .get(&(victim_fp as usize))
+                .unwrap()
+                .orig_ret_pc,
+            pc_in_victim as usize,
+            "the pre-existing entry's orig_ret_pc is preserved (not clobbered to the trampoline)"
+        );
+        assert_eq!(arr[3], tramp, "slot still points at the trampoline");
     }
 }

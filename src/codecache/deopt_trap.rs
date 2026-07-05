@@ -556,6 +556,114 @@ pub unsafe extern "C" fn rt_uncommon_trap(
     crate::interpreter::interpret_active(vm, resume).raw()
 }
 
+/// D6 helper: the victim activation's ORIGINAL return pc, looked up (peek, no
+/// remove) in `pending_deopts` by the victim's fp. `deopt_return_trampoline`
+/// calls this FIRST, before building its walker-visible frame record, so that
+/// `[record_fp + 8]` can hold `orig_ret_pc` — a pc inside the victim nm — and a
+/// GC during the later `rt_deopt_on_return` call classifies the victim compiled
+/// frame at its true return safepoint (its oop map covers exactly that pc, D4).
+/// Pure lookup: no allocation, no GC, so it is safe to call before the record
+/// exists. A miss is the same VM bug [`rt_deopt_on_return`] panics on (only
+/// runs for a §2c-redirected slot); panicking here surfaces it one call
+/// earlier. `rt_deopt_on_return` does the actual `remove`.
+///
+/// # Safety
+/// Only reached via `blr` from `deopt_return_trampoline`; `vm` is `x28`, `fp`
+/// the victim's FP. Never called directly from Rust (tests aside).
+pub unsafe extern "C" fn rt_deopt_return_pc(
+    vm: *mut crate::runtime::vm_state::VmState,
+    fp: u64,
+) -> u64 {
+    // SAFETY: contract above.
+    let vm = unsafe { &mut *vm };
+    vm.pending_deopts
+        .get(&(fp as usize))
+        .unwrap_or_else(|| {
+            panic!(
+                "rt_deopt_return_pc: no pending deopt for victim fp {fp:#x} -- the return \
+                 trampoline fired for a slot §2c never redirected (VM-consistency bug)"
+            )
+        })
+        .orig_ret_pc as u64
+}
+
+/// D6: the `extern "C"` entry `deopt_return_trampoline` (`codecache::stubs`)
+/// calls after a callee returns into a redirected saved-LR slot of a
+/// `NotEntrant` nmethod activation. The sibling of [`rt_uncommon_trap`] on the
+/// RETURN path — the two differ in exactly two inputs to the SAME
+/// materialize+run machinery ([`crate::runtime::deopt::deoptimize_frame`] +
+/// [`crate::interpreter::interpret_active`], reused UNCHANGED):
+///
+/// - `pc = orig_ret_pc` (the original return address into the victim, whose
+///   `PcDesc` names a `SafepointKind::Call` deopt site — `reexecute == false`
+///   by construction, since it's a return address), vs the trap pc; and
+/// - `incoming_result = Some(result)` (the completed call's value, which the
+///   materializer pushes onto the innermost operand stack, D5 M3.3), vs `None`.
+///
+/// `fp` is the victim (nm) activation's OWN fp — the key
+/// [`crate::runtime::vm_state::VmState::pending_deopts`] was populated under by
+/// §2c ([`crate::runtime::frames::redirect_returns_into_nm`]). Consuming that
+/// entry yields `PendingDeopt { orig_ret_pc, nm }`; a MISSING entry is a VM bug
+/// (the trampoline only runs for a slot §2c redirected, which always inserts
+/// the entry first) → panic. Returns the deoptee's result oop raw bits, which
+/// the trampoline `ret`s to the victim's OWN caller (the activation is gone).
+///
+/// # Safety
+/// Only reached via `blr` from `deopt_return_trampoline`; `vm` is `x28`
+/// (`&mut VmState`), `fp` the victim activation's FP (restored into `x29` by
+/// the returning callee's epilogue), `result` the callee's own result oop.
+/// Never called directly from Rust (tests aside, which honor the same
+/// contract).
+pub unsafe extern "C" fn rt_deopt_on_return(
+    vm: *mut crate::runtime::vm_state::VmState,
+    fp: u64,
+    result: u64,
+) -> u64 {
+    // SAFETY: contract above — `vm` is the `x28` &mut VmState the trampoline
+    // forwarded.
+    let vm = unsafe { &mut *vm };
+
+    // NLR escaping through a redirected frame: the callee is propagating a
+    // non-local-return SENTINEL in x0, NOT a call result — §2c hijacked the
+    // exact native return edge (`[callee_fp+8]`) the NLR sentinel rides on (S11
+    // step 9). Do NOT deopt: drop the pending entry and hand the sentinel
+    // straight back, so the trampoline's teardown `ret`s it to the victim's
+    // caller — exactly what the victim's own `emit_nlr_check` at `orig_ret_pc`
+    // would have done had the return not been redirected. MUST precede the
+    // `Oop::from_raw` below: the sentinel (`0b0110`) is a reserved-tag word that
+    // trips `from_raw`'s debug tag check (→ abort across the extern "C" edge).
+    if result == crate::oops::layout::NLR_SENTINEL {
+        vm.pending_deopts.remove(&(fp as usize));
+        return crate::oops::layout::NLR_SENTINEL;
+    }
+
+    // Consume the pending deopt for THIS activation (keyed by its own fp). A
+    // miss is a VM bug: §2c redirects a slot only after inserting its entry, so
+    // the trampoline can never run for an fp with no entry.
+    let pending = vm.pending_deopts.remove(&(fp as usize)).unwrap_or_else(|| {
+        panic!(
+            "rt_deopt_on_return: no pending deopt for victim fp {fp:#x} -- the return \
+             trampoline fired for a slot §2c never redirected (VM-consistency bug)"
+        )
+    });
+
+    // Reuse the step-6/7 materialize+run path EXACTLY (same two calls
+    // `rt_uncommon_trap` makes): the ONLY differences are `pc = orig_ret_pc`
+    // and `incoming_result = Some(result)` — a call-return (reexecute == false)
+    // site, so `deoptimize_frame` pushes the result onto the innermost operand
+    // stack (D5 M3.3).
+    let resume = crate::runtime::deopt::deoptimize_frame(
+        vm,
+        crate::runtime::deopt::FrameView {
+            fp: fp as usize,
+            pc: pending.orig_ret_pc,
+            nm: pending.nm,
+            incoming_result: Some(Oop::from_raw(result)),
+        },
+    );
+    crate::interpreter::interpret_active(vm, resume).raw()
+}
+
 /// D3 step 4: the off-signal landing for a `0xDE02` compiled-assertion trap —
 /// a compiled-code "should not reach". This is always a VM bug, so it panics
 /// with the trap pc. `-> !`: it never returns to the assert stub.
@@ -819,6 +927,184 @@ mod tests {
             "the ambient (no-frame) outer activation was restored"
         );
     }
+
+    /// S13 step 9 — `rt_deopt_on_return` END-TO-END, driven directly like
+    /// `rt_uncommon_trap_runs_to_completion` (the trampoline's own call, minus
+    /// the native trampoline itself). Seeds `pending_deopts[fp]` with a Call
+    /// (reexecute == false) deopt site at `orig_ret_pc`, hand-builds the victim
+    /// physical frame, and calls `rt_deopt_on_return(vm, fp, result)`. Asserts
+    /// it consumes the pending entry, materializes with `incoming_result` pushed
+    /// on the operand stack (the deoptee resumes PAST the send), runs to
+    /// completion, and returns that result.
+    ///
+    /// Deoptee: `push_self; send #foo; return_tos`. The site is the RETURN of
+    /// `send #foo` (reexecute == false, resume bci PAST the 2-byte send at bci
+    /// 1 → bci 3), so the nested run does NOT re-run the send — it resumes at
+    /// `return_tos` with `incoming_result` already on the stack and delivers it.
+    #[test]
+    fn rt_deopt_on_return_runs_to_completion() {
+        use crate::bytecode::BytecodeBuilder;
+        use crate::compiler::scopes::{
+            CtxLoc, SafepointKind, SafepointState, ScopeDescData, ValueLoc,
+        };
+        use crate::oops::smi::SmallInt;
+        use crate::runtime::deopt::test_support::install_deopt_nmethod;
+        use crate::runtime::vm_state::{PendingDeopt, VmOptions, VmState};
+
+        let mut vm = VmState::with_options(VmOptions {
+            heap_mib: 64,
+            trace: Default::default(),
+            gc_stress: false,
+            gc_stress_full_period: None,
+            eden_kb: None,
+            jit: crate::runtime::JitMode::Off,
+        });
+
+        // `push_self; send #foo; return_tos`.
+        let method = {
+            let mut b = BytecodeBuilder::new();
+            b.push_self(); // bci 0
+            let foo = vm.universe.intern(b"foo");
+            b.send(&mut vm, foo, 0); // bci 1 (2 bytes) -> resume PAST at bci 3
+            b.ret_tos(); // bci 3
+            let sel = vm.universe.intern(b"deoptee_return_e2e");
+            b.finish(&mut vm, sel, 0, 0)
+        };
+
+        let nil = vm.universe.nil_obj;
+        let (nm_id, orig_ret_pc) = install_deopt_nmethod(
+            &mut vm,
+            method,
+            nil,
+            ScopeDescData {
+                method_pool_ix: 0,
+                is_block: false,
+                sender: None,
+                receiver: ValueLoc::FrameSlot(-8),
+                slots: vec![],
+                ctx: CtxLoc::None,
+            },
+            // The call site keys on its RETURN address offset (inside the code
+            // blob, which is the 16-byte pool). bci names the SEND (bci 1);
+            // reexecute == false; empty recorded stack (the result comes from
+            // incoming_result, not the recorded stack).
+            0x8,
+            SafepointState {
+                scope: 0, // overridden by install_deopt_nmethod
+                bci: 1,
+                kind: SafepointKind::Call,
+                reexecute: false,
+                stack: vec![],
+            },
+        );
+
+        // The victim (nm-activation) physical frame: receiver at FrameSlot -8.
+        let receiver_val = SmallInt::new(0x11).oop();
+        let phys: [u64; 2] = [receiver_val.raw(), 0];
+        let fp = (&phys[1]) as *const u64 as usize;
+
+        // The completed callee's result — what §2c's return path delivers as
+        // incoming_result and the deoptee's `return_tos` then returns.
+        let result_val = SmallInt::new(0x5A).oop();
+
+        // Seed the pending deopt exactly as §2c's redirection walk would have.
+        vm.pending_deopts.insert(
+            fp,
+            PendingDeopt {
+                orig_ret_pc,
+                nm: nm_id,
+            },
+        );
+
+        let sp_before = vm.stack.sp;
+        let deopt_before = vm.stats.deopt_count;
+
+        // Drive the codecache entry exactly as `deopt_return_trampoline` would.
+        // SAFETY: `vm` is a live &mut VmState; `fp` names the hand-built victim
+        // frame; `result_val` is the callee's result. The trampoline's own call.
+        let raw =
+            unsafe { rt_deopt_on_return(&mut vm as *mut VmState, fp as u64, result_val.raw()) };
+
+        assert_eq!(
+            raw,
+            result_val.raw(),
+            "rt_deopt_on_return delivers incoming_result (resumed past the send at return_tos)"
+        );
+        assert_eq!(vm.stats.deopt_count, deopt_before + 1, "one deopt counted");
+        assert_eq!(
+            vm.stack.sp, sp_before,
+            "the nested run unwound back to the pre-deopt watermark"
+        );
+        assert!(
+            !vm.stack.has_frame(),
+            "the ambient (no-frame) outer activation was restored"
+        );
+        assert!(
+            vm.pending_deopts.is_empty(),
+            "the pending_deopts entry was consumed (removed) by the return-path deopt"
+        );
+    }
+
+    /// S13 step 9 (NLR fix): an NLR sentinel escaping through a redirected
+    /// frame is NOT a call result — `rt_deopt_on_return` hands it straight back
+    /// (the trampoline propagates it) instead of materializing a frame from the
+    /// reserved-tag word. Without this, `Oop::from_raw(sentinel)` aborts (debug)
+    /// or the sentinel is pushed as a bogus operand + the NLR is swallowed
+    /// (release).
+    #[test]
+    fn rt_deopt_on_return_propagates_nlr_sentinel() {
+        use crate::codecache::nmethod::NmethodId;
+        use crate::runtime::vm_state::{PendingDeopt, VmOptions, VmState};
+
+        let mut vm = VmState::with_options(VmOptions {
+            heap_mib: 64,
+            trace: Default::default(),
+            gc_stress: false,
+            gc_stress_full_period: None,
+            eden_kb: None,
+            jit: crate::runtime::JitMode::Off,
+        });
+        let fp = 0xF00usize;
+        vm.pending_deopts.insert(
+            fp,
+            PendingDeopt {
+                orig_ret_pc: 0x1000,
+                nm: NmethodId(0),
+            },
+        );
+        let before = vm.stats.deopt_count;
+
+        // SAFETY: the NLR-sentinel arm returns before dereferencing nm/fp — the
+        // dummy PendingDeopt is never read, so no real nmethod/frame is needed.
+        let raw = unsafe {
+            rt_deopt_on_return(
+                &mut vm as *mut VmState,
+                fp as u64,
+                crate::oops::layout::NLR_SENTINEL,
+            )
+        };
+        assert_eq!(
+            raw,
+            crate::oops::layout::NLR_SENTINEL,
+            "the NLR sentinel is propagated verbatim, never deopted"
+        );
+        assert_eq!(
+            vm.stats.deopt_count, before,
+            "no deopt happens for an escaping NLR"
+        );
+        assert!(
+            vm.pending_deopts.is_empty(),
+            "the pending entry is dropped on the NLR path too"
+        );
+    }
+
+    // NB: the "missing `pending_deopts[fp]` panics" guard in `rt_deopt_on_
+    // return` / `rt_deopt_return_pc` is deliberately NOT unit-tested — a panic
+    // out of an `extern "C"` fn ABORTS (it cannot unwind across the C ABI), so
+    // `#[should_panic]` can't observe it. The guard is a documented VM-bug
+    // assertion (the trampoline only ever fires for a §2c-redirected slot, which
+    // always records the entry first); the safe walker's own analogue
+    // (`resolve_redirected_lr`, a plain Rust fn) carries the same invariant.
 
     /// `brk_imm_decode` (tests_s13.md): the encoder for `brk #0xDE00..02`
     /// round-trips through the handler's decode mask, and foreign brks —
