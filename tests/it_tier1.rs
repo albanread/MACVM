@@ -1025,6 +1025,38 @@ fn make_not_entrant_patches_entries_and_unhooks() {
     }
 }
 
+/// S13 step 10c (the zombie sweep): a full GC reclaims a `NotEntrant` nmethod
+/// that no live frame references, and disarms the §2d loop poll. Compile
+/// `plusArg:`, `make_not_entrant` it (which flips it NotEntrant AND arms the
+/// poll), then `full_gc`: with no in-flight frame and no pending redirect, the
+/// record + code block are freed and both poll flags clear.
+#[test]
+fn full_gc_zombies_unreferenced_not_entrant_and_disarms() {
+    let mut vm = test_vm();
+    let (id, _m_sel) = compile_plus_arg(&mut vm);
+    let base = vm.code_table.get(id).unwrap().code.base as u64;
+
+    macvm::codecache::flush::make_not_entrant(&mut vm, id);
+    assert!(vm.pending_deopt_flag, "make_not_entrant arms the §2d poll");
+
+    macvm::memory::fullgc::full_gc(&mut vm).expect("full_gc must succeed");
+
+    assert!(
+        vm.code_table.get(id).is_none(),
+        "the unreferenced NotEntrant nmethod is zombied + removed by the full GC"
+    );
+    assert_eq!(
+        vm.code_table.find_by_pc(base),
+        None,
+        "its code range returned to the free list"
+    );
+    assert!(
+        !vm.pending_deopt_flag,
+        "poll disarmed once no NotEntrant nmethod remains"
+    );
+    assert_eq!(vm.reg_block.poll_flag, 0, "poll_flag disarmed");
+}
+
 /// Compiles `plusArg: arg [ ^self + arg ]` for `smi_klass` and returns its
 /// nmethod id — the keystone-test fixture. Identical setup to
 /// `make_not_entrant_patches_entries_and_unhooks`, factored out so the two

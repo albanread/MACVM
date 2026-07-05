@@ -105,10 +105,13 @@ pub fn make_not_entrant(vm: &mut VmState, id: NmethodId) {
     // `stub_poll`; `pending_deopt_flag` is the runtime-side gate. This is a
     // GLOBAL arm — all loops in all frames now poll — but `rt_poll` only DEOPTS
     // a frame whose OWN nmethod is NotEntrant; a poll in any other frame sees no
-    // self-match and returns "continue" fast. `rt_poll` disarms both once no
-    // NotEntrant compiled frame remains, bounding the polling to the drain
-    // window. Idempotent: a second `make_not_entrant` before the first drains
-    // just re-sets an already-set flag.
+    // self-match and returns "continue" fast. The disarm is NOT done by
+    // `rt_poll` (it runs with an IntoCompiled tier link + no anchor — a stack
+    // walk there would abort); the step-10c zombie sweep
+    // ([`sweep_not_entrant_zombies`]) clears both flags at a GC-safe walk point
+    // once no NotEntrant nmethod remains. Idempotent: a second
+    // `make_not_entrant` before the first drains just re-sets an already-set
+    // flag.
     vm.pending_deopt_flag = true;
     vm.reg_block.poll_flag = 1;
 }
@@ -215,6 +218,57 @@ pub fn flush_nmethod(vm: &mut VmState, id: NmethodId) {
     // --- D6.1 step 4 ------------------------------------------------------
     let nm = vm.code_table.remove(id);
     vm.code_cache.free(nm.code);
+}
+
+/// S13 D1 §3 (step 10c): the ZOMBIE SWEEP. A `NotEntrant` nmethod that no live
+/// activation references has no old code left to complete, so it can finally be
+/// reclaimed — its record dropped and its code block returned to the free list
+/// ([`flush_nmethod`], which also resets any compiled caller's `bl` that still
+/// targeted it). Called by `memory::fullgc::full_gc` at its single
+/// between-mark-and-rewrite point (the one place a full stack walk is legal
+/// during GC — the same window the S12 weak sweep and its own
+/// `debug_assert_weak_sweep_invariant` use).
+///
+/// "Referenced" = any live compiled frame's nmethod (`walk_frames` already
+/// translates a step-9 redirected saved-LR back to the victim's real pc via
+/// `pending_deopts`, so a redirected in-flight frame is seen here) PLUS every
+/// `pending_deopts` target (belt-and-suspenders: a redirect not yet consumed
+/// keeps its nmethod's code alive for `deopt_return_trampoline`).
+///
+/// Once the last `NotEntrant` nmethod is gone, the §2d loop-poll arming is
+/// cleared — its whole job (deopting call-free NotEntrant loops that no return
+/// or trap can reach) is discharged, so every loop can stop paying the poll.
+/// This is the SAFE home for the disarm that [`make_not_entrant`] arms:
+/// `rt_poll` itself cannot walk the stack to decide (it runs with an
+/// `IntoCompiled` tier link and no anchor — it would abort), but a full GC can.
+pub fn sweep_not_entrant_zombies(vm: &mut VmState) {
+    let candidates = vm.code_table.not_entrant_ids();
+    if candidates.is_empty() {
+        return;
+    }
+
+    let mut referenced: std::collections::HashSet<NmethodId> = std::collections::HashSet::new();
+    crate::runtime::frames::walk_frames(vm, |fv| {
+        if let crate::runtime::frames::FrameView::Compiled { nm, .. } = fv {
+            referenced.insert(nm);
+        }
+    });
+    for pd in vm.pending_deopts.values() {
+        referenced.insert(pd.nm);
+    }
+
+    for id in candidates {
+        if !referenced.contains(&id) {
+            flush_nmethod(vm, id);
+        }
+    }
+
+    // §2d disarm: nothing NotEntrant left → no call-free loop can still need a
+    // poll deopt, so drop the global arm (and its per-loop poll cost).
+    if vm.code_table.not_entrant_ids().is_empty() {
+        vm.pending_deopt_flag = false;
+        vm.reg_block.poll_flag = 0;
+    }
 }
 
 #[cfg(test)]
@@ -414,5 +468,72 @@ mod tests {
              (klass_z, z_sel), never resurrects the old key"
         );
         assert_eq!(vm.code_table.lookup(klass_z, z_sel), Some(z_id));
+    }
+
+    /// S13 §3 (step 10c): the zombie sweep frees a `NotEntrant` nmethod that no
+    /// live frame references, and — being the last one — disarms the §2d loop
+    /// poll (`pending_deopt_flag` + `poll_flag`).
+    #[test]
+    fn zombie_sweep_frees_unreferenced_not_entrant_and_disarms() {
+        let mut vm = test_vm();
+        let sel = vm.universe.intern(b"gone:");
+        let klass = fake_klass(&mut vm, 0x1000);
+        let code = install_blob(&mut vm, 32);
+        let id = vm.code_table.install(fake_nmethod(klass, sel, code));
+
+        vm.code_table.set_not_entrant(id);
+        vm.pending_deopt_flag = true; // §2d arming, as make_not_entrant does
+        vm.reg_block.poll_flag = 1;
+
+        // A bare test VM has no native compiled frames, so nothing references it.
+        sweep_not_entrant_zombies(&mut vm);
+
+        assert!(
+            vm.code_table.get(id).is_none(),
+            "an unreferenced NotEntrant nmethod is zombied + removed"
+        );
+        assert!(
+            !vm.pending_deopt_flag,
+            "last NotEntrant gone -> pending_deopt_flag disarmed"
+        );
+        assert_eq!(vm.reg_block.poll_flag, 0, "poll_flag disarmed");
+    }
+
+    /// A `NotEntrant` nmethod with a still-outstanding redirected return (a live
+    /// `pending_deopts` entry naming it) is NOT reclaimed —
+    /// `deopt_return_trampoline` still needs its code — and the poll stays armed.
+    #[test]
+    fn zombie_sweep_keeps_pending_deopt_referenced() {
+        let mut vm = test_vm();
+        let sel = vm.universe.intern(b"pending:");
+        let klass = fake_klass(&mut vm, 0x2000);
+        let code = install_blob(&mut vm, 32);
+        let id = vm.code_table.install(fake_nmethod(klass, sel, code));
+
+        vm.code_table.set_not_entrant(id);
+        vm.pending_deopt_flag = true;
+        vm.reg_block.poll_flag = 1;
+        vm.pending_deopts.insert(
+            0xdead_beef,
+            crate::runtime::vm_state::PendingDeopt {
+                orig_ret_pc: 0x1234,
+                nm: id,
+            },
+        );
+
+        sweep_not_entrant_zombies(&mut vm);
+
+        assert!(
+            matches!(
+                vm.code_table.get(id).map(|n| n.state),
+                Some(NmState::NotEntrant)
+            ),
+            "a pending-redirect NotEntrant nmethod survives the sweep"
+        );
+        assert!(
+            vm.pending_deopt_flag,
+            "a NotEntrant frame is still pending -> stay armed"
+        );
+        assert_eq!(vm.reg_block.poll_flag, 1, "poll_flag stays armed");
     }
 }

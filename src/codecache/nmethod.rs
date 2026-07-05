@@ -508,6 +508,21 @@ impl CodeTable {
             .filter(|nm| matches!(nm.state, NmState::Alive))
     }
 
+    /// S13 §3 (step 10c): the ids of every currently-`NotEntrant` nmethod — the
+    /// candidate set the full-GC zombie sweep (`codecache::flush::
+    /// sweep_not_entrant_zombies`) tests against live frame references. The
+    /// counterpart to [`Self::iter_alive`]'s deliberate NotEntrant exclusion: a
+    /// NotEntrant nmethod is reclaimed ONLY here (→ `Zombie`), never by the
+    /// dead-key weak sweep.
+    pub fn not_entrant_ids(&self) -> Vec<NmethodId> {
+        self.slots
+            .iter()
+            .flatten()
+            .filter(|nm| matches!(nm.state, NmState::NotEntrant))
+            .map(|nm| nm.id)
+            .collect()
+    }
+
     /// S12 D6.1 step 1: marks `id` `Zombie` and removes it from `by_key` —
     /// `by_addr`/the slot itself deliberately stay put until [`Self::
     /// remove`] (step 4), so a concurrent walk this cycle still classifies

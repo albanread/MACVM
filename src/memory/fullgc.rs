@@ -492,6 +492,14 @@ pub fn full_gc(vm: &mut VmState) -> Result<FullGcReport, GcStallError> {
         crate::codecache::flush::flush_nmethod(vm, id);
     }
 
+    // --- A.6: S13 §3 zombie sweep ----------------------------------------
+    // Same window, same rationale as A.5: `walk_frames` is legal here, and
+    // freeing before phase B keeps any downstream updater off reclaimed code.
+    // A `NotEntrant` nmethod (redefinition / dependency invalidation, §2a) that
+    // no live frame references becomes `Zombie` and its code is freed; once
+    // none remain, the §2d loop-poll arming is cleared.
+    crate::codecache::flush::sweep_not_entrant_zombies(vm);
+
     // --- B ----------------------------------------------------------------
     let mut side_marks: SideMarks = HashMap::new();
     let (eden_plan, eden_new_top) =
