@@ -428,6 +428,42 @@ pub fn walk_frames(vm: &VmState, mut f: impl FnMut(FrameView)) {
                         )
                     });
                     match vm.tier_links[link_idx] {
+                        // S15 (OSR): an OSR transition POPPED the interpreter
+                        // frame it replaced; when that frame was the dispatch
+                        // loop's ENTRY frame, the link records the sentinel
+                        // (run_method's own spoof convention) — there is no
+                        // interpreter frame to visit, so consume the NEXT
+                        // boundary exactly like the sentinel-bottom arm does.
+                        TierLink::IntoCompiled { interp_frame, .. }
+                            if interp_frame == ENTRY_FRAME_SENTINEL as usize =>
+                        {
+                            if link_idx == 0 {
+                                Mode::Done
+                            } else {
+                                link_idx -= 1;
+                                match vm.tier_links[link_idx] {
+                                    TierLink::IntoInterpreter {
+                                        compiled_fp,
+                                        compiled_ret_pc,
+                                    } => {
+                                        Mode::Anchor(compiled_fp, compiled_ret_pc, AdapterKind::C2i)
+                                    }
+                                    TierLink::DeoptBridge {
+                                        dead_fp,
+                                        caller_ret_pc,
+                                    } => Mode::Anchor(
+                                        dead_fp,
+                                        caller_ret_pc,
+                                        AdapterKind::DeoptBridge,
+                                    ),
+                                    TierLink::IntoCompiled { .. } => panic!(
+                                        "walk_frames: an OSR'd entry frame's link must pair \
+                                         with IntoInterpreter/DeoptBridge below, found \
+                                         IntoCompiled"
+                                    ),
+                                }
+                            }
+                        }
                         TierLink::IntoCompiled { interp_frame, .. } => Mode::Interp(interp_frame),
                         TierLink::DeoptBridge { .. } => panic!(
                             "walk_frames: call_stub's own boundary must pair with \

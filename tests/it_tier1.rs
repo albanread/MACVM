@@ -6458,3 +6458,84 @@ fn osr_compile_emits_entry_and_map() {
         "closure-bearing methods are outside the v1 OSR envelope"
     );
 }
+
+/// S15 step 4 — THE OSR gate observable: a single long-running interpreted
+/// loop crosses LOOP_COUNTER_LIMIT backedges, transfers ONTO the compiled
+/// OSR entry mid-loop, finishes compiled, and the activation returns the
+/// identical result with NO method re-entry. Verified through the REAL
+/// jump_back slow path (run_method), with osr_entries bumped and the
+/// osr_table populated.
+#[test]
+fn osr_transitions_running_loop_via_jump_back() {
+    let mut vm = loop_test_vm();
+    let smi_klass = vm.universe.smi_klass;
+    let lt_sel = vm.universe.intern(b"<");
+    let plus_sel = vm.universe.intern(b"+");
+
+    // `osrSum: n [ |i s| i:=0. s:=0. [i<n] whileTrue:[s:=s+i. i:=i+1]. ^s ]`
+    // t0=n, t1=i, t2=s — TWO live loop variables cross the transfer.
+    let mut b = BytecodeBuilder::new();
+    b.push_smi_i8(0);
+    b.store_temp_pop(1);
+    b.push_smi_i8(0);
+    b.store_temp_pop(2);
+    let hdr = b.new_label();
+    b.bind(hdr);
+    b.push_temp(1);
+    b.push_temp(0);
+    b.send(&mut vm, lt_sel, 1);
+    let end = b.new_label();
+    b.br_false_fwd(end);
+    b.push_temp(2);
+    b.push_temp(1);
+    b.send(&mut vm, plus_sel, 1);
+    b.store_temp_pop(2);
+    b.push_temp(1);
+    b.push_smi_i8(1);
+    b.send(&mut vm, plus_sel, 1);
+    b.store_temp_pop(1);
+    b.jump_back(hdr);
+    b.bind(end);
+    b.push_temp(2);
+    b.ret_tos();
+    let m_sel = vm.universe.intern(b"osrSum:");
+    let method = b.finish(&mut vm, m_sel, 1, 2);
+    // Install so the OSR dispatch-truth guard (lookup(k,sel)==method) passes.
+    install_method(&mut vm, smi_klass, m_sel, method);
+
+    // n big enough to cross LOOP_COUNTER_LIMIT (10_000) mid-loop, plus a
+    // margin that must run COMPILED for the differential to mean anything.
+    let n = 25_000i64;
+    let expected: i64 = (0..n).sum();
+    let recv = SmallInt::new(0).oop();
+    let result = macvm::interpreter::run_method(&mut vm, method, recv, &[SmallInt::new(n).oop()]);
+    assert_eq!(
+        SmallInt::try_from(result).map(|s| s.value()),
+        Some(expected),
+        "the part-interpreted, part-compiled activation must answer exactly \
+         what pure interpretation would"
+    );
+    assert_eq!(vm.stats.osr_entries, 1, "exactly one OSR transition fired");
+    assert_eq!(vm.stats.osr_declined, 0, "nothing declined");
+    let sel = SymbolOop::try_from(method.selector()).expect("selector");
+    let osr_id = vm
+        .code_table
+        .lookup_osr(smi_klass, sel, /* hdr bci = */ 8)
+        .or_else(|| {
+            // header bci depends on builder widths; probe the table via the
+            // installed nmethod instead of hardcoding.
+            vm.code_table
+                .iter_all()
+                .find(|nm| nm.osr_map.is_some())
+                .map(|nm| nm.id)
+        })
+        .expect("an OSR nmethod was installed");
+    let nm = vm.code_table.get(osr_id).expect("alive");
+    assert!(nm.osr_map.is_some());
+
+    // A second run now enters the OSR nmethod through its NORMAL entry via
+    // the ordinary invocation trigger (it also serves future calls) — or
+    // re-OSRs; either way the answer is identical and nothing crashes.
+    let r2 = macvm::interpreter::run_method(&mut vm, method, recv, &[SmallInt::new(n).oop()]);
+    assert_eq!(SmallInt::try_from(r2).map(|s| s.value()), Some(expected));
+}

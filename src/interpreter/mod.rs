@@ -493,10 +493,50 @@ fn dispatch_from(vm: &mut VmState, mut method: MethodOop, mut bci: usize) -> Oop
             OP_JUMP_BACK => {
                 let d = read_u16(method, bci + 1);
                 let next = bci + 3;
+                // SPEC §5.5's pinned order: poll first, THEN the loop
+                // counter (A4).
                 if vm.reg_block.poll_flag != 0 {
                     poll(vm);
                 }
-                bci = next - d as usize;
+                let target = next - d as usize;
+                if crate::runtime::osr::bump_loop_counter(method) {
+                    // S15: offer this running frame for on-stack
+                    // replacement. `regs` is stamped first — it is the
+                    // scanned GC root the compiled window keeps current
+                    // and every non-Declined arm reloads from (the raw
+                    // `method` local may be STALE after a compiled run's
+                    // collections; only the Declined arm — whose window is
+                    // allocation-free — may keep using it).
+                    vm.regs.method = Some(method);
+                    vm.regs.bci = target;
+                    match crate::runtime::osr::rt_osr_request(vm, vm.stack.fp, target as u16) {
+                        crate::runtime::osr::OsrOutcome::Completed {
+                            result,
+                            entry_frame: true,
+                        } => return result,
+                        crate::runtime::osr::OsrOutcome::Completed {
+                            entry_frame: false, ..
+                        } => {
+                            method = regs_method(vm);
+                            bci = vm.regs.bci;
+                        }
+                        crate::runtime::osr::OsrOutcome::Nlr(step) => match step {
+                            unwind::UnwindStep::ReturnedFromHome(Some(result)) => return result,
+                            unwind::UnwindStep::Escaped => {
+                                return Oop::from_raw_unchecked(crate::oops::layout::NLR_SENTINEL)
+                            }
+                            _ => {
+                                method = regs_method(vm);
+                                bci = vm.regs.bci;
+                            }
+                        },
+                        crate::runtime::osr::OsrOutcome::Declined => {
+                            bci = target;
+                        }
+                    }
+                } else {
+                    bci = target;
+                }
             }
             OP_BR_TRUE_FWD => {
                 let d = read_u16(method, bci + 1);

@@ -233,6 +233,13 @@ pub const IC_POLY_ARRAY_LEN: usize = IC_POLY_MAX_PAIRS * 2;
 
 pub const COUNTERS_INVOCATION_MASK: i64 = 0xFFFF;
 pub const COUNTERS_INVOCATION_MAX: i64 = 0xFFFF;
+/// S15 (SPEC §5.5 / the §4.4 SPEC-QUESTION pin): the LOOP counter lives in
+/// bits 16-31 of `MethodOop.counters` — invocation:16 | loop:16 | rest.
+pub const COUNTERS_LOOP_SHIFT: u32 = 16;
+pub const COUNTERS_LOOP_MASK: i64 = 0xFFFF << COUNTERS_LOOP_SHIFT;
+/// Backedges through ONE method before the interpreter offers the running
+/// frame for OSR (SPEC §5.5). Well under the field's 65,535 ceiling.
+pub const LOOP_COUNTER_LIMIT: i64 = 10_000;
 /// S10 D1: set by `compiler::driver::compile_method` when `eligible`
 /// rejects a method, so the interpreter's counter-overflow trigger doesn't
 /// re-attempt (and re-reject) the same never-compilable method every 10k

@@ -15,6 +15,7 @@ pub mod error;
 pub mod frames;
 pub mod globals;
 pub mod lookup;
+pub mod osr;
 pub mod primitives;
 pub mod recompile;
 pub mod vm_state;
