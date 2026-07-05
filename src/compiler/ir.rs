@@ -408,6 +408,15 @@ pub struct IrMethod {
     /// reasoning as `true_lit`/`false_lit` above), so `convert()` resolves
     /// it once, here.
     pub call_sites: Vec<CallSiteInfo>,
+    /// S14 step 2 (A1 feedback annotation): the `SiteFeedback` observed for each
+    /// `call_sites` entry, SAME index — the receiver types the interpreter saw
+    /// at that send, read from its IC by `feedback::read_send_site` during
+    /// `convert`. Pure annotation in this step: the inliner (later steps) reads
+    /// it to decide speculate/inline/trap; emit ignores it (no behaviour change,
+    /// so listing goldens stay byte-stable). Kept parallel to `call_sites`
+    /// rather than a field on `CallSiteInfo` because `SiteFeedback` is not `Copy`
+    /// (its `Poly` arm owns a `Vec`) and `CallSiteInfo` is.
+    pub site_feedback: Vec<crate::compiler::feedback::SiteFeedback>,
     /// S13: the physical oop-pool index holding THIS method's own compiled
     /// `MethodOop`, interned (as `RelocKind::Oop`, so a moving GC keeps it
     /// current) at the end of `convert` — but ONLY when the method has at
@@ -696,6 +705,9 @@ struct Translator<'a> {
     /// indexes into this, same shape as `pool`'s own accumulate-then-hand-
     /// to-`IrMethod` pattern.
     call_sites: Vec<CallSiteInfo>,
+    /// S14 step 2: `SiteFeedback` per `call_sites` entry (same index), read from
+    /// each send's IC as it is lowered. See `IrMethod::site_feedback`.
+    site_feedback: Vec<crate::compiler::feedback::SiteFeedback>,
     /// S11 D7: vregs known at compile time to hold a specific class
     /// constant, i.e. produced by a `push_global` whose Association value
     /// is a `KlassOop`. Keyed by `VReg.0`. Used to recognize `X basicNew`
@@ -1064,6 +1076,16 @@ impl<'a> Translator<'a> {
                     argc: real_argc + 1,
                     static_klass: Some(super_klass),
                 });
+                // S14 step 2: annotate the site with its observed feedback (the
+                // inliner prefers the STATIC super_klass above, but the field is
+                // kept parallel to `call_sites` for every site uniformly).
+                self.site_feedback
+                    .push(crate::compiler::feedback::read_send_site(
+                        self.vm,
+                        self.method,
+                        ic,
+                        None,
+                    ));
 
                 let dst = self.fresh(true);
                 // S13 step 3b: a call-return safepoint (reexecute=false). The
@@ -1202,6 +1224,14 @@ impl<'a> Translator<'a> {
                     argc: real_argc + 1,
                     static_klass: None,
                 });
+                // S14 step 2: annotate this send with its interpreter feedback.
+                self.site_feedback
+                    .push(crate::compiler::feedback::read_send_site(
+                        self.vm,
+                        self.method,
+                        ic,
+                        None,
+                    ));
 
                 let dst = self.fresh(true);
                 // S13 step 3b: call-return safepoint (reexecute=false), same
@@ -1338,6 +1368,7 @@ pub fn convert(vm: &VmState, method: MethodOop, cfg: &Cfg) -> IrMethod {
         next_extra_block: cfg.blocks.len() as u32,
         blocks_by_id: (0..cfg.blocks.len()).map(|_| None).collect(),
         call_sites: Vec::new(),
+        site_feedback: Vec::new(),
         const_class: HashMap::new(),
     };
 
@@ -1631,6 +1662,7 @@ pub fn convert(vm: &VmState, method: MethodOop, cfg: &Cfg) -> IrMethod {
         nil_lit,
         mark_slots_lit,
         call_sites: t.call_sites,
+        site_feedback: t.site_feedback,
         method_pool_ix,
     }
 }
@@ -1667,6 +1699,64 @@ mod tests {
         let m = b.finish(vm, sel, 1, 0);
         m.set_primitive(prim_id);
         m
+    }
+
+    /// S14 step 2: `convert` annotates each real (non-inlined) `call_sites`
+    /// entry with its interpreter feedback, same index, no behaviour change. A
+    /// mono send to a NON-smi klass (so it stays a real `CallSend`, not a fused
+    /// smi op) carries `Mono` feedback; a fresh (empty) IC carries `Untaken`.
+    #[test]
+    fn convert_annotates_site_feedback() {
+        use crate::compiler::feedback::SiteFeedback;
+        let mut vm = test_vm();
+        let foo_sel = vm.universe.intern(b"foo");
+        let target = {
+            let mut b = BytecodeBuilder::new();
+            b.ret_self();
+            b.finish(&mut vm, foo_sel, 0, 0)
+        };
+
+        // `m [ ^self foo ]` — one real send site.
+        let mut b = BytecodeBuilder::new();
+        b.push_self();
+        b.send(&mut vm, foo_sel, 0);
+        b.ret_tos();
+        let sel = vm.universe.intern(b"m");
+        let method = b.finish(&mut vm, sel, 0, 0);
+
+        // Fresh IC (never dispatched) → Untaken.
+        {
+            let cfg = decode::decode(method);
+            let ir = convert(&vm, method, &cfg);
+            assert_eq!(
+                ir.site_feedback.len(),
+                ir.call_sites.len(),
+                "one per call site"
+            );
+            assert_eq!(ir.call_sites.len(), 1, "the one `foo` send");
+            assert!(
+                matches!(ir.site_feedback[0], SiteFeedback::Untaken),
+                "an unexecuted send is Untaken, got {:?}",
+                ir.site_feedback[0]
+            );
+        }
+
+        // Warm the IC to mono on a NON-smi klass → Mono feedback.
+        let klass = vm.universe.object_klass;
+        let epoch = vm.ic_epoch;
+        InterpreterIc::at(method, 0).set_mono(&mut vm, klass, target, epoch);
+        let cfg = decode::decode(method);
+        let ir = convert(&vm, method, &cfg);
+        match &ir.site_feedback[0] {
+            SiteFeedback::Mono {
+                klass: k,
+                method: m,
+            } => {
+                assert_eq!(k.oop().raw(), klass.oop().raw());
+                assert_eq!(m.oop().raw(), target.oop().raw());
+            }
+            other => panic!("expected Mono, got {other:?}"),
+        }
     }
 
     /// `send site with mono smi IC + prim '+'` (D1 item 2): a monomorphic,

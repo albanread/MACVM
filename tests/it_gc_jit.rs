@@ -393,6 +393,7 @@ fn compiled_mono_caller_guard_keeps_key_klass_alive() {
             argc: 0,
             static_klass: None,
         }],
+        site_feedback: Vec::new(),
         method_pool_ix: None,
     };
     let ra = regalloc::regalloc(&call_hot_method_ir);
@@ -524,6 +525,7 @@ fn install_loop_nmethod(
         nil_lit: PoolLit(0),
         mark_slots_lit: PoolLit(3),
         call_sites,
+        site_feedback: Vec::new(),
         method_pool_ix: None,
     };
     let ra: RegallocResult = regalloc::regalloc(&ir);
