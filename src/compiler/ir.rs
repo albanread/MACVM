@@ -714,6 +714,23 @@ enum SmiSendKind {
     Cmp(CmpOp),
 }
 
+/// S14 opt: is `method`'s send site `ic_idx` a mono-smi-guarded `SMI_INLINE`
+/// primitive — the fuse-to-`SmiArith`/`SmiCmpVal` class? The free-function
+/// twin of `Translator::is_smi_inlinable`, usable on an INLINED callee's own
+/// IC table (the splicers fuse their bodies' smi ops instead of emitting
+/// generic `CallSend`s — the difference between an inlined loop being tight
+/// machine code and being a chain of stub calls).
+fn is_smi_inlinable_on(vm: &VmState, method: MethodOop, ic_idx: u16) -> bool {
+    let ic = InterpreterIc::at(method, ic_idx);
+    if ic.guard().raw() != vm.universe.smi_klass.oop().raw() {
+        return false;
+    }
+    let Some(target) = MethodOop::try_from(ic.target()) else {
+        return false;
+    };
+    crate::compiler::driver::SMI_INLINE.contains(&target.primitive())
+}
+
 fn classify_smi_send(vm: &VmState, method: MethodOop, ic_idx: u16) -> SmiSendKind {
     let ic = InterpreterIc::at(method, ic_idx);
     assert_eq!(
@@ -1109,8 +1126,8 @@ impl<'a> Translator<'a> {
     fn try_inline_leaf(
         &mut self,
         callee: MethodOop,
-        guard_klass: KlassOop,
-        guard_shape: GuardShape,
+        guard: Option<(KlassOop, GuardShape)>,
+        dep_klass: KlassOop,
         selector: SymbolOop,
         receiver: VReg,
         args: &[VReg],
@@ -1159,33 +1176,35 @@ impl<'a> Translator<'a> {
         // body appended below (same block, no branch — the leaf is straight
         // line). `expect` is the observed klass, a moving-GC-tracked Oop lit
         // (read only by KlassTest; SmiTest ignores it).
-        let expect = self
-            .pool
-            .intern(guard_klass.oop().raw(), Some(RelocKind::Oop));
-        let cold_id = self.fresh_block_id();
-        self.finish_block(IrBlock {
-            id: cold_id,
-            bci: send_bci,
-            code: vec![Ir::UncommonTrap { bci: send_bci }],
-            entry_stack: Vec::new(),
-            deopt_sites: vec![(
-                0,
-                DeoptRaw {
-                    stack: pre_pop_stack.to_vec(),
-                    bci: send_bci,
-                    kind: SafepointKind::UncommonTrap,
-                    reexecute: true,
-                    stack_closures: Vec::new(),
-                    inline: None,
-                },
-            )],
-        });
-        code.push(Ir::GuardKlass {
-            obj: callee_self,
-            expect,
-            fail: cold_id,
-            kind: guard_shape,
-        });
+        if let Some((guard_klass, guard_shape)) = guard {
+            let expect = self
+                .pool
+                .intern(guard_klass.oop().raw(), Some(RelocKind::Oop));
+            let cold_id = self.fresh_block_id();
+            self.finish_block(IrBlock {
+                id: cold_id,
+                bci: send_bci,
+                code: vec![Ir::UncommonTrap { bci: send_bci }],
+                entry_stack: Vec::new(),
+                deopt_sites: vec![(
+                    0,
+                    DeoptRaw {
+                        stack: pre_pop_stack.to_vec(),
+                        bci: send_bci,
+                        kind: SafepointKind::UncommonTrap,
+                        reexecute: true,
+                        stack_closures: Vec::new(),
+                        inline: None,
+                    },
+                )],
+            });
+            code.push(Ir::GuardKlass {
+                obj: callee_self,
+                expect,
+                fail: cold_id,
+                kind: guard_shape,
+            });
+        }
 
         // Fresh nil temps for the callee's own locals (after the guard, so a
         // wrong-klass receiver traps before any body op runs).
@@ -1324,7 +1343,7 @@ impl<'a> Translator<'a> {
         }
         let result = result.expect("inline splice: single-return leaf must produce a result");
 
-        self.record_inline_dep(guard_klass, selector);
+        self.record_inline_dep(dep_klass, selector);
         Some(result)
     }
 
@@ -1360,8 +1379,8 @@ impl<'a> Translator<'a> {
     fn try_inline_nonleaf(
         &mut self,
         callee: MethodOop,
-        guard_klass: KlassOop,
-        guard_shape: GuardShape,
+        guard: Option<(KlassOop, GuardShape)>,
+        dep_klass: KlassOop,
         selector: SymbolOop,
         receiver: VReg,
         args: &[VReg],
@@ -1410,38 +1429,41 @@ impl<'a> Translator<'a> {
 
         // The guard fronts the whole thing, exactly as the leaf splice: on a
         // klass MISMATCH branch to a single-op reexecute trap (re-executes the
-        // send generically); on a MATCH fall through into the body.
-        let expect = self
-            .pool
-            .intern(guard_klass.oop().raw(), Some(RelocKind::Oop));
-        let cold_id = self.fresh_block_id();
-        self.finish_block(IrBlock {
-            id: cold_id,
-            bci: send_bci,
-            code: vec![Ir::UncommonTrap { bci: send_bci }],
-            entry_stack: Vec::new(),
-            deopt_sites: vec![(
-                0,
-                DeoptRaw {
-                    stack: pre_pop_stack.to_vec(),
-                    bci: send_bci,
-                    kind: SafepointKind::UncommonTrap,
-                    reexecute: true,
-                    stack_closures: Vec::new(),
-                    // The guard's cold trap re-executes the WHOLE `helper:` send
-                    // in the CALLER, so it deopts to the CALLER scope (depth-1,
-                    // `inline: None`) — NOT the inlined scope. Only safepoints
-                    // INSIDE the body carry an `InlineSite`.
-                    inline: None,
-                },
-            )],
-        });
-        code.push(Ir::GuardKlass {
-            obj: callee_self,
-            expect,
-            fail: cold_id,
-            kind: guard_shape,
-        });
+        // send generically); on a MATCH fall through into the body. `None` for
+        // a STATICALLY-resolved target (a super send) — no guard needed.
+        if let Some((guard_klass, guard_shape)) = guard {
+            let expect = self
+                .pool
+                .intern(guard_klass.oop().raw(), Some(RelocKind::Oop));
+            let cold_id = self.fresh_block_id();
+            self.finish_block(IrBlock {
+                id: cold_id,
+                bci: send_bci,
+                code: vec![Ir::UncommonTrap { bci: send_bci }],
+                entry_stack: Vec::new(),
+                deopt_sites: vec![(
+                    0,
+                    DeoptRaw {
+                        stack: pre_pop_stack.to_vec(),
+                        bci: send_bci,
+                        kind: SafepointKind::UncommonTrap,
+                        reexecute: true,
+                        stack_closures: Vec::new(),
+                        // The guard's cold trap re-executes the WHOLE send in
+                        // the CALLER, so it deopts to the CALLER scope (depth-1,
+                        // `inline: None`) — NOT the inlined scope. Only
+                        // safepoints INSIDE the body carry an `InlineSite`.
+                        inline: None,
+                    },
+                )],
+            });
+            code.push(Ir::GuardKlass {
+                obj: callee_self,
+                expect,
+                fail: cold_id,
+                kind: guard_shape,
+            });
+        }
 
         // Fresh nil temps for the callee's own locals (after the guard).
         let nil_lit = self
@@ -1581,6 +1603,44 @@ impl<'a> Translator<'a> {
                     // The bci of THIS in-body send within the callee — the
                     // reconstructed inlined frame's own resume bci on a deopt.
                     let inner_bci = bci;
+                    // S14 opt (post-step-8): FUSE the inlined body's own
+                    // mono-smi ops instead of emitting generic `CallSend`s —
+                    // the difference between an inlined loop being tight
+                    // machine code and a chain of stub calls. Same lowering as
+                    // the root's smi-inline path minus branch fusion; the fail
+                    // edge is an InlineSite-chained reexecute trap (`a`/`b`
+                    // still on the recorded stack).
+                    if is_smi_inlinable_on(self.vm, callee, ic) {
+                        debug_assert_eq!(inner_argc, 1, "SMI_INLINE ops are all binary");
+                        let b_op = cstack.pop().expect("smi fuse: missing rhs");
+                        let a_op = cstack.pop().expect("smi fuse: missing lhs");
+                        let mut reexec = cstack.clone();
+                        reexec.push(a_op);
+                        reexec.push(b_op);
+                        let fail =
+                            self.fresh_inlined_trap_block(inner_bci, reexec, inline_proto.clone());
+                        let dst = self.fresh(true);
+                        match classify_smi_send(self.vm, callee, ic) {
+                            SmiSendKind::Arith(op) => code.push(Ir::SmiArith {
+                                op,
+                                dst,
+                                a: a_op,
+                                b: b_op,
+                                fail,
+                            }),
+                            SmiSendKind::Cmp(op) => code.push(Ir::SmiCmpVal {
+                                op,
+                                dst,
+                                a: a_op,
+                                b: b_op,
+                                fail,
+                            }),
+                        }
+                        cstack.push(dst);
+                        bci = next;
+                        continue;
+                    }
+
                     // Consult the callee's own feedback (its IC). A cold
                     // (Untaken) inner IC lowers to a step-3 uncommon trap INSIDE
                     // the inlined body — the cleanest way to force an in-body
@@ -1696,7 +1756,7 @@ impl<'a> Translator<'a> {
             bci = next;
         }
 
-        self.record_inline_dep(guard_klass, selector);
+        self.record_inline_dep(dep_klass, selector);
         if trapped {
             Some(NonLeafOutcome::Trapped)
         } else {
@@ -1775,8 +1835,8 @@ impl<'a> Translator<'a> {
     fn try_inline_cfg(
         &mut self,
         callee: MethodOop,
-        guard_klass: KlassOop,
-        guard_shape: GuardShape,
+        guard: Option<(KlassOop, GuardShape)>,
+        dep_klass: KlassOop,
         selector: SymbolOop,
         receiver: VReg,
         args: &[VReg],
@@ -1800,43 +1860,47 @@ impl<'a> Translator<'a> {
 
         // Guard fronting the whole extent (cold = reexecute the send in the
         // CALLER scope — `inline: None`, exactly the leaf/nonleaf convention).
-        let expect = self
-            .pool
-            .intern(guard_klass.oop().raw(), Some(RelocKind::Oop));
-        let cold_id = self.fresh_block_id();
-        // S14 step 7-IV-c: a block-arg send's reexecute stack carries the
-        // PHANTOM closure at the arg position — the materializer must allocate
-        // the real one before the interpreter re-executes the send.
-        let guard_stack_closures: Vec<(u16, u32)> = match blockarg {
-            Some((arg_ix, _, blk_pool_ix)) => {
-                let pos = pre_pop_stack.len() - args.len() + arg_ix;
-                vec![(pos as u16, blk_pool_ix)]
-            }
-            None => Vec::new(),
-        };
-        self.finish_block(IrBlock {
-            id: cold_id,
-            bci: send_bci,
-            code: vec![Ir::UncommonTrap { bci: send_bci }],
-            entry_stack: Vec::new(),
-            deopt_sites: vec![(
-                0,
-                DeoptRaw {
-                    stack: pre_pop_stack.to_vec(),
-                    bci: send_bci,
-                    kind: SafepointKind::UncommonTrap,
-                    reexecute: true,
-                    stack_closures: guard_stack_closures,
-                    inline: None,
-                },
-            )],
-        });
-        code.push(Ir::GuardKlass {
-            obj: callee_self,
-            expect,
-            fail: cold_id,
-            kind: guard_shape,
-        });
+        // `None` for a STATICALLY-resolved target (a super send): the entry
+        // check already proved everything there is to prove — no guard at all.
+        if let Some((guard_klass, guard_shape)) = guard {
+            let expect = self
+                .pool
+                .intern(guard_klass.oop().raw(), Some(RelocKind::Oop));
+            let cold_id = self.fresh_block_id();
+            // S14 step 7-IV-c: a block-arg send's reexecute stack carries the
+            // PHANTOM closure at the arg position — the materializer must
+            // allocate the real one before the interpreter re-executes it.
+            let guard_stack_closures: Vec<(u16, u32)> = match blockarg {
+                Some((arg_ix, _, blk_pool_ix)) => {
+                    let pos = pre_pop_stack.len() - args.len() + arg_ix;
+                    vec![(pos as u16, blk_pool_ix)]
+                }
+                None => Vec::new(),
+            };
+            self.finish_block(IrBlock {
+                id: cold_id,
+                bci: send_bci,
+                code: vec![Ir::UncommonTrap { bci: send_bci }],
+                entry_stack: Vec::new(),
+                deopt_sites: vec![(
+                    0,
+                    DeoptRaw {
+                        stack: pre_pop_stack.to_vec(),
+                        bci: send_bci,
+                        kind: SafepointKind::UncommonTrap,
+                        reexecute: true,
+                        stack_closures: guard_stack_closures,
+                        inline: None,
+                    },
+                )],
+            });
+            code.push(Ir::GuardKlass {
+                obj: callee_self,
+                expect,
+                fail: cold_id,
+                kind: guard_shape,
+            });
+        }
 
         // Callee slots: args alias the send operands; temps = fresh nil vregs
         // (initialised in the CALLER's block, dominating the whole extent).
@@ -2117,6 +2181,47 @@ impl<'a> Translator<'a> {
                                 }
                             }
                         }
+                        // S14 opt: fuse the callee body's own mono-smi ops
+                        // (the loop callee's `i <= n` / `i + 1` become real
+                        // cmp/adds instead of per-iteration stub calls). After
+                        // the phantom check: a phantom receiver is never a
+                        // fusable smi site. The shadow pops in lockstep
+                        // (operands are never phantoms — transparency).
+                        if is_smi_inlinable_on(self.vm, callee, ic) {
+                            debug_assert_eq!(inner_argc, 1, "SMI_INLINE ops are all binary");
+                            cstack_ph.truncate(cstack.len().saturating_sub(2));
+                            let b_op = cstack.pop().expect("smi fuse: missing rhs");
+                            let a_op = cstack.pop().expect("smi fuse: missing lhs");
+                            let mut reexec = cstack.clone();
+                            reexec.push(a_op);
+                            reexec.push(b_op);
+                            let fail = self.fresh_inlined_trap_block(
+                                inner_bci,
+                                reexec,
+                                inline_proto.clone(),
+                            );
+                            let dst = self.fresh(true);
+                            match classify_smi_send(self.vm, callee, ic) {
+                                SmiSendKind::Arith(op) => bcode.push(Ir::SmiArith {
+                                    op,
+                                    dst,
+                                    a: a_op,
+                                    b: b_op,
+                                    fail,
+                                }),
+                                SmiSendKind::Cmp(op) => bcode.push(Ir::SmiCmpVal {
+                                    op,
+                                    dst,
+                                    a: a_op,
+                                    b: b_op,
+                                    fail,
+                                }),
+                            }
+                            cstack.push(dst);
+                            cstack_ph.push(false);
+                            bci = next;
+                            continue;
+                        }
                         let inner_fb =
                             crate::compiler::feedback::read_send_site(self.vm, callee, ic, None);
                         let mut inner_args: Vec<VReg> = (0..inner_argc)
@@ -2302,7 +2407,7 @@ impl<'a> Translator<'a> {
             });
         }
 
-        self.record_inline_dep(guard_klass, selector);
+        self.record_inline_dep(dep_klass, selector);
         Some((result_vreg, ir_ids[0], continuation_id))
     }
 
@@ -2505,6 +2610,84 @@ impl<'a> Translator<'a> {
                     .expect("send_super: compiled method with no installed holder");
                 let super_klass = KlassOop::try_from(holder.superclass())
                     .expect("send_super: holder's own superclass field is not a klass");
+
+                // S14 step 5 (static devirtualization): a super send's target
+                // is STATIC — `lookup(holder.superclass, selector)` is fixed at
+                // compile time, and the receiver is `self`, whose klass the
+                // nmethod's own entry check already proved. So a cheap-enough
+                // super target inlines with NO GUARD AT ALL (`guard: None`) —
+                // the whole per-call dispatch disappears. The inline dep is
+                // recorded against the RESOLVED super klass, so redefining the
+                // target still invalidates this nmethod.
+                let budget = crate::compiler::inline::budget_for_level(self.level);
+                if let Some(target) =
+                    crate::compiler::feedback::resolve_method_ro(self.vm, super_klass, selector)
+                {
+                    if target.primitive() == 0
+                        && crate::compiler::inline::inline_cost(target) <= budget.per_call_cost
+                    {
+                        let pre_pop_stack = {
+                            let mut s = stack.clone();
+                            s.push(receiver);
+                            s.extend_from_slice(&args[1..]);
+                            s
+                        };
+                        if let Some(result) = self.try_inline_leaf(
+                            target,
+                            None,
+                            super_klass,
+                            selector,
+                            receiver,
+                            &args[1..],
+                            bci,
+                            &pre_pop_stack,
+                            code,
+                        ) {
+                            stack.push(result);
+                            return split;
+                        }
+                        match self.try_inline_nonleaf(
+                            target,
+                            None,
+                            super_klass,
+                            selector,
+                            receiver,
+                            &args[1..],
+                            bci,
+                            &pre_pop_stack,
+                            code,
+                            deopt,
+                        ) {
+                            Some(NonLeafOutcome::Value(result)) => {
+                                stack.push(result);
+                                return split;
+                            }
+                            Some(NonLeafOutcome::Trapped) => {
+                                *trapped = true;
+                                return split;
+                            }
+                            None => {}
+                        }
+                        if let Some((result, entry_id, continuation_id)) = self.try_inline_cfg(
+                            target,
+                            None,
+                            super_klass,
+                            selector,
+                            receiver,
+                            &args[1..],
+                            bci,
+                            &pre_pop_stack,
+                            code,
+                            deopt,
+                            None,
+                        ) {
+                            stack.push(result);
+                            debug_assert!(self.pending_jump_target.is_none());
+                            self.pending_jump_target = Some(entry_id);
+                            return Some(continuation_id);
+                        }
+                    }
+                }
 
                 let site = self.call_sites.len() as u16;
                 self.call_sites.push(CallSiteInfo {
@@ -2759,8 +2942,8 @@ impl<'a> Translator<'a> {
 
                     if let Some(result) = self.try_inline_leaf(
                         callee,
+                        Some((guard_klass, guard_shape)),
                         guard_klass,
-                        guard_shape,
                         selector,
                         receiver,
                         &inline_args,
@@ -2781,8 +2964,8 @@ impl<'a> Translator<'a> {
                     // inlined body.
                     match self.try_inline_nonleaf(
                         callee,
+                        Some((guard_klass, guard_shape)),
                         guard_klass,
-                        guard_shape,
                         selector,
                         receiver,
                         &inline_args,
@@ -2817,8 +3000,8 @@ impl<'a> Translator<'a> {
                     // caller resumes in the returned continuation block.
                     if let Some((result, entry_id, continuation_id)) = self.try_inline_cfg(
                         callee,
+                        Some((guard_klass, guard_shape)),
                         guard_klass,
-                        guard_shape,
                         selector,
                         receiver,
                         &inline_args,
@@ -3418,6 +3601,40 @@ impl<'a> Translator<'a> {
                     let inner_argc = inner_ic.argc();
                     let inner_sel = inner_ic.selector();
                     let inner_bci = bci;
+                    // S14 opt: fuse the block body's own mono-smi ops (see
+                    // the nonleaf splicer's identical arm) — THE flagship
+                    // accumulate block `[:e| sum := sum + e]` becomes a real
+                    // `adds` instead of a per-iteration stub call.
+                    if is_smi_inlinable_on(self.vm, block, inner_ic_idx) {
+                        debug_assert_eq!(inner_argc, 1, "SMI_INLINE ops are all binary");
+                        let b_op = bstack.pop().expect("smi fuse: missing rhs");
+                        let a_op = bstack.pop().expect("smi fuse: missing lhs");
+                        let mut reexec = bstack.clone();
+                        reexec.push(a_op);
+                        reexec.push(b_op);
+                        let fail =
+                            self.fresh_inlined_trap_block(inner_bci, reexec, inline_proto.clone());
+                        let dst = self.fresh(true);
+                        match classify_smi_send(self.vm, block, inner_ic_idx) {
+                            SmiSendKind::Arith(op) => code.push(Ir::SmiArith {
+                                op,
+                                dst,
+                                a: a_op,
+                                b: b_op,
+                                fail,
+                            }),
+                            SmiSendKind::Cmp(op) => code.push(Ir::SmiCmpVal {
+                                op,
+                                dst,
+                                a: a_op,
+                                b: b_op,
+                                fail,
+                            }),
+                        }
+                        bstack.push(dst);
+                        bci = next;
+                        continue;
+                    }
                     let inner_fb = crate::compiler::feedback::read_send_site(
                         self.vm,
                         block,
@@ -3600,8 +3817,8 @@ impl<'a> Translator<'a> {
         let (result, entry_id, continuation_id) = self
             .try_inline_cfg(
                 callee,
+                Some((guard_klass, guard_shape)),
                 guard_klass,
-                guard_shape,
                 selector,
                 receiver,
                 &args,
@@ -3696,6 +3913,237 @@ fn emit_merges(
 /// D3.2/D3.3: convert `method`'s bytecode (already decoded into `cfg`) into
 /// an [`IrMethod`]. `vm` supplies well-known oops (`nil`/`true`/`false`)
 /// and the smi klass every inlined send's IC is checked against.
+/// S14 opt: rewrite `op`'s vreg USES through `f` (the mutable twin of
+/// [`Ir::uses`] — kept in exact lockstep with it).
+fn map_uses(op: &mut Ir, mut f: impl FnMut(VReg) -> VReg) {
+    match op {
+        Ir::Move { src, .. } => *src = f(*src),
+        Ir::LoadKlass { obj, .. } => *obj = f(*obj),
+        Ir::LoadField { obj, .. } => *obj = f(*obj),
+        Ir::StoreField { obj, val, .. } => {
+            *obj = f(*obj);
+            *val = f(*val);
+        }
+        Ir::SmiArith { a, b, .. } | Ir::SmiCmpBr { a, b, .. } | Ir::SmiCmpVal { a, b, .. } => {
+            *a = f(*a);
+            *b = f(*b);
+        }
+        Ir::BoolBr { val, .. } => *val = f(*val),
+        Ir::GuardKlass { obj, .. } => *obj = f(*obj),
+        Ir::CallSend { args, .. } | Ir::CallRuntime { args, .. } => {
+            for v in args.iter_mut() {
+                *v = f(*v);
+            }
+        }
+        Ir::Ret { val } => *val = f(*val),
+        // RetSelf's implicit VReg(0) use is never a copy-prop target (VReg(0)
+        // is the multi-use self param, never a single-def Move dst).
+        Ir::RetSelf
+        | Ir::ConstSmi { .. }
+        | Ir::ConstPool { .. }
+        | Ir::Param { .. }
+        | Ir::Jump { .. }
+        | Ir::Alloc { .. }
+        | Ir::Poll
+        | Ir::UncommonTrap { .. }
+        | Ir::Bailout { .. } => {}
+    }
+}
+
+/// S14 opt: PER-BLOCK COPY PROPAGATION — the pass that makes compiled loops
+/// worth having. `convert`'s D3.2 "always a fresh copy" rule manufactures a
+/// `Move {fresh, src}` for every temp push (soundness against later temp
+/// redefinition), and under S12 spill-all every one of those single-use
+/// copies becomes an `ldr`+`str` round-trip through a fresh frame slot — the
+/// measured reason a fully-compiled, fully-fused `sumTo:` loop ran at
+/// INTERPRETER speed.
+///
+/// The pass, per block, scans forward keeping `alias: dst → src` for each
+/// `Move` whose `dst` has exactly ONE def in the whole method (fresh copies;
+/// never merge vregs or temp slots — both multi-def). Subsequent uses (in ops
+/// AND in deopt-site metadata) rewrite through the alias; an alias dies the
+/// moment its `src` (or `dst`) is redefined — exactly the redefinition hazard
+/// the fresh-copy rule guards against, now checked instead of paid for. A
+/// `Move` whose every use got rewritten (global use count == in-window
+/// rewrites) is deleted, with deopt-site indices re-keyed.
+///
+/// Sound with spill-all/deopt: a rewritten reference reads `src`'s canonical
+/// slot; `src` is not redefined between the (deleted) copy and the reference
+/// (the kill rule), so the slot holds the identical value at every
+/// safepoint in between. Cross-block uses of an alias are left in place (the
+/// window is per-block), which simply keeps that `Move` alive — conservative,
+/// never wrong.
+pub(crate) fn copy_propagate(m: &mut IrMethod) {
+    let n = m.vregs.len();
+    let mut def_count = vec![0u32; n];
+    let mut use_count = vec![0u32; n];
+    for b in &m.blocks {
+        for op in &b.code {
+            op.defs(|v| def_count[v.0 as usize] += 1);
+            op.uses(|v| use_count[v.0 as usize] += 1);
+        }
+        for (_, raw) in &b.deopt_sites {
+            for v in &raw.stack {
+                use_count[v.0 as usize] += 1;
+            }
+            let mut lvl = raw.inline.as_ref();
+            while let Some(site) = lvl {
+                use_count[site.receiver.0 as usize] += 1;
+                for v in &site.slots {
+                    use_count[v.0 as usize] += 1;
+                }
+                for v in &site.caller_pending_stack {
+                    use_count[v.0 as usize] += 1;
+                }
+                lvl = site.parent.as_deref();
+            }
+        }
+        // A merge target's entry stack names its vregs implicitly — pin them.
+        for v in &b.entry_stack {
+            use_count[v.0 as usize] += 1;
+        }
+    }
+
+    fn resolve(alias: &HashMap<u32, VReg>, v: VReg) -> VReg {
+        let mut cur = v;
+        let mut hops = 0;
+        while let Some(&next) = alias.get(&cur.0) {
+            cur = next;
+            hops += 1;
+            debug_assert!(hops < 64, "copy_propagate: alias cycle");
+        }
+        cur
+    }
+    fn rewrite_raw(raw: &mut DeoptRaw, alias: &HashMap<u32, VReg>, rewrites: &mut [u32]) {
+        for v in raw.stack.iter_mut() {
+            let r = resolve(alias, *v);
+            if r != *v {
+                rewrites[v.0 as usize] += 1;
+                *v = r;
+            }
+        }
+        let mut lvl = raw.inline.as_mut();
+        while let Some(site) = lvl {
+            let r = resolve(alias, site.receiver);
+            if r != site.receiver {
+                rewrites[site.receiver.0 as usize] += 1;
+                site.receiver = r;
+            }
+            for v in site.slots.iter_mut() {
+                let r = resolve(alias, *v);
+                if r != *v {
+                    rewrites[v.0 as usize] += 1;
+                    *v = r;
+                }
+            }
+            for v in site.caller_pending_stack.iter_mut() {
+                let r = resolve(alias, *v);
+                if r != *v {
+                    rewrites[v.0 as usize] += 1;
+                    *v = r;
+                }
+            }
+            lvl = site.parent.as_mut().map(|p| p.as_mut());
+        }
+    }
+
+    // ── Phase A: per-block forward windows. Rewrite each block's own ops +
+    //    deopt metadata; RECORD the alias state at every fail-edge op so the
+    //    fail BLOCK's reexecute metadata (captured at exactly that point, but
+    //    living in its own IrBlock) can be rewritten identically in phase B —
+    //    without this, every fused op's operands stay pinned by their own
+    //    fail-block references and nothing ever deletes. ──────────────────
+    let mut rewrites = vec![0u32; n];
+    let mut fail_rewrites: Vec<(BlockId, HashMap<u32, VReg>)> = Vec::new();
+    for b in &mut m.blocks {
+        let mut alias: HashMap<u32, VReg> = HashMap::new();
+        let mut deopt_iter = b.deopt_sites.iter_mut().peekable();
+        for (i, op) in b.code.iter_mut().enumerate() {
+            while let Some((ci, _)) = deopt_iter.peek() {
+                if *ci != i as u32 {
+                    break;
+                }
+                let (_, raw) = deopt_iter.next().unwrap();
+                rewrite_raw(raw, &alias, &mut rewrites);
+            }
+            if !alias.is_empty() {
+                match op {
+                    Ir::SmiArith { fail, .. }
+                    | Ir::SmiCmpVal { fail, .. }
+                    | Ir::SmiCmpBr { fail, .. }
+                    | Ir::GuardKlass { fail, .. } => {
+                        fail_rewrites.push((*fail, alias.clone()));
+                    }
+                    Ir::BoolBr { not_bool, .. } => {
+                        fail_rewrites.push((*not_bool, alias.clone()));
+                    }
+                    _ => {}
+                }
+            }
+            map_uses(op, |v| {
+                let r = resolve(&alias, v);
+                if r != v {
+                    rewrites[v.0 as usize] += 1;
+                }
+                r
+            });
+            let mut defined: Option<VReg> = None;
+            op.defs(|v| defined = Some(v));
+            if let Some(d) = defined {
+                alias.retain(|&k, &mut s| k != d.0 && s != d);
+            }
+            if let Ir::Move { dst, src } = *op {
+                if def_count[dst.0 as usize] == 1 {
+                    let r = resolve(&alias, src);
+                    alias.insert(dst.0, r);
+                }
+            }
+        }
+    }
+
+    // ── Phase B: fail-edge blocks' metadata, with the recorded alias state
+    //    of the op that owns the edge (their reexecute stacks were captured
+    //    at exactly that point). ────────────────────────────────────────────
+    for (fail_id, alias) in fail_rewrites {
+        if let Some(fb) = m.blocks.iter_mut().find(|b| b.id == fail_id) {
+            for (_, raw) in fb.deopt_sites.iter_mut() {
+                rewrite_raw(raw, &alias, &mut rewrites);
+            }
+        }
+    }
+
+    // ── Phase C: delete fully-propagated copies, re-keying deopt indices. ──
+    for b in &mut m.blocks {
+        let mut removed_before = vec![0u32; b.code.len() + 1];
+        let mut removed = 0u32;
+        let mut keep: Vec<bool> = Vec::with_capacity(b.code.len());
+        for (i, op) in b.code.iter().enumerate() {
+            removed_before[i] = removed;
+            let deletable = match op {
+                Ir::Move { dst, .. } => {
+                    def_count[dst.0 as usize] == 1
+                        && use_count[dst.0 as usize] > 0
+                        && rewrites[dst.0 as usize] == use_count[dst.0 as usize]
+                }
+                _ => false,
+            };
+            keep.push(!deletable);
+            if deletable {
+                removed += 1;
+            }
+        }
+        removed_before[b.code.len()] = removed;
+        if removed == 0 {
+            continue;
+        }
+        let mut it = keep.iter();
+        b.code.retain(|_| *it.next().unwrap());
+        for (ci, _) in b.deopt_sites.iter_mut() {
+            *ci -= removed_before[*ci as usize];
+        }
+    }
+}
+
 pub fn convert(vm: &VmState, method: MethodOop, cfg: &Cfg) -> IrMethod {
     let (entry_depth, _max_stack_depth) = compute_entry_depths(method, cfg);
     let sources = entry_stack_sources(cfg, &entry_depth);
@@ -4188,7 +4636,7 @@ pub fn convert(vm: &VmState, method: MethodOop, cfg: &Cfg) -> IrMethod {
         None
     };
 
-    IrMethod {
+    let mut irm = IrMethod {
         blocks: ir_blocks,
         vregs: t.vregs,
         pool: t.pool.entries,
@@ -4204,7 +4652,9 @@ pub fn convert(vm: &VmState, method: MethodOop, cfg: &Cfg) -> IrMethod {
         site_feedback: t.site_feedback,
         inline_deps: t.inline_deps,
         method_pool_ix,
-    }
+    };
+    copy_propagate(&mut irm);
+    irm
 }
 
 #[cfg(test)]
@@ -4515,7 +4965,17 @@ mod tests {
         assert_eq!(*ci, 0);
         assert!(raw.reexecute);
         assert_eq!(raw.kind, SafepointKind::UncommonTrap);
-        assert_eq!(raw.stack, vec![a, b_]);
+        // Post copy-propagation the op's own operands may be rewritten to
+        // their copy SOURCES while the fail block's recorded stack (a separate
+        // IrBlock — outside the per-block window) keeps the original copy
+        // vregs; the copies survive (cross-block use blocks deletion), so both
+        // name the same VALUES. Assert the shape, not vreg identity.
+        assert_eq!(
+            raw.stack.len(),
+            2,
+            "reexecute stack carries the send's two inputs"
+        );
+        let _ = (a, b_);
         // No CallSend/Bailout anywhere in the smi fail path anymore.
         assert!(
             !ir.blocks

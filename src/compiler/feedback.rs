@@ -131,7 +131,11 @@ fn resolve_target(vm: &VmState, target: Oop) -> MethodOop {
 /// Read-only method lookup — the `runtime::lookup::lookup` walk minus its
 /// `&mut` lookup-cache insert (this reader is `&VmState` by contract). Probes
 /// each klass's `MethodDictOop` up the superclass chain to `nil`.
-fn resolve_method_ro(vm: &VmState, klass: KlassOop, selector: SymbolOop) -> Option<MethodOop> {
+pub(crate) fn resolve_method_ro(
+    vm: &VmState,
+    klass: KlassOop,
+    selector: SymbolOop,
+) -> Option<MethodOop> {
     let nil = vm.universe.nil_obj;
     let mut k = klass;
     loop {

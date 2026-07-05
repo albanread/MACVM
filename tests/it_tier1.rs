@@ -3083,8 +3083,17 @@ fn send_super_resolves_at_compile_time_and_dispatches() {
         HEADER_WORDS,
     );
 
+    // Each foo is PADDED past the level-1 inline budget: since S14's
+    // static super-send inlining, a cheap super target INLINES (guard-free)
+    // and this test would silently stop covering the S11 compiled-IC super
+    // DISPATCH path it exists for (the inline path has its own test,
+    // `super_send_inlines_static_target`).
     let make_foo = |vm: &mut VmState, n: i64| -> MethodOop {
         let mut b = BytecodeBuilder::new();
+        for _ in 0..16 {
+            b.push_literal(vm, SmallInt::new(n).oop());
+            b.pop();
+        }
         b.push_literal(vm, SmallInt::new(n).oop());
         b.ret_tos();
         b.finish(vm, foo_sel, 0, 0)
@@ -3433,8 +3442,18 @@ fn install_prim(vm: &mut VmState, klass: KlassOop, name: &[u8], argc: usize, pri
 /// compiled (so the test can't silently pass all-interpreted).
 #[test]
 fn nlr_through_compiled_frame() {
-    let mut vm = test_vm();
-    vm.options.jit = JitMode::Threshold(1);
+    // JIT-armed CONSTRUCTION (not a post-hoc `options.jit` mutation): the
+    // SIGTRAP deopt handler only arms in `with_options`, and since S14's
+    // super-send inlining these shapes legitimately compile with in-body
+    // cold-site traps — an unarmed brk kills the process.
+    let mut vm = VmState::with_options(VmOptions {
+        heap_mib: 64,
+        trace: Default::default(),
+        gc_stress: false,
+        gc_stress_full_period: None,
+        eden_kb: None,
+        jit: JitMode::Threshold(1),
+    });
     let closure_klass = vm.universe.closure_klass;
     install_prim(&mut vm, closure_klass, b"value", 0, 50);
     load_source(
@@ -3487,8 +3506,18 @@ fn nlr_through_compiled_frame() {
 /// the sentinel bounce, via the ordinary marked-frame walk.
 #[test]
 fn nlr_through_compiled_frame_runs_home_side_ensure() {
-    let mut vm = test_vm();
-    vm.options.jit = JitMode::Threshold(1);
+    // JIT-armed CONSTRUCTION (not a post-hoc `options.jit` mutation): the
+    // SIGTRAP deopt handler only arms in `with_options`, and since S14's
+    // super-send inlining these shapes legitimately compile with in-body
+    // cold-site traps — an unarmed brk kills the process.
+    let mut vm = VmState::with_options(VmOptions {
+        heap_mib: 64,
+        trace: Default::default(),
+        gc_stress: false,
+        gc_stress_full_period: None,
+        eden_kb: None,
+        jit: JitMode::Threshold(1),
+    });
     let closure_klass = vm.universe.closure_klass;
     install_prim(&mut vm, closure_klass, b"value", 0, 50);
     install_prim(&mut vm, closure_klass, b"ensure:", 1, 60);
@@ -5057,10 +5086,10 @@ fn compiled_inlined_loop_callee_matches_interpreter() {
     let id = driver::compile_method(&mut vm, smi_klass, caller).expect("must compile");
     {
         let nm = vm.code_table.get(id).expect("installed");
-        assert_eq!(
-            nm.ic_sites.len(),
-            2,
-            "spin's warm `<` and `+` are compiled IC sites INSIDE the inlined loop"
+        assert!(
+            nm.ic_sites.is_empty(),
+            "spin's warm `<` and `+` are FUSED smi ops inside the inlined loop \
+             (S14 opt: in-body smi fusion) — no compiled IC sites at all"
         );
         assert_eq!(nm.inline_deps.len(), 1, "one inline dependency (spin:)");
     }
@@ -5698,4 +5727,77 @@ fn recompile_declined_when_profile_unchanged() {
         "code stays Alive (no churn)"
     );
     assert_eq!(nm.version, 0);
+}
+
+/// S14 opt (static devirtualization): a CHEAP super-send target INLINES with
+/// NO guard — the target is statically `lookup(holder.superclass, selector)`
+/// and the receiver is `self`, already proven by the entry check. The compiled
+/// caller has NO IC site for the super send, records the inline dep against
+/// the SUPER klass, and returns the super target's value.
+#[test]
+fn super_send_inlines_static_target() {
+    let mut vm = test_vm();
+    let step_sel = vm.universe.intern(b"stepv");
+    let base = vm.universe.new_klass(
+        vm.universe.object_klass,
+        "S14SupBase",
+        Format::Slots,
+        false,
+        HEADER_WORDS,
+    );
+    let derived = vm
+        .universe
+        .new_klass(base, "S14SupDerived", Format::Slots, false, HEADER_WORDS);
+    // Base>>stepv [ ^77 ] — a cheap quick-return: inlines.
+    let base_step = {
+        let mut b = BytecodeBuilder::new();
+        b.push_smi_i8(77);
+        b.ret_tos();
+        b.finish(&mut vm, step_sel, 0, 0)
+    };
+    install_method(&mut vm, base, step_sel, base_step);
+    // Derived>>stepv [ ^0 ] (an override the SUPER send must skip).
+    let derived_step = {
+        let mut b = BytecodeBuilder::new();
+        b.push_smi_i8(0);
+        b.ret_tos();
+        b.finish(&mut vm, step_sel, 0, 0)
+    };
+    install_method(&mut vm, derived, step_sel, derived_step);
+    // Derived>>callSuper [ ^super stepv ].
+    let cs_sel = vm.universe.intern(b"callSuper");
+    let mut b = BytecodeBuilder::new();
+    b.push_self();
+    b.send_super(&mut vm, step_sel, 0);
+    b.ret_tos();
+    let call_super = b.finish(&mut vm, cs_sel, 0, 0);
+    install_method(&mut vm, derived, cs_sel, call_super);
+
+    let id = driver::compile_method(&mut vm, derived, call_super).expect("must compile");
+    {
+        let nm = vm.code_table.get(id).unwrap();
+        assert!(
+            nm.ic_sites.is_empty(),
+            "the cheap super target was INLINED — no compiled IC site"
+        );
+        assert_eq!(nm.inline_deps.len(), 1, "one inline dep (Base, stepv)");
+        assert_eq!(
+            nm.inline_deps[0].0.oop().raw(),
+            base.oop().raw(),
+            "the dep is against the RESOLVED SUPER klass (redefinition safety)"
+        );
+    }
+    let recv = alloc::alloc_slots(&mut vm, derived).oop();
+    let interp = macvm::interpreter::run_method(&mut vm, call_super, recv, &[]);
+    assert_eq!(interp.raw(), SmallInt::new(77).oop().raw());
+    let nm = vm.code_table.get(id).unwrap();
+    let entry = unsafe { nm.code.base.add(nm.entry_off as usize) } as u64;
+    let call: CallStubFn = unsafe { std::mem::transmute(vm.stubs.call_stub_entry()) };
+    let vm_ptr: *mut VmState = &mut vm;
+    let result = unsafe { call(entry, vm_ptr, [recv.raw()].as_ptr(), 1) };
+    assert_eq!(
+        result,
+        SmallInt::new(77).oop().raw(),
+        "guard-free inlined super send returns the BASE implementation (skipping the override)"
+    );
 }
