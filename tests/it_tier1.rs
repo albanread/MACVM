@@ -6539,3 +6539,89 @@ fn osr_transitions_running_loop_via_jump_back() {
     let r2 = macvm::interpreter::run_method(&mut vm, method, recv, &[SmallInt::new(n).oop()]);
     assert_eq!(SmallInt::try_from(r2).map(|s| s.value()), Some(expected));
 }
+
+/// S15 step 5 (A5) — the OSR x deopt round trip: the activation goes
+/// interpreted -> OSR-compiled -> (uncommon trap mid-loop) -> interpreted,
+/// and nobody upstream can tell. The loop's body contains a branch UNTAKEN
+/// during the first 10k backedges (so the OSR compile lowers its send to a
+/// cold trap) that becomes TAKEN later — firing the trap INSIDE the OSR
+/// frame. S13 materializes the mid-loop interpreter frame from the OSR
+/// frame's ordinary scope descs and the nested run finishes the loop.
+#[test]
+fn osr_frame_deopts_mid_loop_and_finishes_interpreted() {
+    let mut vm = loop_test_vm();
+    let smi_klass = vm.universe.smi_klass;
+    let lt_sel = vm.universe.intern(b"<");
+    let plus_sel = vm.universe.intern(b"+");
+    let gt_sel = vm.universe.intern(b">");
+    let poke_sel = vm.universe.intern(b"poke");
+    install_smi_prim(&mut vm, b">", 1, 12);
+
+    // `poke [ ^1 ]` — INSTALLED but never sent during the pre-OSR phase, so
+    // its site's IC is Empty at OSR-compile time -> Untaken -> trap.
+    let poke = {
+        let mut pb = BytecodeBuilder::new();
+        pb.push_smi_i8(1);
+        pb.ret_tos();
+        pb.finish(&mut vm, poke_sel, 0, 0)
+    };
+    install_method(&mut vm, smi_klass, poke_sel, poke);
+
+    // `run: n [ |i s| i:=0. s:=0.
+    //           [i<n] whileTrue:[ (i>15000) ifTrue:[ s := s + self poke ].
+    //                             i:=i+1 ].  ^s ]`
+    // t0=n, t1=i, t2=s.
+    let mut b = BytecodeBuilder::new();
+    b.push_smi_i8(0);
+    b.store_temp_pop(1);
+    b.push_smi_i8(0);
+    b.store_temp_pop(2);
+    let hdr = b.new_label();
+    b.bind(hdr);
+    b.push_temp(1);
+    b.push_temp(0);
+    b.send(&mut vm, lt_sel, 1);
+    let end = b.new_label();
+    b.br_false_fwd(end);
+    b.push_temp(1);
+    b.push_literal(&mut vm, SmallInt::new(15000).oop());
+    b.send(&mut vm, gt_sel, 1);
+    let skip = b.new_label();
+    b.br_false_fwd(skip);
+    b.push_temp(2);
+    b.push_self();
+    b.send(&mut vm, poke_sel, 0);
+    b.send(&mut vm, plus_sel, 1);
+    b.store_temp_pop(2);
+    b.bind(skip);
+    b.push_temp(1);
+    b.push_smi_i8(1);
+    b.send(&mut vm, plus_sel, 1);
+    b.store_temp_pop(1);
+    b.jump_back(hdr);
+    b.bind(end);
+    b.push_temp(2);
+    b.ret_tos();
+    let m_sel = vm.universe.intern(b"osrDeopt:");
+    let method = b.finish(&mut vm, m_sel, 1, 2);
+    install_method(&mut vm, smi_klass, m_sel, method);
+
+    // n=16_000: OSR at backedge 10_000 (branch still untaken -> the trap IS
+    // in the compiled loop); the branch turns true at i=15_001 -> trap ->
+    // deopt -> the rest runs interpreted. s counts the taken iterations.
+    let n = 16_000i64;
+    let expected = n - 15_001; // i = 15_001 .. 15_999
+    let recv = SmallInt::new(0).oop();
+    let deopts_before = vm.stats.deopt_count;
+    let result = macvm::interpreter::run_method(&mut vm, method, recv, &[SmallInt::new(n).oop()]);
+    assert_eq!(
+        SmallInt::try_from(result).map(|s| s.value()),
+        Some(expected),
+        "interpreted -> OSR-compiled -> deopt -> interpreted must be seamless"
+    );
+    assert_eq!(vm.stats.osr_entries, 1, "the loop OSR'd once");
+    assert!(
+        vm.stats.deopt_count > deopts_before,
+        "the cold branch's trap fired INSIDE the OSR frame"
+    );
+}
