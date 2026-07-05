@@ -17,6 +17,7 @@
 //! An nmethod-id target is resolved with a local read-only method walk (the
 //! `lookup` walk minus its `&mut` cache insert), not `runtime::lookup::lookup`.
 
+use crate::bytecode::opcode::{decode_at, Instr};
 use crate::codecache::nmethod::NmethodId;
 use crate::interpreter::ic::InterpreterIc;
 use crate::oops::layout::{IC_GUARD_MEGA, IC_GUARD_POLY, IC_POLY_MAX_PAIRS};
@@ -145,6 +146,45 @@ fn resolve_method_ro(vm: &VmState, klass: KlassOop, selector: SymbolOop) -> Opti
         }
         k = KlassOop::try_from(sc).expect("resolve_method_ro: superclass field is not a klass");
     }
+}
+
+/// S14 step 8 (A5): a canonical digest of "what the feedback said" — FNV-1a
+/// over every send site's IC lattice STATE TAG (Empty=0, Mono=1, Poly=2,
+/// Mega=3), in bytecode order. Stored in the nmethod (`profile_hash`) at
+/// compile time; the recompile-on-trap loop re-snapshots at trap time and
+/// DECLINES the recompile when equal — the compiler would see the same states
+/// and make the same decisions (Self's `checkEffectiveness`).
+///
+/// Deviation from the sprint doc (documented): the doc digests klass identity
+/// SETS; state TAGS suffice for the storm-closer (the storm transition IS
+/// `Untaken → Mono`, and a guard storm is `Mono → Poly` — both tag-visible).
+/// A klass-set-preserving change (same-tag re-targeting) is invisible here,
+/// but redefinition already invalidates through the dependency index.
+pub fn snapshot_profile(_vm: &VmState, method: MethodOop) -> u64 {
+    use crate::interpreter::ic::{ic_state, IcState};
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325; // FNV-1a offset basis
+    let mut fnv = |byte: u8| {
+        h ^= byte as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    };
+    let len = method.bytecode_len();
+    let mut bci = 0;
+    while bci < len {
+        let (instr, next) = decode_at(method, bci);
+        if let Instr::Send { ic, super_: false } = instr {
+            let tag: u8 = match ic_state(method, ic) {
+                IcState::Empty => 0,
+                IcState::Mono => 1,
+                IcState::Poly(_) => 2,
+                IcState::Mega => 3,
+            };
+            fnv(ic as u8);
+            fnv((ic >> 8) as u8);
+            fnv(tag);
+        }
+        bci = next;
+    }
+    h
 }
 
 #[cfg(test)]

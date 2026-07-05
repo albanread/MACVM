@@ -171,6 +171,13 @@ pub struct Nmethod {
     pub state: NmState,
     pub level: u8,
     pub version: u8,
+    /// S14 step 8: uncommon traps taken through this nmethod's code — bumped by
+    /// `rt_uncommon_trap` after each completed trap deopt. Crossing
+    /// `recompile::UNCOMMON_TRAP_LIMIT` triggers the recompile-on-trap check.
+    pub trap_count: u32,
+    /// S14 step 8 (A5): `feedback::snapshot_profile` of the method at compile
+    /// time — the effectiveness check compares the live profile against this.
+    pub profile_hash: u64,
     pub literal_off: u32,
     /// Blob-relative, exactly as `CodeBlob` produced them — add
     /// `code.base` for an absolute address (matches S9's own convention).
@@ -308,6 +315,8 @@ impl Nmethod {
             state: NmState::Alive,
             level: 1,
             version: 0,
+            trap_count: 0,
+            profile_hash: 0,
             literal_off: 0,
             relocs: Vec::new(),
             frame_slots,
@@ -779,6 +788,8 @@ mod tests {
             state: NmState::Alive,
             level: 1,
             version: 0,
+            trap_count: 0,
+            profile_hash: 0,
             literal_off: 0,
             relocs: Vec::new(),
             frame_slots: 0,

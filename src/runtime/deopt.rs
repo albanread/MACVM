@@ -747,6 +747,8 @@ pub(crate) mod test_support {
             state: NmState::Alive,
             level: 1,
             version: 0,
+            trap_count: 0,
+            profile_hash: 0,
             literal_off: 0,
             relocs: Vec::new(),
             frame_slots: 0,

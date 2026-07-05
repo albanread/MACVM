@@ -16,6 +16,7 @@ pub mod frames;
 pub mod globals;
 pub mod lookup;
 pub mod primitives;
+pub mod recompile;
 pub mod vm_state;
 
 pub use vm_state::{InterpRegs, JitMode, TierLink, TraceFlags, VmOptions, VmRegBlock, VmState};

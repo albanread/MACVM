@@ -198,6 +198,15 @@ pub struct DeoptStats {
     /// real run (a test that calls `deoptimize_frame` directly bumps only
     /// `deopt_count`).
     pub deopt_by_reason: [u64; 3],
+    /// S14 step 8: recompilations performed by the recompile-on-trap loop
+    /// (`runtime::recompile`) — a trapped-out nmethod replaced by a fresh
+    /// compile against its now-warm feedback.
+    pub recompiles: u64,
+    /// S14 step 8 (A5): recompiles DECLINED because the feedback profile was
+    /// unchanged since compile — recompiling would emit identical decisions
+    /// (Self's `checkEffectiveness`; the anti-thrash gate for storms that
+    /// recompilation cannot fix, e.g. a persistent smi-overflow trap).
+    pub recompile_declined_ineffective: u64,
 }
 
 /// S13 D7: which trigger fired a deopt — for `deopt_by_reason` attribution and

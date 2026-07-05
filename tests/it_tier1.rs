@@ -2374,6 +2374,8 @@ fn mono_resolve_patches_call_site_and_dispatches() {
         state: NmState::Alive,
         level: 1,
         version: 0,
+        trap_count: 0,
+        profile_hash: 0,
         literal_off: blob.literal_off,
         relocs: blob.relocs.clone(),
         frame_slots: ra.frame_slots,
@@ -2537,6 +2539,8 @@ fn build_c2i_scenario(vm: &mut VmState) -> (u64, KlassOop, NmethodId) {
         state: NmState::Alive,
         level: 1,
         version: 0,
+        trap_count: 0,
+        profile_hash: 0,
         literal_off: blob.literal_off,
         relocs: blob.relocs.clone(),
         frame_slots: ra.frame_slots,
@@ -2764,6 +2768,8 @@ fn full_ic_lattice_mono_to_pic_to_mega() {
         state: NmState::Alive,
         level: 1,
         version: 0,
+        trap_count: 0,
+        profile_hash: 0,
         literal_off: blob.literal_off,
         relocs: blob.relocs.clone(),
         frame_slots: ra.frame_slots,
@@ -2985,6 +2991,8 @@ fn dnu_from_compiled_code_reaches_does_not_understand() {
         state: NmState::Alive,
         level: 1,
         version: 0,
+        trap_count: 0,
+        profile_hash: 0,
         literal_off: blob.literal_off,
         relocs: blob.relocs.clone(),
         frame_slots: ra.frame_slots,
@@ -5488,4 +5496,206 @@ fn depth3_deopt_in_block_in_callee_rebuilds_all_frames() {
         deopts_before + 1,
         "one deopt (the block's cold +)"
     );
+}
+
+// ── S14 step 8: the recompile-on-trap loop (the storm-closer) ───────────────
+
+/// S14 step 8 (a): the COLD-COMPILE DEOPT STORM CLOSES. `pk [ ^self poke ]`
+/// compiled with `poke`'s IC Empty → an uncommon trap. Call 1 deopts (and its
+/// re-execution WARMS the IC); call 2 deopts, crosses UNCOMMON_TRAP_LIMIT, the
+/// profile has changed (Empty → Mono) → the method RECOMPILES against the warm
+/// feedback and the old nmethod retires. Call 3, through the replacement,
+/// runs the real inlined/called send with NO deopt. This is the fix for the
+/// benchmark's 6x-slower cold-compiled dispatch.
+#[test]
+fn recompile_on_trap_closes_the_deopt_storm() {
+    let mut vm = VmState::with_options(VmOptions {
+        heap_mib: 64,
+        trace: Default::default(),
+        gc_stress: false,
+        gc_stress_full_period: None,
+        eden_kb: None,
+        jit: JitMode::Threshold(1),
+    });
+    let smi_klass = vm.universe.smi_klass;
+    // `poke [ ^42 ]` on SmallInteger.
+    let poke_sel = vm.universe.intern(b"poke");
+    let poke = {
+        let mut pb = BytecodeBuilder::new();
+        pb.push_smi_i8(42);
+        pb.ret_tos();
+        pb.finish(&mut vm, poke_sel, 0, 0)
+    };
+    install_method(&mut vm, smi_klass, poke_sel, poke);
+    // `pk [ ^self poke ]` — the IC stays EMPTY (never run interpreted).
+    let pk_sel = vm.universe.intern(b"pk");
+    let mut b = BytecodeBuilder::new();
+    b.push_self();
+    b.send(&mut vm, poke_sel, 0);
+    b.ret_tos();
+    let pk = b.finish(&mut vm, pk_sel, 0, 0);
+    install_method(&mut vm, smi_klass, pk_sel, pk);
+
+    let id = driver::compile_method(&mut vm, smi_klass, pk).expect("must compile (trap)");
+    let self_smi = SmallInt::new(9).oop();
+    let call: CallStubFn = unsafe { std::mem::transmute(vm.stubs.call_stub_entry()) };
+
+    let entry_of = |vm: &VmState, id: NmethodId| {
+        let nm = vm.code_table.get(id).unwrap();
+        (unsafe { nm.code.base.add(nm.entry_off as usize) }) as u64
+    };
+
+    // Call 1: trap → deopt → warms poke's IC. No recompile yet (below limit).
+    let vm_ptr: *mut VmState = &mut vm;
+    let d0 = unsafe { (*vm_ptr).stats.deopt_count };
+    let entry = entry_of(unsafe { &*vm_ptr }, id);
+    let r1 = unsafe { call(entry, vm_ptr, [self_smi.raw()].as_ptr(), 1) };
+    assert_eq!(r1, SmallInt::new(42).oop().raw());
+    assert_eq!(
+        unsafe { (*vm_ptr).stats.deopt_count },
+        d0 + 1,
+        "call 1 deopts"
+    );
+    assert_eq!(
+        unsafe { (*vm_ptr).stats.recompiles },
+        0,
+        "below the trap limit"
+    );
+
+    // Call 2: trap again → limit crossed → profile CHANGED (Empty→Mono) →
+    // RECOMPILE + retire the old nmethod.
+    let entry = entry_of(unsafe { &*vm_ptr }, id);
+    let r2 = unsafe { call(entry, vm_ptr, [self_smi.raw()].as_ptr(), 1) };
+    assert_eq!(r2, SmallInt::new(42).oop().raw());
+    assert_eq!(
+        unsafe { (*vm_ptr).stats.deopt_count },
+        d0 + 2,
+        "call 2 deopts"
+    );
+    assert_eq!(
+        unsafe { (*vm_ptr).stats.recompiles },
+        1,
+        "the storm-closer fired"
+    );
+    assert!(
+        matches!(vm.code_table.get(id).unwrap().state, NmState::NotEntrant),
+        "the trapped-out nmethod retired after its replacement installed"
+    );
+
+    // The replacement: same key, version 1, with poke actually compiled in
+    // (`^42` is a quick-return leaf → inlined behind a guard → an inline dep).
+    let pk_sel_raw = vm.universe.intern(b"pk").oop().raw();
+    let new_nm = vm
+        .code_table
+        .iter_alive()
+        .find(|nm| {
+            nm.key_klass.oop().raw() == smi_klass.oop().raw()
+                && nm.key_selector.oop().raw() == pk_sel_raw
+        })
+        .expect("a replacement nmethod for (smi, pk) must be Alive");
+    assert_eq!(new_nm.version, 1, "replacement carries version+1");
+    assert_eq!(
+        new_nm.inline_deps.len(),
+        1,
+        "the warm recompile INLINED poke (no more trap)"
+    );
+    let new_id = new_nm.id;
+
+    // Call 3 through the replacement: real code, NO deopt.
+    let d2 = unsafe { (*vm_ptr).stats.deopt_count };
+    let entry = entry_of(unsafe { &*vm_ptr }, new_id);
+    let r3 = unsafe { call(entry, vm_ptr, [self_smi.raw()].as_ptr(), 1) };
+    assert_eq!(r3, SmallInt::new(42).oop().raw());
+    assert_eq!(
+        unsafe { (*vm_ptr).stats.deopt_count },
+        d2,
+        "the storm is CLOSED: the recompiled code runs without deopting"
+    );
+}
+
+/// S14 step 8 (b): the A5 EFFECTIVENESS CHECK declines a useless recompile.
+/// A persistent smi-OVERFLOW storm (`^self + arg` with operands that overflow
+/// every call) deopts repeatedly, but the feedback profile never changes (the
+/// `+` site was Mono at compile and stays Mono) — recompiling would emit
+/// identical code. The check declines, bumps the stat, and the nmethod stays
+/// Alive at version 0 (no churn).
+#[test]
+fn recompile_declined_when_profile_unchanged() {
+    let mut vm = VmState::with_options(VmOptions {
+        heap_mib: 64,
+        trace: Default::default(),
+        gc_stress: false,
+        gc_stress_full_period: None,
+        eden_kb: None,
+        jit: JitMode::Threshold(1),
+    });
+    let plus_sel = vm.universe.intern(b"+");
+    let smi_klass = vm.universe.smi_klass;
+    // `plusArg: arg [ ^self + arg ]`, `+` = prim 1 with a `^arg` fallback
+    // (prim_fails) — the compiled_smi_overflow scenario.
+    let mut b = BytecodeBuilder::new();
+    b.push_self();
+    b.push_temp(0);
+    b.send(&mut vm, plus_sel, 1);
+    b.ret_tos();
+    let m_sel = vm.universe.intern(b"plusArg:");
+    let method = b.finish(&mut vm, m_sel, 1, 0);
+    let plus_fallback = {
+        let mut pb = BytecodeBuilder::new();
+        pb.push_temp(0);
+        pb.ret_tos();
+        let m = pb.finish(&mut vm, plus_sel, 1, 0);
+        m.set_primitive(1);
+        m.set_flags(1, 0, false, false, true, false, 0);
+        m
+    };
+    let epoch = vm.ic_epoch;
+    InterpreterIc::at(method, 0).set_mono(&mut vm, smi_klass, plus_fallback, epoch);
+    install_method(&mut vm, smi_klass, plus_sel, plus_fallback);
+    // The recompile check resolves the method by (key klass, selector) lookup —
+    // install it like any real method.
+    let m_sel2 = vm.universe.intern(b"plusArg:");
+    install_method(&mut vm, smi_klass, m_sel2, method);
+    let id = driver::compile_method(&mut vm, smi_klass, method).expect("must compile");
+
+    // Overflowing operands: prim fails, fallback `^arg` = the second operand.
+    let a = SmallInt::new(SmallInt::MAX);
+    let b_arg = SmallInt::new(SmallInt::MAX - 7);
+    let call: CallStubFn = unsafe { std::mem::transmute(vm.stubs.call_stub_entry()) };
+    let vm_ptr: *mut VmState = &mut vm;
+    let nm = unsafe { &*vm_ptr }.code_table.get(id).unwrap();
+    let entry = unsafe { nm.code.base.add(nm.entry_off as usize) } as u64;
+
+    let d0 = unsafe { (*vm_ptr).stats.deopt_count };
+    for _ in 0..4 {
+        let r = unsafe {
+            call(
+                entry,
+                vm_ptr,
+                [a.oop().raw(), b_arg.oop().raw()].as_ptr(),
+                2,
+            )
+        };
+        assert_eq!(r, b_arg.oop().raw(), "overflow → fallback `^arg`");
+    }
+    assert_eq!(
+        unsafe { (*vm_ptr).stats.deopt_count },
+        d0 + 4,
+        "every call deopts"
+    );
+    assert!(
+        unsafe { (*vm_ptr).stats.recompile_declined_ineffective } >= 1,
+        "the A5 check declined at least once (profile unchanged)"
+    );
+    assert_eq!(
+        unsafe { (*vm_ptr).stats.recompiles },
+        0,
+        "no useless recompile happened"
+    );
+    let nm = vm.code_table.get(id).unwrap();
+    assert!(
+        matches!(nm.state, NmState::Alive),
+        "code stays Alive (no churn)"
+    );
+    assert_eq!(nm.version, 0);
 }

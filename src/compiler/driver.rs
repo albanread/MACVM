@@ -313,7 +313,16 @@ fn mono_smi_inline_send(_vm: &VmState, method: MethodOop, ic_idx: u16) -> Eligib
     }
     let site = InterpreterIc::at(method, ic_idx);
     let Some(target) = MethodOop::try_from(site.target()) else {
-        return Eligibility::NoPermanent;
+        // S14 step 8: a mono site whose target is a compiled NMETHOD ID (a smi
+        // handle — `set_mono_compiled` rewrites the IC once the callee
+        // compiles). The method-shape checks below need a MethodOop, but a
+        // generic mono send compiles fine WITHOUT one (`Ir::CallSend` through
+        // the S11 machinery, exactly the 962be22 widening) — and
+        // `feedback::read_send_site` resolves compiled ids on its own for the
+        // inline decision. The old `NoPermanent` here PERMANENTLY DISABLED any
+        // method recompiled after its callee had compiled — the exact shape
+        // the recompile-on-trap loop produces (found by its storm test).
+        return Eligibility::Yes;
     };
     // S11 D7: a mono `basicNew` site clears eligibility. `ir.rs` turns it
     // into an inline `Ir::Alloc` when the receiver is a compile-time Slots
@@ -376,6 +385,18 @@ pub fn compile_method(
     vm: &mut VmState,
     rcvr_klass: KlassOop,
     method: MethodOop,
+) -> Option<NmethodId> {
+    compile_method_versioned(vm, rcvr_klass, method, 0)
+}
+
+/// S14 step 8: [`compile_method`] with an explicit `version` — the
+/// recompile-on-trap loop passes `old.version + 1` so the thrash cap
+/// (`recompile::MAX_VERSIONS`) can count replacement generations.
+pub fn compile_method_versioned(
+    vm: &mut VmState,
+    rcvr_klass: KlassOop,
+    method: MethodOop,
+    version: u8,
 ) -> Option<NmethodId> {
     match eligibility_detail(vm, method) {
         Eligibility::Yes => {}
@@ -576,7 +597,12 @@ pub fn compile_method(
         verified_entry_off,
         state: NmState::Alive,
         level: 1,
-        version: 0,
+        version,
+        trap_count: 0,
+        // S14 step 8 (A5): the feedback profile this compile SAW — the
+        // effectiveness check re-snapshots at trap time and declines the
+        // recompile when nothing changed.
+        profile_hash: crate::compiler::feedback::snapshot_profile(vm, method),
         literal_off: blob.literal_off,
         relocs: blob.relocs,
         frame_slots: regalloc_result.frame_slots,

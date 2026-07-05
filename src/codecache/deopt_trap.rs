@@ -554,7 +554,13 @@ pub unsafe extern "C" fn rt_uncommon_trap(
         },
     );
     vm.note_deopt(crate::runtime::vm_state::DeoptReason::Trap); // D7 stats + trace
-    crate::interpreter::interpret_active(vm, resume).raw()
+    let result = crate::interpreter::interpret_active(vm, resume).raw();
+    // S14 step 8: the trap's re-execution just WARMED whatever IC was cold —
+    // count it and, past the limit, recompile this nmethod against the new
+    // feedback (the storm-closer). After the nested run so the profile
+    // snapshot sees the warmed state.
+    crate::runtime::recompile::note_uncommon_trap(vm, nm_id);
+    result
 }
 
 /// D6 helper: the victim activation's ORIGINAL return pc, looked up (peek, no

@@ -60,6 +60,41 @@ use super::CodeHandle;
 /// # Panics
 /// If `id` is not installed, or is not `Alive` (double-invalidation) — a
 /// VM-consistency bug, never guest-triggerable.
+/// S14 step 8: [`make_not_entrant`] MINUS the §2c in-flight return-redirect
+/// walk — for retiring a nmethod from the RECOMPILE-ON-TRAP context
+/// (`rt_uncommon_trap`, after a completed deopt), where the native chain is
+/// not walkable (the trapped frame is gone; the tier-link state says
+/// IntoCompiled with no anchor — the same constraint that moved `rt_poll`'s
+/// disarm to the 10c sweep).
+///
+/// Skipping §2c is SOUND **for recompilation only**: the replacement compiles
+/// the SAME method (identical semantics, better feedback-driven codegen), so
+/// an in-flight activation of the old code deeper in the stack may simply run
+/// to completion on it. Future entries are blocked by the §2b entry patch,
+/// and a call-free loop still deopts via the §2d poll arm. SEMANTIC
+/// invalidation (redefinition — deps.rs) must keep using [`make_not_entrant`]:
+/// there the old code is WRONG and in-flight activations must deopt eagerly.
+pub fn make_not_entrant_lazy(vm: &mut VmState, id: NmethodId) {
+    let (code, entry_off, verified_entry_off) = {
+        let nm = vm
+            .code_table
+            .get(id)
+            .expect("make_not_entrant_lazy: id must be installed");
+        (nm.code, nm.entry_off, nm.verified_entry_off)
+    };
+    vm.code_table.set_not_entrant(id); // §2a
+    let not_entrant_addr = vm.stubs.not_entrant_addr(); // §2b
+    vm.code_cache
+        .write_branch26_at(code, entry_off, not_entrant_addr);
+    if verified_entry_off != entry_off {
+        vm.code_cache
+            .write_branch26_at(code, verified_entry_off, not_entrant_addr);
+    }
+    // §2d: the poll arm (the 10c sweep disarms once drained). NO §2c walk.
+    vm.pending_deopt_flag = true;
+    vm.reg_block.poll_flag = 1;
+}
+
 pub fn make_not_entrant(vm: &mut VmState, id: NmethodId) {
     // Read the two entry offsets + code handle BEFORE flipping state (the
     // borrow of `code_table` here ends before the mutable `code_cache` writes
@@ -331,6 +366,8 @@ mod tests {
             state: NmState::Alive,
             level: 1,
             version: 0,
+            trap_count: 0,
+            profile_hash: 0,
             literal_off: 0,
             relocs: Vec::new(),
             frame_slots: 0,
