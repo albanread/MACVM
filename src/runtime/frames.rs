@@ -87,6 +87,12 @@ pub enum AdapterKind {
     MustBeBoolean,
     AllocSlow,
     Poll,
+    /// S14 step 9: not a real adapter — the synthetic anchor
+    /// [`deopt_bridge_link`] plants so a walk during `interpret_active` can
+    /// bridge an ABANDONED deopted frame onto its caller chain. Owns no
+    /// root-spill slots at all (the dead frame's oops live on in the
+    /// materialized interpreter frames).
+    DeoptBridge,
 }
 
 impl AdapterKind {
@@ -224,6 +230,30 @@ fn resolve_redirected_lr(vm: &VmState, fp_next: u64, saved_lr: u64) -> u64 {
     }
 }
 
+/// S14 step 9: the tier link that lets a walk BRIDGE an ABANDONED (deopted)
+/// compiled frame while its materialized interpreter replacement runs
+/// (`interpret_active`). The materialized region bottoms at an
+/// `ENTRY_FRAME_SENTINEL`, and without a paired `IntoInterpreter` link any
+/// walk during the nested run panicked at the sentinel↔`IntoCompiled`
+/// mismatch (the MACVM_GC_STRESS × JIT abort). The link's anchor is the DEAD
+/// frame's own fp with its saved-return pc (`[fp+8]`, §2c-translated), so the
+/// `Anchor` step lands the walk directly on the dead frame's CALLER,
+/// classified by the caller's own return safepoint — the dead frame itself is
+/// SKIPPED entirely (its oops were consumed by the materializer and live on
+/// in the interpreter frames the linear stack scan already covers).
+pub fn deopt_bridge_link(vm: &VmState, dead_fp: u64) -> crate::runtime::vm_state::TierLink {
+    // SAFETY: `dead_fp` is the deopted frame's own x29, still a live native
+    // frame (the deopt stub sits below it) for the whole nested run — the
+    // same reads the walker itself performs on anchored frames.
+    let caller_fp = unsafe { read_u64(dead_fp) };
+    let raw_ret = unsafe { read_u64(dead_fp + 8) };
+    let ret_pc = resolve_redirected_lr(vm, caller_fp, raw_ret);
+    crate::runtime::vm_state::TierLink::DeoptBridge {
+        dead_fp,
+        caller_ret_pc: ret_pc,
+    }
+}
+
 /// D3: walk every activation of the (single) process, innermost first,
 /// interleaving native compiled/stub frames and process-stack interpreter
 /// frames via `vm.tier_links` + the anchor. `f` is called once per
@@ -286,6 +316,22 @@ pub fn walk_frames(vm: &VmState, mut f: impl FnMut(FrameView)) {
     let live_interp =
         vm.stack.has_frame() && vm.stack.fp != crate::oops::layout::ENTRY_FRAME_SENTINEL as usize;
     let mut mode = match vm.tier_links.last() {
+        // S14 step 9: a DeoptBridge behaves exactly like IntoInterpreter at
+        // walk start — the materialized interpreter frames are innermost for
+        // the nested run's whole lifetime; the frameless edge case consumes
+        // the link and enters the caller chain it anchors (same rule, same
+        // reasons, as the C2i arm below).
+        Some(TierLink::DeoptBridge {
+            dead_fp,
+            caller_ret_pc,
+        }) => {
+            if live_interp {
+                Mode::Interp(vm.stack.fp)
+            } else {
+                link_idx -= 1;
+                Mode::Anchor(*dead_fp, *caller_ret_pc, AdapterKind::DeoptBridge)
+            }
+        }
         Some(TierLink::IntoInterpreter {
             compiled_fp,
             compiled_ret_pc,
@@ -383,6 +429,10 @@ pub fn walk_frames(vm: &VmState, mut f: impl FnMut(FrameView)) {
                     });
                     match vm.tier_links[link_idx] {
                         TierLink::IntoCompiled { interp_frame, .. } => Mode::Interp(interp_frame),
+                        TierLink::DeoptBridge { .. } => panic!(
+                            "walk_frames: call_stub's own boundary must pair with \
+                             TierLink::IntoCompiled, found DeoptBridge instead"
+                        ),
                         TierLink::IntoInterpreter { .. } => panic!(
                             "walk_frames: call_stub's own boundary must pair with \
                              TierLink::IntoCompiled, found IntoInterpreter instead"
@@ -408,6 +458,14 @@ pub fn walk_frames(vm: &VmState, mut f: impl FnMut(FrameView)) {
                                 compiled_fp,
                                 compiled_ret_pc,
                             } => Mode::Anchor(compiled_fp, compiled_ret_pc, AdapterKind::C2i),
+                            // S14 step 9: the materialized region a deopt's
+                            // nested run executes — bridge PAST the abandoned
+                            // compiled frame onto its caller (the anchor pc is
+                            // already the caller's own return safepoint).
+                            TierLink::DeoptBridge {
+                                dead_fp,
+                                caller_ret_pc,
+                            } => Mode::Anchor(dead_fp, caller_ret_pc, AdapterKind::DeoptBridge),
                             TierLink::IntoCompiled { .. } => panic!(
                                 "walk_frames: an ENTRY_FRAME_SENTINEL must pair with \
                                  TierLink::IntoInterpreter, found IntoCompiled instead"

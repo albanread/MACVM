@@ -554,7 +554,12 @@ pub unsafe extern "C" fn rt_uncommon_trap(
         },
     );
     vm.note_deopt(crate::runtime::vm_state::DeoptReason::Trap); // D7 stats + trace
+                                                                // S14 step 9: bridge link so a GC during the nested run can walk PAST the
+                                                                // abandoned compiled frame onto its caller chain (see `deopt_bridge_link`).
+    let bridge = crate::runtime::frames::deopt_bridge_link(vm, fp);
+    vm.tier_links.push(bridge);
     let result = crate::interpreter::interpret_active(vm, resume).raw();
+    vm.tier_links.pop();
     // S14 step 8: the trap's re-execution just WARMED whatever IC was cold —
     // count it and, past the limit, recompile this nmethod against the new
     // feedback (the storm-closer). After the nested run so the profile
@@ -669,7 +674,12 @@ pub unsafe extern "C" fn rt_deopt_on_return(
         },
     );
     vm.note_deopt(crate::runtime::vm_state::DeoptReason::Return); // D7 stats + trace
-    crate::interpreter::interpret_active(vm, resume).raw()
+                                                                  // S14 step 9: same walk bridge as `rt_uncommon_trap` (see there).
+    let bridge = crate::runtime::frames::deopt_bridge_link(vm, fp);
+    vm.tier_links.push(bridge);
+    let result = crate::interpreter::interpret_active(vm, resume).raw();
+    vm.tier_links.pop();
+    result
 }
 
 /// D3 step 4: the off-signal landing for a `0xDE02` compiled-assertion trap —

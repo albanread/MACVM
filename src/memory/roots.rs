@@ -367,6 +367,11 @@ fn real_oop_rootspill_slots(vm: &VmState, kind: AdapterKind, caller_pc: u64) -> 
     match kind {
         AdapterKind::MustBeBoolean => 1,
         AdapterKind::AllocSlow => 1,
+        // S14 step 9: the synthetic deopt-bridge anchor owns NO spill slots —
+        // it marks an ABANDONED compiled frame whose oops were already
+        // materialized into interpreter frames (covered by the linear stack
+        // scan); the walk merely passes through to the caller chain.
+        AdapterKind::DeoptBridge => 0,
         AdapterKind::Poll => unreachable!(
             "each_code_root: stub_poll never tags the anchor (S10 D5.6) -- walk_frames must \
              never produce FrameView::Adapter{{kind: Poll, ..}} (see its own module doc)"

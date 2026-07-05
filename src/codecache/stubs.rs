@@ -1612,7 +1612,12 @@ pub unsafe extern "C" fn rt_poll(vm: *mut VmState, loop_fp: u64, ret_pc: u64) ->
         },
     );
     vm.note_deopt(crate::runtime::vm_state::DeoptReason::Poll); // D7 stats + trace
+                                                                // S14 step 9: same walk bridge as `rt_uncommon_trap` (see
+                                                                // `frames::deopt_bridge_link`).
+    let bridge = crate::runtime::frames::deopt_bridge_link(vm, loop_fp);
+    vm.tier_links.push(bridge);
     let result = crate::interpreter::interpret_active(vm, resume).raw();
+    vm.tier_links.pop();
 
     // An NLR escaping through the deoptee: the nested interpreter run returned
     // the reserved-tag sentinel, NOT an oop. Hand it straight back (deopted=1

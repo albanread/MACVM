@@ -131,6 +131,14 @@ pub enum TierLink {
     /// nmethod is running "underneath" — the only way a mixed-tier stack
     /// trace can name it (`key_klass`/`key_selector`) and locate its own
     /// `poll_bci`, since nothing else records a compiled activation at all.
+    /// S14 step 9: a synthetic crossing pushed around a deopt's
+    /// `interpret_active` nested run — pairs with the materialized region's
+    /// own `ENTRY_FRAME_SENTINEL` so a walk can bridge PAST the abandoned
+    /// compiled frame (`dead_fp`, skipped entirely) onto its caller chain,
+    /// classified at `caller_ret_pc` (the dead frame's §2c-translated saved
+    /// return pc — a real safepoint in the caller). See
+    /// `frames::deopt_bridge_link`.
+    DeoptBridge { dead_fp: u64, caller_ret_pc: u64 },
     IntoCompiled {
         interp_frame: usize,
         entry_sp: u64,
