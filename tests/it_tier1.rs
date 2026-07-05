@@ -4823,3 +4823,324 @@ fn compiled_block_nlr_with_arg_matches_interpreter() {
         "compiled block NLR of arg = 7"
     );
 }
+
+/// PROBE (S14 7-IV foundation check): a NON-FUSED `BoolBr` (raw boolean temp as
+/// the condition — no comparison to fuse) feeding a MERGE block. Verifies
+/// convert's sim-stack depth bookkeeping agrees with `compute_entry_depths`
+/// across a BoolBr edge (`r := flag ifTrue: [1] ifFalse: [2]. ^r`).
+#[test]
+fn convert_nonfused_boolbr_into_merge() {
+    let mut vm = test_vm();
+    let sel = vm.universe.intern(b"m:");
+    let mut b = BytecodeBuilder::new();
+    b.push_temp(0); // flag — a raw boolean temp, NOT a fusable comparison
+    let else_l = b.new_label();
+    let end_l = b.new_label();
+    b.br_false_fwd(else_l);
+    b.push_smi_i8(1);
+    b.jump_fwd(end_l);
+    b.bind(else_l);
+    b.push_smi_i8(2);
+    b.bind(end_l); // merge, depth 1
+    b.store_temp_pop(1); // r := ...
+    b.push_temp(1);
+    b.ret_tos();
+    let m = b.finish(&mut vm, sel, 1, 1);
+
+    assert!(
+        driver::eligible(&vm, m),
+        "branchy boolean-temp method is eligible"
+    );
+    let cfg = decode::decode(m);
+    let ir = macvm::compiler::ir::convert(&vm, m, &cfg);
+    assert!(!ir.blocks.is_empty());
+
+    // And the differential: interp vs compiled, both polarities.
+    let smi_klass = vm.universe.smi_klass;
+    let id = driver::compile_method(&mut vm, smi_klass, m).expect("must compile");
+    for (flag, expect) in [(vm.universe.true_obj, 1i64), (vm.universe.false_obj, 2i64)] {
+        let interp = macvm::interpreter::run_method(&mut vm, m, SmallInt::new(9).oop(), &[flag]);
+        assert_eq!(interp.raw(), SmallInt::new(expect).oop().raw());
+        let nm = vm.code_table.get(id).expect("installed");
+        let entry = unsafe { nm.code.base.add(nm.entry_off as usize) } as u64;
+        let call: CallStubFn = unsafe { std::mem::transmute(vm.stubs.call_stub_entry()) };
+        let vm_ptr: *mut VmState = &mut vm;
+        let result = unsafe {
+            call(
+                entry,
+                vm_ptr,
+                [SmallInt::new(9).oop().raw(), flag.raw()].as_ptr(),
+                2,
+            )
+        };
+        assert_eq!(result, SmallInt::new(expect).oop().raw());
+    }
+}
+
+// ── S14 step 7-IV-a: multi-block (CFG) callee inlining ──────────────────────
+
+/// S14 step 7-IV-a (a): a BRANCHY no-send callee with TWO returns inlines.
+/// `choose: f [ f ifTrue: [^1]. ^2 ]` (hand-built: br_false + two returns) is
+/// multi-block, so the leaf/nonleaf splicers decline and `try_inline_cfg` maps
+/// its CFG into caller blocks; both returns feed the result vreg via the
+/// continuation. Differential over both polarities; the send was inlined (no
+/// compiled IC site, one inline dep).
+#[test]
+fn compiled_inlined_branchy_callee_matches_interpreter() {
+    let mut vm = test_vm();
+    let smi_klass = vm.universe.smi_klass;
+
+    // `choose: f [ f ifTrue: [^1]. ^2 ]` on SmallInteger.
+    let choose_sel = vm.universe.intern(b"choose:");
+    let choose = {
+        let mut cb = BytecodeBuilder::new();
+        let else_l = cb.new_label();
+        cb.push_temp(0); // f
+        cb.br_false_fwd(else_l);
+        cb.push_smi_i8(1);
+        cb.ret_tos();
+        cb.bind(else_l);
+        cb.push_smi_i8(2);
+        cb.ret_tos();
+        cb.finish(&mut vm, choose_sel, 1, 0)
+    };
+    install_method(&mut vm, smi_klass, choose_sel, choose);
+
+    // `runc: f [ ^3 choose: f ]`, warmed mono.
+    let runc_sel = vm.universe.intern(b"runc:");
+    let mut b = BytecodeBuilder::new();
+    b.push_smi_i8(3);
+    b.push_temp(0);
+    b.send(&mut vm, choose_sel, 1);
+    b.ret_tos();
+    let runc = b.finish(&mut vm, runc_sel, 1, 0);
+    let epoch = vm.ic_epoch;
+    InterpreterIc::at(runc, 0).set_mono(&mut vm, smi_klass, choose, epoch);
+
+    assert!(driver::eligible(&vm, runc));
+    let id = driver::compile_method(&mut vm, smi_klass, runc).expect("must compile");
+    {
+        let nm = vm.code_table.get(id).expect("installed");
+        assert!(
+            nm.ic_sites.is_empty(),
+            "the branchy callee was CFG-inlined (no sends inside) → no compiled IC site"
+        );
+        assert_eq!(nm.inline_deps.len(), 1, "one inline dependency (choose:)");
+    }
+
+    let self_smi = SmallInt::new(9).oop();
+    for (flag, expect) in [(vm.universe.true_obj, 1i64), (vm.universe.false_obj, 2i64)] {
+        let interp = macvm::interpreter::run_method(&mut vm, runc, self_smi, &[flag]);
+        assert_eq!(interp.raw(), SmallInt::new(expect).oop().raw());
+        let nm = vm.code_table.get(id).expect("installed");
+        let entry = unsafe { nm.code.base.add(nm.entry_off as usize) } as u64;
+        let call: CallStubFn = unsafe { std::mem::transmute(vm.stubs.call_stub_entry()) };
+        let vm_ptr: *mut VmState = &mut vm;
+        let result = unsafe { call(entry, vm_ptr, [self_smi.raw(), flag.raw()].as_ptr(), 2) };
+        assert_eq!(
+            result,
+            SmallInt::new(expect).oop().raw(),
+            "compiled CFG-inlined branchy callee (flag {expect}) must match interp"
+        );
+    }
+}
+
+/// Builds the LOOP callee `spin: n [ |i| i := 0. [i < n] whileTrue: [i := i + 1]. ^i ]`
+/// (hand-built with a real backward jump) on SmallInteger, plus the smi `<`
+/// (prim 10) and `+` (prim 1) methods its sends dispatch to. Returns
+/// (spin_method, lt_method, plus_method).
+fn spin_loop_scenario(vm: &mut VmState) -> (MethodOop, MethodOop, MethodOop) {
+    let smi_klass = vm.universe.smi_klass;
+    let lt_sel = vm.universe.intern(b"<");
+    let lt = {
+        let mut lb = BytecodeBuilder::new();
+        lb.push_self();
+        lb.ret_self();
+        let m = lb.finish(vm, lt_sel, 1, 0);
+        m.set_primitive(10);
+        m
+    };
+    let lt_sel = vm.universe.intern(b"<");
+    install_method(vm, smi_klass, lt_sel, lt);
+    let plus_sel = vm.universe.intern(b"+");
+    let plus = {
+        let mut pb = BytecodeBuilder::new();
+        pb.push_self();
+        pb.ret_self();
+        let m = pb.finish(vm, plus_sel, 1, 0);
+        m.set_primitive(1);
+        m
+    };
+    let plus_sel = vm.universe.intern(b"+");
+    install_method(vm, smi_klass, plus_sel, plus);
+
+    // spin: n — unified slots: 0 = n (arg), 1 = i (temp).
+    let spin_sel = vm.universe.intern(b"spin:");
+    let mut sb = BytecodeBuilder::new();
+    let cond_l = sb.new_label();
+    let exit_l = sb.new_label();
+    sb.push_smi_i8(0);
+    sb.store_temp_pop(1); // i := 0
+    sb.bind(cond_l);
+    sb.push_temp(1); // i
+    sb.push_temp(0); // n
+    sb.send(vm, lt_sel, 1); // i < n        (ic 0)
+    sb.br_false_fwd(exit_l);
+    sb.push_temp(1);
+    sb.push_smi_i8(1);
+    sb.send(vm, plus_sel, 1); // i + 1      (ic 1)
+    sb.store_temp_pop(1); // i := i + 1
+    sb.jump_back(cond_l);
+    sb.bind(exit_l);
+    sb.push_temp(1);
+    sb.ret_tos(); // ^i
+    let spin = sb.finish(vm, spin_sel, 1, 1);
+    let spin_sel = vm.universe.intern(b"spin:");
+    install_method(vm, smi_klass, spin_sel, spin);
+    (spin, lt, plus)
+}
+
+/// The warm caller `callspin: n [ ^self spin: n ]` (self a smi), its IC warmed
+/// mono to `spin`.
+fn spin_caller(vm: &mut VmState, spin: MethodOop) -> MethodOop {
+    let smi_klass = vm.universe.smi_klass;
+    let spin_sel = vm.universe.intern(b"spin:");
+    let call_sel = vm.universe.intern(b"callspin:");
+    let mut b = BytecodeBuilder::new();
+    b.push_self();
+    b.push_temp(0);
+    b.send(vm, spin_sel, 1);
+    b.ret_tos();
+    let caller = b.finish(vm, call_sel, 1, 0);
+    let epoch = vm.ic_epoch;
+    InterpreterIc::at(caller, 0).set_mono(vm, smi_klass, spin, epoch);
+    caller
+}
+
+/// S14 step 7-IV-a (b): a LOOP callee inlines — `spin:` (a real backward-jump
+/// loop with two warm sends) splices as caller blocks: its `<`/`+` become
+/// compiled `CallSend`s inside the inlined loop, the backward jump becomes an
+/// `Ir::Poll` with an InlineSite-chained loop-poll deopt scope. `callspin: 5`
+/// → 5, interp == compiled, no deopt.
+#[test]
+fn compiled_inlined_loop_callee_matches_interpreter() {
+    let mut vm = test_vm();
+    let smi_klass = vm.universe.smi_klass;
+    let (spin, lt, plus) = spin_loop_scenario(&mut vm);
+    // Warm BOTH of spin's own sites (mono smi).
+    let epoch = vm.ic_epoch;
+    InterpreterIc::at(spin, 0).set_mono(&mut vm, smi_klass, lt, epoch);
+    let epoch = vm.ic_epoch;
+    InterpreterIc::at(spin, 1).set_mono(&mut vm, smi_klass, plus, epoch);
+    let caller = spin_caller(&mut vm, spin);
+
+    // The callee must actually fit the level-1 inline budget (self-check: if
+    // tunables change this test must fail loudly, not silently test a Call).
+    assert!(
+        macvm::compiler::inline::inline_cost(spin)
+            <= macvm::compiler::inline::budget_for_level(1).per_call_cost,
+        "spin: must fit the level-1 budget for this test to exercise CFG inlining \
+         (cost {} > {})",
+        macvm::compiler::inline::inline_cost(spin),
+        macvm::compiler::inline::budget_for_level(1).per_call_cost,
+    );
+
+    assert!(driver::eligible(&vm, caller));
+    let id = driver::compile_method(&mut vm, smi_klass, caller).expect("must compile");
+    {
+        let nm = vm.code_table.get(id).expect("installed");
+        assert_eq!(
+            nm.ic_sites.len(),
+            2,
+            "spin's warm `<` and `+` are compiled IC sites INSIDE the inlined loop"
+        );
+        assert_eq!(nm.inline_deps.len(), 1, "one inline dependency (spin:)");
+    }
+
+    let self_smi = SmallInt::new(1).oop();
+    let interp =
+        macvm::interpreter::run_method(&mut vm, caller, self_smi, &[SmallInt::new(5).oop()]);
+    assert_eq!(
+        interp.raw(),
+        SmallInt::new(5).oop().raw(),
+        "interp: spin(5) = 5"
+    );
+
+    let nm = vm.code_table.get(id).expect("installed");
+    let entry = unsafe { nm.code.base.add(nm.entry_off as usize) } as u64;
+    let call: CallStubFn = unsafe { std::mem::transmute(vm.stubs.call_stub_entry()) };
+    let vm_ptr: *mut VmState = &mut vm;
+    let result = unsafe {
+        call(
+            entry,
+            vm_ptr,
+            [self_smi.raw(), SmallInt::new(5).oop().raw()].as_ptr(),
+            2,
+        )
+    };
+    assert_eq!(
+        result,
+        SmallInt::new(5).oop().raw(),
+        "compiled CFG-inlined loop callee spin(5) = 5 (differential match)"
+    );
+}
+
+/// S14 step 7-IV-a (c): a DEOPT INSIDE an inlined LOOP callee. `spin:`'s `<`
+/// site is left COLD (Untaken) → a terminating trap at the inlined loop's
+/// condition. Entering the compiled caller reaches the trap on the first
+/// iteration → the depth-2 materializer rebuilds the CALLEE frame (mid-loop,
+/// resume at the `<` send) AND the CALLER frame → the interpreter runs the
+/// whole loop → 4, == interp, deopt_count +1.
+#[test]
+fn deopt_inside_inlined_loop_callee_rebuilds_frames() {
+    let mut vm = VmState::with_options(VmOptions {
+        heap_mib: 64,
+        trace: Default::default(),
+        gc_stress: false,
+        gc_stress_full_period: None,
+        eden_kb: None,
+        jit: JitMode::Threshold(1),
+    });
+    let smi_klass = vm.universe.smi_klass;
+    let (spin, _lt, plus) = spin_loop_scenario(&mut vm);
+    // Warm ONLY `+` (ic 1); `<` (ic 0) stays Empty → an in-loop trap.
+    let epoch = vm.ic_epoch;
+    InterpreterIc::at(spin, 1).set_mono(&mut vm, smi_klass, plus, epoch);
+    let caller = spin_caller(&mut vm, spin);
+
+    assert!(driver::eligible(&vm, caller));
+    // Compile BEFORE the interp reference (interp would warm `<`).
+    let id = driver::compile_method(&mut vm, smi_klass, caller).expect("must compile");
+    let interp = macvm::interpreter::run_method(
+        &mut vm,
+        caller,
+        SmallInt::new(1).oop(),
+        &[SmallInt::new(4).oop()],
+    );
+    assert_eq!(interp.raw(), SmallInt::new(4).oop().raw());
+
+    let nm = vm.code_table.get(id).expect("installed");
+    let entry = unsafe { nm.code.base.add(nm.entry_off as usize) } as u64;
+    let call: CallStubFn = unsafe { std::mem::transmute(vm.stubs.call_stub_entry()) };
+    let vm_ptr: *mut VmState = &mut vm;
+    let deopts_before = unsafe { (*vm_ptr).stats.deopt_count };
+    let result = unsafe {
+        call(
+            entry,
+            vm_ptr,
+            [SmallInt::new(1).oop().raw(), SmallInt::new(4).oop().raw()].as_ptr(),
+            2,
+        )
+    };
+    let deopts_after = unsafe { (*vm_ptr).stats.deopt_count };
+    assert_eq!(
+        result,
+        SmallInt::new(4).oop().raw(),
+        "the in-loop trap must rebuild callee (mid-loop) + caller frames → spin(4) = 4"
+    );
+    assert_eq!(
+        deopts_after,
+        deopts_before + 1,
+        "exactly one deopt (the cold `<`)"
+    );
+}

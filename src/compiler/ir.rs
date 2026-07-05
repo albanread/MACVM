@@ -847,6 +847,13 @@ struct Translator<'a> {
     /// merges lossily (that would have made M `NoPermanent`), so linear tracking
     /// suffices — a site never reaches a value-send by a path convert can't see.
     temp_sites: Vec<Option<usize>>,
+    /// S14 step 7-IV-a: when a `Send` arm spliced a MULTI-BLOCK callee
+    /// (`try_inline_cfg`), the caller's current block must end with a `Jump`
+    /// into the callee's ENTRY block — not the continuation the arm returns as
+    /// `split`. The arm sets this; `convert`'s split handling `take()`s it as
+    /// the Jump target (falling back to the continuation when unset — the
+    /// ordinary smi-split case).
+    pending_jump_target: Option<BlockId>,
 }
 
 impl<'a> Translator<'a> {
@@ -1668,6 +1675,481 @@ impl<'a> Translator<'a> {
         }
     }
 
+    /// S14 step 7-IV-a: an uncommon-trap block for a deopt site INSIDE an
+    /// inlined extent — like [`Translator::fresh_not_bool_block`] /
+    /// [`Translator::fail_and_branch`] but carrying the extent's `InlineSite`,
+    /// so the deopt rebuilds BOTH the inlined frame and its caller.
+    fn fresh_inlined_trap_block(
+        &mut self,
+        trap_bci: usize,
+        reexec_stack: Vec<VReg>,
+        inline: InlineSite,
+    ) -> BlockId {
+        let trap_id = self.fresh_block_id();
+        self.finish_block(IrBlock {
+            id: trap_id,
+            bci: trap_bci,
+            code: vec![Ir::UncommonTrap { bci: trap_bci }],
+            entry_stack: Vec::new(),
+            deopt_sites: vec![(
+                0,
+                DeoptRaw {
+                    stack: reexec_stack,
+                    bci: trap_bci,
+                    kind: SafepointKind::UncommonTrap,
+                    reexecute: true,
+                    inline: Some(inline),
+                },
+            )],
+        });
+        trap_id
+    }
+
+    /// S14 step 7-IV-a: splice a MULTI-BLOCK callee (branches, loops — the
+    /// general CFG form `inline::is_inline_eligible_cfg` admits) inline behind
+    /// a receiver-klass guard. Where the leaf/nonleaf splicers paste a single
+    /// straight line into the caller's current block, this maps the callee's
+    /// WHOLE decoded CFG onto fresh caller `IrBlock`s:
+    ///
+    ///   - every callee CFG block gets a fresh caller block id; its
+    ///     `Jump`/`Branch` targets are remapped through that table;
+    ///   - the callee's operand-stack merge discipline is rebuilt with the SAME
+    ///     machinery `convert` uses on the root method (`compute_entry_depths` +
+    ///     `entry_stack_sources` + `emit_merges` + fresh merge vregs);
+    ///   - every `return` becomes `Move {result_vreg, v}; Jump {continuation}` —
+    ///     the caller resumes in `continuation` with `result_vreg` as the send's
+    ///     value;
+    ///   - a backward jump becomes an `Ir::Poll` with an in-body LOOP-POLL deopt
+    ///     scope (`InlineSite`-chained, reexecute at the callee's loop-header
+    ///     bci) — the first time a loop-poll deopt reconstructs depth 2;
+    ///   - a `Branch` becomes a (non-fused) `Ir::BoolBr` whose `not_bool` edge is
+    ///     an `InlineSite`-chained trap. The condition is POPPED from the sim
+    ///     stack after capturing the trap's reexecute snapshot — the
+    ///     strictly-correct accounting (`instr_stack_delta(br) == -1`), keeping
+    ///     Inherit/Merge successors depth-exact at ANY stack depth (convert's
+    ///     root loop gets away without the pop only because its branch
+    ///     successors sit at depth 0 and `Empty` discards the leftover);
+    ///   - the callee's own sends lower exactly as in the nonleaf splice: a cold
+    ///     (Untaken) IC → a TERMINATING in-body trap; a warm IC → a plain
+    ///     compiled `CallSend` with a call-return deopt scope. No smi fusion, no
+    ///     branch fusion, no recursive inlining inside the inlinee (correctness
+    ///     first; those are optimizations on top).
+    ///
+    /// On success returns `(result_vreg, callee_entry_id, continuation_id)`:
+    /// the caller pushes `result_vreg`, sets `pending_jump_target =
+    /// callee_entry_id`, and returns `continuation_id` as its `split`. Returns
+    /// `None` (having emitted NOTHING) only on an up-front shape mismatch.
+    #[allow(clippy::too_many_arguments)]
+    fn try_inline_cfg(
+        &mut self,
+        callee: MethodOop,
+        guard_klass: KlassOop,
+        guard_shape: GuardShape,
+        selector: SymbolOop,
+        receiver: VReg,
+        args: &[VReg],
+        send_bci: usize,
+        pre_pop_stack: &[VReg],
+        code: &mut Vec<Ir>,
+        deopt: &mut Vec<(u32, DeoptRaw)>,
+    ) -> Option<(VReg, BlockId, BlockId)> {
+        let _ = deopt; // caller-block deopt vec unused: guard cold path is its own block
+        let ccfg = crate::compiler::decode::decode(callee);
+        if ccfg.blocks.is_empty() || callee.argc() != args.len() {
+            return None;
+        }
+
+        let callee_pool_ix = self.pool.intern(callee.oop().raw(), Some(RelocKind::Oop)).0;
+        let n_operands = args.len() + 1;
+        debug_assert!(pre_pop_stack.len() >= n_operands);
+        let caller_pending_stack = pre_pop_stack[..pre_pop_stack.len() - n_operands].to_vec();
+        let callee_self = receiver;
+
+        // Guard fronting the whole extent (cold = reexecute the send in the
+        // CALLER scope — `inline: None`, exactly the leaf/nonleaf convention).
+        let expect = self
+            .pool
+            .intern(guard_klass.oop().raw(), Some(RelocKind::Oop));
+        let cold_id = self.fresh_block_id();
+        self.finish_block(IrBlock {
+            id: cold_id,
+            bci: send_bci,
+            code: vec![Ir::UncommonTrap { bci: send_bci }],
+            entry_stack: Vec::new(),
+            deopt_sites: vec![(
+                0,
+                DeoptRaw {
+                    stack: pre_pop_stack.to_vec(),
+                    bci: send_bci,
+                    kind: SafepointKind::UncommonTrap,
+                    reexecute: true,
+                    inline: None,
+                },
+            )],
+        });
+        code.push(Ir::GuardKlass {
+            obj: callee_self,
+            expect,
+            fail: cold_id,
+            kind: guard_shape,
+        });
+
+        // Callee slots: args alias the send operands; temps = fresh nil vregs
+        // (initialised in the CALLER's block, dominating the whole extent).
+        let mut callee_slots: Vec<VReg> = Vec::with_capacity(callee.argc() + callee.ntemps());
+        callee_slots.extend_from_slice(args);
+        let nil_lit = self
+            .pool
+            .intern(self.vm.universe.nil_obj.raw(), Some(RelocKind::Oop));
+        for _ in 0..callee.ntemps() {
+            let t = self.fresh(true);
+            code.push(Ir::ConstPool {
+                dst: t,
+                lit: nil_lit,
+            });
+            callee_slots.push(t);
+        }
+
+        let inline_proto = InlineSite {
+            method_pool_ix: callee_pool_ix,
+            receiver: callee_self,
+            slots: callee_slots.clone(),
+            sender_bci: send_bci as u16,
+            caller_pending_stack,
+            is_block: false,
+        };
+
+        // ── CFG scaffolding: the same machinery convert runs on the root. ──
+        let (entry_depth, _max) = compute_entry_depths(callee, &ccfg);
+        let sources = entry_stack_sources(&ccfg, &entry_depth);
+        let n = ccfg.blocks.len();
+        let ir_ids: Vec<BlockId> = (0..n).map(|_| self.fresh_block_id()).collect();
+        let continuation_id = self.fresh_block_id();
+        let result_vreg = self.fresh(true);
+
+        let mut entry_stacks: Vec<Option<Vec<VReg>>> = vec![None; n];
+        for (b, source) in sources.iter().enumerate() {
+            match source {
+                EntryStackSource::Empty => entry_stacks[b] = Some(Vec::new()),
+                EntryStackSource::Merge => {
+                    let depth = entry_depth[b] as usize;
+                    entry_stacks[b] = Some((0..depth).map(|_| self.fresh(true)).collect());
+                }
+                EntryStackSource::Inherit(_) => {}
+            }
+        }
+        let mut exit_stacks: Vec<Option<Vec<VReg>>> = vec![None; n];
+        let mut reachable = vec![false; n];
+        reachable[0] = true;
+
+        for b in 0..n {
+            if !reachable[b] {
+                // Dead (post-trap / post-return) callee block: an inert,
+                // structurally-valid placeholder, never jumped to (mirrors
+                // convert's own dead-block handling).
+                self.finish_block(IrBlock {
+                    id: ir_ids[b],
+                    bci: send_bci,
+                    code: vec![Ir::RetSelf],
+                    entry_stack: Vec::new(),
+                    deopt_sites: Vec::new(),
+                });
+                continue;
+            }
+            let entry_stack = match sources[b] {
+                EntryStackSource::Empty | EntryStackSource::Merge => {
+                    entry_stacks[b].clone().expect("pre-allocated above")
+                }
+                EntryStackSource::Inherit(pred) => exit_stacks[pred]
+                    .clone()
+                    .expect("single non-backward predecessor translated first"),
+            };
+            let cfg_block = &ccfg.blocks[b];
+            let mut cstack = entry_stack.clone();
+            let mut bcode: Vec<Ir> = Vec::new();
+            let mut bdeopt: Vec<(u32, DeoptRaw)> = Vec::new();
+            let mut trapped = false;
+            let mut returned = false;
+            let mut last_instr_bci = cfg_block.bci_start;
+            let mut bci = cfg_block.bci_start;
+            while bci < cfg_block.bci_end {
+                last_instr_bci = bci;
+                let (instr, next) = decode_at(callee, bci);
+                match instr {
+                    Instr::PushSelf => cstack.push(callee_self),
+                    Instr::PushNil => cstack
+                        .push(self.push_well_known(self.vm.universe.nil_obj.raw(), &mut bcode)),
+                    Instr::PushTrue => cstack
+                        .push(self.push_well_known(self.vm.universe.true_obj.raw(), &mut bcode)),
+                    Instr::PushFalse => cstack
+                        .push(self.push_well_known(self.vm.universe.false_obj.raw(), &mut bcode)),
+                    Instr::PushSmi(v) => {
+                        let dst = self.fresh(true);
+                        bcode.push(Ir::ConstSmi {
+                            dst,
+                            value: v as i64,
+                        });
+                        cstack.push(dst);
+                    }
+                    Instr::PushLiteral(idx) => {
+                        let lit_oop = callee.literals().at(idx as usize);
+                        cstack.push(self.push_well_known(lit_oop.raw(), &mut bcode));
+                    }
+                    Instr::PushGlobal(idx) => {
+                        let assoc = callee.literals().at(idx as usize);
+                        let assoc_vreg = self.push_well_known(assoc.raw(), &mut bcode);
+                        let dst = self.fresh(true);
+                        bcode.push(Ir::LoadField {
+                            dst,
+                            obj: assoc_vreg,
+                            byte_off: (BODY_OFFSET + 8) as i32,
+                        });
+                        cstack.push(dst);
+                    }
+                    Instr::PushTemp(t) => {
+                        let dst = self.fresh(true);
+                        bcode.push(Ir::Move {
+                            dst,
+                            src: callee_slots[t as usize],
+                        });
+                        cstack.push(dst);
+                    }
+                    Instr::StoreTemp(t) => {
+                        let tos = *cstack.last().expect("cfg splice: store_temp empty stack");
+                        bcode.push(Ir::Move {
+                            dst: callee_slots[t as usize],
+                            src: tos,
+                        });
+                    }
+                    Instr::StoreTempPop(t) => {
+                        let v = cstack
+                            .pop()
+                            .expect("cfg splice: store_temp_pop empty stack");
+                        bcode.push(Ir::Move {
+                            dst: callee_slots[t as usize],
+                            src: v,
+                        });
+                    }
+                    Instr::PushInstvar(iv) => {
+                        let dst = self.fresh(true);
+                        bcode.push(Ir::LoadField {
+                            dst,
+                            obj: callee_self,
+                            byte_off: (BODY_OFFSET + 8 * iv as usize) as i32,
+                        });
+                        cstack.push(dst);
+                    }
+                    Instr::StoreInstvarPop(iv) => {
+                        let val = cstack
+                            .pop()
+                            .expect("cfg splice: store_instvar_pop empty stack");
+                        bcode.push(Ir::StoreField {
+                            obj: callee_self,
+                            byte_off: (BODY_OFFSET + 8 * iv as usize) as i32,
+                            val,
+                            barrier: true,
+                        });
+                    }
+                    Instr::StoreGlobalPop(idx) => {
+                        let assoc = callee.literals().at(idx as usize);
+                        let assoc_vreg = self.push_well_known(assoc.raw(), &mut bcode);
+                        let val = cstack
+                            .pop()
+                            .expect("cfg splice: store_global_pop empty stack");
+                        bcode.push(Ir::StoreField {
+                            obj: assoc_vreg,
+                            byte_off: (BODY_OFFSET + 8) as i32,
+                            val,
+                            barrier: true,
+                        });
+                    }
+                    Instr::Pop => {
+                        cstack.pop().expect("cfg splice: pop empty stack");
+                    }
+                    Instr::Dup => {
+                        let tos = *cstack.last().expect("cfg splice: dup empty stack");
+                        cstack.push(tos);
+                    }
+                    Instr::Send { ic, super_ } => {
+                        debug_assert!(!super_, "cfg splice: super gated by is_inline_eligible_cfg");
+                        let inner_ic = InterpreterIc::at(callee, ic);
+                        let inner_argc = inner_ic.argc();
+                        let inner_sel = inner_ic.selector();
+                        let inner_bci = bci;
+                        let inner_fb =
+                            crate::compiler::feedback::read_send_site(self.vm, callee, ic, None);
+                        let mut inner_args: Vec<VReg> = (0..inner_argc)
+                            .map(|_| cstack.pop().expect("cfg splice: send missing arg"))
+                            .collect();
+                        inner_args.reverse();
+                        let inner_recv = cstack.pop().expect("cfg splice: send missing receiver");
+
+                        if let crate::compiler::inline::InlineDecision::Trap =
+                            crate::compiler::inline::decide(&inner_fb)
+                        {
+                            let mut reexec_stack = cstack.clone();
+                            reexec_stack.push(inner_recv);
+                            reexec_stack.extend_from_slice(&inner_args);
+                            bdeopt.push((
+                                bcode.len() as u32,
+                                DeoptRaw {
+                                    stack: reexec_stack,
+                                    bci: inner_bci,
+                                    kind: SafepointKind::UncommonTrap,
+                                    reexecute: true,
+                                    inline: Some(inline_proto.clone()),
+                                },
+                            ));
+                            bcode.push(Ir::UncommonTrap { bci: inner_bci });
+                            trapped = true;
+                            break;
+                        }
+
+                        let mut send_args = vec![inner_recv];
+                        send_args.extend_from_slice(&inner_args);
+                        let site = self.call_sites.len() as u16;
+                        self.call_sites.push(CallSiteInfo {
+                            selector: inner_sel,
+                            argc: inner_argc + 1,
+                            static_klass: None,
+                        });
+                        self.site_feedback.push(inner_fb);
+                        let dst = self.fresh(true);
+                        bdeopt.push((
+                            bcode.len() as u32,
+                            DeoptRaw {
+                                stack: cstack.clone(),
+                                bci: inner_bci,
+                                kind: SafepointKind::Call,
+                                reexecute: false,
+                                inline: Some(inline_proto.clone()),
+                            },
+                        ));
+                        bcode.push(Ir::CallSend {
+                            dst,
+                            site,
+                            args: send_args,
+                        });
+                        cstack.push(dst);
+                    }
+                    Instr::ReturnTos => {
+                        let v = cstack.pop().expect("cfg splice: return_tos empty stack");
+                        bcode.push(Ir::Move {
+                            dst: result_vreg,
+                            src: v,
+                        });
+                        bcode.push(Ir::Jump {
+                            target: continuation_id,
+                        });
+                        returned = true;
+                        break;
+                    }
+                    Instr::ReturnSelf => {
+                        bcode.push(Ir::Move {
+                            dst: result_vreg,
+                            src: callee_self,
+                        });
+                        bcode.push(Ir::Jump {
+                            target: continuation_id,
+                        });
+                        returned = true;
+                        break;
+                    }
+                    // Branch/jump opcodes are the block's own terminator —
+                    // handled below from the decoded `Terminator` (they need the
+                    // remapped target ids).
+                    Instr::JumpFwd(_)
+                    | Instr::JumpBack(_)
+                    | Instr::BrTrueFwd(_)
+                    | Instr::BrFalseFwd(_) => {}
+                    other => unreachable!(
+                        "cfg splice: {other:?} passed is_inline_eligible_cfg but has no arm"
+                    ),
+                }
+                bci = next;
+            }
+
+            if !trapped && !returned {
+                match cfg_block.terminator {
+                    crate::compiler::decode::Terminator::Return => {
+                        unreachable!(
+                            "cfg splice: a Return-terminated callee block must end in a \
+                             return instruction"
+                        )
+                    }
+                    crate::compiler::decode::Terminator::Fallthrough(t) => {
+                        reachable[t] = true;
+                        emit_merges(&sources, &entry_stacks, t, &cstack, &mut bcode);
+                        bcode.push(Ir::Jump { target: ir_ids[t] });
+                    }
+                    crate::compiler::decode::Terminator::Jump {
+                        target,
+                        is_backward,
+                    } => {
+                        reachable[target] = true;
+                        if is_backward {
+                            // In-body loop poll: reexecute at the CALLEE's
+                            // loop-header bci, InlineSite-chained (a mid-loop
+                            // NotEntrant deopt rebuilds callee + caller frames).
+                            let poll_ci = bcode.len() as u32;
+                            bcode.push(Ir::Poll);
+                            bdeopt.push((
+                                poll_ci,
+                                DeoptRaw {
+                                    stack: cstack.clone(),
+                                    bci: ccfg.blocks[target].bci_start,
+                                    kind: SafepointKind::LoopPoll,
+                                    reexecute: true,
+                                    inline: Some(inline_proto.clone()),
+                                },
+                            ));
+                        }
+                        emit_merges(&sources, &entry_stacks, target, &cstack, &mut bcode);
+                        bcode.push(Ir::Jump {
+                            target: ir_ids[target],
+                        });
+                    }
+                    crate::compiler::decode::Terminator::Branch { if_true, if_false } => {
+                        reachable[if_true] = true;
+                        reachable[if_false] = true;
+                        let val = *cstack
+                            .last()
+                            .expect("cfg splice: branch with empty simulated stack");
+                        // not_bool reexecute snapshot INCLUDES the condition
+                        // (the interpreter re-tests it); the sim stack pops it
+                        // for the successors (strictly-correct accounting).
+                        let not_bool_id = self.fresh_inlined_trap_block(
+                            last_instr_bci,
+                            cstack.clone(),
+                            inline_proto.clone(),
+                        );
+                        cstack.pop();
+                        emit_merges(&sources, &entry_stacks, if_true, &cstack, &mut bcode);
+                        emit_merges(&sources, &entry_stacks, if_false, &cstack, &mut bcode);
+                        bcode.push(Ir::BoolBr {
+                            val,
+                            if_true: ir_ids[if_true],
+                            if_false: ir_ids[if_false],
+                            not_bool: not_bool_id,
+                        });
+                    }
+                }
+            }
+
+            exit_stacks[b] = Some(cstack);
+            self.finish_block(IrBlock {
+                id: ir_ids[b],
+                bci: send_bci,
+                code: bcode,
+                entry_stack,
+                deopt_sites: bdeopt,
+            });
+        }
+
+        self.record_inline_dep(guard_klass, selector);
+        Some((result_vreg, ir_ids[0], continuation_id))
+    }
+
     fn record_inline_dep(&mut self, klass: KlassOop, selector: SymbolOop) {
         // Dedup: an inlined method reached via two identical sites need only one
         // dependency (the invalidation is idempotent, but keeping the vec tight
@@ -2168,6 +2650,31 @@ impl<'a> Translator<'a> {
                             return split; // (always None on the trap path)
                         }
                         None => {}
+                    }
+                    // S14 step 7-IV-a: a MULTI-BLOCK callee (branches/loops —
+                    // the single-straight-line splicers above declined). Map its
+                    // whole CFG into fresh caller blocks; the send's value
+                    // arrives in `result` via the callee's return edges, and the
+                    // caller resumes in the returned continuation block.
+                    if let Some((result, entry_id, continuation_id)) = self.try_inline_cfg(
+                        callee,
+                        guard_klass,
+                        guard_shape,
+                        selector,
+                        receiver,
+                        &inline_args,
+                        bci,
+                        &pre_pop_stack,
+                        code,
+                        deopt,
+                    ) {
+                        stack.push(result);
+                        debug_assert!(
+                            self.pending_jump_target.is_none(),
+                            "cfg splice: a pending jump target is already armed"
+                        );
+                        self.pending_jump_target = Some(entry_id);
+                        return Some(continuation_id);
                     }
                     // Declined mid-way (an unspliceable shape slipped past the
                     // budget/leaf gate): fall through to a plain CallSend, but
@@ -2955,6 +3462,7 @@ pub fn convert(vm: &VmState, method: MethodOop, cfg: &Cfg) -> IrMethod {
             }
         },
         temp_sites: vec![None; method.argc() + method.ntemps()],
+        pending_jump_target: None,
     };
 
     // Pre-allocate merge vregs for every block that needs them (D3.2) —
@@ -3165,8 +3673,14 @@ pub fn convert(vm: &VmState, method: MethodOop, cfg: &Cfg) -> IrMethod {
                 break;
             }
             if let Some(continuation_id) = split {
+                // S14 step 7-IV-a: a CFG-inlined send set `pending_jump_target`
+                // to the callee's ENTRY block — the current block jumps THERE,
+                // and control reaches `continuation_id` only via the inlined
+                // callee's return edges. Unset (the ordinary smi-split case),
+                // the jump goes straight to the continuation.
+                let jump_target = t.pending_jump_target.take().unwrap_or(continuation_id);
                 code.push(Ir::Jump {
-                    target: continuation_id,
+                    target: jump_target,
                 });
                 t.finish_block(IrBlock {
                     id: cur_id,

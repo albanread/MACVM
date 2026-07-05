@@ -159,6 +159,38 @@ pub fn is_inline_eligible_nonleaf(method: MethodOop) -> bool {
     true
 }
 
+/// S14 step 7-IV-a: is `method` a callee the CFG (multi-block) inliner can
+/// splice? The general form of [`is_inline_eligible_nonleaf`]: the callee may
+/// have BRANCHES and LOOPS (`ifTrue:`/`whileTrue:`/`to:do:` frontend-inlined
+/// control flow) — `ir::try_inline_cfg` maps its whole decoded CFG into fresh
+/// caller blocks. Still excluded (deferred slices): `has_ctx`/`is_block`
+/// callees (Context/scope machinery), super sends (static-holder scope
+/// machinery), and closure/ctx-temp/block-return/NLR opcodes. The callee's own
+/// ordinary sends become plain `CallSend`s (or cold traps) inside the inlined
+/// extent, each recording a `SenderLink` deopt scope; its backward jumps
+/// become `Poll`s with in-body loop-poll deopt scopes.
+pub fn is_inline_eligible_cfg(method: MethodOop) -> bool {
+    if method.primitive() != 0 || method.has_ctx() || method.is_block() {
+        return false;
+    }
+    let len = method.bytecode_len();
+    let mut bci = 0;
+    while bci < len {
+        let (instr, next) = decode_at(method, bci);
+        match instr {
+            Instr::Send { super_: true, .. }
+            | Instr::PushCtxTemp { .. }
+            | Instr::StoreCtxTempPop { .. }
+            | Instr::PushClosure { .. }
+            | Instr::BlockReturnTos
+            | Instr::NlrTos => return false,
+            _ => {}
+        }
+        bci = next;
+    }
+    true
+}
+
 /// A method whose whole body is a single `push_*; ^tos` (accessor / quick
 /// return) or a bare `^self` — the cost-2 shapes above.
 fn is_quick_return(method: MethodOop) -> bool {
@@ -290,9 +322,14 @@ pub fn decide_with_budget(
             //     materializer runs at depth > 1.
             // Anything else (a primitive, an over-budget body, a callee with a
             // super send / blocks / ctx, a Poly/Mega/Untaken site) → `Call`.
+            // S14 step 7-IV-a: a multi-block callee (branches/loops —
+            // `is_inline_eligible_cfg`) is now inlinable too; the splicer tries
+            // leaf → nonleaf → CFG in order (each strictly more general).
             let inlinable = method.primitive() == 0
                 && inline_cost(*method) <= budget.per_call_cost
-                && (is_leaf(*method) || is_inline_eligible_nonleaf(*method));
+                && (is_leaf(*method)
+                    || is_inline_eligible_nonleaf(*method)
+                    || is_inline_eligible_cfg(*method));
             if inlinable {
                 let guard = if klass.oop().raw() == smi_klass_bits {
                     GuardKind::SmiTest
