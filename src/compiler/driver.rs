@@ -113,6 +113,40 @@ fn eligibility_detail(vm: &VmState, method: MethodOop) -> Eligibility {
         return Eligibility::NoPermanent;
     }
 
+    // S14 step 7-I: a method that CREATES a literal closure (`push_closure`) is
+    // no longer rejected outright. Run the escape pre-pass ONCE (only when a
+    // closure is present — the common closure-free method pays nothing) and let
+    // it decide: every closure site must be provably elidable (immediately
+    // invoked via a matching `value`-send, non-escaping, spliceable) or the
+    // whole method stays interpreted (`NoPermanent`). An escaping closure a
+    // compiled frame cannot represent is the exact soundness boundary (SPEC
+    // §8.4) — "inline-or-gated". A `value`-send on a proven site bypasses the
+    // IC-mono check below (its receiver is a statically-known block; it need not
+    // be IC-mono to be splicable).
+    let has_closure = {
+        let mut b = 0usize;
+        let mut found = false;
+        while b < method.bytecode_len() {
+            let (instr, next) = decode_at(method, b);
+            if matches!(instr, Instr::PushClosure { .. }) {
+                found = true;
+                break;
+            }
+            b = next;
+        }
+        found
+    };
+    let escape = if has_closure {
+        let e = crate::compiler::escape::analyze(method);
+        if !e.all_elidable {
+            // Some closure escapes (or is unspliceable) — cannot compile M.
+            return Eligibility::NoPermanent;
+        }
+        Some(e)
+    } else {
+        None
+    };
+
     let mut verdict = Eligibility::Yes;
     let mut bci = 0usize;
     while bci < method.bytecode_len() {
@@ -138,6 +172,19 @@ fn eligibility_detail(vm: &VmState, method: MethodOop) -> Eligibility {
             | Instr::ReturnTos
             | Instr::ReturnSelf => {}
             Instr::Send { ic, super_ } => {
+                // S14 step 7-I: a `value`-send on a PROVEN elidable closure site
+                // (the escape pre-pass mapped this bci to a splice) is eligible
+                // regardless of its IC — its receiver is a statically-known block
+                // that `ir::convert` splices inline, so the IC-mono check below
+                // (meant for ordinary dynamic dispatch) does not apply.
+                if escape
+                    .as_ref()
+                    .is_some_and(|e| e.value_send_target(bci).is_some())
+                {
+                    // Yes — never worse than the current verdict.
+                    bci = next;
+                    continue;
+                }
                 // D4.6: a super send's own target is resolved statically
                 // (holder.superclass(), fixed at compile time) rather than
                 // through the interpreter's own IC lattice, so
@@ -157,12 +204,23 @@ fn eligibility_detail(vm: &VmState, method: MethodOop) -> Eligibility {
             // both (mirrors `PushInstvar`/`PushGlobal`'s existing
             // read-side handling exactly).
             Instr::StoreInstvarPop(_) | Instr::StoreGlobalPop(_) => {}
-            // Still excluded (D1 point 1): ctx stores, closures, ctx
-            // temps, super sends (handled above), block returns, NLR --
-            // blocks/contexts compile in S14 with inlining.
+            // S14 step 7-I: a `push_closure` in M's own top-level bytecode is
+            // allowed ONLY when the escape pre-pass above proved EVERY closure
+            // site elidable (we returned `NoPermanent` otherwise). `ir::convert`
+            // emits no IR for it (it splices the block body at the value-send).
+            Instr::PushClosure { .. } => {
+                debug_assert!(
+                    escape.is_some(),
+                    "a push_closure reached the scan but has_closure was false"
+                );
+            }
+            // Still excluded (D1 point 1): ctx temps and stores, block returns,
+            // NLR appearing in M's OWN top-level bytecode. These only
+            // legitimately appear INSIDE a block body (which we reach via the
+            // splice, not this scan) — captured-temp elision (7-II) and NLR
+            // (7-III) are later slices.
             Instr::PushCtxTemp { .. }
             | Instr::StoreCtxTempPop { .. }
-            | Instr::PushClosure { .. }
             | Instr::BlockReturnTos
             | Instr::NlrTos => return Eligibility::NoPermanent,
         }
@@ -889,12 +947,16 @@ mod tests {
         assert!(!eligible(&vm, method));
     }
 
-    /// D1 point 1: a `PushClosure` opcode (a literal block argument) is
-    /// excluded outright — never inlined by S10, unlike `to:do:`/
-    /// `whileTrue:`'s own frontend-level inlining (which emits no
-    /// `PushClosure` at all, see `world/tests/tier1.mst`'s own doc).
+    /// S14 step 7-I (was `eligible_rejects_closure_op`): a `PushClosure` no
+    /// longer excludes a method outright. The escape pre-pass classifies each
+    /// closure site; here `[self]` is immediately `pop`ped — a DEAD closure
+    /// (SPEC A7 step 2(b) "no use") is elidable, so the method is eligible and
+    /// `ir::convert` elides the closure entirely (compiles to `^self`). An
+    /// ESCAPING closure (stored/returned/passed) still keeps the method
+    /// interpreted — covered by `eligible_rejects_escaping_closure` below and
+    /// the `escape.rs` unit tests / `it_tier1` differential tests.
     #[test]
-    fn eligible_rejects_closure_op() {
+    fn eligible_allows_dead_closure() {
         let mut vm = test_vm();
         let mut b = BytecodeBuilder::new();
         let lit = b.build_block(&mut vm, 0, 0, false, 0, false, |blk, _vm| {
@@ -906,7 +968,40 @@ mod tests {
         b.ret_self();
         let sel = vm.universe.intern(b"withBlock");
         let method = b.finish(&mut vm, sel, 0, 0);
-        assert!(!eligible(&vm, method));
+        assert!(
+            eligible(&vm, method),
+            "a dead (immediately popped) closure is elidable → eligible (7-I)"
+        );
+    }
+
+    /// S14 step 7-I: an ESCAPING closure (stored into an instvar → a compiled
+    /// frame cannot be its `home_frame_ref`) keeps the whole method interpreted
+    /// — the "inline-or-gated" soundness boundary.
+    #[test]
+    fn eligible_rejects_escaping_closure() {
+        let mut vm = test_vm();
+        let holder = vm.universe.new_klass(
+            vm.universe.object_klass,
+            "S14EscapeUnit",
+            crate::oops::Format::Slots,
+            false,
+            crate::oops::layout::HEADER_WORDS + 1,
+        );
+        let mut b = BytecodeBuilder::new();
+        let lit = b.build_block(&mut vm, 0, 0, false, 0, false, |blk, _vm| {
+            blk.push_self();
+            blk.ret_tos();
+        });
+        b.push_closure(lit, 0);
+        b.store_instvar_pop(0);
+        b.ret_self();
+        let sel = vm.universe.intern(b"stash");
+        let method = b.finish(&mut vm, sel, 0, 0);
+        crate::runtime::lookup::install_method(&mut vm, holder, sel, method);
+        assert!(
+            !eligible(&vm, method),
+            "a stored (escaping) closure keeps the method interpreted (7-I gate)"
+        );
     }
 
     /// D1 point 1: `has_ctx` (a heap `Context` needed because some inner

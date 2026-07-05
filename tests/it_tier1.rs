@@ -4115,3 +4115,183 @@ fn redefining_inlined_nonleaf_callee_invalidates_caller() {
         "redefining the inlined non-leaf `run` must make the caller nmethod NotEntrant"
     );
 }
+
+// ── S14 step 7-I: value-send block inlining (non-capturing, safepoint-free) ──
+
+/// Install `value` (argc 0) and `value:` (argc 1) as primitive-50 block
+/// activation on `closure_klass`, so the INTERPRETER reference path can
+/// activate a literal block. The COMPILED path never dispatches these (it
+/// splices the block body inline), so this only feeds the interpreter oracle.
+fn install_value_prims(vm: &mut VmState) {
+    // Value-family primitive ids are `50 + argc` (runtime/primitives.rs:
+    // value=50, value:=51, value:value:=52, …).
+    for (name, argc) in [
+        (b"value".as_slice(), 0usize),
+        (b"value:".as_slice(), 1usize),
+    ] {
+        let sel = vm.universe.intern(name);
+        let mut vb = BytecodeBuilder::new();
+        vb.push_self();
+        vb.ret_self();
+        let m = vb.finish(vm, sel, argc, 0);
+        m.set_primitive((50 + argc) as i64);
+        let closure_klass = vm.universe.closure_klass;
+        let sel = vm.universe.intern(name);
+        install_method(vm, closure_klass, sel, m);
+    }
+}
+
+/// S14 step 7-I (a): a literal block invoked directly by `value` in the same
+/// method is SPLICED inline — no closure is allocated, no `value` is dispatched.
+/// `run [ ^[42] value ]` compiles (the escape pre-pass proves `[42]` elidable)
+/// and the compiled nmethod returns 42, exactly the interpreter's answer.
+#[test]
+fn compiled_direct_value_block_matches_interpreter() {
+    let mut vm = test_vm();
+    install_value_prims(&mut vm);
+    let smi_klass = vm.universe.smi_klass;
+    let value_sel = vm.universe.intern(b"value");
+    let run_sel = vm.universe.intern(b"run");
+
+    // `run [ ^[42] value ]`.
+    let mut b = BytecodeBuilder::new();
+    let lit = b.build_block(&mut vm, 0, 0, false, 0, false, |blk, _vm| {
+        blk.push_smi_i8(42);
+        blk.block_return_tos();
+    });
+    b.push_closure(lit, 0);
+    b.send(&mut vm, value_sel, 0);
+    b.ret_tos();
+    let run = b.finish(&mut vm, run_sel, 0, 0);
+
+    // Eligible (the only closure it makes is directly value'd → elidable).
+    assert!(
+        driver::eligible(&vm, run),
+        "a method whose only closure is directly value'd must be eligible (7-I)"
+    );
+
+    // Interpreter reference.
+    let self_smi = SmallInt::new(1).oop();
+    let interp = macvm::interpreter::run_method(&mut vm, run, self_smi, &[]);
+    assert_eq!(
+        interp.raw(),
+        SmallInt::new(42).oop().raw(),
+        "interp: [42] value = 42"
+    );
+
+    // Compiled (customized for SmallInteger; self is unused by the body). The
+    // block body was spliced — no compiled IC site for the `value` send.
+    let id = driver::compile_method(&mut vm, smi_klass, run).expect("must compile");
+    assert!(
+        vm.code_table.get(id).unwrap().ic_sites.is_empty(),
+        "the `value` send was spliced → no compiled IC site"
+    );
+    let nm = vm.code_table.get(id).expect("installed");
+    let entry = unsafe { nm.code.base.add(nm.entry_off as usize) } as u64;
+    let call: CallStubFn = unsafe { std::mem::transmute(vm.stubs.call_stub_entry()) };
+    let vm_ptr: *mut VmState = &mut vm;
+    let result = unsafe { call(entry, vm_ptr, [self_smi.raw()].as_ptr(), 1) };
+    assert_eq!(
+        result,
+        SmallInt::new(42).oop().raw(),
+        "compiled `[42] value` splices to 42 (differential match)"
+    );
+}
+
+/// S14 step 7-I (b): a one-arg block invoked with `value:` splices, its arg
+/// aliasing the send operand. `applyTo7 [ ^[:x | x] value: 7 ]` → 7, both
+/// interpreted and compiled.
+#[test]
+fn compiled_value_arg_block_matches_interpreter() {
+    let mut vm = test_vm();
+    install_value_prims(&mut vm);
+    let smi_klass = vm.universe.smi_klass;
+    let value_arg_sel = vm.universe.intern(b"value:");
+    let sel = vm.universe.intern(b"applyTo7");
+
+    // `applyTo7 [ ^[:x | x] value: 7 ]` — identity block, send-free body.
+    let mut b = BytecodeBuilder::new();
+    let lit = b.build_block(&mut vm, 1, 0, false, 0, false, |blk, _vm| {
+        blk.push_temp(0); // x (the block's arg)
+        blk.block_return_tos();
+    });
+    b.push_closure(lit, 0);
+    b.push_smi_i8(7);
+    b.send(&mut vm, value_arg_sel, 1);
+    b.ret_tos();
+    let m = b.finish(&mut vm, sel, 0, 0);
+
+    assert!(
+        driver::eligible(&vm, m),
+        "value:-invoked identity block is eligible"
+    );
+
+    let self_smi = SmallInt::new(1).oop();
+    let interp = macvm::interpreter::run_method(&mut vm, m, self_smi, &[]);
+    assert_eq!(
+        interp.raw(),
+        SmallInt::new(7).oop().raw(),
+        "interp: [:x|x] value: 7 = 7"
+    );
+
+    let id = driver::compile_method(&mut vm, smi_klass, m).expect("must compile");
+    let nm = vm.code_table.get(id).expect("installed");
+    let entry = unsafe { nm.code.base.add(nm.entry_off as usize) } as u64;
+    let call: CallStubFn = unsafe { std::mem::transmute(vm.stubs.call_stub_entry()) };
+    let vm_ptr: *mut VmState = &mut vm;
+    let result = unsafe { call(entry, vm_ptr, [self_smi.raw()].as_ptr(), 1) };
+    assert_eq!(
+        result,
+        SmallInt::new(7).oop().raw(),
+        "compiled `[:x|x] value: 7` splices its arg through to 7 (differential match)"
+    );
+}
+
+/// S14 step 7-I: a closure that ESCAPES (stored into an instvar) keeps the whole
+/// method interpreted — the "inline-or-gated" soundness boundary. The method is
+/// ineligible and never compiles, and the interpreter still runs it correctly.
+#[test]
+fn compiled_escaping_block_stays_interpreted() {
+    let mut vm = test_vm();
+    install_value_prims(&mut vm);
+    let holder = vm.universe.new_klass(
+        vm.universe.object_klass,
+        "S14EscapingHolder",
+        Format::Slots,
+        false,
+        HEADER_WORDS + 1,
+    );
+    let stash_sel = vm.universe.intern(b"stash");
+
+    // `stash [ block := [42]. ^self ]` — the closure is stored into instvar 0
+    // (it escapes: a compiled frame cannot be its `home_frame_ref`).
+    let mut b = BytecodeBuilder::new();
+    let lit = b.build_block(&mut vm, 0, 0, false, 0, false, |blk, _vm| {
+        blk.push_smi_i8(42);
+        blk.block_return_tos();
+    });
+    b.push_closure(lit, 0);
+    b.store_instvar_pop(0);
+    b.ret_self();
+    let stash = b.finish(&mut vm, stash_sel, 0, 0);
+
+    // Ineligible: the escape pre-pass finds a non-elidable closure site.
+    assert!(
+        !driver::eligible(&vm, stash),
+        "a method that stores a closure (escaping) must stay interpreted (7-I gate)"
+    );
+    assert!(
+        driver::compile_method(&mut vm, holder, stash).is_none(),
+        "an escaping-closure method must not compile"
+    );
+
+    // The interpreter still runs it: returns self, and instvar0 holds the closure.
+    let obj = alloc::alloc_slots(&mut vm, holder).oop();
+    let result = macvm::interpreter::run_method(&mut vm, stash, obj, &[]);
+    assert_eq!(result.raw(), obj.raw(), "interp: `stash` returns self");
+    let stored = MemOop::try_from(obj).unwrap().body_oop(0);
+    assert!(
+        macvm::oops::wrappers::ClosureOop::try_from(stored).is_some(),
+        "the escaping closure was stored into instvar0 by the interpreter"
+    );
+}

@@ -424,6 +424,12 @@ pub struct InlineSite {
     /// The CALLER's operand stack BELOW the inlined send's receiver+args, frozen
     /// for the whole inlined extent (the `SenderLink.pending_stack`).
     pub caller_pending_stack: Vec<VReg>,
+    /// S14 step 7-I: `true` iff the inlined callee is a spliced literal BLOCK
+    /// (its reconstructed scope is an `is_block` scope — the deopt materializer
+    /// pushes a `CompiledBlock` activation frame, not a method frame). `false`
+    /// for a step-4c method inline. `driver::build_deopt_metadata` stamps the
+    /// inlined scope's `ScopeDescData.is_block` from this.
+    pub is_block: bool,
 }
 
 /// S13 step 7b: the deopt info a fused comparison (`SmiCmpBr`) carries from
@@ -808,6 +814,24 @@ struct Translator<'a> {
     /// isn't observed; a klass-format redefinition flushes via S12's sweep,
     /// same class of hole as `stale_mono_documented_hole`).
     const_class: HashMap<u32, KlassOop>,
+    /// S14 step 7-I: the escape pre-pass result for M, `Some` iff M creates a
+    /// literal closure (`push_closure`) that was proven elidable
+    /// (`driver::eligibility_detail` guarantees `all_elidable` before compiling,
+    /// so this is only ever `Some` for a method whose EVERY closure site is a
+    /// good value-send use). `translate_instr` consults `value_send_target(bci)`
+    /// to decide whether a `Send` splices a block body inline.
+    escape: Option<crate::compiler::escape::ClosureEscape>,
+    /// S14 step 7-I: parallel to `temp_vregs` — `temp_sites[t] == Some(bci)`
+    /// means the unified arg/temp slot `t` currently holds the block created at
+    /// `push_closure` site `bci` (a phantom value — no real vreg backs it). A
+    /// `store_temp_pop` of a block-site stack slot sets this; a `push_temp` of a
+    /// block-site temp slot reads it (pushing a phantom onto the operand
+    /// `stack_sites` shadow), so a `b := [..]. ^b value` splices without ever
+    /// materialising the closure. Tracked linearly as `convert` walks blocks in
+    /// bci order; the escape pre-pass already guaranteed no block-site ever
+    /// merges lossily (that would have made M `NoPermanent`), so linear tracking
+    /// suffices — a site never reaches a value-send by a path convert can't see.
+    temp_sites: Vec<Option<usize>>,
 }
 
 impl<'a> Translator<'a> {
@@ -1393,6 +1417,8 @@ impl<'a> Translator<'a> {
             slots: callee_slots.clone(),
             sender_bci: send_bci as u16,
             caller_pending_stack: caller_pending_stack.clone(),
+            // A step-4c METHOD inline, not a spliced block.
+            is_block: false,
         };
 
         // Translate the callee's straight-line body onto a fresh operand stack.
@@ -1680,11 +1706,33 @@ impl<'a> Translator<'a> {
         fusable: bool,
         bci: usize,
         stack: &mut Vec<VReg>,
+        stack_sites: &mut Vec<Option<usize>>,
         code: &mut Vec<Ir>,
         deopt: &mut Vec<(u32, DeoptRaw)>,
         pending_cmp: &mut Option<(CmpOp, VReg, VReg, PendingCmpDeopt)>,
         trapped: &mut bool,
     ) -> Option<BlockId> {
+        debug_assert_eq!(
+            stack.len(),
+            stack_sites.len(),
+            "translate_instr: operand-stack / block-site shadow desync"
+        );
+        // S14 step 7-I: handle every opcode that can create, move, or consume a
+        // phantom block-site FIRST, keeping `stack`/`stack_sites` in lockstep,
+        // and return early. A `push_closure` proven elidable emits NO IR (the
+        // block body is spliced at its value-send); the temp/dup/pop/value-send
+        // arms propagate or consume the site. Reached only for a method the
+        // escape pre-pass proved `all_elidable` (`self.escape.is_some()`), so a
+        // site here is always a good, spliceable use. Every OTHER opcode falls
+        // through to the main match below, after which `stack_sites` is resynced
+        // to `stack`'s new length with `None` (those opcodes never touch a site).
+        if self.escape.is_some() {
+            if let Some(r) =
+                self.translate_site_instr(instr, bci, stack, stack_sites, code, deopt, trapped)
+            {
+                return r;
+            }
+        }
         let mut split: Option<BlockId> = None;
         match *instr {
             Instr::PushSelf => stack.push(self.self_vreg),
@@ -2223,7 +2271,340 @@ impl<'a> Translator<'a> {
                 )
             }
         }
+        // S14 step 7-I: `stack_sites` is resynced to `stack`'s new length by the
+        // CALLER (`convert`'s per-instruction loop), NOT here — `translate_instr`
+        // has many early `return split` paths (Alloc, trap, inline, generic
+        // send) that would otherwise skip a resync and leave the shadow stale.
         split
+    }
+
+    /// S14 step 7-I: intercept the opcodes that create, move, or consume a
+    /// phantom block-site (a `push_closure` the escape pre-pass proved elidable)
+    /// BEFORE `translate_instr`'s main match, keeping `stack` and its
+    /// `stack_sites` shadow in lockstep. Returns:
+    ///   - `None` — this opcode does not touch a live block-site here; the caller
+    ///     falls through to the main match (which handles the real value) and
+    ///     resyncs `stack_sites` afterwards;
+    ///   - `Some(split)` — handled here; the caller returns `split` directly.
+    ///     A `push_closure` (emits no IR) and the temp/dup/pop bookkeeping return
+    ///     `Some(None)`; a value-send splices the block body inline and also
+    ///     returns `Some(None)` (a send-free leaf block adds no continuation).
+    ///
+    /// Only reached for a method the escape pre-pass proved `all_elidable`
+    /// (`self.escape.is_some()`), so a live block-site here is always an
+    /// immediately-invoked, non-escaping, safepoint-free literal block.
+    /// `_deopt`/`_trapped` are unused in 7-I (a send-free block records no deopt
+    /// site and never traps) — threaded now for the non-leaf-block slice.
+    #[allow(clippy::too_many_arguments)]
+    fn translate_site_instr(
+        &mut self,
+        instr: &Instr,
+        bci: usize,
+        stack: &mut Vec<VReg>,
+        stack_sites: &mut Vec<Option<usize>>,
+        code: &mut Vec<Ir>,
+        _deopt: &mut Vec<(u32, DeoptRaw)>,
+        _trapped: &mut bool,
+    ) -> Option<Option<BlockId>> {
+        match *instr {
+            // A proven-elidable closure: emit NO IR. Push a phantom onto the
+            // operand stack (`self_vreg` as a harmless filler — a leaked phantom
+            // reads `self`, and `convert`'s block-boundary assert catches any
+            // leak in debug) with its site id in the shadow. The real carrier is
+            // `stack_sites`; the vreg is never read (its only consumer, the
+            // value-send, reads `stack_sites`, not the vreg).
+            Instr::PushClosure { .. } => {
+                stack.push(self.self_vreg);
+                stack_sites.push(Some(bci));
+                Some(None)
+            }
+            // A temp currently holding a block-site pushes the phantom; else fall
+            // through so the main match emits the real `Move`.
+            Instr::PushTemp(t) => {
+                if let Some(site) = self.temp_sites[t as usize] {
+                    stack.push(self.self_vreg);
+                    stack_sites.push(Some(site));
+                    Some(None)
+                } else {
+                    None
+                }
+            }
+            Instr::StoreTempPop(t) => match stack_sites.last().copied().flatten() {
+                Some(site) => {
+                    // Top is a block-site: record it in the temp, drop the
+                    // phantom, emit no `Move`.
+                    stack.pop();
+                    stack_sites.pop();
+                    self.temp_sites[t as usize] = Some(site);
+                    Some(None)
+                }
+                None => {
+                    // Storing a real value: clear any stale site the temp held,
+                    // then fall through to emit the real `Move`.
+                    self.temp_sites[t as usize] = None;
+                    None
+                }
+            },
+            Instr::StoreTemp(t) => match stack_sites.last().copied().flatten() {
+                // `store_temp` peeks (no pop) — mirror the shadow, leave the site
+                // on the stack.
+                Some(site) => {
+                    self.temp_sites[t as usize] = Some(site);
+                    Some(None)
+                }
+                None => {
+                    self.temp_sites[t as usize] = None;
+                    None
+                }
+            },
+            Instr::Dup => match stack_sites.last().copied().flatten() {
+                Some(site) => {
+                    stack.push(self.self_vreg);
+                    stack_sites.push(Some(site));
+                    Some(None)
+                }
+                None => None,
+            },
+            Instr::Pop => match stack_sites.last().copied().flatten() {
+                // Discard a dead closure — SPEC A7 "dead" is elidable, no IR.
+                Some(_) => {
+                    stack.pop();
+                    stack_sites.pop();
+                    Some(None)
+                }
+                None => None,
+            },
+            Instr::Send { ic, .. } => {
+                // A `value`-family send the escape pre-pass mapped to a splice.
+                // (`value_send_target` returns a `Copy` `usize`, so the immutable
+                // borrow of `self.escape` ends before the `&mut self` splice.)
+                let target = self.escape.as_ref().and_then(|e| e.value_send_target(bci));
+                if let Some(site) = target {
+                    self.splice_block(site, ic, bci, stack, stack_sites, code);
+                    Some(None)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// S14 step 7-I: splice a proven-elidable literal block's body inline at its
+    /// `value`-family send. Mirrors [`Translator::try_inline_leaf`] (a single
+    /// straight-line, SAFEPOINT-FREE body) MINUS the receiver guard: the receiver
+    /// is statically the block created at `site_bci`, so there is no klass to
+    /// test and no dependency to record. The block's home `self` is M's receiver
+    /// (`self_vreg` = the closure's captured `copied[0]`, SPEC §5.4). Pops the
+    /// value-send's args + the phantom receiver (keeping `stack`/`stack_sites` in
+    /// lockstep) and pushes the block's return value. Records NO deopt site: a
+    /// send-free body has no safepoint, so no `is_block` scope is emitted — the
+    /// block-scope deopt materializer arrives with non-leaf block inlining.
+    fn splice_block(
+        &mut self,
+        site_bci: usize,
+        ic: u16,
+        _send_bci: usize,
+        stack: &mut Vec<VReg>,
+        stack_sites: &mut Vec<Option<usize>>,
+        code: &mut Vec<Ir>,
+    ) {
+        // Resolve the CompiledBlock from the `push_closure` literal at `site_bci`.
+        let (site_instr, _) = decode_at(self.method, site_bci);
+        let lit = match site_instr {
+            Instr::PushClosure { lit, .. } => lit,
+            _ => unreachable!("splice_block: site bci is not a push_closure"),
+        };
+        let block = MethodOop::try_from(self.method.literals().at(lit as usize))
+            .expect("splice_block: push_closure literal is not a CompiledBlock");
+
+        let argc = InterpreterIc::at(self.method, ic).argc() as usize;
+        debug_assert_eq!(
+            argc,
+            block.argc(),
+            "splice_block: value-send argc must match block argc (escape guaranteed)"
+        );
+
+        // Pop the value-send's args (real vregs) + the phantom receiver, keeping
+        // `stack`/`stack_sites` in lockstep. An arg is never a block-site (an
+        // arg-site would have escaped), so its shadow entry is `None`.
+        let mut blk_args: Vec<VReg> = (0..argc)
+            .map(|_| {
+                stack_sites.pop();
+                stack.pop().expect("value-send: missing arg operand")
+            })
+            .collect();
+        blk_args.reverse();
+        stack_sites.pop(); // the phantom receiver's site marker
+        stack
+            .pop()
+            .expect("value-send: missing receiver (phantom closure)");
+
+        // The block's home self = M's receiver (only read by push_self / instvar
+        // access inside the block body).
+        let block_self = self.self_vreg;
+
+        // Re-validate the spliceable shape (escape's `block_is_spliceable` proved
+        // it; the arity is site-specific). If it somehow fails we have already
+        // popped the operands and cannot cleanly recover — assert.
+        let block_cfg = crate::compiler::decode::decode(block);
+        assert!(
+            block_cfg.blocks.len() == 1
+                && matches!(
+                    block_cfg.blocks[0].terminator,
+                    crate::compiler::decode::Terminator::Return
+                )
+                && block.argc() == blk_args.len(),
+            "splice_block: escape proved spliceable but shape re-check failed"
+        );
+
+        // Callee slots: args alias the value-send operands (no stores); temps
+        // become fresh nil vregs with canonical spill homes.
+        let mut slots: Vec<VReg> = Vec::with_capacity(block.argc() + block.ntemps());
+        slots.extend_from_slice(&blk_args);
+        let nil_lit = self
+            .pool
+            .intern(self.vm.universe.nil_obj.raw(), Some(RelocKind::Oop));
+        for _ in 0..block.ntemps() {
+            let t = self.fresh(true);
+            code.push(Ir::ConstPool {
+                dst: t,
+                lit: nil_lit,
+            });
+            slots.push(t);
+        }
+
+        // Translate the block's straight-line, safepoint-free body onto a fresh
+        // operand stack. Same value-shuffle/field/return arms as the leaf method
+        // splice, PLUS `BlockReturnTos` (a block's own fall-off return, which
+        // `decode` treats as a `Return` terminator — decode.rs).
+        let mut bstack: Vec<VReg> = Vec::new();
+        let mut result: Option<VReg> = None;
+        let len = block.bytecode_len();
+        let mut bci = 0;
+        while bci < len {
+            let (instr, next) = decode_at(block, bci);
+            match instr {
+                Instr::PushSelf => bstack.push(block_self),
+                Instr::PushNil => {
+                    bstack.push(self.push_well_known(self.vm.universe.nil_obj.raw(), code))
+                }
+                Instr::PushTrue => {
+                    bstack.push(self.push_well_known(self.vm.universe.true_obj.raw(), code))
+                }
+                Instr::PushFalse => {
+                    bstack.push(self.push_well_known(self.vm.universe.false_obj.raw(), code))
+                }
+                Instr::PushSmi(v) => {
+                    let dst = self.fresh(true);
+                    code.push(Ir::ConstSmi {
+                        dst,
+                        value: v as i64,
+                    });
+                    bstack.push(dst);
+                }
+                Instr::PushLiteral(idx) => {
+                    let lit_oop = block.literals().at(idx as usize);
+                    bstack.push(self.push_well_known(lit_oop.raw(), code));
+                }
+                Instr::PushGlobal(idx) => {
+                    let assoc = block.literals().at(idx as usize);
+                    let assoc_vreg = self.push_well_known(assoc.raw(), code);
+                    let dst = self.fresh(true);
+                    code.push(Ir::LoadField {
+                        dst,
+                        obj: assoc_vreg,
+                        byte_off: (BODY_OFFSET + 8) as i32,
+                    });
+                    bstack.push(dst);
+                }
+                Instr::PushTemp(n) => {
+                    let dst = self.fresh(true);
+                    code.push(Ir::Move {
+                        dst,
+                        src: slots[n as usize],
+                    });
+                    bstack.push(dst);
+                }
+                Instr::StoreTemp(n) => {
+                    let tos = *bstack
+                        .last()
+                        .expect("block splice: store_temp on empty stack");
+                    code.push(Ir::Move {
+                        dst: slots[n as usize],
+                        src: tos,
+                    });
+                }
+                Instr::StoreTempPop(n) => {
+                    let v = bstack
+                        .pop()
+                        .expect("block splice: store_temp_pop on empty stack");
+                    code.push(Ir::Move {
+                        dst: slots[n as usize],
+                        src: v,
+                    });
+                }
+                Instr::PushInstvar(n) => {
+                    let dst = self.fresh(true);
+                    code.push(Ir::LoadField {
+                        dst,
+                        obj: block_self,
+                        byte_off: (BODY_OFFSET + 8 * n as usize) as i32,
+                    });
+                    bstack.push(dst);
+                }
+                Instr::StoreInstvarPop(n) => {
+                    let val = bstack
+                        .pop()
+                        .expect("block splice: store_instvar_pop on empty stack");
+                    code.push(Ir::StoreField {
+                        obj: block_self,
+                        byte_off: (BODY_OFFSET + 8 * n as usize) as i32,
+                        val,
+                        barrier: true,
+                    });
+                }
+                Instr::StoreGlobalPop(idx) => {
+                    let assoc = block.literals().at(idx as usize);
+                    let assoc_vreg = self.push_well_known(assoc.raw(), code);
+                    let val = bstack
+                        .pop()
+                        .expect("block splice: store_global_pop on empty stack");
+                    code.push(Ir::StoreField {
+                        obj: assoc_vreg,
+                        byte_off: (BODY_OFFSET + 8) as i32,
+                        val,
+                        barrier: true,
+                    });
+                }
+                Instr::Pop => {
+                    bstack.pop().expect("block splice: pop on empty stack");
+                }
+                Instr::Dup => {
+                    let tos = *bstack.last().expect("block splice: dup on empty stack");
+                    bstack.push(tos);
+                }
+                Instr::ReturnTos | Instr::BlockReturnTos => {
+                    result = Some(bstack.pop().expect("block splice: return on empty stack"));
+                    break;
+                }
+                Instr::ReturnSelf => {
+                    result = Some(block_self);
+                    break;
+                }
+                // `block_is_spliceable` rejected sends / ctx / closure / NLR, and
+                // the single-block shape excludes jumps/branches; every other
+                // opcode is handled above.
+                other => unreachable!(
+                    "block splice: {other:?} passed block_is_spliceable but has no arm"
+                ),
+            }
+            bci = next;
+        }
+
+        let result = result.expect("block splice: a returning block must produce a result");
+        stack.push(result);
+        stack_sites.push(None);
     }
 
     fn push_well_known(&mut self, raw: u64, code: &mut Vec<Ir>) -> VReg {
@@ -2334,6 +2715,31 @@ pub fn convert(vm: &VmState, method: MethodOop, cfg: &Cfg) -> IrMethod {
         // levels arrive (S14 step 8).
         level: 1,
         const_class: HashMap::new(),
+        // S14 step 7-I: run the escape pre-pass iff M creates a literal closure.
+        // The driver already proved `all_elidable` for such a method before
+        // reaching here, so a `Some` result always means every closure site is a
+        // splicable good use. A closure-free method pays nothing (skips the scan
+        // AND the pre-pass) — keeping non-closure methods' listing goldens
+        // byte-stable.
+        escape: {
+            let mut has_closure = false;
+            let mut b = 0usize;
+            let bc_len = method.bytecode_len();
+            while b < bc_len {
+                let (instr, next) = decode_at(method, b);
+                if matches!(instr, Instr::PushClosure { .. }) {
+                    has_closure = true;
+                    break;
+                }
+                b = next;
+            }
+            if has_closure {
+                Some(crate::compiler::escape::analyze(method))
+            } else {
+                None
+            }
+        },
+        temp_sites: vec![None; method.argc() + method.ntemps()],
     };
 
     // Pre-allocate merge vregs for every block that needs them (D3.2) —
@@ -2464,6 +2870,13 @@ pub fn convert(vm: &VmState, method: MethodOop, cfg: &Cfg) -> IrMethod {
 
         let is_branch_terminator = matches!(cfg_block.terminator, Terminator::Branch { .. });
         let mut stack = entry_stack.clone();
+        // S14 step 7-I: parallel to `stack` — `stack_sites[i] == Some(bci)` iff
+        // operand-stack slot `i` currently holds the (phantom) block created at
+        // `push_closure` site `bci`. A block-site never survives a block boundary
+        // in the 7-I straight-line shapes (push_closure and its value-send are in
+        // the same block, adjacent or via a temp), so entry is all-`None`;
+        // `translate_instr` maintains it in lockstep with `stack`.
+        let mut stack_sites: Vec<Option<usize>> = vec![None; stack.len()];
         let mut pending_cmp: Option<(CmpOp, VReg, VReg, PendingCmpDeopt)> = None;
         // S11 step 7: a fallible smi-inline op mid-block (SmiArith/
         // SmiCmpVal, never a terminator) now needs a REAL fallback that
@@ -2505,11 +2918,20 @@ pub fn convert(vm: &VmState, method: MethodOop, cfg: &Cfg) -> IrMethod {
                 fusable,
                 bci,
                 &mut stack,
+                &mut stack_sites,
                 &mut code,
                 &mut deopt,
                 &mut pending_cmp,
                 &mut trapped,
             );
+            // S14 step 7-I: resync the block-site shadow to `stack`'s new length
+            // after EVERY `translate_instr` (its many early `return split` paths
+            // would skip an in-function resync). A site-carrying opcode kept the
+            // two in lockstep itself (this is a no-op then); a plain opcode only
+            // ever pushes/pops non-site values, so padding new slots with `None`
+            // and truncating popped ones is exact — a real send's receiver/args
+            // are never sites (a site receiver is a splice, handled earlier).
+            stack_sites.resize(stack.len(), None);
             if trapped {
                 // The `Ir::UncommonTrap` is already the last op in `code` (and
                 // its deopt site is already in `deopt`). Stop translating this
@@ -2538,6 +2960,17 @@ pub fn convert(vm: &VmState, method: MethodOop, cfg: &Cfg) -> IrMethod {
             }
             bci = next;
         }
+        // S14 step 7-I: a phantom block-site must never survive to a block
+        // boundary — the escape pre-pass proved every closure is consumed by a
+        // value-send in the straight-line shape 7-I splices, so `stack_sites` is
+        // all-`None` here. If one leaked, `emit_merges`/terminator handling would
+        // emit an `Ir::Move` of a never-defined phantom vreg. Asserted so a
+        // future out-of-scope closure shape is caught in testing, not silently
+        // miscompiled.
+        debug_assert!(
+            stack_sites.iter().all(|s| s.is_none()),
+            "S14 7-I: a block-site survived to a block boundary (out-of-scope closure shape)"
+        );
         let local_exit = stack;
 
         // S14 step 3: a trapped block ends at its `Ir::UncommonTrap` (already

@@ -13,6 +13,7 @@ pub mod assembler;
 pub mod decode;
 pub mod driver;
 pub mod emit;
+pub mod escape;
 pub mod feedback;
 pub mod inline;
 pub mod ir;
