@@ -64,8 +64,27 @@ fn spill_offset(slot: crate::compiler::regalloc::SpillSlot) -> i64 {
     -8 * (slot.0 as i64 + 1)
 }
 
-fn spill_mem(slot: crate::compiler::regalloc::SpillSlot) -> Operand {
-    mem(29, spill_offset(slot))
+/// S14 step 8: emit one spill-slot access (`mnemonic` = `ldr`/`str`, `reg` the
+/// data register operand). A slot within the unscaled imm9 range (offset ≥
+/// −256) is a single `[x29, #off]` access; a DEEPER slot (large frames — heavy
+/// inlining easily exceeds 32 spill slots) computes the address into x19
+/// first (`sub x19, x29, #|off|`), which imm9 cannot reach. x19 is an
+/// emit-local scratch (the alloc fast path already clobbers x19/x20; the call
+/// stub saves callee-saved registers at the boundary) and regalloc only ever
+/// assigns x0–x15, so `reg` can never BE x19.
+fn emit_spill_access(
+    asm: &mut dyn Assembler,
+    mnemonic: &str,
+    reg: Operand,
+    slot: crate::compiler::regalloc::SpillSlot,
+) {
+    let off = spill_offset(slot);
+    if off >= -256 {
+        asm.emit(mnemonic, &[reg, mem(29, off)]);
+    } else {
+        asm.emit("sub", &[x(19), x(29), imm(-off)]);
+        asm.emit(mnemonic, &[reg, mem(19, 0)]);
+    }
 }
 
 /// Emit `dst = val` for an arbitrary 64-bit `val` — one `movz` for the
@@ -265,7 +284,7 @@ impl<'a> Emitter<'a> {
         match self.assignment_of(v) {
             Assignment::Reg(r) => xr(r),
             Assignment::Spill(slot) => {
-                self.asm.emit("ldr", &[x(scratch), spill_mem(slot)]);
+                emit_spill_access(self.asm, "ldr", x(scratch), slot);
                 xr(scratch)
             }
         }
@@ -283,8 +302,7 @@ impl<'a> Emitter<'a> {
 
     fn commit(&mut self, dst: VReg, computed_in: Reg) {
         if let Assignment::Spill(slot) = self.assignment_of(dst) {
-            self.asm
-                .emit("str", &[Operand::Reg(computed_in), spill_mem(slot)]);
+            emit_spill_access(self.asm, "str", Operand::Reg(computed_in), slot);
         }
     }
 
@@ -337,7 +355,7 @@ impl<'a> Emitter<'a> {
         // different write).
         match self.assignment_of(dst) {
             Assignment::Reg(r) => self.asm.emit("mov", &[x(r), x(17)]),
-            Assignment::Spill(slot) => self.asm.emit("str", &[x(17), spill_mem(slot)]),
+            Assignment::Spill(slot) => emit_spill_access(self.asm, "str", x(17), slot),
         }
 
         let rb2 = self.resolve(b, 17); // fresh again: mul just overwrote x17
@@ -346,7 +364,7 @@ impl<'a> Emitter<'a> {
         let low = match self.assignment_of(dst) {
             Assignment::Reg(r) => xr(r),
             Assignment::Spill(slot) => {
-                self.asm.emit("ldr", &[x(17), spill_mem(slot)]);
+                emit_spill_access(self.asm, "ldr", x(17), slot);
                 xr(17)
             }
         };
@@ -758,7 +776,7 @@ impl<'a> Emitter<'a> {
                 let (i, s) = pending.remove(pos);
                 match s {
                     Src::Reg(r) => self.asm.emit("mov", &[x(i), x(r)]),
-                    Src::Mem(slot) => self.asm.emit("ldr", &[x(i), spill_mem(slot)]),
+                    Src::Mem(slot) => emit_spill_access(self.asm, "ldr", x(i), slot),
                 }
             } else {
                 // A genuine cycle (e.g. x0<-x1, x1<-x0): only possible
@@ -1093,7 +1111,7 @@ fn emit_ir(e: &mut Emitter, ir: &Ir, next_in_order: Option<BlockId>) {
                 Assignment::Reg(r) => e.asm.ldr_literal(xr(r), lit_id),
                 Assignment::Spill(slot) => {
                     e.asm.ldr_literal(xr(16), lit_id);
-                    e.asm.emit("str", &[x(16), spill_mem(slot)]);
+                    emit_spill_access(e.asm, "str", x(16), slot);
                 }
             }
         }
@@ -1114,7 +1132,7 @@ fn emit_ir(e: &mut Emitter, ir: &Ir, next_in_order: Option<BlockId>) {
                     }
                 }
                 Assignment::Spill(slot) => {
-                    e.asm.emit("str", &[Operand::Reg(abi), spill_mem(slot)]);
+                    emit_spill_access(e.asm, "str", Operand::Reg(abi), slot);
                 }
             }
         }
@@ -1203,7 +1221,7 @@ fn emit_ir(e: &mut Emitter, ir: &Ir, next_in_order: Option<BlockId>) {
                     }
                 }
                 Assignment::Spill(slot) => {
-                    e.asm.emit("ldr", &[x(0), spill_mem(slot)]);
+                    emit_spill_access(e.asm, "ldr", x(0), slot);
                 }
             }
             let epi = e.epilogue;
@@ -1217,7 +1235,7 @@ fn emit_ir(e: &mut Emitter, ir: &Ir, next_in_order: Option<BlockId>) {
                     }
                 }
                 Assignment::Spill(slot) => {
-                    e.asm.emit("ldr", &[x(0), spill_mem(slot)]);
+                    emit_spill_access(e.asm, "ldr", x(0), slot);
                 }
             }
             let epi = e.epilogue;
