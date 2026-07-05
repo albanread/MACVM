@@ -718,10 +718,19 @@ fn build_deopt_metadata(
                         ctx: root_ctx,
                     }),
                     Some(site) => {
-                        // Begin the CALLER scope first (the SenderLink's target
-                        // must exist before its child — `begin_scope`'s own
-                        // invariant). It is the same depth-1 root scope shape.
-                        let caller_scope = rec.begin_scope(ScopeDescData {
+                        // S14 step 7-IV-b: the inline levels form a CHAIN
+                        // (`site.parent` — a block spliced inside an inlined
+                        // callee is depth 3: block ← callee ← root). Begin the
+                        // ROOT scope first (`begin_scope`'s invariant: a
+                        // SenderLink's target must exist before its child), then
+                        // each level OUTERMOST-first; every pre-7-IV site has
+                        // `parent: None` (a 2-scope chain, byte-identical to the
+                        // old shape).
+                        let mut chain: Vec<&ir::InlineSite> = vec![site];
+                        while let Some(p) = &chain.last().unwrap().parent {
+                            chain.push(p);
+                        }
+                        let mut prev_scope = rec.begin_scope(ScopeDescData {
                             method_pool_ix: root_method_ix,
                             is_block: false,
                             sender: None,
@@ -729,38 +738,40 @@ fn build_deopt_metadata(
                             slots: root_slots,
                             ctx: root_ctx,
                         });
-                        // The SenderLink: where the caller resumes (the inlined
-                        // send's bci, advanced past it by the materializer) and
-                        // its frozen operand stack below the send's operands.
-                        let pending_stack = site
-                            .caller_pending_stack
-                            .iter()
-                            .map(|&v| resolve_frame_loc(v, position, intervals))
-                            .collect();
-                        // The INLINED (innermost) scope: the callee's own
-                        // receiver/slots/method, chained to the caller.
-                        let inl_receiver = resolve_frame_loc(site.receiver, position, intervals);
-                        let inl_slots = site
-                            .slots
-                            .iter()
-                            .map(|&v| resolve_frame_loc(v, position, intervals))
-                            .collect();
-                        rec.begin_scope(ScopeDescData {
-                            method_pool_ix: site.method_pool_ix,
-                            // S14 step 7-II: an inlined spliced BLOCK records an
-                            // `is_block` scope (the deopt materializer rebuilds a
-                            // block activation frame); a step-4c method inline
-                            // records `false`.
-                            is_block: site.is_block,
-                            sender: Some(SenderLink {
-                                sender: caller_scope,
-                                sender_bci: site.sender_bci,
-                                pending_stack,
-                            }),
-                            receiver: inl_receiver,
-                            slots: inl_slots,
-                            ctx: CtxLoc::None,
-                        })
+                        for level in chain.iter().rev() {
+                            // The SenderLink: where this level's CALLER resumes
+                            // (the inlined send's bci, advanced past it by the
+                            // materializer) and the caller's frozen operand
+                            // stack below the send's operands.
+                            let pending_stack = level
+                                .caller_pending_stack
+                                .iter()
+                                .map(|&v| resolve_frame_loc(v, position, intervals))
+                                .collect();
+                            let inl_receiver =
+                                resolve_frame_loc(level.receiver, position, intervals);
+                            let inl_slots = level
+                                .slots
+                                .iter()
+                                .map(|&v| resolve_frame_loc(v, position, intervals))
+                                .collect();
+                            prev_scope = rec.begin_scope(ScopeDescData {
+                                method_pool_ix: level.method_pool_ix,
+                                // S14 step 7-II: an inlined spliced BLOCK records
+                                // an `is_block` scope (the materializer rebuilds
+                                // a block activation frame).
+                                is_block: level.is_block,
+                                sender: Some(SenderLink {
+                                    sender: prev_scope,
+                                    sender_bci: level.sender_bci,
+                                    pending_stack,
+                                }),
+                                receiver: inl_receiver,
+                                slots: inl_slots,
+                                ctx: CtxLoc::None,
+                            });
+                        }
+                        prev_scope
                     }
                 };
                 let stack = raw

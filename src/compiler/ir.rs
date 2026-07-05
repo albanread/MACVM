@@ -430,6 +430,14 @@ pub struct InlineSite {
     /// for a step-4c method inline. `driver::build_deopt_metadata` stamps the
     /// inlined scope's `ScopeDescData.is_block` from this.
     pub is_block: bool,
+    /// S14 step 7-IV-b: the ENCLOSING inline level, when this callee was itself
+    /// spliced inside another inlined extent (a block spliced inside an inlined
+    /// `do:`-style callee — depth 3: block ← callee ← root). `None` = this
+    /// callee's caller IS the root method (depth 2, every pre-7-IV shape). For
+    /// a `parent` level, `sender_bci`/`caller_pending_stack` describe the send
+    /// in THAT level's method, not the root. `build_deopt_metadata` walks the
+    /// chain outermost-first when beginning scopes.
+    pub parent: Option<Box<InlineSite>>,
 }
 
 /// S13 step 7b: the deopt info a fused comparison (`SmiCmpBr`) carries from
@@ -1441,6 +1449,7 @@ impl<'a> Translator<'a> {
             caller_pending_stack: caller_pending_stack.clone(),
             // A step-4c METHOD inline, not a spliced block.
             is_block: false,
+            parent: None,
         };
 
         // Translate the callee's straight-line body onto a fresh operand stack.
@@ -1817,6 +1826,7 @@ impl<'a> Translator<'a> {
             sender_bci: send_bci as u16,
             caller_pending_stack,
             is_block: false,
+            parent: None,
         };
 
         // ── CFG scaffolding: the same machinery convert runs on the root. ──
@@ -3045,6 +3055,7 @@ impl<'a> Translator<'a> {
             sender_bci: send_bci as u16,
             caller_pending_stack: stack.clone(),
             is_block: true,
+            parent: None,
         };
 
         // Translate the block's straight-line body onto a fresh operand stack.

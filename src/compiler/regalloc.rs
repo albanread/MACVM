@@ -286,22 +286,27 @@ pub fn compute_intervals(method: &IrMethod) -> (Vec<BlockId>, Vec<LiveInterval>,
                 .iter()
                 .find(|(ci, raw)| *ci == idx as u32 && raw.inline.is_some())
             {
-                let site = raw.inline.as_ref().unwrap();
                 // Caller (root) frame: receiver + every unified slot.
                 deopt_live.push((0, pos));
                 for s in 1..=n_slots {
                     deopt_live.push((s, pos));
                 }
-                // Inlined frame: its own receiver + slots.
-                deopt_live.push((site.receiver.0, pos));
-                for slot in &site.slots {
-                    deopt_live.push((slot.0, pos));
+                // S14 step 7-IV-b: EVERY inline level of the chain (a block
+                // spliced inside an inlined callee is depth 3) — each level's
+                // receiver + slots + frozen pending stack must be live-across so
+                // spill-all pins every entity of every rebuilt frame.
+                let mut level = raw.inline.as_ref();
+                while let Some(site) = level {
+                    deopt_live.push((site.receiver.0, pos));
+                    for slot in &site.slots {
+                        deopt_live.push((slot.0, pos));
+                    }
+                    for v in &site.caller_pending_stack {
+                        deopt_live.push((v.0, pos));
+                    }
+                    level = site.parent.as_deref();
                 }
-                // The caller's frozen operand stack (SenderLink.pending_stack)
-                // and the innermost recorded operand stack.
-                for v in &site.caller_pending_stack {
-                    deopt_live.push((v.0, pos));
-                }
+                // The innermost recorded operand stack.
                 for &v in &raw.stack {
                     deopt_live.push((v.0, pos));
                 }

@@ -253,6 +253,9 @@ pub fn analyze(method: MethodOop) -> ClosureEscape {
     let mut sites: HashSet<usize> = HashSet::new();
     let mut escaping: HashSet<usize> = HashSet::new();
     let mut value_sends: HashMap<usize, usize> = HashMap::new();
+    // site bci → does its block body contain any `Send`? (Its splice then has
+    // in-body safepoints — see the stale-alias rule in `transfer_block`.)
+    let mut site_has_sends: HashMap<usize, bool> = HashMap::new();
 
     // Discover every push_closure site up front + validate block spliceability
     // once. An unspliceable block's site is escaping from the start (it is not
@@ -269,6 +272,7 @@ pub fn analyze(method: MethodOop) -> ClosureEscape {
                 if !block_is_spliceable(block) {
                     escaping.insert(bci);
                 }
+                site_has_sends.insert(bci, !crate::compiler::inline::is_leaf(block));
             }
             bci = next;
         }
@@ -304,11 +308,29 @@ pub fn analyze(method: MethodOop) -> ClosureEscape {
             b,
             &mut st,
             &sites,
+            &site_has_sends,
             &mut escaping,
             &mut value_sends,
         );
-        // Propagate the block's exit state to its successors.
+        // SOUNDNESS (S14 7-IV-b): a Site still LIVE at a block boundary WITH
+        // SUCCESSORS escapes. A phantom closure has no compiled location — any
+        // safepoint in a successor (a send, a loop poll on a backward edge)
+        // would record its slot as dead/Nil, and a deopt there would hand the
+        // interpreter nil where it expects the closure. Killing cross-block
+        // liveness outright is conservative (a cross-block good use is
+        // rejected rather than miscompiled); ElidedClosure materialization can
+        // lift this later. A `Return`-terminated block has no successor and no
+        // further safepoint — a stale alias surviving to it is harmless
+        // (`b := [7]. ^b value`).
         let cfg_block = &cfg.blocks[b];
+        if !matches!(cfg_block.terminator, Terminator::Return) {
+            for &slot in st.stack.iter().chain(st.temps.iter()) {
+                if let AV::Site(s) = slot {
+                    escaping.insert(s);
+                }
+            }
+        }
+        // Propagate the block's exit state to its successors.
         match cfg_block.terminator {
             Terminator::Return => {}
             Terminator::Fallthrough(t) | Terminator::Jump { target: t, .. } => {
@@ -352,6 +374,7 @@ fn transfer_block(
     b: usize,
     st: &mut State,
     sites: &HashSet<usize>,
+    site_has_sends: &HashMap<usize, bool>,
     escaping: &mut HashSet<usize>,
     value_sends: &mut HashMap<usize, usize>,
 ) {
@@ -420,6 +443,11 @@ fn transfer_block(
 
                 let sel_bytes = selector_bytes(method, ic);
                 let vf_argc = value_family_argc(&sel_bytes);
+                // Does THIS send introduce a SAFEPOINT while other phantoms are
+                // live? A real (non-value) send always does (CallSend / cold
+                // trap). A GOOD value-send introduces one only if the spliced
+                // block body itself has sends (its in-body CallSends/traps).
+                let mut send_is_safepoint = true;
                 match recv {
                     AV::Site(s) if !super_ => {
                         // A GOOD use iff: value-family selector, argc matches the
@@ -430,6 +458,9 @@ fn transfer_block(
                             matches!(vf_argc, Some(a) if a == argc) && block_argc == Some(argc);
                         if good {
                             value_sends.insert(bci, s);
+                            // The splice replaces the dispatch: a SEND-FREE
+                            // block body has no safepoint at all.
+                            send_is_safepoint = site_has_sends.get(&s).copied().unwrap_or(true);
                         } else {
                             escaping.insert(s);
                         }
@@ -440,6 +471,24 @@ fn transfer_block(
                         escaping.insert(s);
                     }
                     AV::Other => {}
+                }
+                // SOUNDNESS (S14 7-IV-b): any Site still LIVE (stack or temp)
+                // across a SAFEPOINT escapes. A phantom closure has no compiled
+                // location — a deopt at this send would materialize its
+                // temp/stack slot as dead/Nil, and the interpreter's later
+                // `value` of it would be a nil send. This hits (a) sites whose
+                // liveness spans an unrelated real send — `b := [..]. self
+                // poke. ^b value` — and (b) stale temp aliases of a consumed
+                // site whose SPLICED body itself contains sends (the in-body
+                // safepoints would record the alias slot as Nil). A send-free
+                // block's splice has no safepoint, so a stale alias of it is
+                // harmless (`b := [7]. ^b value` stays elidable).
+                if send_is_safepoint {
+                    for &slot in st.stack.iter().chain(st.temps.iter()) {
+                        if let AV::Site(s) = slot {
+                            escaping.insert(s);
+                        }
+                    }
                 }
                 // The result of the send is opaque.
                 st.stack.push(AV::Other);

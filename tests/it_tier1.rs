@@ -5144,3 +5144,48 @@ fn deopt_inside_inlined_loop_callee_rebuilds_frames() {
         "exactly one deopt (the cold `<`)"
     );
 }
+
+/// SOUNDNESS regression (S14 7-IV-b): a phantom closure whose liveness SPANS an
+/// unrelated safepoint must NOT elide. `stash [ b := [42]. self poke. ^b value ]`
+/// — at the cold `self poke` deopt, the elided closure has no compiled location,
+/// so temp `b` would materialize as nil and the interpreter's `b value` would be
+/// a nil send. The escape analysis now rejects the shape (stays interpreted, and
+/// the interpreter still runs it correctly).
+#[test]
+fn phantom_live_across_safepoint_stays_interpreted() {
+    let mut vm = test_vm();
+    install_value_prims(&mut vm);
+    let smi_klass = vm.universe.smi_klass;
+    let poke_sel = vm.universe.intern(b"poke");
+    let poke = {
+        let mut pb = BytecodeBuilder::new();
+        pb.ret_self();
+        pb.finish(&mut vm, poke_sel, 0, 0)
+    };
+    install_method(&mut vm, smi_klass, poke_sel, poke);
+
+    let value_sel = vm.universe.intern(b"value");
+    let sel = vm.universe.intern(b"stash");
+    let mut b = BytecodeBuilder::new();
+    let lit = b.build_block(&mut vm, 0, 0, false, 0, false, |blk, _vm| {
+        blk.push_smi_i8(42);
+        blk.block_return_tos();
+    });
+    b.push_closure(lit, 0);
+    b.store_temp_pop(0); // b := [42]
+    b.push_self();
+    b.send(&mut vm, poke_sel, 0); // self poke   ← a safepoint while b is live
+    b.pop();
+    b.push_temp(0);
+    b.send(&mut vm, value_sel, 0); // ^b value
+    b.ret_tos();
+    let m = b.finish(&mut vm, sel, 0, 1);
+
+    assert!(
+        !driver::eligible(&vm, m),
+        "a phantom live across an unrelated safepoint must NOT compile (deopt would nil it)"
+    );
+    // The interpreter is still correct for the same shape.
+    let r = macvm::interpreter::run_method(&mut vm, m, SmallInt::new(3).oop(), &[]);
+    assert_eq!(r.raw(), SmallInt::new(42).oop().raw());
+}

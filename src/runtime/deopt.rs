@@ -127,7 +127,53 @@ fn read_value(vm: &VmState, nm: &Nmethod, fv: &FrameView, loc: ValueLoc) -> Oop 
         ValueLoc::ConstPool(ix) => read_pool_oop(nm, ix),
         ValueLoc::ConstSmi(v) => SmallInt::new(v).oop(),
         ValueLoc::Nil => vm.universe.nil_obj,
+        // S14 step 7-IV-b: an elided closure ALLOCATES on materialization —
+        // handled by the M3 frame loop's own closure pass (which has `&mut vm`,
+        // the root frame, and GC-safe ordering), never by this plain reader.
+        // Reaching it here means a phantom leaked into a location the compiler
+        // must never record one in (a receiver, a pending stack, a ctx temp).
+        ValueLoc::ElidedClosure(_) => unreachable!(
+            "read_value: ValueLoc::ElidedClosure outside a frame-slot/site-stack \
+             position (compiler bug — phantoms are only recorded in inlined-scope \
+             slots and reexecute site stacks)"
+        ),
     }
+}
+
+/// S14 step 7-IV-b: materialize an ELIDED closure — the compiled code spliced
+/// the block inline and never allocated it, but the interpreter frame being
+/// rebuilt needs the real thing. Mirrors `interpreter::blocks::make_closure`,
+/// sourced from the already-materialized ROOT frame (the block's home is
+/// always the compilation root in v1): `home_ref` = (root fp, root serial),
+/// `copied[0]` = root receiver, `copied[1]` = root Context iff the block
+/// `captures_ctx` (the root's own M6 ran before any inlined frame is built, so
+/// its FRAME_CONTEXT is final — a fresh Context if the root's was elided).
+/// GC-safe: the block MethodOop rides in a handle across the allocation, and
+/// the root frame's fields are re-read from the (rooted) process stack after.
+fn materialize_closure(vm: &mut VmState, id: NmethodId, root_fp: usize, pool_ix: u32) -> Oop {
+    let blk_oop = read_pool_oop(nmethod_ref(vm, id), pool_ix);
+    let blk = crate::oops::wrappers::MethodOop::try_from(blk_oop)
+        .expect("materialize_closure: pool entry is not a CompiledBlock");
+    let captures_ctx = blk.captures_ctx();
+    let ncopied = 1 + captures_ctx as usize;
+
+    let scope = crate::memory::handles::HandleScope::enter(vm);
+    let blk_h = scope.handle(vm, blk);
+    let closure = crate::memory::alloc::alloc_closure(vm, ncopied);
+    closure.set_method(blk_h.get(vm));
+
+    let root = Frame { fp: root_fp };
+    closure.set_copied(0, root.receiver(&vm.stack));
+    if captures_ctx {
+        closure.set_copied(1, root.context(&vm.stack));
+    }
+    let home = crate::oops::home_ref::pack_home_ref(crate::oops::home_ref::HomeRef {
+        proc: 0,
+        serial: root.serial(&vm.stack),
+        fp: root_fp,
+    });
+    closure.set_home(home);
+    closure.oop()
 }
 
 /// Length in bytes of the bytecode at `bci` — `decode_at`'s `next - bci`
@@ -324,6 +370,12 @@ pub fn deoptimize_frame(vm: &mut VmState, frame: FrameView) -> DeoptResume {
     // caller — the compiled frame's own native caller resumes via the
     // trampoline epilogue once the nested run returns, step 7).
     let mut prev_fp: i64 = crate::oops::layout::ENTRY_FRAME_SENTINEL;
+    // S14 step 7-IV-b: the OUTERMOST (root) materialized frame's fp — the home
+    // of every elided closure and every inlined `is_block` scope in this chain
+    // (v1 splices blocks only into their home compilation). Set on the first
+    // iteration; later frames' closure/context materialization reads the root
+    // frame's receiver/context/serial from it.
+    let mut root_fp: Option<usize> = None;
     // Track the innermost frame's fp so M5/M6/M7 can address it after all
     // pushes (a later `push_frame` cannot move an earlier frame — the stack
     // only grows — so this stays valid).
@@ -354,11 +406,24 @@ pub fn deoptimize_frame(vm: &mut VmState, frame: FrameView) -> DeoptResume {
         // FrameSlot read (they're plain values now).
         let nm_ref = nmethod_ref(vm, frame.nm);
         let receiver = read_value(vm, nm_ref, &frame, vf.scope.receiver);
+        // S14 step 7-IV-b: an inlined scope's slot may hold an ELIDED CLOSURE
+        // (a `do:`-style callee's block-arg temp). Its allocation must not run
+        // mid-collect (the other raw `Oop`s here are unrooted until pushed), so
+        // read a nil placeholder now, remember the slot, and materialize AFTER
+        // the frame is pushed (everything rooted, `set_temp` overwrites).
+        let mut phantom_slots: Vec<(usize, u32)> = Vec::new();
         let slot_vals: Vec<Oop> = vf
             .scope
             .slots
             .iter()
-            .map(|&loc| read_value(vm, nm_ref, &frame, loc))
+            .enumerate()
+            .map(|(i, &loc)| match loc {
+                ValueLoc::ElidedClosure(pool_ix) => {
+                    phantom_slots.push((i, pool_ix));
+                    vm.universe.nil_obj
+                }
+                _ => read_value(vm, nm_ref, &frame, loc),
+            })
             .collect();
         debug_assert_eq!(
             slot_vals.len(),
@@ -390,6 +455,9 @@ pub fn deoptimize_frame(vm: &mut VmState, frame: FrameView) -> DeoptResume {
         }
         let fp_new = vm.stack.sp;
         crate::interpreter::push_frame(vm, method, argc, prev_fp, saved_bci);
+        if root_fp.is_none() {
+            root_fp = Some(fp_new);
+        }
 
         // Overwrite the nil temps `push_frame` laid down with the scope's
         // real temp values (unified slots argc..). `Frame::set_temp` uses the
@@ -401,21 +469,32 @@ pub fn deoptimize_frame(vm: &mut VmState, frame: FrameView) -> DeoptResume {
 
         // ── M6: context. ────────────────────────────────────────────────
         // S14 step 7-II: an `is_block` frame is a ctx-LESS block activation
-        // whose FP+3 ALIASES its home method's Context (SPEC §5.4 — a ctx-less
-        // block's frame aliases the enclosing Context directly). Its home is its
-        // sender, which we built on the previous iteration (`prev_fp`), so read
-        // that frame's Context and share it. Correct for BOTH a non-capturing
-        // home (nil Context — 7-II) and a captured-temp home (the just-
-        // materialized `CtxLoc::Elided` Context — 7-II-b). A method frame uses
-        // its own recorded `CtxLoc` (M6 proper).
+        // whose FP+3 ALIASES its HOME method's Context (SPEC §5.4 — a ctx-less
+        // block's frame aliases the enclosing Context directly). Its home is
+        // the compilation ROOT (v1 splices blocks only into their home
+        // compilation), which was built and M6'd first — read the ROOT frame's
+        // Context and share it. (7-IV-b: at depth 3 — a block spliced inside an
+        // inlined `do:` callee — the block's SENDER is the ctx-less callee, so
+        // `prev_fp` would alias the WRONG (nil) context; the home is the root.)
+        // Correct for both a nil-Context home (7-II) and an elided-Context home
+        // (7-II-b). A method frame uses its own recorded `CtxLoc` (M6 proper).
         if vf.scope.is_block && prev_fp != crate::oops::layout::ENTRY_FRAME_SENTINEL {
             let home_ctx = Frame {
-                fp: prev_fp as usize,
+                fp: root_fp.expect("is_block frame is never outermost"),
             }
             .context(&vm.stack);
             Frame { fp: fp_new }.set_context(&mut vm.stack, home_ctx);
         } else {
             materialize_context(vm, frame.nm, &frame, &vf.scope.ctx, fp_new);
+        }
+
+        // S14 step 7-IV-b: materialize this frame's ELIDED-CLOSURE slots now —
+        // the frame (and the root) are pushed and rooted, so the allocation is
+        // GC-safe, and `set_temp` overwrites the nil placeholders.
+        for &(slot_ix, pool_ix) in &phantom_slots {
+            let root = root_fp.expect("root frame exists by now");
+            let closure = materialize_closure(vm, frame.nm, root, pool_ix);
+            Frame { fp: fp_new }.set_temp(&mut vm.stack, slot_ix, closure);
         }
 
         if vf.is_innermost {
@@ -432,8 +511,19 @@ pub fn deoptimize_frame(vm: &mut VmState, frame: FrameView) -> DeoptResume {
             };
             // ── M3.3 innermost operand stack: the site's recorded values,
             //    plus `incoming_result` iff the site is a call-return. ─────
+            // S14 step 7-IV-b: a reexecute stack may carry an ELIDED CLOSURE
+            // (the guard-cold path of a send that passed a spliced block as an
+            // argument re-executes that send, which needs the real closure).
+            // Alloc-then-push is GC-safe here: every previously pushed value is
+            // already rooted on the process stack.
             for &loc in &site_stack {
-                let v = read_value(vm, nmethod_ref(vm, frame.nm), &frame, loc);
+                let v = match loc {
+                    ValueLoc::ElidedClosure(pool_ix) => {
+                        let root = root_fp.expect("root frame exists by now");
+                        materialize_closure(vm, frame.nm, root, pool_ix)
+                    }
+                    _ => read_value(vm, nmethod_ref(vm, frame.nm), &frame, loc),
+                };
                 vm.stack.push(v);
             }
             if site_reexecute {
@@ -1208,6 +1298,133 @@ mod tests {
             !vm.stack.has_frame(),
             "the ambient (no-frame) outer activation was restored"
         );
+    }
+
+    /// S14 step 7-IV-b: `ValueLoc::ElidedClosure` materialization. A scope
+    /// whose SLOT and whose reexecute SITE STACK each carry an elided closure
+    /// (pool word 1 = the CompiledBlock) must rebuild a frame whose temp and
+    /// operand-stack entry are REAL `BlockClosure`s: method = the block,
+    /// `copied[0]` = the (root) frame's receiver, and `home_ref` naming the
+    /// materialized frame's own fp + serial (a live home for later
+    /// `value`/`nlr` sends).
+    #[test]
+    fn materialize_elided_closure_slot_and_stack() {
+        let mut vm = test_vm();
+
+        // Deoptee: argc=1, ntemps=1; resume at bci 1 (model height 1 — one
+        // push before it).
+        let method = {
+            let mut b = BytecodeBuilder::new();
+            b.push_nil(); // bci 0 -> h1
+            b.ret_tos(); // bci 1 (resume point)
+            let sel = vm.universe.intern(b"deopteeEc");
+            b.finish(&mut vm, sel, 1, 1)
+        };
+        // The CompiledBlock the phantom names (send-free `[42]`).
+        let blk = crate::bytecode::builder::build_standalone_block(
+            &mut vm,
+            0,
+            0,
+            false,
+            0,
+            false,
+            |bb, _vm| {
+                bb.push_smi_i8(42);
+                bb.block_return_tos();
+            },
+        );
+
+        let receiver_val = SmallInt::new(0x77).oop();
+        let arg0_val = SmallInt::new(0x88).oop();
+        // Pool word 1 = the block MethodOop (what ElidedClosure(1) names).
+        let nm = build_nmethod_with_pool(&mut vm, method, blk.oop());
+
+        let phys: [u64; 3] = [receiver_val.raw(), arg0_val.raw(), 0];
+        let fp = (&phys[2]) as *const u64 as usize;
+
+        let mut rec = ScopeDescRecorder::new();
+        let scope = rec.begin_scope(ScopeDescData {
+            method_pool_ix: 0,
+            is_block: false,
+            sender: None,
+            receiver: ValueLoc::FrameSlot(-16),
+            slots: vec![
+                ValueLoc::FrameSlot(-8),    // arg0
+                ValueLoc::ElidedClosure(1), // temp0 = the phantom closure
+            ],
+            ctx: CtxLoc::None,
+        });
+        rec.record_site(
+            0x10,
+            SafepointState {
+                scope,
+                bci: 1,
+                kind: SafepointKind::UncommonTrap,
+                reexecute: true,
+                stack: vec![ValueLoc::ElidedClosure(1)], // phantom on the stack too
+            },
+        );
+        let (blob, pcdescs) = rec.pack();
+        let nm_id = install_nmethod(&mut vm, nm, blob, pcdescs);
+        let nm_ref = vm.code_table.get(nm_id).unwrap();
+        let pc = nm_ref.code.base as usize + 0x10;
+
+        let sp_before = vm.stack.sp;
+        let _resume = deoptimize_frame(
+            &mut vm,
+            FrameView {
+                fp,
+                pc,
+                nm: nm_id,
+                incoming_result: None,
+            },
+        );
+
+        let fp_new = sp_before + 2; // receiver + 1 arg pushed below the frame
+        let f = Frame { fp: fp_new };
+        f.verify(&vm.stack);
+        assert_eq!(f.receiver(&vm.stack), receiver_val);
+        assert_eq!(f.temp(&vm.stack, 0), arg0_val, "arg0 untouched");
+
+        // temp0: a REAL closure materialized from the phantom.
+        let c1 = crate::oops::wrappers::ClosureOop::try_from(f.temp(&vm.stack, 1))
+            .expect("temp0 must hold a materialized BlockClosure");
+        assert_eq!(
+            c1.method().oop().raw(),
+            blk.oop().raw(),
+            "closure method = the block"
+        );
+        assert_eq!(
+            c1.ncopied(),
+            1,
+            "non-capturing block: copied[] = [home receiver]"
+        );
+        assert_eq!(
+            c1.copied(0),
+            receiver_val,
+            "copied[0] = the home (root) receiver"
+        );
+        let h1 = crate::oops::home_ref::unpack_home_ref(c1.home());
+        assert_eq!(h1.fp, fp_new, "home_ref fp = the materialized ROOT frame");
+        assert_eq!(
+            h1.serial as i64,
+            f.serial(&vm.stack) as i64,
+            "home_ref serial = the materialized frame's serial (a LIVE home)"
+        );
+
+        // Operand stack: a second, DISTINCT closure with the same shape.
+        let opnd_base = fp_new + FRAME_TEMPS_BASE + method.ntemps();
+        assert_eq!(vm.stack.sp, opnd_base + 1, "one operand value pushed");
+        let c2 = crate::oops::wrappers::ClosureOop::try_from(vm.stack.get(opnd_base))
+            .expect("site stack entry must hold a materialized BlockClosure");
+        assert_ne!(
+            c1.oop().raw(),
+            c2.oop().raw(),
+            "slot and stack phantoms are independent allocations"
+        );
+        assert_eq!(c2.method().oop().raw(), blk.oop().raw());
+        let h2 = crate::oops::home_ref::unpack_home_ref(c2.home());
+        assert_eq!(h2.fp, fp_new);
     }
 
     // Test scaffolding (nmethod-building) is shared with

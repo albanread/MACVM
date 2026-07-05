@@ -139,6 +139,18 @@ pub enum ValueLoc {
     FrameSlot(i32),
     /// Shorthand for the `nil_obj` well-known oop (very common).
     Nil,
+    /// S14 step 7-IV-b: an ELIDED literal closure — the compiled code never
+    /// allocated it (its block was spliced inline), but the interpreter frame
+    /// being rebuilt needs the real thing (a `do:`-style callee's block-arg
+    /// temp, or the guard-cold reexecute stack of the send that passed it).
+    /// The payload is the CompiledBlock `MethodOop`'s pool index. The
+    /// materializer allocates a fresh `BlockClosure { method: pool[ix],
+    /// home_ref: (root frame fp, serial), copied[0]: root receiver,
+    /// copied[1]: root Context iff captures_ctx }` — the block's home is
+    /// always the compilation ROOT in v1 (a block whose home isn't the root
+    /// never elides), and the root frame is fully built (incl. its M6
+    /// Context) before any inlined frame's values are read.
+    ElidedClosure(u32),
 }
 
 impl ValueLoc {
@@ -157,6 +169,10 @@ impl ValueLoc {
                 write_sleb(out, off as i64);
             }
             ValueLoc::Nil => out.push(3),
+            ValueLoc::ElidedClosure(ix) => {
+                out.push(4);
+                write_uleb(out, ix as u64);
+            }
         }
     }
 
@@ -168,6 +184,7 @@ impl ValueLoc {
             1 => ValueLoc::ConstSmi(read_sleb(buf, pos)),
             2 => ValueLoc::FrameSlot(read_sleb(buf, pos) as i32),
             3 => ValueLoc::Nil,
+            4 => ValueLoc::ElidedClosure(read_uleb(buf, pos) as u32),
             other => panic!("ValueLoc::read: bad tag {other}"),
         }
     }
@@ -690,6 +707,8 @@ mod tests {
             ValueLoc::FrameSlot(-480),
             ValueLoc::FrameSlot(16),
             ValueLoc::Nil,
+            ValueLoc::ElidedClosure(0),
+            ValueLoc::ElidedClosure(777),
         ] {
             let mut out = Vec::new();
             loc.write(&mut out);
