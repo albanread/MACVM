@@ -224,7 +224,16 @@ fn mono_smi_inline_send(_vm: &VmState, method: MethodOop, ic_idx: u16) -> Eligib
         // count. No trap counting / recompilation is added here.
         IcState::Empty => return Eligibility::Yes,
         IcState::Mono => {}
-        IcState::Poly(_) | IcState::Mega => return Eligibility::NoPermanent,
+        // S14: a POLY or MEGA site no longer blocks compilation — it compiles as
+        // a generic compiled-IC `CallSend` (`inline::decide` → `Call`, there is
+        // no single target to speculate on). The S11 IC machinery handles the
+        // polymorphism at runtime: the site's `bl` starts at `stub_resolve` and
+        // transitions Mono → PIC → Mega exactly as an interpreter IC does
+        // (S11 step 5, PIC/mega already built + tested). Inlining the dominant
+        // poly case behind a klass guard (DominantWithSlowPath) is a later
+        // optimization; this just STOPS BLOCKING the method. The `it_world`
+        // differential gate covers the runtime correctness.
+        IcState::Poly(_) | IcState::Mega => return Eligibility::Yes,
     }
     let site = InterpreterIc::at(method, ic_idx);
     let Some(target) = MethodOop::try_from(site.target()) else {
@@ -929,10 +938,11 @@ mod tests {
         assert!(eligible(&vm, method));
     }
 
-    /// A polymorphic IC (more than one klass seen at a send site) keeps
-    /// this method interpreted too — same gate as `Mega`.
+    /// S14: a polymorphic IC (more than one klass seen at a send site) is now
+    /// ELIGIBLE — it compiles as a generic compiled-IC `CallSend` and the S11
+    /// PIC machinery handles the polymorphism at runtime (was `NoPermanent`).
     #[test]
-    fn eligible_rejects_poly_ic() {
+    fn eligible_accepts_poly_ic() {
         let mut vm = test_vm();
         let plus_sel = vm.universe.intern(b"+");
         let plus_target = primitive_stub(&mut vm, plus_sel, 1);
@@ -960,7 +970,10 @@ mod tests {
         let epoch = vm.ic_epoch;
         InterpreterIc::at(method, 0).set_poly(&mut vm, pairs, epoch);
 
-        assert!(!eligible(&vm, method));
+        assert!(
+            eligible(&vm, method),
+            "a poly send compiles as a generic Call (PIC handles it at runtime)"
+        );
     }
 
     /// D1 point 3: a method with a primitive attached stays interpreted —
