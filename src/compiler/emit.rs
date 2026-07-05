@@ -1379,6 +1379,7 @@ mod tests {
             call_sites: Vec::new(),
             site_feedback: Vec::new(),
             inline_deps: Vec::new(),
+            self_devirt: false,
             method_pool_ix: None,
         }
     }
@@ -1784,6 +1785,7 @@ mod tests {
             call_sites: Vec::new(),
             site_feedback: Vec::new(),
             inline_deps: Vec::new(),
+            self_devirt: false,
             method_pool_ix: None,
         };
         let ra = regalloc::regalloc(&method);
@@ -2078,6 +2080,7 @@ mod tests {
             ],
             site_feedback: Vec::new(),
             inline_deps: Vec::new(),
+            self_devirt: false,
             method_pool_ix: None,
         };
         let ra = regalloc::regalloc(&method);

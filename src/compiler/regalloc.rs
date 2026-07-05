@@ -658,6 +658,7 @@ mod tests {
             call_sites: Vec::new(),
             site_feedback: Vec::new(),
             inline_deps: Vec::new(),
+            self_devirt: false,
             method_pool_ix: None,
         }
     }

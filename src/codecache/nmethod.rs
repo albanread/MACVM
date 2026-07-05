@@ -227,6 +227,13 @@ pub struct Nmethod {
     /// `IcSite` guard klass / `super_klass`): the pair names live heap objects
     /// a moving collector relocates. Empty for a non-inlining nmethod.
     pub inline_deps: Vec<(KlassOop, SymbolOop)>,
+    /// S14 step 5: this nmethod contains guard-free SELF-send inlines baked
+    /// against `key_klass` — its code is only correct for receivers of
+    /// exactly that klass. Super-send linking (`resolve_super_target_entry`)
+    /// must use the c2i adapter instead of `verified_entry` for such a
+    /// target, because super sites enter with subclass receivers the entry
+    /// guard never checks.
+    pub self_devirt: bool,
 }
 
 impl Nmethod {
@@ -328,6 +335,7 @@ impl Nmethod {
             deopt_scopes: Vec::new(),
             deopt_pcdescs: Vec::new(),
             inline_deps: Vec::new(),
+            self_devirt: false,
         }
     }
 }
@@ -816,6 +824,7 @@ mod tests {
             deopt_scopes: Vec::new(),
             deopt_pcdescs: Vec::new(),
             inline_deps: Vec::new(),
+            self_devirt: false,
         }
     }
 

@@ -379,6 +379,7 @@ mod tests {
             deopt_scopes: Vec::new(),
             deopt_pcdescs: Vec::new(),
             inline_deps: Vec::new(),
+            self_devirt: false,
         }
     }
 

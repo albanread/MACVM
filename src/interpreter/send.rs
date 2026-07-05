@@ -27,7 +27,7 @@ pub use crate::runtime::lookup::klass_of;
 /// post-bump invocation count, so `activate_method`'s S10 D4 compile
 /// trigger can check for the exact threshold crossing without a second,
 /// separately maintained read of the same field.
-pub(crate) fn bump_invocation(m: MethodOop) -> i64 {
+pub fn bump_invocation(m: MethodOop) -> i64 {
     let c = m.counters();
     let inv = c & COUNTERS_INVOCATION_MASK;
     let bumped = (inv + 1).min(COUNTERS_INVOCATION_MAX);

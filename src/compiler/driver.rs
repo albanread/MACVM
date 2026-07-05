@@ -6,7 +6,7 @@
 
 use crate::bytecode::opcode::{decode_at, Instr};
 use crate::codecache::nmethod::{IcSite, NmState, Nmethod, NmethodId, OopMap, PcDesc};
-use crate::codecache::stubs::resolve_target_entry;
+use crate::codecache::stubs::resolve_super_target_entry;
 use crate::compiler::jasm_assembler::JasmAssembler;
 use crate::compiler::{decode, emit, ir, oopmap, regalloc};
 use crate::interpreter::ic::InterpreterIc;
@@ -426,7 +426,7 @@ pub fn compile_method_versioned(
     }
 
     let cfg = decode::decode(method);
-    let ir_method = ir::convert(vm, method, &cfg);
+    let ir_method = ir::convert(vm, rcvr_klass, method, &cfg);
     let regalloc_result = regalloc::regalloc(&ir_method);
 
     let mut asm = JasmAssembler::new();
@@ -484,7 +484,7 @@ pub fn compile_method_versioned(
         let resolved = match ir_method.call_sites[s.site as usize].static_klass {
             Some(super_klass) => {
                 let target_method = lookup(vm, super_klass, s.selector)?;
-                let target = resolve_target_entry(vm, super_klass, s.selector, target_method, true);
+                let target = resolve_super_target_entry(vm, super_klass, s.selector, target_method);
                 Some((super_klass, target))
             }
             None => None,
@@ -618,6 +618,7 @@ pub fn compile_method_versioned(
         // affected_by_install` reads these to invalidate this nmethod when an
         // inlined callee is redefined.
         inline_deps: ir_method.inline_deps.clone(),
+        self_devirt: ir_method.self_devirt,
     };
     // S12 D1 enforcement point 2: "debug + stress" — reuses the existing
     // heap-verifier's own gate (`MACVM_GC_VERIFY=1` opts a release build
@@ -1337,7 +1338,7 @@ mod tests {
         InterpreterIc::at(method, 1).set_mono(&mut vm, obj_klass, box_target, epoch);
 
         let cfg = decode::decode(method);
-        let ir_method = ir::convert(&vm, method, &cfg);
+        let ir_method = ir::convert(&vm, vm.universe.smi_klass, method, &cfg);
         let ra = regalloc::regalloc(&ir_method);
 
         let mut asm = JasmAssembler::new();
@@ -1491,7 +1492,7 @@ mod tests {
         InterpreterIc::at(method, 1).set_mono(&mut vm, obj_klass, plus_target, epoch);
 
         let cfg = decode::decode(method);
-        let ir_method = ir::convert(&vm, method, &cfg);
+        let ir_method = ir::convert(&vm, vm.universe.smi_klass, method, &cfg);
         let ra = regalloc::regalloc(&ir_method);
 
         let mut asm = JasmAssembler::new();

@@ -511,6 +511,35 @@ pub(crate) fn resolve_target_entry(
     }
 }
 
+/// S14 step 5: `resolve_target_entry` for a SUPER-send site. A super site
+/// links `verified_entry` directly (skipping the entry guard) and its
+/// receivers are SUBCLASS instances — any klass below the holder — so it must
+/// never enter an nmethod whose code was customized to its key klass
+/// (`self_devirt`: guard-free self-send inlines baked against exactly that
+/// klass). Such a target dispatches through the method's c2i adapter instead:
+/// the interpreter re-dispatches its self-sends against the receiver's REAL
+/// klass. Non-devirtualized targets keep the fast compiled link (their code is
+/// receiver-klass-independent, the pre-step-5 status quo).
+pub(crate) fn resolve_super_target_entry(
+    vm: &mut VmState,
+    super_klass: KlassOop,
+    selector: SymbolOop,
+    method: MethodOop,
+) -> u64 {
+    let devirt = vm
+        .code_table
+        .lookup(super_klass, selector)
+        .and_then(|id| vm.code_table.get(id))
+        .is_some_and(|nm| nm.self_devirt);
+    if devirt {
+        let c2i_shared_addr = vm.stubs.c2i_shared_addr();
+        vm.adapters
+            .get_or_make(&mut vm.code_cache, c2i_shared_addr, method)
+    } else {
+        resolve_target_entry(vm, super_klass, selector, method, true)
+    }
+}
+
 /// Finds the caller nmethod and its own `IcSite` from a send site's return
 /// address. `ret_addr - 4` is always the `bl`/guard-miss site itself —
 /// D4.1's own invariant, true through every door a compiled send can be
@@ -622,7 +651,7 @@ pub unsafe extern "C" fn rt_resolve_send(vm: *mut VmState, ret_addr: u64, argv: 
         let Some(method) = lookup(vm, sk, selector) else {
             return vm.stubs.dnu_addr();
         };
-        let target = resolve_target_entry(vm, sk, selector, method, true);
+        let target = resolve_super_target_entry(vm, sk, selector, method);
         vm.code_cache
             .patch_branch26_at(caller_code, site_off, target);
         vm.code_table.get_mut(caller_id).unwrap().ic_sites[site_idx].state =
@@ -971,12 +1000,93 @@ pub unsafe extern "C" fn rt_interpret_call(
         .map(|i| Oop::from_raw(unsafe { *argv.add(1 + i) }))
         .collect();
 
-    vm.tier_links.push(TierLink::IntoInterpreter {
-        compiled_fp: vm.reg_block.last_compiled_fp,
-        compiled_ret_pc: vm.reg_block.last_compiled_pc,
-    });
-    let result = crate::interpreter::run_method_reentrant(vm, method, receiver, &args);
-    vm.tier_links.pop();
+    // Captured BEFORE the nested run: the interpreted body may itself enter
+    // and leave compiled code, clobbering the anchor the repatch below needs.
+    let ret_addr = vm.reg_block.last_compiled_pc;
+    // The nested run below can trigger a MOVING GC (scavenge or full), so the
+    // raw `method`/`receiver` oops the escape hatch needs AFTERWARDS are held
+    // through handles for the duration — the same discipline
+    // `run_method_reentrant` itself applies to the saved outer method
+    // (review finding: post-run reads through the pre-run raw copies would
+    // dangle after a collection).
+    let (result, method, receiver) = {
+        let scope = crate::memory::handles::HandleScope::enter(vm);
+        let method_h = scope.handle(vm, method.oop());
+        let receiver_h = scope.handle(vm, receiver);
+        vm.tier_links.push(TierLink::IntoInterpreter {
+            compiled_fp: vm.reg_block.last_compiled_fp,
+            compiled_ret_pc: vm.reg_block.last_compiled_pc,
+        });
+        let result = crate::interpreter::run_method_reentrant(vm, method, receiver, &args);
+        vm.tier_links.pop();
+        let method = MethodOop::try_from(method_h.get(vm))
+            .expect("rt_interpret_call: the c2i adapter's method survived the nested run");
+        (result, method, receiver_h.get(vm))
+    };
+    // S14 step 5 (the c2i escape hatch): a method reached ONLY through
+    // compiled c2i calls never passes the interpreter's own compile trigger
+    // (`activate_method`) — before step 5, some caller always trapped into
+    // the interpreter eventually and warmed things up, but a fully
+    // devirtualized caller never deopts, so without this the callee would
+    // interpret FOREVER behind a frozen c2i site (the bench-smoke tripwire
+    // caught exactly that: arith collapsing back to interpreter speed).
+    // Mirror the trigger here: bump the invocation counter, compile (or
+    // reuse) the (receiver-klass, selector) nmethod past the threshold, and
+    // re-point the calling MONO site at the fresh compiled entry so every
+    // FUTURE call dispatches compiled. This runs AFTER the interpreted run
+    // below on purpose: that run just WARMED the method's own inner ICs, so
+    // the compile sees real feedback (compiling before it would bake a cold
+    // trap-laden v0 whose second trap re-executes an arbitrarily long call
+    // interpreted — the arith bench's own 5M-iteration worst case).
+    if let crate::runtime::vm_state::JitMode::Threshold(n) = vm.options.jit {
+        let bumped = crate::interpreter::send::bump_invocation(method);
+        if bumped >= n as i64 && !method.compile_disabled() {
+            let k = klass_of(vm, receiver);
+            let sel = SymbolOop::try_from(method.selector())
+                .expect("a method's selector is always a Symbol");
+            // DISPATCH-TRUTH guard (review finding): compile+install ONLY when
+            // this method is what dynamic lookup for (k, sel) actually finds.
+            // A SUPER-dispatched c2i callee is an ANCESTOR method — installing
+            // it under the SUBCLASS key would make every future normal send of
+            // sel to a k receiver execute the ancestor instead of the
+            // override; likewise a method the nested run just REDEFINED must
+            // not be resurrected under the fresh key.
+            let is_dispatch_truth =
+                lookup(vm, k, sel).is_some_and(|m2| m2.oop().raw() == method.oop().raw());
+            if !is_dispatch_truth {
+                return result.raw();
+            }
+            let existing = vm.code_table.lookup(k, sel).filter(|&id| {
+                vm.code_table
+                    .get(id)
+                    .is_some_and(|nm| matches!(nm.state, crate::codecache::nmethod::NmState::Alive))
+            });
+            let compiled =
+                existing.or_else(|| crate::compiler::driver::compile_method(vm, k, method));
+            if let Some(id) = compiled {
+                // Re-point the calling site's `bl` (its return address is the
+                // anchored last_compiled_pc) — but ONLY a Mono site whose
+                // recorded klass is this receiver's: a Pic/Mega site's shared
+                // stub serves other klasses too and is left to its own
+                // machinery. The patched target is the FULL `entry` (klass
+                // guard included), same as rt_resolve_send's mono link.
+                if vm.code_table.find_by_pc(ret_addr).is_some() {
+                    let (caller_id, caller_code, site_off, site_idx, _sel2, _argc) =
+                        find_caller_site(vm, ret_addr);
+                    let site = &vm.code_table.get(caller_id).unwrap().ic_sites[site_idx];
+                    let is_mono_k = matches!(site.state, IcState::Mono { klass, .. } if klass == k);
+                    if is_mono_k && site.super_klass.is_none() {
+                        let nm = vm.code_table.get(id).expect("just compiled/looked up");
+                        let target = nm.code.base as u64 + nm.entry_off as u64;
+                        vm.code_cache
+                            .patch_branch26_at(caller_code, site_off, target);
+                        vm.code_table.get_mut(caller_id).unwrap().ic_sites[site_idx].state =
+                            IcState::Mono { klass: k, target };
+                    }
+                }
+            }
+        }
+    }
 
     result.raw()
 }

@@ -528,6 +528,13 @@ pub struct IrMethod {
     /// caller nmethod `NotEntrant`. Empty for a method that inlined nothing
     /// (keeps such methods' behaviour and goldens unchanged).
     pub inline_deps: Vec<(KlassOop, SymbolOop)>,
+    /// S14 step 5: true when a guard-free SELF-send inline was spliced, i.e.
+    /// this code is only correct for receivers of exactly the customization
+    /// klass. Super-send linking (`driver`'s pre-seed and `rt_resolve_send`'s
+    /// super arm) checks the copied `Nmethod.self_devirt` and links the c2i
+    /// adapter instead of `verified_entry` when set — a super site enters
+    /// with SUBCLASS receivers the entry guard never sees.
+    pub self_devirt: bool,
     /// S13: the physical oop-pool index holding THIS method's own compiled
     /// `MethodOop`, interned (as `RelocKind::Oop`, so a moving GC keeps it
     /// current) at the end of `convert` — but ONLY when the method has at
@@ -797,6 +804,20 @@ impl PoolBuilder {
 struct Translator<'a> {
     vm: &'a VmState,
     method: MethodOop,
+    /// S14 step 5 (customization, A3): the receiver klass K this compilation
+    /// is FOR. The nmethod's entry guard proves every receiver has exactly
+    /// this klass, so a send whose receiver is provably `self` dispatches
+    /// against K statically — resolved at compile time via
+    /// `resolve_method_ro(vm, rcvr_klass, selector)`, with no IC warmth
+    /// required and (within budget) a guard-free inline.
+    rcvr_klass: KlassOop,
+    /// S14 step 5: set when any guard-free SELF-send inline was spliced —
+    /// i.e. the emitted code's correctness depends on the receiver really
+    /// having klass `rcvr_klass`. A super-send site elsewhere links straight
+    /// to `verified_entry` (skipping the entry guard) with a SUBCLASS
+    /// receiver, so `driver`/`rt_resolve_send` must refuse the compiled link
+    /// (fall back to the c2i adapter) when this is set on the target.
+    self_devirt: bool,
     vregs: Vec<VRegInfo>,
     pool: PoolBuilder,
     self_vreg: VReg,
@@ -1055,6 +1076,28 @@ impl<'a> Translator<'a> {
     /// `inline::decide` (`SiteFeedback::Untaken`); Poly, Mega, mono-but-non-smi,
     /// and mono-smi-but-not-inlinable lower to an ordinary generic
     /// `Ir::CallSend`.
+    /// S14 step 5: the statically-resolved target of a SELF-send against the
+    /// known receiver klass `k` — `None` when devirtualization must NOT
+    /// apply: unresolvable selectors (the DNU path keeps its feedback
+    /// lowering), and SMI-FUSABLE primitives on a smi customization — the
+    /// feedback path's trap→warm→recompile cycle re-lowers those to fused
+    /// `SmiArith`/`SmiCmpVal`, which a devirtualized plain call would forfeit
+    /// for the nmethod's whole lifetime (review finding, this step).
+    fn devirt_self_target(
+        &self,
+        k: KlassOop,
+        selector: crate::oops::wrappers::SymbolOop,
+    ) -> Option<MethodOop> {
+        let target = crate::compiler::feedback::resolve_method_ro(self.vm, k, selector)?;
+        let smi_fusable = k.oop().raw() == self.vm.universe.smi_klass.oop().raw()
+            && crate::compiler::driver::SMI_INLINE.contains(&target.primitive());
+        if smi_fusable {
+            None
+        } else {
+            Some(target)
+        }
+    }
+
     fn is_smi_inlinable(&self, ic_idx: u16) -> bool {
         let ic = InterpreterIc::at(self.method, ic_idx);
         if ic.guard().raw() != self.vm.universe.smi_klass.oop().raw() {
@@ -1389,6 +1432,16 @@ impl<'a> Translator<'a> {
         code: &mut Vec<Ir>,
         deopt: &mut Vec<(u32, DeoptRaw)>,
     ) -> Option<NonLeafOutcome> {
+        // EXACT arm-set validation, not a caller courtesy: the body walk below
+        // cannot decline once the guard is emitted (its own `unreachable!`
+        // comment), and callers' budget gates are NOT shape-exact — e.g. a
+        // sendless `^[aBlock]` body is `is_leaf` (no sends) yet the leaf
+        // splicer declines it (PushClosure), which used to land it HERE and
+        // abort on the closure opcode (review finding — reachable through the
+        // warm-mono feedback path too, not just step-5 devirt).
+        if !crate::compiler::inline::is_inline_eligible_nonleaf(callee) {
+            return None;
+        }
         // Same MINIMUM viable shape as the leaf splice: a single straight-line
         // block ending in a return, arity matching. Validate against the CFG
         // BEFORE emitting anything. `is_inline_eligible_nonleaf` already proved
@@ -1424,6 +1477,19 @@ impl<'a> Translator<'a> {
         // Callee slots: args alias the send operands (no stores); temps become
         // fresh nil vregs. `receiver` is the callee's `self`.
         let callee_self = receiver;
+
+        // S14 step 5: the statically-proven klass of `callee_self` — the
+        // guard klass when this splice is receiver-guarded, or the
+        // customization klass when the receiver is the root method's own
+        // `self` (guard-free super/self splices, whose receiver the entry
+        // guard already checked). `None` cannot occur today (every
+        // guard-free splice passes a self receiver) but stays sound if it
+        // ever does: inner self-sends just keep their feedback lowering.
+        let callee_self_klass: Option<KlassOop> = match guard {
+            Some((gk, _)) => Some(gk),
+            None if receiver == self.self_vreg => Some(self.rcvr_klass),
+            None => None,
+        };
         let mut callee_slots: Vec<VReg> = Vec::with_capacity(callee.argc() + callee.ntemps());
         callee_slots.extend_from_slice(args);
 
@@ -1661,35 +1727,45 @@ impl<'a> Translator<'a> {
                         .pop()
                         .expect("inline splice: inner send missing receiver operand");
 
-                    if let crate::compiler::inline::InlineDecision::Trap =
-                        crate::compiler::inline::decide(&inner_fb)
-                    {
-                        // Cold inner send → terminating uncommon trap INSIDE the
-                        // inlined body, re-executing the inner send interpreted.
-                        // Its recorded operand stack is the inlined body's stack
-                        // WITH the inner send's receiver+args still present
-                        // (reexecute=true), plus the receiver+args just popped.
-                        let mut reexec_stack = cstack.clone();
-                        reexec_stack.push(inner_recv);
-                        reexec_stack.extend_from_slice(&inner_args);
-                        deopt.push((
-                            code.len() as u32,
-                            DeoptRaw {
-                                stack: reexec_stack,
-                                // Resume bci is the INNER send's bci in the
-                                // INLINED callee (the inlined frame's own resume
-                                // point); the caller frame's resume comes from
-                                // the SenderLink.
-                                bci: inner_bci,
-                                kind: SafepointKind::UncommonTrap,
-                                reexecute: true,
-                                stack_closures: Vec::new(),
-                                inline: Some(inline_proto.clone()),
-                            },
-                        ));
-                        code.push(Ir::UncommonTrap { bci: inner_bci });
-                        trapped = true;
-                        break;
+                    // S14 step 5: an inner SELF-send (receiver == the spliced
+                    // callee's own self) with a statically-known receiver klass
+                    // never traps cold — its target is fixed at compile time,
+                    // so an Empty IC just compiles as the plain lazy CallSend
+                    // below (no interpreted warm-up, no in-body deopt).
+                    let inner_static_self = inner_recv == callee_self
+                        && callee_self_klass
+                            .is_some_and(|k| self.devirt_self_target(k, inner_sel).is_some());
+                    if !inner_static_self {
+                        if let crate::compiler::inline::InlineDecision::Trap =
+                            crate::compiler::inline::decide(&inner_fb)
+                        {
+                            // Cold inner send → terminating uncommon trap INSIDE the
+                            // inlined body, re-executing the inner send interpreted.
+                            // Its recorded operand stack is the inlined body's stack
+                            // WITH the inner send's receiver+args still present
+                            // (reexecute=true), plus the receiver+args just popped.
+                            let mut reexec_stack = cstack.clone();
+                            reexec_stack.push(inner_recv);
+                            reexec_stack.extend_from_slice(&inner_args);
+                            deopt.push((
+                                code.len() as u32,
+                                DeoptRaw {
+                                    stack: reexec_stack,
+                                    // Resume bci is the INNER send's bci in the
+                                    // INLINED callee (the inlined frame's own resume
+                                    // point); the caller frame's resume comes from
+                                    // the SenderLink.
+                                    bci: inner_bci,
+                                    kind: SafepointKind::UncommonTrap,
+                                    reexecute: true,
+                                    stack_closures: Vec::new(),
+                                    inline: Some(inline_proto.clone()),
+                                },
+                            ));
+                            code.push(Ir::UncommonTrap { bci: inner_bci });
+                            trapped = true;
+                            break;
+                        }
                     }
 
                     // A real compiled send inside the inlined body. Its site is
@@ -1847,6 +1923,13 @@ impl<'a> Translator<'a> {
         blockarg: Option<(usize, MethodOop, u32)>,
     ) -> Option<(VReg, BlockId, BlockId)> {
         let _ = deopt; // caller-block deopt vec unused: guard cold path is its own block
+                       // Same exact-arm-set validation as `try_inline_nonleaf` (see the
+                       // comment there): the CFG walk aborts on shapes outside its arm list,
+                       // so this splicer proves its own eligibility instead of trusting the
+                       // caller's budget gate.
+        if !crate::compiler::inline::is_inline_eligible_cfg(callee) {
+            return None;
+        }
         let ccfg = crate::compiler::decode::decode(callee);
         if ccfg.blocks.is_empty() || callee.argc() != args.len() {
             return None;
@@ -1857,6 +1940,19 @@ impl<'a> Translator<'a> {
         debug_assert!(pre_pop_stack.len() >= n_operands);
         let caller_pending_stack = pre_pop_stack[..pre_pop_stack.len() - n_operands].to_vec();
         let callee_self = receiver;
+
+        // S14 step 5: the statically-proven klass of `callee_self` — the
+        // guard klass when this splice is receiver-guarded, or the
+        // customization klass when the receiver is the root method's own
+        // `self` (guard-free super/self splices, whose receiver the entry
+        // guard already checked). `None` cannot occur today (every
+        // guard-free splice passes a self receiver) but stays sound if it
+        // ever does: inner self-sends just keep their feedback lowering.
+        let callee_self_klass: Option<KlassOop> = match guard {
+            Some((gk, _)) => Some(gk),
+            None if receiver == self.self_vreg => Some(self.rcvr_klass),
+            None => None,
+        };
 
         // Guard fronting the whole extent (cold = reexecute the send in the
         // CALLER scope — `inline: None`, exactly the leaf/nonleaf convention).
@@ -2242,26 +2338,36 @@ impl<'a> Translator<'a> {
                             None => Vec::new(),
                         };
 
-                        if let crate::compiler::inline::InlineDecision::Trap =
-                            crate::compiler::inline::decide(&inner_fb)
-                        {
-                            let mut reexec_stack = cstack.clone();
-                            reexec_stack.push(inner_recv);
-                            reexec_stack.extend_from_slice(&inner_args);
-                            bdeopt.push((
-                                bcode.len() as u32,
-                                DeoptRaw {
-                                    stack: reexec_stack,
-                                    bci: inner_bci,
-                                    kind: SafepointKind::UncommonTrap,
-                                    reexecute: true,
-                                    stack_closures: ph_closures.clone(),
-                                    inline: Some(inline_proto.clone()),
-                                },
-                            ));
-                            bcode.push(Ir::UncommonTrap { bci: inner_bci });
-                            trapped = true;
-                            break;
+                        // S14 step 5: an inner SELF-send (receiver == the spliced
+                        // callee's own self) with a statically-known receiver klass
+                        // never traps cold — its target is fixed at compile time,
+                        // so an Empty IC just compiles as the plain lazy CallSend
+                        // below (no interpreted warm-up, no in-body deopt).
+                        let inner_static_self = inner_recv == callee_self
+                            && callee_self_klass
+                                .is_some_and(|k| self.devirt_self_target(k, inner_sel).is_some());
+                        if !inner_static_self {
+                            if let crate::compiler::inline::InlineDecision::Trap =
+                                crate::compiler::inline::decide(&inner_fb)
+                            {
+                                let mut reexec_stack = cstack.clone();
+                                reexec_stack.push(inner_recv);
+                                reexec_stack.extend_from_slice(&inner_args);
+                                bdeopt.push((
+                                    bcode.len() as u32,
+                                    DeoptRaw {
+                                        stack: reexec_stack,
+                                        bci: inner_bci,
+                                        kind: SafepointKind::UncommonTrap,
+                                        reexecute: true,
+                                        stack_closures: ph_closures.clone(),
+                                        inline: Some(inline_proto.clone()),
+                                    },
+                                ));
+                                bcode.push(Ir::UncommonTrap { bci: inner_bci });
+                                trapped = true;
+                                break;
+                            }
                         }
 
                         let mut send_args = vec![inner_recv];
@@ -2623,8 +2729,16 @@ impl<'a> Translator<'a> {
                 if let Some(target) =
                     crate::compiler::feedback::resolve_method_ro(self.vm, super_klass, selector)
                 {
+                    // Same shape gates as `decide_with_budget` (and the step-5
+                    // self-send devirt): a closure/ctx/super-bearing callee has
+                    // no splicer arm — without these the walk aborts on
+                    // `unreachable!` (review finding; pre-existing here, fixed
+                    // alongside step 5's identical gate).
                     if target.primitive() == 0
                         && crate::compiler::inline::inline_cost(target) <= budget.per_call_cost
+                        && (crate::compiler::inline::is_leaf(target)
+                            || crate::compiler::inline::is_inline_eligible_nonleaf(target)
+                            || crate::compiler::inline::is_inline_eligible_cfg(target))
                     {
                         let pre_pop_stack = {
                             let mut s = stack.clone();
@@ -2831,6 +2945,120 @@ impl<'a> Translator<'a> {
                     }
                 }
 
+                // S14 step 5 (customization, A3): SELF-send devirtualization.
+                // If the receiver is provably `self` — its stack slot holds
+                // `self_vreg` and is not an escape-mode PHANTOM filler (elided
+                // closures push `self_vreg` as a placeholder, shadowed by a
+                // `Some` entry in `stack_sites`) — the target is
+                // `lookup(rcvr_klass, selector)`, fixed at compile time: the
+                // nmethod's entry guard already proved the receiver klass.
+                // Static knowledge beats feedback (A1): a cheap target inlines
+                // GUARD-FREE exactly like a super send (the dep still recorded
+                // against K so redefinition invalidates); anything else stays a
+                // plain lazy `CallSend`, but the cold-IC TRAP below is skipped —
+                // a self-send needs no interpreted warm-up to know its target.
+                let self_send_target: Option<MethodOop> = {
+                    let ic_view = InterpreterIc::at(self.method, ic);
+                    let real_argc = ic_view.argc() as usize;
+                    stack
+                        .len()
+                        .checked_sub(real_argc + 1)
+                        .filter(|&rcvr_ix| {
+                            stack[rcvr_ix] == self.self_vreg
+                                && !(self.escape.is_some()
+                                    && stack_sites.get(rcvr_ix).is_some_and(|s| s.is_some()))
+                        })
+                        .and_then(|_| self.devirt_self_target(self.rcvr_klass, ic_view.selector()))
+                };
+                if let Some(target) = self_send_target {
+                    let ic_view = InterpreterIc::at(self.method, ic);
+                    let selector = ic_view.selector();
+                    let real_argc = ic_view.argc();
+                    let budget = crate::compiler::inline::budget_for_level(self.level);
+                    // Shape gates mirror `decide_with_budget` exactly: the
+                    // splicers' body walks have no arms for closures /
+                    // ctx-temps / super sends and would abort (or, for a
+                    // release-mode super send, silently miscompile) on a
+                    // callee the eligibility fns reject (review finding).
+                    if target.primitive() == 0
+                        && crate::compiler::inline::inline_cost(target) <= budget.per_call_cost
+                        && (crate::compiler::inline::is_leaf(target)
+                            || crate::compiler::inline::is_inline_eligible_nonleaf(target)
+                            || crate::compiler::inline::is_inline_eligible_cfg(target))
+                    {
+                        let pre_pop_stack = stack.clone();
+                        let mut real_args: Vec<VReg> = (0..real_argc)
+                            .map(|_| stack.pop().expect("self send: missing arg operand"))
+                            .collect();
+                        real_args.reverse();
+                        let receiver = stack.pop().expect("self send: missing receiver operand");
+                        debug_assert_eq!(receiver, self.self_vreg);
+                        if let Some(result) = self.try_inline_leaf(
+                            target,
+                            None,
+                            self.rcvr_klass,
+                            selector,
+                            receiver,
+                            &real_args,
+                            bci,
+                            &pre_pop_stack,
+                            code,
+                        ) {
+                            self.self_devirt = true;
+                            stack.push(result);
+                            return split;
+                        }
+                        match self.try_inline_nonleaf(
+                            target,
+                            None,
+                            self.rcvr_klass,
+                            selector,
+                            receiver,
+                            &real_args,
+                            bci,
+                            &pre_pop_stack,
+                            code,
+                            deopt,
+                        ) {
+                            Some(NonLeafOutcome::Value(result)) => {
+                                self.self_devirt = true;
+                                stack.push(result);
+                                return split;
+                            }
+                            Some(NonLeafOutcome::Trapped) => {
+                                self.self_devirt = true;
+                                *trapped = true;
+                                return split;
+                            }
+                            None => {}
+                        }
+                        if let Some((result, entry_id, continuation_id)) = self.try_inline_cfg(
+                            target,
+                            None,
+                            self.rcvr_klass,
+                            selector,
+                            receiver,
+                            &real_args,
+                            bci,
+                            &pre_pop_stack,
+                            code,
+                            deopt,
+                            None,
+                        ) {
+                            self.self_devirt = true;
+                            stack.push(result);
+                            debug_assert!(self.pending_jump_target.is_none());
+                            self.pending_jump_target = Some(entry_id);
+                            return Some(continuation_id);
+                        }
+                        // No splicer took it: restore the operands and fall
+                        // through to the plain-CallSend tail below (which pops
+                        // them again itself).
+                        stack.push(receiver);
+                        stack.extend_from_slice(&real_args);
+                    }
+                }
+
                 // S14 step 3: consult the site's type feedback (read here,
                 // parallel to S14 step 2's own `read_send_site` call) BEFORE
                 // touching the operand stack. An `Untaken` site (IC still
@@ -2840,59 +3068,64 @@ impl<'a> Translator<'a> {
                 // executed interpreted, so there is no target to speculate on.
                 // Everything else (`Mono`/`Poly`/`Mega`) stays a plain generic
                 // `Ir::CallSend` (method/poly INLINING is S14 steps 4/6).
+                // S14 step 5: a devirtualized self-send never traps — its
+                // target is static, so a cold IC just means the site compiles
+                // as the lazy `CallSend` below and resolves on first call.
                 let feedback =
                     crate::compiler::feedback::read_send_site(self.vm, self.method, ic, None);
-                if let crate::compiler::inline::InlineDecision::Trap =
-                    crate::compiler::inline::decide(&feedback)
-                {
-                    // The trap re-executes the WHOLE send in the interpreter
-                    // (reexecute=true at THIS send's own bci), which populates
-                    // the IC and returns the identical result — so the recorded
-                    // operand stack must be the state BEFORE the send's pops,
-                    // with the receiver + all args STILL PRESENT (snapshot
-                    // `stack` HERE, before any pop below). Same
-                    // reexecute-stack convention as the smi-overflow /
-                    // basicNew-alloc / loop-poll sites; `regalloc::deopt_live`
-                    // forces every recorded vreg live-across the trap so
-                    // spill-all pins it to a frame slot the deopt materializer
-                    // reads.
-                    //
-                    // We push NEITHER a `CallSiteInfo` NOR a `site_feedback`
-                    // entry for a trapped site: it never dispatches, so it owns
-                    // no `Ir::CallSend.site` index (the `call_sites`/
-                    // `site_feedback` vecs stay parallel, indexed by real send
-                    // sites only). And we push no `dst`: control leaves the
-                    // method via the trap, so nothing after it in this block is
-                    // reachable — `trapped` tells `convert` to finish the block
-                    // here and skip the rest.
-                    //
-                    // INTERIM DEOPT-STORM (documented, NOT solved here): an
-                    // EXECUTED trap re-executes the send interpreted and warms
-                    // the IC, but this nmethod stays Alive with the trap still
-                    // compiled, so the NEXT call re-traps — a storm until the
-                    // method is recompiled with the now-warm feedback. That
-                    // recompile-on-trap loop is S14 step 8 (recompile.rs) and
-                    // needs `trap_counts` / `UNCOMMON_TRAP_LIMIT`, which S13
-                    // never built. Step 3 accepts the storm: it is
-                    // CORRECTNESS-PRESERVING (every trap re-executes the send
-                    // exactly, identical output) — just slow, and bounded per
-                    // run by the call count. No trap counting / recompilation
-                    // is implemented here.
-                    let reexec_stack = stack.clone();
-                    deopt.push((
-                        code.len() as u32,
-                        DeoptRaw {
-                            stack: reexec_stack,
-                            bci,
-                            kind: SafepointKind::UncommonTrap,
-                            reexecute: true,
-                            stack_closures: Vec::new(),
-                            inline: None,
-                        },
-                    ));
-                    code.push(Ir::UncommonTrap { bci });
-                    *trapped = true;
-                    return split; // (always None on the trap path)
+                if self_send_target.is_none() {
+                    if let crate::compiler::inline::InlineDecision::Trap =
+                        crate::compiler::inline::decide(&feedback)
+                    {
+                        // The trap re-executes the WHOLE send in the interpreter
+                        // (reexecute=true at THIS send's own bci), which populates
+                        // the IC and returns the identical result — so the recorded
+                        // operand stack must be the state BEFORE the send's pops,
+                        // with the receiver + all args STILL PRESENT (snapshot
+                        // `stack` HERE, before any pop below). Same
+                        // reexecute-stack convention as the smi-overflow /
+                        // basicNew-alloc / loop-poll sites; `regalloc::deopt_live`
+                        // forces every recorded vreg live-across the trap so
+                        // spill-all pins it to a frame slot the deopt materializer
+                        // reads.
+                        //
+                        // We push NEITHER a `CallSiteInfo` NOR a `site_feedback`
+                        // entry for a trapped site: it never dispatches, so it owns
+                        // no `Ir::CallSend.site` index (the `call_sites`/
+                        // `site_feedback` vecs stay parallel, indexed by real send
+                        // sites only). And we push no `dst`: control leaves the
+                        // method via the trap, so nothing after it in this block is
+                        // reachable — `trapped` tells `convert` to finish the block
+                        // here and skip the rest.
+                        //
+                        // INTERIM DEOPT-STORM (documented, NOT solved here): an
+                        // EXECUTED trap re-executes the send interpreted and warms
+                        // the IC, but this nmethod stays Alive with the trap still
+                        // compiled, so the NEXT call re-traps — a storm until the
+                        // method is recompiled with the now-warm feedback. That
+                        // recompile-on-trap loop is S14 step 8 (recompile.rs) and
+                        // needs `trap_counts` / `UNCOMMON_TRAP_LIMIT`, which S13
+                        // never built. Step 3 accepts the storm: it is
+                        // CORRECTNESS-PRESERVING (every trap re-executes the send
+                        // exactly, identical output) — just slow, and bounded per
+                        // run by the call count. No trap counting / recompilation
+                        // is implemented here.
+                        let reexec_stack = stack.clone();
+                        deopt.push((
+                            code.len() as u32,
+                            DeoptRaw {
+                                stack: reexec_stack,
+                                bci,
+                                kind: SafepointKind::UncommonTrap,
+                                reexecute: true,
+                                stack_closures: Vec::new(),
+                                inline: None,
+                            },
+                        ));
+                        code.push(Ir::UncommonTrap { bci });
+                        *trapped = true;
+                        return split; // (always None on the trap path)
+                    }
                 }
 
                 let ic_view = InterpreterIc::at(self.method, ic);
@@ -2909,8 +3142,18 @@ impl<'a> Translator<'a> {
                 // records — snapshot it BEFORE popping.
                 let budget = crate::compiler::inline::budget_for_level(self.level);
                 let smi_bits = self.vm.universe.smi_klass.oop().raw();
-                if let crate::compiler::inline::InlineDecision::Inline { callee, guard } =
+                // S14 step 5: devirtualized self-sends skip the feedback-driven
+                // inline too — the devirt block above already tried the same
+                // splicers guard-free, and a shared method's IC may have
+                // observed a DIFFERENT customization's receiver klass, so a
+                // guarded inline here would fail its guard on every call.
+                let feedback_inline = if self_send_target.is_none() {
                     crate::compiler::inline::decide_with_budget(&feedback, &budget, smi_bits)
+                } else {
+                    crate::compiler::inline::InlineDecision::Call
+                };
+                if let crate::compiler::inline::InlineDecision::Inline { callee, guard } =
+                    feedback_inline
                 {
                     let guard_shape = match guard {
                         crate::compiler::inline::GuardKind::SmiTest => GuardShape::SmiTest,
@@ -3453,6 +3696,14 @@ impl<'a> Translator<'a> {
         code: &mut Vec<Ir>,
         deopt: &mut Vec<(u32, DeoptRaw)>,
     ) -> Result<VReg, ()> {
+        // S14 step 5: a spliced block's home self is the ROOT method's own
+        // `self` whenever `block_self == self_vreg` (the only shape today),
+        // so its klass is statically the customization klass.
+        let block_self_klass: Option<KlassOop> = if block_self == self.self_vreg {
+            Some(self.rcvr_klass)
+        } else {
+            None
+        };
         let mut bstack: Vec<VReg> = Vec::new();
         let mut result: Option<VReg> = None;
         let mut trapped = false;
@@ -3653,29 +3904,39 @@ impl<'a> Translator<'a> {
                         .pop()
                         .expect("block splice: inner send missing receiver operand");
 
-                    if let crate::compiler::inline::InlineDecision::Trap =
-                        crate::compiler::inline::decide(&inner_fb)
-                    {
-                        // Cold inner send → terminating trap re-executing it
-                        // interpreted. Recorded stack has the receiver+args still
-                        // present (reexecute=true), in the BLOCK's own scope.
-                        let mut reexec_stack = bstack.clone();
-                        reexec_stack.push(inner_recv);
-                        reexec_stack.extend_from_slice(&inner_args);
-                        deopt.push((
-                            code.len() as u32,
-                            DeoptRaw {
-                                stack: reexec_stack,
-                                bci: inner_bci,
-                                kind: SafepointKind::UncommonTrap,
-                                reexecute: true,
-                                stack_closures: Vec::new(),
-                                inline: Some(inline_proto.clone()),
-                            },
-                        ));
-                        code.push(Ir::UncommonTrap { bci: inner_bci });
-                        trapped = true;
-                        break;
+                    // S14 step 5: an inner SELF-send (receiver == the spliced
+                    // callee's own self) with a statically-known receiver klass
+                    // never traps cold — its target is fixed at compile time,
+                    // so an Empty IC just compiles as the plain lazy CallSend
+                    // below (no interpreted warm-up, no in-body deopt).
+                    let inner_static_self = inner_recv == block_self
+                        && block_self_klass
+                            .is_some_and(|k| self.devirt_self_target(k, inner_sel).is_some());
+                    if !inner_static_self {
+                        if let crate::compiler::inline::InlineDecision::Trap =
+                            crate::compiler::inline::decide(&inner_fb)
+                        {
+                            // Cold inner send → terminating trap re-executing it
+                            // interpreted. Recorded stack has the receiver+args still
+                            // present (reexecute=true), in the BLOCK's own scope.
+                            let mut reexec_stack = bstack.clone();
+                            reexec_stack.push(inner_recv);
+                            reexec_stack.extend_from_slice(&inner_args);
+                            deopt.push((
+                                code.len() as u32,
+                                DeoptRaw {
+                                    stack: reexec_stack,
+                                    bci: inner_bci,
+                                    kind: SafepointKind::UncommonTrap,
+                                    reexecute: true,
+                                    stack_closures: Vec::new(),
+                                    inline: Some(inline_proto.clone()),
+                                },
+                            ));
+                            code.push(Ir::UncommonTrap { bci: inner_bci });
+                            trapped = true;
+                            break;
+                        }
                     }
 
                     let mut send_args = vec![inner_recv];
@@ -4144,7 +4405,7 @@ pub(crate) fn copy_propagate(m: &mut IrMethod) {
     }
 }
 
-pub fn convert(vm: &VmState, method: MethodOop, cfg: &Cfg) -> IrMethod {
+pub fn convert(vm: &VmState, rcvr_klass: KlassOop, method: MethodOop, cfg: &Cfg) -> IrMethod {
     let (entry_depth, _max_stack_depth) = compute_entry_depths(method, cfg);
     let sources = entry_stack_sources(cfg, &entry_depth);
 
@@ -4176,6 +4437,8 @@ pub fn convert(vm: &VmState, method: MethodOop, cfg: &Cfg) -> IrMethod {
     let mut t = Translator {
         vm,
         method,
+        rcvr_klass,
+        self_devirt: false,
         vregs,
         pool: PoolBuilder::new(),
         self_vreg,
@@ -4651,6 +4914,7 @@ pub fn convert(vm: &VmState, method: MethodOop, cfg: &Cfg) -> IrMethod {
         call_sites: t.call_sites,
         site_feedback: t.site_feedback,
         inline_deps: t.inline_deps,
+        self_devirt: t.self_devirt,
         method_pool_ix,
     };
     copy_propagate(&mut irm);
@@ -4728,7 +4992,7 @@ mod tests {
         // call_site, no site_feedback entry, but ONE UncommonTrap deopt site.
         {
             let cfg = decode::decode(method);
-            let ir = convert(&vm, method, &cfg);
+            let ir = convert(&vm, vm.universe.smi_klass, method, &cfg);
             assert_eq!(
                 ir.site_feedback.len(),
                 ir.call_sites.len(),
@@ -4756,7 +5020,7 @@ mod tests {
         let epoch = vm.ic_epoch;
         InterpreterIc::at(method, 0).set_mono(&mut vm, klass, target, epoch);
         let cfg = decode::decode(method);
-        let ir = convert(&vm, method, &cfg);
+        let ir = convert(&vm, vm.universe.smi_klass, method, &cfg);
         assert_eq!(
             ir.call_sites.len(),
             1,
@@ -4810,7 +5074,7 @@ mod tests {
         InterpreterIc::at(method, 0).set_mono(&mut vm, recv_klass, val, epoch);
 
         let cfg = decode::decode(method);
-        let ir = convert(&vm, method, &cfg);
+        let ir = convert(&vm, vm.universe.smi_klass, method, &cfg);
 
         // No CallSend for the inlined site.
         assert_eq!(ir.call_sites.len(), 0, "inlined leaf → no CallSend");
@@ -4882,7 +5146,7 @@ mod tests {
         InterpreterIc::at(method, 0).set_mono(&mut vm, smi_klass, id_method, epoch);
 
         let cfg = decode::decode(method);
-        let ir = convert(&vm, method, &cfg);
+        let ir = convert(&vm, vm.universe.smi_klass, method, &cfg);
         assert_eq!(ir.call_sites.len(), 0, "^self inlined, no CallSend");
         let smi_guards = ir
             .blocks
@@ -4930,7 +5194,7 @@ mod tests {
         ic.set_mono(&mut vm, smi_klass, plus_method, epoch);
 
         let cfg = decode::decode(method);
-        let ir = convert(&vm, method, &cfg);
+        let ir = convert(&vm, vm.universe.smi_klass, method, &cfg);
 
         let (fail, a, b_) = ir.blocks[0]
             .code
@@ -5023,7 +5287,7 @@ mod tests {
         ic.set_mono(&mut vm, smi_klass, lt_method, epoch);
 
         let cfg = decode::decode(method);
-        let ir = convert(&vm, method, &cfg);
+        let ir = convert(&vm, vm.universe.smi_klass, method, &cfg);
 
         let block0 = &ir.blocks[0];
         assert!(
@@ -5063,7 +5327,7 @@ mod tests {
         let method = b.finish(&mut vm, sel, 0, 0);
 
         let cfg = decode::decode(method);
-        let ir = convert(&vm, method, &cfg);
+        let ir = convert(&vm, vm.universe.smi_klass, method, &cfg);
 
         // Same block layout as decode::tests::leaders_if_else: 0=condition,
         // 1=true arm, 2=false arm, 3=merge.
@@ -5104,7 +5368,7 @@ mod tests {
         let method = b.finish(&mut vm, sel, 0, 0);
 
         let cfg = decode::decode(method);
-        let ir = convert(&vm, method, &cfg);
+        let ir = convert(&vm, vm.universe.smi_klass, method, &cfg);
 
         // 2 real blocks (push+jump, then the target) -- S11 step 7: no
         // extra synthetic block anymore unless one is actually NEEDED (a
@@ -5153,7 +5417,7 @@ mod tests {
         let method = b.finish(&mut vm, sel, 0, 1);
 
         let cfg = decode::decode(method);
-        let ir = convert(&vm, method, &cfg);
+        let ir = convert(&vm, vm.universe.smi_klass, method, &cfg);
 
         let stored_vreg = ir.blocks[0]
             .code

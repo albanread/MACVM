@@ -148,6 +148,7 @@ fn run_ir_raw() {
         call_sites: Vec::new(),
         site_feedback: Vec::new(),
         inline_deps: Vec::new(),
+        self_devirt: false,
         method_pool_ix: None,
     };
 
@@ -270,6 +271,7 @@ fn mul_method() -> IrMethod {
         call_sites: Vec::new(),
         site_feedback: Vec::new(),
         inline_deps: Vec::new(),
+        self_devirt: false,
         method_pool_ix: None,
     }
 }
@@ -391,6 +393,7 @@ fn run_ir_raw_forces_spill() {
         call_sites: Vec::new(),
         site_feedback: Vec::new(),
         inline_deps: Vec::new(),
+        self_devirt: false,
         method_pool_ix: None,
     };
 
@@ -818,16 +821,18 @@ fn compiled_untaken_send_traps_and_reexecutes() {
         fb.ret_tos();
         fb.finish(&mut vm, foo_sel, 1, 0)
     };
-    install_method(&mut vm, smi_klass, foo_sel, foo_target);
-
     // The site's IC is LEFT EMPTY (never dispatched) — Untaken. Previously this
     // returned `NoRetryLater` and `compile_method` declined; now it compiles as
-    // a trap.
+    // a trap. S14 step 5: `foo:` is installed only AFTER the compile — a
+    // resolvable SELF-send would otherwise devirtualize statically and never
+    // trap at all (the step-5 behavior its own tests cover); this test is
+    // specifically about the step-3 trap path.
     assert!(
         driver::eligible(&vm, method),
         "an Untaken generic send is now eligible (compiles as a trap)"
     );
     let id = driver::compile_method(&mut vm, smi_klass, method).expect("must compile now");
+    install_method(&mut vm, smi_klass, foo_sel, foo_target);
     assert!(
         !vm.code_table
             .get(id)
@@ -1512,7 +1517,9 @@ fn compile_and_get_listing(vm: &VmState, method: MethodOop) -> String {
         "golden method must be eligible (was it called enough times to warm its own inner ICs?)"
     );
     let cfg = macvm::compiler::decode::decode(method);
-    let ir = macvm::compiler::ir::convert(vm, method, &cfg);
+    let holder = KlassOop::try_from(method.holder())
+        .expect("golden methods are frontend-loaded, holder always set");
+    let ir = macvm::compiler::ir::convert(vm, holder, method, &cfg);
     let ra = regalloc::regalloc(&ir);
     let mut asm = JasmAssembler::new();
     // None: this helper predates S11's guard and backs the already-committed
@@ -2332,6 +2339,7 @@ fn mono_resolve_patches_call_site_and_dispatches() {
         }],
         site_feedback: Vec::new(),
         inline_deps: Vec::new(),
+        self_devirt: false,
         method_pool_ix: None,
     };
     let ra = regalloc::regalloc(&caller_method);
@@ -2387,6 +2395,7 @@ fn mono_resolve_patches_call_site_and_dispatches() {
         deopt_scopes: Vec::new(),
         deopt_pcdescs: Vec::new(),
         inline_deps: Vec::new(),
+        self_devirt: false,
     };
     let caller_id = vm.code_table.install(caller_nm);
     let caller_entry = h.base as u64; // entry_off == verified_entry_off == 0 (no guard, `None`)
@@ -2497,6 +2506,7 @@ fn build_c2i_scenario(vm: &mut VmState) -> (u64, KlassOop, NmethodId) {
         }],
         site_feedback: Vec::new(),
         inline_deps: Vec::new(),
+        self_devirt: false,
         method_pool_ix: None,
     };
     let ra = regalloc::regalloc(&caller_method);
@@ -2552,6 +2562,7 @@ fn build_c2i_scenario(vm: &mut VmState) -> (u64, KlassOop, NmethodId) {
         deopt_scopes: Vec::new(),
         deopt_pcdescs: Vec::new(),
         inline_deps: Vec::new(),
+        self_devirt: false,
     };
     let caller_id = vm.code_table.install(caller_nm);
     let caller_entry = h.base as u64; // entry_off == verified_entry_off == 0 (no guard, `None`)
@@ -2726,6 +2737,7 @@ fn full_ic_lattice_mono_to_pic_to_mega() {
         }],
         site_feedback: Vec::new(),
         inline_deps: Vec::new(),
+        self_devirt: false,
         method_pool_ix: None,
     };
     let ra = regalloc::regalloc(&caller_method);
@@ -2781,6 +2793,7 @@ fn full_ic_lattice_mono_to_pic_to_mega() {
         deopt_scopes: Vec::new(),
         deopt_pcdescs: Vec::new(),
         inline_deps: Vec::new(),
+        self_devirt: false,
     };
     let caller_id = vm.code_table.install(caller_nm);
     let caller_entry = h.base as u64;
@@ -2949,6 +2962,7 @@ fn dnu_from_compiled_code_reaches_does_not_understand() {
         }],
         site_feedback: Vec::new(),
         inline_deps: Vec::new(),
+        self_devirt: false,
         method_pool_ix: None,
     };
     let ra = regalloc::regalloc(&caller_method);
@@ -3004,6 +3018,7 @@ fn dnu_from_compiled_code_reaches_does_not_understand() {
         deopt_scopes: Vec::new(),
         deopt_pcdescs: Vec::new(),
         inline_deps: Vec::new(),
+        self_devirt: false,
     };
     let caller_id = vm.code_table.install(caller_nm);
     let caller_entry = h.base as u64;
@@ -3335,7 +3350,7 @@ fn allocation_fast_and_slow() {
 
     // The detection must fire: an inline Ir::Alloc, not a generic CallSend.
     let cfg = decode::decode(method);
-    let ir_method = ir::convert(&vm, method, &cfg);
+    let ir_method = ir::convert(&vm, vm.universe.smi_klass, method, &cfg);
     assert!(
         ir_method
             .blocks
@@ -3613,7 +3628,7 @@ fn deopt_resolve_frame_loc_from_real_regalloc() {
     InterpreterIc::at(method, 1).set_mono(&mut vm, obj_klass, baz_target, epoch);
 
     let cfg = decode::decode(method);
-    let ir = ir::convert(&vm, method, &cfg);
+    let ir = ir::convert(&vm, vm.universe.smi_klass, method, &cfg);
     let ra = regalloc::regalloc(&ir);
 
     assert!(
@@ -3916,7 +3931,7 @@ fn redefining_inlined_callee_invalidates_caller() {
 fn nonleaf_inline_scenario(
     vm: &mut VmState,
     warm_bar: bool,
-) -> (KlassOop, SymbolOop, SymbolOop, MethodOop) {
+) -> (KlassOop, SymbolOop, SymbolOop, MethodOop, MethodOop) {
     let recv_klass = vm.universe.new_klass(
         vm.universe.object_klass,
         "S14NonLeafRecv",
@@ -3932,7 +3947,6 @@ fn nonleaf_inline_scenario(
         bb.ret_tos();
         bb.finish(vm, bar_sel, 0, 0)
     };
-    install_method(vm, recv_klass, bar_sel, bar);
 
     // `run [ ^self bar ]` — a NON-leaf helper (one inner send).
     let run_sel = vm.universe.intern(b"run");
@@ -3962,7 +3976,12 @@ fn nonleaf_inline_scenario(
     // Warm the `x run` site to Mono on `recv_klass` (its real target).
     let epoch = vm.ic_epoch;
     InterpreterIc::at(outer, 0).set_mono(vm, recv_klass, run, epoch);
-    (recv_klass, run_sel, bar_sel, outer)
+    // S14 step 5: `bar` is NOT installed here — the caller installs it AFTER
+    // compiling, so the compile cannot statically resolve the inlined body's
+    // `self bar` (the step-5 trap-skip would otherwise defeat the
+    // cold-inner-send deopt scenario this helper exists to set up). Runtime
+    // dispatch / interpreted re-execution happen after the caller's install.
+    (recv_klass, run_sel, bar_sel, bar, outer)
 }
 
 /// S14 step 4c (a): the NON-LEAF inlined DIFFERENTIAL. `outer: x [ ^x run ]`
@@ -3974,7 +3993,7 @@ fn nonleaf_inline_scenario(
 fn compiled_inlined_nonleaf_matches_interpreter() {
     let mut vm = test_vm();
     let smi_klass = vm.universe.smi_klass;
-    let (recv_klass, _run_sel, _bar_sel, outer) = nonleaf_inline_scenario(&mut vm, true);
+    let (recv_klass, _run_sel, bar_sel, bar, outer) = nonleaf_inline_scenario(&mut vm, true);
 
     // Compile `outer:` customized for SmallInteger (self is a smi; the inlined
     // send's receiver is the ARG `x`). Eligible: its one send is a mono callee
@@ -3984,6 +4003,7 @@ fn compiled_inlined_nonleaf_matches_interpreter() {
         "a mono non-leaf send must be eligible (it inlines)"
     );
     let id = driver::compile_method(&mut vm, smi_klass, outer).expect("must compile");
+    install_method(&mut vm, recv_klass, bar_sel, bar);
 
     // The `x run` send was inlined: it records NO IcSite of its own; the
     // inlined body's inner `self bar` send DID emit one real compiled IC site
@@ -4058,13 +4078,14 @@ fn deopt_through_inlined_nonleaf_body_rebuilds_both_frames() {
     let smi_klass = vm.universe.smi_klass;
     // warm_bar = false → the helper's inner `self bar` stays Untaken → an
     // in-body trap once inlined.
-    let (recv_klass, _run_sel, _bar_sel, outer) = nonleaf_inline_scenario(&mut vm, false);
+    let (recv_klass, _run_sel, bar_sel, bar, outer) = nonleaf_inline_scenario(&mut vm, false);
 
     assert!(
         driver::eligible(&vm, outer),
         "a mono non-leaf send (whose inner send is a cold trap) is still eligible"
     );
     let id = driver::compile_method(&mut vm, smi_klass, outer).expect("must compile");
+    install_method(&mut vm, recv_klass, bar_sel, bar);
 
     // The inlined body's inner send is an uncommon TRAP (Untaken), not a
     // CallSend → the nmethod records NO compiled IC site, but DOES record the
@@ -4130,7 +4151,8 @@ fn deopt_through_inlined_nonleaf_body_rebuilds_both_frames() {
 fn redefining_inlined_nonleaf_callee_invalidates_caller() {
     let mut vm = test_vm();
     let smi_klass = vm.universe.smi_klass;
-    let (recv_klass, run_sel, _bar_sel, outer) = nonleaf_inline_scenario(&mut vm, true);
+    let (recv_klass, run_sel, bar_sel, bar, outer) = nonleaf_inline_scenario(&mut vm, true);
+    install_method(&mut vm, recv_klass, bar_sel, bar);
     let id = driver::compile_method(&mut vm, smi_klass, outer).expect("must compile");
     assert!(
         matches!(vm.code_table.get(id).unwrap().state, NmState::Alive),
@@ -4631,7 +4653,6 @@ fn compiled_captured_temp_deopt_materializes_context() {
         pb.ret_self();
         pb.finish(&mut vm, poke_sel, 0, 0)
     };
-    install_method(&mut vm, smi_klass, poke_sel, poke);
 
     // `foo [ |x| x := 7. [x] value. self poke. ^x ]` (self is a smi).
     let sel = vm.universe.intern(b"foo");
@@ -4659,6 +4680,9 @@ fn compiled_captured_temp_deopt_materializes_context() {
     // warm `self poke` to Mono (→ inlined leaf, no trap). Compiling with the IC
     // still Empty keeps it Untaken → the cold trap this test's deopt needs.
     let id = driver::compile_method(&mut vm, smi_klass, m).expect("must compile");
+    // S14 step 5: installed after the compile so the cold `self poke` stays
+    // statically unresolvable and still lowers to the trap this test needs.
+    install_method(&mut vm, smi_klass, poke_sel, poke);
     let interp = macvm::interpreter::run_method(&mut vm, m, self_smi, &[]);
     assert_eq!(interp.raw(), SmallInt::new(7).oop().raw());
 
@@ -4889,7 +4913,7 @@ fn convert_nonfused_boolbr_into_merge() {
         "branchy boolean-temp method is eligible"
     );
     let cfg = decode::decode(m);
-    let ir = macvm::compiler::ir::convert(&vm, m, &cfg);
+    let ir = macvm::compiler::ir::convert(&vm, vm.universe.smi_klass, m, &cfg);
     assert!(!ir.blocks.is_empty());
 
     // And the differential: interp vs compiled, both polarities.
@@ -5555,7 +5579,6 @@ fn recompile_on_trap_closes_the_deopt_storm() {
         pb.ret_tos();
         pb.finish(&mut vm, poke_sel, 0, 0)
     };
-    install_method(&mut vm, smi_klass, poke_sel, poke);
     // `pk [ ^self poke ]` — the IC stays EMPTY (never run interpreted).
     let pk_sel = vm.universe.intern(b"pk");
     let mut b = BytecodeBuilder::new();
@@ -5565,7 +5588,12 @@ fn recompile_on_trap_closes_the_deopt_storm() {
     let pk = b.finish(&mut vm, pk_sel, 0, 0);
     install_method(&mut vm, smi_klass, pk_sel, pk);
 
+    // S14 step 5: install `poke` only AFTER compiling `pk` — a resolvable
+    // self-send would devirtualize (inline guard-free) and never trap, but
+    // this test exists to prove the trap→recompile storm-closer. The runtime
+    // re-execution (and the v1 recompile) still see it installed.
     let id = driver::compile_method(&mut vm, smi_klass, pk).expect("must compile (trap)");
+    install_method(&mut vm, smi_klass, poke_sel, poke);
     let self_smi = SmallInt::new(9).oop();
     let call: CallStubFn = unsafe { std::mem::transmute(vm.stubs.call_stub_entry()) };
 
@@ -5800,4 +5828,341 @@ fn super_send_inlines_static_target() {
         SmallInt::new(77).oop().raw(),
         "guard-free inlined super send returns the BASE implementation (skipping the override)"
     );
+}
+
+// ── S14 step 5: customization + self-send devirtualization ────────────────
+
+/// A self-send to a cheap installed target devirtualizes: statically resolved
+/// against the customization klass, inlined with NO guard and NO IC site, the
+/// `(K, selector)` dependency recorded, and `self_devirt` set on the nmethod
+/// (super linking must c2i such a target). Differential vs the interpreter.
+#[test]
+fn self_send_devirt_inlines_guard_free() {
+    let mut vm = test_vm();
+    let object_klass = vm.universe.object_klass;
+    let k = vm.universe.new_klass(
+        object_klass,
+        "S14SelfRecv",
+        Format::Slots,
+        false,
+        HEADER_WORDS + 1,
+    );
+
+    // `acc [ ^instvar0 ]` — installed BEFORE the compile: the whole point is
+    // that a self-send needs no IC warmth, only a resolvable target.
+    let acc_sel = vm.universe.intern(b"acc");
+    let acc = {
+        let mut ab = BytecodeBuilder::new();
+        ab.push_instvar(0);
+        ab.ret_tos();
+        ab.finish(&mut vm, acc_sel, 0, 0)
+    };
+    install_method(&mut vm, k, acc_sel, acc);
+
+    // `m [ ^self acc ]` — its IC is LEFT EMPTY (never run interpreted): the
+    // pre-step-5 pipeline would lower this to an uncommon trap.
+    let m_sel = vm.universe.intern(b"m");
+    let mut b = BytecodeBuilder::new();
+    b.push_self();
+    b.send(&mut vm, acc_sel, 0);
+    b.ret_tos();
+    let m = b.finish(&mut vm, m_sel, 0, 0);
+    install_method(&mut vm, k, m_sel, m);
+
+    let id = driver::compile_method(&mut vm, k, m).expect("must compile");
+    {
+        let nm = vm.code_table.get(id).expect("installed");
+        assert!(
+            nm.ic_sites.is_empty(),
+            "the self-send was devirtualized+inlined: no compiled IC site"
+        );
+        assert_eq!(nm.inline_deps.len(), 1, "one (K, acc) inline dependency");
+        assert_eq!(nm.inline_deps[0].0.oop().raw(), k.oop().raw());
+        assert_eq!(nm.inline_deps[0].1.oop().raw(), acc_sel.oop().raw());
+        assert!(
+            nm.self_devirt,
+            "a guard-free self-send inline marks the nmethod self_devirt"
+        );
+    }
+
+    // No GuardKlass anywhere in the IR (the entry guard is the only check).
+    let cfg = decode::decode(m);
+    let ir = macvm::compiler::ir::convert(&vm, k, m, &cfg);
+    for blk in &ir.blocks {
+        for op in &blk.code {
+            assert!(
+                !matches!(op, macvm::compiler::ir::Ir::GuardKlass { .. }),
+                "self-send inline must be guard-free"
+            );
+        }
+    }
+
+    // Differential: instvar0 = 4242.
+    let recv = alloc::alloc_slots(&mut vm, k).oop();
+    MemOop::try_from(recv)
+        .unwrap()
+        .set_body_oop(0, SmallInt::new(4242).oop());
+    let interp = macvm::interpreter::run_method(&mut vm, m, recv, &[]);
+    let nm = vm.code_table.get(id).expect("installed");
+    let entry = unsafe { nm.code.base.add(nm.entry_off as usize) } as u64;
+    let call: CallStubFn = unsafe { std::mem::transmute(vm.stubs.call_stub_entry()) };
+    let vm_ptr: *mut VmState = &mut vm;
+    let result = unsafe { call(entry, vm_ptr, [recv.raw()].as_ptr(), 1) };
+    assert_eq!(result, interp.raw());
+    assert_eq!(result, SmallInt::new(4242).oop().raw());
+}
+
+/// A3's table row "only nmethods for other klasses exist → compile fresh for
+/// K": ONE inherited MethodOop compiles into THREE distinct nmethods, one per
+/// concrete receiver klass, each devirtualizing `self v` to ITS OWN klass's
+/// override — the tests_s14.md `customization.mst` gate item, Rust-side.
+#[test]
+fn customization_compiles_per_receiver_klass() {
+    let mut vm = test_vm();
+    let object_klass = vm.universe.object_klass;
+    let base = vm.universe.new_klass(
+        object_klass,
+        "S14CustBase",
+        Format::Slots,
+        false,
+        HEADER_WORDS,
+    );
+    let sub_b = vm
+        .universe
+        .new_klass(base, "S14CustB", Format::Slots, false, HEADER_WORDS);
+    let sub_c = vm
+        .universe
+        .new_klass(base, "S14CustC", Format::Slots, false, HEADER_WORDS);
+
+    let v_sel = vm.universe.intern(b"v");
+    let mk_v = |vm: &mut VmState, val: i8| {
+        let mut vb = BytecodeBuilder::new();
+        vb.push_smi_i8(val);
+        vb.ret_tos();
+        vb.finish(vm, v_sel, 0, 0)
+    };
+    let v_base = mk_v(&mut vm, 1);
+    let v_b = mk_v(&mut vm, 2);
+    let v_c = mk_v(&mut vm, 3);
+    install_method(&mut vm, base, v_sel, v_base);
+    install_method(&mut vm, sub_b, v_sel, v_b);
+    install_method(&mut vm, sub_c, v_sel, v_c);
+
+    // `m [ ^self v ]` defined ONCE, on the superclass — inherited by both subs.
+    let m_sel = vm.universe.intern(b"m");
+    let mut b = BytecodeBuilder::new();
+    b.push_self();
+    b.send(&mut vm, v_sel, 0);
+    b.ret_tos();
+    let m = b.finish(&mut vm, m_sel, 0, 0);
+    install_method(&mut vm, base, m_sel, m);
+
+    // The SAME MethodOop compiles three times, once per receiver klass.
+    let id_base = driver::compile_method(&mut vm, base, m).expect("compile for base");
+    let id_b = driver::compile_method(&mut vm, sub_b, m).expect("compile for B");
+    let id_c = driver::compile_method(&mut vm, sub_c, m).expect("compile for C");
+    assert_ne!(id_base, id_b);
+    assert_ne!(id_b, id_c);
+    assert_eq!(
+        vm.code_table.lookup(base, v_sel),
+        None,
+        "v itself never compiled"
+    );
+    assert_eq!(
+        vm.code_table.lookup(base, m_sel),
+        Some(id_base),
+        "per-klass key (base, m)"
+    );
+    assert_eq!(
+        vm.code_table.lookup(sub_b, m_sel),
+        Some(id_b),
+        "per-klass key (B, m)"
+    );
+    assert_eq!(
+        vm.code_table.lookup(sub_c, m_sel),
+        Some(id_c),
+        "per-klass key (C, m)"
+    );
+
+    // Each customization devirtualized `self v` against ITS klass: running the
+    // three compiled versions returns each klass's own override.
+    let call: CallStubFn = unsafe { std::mem::transmute(vm.stubs.call_stub_entry()) };
+    for (id, klass, expect) in [(id_base, base, 1i64), (id_b, sub_b, 2), (id_c, sub_c, 3)] {
+        let recv = alloc::alloc_slots(&mut vm, klass).oop();
+        let nm = vm.code_table.get(id).expect("installed");
+        assert!(
+            nm.self_devirt,
+            "each version inlined its own `self v` guard-free"
+        );
+        let entry = unsafe { nm.code.base.add(nm.entry_off as usize) } as u64;
+        let vm_ptr: *mut VmState = &mut vm;
+        let result = unsafe { call(entry, vm_ptr, [recv.raw()].as_ptr(), 1) };
+        assert_eq!(
+            result,
+            SmallInt::new(expect).oop().raw(),
+            "customized nmethod must use its OWN klass's `v`"
+        );
+    }
+}
+
+/// THE step-5 soundness case: a SUPER send links `verified_entry` directly and
+/// enters with SUBCLASS receivers — so it must NOT link a target nmethod whose
+/// code devirtualized self-sends against ITS key klass. `resolve_super_target_
+/// entry` falls back to the c2i adapter for a `self_devirt` target: the
+/// interpreter re-dispatches `self v` against the receiver's REAL klass.
+#[test]
+fn super_send_into_devirt_target_goes_c2i() {
+    let mut vm = test_vm();
+    let object_klass = vm.universe.object_klass;
+    let base = vm.universe.new_klass(
+        object_klass,
+        "S14SuperBase",
+        Format::Slots,
+        false,
+        HEADER_WORDS,
+    );
+    let sub = vm
+        .universe
+        .new_klass(base, "S14SuperSub", Format::Slots, false, HEADER_WORDS);
+
+    let v_sel = vm.universe.intern(b"v");
+    let v_base = {
+        let mut vb = BytecodeBuilder::new();
+        vb.push_smi_i8(1);
+        vb.ret_tos();
+        vb.finish(&mut vm, v_sel, 0, 0)
+    };
+    let v_sub = {
+        let mut vb = BytecodeBuilder::new();
+        vb.push_smi_i8(2);
+        vb.ret_tos();
+        vb.finish(&mut vm, v_sel, 0, 0)
+    };
+    install_method(&mut vm, base, v_sel, v_base);
+    install_method(&mut vm, sub, v_sel, v_sub);
+
+    // `m [ <padding>. ^self v ]` on base — padded past the level-1 inline
+    // budget (30) so a super site CALLS it rather than inlining it.
+    let m_sel = vm.universe.intern(b"m");
+    let m = {
+        let mut mb = BytecodeBuilder::new();
+        for _ in 0..20 {
+            mb.push_smi_i8(0);
+            mb.pop();
+        }
+        mb.push_self();
+        mb.send(&mut vm, v_sel, 0);
+        mb.ret_tos();
+        mb.finish(&mut vm, m_sel, 0, 0)
+    };
+    install_method(&mut vm, base, m_sel, m);
+
+    // Compile `m` customized for BASE: `self v` devirtualizes to base's own
+    // `v [ ^1 ]`, marking the nmethod self_devirt.
+    let id_m = driver::compile_method(&mut vm, base, m).expect("compile m for base");
+    assert!(
+        vm.code_table.get(id_m).expect("installed").self_devirt,
+        "m-for-base devirtualized its self-send"
+    );
+
+    // `callM [ ^super m ]` on SUB (holder sub, super = base): its super site
+    // statically resolves (base, m) — exactly the (base, m) nmethod above —
+    // but the RECEIVER is a sub instance, so linking verified_entry would run
+    // base-devirtualized code and answer 1. The c2i fallback interprets `m`,
+    // whose `self v` re-dispatches on sub → 2.
+    let call_sel = vm.universe.intern(b"callM");
+    let mut cb = BytecodeBuilder::new();
+    cb.push_self();
+    cb.send_super(&mut vm, m_sel, 0);
+    cb.ret_tos();
+    let call_m = cb.finish(&mut vm, call_sel, 0, 0);
+    install_method(&mut vm, sub, call_sel, call_m);
+
+    let id_call = driver::compile_method(&mut vm, sub, call_m).expect("compile callM for sub");
+    let recv = alloc::alloc_slots(&mut vm, sub).oop();
+    let interp = macvm::interpreter::run_method(&mut vm, call_m, recv, &[]);
+    assert_eq!(
+        interp.raw(),
+        SmallInt::new(2).oop().raw(),
+        "interpreter reference: super m → self v hits SUB's override"
+    );
+    let nm = vm.code_table.get(id_call).expect("installed");
+    let entry = unsafe { nm.code.base.add(nm.entry_off as usize) } as u64;
+    let call: CallStubFn = unsafe { std::mem::transmute(vm.stubs.call_stub_entry()) };
+    let vm_ptr: *mut VmState = &mut vm;
+    let result = unsafe { call(entry, vm_ptr, [recv.raw()].as_ptr(), 1) };
+    assert_eq!(
+        result,
+        SmallInt::new(2).oop().raw(),
+        "compiled super send into a self_devirt target must go c2i, not run \
+         base-customized code with a sub receiver"
+    );
+}
+
+/// Review-finding regression: a devirtualized self-send whose target is
+/// `is_leaf` (no sends) but NOT leaf-spliceable (its body pushes a closure)
+/// must fall through to a plain send — the nonleaf/cfg splicers used to walk
+/// such a body and abort on the closure opcode (`unreachable!`). The same
+/// shape was reachable pre-step-5 through warm-mono feedback, so this pins
+/// both doors shut (the splicers now self-validate their exact arm sets).
+#[test]
+fn self_send_to_closure_returning_target_compiles_without_abort() {
+    // JIT-armed construction: the `value` send's cold IC compiles to a real
+    // uncommon-trap `brk`, which needs the live SIGTRAP handler.
+    let mut vm = VmState::with_options(VmOptions {
+        heap_mib: 64,
+        trace: Default::default(),
+        gc_stress: false,
+        gc_stress_full_period: None,
+        eden_kb: None,
+        jit: JitMode::Threshold(1),
+    });
+    install_value_prims(&mut vm);
+    let object_klass = vm.universe.object_klass;
+    let k = vm.universe.new_klass(
+        object_klass,
+        "S14ClosureRet",
+        Format::Slots,
+        false,
+        HEADER_WORDS,
+    );
+
+    // `blk [ ^[42] ]` — sendless (is_leaf), cost tiny, but PushClosure makes
+    // it unspliceable by every splicer.
+    let blk_sel = vm.universe.intern(b"blk");
+    let blk = {
+        let mut bb = BytecodeBuilder::new();
+        let lit = bb.build_block(&mut vm, 0, 0, false, 0, false, |b, _vm| {
+            b.push_smi_i8(42);
+            b.block_return_tos();
+        });
+        bb.push_closure(lit, 0);
+        bb.ret_tos();
+        bb.finish(&mut vm, blk_sel, 0, 0)
+    };
+    install_method(&mut vm, k, blk_sel, blk);
+
+    // `use [ ^(self blk) value ]` — the self-send devirt resolves `blk`,
+    // every splicer declines, and the site compiles as a plain CallSend.
+    let value_sel = vm.universe.intern(b"value");
+    let use_sel = vm.universe.intern(b"use");
+    let mut ub = BytecodeBuilder::new();
+    ub.push_self();
+    ub.send(&mut vm, blk_sel, 0);
+    ub.send(&mut vm, value_sel, 0);
+    ub.ret_tos();
+    let use_m = ub.finish(&mut vm, use_sel, 0, 0);
+    install_method(&mut vm, k, use_sel, use_m);
+
+    // The compile itself is the regression assertion (it used to abort).
+    let id = driver::compile_method(&mut vm, k, use_m).expect("must compile, not abort");
+    let recv = alloc::alloc_slots(&mut vm, k).oop();
+    let interp = macvm::interpreter::run_method(&mut vm, use_m, recv, &[]);
+    assert_eq!(interp.raw(), SmallInt::new(42).oop().raw());
+    let nm = vm.code_table.get(id).expect("installed");
+    let entry = unsafe { nm.code.base.add(nm.entry_off as usize) } as u64;
+    let call: CallStubFn = unsafe { std::mem::transmute(vm.stubs.call_stub_entry()) };
+    let vm_ptr: *mut VmState = &mut vm;
+    let result = unsafe { call(entry, vm_ptr, [recv.raw()].as_ptr(), 1) };
+    assert_eq!(result, SmallInt::new(42).oop().raw());
 }
