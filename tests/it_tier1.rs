@@ -762,6 +762,123 @@ fn compiled_not_boolean_deopts_to_interpreter() {
     );
 }
 
+/// S14 step 3 (the THIRD organic trap client, and the first SPECULATIVE one):
+/// a generic (non-smi) send whose IC is still `Untaken` (never executed while
+/// interpreted) now COMPILES — the send lowers to an uncommon trap
+/// (`SiteFeedback::Untaken` -> `inline::decide` -> `Ir::UncommonTrap`,
+/// reexecute=true at the send's own bci) instead of the pre-S14 `NoRetryLater`
+/// that blocked compilation. Running the compiled method fires the trap on the
+/// FIRST call: brk -> SIGTRAP -> handler -> uncommon trampoline ->
+/// rt_uncommon_trap -> deoptimize_frame -> interpret_active re-executes the
+/// WHOLE send in the interpreter (which also warms the IC for a later
+/// recompile), and the result must equal a pure `run_method` reference for the
+/// same send. `deopt_count` must bump (the brk actually fired).
+///
+/// The re-executed method `foo:` returns its ARGUMENT (`^arg`), and the two
+/// operands (receiver vs. arg) are DISTINCT, so a deopt that read the wrong
+/// frame slot for the reexecute stack `[receiver, arg]` would return the
+/// receiver instead of the arg and fail — this pins the trap's recorded
+/// operand-stack correctness (receiver + args, captured before the send pops).
+#[test]
+fn compiled_untaken_send_traps_and_reexecutes() {
+    let mut vm = VmState::with_options(VmOptions {
+        heap_mib: 64,
+        trace: Default::default(),
+        gc_stress: false,
+        gc_stress_full_period: None,
+        eden_kb: None,
+        jit: JitMode::Threshold(1),
+    });
+    let smi_klass = vm.universe.smi_klass;
+    let foo_sel = vm.universe.intern(b"foo:");
+
+    // The compiled method under test: `callFoo: arg [ ^self foo: arg ]`. Its
+    // one inner send (`self foo: arg`) is a generic, non-smi send.
+    let mut b = BytecodeBuilder::new();
+    b.push_self();
+    b.push_temp(0);
+    b.send(&mut vm, foo_sel, 1);
+    b.ret_tos();
+    let m_sel = vm.universe.intern(b"callFoo:");
+    let method = b.finish(&mut vm, m_sel, 1, 0);
+
+    // `foo:` on SmallInteger: a plain (non-primitive) method `^arg`, returning
+    // the SECOND operand — a deterministic, operand-discriminating target the
+    // deopt re-executes into (its klass is where `lookup` walks when the send
+    // re-executes interpreted).
+    let foo_target = {
+        let mut fb = BytecodeBuilder::new();
+        fb.push_temp(0); // ^arg
+        fb.ret_tos();
+        fb.finish(&mut vm, foo_sel, 1, 0)
+    };
+    install_method(&mut vm, smi_klass, foo_sel, foo_target);
+
+    // The site's IC is LEFT EMPTY (never dispatched) — Untaken. Previously this
+    // returned `NoRetryLater` and `compile_method` declined; now it compiles as
+    // a trap.
+    assert!(
+        driver::eligible(&vm, method),
+        "an Untaken generic send is now eligible (compiles as a trap)"
+    );
+    let id = driver::compile_method(&mut vm, smi_klass, method).expect("must compile now");
+    assert!(
+        !vm.code_table
+            .get(id)
+            .expect("installed")
+            .deopt_pcdescs
+            .is_empty(),
+        "a trapped send carries at least one deopt PcDesc (the trap site)"
+    );
+
+    // Two DISTINCT operands: receiver 7, arg 99. The re-executed `^arg` returns
+    // 99 — distinct from the receiver, so a wrong-slot deopt would return 7.
+    let recv = SmallInt::new(7).oop();
+    let arg = SmallInt::new(99).oop();
+
+    // Interpreter reference: run the SAME method purely interpreted. The send
+    // dispatches to `foo:` = `^arg`, yielding the arg (99).
+    let interp_result = macvm::interpreter::run_method(&mut vm, method, recv, &[arg]);
+    assert_eq!(
+        interp_result.raw(),
+        arg.raw(),
+        "pure-interpreter reference: `^self foo: arg` dispatches to `^arg` = the arg"
+    );
+
+    let nm = vm.code_table.get(id).expect("installed nmethod");
+    let entry = unsafe { nm.code.base.add(nm.entry_off as usize) } as u64;
+    let call: CallStubFn = unsafe { std::mem::transmute(vm.stubs.call_stub_entry()) };
+    let vm_ptr: *mut VmState = &mut vm;
+
+    let deopts_before = unsafe { (*vm_ptr).stats.deopt_count };
+    assert_eq!(deopts_before, 0, "nothing has trapped yet");
+
+    // THE organic trap: the Untaken send. brk -> SIGTRAP -> handler ->
+    // uncommon trampoline -> rt_uncommon_trap -> deoptimize_frame ->
+    // interpret_active re-executes the send -> `^arg` -> 99, back through
+    // call_stub.
+    let deopt_result = unsafe { call(entry, vm_ptr, [recv.raw(), arg.raw()].as_ptr(), 2) };
+    let deopts_after = unsafe { (*vm_ptr).stats.deopt_count };
+
+    assert_eq!(
+        deopt_result,
+        interp_result.raw(),
+        "the trap-and-reexecute path must produce the IDENTICAL result to the pure interpreter \
+         for the same send (differential equivalence)"
+    );
+    assert_eq!(
+        deopt_result,
+        arg.raw(),
+        "and specifically the ARG (99), proving the reexecute stack `[receiver, arg]` resolved \
+         to the right frame slots"
+    );
+    assert_eq!(
+        deopts_after,
+        deopts_before + 1,
+        "exactly one deopt must have been counted (the Untaken-site brk actually fired)"
+    );
+}
+
 /// Builds `jit: JitMode::Threshold(1)` VM with the two inlinable smi prims
 /// (`+`, `<`) the loop tests use.
 fn loop_test_vm() -> VmState {
@@ -3400,8 +3517,9 @@ fn nlr_through_compiled_frame_runs_home_side_ensure() {
 /// again in `baz: a`), so S12's spill-all forces them to canonical frame
 /// slots there; `resolve_frame_loc` must return exactly those
 /// `FrameSlot`s, and a never-defined vreg must resolve to `Nil` (the dead/
-/// absent case). Fresh method → both sends are generic `CallSend`
-/// safepoints (no warm mono-smi IC to inline).
+/// absent case). Both sends are warmed to a NON-smi mono IC so they stay
+/// generic `CallSend` safepoints (S14 step 3: an Untaken/empty IC would now
+/// lower to an uncommon trap instead, a different scope shape).
 #[test]
 fn deopt_resolve_frame_loc_from_real_regalloc() {
     use macvm::compiler::scopes::{resolve_frame_loc, ValueLoc};
@@ -3420,6 +3538,24 @@ fn deopt_resolve_frame_loc_from_real_regalloc() {
     b.send(&mut vm, baz_sel, 1); // self baz: a
     b.ret_tos();
     let method = b.finish(&mut vm, foo_sel, 1, 0);
+
+    // S14 step 3: warm both send sites to Mono on a NON-smi klass so they stay
+    // real generic `CallSend`s (this golden targets the two call-return
+    // safepoints). An Untaken IC would now lower each send to an uncommon trap.
+    let obj_klass = vm.universe.object_klass;
+    let bar_target = {
+        let mut tb = BytecodeBuilder::new();
+        tb.ret_self();
+        tb.finish(&mut vm, bar_sel, 0, 0)
+    };
+    let baz_target = {
+        let mut tb = BytecodeBuilder::new();
+        tb.ret_self();
+        tb.finish(&mut vm, baz_sel, 1, 0)
+    };
+    let epoch = vm.ic_epoch;
+    InterpreterIc::at(method, 0).set_mono(&mut vm, obj_klass, bar_target, epoch);
+    InterpreterIc::at(method, 1).set_mono(&mut vm, obj_klass, baz_target, epoch);
 
     let cfg = decode::decode(method);
     let ir = ir::convert(&vm, method, &cfg);

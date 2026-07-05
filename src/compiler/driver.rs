@@ -169,7 +169,13 @@ fn eligibility_detail(vm: &VmState, method: MethodOop) -> Eligibility {
         bci = next;
     }
     if verdict != Eligibility::Yes {
-        return verdict; // NoRetryLater: some site was Empty, nothing else disqualified
+        // S14 step 3: `mono_smi_inline_send` no longer returns `NoRetryLater`
+        // (an `Empty` IC is now `Yes` — compilable as a trap), so in practice
+        // `verdict` is always `Yes` here (a `NoPermanent` site short-circuits
+        // above). This guard is kept as a defensive catch-all: any future
+        // `NoRetryLater`/`NoPermanent` producer added to the loop still returns
+        // its verdict rather than falling through to the frame-budget check.
+        return verdict;
     }
 
     // Frame budget (D1 point 3): reuses ir.rs's own CFG-aware stack-depth
@@ -196,7 +202,27 @@ fn eligibility_detail(vm: &VmState, method: MethodOop) -> Eligibility {
 /// this stays narrower than D1's full "arbitrary send in any IC state" text.
 fn mono_smi_inline_send(vm: &VmState, method: MethodOop, ic_idx: u16) -> Eligibility {
     match ic_state(method, ic_idx) {
-        IcState::Empty => return Eligibility::NoRetryLater,
+        // S14 step 3: an `Empty` IC (the site never executed while interpreted)
+        // no longer BLOCKS compilation. It is now COMPILABLE as an uncommon
+        // TRAP (`SiteFeedback::Untaken` -> `inline::decide` -> `Ir::UncommonTrap`
+        // at the generic send site in `ir.rs`): Self's lazy cold path. When the
+        // trap fires it re-executes the send interpreted, warming the IC for the
+        // NEXT compilation. So `Empty` is `Yes` here, not `NoRetryLater` — a
+        // method whose ONLY sends are `Empty` still compiles (a method full of
+        // traps, valid, just cold). This is what lets a first-call-is-the-
+        // trigger method (`MACVM_JIT=threshold=1`, where every inner send is
+        // guaranteed cold on the first attempt) compile immediately instead of
+        // deferring to a warmer next call.
+        //
+        // INTERIM DEOPT-STORM (documented, NOT solved in step 3): an executed
+        // trap warms the IC but the nmethod stays Alive with the trap still
+        // compiled, so it re-traps every call until recompiled with the warm
+        // feedback. That recompile-on-trap loop is S14 step 8 (recompile.rs) and
+        // needs `trap_counts`/`UNCOMMON_TRAP_LIMIT`, which S13 never built. The
+        // storm is CORRECTNESS-PRESERVING (each trap re-executes the send
+        // exactly, identical output) — just slow, bounded per run by the call
+        // count. No trap counting / recompilation is added here.
+        IcState::Empty => return Eligibility::Yes,
         IcState::Mono => {}
         IcState::Poly(_) | IcState::Mega => return Eligibility::NoPermanent,
     }
@@ -635,12 +661,18 @@ mod tests {
         assert!(eligible(&vm, method));
     }
 
+    /// S14 step 3: an `Empty` IC (the site never executed while interpreted)
+    /// is now ELIGIBLE — the generic send lowers to an uncommon trap
+    /// (`SiteFeedback::Untaken` -> `inline::decide` -> `Ir::UncommonTrap`), so a
+    /// cold site no longer blocks compilation. (Before this step it returned
+    /// `NoRetryLater` -> `eligible == false`.)
     #[test]
-    fn eligible_rejects_empty_ic() {
+    fn eligible_accepts_empty_ic_as_trap() {
         let mut vm = test_vm();
         let method = plus_method(&mut vm);
-        // No `set_mono` call: the IC is left at its fresh, empty state.
-        assert!(!eligible(&vm, method));
+        // No `set_mono` call: the IC is left at its fresh, empty state — which
+        // is now compilable (as a trap), not a compile blocker.
+        assert!(eligible(&vm, method));
     }
 
     /// A Mono IC guarded on something OTHER than SmallInteger's own klass
@@ -868,32 +900,40 @@ mod tests {
         );
     }
 
-    /// D1's `NoRetryLater` path (the fix in this same commit): a method
-    /// whose only problem is a still-cold inner send site must NOT be
-    /// permanently disabled — the counter is left exactly as the caller
-    /// set it, so a later call (after this method's own body has actually
-    /// run and warmed that site) gets a fresh attempt. See `Eligibility`'s
-    /// own doc for why this distinction exists at all.
+    /// S14 step 3: a method whose only inner send is a still-cold (`Empty`) IC
+    /// now COMPILES — the send lowers to an uncommon trap
+    /// (`SiteFeedback::Untaken` -> `Ir::UncommonTrap`), Self's lazy cold path.
+    /// Before this step the cold IC returned `NoRetryLater` and `compile_method`
+    /// declined with `None` (leaving the counter alone for a warmer retry); now
+    /// there is nothing to defer — the trap re-executes the send interpreted
+    /// when hit, warming the IC for a *later* recompile (S14 step 8). The method
+    /// is neither compile-disabled nor left uncompiled.
     #[test]
-    fn compile_method_leaves_cold_ic_method_retryable() {
+    fn compile_method_compiles_cold_ic_method_as_trap() {
         let mut vm = test_vm();
         let method = plus_method(&mut vm);
-        // Left with an empty inner IC -> not yet eligible, but not
-        // permanently so either.
+        // Left with an empty inner IC: now compilable as a trap.
         assert!(!method.compile_disabled());
-        method.set_counters(41); // as if bump_invocation had already run once
+        method.set_counters(41);
         let smi_klass = vm.universe.smi_klass;
         let id = compile_method(&mut vm, smi_klass, method);
-        assert!(id.is_none());
+        assert!(
+            id.is_some(),
+            "a cold inner IC now compiles as an uncommon trap, not a compile blocker"
+        );
         assert!(
             !method.compile_disabled(),
-            "a cold inner IC must not permanently disable the method"
+            "a successful compilation never sets the don't-compile bit"
         );
-        assert_eq!(
-            method.counters() & crate::oops::layout::COUNTERS_INVOCATION_MASK,
-            41,
-            "the counter must be left untouched, not reset, so a later call still crosses \
-             threshold and retries"
+        // The nmethod carries a deopt PcDesc — the trap site itself — proving
+        // the send lowered to a trap, not a real `CallSend`.
+        assert!(
+            !vm.code_table
+                .get(id.unwrap())
+                .expect("installed")
+                .deopt_pcdescs
+                .is_empty(),
+            "the trapped send must carry at least one deopt PcDesc (the trap site)"
         );
     }
 
@@ -961,6 +1001,26 @@ mod tests {
         b.send(&mut vm, box_sel, 2); // self box: (self bar) with: a  <- SITE 1
         b.ret_tos();
         let method = b.finish(&mut vm, foo_sel, 1, 0);
+
+        // S14 step 3: warm both send sites to Mono on a NON-smi klass so they
+        // stay generic `CallSend`s (this test's premise). An Empty IC would now
+        // lower to an uncommon TRAP (`SiteFeedback::Untaken`), which is a
+        // different scope shape exercised by the it_tier1 trap test — here we
+        // want the two-CallSend safepoint layout.
+        let obj_klass = vm.universe.object_klass;
+        let bar_target = {
+            let mut tb = BytecodeBuilder::new();
+            tb.ret_self();
+            tb.finish(&mut vm, bar_sel, 0, 0)
+        };
+        let box_target = {
+            let mut tb = BytecodeBuilder::new();
+            tb.ret_self();
+            tb.finish(&mut vm, box_sel, 2, 0)
+        };
+        let epoch = vm.ic_epoch;
+        InterpreterIc::at(method, 0).set_mono(&mut vm, obj_klass, bar_target, epoch);
+        InterpreterIc::at(method, 1).set_mono(&mut vm, obj_klass, box_target, epoch);
 
         let cfg = decode::decode(method);
         let ir_method = ir::convert(&vm, method, &cfg);
@@ -1095,6 +1155,26 @@ mod tests {
         b.push_temp(1); // ^i
         b.ret_tos();
         let method = b.finish(&mut vm, m_sel, 1, 1);
+
+        // S14 step 3: warm both in-loop send sites to Mono on a NON-smi klass so
+        // they stay generic `CallSend`s inside the loop (this test targets the
+        // back-edge `Poll` and its loop-carried scope, which needs the loop body
+        // intact). An Empty IC would now lower each send to an uncommon TRAP,
+        // dismantling the loop before the poll is even reached.
+        let obj_klass = vm.universe.object_klass;
+        let lt_target = {
+            let mut tb = BytecodeBuilder::new();
+            tb.ret_self();
+            tb.finish(&mut vm, lt_sel, 1, 0)
+        };
+        let plus_target = {
+            let mut tb = BytecodeBuilder::new();
+            tb.ret_self();
+            tb.finish(&mut vm, plus_sel, 1, 0)
+        };
+        let epoch = vm.ic_epoch;
+        InterpreterIc::at(method, 0).set_mono(&mut vm, obj_klass, lt_target, epoch);
+        InterpreterIc::at(method, 1).set_mono(&mut vm, obj_klass, plus_target, epoch);
 
         let cfg = decode::decode(method);
         let ir_method = ir::convert(&vm, method, &cfg);

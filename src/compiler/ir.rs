@@ -868,10 +868,12 @@ impl<'a> Translator<'a> {
     /// controlled duplication over a cross-module coupling for a
     /// three-line predicate — `project_s11_step4_design`'s own "two
     /// conventions, kept intentionally separate" precedent). Every OTHER
-    /// IC state (Empty at compile time can't happen — `driver.rs`'s own
-    /// `NoRetryLater` keeps a cold site from ever reaching a real compile;
-    /// Poly, Mega, mono-but-non-smi, mono-smi-but-not-inlinable) still
-    /// compiles now, just as an ordinary generic `Ir::CallSend` instead.
+    /// IC state falls to the generic `Instr::Send` arm: S14 step 3 an `Empty`
+    /// site now CAN reach a real compile (its guard isn't the smi klass, so
+    /// this returns `false`) and lowers there to an uncommon TRAP via
+    /// `inline::decide` (`SiteFeedback::Untaken`); Poly, Mega, mono-but-non-smi,
+    /// and mono-smi-but-not-inlinable lower to an ordinary generic
+    /// `Ir::CallSend`.
     fn is_smi_inlinable(&self, ic_idx: u16) -> bool {
         let ic = InterpreterIc::at(self.method, ic_idx);
         if ic.guard().raw() != self.vm.universe.smi_klass.oop().raw() {
@@ -939,6 +941,16 @@ impl<'a> Translator<'a> {
     /// `SmiCmpBr`'s own fused fail (handled entirely at the BRANCH
     /// terminator, which already has its own real targets — no split
     /// needed there) and the fast, non-failing smi-inline path.
+    ///
+    /// S14 step 3: `trapped` is set `true` when a generic send site's feedback
+    /// is `Untaken` and [`crate::compiler::inline::decide`] lowers it to an
+    /// uncommon trap (`Ir::UncommonTrap`) INSTEAD of an `Ir::CallSend`. A trap
+    /// is a terminator — control leaves the compiled method entirely — so the
+    /// caller (`convert`'s per-CFG-block loop) must finish the current `IrBlock`
+    /// at the trap and skip both the rest of this CFG block's instructions and
+    /// its own terminator (all dead after the trap). Distinct from `split`,
+    /// which ends a block WITH a continuation to fall into; a trapped block has
+    /// no continuation.
     #[allow(clippy::too_many_arguments)]
     fn translate_instr(
         &mut self,
@@ -949,6 +961,7 @@ impl<'a> Translator<'a> {
         code: &mut Vec<Ir>,
         deopt: &mut Vec<(u32, DeoptRaw)>,
         pending_cmp: &mut Option<(CmpOp, VReg, VReg, PendingCmpDeopt)>,
+        trapped: &mut bool,
     ) -> Option<BlockId> {
         let mut split: Option<BlockId> = None;
         match *instr {
@@ -1208,6 +1221,68 @@ impl<'a> Translator<'a> {
                     }
                 }
 
+                // S14 step 3: consult the site's type feedback (read here,
+                // parallel to S14 step 2's own `read_send_site` call) BEFORE
+                // touching the operand stack. An `Untaken` site (IC still
+                // `Empty` at compile time — now COMPILABLE as of this step's
+                // eligibility relaxation, see `driver::mono_smi_inline_send`)
+                // lowers to an uncommon TRAP instead of a real send: it never
+                // executed interpreted, so there is no target to speculate on.
+                // Everything else (`Mono`/`Poly`/`Mega`) stays a plain generic
+                // `Ir::CallSend` (method/poly INLINING is S14 steps 4/6).
+                let feedback =
+                    crate::compiler::feedback::read_send_site(self.vm, self.method, ic, None);
+                if let crate::compiler::inline::InlineDecision::Trap =
+                    crate::compiler::inline::decide(&feedback)
+                {
+                    // The trap re-executes the WHOLE send in the interpreter
+                    // (reexecute=true at THIS send's own bci), which populates
+                    // the IC and returns the identical result — so the recorded
+                    // operand stack must be the state BEFORE the send's pops,
+                    // with the receiver + all args STILL PRESENT (snapshot
+                    // `stack` HERE, before any pop below). Same
+                    // reexecute-stack convention as the smi-overflow /
+                    // basicNew-alloc / loop-poll sites; `regalloc::deopt_live`
+                    // forces every recorded vreg live-across the trap so
+                    // spill-all pins it to a frame slot the deopt materializer
+                    // reads.
+                    //
+                    // We push NEITHER a `CallSiteInfo` NOR a `site_feedback`
+                    // entry for a trapped site: it never dispatches, so it owns
+                    // no `Ir::CallSend.site` index (the `call_sites`/
+                    // `site_feedback` vecs stay parallel, indexed by real send
+                    // sites only). And we push no `dst`: control leaves the
+                    // method via the trap, so nothing after it in this block is
+                    // reachable — `trapped` tells `convert` to finish the block
+                    // here and skip the rest.
+                    //
+                    // INTERIM DEOPT-STORM (documented, NOT solved here): an
+                    // EXECUTED trap re-executes the send interpreted and warms
+                    // the IC, but this nmethod stays Alive with the trap still
+                    // compiled, so the NEXT call re-traps — a storm until the
+                    // method is recompiled with the now-warm feedback. That
+                    // recompile-on-trap loop is S14 step 8 (recompile.rs) and
+                    // needs `trap_counts` / `UNCOMMON_TRAP_LIMIT`, which S13
+                    // never built. Step 3 accepts the storm: it is
+                    // CORRECTNESS-PRESERVING (every trap re-executes the send
+                    // exactly, identical output) — just slow, and bounded per
+                    // run by the call count. No trap counting / recompilation
+                    // is implemented here.
+                    let reexec_stack = stack.clone();
+                    deopt.push((
+                        code.len() as u32,
+                        DeoptRaw {
+                            stack: reexec_stack,
+                            bci,
+                            kind: SafepointKind::UncommonTrap,
+                            reexecute: true,
+                        },
+                    ));
+                    code.push(Ir::UncommonTrap { bci });
+                    *trapped = true;
+                    return split; // (always None on the trap path)
+                }
+
                 let ic_view = InterpreterIc::at(self.method, ic);
                 let real_argc = ic_view.argc();
                 let mut real_args: Vec<VReg> = (0..real_argc)
@@ -1224,14 +1299,10 @@ impl<'a> Translator<'a> {
                     argc: real_argc + 1,
                     static_klass: None,
                 });
-                // S14 step 2: annotate this send with its interpreter feedback.
-                self.site_feedback
-                    .push(crate::compiler::feedback::read_send_site(
-                        self.vm,
-                        self.method,
-                        ic,
-                        None,
-                    ));
+                // S14 step 2: annotate this send with its interpreter feedback
+                // (already read above for the trap decision — kept parallel to
+                // `call_sites` for every REAL send site).
+                self.site_feedback.push(feedback);
 
                 let dst = self.fresh(true);
                 // S13 step 3b: call-return safepoint (reexecute=false), same
@@ -1420,7 +1491,48 @@ pub fn convert(vm: &VmState, method: MethodOop, cfg: &Cfg) -> IrMethod {
 
     let mut exit_stacks: Vec<Option<Vec<VReg>>> = vec![None; cfg.blocks.len()];
 
+    // S14 step 3: forward reachability over LIVE (non-trap) control flow. A
+    // block that lowers a send to an uncommon TRAP terminates the method there,
+    // so its CFG successors are unreachable UNLESS a live edge from another
+    // block also reaches them. `compute_entry_depths`/`entry_stack_sources` are
+    // computed on the no-trap CFG (they can't see a per-site trap decision), so
+    // once a block traps, a downstream merge that was to receive a value from it
+    // would otherwise be fed a mismatched (or empty) operand stack — corrupting
+    // the merge (an `emit_merges` depth-mismatch panic, or worse a wrong Move).
+    // Tracking reachability lets `convert` skip DEAD blocks entirely: they are
+    // finished as trivial `Ir::Bailout` blocks (never reached at runtime, and
+    // regalloc's own reachability DFS never orders them into the live path — the
+    // exact treatment decode's post-return dead blocks already get) and, crucially,
+    // never feed a live merge. Blocks are processed in increasing bci order, so
+    // every forward predecessor of a merge runs (and marks it reachable) before
+    // the merge itself; a backward-edge (loop) target was already reached
+    // forward, so its liveness is already settled.
+    let mut reachable = vec![false; cfg.blocks.len()];
+    reachable[0] = true;
+
     for (b, cfg_block) in cfg.blocks.iter().enumerate() {
+        // A dead block (unreachable once traps are accounted for): finish a
+        // trivial placeholder so `blocks_by_id` is complete, but translate
+        // nothing and feed no merges. Its `entry_stack`/`exit_stacks` are never
+        // consulted (no live successor inherits from it — any `Inherit(dead)`
+        // block is itself dead and skipped here too).
+        if !reachable[b] {
+            t.finish_block(IrBlock {
+                id: block_id(b),
+                bci: cfg_block.bci_start,
+                // `RetSelf`: a valid, operand-free terminator (reads only
+                // `VReg(0)`, always present). This block is never reached at
+                // runtime and never ordered into the live path by regalloc's DFS
+                // from block 0; the terminator exists only so the block is
+                // structurally well-formed if the DFS's dead-code sweep appends
+                // it.
+                code: vec![Ir::RetSelf],
+                entry_stack: Vec::new(),
+                deopt_sites: Vec::new(),
+            });
+            continue;
+        }
+
         let entry_stack = match sources[b] {
             EntryStackSource::Empty | EntryStackSource::Merge => {
                 entry_stacks[b].clone().expect("pre-allocated above")
@@ -1476,6 +1588,11 @@ pub fn convert(vm: &VmState, method: MethodOop, cfg: &Cfg) -> IrMethod {
         // the reexecute resume point for a non-boolean `mustBeBoolean` deopt
         // (the interpreter rolls its own bci back to exactly this opcode).
         let mut last_instr_bci = cfg_block.bci_start;
+        // S14 step 3: set true when a generic send in this block lowered to an
+        // uncommon TRAP (an `Untaken` site). A trap is a terminator (control
+        // leaves the method), so the rest of this CFG block's instructions AND
+        // its terminator are dead — finish the block at the trap and move on.
+        let mut trapped = false;
         while bci < cfg_block.bci_end {
             last_instr_bci = bci;
             let (instr, next) = decode_at(method, bci);
@@ -1498,7 +1615,16 @@ pub fn convert(vm: &VmState, method: MethodOop, cfg: &Cfg) -> IrMethod {
                 &mut code,
                 &mut deopt,
                 &mut pending_cmp,
+                &mut trapped,
             );
+            if trapped {
+                // The `Ir::UncommonTrap` is already the last op in `code` (and
+                // its deopt site is already in `deopt`). Stop translating this
+                // block: everything after the trap is unreachable. `code`/
+                // `deopt` are finished into `cur_id` by the trapped-block path
+                // below (which skips the terminator entirely).
+                break;
+            }
             if let Some(continuation_id) = split {
                 code.push(Ir::Jump {
                     target: continuation_id,
@@ -1520,6 +1646,46 @@ pub fn convert(vm: &VmState, method: MethodOop, cfg: &Cfg) -> IrMethod {
             bci = next;
         }
         let local_exit = stack;
+
+        // S14 step 3: a trapped block ends at its `Ir::UncommonTrap` (already
+        // the last op in `code`, its deopt site already in `deopt`) — control
+        // leaves the method, so there is NO terminator to emit and NO merge to
+        // propagate. Finish the current accumulating block here and move on.
+        // `exit_stacks[b]` is still recorded (with the pre-trap operand stack)
+        // so any successor whose `entry_stack_sources` said `Inherit(b)` finds
+        // a well-formed stack; that successor is now unreachable from `b` (the
+        // trap doesn't branch to it) and, absent another predecessor, becomes
+        // dead code that `regalloc`'s reachability DFS simply never orders into
+        // the live path (its own `unreachable`-block handling, already exercised
+        // by decode's post-return dead blocks).
+        if trapped {
+            exit_stacks[b] = Some(local_exit);
+            t.finish_block(IrBlock {
+                id: cur_id,
+                bci: cur_bci,
+                code,
+                entry_stack: if cur_id == block_id(b) {
+                    entry_stack
+                } else {
+                    Vec::new()
+                },
+                deopt_sites: deopt,
+            });
+            continue;
+        }
+
+        // S14 step 3: this block is live (reachable) and did NOT trap (a trapped
+        // block `continue`d above), so its terminator's successors are live too
+        // — mark them reachable BEFORE the terminator match feeds their merges.
+        // A `Return` has no successor.
+        match cfg_block.terminator {
+            Terminator::Return => {}
+            Terminator::Fallthrough(t) | Terminator::Jump { target: t, .. } => reachable[t] = true,
+            Terminator::Branch { if_true, if_false } => {
+                reachable[if_true] = true;
+                reachable[if_false] = true;
+            }
+        }
 
         match cfg_block.terminator {
             Terminator::Return => {}
@@ -1701,10 +1867,12 @@ mod tests {
         m
     }
 
-    /// S14 step 2: `convert` annotates each real (non-inlined) `call_sites`
-    /// entry with its interpreter feedback, same index, no behaviour change. A
-    /// mono send to a NON-smi klass (so it stays a real `CallSend`, not a fused
-    /// smi op) carries `Mono` feedback; a fresh (empty) IC carries `Untaken`.
+    /// S14 step 2/3: `convert` annotates each real (non-inlined, non-trapped)
+    /// `call_sites` entry with its interpreter feedback, same index. A mono send
+    /// to a NON-smi klass stays a real `CallSend` and carries `Mono` feedback;
+    /// a fresh (empty) IC is `Untaken` and — S14 step 3 — lowers to an uncommon
+    /// TRAP instead of a `CallSend`, so it produces NO `call_sites`/
+    /// `site_feedback` entry but DOES record an `UncommonTrap` deopt site.
     #[test]
     fn convert_annotates_site_feedback() {
         use crate::compiler::feedback::SiteFeedback;
@@ -1724,29 +1892,44 @@ mod tests {
         let sel = vm.universe.intern(b"m");
         let method = b.finish(&mut vm, sel, 0, 0);
 
-        // Fresh IC (never dispatched) → Untaken.
+        // Fresh IC (never dispatched) → Untaken → an uncommon trap: no
+        // call_site, no site_feedback entry, but ONE UncommonTrap deopt site.
         {
             let cfg = decode::decode(method);
             let ir = convert(&vm, method, &cfg);
             assert_eq!(
                 ir.site_feedback.len(),
                 ir.call_sites.len(),
-                "one per call site"
+                "one site_feedback per real call site (both empty for a trapped-only method)"
             );
-            assert_eq!(ir.call_sites.len(), 1, "the one `foo` send");
-            assert!(
-                matches!(ir.site_feedback[0], SiteFeedback::Untaken),
-                "an unexecuted send is Untaken, got {:?}",
-                ir.site_feedback[0]
+            assert_eq!(
+                ir.call_sites.len(),
+                0,
+                "an Untaken send lowers to a trap, not a CallSend -> no call_site"
+            );
+            let trap_sites: usize = ir
+                .blocks
+                .iter()
+                .flat_map(|blk| blk.deopt_sites.iter())
+                .filter(|(_, raw)| matches!(raw.kind, SafepointKind::UncommonTrap))
+                .count();
+            assert_eq!(
+                trap_sites, 1,
+                "the one Untaken `foo` send became exactly one uncommon-trap deopt site"
             );
         }
 
-        // Warm the IC to mono on a NON-smi klass → Mono feedback.
+        // Warm the IC to mono on a NON-smi klass → Mono feedback → real CallSend.
         let klass = vm.universe.object_klass;
         let epoch = vm.ic_epoch;
         InterpreterIc::at(method, 0).set_mono(&mut vm, klass, target, epoch);
         let cfg = decode::decode(method);
         let ir = convert(&vm, method, &cfg);
+        assert_eq!(
+            ir.call_sites.len(),
+            1,
+            "a warm mono send is a real CallSend"
+        );
         match &ir.site_feedback[0] {
             SiteFeedback::Mono {
                 klass: k,
