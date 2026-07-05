@@ -200,7 +200,7 @@ fn eligibility_detail(vm: &VmState, method: MethodOop) -> Eligibility {
 /// non-basicNew guard, or a mono-smi target whose primitive isn't fusable)
 /// keeps this method interpreted. See `eligibility_detail`'s own doc for why
 /// this stays narrower than D1's full "arbitrary send in any IC state" text.
-fn mono_smi_inline_send(vm: &VmState, method: MethodOop, ic_idx: u16) -> Eligibility {
+fn mono_smi_inline_send(_vm: &VmState, method: MethodOop, ic_idx: u16) -> Eligibility {
     match ic_state(method, ic_idx) {
         // S14 step 3: an `Empty` IC (the site never executed while interpreted)
         // no longer BLOCKS compilation. It is now COMPILABLE as an uncommon
@@ -260,14 +260,20 @@ fn mono_smi_inline_send(vm: &VmState, method: MethodOop, ic_idx: u16) -> Eligibi
     {
         return Eligibility::Yes;
     }
-    if site.guard().raw() != vm.universe.smi_klass.oop().raw() {
-        return Eligibility::NoPermanent; // mono but non-smi guard, non-inlinable
-    }
-    if SMI_INLINE.contains(&target.primitive()) {
-        Eligibility::Yes
-    } else {
-        Eligibility::NoPermanent
-    }
+    // S14 (the S11-deferred D1 widening): any remaining Mono send is compilable
+    // as a plain compiled-IC `Call` (S11). The site dispatches to its single
+    // known target — a direct compiled call if that target is compiled, else a
+    // shallow c2i hop that interprets it and returns. This is neither
+    // smi-inlinable (handled as a fused fast path in `ir::is_smi_inlinable`) nor
+    // inline-eligible (handled above), but S11's compiled-IC send path handles a
+    // generic mono send, and S14 step 4c validated exactly this shape — an
+    // inlined non-leaf callee's OWN sends become generic `CallSend`s and run
+    // correctly, incl. c2i re-entry. So a mono send NO LONGER blocks compilation
+    // regardless of its guard klass or its target's primitive; `ir::convert`
+    // lowers it to `Ir::CallSend` (`inline::decide` -> `Call`). The `it_world`
+    // differential gate (interpreter vs `MACVM_JIT=threshold=1`) is the safety
+    // net for the broader c2i-reentrancy surface this opens.
+    Eligibility::Yes
 }
 
 /// D4: `eligible`? -> decode -> convert -> regalloc -> emit -> publish ->
@@ -766,35 +772,41 @@ mod tests {
         m
     }
 
-    /// A Mono IC guarded on something OTHER than SmallInteger's own klass keeps
-    /// this method interpreted (D1 point 2's own mono-SMI gate) — for a NON-LEAF
-    /// target (a leaf callee would now inline behind a klass guard, S14 step 4b).
+    /// S14 (S11-deferred D1 widening): a Mono IC guarded on a NON-smi klass and
+    /// targeting a non-inlinable (too-big) non-leaf body is now ELIGIBLE — it
+    /// compiles as a plain compiled-IC `Call` (was `NoPermanent`). A leaf callee
+    /// would inline behind a klass guard (4b); this one is too big to inline, so
+    /// it stays a generic dynamic send, which S11's IC machinery handles.
     #[test]
-    fn eligible_rejects_non_smi_guard() {
+    fn eligible_accepts_generic_mono_non_smi_send() {
         let mut vm = test_vm();
         let method = plus_method(&mut vm);
         let plus_sel = vm.universe.intern(b"+");
         let plus_target = non_leaf_stub(&mut vm, plus_sel, 1);
-        // Mono, but guarded on Object's klass instead of SmallInteger's.
         let object_klass = vm.universe.object_klass;
         let epoch = vm.ic_epoch;
         InterpreterIc::at(method, 0).set_mono(&mut vm, object_klass, plus_target, epoch);
-        assert!(!eligible(&vm, method));
+        assert!(
+            eligible(&vm, method),
+            "a generic mono send compiles as a Call"
+        );
     }
 
-    /// Same gate, for a Mono-but-non-inlinable-primitive target (NON-LEAF).
+    /// Same widening for a Mono smi-guarded send to a non-inlinable-primitive
+    /// (non-leaf) target: now compiles as a generic `Call` (was `NoPermanent`).
     #[test]
-    fn eligible_rejects_non_inline_primitive() {
+    fn eligible_accepts_generic_mono_primitive_target() {
         let mut vm = test_vm();
         let method = plus_method(&mut vm);
-        // Mono, smi-guarded, but the target's primitive (23 = basicNew)
-        // isn't in SMI_INLINE — and the target is non-leaf so it isn't inlined.
         let plus_sel = vm.universe.intern(b"+");
         let not_inline = non_leaf_stub(&mut vm, plus_sel, 23);
         let smi_klass = vm.universe.smi_klass;
         let epoch = vm.ic_epoch;
         InterpreterIc::at(method, 0).set_mono(&mut vm, smi_klass, not_inline, epoch);
-        assert!(!eligible(&vm, method));
+        assert!(
+            eligible(&vm, method),
+            "a generic mono send compiles as a Call"
+        );
     }
 
     /// D4.6 (S11 step 6): a `super` send's own target is resolved
