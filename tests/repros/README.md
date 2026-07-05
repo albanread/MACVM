@@ -19,51 +19,72 @@ ports; the benchmarks' own 4-mode gates stay red until these are fixed):
 
 3. cold_branch_recompile_spill_corruption.mst — BUG D (Richards blocker,
    STILL OPEN, JIT correctness / memory corruption class): the current
-   #deviceInAdd: DNU hunt's own minimized repro. `MACVM_JIT=threshold=1`
+   #deviceInAdd: DNU hunt's own minimized repro. `MACVM_JIT=threshold=1
    ./target/release/macvm run <file> --world world` -> release build:
    SIGSEGV (exit 139); debug build: panics EARLIER, at
    `oops/mod.rs:53` "reserved tag: word 0x2 has the unused RESERVED_TAG",
    from `memory::roots::each_code_root` during a scavenge nested inside
-   compiled `process:` (backtrace: `alloc_indexable_oops` <-
+   compiled code (backtrace: `alloc_indexable_oops` <-
    `prim_basic_new_colon` <- `try_primitive` <- `run_method_reentrant` <-
    `rt_interpret_call`) — i.e. the GC's own root-scan finds a compiled
    frame's oop-map claiming a slot is a live oop when the raw word there
    isn't validly tagged at all. Interpreted: completes cleanly, 577783.
 
-   Evidence chain (see the investigation this session, `MACVM_DEBUG_REGALLOC`-
-   style ad hoc instrumentation, since reverted — not shipped):
-     - Reproduces ONLY across a recompile-after-a-cold-sibling-branch
-       transition: running the same two arms interleaved from the very
-       first call (no Untaken->Mono transition ever needed) does NOT
-       reproduce it — confirmed by a same-shaped variant.
-     - `add2:`'s send site (the cold sibling, `ifFalse: [ data add2: 7 ]`)
-       IS correctly classified `SiteFeedback::Untaken` and DOES lower to a
-       proper step-3 `Ir::UncommonTrap` in BOTH the v0 AND the recompiled
-       v1 nmethod (confirmed directly — not a missing-trap bug).
-     - `copy_propagate` correctly resolves the trap's own recorded
-       `DeoptRaw.stack` vregs back to `data`'s canonical, long-lived vreg
-       (confirmed: raw `[18, 19]` -> post-copy-prop `[2, 19]`, matching
-       `data`'s own wide `[2, 68]` live interval and dedicated spill slot —
-       no slot collision found in the allocation itself either).
-     - So the corruption is NOT in: trap emission, copy-propagation, or
-       the live-interval/slot-assignment computation, as far as verified.
-       Remaining suspects, in rough likelihood order: `emit.rs`'s actual
-       arm64 codegen for a spill read/write specific to this multi-branch
-       shape; `scopes.rs`'s LEB128 `ValueLoc`/`ScopeDesc` pack/unpack
-       round-trip; or something entry/prologue-related that skips
-       re-establishing `data` on a specific compiled entry path (unverified
-       — not yet actually checked).
-     - The GC-root panic (found via a debug build, which the earlier hunt
-       hadn't tried) is likely the SAME underlying corruption caught one
-       step earlier by the GC's own oop-map validation, rather than a
-       second independent bug — not yet proven, but the shape (a spill
-       slot's oop-map bit says "live oop", the actual bit pattern is an
-       invalid raw tag) matches "wrong value ended up in this slot"
-       exactly.
-   Next step: `emit.rs`'s spill-slot store/load codegen for this exact
-   shape, and/or a `MACVM_DEBUG_REGALLOC`-equivalent env-gated trace
-   channel built properly (this session's version was ad hoc and reverted)
-   so the next pass doesn't have to re-derive the vreg numbering by hand.
+   **The corrupted frame belongs to `R3 class>>go` (the outer driver with
+   the two `1 to: 50000 do:` loops) — NOT `process:`.** Its own two
+   selector calls (line 46/47) are separate call sites, one per loop, each
+   hardcoded to a different `kind` constant — so the SECOND loop's own
+   `#process:` call site is itself entirely untaken until the first loop's
+   50000 iterations finish, the same "recompile while a sibling site is
+   cold" shape one level up. `go` recompiles (nmethod 4 -> 52) very early
+   (within the first loop), so by the time the second loop's own call site
+   finally fires for the first time ever, it does so inside a nmethod
+   compiled without ever having seen it.
+
+   Evidence chain (ad hoc `MACVM_DEBUG_REGALLOC`/`MACVM_DEBUG_MATERIALIZE`
+   env-gated instrumentation, added then reverted each pass — not shipped;
+   re-add at the cited call sites to reproduce this trail):
+     - Confirmed via a same-shaped interleaved variant: the bug needs a
+       recompile-while-a-sibling-branch-is-cold transition — running both
+       arms from the very first call never reproduces it.
+     - Traced to `nmethod 52` (`go`'s own recompiled version) specifically,
+       via a `[code-root] nm=... slot=...` dump added at `memory::roots::
+       each_code_root`'s own `Oop::from_raw` call: the bad word is at
+       `go`'s SpillSlot(12), not anywhere in `process:`'s frame.
+     - `go`'s own bci=102 (the second loop's `#process:`/`#size` call
+       site) IS correctly classified `Untaken` and traps correctly, in
+       BOTH nmethod 4 and 52 (confirmed by instrumenting `ir::convert`'s
+       feedback-read and step-3 trap-emission sites directly) — ruling out
+       a missing-trap bug at that level.
+     - `copy_propagate` correctly resolves this trap's own recorded
+       `DeoptRaw.stack` back through to the SAME long-lived vreg (12) both
+       before and after propagation.
+     - **Vreg 12's own computed live interval, `[50, 71]`, DOES cover
+       position 58 — the bci=102 trap's own linearized position** (added a
+       `block_start_pos`/`block_end_pos` dump to confirm this directly).
+       This DISPROVES the "trap position isn't covered by the interval"
+       hypothesis an earlier pass in this same investigation had reached
+       for `process:`'s own shape — that theory does not hold once the
+       actual culprit method (`go`, not `process:`) is identified. Do not
+       re-assume it without re-verifying against `go`'s own data.
+     - So as of this pass: the interval computation, trap emission, and
+       copy-propagation are ALL independently confirmed correct for the
+       one site directly implicated by the recorded deopt metadata. The
+       corruption must be introduced somewhere ELSE — most likely a LATER
+       call-site inside the loop (the `#size`/`#queuePacket:`-equivalent
+       calls after `#process:` returns) whose own oop-map, built from the
+       SAME interval data, ends up marking SpillSlot(12) live when the
+       actual compiled code no longer maintains a valid value there, or a
+       genuine emit.rs codegen bug in the spill write/read sequence itself
+       (not yet directly inspected — the next concrete step is dumping
+       `nmethod 52`'s actual machine code, e.g. via `CodeBlob.listing` in a
+       debug build, and reading the instructions around every call site
+       after the second loop's own `#process:` send).
+   Next step: get `go`'s (nmethod 52) real disassembled listing and read
+   the actual spill instructions around each of its post-loop-entry call
+   sites, rather than continuing to infer from IR-level dumps alone — the
+   IR/regalloc layer has now been checked as thoroughly as static+dynamic
+   dumps allow without reading emitted machine code directly.
 
 All three also reproduce via the full benchmarks:
   MACVM_JIT=threshold=1 ./target/release/macvm run world/bench/richards.mst  --world world
