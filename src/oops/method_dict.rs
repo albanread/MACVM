@@ -103,6 +103,24 @@ impl MethodDictOop {
         MethodOop::try_from(self.value_at(slot))
     }
 
+    /// RUSTTCL's `methods` verb (and any future introspection): every
+    /// occupied `(selector, method)` pair, open-addressed slots skipped in
+    /// table order (no defined selector ordering — callers that want one
+    /// sort themselves).
+    pub fn each_pair(self, vm: &VmState, mut f: impl FnMut(SymbolOop, MethodOop)) {
+        let nil = vm.universe.nil_obj;
+        for slot in 0..self.capacity() {
+            let k = self.key_at(slot);
+            if k.raw() == nil.raw() {
+                continue;
+            }
+            let sel = SymbolOop::try_from(k).expect("method dict key is always a symbol");
+            let m = MethodOop::try_from(self.value_at(slot))
+                .expect("method dict value is always a method");
+            f(sel, m);
+        }
+    }
+
     /// Insert or overwrite `selector -> method`. Returns the dictionary to
     /// use from now on (may be a freshly grown one — the caller MUST store
     /// it into the klass's `methods` slot right away, per the module doc).

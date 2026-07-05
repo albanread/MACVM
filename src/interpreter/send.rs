@@ -312,6 +312,7 @@ pub fn send_super_generic(vm: &mut VmState, argc: u8, ic_idx: u16) -> SendOutcom
 /// the original site's IC — that IC's state describes the *original*
 /// selector, not `#doesNotUnderstand:`).
 fn dnu(vm: &mut VmState, rcvr_klass: KlassOop, selector: SymbolOop, argc: u8) -> SendOutcome {
+    crate::runtime::error::trace_dnu(vm, "interpreted", rcvr_klass, selector);
     let argc_usize = argc as usize;
     let sp = vm.stack.sp;
     let args_start = sp - argc_usize;

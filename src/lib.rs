@@ -20,5 +20,6 @@ pub mod interpreter; // baseline threaded-code interpreter
 pub mod memory; // object memory, allocation, garbage collection
 pub mod oops; // object references, tagging, 2-word headers, classes
 pub mod runtime; // stacks, activation frames, method lookup, inline caches, primitives
+pub mod rusttcl; // live VM-introspection shell (disasm/methods/nmethods/ic/stats/trace), built on vendored rust-tcl
 pub mod utils; // shared utilities
-pub mod vendor; // vendored third-party source (S9: JASM's wfasm AArch64 encoder)
+pub mod vendor; // vendored third-party source (S9: JASM's wfasm AArch64 encoder; rust-tcl)

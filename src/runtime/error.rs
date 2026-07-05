@@ -82,6 +82,22 @@ pub fn print_stack_trace(vm: &mut VmState) {
     }
 }
 
+/// `MACVM_TRACE=dnu` (RUSTTCL's `trace dnu on`, same channel): one line per
+/// `doesNotUnderstand:` dispatch, printed BEFORE the `Message` send/lookup
+/// below runs — so a `#doesNotUnderstand:` override that itself traps or
+/// aborts still leaves the diagnostic visible. `site` names where the send
+/// originated (`"interpreted"` from `send::dnu`, `"compiled nm=<id>"` from
+/// `stubs::rt_dnu`) — the detail that tells a wrong-receiver-in-compiled-
+/// code bug apart from an ordinary interpreted DNU at a glance.
+pub fn trace_dnu(vm: &VmState, site: &str, receiver_klass: KlassOop, selector: SymbolOop) {
+    if !vm.options.trace.is_enabled("dnu") {
+        return;
+    }
+    let klass_name = name_of(receiver_klass.name());
+    let sel_str = selector.as_string();
+    eprintln!("[dnu] {site}: {klass_name}>>#{sel_str} not understood");
+}
+
 /// `selector` was not understood by `receiver_klass`, AND
 /// `#doesNotUnderstand:` itself could not be found from `receiver_klass`
 /// (only reachable before the library installs a root `doesNotUnderstand:`

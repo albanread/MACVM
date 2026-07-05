@@ -1226,7 +1226,7 @@ pub unsafe extern "C" fn rt_dnu(vm: *mut VmState, ret_addr: u64, argv: *mut u64)
         "rt_dnu: anchor must be set by stub_dnu's prologue before this call"
     );
 
-    let (_caller_id, _caller_code, _site_off, _site_idx, selector, argc_total) =
+    let (caller_id, _caller_code, _site_off, _site_idx, selector, argc_total) =
         find_caller_site(vm, ret_addr);
     let real_argc = argc_total as usize - 1;
 
@@ -1235,6 +1235,7 @@ pub unsafe extern "C" fn rt_dnu(vm: *mut VmState, ret_addr: u64, argv: *mut u64)
     // register protocol.
     let receiver = Oop::from_raw(unsafe { *argv });
     let k = klass_of(vm, receiver);
+    crate::runtime::error::trace_dnu(vm, &format!("compiled nm={}", caller_id.0), k, selector);
 
     // `selector`/`k`/`receiver` are bare parameters held across BOTH
     // allocations below (the interpreter's own `send::dnu` holds the

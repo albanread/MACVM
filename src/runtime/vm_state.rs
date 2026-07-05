@@ -235,6 +235,60 @@ pub struct VmStats {
     pub osr_declined: u64,
 }
 
+/// The `MACVM_TRACE=stats` dump (`main.rs::print_vm_stats`) and RUSTTCL's
+/// `stats` verb both want the identical counter listing — one on process
+/// exit (gated on the trace flag, to stderr), the other on demand from an
+/// interactive/scripted shell (unconditional, returned as a `Value`) — so
+/// this is the one place the line list is written, `[stats] `-prefixed to
+/// match the trace channel's existing look either way.
+pub fn format_vm_stats(vm: &VmState) -> String {
+    let s = &vm.stats;
+    let g = &vm.universe.gc_stats;
+    let mut code_alive = 0usize;
+    let mut code_zombie = 0usize;
+    for nm in vm.code_table.iter_all() {
+        match nm.state {
+            crate::codecache::nmethod::NmState::Alive => code_alive += nm.code.len,
+            _ => code_zombie += nm.code.len,
+        }
+    }
+    [
+        format!("[stats] ic_misses={}", s.ic_misses),
+        format!("[stats] pic_extends={}", s.pic_extends),
+        format!("[stats] mega_transitions={}", s.mega_transitions),
+        format!("[stats] compilations={}", s.compilations),
+        format!("[stats] recompiles={}", s.recompiles),
+        format!(
+            "[stats] recompile_declined_ineffective={}",
+            s.recompile_declined_ineffective
+        ),
+        format!(
+            "[stats] deopt_count={} by_reason=[trap {}, return {}, poll {}]",
+            s.deopt_count, s.deopt_by_reason[0], s.deopt_by_reason[1], s.deopt_by_reason[2]
+        ),
+        format!("[stats] osr_entries={}", s.osr_entries),
+        format!("[stats] osr_declined={}", s.osr_declined),
+        format!("[stats] scavenge_count={}", g.scavenge_count),
+        format!(
+            "[stats] scavenge_us_total={} scavenge_us_max={}",
+            g.total_scavenge_pause.as_micros(),
+            g.scavenge_pause_max.as_micros()
+        ),
+        format!("[stats] full_gc_count={}", g.full_gc_count),
+        format!(
+            "[stats] full_gc_us_total={} full_gc_us_max={}",
+            g.full_pause_total.as_micros(),
+            g.full_pause_max.as_micros()
+        ),
+        format!("[stats] bytes_allocated={}", g.bytes_allocated),
+        format!("[stats] bytes_promoted={}", g.bytes_promoted),
+        format!("[stats] contexts_allocated={}", g.context_allocs),
+        format!("[stats] code_bytes_alive={code_alive}"),
+        format!("[stats] code_bytes_zombie={code_zombie}"),
+    ]
+    .join("\n")
+}
+
 /// S13 D7: which trigger fired a deopt — for `deopt_by_reason` attribution and
 /// the `MACVM_TRACE=deopt` channel. The discriminant IS the `deopt_by_reason`
 /// index.
@@ -268,6 +322,25 @@ impl TraceFlags {
 
     pub fn is_enabled(&self, channel: &str) -> bool {
         self.channels.contains(channel)
+    }
+
+    /// RUSTTCL's `trace` verb: flip a channel on/off live, past the
+    /// `MACVM_TRACE` env-var parse at startup (`is_enabled` is read on
+    /// every dispatch/deopt/etc., so this takes effect on the very next
+    /// check — no restart needed).
+    pub fn enable(&mut self, channel: &str) {
+        self.channels.insert(channel.to_string());
+    }
+
+    pub fn disable(&mut self, channel: &str) {
+        self.channels.remove(channel);
+    }
+
+    /// Sorted for stable, diffable `trace` verb output.
+    pub fn list(&self) -> Vec<String> {
+        let mut v: Vec<String> = self.channels.iter().cloned().collect();
+        v.sort();
+        v
     }
 }
 
@@ -352,7 +425,8 @@ impl VmOptions {
     /// environment (`tests/common/mod.rs`'s own doc comment: env mutation
     /// races across the multi-threaded test runner, so tests only ever
     /// READ it). `None` (the var unset) yields `(false, None)`: stress off.
-    fn parse_gc_stress(raw: Option<&str>) -> (bool, Option<u64>) {
+    /// `pub(crate)` also for RUSTTCL's `flag` verb — same grammar, live.
+    pub(crate) fn parse_gc_stress(raw: Option<&str>) -> (bool, Option<u64>) {
         let Some(s) = raw.map(str::trim) else {
             return (false, None);
         };
@@ -370,7 +444,8 @@ impl VmOptions {
     /// `parse_gc_stress`). Unset => `Off` (see `jit`'s own doc comment for
     /// why). An unrecognized value warns and falls back to `Off` too — a
     /// typo'd flag must never silently turn compilation on.
-    fn parse_jit(raw: Option<&str>) -> JitMode {
+    /// `pub(crate)` also for RUSTTCL's `flag` verb — same grammar, live.
+    pub(crate) fn parse_jit(raw: Option<&str>) -> JitMode {
         let Some(s) = raw.map(str::trim) else {
             return JitMode::Off;
         };
@@ -676,7 +751,8 @@ impl VmState {
     /// unlike `MACVM_JIT` this is safe to source from the ambient environment
     /// because stress is OUTPUT-EQUIVALENT (a differential harness): it only
     /// forces extra deopts, never changes a program's result.
-    fn parse_deopt_stress(raw: Option<&str>) -> (bool, u64) {
+    /// `pub(crate)` also for RUSTTCL's `flag` verb — same grammar, live.
+    pub(crate) fn parse_deopt_stress(raw: Option<&str>) -> (bool, u64) {
         match raw.map(str::trim) {
             Some("1") => (true, Self::DEFAULT_STRESS_PERIOD),
             Some(s) => match s.parse::<u64>() {

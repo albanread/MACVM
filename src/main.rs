@@ -41,6 +41,7 @@ fn main() {
     match args.first().map(|s| s.as_str()) {
         Some("run") => cmd_run(&args[1..]),
         Some("repl") => cmd_repl(&args[1..]),
+        Some("rusttcl") => cmd_rusttcl(&args[1..]),
         _ => println!("MACVM — Self/Strongtalk-lineage research VM (arm64). Scaffold only."),
     }
 }
@@ -122,48 +123,7 @@ fn print_vm_stats(vm: &VmState) {
     if !vm.options.trace.is_enabled("stats") {
         return;
     }
-    let s = &vm.stats;
-    let g = &vm.universe.gc_stats;
-    let mut code_alive = 0usize;
-    let mut code_zombie = 0usize;
-    for nm in vm.code_table.iter_all() {
-        match nm.state {
-            macvm::codecache::nmethod::NmState::Alive => code_alive += nm.code.len,
-            _ => code_zombie += nm.code.len,
-        }
-    }
-    eprintln!("[stats] ic_misses={}", s.ic_misses);
-    eprintln!("[stats] pic_extends={}", s.pic_extends);
-    eprintln!("[stats] mega_transitions={}", s.mega_transitions);
-    eprintln!("[stats] compilations={}", s.compilations);
-    eprintln!("[stats] recompiles={}", s.recompiles);
-    eprintln!(
-        "[stats] recompile_declined_ineffective={}",
-        s.recompile_declined_ineffective
-    );
-    eprintln!(
-        "[stats] deopt_count={} by_reason=[trap {}, return {}, poll {}]",
-        s.deopt_count, s.deopt_by_reason[0], s.deopt_by_reason[1], s.deopt_by_reason[2]
-    );
-    eprintln!("[stats] osr_entries={}", s.osr_entries);
-    eprintln!("[stats] osr_declined={}", s.osr_declined);
-    eprintln!("[stats] scavenge_count={}", g.scavenge_count);
-    eprintln!(
-        "[stats] scavenge_us_total={} scavenge_us_max={}",
-        g.total_scavenge_pause.as_micros(),
-        g.scavenge_pause_max.as_micros()
-    );
-    eprintln!("[stats] full_gc_count={}", g.full_gc_count);
-    eprintln!(
-        "[stats] full_gc_us_total={} full_gc_us_max={}",
-        g.full_pause_total.as_micros(),
-        g.full_pause_max.as_micros()
-    );
-    eprintln!("[stats] bytes_allocated={}", g.bytes_allocated);
-    eprintln!("[stats] bytes_promoted={}", g.bytes_promoted);
-    eprintln!("[stats] contexts_allocated={}", g.context_allocs);
-    eprintln!("[stats] code_bytes_alive={code_alive}");
-    eprintln!("[stats] code_bytes_zombie={code_zombie}");
+    eprintln!("{}", macvm::runtime::vm_state::format_vm_stats(vm));
 }
 
 /// `MACVM_TRACE=gc`: a grep-friendly one-line counter summary printed to
@@ -225,6 +185,27 @@ fn cmd_repl(args: &[String]) {
                 buf.clear();
             }
         }
+    }
+}
+
+/// `macvm rusttcl [--world <dir>] [script.tcl]`: the live VM-introspection
+/// shell (see `macvm::rusttcl`'s module doc) — `disasm`/`methods`/
+/// `nmethods`/`ic`/`stats`/`trace`/`load`/`help`, plus the full vendored
+/// Tcl language for scripting them. A positional script path runs
+/// non-interactively (one shell invocation replaying a saved diagnostic
+/// recipe); with none, it's an interactive `rusttcl> ` prompt.
+fn cmd_rusttcl(args: &[String]) {
+    let (world_dir, rest) = parse_world_flag(args);
+    let mut ctx =
+        macvm::rusttcl::RusttclCtx::new(world_dir.unwrap_or_else(|| PathBuf::from("world")));
+    match rest.first() {
+        Some(script) => {
+            if let Err(e) = macvm::rusttcl::run_script(&mut ctx, Path::new(script)) {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        }
+        None => macvm::rusttcl::run_repl(&mut ctx),
     }
 }
 
