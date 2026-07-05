@@ -415,6 +415,11 @@ pub fn compile_method(
                 },
                 None => CompiledIcState::Unresolved,
             },
+            // S13 step 10d: `super_resolutions` is `Some` iff this is a
+            // `send_super` site (D4.6) — its `klass` IS the static
+            // holder-superclass. Record it so a later `not_entrant_stub`
+            // re-dispatch stays super-aware even if the state is reset.
+            super_klass: (*resolved).map(|(klass, _)| klass),
         })
         .collect();
 
@@ -686,6 +691,47 @@ mod tests {
         let m_sel = vm.universe.intern(b"m");
         let method = b.finish(&mut vm, m_sel, 1, 0);
         assert!(eligible(&vm, method));
+    }
+
+    /// S13 step 10d: compiling a `send_super` site stamps its STATIC
+    /// holder-superclass onto the runtime `IcSite` (`super_klass`) — the marker
+    /// that keeps a later `not_entrant_stub` re-dispatch super-aware instead of
+    /// collapsing into a receiver-klass dynamic send. A method on SmallInteger
+    /// doing `super +` resolves against Integer (smi's superclass), so its
+    /// compiled site must carry `super_klass == Some(Integer)`.
+    #[test]
+    fn compiled_super_send_records_static_super_klass() {
+        let mut vm = test_vm();
+        let plus_sel = vm.universe.intern(b"+");
+        let smi_klass = vm.universe.smi_klass;
+        let integer_klass = vm.universe.integer_klass; // smi_klass.superclass()
+
+        // The super target must resolve: install `+` on Integer (smi's super).
+        let int_plus = primitive_stub(&mut vm, plus_sel, 1);
+        crate::runtime::lookup::install_method(&mut vm, integer_klass, plus_sel, int_plus);
+
+        // `superPlus: arg [ ^super + arg ]`, holder = SmallInteger.
+        let mut b = BytecodeBuilder::new();
+        b.push_self();
+        b.push_temp(0);
+        b.send_super(&mut vm, plus_sel, 1);
+        b.ret_tos();
+        let m_sel = vm.universe.intern(b"superPlus:");
+        let method = b.finish(&mut vm, m_sel, 1, 0);
+        crate::runtime::lookup::install_method(&mut vm, smi_klass, m_sel, method);
+
+        let id = compile_method(&mut vm, smi_klass, method).expect("super-send method compiles");
+        let nm = vm.code_table.get(id).unwrap();
+        assert_eq!(
+            nm.ic_sites.len(),
+            1,
+            "the one super send is the method's only IC site"
+        );
+        assert_eq!(
+            nm.ic_sites[0].super_klass.map(|k| k.oop().raw()),
+            Some(integer_klass.oop().raw()),
+            "the super site records Integer (smi's superclass) as its static super_klass"
+        );
     }
 
     #[test]

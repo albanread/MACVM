@@ -137,12 +137,23 @@ pub enum IcState {
 /// identify the send; `state` starts `Unresolved` at publish (every fresh
 /// site's `bl` targets `stub_resolve`, D3) and evolves as real receivers
 /// arrive (D4.1's state machine).
+///
+/// `super_klass` (S13 step 10d) marks a `send_super` site with its STATIC
+/// holder-superclass — the klass a super send resolves against (D4.6), fixed at
+/// compile time and *independent* of the actual receiver. `None` for an
+/// ordinary dynamic send. It lives on the `IcSite` itself, NOT inside
+/// `IcState::Mono`, precisely so it survives a state reset: a flush (D6.2) can
+/// knock a super site back to `Unresolved`, and `rt_resolve_send` must STILL
+/// re-resolve it super-aware rather than collapsing into a receiver-klass
+/// dynamic send that reaches the subclass override `super` was meant to skip
+/// (the step-8-deferred blocker). GC keeps it current in [`Self::oops_do`].
 #[derive(Clone, Copy, Debug)]
 pub struct IcSite {
     pub off: u32,
     pub selector: SymbolOop,
     pub argc: u8,
     pub state: IcState,
+    pub super_klass: Option<KlassOop>,
 }
 
 pub struct Nmethod {
@@ -649,6 +660,14 @@ impl CodeTable {
                         klass: unsafe { KlassOop::from_oop_unchecked(nk) },
                         target,
                     };
+                }
+                // S13 step 10d: a super site's static holder-superclass is
+                // derefed by `rt_resolve_send` (`lookup(super_klass, ..)`) on a
+                // re-dispatch, so a moving GC must keep it current too — same
+                // relocation hazard as the `Mono` guard klass above.
+                if let Some(sk) = site.super_klass {
+                    let nsk = f(sk.oop());
+                    site.super_klass = Some(unsafe { KlassOop::from_oop_unchecked(nsk) });
                 }
             }
         }

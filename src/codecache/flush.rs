@@ -379,6 +379,7 @@ mod tests {
                 klass: klass_x,
                 target: a_entry,
             },
+            super_klass: None,
         });
         let b_id = vm.code_table.install(b_nm);
 
@@ -399,6 +400,7 @@ mod tests {
             selector: sel,
             argc: 0,
             state: IcState::Pic { stub: pic_stub },
+            super_klass: None,
         });
         let c_id = vm.code_table.install(c_nm);
 

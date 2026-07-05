@@ -422,6 +422,7 @@ fn compiled_mono_caller_guard_keeps_key_klass_alive() {
             selector: s.selector,
             argc: s.argc,
             state: IcState::Unresolved,
+            super_klass: None,
         })
         .collect();
     let call_hot_nm = Nmethod {
@@ -575,6 +576,7 @@ fn install_loop_nmethod(
             selector: s.selector,
             argc: s.argc,
             state: IcState::Unresolved,
+            super_klass: None,
         })
         .collect();
     let nm = Nmethod {

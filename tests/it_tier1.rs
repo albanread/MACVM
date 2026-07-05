@@ -2178,6 +2178,7 @@ fn mono_resolve_patches_call_site_and_dispatches() {
             selector: s.selector,
             argc: s.argc,
             state: IcState::Unresolved,
+            super_klass: None,
         })
         .collect();
     let caller_nm = Nmethod {
@@ -2336,6 +2337,7 @@ fn build_c2i_scenario(vm: &mut VmState) -> (u64, KlassOop, NmethodId) {
             selector: s.selector,
             argc: s.argc,
             state: IcState::Unresolved,
+            super_klass: None,
         })
         .collect();
     let caller_nm = Nmethod {
@@ -2558,6 +2560,7 @@ fn full_ic_lattice_mono_to_pic_to_mega() {
             selector: s.selector,
             argc: s.argc,
             state: IcState::Unresolved,
+            super_klass: None,
         })
         .collect();
     let caller_nm = Nmethod {
@@ -2774,6 +2777,7 @@ fn dnu_from_compiled_code_reaches_does_not_understand() {
             selector: s.selector,
             argc: s.argc,
             state: IcState::Unresolved,
+            super_klass: None,
         })
         .collect();
     let caller_nm = Nmethod {

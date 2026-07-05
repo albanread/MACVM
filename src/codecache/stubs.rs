@@ -604,7 +604,31 @@ pub unsafe extern "C" fn rt_resolve_send(vm: *mut VmState, ret_addr: u64, argv: 
 
     let (caller_id, caller_code, site_off, site_idx, selector, _argc) =
         find_caller_site(vm, ret_addr);
-    let prev_state = vm.code_table.get(caller_id).unwrap().ic_sites[site_idx].state;
+    let site = &vm.code_table.get(caller_id).unwrap().ic_sites[site_idx];
+    let prev_state = site.state;
+    let super_klass = site.super_klass;
+
+    // S13 step 10d: a `send_super` site re-dispatches from its STATIC
+    // holder-superclass (D4.6), NEVER the receiver's klass — skipping subclass
+    // overrides is the whole point of `super`. Its `bl` reached here only
+    // because its compile-time-resolved target was invalidated (patched to
+    // `not_entrant_stub`) or flushed to `Unresolved`; re-resolve the SAME static
+    // super binding and re-point the `bl`, staying `Mono{super_klass, target}`.
+    // This bypasses the receiver-klass dynamic lookup + poly/mega machinery
+    // below entirely — a super site is monomorphic by construction. Without
+    // this, the site would collapse into an ordinary dynamic send reaching the
+    // very override `super` was meant to skip (the step-8-deferred blocker).
+    if let Some(sk) = super_klass {
+        let Some(method) = lookup(vm, sk, selector) else {
+            return vm.stubs.dnu_addr();
+        };
+        let target = resolve_target_entry(vm, sk, selector, method, true);
+        vm.code_cache
+            .patch_branch26_at(caller_code, site_off, target);
+        vm.code_table.get_mut(caller_id).unwrap().ic_sites[site_idx].state =
+            IcState::Mono { klass: sk, target };
+        return target;
+    }
 
     // SAFETY: this function's own contract above -- `argv[0]` is always
     // the receiver, D4.1's register protocol.
