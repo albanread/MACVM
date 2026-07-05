@@ -126,22 +126,19 @@ fn block_is_spliceable(block: MethodOop) -> bool {
     if cfg.blocks.len() != 1 || !matches!(cfg.blocks[0].terminator, Terminator::Return) {
         return false;
     }
-    // A `captures_ctx` block accesses M's ctx-temps; 7-II-b-i restricts such a
-    // block to be SEND-FREE (an in-block deopt of a capturing block needs the
-    // block frame's Context to alias M's, which is 7-II-b-ii's materializer
-    // change). A NON-capturing block may still have ordinary sends (7-II).
-    let captures = block.captures_ctx();
+    // 7-II-b-ii: a `captures_ctx` block MAY now have ordinary sends — an in-block
+    // deopt rebuilds the block frame with its Context aliasing M's (the deopt
+    // materializer's `is_block` context-aliasing), so a post-deopt ctx-temp
+    // write reaches M's Context. Only super sends / nested closures / NLR / a
+    // depth>0 (nested-context) ctx access remain gated.
     let len = block.bytecode_len();
     let mut bci = 0;
     while bci < len {
         let (instr, next) = decode_at(block, bci);
         match instr {
-            // Always gated: super sends, nested closures, NLR.
             Instr::Send { super_: true, .. } | Instr::PushClosure { .. } | Instr::NlrTos => {
                 return false
             }
-            // A capturing block must be send-free (7-II-b-i).
-            Instr::Send { .. } if captures => return false,
             // ctx-temp access is DEPTH 0 only (M's own Context, which a ctx-less
             // block's frame aliases). A `depth != 0` (nested context) is gated.
             Instr::PushCtxTemp { depth, .. } | Instr::StoreCtxTempPop { depth, .. }
@@ -784,10 +781,11 @@ mod tests {
         );
     }
 
-    /// 7-II-b-i: a captures_ctx block WITH a send is still gated (an in-block
-    /// deopt needs the block frame's Context to alias the home's — 7-II-b-ii).
+    /// 7-II-b-ii: a captures_ctx block WITH an ordinary send IS spliceable — an
+    /// in-block deopt rebuilds the block frame with its Context aliasing the
+    /// home's, so a post-deopt ctx-temp write reaches M's Context.
     #[test]
-    fn capturing_block_with_send_escapes() {
+    fn capturing_block_with_send_is_elidable() {
         let mut vm = test_vm();
         let value_sel = vm.universe.intern(b"value");
         let bar = vm.universe.intern(b"bar");
@@ -805,8 +803,8 @@ mod tests {
 
         let e = analyze(m);
         assert!(
-            !e.all_elidable,
-            "a send-ful capturing block is gated in 7-II-b-i → escaping"
+            e.all_elidable,
+            "a send-ful capturing block is spliceable in 7-II-b-ii"
         );
     }
 }

@@ -400,7 +400,23 @@ pub fn deoptimize_frame(vm: &mut VmState, frame: FrameView) -> DeoptResume {
         }
 
         // ── M6: context. ────────────────────────────────────────────────
-        materialize_context(vm, frame.nm, &frame, &vf.scope.ctx, fp_new);
+        // S14 step 7-II: an `is_block` frame is a ctx-LESS block activation
+        // whose FP+3 ALIASES its home method's Context (SPEC §5.4 — a ctx-less
+        // block's frame aliases the enclosing Context directly). Its home is its
+        // sender, which we built on the previous iteration (`prev_fp`), so read
+        // that frame's Context and share it. Correct for BOTH a non-capturing
+        // home (nil Context — 7-II) and a captured-temp home (the just-
+        // materialized `CtxLoc::Elided` Context — 7-II-b). A method frame uses
+        // its own recorded `CtxLoc` (M6 proper).
+        if vf.scope.is_block && prev_fp != crate::oops::layout::ENTRY_FRAME_SENTINEL {
+            let home_ctx = Frame {
+                fp: prev_fp as usize,
+            }
+            .context(&vm.stack);
+            Frame { fp: fp_new }.set_context(&mut vm.stack, home_ctx);
+        } else {
+            materialize_context(vm, frame.nm, &frame, &vf.scope.ctx, fp_new);
+        }
 
         if vf.is_innermost {
             innermost_fp = fp_new;

@@ -4643,3 +4643,89 @@ fn compiled_captured_temp_deopt_materializes_context() {
         "the cold `self poke` trap fired once"
     );
 }
+
+/// S14 step 7-II-b-ii: a SEND-FUL capturing block whose in-block send deopts.
+/// `foo [ |sum| sum := 0. [:e | sum := e bar. sum] value: 5. ^sum ]` with the
+/// block's `e bar` cold (Untaken) → a trap INSIDE the elided block. The deopt
+/// rebuilds the block's activation frame whose Context ALIASES M's (materialized
+/// from the promoted vreg); the post-deopt `sum := e bar` writes THAT Context, so
+/// M's `^sum` reads it back == interp. Exercises the block-frame context aliasing.
+#[test]
+fn deopt_through_capturing_block_aliases_home_context() {
+    let mut vm = VmState::with_options(VmOptions {
+        heap_mib: 64,
+        trace: Default::default(),
+        gc_stress: false,
+        gc_stress_full_period: None,
+        eden_kb: None,
+        jit: JitMode::Threshold(1),
+    });
+    install_value_prims(&mut vm);
+    let smi_klass = vm.universe.smi_klass;
+
+    // `bar [ ^42 ]` on SmallInteger (the block's `e bar`, e == 5, dispatches here).
+    let bar_sel = vm.universe.intern(b"bar");
+    let bar = {
+        let mut bb = BytecodeBuilder::new();
+        bb.push_smi_i8(42);
+        bb.ret_tos();
+        bb.finish(&mut vm, bar_sel, 0, 0)
+    };
+    install_method(&mut vm, smi_klass, bar_sel, bar);
+
+    let value_arg_sel = vm.universe.intern(b"value:");
+    let sel = vm.universe.intern(b"foo");
+    let mut b = BytecodeBuilder::new();
+    // block `[:e | sum := e bar. sum]` — captures_ctx, a send (`e bar`) then a
+    // ctx-temp write, then reads it back.
+    let lit = b.build_block(&mut vm, 1, 0, false, 0, true, |blk, vm| {
+        blk.push_temp(0); // e
+        blk.send(vm, bar_sel, 0); // e bar (cold → trap)
+        blk.store_ctx_temp_pop(0, 0); // sum := (e bar)
+        blk.push_ctx_temp(0, 0); // sum
+        blk.block_return_tos();
+    });
+    b.push_smi_i8(0);
+    b.store_ctx_temp_pop(0, 0); // sum := 0
+    b.push_closure(lit, 0);
+    b.push_smi_i8(5);
+    b.send(&mut vm, value_arg_sel, 1); // [:e|...] value: 5
+    b.pop();
+    b.push_ctx_temp(0, 0); // sum
+    b.ret_tos();
+    let m = b.finish(&mut vm, sel, 0, 0);
+    m.set_flags(0, 0, true, false, false, false, 1); // has_ctx, nctx=1
+
+    assert!(
+        driver::eligible(&vm, m),
+        "a send-ful capturing block is eligible (7-II-b-ii)"
+    );
+    let self_smi = SmallInt::new(1).oop();
+    // Compile before interp (keep `e bar` Untaken → the trap this test forces).
+    let id = driver::compile_method(&mut vm, smi_klass, m).expect("must compile");
+    let interp = macvm::interpreter::run_method(&mut vm, m, self_smi, &[]);
+    assert_eq!(
+        interp.raw(),
+        SmallInt::new(42).oop().raw(),
+        "interp: sum := (5 bar) = 42"
+    );
+
+    let nm = vm.code_table.get(id).expect("installed");
+    let entry = unsafe { nm.code.base.add(nm.entry_off as usize) } as u64;
+    let call: CallStubFn = unsafe { std::mem::transmute(vm.stubs.call_stub_entry()) };
+    let vm_ptr: *mut VmState = &mut vm;
+    let deopts_before = unsafe { (*vm_ptr).stats.deopt_count };
+    let result = unsafe { call(entry, vm_ptr, [self_smi.raw()].as_ptr(), 1) };
+    let deopts_after = unsafe { (*vm_ptr).stats.deopt_count };
+    assert_eq!(
+        result,
+        SmallInt::new(42).oop().raw(),
+        "the in-block trap must alias the block frame's Context to M's, so the \
+         post-deopt `sum :=` write is read back by M's `^sum` = 42"
+    );
+    assert_eq!(
+        deopts_after,
+        deopts_before + 1,
+        "the cold `e bar` trap fired once"
+    );
+}
