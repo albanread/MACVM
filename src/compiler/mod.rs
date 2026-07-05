@@ -13,6 +13,7 @@ pub mod assembler;
 pub mod decode;
 pub mod driver;
 pub mod emit;
+pub mod feedback;
 pub mod ir;
 pub mod jasm_assembler;
 pub mod oopmap;
