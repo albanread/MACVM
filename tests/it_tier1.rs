@@ -4295,3 +4295,161 @@ fn compiled_escaping_block_stays_interpreted() {
         "the escaping closure was stored into instvar0 by the interpreter"
     );
 }
+
+/// S14 step 7-II: a spliced block with an in-body send that DEOPTS. `applyTo7
+/// [ ^[:x | x bar] value: 7 ]` splices `[:x | x bar]` inline; the block's own
+/// `x bar` send is cold (Untaken) → a step-3 uncommon TRAP inside the elided
+/// block, recording an `is_block` deopt scope chained to the home method. Calling
+/// the compiled method hits that trap → `deoptimize_frame` must rebuild the home
+/// method's frame AND the BLOCK's own activation frame (an `is_block` scope) from
+/// the ONE physical compiled frame → `interpret_active` re-executes `x bar`
+/// generically → identical result to the pure interpreter, `deopt_count` bumped.
+/// This is the first time the materializer rebuilds a block frame.
+#[test]
+fn deopt_through_inlined_block_rebuilds_block_frame() {
+    let mut vm = VmState::with_options(VmOptions {
+        heap_mib: 64,
+        trace: Default::default(),
+        gc_stress: false,
+        gc_stress_full_period: None,
+        eden_kb: None,
+        jit: JitMode::Threshold(1),
+    });
+    install_value_prims(&mut vm);
+    let smi_klass = vm.universe.smi_klass;
+
+    // `bar [ ^42 ]` on SmallInteger (the block's `x bar`, x == 7, dispatches here).
+    let bar_sel = vm.universe.intern(b"bar");
+    let bar = {
+        let mut bb = BytecodeBuilder::new();
+        bb.push_smi_i8(42);
+        bb.ret_tos();
+        bb.finish(&mut vm, bar_sel, 0, 0)
+    };
+    install_method(&mut vm, smi_klass, bar_sel, bar);
+
+    // `applyTo7 [ ^[:x | x bar] value: 7 ]`. The block's `x bar` IC stays Empty
+    // → Untaken → an in-body trap once spliced.
+    let value_arg_sel = vm.universe.intern(b"value:");
+    let sel = vm.universe.intern(b"applyTo7");
+    let mut b = BytecodeBuilder::new();
+    let lit = b.build_block(&mut vm, 1, 0, false, 0, false, |blk, vm| {
+        blk.push_temp(0); // x
+        blk.send(vm, bar_sel, 0); // x bar  (cold → trap)
+        blk.block_return_tos();
+    });
+    b.push_closure(lit, 0);
+    b.push_smi_i8(7);
+    b.send(&mut vm, value_arg_sel, 1);
+    b.ret_tos();
+    let m = b.finish(&mut vm, sel, 0, 0);
+
+    assert!(
+        driver::eligible(&vm, m),
+        "a send-ful directly-value'd block is eligible (7-II)"
+    );
+    let id = driver::compile_method(&mut vm, smi_klass, m).expect("must compile");
+    // The block's cold inner send is a trap, not a compiled IC site.
+    assert!(
+        vm.code_table.get(id).unwrap().ic_sites.is_empty(),
+        "the block's cold `x bar` is a trap → no compiled IC site"
+    );
+
+    let self_smi = SmallInt::new(1).oop();
+    // Interpreter reference.
+    let interp = macvm::interpreter::run_method(&mut vm, m, self_smi, &[]);
+    assert_eq!(
+        interp.raw(),
+        SmallInt::new(42).oop().raw(),
+        "interp: [:x|x bar] value: 7 = 42"
+    );
+
+    let nm = vm.code_table.get(id).expect("installed");
+    let entry = unsafe { nm.code.base.add(nm.entry_off as usize) } as u64;
+    let call: CallStubFn = unsafe { std::mem::transmute(vm.stubs.call_stub_entry()) };
+    let vm_ptr: *mut VmState = &mut vm;
+    let deopts_before = unsafe { (*vm_ptr).stats.deopt_count };
+    let result = unsafe { call(entry, vm_ptr, [self_smi.raw()].as_ptr(), 1) };
+    let deopts_after = unsafe { (*vm_ptr).stats.deopt_count };
+
+    assert_eq!(
+        result,
+        SmallInt::new(42).oop().raw(),
+        "the in-block trap must deopt through the block frame + home frame and return 42"
+    );
+    assert_eq!(
+        deopts_after,
+        deopts_before + 1,
+        "exactly one deopt fired (the block's trap)"
+    );
+}
+
+/// S14 step 7-II: a spliced block whose in-body send is WARM → a real compiled
+/// `CallSend` inside the elided block (no trap, no deopt). `[:x | x bar] value:
+/// 7` with `x bar` warmed mono → the block body dispatches `bar` and returns 42,
+/// matching the interpreter, WITHOUT any deopt.
+#[test]
+fn compiled_block_with_warm_send_matches_interpreter() {
+    let mut vm = test_vm();
+    install_value_prims(&mut vm);
+    let smi_klass = vm.universe.smi_klass;
+
+    let bar_sel = vm.universe.intern(b"bar");
+    let bar = {
+        let mut bb = BytecodeBuilder::new();
+        bb.push_smi_i8(42);
+        bb.ret_tos();
+        bb.finish(&mut vm, bar_sel, 0, 0)
+    };
+    install_method(&mut vm, smi_klass, bar_sel, bar);
+
+    let value_arg_sel = vm.universe.intern(b"value:");
+    let sel = vm.universe.intern(b"applyTo7");
+    let mut b = BytecodeBuilder::new();
+    let lit = b.build_block(&mut vm, 1, 0, false, 0, false, |blk, vm| {
+        blk.push_temp(0);
+        blk.send(vm, bar_sel, 0);
+        blk.block_return_tos();
+    });
+    b.push_closure(lit, 0);
+    b.push_smi_i8(7);
+    b.send(&mut vm, value_arg_sel, 1);
+    b.ret_tos();
+    let m = b.finish(&mut vm, sel, 0, 0);
+
+    // Warm the BLOCK's own `x bar` IC (ic index 0) to Mono on SmallInteger so it
+    // splices as a compiled `CallSend`, not a trap.
+    let block = MethodOop::try_from(m.literals().at(lit)).unwrap();
+    let epoch = vm.ic_epoch;
+    InterpreterIc::at(block, 0).set_mono(&mut vm, smi_klass, bar, epoch);
+
+    assert!(driver::eligible(&vm, m));
+    let id = driver::compile_method(&mut vm, smi_klass, m).expect("must compile");
+    // The block's warm `x bar` splices as a real compiled IC site.
+    assert_eq!(
+        vm.code_table.get(id).unwrap().ic_sites.len(),
+        1,
+        "the block's warm `x bar` is a compiled IC site inside the splice"
+    );
+
+    let self_smi = SmallInt::new(1).oop();
+    let interp = macvm::interpreter::run_method(&mut vm, m, self_smi, &[]);
+    assert_eq!(interp.raw(), SmallInt::new(42).oop().raw());
+
+    let nm = vm.code_table.get(id).expect("installed");
+    let entry = unsafe { nm.code.base.add(nm.entry_off as usize) } as u64;
+    let call: CallStubFn = unsafe { std::mem::transmute(vm.stubs.call_stub_entry()) };
+    let vm_ptr: *mut VmState = &mut vm;
+    let deopts_before = unsafe { (*vm_ptr).stats.deopt_count };
+    let result = unsafe { call(entry, vm_ptr, [self_smi.raw()].as_ptr(), 1) };
+    let deopts_after = unsafe { (*vm_ptr).stats.deopt_count };
+    assert_eq!(
+        result,
+        SmallInt::new(42).oop().raw(),
+        "compiled block CallSend → 42"
+    );
+    assert_eq!(
+        deopts_after, deopts_before,
+        "the warm block send does not deopt"
+    );
+}

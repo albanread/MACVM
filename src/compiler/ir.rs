@@ -2292,9 +2292,9 @@ impl<'a> Translator<'a> {
     ///
     /// Only reached for a method the escape pre-pass proved `all_elidable`
     /// (`self.escape.is_some()`), so a live block-site here is always an
-    /// immediately-invoked, non-escaping, safepoint-free literal block.
-    /// `_deopt`/`_trapped` are unused in 7-I (a send-free block records no deopt
-    /// site and never traps) — threaded now for the non-leaf-block slice.
+    /// immediately-invoked, non-escaping literal block. 7-II: a spliced block
+    /// with a cold in-body send lowers to a terminating trap — `splice_block`
+    /// returns `true`, which sets `*trapped` so `convert` finishes the block.
     #[allow(clippy::too_many_arguments)]
     fn translate_site_instr(
         &mut self,
@@ -2303,8 +2303,8 @@ impl<'a> Translator<'a> {
         stack: &mut Vec<VReg>,
         stack_sites: &mut Vec<Option<usize>>,
         code: &mut Vec<Ir>,
-        _deopt: &mut Vec<(u32, DeoptRaw)>,
-        _trapped: &mut bool,
+        deopt: &mut Vec<(u32, DeoptRaw)>,
+        trapped: &mut bool,
     ) -> Option<Option<BlockId>> {
         match *instr {
             // A proven-elidable closure: emit NO IR. Push a phantom onto the
@@ -2380,7 +2380,9 @@ impl<'a> Translator<'a> {
                 // borrow of `self.escape` ends before the `&mut self` splice.)
                 let target = self.escape.as_ref().and_then(|e| e.value_send_target(bci));
                 if let Some(site) = target {
-                    self.splice_block(site, ic, bci, stack, stack_sites, code);
+                    if self.splice_block(site, ic, bci, stack, stack_sites, code, deopt) {
+                        *trapped = true;
+                    }
                     Some(None)
                 } else {
                     None
@@ -2390,25 +2392,39 @@ impl<'a> Translator<'a> {
         }
     }
 
-    /// S14 step 7-I: splice a proven-elidable literal block's body inline at its
-    /// `value`-family send. Mirrors [`Translator::try_inline_leaf`] (a single
-    /// straight-line, SAFEPOINT-FREE body) MINUS the receiver guard: the receiver
-    /// is statically the block created at `site_bci`, so there is no klass to
-    /// test and no dependency to record. The block's home `self` is M's receiver
-    /// (`self_vreg` = the closure's captured `copied[0]`, SPEC §5.4). Pops the
-    /// value-send's args + the phantom receiver (keeping `stack`/`stack_sites` in
-    /// lockstep) and pushes the block's return value. Records NO deopt site: a
-    /// send-free body has no safepoint, so no `is_block` scope is emitted — the
-    /// block-scope deopt materializer arrives with non-leaf block inlining.
+    /// S14 step 7-I/7-II: splice a proven-elidable literal block's body inline at
+    /// its `value`-family send. Like [`Translator::try_inline_nonleaf`] MINUS the
+    /// receiver guard — the receiver is statically the block created at
+    /// `site_bci`, so there is no klass to test and no dependency to record. The
+    /// block's home `self` is M's receiver (`self_vreg` = the closure's captured
+    /// `copied[0]`, SPEC §5.4). Pops the value-send's args + the phantom receiver
+    /// (keeping `stack`/`stack_sites` in lockstep).
+    ///
+    /// **7-II**: the block body MAY contain its own (non-super) sends — each
+    /// becomes a plain `Ir::CallSend` (or, for a cold IC, a step-3
+    /// `Ir::UncommonTrap`) inside the spliced extent, recording an in-body deopt
+    /// scope with an `is_block: true` `InlineSite` chained to M. A deopt there
+    /// rebuilds the block's OWN activation frame: it is a method-shaped frame, and
+    /// the block frame's only structural difference (the closure in its
+    /// receiver-arg slot rather than the home self) is read ONLY by `nlr_tos` /
+    /// nested `push_closure`, both still gated out — so the deopt materializer's
+    /// method-frame path reconstructs it soundly (`runtime/deopt.rs`).
+    ///
+    /// Returns `true` iff an in-body send was cold and became a TERMINATING trap
+    /// (control leaves the method — the caller must finish the current block,
+    /// nothing after is reachable); on a normal return it pushes the block's
+    /// result onto `stack` and returns `false`.
+    #[allow(clippy::too_many_arguments)]
     fn splice_block(
         &mut self,
         site_bci: usize,
         ic: u16,
-        _send_bci: usize,
+        send_bci: usize,
         stack: &mut Vec<VReg>,
         stack_sites: &mut Vec<Option<usize>>,
         code: &mut Vec<Ir>,
-    ) {
+        deopt: &mut Vec<(u32, DeoptRaw)>,
+    ) -> bool {
         // Resolve the CompiledBlock from the `push_closure` literal at `site_bci`.
         let (site_instr, _) = decode_at(self.method, site_bci);
         let lit = match site_instr {
@@ -2474,12 +2490,32 @@ impl<'a> Translator<'a> {
             slots.push(t);
         }
 
-        // Translate the block's straight-line, safepoint-free body onto a fresh
-        // operand stack. Same value-shuffle/field/return arms as the leaf method
-        // splice, PLUS `BlockReturnTos` (a block's own fall-off return, which
-        // `decode` treats as a `Return` terminator — decode.rs).
+        // 7-II: the InlineSite prototype for every in-body deopt safepoint. The
+        // reconstructed inlined scope is an `is_block` scope whose sender is M
+        // (this method): `sender_bci` is the value-send's bci and
+        // `caller_pending_stack` is M's operand stack BELOW the value-send's
+        // receiver+args (which we just popped, so `stack` IS that now). The
+        // scope's receiver is the block's home self (M's receiver) and its slots
+        // are the block's args+temps.
+        let block_pool_ix = self.pool.intern(block.oop().raw(), Some(RelocKind::Oop)).0;
+        let inline_proto = InlineSite {
+            method_pool_ix: block_pool_ix,
+            receiver: block_self,
+            slots: slots.clone(),
+            sender_bci: send_bci as u16,
+            caller_pending_stack: stack.clone(),
+            is_block: true,
+        };
+
+        // Translate the block's straight-line body onto a fresh operand stack.
+        // Same value-shuffle/field/return arms as the leaf method splice, PLUS
+        // `BlockReturnTos` (a block's own fall-off return, which `decode` treats
+        // as a `Return` terminator — decode.rs), PLUS the 7-II `Send` arm (a
+        // compiled `CallSend` or a step-3 cold trap inside the inlined block,
+        // recording an `is_block` in-body deopt scope).
         let mut bstack: Vec<VReg> = Vec::new();
         let mut result: Option<VReg> = None;
+        let mut trapped = false;
         let len = block.bytecode_len();
         let mut bci = 0;
         while bci < len {
@@ -2592,7 +2628,97 @@ impl<'a> Translator<'a> {
                     result = Some(block_self);
                     break;
                 }
-                // `block_is_spliceable` rejected sends / ctx / closure / NLR, and
+                // 7-II: the block's OWN (non-super) sends. A cold IC (Untaken)
+                // lowers to a TERMINATING uncommon trap inside the inlined block
+                // (re-executing the send interpreted); a warm IC stays a plain
+                // compiled `CallSend`. Both record an `is_block` in-body deopt
+                // scope. Mirrors `try_inline_nonleaf`'s Send arm exactly, minus
+                // recursion (depth-1 into the block: a nested send stays a Call).
+                Instr::Send {
+                    ic: inner_ic_idx,
+                    super_,
+                } => {
+                    debug_assert!(
+                        !super_,
+                        "block splice: super send gated out by block_is_spliceable"
+                    );
+                    let inner_ic = InterpreterIc::at(block, inner_ic_idx);
+                    let inner_argc = inner_ic.argc();
+                    let inner_sel = inner_ic.selector();
+                    let inner_bci = bci;
+                    let inner_fb = crate::compiler::feedback::read_send_site(
+                        self.vm,
+                        block,
+                        inner_ic_idx,
+                        None,
+                    );
+                    let mut inner_args: Vec<VReg> = (0..inner_argc)
+                        .map(|_| {
+                            bstack
+                                .pop()
+                                .expect("block splice: inner send missing arg operand")
+                        })
+                        .collect();
+                    inner_args.reverse();
+                    let inner_recv = bstack
+                        .pop()
+                        .expect("block splice: inner send missing receiver operand");
+
+                    if let crate::compiler::inline::InlineDecision::Trap =
+                        crate::compiler::inline::decide(&inner_fb)
+                    {
+                        // Cold inner send → terminating trap re-executing it
+                        // interpreted. Recorded stack has the receiver+args still
+                        // present (reexecute=true), in the BLOCK's own scope.
+                        let mut reexec_stack = bstack.clone();
+                        reexec_stack.push(inner_recv);
+                        reexec_stack.extend_from_slice(&inner_args);
+                        deopt.push((
+                            code.len() as u32,
+                            DeoptRaw {
+                                stack: reexec_stack,
+                                bci: inner_bci,
+                                kind: SafepointKind::UncommonTrap,
+                                reexecute: true,
+                                inline: Some(inline_proto.clone()),
+                            },
+                        ));
+                        code.push(Ir::UncommonTrap { bci: inner_bci });
+                        trapped = true;
+                        break;
+                    }
+
+                    let mut send_args = vec![inner_recv];
+                    send_args.extend_from_slice(&inner_args);
+                    let site = self.call_sites.len() as u16;
+                    self.call_sites.push(CallSiteInfo {
+                        selector: inner_sel,
+                        argc: inner_argc + 1,
+                        static_klass: None,
+                    });
+                    self.site_feedback.push(inner_fb);
+                    let dst = self.fresh(true);
+                    // Call-return safepoint (reexecute=false): recorded stack is
+                    // the block's operand stack BELOW the send; the materializer
+                    // pushes the result.
+                    deopt.push((
+                        code.len() as u32,
+                        DeoptRaw {
+                            stack: bstack.clone(),
+                            bci: inner_bci,
+                            kind: SafepointKind::Call,
+                            reexecute: false,
+                            inline: Some(inline_proto.clone()),
+                        },
+                    ));
+                    code.push(Ir::CallSend {
+                        dst,
+                        site,
+                        args: send_args,
+                    });
+                    bstack.push(dst);
+                }
+                // `block_is_spliceable` still rejects super/ctx/closure/NLR, and
                 // the single-block shape excludes jumps/branches; every other
                 // opcode is handled above.
                 other => unreachable!(
@@ -2602,9 +2728,16 @@ impl<'a> Translator<'a> {
             bci = next;
         }
 
+        if trapped {
+            // An in-body cold send became a terminating trap: control leaves the
+            // method here. Push NO result — the caller (`translate_site_instr`)
+            // propagates `trapped` so `convert` finishes the block at the trap.
+            return true;
+        }
         let result = result.expect("block splice: a returning block must produce a result");
         stack.push(result);
         stack_sites.push(None);
+        false
     }
 
     fn push_well_known(&mut self, raw: u64, code: &mut Vec<Ir>) -> VReg {

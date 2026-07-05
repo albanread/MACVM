@@ -711,7 +711,11 @@ fn build_deopt_metadata(
                             .collect();
                         rec.begin_scope(ScopeDescData {
                             method_pool_ix: site.method_pool_ix,
-                            is_block: false,
+                            // S14 step 7-II: an inlined spliced BLOCK records an
+                            // `is_block` scope (the deopt materializer rebuilds a
+                            // block activation frame); a step-4c method inline
+                            // records `false`.
+                            is_block: site.is_block,
                             sender: Some(SenderLink {
                                 sender: caller_scope,
                                 sender_bci: site.sender_bci,

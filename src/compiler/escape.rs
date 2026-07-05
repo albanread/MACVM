@@ -94,50 +94,47 @@ fn selector_bytes(method: MethodOop, ic: u16) -> Vec<u8> {
 }
 
 /// Is the CompiledBlock at `push_closure` site `s` (the literal `MethodOop`)
-/// itself spliceable by 7-I? Defers captured/owned-Context blocks (7-II) and
-/// any body containing a closure/ctx-temp/nlr opcode (later slices). A
+/// itself spliceable? Defers captured/owned-Context blocks and any body
+/// containing a super-send / closure / ctx-temp / NLR opcode (later slices). A
 /// `block_return_tos` IS allowed (it is the block's own return). Requires the
-/// single-straight-line shape the leaf splicer handles: exactly one basic block
+/// single-straight-line shape the splicer handles: exactly one basic block
 /// ending in a return terminator.
 ///
-/// **7-I is restricted to SAFEPOINT-FREE (send-free) blocks** — a spliced
-/// block's body must contain NO `Send` (real OR smi-inlinable — a `+`/`<` is a
-/// `Send` opcode with an overflow-trap safepoint), NO allocation. Rationale:
-/// the deopt materializer (`runtime/deopt.rs`) does NOT yet rebuild a block-
-/// activation frame from an `is_block` scope (it never allocated a real
-/// closure to reconstruct one from), so a deopt at a safepoint INSIDE an
-/// elided block would rebuild the wrong (method) frame. A send-free block has
-/// no in-body safepoint, so no in-block deopt can occur → the untested
-/// `is_block` materialization path is never reached. This mirrors exactly how
-/// step 4b (leaf methods) preceded 4c (non-leaf): the next slice adds the
-/// `is_block` deopt materialization and lifts this send-free restriction.
+/// **7-II**: an ordinary (non-super) `Send` inside the block body IS allowed —
+/// `splice_block` lowers it to a `CallSend`/cold-trap inside the inlined block,
+/// recording an `is_block` in-body deopt scope. A deopt there rebuilds the
+/// block's own (method-shaped) activation frame soundly, because the block
+/// frame's only structural difference — the closure in its receiver-arg slot —
+/// is read ONLY by `nlr_tos` / nested `push_closure`, both still gated out.
+/// (7-I had restricted this to send-free blocks while `runtime/deopt.rs`'s
+/// `is_block` handling was unproven; 7-II proves it and lifts the restriction.)
 fn block_is_spliceable(block: MethodOop) -> bool {
-    // Non-capturing, no owned Context (7-I scope). A block that captures the
-    // enclosing Context or owns its own heap Context needs captured-temp
-    // promotion (7-II) — gated out here.
+    // Non-capturing, no owned Context. A block that captures the enclosing
+    // Context or owns its own heap Context needs captured-temp promotion (the
+    // next slice) — gated out here.
     if block.captures_ctx() || block.has_ctx() {
         return false;
     }
-    // Single straight-line block ending in a return — the exact shape the leaf
-    // splicer (`splice_block`, no guard) handles. Validated against the SAME
-    // decode CFG the splicer re-validates against, so the two agree by
-    // construction.
+    // Single straight-line block ending in a return — the exact shape
+    // `splice_block` handles. Validated against the SAME decode CFG the splicer
+    // re-validates against, so the two agree by construction.
     let cfg = decode::decode(block);
     if cfg.blocks.len() != 1 || !matches!(cfg.blocks[0].terminator, Terminator::Return) {
         return false;
     }
-    // No opcode outside the safepoint-free set the splicer handles. ANY `Send`
-    // (a real send OR a smi-inlinable `+`/`<` — both introduce a safepoint the
-    // block-scope deopt materializer cannot yet service), a nested
-    // `push_closure`, a ctx-temp access, or an NLR all defer to a later slice —
-    // the block is not spliceable and its site is not elidable.
-    // `block_return_tos` is the block's own return and IS allowed.
+    // No opcode outside the set the splicer handles. A SUPER send (needs
+    // static-super scope machinery), a nested `push_closure`, a ctx-temp access,
+    // or an NLR all defer to a later slice — the block is not spliceable.
+    // `block_return_tos` is the block's own return and IS allowed. 7-II: an
+    // ordinary (non-super) `Send` IS allowed — the splicer lowers it to a
+    // `CallSend`/cold-trap inside the block, recording an `is_block` in-body
+    // deopt scope the materializer rebuilds soundly.
     let len = block.bytecode_len();
     let mut bci = 0;
     while bci < len {
         let (instr, next) = decode_at(block, bci);
         match instr {
-            Instr::Send { .. }
+            Instr::Send { super_: true, .. }
             | Instr::PushCtxTemp { .. }
             | Instr::StoreCtxTempPop { .. }
             | Instr::PushClosure { .. }
@@ -666,17 +663,17 @@ mod tests {
         assert_eq!(e.escaping.len(), 1);
     }
 
-    /// 7-I is SAFEPOINT-FREE: a block whose body contains a `Send` (here a smi
-    /// `+`, which is a `Send` opcode with an overflow-trap safepoint) is NOT
-    /// spliceable → its site escapes, even though it is directly invoked. The
-    /// next slice (block-scope deopt materialization) lifts this.
+    /// 7-II: a block whose body contains an ordinary (non-super) `Send` (here a
+    /// smi `+`) IS spliceable → elidable when directly invoked. Its `+` becomes a
+    /// `CallSend`/cold-trap inside the inlined block; a deopt there rebuilds the
+    /// block's own frame. (7-I had gated send-ful blocks out.)
     #[test]
-    fn block_with_a_send_escapes() {
+    fn block_with_a_send_is_elidable() {
         let mut vm = test_vm();
         let value_sel = vm.universe.intern(b"value");
         let plus = vm.universe.intern(b"+");
         let mut b = BytecodeBuilder::new();
-        // `[ 3 + 4 ] value` — the block body has a `+` send (a safepoint).
+        // `[ 3 + 4 ] value` — the block body has a `+` send.
         let lit = b.build_block(&mut vm, 0, 0, false, 0, false, |blk, vm| {
             blk.push_smi_i8(3);
             blk.push_smi_i8(4);
@@ -691,8 +688,35 @@ mod tests {
 
         let e = analyze(m);
         assert!(
+            e.all_elidable,
+            "a directly-invoked block with an ordinary send is spliceable (7-II)"
+        );
+        assert!(e.escaping.is_empty());
+    }
+
+    /// A block containing a SUPER send is still NOT spliceable (needs
+    /// static-super scope machinery) → its site escapes.
+    #[test]
+    fn block_with_a_super_send_escapes() {
+        let mut vm = test_vm();
+        let value_sel = vm.universe.intern(b"value");
+        let foo = vm.universe.intern(b"foo");
+        let mut b = BytecodeBuilder::new();
+        let lit = b.build_block(&mut vm, 0, 0, false, 0, false, |blk, vm| {
+            blk.push_self();
+            blk.send_super(vm, foo, 0);
+            blk.ret_tos();
+        });
+        b.push_closure(lit, 0);
+        b.send(&mut vm, value_sel, 0);
+        b.ret_tos();
+        let sel = vm.universe.intern(b"m");
+        let m = b.finish(&mut vm, sel, 0, 0);
+
+        let e = analyze(m);
+        assert!(
             !e.all_elidable,
-            "a block whose body contains a send is not safepoint-free → escaping in 7-I"
+            "a block with a super send is not spliceable → escaping"
         );
         assert_eq!(e.escaping.len(), 1);
     }
