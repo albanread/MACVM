@@ -707,6 +707,52 @@ fn emit_inlined(
             b.bind(l2);
             b.push_nil();
         }
+        // S15: `n timesRepeat: [body]` — `to:do:`'s shape minus the loop
+        // variable. Answers the receiver (Smalltalk's own contract); zero
+        // and negative receivers run the body zero times (`1 <= n` fails
+        // immediately).
+        "timesRepeat:" => {
+            let body_blk = arg_block(0);
+
+            emit_expr(cx, hoist, cache, b, scope_id, next_hoist_slot, receiver)?;
+            b.dup();
+            let lim_slot = *next_hoist_slot as u8;
+            *next_hoist_slot += 1;
+            b.store_temp_pop(lim_slot);
+            let i_slot = *next_hoist_slot as u8;
+            *next_hoist_slot += 1;
+            b.push_smi_i8(1);
+            b.store_temp_pop(i_slot);
+
+            let l0 = b.new_label();
+            let l2 = b.new_label();
+            b.bind(l0);
+            b.push_temp(i_slot);
+            b.push_temp(lim_slot);
+            let le_sel = cx.vm.universe.intern(b"<=");
+            b.send(cx.vm, le_sel, 1);
+            b.br_false_fwd(l2);
+
+            emit_statement_seq(
+                cx,
+                hoist,
+                cache,
+                b,
+                scope_id,
+                next_hoist_slot,
+                &body_blk.body,
+            )?;
+            b.pop();
+
+            b.push_temp(i_slot);
+            b.push_smi_i8(1);
+            let plus_sel = cx.vm.universe.intern(b"+");
+            b.send(cx.vm, plus_sel, 1);
+            b.store_temp_pop(i_slot);
+            b.jump_back(l0);
+            b.bind(l2);
+            // The dup'd receiver from setup is now TOS = the result.
+        }
         "to:do:" => {
             let body_blk = arg_block(1);
             let loop_var = &body_blk.params[0];

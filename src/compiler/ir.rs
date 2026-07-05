@@ -164,6 +164,32 @@ pub enum Ir {
         b: VReg,
         fail: BlockId,
     },
+    /// S15 step 7 (the sieve fix): Array element READ intrinsified — the
+    /// same treatment smi arithmetic got in S14. Inline guards (receiver
+    /// mem-tagged AND klass == Array, index smi, 1-based bounds vs the
+    /// tagged size slot) then a single load; `fail` is a reexecute-true
+    /// trap edge that re-runs the send interpreted (prim-fail → the
+    /// Smalltalk error path, byte-identical semantics).
+    ArrayAt {
+        dst: VReg,
+        arr: VReg,
+        idx: VReg,
+        /// Pool literal holding the Array klass oop (GC keeps it current).
+        klass: PoolLit,
+        fail: BlockId,
+    },
+    /// S15: Array element WRITE intrinsified — guards as `ArrayAt`, then a
+    /// single store + the same young-into-old card barrier `StoreField`
+    /// emits. Produces the stored value (the send's own result).
+    ArrayAtPut {
+        dst: VReg,
+        arr: VReg,
+        idx: VReg,
+        val: VReg,
+        /// Pool literal holding the Array klass oop.
+        klass: PoolLit,
+        fail: BlockId,
+    },
     /// The fusion peephole (D3.2): a comparison send whose ONLY consumer
     /// is an immediately-following `br_true_fwd`/`br_false_fwd`.
     SmiCmpBr {
@@ -284,6 +310,15 @@ impl Ir {
                 f(*a);
                 f(*b);
             }
+            Ir::ArrayAt { arr, idx, .. } => {
+                f(*arr);
+                f(*idx);
+            }
+            Ir::ArrayAtPut { arr, idx, val, .. } => {
+                f(*arr);
+                f(*idx);
+                f(*val);
+            }
             Ir::BoolBr { val, .. } => f(*val),
             Ir::GuardKlass { obj, .. } => f(*obj),
             Ir::CallSend { args, .. } | Ir::CallRuntime { args, .. } => {
@@ -331,6 +366,8 @@ impl Ir {
             | Ir::LoadKlass { dst, .. }
             | Ir::LoadField { dst, .. }
             | Ir::SmiArith { dst, .. }
+            | Ir::ArrayAt { dst, .. }
+            | Ir::ArrayAtPut { dst, .. }
             | Ir::SmiCmpVal { dst, .. }
             | Ir::CallSend { dst, .. }
             | Ir::Alloc { dst, .. } => f(*dst),
@@ -738,6 +775,22 @@ fn is_smi_inlinable_on(vm: &VmState, method: MethodOop, ic_idx: u16) -> bool {
     crate::compiler::driver::SMI_INLINE.contains(&target.primitive())
 }
 
+/// S15: free-function twin of `Translator::array_op_kind` for an INLINED
+/// callee's own IC table (the splicers intrinsify their bodies' array ops
+/// exactly like their smi ops). `Some(is_put)`.
+fn array_op_kind_on(vm: &VmState, method: MethodOop, ic_idx: u16) -> Option<bool> {
+    let ic = InterpreterIc::at(method, ic_idx);
+    if ic.guard().raw() != vm.universe.array_klass.oop().raw() {
+        return None;
+    }
+    let target = MethodOop::try_from(ic.target())?;
+    match target.primitive() {
+        26 => Some(false),
+        27 => Some(true),
+        _ => None,
+    }
+}
+
 fn classify_smi_send(vm: &VmState, method: MethodOop, ic_idx: u16) -> SmiSendKind {
     let ic = InterpreterIc::at(method, ic_idx);
     assert_eq!(
@@ -1095,6 +1148,25 @@ impl<'a> Translator<'a> {
             None
         } else {
             Some(target)
+        }
+    }
+
+    /// S15 (the sieve fix): is send site `ic_idx` a mono-Array-guarded
+    /// `at:` / `at:put:` primitive — the intrinsify-to-`ArrayAt`/
+    /// `ArrayAtPut` class? Exactly `is_smi_inlinable`'s shape, one klass
+    /// over: the IC observed only Array receivers and the target is the
+    /// indexable-oops primitive, so the element access compiles to inline
+    /// guards + one memory op instead of a per-element c2i round trip.
+    fn array_op_kind(&self, method: MethodOop, ic_idx: u16) -> Option<bool /* is_put */> {
+        let ic = InterpreterIc::at(method, ic_idx);
+        if ic.guard().raw() != self.vm.universe.array_klass.oop().raw() {
+            return None;
+        }
+        let target = MethodOop::try_from(ic.target())?;
+        match target.primitive() {
+            26 => Some(false), // at:
+            27 => Some(true),  // at:put:
+            _ => None,
         }
     }
 
@@ -1676,6 +1748,49 @@ impl<'a> Translator<'a> {
                     // the root's smi-inline path minus branch fusion; the fail
                     // edge is an InlineSite-chained reexecute trap (`a`/`b`
                     // still on the recorded stack).
+                    if let Some(is_put) = array_op_kind_on(self.vm, callee, ic) {
+                        // S15: in-body array intrinsic (see the root arm).
+                        let val = if is_put {
+                            Some(cstack.pop().expect("array fuse: missing value"))
+                        } else {
+                            None
+                        };
+                        let idx_op = cstack.pop().expect("array fuse: missing index");
+                        let arr_op = cstack.pop().expect("array fuse: missing receiver");
+                        let mut reexec = cstack.clone();
+                        reexec.push(arr_op);
+                        reexec.push(idx_op);
+                        if let Some(v) = val {
+                            reexec.push(v);
+                        }
+                        let fail =
+                            self.fresh_inlined_trap_block(inner_bci, reexec, inline_proto.clone());
+                        let klass = self.pool.intern(
+                            self.vm.universe.array_klass.oop().raw(),
+                            Some(RelocKind::Oop),
+                        );
+                        let dst = self.fresh(true);
+                        match val {
+                            Some(v) => code.push(Ir::ArrayAtPut {
+                                dst,
+                                arr: arr_op,
+                                idx: idx_op,
+                                val: v,
+                                klass,
+                                fail,
+                            }),
+                            None => code.push(Ir::ArrayAt {
+                                dst,
+                                arr: arr_op,
+                                idx: idx_op,
+                                klass,
+                                fail,
+                            }),
+                        }
+                        cstack.push(dst);
+                        bci = next;
+                        continue;
+                    }
                     if is_smi_inlinable_on(self.vm, callee, ic) {
                         debug_assert_eq!(inner_argc, 1, "SMI_INLINE ops are all binary");
                         let b_op = cstack.pop().expect("smi fuse: missing rhs");
@@ -2283,6 +2398,55 @@ impl<'a> Translator<'a> {
                         // the phantom check: a phantom receiver is never a
                         // fusable smi site. The shadow pops in lockstep
                         // (operands are never phantoms — transparency).
+                        if let Some(is_put) = array_op_kind_on(self.vm, callee, ic) {
+                            // S15: in-body array intrinsic (see the root arm).
+                            let popped = if is_put { 3 } else { 2 };
+                            cstack_ph.truncate(cstack.len().saturating_sub(popped));
+                            let val = if is_put {
+                                Some(cstack.pop().expect("array fuse: missing value"))
+                            } else {
+                                None
+                            };
+                            let idx_op = cstack.pop().expect("array fuse: missing index");
+                            let arr_op = cstack.pop().expect("array fuse: missing receiver");
+                            let mut reexec = cstack.clone();
+                            reexec.push(arr_op);
+                            reexec.push(idx_op);
+                            if let Some(v) = val {
+                                reexec.push(v);
+                            }
+                            let fail = self.fresh_inlined_trap_block(
+                                inner_bci,
+                                reexec,
+                                inline_proto.clone(),
+                            );
+                            let klass = self.pool.intern(
+                                self.vm.universe.array_klass.oop().raw(),
+                                Some(RelocKind::Oop),
+                            );
+                            let dst = self.fresh(true);
+                            match val {
+                                Some(v) => bcode.push(Ir::ArrayAtPut {
+                                    dst,
+                                    arr: arr_op,
+                                    idx: idx_op,
+                                    val: v,
+                                    klass,
+                                    fail,
+                                }),
+                                None => bcode.push(Ir::ArrayAt {
+                                    dst,
+                                    arr: arr_op,
+                                    idx: idx_op,
+                                    klass,
+                                    fail,
+                                }),
+                            }
+                            cstack.push(dst);
+                            cstack_ph.push(false);
+                            bci = next;
+                            continue;
+                        }
                         if is_smi_inlinable_on(self.vm, callee, ic) {
                             debug_assert_eq!(inner_argc, 1, "SMI_INLINE ops are all binary");
                             cstack_ph.truncate(cstack.len().saturating_sub(2));
@@ -2897,6 +3061,72 @@ impl<'a> Translator<'a> {
                         split = Some(continuation_id);
                     }
                 }
+            }
+            // S15 (the sieve fix): mono-Array `at:`/`at:put:` intrinsified —
+            // the same fusion smi arithmetic got in S14. The fail edge is a
+            // reexecute-true trap that re-runs the send interpreted, so
+            // bounds errors, non-Array receivers, and non-smi indices keep
+            // byte-identical Smalltalk semantics (the primitive's own
+            // fallback path).
+            Instr::Send { ic, .. } if self.array_op_kind(self.method, ic).is_some() => {
+                let is_put = self
+                    .array_op_kind(self.method, ic)
+                    .expect("guard just matched");
+                let reexec_stack = stack.clone();
+                let klass = self.pool.intern(
+                    self.vm.universe.array_klass.oop().raw(),
+                    Some(RelocKind::Oop),
+                );
+                // Fail-only trap block, NO continuation split: the intrinsic
+                // is an ordinary mid-block op (exactly like the splicers'
+                // in-body fused ops) — splitting here collided with branch
+                // TERMINATORS when the send feeds `ifTrue:` directly (the
+                // split's continuation left the result outside the block the
+                // terminator's depth accounting expected — the sieve warm-
+                // compile merge-depth panic).
+                let fail_id = self.fresh_block_id();
+                self.finish_block(IrBlock {
+                    id: fail_id,
+                    bci,
+                    code: vec![Ir::UncommonTrap { bci }],
+                    entry_stack: Vec::new(),
+                    deopt_sites: vec![(
+                        0,
+                        DeoptRaw {
+                            stack: reexec_stack,
+                            bci,
+                            kind: SafepointKind::UncommonTrap,
+                            reexecute: true,
+                            stack_closures: Vec::new(),
+                            inline: None,
+                        },
+                    )],
+                });
+                let dst = self.fresh(true);
+                if is_put {
+                    let val = stack.pop().expect("at:put:: missing value operand");
+                    let idx = stack.pop().expect("at:put:: missing index operand");
+                    let arr = stack.pop().expect("at:put:: missing receiver operand");
+                    code.push(Ir::ArrayAtPut {
+                        dst,
+                        arr,
+                        idx,
+                        val,
+                        klass,
+                        fail: fail_id,
+                    });
+                } else {
+                    let idx = stack.pop().expect("at:: missing index operand");
+                    let arr = stack.pop().expect("at:: missing receiver operand");
+                    code.push(Ir::ArrayAt {
+                        dst,
+                        arr,
+                        idx,
+                        klass,
+                        fail: fail_id,
+                    });
+                }
+                stack.push(dst);
             }
             // D1's "arbitrary send/send_w in ANY IC state": every send this
             // step's own smi-inline guard above doesn't handle (Poly, Mega,
@@ -3981,6 +4211,49 @@ impl<'a> Translator<'a> {
                     // the nonleaf splicer's identical arm) — THE flagship
                     // accumulate block `[:e| sum := sum + e]` becomes a real
                     // `adds` instead of a per-iteration stub call.
+                    if let Some(is_put) = array_op_kind_on(self.vm, block, inner_ic_idx) {
+                        // S15: in-body array intrinsic (see the root arm).
+                        let val = if is_put {
+                            Some(bstack.pop().expect("array fuse: missing value"))
+                        } else {
+                            None
+                        };
+                        let idx_op = bstack.pop().expect("array fuse: missing index");
+                        let arr_op = bstack.pop().expect("array fuse: missing receiver");
+                        let mut reexec = bstack.clone();
+                        reexec.push(arr_op);
+                        reexec.push(idx_op);
+                        if let Some(v) = val {
+                            reexec.push(v);
+                        }
+                        let fail =
+                            self.fresh_inlined_trap_block(inner_bci, reexec, inline_proto.clone());
+                        let klass = self.pool.intern(
+                            self.vm.universe.array_klass.oop().raw(),
+                            Some(RelocKind::Oop),
+                        );
+                        let dst = self.fresh(true);
+                        match val {
+                            Some(v) => code.push(Ir::ArrayAtPut {
+                                dst,
+                                arr: arr_op,
+                                idx: idx_op,
+                                val: v,
+                                klass,
+                                fail,
+                            }),
+                            None => code.push(Ir::ArrayAt {
+                                dst,
+                                arr: arr_op,
+                                idx: idx_op,
+                                klass,
+                                fail,
+                            }),
+                        }
+                        bstack.push(dst);
+                        bci = next;
+                        continue;
+                    }
                     if is_smi_inlinable_on(self.vm, block, inner_ic_idx) {
                         debug_assert_eq!(inner_argc, 1, "SMI_INLINE ops are all binary");
                         let b_op = bstack.pop().expect("smi fuse: missing rhs");
@@ -4314,6 +4587,15 @@ fn map_uses(op: &mut Ir, mut f: impl FnMut(VReg) -> VReg) {
             *a = f(*a);
             *b = f(*b);
         }
+        Ir::ArrayAt { arr, idx, .. } => {
+            *arr = f(*arr);
+            *idx = f(*idx);
+        }
+        Ir::ArrayAtPut { arr, idx, val, .. } => {
+            *arr = f(*arr);
+            *idx = f(*idx);
+            *val = f(*val);
+        }
         Ir::BoolBr { val, .. } => *val = f(*val),
         Ir::GuardKlass { obj, .. } => *obj = f(*obj),
         Ir::CallSend { args, .. } | Ir::CallRuntime { args, .. } => {
@@ -4454,7 +4736,9 @@ pub(crate) fn copy_propagate(m: &mut IrMethod) {
             }
             if !alias.is_empty() {
                 match op {
-                    Ir::SmiArith { fail, .. }
+                    Ir::ArrayAt { fail, .. }
+                    | Ir::ArrayAtPut { fail, .. }
+                    | Ir::SmiArith { fail, .. }
                     | Ir::SmiCmpVal { fail, .. }
                     | Ir::SmiCmpBr { fail, .. }
                     | Ir::GuardKlass { fail, .. } => {
@@ -4884,6 +5168,7 @@ pub fn convert(vm: &VmState, rcvr_klass: KlassOop, method: MethodOop, cfg: &Cfg)
         // block `continue`d above), so its terminator's successors are live too
         // — mark them reachable BEFORE the terminator match feeds their merges.
         // A `Return` has no successor.
+        let mut had_unfused_branch = false;
         match cfg_block.terminator {
             Terminator::Return => {}
             Terminator::Fallthrough(t) | Terminator::Jump { target: t, .. } => reachable[t] = true,
@@ -4946,8 +5231,27 @@ pub fn convert(vm: &VmState, rcvr_klass: KlassOop, method: MethodOop, cfg: &Cfg)
                 });
             }
             Terminator::Branch { if_true, if_false } => {
-                emit_merges(&sources, &entry_stacks, if_true, &local_exit, &mut code);
-                emit_merges(&sources, &entry_stacks, if_false, &local_exit, &mut code);
+                // The stack the SUCCESSORS see: a FUSED comparison never
+                // pushed its condition (pending_cmp — local_exit is already
+                // successor-shaped), but a NON-fused BoolBr consumes the
+                // condition it finds on top, so the merges (and the Inherit
+                // record below) must see local_exit WITH THE CONDITION
+                // POPPED. Feeding the full stack left every successor one
+                // deep — latent since 7b-ii shipped BoolBr, hidden because a
+                // cold condition send cut the block at a trap and a warm one
+                // was, until S15's deeper dissolved-loop nesting, always
+                // smi-fusable (found by the sieve warm compile's merge-depth
+                // assert).
+                let succ_exit: Vec<VReg> = if pending_cmp.is_some() {
+                    local_exit.clone()
+                } else {
+                    let mut v = local_exit.clone();
+                    v.pop()
+                        .expect("branch terminator with an empty simulated stack (compiler bug)");
+                    v
+                };
+                emit_merges(&sources, &entry_stacks, if_true, &succ_exit, &mut code);
+                emit_merges(&sources, &entry_stacks, if_false, &succ_exit, &mut code);
                 if let Some((op, a, b_, deopt_info)) = pending_cmp.take() {
                     // S13 step 7b: `deopt_info` was captured at the fused
                     // comparison's own smi-inline site (before its operand
@@ -4965,6 +5269,7 @@ pub fn convert(vm: &VmState, rcvr_klass: KlassOop, method: MethodOop, cfg: &Cfg)
                         fail: fail_id,
                     });
                 } else {
+                    had_unfused_branch = true;
                     let val = *local_exit
                         .last()
                         .expect("branch terminator with an empty simulated stack (compiler bug)");
@@ -4983,7 +5288,19 @@ pub fn convert(vm: &VmState, rcvr_klass: KlassOop, method: MethodOop, cfg: &Cfg)
             }
         }
 
-        exit_stacks[b] = Some(local_exit);
+        // Inherit-successors must ALSO see the branch condition popped —
+        // record the successor-shaped stack for Branch terminators (identity
+        // for every other terminator).
+        exit_stacks[b] = Some(match cfg_block.terminator {
+            Terminator::Branch { .. } => {
+                let mut v = local_exit.clone();
+                if had_unfused_branch {
+                    v.pop();
+                }
+                v
+            }
+            _ => local_exit,
+        });
         t.finish_block(IrBlock {
             id: cur_id,
             bci: cur_bci,

@@ -170,6 +170,12 @@ pub fn inline_block_positions(
         {
             Some(vec![BlockPos::Receiver, BlockPos::Arg(0)])
         }
+        // S15 (the sieve unlock): `n timesRepeat: [body]` — a zero-arg
+        // literal block repeated receiver-many times. Not inlining it made
+        // any method using it permanently uncompilable (the block escapes
+        // into a real send), which is exactly how sieve's whole `run` — and
+        // every hot loop inside it — stayed interpreted forever.
+        ("timesRepeat:", 1) if block_argc(&args[0]) == Some(0) => Some(vec![BlockPos::Arg(0)]),
         ("to:do:", 2) if block_argc(&args[1]) == Some(1) => {
             let Expr::Block(b) = &args[1] else {
                 unreachable!()
@@ -206,10 +212,45 @@ fn to_do_needs_real_send(loop_var: &str, body: &[Expr]) -> bool {
                 }
                 scan(value, loop_var, in_nested_block, found);
             }
-            Expr::Send { receiver, args, .. } => {
-                scan(receiver, loop_var, in_nested_block, found);
-                for a in args {
-                    scan(a, loop_var, in_nested_block, found);
+            Expr::Send {
+                receiver,
+                selector,
+                args,
+                ..
+            } => {
+                // S15: a send whose literal-block arguments will themselves
+                // be DISSOLVED (ifTrue:/whileTrue:/to:do:/timesRepeat: — the
+                // recursive `inline_block_positions` check) creates no
+                // closure: references from inside those blocks compile in
+                // the SAME scope, so they don't force a real `to:do:` send.
+                // Only blocks in genuinely non-inlinable positions keep
+                // marking `in_nested_block`. (Before this, sieve's second
+                // loop — `i` referenced inside its `ifTrue:` arm — was
+                // declined, which left the whole enclosing method with an
+                // escaping closure and thus permanently uncompilable.)
+                let dissolving = inline_block_positions(selector, receiver, args);
+                let pos_dissolves = |p: BlockPos| {
+                    dissolving
+                        .as_ref()
+                        .is_some_and(|v| v.contains(&p))
+                };
+                match receiver.as_ref() {
+                    Expr::Block(b) if pos_dissolves(BlockPos::Receiver) => {
+                        for stmt in &b.body {
+                            scan(stmt, loop_var, in_nested_block, found);
+                        }
+                    }
+                    r => scan(r, loop_var, in_nested_block, found),
+                }
+                for (i, a) in args.iter().enumerate() {
+                    match a {
+                        Expr::Block(b) if pos_dissolves(BlockPos::Arg(i)) => {
+                            for stmt in &b.body {
+                                scan(stmt, loop_var, in_nested_block, found);
+                            }
+                        }
+                        a => scan(a, loop_var, in_nested_block, found),
+                    }
                 }
             }
             Expr::Cascade {

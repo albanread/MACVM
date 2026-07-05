@@ -6625,3 +6625,58 @@ fn osr_frame_deopts_mid_loop_and_finishes_interpreted() {
         "the cold branch's trap fired INSIDE the OSR frame"
     );
 }
+
+/// S15 (the deep-frame miscompile): `at:put:` whose VALUE operand spills to
+/// a slot beyond stur/ldur's imm9 range — the spill-load fallback used to
+/// clobber x19, the register holding the just-computed element address, so
+/// the store landed in the FRAME instead of the array. Reproduces the sieve
+/// shape (three nested dissolved loops => a frame big enough to overflow
+/// imm9) and checks the array actually changed, warm-compiled.
+#[test]
+fn array_put_with_big_frame_spilled_value() {
+    // Reuse the exact minimal shape through the REAL frontend + runtime.
+    let dir = std::env::temp_dir().join(format!("macvm_arrayput_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let script = dir.join("t.mst");
+    std::fs::write(
+        &script,
+        "Object subclass: T [\n\
+            T class >> go [ | a n c k | n := 12.\n\
+                2 timesRepeat: [\n\
+                    a := Array new: n.\n\
+                    1 to: n do: [:x | a at: x put: true ].\n\
+                    c := 0.\n\
+                    1 to: n do: [:i |\n\
+                        (a at: i) ifTrue: [\n\
+                            k := i + i.\n\
+                            [ k <= n ] whileTrue: [\n\
+                                a at: k put: false.\n\
+                                k := k + i ].\n\
+                            c := c + 1 ] ] ].\n\
+                ^c ]\n\
+        ]\n\
+        Transcript show: T go printString. Transcript cr.\n\
+        Transcript show: T go printString. Transcript cr.\n\
+        Transcript show: T go printString. Transcript cr.\n",
+    )
+    .unwrap();
+    let bin = PathBuf::from(env!("CARGO_BIN_EXE_macvm"));
+    let world_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("world");
+    let out = Command::new(&bin)
+        .args([
+            "run",
+            script.to_str().unwrap(),
+            "--world",
+            world_dir.to_str().unwrap(),
+        ])
+        .env("MACVM_JIT", "threshold=1")
+        .output()
+        .expect("spawn");
+    std::fs::remove_dir_all(&dir).ok();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "must not crash: {stdout}");
+    assert_eq!(
+        stdout, "1\n1\n1\n",
+        "all three calls (cold, deopt-warmed, WARM-COMPILED) must agree"
+    );
+}

@@ -115,6 +115,15 @@ fn eligibility_detail(vm: &VmState, method: MethodOop) -> Eligibility {
         || method.primitive() != 0
         || method.bytecode_len() > MAX_BYTECODE_LEN
     {
+        if vm.options.trace.is_enabled("jit") {
+            eprintln!(
+                "[jit] NoPermanent reason: block={} argc={} prim={} bc_len={}",
+                method.is_block(),
+                method.argc(),
+                method.primitive(),
+                method.bytecode_len()
+            );
+        }
         return Eligibility::NoPermanent;
     }
 
@@ -263,6 +272,14 @@ fn eligibility_detail(vm: &VmState, method: MethodOop) -> Eligibility {
     let cfg = decode::decode(method);
     let (_, max_stack) = ir::compute_entry_depths(method, &cfg);
     if method.ntemps() as i32 + max_stack > FRAME_BUDGET_SLOTS {
+        if vm.options.trace.is_enabled("jit") {
+            eprintln!(
+                "[jit] NoPermanent reason: frame budget (ntemps {} + max_stack {} > {})",
+                method.ntemps(),
+                max_stack,
+                FRAME_BUDGET_SLOTS
+            );
+        }
         return Eligibility::NoPermanent;
     }
 

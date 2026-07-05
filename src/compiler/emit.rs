@@ -78,12 +78,29 @@ fn emit_spill_access(
     reg: Operand,
     slot: crate::compiler::regalloc::SpillSlot,
 ) {
+    emit_spill_access_via(asm, mnemonic, reg, slot, 19);
+}
+
+/// S15: the same imm9-overflow-safe spill access with a CALLER-CHOSEN address
+/// scratch. The default x19 fallback silently CLOBBERED an address a caller
+/// had just computed in x19 — `emit_array_at_put` resolving its (spilled,
+/// big-offset) value operand after building the element address wrote the
+/// store into the FRAME instead of the array (the S15 sieve-shape
+/// miscompile, visible only in deep-nesting frames large enough to overflow
+/// imm9).
+fn emit_spill_access_via(
+    asm: &mut dyn Assembler,
+    mnemonic: &str,
+    reg: Operand,
+    slot: crate::compiler::regalloc::SpillSlot,
+    addr_scratch: u8,
+) {
     let off = spill_offset(slot);
     if off >= -256 {
         asm.emit(mnemonic, &[reg, mem(29, off)]);
     } else {
-        asm.emit("sub", &[x(19), x(29), imm(-off)]);
-        asm.emit(mnemonic, &[reg, mem(19, 0)]);
+        asm.emit("sub", &[x(addr_scratch), x(29), imm(-off)]);
+        asm.emit(mnemonic, &[reg, mem(addr_scratch, 0)]);
     }
 }
 
@@ -403,6 +420,128 @@ impl<'a> Emitter<'a> {
             self.asm.b_cond(Cond::Vs, fail_label);
         }
         self.commit(dst, d);
+    }
+
+    /// S15 (the sieve fix): the shared guard prefix of both array
+    /// intrinsics. Verifies, branching to `fail` (a reexecute-true trap
+    /// that re-runs the send interpreted — prim-fail and bounds errors
+    /// keep byte-identical Smalltalk semantics):
+    ///   1. the receiver is mem-tagged (0b01) AND its klass IS Array —
+    ///      the mono IC observed only Arrays, but feedback is not proof;
+    ///   2. the index is a smi;
+    ///   3. 1-based bounds: `(idx - 4) unsigned< len` compares the TAGGED
+    ///      index against the TAGGED size slot directly — both carry tag
+    ///      00, and <<2 preserves unsigned order, so no untagging needed.
+    ///
+    /// Scratches: x19/x20 (the alloc-sequence pair, never allocatable);
+    /// the operands themselves sit in x16/x17 via `resolve`.
+    fn emit_array_guards(&mut self, rarr: Reg, ridx: Reg, array_klass: PoolLit, fail: BlockId) {
+        let fail_l = self.block_label(fail);
+        self.asm.emit("and", &[x(19), Operand::Reg(rarr), imm(3)]);
+        self.asm.emit("cmp", &[x(19), imm(1)]);
+        self.asm.b_cond(Cond::Ne, fail_l);
+        // klass word at [arr + KLASS_OFFSET(8) - MEM_TAG(1)]
+        self.asm.emit("ldur", &[x(19), mem(rarr.num, 7)]);
+        self.asm
+            .ldr_literal(xr(20), self.literal_ids[array_klass.0 as usize]);
+        self.asm.emit("cmp", &[x(19), x(20)]);
+        self.asm.b_cond(Cond::Ne, fail_l);
+        self.asm.emit("tst", &[Operand::Reg(ridx), imm(3)]);
+        self.asm.b_cond(Cond::Ne, fail_l);
+        // size slot (a smi) at [arr + BODY_OFFSET(16) - MEM_TAG(1)]
+        self.asm.emit("ldur", &[x(19), mem(rarr.num, 15)]);
+        self.asm.emit("sub", &[x(20), Operand::Reg(ridx), imm(4)]);
+        self.asm.emit("cmp", &[x(20), x(19)]);
+        self.asm.b_cond(Cond::Hs, fail_l);
+    }
+
+    /// `arr at: idx` — guards, then one load. Element v (1-based, tagged
+    /// idx = 4v) lives at `arr - MEM_TAG + BODY_OFFSET + 8v` (body word 0
+    /// is the size slot): base = arr + 2*idx, load at [base + 15].
+    fn emit_array_at(&mut self, dst: VReg, arr: VReg, idx: VReg, klass: PoolLit, fail: BlockId) {
+        let rarr = self.resolve(arr, 16);
+        let ridx = self.resolve(idx, 17);
+        self.emit_array_guards(rarr, ridx, klass, fail);
+        self.asm
+            .emit("add", &[x(19), Operand::Reg(rarr), Operand::Reg(ridx)]);
+        self.asm.emit("add", &[x(19), x(19), Operand::Reg(ridx)]);
+        let d = self.dest_target(dst);
+        self.asm.emit("ldur", &[Operand::Reg(d), mem(19, 15)]);
+        self.commit(dst, d);
+    }
+
+    /// `arr at: idx put: val` — guards, one store, and the SAME
+    /// young-into-old card barrier `emit_store_field` uses (the slot
+    /// address is dynamic here, but the sequence is otherwise identical).
+    /// Answers `val` (the send's own result).
+    fn emit_array_at_put(
+        &mut self,
+        dst: VReg,
+        arr: VReg,
+        idx: VReg,
+        val: VReg,
+        klass: PoolLit,
+        fail: BlockId,
+    ) {
+        let rarr = self.resolve(arr, 16);
+        let ridx = self.resolve(idx, 17);
+        self.emit_array_guards(rarr, ridx, klass, fail);
+        self.asm
+            .emit("add", &[x(19), Operand::Reg(rarr), Operand::Reg(ridx)]);
+        self.asm.emit("add", &[x(19), x(19), Operand::Reg(ridx)]);
+        // x19 = arr + 8v; slot byte address = x19 + 15. `val` resolves LAST
+        // (arr's x16 is dead after the adds) — and its spill load must use
+        // x20 as the big-offset address scratch, NEVER the default x19,
+        // which holds the element address this store is about to use (the
+        // deep-frame miscompile this comment's fn-level twin documents).
+        let rval = match self.resident[val.0 as usize] {
+            Some(rr) => xr(rr),
+            None => match self.assignment_of(val) {
+                Assignment::Reg(r) => xr(r),
+                Assignment::Spill(slot) => {
+                    emit_spill_access_via(self.asm, "ldr", x(16), slot, 20);
+                    xr(16)
+                }
+            },
+        };
+        self.asm.emit("stur", &[Operand::Reg(rval), mem(19, 15)]);
+
+        // Card barrier — emit_store_field's exact shape with the dynamic
+        // slot address already in x19 (+15 applied below).
+        let skip = self.asm.new_label();
+        self.asm.emit(
+            "ldr",
+            &[
+                x(20),
+                mem(28, crate::oops::layout::VMREG_OLD_START_OFFSET as i64),
+            ],
+        );
+        self.asm.emit("cmp", &[Operand::Reg(rarr), x(20)]);
+        self.asm.b_cond(Cond::Lo, skip);
+        self.asm.emit("tst", &[Operand::Reg(rval), imm(3)]);
+        self.asm.b_cond(Cond::Eq, skip);
+        self.asm.emit("cmp", &[Operand::Reg(rval), x(20)]);
+        self.asm.b_cond(Cond::Hs, skip);
+        self.asm.emit("add", &[x(19), x(19), imm(15)]);
+        self.asm.emit(
+            "lsr",
+            &[x(19), x(19), imm(crate::memory::cards::CARD_SHIFT as i64)],
+        );
+        self.asm.emit(
+            "ldr",
+            &[
+                x(20),
+                mem(
+                    28,
+                    crate::oops::layout::VMREG_CARD_BASE_BIASED_OFFSET as i64,
+                ),
+            ],
+        );
+        self.asm.emit("add", &[x(20), x(20), x(19)]);
+        self.asm.emit("strb", &[x(31), mem(20, 0)]);
+        self.asm.bind(skip);
+
+        self.commit(dst, rval);
     }
 
     /// See this module's own doc for why this differs from D5.3's literal
@@ -1310,6 +1449,21 @@ fn emit_ir(e: &mut Emitter, ir: &Ir, next_in_order: Option<BlockId>) {
             b,
             fail,
         } => e.emit_smi_arith_simple(op, dst, a, b, fail),
+        Ir::ArrayAt {
+            dst,
+            arr,
+            idx,
+            klass,
+            fail,
+        } => e.emit_array_at(dst, arr, idx, klass, fail),
+        Ir::ArrayAtPut {
+            dst,
+            arr,
+            idx,
+            val,
+            klass,
+            fail,
+        } => e.emit_array_at_put(dst, arr, idx, val, klass, fail),
         Ir::SmiCmpBr {
             op,
             a,
