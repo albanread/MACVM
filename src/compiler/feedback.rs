@@ -82,9 +82,12 @@ pub fn read_send_site(
         };
     }
     match KlassOop::try_from(guard) {
-        Some(klass) => SiteFeedback::Mono {
-            klass,
-            method: resolve_target(vm, ic.target()),
+        Some(klass) => match resolve_target(vm, ic.target(), klass, ic.selector()) {
+            Some(method) => SiteFeedback::Mono { klass, method },
+            // A stale compiled-id whose (klass, selector) no longer resolves:
+            // treat the site as never-taken — the trap re-dispatches against
+            // the runtime truth. (Never speculate on unverifiable feedback.)
+            None => SiteFeedback::Untaken,
         },
         None => SiteFeedback::Untaken, // guard == nil
     }
@@ -100,9 +103,16 @@ fn read_poly(vm: &VmState, ic: InterpreterIc) -> SiteFeedback {
         let Some(klass) = KlassOop::try_from(pairs.at(2 * i)) else {
             break; // first empty slot: the rest are empty too
         };
+        // Poly pairs only ever store interpreted MethodOops (`reverify_poly`
+        // re-derives, never preserves a compiled id — ic.rs's own rule), but
+        // resolve defensively anyway; a pair that no longer resolves is
+        // dropped rather than speculated on.
+        let Some(method) = resolve_target(vm, pairs.at(2 * i + 1), klass, ic.selector()) else {
+            continue;
+        };
         cases.push(FeedbackCase {
             klass,
-            method: resolve_target(vm, pairs.at(2 * i + 1)),
+            method,
             count: None,
         });
     }
@@ -111,21 +121,32 @@ fn read_poly(vm: &VmState, ic: InterpreterIc) -> SiteFeedback {
 
 /// A mono/poly target is either a plain `MethodOop` (interpreter-resolved) or a
 /// smi `NmethodId` (the site tiered up — `ic::set_mono_compiled`). Resolve both
-/// to the underlying `MethodOop`; the nmethod path re-looks-up its own
-/// `(key_klass, key_selector)`.
-fn resolve_target(vm: &VmState, target: Oop) -> MethodOop {
+/// to the underlying `MethodOop` via the SITE's own (guard klass, selector) —
+/// never through the nmethod the stale id happens to name today:
+///
+/// An interpreter IC holding a compiled id heals only on its next DISPATCH
+/// (send_generic's validity check); the COMPILER can read it any time after
+/// the nmethod was invalidated, swept, or — the dangerous case — its table
+/// slot REUSED for a different (klass, selector) entirely. Trusting the slot
+/// blindly panicked on a freed id (the MACVM_DEOPT_STRESS sieve crash, S14
+/// step 9) and, worse, would hand back the REUSED entry's method: wrong-method
+/// feedback behind a passing klass guard is a silent miscompile. Resolving
+/// through (klass, selector) is immune to both; `None` means the site has no
+/// verifiable target and the caller must not speculate.
+fn resolve_target(
+    vm: &VmState,
+    target: Oop,
+    klass: KlassOop,
+    selector: crate::oops::wrappers::SymbolOop,
+) -> Option<MethodOop> {
     if let Some(m) = MethodOop::try_from(target) {
-        return m;
+        return Some(m);
     }
-    let smi =
-        SmallInt::try_from(target).expect("mono IC target must be a MethodOop or an nmethod id");
-    let id = NmethodId(smi.value() as u32);
-    let nm = vm
-        .code_table
-        .get(id)
-        .expect("a mono-compiled IC target must name a live nmethod");
-    resolve_method_ro(vm, nm.key_klass, nm.key_selector)
-        .expect("a live nmethod's own (key_klass, key_selector) must still resolve to a method")
+    debug_assert!(
+        SmallInt::try_from(target).is_some(),
+        "mono IC target must be a MethodOop or an nmethod id"
+    );
+    resolve_method_ro(vm, klass, selector)
 }
 
 /// Read-only method lookup — the `runtime::lookup::lookup` walk minus its

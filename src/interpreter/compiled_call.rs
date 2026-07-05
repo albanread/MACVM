@@ -224,7 +224,21 @@ fn stress_tick(vm: &mut VmState, entering: NmethodId) {
     }
     let victim = alive[vm.stress_rr_cursor % alive.len()];
     vm.stress_rr_cursor = vm.stress_rr_cursor.wrapping_add(1);
-    crate::codecache::flush::make_not_entrant(vm, victim);
+    // S14 step 9: a NESTED entry (c2i reentrancy, or the post-deopt
+    // interpret inside `rt_uncommon_trap`) sits above compiled native
+    // frames whose walk anchor is no longer set — `make_not_entrant`'s §2c
+    // return-address-redirection walk aborts there (frames.rs's
+    // "innermost side is native but no anchor" assert, the long-standing
+    // MACVM_DEOPT_STRESS crash). Use the walk-free LAZY invalidation when
+    // nested (§2a entry patch + §2b by_key + §2d poll arm still all fire —
+    // in-flight activations finish via the poll/return paths instead of
+    // eager redirection); the full walk keeps running for the common
+    // TOP-LEVEL entries, so stress coverage of §2c is preserved.
+    if vm.compiled_depth == 0 {
+        crate::codecache::flush::make_not_entrant(vm, victim);
+    } else {
+        crate::codecache::flush::make_not_entrant_lazy(vm, victim);
+    }
 }
 
 #[cfg(test)]
