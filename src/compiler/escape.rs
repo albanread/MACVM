@@ -126,19 +126,22 @@ fn block_is_spliceable(block: MethodOop) -> bool {
     if cfg.blocks.len() != 1 || !matches!(cfg.blocks[0].terminator, Terminator::Return) {
         return false;
     }
-    // 7-II-b-ii: a `captures_ctx` block MAY now have ordinary sends — an in-block
-    // deopt rebuilds the block frame with its Context aliasing M's (the deopt
-    // materializer's `is_block` context-aliasing), so a post-deopt ctx-temp
-    // write reaches M's Context. Only super sends / nested closures / NLR / a
-    // depth>0 (nested-context) ctx access remain gated.
+    // 7-II-b-ii: a `captures_ctx` block MAY have ordinary sends. 7-III: a block
+    // MAY contain `nlr_tos` (`^expr`) — inlined into its home M, the NLR is just
+    // a return from M (`Ir::Ret`); the `ensure:` decline (SPEC A7 Step 1) is
+    // AUTOMATIC because any M with `ensure:`/`ifCurtailed:` fails the escape gate
+    // (its handler block escapes as a non-value arg). Still gated: super sends,
+    // nested closures, depth>0 (nested-context) ctx access.
+    let mut has_nlr = false;
+    let mut has_send = false;
     let len = block.bytecode_len();
     let mut bci = 0;
     while bci < len {
         let (instr, next) = decode_at(block, bci);
         match instr {
-            Instr::Send { super_: true, .. } | Instr::PushClosure { .. } | Instr::NlrTos => {
-                return false
-            }
+            Instr::Send { super_: true, .. } | Instr::PushClosure { .. } => return false,
+            Instr::Send { .. } => has_send = true,
+            Instr::NlrTos => has_nlr = true,
             // ctx-temp access is DEPTH 0 only (M's own Context, which a ctx-less
             // block's frame aliases). A `depth != 0` (nested context) is gated.
             Instr::PushCtxTemp { depth, .. } | Instr::StoreCtxTempPop { depth, .. }
@@ -149,6 +152,15 @@ fn block_is_spliceable(block: MethodOop) -> bool {
             _ => {}
         }
         bci = next;
+    }
+    // 7-III: an NLR block must be SEND-FREE for now. A send-ful NLR block that
+    // deopted at an inner send would rebuild an is_block frame and then run the
+    // interpreter's `nlr_tos`, which reads a real closure's `home_ref` from the
+    // block frame's receiver slot — but we elided the closure. A send-free NLR
+    // block never deopts inside, so the interpreter never runs its `nlr_tos`.
+    // (Synthesizing a home-ref closure for send-ful NLR blocks is a later slice.)
+    if has_nlr && has_send {
+        return false;
     }
     true
 }

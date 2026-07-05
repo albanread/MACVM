@@ -2661,6 +2661,21 @@ impl<'a> Translator<'a> {
                     result = Some(block_self);
                     break;
                 }
+                // 7-III: `^expr` (non-local return). The block's home is M (the
+                // block is created + value'd in M), so the NLR is just a RETURN
+                // FROM M — `Ir::Ret` of the value. Control leaves the method, so
+                // (like a trap) the caller must finish the current block. The
+                // `ensure:` decline (SPEC A7 Step 1) is automatic: an M with
+                // `ensure:` fails the escape gate (its handler block escapes).
+                // `block_is_spliceable` restricts NLR blocks to SEND-FREE, so no
+                // in-block deopt runs the interpreter's `nlr_tos` (which would
+                // need a synthesized home-ref closure).
+                Instr::NlrTos => {
+                    let val = bstack.pop().expect("block splice: nlr_tos on empty stack");
+                    code.push(Ir::Ret { val });
+                    trapped = true;
+                    break;
+                }
                 // 7-II: the block's OWN (non-super) sends. A cold IC (Untaken)
                 // lowers to a TERMINATING uncommon trap inside the inlined block
                 // (re-executing the send interpreted); a warm IC stays a plain

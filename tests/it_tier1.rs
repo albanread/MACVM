@@ -4729,3 +4729,97 @@ fn deopt_through_capturing_block_aliases_home_context() {
         "the cold `e bar` trap fired once"
     );
 }
+
+// ── S14 step 7-III: non-local return from an inlined (send-free) block ──────
+
+/// S14 step 7-III: `^expr` inside an inlined block returns from the block's HOME
+/// method. `foo [ [^42] value. ^0 ]` — the block's `^42` is a non-local return
+/// from `foo`, so `foo` returns 42 and the trailing `^0` is never reached. When
+/// `[^42]` is spliced into `foo`, the NLR lowers to a plain return-from-foo
+/// (`Ir::Ret`). Compiled == interpreter.
+#[test]
+fn compiled_block_nlr_returns_from_home() {
+    let mut vm = test_vm();
+    install_value_prims(&mut vm);
+    let smi_klass = vm.universe.smi_klass;
+    let value_sel = vm.universe.intern(b"value");
+    let sel = vm.universe.intern(b"foo");
+
+    let mut b = BytecodeBuilder::new();
+    // block `[^42]` — a send-free non-local return.
+    let lit = b.build_block(&mut vm, 0, 0, false, 0, false, |blk, _vm| {
+        blk.push_smi_i8(42);
+        blk.nlr_tos();
+    });
+    b.push_closure(lit, 0);
+    b.send(&mut vm, value_sel, 0); // [^42] value   → NLR returns 42 from foo
+    b.pop();
+    b.push_smi_i8(0);
+    b.ret_tos(); // ^0  — unreachable (the block already returned from foo)
+    let m = b.finish(&mut vm, sel, 0, 0);
+
+    assert!(
+        driver::eligible(&vm, m),
+        "a send-free NLR block is eligible (7-III)"
+    );
+    let self_smi = SmallInt::new(1).oop();
+    let interp = macvm::interpreter::run_method(&mut vm, m, self_smi, &[]);
+    assert_eq!(
+        interp.raw(),
+        SmallInt::new(42).oop().raw(),
+        "interp: [^42] value returns 42 from foo"
+    );
+
+    let id = driver::compile_method(&mut vm, smi_klass, m).expect("must compile");
+    let nm = vm.code_table.get(id).expect("installed");
+    let entry = unsafe { nm.code.base.add(nm.entry_off as usize) } as u64;
+    let call: CallStubFn = unsafe { std::mem::transmute(vm.stubs.call_stub_entry()) };
+    let vm_ptr: *mut VmState = &mut vm;
+    let result = unsafe { call(entry, vm_ptr, [self_smi.raw()].as_ptr(), 1) };
+    assert_eq!(
+        result,
+        SmallInt::new(42).oop().raw(),
+        "compiled: block NLR lowers to a return-from-foo = 42 (differential match)"
+    );
+}
+
+/// S14 step 7-III: an NLR block that returns its own arg. `foo [ [:x | ^x]
+/// value: 7. ^0 ]` → 7 (the `^x` returns the block's arg from foo).
+#[test]
+fn compiled_block_nlr_with_arg_matches_interpreter() {
+    let mut vm = test_vm();
+    install_value_prims(&mut vm);
+    let smi_klass = vm.universe.smi_klass;
+    let value_arg_sel = vm.universe.intern(b"value:");
+    let sel = vm.universe.intern(b"foo");
+
+    let mut b = BytecodeBuilder::new();
+    let lit = b.build_block(&mut vm, 1, 0, false, 0, false, |blk, _vm| {
+        blk.push_temp(0); // x
+        blk.nlr_tos(); // ^x
+    });
+    b.push_closure(lit, 0);
+    b.push_smi_i8(7);
+    b.send(&mut vm, value_arg_sel, 1);
+    b.pop();
+    b.push_smi_i8(0);
+    b.ret_tos();
+    let m = b.finish(&mut vm, sel, 0, 0);
+
+    assert!(driver::eligible(&vm, m));
+    let self_smi = SmallInt::new(1).oop();
+    let interp = macvm::interpreter::run_method(&mut vm, m, self_smi, &[]);
+    assert_eq!(interp.raw(), SmallInt::new(7).oop().raw());
+
+    let id = driver::compile_method(&mut vm, smi_klass, m).expect("must compile");
+    let nm = vm.code_table.get(id).expect("installed");
+    let entry = unsafe { nm.code.base.add(nm.entry_off as usize) } as u64;
+    let call: CallStubFn = unsafe { std::mem::transmute(vm.stubs.call_stub_entry()) };
+    let vm_ptr: *mut VmState = &mut vm;
+    let result = unsafe { call(entry, vm_ptr, [self_smi.raw()].as_ptr(), 1) };
+    assert_eq!(
+        result,
+        SmallInt::new(7).oop().raw(),
+        "compiled block NLR of arg = 7"
+    );
+}
