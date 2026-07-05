@@ -28,7 +28,7 @@
 
 use crate::codecache::deopt_trap::{read_frame_slot, read_pool_oop};
 use crate::codecache::nmethod::{Nmethod, NmethodId};
-use crate::compiler::scopes::{CtxLoc, DecodedScope, DeoptState, ValueLoc};
+use crate::compiler::scopes::{CtxLoc, DecodedScope, DeoptState, SafepointKind, ValueLoc};
 use crate::interpreter::stack::{Frame, FrameActivation};
 use crate::oops::smi::SmallInt;
 use crate::oops::wrappers::MethodOop;
@@ -175,7 +175,7 @@ pub fn deoptimize_frame(vm: &mut VmState, frame: FrameView) -> DeoptResume {
     // is dropped before the mutable `vm.stack` pushes (and the allocations
     // M6 performs) begin.
     let mut virtual_frames: Vec<VirtualFrame> = Vec::new();
-    let (site_bci, site_reexecute, site_stack) = {
+    let (site_bci, site_reexecute, site_kind, site_stack) = {
         let nm = vm
             .code_table
             .get(frame.nm)
@@ -220,6 +220,7 @@ pub fn deoptimize_frame(vm: &mut VmState, frame: FrameView) -> DeoptResume {
         (
             deopt.site.bci as usize,
             deopt.site.reexecute,
+            deopt.site.kind,
             deopt.site.stack.clone(),
         )
     };
@@ -366,10 +367,25 @@ pub fn deoptimize_frame(vm: &mut VmState, frame: FrameView) -> DeoptResume {
             }
 
             // ── M4: operand-stack height cross-check (debug builds). ──────
+            // Skipped for the innermost frame of a `LoopPoll` deopt: its resume
+            // bci is the loop HEADER — a genuine CFG merge (entry edge + back
+            // edge) — where `interpreter_model_height`'s straight-line scan is
+            // documented to disagree with the CFG fixpoint (it double-counts
+            // both arms of any conditional that feeds the header, e.g.
+            // `x := c ifTrue:[..] ifFalse:[..]. [i<x] whileTrue:[..]`). The
+            // recorded `stack` (CFG-derived) is the source of truth and the
+            // materialization is correct — this check just can't model a merge.
+            // Every OTHER reexecute site (traps) resumes at a mid-block op bci
+            // where the linear scan is exact, so they keep the check.
             #[cfg(debug_assertions)]
             {
                 let resume_bci = saved_bci;
-                if let Some(model) = interpreter_model_height(method, resume_bci) {
+                let skip_merge_check =
+                    vf.is_innermost && matches!(site_kind, SafepointKind::LoopPoll);
+                if let (false, Some(model)) = (
+                    skip_merge_check,
+                    interpreter_model_height(method, resume_bci),
+                ) {
                     let materialized =
                         (vm.stack.sp - (fp_new + frame_header_and_temps(method))) as i32;
                     debug_assert_eq!(

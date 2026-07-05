@@ -1503,7 +1503,37 @@ pub fn convert(vm: &VmState, method: MethodOop, cfg: &Cfg) -> IrMethod {
                 is_backward,
             } => {
                 if is_backward {
+                    // S13 step 10b: a backward-jump `Poll` is a deopt SAFEPOINT
+                    // (mirroring the UncommonTrap fail blocks) — if this loop's
+                    // own nmethod is made `NotEntrant` mid-loop, only the poll
+                    // can deopt it (a call-free loop never returns into a
+                    // redirected slot). Record ONE deopt site at the poll:
+                    //   - `kind = LoopPoll`, `reexecute = true`;
+                    //   - `stack` = `local_exit`, the pre-merge exit operand
+                    //     stack live AT the poll (merges are just vreg renames,
+                    //     so pre-merge vregs resolve to the same VALUES);
+                    //   - `bci` = the LOOP-HEADER bci = the backward-jump
+                    //     `target` block's `bci_start`: the interpreter resumes
+                    //     there and RE-EXECUTES the loop condition.
+                    // The poll's `SafepointPc` is emitted at the `bl stub_poll`
+                    // RETURN address (`emit::emit_poll`), so this site keys on
+                    // that return offset via the shared position numbering (like
+                    // a CallSend), and `driver::build_deopt_metadata` correlates
+                    // it exactly like any other `deopt_sites` entry — no
+                    // kind-specific handling there. `regalloc::deopt_live` forces
+                    // receiver + slots + `local_exit` live-across the poll so
+                    // spill-all pins them to frame slots (never Nil).
+                    let poll_ci = code.len() as u32;
                     code.push(Ir::Poll);
+                    deopt.push((
+                        poll_ci,
+                        DeoptRaw {
+                            stack: local_exit.clone(),
+                            bci: cfg.blocks[target].bci_start,
+                            kind: SafepointKind::LoopPoll,
+                            reexecute: true,
+                        },
+                    ));
                 }
                 emit_merges(&sources, &entry_stacks, target, &local_exit, &mut code);
                 code.push(Ir::Jump {

@@ -635,6 +635,22 @@ impl<'a> Emitter<'a> {
         );
         self.asm.cbz(xr(16), skip);
         self.asm.call_far(self.stub_poll_lit);
+        // S13 step 10b: the poll is a deopt SAFEPOINT. Record its `SafepointPc`
+        // at the `bl stub_poll` RETURN address — the offset right AFTER the
+        // call, which is exactly where `skip` binds (`cbz` also lands here on a
+        // dormant flag). `stub_poll`'s `rt_poll` passes this same address as
+        // `ret_pc`, and `driver::build_deopt_metadata` keys the LoopPoll deopt
+        // scope's `PcDesc.code_off` on it — the SAME "return-address safepoint"
+        // convention `emit_call_send` uses (read `asm.offset()` fresh, not
+        // derived from any encoding length). Recording it here (before `bind`)
+        // vs. after is equivalent: `bind` emits no code, so the offset is
+        // identical either way; recording BEFORE keeps `self.pos` reading this
+        // `Ir::Poll`'s own position (the driver/regalloc share numbering).
+        self.safepoints.push(SafepointPc {
+            pc_off: self.asm.offset(),
+            bci: self.current_bci,
+            position: self.pos,
+        });
         self.asm.bind(skip);
     }
 

@@ -55,7 +55,19 @@ fn is_safepoint(ir: &Ir) -> bool {
         // an OopMap, exactly like a call, so the deopt materializer can read
         // them from the frame. Its position keys BOTH the S12 OopMap and the
         // S13 deopt scope at the brk offset.
-        Ir::CallSend { .. } | Ir::CallRuntime { .. } | Ir::Alloc { .. } | Ir::UncommonTrap { .. }
+        //
+        // S13 step 10b: a loop back-edge `Poll` is now a safepoint too — its
+        // `bl stub_poll` may deopt the frame (if the loop's own nmethod became
+        // `NotEntrant`), so the loop-carried operand stack + receiver + slots
+        // (its `DeoptRaw.stack`, forced live-across by `deopt_live` below) must
+        // be spilled to frame slots the materializer reads. Its position keys
+        // the OopMap (over the `bl` call) AND the LoopPoll deopt scope, at the
+        // poll's return offset.
+        Ir::CallSend { .. }
+            | Ir::CallRuntime { .. }
+            | Ir::Alloc { .. }
+            | Ir::UncommonTrap { .. }
+            | Ir::Poll
     )
 }
 
@@ -209,14 +221,24 @@ pub fn compute_intervals(method: &IrMethod) -> (Vec<BlockId>, Vec<LiveInterval>,
     // safepoint's own position) and forced to `end > pos` below, so
     // `crosses_safepoint` fires and spill-all pins them.
     //
-    // Scoped to `UncommonTrap` ONLY: `Call`/`Alloc` deopt sites (S13 step 3b)
-    // sit inline in a block whose successors run AFTER them, so their recorded
-    // vregs are already naturally live-across (used later) and already spilled;
-    // widening THOSE would spill genuinely-dead values (a call-return site's
-    // popped receiver/args, an Alloc's class const) into their OopMaps,
+    // Scoped to `UncommonTrap` and `LoopPoll` — NOT `Call`/`Alloc`: those (S13
+    // step 3b) sit inline in a block whose successors run AFTER them, so their
+    // recorded vregs are already naturally live-across (used later) and already
+    // spilled; widening THOSE would spill genuinely-dead values (a call-return
+    // site's popped receiver/args, an Alloc's class const) into their OopMaps,
     // needlessly enlarging them and disturbing S12's GC-root tests — and is
     // unnecessary, since natural liveness already covers exactly what those
     // sites read.
+    //
+    // S13 step 10b: a `LoopPoll` site (an `Ir::Poll` at a loop back-edge) needs
+    // the SAME widening. Its recorded `stack` is the loop-carried operand stack
+    // — genuinely live (re-read on the next loop iteration), NOT dead like a
+    // call-return's popped operands. Loop-range widening (below) already extends
+    // loop-carried intervals to `loop_end`, but the poll can sit AT `loop_end`,
+    // so those intervals may `end == poll_pos` rather than STRICTLY across it
+    // (`crosses_safepoint` needs `end > pos`). Forcing `end > pos` here pins
+    // receiver + slots + the recorded stack to canonical frame slots the deopt
+    // materializer reads, exactly as for an UncommonTrap.
     let mut deopt_live: Vec<(u32, u32)> = Vec::new(); // (vreg, safepoint pos)
     let n_slots = method.argc as u32 + method.ntemps as u32;
 
@@ -227,11 +249,13 @@ pub fn compute_intervals(method: &IrMethod) -> (Vec<BlockId>, Vec<LiveInterval>,
             if is_safepoint(ir) {
                 safepoint_positions.push(pos);
             }
-            if let Some((_, raw)) = block
-                .deopt_sites
-                .iter()
-                .find(|(ci, raw)| *ci == idx as u32 && raw.kind == SafepointKind::UncommonTrap)
-            {
+            if let Some((_, raw)) = block.deopt_sites.iter().find(|(ci, raw)| {
+                *ci == idx as u32
+                    && matches!(
+                        raw.kind,
+                        SafepointKind::UncommonTrap | SafepointKind::LoopPoll
+                    )
+            }) {
                 // Receiver (0) + every unified arg/temp slot + the recorded
                 // operand stack are exactly the vregs the driver resolves for
                 // this site.

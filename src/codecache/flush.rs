@@ -96,6 +96,21 @@ pub fn make_not_entrant(vm: &mut VmState, id: NmethodId) {
     // chain regardless.
     let tramp = vm.stubs.deopt_return_addr();
     crate::runtime::frames::redirect_returns_into_nm(vm, id, tramp);
+
+    // §2d (S13 step 10b): arm the loop poll. §2b stops FUTURE entries and §2c
+    // redirects in-flight callee RETURNS — but a CALL-FREE loop (pure inlined
+    // arithmetic, no sends → no returns to redirect) can run arbitrarily long
+    // in `id`'s now-NotEntrant code, and ONLY the loop poll can deopt it.
+    // Setting `poll_flag` makes every compiled loop back-edge actually call
+    // `stub_poll`; `pending_deopt_flag` is the runtime-side gate. This is a
+    // GLOBAL arm — all loops in all frames now poll — but `rt_poll` only DEOPTS
+    // a frame whose OWN nmethod is NotEntrant; a poll in any other frame sees no
+    // self-match and returns "continue" fast. `rt_poll` disarms both once no
+    // NotEntrant compiled frame remains, bounding the polling to the drain
+    // window. Idempotent: a second `make_not_entrant` before the first drains
+    // just re-sets an already-set flag.
+    vm.pending_deopt_flag = true;
+    vm.reg_block.poll_flag = 1;
 }
 
 /// D6.1/D6.2: flushes `id` — marks it `Zombie` and unhooks it from

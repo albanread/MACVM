@@ -4,7 +4,7 @@
 //! published into the same [`CodeCache`] real compiled methods live in.
 
 use crate::compiler::assembler::{
-    imm, mem, mem_post, mem_pre, sp, x, Assembler, CodeBlob, Cond, RelocKind,
+    imm, mem, mem_post, mem_pre, sp, x, xr, Assembler, CodeBlob, Cond, RelocKind,
 };
 use crate::compiler::jasm_assembler::JasmAssembler;
 use crate::oops::layout::{
@@ -382,6 +382,10 @@ fn build_call_stub() -> CodeBlob {
 fn build_stub_poll() -> CodeBlob {
     let mut a = JasmAssembler::new();
 
+    // Frame: [x29] = saved caller x29 = LOOP's fp, [x29+8] = saved x30 = the
+    // return address INSIDE the loop right after `bl stub_poll` (== the poll's
+    // ret_pc). `rt_poll` is a C call and preserves x29, so x29 still names THIS
+    // frame after it returns — we reload loop_fp/ret_pc from [x29] not registers.
     a.emit("stp", &[x(29), x(30), mem_pre(31, -16)]);
     a.emit("mov", &[x(29), sp()]);
     a.emit("sub", &[sp(), sp(), imm(128)]);
@@ -394,10 +398,29 @@ fn build_stub_poll() -> CodeBlob {
     a.emit("stp", &[x(12), x(13), mem(31, 96)]);
     a.emit("stp", &[x(14), x(15), mem(31, 112)]);
 
-    a.emit("mov", &[x(0), x(28)]); // vm -> rt_poll's one argument
+    // rt_poll(vm, loop_fp, ret_pc) -> PollOutcome{result:x0, deopted:x1}.
+    a.emit("mov", &[x(0), x(28)]); // x0 = &mut VmState
+    a.emit("ldr", &[x(1), mem(29, 0)]); // x1 = loop_fp = saved x29
+    a.emit("ldr", &[x(2), mem(29, 8)]); // x2 = ret_pc  = saved x30
     let rt_poll_lit = a.literal_u64(rt_poll as *const () as u64, Some(RelocKind::RuntimeAddr));
     a.call_far(rt_poll_lit);
 
+    // deopted == 0 -> normal loop resume (restore x0-x15, ret to the loop).
+    // deopted != 0 -> deopt teardown: x0 already holds the deoptee's result;
+    // discard BOTH stub_poll's frame AND the loop frame and `ret` the result to
+    // the loop's own native caller (the loop activation is gone after a deopt).
+    let cont = a.new_label();
+    a.cbz(xr(1), cont);
+
+    // --- deopt teardown (mirrors deopt_trap::build_uncommon_trampoline) ---
+    // x0 (result) is NOT restored — it must survive to the loop's caller.
+    a.emit("ldr", &[x(2), mem(29, 0)]); // x2 = loop_fp (= saved x29)
+    a.emit("mov", &[sp(), x(2)]); // sp := loop_fp: drop stub_poll frame + loop locals
+    a.emit("ldp", &[x(29), x(30), mem_post(31, 16)]); // pop loop frame's own {caller_fp, caller_lr}
+    a.emit("ret", &[]); // return result (x0) to the loop's caller
+
+    // --- continue: restore the loop's live regs and resume it ---
+    a.bind(cont);
     a.emit("ldp", &[x(0), x(1), mem(31, 0)]);
     a.emit("ldp", &[x(2), x(3), mem(31, 16)]);
     a.emit("ldp", &[x(4), x(5), mem(31, 32)]);
@@ -1348,31 +1371,142 @@ pub unsafe extern "C" fn rt_alloc_slow(vm: *mut VmState, klass_bits: u64, size_b
     crate::memory::alloc::alloc_slots(vm, klass).oop().raw()
 }
 
-/// S10: nothing sets `VmRegBlock::poll_flag` nonzero yet (mirrors
-/// `interpreter::poll`'s own S2-era status), so this is rarely even
-/// reached in a normal run — a real interrupt/trace producer is a later
-/// sprint's job (D5.6). The one thing wired up now is
-/// `VmState::trace_on_poll`, tests_s10.md's `mixed_trace_golden` (gate
-/// item 4) hook: a test sets it before calling into compiled code whose
-/// own loop will reach a `Poll`, since compiled code is send-free (D1)
-/// and so has no other way to invoke a `printStackTrace` primitive from
-/// the inside. One-shot: cleared immediately, so a loop with several
-/// back-edge crossings prints exactly once.
+/// S13 step 10b: `rt_poll`'s return, split across two registers by the
+/// AArch64 C ABI so `stub_poll` can branch on it. A struct of two ≤8-byte
+/// all-integer fields is ≤16 bytes and "fully integer", so the AAPCS64
+/// "return in registers" rule (§B.2/§5.5) returns it in `x0:x1` with field 0
+/// (`result`) in `x0` and field 1 (`deopted`) in `x1` — NOT via a hidden
+/// x8 sret pointer (that path is only for aggregates > 16 bytes or containing
+/// floats). `stub_poll`'s teardown depends on exactly this: after `bl
+/// rt_poll`, `x0 = result` and `x1 = deopted`. The `#[repr(C)]` pins field
+/// order = declaration order so `offset_of!(result) == 0` (see the ABI unit
+/// test). `deopted` is 0 (continue the loop) or 1 (this frame was deopted;
+/// `result` is the deoptee's own result, to hand to the loop's native caller).
+#[repr(C)]
+pub struct PollOutcome {
+    pub result: u64,
+    pub deopted: u64,
+}
+
+/// S13 step 10b: the loop back-edge poll's runtime side. Reached via `bl
+/// rt_poll` from `stub_poll` whenever a compiled loop crosses a back-edge with
+/// `reg_block.poll_flag` armed (which `flush::make_not_entrant` sets, §2d).
+///
+/// Two jobs:
+///  1. the pre-existing one-shot `trace_on_poll` hook (fires regardless of any
+///     deopt — `mixed_trace_golden`'s gate);
+///  2. the loop-poll DEOPT: if `pending_deopt_flag` is set AND the polling
+///     frame's OWN nmethod (the one `ret_pc` lands in) is `NotEntrant`, deopt
+///     this frame exactly like `rt_uncommon_trap` does — materialize the
+///     interpreter frame(s) at the LoopPoll scope and run them to completion,
+///     returning the deoptee's result with `deopted = 1` so `stub_poll` tears
+///     down to the loop's native caller. A poll in any OTHER (still-`Alive`)
+///     frame, or with the flag unset, returns `{0, 0}` (continue the loop).
+///
+/// After a deopt, if no `NotEntrant` compiled frame remains on the stack, both
+/// `pending_deopt_flag` and `poll_flag` are cleared (bounding polling to the
+/// drain window). An escaping `NLR_SENTINEL` is propagated verbatim (never
+/// treated as a normal result), exactly as `rt_deopt_on_return` does.
 ///
 /// # Safety
 /// Only ever reached via `bl rt_poll` from `stub_poll`'s own hand-assembled
-/// listing above, never called directly from Rust — `vm` must be `x28`,
-/// established once by `call_stub` and never null for the lifetime of any
-/// compiled call (D4's own invariant), the same pointer `Stubs::invoke`'s
-/// own `call` already trusts.
-pub unsafe extern "C" fn rt_poll(vm: *mut VmState) {
+/// listing above, never called directly from Rust (tests aside, which honor
+/// the same contract) — `vm` must be `x28` (`&mut VmState`), `loop_fp` the
+/// polling compiled frame's own FP (the saved x29 `stub_poll` reloads), and
+/// `ret_pc` the return address of the `bl stub_poll` (inside the polling
+/// nmethod, the LoopPoll scope's `PcDesc.code_off` key).
+pub unsafe extern "C" fn rt_poll(vm: *mut VmState, loop_fp: u64, ret_pc: u64) -> PollOutcome {
     // SAFETY: this function's own contract, guaranteed by every caller
     // (`stub_poll`'s assembly, the only one there is).
     let vm = unsafe { &mut *vm };
+
+    // (1) The one-shot trace hook — independent of any deopt.
     if vm.trace_on_poll {
         vm.trace_on_poll = false;
         crate::runtime::error::print_stack_trace(vm);
     }
+
+    // (2) Fast continue: nothing is NotEntrant, so no loop needs deopting.
+    if !vm.pending_deopt_flag {
+        return PollOutcome {
+            result: 0,
+            deopted: 0,
+        };
+    }
+
+    // Which nmethod owns this poll? A poll pc is always inside a published
+    // nmethod (the poll instruction lives in compiled code); a miss should not
+    // happen, so continue defensively (debug-assert to surface a VM bug).
+    let nm_id = match vm.code_table.find_by_pc(ret_pc) {
+        Some(id) => id,
+        None => {
+            debug_assert!(
+                false,
+                "rt_poll: ret_pc {ret_pc:#x} is not inside any published nmethod"
+            );
+            return PollOutcome {
+                result: 0,
+                deopted: 0,
+            };
+        }
+    };
+
+    // Is THIS frame's own nmethod the NotEntrant one? If not, the flag is for
+    // some OTHER frame (or is stale) — this frame is fine, continue.
+    let is_not_entrant = matches!(
+        vm.code_table.get(nm_id).map(|nm| nm.state),
+        Some(crate::codecache::nmethod::NmState::NotEntrant)
+    );
+    if !is_not_entrant {
+        return PollOutcome {
+            result: 0,
+            deopted: 0,
+        };
+    }
+
+    // Deopt this frame exactly like `rt_uncommon_trap`: a reexecute (LoopPoll)
+    // site — `incoming_result: None`; the recorded loop-carried stack is read
+    // from the frame, and the interpreter resumes at the loop-header bci and
+    // re-executes the loop condition.
+    let resume = crate::runtime::deopt::deoptimize_frame(
+        vm,
+        crate::runtime::deopt::FrameView {
+            fp: loop_fp as usize,
+            pc: ret_pc as usize,
+            nm: nm_id,
+            incoming_result: None,
+        },
+    );
+    let result = crate::interpreter::interpret_active(vm, resume).raw();
+
+    // An NLR escaping through the deoptee: the nested interpreter run returned
+    // the reserved-tag sentinel, NOT an oop. Hand it straight back (deopted=1
+    // so `stub_poll` tears down and `ret`s it to the loop's caller, which then
+    // propagates it via its own `emit_nlr_check`), never as a normal result.
+    // (A call-free loop cannot itself originate an NLR — no sends — so this arm
+    // is defensive symmetry with `rt_deopt_on_return`; MUST still precede any
+    // `Oop::from_raw(result)`, though nothing here rebuilds an oop.)
+    if result == crate::oops::layout::NLR_SENTINEL {
+        return PollOutcome {
+            result: crate::oops::layout::NLR_SENTINEL,
+            deopted: 1,
+        };
+    }
+
+    // The flags stay ARMED here. Disarming needs a native-stack walk to prove
+    // "no NotEntrant frame is still running a loop", but `rt_poll` is NOT a
+    // legal place to call `walk_frames`: it runs (via `bl stub_poll`) with the
+    // enter_compiled `TierLink::IntoCompiled` still on `vm.tier_links` and NO
+    // anchor set (`stub_poll` is not one of the six anchor-setting stubs), so
+    // `walk_frames`' start rule would assert (`last_compiled_fp == 0` under an
+    // IntoCompiled innermost) and — since this is `extern "C"` — that panic
+    // aborts the VM. The just-deopted nmethod is still `NotEntrant` anyway (it
+    // is freed only by the step-10c zombie sweep), so re-arming is idempotent
+    // and correct; disarming is deferred to that sweep, which runs at a GC
+    // safepoint where the walk IS legal. Until then every loop keeps polling
+    // and `rt_poll` returns `{0,0}` fast for any still-`Alive` frame — a bounded
+    // perf cost, never a correctness issue.
+    PollOutcome { result, deopted: 1 }
 }
 
 #[cfg(test)]
@@ -1421,6 +1555,85 @@ mod tests {
                 "x{i} must appear in a restoring ldp"
             );
         }
+    }
+
+    /// S13 step 10b: the poll stub's CONTINUE path still restores x0-x15 (the
+    /// loop's live regs), AND it now has a deopt-teardown branch. Structural
+    /// check on the listing: a `cbz` on the `deopted` flag (x1), and — reached
+    /// only when `deopted != 0` — the teardown that discards the loop frame
+    /// (`mov sp, x2` after loading loop_fp, then `ldp x29,x30` popping the loop
+    /// frame's own record). The x0-x15 save/restore invariant is covered by
+    /// `poll_stub_preserves_x0_x15`; this asserts the NEW branch exists.
+    #[test]
+    fn poll_stub_has_deopt_teardown_branch() {
+        let blob = build_stub_poll();
+        // A `cbz` (conditional-branch-on-zero) must appear — the `deopted == 0`
+        // continue test. `cbz` lowers to a `cbz`/`b`-shaped listing entry.
+        assert!(
+            blob.listing.iter().any(|l| l.contains("cbz")),
+            "the poll stub must branch on rt_poll's `deopted` flag (cbz), got:\n{}",
+            blob.listing.join("\n")
+        );
+        // The teardown's `mov sp, x2` — the SP-register move that discards the
+        // stub_poll frame + loop locals down to loop_fp. `sp` is x31/is_sp, so
+        // the listing spells the destination with `is_sp: true`.
+        assert!(
+            blob.listing
+                .iter()
+                .any(|l| l.contains("mov ") && l.contains("is_sp: true")),
+            "the deopt teardown must `mov sp, <reg>` to discard down to loop_fp, got:\n{}",
+            blob.listing.join("\n")
+        );
+        // TWO `ldp x29,x30` epilogues now (one per branch: teardown + continue),
+        // vs. exactly one before this step.
+        let fp_lr_pops = blob
+            .listing
+            .iter()
+            .filter(|l| l.contains("ldp ") && l.contains("num: 29,"))
+            .count();
+        assert_eq!(
+            fp_lr_pops, 2,
+            "two `ldp x29,x30` frame-record pops (deopt-teardown branch + continue branch)"
+        );
+    }
+
+    /// S13 step 10b: the AArch64 C ABI returns `PollOutcome{result, deopted}`
+    /// (two ≤8-byte integer fields, ≤16 bytes total, all-integer) in `x0:x1`
+    /// with field 0 in x0, field 1 in x1 — `stub_poll`'s teardown depends on
+    /// exactly that. `#[repr(C)]` pins declaration order, so `result` is at
+    /// offset 0 and `deopted` at offset 8; the struct is 16 bytes.
+    #[test]
+    fn poll_outcome_abi_layout() {
+        use std::mem::{offset_of, size_of};
+        assert_eq!(offset_of!(PollOutcome, result), 0, "result -> x0 (field 0)");
+        assert_eq!(
+            offset_of!(PollOutcome, deopted),
+            8,
+            "deopted -> x1 (field 1)"
+        );
+        assert_eq!(
+            size_of::<PollOutcome>(),
+            16,
+            "a 16-byte all-integer struct returns in x0:x1, not via an x8 sret pointer"
+        );
+    }
+
+    /// S13 step 10b: `rt_poll`'s decision logic, exercised directly (no native
+    /// frame needed for the early-return arms). With `pending_deopt_flag` unset
+    /// it returns `{0, 0}` (continue) regardless of any nmethod state — the
+    /// fast path every non-deopting poll takes. This is the arm that keeps a
+    /// normal run's polls cheap.
+    #[test]
+    fn rt_poll_continues_when_flag_unset() {
+        let mut vm = test_vm();
+        vm.pending_deopt_flag = false;
+        vm.trace_on_poll = false;
+        // ret_pc/loop_fp are irrelevant on this arm (returns before touching
+        // code_table). SAFETY: honors rt_poll's contract — `vm` is a live &mut
+        // VmState; the flag-unset arm returns before dereferencing loop_fp.
+        let out = unsafe { rt_poll(&mut vm as *mut VmState, 0, 0) };
+        assert_eq!(out.deopted, 0, "flag unset -> continue (no deopt)");
+        assert_eq!(out.result, 0, "continue outcome carries no result");
     }
 
     #[test]

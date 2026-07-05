@@ -1007,4 +1007,108 @@ mod tests {
             "box:with: pops receiver + 2 args -> empty stack below"
         );
     }
+
+    /// S13 step 10b: a method with a backward-jump loop produces an nmethod
+    /// whose deopt metadata carries a `LoopPoll` site (`reexecute == true`) at
+    /// the poll's return offset, and its recorded scope resolves the
+    /// loop-carried operand-stack vregs to real FrameSlot `ValueLoc`s (via
+    /// spill-all plus `deopt_live` widening), never `Nil`. Driven through the
+    /// decode/convert/regalloc/emit pipeline directly, exactly like
+    /// `deopt_scope_blob_records_real_valuelocs`, on a call-free loop shape.
+    ///
+    /// `countTo: n [ | i | i := 0. [i < n] whileTrue: [i := i + 1]. ^i ]`,
+    /// hand-built as a header-test loop: a `LOOP:` block tests `i < n`
+    /// (`br_false_fwd END`), the body increments `i`, and a `jump_back LOOP`
+    /// closes it — that back-edge is the `Ir::Poll` this test targets.
+    #[test]
+    fn loop_poll_records_loop_poll_deopt_scope() {
+        use crate::compiler::scopes::{decode_scope, decode_site, SafepointKind, ValueLoc};
+
+        let mut vm = test_vm();
+        let lt_sel = vm.universe.intern(b"<");
+        let plus_sel = vm.universe.intern(b"+");
+        let m_sel = vm.universe.intern(b"countTo:");
+
+        // temps: t0 = n (the arg), t1 = i (the counter).
+        let mut b = BytecodeBuilder::new();
+        b.push_smi_i8(0);
+        b.store_temp_pop(1); // i := 0
+        let loop_hdr = b.new_label();
+        b.bind(loop_hdr);
+        b.push_temp(1); // i
+        b.push_temp(0); // n
+        b.send(&mut vm, lt_sel, 1); // i < n
+        let end = b.new_label();
+        b.br_false_fwd(end); // exit when !(i < n)
+        b.push_temp(1); // i
+        b.push_smi_i8(1);
+        b.send(&mut vm, plus_sel, 1); // i + 1
+        b.store_temp_pop(1); // i := i + 1
+        b.jump_back(loop_hdr); // <- BACKWARD JUMP -> Ir::Poll
+        b.bind(end);
+        b.push_temp(1); // ^i
+        b.ret_tos();
+        let method = b.finish(&mut vm, m_sel, 1, 1);
+
+        let cfg = decode::decode(method);
+        let ir_method = ir::convert(&vm, method, &cfg);
+        let ra = regalloc::regalloc(&ir_method);
+
+        let mut asm = JasmAssembler::new();
+        let (_blob, _pcs, _ve, _ic, safepoint_pcs) =
+            emit::emit(&mut asm, &ir_method, &ra, 0, 0, 0, None);
+
+        let (blob, pcdescs) = build_deopt_metadata(&ir_method, &ra, &safepoint_pcs);
+
+        // Exactly one LoopPoll site among the decoded deopt sites.
+        let poll_sites: Vec<_> = pcdescs
+            .iter()
+            .map(|d| decode_site(&blob, d.site_off))
+            .filter(|s| matches!(s.kind, SafepointKind::LoopPoll))
+            .collect();
+        assert_eq!(
+            poll_sites.len(),
+            1,
+            "the single loop back-edge produces exactly one LoopPoll deopt site"
+        );
+        let poll = &poll_sites[0];
+        assert!(
+            poll.reexecute,
+            "a loop-poll deopt re-executes the loop condition at the header bci"
+        );
+        // The loop-header bci is the resume point (re-execute the condition).
+        let loop_hdr_bci = cfg
+            .blocks
+            .iter()
+            .find(|blk| blk.is_loop_header)
+            .expect("the loop has a header block")
+            .bci_start;
+        assert_eq!(
+            poll.bci as usize, loop_hdr_bci,
+            "the LoopPoll resumes at the loop-header bci (re-executes the condition)"
+        );
+
+        // Every recorded stack ValueLoc (the loop-carried operand stack, empty
+        // here — the back-edge block leaves nothing on the stack — but the
+        // SCOPE's own slots must resolve) must be a concrete FrameSlot, never
+        // Nil: spill-all + deopt_live pin the live loop-carried vregs.
+        let scope = decode_scope(&blob, poll.scope_off);
+        for (i, loc) in scope.slots.iter().enumerate() {
+            assert!(
+                matches!(loc, ValueLoc::FrameSlot(_)),
+                "loop-carried slot {i} must resolve to a FrameSlot across the poll, got {loc:?}"
+            );
+        }
+        assert!(
+            matches!(scope.receiver, ValueLoc::FrameSlot(_)),
+            "the receiver must resolve to a FrameSlot across the poll, got {:?}",
+            scope.receiver
+        );
+        for loc in &poll.stack {
+            assert!(
+                matches!(loc, ValueLoc::FrameSlot(_)),
+                "every loop-carried operand-stack value must be a FrameSlot, got {loc:?}"
+            );
+        }
+    }
 }

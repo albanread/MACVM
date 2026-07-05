@@ -542,6 +542,16 @@ pub struct VmState {
     /// field rather than a `#[cfg(test)]` one, matching `poll_flag`'s own
     /// "wired but usually inert" status.
     pub trace_on_poll: bool,
+    /// S13 step 10b: `true` while at least one compiled activation's own
+    /// nmethod is `NotEntrant` and could still be running a call-free loop that
+    /// only the loop poll can deopt. `flush::make_not_entrant` sets it (and arms
+    /// `reg_block.poll_flag`) as a GLOBAL "some frame needs a loop-poll deopt"
+    /// signal; every compiled loop then polls, but `rt_poll` only DEOPTS a frame
+    /// whose OWN nmethod is `NotEntrant` — a poll in any other (still-`Alive`)
+    /// frame checks this flag, sees no self-match, and returns "continue" fast.
+    /// `rt_poll` clears it (and `poll_flag`) once no `NotEntrant` compiled frame
+    /// remains, so polling is bounded to the drain window (§2d). Default `false`.
+    pub pending_deopt_flag: bool,
     /// S12 D3 test-only hook, same "dormant, not `#[cfg(test)]`" status as
     /// `trace_on_poll`: `codecache::stubs::rt_alloc_slow` (one of the six
     /// anchor-setting stubs, so a real place `runtime::frames::walk_frames`
@@ -675,6 +685,7 @@ impl VmState {
             pending_deopts: HashMap::new(),
             nlr_state: None,
             trace_on_poll: false,
+            pending_deopt_flag: false,
             test_walk_capture: None,
             test_tear_tier_links_before_walk: false,
             test_force_scavenge_in_alloc_slow: false,

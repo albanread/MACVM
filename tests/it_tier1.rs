@@ -19,6 +19,7 @@ use macvm::compiler::ir::{
 use macvm::compiler::jasm_assembler::JasmAssembler;
 use macvm::compiler::regalloc;
 use macvm::frontend::{classdef, parser};
+use macvm::interpreter::compiled_call::{enter_compiled, EnterResult};
 use macvm::interpreter::ic::InterpreterIc;
 use macvm::memory::alloc;
 use macvm::memory::scavenge::scavenge;
@@ -755,6 +756,195 @@ fn compiled_not_boolean_deopts_to_interpreter() {
         deopts_after,
         deopts_before + 1,
         "exactly one deopt (the not_bool brk fired)"
+    );
+}
+
+/// Builds `jit: JitMode::Threshold(1)` VM with the two inlinable smi prims
+/// (`+`, `<`) the loop tests use.
+fn loop_test_vm() -> VmState {
+    let mut vm = VmState::with_options(VmOptions {
+        heap_mib: 64,
+        trace: Default::default(),
+        gc_stress: false,
+        gc_stress_full_period: None,
+        eden_kb: None,
+        jit: JitMode::Threshold(1),
+    });
+    install_smi_prim(&mut vm, b"+", 1, 1);
+    install_smi_prim(&mut vm, b"<", 1, 10);
+    vm
+}
+
+/// S13 step 10b (the THIRD deopt path) through the PRODUCTION dispatch path:
+/// a CALL-FREE compiled loop deopts via its loop poll when its own nmethod is
+/// `NotEntrant`, entered via `enter_compiled` — which pushes a live
+/// `TierLink::IntoCompiled` — NOT the raw `call_stub`. That tier-link + the
+/// missing stub anchor is the exact state `rt_poll` runs under; an earlier
+/// draft walked the native stack from `rt_poll` (`maybe_disarm_poll`) and
+/// aborted the VM here (`walk_frames`: IntoCompiled innermost, no anchor set).
+/// `rt_poll` no longer walks, so the deopt completes and the correct result
+/// flows back out through the whole `enter_compiled` teardown.
+#[test]
+fn compiled_loop_poll_deopts_via_enter_compiled() {
+    let mut vm = loop_test_vm();
+    let smi_klass = vm.universe.smi_klass;
+    let lt_sel = vm.universe.intern(b"<");
+    let plus_sel = vm.universe.intern(b"+");
+
+    // `countTo: n [ |i| i:=0. [i<n] whileTrue:[i:=i+1]. ^i ]`.  t0=n, t1=i.
+    let mut b = BytecodeBuilder::new();
+    b.push_smi_i8(0);
+    b.store_temp_pop(1);
+    let loop_hdr = b.new_label();
+    b.bind(loop_hdr);
+    b.push_temp(1);
+    b.push_temp(0);
+    b.send(&mut vm, lt_sel, 1);
+    let end = b.new_label();
+    b.br_false_fwd(end);
+    b.push_temp(1);
+    b.push_smi_i8(1);
+    b.send(&mut vm, plus_sel, 1);
+    b.store_temp_pop(1);
+    b.jump_back(loop_hdr);
+    b.bind(end);
+    b.push_temp(1);
+    b.ret_tos();
+    let m_sel = vm.universe.intern(b"countTo:");
+    let method = b.finish(&mut vm, m_sel, 1, 1);
+
+    // Warm the inner smi ICs to mono-smi via one interpreted run.
+    let recv = SmallInt::new(0).oop();
+    let warm = macvm::interpreter::run_method(&mut vm, method, recv, &[SmallInt::new(3).oop()]);
+    assert_eq!(warm.raw(), SmallInt::new(3).oop().raw());
+
+    let id = driver::compile_method(&mut vm, smi_klass, method).expect("must compile");
+    {
+        let nm = vm.code_table.get(id).expect("installed");
+        assert!(nm.ic_sites.is_empty(), "the loop must compile call-free");
+        assert!(
+            !nm.deopt_pcdescs.is_empty(),
+            "the loop poll must carry a LoopPoll deopt scope"
+        );
+    }
+
+    // Arm §2d (set_not_entrant §2a + both flags) WITHOUT make_not_entrant's
+    // entry patch, so the compiled loop actually runs and reaches its own poll.
+    vm.code_table.set_not_entrant(id);
+    vm.pending_deopt_flag = true;
+    vm.reg_block.poll_flag = 1;
+    let deopts_before = vm.stats.deopt_count;
+
+    // Enter through the production path (pushes TierLink::IntoCompiled).
+    let n = 20i64;
+    vm.stack.push(SmallInt::new(0).oop()); // receiver
+    vm.stack.push(SmallInt::new(n).oop()); // arg n
+    assert_eq!(enter_compiled(&mut vm, id, 1), EnterResult::Completed);
+    let result = vm.stack.pop();
+    assert_eq!(
+        result.raw(),
+        SmallInt::new(n).oop().raw(),
+        "loop-poll deopt through enter_compiled must produce the correct result"
+    );
+    assert_eq!(
+        vm.stats.deopt_count,
+        deopts_before + 1,
+        "exactly one loop-poll deopt fired"
+    );
+    // The flags stay ARMED: disarming needs a native walk that is illegal from
+    // rt_poll (IntoCompiled innermost + no anchor); it is deferred to step 10c's
+    // zombie sweep, which runs at a GC-safe walk point.
+    assert!(
+        vm.pending_deopt_flag,
+        "pending_deopt_flag stays armed until the 10c zombie sweep disarms it"
+    );
+}
+
+/// S13 step 10b — the M4 merge-height regression. A `LoopPoll` resume bci is a
+/// loop HEADER, a genuine CFG merge. If the loop header is fed by a conditional
+/// (`x := (n<5) ifTrue:[10] ifFalse:[20]`), the debug-only M4 cross-check's
+/// straight-line `interpreter_model_height` double-counts BOTH arms and
+/// disagrees with the real (CFG-derived) height — which, before the fix,
+/// aborted the whole VM on a `debug_assert_eq!` across the `extern "C"` `rt_poll`
+/// boundary. The materialization itself is correct; the check just can't model a
+/// merge, so it is skipped for LoopPoll. This test deopts exactly that shape and
+/// must produce the right answer in a DEBUG build (where M4 runs).
+#[test]
+fn loop_poll_deopt_at_merge_header_resume() {
+    let mut vm = loop_test_vm();
+    let smi_klass = vm.universe.smi_klass;
+    let lt_sel = vm.universe.intern(b"<");
+    let plus_sel = vm.universe.intern(b"+");
+
+    // `probe: n [ |x i| x := (n<5) ifTrue:[10] ifFalse:[20]. i:=0.
+    //             [i<x] whileTrue:[i:=i+1]. ^i ]`.  t0=n, t1=x, t2=i.
+    let mut b = BytecodeBuilder::new();
+    b.push_temp(0); // n
+    b.push_smi_i8(5);
+    b.send(&mut vm, lt_sel, 1); // n < 5
+    let else_l = b.new_label();
+    b.br_false_fwd(else_l);
+    b.push_smi_i8(10);
+    let merge_l = b.new_label();
+    b.jump_fwd(merge_l);
+    b.bind(else_l);
+    b.push_smi_i8(20);
+    b.bind(merge_l); // <- merge feeding the loop header below
+    b.store_temp_pop(1); // x := ...
+    b.push_smi_i8(0);
+    b.store_temp_pop(2); // i := 0
+    let loop_hdr = b.new_label();
+    b.bind(loop_hdr);
+    b.push_temp(2); // i
+    b.push_temp(1); // x
+    b.send(&mut vm, lt_sel, 1);
+    let end = b.new_label();
+    b.br_false_fwd(end);
+    b.push_temp(2);
+    b.push_smi_i8(1);
+    b.send(&mut vm, plus_sel, 1);
+    b.store_temp_pop(2);
+    b.jump_back(loop_hdr);
+    b.bind(end);
+    b.push_temp(2); // ^i
+    b.ret_tos();
+    let m_sel = vm.universe.intern(b"probe:");
+    let method = b.finish(&mut vm, m_sel, 1, 2);
+
+    let recv = SmallInt::new(0).oop();
+    // n=3 -> (3<5) true -> x=10 -> loop counts i to 10 -> result 10.
+    let warm = macvm::interpreter::run_method(&mut vm, method, recv, &[SmallInt::new(3).oop()]);
+    assert_eq!(
+        warm.raw(),
+        SmallInt::new(10).oop().raw(),
+        "interp ref: probe: 3 = 10"
+    );
+
+    let id = driver::compile_method(&mut vm, smi_klass, method).expect("must compile");
+    assert!(
+        !vm.code_table.get(id).unwrap().deopt_pcdescs.is_empty(),
+        "must carry a LoopPoll deopt scope at the merge header"
+    );
+
+    vm.code_table.set_not_entrant(id);
+    vm.pending_deopt_flag = true;
+    vm.reg_block.poll_flag = 1;
+    let deopts_before = vm.stats.deopt_count;
+
+    vm.stack.push(SmallInt::new(0).oop()); // receiver
+    vm.stack.push(SmallInt::new(3).oop()); // arg n=3
+    assert_eq!(enter_compiled(&mut vm, id, 1), EnterResult::Completed);
+    let result = vm.stack.pop();
+    assert_eq!(
+        result.raw(),
+        SmallInt::new(10).oop().raw(),
+        "deopt resuming at a merge-point loop header must still produce 10 \
+         (M4's straight-line model can't be trusted here, so it is skipped)"
+    );
+    assert_eq!(
+        vm.stats.deopt_count,
+        deopts_before + 1,
+        "one loop-poll deopt fired"
     );
 }
 
