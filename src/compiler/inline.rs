@@ -15,8 +15,93 @@
 //! `MethodOop`/`KlassOop` read here stays valid for the whole compile. If a
 //! later step ever compiles across a collection, these become `Handle`s then.
 
+use crate::bytecode::opcode::{decode_at, Instr};
 use crate::compiler::feedback::SiteFeedback;
 use crate::oops::wrappers::{KlassOop, MethodOop};
+
+/// S14 step 4 (SPEC §8.1/§8.4): the inlining budget at one recompilation level.
+/// All tunables. `per_call_cost` bounds a single inlinee's [`inline_cost`];
+/// `total_bytes` the cumulative inlined bytecode across one compilation;
+/// `max_depth` the inline-chain depth.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InlineBudget {
+    pub per_call_cost: u32,
+    pub total_bytes: u32,
+    pub max_depth: u32,
+}
+
+/// The budget for recompilation level `level` (1..=4, SPEC §8.1). Higher levels
+/// (reached only after the effectiveness/version gates, S14 step 8) inline more
+/// aggressively. Clamps `level >= 4` to the top row.
+pub fn budget_for_level(level: u8) -> InlineBudget {
+    match level {
+        0 | 1 => InlineBudget {
+            per_call_cost: 30,
+            total_bytes: 300,
+            max_depth: 4,
+        },
+        2 => InlineBudget {
+            per_call_cost: 50,
+            total_bytes: 600,
+            max_depth: 6,
+        },
+        3 => InlineBudget {
+            per_call_cost: 80,
+            total_bytes: 1200,
+            max_depth: 8,
+        },
+        _ => InlineBudget {
+            per_call_cost: 120,
+            total_bytes: 2400,
+            max_depth: 8,
+        },
+    }
+}
+
+/// Cost of inlining `callee` (SPEC §8.4 cost model). Rules, first match wins:
+/// 1. a `primitive != 0` method — its bytecode is only the failure fallback,
+///    the real work is the primitive, so it inlines for a flat **4**;
+/// 2. an accessor (`push_instvar; ^tos`) or quick return (`push_*; ^tos`, or a
+///    bare `^self`) — **2**;
+/// 3. otherwise the bytecode length in bytes.
+pub fn inline_cost(callee: MethodOop) -> u32 {
+    if callee.primitive() != 0 {
+        return 4;
+    }
+    if is_quick_return(callee) {
+        return 2;
+    }
+    callee.bytecode_len() as u32
+}
+
+/// A method whose whole body is a single `push_*; ^tos` (accessor / quick
+/// return) or a bare `^self` — the cost-2 shapes above.
+fn is_quick_return(method: MethodOop) -> bool {
+    let len = method.bytecode_len();
+    if len == 0 {
+        return false;
+    }
+    let (first, next) = decode_at(method, 0);
+    match first {
+        Instr::ReturnSelf => next == len,
+        Instr::PushSelf
+        | Instr::PushNil
+        | Instr::PushTrue
+        | Instr::PushFalse
+        | Instr::PushSmi(_)
+        | Instr::PushLiteral(_)
+        | Instr::PushTemp(_)
+        | Instr::PushInstvar(_)
+        | Instr::PushGlobal(_) => {
+            if next >= len {
+                return false;
+            }
+            let (second, next2) = decode_at(method, next);
+            matches!(second, Instr::ReturnTos) && next2 == len
+        }
+        _ => false,
+    }
+}
 
 /// What to do at one send site (SPEC §8.4). Step 3 only ever produces `Trap`
 /// and `Call`; the `Inline`/`DominantWithSlowPath` arms are declared now (the
@@ -139,5 +224,71 @@ mod tests {
     #[test]
     fn mega_calls() {
         assert!(matches!(decide(&SiteFeedback::Mega), InlineDecision::Call));
+    }
+
+    use crate::bytecode::builder::BytecodeBuilder;
+
+    #[test]
+    fn budget_grows_with_level() {
+        assert_eq!(budget_for_level(1).per_call_cost, 30);
+        assert_eq!(budget_for_level(0).per_call_cost, 30, "level 0 clamps to 1");
+        assert!(budget_for_level(2).per_call_cost > budget_for_level(1).per_call_cost);
+        assert!(budget_for_level(3).total_bytes > budget_for_level(2).total_bytes);
+        assert_eq!(
+            budget_for_level(4),
+            budget_for_level(9),
+            "level >= 4 clamps"
+        );
+    }
+
+    #[test]
+    fn cost_primitive_is_flat_four() {
+        let mut vm = test_vm();
+        let sel = vm.universe.intern(b"prim");
+        let mut b = BytecodeBuilder::new();
+        b.push_self();
+        b.push_temp(0);
+        b.ret_tos(); // a non-trivial fallback body...
+        let m = b.finish(&mut vm, sel, 1, 0);
+        m.set_primitive(1); // ...but a primitive, so cost is 4 regardless
+        assert_eq!(inline_cost(m), 4);
+    }
+
+    #[test]
+    fn cost_accessor_and_quick_return_are_two() {
+        let mut vm = test_vm();
+        // `^self` (bare return-self).
+        let s1 = vm.universe.intern(b"retSelf");
+        let mut b1 = BytecodeBuilder::new();
+        b1.ret_self();
+        assert_eq!(inline_cost(b1.finish(&mut vm, s1, 0, 0)), 2);
+
+        // `^temp0` (push then return-tos — the accessor/quick-return shape).
+        let s2 = vm.universe.intern(b"getArg");
+        let mut b2 = BytecodeBuilder::new();
+        b2.push_temp(0);
+        b2.ret_tos();
+        assert_eq!(inline_cost(b2.finish(&mut vm, s2, 1, 0)), 2);
+    }
+
+    #[test]
+    fn cost_general_is_bytecode_len() {
+        let mut vm = test_vm();
+        let sel = vm.universe.intern(b"general");
+        // `push_self; push_temp; push_temp; pop; pop; ^self` — more than a quick
+        // return, no primitive → cost is the raw bytecode length.
+        let mut b = BytecodeBuilder::new();
+        b.push_self();
+        b.push_temp(0);
+        b.push_temp(0);
+        b.pop();
+        b.pop();
+        b.ret_self();
+        let m = b.finish(&mut vm, sel, 1, 0);
+        assert_eq!(inline_cost(m), m.bytecode_len() as u32);
+        assert!(
+            inline_cost(m) > 2,
+            "a general body costs more than a quick return"
+        );
     }
 }
