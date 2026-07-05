@@ -137,6 +137,7 @@ fn run_ir_raw() {
         pool: Vec::new(),
         argc: 2,
         ntemps: 0,
+        ctx_vregs: Vec::new(),
         safepoints: Vec::new(),
         // Unused: this method has no SmiCmpVal/BoolBr, so emit.rs never
         // dereferences these against the (also empty) pool.
@@ -260,6 +261,7 @@ fn mul_method() -> IrMethod {
         pool: Vec::new(),
         argc: 2,
         ntemps: 0,
+        ctx_vregs: Vec::new(),
         safepoints: Vec::new(),
         true_lit: PoolLit(0),
         false_lit: PoolLit(0),
@@ -380,6 +382,7 @@ fn run_ir_raw_forces_spill() {
         pool: Vec::new(),
         argc: 0,
         ntemps: 0,
+        ctx_vregs: Vec::new(),
         safepoints: Vec::new(),
         true_lit: PoolLit(0),
         false_lit: PoolLit(0),
@@ -2316,6 +2319,7 @@ fn mono_resolve_patches_call_site_and_dispatches() {
         pool: Vec::new(),
         argc: 1,
         ntemps: 0,
+        ctx_vregs: Vec::new(),
         safepoints: Vec::new(),
         true_lit: PoolLit(0),
         false_lit: PoolLit(0),
@@ -2478,6 +2482,7 @@ fn build_c2i_scenario(vm: &mut VmState) -> (u64, KlassOop, NmethodId) {
         pool: Vec::new(),
         argc: 1,
         ntemps: 0,
+        ctx_vregs: Vec::new(),
         safepoints: Vec::new(),
         true_lit: PoolLit(0),
         false_lit: PoolLit(0),
@@ -2704,6 +2709,7 @@ fn full_ic_lattice_mono_to_pic_to_mega() {
         pool: Vec::new(),
         argc: 1,
         ntemps: 0,
+        ctx_vregs: Vec::new(),
         safepoints: Vec::new(),
         true_lit: PoolLit(0),
         false_lit: PoolLit(0),
@@ -2924,6 +2930,7 @@ fn dnu_from_compiled_code_reaches_does_not_understand() {
         pool: Vec::new(),
         argc: 1,
         ntemps: 0,
+        ctx_vregs: Vec::new(),
         safepoints: Vec::new(),
         true_lit: PoolLit(0),
         false_lit: PoolLit(0),
@@ -4451,5 +4458,188 @@ fn compiled_block_with_warm_send_matches_interpreter() {
     assert_eq!(
         deopts_after, deopts_before,
         "the warm block send does not deopt"
+    );
+}
+
+// ── S14 step 7-II-b: captured-temp promotion + Context elision ──────────────
+
+/// S14 step 7-II-b: a home method whose captured temp is READ by a send-free
+/// elided block. `foo [ |x| x := 7. [x] value. ^x ]` — `x` is a ctx-temp
+/// (nctx=1) captured by `[x]`; with the block inlined, `x` promotes to a vreg
+/// and M's Context is elided. Both interp and compiled return 7.
+#[test]
+fn compiled_captured_temp_read_matches_interpreter() {
+    let mut vm = test_vm();
+    install_value_prims(&mut vm);
+    let smi_klass = vm.universe.smi_klass;
+    let value_sel = vm.universe.intern(b"value");
+    let sel = vm.universe.intern(b"foo");
+
+    let mut b = BytecodeBuilder::new();
+    // block `[x]` — captures_ctx, reads M's ctx-temp 0 at depth 0, send-free.
+    let lit = b.build_block(&mut vm, 0, 0, false, 0, true, |blk, _vm| {
+        blk.push_ctx_temp(0, 0);
+        blk.block_return_tos();
+    });
+    b.push_smi_i8(7);
+    b.store_ctx_temp_pop(0, 0); // x := 7
+    b.push_closure(lit, 0);
+    b.send(&mut vm, value_sel, 0); // [x] value
+    b.pop(); // discard the value result
+    b.push_ctx_temp(0, 0); // x
+    b.ret_tos();
+    let m = b.finish(&mut vm, sel, 0, 0);
+    m.set_flags(0, 0, true, false, false, false, 1); // has_ctx, nctx=1
+
+    assert!(
+        driver::eligible(&vm, m),
+        "a has_ctx method with an elidable capturing block is eligible"
+    );
+    let self_smi = SmallInt::new(1).oop();
+    let interp = macvm::interpreter::run_method(&mut vm, m, self_smi, &[]);
+    assert_eq!(
+        interp.raw(),
+        SmallInt::new(7).oop().raw(),
+        "interp: captured x read = 7"
+    );
+
+    let id = driver::compile_method(&mut vm, smi_klass, m).expect("must compile");
+    let nm = vm.code_table.get(id).expect("installed");
+    let entry = unsafe { nm.code.base.add(nm.entry_off as usize) } as u64;
+    let call: CallStubFn = unsafe { std::mem::transmute(vm.stubs.call_stub_entry()) };
+    let vm_ptr: *mut VmState = &mut vm;
+    let result = unsafe { call(entry, vm_ptr, [self_smi.raw()].as_ptr(), 1) };
+    assert_eq!(
+        result,
+        SmallInt::new(7).oop().raw(),
+        "compiled: promoted ctx-temp read = 7"
+    );
+}
+
+/// S14 step 7-II-b: a captured temp WRITTEN by a send-free elided block.
+/// `foo [ |x| x := 0. [:v | x := v. x] value: 9. ^x ]` → 9 (the block writes M's
+/// ctx-temp, M reads it back through the promoted vreg).
+#[test]
+fn compiled_captured_temp_write_matches_interpreter() {
+    let mut vm = test_vm();
+    install_value_prims(&mut vm);
+    let smi_klass = vm.universe.smi_klass;
+    let value_arg_sel = vm.universe.intern(b"value:");
+    let sel = vm.universe.intern(b"foo");
+
+    let mut b = BytecodeBuilder::new();
+    // block `[:v | x := v. x]` — captures_ctx, writes+reads M's ctx-temp 0.
+    let lit = b.build_block(&mut vm, 1, 0, false, 0, true, |blk, _vm| {
+        blk.push_temp(0); // v (block arg)
+        blk.store_ctx_temp_pop(0, 0); // x := v
+        blk.push_ctx_temp(0, 0); // x
+        blk.block_return_tos();
+    });
+    b.push_smi_i8(0);
+    b.store_ctx_temp_pop(0, 0); // x := 0
+    b.push_closure(lit, 0);
+    b.push_smi_i8(9);
+    b.send(&mut vm, value_arg_sel, 1); // [:v|...] value: 9
+    b.pop();
+    b.push_ctx_temp(0, 0); // x
+    b.ret_tos();
+    let m = b.finish(&mut vm, sel, 0, 0);
+    m.set_flags(0, 0, true, false, false, false, 1); // has_ctx, nctx=1
+
+    assert!(driver::eligible(&vm, m));
+    let self_smi = SmallInt::new(1).oop();
+    let interp = macvm::interpreter::run_method(&mut vm, m, self_smi, &[]);
+    assert_eq!(
+        interp.raw(),
+        SmallInt::new(9).oop().raw(),
+        "interp: block-written x = 9"
+    );
+
+    let id = driver::compile_method(&mut vm, smi_klass, m).expect("must compile");
+    let nm = vm.code_table.get(id).expect("installed");
+    let entry = unsafe { nm.code.base.add(nm.entry_off as usize) } as u64;
+    let call: CallStubFn = unsafe { std::mem::transmute(vm.stubs.call_stub_entry()) };
+    let vm_ptr: *mut VmState = &mut vm;
+    let result = unsafe { call(entry, vm_ptr, [self_smi.raw()].as_ptr(), 1) };
+    assert_eq!(
+        result,
+        SmallInt::new(9).oop().raw(),
+        "compiled: block writes promoted ctx-temp = 9"
+    );
+}
+
+/// S14 step 7-II-b: the `CtxLoc::Elided` materialization. M reads a captured
+/// temp, then hits a COLD send that traps → deopt must allocate a fresh Context
+/// and fill it from the promoted vreg, so the post-deopt `^x` (a ctx-temp read
+/// in the interpreter) sees the right value. == interp, deopt_count +1.
+#[test]
+fn compiled_captured_temp_deopt_materializes_context() {
+    let mut vm = VmState::with_options(VmOptions {
+        heap_mib: 64,
+        trace: Default::default(),
+        gc_stress: false,
+        gc_stress_full_period: None,
+        eden_kb: None,
+        jit: JitMode::Threshold(1),
+    });
+    install_value_prims(&mut vm);
+    let smi_klass = vm.universe.smi_klass;
+    let value_sel = vm.universe.intern(b"value");
+
+    // `poke [ ^self ]` on SmallInteger — the cold send's target (IC stays Empty
+    // → Untaken → a trap once compiled).
+    let poke_sel = vm.universe.intern(b"poke");
+    let poke = {
+        let mut pb = BytecodeBuilder::new();
+        pb.ret_self();
+        pb.finish(&mut vm, poke_sel, 0, 0)
+    };
+    install_method(&mut vm, smi_klass, poke_sel, poke);
+
+    // `foo [ |x| x := 7. [x] value. self poke. ^x ]` (self is a smi).
+    let sel = vm.universe.intern(b"foo");
+    let mut b = BytecodeBuilder::new();
+    let lit = b.build_block(&mut vm, 0, 0, false, 0, true, |blk, _vm| {
+        blk.push_ctx_temp(0, 0);
+        blk.block_return_tos();
+    });
+    b.push_smi_i8(7);
+    b.store_ctx_temp_pop(0, 0);
+    b.push_closure(lit, 0);
+    b.send(&mut vm, value_sel, 0);
+    b.pop();
+    b.push_self();
+    b.send(&mut vm, poke_sel, 0); // self poke  (cold → trap → deopt)
+    b.pop();
+    b.push_ctx_temp(0, 0); // x
+    b.ret_tos();
+    let m = b.finish(&mut vm, sel, 0, 0);
+    m.set_flags(0, 0, true, false, false, false, 1);
+
+    assert!(driver::eligible(&vm, m));
+    let self_smi = SmallInt::new(3).oop();
+    // Compile BEFORE the interp reference: running the interpreter first would
+    // warm `self poke` to Mono (→ inlined leaf, no trap). Compiling with the IC
+    // still Empty keeps it Untaken → the cold trap this test's deopt needs.
+    let id = driver::compile_method(&mut vm, smi_klass, m).expect("must compile");
+    let interp = macvm::interpreter::run_method(&mut vm, m, self_smi, &[]);
+    assert_eq!(interp.raw(), SmallInt::new(7).oop().raw());
+
+    let nm = vm.code_table.get(id).expect("installed");
+    let entry = unsafe { nm.code.base.add(nm.entry_off as usize) } as u64;
+    let call: CallStubFn = unsafe { std::mem::transmute(vm.stubs.call_stub_entry()) };
+    let vm_ptr: *mut VmState = &mut vm;
+    let deopts_before = unsafe { (*vm_ptr).stats.deopt_count };
+    let result = unsafe { call(entry, vm_ptr, [self_smi.raw()].as_ptr(), 1) };
+    let deopts_after = unsafe { (*vm_ptr).stats.deopt_count };
+    assert_eq!(
+        result,
+        SmallInt::new(7).oop().raw(),
+        "deopt must materialize M's elided Context so the post-deopt ctx-temp read = 7"
+    );
+    assert_eq!(
+        deopts_after,
+        deopts_before + 1,
+        "the cold `self poke` trap fired once"
     );
 }

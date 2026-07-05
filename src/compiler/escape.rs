@@ -112,7 +112,11 @@ fn block_is_spliceable(block: MethodOop) -> bool {
     // Non-capturing, no owned Context. A block that captures the enclosing
     // Context or owns its own heap Context needs captured-temp promotion (the
     // next slice) — gated out here.
-    if block.captures_ctx() || block.has_ctx() {
+    // A block that owns its OWN heap Context (`has_ctx`) needs nested-context
+    // depth machinery — gated. A `captures_ctx` block (it reads/writes the HOME
+    // method's captured temps) IS spliceable in 7-II-b (its ctx-temps promote to
+    // the home's vregs).
+    if block.has_ctx() {
         return false;
     }
     // Single straight-line block ending in a return — the exact shape
@@ -122,23 +126,29 @@ fn block_is_spliceable(block: MethodOop) -> bool {
     if cfg.blocks.len() != 1 || !matches!(cfg.blocks[0].terminator, Terminator::Return) {
         return false;
     }
-    // No opcode outside the set the splicer handles. A SUPER send (needs
-    // static-super scope machinery), a nested `push_closure`, a ctx-temp access,
-    // or an NLR all defer to a later slice — the block is not spliceable.
-    // `block_return_tos` is the block's own return and IS allowed. 7-II: an
-    // ordinary (non-super) `Send` IS allowed — the splicer lowers it to a
-    // `CallSend`/cold-trap inside the block, recording an `is_block` in-body
-    // deopt scope the materializer rebuilds soundly.
+    // A `captures_ctx` block accesses M's ctx-temps; 7-II-b-i restricts such a
+    // block to be SEND-FREE (an in-block deopt of a capturing block needs the
+    // block frame's Context to alias M's, which is 7-II-b-ii's materializer
+    // change). A NON-capturing block may still have ordinary sends (7-II).
+    let captures = block.captures_ctx();
     let len = block.bytecode_len();
     let mut bci = 0;
     while bci < len {
         let (instr, next) = decode_at(block, bci);
         match instr {
-            Instr::Send { super_: true, .. }
-            | Instr::PushCtxTemp { .. }
-            | Instr::StoreCtxTempPop { .. }
-            | Instr::PushClosure { .. }
-            | Instr::NlrTos => return false,
+            // Always gated: super sends, nested closures, NLR.
+            Instr::Send { super_: true, .. } | Instr::PushClosure { .. } | Instr::NlrTos => {
+                return false
+            }
+            // A capturing block must be send-free (7-II-b-i).
+            Instr::Send { .. } if captures => return false,
+            // ctx-temp access is DEPTH 0 only (M's own Context, which a ctx-less
+            // block's frame aliases). A `depth != 0` (nested context) is gated.
+            Instr::PushCtxTemp { depth, .. } | Instr::StoreCtxTempPop { depth, .. }
+                if depth != 0 =>
+            {
+                return false
+            }
             _ => {}
         }
         bci = next;
@@ -748,12 +758,15 @@ mod tests {
 
     /// A capturing block (`captures_ctx`) is not spliceable in 7-I → escaping,
     /// even if directly invoked.
+    /// 7-II-b: a SEND-FREE `captures_ctx` block (it captures the home's Context
+    /// to read/write ctx-temps) IS spliceable — its ctx-temps promote to the
+    /// home's vregs. Elidable when directly invoked.
     #[test]
-    fn capturing_block_escapes() {
+    fn capturing_send_free_block_is_elidable() {
         let mut vm = test_vm();
         let value_sel = vm.universe.intern(b"value");
         let mut b = BytecodeBuilder::new();
-        // captures_ctx = true (last arg): a 7-II shape, gated out of 7-I.
+        // captures_ctx = true (6th arg), send-free body.
         let lit = b.build_block(&mut vm, 0, 0, false, 0, true, |blk, _vm| {
             blk.push_smi_i8(1);
             blk.ret_tos();
@@ -766,8 +779,34 @@ mod tests {
 
         let e = analyze(m);
         assert!(
+            e.all_elidable,
+            "a send-free captures_ctx block is spliceable in 7-II-b"
+        );
+    }
+
+    /// 7-II-b-i: a captures_ctx block WITH a send is still gated (an in-block
+    /// deopt needs the block frame's Context to alias the home's — 7-II-b-ii).
+    #[test]
+    fn capturing_block_with_send_escapes() {
+        let mut vm = test_vm();
+        let value_sel = vm.universe.intern(b"value");
+        let bar = vm.universe.intern(b"bar");
+        let mut b = BytecodeBuilder::new();
+        let lit = b.build_block(&mut vm, 0, 0, false, 0, true, |blk, vm| {
+            blk.push_self();
+            blk.send(vm, bar, 0);
+            blk.ret_tos();
+        });
+        b.push_closure(lit, 0);
+        b.send(&mut vm, value_sel, 0);
+        b.ret_tos();
+        let sel = vm.universe.intern(b"m");
+        let m = b.finish(&mut vm, sel, 0, 0);
+
+        let e = analyze(m);
+        assert!(
             !e.all_elidable,
-            "a captures_ctx block is not spliceable in 7-I → escaping"
+            "a send-ful capturing block is gated in 7-II-b-i → escaping"
         );
     }
 }

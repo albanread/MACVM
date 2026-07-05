@@ -104,8 +104,13 @@ pub fn eligible(vm: &VmState, method: MethodOop) -> bool {
 /// deserves — `docs/sprints/sprint_s11_detail.md` has a SPEC-QUESTION on
 /// this gap.
 fn eligibility_detail(vm: &VmState, method: MethodOop) -> Eligibility {
+    // S14 step 7-II-b: `has_ctx` (M owns a heap Context because a nested block
+    // captures its temps) is NO LONGER an outright reject — the escape pre-pass
+    // below gates it: a has_ctx method always creates a capturing closure, so it
+    // compiles ONLY if that closure is elidable (all_elidable), which promotes
+    // ALL of M's ctx-temps to vregs and elides M's Context. A `has_ctx` method
+    // whose block escapes still returns NoPermanent (via the pre-pass).
     if method.is_block()
-        || method.has_ctx()
         || method.argc() > 5
         || method.primitive() != 0
         || method.bytecode_len() > MAX_BYTECODE_LEN
@@ -146,6 +151,14 @@ fn eligibility_detail(vm: &VmState, method: MethodOop) -> Eligibility {
     } else {
         None
     };
+    // S14 step 7-II-b: a `has_ctx` method's Context elides ONLY because every
+    // capturing block is inlined. A has_ctx method with NO (elidable) closure has
+    // nothing justifying the elision — real frontend output never produces one
+    // (has_ctx ⟺ a capturing block exists), so reject the degenerate case rather
+    // than silently compile a method whose Context has no promotable owner.
+    if method.has_ctx() && escape.is_none() {
+        return Eligibility::NoPermanent;
+    }
 
     let mut verdict = Eligibility::Yes;
     let mut bci = 0usize;
@@ -214,15 +227,21 @@ fn eligibility_detail(vm: &VmState, method: MethodOop) -> Eligibility {
                     "a push_closure reached the scan but has_closure was false"
                 );
             }
-            // Still excluded (D1 point 1): ctx temps and stores, block returns,
-            // NLR appearing in M's OWN top-level bytecode. These only
-            // legitimately appear INSIDE a block body (which we reach via the
-            // splice, not this scan) — captured-temp elision (7-II) and NLR
-            // (7-III) are later slices.
-            Instr::PushCtxTemp { .. }
-            | Instr::StoreCtxTempPop { .. }
-            | Instr::BlockReturnTos
-            | Instr::NlrTos => return Eligibility::NoPermanent,
+            // S14 step 7-II-b: M's own captured temp access. Allowed at DEPTH 0
+            // (M's own Context) — `ir::convert` promotes it to a vreg and elides
+            // M's Context. A has_ctx M always creates a capturing closure, so the
+            // escape pre-pass (`escape.is_some()` + all_elidable) already proved
+            // the Context elidable. A `depth != 0` (nested-context access) is a
+            // later slice → NoPermanent.
+            Instr::PushCtxTemp { depth, .. } | Instr::StoreCtxTempPop { depth, .. } => {
+                if depth != 0 || escape.is_none() {
+                    return Eligibility::NoPermanent;
+                }
+            }
+            // Block returns / NLR only legitimately appear INSIDE a block body
+            // (reached via the splice, not this scan). At M's top level they are
+            // malformed / an explicit NLR (7-III) → still excluded.
+            Instr::BlockReturnTos | Instr::NlrTos => return Eligibility::NoPermanent,
         }
         bci = next;
     }
@@ -666,6 +685,23 @@ fn build_deopt_metadata(
                     .method_pool_ix
                     .expect("a method with a deopt site interned its own method oop");
 
+                // S14 step 7-II-b: if M owns a heap Context that was ELIDED (its
+                // captured temps promoted to `ctx_vregs`), the root scope records
+                // `CtxLoc::Elided` over those vregs' frame slots so a deopt allocs
+                // a fresh Context and fills it (materializer M6). No ctx-vregs →
+                // M never owned a Context → `None` (unchanged S13 behaviour).
+                let root_ctx = if ir_method.ctx_vregs.is_empty() {
+                    CtxLoc::None
+                } else {
+                    CtxLoc::Elided {
+                        temps: ir_method
+                            .ctx_vregs
+                            .iter()
+                            .map(|&v| resolve_frame_loc(v, position, intervals))
+                            .collect(),
+                    }
+                };
+
                 // S14 step 4c: a safepoint INSIDE an inlined body records a
                 // NESTED scope — the inlined callee's own receiver/slots/method
                 // + a `SenderLink` to the (freshly begun) caller scope. A
@@ -679,7 +715,7 @@ fn build_deopt_metadata(
                         sender: None,
                         receiver: root_receiver,
                         slots: root_slots,
-                        ctx: CtxLoc::None,
+                        ctx: root_ctx,
                     }),
                     Some(site) => {
                         // Begin the CALLER scope first (the SenderLink's target
@@ -691,7 +727,7 @@ fn build_deopt_metadata(
                             sender: None,
                             receiver: root_receiver,
                             slots: root_slots,
-                            ctx: CtxLoc::None,
+                            ctx: root_ctx,
                         });
                         // The SenderLink: where the caller resumes (the inlined
                         // send's bci, advanced past it by the materializer) and
@@ -1008,9 +1044,12 @@ mod tests {
         );
     }
 
-    /// D1 point 1: `has_ctx` (a heap `Context` needed because some inner
-    /// block captures this activation's own temps/self) is excluded —
-    /// S10 compiled frames have no heap Context at all.
+    /// S14 step 7-II-b: `has_ctx` is no longer an outright reject (a real
+    /// has_ctx method's Context ELIDES when its capturing blocks inline). But
+    /// this DEGENERATE method sets `has_ctx` with NO closure at all — nothing
+    /// justifies the elision, so it stays interpreted (the `has_ctx && no-closure`
+    /// guard). A real has_ctx-with-elidable-block method IS eligible — covered by
+    /// the `it_tier1` captured-temp differential tests.
     #[test]
     fn eligible_rejects_has_ctx() {
         let mut vm = test_vm();

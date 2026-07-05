@@ -306,6 +306,20 @@ pub fn compute_intervals(method: &IrMethod) -> (Vec<BlockId>, Vec<LiveInterval>,
                     deopt_live.push((v.0, pos));
                 }
             }
+            // S14 step 7-II-b: M's promoted ctx-temps back the ELIDED Context the
+            // ROOT scope materializes at EVERY deopt (any kind — trap, root
+            // `Call`, inlined-body site). They are frequently DEAD in the compiled
+            // code after a terminating trap (their post-trap ctx-temp reads never
+            // emit), so natural liveness does NOT cover them — force each live
+            // across so spill-all pins it to a frame slot the `CtxLoc::Elided`
+            // materializer reads. Only for a `has_ctx` M (else `ctx_vregs` empty).
+            if !method.ctx_vregs.is_empty()
+                && block.deopt_sites.iter().any(|(ci, _)| *ci == idx as u32)
+            {
+                for &cv in &method.ctx_vregs {
+                    deopt_live.push((cv.0, pos));
+                }
+            }
             ir.uses(|v| {
                 max_use
                     .entry(v.0)
@@ -560,6 +574,7 @@ mod tests {
             pool: Vec::new(),
             argc: 0,
             ntemps: 0,
+            ctx_vregs: Vec::new(),
             safepoints: Vec::new(),
             true_lit: PoolLit(0),
             false_lit: PoolLit(0),

@@ -461,6 +461,11 @@ pub struct IrMethod {
     pub pool: Vec<PoolEntry>,
     pub argc: u8,
     pub ntemps: u8,
+    /// S14 step 7-II-b: the vregs holding M's promoted captured temps (one per
+    /// ctx-slot) when M's heap Context is elided; empty otherwise.
+    /// `build_deopt_metadata` records `CtxLoc::Elided` over their frame slots so
+    /// a deopt rebuilds a real Context.
+    pub ctx_vregs: Vec<VReg>,
     pub safepoints: Vec<SafepointId>,
     /// Always present (`convert` interns them unconditionally) — `emit.rs`
     /// has no `VmState` of its own to intern `true_obj`/`false_obj` on
@@ -757,6 +762,16 @@ struct Translator<'a> {
     pool: PoolBuilder,
     self_vreg: VReg,
     temp_vregs: Vec<VReg>,
+    /// S14 step 7-II-b: one vreg per M ctx-slot (`method.nctx()`) — the promoted
+    /// homes of M's captured temps when M's heap Context is ELIDED (every block
+    /// capturing them is inlined). `push_ctx_temp{depth:0,idx}` /
+    /// `store_ctx_temp_pop{depth:0,idx}` in M's own body AND in a spliced
+    /// (ctx-less, `captures_ctx`) block both address `ctx_vregs[idx]` — a
+    /// ctx-less block's frame aliases M's Context, so it reaches M's ctx-temps at
+    /// depth 0. Empty when M is not `has_ctx`. Nil-initialised at method entry
+    /// (matching `alloc_context`'s nil-fill). The deopt root scope records
+    /// `CtxLoc::Elided` over these so the materializer rebuilds a real Context.
+    ctx_vregs: Vec<VReg>,
     /// S11 step 7 (D1): a smi-inlined fail edge, or a `not_bool` edge, no
     /// longer bails the whole method out to the interpreter — it computes
     /// a real fallback value (`CallSend`/`CallRuntime`) and REJOINS normal
@@ -2260,11 +2275,29 @@ impl<'a> Translator<'a> {
                     barrier: true,
                 });
             }
-            Instr::PushCtxTemp { .. }
-            | Instr::StoreCtxTempPop { .. }
-            | Instr::PushClosure { .. }
-            | Instr::BlockReturnTos
-            | Instr::NlrTos => {
+            // S14 step 7-II-b: M's own captured temp, promoted to `ctx_vregs`
+            // (M's heap Context is elided). Only depth 0 (M's own Context) is
+            // eligible — a `depth != 0` was rejected by `driver::eligible`.
+            Instr::PushCtxTemp { depth, idx } => {
+                debug_assert_eq!(depth, 0, "compiled ctx-temp access must be depth 0");
+                let dst = self.fresh(true);
+                code.push(Ir::Move {
+                    dst,
+                    src: self.ctx_vregs[idx as usize],
+                });
+                stack.push(dst);
+            }
+            Instr::StoreCtxTempPop { depth, idx } => {
+                debug_assert_eq!(depth, 0, "compiled ctx-temp access must be depth 0");
+                let v = stack
+                    .pop()
+                    .expect("store_ctx_temp_pop: empty simulated stack");
+                code.push(Ir::Move {
+                    dst: self.ctx_vregs[idx as usize],
+                    src: v,
+                });
+            }
+            Instr::PushClosure { .. } | Instr::BlockReturnTos | Instr::NlrTos => {
                 panic!(
                     "translate_instr: {instr:?} should have been rejected by driver::eligible \
                      (D1) -- compiler bug if this fires"
@@ -2718,9 +2751,33 @@ impl<'a> Translator<'a> {
                     });
                     bstack.push(dst);
                 }
-                // `block_is_spliceable` still rejects super/ctx/closure/NLR, and
-                // the single-block shape excludes jumps/branches; every other
-                // opcode is handled above.
+                // S14 step 7-II-b: the block reads/writes its HOME method's
+                // captured temps. A ctx-less (`captures_ctx`) block's frame
+                // aliases M's Context, so it addresses M's ctx-temps at depth 0 —
+                // the SAME promoted `ctx_vregs` M itself uses. `depth != 0` was
+                // rejected by `block_is_spliceable`.
+                Instr::PushCtxTemp { depth, idx } => {
+                    debug_assert_eq!(depth, 0, "block ctx-temp access must be depth 0");
+                    let dst = self.fresh(true);
+                    code.push(Ir::Move {
+                        dst,
+                        src: self.ctx_vregs[idx as usize],
+                    });
+                    bstack.push(dst);
+                }
+                Instr::StoreCtxTempPop { depth, idx } => {
+                    debug_assert_eq!(depth, 0, "block ctx-temp access must be depth 0");
+                    let v = bstack
+                        .pop()
+                        .expect("block splice: store_ctx_temp_pop on empty stack");
+                    code.push(Ir::Move {
+                        dst: self.ctx_vregs[idx as usize],
+                        src: v,
+                    });
+                }
+                // `block_is_spliceable` still rejects super/closure/NLR and
+                // depth>0 ctx access, and the single-block shape excludes
+                // jumps/branches; every other opcode is handled above.
                 other => unreachable!(
                     "block splice: {other:?} passed block_is_spliceable but has no arm"
                 ),
@@ -2831,6 +2888,15 @@ pub fn convert(vm: &VmState, method: MethodOop, cfg: &Cfg) -> IrMethod {
             VReg((i + 1) as u32)
         })
         .collect();
+    // S14 step 7-II-b: a vreg per M ctx-slot (only when M is `has_ctx` — its
+    // heap Context is elided and its captured temps live in these vregs).
+    let ctx_vregs: Vec<VReg> = (0..method.nctx())
+        .map(|_| {
+            let n = vregs.len() as u32;
+            vregs.push(VRegInfo { is_oop: true });
+            VReg(n)
+        })
+        .collect();
     let mut t = Translator {
         vm,
         method,
@@ -2838,6 +2904,7 @@ pub fn convert(vm: &VmState, method: MethodOop, cfg: &Cfg) -> IrMethod {
         pool: PoolBuilder::new(),
         self_vreg,
         temp_vregs: temp_vregs.clone(),
+        ctx_vregs: ctx_vregs.clone(),
         next_extra_block: cfg.blocks.len() as u32,
         blocks_by_id: (0..cfg.blocks.len()).map(|_| None).collect(),
         call_sites: Vec::new(),
@@ -2996,6 +3063,15 @@ pub fn convert(vm: &VmState, method: MethodOop, cfg: &Cfg) -> IrMethod {
             for &tv in temp_vregs.iter().skip(method.argc()) {
                 code.push(Ir::ConstPool {
                     dst: tv,
+                    lit: nil_lit,
+                });
+            }
+            // S14 step 7-II-b: nil-init the promoted ctx-temp vregs (M's elided
+            // Context's slots start nil, matching `alloc_context`'s nil-fill —
+            // so a ctx-temp read before it is written yields nil).
+            for &cv in ctx_vregs.iter() {
+                code.push(Ir::ConstPool {
+                    dst: cv,
                     lit: nil_lit,
                 });
             }
@@ -3282,6 +3358,7 @@ pub fn convert(vm: &VmState, method: MethodOop, cfg: &Cfg) -> IrMethod {
         pool: t.pool.entries,
         argc: method.argc() as u8,
         ntemps: method.ntemps() as u8,
+        ctx_vregs,
         safepoints: Vec::new(),
         true_lit,
         false_lit,
