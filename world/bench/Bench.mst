@@ -1,0 +1,63 @@
+"Bench.mst — the S15 benchmark harness (sprint_s15_detail.md A6/A7).
+ Protocol: a benchmark class implements class-side
+   setUp      — build fixture state (once per timed iteration is fine;
+                the canonical suites re-build per run anyway)
+   runOne     — one full benchmark run
+   checkResult: r — answer true iff r is the canonical check value
+                (a benchmark that stops validating eventually measures
+                nothing — the doc's own trap warning).
+ `Bench run: X inner: i outer: o` performs o timed rounds of i runs each,
+ checking EVERY result, and prints `<name> <inner> <medianMs>` — median,
+ not mean, so one GC-unlucky round can't skew (A7). Loaded standalone by
+ all.mst / the individual bench drivers; NOT in world.list."
+
+Object subclass: Bench [
+    <classVars: Times>
+
+    Bench class >> vmStats [
+        <primitive: 111>
+        ^nil
+    ]
+
+    Bench class >> run: benchClass named: name inner: inner outer: outer [
+        | t0 t1 r ms |
+        Times := OrderedCollection new.
+        "Warmup (discarded): counters trigger, code compiles, heap settles."
+        3 timesRepeat: [
+            benchClass setUp.
+            r := benchClass runOne.
+            (benchClass checkResult: r)
+                ifFalse: [ self error: 'benchmark warmup produced a wrong result' ] ].
+        outer timesRepeat: [
+            benchClass setUp.
+            t0 := Smalltalk millisecondClock.
+            inner timesRepeat: [
+                r := benchClass runOne.
+                (benchClass checkResult: r)
+                    ifFalse: [ self error: 'benchmark produced a wrong result' ] ].
+            t1 := Smalltalk millisecondClock.
+            Times add: t1 - t0 ].
+        ms := self median: Times.
+        Transcript show: name; show: ' '; show: inner printString;
+            show: ' '; show: ms printString; cr.
+        ^ms
+    ]
+
+    "Median of a small OrderedCollection of smis (selection into an Array —
+     n is tiny, O(n^2) is fine and keeps this free of sort dependencies)."
+    Bench class >> median: aCollection [
+        | n arr v least ix |
+        n := aCollection size.
+        arr := Array new: n.
+        ix := 1.
+        aCollection do: [:each | arr at: ix put: each. ix := ix + 1 ].
+        1 to: (n + 1) // 2 do: [:round |
+            least := round.
+            round to: n do: [:j |
+                (arr at: j) < (arr at: least) ifTrue: [ least := j ] ].
+            v := arr at: least.
+            arr at: least put: (arr at: round).
+            arr at: round put: v ].
+        ^arr at: (n + 1) // 2
+    ]
+]

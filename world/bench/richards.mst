@@ -1,0 +1,502 @@
+"richards.mst — Martin Richards' OS-scheduler simulation (S15 A6), ported
+ from the canonical Smalltalk version (Strongtalk/Squeak RichardsBenchmark;
+ the same structure the are-we-fast-yet suite mirrors). Boolean-triple
+ TaskState variant, 1-based packet data (Packet init datum := 1, handler
+ compares count > 4, worker writes datum: 1) — the Smalltalk lineage's own
+ convention, kept consistent throughout because the canonical check values
+ depend on it. The canonical per-task function CLOSURES are ported as
+ TaskControlBlock SUBCLASSES (IdleTask/WorkerTask/HandlerTask/DeviceTask)
+ overriding processWork:, each holding the scheduler in an ivar — this
+ dialect's `self new = basicNew, no auto-initialize` world has no per-task
+ environment worth capturing, and the subclass form is the standard
+ closure-free rendering (the V8/Java ports do the same).
+ Identity comparisons (==) walk all task/packet links; nil is NoWork/NoTask.
+ Constants (Idler=1 … DeviceB=6, kinds 1/2) are RBObject instance methods so
+ every participant reads them the same way.
+ CANONICAL CHECK, single run of the standard workload (idler count 10000):
+ queuePacketCount = 23246 and holdCount = 9297, encoded by runOne as
+ queuePacketCount * 100000 + holdCount = 2324609297; checkResult: matches
+ that exact value, so both counts are verified on EVERY harness iteration.
+
+ The Bench class below is a VERBATIM inline copy of world/bench/Bench.mst:
+ `macvm run` loads exactly one file plus world.list (src/main.rs cmd_run →
+ frontend/world.rs load_file — no include mechanism), Bench.mst is
+ deliberately NOT in world.list, so a standalone
+ `macvm run world/bench/richards.mst --world world` can only resolve the
+ driver line's `Bench` if this file binds it itself. Re-definition is a
+ clean reopen (verified: loading Bench.mst twice then calling median: works
+ unchanged), so a future all.mst/bench.list concatenation that loads
+ Bench.mst before this file stays correct — the copy just re-installs
+ identical methods. If Bench.mst's harness ever changes, refresh this copy.
+
+ Not in world.list; `macvm run world/bench/richards.mst --world world`
+ loads it explicitly, matching every other file in this directory."
+
+Object subclass: Bench [
+    <classVars: Times>
+
+    Bench class >> vmStats [
+        <primitive: 111>
+        ^nil
+    ]
+
+    Bench class >> run: benchClass named: name inner: inner outer: outer [
+        | t0 t1 r ms |
+        Times := OrderedCollection new.
+        "Warmup (discarded): counters trigger, code compiles, heap settles."
+        3 timesRepeat: [
+            benchClass setUp.
+            r := benchClass runOne.
+            (benchClass checkResult: r)
+                ifFalse: [ self error: 'benchmark warmup produced a wrong result' ] ].
+        outer timesRepeat: [
+            benchClass setUp.
+            t0 := Smalltalk millisecondClock.
+            inner timesRepeat: [
+                r := benchClass runOne.
+                (benchClass checkResult: r)
+                    ifFalse: [ self error: 'benchmark produced a wrong result' ] ].
+            t1 := Smalltalk millisecondClock.
+            Times add: t1 - t0 ].
+        ms := self median: Times.
+        Transcript show: name; show: ' '; show: inner printString;
+            show: ' '; show: ms printString; cr.
+        ^ms
+    ]
+
+    "Median of a small OrderedCollection of smis (selection into an Array —
+     n is tiny, O(n^2) is fine and keeps this free of sort dependencies)."
+    Bench class >> median: aCollection [
+        | n arr v least ix |
+        n := aCollection size.
+        arr := Array new: n.
+        ix := 1.
+        aCollection do: [:each | arr at: ix put: each. ix := ix + 1 ].
+        1 to: (n + 1) // 2 do: [:round |
+            least := round.
+            round to: n do: [:j |
+                (arr at: j) < (arr at: least) ifTrue: [ least := j ] ].
+            v := arr at: least.
+            arr at: least put: (arr at: round).
+            arr at: round put: v ].
+        ^arr at: (n + 1) // 2
+    ]
+]
+
+"--- Richards proper ------------------------------------------------------"
+
+Object subclass: RBObject [
+    "Task identities double as taskTable indices (1-based, canonical
+     Smalltalk numbering). NoWork/NoTask are plain nil."
+    idlerId [ ^1 ]
+    workerId [ ^2 ]
+    handlerA [ ^3 ]
+    handlerB [ ^4 ]
+    deviceA [ ^5 ]
+    deviceB [ ^6 ]
+    devicePacketKind [ ^1 ]
+    workPacketKind [ ^2 ]
+
+    append: packet head: queueHead [
+        | mouse link |
+        packet link: nil.
+        queueHead == nil ifTrue: [ ^packet ].
+        mouse := queueHead.
+        link := mouse link.
+        [ link == nil ] whileFalse: [ mouse := link. link := mouse link ].
+        mouse link: packet.
+        ^queueHead
+    ]
+]
+
+RBObject subclass: Packet [
+    | link identity kind datum data |
+
+    Packet class >> link: aLink identity: anIdentity kind: aKind [
+        ^self new initLink: aLink identity: anIdentity kind: aKind
+    ]
+    initLink: aLink identity: anIdentity kind: aKind [
+        link := aLink.
+        identity := anIdentity.
+        kind := aKind.
+        datum := 1.
+        data := Array new: 4.
+        1 to: 4 do: [:i | data at: i put: 0 ].
+        ^self
+    ]
+    link [ ^link ]
+    link: x [ link := x ]
+    identity [ ^identity ]
+    identity: x [ identity := x ]
+    kind [ ^kind ]
+    datum [ ^datum ]
+    datum: x [ datum := x ]
+    data [ ^data ]
+]
+
+RBObject subclass: TaskState [
+    | packetPendingIV taskWaiting taskHolding |
+
+    "boolean accessors"
+    isPacketPending [ ^packetPendingIV ]
+    isTaskWaiting [ ^taskWaiting ]
+    isTaskHolding [ ^taskHolding ]
+    packetPending: aBool [ packetPendingIV := aBool ]
+    taskWaiting: aBool [ taskWaiting := aBool ]
+    taskHolding: aBool [ taskHolding := aBool ]
+
+    "state transitions (answer self so class-side constructors can chain)"
+    packetPending [
+        packetPendingIV := true.
+        taskWaiting := false.
+        taskHolding := false.
+        ^self
+    ]
+    running [
+        packetPendingIV := false.
+        taskWaiting := false.
+        taskHolding := false.
+        ^self
+    ]
+    waiting [
+        packetPendingIV := false.
+        taskHolding := false.
+        taskWaiting := true.
+        ^self
+    ]
+    waitingWithPacket [
+        taskHolding := false.
+        taskWaiting := true.
+        packetPendingIV := true.
+        ^self
+    ]
+
+    "state predicates"
+    isRunning [
+        ^packetPendingIV not and: [ taskWaiting not and: [ taskHolding not ] ]
+    ]
+    isTaskHoldingOrWaiting [
+        ^taskHolding or: [ packetPendingIV not and: [ taskWaiting ] ]
+    ]
+    isWaiting [
+        ^packetPendingIV not and: [ taskWaiting and: [ taskHolding not ] ]
+    ]
+    isWaitingWithPacket [
+        ^packetPendingIV and: [ taskWaiting and: [ taskHolding not ] ]
+    ]
+
+    TaskState class >> running [ ^self new running ]
+    TaskState class >> waiting [ ^self new waiting ]
+    TaskState class >> waitingWithPacket [ ^self new waitingWithPacket ]
+]
+
+"--- per-task private data records (the canonical *TaskDataRecord classes) -"
+
+RBObject subclass: DeviceTaskDataRecord [
+    | pending |
+    DeviceTaskDataRecord class >> create [ ^self new init ]
+    init [ pending := nil. ^self ]
+    pending [ ^pending ]
+    pending: aPacket [ pending := aPacket ]
+]
+
+RBObject subclass: HandlerTaskDataRecord [
+    | workIn deviceIn |
+    HandlerTaskDataRecord class >> create [ ^self new init ]
+    init [ workIn := nil. deviceIn := nil. ^self ]
+    workIn [ ^workIn ]
+    workIn: aPacket [ workIn := aPacket ]
+    deviceIn [ ^deviceIn ]
+    deviceIn: aPacket [ deviceIn := aPacket ]
+    workInAdd: aPacket [ workIn := self append: aPacket head: workIn ]
+    deviceInAdd: aPacket [ deviceIn := self append: aPacket head: deviceIn ]
+]
+
+RBObject subclass: IdleTaskDataRecord [
+    | control count |
+    IdleTaskDataRecord class >> create [ ^self new init ]
+    init [ control := 1. count := 10000. ^self ]
+    control [ ^control ]
+    control: v [ control := v ]
+    count [ ^count ]
+    count: v [ count := v ]
+]
+
+RBObject subclass: WorkerTaskDataRecord [
+    | destination count |
+    WorkerTaskDataRecord class >> create [ ^self new init ]
+    init [ destination := self handlerA. count := 0. ^self ]
+    destination [ ^destination ]
+    destination: v [ destination := v ]
+    count [ ^count ]
+    count: v [ count := v ]
+]
+
+"--- TaskControlBlock + the four task kinds --------------------------------"
+
+TaskState subclass: TaskControlBlock [
+    | link identity priority input handle scheduler |
+
+    TaskControlBlock class >> link: aLink identity: anIdentity priority: aPriority work: aWorkQueue state: aState scheduler: aScheduler data: aData [
+        ^self new initLink: aLink identity: anIdentity priority: aPriority
+              work: aWorkQueue state: aState scheduler: aScheduler data: aData
+    ]
+    initLink: aLink identity: anIdentity priority: aPriority work: aWorkQueue state: aState scheduler: aScheduler data: aData [
+        link := aLink.
+        identity := anIdentity.
+        priority := aPriority.
+        input := aWorkQueue.
+        self packetPending: aState isPacketPending.
+        self taskWaiting: aState isTaskWaiting.
+        self taskHolding: aState isTaskHolding.
+        scheduler := aScheduler.
+        handle := aData.
+        ^self
+    ]
+
+    link [ ^link ]
+    identity [ ^identity ]
+    priority [ ^priority ]
+
+    addInput: packet checkPriority: oldTask [
+        input == nil
+            ifTrue: [
+                input := packet.
+                self packetPending: true.
+                priority > oldTask priority ifTrue: [ ^self ] ]
+            ifFalse: [ input := self append: packet head: input ].
+        ^oldTask
+    ]
+
+    runTask [
+        | message |
+        self isWaitingWithPacket
+            ifTrue: [
+                message := input.
+                input := message link.
+                input == nil
+                    ifTrue: [ self running ]
+                    ifFalse: [ self packetPending ] ]
+            ifFalse: [ message := nil ].
+        ^self processWork: message
+    ]
+
+    "the canonical per-task function closure, rendered as an override"
+    processWork: work [
+        self error: 'TaskControlBlock subclasses must override processWork:'
+    ]
+]
+
+TaskControlBlock subclass: IdleTask [
+    processWork: work [
+        | data control |
+        data := handle.
+        data count: data count - 1.
+        data count = 0 ifTrue: [ ^scheduler holdSelf ].
+        control := data control.
+        (control bitAnd: 1) = 0
+            ifTrue: [
+                data control: control // 2.
+                ^scheduler release: self deviceA ]
+            ifFalse: [
+                data control: ((control // 2) bitXor: 53256).
+                ^scheduler release: self deviceB ]
+    ]
+]
+
+TaskControlBlock subclass: WorkerTask [
+    processWork: work [
+        | data |
+        data := handle.
+        work == nil ifTrue: [ ^scheduler markWaiting ].
+        data destination: (data destination = self handlerA
+            ifTrue: [ self handlerB ]
+            ifFalse: [ self handlerA ]).
+        work identity: data destination.
+        work datum: 1.
+        1 to: 4 do: [:i |
+            data count: data count + 1.
+            data count > 26 ifTrue: [ data count: 1 ].
+            work data at: i put: 65 + data count - 1 ].
+        ^scheduler queuePacket: work
+    ]
+]
+
+TaskControlBlock subclass: HandlerTask [
+    processWork: work [
+        | data workPacket count devicePacket |
+        data := handle.
+        work == nil ifFalse: [
+            work kind = self workPacketKind
+                ifTrue: [ data workInAdd: work ]
+                ifFalse: [ data deviceInAdd: work ] ].
+        workPacket := data workIn.
+        workPacket == nil ifTrue: [ ^scheduler markWaiting ].
+        count := workPacket datum.
+        count > 4 ifTrue: [
+            data workIn: workPacket link.
+            ^scheduler queuePacket: workPacket ].
+        devicePacket := data deviceIn.
+        devicePacket == nil ifTrue: [ ^scheduler markWaiting ].
+        data deviceIn: devicePacket link.
+        devicePacket datum: (workPacket data at: count).
+        workPacket datum: count + 1.
+        ^scheduler queuePacket: devicePacket
+    ]
+]
+
+TaskControlBlock subclass: DeviceTask [
+    processWork: work [
+        | data functionWork |
+        data := handle.
+        work == nil
+            ifTrue: [
+                functionWork := data pending.
+                functionWork == nil ifTrue: [ ^scheduler markWaiting ].
+                data pending: nil.
+                ^scheduler queuePacket: functionWork ]
+            ifFalse: [
+                data pending: work.
+                ^scheduler holdSelf ]
+    ]
+]
+
+"--- the scheduler ----------------------------------------------------------"
+
+RBObject subclass: RichardsBenchmark [
+    | taskList currentTask currentTaskIdentity taskTable queuePacketCount holdCount |
+
+    RichardsBenchmark class >> create [ ^self new init ]
+    init [
+        taskList := nil.
+        currentTask := nil.
+        currentTaskIdentity := 0.
+        taskTable := Array new: 6.
+        queuePacketCount := 0.
+        holdCount := 0.
+        ^self
+    ]
+
+    addTask: aTask identity: identity [
+        taskList := aTask.
+        taskTable at: identity put: aTask.
+    ]
+    createIdler: identity priority: priority work: work state: state [
+        self addTask: (IdleTask link: taskList identity: identity
+                priority: priority work: work state: state
+                scheduler: self data: IdleTaskDataRecord create)
+            identity: identity
+    ]
+    createWorker: identity priority: priority work: work state: state [
+        self addTask: (WorkerTask link: taskList identity: identity
+                priority: priority work: work state: state
+                scheduler: self data: WorkerTaskDataRecord create)
+            identity: identity
+    ]
+    createHandler: identity priority: priority work: work state: state [
+        self addTask: (HandlerTask link: taskList identity: identity
+                priority: priority work: work state: state
+                scheduler: self data: HandlerTaskDataRecord create)
+            identity: identity
+    ]
+    createDevice: identity priority: priority work: work state: state [
+        self addTask: (DeviceTask link: taskList identity: identity
+                priority: priority work: work state: state
+                scheduler: self data: DeviceTaskDataRecord create)
+            identity: identity
+    ]
+    createPacket: link identity: identity kind: kind [
+        ^Packet link: link identity: identity kind: kind
+    ]
+
+    findTask: identity [
+        | t |
+        t := taskTable at: identity.
+        t == nil ifTrue: [ self error: 'findTask failed' ].
+        ^t
+    ]
+    holdSelf [
+        holdCount := holdCount + 1.
+        currentTask taskHolding: true.
+        ^currentTask link
+    ]
+    queuePacket: packet [
+        | t |
+        t := self findTask: packet identity.
+        t == nil ifTrue: [ ^nil ].
+        queuePacketCount := queuePacketCount + 1.
+        packet link: nil.
+        packet identity: currentTaskIdentity.
+        ^t addInput: packet checkPriority: currentTask
+    ]
+    release: identity [
+        | t |
+        t := self findTask: identity.
+        t == nil ifTrue: [ ^nil ].
+        t taskHolding: false.
+        t priority > currentTask priority ifTrue: [ ^t ].
+        ^currentTask
+    ]
+    markWaiting [
+        currentTask taskWaiting: true.
+        ^currentTask
+    ]
+
+    schedule [
+        currentTask := taskList.
+        [ currentTask == nil ] whileFalse: [
+            currentTask isTaskHoldingOrWaiting
+                ifTrue: [ currentTask := currentTask link ]
+                ifFalse: [
+                    currentTaskIdentity := currentTask identity.
+                    currentTask := currentTask runTask ] ]
+    ]
+
+    "the canonical standard workload; answers the encoded check value"
+    start [
+        | workQ |
+        self createIdler: self idlerId priority: 0
+            work: nil state: TaskState running.
+
+        workQ := self createPacket: nil identity: self workerId kind: self workPacketKind.
+        workQ := self createPacket: workQ identity: self workerId kind: self workPacketKind.
+        self createWorker: self workerId priority: 1000
+            work: workQ state: TaskState waitingWithPacket.
+
+        workQ := self createPacket: nil identity: self deviceA kind: self devicePacketKind.
+        workQ := self createPacket: workQ identity: self deviceA kind: self devicePacketKind.
+        workQ := self createPacket: workQ identity: self deviceA kind: self devicePacketKind.
+        self createHandler: self handlerA priority: 2000
+            work: workQ state: TaskState waitingWithPacket.
+
+        workQ := self createPacket: nil identity: self deviceB kind: self devicePacketKind.
+        workQ := self createPacket: workQ identity: self deviceB kind: self devicePacketKind.
+        workQ := self createPacket: workQ identity: self deviceB kind: self devicePacketKind.
+        self createHandler: self handlerB priority: 3000
+            work: workQ state: TaskState waitingWithPacket.
+
+        self createDevice: self deviceA priority: 4000
+            work: nil state: TaskState waiting.
+        self createDevice: self deviceB priority: 5000
+            work: nil state: TaskState waiting.
+
+        self schedule.
+
+        ^(queuePacketCount * 100000) + holdCount
+    ]
+
+    "--- Bench harness protocol (class side) --------------------------------"
+    RichardsBenchmark class >> setUp [
+        "each runOne builds its own fresh scheduler — nothing shared to set up"
+        ^self
+    ]
+    RichardsBenchmark class >> runOne [
+        ^self create start
+    ]
+    RichardsBenchmark class >> checkResult: r [
+        "queuePacketCount = 23246 and holdCount = 9297, encoded exactly"
+        ^r = 2324609297
+    ]
+]
+
+Bench run: RichardsBenchmark named: 'Richards' inner: 1 outer: 10.

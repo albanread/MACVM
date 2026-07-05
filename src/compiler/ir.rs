@@ -1380,6 +1380,25 @@ impl<'a> Translator<'a> {
                     });
                     cstack.push(dst);
                 }
+                // S15 (DeltaBlue port finding): a classVar/global STORE in an
+                // inlined non-leaf body — `is_inline_eligible_nonleaf` always
+                // admitted the opcode but this walker had no arm, so any
+                // callee like `reset [ Current := self new ]` aborted on the
+                // unreachable! below the moment it inlined. Mirrors the root
+                // arm exactly (association word 1 = value, barrier on).
+                Instr::StoreGlobalPop(idx) => {
+                    let assoc = callee.literals().at(idx as usize);
+                    let assoc_vreg = self.push_well_known(assoc.raw(), code);
+                    let val = cstack
+                        .pop()
+                        .expect("inline splice: store_global_pop on empty stack");
+                    code.push(Ir::StoreField {
+                        obj: assoc_vreg,
+                        byte_off: (BODY_OFFSET + 8) as i32,
+                        val,
+                        barrier: true,
+                    });
+                }
                 Instr::PushTemp(n) => {
                     // Fresh copy (same v1 rule as the main path): the slot may be
                     // reassigned later on this path.
@@ -1677,6 +1696,26 @@ impl<'a> Translator<'a> {
                         byte_off: (BODY_OFFSET + 8) as i32,
                     });
                     cstack.push(dst);
+                }
+                // S15 (DeltaBlue port finding): classVar/global STORE — the
+                // eligibility gate always admitted the opcode; this walker
+                // lacked the arm (its leaf twin above got it first by
+                // mistake, which is harmless there — leaf bodies with stores
+                // are legal too if `leaf_body_is_spliceable` ever admits
+                // them). Mirrors the root arm: association word 1 = value,
+                // barrier on.
+                Instr::StoreGlobalPop(idx) => {
+                    let assoc = callee.literals().at(idx as usize);
+                    let assoc_vreg = self.push_well_known(assoc.raw(), code);
+                    let val = cstack
+                        .pop()
+                        .expect("inline splice: store_global_pop on empty stack");
+                    code.push(Ir::StoreField {
+                        obj: assoc_vreg,
+                        byte_off: (BODY_OFFSET + 8) as i32,
+                        val,
+                        barrier: true,
+                    });
                 }
                 Instr::PushTemp(n) => {
                     let dst = self.fresh(true);

@@ -6680,3 +6680,42 @@ fn array_put_with_big_frame_spilled_value() {
         "all three calls (cold, deopt-warmed, WARM-COMPILED) must agree"
     );
 }
+
+/// S15 (DeltaBlue port finding, bug B): a classVar/global STORE inside a
+/// non-leaf-inlinable callee — `is_inline_eligible_nonleaf` always admitted
+/// `StoreGlobalPop` but the nonleaf splice walker had no arm, so the first
+/// warm inline of e.g. `reset [ Current := self new ]` hit `unreachable!`
+/// and aborted the VM.
+#[test]
+fn inlined_classvar_store_compiles() {
+    let dir = std::env::temp_dir().join(format!("macvm_cvstore_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let script = dir.join("t.mst");
+    std::fs::write(
+        &script,
+        "Object subclass: FooCv [\n\
+            <classVars: Cur>\n\
+            FooCv class >> mk [ ^7 ]\n\
+            FooCv class >> reset [ Cur := self mk ]\n\
+            FooCv class >> outer [ FooCv reset. ^Cur ]\n\
+        ]\n\
+        1 to: 200 do: [:i | FooCv outer ].\n\
+        Transcript show: FooCv outer printString. Transcript cr.\n",
+    )
+    .unwrap();
+    let bin = PathBuf::from(env!("CARGO_BIN_EXE_macvm"));
+    let world_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("world");
+    let out = Command::new(&bin)
+        .args([
+            "run",
+            script.to_str().unwrap(),
+            "--world",
+            world_dir.to_str().unwrap(),
+        ])
+        .env("MACVM_JIT", "threshold=1")
+        .output()
+        .expect("spawn");
+    std::fs::remove_dir_all(&dir).ok();
+    assert!(out.status.success(), "must not abort");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "7\n");
+}

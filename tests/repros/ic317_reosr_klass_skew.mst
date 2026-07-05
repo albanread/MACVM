@@ -1,0 +1,161 @@
+"repro_ic_panic.mst — minimal Richards-derived repro:
+ MACVM_JIT=off prints two counts and exits 0;
+ MACVM_JIT=threshold=1000 (or =1) aborts with
+   ic_transition: klass k0 must still resolve selector (ic.rs:317)
+ A scheduler loop walks a 2-task list (IdleT + DeviceT, shared
+ TaskControlBlock-style superclass), OSR-compiles, then deopts as the
+ receiver klass mix at its send sites changes."
+
+Object subclass: RBase [
+    deviceA [ ^2 ]
+    idlerId [ ^1 ]
+]
+
+RBase subclass: RPacket [
+    | link identity |
+    RPacket class >> identity: anIdentity [ ^self new initIdentity: anIdentity ]
+    initIdentity: anIdentity [ link := nil. identity := anIdentity. ^self ]
+    link [ ^link ]
+    link: x [ link := x ]
+    identity [ ^identity ]
+    identity: x [ identity := x ]
+]
+
+RBase subclass: RState [
+    | pendingIV waitingIV holdingIV |
+    packetPending: b [ pendingIV := b ]
+    taskWaiting: b [ waitingIV := b ]
+    taskHolding: b [ holdingIV := b ]
+    running [ pendingIV := false. waitingIV := false. holdingIV := false. ^self ]
+    waiting [ pendingIV := false. holdingIV := false. waitingIV := true. ^self ]
+    packetPendingNow [ pendingIV := true. waitingIV := false. holdingIV := false. ^self ]
+    isTaskHoldingOrWaiting [ ^holdingIV or: [ pendingIV not and: [ waitingIV ] ] ]
+    isWaitingWithPacket [ ^pendingIV and: [ waitingIV and: [ holdingIV not ] ] ]
+]
+
+RState subclass: RTask [
+    | link identity priority input pending count scheduler |
+    RTask class >> link: l identity: i priority: p work: w scheduler: s [
+        ^self new initLink: l identity: i priority: p work: w scheduler: s
+    ]
+    initLink: l identity: i priority: p work: w scheduler: s [
+        link := l. identity := i. priority := p. input := w.
+        pending := nil. count := 10000. scheduler := s.
+        self running.
+        w == nil ifFalse: [ self packetPendingNow. self taskWaiting: true ].
+        ^self
+    ]
+    link [ ^link ]
+    identity [ ^identity ]
+    priority [ ^priority ]
+    addInput: packet checkPriority: oldTask [
+        input == nil
+            ifTrue: [
+                input := packet.
+                self packetPending: true.
+                priority > oldTask priority ifTrue: [ ^self ] ]
+            ifFalse: [ self error: 'queue unused in repro' ].
+        ^oldTask
+    ]
+    runTask [
+        | message |
+        self isWaitingWithPacket
+            ifTrue: [
+                message := input.
+                input := message link.
+                input == nil
+                    ifTrue: [ self running ]
+                    ifFalse: [ self packetPendingNow ] ]
+            ifFalse: [ message := nil ].
+        ^self processWork: message
+    ]
+    processWork: work [ self error: 'subclass responsibility' ]
+]
+
+RTask subclass: IdleT [
+    processWork: work [
+        count := count - 1.
+        count = 0 ifTrue: [ ^scheduler holdSelf ].
+        ^scheduler release: self deviceA
+    ]
+]
+
+RTask subclass: DeviceT [
+    processWork: work [
+        | fw |
+        work == nil
+            ifTrue: [
+                fw := pending.
+                fw == nil ifTrue: [ ^scheduler markWaiting ].
+                pending := nil.
+                ^scheduler queuePacket: fw ]
+            ifFalse: [
+                pending := work.
+                ^scheduler holdSelf ]
+    ]
+]
+
+RBase subclass: RSched [
+    | taskList currentTask currentTaskIdentity taskTable queuePacketCount holdCount |
+    RSched class >> create [ ^self new init ]
+    init [
+        taskList := nil.
+        taskTable := Array new: 2.
+        queuePacketCount := 0.
+        holdCount := 0.
+        currentTaskIdentity := 0.
+        ^self
+    ]
+    add: aTask [
+        taskList := aTask.
+        taskTable at: aTask identity put: aTask.
+    ]
+    findTask: identity [
+        | t |
+        t := taskTable at: identity.
+        t == nil ifTrue: [ self error: 'findTask failed' ].
+        ^t
+    ]
+    holdSelf [
+        holdCount := holdCount + 1.
+        currentTask taskHolding: true.
+        ^currentTask link
+    ]
+    queuePacket: packet [
+        | t |
+        t := self findTask: packet identity.
+        queuePacketCount := queuePacketCount + 1.
+        packet link: nil.
+        packet identity: currentTaskIdentity.
+        ^t addInput: packet checkPriority: currentTask
+    ]
+    release: identity [
+        | t |
+        t := self findTask: identity.
+        t taskHolding: false.
+        t priority > currentTask priority ifTrue: [ ^t ].
+        ^currentTask
+    ]
+    markWaiting [
+        currentTask taskWaiting: true.
+        ^currentTask
+    ]
+    schedule [
+        currentTask := taskList.
+        [ currentTask == nil ] whileFalse: [
+            currentTask isTaskHoldingOrWaiting
+                ifTrue: [ currentTask := currentTask link ]
+                ifFalse: [
+                    currentTaskIdentity := currentTask identity.
+                    currentTask := currentTask runTask ] ]
+    ]
+    start [
+        self add: (IdleT link: taskList identity: self idlerId priority: 0 work: nil scheduler: self).
+        self add: (DeviceT link: taskList identity: self deviceA priority: 4000
+            work: (RPacket identity: self deviceA) scheduler: self).
+        self schedule.
+        Transcript show: queuePacketCount printString; show: ' '; show: holdCount printString; cr.
+    ]
+]
+
+RSched create start.

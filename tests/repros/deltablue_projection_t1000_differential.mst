@@ -1,0 +1,524 @@
+"--- Strength ---------------------------------------------------------------
+ Strengths are immutable singletons; the Table (Dictionary, symbol ->
+ singleton) is the ordering table the of: constructor resolves through.
+ Lower arithmeticValue = stronger. initStrengths is called explicitly at
+ the bottom of the file (no automatic class initialization in this world)."
+
+Object subclass: Strength [
+    | symbolicValue arithmeticValue |
+    <classVars: Table Required StrongPreferred Preferred StrongDefault Normal WeakDefault Weakest>
+
+    Strength class >> addStrength: aSymbol value: n [
+        | s |
+        s := self basicNew initSymbol: aSymbol value: n.
+        Table at: aSymbol put: s.
+        ^s
+    ]
+    Strength class >> initStrengths [
+        Table := Dictionary new.
+        Required := self addStrength: #required value: 0.
+        StrongPreferred := self addStrength: #strongPreferred value: 1.
+        Preferred := self addStrength: #preferred value: 2.
+        StrongDefault := self addStrength: #strongDefault value: 3.
+        Normal := self addStrength: #normal value: 4.
+        WeakDefault := self addStrength: #weakDefault value: 5.
+        Weakest := self addStrength: #weakest value: 6.
+    ]
+    Strength class >> of: aSymbol [ ^Table at: aSymbol ]
+    Strength class >> required [ ^Required ]
+    Strength class >> strongPreferred [ ^StrongPreferred ]
+    Strength class >> preferred [ ^Preferred ]
+    Strength class >> strongDefault [ ^StrongDefault ]
+    Strength class >> normal [ ^Normal ]
+    Strength class >> weakDefault [ ^WeakDefault ]
+    Strength class >> weakest [ ^Weakest ]
+
+    initSymbol: aSymbol value: n [
+        symbolicValue := aSymbol.
+        arithmeticValue := n.
+    ]
+    arithmeticValue [ ^arithmeticValue ]
+    sameAs: aStrength [ ^arithmeticValue = aStrength arithmeticValue ]
+    stronger: aStrength [ ^arithmeticValue < aStrength arithmeticValue ]
+    weaker: aStrength [ ^arithmeticValue > aStrength arithmeticValue ]
+    weakest: aStrength [
+        (self weaker: aStrength) ifTrue: [ ^self ].
+        ^aStrength
+    ]
+]
+
+"--- Variable ---------------------------------------------------------------"
+
+Object subclass: Variable [
+    | value constraints determinedBy walkStrength stay mark |
+
+    Variable class >> new [ ^self basicNew init ]
+    Variable class >> value: aValue [
+        | v |
+        v := self new.
+        v value: aValue.
+        ^v
+    ]
+
+    init [
+        value := 0.
+        constraints := OrderedCollection new.
+        determinedBy := nil.
+        walkStrength := Strength weakest.
+        stay := true.
+        mark := 0.
+    ]
+    value [ ^value ]
+    value: aValue [ value := aValue ]
+    constraints [ ^constraints ]
+    determinedBy [ ^determinedBy ]
+    determinedBy: aConstraint [ determinedBy := aConstraint ]
+    walkStrength [ ^walkStrength ]
+    walkStrength: aStrength [ walkStrength := aStrength ]
+    stay [ ^stay ]
+    stay: aBoolean [ stay := aBoolean ]
+    mark [ ^mark ]
+    mark: anInteger [ mark := anInteger ]
+    addConstraint: aConstraint [ constraints add: aConstraint ]
+    "OrderedCollection has no remove:, so rebuild without the element —
+     constraint lists are short and removal is off the hot propagation path."
+    removeConstraint: aConstraint [
+        | keep |
+        keep := OrderedCollection new.
+        constraints do: [:c | (c == aConstraint) ifFalse: [ keep add: c ] ].
+        constraints := keep.
+        (determinedBy == aConstraint) ifTrue: [ determinedBy := nil ].
+    ]
+]
+
+"--- Plan -------------------------------------------------------------------
+ A Plan IS an ordered list of constraints (the canonical version subclasses
+ OrderedCollection exactly like this); execute runs them in order."
+
+OrderedCollection subclass: Plan [
+    execute [ self do: [:c | c execute ] ]
+]
+
+"--- Planner ----------------------------------------------------------------
+ The solver. Current is the planner singleton the constraint add/destroy
+ protocol reaches (canonical `Planner current`); each test run resets it."
+
+Object subclass: Planner [
+    | currentMark |
+    <classVars: Current>
+
+    Planner class >> new [ ^self basicNew init ]
+    Planner class >> reset [ Current := self new ]
+    Planner class >> current [ ^Current ]
+
+    init [ currentMark := 0 ]
+    newMark [
+        currentMark := currentMark + 1.
+        ^currentMark
+    ]
+
+    incrementalAdd: aConstraint [
+        | mark overridden |
+        mark := self newMark.
+        overridden := aConstraint satisfy: mark.
+        [ overridden == nil ] whileFalse: [
+            overridden := overridden satisfy: mark ].
+    ]
+
+    incrementalRemove: aConstraint [
+        | out unsatisfied |
+        out := aConstraint output.
+        aConstraint markUnsatisfied.
+        aConstraint removeFromGraph.
+        unsatisfied := self removePropagateFrom: out.
+        unsatisfied do: [:u | self incrementalAdd: u ].
+    ]
+
+    addPropagate: aConstraint mark: mark [
+        | todo d |
+        todo := OrderedCollection new.
+        todo addLast: aConstraint.
+        [ todo isEmpty ] whileFalse: [
+            d := todo removeFirst.
+            (d output mark = mark) ifTrue: [
+                self incrementalRemove: aConstraint.
+                ^false ].
+            d recalculate.
+            self addConstraintsConsuming: d output to: todo ].
+        ^true
+    ]
+
+    removePropagateFrom: out [
+        | unsatisfied todo v |
+        out determinedBy: nil.
+        out walkStrength: Strength weakest.
+        out stay: true.
+        unsatisfied := OrderedCollection new.
+        todo := OrderedCollection new.
+        todo addLast: out.
+        [ todo isEmpty ] whileFalse: [
+            v := todo removeFirst.
+            v constraints do: [:c |
+                c isSatisfied ifFalse: [ unsatisfied addLast: c ] ].
+            self constraintsConsuming: v do: [:c |
+                c recalculate.
+                todo addLast: c output ] ].
+        ^unsatisfied
+    ]
+
+    extractPlanFromConstraints: aCollection [
+        | sources |
+        sources := OrderedCollection new.
+        aCollection do: [:c |
+            (c isInput and: [ c isSatisfied ]) ifTrue: [ sources addLast: c ] ].
+        ^self makePlan: sources
+    ]
+
+    makePlan: sources [
+        | mark plan todo c |
+        mark := self newMark.
+        plan := Plan new.
+        todo := sources.
+        [ todo isEmpty ] whileFalse: [
+            c := todo removeFirst.
+            ((c output mark ~= mark) and: [ c inputsKnown: mark ]) ifTrue: [
+                plan addLast: c.
+                c output mark: mark.
+                self addConstraintsConsuming: c output to: todo ] ].
+        ^plan
+    ]
+
+    constraintsConsuming: aVariable do: aBlock [
+        | determining |
+        determining := aVariable determinedBy.
+        aVariable constraints do: [:c |
+            ((c ~~ determining) and: [ c isSatisfied ]) ifTrue: [ aBlock value: c ] ].
+    ]
+
+    addConstraintsConsuming: aVariable to: aCollection [
+        self constraintsConsuming: aVariable do: [:c | aCollection addLast: c ].
+    ]
+]
+
+"--- AbstractConstraint ------------------------------------------------------"
+
+Object subclass: AbstractConstraint [
+    | strength |
+
+    strength [ ^strength ]
+    isInput [ ^false ]
+
+    addConstraint [
+        self addToGraph.
+        Planner current incrementalAdd: self.
+    ]
+
+    destroyConstraint [
+        self isSatisfied
+            ifTrue: [ Planner current incrementalRemove: self ]
+            ifFalse: [ self removeFromGraph ].
+    ]
+
+    "Answers the constraint this one overrode, or nil (the canonical
+     satisfy: — the planner keeps re-satisfying overridden constraints
+     until the walkabout settles)."
+    satisfy: mark [
+        | out overridden |
+        self chooseMethod: mark.
+        self isSatisfied ifFalse: [
+            (strength sameAs: Strength required) ifTrue: [
+                self error: 'Could not satisfy a required constraint' ].
+            ^nil ].
+        self markInputs: mark.
+        out := self output.
+        overridden := out determinedBy.
+        (overridden == nil) ifFalse: [ overridden markUnsatisfied ].
+        out determinedBy: self.
+        (Planner current addPropagate: self mark: mark) ifFalse: [
+            self error: 'Cycle encountered' ].
+        out mark: mark.
+        ^overridden
+    ]
+
+    markInputs: mark [
+        self inputsDo: [:in | in mark: mark ].
+    ]
+
+    inputsKnown: mark [
+        self inputsDo: [:v |
+            ((v mark = mark) or: [ v stay or: [ v determinedBy == nil ] ])
+                ifFalse: [ ^false ] ].
+        ^true
+    ]
+]
+
+"--- UnaryConstraint (StayConstraint, EditConstraint) ------------------------"
+
+AbstractConstraint subclass: UnaryConstraint [
+    | output satisfied |
+
+    UnaryConstraint class >> var: aVariable strength: strengthSymbol [
+        ^self basicNew initVar: aVariable strength: strengthSymbol
+    ]
+    initVar: aVariable strength: strengthSymbol [
+        strength := Strength of: strengthSymbol.
+        output := aVariable.
+        satisfied := false.
+        self addConstraint.
+    ]
+
+    isSatisfied [ ^satisfied ]
+    output [ ^output ]
+    addToGraph [
+        output addConstraint: self.
+        satisfied := false.
+    ]
+    removeFromGraph [
+        (output == nil) ifFalse: [ output removeConstraint: self ].
+        satisfied := false.
+    ]
+    chooseMethod: mark [
+        satisfied := (output mark ~= mark)
+            and: [ strength stronger: output walkStrength ].
+    ]
+    inputsDo: aBlock [ ^self ]
+    markUnsatisfied [ satisfied := false ]
+    recalculate [
+        output walkStrength: strength.
+        output stay: self isInput not.
+        output stay ifTrue: [ self execute ].
+    ]
+]
+
+UnaryConstraint subclass: StayConstraint [
+    execute [ ^self ]
+]
+
+UnaryConstraint subclass: EditConstraint [
+    isInput [ ^true ]
+    execute [ ^self ]
+]
+
+"--- BinaryConstraint (EqualityConstraint, ScaleConstraint) ------------------"
+
+AbstractConstraint subclass: BinaryConstraint [
+    | v1 v2 direction |
+
+    BinaryConstraint class >> var: aVariable var: bVariable strength: strengthSymbol [
+        ^self basicNew initVar: aVariable var: bVariable strength: strengthSymbol
+    ]
+    initVar: aVariable var: bVariable strength: strengthSymbol [
+        strength := Strength of: strengthSymbol.
+        v1 := aVariable.
+        v2 := bVariable.
+        direction := nil.
+        self addConstraint.
+    ]
+
+    isSatisfied [ ^(direction == nil) not ]
+    addToGraph [
+        v1 addConstraint: self.
+        v2 addConstraint: self.
+        direction := nil.
+    ]
+    removeFromGraph [
+        (v1 == nil) ifFalse: [ v1 removeConstraint: self ].
+        (v2 == nil) ifFalse: [ v2 removeConstraint: self ].
+        direction := nil.
+    ]
+    chooseMethod: mark [
+        (v1 mark = mark) ifTrue: [
+            direction := ((v2 mark ~= mark) and: [ strength stronger: v2 walkStrength ])
+                ifTrue: [ #forward ] ifFalse: [ nil ].
+            ^self ].
+        (v2 mark = mark) ifTrue: [
+            direction := ((v1 mark ~= mark) and: [ strength stronger: v1 walkStrength ])
+                ifTrue: [ #backward ] ifFalse: [ nil ].
+            ^self ].
+        "Neither variable is marked, so there is a choice: prefer to flow
+         toward the weaker walkabout strength."
+        (v1 walkStrength weaker: v2 walkStrength)
+            ifTrue: [
+                direction := (strength stronger: v1 walkStrength)
+                    ifTrue: [ #backward ] ifFalse: [ nil ] ]
+            ifFalse: [
+                direction := (strength stronger: v2 walkStrength)
+                    ifTrue: [ #forward ] ifFalse: [ nil ] ].
+    ]
+    inputsDo: aBlock [
+        (direction == #forward)
+            ifTrue: [ aBlock value: v1 ]
+            ifFalse: [ aBlock value: v2 ].
+    ]
+    markUnsatisfied [ direction := nil ]
+    output [
+        (direction == #forward) ifTrue: [ ^v2 ].
+        ^v1
+    ]
+    recalculate [
+        | in out |
+        (direction == #forward)
+            ifTrue: [ in := v1. out := v2 ]
+            ifFalse: [ in := v2. out := v1 ].
+        out walkStrength: (strength weakest: in walkStrength).
+        out stay: in stay.
+        out stay ifTrue: [ self execute ].
+    ]
+]
+
+BinaryConstraint subclass: EqualityConstraint [
+    execute [
+        (direction == #forward)
+            ifTrue: [ v2 value: v1 value ]
+            ifFalse: [ v1 value: v2 value ].
+    ]
+]
+
+"ScaleConstraint relates src (v1) and dst (v2) by dst = src * scale + offset,
+ where scale and offset are themselves constrainable Variables."
+BinaryConstraint subclass: ScaleConstraint [
+    | scale offset |
+
+    ScaleConstraint class >> src: srcVariable scale: scaleVariable offset: offsetVariable dst: dstVariable strength: strengthSymbol [
+        ^self basicNew initSrc: srcVariable scale: scaleVariable
+            offset: offsetVariable dst: dstVariable strength: strengthSymbol
+    ]
+    initSrc: srcVariable scale: scaleVariable offset: offsetVariable dst: dstVariable strength: strengthSymbol [
+        strength := Strength of: strengthSymbol.
+        v1 := srcVariable.
+        v2 := dstVariable.
+        scale := scaleVariable.
+        offset := offsetVariable.
+        direction := nil.
+        self addConstraint.
+    ]
+
+    addToGraph [
+        v1 addConstraint: self.
+        v2 addConstraint: self.
+        scale addConstraint: self.
+        offset addConstraint: self.
+        direction := nil.
+    ]
+    removeFromGraph [
+        (v1 == nil) ifFalse: [ v1 removeConstraint: self ].
+        (v2 == nil) ifFalse: [ v2 removeConstraint: self ].
+        (scale == nil) ifFalse: [ scale removeConstraint: self ].
+        (offset == nil) ifFalse: [ offset removeConstraint: self ].
+        direction := nil.
+    ]
+    inputsDo: aBlock [
+        (direction == #forward)
+            ifTrue: [ aBlock value: v1 ]
+            ifFalse: [ aBlock value: v2 ].
+        aBlock value: scale.
+        aBlock value: offset.
+    ]
+    execute [
+        (direction == #forward)
+            ifTrue: [ v2 value: v1 value * scale value + offset value ]
+            ifFalse: [ v1 value: (v2 value - offset value) // scale value ].
+    ]
+    recalculate [
+        | in out |
+        (direction == #forward)
+            ifTrue: [ in := v1. out := v2 ]
+            ifFalse: [ in := v2. out := v1 ].
+        out walkStrength: (strength weakest: in walkStrength).
+        out stay: (in stay and: [ scale stay and: [ offset stay ] ]).
+        out stay ifTrue: [ self execute ].
+    ]
+]
+
+"--- DeltaBlue driver ---------------------------------------------------------
+ The standard chainTest:/projectionTest: workloads with the canonical
+ asserts ported as-is. chainTest: answers the chain's final value (99);
+ projectionTest: answers the last dst plus the sum of the checked dests
+ (2025 + sum over i=1..99 of i*5+2000 = 2025 + 222750 = 224775), so
+ runOne's exact expected answer is 99 + 224775 = 224874."
+
+Object subclass: DeltaBlue [
+    DeltaBlue class >> setUp [ ^self ]
+
+    DeltaBlue class >> runOne [
+        ^(self chainTest: 100) + (self projectionTest: 100)
+    ]
+
+    DeltaBlue class >> checkResult: r [ ^r = 224874 ]
+
+    "Builds a chain of n equality constraints between n+1 variables, stays
+     the last, edits the first, then pushes 100 values down the chain,
+     asserting each arrives intact at the far end (the canonical test)."
+    DeltaBlue class >> chainTest: n [
+        | prev v first last editC edits plan |
+        Planner reset.
+        prev := nil.
+        1 to: n + 1 do: [:i |
+            v := Variable new.
+            (prev == nil) ifFalse: [
+                EqualityConstraint var: prev var: v strength: #required ].
+            (i = 1) ifTrue: [ first := v ].
+            (i = (n + 1)) ifTrue: [ last := v ].
+            prev := v ].
+        StayConstraint var: last strength: #strongDefault.
+        editC := EditConstraint var: first strength: #preferred.
+        edits := OrderedCollection new.
+        edits add: editC.
+        plan := Planner current extractPlanFromConstraints: edits.
+        0 to: 99 do: [:i |
+            first value: i.
+            plan execute.
+            (last value = i) ifFalse: [ self error: 'Chain test failed' ] ].
+        ^last value
+    ]
+
+    "Constructs one set of variables related to another by the linear
+     transformation dst = src * scale + offset, then checks the dst set
+     tracks edits to a src, a dst, the scale, and the offset (the
+     canonical four projection asserts)."
+    DeltaBlue class >> projectionTest: n [
+        | scale offset src dst dests total |
+        Planner reset.
+        dests := OrderedCollection new.
+        scale := Variable value: 10.
+        offset := Variable value: 1000.
+        1 to: n do: [:i |
+            src := Variable value: i.
+            dst := Variable value: i.
+            dests addLast: dst.
+            StayConstraint var: src strength: #normal.
+            ScaleConstraint src: src scale: scale offset: offset dst: dst strength: #required ].
+        self change: src to: 17.
+        (dst value = 1170) ifFalse: [ self error: 'Projection test 1 failed' ].
+        self change: dst to: 1050.
+        (src value = 5) ifFalse: [ self error: 'Projection test 2 failed' ].
+        self change: scale to: 5.
+        1 to: n - 1 do: [:i |
+            ((dests at: i) value = (i * 5 + 1000))
+                ifFalse: [ self error: 'Projection test 3 failed' ] ].
+        self change: offset to: 2000.
+        total := 0.
+        1 to: n - 1 do: [:i |
+            ((dests at: i) value = (i * 5 + 2000))
+                ifFalse: [ self error: 'Projection test 4 failed' ].
+            total := total + (dests at: i) value ].
+        ^total + dst value
+    ]
+
+    "The canonical 'change' helper: plant a preferred edit, extract the
+     plan it enables, push the new value through ten times, tear down."
+    DeltaBlue class >> change: aVariable to: newValue [
+        | editC edits plan |
+        editC := EditConstraint var: aVariable strength: #preferred.
+        edits := OrderedCollection new.
+        edits add: editC.
+        plan := Planner current extractPlanFromConstraints: edits.
+        10 timesRepeat: [
+            aVariable value: newValue.
+            plan execute ].
+        editC destroyConstraint.
+    ]
+]
+
+Strength initStrengths.
+Transcript show: (DeltaBlue projectionTest: 100) printString; cr.

@@ -1,0 +1,4 @@
+# bench.list — the S15 A6 suite order (scripts/perf.sh reads this).
+# Harness-format benches only (each embeds Bench and prints `name inner ms`).
+richards.mst
+deltablue.mst
