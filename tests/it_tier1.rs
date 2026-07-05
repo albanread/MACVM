@@ -6166,3 +6166,91 @@ fn self_send_to_closure_returning_target_compiles_without_abort() {
     let result = unsafe { call(entry, vm_ptr, [recv.raw()].as_ptr(), 1) };
     assert_eq!(result, SmallInt::new(42).oop().raw());
 }
+
+/// S14 step 6: `DominantWithSlowPath` — a two-case POLY site inlines the
+/// dominant LEAF body behind a klass guard whose fail edge is a REAL compiled
+/// send that REJOINS (not a trap). Both receivers must produce
+/// interpreter-identical results through the ONE compiled caller: the
+/// dominant klass via the guarded inlined fast path, the minority klass via
+/// the slow-path send. The dominant inline records its (klass, selector) dep;
+/// the slow path is the nmethod's single compiled IC site.
+#[test]
+fn poly_dominant_inlines_with_rejoining_slow_path() {
+    let mut vm = test_vm();
+    let smi_klass = vm.universe.smi_klass;
+    let object_klass = vm.universe.object_klass;
+    let ka = vm
+        .universe
+        .new_klass(object_klass, "S14DomA", Format::Slots, false, HEADER_WORDS);
+    let kb = vm
+        .universe
+        .new_klass(object_klass, "S14DomB", Format::Slots, false, HEADER_WORDS);
+
+    // Leaf constant-return targets, distinct per klass.
+    let v_sel = vm.universe.intern(b"v");
+    let mk = |vm: &mut VmState, val: i8| {
+        let mut b = BytecodeBuilder::new();
+        b.push_smi_i8(val);
+        b.ret_tos();
+        b.finish(vm, v_sel, 0, 0)
+    };
+    let va = mk(&mut vm, 11);
+    let vb = mk(&mut vm, 22);
+    install_method(&mut vm, ka, v_sel, va);
+    install_method(&mut vm, kb, v_sel, vb);
+
+    // `call: x [ ^x v ]` — receiver is the ARG (self-send devirt must not
+    // interfere), IC seeded POLY with exactly two cases, A first (the
+    // countless-interpreter-POLY dominance rule trusts cases[0] at len==2).
+    let call_sel = vm.universe.intern(b"call:");
+    let mut cb = BytecodeBuilder::new();
+    cb.push_temp(0);
+    cb.send(&mut vm, v_sel, 0);
+    cb.ret_tos();
+    let call_m = cb.finish(&mut vm, call_sel, 1, 0);
+    install_method(&mut vm, smi_klass, call_sel, call_m);
+    let array_klass = vm.universe.array_klass;
+    let pairs = macvm::memory::alloc::alloc_indexable_oops(
+        &mut vm,
+        array_klass,
+        macvm::oops::layout::IC_POLY_ARRAY_LEN,
+    );
+    pairs.at_put(0, ka.oop());
+    pairs.at_put(1, va.oop());
+    pairs.at_put(2, kb.oop());
+    pairs.at_put(3, vb.oop());
+    let epoch = vm.ic_epoch;
+    InterpreterIc::at(call_m, 0).set_poly(&mut vm, pairs, epoch);
+
+    let id = driver::compile_method(&mut vm, smi_klass, call_m).expect("must compile");
+    {
+        let nm = vm.code_table.get(id).expect("installed");
+        assert_eq!(
+            nm.ic_sites.len(),
+            1,
+            "exactly one compiled IC site: the rejoining slow-path send"
+        );
+        assert_eq!(nm.inline_deps.len(), 1, "the dominant inline's dep");
+        assert_eq!(nm.inline_deps[0].0.oop().raw(), ka.oop().raw());
+        assert_eq!(nm.inline_deps[0].1.oop().raw(), v_sel.oop().raw());
+    }
+
+    // Differential, BOTH paths, through the same compiled entry.
+    let a = alloc::alloc_slots(&mut vm, ka).oop();
+    let b = alloc::alloc_slots(&mut vm, kb).oop();
+    let self_smi = SmallInt::new(5).oop();
+    let call: CallStubFn = unsafe { std::mem::transmute(vm.stubs.call_stub_entry()) };
+    for (arg, expect) in [(a, 11i64), (b, 22)] {
+        let interp = macvm::interpreter::run_method(&mut vm, call_m, self_smi, &[arg]);
+        assert_eq!(interp.raw(), SmallInt::new(expect).oop().raw());
+        let nm = vm.code_table.get(id).expect("installed");
+        let entry = unsafe { nm.code.base.add(nm.entry_off as usize) } as u64;
+        let vm_ptr: *mut VmState = &mut vm;
+        let result = unsafe { call(entry, vm_ptr, [self_smi.raw(), arg.raw()].as_ptr(), 2) };
+        assert_eq!(
+            result,
+            SmallInt::new(expect).oop().raw(),
+            "dominant fast path AND rejoining slow path must both match the interpreter"
+        );
+    }
+}

@@ -3152,6 +3152,131 @@ impl<'a> Translator<'a> {
                 } else {
                     crate::compiler::inline::InlineDecision::Call
                 };
+                // S14 step 6: a POLY site with a dominant case — inline the
+                // dominant LEAF body behind a klass guard whose FAIL edge is a
+                // REAL compiled send that REJOINS at a continuation (never a
+                // trap: the minority receivers are known-taken; trapping would
+                // deopt-storm, SPEC §8.4). Both paths write the same `dst`
+                // vreg, so the continuation resumes with one canonical result
+                // regardless of which side ran. The inline dep is recorded
+                // against the DOMINANT klass (the guard's assumption); the
+                // slow path is an ordinary lazy compiled-IC send needing none.
+                if let crate::compiler::inline::InlineDecision::DominantWithSlowPath {
+                    case_klass,
+                    case_method,
+                    guard,
+                } = &feedback_inline
+                {
+                    let case_klass = *case_klass;
+                    let case_method = *case_method;
+                    // Same dry-run rule as `try_inline_leaf`: prove the WHOLE
+                    // splice succeeds before emitting anything (the slow block
+                    // is minted first, and an orphaned block would be dead
+                    // weight; a half-spliced fast path would be corruption).
+                    let callee_cfg = crate::compiler::decode::decode(case_method);
+                    let spliceable = callee_cfg.blocks.len() == 1
+                        && matches!(
+                            callee_cfg.blocks[0].terminator,
+                            crate::compiler::decode::Terminator::Return
+                        )
+                        && case_method.argc() == real_argc as usize
+                        && leaf_body_is_spliceable(case_method);
+                    if spliceable {
+                        let selector = ic_view.selector();
+                        let pre_pop_stack = stack.clone();
+                        let mut inline_args: Vec<VReg> = (0..real_argc)
+                            .map(|_| stack.pop().expect("dominant send: missing arg operand"))
+                            .collect();
+                        inline_args.reverse();
+                        let receiver = stack
+                            .pop()
+                            .expect("dominant send: missing receiver operand");
+
+                        // The rejoining SLOW block: a full generic send whose
+                        // result is moved into the shared `dst`, then a jump to
+                        // the continuation. Its call-return safepoint records
+                        // the caller stack BELOW the send (reexecute=false),
+                        // exactly like a root-level CallSend.
+                        let continuation_id = self.fresh_block_id();
+                        let slow_id = self.fresh_block_id();
+                        let dst = self.fresh(true);
+                        let dst_slow = self.fresh(true);
+                        let mut send_args = vec![receiver];
+                        send_args.extend_from_slice(&inline_args);
+                        let site = self.call_sites.len() as u16;
+                        self.call_sites.push(CallSiteInfo {
+                            selector,
+                            argc: real_argc + 1,
+                            static_klass: None,
+                        });
+                        self.site_feedback.push(feedback.clone());
+                        self.finish_block(IrBlock {
+                            id: slow_id,
+                            bci,
+                            code: vec![
+                                Ir::CallSend {
+                                    dst: dst_slow,
+                                    site,
+                                    args: send_args,
+                                },
+                                Ir::Move { dst, src: dst_slow },
+                                Ir::Jump {
+                                    target: continuation_id,
+                                },
+                            ],
+                            entry_stack: Vec::new(),
+                            deopt_sites: vec![(
+                                0,
+                                DeoptRaw {
+                                    stack: stack.clone(),
+                                    bci,
+                                    kind: SafepointKind::Call,
+                                    reexecute: false,
+                                    stack_closures: Vec::new(),
+                                    inline: None,
+                                },
+                            )],
+                        });
+
+                        // FAST path, in the current block: the guard (fail →
+                        // the rejoining slow block), the spliced dominant leaf
+                        // body (guard=None — the guard above already dominates
+                        // it; the dep vs case_klass is recorded inside), and
+                        // the move into the shared result vreg.
+                        let expect = self
+                            .pool
+                            .intern(case_klass.oop().raw(), Some(RelocKind::Oop));
+                        let guard_shape = match guard {
+                            crate::compiler::inline::GuardKind::SmiTest => GuardShape::SmiTest,
+                            _ => GuardShape::KlassTest,
+                        };
+                        code.push(Ir::GuardKlass {
+                            obj: receiver,
+                            expect,
+                            fail: slow_id,
+                            kind: guard_shape,
+                        });
+                        let result = self
+                            .try_inline_leaf(
+                                case_method,
+                                None,
+                                case_klass,
+                                selector,
+                                receiver,
+                                &inline_args,
+                                bci,
+                                &pre_pop_stack,
+                                code,
+                            )
+                            .expect("dominant leaf was pre-validated spliceable");
+                        code.push(Ir::Move { dst, src: result });
+                        stack.push(dst);
+                        return Some(continuation_id);
+                    }
+                    // Unspliceable dominant shape: fall through to the plain
+                    // generic CallSend tail below (nothing was emitted).
+                }
+
                 if let crate::compiler::inline::InlineDecision::Inline { callee, guard } =
                     feedback_inline
                 {

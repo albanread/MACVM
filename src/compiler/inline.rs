@@ -344,6 +344,35 @@ pub fn decide_with_budget(
                 InlineDecision::Call
             }
         }
+        // S14 step 6: a POLY site with a DOMINANT case inlines the dominant
+        // body behind a klass guard whose fail edge is a REAL compiled send
+        // (never a trap — the minority receivers are known-taken, trapping
+        // would deopt-storm; SPEC §8.4). The interpreter's POLY array carries
+        // no counts, so dominance is a first-seen guess — trusted ONLY at
+        // exactly two cases (the doc's pinned restriction until compiled-PIC
+        // counts arrive on recompile: beyond two, first-seen is too weak).
+        // Leaf-only in this slice: the fast path then contains NO safepoint
+        // of its own, so no in-body deopt scope interplay with the rejoin.
+        SiteFeedback::Poly { cases } if cases.len() == 2 => {
+            let dominant = &cases[0];
+            let inlinable = dominant.method.primitive() == 0
+                && inline_cost(dominant.method) <= budget.per_call_cost
+                && is_leaf(dominant.method);
+            if inlinable {
+                let guard = if dominant.klass.oop().raw() == smi_klass_bits {
+                    GuardKind::SmiTest
+                } else {
+                    GuardKind::KlassTest
+                };
+                InlineDecision::DominantWithSlowPath {
+                    case_klass: dominant.klass,
+                    case_method: dominant.method,
+                    guard,
+                }
+            } else {
+                InlineDecision::Call
+            }
+        }
         // An Untaken site owns no observed target (the step-3 trap is `decide`'s
         // job, reached separately in `convert`); Poly/Mega dispatch dynamically.
         SiteFeedback::Untaken | SiteFeedback::Poly { .. } | SiteFeedback::Mega => {
