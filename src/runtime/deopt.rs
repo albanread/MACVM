@@ -433,16 +433,6 @@ pub fn deoptimize_frame(vm: &mut VmState, frame: FrameView) -> DeoptResume {
             slot_vals.len()
         );
 
-        // Outer scopes push their pending operand stack FIRST (it belongs to
-        // the caller frame, sitting below the callee it inlined). The
-        // innermost frame's operand stack is pushed AFTER its header (below).
-        if !vf.is_innermost {
-            for &loc in &vf.pending_stack {
-                let v = read_value(vm, nmethod_ref(vm, frame.nm), &frame, loc);
-                vm.stack.push(v);
-            }
-        }
-
         // Receiver + args, exactly where the interpreter's caller leaves
         // them (unified slots 0..argc are the callee's negative-offset arg
         // area). `push_frame` reads its receiver copy from `stack[fp-argc-1]`,
@@ -465,6 +455,25 @@ pub fn deoptimize_frame(vm: &mut VmState, frame: FrameView) -> DeoptResume {
         let f = Frame { fp: fp_new };
         for (t, &v) in slot_vals[argc..].iter().enumerate() {
             f.set_temp(&mut vm.stack, argc + t, v);
+        }
+
+        // A NON-innermost frame's frozen operand stack (its child's
+        // `SenderLink.pending_stack`) goes ABOVE its own header+temps — the
+        // frame's live operand-stack area, exactly where the interpreter had
+        // it when the inlined send fired; the CHILD frame's receiver lands on
+        // top of it next iteration. (This used to be pushed BEFORE the
+        // frame's own receiver/header — i.e. BELOW the frame, in the caller's
+        // territory — which resumed the frame with its frozen entries missing
+        // and shifted: `lo + (self next ...)` answered `nil + ...` after the
+        // inlined callee's in-body trap. Unnoticed until S14 step 5 made
+        // non-empty pending stacks common: every earlier depth-2 test froze
+        // an EMPTY stack, for which both orders are identical. Found by the
+        // step-9 soak gate.)
+        if !vf.is_innermost {
+            for &loc in &vf.pending_stack {
+                let v = read_value(vm, nmethod_ref(vm, frame.nm), &frame, loc);
+                vm.stack.push(v);
+            }
         }
 
         // ── M6: context. ────────────────────────────────────────────────

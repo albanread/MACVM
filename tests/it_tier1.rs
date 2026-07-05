@@ -6254,3 +6254,99 @@ fn poly_dominant_inlines_with_rejoining_slow_path() {
         );
     }
 }
+
+/// Step-9 soak-gate regression (THE materializer ordering bug): an inlined
+/// callee's in-body trap deopts with the CALLER's frozen operand stack
+/// non-empty — `lo + (self next ...)` freezes `[lo]` across the spliced
+/// `next`. The materializer used to push that pending stack BELOW the caller
+/// frame's own header (indistinguishable for the empty pending stacks every
+/// earlier depth-2 test froze), resuming with `lo` missing → `nil + ...` DNU.
+#[test]
+fn inlined_trap_deopt_restores_nonempty_pending_stack() {
+    let mut vm = VmState::with_options(VmOptions {
+        heap_mib: 64,
+        trace: Default::default(),
+        gc_stress: false,
+        gc_stress_full_period: None,
+        eden_kb: None,
+        jit: JitMode::Threshold(1),
+    });
+    load_source(
+        &mut vm,
+        "Object subclass: RDiag [\n\
+        \x20   | state |\n\
+        \x20   init [ state := 123 ]\n\
+        \x20   next [ state := (state * 5 + 3) bitAnd: 255. ^state ]\n\
+        \x20   between: lo and: hi [ ^lo + (self next \\\\ (hi - lo + 1)) ]\n\
+        ]\n",
+    );
+    install_smi_prim(&mut vm, b"*", 1, 3);
+    install_smi_prim(&mut vm, b"+", 1, 1);
+    install_smi_prim(&mut vm, b"-", 1, 2);
+    install_smi_prim(&mut vm, b"bitAnd:", 1, 6);
+    install_smi_prim(&mut vm, b"\\\\", 1, 5);
+    let k = klass_named(&mut vm, "RDiag");
+    let next_m = method_named(&mut vm, k, "next");
+    let btw_m = method_named(&mut vm, k, "between:and:");
+    let _ = next_m;
+    // COLD compile: next's inner smi ICs are Empty — the devirt inline still
+    // splices next (static resolve needs no IC), so its inner sends become
+    // IN-BODY TRAPS; executing the compiled code exercises trap → SenderLink
+    // deopt → interpreted re-execution.
+    let recv = alloc::alloc_slots(&mut vm, k).oop();
+    MemOop::try_from(recv)
+        .unwrap()
+        .set_body_oop(0, SmallInt::new(123).oop());
+
+    // Structural pin: the spliced `next` body's in-body trap must carry a
+    // NON-empty caller pending stack — the shape this regression is about.
+    let cfg = decode::decode(btw_m);
+    let ir = macvm::compiler::ir::convert(&vm, k, btw_m, &cfg);
+    let has_nonempty_pending = ir.blocks.iter().any(|b| {
+        b.deopt_sites.iter().any(|d| {
+            d.1.inline
+                .as_ref()
+                .is_some_and(|s| !s.caller_pending_stack.is_empty())
+        })
+    });
+    assert!(
+        has_nonempty_pending,
+        "scenario must produce an inlined trap with a non-empty frozen caller stack"
+    );
+    let id = driver::compile_method(&mut vm, k, btw_m).expect("compile");
+    let call: CallStubFn = unsafe { std::mem::transmute(vm.stubs.call_stub_entry()) };
+    let nm = vm.code_table.get(id).unwrap();
+    let entry = unsafe { nm.code.base.add(nm.entry_off as usize) } as u64;
+    let vm_ptr: *mut VmState = &mut vm;
+    // reset state so the LCG sequence matches the interp run
+    MemOop::try_from(recv)
+        .unwrap()
+        .set_body_oop(0, SmallInt::new(123).oop());
+    let interp2 = macvm::interpreter::run_method(
+        &mut vm,
+        btw_m,
+        recv,
+        &[SmallInt::new(10).oop(), SmallInt::new(99).oop()],
+    );
+    MemOop::try_from(recv)
+        .unwrap()
+        .set_body_oop(0, SmallInt::new(123).oop());
+    let compiled = unsafe {
+        call(
+            entry,
+            vm_ptr,
+            [
+                recv.raw(),
+                SmallInt::new(10).oop().raw(),
+                SmallInt::new(99).oop().raw(),
+            ]
+            .as_ptr(),
+            3,
+        )
+    };
+    assert_eq!(
+        compiled,
+        interp2.raw(),
+        "differential across the in-body trap deopt"
+    );
+}
