@@ -1,0 +1,307 @@
+/* dark.css — the "Dark" theme (Theme menu, src/preprocess.rs's `Theme`):
+   a straight dark-mode recoloring of hidef.css's exact structure — same
+   class names, same layout/spacing/radius rules, same icon set (its blue/
+   red accents read fine on a dark surface, matching how most real dark-
+   mode UIs keep colored accent icons rather than recoloring them). Only
+   the palette changes: this file is hidef.css with new `--hd-*` values
+   plus a few previously-hardcoded token/scrollbar colors adjusted for
+   dark-background contrast. */
+
+:root {
+  --hd-bg: #17181c;               /* page/app background */
+  --hd-surface: #202127;          /* cards: transcript, smappl boxes */
+  --hd-chrome: #1c1d22;           /* toolbar / status bar backdrop */
+  --hd-border: rgba(255, 255, 255, 0.08);
+  --hd-text: #e4e4e7;
+  --hd-text-muted: #8b8d98;
+  --hd-accent: #5b9dff;           /* links, active state */
+  --hd-accent-soft: rgba(91, 157, 255, 0.14);
+  --hd-danger: #f87171;           /* destructive actions (remove class/method) */
+
+  --hd-space-1: 4px;
+  --hd-space-2: 8px;
+  --hd-space-3: 14px;
+
+  --hd-font-body: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Arial, sans-serif;
+  --hd-font-code: 'SF Mono', Menlo, Consolas, monospace;
+  --hd-size-body: 16px;
+  --hd-size-code: 13.5px;
+
+  --hd-page-width: 780px;
+  --hd-page-left-margin: 32px;
+  --hd-radius: 10px;
+}
+
+html, body {
+  overscroll-behavior: none;
+}
+body {
+  margin: 0;
+  background: var(--hd-bg);
+  color: var(--hd-text);
+  font-family: var(--hd-font-body);
+  font-size: var(--hd-size-body);
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+.st-page {
+  max-width: var(--hd-page-width);
+  padding: var(--hd-space-2) var(--hd-space-3) var(--hd-space-3) var(--hd-page-left-margin);
+}
+
+h1, h2, h3, h4, h5, h6 { font-family: var(--hd-font-body); font-weight: 600; letter-spacing: -0.01em; }
+h1 { font-size: 30px; }
+h2 { font-size: 23px; }
+h3 { font-size: 18px; }
+h4 { font-size: 15.5px; }
+h5 { font-size: 15px; }
+h6 { font-size: 13px; color: var(--hd-text-muted); }
+
+a, a.doit { color: var(--hd-accent); text-decoration: none; cursor: default; border-bottom: 1px solid transparent; }
+a:hover, a.doit:hover { border-bottom-color: var(--hd-accent); }
+a:visited { color: var(--hd-accent); }
+
+pre, code, .st-code {
+  font-family: var(--hd-font-code);
+  font-size: var(--hd-size-code);
+}
+
+ul { list-style-type: none; padding-left: 0; }
+ul li { position: relative; padding-left: 18px; margin: var(--hd-space-1) 0; }
+ul li::before {
+  content: "";
+  position: absolute; left: 2px; top: 0.65em;
+  width: 5px; height: 5px; border-radius: 50%;
+  background: var(--hd-accent);
+}
+
+/* ---- flat "raised"/"lowered" surfaces: same names, no bevels ---- */
+.st-raised {
+  background: var(--hd-chrome);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.35);
+  border-bottom: 1px solid var(--hd-border);
+}
+.st-lowered {
+  background: var(--hd-surface);
+  box-shadow: inset 0 0 0 1px var(--hd-border);
+  border-radius: var(--hd-radius);
+}
+
+/* ---- chrome: toolbar / status bar / transcript ---- */
+.st-toolbar {
+  display: flex;
+  align-items: center;
+  gap: var(--hd-space-2);
+  padding: var(--hd-space-2) var(--hd-space-3);
+}
+.st-toolbar button {
+  width: 34px; height: 34px;
+  padding: 5px;
+  background: transparent;
+  border: none;
+  border-radius: 8px;
+  font-family: var(--hd-font-body);
+  transition: background-color 120ms ease;
+}
+.st-toolbar button:hover {
+  background: rgba(91, 157, 255, 0.14);
+}
+.st-toolbar button:active {
+  background: rgba(91, 157, 255, 0.24);
+}
+.st-toolbar button img, .st-icon {
+  image-rendering: auto;
+  width: 24px; height: 24px;
+}
+
+.st-statusbar {
+  font-family: var(--hd-font-body);
+  font-size: 12.5px;
+  color: var(--hd-text-muted);
+  padding: 6px var(--hd-space-3);
+}
+.st-statusbar .st-field {
+  display: inline-block;
+  padding: 2px var(--hd-space-2);
+  border-radius: 6px;
+  background: var(--hd-surface);
+  box-shadow: inset 0 0 0 1px var(--hd-border);
+}
+
+.st-transcript {
+  font-family: var(--hd-font-code);
+  font-size: var(--hd-size-code);
+  padding: var(--hd-space-2) var(--hd-space-3);
+  overflow: auto;
+  overscroll-behavior: contain;
+  margin: 0 var(--hd-space-3);
+  white-space: pre-wrap;
+}
+
+/* ---- smappl placeholder (G0, inert) ---- */
+.smappl {
+  display: inline-block;
+  background: var(--hd-accent-soft);
+  color: var(--hd-accent);
+  font-family: var(--hd-font-code);
+  font-size: var(--hd-size-code);
+  padding: var(--hd-space-1) var(--hd-space-2);
+  border-radius: 6px;
+}
+
+/* ---- outliner (G3) ---- */
+.st-outliner { font-family: var(--hd-font-body); }
+.st-outliner .st-node { margin-left: 15px; }
+.st-outliner .st-toggle {
+  vertical-align: middle;
+  margin-right: var(--hd-space-1);
+}
+.st-outliner .st-header {
+  background: var(--hd-chrome);
+  border-radius: 6px;
+  padding: 2px var(--hd-space-2);
+}
+.st-outliner .st-superclass { font-weight: normal; color: var(--hd-text-muted); }
+.st-outliner .st-class { font-weight: 600; }
+
+/* ---- workspace tool (src/workspace_render.rs) ---- */
+.st-workspace { display: flex; flex-direction: column; height: calc(100vh - 130px); }
+.st-workspace-editor {
+  flex: 1;
+  min-height: 0;
+  margin-top: var(--hd-space-2);
+  border-radius: var(--hd-radius);
+  box-shadow: inset 0 0 0 1px var(--hd-border);
+  background: var(--hd-surface);
+}
+
+/* ---- class browser view (G3 mock, src/browser_render.rs) ---- */
+.st-browser { display: flex; flex-direction: column; height: calc(100vh - 130px); }
+.st-browser-lists { display: flex; flex-direction: row; flex: 2; min-height: 0; gap: 1px; }
+.st-browser-pane {
+  flex: 1;
+  overflow: auto;
+  overscroll-behavior: contain;
+  background: var(--hd-surface);
+  font-family: var(--hd-font-body);
+  font-size: 14px;
+  border-radius: 6px;
+  box-shadow: inset 0 0 0 1px var(--hd-border);
+}
+.st-browser-item { padding: 3px 8px; white-space: nowrap; cursor: default; border-radius: 4px; margin: 1px 3px; }
+.st-browser-item.active { background: var(--hd-accent); color: #0b0d12; }
+.st-browser-side-tabs {
+  display: flex;
+  background: var(--hd-chrome);
+  border-radius: 6px 6px 0 0;
+}
+.st-browser-side-tab {
+  flex: 1;
+  text-align: center;
+  padding: 4px 0;
+  font-size: 12.5px;
+  color: var(--hd-text-muted);
+  cursor: default;
+}
+.st-browser-side-tab.active { color: var(--hd-accent); font-weight: 600; }
+.st-browser-source {
+  flex: 1;
+  min-height: 0;
+  margin-top: var(--hd-space-2);
+  border-radius: var(--hd-radius);
+  box-shadow: inset 0 0 0 1px var(--hd-border);
+  background: var(--hd-surface);
+}
+/* ---- class browser create/remove actions ---- */
+.st-browser-action-row {
+  position: sticky;
+  bottom: 0;
+  padding: var(--hd-space-2);
+  border-top: 1px solid var(--hd-border);
+  background: var(--hd-surface);
+}
+.st-browser-new-button, .st-browser-danger-button {
+  font-family: var(--hd-font-body);
+  font-size: 12.5px;
+  padding: 4px 10px;
+  background: transparent;
+  color: var(--hd-text);
+  border: 1px solid var(--hd-border);
+  border-radius: 6px;
+  cursor: default;
+  transition: background-color 120ms ease;
+}
+.st-browser-new-button:hover { background: var(--hd-accent-soft); border-color: var(--hd-accent); color: var(--hd-accent); }
+.st-browser-danger-button { color: var(--hd-danger); border-color: rgba(248, 113, 113, 0.35); }
+.st-browser-danger-button:hover { background: rgba(248, 113, 113, 0.12); }
+.st-remove-row .st-confirm-strip:not([hidden]) {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--hd-space-1);
+  margin-left: var(--hd-space-2);
+  color: var(--hd-text-muted);
+  font-size: 12.5px;
+}
+.st-code-editor { position: relative; height: 100%; }
+.st-code-highlight, .st-code-input {
+  position: absolute;
+  inset: 0;
+  margin: 0;
+  box-sizing: border-box;
+  font-family: var(--hd-font-code);
+  font-size: var(--hd-size-code);
+  line-height: 1.4;
+  tab-size: 4;
+  letter-spacing: normal;
+  padding: var(--hd-space-2);
+  white-space: pre-wrap;
+  word-wrap: break-word;
+  overflow: auto;
+  overscroll-behavior: contain;
+  border-radius: var(--hd-radius);
+}
+.st-code-input {
+  appearance: none;
+  -webkit-appearance: none;
+  color: transparent;
+  background: transparent;
+  border: none;
+  resize: none;
+  caret-color: var(--hd-text);
+  z-index: 2;
+}
+.st-code-highlight {
+  z-index: 1;
+  pointer-events: none;
+  color: var(--hd-text);
+}
+.st-tok-comment { color: #6b7280; font-style: italic; }
+.st-tok-string { color: #f0b060; }
+.st-tok-symbol { color: #2dd4bf; }
+.st-tok-keyword { color: var(--hd-accent); font-weight: 600; }
+.st-tok-pseudo { color: #b794f6; }
+.st-tok-number { color: var(--hd-text); font-weight: 600; }
+
+/* ---- custom context menu (smtk.js — replaces WKWebView's native one) ---- */
+.st-context-menu {
+  position: fixed;
+  z-index: 1000;
+  min-width: 150px;
+  padding: 4px;
+  background: var(--hd-surface);
+  border-radius: 8px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.5), inset 0 0 0 1px var(--hd-border);
+  font-family: var(--hd-font-body);
+  font-size: 13.5px;
+}
+.st-context-menu-item { padding: 6px 10px; border-radius: 5px; cursor: default; color: var(--hd-text); }
+.st-context-menu-item:hover { background: var(--hd-accent-soft); color: var(--hd-accent); }
+
+/* ---- overlay scrollbars ---- */
+::-webkit-scrollbar { width: 10px; height: 10px; background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.16);
+  border-radius: 5px;
+}
+::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.26); }
+::-webkit-scrollbar-button { width: 0; height: 0; display: none; }

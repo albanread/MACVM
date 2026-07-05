@@ -1,0 +1,74 @@
+<!-- canvas-swatch.html — visual-verification page for the Canvas widget
+     (../../docs/CANVAS.md), same posture as theme-swatch.html: computer-use
+     tools can't attach to the native `cargo run -p macvm-gui` app (no .app
+     bundle registration), so this exercises the real shipped `smtk.js`
+     against the real `canvas_render.rs` markup through a local static
+     server instead. Load with ?theme=dark.css etc. to check across themes.
+
+     The "Run Demo"/"Clear" buttons below are the real production markup
+     and post through the real smtk.js click-wiring — with no native host
+     attached, that only reaches smtk.js's own `post()` console.log
+     fallback (open devtools to confirm the right {kind: "canvasRunDemo"}/
+     {kind: "canvasClear"} message), since there's no VM here to answer.
+
+     The "simulate VmResponse" controls further down are NOT part of the
+     production page — they stand in for main.rs's `vm_bridge_drain`,
+     calling straight into smtk.js's real window.macvmCanvasCreated/
+     macvmCanvasDraw with the exact JSON gui/src/vm_host.rs's
+     CanvasCommands builder actually produces (captured directly from a
+     `cargo test -p macvm-gui canvas_run_demo -- --nocapture` run, not
+     hand-duplicated), so this checks the real JS interpreter — allowlist
+     dispatch, ctx method calls, JSON parsing — draws real pixels. -->
+<meta charset="utf-8">
+<div class="st-page">
+  <h1>Canvas swatch</h1>
+
+  <div class="st-canvas-view" id="macvm-canvas-view">
+    <div class="st-browser-action-row st-canvas-actions">
+      <button type="button" class="st-browser-new-button" data-canvas-action="run-demo">Run Demo</button>
+      <button type="button" class="st-browser-new-button" data-canvas-action="clear">Clear</button>
+    </div>
+    <div class="st-lowered st-canvas-surface">
+      <canvas id="macvm-canvas-0" width="420" height="220"></canvas>
+    </div>
+  </div>
+
+  <hr>
+  <p><em>Verification harness below — not part of the real Canvas view:</em></p>
+  <div class="st-browser-action-row">
+    <button type="button" id="sim-created">Simulate CanvasCreated(640, 300)</button>
+    <button type="button" id="sim-demo">Simulate CanvasDraw (Run Demo payload)</button>
+    <button type="button" id="sim-clear">Simulate CanvasDraw (Clear payload)</button>
+  </div>
+</div>
+<script>
+  const theme = new URLSearchParams(location.search).get('theme') || 'hidef.css';
+  const link = document.createElement('link');
+  link.rel = 'stylesheet';
+  link.href = theme;
+  document.head.appendChild(link);
+</script>
+<script src="smtk.js"></script>
+<script>
+  // Byte-for-byte what vm_host::canvas_demo_commands().to_json() actually
+  // emits — see this file's header comment for how it was captured.
+  const REAL_RUN_DEMO_JSON =
+    '[["clearRect",0,0,10000,10000],["fillStyle","steelblue"],["fillRect",20,20,120,80],' +
+    '["strokeStyle","crimson"],["lineWidth",3],["beginPath"],' +
+    '["arc",220,60,40,0,6.283185307179586],["stroke"],["save"],' +
+    '["strokeStyle","seagreen"],["lineWidth",2],["beginPath"],["moveTo",20,140],' +
+    '["lineTo",300,140],["stroke"],["restore"],["fillStyle","#222"],' +
+    '["font","16px sans-serif"],["fillText","MACVM Canvas",20,175]]';
+  // What vm_host::handle's CanvasClear arm actually builds.
+  const REAL_CLEAR_JSON = '[["clearRect",0,0,10000,10000]]';
+
+  document.getElementById('sim-created').addEventListener('click', function () {
+    window.macvmCanvasCreated(0, 640, 300);
+  });
+  document.getElementById('sim-demo').addEventListener('click', function () {
+    window.macvmCanvasDraw(0, REAL_RUN_DEMO_JSON);
+  });
+  document.getElementById('sim-clear').addEventListener('click', function () {
+    window.macvmCanvasDraw(0, REAL_CLEAR_JSON);
+  });
+</script>

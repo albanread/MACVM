@@ -9,6 +9,7 @@
 //! `Transcript show:` round trip until G2.
 
 mod browser_render;
+mod canvas_render;
 mod objc;
 mod preprocess;
 mod vm_host;
@@ -38,28 +39,30 @@ static VM: OnceLock<vm_host::VmHost> = OnceLock::new();
 
 /// Current theme (`../PLAN.md` Theme menu), read on every `navigate_to` and
 /// flipped by the native Theme menu's target/action handlers below. A plain
-/// atomic rather than the `Mutex<NavState>` pattern above: `Theme` is
-/// `Copy`, and AppKit only ever calls into this process on the main thread
-/// (see `MainThreadPtr`'s doc comment), so there's no real concurrency to
-/// protect against — `Ordering::Relaxed` is enough. Defaults to Hi-Def
-/// (`1`) rather than Classic — the Theme menu (and its checkmarks, computed
-/// from `current_theme()` at menu-build time) still let you switch back.
-static THEME: AtomicU8 = AtomicU8::new(1);
+/// atomic INDEX into `Theme::ALL` rather than the `Mutex<NavState>` pattern
+/// above: `Theme` is `Copy`, and AppKit only ever calls into this process on
+/// the main thread (see `MainThreadPtr`'s doc comment), so there's no real
+/// concurrency to protect against — `Ordering::Relaxed` is enough. Defaults
+/// to `Theme::ALL`'s Hi-Def index rather than 0 (Classic) — the Theme menu
+/// (and its checkmarks, computed from `current_theme()` at menu-build time)
+/// still let you switch to any theme including Classic.
+static THEME: AtomicU8 = AtomicU8::new(1); // Theme::ALL[1] == Theme::HiDef
 
 fn current_theme() -> Theme {
-    match THEME.load(Ordering::Relaxed) {
-        1 => Theme::HiDef,
-        _ => Theme::Classic,
-    }
+    let idx = THEME.load(Ordering::Relaxed) as usize;
+    Theme::ALL.get(idx).copied().unwrap_or(Theme::HiDef)
 }
 
 fn set_theme(theme: Theme) {
-    THEME.store(if theme == Theme::HiDef { 1 } else { 0 }, Ordering::Relaxed);
+    if let Some(idx) = Theme::ALL.iter().position(|&t| t == theme) {
+        THEME.store(idx as u8, Ordering::Relaxed);
+    }
 }
 
-/// The two Theme-menu items, so their checkmarks can be updated when the
-/// active theme changes (`update_theme_menu_checkmarks`).
-static THEME_MENU_ITEMS: OnceLock<(MainThreadPtr, MainThreadPtr)> = OnceLock::new();
+/// One `(Theme, menu-item-pointer)` pair per `Theme::ALL` entry, so their
+/// checkmarks can be updated when the active theme changes
+/// (`update_theme_menu_checkmarks`).
+static THEME_MENU_ITEMS: OnceLock<Vec<(Theme, MainThreadPtr)>> = OnceLock::new();
 
 /// Page zoom percentage (G5 `biggerText`/`smallerText`, `../PLAN.md` §4),
 /// read on every `navigate_to` same as `THEME`. Stored directly as the
@@ -171,6 +174,12 @@ fn workspace_view_marker() -> PathBuf {
     gui_root().join(".workspace-view")
 }
 
+/// Same idea as `browser_view_marker`, for the Canvas view
+/// (`canvas_render.rs`, `../docs/CANVAS.md`).
+fn canvas_view_marker() -> PathBuf {
+    gui_root().join(".canvas-view")
+}
+
 fn start_page() -> PathBuf {
     gui_root().join("reference/pages/startPage.html")
 }
@@ -220,6 +229,14 @@ fn navigate_to(path: &Path) {
         // directly — see `open_workspace`'s doc comment for why there's no
         // VM round trip (or content persistence) involved here.
         display_workspace();
+        return;
+    }
+    if path == canvas_view_marker() {
+        // Same shape as the workspace marker: rebuild and display directly.
+        // Whatever was drawn is lost on navigating away, same accepted
+        // limitation `open_workspace`'s doc comment already notes for its
+        // own content — see `open_canvas`'s doc comment.
+        display_canvas();
         return;
     }
     let html = match preprocess::load_and_preprocess(path, current_theme(), current_font_scale_percent(), &current_transcript()) {
@@ -291,6 +308,36 @@ fn display_workspace() {
     let text = WORKSPACE_TEXT.lock().unwrap().clone().unwrap_or_else(|| workspace_render::initial_text().to_string());
     let body = workspace_render::render_workspace(&text);
     let html = preprocess::render_generated_page("Workspace", &body, &gui_root(), current_theme(), current_font_scale_percent(), &current_transcript());
+    display_html(&html);
+}
+
+/// Opens the Canvas view (`canvas_render.rs`, `../docs/CANVAS.md`, the
+/// toolbar's "abstract" icon). Displays synchronously at the default
+/// size, exactly like `open_workspace`, then *also* submits a real
+/// `CanvasCreate` request — "allocate a widget of a specific size" is a
+/// genuine round trip through `vm_host`, not just a static initial
+/// render, so opening the view exercises it for real every time, not
+/// only when "Run Demo" is clicked.
+///
+/// Same accepted limitation as Workspace: whatever's drawn lives only in
+/// the page's own `<canvas>` pixel buffer, which a fresh `loadFileURL:`
+/// throws away on navigating elsewhere.
+fn open_canvas() {
+    if let Some(nav) = NAV.get() {
+        nav.lock().unwrap().go(canvas_view_marker());
+    }
+    display_canvas();
+    if let Some(vm) = VM.get() {
+        vm.submit(vm_host::VmRequest::CanvasCreate {
+            width: canvas_render::DEFAULT_WIDTH,
+            height: canvas_render::DEFAULT_HEIGHT,
+        });
+    }
+}
+
+fn display_canvas() {
+    let body = canvas_render::render_canvas(canvas_render::DEFAULT_WIDTH, canvas_render::DEFAULT_HEIGHT);
+    let html = preprocess::render_generated_page("Canvas", &body, &gui_root(), current_theme(), current_font_scale_percent(), &current_transcript());
     display_html(&html);
 }
 
@@ -433,6 +480,7 @@ extern "C" fn on_script_message(_this: Id, _cmd: Sel, _controller: Id, message: 
                 }
                 "hierarchy" => open_class_browser(),
                 "workspace" => open_workspace(),
+                "canvas" => open_canvas(),
                 "refresh" => reload_current_page(),
                 "biggerText" => {
                     bump_font_scale(FONT_SCALE_STEP as i32);
@@ -537,6 +585,16 @@ extern "C" fn on_script_message(_this: Id, _cmd: Sel, _controller: Id, message: 
         "workspaceTextChanged" => {
             *WORKSPACE_TEXT.lock().unwrap() = Some(dict_get_string(body, "text"));
         }
+        "canvasRunDemo" => {
+            if let Some(vm) = VM.get() {
+                vm.submit(vm_host::VmRequest::CanvasRunDemo);
+            }
+        }
+        "canvasClear" => {
+            if let Some(vm) = VM.get() {
+                vm.submit(vm_host::VmRequest::CanvasClear);
+            }
+        }
         "editAction" => {
             send_edit_action(&dict_get_string(body, "action"));
         }
@@ -574,20 +632,17 @@ fn reload_current_page() {
 const NS_CONTROL_STATE_VALUE_ON: i64 = 1;
 const NS_CONTROL_STATE_VALUE_OFF: i64 = 0;
 
-/// Reflect the active theme as a checkmark on the two Theme-menu items.
+/// Reflect the active theme as a checkmark on every Theme-menu item.
 fn update_theme_menu_checkmarks() {
-    let Some((classic_item, hidef_item)) = THEME_MENU_ITEMS.get() else { return };
-    let is_hidef = current_theme() == Theme::HiDef;
-    objc::send1_i64(
-        classic_item.0,
-        sel("setState:"),
-        if is_hidef { NS_CONTROL_STATE_VALUE_OFF } else { NS_CONTROL_STATE_VALUE_ON },
-    );
-    objc::send1_i64(
-        hidef_item.0,
-        sel("setState:"),
-        if is_hidef { NS_CONTROL_STATE_VALUE_ON } else { NS_CONTROL_STATE_VALUE_OFF },
-    );
+    let Some(items) = THEME_MENU_ITEMS.get() else { return };
+    let current = current_theme();
+    for (theme, item) in items {
+        objc::send1_i64(
+            item.0,
+            sel("setState:"),
+            if *theme == current { NS_CONTROL_STATE_VALUE_ON } else { NS_CONTROL_STATE_VALUE_OFF },
+        );
+    }
 }
 
 extern "C" fn theme_menu_select_classic(_this: Id, _cmd: Sel, _sender: Id) {
@@ -598,6 +653,36 @@ extern "C" fn theme_menu_select_classic(_this: Id, _cmd: Sel, _sender: Id) {
 
 extern "C" fn theme_menu_select_hidef(_this: Id, _cmd: Sel, _sender: Id) {
     set_theme(Theme::HiDef);
+    update_theme_menu_checkmarks();
+    reload_current_page();
+}
+
+extern "C" fn theme_menu_select_dark(_this: Id, _cmd: Sel, _sender: Id) {
+    set_theme(Theme::Dark);
+    update_theme_menu_checkmarks();
+    reload_current_page();
+}
+
+extern "C" fn theme_menu_select_crt_amber(_this: Id, _cmd: Sel, _sender: Id) {
+    set_theme(Theme::CrtAmber);
+    update_theme_menu_checkmarks();
+    reload_current_page();
+}
+
+extern "C" fn theme_menu_select_crt_green(_this: Id, _cmd: Sel, _sender: Id) {
+    set_theme(Theme::CrtGreen);
+    update_theme_menu_checkmarks();
+    reload_current_page();
+}
+
+extern "C" fn theme_menu_select_squeak(_this: Id, _cmd: Sel, _sender: Id) {
+    set_theme(Theme::Squeak);
+    update_theme_menu_checkmarks();
+    reload_current_page();
+}
+
+extern "C" fn theme_menu_select_alto_mono(_this: Id, _cmd: Sel, _sender: Id) {
+    set_theme(Theme::AltoMono);
     update_theme_menu_checkmarks();
     reload_current_page();
 }
@@ -613,6 +698,11 @@ fn build_theme_delegate() -> Id {
     let cls = objc::allocate_class(objc::get_class("NSObject"), "MacvmThemeDelegate");
     objc::add_method(cls, sel("selectClassicTheme:"), theme_menu_select_classic as *const _, "v@:@");
     objc::add_method(cls, sel("selectHiDefTheme:"), theme_menu_select_hidef as *const _, "v@:@");
+    objc::add_method(cls, sel("selectDarkTheme:"), theme_menu_select_dark as *const _, "v@:@");
+    objc::add_method(cls, sel("selectCrtAmberTheme:"), theme_menu_select_crt_amber as *const _, "v@:@");
+    objc::add_method(cls, sel("selectCrtGreenTheme:"), theme_menu_select_crt_green as *const _, "v@:@");
+    objc::add_method(cls, sel("selectSqueakTheme:"), theme_menu_select_squeak as *const _, "v@:@");
+    objc::add_method(cls, sel("selectAltoMonoTheme:"), theme_menu_select_alto_mono as *const _, "v@:@");
     objc::register_class(cls);
     objc::alloc_init("MacvmThemeDelegate")
 }
@@ -685,6 +775,25 @@ extern "C" fn vm_bridge_drain(_this: Id, _cmd: Sel, _arg: Id) {
             }
             vm_host::VmResponse::WorkspacePrintResult { text } => {
                 eval_js(&format!("window.macvmInsertPrintResult({})", js_string_literal(&text)));
+            }
+            vm_host::VmResponse::CanvasCreated { id, width, height } => {
+                // The response is the authority on size, not the page's
+                // initial static guess (`canvas_render::render_canvas`) —
+                // keeps the `<canvas>` pixel buffer in sync if a future
+                // `Canvas extent:` ever requests a size other than the
+                // default this view opens with.
+                eval_js(&format!("window.macvmCanvasCreated({id}, {width}, {height})"));
+            }
+            vm_host::VmResponse::CanvasDraw { id, commands_json } => {
+                eval_js(&format!("window.macvmCanvasDraw({id}, {})", js_string_literal(&commands_json)));
+            }
+            vm_host::VmResponse::CanvasCleared { .. } => {
+                // No DOM action of its own — the paired `CanvasDraw`
+                // response (a `clearRect` batch, see `vm_host::handle`'s
+                // `CanvasClear` arm) already does the actual pixel clear.
+                // This variant exists for a future GUI-side content
+                // cache/replay-on-reopen (`../docs/CANVAS.md` §7) to
+                // invalidate against, not for anything the DOM needs today.
             }
         }
     }
@@ -789,27 +898,38 @@ fn build_menu_bar() {
     objc::send1_id(app, sel("setMainMenu:"), main_menu);
 }
 
-/// The Theme menu (`../PLAN.md` Theme menu): Classic (period-accurate
-/// bevels/pixel icons) vs Hi-Def (modern flat styling, vector icons) — see
-/// `preprocess::Theme`. Both items' target is explicitly set to a small
-/// delegate object rather than left `nil`, because `nil` dispatches through
-/// the responder chain looking for the selector, and nothing else in this
-/// app implements `selectClassicTheme:`/`selectHiDefTheme:`.
+/// The Theme menu (`../PLAN.md` Theme menu): `preprocess::Theme::ALL`,
+/// each paired with its own native action selector below. Every item's
+/// target is explicitly set to a small delegate object rather than left
+/// `nil`, because `nil` dispatches through the responder chain looking for
+/// the selector, and nothing else in this app implements any of these
+/// `selectXTheme:` actions.
 fn build_theme_menu() -> Id {
     let delegate = build_theme_delegate();
 
-    let classic_item = menu_item("Classic", Some("selectClassicTheme:"), "");
-    let hidef_item = menu_item("Hi-Def", Some("selectHiDefTheme:"), "");
-    objc::send1_id(classic_item, sel("setTarget:"), delegate);
-    objc::send1_id(hidef_item, sel("setTarget:"), delegate);
+    let actions: [(Theme, &str); 7] = [
+        (Theme::Classic, "selectClassicTheme:"),
+        (Theme::HiDef, "selectHiDefTheme:"),
+        (Theme::Dark, "selectDarkTheme:"),
+        (Theme::CrtAmber, "selectCrtAmberTheme:"),
+        (Theme::CrtGreen, "selectCrtGreenTheme:"),
+        (Theme::Squeak, "selectSqueakTheme:"),
+        (Theme::AltoMono, "selectAltoMonoTheme:"),
+    ];
 
-    THEME_MENU_ITEMS
-        .set((MainThreadPtr(classic_item), MainThreadPtr(hidef_item)))
-        .ok()
-        .expect("build_theme_menu called twice");
+    let mut checkmark_entries = Vec::with_capacity(actions.len());
+    let mut menu_items = Vec::with_capacity(actions.len());
+    for (theme, action) in actions {
+        let item = menu_item(theme.menu_label(), Some(action), "");
+        objc::send1_id(item, sel("setTarget:"), delegate);
+        checkmark_entries.push((theme, MainThreadPtr(item)));
+        menu_items.push(item);
+    }
+
+    THEME_MENU_ITEMS.set(checkmark_entries).ok().expect("build_theme_menu called twice");
     update_theme_menu_checkmarks();
 
-    submenu("Theme", &[classic_item, hidef_item])
+    submenu("Theme", &menu_items)
 }
 
 // ── Window + WKWebView ─────────────────────────────────────────────────────

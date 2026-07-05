@@ -379,6 +379,81 @@
     input.dispatchEvent(new Event("input", { bubbles: true }));
   };
 
+  // ── Canvas (canvas_render.rs, ../docs/CANVAS.md) ───────────────────────
+  //
+  // "Run Demo"/"Clear" stand in for a real Smalltalk `Canvas` send the same
+  // way Workspace's Do it/Print it stand in for real evaluation above —
+  // they round-trip through vm_host's mock world (VmRequest::CanvasRunDemo/
+  // CanvasClear) rather than drawing directly in JS, so the whole pipeline
+  // gets exercised for real every time, not just the rendering half of it.
+
+  document.addEventListener(
+    "click",
+    function (ev) {
+      const runDemoBtn = ev.target.closest('[data-canvas-action="run-demo"]');
+      if (runDemoBtn) {
+        ev.preventDefault();
+        post({ kind: "canvasRunDemo" });
+        return;
+      }
+      const clearBtn = ev.target.closest('[data-canvas-action="clear"]');
+      if (clearBtn) {
+        ev.preventDefault();
+        post({ kind: "canvasClear" });
+      }
+    },
+    true
+  );
+
+  // The wire format (docs/CANVAS.md §5.2): a JSON array of
+  // `[opName, ...args]` entries. Two explicit allowlists, checked before
+  // touching `ctx` at all — an unrecognized op name is a clean, logged
+  // no-op rather than a thrown exception or (worse) blindly indexing into
+  // the canvas context with a bug/attacker-controlled string.
+  const CANVAS_METHODS = new Set([
+    "beginPath", "closePath", "moveTo", "lineTo", "rect", "arc", "arcTo",
+    "quadraticCurveTo", "bezierCurveTo", "fill", "stroke", "clip",
+    "fillRect", "strokeRect", "clearRect", "fillText", "strokeText",
+    "save", "restore", "translate", "rotate", "scale", "resetTransform",
+  ]);
+  const CANVAS_PROPERTIES = new Set([
+    "fillStyle", "strokeStyle", "lineWidth", "lineCap", "lineJoin", "font",
+    "textAlign", "textBaseline", "globalAlpha",
+  ]);
+
+  // vm_host::VmResponse::CanvasDraw arrives here (main.rs).
+  window.macvmCanvasDraw = function (id, commandsJson) {
+    const canvas = document.getElementById("macvm-canvas-" + id);
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    let commands;
+    try {
+      commands = JSON.parse(commandsJson);
+    } catch (e) {
+      console.warn("macvm canvas: malformed commands JSON", e);
+      return;
+    }
+    for (const cmd of commands) {
+      const name = cmd[0];
+      const args = cmd.slice(1);
+      if (CANVAS_METHODS.has(name)) ctx[name](...args);
+      else if (CANVAS_PROPERTIES.has(name)) ctx[name] = args[0];
+      else console.warn("macvm canvas: unknown op", name);
+    }
+  };
+
+  // vm_host::VmResponse::CanvasCreated arrives here (main.rs). The response
+  // is the authority on size, not this page's own initial static guess
+  // (canvas_render::render_canvas) — keeps the <canvas> element's actual
+  // pixel-buffer dimensions (its width/height attributes, not CSS size) in
+  // sync if a future request ever asks for a size other than the default.
+  window.macvmCanvasCreated = function (id, width, height) {
+    const canvas = document.getElementById("macvm-canvas-" + id);
+    if (!canvas) return;
+    canvas.width = width;
+    canvas.height = height;
+  };
+
   // ── Context menu takeover ───────────────────────────────────────────────
   //
   // WKWebView's own default right-click menu is generic web-browser chrome

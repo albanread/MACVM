@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "gui-assets-static",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": ["-m", "http.server", "8917", "--directory", "gui/assets"],
+      "port": 8917
+    }
+  ]
+}

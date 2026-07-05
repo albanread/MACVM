@@ -164,6 +164,20 @@ pub enum VmRequest {
     /// shaped to become a near-direct caller of it, not a stand-in that'll
     /// need reshaping later.
     WorkspacePrintIt { code: String },
+    /// "Smalltalk allocates a widget of a specific size" (`docs/CANVAS.md`
+    /// §5.1) — stands in for a real `Canvas extent: w @ h` send (no VM-side
+    /// primitive exists yet, same "prove the wire mechanics, don't
+    /// simulate evaluation" posture as `WorkspacePrintIt`). Always
+    /// (re)creates the single `id: 0` canvas — multiple simultaneous
+    /// canvases are deferred (`docs/CANVAS.md` §7).
+    CanvasCreate { width: u32, height: u32 },
+    /// The Canvas view's (`canvas_render.rs`, `../../docs/CANVAS.md`)
+    /// "Run Demo" button — same stand-in posture as `CanvasCreate`.
+    CanvasRunDemo,
+    /// Clears the canvas — a single `clearRect` batch, not a separate
+    /// code path (`docs/CANVAS.md` §5.3: "full redraw" is a command-batch
+    /// convention, not a different channel).
+    CanvasClear,
 }
 
 /// VM → GUI. `Transcript` is what the G1 stub host already produces.
@@ -201,6 +215,17 @@ pub enum VmResponse {
     /// rather than routing it to the transcript (`smtk.js`'s
     /// `macvmInsertPrintResult`).
     WorkspacePrintResult { text: String },
+    /// Answers `CanvasCreate` — `main.rs` (re)sets the `<canvas>` element's
+    /// `width`/`height` attributes (which, per the HTML5 canvas spec,
+    /// clears its content as a side effect — matches "allocate a widget of
+    /// a specific size" reading as a fresh surface, not a resize-in-place).
+    CanvasCreated { id: u32, width: u32, height: u32 },
+    /// Answers `CanvasRunDemo` — `commands_json` is a JSON array of
+    /// `[opName, ...args]` (`docs/CANVAS.md` §5.2), executed by
+    /// `smtk.js`'s `macvmCanvasDraw` against a real `CanvasRenderingContext2D`.
+    CanvasDraw { id: u32, commands_json: String },
+    /// Answers `CanvasClear`.
+    CanvasCleared { id: u32 },
 }
 
 /// `Id`/`Sel` are raw pointers, not `Send` by default. Safe to send into the
@@ -668,7 +693,124 @@ fn handle(request: VmRequest, world: &mut MockWorld, selection: &mut BrowserSele
             let text = format!(" \"(no VM yet: {code})\"");
             vec![VmResponse::WorkspacePrintResult { text }]
         }
+        VmRequest::CanvasCreate { width, height } => {
+            vec![VmResponse::CanvasCreated { id: CANVAS_ID, width, height }]
+        }
+        VmRequest::CanvasRunDemo => {
+            vec![VmResponse::CanvasDraw { id: CANVAS_ID, commands_json: canvas_demo_commands().to_json() }]
+        }
+        VmRequest::CanvasClear => {
+            let mut cmds = CanvasCommands::new();
+            cmds.call("clearRect", &[0.0.into(), 0.0.into(), 10_000.0.into(), 10_000.0.into()]);
+            vec![VmResponse::CanvasCleared { id: CANVAS_ID }, VmResponse::CanvasDraw { id: CANVAS_ID, commands_json: cmds.to_json() }]
+        }
     }
+}
+
+/// v1's only canvas (`docs/CANVAS.md` §7: multiple canvases deferred).
+const CANVAS_ID: u32 = 0;
+
+/// A small ergonomic builder for a canvas command batch
+/// (`VmResponse::CanvasDraw`'s `commands_json`, `docs/CANVAS.md` §5.2) —
+/// stands in for how the real Smalltalk-side `Canvas` would accumulate
+/// calls before flushing (§3), just in Rust for the demo/test path here.
+/// Hand-writes JSON directly rather than pulling in a serde dependency
+/// for a handful of numbers and strings.
+#[derive(Default)]
+pub struct CanvasCommands {
+    commands: Vec<String>,
+}
+
+/// One command argument — canvas ops take a mix of numbers (coordinates,
+/// widths) and strings (colors, fonts, text), so a single `call` needs a
+/// heterogeneous arg list rather than separate numeric/string methods.
+pub enum CanvasArg {
+    Num(f64),
+    Str(String),
+}
+
+impl From<f64> for CanvasArg {
+    fn from(v: f64) -> Self {
+        CanvasArg::Num(v)
+    }
+}
+
+impl From<&str> for CanvasArg {
+    fn from(v: &str) -> Self {
+        CanvasArg::Str(v.to_string())
+    }
+}
+
+impl CanvasCommands {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// `name` is either a `CanvasRenderingContext2D` method (called as
+    /// `ctx[name](...args)`) or a property (assigned as `ctx[name] =
+    /// args[0]`) — `smtk.js`'s `macvmCanvasDraw` decides which via its own
+    /// two allowlists; this builder doesn't need to know which is which.
+    pub fn call(&mut self, name: &str, args: &[CanvasArg]) -> &mut Self {
+        let mut parts = vec![json_string(name)];
+        for a in args {
+            parts.push(match a {
+                CanvasArg::Num(n) => n.to_string(),
+                CanvasArg::Str(s) => json_string(s),
+            });
+        }
+        self.commands.push(format!("[{}]", parts.join(",")));
+        self
+    }
+
+    pub fn to_json(&self) -> String {
+        format!("[{}]", self.commands.join(","))
+    }
+}
+
+/// Minimal JSON string escaping — only what this fixed command/color/text
+/// vocabulary ever actually needs (quotes, backslashes), not a general-
+/// purpose JSON encoder.
+fn json_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            _ => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// "Run Demo"'s fixed content — a filled rectangle, a stroked circle, a
+/// line, and a text label, deliberately exercising one op from each
+/// vocabulary group (`docs/CANVAS.md` §5.2: paint, path, state/transform,
+/// text, properties) so a visual check of this one demo is a real check
+/// of the whole interpreter, not just one code path through it.
+fn canvas_demo_commands() -> CanvasCommands {
+    let mut c = CanvasCommands::new();
+    c.call("clearRect", &[0.0.into(), 0.0.into(), 10_000.0.into(), 10_000.0.into()]);
+    c.call("fillStyle", &["steelblue".into()]);
+    c.call("fillRect", &[20.0.into(), 20.0.into(), 120.0.into(), 80.0.into()]);
+    c.call("strokeStyle", &["crimson".into()]);
+    c.call("lineWidth", &[3.0.into()]);
+    c.call("beginPath", &[]);
+    c.call("arc", &[220.0.into(), 60.0.into(), 40.0.into(), 0.0.into(), (std::f64::consts::PI * 2.0).into()]);
+    c.call("stroke", &[]);
+    c.call("save", &[]);
+    c.call("strokeStyle", &["seagreen".into()]);
+    c.call("lineWidth", &[2.0.into()]);
+    c.call("beginPath", &[]);
+    c.call("moveTo", &[20.0.into(), 140.0.into()]);
+    c.call("lineTo", &[300.0.into(), 140.0.into()]);
+    c.call("stroke", &[]);
+    c.call("restore", &[]);
+    c.call("fillStyle", &["#222".into()]);
+    c.call("font", &["16px sans-serif".into()]);
+    c.call("fillText", &["MACVM Canvas".into(), 20.0.into(), 175.0.into()]);
+    c
 }
 
 fn render_browser_panes(world: &MockWorld, selection: &BrowserSelection) -> VmResponse {
@@ -859,6 +1001,57 @@ mod tests {
             .expect("expected a transcript message");
         assert!(!message.contains("(persisted to image)"), "{message}");
         assert!(message.contains("failed to persist"), "{message}");
+    }
+
+    #[test]
+    fn canvas_commands_builds_a_json_array_of_op_arrays() {
+        let mut cmds = CanvasCommands::new();
+        cmds.call("beginPath", &[]);
+        cmds.call("lineTo", &[20.0.into(), 140.0.into()]);
+        cmds.call("fillStyle", &["steelblue".into()]);
+        assert_eq!(cmds.to_json(), r#"[["beginPath"],["lineTo",20,140],["fillStyle","steelblue"]]"#);
+    }
+
+    #[test]
+    fn json_string_escapes_quotes_and_backslashes() {
+        assert_eq!(json_string("plain"), "\"plain\"");
+        assert_eq!(json_string(r#"say "hi" \ ok"#), r#""say \"hi\" \\ ok""#);
+    }
+
+    #[test]
+    fn canvas_create_echoes_back_the_requested_size_under_the_fixed_v1_id() {
+        let mut world = MockWorld::seed();
+        let mut selection = BrowserSelection::default();
+        let responses = handle(VmRequest::CanvasCreate { width: 640, height: 480 }, &mut world, &mut selection, None);
+        assert!(matches!(responses.as_slice(), [VmResponse::CanvasCreated { id: 0, width: 640, height: 480 }]));
+    }
+
+    #[test]
+    fn canvas_run_demo_returns_one_nonempty_draw_batch_for_the_fixed_canvas() {
+        let mut world = MockWorld::seed();
+        let mut selection = BrowserSelection::default();
+        let responses = handle(VmRequest::CanvasRunDemo, &mut world, &mut selection, None);
+        let [VmResponse::CanvasDraw { id, commands_json }] = responses.as_slice() else {
+            panic!("expected exactly one CanvasDraw response");
+        };
+        assert_eq!(*id, 0);
+        assert!(commands_json.starts_with('[') && commands_json.ends_with(']'), "{commands_json}");
+        assert!(commands_json.contains("fillRect"), "{commands_json}");
+        assert!(commands_json.contains("MACVM Canvas"), "{commands_json}");
+    }
+
+    #[test]
+    fn canvas_clear_answers_cleared_then_a_full_canvas_clear_rect_batch() {
+        let mut world = MockWorld::seed();
+        let mut selection = BrowserSelection::default();
+        let responses = handle(VmRequest::CanvasClear, &mut world, &mut selection, None);
+        let [VmResponse::CanvasCleared { id: cleared_id }, VmResponse::CanvasDraw { id: draw_id, commands_json }] = responses.as_slice()
+        else {
+            panic!("expected [CanvasCleared, CanvasDraw]");
+        };
+        assert_eq!(*cleared_id, 0);
+        assert_eq!(*draw_id, 0);
+        assert!(commands_json.contains("clearRect"), "{commands_json}");
     }
 
     #[test]

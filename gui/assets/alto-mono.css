@@ -1,0 +1,307 @@
+/* alto-mono.css — the "Alto Mono" theme (Theme menu, src/preprocess.rs's
+   `Theme`): the earliest era — Xerox PARC's Alto/Star, where Smalltalk
+   itself was born (1970s-early 80s), on displays that only had two
+   colors at all. Stark black-on-white, zero shadows/gradients/bevels,
+   sharp square corners everywhere, thin solid hairline borders. "Active"/
+   "selected" states are shown by INVERTING (black background, white
+   text) rather than an accent color — an authentic period technique,
+   not an invented one: a monochrome bitmap display had no other way to
+   show selection. Distinct from Classic (strongtalk.css), which recreates
+   a LATER (1996) era's color, bevels, and pixel icons — this instead
+   removes color and depth entirely. */
+
+:root {
+  --hd-bg: #ffffff;
+  --hd-surface: #ffffff;
+  --hd-chrome: #ffffff;
+  --hd-border: #000000;
+  --hd-text: #000000;
+  --hd-text-muted: #555555;
+  --hd-accent: #000000;           /* no color accent in this era — emphasis is weight/invert, not hue */
+  --hd-accent-soft: #000000;       /* used only as the INVERTED background (see .active rules) */
+  --hd-danger: #000000;           /* likewise: danger is marked by a label, not a color */
+
+  --hd-space-1: 4px;
+  --hd-space-2: 8px;
+  --hd-space-3: 14px;
+
+  --hd-font-body: Georgia, 'Times New Roman', Times, serif;
+  --hd-font-code: 'SF Mono', Menlo, Consolas, monospace;
+  --hd-size-body: 16px;
+  --hd-size-code: 13.5px;
+
+  --hd-page-width: 750px;
+  --hd-page-left-margin: 30px;
+  --hd-radius: 0px;                /* bitmap-era UI: no rounded anything */
+}
+
+html, body {
+  overscroll-behavior: none;
+}
+body {
+  margin: 0;
+  background: var(--hd-bg);
+  color: var(--hd-text);
+  font-family: var(--hd-font-body);
+  font-size: var(--hd-size-body);
+  line-height: 1.5;
+}
+.st-page {
+  max-width: var(--hd-page-width);
+  padding: var(--hd-space-2) var(--hd-space-3) var(--hd-space-3) var(--hd-page-left-margin);
+}
+
+h1, h2, h3, h4, h5, h6 { font-family: var(--hd-font-body); font-weight: 700; letter-spacing: 0; }
+h1 { font-size: 28px; border-bottom: 2px solid var(--hd-border); padding-bottom: 4px; }
+h2 { font-size: 22px; }
+h3 { font-size: 18px; }
+h4 { font-size: 15.5px; }
+h5 { font-size: 15px; }
+h6 { font-size: 13px; color: var(--hd-text-muted); }
+
+a, a.doit { color: var(--hd-text); text-decoration: underline; cursor: default; }
+a:hover, a.doit:hover { background: var(--hd-text); color: var(--hd-bg); }
+a:visited { color: var(--hd-text); }
+
+pre, code, .st-code {
+  font-family: var(--hd-font-code);
+  font-size: var(--hd-size-code);
+}
+
+ul { list-style-type: none; padding-left: 0; }
+ul li { position: relative; padding-left: 16px; margin: var(--hd-space-1) 0; }
+ul li::before {
+  content: "-";
+  position: absolute; left: 2px; top: 0;
+}
+
+/* ---- "raised"/"lowered": here, just a hairline rule, no depth at all ---- */
+.st-raised {
+  background: var(--hd-chrome);
+  border-bottom: 1px solid var(--hd-border);
+}
+.st-lowered {
+  background: var(--hd-surface);
+  border: 1px solid var(--hd-border);
+}
+
+/* ---- chrome: toolbar / status bar / transcript ---- */
+.st-toolbar {
+  display: flex;
+  align-items: center;
+  gap: var(--hd-space-2);
+  padding: var(--hd-space-2) var(--hd-space-3);
+  border-bottom: 1px solid var(--hd-border);
+}
+.st-toolbar button {
+  width: 32px; height: 32px;
+  padding: 4px;
+  background: var(--hd-surface);
+  border: 1px solid var(--hd-border);
+  border-radius: 0;
+  font-family: var(--hd-font-body);
+}
+.st-toolbar button:hover {
+  background: var(--hd-text);
+}
+.st-toolbar button:hover img {
+  filter: invert(1);
+}
+.st-toolbar button:active {
+  background: var(--hd-text-muted);
+}
+.st-toolbar button img, .st-icon {
+  image-rendering: auto;
+  width: 22px; height: 22px;
+  /* Flattens the (blue/red-accented) hidef icon set to pure black-and-
+     white line art — no color at all in this era's display hardware. */
+  filter: grayscale(1) contrast(3) brightness(0.9);
+}
+
+.st-statusbar {
+  font-family: var(--hd-font-body);
+  font-size: 12.5px;
+  color: var(--hd-text-muted);
+  padding: 6px var(--hd-space-3);
+  border-top: 1px solid var(--hd-border);
+}
+.st-statusbar .st-field {
+  display: inline-block;
+  padding: 2px var(--hd-space-2);
+  border: 1px solid var(--hd-border);
+}
+
+.st-transcript {
+  font-family: var(--hd-font-code);
+  font-size: var(--hd-size-code);
+  padding: var(--hd-space-2) var(--hd-space-3);
+  overflow: auto;
+  overscroll-behavior: contain;
+  margin: 0 var(--hd-space-3);
+  white-space: pre-wrap;
+  border: 1px solid var(--hd-border);
+}
+
+/* ---- smappl placeholder (G0, inert) ---- */
+.smappl {
+  display: inline-block;
+  background: var(--hd-surface);
+  color: var(--hd-text);
+  font-family: var(--hd-font-code);
+  font-size: var(--hd-size-code);
+  padding: var(--hd-space-1) var(--hd-space-2);
+  border: 1px solid var(--hd-border);
+}
+
+/* ---- outliner (G3) ---- */
+.st-outliner { font-family: var(--hd-font-body); }
+.st-outliner .st-node { margin-left: 15px; }
+.st-outliner .st-toggle {
+  vertical-align: middle;
+  margin-right: var(--hd-space-1);
+}
+.st-outliner .st-header {
+  background: var(--hd-surface);
+  border: 1px solid var(--hd-border);
+  padding: 2px var(--hd-space-2);
+}
+.st-outliner .st-superclass { font-weight: normal; color: var(--hd-text-muted); }
+.st-outliner .st-class { font-weight: 700; }
+
+/* ---- workspace tool (src/workspace_render.rs) ---- */
+.st-workspace { display: flex; flex-direction: column; height: calc(100vh - 130px); }
+.st-workspace-editor {
+  flex: 1;
+  min-height: 0;
+  margin-top: var(--hd-space-2);
+  border: 1px solid var(--hd-border);
+  background: var(--hd-surface);
+}
+
+/* ---- class browser view (G3 mock, src/browser_render.rs) ---- */
+.st-browser { display: flex; flex-direction: column; height: calc(100vh - 130px); }
+.st-browser-lists { display: flex; flex-direction: row; flex: 2; min-height: 0; gap: 1px; background: var(--hd-border); }
+.st-browser-pane {
+  flex: 1;
+  overflow: auto;
+  overscroll-behavior: contain;
+  background: var(--hd-surface);
+  font-family: var(--hd-font-body);
+  font-size: 14px;
+}
+.st-browser-item { padding: 3px 8px; white-space: nowrap; cursor: default; }
+.st-browser-item.active { background: var(--hd-text); color: var(--hd-bg); }
+.st-browser-side-tabs {
+  display: flex;
+  background: var(--hd-surface);
+  border-bottom: 1px solid var(--hd-border);
+}
+.st-browser-side-tab {
+  flex: 1;
+  text-align: center;
+  padding: 4px 0;
+  font-size: 12.5px;
+  color: var(--hd-text-muted);
+  cursor: default;
+}
+.st-browser-side-tab.active { color: var(--hd-text); font-weight: 700; text-decoration: underline; }
+.st-browser-source {
+  flex: 1;
+  min-height: 0;
+  margin-top: var(--hd-space-2);
+  border: 1px solid var(--hd-border);
+  background: var(--hd-surface);
+}
+/* ---- class browser create/remove actions ---- */
+.st-browser-action-row {
+  position: sticky;
+  bottom: 0;
+  padding: var(--hd-space-2);
+  border-top: 1px solid var(--hd-border);
+  background: var(--hd-surface);
+}
+.st-browser-new-button, .st-browser-danger-button {
+  font-family: var(--hd-font-body);
+  font-size: 12.5px;
+  padding: 4px 10px;
+  background: var(--hd-surface);
+  color: var(--hd-text);
+  border: 1px solid var(--hd-border);
+  border-radius: 0;
+  cursor: default;
+}
+.st-browser-new-button:hover { background: var(--hd-text); color: var(--hd-bg); }
+.st-browser-danger-button { font-weight: 700; }
+.st-browser-danger-button:hover { background: var(--hd-text); color: var(--hd-bg); }
+.st-remove-row .st-confirm-strip:not([hidden]) {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--hd-space-1);
+  margin-left: var(--hd-space-2);
+  color: var(--hd-text-muted);
+  font-size: 12.5px;
+}
+.st-code-editor { position: relative; height: 100%; }
+.st-code-highlight, .st-code-input {
+  position: absolute;
+  inset: 0;
+  margin: 0;
+  box-sizing: border-box;
+  font-family: var(--hd-font-code);
+  font-size: var(--hd-size-code);
+  line-height: 1.4;
+  tab-size: 4;
+  letter-spacing: normal;
+  padding: var(--hd-space-2);
+  white-space: pre-wrap;
+  word-wrap: break-word;
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+.st-code-input {
+  appearance: none;
+  -webkit-appearance: none;
+  color: transparent;
+  background: transparent;
+  border: none;
+  resize: none;
+  caret-color: var(--hd-text);
+  z-index: 2;
+}
+.st-code-highlight {
+  z-index: 1;
+  pointer-events: none;
+  color: var(--hd-text);
+}
+/* No syntax color in this era — weight/style/underline substitute for
+   hue, matching a two-tone bitmap display's actual constraints. */
+.st-tok-comment { color: var(--hd-text-muted); font-style: italic; }
+.st-tok-string { text-decoration: underline; }
+.st-tok-symbol { font-style: italic; }
+.st-tok-keyword { font-weight: 700; }
+.st-tok-pseudo { font-weight: 700; text-decoration: underline; }
+.st-tok-number { font-weight: 700; }
+
+/* ---- custom context menu (smtk.js — replaces WKWebView's native one) ---- */
+.st-context-menu {
+  position: fixed;
+  z-index: 1000;
+  min-width: 150px;
+  padding: 0;
+  background: var(--hd-surface);
+  border: 1px solid var(--hd-border);
+  box-shadow: 2px 2px 0 var(--hd-border);
+  font-family: var(--hd-font-body);
+  font-size: 13.5px;
+}
+.st-context-menu-item { padding: 6px 10px; cursor: default; }
+.st-context-menu-item:hover { background: var(--hd-text); color: var(--hd-bg); }
+
+/* ---- scrollbars ---- */
+::-webkit-scrollbar { width: 14px; height: 14px; background: var(--hd-surface); }
+::-webkit-scrollbar-thumb {
+  background: var(--hd-text-muted);
+  border: 1px solid var(--hd-border);
+}
+::-webkit-scrollbar-thumb:hover { background: var(--hd-text); }
+::-webkit-scrollbar-button { width: 0; height: 0; display: none; }

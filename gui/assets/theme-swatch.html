@@ -1,0 +1,67 @@
+<!-- theme-swatch.html — a throwaway visual-verification page, NOT part of
+     the app itself: exercises the same class names every theme styles
+     (.st-toolbar, .st-browser-item.active, .st-tok-*, buttons, headings,
+     links) so a new theme's CSS can be checked by loading this file with
+     ?theme=dark.css (etc.) instead of driving the real native app, which
+     computer-use tools can't attach to (no .app bundle registration). -->
+<div class="st-page">
+  <div class="st-raised st-toolbar">
+    <button><img src="icons-hidef/home.svg" alt="home"></button>
+    <button><img src="icons-hidef/find.svg" alt="find"></button>
+    <button><img src="icons-hidef/edit.svg" alt="edit"></button>
+  </div>
+
+  <h1>MACVM Class Browser</h1>
+  <h2>A Second-Level Heading</h2>
+  <p>Some body text with a <a href="#" class="doit">doit link</a> and a plain <a href="#">link</a>.</p>
+
+  <div class="st-browser">
+    <div class="st-browser-lists">
+      <div class="st-browser-pane">
+        <div class="st-browser-item active">OrderedCollection</div>
+        <div class="st-browser-item">Dictionary</div>
+        <div class="st-browser-item">Set</div>
+        <div class="st-browser-item">Bag</div>
+      </div>
+      <div class="st-browser-pane">
+        <div class="st-browser-side-tabs">
+          <div class="st-browser-side-tab active">instance</div>
+          <div class="st-browser-side-tab">class</div>
+        </div>
+        <div class="st-browser-item">add:</div>
+        <div class="st-browser-item active">removeFirst</div>
+      </div>
+    </div>
+    <div class="st-browser-source">
+      <div class="st-code-editor">
+        <pre class="st-code-highlight"><span class="st-tok-comment">"a comment"</span>
+<span class="st-tok-keyword">removeFirst</span> [
+    | v |
+    self isEmpty ifTrue: [ ^<span class="st-tok-symbol">#empty</span> ].
+    v := array at: <span class="st-tok-number">1</span>.
+    ^v
+]</pre>
+      </div>
+    </div>
+    <div class="st-browser-action-row">
+      <button class="st-browser-new-button">+ New Method</button>
+      <button class="st-browser-danger-button">Remove</button>
+    </div>
+  </div>
+
+  <div class="st-raised st-transcript">Transcript output line one.
+Transcript output line two.</div>
+
+  <div class="st-raised st-statusbar">
+    <span class="st-field">Ready</span>
+  </div>
+</div>
+<script>
+  // ?theme=dark.css (etc.) picks the stylesheet at load time, so one
+  // static file can preview every theme without duplicating the markup.
+  const theme = new URLSearchParams(location.search).get('theme') || 'hidef.css';
+  const link = document.createElement('link');
+  link.rel = 'stylesheet';
+  link.href = theme;
+  document.head.appendChild(link);
+</script>

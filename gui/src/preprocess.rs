@@ -12,12 +12,18 @@
 
 use std::path::Path;
 
-/// The two visual themes the shell's native Theme menu can switch between
-/// (`main.rs::build_theme_menu`). Both themes reuse the exact same class
+/// The visual themes the shell's native Theme menu can switch between
+/// (`main.rs::build_theme_menu`). Every theme reuses the exact same class
 /// names (`.st-toolbar`, `.st-raised`, `.st-lowered`, `.st-transcript`,
 /// `.st-statusbar`, `.st-field`, `.smappl`, `.st-outliner`, …) — see
 /// `assets/hidef.css`'s own doc comment — so switching is just "load a
 /// different stylesheet and a different icon set," never a template change.
+/// `Classic` is the one genuinely different structural design (its own
+/// PNG icon set, Win95 bevels); every other non-`HiDef` theme is a color/
+/// font reskin of `hidef.css`'s exact structure, reusing its SVG icon set
+/// (`assets/icons-hidef/`) — for the CRT/monochrome themes, recolored via
+/// a CSS `filter` in that theme's own stylesheet rather than needing
+/// dedicated icon assets (see e.g. `assets/crt-amber.css`'s own comment).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Theme {
     /// The period-accurate Strongtalk (1996) look — `../PLAN.md` §2.
@@ -26,20 +32,63 @@ pub enum Theme {
     /// because the pixel-art/Win95 chrome is true to the original but reads
     /// as dated for extended use; same layout and semantics, just restyled.
     HiDef,
+    /// Modern dark mode — `assets/dark.css`.
+    Dark,
+    /// 1970s-80s amber-phosphor terminal — `assets/crt-amber.css`.
+    CrtAmber,
+    /// 1970s-80s green-phosphor terminal — `assets/crt-green.css`.
+    CrtGreen,
+    /// Squeak's playful, colorful 1996+ Morphic look — `assets/squeak.css`.
+    Squeak,
+    /// Xerox Alto/Star, the monochrome bitmap-display era Smalltalk itself
+    /// was born on (1970s-early 80s) — `assets/alto-mono.css`.
+    AltoMono,
 }
 
 impl Theme {
+    /// Every variant, in native Theme-menu display order — the single
+    /// source of truth `main.rs::build_theme_menu` walks to build the menu
+    /// and the checkmark list, so adding a theme never means updating two
+    /// separate lists by hand.
+    pub const ALL: [Theme; 7] = [
+        Theme::Classic,
+        Theme::HiDef,
+        Theme::Dark,
+        Theme::CrtAmber,
+        Theme::CrtGreen,
+        Theme::Squeak,
+        Theme::AltoMono,
+    ];
+
+    /// Native Theme-menu label.
+    pub fn menu_label(self) -> &'static str {
+        match self {
+            Theme::Classic => "Classic",
+            Theme::HiDef => "Hi-Def",
+            Theme::Dark => "Dark",
+            Theme::CrtAmber => "CRT Amber",
+            Theme::CrtGreen => "CRT Green",
+            Theme::Squeak => "Squeak Morphic",
+            Theme::AltoMono => "Alto Mono",
+        }
+    }
+
     fn stylesheet_relative_path(self) -> &'static str {
         match self {
             Theme::Classic => "assets/strongtalk.css",
             Theme::HiDef => "assets/hidef.css",
+            Theme::Dark => "assets/dark.css",
+            Theme::CrtAmber => "assets/crt-amber.css",
+            Theme::CrtGreen => "assets/crt-green.css",
+            Theme::Squeak => "assets/squeak.css",
+            Theme::AltoMono => "assets/alto-mono.css",
         }
     }
 
     fn icon_url(self, icon: &str) -> String {
         match self {
             Theme::Classic => gui_file_url(&format!("reference/icons-png/{icon}.png")),
-            Theme::HiDef => gui_file_url(&format!("assets/icons-hidef/{icon}.svg")),
+            _ => gui_file_url(&format!("assets/icons-hidef/{icon}.svg")),
         }
     }
 }
@@ -163,6 +212,7 @@ const TOOLBAR_BUTTONS: &[(&str, &str, &str)] = &[
     ("blankSheet", "workspace", "Workspace"),
     ("texteditor", "editor", "Text editor"),
     ("documentation", "documentation", "Documentation"),
+    ("abstract", "canvas", "Canvas"),
     // G5 polish items (`../PLAN.md` §4 G5) — not part of the documented
     // nine either, same judgment call as goBack/goForward/home above.
     ("refresh", "refresh", "Refresh"),
@@ -363,6 +413,36 @@ mod tests {
         assert!(classic_toolbar.contains("reference/icons-png/home.png"), "{classic_toolbar}");
         let hidef_toolbar = toolbar_html(Theme::HiDef);
         assert!(hidef_toolbar.contains("assets/icons-hidef/home.svg"), "{hidef_toolbar}");
+    }
+
+    /// The five newer themes: each resolves to its own stylesheet, and —
+    /// since only `Classic` has its own icon set — every one of them
+    /// reuses HiDef's SVG icons (recolored via CSS `filter` in the CRT/
+    /// monochrome themes' own stylesheets, not a different icon set).
+    #[test]
+    fn newer_themes_pick_their_own_stylesheet_but_share_hidef_icons() {
+        let cases: [(Theme, &str); 5] = [
+            (Theme::Dark, "assets/dark.css"),
+            (Theme::CrtAmber, "assets/crt-amber.css"),
+            (Theme::CrtGreen, "assets/crt-green.css"),
+            (Theme::Squeak, "assets/squeak.css"),
+            (Theme::AltoMono, "assets/alto-mono.css"),
+        ];
+        for (theme, expected_css) in cases {
+            let head = chrome_head_extra(Path::new("."), theme, 100);
+            assert!(head.contains(expected_css), "{theme:?}: {head}");
+            let toolbar = toolbar_html(theme);
+            assert!(toolbar.contains("assets/icons-hidef/home.svg"), "{theme:?}: {toolbar}");
+        }
+    }
+
+    #[test]
+    fn theme_all_has_no_duplicate_stylesheets_and_matches_its_own_length() {
+        assert_eq!(Theme::ALL.len(), 7);
+        let mut paths: Vec<&str> = Theme::ALL.iter().map(|t| t.stylesheet_relative_path()).collect();
+        paths.sort_unstable();
+        paths.dedup();
+        assert_eq!(paths.len(), Theme::ALL.len(), "every theme must have a distinct stylesheet");
     }
 
     #[test]

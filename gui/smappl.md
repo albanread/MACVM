@@ -11,6 +11,19 @@ This document doesn't change any decision already on record in `PLAN.md` or
 `APPS.md` — it supplies the exact source citations and the full vocabulary
 catalog neither of those docs spells out yet, and slots in underneath them.
 
+**Related but distinct: the Canvas widget** (`../docs/CANVAS.md`). Both are
+ultimately "Smalltalk controls something embedded in the page," but the
+shapes are opposite. `smappl` evaluates `visual=` **once**, at render
+time, embedding a static result — cached and reused across relayouts (§2
+below), but never re-evaluated on its own after that. Canvas is a
+long-lived widget that keeps receiving **new** drawing commands over
+time — an animation, a live diagram, incremental redraws — pushed over
+the same batched VM↔GUI channel `smappl`'s own G2+ evaluator will
+eventually use (§6). Treat this document's vocabulary (§3) as the
+"one-shot widget" side of Smalltalk-embedded content; Canvas is the
+"continuous/animated" side — not a `smappl` variant, and not reachable
+through any of §3's six shapes.
+
 ## 1. What "smappl" means
 
 No `.dlt` comment anywhere expands the name — it's assumed knowledge in the
