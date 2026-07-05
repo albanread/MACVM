@@ -183,6 +183,20 @@ pub fn install_method(vm: &mut VmState, klass: KlassOop, selector: SymbolOop, m:
         vm.ic_epoch < (1 << crate::oops::layout::IC_META_EPOCH_BITS),
         "install_method: ic_epoch wrapped past 24 bits"
     );
+
+    // S13 D1: redefinition invalidation. Any compiled method that assumed
+    // `lookup(K', selector)` — where `K'` is `klass` itself or a subclass
+    // whose own compiled `(K', selector)` now resolves to a different method —
+    // is made `NotEntrant` and its in-flight frames redirected to deopt on
+    // return. On a *first* install of `selector` there is no such nmethod, so
+    // this no-ops. Runs LAST, after every allocation above: this path
+    // allocates nothing and runs no guest code, so no GC can move the oops it
+    // scans, and `selector`/`klass` must be re-read from their handles (a GC
+    // in `dict.insert` above may have moved either — `klass` was already
+    // refreshed for the barrier; `selector` is refreshed here).
+    let klass = klass_h.get(vm);
+    let selector = selector_h.get(vm);
+    crate::runtime::deps::invalidate_dependents(vm, klass, selector);
 }
 
 /// A `CompiledBlock` literal has no holder of its own at build time (its

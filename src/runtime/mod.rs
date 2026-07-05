@@ -10,6 +10,7 @@
 //! memory.
 
 pub mod deopt;
+pub mod deps;
 pub mod error;
 pub mod frames;
 pub mod globals;

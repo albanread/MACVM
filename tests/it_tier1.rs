@@ -835,6 +835,121 @@ fn make_not_entrant_patches_entries_and_unhooks() {
     }
 }
 
+/// Compiles `plusArg: arg [ ^self + arg ]` for `smi_klass` and returns its
+/// nmethod id — the keystone-test fixture. Identical setup to
+/// `make_not_entrant_patches_entries_and_unhooks`, factored out so the two
+/// step-10a redefinition tests share exactly the make_not_entrant test's own
+/// proven-compilable method.
+fn compile_plus_arg(
+    vm: &mut VmState,
+) -> (
+    macvm::codecache::nmethod::NmethodId,
+    macvm::oops::wrappers::SymbolOop,
+) {
+    let plus_sel = vm.universe.intern(b"+");
+    let smi_klass = vm.universe.smi_klass;
+    let mut b = BytecodeBuilder::new();
+    b.push_self();
+    b.push_temp(0);
+    b.send(vm, plus_sel, 1);
+    b.ret_tos();
+    let m_sel = vm.universe.intern(b"plusArg:");
+    let method = b.finish(vm, m_sel, 1, 0);
+    let plus_target = primitive_stub(vm, plus_sel, 1);
+    let epoch = vm.ic_epoch;
+    InterpreterIc::at(method, 0).set_mono(vm, smi_klass, plus_target, epoch);
+    install_method(vm, smi_klass, plus_sel, plus_target);
+    let id = driver::compile_method(vm, smi_klass, method).expect("must compile");
+    (id, m_sel)
+}
+
+/// A trivial `^self` method under `sel` — a valid `MethodOop` to hand
+/// `install_method` when a redefinition test just needs the dictionary
+/// binding to change (the body is never executed).
+fn trivial_method(
+    vm: &mut VmState,
+    sel: macvm::oops::wrappers::SymbolOop,
+) -> macvm::oops::wrappers::MethodOop {
+    let mut b = BytecodeBuilder::new();
+    b.push_self();
+    b.ret_tos();
+    b.finish(vm, sel, 0, 0)
+}
+
+/// S13 step 10a (D1 + D2, the KEYSTONE): redefining a compiled method's OWN
+/// `(klass, selector)` — the ordinary `install_method` path, no direct
+/// `make_not_entrant` call — drives the dependency hook end-to-end: the live
+/// nmethod flips to `NotEntrant` and is unhooked from the lookup map, so a
+/// fresh send re-resolves to the new method while the old code survives for
+/// any in-flight frame. This is what makes steps 8 and 9's mechanism *fire*.
+#[test]
+fn redefining_compiled_method_makes_it_not_entrant() {
+    let mut vm = test_vm();
+    let smi_klass = vm.universe.smi_klass;
+    let (id, m_sel) = compile_plus_arg(&mut vm);
+    assert_eq!(
+        vm.code_table.lookup(smi_klass, m_sel),
+        Some(id),
+        "compiled → lookup finds it before redefinition"
+    );
+
+    // Redefine `plusArg:` on SmallInt itself — the pure install path.
+    let new_body = trivial_method(&mut vm, m_sel);
+    install_method(&mut vm, smi_klass, m_sel, new_body);
+
+    assert!(
+        matches!(
+            vm.code_table.get(id).unwrap().state,
+            macvm::codecache::nmethod::NmState::NotEntrant
+        ),
+        "redefinition must invalidate the old compiled method"
+    );
+    assert_eq!(
+        vm.code_table.lookup(smi_klass, m_sel),
+        None,
+        "unhooked → a fresh send misses and re-resolves to the new method"
+    );
+}
+
+/// D2's subclass rule, end-to-end: a compiled `SmallInt>>#plusArg:` is
+/// invalidated by installing `plusArg:` on an ANCESTOR (`Integer`), because
+/// `lookup(SmallInt, #plusArg:)` walks through `Integer` and could now find
+/// the new binding. Installing an UNRELATED selector, or the same selector on
+/// a class off SmallInt's chain, must leave it alone.
+#[test]
+fn redefining_superclass_method_invalidates_subclass_nmethod() {
+    let mut vm = test_vm();
+    let (id, m_sel) = compile_plus_arg(&mut vm);
+    let integer_klass = vm.universe.integer_klass;
+    let double_klass = vm.universe.double_klass;
+
+    // A different selector on the ancestor, and the same selector on an
+    // off-chain class, are both no-ops.
+    let other_sel = vm.universe.intern(b"unrelated");
+    let other_body = trivial_method(&mut vm, other_sel);
+    install_method(&mut vm, integer_klass, other_sel, other_body);
+    let off_chain_body = trivial_method(&mut vm, m_sel);
+    install_method(&mut vm, double_klass, m_sel, off_chain_body);
+    assert!(
+        matches!(
+            vm.code_table.get(id).unwrap().state,
+            macvm::codecache::nmethod::NmState::Alive
+        ),
+        "unrelated selector / off-chain class must NOT invalidate"
+    );
+
+    // Same selector on a true ancestor → invalidates the subclass nmethod.
+    let new_body = trivial_method(&mut vm, m_sel);
+    install_method(&mut vm, integer_klass, m_sel, new_body);
+    assert!(
+        matches!(
+            vm.code_table.get(id).unwrap().state,
+            macvm::codecache::nmethod::NmState::NotEntrant
+        ),
+        "redefining #plusArg: on Integer must invalidate compiled SmallInt>>#plusArg:"
+    );
+}
+
 /// The current AArch64 native stack pointer — `sp` never appears as an
 /// ordinary register operand (AArch64 requires `mov`/add-immediate forms
 /// for it), so reading it needs one inline-asm instruction; this whole
