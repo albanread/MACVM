@@ -190,10 +190,9 @@ fn eligibility_detail(vm: &VmState, method: MethodOop) -> Eligibility {
                 // regardless of its IC — its receiver is a statically-known block
                 // that `ir::convert` splices inline, so the IC-mono check below
                 // (meant for ordinary dynamic dispatch) does not apply.
-                if escape
-                    .as_ref()
-                    .is_some_and(|e| e.value_send_target(bci).is_some())
-                {
+                if escape.as_ref().is_some_and(|e| {
+                    e.value_send_target(bci).is_some() || e.blockarg_send_target(bci).is_some()
+                }) {
                     // Yes — never worse than the current verdict.
                     bci = next;
                     continue;
@@ -750,11 +749,18 @@ fn build_deopt_metadata(
                                 .collect();
                             let inl_receiver =
                                 resolve_frame_loc(level.receiver, position, intervals);
-                            let inl_slots = level
+                            let mut inl_slots: Vec<_> = level
                                 .slots
                                 .iter()
                                 .map(|&v| resolve_frame_loc(v, position, intervals))
                                 .collect();
+                            // S14 step 7-IV-c: a slot holding an ELIDED-CLOSURE
+                            // phantom overrides its (filler) vreg location — the
+                            // materializer allocates the real closure.
+                            for &(slot_ix, pool_ix) in &level.slot_closures {
+                                inl_slots[slot_ix as usize] =
+                                    crate::compiler::scopes::ValueLoc::ElidedClosure(pool_ix);
+                            }
                             prev_scope = rec.begin_scope(ScopeDescData {
                                 method_pool_ix: level.method_pool_ix,
                                 // S14 step 7-II: an inlined spliced BLOCK records
@@ -774,11 +780,17 @@ fn build_deopt_metadata(
                         prev_scope
                     }
                 };
-                let stack = raw
+                let mut stack: Vec<_> = raw
                     .stack
                     .iter()
                     .map(|&v| resolve_frame_loc(v, position, intervals))
                     .collect();
+                // S14 step 7-IV-c: phantom stack entries override their filler
+                // vregs (a block-arg send's guard-cold reexecute stack; in-callee
+                // sites with the phantom below a send's operands).
+                for &(ix, pool_ix) in &raw.stack_closures {
+                    stack[ix as usize] = crate::compiler::scopes::ValueLoc::ElidedClosure(pool_ix);
+                }
                 rec.record_site(
                     sp.pc_off,
                     SafepointState {

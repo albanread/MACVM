@@ -23,7 +23,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::bytecode::opcode::{decode_at, Instr};
 use crate::compiler::decode::{self, Cfg, Terminator};
-use crate::interpreter::ic::InterpreterIc;
+use crate::interpreter::ic::{ic_state, IcState, InterpreterIc};
 use crate::oops::wrappers::MethodOop;
 
 /// Abstract value of one operand-stack slot or temp slot. `Site(bci)` names the
@@ -52,6 +52,11 @@ pub struct ClosureEscape {
     /// `value`-send bci → the site id it invokes, recorded ONLY for good uses
     /// (matching-argc value-family send whose receiver is a live `Site`).
     value_sends: HashMap<usize, usize>,
+    /// S14 step 7-IV-c: block-arg send bci → `(site id, arg index)` — a mono
+    /// send passing the site's block as its ONLY block argument to a callee
+    /// proven BLOCK-ARG TRANSPARENT ([`block_arg_transparent`]): the callee
+    /// will be CFG-inlined and the block spliced at its `value` sites inside.
+    blockarg_sends: HashMap<usize, (usize, usize)>,
 }
 
 impl ClosureEscape {
@@ -66,6 +71,15 @@ impl ClosureEscape {
             .get(&bci)
             .copied()
             .filter(|s| !self.escaping.contains(s))
+    }
+
+    /// S14 step 7-IV-c: the `(site id, arg index)` a BLOCK-ARG send at `bci`
+    /// threads into its inlined callee — `Some` only for a proven good use.
+    pub fn blockarg_send_target(&self, bci: usize) -> Option<(usize, usize)> {
+        self.blockarg_sends
+            .get(&bci)
+            .copied()
+            .filter(|(s, _)| !self.escaping.contains(s))
     }
 }
 
@@ -239,6 +253,147 @@ fn merge_into(
     }
 }
 
+/// S14 step 7-IV-c: is callee `d` BLOCK-ARG TRANSPARENT in its arg `arg_ix`
+/// for a block of `blk_argc` args? I.e., bound to a phantom (elided) closure,
+/// does `d` use that arg ONLY as the receiver of matching-argc value-family
+/// sends? Then `d` can be CFG-inlined with the phantom threaded through and the
+/// block spliced at each `value` site. The check is a per-block linear scan
+/// (no fixpoint): the phantom's only durable home is the IMMUTABLE arg temp —
+/// it may ride the operand stack transiently within a block (even below other
+/// sends' operands: those sites record `ValueLoc::ElidedClosure`), but must
+/// not survive to a block boundary on the stack, be stored anywhere, be
+/// dup'd, be passed as an argument, or be returned.
+fn block_arg_transparent(d: MethodOop, arg_ix: usize, blk_argc: usize) -> bool {
+    let cfg = decode::decode(d);
+    let (entry_depth, _) = crate::compiler::ir::compute_entry_depths(d, &cfg);
+    for (b, block) in cfg.blocks.iter().enumerate() {
+        // Entry stacks never carry the phantom (boundary rule below).
+        let mut stack: Vec<bool> = vec![false; entry_depth[b].max(0) as usize];
+        let mut bci = block.bci_start;
+        while bci < block.bci_end {
+            let (instr, next) = decode_at(d, bci);
+            match instr {
+                Instr::PushTemp(t) => stack.push(t as usize == arg_ix),
+                Instr::StoreTempPop(t) => {
+                    let v = stack.pop().unwrap_or(false);
+                    // The phantom may not be stored anywhere, and its home
+                    // temp may not be overwritten.
+                    if v || t as usize == arg_ix {
+                        return false;
+                    }
+                }
+                Instr::StoreTemp(t) => {
+                    let v = *stack.last().unwrap_or(&false);
+                    if v || t as usize == arg_ix {
+                        return false;
+                    }
+                }
+                Instr::Dup => {
+                    if *stack.last().unwrap_or(&false) {
+                        return false;
+                    }
+                    stack.push(false);
+                }
+                Instr::Pop => {
+                    // Discarding a pushed phantom copy is dead — fine.
+                    stack.pop();
+                }
+                Instr::StoreInstvarPop(_) | Instr::StoreGlobalPop(_) => {
+                    if stack.pop().unwrap_or(false) {
+                        return false;
+                    }
+                }
+                Instr::Send { ic, super_ } => {
+                    let argc = InterpreterIc::at(d, ic).argc() as usize;
+                    let mut arg_phantom = false;
+                    for _ in 0..argc {
+                        if stack.pop().unwrap_or(false) {
+                            arg_phantom = true;
+                        }
+                    }
+                    let recv_phantom = stack.pop().unwrap_or(false);
+                    if arg_phantom || (super_ && recv_phantom) {
+                        return false;
+                    }
+                    if recv_phantom {
+                        let sel = selector_bytes(d, ic);
+                        let good = value_family_argc(&sel) == Some(argc)
+                            && argc == blk_argc
+                            // Exactly ONE phantom at the value site: none may
+                            // remain below (it would land in the spliced
+                            // block's pending stack, which cannot carry one).
+                            && !stack.iter().any(|&ph| ph);
+                        if !good {
+                            return false;
+                        }
+                    }
+                    stack.push(false);
+                }
+                Instr::ReturnTos => {
+                    if stack.pop().unwrap_or(false) {
+                        return false;
+                    }
+                }
+                Instr::ReturnSelf
+                | Instr::JumpFwd(_)
+                | Instr::JumpBack(_)
+                | Instr::BrTrueFwd(_)
+                | Instr::BrFalseFwd(_) => {}
+                // Every other opcode either pushes one opaque value or is
+                // rejected up front by `is_inline_eligible_cfg(d)`
+                // (super/ctx/closure/NLR never reach here).
+                _ => stack.push(false),
+            }
+            bci = next;
+        }
+        // Boundary rule: the phantom never leaves a block on the stack.
+        if stack.iter().any(|&ph| ph) {
+            return false;
+        }
+    }
+    true
+}
+
+/// S14 step 7-IV-c: full candidate check for a BLOCK-ARG send: the site's IC
+/// is mono to a non-primitive, CFG-inlinable callee within the DOUBLED
+/// block-arg budget (SPEC §8.4's block-argument bonus — inlining the callee is
+/// what unlocks inlining its block argument), the block itself fits the plain
+/// budget, and the callee is transparent in that arg.
+fn blockarg_candidate_ok(method: MethodOop, ic: u16, arg_ix: usize, site_bci: usize) -> bool {
+    let (instr, _) = decode_at(method, site_bci);
+    let Instr::PushClosure { lit, .. } = instr else {
+        return false;
+    };
+    let Some(blk) = MethodOop::try_from(method.literals().at(lit as usize)) else {
+        return false;
+    };
+    if !block_is_spliceable(blk) {
+        return false;
+    }
+    if !matches!(ic_state(method, ic), IcState::Mono) {
+        return false;
+    }
+    let site = InterpreterIc::at(method, ic);
+    let Some(d) = MethodOop::try_from(site.target()) else {
+        // A mono site whose target is an nmethod id — resolvable in principle,
+        // conservative for now.
+        return false;
+    };
+    if d.primitive() != 0
+        || d.argc() != site.argc() as usize
+        || !crate::compiler::inline::is_inline_eligible_cfg(d)
+    {
+        return false;
+    }
+    let budget = crate::compiler::inline::budget_for_level(1);
+    if crate::compiler::inline::inline_cost(d) > budget.per_call_cost * 2
+        || crate::compiler::inline::inline_cost(blk) > budget.per_call_cost
+    {
+        return false;
+    }
+    block_arg_transparent(d, arg_ix, blk.argc())
+}
+
 /// The escape pre-pass. `method` is M (the ROOT method being considered for
 /// compilation) — NOT a block. Abstract-interprets M's CFG to a fixpoint,
 /// classifying every `push_closure` site as elidable (good use) or escaping.
@@ -253,6 +408,7 @@ pub fn analyze(method: MethodOop) -> ClosureEscape {
     let mut sites: HashSet<usize> = HashSet::new();
     let mut escaping: HashSet<usize> = HashSet::new();
     let mut value_sends: HashMap<usize, usize> = HashMap::new();
+    let mut blockarg_sends: HashMap<usize, (usize, usize)> = HashMap::new();
     // site bci → does its block body contain any `Send`? (Its splice then has
     // in-body safepoints — see the stale-alias rule in `transfer_block`.)
     let mut site_has_sends: HashMap<usize, bool> = HashMap::new();
@@ -286,6 +442,7 @@ pub fn analyze(method: MethodOop) -> ClosureEscape {
             sites,
             escaping,
             value_sends,
+            blockarg_sends,
         };
     }
 
@@ -311,6 +468,7 @@ pub fn analyze(method: MethodOop) -> ClosureEscape {
             &site_has_sends,
             &mut escaping,
             &mut value_sends,
+            &mut blockarg_sends,
         );
         // SOUNDNESS (S14 7-IV-b): a Site still LIVE at a block boundary WITH
         // SUCCESSORS escapes. A phantom closure has no compiled location — any
@@ -352,6 +510,7 @@ pub fn analyze(method: MethodOop) -> ClosureEscape {
         sites,
         escaping,
         value_sends,
+        blockarg_sends,
     }
 }
 
@@ -377,6 +536,7 @@ fn transfer_block(
     site_has_sends: &HashMap<usize, bool>,
     escaping: &mut HashSet<usize>,
     value_sends: &mut HashMap<usize, usize>,
+    blockarg_sends: &mut HashMap<usize, (usize, usize)>,
 ) {
     let cfg_block = &cfg.blocks[b];
     let mut bci = cfg_block.bci_start;
@@ -433,11 +593,35 @@ fn transfer_block(
                 }
                 let recv = st.stack.pop().unwrap_or(AV::Other);
 
-                // ANY Site among the ARG slots escapes (an arg is never a good
-                // use — the callee could stash it anywhere).
-                for &a in &arg_avs {
-                    if let AV::Site(s) = a {
-                        escaping.insert(s);
+                // S14 step 7-IV-c: a Site among the ARG slots is a GOOD use
+                // iff this is a BLOCK-ARG send: exactly one Site arg, a plain
+                // (non-super) send with a non-Site receiver, whose mono callee
+                // is CFG-inlinable within the doubled budget and BLOCK-ARG
+                // TRANSPARENT in that arg — the callee inlines and the block
+                // splices at its `value` sites. Anything else escapes the arg
+                // Site(s) (the callee could stash them anywhere).
+                // NOTE `arg_avs` is popped top-first: `arg_avs[k]` is source
+                // arg `argc - 1 - k` (= the callee's unified temp index).
+                let phantom_args: Vec<(usize, usize)> = arg_avs
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(k, &a)| match a {
+                        AV::Site(s) => Some((argc - 1 - k, s)),
+                        AV::Other => None,
+                    })
+                    .collect();
+                if !phantom_args.is_empty() {
+                    let good_blockarg = phantom_args.len() == 1
+                        && matches!(recv, AV::Other)
+                        && !super_
+                        && blockarg_candidate_ok(method, ic, phantom_args[0].0, phantom_args[0].1);
+                    if good_blockarg {
+                        let (arg_ix, s) = phantom_args[0];
+                        blockarg_sends.insert(bci, (s, arg_ix));
+                    } else {
+                        for &(_, s) in &phantom_args {
+                            escaping.insert(s);
+                        }
                     }
                 }
 

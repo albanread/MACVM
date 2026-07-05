@@ -390,6 +390,14 @@ pub struct DeoptRaw {
     pub bci: usize,
     pub kind: SafepointKind,
     pub reexecute: bool,
+    /// S14 step 7-IV-c: sparse overrides — `(index into stack, block MethodOop
+    /// pool ix)` for stack entries holding an ELIDED-CLOSURE phantom (its vreg
+    /// is an unread filler; the materializer allocates the real closure via
+    /// `ValueLoc::ElidedClosure`). Empty except at sites recorded while a
+    /// phantom rides the operand stack (a block-arg send's guard-cold
+    /// reexecute stack; in-callee sites with the phantom below a send's
+    /// operands).
+    pub stack_closures: Vec<(u16, u32)>,
     /// S14 step 4c: `Some` iff this safepoint lives INSIDE an inlined callee's
     /// body (a `CallSend`/trap the non-leaf splicer emitted). The driver reads
     /// it to record a NESTED deopt scope — the inlined callee's own receiver/
@@ -438,6 +446,12 @@ pub struct InlineSite {
     /// in THAT level's method, not the root. `build_deopt_metadata` walks the
     /// chain outermost-first when beginning scopes.
     pub parent: Option<Box<InlineSite>>,
+    /// S14 step 7-IV-c: sparse overrides — `(unified slot index, block
+    /// MethodOop pool ix)` for slots holding an ELIDED-CLOSURE phantom (a
+    /// `do:`-style callee's block-arg temp). The driver emits
+    /// `ValueLoc::ElidedClosure` for these instead of resolving the (filler)
+    /// vreg. Shared by every safepoint of the extent via the proto.
+    pub slot_closures: Vec<(u16, u32)>,
 }
 
 /// S13 step 7b: the deopt info a fused comparison (`SmiCmpBr`) carries from
@@ -929,6 +943,7 @@ impl<'a> Translator<'a> {
                     bci: fail_bci,
                     kind: SafepointKind::UncommonTrap,
                     reexecute: true,
+                    stack_closures: Vec::new(),
                     inline: None,
                 },
             )],
@@ -962,6 +977,7 @@ impl<'a> Translator<'a> {
                     bci: branch_bci,
                     kind: SafepointKind::UncommonTrap,
                     reexecute: true,
+                    stack_closures: Vec::new(),
                     inline: None,
                 },
             )],
@@ -998,6 +1014,7 @@ impl<'a> Translator<'a> {
                     bci: fail_bci,
                     kind: SafepointKind::UncommonTrap,
                     reexecute: true,
+                    stack_closures: Vec::new(),
                     inline: None,
                 },
             )],
@@ -1158,6 +1175,7 @@ impl<'a> Translator<'a> {
                     bci: send_bci,
                     kind: SafepointKind::UncommonTrap,
                     reexecute: true,
+                    stack_closures: Vec::new(),
                     inline: None,
                 },
             )],
@@ -1409,6 +1427,7 @@ impl<'a> Translator<'a> {
                     bci: send_bci,
                     kind: SafepointKind::UncommonTrap,
                     reexecute: true,
+                    stack_closures: Vec::new(),
                     // The guard's cold trap re-executes the WHOLE `helper:` send
                     // in the CALLER, so it deopts to the CALLER scope (depth-1,
                     // `inline: None`) — NOT the inlined scope. Only safepoints
@@ -1450,6 +1469,7 @@ impl<'a> Translator<'a> {
             // A step-4c METHOD inline, not a spliced block.
             is_block: false,
             parent: None,
+            slot_closures: Vec::new(),
         };
 
         // Translate the callee's straight-line body onto a fresh operand stack.
@@ -1603,6 +1623,7 @@ impl<'a> Translator<'a> {
                                 bci: inner_bci,
                                 kind: SafepointKind::UncommonTrap,
                                 reexecute: true,
+                                stack_closures: Vec::new(),
                                 inline: Some(inline_proto.clone()),
                             },
                         ));
@@ -1634,6 +1655,7 @@ impl<'a> Translator<'a> {
                             bci: inner_bci,
                             kind: SafepointKind::Call,
                             reexecute: false,
+                            stack_closures: Vec::new(),
                             inline: Some(inline_proto.clone()),
                         },
                     ));
@@ -1707,6 +1729,7 @@ impl<'a> Translator<'a> {
                     bci: trap_bci,
                     kind: SafepointKind::UncommonTrap,
                     reexecute: true,
+                    stack_closures: Vec::new(),
                     inline: Some(inline),
                 },
             )],
@@ -1761,6 +1784,7 @@ impl<'a> Translator<'a> {
         pre_pop_stack: &[VReg],
         code: &mut Vec<Ir>,
         deopt: &mut Vec<(u32, DeoptRaw)>,
+        blockarg: Option<(usize, MethodOop, u32)>,
     ) -> Option<(VReg, BlockId, BlockId)> {
         let _ = deopt; // caller-block deopt vec unused: guard cold path is its own block
         let ccfg = crate::compiler::decode::decode(callee);
@@ -1780,6 +1804,16 @@ impl<'a> Translator<'a> {
             .pool
             .intern(guard_klass.oop().raw(), Some(RelocKind::Oop));
         let cold_id = self.fresh_block_id();
+        // S14 step 7-IV-c: a block-arg send's reexecute stack carries the
+        // PHANTOM closure at the arg position — the materializer must allocate
+        // the real one before the interpreter re-executes the send.
+        let guard_stack_closures: Vec<(u16, u32)> = match blockarg {
+            Some((arg_ix, _, blk_pool_ix)) => {
+                let pos = pre_pop_stack.len() - args.len() + arg_ix;
+                vec![(pos as u16, blk_pool_ix)]
+            }
+            None => Vec::new(),
+        };
         self.finish_block(IrBlock {
             id: cold_id,
             bci: send_bci,
@@ -1792,6 +1826,7 @@ impl<'a> Translator<'a> {
                     bci: send_bci,
                     kind: SafepointKind::UncommonTrap,
                     reexecute: true,
+                    stack_closures: guard_stack_closures,
                     inline: None,
                 },
             )],
@@ -1827,6 +1862,13 @@ impl<'a> Translator<'a> {
             caller_pending_stack,
             is_block: false,
             parent: None,
+            // S14 step 7-IV-c: the block-arg temp holds a PHANTOM (its vreg is
+            // an unread filler) — every in-callee deopt scope materializes the
+            // real closure for that slot.
+            slot_closures: match blockarg {
+                Some((arg_ix, _, blk_pool_ix)) => vec![(arg_ix as u16, blk_pool_ix)],
+                None => Vec::new(),
+            },
         };
 
         // ── CFG scaffolding: the same machinery convert runs on the root. ──
@@ -1876,6 +1918,11 @@ impl<'a> Translator<'a> {
             };
             let cfg_block = &ccfg.blocks[b];
             let mut cstack = entry_stack.clone();
+            // S14 step 7-IV-c: parallel phantom shadow — `true` where the
+            // callee's sim stack holds the block-arg PHANTOM (pushed by
+            // `push_temp arg_ix`). Never survives a block boundary
+            // (transparency's boundary rule), so entry is all-false.
+            let mut cstack_ph: Vec<bool> = vec![false; cstack.len()];
             let mut bcode: Vec<Ir> = Vec::new();
             let mut bdeopt: Vec<(u32, DeoptRaw)> = Vec::new();
             let mut trapped = false;
@@ -1917,6 +1964,17 @@ impl<'a> Translator<'a> {
                         cstack.push(dst);
                     }
                     Instr::PushTemp(t) => {
+                        // The block-arg temp pushes the PHANTOM (no Move — its
+                        // filler vreg is never read; the shadow carries it).
+                        if let Some((arg_ix, _, _)) = blockarg {
+                            if t as usize == arg_ix {
+                                cstack.push(callee_self); // harmless filler
+                                cstack_ph.resize(cstack.len() - 1, false);
+                                cstack_ph.push(true);
+                                bci = next;
+                                continue;
+                            }
+                        }
                         let dst = self.fresh(true);
                         bcode.push(Ir::Move {
                             dst,
@@ -1986,6 +2044,79 @@ impl<'a> Translator<'a> {
                         let inner_argc = inner_ic.argc();
                         let inner_sel = inner_ic.selector();
                         let inner_bci = bci;
+                        // S14 step 7-IV-c: a value-family send whose RECEIVER is
+                        // the phantom splices the BLOCK's body right here, with
+                        // an InlineSite CHAINED to this callee's own (depth 3:
+                        // block ← callee ← root). Transparency proved the shape
+                        // (matching argc, no other phantom on the stack).
+                        cstack_ph.resize(cstack.len(), false);
+                        let recv_is_phantom = cstack_ph
+                            .get(cstack.len() - 1 - inner_argc as usize)
+                            .copied()
+                            .unwrap_or(false);
+                        if recv_is_phantom {
+                            let (_, blk, blk_pool_ix) =
+                                blockarg.expect("phantom shadow set without a blockarg");
+                            let mut blk_args: Vec<VReg> = (0..inner_argc)
+                                .map(|_| {
+                                    cstack_ph.pop();
+                                    cstack.pop().expect("cfg splice: value arg")
+                                })
+                                .collect();
+                            blk_args.reverse();
+                            cstack_ph.pop();
+                            cstack.pop().expect("cfg splice: phantom receiver");
+                            debug_assert!(
+                                !cstack_ph.iter().any(|&ph| ph),
+                                "cfg splice: phantom below a value site (transparency bug)"
+                            );
+                            // The block's slots: value args alias + fresh nils.
+                            let mut bslots: Vec<VReg> =
+                                Vec::with_capacity(blk.argc() + blk.ntemps());
+                            bslots.extend_from_slice(&blk_args);
+                            let nil_lit2 = self
+                                .pool
+                                .intern(self.vm.universe.nil_obj.raw(), Some(RelocKind::Oop));
+                            for _ in 0..blk.ntemps() {
+                                let t = self.fresh(true);
+                                bcode.push(Ir::ConstPool {
+                                    dst: t,
+                                    lit: nil_lit2,
+                                });
+                                bslots.push(t);
+                            }
+                            let blk_proto = InlineSite {
+                                method_pool_ix: blk_pool_ix,
+                                receiver: self.self_vreg, // home self = ROOT's
+                                slots: bslots.clone(),
+                                sender_bci: inner_bci as u16,
+                                caller_pending_stack: cstack.clone(),
+                                is_block: true,
+                                parent: Some(Box::new(inline_proto.clone())),
+                                slot_closures: Vec::new(),
+                            };
+                            match self.translate_spliced_block_body(
+                                blk,
+                                &bslots,
+                                self.self_vreg,
+                                &blk_proto,
+                                &mut bcode,
+                                &mut bdeopt,
+                            ) {
+                                Ok(res) => {
+                                    cstack.push(res);
+                                    cstack_ph.push(false);
+                                    bci = next;
+                                    continue;
+                                }
+                                Err(()) => {
+                                    // Terminating trap/NLR inside the block:
+                                    // this callee block ends here.
+                                    trapped = true;
+                                    break;
+                                }
+                            }
+                        }
                         let inner_fb =
                             crate::compiler::feedback::read_send_site(self.vm, callee, ic, None);
                         let mut inner_args: Vec<VReg> = (0..inner_argc)
@@ -1993,6 +2124,18 @@ impl<'a> Translator<'a> {
                             .collect();
                         inner_args.reverse();
                         let inner_recv = cstack.pop().expect("cfg splice: send missing receiver");
+                        // Phantom entries below this send's operands must be
+                        // recorded as ElidedClosure at its deopt sites.
+                        cstack_ph.truncate(cstack.len());
+                        let ph_closures: Vec<(u16, u32)> = match blockarg {
+                            Some((_, _, blk_pool_ix)) => cstack_ph
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, &ph)| ph)
+                                .map(|(i, _)| (i as u16, blk_pool_ix))
+                                .collect(),
+                            None => Vec::new(),
+                        };
 
                         if let crate::compiler::inline::InlineDecision::Trap =
                             crate::compiler::inline::decide(&inner_fb)
@@ -2007,6 +2150,7 @@ impl<'a> Translator<'a> {
                                     bci: inner_bci,
                                     kind: SafepointKind::UncommonTrap,
                                     reexecute: true,
+                                    stack_closures: ph_closures.clone(),
                                     inline: Some(inline_proto.clone()),
                                 },
                             ));
@@ -2032,6 +2176,7 @@ impl<'a> Translator<'a> {
                                 bci: inner_bci,
                                 kind: SafepointKind::Call,
                                 reexecute: false,
+                                stack_closures: ph_closures,
                                 inline: Some(inline_proto.clone()),
                             },
                         ));
@@ -2110,6 +2255,7 @@ impl<'a> Translator<'a> {
                                     bci: ccfg.blocks[target].bci_start,
                                     kind: SafepointKind::LoopPoll,
                                     reexecute: true,
+                                    stack_closures: Vec::new(),
                                     inline: Some(inline_proto.clone()),
                                 },
                             ));
@@ -2392,6 +2538,7 @@ impl<'a> Translator<'a> {
                         bci,
                         kind: SafepointKind::Call,
                         reexecute: false,
+                        stack_closures: Vec::new(),
                         inline: None,
                     },
                 ));
@@ -2487,6 +2634,7 @@ impl<'a> Translator<'a> {
                                 bci,
                                 kind: SafepointKind::Alloc,
                                 reexecute: true,
+                                stack_closures: Vec::new(),
                                 inline: None,
                             },
                         ));
@@ -2555,6 +2703,7 @@ impl<'a> Translator<'a> {
                             bci,
                             kind: SafepointKind::UncommonTrap,
                             reexecute: true,
+                            stack_closures: Vec::new(),
                             inline: None,
                         },
                     ));
@@ -2677,6 +2826,7 @@ impl<'a> Translator<'a> {
                         &pre_pop_stack,
                         code,
                         deopt,
+                        None,
                     ) {
                         stack.push(result);
                         debug_assert!(
@@ -2706,6 +2856,7 @@ impl<'a> Translator<'a> {
                             bci,
                             kind: SafepointKind::Call,
                             reexecute: false,
+                            stack_closures: Vec::new(),
                             inline: None,
                         },
                     ));
@@ -2745,6 +2896,7 @@ impl<'a> Translator<'a> {
                         bci,
                         kind: SafepointKind::Call,
                         reexecute: false,
+                        stack_closures: Vec::new(),
                         inline: None,
                     },
                 ));
@@ -2928,6 +3080,27 @@ impl<'a> Translator<'a> {
                 // A `value`-family send the escape pre-pass mapped to a splice.
                 // (`value_send_target` returns a `Copy` `usize`, so the immutable
                 // borrow of `self.escape` ends before the `&mut self` splice.)
+                // S14 step 7-IV-c: a BLOCK-ARG send (the block rides as an
+                // ARGUMENT into a transparent, CFG-inlinable mono callee — the
+                // `do:` pattern). MUST splice: the phantom has no runtime value,
+                // so there is no Call fallback.
+                if let Some((site, arg_ix)) = self
+                    .escape
+                    .as_ref()
+                    .and_then(|e| e.blockarg_send_target(bci))
+                {
+                    let cont = self.splice_blockarg_send(
+                        site,
+                        arg_ix,
+                        ic,
+                        bci,
+                        stack,
+                        stack_sites,
+                        code,
+                        deopt,
+                    );
+                    return Some(Some(cont));
+                }
                 let target = self.escape.as_ref().and_then(|e| e.value_send_target(bci));
                 if let Some(site) = target {
                     if self.splice_block(site, ic, bci, stack, stack_sites, code, deopt) {
@@ -3056,14 +3229,47 @@ impl<'a> Translator<'a> {
             caller_pending_stack: stack.clone(),
             is_block: true,
             parent: None,
+            slot_closures: Vec::new(),
         };
 
-        // Translate the block's straight-line body onto a fresh operand stack.
-        // Same value-shuffle/field/return arms as the leaf method splice, PLUS
-        // `BlockReturnTos` (a block's own fall-off return, which `decode` treats
-        // as a `Return` terminator — decode.rs), PLUS the 7-II `Send` arm (a
-        // compiled `CallSend` or a step-3 cold trap inside the inlined block,
-        // recording an `is_block` in-body deopt scope).
+        match self.translate_spliced_block_body(
+            block,
+            &slots,
+            block_self,
+            &inline_proto,
+            code,
+            deopt,
+        ) {
+            Err(()) => true,
+            Ok(result) => {
+                stack.push(result);
+                stack_sites.push(None);
+                false
+            }
+        }
+    }
+
+    /// S14 step 7-IV-c: the SHARED spliced-block body translator — used by
+    /// [`Translator::splice_block`] (a block value'd directly in M) AND by
+    /// [`Translator::try_inline_cfg`]'s block-arg path (a block spliced at a
+    /// `value` site INSIDE an inlined callee, with a chained `InlineSite`).
+    /// Translates the single straight-line body onto a fresh operand stack:
+    /// value-shuffle/field arms, ctx-temp arms (→ the home's promoted
+    /// `ctx_vregs`), the block's own sends (cold → terminating trap, warm →
+    /// `CallSend`, both recording `inline_proto`), `nlr_tos` → `Ir::Ret` (a
+    /// return from the whole compilation — the block's home is the root).
+    /// Returns `Ok(result_vreg)` on a normal block return, `Err(())` when the
+    /// body ended in a TERMINATING op (trap or NLR) — the caller must stop
+    /// translating its current block.
+    fn translate_spliced_block_body(
+        &mut self,
+        block: MethodOop,
+        slots: &[VReg],
+        block_self: VReg,
+        inline_proto: &InlineSite,
+        code: &mut Vec<Ir>,
+        deopt: &mut Vec<(u32, DeoptRaw)>,
+    ) -> Result<VReg, ()> {
         let mut bstack: Vec<VReg> = Vec::new();
         let mut result: Option<VReg> = None;
         let mut trapped = false;
@@ -3246,6 +3452,7 @@ impl<'a> Translator<'a> {
                                 bci: inner_bci,
                                 kind: SafepointKind::UncommonTrap,
                                 reexecute: true,
+                                stack_closures: Vec::new(),
                                 inline: Some(inline_proto.clone()),
                             },
                         ));
@@ -3274,6 +3481,7 @@ impl<'a> Translator<'a> {
                             bci: inner_bci,
                             kind: SafepointKind::Call,
                             reexecute: false,
+                            stack_closures: Vec::new(),
                             inline: Some(inline_proto.clone()),
                         },
                     ));
@@ -3319,15 +3527,102 @@ impl<'a> Translator<'a> {
         }
 
         if trapped {
-            // An in-body cold send became a terminating trap: control leaves the
-            // method here. Push NO result — the caller (`translate_site_instr`)
-            // propagates `trapped` so `convert` finishes the block at the trap.
-            return true;
+            return Err(());
         }
-        let result = result.expect("block splice: a returning block must produce a result");
+        Ok(result.expect("block splice: a returning block must produce a result"))
+    }
+
+    /// S14 step 7-IV-c: lower a BLOCK-ARG send — `recv D-selector: ... B ...`
+    /// where `B` is a proven-elidable literal block and the mono callee D is
+    /// block-arg transparent. Splices D via [`Translator::try_inline_cfg`]
+    /// with the phantom threaded through (D's `value` sites splice B's body,
+    /// depth-3 InlineSite chains, `ElidedClosure` recorded for the phantom's
+    /// slot/stack positions). There is NO fallback: the escape pre-pass
+    /// committed to this shape, and the phantom has no runtime value to pass
+    /// to a real send. Pops the send's operands, pushes the result, arms
+    /// `pending_jump_target` with D's entry block, and returns the
+    /// continuation the caller must adopt as its `split`.
+    #[allow(clippy::too_many_arguments)]
+    fn splice_blockarg_send(
+        &mut self,
+        site_bci: usize,
+        arg_ix: usize,
+        ic: u16,
+        send_bci: usize,
+        stack: &mut Vec<VReg>,
+        stack_sites: &mut Vec<Option<usize>>,
+        code: &mut Vec<Ir>,
+        deopt: &mut Vec<(u32, DeoptRaw)>,
+    ) -> BlockId {
+        // Resolve B from its push_closure literal, D + guard klass from the
+        // send's own (mono) feedback — the SAME IC state the escape pre-pass
+        // read moments ago in this no-GC compile window.
+        let (site_instr, _) = decode_at(self.method, site_bci);
+        let lit = match site_instr {
+            Instr::PushClosure { lit, .. } => lit,
+            _ => unreachable!("splice_blockarg_send: site bci is not a push_closure"),
+        };
+        let blk = MethodOop::try_from(self.method.literals().at(lit as usize))
+            .expect("splice_blockarg_send: push_closure literal is not a CompiledBlock");
+        let blk_pool_ix = self.pool.intern(blk.oop().raw(), Some(RelocKind::Oop)).0;
+
+        let feedback = crate::compiler::feedback::read_send_site(self.vm, self.method, ic, None);
+        let (guard_klass, callee) = match &feedback {
+            crate::compiler::feedback::SiteFeedback::Mono { klass, method } => (*klass, *method),
+            other => unreachable!(
+                "splice_blockarg_send: escape proved a mono block-arg site but feedback is \
+                 {other:?} (compiler bug — IC state cannot change mid-compile)"
+            ),
+        };
+        let guard_shape = if guard_klass.oop().raw() == self.vm.universe.smi_klass.oop().raw() {
+            GuardShape::SmiTest
+        } else {
+            GuardShape::KlassTest
+        };
+        let selector = InterpreterIc::at(self.method, ic).selector();
+        let argc = InterpreterIc::at(self.method, ic).argc() as usize;
+
+        // Pop operands (keeping the phantom shadow in lockstep). The phantom
+        // arg's vreg is a filler; its POSITION is what matters (arg_ix).
+        let pre_pop_stack = stack.clone();
+        let mut args: Vec<VReg> = (0..argc)
+            .map(|_| {
+                stack_sites.pop();
+                stack.pop().expect("blockarg send: missing arg operand")
+            })
+            .collect();
+        args.reverse();
+        stack_sites.pop();
+        let receiver = stack
+            .pop()
+            .expect("blockarg send: missing receiver operand");
+
+        let (result, entry_id, continuation_id) = self
+            .try_inline_cfg(
+                callee,
+                guard_klass,
+                guard_shape,
+                selector,
+                receiver,
+                &args,
+                send_bci,
+                &pre_pop_stack,
+                code,
+                deopt,
+                Some((arg_ix, blk, blk_pool_ix)),
+            )
+            .expect(
+                "splice_blockarg_send: escape proved the callee CFG-inlinable but the \
+                 splice declined (compiler bug)",
+            );
         stack.push(result);
         stack_sites.push(None);
-        false
+        debug_assert!(
+            self.pending_jump_target.is_none(),
+            "blockarg splice: a pending jump target is already armed"
+        );
+        self.pending_jump_target = Some(entry_id);
+        continuation_id
     }
 
     fn push_well_known(&mut self, raw: u64, code: &mut Vec<Ir>) -> VReg {
@@ -3804,6 +4099,7 @@ pub fn convert(vm: &VmState, method: MethodOop, cfg: &Cfg) -> IrMethod {
                             bci: cfg.blocks[target].bci_start,
                             kind: SafepointKind::LoopPoll,
                             reexecute: true,
+                            stack_closures: Vec::new(),
                             inline: None,
                         },
                     ));

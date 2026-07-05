@@ -5189,3 +5189,303 @@ fn phantom_live_across_safepoint_stays_interpreted() {
     let r = macvm::interpreter::run_method(&mut vm, m, SmallInt::new(3).oop(), &[]);
     assert_eq!(r.raw(), SmallInt::new(42).oop().raw());
 }
+
+// ── S14 step 7-IV-c: block-arg threading through an inlined callee (do:) ────
+
+/// Builds the do:-shaped loop callee on SmallInteger:
+/// `upTo: aBlock [ |i| i := 1. [i <= self] whileTrue: [aBlock value: i. i := i + 1]. ^self ]`
+/// plus smi `<=` (prim 11) and `+` (prim 1). Returns (upto, le, plus).
+fn upto_scenario(vm: &mut VmState) -> (MethodOop, MethodOop, MethodOop) {
+    let smi_klass = vm.universe.smi_klass;
+    let le = {
+        let sel = vm.universe.intern(b"<=");
+        let mut b = BytecodeBuilder::new();
+        b.push_self();
+        b.ret_self();
+        let m = b.finish(vm, sel, 1, 0);
+        m.set_primitive(11);
+        let sel = vm.universe.intern(b"<=");
+        install_method(vm, smi_klass, sel, m);
+        m
+    };
+    let plus = {
+        let sel = vm.universe.intern(b"+");
+        let mut b = BytecodeBuilder::new();
+        b.push_self();
+        b.ret_self();
+        let m = b.finish(vm, sel, 1, 0);
+        m.set_primitive(1);
+        let sel = vm.universe.intern(b"+");
+        install_method(vm, smi_klass, sel, m);
+        m
+    };
+    // upTo: — unified slots: 0 = aBlock (arg), 1 = i (temp).
+    let le_sel = vm.universe.intern(b"<=");
+    let plus_sel = vm.universe.intern(b"+");
+    let value_arg_sel = vm.universe.intern(b"value:");
+    let upto_sel = vm.universe.intern(b"upTo:");
+    let mut b = BytecodeBuilder::new();
+    let cond_l = b.new_label();
+    let exit_l = b.new_label();
+    b.push_smi_i8(1);
+    b.store_temp_pop(1); // i := 1
+    b.bind(cond_l);
+    b.push_temp(1);
+    b.push_self();
+    b.send(vm, le_sel, 1); // i <= self      (ic 0)
+    b.br_false_fwd(exit_l);
+    b.push_temp(0); // aBlock  (the PHANTOM once inlined)
+    b.push_temp(1); // i
+    b.send(vm, value_arg_sel, 1); // aBlock value: i   (ic 1 — SPLICED)
+    b.pop();
+    b.push_temp(1);
+    b.push_smi_i8(1);
+    b.send(vm, plus_sel, 1); // i + 1        (ic 2)
+    b.store_temp_pop(1);
+    b.jump_back(cond_l);
+    b.bind(exit_l);
+    b.ret_self(); // ^self
+    let upto = b.finish(vm, upto_sel, 1, 1);
+    let upto_sel = vm.universe.intern(b"upTo:");
+    install_method(vm, smi_klass, upto_sel, upto);
+    (upto, le, plus)
+}
+
+/// Builds `sumUp: n [ |sum| sum := 0. n upTo: [:e | sum := sum + e]. ^sum ]`
+/// (has_ctx, nctx=1; the block captures `sum`). Warms M's upTo: site mono.
+/// Returns (m, block).
+fn sumup_scenario(vm: &mut VmState, upto: MethodOop) -> (MethodOop, MethodOop) {
+    let smi_klass = vm.universe.smi_klass;
+    let plus_sel = vm.universe.intern(b"+");
+    let upto_sel = vm.universe.intern(b"upTo:");
+    let sel = vm.universe.intern(b"sumUp:");
+    let mut b = BytecodeBuilder::new();
+    // block `[:e | sum := sum + e. sum]` — captures_ctx, one send (+, ic 0).
+    let lit = b.build_block(vm, 1, 0, false, 0, true, |blk, vm| {
+        blk.push_ctx_temp(0, 0); // sum
+        blk.push_temp(0); // e
+        blk.send(vm, plus_sel, 1); // sum + e     (block ic 0)
+        blk.store_ctx_temp_pop(0, 0); // sum := ...
+        blk.push_ctx_temp(0, 0);
+        blk.block_return_tos();
+    });
+    b.push_smi_i8(0);
+    b.store_ctx_temp_pop(0, 0); // sum := 0
+    b.push_temp(0); // n (receiver of upTo:)
+    b.push_closure(lit, 0); // the block, as the ARG
+    b.send(vm, upto_sel, 1); // n upTo: [...]      (ic 0)
+    b.pop();
+    b.push_ctx_temp(0, 0); // sum
+    b.ret_tos();
+    let m = b.finish(vm, sel, 1, 0);
+    m.set_flags(1, 0, true, false, false, false, 1); // argc 1, has_ctx, nctx=1
+    let block = MethodOop::try_from(m.literals().at(lit)).unwrap();
+    let epoch = vm.ic_epoch;
+    InterpreterIc::at(m, 0).set_mono(vm, smi_klass, upto, epoch);
+    (m, block)
+}
+
+/// S14 step 7-IV-c (a): THE FLAGSHIP — `sumUp: n [ |sum| sum := 0. n upTo:
+/// [:e | sum := sum + e]. ^sum ]` compiles with the `upTo:` loop callee
+/// CFG-inlined, the block-arg threaded through as a phantom, the block body
+/// spliced at the `value:` site INSIDE the inlined loop, the captured `sum`
+/// promoted to a vreg, and M's Context elided. sumUp(5) = 15, == interp.
+#[test]
+fn compiled_blockarg_do_pattern_matches_interpreter() {
+    let mut vm = test_vm();
+    install_value_prims(&mut vm);
+    let smi_klass = vm.universe.smi_klass;
+    let (upto, le, plus) = upto_scenario(&mut vm);
+    // Warm the callee's own `<=` and `+` (mono smi). Its `value:` site is
+    // spliced, never dispatched — warmth irrelevant.
+    let epoch = vm.ic_epoch;
+    InterpreterIc::at(upto, 0).set_mono(&mut vm, smi_klass, le, epoch);
+    let epoch = vm.ic_epoch;
+    InterpreterIc::at(upto, 2).set_mono(&mut vm, smi_klass, plus, epoch);
+    let (m, block) = sumup_scenario(&mut vm, upto);
+    // Warm the BLOCK's own `+`.
+    let epoch = vm.ic_epoch;
+    InterpreterIc::at(block, 0).set_mono(&mut vm, smi_klass, plus, epoch);
+
+    // The callee must exercise the DOUBLED block-arg budget (cost > plain 30,
+    // <= 60) — otherwise this test isn't proving the bonus.
+    let cost = macvm::compiler::inline::inline_cost(upto);
+    let plain = macvm::compiler::inline::budget_for_level(1).per_call_cost;
+    assert!(
+        cost <= plain * 2,
+        "upTo: (cost {cost}) must fit the doubled block-arg budget ({})",
+        plain * 2
+    );
+
+    assert!(
+        driver::eligible(&vm, m),
+        "the do:-pattern method must be eligible (block-arg threading, 7-IV-c)"
+    );
+    let self_smi = SmallInt::new(1).oop();
+    let interp = macvm::interpreter::run_method(&mut vm, m, self_smi, &[SmallInt::new(5).oop()]);
+    assert_eq!(
+        interp.raw(),
+        SmallInt::new(15).oop().raw(),
+        "interp: sumUp(5) = 15"
+    );
+
+    let id = driver::compile_method(&mut vm, smi_klass, m).expect("must compile");
+    let nm = vm.code_table.get(id).expect("installed");
+    let entry = unsafe { nm.code.base.add(nm.entry_off as usize) } as u64;
+    let call: CallStubFn = unsafe { std::mem::transmute(vm.stubs.call_stub_entry()) };
+    let vm_ptr: *mut VmState = &mut vm;
+    let result = unsafe {
+        call(
+            entry,
+            vm_ptr,
+            [self_smi.raw(), SmallInt::new(5).oop().raw()].as_ptr(),
+            2,
+        )
+    };
+    assert_eq!(
+        result,
+        SmallInt::new(15).oop().raw(),
+        "compiled do:-pattern sumUp(5) = 15 (differential match)"
+    );
+}
+
+/// S14 step 7-IV-c (b): the GUARD-COLD path materializes the elided closure.
+/// The compiled `sumUp:` speculates n is a smi (the `upTo:` guard). Calling it
+/// with a K2 instance (K2 has its OWN `upTo:` = `[ ^aBlock value: 99 ]`) fails
+/// the guard → the reexecute stack's PHANTOM becomes a real closure → the
+/// interpreter re-executes `n upTo: realB` → K2's upTo: `value:`s the REAL
+/// closure → the block writes 99 through M's materialized Context → ^sum = 99.
+#[test]
+fn blockarg_guard_cold_materializes_closure() {
+    let mut vm = VmState::with_options(VmOptions {
+        heap_mib: 64,
+        trace: Default::default(),
+        gc_stress: false,
+        gc_stress_full_period: None,
+        eden_kb: None,
+        jit: JitMode::Threshold(1),
+    });
+    install_value_prims(&mut vm);
+    let smi_klass = vm.universe.smi_klass;
+    let (upto, le, plus) = upto_scenario(&mut vm);
+    let epoch = vm.ic_epoch;
+    InterpreterIc::at(upto, 0).set_mono(&mut vm, smi_klass, le, epoch);
+    let epoch = vm.ic_epoch;
+    InterpreterIc::at(upto, 2).set_mono(&mut vm, smi_klass, plus, epoch);
+    let (m, block) = sumup_scenario(&mut vm, upto);
+    let epoch = vm.ic_epoch;
+    InterpreterIc::at(block, 0).set_mono(&mut vm, smi_klass, plus, epoch);
+
+    // K2 with its own `upTo: aBlock [ ^aBlock value: 99 ]`.
+    let k2 = vm.universe.new_klass(
+        vm.universe.object_klass,
+        "S14BlockargOther",
+        Format::Slots,
+        false,
+        HEADER_WORDS,
+    );
+    let upto_sel = vm.universe.intern(b"upTo:");
+    let value_arg_sel = vm.universe.intern(b"value:");
+    let k2_upto = {
+        let mut b = BytecodeBuilder::new();
+        b.push_temp(0); // aBlock
+        b.push_smi_i8(99);
+        b.send(&mut vm, value_arg_sel, 1);
+        b.ret_tos();
+        b.finish(&mut vm, upto_sel, 1, 0)
+    };
+    let upto_sel = vm.universe.intern(b"upTo:");
+    install_method(&mut vm, k2, upto_sel, k2_upto);
+
+    let id = driver::compile_method(&mut vm, smi_klass, m).expect("must compile");
+    let k2obj = alloc::alloc_slots(&mut vm, k2).oop();
+    let self_smi = SmallInt::new(1).oop();
+    // Interp reference with the K2 receiver.
+    let interp = macvm::interpreter::run_method(&mut vm, m, self_smi, &[k2obj]);
+    assert_eq!(
+        interp.raw(),
+        SmallInt::new(99).oop().raw(),
+        "interp: K2 upTo: → sum = 99"
+    );
+
+    let nm = vm.code_table.get(id).expect("installed");
+    let entry = unsafe { nm.code.base.add(nm.entry_off as usize) } as u64;
+    let call: CallStubFn = unsafe { std::mem::transmute(vm.stubs.call_stub_entry()) };
+    let vm_ptr: *mut VmState = &mut vm;
+    let deopts_before = unsafe { (*vm_ptr).stats.deopt_count };
+    let result = unsafe { call(entry, vm_ptr, [self_smi.raw(), k2obj.raw()].as_ptr(), 2) };
+    let deopts_after = unsafe { (*vm_ptr).stats.deopt_count };
+    assert_eq!(
+        result,
+        SmallInt::new(99).oop().raw(),
+        "guard-cold: phantom → real closure → K2's upTo: writes sum through M's Context"
+    );
+    // At least the guard's deopt fired. (Under threshold=1 the re-executed
+    // path may compile K2's own upTo: whose cold `value:` traps once more —
+    // collateral, correctness-preserving.)
+    assert!(
+        deopts_after > deopts_before,
+        "the block-arg guard must have deopted (before {deopts_before}, after {deopts_after})"
+    );
+}
+
+/// S14 step 7-IV-c (c): DEPTH-3 deopt — the BLOCK's own `+` is cold, so the
+/// spliced block body (inside the inlined `upTo:` inside `sumUp:`) traps on
+/// the first iteration. The materializer rebuilds THREE frames — M (Context
+/// materialized from the promoted `sum`), the callee (its block-arg temp = a
+/// MATERIALIZED closure!), and the block (Context aliasing M's, the ROOT) —
+/// then the interpreter finishes the whole loop (using the real closure for
+/// the remaining iterations) → sumUp(5) = 15, deopt_count +1.
+#[test]
+fn depth3_deopt_in_block_in_callee_rebuilds_all_frames() {
+    let mut vm = VmState::with_options(VmOptions {
+        heap_mib: 64,
+        trace: Default::default(),
+        gc_stress: false,
+        gc_stress_full_period: None,
+        eden_kb: None,
+        jit: JitMode::Threshold(1),
+    });
+    install_value_prims(&mut vm);
+    let smi_klass = vm.universe.smi_klass;
+    let (upto, le, plus) = upto_scenario(&mut vm);
+    let epoch = vm.ic_epoch;
+    InterpreterIc::at(upto, 0).set_mono(&mut vm, smi_klass, le, epoch);
+    let epoch = vm.ic_epoch;
+    InterpreterIc::at(upto, 2).set_mono(&mut vm, smi_klass, plus, epoch);
+    // The BLOCK's `+` stays Empty → a terminating trap inside the spliced body.
+    let (m, _block) = sumup_scenario(&mut vm, upto);
+
+    assert!(driver::eligible(&vm, m));
+    // Compile BEFORE the interp reference (interp would warm the block's +).
+    let id = driver::compile_method(&mut vm, smi_klass, m).expect("must compile");
+    let self_smi = SmallInt::new(1).oop();
+    let interp = macvm::interpreter::run_method(&mut vm, m, self_smi, &[SmallInt::new(5).oop()]);
+    assert_eq!(interp.raw(), SmallInt::new(15).oop().raw());
+
+    let nm = vm.code_table.get(id).expect("installed");
+    let entry = unsafe { nm.code.base.add(nm.entry_off as usize) } as u64;
+    let call: CallStubFn = unsafe { std::mem::transmute(vm.stubs.call_stub_entry()) };
+    let vm_ptr: *mut VmState = &mut vm;
+    let deopts_before = unsafe { (*vm_ptr).stats.deopt_count };
+    let result = unsafe {
+        call(
+            entry,
+            vm_ptr,
+            [self_smi.raw(), SmallInt::new(5).oop().raw()].as_ptr(),
+            2,
+        )
+    };
+    let deopts_after = unsafe { (*vm_ptr).stats.deopt_count };
+    assert_eq!(
+        result,
+        SmallInt::new(15).oop().raw(),
+        "depth-3 deopt must rebuild M + callee (with a materialized closure in its \
+         block-arg temp) + block frames, then the interpreter finishes the loop → 15"
+    );
+    assert_eq!(
+        deopts_after,
+        deopts_before + 1,
+        "one deopt (the block's cold +)"
+    );
+}
