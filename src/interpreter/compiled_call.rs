@@ -66,6 +66,16 @@ pub fn enter_compiled(vm: &mut VmState, nm_id: NmethodId, argc: u8) -> EnterResu
         vm.nlr_state.is_none(),
         "enter_compiled: entering compiled code with a parked NLR still in flight"
     );
+
+    // S13 D7 behavior 2 (`MACVM_DEOPT_STRESS`): every `stress_period` compiled
+    // entries, force-invalidate the next Alive nmethod as if its key method were
+    // redefined — driving the whole §2a/§2c/§2d + zombie-sweep deopt machinery
+    // under a real workload. Runs BEFORE `entry` is read so state stays
+    // consistent; never invalidates the method being entered.
+    if vm.deopt_stress {
+        stress_tick(vm, nm_id);
+    }
+
     let entry = {
         let nm = vm
             .code_table
@@ -157,6 +167,34 @@ pub fn enter_compiled(vm: &mut VmState, nm_id: NmethodId, argc: u8) -> EnterResu
     vm.stack.sp = base;
     push(vm, Oop::from_raw(result_bits));
     EnterResult::Completed
+}
+
+/// S13 D7 behavior 2: the `MACVM_DEOPT_STRESS` periodic-invalidation tick.
+/// Decrements `stress_countdown`; on reaching zero, resets it to `stress_period`
+/// and makes the next Alive nmethod (round-robin, never `entering`) NotEntrant
+/// — the same D1 path a real redefinition takes. Output-equivalent: the victim
+/// just re-resolves (interpret / recompile) on its next send, and any in-flight
+/// activation of it deopts via return-redirection or its loop poll. Callable
+/// only when `deopt_stress` is set (checked by the caller).
+fn stress_tick(vm: &mut VmState, entering: NmethodId) {
+    vm.stress_countdown = vm.stress_countdown.saturating_sub(1);
+    if vm.stress_countdown != 0 {
+        return;
+    }
+    vm.stress_countdown = vm.stress_period.max(1);
+
+    let alive: Vec<NmethodId> = vm
+        .code_table
+        .iter_alive()
+        .map(|nm| nm.id)
+        .filter(|&id| id != entering)
+        .collect();
+    if alive.is_empty() {
+        return; // nothing else to invalidate (the only nmethod is the one we're entering)
+    }
+    let victim = alive[vm.stress_rr_cursor % alive.len()];
+    vm.stress_rr_cursor = vm.stress_rr_cursor.wrapping_add(1);
+    crate::codecache::flush::make_not_entrant(vm, victim);
 }
 
 #[cfg(test)]

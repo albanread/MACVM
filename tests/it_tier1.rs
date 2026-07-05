@@ -851,6 +851,12 @@ fn compiled_loop_poll_deopts_via_enter_compiled() {
         deopts_before + 1,
         "exactly one loop-poll deopt fired"
     );
+    // S13 step 11: the deopt is attributed to the Poll reason.
+    assert_eq!(
+        vm.stats.deopt_by_reason[macvm::runtime::vm_state::DeoptReason::Poll as usize],
+        1,
+        "the loop-poll deopt is counted under DeoptReason::Poll"
+    );
     // The flags stay ARMED: disarming needs a native walk that is illegal from
     // rt_poll (IntoCompiled innermost + no anchor); it is deferred to step 10c's
     // zombie sweep, which runs at a GC-safe walk point.
@@ -1055,6 +1061,54 @@ fn full_gc_zombies_unreferenced_not_entrant_and_disarms() {
         "poll disarmed once no NotEntrant nmethod remains"
     );
     assert_eq!(vm.reg_block.poll_flag, 0, "poll_flag disarmed");
+}
+
+/// S13 step 11 (`MACVM_DEOPT_STRESS` behavior 2): every `stress_period` compiled
+/// entries, `enter_compiled` force-invalidates the next Alive nmethod
+/// round-robin (never the one being entered) via the real D1 path. Two compiled
+/// methods A/B, period 2, two entries into A → the second tick makes B
+/// NotEntrant while A (the entered method) stays Alive; A keeps returning the
+/// correct result throughout (stress is output-equivalent).
+#[test]
+fn deopt_stress_periodic_invalidation_round_robins() {
+    let mut vm = test_vm();
+    let smi_klass = vm.universe.smi_klass;
+    let (a_id, _) = compile_plus_arg(&mut vm); // A = plusArg: arg [^self + arg]
+
+    // B = retArg: x [^x], a trivial call-free eligible method.
+    let ret_sel = vm.universe.intern(b"retArg:");
+    let mut b = BytecodeBuilder::new();
+    b.push_temp(0);
+    b.ret_tos();
+    let bm = b.finish(&mut vm, ret_sel, 1, 0);
+    let b_id = driver::compile_method(&mut vm, smi_klass, bm).expect("B compiles");
+
+    // Arm stress with a tiny period.
+    vm.deopt_stress = true;
+    vm.stress_period = 2;
+    vm.stress_countdown = 2;
+
+    // Two entries into A: tick 1 just decrements, tick 2 invalidates the
+    // round-robin victim (B — A is filtered out as the method being entered).
+    for _ in 0..2 {
+        vm.stack.push(SmallInt::new(3).oop()); // receiver
+        vm.stack.push(SmallInt::new(4).oop()); // arg
+        assert_eq!(enter_compiled(&mut vm, a_id, 1), EnterResult::Completed);
+        assert_eq!(
+            vm.stack.pop().raw(),
+            SmallInt::new(7).oop().raw(),
+            "A stays correct under stress: 3 + 4 = 7"
+        );
+    }
+
+    assert!(
+        matches!(vm.code_table.get(b_id).unwrap().state, NmState::NotEntrant),
+        "stress invalidated B (round-robin, != the entered A) after `period` entries"
+    );
+    assert!(
+        matches!(vm.code_table.get(a_id).unwrap().state, NmState::Alive),
+        "the method being entered is never chosen as the stress victim"
+    );
 }
 
 /// Compiles `plusArg: arg [ ^self + arg ]` for `smi_klass` and returns its

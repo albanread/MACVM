@@ -1501,6 +1501,7 @@ pub unsafe extern "C" fn rt_poll(vm: *mut VmState, loop_fp: u64, ret_pc: u64) ->
             incoming_result: None,
         },
     );
+    vm.note_deopt(crate::runtime::vm_state::DeoptReason::Poll); // D7 stats + trace
     let result = crate::interpreter::interpret_active(vm, resume).raw();
 
     // An NLR escaping through the deoptee: the nested interpreter run returned

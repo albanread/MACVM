@@ -553,6 +553,7 @@ pub unsafe extern "C" fn rt_uncommon_trap(
             incoming_result: None, // uncommon-trap: reexecute site (no call result)
         },
     );
+    vm.note_deopt(crate::runtime::vm_state::DeoptReason::Trap); // D7 stats + trace
     crate::interpreter::interpret_active(vm, resume).raw()
 }
 
@@ -661,6 +662,7 @@ pub unsafe extern "C" fn rt_deopt_on_return(
             incoming_result: Some(Oop::from_raw(result)),
         },
     );
+    vm.note_deopt(crate::runtime::vm_state::DeoptReason::Return); // D7 stats + trace
     crate::interpreter::interpret_active(vm, resume).raw()
 }
 

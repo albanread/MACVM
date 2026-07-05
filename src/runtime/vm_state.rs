@@ -191,6 +191,26 @@ pub struct DeoptStats {
     /// Compiled frames materialized back into interpreter frames — bumped
     /// once per `deoptimize_frame` call (D5 M1).
     pub deopt_count: u64,
+    /// S13 D7: deopts split by trigger, indexed by [`DeoptReason`]
+    /// (`[trap, return, poll]`). Attributed at the three runtime deopt entry
+    /// points (`rt_uncommon_trap`/`rt_deopt_on_return`/`rt_poll`) via
+    /// [`VmState::note_deopt`], so `deopt_count == sum(deopt_by_reason)` for a
+    /// real run (a test that calls `deoptimize_frame` directly bumps only
+    /// `deopt_count`).
+    pub deopt_by_reason: [u64; 3],
+}
+
+/// S13 D7: which trigger fired a deopt — for `deopt_by_reason` attribution and
+/// the `MACVM_TRACE=deopt` channel. The discriminant IS the `deopt_by_reason`
+/// index.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeoptReason {
+    /// An uncommon trap (`brk`): smi overflow or `mustBeBoolean` (step 7).
+    Trap = 0,
+    /// A lazy return-address redirection into a `NotEntrant` frame (step 9).
+    Return = 1,
+    /// A loop back-edge poll of a `NotEntrant` frame (step 10b §2d).
+    Poll = 2,
 }
 
 /// Which `MACVM_TRACE` channels are enabled. The channel set is open-ended
@@ -441,6 +461,16 @@ pub struct VmState {
     /// materialized back into interpreter frame(s); read by tests and (later)
     /// the `MACVM_DEOPT_STRESS` differential harness.
     pub stats: DeoptStats,
+    /// S13 D7 (`MACVM_DEOPT_STRESS`) periodic-invalidation state. `deopt_stress`
+    /// gates behavior 2 entirely; `stress_period` is the number of compiled
+    /// entries between forced invalidations; `stress_countdown` the live counter
+    /// (`enter_compiled` decrements it); `stress_rr_cursor` round-robins the
+    /// victim over alive nmethods. Parsed from `MACVM_DEOPT_STRESS` in
+    /// `with_options` (see [`VmState::parse_deopt_stress`]); off by default.
+    pub deopt_stress: bool,
+    pub stress_period: u64,
+    pub stress_countdown: u64,
+    pub stress_rr_cursor: usize,
     /// The next frame serial to hand out (SPEC §5.4, S4) — monotonic,
     /// post-incremented at every `push_frame`. Never reused, which is what
     /// makes a `HomeRef`'s `(fp, serial)` pair a reliable dead-home check:
@@ -602,6 +632,42 @@ impl VmState {
     // collection under a live compiled frame is now simply an ordinary,
     // fully rooted collection, so there is nothing left to defer).
 
+    /// `MACVM_DEOPT_STRESS`'s default invalidation period (D7's own tunable).
+    pub const DEFAULT_STRESS_PERIOD: u64 = 1_000;
+
+    /// Pure parse of `MACVM_DEOPT_STRESS` (D7): `1` → on at the default period;
+    /// a bare `N` → on with period `N`; unset/other → off. Read in [`Self::new`]
+    /// (NOT `with_options`, which is deliberately env-free for tests) — but
+    /// unlike `MACVM_JIT` this is safe to source from the ambient environment
+    /// because stress is OUTPUT-EQUIVALENT (a differential harness): it only
+    /// forces extra deopts, never changes a program's result.
+    fn parse_deopt_stress(raw: Option<&str>) -> (bool, u64) {
+        match raw.map(str::trim) {
+            Some("1") => (true, Self::DEFAULT_STRESS_PERIOD),
+            Some(s) => match s.parse::<u64>() {
+                Ok(n) if n > 0 => (true, n),
+                _ => (false, Self::DEFAULT_STRESS_PERIOD),
+            },
+            None => (false, Self::DEFAULT_STRESS_PERIOD),
+        }
+    }
+
+    /// D7: attribute a deopt to its trigger (`deopt_by_reason`) and, under
+    /// `MACVM_TRACE=deopt`, print it. Called at each runtime deopt entry point
+    /// AFTER `deoptimize_frame` has bumped `deopt_count`.
+    pub fn note_deopt(&mut self, reason: DeoptReason) {
+        self.stats.deopt_by_reason[reason as usize] += 1;
+        if self.options.trace.is_enabled("deopt") {
+            eprintln!(
+                "[deopt] {reason:?} (#{}, by_reason=[trap {}, return {}, poll {}])",
+                self.stats.deopt_count,
+                self.stats.deopt_by_reason[0],
+                self.stats.deopt_by_reason[1],
+                self.stats.deopt_by_reason[2],
+            );
+        }
+    }
+
     /// Parses options from the environment once and boots a fresh universe.
     pub fn new() -> VmState {
         let mut vm = Self::with_options(VmOptions::from_env());
@@ -610,6 +676,14 @@ impl VmState {
             let s = s.strip_prefix("0x").unwrap_or(s);
             usize::from_str_radix(s, 16).ok()
         });
+        // S13 D7: stress is a VmState field (not a VmOptions one — 78 literal
+        // constructors), sourced from the ambient env only on this real entry
+        // point, never in `with_options`.
+        let (ds, sp) =
+            Self::parse_deopt_stress(std::env::var("MACVM_DEOPT_STRESS").ok().as_deref());
+        vm.deopt_stress = ds;
+        vm.stress_period = sp;
+        vm.stress_countdown = sp;
         vm
     }
 
@@ -670,6 +744,12 @@ impl VmState {
             start_instant: Instant::now(),
             bytecode_count: 0,
             stats: DeoptStats::default(),
+            // S13 D7: OFF here (env-free constructor); `new()` turns it on from
+            // `MACVM_DEOPT_STRESS`, tests set the fields directly.
+            deopt_stress: false,
+            stress_period: Self::DEFAULT_STRESS_PERIOD,
+            stress_countdown: Self::DEFAULT_STRESS_PERIOD,
+            stress_rr_cursor: 0,
             next_frame_serial: 0,
             dbg_oop: None,
             handle_arena: Box::new(crate::memory::handles::HandleArena::new()),
