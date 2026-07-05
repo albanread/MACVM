@@ -28,7 +28,7 @@
 
 use crate::codecache::deopt_trap::{read_frame_slot, read_pool_oop};
 use crate::codecache::nmethod::{Nmethod, NmethodId};
-use crate::compiler::scopes::{CtxLoc, DecodedScope, DeoptState, SafepointKind, ValueLoc};
+use crate::compiler::scopes::{CtxLoc, DecodedScope, DeoptState, ValueLoc};
 use crate::interpreter::stack::{Frame, FrameActivation};
 use crate::oops::smi::SmallInt;
 use crate::oops::wrappers::MethodOop;
@@ -188,6 +188,9 @@ pub fn deoptimize_frame(vm: &mut VmState, frame: FrameView) -> DeoptResume {
     // is dropped before the mutable `vm.stack` pushes (and the allocations
     // M6 performs) begin.
     let mut virtual_frames: Vec<VirtualFrame> = Vec::new();
+    // `site_kind` is consulted only by the debug-build M4 height cross-check
+    // below; a release build never reads it.
+    #[cfg_attr(not(debug_assertions), allow(unused_variables))]
     let (site_bci, site_reexecute, site_kind, site_stack) = {
         let nm = vm
             .code_table
@@ -448,8 +451,8 @@ pub fn deoptimize_frame(vm: &mut VmState, frame: FrameView) -> DeoptResume {
                 // saved_bci (the caller's resume) — the height model must be
                 // evaluated at where this frame actually resumes interpreting.
                 let resume_bci = resume_bci;
-                let skip_merge_check =
-                    vf.is_innermost && matches!(site_kind, SafepointKind::LoopPoll);
+                let skip_merge_check = vf.is_innermost
+                    && matches!(site_kind, crate::compiler::scopes::SafepointKind::LoopPoll);
                 if let (false, Some(model)) = (
                     skip_merge_check,
                     interpreter_model_height(method, resume_bci),
