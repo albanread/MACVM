@@ -67,6 +67,36 @@ pub fn enter_compiled(vm: &mut VmState, nm_id: NmethodId, argc: u8) -> EnterResu
         "enter_compiled: entering compiled code with a parked NLR still in flight"
     );
 
+    // S14 perf recovery: an ARMED poll flag makes EVERY compiled loop
+    // back-edge take the `bl stub_poll` slow path — a full runtime call per
+    // iteration, which flattens every loop benchmark to interpreter speed.
+    // §2d arms it on every invalidation (incl. each recompile-on-trap
+    // retirement), but the 10c sweep that disarms it only ran at FULL GC —
+    // never in an allocation-light run, so the flag stayed armed forever.
+    // This I→C boundary is a WALK-SAFE point (fully anchored interpreter
+    // state — the same context GC walks from), so drain-check here: the
+    // sweep frees drained NotEntrant nmethods and clears both flags once
+    // none remain. Cheap when disarmed (one bool test); runs only while
+    // armed.
+    // (`compiled_depth == 0` guard: a NESTED enter — c2i reentrancy, or the
+    // post-deopt interpret inside `rt_uncommon_trap` — sits above compiled
+    // native frames whose chain may not be walkable from here; the next
+    // TOP-LEVEL enter sweeps instead.)
+    // (`Alive` guard: the S13 10b poll-deopt path deliberately enters a
+    // NotEntrant nmethod — its patched entry is HOW the running loop gets
+    // deopted — and the sweep would flush that very target out from under
+    // us. An Alive target can't be flushed by the sweep, which only frees
+    // drained NotEntrant code.)
+    if vm.pending_deopt_flag
+        && vm.compiled_depth == 0
+        && vm
+            .code_table
+            .get(nm_id)
+            .is_some_and(|nm| matches!(nm.state, crate::codecache::nmethod::NmState::Alive))
+    {
+        crate::codecache::flush::sweep_not_entrant_zombies(vm);
+    }
+
     // S13 D7 behavior 2 (`MACVM_DEOPT_STRESS`): every `stress_period` compiled
     // entries, force-invalidate the next Alive nmethod as if its key method were
     // redefined — driving the whole §2a/§2c/§2d + zombie-sweep deopt machinery

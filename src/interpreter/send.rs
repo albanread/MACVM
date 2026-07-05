@@ -166,7 +166,22 @@ pub fn activate_method(
         if bumped >= n as i64 && !m.compile_disabled() {
             let rcvr = vm.stack.get(vm.stack.sp - argc as usize - 1);
             let k = klass_of(vm, rcvr);
-            if let Some(id) = crate::compiler::driver::compile_method(vm, k, m) {
+            // S14 perf recovery (THE compile-storm fix): REUSE an Alive
+            // nmethod for this (klass, selector) instead of compiling a fresh
+            // one on every trigger. Without this check, every stale-IC heal
+            // after a recompile-on-trap retirement RE-COMPILED the method
+            // (dozens of duplicate nmethods per run), eventually exhausting
+            // the code cache — which silently disabled the JIT for the rest
+            // of the process and pinned every benchmark at interpreter speed.
+            let sel = crate::oops::wrappers::SymbolOop::try_from(m.selector())
+                .expect("a method's selector is always a Symbol");
+            let existing = vm.code_table.lookup(k, sel).filter(|&id| {
+                vm.code_table
+                    .get(id)
+                    .is_some_and(|nm| matches!(nm.state, NmState::Alive))
+            });
+            let compiled = existing.or_else(|| crate::compiler::driver::compile_method(vm, k, m));
+            if let Some(id) = compiled {
                 if let Some((caller, ic_idx)) = ic_site {
                     let epoch = vm.ic_epoch;
                     InterpreterIc::at(caller, ic_idx).set_mono_compiled(vm, k, id, epoch);

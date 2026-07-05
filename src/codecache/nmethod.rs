@@ -567,7 +567,15 @@ impl CodeTable {
             .expect("mark_zombie: id must be alive");
         nm.state = NmState::Zombie;
         let key = (nm.key_klass.oop().raw(), nm.key_selector.oop().raw());
-        self.by_key.remove(&key);
+        // Only unhook the key if it still names THIS nmethod: a replaced
+        // (recompiled) nmethod's key already points at its successor, and
+        // removing it here would orphan the LIVE replacement — every later
+        // `lookup` would miss, so compiled sites would resolve to c2i
+        // adapters (interpreting forever) and the interpreter trigger would
+        // compile duplicate after duplicate. (The S14 perf-recovery bug.)
+        if self.by_key.get(&key) == Some(&id) {
+            self.by_key.remove(&key);
+        }
     }
 
     /// S13 D1 §2a: mark `id` `NotEntrant` and unhook it from `by_key`, so a
@@ -599,7 +607,14 @@ impl CodeTable {
         );
         nm.state = NmState::NotEntrant;
         let key = (nm.key_klass.oop().raw(), nm.key_selector.oop().raw());
-        self.by_key.remove(&key);
+        // Same successor guard as `mark_zombie`: recompilation installs the
+        // replacement FIRST (recompile.rs relies on the key never pointing
+        // at nothing), so by the time the old version is retired the key
+        // already names the new one — removing it unconditionally would
+        // orphan the replacement from every future `lookup`.
+        if self.by_key.get(&key) == Some(&id) {
+            self.by_key.remove(&key);
+        }
     }
 
     /// S12 D6.1 step 4: removes `id` from `by_addr`, drops its `Nmethod`
