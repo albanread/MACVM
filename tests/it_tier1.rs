@@ -3852,3 +3852,266 @@ fn redefining_inlined_callee_invalidates_caller() {
         "redefining the inlined `val` must make the caller nmethod NotEntrant"
     );
 }
+
+// ─── S14 step 4c: non-leaf method inlining ─────────────────────────────────
+
+/// Builds the non-leaf inline scenario:
+///   `bar [ ^instvar0 ]`      — a leaf accessor on `recv_klass`,
+///   `run [ ^self bar ]`      — a NON-leaf helper (its `self bar` send is the
+///                              in-body safepoint that makes 4c's depth-2 deopt
+///                              live), warmed mono to `bar`,
+///   `outer: x [ ^x run ]`    — the caller; the `x run` send is warmed mono to
+///                              `run` on the ARGUMENT `x` (so the inline guard's
+///                              cold path is genuinely reachable — the entry
+///                              guard customizes on `self`, not `x`).
+/// `warm_bar` controls the helper's OWN `self bar` IC: `true` warms it mono (so
+/// the inlined body's inner send becomes a real compiled `CallSend`), `false`
+/// leaves it Empty (so the inlined body's inner send becomes a step-3 uncommon
+/// TRAP — the in-body deopt trigger). Returns `(recv_klass, run_sel, bar_sel,
+/// outer_method)`.
+fn nonleaf_inline_scenario(
+    vm: &mut VmState,
+    warm_bar: bool,
+) -> (KlassOop, SymbolOop, SymbolOop, MethodOop) {
+    let recv_klass = vm.universe.new_klass(
+        vm.universe.object_klass,
+        "S14NonLeafRecv",
+        Format::Slots,
+        false,
+        HEADER_WORDS + 1,
+    );
+    // `bar [ ^instvar0 ]` — a leaf accessor.
+    let bar_sel = vm.universe.intern(b"bar");
+    let bar = {
+        let mut bb = BytecodeBuilder::new();
+        bb.push_instvar(0);
+        bb.ret_tos();
+        bb.finish(vm, bar_sel, 0, 0)
+    };
+    install_method(vm, recv_klass, bar_sel, bar);
+
+    // `run [ ^self bar ]` — a NON-leaf helper (one inner send).
+    let run_sel = vm.universe.intern(b"run");
+    let run = {
+        let mut rb = BytecodeBuilder::new();
+        rb.push_self();
+        rb.send(vm, bar_sel, 0);
+        rb.ret_tos();
+        rb.finish(vm, run_sel, 0, 0)
+    };
+    install_method(vm, recv_klass, run_sel, run);
+    if warm_bar {
+        // Warm the helper's OWN `self bar` site to Mono on `recv_klass` so the
+        // inlined body's inner send is a real compiled `CallSend`.
+        let epoch = vm.ic_epoch;
+        InterpreterIc::at(run, 0).set_mono(vm, recv_klass, bar, epoch);
+    }
+
+    // `outer: x [ ^x run ]` — the `x run` send is on the ARGUMENT.
+    let outer_sel = vm.universe.intern(b"outer:");
+    let mut ob = BytecodeBuilder::new();
+    ob.push_temp(0); // x
+    ob.send(vm, run_sel, 0);
+    ob.ret_tos();
+    let outer = ob.finish(vm, outer_sel, 1, 0);
+
+    // Warm the `x run` site to Mono on `recv_klass` (its real target).
+    let epoch = vm.ic_epoch;
+    InterpreterIc::at(outer, 0).set_mono(vm, recv_klass, run, epoch);
+    (recv_klass, run_sel, bar_sel, outer)
+}
+
+/// S14 step 4c (a): the NON-LEAF inlined DIFFERENTIAL. `outer: x [ ^x run ]`
+/// with `run [ ^self bar ]` (a helper with a real inner send) warmed mono →
+/// `run` is spliced inline, and its `self bar` send becomes a plain compiled
+/// `CallSend` INSIDE the inlined body (recording a `SenderLink` deopt scope).
+/// The compiled result equals the pure interpreter for a discriminating value.
+#[test]
+fn compiled_inlined_nonleaf_matches_interpreter() {
+    let mut vm = test_vm();
+    let smi_klass = vm.universe.smi_klass;
+    let (recv_klass, _run_sel, _bar_sel, outer) = nonleaf_inline_scenario(&mut vm, true);
+
+    // Compile `outer:` customized for SmallInteger (self is a smi; the inlined
+    // send's receiver is the ARG `x`). Eligible: its one send is a mono callee
+    // whose body is a single-block non-leaf (4c).
+    assert!(
+        driver::eligible(&vm, outer),
+        "a mono non-leaf send must be eligible (it inlines)"
+    );
+    let id = driver::compile_method(&mut vm, smi_klass, outer).expect("must compile");
+
+    // The `x run` send was inlined: it records NO IcSite of its own; the
+    // inlined body's inner `self bar` send DID emit one real compiled IC site
+    // (it dispatches). And the nmethod records the (recv_klass, run) inline dep.
+    {
+        let nm = vm.code_table.get(id).expect("installed");
+        assert_eq!(
+            nm.ic_sites.len(),
+            1,
+            "the inlined body's inner `self bar` send is one real compiled IC site \
+             (the outer `x run` was inlined away)"
+        );
+        assert_eq!(
+            nm.inline_deps.len(),
+            1,
+            "one inline dependency recorded (the inlined `run`)"
+        );
+        assert_eq!(nm.inline_deps[0].0.oop().raw(), recv_klass.oop().raw());
+    }
+
+    // An argument whose instvar0 holds a discriminating value (12321).
+    let discriminating = SmallInt::new(12321).oop();
+    let arg = alloc::alloc_slots(&mut vm, recv_klass).oop();
+    MemOop::try_from(arg)
+        .unwrap()
+        .set_body_oop(0, discriminating);
+    let self_smi = SmallInt::new(7).oop(); // the customization receiver (unused by the body)
+
+    // Interpreter reference: `^x run` → `^self bar` (self=x) → `^instvar0`.
+    let interp = macvm::interpreter::run_method(&mut vm, outer, self_smi, &[arg]);
+    assert_eq!(
+        interp.raw(),
+        discriminating.raw(),
+        "interpreter reference: `^x run` = the argument's instvar0"
+    );
+
+    // Compiled: guard `x`, splice `run`, dispatch `self bar` → the same value.
+    let nm = vm.code_table.get(id).expect("installed");
+    let entry = unsafe { nm.code.base.add(nm.entry_off as usize) } as u64;
+    let call: CallStubFn = unsafe { std::mem::transmute(vm.stubs.call_stub_entry()) };
+    let vm_ptr: *mut VmState = &mut vm;
+    let result = unsafe { call(entry, vm_ptr, [self_smi.raw(), arg.raw()].as_ptr(), 2) };
+    assert_eq!(
+        result,
+        discriminating.raw(),
+        "compiled inlined non-leaf must match the interpreter (differential)"
+    );
+}
+
+/// S14 step 4c (b): THE CRUX — a deopt at a safepoint INSIDE the inlined body.
+/// `outer: x [ ^x run ]` with `run [ ^self bar ]` where `run`'s OWN `self bar`
+/// IC is left Empty (Untaken): when `run` is inlined into the compiled `outer`,
+/// that inner send becomes a step-3 uncommon TRAP INSIDE the inlined body.
+/// Calling the compiled `outer` hits the trap → `deoptimize_frame` must rebuild
+/// BOTH interpreter frames (the inlined `run` frame AND the caller `outer`
+/// frame) from the ONE physical compiled frame, following the `SenderLink`
+/// chain → `interpret_active` resumes → re-executes `self bar` generically →
+/// identical result to the pure interpreter, with `deopt_count` bumped. This is
+/// the first time the depth-N materializer runs at depth 2.
+#[test]
+fn deopt_through_inlined_nonleaf_body_rebuilds_both_frames() {
+    // A JIT-armed VM so the SIGTRAP handler is live (the in-body trap and the
+    // guard cold path are real `brk`s).
+    let mut vm = VmState::with_options(VmOptions {
+        heap_mib: 64,
+        trace: Default::default(),
+        gc_stress: false,
+        gc_stress_full_period: None,
+        eden_kb: None,
+        jit: JitMode::Threshold(1),
+    });
+    let smi_klass = vm.universe.smi_klass;
+    // warm_bar = false → the helper's inner `self bar` stays Untaken → an
+    // in-body trap once inlined.
+    let (recv_klass, _run_sel, _bar_sel, outer) = nonleaf_inline_scenario(&mut vm, false);
+
+    assert!(
+        driver::eligible(&vm, outer),
+        "a mono non-leaf send (whose inner send is a cold trap) is still eligible"
+    );
+    let id = driver::compile_method(&mut vm, smi_klass, outer).expect("must compile");
+
+    // The inlined body's inner send is an uncommon TRAP (Untaken), not a
+    // CallSend → the nmethod records NO compiled IC site, but DOES record the
+    // (recv_klass, run) inline dep and a nested (depth-2) deopt scope.
+    {
+        let nm = vm.code_table.get(id).expect("installed");
+        assert!(
+            nm.ic_sites.is_empty(),
+            "the inlined body's cold inner send is a trap, not a compiled IC site"
+        );
+        assert_eq!(nm.inline_deps.len(), 1, "one inline dependency (`run`)");
+    }
+
+    // Argument of recv_klass whose instvar0 holds a discriminating value.
+    let discriminating = SmallInt::new(45654).oop();
+    let arg = alloc::alloc_slots(&mut vm, recv_klass).oop();
+    MemOop::try_from(arg)
+        .unwrap()
+        .set_body_oop(0, discriminating);
+    let self_smi = SmallInt::new(7).oop();
+
+    // Interpreter reference.
+    let interp = macvm::interpreter::run_method(&mut vm, outer, self_smi, &[arg]);
+    assert_eq!(interp.raw(), discriminating.raw());
+
+    let nm = vm.code_table.get(id).expect("installed");
+    let entry = unsafe { nm.code.base.add(nm.entry_off as usize) } as u64;
+    let call: CallStubFn = unsafe { std::mem::transmute(vm.stubs.call_stub_entry()) };
+    let vm_ptr: *mut VmState = &mut vm;
+
+    let deopts_before = unsafe { (*vm_ptr).stats.deopt_count };
+    // Entering the compiled `outer` passes the inline guard (x IS recv_klass),
+    // splices into the inlined `run` body, and hits the in-body trap on
+    // `self bar` → deopt through the SenderLink chain → rebuild the `run` frame
+    // AND the `outer` frame → interpret both → `^self bar` = 45654.
+    let result = unsafe { call(entry, vm_ptr, [self_smi.raw(), arg.raw()].as_ptr(), 2) };
+    let deopts_after = unsafe { (*vm_ptr).stats.deopt_count };
+
+    assert_eq!(
+        result,
+        discriminating.raw(),
+        "the in-body trap must deopt through BOTH frames and return the inlined \
+         body's own computed value"
+    );
+    assert_eq!(
+        result,
+        interp.raw(),
+        "and match the pure-interpreter reference (differential — proves both frames rebuilt)"
+    );
+    assert_eq!(
+        deopts_after,
+        deopts_before + 1,
+        "exactly one deopt (the in-body trap's brk fired)"
+    );
+}
+
+/// S14 step 4c (c): REDEFINITION invalidation for a non-leaf inlined callee.
+/// Redefining the inlined `run` on the receiver klass makes the caller nmethod
+/// `NotEntrant` — its guard assumed `lookup(recv_klass, run)` == the spliced
+/// body, an assumption a redefinition breaks (identical mechanism to 4b, on a
+/// non-leaf callee).
+#[test]
+fn redefining_inlined_nonleaf_callee_invalidates_caller() {
+    let mut vm = test_vm();
+    let smi_klass = vm.universe.smi_klass;
+    let (recv_klass, run_sel, _bar_sel, outer) = nonleaf_inline_scenario(&mut vm, true);
+    let id = driver::compile_method(&mut vm, smi_klass, outer).expect("must compile");
+    assert!(
+        matches!(vm.code_table.get(id).unwrap().state, NmState::Alive),
+        "freshly compiled → Alive"
+    );
+
+    // An unrelated redefinition must NOT invalidate.
+    let unrelated = vm.universe.intern(b"unrelatedNL");
+    let unrelated_body = trivial_method(&mut vm, unrelated);
+    install_method(&mut vm, recv_klass, unrelated, unrelated_body);
+    assert!(
+        matches!(vm.code_table.get(id).unwrap().state, NmState::Alive),
+        "unrelated selector must NOT invalidate the inlining caller"
+    );
+
+    // Redefining the inlined callee `run` itself → NotEntrant.
+    let new_run = {
+        let mut rb = BytecodeBuilder::new();
+        rb.push_self();
+        rb.ret_tos();
+        rb.finish(&mut vm, run_sel, 0, 0)
+    };
+    install_method(&mut vm, recv_klass, run_sel, new_run);
+    assert!(
+        matches!(vm.code_table.get(id).unwrap().state, NmState::NotEntrant),
+        "redefining the inlined non-leaf `run` must make the caller nmethod NotEntrant"
+    );
+}

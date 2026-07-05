@@ -100,6 +100,65 @@ pub fn is_leaf(method: MethodOop) -> bool {
     true
 }
 
+/// S14 step 4c: is `method` a callee the NON-LEAF inliner can splice? This is
+/// the eligibility gate for a callee that HAS sends (so it is not a leaf) but
+/// is still a single straight-line body whose own sends become plain compiled
+/// `CallSend`s (or step-3 traps) inside the inlined extent, and whose deopts
+/// rebuild through a `SenderLink` chain. The narrow, provably-correct shape
+/// step 4c inlines (breadth — multi-block callees, branches inside the inlinee,
+/// recursion into the inlinee — is deferred; the vertical, splice → nested
+/// scope → depth-2 deopt reconstruction, is what this step proves):
+///
+///   - NOT a `has_ctx`/`is_block` method (no Context to materialize, no
+///     non-local return frame games);
+///   - contains NO `super` send, NO closure/ctx-temp/block-return/NLR opcode
+///     (those need scope machinery this step does not build — they stay
+///     `Call`);
+///   - a SINGLE straight-line block ending in a return (the same shape
+///     `try_inline_leaf` already handles, minus the leaf restriction —
+///     `try_inline_nonleaf` splices exactly this and no more).
+///
+/// The callee's own ordinary (non-super) sends are fine: each becomes a plain
+/// `Ir::CallSend` (compiled IC) — or, if its own IC is cold, a step-3
+/// `Ir::UncommonTrap` — inside the inlined body, recording a deopt scope whose
+/// scope is the inlined scope (with a `SenderLink` to the caller). This is what
+/// makes the depth-2 deopt reconstruction live for the first time.
+pub fn is_inline_eligible_nonleaf(method: MethodOop) -> bool {
+    if method.primitive() != 0 || method.has_ctx() || method.is_block() {
+        return false;
+    }
+    // Single straight-line block ending in a return: reuse the decode CFG the
+    // splicer itself validates against, so the two agree by construction.
+    let cfg = crate::compiler::decode::decode(method);
+    if cfg.blocks.len() != 1
+        || !matches!(
+            cfg.blocks[0].terminator,
+            crate::compiler::decode::Terminator::Return
+        )
+    {
+        return false;
+    }
+    // No opcode outside the set the non-leaf splicer handles. A `super` send,
+    // a closure/ctx-temp/block-return/NLR all stay `Call` (the callee is not
+    // inlined at all — the caller does a plain compiled send to it).
+    let len = method.bytecode_len();
+    let mut bci = 0;
+    while bci < len {
+        let (instr, next) = decode_at(method, bci);
+        match instr {
+            Instr::Send { super_: true, .. }
+            | Instr::PushCtxTemp { .. }
+            | Instr::StoreCtxTempPop { .. }
+            | Instr::PushClosure { .. }
+            | Instr::BlockReturnTos
+            | Instr::NlrTos => return false,
+            _ => {}
+        }
+        bci = next;
+    }
+    true
+}
+
 /// A method whose whole body is a single `push_*; ^tos` (accessor / quick
 /// return) or a bare `^self` — the cost-2 shapes above.
 fn is_quick_return(method: MethodOop) -> bool {
@@ -214,13 +273,27 @@ pub fn decide_with_budget(
             // A PRIMITIVE method's real behaviour is the primitive itself; its
             // bytecode is only the failure fallback (`instVarAt:`, `+`, etc.).
             // Splicing that fallback inline would run the WRONG code — so a
-            // primitive is never leaf-inlined here (primitive-INTRINSIC inlining
-            // is a later step). `is_leaf` alone would accept it (a fallback with
-            // no sends is send-free), hence this explicit guard.
-            if method.primitive() == 0
-                && is_leaf(*method)
+            // primitive is never inlined here (primitive-INTRINSIC inlining is a
+            // later step). `is_leaf` alone would accept it (a fallback with no
+            // sends is send-free), hence the `primitive() == 0` guard on both
+            // arms below.
+            //
+            // S14 step 4c: a mono callee inlines iff it is cheap enough AND
+            // either
+            //   - a LEAF (no sends → no inner safepoint → no `SenderLink`
+            //     needed — step 4b's exact class), OR
+            //   - a non-leaf but INLINE-ELIGIBLE body ([`is_inline_eligible_
+            //     nonleaf`]: single straight-line block, no super/ctx/closure/
+            //     NLR). Its own sends become plain `CallSend`s (or step-3 traps)
+            //     inside the inlined extent and record deopt scopes chained to
+            //     the caller via a `SenderLink` — the first time the depth-N
+            //     materializer runs at depth > 1.
+            // Anything else (a primitive, an over-budget body, a callee with a
+            // super send / blocks / ctx, a Poly/Mega/Untaken site) → `Call`.
+            let inlinable = method.primitive() == 0
                 && inline_cost(*method) <= budget.per_call_cost
-            {
+                && (is_leaf(*method) || is_inline_eligible_nonleaf(*method));
+            if inlinable {
                 let guard = if klass.oop().raw() == smi_klass_bits {
                     GuardKind::SmiTest
                 } else {
@@ -435,7 +508,11 @@ mod tests {
             other => panic!("expected Inline, got {other:?}"),
         }
 
-        // A NON-leaf mono target (`^self foo`) → Call, never Inline.
+        // S14 step 4c: a NON-leaf but INLINE-ELIGIBLE mono target (`^self foo`,
+        // a single straight-line body with one ordinary send, no super/ctx/NLR)
+        // now INLINES (its send becomes a plain `CallSend`/trap inside the
+        // spliced body, with a `SenderLink` deopt scope). Step 4b left this a
+        // `Call`; 4c relaxes it.
         let foo = vm.universe.intern(b"foo");
         let nl_sel = vm.universe.intern(b"nonLeaf");
         let mut nb = BytecodeBuilder::new();
@@ -443,17 +520,43 @@ mod tests {
         nb.send(&mut vm, foo, 0);
         nb.ret_tos();
         let non_leaf = nb.finish(&mut vm, nl_sel, 0, 0);
-        assert!(matches!(
-            decide_with_budget(
-                &SiteFeedback::Mono {
-                    klass: obj_klass,
-                    method: non_leaf,
-                },
-                &budget,
-                smi_bits,
+        assert!(
+            matches!(
+                decide_with_budget(
+                    &SiteFeedback::Mono {
+                        klass: obj_klass,
+                        method: non_leaf,
+                    },
+                    &budget,
+                    smi_bits,
+                ),
+                InlineDecision::Inline { .. }
             ),
-            InlineDecision::Call
-        ));
+            "a cheap single-block non-leaf callee inlines (4c)"
+        );
+
+        // A callee with a SUPER send stays `Call` (4c gates super sends out —
+        // they need scope machinery this step does not build).
+        let sup_sel = vm.universe.intern(b"withSuper");
+        let mut sb = BytecodeBuilder::new();
+        sb.push_self();
+        sb.send_super(&mut vm, foo, 0);
+        sb.ret_tos();
+        let super_callee = sb.finish(&mut vm, sup_sel, 0, 0);
+        assert!(
+            matches!(
+                decide_with_budget(
+                    &SiteFeedback::Mono {
+                        klass: obj_klass,
+                        method: super_callee,
+                    },
+                    &budget,
+                    smi_bits,
+                ),
+                InlineDecision::Call
+            ),
+            "a callee with a super send is not inlined (stays Call)"
+        );
 
         // An over-budget leaf (cost > per_call_cost) → Call. Build a leaf whose
         // cost is its bytecode length, larger than a tiny budget.

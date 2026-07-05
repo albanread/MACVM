@@ -267,6 +267,45 @@ pub fn compute_intervals(method: &IrMethod) -> (Vec<BlockId>, Vec<LiveInterval>,
                     deopt_live.push((v.0, pos));
                 }
             }
+            // S14 step 4c: an INLINED-body safepoint (of ANY kind, INCLUDING a
+            // `Call` — a real `CallSend` inside a spliced non-leaf body). Its
+            // deopt rebuilds TWO interpreter frames from this one physical
+            // frame, so the driver resolves, for THIS site, not just the root
+            // scope's receiver/slots but ALSO the INLINED scope's receiver +
+            // slots and the caller's `pending_stack` — none of which are
+            // guaranteed naturally live-across (the inlined body may just return
+            // after the send, leaving the caller's frozen operand stack and the
+            // root slots dead in the compiled code, hence Nil'd — a silently
+            // wrong depth-2 deopt). Widen them all to `end > pos` so spill-all
+            // pins every entity of BOTH frames to a canonical slot the
+            // materializer reads. The `Call` exclusion above is deliberately not
+            // relaxed for ROOT `Call`s (natural liveness covers them); this is
+            // the narrow inlined-site case only.
+            if let Some((_, raw)) = block
+                .deopt_sites
+                .iter()
+                .find(|(ci, raw)| *ci == idx as u32 && raw.inline.is_some())
+            {
+                let site = raw.inline.as_ref().unwrap();
+                // Caller (root) frame: receiver + every unified slot.
+                deopt_live.push((0, pos));
+                for s in 1..=n_slots {
+                    deopt_live.push((s, pos));
+                }
+                // Inlined frame: its own receiver + slots.
+                deopt_live.push((site.receiver.0, pos));
+                for slot in &site.slots {
+                    deopt_live.push((slot.0, pos));
+                }
+                // The caller's frozen operand stack (SenderLink.pending_stack)
+                // and the innermost recorded operand stack.
+                for v in &site.caller_pending_stack {
+                    deopt_live.push((v.0, pos));
+                }
+                for &v in &raw.stack {
+                    deopt_live.push((v.0, pos));
+                }
+            }
             ir.uses(|v| {
                 max_use
                     .entry(v.0)

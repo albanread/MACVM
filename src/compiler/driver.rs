@@ -241,18 +241,22 @@ fn mono_smi_inline_send(vm: &VmState, method: MethodOop, ic_idx: u16) -> Eligibi
     if target.primitive() == crate::compiler::ir::PRIM_BASIC_NEW && site.argc() == 0 {
         return Eligibility::Yes;
     }
-    // S14 step 4b: a mono send whose callee is a cheap NON-PRIMITIVE LEAF is
+    // S14 step 4b/4c: a mono send whose callee is a cheap NON-PRIMITIVE body is
     // inlinable regardless of the receiver klass — `ir::convert` splices it
     // behind a receiver-klass guard (cold path = an uncommon trap). This admits
-    // a mono-non-smi accessor send (`^self val`, `val` a leaf) that would
-    // otherwise be rejected as a "mono but non-smi guard" below. A PRIMITIVE
-    // target is excluded (its bytecode is only the failure fallback, not its
-    // real behaviour — kept in lockstep with `inline::decide_with_budget`'s own
-    // `primitive() == 0` gate). Budget-checked at level 1 (the tier-1 level).
+    // a mono-non-smi accessor send (`^self val`, `val` a leaf — 4b) OR a cheap
+    // single-block NON-leaf callee (`run [ ^self bar ]` — 4c), either of which
+    // would otherwise be rejected as a "mono but non-smi guard" below. A
+    // PRIMITIVE target is excluded (its bytecode is only the failure fallback,
+    // not its real behaviour). Kept in EXACT lockstep with
+    // `inline::decide_with_budget`'s own gate (leaf OR inline-eligible non-leaf,
+    // non-primitive, within budget) so the eligibility check and the actual
+    // inline decision never disagree. Budget-checked at level 1 (tier-1 level).
     if target.primitive() == 0
-        && crate::compiler::inline::is_leaf(target)
         && crate::compiler::inline::inline_cost(target)
             <= crate::compiler::inline::budget_for_level(1).per_call_cost
+        && (crate::compiler::inline::is_leaf(target)
+            || crate::compiler::inline::is_inline_eligible_nonleaf(target))
     {
         return Eligibility::Yes;
     }
@@ -557,7 +561,7 @@ fn build_deopt_metadata(
     safepoint_pcs: &[emit::SafepointPc],
 ) -> (Vec<u8>, Vec<crate::compiler::scopes::PcDesc>) {
     use crate::compiler::scopes::{
-        resolve_frame_loc, CtxLoc, SafepointState, ScopeDescData, ScopeDescRecorder,
+        resolve_frame_loc, CtxLoc, SafepointState, ScopeDescData, ScopeDescRecorder, SenderLink,
     };
 
     let sp_by_pos: std::collections::HashMap<u32, &emit::SafepointPc> =
@@ -578,23 +582,74 @@ fn build_deopt_metadata(
                     )
                 });
                 let position = sp.position; // == pos (map is keyed by it)
-                let receiver = resolve_frame_loc(ir::VReg(0), position, intervals);
-                let slots = (0..n_slots)
+                                            // The ROOT (caller) scope — the depth-1 shape S13 always built:
+                                            // this method's own receiver (VReg 0) + unified slots
+                                            // (VReg 1..=n_slots), `sender: None`, root method_pool_ix.
+                let root_receiver = resolve_frame_loc(ir::VReg(0), position, intervals);
+                let root_slots = (0..n_slots)
                     .map(|i| resolve_frame_loc(ir::VReg(i as u32 + 1), position, intervals))
                     .collect();
-                let scope = rec.begin_scope(ScopeDescData {
-                    // S13: this method's own compiled MethodOop, interned by
-                    // `ir::convert` iff the method has deopt sites — which it
-                    // does (we are recording one now), so this is always Some.
-                    method_pool_ix: ir_method
-                        .method_pool_ix
-                        .expect("a method with a deopt site interned its own method oop"),
-                    is_block: false,
-                    sender: None,
-                    receiver,
-                    slots,
-                    ctx: CtxLoc::None,
-                });
+                let root_method_ix = ir_method
+                    .method_pool_ix
+                    .expect("a method with a deopt site interned its own method oop");
+
+                // S14 step 4c: a safepoint INSIDE an inlined body records a
+                // NESTED scope — the inlined callee's own receiver/slots/method
+                // + a `SenderLink` to the (freshly begun) caller scope. A
+                // root-method safepoint (`raw.inline == None`) records the
+                // depth-1 caller scope directly, exactly as S13 did (no
+                // regression — `sender: None`).
+                let scope = match &raw.inline {
+                    None => rec.begin_scope(ScopeDescData {
+                        method_pool_ix: root_method_ix,
+                        is_block: false,
+                        sender: None,
+                        receiver: root_receiver,
+                        slots: root_slots,
+                        ctx: CtxLoc::None,
+                    }),
+                    Some(site) => {
+                        // Begin the CALLER scope first (the SenderLink's target
+                        // must exist before its child — `begin_scope`'s own
+                        // invariant). It is the same depth-1 root scope shape.
+                        let caller_scope = rec.begin_scope(ScopeDescData {
+                            method_pool_ix: root_method_ix,
+                            is_block: false,
+                            sender: None,
+                            receiver: root_receiver,
+                            slots: root_slots,
+                            ctx: CtxLoc::None,
+                        });
+                        // The SenderLink: where the caller resumes (the inlined
+                        // send's bci, advanced past it by the materializer) and
+                        // its frozen operand stack below the send's operands.
+                        let pending_stack = site
+                            .caller_pending_stack
+                            .iter()
+                            .map(|&v| resolve_frame_loc(v, position, intervals))
+                            .collect();
+                        // The INLINED (innermost) scope: the callee's own
+                        // receiver/slots/method, chained to the caller.
+                        let inl_receiver = resolve_frame_loc(site.receiver, position, intervals);
+                        let inl_slots = site
+                            .slots
+                            .iter()
+                            .map(|&v| resolve_frame_loc(v, position, intervals))
+                            .collect();
+                        rec.begin_scope(ScopeDescData {
+                            method_pool_ix: site.method_pool_ix,
+                            is_block: false,
+                            sender: Some(SenderLink {
+                                sender: caller_scope,
+                                sender_bci: site.sender_bci,
+                                pending_stack,
+                            }),
+                            receiver: inl_receiver,
+                            slots: inl_slots,
+                            ctx: CtxLoc::None,
+                        })
+                    }
+                };
                 let stack = raw
                     .stack
                     .iter()
@@ -1043,24 +1098,25 @@ mod tests {
         // stay generic `CallSend`s (this test's premise). An Empty IC would now
         // lower to an uncommon TRAP (`SiteFeedback::Untaken`), which is a
         // different scope shape exercised by the it_tier1 trap test — here we
-        // want the two-CallSend safepoint layout. S14 step 4b: the targets are
-        // deliberately NON-LEAF (each contains its own inner send), so the
-        // inliner leaves both sites as real `CallSend`s rather than splicing a
-        // leaf accessor inline (which would collapse a safepoint and break the
-        // two-CallSend premise).
+        // want the two-CallSend safepoint layout. S14 step 4c: the targets are
+        // deliberately NON-INLINABLE (each contains a SUPER send, which the
+        // inliner gates out), so the inliner leaves both sites as real
+        // `CallSend`s rather than splicing a body inline (a leaf accessor OR a
+        // plain non-leaf now inlines — either would collapse a safepoint and
+        // break the two-CallSend premise).
         let obj_klass = vm.universe.object_klass;
         let inner_sel = vm.universe.intern(b"inner");
         let bar_target = {
             let mut tb = BytecodeBuilder::new();
             tb.push_self();
-            tb.send(&mut vm, inner_sel, 0); // a send → non-leaf
+            tb.send_super(&mut vm, inner_sel, 0); // a SUPER send → not inlinable
             tb.ret_tos();
             tb.finish(&mut vm, bar_sel, 0, 0)
         };
         let box_target = {
             let mut tb = BytecodeBuilder::new();
             tb.push_self();
-            tb.send(&mut vm, inner_sel, 0); // a send → non-leaf
+            tb.send_super(&mut vm, inner_sel, 0); // a SUPER send → not inlinable
             tb.ret_tos();
             tb.finish(&mut vm, box_sel, 2, 0)
         };

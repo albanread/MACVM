@@ -43,7 +43,11 @@ use crate::runtime::vm_state::{InterpRegs, VmState};
 ///   outermost frame returns through its `ENTRY_FRAME_SENTINEL` link (a
 ///   debug cross-check on the sentinel-driven stop).
 /// - `resume_bci` — the innermost frame's M5 resume bci, the bci the nested
-///   `dispatch` picks up at (same value as that frame's `saved_bci` header).
+///   `dispatch` picks up at. This is the innermost frame's own START point; it
+///   equals that frame's `saved_bci` header only at depth 1 (where the frame
+///   has no materialized caller). At depth > 1 the header is the CALLER's resume
+///   (where the caller picks up when the inlined callee returns), distinct from
+///   this start bci.
 /// - `saved_activation` / `saved_regs` — the AMBIENT outer interpreter state
 ///   snapshotted at M2, BEFORE the M3 pushes clobbered `vm.stack.fp`/`sp`;
 ///   `interpret_active` restores them after the run so a paused outer
@@ -79,17 +83,26 @@ pub struct FrameView {
 }
 
 /// One decoded virtual frame plus the two per-scope facts M3 needs from the
-/// site/chain (its resume bci and pending operand stack). Built in M0,
-/// consumed outermost → innermost in M3.
+/// site/chain (its own header resume bci and pending operand stack). Built in
+/// M0, consumed outermost → innermost in M3.
 struct VirtualFrame {
     scope: DecodedScope,
-    /// `saved_bci` this frame resumes its CALLER at (outer frames:
-    /// `sender_bci + len(send)`; the innermost frame's own resume bci is set
-    /// separately in M5 and is NOT this field).
-    caller_resume_bci: usize,
-    /// The frame's operand stack at the deopt point. Outer frames: their
-    /// child's `SenderLink.pending_stack`. Innermost: the site's own
-    /// recorded `stack` (plus `incoming_result`, handled in M3.3).
+    /// This frame's HEADER `saved_bci` — where its CALLER (the frame below it)
+    /// resumes when THIS frame returns. Derived from THIS frame's OWN
+    /// `SenderLink` (`sender_bci + len(send in the caller's method)`): the
+    /// innermost frame's own sender describes the send in its caller, so its
+    /// header saved_bci is the CALLER's post-send resume — NOT this frame's own
+    /// start bci (that is `resume_bci`, the M5 value handed to
+    /// `interpret_active`, and applies only to where the INNERMOST frame begins
+    /// interpreting, not to any frame's header). The outermost (root) frame has
+    /// no sender → `0` (it links to `ENTRY_FRAME_SENTINEL` and never returns to
+    /// a materialized caller, so its header saved_bci is unused for a return).
+    header_saved_bci: usize,
+    /// The frame's operand stack at the deopt point. A CALLER (non-innermost)
+    /// frame: its CHILD's `SenderLink.pending_stack` (the child's sender link
+    /// records the caller's — i.e. THIS frame's — frozen operand stack below the
+    /// inlined send's receiver+args). Innermost: the site's own recorded `stack`
+    /// (plus `incoming_result`, handled in M3.3).
     pending_stack: Vec<ValueLoc>,
     /// True for exactly the innermost frame (the one the site names).
     is_innermost: bool,
@@ -191,28 +204,76 @@ pub fn deoptimize_frame(vm: &mut VmState, frame: FrameView) -> DeoptResume {
         // `stack` (handled in M3), and its own resume bci is M5's — so it
         // carries empty placeholders that M3 overrides.
         let chain: Vec<DecodedScope> = deopt.scopes().collect();
-        for (i, scope) in chain.into_iter().enumerate() {
+        // Two facts per frame come from DIFFERENT sender links (the classic
+        // frame-overlap subtlety), so they must NOT be conflated:
+        //
+        //  - a frame's HEADER `saved_bci` (where its CALLER resumes when THIS
+        //    frame returns) comes from THIS frame's OWN sender link
+        //    (`chain[i].sender`): the send in its caller, `sender_bci + len(send
+        //    in the CALLER's method)`. The caller's method is `chain[i+1]`. The
+        //    outermost (root) scope has `sender: None` → `0` (it links to the
+        //    entry sentinel and never returns to a materialized caller).
+        //
+        //  - a frame's operand STACK comes from its CHILD's sender link
+        //    (`chain[i-1].sender.pending_stack`): a sender link records the
+        //    CALLER's — i.e. THIS frame's — frozen operand stack. The innermost
+        //    frame (i == 0) has no child; its operand stack is the site's own
+        //    recorded `stack` (M3.3), a placeholder here.
+        //
+        // S13 depth-1: the single scope has `sender: None` and IS the innermost
+        // AND outermost, so both are trivial and the S13 site/M5 values drive
+        // everything — the chain-derived values only matter at depth > 1 (S14
+        // inlining), which is exactly what this must get right.
+        for (i, scope) in chain.iter().enumerate() {
             let is_innermost = i == 0;
-            // A scope's `sender` describes the send in its CALLER that
-            // inlined it — i.e. it tells the CALLER (the next scope in the
-            // chain) where to resume and what its pending stack is. So the
-            // pending stack / caller-resume bci for scope `k` come from scope
-            // `k-1`'s (its child's) sender link. S13 is depth-1: only the
-            // innermost scope exists, `sender` is None, and both fields are
-            // supplied by the site (M3) — the chain-derived values only
-            // matter once S14 emits real `SenderLink`s.
-            let (caller_resume_bci, pending_stack) = match &scope.sender {
-                Some((_sender_off, sender_bci, pending)) => {
-                    let sender_method = pool_method(vm, frame.nm, scope.method_pool_ix);
-                    let resume =
-                        *sender_bci as usize + bytecode_len_at(sender_method, *sender_bci as usize);
-                    (resume, pending.clone())
+            // Header saved_bci: from THIS frame's own sender (the send in its
+            // caller). Decode the send in the CALLER's own method (`chain[i+1]`).
+            let header_saved_bci = match &scope.sender {
+                Some((_sender_off, sender_bci, _pending)) => {
+                    let caller_scope = chain.get(i + 1).unwrap_or_else(|| {
+                        panic!(
+                            "deopt M0: scope {i} has a SenderLink but no caller scope at {}",
+                            i + 1
+                        )
+                    });
+                    let caller_method = pool_method(vm, frame.nm, caller_scope.method_pool_ix);
+                    *sender_bci as usize + bytecode_len_at(caller_method, *sender_bci as usize)
                 }
-                None => (0, Vec::new()),
+                None if is_innermost => {
+                    // A `sender: None` INNERMOST scope is the S13 depth-1 case:
+                    // the single frame is both innermost and outermost, links to
+                    // the entry sentinel, and never returns to a materialized
+                    // caller — so its header saved_bci is unused for a return.
+                    // Set it to the frame's OWN M5 resume bci (the historical
+                    // S13 convention: "the frame's own resume point"), which
+                    // keeps a materialized depth-1 frame byte-identical to the
+                    // interpreter frame it stands for. `chain[0]`'s method is
+                    // this scope's.
+                    let m = pool_method(vm, frame.nm, scope.method_pool_ix);
+                    let site_bci = deopt.site.bci as usize;
+                    if deopt.site.reexecute {
+                        site_bci
+                    } else {
+                        site_bci + bytecode_len_at(m, site_bci)
+                    }
+                }
+                None => 0, // depth-2 outermost caller — links to the sentinel, unused
+            };
+            // Operand stack: from the CHILD's sender link (which names THIS
+            // frame as the caller); innermost uses the site's stack in M3.
+            let pending_stack = if i == 0 {
+                Vec::new()
+            } else {
+                match &chain[i - 1].sender {
+                    Some((_sender_off, _sender_bci, pending)) => pending.clone(),
+                    None => unreachable!(
+                        "deopt M0: non-innermost scope {i} has a child with no SenderLink"
+                    ),
+                }
             };
             virtual_frames.push(VirtualFrame {
-                scope,
-                caller_resume_bci,
+                scope: scope.clone(),
+                header_saved_bci,
                 pending_stack,
                 is_innermost,
             });
@@ -265,30 +326,25 @@ pub fn deoptimize_frame(vm: &mut VmState, frame: FrameView) -> DeoptResume {
     // only grows — so this stays valid).
     let mut innermost_fp: usize = 0;
     // The innermost frame's M5 resume bci — the bci `interpret_active` enters
-    // the nested `dispatch` at. Identical to that frame's `saved_bci` header
-    // (both are M5's value); captured here to hand back in `DeoptResume`.
+    // the nested `dispatch` at. This is the innermost frame's own START point,
+    // DISTINCT from its header `saved_bci` (which is where its CALLER resumes on
+    // return): in a depth-1 chain the innermost has no materialized caller so
+    // the two coincide, but at depth > 1 they differ (start = the inlined op's
+    // bci; header = the caller's post-send resume). Captured here to hand back
+    // in `DeoptResume`.
     let mut resume_bci: usize = 0;
     for vf in virtual_frames.iter() {
         let method = pool_method(vm, frame.nm, vf.scope.method_pool_ix);
         let argc = method.argc();
         let ntemps = method.ntemps();
 
-        // The `saved_bci` this frame resumes its CALLER at. For the innermost
-        // frame this is M5's resume bci; for an outer frame it is the
-        // post-send resume point derived in M0. (Both are "where THIS frame's
-        // pc points" — the header's saved_bci is the frame's own resume
-        // point, read by the interpreter when control returns INTO it.)
-        let saved_bci = if vf.is_innermost {
-            // M5: innermost resume bci — `bci` if re-executing the op,
-            // else past the completed send.
-            if site_reexecute {
-                site_bci
-            } else {
-                site_bci + bytecode_len_at(method, site_bci)
-            }
-        } else {
-            vf.caller_resume_bci
-        };
+        // A frame's HEADER `saved_bci` is where its CALLER resumes when THIS
+        // frame returns — derived in M0 from THIS frame's own `SenderLink` (the
+        // send in its caller). The outermost frame links to the entry sentinel,
+        // so its `header_saved_bci` (0) is never read for a return. This is the
+        // header value for EVERY frame — the innermost frame's OWN start bci is
+        // a separate value (`resume_bci` below), NOT its header.
+        let saved_bci = vf.header_saved_bci;
 
         // Read receiver + unified slot values BEFORE any push, so a stray
         // realloc of the stack Vec during the pushes can't invalidate a
@@ -345,7 +401,16 @@ pub fn deoptimize_frame(vm: &mut VmState, frame: FrameView) -> DeoptResume {
 
         if vf.is_innermost {
             innermost_fp = fp_new;
-            resume_bci = saved_bci;
+            // ── M5: the innermost frame's OWN start bci — where
+            //    `interpret_active` picks up. `site_bci` if re-executing the op,
+            //    else past the completed send. DISTINCT from this frame's header
+            //    saved_bci (the caller's resume). At depth 1 they coincide (no
+            //    materialized caller); at depth > 1 they differ.
+            resume_bci = if site_reexecute {
+                site_bci
+            } else {
+                site_bci + bytecode_len_at(method, site_bci)
+            };
             // ── M3.3 innermost operand stack: the site's recorded values,
             //    plus `incoming_result` iff the site is a call-return. ─────
             for &loc in &site_stack {
@@ -379,7 +444,10 @@ pub fn deoptimize_frame(vm: &mut VmState, frame: FrameView) -> DeoptResume {
             // where the linear scan is exact, so they keep the check.
             #[cfg(debug_assertions)]
             {
-                let resume_bci = saved_bci;
+                // The innermost frame's OWN start bci (M5), NOT its header
+                // saved_bci (the caller's resume) — the height model must be
+                // evaluated at where this frame actually resumes interpreting.
+                let resume_bci = resume_bci;
                 let skip_merge_check =
                     vf.is_innermost && matches!(site_kind, SafepointKind::LoopPoll);
                 if let (false, Some(model)) = (
