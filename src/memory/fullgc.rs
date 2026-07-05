@@ -588,6 +588,9 @@ pub fn full_gc(vm: &mut VmState) -> Result<FullGcReport, GcStallError> {
     vm.universe.gc_stats.full_gc_count += 1;
     vm.universe.gc_stats.marked_bytes_last = marked_bytes as u64;
     vm.universe.gc_stats.full_pause_total += pause;
+    if pause > vm.universe.gc_stats.full_pause_max {
+        vm.universe.gc_stats.full_pause_max = pause;
+    }
     vm.universe.gc_stats.last_reclaimed_bytes = reclaimed_bytes as u64;
 
     if super::verify::verify_enabled() {

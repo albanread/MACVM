@@ -631,6 +631,7 @@ pub fn compile_method_versioned(
         let patch_target = resolved.map_or(resolve_addr, |(_, target)| target);
         vm.code_cache.patch_branch26_at(h, site.off, patch_target);
     }
+    vm.stats.compilations += 1; // S15 A8 tier-balance counter
     let id = vm.code_table.install(nm);
     if vm.options.trace.is_enabled("jit") {
         eprintln!(

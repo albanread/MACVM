@@ -437,6 +437,10 @@ pub fn scavenge(vm: &mut VmState) -> Result<ScavengeReport, GcStallError> {
     super::verify::dbg_oop_trace(vm, "scavenge-entry");
     let start = Instant::now();
     let eden_used_before = vm.universe.eden.top - vm.universe.eden.start;
+    // S15 A8: `bytes_allocated` was a declared-but-never-fed field; eden
+    // consumption at each scavenge is the cheap, exact-enough feed (large
+    // direct-to-old allocations are counted by `bytes_promoted`'s own path).
+    vm.universe.gc_stats.bytes_allocated += eden_used_before as u64;
     vm.universe.age_table.clear();
 
     let old_top_before = vm.universe.old.top;
@@ -547,6 +551,12 @@ pub fn scavenge(vm: &mut VmState) -> Result<ScavengeReport, GcStallError> {
     }
     super::verify::dbg_oop_trace(vm, "scavenge-exit");
     let pause = start.elapsed();
+    // S15 A7/A8: totals+max accumulated HERE (the one place every scavenge
+    // exits through) — `ScavengeReport.pause` is per-call, these are run-wide.
+    vm.universe.gc_stats.total_scavenge_pause += pause;
+    if pause > vm.universe.gc_stats.scavenge_pause_max {
+        vm.universe.gc_stats.scavenge_pause_max = pause;
+    }
 
     if vm.options.trace.is_enabled("gc") {
         let eden_after = vm.universe.eden.top - vm.universe.eden.start;

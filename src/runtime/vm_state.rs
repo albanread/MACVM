@@ -195,7 +195,7 @@ pub struct NlrState {
 /// later deopt steps (stress counting kept separate from the
 /// `UncommonTrapLimit` tally, D7) have a home without reshaping `VmState`.
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
-pub struct DeoptStats {
+pub struct VmStats {
     /// Compiled frames materialized back into interpreter frames — bumped
     /// once per `deoptimize_frame` call (D5 M1).
     pub deopt_count: u64,
@@ -215,6 +215,24 @@ pub struct DeoptStats {
     /// (Self's `checkEffectiveness`; the anti-thrash gate for storms that
     /// recompilation cannot fix, e.g. a persistent smi-overflow trap).
     pub recompile_declined_ineffective: u64,
+    /// S15 A8 (dispatch overhead): compiled-IC misses — every arrival at
+    /// `rt_resolve_send` (a send whose site was Unresolved, or whose
+    /// mono/pic guard rejected the receiver). Hits are NOT counted (they
+    /// never leave compiled code — the doc's "slow paths only" rule).
+    pub ic_misses: u64,
+    /// S15 A8: PIC growths (a Pic-state site adding a klass pair).
+    pub pic_extends: u64,
+    /// S15 A8: Pic→Mega promotions (site went megamorphic).
+    pub mega_transitions: u64,
+    /// S15 A8 (tier balance): successful tier-1 compilations installed
+    /// (all levels — `Nmethod.level` is 1 until the policy ladder lands).
+    pub compilations: u64,
+    /// S15: OSR transitions actually taken (interpreter frame replaced by
+    /// a compiled frame mid-loop).
+    pub osr_entries: u64,
+    /// S15: OSR requests declined (version cap / effectiveness / not
+    /// compilable) — the loop kept interpreting, counter reset.
+    pub osr_declined: u64,
 }
 
 /// S13 D7: which trigger fired a deopt — for `deopt_by_reason` attribution and
@@ -477,7 +495,7 @@ pub struct VmState {
     /// `runtime::deopt::deoptimize_frame` every time a compiled frame is
     /// materialized back into interpreter frame(s); read by tests and (later)
     /// the `MACVM_DEOPT_STRESS` differential harness.
-    pub stats: DeoptStats,
+    pub stats: VmStats,
     /// S13 D7 (`MACVM_DEOPT_STRESS`) periodic-invalidation state. `deopt_stress`
     /// gates behavior 2 entirely; `stress_period` is the number of compiled
     /// entries between forced invalidations; `stress_countdown` the live counter
@@ -760,7 +778,7 @@ impl VmState {
             exit_code: None,
             start_instant: Instant::now(),
             bytecode_count: 0,
-            stats: DeoptStats::default(),
+            stats: VmStats::default(),
             // S13 D7: OFF here (env-free constructor); `new()` turns it on from
             // `MACVM_DEOPT_STRESS`, tests set the fields directly.
             deopt_stress: false,

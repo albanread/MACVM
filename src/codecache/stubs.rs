@@ -631,6 +631,10 @@ pub unsafe extern "C" fn rt_resolve_send(vm: *mut VmState, ret_addr: u64, argv: 
         "rt_resolve_send: anchor must be set by stub_resolve's prologue before this call"
     );
 
+    // S15 A8: every arrival here IS a compiled-IC miss (Unresolved first
+    // touch, or a mono/pic guard rejecting the receiver) — hits never leave
+    // compiled code, so misses are the whole observable.
+    vm.stats.ic_misses += 1;
     let (caller_id, caller_code, site_off, site_idx, selector, _argc) =
         find_caller_site(vm, ret_addr);
     let site = &vm.code_table.get(caller_id).unwrap().ic_sites[site_idx];
@@ -717,6 +721,7 @@ pub unsafe extern "C" fn rt_resolve_send(vm: *mut VmState, ret_addr: u64, argv: 
             let mut pairs = vm.pic_table.pairs_of(stub).to_vec();
             let new_t = resolve_target_entry(vm, k, selector, method, true);
             if pairs.len() < PIC_MAX_ENTRIES {
+                vm.stats.pic_extends += 1;
                 pairs.push((k, new_t));
                 let resolve_addr = vm.stubs.resolve_addr();
                 let smi_klass_bits = vm.universe.smi_klass.oop().raw();
@@ -726,6 +731,7 @@ pub unsafe extern "C" fn rt_resolve_send(vm: *mut VmState, ret_addr: u64, argv: 
                 vm.pic_table.free(&mut vm.code_cache, stub);
                 (new_stub.base as u64, new_t, IcState::Pic { stub: new_stub })
             } else {
+                vm.stats.mega_transitions += 1;
                 vm.pic_table.free(&mut vm.code_cache, stub);
                 let mega_shared_addr = vm.stubs.mega_shared_addr();
                 let mega_stub =

@@ -94,6 +94,7 @@ fn cmd_run(args: &[String]) {
     let result = macvm::frontend::world::load_file(&mut vm, Path::new(file));
     print_bytecode_count(&vm);
     print_gc_bridge_stats(&vm);
+    print_vm_stats(&vm);
     match result {
         Ok(()) => std::process::exit(vm.exit_code.unwrap_or(0)),
         Err(e) => {
@@ -110,6 +111,59 @@ fn print_bytecode_count(vm: &VmState) {
     if vm.options.trace.is_enabled("count") {
         eprintln!("bytecodes: {}", vm.bytecode_count);
     }
+}
+
+/// `MACVM_TRACE=stats` (S15 A8): the full counter dump at process exit, to
+/// stderr (golden stdout transcripts stay exact), grep-friendly one line per
+/// counter. Code-cache byte totals are computed here from the live tables
+/// rather than counted incrementally (they are exact by construction and
+/// cost nothing off this path).
+fn print_vm_stats(vm: &VmState) {
+    if !vm.options.trace.is_enabled("stats") {
+        return;
+    }
+    let s = &vm.stats;
+    let g = &vm.universe.gc_stats;
+    let mut code_alive = 0usize;
+    let mut code_zombie = 0usize;
+    for nm in vm.code_table.iter_all() {
+        match nm.state {
+            macvm::codecache::nmethod::NmState::Alive => code_alive += nm.code.len,
+            _ => code_zombie += nm.code.len,
+        }
+    }
+    eprintln!("[stats] ic_misses={}", s.ic_misses);
+    eprintln!("[stats] pic_extends={}", s.pic_extends);
+    eprintln!("[stats] mega_transitions={}", s.mega_transitions);
+    eprintln!("[stats] compilations={}", s.compilations);
+    eprintln!("[stats] recompiles={}", s.recompiles);
+    eprintln!(
+        "[stats] recompile_declined_ineffective={}",
+        s.recompile_declined_ineffective
+    );
+    eprintln!(
+        "[stats] deopt_count={} by_reason=[trap {}, return {}, poll {}]",
+        s.deopt_count, s.deopt_by_reason[0], s.deopt_by_reason[1], s.deopt_by_reason[2]
+    );
+    eprintln!("[stats] osr_entries={}", s.osr_entries);
+    eprintln!("[stats] osr_declined={}", s.osr_declined);
+    eprintln!("[stats] scavenge_count={}", g.scavenge_count);
+    eprintln!(
+        "[stats] scavenge_us_total={} scavenge_us_max={}",
+        g.total_scavenge_pause.as_micros(),
+        g.scavenge_pause_max.as_micros()
+    );
+    eprintln!("[stats] full_gc_count={}", g.full_gc_count);
+    eprintln!(
+        "[stats] full_gc_us_total={} full_gc_us_max={}",
+        g.full_pause_total.as_micros(),
+        g.full_pause_max.as_micros()
+    );
+    eprintln!("[stats] bytes_allocated={}", g.bytes_allocated);
+    eprintln!("[stats] bytes_promoted={}", g.bytes_promoted);
+    eprintln!("[stats] contexts_allocated={}", g.context_allocs);
+    eprintln!("[stats] code_bytes_alive={code_alive}");
+    eprintln!("[stats] code_bytes_zombie={code_zombie}");
 }
 
 /// `MACVM_TRACE=gc`: a grep-friendly one-line counter summary printed to

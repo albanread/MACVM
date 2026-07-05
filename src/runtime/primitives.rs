@@ -495,6 +495,15 @@ pub static PRIMITIVES: &[PrimDesc] = &[
         can_allocate: true,
         can_fail: true,
     },
+    // --- S15 A8 dev hook ----------------------------------------------------
+    PrimDesc {
+        id: 111,
+        name: "__vmStats",
+        f: prim_vm_stats,
+        argc: 0,
+        can_allocate: true,
+        can_fail: false,
+    },
 ];
 
 pub fn prim_by_id(id: u16) -> Option<&'static PrimDesc> {
@@ -1057,6 +1066,52 @@ fn prim_gc_stats(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     PrimResult::Ok(result.oop())
 }
 
+/// `__vmStats` (S15 A8 dev hook): answers a 16-element Array of smis in
+/// PINNED order — `(icMisses picExtends megaTransitions compilations
+/// recompiles recompileDeclined deoptCount deoptTrap deoptReturn deoptPoll
+/// osrEntries osrDeclined scavengeCount fullGcCount contextsAllocated
+/// bytesPromoted)` — the tier/dispatch/speculation twin of `gcStats`
+/// (same positional-array convention, same reason: harnesses index by
+/// position, so the order is load-bearing). Values are captured BEFORE
+/// the result Array allocates, so the allocation cannot skew them beyond
+/// its own GC side effects (which land AFTER the snapshot — acceptable
+/// for a diagnostics hook).
+fn prim_vm_stats(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    let smi = |v: u64| SmallInt::new(v as i64).oop();
+    let st = vm.stats;
+    let (g_scav, g_full, g_ctx, g_promoted) = (
+        vm.universe.gc_stats.scavenge_count,
+        vm.universe.gc_stats.full_gc_count,
+        vm.universe.gc_stats.context_allocs,
+        vm.universe.gc_stats.bytes_promoted,
+    );
+    let fields = [
+        smi(st.ic_misses),
+        smi(st.pic_extends),
+        smi(st.mega_transitions),
+        smi(st.compilations),
+        smi(st.recompiles),
+        smi(st.recompile_declined_ineffective),
+        smi(st.deopt_count),
+        smi(st.deopt_by_reason[0]),
+        smi(st.deopt_by_reason[1]),
+        smi(st.deopt_by_reason[2]),
+        smi(st.osr_entries),
+        smi(st.osr_declined),
+        smi(g_scav),
+        smi(g_full),
+        smi(g_ctx),
+        smi(g_promoted),
+    ];
+    let array_klass = vm.universe.array_klass;
+    let result = alloc::alloc_indexable_oops(vm, array_klass, fields.len());
+    for (i, &v) in fields.iter().enumerate() {
+        result.at_put(i, v);
+    }
+    let _ = args;
+    PrimResult::Ok(result.oop())
+}
+
 /// SPEC §6.3: prints the message + a VM stack trace, terminates. Never
 /// returns (its Rust return type is only `PrimResult` so it fits the
 /// `PrimFn` signature — `std::process::exit`'s `!` unifies with it).
@@ -1301,6 +1356,7 @@ mod tests {
             (108, "asDouble"),
             (109, "printDigits"),
             (110, "asSymbol"),
+            (111, "__vmStats"),
         ];
         assert_eq!(
             PRIMITIVES.len(),
@@ -1314,6 +1370,28 @@ mod tests {
     }
 
     #[test]
+    fn vm_stats_prim_shape_and_positions() {
+        let mut vm = test_vm();
+        vm.stats.ic_misses = 7;
+        vm.stats.compilations = 3;
+        vm.universe.gc_stats.context_allocs = 9;
+        let nil = vm.universe.nil_obj;
+        let r = match prim_vm_stats(&mut vm, &[nil]) {
+            PrimResult::Ok(o) => crate::oops::wrappers::ArrayOop::try_from(o).expect("an Array"),
+            other => panic!("__vmStats must succeed, got {other:?}"),
+        };
+        assert_eq!(r.len(), 16, "pinned 16-element shape");
+        let at = |i: usize| {
+            crate::oops::smi::SmallInt::try_from(r.at(i))
+                .expect("all smis")
+                .value()
+        };
+        assert_eq!(at(0), 7, "icMisses is position 0 (pinned)");
+        assert_eq!(at(3), 3, "compilations is position 3 (pinned)");
+        assert_eq!(at(14), 9, "contextsAllocated is position 14 (pinned)");
+    }
+
+    #[test]
     fn prim_table_sorted_unique() {
         let mut last: Option<u16> = None;
         for d in PRIMITIVES {
@@ -1324,7 +1402,10 @@ mod tests {
             let colons = d.name.matches(':').count();
             let expected_argc = if colons == 0 { 0 } else { colons };
             // Binary selectors (+, -, ==, etc.) have argc 1 despite 0 colons.
-            let is_binary = !d.name.chars().next().unwrap().is_alphabetic();
+            // `_`-prefixed dev hooks (`__vmStats`) are ordinary unary names,
+            // not operators.
+            let first = d.name.chars().next().unwrap();
+            let is_binary = !first.is_alphabetic() && first != '_';
             if is_binary {
                 assert_eq!(d.argc, 1, "{} expected argc 1", d.name);
             } else {

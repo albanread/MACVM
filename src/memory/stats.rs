@@ -25,6 +25,12 @@ pub struct GcStats {
     /// `gcStats`'s `markedBytesLast` and lesson 15's "measure marked bytes
     /// vs expected working set before touching policy" diagnostic.
     pub marked_bytes_last: u64,
+    /// S15 A7: the single longest scavenge pause so far (PERF.md's pause
+    /// rows; percentiles come from `MACVM_TRACE=gc` parsing, but max is
+    /// cheap enough to keep always-on).
+    pub scavenge_pause_max: Duration,
+    /// S15 A7: the single longest full-GC pause so far.
+    pub full_pause_max: Duration,
     /// S8: cumulative full-GC pause time, alongside `total_scavenge_pause`.
     pub full_pause_total: Duration,
     /// S8: `OldGen::grow` calls that actually committed a segment (0 return

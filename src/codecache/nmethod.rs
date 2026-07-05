@@ -540,6 +540,12 @@ impl CodeTable {
     /// dead key. Its key is kept STRONG in `oops_do` above precisely so it is
     /// never seen dead here anyway; the two decisions are the paired halves of
     /// "a NotEntrant nmethod stays fully live until its frames drain".
+    /// S15 A8: every installed nmethod regardless of state — the stats
+    /// dump's code-cache byte accounting (`Alive` vs not) reads this.
+    pub fn iter_all(&self) -> impl Iterator<Item = &Nmethod> {
+        self.slots.iter().flatten()
+    }
+
     pub fn iter_alive(&self) -> impl Iterator<Item = &Nmethod> {
         self.slots
             .iter()
