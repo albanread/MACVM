@@ -1,0 +1,84 @@
+"cold_branch_recompile_spill_corruption.mst — BUG D (JIT correctness,
+ SIGSEGV/wrong-object-corruption class). See tests/repros/README.md entry 3
+ for the full evidence chain (repro:threshold=1, exit 139 SIGSEGV under
+ release; a debug build instead panics earlier at oops/mod.rs:53 'reserved
+ tag' from memory::roots::each_code_root during a scavenge nested inside
+ compiled `process:` — a GC root-scan finding a corrupted oop-map slot).
+
+ Minimized from HandlerTask>>processWork:'s exact shape (world/bench/
+ richards.mst) after the DNU #deviceInAdd: investigation: an ivar is read
+ into a local ('data'), used inside a two-way branch where ONE arm is
+ still cold (Untaken IC) at compile time, then the SAME local is read
+ AGAIN — unconditionally — several statements later, past an intervening
+ branch-with-early-return. `go` runs 50000 calls exercising only the WARM
+ arm first (forcing threshold=1 to compile, trap, and recompile against
+ that one-sided feedback), THEN 50000 calls exercising the SIBLING arm for
+ the first time ever — reproduces reliably on the very first such call.
+
+ Interpreted (MACVM_JIT unset, or =off): completes cleanly, answers 577783.
+ MACVM_JIT=threshold=1: SIGSEGV (release) / reserved-tag panic (debug),
+ always on the first kind=2 call, never during the first (kind=1-only)
+ loop and never if kind is interleaved from the very first call (see
+ README) — the recompile-after-a-cold-sibling-branch transition is
+ necessary to reproduce, not the branch shape alone."
+
+Object subclass: Box [
+    | payload other |
+    payload: x [ payload := x ]
+    other: x [ other := x ]
+    add1: x [ payload := payload + x. ^self ]
+    add2: x [ payload := payload + (x * 2). ^self ]
+    payload [ ^payload ]
+    other [ ^other ]
+]
+
+Object subclass: R3 [
+    | handle sched |
+    handle: x [ handle := x ]
+    sched: x [ sched := x ]
+
+    "Mirrors HandlerTask>>processWork:'s exact shape: an ivar-read into a
+     temp near the top, an unrelated arg-only test, a two-way branch where
+     each arm re-reads that SAME temp and sends it a DIFFERENT selector
+     (one warm, one cold), then the temp is read AGAIN — unconditionally —
+     past a further branch with an early return."
+    process: kind [
+        | data workPacket count devicePacket |
+        data := handle.
+        kind = 1
+            ifTrue: [ data add1: 5 ]
+            ifFalse: [ data add2: 7 ].
+        workPacket := data payload.
+        workPacket = 0 ifTrue: [ ^sched markWaiting ].
+        count := workPacket.
+        count > 1000000 ifTrue: [
+            data other: workPacket.
+            ^sched queuePacket: data ].
+        devicePacket := count + 1.
+        data other: devicePacket.
+        ^sched queuePacket: data
+    ]
+
+    R3 class >> go [
+        | r b s total |
+        r := R3 new.
+        b := Box new.
+        b payload: 1.
+        s := R3 new.
+        r handle: b.
+        r sched: s.
+        total := 0.
+        "First 50000 calls: kind=1 only -- the OTHER arm (kind=2) stays
+         cold long enough for threshold=1 to compile, trap, and recompile
+         against feedback that has STILL never seen kind=2 even once."
+        1 to: 50000 do: [:i | total := total + (r process: 1) size ].
+        "Now finally take the cold arm, for the very first time ever."
+        1 to: 50000 do: [:i | total := total + (r process: 2) size ].
+        ^total
+    ]
+
+    markWaiting [ ^'w' ]
+    queuePacket: aBox [ ^aBox payload printString ]
+]
+
+Transcript show: R3 go printString; cr.
