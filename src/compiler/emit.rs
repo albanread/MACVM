@@ -181,6 +181,22 @@ pub struct EmittedIcSite {
 /// `RegallocResult::intervals` — data `emit.rs` never touches, only each
 /// vreg's ALREADY-DECIDED assignment), same "accumulate at emit time,
 /// resolve at driver.rs time" split as [`BlockPc`]/[`EmittedIcSite`].
+/// S15 A2 step 4: what `emit` needs to build the synthetic OSR entry block.
+/// The driver computes this AFTER regalloc (the copy destinations are the
+/// header's live-in entities' spill homes, in OSR-BUFFER ORDER — the runtime
+/// packer fills the buffer in the same order from the interpreter frame).
+pub struct EmitOsr {
+    /// The loop-header block the entry branches to.
+    pub header: crate::compiler::ir::BlockId,
+    /// Buffer word i is stored to `copies[i]`'s spill home.
+    pub copies: Vec<crate::compiler::regalloc::SpillSlot>,
+    /// The header block's linear start position — resident registers whose
+    /// intervals are live there are reloaded from their slots before
+    /// branching (the S14 residency optimization keeps loop values in
+    /// registers the buffer copies never touch).
+    pub reload_pos: u32,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct SafepointPc {
     pub pc_off: u32,
@@ -323,10 +339,18 @@ impl<'a> Emitter<'a> {
     /// have GC'd; the fast paths neither call nor GC, so residents stay
     /// valid there and cost nothing).
     fn emit_resident_reloads(&mut self) {
+        self.emit_resident_reloads_at(self.pos);
+    }
+
+    /// S15 (OSR): reload every resident register whose interval is live at
+    /// `pos` — the OSR entry block calls this with the HEADER's start
+    /// position (its own emission happens after the whole body, where
+    /// `self.pos` is past everything).
+    fn emit_resident_reloads_at(&mut self, pos: u32) {
         let live: Vec<(u8, crate::compiler::regalloc::SpillSlot)> = self
             .resident_reloads
             .iter()
-            .filter(|&&(s, e, _, _)| s <= self.pos && e > self.pos)
+            .filter(|&&(s, e, _, _)| s <= pos && e > pos)
             .map(|&(_, _, rr, slot)| (rr, slot))
             .collect();
         for (rr, slot) in live {
@@ -1050,6 +1074,7 @@ fn emit_entry_guard(asm: &mut dyn Assembler, guard: &EntryGuard) {
 /// [`EmittedIcSite`] per `Ir::CallSend` encountered in encounter order, and
 /// (S12) one [`SafepointPc`] per real safepoint (`CallSend`/`CallRuntime`/
 /// `Alloc`'s slow edge) encountered, also in encounter order.
+#[allow(clippy::too_many_arguments)] // grew organically S10→S15; a params struct is a later cleanup
 pub fn emit(
     asm: &mut dyn Assembler,
     method: &IrMethod,
@@ -1058,12 +1083,14 @@ pub fn emit(
     must_be_boolean_addr: u64,
     alloc_slow_addr: u64,
     guard: Option<EntryGuard>,
+    osr: Option<&EmitOsr>,
 ) -> (
     CodeBlob,
     Vec<BlockPc>,
     u32,
     Vec<EmittedIcSite>,
     Vec<SafepointPc>,
+    Option<u32>,
 ) {
     let literal_ids = intern_pool(asm, method);
 
@@ -1164,6 +1191,40 @@ pub fn emit(
     );
     e.asm.emit("ret", &[]);
 
+    // S15 A2 step 4: the synthetic OSR entry block, emitted AFTER the whole
+    // body (a cold tail — it runs exactly once per OSR transition). Shape:
+    // the NORMAL prologue (so the compiled frame is byte-identical to a
+    // called activation's), a straight-line copy of the incoming OSR buffer
+    // (`x1`, packed by rt_osr_request in `EmitOsr.copies` order) into each
+    // entity's canonical spill home, resident-register reloads for intervals
+    // live at the header, and an unconditional branch to the header block.
+    // Deliberately NO safepoint anywhere in the block (the buffer is the
+    // only root while it runs, and it is dead the instant the copies land —
+    // the first real safepoint is inside the loop body, which carries full
+    // scope descs; a deopt there rebuilds the mid-loop interpreter frame).
+    let osr_entry_off = osr.map(|req| {
+        let entry_off = e.asm.offset();
+        e.asm.emit(
+            "stp",
+            &[x(29), x(30), crate::compiler::assembler::mem_pre(31, -16)],
+        );
+        e.asm.emit("mov", &[x(29), sp()]);
+        if frame_bytes > 0 {
+            e.asm.emit("sub", &[sp(), sp(), imm(frame_bytes)]);
+        }
+        for (i, &slot) in req.copies.iter().enumerate() {
+            // Buffer reads use ldr [x1, #off] (unsigned scaled imm12 —
+            // plenty for any realistic slot count); stores go through the
+            // imm9-safe spill helper.
+            e.asm.emit("ldr", &[x(16), mem(1, (8 * i) as i64)]);
+            emit_spill_access(e.asm, "str", x(16), slot);
+        }
+        e.emit_resident_reloads_at(req.reload_pos);
+        let hl = e.labels[req.header.0 as usize];
+        e.asm.b(hl);
+        entry_off
+    });
+
     let ic_sites = e.ic_sites;
     let safepoints = e.safepoints;
     (
@@ -1172,6 +1233,7 @@ pub fn emit(
         verified_entry_off,
         ic_sites,
         safepoints,
+        osr_entry_off,
     )
 }
 
@@ -1473,8 +1535,8 @@ mod tests {
         let method = branchy_method();
         let ra = regalloc::regalloc(&method);
         let mut asm = JasmAssembler::new();
-        let (_blob, block_pcs, _verified_entry_off, _ic_sites, _safepoints) =
-            emit(&mut asm, &method, &ra, 0, 0, 0, None);
+        let (_blob, block_pcs, _verified_entry_off, _ic_sites, _safepoints, _osr_off) =
+            emit(&mut asm, &method, &ra, 0, 0, 0, None, None);
 
         assert_eq!(
             block_pcs.len(),
@@ -1552,8 +1614,8 @@ mod tests {
         let method = hand_method(vec![block0, block1], vregs, 2);
         let ra = regalloc::regalloc(&method);
         let mut asm = JasmAssembler::new();
-        let (blob, _pcs, _verified_entry_off, _ic_sites, _safepoints) =
-            emit(&mut asm, &method, &ra, 0, 0, 0, None);
+        let (blob, _pcs, _verified_entry_off, _ic_sites, _safepoints, _osr_off) =
+            emit(&mut asm, &method, &ra, 0, 0, 0, None, None);
 
         let mnemonics: Vec<&str> = blob.listing.iter().map(|l| mnemonic(l)).collect();
         let asr_pos = mnemonics.iter().position(|&m| m == "asr");
@@ -1624,8 +1686,8 @@ mod tests {
         let near = make(30);
         let ra = regalloc::regalloc(&near);
         let mut asm = JasmAssembler::new();
-        let (blob, _pcs, _verified_entry_off, _ic_sites, _safepoints) =
-            emit(&mut asm, &near, &ra, 0, 0, 0, None);
+        let (blob, _pcs, _verified_entry_off, _ic_sites, _safepoints, _osr_off) =
+            emit(&mut asm, &near, &ra, 0, 0, 0, None, None);
         let near_mnemonics: Vec<String> = blob.listing.iter().map(|l| mnemonic(l)).collect();
         assert!(
             near_mnemonics.iter().any(|m| m == "ldur"),
@@ -1641,8 +1703,8 @@ mod tests {
         let far = make(31);
         let ra2 = regalloc::regalloc(&far);
         let mut asm2 = JasmAssembler::new();
-        let (blob2, _pcs2, _verified_entry_off2, _ic_sites2, _safepoints) =
-            emit(&mut asm2, &far, &ra2, 0, 0, 0, None);
+        let (blob2, _pcs2, _verified_entry_off2, _ic_sites2, _safepoints, _osr_off) =
+            emit(&mut asm2, &far, &ra2, 0, 0, 0, None, None);
         let mnemonics: Vec<String> = blob2.listing.iter().map(|l| mnemonic(l)).collect();
         assert!(
             mnemonics.iter().any(|m| m == "sub"),
@@ -1698,8 +1760,8 @@ mod tests {
         let with_barrier = make(true);
         let ra = regalloc::regalloc(&with_barrier);
         let mut asm = JasmAssembler::new();
-        let (blob, _pcs, _verified_entry_off, _ic_sites, _safepoints) =
-            emit(&mut asm, &with_barrier, &ra, 0, 0, 0, None);
+        let (blob, _pcs, _verified_entry_off, _ic_sites, _safepoints, _osr_off) =
+            emit(&mut asm, &with_barrier, &ra, 0, 0, 0, None, None);
         let mnemonics: Vec<String> = blob.listing.iter().map(|l| mnemonic(l)).collect();
         assert!(
             mnemonics.iter().any(|m| m == "stur" || m == "str"),
@@ -1720,8 +1782,8 @@ mod tests {
         let without_barrier = make(false);
         let ra2 = regalloc::regalloc(&without_barrier);
         let mut asm2 = JasmAssembler::new();
-        let (blob2, _pcs2, _verified_entry_off2, _ic_sites2, _safepoints) =
-            emit(&mut asm2, &without_barrier, &ra2, 0, 0, 0, None);
+        let (blob2, _pcs2, _verified_entry_off2, _ic_sites2, _safepoints, _osr_off) =
+            emit(&mut asm2, &without_barrier, &ra2, 0, 0, 0, None, None);
         let mnemonics2: Vec<String> = blob2.listing.iter().map(|l| mnemonic(l)).collect();
         assert!(
             mnemonics2.iter().any(|m| m == "stur" || m == "str"),
@@ -1790,7 +1852,8 @@ mod tests {
         };
         let ra = regalloc::regalloc(&method);
         let mut asm = JasmAssembler::new();
-        let (blob, _pcs, _ve, _ic, _safepoints) = emit(&mut asm, &method, &ra, 0, 0, 0xAABB, None);
+        let (blob, _pcs, _ve, _ic, _safepoints, _osr_off) =
+            emit(&mut asm, &method, &ra, 0, 0, 0xAABB, None, None);
         let listing = blob.listing.join("\n");
         let mnemonic = |l: &str| l.split_whitespace().nth(2).unwrap_or("").to_string();
         let mnemonics: Vec<String> = blob.listing.iter().map(|l| mnemonic(l)).collect();
@@ -1874,8 +1937,8 @@ mod tests {
             key_klass_bits: 0x2000,
             resolve_addr: 0x3000,
         };
-        let (blob, _pcs, verified_entry_off, _ic_sites, _safepoints) =
-            emit(&mut asm, &method, &ra, 0, 0, 0, Some(guard));
+        let (blob, _pcs, verified_entry_off, _ic_sites, _safepoints, _osr_off) =
+            emit(&mut asm, &method, &ra, 0, 0, 0, Some(guard), None);
 
         // `verified_entry_off` must land exactly on the S10-era prologue's
         // own first instruction (`stp x29,x30,...`) -- found empirically in
@@ -1974,8 +2037,8 @@ mod tests {
             key_klass_bits: 0x2000,
             resolve_addr: 0x3000,
         };
-        let (blob, _pcs, _verified_entry_off, _ic_sites, _safepoints) =
-            emit(&mut asm, &method, &ra, 0, 0, 0, Some(guard));
+        let (blob, _pcs, _verified_entry_off, _ic_sites, _safepoints, _osr_off) =
+            emit(&mut asm, &method, &ra, 0, 0, 0, Some(guard), None);
 
         let oop_relocs: Vec<&crate::compiler::assembler::Reloc> = blob
             .relocs
@@ -2085,8 +2148,8 @@ mod tests {
         };
         let ra = regalloc::regalloc(&method);
         let mut asm = JasmAssembler::new();
-        let (blob, _pcs, _verified_entry_off, ic_sites, _safepoints) =
-            emit(&mut asm, &method, &ra, 0, 0, 0, None);
+        let (blob, _pcs, _verified_entry_off, ic_sites, _safepoints, _osr_off) =
+            emit(&mut asm, &method, &ra, 0, 0, 0, None, None);
 
         assert_eq!(
             ic_sites.len(),

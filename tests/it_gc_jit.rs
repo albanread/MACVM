@@ -401,13 +401,14 @@ fn compiled_mono_caller_guard_keeps_key_klass_alive() {
     };
     let ra = regalloc::regalloc(&call_hot_method_ir);
     let mut asm = JasmAssembler::new();
-    let (blob, _pcs, _verified_entry_off, emitted_ic_sites, _safepoints) = emit::emit(
+    let (blob, _pcs, _verified_entry_off, emitted_ic_sites, _safepoints, _osr_off) = emit::emit(
         &mut asm,
         &call_hot_method_ir,
         &ra,
         vm.stubs.stub_poll_addr(),
         vm.stubs.must_be_boolean_addr(),
         vm.stubs.alloc_slow_addr(),
+        None,
         None,
     );
     assert_eq!(emitted_ic_sites.len(), 1, "exactly one Ir::CallSend");
@@ -453,6 +454,7 @@ fn compiled_mono_caller_guard_keeps_key_klass_alive() {
         deopt_pcdescs: Vec::new(),
         inline_deps: Vec::new(),
         self_devirt: false,
+        osr_map: None,
     };
     let call_hot_id = vm.code_table.install(call_hot_nm);
     let call_hot_entry = h.base as u64; // entry_off == verified_entry_off == 0 (no guard, `None`)
@@ -540,12 +542,13 @@ fn install_loop_nmethod(
     };
     let ra: RegallocResult = regalloc::regalloc(&ir);
     let mut asm = JasmAssembler::new();
-    let (blob, _pcs, verified_entry_off, emitted_ic_sites, safepoints): (
+    let (blob, _pcs, verified_entry_off, emitted_ic_sites, safepoints, _osr_off): (
         _,
         _,
         u32,
         _,
         Vec<SafepointPc>,
+        Option<u32>,
     ) = emit::emit(
         &mut asm,
         &ir,
@@ -553,6 +556,7 @@ fn install_loop_nmethod(
         vm.stubs.stub_poll_addr(),
         vm.stubs.must_be_boolean_addr(),
         vm.stubs.alloc_slow_addr(),
+        None,
         None,
     );
 
@@ -615,6 +619,7 @@ fn install_loop_nmethod(
         deopt_pcdescs: Vec::new(),
         inline_deps: Vec::new(),
         self_devirt: false,
+        osr_map: None,
     };
     vm.code_table.install(nm)
 }

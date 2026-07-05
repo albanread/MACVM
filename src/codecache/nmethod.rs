@@ -234,6 +234,11 @@ pub struct Nmethod {
     /// target, because super sites enter with subclass receivers the entry
     /// guard never checks.
     pub self_devirt: bool,
+    /// S15: the interpreter→compiled frame-conversion map, present iff this
+    /// nmethod was compiled WITH an OSR entry (at most one in v1). The
+    /// nmethod is otherwise normal — same key, normal entries, scope descs
+    /// everywhere; `rt_osr_request` reads this to pack the transfer buffer.
+    pub osr_map: Option<crate::compiler::scopes::OsrMap>,
 }
 
 impl Nmethod {
@@ -336,6 +341,7 @@ impl Nmethod {
             deopt_pcdescs: Vec::new(),
             inline_deps: Vec::new(),
             self_devirt: false,
+            osr_map: None,
         }
     }
 }
@@ -344,6 +350,9 @@ impl Nmethod {
 pub struct CodeTable {
     slots: Vec<Option<Nmethod>>,
     by_key: HashMap<(u64, u64), NmethodId>,
+    /// S15: `(klass, selector, osr_bci)` → OSR-entry nmethod. Same weak /
+    /// rebuild-after-GC / conditional-retirement discipline as `by_key`.
+    osr_table: HashMap<(u64, u64, u16), NmethodId>,
     /// `(code base, id)`, sorted by base — `find_by_pc` binary-searches
     /// this; the code cache never moves a published block (S9/S12's own
     /// invariant), so this table is never invalidated by a GC the way
@@ -413,6 +422,19 @@ impl CodeTable {
 
     pub fn lookup(&self, k: KlassOop, sel: SymbolOop) -> Option<NmethodId> {
         self.by_key.get(&(k.oop().raw(), sel.oop().raw())).copied()
+    }
+
+    /// S15: the OSR side table — `(klass, selector, loop-header bci)` → the
+    /// nmethod carrying that OSR entry.
+    pub fn lookup_osr(&self, k: KlassOop, sel: SymbolOop, bci: u16) -> Option<NmethodId> {
+        self.osr_table
+            .get(&(k.oop().raw(), sel.oop().raw(), bci))
+            .copied()
+    }
+
+    pub fn install_osr(&mut self, k: KlassOop, sel: SymbolOop, bci: u16, id: NmethodId) {
+        self.osr_table
+            .insert((k.oop().raw(), sel.oop().raw(), bci), id);
     }
 
     /// D8: visit every embedded-oop pool word in every nmethod (S10 has
@@ -581,6 +603,12 @@ impl CodeTable {
             .expect("mark_zombie: id must be alive");
         nm.state = NmState::Zombie;
         let key = (nm.key_klass.oop().raw(), nm.key_selector.oop().raw());
+        if let Some(m) = &nm.osr_map {
+            let okey = (key.0, key.1, m.osr_bci);
+            if self.osr_table.get(&okey) == Some(&id) {
+                self.osr_table.remove(&okey);
+            }
+        }
         // Only unhook the key if it still names THIS nmethod: a replaced
         // (recompiled) nmethod's key already points at its successor, and
         // removing it here would orphan the LIVE replacement — every later
@@ -621,6 +649,12 @@ impl CodeTable {
         );
         nm.state = NmState::NotEntrant;
         let key = (nm.key_klass.oop().raw(), nm.key_selector.oop().raw());
+        if let Some(m) = &nm.osr_map {
+            let okey = (key.0, key.1, m.osr_bci);
+            if self.osr_table.get(&okey) == Some(&id) {
+                self.osr_table.remove(&okey);
+            }
+        }
         // Same successor guard as `mark_zombie`: recompilation installs the
         // replacement FIRST (recompile.rs relies on the key never pointing
         // at nothing), so by the time the old version is retired the key
@@ -742,9 +776,22 @@ impl CodeTable {
     /// changes out from under it exactly like `LookupCache`'s own entries.
     pub fn rehash(&mut self) {
         self.by_key.clear();
+        self.osr_table.clear();
         for nm in self.slots.iter().flatten() {
+            // Only ALIVE nmethods re-enter either map: retirement REMOVED a
+            // NotEntrant/Zombie entry's key on purpose (S14's successor
+            // guard), and blindly re-inserting here would resurrect it —
+            // slot-order iteration could then shadow a live replacement
+            // sitting in a LOWER (reused) slot. (Latent since S12's rehash;
+            // made observable by S15's osr_table sharing the discipline.)
+            if !matches!(nm.state, NmState::Alive) {
+                continue;
+            }
             let key = (nm.key_klass.oop().raw(), nm.key_selector.oop().raw());
             self.by_key.insert(key, nm.id);
+            if let Some(m) = &nm.osr_map {
+                self.osr_table.insert((key.0, key.1, m.osr_bci), nm.id);
+            }
         }
     }
 
@@ -831,6 +878,7 @@ mod tests {
             deopt_pcdescs: Vec::new(),
             inline_deps: Vec::new(),
             self_devirt: false,
+            osr_map: None,
         }
     }
 

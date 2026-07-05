@@ -53,6 +53,112 @@ pub fn resolve_frame_loc(vreg: VReg, pos: u32, intervals: &[LiveInterval]) -> Va
     ValueLoc::Nil
 }
 
+// ── OSR map (S15 A2/A3) ───────────────────────────────────────────────────
+
+/// Where one OSR-transferred value comes FROM in the interpreter frame
+/// being replaced (S15 A3 step 3 reads these; SPEC §5.1 slot layout).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum OsrSource {
+    Receiver,
+    /// Unified arg/temp slot index (SPEC §4.1 numbering).
+    Slot(u16),
+    /// Interpreter operand-stack element i at the loop header (0 = bottom).
+    StackSlot(u16),
+    /// The frame's heap Context oop (methods with `has_ctx`) — unused while
+    /// v1 declines OSR for `has_ctx` methods, carried for format stability.
+    Context,
+}
+
+/// One transferred value: its interpreter-side source and the compiled
+/// frame's canonical spill home (byte offset from FP) of the vreg that is
+/// live-in at the OSR entry.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct OsrSlot {
+    pub src: OsrSource,
+    pub dst_frame_off: i32,
+}
+
+/// The interpreter→compiled frame-conversion map, packed into the nmethod
+/// alongside the scope-desc blob family (same LEB primitives). One nmethod
+/// has AT MOST ONE OSR entry in v1 (the loop that triggered).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OsrMap {
+    /// The root-scope loop-header bci this entry serves.
+    pub osr_bci: u16,
+    /// Code offset of the OSR entry block.
+    pub entry_off: u32,
+    /// Compiled frame size (in 8-byte words) the OSR prologue allocates —
+    /// the same value the normal prologue uses.
+    pub frame_words: u32,
+    /// In buffer order: the packer (A3 step 3) reads sources in exactly
+    /// this order, and the entry block's copy sequence consumes the buffer
+    /// in the same order.
+    pub slots: Vec<OsrSlot>,
+}
+
+impl OsrMap {
+    /// Tag values for `OsrSource` (pinned — the blob is a persistent
+    /// format the runtime unpacks).
+    const TAG_RECEIVER: u64 = 0;
+    const TAG_SLOT: u64 = 1;
+    const TAG_STACK: u64 = 2;
+    const TAG_CONTEXT: u64 = 3;
+
+    pub fn pack(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        write_uleb(&mut out, self.osr_bci as u64);
+        write_uleb(&mut out, self.entry_off as u64);
+        write_uleb(&mut out, self.frame_words as u64);
+        write_uleb(&mut out, self.slots.len() as u64);
+        for s in &self.slots {
+            match s.src {
+                OsrSource::Receiver => write_uleb(&mut out, Self::TAG_RECEIVER),
+                OsrSource::Slot(i) => {
+                    write_uleb(&mut out, Self::TAG_SLOT);
+                    write_uleb(&mut out, i as u64);
+                }
+                OsrSource::StackSlot(i) => {
+                    write_uleb(&mut out, Self::TAG_STACK);
+                    write_uleb(&mut out, i as u64);
+                }
+                OsrSource::Context => write_uleb(&mut out, Self::TAG_CONTEXT),
+            }
+            // dst offsets are negative (below FP) — zigzag via the same
+            // scheme resolve_frame_loc's FrameSlot uses when packed in
+            // scope blobs: encode magnitude of the always-negative offset.
+            debug_assert!(s.dst_frame_off < 0, "spill homes live below FP");
+            write_uleb(&mut out, (-s.dst_frame_off) as u64);
+        }
+        out
+    }
+
+    pub fn unpack(buf: &[u8]) -> OsrMap {
+        let mut pos = 0usize;
+        let osr_bci = read_uleb(buf, &mut pos) as u16;
+        let entry_off = read_uleb(buf, &mut pos) as u32;
+        let frame_words = read_uleb(buf, &mut pos) as u32;
+        let n = read_uleb(buf, &mut pos) as usize;
+        let mut slots = Vec::with_capacity(n);
+        for _ in 0..n {
+            let src = match read_uleb(buf, &mut pos) {
+                Self::TAG_RECEIVER => OsrSource::Receiver,
+                Self::TAG_SLOT => OsrSource::Slot(read_uleb(buf, &mut pos) as u16),
+                Self::TAG_STACK => OsrSource::StackSlot(read_uleb(buf, &mut pos) as u16),
+                Self::TAG_CONTEXT => OsrSource::Context,
+                other => panic!("OsrMap::unpack: unknown source tag {other}"),
+            };
+            let dst_frame_off = -(read_uleb(buf, &mut pos) as i32);
+            slots.push(OsrSlot { src, dst_frame_off });
+        }
+        OsrMap {
+            osr_bci,
+            entry_off,
+            frame_words,
+            slots,
+        }
+    }
+}
+
 // ── LEB128 ────────────────────────────────────────────────────────────────
 
 /// Unsigned LEB128 (SPEC §12.1's named round-trip test): 7 payload bits per
@@ -639,6 +745,46 @@ impl Iterator for ScopeChainIter<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn osr_map_round_trip() {
+        let m = OsrMap {
+            osr_bci: 7,
+            entry_off: 0x1a4,
+            frame_words: 12,
+            slots: vec![
+                OsrSlot {
+                    src: OsrSource::Receiver,
+                    dst_frame_off: -8,
+                },
+                OsrSlot {
+                    src: OsrSource::Slot(3),
+                    dst_frame_off: -32,
+                },
+                OsrSlot {
+                    src: OsrSource::StackSlot(0),
+                    dst_frame_off: -48,
+                },
+                OsrSlot {
+                    src: OsrSource::Context,
+                    dst_frame_off: -160,
+                },
+            ],
+        };
+        let packed = m.pack();
+        assert_eq!(OsrMap::unpack(&packed), m, "pack/unpack round-trip");
+    }
+
+    #[test]
+    fn osr_map_empty_slots() {
+        let m = OsrMap {
+            osr_bci: 0,
+            entry_off: 0,
+            frame_words: 2,
+            slots: Vec::new(),
+        };
+        assert_eq!(OsrMap::unpack(&m.pack()), m);
+    }
 
     fn uleb_roundtrip(v: u64) {
         let mut out = Vec::new();

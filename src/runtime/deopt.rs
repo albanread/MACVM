@@ -770,6 +770,7 @@ pub(crate) mod test_support {
             deopt_pcdescs: Vec::new(),
             inline_deps: Vec::new(),
             self_devirt: false,
+            osr_map: None,
         }
     }
 

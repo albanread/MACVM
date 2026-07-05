@@ -366,6 +366,13 @@ impl BytecodeBuilder {
 
     // --- control flow -----------------------------------------------------
 
+    /// S15 (OSR tests): the current bytecode offset — what `bind` would
+    /// bind a label to right now. Lets a test capture a loop header's bci
+    /// exactly instead of re-deriving instruction widths.
+    pub fn here(&self) -> usize {
+        self.code.len()
+    }
+
     pub fn new_label(&mut self) -> Label {
         let idx = self.labels.len();
         self.labels.push(LabelState::Unbound(Vec::new()));

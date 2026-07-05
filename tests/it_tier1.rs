@@ -155,13 +155,14 @@ fn run_ir_raw() {
     let regalloc_result = regalloc::regalloc(&method);
 
     let mut asm = JasmAssembler::new();
-    let (blob, pcs, _verified_entry_off, _ic_sites, _safepoints) = emit::emit(
+    let (blob, pcs, _verified_entry_off, _ic_sites, _safepoints, _osr_off) = emit::emit(
         &mut asm,
         &method,
         &regalloc_result,
         stubs.stub_poll_addr(),
         stubs.must_be_boolean_addr(),
         stubs.alloc_slow_addr(),
+        None,
         None,
     );
     assert_eq!(
@@ -204,13 +205,14 @@ fn run_ir_raw() {
 fn build_and_publish(cache: &mut CodeCache, stub_poll_addr: u64, method: &IrMethod) -> *const u8 {
     let regalloc_result = regalloc::regalloc(method);
     let mut asm = JasmAssembler::new();
-    let (blob, _pcs, _verified_entry_off, _ic_sites, _safepoints) = emit::emit(
+    let (blob, _pcs, _verified_entry_off, _ic_sites, _safepoints, _osr_off) = emit::emit(
         &mut asm,
         method,
         &regalloc_result,
         stub_poll_addr,
         0,
         0,
+        None,
         None,
     );
     let h = cache.alloc(blob.code.len()).unwrap();
@@ -404,13 +406,14 @@ fn run_ir_raw_forces_spill() {
     );
 
     let mut asm = JasmAssembler::new();
-    let (blob, _pcs, _verified_entry_off, _ic_sites, _safepoints) = emit::emit(
+    let (blob, _pcs, _verified_entry_off, _ic_sites, _safepoints, _osr_off) = emit::emit(
         &mut asm,
         &method,
         &regalloc_result,
         stubs.stub_poll_addr(),
         stubs.must_be_boolean_addr(),
         stubs.alloc_slow_addr(),
+        None,
         None,
     );
     let h = cache.alloc(blob.code.len()).unwrap();
@@ -1526,13 +1529,14 @@ fn compile_and_get_listing(vm: &VmState, method: MethodOop) -> String {
     // S10 listing goldens (s10_sumTo/absDiff/bitsOf) -- keeping their output
     // unchanged is the point, not something to revisit as a side effect of
     // step 2's own scope.
-    let (blob, _pcs, _verified_entry_off, _ic_sites, _safepoints) = emit::emit(
+    let (blob, _pcs, _verified_entry_off, _ic_sites, _safepoints, _osr_off) = emit::emit(
         &mut asm,
         &ir,
         &ra,
         0xDEAD_BEEF_0000_0000,
         0xDEAD_BEEF_0000_0001,
         0xDEAD_BEEF_0000_0002,
+        None,
         None,
     );
     blob.listing.join("\n") + "\n"
@@ -2344,13 +2348,14 @@ fn mono_resolve_patches_call_site_and_dispatches() {
     };
     let ra = regalloc::regalloc(&caller_method);
     let mut asm = JasmAssembler::new();
-    let (blob, _pcs, _verified_entry_off, emitted_ic_sites, _safepoints) = emit::emit(
+    let (blob, _pcs, _verified_entry_off, emitted_ic_sites, _safepoints, _osr_off) = emit::emit(
         &mut asm,
         &caller_method,
         &ra,
         vm.stubs.stub_poll_addr(),
         vm.stubs.must_be_boolean_addr(),
         vm.stubs.alloc_slow_addr(),
+        None,
         None,
     );
     assert_eq!(emitted_ic_sites.len(), 1, "exactly one Ir::CallSend");
@@ -2396,6 +2401,7 @@ fn mono_resolve_patches_call_site_and_dispatches() {
         deopt_pcdescs: Vec::new(),
         inline_deps: Vec::new(),
         self_devirt: false,
+        osr_map: None,
     };
     let caller_id = vm.code_table.install(caller_nm);
     let caller_entry = h.base as u64; // entry_off == verified_entry_off == 0 (no guard, `None`)
@@ -2511,13 +2517,14 @@ fn build_c2i_scenario(vm: &mut VmState) -> (u64, KlassOop, NmethodId) {
     };
     let ra = regalloc::regalloc(&caller_method);
     let mut asm = JasmAssembler::new();
-    let (blob, _pcs, _verified_entry_off, emitted_ic_sites, _safepoints) = emit::emit(
+    let (blob, _pcs, _verified_entry_off, emitted_ic_sites, _safepoints, _osr_off) = emit::emit(
         &mut asm,
         &caller_method,
         &ra,
         vm.stubs.stub_poll_addr(),
         vm.stubs.must_be_boolean_addr(),
         vm.stubs.alloc_slow_addr(),
+        None,
         None,
     );
     assert_eq!(emitted_ic_sites.len(), 1, "exactly one Ir::CallSend");
@@ -2563,6 +2570,7 @@ fn build_c2i_scenario(vm: &mut VmState) -> (u64, KlassOop, NmethodId) {
         deopt_pcdescs: Vec::new(),
         inline_deps: Vec::new(),
         self_devirt: false,
+        osr_map: None,
     };
     let caller_id = vm.code_table.install(caller_nm);
     let caller_entry = h.base as u64; // entry_off == verified_entry_off == 0 (no guard, `None`)
@@ -2742,13 +2750,14 @@ fn full_ic_lattice_mono_to_pic_to_mega() {
     };
     let ra = regalloc::regalloc(&caller_method);
     let mut asm = JasmAssembler::new();
-    let (blob, _pcs, _verified_entry_off, emitted_ic_sites, _safepoints) = emit::emit(
+    let (blob, _pcs, _verified_entry_off, emitted_ic_sites, _safepoints, _osr_off) = emit::emit(
         &mut asm,
         &caller_method,
         &ra,
         vm.stubs.stub_poll_addr(),
         vm.stubs.must_be_boolean_addr(),
         vm.stubs.alloc_slow_addr(),
+        None,
         None,
     );
     assert_eq!(emitted_ic_sites.len(), 1);
@@ -2794,6 +2803,7 @@ fn full_ic_lattice_mono_to_pic_to_mega() {
         deopt_pcdescs: Vec::new(),
         inline_deps: Vec::new(),
         self_devirt: false,
+        osr_map: None,
     };
     let caller_id = vm.code_table.install(caller_nm);
     let caller_entry = h.base as u64;
@@ -2967,13 +2977,14 @@ fn dnu_from_compiled_code_reaches_does_not_understand() {
     };
     let ra = regalloc::regalloc(&caller_method);
     let mut asm = JasmAssembler::new();
-    let (blob, _pcs, _verified_entry_off, emitted_ic_sites, _safepoints) = emit::emit(
+    let (blob, _pcs, _verified_entry_off, emitted_ic_sites, _safepoints, _osr_off) = emit::emit(
         &mut asm,
         &caller_method,
         &ra,
         vm.stubs.stub_poll_addr(),
         vm.stubs.must_be_boolean_addr(),
         vm.stubs.alloc_slow_addr(),
+        None,
         None,
     );
     assert_eq!(emitted_ic_sites.len(), 1);
@@ -3019,6 +3030,7 @@ fn dnu_from_compiled_code_reaches_does_not_understand() {
         deopt_pcdescs: Vec::new(),
         inline_deps: Vec::new(),
         self_devirt: false,
+        osr_map: None,
     };
     let caller_id = vm.code_table.install(caller_nm);
     let caller_entry = h.base as u64;
@@ -6348,5 +6360,101 @@ fn inlined_trap_deopt_restores_nonempty_pending_stack() {
         compiled,
         interp2.raw(),
         "differential across the in-body trap deopt"
+    );
+}
+
+/// S15 steps 2-3: an OSR compile of a warm smi loop produces a normal
+/// nmethod PLUS an `OsrMap` (header bci, in-code entry offset, live-in
+/// transfer slots) and registers it in the `osr_table`; the nmethod still
+/// serves ordinary calls through its normal entry. has_ctx / closure
+/// methods decline (v1 envelope).
+#[test]
+fn osr_compile_emits_entry_and_map() {
+    let mut vm = loop_test_vm();
+    let smi_klass = vm.universe.smi_klass;
+    let lt_sel = vm.universe.intern(b"<");
+    let plus_sel = vm.universe.intern(b"+");
+
+    // `countTo: n [ |i| i:=0. [i<n] whileTrue:[i:=i+1]. ^i ]`.  t0=n, t1=i.
+    let mut b = BytecodeBuilder::new();
+    b.push_smi_i8(0);
+    b.store_temp_pop(1);
+    let hdr_bci = b.here();
+    let loop_hdr = b.new_label();
+    b.bind(loop_hdr);
+    b.push_temp(1);
+    b.push_temp(0);
+    b.send(&mut vm, lt_sel, 1);
+    let end = b.new_label();
+    b.br_false_fwd(end);
+    b.push_temp(1);
+    b.push_smi_i8(1);
+    b.send(&mut vm, plus_sel, 1);
+    b.store_temp_pop(1);
+    b.jump_back(loop_hdr);
+    b.bind(end);
+    b.push_temp(1);
+    b.ret_tos();
+    let m_sel = vm.universe.intern(b"osrCountTo:");
+    let method = b.finish(&mut vm, m_sel, 1, 1);
+
+    // Warm the inner smi ICs (mono-smi) with one interpreted run.
+    let recv = SmallInt::new(0).oop();
+    let warm = macvm::interpreter::run_method(&mut vm, method, recv, &[SmallInt::new(3).oop()]);
+    assert_eq!(warm.raw(), SmallInt::new(3).oop().raw());
+
+    let id = driver::compile_method_osr(&mut vm, smi_klass, method, hdr_bci as u16)
+        .expect("OSR compile of a warm ctx-free smi loop must succeed");
+    let sel = SymbolOop::try_from(method.selector()).expect("selector");
+    {
+        let nm = vm.code_table.get(id).expect("installed");
+        let m = nm.osr_map.as_ref().expect("nmethod carries an OsrMap");
+        assert_eq!(m.osr_bci, hdr_bci as u16);
+        assert!(
+            (m.entry_off as usize) > 0 && (m.entry_off as usize) < nm.code.len,
+            "OSR entry offset lands inside the code blob"
+        );
+        assert!(m.frame_words >= 1, "a real frame is allocated");
+        use macvm::compiler::scopes::OsrSource;
+        assert!(
+            m.slots.iter().any(|s| matches!(s.src, OsrSource::Slot(0))),
+            "loop bound n (slot 0) is a live-in transfer"
+        );
+        assert!(
+            m.slots.iter().any(|s| matches!(s.src, OsrSource::Slot(1))),
+            "loop counter i (slot 1) is a live-in transfer"
+        );
+        for sl in &m.slots {
+            assert!(sl.dst_frame_off < 0, "spill homes live below FP");
+        }
+        assert_eq!(
+            vm.code_table.lookup_osr(smi_klass, sel, hdr_bci as u16),
+            Some(id),
+            "osr_table maps (klass, selector, header bci) to the carrier"
+        );
+    }
+
+    // The OSR nmethod still serves NORMAL calls through its normal entry.
+    let n = 12i64;
+    vm.stack.push(SmallInt::new(0).oop());
+    vm.stack.push(SmallInt::new(n).oop());
+    assert_eq!(enter_compiled(&mut vm, id, 1), EnterResult::Completed);
+    assert_eq!(vm.stack.pop().raw(), SmallInt::new(n).oop().raw());
+
+    // v1 envelope: a closure-bearing method declines OSR.
+    let value_sel = vm.universe.intern(b"value");
+    let mut cb = BytecodeBuilder::new();
+    let lit = cb.build_block(&mut vm, 0, 0, false, 0, false, |blk, _vm| {
+        blk.push_smi_i8(1);
+        blk.block_return_tos();
+    });
+    cb.push_closure(lit, 0);
+    cb.send(&mut vm, value_sel, 0);
+    cb.ret_tos();
+    let wb_sel = vm.universe.intern(b"withBlock");
+    let cm = cb.finish(&mut vm, wb_sel, 0, 0);
+    assert!(
+        driver::compile_method_osr(&mut vm, smi_klass, cm, 0).is_none(),
+        "closure-bearing methods are outside the v1 OSR envelope"
     );
 }

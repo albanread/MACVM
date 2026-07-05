@@ -398,6 +398,47 @@ pub fn compile_method_versioned(
     method: MethodOop,
     version: u8,
 ) -> Option<NmethodId> {
+    compile_method_full(vm, rcvr_klass, method, version, None)
+}
+
+/// S15 A2: compile WITH an OSR entry at `osr_bci` (a root-scope loop-header
+/// bci — the backward jump target that overflowed the loop counter). The
+/// result is a NORMAL nmethod for the key (it also serves future calls; it
+/// replaces the CodeTable entry) that additionally carries an `OsrMap` +
+/// entry block. Declines (None) when the method/header shape is outside the
+/// v1 OSR envelope — the caller resets the loop counter and keeps
+/// interpreting.
+/// S15: does `method`'s bytecode create any literal closure? OSR v1
+/// declines such methods (see `compile_method_full`'s envelope comment).
+fn method_has_closure(method: MethodOop) -> bool {
+    let len = method.bytecode_len();
+    let mut bci = 0;
+    while bci < len {
+        let (instr, next) = decode_at(method, bci);
+        if matches!(instr, Instr::PushClosure { .. }) {
+            return true;
+        }
+        bci = next;
+    }
+    false
+}
+
+pub fn compile_method_osr(
+    vm: &mut VmState,
+    rcvr_klass: KlassOop,
+    method: MethodOop,
+    osr_bci: u16,
+) -> Option<NmethodId> {
+    compile_method_full(vm, rcvr_klass, method, 0, Some(osr_bci))
+}
+
+fn compile_method_full(
+    vm: &mut VmState,
+    rcvr_klass: KlassOop,
+    method: MethodOop,
+    version: u8,
+    osr_bci: Option<u16>,
+) -> Option<NmethodId> {
     match eligibility_detail(vm, method) {
         Eligibility::Yes => {}
         Eligibility::NoPermanent => {
@@ -425,6 +466,16 @@ pub fn compile_method_versioned(
         }
     }
 
+    // S15 A2 v1 OSR envelope: no `has_ctx` (the interpreter frame already
+    // owns a materialized Context; compiling root ctx-access through the
+    // incoming Context oop is a later slice — the flagship loop shapes,
+    // frontend-inlined to:do:/whileTrue:, are ctx-free) and no closures
+    // (escape-mode operand stacks can hold phantoms the transfer buffer
+    // cannot represent).
+    if osr_bci.is_some() && (method.has_ctx() || method_has_closure(method)) {
+        return None;
+    }
+
     let cfg = decode::decode(method);
     let ir_method = ir::convert(vm, rcvr_klass, method, &cfg);
     let regalloc_result = regalloc::regalloc(&ir_method);
@@ -438,15 +489,92 @@ pub fn compile_method_versioned(
         key_klass_bits: rcvr_klass.oop().raw(),
         resolve_addr: vm.stubs.resolve_addr(),
     };
-    let (blob, block_pcs, verified_entry_off, emitted_ic_sites, safepoint_pcs) = emit::emit(
-        &mut asm,
-        &ir_method,
-        &regalloc_result,
-        stub_poll_addr,
-        must_be_boolean_addr,
-        alloc_slow_addr,
-        Some(guard),
-    );
+    // S15 A2 steps 4-5: locate the header block (decode block index == IR
+    // block id for original blocks), resolve its live-in entities against
+    // its own linear start position, and hand emit the copy plan. Entities
+    // whose interval is DEAD at the header resolve to Nil and are OMITTED
+    // (scope descs materialize dead slots as nil on a later deopt — the
+    // doc's honest-caveat rule). A header that cannot be found (bci not a
+    // block start) or whose entry stack is unavailable declines the whole
+    // OSR compile.
+    let mut osr_plan: Option<(emit::EmitOsr, Vec<crate::compiler::scopes::OsrSlot>)> = None;
+    if let Some(bci) = osr_bci {
+        let header_ix = cfg
+            .blocks
+            .iter()
+            .position(|b| b.bci_start == bci as usize)?;
+        let header = crate::compiler::ir::BlockId(header_ix as u32);
+        let header_pos = *regalloc_result
+            .block_start_pos
+            .get(&header_ix.try_into().ok()?)?;
+        let entry_stack = &ir_method.blocks[header_ix].entry_stack;
+
+        use crate::compiler::scopes::{OsrSlot, OsrSource, ValueLoc};
+        let n_slots = method.argc() + method.ntemps();
+        let mut sources: Vec<(OsrSource, crate::compiler::ir::VReg)> =
+            vec![(OsrSource::Receiver, crate::compiler::ir::VReg(0))];
+        for i in 0..n_slots {
+            sources.push((
+                OsrSource::Slot(i as u16),
+                crate::compiler::ir::VReg((1 + i) as u32),
+            ));
+        }
+        for (j, &v) in entry_stack.iter().enumerate() {
+            sources.push((OsrSource::StackSlot(j as u16), v));
+        }
+        let mut copies = Vec::new();
+        let mut slots = Vec::new();
+        for (src, v) in sources {
+            match crate::compiler::scopes::resolve_frame_loc(
+                v,
+                header_pos,
+                &regalloc_result.intervals,
+            ) {
+                ValueLoc::FrameSlot(off) => {
+                    debug_assert!(off < 0 && off % 8 == 0);
+                    let slot = crate::compiler::regalloc::SpillSlot((-off / 8 - 1) as u16);
+                    copies.push(slot);
+                    slots.push(OsrSlot {
+                        src,
+                        dst_frame_off: off,
+                    });
+                }
+                ValueLoc::Nil => {} // dead at the header — omitted
+                other => {
+                    debug_assert!(
+                        false,
+                        "OSR live-in resolved to non-slot {other:?} (compiler bug)"
+                    );
+                    return None;
+                }
+            }
+        }
+        osr_plan = Some((
+            emit::EmitOsr {
+                header,
+                copies,
+                reload_pos: header_pos,
+            },
+            slots,
+        ));
+    }
+    let osr_req: Option<emit::EmitOsr> = osr_plan.as_ref().map(|(req, _)| emit::EmitOsr {
+        header: req.header,
+        copies: req.copies.clone(),
+        reload_pos: req.reload_pos,
+    });
+    let frame_slots_for_osr = regalloc_result.frame_slots;
+    let (blob, block_pcs, verified_entry_off, emitted_ic_sites, safepoint_pcs, osr_off) =
+        emit::emit(
+            &mut asm,
+            &ir_method,
+            &regalloc_result,
+            stub_poll_addr,
+            must_be_boolean_addr,
+            alloc_slow_addr,
+            Some(guard),
+            osr_req.as_ref(),
+        );
 
     // D4.6: pre-resolve every `send_super` site's own target BEFORE
     // publishing anything -- resolving here (not at runtime, via
@@ -619,6 +747,15 @@ pub fn compile_method_versioned(
         // inlined callee is redefined.
         inline_deps: ir_method.inline_deps.clone(),
         self_devirt: ir_method.self_devirt,
+        osr_map: osr_plan.as_ref().map(|(_, slots)| {
+            let frame_bytes = ((8 * frame_slots_for_osr as i64) + 15) & !15;
+            crate::compiler::scopes::OsrMap {
+                osr_bci: osr_bci.expect("osr_plan implies osr_bci"),
+                entry_off: osr_off.expect("emit built the entry block when asked"),
+                frame_words: (frame_bytes / 8) as u32,
+                slots: slots.clone(),
+            }
+        }),
     };
     // S12 D1 enforcement point 2: "debug + stress" — reuses the existing
     // heap-verifier's own gate (`MACVM_GC_VERIFY=1` opts a release build
@@ -632,7 +769,18 @@ pub fn compile_method_versioned(
         vm.code_cache.patch_branch26_at(h, site.off, patch_target);
     }
     vm.stats.compilations += 1; // S15 A8 tier-balance counter
+    let has_osr = nm.osr_map.is_some();
     let id = vm.code_table.install(nm);
+    if has_osr {
+        let sel = crate::oops::wrappers::SymbolOop::try_from(method.selector())
+            .expect("a method's selector is always a Symbol");
+        vm.code_table.install_osr(
+            rcvr_klass,
+            sel,
+            osr_bci.expect("has_osr implies osr_bci"),
+            id,
+        );
+    }
     if vm.options.trace.is_enabled("jit") {
         eprintln!(
             "[jit] compiled {} -> nmethod {} ({} bytes, {} frame slots)",
@@ -1343,8 +1491,8 @@ mod tests {
         let ra = regalloc::regalloc(&ir_method);
 
         let mut asm = JasmAssembler::new();
-        let (_blob, _pcs, _ve, _ic, safepoint_pcs) =
-            emit::emit(&mut asm, &ir_method, &ra, 0, 0, 0, None);
+        let (_blob, _pcs, _ve, _ic, safepoint_pcs, _osr_off) =
+            emit::emit(&mut asm, &ir_method, &ra, 0, 0, 0, None, None);
         assert_eq!(
             safepoint_pcs.len(),
             2,
@@ -1497,8 +1645,8 @@ mod tests {
         let ra = regalloc::regalloc(&ir_method);
 
         let mut asm = JasmAssembler::new();
-        let (_blob, _pcs, _ve, _ic, safepoint_pcs) =
-            emit::emit(&mut asm, &ir_method, &ra, 0, 0, 0, None);
+        let (_blob, _pcs, _ve, _ic, safepoint_pcs, _osr_off) =
+            emit::emit(&mut asm, &ir_method, &ra, 0, 0, 0, None, None);
 
         let (blob, pcdescs) = build_deopt_metadata(&ir_method, &ra, &safepoint_pcs);
 

@@ -212,7 +212,14 @@ fn reverse_postorder(method: &IrMethod) -> Vec<BlockId> {
 /// `emit.rs`'s own position counter, which walks `block_order` identically)
 /// depend on this being the exact same sequence `crosses_safepoint` above
 /// was computed against, not a re-derivation that could drift out of sync.
-pub fn compute_intervals(method: &IrMethod) -> (Vec<BlockId>, Vec<LiveInterval>, Vec<u32>) {
+pub fn compute_intervals(
+    method: &IrMethod,
+) -> (
+    Vec<BlockId>,
+    Vec<LiveInterval>,
+    Vec<u32>,
+    std::collections::HashMap<u32, u32>,
+) {
     let block_order = reverse_postorder(method);
 
     let mut pos: u32 = 0;
@@ -454,7 +461,7 @@ pub fn compute_intervals(method: &IrMethod) -> (Vec<BlockId>, Vec<LiveInterval>,
         })
         .collect();
 
-    (block_order, intervals, safepoint_positions)
+    (block_order, intervals, safepoint_positions, block_start_pos)
 }
 
 /// x0–x15 (`arm64.md` §3); x16/x17 scratch, x18 platform, x19–x23 unused
@@ -620,10 +627,16 @@ pub struct RegallocResult {
     /// of these, and `compiler::oopmap::build_for_position` intersects
     /// `intervals` against it to build that safepoint's own `OopMap`.
     pub safepoint_positions: Vec<u32>,
+    /// S15 (OSR): each block id's first linear position, in the SAME
+    /// numbering as `intervals`/`safepoint_positions` — the driver resolves
+    /// the OSR header block's live-in entities against exactly this
+    /// position, and emit reloads residents live there.
+    pub block_start_pos: std::collections::HashMap<u32, u32>,
 }
 
 pub fn regalloc(method: &IrMethod) -> RegallocResult {
-    let (block_order, mut intervals, safepoint_positions) = compute_intervals(method);
+    let (block_order, mut intervals, safepoint_positions, block_start_pos) =
+        compute_intervals(method);
     let (frame_slots, slot_is_oop) = allocate(&mut intervals);
     // S14 perf recovery: call-free spilled intervals also get a resident
     // register (slots stay canonical; see LiveInterval::resident_reg).
@@ -634,6 +647,7 @@ pub fn regalloc(method: &IrMethod) -> RegallocResult {
         frame_slots,
         slot_is_oop,
         safepoint_positions,
+        block_start_pos,
     }
 }
 
@@ -694,7 +708,7 @@ mod tests {
             vec![VRegInfo { is_oop: true }, VRegInfo { is_oop: true }],
         );
 
-        let (_order, intervals, _safepoints) = compute_intervals(&method);
+        let (_order, intervals, _safepoints, _bsp) = compute_intervals(&method);
         let iv = intervals
             .iter()
             .find(|iv| iv.vreg == v0)
@@ -728,7 +742,7 @@ mod tests {
         };
         let method = hand_method(vec![block0, block1], vec![VRegInfo { is_oop: true }]);
 
-        let (order, intervals, _safepoints) = compute_intervals(&method);
+        let (order, intervals, _safepoints, _bsp) = compute_intervals(&method);
         assert_eq!(
             order,
             vec![BlockId(0), BlockId(1)],
@@ -764,7 +778,7 @@ mod tests {
         };
         let method = hand_method(vec![block], vec![VRegInfo { is_oop: true }]);
 
-        let (_order, mut intervals, _safepoints) = compute_intervals(&method);
+        let (_order, mut intervals, _safepoints, _bsp) = compute_intervals(&method);
         assert!(
             intervals[0].crosses_safepoint,
             "v0 is defined before and used after the call"
@@ -933,7 +947,7 @@ mod tests {
             deopt_sites: Vec::new(),
         };
         let method = hand_method(vec![block0, dead], Vec::new());
-        let (order, _intervals, _safepoints) = compute_intervals(&method);
+        let (order, _intervals, _safepoints, _bsp) = compute_intervals(&method);
         assert_eq!(
             order.len(),
             2,
@@ -1065,7 +1079,7 @@ mod tests {
             vec![entry, header, body, exit, bailout],
             (0..6).map(|_| VRegInfo { is_oop: true }).collect(),
         );
-        let (order, intervals, _safepoints) = compute_intervals(&method);
+        let (order, intervals, _safepoints, _bsp) = compute_intervals(&method);
 
         // Confirms this hand-built shape actually reproduces the bug's own
         // precondition: the exit block linearized before the body block.
