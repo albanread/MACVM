@@ -43,7 +43,21 @@ pub struct LiveInterval {
     /// safepoint (an interval whose only reference IS the safepoint's own
     /// argument list ends exactly at `p` and does not need to survive it).
     pub crosses_safepoint: bool,
+    /// S14 perf recovery: true iff a REAL CALL (`CallSend`/`CallRuntime`)
+    /// position sits strictly inside this interval. A call clobbers every
+    /// caller-saved register AND its callee may itself use the resident
+    /// registers, so only call-free intervals qualify for residency.
+    pub crosses_call: bool,
     pub assignment: Option<Assignment>,
+    /// S14 perf recovery (the 135x-regression fix): a callee-saved register
+    /// (x21–x23) this SPILLED interval's value ALSO lives in between
+    /// GC-continuing safepoints. The frame slot stays canonical — every def
+    /// writes BOTH (write-through), deopt/oop-maps read slots unchanged — but
+    /// reads prefer the register, and the only re-syncs are the Poll/Alloc
+    /// SLOW paths (their fast paths neither call nor GC; trap fail-edges are
+    /// terminating, so a stale register is never read after one). `None` for
+    /// register-assigned or call-crossing intervals.
+    pub resident_reg: Option<u8>,
 }
 
 fn is_safepoint(ir: &Ir) -> bool {
@@ -203,6 +217,7 @@ pub fn compute_intervals(method: &IrMethod) -> (Vec<BlockId>, Vec<LiveInterval>,
 
     let mut pos: u32 = 0;
     let mut safepoint_positions: Vec<u32> = Vec::new();
+    let mut call_positions: Vec<u32> = Vec::new();
     let mut min_def: HashMap<u32, u32> = HashMap::new();
     let mut max_use: HashMap<u32, u32> = HashMap::new();
     let mut block_start_pos: HashMap<u32, u32> = HashMap::new();
@@ -248,6 +263,9 @@ pub fn compute_intervals(method: &IrMethod) -> (Vec<BlockId>, Vec<LiveInterval>,
         for (idx, ir) in block.code.iter().enumerate() {
             if is_safepoint(ir) {
                 safepoint_positions.push(pos);
+            }
+            if matches!(ir, Ir::CallSend { .. } | Ir::CallRuntime { .. }) {
+                call_positions.push(pos);
             }
             if let Some((_, raw)) = block.deopt_sites.iter().find(|(ci, raw)| {
                 *ci == idx as u32
@@ -422,13 +440,16 @@ pub fn compute_intervals(method: &IrMethod) -> (Vec<BlockId>, Vec<LiveInterval>,
             let crosses_safepoint = safepoint_positions
                 .iter()
                 .any(|&sp| start <= sp && end > sp);
+            let crosses_call = call_positions.iter().any(|&cp| start <= cp && end > cp);
             Some(LiveInterval {
                 vreg: VReg(vid),
                 start,
                 end,
                 is_oop: method.vregs[vid as usize].is_oop,
                 crosses_safepoint,
+                crosses_call,
                 assignment: None,
+                resident_reg: None,
             })
         })
         .collect();
@@ -451,6 +472,52 @@ const NUM_ALLOCATABLE_REGS: u8 = 16;
 /// with the furthest end is spilled to make room (Poletto/Sarkar). (3)
 /// Spill slots are handed out monotonically; each records its interval's
 /// `is_oop` — the raw material for S12's `OopMap`s.
+/// S14 perf recovery: give call-free SPILLED intervals a RESIDENT register
+/// (x21–x23, callee-saved; disjoint from the x0–x15 allocatable pool and from
+/// emit's x16/x17/x19/x20 scratches). Longest intervals first — loop-carried
+/// variables win the registers. The slot stays canonical (write-through); see
+/// [`LiveInterval::resident_reg`].
+pub fn assign_residents(intervals: &mut [LiveInterval]) {
+    // Base pool: x21–x23 (callee-saved, never touched by emit's scratches
+    // x16/x17/x19/x20 or the ABI paths). EXTENDED by every x6–x15 register
+    // the main allocator left GLOBALLY unused in this method — in the
+    // spill-heavy hot methods residency exists for, nearly all of them (the
+    // whole point is that spill-all left the register file idle). x0–x5 stay
+    // out (ABI argument/result/alloc-slow paths write them mid-body).
+    let mut pool: Vec<u8> = vec![21, 22, 23];
+    let mut reg_used = [false; NUM_ALLOCATABLE_REGS as usize];
+    for iv in intervals.iter() {
+        if let Some(Assignment::Reg(r)) = iv.assignment {
+            reg_used[r as usize] = true;
+        }
+    }
+    for r in 6..NUM_ALLOCATABLE_REGS {
+        if !reg_used[r as usize] {
+            pool.push(r);
+        }
+    }
+
+    let mut taken: Vec<Vec<(u32, u32)>> = vec![Vec::new(); pool.len()];
+    let mut order: Vec<usize> = (0..intervals.len())
+        .filter(|&i| {
+            matches!(intervals[i].assignment, Some(Assignment::Spill(_)))
+                && !intervals[i].crosses_call
+                && intervals[i].end > intervals[i].start
+        })
+        .collect();
+    order.sort_by_key(|&i| std::cmp::Reverse(intervals[i].end - intervals[i].start));
+    for i in order {
+        let (s, e) = (intervals[i].start, intervals[i].end);
+        for (ri, reg) in pool.iter().enumerate() {
+            if taken[ri].iter().all(|&(ts, te)| e <= ts || te <= s) {
+                taken[ri].push((s, e));
+                intervals[i].resident_reg = Some(*reg);
+                break;
+            }
+        }
+    }
+}
+
 pub fn allocate(intervals: &mut [LiveInterval]) -> (u16, Vec<bool>) {
     let mut slot_is_oop: Vec<bool> = Vec::new();
     let spill = |iv: &mut LiveInterval, slot_is_oop: &mut Vec<bool>| {
@@ -558,6 +625,9 @@ pub struct RegallocResult {
 pub fn regalloc(method: &IrMethod) -> RegallocResult {
     let (block_order, mut intervals, safepoint_positions) = compute_intervals(method);
     let (frame_slots, slot_is_oop) = allocate(&mut intervals);
+    // S14 perf recovery: call-free spilled intervals also get a resident
+    // register (slots stay canonical; see LiveInterval::resident_reg).
+    assign_residents(&mut intervals);
     RegallocResult {
         block_order,
         intervals,
@@ -717,6 +787,8 @@ mod tests {
                 end: 5,
                 is_oop: true,
                 crosses_safepoint: true,
+                crosses_call: false,
+                resident_reg: None,
                 assignment: None,
             },
             LiveInterval {
@@ -725,6 +797,8 @@ mod tests {
                 end: 5,
                 is_oop: false,
                 crosses_safepoint: true,
+                crosses_call: false,
+                resident_reg: None,
                 assignment: None,
             },
         ];
@@ -758,6 +832,8 @@ mod tests {
             end: 10,
             is_oop: true,
             crosses_safepoint: true,
+            crosses_call: false,
+            resident_reg: None,
             assignment: Some(Assignment::Reg(3)),
         }];
         verify_spill_all(&intervals);
@@ -774,6 +850,8 @@ mod tests {
             end: 10,
             is_oop: true,
             crosses_safepoint: true,
+            crosses_call: false,
+            resident_reg: None,
             assignment: Some(Assignment::Spill(SpillSlot(0))),
         }];
         verify_spill_all(&intervals); // must not panic
@@ -790,6 +868,8 @@ mod tests {
             end: 999,
             is_oop: false,
             crosses_safepoint: false,
+            crosses_call: false,
+            resident_reg: None,
             assignment: None,
         }];
         for i in 1..17u32 {
@@ -799,6 +879,8 @@ mod tests {
                 end: 10,
                 is_oop: false,
                 crosses_safepoint: false,
+                crosses_call: false,
+                resident_reg: None,
                 assignment: None,
             });
         }

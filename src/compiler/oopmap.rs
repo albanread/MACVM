@@ -161,6 +161,8 @@ mod tests {
             end,
             is_oop,
             crosses_safepoint: true,
+            crosses_call: false,
+            resident_reg: None,
             assignment: Some(Assignment::Spill(SpillSlot(slot))),
         }
     }

@@ -261,6 +261,16 @@ struct Emitter<'a> {
     /// CallRuntime/Alloc's slow edge) emitted so far — see
     /// [`SafepointPc`]'s own doc.
     safepoints: Vec<SafepointPc>,
+    /// S14 perf recovery: per-vreg RESIDENT register (x21–x23) — the
+    /// register the value ALSO lives in besides its canonical slot
+    /// (`LiveInterval::resident_reg`). Reads prefer it; every def
+    /// writes through to the slot AND refreshes it.
+    resident: Vec<Option<u8>>,
+    /// The resident intervals as `(start, end, reg, slot)` — the Poll/Alloc
+    /// SLOW paths reload every entry live at the site (their `bl` may have
+    /// GC'd, moving the oops the resident registers point at; the canonical
+    /// slots were updated by the GC's frame walk).
+    resident_reloads: Vec<(u32, u32, u8, crate::compiler::regalloc::SpillSlot)>,
 }
 
 impl<'a> Emitter<'a> {
@@ -281,12 +291,46 @@ impl<'a> Emitter<'a> {
     /// earlier resolution is still valid (see `Mul`'s own handling, and
     /// this module's own doc).
     fn resolve(&mut self, v: VReg, scratch: u8) -> Reg {
+        // S14 perf recovery: a resident register mirrors the canonical slot
+        // at every instruction boundary (write-through defs; slow-path
+        // reloads after any GC opportunity) — read it, skip the ldr.
+        if let Some(rr) = self.resident[v.0 as usize] {
+            return xr(rr);
+        }
         match self.assignment_of(v) {
             Assignment::Reg(r) => xr(r),
             Assignment::Spill(slot) => {
                 emit_spill_access(self.asm, "ldr", x(scratch), slot);
                 xr(scratch)
             }
+        }
+    }
+
+    /// S14 perf recovery: after ANY def of `dst` lands in `from`, mirror it
+    /// into `dst`'s resident register (no-op for non-resident vregs). Every
+    /// def site must run this — `commit` does it centrally; the few def
+    /// paths that bypass `commit` call it directly.
+    fn refresh_resident(&mut self, dst: VReg, from: Reg) {
+        if let Some(rr) = self.resident[dst.0 as usize] {
+            if rr != from.num {
+                self.asm.emit("mov", &[x(rr), Operand::Reg(from)]);
+            }
+        }
+    }
+
+    /// Reload every resident register whose interval is live at the current
+    /// position — emitted on the Poll/Alloc SLOW paths only (their `bl` may
+    /// have GC'd; the fast paths neither call nor GC, so residents stay
+    /// valid there and cost nothing).
+    fn emit_resident_reloads(&mut self) {
+        let live: Vec<(u8, crate::compiler::regalloc::SpillSlot)> = self
+            .resident_reloads
+            .iter()
+            .filter(|&&(s, e, _, _)| s <= self.pos && e > self.pos)
+            .map(|&(_, _, rr, slot)| (rr, slot))
+            .collect();
+        for (rr, slot) in live {
+            emit_spill_access(self.asm, "ldr", x(rr), slot);
         }
     }
 
@@ -304,6 +348,7 @@ impl<'a> Emitter<'a> {
         if let Assignment::Spill(slot) = self.assignment_of(dst) {
             emit_spill_access(self.asm, "str", Operand::Reg(computed_in), slot);
         }
+        self.refresh_resident(dst, computed_in);
     }
 
     fn emit_tag_check(&mut self, ra: Reg, rb: Reg, fail: BlockId) {
@@ -372,6 +417,9 @@ impl<'a> Emitter<'a> {
             .emit("cmp", &[x(16), Operand::RegShift(low, Shift::Asr, 63)]);
         let fail_label = self.block_label(fail);
         self.asm.b_cond(Cond::Ne, fail_label);
+        // The value reached dst's slot/register via the custom paths above,
+        // bypassing `commit` — mirror it into the resident register too.
+        self.refresh_resident(dst, low);
     }
 
     fn emit_load_field(&mut self, dst: VReg, obj: VReg, byte_off: i32) {
@@ -569,6 +617,9 @@ impl<'a> Emitter<'a> {
             bci: self.current_bci,
             position: self.pos,
         });
+        // S14 perf recovery: the slow `bl` may have GC'd — re-sync residents
+        // (slow path only; the inline bump fast path branched to `done`).
+        self.emit_resident_reloads();
         if d.num != 0 {
             self.asm.emit("mov", &[Operand::Reg(d), x(0)]);
         }
@@ -707,6 +758,15 @@ impl<'a> Emitter<'a> {
             bci: self.current_bci,
             position: self.pos,
         });
+        // S14 perf recovery: `rt_poll` may have GC'd (moving the oops the
+        // resident registers point at) — re-sync residents from their
+        // canonical slots ON THE SLOW PATH ONLY. The `cbz` fast path jumps
+        // straight to `skip`, past these reloads: a dormant poll costs the
+        // loop nothing, which is what makes register-resident loop variables
+        // sound AND fast. (The recorded safepoint pc above is the `bl`'s
+        // return address — the first reload — as `rt_poll`'s `ret_pc`
+        // convention requires.)
+        self.emit_resident_reloads();
         self.asm.bind(skip);
     }
 
@@ -1041,6 +1101,23 @@ pub fn emit(
         pos: 0,
         current_bci: 0,
         safepoints: Vec::new(),
+        resident: {
+            let mut r: Vec<Option<u8>> = vec![None; method.vregs.len()];
+            for iv in &regalloc.intervals {
+                if let Some(rr) = iv.resident_reg {
+                    r[iv.vreg.0 as usize] = Some(rr);
+                }
+            }
+            r
+        },
+        resident_reloads: regalloc
+            .intervals
+            .iter()
+            .filter_map(|iv| match (iv.resident_reg, iv.assignment) {
+                (Some(rr), Some(Assignment::Spill(slot))) => Some((iv.start, iv.end, rr, slot)),
+                _ => None,
+            })
+            .collect(),
     };
 
     // Prologue (D5.2): frame_bytes = 8*frame_slots, rounded to 16.
@@ -1112,6 +1189,7 @@ fn emit_ir(e: &mut Emitter, ir: &Ir, next_in_order: Option<BlockId>) {
                 Assignment::Spill(slot) => {
                     e.asm.ldr_literal(xr(16), lit_id);
                     emit_spill_access(e.asm, "str", x(16), slot);
+                    e.refresh_resident(dst, xr(16));
                 }
             }
         }
@@ -1133,6 +1211,7 @@ fn emit_ir(e: &mut Emitter, ir: &Ir, next_in_order: Option<BlockId>) {
                 }
                 Assignment::Spill(slot) => {
                     emit_spill_access(e.asm, "str", Operand::Reg(abi), slot);
+                    e.refresh_resident(dst, abi);
                 }
             }
         }
@@ -1214,29 +1293,17 @@ fn emit_ir(e: &mut Emitter, ir: &Ir, next_in_order: Option<BlockId>) {
         Ir::Poll => e.emit_poll(),
         Ir::UncommonTrap { .. } => e.emit_uncommon_trap(),
         Ir::Ret { val } => {
-            match e.assignment_of(val) {
-                Assignment::Reg(r) => {
-                    if r != 0 {
-                        e.asm.emit("mov", &[x(0), x(r)]);
-                    }
-                }
-                Assignment::Spill(slot) => {
-                    emit_spill_access(e.asm, "ldr", x(0), slot);
-                }
+            let rv = e.resolve(val, 0);
+            if rv.num != 0 {
+                e.asm.emit("mov", &[x(0), Operand::Reg(rv)]);
             }
             let epi = e.epilogue;
             e.asm.b(epi);
         }
         Ir::RetSelf => {
-            match e.assignment_of(SELF_VREG) {
-                Assignment::Reg(r) => {
-                    if r != 0 {
-                        e.asm.emit("mov", &[x(0), x(r)]);
-                    }
-                }
-                Assignment::Spill(slot) => {
-                    emit_spill_access(e.asm, "ldr", x(0), slot);
-                }
+            let rv = e.resolve(SELF_VREG, 0);
+            if rv.num != 0 {
+                e.asm.emit("mov", &[x(0), Operand::Reg(rv)]);
             }
             let epi = e.epilogue;
             e.asm.b(epi);
