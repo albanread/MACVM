@@ -341,6 +341,7 @@ mod tests {
             poll_bci: None,
             deopt_scopes: Vec::new(),
             deopt_pcdescs: Vec::new(),
+            inline_deps: Vec::new(),
         }
     }
 

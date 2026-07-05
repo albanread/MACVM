@@ -57,9 +57,20 @@ pub fn affected_by_install(vm: &VmState, holder: KlassOop, selector: SymbolOop) 
     let sel_raw = selector.oop().raw();
     let mut victims = Vec::new();
     for nm in vm.code_table.iter_alive() {
-        if nm.key_selector.oop().raw() == sel_raw
-            && superchain_contains(&vm.universe, nm.key_klass, holder)
-        {
+        // Own key: the nmethod compiled `lookup(key_klass, key_selector)` and
+        // assumed that result (S13's sole dependency).
+        let own_key_affected = nm.key_selector.oop().raw() == sel_raw
+            && superchain_contains(&vm.universe, nm.key_klass, holder);
+        // S14 step 4b: any INLINED leaf's dependency. The guard assumed
+        // `lookup(dep_klass, dep_sel)` resolved to the spliced callee, so
+        // installing `dep_sel` anywhere on `dep_klass`'s superchain — `holder`
+        // ON that chain — could change that result and must invalidate. Same
+        // selector-match + walk-direction rule as the own key (D2), applied per
+        // inline dependency.
+        let inline_dep_affected = nm.inline_deps.iter().any(|(dk, ds)| {
+            ds.oop().raw() == sel_raw && superchain_contains(&vm.universe, *dk, holder)
+        });
+        if own_key_affected || inline_dep_affected {
             victims.push(nm.id);
         }
     }
@@ -167,6 +178,7 @@ mod tests {
             poll_bci: None,
             deopt_scopes: Vec::new(),
             deopt_pcdescs: Vec::new(),
+            inline_deps: Vec::new(),
         }
     }
 

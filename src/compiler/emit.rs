@@ -51,7 +51,8 @@ use crate::compiler::assembler::{
     imm, mem, sp, x, xr, Assembler, CodeBlob, Cond, Label, LiteralId, Operand, Reg, RelocKind,
 };
 use crate::compiler::ir::{
-    BailoutReason, BlockId, CallSiteInfo, CmpOp, Ir, IrMethod, PoolLit, SmiOp, StubId, VReg,
+    BailoutReason, BlockId, CallSiteInfo, CmpOp, GuardShape, Ir, IrMethod, PoolLit, SmiOp, StubId,
+    VReg,
 };
 use crate::compiler::regalloc::{Assignment, RegallocResult};
 use crate::oops::wrappers::SymbolOop;
@@ -556,6 +557,43 @@ impl<'a> Emitter<'a> {
 
         self.asm.bind(done);
         self.commit(dst, d);
+    }
+
+    /// S14 step 4b: the receiver-klass guard before an inlined leaf body.
+    /// On a MATCH, falls through to the next instruction (the body); on a
+    /// MISMATCH, branches to `fail` (a cold `UncommonTrap` block that deopts +
+    /// re-executes the send generically).
+    ///
+    /// `SmiTest`: `tst rcvr,#3; b.ne cold` — the receiver must be a smi (2-bit
+    /// tag 00, SPEC §2.1). `KlassTest`: reject a smi first (`tst rcvr,#3; b.eq
+    /// cold` — a smi is never a heap-klass instance), then load the klass word
+    /// (`ldur x17,[rcvr,#7]`: KLASS_OFFSET 8 minus the MEM_TAG 1 bias, exactly
+    /// `emit_entry_guard`'s own `mem(0,7)` form) and compare it against the
+    /// expected klassOop pool literal (`b.ne cold`). x16/x17 are free scratch;
+    /// the receiver is resolved into x16, and once its klass word is in x17 the
+    /// x16 slot is reused for the literal.
+    fn emit_guard_klass(&mut self, obj: VReg, expect: PoolLit, fail: BlockId, kind: GuardShape) {
+        let robj = self.resolve(obj, 16);
+        let cold = self.block_label(fail);
+        match kind {
+            GuardShape::SmiTest => {
+                self.asm.emit("tst", &[Operand::Reg(robj), imm(3)]);
+                self.asm.b_cond(Cond::Ne, cold);
+            }
+            GuardShape::KlassTest => {
+                // Reject a smi: it has no klass word to load, and a smi
+                // receiver can never be this heap-klass instance.
+                self.asm.emit("tst", &[Operand::Reg(robj), imm(3)]);
+                self.asm.b_cond(Cond::Eq, cold);
+                // Klass word at untagged-address + KLASS_OFFSET(8); MEM_TAG(1)
+                // biases the tagged pointer by −1 → offset 7, unscaled `ldur`.
+                self.asm.emit("ldur", &[x(17), mem(robj.num, 7)]);
+                let expect_lit = self.literal_ids[expect.0 as usize];
+                self.asm.ldr_literal(xr(16), expect_lit);
+                self.asm.emit("cmp", &[x(17), x(16)]);
+                self.asm.b_cond(Cond::Ne, cold);
+            }
+        }
     }
 
     fn emit_smi_cmp_br(
@@ -1080,12 +1118,18 @@ fn emit_ir(e: &mut Emitter, ir: &Ir, next_in_order: Option<BlockId>) {
                 }
             }
         }
-        Ir::LoadKlass { .. } | Ir::GuardKlass { .. } => {
+        Ir::LoadKlass { .. } => {
             unreachable!(
                 "S11-only Ir variant; nothing constructs one yet (LoadKlass: needed by \
-                          no D3.2 row; GuardKlass: S14+ inlining guards)"
+                          no D3.2 row)"
             )
         }
+        Ir::GuardKlass {
+            obj,
+            expect,
+            fail,
+            kind,
+        } => e.emit_guard_klass(obj, expect, fail, kind),
         Ir::LoadField { dst, obj, byte_off } => e.emit_load_field(dst, obj, byte_off),
         Ir::StoreField {
             obj,
@@ -1248,6 +1292,7 @@ mod tests {
             mark_slots_lit: PoolLit(0),
             call_sites: Vec::new(),
             site_feedback: Vec::new(),
+            inline_deps: Vec::new(),
             method_pool_ix: None,
         }
     }
@@ -1651,6 +1696,7 @@ mod tests {
             mark_slots_lit: PoolLit(1),
             call_sites: Vec::new(),
             site_feedback: Vec::new(),
+            inline_deps: Vec::new(),
             method_pool_ix: None,
         };
         let ra = regalloc::regalloc(&method);
@@ -1943,6 +1989,7 @@ mod tests {
                 },
             ],
             site_feedback: Vec::new(),
+            inline_deps: Vec::new(),
             method_pool_ix: None,
         };
         let ra = regalloc::regalloc(&method);

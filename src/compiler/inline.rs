@@ -74,6 +74,32 @@ pub fn inline_cost(callee: MethodOop) -> u32 {
     callee.bytecode_len() as u32
 }
 
+/// S14 step 4b: a method is a **leaf** iff its bytecode contains NO `Instr::Send`
+/// at all (super or not). A leaf has no `CallSend`, no smi-inline overflow trap,
+/// no allocation → NO safepoint inside its body once inlined → no deopt can
+/// occur within it → the inliner needs NO `SenderLink` scope chain for it. This
+/// is the exact class of callees step 4b splices inline (`^instvar`, `^self`,
+/// `^arg`, `t := expr. ^t` with no sends); anything with even one send (e.g.
+/// `^self + 1`, whose `+` is a send) is NOT a leaf and stays a plain `Call`.
+///
+/// Note this is STRICTLY the presence of a `Send` opcode — a smi-inlinable
+/// send (`+`/`<`) is still a `Send` in the callee's own bytecode, so a method
+/// containing one is not a leaf here. That is deliberately conservative for
+/// step 4b: inlining a body that itself needs the smi-overflow trap (a
+/// safepoint) is a later step's problem.
+pub fn is_leaf(method: MethodOop) -> bool {
+    let len = method.bytecode_len();
+    let mut bci = 0;
+    while bci < len {
+        let (instr, next) = decode_at(method, bci);
+        if matches!(instr, Instr::Send { .. }) {
+            return false;
+        }
+        bci = next;
+    }
+    true
+}
+
 /// A method whose whole body is a single `push_*; ^tos` (accessor / quick
 /// return) or a bare `^self` — the cost-2 shapes above.
 fn is_quick_return(method: MethodOop) -> bool {
@@ -155,6 +181,62 @@ pub fn decide(feedback: &SiteFeedback) -> InlineDecision {
     match feedback {
         SiteFeedback::Untaken => InlineDecision::Trap,
         SiteFeedback::Mono { .. } | SiteFeedback::Poly { .. } | SiteFeedback::Mega => {
+            InlineDecision::Call
+        }
+    }
+}
+
+/// S14 step 4b: the inlining decision proper (A2 item 2). A `Mono { klass,
+/// method }` site whose callee is a **leaf** ([`is_leaf`]) and cheap enough
+/// (`inline_cost(method) <= budget.per_call_cost`) becomes
+/// `Inline { callee, guard }`, where the guard is:
+///   - `SmiTest` when the observed `klass` is the smi klass (`smi_klass_bits`
+///     is `vm.universe.smi_klass.oop().raw()`) — a tag test, not a klass load;
+///   - `KlassTest` otherwise — reject-smi-then-compare-klass-word.
+///
+/// Everything else falls back to a plain `Call` (never a `Trap` here — an
+/// `Untaken` site has no observed target to speculate on, so it stays the
+/// step-3 caller's concern via [`decide`]; a non-leaf callee, an over-budget
+/// leaf, a `Poly`, or a `Mega` all dispatch dynamically). Poly-dominant
+/// inlining, non-leaf mono inlining, and static-klass guard elision are all
+/// later S14 steps.
+///
+/// `smi_klass_bits`, not a `KlassOop`: this runs inside `compiler::inline`,
+/// which (like `feedback.rs`) works in raw oops for the whole no-GC compile
+/// window — the caller (`convert`) passes `vm.universe.smi_klass.oop().raw()`.
+pub fn decide_with_budget(
+    feedback: &SiteFeedback,
+    budget: &InlineBudget,
+    smi_klass_bits: u64,
+) -> InlineDecision {
+    match feedback {
+        SiteFeedback::Mono { klass, method } => {
+            // A PRIMITIVE method's real behaviour is the primitive itself; its
+            // bytecode is only the failure fallback (`instVarAt:`, `+`, etc.).
+            // Splicing that fallback inline would run the WRONG code — so a
+            // primitive is never leaf-inlined here (primitive-INTRINSIC inlining
+            // is a later step). `is_leaf` alone would accept it (a fallback with
+            // no sends is send-free), hence this explicit guard.
+            if method.primitive() == 0
+                && is_leaf(*method)
+                && inline_cost(*method) <= budget.per_call_cost
+            {
+                let guard = if klass.oop().raw() == smi_klass_bits {
+                    GuardKind::SmiTest
+                } else {
+                    GuardKind::KlassTest
+                };
+                InlineDecision::Inline {
+                    callee: *method,
+                    guard,
+                }
+            } else {
+                InlineDecision::Call
+            }
+        }
+        // An Untaken site owns no observed target (the step-3 trap is `decide`'s
+        // job, reached separately in `convert`); Poly/Mega dispatch dynamically.
+        SiteFeedback::Untaken | SiteFeedback::Poly { .. } | SiteFeedback::Mega => {
             InlineDecision::Call
         }
     }
@@ -269,6 +351,147 @@ mod tests {
         b2.push_temp(0);
         b2.ret_tos();
         assert_eq!(inline_cost(b2.finish(&mut vm, s2, 1, 0)), 2);
+    }
+
+    /// S14 step 4b: `is_leaf` is true exactly when the bytecode has no `Send`.
+    #[test]
+    fn is_leaf_detects_sends() {
+        let mut vm = test_vm();
+        // `^instvar0` — accessor, no send → leaf.
+        let s1 = vm.universe.intern(b"getIv");
+        let mut b1 = BytecodeBuilder::new();
+        b1.push_instvar(0);
+        b1.ret_tos();
+        assert!(is_leaf(b1.finish(&mut vm, s1, 0, 0)));
+
+        // `^self` → leaf.
+        let s2 = vm.universe.intern(b"getSelf");
+        let mut b2 = BytecodeBuilder::new();
+        b2.ret_self();
+        assert!(is_leaf(b2.finish(&mut vm, s2, 0, 0)));
+
+        // `t := arg. ^t` (a store + push + return, still no send) → leaf.
+        let s3 = vm.universe.intern(b"stash:");
+        let mut b3 = BytecodeBuilder::new();
+        b3.push_temp(0);
+        b3.store_temp_pop(1);
+        b3.push_temp(1);
+        b3.ret_tos();
+        assert!(is_leaf(b3.finish(&mut vm, s3, 1, 1)));
+
+        // `^self foo` (one send) → NOT a leaf.
+        let foo = vm.universe.intern(b"foo");
+        let s4 = vm.universe.intern(b"callsFoo");
+        let mut b4 = BytecodeBuilder::new();
+        b4.push_self();
+        b4.send(&mut vm, foo, 0);
+        b4.ret_tos();
+        assert!(!is_leaf(b4.finish(&mut vm, s4, 0, 0)));
+    }
+
+    /// S14 step 4b: a mono site to a cheap LEAF inlines; the guard is `SmiTest`
+    /// for a smi klass and `KlassTest` for any other; a non-leaf, an
+    /// over-budget leaf, Poly/Mega/Untaken all fall back to `Call`.
+    #[test]
+    fn decide_with_budget_inlines_cheap_leaves() {
+        let mut vm = test_vm();
+        let budget = budget_for_level(1);
+        let smi_bits = vm.universe.smi_klass.oop().raw();
+
+        // A cheap leaf accessor `^instvar0` on a non-smi klass → Inline + KlassTest.
+        let acc_sel = vm.universe.intern(b"iv");
+        let mut ab = BytecodeBuilder::new();
+        ab.push_instvar(0);
+        ab.ret_tos();
+        let accessor = ab.finish(&mut vm, acc_sel, 0, 0);
+        let obj_klass = vm.universe.object_klass;
+        match decide_with_budget(
+            &SiteFeedback::Mono {
+                klass: obj_klass,
+                method: accessor,
+            },
+            &budget,
+            smi_bits,
+        ) {
+            InlineDecision::Inline { callee, guard } => {
+                assert_eq!(callee.oop().raw(), accessor.oop().raw());
+                assert_eq!(guard, GuardKind::KlassTest, "non-smi klass → KlassTest");
+            }
+            other => panic!("expected Inline, got {other:?}"),
+        }
+
+        // Same accessor but a SMI receiver klass → Inline + SmiTest.
+        match decide_with_budget(
+            &SiteFeedback::Mono {
+                klass: vm.universe.smi_klass,
+                method: accessor,
+            },
+            &budget,
+            smi_bits,
+        ) {
+            InlineDecision::Inline { guard, .. } => {
+                assert_eq!(guard, GuardKind::SmiTest, "smi klass → SmiTest");
+            }
+            other => panic!("expected Inline, got {other:?}"),
+        }
+
+        // A NON-leaf mono target (`^self foo`) → Call, never Inline.
+        let foo = vm.universe.intern(b"foo");
+        let nl_sel = vm.universe.intern(b"nonLeaf");
+        let mut nb = BytecodeBuilder::new();
+        nb.push_self();
+        nb.send(&mut vm, foo, 0);
+        nb.ret_tos();
+        let non_leaf = nb.finish(&mut vm, nl_sel, 0, 0);
+        assert!(matches!(
+            decide_with_budget(
+                &SiteFeedback::Mono {
+                    klass: obj_klass,
+                    method: non_leaf,
+                },
+                &budget,
+                smi_bits,
+            ),
+            InlineDecision::Call
+        ));
+
+        // An over-budget leaf (cost > per_call_cost) → Call. Build a leaf whose
+        // cost is its bytecode length, larger than a tiny budget.
+        let big_sel = vm.universe.intern(b"bigLeaf");
+        let mut bb = BytecodeBuilder::new();
+        bb.push_self();
+        bb.push_temp(0);
+        bb.push_temp(0);
+        bb.pop();
+        bb.pop();
+        bb.ret_self();
+        let big_leaf = bb.finish(&mut vm, big_sel, 1, 0);
+        let tiny = InlineBudget {
+            per_call_cost: 1,
+            total_bytes: 300,
+            max_depth: 4,
+        };
+        assert!(matches!(
+            decide_with_budget(
+                &SiteFeedback::Mono {
+                    klass: obj_klass,
+                    method: big_leaf,
+                },
+                &tiny,
+                smi_bits,
+            ),
+            InlineDecision::Call
+        ));
+
+        // Untaken / Poly / Mega → Call (never Inline here).
+        assert!(matches!(
+            decide_with_budget(&SiteFeedback::Untaken, &budget, smi_bits),
+            InlineDecision::Call
+        ));
+        assert!(matches!(
+            decide_with_budget(&SiteFeedback::Mega, &budget, smi_bits),
+            InlineDecision::Call
+        ));
     }
 
     #[test]

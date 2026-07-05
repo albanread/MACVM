@@ -146,6 +146,7 @@ fn run_ir_raw() {
         mark_slots_lit: PoolLit(0),
         call_sites: Vec::new(),
         site_feedback: Vec::new(),
+        inline_deps: Vec::new(),
         method_pool_ix: None,
     };
 
@@ -266,6 +267,7 @@ fn mul_method() -> IrMethod {
         mark_slots_lit: PoolLit(0),
         call_sites: Vec::new(),
         site_feedback: Vec::new(),
+        inline_deps: Vec::new(),
         method_pool_ix: None,
     }
 }
@@ -385,6 +387,7 @@ fn run_ir_raw_forces_spill() {
         mark_slots_lit: PoolLit(0),
         call_sites: Vec::new(),
         site_feedback: Vec::new(),
+        inline_deps: Vec::new(),
         method_pool_ix: None,
     };
 
@@ -2324,6 +2327,7 @@ fn mono_resolve_patches_call_site_and_dispatches() {
             static_klass: None,
         }],
         site_feedback: Vec::new(),
+        inline_deps: Vec::new(),
         method_pool_ix: None,
     };
     let ra = regalloc::regalloc(&caller_method);
@@ -2376,6 +2380,7 @@ fn mono_resolve_patches_call_site_and_dispatches() {
         poll_bci: None,
         deopt_scopes: Vec::new(),
         deopt_pcdescs: Vec::new(),
+        inline_deps: Vec::new(),
     };
     let caller_id = vm.code_table.install(caller_nm);
     let caller_entry = h.base as u64; // entry_off == verified_entry_off == 0 (no guard, `None`)
@@ -2484,6 +2489,7 @@ fn build_c2i_scenario(vm: &mut VmState) -> (u64, KlassOop, NmethodId) {
             static_klass: None,
         }],
         site_feedback: Vec::new(),
+        inline_deps: Vec::new(),
         method_pool_ix: None,
     };
     let ra = regalloc::regalloc(&caller_method);
@@ -2536,6 +2542,7 @@ fn build_c2i_scenario(vm: &mut VmState) -> (u64, KlassOop, NmethodId) {
         poll_bci: None,
         deopt_scopes: Vec::new(),
         deopt_pcdescs: Vec::new(),
+        inline_deps: Vec::new(),
     };
     let caller_id = vm.code_table.install(caller_nm);
     let caller_entry = h.base as u64; // entry_off == verified_entry_off == 0 (no guard, `None`)
@@ -2708,6 +2715,7 @@ fn full_ic_lattice_mono_to_pic_to_mega() {
             static_klass: None,
         }],
         site_feedback: Vec::new(),
+        inline_deps: Vec::new(),
         method_pool_ix: None,
     };
     let ra = regalloc::regalloc(&caller_method);
@@ -2760,6 +2768,7 @@ fn full_ic_lattice_mono_to_pic_to_mega() {
         poll_bci: None,
         deopt_scopes: Vec::new(),
         deopt_pcdescs: Vec::new(),
+        inline_deps: Vec::new(),
     };
     let caller_id = vm.code_table.install(caller_nm);
     let caller_entry = h.base as u64;
@@ -2926,6 +2935,7 @@ fn dnu_from_compiled_code_reaches_does_not_understand() {
             static_klass: None,
         }],
         site_feedback: Vec::new(),
+        inline_deps: Vec::new(),
         method_pool_ix: None,
     };
     let ra = regalloc::regalloc(&caller_method);
@@ -2978,6 +2988,7 @@ fn dnu_from_compiled_code_reaches_does_not_understand() {
         poll_bci: None,
         deopt_scopes: Vec::new(),
         deopt_pcdescs: Vec::new(),
+        inline_deps: Vec::new(),
     };
     let caller_id = vm.code_table.install(caller_nm);
     let caller_entry = h.base as u64;
@@ -3598,5 +3609,246 @@ fn deopt_resolve_frame_loc_from_real_regalloc() {
     assert_eq!(
         resolve_frame_loc(VReg(9999), p0, &ra.intervals),
         ValueLoc::Nil
+    );
+}
+
+// ─── S14 step 4b: leaf-method inlining ─────────────────────────────────────
+
+/// Builds a klass with one instvar plus a leaf accessor `val [ ^instvar0 ]`
+/// installed on it, and a caller `getVal: x [ ^x val ]` — customized for
+/// `SmallInteger` (so the entry guard proves `self`, NOT `x`) — warmed mono to
+/// that accessor on the ARGUMENT `x`. Sending to `x` (not `self`) is what makes
+/// the inline guard's cold path genuinely reachable: the entry guard proves
+/// nothing about `x`'s klass, so a wrong-klass `x` really does miss the inline
+/// guard rather than the method-level entry guard. Returns
+/// `(recv_klass, val_sel, caller_method)`.
+fn inline_accessor_scenario(vm: &mut VmState) -> (KlassOop, SymbolOop, MethodOop) {
+    let recv_klass = vm.universe.new_klass(
+        vm.universe.object_klass,
+        "S14InlineAccessor",
+        Format::Slots,
+        false,
+        HEADER_WORDS + 1,
+    );
+    // `val [ ^instvar0 ]` — a leaf accessor (no send).
+    let val_sel = vm.universe.intern(b"val");
+    let val = {
+        let mut vb = BytecodeBuilder::new();
+        vb.push_instvar(0);
+        vb.ret_tos();
+        vb.finish(vm, val_sel, 0, 0)
+    };
+    install_method(vm, recv_klass, val_sel, val);
+
+    // `getVal: x [ ^x val ]` — the send's receiver is the ARGUMENT, whose klass
+    // the entry guard (which customizes on `self`) never constrains.
+    let get_sel = vm.universe.intern(b"getVal:");
+    let mut b = BytecodeBuilder::new();
+    b.push_temp(0); // x
+    b.send(vm, val_sel, 0);
+    b.ret_tos();
+    let caller = b.finish(vm, get_sel, 1, 0);
+
+    // Warm the `x val` site to Mono on `recv_klass` (its real target).
+    let epoch = vm.ic_epoch;
+    InterpreterIc::at(caller, 0).set_mono(vm, recv_klass, val, epoch);
+    (recv_klass, val_sel, caller)
+}
+
+/// S14 step 4b (a): the inlined-accessor DIFFERENTIAL. A caller `getVal: x [ ^x
+/// val ]`, warmed mono to a leaf accessor `^instvar0`, compiles with the send
+/// SPLICED INLINE (no `IcSite`). Running the compiled nmethod on an argument
+/// whose instvar holds a discriminating value returns exactly that value — the
+/// same value the pure interpreter (`run_method`) produces for the same send.
+#[test]
+fn compiled_inlined_accessor_matches_interpreter() {
+    let mut vm = test_vm();
+    let smi_klass = vm.universe.smi_klass;
+    let (recv_klass, _val_sel, caller) = inline_accessor_scenario(&mut vm);
+
+    // Compile the caller customized for SmallInteger (self is a smi; the inlined
+    // send's receiver is the ARG `x`). Eligible because its one send is a mono
+    // leaf accessor (S14 step 4b eligibility relaxation).
+    assert!(
+        driver::eligible(&vm, caller),
+        "a mono leaf-accessor send must be eligible (it inlines)"
+    );
+    let id = driver::compile_method(&mut vm, smi_klass, caller).expect("must compile");
+
+    // The send was inlined: NO IcSite for it, and the nmethod records one
+    // inline dependency.
+    {
+        let nm = vm.code_table.get(id).expect("installed");
+        assert!(
+            nm.ic_sites.is_empty(),
+            "the `x val` send was inlined → no compiled IC site"
+        );
+        assert_eq!(nm.inline_deps.len(), 1, "one inline dependency recorded");
+        assert_eq!(nm.inline_deps[0].0.oop().raw(), recv_klass.oop().raw());
+    }
+
+    // An argument whose instvar0 holds a discriminating value (54321).
+    let discriminating = SmallInt::new(54321).oop();
+    let arg = alloc::alloc_slots(&mut vm, recv_klass).oop();
+    MemOop::try_from(arg)
+        .unwrap()
+        .set_body_oop(0, discriminating);
+    let self_smi = SmallInt::new(3).oop(); // the customization receiver (unused by the body)
+
+    // Interpreter reference: `^x val` dispatches to `^instvar0` = 54321.
+    let interp = macvm::interpreter::run_method(&mut vm, caller, self_smi, &[arg]);
+    assert_eq!(
+        interp.raw(),
+        discriminating.raw(),
+        "interpreter reference: `^x val` = the argument's instvar0"
+    );
+
+    // Compiled: the inlined accessor loads instvar0 off the (guarded) argument.
+    let nm = vm.code_table.get(id).expect("installed");
+    let entry = unsafe { nm.code.base.add(nm.entry_off as usize) } as u64;
+    let call: CallStubFn = unsafe { std::mem::transmute(vm.stubs.call_stub_entry()) };
+    let vm_ptr: *mut VmState = &mut vm;
+    let result = unsafe { call(entry, vm_ptr, [self_smi.raw(), arg.raw()].as_ptr(), 2) };
+    assert_eq!(
+        result,
+        discriminating.raw(),
+        "compiled inlined accessor must load the argument's instvar0 (differential match)"
+    );
+}
+
+/// S14 step 4b (b): the guard COLD PATH. The SAME compiled nmethod (its `x val`
+/// send inlined behind a guard speculating `x` is `recv_klass`) called with an
+/// ARGUMENT of a DIFFERENT klass fails the inline guard, deopts (`brk` → SIGTRAP
+/// → uncommon trampoline → re-execute the send generically in the interpreter)
+/// and returns THAT klass's own `val` result — while `deopt_count` bumps (the
+/// guard's brk actually fired). Sending to the ARG (not `self`) is essential:
+/// the method's entry guard customizes on `self`, so it constrains `self`'s
+/// klass but says nothing about `x`, leaving the inline guard's cold path
+/// genuinely reachable (a `self`-receiver send would be caught by the redundant
+/// entry guard first — static-klass guard elision is a later step).
+#[test]
+fn compiled_inlined_accessor_guard_cold_path_deopts() {
+    // A JIT-armed VM so the SIGTRAP handler is live (the guard's cold path is a
+    // real `brk #0xDE00`).
+    let mut vm = VmState::with_options(VmOptions {
+        heap_mib: 64,
+        trace: Default::default(),
+        gc_stress: false,
+        gc_stress_full_period: None,
+        eden_kb: None,
+        jit: JitMode::Threshold(1),
+    });
+    let smi_klass = vm.universe.smi_klass;
+    let (_recv_klass, val_sel, caller) = inline_accessor_scenario(&mut vm);
+    // Customize for SmallInteger (self is a smi); the inlined send's receiver is
+    // the arg `x`, whose klass the entry guard never constrains.
+    let id = driver::compile_method(&mut vm, smi_klass, caller).expect("must compile");
+
+    // A SECOND klass, off `recv_klass`'s branch, with its OWN `val` returning a
+    // DISTINCT value.
+    let other_klass = vm.universe.new_klass(
+        vm.universe.object_klass,
+        "S14InlineOther",
+        Format::Slots,
+        false,
+        HEADER_WORDS + 1,
+    );
+    let other_val = {
+        let mut vb = BytecodeBuilder::new();
+        vb.push_instvar(0);
+        vb.ret_tos();
+        vb.finish(&mut vm, val_sel, 0, 0)
+    };
+    install_method(&mut vm, other_klass, val_sel, other_val);
+
+    // Argument of the OTHER klass, instvar0 = a discriminating value.
+    let other_value = SmallInt::new(98765).oop();
+    let other_arg = alloc::alloc_slots(&mut vm, other_klass).oop();
+    MemOop::try_from(other_arg)
+        .unwrap()
+        .set_body_oop(0, other_value);
+    let self_smi = SmallInt::new(3).oop();
+
+    // Interpreter reference for the OTHER argument.
+    let interp = macvm::interpreter::run_method(&mut vm, caller, self_smi, &[other_arg]);
+    assert_eq!(interp.raw(), other_value.raw());
+
+    let nm = vm.code_table.get(id).expect("installed");
+    let entry = unsafe { nm.code.base.add(nm.entry_off as usize) } as u64;
+    let call: CallStubFn = unsafe { std::mem::transmute(vm.stubs.call_stub_entry()) };
+    let vm_ptr: *mut VmState = &mut vm;
+
+    let deopts_before = unsafe { (*vm_ptr).stats.deopt_count };
+    // The wrong-klass ARGUMENT fails the inline guard → cold trap → deopt →
+    // re-execute `x val` generically in the interpreter → `other_klass`'s own
+    // accessor → 98765.
+    let result = unsafe { call(entry, vm_ptr, [self_smi.raw(), other_arg.raw()].as_ptr(), 2) };
+    let deopts_after = unsafe { (*vm_ptr).stats.deopt_count };
+
+    assert_eq!(
+        result,
+        other_value.raw(),
+        "the guard cold path must deopt and return the OTHER klass's own val result"
+    );
+    assert_eq!(
+        result,
+        interp.raw(),
+        "and match the pure-interpreter reference for the same send (differential)"
+    );
+    assert_eq!(
+        deopts_after,
+        deopts_before + 1,
+        "exactly one deopt (the argument-klass guard's brk fired)"
+    );
+}
+
+/// S14 step 4b (c): REDEFINITION invalidation. Redefining the INLINED callee
+/// (`val` on the receiver klass — or an ancestor) makes the caller nmethod
+/// `NotEntrant`, because its guard assumed `lookup(recv_klass, val)` == the
+/// spliced accessor, an assumption a redefinition breaks.
+#[test]
+fn redefining_inlined_callee_invalidates_caller() {
+    let mut vm = test_vm();
+    let smi_klass = vm.universe.smi_klass;
+    let (recv_klass, val_sel, caller) = inline_accessor_scenario(&mut vm);
+    // Customized for SmallInteger; the inline dependency it records is
+    // `(recv_klass, val)` — the accessor's own key, independent of the
+    // customization klass.
+    let id = driver::compile_method(&mut vm, smi_klass, caller).expect("must compile");
+    assert!(
+        matches!(vm.code_table.get(id).unwrap().state, NmState::Alive),
+        "freshly compiled → Alive"
+    );
+
+    // Redefining an UNRELATED selector, or `val` on an off-chain class, must NOT
+    // invalidate the caller.
+    let unrelated = vm.universe.intern(b"unrelatedSel");
+    let unrelated_body = trivial_method(&mut vm, unrelated);
+    install_method(&mut vm, recv_klass, unrelated, unrelated_body);
+    let off_chain = vm.universe.new_klass(
+        vm.universe.object_klass,
+        "S14InlineOffChain",
+        Format::Slots,
+        false,
+        HEADER_WORDS + 1,
+    );
+    let off_body = trivial_method(&mut vm, val_sel);
+    install_method(&mut vm, off_chain, val_sel, off_body);
+    assert!(
+        matches!(vm.code_table.get(id).unwrap().state, NmState::Alive),
+        "unrelated selector / off-chain klass must NOT invalidate the inlining caller"
+    );
+
+    // Redefining the inlined callee itself (`val` on `recv_klass`) → NotEntrant.
+    let new_val = {
+        let mut vb = BytecodeBuilder::new();
+        vb.push_instvar(0);
+        vb.ret_tos();
+        vb.finish(&mut vm, val_sel, 0, 0)
+    };
+    install_method(&mut vm, recv_klass, val_sel, new_val);
+    assert!(
+        matches!(vm.code_table.get(id).unwrap().state, NmState::NotEntrant),
+        "redefining the inlined `val` must make the caller nmethod NotEntrant"
     );
 }

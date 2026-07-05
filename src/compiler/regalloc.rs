@@ -528,6 +528,7 @@ mod tests {
             mark_slots_lit: PoolLit(0),
             call_sites: Vec::new(),
             site_feedback: Vec::new(),
+            inline_deps: Vec::new(),
             method_pool_ix: None,
         }
     }

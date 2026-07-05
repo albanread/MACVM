@@ -394,6 +394,7 @@ fn compiled_mono_caller_guard_keeps_key_klass_alive() {
             static_klass: None,
         }],
         site_feedback: Vec::new(),
+        inline_deps: Vec::new(),
         method_pool_ix: None,
     };
     let ra = regalloc::regalloc(&call_hot_method_ir);
@@ -446,6 +447,7 @@ fn compiled_mono_caller_guard_keeps_key_klass_alive() {
         poll_bci: None,
         deopt_scopes: Vec::new(),
         deopt_pcdescs: Vec::new(),
+        inline_deps: Vec::new(),
     };
     let call_hot_id = vm.code_table.install(call_hot_nm);
     let call_hot_entry = h.base as u64; // entry_off == verified_entry_off == 0 (no guard, `None`)
@@ -526,6 +528,7 @@ fn install_loop_nmethod(
         mark_slots_lit: PoolLit(3),
         call_sites,
         site_feedback: Vec::new(),
+        inline_deps: Vec::new(),
         method_pool_ix: None,
     };
     let ra: RegallocResult = regalloc::regalloc(&ir);
@@ -601,6 +604,7 @@ fn install_loop_nmethod(
         poll_bci: None,
         deopt_scopes: Vec::new(),
         deopt_pcdescs: Vec::new(),
+        inline_deps: Vec::new(),
     };
     vm.code_table.install(nm)
 }

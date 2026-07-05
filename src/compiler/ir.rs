@@ -91,6 +91,19 @@ pub enum BailoutReason {
     SmiOpFailed,
 }
 
+/// S14 step 4b: which receiver-klass test an [`Ir::GuardKlass`] lowers to
+/// (mirrors `inline::GuardKind`'s `SmiTest`/`KlassTest`, minus its `None` — a
+/// `None` guard emits no `GuardKlass` op at all). Kept as its own tiny enum so
+/// `emit.rs` needn't depend on `compiler::inline`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GuardShape {
+    /// `tst rcvr, #3; b.ne cold` — the receiver must be a smi (2-bit tag 00).
+    SmiTest,
+    /// reject-smi, load the klass word, compare against the expected klass
+    /// literal, `b.ne cold` — the receiver must be a heap oop of that klass.
+    KlassTest,
+}
+
 /// One compiler-stage literal-pool entry (D2) — `emit.rs` walks these at
 /// `finish` time and calls `Assembler::literal_u64(value, kind)` for each,
 /// getting back the vendored assembler's own `LiteralId`.
@@ -179,10 +192,24 @@ pub enum Ir {
         if_false: BlockId,
         not_bool: BlockId,
     },
+    /// S14 step 4b: a receiver-klass guard in front of an inlined leaf body.
+    /// On a MATCH, control falls through to the inlined body; on a MISMATCH it
+    /// branches to `fail` — a cold block that is a single `Ir::UncommonTrap`
+    /// (reexecute=true at the inlined send's own bci), so a wrong receiver
+    /// deopts and re-executes the send generically (S14 step-3 trap shape).
+    /// `kind` selects the test emit.rs lowers: `SmiTest` (`tst rcvr,#3; b.ne`)
+    /// when the speculated klass is the smi klass, `KlassTest`
+    /// (reject-smi-then-compare-klass-word against `expect`) otherwise.
+    /// `expect` is the expected klassOop, interned as a `RelocKind::Oop` pool
+    /// literal (a moving GC keeps it current) — read only by `KlassTest`;
+    /// `SmiTest` ignores it. This op is NOT itself a regalloc safepoint (it is
+    /// a pure test); the safepoint that spills the reexecute stack is the
+    /// `UncommonTrap` in the `fail` block.
     GuardKlass {
         obj: VReg,
         expect: PoolLit,
         fail: BlockId,
+        kind: GuardShape,
     },
     CallSend {
         dst: VReg,
@@ -417,6 +444,14 @@ pub struct IrMethod {
     /// rather than a field on `CallSiteInfo` because `SiteFeedback` is not `Copy`
     /// (its `Poly` arm owns a `Vec`) and `CallSiteInfo` is.
     pub site_feedback: Vec<crate::compiler::feedback::SiteFeedback>,
+    /// S14 step 4b: one `(receiver_klass, selector)` pair per INLINED leaf
+    /// body — the guard's assumption (`lookup(receiver_klass, selector)`
+    /// resolves to the callee actually spliced). `driver::compile_method`
+    /// copies this verbatim into `Nmethod.inline_deps`, which `deps::
+    /// affected_by_install` consults so redefining an inlined callee makes the
+    /// caller nmethod `NotEntrant`. Empty for a method that inlined nothing
+    /// (keeps such methods' behaviour and goldens unchanged).
+    pub inline_deps: Vec<(KlassOop, SymbolOop)>,
     /// S13: the physical oop-pool index holding THIS method's own compiled
     /// `MethodOop`, interned (as `RelocKind::Oop`, so a moving GC keeps it
     /// current) at the end of `convert` — but ONLY when the method has at
@@ -708,6 +743,18 @@ struct Translator<'a> {
     /// S14 step 2: `SiteFeedback` per `call_sites` entry (same index), read from
     /// each send's IC as it is lowered. See `IrMethod::site_feedback`.
     site_feedback: Vec<crate::compiler::feedback::SiteFeedback>,
+    /// S14 step 4b: one `(receiver_klass, selector)` per INLINED leaf body — the
+    /// dependency the guard assumes (`lookup(receiver_klass, selector)` resolves
+    /// to the callee actually spliced). Copied into `IrMethod.inline_deps`; the
+    /// driver copies THAT into `Nmethod.inline_deps`, and `deps::
+    /// affected_by_install` invalidates this nmethod if the selector is
+    /// redefined anywhere on the receiver klass's superchain.
+    inline_deps: Vec<(KlassOop, SymbolOop)>,
+    /// S14 step 4b: recompilation level driving the inline budget
+    /// (`inline::budget_for_level`). Tier-1 compiles are always level 1 today
+    /// (`driver::compile_method` sets `level: 1`); threaded here so the budget
+    /// tracks it when higher levels arrive.
+    level: u8,
     /// S11 D7: vregs known at compile time to hold a specific class
     /// constant, i.e. produced by a `push_global` whose Association value
     /// is a `KlassOop`. Keyed by `VReg.0`. Used to recognize `X basicNew`
@@ -917,6 +964,263 @@ impl<'a> Translator<'a> {
             return None;
         }
         Some((klass, size_words as u32))
+    }
+
+    /// S14 step 4b: splice a **single-block straight-line leaf** callee inline.
+    ///
+    /// `receiver`/`args` are the send's OPERAND vregs (already popped by the
+    /// caller); they alias the callee's `self`/argument slots directly, no
+    /// stores (A2 scope-splicing rule: "callee args map to the vregs holding the
+    /// send's operands"). `guard_klass` is the observed receiver klass whose
+    /// `expect`-literal the guard compares against, `guard_shape` the test to
+    /// emit. `selector` is the send's own selector (for the inline dependency).
+    ///
+    /// Returns `Some(result_vreg)` — the vreg holding the inlined body's return
+    /// value, which the caller pushes onto its operand stack — after appending
+    /// the guard + spliced body to `code`, minting the cold trap block (and its
+    /// reexecute deopt site), and recording the inline dependency. Returns
+    /// `None` (splice DECLINED — the caller falls back to a plain `Call`) when
+    /// the callee is not a single straight-line block ending in a return, or
+    /// contains an opcode this narrow step doesn't splice.
+    ///
+    /// No safepoint is recorded for the body: a leaf has no send / no smi-inline
+    /// overflow trap / no alloc, so no deopt can occur inside it (the ONLY deopt
+    /// is the guard's own cold trap, which lives in the `fail` block). The
+    /// caller therefore records NO `CallSiteInfo`/`site_feedback`/`IcSite` for
+    /// this site.
+    #[allow(clippy::too_many_arguments)]
+    fn try_inline_leaf(
+        &mut self,
+        callee: MethodOop,
+        guard_klass: KlassOop,
+        guard_shape: GuardShape,
+        selector: SymbolOop,
+        receiver: VReg,
+        args: &[VReg],
+        send_bci: usize,
+        pre_pop_stack: &[VReg],
+        code: &mut Vec<Ir>,
+    ) -> Option<VReg> {
+        // MINIMUM viable scope: the callee must be a SINGLE straight-line block
+        // ending in a return, and its arity must match what we popped. A
+        // multi-block leaf (a branch/loop with no sends) or an arity mismatch is
+        // out of this narrow step's scope — decline, and the caller does a plain
+        // Call. Validate against the CFG BEFORE emitting anything.
+        let callee_cfg = crate::compiler::decode::decode(callee);
+        if callee_cfg.blocks.len() != 1
+            || !matches!(
+                callee_cfg.blocks[0].terminator,
+                crate::compiler::decode::Terminator::Return
+            )
+            || callee.argc() != args.len()
+        {
+            return None;
+        }
+        // DRY-RUN: confirm every callee opcode is one this narrow step splices
+        // BEFORE emitting the guard/cold block/body — a mid-splice decline would
+        // leave a guard dominating a half-built body while the caller falls back
+        // to a `Call`, corrupting the operand-stack discipline. If any opcode is
+        // unsupported, decline cleanly here having emitted NOTHING.
+        if !leaf_body_is_spliceable(callee) {
+            return None;
+        }
+
+        // The callee's unified arg/temp slots: args 0..argc alias the send's
+        // operand vregs (NO stores — A2's scope-splicing rule); the callee's own
+        // temps argc..argc+ntemps become fresh nil vregs. `callee_self` is the
+        // send's receiver vreg.
+        let callee_self = receiver;
+        let mut callee_slots: Vec<VReg> = Vec::with_capacity(callee.argc() + callee.ntemps());
+        callee_slots.extend_from_slice(args);
+
+        // Emit the guard FIRST so it dominates the whole spliced body. On a
+        // klass MISMATCH it branches to `cold_id` (a single-op UncommonTrap,
+        // reexecute=true at the send's own bci, recorded stack = the operand
+        // stack BEFORE the send's pops, so receiver + args are still present) —
+        // identical to the S14 step-3 trap: a wrong receiver deopts and
+        // re-executes the send generically. On a MATCH it falls through into the
+        // body appended below (same block, no branch — the leaf is straight
+        // line). `expect` is the observed klass, a moving-GC-tracked Oop lit
+        // (read only by KlassTest; SmiTest ignores it).
+        let expect = self
+            .pool
+            .intern(guard_klass.oop().raw(), Some(RelocKind::Oop));
+        let cold_id = self.fresh_block_id();
+        self.finish_block(IrBlock {
+            id: cold_id,
+            bci: send_bci,
+            code: vec![Ir::UncommonTrap { bci: send_bci }],
+            entry_stack: Vec::new(),
+            deopt_sites: vec![(
+                0,
+                DeoptRaw {
+                    stack: pre_pop_stack.to_vec(),
+                    bci: send_bci,
+                    kind: SafepointKind::UncommonTrap,
+                    reexecute: true,
+                },
+            )],
+        });
+        code.push(Ir::GuardKlass {
+            obj: callee_self,
+            expect,
+            fail: cold_id,
+            kind: guard_shape,
+        });
+
+        // Fresh nil temps for the callee's own locals (after the guard, so a
+        // wrong-klass receiver traps before any body op runs).
+        let nil_lit = self
+            .pool
+            .intern(self.vm.universe.nil_obj.raw(), Some(RelocKind::Oop));
+        for _ in 0..callee.ntemps() {
+            let t = self.fresh(true);
+            code.push(Ir::ConstPool {
+                dst: t,
+                lit: nil_lit,
+            });
+            callee_slots.push(t);
+        }
+
+        // Translate the callee's straight-line body onto a fresh operand stack.
+        // A leaf has no send/smi-inline/alloc, so only value-shuffling and
+        // field/return opcodes can appear. `return_tos` → the send's result is
+        // the callee's TOS; `return_self` → the receiver vreg. The `expect`
+        // (single-block Return terminator) means exactly one return terminates.
+        let mut cstack: Vec<VReg> = Vec::new();
+        let mut result: Option<VReg> = None;
+        let len = callee.bytecode_len();
+        let mut bci = 0;
+        while bci < len {
+            let (instr, next) = decode_at(callee, bci);
+            match instr {
+                Instr::PushSelf => cstack.push(callee_self),
+                Instr::PushNil => {
+                    cstack.push(self.push_well_known(self.vm.universe.nil_obj.raw(), code))
+                }
+                Instr::PushTrue => {
+                    cstack.push(self.push_well_known(self.vm.universe.true_obj.raw(), code))
+                }
+                Instr::PushFalse => {
+                    cstack.push(self.push_well_known(self.vm.universe.false_obj.raw(), code))
+                }
+                Instr::PushSmi(v) => {
+                    let dst = self.fresh(true);
+                    code.push(Ir::ConstSmi {
+                        dst,
+                        value: v as i64,
+                    });
+                    cstack.push(dst);
+                }
+                Instr::PushLiteral(idx) => {
+                    let lit_oop = callee.literals().at(idx as usize);
+                    cstack.push(self.push_well_known(lit_oop.raw(), code));
+                }
+                Instr::PushGlobal(idx) => {
+                    let assoc = callee.literals().at(idx as usize);
+                    let assoc_vreg = self.push_well_known(assoc.raw(), code);
+                    let dst = self.fresh(true);
+                    code.push(Ir::LoadField {
+                        dst,
+                        obj: assoc_vreg,
+                        byte_off: (BODY_OFFSET + 8) as i32,
+                    });
+                    cstack.push(dst);
+                }
+                Instr::PushTemp(n) => {
+                    // Fresh copy (same v1 rule as the main path): the slot may be
+                    // reassigned later on this path.
+                    let dst = self.fresh(true);
+                    code.push(Ir::Move {
+                        dst,
+                        src: callee_slots[n as usize],
+                    });
+                    cstack.push(dst);
+                }
+                Instr::StoreTemp(n) => {
+                    let tos = *cstack
+                        .last()
+                        .expect("inline splice: store_temp on empty stack");
+                    code.push(Ir::Move {
+                        dst: callee_slots[n as usize],
+                        src: tos,
+                    });
+                }
+                Instr::StoreTempPop(n) => {
+                    let v = cstack
+                        .pop()
+                        .expect("inline splice: store_temp_pop on empty stack");
+                    code.push(Ir::Move {
+                        dst: callee_slots[n as usize],
+                        src: v,
+                    });
+                }
+                Instr::PushInstvar(n) => {
+                    let dst = self.fresh(true);
+                    code.push(Ir::LoadField {
+                        dst,
+                        obj: callee_self,
+                        byte_off: (BODY_OFFSET + 8 * n as usize) as i32,
+                    });
+                    cstack.push(dst);
+                }
+                Instr::StoreInstvarPop(n) => {
+                    let val = cstack
+                        .pop()
+                        .expect("inline splice: store_instvar_pop on empty stack");
+                    code.push(Ir::StoreField {
+                        obj: callee_self,
+                        byte_off: (BODY_OFFSET + 8 * n as usize) as i32,
+                        val,
+                        barrier: true,
+                    });
+                }
+                Instr::Pop => {
+                    cstack.pop().expect("inline splice: pop on empty stack");
+                }
+                Instr::Dup => {
+                    let tos = *cstack.last().expect("inline splice: dup on empty stack");
+                    cstack.push(tos);
+                }
+                Instr::ReturnTos => {
+                    result = Some(
+                        cstack
+                            .pop()
+                            .expect("inline splice: return_tos on empty stack"),
+                    );
+                    break;
+                }
+                Instr::ReturnSelf => {
+                    result = Some(callee_self);
+                    break;
+                }
+                // Pre-validated by `leaf_body_is_spliceable` above — no opcode
+                // outside the supported set (or the multi-block case) reaches
+                // here, so a decline past the guard's emission is impossible.
+                other => unreachable!(
+                    "inline splice: {other:?} passed leaf_body_is_spliceable but has no arm"
+                ),
+            }
+            bci = next;
+        }
+        let result = result.expect("inline splice: single-return leaf must produce a result");
+
+        self.record_inline_dep(guard_klass, selector);
+        Some(result)
+    }
+
+    fn record_inline_dep(&mut self, klass: KlassOop, selector: SymbolOop) {
+        // Dedup: an inlined method reached via two identical sites need only one
+        // dependency (the invalidation is idempotent, but keeping the vec tight
+        // keeps the driver's copy small).
+        let pair = (klass.oop().raw(), selector.oop().raw());
+        if !self
+            .inline_deps
+            .iter()
+            .any(|(k, s)| (k.oop().raw(), s.oop().raw()) == pair)
+        {
+            self.inline_deps.push((klass, selector));
+        }
     }
 
     /// Translates every instruction except a block's own terminator
@@ -1285,6 +1589,93 @@ impl<'a> Translator<'a> {
 
                 let ic_view = InterpreterIc::at(self.method, ic);
                 let real_argc = ic_view.argc();
+
+                // S14 step 4b: leaf-method inlining. Consult the budget-aware
+                // decision on the SAME `feedback` already read for the trap
+                // check. A `Mono` site whose callee is a cheap leaf splices
+                // inline behind a receiver-klass guard (cold path = the SAME
+                // step-3 uncommon trap, so a wrong receiver deopts + re-executes
+                // the send generically); everything else stays a plain
+                // `CallSend` below. The pre-pop operand `stack` (receiver + args
+                // still present) is the reexecute stack the guard's cold trap
+                // records — snapshot it BEFORE popping.
+                let budget = crate::compiler::inline::budget_for_level(self.level);
+                let smi_bits = self.vm.universe.smi_klass.oop().raw();
+                if let crate::compiler::inline::InlineDecision::Inline { callee, guard } =
+                    crate::compiler::inline::decide_with_budget(&feedback, &budget, smi_bits)
+                {
+                    let guard_shape = match guard {
+                        crate::compiler::inline::GuardKind::SmiTest => GuardShape::SmiTest,
+                        // `KlassTest` and (defensively) `None` — a `None`-guard
+                        // elision is a later step; today `decide_with_budget`
+                        // only ever returns SmiTest/KlassTest for a real inline,
+                        // so this maps the rest to a full klass test (never
+                        // wrong, at worst one redundant compare).
+                        _ => GuardShape::KlassTest,
+                    };
+                    // The observed receiver klass IS the guard klass; the callee
+                    // is the resolved leaf method. The guard depends on
+                    // `lookup(guard_klass, selector)` == callee.
+                    let guard_klass = match &feedback {
+                        crate::compiler::feedback::SiteFeedback::Mono { klass, .. } => *klass,
+                        // Unreachable: `decide_with_budget` only returns `Inline`
+                        // for a `Mono` site.
+                        _ => unreachable!("Inline decision from a non-Mono feedback"),
+                    };
+                    let selector = ic_view.selector();
+                    let pre_pop_stack = stack.clone();
+                    // Pop the send's operands (they alias the callee's
+                    // self/args — no stores).
+                    let mut inline_args: Vec<VReg> = (0..real_argc)
+                        .map(|_| stack.pop().expect("send: missing arg operand"))
+                        .collect();
+                    inline_args.reverse();
+                    let receiver = stack.pop().expect("send: missing receiver operand");
+
+                    if let Some(result) = self.try_inline_leaf(
+                        callee,
+                        guard_klass,
+                        guard_shape,
+                        selector,
+                        receiver,
+                        &inline_args,
+                        bci,
+                        &pre_pop_stack,
+                        code,
+                    ) {
+                        // Inlined: push the body's result. NO CallSiteInfo /
+                        // site_feedback / IcSite / call-return deopt for this
+                        // site — it never dispatches (A2).
+                        stack.push(result);
+                        return split; // (None here — no smi split on this path)
+                    }
+                    // Declined mid-way (an unspliceable shape slipped past the
+                    // budget/leaf gate): fall through to a plain CallSend, but
+                    // the operands are already popped — rebuild `args` from them.
+                    let mut args = vec![receiver];
+                    args.extend_from_slice(&inline_args);
+                    let site = self.call_sites.len() as u16;
+                    self.call_sites.push(CallSiteInfo {
+                        selector,
+                        argc: real_argc + 1,
+                        static_klass: None,
+                    });
+                    self.site_feedback.push(feedback);
+                    let dst = self.fresh(true);
+                    deopt.push((
+                        code.len() as u32,
+                        DeoptRaw {
+                            stack: stack.clone(),
+                            bci,
+                            kind: SafepointKind::Call,
+                            reexecute: false,
+                        },
+                    ));
+                    code.push(Ir::CallSend { dst, site, args });
+                    stack.push(dst);
+                    return split;
+                }
+
                 let mut real_args: Vec<VReg> = (0..real_argc)
                     .map(|_| stack.pop().expect("send: missing arg operand"))
                     .collect();
@@ -1384,6 +1775,44 @@ impl<'a> Translator<'a> {
     }
 }
 
+/// S14 step 4b: does `callee`'s body consist solely of opcodes
+/// [`Translator::try_inline_leaf`] can splice? A dry-run over the bytecode used
+/// to decide inlining BEFORE emitting the guard, so a mid-splice bailout (which
+/// would leave a guard dominating a half-built body) is impossible. The set
+/// mirrors `try_inline_leaf`'s own match arms exactly; a `Send` never appears
+/// (the caller only reaches here for a leaf, `inline::is_leaf`).
+fn leaf_body_is_spliceable(callee: MethodOop) -> bool {
+    let len = callee.bytecode_len();
+    let mut bci = 0;
+    while bci < len {
+        let (instr, next) = decode_at(callee, bci);
+        let ok = matches!(
+            instr,
+            Instr::PushSelf
+                | Instr::PushNil
+                | Instr::PushTrue
+                | Instr::PushFalse
+                | Instr::PushSmi(_)
+                | Instr::PushLiteral(_)
+                | Instr::PushGlobal(_)
+                | Instr::PushTemp(_)
+                | Instr::StoreTemp(_)
+                | Instr::StoreTempPop(_)
+                | Instr::PushInstvar(_)
+                | Instr::StoreInstvarPop(_)
+                | Instr::Pop
+                | Instr::Dup
+                | Instr::ReturnTos
+                | Instr::ReturnSelf
+        );
+        if !ok {
+            return false;
+        }
+        bci = next;
+    }
+    true
+}
+
 fn emit_merges(
     sources: &[EntryStackSource],
     entry_stacks: &[Option<Vec<VReg>>],
@@ -1440,6 +1869,11 @@ pub fn convert(vm: &VmState, method: MethodOop, cfg: &Cfg) -> IrMethod {
         blocks_by_id: (0..cfg.blocks.len()).map(|_| None).collect(),
         call_sites: Vec::new(),
         site_feedback: Vec::new(),
+        inline_deps: Vec::new(),
+        // Tier-1 compiles are always level 1 today (`driver::compile_method`
+        // sets `level: 1`); the inline budget scales with this when higher
+        // levels arrive (S14 step 8).
+        level: 1,
         const_class: HashMap::new(),
     };
 
@@ -1829,6 +2263,7 @@ pub fn convert(vm: &VmState, method: MethodOop, cfg: &Cfg) -> IrMethod {
         mark_slots_lit,
         call_sites: t.call_sites,
         site_feedback: t.site_feedback,
+        inline_deps: t.inline_deps,
         method_pool_ix,
     }
 }
@@ -1878,9 +2313,15 @@ mod tests {
         use crate::compiler::feedback::SiteFeedback;
         let mut vm = test_vm();
         let foo_sel = vm.universe.intern(b"foo");
+        // S14 step 4b: a NON-LEAF target (its body has an inner send) so a warm
+        // mono site to it stays a real `CallSend` instead of being spliced
+        // inline (a leaf accessor would inline; that path is its own test).
+        let inner_sel = vm.universe.intern(b"inner");
         let target = {
             let mut b = BytecodeBuilder::new();
-            b.ret_self();
+            b.push_self();
+            b.send(&mut vm, inner_sel, 0);
+            b.ret_tos();
             b.finish(&mut vm, foo_sel, 0, 0)
         };
 
@@ -1940,6 +2381,135 @@ mod tests {
             }
             other => panic!("expected Mono, got {other:?}"),
         }
+    }
+
+    /// S14 step 4b: a warm mono send to a cheap LEAF accessor (`^instvar0`)
+    /// splices inline — the IR gains an `Ir::GuardKlass` + a `LoadField` off the
+    /// receiver, NO `Ir::CallSend` for the site, and the method records one
+    /// `inline_deps` pair `(receiver_klass, selector)`. The cold trap block
+    /// carries a reexecute `UncommonTrap` at the send's bci.
+    #[test]
+    fn convert_inlines_leaf_accessor() {
+        let mut vm = test_vm();
+        let recv_klass = vm.universe.new_klass(
+            vm.universe.object_klass,
+            "S14InlineRecv",
+            crate::oops::Format::Slots,
+            false,
+            crate::oops::layout::HEADER_WORDS + 1,
+        );
+        // `val [ ^instvar0 ]` — a leaf accessor.
+        let val_sel = vm.universe.intern(b"val");
+        let val = {
+            let mut vb = BytecodeBuilder::new();
+            vb.push_instvar(0);
+            vb.ret_tos();
+            vb.finish(&mut vm, val_sel, 0, 0)
+        };
+
+        // `m [ ^self val ]`.
+        let mut b = BytecodeBuilder::new();
+        b.push_self();
+        b.send(&mut vm, val_sel, 0);
+        b.ret_tos();
+        let m_sel = vm.universe.intern(b"m");
+        let method = b.finish(&mut vm, m_sel, 0, 0);
+
+        let epoch = vm.ic_epoch;
+        InterpreterIc::at(method, 0).set_mono(&mut vm, recv_klass, val, epoch);
+
+        let cfg = decode::decode(method);
+        let ir = convert(&vm, method, &cfg);
+
+        // No CallSend for the inlined site.
+        assert_eq!(ir.call_sites.len(), 0, "inlined leaf → no CallSend");
+        assert_eq!(ir.site_feedback.len(), 0);
+
+        // Exactly one GuardKlass, one instvar LoadField off the receiver, and no
+        // CallSend anywhere.
+        let (mut guards, mut loads, mut calls) = (0, 0, 0);
+        for blk in &ir.blocks {
+            for op in &blk.code {
+                match op {
+                    Ir::GuardKlass { obj, kind, .. } => {
+                        guards += 1;
+                        assert_eq!(*obj, VReg(0), "guard tests the receiver (self)");
+                        assert_eq!(*kind, GuardShape::KlassTest, "non-smi klass → KlassTest");
+                    }
+                    Ir::LoadField { obj, byte_off, .. } => {
+                        // The accessor's instvar0 read off the receiver.
+                        if *obj == VReg(0) && *byte_off == BODY_OFFSET as i32 {
+                            loads += 1;
+                        }
+                    }
+                    Ir::CallSend { .. } => calls += 1,
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(guards, 1, "one receiver-klass guard");
+        assert_eq!(loads, 1, "one inlined instvar0 load off the receiver");
+        assert_eq!(calls, 0, "no CallSend — the send was inlined");
+
+        // One inline dependency: (recv_klass, val).
+        assert_eq!(ir.inline_deps.len(), 1);
+        assert_eq!(ir.inline_deps[0].0.oop().raw(), recv_klass.oop().raw());
+        assert_eq!(ir.inline_deps[0].1.oop().raw(), val_sel.oop().raw());
+
+        // A cold reexecute trap at the send's bci.
+        let trap_sites: usize = ir
+            .blocks
+            .iter()
+            .flat_map(|blk| blk.deopt_sites.iter())
+            .filter(|(_, raw)| matches!(raw.kind, SafepointKind::UncommonTrap) && raw.reexecute)
+            .count();
+        assert_eq!(trap_sites, 1, "the guard's cold path is one reexecute trap");
+    }
+
+    /// S14 step 4b: `^self` (a bare return-self leaf) inlines — the result is
+    /// the receiver vreg itself (no field load), behind a klass guard, and a
+    /// mono SMI receiver picks the `SmiTest` guard shape.
+    #[test]
+    fn convert_inlines_self_and_arg_smi_guard() {
+        let mut vm = test_vm();
+        // `id [ ^self ]` on SmallInteger (smi klass → SmiTest guard).
+        let id_sel = vm.universe.intern(b"idSelf");
+        let id_method = {
+            let mut vb = BytecodeBuilder::new();
+            vb.ret_self();
+            vb.finish(&mut vm, id_sel, 0, 0)
+        };
+        // `m [ ^self idSelf ]`.
+        let mut b = BytecodeBuilder::new();
+        b.push_self();
+        b.send(&mut vm, id_sel, 0);
+        b.ret_tos();
+        let m_sel = vm.universe.intern(b"mSelf");
+        let method = b.finish(&mut vm, m_sel, 0, 0);
+        let smi_klass = vm.universe.smi_klass;
+        let epoch = vm.ic_epoch;
+        InterpreterIc::at(method, 0).set_mono(&mut vm, smi_klass, id_method, epoch);
+
+        let cfg = decode::decode(method);
+        let ir = convert(&vm, method, &cfg);
+        assert_eq!(ir.call_sites.len(), 0, "^self inlined, no CallSend");
+        let smi_guards = ir
+            .blocks
+            .iter()
+            .flat_map(|b| b.code.iter())
+            .filter(|op| {
+                matches!(
+                    op,
+                    Ir::GuardKlass {
+                        kind: GuardShape::SmiTest,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(smi_guards, 1, "a smi receiver klass → one SmiTest guard");
+        assert_eq!(ir.inline_deps.len(), 1);
+        assert_eq!(ir.inline_deps[0].1.oop().raw(), id_sel.oop().raw());
     }
 
     /// `send site with mono smi IC + prim '+'` (D1 item 2): a monomorphic,

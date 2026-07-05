@@ -241,8 +241,23 @@ fn mono_smi_inline_send(vm: &VmState, method: MethodOop, ic_idx: u16) -> Eligibi
     if target.primitive() == crate::compiler::ir::PRIM_BASIC_NEW && site.argc() == 0 {
         return Eligibility::Yes;
     }
+    // S14 step 4b: a mono send whose callee is a cheap NON-PRIMITIVE LEAF is
+    // inlinable regardless of the receiver klass — `ir::convert` splices it
+    // behind a receiver-klass guard (cold path = an uncommon trap). This admits
+    // a mono-non-smi accessor send (`^self val`, `val` a leaf) that would
+    // otherwise be rejected as a "mono but non-smi guard" below. A PRIMITIVE
+    // target is excluded (its bytecode is only the failure fallback, not its
+    // real behaviour — kept in lockstep with `inline::decide_with_budget`'s own
+    // `primitive() == 0` gate). Budget-checked at level 1 (the tier-1 level).
+    if target.primitive() == 0
+        && crate::compiler::inline::is_leaf(target)
+        && crate::compiler::inline::inline_cost(target)
+            <= crate::compiler::inline::budget_for_level(1).per_call_cost
+    {
+        return Eligibility::Yes;
+    }
     if site.guard().raw() != vm.universe.smi_klass.oop().raw() {
-        return Eligibility::NoPermanent; // mono but non-smi guard
+        return Eligibility::NoPermanent; // mono but non-smi guard, non-inlinable
     }
     if SMI_INLINE.contains(&target.primitive()) {
         Eligibility::Yes
@@ -477,6 +492,11 @@ pub fn compile_method(
         poll_bci,
         deopt_scopes,
         deopt_pcdescs,
+        // S14 step 4b: the inline dependencies the converter recorded (one
+        // `(receiver_klass, selector)` per spliced leaf). `deps::
+        // affected_by_install` reads these to invalidate this nmethod when an
+        // inlined callee is redefined.
+        inline_deps: ir_method.inline_deps.clone(),
     };
     // S12 D1 enforcement point 2: "debug + stress" — reuses the existing
     // heap-verifier's own gate (`MACVM_GC_VERIFY=1` opts a release build
@@ -675,14 +695,31 @@ mod tests {
         assert!(eligible(&vm, method));
     }
 
-    /// A Mono IC guarded on something OTHER than SmallInteger's own klass
-    /// keeps this method interpreted (D1 point 2's own mono-SMI gate).
+    /// A NON-LEAF target used by the eligibility-rejection tests below: its
+    /// bytecode contains a send, so `inline::is_leaf` is false and the S14
+    /// step-4b leaf-inline eligibility relaxation doesn't admit it — the older
+    /// mono-SMI/non-inline-primitive gates apply unchanged. (`primitive_stub`'s
+    /// `^self` body IS a leaf and would now inline.)
+    fn non_leaf_stub(vm: &mut VmState, sel: SymbolOop, prim_id: i64) -> MethodOop {
+        let inner = vm.universe.intern(b"innerStubSel");
+        let mut b = BytecodeBuilder::new();
+        b.push_self();
+        b.send(vm, inner, 0); // a send → non-leaf
+        b.ret_tos();
+        let m = b.finish(vm, sel, 1, 0);
+        m.set_primitive(prim_id);
+        m
+    }
+
+    /// A Mono IC guarded on something OTHER than SmallInteger's own klass keeps
+    /// this method interpreted (D1 point 2's own mono-SMI gate) — for a NON-LEAF
+    /// target (a leaf callee would now inline behind a klass guard, S14 step 4b).
     #[test]
     fn eligible_rejects_non_smi_guard() {
         let mut vm = test_vm();
         let method = plus_method(&mut vm);
         let plus_sel = vm.universe.intern(b"+");
-        let plus_target = primitive_stub(&mut vm, plus_sel, 1);
+        let plus_target = non_leaf_stub(&mut vm, plus_sel, 1);
         // Mono, but guarded on Object's klass instead of SmallInteger's.
         let object_klass = vm.universe.object_klass;
         let epoch = vm.ic_epoch;
@@ -690,15 +727,15 @@ mod tests {
         assert!(!eligible(&vm, method));
     }
 
-    /// Same gate, for a Mono-but-non-inlinable-primitive target.
+    /// Same gate, for a Mono-but-non-inlinable-primitive target (NON-LEAF).
     #[test]
     fn eligible_rejects_non_inline_primitive() {
         let mut vm = test_vm();
         let method = plus_method(&mut vm);
         // Mono, smi-guarded, but the target's primitive (23 = basicNew)
-        // isn't in SMI_INLINE.
+        // isn't in SMI_INLINE — and the target is non-leaf so it isn't inlined.
         let plus_sel = vm.universe.intern(b"+");
-        let not_inline = primitive_stub(&mut vm, plus_sel, 23);
+        let not_inline = non_leaf_stub(&mut vm, plus_sel, 23);
         let smi_klass = vm.universe.smi_klass;
         let epoch = vm.ic_epoch;
         InterpreterIc::at(method, 0).set_mono(&mut vm, smi_klass, not_inline, epoch);
@@ -1006,16 +1043,25 @@ mod tests {
         // stay generic `CallSend`s (this test's premise). An Empty IC would now
         // lower to an uncommon TRAP (`SiteFeedback::Untaken`), which is a
         // different scope shape exercised by the it_tier1 trap test — here we
-        // want the two-CallSend safepoint layout.
+        // want the two-CallSend safepoint layout. S14 step 4b: the targets are
+        // deliberately NON-LEAF (each contains its own inner send), so the
+        // inliner leaves both sites as real `CallSend`s rather than splicing a
+        // leaf accessor inline (which would collapse a safepoint and break the
+        // two-CallSend premise).
         let obj_klass = vm.universe.object_klass;
+        let inner_sel = vm.universe.intern(b"inner");
         let bar_target = {
             let mut tb = BytecodeBuilder::new();
-            tb.ret_self();
+            tb.push_self();
+            tb.send(&mut vm, inner_sel, 0); // a send → non-leaf
+            tb.ret_tos();
             tb.finish(&mut vm, bar_sel, 0, 0)
         };
         let box_target = {
             let mut tb = BytecodeBuilder::new();
-            tb.ret_self();
+            tb.push_self();
+            tb.send(&mut vm, inner_sel, 0); // a send → non-leaf
+            tb.ret_tos();
             tb.finish(&mut vm, box_sel, 2, 0)
         };
         let epoch = vm.ic_epoch;

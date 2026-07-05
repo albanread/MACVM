@@ -210,6 +210,16 @@ pub struct Nmethod {
     /// (DISTINCT from S12's oopmap `pcdescs` above — different key
     /// convention and payload). Empty until step 3.
     pub deopt_pcdescs: Vec<crate::compiler::scopes::PcDesc>,
+    /// S14 step 4b: one `(receiver_klass, selector)` pair per INLINED leaf
+    /// body — the assumption the guard makes (`lookup(receiver_klass,
+    /// selector)` resolves to the callee actually spliced). `deps::
+    /// affected_by_install` consults these so redefining an inlined callee
+    /// (`install_method` of `selector` anywhere on `receiver_klass`'s
+    /// superchain) makes THIS nmethod `NotEntrant`. Both oops are kept
+    /// GC-current by [`CodeTable::oops_do_inline_deps`] (same treatment as the
+    /// `IcSite` guard klass / `super_klass`): the pair names live heap objects
+    /// a moving collector relocates. Empty for a non-inlining nmethod.
+    pub inline_deps: Vec<(KlassOop, SymbolOop)>,
 }
 
 impl Nmethod {
@@ -308,6 +318,7 @@ impl Nmethod {
             poll_bci: None,
             deopt_scopes: Vec::new(),
             deopt_pcdescs: Vec::new(),
+            inline_deps: Vec::new(),
         }
     }
 }
@@ -670,6 +681,20 @@ impl CodeTable {
                     site.super_klass = Some(unsafe { KlassOop::from_oop_unchecked(nsk) });
                 }
             }
+            // S14 step 4b: each inline dependency `(klass, selector)` is a
+            // Rust-side oop pair `deps::affected_by_install` derefs
+            // (`superchain_contains(vm, klass, ..)`, selector raw-compare) on
+            // every `install_method`, so a moving GC must keep both current —
+            // same relocation hazard as `key_selector`/`super_klass`. ALWAYS
+            // visited (never weak): unlike `key_klass`, an inline-dep klass is a
+            // callee's receiver klass the guard genuinely assumes stays alive,
+            // and the invalidation walk must find it at its live address.
+            for (dk, ds) in &mut nm.inline_deps {
+                let ndk = f(dk.oop());
+                *dk = unsafe { KlassOop::from_oop_unchecked(ndk) };
+                let nds = f(ds.oop());
+                *ds = unsafe { SymbolOop::from_oop_unchecked(nds) };
+            }
         }
     }
 
@@ -764,6 +789,7 @@ mod tests {
             poll_bci: None,
             deopt_scopes: Vec::new(),
             deopt_pcdescs: Vec::new(),
+            inline_deps: Vec::new(),
         }
     }
 
