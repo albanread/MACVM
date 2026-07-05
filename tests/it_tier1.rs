@@ -638,6 +638,126 @@ fn compiled_smi_overflow_deopts_to_interpreter() {
     );
 }
 
+/// S13 step 7b-ii (the SECOND organic trap client): a compiled `br_true`/
+/// `br_false` on a NON-boolean operand deopts (`brk #0xDE00`, reexecute at the
+/// branch bci), the interpreter re-executes the branch, sees the non-boolean,
+/// and runs its own `mustBeBoolean` protocol — result identical to a pure
+/// interpreter run. Same signal chain as the smi-overflow test, driven by the
+/// `BoolBr.not_bool` edge instead of a smi fail edge.
+#[test]
+fn compiled_not_boolean_deopts_to_interpreter() {
+    let mut vm = VmState::with_options(VmOptions {
+        heap_mib: 64,
+        trace: Default::default(),
+        gc_stress: false,
+        gc_stress_full_period: None,
+        eden_kb: None,
+        jit: JitMode::Threshold(1),
+    });
+    let smi_klass = vm.universe.smi_klass;
+
+    // `mustBeBoolean` handler on SmallInteger: `^true` (SPEC §5.4 Alg 11 — the
+    // branch re-executes with the handler's result). A smi is the non-boolean
+    // we branch on below, so its klass is where the interpreter looks.
+    let mb_sel = vm.universe.sel_must_be_boolean;
+    let handler = {
+        let mut hb = BytecodeBuilder::new();
+        hb.push_true();
+        hb.ret_tos();
+        hb.finish(&mut vm, mb_sel, 0, 0)
+    };
+    install_method(&mut vm, smi_klass, mb_sel, handler);
+
+    // `chooseOn: x [ ^x ifTrue: [1] ifFalse: [0] ]` — a NON-fused boolean
+    // branch on the arg (distinct branch values so the result discriminates).
+    let mut b = BytecodeBuilder::new();
+    let tb = b.new_label();
+    let end = b.new_label();
+    b.push_temp(0); // x
+    b.br_true_fwd(tb);
+    b.push_smi_i8(0); // false branch -> 0
+    b.jump_fwd(end);
+    b.bind(tb);
+    b.push_smi_i8(1); // true branch -> 1
+    b.bind(end);
+    b.ret_tos();
+    let m_sel = vm.universe.intern(b"chooseOn:");
+    let method = b.finish(&mut vm, m_sel, 1, 0);
+
+    assert!(
+        driver::eligible(&vm, method),
+        "a plain boolean branch is eligible"
+    );
+    let id = driver::compile_method(&mut vm, smi_klass, method).expect("must compile");
+    assert!(
+        !vm.code_table
+            .get(id)
+            .expect("installed")
+            .deopt_pcdescs
+            .is_empty(),
+        "the not_bool edge is a deopt trap site -> at least one deopt PcDesc"
+    );
+
+    let recv = SmallInt::new(0).oop(); // receiver klass = smi_klass (customization key)
+    let nonbool = SmallInt::new(5).oop(); // a smi: NOT true/false -> not_bool -> deopt
+
+    // Interpreter reference for the non-boolean arg: mustBeBoolean(5) -> true
+    // -> the true branch -> 1.
+    let interp_result = macvm::interpreter::run_method(&mut vm, method, recv, &[nonbool]);
+    assert_eq!(
+        interp_result.raw(),
+        SmallInt::new(1).oop().raw(),
+        "pure interpreter: non-boolean branch -> mustBeBoolean -> true -> the 1 branch"
+    );
+
+    let nm = vm.code_table.get(id).expect("installed nmethod");
+    let entry = unsafe { nm.code.base.add(nm.entry_off as usize) } as u64;
+    let call: CallStubFn = unsafe { std::mem::transmute(vm.stubs.call_stub_entry()) };
+    let vm_ptr: *mut VmState = &mut vm;
+
+    // Fast paths: real booleans never trap. true -> 1, false -> 0.
+    let t_res = unsafe {
+        call(
+            entry,
+            vm_ptr,
+            [recv.raw(), vm.universe.true_obj.raw()].as_ptr(),
+            2,
+        )
+    };
+    assert_eq!(t_res, SmallInt::new(1).oop().raw(), "fast path: true -> 1");
+    let f_res = unsafe {
+        call(
+            entry,
+            vm_ptr,
+            [recv.raw(), vm.universe.false_obj.raw()].as_ptr(),
+            2,
+        )
+    };
+    assert_eq!(f_res, SmallInt::new(0).oop().raw(), "fast path: false -> 0");
+    let deopts_before = unsafe { (*vm_ptr).stats.deopt_count };
+    assert_eq!(deopts_before, 0, "boolean branches never trap");
+
+    // THE organic trap: a non-boolean operand. brk -> SIGTRAP -> deopt ->
+    // interpret_active runs mustBeBoolean -> true -> the 1 branch.
+    let deopt_result = unsafe { call(entry, vm_ptr, [recv.raw(), nonbool.raw()].as_ptr(), 2) };
+    let deopts_after = unsafe { (*vm_ptr).stats.deopt_count };
+    assert_eq!(
+        deopt_result,
+        interp_result.raw(),
+        "the not_bool deopt must produce the IDENTICAL result to the pure interpreter"
+    );
+    assert_eq!(
+        deopt_result,
+        SmallInt::new(1).oop().raw(),
+        "mustBeBoolean returned true, so the 1 branch runs"
+    );
+    assert_eq!(
+        deopts_after,
+        deopts_before + 1,
+        "exactly one deopt (the not_bool brk fired)"
+    );
+}
+
 /// The current AArch64 native stack pointer — `sp` never appears as an
 /// ordinary register operand (AArch64 requires `mov`/add-immediate forms
 /// for it), so reading it needs one inline-asm instruction; this whole

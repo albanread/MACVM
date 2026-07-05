@@ -779,41 +779,34 @@ impl<'a> Translator<'a> {
         (fail_id, continuation_id)
     }
 
-    /// D1's `BoolBr.not_bool` replacement: `rt_must_be_boolean` (S11 step
-    /// 6) then re-tests its own result — a self-loop, exactly mirroring
-    /// the interpreter's own documented "a handler that keeps returning
-    /// non-booleans livelocks by construction, same as real Smalltalk, not
-    /// a VM bug" (`interpreter::mod::must_be_boolean_send`'s doc). Reuses
-    /// `val` as BOTH the `CallRuntime`'s arg AND its own `dst` — the
-    /// block's only live value is "whatever we're testing this iteration",
-    /// so no second vreg is needed, and every caller (an ordinary
-    /// `BoolBr`'s own `not_bool` edge, or a fused `SmiCmpBr`'s synthesized
-    /// fallback) can hand this whatever vreg already holds the value that
-    /// failed the FIRST check, unchanged.
-    fn fresh_not_bool_block(&mut self, val: VReg, if_true: BlockId, if_false: BlockId) -> BlockId {
+    /// S13 step 7b-ii: a `BoolBr.not_bool` edge (the value branched on wasn't
+    /// `true`/`false`) DEOPTS — a single `Ir::UncommonTrap{ bci: branch_bci }`,
+    /// reexecute=true at the branch opcode. The interpreter re-executes the
+    /// branch, sees the non-boolean, and runs its own `must_be_boolean_send`
+    /// (SPEC §5.4 Alg 11: push the value back, roll bci to the branch, send
+    /// `#mustBeBoolean`, re-test) — so the compiled path stops carrying a
+    /// `CallRuntime{MUST_BE_BOOLEAN}` self-loop and defers the whole
+    /// (rare, cold) protocol to the interpreter. `reexec_stack` is the
+    /// operand stack BEFORE the branch (the value being tested still on top,
+    /// since the deferred branch never popped it) — exactly what reexecute
+    /// needs. `regalloc::deopt_live` forces every vreg this site reads
+    /// (receiver + slots + `reexec_stack`) live-across the trap so it spills.
+    fn fresh_not_bool_block(&mut self, branch_bci: usize, reexec_stack: Vec<VReg>) -> BlockId {
         let not_bool_id = self.fresh_block_id();
         self.finish_block(IrBlock {
             id: not_bool_id,
-            bci: 0, // not a real bytecode position, same as the old bailout block's own bci:0
-            code: vec![
-                Ir::CallRuntime {
-                    dst: Some(val),
-                    stub: StubId::MUST_BE_BOOLEAN,
-                    args: vec![val],
-                },
-                Ir::BoolBr {
-                    val,
-                    if_true,
-                    if_false,
-                    not_bool: not_bool_id,
-                },
-            ],
+            bci: branch_bci,
+            code: vec![Ir::UncommonTrap { bci: branch_bci }],
             entry_stack: Vec::new(),
-            // The synthesized smi-fallback / not-boolean blocks record no
-            // deopt sites in v1 (S13 step 3b): their CallSend/CallRuntime
-            // safepoints can't deopt until step 7 turns them into real trap
-            // clients, so the driver simply finds nothing to attach here.
-            deopt_sites: Vec::new(),
+            deopt_sites: vec![(
+                0,
+                DeoptRaw {
+                    stack: reexec_stack,
+                    bci: branch_bci,
+                    kind: SafepointKind::UncommonTrap,
+                    reexecute: true,
+                },
+            )],
         });
         not_bool_id
     }
@@ -1447,7 +1440,13 @@ pub fn convert(vm: &VmState, method: MethodOop, cfg: &Cfg) -> IrMethod {
         let mut cur_id = block_id(b);
         let mut cur_bci = cfg_block.bci_start;
         let mut bci = cfg_block.bci_start;
+        // S13 step 7b-ii: the bci of the block's LAST instruction. For a
+        // `Branch` terminator that is the `br_true`/`br_false` opcode itself —
+        // the reexecute resume point for a non-boolean `mustBeBoolean` deopt
+        // (the interpreter rolls its own bci back to exactly this opcode).
+        let mut last_instr_bci = cfg_block.bci_start;
         while bci < cfg_block.bci_end {
+            last_instr_bci = bci;
             let (instr, next) = decode_at(method, bci);
             // Fusable iff nothing but the block's own terminator follows
             // this instruction, AND that terminator is a Branch (D3.2 —
@@ -1534,8 +1533,11 @@ pub fn convert(vm: &VmState, method: MethodOop, cfg: &Cfg) -> IrMethod {
                     let val = *local_exit
                         .last()
                         .expect("branch terminator with an empty simulated stack (compiler bug)");
-                    let not_bool_id =
-                        t.fresh_not_bool_block(val, block_id(if_true), block_id(if_false));
+                    // S13 step 7b-ii: the not_bool edge deopts at the branch
+                    // opcode. `local_exit` is the operand stack BEFORE the
+                    // branch (the deferred `br_true`/`br_false` never popped
+                    // `val`), so it IS the reexecute stack.
+                    let not_bool_id = t.fresh_not_bool_block(last_instr_bci, local_exit.to_vec());
                     code.push(Ir::BoolBr {
                         val,
                         if_true: block_id(if_true),
