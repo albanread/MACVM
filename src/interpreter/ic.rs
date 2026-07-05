@@ -298,9 +298,23 @@ pub fn ic_transition(
                 let scope = crate::memory::handles::HandleScope::enter(vm);
                 let rcvr_klass_h = scope.handle(vm, rcvr_klass);
                 let m_h = scope.handle(vm, m);
+                // S15 (BUG A, found by the Richards port): `selector` must be
+                // handle-protected across the allocation too — it is read
+                // AFTER `alloc_poly_pairs` by the compiled-id re-resolve
+                // below, and a scavenge moves a YOUNG symbol (any selector
+                // interned by freshly loaded code). Probing the method
+                // dictionary with the stale pre-move address misses every
+                // entry, so the expect below fired as "klass k0 must still
+                // resolve selector" — an abort, since the whole transition
+                // can run inside rt_uncommon_trap's no-unwind extern "C"
+                // frame. World selectors survive genesis GCs into old space,
+                // which is why only new benchmark code ever hit this.
+                let selector_h = scope.handle(vm, selector.oop());
 
                 let pairs = alloc_poly_pairs(vm);
 
+                let selector = SymbolOop::try_from(selector_h.get(vm))
+                    .expect("ic_transition: selector survived the pairs allocation");
                 let caller = vm.regs.method.expect("ic_transition: no active method");
                 let ic = InterpreterIc::at(caller, ic_idx);
                 let k0 =
