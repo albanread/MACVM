@@ -758,6 +758,83 @@ fn compiled_not_boolean_deopts_to_interpreter() {
     );
 }
 
+/// S13 step 8 (§2a+§2b): `make_not_entrant` on a real compiled method flips it
+/// to `NotEntrant`, unhooks it from the `(klass, selector)` lookup (a new send
+/// misses + re-resolves), PATCHES both `entry` and `verified_entry` to
+/// `b not_entrant_stub` (so a compiled caller's still-live `bl` re-dispatches),
+/// and RETAINS the record + address map (an in-flight/trapping frame still
+/// resolves). Structural check on the real patched code — the functional C→C
+/// re-dispatch is the same `stub_resolve` machine `not_entrant_stub` copies
+/// (already exercised) + adversarially verified. JitMode::Off: no code is
+/// executed here, so no SIGTRAP handler is needed.
+#[test]
+fn make_not_entrant_patches_entries_and_unhooks() {
+    let mut vm = test_vm();
+    let plus_sel = vm.universe.intern(b"+");
+    let smi_klass = vm.universe.smi_klass;
+
+    // `plusArg: arg [ ^self + arg ]`, mono-smi IC → eligible + compiled.
+    let mut b = BytecodeBuilder::new();
+    b.push_self();
+    b.push_temp(0);
+    b.send(&mut vm, plus_sel, 1);
+    b.ret_tos();
+    let m_sel = vm.universe.intern(b"plusArg:");
+    let method = b.finish(&mut vm, m_sel, 1, 0);
+    let plus_target = primitive_stub(&mut vm, plus_sel, 1);
+    let epoch = vm.ic_epoch;
+    InterpreterIc::at(method, 0).set_mono(&mut vm, smi_klass, plus_target, epoch);
+    install_method(&mut vm, smi_klass, plus_sel, plus_target);
+    let id = driver::compile_method(&mut vm, smi_klass, method).expect("must compile");
+
+    assert_eq!(
+        vm.code_table.lookup(smi_klass, m_sel),
+        Some(id),
+        "installed → lookup finds it"
+    );
+    let (base, entry_off, verified_off) = {
+        let nm = vm.code_table.get(id).unwrap();
+        (
+            nm.code.base as usize,
+            nm.entry_off as usize,
+            nm.verified_entry_off as usize,
+        )
+    };
+
+    macvm::codecache::flush::make_not_entrant(&mut vm, id);
+
+    assert!(
+        matches!(
+            vm.code_table.get(id).unwrap().state,
+            macvm::codecache::nmethod::NmState::NotEntrant
+        ),
+        "state → NotEntrant"
+    );
+    assert_eq!(
+        vm.code_table.lookup(smi_klass, m_sel),
+        None,
+        "unhooked from by_key → a fresh send misses + re-resolves"
+    );
+    assert_eq!(
+        vm.code_table.find_by_pc(base as u64 + entry_off as u64),
+        Some(id),
+        "record + address map retained → in-flight frames still resolve"
+    );
+
+    // Both entries decode to `b not_entrant_stub`.
+    let not_entrant = vm.stubs.not_entrant_addr();
+    for off in [entry_off, verified_off] {
+        let site = base + off;
+        let word = unsafe { *(site as *const u32) };
+        let disp = not_entrant as i64 - site as i64;
+        let expected = 0x1400_0000u32 | (((disp >> 2) as u32) & 0x03FF_FFFF);
+        assert_eq!(
+            word, expected,
+            "entry @ +{off:#x} must be patched to `b not_entrant_stub`"
+        );
+    }
+}
+
 /// The current AArch64 native stack pointer — `sp` never appears as an
 /// ordinary register operand (AArch64 requires `mov`/add-immediate forms
 /// for it), so reading it needs one inline-asm instruction; this whole

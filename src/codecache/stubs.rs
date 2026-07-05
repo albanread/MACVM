@@ -165,6 +165,18 @@ pub struct Stubs {
     /// and the size in bytes in x1 (S11 step 8). Callee-shaped (plain `ret`,
     /// result oop in x0), same contract as `must_be_boolean`.
     pub alloc_slow: CodeHandle,
+    /// S13 D1 §2b: the shared `not_entrant_stub` — a now-`NotEntrant`
+    /// nmethod's `entry`/`verified_entry` are patched (by
+    /// `nmethod::make_not_entrant`) to `b not_entrant_stub`, so a future call
+    /// through a compiled caller's `bl` (which still targets the old entry)
+    /// lands here with receiver+args untouched in x0..x5 and x30 = the
+    /// caller's own send-site return address. It re-dispatches EXACTLY like an
+    /// IC miss (`stub_resolve`/[`rt_resolve_send`]): re-resolve
+    /// (receiver klass, selector) for that site, patch the site's `bl` to the
+    /// CURRENT method's target, and tail-jump there. See
+    /// [`build_not_entrant_stub`] for why this shares the resolve tail
+    /// verbatim rather than being its own runtime function.
+    pub not_entrant: CodeHandle,
 }
 
 impl Stubs {
@@ -191,6 +203,11 @@ impl Stubs {
     }
     pub fn alloc_slow_addr(&self) -> u64 {
         self.alloc_slow.base as u64
+    }
+    /// S13 §2b: the address `make_not_entrant` patches an invalidated
+    /// nmethod's `entry`/`verified_entry` to branch to.
+    pub fn not_entrant_addr(&self) -> u64 {
+        self.not_entrant.base as u64
     }
 
     /// Invokes `entry` (a compiled method's own entry point — an `Nmethod`'s
@@ -268,6 +285,12 @@ pub fn install(cache: &mut CodeCache) -> Stubs {
         .expect("stubs::install: code cache too small for alloc_slow");
     cache.publish(h8, &alloc_slow_blob);
 
+    let not_entrant_blob = build_not_entrant_stub();
+    let h9 = cache
+        .alloc(not_entrant_blob.code.len())
+        .expect("stubs::install: code cache too small for not_entrant");
+    cache.publish(h9, &not_entrant_blob);
+
     Stubs {
         call_stub: h1,
         stub_poll: h2,
@@ -277,6 +300,7 @@ pub fn install(cache: &mut CodeCache) -> Stubs {
         dnu: h6,
         must_be_boolean: h7,
         alloc_slow: h8,
+        not_entrant: h9,
     }
 }
 
@@ -635,6 +659,65 @@ pub unsafe extern "C" fn rt_resolve_send(vm: *mut VmState, ret_addr: u64, argv: 
         .state = new_state;
 
     ret_target
+}
+
+/// S13 D1 §2b: `not_entrant_stub`. A now-`NotEntrant` nmethod's `entry` and
+/// `verified_entry` are patched (`nmethod::make_not_entrant`) to `b
+/// not_entrant_stub`. A future call reaches it through a compiled caller's
+/// still-live `bl` (whose target is the old entry): at that instant x0..x5
+/// hold the receiver+args exactly as the caller set them (the patched `b` is
+/// the FIRST instruction at the entry — nothing has run yet), and x30 is the
+/// caller's own send-site return address (a `b` doesn't touch x30, so it is
+/// still whatever the caller's `bl` set — the SAME invariant `stub_resolve`'s
+/// `bl`-door relies on).
+///
+/// The whole re-dispatch job — find the caller's `IcSite` from x30, re-resolve
+/// (receiver klass, selector) via `code_table.lookup`, patch the site's `bl`
+/// to the CURRENT method's target, tail-jump there — is EXACTLY
+/// [`rt_resolve_send`]'s existing D4.1 machine, with nothing about it specific
+/// to a "miss" versus an "invalidated entry": the MONO re-resolve arm
+/// (`Mono {klass,..} if klass == k`) already re-runs a fresh `lookup`, so a
+/// site whose `bl` had been patched straight to the OLD (now-NotEntrant) entry
+/// gets repointed to whatever `code_table.lookup(k, selector)` returns TODAY —
+/// the redefined method's fresh nmethod, or a c2i adapter if it's no longer
+/// compiled. So this stub is byte-for-byte `stub_resolve`'s own listing rather
+/// than a new runtime function: same prologue, same `rt_resolve_send`, same
+/// tail-jump. A distinct handle (not just an alias of `resolve`) is kept only
+/// so the invalidation path has its OWN stable branch target, decoupled from
+/// any future divergence of the fresh-`bl` door.
+///
+/// **KNOWN LIMITATION — `send_super` re-dispatch (step-10 blocker).** This
+/// reuse is correct for ORDINARY sends (Mono/PIC/Mega/Unresolved/c2i, all
+/// adversarially verified S13 step 8). It is WRONG for a compiled `send_super`
+/// site: `rt_resolve_send` re-resolves via `lookup(klass_of(self), selector)`,
+/// but a super site must resolve from its STATIC holder-superclass — and the
+/// runtime `IcSite` carries no super marker (`static_klass` lives only in the
+/// discarded compile-time `CallSiteInfo`). So if a super-send's TARGET nmethod
+/// is made `NotEntrant`, the super site silently collapses into a dynamic send
+/// reaching a subclass override `super` was meant to skip. LATENT until a
+/// super-target is invalidated (only the step-10 redefinition trigger does
+/// that; no step-8 test hits it). The fix belongs with step 10: give the
+/// runtime `IcSite` a super/static-klass marker so re-resolution stays
+/// super-aware, exactly as `driver::compile_method`'s own super pre-resolution
+/// already is at compile time.
+fn build_not_entrant_stub() -> CodeBlob {
+    let mut a = JasmAssembler::new();
+
+    emit_stub_prologue(&mut a);
+    emit_stub_kind_tag(&mut a, KIND_RESOLVE);
+    a.emit("mov", &[x(0), x(28)]); // vm
+    a.emit("mov", &[x(1), x(30)]); // ret_addr (captured before call_far clobbers x30)
+    a.emit("sub", &[x(2), x(29), imm(ROOTSPILL_BYTES as i64)]); // argv = &RootSpill
+    let rt_resolve_lit = a.literal_u64(
+        rt_resolve_send as *const () as u64,
+        Some(RelocKind::RuntimeAddr),
+    );
+    a.call_far(rt_resolve_lit);
+    a.emit("mov", &[x(16), x(0)]); // result -> x16 (P4: survives the epilogue's own x0 reload)
+    emit_stub_epilogue(&mut a);
+    a.emit("br", &[x(16)]);
+
+    a.finish()
 }
 
 /// D6.1: the shared c2i adapter tail. Reused unchanged from
@@ -1235,6 +1318,8 @@ mod tests {
         assert!(cache.contains(stubs.mega_shared_addr()));
         assert!(cache.contains(stubs.dnu_addr()));
         assert!(cache.contains(stubs.must_be_boolean_addr()));
+        assert!(cache.contains(stubs.alloc_slow_addr()));
+        assert!(cache.contains(stubs.not_entrant_addr()));
     }
 
     fn test_vm() -> VmState {

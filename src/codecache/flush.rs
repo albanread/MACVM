@@ -21,6 +21,71 @@ use crate::runtime::vm_state::VmState;
 use super::nmethod::{IcState, NmethodId};
 use super::CodeHandle;
 
+/// S13 D1 §2a + §2b: the invalidation MECHANISM — make `id` stop being
+/// ENTERED (future calls re-resolve to the current method), while any
+/// in-flight activation keeps running its old code. Called directly by the
+/// redefinition/dependency path (step 10) — and, for now, by tests. This is
+/// NOT the redirection of in-flight frames (§2c = step 9); it deliberately
+/// leaves those frames untouched.
+///
+/// Two effects, matching D1 §2a/§2b exactly:
+///
+/// - **§2a** — `code_table.set_not_entrant(id)`: state → `NotEntrant`, unhook
+///   from the `(klass, selector)` lookup map so new sends miss and re-resolve,
+///   and interpreter ICs holding its stale id self-heal (their re-validate
+///   check fails on the non-`Alive` state). The `Nmethod` record and code
+///   block are NOT freed — an in-flight frame still runs this code, and a
+///   patched compiled caller's `bl` still points at its entry (step 10's
+///   zombie sweep frees it once nothing references it).
+///
+/// - **§2b** — entry patching: overwrite the FIRST instruction word at BOTH
+///   `entry` (offset 0) and `verified_entry` (`verified_entry_off`) with `b
+///   not_entrant_stub` (a full-word Branch26, [`super::CodeCache::
+///   write_branch26_at`]), so a future call through a compiled caller's still-
+///   live `bl` (which targets the old entry) lands in the shared stub and
+///   re-dispatches like an IC miss. S11 guarantees a patchable instruction at
+///   offset 0 of each entry. When `entry_off == verified_entry_off` (an
+///   un-customized nmethod with no separate klass-guard entry — S10's own
+///   convention), both offsets name the SAME word; patching it twice is
+///   idempotent (the second write lays down the byte-identical `b`), so no
+///   special-casing is needed.
+///
+/// W^X: each `write_branch26_at` opens its own [`super::guard::JitWriteGuard`],
+/// writes the one word, then on `Drop` flips back to exec mode and flushes the
+/// icache over exactly that word (guard.rs's own P9 order). Two separate words
+/// ⇒ two guard cycles; nesting a single guard over both is FORBIDDEN in v1
+/// (the guard's own depth assert), so per-word guards are the correct idiom
+/// here, not a batched one. Invalidation is rare, so the extra flush is free.
+///
+/// # Panics
+/// If `id` is not installed, or is not `Alive` (double-invalidation) — a
+/// VM-consistency bug, never guest-triggerable.
+pub fn make_not_entrant(vm: &mut VmState, id: NmethodId) {
+    // Read the two entry offsets + code handle BEFORE flipping state (the
+    // borrow of `code_table` here ends before the mutable `code_cache` writes
+    // below — disjoint fields, but sequenced cleanly regardless).
+    let (code, entry_off, verified_entry_off) = {
+        let nm = vm
+            .code_table
+            .get(id)
+            .expect("make_not_entrant: id must be installed");
+        (nm.code, nm.entry_off, nm.verified_entry_off)
+    };
+
+    // §2a: state → NotEntrant + unhook from by_key (record + by_addr retained).
+    vm.code_table.set_not_entrant(id);
+
+    // §2b: redirect BOTH entries to the shared not_entrant_stub. Each write is
+    // its own guard/flush cycle (no guard nesting in v1).
+    let not_entrant_addr = vm.stubs.not_entrant_addr();
+    vm.code_cache
+        .write_branch26_at(code, entry_off, not_entrant_addr);
+    if verified_entry_off != entry_off {
+        vm.code_cache
+            .write_branch26_at(code, verified_entry_off, not_entrant_addr);
+    }
+}
+
 /// D6.1/D6.2: flushes `id` — marks it `Zombie` and unhooks it from
 /// `by_key` (step 1), sweeps every OTHER alive nmethod's own `IcSite`s and
 /// resets any whose current target lands inside `id`'s own code range

@@ -261,6 +261,47 @@ impl CodeCache {
         self.patch_branch26(site, target);
     }
 
+    /// S13 §2b: overwrite the WHOLE 4-byte instruction word at `(handle, off)`
+    /// with an unconditional `b target` (AArch64 Branch26: `0x1400_0000 |
+    /// imm26`), replacing whatever instruction was there — unlike
+    /// [`Self::patch_branch26_at`], which patches only the imm26 FIELD of an
+    /// existing `bl`/`b`. `make_not_entrant` needs this because the site it
+    /// stamps (a compiled method's `entry`/`verified_entry`) currently holds
+    /// the klass-guard/prologue's first instruction (a `tst`/`stp`), NOT a
+    /// branch — so there are no opcode bits worth preserving; the entire word
+    /// must become a fresh `b`.
+    ///
+    /// `target` must be within Branch26 range (±128 MB). Both the site and the
+    /// stub live in this same `CodeCache` (one `mmap`, ≤ tens of MB), so this
+    /// always holds — asserted rather than veneered (the veneer machinery in
+    /// [`Self::patch_branch26`] exists for far *cross-cache* targets, which do
+    /// not arise here). The write is W^X-correct by construction: it happens
+    /// inside one [`JitWriteGuard`] whose `Drop` flips back to exec mode and
+    /// THEN flushes the icache over the noted word (guard.rs's own P9 order).
+    pub fn write_branch26_at(&mut self, handle: CodeHandle, off: u32, target: u64) {
+        debug_assert!(
+            (off as usize) + 4 <= handle.len,
+            "write_branch26_at: offset {off} + 4 exceeds the handle's own length {}",
+            handle.len
+        );
+        let site = unsafe { handle.base.add(off as usize) };
+        let disp = target as i64 - site as i64;
+        assert!(
+            in_branch26_range(disp),
+            "write_branch26_at: target {target:#x} is out of Branch26 range of site {:#x} \
+             (disp {disp:#x}) — the not_entrant_stub must live in the same code cache",
+            site as u64
+        );
+        let word = 0x1400_0000u32 | (((disp >> 2) as u32) & 0x03FF_FFFF);
+        let mut g = JitWriteGuard::new();
+        g.note(site, 4);
+        unsafe {
+            let s = std::slice::from_raw_parts_mut(site as *mut u8, 4);
+            s.copy_from_slice(&word.to_le_bytes());
+        }
+        // g drops here: exec mode first, then icache-flush the noted word.
+    }
+
     /// Overwrite an 8-byte literal-pool word in place (GC relocation, or an
     /// inline cache's cached klass — S12). No re-publish, no separate flush
     /// call needed beyond the guard's own.

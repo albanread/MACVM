@@ -411,13 +411,42 @@ impl CodeTable {
     pub fn oops_do(&mut self, include_key_klass: bool, f: &mut dyn FnMut(&mut u64)) {
         let mut guard = JitWriteGuard::new();
         for nm in self.slots.iter().flatten() {
-            if !matches!(nm.state, NmState::Alive) {
+            // S13 §2b/§3: `Alive` OR `NotEntrant`, skipping ONLY `Zombie`. A
+            // `NotEntrant` nmethod is invalidated for FUTURE entry but may
+            // still have in-flight activations (step 9's lazy return-address
+            // redirection is exactly what lets its frames keep running old
+            // code); those frames `ldr` their oops — `ConstPool` literals, the
+            // key_klass guard word — straight out of THIS nmethod's own pool,
+            // so a moving GC that skipped it would leave those words stale and
+            // the running old code would read a dangling oop. The doc's §3
+            // ("existing activations complete under the OLD method") REQUIRES
+            // an invalidated nmethod's oops stay GC-current until it is
+            // `Zombie`d (step 10, only after no frame references it). A
+            // `Zombie` has, by that step's own precondition, no live
+            // activation, so its pool need not be maintained.
+            if matches!(nm.state, NmState::Zombie) {
                 continue;
             }
             guard.note(nm.code.base, nm.code.len);
             let base = nm.code.base as usize;
             for reloc in nm.oop_relocs() {
-                if !include_key_klass && matches!(reloc.kind, RelocKind::KeyKlassOop) {
+                // S12 D5: an ALIVE nmethod's `key_klass` is WEAK — the full-GC
+                // mark pass (`include_key_klass == false`) skips it so a klass
+                // death can flush the nmethod (`weak_sweep`). S13 §2b: a
+                // `NotEntrant` nmethod's key is STRONG instead — it has
+                // in-flight activations whose code `ldr`s this very key_klass
+                // guard word, and the state gate above keeps that word
+                // GC-current; if the mark pass also skipped it, the klass could
+                // die unmarked and the update pass would chase a never-installed
+                // forwarding word into a dangling read (`weak_sweep`/`iter_alive`
+                // exclude NotEntrant, so nothing else keeps it alive). Only
+                // Zombie can never reach here (skipped wholesale above). Keeping
+                // a redefined method's key alive until its frames drain (Zombie,
+                // step 10) is the correct conservative choice.
+                if !include_key_klass
+                    && matches!(reloc.kind, RelocKind::KeyKlassOop)
+                    && matches!(nm.state, NmState::Alive)
+                {
                     continue;
                 }
                 debug_assert!(
@@ -463,10 +492,15 @@ impl CodeTable {
             .collect()
     }
 
-    /// Every currently-`Alive` nmethod (never `Zombie`/being-flushed one,
-    /// `NotEntrant` isn't produced anywhere in S12/S13 either) — the
-    /// iteration base for `weak_sweep` above and `codecache::flush`'s own
-    /// compiled-site invalidation sweep (S12 D6.2).
+    /// Every currently-`Alive` nmethod — the iteration base for `weak_sweep`
+    /// above and `codecache::flush`'s own compiled-site invalidation sweep
+    /// (S12 D6.2). Deliberately EXCLUDES `NotEntrant` (S13 §2b's
+    /// `make_not_entrant` now produces it): a NotEntrant nmethod must NOT be
+    /// weak-swept — it may have in-flight activations, so it can only be
+    /// reclaimed by step 10's frame-reference check (→ `Zombie`), never by a
+    /// dead key. Its key is kept STRONG in `oops_do` above precisely so it is
+    /// never seen dead here anyway; the two decisions are the paired halves of
+    /// "a NotEntrant nmethod stays fully live until its frames drain".
     pub fn iter_alive(&self) -> impl Iterator<Item = &Nmethod> {
         self.slots
             .iter()
@@ -486,6 +520,38 @@ impl CodeTable {
             .as_mut()
             .expect("mark_zombie: id must be alive");
         nm.state = NmState::Zombie;
+        let key = (nm.key_klass.oop().raw(), nm.key_selector.oop().raw());
+        self.by_key.remove(&key);
+    }
+
+    /// S13 D1 §2a: mark `id` `NotEntrant` and unhook it from `by_key`, so a
+    /// new send for `(key_klass, key_selector)` MISSES the lookup map and
+    /// re-resolves against the current MethodDictionary (the redefined
+    /// method's fresh nmethod, or the interpreter). Interpreter ICs holding a
+    /// stale smi id of this nmethod self-heal on their own next use: the
+    /// dispatch path re-validates `code_table.get(id).is_some_and(state ==
+    /// Alive)` before entering (`interpreter::send::send_generic`), and a
+    /// `NotEntrant` state fails that check.
+    ///
+    /// Crucially — UNLIKE [`Self::mark_zombie`] — the `Nmethod` RECORD and its
+    /// `by_addr` entry stay put: an in-flight activation is still running this
+    /// nmethod's code, and a compiled caller's `bl` still targets its
+    /// (now-patched) entry, so `get(id)`/`find_by_pc(pc)` must keep resolving
+    /// to it for the GC frame-root scan (`oopmap_at`) and the step-9 lazy
+    /// return-address walk. Freeing the code block and dropping the record is
+    /// step 10's zombie sweep, only after no frame references it. The caller
+    /// (`flush::make_not_entrant`) does the entry patching separately (it
+    /// needs `&mut CodeCache`, which this table doesn't own).
+    pub fn set_not_entrant(&mut self, id: NmethodId) {
+        let nm = self.slots[id.0 as usize]
+            .as_mut()
+            .expect("set_not_entrant: id must still be installed");
+        debug_assert!(
+            matches!(nm.state, NmState::Alive),
+            "set_not_entrant: {id:?} must be Alive (double-invalidation, or a Zombie \
+             being resurrected, is a VM-consistency bug)"
+        );
+        nm.state = NmState::NotEntrant;
         let key = (nm.key_klass.oop().raw(), nm.key_selector.oop().raw());
         self.by_key.remove(&key);
     }
@@ -912,6 +978,114 @@ mod tests {
             seen,
             vec![0x1111, 0x2222],
             "include_key_klass=true must visit both words"
+        );
+    }
+
+    /// S13 §2b (the paired half of the `oops_do` state-gate fix): once an
+    /// nmethod is `NotEntrant`, its `key_klass` becomes STRONG — the full-GC
+    /// mark pass (`include_key_klass=false`) must NOW visit it, because the
+    /// nmethod may have in-flight activations whose code `ldr`s that guard word
+    /// (which `oops_do` keeps current). An `Alive` nmethod's key stays weak
+    /// (the sibling test above); a NotEntrant one does not, or its key could
+    /// die unmarked and the update pass would chase a dangling forwarding.
+    #[test]
+    fn oops_do_visits_notentrant_key_klass_as_strong() {
+        let mut vm = test_vm();
+        let klass = vm.universe.array_klass;
+        let h = vm.code_cache.alloc(32).expect("alloc");
+        vm.code_cache.publish(
+            h,
+            &CodeBlob {
+                code: vec![0u8; 32],
+                literal_off: 8,
+                relocs: Vec::new(),
+                listing: Vec::new(),
+            },
+        );
+        vm.code_cache
+            .patch_pool_word(unsafe { h.base.add(8) } as *mut u64, 0x1111);
+        vm.code_cache
+            .patch_pool_word(unsafe { h.base.add(16) } as *mut u64, 0x2222);
+        let sel = vm.universe.intern(b"notEntrantKeyStrong");
+        let nm = fake_nmethod(klass, sel, h.base as usize, h.len);
+        let nm = Nmethod {
+            relocs: vec![
+                Reloc {
+                    offset: 8,
+                    kind: RelocKind::Oop,
+                },
+                Reloc {
+                    offset: 16,
+                    kind: RelocKind::KeyKlassOop,
+                },
+            ],
+            ..nm
+        };
+        let id = vm.code_table.install(nm);
+
+        // While Alive: key is weak — the mark pass skips it.
+        let mut seen: Vec<u64> = Vec::new();
+        vm.code_table.oops_do(false, &mut |w| seen.push(*w));
+        assert_eq!(seen, vec![0x1111], "Alive: key_klass weak (mark skips it)");
+
+        // After make-not-entrant: key is STRONG — the mark pass visits it.
+        vm.code_table.set_not_entrant(id);
+        seen.clear();
+        vm.code_table.oops_do(false, &mut |w| seen.push(*w));
+        seen.sort();
+        assert_eq!(
+            seen,
+            vec![0x1111, 0x2222],
+            "NotEntrant: key_klass strong (mark pass MUST visit it)"
+        );
+    }
+
+    /// S13 §2a: `set_not_entrant` flips state + unhooks from `by_key` (so new
+    /// sends miss + re-resolve), but RETAINS the record (`get`) and the
+    /// address map (`find_by_pc`) so an in-flight frame that traps or is walked
+    /// still resolves its nmethod.
+    #[test]
+    fn set_not_entrant_unhooks_by_key_retains_record() {
+        let mut vm = test_vm();
+        let klass = vm.universe.array_klass;
+        let sel = vm.universe.intern(b"notEntrantInvariants");
+        let h = vm.code_cache.alloc(32).expect("alloc");
+        vm.code_cache.publish(
+            h,
+            &CodeBlob {
+                code: vec![0u8; 32],
+                literal_off: 8,
+                relocs: Vec::new(),
+                listing: Vec::new(),
+            },
+        );
+        let nm = fake_nmethod(klass, sel, h.base as usize, h.len);
+        let id = vm.code_table.install(nm);
+        let pc = h.base as u64 + 4; // an address inside the code
+
+        assert_eq!(
+            vm.code_table.lookup(klass, sel),
+            Some(id),
+            "installed → lookup"
+        );
+        vm.code_table.set_not_entrant(id);
+        assert!(
+            matches!(vm.code_table.get(id).unwrap().state, NmState::NotEntrant),
+            "state → NotEntrant"
+        );
+        assert_eq!(
+            vm.code_table.lookup(klass, sel),
+            None,
+            "unhooked from by_key → a fresh send misses + re-resolves"
+        );
+        assert!(
+            vm.code_table.get(id).is_some(),
+            "record retained (get by id still works)"
+        );
+        assert_eq!(
+            vm.code_table.find_by_pc(pc),
+            Some(id),
+            "by_addr retained (find_by_pc) → an in-flight/trapping frame still resolves"
         );
     }
 
