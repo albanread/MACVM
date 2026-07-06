@@ -205,16 +205,23 @@ ports; the benchmarks' own 4-mode gates stay red until these are fixed):
        source of an out-of-bounds write corrupting an adjacent object);
        `runtime::deopt`'s `materialize_closure`/`materialize_context`
        (klass set atomically as part of `alloc_closure`/`alloc_context`,
-       values read into handles before any allocation).
-     - NOT yet ruled out / not yet checked: the JIT's own inline
-       allocation fast path (`compiler::emit`'s `emit_alloc`, S11 D7/step
-       8 — hand-written arm64, a plausible place for a hand-rolled
-       off-by-one, though it is only used for `Ir::Alloc`'s fixed-size
-       case, not the variable-sized `String new:` this specific crash's
-       own backtrace involves — worth checking anyway since OTHER
-       allocations earlier in the same run could be the ones actually
-       corrupted); whatever specific world-level method builds a
-       `printString` result digit-by-digit (a loop-bound off-by-one
+       values read into handles before any allocation); the JIT's own
+       inline allocation fast path (`compiler::emit`'s `emit_alloc`, S11
+       D7/step 8 — traced every offset and register through the fast path:
+       `x19` briefly holds the object's own start address, gets clobbered
+       loading eden_end for the bounds compare, then is exactly recomputed
+       as `new_top - size_bytes` before the header/body writes, which is
+       arithmetically exact, not an approximation; the header writes land
+       at offsets 0/`WORD_SIZE` as expected, and the nil-init loop's own
+       bound (`body_words = size_words - HEADER_WORDS`, offsets
+       `HEADER_WORDS..size_words`) covers the body exactly with no
+       off-by-one in either direction. Still only used for `Ir::Alloc`'s
+       fixed-size case, not the variable-sized `String new:` this crash's
+       own backtrace involves, so ruling it out doesn't rule out an EARLIER
+       allocation via this path being the one actually corrupted by
+       something else — it just means this code itself isn't the bug).
+     - NOT yet ruled out / not yet checked: whatever specific world-level
+       method builds a `printString` result digit-by-digit (a loop-bound off-by-one
        there, writing one byte past the allocated string's own end, would
        produce exactly this symptom — corrupting the NEXT object's own
        header — but this would be a `world/*.mst` library bug, not a VM
