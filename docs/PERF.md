@@ -160,3 +160,26 @@ complete under any JIT threshold at all.
 - Also known, pre-existing (stash-bisected, not from these fixes): the
   BUG D repro fails under `MACVM_GC_STRESS=1` + `threshold=1`
   (`doesNotUnderstand: size`), while passing under `MACVM_DEOPT_STRESS`.
+
+## 2026-07-06 regression A/B: the f62a1e4 fixes are perf-neutral
+
+Question asked and answered with a true A/B (release builds of HEAD vs
+d65d1dd — the commit immediately before the fixes — same machine, runs
+interleaved): did the root-cause-4 fixes cost performance?
+
+| Benchmark | Mode | pre-fix (d65d1dd) | post-fix (HEAD) |
+|---|---|---|---|
+| arith | off / t=1 / t=1000 | 1253 / 6 / 9 ms | 1262 / 6 / 9 ms |
+| dispatch | off / t=1 / t=1000 | 1844 / 26 / 11 ms | 1838 / 26 / 11 ms |
+| sieve | off | 85 ms | 85 ms |
+| sieve | t=1 / t=1000 | **SIGSEGV (exit 139)** | 84 / 85 ms, correct |
+| richards | off / t=1 | 204 / DNU abort | 205 / 194 ms correct |
+| deltablue | off / t=1 | 209 / 119 ms | 209 / 120 ms |
+
+Identical to the millisecond on every benchmark that ran before — which
+also directly measures the only hot-path cost the fixes added (the two
+extra register-pair spills per runtime-stub call: no observable effect).
+And the A/B surfaced something the record didn't yet know: the PRE-fix
+build SIGSEGVs on sieve under BOTH JIT thresholds in release — the OSR
+uninitialized-slot bug again, cured by the same fix. Net: nothing slower,
+two benchmarks (sieve JIT, richards t=1) went from crashing to correct.
