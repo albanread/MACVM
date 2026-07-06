@@ -72,6 +72,17 @@ pub(crate) fn try_primitive(vm: &mut VmState, m: MethodOop, argc: u8) -> Primiti
     if prim_id == 0 {
         return PrimitiveOutcome::Fallthrough;
     }
+    // S20 step 4: `PRIM_ID_FFI` (-1) is a distinct sentinel, not a real
+    // `PRIMITIVES` table entry — casting it `as u16` below would wrap to
+    // 65535 and either miss the table entirely (a spurious panic) or, worse,
+    // alias whatever real entry happens to sit at index 65535. Intercept it
+    // here, before the generic `prim_by_id` lookup, and hand the whole
+    // dispatch to `runtime::ffi` — the FFI descriptor (`m.literals()`, S20
+    // step 3) carries its own variable-arity argument shape that the
+    // table's fixed colon-counted-argc model was never built to represent.
+    if prim_id == crate::oops::layout::PRIM_ID_FFI {
+        return crate::runtime::ffi::dispatch_ffi_primitive(vm, m, argc);
+    }
 
     // `m` is held across this allocation-capable step (a `can_allocate`
     // primitive) purely for the `Fail` arm's own debug_assert below —

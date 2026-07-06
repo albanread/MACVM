@@ -1,0 +1,570 @@
+//! S20 step 4 (docs/FFI.md §5): the runtime primitive behind a compiled
+//! `<primitive: FFI …>` pragma (S20 step 3, `frontend::codegen::
+//! build_ffi_descriptor`) — resolves the native symbol, marshals the real
+//! Smalltalk call arguments into AAPCS64 register words, calls through the
+//! shape-keyed trampolines (S20 step 2, `codecache::ffi_stubs`), and
+//! unmarshals the result back into an `Oop`.
+//!
+//! Reached from `interpreter::send::try_primitive`, which intercepts
+//! `MethodOop::primitive() == PRIM_ID_FFI` BEFORE its generic
+//! `prim_by_id` lookup — that lookup casts a numbered primitive id `as
+//! u16` to index `primitives::PRIMITIVES`, and `PRIM_ID_FFI` (`-1i64`)
+//! would wrap to `65535` under that cast, silently aliasing whatever real
+//! entry (if any) happens to sit at that index instead of ever reaching
+//! this module. `try_primitive`'s own doc comment and this module's entry
+//! point, [`dispatch_ffi_primitive`], are the two halves of that
+//! interception.
+//!
+//! Compiled (tier-1 JIT) code can never reach an FFI method in the first
+//! place: `compiler::driver::eligibility_detail` rejects any method whose
+//! `primitive() != 0` (`driver.rs`'s `NoPermanent` arm), and `PRIM_ID_FFI`
+//! satisfies that inequality exactly like any real numbered primitive
+//! would — FFI methods are permanently interpreter-only, so this module
+//! never needs to think about a compiled call site, an oop-map, or a GC
+//! safepoint mid-call.
+//!
+//! Error-handling policy, spelled out once here rather than re-litigated
+//! at each call site below: this function draws a hard line between two
+//! completely different kinds of "this didn't work" —
+//!   - **Bad Smalltalk-level data** (wrong argument type, an arity
+//!     mismatch between the compiled call site and the descriptor's own
+//!     `args` array) is exactly the kind of thing a hand-authored or
+//!     buggy pragma can trigger, and every other primitive in this
+//!     codebase (`runtime::primitives`) treats that class of problem as
+//!     `PrimitiveOutcome::Fallthrough` — never a Rust panic. This module
+//!     follows the same convention.
+//!   - **Missing runtime/feature support** (an ABI shape token with no
+//!     trampoline yet, Tier 2 Cocoa dispatch, a symbol that fails to
+//!     resolve for a `ffi_gen`-generated binding) is "a well-formed,
+//!     correctly-compiled program reached a path with no runtime support
+//!     behind it yet" — the same class of situation `try_primitive`
+//!     itself already `panic!`s on for an unknown primitive id. This
+//!     module panics for exactly that class too, with a message naming
+//!     the missing piece, rather than silently `Fallthrough`ing (which,
+//!     for an FFI pragma whose generated method body is otherwise EMPTY,
+//!     would return the receiver and look exactly like quiet success).
+
+use crate::interpreter::send::PrimitiveOutcome;
+use crate::memory::alloc;
+use crate::oops::layout::{SMI_MAX, SMI_MIN};
+use crate::oops::smi::SmallInt;
+use crate::oops::wrappers::{ArrayOop, DoubleOop, MethodOop, SymbolOop};
+use crate::oops::Oop;
+use crate::runtime::vm_state::VmState;
+
+/// The 6 fixed descriptor slot indices (`build_ffi_descriptor`'s own doc,
+/// `frontend/codegen.rs`) — named here so this module never has a bare
+/// `desc.at(4)` whose meaning depends on remembering the layout by heart.
+const DESC_KIND: usize = 0;
+const DESC_NAME: usize = 1;
+// `DESC_CLASS` (2) and `DESC_CLASS_SIDE` (3) are Tier 2-only (ObjC class
+// name + classSide flag) — Tier 1 dispatch never reads either, per this
+// step's own brief.
+const DESC_RET: usize = 4;
+const DESC_ARGS: usize = 5;
+
+/// S20 step 4's entry point, called directly from `interpreter::send::
+/// try_primitive` once it has recognized `m.primitive() == PRIM_ID_FFI`.
+/// `argc` is the method's real declared arity (`MethodOop::argc()`'s own
+/// value, threaded down from the send site exactly like every other
+/// primitive receives it) — used both to size the read off `vm.stack` and
+/// to cross-check the descriptor's own `args` array length below.
+///
+/// GC-safety note, load-bearing enough to spell out explicitly (contrast:
+/// `build_ffi_descriptor` in `codegen.rs` needed real `HandleScope`
+/// protection because it built and returned fresh oops WHILE holding
+/// other newly-made oops live across further allocation). This function
+/// never does that: every oop it ever touches — the descriptor's own
+/// Symbols (`kind`/`name`/`ret`/each `args` element), the receiver and
+/// argument oops read off `vm.stack` — is converted to an owned, plain
+/// Rust value (`String`, `i64`, `f64`, `u64`) and then DROPPED, well
+/// before the one and only allocating step in this whole function (`ret
+/// == "f"`'s `alloc::alloc_double` call, right at the very end). By the
+/// time that allocation can run, nothing oop-typed from earlier in this
+/// function is still alive in a local for a scavenge to invalidate —
+/// there is nothing here for a `HandleScope` to protect.
+pub(crate) fn dispatch_ffi_primitive(vm: &mut VmState, m: MethodOop, argc: u8) -> PrimitiveOutcome {
+    let desc = m.literals();
+
+    let kind = sym_text(desc.at(DESC_KIND));
+    if kind != "function" {
+        // Tier 2 (`kind == "selector"`, ObjC message dispatch) has no
+        // runtime support yet (S20 step 7) — and unlike a genuinely bad
+        // argument, a Tier-2 pragma's generated method body is EMPTY
+        // besides the pragma itself, so a silent `Fallthrough` here would
+        // return the receiver and look exactly like the send succeeded
+        // while doing nothing whatsoever. Loud failure, naming why.
+        panic!(
+            "runtime::ffi::dispatch_ffi_primitive: Tier 2 FFI dispatch (kind {kind:?}, selector \
+             {name:?}) isn't implemented yet — S20 step 7",
+            name = sym_text(desc.at(DESC_NAME)),
+        );
+    }
+    let name = sym_text(desc.at(DESC_NAME));
+
+    let ret_tok = sym_text(desc.at(DESC_RET));
+    let ret_class = match ret_tok.as_str() {
+        "g" => crate::codecache::ffi_stubs::FfiRetClass::G,
+        "f" => crate::codecache::ffi_stubs::FfiRetClass::F,
+        "v" => crate::codecache::ffi_stubs::FfiRetClass::V,
+        other => panic!(
+            "runtime::ffi::dispatch_ffi_primitive: unsupported FFI return-shape token {other:?} \
+             for function {name:?} — only \"g\"/\"f\"/\"v\" have a trampoline \
+             (codecache/ffi_stubs.rs's FfiRetClass); struct/HFA return shapes (h2/h3/h4/i1/i2/b/s) \
+             are Tier 2/deferred territory (docs/FFI.md §3)"
+        ),
+    };
+
+    let args_desc = ArrayOop::try_from(desc.at(DESC_ARGS))
+        .expect("runtime::ffi::dispatch_ffi_primitive: descriptor's args slot must be an Array");
+    let argc_usize = argc as usize;
+    if args_desc.len() != argc_usize {
+        // A hand-authored (or otherwise miscompiled) pragma whose declared
+        // arg-token list doesn't match the method's own real arity — a
+        // user-triggerable data problem, not a "feature doesn't exist"
+        // one. Same convention as a bad argument type below: Fallthrough,
+        // never a panic.
+        return PrimitiveOutcome::Fallthrough;
+    }
+
+    // Read the real call arguments directly off `vm.stack` — deliberately
+    // NOT `try_primitive`'s own shared 6-element `buf` (too small for an
+    // FFI call's own arity: docs/FFI.md §6.3's `mmap` example alone is
+    // argc=6, needing 7 slots including the receiver, and this brief's own
+    // scope cut keeps that shared hot-path buffer untouched). Index 0 is
+    // the receiver — for a Tier 1 `#function` call there is no meaningful
+    // receiver to marshal (the example's `FFIPosix class` receiver is
+    // never touched by the native call), so it's simply skipped; indices
+    // `1..=argc` are the real arguments, in declared order.
+    let base = vm.stack.sp - argc_usize - 1;
+
+    let mut argv_g = [0u64; 8];
+    let mut argv_f = [0u64; 8];
+    let mut next_g = 0usize;
+    let mut next_f = 0usize;
+    for i in 0..argc_usize {
+        let arg_oop = vm.stack.get(base + 1 + i);
+        let tok = sym_text(args_desc.at(i));
+        match tok.as_str() {
+            "g" => {
+                let Some(word) = marshal_g(arg_oop) else {
+                    // Wrong Smalltalk-level argument type (not a
+                    // SmallInt) — a genuine calling error a Smalltalk
+                    // caller could trigger, same convention as every
+                    // other primitive's own argument-tag validation.
+                    return PrimitiveOutcome::Fallthrough;
+                };
+                if next_g >= argv_g.len() {
+                    // More than 8 "g"-class arguments — no trampoline
+                    // slot left (ffi_stubs.rs's own fixed 8-GPR-slot
+                    // AAPCS64 contract). MethodOop's argc field is only
+                    // 4 bits wide (METHOD_ARGC_MAX = 15, oops/layout.rs),
+                    // so a hand-authored pragma naming 9+ same-class
+                    // args is syntactically reachable from ordinary
+                    // Smalltalk source (a long keyword selector) — an
+                    // oversized call shape, not "can't happen": treated
+                    // the same as any other bad/oversized call shape,
+                    // Fallthrough rather than an out-of-bounds panic.
+                    return PrimitiveOutcome::Fallthrough;
+                }
+                argv_g[next_g] = word;
+                next_g += 1;
+            }
+            "f" => {
+                let Some(word) = marshal_f(arg_oop) else {
+                    return PrimitiveOutcome::Fallthrough;
+                };
+                if next_f >= argv_f.len() {
+                    // Same reasoning as the "g" arm above, for the FPR
+                    // register file.
+                    return PrimitiveOutcome::Fallthrough;
+                }
+                argv_f[next_f] = word;
+                next_f += 1;
+            }
+            other => panic!(
+                "runtime::ffi::dispatch_ffi_primitive: unsupported FFI argument-shape token \
+                 {other:?} (arg #{i} of function {name:?}) — only \"g\"/\"f\" have a marshaling \
+                 path today; struct/HFA argument shapes are Tier 2/deferred territory \
+                 (docs/FFI.md §3)"
+            ),
+        }
+    }
+
+    // Resolve fresh on EVERY call — a deliberate, documented scope cut for
+    // a later performance pass (a per-descriptor resolved-address cache),
+    // not an oversight: this step's brief is "make the pragma callable at
+    // all", and `dlsym` against the process-global namespace (`RTLD_
+    // DEFAULT`, via `lib: None`) is correct and cheap enough for now.
+    let target =
+        crate::vendor::wfasm::native_macos::dlsym_resolve(None, &name).unwrap_or_else(|| {
+            // A `ffi_gen`-generated binding names only functions verified
+            // to exist in the real ABI database (docs/FFI.md) — resolution
+            // failing here means the process environment itself is wrong
+            // (missing library, stripped symbol), not a Smalltalk-level
+            // data problem. Loud failure, naming the symbol.
+            panic!(
+                "runtime::ffi::dispatch_ffi_primitive: dlsym_resolve found no symbol named \
+                 {name:?} in the process-global namespace (RTLD_DEFAULT) — a ffi_gen-generated \
+                 binding should never name a function that doesn't exist in this process"
+            )
+        });
+
+    let result = vm.ffi_stubs.invoke(ret_class, target, &argv_g, &argv_f);
+
+    match ret_class {
+        crate::codecache::ffi_stubs::FfiRetClass::V => {
+            // `ret_v` callers ignore the trampoline's raw `u64` entirely
+            // (`ffi_stubs.rs`'s own doc) — the callee's C return type is
+            // void, there is no value to unmarshal.
+            PrimitiveOutcome::Result(vm.universe.nil_obj)
+        }
+        crate::codecache::ffi_stubs::FfiRetClass::G => {
+            let signed = result as i64;
+            if !(SMI_MIN..=SMI_MAX).contains(&signed) {
+                // On real macOS/arm64 (48-bit-or-smaller user virtual
+                // address space) every real POSIX return value — pointers,
+                // fds, error sentinels like -1 — always fits an SMI's
+                // 61-bit magnitude; this is not expected to ever fire for
+                // a real call. There is no BigInt/LargeInteger oop wrapper
+                // anywhere in this codebase yet (only an AST-level
+                // `Literal::BigInt` exists, no runtime oop), so there is
+                // no graceful fallback available — and silently truncating
+                // would corrupt a real returned pointer/value far worse
+                // than a loud crash. Internal invariant violation, not
+                // user-recoverable Smalltalk-level data: panic, don't
+                // truncate.
+                panic!(
+                    "runtime::ffi::dispatch_ffi_primitive: function {name:?}'s \"g\" return \
+                     value {signed} overflows SmallInt's range ({SMI_MIN}..={SMI_MAX}) — no \
+                     BigInt/LargeInteger oop exists yet to fall back to"
+                );
+            }
+            PrimitiveOutcome::Result(SmallInt::new(signed).oop())
+        }
+        crate::codecache::ffi_stubs::FfiRetClass::F => {
+            let v = f64::from_bits(result);
+            let d = alloc::alloc_double(vm, v);
+            PrimitiveOutcome::Result(d.oop())
+        }
+    }
+}
+
+/// Marshal one `"g"`-class (integer/pointer) Smalltalk argument to its raw
+/// register word. `None` means `arg` wasn't a SmallInt — a genuine
+/// Smalltalk-level calling-convention violation, handled by the caller as
+/// `PrimitiveOutcome::Fallthrough`, never a panic (this codebase's
+/// established convention: every primitive validates its own argument
+/// tags, per `runtime::primitives`).
+fn marshal_g(arg: Oop) -> Option<u64> {
+    SmallInt::try_from(arg).map(|smi| smi.value() as u64)
+}
+
+/// Marshal one `"f"`-class (double) Smalltalk argument to its raw FPR
+/// register word — a bit-reinterpret via `f64::to_bits`, matching
+/// `ffi_stubs.rs`'s own doc that `argv_f[i]` holds `f64::to_bits()`, never
+/// a numeric cast. `None` means `arg` wasn't a Double, same Fallthrough
+/// convention as [`marshal_g`].
+fn marshal_f(arg: Oop) -> Option<u64> {
+    DoubleOop::try_from(arg).map(|d| d.value().to_bits())
+}
+
+/// Small shared helper: a descriptor slot (or an `args` array element) is
+/// always a Symbol (`build_ffi_descriptor`'s own fixed shape) — extract
+/// its text once, in one place, rather than repeating the
+/// `SymbolOop::try_from(...).expect(...).as_string()` idiom at every call
+/// site (the same idiom `codegen.rs`'s own `sym_str` test helper uses).
+fn sym_text(o: Oop) -> String {
+    SymbolOop::try_from(o)
+        .expect("runtime::ffi: expected a Symbol oop in the FFI descriptor")
+        .as_string()
+}
+
+#[cfg(test)]
+// This test module only (not `dispatch_ffi_primitive` or its helpers
+// above, which contain no `unsafe` at all): the `getpid` cross-check test
+// below needs a raw `extern "C"` call to compare against, exactly the
+// same one-off need `codecache::ffi_stubs`'s own `getpid` test and
+// `vendor::wfasm::native_macos`'s own `dlsym_resolve` test already have —
+// mirrors `runtime::frames`'s own module-scoped `#![allow(unsafe_code)]`
+// boundary rationale (a real native call/read has no safe-Rust
+// equivalent), just narrowed to `#[cfg(test)]` since production code here
+// never needs it.
+#[allow(unsafe_code)]
+mod tests {
+    use super::*;
+    use crate::frontend::ast::TopItem;
+    use crate::frontend::codegen::compile_method;
+    use crate::frontend::parser::parse_file;
+    use crate::interpreter::run_method;
+    use crate::oops::wrappers::KlassOop;
+    use crate::runtime::vm_state::VmOptions;
+
+    fn test_vm() -> VmState {
+        VmState::with_options(VmOptions {
+            heap_mib: 64,
+            trace: Default::default(),
+            gc_stress: false,
+            gc_stress_full_period: None,
+            eden_kb: None,
+            jit: crate::runtime::JitMode::Off,
+        })
+    }
+
+    /// Exactly `codegen.rs`'s own test-module pattern (`test_klass`) — a
+    /// fresh, empty `Object` subclass to hang a single method off of.
+    fn test_klass(vm: &mut VmState, name: &str) -> KlassOop {
+        let object_klass = vm.universe.object_klass;
+        vm.universe.new_klass(
+            object_klass,
+            name,
+            crate::oops::Format::Slots,
+            false,
+            crate::oops::layout::HEADER_WORDS,
+        )
+    }
+
+    /// Exactly `codegen.rs`'s own test-module pattern (`first_method_of`) —
+    /// parse a one-method class body and pull out its `MethodNode`.
+    fn first_method_of(src: &str) -> crate::frontend::ast::MethodNode {
+        let items = parse_file(src).expect("parse");
+        let TopItem::ClassDef(c) = items.into_iter().next().unwrap() else {
+            panic!("expected a class def")
+        };
+        c.methods.into_iter().next().expect("expected a method")
+    }
+
+    /// Compile `src`'s first (and only) method on a fresh test klass named
+    /// `klass_name`, then actually RUN it through the real interpreter
+    /// send/primitive path (`interpreter::run_method`, the same "compile
+    /// then execute and read back the result" helper `codegen.rs`'s own
+    /// `run_top` uses for a bare doIt) with `recv`/`args` as the real
+    /// call — end to end from source text through `try_primitive`'s new
+    /// `PRIM_ID_FFI` interception into this module.
+    fn compile_and_run(
+        vm: &mut VmState,
+        klass_name: &str,
+        src: &str,
+        recv: Oop,
+        args: &[Oop],
+    ) -> Oop {
+        let klass = test_klass(vm, klass_name);
+        let mut method = first_method_of(src);
+        let m = compile_method(vm, klass, false, &mut method).expect("compile");
+        run_method(vm, m, recv, args)
+    }
+
+    /// Zero-arg, `ret: #g`, a real libc function — the simplest possible
+    /// end-to-end round trip through `dispatch_ffi_primitive`, proving
+    /// symbol resolution + the `ret_g` trampoline + SMI unmarshaling all
+    /// work together against a REAL system call (this sprint's own
+    /// established convention: no mocks — see `ffi_stubs.rs`'s own
+    /// `getpid` test).
+    #[test]
+    fn ffi_getpid_zero_args_ret_g_matches_real_getpid() {
+        extern "C" {
+            fn getpid() -> i32;
+        }
+        let mut vm = test_vm();
+        let nil = vm.universe.nil_obj;
+        let result = compile_and_run(
+            &mut vm,
+            "FFIGetpid",
+            "Object subclass: FFIGetpid [ \
+                getpid [ <primitive: FFI function: #getpid ret: #g args: #()> ] \
+            ]",
+            nil,
+            &[],
+        );
+        let want = unsafe { getpid() } as i64;
+        let got = SmallInt::try_from(result)
+            .expect("expected a SmallInt result")
+            .value();
+        assert_eq!(got, want);
+    }
+
+    /// One `g`-class argument, exercising the real GPR marshal path
+    /// (`marshal_g` -> `argv_g[0]`) — `llabs(-5) == 5`, a real libc call,
+    /// not a test double.
+    #[test]
+    fn ffi_llabs_one_g_arg_marshals_gpr_correctly() {
+        let mut vm = test_vm();
+        let nil = vm.universe.nil_obj;
+        let arg = SmallInt::new(-5).oop();
+        let result = compile_and_run(
+            &mut vm,
+            "FFILlabs",
+            "Object subclass: FFILlabs [ \
+                llabsOf: n [ <primitive: FFI function: #llabs ret: #g args: #(g)> ] \
+            ]",
+            nil,
+            &[arg],
+        );
+        let got = SmallInt::try_from(result)
+            .expect("expected a SmallInt result")
+            .value();
+        assert_eq!(got, 5);
+    }
+
+    /// One `f`-class argument AND `f`-class return in the SAME call —
+    /// exercises the FPR marshal path (`marshal_f` -> `argv_f[0]`) end to
+    /// end, including the allocating `ret == "f"` unmarshal step
+    /// (`alloc::alloc_double`). `fabs(-3.5) == 3.5`, a real libc call.
+    #[test]
+    fn ffi_fabs_one_f_arg_ret_f_marshals_fpr_correctly() {
+        let mut vm = test_vm();
+        let nil = vm.universe.nil_obj;
+        let arg = alloc::alloc_double(&mut vm, -3.5).oop();
+        let result = compile_and_run(
+            &mut vm,
+            "FFIFabs",
+            "Object subclass: FFIFabs [ \
+                fabsOf: x [ <primitive: FFI function: #fabs ret: #f args: #(f)> ] \
+            ]",
+            nil,
+            &[arg],
+        );
+        let got = DoubleOop::try_from(result)
+            .expect("expected a Double result")
+            .value();
+        assert_eq!(got, 3.5);
+    }
+
+    /// Negative test: the descriptor's own `args` array length doesn't
+    /// match the method's real declared arity — a hand-authored-pragma
+    /// bug (user-writable, not "can't happen"), so this must fall
+    /// through cleanly rather than panicking. Built directly against
+    /// `dispatch_ffi_primitive` (not through a compiled pragma, since the
+    /// real frontend/parser always keeps `args` and the param list in
+    /// sync by construction) by hand-assembling a mismatched descriptor
+    /// onto an otherwise-ordinary one-argument method.
+    #[test]
+    fn ffi_args_arity_mismatch_falls_through_not_panics() {
+        let mut vm = test_vm();
+        let klass = test_klass(&mut vm, "FFIArityMismatch");
+        // A real 1-arg method (`llabs ret: #g args: #(g)`) compiled
+        // normally, then its descriptor's `args` array is overwritten
+        // in-place with a 2-element one — a length that no longer
+        // matches the method's own (still 1) `argc()`.
+        let mut method = first_method_of(
+            "Object subclass: FFIArityMismatch [ \
+                llabsOf: n [ <primitive: FFI function: #llabs ret: #g args: #(g)> ] \
+            ]",
+        );
+        let m = compile_method(&mut vm, klass, false, &mut method).expect("compile");
+        assert_eq!(m.argc(), 1);
+        let desc = m.literals();
+        let g_sym = vm.universe.intern(b"g").oop();
+        let array_klass = vm.universe.array_klass;
+        let mismatched_args = alloc::alloc_indexable_oops(&mut vm, array_klass, 2);
+        mismatched_args.at_put(0, g_sym);
+        mismatched_args.at_put(1, g_sym);
+        desc.at_put(DESC_ARGS, mismatched_args.oop());
+
+        // Calling `dispatch_ffi_primitive` directly (not through
+        // `run_method`, which drives the FULL `try_primitive` dispatch)
+        // means the stack must be primed exactly as `try_primitive` itself
+        // would have left it before handing off: receiver, then the real
+        // arguments, `vm.stack.sp` sitting just past the last one.
+        let nil = vm.universe.nil_obj;
+        let arg = SmallInt::new(-5).oop();
+        vm.stack.push(nil);
+        vm.stack.push(arg);
+
+        let outcome = dispatch_ffi_primitive(&mut vm, m, 1);
+        match outcome {
+            PrimitiveOutcome::Fallthrough => {}
+            _ => panic!("expected Fallthrough on an args-arity mismatch"),
+        }
+    }
+
+    /// Adversarial-review finding (S20 step 4): `MethodOop`'s own `argc`
+    /// field is 4 bits wide (`METHOD_ARGC_MAX` = 15, `oops/layout.rs`), so
+    /// a hand-authored pragma can syntactically declare more than 8
+    /// same-class arguments (a real 9-keyword selector), overrunning
+    /// `argv_g`'s fixed 8 slots — an out-of-bounds array write that Rust
+    /// bounds-checks into a hard panic/crash in both debug and release, not
+    /// silent corruption, but still reachable from ordinary, in-range,
+    /// user-writable Smalltalk source with no VM-internal misuse needed.
+    /// Must fall through cleanly instead, same as any other oversized/bad
+    /// call shape.
+    #[test]
+    fn ffi_more_than_eight_same_class_args_falls_through_not_panics() {
+        let mut vm = test_vm();
+        let klass = test_klass(&mut vm, "FFITooManyGArgs");
+        let mut method = first_method_of(
+            "Object subclass: FFITooManyGArgs [ \
+                a: p1 b: p2 c: p3 d: p4 e: p5 f: p6 g: p7 h: p8 i: p9 [ \
+                    <primitive: FFI function: #foo ret: #g args: #(g g g g g g g g g)> \
+                ] \
+            ]",
+        );
+        let m = compile_method(&mut vm, klass, false, &mut method).expect("compile");
+        assert_eq!(m.argc(), 9);
+        let nil = vm.universe.nil_obj;
+        vm.stack.push(nil);
+        for i in 0..9 {
+            vm.stack.push(SmallInt::new(i).oop());
+        }
+        let outcome = dispatch_ffi_primitive(&mut vm, m, 9);
+        match outcome {
+            PrimitiveOutcome::Fallthrough => {}
+            _ => panic!("expected Fallthrough when more than 8 same-class FFI args are declared"),
+        }
+    }
+
+    /// Unsupported ret-class token (`"h4"`, a struct/HFA return shape with
+    /// no trampoline yet) must panic, naming the token — "feature doesn't
+    /// exist yet", not "bad Smalltalk data".
+    #[test]
+    #[should_panic(expected = "unsupported FFI return-shape token \"h4\"")]
+    fn ffi_unsupported_ret_token_panics() {
+        let mut vm = test_vm();
+        let klass = test_klass(&mut vm, "FFIUnsupportedRet");
+        let mut method = first_method_of(
+            "Object subclass: FFIUnsupportedRet [ \
+                frame [ <primitive: FFI selector: #frame class: #NSView ret: #h4> ] \
+            ]",
+        );
+        // This particular pragma is `kind: #selector` (Tier 2) by
+        // construction (`ret: #h4` only ever shows up on a Tier 2 shape in
+        // practice) — force it to `#function` so the ret-token check (not
+        // the earlier Tier-2 check) is what actually fires, isolating
+        // exactly the panic this test means to name.
+        let m = compile_method(&mut vm, klass, false, &mut method).expect("compile");
+        let desc = m.literals();
+        let function_sym = vm.universe.intern(b"function").oop();
+        desc.at_put(DESC_KIND, function_sym);
+        let nil = vm.universe.nil_obj;
+        let _ = run_method(&mut vm, m, nil, &[]);
+    }
+
+    /// `kind: #selector` (Tier 2 Cocoa dispatch) has no runtime support
+    /// yet (S20 step 7) — must panic, naming why, rather than silently
+    /// `Fallthrough`ing and returning the receiver as if it had succeeded.
+    #[test]
+    #[should_panic(expected = "Tier 2 FFI dispatch")]
+    fn ffi_tier2_selector_kind_panics() {
+        let mut vm = test_vm();
+        let nil = vm.universe.nil_obj;
+        let _ = compile_and_run(
+            &mut vm,
+            "FFITier2",
+            "Object subclass: FFITier2 [ \
+                frame [ <primitive: FFI selector: #frame class: #NSView ret: #h4> ] \
+            ]",
+            nil,
+            &[],
+        );
+    }
+
+    // A `ret: #v` end-to-end `.mst`-level test is deliberately deferred:
+    // there is no side-effect-observable, pointer-free void libc function
+    // to call yet that this test module could verify actually ran (a real
+    // void POSIX function worth calling — e.g. writing through a pointer
+    // argument — needs a byte-array/pointer argument representation, which
+    // is S20 step 5's Alien work, not built yet). `FfiRetClass::V`'s own
+    // unmarshal arm above (`PrimitiveOutcome::Result(vm.universe.nil_obj)`)
+    // is exercised by `ffi_stubs.rs`'s own lower-level `ret_v` trampoline
+    // test in the meantime. Revisit once step 5 lands.
+}

@@ -691,6 +691,18 @@ pub struct VmState {
     /// embed as a pool constant in any method that emits `Ir::Poll`;
     /// `enter_compiled` (S10 step 8) needs `call_stub_entry()`.
     pub stubs: crate::codecache::stubs::Stubs,
+    /// S20 step 2/4: the 3 shape-keyed FFI native-call trampolines
+    /// (`ret_g`/`ret_f`/`ret_v` — `codecache::ffi_stubs::FfiStubs`),
+    /// published into `code_cache` once, here, at boot — the exact same
+    /// unconditional-install shape as `stubs` just above (FFI methods run
+    /// interpreted only, per `compiler::driver::eligible`'s `primitive() !=
+    /// 0` rejection, but the trampolines themselves have nothing to do with
+    /// the JIT: `Stubs`/`DeoptTrampolines` are compiled-code plumbing,
+    /// `FfiStubs` is the interpreter's own gateway to `dlsym`-resolved
+    /// native code, reached from `runtime::ffi::dispatch_ffi_primitive`).
+    /// `derive(Clone, Copy)` (see `FfiStubs`'s own doc) — cheap to store
+    /// and to hand a copy to any caller that needs it, same as `stubs`.
+    pub ffi_stubs: crate::codecache::ffi_stubs::FfiStubs,
     /// S13 step 5: the generated deopt trampolines (the uncommon trampoline
     /// plus the `0xDE02` assert stub), published into `code_cache` alongside
     /// `stubs`, and the process-global SIGTRAP handler that redirects into
@@ -895,6 +907,15 @@ impl VmState {
         let mut code_cache = CodeCache::new(DEFAULT_CODE_CACHE_CAPACITY)
             .expect("VmState::with_options: failed to reserve JIT code cache");
         let stubs = crate::codecache::stubs::install(&mut code_cache);
+        // S20 step 4: publish the 3 FFI trampolines alongside `stubs`, same
+        // unconditional-at-boot install — an FFI method's own eligibility
+        // is unrelated to `options.jit` (it always runs interpreted, per
+        // `compiler::driver::eligible`'s `primitive() != 0` rejection), so
+        // there is no `JitMode::Off` carve-out here the way there is for
+        // `deopt_trampolines` below (those exist purely to service compiled
+        // code; these service `runtime::ffi::dispatch_ffi_primitive`, which
+        // can run in ANY `JitMode`).
+        let ffi_stubs = crate::codecache::ffi_stubs::install(&mut code_cache);
         // S13 step 5: publish the deopt trampolines and arm the SIGTRAP
         // handler — but ONLY with the JIT on. Under `JitMode::Off` nothing is
         // ever compiled, so no deopt `brk` can fire; installing a
@@ -938,6 +959,7 @@ impl VmState {
             pic_table: crate::codecache::pics::PicTable::new(),
             mega_table: crate::codecache::mega::MegaTable::new(),
             stubs,
+            ffi_stubs,
             deopt_trampolines,
             tier_links: Vec::new(),
             compiled_depth: 0,

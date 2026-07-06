@@ -13,6 +13,7 @@ pub mod debug;
 pub mod deopt;
 pub mod deps;
 pub mod error;
+pub mod ffi;
 pub mod frames;
 pub mod globals;
 pub mod lookup;
