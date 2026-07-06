@@ -100,6 +100,18 @@ impl PicTable {
         self.by_handle.remove(&(stub.base as u64));
     }
 
+    /// DBG0 (docs/DEBUGGER.md §4.2 step 1): does `pc` fall inside any live
+    /// PIC stub's code range? Returns the stub's own entry count when so —
+    /// enough for a crash dossier's verdict line to say "PIC stub, N
+    /// entries" instead of "in-cache, unnamed". Linear over live PICs:
+    /// crash-path-only, never hot.
+    pub fn contains_pc(&self, pc: u64) -> Option<usize> {
+        self.by_handle.values().find_map(|d| {
+            let base = d.handle.base as u64;
+            (pc >= base && pc < base + d.handle.len as u64).then_some(d.pairs.len())
+        })
+    }
+
     /// D8-adjacent (pre-S12 bridge): visits every live PIC's own embedded
     /// klass pool words — load-bearing, same reasoning as
     /// `adapters::AdapterTable::oops_do` (a receiver klass compared

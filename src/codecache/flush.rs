@@ -82,6 +82,8 @@ pub fn make_not_entrant_lazy(vm: &mut VmState, id: NmethodId) {
             .expect("make_not_entrant_lazy: id must be installed");
         (nm.code, nm.entry_off, nm.verified_entry_off)
     };
+    vm.probe_ring
+        .push(crate::runtime::vm_state::ProbeEvent::Invalidate { nm: id.0 });
     vm.code_table.set_not_entrant(id); // §2a
     let not_entrant_addr = vm.stubs.not_entrant_addr(); // §2b
     vm.code_cache
@@ -108,6 +110,8 @@ pub fn make_not_entrant(vm: &mut VmState, id: NmethodId) {
     };
 
     // §2a: state → NotEntrant + unhook from by_key (record + by_addr retained).
+    vm.probe_ring
+        .push(crate::runtime::vm_state::ProbeEvent::Invalidate { nm: id.0 });
     vm.code_table.set_not_entrant(id);
 
     // §2b: redirect BOTH entries to the shared not_entrant_stub. Each write is

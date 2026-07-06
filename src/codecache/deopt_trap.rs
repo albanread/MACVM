@@ -30,7 +30,6 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
-#[cfg(test)]
 use crate::compiler::assembler::xr;
 use crate::compiler::assembler::{mem, mem_post, mem_pre, sp, x, Assembler, RelocKind};
 use crate::compiler::jasm_assembler::JasmAssembler;
@@ -121,10 +120,91 @@ static REG_LO: [AtomicU64; REGISTRY_CAP] = [const { AtomicU64::new(0) }; REGISTR
 static REG_HI: [AtomicU64; REGISTRY_CAP] = [const { AtomicU64::new(0) }; REGISTRY_CAP];
 static REG_TRAMP: [AtomicU64; REGISTRY_CAP] = [const { AtomicU64::new(0) }; REGISTRY_CAP];
 static REG_ASSERT: [AtomicU64; REGISTRY_CAP] = [const { AtomicU64::new(0) }; REGISTRY_CAP];
+/// DBG0: the per-cache PROBE trampoline (docs/DEBUGGER.md §4.1) — the fifth
+/// registry column, same publish discipline as the other four.
+static REG_PROBE: [AtomicU64; REGISTRY_CAP] = [const { AtomicU64::new(0) }; REGISTRY_CAP];
 /// High-water mark of slots ever used (the handler scans `0..REG_LEN`; retired
 /// slots within it have `lo == 0` and are skipped / reused).
 static REG_LEN: AtomicUsize = AtomicUsize::new(0);
 static REGISTRY_LOCK: Mutex<()> = Mutex::new(());
+
+// ── DBG0: PROBE's in-handler capture + reentrancy state ──────────────────
+//
+// The register file at the trigger, copied in-handler (plain relaxed atomic
+// stores — async-signal-safe) and read post-sigreturn by `rt_probe_crash`/
+// `rt_compiled_assert_failed`. Layout: [0..29] x0-x28, [29] fp, [30] lr,
+// [31] sp, [32] pc, [33] cpsr, [34] far, [35] signal number.
+const CAP_FP: usize = 29;
+const CAP_LR: usize = 30;
+const CAP_SP: usize = 31;
+const CAP_PC: usize = 32;
+const CAP_CPSR: usize = 33;
+const CAP_FAR: usize = 34;
+const CAP_SIG: usize = 35;
+static CAPTURED: [AtomicU64; 36] = [const { AtomicU64::new(0) }; 36];
+
+/// §4.5's backstop: `true` from the moment a fault is claimed for PROBE
+/// until the process dies. A SECOND fault while the dossier runs (the
+/// dossier itself dereferencing something the validation missed) restores
+/// `SIG_DFL` and dies with the original signal — the per-step-flushed
+/// dossier prefix survives on stderr.
+static PROBE_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+
+/// The dedicated stack `rt_probe_crash` runs on. A SEGV frame's own sp may
+/// be garbage or exhausted; the probe trampoline unconditionally switches
+/// here, which also makes stack-overflow crashes reportable. Never freed —
+/// the dossier ends in exit(70).
+const PROBE_STACK_BYTES: usize = 512 * 1024;
+struct ProbeStack(core::cell::UnsafeCell<[u8; PROBE_STACK_BYTES]>);
+// SAFETY: written only as the machine stack of the single post-crash
+// dossier path (guarded by PROBE_IN_PROGRESS); never concurrently accessed.
+unsafe impl Sync for ProbeStack {}
+static PROBE_STACK: ProbeStack = ProbeStack(core::cell::UnsafeCell::new([0; PROBE_STACK_BYTES]));
+
+/// The alternate SIGNAL stack (sigaltstack) — without it `SA_ONSTACK` is
+/// inert (nothing in the tree ever installed one before DBG0) and a SIGSEGV
+/// from native-stack exhaustion could not deliver at all.
+const ALT_STACK_BYTES: usize = 256 * 1024;
+struct AltStack(core::cell::UnsafeCell<[u8; ALT_STACK_BYTES]>);
+// SAFETY: handed to the kernel via sigaltstack; the kernel serializes use.
+unsafe impl Sync for AltStack {}
+static ALT_STACK: AltStack = AltStack(core::cell::UnsafeCell::new([0; ALT_STACK_BYTES]));
+
+/// In-handler capture of the whole integer register file (+ fault address
+/// and signal number). Relaxed stores: the reader runs strictly after
+/// sigreturn on the same thread.
+///
+/// # Safety
+/// `ss`/`far` come from the kernel-provided ucontext of the CURRENT
+/// delivery.
+unsafe fn capture_regs(ss: &ArmThreadState64, far: u64, sig: i32) {
+    for (slot, &v) in CAPTURED.iter().zip(ss.__x.iter()) {
+        slot.store(v, Ordering::Relaxed);
+    }
+    CAPTURED[CAP_FP].store(ss.__fp, Ordering::Relaxed);
+    CAPTURED[CAP_LR].store(ss.__lr, Ordering::Relaxed);
+    CAPTURED[CAP_SP].store(ss.__sp, Ordering::Relaxed);
+    CAPTURED[CAP_PC].store(ss.__pc, Ordering::Relaxed);
+    CAPTURED[CAP_CPSR].store(ss.__cpsr as u64, Ordering::Relaxed);
+    CAPTURED[CAP_FAR].store(far, Ordering::Relaxed);
+    CAPTURED[CAP_SIG].store(sig as u64, Ordering::Relaxed);
+}
+
+/// The post-sigreturn read of [`capture_regs`]'s snapshot.
+fn read_captured() -> crate::runtime::probe::CapturedRegs {
+    let mut r = crate::runtime::probe::CapturedRegs::default();
+    for (dst, slot) in r.x.iter_mut().zip(CAPTURED.iter()) {
+        *dst = slot.load(Ordering::Relaxed);
+    }
+    r.fp = CAPTURED[CAP_FP].load(Ordering::Relaxed);
+    r.lr = CAPTURED[CAP_LR].load(Ordering::Relaxed);
+    r.sp = CAPTURED[CAP_SP].load(Ordering::Relaxed);
+    r.pc = CAPTURED[CAP_PC].load(Ordering::Relaxed);
+    r.cpsr = CAPTURED[CAP_CPSR].load(Ordering::Relaxed) as u32;
+    r.far = CAPTURED[CAP_FAR].load(Ordering::Relaxed);
+    r.sig = CAPTURED[CAP_SIG].load(Ordering::Relaxed) as i32;
+    r
+}
 
 /// `true` once a SIGTRAP handler has been armed (by the first `install`).
 /// Arming is process-global and idempotent — later caches only add registry
@@ -136,7 +216,7 @@ static HANDLER_ARMED: AtomicBool = AtomicBool::new(false);
 /// cache) before appending; panics only if `REGISTRY_CAP` distinct LIVE caches
 /// coexist (absurd — deregistration on drop keeps this bounded by peak
 /// concurrency, not total caches ever created).
-fn register(lo: u64, hi: u64, tramp: u64, assert: u64) {
+fn register_with_probe(lo: u64, hi: u64, tramp: u64, assert: u64, probe: u64) {
     let _g = REGISTRY_LOCK.lock().unwrap();
     let n = REG_LEN.load(Ordering::Acquire);
     // Prefer an existing same-lo entry (re-install), then any retired slot.
@@ -158,6 +238,7 @@ fn register(lo: u64, hi: u64, tramp: u64, assert: u64) {
     REG_HI[i].store(hi, Ordering::Relaxed);
     REG_TRAMP[i].store(tramp, Ordering::Relaxed);
     REG_ASSERT[i].store(assert, Ordering::Relaxed);
+    REG_PROBE[i].store(probe, Ordering::Relaxed);
     REG_LO[i].store(lo, Ordering::Release);
 }
 
@@ -180,6 +261,12 @@ pub(crate) fn deregister(lo: u64) {
 /// or `None` if `pc` is in no registered cache. Reads `lo` with Acquire (the
 /// publish key) before the rest of the entry.
 fn lookup_pc(pc: u64) -> Option<(u64, u64)> {
+    lookup_pc_full(pc).map(|(t, a, _)| (t, a))
+}
+
+/// Like [`lookup_pc`] but also returns the owning cache's PROBE trampoline
+/// (0 when none was registered — a pre-DBG0 test arm).
+fn lookup_pc_full(pc: u64) -> Option<(u64, u64, u64)> {
     let n = REG_LEN.load(Ordering::Acquire);
     for i in 0..n {
         let lo = REG_LO[i].load(Ordering::Acquire);
@@ -191,6 +278,7 @@ fn lookup_pc(pc: u64) -> Option<(u64, u64)> {
             return Some((
                 REG_TRAMP[i].load(Ordering::Relaxed),
                 REG_ASSERT[i].load(Ordering::Relaxed),
+                REG_PROBE[i].load(Ordering::Relaxed),
             ));
         }
     }
@@ -337,8 +425,13 @@ extern "C" fn sigtrap_handler(_sig: i32, _info: *mut libc::siginfo_t, ctx: *mut 
         };
 
         if imm == TRAP_ASSERT {
-            // (4) Redirect to the assert stub, which panics off-signal.
+            // (4) Redirect to the assert stub, which emits the PROBE
+            // dossier off-signal (DBG0 — previously it panicked). Capture
+            // the register file for the dossier's step 3 and claim the
+            // reentrancy guard: from here on the process is dying.
             if assert != 0 {
+                capture_regs(ss, 0, 0);
+                PROBE_IN_PROGRESS.store(true, Ordering::Release);
                 ss.__x[16] = pc;
                 ss.__pc = assert;
             } else {
@@ -368,13 +461,120 @@ extern "C" fn sigtrap_handler(_sig: i32, _info: *mut libc::siginfo_t, ctx: *mut 
 /// # Safety
 /// Only reached from within [`sigtrap_handler`].
 unsafe fn restore_default_and_return() {
-    let mut sa: libc::sigaction = core::mem::zeroed();
+    unsafe { restore_default_for(libc::SIGTRAP) }
+}
+
+/// The per-signal generalization DBG0's fault handler needs (it serves both
+/// SIGSEGV and SIGBUS).
+///
+/// # Safety
+/// Signal-handler context only.
+unsafe fn restore_default_for(sig: i32) {
+    let mut sa: libc::sigaction = unsafe { core::mem::zeroed() };
     sa.sa_sigaction = libc::SIG_DFL;
     // Best-effort: a failure here cannot be reported from signal context, and
-    // the re-executed brk will still trap (just possibly through this handler
-    // again — which will loop at most until sigaction succeeds; in practice it
-    // never fails for SIG_DFL).
-    let _ = libc::sigaction(libc::SIGTRAP, &sa, core::ptr::null_mut());
+    // the re-executed fault will still arrive (just possibly through this
+    // handler again — which loops at most until sigaction succeeds; in
+    // practice it never fails for SIG_DFL).
+    let _ = unsafe { libc::sigaction(sig, &sa, core::ptr::null_mut()) };
+}
+
+// ── DBG0: the SIGSEGV/SIGBUS handler (docs/DEBUGGER.md §4.1) ─────────────
+
+/// Async-signal-safe verdict line for a FOREIGN fault (pc outside every
+/// registered code cache): raw `write(2)` of a fixed message + hand-rolled
+/// hex — no allocation, no formatting machinery, no locks. "That
+/// classification itself is the first question of every crash triage."
+unsafe fn write_foreign_verdict(sig: i32, pc: u64, far: u64) {
+    fn put(buf: &mut [u8; 128], n: &mut usize, s: &[u8]) {
+        for &b in s {
+            if *n < buf.len() {
+                buf[*n] = b;
+                *n += 1;
+            }
+        }
+    }
+    fn put_hex(buf: &mut [u8; 128], n: &mut usize, v: u64) {
+        put(buf, n, b"0x");
+        let digits = b"0123456789abcdef";
+        let mut started = false;
+        for i in (0..16).rev() {
+            let d = ((v >> (i * 4)) & 0xf) as usize;
+            if d != 0 || started || i == 0 {
+                started = true;
+                put(buf, n, &[digits[d]]);
+            }
+        }
+    }
+    let mut buf = [0u8; 128];
+    let mut n = 0usize;
+    put(
+        &mut buf,
+        &mut n,
+        if sig == libc::SIGBUS {
+            b"MACVM PROBE: SIGBUS pc "
+        } else {
+            b"MACVM PROBE: SIGSEGV pc "
+        },
+    );
+    put_hex(&mut buf, &mut n, pc);
+    put(&mut buf, &mut n, b" far ");
+    put_hex(&mut buf, &mut n, far);
+    put(
+        &mut buf,
+        &mut n,
+        b" FOREIGN (not in any code cache); dying\n",
+    );
+    let _ = unsafe { libc::write(2, buf.as_ptr() as *const core::ffi::c_void, n) };
+}
+
+/// SA_SIGINFO handler for SIGSEGV/SIGBUS (DBG0). Same discipline as
+/// [`sigtrap_handler`]: classify, capture, rewrite `__pc`, and do ALL real
+/// work after sigreturn. Differences: (a) a reentrancy check FIRST — a
+/// fault while a dossier is already in progress means the dossier itself
+/// dereferenced something bad; restore `SIG_DFL` and die, keeping the
+/// per-step-flushed prefix; (b) faults are classified by their pc being
+/// inside a REGISTERED cache — only there is the x28-is-&VmState convention
+/// trustworthy (docs/DEBUGGER.md §4.1); everything else gets the raw-write
+/// verdict line and the default fatal disposition.
+extern "C" fn sig_fault_handler(
+    sig: i32,
+    _info: *mut libc::siginfo_t,
+    ctx: *mut core::ffi::c_void,
+) {
+    // SAFETY: kernel-provided pointers for this delivery; same layout
+    // contract as `sigtrap_handler`.
+    unsafe {
+        if PROBE_IN_PROGRESS.swap(true, Ordering::AcqRel) {
+            restore_default_for(sig);
+            return;
+        }
+        let uc = ctx as *mut Ucontext;
+        if uc.is_null() {
+            restore_default_for(sig);
+            return;
+        }
+        let mc = (*uc).uc_mcontext;
+        if mc.is_null() {
+            restore_default_for(sig);
+            return;
+        }
+        let far = (*mc).__es.__far;
+        let ss = &mut (*mc).__ss;
+        let pc = ss.__pc;
+
+        let probe = match lookup_pc_full(pc) {
+            Some((_, _, probe)) if probe != 0 => probe,
+            _ => {
+                write_foreign_verdict(sig, pc, far);
+                restore_default_for(sig);
+                return;
+            }
+        };
+        capture_regs(ss, far, sig);
+        ss.__x[16] = pc;
+        ss.__pc = probe;
+    }
 }
 
 // ── Trampolines (D4 / D6) generated at startup ────────────────────────────
@@ -491,6 +691,45 @@ fn build_assert_stub() -> crate::compiler::assembler::CodeBlob {
     );
     a.call_far(lit);
     // rt_compiled_assert_failed is `-> !`; this trap is never reached.
+    emit_brk(&mut a, TRAP_ASSERT);
+
+    a.finish()
+}
+
+/// DBG0 (docs/DEBUGGER.md §4.1): the PROBE trampoline SIGSEGV/SIGBUS
+/// redirects resume into. Deliberately NON-destructive — unlike the
+/// uncommon trampoline it touches neither the trapped frame's fp nor its
+/// sp (the crash scene is evidence, and a SEGV sp may itself be garbage or
+/// exhausted): it switches to PROBE's own dedicated static stack, marshals
+/// `x0 = x28` (&VmState — trustworthy because the handler only redirects
+/// registered-range faults) and the trap pc, and calls the `-> !` dossier
+/// entry. The full register file was already captured in-handler.
+///
+/// ```text
+///   mov  x0, x28              // &mut VmState
+///   mov  x1, x16              // trap pc
+///   ldr  x17, <probe_stack_top>
+///   mov  sp, x17              // dedicated, known-good, 16-aligned stack
+///   ldr  x16, <rt_probe_crash>; blr x16   // -> ! (dossier + exit 70)
+///   brk  #0xDE02              // unreachable belt-and-braces
+/// ```
+fn build_probe_trampoline() -> crate::compiler::assembler::CodeBlob {
+    let mut a = JasmAssembler::new();
+
+    a.emit("mov", &[x(0), x(28)]); // vm
+    a.emit("mov", &[x(1), x(16)]); // trap pc
+    let top = {
+        let base = PROBE_STACK.0.get() as u64;
+        (base + PROBE_STACK_BYTES as u64) & !15
+    };
+    let stack_lit = a.literal_u64(top, Some(RelocKind::RuntimeAddr));
+    a.ldr_literal(xr(17), stack_lit);
+    a.emit("mov", &[sp(), x(17)]);
+    let entry_lit = a.literal_u64(
+        rt_probe_crash as *const () as u64,
+        Some(RelocKind::RuntimeAddr),
+    );
+    a.call_far(entry_lit);
     emit_brk(&mut a, TRAP_ASSERT);
 
     a.finish()
@@ -682,21 +921,56 @@ pub unsafe extern "C" fn rt_deopt_on_return(
     result
 }
 
-/// D3 step 4: the off-signal landing for a `0xDE02` compiled-assertion trap —
-/// a compiled-code "should not reach". This is always a VM bug, so it panics
-/// with the trap pc. `-> !`: it never returns to the assert stub.
+/// D3 step 4 (rerouted by DBG0): the off-signal landing for a `0xDE02`
+/// compiled-assertion trap — a compiled-code "should not reach", always a
+/// VM bug. Previously this panicked; now it emits the full PROBE dossier
+/// (docs/DEBUGGER.md §4.2 — the handler captured the register file on the
+/// `TRAP_ASSERT` arm) and exits 70. `-> !`: it never returns to the assert
+/// stub.
 ///
 /// # Safety
 /// Only reached via `blr` from `build_assert_stub`'s listing; `vm` is `x28`.
 /// Never called directly from Rust.
 pub unsafe extern "C" fn rt_compiled_assert_failed(
-    _vm: *mut crate::runtime::vm_state::VmState,
+    vm: *mut crate::runtime::vm_state::VmState,
     trap_pc: u64,
 ) -> ! {
-    panic!(
+    // SAFETY: contract above — x28 is &mut VmState inside compiled code.
+    let vm = unsafe { &mut *vm };
+    let mut regs = read_captured();
+    regs.pc = trap_pc; // belt-and-braces: the capture's pc IS the trap pc
+    eprintln!(
         "compiled-code assertion (brk #0xDE02) at pc {trap_pc:#x} — a 'should not reach' \
          guard fired; this is a VM/compiler bug"
     );
+    // SAFETY: vm is the live VmState per this function's own contract.
+    unsafe { crate::runtime::probe::crash_dossier(vm, &regs, "brk #0xDE02 (compiled assert)") }
+}
+
+/// DBG0: the off-signal landing for a SIGSEGV/SIGBUS whose pc was inside a
+/// registered code cache — reached via `build_probe_trampoline` on PROBE's
+/// own dedicated stack, with the register file already captured in-handler.
+/// Emits the dossier and exits 70.
+///
+/// # Safety
+/// Only reached via `blr` from `build_probe_trampoline`'s listing; `vm` is
+/// `x28` as forwarded by the trampoline (trustworthy: the handler only
+/// redirects registered-range faults, where the call stub's x28 invariant
+/// holds). Never called directly from Rust.
+pub unsafe extern "C" fn rt_probe_crash(
+    vm: *mut crate::runtime::vm_state::VmState,
+    _trap_pc: u64,
+) -> ! {
+    // SAFETY: contract above.
+    let vm = unsafe { &mut *vm };
+    let regs = read_captured();
+    let trigger = if regs.sig == libc::SIGBUS {
+        "SIGBUS (pc in code cache)"
+    } else {
+        "SIGSEGV (pc in code cache)"
+    };
+    // SAFETY: vm is the live VmState per this function's own contract.
+    unsafe { crate::runtime::probe::crash_dossier(vm, &regs, trigger) }
 }
 
 // ── A checked native-stack slot read (layer-boundary helper) ──────────────
@@ -787,25 +1061,52 @@ pub fn install(cache: &mut CodeCache) -> DeoptTrampolines {
         .expect("deopt_trap::install: code cache too small for assert stub");
     cache.publish(ha, &assert_blob);
 
+    let probe_blob = build_probe_trampoline();
+    let hp = cache
+        .alloc(probe_blob.code.len())
+        .expect("deopt_trap::install: code cache too small for probe trampoline");
+    cache.publish(hp, &probe_blob);
+
     // 2. Register this cache's range + trampolines so the handler can map a
     //    trapping pc back to THIS cache (retired by `CodeCache::drop`).
     let (lo, hi) = cache.bounds();
-    register(lo, hi, hu.base as u64, ha.base as u64);
+    register_with_probe(lo, hi, hu.base as u64, ha.base as u64, hp.base as u64);
 
-    // 3. Arm the handler on the first install only (process-global, idempotent).
-    //    SA_SIGINFO for the 3-arg form; SA_ONSTACK so a trap on a nearly-
-    //    exhausted stack still delivers on the alt stack if one is set up.
+    // 3. Arm the handlers on the first install only (process-global,
+    //    idempotent). SA_SIGINFO for the 3-arg form; SA_ONSTACK now actually
+    //    means something — DBG0 installs the sigaltstack below (previously
+    //    none existed anywhere, making the flag inert).
     if !HANDLER_ARMED.swap(true, Ordering::AcqRel) {
-        // SAFETY: `sigtrap_handler` matches the SA_SIGINFO 3-arg ABI; armed
-        // exactly once (the swap above) with a zeroed, fully-initialized
-        // `sigaction`.
+        // SAFETY: both handlers match the SA_SIGINFO 3-arg ABI; armed exactly
+        // once (the swap above) with zeroed, fully-initialized structures.
+        // The sigaltstack buffer is a process-lifetime static.
         unsafe {
+            let mut alt: libc::stack_t = core::mem::zeroed();
+            alt.ss_sp = ALT_STACK.0.get() as *mut core::ffi::c_void;
+            alt.ss_size = ALT_STACK_BYTES;
+            alt.ss_flags = 0;
+            let rc = libc::sigaltstack(&alt, core::ptr::null_mut());
+            assert_eq!(rc, 0, "deopt_trap::install: sigaltstack failed");
+
             let mut sa: libc::sigaction = core::mem::zeroed();
             sa.sa_sigaction = sigtrap_handler as *const () as usize;
             sa.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
             libc::sigemptyset(&mut sa.sa_mask);
             let rc = libc::sigaction(libc::SIGTRAP, &sa, core::ptr::null_mut());
             assert_eq!(rc, 0, "deopt_trap::install: sigaction(SIGTRAP) failed");
+
+            // DBG0: the PROBE fault handlers (docs/DEBUGGER.md §4.1). Armed
+            // with the JIT (interpreter-only runs have no code cache, so
+            // every fault there is foreign-by-definition — the v2 arming
+            // decision recorded in the design doc).
+            let mut sf: libc::sigaction = core::mem::zeroed();
+            sf.sa_sigaction = sig_fault_handler as *const () as usize;
+            sf.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
+            libc::sigemptyset(&mut sf.sa_mask);
+            let rc = libc::sigaction(libc::SIGSEGV, &sf, core::ptr::null_mut());
+            assert_eq!(rc, 0, "deopt_trap::install: sigaction(SIGSEGV) failed");
+            let rc = libc::sigaction(libc::SIGBUS, &sf, core::ptr::null_mut());
+            assert_eq!(rc, 0, "deopt_trap::install: sigaction(SIGBUS) failed");
         }
     }
 
@@ -831,7 +1132,7 @@ pub fn install(cache: &mut CodeCache) -> DeoptTrampolines {
 /// handler. `test_disarm_handler` restores `SIG_DFL` + retires the entry.
 #[cfg(test)]
 unsafe fn test_arm_handler(lo: u64, hi: u64, uncommon_tramp: u64) {
-    register(lo, hi, uncommon_tramp, 0);
+    register_with_probe(lo, hi, uncommon_tramp, 0, 0);
     // SAFETY: same contract as `install`'s sigaction arm.
     unsafe {
         let mut sa: libc::sigaction = core::mem::zeroed();

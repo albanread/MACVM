@@ -12,7 +12,7 @@ use crate::oops::layout::ENTRY_FRAME_SENTINEL;
 use crate::oops::wrappers::{KlassOop, MethodOop, SymbolOop};
 use crate::runtime::vm_state::{TierLink, VmState};
 
-fn name_of(o: crate::oops::Oop) -> String {
+pub(crate) fn name_of(o: crate::oops::Oop) -> String {
     SymbolOop::try_from(o)
         .map(|s| s.as_string())
         .unwrap_or_else(|| "?".to_string())
@@ -109,6 +109,14 @@ pub fn dnu_fallback(vm: &mut VmState, selector: SymbolOop, receiver_klass: Klass
     let _ = writeln!(vm.out, "DNU #{sel_str} (receiver class {klass_name})");
     print_stack_trace(vm);
     let _ = vm.out.flush();
+    // DBG0: the fatal-DNU mini-dossier (docs/DEBUGGER.md §4.1) — the
+    // deviceInAdd:-hunt tool. `MACVM_PROBE=off` opts out.
+    if crate::runtime::probe::guest_report_enabled() {
+        crate::runtime::probe::fatal_guest_report(
+            vm,
+            &format!("DNU #{sel_str} (receiver class {klass_name})"),
+        );
+    }
     std::process::exit(1);
 }
 

@@ -17,6 +17,7 @@ pub mod globals;
 pub mod lookup;
 pub mod osr;
 pub mod primitives;
+pub mod probe;
 pub mod recompile;
 pub mod vm_state;
 

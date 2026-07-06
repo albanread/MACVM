@@ -889,6 +889,8 @@ fn compile_method_full(
     vm.stats.compilations += 1; // S15 A8 tier-balance counter
     let has_osr = nm.osr_map.is_some();
     let id = vm.code_table.install(nm);
+    vm.probe_ring
+        .push(crate::runtime::vm_state::ProbeEvent::Compile { nm: id.0, version });
     if has_osr {
         let sel = crate::oops::wrappers::SymbolOop::try_from(method.selector())
             .expect("a method's selector is always a Symbol");

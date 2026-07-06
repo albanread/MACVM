@@ -302,6 +302,67 @@ pub enum DeoptReason {
     Poll = 2,
 }
 
+/// DBG0 (docs/DEBUGGER.md §4.2 step 9): one recent-history event for the
+/// PROBE crash dossier's ring buffer. `Copy`, and deliberately carries NO
+/// oops (nmethod ids only — the ring is not a GC root; names are resolved
+/// best-effort at dump time). The frozen crash instant tells you *where*;
+/// the ring tells you *what just happened* — on BUG D it was the deopt
+/// trace tail immediately before the failure that localized the culprit
+/// nmethod.
+#[derive(Clone, Copy, Debug)]
+pub enum ProbeEvent {
+    /// A fresh nmethod was published (driver install).
+    Compile { nm: u32, version: u8 },
+    /// A frame deoptimized (materializer M1) at `bci` of nmethod `nm`.
+    Deopt { nm: u32, bci: u32, reexecute: bool },
+    /// An nmethod was made NotEntrant (redefinition/recompile/breakpoint).
+    Invalidate { nm: u32 },
+}
+
+/// Fixed-size overwrite-oldest ring of [`ProbeEvent`]s. Feeds: nmethod
+/// install (driver), `deoptimize_frame` M1, `make_not_entrant{,_lazy}`.
+/// Cost when nothing ever dumps it: one slot store per (already-rare)
+/// compile/deopt/invalidate event.
+pub struct ProbeRing {
+    buf: Vec<Option<ProbeEvent>>,
+    next: usize,
+    /// Total events ever pushed (so the dump can say "showing last N of M").
+    pub total: u64,
+}
+
+impl ProbeRing {
+    const CAP: usize = 256;
+
+    pub fn new() -> ProbeRing {
+        ProbeRing {
+            buf: vec![None; Self::CAP],
+            next: 0,
+            total: 0,
+        }
+    }
+
+    pub fn push(&mut self, e: ProbeEvent) {
+        self.buf[self.next] = Some(e);
+        self.next = (self.next + 1) % Self::CAP;
+        self.total += 1;
+    }
+
+    /// Oldest-first iteration over whatever is retained.
+    pub fn iter_oldest_first(&self) -> impl Iterator<Item = ProbeEvent> + '_ {
+        let n = self.next;
+        self.buf[n..]
+            .iter()
+            .chain(self.buf[..n].iter())
+            .filter_map(|e| *e)
+    }
+}
+
+impl Default for ProbeRing {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Which `MACVM_TRACE` channels are enabled. The channel set is open-ended
 /// (CONVENTIONS §3); S1 only stores membership, nothing reads it yet.
 #[derive(Clone, Default, Debug, PartialEq, Eq)]
@@ -595,6 +656,9 @@ pub struct VmState {
     /// need it, avoiding the env-var-race concern `MACVM_HEAP`/
     /// `MACVM_TRACE` are parsed once for in `VmOptions::from_env`, not here.
     pub dbg_oop: Option<usize>,
+    /// DBG0: the PROBE dossier's recent-history ring (docs/DEBUGGER.md §4.2
+    /// step 9). Holds no oops — see [`ProbeEvent`].
+    pub probe_ring: ProbeRing,
     /// Scoped GC roots for oops held across an allocating call (S7-9, SPEC
     /// §7.6) — see `memory::handles`. Boxed so its address is stable across
     /// this struct moving; `HandleScope` points directly at the box's
@@ -863,6 +927,7 @@ impl VmState {
             stress_rr_cursor: 0,
             next_frame_serial: 0,
             dbg_oop: None,
+            probe_ring: ProbeRing::new(),
             handle_arena: Box::new(crate::memory::handles::HandleArena::new()),
             code_cache,
             code_table: CodeTable::new(),

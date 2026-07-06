@@ -80,6 +80,16 @@ impl MegaTable {
         }
     }
 
+    /// DBG0 (docs/DEBUGGER.md §4.2 step 1): does `pc` fall inside any
+    /// cached mega trampoline's code range? Crash-dossier verdict only —
+    /// linear scan, never hot.
+    pub fn contains_pc(&self, pc: u64) -> bool {
+        self.by_selector.values().any(|m| {
+            let base = m.handle.base as u64;
+            pc >= base && pc < base + m.handle.len as u64
+        })
+    }
+
     /// D4.4's own explicit ask ("rehashed after full GC like CodeTable")
     /// — unlike `AdapterTable`'s deferred key staleness, this one just
     /// reads each entry's OWN pool word back (already kept current by

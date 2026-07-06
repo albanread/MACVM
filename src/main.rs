@@ -36,6 +36,15 @@ fn main() {
     if std::env::args().any(|a| a == "--selftest-dnu-fallback") {
         selftest_dnu_fallback();
     }
+    if std::env::args().any(|a| a == "--selftest-probe-assert") {
+        selftest_probe_crash(ProbeCrashKind::Assert);
+    }
+    if std::env::args().any(|a| a == "--selftest-probe-segv") {
+        selftest_probe_crash(ProbeCrashKind::Segv);
+    }
+    if std::env::args().any(|a| a == "--selftest-probe-foreign") {
+        selftest_probe_foreign();
+    }
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(|s| s.as_str()) {
@@ -288,4 +297,84 @@ fn selftest_dnu_fallback() -> ! {
     let nil = vm.universe.nil_obj;
     let _ = macvm::interpreter::run_method(&mut vm, caller, nil, &[recv]);
     unreachable!("dnu_fallback must have exited the process");
+}
+
+/// DBG0 gates (docs/DEBUGGER.md §6): which planted crash a
+/// `--selftest-probe-*` flag drives through the PROBE dossier machinery.
+enum ProbeCrashKind {
+    /// A hand-published blob whose first instruction is `brk #0xDE02` —
+    /// the compiled-assert trigger.
+    Assert,
+    /// A hand-published blob that loads from address 0 — a SIGSEGV whose
+    /// pc is inside the registered code cache.
+    Segv,
+}
+
+/// Publish a tiny crashing blob into a JIT VM's code cache and invoke it
+/// through the real call stub (which establishes the x28 = &VmState
+/// invariant the PROBE handlers rely on). The dossier exits 70; reaching
+/// the end of this function is the failure mode.
+fn selftest_probe_crash(kind: ProbeCrashKind) -> ! {
+    use macvm::compiler::assembler::{imm, mem, x, Assembler};
+    use macvm::compiler::jasm_assembler::JasmAssembler;
+
+    let mut vm = VmState::with_options(VmOptions {
+        heap_mib: 64,
+        trace: Default::default(),
+        gc_stress: false,
+        gc_stress_full_period: None,
+        eden_kb: None,
+        jit: macvm::runtime::JitMode::Threshold(1),
+    });
+
+    let mut a = JasmAssembler::new();
+    match kind {
+        ProbeCrashKind::Assert => {
+            macvm::codecache::deopt_trap::emit_brk(
+                &mut a,
+                macvm::codecache::deopt_trap::TRAP_ASSERT,
+            );
+        }
+        ProbeCrashKind::Segv => {
+            a.emit("movz", &[x(16), imm(0)]);
+            a.emit("ldr", &[x(0), mem(16, 0)]); // load from address 0 → SIGSEGV
+        }
+    }
+    let blob = a.finish();
+    let h = vm
+        .code_cache
+        .alloc(blob.code.len())
+        .expect("selftest-probe: code cache alloc");
+    vm.code_cache.publish(h, &blob);
+    let entry = h.base as u64;
+    let nil = vm.universe.nil_obj.raw();
+    let stubs = vm.stubs;
+    let _ = stubs.invoke(entry, &mut vm, &[nil]);
+    eprintln!("selftest-probe: crash did not fire (BUG)");
+    std::process::exit(1);
+}
+
+/// A fault whose pc is OUTSIDE every registered code cache — plain Rust
+/// null-page read. PROBE must print only the one-line FOREIGN verdict and
+/// let the default disposition kill the process (killed-by-signal, not
+/// exit 70). The JIT VM exists solely to arm the handlers.
+fn selftest_probe_foreign() -> ! {
+    let vm = VmState::with_options(VmOptions {
+        heap_mib: 64,
+        trace: Default::default(),
+        gc_stress: false,
+        gc_stress_full_period: None,
+        eden_kb: None,
+        jit: macvm::runtime::JitMode::Threshold(1),
+    });
+    let _ = &vm;
+    // SAFETY deliberately violated — this selftest IS the crash. The
+    // address is computed through a volatile read of a runtime value so
+    // neither rustc nor clippy can prove (or lint) the dereference away.
+    unsafe {
+        let addr: usize = std::ptr::read_volatile(&8usize);
+        std::ptr::read_volatile(addr as *const u64);
+    }
+    eprintln!("selftest-probe-foreign: read of address 8 did not fault (BUG)");
+    std::process::exit(1);
 }

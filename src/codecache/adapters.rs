@@ -100,6 +100,16 @@ impl AdapterTable {
             unsafe { f(&mut *addr) };
         }
     }
+
+    /// DBG0 (docs/DEBUGGER.md §4.2 step 1): does `pc` fall inside any
+    /// cached c2i adapter's code range? Crash-dossier verdict only —
+    /// linear scan, never hot.
+    pub fn contains_pc(&self, pc: u64) -> bool {
+        self.by_method.values().any(|a| {
+            let base = a.handle.base as u64;
+            pc >= base && pc < base + a.handle.len as u64
+        })
+    }
 }
 
 /// D6.1: `c2i_<method>` — loads `method`'s own oop (`RelocKind::Oop`,

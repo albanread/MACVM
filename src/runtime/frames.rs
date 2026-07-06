@@ -666,6 +666,97 @@ unsafe fn write_u64(addr: u64, val: u64) {
     unsafe { *(addr as *mut u64) = val }
 }
 
+/// DBG0 (docs/DEBUGGER.md §4.2 step 6): PROBE's raw-seeded native walk.
+///
+/// [`walk_frames`] cannot serve a crash dossier: it seeds from the
+/// anchor/tier-links, and the anchor is CLEARED during ordinary compiled
+/// execution (`emit_stub_epilogue`), so at an async crash pc inside an
+/// nmethod it panics immediately ("no anchor is set"). This walker instead
+/// starts from the CAPTURED crash context's own `(fp, pc)` and follows the
+/// arm64 frame-record chain (`[fp]` = caller fp, `[fp+8]` = saved lr) that
+/// every published nmethod's `stp x29,x30; mov x29,sp` prologue guarantees.
+///
+/// Contrast with the GC walker's trust model (§4.5's rules):
+/// - every fp is validated against `[stack_lo, stack_hi)` and 8-byte
+///   alignment BEFORE it is dereferenced — the crash frame is the SUSPECT,
+///   and a wild fp here would fault (not panic: `catch_unwind` can't help);
+/// - unclassifiable pcs are REPORTED, never panicked on (the caller names
+///   pcs itself — this function only emits raw `(fp, pc)` pairs);
+/// - the walk stops (with a stated reason) at the call stub (bottom of the
+///   native segment), a non-monotonic fp (frames must strictly ascend on
+///   this downward-growing stack), an out-of-bounds fp, or the step cap.
+///
+/// Deopt-redirected saved-LRs are translated back through `pending_deopts`
+/// exactly like the GC walk, so a mid-invalidation crash still names the
+/// true caller pc. Returns `(frames_emitted, stop_reason)`.
+pub fn probe_walk_native(
+    vm: &VmState,
+    seed_fp: u64,
+    seed_pc: u64,
+    stack_lo: u64,
+    stack_hi: u64,
+    mut f: impl FnMut(usize, u64, u64),
+) -> (usize, String) {
+    const PROBE_WALK_CAP: usize = 256;
+    let mut fp = seed_fp;
+    let mut pc = seed_pc;
+    let mut steps = 0usize;
+    loop {
+        if steps >= PROBE_WALK_CAP {
+            return (steps, format!("stopped: step cap {PROBE_WALK_CAP}"));
+        }
+        f(steps, fp, pc);
+        steps += 1;
+        if call_stub_contains(vm, pc) {
+            return (
+                steps,
+                "stopped: reached call_stub (native segment floor)".into(),
+            );
+        }
+        if fp < stack_lo || fp + 16 > stack_hi {
+            return (steps, format!("stopped: fp {fp:#x} outside stack bounds"));
+        }
+        if fp & 7 != 0 {
+            return (steps, format!("stopped: fp {fp:#x} misaligned"));
+        }
+        // SAFETY: just bounds- and alignment-checked against the caller's
+        // stack range — the whole point of this walker vs the GC one.
+        let fp_next = unsafe { read_u64(fp) };
+        let raw_lr = unsafe { read_u64(fp + 8) };
+        if fp_next == 0 {
+            return (steps, "stopped: fp chain ends (saved fp = 0)".into());
+        }
+        if fp_next <= fp {
+            return (
+                steps,
+                format!("stopped: non-monotonic fp chain ({fp_next:#x} <= {fp:#x})"),
+            );
+        }
+        // A redirected saved-LR names deopt_return_trampoline; translate it
+        // back — but tolerate a MISSING pending_deopts entry (report it)
+        // instead of resolve_redirected_lr's panic: on the crash path the
+        // bookkeeping itself is a suspect.
+        pc = if raw_lr == vm.stubs.deopt_return_addr() {
+            match vm.pending_deopts.get(&(fp_next as usize)) {
+                Some(pd) => pd.orig_ret_pc as u64,
+                None => {
+                    return (
+                        steps,
+                        format!(
+                            "stopped: saved-LR at fp {fp_next:#x} is deopt_return_trampoline \
+                             with no pending_deopts entry (torn invalidation state — itself \
+                             a finding)"
+                        ),
+                    )
+                }
+            }
+        } else {
+            raw_lr
+        };
+        fp = fp_next;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

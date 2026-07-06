@@ -376,6 +376,12 @@ pub fn deoptimize_frame(vm: &mut VmState, frame: FrameView) -> DeoptResume {
 
     // ── M1: bump the deopt counter; trace under MACVM_TRACE=deopt. ───────
     vm.stats.deopt_count += 1;
+    vm.probe_ring
+        .push(crate::runtime::vm_state::ProbeEvent::Deopt {
+            nm: frame.nm.0,
+            bci: site_bci as u32,
+            reexecute: site_reexecute,
+        });
     if vm.options.trace.is_enabled("deopt") {
         eprintln!(
             "[deopt] nm={:?} pc={:#x} fp={:#x} bci={} reexecute={} frames={} result={}",

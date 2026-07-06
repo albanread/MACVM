@@ -1127,6 +1127,13 @@ fn prim_error(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     let _ = writeln!(vm.out, "Error: {text}");
     crate::runtime::error::print_stack_trace(vm);
     let _ = vm.out.flush();
+    // DBG0 (docs/DEBUGGER.md §4.1): a fatal guest error gets the PROBE
+    // mini-dossier — walkback + tier-link/anchor state + recent-history
+    // ring + heap verify. No signal machinery: the interpreter is coherent
+    // here. `MACVM_PROBE=off` silences it for exact-stderr golden tests.
+    if crate::runtime::probe::guest_report_enabled() {
+        crate::runtime::probe::fatal_guest_report(vm, &format!("error: {text}"));
+    }
     std::process::exit(1)
 }
 
