@@ -138,20 +138,34 @@ pub enum SendOutcome {
 /// exactly as the dispatch loop set it before the send (the resume point in
 /// the *same*, unpushed, calling method).
 ///
-/// `ic_site`, S10 D4: `Some((caller, ic_idx))` when this activation came
-/// through a genuine IC send site (`send_generic`'s fast or slow path) —
-/// the one piece of information the compile trigger below needs in order
-/// to rewrite that site to dispatch through the fresh nmethod on every
-/// later call, not just this one. `None` from every other caller (`dnu`,
+/// `ic_site`, S10 D4: `Some(ic_idx)` when this activation came through a
+/// genuine IC send site (`send_generic`'s fast or slow path) — the one
+/// piece of information the compile trigger below needs in order to
+/// rewrite that site to dispatch through the fresh nmethod on every later
+/// call, not just this one. `None` from every other caller (`dnu`,
 /// `must_be_boolean_send`, `cannot_return`): each of those reaches a
 /// method via a full lookup, never an IC, so there is nothing to rewrite —
 /// the compile trigger still fires for them (S10 D4 doesn't carve out an
 /// exception), it just can't speed up their own dispatch next time.
+///
+/// Deliberately carries only `ic_idx`, never the caller `MethodOop` itself
+/// (S15, found by the same klass-skew shape as BUG A): `send_generic`'s
+/// slow path resolves the target through `ic_transition`, whose rows 5/6
+/// (klass-skew poly transition) allocate the pairs array and can scavenge.
+/// A `MethodOop` captured before that call and threaded in here would be a
+/// stale from-space address by the time the compile trigger below fires —
+/// `ic_transition` re-derives its own internal copy after the allocation
+/// (`ic.rs`'s `caller = vm.regs.method.expect(...)`) but has no way to hand
+/// that fresher value back through its `Option<MethodOop>` return. Rather
+/// than plumb a second return value through, the caller method is
+/// re-resolved from `vm.regs.method` at the point of use below — a scanned
+/// root that still names this same caller (no frame push has happened yet
+/// for this activation).
 pub fn activate_method(
     vm: &mut VmState,
     m: MethodOop,
     argc: u8,
-    ic_site: Option<(MethodOop, u16)>,
+    ic_site: Option<u16>,
 ) -> SendOutcome {
     let bumped = bump_invocation(m);
 
@@ -182,7 +196,12 @@ pub fn activate_method(
             });
             let compiled = existing.or_else(|| crate::compiler::driver::compile_method(vm, k, m));
             if let Some(id) = compiled {
-                if let Some((caller, ic_idx)) = ic_site {
+                if let Some(ic_idx) = ic_site {
+                    // Re-derived fresh, not threaded through `ic_site` — see
+                    // this function's doc comment for why a caller
+                    // `MethodOop` captured back in `send_generic` can no
+                    // longer be trusted here.
+                    let caller = vm.regs.method.expect("activate_method: no active method");
                     let epoch = vm.ic_epoch;
                     InterpreterIc::at(caller, ic_idx).set_mono_compiled(vm, k, id, epoch);
                 }
@@ -280,12 +299,18 @@ pub fn send_generic(vm: &mut VmState, argc: u8, ic_idx: u16, is_super: bool) -> 
         } else {
             let m = MethodOop::try_from(ic.target())
                 .expect("send_generic: mono target is not a CompiledMethod");
-            return activate_method(vm, m, argc, Some((caller, ic_idx)));
+            return activate_method(vm, m, argc, Some(ic_idx));
         }
     }
 
     match ic_transition(vm, caller, ic_idx, k, is_super) {
-        Some(m) => activate_method(vm, m, argc, Some((caller, ic_idx))),
+        // Only `ic_idx` crosses into `activate_method` — NOT this `caller`:
+        // `ic_transition`'s klass-skew rows (5/6) can have allocated the
+        // poly-pairs array, so this outer binding (captured above, before
+        // that call) may already be a stale from-space address. See
+        // `activate_method`'s doc comment for the full story (S15, same
+        // shape as BUG A).
+        Some(m) => activate_method(vm, m, argc, Some(ic_idx)),
         None => {
             // Re-derive everything: `ic_transition` may have allocated (the
             // poly-pairs array), so the cached `ic` view (its `ics` array
