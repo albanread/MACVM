@@ -767,6 +767,24 @@ pub unsafe extern "C" fn rt_resolve_send(vm: *mut VmState, ret_addr: u64, argv: 
         .ic_sites[site_idx]
         .state = new_state;
 
+    // Debugger (DBG3 companion): `MACVM_DBG_RESOLVE=1` traces every
+    // compiled-IC miss resolution — receiver klass, prior site state, and
+    // whether the resolved target is a c2i adapter (`c2i=true` means the
+    // callee runs interpreted behind this site). Debug builds only, stderr.
+    // One line per rt_resolve_send arrival; hits never leave compiled code,
+    // so this IS the complete compiled-dispatch transition log.
+    #[cfg(debug_assertions)]
+    if std::env::var("MACVM_DBG_RESOLVE").is_ok() {
+        let sel = selector.as_string();
+        let is_c2i = vm.code_table.lookup(k, selector).is_none();
+        let kname = crate::memory::print_oop(&vm.universe, k.name());
+        eprintln!(
+            "RESOLVE sel=#{sel} recv={:#x} klass={kname} prev={prev_state:?} \
+             c2i={is_c2i} ret_target={ret_target:#x} patch_target={patch_target:#x}",
+            receiver.raw(),
+        );
+    }
+
     ret_target
 }
 
@@ -1005,10 +1023,13 @@ pub unsafe extern "C" fn rt_interpret_call(
         "rt_interpret_call: anchor must be set by c2i_shared's prologue before this call"
     );
 
-    let method = MethodOop::try_from(Oop::from_raw(method_bits)).expect(
+    let baked_method = MethodOop::try_from(Oop::from_raw(method_bits)).expect(
         "rt_interpret_call: method_bits must be a genuine MethodOop -- AdapterTable::get_or_make's own RelocKind::Oop pool word",
     );
-    let real_argc = method.argc();
+    // The selector is fixed by the adapter's baked method; the true arity is a
+    // property of the selector, so it is the SAME whichever method actually
+    // runs below.
+    let real_argc = baked_method.argc();
     // SAFETY: this function's own contract above -- argv[0] is the
     // receiver, argv[1..=real_argc] the real Smalltalk args, D4.1's
     // register protocol (shared with `rt_resolve_send`'s own argv).
@@ -1016,6 +1037,50 @@ pub unsafe extern "C" fn rt_interpret_call(
     let args: Vec<Oop> = (0..real_argc)
         .map(|i| Oop::from_raw(unsafe { *argv.add(1 + i) }))
         .collect();
+
+    // C2I DISPATCH TRUTH. A c2i adapter carries NO receiver-klass guard, unlike
+    // a real nmethod `entry` (`emit_entry_guard`). A compiled Mono/Pic IC site
+    // therefore can dispatch a receiver of the WRONG klass straight into this
+    // adapter: the site was patched to `Mono{K1 -> c2i_M1}` (D6.1 -- an
+    // interpreted callee resolves to its adapter, not a guarded entry), then
+    // later called with a K2 receiver. A real entry would have guarded-and-
+    // missed (re-resolve -> PIC); the adapter, having no guard, would otherwise
+    // run `M1` unconditionally on the K2 receiver -- a SILENT wrong answer
+    // (e.g. `Mono{True -> c2i_(True>>not)}` executing `True>>not` = `^false` for
+    // a `false` receiver, where `False>>not` = `^true` was due). So the baked
+    // method is only a HINT: for an ORDINARY send the truth is dynamic lookup on
+    // the receiver's ACTUAL klass (this also transparently handles an override
+    // arriving at an inherited method's shared adapter, and a redefinition the
+    // nested run performed). ONLY a `super` send legitimately runs the baked
+    // ANCESTOR method that `lookup(receiver_klass)` would skip -- detected by
+    // the calling site's `super_klass` marker. The common healthy case
+    // (`lookup == baked`) needs no site inspection at all.
+    let sel = SymbolOop::try_from(baked_method.selector())
+        .expect("a method's selector is always a Symbol");
+    let k = klass_of(vm, receiver);
+    let method = match lookup(vm, k, sel) {
+        Some(m) if m.oop().raw() == baked_method.oop().raw() => baked_method,
+        looked_up => {
+            // Divergence: either a `super` send (run the baked ancestor) or a
+            // klass-mismatched ordinary dispatch / override / redefinition (run
+            // what lookup found). Disambiguate via the calling site.
+            let ret_addr = vm.reg_block.last_compiled_pc;
+            let is_super_site = vm.code_table.find_by_pc(ret_addr).is_some_and(|caller_id| {
+                let (_, _, _, site_idx, _, _) = find_caller_site(vm, ret_addr);
+                vm.code_table.get(caller_id).unwrap().ic_sites[site_idx]
+                    .super_klass
+                    .is_some()
+            });
+            if is_super_site {
+                baked_method
+            } else {
+                // `None` (receiver genuinely does not understand the selector)
+                // is a pathological polymorphic-site edge; fall back to the
+                // baked method, exactly as the pre-fix code always did.
+                looked_up.unwrap_or(baked_method)
+            }
+        }
+    };
 
     // Captured BEFORE the nested run: the interpreted body may itself enter
     // and leave compiled code, clobbering the anchor the repatch below needs.

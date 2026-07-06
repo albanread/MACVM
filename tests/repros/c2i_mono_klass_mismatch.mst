@@ -1,0 +1,34 @@
+"BUG C / task #88 regression — c2i adapters have no receiver-klass guard.
+
+ A compiled Mono IC site whose target is a c2i adapter (interpreted callee)
+ dispatched ANY receiver klass into the adapter's one baked method: the
+ adapter is `ldr method; ldr c2i_shared; br` with no guard, unlike a real
+ nmethod entry (`emit_entry_guard`). Here `chk:` compiles at the threshold
+ with polymorphic #not feedback while True>>not / False>>not are still
+ interpreted; its send site resolves `Mono{True -> c2i_(True>>not)}` on the
+ first post-compile call, and the NEXT call — receiver `false` — ran
+ True>>not (`^false`) instead of False>>not (`^true`): a silent wrong value.
+
+ Fixed in `rt_interpret_call` (stubs.rs): the baked method is a hint; an
+ ordinary send re-derives dispatch truth via `lookup(klass_of(receiver))`,
+ with the baked ancestor reserved for super sites (site.super_klass).
+
+ Prints the number of wrong `x not` results over 300 alternating calls —
+ MUST print 0 at EVERY threshold (the historical failure printed 1+ at any
+ threshold that lands chk:'s compile mid-run, e.g. threshold=100):
+
+   for t in off 1 10 100 1000; do
+     MACVM_JIT=$([ $t = off ] && echo off || echo threshold=$t) \
+       ./target/debug/macvm run tests/repros/c2i_mono_klass_mismatch.mst --world world
+   done"
+
+Object subclass: TS [
+    chk: x [ ^x not ]
+]
+
+K := TS new.
+Wrong := 0.
+1 to: 300 do: [:i |
+    R := K chk: (i even).
+    (R = i odd) ifFalse: [ Wrong := Wrong + 1 ] ].
+Transcript show: Wrong printString; cr.

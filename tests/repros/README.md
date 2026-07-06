@@ -49,14 +49,14 @@ ports; the benchmarks' own 4-mode gates stay red until these are fixed):
    identically, confirming this fix doesn't touch that code path.
 
 2. deltablue_projection_t1000_differential.mst — BUG C (silent wrong
-   result, STILL OPEN): MACVM_JIT=threshold=1000 -> "Projection test
-   3/4 failed" (the exact test number has shifted across investigation
-   passes — timing-sensitive, matching which loop OSRs when); interpreted
-   answer 224775. Passes at threshold=100/10000/100000. Not fixed by BUG
-   D's three root causes below (re-tested after landing them — still
-   fails); may share BUG D's 4th, still-open issue instead (both are "a
-   value read again well after an intervening branch/call" shapes) — not
-   yet confirmed either way.
+   result). **FIXED — root cause was repro 4's c2i guard hole (see
+   below, same commit).** Historically: MACVM_JIT=threshold=1000 ->
+   "Projection test 3/4 failed" (the exact test number shifted across
+   investigation passes — timing-sensitive, matching which loop OSRs
+   when); interpreted answer 224775. Passed at threshold=100/10000/
+   100000. Verified fixed: off and threshold=1000 now print IDENTICAL
+   output (224775), and the full deltablue bench passes its checksum at
+   threshold=1000/10000.
 
 3. cold_branch_recompile_spill_corruption.mst — BUG D (Richards blocker,
    JIT correctness / memory corruption class). THREE root causes found
@@ -204,21 +204,39 @@ ports; the benchmarks' own 4-mode gates stay red until these are fixed):
    first time ever** (23246/9297). The evidence below is retained as the
    investigation record.
 
-   **NEWLY DOCUMENTED, STILL OPEN (pre-existing, stash-bisected against
-   the pre-fix tree — NOT from these fixes):**
-     - The mid-threshold silent wrong-answer band: Richards is wrong at
-       `threshold=100..20000` (and DeltaBlue at 1000 — very likely BUG
-       C's own mechanism) but correct interpreted, at t≤10, and at
-       t≥100000 (OSR-only compilation). The scheduler loop exits early
-       EXACTLY when invocation-triggered compilation lands mid-run (at
-       t=20000 it dies ~92% through, where `queuePacket:` crosses 20000
-       invocations) — a method compiled mid-run from warm poly feedback
-       immediately returns a wrong value. Runs after the first may
-       collapse further (counts like "2/1") or recover (t=20000's runs
-       2+ are correct once everything is compiled).
-     - The repro fails under `MACVM_GC_STRESS=1` + `threshold=1`
-       (`doesNotUnderstand: size`) while passing under
-       `MACVM_DEOPT_STRESS` — untriaged.
+   **The mid-threshold silent wrong-answer band — FIXED (repro 4's c2i
+   guard hole, same commit).** Richards was wrong at
+   `threshold=100..20000` (and DeltaBlue at 1000 — confirmed to BE BUG
+   C's own mechanism) but correct interpreted, at t≤10, and at
+   t≥100000. The trigger was always "invocation-triggered compilation
+   lands mid-run": the freshly compiled caller's first sends resolve
+   while callees are still interpreted, i.e. exactly when Mono→c2i
+   links with no receiver guard get minted. Verified fixed: Richards
+   passes its checksum at off/100/1000/20000/100000; DeltaBlue at
+   off/1000/10000.
+
+   **STILL OPEN (all pre-existing, stash-bisected against the pre-fix
+   tree — none are regressions from the c2i fix):**
+     - This repro under `MACVM_GC_STRESS=1` + `threshold=1`:
+       `doesNotUnderstand: size`, dossier heap verify OK (wrong-value
+       family, NOT heap corruption; 14 tier_links deep, DeoptBridge
+       adapters interleaved). Passes without GC stress (577783).
+     - deltablue at `threshold=100` (both trees): pre-c2i-fix it died
+       of heap exhaustion allocating a garbage-sized 67,108,888-byte
+       object (a wrong VALUE fed to `new:`); post-fix it aborts with
+       `frames.rs:347` "innermost side is native (last tier crossing
+       was IntoCompiled) but no anchor is set" inside
+       `rt_uncommon_trap` — an uncommon-trap-path anchor invariant
+       violated when GC starts under the trap handler. Deterministic,
+       release build, 2/2 runs.
+     - richards under `MACVM_DEOPT_STRESS=1` + `threshold=100`
+       (both trees): pre-fix "benchmark warmup produced a wrong
+       result"; post-fix DNU `#mustBeBoolean` (receiver
+       UndefinedObject) at `TaskControlBlock>>runTask @21` with dossier
+       heap verify FAILED ("klass not klass-shaped") after a
+       5539-event deopt/recompile churn loop at bci=21 — possible real
+       corruption under invalidation churn, distinct from the GC-stress
+       item's heap-OK shape.
 
    Original root-cause-4 crash shape (retained): a debug build panicked
    at `oops/mod.rs:57` ("mark tag: word 0x7 has MARK_TAG") from
@@ -330,7 +348,39 @@ ports; the benchmarks' own 4-mode gates stay red until these are fixed):
    results) with the three fixes landed; only the full-scale repro/
    Richards still hits root cause 4.
 
-All repros above also reproduce (or, for BUG A, used to) via the full
+4. c2i_mono_klass_mismatch.mst — BUG C / the mid-threshold band's root
+   cause (task #88). **FIXED (same commit as this repro).** A c2i
+   adapter (`adapters.rs::build_c2i_adapter`) is `ldr method; ldr
+   c2i_shared; br` — NO receiver-klass guard, unlike a real nmethod
+   entry (`emit_entry_guard`). So a compiled Mono IC site whose target
+   resolved to a c2i adapter (callee still interpreted — precisely the
+   mid-run-compile window) dispatched ANY receiver klass into the one
+   baked method: `Mono{True -> c2i_(True>>not)}` ran `True>>not`
+   (`^false`) on a `false` receiver — a silent wrong boolean, which
+   Richards' `isTaskHoldingOrWaiting` then consumed. PIC-linked c2i
+   targets were never affected (the PIC stub guards klass upstream);
+   Mono links were the hole. Fixed in `stubs.rs::rt_interpret_call`:
+   the adapter's baked method is only a hint — an ordinary send
+   re-derives dispatch truth via `lookup(klass_of(receiver), selector)`
+   before running anything, with the baked ancestor method reserved for
+   super sites (`site.super_klass`). The site itself stays Mono and
+   self-heals into a PIC once the callee compiles (real entry guard
+   misses -> rt_resolve_send).
+
+   Localized with the S-debugger tooling in one pass: `MACVM_DBG_IR`
+   proved both `not` compiles and the caller's IR correct;
+   `disasm-native` (pool resolution) proved the emitted guards correct;
+   `MACVM_DBG_RESOLVE` then showed the single Unresolved->Mono{True}
+   transition with c2i=true and NO further misses while `false`
+   receivers kept arriving — dispatch, not compilation.
+
+   Gate: prints "0" (wrong-answer count over 300 alternating poly
+   sends) at EVERY threshold; historically printed 1+ at any threshold
+   landing the caller's compile mid-run:
+     for t in off 1 10 100 1000; do MACVM_JIT=threshold=$t \
+       ./target/debug/macvm run tests/repros/c2i_mono_klass_mismatch.mst --world world; done
+
+All repros above also reproduce (or, for BUG A/C, used to) via the full
 benchmarks:
   MACVM_JIT=threshold=1 ./target/release/macvm run world/bench/richards.mst  --world world
   MACVM_JIT=threshold=1000 ./target/release/macvm run world/bench/deltablue.mst --world world
