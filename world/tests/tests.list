@@ -33,4 +33,5 @@ tier1.mst
 27_date_time_tests.mst
 28_readwritestream_tests.mst
 29_object_protocol_gaps_tests.mst
+30_ffi_alien_tests.mst
 99_run_all.mst

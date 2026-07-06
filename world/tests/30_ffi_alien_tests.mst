@@ -1,0 +1,89 @@
+"30_ffi_alien_tests.mst — FFIAlienTests (S20 FFI: docs/FFI.md). Exercises
+ the real end-to-end pipeline through the ACTUAL world/macvm boot path
+ (not a Rust-side cargo test) — Tier 1 POSIX FFI dispatch (S20 step 4)
+ and the Alien byte-level memory type (S20 step 5), including a genuine
+ mmap syscall wrapped as an indirect Alien and read/written through real
+ mapped memory. `FFI`/`Alien` are always available (bootstrapped at VM
+ startup, `runtime::alien::bootstrap_alien_methods`), so no special world
+ setup is needed beyond an ordinary class-side <primitive: FFI ...> pragma
+ method, exactly like any real POSIX binding ffi_gen would generate."
+
+Object subclass: FFIAlienPosix [
+    FFIAlienPosix class >> getpid [
+        <primitive: FFI function: #getpid ret: #g args: #()>
+    ]
+    FFIAlienPosix class >> mmapAddr: a1 length: a2 prot: a3 flags: a4 fd: a5 offset: a6 [
+        <primitive: FFI function: #mmap ret: #g args: #(g g g g g g)>
+    ]
+]
+
+TestCase subclass: FFIAlienTests [
+    runAll [
+        self runTest: #testFFIGetpidReturnsARealPid do: [ self testFFIGetpidReturnsARealPid ].
+        self runTest: #testAlienDirectByteRoundTrip do: [ self testAlienDirectByteRoundTrip ].
+        self runTest: #testAlienDirectDoubleRoundTrip do: [ self testAlienDirectDoubleRoundTrip ].
+        self runTest: #testAlienSignedLongNegativeRoundTrip do: [ self testAlienSignedLongNegativeRoundTrip ].
+        self runTest: #testAlienByteAtOutOfRangeFails do: [ self testAlienByteAtOutOfRangeFails ].
+        self runTest: #testMmapIndirectAlienReadsWritesRealMemory do: [ self testMmapIndirectAlienReadsWritesRealMemory ].
+    ]
+
+    "A real dlsym-resolved libc call through S20 step 4's dispatch — the
+     only independently-checkable property from inside Smalltalk itself is
+     that a real OS process id came back (a positive SmallInt), not a fixed
+     expected value."
+    testFFIGetpidReturnsARealPid [
+        | pid |
+        pid := FFIAlienPosix getpid.
+        self assert: pid > 0.
+    ]
+
+    testAlienDirectByteRoundTrip [
+        | a |
+        a := Alien new: 4.
+        a byteAt: 1 put: 200.
+        self assert: (a byteAt: 1) = 200.
+        self assert: a size = 4.
+    ]
+
+    testAlienDirectDoubleRoundTrip [
+        | a |
+        a := Alien new: 8.
+        a doubleAt: 1 put: 3.5.
+        self assert: (a doubleAt: 1) = 3.5.
+    ]
+
+    testAlienSignedLongNegativeRoundTrip [
+        | a |
+        a := Alien new: 8.
+        a signedLongAt: 1 put: -12345.
+        self assert: (a signedLongAt: 1) = -12345.
+    ]
+
+    testAlienByteAtOutOfRangeFails [
+        "byteAt: on an out-of-range index has no primitive-supplied
+         fallback body (S20 step 5's own deliberate minimalism), so the
+         primitive Fails and falls through to this method's own implicit
+         self-return — checked here as 'answers the receiver, not a
+         byte', the only externally-observable difference from a real
+         in-range read (which answers a SmallInt byte value instead)."
+        | a result |
+        a := Alien new: 2.
+        result := a byteAt: 99.
+        self assert: result == a.
+    ]
+
+    "The capstone: a REAL mmap syscall (S20 step 4) wrapping its returned
+     address as an indirect Alien (S20 step 5), writing and reading a real
+     byte through real mapped memory — spanning S20 steps 1 through 5 in
+     one call, now proven via the real world-loaded test harness rather
+     than only a Rust-side cargo test. PROT_READ|PROT_WRITE = 3,
+     MAP_PRIVATE|MAP_ANON = 4098 (0x1002) — real macOS/arm64 flag values."
+    testMmapIndirectAlienReadsWritesRealMemory [
+        | addr a |
+        addr := FFIAlienPosix
+            mmapAddr: 0 length: 4096 prot: 3 flags: 4098 fd: -1 offset: 0.
+        a := Alien forAddress: addr size: 4096.
+        a byteAt: 1 put: 42.
+        self assert: (a byteAt: 1) = 42.
+    ]
+]

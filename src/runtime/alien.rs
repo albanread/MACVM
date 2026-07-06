@@ -466,16 +466,43 @@ pub(crate) fn prim_alien_for_address_size(vm: &mut VmState, args: &[Oop]) -> Pri
 // only adds its METHODS afterward, once "Alien" already resolves as a
 // global (`bootstrap_well_known`, `runtime::globals`, which this function's
 // own caller — `VmState::with_options` — always runs first).
+//
+// Every method below carries an explicit `^self` after its pragma — NOT
+// decorative, and NOT the same "empty body, forward-declared" minimalism
+// `ffi_gen`'s own generated `<primitive: FFI ...>` bindings use. Those FFI
+// pragma methods dispatch through `runtime::ffi::dispatch_ffi_primitive`, a
+// SEPARATE path `interpreter::send::try_primitive` reaches BEFORE its
+// generic `prim_by_id` match arms — an empty body there never touches the
+// generic path's own `debug_assert!(m.prim_fails(), ...)` at all. Alien's
+// primitives (112-120) are ORDINARY numbered primitives going through that
+// SAME generic path every other primitive in this codebase uses, and
+// `frontend::codegen`'s own `prim_fails = primitive.is_some() &&
+// !method.body.is_empty()` computes `false` for a body with zero explicit
+// statements — so a genuinely EMPTY body here (as this file originally,
+// wrongly, had) means the very first real out-of-range `byteAt:`/bad-typed
+// `doubleAt:put:`/etc. call trips that debug_assert and panics, instead of
+// falling through to a real fallback body. Found by actually running the
+// new `world/tests/30_ffi_alien_tests.mst` smoke test (S20 step 6) through
+// the real world-loaded test harness (`tests/it_world.rs`'s `suite_green`)
+// — none of this module's own unit tests caught it, since every one of
+// them calls the primitive Rust function directly, bypassing full
+// dispatch entirely. `^self` matches this codebase's own universal
+// convention for every other primitive-backed method in `world/*.mst`
+// (e.g. `SmallInteger>>+`'s `<primitive: 1> ^self`) — on success the
+// primitive already returns before reaching this bytecode; `^self` only
+// ever runs on a genuine `PrimResult::Fail`, giving these accessors the
+// same "answers the receiver on bad data" fallback every other Fail-able
+// primitive already has.
 const ALIEN_BOOTSTRAP_SRC: &str = "Object subclass: Alien [ \
-    Alien class >> new: n [ <primitive: 119> ] \
-    Alien class >> forAddress: addr size: n [ <primitive: 120> ] \
-    byteAt: i [ <primitive: 112> ] \
-    byteAt: i put: v [ <primitive: 113> ] \
-    signedLongAt: i [ <primitive: 114> ] \
-    signedLongAt: i put: v [ <primitive: 115> ] \
-    doubleAt: i [ <primitive: 116> ] \
-    doubleAt: i put: v [ <primitive: 117> ] \
-    size [ <primitive: 118> ] \
+    Alien class >> new: n [ <primitive: 119> ^self ] \
+    Alien class >> forAddress: addr size: n [ <primitive: 120> ^self ] \
+    byteAt: i [ <primitive: 112> ^self ] \
+    byteAt: i put: v [ <primitive: 113> ^self ] \
+    signedLongAt: i [ <primitive: 114> ^self ] \
+    signedLongAt: i put: v [ <primitive: 115> ^self ] \
+    doubleAt: i [ <primitive: 116> ^self ] \
+    doubleAt: i put: v [ <primitive: 117> ^self ] \
+    size [ <primitive: 118> ^self ] \
 ]";
 
 /// Called once from `VmState::with_options`, immediately after

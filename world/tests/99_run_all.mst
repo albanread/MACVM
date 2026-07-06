@@ -33,4 +33,5 @@ TestRunner run: IdentityCollectionsTests.
 TestRunner run: DateTimeTests.
 TestRunner run: ReadWriteStreamTests.
 TestRunner run: ObjectProtocolGapsTests.
+TestRunner run: FFIAlienTests.
 TestRunner report.
