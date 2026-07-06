@@ -1729,6 +1729,27 @@ pub unsafe extern "C" fn rt_poll(vm: *mut VmState, loop_fp: u64, ret_pc: u64) ->
         };
     }
 
+    // ANCHOR (task #94): `stub_poll` deliberately skips `emit_stub_prologue`
+    // (S10 D5.6 — polling itself never allocates), so unlike the six real
+    // anchor-setting stubs, NOTHING publishes `last_compiled_fp/pc/kind` on
+    // entry here. But `deoptimize_frame` below CAN allocate (materialize_
+    // context/materialize_closure) and `interpret_active` runs arbitrary
+    // interpreted code that certainly can — and `walk_frames`' start rule
+    // reads exactly this anchor whenever the innermost tier crossing is
+    // `IntoCompiled` (which it is: `enter_compiled`'s own crossing, still on
+    // `vm.tier_links`, is untouched until `deopt_bridge_link` pushes below).
+    // Without it, a GC mid-materialization has no way to find — and
+    // therefore correctly relocate the oops in — the still-live POLLING
+    // compiled frame at `(loop_fp, ret_pc)`: exactly the same hole
+    // `build_uncommon_trampoline`/`build_deopt_return_trampoline` had before
+    // their own anchor fix, just reached from the loop-poll deopt door
+    // instead of the trap/return doors. Same remedy, set from Rust instead
+    // of assembly since this stub's hot (non-deopting) path must stay
+    // anchor-free — only the rare deopt-taking path pays this cost.
+    vm.reg_block.last_compiled_fp = loop_fp;
+    vm.reg_block.last_compiled_pc = ret_pc;
+    vm.reg_block.last_compiled_kind = KIND_DEOPT_BRIDGE;
+
     // Deopt this frame exactly like `rt_uncommon_trap`: a reexecute (LoopPoll)
     // site — `incoming_result: None`; the recorded loop-carried stack is read
     // from the frame, and the interpreter resumes at the loop-header bci and
@@ -1749,6 +1770,14 @@ pub unsafe extern "C" fn rt_poll(vm: *mut VmState, loop_fp: u64, ret_pc: u64) ->
     vm.tier_links.push(bridge);
     let result = crate::interpreter::interpret_active(vm, resume).raw();
     vm.tier_links.pop();
+
+    // CLEAR the anchor (P9) now that both the materializer and the nested
+    // interpreter run are done — before EITHER return path below, so
+    // `rt_poll` never hands control back to `stub_poll` with a stale
+    // nonzero anchor (which `walk_frames` would otherwise trust for an
+    // unrelated LATER poll or trap).
+    vm.reg_block.last_compiled_fp = 0;
+    vm.reg_block.last_compiled_kind = 0;
 
     // An NLR escaping through the deoptee: the nested interpreter run returned
     // the reserved-tag sentinel, NOT an oop. Hand it straight back (deopted=1
