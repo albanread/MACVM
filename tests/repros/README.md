@@ -5,8 +5,48 @@ ports; the benchmarks' own 4-mode gates stay red until these are fixed):
    **FIXED** (commit 6145c63): `ic_transition`'s mono→poly arm read
    `selector` AFTER `alloc_poly_pairs`'s own allocation without protecting
    it first — a scavenge mid-transition left it a stale pre-move address.
-   Handle-protected across the allocation, then re-derived. This repro now
-   passes (prints "9999 10001", exit 0) at every threshold tried.
+   Handle-protected across the allocation, then re-derived. This repro then
+   passed (prints "9999 10001", exit 0) at every threshold tried — until it
+   recurred (see below).
+
+   **RECURRED, then FIXED AGAIN (commit 8429a7d), same bug class, different
+   variable.** Found during final verification of BUG D's fixes: this repro
+   started panicking with a POISON-pattern read (`mark tag: word
+   0xf0f0f0f0f0f0f0f3 has MARK_TAG` — `scavenge::POISON`'s own fill value
+   for vacated from-space memory), backtrace through
+   `MethodOop::ics` -> `InterpreterIc::at` -> `send::activate_method` ->
+   `send::send_generic` -> `dispatch_from` -> `interpret_active` — a
+   DIFFERENT code path from the original fix (`activate_method`'s JIT
+   compile-trigger, not `ic_transition`'s mono->poly arm). Bisected via
+   `git checkout <pre-BUG-D-commit> -- <BUG-D's 5 files>` to confirm this
+   was NOT a regression from BUG D's work — it failed identically on the
+   pre-BUG-D-fix code too, meaning this recurrence had been latent all
+   along and BUG D's own stress testing was simply the first thing to
+   shake it loose.
+
+   Root cause: `send_generic` (`send.rs`) captures `caller` from
+   `vm.regs.method` BEFORE calling `ic_transition` — whose klass-skew rows
+   5/6 (poly transition) allocate the pairs array and can scavenge — then
+   threads that PRE-CALL `caller` into `activate_method`'s `ic_site`
+   parameter, which dereferences it (via `InterpreterIc::at`, to patch the
+   IC once a JIT compile succeeds) well AFTER that allocation could have
+   moved it. `ic_transition` already re-derives its OWN internal `caller`
+   after the allocation (`ic.rs`'s `let caller = vm.regs.method.expect(...)`)
+   — but it only returns the resolved target method, `Option<MethodOop>`,
+   with no way to hand that fresher `caller` back to its own caller.
+   `send_generic`'s DNU (`None`) arm already re-derives `caller` the same
+   way for the identical reason (see its own comment, one screen down) —
+   the `Some(m)` arm just never got the same treatment.
+
+   Fixed by changing `activate_method`'s `ic_site` parameter from
+   `Option<(MethodOop, u16)>` to `Option<u16>` — the caller `MethodOop` is
+   no longer threaded through at all; instead it is always re-resolved
+   fresh from `vm.regs.method` at the point of use, mirroring the pattern
+   already established in `ic_transition` and `send_generic`'s DNU path.
+   Verified: passes x3 under `threshold=1` plus `off`/`threshold=1000` (all
+   agree: "9999 10001"); full lib suite (557 passed) and full integration
+   suite clean; the still-open BUG D root cause 4 below reproduces
+   identically, confirming this fix doesn't touch that code path.
 
 2. deltablue_projection_t1000_differential.mst — BUG C (silent wrong
    result, STILL OPEN): MACVM_JIT=threshold=1000 -> "Projection test
