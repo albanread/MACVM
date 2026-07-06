@@ -167,6 +167,17 @@ pub fn w(n: u8) -> Operand {
         is_sp: false,
     })
 }
+/// A double-precision FP/SIMD register (`d0`..`d31`) — S20 FFI's own
+/// trampolines (`codecache::ffi_stubs`) are the first user; every other
+/// emitter in this codebase is GPR-only (Smalltalk values are oops/smis,
+/// never native floats carried in the FP register file).
+pub fn d(n: u8) -> Operand {
+    Operand::Reg(Reg {
+        class: RegClass::D,
+        num: n,
+        is_sp: false,
+    })
+}
 /// The stack pointer, as an X-class operand (`sp`, not `xzr` — register 31
 /// means different things in different syntactic positions; `is_sp`
 /// disambiguates for the encoder's ALU/move paths. Memory-base position

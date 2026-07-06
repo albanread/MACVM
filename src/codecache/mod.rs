@@ -18,6 +18,7 @@
 
 pub mod adapters;
 pub mod deopt_trap;
+pub mod ffi_stubs;
 pub mod flush;
 pub mod guard;
 pub mod mega;
