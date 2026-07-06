@@ -504,6 +504,88 @@ pub static PRIMITIVES: &[PrimDesc] = &[
         can_allocate: true,
         can_fail: false,
     },
+    // --- Alien group (S20 step 5) --------------------------------------------
+    // docs/FFI.md §4 "Representation": `Alien`'s own typed byte-level
+    // accessors + constructors (`runtime::alien`'s own module doc has the
+    // full design rationale — reused `Format::IndexableBytes` shape, one
+    // named external-address field, direct-vs-indirect split). Every one of
+    // these validates its own receiver/arg tags exactly like every other
+    // group in this table; `can_allocate` is true only for `doubleAt:` (the
+    // one allocating accessor — see `runtime::alien::prim_alien_double_at`'s
+    // own doc comment) and the two constructors (`new:`/`forAddress:size:`,
+    // which allocate the fresh Alien itself).
+    PrimDesc {
+        id: 112,
+        name: "byteAt:",
+        f: crate::runtime::alien::prim_alien_byte_at,
+        argc: 1,
+        can_allocate: false,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 113,
+        name: "byteAt:put:",
+        f: crate::runtime::alien::prim_alien_byte_at_put,
+        argc: 2,
+        can_allocate: false,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 114,
+        name: "signedLongAt:",
+        f: crate::runtime::alien::prim_alien_signed_long_at,
+        argc: 1,
+        can_allocate: false,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 115,
+        name: "signedLongAt:put:",
+        f: crate::runtime::alien::prim_alien_signed_long_at_put,
+        argc: 2,
+        can_allocate: false,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 116,
+        name: "doubleAt:",
+        f: crate::runtime::alien::prim_alien_double_at,
+        argc: 1,
+        can_allocate: true,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 117,
+        name: "doubleAt:put:",
+        f: crate::runtime::alien::prim_alien_double_at_put,
+        argc: 2,
+        can_allocate: false,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 118,
+        name: "size",
+        f: crate::runtime::alien::prim_alien_size,
+        argc: 0,
+        can_allocate: false,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 119,
+        name: "new:",
+        f: crate::runtime::alien::prim_alien_new,
+        argc: 1,
+        can_allocate: true,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 120,
+        name: "forAddress:size:",
+        f: crate::runtime::alien::prim_alien_for_address_size,
+        argc: 2,
+        can_allocate: true,
+        can_fail: true,
+    },
 ];
 
 pub fn prim_by_id(id: u16) -> Option<&'static PrimDesc> {
@@ -1379,6 +1461,15 @@ mod tests {
             (109, "printDigits"),
             (110, "asSymbol"),
             (111, "__vmStats"),
+            (112, "byteAt:"),
+            (113, "byteAt:put:"),
+            (114, "signedLongAt:"),
+            (115, "signedLongAt:put:"),
+            (116, "doubleAt:"),
+            (117, "doubleAt:put:"),
+            (118, "size"),
+            (119, "new:"),
+            (120, "forAddress:size:"),
         ];
         assert_eq!(
             PRIMITIVES.len(),

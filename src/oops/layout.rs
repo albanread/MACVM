@@ -120,6 +120,50 @@ pub const METHOD_SIZE_INDEX: usize = 7; // smi: bytecode byte count
 /// Absolute byte offset of the first bytecode byte.
 pub const METHOD_BYTECODE_BYTE_OFFSET: usize = BODY_OFFSET + 8 * (METHOD_SIZE_INDEX + 1); // 80
 
+// --- Alien body layout (S20 step 5, docs/FFI.md §4 "Representation") ------
+//
+// `Alien` reuses `Format::IndexableBytes` (the same format `ByteArrayOop`
+// already uses) rather than inventing a new `Format` variant, following the
+// SAME "named fields precede an indexable byte tail" idiom `CompiledMethod`
+// (`Format::Method`, above) already established for a mixed shape. This is
+// a deliberate, considered adaptation of real Strongtalk's `Alien.dlt`
+// design (`~/claudeprojects/strongtalk-repo/StrongtalkSource/Alien.dlt`,
+// §2): Strongtalk encodes direct-vs-indirect via a SIGN-FLIPPED size field
+// shared with the object's own ordinary size slot (negative size = indirect,
+// with a companion `addressField` holding the real pointer). Porting that
+// literally would mean teaching `MemOop::raw_size_slot`/`indexable_len`
+// (`oops/heap.rs`) to interpret magnitude via `.abs()` — a small change,
+// but one EVERY `ByteArrayOop`/`String`/`Symbol` in the entire VM shares,
+// for a feature only `Alien` needs. Instead, Alien gets exactly ONE named
+// field (below) ahead of its own implicit size slot, exactly like
+// `CompiledMethod`'s 7 named fields sit ahead of `METHOD_SIZE_INDEX` — zero
+// changes needed anywhere in `oops/heap.rs`'s already-klass-nis-aware
+// `raw_size_slot`/`indexable_len`/`tail_start_word`/`tail_byte_at` family.
+/// The one named field: a SmallInt raw external address. `0` means
+/// "direct" — the object's own indexable byte tail (found via the same
+/// `tail_start_word`/`tail_byte_at` machinery `ByteArrayOop`/`Symbol` already
+/// use) IS the real storage. A nonzero value means "indirect" — that value
+/// IS the real external (non-heap, non-GC-owned) address to read/write
+/// through instead; the object's own tail bytes still physically exist
+/// (allocated to the same declared size, `Universe::alien_klass`'s creation
+/// call + `runtime::alien::prim_alien_for_address_size`) but are never
+/// touched — a deliberate, documented waste of real heap space equal to the
+/// wrapped region's size, traded for identical bounds-checking/allocation/
+/// GC-scanning code paths between direct and indirect Aliens with zero
+/// special-casing (`runtime::alien`'s own module doc elaborates).
+pub const ALIEN_EXTERNAL_ADDR_INDEX: usize = 0;
+/// `Universe::alien_klass`'s `nis_words`: one named field
+/// (`ALIEN_EXTERNAL_ADDR_INDEX`) ahead of Alien's own implicit size slot,
+/// exactly the same pattern `METHOD_NAMED_WORDS` (7) establishes for
+/// `Format::Method`'s klass (`nis = HEADER_WORDS + METHOD_NAMED_WORDS`).
+/// Empirically verified (`runtime::alien`'s own
+/// `alien_nis_words_derivation_is_correct` test): allocating an Alien with
+/// N tail bytes yields `indexable_len() == N` exactly, and writing tail
+/// byte 0 never clobbers the external-address field at body-word 0 — the
+/// size slot lands at body-word 1, the tail starts at body-word 2, so the
+/// two fields (address, tail) never alias.
+pub const ALIEN_NAMED_WORDS: usize = 1;
+
 // flags packing — SPEC §4.4 (S4-extended) "argc:4 | ntemps:8 | has_ctx:1 |
 // is_block:1 | prim_fails:1 | captures_ctx:1 | nctx:8"
 pub const METHOD_FLAGS_ARGC_SHIFT: u32 = 0;

@@ -64,6 +64,7 @@ pub(crate) fn bootstrap_well_known(vm: &mut VmState) {
         symbol_klass,
         array_klass,
         bytearray_klass,
+        alien_klass,
         association_klass,
         methoddict_klass,
         method_klass,

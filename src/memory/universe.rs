@@ -17,7 +17,7 @@
 //! rather than performing a wild read.
 
 use crate::oops::klass::Format;
-use crate::oops::layout::{HEADER_WORDS, KLASS_SIZE_WORDS};
+use crate::oops::layout::{ALIEN_NAMED_WORDS, HEADER_WORDS, KLASS_SIZE_WORDS};
 use crate::oops::mark::Mark;
 use crate::oops::smi::SmallInt;
 use crate::oops::wrappers::{KlassOop, MemOop, SymbolOop};
@@ -119,6 +119,21 @@ pub struct Universe {
     pub symbol_klass: KlassOop,
     pub array_klass: KlassOop,
     pub bytearray_klass: KlassOop,
+    /// S20 step 5 (docs/FFI.md §4): the FFI byte-level memory-access type.
+    /// `Format::IndexableBytes` like `bytearray_klass` (same body shape,
+    /// same `oops::heap` machinery), but superclass `object_klass` — NOT
+    /// `bytearray_klass`/`arrayed_collection_klass` — because Alien
+    /// deliberately does not inherit ByteArray's own `size`/`at:`/
+    /// `byteAt:`-family primitives, which assume zero named fields
+    /// (`oops::layout::ALIEN_NAMED_WORDS` shifts Alien's tail by one word)
+    /// and would silently misread/miswrite against Alien's shape, plus
+    /// have no notion of "indirect" (external-pointer-backed) mode at all.
+    /// Alien gets its own, complete accessor primitive set instead
+    /// (`runtime::alien`). Methods are installed post-genesis by
+    /// `runtime::alien::bootstrap_alien_methods`, not here — genesis only
+    /// fixes the klass's SHAPE (`nis_words` can't be expressed by the
+    /// `subclass:` parser, only by this same `remaining_klass!` machinery).
+    pub alien_klass: KlassOop,
     pub association_klass: KlassOop,
     pub methoddict_klass: KlassOop,
     pub method_klass: KlassOop,
@@ -476,6 +491,32 @@ impl Universe {
             true,
             HEADER_WORDS
         );
+        // S20 step 5 (docs/FFI.md §4): `Alien`, right after `ByteArray`
+        // since they share `Format::IndexableBytes` — but superclass
+        // `object_klass`, NOT `bytearray_klass`/`arrayed_collection_klass`
+        // (see `Universe::alien_klass`'s own doc comment for why: Alien's
+        // tail is shifted by `ALIEN_NAMED_WORDS` and ByteArray's own
+        // `at:`/`byteAt:`-family primitives assume no shift at all).
+        // `untagged = true`, matching `bytearray_klass`'s own 4th argument
+        // (a raw byte tail, never oop-scanned). `nis_words = HEADER_WORDS +
+        // ALIEN_NAMED_WORDS` places the one named field
+        // (`ALIEN_EXTERNAL_ADDR_INDEX`) at body-word 0, Alien's own
+        // implicit size slot at body-word 1, and the byte tail starting at
+        // body-word 2 — the exact same "named fields, then size slot, then
+        // tail" pattern `method_klass` below uses for `Format::Method`'s 7
+        // named fields, just with 1 instead of 7. This derivation is
+        // empirically checked by `runtime::alien`'s
+        // `alien_nis_words_derivation_is_correct` test (allocate, confirm
+        // `indexable_len()` and no aliasing between the address field and
+        // tail byte 0) — see that test before trusting this arithmetic
+        // further.
+        let alien_klass = remaining_klass!(
+            "Alien",
+            object_klass.oop(),
+            Format::IndexableBytes,
+            true,
+            HEADER_WORDS + ALIEN_NAMED_WORDS
+        );
         let association_klass = remaining_klass!(
             "Association",
             object_klass.oop(),
@@ -642,6 +683,7 @@ impl Universe {
             symbol_klass,
             array_klass,
             bytearray_klass,
+            alien_klass,
             association_klass,
             methoddict_klass,
             method_klass,
@@ -965,6 +1007,9 @@ mod tests {
             (u.arrayed_collection_klass, u.sequenceable_collection_klass),
             (u.array_klass, u.arrayed_collection_klass),
             (u.bytearray_klass, u.arrayed_collection_klass),
+            // Alien: NOT under ArrayedCollection (see `Universe::alien_klass`'s
+            // own doc comment) — direct `Object` subclass, S20 step 5.
+            (u.alien_klass, u.object_klass),
             (u.string_klass, u.arrayed_collection_klass),
             (u.symbol_klass, u.string_klass),
             (u.behavior_klass, u.object_klass),
@@ -1060,6 +1105,7 @@ mod tests {
             u.symbol_klass,
             u.array_klass,
             u.bytearray_klass,
+            u.alien_klass,
             u.association_klass,
             u.methoddict_klass,
             u.method_klass,
@@ -1099,6 +1145,18 @@ mod tests {
         assert_eq!(u.bytearray_klass.format(), Format::IndexableBytes);
         assert!(u.bytearray_klass.has_untagged_contents());
         assert!(!u.array_klass.has_untagged_contents());
+        // S20 step 5 (docs/FFI.md §4): Alien is `Format::IndexableBytes`
+        // like ByteArray, but shifted by `ALIEN_NAMED_WORDS` (1) for its own
+        // external-address field — `runtime::alien`'s own test module
+        // empirically checks the ACTUAL body-word arithmetic this implies
+        // (`alien_nis_words_derivation_is_correct`); this assertion only
+        // pins the klass-level shape inputs that derivation depends on.
+        assert_eq!(
+            u.alien_klass.non_indexable_size(),
+            HEADER_WORDS + crate::oops::layout::ALIEN_NAMED_WORDS
+        );
+        assert_eq!(u.alien_klass.format(), Format::IndexableBytes);
+        assert!(u.alien_klass.has_untagged_contents());
     }
 
     #[test]

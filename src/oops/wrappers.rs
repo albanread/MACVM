@@ -99,6 +99,17 @@ macro_rules! oop_newtype {
 oop_newtype!(KlassOop, Format::Klass);
 oop_newtype!(ArrayOop, Format::IndexableOops);
 oop_newtype!(ByteArrayOop, Format::IndexableBytes);
+// S20 step 5 (docs/FFI.md §4): `Alien` shares `Format::IndexableBytes` with
+// `ByteArrayOop`/`SymbolOop` (`Universe::alien_klass`'s own doc comment
+// explains why it's the same underlying format), so `try_from` here is
+// format-only — same as `ByteArrayOop`/`StringOop`, NOT `SymbolOop::
+// try_from_exact`'s stricter exact-klass check. This is exactly as sound as
+// it already is for those two: ordinary Smalltalk method dispatch already
+// guarantees a primitive attached only to Alien's own method dict ever
+// runs with an actual Alien receiver (the interpreter looks up the method
+// via the RECEIVER's klass, so `Alien>>byteAt:` is simply never found —
+// let alone invoked — for a non-Alien receiver in the first place).
+oop_newtype!(AlienOop, Format::IndexableBytes);
 oop_newtype!(MethodOop, Format::Method);
 oop_newtype!(ClosureOop, Format::Closure);
 oop_newtype!(ContextOop, Format::Context);
@@ -234,6 +245,40 @@ impl ByteArrayOop {
         for i in 0..len {
             buf.push(self.byte_at(i));
         }
+    }
+}
+
+impl AlienOop {
+    /// Body-word-0 named field (`oops::layout::ALIEN_EXTERNAL_ADDR_INDEX`):
+    /// `0` for a direct Alien (its own indexable tail IS the storage),
+    /// nonzero for an indirect one (the real external address to read/
+    /// write through instead — `runtime::alien`'s accessor primitives are
+    /// the only real readers/writers of this distinction). Mirrors
+    /// `MethodOop`'s own named-field-accessor idiom (`bytecode::method`):
+    /// `body_oop` + `SmallInt::try_from`/`.value()`, never a raw word read,
+    /// so the usual oop-tag `debug_assert`s still apply to this slot.
+    pub fn external_addr(self) -> u64 {
+        crate::oops::smi::SmallInt::try_from(
+            self.as_mem()
+                .body_oop(crate::oops::layout::ALIEN_EXTERNAL_ADDR_INDEX),
+        )
+        .expect("Alien external-address field is not a SmallInt")
+        .value() as u64
+    }
+
+    /// Sets the external-address field — `0` to mark direct (the default a
+    /// fresh `Alien class >> new:` leaves it at), nonzero to mark indirect
+    /// (`Alien class >> forAddress:size:`). `addr` is a real process
+    /// virtual address; on real macOS/arm64 (48-bit-or-smaller user virtual
+    /// address space) this always fits `SmallInt`'s 61-bit magnitude —
+    /// same trust `runtime::ffi`'s own "g" return-class unmarshal already
+    /// places in a native address/pointer value (see that module's own
+    /// `FfiRetClass::G` doc for the range argument in full).
+    pub fn set_external_addr(self, addr: u64) {
+        self.as_mem().set_body_oop(
+            crate::oops::layout::ALIEN_EXTERNAL_ADDR_INDEX,
+            crate::oops::smi::SmallInt::new(addr as i64).oop(),
+        );
     }
 }
 

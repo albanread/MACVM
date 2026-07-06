@@ -973,6 +973,13 @@ impl VmState {
             test_scavenge_probe: None,
         };
         crate::runtime::globals::bootstrap_well_known(&mut vm);
+        // S20 step 5 (docs/FFI.md §4): installs Alien's own instance/class-
+        // side accessor methods onto the genesis-shaped `alien_klass` —
+        // must run AFTER `bootstrap_well_known` above, since it relies on
+        // "Alien" already being a resolvable global (`install_class_def`'s
+        // REOPEN branch, not its create branch — see
+        // `runtime::alien::bootstrap_alien_methods`'s own doc comment).
+        crate::runtime::alien::bootstrap_alien_methods(&mut vm);
         vm
     }
 
