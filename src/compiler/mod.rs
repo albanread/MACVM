@@ -11,6 +11,7 @@
 
 pub mod assembler;
 pub mod decode;
+pub mod disasm_a64;
 pub mod driver;
 pub mod emit;
 pub mod escape;

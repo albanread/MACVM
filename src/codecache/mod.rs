@@ -55,6 +55,25 @@ pub struct CodeHandle {
     pub len: usize,
 }
 
+impl CodeHandle {
+    /// DBG3 (docs/DEBUGGER.md §4.4): a read-only view of this handle's
+    /// published bytes, for the machine-code disassembler. Sound because a
+    /// published block never moves or resizes for its whole lifetime (the
+    /// S12 invariant this module's own doc pins) and the code cache is
+    /// always readable; `codecache` is the crate's designated owner of
+    /// raw MAP_JIT pointer access, so the one `unsafe` stays here rather
+    /// than at every disassembly call site.
+    ///
+    /// # Safety of the returned slice
+    /// Valid only while the owning `CodeCache` is alive and the block has
+    /// not been `free`d — both guaranteed for any nmethod the caller found
+    /// live in the code table.
+    pub fn as_bytes(&self) -> &[u8] {
+        // SAFETY: see the doc above — published, immovable, readable.
+        unsafe { std::slice::from_raw_parts(self.base, self.len) }
+    }
+}
+
 /// One `MAP_JIT` region plus its allocation bookkeeping. Never moves or
 /// resizes blocks once handed out (S12 depends on this: a published
 /// nmethod's address is stable for its whole lifetime).

@@ -85,6 +85,11 @@ const TABLE: &[VerbDoc] = &[
         help: "Dump the PROBE recent-history ring (DBG0): the last N compile / deopt / invalidate events, oldest first — the crash dossier's step 9, on demand.",
     },
     VerbDoc {
+        name: "disasm-native",
+        usage: "disasm-native <Class> <selector>",
+        help: "Disassemble a compiled nmethod's MACHINE CODE (DBG3): one line per instruction, with ic-site and safepoint offsets annotated. Requires the method to have compiled (see nmethods). Contrast `disasm`, which shows bytecode.",
+    },
+    VerbDoc {
         name: "help",
         usage: "help [verb]",
         help: "List every RUSTTCL verb, or show one verb's full help text.",
@@ -110,6 +115,7 @@ pub fn register_macvm_verbs(registry: &mut Registry) {
     registry.register("bp-clear", Arity::exact(3), verb_bp_clear);
     registry.register("bp-list", Arity::exact(0), verb_bp_list);
     registry.register("ring", Arity::exact(0), verb_ring);
+    registry.register("disasm-native", Arity::exact(2), verb_disasm_native);
     registry.register("help", Arity::range(0, 1), verb_help);
     registry.register("quit", Arity::exact(0), verb_quit);
     registry.register("exit", Arity::exact(0), verb_quit);
@@ -476,6 +482,59 @@ fn verb_bp_list(_vm: &mut Vm<'_>, _args: &[Value]) -> TclResult<Value> {
     } else {
         Ok(Value::new(rows.join("\n")))
     }
+}
+
+fn verb_disasm_native(_vm: &mut Vm<'_>, args: &[Value]) -> TclResult<Value> {
+    let ctx = bridge::active_ctx();
+    let klass = super::resolve_klass(ctx, args[0].as_str()).map_err(TclError::runtime)?;
+    let sel = ctx.vm.universe.intern(args[1].as_str().as_bytes());
+    let id = ctx.vm.code_table.lookup(klass, sel).ok_or_else(|| {
+        TclError::runtime(format!(
+            "{}>>{} has no compiled nmethod (see `nmethods`)",
+            args[0].as_str(),
+            args[1].as_str()
+        ))
+    })?;
+    let nm = ctx
+        .vm
+        .code_table
+        .get(id)
+        .expect("lookup returned a live id");
+    // ic-site + safepoint offsets, for annotating the listing lines.
+    let ic_offs: std::collections::HashSet<usize> =
+        nm.ic_sites.iter().map(|s| s.off as usize).collect();
+    let sp_offs: std::collections::HashSet<usize> =
+        nm.pcdescs.iter().map(|p| p.pc_off as usize).collect();
+    // Disassemble the CODE region only (up to the literal pool).
+    let code = &nm.code.as_bytes()[..nm.literal_off as usize];
+    let listing = crate::compiler::disasm_a64::disasm_slice(code, None);
+    let mut rows: Vec<String> = vec![format!(
+        "nmethod #{} v{} entry+{:#x} verified+{:#x} ({} code bytes, {} pool)",
+        id.0,
+        nm.version,
+        nm.entry_off,
+        nm.verified_entry_off,
+        nm.literal_off,
+        nm.code.len - nm.literal_off as usize
+    )];
+    for (i, line) in listing.lines().enumerate() {
+        let off = i * 4;
+        let mut annot = String::new();
+        if off == nm.entry_off as usize {
+            annot.push_str("  ; entry");
+        }
+        if off == nm.verified_entry_off as usize && nm.verified_entry_off != nm.entry_off {
+            annot.push_str("  ; verified_entry");
+        }
+        if ic_offs.contains(&off) {
+            annot.push_str("  ; IC send site");
+        }
+        if sp_offs.contains(&off) {
+            annot.push_str("  ; safepoint");
+        }
+        rows.push(format!("{line}{annot}"));
+    }
+    Ok(Value::new(rows.join("\n")))
 }
 
 fn verb_ring(_vm: &mut Vm<'_>, _args: &[Value]) -> TclResult<Value> {

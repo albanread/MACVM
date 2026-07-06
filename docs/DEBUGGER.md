@@ -557,7 +557,13 @@ infrastructure is sitting right there) make it trustworthy fast.
 
 ## 6. Build plan and deferrals
 
-Ordered by value-per-effort, honestly small steps — each lands testable:
+Ordered by value-per-effort, honestly small steps — each lands testable.
+**Status (2026-07-06): DBG0, DBG1, DBG2 DONE and gated; DBG3 = disassembler
++ dossier/TCL integration in progress (interactive planted breakpoints
+deferred — they need hardware single-step, Mach-exception territory, per
+§4.3). All three shipped waves are exposed to RUSTTCL (`dbg`, `bp`,
+`bp-clear`, `bp-list`, `ring`), and the fatal-error/DNU paths route to
+both the PROBE mini-dossier and (when armed) a HALT stop.**
 
 - **DBG0 — PROBE dossier** (no interactivity): SIGSEGV/SIGBUS handlers +
   sigaltstack + register-capture buffer + probe trampoline + crash report

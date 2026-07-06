@@ -122,8 +122,11 @@ pub unsafe fn crash_dossier(vm: &mut VmState, regs: &CapturedRegs, trigger: &str
     }
     flush();
 
-    // ── 5. Disassembly window: not built (DBG3). ─────────────────────────
-    eprintln!("[5] disasm: not built (DBG3)");
+    // ── 5. Disassembly window: ±16 instructions around the crash pc. ─────
+    for line in disasm_window(vm, regs.pc) {
+        eprintln!("[5] {line}");
+    }
+    flush();
 
     // ── 6. Walkback: raw-fp native walk + interpreter chain. ─────────────
     walkback(vm, regs, &mut |line| {
@@ -559,6 +562,40 @@ fn walkback(vm: &VmState, regs: &CapturedRegs, emit: &mut dyn FnMut(String)) {
             Err(e) => emit(format!("interp walk DIED: {}", panic_msg(&e))),
         }
     }
+}
+
+/// Dossier step 5 (DBG3): disassemble ±16 instructions around the crash
+/// pc, with the faulting word marked. Only meaningful when the pc is
+/// inside a known nmethod (whose bytes we can slice safely — a published
+/// block never moves); a foreign or stub pc yields a one-line note.
+fn disasm_window(vm: &VmState, pc: u64) -> Vec<String> {
+    let Some(id) = vm.code_table.find_by_pc(pc) else {
+        return vec!["disasm: pc not in an nmethod (see verdict)".into()];
+    };
+    let Some(nm) = vm.code_table.get(id) else {
+        return vec!["disasm: nmethod vanished".into()];
+    };
+    let base = nm.code.base as u64;
+    let code_off = (pc - base) as usize;
+    let window = 16 * 4; // ±16 instructions
+    let lo = code_off.saturating_sub(window);
+    let hi = (code_off + window + 4).min(nm.code.len);
+    let bytes = &nm.code.as_bytes()[lo..hi];
+    let listing =
+        crate::compiler::disasm_a64::disasm_slice(bytes, Some(code_off.saturating_sub(lo)));
+    // Re-base the +offset labels onto the nmethod so they read absolutely.
+    listing
+        .lines()
+        .map(|l| {
+            // Each line starts "+0xNN  ..." relative to `lo`; annotate the
+            // nmethod offset it really is.
+            l.to_string()
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .enumerate()
+        .map(|(i, l)| format!("nm+{:#06x}  {l}", lo + i * 4))
+        .collect()
 }
 
 fn heap_verify_line(vm: &VmState) -> String {
