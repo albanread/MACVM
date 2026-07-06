@@ -1201,17 +1201,43 @@ pub unsafe extern "C" fn rt_interpret_call(
                 // machinery. The patched target is the FULL `entry` (klass
                 // guard included), same as rt_resolve_send's mono link.
                 if vm.code_table.find_by_pc(ret_addr).is_some() {
-                    let (caller_id, caller_code, site_off, site_idx, _sel2, _argc) =
+                    let (caller_id, caller_code, site_off, site_idx, site_sel, _argc) =
                         find_caller_site(vm, ret_addr);
                     let site = &vm.code_table.get(caller_id).unwrap().ic_sites[site_idx];
                     let is_mono_k = matches!(site.state, IcState::Mono { klass, .. } if klass == k);
-                    if is_mono_k && site.super_klass.is_none() {
+                    // Task #93: `ret_addr` was captured BEFORE the nested run,
+                    // and the nested run can invalidate, FLUSH, and REUSE the
+                    // caller's code-cache region for a brand-new nmethod (under
+                    // MACVM_DEOPT_STRESS, routinely). `find_by_pc` then names
+                    // the NEW occupant, and if the same offset happens to be
+                    // one of ITS IcSites, patching it links a site for a
+                    // DIFFERENT selector straight to this callee's entry —
+                    // whose klass guard happily passes for any same-klass
+                    // receiver: the wrong METHOD runs with a valid receiver
+                    // (instvar indices out of range, phantom DNUs, garbage
+                    // smis into arithmetic — task #93's whole zoo). The
+                    // selector equality check makes the patch safe: a reused
+                    // region's coincidental site can only match if it sends
+                    // the SAME selector, in which case the link is correct
+                    // for it too.
+                    if is_mono_k && site.super_klass.is_none() && site_sel == sel {
                         let nm = vm.code_table.get(id).expect("just compiled/looked up");
                         let target = nm.code.base as u64 + nm.entry_off as u64;
                         vm.code_cache
                             .patch_branch26_at(caller_code, site_off, target);
                         vm.code_table.get_mut(caller_id).unwrap().ic_sites[site_idx].state =
                             IcState::Mono { klass: k, target };
+                    } else if is_mono_k && site.super_klass.is_none() {
+                        #[cfg(debug_assertions)]
+                        if std::env::var("MACVM_DBG_RESOLVE").is_ok() {
+                            eprintln!(
+                                "C2I-REPATCH BLOCKED: site sel {:?} != callee sel {:?} \
+                                 (caller {caller_id:?} off {site_off:#x} — stale ret_addr \
+                                 into a reused code region)",
+                                site_sel.as_string(),
+                                sel.as_string(),
+                            );
+                        }
                     }
                 }
             }

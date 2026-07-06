@@ -47,6 +47,27 @@ impl AdapterTable {
     /// nmethod's `entry` (`bl`, x0 = result on return) — `rt_resolve_send`
     /// (D4.1) doesn't need to know the difference when recording
     /// `IcState::Mono{klass, target}`.
+    ///
+    /// Task #93: the module doc's own "a cache MISS on a stale key just
+    /// rebuilds a redundant but correct adapter" assumed a stale key could
+    /// only ever produce a MISS — true only if addresses are never reused.
+    /// They routinely are: `method` is an ordinary heap oop (block methods
+    /// especially — created and collected constantly), so once its OLD
+    /// address is freed by a GC, a LATER, wholly unrelated method can be
+    /// allocated at that exact address (eden-base recycling, task #94's
+    /// same mechanism) and collide with the stale key still sitting in
+    /// `by_method`. That is a false HIT, not a miss: `method`'s OWN c2i
+    /// request returns a DIFFERENT method's adapter — the mono site gets
+    /// patched to run the wrong callee forever, with a real (valid, live)
+    /// receiver each time, so no tag/plausibility check anywhere ever
+    /// catches it (task #93's whole DNU/wrong-arithmetic zoo: `nm=247`'s
+    /// `#not` site silently running an unrelated `#==`/`#bitAnd:`/etc.
+    /// method's c2i adapter). Guarded by re-deriving the CACHED entry's
+    /// identity from its own embedded pool word — kept current across
+    /// every GC by `oops_do`, unlike the key — and rejecting the hit on
+    /// mismatch (falls through and rebuilds, exactly the miss path; the
+    /// orphaned stale entry is left in place, a harmless one-adapter leak
+    /// under the same key it will be overwritten at below).
     pub fn get_or_make(
         &mut self,
         cache: &mut CodeCache,
@@ -55,7 +76,16 @@ impl AdapterTable {
     ) -> u64 {
         let key = method.oop().raw();
         if let Some(a) = self.by_method.get(&key) {
-            return a.handle.base as u64;
+            // SAFETY: `method_pool_off` was recorded as this SAME blob's own
+            // `literal_off` at build time and is kept 8-byte-aligned,
+            // in-bounds, and current (oops_do) for as long as the entry
+            // lives — identical access pattern to `oops_do` above.
+            let cached_method_bits = unsafe {
+                std::ptr::read(a.handle.base.add(a.method_pool_off as usize) as *const u64)
+            };
+            if cached_method_bits == key {
+                return a.handle.base as u64;
+            }
         }
         let blob = build_c2i_adapter(method, c2i_shared_addr);
         let method_pool_off = blob.literal_off; // method oop is the FIRST literal interned
