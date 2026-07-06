@@ -127,6 +127,37 @@ fn eligibility_detail(vm: &VmState, method: MethodOop) -> Eligibility {
         return Eligibility::NoPermanent;
     }
 
+    // S15, BUG D root cause 4's deeper half (tests/repros/README.md): a
+    // compiled SEND site marshals receiver+args into x0..x7 — 8 registers
+    // (`emit_call_send`), matching `ROOTSPILL_SLOTS`' 8-slot spill area in
+    // every Rust-reaching stub. A send with more than 7 real args has no
+    // register home for the tail; the method stays interpreted (the
+    // interpreter's stack-based sends handle any arity). This caps SITES,
+    // complementing the `method.argc() > 5` cap above on the method's OWN
+    // entry convention. Found by Richards' 7-arg task initializer: before
+    // the RootSpill widening, its c2i marshaling read args 6-7 from the
+    // stub frame's saved fp/lr — silent heap corruption surfacing as a DNU
+    // on a "SmallInteger" thousands of sends later.
+    {
+        let mut b = 0usize;
+        while b < method.bytecode_len() {
+            let (instr, next) = decode_at(method, b);
+            if let Instr::Send { ic, .. } = instr {
+                if crate::interpreter::ic::InterpreterIc::at(method, ic).argc() > 7 {
+                    if vm.options.trace.is_enabled("jit") {
+                        eprintln!(
+                            "[jit] NoPermanent reason: send site ic={ic} argc={} > 7 \
+                             (register-marshaling cap)",
+                            crate::interpreter::ic::InterpreterIc::at(method, ic).argc()
+                        );
+                    }
+                    return Eligibility::NoPermanent;
+                }
+            }
+            b = next;
+        }
+    }
+
     // S14 step 7-I: a method that CREATES a literal closure (`push_closure`) is
     // no longer rejected outright. Run the escape pre-pass ONCE (only when a
     // closure is present — the common closure-free method pays nothing) and let
@@ -495,7 +526,7 @@ fn compile_method_full(
 
     let cfg = decode::decode(method);
     let ir_method = ir::convert(vm, rcvr_klass, method, &cfg);
-    let regalloc_result = regalloc::regalloc(&ir_method);
+    let mut regalloc_result = regalloc::regalloc(&ir_method);
 
     let mut asm = JasmAssembler::new();
     let stub_poll_addr = vm.stubs.stub_poll_addr();
@@ -557,7 +588,75 @@ fn compile_method_full(
                         dst_frame_off: off,
                     });
                 }
-                ValueLoc::Nil => {} // dead at the header — omitted
+                // Dead AT THE HEADER — but "dead" here means the vreg's
+                // interval doesn't cover the header POSITION, which is NOT
+                // the same as "no scope inside the loop will ever read its
+                // slot": a temp whose only in-loop reference is a cold
+                // arm's UncommonTrap has no organic in-loop use (the arm IS
+                // the trap), yet every such trap's deopt scope still
+                // records the temp's canonical FrameSlot via
+                // `extra_oop_live`'s exact-position facts. The interpreter
+                // frame being converted holds the temp's TRUE value right
+                // now, so pack it into that slot anyway whenever the vreg
+                // has a spill home at all — a deopt from inside the loop
+                // then rebuilds the exact interpreter state. (Before this,
+                // the entry block left such slots as native-stack garbage —
+                // BUG D root cause 4's first half; and nil-filling them,
+                // while GC-sound, handed a mid-loop deopt `nil` for a temp
+                // the resumed interpreter genuinely reads — caught by
+                // `osr_frame_deopts_mid_loop_and_finishes_interpreted`.)
+                // A dead OPERAND-stack entry has no interpreter-side value
+                // to pack (the loop-header operand stack is empty for
+                // structured loops), and a vreg with NO spill home cannot
+                // be named by any scope (scopes resolve through the same
+                // intervals) — the entry block's nil-fill covers those.
+                ValueLoc::Nil => {
+                    if !matches!(src, OsrSource::StackSlot(_)) {
+                        let slot_home = regalloc_result.intervals.iter().find_map(|iv| {
+                            if iv.vreg == v {
+                                if let Some(crate::compiler::regalloc::Assignment::Spill(s)) =
+                                    iv.assignment
+                                {
+                                    return Some(s);
+                                }
+                            }
+                            None
+                        });
+                        if let Some(s) = slot_home {
+                            copies.push(s);
+                            slots.push(OsrSlot {
+                                src,
+                                dst_frame_off: -8 * (s.0 as i32 + 1),
+                            });
+                            // The packed slot must stay a GC-scanned oop
+                            // slot at EVERY later safepoint, or a mid-loop
+                            // collection leaves the packed pointer stale
+                            // and the eventual trap materializes garbage
+                            // (caught by the scavenge-exit verifier on the
+                            // BUG D repro). Blanket-widening is SOUND for
+                            // exactly this vreg — its slot is written on
+                            // every entry path before any widened position
+                            // (normal entry: the prologue's unconditional
+                            // temp nil-init; OSR entry: the entry block's
+                            // nil-fill + this very copy) — the same
+                            // dominates-the-whole-method argument that
+                            // keeps ctx_vregs in `deopt_live_widen`.
+                            let widen_end = regalloc_result
+                                .intervals
+                                .iter()
+                                .map(|iv| iv.end)
+                                .max()
+                                .unwrap_or(0)
+                                + 1;
+                            if let Some(iv) =
+                                regalloc_result.intervals.iter_mut().find(|iv| iv.vreg == v)
+                            {
+                                iv.end = iv.end.max(widen_end);
+                                iv.crosses_safepoint = true;
+                            }
+                        }
+                    }
+                }
                 other => {
                     debug_assert!(
                         false,

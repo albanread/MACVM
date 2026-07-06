@@ -64,6 +64,14 @@ pub fn emit_stub_prologue(a: &mut dyn Assembler) {
     a.emit("stp", &[x(0), x(1), mem(31, 0)]);
     a.emit("stp", &[x(2), x(3), mem(31, 16)]);
     a.emit("stp", &[x(4), x(5), mem(31, 32)]);
+    // x6/x7 too (S15, BUG D root cause 4's deeper half — see
+    // `layout::ROOTSPILL_SLOTS`'s own doc): a compiled send site marshals
+    // up to receiver+7 args into x0..x7, and the Rust call this stub is
+    // about to make treats x6/x7 as caller-saved scratch — without this
+    // pair a ≥6-arg send's tail args are clobbered on every resolve/mega/
+    // dnu, and c2i's argv read walked off the old 6-slot area into this
+    // frame's own saved fp/lr.
+    a.emit("stp", &[x(6), x(7), mem(31, 48)]);
     // Anchor (D4.1): last_compiled_fp/pc so a stack walker (S12) can find
     // this stub's own frame, and everything above it, while control is in
     // Rust.
@@ -94,7 +102,7 @@ fn emit_stub_kind_tag(a: &mut dyn Assembler, kind: u64) {
 }
 
 /// Part 2: clears the anchor (P9 — a stale anchor makes S12's walker walk
-/// freed frames), reloads x0..x5 from RootSpill, tears down the frame.
+/// freed frames), reloads x0..x7 from RootSpill, tears down the frame.
 /// Does NOT emit the final `ret`/`br`/`b` — callers differ on that (plain
 /// `ret` for a callee-shaped stub like `dnu`, `br x16` tail-jump for
 /// `resolve`/`mega`, P4) — and does not touch whatever scratch register
@@ -121,6 +129,7 @@ pub fn emit_stub_epilogue(a: &mut dyn Assembler) {
     a.emit("ldp", &[x(0), x(1), mem(31, 0)]);
     a.emit("ldp", &[x(2), x(3), mem(31, 16)]);
     a.emit("ldp", &[x(4), x(5), mem(31, 32)]);
+    a.emit("ldp", &[x(6), x(7), mem(31, 48)]);
     a.emit("add", &[sp(), sp(), imm(ROOTSPILL_BYTES as i64)]);
     a.emit("ldp", &[x(29), x(30), mem_post(31, 16)]);
 }
@@ -946,7 +955,7 @@ fn build_c2i_shared() -> CodeBlob {
     emit_stub_kind_tag(&mut a, KIND_C2I);
     a.emit("mov", &[x(0), x(28)]); // vm
     a.emit("mov", &[x(1), x(17)]); // method_bits, carried through from c2i_<method>
-    a.emit("mov", &[x(2), sp()]); // argv = &RootSpill (x0..x5, contiguous)
+    a.emit("mov", &[x(2), sp()]); // argv = &RootSpill (x0..x7, contiguous)
     let rt_interpret_call_lit = a.literal_u64(
         rt_interpret_call as *const () as u64,
         Some(RelocKind::RuntimeAddr),
@@ -964,8 +973,10 @@ fn build_c2i_shared() -> CodeBlob {
 /// Only ever reached via `blr`/`bl` from `c2i_shared`'s own hand-assembled
 /// listing above (through `call_far`), never called directly from Rust —
 /// same contract as [`rt_poll`]/[`rt_resolve_send`]. `argv` points at
-/// `c2i_shared`'s own RootSpill area (6 live `u64`s, receiver + up to 5
-/// args, contiguous ascending); valid for the duration of this call only.
+/// `c2i_shared`'s own RootSpill area (8 live `u64`s, receiver + up to 7
+/// args, contiguous ascending — matching `emit_call_send`'s x0..x7
+/// marshaling and eligibility's receiver+7 send-site cap); valid for the
+/// duration of this call only.
 ///
 /// D6.1's C→I path: resolves `method_bits` to a real `MethodOop` (trusted
 /// — it came from the adapter's own `RelocKind::Oop` pool word, which
@@ -1110,7 +1121,7 @@ fn build_mega_shared() -> CodeBlob {
     emit_stub_kind_tag(&mut a, KIND_MEGA);
     a.emit("mov", &[x(0), x(28)]); // vm
     a.emit("mov", &[x(1), x(16)]); // selector_bits, carried through from mega_<sel>
-    a.emit("mov", &[x(2), sp()]); // argv = &RootSpill (x0..x5, contiguous)
+    a.emit("mov", &[x(2), sp()]); // argv = &RootSpill (x0..x7, contiguous)
     let rt_mega_lookup_lit = a.literal_u64(
         rt_mega_lookup as *const () as u64,
         Some(RelocKind::RuntimeAddr),
@@ -1182,7 +1193,7 @@ fn build_stub_dnu() -> CodeBlob {
     emit_stub_kind_tag(&mut a, KIND_DNU);
     a.emit("mov", &[x(0), x(28)]); // vm
     a.emit("mov", &[x(1), x(30)]); // ret_addr, captured before call_far clobbers it
-    a.emit("mov", &[x(2), sp()]); // argv = &RootSpill (x0..x5, contiguous)
+    a.emit("mov", &[x(2), sp()]); // argv = &RootSpill (x0..x7, contiguous)
     let rt_dnu_lit = a.literal_u64(rt_dnu as *const () as u64, Some(RelocKind::RuntimeAddr));
     a.call_far(rt_dnu_lit);
     a.emit("mov", &[x(16), x(0)]); // result -> x16, survives the epilogue's own x0 reload

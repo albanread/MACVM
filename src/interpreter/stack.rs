@@ -58,14 +58,34 @@ pub fn stack_audit_suspend(on: bool) {
 fn audit_stack_write(idx: usize, v: Oop, via: &str) {
     if !stack_write_audit_enabled()
         || STACK_AUDIT_SUSPENDED.load(std::sync::atomic::Ordering::Relaxed)
-        || !v.is_mem()
     {
+        return;
+    }
+    if !v.is_mem() {
+        // HEURISTIC arm (BUG D root cause 4's decisive clue): dead
+        // native-frame words — (pc, fp) pairs from stp x29/x30 — have low
+        // bits 00, so they PARSE AS SMIS and sail through every tag check;
+        // this is exactly how the c2i 7-arg marshaling bug's garbage
+        // crossed the whole VM unnoticed. Flag any "smi" whose raw value
+        // lands in the macOS code/native-stack address band. CAVEAT: a
+        // genuine SmallInteger near 1-1.5 billion (raw 4-6.2 GiB) is a
+        // legal value this heuristic would misflag — acceptable for an
+        // opt-in debug tool (workloads that big should simply not run
+        // under MACVM_DBG_STACK_WRITES), not for an always-on assert.
+        let r = v.raw();
+        if r & 3 == 0 && (0x1_0000_0000u64..0x1_7000_0000u64).contains(&r) {
+            panic!(
+                "STACK-WRITE AUDIT ({via}): slot {idx} <- {:#x}, a \"smi\" in the \
+                 code/stack address band — dead-frame residue leaking as a value",
+                r
+            );
+        }
         return;
     }
     let m = crate::oops::wrappers::MemOop::try_from(v).unwrap();
     let w = m.mark_word_raw();
-    let plausible = w & crate::oops::layout::TAG_MASK == crate::oops::layout::MARK_TAG
-        && w & 0b100 != 0;
+    let plausible =
+        w & crate::oops::layout::TAG_MASK == crate::oops::layout::MARK_TAG && w & 0b100 != 0;
     if !plausible {
         panic!(
             "STACK-WRITE AUDIT ({via}): slot {idx} <- {:#x}, whose target mark word {:#x} \

@@ -1351,6 +1351,30 @@ pub fn emit(
         if frame_bytes > 0 {
             e.asm.emit("sub", &[sp(), sp(), imm(frame_bytes)]);
         }
+        // BUG D root cause 4 (tests/repros/README.md): nil-fill EVERY spill
+        // slot before the buffer copies land on top. The normal entry path
+        // nil-inits the unified temp slots via the entry block's own IR
+        // (ir.rs), and every other slot's first access on normal flow is
+        // its def's store — but this synthetic block BRANCHES PAST the
+        // entry block, so any slot the OsrMap omitted (a temp genuinely
+        // dead at the loop header, like a value only used before the loop)
+        // otherwise holds NATIVE STACK GARBAGE — leftover words from dead
+        // frames of earlier calls at the same SP depth. Those slots are
+        // still referenced: an in-loop trap's deopt scope records every
+        // unified temp (the rebuilt interpreter frame needs all of them,
+        // dead-or-not — `deopt_live_exact`/`extra_oop_live`), and the SAME
+        // forcing puts them in the oop maps GC scans at in-loop
+        // safepoints. Reading garbage there was a deterministic
+        // wrong-object corruption (a stale derived pointer into a dead
+        // `printString` frame's string body, in the repro). Nil is exactly
+        // what the interpreter's own frame would hold for a dead temp
+        // (S13's "dead → Nil" rule) — and a handful of stores once per OSR
+        // TRANSITION is free.
+        e.asm
+            .ldr_literal(xr(16), e.literal_ids[e.nil_lit.0 as usize]);
+        for s in 0..regalloc.frame_slots {
+            emit_spill_access(e.asm, "str", x(16), crate::compiler::regalloc::SpillSlot(s));
+        }
         for (i, &slot) in req.copies.iter().enumerate() {
             // Buffer reads use ldr [x1, #off] (unsigned scaled imm12 —
             // plenty for any realistic slot count); stores go through the

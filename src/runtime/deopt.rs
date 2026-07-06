@@ -469,40 +469,6 @@ pub fn deoptimize_frame(vm: &mut VmState, frame: FrameView) -> DeoptResume {
              {ntemps}",
             slot_vals.len()
         );
-        // TEMP BUG-D-4 DIAGNOSTIC: name the exact ValueLoc handing back an
-        // implausible oop before the stack auditor's panic loses the context.
-        #[cfg(debug_assertions)]
-        if std::env::var("MACVM_DBG_STACK_WRITES").is_ok() {
-            let plausible = |o: Oop| -> bool {
-                if !o.is_mem() {
-                    return true;
-                }
-                let w = crate::oops::wrappers::MemOop::try_from(o).unwrap().mark_word_raw();
-                w & crate::oops::layout::TAG_MASK == crate::oops::layout::MARK_TAG
-                    && w & 0b100 != 0
-            };
-            for (i, (&v, &loc)) in slot_vals.iter().zip(vf.scope.slots.iter()).enumerate() {
-                if !plausible(v) {
-                    let sel = crate::oops::wrappers::SymbolOop::try_from(method.selector())
-                        .map(|s| s.as_string())
-                        .unwrap_or_else(|| format!("{:#x}", method.selector().raw()));
-                    eprintln!(
-                        "BUGD4: nm={:?} pc={:#x} method_pool_ix={} selector={sel} \
-                         unified_slot={i} (argc={argc}) loc={loc:?} val={:#x} \
-                         site_bci={site_bci} reexecute={site_reexecute} innermost={} \
-                         fp={:#x} scope_slots={:?} receiver_loc={:?}",
-                        frame.nm,
-                        frame.pc,
-                        vf.scope.method_pool_ix,
-                        v.raw(),
-                        vf.is_innermost,
-                        frame.fp,
-                        vf.scope.slots,
-                        vf.scope.receiver,
-                    );
-                }
-            }
-        }
 
         // Receiver + args, exactly where the interpreter's caller leaves
         // them (unified slots 0..argc are the callee's negative-offset arg

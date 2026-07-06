@@ -271,12 +271,19 @@ where
                 caller_pc,
             } => {
                 let n = real_oop_rootspill_slots(vm, kind, caller_pc);
+                debug_assert!(
+                    n <= crate::oops::layout::ROOTSPILL_SLOTS,
+                    "each_code_root: {n} live RootSpill slots claimed, but the area only \
+                     holds {} — a send site exceeded the register-marshaling cap the \
+                     compiler was supposed to enforce",
+                    crate::oops::layout::ROOTSPILL_SLOTS
+                );
                 for i in 0..n {
                     // SAFETY: `fp` is a live anchor-setting stub's own x29;
                     // RootSpill occupies `[fp − ROOTSPILL_BYTES, fp)`
-                    // (`emit_stub_prologue`'s own `sub sp,sp,#48` executed
-                    // AFTER `mov x29,sp`, so `x29` stays above the area
-                    // while `sp`/the `stp`s address into it) — slot `i`
+                    // (`emit_stub_prologue`'s own `sub sp,sp,#ROOTSPILL_BYTES`
+                    // executed AFTER `mov x29,sp`, so `x29` stays above the
+                    // area while `sp`/the `stp`s address into it) — slot `i`
                     // (x_i) lives at `fp − ROOTSPILL_BYTES + 8·i`, P8's
                     // pinned ABI.
                     let addr = (fp - ROOTSPILL_BYTES as u64 + 8 * i as u64) as *mut u64;
@@ -328,14 +335,14 @@ where
     vm.mega_table = mega_table;
 }
 
-/// D4.1's per-kind RootSpill interpretation: how many of the SIX
-/// generically-spilled `x0..x5` words (starting from slot 0) are genuinely
+/// D4.1's per-kind RootSpill interpretation: how many of the EIGHT
+/// generically-spilled `x0..x7` words (starting from slot 0) are genuinely
 /// live oops for `kind` — the rest may hold stale, non-oop register content
 /// from the compiled caller's own unrelated register allocation (a dead
 /// value regalloc never bothered to clear) or a raw non-oop argument
 /// (`AllocSlow`'s own `size_bytes`), and must NOT be traced as a possible
 /// oop: an adversarial-review finding from step 3's own design pass —
-/// blindly scanning all 6 for every kind risks tracing garbage bits as a
+/// blindly scanning all 8 for every kind risks tracing garbage bits as a
 /// pointer, corrupting unrelated heap memory the moment anything moves.
 ///
 /// `MustBeBoolean`/`AllocSlow` are FIXED (their own call shape never
