@@ -36,6 +36,16 @@ pub const KIND_MEGA: u64 = 2;
 pub const KIND_DNU: u64 = 3;
 pub const KIND_MUST_BE_BOOLEAN: u64 = 4;
 pub const KIND_ALLOC_SLOW: u64 = 5;
+/// The two deopt trampolines' anchor tag (`build_uncommon_trampoline` /
+/// `build_deopt_return_trampoline`): their frame record — `[fp]` = the
+/// deoptee's fp, `[fp+8]` = the pc classifying it (trap pc / orig return
+/// pc) — anchors a GC that starts inside `deoptimize_frame`'s materializer
+/// allocations. Maps to `AdapterKind::DeoptBridge` deliberately: like the
+/// synthetic post-materialization bridge link, the record itself owns NO
+/// RootSpill slots (`real_oop_rootspill_slots` → 0) — the deoptee frame's
+/// oops are covered by its OWN oop map at the recorded pc, via the
+/// `FrameView::Compiled` the walker emits right after the adapter.
+pub const KIND_DEOPT_BRIDGE: u64 = 6;
 
 /// D5's shared stub skeleton, part 1: anchor + AAPCS frame + RootSpill
 /// (x0..x5). Every stub that calls into Rust starts with this; follow with
@@ -883,10 +893,16 @@ fn build_not_entrant_stub() -> CodeBlob {
 ///   mov  x30, x0                 // saved-lr := orig_ret_pc
 ///   stp  x29, x30, [sp,#-16]!    // record: [fp]=victim_fp, [fp+8]=orig_ret_pc
 ///   mov  x29, sp                 //   re-root fp onto the record
+///   str  x29, [x28, #LAST_FP]    // publish the record as the walker's anchor
+///   str  x30, [x28, #LAST_PC]    //   (task #92, same as the uncommon trampoline)
+///   movz x9, #KIND_DEOPT_BRIDGE
+///   str  x9,  [x28, #LAST_KIND]
 ///   mov  x0, x28                 // vm
 ///   mov  x1, x20                 // victim_fp
 ///   mov  x2, x19                 // result
 ///   ldr  x16,<rt_deopt_on_return>; blr x16   // x0 := deopt result oop bits
+///   str  xzr, [x28, #LAST_FP]    // clear the anchor (P9)
+///   str  xzr, [x28, #LAST_KIND]
 ///   mov  sp, x20                 // tear down record + victim frame
 ///   ldp  x29, x30, [sp], #16     // pop the VICTIM's own saved {fp,lr}
 ///   ret                          // return the deopt result to the victim's caller
@@ -924,6 +940,27 @@ fn build_deopt_return_trampoline() -> CodeBlob {
     a.emit("mov", &[x(30), x(0)]); // saved-lr := orig_ret_pc
     a.emit("stp", &[x(29), x(30), mem_pre(31, -16)]);
     a.emit("mov", &[x(29), sp()]);
+    // PUBLISH the record as the walker's anchor (task #92, the same hole as
+    // `build_uncommon_trampoline`'s — see the KIND_DEOPT_BRIDGE doc): the
+    // record alone is invisible to `walk_frames`' anchor-driven start rule,
+    // so a GC inside `rt_deopt_on_return`'s `deoptimize_frame` materializer
+    // allocations would assert ("no anchor is set") — or, without the
+    // assert, skip the victim frame's oops. x9 scratch per
+    // `emit_stub_kind_tag`'s precedent (dead here: the callee has fully
+    // returned, the victim is being abandoned).
+    a.emit(
+        "str",
+        &[x(29), mem(28, VMREG_LAST_COMPILED_FP_OFFSET as i64)],
+    );
+    a.emit(
+        "str",
+        &[x(30), mem(28, VMREG_LAST_COMPILED_PC_OFFSET as i64)],
+    );
+    a.emit("movz", &[x(9), imm(KIND_DEOPT_BRIDGE as i64)]);
+    a.emit(
+        "str",
+        &[x(9), mem(28, VMREG_LAST_COMPILED_KIND_OFFSET as i64)],
+    );
 
     // Marshal (vm, victim_fp, result) and run the return-path deopt.
     a.emit("mov", &[x(0), x(28)]); // vm
@@ -934,6 +971,17 @@ fn build_deopt_return_trampoline() -> CodeBlob {
         Some(RelocKind::RuntimeAddr),
     );
     a.call_far(rt_lit);
+
+    // CLEAR the anchor (P9), exactly as `emit_stub_epilogue`: xzr into fp +
+    // kind. x0 (the deopt result / NLR sentinel) is untouched.
+    a.emit(
+        "str",
+        &[x(31), mem(28, VMREG_LAST_COMPILED_FP_OFFSET as i64)],
+    );
+    a.emit(
+        "str",
+        &[x(31), mem(28, VMREG_LAST_COMPILED_KIND_OFFSET as i64)],
+    );
 
     // Teardown (D6): sp := victim_fp discards the trampoline record AND the
     // whole victim frame; the ldp pops the victim's OWN saved {fp,lr}; ret

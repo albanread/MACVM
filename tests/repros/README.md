@@ -221,22 +221,38 @@ ports; the benchmarks' own 4-mode gates stay red until these are fixed):
        `doesNotUnderstand: size`, dossier heap verify OK (wrong-value
        family, NOT heap corruption; 14 tier_links deep, DeoptBridge
        adapters interleaved). Passes without GC stress (577783).
-     - deltablue at `threshold=100` (both trees): pre-c2i-fix it died
-       of heap exhaustion allocating a garbage-sized 67,108,888-byte
-       object (a wrong VALUE fed to `new:`); post-fix it aborts with
-       `frames.rs:347` "innermost side is native (last tier crossing
-       was IntoCompiled) but no anchor is set" inside
-       `rt_uncommon_trap` — an uncommon-trap-path anchor invariant
-       violated when GC starts under the trap handler. Deterministic,
-       release build, 2/2 runs.
-     - richards under `MACVM_DEOPT_STRESS=1` + `threshold=100`
-       (both trees): pre-fix "benchmark warmup produced a wrong
-       result"; post-fix DNU `#mustBeBoolean` (receiver
-       UndefinedObject) at `TaskControlBlock>>runTask @21` with dossier
-       heap verify FAILED ("klass not klass-shaped") after a
-       5539-event deopt/recompile churn loop at bci=21 — possible real
-       corruption under invalidation churn, distinct from the GC-stress
-       item's heap-OK shape.
+     - deltablue at `threshold=100` — **FIXED (the deopt-trampoline
+       anchor fix, task #92, same commit as this note).** Both deopt
+       trampolines (`build_uncommon_trampoline`,
+       `build_deopt_return_trampoline`) built their walker-visible
+       frame record but never PUBLISHED it as the anchor
+       (`last_compiled_fp/pc/kind`) — the S12-step-7 walker's start
+       rule reads the anchor when the innermost tier crossing is
+       `IntoCompiled`, so a GC inside `deoptimize_frame`'s materializer
+       allocations (e.g. `alloc_closure` for a block-carrying trap
+       scope) hit the frames.rs:347 assert — and in nested tier
+       configurations would instead SILENTLY SKIP the deoptee frame's
+       oops (a real corruption mechanism, see the next item). Fixed by
+       publishing the record as the anchor (new `KIND_DEOPT_BRIDGE` →
+       `AdapterKind::DeoptBridge`, 0 RootSpill slots — the deoptee's
+       oops come from its own oop map at the recorded pc) and clearing
+       it after the Rust call, exactly per `emit_stub_prologue`/
+       `emit_stub_epilogue`. Verified: full richards+deltablue matrix
+       8/8 checksum-clean incl. this exact point. (Pre-c2i-fix the
+       same threshold died of heap exhaustion allocating a
+       garbage-sized 67,108,888-byte object — BUG C's wrong value fed
+       to `new:` — which the c2i fix cured first.)
+     - richards under `MACVM_DEOPT_STRESS=1` + `threshold=100`, STILL
+       OPEN but the anchor fix CHANGED it: the historical dossier
+       "heap verify FAILED (klass not klass-shaped)" signature is GONE
+       (consistent with the silent-skip corruption mechanism above);
+       remaining failures are wrong-value family with heap verify OK —
+       nondeterministic mix of a host panic (`store_instvar_pop:
+       receiver is not a mem oop`, interpreter/mod.rs) and a guest
+       error (`large division unimplemented` at `SmallInteger>>// @27`)
+       under the same nm=218/nm=279 bci=21 reexecute churn. Likely
+       shares the GC-stress item's mechanism (a value corrupted across
+       the deopt/reexecute path).
 
    Original root-cause-4 crash shape (retained): a debug build panicked
    at `oops/mod.rs:57` ("mark tag: word 0x7 has MARK_TAG") from

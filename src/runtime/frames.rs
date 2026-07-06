@@ -66,7 +66,8 @@
 
 use crate::codecache::nmethod::NmethodId;
 use crate::codecache::stubs::{
-    KIND_ALLOC_SLOW, KIND_C2I, KIND_DNU, KIND_MEGA, KIND_MUST_BE_BOOLEAN, KIND_RESOLVE,
+    KIND_ALLOC_SLOW, KIND_C2I, KIND_DEOPT_BRIDGE, KIND_DNU, KIND_MEGA, KIND_MUST_BE_BOOLEAN,
+    KIND_RESOLVE,
 };
 use crate::interpreter::stack::Frame;
 use crate::oops::layout::ENTRY_FRAME_SENTINEL;
@@ -110,6 +111,10 @@ impl AdapterKind {
             KIND_DNU => AdapterKind::Dnu,
             KIND_MUST_BE_BOOLEAN => AdapterKind::MustBeBoolean,
             KIND_ALLOC_SLOW => AdapterKind::AllocSlow,
+            // The deopt trampolines' record (see `KIND_DEOPT_BRIDGE`'s own
+            // doc): same walker semantics as the synthetic bridge link —
+            // no RootSpill slots, pass through to the deoptee frame.
+            KIND_DEOPT_BRIDGE => AdapterKind::DeoptBridge,
             other => panic!(
                 "AdapterKind::from_raw: unrecognized last_compiled_kind {other} -- the anchor's \
                  kind tag and this mapping have drifted apart, or the anchor is corrupt"

@@ -31,9 +31,14 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use crate::compiler::assembler::xr;
-use crate::compiler::assembler::{mem, mem_post, mem_pre, sp, x, Assembler, RelocKind};
+use crate::compiler::assembler::{imm, mem, mem_post, mem_pre, sp, x, Assembler, RelocKind};
 use crate::compiler::jasm_assembler::JasmAssembler;
+use crate::oops::layout::{
+    VMREG_LAST_COMPILED_FP_OFFSET, VMREG_LAST_COMPILED_KIND_OFFSET, VMREG_LAST_COMPILED_PC_OFFSET,
+};
 use crate::oops::Oop;
+
+use super::stubs::KIND_DEOPT_BRIDGE;
 
 use super::{CodeCache, CodeHandle};
 
@@ -611,10 +616,16 @@ impl DeoptTrampolines {
 ///   mov  lr, x16                 // saved-lr := trap_pc (lr is dead here)
 ///   stp  fp, lr, [sp, #-16]!     // push a normal frame record for the walker
 ///   mov  fp, sp                  //   -> [fp] = trapped_frame_fp, [fp+8] = trap_pc
+///   str  fp, [x28, #LAST_FP]     // PUBLISH the record as the walker's anchor
+///   str  lr, [x28, #LAST_PC]     //   (task #92 — the record alone is invisible
+///   movz x9, #KIND_DEOPT_BRIDGE  //    to walk_frames' anchor-driven start rule)
+///   str  x9, [x28, #LAST_KIND]
 ///   ldr  x2, [fp]                // x2 := fp-of-trapped-frame (= the saved fp)
 ///   mov  x0, x28                 // &mut VmState (VM-state register, §3)
 ///   mov  x1, x16                 // trap pc
 ///   ldr  x16, <rt_uncommon_trap>; blr x16   // Rust; result oop -> x0
+///   str  xzr, [x28, #LAST_FP]    // clear the anchor (P9)
+///   str  xzr, [x28, #LAST_KIND]
 ///   ldr  x2, [fp]                // reload trapped_frame_fp (call clobbers x2)
 ///   mov  sp, x2                  // tear down trampoline record AND trapped frame
 ///   ldp  fp, lr, [sp], #16       // pop the COMPILED frame's own saved {fp,lr}
@@ -642,6 +653,28 @@ fn build_uncommon_trampoline() -> crate::compiler::assembler::CodeBlob {
     // Push { fp, lr(=trap_pc) } and re-root fp — a normal frame record.
     a.emit("stp", &[x(29), x(30), mem_pre(31, -16)]);
     a.emit("mov", &[x(29), sp()]);
+    // PUBLISH the record as the walker's anchor (task #92): the record alone
+    // is invisible — `walk_frames`' start rule reads `last_compiled_fp/pc/
+    // kind` when the innermost tier crossing is `IntoCompiled`, exactly the
+    // state a GC inside `deoptimize_frame`'s materializer allocations (e.g.
+    // `alloc_closure` under a block-carrying trap scope) walks from. Without
+    // this the walk asserts (frames.rs "no anchor is set") AND, were the
+    // assert removed, would skip the trapped frame's oops entirely. Same
+    // three writes as `emit_stub_prologue`+`emit_stub_kind_tag`, same x9
+    // scratch precedent (registers are dead at a deopt site — S12 spill-all).
+    a.emit(
+        "str",
+        &[x(29), mem(28, VMREG_LAST_COMPILED_FP_OFFSET as i64)],
+    );
+    a.emit(
+        "str",
+        &[x(30), mem(28, VMREG_LAST_COMPILED_PC_OFFSET as i64)],
+    );
+    a.emit("movz", &[x(9), imm(KIND_DEOPT_BRIDGE as i64)]);
+    a.emit(
+        "str",
+        &[x(9), mem(28, VMREG_LAST_COMPILED_KIND_OFFSET as i64)],
+    );
     // x2 := the trapped frame's fp (= saved fp we just pushed, = [fp]). This is
     // the FP `rt_uncommon_trap`/materialization reads slots against.
     a.emit("ldr", &[x(2), mem(29, 0)]);
@@ -654,6 +687,19 @@ fn build_uncommon_trampoline() -> crate::compiler::assembler::CodeBlob {
         Some(RelocKind::RuntimeAddr),
     );
     a.call_far(lit);
+    // CLEAR the anchor (P9 — a stale anchor outliving this frame would let a
+    // walker step into freed stack), exactly as `emit_stub_epilogue` does:
+    // xzr into fp + kind. Register 31 in a store's data position is the zero
+    // register (see `emit_stub_epilogue`'s own note). x0 (the result oop) is
+    // untouched.
+    a.emit(
+        "str",
+        &[x(31), mem(28, VMREG_LAST_COMPILED_FP_OFFSET as i64)],
+    );
+    a.emit(
+        "str",
+        &[x(31), mem(28, VMREG_LAST_COMPILED_KIND_OFFSET as i64)],
+    );
     // Teardown (D4): reload the trapped frame's fp from the stable record,
     // then set sp to it so the `ldp` pops the COMPILED frame's own {fp,lr} —
     // discarding both the trampoline record and the trapped compiled frame.
