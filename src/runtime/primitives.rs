@@ -1127,6 +1127,21 @@ fn prim_error(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     let _ = writeln!(vm.out, "Error: {text}");
     crate::runtime::error::print_stack_trace(vm);
     let _ = vm.out.flush();
+    // DBG1 (docs/DEBUGGER.md §3.1): when the debugger is active, a fatal
+    // guest error becomes an inspectable stop — the halt loop opens on the
+    // erring activation. The error stays terminal on resume (`error:` has
+    // no proceed semantics in v1); the halt is for looking, not healing.
+    if vm.debug.active && vm.debug.session_depth == 0 {
+        if let Some(m) = vm.regs.method {
+            let bci = vm.regs.bci;
+            crate::runtime::debug::halt(
+                vm,
+                m,
+                bci,
+                crate::runtime::debug::HaltReason::GuestError(format!("Error: {text}")),
+            );
+        }
+    }
     // DBG0 (docs/DEBUGGER.md §4.1): a fatal guest error gets the PROBE
     // mini-dossier — walkback + tier-link/anchor state + recent-history
     // ring + heap verify. No signal machinery: the interpreter is coherent

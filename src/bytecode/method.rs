@@ -151,8 +151,33 @@ impl MethodOop {
     /// Sets the compile-disabled bit and resets the invocation count to 0
     /// (D1: "Ineligible methods set a dont-compile bit... and reset the
     /// invocation count") — one write, since both live in the same smi.
+    /// NOTE (DBG1): this WHOLE-WORD write also clears `has_bp` — callers
+    /// that combine the two (`debug::set_breakpoint`) must re-set `has_bp`
+    /// after, which they do.
     pub fn set_compile_disabled(self) {
         self.set_counters(crate::oops::layout::COUNTERS_COMPILE_DISABLED_BIT);
+    }
+
+    /// DBG1: clears ONLY the compile-disabled bit (breakpoint removal
+    /// restores tier-up eligibility; recompilation then happens naturally
+    /// by counters).
+    pub fn clear_compile_disabled(self) {
+        self.set_counters(self.counters() & !crate::oops::layout::COUNTERS_COMPILE_DISABLED_BIT);
+    }
+
+    /// DBG1 (docs/DEBUGGER.md §2): does this method carry at least one
+    /// breakpoint? The dispatch fast path's second gate after
+    /// `debug.active`.
+    pub fn has_bp(self) -> bool {
+        self.counters() & crate::oops::layout::COUNTERS_HAS_BP_BIT != 0
+    }
+
+    pub fn set_has_bp(self) {
+        self.set_counters(self.counters() | crate::oops::layout::COUNTERS_HAS_BP_BIT);
+    }
+
+    pub fn clear_has_bp(self) {
+        self.set_counters(self.counters() & !crate::oops::layout::COUNTERS_HAS_BP_BIT);
     }
 
     pub fn literals(self) -> ArrayOop {

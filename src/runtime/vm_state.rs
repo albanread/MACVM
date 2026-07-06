@@ -659,6 +659,8 @@ pub struct VmState {
     /// DBG0: the PROBE dossier's recent-history ring (docs/DEBUGGER.md §4.2
     /// step 9). Holds no oops — see [`ProbeEvent`].
     pub probe_ring: ProbeRing,
+    /// DBG1: HALT's shared core (docs/DEBUGGER.md §2). Holds no oops.
+    pub debug: crate::runtime::debug::DebugState,
     /// Scoped GC roots for oops held across an allocating call (S7-9, SPEC
     /// §7.6) — see `memory::handles`. Boxed so its address is stable across
     /// this struct moving; `HandleScope` points directly at the box's
@@ -928,6 +930,7 @@ impl VmState {
             next_frame_serial: 0,
             dbg_oop: None,
             probe_ring: ProbeRing::new(),
+            debug: crate::runtime::debug::DebugState::new(),
             handle_arena: Box::new(crate::memory::handles::HandleArena::new()),
             code_cache,
             code_table: CodeTable::new(),

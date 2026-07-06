@@ -48,7 +48,8 @@ fn main() {
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(|s| s.as_str()) {
-        Some("run") => cmd_run(&args[1..]),
+        Some("run") => cmd_run(&args[1..], false),
+        Some("debug") => cmd_run(&args[1..], true),
         Some("repl") => cmd_repl(&args[1..]),
         Some("rusttcl") => cmd_rusttcl(&args[1..]),
         _ => println!("MACVM — Self/Strongtalk-lineage research VM (arm64). Scaffold only."),
@@ -89,10 +90,14 @@ fn load_world_with_warning(vm: &mut VmState, world_dir: &Path) {
 
 /// `macvm run <file.mst> [--world <dir>]` (SPEC §3.2, `sprint_s05_detail.md`
 /// §Design "CLI"). Exit 0 unless a compile error / uncaught VM error.
-fn cmd_run(args: &[String]) {
+/// `debug = true` (the `macvm debug` subcommand, DBG1 — docs/DEBUGGER.md
+/// §5): arm `vm.debug.active` before running, and honor `MACVM_DEBUG`'s
+/// `break:Class>>sel@bci[,…]` grammar after the world loads (the scripted
+/// gates' entry). `MACVM_DEBUG=1`/`break:` also arms plain `run`.
+fn cmd_run(args: &[String], debug: bool) {
     let (world_dir, rest) = parse_world_flag(args);
     let Some(file) = rest.first() else {
-        eprintln!("usage: macvm run <file.mst> [--world <dir>]");
+        eprintln!("usage: macvm run|debug <file.mst> [--world <dir>]");
         std::process::exit(2);
     };
     let mut vm = VmState::new();
@@ -100,6 +105,20 @@ fn cmd_run(args: &[String]) {
         &mut vm,
         &world_dir.unwrap_or_else(|| PathBuf::from("world")),
     );
+
+    let debug_spec = std::env::var("MACVM_DEBUG").unwrap_or_default();
+    if debug || !debug_spec.is_empty() {
+        vm.debug.active = true;
+        for (class, sel, bci) in macvm::runtime::debug::parse_debug_spec(&debug_spec) {
+            match macvm::runtime::debug::set_breakpoint_by_name(&mut vm, &class, &sel, bci) {
+                Ok(msg) => eprintln!("{msg}"),
+                // The class usually lives in the very file about to run —
+                // park the spec; install_method lands it the moment the
+                // method exists (debug::on_method_installed).
+                Err(_) => vm.debug.pending.push((class, sel, bci)),
+            }
+        }
+    }
 
     let result = macvm::frontend::world::load_file(&mut vm, Path::new(file));
     print_bytecode_count(&vm);

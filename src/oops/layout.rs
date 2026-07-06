@@ -247,6 +247,13 @@ pub const LOOP_COUNTER_LIMIT: i64 = 10_000;
 /// `COUNTERS_INVOCATION_MASK`'s bits 0-15.
 pub const COUNTERS_COMPILE_DISABLED_BIT: i64 = 1 << 16;
 
+/// DBG1 (docs/DEBUGGER.md §2): set on any method carrying at least one
+/// breakpoint, so the dispatch hook's hash lookup runs only inside methods
+/// that actually have breakpoints. Bit 32 — clear of the invocation (0-15)
+/// and loop (16-31) fields, and preserved by their masked
+/// read-modify-write updates.
+pub const COUNTERS_HAS_BP_BIT: i64 = 1 << 32;
+
 // --- MethodDictionary (SPEC §2.4, S3) ---------------------------------------
 // One named field (tally) then an indexable [k0,v0,k1,v1,...] tail.
 

@@ -381,6 +381,29 @@ fn dispatch_from(vm: &mut VmState, mut method: MethodOop, mut bci: usize) -> Oop
         if vm.options.trace.is_enabled("count") {
             vm.bytecode_count += 1;
         }
+        // DBG1 (docs/DEBUGGER.md §2): every debug check — breakpoint AND
+        // step — folds under this ONE master branch, so a non-debugging
+        // run pays exactly one untaken branch per bytecode (the same
+        // budget the trace checks above already spend). After a halt
+        // returns, `method` is re-derived from the scanned root: the halt
+        // loop's `print` doits can allocate and move it (the same reload
+        // discipline every send arm already follows).
+        if vm.debug.active {
+            let hit_bp = method.has_bp() && crate::runtime::debug::hit(vm, method, bci);
+            let hit_step = vm.debug.step.is_some() && crate::runtime::debug::step_check(vm, bci);
+            if hit_bp || hit_step {
+                let reason = if hit_bp {
+                    crate::runtime::debug::HaltReason::Breakpoint
+                } else {
+                    crate::runtime::debug::HaltReason::Step
+                };
+                crate::runtime::debug::halt(vm, method, bci, reason);
+                method = vm
+                    .regs
+                    .method
+                    .expect("dispatch: active method survives a halt");
+            }
+        }
         match op {
             OP_PUSH_SELF => {
                 let r = frame_receiver(vm);

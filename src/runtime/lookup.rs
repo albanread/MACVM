@@ -197,6 +197,14 @@ pub fn install_method(vm: &mut VmState, klass: KlassOop, selector: SymbolOop, m:
     let klass = klass_h.get(vm);
     let selector = selector_h.get(vm);
     crate::runtime::deps::invalidate_dependents(vm, klass, selector);
+
+    // DBG1: a pending name-based breakpoint spec (`MACVM_DEBUG=break:`)
+    // that names THIS (klass, selector) lands the moment the method
+    // exists — before any doit can call it (docs/DEBUGGER.md §5).
+    if vm.debug.active && !vm.debug.pending.is_empty() {
+        let m = m_h.get(vm);
+        crate::runtime::debug::on_method_installed(vm, klass, selector, m);
+    }
 }
 
 /// A `CompiledBlock` literal has no holder of its own at build time (its

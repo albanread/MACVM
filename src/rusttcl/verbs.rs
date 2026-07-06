@@ -60,6 +60,31 @@ const TABLE: &[VerbDoc] = &[
         help: "Compile and run a .mst file into the current VM (its classes become visible to disasm/methods/ic/nmethods afterward).",
     },
     VerbDoc {
+        name: "dbg",
+        usage: "dbg [on|off]",
+        help: "No args: report whether the HALT debugger is armed. on/off: arm/disarm it live (docs/DEBUGGER.md DBG1). While armed, breakpoints, `error:`, and DNU halt into the (halt) command loop instead of dying.",
+    },
+    VerbDoc {
+        name: "bp",
+        usage: "bp <Class> <selector> <bci>",
+        help: "Set a HALT breakpoint (side-table, method pinned to tier-0; existing nmethods invalidated through the redefinition path). Use \"Class class\" for the metaclass side. Arms dbg.",
+    },
+    VerbDoc {
+        name: "bp-clear",
+        usage: "bp-clear <Class> <selector> <bci>",
+        help: "Clear one breakpoint; the method's tier-up eligibility is restored once its last breakpoint is gone.",
+    },
+    VerbDoc {
+        name: "bp-list",
+        usage: "bp-list",
+        help: "List every live breakpoint as Class>>selector @bci.",
+    },
+    VerbDoc {
+        name: "ring",
+        usage: "ring",
+        help: "Dump the PROBE recent-history ring (DBG0): the last N compile / deopt / invalidate events, oldest first — the crash dossier's step 9, on demand.",
+    },
+    VerbDoc {
         name: "help",
         usage: "help [verb]",
         help: "List every RUSTTCL verb, or show one verb's full help text.",
@@ -80,6 +105,11 @@ pub fn register_macvm_verbs(registry: &mut Registry) {
     registry.register("trace", Arity::range(0, 2), verb_trace);
     registry.register("flag", Arity::range(0, 2), verb_flag);
     registry.register("load", Arity::exact(1), verb_load);
+    registry.register("dbg", Arity::range(0, 1), verb_dbg);
+    registry.register("bp", Arity::exact(3), verb_bp);
+    registry.register("bp-clear", Arity::exact(3), verb_bp_clear);
+    registry.register("bp-list", Arity::exact(0), verb_bp_list);
+    registry.register("ring", Arity::exact(0), verb_ring);
     registry.register("help", Arity::range(0, 1), verb_help);
     registry.register("quit", Arity::exact(0), verb_quit);
     registry.register("exit", Arity::exact(0), verb_quit);
@@ -380,4 +410,90 @@ fn verb_help(_vm: &mut Vm<'_>, args: &[Value]) -> TclResult<Value> {
 fn verb_quit(_vm: &mut Vm<'_>, _args: &[Value]) -> TclResult<Value> {
     bridge::active_ctx().quit = true;
     Ok(Value::empty())
+}
+
+// ── DBG1 (docs/DEBUGGER.md): the debugger's TCL surface ─────────────────
+
+fn verb_dbg(_vm: &mut Vm<'_>, args: &[Value]) -> TclResult<Value> {
+    let ctx = bridge::active_ctx();
+    match args {
+        [] => Ok(Value::new(if ctx.vm.debug.active { "on" } else { "off" })),
+        [setting] => match setting.as_str() {
+            "on" => {
+                ctx.vm.debug.active = true;
+                Ok(Value::empty())
+            }
+            "off" => {
+                ctx.vm.debug.active = false;
+                Ok(Value::empty())
+            }
+            other => Err(TclError::runtime(format!(
+                "dbg: expected on|off, got {other:?}"
+            ))),
+        },
+        _ => unreachable!("Arity::range(0, 1) already rejects more than 1 arg"),
+    }
+}
+
+fn verb_bp(_vm: &mut Vm<'_>, args: &[Value]) -> TclResult<Value> {
+    let ctx = bridge::active_ctx();
+    let bci: u16 = args[2].as_str().parse().map_err(|_| {
+        TclError::runtime(format!("bp: bci must be a number: {:?}", args[2].as_str()))
+    })?;
+    crate::runtime::debug::set_breakpoint_by_name(
+        &mut ctx.vm,
+        args[0].as_str(),
+        args[1].as_str(),
+        bci,
+    )
+    .map(Value::new)
+    .map_err(TclError::runtime)
+}
+
+fn verb_bp_clear(_vm: &mut Vm<'_>, args: &[Value]) -> TclResult<Value> {
+    let ctx = bridge::active_ctx();
+    let bci: u16 = args[2].as_str().parse().map_err(|_| {
+        TclError::runtime(format!(
+            "bp-clear: bci must be a number: {:?}",
+            args[2].as_str()
+        ))
+    })?;
+    crate::runtime::debug::clear_breakpoint_by_name(
+        &mut ctx.vm,
+        args[0].as_str(),
+        args[1].as_str(),
+        bci,
+    )
+    .map(Value::new)
+    .map_err(TclError::runtime)
+}
+
+fn verb_bp_list(_vm: &mut Vm<'_>, _args: &[Value]) -> TclResult<Value> {
+    let ctx = bridge::active_ctx();
+    let rows = ctx.vm.debug.list();
+    if rows.is_empty() {
+        Ok(Value::new("(no breakpoints)"))
+    } else {
+        Ok(Value::new(rows.join("\n")))
+    }
+}
+
+fn verb_ring(_vm: &mut Vm<'_>, _args: &[Value]) -> TclResult<Value> {
+    let ctx = bridge::active_ctx();
+    use crate::runtime::vm_state::ProbeEvent;
+    let mut rows: Vec<String> = vec![format!(
+        "showing last {} of {} events (oldest first)",
+        ctx.vm.probe_ring.iter_oldest_first().count(),
+        ctx.vm.probe_ring.total
+    )];
+    for e in ctx.vm.probe_ring.iter_oldest_first() {
+        rows.push(match e {
+            ProbeEvent::Compile { nm, version } => format!("compile   nm={nm} v{version}"),
+            ProbeEvent::Deopt { nm, bci, reexecute } => {
+                format!("deopt     nm={nm} bci={bci} reexecute={reexecute}")
+            }
+            ProbeEvent::Invalidate { nm } => format!("invalidate nm={nm}"),
+        });
+    }
+    Ok(Value::new(rows.join("\n")))
 }

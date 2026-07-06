@@ -9,6 +9,7 @@
 //! boundary already establishes, just for stack memory instead of code
 //! memory.
 
+pub mod debug;
 pub mod deopt;
 pub mod deps;
 pub mod error;
