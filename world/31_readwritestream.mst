@@ -1,0 +1,132 @@
+"31_readwritestream.mst — ReadWriteStream. Strongtalk's real
+ BasicReadWriteStream.dlt combines WriteStream and ReadStream behavior via
+ a mixin (`BasicOutputStream[E] mixin |> BasicReadStream[E]`) over a
+ shared engine neither of MACVM's existing WriteStream (18_writestream.mst)
+ nor ReadStream (24_readstream.mst) use — they're separate, simple classes,
+ and MACVM has no mixins. So this is its own class combining both sets of
+ methods directly, sharing ONE `position` cursor between reading and
+ writing (exactly Strongtalk's own semantics: nextPut: and next both
+ advance the same cursor) plus a `size` ivar tracking how much of
+ `collection` is logically valid content, distinct from
+ `collection size` (the raw, over-allocated array capacity WriteStream's
+ own grow: pattern already uses).
+
+ `on:` starts empty (`assuming it contains no readable elements yet`, per
+ Strongtalk's own doc comment) — matches; `on:numElements:` (also real,
+ for starting with existing readable content) is ported too.
+
+ contents/contentsWritten/contentsRemaining are Strongtalk's own three-way
+ split, verbatim: contents = contents-so-far (WriteStream compatibility,
+ `1 to: size`), contentsWritten = everything the CURSOR has passed
+ (`1 to: position`), contentsRemaining = everything still ahead of the
+ cursor (`position+1 to: size`)."
+
+Object subclass: ReadWriteStream [
+    | collection position size |
+
+    ReadWriteStream class >> on: aCollection [
+        | s |
+        s := self basicNew.
+        s setOn: aCollection.
+        ^s
+    ]
+    ReadWriteStream class >> on: aCollection numElements: n [
+        | s |
+        s := self on: aCollection.
+        s setSize: n.
+        ^s
+    ]
+    setOn: aCollection [
+        collection := aCollection.
+        position := 0.
+        size := 0.
+    ]
+    setSize: n [
+        size := n.
+    ]
+    size [
+        ^size
+    ]
+    position [
+        ^position
+    ]
+    position: p [
+        position := p.
+    ]
+    reset [
+        position := 0.
+    ]
+    skip: n [
+        position := position + n.
+    ]
+    atEnd [
+        ^position >= size
+    ]
+    grow [
+        | newCap newColl |
+        newCap := (collection size max: 4) * 2.
+        newColl := collection class new: newCap.
+        1 to: size do: [:i | newColl at: i put: (collection at: i) ].
+        collection := newColl.
+    ]
+    nextPut: e [
+        position = collection size ifTrue: [ self grow ].
+        position := position + 1.
+        collection at: position put: e.
+        position > size ifTrue: [ size := position ].
+        ^e
+    ]
+    nextPutAll: aColl [
+        aColl do: [:e | self nextPut: e ].
+        ^aColl
+    ]
+    next [
+        self atEnd ifTrue: [ ^self error: 'end of stream' ].
+        position := position + 1.
+        ^collection at: position
+    ]
+    peek [
+        self atEnd ifTrue: [ ^nil ].
+        ^collection at: position + 1
+    ]
+    upToEnd [
+        | r |
+        r := collection copyFrom: position + 1 to: size.
+        position := size.
+        ^r
+    ]
+    do: aBlock [
+        [ self atEnd ] whileFalse: [ aBlock value: self next ]
+    ]
+    "WriteStream compatibility: the elements written so far, ignoring
+     wherever the cursor currently sits (unlike contentsWritten below)."
+    contents [
+        ^collection copyFrom: 1 to: size
+    ]
+    "Everything the cursor has already passed, read or written."
+    contentsWritten [
+        ^collection copyFrom: 1 to: position
+    ]
+    "Everything still ahead of the cursor."
+    contentsRemaining [
+        ^collection copyFrom: position + 1 to: size
+    ]
+    << anObject [
+        anObject isString ifTrue: [ self nextPutAll: anObject. ^self ].
+        anObject isCharacter ifTrue: [ self nextPut: anObject. ^self ].
+        self nextPutAll: anObject printString.
+        ^self
+    ]
+    cr [
+        self nextPut: Character cr
+    ]
+    nl [
+        self nextPut: Character nl
+    ]
+    tab [
+        self nextPut: Character tab
+    ]
+    space [
+        self nextPut: Character space
+    ]
+]

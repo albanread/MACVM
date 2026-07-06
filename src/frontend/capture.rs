@@ -229,11 +229,8 @@ fn to_do_needs_real_send(loop_var: &str, body: &[Expr]) -> bool {
                 // declined, which left the whole enclosing method with an
                 // escaping closure and thus permanently uncompilable.)
                 let dissolving = inline_block_positions(selector, receiver, args);
-                let pos_dissolves = |p: BlockPos| {
-                    dissolving
-                        .as_ref()
-                        .is_some_and(|v| v.contains(&p))
-                };
+                let pos_dissolves =
+                    |p: BlockPos| dissolving.as_ref().is_some_and(|v| v.contains(&p));
                 match receiver.as_ref() {
                     Expr::Block(b) if pos_dissolves(BlockPos::Receiver) => {
                         for stmt in &b.body {

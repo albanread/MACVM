@@ -26,3 +26,18 @@
 18_writestream.mst
 19_printing.mst
 20_system.mst
+# W1 "library wave 1" additions (WORLD.md's Layer-A/B staged-adoption plan):
+# pure extensions of/additions to the classes above, so they load last and
+# add nothing earlier files could depend on.
+21_collections_ext.mst
+22_set.mst
+23_fraction.mst
+24_readstream.mst
+25_sortedcollection.mst
+26_bag.mst
+27_random.mst
+28_point.mst
+29_identity_collections.mst
+30_date_time.mst
+31_readwritestream.mst
+32_object_protocol_gaps.mst

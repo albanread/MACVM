@@ -14,6 +14,68 @@ use crate::oops::Oop;
 /// Default operand-stack capacity, in oop slots *(tunable)*.
 pub const DEFAULT_STACK_CAPACITY: usize = 64 * 1024;
 
+/// `MACVM_DBG_STACK_WRITES=1` (debug builds only): validate every value
+/// written into a process-stack slot AT WRITE TIME — the moment a bad
+/// pointer is created, not the later GC that trips over it. The check is
+/// `scavenge::audit_roots`' own mark-plausibility predicate (a mem oop's
+/// target must start with a mark-tagged word with the sentinel bit set);
+/// smis and immediates pass untouched, and SPEC §5.1's exact-stack
+/// invariant (every slot a valid oop, frame links smi-encoded) is what
+/// makes this check meaningful on every slot. Built for BUG D root cause
+/// 4's off-by-one-word pointer (tests/repros/README.md), where the
+/// discovering scavenge is far downstream of the corrupting write.
+///
+/// The auditor covers BOTH suspect classes with one choke point: mutator
+/// writes (interpreter/primitives/C2I marshaling/deopt materializer all
+/// funnel through `set`/`try_push`) AND a scavenge's own root rewrite
+/// (`roots::for_each_root`'s stack loop also writes back via `set`).
+#[cfg(debug_assertions)]
+fn stack_write_audit_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("MACVM_DBG_STACK_WRITES").is_ok())
+}
+
+/// Full GC must suspend the auditor: its phase-C forward-chase legitimately
+/// writes addresses whose bytes phase D hasn't copied yet (the exact
+/// transient `roots.rs`'s `from_oop_unchecked` comment documents), so
+/// target marks are unreadable mid-collection. Scavenge does NOT suspend —
+/// its copies are eager (bytes fully written before the new address
+/// escapes), so every value it writes back must already look plausible,
+/// and a bad scavenge rewrite is one of the two suspects this auditor
+/// exists to catch.
+#[cfg(debug_assertions)]
+static STACK_AUDIT_SUSPENDED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(debug_assertions)]
+pub fn stack_audit_suspend(on: bool) {
+    STACK_AUDIT_SUSPENDED.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(debug_assertions)]
+#[inline]
+fn audit_stack_write(idx: usize, v: Oop, via: &str) {
+    if !stack_write_audit_enabled()
+        || STACK_AUDIT_SUSPENDED.load(std::sync::atomic::Ordering::Relaxed)
+        || !v.is_mem()
+    {
+        return;
+    }
+    let m = crate::oops::wrappers::MemOop::try_from(v).unwrap();
+    let w = m.mark_word_raw();
+    let plausible = w & crate::oops::layout::TAG_MASK == crate::oops::layout::MARK_TAG
+        && w & 0b100 != 0;
+    if !plausible {
+        panic!(
+            "STACK-WRITE AUDIT ({via}): slot {idx} <- {:#x}, whose target mark word {:#x} \
+             is implausible — this write is the corruption, not its later GC discovery",
+            v.raw(),
+            w
+        );
+    }
+}
+
 /// The process stack is full — `try_push`'s error, so overflow can be
 /// tested without a real `exit(70)` subprocess.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
@@ -127,6 +189,8 @@ impl ProcessStack {
 
     #[inline]
     pub fn set(&mut self, idx: usize, v: Oop) {
+        #[cfg(debug_assertions)]
+        audit_stack_write(idx, v, "set");
         self.slots[idx] = v;
     }
 
@@ -139,6 +203,8 @@ impl ProcessStack {
         if self.sp >= self.slots.len() {
             return Err(StackOverflow);
         }
+        #[cfg(debug_assertions)]
+        audit_stack_write(self.sp, v, "push");
         self.slots[self.sp] = v;
         self.sp += 1;
         Ok(())

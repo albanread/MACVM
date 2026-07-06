@@ -1,0 +1,88 @@
+"22_sortedcollection_tests.mst — SortedCollectionTests (W1 'full
+ collections protocol' Layer A, world/25_sortedcollection.mst)."
+
+TestCase subclass: SortedCollectionTests [
+    runAll [
+        self runTest: #testDefaultAscendingOrder do: [ self testDefaultAscendingOrder ].
+        self runTest: #testReverseInsertionOrder do: [ self testReverseInsertionOrder ].
+        self runTest: #testDuplicatesKept do: [ self testDuplicatesKept ].
+        self runTest: #testCustomSortBlock do: [ self testCustomSortBlock ].
+        self runTest: #testAsSortedCollection do: [ self testAsSortedCollection ].
+        self runTest: #testAsSortedCollectionWithBlock do: [ self testAsSortedCollectionWithBlock ].
+        self runTest: #testIsSorted do: [ self testIsSorted ].
+        self runTest: #testAddFirstRedirectsThroughAdd do: [ self testAddFirstRedirectsThroughAdd ].
+        self runTest: #testInheritedCollectionProtocol do: [ self testInheritedCollectionProtocol ].
+        self runTest: #testEmptyAndSingle do: [ self testEmptyAndSingle ].
+        self runTest: #testPrintString do: [ self testPrintString ].
+    ]
+
+    testDefaultAscendingOrder [
+        | s |
+        s := SortedCollection new.
+        s add: 5; add: 2; add: 8; add: 1; add: 9.
+        self assert: s asArray = #(1 2 5 8 9).
+    ]
+    "Worst case for the bubble-left insertion step: every new element must
+     travel all the way to the front."
+    testReverseInsertionOrder [
+        | s |
+        s := SortedCollection new.
+        (10 to: 1 by: -1) do: [:i | s add: i ].
+        self assert: s asArray = #(1 2 3 4 5 6 7 8 9 10).
+    ]
+    testDuplicatesKept [
+        | s |
+        s := SortedCollection new.
+        s add: 3; add: 1; add: 3; add: 2; add: 3.
+        self assert: s asArray = #(1 2 3 3 3).
+        self assert: s size = 5.
+    ]
+    testCustomSortBlock [
+        | s |
+        s := SortedCollection sortBlock: [:a :b | a >= b].
+        s add: 3; add: 1; add: 4; add: 1; add: 5.
+        self assert: s asArray = #(5 4 3 1 1).
+    ]
+    testAsSortedCollection [
+        self assert: #(5 3 4 1 2) asSortedCollection asArray = #(1 2 3 4 5).
+    ]
+    testAsSortedCollectionWithBlock [
+        | s |
+        s := #(5 3 4 1 2) asSortedCollection: [:a :b | a >= b].
+        self assert: s asArray = #(5 4 3 2 1).
+    ]
+    testIsSorted [
+        self assert: (SortedCollection new add: 1; add: 2; add: 3; yourself) isSorted.
+    ]
+    "addFirst: on an OrderedCollection means 'insert at index 1' — on a
+     SortedCollection that would break sort order, so it's redirected
+     through add: instead (world/25_sortedcollection.mst)."
+    testAddFirstRedirectsThroughAdd [
+        | s |
+        s := SortedCollection new.
+        s addFirst: 5; addFirst: 1; addFirst: 3.
+        self assert: s asArray = #(1 3 5).
+    ]
+    "SortedCollection is still a Collection (via OrderedCollection), so
+     the generic protocol (21_collections_ext.mst) and OrderedCollection's
+     own (15_ordered.mst) both apply unchanged."
+    testInheritedCollectionProtocol [
+        | s |
+        s := #(5 3 1 4 2) asSortedCollection.
+        self assert: (s select: [:x | x > 2 ]) asArray = #(3 4 5).
+        self assert: (s inject: 0 into: [:a :b | a + b ]) = 15.
+        self assert: s first = 1.
+        self assert: s last = 5.
+    ]
+    testEmptyAndSingle [
+        self assert: SortedCollection new isEmpty.
+        self assert: SortedCollection new printString = 'SortedCollection ()'.
+        self assert: (SortedCollection new add: 42; yourself) asArray = #(42).
+    ]
+    testPrintString [
+        | s |
+        s := SortedCollection new.
+        s add: 2; add: 1.
+        self assert: s printString = 'SortedCollection (1 2 )'.
+    ]
+]

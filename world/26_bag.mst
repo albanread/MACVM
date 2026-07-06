@@ -1,0 +1,78 @@
+"26_bag.mst — Bag (W1 'full collections protocol' Layer A). NEW class.
+ Strongtalk's own Bag.dlt is itself just a thin wrapper over a Dictionary
+ of (element -> occurrence count) — 'contents <VarDict[E,Int]>' — so this
+ needs no new hash-table engine at all, unlike Set (which stores bare
+ elements): it reuses MACVM's existing, tested Dictionary directly.
+ Collection subclass: Bag (matching Strongtalk's real hierarchy: Bag sits
+ directly under Collection, a *sibling* of HashedCollection, not a child
+ of it — a Bag isn't itself a hash table, it just holds one).
+
+ remove:/remove:ifAbsent: ARE supported here (unlike Set, which has none,
+ matching Dictionary's own documented v1 'no deletion' scope cut) because
+ a Bag's removal never needs to delete a Dictionary KEY at all — it only
+ ever decrements an occurrence count, floors at 0, and leaves a zero-count
+ entry lying around harmlessly. includes: is therefore `occurrencesOf: >
+ 0`, NOT `contents includesKey:` (which would still answer true for an
+ element decremented all the way to zero) — a real bug considered and
+ avoided before it was ever written, not discovered afterwards.
+
+ size/occurrencesOf:/includes: are all overridden for O(1)/O(distinct
+ elements) efficiency, exactly like Strongtalk's own version, even though
+ the inherited Collection generics (do:-based) would already give the
+ same right answers less efficiently, since do: itself already expands
+ each element `occurrences` times."
+
+Collection subclass: Bag [
+    | contents |
+
+    Bag class >> new [
+        ^self basicNew init
+    ]
+    init [
+        contents := Dictionary new.
+    ]
+    add: el [
+        ^self add: el withOccurrences: 1
+    ]
+    add: el withOccurrences: oc [
+        contents at: el put: oc + (self occurrencesOf: el).
+        ^el
+    ]
+    occurrencesOf: o [
+        ^contents at: o ifAbsent: [ 0 ]
+    ]
+    includes: el [
+        ^(self occurrencesOf: el) > 0
+    ]
+    size [
+        ^contents inject: 0 into: [:tot :occ | tot + occ ]
+    ]
+    remove: el [
+        ^self remove: el ifAbsent: [ self error: 'element not found' ]
+    ]
+    remove: el ifAbsent: absentBlock [
+        | oc |
+        oc := self occurrencesOf: el.
+        oc = 0 ifTrue: [ ^absentBlock value ].
+        contents at: el put: oc - 1.
+        ^el
+    ]
+    do: aBlock [
+        contents keysAndValuesDo: [:el :occ |
+            occ timesRepeat: [ aBlock value: el ] ]
+    ]
+    printOn: s [
+        s nextPutAll: 'Bag ('.
+        self do: [:each | each printOn: s. s nextPut: $  ].
+        s nextPut: $)
+    ]
+]
+
+Object subclass: Collection [
+    asBag [
+        | b |
+        b := Bag new.
+        self do: [:each | b add: each ].
+        ^b
+    ]
+]

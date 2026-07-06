@@ -1,0 +1,92 @@
+"25_sortedcollection.mst — SortedCollection (W1 'full collections
+ protocol' Layer A). NEW class: OrderedCollection subclass: SortedCollection,
+ reusing its array/growth engine entirely rather than porting Strongtalk's
+ own SortedCollection.dlt startGap/binarySearchFor:between:and: machinery
+ (which itself sits on an AddableSequenceableCollection abstraction MACVM
+ doesn't have). `add:` is a plain insertion-sort step — append via the
+ inherited addLast:, then bubble left via at:/at:put: (OrderedCollection's
+ PUBLIC protocol only; never touches its private array/firstIndex/
+ lastIndex ivars, so it can't desync them). O(n) worst case per insert,
+ same asymptotic cost as Strongtalk's own shift-based
+ makeSpace:beforeIndex:; a real binary search for the insertion point
+ would only cut the *comparison* count, not the shift cost, so it isn't
+ worth the extra complexity for v1.
+
+ addFirst: is redirected through add: as a cheap safety net (the name
+ otherwise implies 'insert at the front', which would silently break sort
+ order) — at:put: is NOT guarded (matches Strongtalk's own stance: it's a
+ documented misuse, not something worth building machinery to prevent).
+
+ Also reopens Magnitude (defaultSort, matching Strongtalk's Magnitude.dlt
+ class-side utility) and Collection (asSortedCollection/
+ asSortedCollection:, the same reopen-after-defining pattern
+ world/22_set.mst and world/24_readstream.mst already established for
+ asSet/readStream)."
+
+Object subclass: Magnitude [
+    Magnitude class >> defaultSort [
+        ^[:a :b | a <= b]
+    ]
+]
+
+OrderedCollection subclass: SortedCollection [
+    | sortBlock |
+
+    SortedCollection class >> new [
+        ^self sortBlock: Magnitude defaultSort
+    ]
+    SortedCollection class >> sortBlock: aBlock [
+        | s |
+        s := self basicNew.
+        s init.
+        s setSortBlock: aBlock.
+        ^s
+    ]
+    setSortBlock: aBlock [
+        sortBlock := aBlock.
+    ]
+    sortBlock [
+        ^sortBlock
+    ]
+    add: newObject [
+        | i |
+        self addLast: newObject.
+        i := self size.
+        [ i > 1 and: [ sortBlock value: newObject value: (self at: i - 1) ] ]
+            whileTrue: [
+                | prior |
+                prior := self at: i - 1.
+                self at: i - 1 put: newObject.
+                self at: i put: prior.
+                i := i - 1 ].
+        ^newObject
+    ]
+    addFirst: v [
+        ^self add: v
+    ]
+    isSorted [
+        2 to: self size do: [:i |
+            (sortBlock value: (self at: i - 1) value: (self at: i)) ifFalse: [ ^false ] ].
+        ^true
+    ]
+    printOn: s [
+        s nextPutAll: 'SortedCollection ('.
+        self do: [:each | each printOn: s. s nextPut: $  ].
+        s nextPut: $)
+    ]
+]
+
+Object subclass: Collection [
+    asSortedCollection [
+        | s |
+        s := SortedCollection new.
+        self do: [:each | s add: each ].
+        ^s
+    ]
+    asSortedCollection: aSortBlock [
+        | s |
+        s := SortedCollection sortBlock: aSortBlock.
+        self do: [:each | s add: each ].
+        ^s
+    ]
+]

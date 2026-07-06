@@ -1,0 +1,81 @@
+"24_random_tests.mst — RandomTests (world/27_random.mst). testParkMillerConformance
+ is the important one: it's Strongtalk's own Random.dlt classSide>>test,
+ not a MACVM-invented number — the well-known Park & Miller 'Minimal
+ Standard' LCG reference vector (seed 1, 10000 iterations -> 1043618065),
+ independently checkable against any other conformant implementation."
+
+TestCase subclass: RandomTests [
+    runAll [
+        self runTest: #testParkMillerConformance do: [ self testParkMillerConformance ].
+        self runTest: #testDefaultSeedIsOne do: [ self testDefaultSeedIsOne ].
+        self runTest: #testFirstStepFromSeedOne do: [ self testFirstStepFromSeedOne ].
+        self runTest: #testNextStaysInUnitInterval do: [ self testNextStaysInUnitInterval ].
+        self runTest: #testPeekDoesNotAdvance do: [ self testPeekDoesNotAdvance ].
+        self runTest: #testPeekMatchesSubsequentNext do: [ self testPeekMatchesSubsequentNext ].
+        self runTest: #testSameSeedReproducible do: [ self testSameSeedReproducible ].
+        self runTest: #testDifferentSeedsDiverge do: [ self testDifferentSeedsDiverge ].
+        self runTest: #testNextIntegerInRange do: [ self testNextIntegerInRange ].
+    ]
+
+    testParkMillerConformance [
+        | r |
+        r := Random new.
+        10000 timesRepeat: [ r next ].
+        self assert: r seed = 1043618065.
+    ]
+    testDefaultSeedIsOne [
+        self assert: Random new seed = 1.
+    ]
+    "16807 * 1 \\ modulus = 16807 exactly (the multiplier itself) — the
+     simplest possible hand-checkable step of the sequence."
+    testFirstStepFromSeedOne [
+        | r |
+        r := Random new.
+        r next.
+        self assert: r seed = 16807.
+    ]
+    testNextStaysInUnitInterval [
+        | r outOfRange |
+        r := Random new.
+        outOfRange := 0.
+        1 to: 500 do: [:i |
+            | x |
+            x := r next.
+            (x > 0 and: [ x < 1 ]) ifFalse: [ outOfRange := outOfRange + 1 ] ].
+        self assert: outOfRange = 0.
+    ]
+    testPeekDoesNotAdvance [
+        | r |
+        r := Random new.
+        self assert: r peek = r peek.
+        self assert: r seed = 1.
+    ]
+    testPeekMatchesSubsequentNext [
+        | r peeked |
+        r := Random new.
+        peeked := r peek.
+        self assert: r next = peeked.
+    ]
+    testSameSeedReproducible [
+        | r r2 |
+        r := Random newWithSeed: 42.
+        r2 := Random newWithSeed: 42.
+        self assert: r next = r2 next.
+        self assert: r next = r2 next.
+    ]
+    testDifferentSeedsDiverge [
+        | r r2 |
+        r := Random newWithSeed: 1.
+        r2 := Random newWithSeed: 2.
+        self deny: r next = r2 next.
+    ]
+    testNextIntegerInRange [
+        | r |
+        r := Random new.
+        1 to: 100 do: [:i |
+            | n |
+            n := r nextInteger.
+            self assert: n >= 0.
+            self assert: n < SmallInteger maxVal ].
+    ]
+]

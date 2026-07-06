@@ -20,4 +20,17 @@
 16_dispatch_tests.mst
 17_gc_full_tests.mst
 tier1.mst
+# W1 "library wave 1" test coverage (world/21-24_*.mst).
+18_collections_ext_tests.mst
+19_set_tests.mst
+20_fraction_tests.mst
+21_readstream_tests.mst
+22_sortedcollection_tests.mst
+23_bag_tests.mst
+24_random_tests.mst
+25_point_tests.mst
+26_identity_collections_tests.mst
+27_date_time_tests.mst
+28_readwritestream_tests.mst
+29_object_protocol_gaps_tests.mst
 99_run_all.mst

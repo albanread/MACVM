@@ -1,0 +1,126 @@
+"26_identity_collections_tests.mst — IdentityCollectionsTests
+ (world/29_identity_collections.mst). `'hel', 'lo'` (concatenation) is used
+ throughout to build two distinct String objects with equal content — `,`
+ always allocates a fresh result, unlike a literal, which the compiler may
+ in principle intern/share (String literals aren't guaranteed distinct
+ objects the way a computed concatenation result is)."
+
+TestCase subclass: IdentityCollectionsTests [
+    runAll [
+        self runTest: #testEqualButDistinctStringsSetUp do: [ self testEqualButDistinctStringsSetUp ].
+        self runTest: #testIdentitySetKeepsBothEqualDistinctObjects do: [ self testIdentitySetKeepsBothEqualDistinctObjects ].
+        self runTest: #testPlainSetCollapsesEqualObjects do: [ self testPlainSetCollapsesEqualObjects ].
+        self runTest: #testIdentitySetIncludesIsIdentityBased do: [ self testIdentitySetIncludesIsIdentityBased ].
+        self runTest: #testIdentitySetDedupsTheSameObject do: [ self testIdentitySetDedupsTheSameObject ].
+        self runTest: #testIdentityDictionaryKeepsBothEqualDistinctKeys do: [ self testIdentityDictionaryKeepsBothEqualDistinctKeys ].
+        self runTest: #testIdentityDictionaryLookupIsIdentityBased do: [ self testIdentityDictionaryLookupIsIdentityBased ].
+        self runTest: #testIdentityDictionarySameKeyObjectOverwrites do: [ self testIdentityDictionarySameKeyObjectOverwrites ].
+        self runTest: #testIdentityDictionaryGrowthPastCapacity do: [ self testIdentityDictionaryGrowthPastCapacity ].
+        self runTest: #testIdentitySetGrowthPastCapacity do: [ self testIdentitySetGrowthPastCapacity ].
+        self runTest: #testIdentityDictionaryPrintString do: [ self testIdentityDictionaryPrintString ].
+        self runTest: #testIdentitySetPrintString do: [ self testIdentitySetPrintString ].
+        self runTest: #testWorksWithSmallIntegerKeysToo do: [ self testWorksWithSmallIntegerKeysToo ].
+    ]
+
+    testEqualButDistinctStringsSetUp [
+        | s1 s2 |
+        s1 := 'hel', 'lo'.
+        s2 := 'hel', 'lo'.
+        self assert: s1 = s2.
+        self deny: s1 == s2.
+    ]
+    testIdentitySetKeepsBothEqualDistinctObjects [
+        | s set |
+        set := IdentitySet new.
+        set add: ('hel', 'lo'); add: ('hel', 'lo').
+        self assert: set size = 2.
+        s := 'x', 'y'.
+        set add: s; add: s.
+        self assert: set size = 3.
+    ]
+    testPlainSetCollapsesEqualObjects [
+        | set |
+        set := Set new.
+        set add: ('hel', 'lo'); add: ('hel', 'lo').
+        self assert: set size = 1.
+    ]
+    testIdentitySetIncludesIsIdentityBased [
+        | s1 set |
+        s1 := 'hel', 'lo'.
+        set := IdentitySet new.
+        set add: s1.
+        self assert: (set includes: s1).
+        self deny: (set includes: ('hel', 'lo')).
+    ]
+    testIdentitySetDedupsTheSameObject [
+        | s1 set |
+        s1 := 'hel', 'lo'.
+        set := IdentitySet new.
+        set add: s1; add: s1; add: s1.
+        self assert: set size = 1.
+    ]
+    testIdentityDictionaryKeepsBothEqualDistinctKeys [
+        | s1 s2 d |
+        s1 := 'hel', 'lo'.
+        s2 := 'hel', 'lo'.
+        d := IdentityDictionary new.
+        d at: s1 put: 'first'; at: s2 put: 'second'.
+        self assert: d size = 2.
+        self assert: (d at: s1) = 'first'.
+        self assert: (d at: s2) = 'second'.
+    ]
+    testIdentityDictionaryLookupIsIdentityBased [
+        | s1 d |
+        s1 := 'hel', 'lo'.
+        d := IdentityDictionary new.
+        d at: s1 put: 'found'.
+        self assert: (d at: ('hel', 'lo') ifAbsent: [ 'missing' ]) = 'missing'.
+        self assert: (d at: s1 ifAbsent: [ 'missing' ]) = 'found'.
+    ]
+    testIdentityDictionarySameKeyObjectOverwrites [
+        | s1 d |
+        s1 := 'hel', 'lo'.
+        d := IdentityDictionary new.
+        d at: s1 put: 'first'.
+        d at: s1 put: 'overwritten'.
+        self assert: d size = 1.
+        self assert: (d at: s1) = 'overwritten'.
+    ]
+    testIdentityDictionaryGrowthPastCapacity [
+        | d |
+        d := IdentityDictionary new.
+        1 to: 100 do: [:i | d at: i put: i * 2 ].
+        self assert: d size = 100.
+        1 to: 100 do: [:i | self assert: (d at: i) = (i * 2) ].
+    ]
+    testIdentitySetGrowthPastCapacity [
+        | set |
+        set := IdentitySet new.
+        1 to: 100 do: [:i | set add: i ].
+        self assert: set size = 100.
+        1 to: 100 do: [:i | self assert: (set includes: i) ].
+    ]
+    testIdentityDictionaryPrintString [
+        | d |
+        d := IdentityDictionary new.
+        d at: 1 put: 2.
+        self assert: d printString = 'IdentityDictionary (1->2 )'.
+    ]
+    testIdentitySetPrintString [
+        | set |
+        set := IdentitySet new.
+        set add: 1.
+        self assert: set printString = 'IdentitySet (1 )'.
+    ]
+    "SmallIntegers are their own identityHash (06_smallinteger.mst), and
+     numerically-equal SmallIntegers are always the SAME tagged value at
+     the VM level, so == and = coincide for them — an important sanity
+     check that identity collections behave normally for immediate values,
+     not just showing a difference for heap objects like String."
+    testWorksWithSmallIntegerKeysToo [
+        | d |
+        d := IdentityDictionary new.
+        d at: 5 put: 'five'.
+        self assert: (d at: 5) = 'five'.
+    ]
+]

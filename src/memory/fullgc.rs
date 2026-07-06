@@ -437,6 +437,19 @@ fn retarget_dbg_oop(vm: &mut VmState, plan: &CompactPlan) {
 /// than it already has, so this never actually returns `Err` today —
 /// kept for signature stability, not because failure is reachable yet.
 pub fn full_gc(vm: &mut VmState) -> Result<FullGcReport, GcStallError> {
+    // The MACVM_DBG_STACK_WRITES auditor must not observe phase C's
+    // forward-chase root rewrites (addresses phase D hasn't copied bytes
+    // to yet — target marks transiently unreadable); suspended for the
+    // whole collection, restored on every exit path.
+    #[cfg(debug_assertions)]
+    crate::interpreter::stack::stack_audit_suspend(true);
+    let r = full_gc_inner(vm);
+    #[cfg(debug_assertions)]
+    crate::interpreter::stack::stack_audit_suspend(false);
+    r
+}
+
+fn full_gc_inner(vm: &mut VmState) -> Result<FullGcReport, GcStallError> {
     assert!(
         vm.universe.gc_enabled,
         "full_gc called before genesis finished (SPEC §7.3 A1, shared with scavenge)"

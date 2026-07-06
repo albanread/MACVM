@@ -1,0 +1,61 @@
+"29_identity_collections.mst — IdentityDictionary/IdentitySet. Strongtalk's
+ own versions (IdentityDictionary.dlt/IdentitySet.dlt) are tiny: its
+ HashedCollection is written generically over two overridable hooks
+ (hashFor:/key:matches:), so IdentityDictionary/IdentitySet each override
+ just those two.
+
+ MACVM's Dictionary (16_dictionary.mst) and Set (22_set.mst) don't have
+ that hook indirection — they call `key hash`/`=` (or `anObject hash`/`=`)
+ directly inside their own scanFor: bodies. But tracing every OTHER method
+ on both classes (at:put:/at:ifAbsent:/includesKey:/add:/includes:/grow/
+ checkGrow/do:/size/...) shows none of them call hash/= directly — they
+ all reach a key/element via `self scanFor: ...` first, dispatched
+ polymorphically. So scanFor: is the ONLY place the hash/equality choice
+ lives, and overriding just that one method here (reusing the inherited
+ keys/vals/elements instance variables directly — ordinary Smalltalk
+ instance-variable inheritance, not a private-encapsulation violation)
+ is enough to correctly identity-ify the whole inherited engine: new,
+ at:put:, grow, do:, size, printOn: (once given their own class name,
+ below) all just work, unchanged.
+
+ identityHash is universal (Object>>identityHash, 01_object.mst) so this
+ works for any key/element type, not just the ones Dictionary/Set were
+ already exercised against."
+
+Dictionary subclass: IdentityDictionary [
+    scanFor: key [
+        | cap i probe |
+        cap := keys size.
+        i := (key identityHash bitAnd: cap - 1) + 1.
+        [ true ] whileTrue: [
+            probe := keys at: i.
+            (probe isNil or: [ probe == key ]) ifTrue: [ ^i ].
+            i := i = cap ifTrue: [ 1 ] ifFalse: [ i + 1 ] ]
+    ]
+    printOn: s [
+        s nextPutAll: 'IdentityDictionary ('.
+        self keysAndValuesDo: [:k :v |
+            k printOn: s.
+            s nextPutAll: '->'.
+            v printOn: s.
+            s nextPut: $  ].
+        s nextPut: $)
+    ]
+]
+
+Set subclass: IdentitySet [
+    scanFor: anObject [
+        | cap i probe |
+        cap := elements size.
+        i := (anObject identityHash bitAnd: cap - 1) + 1.
+        [ true ] whileTrue: [
+            probe := elements at: i.
+            (probe isNil or: [ probe == anObject ]) ifTrue: [ ^i ].
+            i := i = cap ifTrue: [ 1 ] ifFalse: [ i + 1 ] ]
+    ]
+    printOn: s [
+        s nextPutAll: 'IdentitySet ('.
+        self do: [:each | each printOn: s. s nextPut: $  ].
+        s nextPut: $)
+    ]
+]

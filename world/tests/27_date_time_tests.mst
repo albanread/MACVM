@@ -1,0 +1,115 @@
+"27_date_time_tests.mst — DateTimeTests (world/30_date_time.mst). Only
+ covers the working subset Date.dlt/Time.dlt actually have — no
+ today:/now/calendar-arithmetic tests, since none of that exists to test
+ (see 30_date_time.mst's own header for exactly why)."
+
+TestCase subclass: DateTimeTests [
+    runAll [
+        self runTest: #testDateConstructionAndAccessors do: [ self testDateConstructionAndAccessors ].
+        self runTest: #testDateFromMonthName do: [ self testDateFromMonthName ].
+        self runTest: #testDayAndMonthNameLookup do: [ self testDayAndMonthNameLookup ].
+        self runTest: #testDateComparisonByYear do: [ self testDateComparisonByYear ].
+        self runTest: #testDateComparisonByMonth do: [ self testDateComparisonByMonth ].
+        self runTest: #testDateComparisonByDay do: [ self testDateComparisonByDay ].
+        self runTest: #testDateEquality do: [ self testDateEquality ].
+        self runTest: #testDateEqualityAgainstNonDate do: [ self testDateEqualityAgainstNonDate ].
+        self runTest: #testDateHashStable do: [ self testDateHashStable ].
+        self runTest: #testDatePrintString do: [ self testDatePrintString ].
+        self runTest: #testTimeFromSecondsAndAccessors do: [ self testTimeFromSecondsAndAccessors ].
+        self runTest: #testTimeMinutes do: [ self testTimeMinutes ].
+        self runTest: #testTimeArithmetic do: [ self testTimeArithmetic ].
+        self runTest: #testTimeComparison do: [ self testTimeComparison ].
+        self runTest: #testTimeEquality do: [ self testTimeEquality ].
+        self runTest: #testTimeEqualityAgainstNonTime do: [ self testTimeEqualityAgainstNonTime ].
+        self runTest: #testTimePrintString do: [ self testTimePrintString ].
+    ]
+
+    testDateConstructionAndAccessors [
+        | d |
+        d := Date newDay: 4 monthIndex: 7 year: 2026.
+        self assert: d dayOfMonth = 4.
+        self assert: d monthIndex = 7.
+        self assert: d year = 2026.
+        self assert: d month = #July.
+    ]
+    testDateFromMonthName [
+        | d |
+        d := Date newDay: 25 month: #December year: 1999.
+        self assert: d monthIndex = 12.
+        self assert: d dayOfMonth = 25.
+        self assert: d year = 1999.
+    ]
+    testDayAndMonthNameLookup [
+        self assert: (Date dayOfWeek: #Monday) = 1.
+        self assert: (Date dayOfWeek: #Sunday) = 7.
+        self assert: (Date nameOfDay: 1) = #Monday.
+        self assert: (Date indexOfMonth: #January) = 1.
+        self assert: (Date indexOfMonth: #December) = 12.
+        self assert: (Date nameOfMonth: 1) = #January.
+    ]
+    testDateComparisonByYear [
+        self assert: (Date newDay: 1 month: #January year: 2020) < (Date newDay: 1 month: #January year: 2021).
+        self deny: (Date newDay: 1 month: #January year: 2021) < (Date newDay: 1 month: #January year: 2020).
+    ]
+    testDateComparisonByMonth [
+        self assert: (Date newDay: 1 month: #January year: 2020) < (Date newDay: 1 month: #February year: 2020).
+    ]
+    testDateComparisonByDay [
+        self assert: (Date newDay: 1 month: #January year: 2020) < (Date newDay: 2 month: #January year: 2020).
+        self assert: (Date newDay: 1 month: #January year: 2020) <= (Date newDay: 1 month: #January year: 2020).
+        self assert: (Date newDay: 2 month: #January year: 2020) > (Date newDay: 1 month: #January year: 2020).
+    ]
+    testDateEquality [
+        self assert: (Date newDay: 4 month: #July year: 2026) = (Date newDay: 4 month: #July year: 2026).
+        self deny: (Date newDay: 4 month: #July year: 2026) = (Date newDay: 5 month: #July year: 2026).
+        self deny: (Date newDay: 4 month: #July year: 2026) = (Date newDay: 4 month: #August year: 2026).
+    ]
+    "Date>>= checks isKindOf: Date first, matching the isPoint-style
+     defensive pattern established for Point/Fraction — without it this
+     would doesNotUnderstand instead of answering false."
+    testDateEqualityAgainstNonDate [
+        self deny: (Date newDay: 4 month: #July year: 2026) = 5.
+        self deny: (Date newDay: 4 month: #July year: 2026) = 'not a date'.
+    ]
+    testDateHashStable [
+        self assert: (Date newDay: 4 month: #July year: 2026) hash
+            = (Date newDay: 4 month: #July year: 2026) hash.
+    ]
+    testDatePrintString [
+        self assert: (Date newDay: 4 month: #July year: 2026) printString = 'July 4, 2026'.
+    ]
+    testTimeFromSecondsAndAccessors [
+        | t |
+        t := Time fromSeconds: 3725.
+        self assert: t asSeconds = 3725.
+        self assert: t hour = 1.
+        self assert: t minute = 2.
+        self assert: t second = 5.
+    ]
+    testTimeMinutes [
+        self assert: (Time fromSeconds: 3725) minutes = 62.
+    ]
+    testTimeArithmetic [
+        | t |
+        t := (Time fromSeconds: 3600) addTime: (Time fromSeconds: 61).
+        self assert: t asSeconds = 3661.
+        t := (Time fromSeconds: 3661) subtractTime: (Time fromSeconds: 61).
+        self assert: t asSeconds = 3600.
+    ]
+    testTimeComparison [
+        self assert: (Time fromSeconds: 100) < (Time fromSeconds: 200).
+        self assert: (Time fromSeconds: 100) <= (Time fromSeconds: 100).
+        self assert: (Time fromSeconds: 200) > (Time fromSeconds: 100).
+    ]
+    testTimeEquality [
+        self assert: (Time fromSeconds: 100) = (Time fromSeconds: 100).
+        self deny: (Time fromSeconds: 100) = (Time fromSeconds: 200).
+    ]
+    testTimeEqualityAgainstNonTime [
+        self deny: (Time fromSeconds: 100) = 'nope'.
+        self deny: (Time fromSeconds: 100) = 100.
+    ]
+    testTimePrintString [
+        self assert: (Time fromSeconds: 3725) printString = '1:2:5'.
+    ]
+]

@@ -1,0 +1,143 @@
+"28_point.mst — Point. Strongtalk's real Point.dlt is ABSTRACT (x/y are
+ subclassResponsibility; a separate concrete HeavyPoint class actually
+ holds the coordinates, and `Point class>>x:y:` returns a HeavyPoint) —
+ an artifact of its typed-protocol design wanting room for multiple
+ concrete point representations. MACVM has no second representation to
+ make room for, so this collapses the whole thing into one concrete
+ class holding x/y directly (WORLD.md's 'Layer B: reimplement fresh,
+ consult originals for protocol surface').
+
+ expandRect:/insetRect:/corner:/extent: are DELIBERATELY NOT ported — they
+ return/accept a Rectangle, Strongtalk's own UI-toolkit geometry class,
+ which MACVM has no use for at all: the GUI is HTML/JS-rendered
+ (gui/src/objc.rs's WKWebView shell), not Smalltalk-Rectangle-based
+ (WORLD.md's Layer C: 'UI, replaced by WKWebView').
+
+ Also reopens Number (the `@` constructor operator, plus `truncateTo:`,
+ needed for Point>>truncateTo: to have something to call) and Integer
+ (floor/truncated/rounded as identity operations — genuinely absent
+ before this file, since nothing previously needed a SmallInteger's own
+ floor/truncated/rounded; Double already has all three, 08_double.mst)."
+
+nil subclass: Object [
+    isPoint [
+        ^false
+    ]
+]
+
+Object subclass: Point [
+    | x y |
+
+    Point class >> x: xval y: yval [
+        ^self basicNew setX: xval y: yval
+    ]
+    Point class >> origin [
+        ^self x: 0 y: 0
+    ]
+    setX: xval y: yval [
+        x := xval.
+        y := yval.
+    ]
+    x [
+        ^x
+    ]
+    y [
+        ^y
+    ]
+    isPoint [
+        ^true
+    ]
+    asPoint [
+        ^self
+    ]
+    hash [
+        ^(x hash bitShift: 10) bitXor: (x hash bitXor: y hash)
+    ]
+    = other [
+        other isPoint ifFalse: [ ^false ].
+        ^x = other x and: [ y = other y ]
+    ]
+    < other [
+        ^x < other x and: [ y < other y ]
+    ]
+    <= other [
+        ^x <= other x and: [ y <= other y ]
+    ]
+    > other [
+        ^x > other x and: [ y > other y ]
+    ]
+    >= other [
+        ^x >= other x and: [ y >= other y ]
+    ]
+    + other [
+        ^Point x: x + other x y: y + other y
+    ]
+    - other [
+        ^Point x: x - other x y: y - other y
+    ]
+    * other [
+        ^Point x: x * other x y: y * other y
+    ]
+    / other [
+        ^Point x: x / other x y: y / other y
+    ]
+    // other [
+        ^Point x: x // other x y: y // other y
+    ]
+    abs [
+        ^Point x: x abs y: y abs
+    ]
+    negated [
+        ^Point x: x negated y: y negated
+    ]
+    floor [
+        ^Point x: x floor y: y floor
+    ]
+    rounded [
+        ^Point x: x rounded y: y rounded
+    ]
+    truncated [
+        ^Point x: x truncated y: y truncated
+    ]
+    truncateTo: grid [
+        ^Point x: (x truncateTo: grid) y: (y truncateTo: grid)
+    ]
+    max: other [
+        ^Point x: (x max: other x) y: (y max: other y)
+    ]
+    min: other [
+        ^Point x: (x min: other x) y: (y min: other y)
+    ]
+    relativeTo: p [
+        ^self - p
+    ]
+    translatedBy: p [
+        ^self + p
+    ]
+    printOn: s [
+        x printOn: s.
+        s nextPutAll: '@'.
+        y printOn: s.
+    ]
+]
+
+Magnitude subclass: Number [
+    @ aNumber [
+        ^Point x: self y: aNumber
+    ]
+    truncateTo: grid [
+        ^(self / grid) truncated * grid
+    ]
+]
+
+Number subclass: Integer [
+    floor [
+        ^self
+    ]
+    truncated [
+        ^self
+    ]
+    rounded [
+        ^self
+    ]
+]

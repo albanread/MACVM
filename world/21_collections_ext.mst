@@ -1,0 +1,34 @@
+"21_collections_ext.mst — Collection enumeration protocol completion (W1
+ 'full collections protocol'). Ported from Strongtalk's real Collection.dlt
+ (select:/reject:/collect:/occurrencesOf:), stripped of static types and
+ the generic-collection 'species'/'collectUsingAdd:' machinery MACVM's
+ untyped model doesn't need — every result is a plain OrderedCollection,
+ matching the style OrderedCollection's own local collect: (15_ordered.mst)
+ already established. reject: is defined in terms of select: exactly as
+ Strongtalk does it. Reopens Collection (10_array.mst), so every existing
+ and future subclass (Array, String, Dictionary, Interval, Set, ...) gets
+ these for free unless it already has (and keeps) its own override."
+
+Object subclass: Collection [
+    select: aBlock [
+        | r |
+        r := OrderedCollection new.
+        self do: [:each | (aBlock value: each) ifTrue: [ r add: each ] ].
+        ^r
+    ]
+    reject: aBlock [
+        ^self select: [:each | (aBlock value: each) not ]
+    ]
+    collect: aBlock [
+        | r |
+        r := OrderedCollection new.
+        self do: [:each | r add: (aBlock value: each) ].
+        ^r
+    ]
+    occurrencesOf: anObject [
+        | c |
+        c := 0.
+        self do: [:each | each = anObject ifTrue: [ c := c + 1 ] ].
+        ^c
+    ]
+]

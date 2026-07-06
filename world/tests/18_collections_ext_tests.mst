@@ -1,0 +1,48 @@
+"18_collections_ext_tests.mst — CollectionsExtTests (W1 'full collections
+ protocol'). Covers select:/reject:/occurrencesOf: on the Collection root
+ (world/21_collections_ext.mst) plus the generic collect: default on a
+ class (String) that has no local override of its own — Array/Interval/
+ OrderedCollection/ByteArray already had their own collect: before this
+ file existed, so their coverage lives in their own existing test files."
+
+TestCase subclass: CollectionsExtTests [
+    runAll [
+        self runTest: #testSelectOnInterval do: [ self testSelectOnInterval ].
+        self runTest: #testSelectOnArray do: [ self testSelectOnArray ].
+        self runTest: #testReject do: [ self testReject ].
+        self runTest: #testSelectRejectComplementary do: [ self testSelectRejectComplementary ].
+        self runTest: #testCollectGenericDefault do: [ self testCollectGenericDefault ].
+        self runTest: #testOccurrencesOf do: [ self testOccurrencesOf ].
+    ]
+
+    testSelectOnInterval [
+        self assert: ((1 to: 10) select: [:x | x even ]) asArray = #(2 4 6 8 10).
+    ]
+    testSelectOnArray [
+        self assert: (#(1 2 3 4 5) select: [:x | x > 2 ]) asArray = #(3 4 5).
+    ]
+    testReject [
+        self assert: ((1 to: 10) reject: [:x | x even ]) asArray = #(1 3 5 7 9).
+    ]
+    testSelectRejectComplementary [
+        | src evens odds |
+        src := 1 to: 20.
+        evens := src select: [:x | x even ].
+        odds := src reject: [:x | x even ].
+        self assert: evens size + odds size = src size.
+    ]
+    "String has no local collect: override, so this exercises Collection's
+     own generic default (21_collections_ext.mst) — it returns an
+     OrderedCollection, not another String, exactly like Strongtalk's own
+     base Collection>>collect: (subclasses 'may wish to consider
+     overriding' it, per its class comment; String doesn't here)."
+    testCollectGenericDefault [
+        | r |
+        r := 'abc' collect: [:c | c asUppercase ].
+        self assert: r asArray = (Array with: $A with: $B with: $C).
+    ]
+    testOccurrencesOf [
+        self assert: (#(1 2 2 3 2 4) occurrencesOf: 2) = 3.
+        self assert: (#(1 2 3) occurrencesOf: 9) = 0.
+    ]
+]

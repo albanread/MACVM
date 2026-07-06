@@ -1,0 +1,218 @@
+"library_bench.mst — BenchmarkRunner-style harness (SPRINTS.md's W6
+ 'BenchmarkRunner-style harness in world/bench/') exercising the W1
+ library-porting surface (world/21-31_*.mst: Collection protocol, Set,
+ Fraction, ReadStream/WriteStream/ReadWriteStream, SortedCollection, Bag,
+ Random, Point, IdentityDictionary/IdentitySet, Date/Time) rather than raw
+ compiled-code kernels — arith.mst/sieve.mst/fib.mst already cover that
+ narrower, JIT-warmup-sensitive niche; this is about the library
+ surface's own steady-state cost under whatever tier is currently active.
+
+ Timing brackets each benchmark with Smalltalk millisecondClock, matching
+ arith.mst's own convention. Workloads needing repeatable randomness use
+ Random (world/27_random.mst, the Park-Miller 'Minimal Standard' LCG) with
+ a fixed seed -- SPRINTS.md's own 'seeded LCG' phrase for this wave -- so
+ a run is reproducible run to run and machine to machine, unlike
+ wall-clock-seeded randomness would be.
+
+ Not in world.list; `macvm run world/bench/library_bench.mst --world
+ world` loads it explicitly, matching every other file in this directory."
+
+Object subclass: BenchResult [
+    | name millis |
+    BenchResult class >> name: n millis: m [
+        ^self basicNew setName: n millis: m
+    ]
+    setName: n millis: m [
+        name := n.
+        millis := m.
+    ]
+    name [
+        ^name
+    ]
+    millis [
+        ^millis
+    ]
+    printOn: s [
+        s nextPutAll: name.
+        1 to: (32 - name size max: 1) do: [:i | s space ].
+        millis printOn: s.
+        s nextPutAll: ' ms'.
+    ]
+]
+
+Object subclass: BenchmarkRunner [
+    | results |
+
+    BenchmarkRunner class >> new [
+        ^self basicNew init
+    ]
+    init [
+        results := OrderedCollection new.
+    ]
+    results [
+        ^results
+    ]
+    "Two warm-up calls before the timed one, matching arith.mst's own
+     established convention (world/bench/arith.mst's runTimed) -- not
+     decoration. Confirmed directly via MACVM_TRACE=jit that, without
+     this, MACVM_JIT=threshold=1 buys nothing measurable here: threshold=1
+     makes the VERY FIRST call to a method also be ITS OWN compile
+     attempt, which is *guaranteed* to fail for any method with an inner
+     send (its inner call sites are cold on that very first call, so the
+     eligibility check reports NoRetryLater and declines, retriable only
+     on a LATER call after this one has run interpreted and warmed those
+     sites -- src/compiler/driver.rs's own Eligibility doc). Each of these
+     benchmark blocks was previously invoked exactly once, so none of them
+     ever got the retry a compile needs to actually land."
+    time: aBlock named: aName [
+        | start end r |
+        Transcript show: 'running: ', aName; cr.
+        aBlock value.
+        aBlock value.
+        start := Smalltalk millisecondClock.
+        aBlock value.
+        end := Smalltalk millisecondClock.
+        r := BenchResult name: aName millis: end - start.
+        Transcript show: '  ', r printString; cr.
+        results add: r.
+    ]
+    report [
+        | total |
+        Transcript show: '--- Benchmark results ---'; cr.
+        results do: [:r | Transcript show: r printString; cr ].
+        total := results inject: 0 into: [:acc :r | acc + r millis ].
+        Transcript show: '--- total: ', total printString, ' ms ---'; cr.
+    ]
+]
+
+"Concrete workloads, one class-side method per benchmark, each taking an
+ iteration count `n` so the suite can be scaled up or down (see
+ LibraryBenchmarks class >> runAll: at the bottom). Every workload that
+ needs values to work with generates them itself (a small deterministic
+ spread, or via Random) rather than depending on external data, so the
+ file is fully self-contained."
+
+Object subclass: LibraryBenchmarks [
+    LibraryBenchmarks class >> orderedCollectionAddAccess: n [
+        | oc sum |
+        oc := OrderedCollection new.
+        1 to: n do: [:i | oc add: i ].
+        sum := 0.
+        1 to: n do: [:i | sum := sum + (oc at: i) ].
+        ^sum
+    ]
+    LibraryBenchmarks class >> dictionaryInsertLookup: n [
+        | d found |
+        d := Dictionary new.
+        1 to: n do: [:i | d at: i put: i * i ].
+        found := 0.
+        1 to: n do: [:i | (d at: i) = (i * i) ifTrue: [ found := found + 1 ] ].
+        ^found
+    ]
+    LibraryBenchmarks class >> setMembershipAndDedup: n [
+        | s hits |
+        s := Set new.
+        1 to: n do: [:i | s add: i \\ (n // 2 max: 1) ].
+        hits := 0.
+        1 to: n do: [:i | (s includes: i \\ (n // 2 max: 1)) ifTrue: [ hits := hits + 1 ] ].
+        ^hits
+    ]
+    LibraryBenchmarks class >> bagOccurrenceCounting: n [
+        | b alphabetSize |
+        alphabetSize := 26.
+        b := Bag new.
+        1 to: n do: [:i | b add: i \\ alphabetSize ].
+        ^b occurrencesOf: 0
+    ]
+    "Worst case for the insertion-sort bubble (world/25_sortedcollection.mst)
+     would be strictly descending input; this uses Random instead so the
+     cost reflects a realistic, not adversarial, distribution."
+    LibraryBenchmarks class >> sortedCollectionInsertion: n [
+        | sc r |
+        sc := SortedCollection new.
+        r := Random new.
+        1 to: n do: [:i | sc add: (r nextInteger \\ n) ].
+        ^sc size
+    ]
+    "Each iteration builds a small, bounded Fraction from scratch (`i \\
+     100` keeps the denominator base in a fixed small range) rather than
+     accumulating into one running total across all n iterations --
+     chaining +/* across n Fractions compounds numerator/denominator
+     growth roughly multiplicatively every step (cross-multiplication in
+     world/23_fraction.mst's +/*), so an accumulator here would runaway
+     into LargeIntegers within a few hundred iterations and make the
+     benchmark's cost unpredictable instead of measuring steady-state
+     Fraction arithmetic."
+    LibraryBenchmarks class >> fractionArithmetic: n [
+        | f count |
+        count := 0.
+        1 to: n do: [:i |
+            f := (1 / (i \\ 100 + 2)) + (1 / 3).
+            f := f * (2 / 5).
+            f numerator > 0 ifTrue: [ count := count + 1 ] ].
+        ^count
+    ]
+    LibraryBenchmarks class >> stringBuilding: n [
+        | s |
+        s := WriteStream on: String new.
+        1 to: n do: [:i | s << 'x'; << i printString ].
+        ^s contents size
+    ]
+    LibraryBenchmarks class >> symbolInterning: n [
+        | count |
+        count := 0.
+        1 to: n do: [:i |
+            (('sym_', (i \\ 500) printString) asSymbol) isSymbol ifTrue: [ count := count + 1 ] ].
+        ^count
+    ]
+    "NOT a cascade (`recv msg1; msg2` sends BOTH messages to the same
+     `recv` and keeps only the last one's result -- select:'s result
+     would be silently discarded, and this would just return the
+     unfiltered collect: result via yourself). Chained properly instead:
+     select: is sent to collect:'s actual result."
+    LibraryBenchmarks class >> collectionProtocolChain: n [
+        | doubled |
+        doubled := (1 to: n) collect: [:x | x * 2 ].
+        ^doubled select: [:x | x \\ 3 = 0 ]
+    ]
+    LibraryBenchmarks class >> randomGeneration: n [
+        | r sum |
+        r := Random new.
+        sum := 0.
+        1 to: n do: [:i | sum := sum + r nextInteger ].
+        ^sum
+    ]
+    LibraryBenchmarks class >> pointArithmetic: n [
+        | p |
+        p := 0 @ 0.
+        1 to: n do: [:i | p := (p + (1 @ 1)) max: (0 @ 0) ].
+        ^p
+    ]
+    "sortedCollectionInsertion: gets its own, much smaller input.
+     Measured directly (not guessed): n=500 took ~13 SECONDS by itself --
+     its insertion-sort bubble (world/25_sortedcollection.mst) is O(n^2),
+     unlike every other benchmark here (O(n) or O(n log n)), so sharing
+     one `n` would let it dominate the whole suite's wall-clock time by
+     two orders of magnitude. n // 25 keeps it in the same rough ballpark
+     as the others while still scaling with the caller's chosen `n`."
+    LibraryBenchmarks class >> runAll: n [
+        | runner sortedN |
+        runner := BenchmarkRunner new.
+        sortedN := (n // 25) max: 10.
+        runner time: [ self orderedCollectionAddAccess: n ] named: 'OrderedCollection add/access'.
+        runner time: [ self dictionaryInsertLookup: n ] named: 'Dictionary insert/lookup'.
+        runner time: [ self setMembershipAndDedup: n ] named: 'Set membership/dedup'.
+        runner time: [ self bagOccurrenceCounting: n ] named: 'Bag occurrence counting'.
+        runner time: [ self sortedCollectionInsertion: sortedN ] named: 'SortedCollection insertion (n/25)'.
+        runner time: [ self fractionArithmetic: n ] named: 'Fraction arithmetic'.
+        runner time: [ self stringBuilding: n ] named: 'String building (WriteStream)'.
+        runner time: [ self symbolInterning: n ] named: 'Symbol interning'.
+        runner time: [ self collectionProtocolChain: n ] named: 'Collection protocol chain'.
+        runner time: [ self randomGeneration: n ] named: 'Random generation'.
+        runner time: [ self pointArithmetic: n ] named: 'Point arithmetic'.
+        runner report.
+        ^runner
+    ]
+]
+
+LibraryBenchmarks runAll: 3000.

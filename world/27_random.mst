@@ -1,0 +1,60 @@
+"27_random.mst — Random. Ports Strongtalk's real algorithm exactly: the
+ classic Park-Miller 'Minimal Standard' LCG (multiplier 16807, modulus
+ 2^31-1 = 2147483647). Strongtalk's own Random.dlt does this arithmetic in
+ Floats ('seed <Float>', actualNext's temp/modulus-truncated modulo dance)
+ — a workaround for 1980s Smalltalk-80's narrow SmallInteger range.
+ MACVM's SmallInteger is a full 62-bit signed range (oops/layout.rs:
+ SMI_MAX = 2^61-1), and `16807 * (modulus-1)` is only ~2^45 — comfortably
+ inside it — so this port uses exact integer arithmetic (`\\`) for the LCG
+ step itself, converting to Double only for the final `next`/`nextInteger`
+ result. No float rounding is involved in the generator's own state at all.
+
+ Verified against Strongtalk's own published conformance vector
+ (Random.dlt classSide>>test, its ONLY correctness check): seed 1, after
+ 10000 calls to `next`, the seed must land on exactly 1043618065 — the
+ well-known Park & Miller reference test vector for this exact generator,
+ not a MACVM-specific number invented for this port. See
+ world/tests/24_random_tests.mst."
+
+Object subclass: Random [
+    | seed |
+
+    Random class >> modulus [
+        ^2147483647
+    ]
+    Random class >> multiplier [
+        ^16807
+    ]
+    Random class >> new [
+        ^self newWithSeed: 1
+    ]
+    "Strongtalk's own comment: seed should be between 1 and 2147483647.
+     Not enforced here (no exceptions until W5) — an out-of-range seed
+     just produces a non-conformant sequence, not a crash."
+    Random class >> newWithSeed: aSeed [
+        ^self basicNew setSeed: aSeed
+    ]
+    setSeed: aSeed [
+        seed := aSeed.
+    ]
+    seed [
+        ^seed
+    ]
+    "Advances the generator and returns a Double in (0, 1)."
+    next [
+        seed := (self class multiplier * seed) \\ self class modulus.
+        ^seed asDouble / self class modulus asDouble
+    ]
+    "Like next, but does not advance the generator."
+    peek [
+        | candidate |
+        candidate := (self class multiplier * seed) \\ self class modulus.
+        ^candidate asDouble / self class modulus asDouble
+    ]
+    nextInteger [
+        ^(SmallInteger maxVal asDouble * self next) truncated
+    ]
+    peekInteger [
+        ^(SmallInteger maxVal asDouble * self peek) truncated
+    ]
+]

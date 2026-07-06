@@ -1,0 +1,91 @@
+"21_readstream_tests.mst — ReadStreamTests (W1 'full collections
+ protocol', world/24_readstream.mst). next/peek past the end are NOT
+ exercised here (self error:, matching 11_orderedcollection_tests.mst's
+ own documented reason for skipping the empty-collection error case)."
+
+TestCase subclass: ReadStreamTests [
+    runAll [
+        self runTest: #testNextWalksInOrder do: [ self testNextWalksInOrder ].
+        self runTest: #testAtEnd do: [ self testAtEnd ].
+        self runTest: #testPeekDoesNotAdvance do: [ self testPeekDoesNotAdvance ].
+        self runTest: #testUpToEnd do: [ self testUpToEnd ].
+        self runTest: #testUpToEndWhenAlreadyAtEnd do: [ self testUpToEndWhenAlreadyAtEnd ].
+        self runTest: #testResetAndPosition do: [ self testResetAndPosition ].
+        self runTest: #testSkip do: [ self testSkip ].
+        self runTest: #testDoVisitsRemainingElements do: [ self testDoVisitsRemainingElements ].
+        self runTest: #testOnString do: [ self testOnString ].
+        self runTest: #testCollectionReadStream do: [ self testCollectionReadStream ].
+    ]
+
+    testNextWalksInOrder [
+        | rs |
+        rs := ReadStream on: #(10 20 30).
+        self assert: rs next = 10.
+        self assert: rs next = 20.
+        self assert: rs next = 30.
+    ]
+    testAtEnd [
+        | rs |
+        rs := ReadStream on: #().
+        self assert: rs atEnd.
+        rs := ReadStream on: #(1).
+        self deny: rs atEnd.
+        rs next.
+        self assert: rs atEnd.
+    ]
+    testPeekDoesNotAdvance [
+        | rs |
+        rs := ReadStream on: #(1 2).
+        self assert: rs peek = 1.
+        self assert: rs peek = 1.
+        self assert: rs next = 1.
+        self assert: rs peek = 2.
+    ]
+    testUpToEnd [
+        | rs |
+        rs := ReadStream on: #(1 2 3 4).
+        rs next.
+        self assert: rs upToEnd asArray = #(2 3 4).
+        self assert: rs atEnd.
+    ]
+    testUpToEndWhenAlreadyAtEnd [
+        | rs |
+        rs := ReadStream on: #(1 2).
+        rs next. rs next.
+        self assert: rs upToEnd asArray = #().
+    ]
+    testResetAndPosition [
+        | rs |
+        rs := ReadStream on: #(1 2 3).
+        rs next; next.
+        self assert: rs position = 2.
+        rs reset.
+        self assert: rs position = 0.
+        self assert: rs next = 1.
+    ]
+    testSkip [
+        | rs |
+        rs := ReadStream on: #(1 2 3 4 5).
+        rs skip: 2.
+        self assert: rs next = 3.
+    ]
+    testDoVisitsRemainingElements [
+        | rs sum |
+        rs := ReadStream on: #(1 2 3 4).
+        rs next.
+        sum := 0.
+        rs do: [:each | sum := sum + each ].
+        self assert: sum = 9.
+    ]
+    testOnString [
+        | rs |
+        rs := ReadStream on: 'abc'.
+        self assert: rs next = $a.
+        self assert: rs upToEnd = 'bc'.
+    ]
+    testCollectionReadStream [
+        | rs |
+        rs := #(1 2 3) readStream.
+        self assert: rs next = 1.
+    ]
+]

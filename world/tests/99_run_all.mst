@@ -21,4 +21,16 @@ TestRunner run: BlockTests.
 TestRunner run: DispatchTests.
 TestRunner run: GcFullTest.
 TestRunner run: Tier1Tests.
+TestRunner run: CollectionsExtTests.
+TestRunner run: SetTests.
+TestRunner run: FractionTests.
+TestRunner run: ReadStreamTests.
+TestRunner run: SortedCollectionTests.
+TestRunner run: BagTests.
+TestRunner run: RandomTests.
+TestRunner run: PointTests.
+TestRunner run: IdentityCollectionsTests.
+TestRunner run: DateTimeTests.
+TestRunner run: ReadWriteStreamTests.
+TestRunner run: ObjectProtocolGapsTests.
 TestRunner report.

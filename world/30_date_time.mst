@@ -1,0 +1,177 @@
+"30_date_time.mst — Date/Time. Unusually for this porting effort, most of
+ what's MISSING here isn't a MACVM-specific scope cut — it's genuinely
+ unimplemented in Strongtalk's own Date.dlt: `julian`, `leapYear:`,
+ `daysInMonth:forYear:`, `daysInYear:`, `asSeconds`, and
+ `Date class>>julian:` are ALL literally `self unimplemented` in the real
+ source (Strongtalk never finished its own Julian-day calendar
+ arithmetic). Since `addDays:`/`subtractDays:`/`subtractDate:` all call
+ the unimplemented `julian`, they're not ported either — there is no
+ working algorithm in the original to port. What IS ported is exactly
+ Date.dlt's own working subset: construction from an explicit day/month/
+ year, comparison, accessors, weekday/month name lookup, printing.
+
+ `Date class>>today` and `Time class>>now`/`dateAndTimeNow`/`clockValue`/
+ `millisecondClockValue` are also NOT ported — these need a real
+ wall-clock/calendar primitive (Windows `SYSTEMTIME` in the original),
+ and MACVM has none: its own `millisecondClock`
+ (src/runtime/primitives.rs, prim_millisecond_clock) is
+ `vm.start_instant.elapsed()`, elapsed time since the VM started — the
+ exact same 'not a calendar clock' semantics Strongtalk's own
+ `clockValue` doc comment already admits ('elapsed time since Smalltalk
+ started'), not a source of wall-clock time either. Calling `today`/`now`
+ on these classes is a plain doesNotUnderstand, same as every other
+ deliberately-unported method in this whole porting effort (Point's
+ Rectangle methods, Bag's `=`, ...) — no stub is added for it.
+
+ Time.dlt, by contrast, IS fully implemented in the original: it's just
+ 'seconds since midnight' integer arithmetic (fromSeconds:/hour/minute/
+ second/</=/hash/addTime:/subtractTime:/printOn:), and all of it is
+ ported faithfully and completely.
+
+ One real fix made while porting, not a straight copy: Date.dlt's own
+ `hash` calls `bitXor:` with `self month` (a Symbol) as the argument —
+ `((hash bitShift: 4) bitXor: self month) bitXor: hash` — which would
+ crash a strict bitXor: primitive expecting an Integer (MACVM's
+ SmallInteger>>bitXor: is exactly that). Substituted `monthIndex` (an
+ Integer, clearly what was intended for a distribution-mixing hash) —
+ the same class of bug-not-feature this whole effort has consistently
+ fixed rather than reproduced (e.g. Fraction>>printOn:'s nonexistent
+ `stream print:`, Integer>>/'s infinite recursion)."
+
+Object subclass: Date [
+    | dayOfMonth monthIndex year |
+
+    Date class >> daysOfWeek [
+        ^#(#Monday #Tuesday #Wednesday #Thursday #Friday #Saturday #Sunday)
+    ]
+    Date class >> monthsOfYear [
+        ^#(#January #February #March #April #May #June #July #August
+           #September #October #November #December)
+    ]
+    Date class >> dayOfWeek: dayName [
+        ^self daysOfWeek indexOf: dayName ifAbsent: [ self error: 'invalid day name' ]
+    ]
+    Date class >> indexOfMonth: aName [
+        ^self monthsOfYear indexOf: aName ifAbsent: [ self error: 'invalid month name' ]
+    ]
+    Date class >> nameOfDay: dayIndex [
+        ^self daysOfWeek at: dayIndex
+    ]
+    Date class >> nameOfMonth: index [
+        ^self monthsOfYear at: index
+    ]
+    Date class >> newDay: d monthIndex: m year: y [
+        ^self basicNew setDay: d monthIndex: m year: y
+    ]
+    Date class >> newDay: d month: m year: y [
+        ^self newDay: d monthIndex: (self indexOfMonth: m) year: y
+    ]
+    setDay: d monthIndex: m year: y [
+        dayOfMonth := d.
+        monthIndex := m.
+        year := y.
+    ]
+    dayOfMonth [
+        ^dayOfMonth
+    ]
+    monthIndex [
+        ^monthIndex
+    ]
+    year [
+        ^year
+    ]
+    month [
+        ^Date monthsOfYear at: monthIndex
+    ]
+    hash [
+        | h |
+        h := year.
+        h := ((h bitShift: 4) bitXor: monthIndex) bitXor: h.
+        h := ((h bitShift: 4) bitXor: dayOfMonth) bitXor: h.
+        ^h
+    ]
+    < other [
+        ^year < other year
+            or: [ year = other year and: [
+                monthIndex < other monthIndex
+                    or: [ monthIndex = other monthIndex and: [ dayOfMonth < other dayOfMonth ] ] ] ]
+    ]
+    <= other [
+        ^(other < self) not
+    ]
+    > other [
+        ^other < self
+    ]
+    >= other [
+        ^(self < other) not
+    ]
+    = other [
+        (other isKindOf: Date) ifFalse: [ ^false ].
+        ^year = other year and: [ monthIndex = other monthIndex and: [ dayOfMonth = other dayOfMonth ] ]
+    ]
+    printOn: s [
+        s nextPutAll: self month.
+        s nextPut: $ .
+        dayOfMonth printOn: s.
+        s nextPutAll: ', '.
+        year printOn: s.
+    ]
+]
+
+Object subclass: Time [
+    | seconds |
+
+    Time class >> fromSeconds: s [
+        ^self basicNew initSeconds: s
+    ]
+    initSeconds: s [
+        seconds := s.
+    ]
+    asSeconds [
+        ^seconds
+    ]
+    hour [
+        ^seconds // 3600
+    ]
+    minute [
+        ^(seconds \\ 3600) // 60
+    ]
+    minutes [
+        ^seconds // 60
+    ]
+    second [
+        ^seconds \\ 60
+    ]
+    hash [
+        ^seconds hash
+    ]
+    < other [
+        ^seconds < other asSeconds
+    ]
+    <= other [
+        ^(other < self) not
+    ]
+    > other [
+        ^other < self
+    ]
+    >= other [
+        ^(self < other) not
+    ]
+    = other [
+        (other isKindOf: Time) ifFalse: [ ^false ].
+        ^seconds = other asSeconds
+    ]
+    addTime: amt [
+        ^Time fromSeconds: seconds + amt asSeconds
+    ]
+    subtractTime: amt [
+        ^Time fromSeconds: seconds - amt asSeconds
+    ]
+    printOn: s [
+        self hour printOn: s.
+        s nextPut: $:.
+        self minute printOn: s.
+        s nextPut: $:.
+        self second printOn: s.
+    ]
+]

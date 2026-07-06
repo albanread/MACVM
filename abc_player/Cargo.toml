@@ -1,0 +1,9 @@
+[package]
+name = "abc_player"
+version = "0.0.0"
+edition = "2021"
+description = "NOTYETIMPLEMENTED -- reserved for an ABC-notation tune player + game-style SFX synthesizer. See src/lib.rs for status."
+license = "BSD-2-Clause"
+publish = false
+
+[dependencies]

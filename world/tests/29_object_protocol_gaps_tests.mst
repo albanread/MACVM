@@ -1,0 +1,84 @@
+"29_object_protocol_gaps_tests.mst — ObjectProtocolGapsTests
+ (world/32_object_protocol_gaps.mst): allSatisfy:/anySatisfy: and the
+ Collection/Bag value-equality completion."
+
+TestCase subclass: ObjectProtocolGapsTests [
+    runAll [
+        self runTest: #testAllSatisfyTrue do: [ self testAllSatisfyTrue ].
+        self runTest: #testAllSatisfyFalse do: [ self testAllSatisfyFalse ].
+        self runTest: #testAllSatisfyVacuouslyTrueOnEmpty do: [ self testAllSatisfyVacuouslyTrueOnEmpty ].
+        self runTest: #testAnySatisfyTrue do: [ self testAnySatisfyTrue ].
+        self runTest: #testAnySatisfyFalse do: [ self testAnySatisfyFalse ].
+        self runTest: #testSetEqualityIgnoresInsertionOrder do: [ self testSetEqualityIgnoresInsertionOrder ].
+        self runTest: #testSetInequality do: [ self testSetInequality ].
+        self runTest: #testBagEqualityComparesOccurrenceCounts do: [ self testBagEqualityComparesOccurrenceCounts ].
+        self runTest: #testBagInequalityOnDifferentCounts do: [ self testBagInequalityOnDifferentCounts ].
+        self runTest: #testDictionaryEquality do: [ self testDictionaryEquality ].
+        self runTest: #testDictionaryInequalityOnValue do: [ self testDictionaryInequalityOnValue ].
+        self runTest: #testSequenceableCollectionOwnEqualityUnaffected do: [ self testSequenceableCollectionOwnEqualityUnaffected ].
+        self runTest: #testDifferentClassesNeverEqual do: [ self testDifferentClassesNeverEqual ].
+    ]
+
+    testAllSatisfyTrue [
+        self assert: (#(2 4 6) allSatisfy: [:x | x even ]).
+    ]
+    testAllSatisfyFalse [
+        self deny: (#(2 4 5) allSatisfy: [:x | x even ]).
+    ]
+    testAllSatisfyVacuouslyTrueOnEmpty [
+        self assert: (#() allSatisfy: [:x | false ]).
+    ]
+    testAnySatisfyTrue [
+        self assert: (#(1 3 4) anySatisfy: [:x | x even ]).
+    ]
+    testAnySatisfyFalse [
+        self deny: (#(1 3 5) anySatisfy: [:x | x even ]).
+    ]
+    testSetEqualityIgnoresInsertionOrder [
+        | s1 s2 |
+        s1 := Set new. s1 add: 1; add: 2; add: 3.
+        s2 := Set new. s2 add: 3; add: 2; add: 1.
+        self assert: s1 = s2.
+    ]
+    testSetInequality [
+        | s1 s2 |
+        s1 := Set new. s1 add: 1; add: 2.
+        s2 := Set new. s2 add: 1; add: 3.
+        self deny: s1 = s2.
+    ]
+    testBagEqualityComparesOccurrenceCounts [
+        | b1 b2 |
+        b1 := Bag new. b1 add: 1; add: 1; add: 2.
+        b2 := Bag new. b2 add: 2; add: 1; add: 1.
+        self assert: b1 = b2.
+    ]
+    testBagInequalityOnDifferentCounts [
+        | b1 b2 |
+        b1 := Bag new. b1 add: 1; add: 1.
+        b2 := Bag new. b2 add: 1.
+        self deny: b1 = b2.
+    ]
+    testDictionaryEquality [
+        | d1 d2 |
+        d1 := Dictionary new. d1 at: 1 put: 'a'; at: 2 put: 'b'.
+        d2 := Dictionary new. d2 at: 2 put: 'b'; at: 1 put: 'a'.
+        self assert: d1 = d2.
+    ]
+    testDictionaryInequalityOnValue [
+        | d1 d2 |
+        d1 := Dictionary new. d1 at: 1 put: 'a'.
+        d2 := Dictionary new. d2 at: 1 put: 'z'.
+        self deny: d1 = d2.
+    ]
+    "The new Collection>>= must not shadow SequenceableCollection's own,
+     more specific positional override (10_array.mst) -- normal method
+     lookup already guarantees this, but worth a direct regression test
+     given both now live in the same inheritance chain."
+    testSequenceableCollectionOwnEqualityUnaffected [
+        self assert: #(1 2 3) = #(1 2 3).
+        self deny: #(1 2 3) = #(1 3 2).
+    ]
+    testDifferentClassesNeverEqual [
+        self deny: #(1 2 3) = (OrderedCollection new add: 1; add: 2; add: 3; yourself).
+    ]
+]

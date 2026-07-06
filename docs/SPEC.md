@@ -299,6 +299,9 @@ whole instruction** (next_bci); offset 0 = fall through.
 inline** to jumps by the source compiler when the argument is a literal block
 (as in every Smalltalk); otherwise they are real sends.
 
+The full 31-opcode table (hex, mnemonic, operands, description) is in
+`docs/ISA.md`.
+
 ### 4.3 Send-site IC table (side table — replaces self-modifying bytecode)
 Each CompiledMethod references `ics: Array` with stride 4 per site:
 ```
@@ -955,6 +958,11 @@ handles/safepoint), `can_fail`. *(Amended per S3/S4 review: `Activated` added.)*
 
 `sourceCompile:` exposes the Rust source compiler to Smalltalk (later enables
 an in-language `compile:` and eventually a self-hosted tools story).
+
+The full, current id-by-id table (56 primitives as actually implemented,
+cross-checked against `primitives.rs`'s own `prim_ids_frozen` regression
+test) is in `docs/ISA.md` — this section's groupings are the design intent,
+that document is the exhaustive, load-bearing reference.
 
 ## 11. Concurrency — deferred by design
 

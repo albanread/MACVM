@@ -1,0 +1,87 @@
+"20_fraction_tests.mst — FractionTests (W1 lists Fraction as part of
+ completing the Number tower, world/23_fraction.mst). Division-by-zero is
+ NOT exercised here (matches 11_orderedcollection_tests.mst's own
+ documented reason: error:/DNU kills the whole run — no should:raise:
+ until S18/W5's exception layer); verified manually instead (see the
+ session's own smoke test), and 23_fraction.mst raises a clean
+ self error: rather than recursing or corrupting state."
+
+TestCase subclass: FractionTests [
+    runAll [
+        self runTest: #testReducesOnCreation do: [ self testReducesOnCreation ].
+        self runTest: #testWholeNumberCollapsesToInteger do: [ self testWholeNumberCollapsesToInteger ].
+        self runTest: #testNegativeNormalization do: [ self testNegativeNormalization ].
+        self runTest: #testArithmetic do: [ self testArithmetic ].
+        self runTest: #testComparison do: [ self testComparison ].
+        self runTest: #testEqualityAcrossIntegerAndDouble do: [ self testEqualityAcrossIntegerAndDouble ].
+        self runTest: #testAsDouble do: [ self testAsDouble ].
+        self runTest: #testTruncated do: [ self testTruncated ].
+        self runTest: #testIntegerSlash do: [ self testIntegerSlash ].
+        self runTest: #testIntegerSlashFractionNoRecursion do: [ self testIntegerSlashFractionNoRecursion ].
+        self runTest: #testPrintString do: [ self testPrintString ].
+    ]
+
+    testReducesOnCreation [
+        | f |
+        f := Fraction numerator: 2 denominator: 4.
+        self assert: f numerator = 1.
+        self assert: f denominator = 2.
+    ]
+    testWholeNumberCollapsesToInteger [
+        | f |
+        f := Fraction numerator: 4 denominator: 2.
+        self assert: f = 2.
+        self assert: f class = SmallInteger.
+    ]
+    testNegativeNormalization [
+        self assert: (Fraction numerator: -1 denominator: 3) printString = '-1/3'.
+        self assert: (Fraction numerator: 1 denominator: -3) printString = '-1/3'.
+        self assert: (Fraction numerator: -1 denominator: -3) printString = '1/3'.
+    ]
+    testArithmetic [
+        self assert: (1/3) + (1/6) = (1/2).
+        self assert: (1/2) - (1/3) = (1/6).
+        self assert: (2/3) * (3/4) = (1/2).
+        self assert: (1/2) / (1/4) = 2.
+        self assert: (1/2) + 1 = (3/2).
+        self assert: (3/2) - 1 = (1/2).
+    ]
+    testComparison [
+        self assert: (1/3) < (1/2).
+        self deny: (1/2) < (1/3).
+        self assert: (1/2) <= (1/2).
+        self assert: (2/3) > (1/2).
+        self assert: (1/2) >= (1/2).
+    ]
+    testEqualityAcrossIntegerAndDouble [
+        self assert: (4/2) = 2.
+        self assert: (1/2) = 0.5.
+    ]
+    testAsDouble [
+        self assert: (1/4) asDouble = 0.25.
+    ]
+    testTruncated [
+        self assert: (7/2) truncated = 3.
+        self assert: (-7/2) truncated = -3.
+    ]
+    "Integer has // (floor) and \\ (modulo) from 06_smallinteger.mst but,
+     before this file's world/23_fraction.mst, no plain / at all —
+     `3 / 2` was a doesNotUnderstand."
+    testIntegerSlash [
+        self assert: 1 / 2 = (1/2).
+        self assert: 4 / 2 = 2.
+        self assert: (1 / 2.0) = 0.5.
+    ]
+    "Regression: numerator:denominator: collapses a denominator-1 result
+     back to a plain Integer, so `self/1 / aFraction` re-dispatches to
+     THIS SAME method with the SAME argument — infinite recursion, caught
+     as a real process-stack-overflow by actually running `1 / (1/2)`
+     before the cross-multiplying fix."
+    testIntegerSlashFractionNoRecursion [
+        self assert: 1 / (1/2) = 2.
+        self assert: 3 / (1/2) = 6.
+    ]
+    testPrintString [
+        self assert: (1/3) printString = '1/3'.
+    ]
+]

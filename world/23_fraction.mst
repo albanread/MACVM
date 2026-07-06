@@ -1,0 +1,149 @@
+"23_fraction.mst — Fraction (W1 lists Fraction as part of completing the
+ Number tower). NEW class: Number subclass: Fraction, always kept reduced
+ (gcd via the existing Integer>>gcd:, 06_smallinteger.mst) with a positive
+ denominator — the exact invariants Strongtalk's own Fraction.dlt states
+ in its class comment. numerator:denominator: reduces to a plain Integer
+ when the reduced denominator is 1, matching RationalNumber.dlt's real
+ factory method.
+
+ Arithmetic/comparison is written directly against Fraction/Integer, NOT
+ ported from Strongtalk's RationalNumber.dlt addFromX:/multiplyFromX:
+ generated double-dispatch matrix: that machinery exists there to share
+ code across Integer AND Fraction in a typed tower with a RationalNumber
+ abstraction. MACVM's flatter hierarchy (Number -> Integer/Double, no
+ RationalNumber layer) has no such abstraction to share with, so this
+ follows the same direct primitive-call/isDouble-coercing-fallback shape
+ SmallInteger's own arithmetic already uses.
+
+ Also reopens Object (isFraction default, matching isDouble/isInteger's
+ own true/false-default-plus-override pattern, 02_nil_boolean.mst) and
+ Integer, to add the previously entirely-missing `/` (true division):
+ `//` (floor) and `\\` (modulo) already existed; plain `/` did not, so
+ `3 / 2` was a doesNotUnderstand before this file."
+
+nil subclass: Object [
+    isFraction [
+        ^false
+    ]
+]
+
+Number subclass: Fraction [
+    | numerator denominator |
+
+    Fraction class >> numerator: n denominator: d [
+        | g num den sign |
+        d = 0 ifTrue: [ ^self error: 'division by zero' ].
+        sign := d < 0 ifTrue: [ -1 ] ifFalse: [ 1 ].
+        num := n * sign.
+        den := d * sign.
+        g := num gcd: den.
+        num := num // g.
+        den := den // g.
+        den = 1 ifTrue: [ ^num ].
+        ^self basicNew setNumerator: num denominator: den
+    ]
+    setNumerator: n denominator: d [
+        numerator := n.
+        denominator := d.
+    ]
+    numerator [
+        ^numerator
+    ]
+    denominator [
+        ^denominator
+    ]
+    isFraction [
+        ^true
+    ]
+    hash [
+        ^numerator hash bitXor: denominator hash
+    ]
+    negative [
+        ^numerator < 0
+    ]
+    negated [
+        ^Fraction numerator: numerator negated denominator: denominator
+    ]
+    asDouble [
+        ^numerator asDouble / denominator asDouble
+    ]
+    truncated [
+        ^self negative
+            ifTrue: [ (numerator negated // denominator) negated ]
+            ifFalse: [ numerator // denominator ]
+    ]
+    asInteger [
+        ^self truncated
+    ]
+    + aNumber [
+        aNumber isDouble ifTrue: [ ^self asDouble + aNumber ].
+        aNumber isFraction ifTrue: [
+            ^Fraction
+                numerator: (numerator * aNumber denominator) + (aNumber numerator * denominator)
+                denominator: denominator * aNumber denominator ].
+        ^Fraction numerator: numerator + (aNumber * denominator) denominator: denominator
+    ]
+    - aNumber [
+        aNumber isDouble ifTrue: [ ^self asDouble - aNumber ].
+        ^self + aNumber negated
+    ]
+    * aNumber [
+        aNumber isDouble ifTrue: [ ^self asDouble * aNumber ].
+        aNumber isFraction ifTrue: [
+            ^Fraction
+                numerator: numerator * aNumber numerator
+                denominator: denominator * aNumber denominator ].
+        ^Fraction numerator: numerator * aNumber denominator: denominator
+    ]
+    / aNumber [
+        aNumber isDouble ifTrue: [ ^self asDouble / aNumber ].
+        aNumber isFraction ifTrue: [
+            ^Fraction
+                numerator: numerator * aNumber denominator
+                denominator: denominator * aNumber numerator ].
+        ^Fraction numerator: numerator denominator: denominator * aNumber
+    ]
+    < aNumber [
+        aNumber isDouble ifTrue: [ ^self asDouble < aNumber ].
+        aNumber isFraction ifTrue: [
+            ^(numerator * aNumber denominator) < (aNumber numerator * denominator) ].
+        ^numerator < (aNumber * denominator)
+    ]
+    <= aNumber [
+        ^(aNumber < self) not
+    ]
+    > aNumber [
+        ^aNumber < self
+    ]
+    >= aNumber [
+        ^(self < aNumber) not
+    ]
+    = aNumber [
+        aNumber isDouble ifTrue: [ ^self asDouble = aNumber ].
+        aNumber isFraction ifTrue: [
+            ^numerator = aNumber numerator and: [ denominator = aNumber denominator ] ].
+        ^false
+    ]
+    printOn: aStream [
+        numerator printOn: aStream.
+        aStream nextPutAll: '/'.
+        denominator printOn: aStream.
+    ]
+]
+
+Number subclass: Integer [
+    "Cross-multiplies directly rather than building a `self/1` Fraction
+     wrapper first: numerator:denominator: collapses any denominator-1
+     result back to a plain Integer (by design, matching Fraction's own
+     'never store a whole number as n/1' invariant), so `self/1` divided
+     by a real Fraction would just re-dispatch to this SAME method with
+     the SAME aNumber — infinite recursion. Caught by actually running
+     `1 / (1/2)`, which stack-overflowed before this fix."
+    / aNumber [
+        aNumber isDouble ifTrue: [ ^self asDouble / aNumber ].
+        aNumber isFraction ifTrue: [
+            ^Fraction numerator: self * aNumber denominator denominator: aNumber numerator ].
+        aNumber = 0 ifTrue: [ ^self error: 'division by zero' ].
+        ^Fraction numerator: self denominator: aNumber
+    ]
+]

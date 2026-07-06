@@ -152,6 +152,15 @@ bench-s11:
         echo "WARN: compiled speedup ${ratio}x is below the 5x target (tracking only, not gating)"
     fi
 
+# W1 library-porting benchmark suite (world/bench/library_bench.mst) --
+# steady-state cost of the newly-ported library surface (Set/Dictionary/
+# Bag/SortedCollection/Fraction/Random/Point/Streams/...) under whatever
+# tier is currently active. Unlike bench-s10/bench-s11, not a single
+# tracked-over-time metric gated against a ratio -- just a convenient way
+# to run the whole suite and see where the interpreter spends time.
+bench-library:
+    cargo run --release --quiet -- run world/bench/library_bench.mst --world world
+
 # S10: tier-1 JIT compiler (tests_s10.md's acceptance gate). gate-s09
 # already covers "cargo test" + "cargo clippy -- -D warnings" (tests_s10.md
 # gate script's own first/last lines) via the dependency chain, so this

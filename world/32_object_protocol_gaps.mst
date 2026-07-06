@@ -1,0 +1,78 @@
+"32_object_protocol_gaps.mst — closes out two gaps recorded in
+ docs/PORTING_JOURNAL.md while porting other classes this same effort:
+ Collection>>=/hasSameElementsAs: (now unblocked by Bag existing,
+ world/26_bag.mst) plus Bag>>= itself, and Collection>>allSatisfy:/
+ anySatisfy:.
+
+ Object>>copy/postCopy — ALSO in the journal — is NOT here: confirmed
+ genuinely blocked, not just awkward, while actually trying to build it.
+ instVarAt: (primitive 25, read) exists, but there is no instVarAt:put:
+ (write) anywhere in src/runtime/primitives.rs. Named-ivar assignment
+ (`x := val`) only works today because the COMPILER resolves the ivar
+ name to a fixed slot number at compile time and emits a direct
+ store-to-slot-N bytecode; writing an arbitrary, RUNTIME-computed slot
+ index (which a generic copy fundamentally needs, since the count/layout
+ varies per class) has no compile-time name to hook into — it needs a
+ real primitive, not a cleverer Smalltalk-only workaround. Left the
+ finding in docs/PORTING_JOURNAL.md, corrected to name instVarAt:put:
+ precisely instead of hedging with 'or a dedicated primitive if instance-
+ variable enumeration isn't cheaply expressible yet.'
+
+ --- Collection>>=/hasSameElementsAs:, Bag>>= ---
+ Strongtalk's real Collection>>= is `self class = other class and: [self
+ hasSameElementsAs: other]`, and hasSameElementsAs: is `self size = other
+ size and: [self asBag = other asBag]` — deferred in
+ world/21_collections_ext.mst because Bag didn't exist yet. It does now.
+ Bag>>= itself: NOT ported from Strongtalk's own equalsBag: (which
+ compares `self contents size = other contents size` — reaching into
+ contents, another Bag's PRIVATE Dictionary ivar, isn't expressible from
+ outside that Bag instance in ordinary Smalltalk) — uses the
+ already-public `size`/`occurrencesOf:` instead. If self size = other
+ size AND every distinct element of self has a matching occurrence count
+ in other, they must be equal: were other to hold any element self
+ doesn't (or a higher count of one self does), other's own size would
+ have to exceed self's, contradicting the size check.
+
+ A generic Collection>>= does NOT disturb SequenceableCollection's own,
+ more specific `=` override (10_array.mst, positional element-by-element)
+ — normal Smalltalk method lookup always prefers the more specific
+ definition, so Array/String/OrderedCollection/Interval are unaffected;
+ this new default only actually applies to Dictionary/Set/Bag/
+ HashedCollection, none of which had their own `=` before (Object's
+ identity default) — confirmed no existing test in world/tests/ compares
+ two Set/Bag/Dictionary instances with `=`, so this changes no
+ already-passing behavior.
+
+ --- allSatisfy:/anySatisfy: ---
+ Assumed to exist while smoke-testing Random (world/27_random.mst); they
+ didn't. Trivial in terms of do:, same shape as select:/reject:
+ (world/21_collections_ext.mst)."
+
+Object subclass: Collection [
+    allSatisfy: aBlock [
+        self do: [:each | (aBlock value: each) ifFalse: [ ^false ] ].
+        ^true
+    ]
+    anySatisfy: aBlock [
+        self do: [:each | (aBlock value: each) ifTrue: [ ^true ] ].
+        ^false
+    ]
+    = other [
+        ^self == other
+            or: [ self class = other class and: [ self hasSameElementsAs: other ] ]
+    ]
+    hasSameElementsAs: other [
+        ^self size = other size and: [ self asBag = other asBag ]
+    ]
+]
+
+Collection subclass: Bag [
+    = other [
+        (other isKindOf: Bag) ifFalse: [ ^false ].
+        self == other ifTrue: [ ^true ].
+        self size = other size ifFalse: [ ^false ].
+        contents keysAndValuesDo: [:el :occ |
+            (other occurrencesOf: el) = occ ifFalse: [ ^false ] ].
+        ^true
+    ]
+]

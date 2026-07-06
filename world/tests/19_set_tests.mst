@@ -1,0 +1,56 @@
+"19_set_tests.mst — SetTests (W1 'full collections protocol'). Mirrors
+ 12_dictionary_tests.mst's own growth-past-capacity shape, since Set
+ (world/22_set.mst) reuses Dictionary's exact open-addressing engine."
+
+TestCase subclass: SetTests [
+    runAll [
+        self runTest: #testAddDedups do: [ self testAddDedups ].
+        self runTest: #testIncludes do: [ self testIncludes ].
+        self runTest: #testGrowthPastCapacity do: [ self testGrowthPastCapacity ].
+        self runTest: #testDoVisitsEachOnce do: [ self testDoVisitsEachOnce ].
+        self runTest: #testAsSet do: [ self testAsSet ].
+        self runTest: #testPrintString do: [ self testPrintString ].
+    ]
+
+    testAddDedups [
+        | s |
+        s := Set new.
+        s add: 1; add: 2; add: 1; add: 3; add: 2.
+        self assert: s size = 3.
+    ]
+    testIncludes [
+        | s |
+        s := Set new.
+        s add: 5; add: 7.
+        self assert: (s includes: 5).
+        self assert: (s includes: 7).
+        self deny: (s includes: 6).
+    ]
+    testGrowthPastCapacity [
+        | s |
+        s := Set new.
+        1 to: 100 do: [:i | s add: i ].
+        self assert: s size = 100.
+        1 to: 100 do: [:i | self assert: (s includes: i) ].
+    ]
+    testDoVisitsEachOnce [
+        | s sum |
+        s := Set new.
+        s add: 1; add: 2; add: 3; add: 2; add: 1.
+        sum := 0.
+        s do: [:each | sum := sum + each ].
+        self assert: sum = 6.
+    ]
+    testAsSet [
+        | s |
+        s := #(1 2 2 3 3 3 4) asSet.
+        self assert: s size = 4.
+        self assert: (s includes: 4).
+    ]
+    testPrintString [
+        | s |
+        s := Set new.
+        s add: 1.
+        self assert: s printString = 'Set (1 )'.
+    ]
+]

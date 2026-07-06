@@ -1,0 +1,117 @@
+"28_readwritestream_tests.mst — ReadWriteStreamTests (world/31_readwritestream.mst)."
+
+TestCase subclass: ReadWriteStreamTests [
+    runAll [
+        self runTest: #testWriteThenReadBack do: [ self testWriteThenReadBack ].
+        self runTest: #testContentsVsContentsWrittenVsContentsRemaining do: [ self testContentsVsContentsWrittenVsContentsRemaining ].
+        self runTest: #testResetRewindsForRereading do: [ self testResetRewindsForRereading ].
+        self runTest: #testAtEndTracksSizeNotCapacity do: [ self testAtEndTracksSizeNotCapacity ].
+        self runTest: #testUpToEnd do: [ self testUpToEnd ].
+        self runTest: #testPeekDoesNotAdvance do: [ self testPeekDoesNotAdvance ].
+        self runTest: #testGrowthPastInitialCapacity do: [ self testGrowthPastInitialCapacity ].
+        self runTest: #testShovelOperator do: [ self testShovelOperator ].
+        self runTest: #testOnWithNumElementsStartsReadable do: [ self testOnWithNumElementsStartsReadable ].
+        self runTest: #testDoVisitsRemainingElementsOnly do: [ self testDoVisitsRemainingElementsOnly ].
+        self runTest: #testOnArrayNotJustString do: [ self testOnArrayNotJustString ].
+    ]
+
+    testWriteThenReadBack [
+        | s |
+        s := ReadWriteStream on: String new.
+        s nextPutAll: 'hello'.
+        self assert: s size = 5.
+        s reset.
+        self assert: s next = $h.
+        self assert: s next = $e.
+        self assert: s upToEnd = 'llo'.
+    ]
+    "Strongtalk's own three-way split: contents = everything written so
+     far (WriteStream-compatible), contentsWritten = everything the
+     CURSOR has passed, contentsRemaining = everything still ahead of it."
+    testContentsVsContentsWrittenVsContentsRemaining [
+        | s |
+        s := ReadWriteStream on: String new.
+        s nextPutAll: 'hello'.
+        s reset.
+        s next. s next.
+        self assert: s contents = 'hello'.
+        self assert: s contentsWritten = 'he'.
+        self assert: s contentsRemaining = 'llo'.
+    ]
+    testResetRewindsForRereading [
+        | s |
+        s := ReadWriteStream on: String new.
+        s nextPutAll: 'ab'.
+        s reset.
+        self assert: s next = $a.
+        s reset.
+        self assert: s next = $a.
+    ]
+    "size (logical content length) is what atEnd/next/peek check against
+     — NOT collection size (the raw, possibly-over-allocated array
+     capacity grow: works with, same distinction WriteStream's own grow:
+     already relies on)."
+    testAtEndTracksSizeNotCapacity [
+        | s |
+        s := ReadWriteStream on: (String new: 100).
+        s nextPutAll: 'x'.
+        s reset.
+        self deny: s atEnd.
+        s next.
+        self assert: s atEnd.
+    ]
+    testUpToEnd [
+        | s |
+        s := ReadWriteStream on: String new.
+        s nextPutAll: 'abcd'.
+        s reset.
+        s next.
+        self assert: s upToEnd = 'bcd'.
+        self assert: s atEnd.
+    ]
+    testPeekDoesNotAdvance [
+        | s |
+        s := ReadWriteStream on: String new.
+        s nextPutAll: 'ab'.
+        s reset.
+        self assert: s peek = $a.
+        self assert: s peek = $a.
+        self assert: s next = $a.
+    ]
+    testGrowthPastInitialCapacity [
+        | s |
+        s := ReadWriteStream on: (String new: 0).
+        1 to: 100 do: [:i | s nextPut: $x ].
+        self assert: s size = 100.
+        s reset.
+        self assert: s upToEnd size = 100.
+    ]
+    testShovelOperator [
+        | s |
+        s := ReadWriteStream on: String new.
+        s << 'a'; << 1; << $b.
+        self assert: s contents = 'a1b'.
+    ]
+    testOnWithNumElementsStartsReadable [
+        | s |
+        s := ReadWriteStream on: #(10 20 30) numElements: 3.
+        self assert: s size = 3.
+        self deny: s atEnd.
+        self assert: s next = 10.
+    ]
+    testDoVisitsRemainingElementsOnly [
+        | s sum |
+        s := ReadWriteStream on: #(1 2 3 4) numElements: 4.
+        s next.
+        sum := 0.
+        s do: [:e | sum := sum + e ].
+        self assert: sum = 9.
+    ]
+    testOnArrayNotJustString [
+        | s |
+        s := ReadWriteStream on: (Array new: 0).
+        s nextPut: 1; nextPut: 2; nextPut: 3.
+        s reset.
+        self assert: s upToEnd = #(1 2 3).
+    ]
+]

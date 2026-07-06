@@ -1,0 +1,68 @@
+"24_readstream.mst — ReadStream (W1 'full collections protocol'). NEW
+ class. Deliberately much simpler than Strongtalk's real layered
+ BasicInputStream -> BasicReadStream -> SeqCltnReadStream hierarchy
+ (WORLD.md's 'Layer B: reimplement fresh, consult originals for protocol
+ surface' guidance for streams) — a single class over a collection+
+ position cursor, mirroring WriteStream's own pragmatic style
+ (18_writestream.mst) rather than porting the peek-buffer abstraction
+ Strongtalk's version uses internally. `next`/`peek` past the end error
+ (matches OrderedCollection>>removeFirst/removeLast's own established
+ 'invalid on empty' convention, 15_ordered.mst — no exceptions until
+ W5/S18, so this is the house v1 idiom, not a Bluebook-nil-return port)."
+
+Object subclass: ReadStream [
+    | collection position |
+
+    ReadStream class >> on: aCollection [
+        | s |
+        s := self basicNew.
+        s setOn: aCollection.
+        ^s
+    ]
+    setOn: aCollection [
+        collection := aCollection.
+        position := 0.
+    ]
+    atEnd [
+        ^position >= collection size
+    ]
+    next [
+        self atEnd ifTrue: [ ^self error: 'end of stream' ].
+        position := position + 1.
+        ^collection at: position
+    ]
+    peek [
+        self atEnd ifTrue: [ ^nil ].
+        ^collection at: position + 1
+    ]
+    skip: n [
+        position := position + n.
+    ]
+    reset [
+        position := 0.
+    ]
+    position [
+        ^position
+    ]
+    position: p [
+        position := p.
+    ]
+    size [
+        ^collection size
+    ]
+    upToEnd [
+        | r |
+        r := collection copyFrom: position + 1 to: collection size.
+        position := collection size.
+        ^r
+    ]
+    do: aBlock [
+        [ self atEnd ] whileFalse: [ aBlock value: self next ]
+    ]
+]
+
+Object subclass: Collection [
+    readStream [
+        ^ReadStream on: self
+    ]
+]

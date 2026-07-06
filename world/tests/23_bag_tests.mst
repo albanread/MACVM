@@ -1,0 +1,101 @@
+"23_bag_tests.mst — BagTests (W1 'full collections protocol' Layer A,
+ world/26_bag.mst)."
+
+TestCase subclass: BagTests [
+    runAll [
+        self runTest: #testAddCountsOccurrences do: [ self testAddCountsOccurrences ].
+        self runTest: #testSize do: [ self testSize ].
+        self runTest: #testOccurrencesOfMissing do: [ self testOccurrencesOfMissing ].
+        self runTest: #testIncludes do: [ self testIncludes ].
+        self runTest: #testAddWithOccurrences do: [ self testAddWithOccurrences ].
+        self runTest: #testRemoveDecrementsAndFloors do: [ self testRemoveDecrementsAndFloors ].
+        self runTest: #testRemoveIfAbsent do: [ self testRemoveIfAbsent ].
+        self runTest: #testAsBag do: [ self testAsBag ].
+        self runTest: #testInheritedCollectionProtocol do: [ self testInheritedCollectionProtocol ].
+        self runTest: #testIsEmpty do: [ self testIsEmpty ].
+        self runTest: #testPrintString do: [ self testPrintString ].
+    ]
+
+    testAddCountsOccurrences [
+        | b |
+        b := Bag new.
+        b add: 1; add: 1; add: 2.
+        self assert: (b occurrencesOf: 1) = 2.
+        self assert: (b occurrencesOf: 2) = 1.
+    ]
+    testSize [
+        | b |
+        b := Bag new.
+        b add: 1; add: 1; add: 2.
+        self assert: b size = 3.
+    ]
+    testOccurrencesOfMissing [
+        self assert: (Bag new occurrencesOf: 42) = 0.
+    ]
+    testIncludes [
+        | b |
+        b := Bag new.
+        b add: 5.
+        self assert: (b includes: 5).
+        self deny: (b includes: 9).
+    ]
+    testAddWithOccurrences [
+        | b |
+        b := Bag new.
+        b add: 1 withOccurrences: 3.
+        self assert: (b occurrencesOf: 1) = 3.
+        self assert: b size = 3.
+    ]
+    "Removal never deletes the underlying Dictionary key — it decrements
+     the occurrence count and floors at 0 — so this specifically checks
+     that includes: (occurrencesOf: > 0, not contents includesKey:)
+     correctly reports false once the count reaches zero, not just that
+     occurrencesOf: itself reads back 0."
+    testRemoveDecrementsAndFloors [
+        | b |
+        b := Bag new.
+        b add: 7; add: 7.
+        b remove: 7.
+        self assert: (b occurrencesOf: 7) = 1.
+        self assert: (b includes: 7).
+        b remove: 7.
+        self assert: (b occurrencesOf: 7) = 0.
+        self deny: (b includes: 7).
+    ]
+    testRemoveIfAbsent [
+        | b |
+        b := Bag new.
+        b add: 3.
+        self assert: (b remove: 3 ifAbsent: [ 'missing' ]) = 3.
+        self assert: (b remove: 9 ifAbsent: [ 'missing' ]) = 'missing'.
+    ]
+    testAsBag [
+        | b |
+        b := #(1 1 2 3 3 3) asBag.
+        self assert: b size = 6.
+        self assert: (b occurrencesOf: 3) = 3.
+        self assert: (b occurrencesOf: 1) = 2.
+    ]
+    "Bag subclasses Collection directly (a sibling of HashedCollection,
+     matching Strongtalk's real hierarchy) so select:/inject:into: from
+     21_collections_ext.mst/10_array.mst apply unchanged — and do:'s own
+     occurrence-expansion means they see each duplicate the right number
+     of times."
+    testInheritedCollectionProtocol [
+        | b sum |
+        b := #(1 1 2 3) asBag.
+        self assert: (b select: [:x | x > 1 ]) asArray size = 2.
+        sum := b inject: 0 into: [:acc :x | acc + x ].
+        self assert: sum = 7.
+    ]
+    testIsEmpty [
+        self assert: Bag new isEmpty.
+        self deny: (Bag new add: 1; yourself) isEmpty.
+    ]
+    testPrintString [
+        | b |
+        b := Bag new.
+        b add: 1.
+        self assert: b printString = 'Bag (1 )'.
+    ]
+]

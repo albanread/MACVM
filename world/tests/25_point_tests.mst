@@ -1,0 +1,94 @@
+"25_point_tests.mst — PointTests (world/28_point.mst). Point.dlt itself
+ has no classSide>>test section (unlike Random.dlt/SortedCollection.dlt),
+ so there's no published reference vector to check against here — these
+ are ordinary correctness tests against the ported protocol."
+
+TestCase subclass: PointTests [
+    runAll [
+        self runTest: #testXY do: [ self testXY ].
+        self runTest: #testArithmetic do: [ self testArithmetic ].
+        self runTest: #testEquality do: [ self testEquality ].
+        self runTest: #testEqualityAgainstNonPoint do: [ self testEqualityAgainstNonPoint ].
+        self runTest: #testComparison do: [ self testComparison ].
+        self runTest: #testAbsNegated do: [ self testAbsNegated ].
+        self runTest: #testMaxMin do: [ self testMaxMin ].
+        self runTest: #testOrigin do: [ self testOrigin ].
+        self runTest: #testFloorTruncatedRounded do: [ self testFloorTruncatedRounded ].
+        self runTest: #testTruncateTo do: [ self testTruncateTo ].
+        self runTest: #testTranslatedByAndRelativeTo do: [ self testTranslatedByAndRelativeTo ].
+        self runTest: #testHashStableAndConsistentWithEquality do: [ self testHashStableAndConsistentWithEquality ].
+        self runTest: #testPrintString do: [ self testPrintString ].
+        self runTest: #testIntegerFloorTruncatedRoundedAreIdentity do: [ self testIntegerFloorTruncatedRoundedAreIdentity ].
+    ]
+
+    testXY [
+        | p |
+        p := 3 @ 4.
+        self assert: p x = 3.
+        self assert: p y = 4.
+    ]
+    testArithmetic [
+        self assert: (3 @ 4) + (1 @ 2) = (4 @ 6).
+        self assert: (3 @ 4) - (1 @ 2) = (2 @ 2).
+        self assert: (3 @ 4) * (2 @ 2) = (6 @ 8).
+        self assert: (4 @ 8) / (2 @ 4) = (2 @ 2).
+        self assert: (7 @ 9) // (2 @ 2) = (3 @ 4).
+    ]
+    testEquality [
+        self assert: (3 @ 4) = (3 @ 4).
+        self deny: (3 @ 4) = (3 @ 5).
+        self deny: (3 @ 4) = (5 @ 4).
+    ]
+    "Point>>= checks other isPoint first — before the Object-level default
+     isPoint (added alongside Point, matching the isDouble/isFraction
+     precedent) existed, this crashed with a doesNotUnderstand instead of
+     just answering false, caught by actually running `(3@4) = 5`."
+    testEqualityAgainstNonPoint [
+        self deny: (3 @ 4) = 5.
+        self deny: (3 @ 4) = 'not a point'.
+    ]
+    testComparison [
+        self assert: (1 @ 1) < (2 @ 2).
+        self deny: (2 @ 2) < (1 @ 1).
+        self assert: (1 @ 1) <= (1 @ 1).
+        self assert: (3 @ 3) > (2 @ 2).
+        self assert: (2 @ 2) >= (2 @ 2).
+    ]
+    testAbsNegated [
+        self assert: (-3 @ -4) abs = (3 @ 4).
+        self assert: (3 @ 4) negated = (-3 @ -4).
+    ]
+    testMaxMin [
+        self assert: ((3 @ 8) max: (5 @ 2)) = (5 @ 8).
+        self assert: ((3 @ 8) min: (5 @ 2)) = (3 @ 2).
+    ]
+    testOrigin [
+        self assert: Point origin = (0 @ 0).
+    ]
+    testFloorTruncatedRounded [
+        self assert: (3.7 @ 4.2) floor = (3 @ 4).
+        self assert: (3.7 @ 4.2) truncated = (3 @ 4).
+        self assert: (3.7 @ 4.2) rounded = (4 @ 4).
+    ]
+    "Exercises Number>>truncateTo: (also new, world/28_point.mst), which
+     itself composes Integer>>/ (a Fraction, world/23_fraction.mst) with
+     Fraction>>truncated — a chain across three separate ported files."
+    testTruncateTo [
+        self assert: ((13 @ 27) truncateTo: 10) = (10 @ 20).
+    ]
+    testTranslatedByAndRelativeTo [
+        self assert: ((1 @ 1) translatedBy: (2 @ 2)) = (3 @ 3).
+        self assert: ((3 @ 3) relativeTo: (1 @ 1)) = (2 @ 2).
+    ]
+    testHashStableAndConsistentWithEquality [
+        self assert: (3 @ 4) hash = (3 @ 4) hash.
+    ]
+    testPrintString [
+        self assert: (3 @ 4) printString = '3@4'.
+    ]
+    testIntegerFloorTruncatedRoundedAreIdentity [
+        self assert: 5 floor = 5.
+        self assert: 5 truncated = 5.
+        self assert: 5 rounded = 5.
+    ]
+]

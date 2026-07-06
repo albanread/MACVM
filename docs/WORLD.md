@@ -273,3 +273,8 @@ which core sprint is currently green. Full design: [`IMAGE.md`](IMAGE.md).
 | W6 | Benchmark harvest (Richards/DeltaBlue/Stanford) | W1 (feeds S15) |
 
 W-waves interleave with core sprints; W1 can start the moment S6 is green.
+
+W1 porting is underway ahead of schedule as a non-disruptive side track
+(same posture as S20/S23) while the core sprints are on S12/S13 — see
+[`docs/PORTING_JOURNAL.md`](PORTING_JOURNAL.md) for the running list of
+primitives/methods it's finding missing along the way.
