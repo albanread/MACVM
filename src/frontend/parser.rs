@@ -5,7 +5,9 @@
 
 use crate::oops::layout::{SMI_MAX, SMI_MIN};
 
-use super::ast::{BlockNode, ClassDefNode, Expr, Indexable, Literal, MethodNode, TopItem};
+use super::ast::{
+    BlockNode, ClassDefNode, Expr, FfiPragma, Indexable, Literal, MethodNode, TopItem,
+};
 use super::lexer::{int_lit_magnitude, Lexer, Span, Tok};
 use super::CompileError;
 
@@ -17,8 +19,11 @@ enum ClassPragma {
 
 const RESERVED: &[&str] = &["self", "super", "nil", "true", "false"];
 
-/// `(primitive id, temporaries, statements)` — a parsed `method_body`.
-type MethodBody = (Option<u16>, Vec<String>, Vec<Expr>);
+/// `(primitive id, FFI pragma, temporaries, statements)` — a parsed
+/// `method_body`. `primitive`/`ffi` are never both `Some` — S20's
+/// `<primitive: FFI …>` (`ast::FfiPragma`) is parsed as a DISTINCT pragma
+/// shape from the bare `<primitive: N>` integer form, not a variant of it.
+type MethodBody = (Option<u16>, Option<FfiPragma>, Vec<String>, Vec<Expr>);
 
 fn is_reserved(name: &str) -> bool {
     RESERVED.contains(&name)
@@ -645,14 +650,24 @@ impl<'a> Parser<'a> {
     }
 
     /// Method-body pragma (`sprint_s05_detail.md` §Algorithms "Pragmas"
-    /// rule 1/2). Returns `Some(id)` for a recognized `<primitive: N>`.
-    fn parse_method_pragma(&mut self) -> Result<Option<u16>, CompileError> {
+    /// rule 1/2). Returns `(Some(id), None)` for a recognized
+    /// `<primitive: N>`, or `(None, Some(ffi))` for S20's `<primitive: FFI
+    /// …>` (docs/FFI.md §6.3) — a keyword-bodied pragma, structurally
+    /// distinct from the bare-integer form, recognized the instant the
+    /// token right after `primitive:` is the identifier `FFI` rather than
+    /// an integer literal.
+    fn parse_method_pragma(&mut self) -> Result<(Option<u16>, Option<FfiPragma>), CompileError> {
         let start = self.cur.1;
         self.lx.set_pragma_mode(true);
         self.bump()?; // '<'
         if let Tok::Keyword(k) = self.cur.0.clone() {
             if k == "primitive:" {
                 self.bump()?;
+                if matches!(&self.cur.0, Tok::Ident(id) if id == "FFI") {
+                    self.bump()?;
+                    let ffi = self.parse_ffi_pragma_body(start)?;
+                    return Ok((None, Some(ffi)));
+                }
                 let (negative, radix, digits) = match self.cur.0.clone() {
                     Tok::IntLit {
                         negative,
@@ -678,11 +693,167 @@ impl<'a> Parser<'a> {
                 if mag.len() > 8 || v == 0 || v > u16::MAX as u64 {
                     return Err(self.error(start, "primitive id out of range 1..=65535"));
                 }
-                return Ok(Some(v as u16));
+                return Ok((Some(v as u16), None));
             }
         }
         self.skip_pragma_body(1)?;
-        Ok(None)
+        Ok((None, None))
+    }
+
+    /// S20 FFI: the body of `<primitive: FFI …>`, cursor already past the
+    /// `FFI` identifier, still in pragma mode. A flat run of keyword:value
+    /// pairs (`function:`/`selector:`/`class:`/`classSide:`/`ret:`/
+    /// `args:`) until the closing `>` — order-independent, each recognized
+    /// once (a repeat is a hard error, matching `parse_method_body`'s own
+    /// "duplicate primitive pragma" posture one level up).
+    fn parse_ffi_pragma_body(&mut self, start: Span) -> Result<FfiPragma, CompileError> {
+        let mut function: Option<String> = None;
+        let mut selector: Option<String> = None;
+        let mut class: Option<String> = None;
+        let mut class_side: Option<bool> = None;
+        let mut ret: Option<String> = None;
+        let mut args: Option<Vec<String>> = None;
+
+        loop {
+            if matches!(&self.cur.0, Tok::BinarySel(s) if s == ">") {
+                break;
+            }
+            let Tok::Keyword(k) = self.cur.0.clone() else {
+                return Err(self.error(
+                    self.cur.1,
+                    "expected a keyword part (function:/selector:/class:/classSide:/ret:/args:) \
+                     in <primitive: FFI …>",
+                ));
+            };
+            self.bump()?;
+            macro_rules! dup_check {
+                ($slot:expr, $name:literal) => {
+                    if $slot.is_some() {
+                        return Err(
+                            self.error(start, concat!("duplicate '", $name, "' in FFI pragma"))
+                        );
+                    }
+                };
+            }
+            match k.as_str() {
+                "function:" => {
+                    dup_check!(function, "function:");
+                    function = Some(self.expect_ffi_sym("function:")?);
+                }
+                "selector:" => {
+                    dup_check!(selector, "selector:");
+                    selector = Some(self.expect_ffi_sym("selector:")?);
+                }
+                "class:" => {
+                    dup_check!(class, "class:");
+                    class = Some(self.expect_ffi_sym("class:")?);
+                }
+                "classSide:" => {
+                    dup_check!(class_side, "classSide:");
+                    class_side = Some(self.expect_ffi_bool("classSide:")?);
+                }
+                "ret:" => {
+                    dup_check!(ret, "ret:");
+                    ret = Some(self.expect_ffi_sym("ret:")?);
+                }
+                "args:" => {
+                    dup_check!(args, "args:");
+                    args = Some(self.expect_ffi_sym_array("args:")?);
+                }
+                other => {
+                    return Err(self.error(
+                        start,
+                        format!("unknown keyword '{other}' in <primitive: FFI …>"),
+                    ))
+                }
+            }
+        }
+        self.lx.set_pragma_mode(false);
+        self.bump()?; // '>'
+
+        let ret = ret.ok_or_else(|| self.error(start, "FFI pragma missing 'ret:'"))?;
+        let args = args.unwrap_or_default();
+
+        match (function, selector) {
+            (Some(name), None) => Ok(FfiPragma::Function { name, ret, args }),
+            (None, Some(selector)) => {
+                let class = class
+                    .ok_or_else(|| self.error(start, "FFI 'selector:' pragma missing 'class:'"))?;
+                Ok(FfiPragma::Selector {
+                    selector,
+                    class,
+                    class_side: class_side.unwrap_or(false),
+                    ret,
+                    args,
+                })
+            }
+            (Some(_), Some(_)) => Err(self.error(
+                start,
+                "FFI pragma must not specify both 'function:' (Tier 1) and 'selector:' (Tier 2)",
+            )),
+            (None, None) => Err(self.error(
+                start,
+                "FFI pragma needs 'function:' (Tier 1, POSIX) or 'selector:' (Tier 2, Cocoa)",
+            )),
+        }
+    }
+
+    /// A bare symbol literal (`#foo`, `#foo:bar:`) — every FFI pragma value
+    /// EXCEPT `classSide:`/`args:` is one of these.
+    fn expect_ffi_sym(&mut self, ctx: &str) -> Result<String, CompileError> {
+        match self.cur.0.clone() {
+            Tok::SymLit(s) => {
+                self.bump()?;
+                Ok(s)
+            }
+            _ => Err(self.error(
+                self.cur.1,
+                format!("expected a symbol literal (#foo) after '{ctx}'"),
+            )),
+        }
+    }
+
+    fn expect_ffi_bool(&mut self, ctx: &str) -> Result<bool, CompileError> {
+        match self.cur.0.clone() {
+            Tok::Ident(s) if s == "true" => {
+                self.bump()?;
+                Ok(true)
+            }
+            Tok::Ident(s) if s == "false" => {
+                self.bump()?;
+                Ok(false)
+            }
+            _ => Err(self.error(
+                self.cur.1,
+                format!("expected 'true' or 'false' after '{ctx}'"),
+            )),
+        }
+    }
+
+    /// `#(g g g)`-shaped: a literal array of bare shape-token symbols.
+    /// Reuses [`Self::parse_array_literal`] verbatim (the SAME grammar an
+    /// ordinary method-body `#(…)` expression uses — pragma mode and
+    /// literal-array mode are independent lexer flags, so nesting one
+    /// inside the other is not a new lexer case) rather than re-deriving
+    /// array-literal parsing here.
+    fn expect_ffi_sym_array(&mut self, ctx: &str) -> Result<Vec<String>, CompileError> {
+        if !matches!(self.cur.0, Tok::LitArrayOpen) {
+            return Err(self.error(self.cur.1, format!("expected '#(' after '{ctx}'")));
+        }
+        let span = self.cur.1;
+        let Literal::Array(elems) = self.parse_array_literal()? else {
+            unreachable!("parse_array_literal always returns Literal::Array")
+        };
+        elems
+            .into_iter()
+            .map(|e| match e {
+                Literal::Symbol(s) => Ok(s),
+                _ => Err(self.error(
+                    span,
+                    format!("'{ctx}' array elements must be bare shape symbols (g, f, h4, …)"),
+                )),
+            })
+            .collect()
     }
 
     fn parse_class_pragma(&mut self) -> Result<ClassPragma, CompileError> {
@@ -770,30 +941,34 @@ impl<'a> Parser<'a> {
 
     fn parse_method_body(&mut self) -> Result<MethodBody, CompileError> {
         let mut primitive = None;
+        let mut ffi = None;
         while matches!(&self.cur.0, Tok::BinarySel(s) if s == "<") {
             let prim_span = self.cur.1;
-            if let Some(id) = self.parse_method_pragma()? {
-                if primitive.is_some() {
+            let (id, pragma_ffi) = self.parse_method_pragma()?;
+            if id.is_some() || pragma_ffi.is_some() {
+                if primitive.is_some() || ffi.is_some() {
                     return Err(self.error(prim_span, "duplicate primitive pragma"));
                 }
-                primitive = Some(id);
+                primitive = id;
+                ffi = pragma_ffi;
             }
         }
         let temps = self.parse_optional_temps()?;
         let body = self.parse_statements()?;
-        Ok((primitive, temps, body))
+        Ok((primitive, ffi, temps, body))
     }
 
     fn parse_method(&mut self, class_side: bool) -> Result<MethodNode, CompileError> {
         let span = self.cur.1;
         let (pattern_selector, params) = self.parse_pattern()?;
         self.expect(&Tok::LBracket, "expected '[' to start method body")?;
-        let (primitive, temps, body) = self.parse_method_body()?;
+        let (primitive, ffi, temps, body) = self.parse_method_body()?;
         self.expect(&Tok::RBracket, "expected ']' to close method body")?;
         Ok(MethodNode {
             pattern_selector,
             params,
             primitive,
+            ffi,
             temps,
             body,
             class_side,
@@ -847,12 +1022,13 @@ impl<'a> Parser<'a> {
                         let param = self.expect_ident("expected a parameter name")?;
                         self.check_not_reserved(mspan, &param)?;
                         self.expect(&Tok::LBracket, "expected '['")?;
-                        let (primitive, temps, body) = self.parse_method_body()?;
+                        let (primitive, ffi, temps, body) = self.parse_method_body()?;
                         self.expect(&Tok::RBracket, "expected ']'")?;
                         methods.push(MethodNode {
                             pattern_selector: "|".to_string(),
                             params: vec![param],
                             primitive,
+                            ffi,
                             temps,
                             body,
                             class_side: false,
@@ -1174,6 +1350,157 @@ mod tests {
 
         let dup = parse_file("Object subclass: X [ foo [ <primitive: 7> <primitive: 8> ^1 ] ]");
         assert!(dup.is_err());
+    }
+
+    // S20 FFI (docs/FFI.md §6.3) — `<primitive: FFI …>` parsing.
+
+    #[test]
+    fn parse_ffi_pragma_tier1_function() {
+        // docs/FFI.md §6.3's real generated FFIPosix>>mmapAddr:... shape,
+        // verbatim (6 `g` args, `g` return).
+        let items = parse_file(
+            "Object subclass: X [ \
+                mmapAddr: a1 length: a2 prot: a3 flags: a4 fd: a5 offset: a6 [ \
+                    <primitive: FFI function: #mmap ret: #g args: #(g g g g g g)> \
+                ] \
+            ]",
+        )
+        .unwrap();
+        let TopItem::ClassDef(c) = &items[0] else {
+            panic!()
+        };
+        let m = &c.methods[0];
+        assert_eq!(m.primitive, None);
+        match &m.ffi {
+            Some(FfiPragma::Function { name, ret, args }) => {
+                assert_eq!(name, "mmap");
+                assert_eq!(ret, "g");
+                assert_eq!(args, &vec!["g", "g", "g", "g", "g", "g"]);
+            }
+            other => panic!("expected FfiPragma::Function, got {other:?}"),
+        }
+        assert_eq!(m.body.len(), 0, "the pragma is the whole body — no ^expr");
+    }
+
+    #[test]
+    fn parse_ffi_pragma_tier2_selector() {
+        // docs/FFI.md §6.3's real generated NSColorAlien shape, verbatim
+        // (4 `f` args, `g` return, classSide: true).
+        let items = parse_file(
+            "Object subclass: X [ \
+                X class >> colorWithRed: a1 green: a2 blue: a3 alpha: a4 [ \
+                    <primitive: FFI selector: #colorWithRed:green:blue:alpha: \
+                        class: #NSColor classSide: true ret: #g args: #(f f f f)> \
+                ] \
+            ]",
+        )
+        .unwrap();
+        let TopItem::ClassDef(c) = &items[0] else {
+            panic!()
+        };
+        let m = &c.methods[0];
+        match &m.ffi {
+            Some(FfiPragma::Selector {
+                selector,
+                class,
+                class_side,
+                ret,
+                args,
+            }) => {
+                assert_eq!(selector, "colorWithRed:green:blue:alpha:");
+                assert_eq!(class, "NSColor");
+                assert!(*class_side);
+                assert_eq!(ret, "g");
+                assert_eq!(args, &vec!["f", "f", "f", "f"]);
+            }
+            other => panic!("expected FfiPragma::Selector, got {other:?}"),
+        }
+    }
+
+    /// `frame`'s real shape (docs/FFI.md §6.3): no `args:` at all, `ret: #h4`
+    /// — `args` must default to empty rather than erroring, and a Tier 2
+    /// pragma's own `classSide:` must default to `false` when omitted.
+    #[test]
+    fn parse_ffi_pragma_defaults_no_args_no_classside() {
+        let items = parse_file(
+            "Object subclass: X [ \
+                frame [ <primitive: FFI selector: #frame class: #NSView ret: #h4> ] \
+            ]",
+        )
+        .unwrap();
+        let TopItem::ClassDef(c) = &items[0] else {
+            panic!()
+        };
+        match &c.methods[0].ffi {
+            Some(FfiPragma::Selector {
+                class_side, args, ..
+            }) => {
+                assert!(!*class_side);
+                assert!(args.is_empty());
+            }
+            other => panic!("expected FfiPragma::Selector, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_ffi_pragma_missing_ret_is_an_error() {
+        let err = parse_file(
+            "Object subclass: X [ foo [ <primitive: FFI function: #getpid args: #()> ^1 ] ]",
+        );
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn parse_ffi_pragma_both_function_and_selector_is_an_error() {
+        let err = parse_file(
+            "Object subclass: X [ foo [ \
+                <primitive: FFI function: #getpid selector: #foo class: #Bar ret: #g> ^1 \
+            ] ]",
+        );
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn parse_ffi_pragma_neither_function_nor_selector_is_an_error() {
+        let err = parse_file("Object subclass: X [ foo [ <primitive: FFI ret: #g> ^1 ] ]");
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn parse_ffi_pragma_selector_without_class_is_an_error() {
+        let err =
+            parse_file("Object subclass: X [ foo [ <primitive: FFI selector: #foo ret: #g> ^1 ] ]");
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn parse_ffi_pragma_args_element_must_be_a_symbol() {
+        let err = parse_file(
+            "Object subclass: X [ foo [ \
+                <primitive: FFI function: #mmap ret: #g args: #(1 2)> ^1 \
+            ] ]",
+        );
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn parse_ffi_pragma_never_collides_with_plain_primitive_pragma() {
+        // Two DIFFERENT method bodies, one of each kind, in the SAME class —
+        // proves parse_method_pragma's two return arms stay independent.
+        let items = parse_file(
+            "Object subclass: X [ \
+                plain [ <primitive: 7> ^1 ] \
+                ffi [ <primitive: FFI function: #getpid ret: #g> ] \
+            ]",
+        )
+        .unwrap();
+        let TopItem::ClassDef(c) = &items[0] else {
+            panic!()
+        };
+        assert_eq!(c.methods[0].primitive, Some(7));
+        assert!(c.methods[0].ffi.is_none());
+        assert!(c.methods[1].primitive.is_none());
+        assert!(matches!(c.methods[1].ffi, Some(FfiPragma::Function { .. })));
     }
 
     #[test]

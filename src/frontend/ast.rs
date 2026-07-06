@@ -90,10 +90,46 @@ pub struct MethodNode {
     pub pattern_selector: String,
     pub params: Vec<String>,
     pub primitive: Option<u16>,
+    /// S20 FFI (docs/FFI.md §5/§6.3): `<primitive: FFI ...>` — a distinct,
+    /// keyword-bodied pragma the ffi_gen generator already emits (Tier 1
+    /// `function:`, Tier 2 `selector:`), parsed separately from the bare
+    /// `<primitive: N>` integer form above (`primitive` and `ffi` are never
+    /// both `Some` — `parser::parse_method_pragma`'s own two return arms).
+    pub ffi: Option<FfiPragma>,
     pub temps: Vec<String>,
     pub body: Vec<Expr>,
     pub class_side: bool,
     pub span: Span,
+}
+
+/// S20 FFI: the parsed body of a `<primitive: FFI ...>` pragma (docs/FFI.md
+/// §6.3's own generated syntax, verbatim) — `ret`/`args` are the raw ABI
+/// shape-token strings (`"g"`/`"f"`/`"h4"`/…, docs/FFI.md §1), left as
+/// `String` rather than resolved to an enum here: the AST layer has no
+/// opinion on which ret/arg classes the runtime primitive actually
+/// implements yet (v1: `g`/`f`/`v` only, `codecache::ffi_stubs`) — that
+/// validation belongs at the SAME later stage that resolves the target
+/// symbol, not here.
+#[derive(Clone, Debug, PartialEq)]
+pub enum FfiPragma {
+    /// Tier 1 — `<primitive: FFI function: #mmap ret: #g args: #(g g g g g g)>`.
+    Function {
+        name: String,
+        ret: String,
+        args: Vec<String>,
+    },
+    /// Tier 2 — `<primitive: FFI selector: #colorWithRed:green:blue:alpha:
+    /// class: #NSColor classSide: true ret: #g args: #(f f f f)>`. Parsed
+    /// now for completeness (ffi_gen already emits this form for its Cocoa
+    /// manifest) but not yet acted on by any runtime primitive — Tier 2
+    /// dispatch is S20 step 7, deliberately deferred (docs/FFI.md §3).
+    Selector {
+        selector: String,
+        class: String,
+        class_side: bool,
+        ret: String,
+        args: Vec<String>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

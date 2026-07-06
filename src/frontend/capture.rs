@@ -555,6 +555,7 @@ mod tests {
             pattern_selector: "m".to_string(),
             params: params.iter().map(|s| s.to_string()).collect(),
             primitive: None,
+            ffi: None,
             temps: temps.iter().map(|s| s.to_string()).collect(),
             body,
             class_side: false,

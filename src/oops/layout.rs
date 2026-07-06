@@ -105,6 +105,13 @@ pub const METHOD_SELECTOR_INDEX: usize = 0; // Symbol
 pub const METHOD_HOLDER_INDEX: usize = 1; // klassOop | nil (nil until S3 install)
 pub const METHOD_FLAGS_INDEX: usize = 2; // smi, packing below
 pub const METHOD_PRIMITIVE_INDEX: usize = 3; // smi, 0 = none
+/// S20 FFI (docs/FFI.md §5/§6.3): `primitive()`'s sentinel for `<primitive:
+/// FFI …>` — a method whose REAL dispatch info is a small descriptor Array
+/// at `literals()[0]` (`frontend::codegen::build_ffi_descriptor`), not a
+/// numbered primitive at all. Negative, so it can never collide with a real
+/// numbered primitive (`1..=65535`, `parser::parse_method_pragma`'s own
+/// validated range) or the "no primitive" default (`0`).
+pub const PRIM_ID_FFI: i64 = -1;
 pub const METHOD_COUNTERS_INDEX: usize = 4; // smi (invocation:16 | reserved)
 pub const METHOD_LITERALS_INDEX: usize = 5; // Array
 pub const METHOD_ICS_INDEX: usize = 6; // Array (stride 4, SPEC §4.3)

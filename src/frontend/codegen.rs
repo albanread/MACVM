@@ -16,7 +16,7 @@ use crate::oops::wrappers::{ArrayOop, KlassOop, MemOop, MethodOop};
 use crate::oops::Oop;
 use crate::runtime::vm_state::VmState;
 
-use super::ast::{BlockNode, Expr, Literal, MethodNode};
+use super::ast::{BlockNode, Expr, FfiPragma, Literal, MethodNode};
 use super::capture::{self, BlockPos, CaptureInfo, Resolved, ScopeInfo};
 use super::lexer::Span;
 use super::CompileError;
@@ -1040,6 +1040,7 @@ pub fn compile_doit(
         pattern_selector: "doIt".to_string(),
         params: vec![],
         primitive: None,
+        ffi: None,
         temps: vec![],
         body: vec![stmt],
         class_side: false,
@@ -1122,7 +1123,132 @@ fn compile_method_inner(
     if let Some(pid) = method.primitive {
         m.set_primitive(pid as i64);
     }
+    if let Some(ffi) = &method.ffi {
+        // `m` is a bare (unprotected) MethodOop; `build_ffi_descriptor`
+        // interns symbols and allocates an array, either of which can
+        // scavenge and relocate `m` itself. Handle-protect it across that
+        // call — the same hazard class as BUG A — and re-resolve afterward
+        // rather than writing back through the (possibly stale) original.
+        let m_h = cx.scope.handle(cx.vm, m);
+        m_h.get(cx.vm)
+            .set_primitive(crate::oops::layout::PRIM_ID_FFI);
+        let desc = build_ffi_descriptor(cx.vm, &cx.scope, ffi);
+        m_h.get(cx.vm).set_literals(desc);
+        return Ok(m_h.get(cx.vm));
+    }
     Ok(m)
+}
+
+/// S20 FFI (docs/FFI.md §5/§6.3): converts a parsed `<primitive: FFI …>`
+/// pragma into a small, fixed-shape descriptor `ArrayOop`, stored via
+/// `MethodOop::set_literals` and read back by the runtime primitive (S20
+/// step 4) keyed off `primitive() == PRIM_ID_FFI`. Every element is a
+/// plain Symbol, Boolean, or `nil` — no new oop kind needed, and no new
+/// `MethodOop` field either (`literals()` already exists for exactly this
+/// "small per-method side table" shape, S10's own literal-frame slot).
+///
+/// Fixed 6-slot shape, always in this order:
+/// `[kind, name, class, classSide, ret, args]`
+///   - `kind`:      `#function` (Tier 1) or `#selector` (Tier 2)
+///   - `name`:      the POSIX function name OR the ObjC selector (a Symbol)
+///   - `class`:     the ObjC class name (a Symbol) or `nil` (Tier 1 has none)
+///   - `classSide`: `true`/`false` (always `false` for Tier 1 — meaningless
+///     there, but a fixed slot count is simpler than a variable one)
+///   - `ret`:       the ABI return-shape token, e.g. `#g`/`#f`/`#h4` (a Symbol)
+///   - `args`:      an `Array` of ABI arg-shape token Symbols, one per arg
+///
+/// Every intermediate oop (each interned Symbol, the args sub-array) is
+/// `HandleScope`-protected across the LATER allocations in this same
+/// function — `vm.universe.intern` allocates from eden (`Universe::intern`
+/// -> `intern_core(&mut self.eden, …)`, not a permanent old-gen table), so
+/// an unprotected symbol from an EARLIER `intern` call could be relocated
+/// by a scavenge a LATER `intern`/`alloc_indexable_oops` call triggers —
+/// exactly BUG A's class of hazard, guarded against here the same way
+/// this function's own caller already protects `holder`/`inst_var_names`.
+fn build_ffi_descriptor(vm: &mut VmState, scope: &HandleScope, ffi: &FfiPragma) -> ArrayOop {
+    let (kind, name, class, class_side, ret, args): (
+        &str,
+        &str,
+        Option<&str>,
+        bool,
+        &str,
+        &[String],
+    ) = match ffi {
+        FfiPragma::Function { name, ret, args } => (
+            "function",
+            name.as_str(),
+            None,
+            false,
+            ret.as_str(),
+            args.as_slice(),
+        ),
+        FfiPragma::Selector {
+            selector,
+            class,
+            class_side,
+            ret,
+            args,
+        } => (
+            "selector",
+            selector.as_str(),
+            Some(class.as_str()),
+            *class_side,
+            ret.as_str(),
+            args.as_slice(),
+        ),
+    };
+
+    // Each `intern` runs to completion (and is stashed into `scope` for
+    // protection) BEFORE the next one starts — two-phase borrows don't let
+    // `scope.handle(vm, vm.universe.intern(...))` share `vm` in one
+    // expression, which conveniently also makes the "protect before the
+    // next allocation" ordering this function's own doc requires literally
+    // impossible to get backwards.
+    let kind_sym = vm.universe.intern(kind.as_bytes()).oop();
+    let kind_h = scope.handle(vm, kind_sym);
+    let name_sym = vm.universe.intern(name.as_bytes()).oop();
+    let name_h = scope.handle(vm, name_sym);
+    let class_h = class.map(|c| {
+        let sym = vm.universe.intern(c.as_bytes()).oop();
+        scope.handle(vm, sym)
+    });
+    let ret_sym = vm.universe.intern(ret.as_bytes()).oop();
+    let ret_h = scope.handle(vm, ret_sym);
+    let arg_hs: Vec<Handle<Oop>> = args
+        .iter()
+        .map(|a| {
+            let sym = vm.universe.intern(a.as_bytes()).oop();
+            scope.handle(vm, sym)
+        })
+        .collect();
+
+    // `vm.universe.array_klass` is read fresh at EACH use, not cached in a
+    // local held across an allocation: a fresh VM's bootstrap klasses still
+    // live in eden until first promoted, so a bare copy would go stale the
+    // moment an intervening scavenge relocates it — same hazard as `m`
+    // above, just on the klass argument this time. `nil_obj`/`true_obj`/
+    // `false_obj` below follow the same always-re-read convention.
+    let args_arr = alloc::alloc_indexable_oops(vm, vm.universe.array_klass, arg_hs.len());
+    for (i, h) in arg_hs.iter().enumerate() {
+        args_arr.at_put(i, h.get(vm));
+    }
+    let args_arr_h = scope.handle(vm, args_arr.oop());
+
+    let desc = alloc::alloc_indexable_oops(vm, vm.universe.array_klass, 6);
+    desc.at_put(0, kind_h.get(vm));
+    desc.at_put(1, name_h.get(vm));
+    desc.at_put(2, class_h.map(|h| h.get(vm)).unwrap_or(vm.universe.nil_obj));
+    desc.at_put(
+        3,
+        if class_side {
+            vm.universe.true_obj
+        } else {
+            vm.universe.false_obj
+        },
+    );
+    desc.at_put(4, ret_h.get(vm));
+    desc.at_put(5, args_arr_h.get(vm));
+    desc
 }
 
 #[cfg(test)]
@@ -1132,6 +1258,7 @@ mod tests {
     use crate::frontend::lexer::int_lit_magnitude;
     use crate::frontend::parser::parse_file;
     use crate::interpreter::run_method;
+    use crate::oops::wrappers::SymbolOop;
     use crate::runtime::vm_state::{OutputBuffer, VmOptions};
 
     fn test_vm() -> VmState {
@@ -1189,6 +1316,7 @@ mod tests {
             pattern_selector: "m".into(),
             params: vec![],
             primitive: None,
+            ffi: None,
             temps: vec![],
             body: vec![Expr::Return {
                 value: Box::new(Expr::Var {
@@ -1216,6 +1344,7 @@ mod tests {
             pattern_selector: "m2".into(),
             params: vec![],
             primitive: None,
+            ffi: None,
             temps: vec!["x".to_string()],
             body: vec![
                 Expr::Assign {
@@ -1253,6 +1382,7 @@ mod tests {
             pattern_selector: "m".into(),
             params: vec![],
             primitive: None,
+            ffi: None,
             temps: vec![],
             body: vec![Expr::Var {
                 name: "Zork".into(),
@@ -1292,6 +1422,7 @@ mod tests {
             pattern_selector: "m".into(),
             params: vec![],
             primitive: None,
+            ffi: None,
             temps: vec![],
             body: vec![
                 Expr::Lit {
@@ -1336,6 +1467,7 @@ mod tests {
             pattern_selector: "m".into(),
             params: vec![],
             primitive: None,
+            ffi: None,
             temps: vec![],
             body: vec![
                 Expr::Send {
@@ -1388,6 +1520,7 @@ mod tests {
             pattern_selector: "a:b:".into(),
             params: vec!["a".into(), "b".into()],
             primitive: None,
+            ffi: None,
             temps: vec!["t".into()],
             body: vec![],
             class_side: false,
@@ -1404,6 +1537,7 @@ mod tests {
             pattern_selector: "m2".into(),
             params: vec![],
             primitive: None,
+            ffi: None,
             temps: vec!["t".into()],
             body: vec![Expr::Block(Box::new(BlockNode {
                 params: vec![],
@@ -1426,6 +1560,7 @@ mod tests {
             pattern_selector: "m3".into(),
             params: vec![],
             primitive: Some(7),
+            ffi: None,
             temps: vec![],
             body: vec![Expr::SelfRef(sp)],
             class_side: false,
@@ -1439,6 +1574,7 @@ mod tests {
             pattern_selector: "m4".into(),
             params: vec![],
             primitive: Some(7),
+            ffi: None,
             temps: vec![],
             body: vec![],
             class_side: false,
@@ -1451,6 +1587,7 @@ mod tests {
             pattern_selector: "m5".into(),
             params: vec![],
             primitive: None,
+            ffi: None,
             temps: vec![],
             body: vec![Expr::Block(Box::new(BlockNode {
                 params: vec![],
@@ -1477,6 +1614,7 @@ mod tests {
             pattern_selector: "m".into(),
             params: vec![],
             primitive: None,
+            ffi: None,
             temps: vec![],
             body: vec![Expr::Return {
                 value: Box::new(Expr::Lit {
@@ -1586,5 +1724,173 @@ mod tests {
         );
         assert_eq!(r, SmallInt::new(3).oop());
         let _ = OutputBuffer::new(); // sanity: type still in scope
+    }
+
+    // S20 FFI (docs/FFI.md §5/§6.3) — `build_ffi_descriptor` + its
+    // `compile_method_inner` wiring, end to end from real source text.
+
+    fn test_klass(vm: &mut VmState, name: &str) -> KlassOop {
+        let object_klass = vm.universe.object_klass;
+        vm.universe.new_klass(
+            object_klass,
+            name,
+            crate::oops::Format::Slots,
+            false,
+            crate::oops::layout::HEADER_WORDS,
+        )
+    }
+
+    fn first_method_of(src: &str) -> MethodNode {
+        let items = parse_file(src).expect("parse");
+        let TopItem::ClassDef(c) = items.into_iter().next().unwrap() else {
+            panic!("expected a class def")
+        };
+        c.methods.into_iter().next().expect("expected a method")
+    }
+
+    fn sym_str(o: Oop) -> String {
+        SymbolOop::try_from(o)
+            .expect("expected a Symbol oop")
+            .as_string()
+    }
+
+    /// docs/FFI.md §6.3's real generated `FFIPosix>>mmapAddr:...` shape,
+    /// verbatim — proves the WHOLE pipeline (parse -> `MethodNode.ffi` ->
+    /// `build_ffi_descriptor` -> a real, GC-allocated `literals()` Array)
+    /// against the exact ffi_gen output this pragma exists to serve.
+    #[test]
+    fn ffi_tier1_function_compiles_to_descriptor_literal() {
+        let mut vm = test_vm();
+        let klass = test_klass(&mut vm, "FFIPosix");
+        let mut method = first_method_of(
+            "Object subclass: FFIPosix [ \
+                mmapAddr: a1 length: a2 prot: a3 flags: a4 fd: a5 offset: a6 [ \
+                    <primitive: FFI function: #mmap ret: #g args: #(g g g g g g)> \
+                ] \
+            ]",
+        );
+        let m = compile_method(&mut vm, klass, false, &mut method).expect("compile");
+
+        assert_eq!(m.primitive(), crate::oops::layout::PRIM_ID_FFI);
+        let desc = m.literals();
+        assert_eq!(desc.len(), 6, "kind/name/class/classSide/ret/args");
+        assert_eq!(sym_str(desc.at(0)), "function");
+        assert_eq!(sym_str(desc.at(1)), "mmap");
+        assert_eq!(desc.at(2), vm.universe.nil_obj, "Tier 1 has no class");
+        assert_eq!(
+            desc.at(3),
+            vm.universe.false_obj,
+            "Tier 1's classSide is moot"
+        );
+        assert_eq!(sym_str(desc.at(4)), "g");
+        let args = ArrayOop::try_from(desc.at(5)).expect("args must be an Array");
+        assert_eq!(args.len(), 6);
+        for i in 0..6 {
+            assert_eq!(sym_str(args.at(i)), "g");
+        }
+    }
+
+    /// docs/FFI.md §6.3's real generated `NSColorAlien` shape, verbatim —
+    /// Tier 2's `class:`/`classSide:` slots, and `f`-shaped args (proves
+    /// the descriptor isn't accidentally `g`-only).
+    #[test]
+    fn ffi_tier2_selector_compiles_to_descriptor_literal() {
+        let mut vm = test_vm();
+        let klass = test_klass(&mut vm, "NSColorAlien");
+        let mut method = first_method_of(
+            "Object subclass: NSColorAlien [ \
+                NSColorAlien class >> colorWithRed: a1 green: a2 blue: a3 alpha: a4 [ \
+                    <primitive: FFI selector: #colorWithRed:green:blue:alpha: \
+                        class: #NSColor classSide: true ret: #g args: #(f f f f)> \
+                ] \
+            ]",
+        );
+        let m = compile_method(&mut vm, klass, true, &mut method).expect("compile");
+
+        assert_eq!(m.primitive(), crate::oops::layout::PRIM_ID_FFI);
+        let desc = m.literals();
+        assert_eq!(sym_str(desc.at(0)), "selector");
+        assert_eq!(sym_str(desc.at(1)), "colorWithRed:green:blue:alpha:");
+        assert_eq!(sym_str(desc.at(2)), "NSColor");
+        assert_eq!(desc.at(3), vm.universe.true_obj);
+        assert_eq!(sym_str(desc.at(4)), "g");
+        let args = ArrayOop::try_from(desc.at(5)).unwrap();
+        assert_eq!(args.len(), 4);
+        for i in 0..4 {
+            assert_eq!(sym_str(args.at(i)), "f");
+        }
+    }
+
+    /// `args: #()` (empty) and no `classSide:` at all (`frame`'s real
+    /// shape, docs/FFI.md §6.3) — an empty descriptor args Array, not a
+    /// missing/nil one, and `classSide` defaults to `false`.
+    #[test]
+    fn ffi_pragma_empty_args_and_default_classside() {
+        let mut vm = test_vm();
+        let klass = test_klass(&mut vm, "NSViewAlien");
+        let mut method = first_method_of(
+            "Object subclass: NSViewAlien [ \
+                frame [ <primitive: FFI selector: #frame class: #NSView ret: #h4> ] \
+            ]",
+        );
+        let m = compile_method(&mut vm, klass, false, &mut method).expect("compile");
+        let desc = m.literals();
+        assert_eq!(desc.at(3), vm.universe.false_obj);
+        let args = ArrayOop::try_from(desc.at(5)).unwrap();
+        assert_eq!(args.len(), 0);
+    }
+
+    /// GC-safety proof, not just a shape check: force a scavenge on EVERY
+    /// allocation (the exact hazard `build_ffi_descriptor`'s own doc
+    /// argues its `HandleScope` protection avoids) while compiling an FFI
+    /// method with enough distinct symbols that an unprotected earlier one
+    /// would be relocated out from under a later `at_put` if the handles
+    /// were missing or misordered.
+    #[test]
+    fn ffi_descriptor_survives_gc_stress() {
+        let mut vm = VmState::with_options(VmOptions {
+            heap_mib: 64,
+            trace: Default::default(),
+            gc_stress: true, // scavenges on (nearly) every allocation
+            gc_stress_full_period: None,
+            eden_kb: None,
+            jit: crate::runtime::JitMode::Off,
+        });
+        let klass = test_klass(&mut vm, "FFIPosix");
+        let mut method = first_method_of(
+            "Object subclass: FFIPosix [ \
+                mmapAddr: a1 length: a2 prot: a3 flags: a4 fd: a5 offset: a6 [ \
+                    <primitive: FFI function: #mmap ret: #g args: #(g g g g g g)> \
+                ] \
+            ]",
+        );
+        let m = compile_method(&mut vm, klass, false, &mut method).expect("compile");
+
+        assert_eq!(m.primitive(), crate::oops::layout::PRIM_ID_FFI);
+        let desc = m.literals();
+        assert_eq!(sym_str(desc.at(0)), "function");
+        assert_eq!(sym_str(desc.at(1)), "mmap");
+        assert_eq!(sym_str(desc.at(4)), "g");
+        let args = ArrayOop::try_from(desc.at(5)).unwrap();
+        assert_eq!(args.len(), 6);
+        for i in 0..6 {
+            assert_eq!(sym_str(args.at(i)), "g");
+        }
+    }
+
+    /// A method's `ffi`/`primitive` fields are mutually exclusive by
+    /// parser construction (S20 step 3), but `compile_method_inner`'s own
+    /// two `if let` blocks are independent code — pin that an ORDINARY
+    /// `<primitive: N>` method is completely unaffected by this whole
+    /// feature (no descriptor, no sentinel primitive id).
+    #[test]
+    fn plain_primitive_pragma_is_unaffected_by_ffi_wiring() {
+        let mut vm = test_vm();
+        let klass = test_klass(&mut vm, "PlainPrim");
+        let mut method =
+            first_method_of("Object subclass: PlainPrim [ foo [ <primitive: 7> ^1 ] ]");
+        let m = compile_method(&mut vm, klass, false, &mut method).expect("compile");
+        assert_eq!(m.primitive(), 7);
+        assert_ne!(m.primitive(), crate::oops::layout::PRIM_ID_FFI);
     }
 }
