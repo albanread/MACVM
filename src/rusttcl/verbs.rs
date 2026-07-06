@@ -90,6 +90,16 @@ const TABLE: &[VerbDoc] = &[
         help: "Disassemble a compiled nmethod's MACHINE CODE (DBG3): one line per instruction, with ic-site and safepoint offsets annotated. Requires the method to have compiled (see nmethods). Contrast `disasm`, which shows bytecode.",
     },
     VerbDoc {
+        name: "pin",
+        usage: "pin <Class> <selector>",
+        help: "Force a method to run interpreted (pin to tier-0, invalidate any nmethod) WITHOUT halting — the differential-diagnosis lever: 'does interpreting THIS method change the result?'. The fastest way to localize a wrong-value-from-compiled-code bug.",
+    },
+    VerbDoc {
+        name: "unpin",
+        usage: "unpin <Class> <selector>",
+        help: "Restore tier-up eligibility for a `pin`-ed method.",
+    },
+    VerbDoc {
         name: "help",
         usage: "help [verb]",
         help: "List every RUSTTCL verb, or show one verb's full help text.",
@@ -116,6 +126,8 @@ pub fn register_macvm_verbs(registry: &mut Registry) {
     registry.register("bp-list", Arity::exact(0), verb_bp_list);
     registry.register("ring", Arity::exact(0), verb_ring);
     registry.register("disasm-native", Arity::exact(2), verb_disasm_native);
+    registry.register("pin", Arity::exact(2), verb_pin);
+    registry.register("unpin", Arity::exact(2), verb_unpin);
     registry.register("help", Arity::range(0, 1), verb_help);
     registry.register("quit", Arity::exact(0), verb_quit);
     registry.register("exit", Arity::exact(0), verb_quit);
@@ -517,6 +529,20 @@ fn verb_disasm_native(_vm: &mut Vm<'_>, args: &[Value]) -> TclResult<Value> {
         nm.literal_off,
         nm.code.len - nm.literal_off as usize
     )];
+    // Whole-blob bytes for resolving ldr-literal pool loads (a load's
+    // target lands PAST literal_off, in the pool).
+    let all = nm.code.as_bytes();
+    let tag = |raw: u64| -> &'static str {
+        if raw == ctx.vm.universe.true_obj.raw() {
+            " =true"
+        } else if raw == ctx.vm.universe.false_obj.raw() {
+            " =false"
+        } else if raw == ctx.vm.universe.nil_obj.raw() {
+            " =nil"
+        } else {
+            ""
+        }
+    };
     for (i, line) in listing.lines().enumerate() {
         let off = i * 4;
         let mut annot = String::new();
@@ -532,9 +558,51 @@ fn verb_disasm_native(_vm: &mut Vm<'_>, args: &[Value]) -> TclResult<Value> {
         if sp_offs.contains(&off) {
             annot.push_str("  ; safepoint");
         }
+        // Resolve ldr-literal pool loads: word 0x58xxxxxx, imm19 = bits[23:5].
+        if off + 4 <= all.len() {
+            let w = u32::from_le_bytes([all[off], all[off + 1], all[off + 2], all[off + 3]]);
+            if w & 0xff00_0000 == 0x5800_0000 {
+                let imm19 = ((w >> 5) & 0x7ffff) as i64;
+                let disp = if imm19 & (1 << 18) != 0 {
+                    imm19 - (1 << 19)
+                } else {
+                    imm19
+                };
+                let target = off as i64 + disp * 4;
+                if target >= 0 && (target as usize) + 8 <= all.len() {
+                    let t = target as usize;
+                    let raw = u64::from_le_bytes([
+                        all[t],
+                        all[t + 1],
+                        all[t + 2],
+                        all[t + 3],
+                        all[t + 4],
+                        all[t + 5],
+                        all[t + 6],
+                        all[t + 7],
+                    ]);
+                    annot.push_str(&format!("  ; pool[{target:#x}]={raw:#x}{}", tag(raw)));
+                }
+            }
+        }
         rows.push(format!("{line}{annot}"));
     }
     Ok(Value::new(rows.join("\n")))
+}
+
+fn verb_pin(_vm: &mut Vm<'_>, args: &[Value]) -> TclResult<Value> {
+    let ctx = bridge::active_ctx();
+    ctx.vm.debug.active = true;
+    crate::runtime::debug::pin_by_name(&mut ctx.vm, args[0].as_str(), args[1].as_str())
+        .map(Value::new)
+        .map_err(TclError::runtime)
+}
+
+fn verb_unpin(_vm: &mut Vm<'_>, args: &[Value]) -> TclResult<Value> {
+    let ctx = bridge::active_ctx();
+    crate::runtime::debug::unpin_by_name(&mut ctx.vm, args[0].as_str(), args[1].as_str())
+        .map(Value::new)
+        .map_err(TclError::runtime)
 }
 
 fn verb_ring(_vm: &mut Vm<'_>, _args: &[Value]) -> TclResult<Value> {

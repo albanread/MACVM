@@ -78,6 +78,14 @@ pub struct DebugState {
     /// so the breakpoint lands the moment the method exists, before any
     /// doit can call it.
     pub pending: Vec<(String, String, u16)>,
+    /// Methods pinned to tier-0 via [`pin_method`] — identity-hash → "did
+    /// we set compile_disabled" (so `unpin` restores only what it disabled).
+    /// The differential-diagnosis lever, no oops.
+    pinned: HashMap<u32, bool>,
+    /// `MACVM_PIN=Class>>sel[,…]` specs not yet installed — landed at
+    /// `install_method` like `pending`, so a pin can name a class defined
+    /// in the file about to run.
+    pub pending_pins: Vec<(String, String)>,
 }
 
 impl DebugState {
@@ -540,6 +548,63 @@ fn print_result(vm: &mut VmState, result: Oop) -> String {
     crate::memory::print_oop(&vm.universe, result)
 }
 
+/// Pin `method` to tier-0 WITHOUT a breakpoint — the differential
+/// diagnosis lever (docs/DEBUGGER.md §3.5, "selective de-optimization").
+/// Identical to `set_breakpoint`'s step 3 (block future compiles +
+/// invalidate existing nmethods via the redefinition path), minus the
+/// halt: the method simply runs interpreted from now on. Answers "does
+/// forcing THIS method interpreted change the result?" — the fastest way
+/// to localize a wrong-value-from-compiled-code bug to one method. Kept in
+/// `debug.pinned` so `unpin` can restore eligibility.
+pub fn pin_method(vm: &mut VmState, method: MethodOop) -> Result<String, String> {
+    let holder = KlassOop::try_from(method.holder());
+    let holder_name = holder
+        .map(|k| crate::runtime::error::name_of(k.name()))
+        .unwrap_or_else(|| "?".into());
+    let selector_name = SymbolOop::try_from(method.selector())
+        .map(|s| s.as_string())
+        .unwrap_or_else(|| "?".into());
+    let hash = vm.universe.identity_hash(method.oop());
+    let restore_compile = !method.compile_disabled();
+    vm.debug.pinned.insert(hash, restore_compile);
+    method.set_compile_disabled();
+    if let (Some(k), Some(s)) = (holder, SymbolOop::try_from(method.selector())) {
+        crate::runtime::deps::invalidate_dependents(vm, k, s);
+    }
+    Ok(format!("pinned to tier-0: {holder_name}>>{selector_name}"))
+}
+
+/// Reverse [`pin_method`]: restore tier-up eligibility (only if we were the
+/// one that disabled it). Recompilation then resumes naturally by counters.
+pub fn unpin_method(vm: &mut VmState, method: MethodOop) -> Result<String, String> {
+    let hash = vm.universe.identity_hash(method.oop());
+    let selector_name = SymbolOop::try_from(method.selector())
+        .map(|s| s.as_string())
+        .unwrap_or_else(|| "?".into());
+    match vm.debug.pinned.remove(&hash) {
+        Some(true) => {
+            method.clear_compile_disabled();
+            Ok(format!("unpinned: {selector_name}"))
+        }
+        Some(false) => Ok(format!(
+            "unpinned: {selector_name} (was already ineligible)"
+        )),
+        None => Err(format!("{selector_name} was not pinned")),
+    }
+}
+
+/// [`pin_method`] by class/selector name.
+pub fn pin_by_name(vm: &mut VmState, class: &str, selector: &str) -> Result<String, String> {
+    let method = resolve_method_by_name(vm, class, selector)?;
+    pin_method(vm, method)
+}
+
+/// [`unpin_method`] by class/selector name.
+pub fn unpin_by_name(vm: &mut VmState, class: &str, selector: &str) -> Result<String, String> {
+    let method = resolve_method_by_name(vm, class, selector)?;
+    unpin_method(vm, method)
+}
+
 /// Name-based breakpoint setting — the shared door `main.rs`
 /// (`MACVM_DEBUG=break:`) and the RUSTTCL `bp` verb both use. Resolution
 /// mirrors RUSTTCL's own: the class via the globals table, the method via
@@ -600,20 +665,19 @@ pub fn on_method_installed(
     selector: SymbolOop,
     method: MethodOop,
 ) {
-    if vm.debug.pending.is_empty() {
+    if vm.debug.pending.is_empty() && vm.debug.pending_pins.is_empty() {
         return;
     }
     let holder_name = crate::runtime::error::name_of(holder.name());
     let sel_name = selector.as_string();
+    // `Class class` names the metaclass side; install_method's holder for a
+    // class-side method IS the metaclass, whose name prints as the base
+    // class's — match on the base name either way.
+    let matches = |spec: &str| spec.strip_suffix(" class").unwrap_or(spec) == holder_name;
     let mut i = 0;
     while i < vm.debug.pending.len() {
         let (c, s, bci) = vm.debug.pending[i].clone();
-        // `Class class` names the metaclass side; install_method's holder
-        // for a class-side method IS the metaclass, whose name prints as
-        // the base class's (name_of reads the klass name slot) — match on
-        // the base name either way.
-        let base = c.strip_suffix(" class").unwrap_or(&c);
-        if base == holder_name && s == sel_name {
+        if matches(&c) && s == sel_name {
             vm.debug.pending.remove(i);
             match set_breakpoint(vm, method, bci) {
                 Ok(msg) => eprintln!("{msg} (deferred)"),
@@ -623,6 +687,35 @@ pub fn on_method_installed(
             i += 1;
         }
     }
+    let mut i = 0;
+    while i < vm.debug.pending_pins.len() {
+        let (c, s) = vm.debug.pending_pins[i].clone();
+        if matches(&c) && s == sel_name {
+            vm.debug.pending_pins.remove(i);
+            match pin_method(vm, method) {
+                Ok(msg) => eprintln!("{msg} (deferred)"),
+                Err(e) => eprintln!("MACVM_PIN: {e}"),
+            }
+        } else {
+            i += 1;
+        }
+    }
+}
+
+/// `MACVM_PIN=Class>>sel[,Class>>sel...]` grammar (no bci — a whole method).
+pub fn parse_pin_spec(raw: &str) -> Vec<(String, String)> {
+    raw.split(',')
+        .filter_map(|part| {
+            let (c, s) = part.split_once(">>")?;
+            let c = c.trim();
+            let s = s.trim();
+            if c.is_empty() || s.is_empty() {
+                None
+            } else {
+                Some((c.to_string(), s.to_string()))
+            }
+        })
+        .collect()
 }
 
 /// `MACVM_DEBUG` grammar: `1` (just arm `debug.active`) or

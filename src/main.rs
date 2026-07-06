@@ -107,7 +107,8 @@ fn cmd_run(args: &[String], debug: bool) {
     );
 
     let debug_spec = std::env::var("MACVM_DEBUG").unwrap_or_default();
-    if debug || !debug_spec.is_empty() {
+    let pin_spec = std::env::var("MACVM_PIN").unwrap_or_default();
+    if debug || !debug_spec.is_empty() || !pin_spec.is_empty() {
         vm.debug.active = true;
         for (class, sel, bci) in macvm::runtime::debug::parse_debug_spec(&debug_spec) {
             match macvm::runtime::debug::set_breakpoint_by_name(&mut vm, &class, &sel, bci) {
@@ -116,6 +117,14 @@ fn cmd_run(args: &[String], debug: bool) {
                 // park the spec; install_method lands it the moment the
                 // method exists (debug::on_method_installed).
                 Err(_) => vm.debug.pending.push((class, sel, bci)),
+            }
+        }
+        // MACVM_PIN: force methods to tier-0 (differential diagnosis —
+        // "does interpreting THIS method change the result?").
+        for (class, sel) in macvm::runtime::debug::parse_pin_spec(&pin_spec) {
+            match macvm::runtime::debug::pin_by_name(&mut vm, &class, &sel) {
+                Ok(msg) => eprintln!("{msg}"),
+                Err(_) => vm.debug.pending_pins.push((class, sel)),
             }
         }
     }

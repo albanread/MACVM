@@ -526,6 +526,32 @@ fn compile_method_full(
 
     let cfg = decode::decode(method);
     let ir_method = ir::convert(vm, rcvr_klass, method, &cfg);
+    // Debugger (DBG3 companion): `MACVM_DBG_IR=<selector>` dumps every
+    // compile of a matching selector at the IR level — blocks, instructions,
+    // and the full literal pool with resolved values — the layer BETWEEN
+    // bytecode (`describe`) and machine code (`disasm-native`). Debug builds
+    // only, exact selector match, stderr. This is what separated "the
+    // compiler decided wrong" from "the runtime dispatched wrong" in the
+    // task-#88 c2i-dispatch investigation.
+    #[cfg(debug_assertions)]
+    if let Ok(want) = std::env::var("MACVM_DBG_IR") {
+        let sel = crate::oops::wrappers::SymbolOop::try_from(method.selector())
+            .map(|s| s.as_string())
+            .unwrap_or_default();
+        if sel == want {
+            eprintln!("==== IR {sel} (v{version}) ====");
+            for blk in &ir_method.blocks {
+                eprintln!("  block {} @bci{}:", blk.id.0, blk.bci);
+                for ir in &blk.code {
+                    eprintln!("    {ir:?}");
+                }
+            }
+            for (i, e) in ir_method.pool.iter().enumerate() {
+                eprintln!("  pool[{i}] = {:#x} {:?}", e.value, e.kind);
+            }
+            eprintln!("==== END IR {sel} ====");
+        }
+    }
     let mut regalloc_result = regalloc::regalloc(&ir_method);
 
     let mut asm = JasmAssembler::new();
