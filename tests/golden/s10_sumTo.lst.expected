@@ -1,83 +1,92 @@
 000000  a9bf7bfd  stp [Reg(Reg { class: X, num: 29, is_sp: false }), Reg(Reg { class: X, num: 30, is_sp: false }), Mem(Mem { base: Reg { class: X, num: 31, is_sp: true }, addr: PreIndex(-16) })]
 000004  910003fd  mov [Reg(Reg { class: X, num: 29, is_sp: false }), Reg(Reg { class: X, num: 31, is_sp: true })]
 000008  d10103ff  sub [Reg(Reg { class: X, num: 31, is_sp: true }), Reg(Reg { class: X, num: 31, is_sp: true }), Imm(64)]
-00000c  f81f83a0  str [Reg(Reg { class: X, num: 0, is_sp: false }), Mem(Mem { base: Reg { class: X, num: 29, is_sp: false }, addr: Offset(-8) })]
-000010  aa0003f5  mov [Reg(Reg { class: X, num: 21, is_sp: false }), Reg(Reg { class: X, num: 0, is_sp: false })]
-000014  f81f03a1  str [Reg(Reg { class: X, num: 1, is_sp: false }), Mem(Mem { base: Reg { class: X, num: 29, is_sp: false }, addr: Offset(-16) })]
-000018  aa0103e7  mov [Reg(Reg { class: X, num: 7, is_sp: false }), Reg(Reg { class: X, num: 1, is_sp: false })]
-00001c  58000010  ldr Reg { class: X, num: 16, is_sp: false }, =lit0
-000020  f81e83b0  str [Reg(Reg { class: X, num: 16, is_sp: false }), Mem(Mem { base: Reg { class: X, num: 29, is_sp: false }, addr: Offset(-24) })]
-000024  aa1003f6  mov [Reg(Reg { class: X, num: 22, is_sp: false }), Reg(Reg { class: X, num: 16, is_sp: false })]
-000028  58000010  ldr Reg { class: X, num: 16, is_sp: false }, =lit0
-00002c  f81e03b0  str [Reg(Reg { class: X, num: 16, is_sp: false }), Mem(Mem { base: Reg { class: X, num: 29, is_sp: false }, addr: Offset(-32) })]
-000030  58000010  ldr Reg { class: X, num: 16, is_sp: false }, =lit0
-000034  f81d83b0  str [Reg(Reg { class: X, num: 16, is_sp: false }), Mem(Mem { base: Reg { class: X, num: 29, is_sp: false }, addr: Offset(-40) })]
-000038  aa1003f7  mov [Reg(Reg { class: X, num: 23, is_sp: false }), Reg(Reg { class: X, num: 16, is_sp: false })]
-00003c  58000010  ldr Reg { class: X, num: 16, is_sp: false }, =lit0
-000040  f81d03b0  str [Reg(Reg { class: X, num: 16, is_sp: false }), Mem(Mem { base: Reg { class: X, num: 29, is_sp: false }, addr: Offset(-48) })]
-000044  aa1003e6  mov [Reg(Reg { class: X, num: 6, is_sp: false }), Reg(Reg { class: X, num: 16, is_sp: false })]
-000048  d2800000  movz [Reg(Reg { class: X, num: 0, is_sp: false }), Imm(0)]
-00004c  aa0003f0  mov [Reg(Reg { class: X, num: 16, is_sp: false }), Reg(Reg { class: X, num: 0, is_sp: false })]
-000050  f81e83b0  str [Reg(Reg { class: X, num: 16, is_sp: false }), Mem(Mem { base: Reg { class: X, num: 29, is_sp: false }, addr: Offset(-24) })]
-000054  aa1003f6  mov [Reg(Reg { class: X, num: 22, is_sp: false }), Reg(Reg { class: X, num: 16, is_sp: false })]
-000058  d2800080  movz [Reg(Reg { class: X, num: 0, is_sp: false }), Imm(4)]
-00005c  aa0003f0  mov [Reg(Reg { class: X, num: 16, is_sp: false }), Reg(Reg { class: X, num: 0, is_sp: false })]
-000060  f81d83b0  str [Reg(Reg { class: X, num: 16, is_sp: false }), Mem(Mem { base: Reg { class: X, num: 29, is_sp: false }, addr: Offset(-40) })]
-000064  aa1003f7  mov [Reg(Reg { class: X, num: 23, is_sp: false }), Reg(Reg { class: X, num: 16, is_sp: false })]
-000068  aa0703f0  mov [Reg(Reg { class: X, num: 16, is_sp: false }), Reg(Reg { class: X, num: 7, is_sp: false })]
-00006c  f81d03b0  str [Reg(Reg { class: X, num: 16, is_sp: false }), Mem(Mem { base: Reg { class: X, num: 29, is_sp: false }, addr: Offset(-48) })]
-000070  aa1003e6  mov [Reg(Reg { class: X, num: 6, is_sp: false }), Reg(Reg { class: X, num: 16, is_sp: false })]
-000074  aa0003f0  mov [Reg(Reg { class: X, num: 16, is_sp: false }), Reg(Reg { class: X, num: 0, is_sp: false })]
-000078  f81c83b0  str [Reg(Reg { class: X, num: 16, is_sp: false }), Mem(Mem { base: Reg { class: X, num: 29, is_sp: false }, addr: Offset(-56) })]
-00007c  aa1003e7  mov [Reg(Reg { class: X, num: 7, is_sp: false }), Reg(Reg { class: X, num: 16, is_sp: false })]
-000080  f24006ff  tst [Reg(Reg { class: X, num: 23, is_sp: false }), Imm(3)]
-000084  54000001  b.Ne L5
-000088  f24004df  tst [Reg(Reg { class: X, num: 6, is_sp: false }), Imm(3)]
-00008c  54000001  b.Ne L5
-000090  eb0602ff  cmp [Reg(Reg { class: X, num: 23, is_sp: false }), Reg(Reg { class: X, num: 6, is_sp: false })]
-000094  5400000d  b.Le L2
-000098  14000000  b L3
-00009c  d43bc000  <raw>
-0000a0  aa1603e0  mov [Reg(Reg { class: X, num: 0, is_sp: false }), Reg(Reg { class: X, num: 22, is_sp: false })]
-0000a4  14000000  b L10
-0000a8  f24006df  tst [Reg(Reg { class: X, num: 22, is_sp: false }), Imm(3)]
-0000ac  54000001  b.Ne L7
-0000b0  f24006ff  tst [Reg(Reg { class: X, num: 23, is_sp: false }), Imm(3)]
-0000b4  54000001  b.Ne L7
-0000b8  ab1702c0  adds [Reg(Reg { class: X, num: 0, is_sp: false }), Reg(Reg { class: X, num: 22, is_sp: false }), Reg(Reg { class: X, num: 23, is_sp: false })]
-0000bc  54000006  b.Vs L7
-0000c0  aa0003f0  mov [Reg(Reg { class: X, num: 16, is_sp: false }), Reg(Reg { class: X, num: 0, is_sp: false })]
-0000c4  f81e83b0  str [Reg(Reg { class: X, num: 16, is_sp: false }), Mem(Mem { base: Reg { class: X, num: 29, is_sp: false }, addr: Offset(-24) })]
-0000c8  aa1003f6  mov [Reg(Reg { class: X, num: 22, is_sp: false }), Reg(Reg { class: X, num: 16, is_sp: false })]
-0000cc  d2800090  movz [Reg(Reg { class: X, num: 16, is_sp: false }), Imm(4)]
-0000d0  f81c03b0  str [Reg(Reg { class: X, num: 16, is_sp: false }), Mem(Mem { base: Reg { class: X, num: 29, is_sp: false }, addr: Offset(-64) })]
-0000d4  aa1003e8  mov [Reg(Reg { class: X, num: 8, is_sp: false }), Reg(Reg { class: X, num: 16, is_sp: false })]
-0000d8  f24006ff  tst [Reg(Reg { class: X, num: 23, is_sp: false }), Imm(3)]
-0000dc  54000001  b.Ne L9
-0000e0  f240051f  tst [Reg(Reg { class: X, num: 8, is_sp: false }), Imm(3)]
-0000e4  54000001  b.Ne L9
-0000e8  ab0802e0  adds [Reg(Reg { class: X, num: 0, is_sp: false }), Reg(Reg { class: X, num: 23, is_sp: false }), Reg(Reg { class: X, num: 8, is_sp: false })]
-0000ec  54000006  b.Vs L9
-0000f0  aa0003f0  mov [Reg(Reg { class: X, num: 16, is_sp: false }), Reg(Reg { class: X, num: 0, is_sp: false })]
-0000f4  f81d83b0  str [Reg(Reg { class: X, num: 16, is_sp: false }), Mem(Mem { base: Reg { class: X, num: 29, is_sp: false }, addr: Offset(-40) })]
-0000f8  aa1003f7  mov [Reg(Reg { class: X, num: 23, is_sp: false }), Reg(Reg { class: X, num: 16, is_sp: false })]
-0000fc  b9402390  ldr [Reg(Reg { class: W, num: 16, is_sp: false }), Mem(Mem { base: Reg { class: X, num: 28, is_sp: false }, addr: Offset(32) })]
-000100  b4000010  cbz Reg { class: X, num: 16, is_sp: false } L11
-000104  58000010  ldr Reg { class: X, num: 16, is_sp: false }, =lit5
-000108  d63f0200  blr [Reg(Reg { class: X, num: 16, is_sp: false })]
-00010c  f85f83b5  ldr [Reg(Reg { class: X, num: 21, is_sp: false }), Mem(Mem { base: Reg { class: X, num: 29, is_sp: false }, addr: Offset(-8) })]
-000110  f85e83b6  ldr [Reg(Reg { class: X, num: 22, is_sp: false }), Mem(Mem { base: Reg { class: X, num: 29, is_sp: false }, addr: Offset(-24) })]
-000114  f85d83b7  ldr [Reg(Reg { class: X, num: 23, is_sp: false }), Mem(Mem { base: Reg { class: X, num: 29, is_sp: false }, addr: Offset(-40) })]
-000118  f85d03a6  ldr [Reg(Reg { class: X, num: 6, is_sp: false }), Mem(Mem { base: Reg { class: X, num: 29, is_sp: false }, addr: Offset(-48) })]
-00011c  f85c83a7  ldr [Reg(Reg { class: X, num: 7, is_sp: false }), Mem(Mem { base: Reg { class: X, num: 29, is_sp: false }, addr: Offset(-56) })]
-000120  aa0703f0  mov [Reg(Reg { class: X, num: 16, is_sp: false }), Reg(Reg { class: X, num: 7, is_sp: false })]
-000124  f81c83b0  str [Reg(Reg { class: X, num: 16, is_sp: false }), Mem(Mem { base: Reg { class: X, num: 29, is_sp: false }, addr: Offset(-56) })]
-000128  aa1003e7  mov [Reg(Reg { class: X, num: 7, is_sp: false }), Reg(Reg { class: X, num: 16, is_sp: false })]
-00012c  14000000  b L1
-000130  d43bc000  <raw>
-000134  d43bc000  <raw>
-000138  aa1503e0  mov [Reg(Reg { class: X, num: 0, is_sp: false }), Reg(Reg { class: X, num: 21, is_sp: false })]
-00013c  14000000  b L10
-000140  910003bf  mov [Reg(Reg { class: X, num: 31, is_sp: true }), Reg(Reg { class: X, num: 29, is_sp: false })]
-000144  a8c17bfd  ldp [Reg(Reg { class: X, num: 29, is_sp: false }), Reg(Reg { class: X, num: 30, is_sp: false }), Mem(Mem { base: Reg { class: X, num: 31, is_sp: true }, addr: PostIndex(16) })]
-000148  d65f03c0  ret []
+00000c  58000010  ldr Reg { class: X, num: 16, is_sp: false }, =lit0
+000010  f81f83b0  str [Reg(Reg { class: X, num: 16, is_sp: false }), Mem(Mem { base: Reg { class: X, num: 29, is_sp: false }, addr: Offset(-8) })]
+000014  f81f03b0  str [Reg(Reg { class: X, num: 16, is_sp: false }), Mem(Mem { base: Reg { class: X, num: 29, is_sp: false }, addr: Offset(-16) })]
+000018  f81e83b0  str [Reg(Reg { class: X, num: 16, is_sp: false }), Mem(Mem { base: Reg { class: X, num: 29, is_sp: false }, addr: Offset(-24) })]
+00001c  f81e03b0  str [Reg(Reg { class: X, num: 16, is_sp: false }), Mem(Mem { base: Reg { class: X, num: 29, is_sp: false }, addr: Offset(-32) })]
+000020  f81d83b0  str [Reg(Reg { class: X, num: 16, is_sp: false }), Mem(Mem { base: Reg { class: X, num: 29, is_sp: false }, addr: Offset(-40) })]
+000024  f81d03b0  str [Reg(Reg { class: X, num: 16, is_sp: false }), Mem(Mem { base: Reg { class: X, num: 29, is_sp: false }, addr: Offset(-48) })]
+000028  f81c83b0  str [Reg(Reg { class: X, num: 16, is_sp: false }), Mem(Mem { base: Reg { class: X, num: 29, is_sp: false }, addr: Offset(-56) })]
+00002c  f81c03b0  str [Reg(Reg { class: X, num: 16, is_sp: false }), Mem(Mem { base: Reg { class: X, num: 29, is_sp: false }, addr: Offset(-64) })]
+000030  f81f83a0  str [Reg(Reg { class: X, num: 0, is_sp: false }), Mem(Mem { base: Reg { class: X, num: 29, is_sp: false }, addr: Offset(-8) })]
+000034  aa0003f5  mov [Reg(Reg { class: X, num: 21, is_sp: false }), Reg(Reg { class: X, num: 0, is_sp: false })]
+000038  f81f03a1  str [Reg(Reg { class: X, num: 1, is_sp: false }), Mem(Mem { base: Reg { class: X, num: 29, is_sp: false }, addr: Offset(-16) })]
+00003c  aa0103e7  mov [Reg(Reg { class: X, num: 7, is_sp: false }), Reg(Reg { class: X, num: 1, is_sp: false })]
+000040  58000010  ldr Reg { class: X, num: 16, is_sp: false }, =lit0
+000044  f81e83b0  str [Reg(Reg { class: X, num: 16, is_sp: false }), Mem(Mem { base: Reg { class: X, num: 29, is_sp: false }, addr: Offset(-24) })]
+000048  aa1003f6  mov [Reg(Reg { class: X, num: 22, is_sp: false }), Reg(Reg { class: X, num: 16, is_sp: false })]
+00004c  58000010  ldr Reg { class: X, num: 16, is_sp: false }, =lit0
+000050  f81e03b0  str [Reg(Reg { class: X, num: 16, is_sp: false }), Mem(Mem { base: Reg { class: X, num: 29, is_sp: false }, addr: Offset(-32) })]
+000054  58000010  ldr Reg { class: X, num: 16, is_sp: false }, =lit0
+000058  f81d83b0  str [Reg(Reg { class: X, num: 16, is_sp: false }), Mem(Mem { base: Reg { class: X, num: 29, is_sp: false }, addr: Offset(-40) })]
+00005c  aa1003f7  mov [Reg(Reg { class: X, num: 23, is_sp: false }), Reg(Reg { class: X, num: 16, is_sp: false })]
+000060  58000010  ldr Reg { class: X, num: 16, is_sp: false }, =lit0
+000064  f81d03b0  str [Reg(Reg { class: X, num: 16, is_sp: false }), Mem(Mem { base: Reg { class: X, num: 29, is_sp: false }, addr: Offset(-48) })]
+000068  aa1003e6  mov [Reg(Reg { class: X, num: 6, is_sp: false }), Reg(Reg { class: X, num: 16, is_sp: false })]
+00006c  d2800000  movz [Reg(Reg { class: X, num: 0, is_sp: false }), Imm(0)]
+000070  aa0003f0  mov [Reg(Reg { class: X, num: 16, is_sp: false }), Reg(Reg { class: X, num: 0, is_sp: false })]
+000074  f81e83b0  str [Reg(Reg { class: X, num: 16, is_sp: false }), Mem(Mem { base: Reg { class: X, num: 29, is_sp: false }, addr: Offset(-24) })]
+000078  aa1003f6  mov [Reg(Reg { class: X, num: 22, is_sp: false }), Reg(Reg { class: X, num: 16, is_sp: false })]
+00007c  d2800080  movz [Reg(Reg { class: X, num: 0, is_sp: false }), Imm(4)]
+000080  aa0003f0  mov [Reg(Reg { class: X, num: 16, is_sp: false }), Reg(Reg { class: X, num: 0, is_sp: false })]
+000084  f81d83b0  str [Reg(Reg { class: X, num: 16, is_sp: false }), Mem(Mem { base: Reg { class: X, num: 29, is_sp: false }, addr: Offset(-40) })]
+000088  aa1003f7  mov [Reg(Reg { class: X, num: 23, is_sp: false }), Reg(Reg { class: X, num: 16, is_sp: false })]
+00008c  aa0703f0  mov [Reg(Reg { class: X, num: 16, is_sp: false }), Reg(Reg { class: X, num: 7, is_sp: false })]
+000090  f81d03b0  str [Reg(Reg { class: X, num: 16, is_sp: false }), Mem(Mem { base: Reg { class: X, num: 29, is_sp: false }, addr: Offset(-48) })]
+000094  aa1003e6  mov [Reg(Reg { class: X, num: 6, is_sp: false }), Reg(Reg { class: X, num: 16, is_sp: false })]
+000098  aa0003f0  mov [Reg(Reg { class: X, num: 16, is_sp: false }), Reg(Reg { class: X, num: 0, is_sp: false })]
+00009c  f81c83b0  str [Reg(Reg { class: X, num: 16, is_sp: false }), Mem(Mem { base: Reg { class: X, num: 29, is_sp: false }, addr: Offset(-56) })]
+0000a0  aa1003e7  mov [Reg(Reg { class: X, num: 7, is_sp: false }), Reg(Reg { class: X, num: 16, is_sp: false })]
+0000a4  f24006ff  tst [Reg(Reg { class: X, num: 23, is_sp: false }), Imm(3)]
+0000a8  54000001  b.Ne L5
+0000ac  f24004df  tst [Reg(Reg { class: X, num: 6, is_sp: false }), Imm(3)]
+0000b0  54000001  b.Ne L5
+0000b4  eb0602ff  cmp [Reg(Reg { class: X, num: 23, is_sp: false }), Reg(Reg { class: X, num: 6, is_sp: false })]
+0000b8  5400000d  b.Le L2
+0000bc  14000000  b L3
+0000c0  d43bc000  <raw>
+0000c4  aa1603e0  mov [Reg(Reg { class: X, num: 0, is_sp: false }), Reg(Reg { class: X, num: 22, is_sp: false })]
+0000c8  14000000  b L10
+0000cc  f24006df  tst [Reg(Reg { class: X, num: 22, is_sp: false }), Imm(3)]
+0000d0  54000001  b.Ne L7
+0000d4  f24006ff  tst [Reg(Reg { class: X, num: 23, is_sp: false }), Imm(3)]
+0000d8  54000001  b.Ne L7
+0000dc  ab1702c0  adds [Reg(Reg { class: X, num: 0, is_sp: false }), Reg(Reg { class: X, num: 22, is_sp: false }), Reg(Reg { class: X, num: 23, is_sp: false })]
+0000e0  54000006  b.Vs L7
+0000e4  aa0003f0  mov [Reg(Reg { class: X, num: 16, is_sp: false }), Reg(Reg { class: X, num: 0, is_sp: false })]
+0000e8  f81e83b0  str [Reg(Reg { class: X, num: 16, is_sp: false }), Mem(Mem { base: Reg { class: X, num: 29, is_sp: false }, addr: Offset(-24) })]
+0000ec  aa1003f6  mov [Reg(Reg { class: X, num: 22, is_sp: false }), Reg(Reg { class: X, num: 16, is_sp: false })]
+0000f0  d2800090  movz [Reg(Reg { class: X, num: 16, is_sp: false }), Imm(4)]
+0000f4  f81c03b0  str [Reg(Reg { class: X, num: 16, is_sp: false }), Mem(Mem { base: Reg { class: X, num: 29, is_sp: false }, addr: Offset(-64) })]
+0000f8  aa1003e8  mov [Reg(Reg { class: X, num: 8, is_sp: false }), Reg(Reg { class: X, num: 16, is_sp: false })]
+0000fc  f24006ff  tst [Reg(Reg { class: X, num: 23, is_sp: false }), Imm(3)]
+000100  54000001  b.Ne L9
+000104  f240051f  tst [Reg(Reg { class: X, num: 8, is_sp: false }), Imm(3)]
+000108  54000001  b.Ne L9
+00010c  ab0802e0  adds [Reg(Reg { class: X, num: 0, is_sp: false }), Reg(Reg { class: X, num: 23, is_sp: false }), Reg(Reg { class: X, num: 8, is_sp: false })]
+000110  54000006  b.Vs L9
+000114  aa0003f0  mov [Reg(Reg { class: X, num: 16, is_sp: false }), Reg(Reg { class: X, num: 0, is_sp: false })]
+000118  f81d83b0  str [Reg(Reg { class: X, num: 16, is_sp: false }), Mem(Mem { base: Reg { class: X, num: 29, is_sp: false }, addr: Offset(-40) })]
+00011c  aa1003f7  mov [Reg(Reg { class: X, num: 23, is_sp: false }), Reg(Reg { class: X, num: 16, is_sp: false })]
+000120  b9402390  ldr [Reg(Reg { class: W, num: 16, is_sp: false }), Mem(Mem { base: Reg { class: X, num: 28, is_sp: false }, addr: Offset(32) })]
+000124  b4000010  cbz Reg { class: X, num: 16, is_sp: false } L11
+000128  58000010  ldr Reg { class: X, num: 16, is_sp: false }, =lit5
+00012c  d63f0200  blr [Reg(Reg { class: X, num: 16, is_sp: false })]
+000130  f85f83b5  ldr [Reg(Reg { class: X, num: 21, is_sp: false }), Mem(Mem { base: Reg { class: X, num: 29, is_sp: false }, addr: Offset(-8) })]
+000134  f85e83b6  ldr [Reg(Reg { class: X, num: 22, is_sp: false }), Mem(Mem { base: Reg { class: X, num: 29, is_sp: false }, addr: Offset(-24) })]
+000138  f85d83b7  ldr [Reg(Reg { class: X, num: 23, is_sp: false }), Mem(Mem { base: Reg { class: X, num: 29, is_sp: false }, addr: Offset(-40) })]
+00013c  f85d03a6  ldr [Reg(Reg { class: X, num: 6, is_sp: false }), Mem(Mem { base: Reg { class: X, num: 29, is_sp: false }, addr: Offset(-48) })]
+000140  f85c83a7  ldr [Reg(Reg { class: X, num: 7, is_sp: false }), Mem(Mem { base: Reg { class: X, num: 29, is_sp: false }, addr: Offset(-56) })]
+000144  aa0703f0  mov [Reg(Reg { class: X, num: 16, is_sp: false }), Reg(Reg { class: X, num: 7, is_sp: false })]
+000148  f81c83b0  str [Reg(Reg { class: X, num: 16, is_sp: false }), Mem(Mem { base: Reg { class: X, num: 29, is_sp: false }, addr: Offset(-56) })]
+00014c  aa1003e7  mov [Reg(Reg { class: X, num: 7, is_sp: false }), Reg(Reg { class: X, num: 16, is_sp: false })]
+000150  14000000  b L1
+000154  d43bc000  <raw>
+000158  d43bc000  <raw>
+00015c  aa1503e0  mov [Reg(Reg { class: X, num: 0, is_sp: false }), Reg(Reg { class: X, num: 21, is_sp: false })]
+000160  14000000  b L10
+000164  910003bf  mov [Reg(Reg { class: X, num: 31, is_sp: true }), Reg(Reg { class: X, num: 29, is_sp: false })]
+000168  a8c17bfd  ldp [Reg(Reg { class: X, num: 29, is_sp: false }), Reg(Reg { class: X, num: 30, is_sp: false }), Mem(Mem { base: Reg { class: X, num: 31, is_sp: true }, addr: PostIndex(16) })]
+00016c  d65f03c0  ret []

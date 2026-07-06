@@ -1296,6 +1296,23 @@ pub fn emit(
     if frame_bytes > 0 {
         e.asm.emit("sub", &[sp(), sp(), imm(frame_bytes)]);
     }
+    // Task #94: nil-fill every deopt-referenced spill slot before any block
+    // code runs — the normal-entry counterpart of the OSR entry's full
+    // nil-fill below (BUG D root cause 4), narrowed to the slots that need
+    // it. `extra_oop_live` now records these slots at EVERY safepoint up to
+    // their trap (a GC mid-`CallSend` must keep them current for the trap's
+    // materializer), so a safepoint reached BEFORE the slot's def — or via a
+    // sibling arm that never wrote it — must scan nil, not leftover native
+    // stack words from dead frames at this SP depth. Params/temps among them
+    // are immediately overwritten by their entry-block defs; the handful of
+    // redundant stores is the price of not needing path-sensitive liveness.
+    if !regalloc.deopt_nil_init_slots.is_empty() {
+        e.asm
+            .ldr_literal(xr(16), e.literal_ids[e.nil_lit.0 as usize]);
+        for &slot in &regalloc.deopt_nil_init_slots {
+            emit_spill_access(e.asm, "str", x(16), slot);
+        }
+    }
 
     let mut block_pcs = Vec::with_capacity(method.blocks.len());
     for (i, &bid) in regalloc.block_order.iter().enumerate() {

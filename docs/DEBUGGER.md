@@ -561,8 +561,9 @@ what let the task-#88 investigation compare "what the compiler baked" against
 | `MACVM_TRACE=debug` | one line per breakpoint set/hit/step — the channel system is open-ended by design; this is just a new name |
 | `brk` immediates | `0xDE10–0xDE1F` reserved for PROBE planted breakpoints (extends the tracing_debugging.md table) |
 | `MACVM_PIN` | `Class>>sel[,…]` — pin methods to tier-0 WITHOUT a breakpoint (compile-disable + invalidate dependents). The differential-diagnosis lever: bisect a wrong answer by pinning suspects until it goes away. Also the RUSTTCL `pin`/`unpin` verbs |
-| `MACVM_DBG_IR=<selector>` | (debug builds) dump every compile of that selector at the IR level — blocks, instructions, literal pool with resolved values. The layer between `describe` (bytecode) and `disasm-native` (machine code) |
+| `MACVM_DBG_IR=<selector>` | (debug builds) dump every compile of that selector at TWO levels: the IR (blocks, instructions, literal pool with resolved values) AND the emitted listing (the assembler's per-instruction lines — the only view that shows spill stores). The layers between `describe` (bytecode) and `disasm-native` (published machine code) |
 | `MACVM_DBG_RESOLVE=1` | (debug builds) one stderr line per compiled-IC miss resolution: receiver klass, prior site state, whether the target is a c2i adapter. Compiled dispatch is otherwise invisible — hits never leave compiled code, so this IS the complete transition log |
+| `MACVM_DBG_REEXEC=1` | (debug builds) one stderr line per value the deopt materializer pushes for a reexecute site's recorded operand stack (`nm`, `bci`, `ValueLoc`, value, receiver). The runtime half of `MACVM_DBG_IR`'s compile-time story: compare what the scope RECORDED against what the frame slot actually HELD. Two entries printing the same address was the tell that closed task #94 (stale slot aliasing a recycled eden-base allocation) |
 
 ---
 

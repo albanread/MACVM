@@ -719,6 +719,25 @@ fn compile_method_full(
             osr_req.as_ref(),
         );
 
+    // Debugger (MACVM_DBG_IR's second half): the same selector match also
+    // dumps the EMITTED LISTING — the assembler's own per-instruction lines,
+    // the layer below the IR dump above and the one that shows what the
+    // machine actually does with each vreg (spill stores included, which the
+    // IR alone can't show). Debug builds only, stderr.
+    #[cfg(debug_assertions)]
+    if let Ok(want) = std::env::var("MACVM_DBG_IR") {
+        let sel = crate::oops::wrappers::SymbolOop::try_from(method.selector())
+            .map(|s| s.as_string())
+            .unwrap_or_default();
+        if sel == want {
+            eprintln!("==== LISTING {sel} (v{version}) ====");
+            for line in &blob.listing {
+                eprintln!("  {line}");
+            }
+            eprintln!("==== END LISTING {sel} ====");
+        }
+    }
+
     // D4.6: pre-resolve every `send_super` site's own target BEFORE
     // publishing anything -- resolving here (not at runtime, via
     // `stub_resolve`, like every other site) is the whole point of a

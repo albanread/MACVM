@@ -217,30 +217,51 @@ ports; the benchmarks' own 4-mode gates stay red until these are fixed):
 
    **STILL OPEN (all pre-existing, stash-bisected against the pre-fix
    tree — none are regressions from the c2i fix):**
-     - This repro under `MACVM_GC_STRESS=1` + `threshold=1`:
-       `doesNotUnderstand: size`, dossier heap verify OK (wrong-value
-       family, NOT heap corruption; 14 tier_links deep, DeoptBridge
-       adapters interleaved). Passes without GC stress (577783).
-       UNCHANGED by feb0f56/fe27eff (2026-07-06): `MACVM_TRACE=deopt`
-       shows every one of this repro's deopts is Trap-reason
-       (`by_reason=[trap N, return 0, poll 0]` throughout) — the
-       trap-door anchor was already fixed by feb0f56, so this isn't a
-       second instance of the same hole. The receiver of `#size` at
-       the DNU is confirmed (via `(halt) frame #0`) to be `a
-       WriteStream` itself — `WriteStream>>nextPut:`'s `push_instvar
-       0` (`collection`) is answering `self` instead of the real
-       Array/String, i.e. the ACTUAL heap object's ivar-0 slot holds a
-       wrong-but-VALID oop (passes `MACVM_DBG_STACK_WRITES`'
-       mark-plausibility check, since `self` is itself a perfectly
-       real live object — this is a value-substitution bug, not a
-       garbage-pointer one, so the write-time auditor built for BUG D
-       root cause 4 cannot catch it). Narrows the search to: did
-       `WriteStream>>setOn:`/`grow`'s compiled `StoreField` write the
-       wrong source register, or did a scavenge mid-`deoptimize_frame`
-       fail to relocate/re-root the receiver correctly before a LATER
-       virtual frame's `read_value` (or the interpreter's own
-       subsequent `push_instvar`) read it back stale. Not yet
-       localized further.
+     - This repro under `MACVM_GC_STRESS=1` + `threshold=1` —
+       **FIXED (task #94): `extra_oop_live` covered a trap's slots at
+       the TRAP position only, leaving them stale across every EARLIER
+       safepoint's GC.** Full mechanism, established layer by layer
+       (halt bt → `MACVM_DBG_REEXEC` → the emitted LISTING →
+       `run_method` outcome probe): under scavenge-per-allocation
+       every fresh object is momentarily at EDEN BASE, so ONE address
+       recycles endlessly. `WriteStream class>>on:` compiled with its
+       `setOn:` send Untaken→Trap-lowered (S14 step 3 — first-compile
+       feedback had never run bci 9); every execution runs `self
+       basicNew` (a c2i CallSend whose interpreted callee's allocation
+       scavenges), then traps and reexecutes `s setOn: aCollection`
+       from recorded FrameSlots. `aCollection`'s organic liveness ends
+       at its entry spill, so the oop map at the CallSend safepoint —
+       where the GC actually struck — did not cover its slot: the
+       String moved, the slot kept the old eden-base address, and
+       `basicNew`'s result (the fresh WriteStream) was allocated at
+       that exact recycled address. The materializer then read
+       `[s, aCollection]` as the SAME object: the interpreter
+       reexecuted `s setOn: s`, `collection := self`, and thousands of
+       sends later `collection size` DNU'd on "a WriteStream" — a
+       wrong-but-VALID oop no auditor could flag. (Both REEXEC entries
+       reading `0x300000001` — eden base — was the tell.)
+
+       Fix (same commit): (1) `regalloc::compute_intervals` records
+       each deopt-referenced vreg's `extra_oop_live` fact at EVERY
+       safepoint up to its trap, not just at the trap — a mid-callee
+       GC now keeps the slots current; (2) `emit`'s prologue nil-fills
+       exactly those slots (`RegallocResult::deopt_nil_init_slots`,
+       the normal-entry counterpart of the OSR entry's f62a1e4
+       nil-fill), which is what makes (1) sound on paths that never
+       wrote the slot — the root-cause-1/3 lesson that path-blind
+       liveness is only safe over always-initialized memory. Listing
+       goldens regenerated (debug build). Verified: this repro's
+       small/mid variants answer correctly under GC_STRESS;
+       **richards under GC_STRESS=1+threshold=1 (release) completes
+       checksum-clean for the first time**; full suite/clippy green;
+       arith ratio ~267x (the prologue fills cost nothing measurable).
+       Practical gate (the full 2×50000 repro under GC_STRESS runs
+       >10min in debug; 500 iterations reproduce the historical DNU
+       in ~2min):
+         sed 's/1 to: 50000 do:/1 to: 500 do:/g' \
+           tests/repros/cold_branch_recompile_spill_corruption.mst > /tmp/small94.mst
+         MACVM_GC_STRESS=1 MACVM_JIT=threshold=1 \
+           ./target/debug/macvm run /tmp/small94.mst --world world  # must print 3781
      - deltablue at `threshold=100` — **FIXED (the deopt-trampoline
        anchor fix, task #92, same commit as this note).** Both deopt
        trampolines (`build_uncommon_trampoline`,
@@ -274,10 +295,13 @@ ports; the benchmarks' own 4-mode gates stay red until these are fixed):
        Trap-reason throughout (`poll 0` even here — Richards' loops
        apparently never take a live loop-poll deopt under this
        harness, so `fe27eff`'s rt_poll anchor fix — real, but for a
-       DIFFERENT door — doesn't touch this signature either). Likely
-       shares the GC-stress item's mechanism (a value corrupted across
-       the deopt/reexecute path) — see item 4's `WriteStream`
-       ivar-substitution finding, the closest lead so far.
+       DIFFERENT door — doesn't touch this signature either).
+       RE-TESTED after task #94's extra_oop_live fix: STILL FAILS
+       (DNU #mustBeBoolean / "does not understand bitAnd:",
+       nondeterministic) — so this is a genuinely DISTINCT mechanism
+       from the GC-in-callee staleness #94 closed; the remaining
+       suspect surface is the invalidation-churn path itself
+       (make_not_entrant/§2c/recompile racing reexecute deopts).
 
    Original root-cause-4 crash shape (retained): a debug build panicked
    at `oops/mod.rs:57` ("mark tag: word 0x7 has MARK_TAG") from

@@ -307,12 +307,44 @@ pub fn compute_intervals(
                 // Receiver (0) + every unified arg/temp slot + the recorded
                 // operand stack are exactly the vregs the driver resolves for
                 // this site.
-                deopt_live_exact.push((0, pos));
+                //
+                // Task #94 (the second `extra_oop_live` gap, sibling of BUG D
+                // root cause 3): recording each vreg at the TRAP position
+                // alone makes the oop map correct AT THE TRAP — but a GC can
+                // strike at any EARLIER safepoint on the way there (a
+                // `CallSend`'s callee allocating — under GC_STRESS, every
+                // one), and the oop map at THAT safepoint knew nothing of
+                // these slots, so the collector left them stale while the
+                // objects moved. The trap's materializer then read
+                // relocated-away addresses — under scavenge-per-allocation
+                // the old eden-base address aliases the NEXT fresh object,
+                // producing a wrong-but-VALID oop (the repro's `s setOn: s`:
+                // `WriteStream class>>on:`'s spilled String argument, dead
+                // organically after its spill, aliased the `basicNew` result
+                // allocated at the recycled eden base). So each fact is
+                // recorded at EVERY safepoint up to and including the trap.
+                // Sound because `emit` nil-fills exactly these slots in the
+                // prologue (`deopt_nil_init_slots` below): a safepoint
+                // reached before the vreg's def — or via a sibling arm that
+                // never wrote it — scans nil (or a conservatively-kept older
+                // value), never uninitialized native stack. The same
+                // path-insensitivity that made interval-widening UNSOUND
+                // (root cause 1/3's lesson) is made harmless by the fill,
+                // NOT by pretending liveness is linear.
+                let mut record = |v: u32| {
+                    deopt_live_exact.push((v, pos));
+                    for &sp in &safepoint_positions {
+                        if sp < pos {
+                            deopt_live_exact.push((v, sp));
+                        }
+                    }
+                };
+                record(0);
                 for s in 1..=n_slots {
-                    deopt_live_exact.push((s, pos));
+                    record(s);
                 }
                 for &v in &raw.stack {
-                    deopt_live_exact.push((v.0, pos));
+                    record(v.0);
                 }
             }
             // S14 step 4c: an INLINED-body safepoint (of ANY kind, INCLUDING a
@@ -334,10 +366,21 @@ pub fn compute_intervals(
                 .iter()
                 .find(|(ci, raw)| *ci == idx as u32 && raw.inline.is_some())
             {
+                // Same task-#94 earlier-safepoint coverage as the plain-trap
+                // arm above — an inlined site's rebuilt frames read the very
+                // same slots, exposed to the very same mid-callee GC.
+                let mut record = |v: u32| {
+                    deopt_live_exact.push((v, pos));
+                    for &sp in &safepoint_positions {
+                        if sp < pos {
+                            deopt_live_exact.push((v, sp));
+                        }
+                    }
+                };
                 // Caller (root) frame: receiver + every unified slot.
-                deopt_live_exact.push((0, pos));
+                record(0);
                 for s in 1..=n_slots {
-                    deopt_live_exact.push((s, pos));
+                    record(s);
                 }
                 // S14 step 7-IV-b: EVERY inline level of the chain (a block
                 // spliced inside an inlined callee is depth 3) — each level's
@@ -345,18 +388,18 @@ pub fn compute_intervals(
                 // spill-all pins every entity of every rebuilt frame.
                 let mut level = raw.inline.as_ref();
                 while let Some(site) = level {
-                    deopt_live_exact.push((site.receiver.0, pos));
+                    record(site.receiver.0);
                     for slot in &site.slots {
-                        deopt_live_exact.push((slot.0, pos));
+                        record(slot.0);
                     }
                     for v in &site.caller_pending_stack {
-                        deopt_live_exact.push((v.0, pos));
+                        record(v.0);
                     }
                     level = site.parent.as_deref();
                 }
                 // The innermost recorded operand stack.
                 for &v in &raw.stack {
-                    deopt_live_exact.push((v.0, pos));
+                    record(v.0);
                 }
             }
             // S14 step 7-II-b: M's promoted ctx-temps back the ELIDED Context the
@@ -740,7 +783,21 @@ pub struct RegallocResult {
     /// sibling arm that never wrote this vreg at all (`compute_intervals`'
     /// own doc has the full story). `oopmap::build_for_position` checks
     /// this as an ADDITIONAL, exact-position fact alongside the interval.
+    ///
+    /// Task #94 extension: each deopt-referenced vreg's facts cover not
+    /// just its trap's own position but EVERY earlier safepoint too — a GC
+    /// striking mid-`CallSend` on the way to the trap must keep these
+    /// slots current or the trap's materializer reads relocated-away
+    /// addresses (see `compute_intervals`' task-#94 comment for the full
+    /// mechanism and why `deopt_nil_init_slots` makes this sound).
     pub extra_oop_live: Vec<(VReg, u32)>,
+    /// Task #94: spill slots `emit` must nil-fill in the prologue — the
+    /// final slot of every deopt-referenced vreg. A safepoint reached
+    /// before the vreg's def (or via a sibling arm that never wrote it)
+    /// then scans nil instead of uninitialized native stack, which is what
+    /// makes `extra_oop_live`'s earlier-safepoint facts sound without
+    /// path-sensitive liveness. Sorted, deduplicated.
+    pub deopt_nil_init_slots: Vec<SpillSlot>,
 }
 
 pub fn regalloc(method: &IrMethod) -> RegallocResult {
@@ -750,6 +807,25 @@ pub fn regalloc(method: &IrMethod) -> RegallocResult {
     // S14 perf recovery: call-free spilled intervals also get a resident
     // register (slots stay canonical; see LiveInterval::resident_reg).
     assign_residents(&mut intervals);
+    // Task #94: the final spill slot of every deopt-referenced vreg (all are
+    // spill-assigned — `crosses_safepoint` is forced for them). `emit`
+    // nil-fills these in the prologue, which is what makes `extra_oop_live`'s
+    // earlier-safepoint facts sound on paths that never wrote the slot (see
+    // `compute_intervals`' own task-#94 comment).
+    let mut deopt_nil_init_slots: Vec<SpillSlot> = {
+        let referenced: std::collections::HashSet<u32> =
+            extra_oop_live.iter().map(|&(v, _)| v.0).collect();
+        intervals
+            .iter()
+            .filter(|iv| referenced.contains(&iv.vreg.0))
+            .filter_map(|iv| match iv.assignment {
+                Some(Assignment::Spill(slot)) => Some(slot),
+                _ => None,
+            })
+            .collect()
+    };
+    deopt_nil_init_slots.sort_by_key(|s| s.0);
+    deopt_nil_init_slots.dedup();
     RegallocResult {
         block_order,
         intervals,
@@ -758,6 +834,7 @@ pub fn regalloc(method: &IrMethod) -> RegallocResult {
         safepoint_positions,
         block_start_pos,
         extra_oop_live,
+        deopt_nil_init_slots,
     }
 }
 

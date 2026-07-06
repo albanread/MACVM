@@ -576,6 +576,22 @@ pub fn deoptimize_frame(vm: &mut VmState, frame: FrameView) -> DeoptResume {
                     }
                     _ => read_value(vm, nmethod_ref(vm, frame.nm), &frame, loc),
                 };
+                // Debugger (DBG3 companion): `MACVM_DBG_REEXEC=1` prints each
+                // value the materializer pushes for a reexecute site's
+                // recorded operand stack — the runtime's half of the story
+                // whose compile-time half is `MACVM_DBG_IR`'s scope/listing
+                // dump. This trace is what proved task #94's stale frame
+                // slots (two entries reading the SAME address) and, earlier,
+                // BUG C's inverted dispatch. Debug builds only, stderr.
+                #[cfg(debug_assertions)]
+                if std::env::var("MACVM_DBG_REEXEC").is_ok() {
+                    eprintln!(
+                        "REEXEC nm={:?} bci={site_bci} loc={loc:?} -> {:#x} (recv {:#x})",
+                        frame.nm,
+                        v.raw(),
+                        receiver.raw(),
+                    );
+                }
                 vm.stack.push(v);
             }
             if site_reexecute {
