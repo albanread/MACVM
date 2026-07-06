@@ -118,3 +118,45 @@ cost, it doesn't erase it.
 | 2026-07-04 | cdfab6a | 110 | 0 |
 | 2026-07-04 | a1e57ac | 110 | 0 |
 | 2026-07-04 | 04e774b | (bridge deleted) | 110 |
+
+# S15 A6/A7 — Richards/DeltaBlue perf recording (PARTIAL — see blockers)
+
+Recorded per `tests_s15.md` T5's procedure: `world/bench/bench.list`
+(`richards.mst`, `deltablue.mst`) run through the shared `Bench.mst`
+harness (3 discarded warmups + median-of-outer, timed via
+`millisecondClock`, excludes genesis/world load) under `MACVM_JIT=off` vs
+`threshold=1` vs `threshold=1000`, via `scripts/perf.sh --release`.
+
+**This is intentionally incomplete.** T5 also specifies a GATING test
+(`tests/it_perf_s15.rs`, not yet written) asserting "Richards ratio ≥
+5.0" — that assertion cannot be satisfied today: Richards cannot complete
+under EITHER JIT threshold right now (see below), so there is no ratio to
+gate on yet. Recording honest partial numbers here rather than a
+fabricated or cherry-picked table; `it_perf_s15.rs` should not be written
+until the blocker below is resolved, since it would either assert
+something false or have to skip the one metric T5 exists to gate.
+
+| Benchmark | interp_ms | jit t=1 | jit t=1000 | best/interp |
+|---|---|---|---|---|
+| richards | 201 | **blocked** (root cause 4) | **blocked** (root cause 4) | n/a |
+| deltablue | 205 | 114 | **blocked** (BUG C) | 1.8x (t=1 only) |
+
+- **richards, both thresholds blocked**: `threshold=1` aborts with `does
+  not understand deviceInAdd:`; `threshold=1000` fails Bench's own
+  warmup-consistency check ("benchmark warmup produced a wrong result")
+  — a silent wrong-answer variant of the same underlying issue rather
+  than a hard abort. Both are consistent with `tests/repros/README.md`'s
+  still-open BUG D root cause 4 (a genuine pointer/memory corruption, not
+  a liveness-tracking gap) — that dossier already notes root cause 4
+  "blocks this repro's full run (and Richards itself)"; this perf run is
+  that same prediction confirmed against the real benchmark rather than
+  the minimal repro.
+- **deltablue, threshold=1000 blocked**: `Projection test 3 failed` —
+  exactly BUG C (`tests/repros/deltablue_projection_t1000_differential.mst`,
+  still open, timing-sensitive test-number drift already documented
+  there). `threshold=1` completes cleanly and IS recorded above.
+- Bottom line: **BUG D root cause 4 is the concrete, sole remaining
+  blocker on fully completing S15's own T5 acceptance gate** for
+  Richards; BUG C blocks only DeltaBlue's `threshold=1000` column. Until
+  either is fixed, the "best/interp" ratios above are partial, honest
+  numbers, not the sprint's actual gate.
