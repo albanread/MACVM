@@ -215,6 +215,15 @@ fn reverse_postorder(method: &IrMethod) -> Vec<BlockId> {
 /// `emit.rs`'s own position counter, which walks `block_order` identically)
 /// depend on this being the exact same sequence `crosses_safepoint` above
 /// was computed against, not a re-derivation that could drift out of sync.
+///
+/// The fifth, `extra_oop_live` (a bug-fix era addition — see this
+/// function's own `deopt_live_exact` doc further down), is
+/// `RegallocResult::extra_oop_live` — exact `(vreg, position)` facts kept
+/// SEPARATE from the plain `[start,end]` intervals in the second return
+/// value, for the same reason: folding them in would widen an interval
+/// across everything numerically in between, unsound wherever that spans
+/// an if/else merge reachable from a sibling arm that never wrote the vreg.
+#[allow(clippy::type_complexity)]
 pub fn compute_intervals(
     method: &IrMethod,
 ) -> (
@@ -222,6 +231,7 @@ pub fn compute_intervals(
     Vec<LiveInterval>,
     Vec<u32>,
     std::collections::HashMap<u32, u32>,
+    Vec<(VReg, u32)>,
 ) {
     let block_order = reverse_postorder(method);
 
@@ -264,7 +274,17 @@ pub fn compute_intervals(
     // (`crosses_safepoint` needs `end > pos`). Forcing `end > pos` here pins
     // receiver + slots + the recorded stack to canonical frame slots the deopt
     // materializer reads, exactly as for an UncommonTrap.
-    let mut deopt_live: Vec<(u32, u32)> = Vec::new(); // (vreg, safepoint pos)
+    // Two SEPARATE lists, folded differently below (see the fold sites'
+    // own docs): `deopt_live_exact`'s vregs (a trap's own receiver/slots/
+    // recorded stack) have NO dominance guarantee over other safepoints
+    // that merely sit at a nearby LINEAR position, so widening their
+    // interval to reach a far-away trap is unsound; `deopt_live_widen`'s
+    // vregs (ctx-temps) DO — every declared Smalltalk temp is nil-initialized
+    // unconditionally at method entry (Smalltalk's own semantics), before
+    // any branch, so their write genuinely dominates every later safepoint
+    // in the method, and widening them is sound.
+    let mut deopt_live_exact: Vec<(u32, u32)> = Vec::new(); // (vreg, safepoint pos)
+    let mut deopt_live_widen: Vec<(u32, u32)> = Vec::new(); // (vreg, safepoint pos)
     let n_slots = method.argc as u32 + method.ntemps as u32;
 
     for &bid in &block_order {
@@ -287,12 +307,12 @@ pub fn compute_intervals(
                 // Receiver (0) + every unified arg/temp slot + the recorded
                 // operand stack are exactly the vregs the driver resolves for
                 // this site.
-                deopt_live.push((0, pos));
+                deopt_live_exact.push((0, pos));
                 for s in 1..=n_slots {
-                    deopt_live.push((s, pos));
+                    deopt_live_exact.push((s, pos));
                 }
                 for &v in &raw.stack {
-                    deopt_live.push((v.0, pos));
+                    deopt_live_exact.push((v.0, pos));
                 }
             }
             // S14 step 4c: an INLINED-body safepoint (of ANY kind, INCLUDING a
@@ -315,9 +335,9 @@ pub fn compute_intervals(
                 .find(|(ci, raw)| *ci == idx as u32 && raw.inline.is_some())
             {
                 // Caller (root) frame: receiver + every unified slot.
-                deopt_live.push((0, pos));
+                deopt_live_exact.push((0, pos));
                 for s in 1..=n_slots {
-                    deopt_live.push((s, pos));
+                    deopt_live_exact.push((s, pos));
                 }
                 // S14 step 7-IV-b: EVERY inline level of the chain (a block
                 // spliced inside an inlined callee is depth 3) — each level's
@@ -325,18 +345,18 @@ pub fn compute_intervals(
                 // spill-all pins every entity of every rebuilt frame.
                 let mut level = raw.inline.as_ref();
                 while let Some(site) = level {
-                    deopt_live.push((site.receiver.0, pos));
+                    deopt_live_exact.push((site.receiver.0, pos));
                     for slot in &site.slots {
-                        deopt_live.push((slot.0, pos));
+                        deopt_live_exact.push((slot.0, pos));
                     }
                     for v in &site.caller_pending_stack {
-                        deopt_live.push((v.0, pos));
+                        deopt_live_exact.push((v.0, pos));
                     }
                     level = site.parent.as_deref();
                 }
                 // The innermost recorded operand stack.
                 for &v in &raw.stack {
-                    deopt_live.push((v.0, pos));
+                    deopt_live_exact.push((v.0, pos));
                 }
             }
             // S14 step 7-II-b: M's promoted ctx-temps back the ELIDED Context the
@@ -350,7 +370,7 @@ pub fn compute_intervals(
                 && block.deopt_sites.iter().any(|(ci, _)| *ci == idx as u32)
             {
                 for &cv in &method.ctx_vregs {
-                    deopt_live.push((cv.0, pos));
+                    deopt_live_widen.push((cv.0, pos));
                 }
             }
             ir.uses(|v| {
@@ -394,11 +414,30 @@ pub fn compute_intervals(
     while changed {
         changed = false;
         for &(loop_start, loop_end) in &loop_ranges {
-            // Any vreg with EITHER endpoint inside the loop range gets
-            // both endpoints widened to at least cover it — a vreg used
-            // only once near a loop's start but never redefined inside it
-            // is still safe to widen (widening an interval never makes it
-            // wrong, only more conservative).
+            // A vreg is widened only if it has at least one endpoint
+            // STRICTLY OUTSIDE the loop range — i.e. it's genuinely
+            // connected to the loop from outside (a pre-loop init reaching
+            // the header, or a post-loop use of a value the body last
+            // wrote), not merely a vreg whose entire def/use span happens
+            // to fall inside [loop_start, loop_end] by coincidence.
+            //
+            // `reverse_postorder` is free to lay out a SIBLING branch off
+            // the loop header (e.g. the `if_false` arm of the loop's own
+            // condition, leading somewhere else entirely) positionally
+            // BETWEEN the header and the body/latch — the range check
+            // alone can't tell that apart from a real loop-carried value.
+            // Requiring containment to be non-total closes exactly that
+            // gap: a vreg whose whole lifetime is inside the range (both
+            // endpoints inside) never needs the loop to keep its slot
+            // "live" for a next iteration that never reads it, so leaving
+            // it alone is strictly more precise, never wrong (found via
+            // `cold_branch_recompile_spill_corruption.mst`/BUG D: a
+            // second, still-cold `to:do:` loop's own init+trap blocks,
+            // laid out between a first loop's header and latch, had their
+            // OWN short-lived temps smeared across the first loop's ENTIRE
+            // body — falsely marking their spill slots live at real call
+            // sites inside it that never write them, so the GC read
+            // uninitialized frame memory as an oop there).
             let touched: Vec<u32> = min_def
                 .keys()
                 .chain(max_use.keys())
@@ -408,7 +447,7 @@ pub fn compute_intervals(
                 .filter(|&v| {
                     let s = *min_def.get(&v).unwrap_or(&u32::MAX);
                     let e = *max_use.get(&v).unwrap_or(&0);
-                    s <= loop_end && e >= loop_start
+                    s <= loop_end && e >= loop_start && (s < loop_start || e > loop_end)
                 })
                 .collect();
             for v in touched {
@@ -426,16 +465,12 @@ pub fn compute_intervals(
         }
     }
 
-    // S13 step 7b: force every deopt-referenced vreg to live STRICTLY ACROSS
-    // its safepoint (`end > pos`), so `crosses_safepoint` fires and spill-all
-    // pins it to a canonical frame slot the deopt materializer reads (see
-    // `deopt_live`'s own doc above). Applied AFTER loop-widening (which only
-    // ever extends), so this is the final word on each interval's end. A vreg
-    // referenced only here (never defined by any op — a slot for an argument
-    // that the body never touches) still needs a `min_def`, so seed it at 0
-    // (the entry `Param`/`ConstPool` that establishes every slot always runs
-    // first).
-    for &(v, sp_pos) in &deopt_live {
+    // S14 step 7-II-b's ctx-temps (`deopt_live_widen`): their write genuinely
+    // DOMINATES every later safepoint (Smalltalk nil-initializes every
+    // declared temp unconditionally at method entry, before any branch), so
+    // widening `[start,end]` out to `sp_pos + 1` — the ORIGINAL S13 step 7b
+    // mechanism — is sound for them specifically. Left unchanged.
+    for &(v, sp_pos) in &deopt_live_widen {
         min_def.entry(v).or_insert(0);
         let e = max_use.entry(v).or_insert(sp_pos + 1);
         if *e <= sp_pos {
@@ -443,13 +478,69 @@ pub fn compute_intervals(
         }
     }
 
+    // S13 step 7b: every deopt-referenced vreg must be SPILLED (a stable
+    // frame slot, not a register that a later call/branch could clobber or
+    // that regalloc could hand to a different interval once it thinks this
+    // one is dead) so the deopt materializer / GC root scan can find it at
+    // its own recorded safepoint. Originally this ALSO widened the vreg's
+    // plain `[start,end]` interval out to `sp_pos + 1` — which works for the
+    // spill decision (a boolean: does ANY safepoint fall in range) but is
+    // unsound for `oopmap::build_for_position`'s PER-SAFEPOINT liveness
+    // check, since a single interval can't express "live at my own organic
+    // uses, and ALSO at this one far-away trap, but not at everything
+    // numerically in between." A trap is typically linearized far down in
+    // the cold tail (`emit_uncommon_trap`'s own doc), so "everything in
+    // between" routinely includes OTHER blocks entirely — e.g. an if/else's
+    // shared post-merge continuation, reachable from a SIBLING arm that
+    // never wrote this vreg's slot at all. That continuation's own,
+    // unrelated safepoints would then wrongly see the slot as a live oop.
+    // (Found via `cold_branch_recompile_spill_corruption.mst`, a second
+    // instance of BUG D: `process:`'s inlined `add1:` arm's `payload` temp —
+    // needed only by ITS OWN smi-overflow trap in the cold tail — bled
+    // "live" into the shared continuation also reachable from the sibling
+    // `add2:` arm, which never touches that slot; a debug-build "mark tag"
+    // GC panic caught it reading raw, never-written stack memory as an oop.
+    // The SAME shape as the earlier loop-widening bug in this same
+    // function, one layer up: a position-interval standing in for real
+    // per-branch liveness, unsound wherever it's asked to span a merge.
+    //
+    // UNLIKE `deopt_live_widen`'s ctx-temps above, a plain trap's own
+    // receiver/slots/recorded-stack vregs have NO such dominance guarantee
+    // — they're ordinary values, not unconditionally-initialized declared
+    // temps, so a sibling arm can easily reach a later safepoint without
+    // ever having written them.
+    //
+    // Fixed by keeping `min_def`/`max_use` at their ORGANIC values (a vreg
+    // referenced only here, never by any op — a slot for an argument the
+    // body never touches — still gets a bare `[0,0]` so it's assignable at
+    // all) and recording each exact `(vreg, trap position)` pair separately
+    // in `extra_oop_live` instead of folding it into the interval.
+    // `crosses_safepoint` ORs in plain membership (deopt_referenced) so the
+    // spill decision is unaffected; `oopmap::build_for_position` checks
+    // `extra_oop_live` as an ADDITIONAL, exact-position fact alongside the
+    // (now unwidened) interval.
+    let deopt_referenced: std::collections::HashSet<u32> = deopt_live_exact
+        .iter()
+        .map(|&(v, _)| v)
+        .chain(deopt_live_widen.iter().map(|&(v, _)| v))
+        .collect();
+    let extra_oop_live: Vec<(VReg, u32)> = deopt_live_exact
+        .iter()
+        .map(|&(v, pos)| (VReg(v), pos))
+        .collect();
+    for &v in &deopt_referenced {
+        min_def.entry(v).or_insert(0);
+        max_use.entry(v).or_insert(0);
+    }
+
     let intervals = (0..method.vregs.len() as u32)
         .filter_map(|vid| {
             let start = *min_def.get(&vid)?;
             let end = *max_use.get(&vid).unwrap_or(&start);
-            let crosses_safepoint = safepoint_positions
-                .iter()
-                .any(|&sp| start <= sp && end > sp);
+            let crosses_safepoint = deopt_referenced.contains(&vid)
+                || safepoint_positions
+                    .iter()
+                    .any(|&sp| start <= sp && end > sp);
             let crosses_call = call_positions.iter().any(|&cp| start <= cp && end > cp);
             Some(LiveInterval {
                 vreg: VReg(vid),
@@ -464,7 +555,13 @@ pub fn compute_intervals(
         })
         .collect();
 
-    (block_order, intervals, safepoint_positions, block_start_pos)
+    (
+        block_order,
+        intervals,
+        safepoint_positions,
+        block_start_pos,
+        extra_oop_live,
+    )
 }
 
 /// x0–x15 (`arm64.md` §3); x16/x17 scratch, x18 platform, x19–x23 unused
@@ -635,10 +732,19 @@ pub struct RegallocResult {
     /// the OSR header block's live-in entities against exactly this
     /// position, and emit reloads residents live there.
     pub block_start_pos: std::collections::HashMap<u32, u32>,
+    /// S13 step 7b (bug-fix revision): exact `(vreg, safepoint position)`
+    /// facts a deopt site's own recorded stack/slots need, kept SEPARATE
+    /// from `intervals`' own `[start,end]` — folding these into the
+    /// interval would widen it to cover EVERY position in between, which is
+    /// unsound whenever that span crosses an if/else merge reachable from a
+    /// sibling arm that never wrote this vreg at all (`compute_intervals`'
+    /// own doc has the full story). `oopmap::build_for_position` checks
+    /// this as an ADDITIONAL, exact-position fact alongside the interval.
+    pub extra_oop_live: Vec<(VReg, u32)>,
 }
 
 pub fn regalloc(method: &IrMethod) -> RegallocResult {
-    let (block_order, mut intervals, safepoint_positions, block_start_pos) =
+    let (block_order, mut intervals, safepoint_positions, block_start_pos, extra_oop_live) =
         compute_intervals(method);
     let (frame_slots, slot_is_oop) = allocate(&mut intervals);
     // S14 perf recovery: call-free spilled intervals also get a resident
@@ -651,6 +757,7 @@ pub fn regalloc(method: &IrMethod) -> RegallocResult {
         slot_is_oop,
         safepoint_positions,
         block_start_pos,
+        extra_oop_live,
     }
 }
 
@@ -711,7 +818,7 @@ mod tests {
             vec![VRegInfo { is_oop: true }, VRegInfo { is_oop: true }],
         );
 
-        let (_order, intervals, _safepoints, _bsp) = compute_intervals(&method);
+        let (_order, intervals, _safepoints, _bsp, _extra) = compute_intervals(&method);
         let iv = intervals
             .iter()
             .find(|iv| iv.vreg == v0)
@@ -745,7 +852,7 @@ mod tests {
         };
         let method = hand_method(vec![block0, block1], vec![VRegInfo { is_oop: true }]);
 
-        let (order, intervals, _safepoints, _bsp) = compute_intervals(&method);
+        let (order, intervals, _safepoints, _bsp, _extra) = compute_intervals(&method);
         assert_eq!(
             order,
             vec![BlockId(0), BlockId(1)],
@@ -781,7 +888,7 @@ mod tests {
         };
         let method = hand_method(vec![block], vec![VRegInfo { is_oop: true }]);
 
-        let (_order, mut intervals, _safepoints, _bsp) = compute_intervals(&method);
+        let (_order, mut intervals, _safepoints, _bsp, _extra) = compute_intervals(&method);
         assert!(
             intervals[0].crosses_safepoint,
             "v0 is defined before and used after the call"
@@ -950,7 +1057,7 @@ mod tests {
             deopt_sites: Vec::new(),
         };
         let method = hand_method(vec![block0, dead], Vec::new());
-        let (order, _intervals, _safepoints, _bsp) = compute_intervals(&method);
+        let (order, _intervals, _safepoints, _bsp, _extra) = compute_intervals(&method);
         assert_eq!(
             order.len(),
             2,
@@ -1082,7 +1189,7 @@ mod tests {
             vec![entry, header, body, exit, bailout],
             (0..6).map(|_| VRegInfo { is_oop: true }).collect(),
         );
-        let (order, intervals, _safepoints, _bsp) = compute_intervals(&method);
+        let (order, intervals, _safepoints, _bsp, _extra) = compute_intervals(&method);
 
         // Confirms this hand-built shape actually reproduces the bug's own
         // precondition: the exit block linearized before the body block.

@@ -546,6 +546,7 @@ fn compile_method_full(
                 v,
                 header_pos,
                 &regalloc_result.intervals,
+                &regalloc_result.extra_oop_live,
             ) {
                 ValueLoc::FrameSlot(off) => {
                     debug_assert!(off < 0 && off % 8 == 0);
@@ -663,6 +664,7 @@ fn compile_method_full(
             &regalloc_result.intervals,
             regalloc_result.frame_slots,
             sp.position,
+            &regalloc_result.extra_oop_live,
         );
         let idx = oopmap::intern(&mut oopmaps, map);
         safepoint_pcdescs.push(PcDesc {
@@ -852,6 +854,7 @@ fn build_deopt_metadata(
         safepoint_pcs.iter().map(|sp| (sp.position, sp)).collect();
 
     let intervals = &regalloc_result.intervals;
+    let extra_oop_live = &regalloc_result.extra_oop_live;
     let n_slots = ir_method.argc as usize + ir_method.ntemps as usize;
     let mut rec = ScopeDescRecorder::new();
     let mut pos = 0u32;
@@ -869,9 +872,17 @@ fn build_deopt_metadata(
                                             // The ROOT (caller) scope — the depth-1 shape S13 always built:
                                             // this method's own receiver (VReg 0) + unified slots
                                             // (VReg 1..=n_slots), `sender: None`, root method_pool_ix.
-                let root_receiver = resolve_frame_loc(ir::VReg(0), position, intervals);
+                let root_receiver =
+                    resolve_frame_loc(ir::VReg(0), position, intervals, extra_oop_live);
                 let root_slots = (0..n_slots)
-                    .map(|i| resolve_frame_loc(ir::VReg(i as u32 + 1), position, intervals))
+                    .map(|i| {
+                        resolve_frame_loc(
+                            ir::VReg(i as u32 + 1),
+                            position,
+                            intervals,
+                            extra_oop_live,
+                        )
+                    })
                     .collect();
                 let root_method_ix = ir_method
                     .method_pool_ix
@@ -889,7 +900,7 @@ fn build_deopt_metadata(
                         temps: ir_method
                             .ctx_vregs
                             .iter()
-                            .map(|&v| resolve_frame_loc(v, position, intervals))
+                            .map(|&v| resolve_frame_loc(v, position, intervals, extra_oop_live))
                             .collect(),
                     }
                 };
@@ -938,14 +949,18 @@ fn build_deopt_metadata(
                             let pending_stack = level
                                 .caller_pending_stack
                                 .iter()
-                                .map(|&v| resolve_frame_loc(v, position, intervals))
+                                .map(|&v| resolve_frame_loc(v, position, intervals, extra_oop_live))
                                 .collect();
-                            let inl_receiver =
-                                resolve_frame_loc(level.receiver, position, intervals);
+                            let inl_receiver = resolve_frame_loc(
+                                level.receiver,
+                                position,
+                                intervals,
+                                extra_oop_live,
+                            );
                             let mut inl_slots: Vec<_> = level
                                 .slots
                                 .iter()
-                                .map(|&v| resolve_frame_loc(v, position, intervals))
+                                .map(|&v| resolve_frame_loc(v, position, intervals, extra_oop_live))
                                 .collect();
                             // S14 step 7-IV-c: a slot holding an ELIDED-CLOSURE
                             // phantom overrides its (filler) vreg location — the
@@ -976,7 +991,7 @@ fn build_deopt_metadata(
                 let mut stack: Vec<_> = raw
                     .stack
                     .iter()
-                    .map(|&v| resolve_frame_loc(v, position, intervals))
+                    .map(|&v| resolve_frame_loc(v, position, intervals, extra_oop_live))
                     .collect();
                 // S14 step 7-IV-c: phantom stack entries override their filler
                 // vregs (a block-arg send's guard-cold reexecute stack; in-callee

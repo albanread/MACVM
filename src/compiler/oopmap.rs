@@ -7,6 +7,7 @@
 //! is not a new dependency direction, just a new file.
 
 use crate::codecache::nmethod::{Nmethod, OopMap};
+use crate::compiler::ir::VReg;
 use crate::compiler::regalloc::{Assignment, LiveInterval};
 
 /// D2: the map of which spill slots hold a LIVE oop at exactly `position`
@@ -38,7 +39,22 @@ use crate::compiler::regalloc::{Assignment, LiveInterval};
 /// the dst does need a slot assigned across the call — it just must not
 /// be TRACED at this particular safepoint; the next safepoint (start <
 /// position by then) covers it normally.
-pub fn build_for_position(intervals: &[LiveInterval], frame_slots: u16, position: u32) -> OopMap {
+/// `extra_oop_live` is `RegallocResult::extra_oop_live` — exact `(vreg,
+/// position)` facts a deopt site's own recorded stack/slots need, checked
+/// here as an ADDITIONAL, exact-position fact alongside each interval's
+/// plain `[start,end]`. Kept separate rather than folded into the interval
+/// itself: a vreg needed only by one far-away trap (traps linearize into
+/// the cold tail — `emit_uncommon_trap`'s own doc) would otherwise need its
+/// interval widened to cover everything numerically in between, which is
+/// unsound wherever that span crosses an if/else merge also reachable from
+/// a sibling arm that never wrote it (`compute_intervals`'s own doc has
+/// the full story — this is what `extra_oop_live` exists to avoid).
+pub fn build_for_position(
+    intervals: &[LiveInterval],
+    frame_slots: u16,
+    position: u32,
+    extra_oop_live: &[(VReg, u32)],
+) -> OopMap {
     let mut map = OopMap::empty();
     for iv in intervals {
         if !iv.is_oop {
@@ -47,7 +63,11 @@ pub fn build_for_position(intervals: &[LiveInterval], frame_slots: u16, position
         let Some(Assignment::Spill(slot)) = iv.assignment else {
             continue;
         };
-        if iv.start < position && iv.end > position {
+        let live = (iv.start < position && iv.end > position)
+            || extra_oop_live
+                .iter()
+                .any(|&(v, p)| v == iv.vreg && p == position);
+        if live {
             debug_assert!(
                 slot.0 < frame_slots,
                 "build_for_position: slot {} out of range (frame_slots={frame_slots})",
@@ -177,7 +197,7 @@ mod tests {
             spilled(0, 0, true, 0, 5),  // ends at 5, safepoint is at 10: dead
             spilled(1, 1, true, 0, 20), // spans 10: live
         ];
-        let map = build_for_position(&intervals, 2, 10);
+        let map = build_for_position(&intervals, 2, 10, &[]);
         assert!(
             !map.is_oop(0),
             "interval ending before the safepoint must be excluded"
@@ -188,13 +208,40 @@ mod tests {
         );
     }
 
+    /// BUG D (regression, `cold_branch_recompile_spill_corruption.mst`): a
+    /// vreg's organic interval ends at its own last real use, but a FAR-AWAY
+    /// deopt site (traps linearize into the cold tail) also needs it —
+    /// `extra_oop_live` records that ONE exact position, and must not leak
+    /// liveness into anything in between, e.g. a real safepoint on a
+    /// SIBLING if/else arm that never wrote this vreg's slot at all.
+    #[test]
+    fn oopmap_extra_oop_live_is_exact_not_a_widened_range() {
+        // Organic interval [0,5): dead well before either query position.
+        let intervals = vec![spilled(0, 0, true, 0, 5)];
+        let extra = [(VReg(0), 80)];
+        assert!(
+            !build_for_position(&intervals, 1, 68, &extra).is_oop(0),
+            "an unrelated safepoint numerically between the organic end and \
+             the forced trap position must NOT see the vreg as live"
+        );
+        assert!(
+            build_for_position(&intervals, 1, 80, &extra).is_oop(0),
+            "the EXACT forced position must see the vreg as live"
+        );
+        assert!(
+            !build_for_position(&intervals, 1, 81, &extra).is_oop(0),
+            "one past the forced position must not — this is a point fact, \
+             not a range"
+        );
+    }
+
     /// An interval ending EXACTLY at the safepoint position is consumed BY
     /// it (the safepoint's own argument), not live ACROSS it — matches
     /// `crosses_safepoint`'s own `end > sp` (not `>=`) convention exactly.
     #[test]
     fn oopmap_excludes_interval_ending_at_position() {
         let intervals = vec![spilled(0, 0, true, 0, 10)];
-        let map = build_for_position(&intervals, 1, 10);
+        let map = build_for_position(&intervals, 1, 10, &[]);
         assert!(!map.is_oop(0));
     }
 
@@ -211,14 +258,14 @@ mod tests {
     #[test]
     fn oopmap_excludes_interval_starting_at_position() {
         let intervals = vec![spilled(0, 0, true, 10, 20)];
-        let map = build_for_position(&intervals, 1, 10);
+        let map = build_for_position(&intervals, 1, 10, &[]);
         assert!(
             !map.is_oop(0),
             "a call's own dst (def AT the safepoint) must not be traced during the call"
         );
         // ...and the very next safepoint, once the value genuinely exists,
         // covers it normally.
-        let map_later = build_for_position(&intervals, 1, 15);
+        let map_later = build_for_position(&intervals, 1, 15, &[]);
         assert!(map_later.is_oop(0));
     }
 
@@ -228,7 +275,7 @@ mod tests {
     #[test]
     fn oopmap_excludes_non_oop_interval() {
         let intervals = vec![spilled(0, 0, false, 0, 20)];
-        let map = build_for_position(&intervals, 1, 10);
+        let map = build_for_position(&intervals, 1, 10, &[]);
         assert!(!map.is_oop(0));
     }
 

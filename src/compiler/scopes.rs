@@ -29,11 +29,20 @@ use crate::compiler::regalloc::{Assignment, LiveInterval};
 ///   S12's spill-all invariant GUARANTEES every value that survives a
 ///   safepoint is spilled there, so a surviving value is always found here
 ///   — never left in a register (there is no `Register` `ValueLoc`).
+/// - OR `(vreg, pos)` is an exact `extra_oop_live` fact (`RegallocResult::
+///   extra_oop_live` — a deopt site's own recorded receiver/slots/stack
+///   vreg, forced to a canonical slot WITHOUT widening the vreg's plain
+///   interval; see `compute_intervals`'s own doc for why the widening was
+///   unsound) → same `FrameSlot`, read off the SAME `assignment` any other
+///   entry for this vreg carries (a vreg has exactly one, per-method-wide
+///   `SpillSlot` once spilled — regalloc's monotonic, never-reused
+///   assignment, D3.5 point 3 — so any interval naming this vreg has it).
 /// - Otherwise the value is DEAD at this safepoint (its last use was at or
-///   before `pos`) → `Nil`. Safe by the same invariant: anything read
-///   after the resume bci is live-across → spilled → handled above, so a
-///   not-found vreg is exactly one whose materialized value is never read
-///   before being overwritten.
+///   before `pos`, and no deopt site needs it here either) → `Nil`. Safe by
+///   the same invariant: anything genuinely read at or after the resume
+///   bci is live-across (organically OR via `extra_oop_live`) → spilled →
+///   handled above, so a not-found vreg is exactly one whose materialized
+///   value is never read before being overwritten.
 ///
 /// Recorded per-safepoint (NOT a pc-independent per-scope location): the
 /// linear-scan regalloc assigns a spill slot per INTERVAL, so a multi-def
@@ -42,9 +51,29 @@ use crate::compiler::regalloc::{Assignment, LiveInterval};
 /// (`ConstSmi`/`ConstPool`/`Nil` from the IR) are a separate layer (the
 /// caller knows the IR's constant map); this handles only frame-resident
 /// values.
-pub fn resolve_frame_loc(vreg: VReg, pos: u32, intervals: &[LiveInterval]) -> ValueLoc {
+///
+/// **Regression note** (`cold_branch_recompile_spill_corruption.mst`,
+/// found immediately after `extra_oop_live` was introduced): this function
+/// has the EXACT SAME "does the interval span `pos`" shape
+/// `oopmap::build_for_position` does, and was missed the first time
+/// `extra_oop_live` replaced the old blanket-widening — a narrowed
+/// interval made THIS resolve to `Nil` at the very safepoint it's most
+/// needed (the trap itself), so the materializer pushed `Nil` in place of
+/// the real value (here, `payload`) onto the reexecuted stack — `nil + 5`
+/// instead of the real addition, which cascaded into DNU handling deeply
+/// enough to overflow the native stack. `extra_oop_live` must be checked
+/// EVERYWHERE `build_for_position`'s own interval check is, not just there.
+pub fn resolve_frame_loc(
+    vreg: VReg,
+    pos: u32,
+    intervals: &[LiveInterval],
+    extra_oop_live: &[(VReg, u32)],
+) -> ValueLoc {
     for iv in intervals {
-        if iv.vreg == vreg && iv.start <= pos && iv.end > pos {
+        if iv.vreg == vreg
+            && (iv.start <= pos && iv.end > pos
+                || extra_oop_live.iter().any(|&(v, p)| v == vreg && p == pos))
+        {
             if let Some(Assignment::Spill(slot)) = iv.assignment {
                 return ValueLoc::FrameSlot(-8 * (slot.0 as i32 + 1));
             }

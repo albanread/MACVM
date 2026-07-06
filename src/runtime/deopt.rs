@@ -186,23 +186,60 @@ fn bytecode_len_at(method: MethodOop, bci: usize) -> usize {
 }
 
 /// The compiler's bytecode abstract-interpreter model of the operand-stack
-/// height at `resume_bci` (D5 M4). A straight-line accumulation of
-/// `instr_stack_delta` from bci 0 to `resume_bci` — correct for the common
-/// linear-region resume point; at a control-flow merge the linear scan can
-/// disagree with the CFG's fixpoint height, so this is used ONLY inside the
-/// debug-build `debug_assert_eq!` cross-check, never to size the real frame
-/// (the recorded `stack` is the source of truth). Returns `None` when the
-/// walk can't reach `resume_bci` exactly (a mid-instruction bci — itself a
-/// bug the caller's assert will surface), so the check is skipped rather than
-/// panicking on the model's own limitation.
+/// height at `resume_bci` (D5 M4) — a scan from bci 0 to `resume_bci` that
+/// FOLLOWS each forward branch's resolved direction rather than walking
+/// raw address order, so it never counts bytes no path to `resume_bci`
+/// actually executes:
+///
+/// - `JumpFwd` is unconditional — always taken, so the walk always
+///   continues at its target, never at `next`.
+/// - `BrTrueFwd`/`BrFalseFwd` fork a structured if/else: the two arms
+///   occupy disjoint bci ranges (`next..target` then `target..`), so
+///   `resume_bci`'s own position tells you which arm it was reached
+///   through — before the target, the fall-through arm; at or past it,
+///   the taken arm — and the walk continues accordingly, entirely
+///   skipping the OTHER arm's bytes.
+/// - `JumpBack` (a loop's own back edge) is left alone: this is a single
+///   forward pass toward `resume_bci`, so a back edge met along the way
+///   is never taken (taking it would loop the model itself). A
+///   structured loop body's net stack effect is zero by construction —
+///   the same value entering and leaving each iteration — so walking
+///   through one changes nothing either way; the loop HEADER's own
+///   merge (entry edge + back edge) is the one case genuinely beyond a
+///   linear scan, and the caller exempts it via `skip_merge_check`.
+///
+/// Without the branch-following above, a resume point inside the SECOND
+/// arm of an if/else would walk through the first arm's bytes too (they
+/// sit earlier in the linear stream) and wrongly fold in whatever it
+/// left on the stack — that leftover isn't popped until the shared merge
+/// point past BOTH arms, so a scan stopping mid-second-arm still carries
+/// it. Found via `cold_branch_recompile_spill_corruption.mst`/BUG D's own
+/// second bug: `process:`'s `ifFalse: [ data add2: 7 ]` arm, untaken
+/// (and hence trapping) until a late recompile, inflated this model to 3
+/// against a correctly-materialized 2 — the `ifTrue:` arm's own
+/// `add1:` send left an unpopped result the model never walked past.
+///
+/// Used ONLY inside the debug-build `debug_assert_eq!` cross-check, never
+/// to size the real frame (the recorded `stack` is the source of truth).
+/// Returns `None` when the walk can't land on `resume_bci` exactly (a
+/// mid-instruction bci — itself a bug the caller's assert will surface),
+/// so the check is skipped rather than panicking on the model's own
+/// limitation.
 #[cfg(debug_assertions)]
 fn interpreter_model_height(method: MethodOop, resume_bci: usize) -> Option<i32> {
+    use crate::bytecode::opcode::Instr;
     let mut bci = 0usize;
     let mut height = 0i32;
     while bci < resume_bci {
         let (instr, next) = crate::bytecode::opcode::decode_at(method, bci);
         height += crate::compiler::ir::instr_stack_delta(method, &instr);
-        bci = next;
+        bci = match instr {
+            Instr::JumpFwd(d) => next + d as usize,
+            Instr::BrTrueFwd(d) | Instr::BrFalseFwd(d) if resume_bci >= next + d as usize => {
+                next + d as usize
+            }
+            _ => next,
+        };
     }
     if bci == resume_bci {
         Some(height)

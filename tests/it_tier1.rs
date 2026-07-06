@@ -3594,14 +3594,28 @@ fn nlr_through_compiled_frame_runs_home_side_ensure() {
 /// Golden for `compiler::scopes::resolve_frame_loc` against a REAL
 /// compiled method's regalloc output (not hand-faked intervals): the
 /// load-bearing mapping the whole deopt-metadata recorder is built on.
-/// `foo: a [ self bar. ^ self baz: a ]` — `self` (VReg 0) and the arg `a`
-/// (VReg 1) are BOTH live across the first `self bar` send (each is used
-/// again in `baz: a`), so S12's spill-all forces them to canonical frame
-/// slots there; `resolve_frame_loc` must return exactly those
-/// `FrameSlot`s, and a never-defined vreg must resolve to `Nil` (the dead/
-/// absent case). Both sends are warmed to a NON-smi mono IC so they stay
-/// generic `CallSend` safepoints (S14 step 3: an Untaken/empty IC would now
-/// lower to an uncommon trap instead, a different scope shape).
+/// `foo: a [ self bar. ^ self baz: a ]`, both sends warmed mono on a
+/// NON-smi klass whose `bar`/`baz:` are themselves trivial `^self` — S14
+/// step 5's self-send devirtualization customizes the WHOLE method for
+/// that klass and inlines both trivial bodies directly, collapsing the
+/// method to two `GuardKlass` checks (protecting the devirtualization
+/// guess) guarding a single `Ret(self)`; the compiled shape actually seen
+/// (confirmed against the real IR, not assumed) is `Param(self), Param(a),
+/// GuardKlass(self, fail=trap1), GuardKlass(self, fail=trap2), Ret(self)`
+/// with NO `CallSend` at all — each guard's own fail edge is an
+/// `UncommonTrap` reexecuting the send it replaced. Neither `self` nor `a`
+/// is otherwise organically read past its own `Param` (the whole point of
+/// the optimization is that nothing besides the guards ever looks at them
+/// again), so both depend entirely on `extra_oop_live`, not organic
+/// liveness, to resolve to a real slot at either trap. `self` is in each
+/// trap's own recorded reexecute stack directly; `a` is a UNIFIED SLOT
+/// (the method's own declared argument), which `deopt_live`'s "receiver +
+/// every unified slot" rule includes at EVERY deopt site regardless of
+/// that site's own narrower recorded stack — full-frame reconstruction
+/// needs every declared local, not just the operands the specific
+/// reexecuted op reads — so `a` resolves to a slot at BOTH traps too, even
+/// though `self bar` itself never reads it. A never-referenced vreg number
+/// is always `Nil`.
 #[test]
 fn deopt_resolve_frame_loc_from_real_regalloc() {
     use macvm::compiler::scopes::{resolve_frame_loc, ValueLoc};
@@ -3621,9 +3635,9 @@ fn deopt_resolve_frame_loc_from_real_regalloc() {
     b.ret_tos();
     let method = b.finish(&mut vm, foo_sel, 1, 0);
 
-    // S14 step 3: warm both send sites to Mono on a NON-smi klass so they stay
-    // real generic `CallSend`s (this golden targets the two call-return
-    // safepoints). An Untaken IC would now lower each send to an uncommon trap.
+    // Warm both send sites to Mono on a klass whose own `bar`/`baz:` are
+    // trivial `^self` bodies — the shape self-send devirtualization (S14
+    // step 5) customizes the whole method and inlines away entirely.
     let obj_klass = vm.universe.object_klass;
     let bar_target = {
         let mut tb = BytecodeBuilder::new();
@@ -3645,40 +3659,77 @@ fn deopt_resolve_frame_loc_from_real_regalloc() {
 
     assert!(
         ra.safepoint_positions.len() >= 2,
-        "two generic sends must produce two safepoints: {:?}",
+        "two devirtualization guards must produce two trap safepoints: {:?}",
         ra.safepoint_positions
     );
-    let p0 = ra.safepoint_positions[0]; // the `self bar` send
+    // Linear order matches source order here (blk0's two GuardKlass ops
+    // reference trap1/trap2 in that order, and `reverse_postorder` lays out
+    // block 0 first, then its successors in discovery order) — p0 is
+    // trap1's own position (needs only `self`), p1 trap2's (needs `self`
+    // AND `a`), confirmed directly against `ir.blocks`' own recorded
+    // `deopt_sites` rather than assumed from position alone.
+    let p0 = ra.safepoint_positions[0]; // trap1: `self bar`'s guard fail
+    let p1 = ra.safepoint_positions[1]; // trap2: `self baz: a`'s guard fail
 
-    // Derive the EXPECTED FrameSlot for VReg(0) directly from regalloc's
-    // own assignment covering p0, then confirm resolve_frame_loc agrees --
-    // proving it reads the real slot, not a coincidence.
+    // Derive the EXPECTED FrameSlot for VReg(0) from regalloc's own
+    // assignment (there is exactly one interval per vreg once spilled —
+    // D3.5 point 3's monotonic, never-reused slot numbering — so which
+    // position "found" it is irrelevant to WHICH slot it names).
     let self_iv = ra
         .intervals
         .iter()
-        .find(|iv| iv.vreg == VReg(0) && iv.start <= p0 && iv.end > p0)
-        .expect("self must be live across the first send");
+        .find(|iv| iv.vreg == VReg(0))
+        .expect("self must have an interval");
+    assert!(
+        self_iv.crosses_safepoint,
+        "self is read by both traps' own recorded stacks, so S12 spill-all must force it"
+    );
     let expected_self = match self_iv.assignment {
         Some(macvm::compiler::regalloc::Assignment::Spill(slot)) => {
             ValueLoc::FrameSlot(-8 * (slot.0 as i32 + 1))
         }
         other => panic!("S12 spill-all: self must be SPILLED across a safepoint, got {other:?}"),
     };
-    assert_eq!(resolve_frame_loc(VReg(0), p0, &ra.intervals), expected_self);
 
-    // The arg `a` (VReg 1) is likewise live-across → a FrameSlot.
-    assert!(
-        matches!(
-            resolve_frame_loc(VReg(1), p0, &ra.intervals),
-            ValueLoc::FrameSlot(_)
-        ),
-        "the arg `a`, used again after the first send, must resolve to a frame slot"
+    // `self` resolves to its real slot at BOTH traps — each one's own
+    // recorded stack names it (`extra_oop_live`'s exact-position fact),
+    // not a widened range that would also (wrongly) cover unrelated code.
+    assert_eq!(
+        resolve_frame_loc(VReg(0), p0, &ra.intervals, &ra.extra_oop_live),
+        expected_self,
+        "self must resolve at trap1, which reexecutes `self bar` and needs it"
+    );
+    assert_eq!(
+        resolve_frame_loc(VReg(0), p1, &ra.intervals, &ra.extra_oop_live),
+        expected_self,
+        "self must resolve at trap2 too, which reexecutes `self baz: a` and needs it"
     );
 
-    // A vreg that doesn't exist (or is dead at p0) → Nil, the materialize-
-    // nil case for a value never read after the resume bci.
+    // `a` (VReg 1) is a unified slot — the "every unified slot" half of
+    // `deopt_live` includes it at EVERY deopt site in the method, not just
+    // trap2's own recorded stack, so it resolves to a frame slot at BOTH
+    // traps (a full-frame rebuild needs every declared local regardless of
+    // which operands the specific reexecuted op reads).
+    assert!(
+        matches!(
+            resolve_frame_loc(VReg(1), p0, &ra.intervals, &ra.extra_oop_live),
+            ValueLoc::FrameSlot(_)
+        ),
+        "the arg `a`, a unified slot, must resolve to a frame slot at trap1 too, even though \
+         `self bar` itself never reads it"
+    );
+    assert!(
+        matches!(
+            resolve_frame_loc(VReg(1), p1, &ra.intervals, &ra.extra_oop_live),
+            ValueLoc::FrameSlot(_)
+        ),
+        "the arg `a`, read by trap2's own recorded stack, must resolve to a frame slot there"
+    );
+
+    // A vreg that doesn't exist (or is dead everywhere) → Nil, the
+    // materialize-nil case for a value never read after the resume bci.
     assert_eq!(
-        resolve_frame_loc(VReg(9999), p0, &ra.intervals),
+        resolve_frame_loc(VReg(9999), p0, &ra.intervals, &ra.extra_oop_live),
         ValueLoc::Nil
     );
 }

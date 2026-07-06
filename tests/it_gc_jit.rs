@@ -574,7 +574,12 @@ fn install_loop_nmethod(
     let mut oopmaps: Vec<OopMap> = vec![OopMap::empty()];
     let mut pcdescs: Vec<PcDesc> = Vec::with_capacity(safepoints.len());
     for sp in &safepoints {
-        let map = oopmap::build_for_position(&ra.intervals, ra.frame_slots, sp.position);
+        let map = oopmap::build_for_position(
+            &ra.intervals,
+            ra.frame_slots,
+            sp.position,
+            &ra.extra_oop_live,
+        );
         let idx = oopmap::intern(&mut oopmaps, map);
         pcdescs.push(PcDesc {
             pc_off: sp.pc_off,
