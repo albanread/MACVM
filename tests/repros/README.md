@@ -296,12 +296,61 @@ ports; the benchmarks' own 4-mode gates stay red until these are fixed):
        apparently never take a live loop-poll deopt under this
        harness, so `fe27eff`'s rt_poll anchor fix — real, but for a
        DIFFERENT door — doesn't touch this signature either).
-       RE-TESTED after task #94's extra_oop_live fix: STILL FAILS
-       (DNU #mustBeBoolean / "does not understand bitAnd:",
-       nondeterministic) — so this is a genuinely DISTINCT mechanism
-       from the GC-in-callee staleness #94 closed; the remaining
-       suspect surface is the invalidation-churn path itself
-       (make_not_entrant/§2c/recompile racing reexecute deopts).
+
+       **CORE MECHANISM FIXED (97a99ae): `AdapterTable::by_method`'s
+       stale hashmap key.** c2i adapters are cached keyed by a
+       MethodOop's raw pointer bits; `oops_do` keeps a LIVE entry's own
+       embedded pool word current across every GC, but the HASHMAP KEY
+       itself is never rehashed. Once a method moves off its old
+       address, a wholly unrelated, LATER-allocated method landing at
+       that exact vacated address (the same eden-base-recycling
+       mechanism task #94 fixed elsewhere, here for METHOD oops
+       instead of process-stack spill slots) collides with the stale
+       key: a false HIT, not the miss the module's own doc assumed was
+       the only possible outcome. A site's `#not` send (say) gets
+       permanently linked to whatever OTHER selector's adapter used to
+       live at that address — with a real, valid receiver every call,
+       so no plausibility check anywhere catches it. Traced live (a
+       temporary probe) to `nm=247` (`isTaskHoldingOrWaiting`)'s `#not`
+       site silently running `#==`/`#bitAnd:`/etc. adapters instead —
+       exactly this repro's whole DNU/wrong-arithmetic zoo. Fixed by
+       re-deriving the cached entry's identity from its OWN embedded
+       pool word (kept current, unlike the key) and rejecting a
+       mismatched hit. Also hardened the adjacent c2i-repatch path
+       (`rt_interpret_call`): its captured `ret_addr` can, under
+       DEOPT_STRESS, land on a coincidentally-reused code-cache region
+       after the nested run flushes the caller — guarded with a
+       selector-equality check before repatching.
+
+       Verified: the exact scenario (richards under
+       `MACVM_DEOPT_STRESS=1 threshold=100`, RELEASE binary) — 20/20 +
+       15/15 clean runs across two sweeps (previously intermittent);
+       deltablue same stress, 10/10 clean.
+
+       **STILL OPEN, narrower**: under DEBUG builds specifically (the
+       `poison_range` diagnostic — `#[cfg(debug_assertions)]`, never
+       compiled into release — that fills a scavenged region with a
+       sentinel so any stale reference "fails fast" instead of
+       "masquerading as an unrelated GC panic multiple cycles
+       downstream", per its own doc), the same richards+DEOPT_STRESS
+       scenario still trips a mark-tag-POISON debug_assert reading
+       `rt_interpret_call`'s `method_bits` — 14/15 debug runs vs 0/30
+       release runs. Per `poison_range`'s OWN documented purpose, this
+       is likely the SAME staleness class (a genuinely stale, not just
+       key-recycled, method reference), just far lower-probability of
+       landing on already-reused memory within one short release run —
+       not proven absent there, only unobserved so far. Root cause not
+       yet localized: neither a scavenge's own pre-scan root audit nor
+       a post-full-gc adapter-pool-word audit (both temporarily added,
+       reverted) caught a bad entry before the crash, and there is no
+       Smalltalk-heap allocation between a c2i adapter's own `ldr`
+       (reading its pool word) and `rt_interpret_call`'s use of it, so
+       the staleness must predate that specific call entirely. Next
+       step: trace WHERE a live adapter's pool word first goes bad —
+       likely needs an audit hook inside `AdapterTable::oops_do`'s OWN
+       callback (comparing `*word` immediately before vs. after the
+       relocation transform `f`, not just before-vs-after a whole GC
+       cycle) to catch the exact GC and exact object it happens to.
 
    Original root-cause-4 crash shape (retained): a debug build panicked
    at `oops/mod.rs:57` ("mark tag: word 0x7 has MARK_TAG") from
