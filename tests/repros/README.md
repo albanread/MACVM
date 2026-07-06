@@ -119,28 +119,85 @@ ports; the benchmarks' own 4-mode gates stay red until these are fixed):
    STACK scan (not `each_code_root`'s compiled-frame scan this time),
    nested inside a scavenge triggered by a `prim_basic_new_colon`
    allocation reached via `rt_interpret_call` (a compiled frame calling
-   into the interpreter). Confirmed via a targeted klass-field peek
-   (read the candidate object's OWN klass field directly, bypassing the
-   `Oop::from_raw` tag check that would otherwise panic first) that the
-   bad stack value is off by exactly one word (8 bytes): the value on the
-   stack, read as a mem-tagged pointer, has `0x7` (`MARK_PRISTINE` — a
-   FRESH, not-yet-populated object's own header) sitting where its klass
-   field should be; the SAME object's klass field, read from 8 bytes
-   HIGHER than where the stack value actually points, IS a plausible
-   mem-tagged klass pointer. This is a genuinely different bug class from
-   roots 1-3 above (a real pointer-arithmetic/offset error, not a GC
-   liveness-tracking gap) — not yet localized to a specific function.
+   into the interpreter). This is a genuinely different bug class from
+   roots 1-3 above (a real pointer/memory corruption, not a GC
+   liveness-tracking gap).
+
+   Confirmed facts, strongest evidence first (the existing, already-wired
+   `MACVM_DBG_ROOTS=1` audit — `scavenge::audit_roots`, a pre-scan sanity
+   check that was ALREADY in the codebase, not added this pass — flags the
+   exact same slot independently of the tag-check panic, via a completely
+   different test, mark-word-sentinel-based rather than klass-field-based;
+   two independent checks agreeing rules out either one being a false
+   positive of its own logic):
+     - The bad value is a single, specific, deterministic process-stack
+       slot (same index, same shape, every run) — NOT a scan-order or
+       timing artifact. `scavenge::audit_roots` (gate it with
+       `MACVM_DBG_ROOTS=1`) already catches it as a "STALE ROOT" before
+       the scavenge that trips the tag-check panic even begins, so the bad
+       value predates this specific scavenge — it was written at some
+       earlier point in execution and simply sat there, unread, until a
+       GC happened to examine it.
+     - Reading the object's header words directly (bypassing
+       `Oop::from_raw`'s tag check, which would otherwise panic first):
+       the word at the stack value's own claimed address decodes as
+       PLAIN ASCII TEXT — a 6-digit number string (e.g. "218406", a
+       plausible `SmallInteger>>printString` result given this repro's own
+       arithmetic) — not a mark word at all. The word 8 bytes higher is
+       `0x7` (`MARK_PRISTINE` — a fresh, GC-untouched object's own real
+       mark word), and the word 16 bytes higher is a plausible mem-tagged
+       klass pointer. This is internally consistent with exactly one
+       reading: the REAL object's true start is 8 bytes (one word) higher
+       than where the stack slot actually points — the stack holds a
+       pointer that is off by exactly one word, into what reads as the
+       tail of a DIFFERENT (preceding, already-fully-written) allocation's
+       own body content instead of the intended object's own header.
+     - Ruled out (read closely, look correct, not the source): the core
+       bump allocator (`alloc::try_bump_eden`, `alloc::init_object_at` —
+       address captured before the bump, mark/klass written atomically at
+       that exact address, no off-by-one in sight); the two indexable
+       allocators built on it (`alloc_indexable_oops`/`alloc_indexable_bytes`
+       — both return the same already-correct tagged oop `init_object_at`
+       produced, no independent address arithmetic of their own); the
+       bounds-checked byte-write primitive behind `byteAt:put:`/
+       `basicByteAt:put:` (`primitives::prim_byte_at_put` — validates
+       `1 <= i <= b.len()` before writing, so it cannot itself be the
+       source of an out-of-bounds write corrupting an adjacent object);
+       `runtime::deopt`'s `materialize_closure`/`materialize_context`
+       (klass set atomically as part of `alloc_closure`/`alloc_context`,
+       values read into handles before any allocation).
+     - NOT yet ruled out / not yet checked: the JIT's own inline
+       allocation fast path (`compiler::emit`'s `emit_alloc`, S11 D7/step
+       8 — hand-written arm64, a plausible place for a hand-rolled
+       off-by-one, though it is only used for `Ir::Alloc`'s fixed-size
+       case, not the variable-sized `String new:` this specific crash's
+       own backtrace involves — worth checking anyway since OTHER
+       allocations earlier in the same run could be the ones actually
+       corrupted); whatever specific world-level method builds a
+       `printString` result digit-by-digit (a loop-bound off-by-one
+       there, writing one byte past the allocated string's own end, would
+       produce exactly this symptom — corrupting the NEXT object's own
+       header — but this would be a `world/*.mst` library bug, not a VM
+       one, and is outside this investigation's file-ownership scope to
+       fix directly even if confirmed); the C2I/argument-marshaling
+       boundary (`stubs::rt_interpret_call`) for a receiver/arg computed
+       from the wrong frame offset.
    Reproduces via the same minimal repro AND the full Richards run;
    confirmed NOT present on the simpler isolate-process/single-loop
    variants added during this investigation (see below), so it needs the
-   fuller repro's own scale/shape to trigger. Next step: instrument
-   whichever code path builds the value that ends up on the stack at the
-   reported index (the crash is deterministic — same index, same shape,
-   across runs) to find where the off-by-one-word arithmetic happens;
-   `runtime::deopt`'s `materialize_closure`/`materialize_context` were
-   read closely and look correct (klass set atomically as part of
-   `alloc_closure`/`alloc_context`, values read into handles before any
-   allocation) but have not been ruled out with certainty.
+   fuller repro's own scale/shape (or specifically, a `printString` call
+   on a number in roughly the 200000+ range, six digits) to trigger.
+   Next step: since the corruption predates the scavenge that discovers
+   it, the productive angle is finding WHERE a six-digit `printString`
+   result gets built and used, not the allocator/GC layer (already
+   audited clean) — a temporary write-time validator on `ProcessStack::
+   push`/`set`, or on `alloc_indexable_bytes`'s own return value
+   immediately after construction, gated to fire only near the point in
+   execution this reproduces, would confirm whether the bad pointer is
+   ever CORRECT immediately after allocation and gets clobbered later
+   (pointing at a real, later, unrelated JIT/marshaling bug) or is wrong
+   from the moment it's first computed (pointing at the allocator or its
+   caller instead, despite the above audit).
 
    Minimal repros added during this investigation (not shipped as fixed
    assets, but the exact commands to rebuild them, since each isolates a
