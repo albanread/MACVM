@@ -119,7 +119,7 @@ cost, it doesn't erase it.
 | 2026-07-04 | a1e57ac | 110 | 0 |
 | 2026-07-04 | 04e774b | (bridge deleted) | 110 |
 
-# S15 A6/A7 — Richards/DeltaBlue perf recording (PARTIAL — see blockers)
+# S15 A6/A7 — Richards/DeltaBlue perf recording
 
 Recorded per `tests_s15.md` T5's procedure: `world/bench/bench.list`
 (`richards.mst`, `deltablue.mst`) run through the shared `Bench.mst`
@@ -127,36 +127,36 @@ harness (3 discarded warmups + median-of-outer, timed via
 `millisecondClock`, excludes genesis/world load) under `MACVM_JIT=off` vs
 `threshold=1` vs `threshold=1000`, via `scripts/perf.sh --release`.
 
-**This is intentionally incomplete.** T5 also specifies a GATING test
-(`tests/it_perf_s15.rs`, not yet written) asserting "Richards ratio ≥
-5.0" — that assertion cannot be satisfied today: Richards cannot complete
-under EITHER JIT threshold right now (see below), so there is no ratio to
-gate on yet. Recording honest partial numbers here rather than a
-fabricated or cherry-picked table; `it_perf_s15.rs` should not be written
-until the blocker below is resolved, since it would either assert
-something false or have to skip the one metric T5 exists to gate.
+## 2026-07-06 (commit f62a1e4) — Richards t=1 CORRECT for the first time
+
+BUG D root cause 4 turned out to be two distinct bugs (OSR uninit frame
+slots + c2i >5-arg marshaling overflow — see tests/repros/README.md and
+f62a1e4's own message), both fixed. Richards now completes CORRECTLY
+under `threshold=1` (23246/9297 golden values) — previously it could not
+complete under any JIT threshold at all.
 
 | Benchmark | interp_ms | jit t=1 | jit t=1000 | best/interp |
 |---|---|---|---|---|
-| richards | 201 | **blocked** (root cause 4) | **blocked** (root cause 4) | n/a |
-| deltablue | 205 | 114 | **blocked** (BUG C) | 1.8x (t=1 only) |
+| richards | 204 | 193 | **blocked** (mid-threshold wrong-answer) | 1.1x (t=1) |
+| deltablue | 208 | 119 | **blocked** (BUG C) | 1.7x (t=1) |
 
-- **richards, both thresholds blocked**: `threshold=1` aborts with `does
-  not understand deviceInAdd:`; `threshold=1000` fails Bench's own
-  warmup-consistency check ("benchmark warmup produced a wrong result")
-  — a silent wrong-answer variant of the same underlying issue rather
-  than a hard abort. Both are consistent with `tests/repros/README.md`'s
-  still-open BUG D root cause 4 (a genuine pointer/memory corruption, not
-  a liveness-tracking gap) — that dossier already notes root cause 4
-  "blocks this repro's full run (and Richards itself)"; this perf run is
-  that same prediction confirmed against the real benchmark rather than
-  the minimal repro.
-- **deltablue, threshold=1000 blocked**: `Projection test 3 failed` —
-  exactly BUG C (`tests/repros/deltablue_projection_t1000_differential.mst`,
-  still open, timing-sensitive test-number drift already documented
-  there). `threshold=1` completes cleanly and IS recorded above.
-- Bottom line: **BUG D root cause 4 is the concrete, sole remaining
-  blocker on fully completing S15's own T5 acceptance gate** for
-  Richards; BUG C blocks only DeltaBlue's `threshold=1000` column. Until
-  either is fixed, the "best/interp" ratios above are partial, honest
-  numbers, not the sprint's actual gate.
+- **richards t=1 = 1.1x is a PERF gap now, not a correctness gap**: the
+  run is correct but trap-heavy (the `work kind` two-way branch keeps one
+  arm trapping — 60k+ uncommon traps observed per run), so most of the
+  win is eaten by deopt/reexecute churn plus interpreted fallback for the
+  7-arg-send creator methods the new eligibility cap declines. T5's
+  "Richards ratio ≥ 5.0" gate therefore remains unmet — but the remaining
+  work is optimization (trap-site healing / poly-arm compilation), not
+  bug-fixing. `it_perf_s15.rs` still should not be written yet: it would
+  fail on day one for perf reasons.
+- **The mid-threshold silent wrong-answer (Richards t=100..20000,
+  DeltaBlue t=1000 — very likely BUG C's own band)**: results are correct
+  interpreted, at t≤10, and at t≥100000 (OSR-only compilation), but wrong
+  whenever invocation-triggered compilation lands MID-run — the
+  early-exit fraction tracks the threshold precisely (at t=20000 the
+  scheduler dies ~92% through, exactly where `queuePacket:` crosses
+  20000 invocations). Documented as the next investigation; blocks only
+  the t=1000 columns above.
+- Also known, pre-existing (stash-bisected, not from these fixes): the
+  BUG D repro fails under `MACVM_GC_STRESS=1` + `threshold=1`
+  (`doesNotUnderstand: size`), while passing under `MACVM_DEOPT_STRESS`.

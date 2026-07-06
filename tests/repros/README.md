@@ -151,17 +151,80 @@ ports; the benchmarks' own 4-mode gates stay red until these are fixed):
    through," only ever "this vreg's own slot, marked live at a position
    its own value was never actually written for."
 
-   **STILL OPEN (root cause 4, NOT YET FIXED):** with all three of the
-   above landed, the full repro (and Richards itself, same command against
-   `world/bench/richards.mst`) now gets much further before failing
-   differently: a debug build panics at `oops/mod.rs:57` ("mark tag: word
-   0x7 has MARK_TAG") from `memory::roots::for_each_root`'s own PROCESS
-   STACK scan (not `each_code_root`'s compiled-frame scan this time),
-   nested inside a scavenge triggered by a `prim_basic_new_colon`
-   allocation reached via `rt_interpret_call` (a compiled frame calling
-   into the interpreter). This is a genuinely different bug class from
-   roots 1-3 above (a real pointer/memory corruption, not a GC
-   liveness-tracking gap).
+   **Root cause 4 — FIXED (commit f62a1e4): it was TWO distinct
+   uninitialized-native-memory reads**, both localized in one session by
+   the write-time stack auditor (`MACVM_DBG_STACK_WRITES=1`, debug
+   builds — `interpreter/stack.rs`, committed in d65d1dd): every
+   process-stack write is validated AT WRITE TIME (mark-plausibility for
+   mem oops, plus a heuristic arm flagging "smis" in the code/stack
+   address band — dead native-frame `(pc, fp)` words have low bits 00 and
+   parse as smis, which is precisely how both bugs' garbage crossed the
+   whole VM unseen). The auditor turned each "where did this come from"
+   into a panic backtrace at the corrupting write, first shot both times.
+
+   **4a: the OSR entry block left omitted frame slots as native-stack
+   garbage.** The synthetic OSR entry branches PAST the normal entry
+   block's temp nil-init, so any slot the OsrMap omitted (a temp dead at
+   the loop header — `go`'s `b`, only used before the loops) held
+   leftover words from dead frames at the same SP depth; in the repro,
+   a derived string-body pointer (`tagged_string + 16`, element-1
+   address) from a dead `printString` frame — the dossier's original
+   "one word too low" decode, exactly. In-loop trap scopes still record
+   such temps' slots (`extra_oop_live`), and the same forcing puts them
+   in the oop maps GC scans. Fixed three ways (each layer's necessity
+   proven by a distinct failure): the OSR entry nil-fills EVERY spill
+   slot before its buffer copies; the OsrMap also packs dead-at-header
+   temps' TRUE interpreter values into their spill homes (nil was
+   GC-sound but a mid-loop deopt then resumed the interpreter with nil
+   for a temp it genuinely reads — caught by
+   `osr_frame_deopts_mid_loop_and_finishes_interpreted`); each so-packed
+   vreg's interval is widened method-wide so GC keeps the slot scanned
+   (sound — the slot is written on every entry path first, ctx_vreg's
+   own `deopt_live_widen` argument; the missing widening was caught by
+   the scavenge-exit verifier on this very repro).
+
+   **4b: every Rust-reaching stub spilled only x0..x5, but compiled sends
+   marshal receiver+args into x0..x7.** Richards' 7-arg task initializer
+   (`link:identity:priority:work:state:scheduler:data:`) through a c2i
+   adapter had args 6-7 read from PAST the 6-slot RootSpill area — the
+   stub frame's own saved fp/lr (byte-for-byte: `argv[6]=[x29]`=saved fp
+   → `scheduler` ivar held a stack address, `argv[7]=[x29+8]`=saved lr →
+   `handle` ivar held a code address), surfacing thousands of sends later
+   as `doesNotUnderstand: deviceInAdd:` on a "SmallInteger" (the ivar
+   dump of the DNU receiver's task object was the clincher). x6/x7 are
+   also C-ABI caller-saved, so every ≥6-arg send through resolve/mega/dnu
+   had its tail args clobbered by the Rust call regardless of c2i. Fixed:
+   `ROOTSPILL_SLOTS` 6 → 8 (x6/x7 spilled+reloaded in the shared stub
+   prologue/epilogue) + an eligibility cap declining methods containing
+   send sites with more than 7 real args (the register convention's
+   actual limit — such methods stay interpreted).
+
+   RESULT: this repro answers its interpreter value 577783 at
+   threshold=1; **Richards completes correctly under threshold=1 for the
+   first time ever** (23246/9297). The evidence below is retained as the
+   investigation record.
+
+   **NEWLY DOCUMENTED, STILL OPEN (pre-existing, stash-bisected against
+   the pre-fix tree — NOT from these fixes):**
+     - The mid-threshold silent wrong-answer band: Richards is wrong at
+       `threshold=100..20000` (and DeltaBlue at 1000 — very likely BUG
+       C's own mechanism) but correct interpreted, at t≤10, and at
+       t≥100000 (OSR-only compilation). The scheduler loop exits early
+       EXACTLY when invocation-triggered compilation lands mid-run (at
+       t=20000 it dies ~92% through, where `queuePacket:` crosses 20000
+       invocations) — a method compiled mid-run from warm poly feedback
+       immediately returns a wrong value. Runs after the first may
+       collapse further (counts like "2/1") or recover (t=20000's runs
+       2+ are correct once everything is compiled).
+     - The repro fails under `MACVM_GC_STRESS=1` + `threshold=1`
+       (`doesNotUnderstand: size`) while passing under
+       `MACVM_DEOPT_STRESS` — untriaged.
+
+   Original root-cause-4 crash shape (retained): a debug build panicked
+   at `oops/mod.rs:57` ("mark tag: word 0x7 has MARK_TAG") from
+   `memory::roots::for_each_root`'s PROCESS STACK scan, nested inside a
+   scavenge triggered by a `prim_basic_new_colon` allocation reached via
+   `rt_interpret_call`.
 
    Confirmed facts, strongest evidence first (the existing, already-wired
    `MACVM_DBG_ROOTS=1` audit — `scavenge::audit_roots`, a pre-scan sanity
