@@ -1,6 +1,16 @@
 # MACVM Debugger Design — HALT and PROBE
 
-**Status:** Design proposal (no code yet)
+**Status:** Design v2 — revised after a line-level substrate audit (2026-07-06);
+DBG0 implementation in progress. v2 changes: PROBE's walkback is a NEW
+raw-fp-seeded walker (the vanilla walker provably panics at any async
+mid-nmethod crash — §4.2); fault-hardening rules added (§4.5 — catch_unwind
+does not catch SIGSEGV); the "static state only" claim corrected to the
+x28-recovery design plus a dedicated non-destructive probe trampoline (§4.1);
+sigaltstack added; PIC/mega/adapter range accessors and non-panicking
+nearest-below pc lookups added to the build list (§1); a deopt/compile ring
+buffer and a fatal-DNU mini-dossier added to DBG0's scope (§4.2, §6); stale
+symbol references fixed (`resignal_fatal` → `restore_default_and_return`,
+"R3 compile service" → the frontend's existing doit path).
 **Prereqs read:** SPEC §5/§8.7/§16.3, APPS.md §3 (R1–R5) & §5.7, tracing_debugging.md,
 `src/runtime/{frames,deopt,vm_state}.rs`, `src/codecache/{deopt_trap,nmethod,flush}.rs`,
 `src/compiler/scopes.rs`, `src/interpreter/mod.rs`
@@ -67,8 +77,41 @@ is in the tree today and gets reused, not rebuilt:
 
 What does **not** exist and must be built: a breakpoint store, a step machine,
 the R5 primitives, SIGSEGV/SIGBUS handlers, a machine-code disassembler, a
-bci↔source map, and the two command loops. That's the whole build list; each
-is small because the substrate is not.
+bci↔source map, and the two command loops. The substrate audit added six more
+items the original list missed, all small but all load-bearing for DBG0:
+
+- **A raw-`(fp, pc)`-seeded native walker.** `walk_frames` starts from
+  `tier_links.last()` + the anchor, and the anchor is CLEARED by
+  `emit_stub_epilogue` on every stub exit — so at an async crash inside an
+  nmethod's own code it panics immediately at `assert_ne!("no anchor is
+  set")` (frames.rs:347). The loop PROBE needs exists as the private
+  `Mode::NativeStep`; a public, validated-read variant seeded from the
+  captured ucontext `__fp`/`__pc` must be added to frames.rs.
+- **Non-panicking nearest-below pc lookups.** Every existing pc→metadata API
+  is exact-match and panic-on-miss (`PcDesc::find_in`, `DeoptState::at`,
+  `oopmap_at`), and a crash pc is generically *between* safepoints. The
+  dossier does its own `partition_point` searches over the `pub` fields
+  (`deopt_pcdescs`, `pcdescs`, `oopmaps`). (Beware: there are TWO `PcDesc`
+  types — `codecache::nmethod`'s S12 oopmap descs and `compiler::scopes`'
+  S13 deopt descs — and two `FrameView` types, the `runtime::frames` enum
+  and the `runtime::deopt` struct.)
+- **`contains_pc` accessors on PicTable/MegaTable/AdapterTable.** Their
+  `CodeHandle`s live in private HashMaps with no iteration or containment
+  API; branch veneers (`patch_branch26`) are recorded nowhere, so the
+  verdict line needs an honest "in-cache, unnamed (possibly a veneer)"
+  class.
+- **A `sigaltstack`.** `SA_ONSTACK` is set on the SIGTRAP sigaction but no
+  alternate stack is ever installed anywhere in src/ — a SIGSEGV from
+  native-stack exhaustion cannot deliver to a handler without one.
+- **An in-handler register capture buffer.** The SIGTRAP handler copies
+  nothing today; the dossier's register view requires the whole
+  `__ss` GPR file plus `__es.__far` (the fault address — currently read by
+  nothing in the tree) copied to a static buffer before sigreturn.
+- **A deopt/compile event ring buffer** (§4.2 step 9). The dossier shows the
+  frozen instant; BUG-D-class triage needs the recent *history* — the deopt
+  trace tail immediately before the failure is what localized nm 128. A
+  small fixed ring fed from the existing `note_deopt`/compile/invalidate
+  points, dumped as a dossier step.
 
 ---
 
@@ -96,17 +139,31 @@ pub struct DebugState {
 already chose side tables over self-modifying bytecode for ICs (SPEC §4.3);
 breakpoints make the same choice for the same reasons: methods stay pure,
 golden disassembly stays byte-identical, and no W^X/flush question exists at
-tier 0. The per-bytecode cost is gated behind `debug.active` plus a new
-method-flags bit `METHOD_FLAGS_HAS_BP` (set on any method carrying at least
-one breakpoint), so the hash lookup runs only inside methods that actually
-have breakpoints:
+tier 0. Two rules the map must obey (v2): **`DebugState` holds no oops** — it
+is not a GC root, which is exactly why the key is the identity hash and the
+`Breakpoint` value carries no `MethodOop` (if that ever changes, `DebugState`
+joins `roots.rs`'s one-list, not a private remap pass). And identity hashes
+can collide: on a hash-lookup hit, confirm via the stored (holder-name,
+selector-name) string pair before halting — a false halt on an astronomically
+unlikely collision would be a confounding debugging experience precisely for
+someone already debugging. Setting a breakpoint also validates `bci` against
+the method's decode boundaries (a mid-instruction bci is a caller bug,
+rejected at set time, not a silent never-hit).
+
+The per-bytecode cost is gated behind `debug.active` plus a new method-flags
+bit `METHOD_FLAGS_HAS_BP` (set on any method carrying at least one
+breakpoint), so the hash lookup runs only inside methods that actually have
+breakpoints. All checks — including the step check — fold under the ONE
+master branch, so the claim below stays literally true:
 
 ```rust
 // dispatch_from, alongside the existing trace checks (interpreter/mod.rs:378)
-if vm.debug.active && method.has_bp() {
-    if let Some(bp) = vm.debug.hit(method, bci) { debug::on_breakpoint(vm, bp); }
+if vm.debug.active {
+    if method.has_bp() {
+        if let Some(bp) = vm.debug.hit(method, bci) { debug::on_breakpoint(vm, bp); }
+    }
+    if vm.debug.step.is_some() { debug::step_check(vm, method, bci); }
 }
-if vm.debug.step.is_some() { debug::step_check(vm, method, bci); }
 ```
 
 `debug.active` is false in every non-debugging run, so the entire feature
@@ -124,11 +181,14 @@ already spend. No opcode is consumed (the 0x44+ space stays free), and
    while the breakpoint lives. Record whether the bit was previously clear so
    `clear_breakpoint` can restore it.
 3. For every **existing** nmethod whose root or *inlined* scopes include this
-   method (walk `CodeTable::iter_alive` + each nmethod's scope chain — the
-   deps machinery already knows how to find inliners, §8.6):
-   `make_not_entrant_lazy` (`flush.rs:77`). Entry points get the deopt-stub
-   patch; live activations convert through the **existing** return-path
-   redirect / back-edge poll. No new deopt mode, no mid-stack frame surgery.
+   method: reuse the S13 REDEFINITION invalidation path (the
+   `DependencyIndex` query + `make_not_entrant_lazy`, `flush.rs:77`) rather
+   than a hand-rolled scope walk — it already finds inliners AND handles the
+   super-send edge cases (S13 10d). Setting a breakpoint is, invalidation-
+   wise, indistinguishable from redefining the method. Entry points get the
+   deopt-stub patch; live activations convert through the **existing**
+   return-path redirect / back-edge poll. No new deopt mode, no mid-stack
+   frame surgery.
 4. Reset the method's invocation counters so the tier-up bookkeeping doesn't
    fire pointlessly.
 
@@ -188,7 +248,9 @@ The command loop has two frontends, one protocol:
 - **CLI v1**: a `(halt) ` REPL on stdin/stderr inside `debug::halt` —
   `bt`, `frame N`, `temps`, `step`, `next`, `finish`, `continue`, `disasm`,
   `print <expr>`. Ships first; needs nothing from Phase W/E. `print` runs a
-  doit via the R3 compile service against the selected frame's receiver.
+  doit via the frontend's EXISTING doit-compilation path (the same one the
+  REPL uses today) against the selected frame's receiver — R3 is the future
+  name for that surface, not a prerequisite.
 - **GUI/W-debugger**: when a `GuiHost` is attached, `debug::halt` instead
   emits a `DebugEvent::Halted` over the existing VM→GUI channel and services
   the existing GUI→VM request channel — mirror queries against the halted
@@ -303,18 +365,47 @@ itself among the suspects.
 
 | Trigger | Path today | PROBE change |
 |---|---|---|
-| `brk #0xDE02` (compiled-code assert) | SIGTRAP handler → `resignal_fatal` → process dies (`deopt_trap.rs:362`) | → enter PROBE instead of dying |
-| SIGSEGV/SIGBUS with pc in a registered code-cache range | **no handler — raw crash** | new handlers, same trampoline-escape pattern as SIGTRAP (`deopt_trap.rs:293`: rewrite `__pc` to a probe trampoline, all real work after sigreturn) |
-| `brk #0xDE10..0xDE1F` — **new: low-level breakpoint namespace** | (unallocated) | → enter PROBE interactively |
+| `brk #0xDE02` (compiled-code assert) | SIGTRAP handler → assert stub → `rt_compiled_assert_failed` panics (`deopt_trap.rs:685`) | handler additionally captures the register file; `rt_compiled_assert_failed` emits the dossier and exits 70 instead of panicking |
+| SIGSEGV/SIGBUS with pc in a registered code-cache range | **no handler — raw crash** | new handlers, same escape pattern as SIGTRAP: capture regs+`__far` to a static buffer, rewrite `__pc` to a **dedicated probe trampoline**, all real work after sigreturn |
+| `brk #0xDE10..0xDE1F` — **new: low-level breakpoint namespace** | (unallocated) | → enter PROBE interactively (DBG3) |
 | `probe` CLI command / `MACVM_PROBE=break:<sel>[:bci]` | — | plant a low-level breakpoint (§4.3) |
-| SIGSEGV/SIGBUS with pc *outside* any code cache | raw crash | unchanged — a Rust bug is rustc's/lldb's jurisdiction, not PROBE's. PROBE still prints the one-line "pc not in any registered code cache" verdict before re-raising, because *that classification itself* is the first question of every crash triage |
+| SIGSEGV/SIGBUS with pc *outside* any code cache | raw crash | one-line verdict via raw `write(2)` (async-signal-safe: no allocation, no formatting machinery, hand-rolled hex into a stack buffer), then restore `SIG_DFL` and return so re-execution dies with the original signal — a Rust bug stays rustc's/lldb's jurisdiction, but *the classification itself* is the first question of every crash triage |
+| **fatal guest error** (DNU / `error:` without `debug.active`) | prints a 2-line trace, exits 1 | additionally emits the dossier's cheap steps (walkback, reg-block/tier-links state, ring buffer, heap verify) before exiting — no signal machinery involved; the interpreter state is coherent, so the vanilla walker works here. This is the mini-dossier the `deviceInAdd:` hunt needed |
 
-The signal-side additions follow `deopt_trap.rs`'s discipline exactly: the
-handler reads only the pre-registered atomic registry (`deopt_trap.rs:100-134`),
-never allocates or locks, and escapes to Rust via a ucontext `__pc` rewrite.
-The captured `ucontext_t` (all GPRs, sp, fp, lr, faulting pc, and for
-SEGV/BUS the fault address) is copied to a static buffer before sigreturn —
-it *is* the register view PROBE displays.
+The signal-side additions live INSIDE `deopt_trap.rs` (its charter: the
+"single unsafe island for signal/ucontext work" — the hand-laid Darwin
+ucontext mirrors are module-private and must not be duplicated). The handler
+reads only the pre-registered atomic registry, never allocates or locks, and
+escapes to Rust via a ucontext `__pc` rewrite. The captured register file
+(all GPRs, sp, fp, lr, faulting pc, and for SEGV/BUS the fault address from
+`__es.__far`) is copied to a static buffer before sigreturn — it *is* the
+register view PROBE displays.
+
+Three v2 corrections to the original design, all load-bearing:
+
+- **A dedicated, non-destructive probe trampoline.** The existing uncommon
+  trampoline is DESTRUCTIVE — it builds a walker-visible frame record and
+  tears down the trapped frame on the way out. PROBE's trampoline must touch
+  neither the trapped fp nor its frame: it only aligns sp defensively,
+  marshals `x0 = x28` (&VmState) and the trap pc, and calls a `-> !` Rust
+  entry. Registered as a fifth per-cache slot alongside the existing
+  `(lo, hi, tramp, assert)` registry columns.
+- **VmState recovery is via x28, and that is a *convention*, not a fact.**
+  The dossier needs `CodeTable`/scopes/stubs — all VmState-resident; the
+  static registry cannot carry them. x28 is trustworthy exactly when the
+  faulting pc is inside a registered code range (the call stub establishes
+  the invariant) — which is the same gate that decides "ours" vs "foreign."
+  Foreign faults get the verdict-only path precisely because their x28 is
+  arbitrary.
+- **A reentrancy guard, because the dossier itself can fault.**
+  `catch_unwind` does not catch SIGSEGV. If a second fault arrives while a
+  dossier is in progress, the handler restores `SIG_DFL` and lets the
+  process die — and the dossier is flushed per-step (unbuffered stderr
+  writes), so whatever was produced before the recursive fault survives.
+  Arming decision (v2): the handlers arm in `deopt_trap::install()` — i.e.
+  for JIT-enabled runs. Interpreter-only runs have no code cache, so every
+  fault there is foreign-by-definition and the verdict line is all PROBE
+  could offer; revisit if that ever proves worth a standalone arming path.
 
 ### 4.2 The frozen-frame report (post-mortem mode)
 
@@ -341,14 +432,30 @@ days, this automates hour one):
    mismatched line here is a BUG-D-class root cause caught red-handed.
 5. **Disassembly window** — ±16 instructions around pc, faulting instruction
    marked (§4.4).
-6. **Walkback** — `walk_frames` output *if it survives*: the walker panics on
-   corrupt tier links by design (`frames.rs:187`), so PROBE runs it under
-   `catch_unwind` and reports "walk died at step N: <panic msg>" as a
-   finding, not a failure. A corrupt walk *is* evidence.
-7. **Heap spot-checks** — `verify.rs` heap verify under `catch_unwind`, same
-   posture.
-8. Machine-readable copy (`MACVM_PROBE_DUMP=<path>`, JSON) for regression
-   harnesses; human copy to stderr.
+6. **Walkback** — NOT the vanilla `walk_frames` (v2): at an async crash pc
+   the anchor is always clear and the vanilla walker panics at step 0 ("no
+   anchor is set"). PROBE walks from the captured `__fp`/`__pc` via the new
+   raw-seeded native walker (§1's build list): classify each pc itself
+   (nmethod / stub / PIC / mega / adapter / unnamed-in-cache), validate every
+   fp against the thread-stack bounds BEFORE dereferencing (a fault here is
+   not catchable — see §4.5 rule 4), translate deopt-redirected return
+   addresses through `pending_deopts`, cap the step count. Each emitted frame
+   line flushes before the next step, so a walk that dies mid-way still
+   leaves its prefix — "walk died at step N" is a finding, not a failure.
+7. **Heap spot-checks** — `verify.rs` heap verify under
+   `catch_unwind(AssertUnwindSafe(..))` (the `rt_alloc_slow` test-hook
+   pattern), same reported-not-fatal posture.
+8. Machine-readable copy (`MACVM_PROBE_DUMP=<path>`, JSON — hand-rolled
+   escaper, zero-dep house style; schema pinned with a `"schema": 1` field
+   from day one) for regression harnesses; human copy to stderr. The human
+   dossier opens with a distinctive marker line (`==== MACVM PROBE DOSSIER
+   v1 ====`) because exit(70) is shared with heap/stack exhaustion — gate
+   tests assert the marker, never the bare exit code.
+9. **Recent history** — the deopt/compile ring buffer (§1 build list): the
+   last N compile / deopt / invalidation events (nmethod id, bci, reason),
+   newest last. The frozen instant tells you *where*; the ring tells you
+   *what just happened* — on BUG D it was the deopt tail immediately before
+   the failure that localized the culprit nmethod.
 
 Then: if stdin is a tty and `MACVM_PROBE=interactive`, drop into the
 `(probe) ` REPL — commands: `regs`, `dis [addr|sym]`, `x/<n>g <addr>`
@@ -411,11 +518,27 @@ infrastructure is sitting right there) make it trustworthy fast.
   compiled frame untouched. If the *user* wants the interpreter view of the
   same halt point, that's HALT's job (plant a high-level breakpoint and
   re-run) — the two-level split is precisely so PROBE never has to.
-- **No allocation before the dossier's step 6.** Steps 1–5 read only
-  pre-registered/static state, so a corrupted-heap crash still yields a
-  useful report.
+- **No allocation before the dossier's step 6** — amended (v2): steps 1–5
+  necessarily read VmState-resident metadata (CodeTable, scopes, pools —
+  reached via x28, §4.1), but they allocate at most transient formatting
+  strings and NEVER touch the Smalltalk heap allocator; heap-DEPENDENT reads
+  (selector names, pool oops) are tag-checked and best-effort, with the raw
+  numeric verdict (nmethod id/version/offsets) printed FIRST so a corrupt
+  heap still yields the essential report.
 - **No Smalltalk evaluation.** A doit runs the interpreter runs the heap —
   everything PROBE must not trust.
+- **No unguarded dereference of captured state, ever** (v2 — the rule
+  findings 6/7's `catch_unwind` posture does NOT give you): `catch_unwind`
+  catches panics, not faults. Every raw pointer derived from the crash
+  context (fp chains, frame slots, oop-looking register values) is
+  range-validated first — heap-layout containment for oop candidates,
+  thread-stack bounds for frame pointers, code-cache bounds for pcs — and
+  the reentrancy guard (§4.1) is the backstop when validation itself is
+  wrong: second fault → SIG_DFL → die, keeping the partial, per-step-flushed
+  dossier.
+- **`resume` is never offered after a caught walk/verify panic** — the
+  `AssertUnwindSafe` wrappers are sound only because every post-catch path
+  terminates the process.
 
 ---
 
@@ -437,10 +560,17 @@ infrastructure is sitting right there) make it trustworthy fast.
 Ordered by value-per-effort, honestly small steps — each lands testable:
 
 - **DBG0 — PROBE dossier** (no interactivity): SIGSEGV/SIGBUS handlers +
-  crash report steps 1–4 + 6–8. *Highest value first: this is the tool BUG D
-  needed.* No disassembler yet (step 5 says "disasm not built").
-  Gate: a `--selftest-probe-*` flag family (crash a planted `brk 0xDE02`,
-  assert exact dossier shape) — the existing selftest pattern.
+  sigaltstack + register-capture buffer + probe trampoline + crash report
+  steps 1–4 + 6–9 (incl. the ring buffer and the raw-fp walker) + the
+  fatal-DNU mini-dossier + the 0xDE02 reroute. *Highest value first: this is
+  the tool BUG D needed.* No disassembler yet (step 5 says "disasm not
+  built"). Gate: a `--selftest-probe-*` flag family (planted `brk 0xDE02`,
+  planted in-cache SIGSEGV, foreign-crash verdict; assert the dossier
+  marker + schema + section presence — never the bare exit code, which is
+  shared with heap/stack exhaustion) — the existing selftest pattern. First
+  REAL customer: the open `MACVM_GC_STRESS=1` + `threshold=1` repro failure
+  (tests/repros/README.md) — DBG0 is validated against it before it's called
+  done.
 - **DBG1 — HALT core**: `DebugState`, dispatch hook, `set_breakpoint`
   pinning (§2.1), CLI loop, backtrace/inspection over interpreter frames,
   stepping. Gate: scripted debugger session goldens (commands in, transcript
