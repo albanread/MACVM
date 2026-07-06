@@ -221,6 +221,26 @@ ports; the benchmarks' own 4-mode gates stay red until these are fixed):
        `doesNotUnderstand: size`, dossier heap verify OK (wrong-value
        family, NOT heap corruption; 14 tier_links deep, DeoptBridge
        adapters interleaved). Passes without GC stress (577783).
+       UNCHANGED by feb0f56/fe27eff (2026-07-06): `MACVM_TRACE=deopt`
+       shows every one of this repro's deopts is Trap-reason
+       (`by_reason=[trap N, return 0, poll 0]` throughout) — the
+       trap-door anchor was already fixed by feb0f56, so this isn't a
+       second instance of the same hole. The receiver of `#size` at
+       the DNU is confirmed (via `(halt) frame #0`) to be `a
+       WriteStream` itself — `WriteStream>>nextPut:`'s `push_instvar
+       0` (`collection`) is answering `self` instead of the real
+       Array/String, i.e. the ACTUAL heap object's ivar-0 slot holds a
+       wrong-but-VALID oop (passes `MACVM_DBG_STACK_WRITES`'
+       mark-plausibility check, since `self` is itself a perfectly
+       real live object — this is a value-substitution bug, not a
+       garbage-pointer one, so the write-time auditor built for BUG D
+       root cause 4 cannot catch it). Narrows the search to: did
+       `WriteStream>>setOn:`/`grow`'s compiled `StoreField` write the
+       wrong source register, or did a scavenge mid-`deoptimize_frame`
+       fail to relocate/re-root the receiver correctly before a LATER
+       virtual frame's `read_value` (or the interpreter's own
+       subsequent `push_instvar`) read it back stale. Not yet
+       localized further.
      - deltablue at `threshold=100` — **FIXED (the deopt-trampoline
        anchor fix, task #92, same commit as this note).** Both deopt
        trampolines (`build_uncommon_trampoline`,
@@ -250,9 +270,14 @@ ports; the benchmarks' own 4-mode gates stay red until these are fixed):
        nondeterministic mix of a host panic (`store_instvar_pop:
        receiver is not a mem oop`, interpreter/mod.rs) and a guest
        error (`large division unimplemented` at `SmallInteger>>// @27`)
-       under the same nm=218/nm=279 bci=21 reexecute churn. Likely
+       under the same nm=218/nm=279 bci=21 reexecute churn. Also
+       Trap-reason throughout (`poll 0` even here — Richards' loops
+       apparently never take a live loop-poll deopt under this
+       harness, so `fe27eff`'s rt_poll anchor fix — real, but for a
+       DIFFERENT door — doesn't touch this signature either). Likely
        shares the GC-stress item's mechanism (a value corrupted across
-       the deopt/reexecute path).
+       the deopt/reexecute path) — see item 4's `WriteStream`
+       ivar-substitution finding, the closest lead so far.
 
    Original root-cause-4 crash shape (retained): a debug build panicked
    at `oops/mod.rs:57` ("mark tag: word 0x7 has MARK_TAG") from
