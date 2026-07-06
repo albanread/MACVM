@@ -37,7 +37,7 @@
 #![cfg(target_os = "macos")]
 
 use std::collections::HashMap;
-use std::ffi::c_void;
+use std::ffi::{c_char, c_void, CString};
 use std::ptr;
 
 use anyhow::{bail, Context, Result};
@@ -63,6 +63,15 @@ extern "C" {
     /// `<pthread.h>` — per-thread W^X toggle for `MAP_JIT` pages. `1` =
     /// write-protected (executable), `0` = writable (non-executable).
     fn pthread_jit_write_protect_np(enabled: i32);
+    // MACVM (S20 FFI, docs/FFI.md §5): `<dlfcn.h>` — the actual dlsym-based
+    // resolution this file's own module doc (line 30) already documented as
+    // the mechanism for far/host targets, but never implemented. Distinct
+    // concern from `MacJit::externs`/`define_extern` above (those resolve a
+    // symbolic relocation INSIDE a JIT-compiled module at publish time); this
+    // resolves a plain runtime address ONCE, handed to an FFI trampoline as a
+    // call target — no relocation record involved at all.
+    fn dlopen(path: *const c_char, mode: i32) -> *mut c_void;
+    fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
 }
 
 const PROT_READ: i32 = 0x1;
@@ -277,6 +286,49 @@ pub fn icache_invalidate(start: *const u8, len: usize) {
     unsafe { sys_icache_invalidate(start as *mut c_void, len) }
 }
 
+/// `<dlfcn.h>`'s pseudo-handle: search every already-loaded image in address
+/// order (skipping the caller's own — irrelevant here, this binary defines no
+/// symbol an FFI call would ever want) instead of one specific library. Every
+/// libc/libSystem symbol (S20 Tier 1 — `mmap`, `open`, …) is reachable this
+/// way with no explicit `dlopen` at all, since libSystem is linked into every
+/// macOS process unconditionally.
+const RTLD_DEFAULT: *mut c_void = -2isize as *mut c_void;
+const RTLD_NOW: i32 = 0x2;
+const RTLD_GLOBAL: i32 = 0x8;
+
+/// S20 FFI (docs/FFI.md §5): resolve one native symbol to its absolute
+/// runtime address — `dlopen(lib, RTLD_NOW|RTLD_GLOBAL)` (or `RTLD_DEFAULT`
+/// when `lib` is `None`) then `dlsym`. `None` covers Tier 1 (POSIX/libc,
+/// always linked); Tier 2 (Cocoa) passes an explicit path — e.g.
+/// `"/usr/lib/libobjc.A.dylib"` for `objc_msgSend`, since this binary links
+/// no Objective-C runtime by default (unlike `gui/`'s own separate
+/// `dlopen`-based Cocoa bridge, which this deliberately does not share —
+/// distinct concerns, distinct call sites, per docs/FFI.md §5's own note).
+/// `dlopen` on an already-open path is cheap (the dynamic linker refcounts
+/// and returns the same handle) — no cache needed at this layer; callers
+/// (the FFI primitive, once-per-method-first-call) own their own resolved-
+/// address cache, mirroring `AdapterTable`'s own per-method-oop cache.
+pub fn dlsym_resolve(lib: Option<&str>, symbol: &str) -> Option<u64> {
+    let handle = match lib {
+        Some(path) => {
+            let c_path = CString::new(path).ok()?;
+            let h = unsafe { dlopen(c_path.as_ptr(), RTLD_NOW | RTLD_GLOBAL) };
+            if h.is_null() {
+                return None;
+            }
+            h
+        }
+        None => RTLD_DEFAULT,
+    };
+    let c_sym = CString::new(symbol).ok()?;
+    let addr = unsafe { dlsym(handle, c_sym.as_ptr()) };
+    if addr.is_null() {
+        None
+    } else {
+        Some(addr as u64)
+    }
+}
+
 impl Default for MacJit {
     fn default() -> Self {
         Self::new()
@@ -398,4 +450,54 @@ ret
 
     // abs_veneer's own encoding is covered by relocpatch::tests::abs_veneer_encoding
     // now that the implementation lives there.
+
+    // S20 FFI (docs/FFI.md §5): `dlsym_resolve` unit tests.
+
+    /// `RTLD_DEFAULT`, no explicit library: a libSystem symbol (linked into
+    /// every macOS process unconditionally, this test binary included) must
+    /// resolve to a real, non-null, and CALLABLE address — not just any
+    /// nonzero bit pattern. `getpid` (zero args, real return value) is the
+    /// simplest possible round-trip proof: resolve, call through raw
+    /// `transmute`, cross-check against the real syscall so this isn't
+    /// asserting against a coincidental garbage address.
+    #[test]
+    fn dlsym_resolve_finds_libc_symbol_and_it_is_callable() {
+        extern "C" {
+            fn getpid() -> i32;
+        }
+        let addr = dlsym_resolve(None, "getpid").expect("getpid must resolve via RTLD_DEFAULT");
+        assert_ne!(addr, 0);
+        let f: extern "C" fn() -> i32 = unsafe { std::mem::transmute(addr) };
+        let want = unsafe { getpid() };
+        assert_eq!(f(), want, "resolved getpid() must match the real syscall");
+    }
+
+    /// A symbol that plainly does not exist anywhere in the process image
+    /// must resolve to `None`, not a null-but-`Some` address or a panic —
+    /// this is the "target not found" arm S20 step 4's dispatch primitive
+    /// needs to turn into a graceful Smalltalk-level failure, not a VM abort.
+    #[test]
+    fn dlsym_resolve_unknown_symbol_is_none() {
+        assert!(dlsym_resolve(None, "this_symbol_does_not_exist_anywhere_macvm_ffi").is_none());
+    }
+
+    /// Explicit-library form (the Tier 2 / Cocoa door, `docs/FFI.md` §5):
+    /// `libobjc.A.dylib` is not linked into this binary by default, so this
+    /// specifically exercises the `dlopen(path, …)` arm, not `RTLD_DEFAULT`.
+    /// `objc_msgSend` is the one symbol every Cocoa dispatch path ultimately
+    /// needs — resolving it here is the exact operation Tier 2 will perform
+    /// once per process, cached.
+    #[test]
+    fn dlsym_resolve_explicit_library_finds_objc_msgsend() {
+        let addr = dlsym_resolve(Some("/usr/lib/libobjc.A.dylib"), "objc_msgSend")
+            .expect("objc_msgSend must resolve via an explicit dlopen of libobjc");
+        assert_ne!(addr, 0);
+    }
+
+    /// A library path that doesn't exist must fail the resolve, not panic —
+    /// `dlopen` returning null is exactly the `.is_null()` early-return arm.
+    #[test]
+    fn dlsym_resolve_missing_library_is_none() {
+        assert!(dlsym_resolve(Some("/no/such/library/anywhere.dylib"), "whatever").is_none());
+    }
 }
