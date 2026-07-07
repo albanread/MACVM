@@ -837,6 +837,31 @@ fn build_help_delegate() -> Id {
     objc::alloc_init("MacvmHelpDelegate")
 }
 
+/// The VM menu's "Restart VM Thread" action — kills the current language
+/// thread and boots a fresh VM (`vm_host::VmHost::restart`). Runs on the main
+/// thread, which is independent of the (possibly wedged) worker thread, so
+/// this stays clickable even when a runaway doit has hung the VM — the whole
+/// reason they're on separate threads.
+extern "C" fn restart_vm_thread(_this: Id, _cmd: Sel, _sender: Id) {
+    if let Some(vm) = VM.get() {
+        vm.restart();
+    }
+}
+
+/// Target object for the VM menu's item — same not-stored-long-term
+/// reasoning as `build_theme_delegate`.
+fn build_vm_delegate() -> Id {
+    let cls = objc::allocate_class(objc::get_class("NSObject"), "MacvmVmDelegate");
+    objc::add_method(
+        cls,
+        sel("restartVmThread:"),
+        restart_vm_thread as *const _,
+        "v@:@",
+    );
+    objc::register_class(cls);
+    objc::alloc_init("MacvmVmDelegate")
+}
+
 extern "C" fn app_should_terminate_after_last_window_closed(
     _this: Id,
     _cmd: Sel,
@@ -1059,6 +1084,14 @@ fn build_menu_bar() {
             menu_item("Select All", Some("selectAll:"), "a"),
         ],
     );
+    // The VM menu: kill + restart the language thread. Cmd+R is free (no
+    // other menu binds it) and this action is a recovery hatch for a wedged
+    // VM, so a shortcut earns its keep.
+    let vm_delegate = build_vm_delegate();
+    let restart_item = menu_item("Restart VM Thread", Some("restartVmThread:"), "r");
+    objc::send1_id(restart_item, sel("setTarget:"), vm_delegate);
+    let vm_menu = submenu("VM", &[restart_item]);
+
     let theme_menu = build_theme_menu();
     let help_delegate = build_help_delegate();
     let help_item = menu_item("MACVM GUI Shell Help", Some("openMacvmHelp:"), "");
@@ -1066,7 +1099,9 @@ fn build_menu_bar() {
     let help_menu = submenu("Help", &[help_item]);
 
     let main_menu = objc::alloc_init("NSMenu");
-    for &item in &[app_menu, file_menu, edit_menu, theme_menu, help_menu] {
+    for &item in &[
+        app_menu, file_menu, edit_menu, vm_menu, theme_menu, help_menu,
+    ] {
         objc::send1_id(main_menu, sel("addItem:"), item);
     }
     objc::send1_id(app, sel("setMainMenu:"), main_menu);

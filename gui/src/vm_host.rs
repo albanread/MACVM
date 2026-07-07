@@ -358,7 +358,7 @@ impl VmHost {
             .pending_since
             .is_some_and(|t| t.elapsed() > inner.timeout)
         {
-            respawn(&mut inner);
+            respawn(&mut inner, RESPAWN_NOTICE_TIMEOUT);
         }
         let request = match inner.requests.send(request) {
             Ok(()) => {
@@ -372,9 +372,26 @@ impl VmHost {
         // the channel immediately (unlike a `pthread_exit` death, which
         // disconnects nothing at all). Respawn now and deliver this
         // request to the fresh worker instead of dropping it.
-        respawn(&mut inner);
+        respawn(&mut inner, RESPAWN_NOTICE_TIMEOUT);
         let _ = inner.requests.send(request);
         inner.pending_since = Some(Instant::now());
+    }
+
+    /// Kill the current language-thread worker and start a fresh one (a new
+    /// VM booted from the image, new channels, new OS thread) — the "Restart
+    /// VM Thread" menu item (`main.rs`). Safe to invoke at any time: if the
+    /// worker is wedged in a runaway loop, it can't be force-killed (a Rust
+    /// thread has no safe async kill), but it is abandoned and disconnected,
+    /// and the fresh worker takes over immediately. Wakes the main thread so
+    /// the "restarted" transcript notice shows right away rather than waiting
+    /// for the next response.
+    pub fn restart(&self) {
+        let wake = {
+            let mut inner = self.inner.lock().unwrap();
+            respawn(&mut inner, "--- VM thread restarted ---");
+            inner.wake
+        };
+        wake.notify();
     }
 
     /// Drain whatever responses have arrived since the last call. Called
@@ -426,18 +443,22 @@ fn spawn_worker(wake: CrossThreadObjcRef, world_dir: std::path::PathBuf) -> Work
 
 /// Replaces `inner`'s worker with a brand new one (fresh channels, fresh
 /// `VmHandle`, on a fresh OS thread) and drops the stale `JoinHandle` (safe
-/// — never joined). Queues a transcript notice on the FRESH channel so the
-/// user sees why their workspace just "came back."
-fn respawn(inner: &mut HostInner) {
+/// — never joined). `notice` is queued on the FRESH channel so the user sees
+/// in the transcript why their workspace just "came back." The old worker,
+/// if idle, exits when its request channel is dropped here; if it's
+/// mid-computation (a runaway loop) it is simply abandoned — disconnected,
+/// its output ignored — and the fresh worker serves everything from now on.
+fn respawn(inner: &mut HostInner, notice: &str) {
     let w = spawn_worker(inner.wake, inner.world_dir.clone());
-    let _ = w.notices.send(VmResponse::Transcript(
-        "--- the language thread stopped responding; a fresh one has been started ---".to_string(),
-    ));
+    let _ = w.notices.send(VmResponse::Transcript(notice.to_string()));
     inner.requests = w.requests;
     inner.responses = w.responses;
     inner.worker = w.worker;
     inner.pending_since = None;
 }
+
+const RESPAWN_NOTICE_TIMEOUT: &str =
+    "--- the language thread stopped responding; a fresh one has been started ---";
 
 /// Spawn the VM worker thread and wire it to wake `main_thread_target` (via
 /// `drain_selector`) on the main thread whenever a response is ready.
@@ -2019,5 +2040,52 @@ mod tests {
         assert_eq!(img2.all_classes().unwrap().len(), n);
         drop(img2);
         std::fs::remove_file(&tmp).ok();
+    }
+
+    /// The "Restart VM Thread" menu action (`VmHost::restart`) swaps in a
+    /// fresh worker + VM that serves the next request, and posts a
+    /// "restarted" notice. A generous timeout so the timeout-respawn path
+    /// can't fire — this tests the EXPLICIT restart, not death detection.
+    #[test]
+    fn restart_swaps_in_a_fresh_worker_that_still_serves() {
+        let tmp_dir = std::env::temp_dir().join(format!("macvm_restart_{}", std::process::id()));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        {
+            let img = image_store::Image::open(&tmp_dir.join("image.sqlite3")).unwrap();
+            image_store::import::import_world_dir(&img, &test_world_dir()).unwrap();
+        }
+        let host = spawn_with_world_and_timeout(
+            objc::NIL,
+            objc::NIL,
+            tmp_dir.clone(),
+            Duration::from_secs(30),
+        );
+
+        // The original worker serves a request.
+        host.submit(VmRequest::Doit {
+            code: "3 + 4.".to_string(),
+        });
+        let seen = poll_until(&host, |rs| transcript_containing(rs, "3 + 4"));
+        assert!(
+            transcript_containing(&seen, "3 + 4"),
+            "original served: {seen:?}"
+        );
+
+        // Explicit restart → fresh worker + "restarted" notice serving next.
+        host.restart();
+        host.submit(VmRequest::Doit {
+            code: "6 * 7.".to_string(),
+        });
+        let seen = poll_until(&host, |rs| transcript_containing(rs, "6 * 7"));
+        assert!(
+            transcript_containing(&seen, "VM thread restarted"),
+            "the restart notice must appear: {seen:?}"
+        );
+        assert!(
+            transcript_containing(&seen, "6 * 7"),
+            "the fresh worker must serve the next request: {seen:?}"
+        );
+
+        std::fs::remove_dir_all(&tmp_dir).ok();
     }
 }
