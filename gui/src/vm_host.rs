@@ -1623,6 +1623,36 @@ mod tests {
         assert_eq!(text, " 7");
     }
 
+    /// Regression for "the workspace evaluates nothing": the default
+    /// placeholder buffer must be a leading comment FOLLOWED BY a runnable
+    /// statement, so Do it / Print it on the untouched buffer (nothing
+    /// selected → the whole buffer is the eval target) produce a real
+    /// result. The old placeholder was pure comment, which parses to no
+    /// statement and answers empty — indistinguishable from "nothing
+    /// happened".
+    #[test]
+    fn the_default_workspace_placeholder_prints_a_real_result() {
+        let mut world = MockWorld::seed();
+        let mut selection = BrowserSelection::default();
+        let mut vm = test_vm_handle(macvm::runtime::JitMode::Off);
+        let responses = handle(
+            VmRequest::WorkspacePrintIt {
+                code: crate::workspace_render::initial_text().to_string(),
+            },
+            &mut world,
+            &mut selection,
+            None,
+            &mut vm,
+        );
+        let [VmResponse::WorkspacePrintResult { text }] = responses.as_slice() else {
+            panic!("expected exactly one WorkspacePrintResult, got {responses:?}");
+        };
+        assert_eq!(
+            text, " 7",
+            "the untouched workspace buffer must Print it to a real 7, not empty"
+        );
+    }
+
     /// "the JIT MUST be supported" (the S21 directive) — end-to-end through
     /// the GUI's own request path, not just the embedding layer's unit test.
     /// `Threshold(1)` compiles on the first call.

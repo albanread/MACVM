@@ -20,14 +20,14 @@
 
 use crate::browser_render::escape;
 
-/// A short, honest starting comment rather than a truly blank buffer —
-/// "obviously we can't actually run it yet" (this is a stub-VM tool), so
-/// says so up front instead of leaving a first-time user wondering why
-/// Do it/Print it don't do anything interesting.
+/// A short starting comment rather than a truly blank buffer, orienting a
+/// first-time user: Do it/Print it evaluate real Smalltalk through the
+/// embedded VM (`vm_host`'s worker thread runs `VmHandle::eval`, SPEC
+/// §16.2), so the buffer includes a live example to try.
 const PLACEHOLDER_TEXT: &str = "\"Type Smalltalk here.\n\
 Do it runs the selection (or everything, if nothing's selected).\n\
-Print it does the same and inserts the result right after it.\n\n\
-There's no VM yet, so both are stubs for now — see vm_host::VmRequest::Doit/WorkspacePrintIt.\"";
+Print it does the same and inserts the result right after it.\"\n\
+3 + 4.";
 
 /// `initial_text` lets `main.rs` restore whatever was last typed within
 /// the same app run (currently: it doesn't — every open starts fresh; see
