@@ -589,16 +589,32 @@ impl TranscriptSink for ChannelTranscript {
     }
 }
 
+/// VM options for the GUI's own worker. Same as `VmOptions::from_env`
+/// (`MACVM_JIT`/`MACVM_HEAP`/… all honored), except the JIT defaults to ON
+/// when `MACVM_JIT` is unset — the GUI runs real programs interactively, and
+/// the JIT is the whole point. `threshold=2000` compiles a method once it's
+/// genuinely hot rather than on first call, so startup and cold code stay
+/// cheap while hot loops get compiled. `MACVM_JIT` still overrides
+/// (including `MACVM_JIT=off`); the library default (`from_env` → off) is
+/// deliberately left alone so the test suite keeps its pure-interpreter
+/// baseline (gate scripts opt in explicitly).
+fn gui_vm_options() -> macvm::runtime::VmOptions {
+    let mut opts = macvm::runtime::VmOptions::from_env();
+    if std::env::var_os("MACVM_JIT").is_none() {
+        opts.jit = macvm::runtime::JitMode::Threshold(2000);
+    }
+    opts
+}
+
 /// Boots the real embedded VM (SPEC §16.2, `src/embed.rs`) against
-/// `world_dir`. Reads `MACVM_JIT`/`MACVM_HEAP`/etc. from the environment
-/// like any other MACVM entry point (`VmOptions::from_env`); nothing here
-/// restricts the JIT — it is fully supported (S21's own directive).
+/// `world_dir` using [`gui_vm_options`] (JIT on by default). Used as the
+/// `.mst` fallback when the image database can't be established.
 fn boot_real_vm(
     responses: Sender<VmResponse>,
     wake: CrossThreadObjcRef,
     world_dir: &Path,
 ) -> Option<VmHandle> {
-    let opts = macvm::runtime::VmOptions::from_env();
+    let opts = gui_vm_options();
     match VmHandle::boot(opts, world_dir) {
         Ok(mut vm) => {
             vm.set_transcript(Box::new(ChannelTranscript { responses, wake }));
@@ -656,7 +672,7 @@ fn boot_vm_from_image(
     responses: Sender<VmResponse>,
     wake: CrossThreadObjcRef,
 ) -> Option<VmHandle> {
-    let opts = macvm::runtime::VmOptions::from_env();
+    let opts = gui_vm_options();
     let mut vm = VmHandle::boot_without_world(opts);
     vm.set_transcript(Box::new(ChannelTranscript {
         responses: responses.clone(),
