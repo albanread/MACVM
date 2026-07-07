@@ -13,6 +13,7 @@
 //! below — see `docs/IMAGE.md` §4 for why "latest" is always computed, not
 //! a stored pointer that could drift out of sync.
 
+pub mod import;
 pub mod mst;
 
 use rusqlite::{params, Connection, OptionalExtension};
@@ -142,7 +143,10 @@ pub struct Image {
 }
 
 fn now_secs() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
 }
 
 /// Upgrade an already-existing database file created before the `deleted`
@@ -160,7 +164,10 @@ fn migrate_add_deleted_columns(conn: &Connection) -> rusqlite::Result<()> {
             .filter_map(|r| r.ok())
             .any(|name| name == "deleted");
         if !has_deleted {
-            conn.execute(&format!("ALTER TABLE {table} ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0"), [])?;
+            conn.execute(
+                &format!("ALTER TABLE {table} ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0"),
+                [],
+            )?;
         }
     }
     Ok(())
@@ -183,7 +190,11 @@ impl Image {
 
     fn class_id_of(&self, class_name: &str) -> rusqlite::Result<Option<i64>> {
         self.conn
-            .query_row("SELECT class_id FROM classes WHERE name = ?1", params![class_name], |r| r.get(0))
+            .query_row(
+                "SELECT class_id FROM classes WHERE name = ?1",
+                params![class_name],
+                |r| r.get(0),
+            )
             .optional()
     }
 
@@ -198,7 +209,12 @@ impl Image {
         Ok(self.class_id_of(class_name)?.is_some())
     }
 
-    fn method_id_of(&self, class_name: &str, side: Side, selector: &str) -> rusqlite::Result<Option<i64>> {
+    fn method_id_of(
+        &self,
+        class_name: &str,
+        side: Side,
+        selector: &str,
+    ) -> rusqlite::Result<Option<i64>> {
         self.conn
             .query_row(
                 "SELECT m.method_id FROM classes c JOIN methods m ON m.class_id = c.class_id \
@@ -242,7 +258,11 @@ impl Image {
              ORDER BY c.load_order",
         )?;
         let rows = stmt.query_map(params![package], |r| {
-            Ok(ClassSummary { name: r.get(0)?, superclass: r.get(1)?, load_order: r.get(2)? })
+            Ok(ClassSummary {
+                name: r.get(0)?,
+                superclass: r.get(1)?,
+                load_order: r.get(2)?,
+            })
         })?;
         rows.collect()
     }
@@ -254,7 +274,11 @@ impl Image {
              WHERE lcv.superclass_name = ?1 AND lcv.deleted = 0 ORDER BY c.load_order",
         )?;
         let rows = stmt.query_map(params![class_name], |r| {
-            Ok(ClassSummary { name: r.get(0)?, superclass: r.get(1)?, load_order: r.get(2)? })
+            Ok(ClassSummary {
+                name: r.get(0)?,
+                superclass: r.get(1)?,
+                load_order: r.get(2)?,
+            })
         })?;
         rows.collect()
     }
@@ -266,11 +290,18 @@ impl Image {
              JOIN latest_method_versions lmv ON lmv.method_id = m.method_id \
              WHERE c.name = ?1 AND m.side = ?2 AND lmv.deleted = 0 ORDER BY m.method_id",
         )?;
-        let rows = stmt.query_map(params![class_name, side.as_str()], |r| r.get::<_, String>(0))?;
+        let rows = stmt.query_map(params![class_name, side.as_str()], |r| {
+            r.get::<_, String>(0)
+        })?;
         rows.collect()
     }
 
-    pub fn methods_in(&self, class_name: &str, side: Side, category: &str) -> rusqlite::Result<Vec<MethodSummary>> {
+    pub fn methods_in(
+        &self,
+        class_name: &str,
+        side: Side,
+        category: &str,
+    ) -> rusqlite::Result<Vec<MethodSummary>> {
         let mut stmt = self.conn.prepare(
             "SELECT m.selector, lmv.category \
              FROM classes c JOIN methods m ON m.class_id = c.class_id \
@@ -278,12 +309,20 @@ impl Image {
              WHERE c.name = ?1 AND m.side = ?2 AND lmv.category = ?3 AND lmv.deleted = 0 ORDER BY m.selector",
         )?;
         let rows = stmt.query_map(params![class_name, side.as_str(), category], |r| {
-            Ok(MethodSummary { selector: r.get(0)?, category: r.get(1)? })
+            Ok(MethodSummary {
+                selector: r.get(0)?,
+                category: r.get(1)?,
+            })
         })?;
         rows.collect()
     }
 
-    pub fn method_source(&self, class_name: &str, side: Side, selector: &str) -> rusqlite::Result<Option<String>> {
+    pub fn method_source(
+        &self,
+        class_name: &str,
+        side: Side,
+        selector: &str,
+    ) -> rusqlite::Result<Option<String>> {
         self.conn
             .query_row(
                 "SELECT lmv.source \
@@ -344,7 +383,11 @@ impl Image {
             let side_str: String = r.get(1)?;
             Ok(FullMethod {
                 selector: r.get(0)?,
-                side: if side_str == "class" { Side::Class } else { Side::Instance },
+                side: if side_str == "class" {
+                    Side::Class
+                } else {
+                    Side::Instance
+                },
                 category: r.get(2)?,
                 source: r.get(3)?,
             })
@@ -366,7 +409,10 @@ impl Image {
         class_vars: &str,
         load_order: i64,
     ) -> rusqlite::Result<i64> {
-        self.conn.execute("INSERT INTO classes (name, load_order) VALUES (?1, ?2)", params![name, load_order])?;
+        self.conn.execute(
+            "INSERT INTO classes (name, load_order) VALUES (?1, ?2)",
+            params![name, load_order],
+        )?;
         let class_id = self.conn.last_insert_rowid();
         self.conn.execute(
             "INSERT INTO class_versions (class_id, version_number, superclass_name, category, comment, instance_vars, class_vars, edited_at) \
@@ -377,8 +423,17 @@ impl Image {
     }
 
     /// Create a method (on an existing class) with its first version.
-    pub fn add_method(&self, class_name: &str, side: Side, selector: &str, category: &str, source: &str) -> rusqlite::Result<Option<i64>> {
-        let Some(class_id) = self.class_id_of(class_name)? else { return Ok(None) };
+    pub fn add_method(
+        &self,
+        class_name: &str,
+        side: Side,
+        selector: &str,
+        category: &str,
+        source: &str,
+    ) -> rusqlite::Result<Option<i64>> {
+        let Some(class_id) = self.class_id_of(class_name)? else {
+            return Ok(None);
+        };
         self.conn.execute(
             "INSERT INTO methods (class_id, selector, side) VALUES (?1, ?2, ?3)",
             params![class_id, selector, side.as_str()],
@@ -396,10 +451,21 @@ impl Image {
     /// prune to `RETENTION_LIMIT`. Returns `false` (no auto-create) if
     /// `class_name`/`side`/`selector` doesn't already name a method — same
     /// contract as `macvm-mock-vm::MockWorld::set_method_source`.
-    pub fn set_method_source(&self, class_name: &str, side: Side, selector: &str, new_source: &str) -> rusqlite::Result<bool> {
-        let Some(method_id) = self.method_id_of(class_name, side, selector)? else { return Ok(false) };
-        let category: String =
-            self.conn.query_row("SELECT category FROM latest_method_versions WHERE method_id = ?1", params![method_id], |r| r.get(0))?;
+    pub fn set_method_source(
+        &self,
+        class_name: &str,
+        side: Side,
+        selector: &str,
+        new_source: &str,
+    ) -> rusqlite::Result<bool> {
+        let Some(method_id) = self.method_id_of(class_name, side, selector)? else {
+            return Ok(false);
+        };
+        let category: String = self.conn.query_row(
+            "SELECT category FROM latest_method_versions WHERE method_id = ?1",
+            params![method_id],
+            |r| r.get(0),
+        )?;
         self.insert_method_version(method_id, &category, new_source, false)?;
         self.prune_method_versions(method_id)?;
         Ok(true)
@@ -408,13 +474,23 @@ impl Image {
     /// "Accept" an edited class comment — same shape as `set_method_source`,
     /// carrying every other field of the class definition forward unchanged.
     pub fn set_class_comment(&self, class_name: &str, new_comment: &str) -> rusqlite::Result<bool> {
-        let Some(class_id) = self.class_id_of(class_name)? else { return Ok(false) };
+        let Some(class_id) = self.class_id_of(class_name)? else {
+            return Ok(false);
+        };
         let (superclass, category, ivars, cvars): (Option<String>, String, String, String) = self.conn.query_row(
             "SELECT superclass_name, category, instance_vars, class_vars FROM latest_class_versions WHERE class_id = ?1",
             params![class_id],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )?;
-        self.insert_class_version(class_id, superclass.as_deref(), &category, new_comment, &ivars, &cvars, false)?;
+        self.insert_class_version(
+            class_id,
+            superclass.as_deref(),
+            &category,
+            new_comment,
+            &ivars,
+            &cvars,
+            false,
+        )?;
         self.prune_class_versions(class_id)?;
         Ok(true)
     }
@@ -428,14 +504,29 @@ impl Image {
     /// through yet (see `mst.rs`'s doc comment) — inventing GUI-only syntax
     /// for a field the file format can't express felt like the wrong kind
     /// of shortcut to take silently.
-    pub fn set_class_definition(&self, class_name: &str, new_superclass: Option<&str>, new_instance_vars: &str) -> rusqlite::Result<bool> {
-        let Some(class_id) = self.class_id_of(class_name)? else { return Ok(false) };
+    pub fn set_class_definition(
+        &self,
+        class_name: &str,
+        new_superclass: Option<&str>,
+        new_instance_vars: &str,
+    ) -> rusqlite::Result<bool> {
+        let Some(class_id) = self.class_id_of(class_name)? else {
+            return Ok(false);
+        };
         let (category, comment, cvars): (String, String, String) = self.conn.query_row(
             "SELECT category, comment, class_vars FROM latest_class_versions WHERE class_id = ?1",
             params![class_id],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?;
-        self.insert_class_version(class_id, new_superclass, &category, &comment, new_instance_vars, &cvars, false)?;
+        self.insert_class_version(
+            class_id,
+            new_superclass,
+            &category,
+            &comment,
+            new_instance_vars,
+            &cvars,
+            false,
+        )?;
         self.prune_class_versions(class_id)?;
         Ok(true)
     }
@@ -446,8 +537,15 @@ impl Image {
     /// at all* to "undo" a removal: it already just reverts to the version
     /// before this one (`docs/IMAGE.md` §4's revert-as-new-version rule).
     /// Returns `false` if the method doesn't exist or is already removed.
-    pub fn remove_method(&self, class_name: &str, side: Side, selector: &str) -> rusqlite::Result<bool> {
-        let Some(method_id) = self.method_id_of(class_name, side, selector)? else { return Ok(false) };
+    pub fn remove_method(
+        &self,
+        class_name: &str,
+        side: Side,
+        selector: &str,
+    ) -> rusqlite::Result<bool> {
+        let Some(method_id) = self.method_id_of(class_name, side, selector)? else {
+            return Ok(false);
+        };
         let (category, source, deleted): (String, String, i64) = self.conn.query_row(
             "SELECT category, source, deleted FROM latest_method_versions WHERE method_id = ?1",
             params![method_id],
@@ -470,7 +568,9 @@ impl Image {
     /// expected to warn about affected subclasses *before* sending this,
     /// not have the store refuse or auto-reparent on its behalf.
     pub fn remove_class(&self, class_name: &str) -> rusqlite::Result<bool> {
-        let Some(class_id) = self.class_id_of(class_name)? else { return Ok(false) };
+        let Some(class_id) = self.class_id_of(class_name)? else {
+            return Ok(false);
+        };
         let (superclass, category, comment, ivars, cvars, deleted): (Option<String>, String, String, String, String, i64) = self.conn.query_row(
             "SELECT superclass_name, category, comment, instance_vars, class_vars, deleted FROM latest_class_versions WHERE class_id = ?1",
             params![class_id],
@@ -479,7 +579,15 @@ impl Image {
         if deleted != 0 {
             return Ok(false);
         }
-        self.insert_class_version(class_id, superclass.as_deref(), &category, &comment, &ivars, &cvars, true)?;
+        self.insert_class_version(
+            class_id,
+            superclass.as_deref(),
+            &category,
+            &comment,
+            &ivars,
+            &cvars,
+            true,
+        )?;
         self.prune_class_versions(class_id)?;
         Ok(true)
     }
@@ -507,7 +615,15 @@ impl Image {
         match self.class_id_of(name)? {
             None => {
                 let load_order = self.next_load_order()?;
-                self.add_class(name, superclass, category, comment, instance_vars, "", load_order)?;
+                self.add_class(
+                    name,
+                    superclass,
+                    category,
+                    comment,
+                    instance_vars,
+                    "",
+                    load_order,
+                )?;
                 Ok(ClassCreateOutcome::Created)
             }
             Some(class_id) => {
@@ -519,7 +635,15 @@ impl Image {
                 if deleted == 0 {
                     return Ok(ClassCreateOutcome::AlreadyLive);
                 }
-                self.insert_class_version(class_id, superclass, category, comment, instance_vars, &cvars, false)?;
+                self.insert_class_version(
+                    class_id,
+                    superclass,
+                    category,
+                    comment,
+                    instance_vars,
+                    &cvars,
+                    false,
+                )?;
                 self.prune_class_versions(class_id)?;
                 Ok(ClassCreateOutcome::Reopened)
             }
@@ -535,8 +659,17 @@ impl Image {
     /// and none of them should be an error, unlike the class-name-collision
     /// case `create_or_reopen_class` refuses. Returns `None` only if
     /// `class_name` doesn't exist at all.
-    pub fn create_or_reopen_method(&self, class_name: &str, side: Side, selector: &str, category: &str, source: &str) -> rusqlite::Result<Option<i64>> {
-        let Some(class_id) = self.class_id_of(class_name)? else { return Ok(None) };
+    pub fn create_or_reopen_method(
+        &self,
+        class_name: &str,
+        side: Side,
+        selector: &str,
+        category: &str,
+        source: &str,
+    ) -> rusqlite::Result<Option<i64>> {
+        let Some(class_id) = self.class_id_of(class_name)? else {
+            return Ok(None);
+        };
         let method_id = match self.method_id_of(class_name, side, selector)? {
             Some(id) => id,
             None => {
@@ -560,8 +693,15 @@ impl Image {
     /// this is what makes "undo" double as "un-remove" for free: undoing
     /// past a removal restores whichever `deleted` state the version being
     /// restored actually had.
-    pub fn undo_method(&self, class_name: &str, side: Side, selector: &str) -> rusqlite::Result<bool> {
-        let Some(method_id) = self.method_id_of(class_name, side, selector)? else { return Ok(false) };
+    pub fn undo_method(
+        &self,
+        class_name: &str,
+        side: Side,
+        selector: &str,
+    ) -> rusqlite::Result<bool> {
+        let Some(method_id) = self.method_id_of(class_name, side, selector)? else {
+            return Ok(false);
+        };
         let previous: Option<(String, String, i64)> = self
             .conn
             .query_row(
@@ -571,7 +711,9 @@ impl Image {
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?;
-        let Some((category, source, deleted)) = previous else { return Ok(false) };
+        let Some((category, source, deleted)) = previous else {
+            return Ok(false);
+        };
         self.insert_method_version(method_id, &category, &source, deleted != 0)?;
         self.prune_method_versions(method_id)?;
         Ok(true)
@@ -581,7 +723,9 @@ impl Image {
     /// own `deleted` flag forward" rule, so undo doubles as un-remove here
     /// too.
     pub fn undo_class(&self, class_name: &str) -> rusqlite::Result<bool> {
-        let Some(class_id) = self.class_id_of(class_name)? else { return Ok(false) };
+        let Some(class_id) = self.class_id_of(class_name)? else {
+            return Ok(false);
+        };
         let previous: Option<(Option<String>, String, String, String, String, i64)> = self
             .conn
             .query_row(
@@ -591,15 +735,34 @@ impl Image {
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
             )
             .optional()?;
-        let Some((superclass, category, comment, ivars, cvars, deleted)) = previous else { return Ok(false) };
-        self.insert_class_version(class_id, superclass.as_deref(), &category, &comment, &ivars, &cvars, deleted != 0)?;
+        let Some((superclass, category, comment, ivars, cvars, deleted)) = previous else {
+            return Ok(false);
+        };
+        self.insert_class_version(
+            class_id,
+            superclass.as_deref(),
+            &category,
+            &comment,
+            &ivars,
+            &cvars,
+            deleted != 0,
+        )?;
         self.prune_class_versions(class_id)?;
         Ok(true)
     }
 
-    fn insert_method_version(&self, method_id: i64, category: &str, source: &str, deleted: bool) -> rusqlite::Result<()> {
-        let next: i64 =
-            self.conn.query_row("SELECT COALESCE(MAX(version_number), 0) + 1 FROM method_versions WHERE method_id = ?1", params![method_id], |r| r.get(0))?;
+    fn insert_method_version(
+        &self,
+        method_id: i64,
+        category: &str,
+        source: &str,
+        deleted: bool,
+    ) -> rusqlite::Result<()> {
+        let next: i64 = self.conn.query_row(
+            "SELECT COALESCE(MAX(version_number), 0) + 1 FROM method_versions WHERE method_id = ?1",
+            params![method_id],
+            |r| r.get(0),
+        )?;
         self.conn.execute(
             "INSERT INTO method_versions (method_id, version_number, category, source, edited_at, deleted) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![method_id, next, category, source, now_secs(), deleted as i64],
@@ -617,8 +780,11 @@ impl Image {
         cvars: &str,
         deleted: bool,
     ) -> rusqlite::Result<()> {
-        let next: i64 =
-            self.conn.query_row("SELECT COALESCE(MAX(version_number), 0) + 1 FROM class_versions WHERE class_id = ?1", params![class_id], |r| r.get(0))?;
+        let next: i64 = self.conn.query_row(
+            "SELECT COALESCE(MAX(version_number), 0) + 1 FROM class_versions WHERE class_id = ?1",
+            params![class_id],
+            |r| r.get(0),
+        )?;
         self.conn.execute(
             "INSERT INTO class_versions (class_id, version_number, superclass_name, category, comment, instance_vars, class_vars, edited_at, deleted) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
@@ -653,7 +819,9 @@ impl Image {
     /// class at the end of the load sequence (the common case: the
     /// importer loading `world.list` in order, or a brand new class).
     pub fn next_load_order(&self) -> rusqlite::Result<i64> {
-        let max: Option<i64> = self.conn.query_row("SELECT MAX(load_order) FROM classes", [], |r| r.get(0))?;
+        let max: Option<i64> =
+            self.conn
+                .query_row("SELECT MAX(load_order) FROM classes", [], |r| r.get(0))?;
         Ok(max.map(|m| m + LOAD_ORDER_STEP).unwrap_or(LOAD_ORDER_START))
     }
 
@@ -675,17 +843,27 @@ impl Image {
     /// `docs/IMAGE.md` §3 describes for when gaps run out. Not needed per
     /// edit; safe to call any time (idempotent on an already-clean table).
     pub fn rebalance_load_order(&self) -> rusqlite::Result<()> {
-        let mut stmt = self.conn.prepare("SELECT class_id FROM classes ORDER BY load_order")?;
-        let ids: Vec<i64> = stmt.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT class_id FROM classes ORDER BY load_order")?;
+        let ids: Vec<i64> = stmt
+            .query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
         for (i, class_id) in ids.into_iter().enumerate() {
             let new_order = LOAD_ORDER_START + (i as i64) * LOAD_ORDER_STEP;
-            self.conn.execute("UPDATE classes SET load_order = ?1 WHERE class_id = ?2", params![new_order, class_id])?;
+            self.conn.execute(
+                "UPDATE classes SET load_order = ?1 WHERE class_id = ?2",
+                params![new_order, class_id],
+            )?;
         }
         Ok(())
     }
 
     pub fn reorder_class(&self, class_name: &str, new_load_order: i64) -> rusqlite::Result<bool> {
-        let changed = self.conn.execute("UPDATE classes SET load_order = ?1 WHERE name = ?2", params![new_load_order, class_name])?;
+        let changed = self.conn.execute(
+            "UPDATE classes SET load_order = ?1 WHERE name = ?2",
+            params![new_load_order, class_name],
+        )?;
         Ok(changed > 0)
     }
 }
@@ -697,18 +875,53 @@ mod tests {
     fn seeded() -> Image {
         let img = Image::open_in_memory().unwrap();
         let lo = img.next_load_order().unwrap();
-        img.add_class("Object", None, "Kernel", "The root of the hierarchy.", "", "", lo).unwrap();
+        img.add_class(
+            "Object",
+            None,
+            "Kernel",
+            "The root of the hierarchy.",
+            "",
+            "",
+            lo,
+        )
+        .unwrap();
         let lo = img.next_load_order().unwrap();
-        img.add_class("Collection", Some("Object"), "Collections", "Abstract collection.", "", "", lo).unwrap();
-        img.add_method("Object", Side::Instance, "printString", "printing", "printString\n\t^'an Object'").unwrap();
-        img.add_method("Object", Side::Instance, "hash", "comparing", "hash\n\t^self identityHash").unwrap();
+        img.add_class(
+            "Collection",
+            Some("Object"),
+            "Collections",
+            "Abstract collection.",
+            "",
+            "",
+            lo,
+        )
+        .unwrap();
+        img.add_method(
+            "Object",
+            Side::Instance,
+            "printString",
+            "printing",
+            "printString\n\t^'an Object'",
+        )
+        .unwrap();
+        img.add_method(
+            "Object",
+            Side::Instance,
+            "hash",
+            "comparing",
+            "hash\n\t^self identityHash",
+        )
+        .unwrap();
         img
     }
 
     #[test]
     fn packages_and_roots_round_trip() {
         let img = seeded();
-        assert_eq!(img.packages().unwrap(), vec!["Kernel".to_string(), "Collections".to_string()]);
+        assert_eq!(
+            img.packages().unwrap(),
+            vec!["Kernel".to_string(), "Collections".to_string()]
+        );
         let roots = img.package_roots("Kernel").unwrap();
         assert_eq!(roots.len(), 1);
         assert_eq!(roots[0].name, "Object");
@@ -725,7 +938,9 @@ mod tests {
         assert!(cats.contains(&"printing".to_string()));
         assert!(cats.contains(&"comparing".to_string()));
 
-        let methods = img.methods_in("Object", Side::Instance, "printing").unwrap();
+        let methods = img
+            .methods_in("Object", Side::Instance, "printing")
+            .unwrap();
         assert_eq!(methods.len(), 1);
         assert_eq!(methods[0].selector, "printString");
     }
@@ -733,24 +948,41 @@ mod tests {
     #[test]
     fn set_method_source_versions_instead_of_overwriting() {
         let img = seeded();
-        assert!(img.set_method_source("Object", Side::Instance, "hash", "hash\n\t^42").unwrap());
-        assert_eq!(img.method_source("Object", Side::Instance, "hash").unwrap().unwrap(), "hash\n\t^42");
+        assert!(img
+            .set_method_source("Object", Side::Instance, "hash", "hash\n\t^42")
+            .unwrap());
+        assert_eq!(
+            img.method_source("Object", Side::Instance, "hash")
+                .unwrap()
+                .unwrap(),
+            "hash\n\t^42"
+        );
         // Unknown selector: no auto-create.
-        assert!(!img.set_method_source("Object", Side::Instance, "nope", "x").unwrap());
+        assert!(!img
+            .set_method_source("Object", Side::Instance, "nope", "x")
+            .unwrap());
     }
 
     #[test]
     fn undo_method_restores_previous_source_as_a_new_version() {
         let img = seeded();
-        img.set_method_source("Object", Side::Instance, "hash", "hash\n\t^42").unwrap();
+        img.set_method_source("Object", Side::Instance, "hash", "hash\n\t^42")
+            .unwrap();
         assert!(img.undo_method("Object", Side::Instance, "hash").unwrap());
         assert_eq!(
-            img.method_source("Object", Side::Instance, "hash").unwrap().unwrap(),
+            img.method_source("Object", Side::Instance, "hash")
+                .unwrap()
+                .unwrap(),
             "hash\n\t^self identityHash"
         );
         // The "undo" is itself a new version — undo-the-undo should work too.
         assert!(img.undo_method("Object", Side::Instance, "hash").unwrap());
-        assert_eq!(img.method_source("Object", Side::Instance, "hash").unwrap().unwrap(), "hash\n\t^42");
+        assert_eq!(
+            img.method_source("Object", Side::Instance, "hash")
+                .unwrap()
+                .unwrap(),
+            "hash\n\t^42"
+        );
     }
 
     #[test]
@@ -762,8 +994,13 @@ mod tests {
     #[test]
     fn set_class_comment_carries_other_fields_forward() {
         let img = seeded();
-        assert!(img.set_class_comment("Collection", "Updated comment.").unwrap());
-        assert_eq!(img.class_comment("Collection").unwrap().unwrap(), "Updated comment.");
+        assert!(img
+            .set_class_comment("Collection", "Updated comment.")
+            .unwrap());
+        assert_eq!(
+            img.class_comment("Collection").unwrap().unwrap(),
+            "Updated comment."
+        );
         // superclass/category must survive the edit unchanged.
         let roots = img.package_roots("Collections").unwrap();
         assert_eq!(roots[0].superclass.as_deref(), Some("Object"));
@@ -773,7 +1010,8 @@ mod tests {
     fn retention_keeps_at_most_the_limit() {
         let img = seeded();
         for i in 0..(RETENTION_LIMIT + 5) {
-            img.set_method_source("Object", Side::Instance, "hash", &format!("hash\n\t^{i}")).unwrap();
+            img.set_method_source("Object", Side::Instance, "hash", &format!("hash\n\t^{i}"))
+                .unwrap();
         }
         let count: i64 = img
             .conn
@@ -786,7 +1024,12 @@ mod tests {
         assert_eq!(count, RETENTION_LIMIT);
         // And the latest surviving value is still correct.
         let last = RETENTION_LIMIT + 4;
-        assert_eq!(img.method_source("Object", Side::Instance, "hash").unwrap().unwrap(), format!("hash\n\t^{last}"));
+        assert_eq!(
+            img.method_source("Object", Side::Instance, "hash")
+                .unwrap()
+                .unwrap(),
+            format!("hash\n\t^{last}")
+        );
     }
 
     #[test]
@@ -827,8 +1070,14 @@ mod tests {
     fn remove_method_hides_it_and_undo_restores_it() {
         let img = seeded();
         assert!(img.remove_method("Object", Side::Instance, "hash").unwrap());
-        assert_eq!(img.method_source("Object", Side::Instance, "hash").unwrap(), None);
-        assert!(!img.categories("Object", Side::Instance).unwrap().contains(&"comparing".to_string()));
+        assert_eq!(
+            img.method_source("Object", Side::Instance, "hash").unwrap(),
+            None
+        );
+        assert!(!img
+            .categories("Object", Side::Instance)
+            .unwrap()
+            .contains(&"comparing".to_string()));
         // Already removed: a second remove is a no-op-false, not an error.
         assert!(!img.remove_method("Object", Side::Instance, "hash").unwrap());
         // Unknown selector.
@@ -836,14 +1085,22 @@ mod tests {
 
         // Undo un-removes it — no dedicated "unremove" needed.
         assert!(img.undo_method("Object", Side::Instance, "hash").unwrap());
-        assert_eq!(img.method_source("Object", Side::Instance, "hash").unwrap().unwrap(), "hash\n\t^self identityHash");
+        assert_eq!(
+            img.method_source("Object", Side::Instance, "hash")
+                .unwrap()
+                .unwrap(),
+            "hash\n\t^self identityHash"
+        );
     }
 
     #[test]
     fn remove_class_hides_it_and_reroots_subclasses() {
         let img = seeded();
         assert!(img.remove_class("Object").unwrap());
-        assert!(!img.packages().unwrap().contains(&"Kernel".to_string()), "Kernel had only Object");
+        assert!(
+            !img.packages().unwrap().contains(&"Kernel".to_string()),
+            "Kernel had only Object"
+        );
         assert_eq!(img.class_comment("Object").unwrap(), None);
         // Collection's superclass_name still literally says "Object", but a
         // removed superclass counts as absent for the package-roots check —
@@ -863,23 +1120,35 @@ mod tests {
     fn create_or_reopen_class_distinguishes_new_live_and_removed() {
         let img = seeded();
         assert_eq!(
-            img.create_or_reopen_class("Stream", Some("Object"), "Streams", "A stream.", "").unwrap(),
+            img.create_or_reopen_class("Stream", Some("Object"), "Streams", "A stream.", "")
+                .unwrap(),
             ClassCreateOutcome::Created
         );
         assert!(img.class_comment("Stream").unwrap().is_some());
 
         // Already live: refused, not silently overwritten.
         assert_eq!(
-            img.create_or_reopen_class("Object", None, "Kernel", "Hijacked!", "").unwrap(),
+            img.create_or_reopen_class("Object", None, "Kernel", "Hijacked!", "")
+                .unwrap(),
             ClassCreateOutcome::AlreadyLive
         );
-        assert_eq!(img.class_comment("Object").unwrap().unwrap(), "The root of the hierarchy.");
+        assert_eq!(
+            img.class_comment("Object").unwrap().unwrap(),
+            "The root of the hierarchy."
+        );
 
         // Removed, then recreated under the same name: reopened, not a
         // UNIQUE(name) constraint error.
         img.remove_class("Collection").unwrap();
         assert_eq!(
-            img.create_or_reopen_class("Collection", Some("Object"), "Collections", "Reborn.", "elements").unwrap(),
+            img.create_or_reopen_class(
+                "Collection",
+                Some("Object"),
+                "Collections",
+                "Reborn.",
+                "elements"
+            )
+            .unwrap(),
             ClassCreateOutcome::Reopened
         );
         assert_eq!(img.class_comment("Collection").unwrap().unwrap(), "Reborn.");
@@ -889,34 +1158,76 @@ mod tests {
     fn create_or_reopen_method_creates_redefines_and_reopens() {
         let img = seeded();
         // Brand new selector.
-        assert!(img.create_or_reopen_method("Object", Side::Instance, "printOn:", "printing", "printOn: s\n\t^s").unwrap().is_some());
-        assert_eq!(img.method_source("Object", Side::Instance, "printOn:").unwrap().unwrap(), "printOn: s\n\t^s");
+        assert!(img
+            .create_or_reopen_method(
+                "Object",
+                Side::Instance,
+                "printOn:",
+                "printing",
+                "printOn: s\n\t^s"
+            )
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            img.method_source("Object", Side::Instance, "printOn:")
+                .unwrap()
+                .unwrap(),
+            "printOn: s\n\t^s"
+        );
 
         // Redefining an already-live selector via this path is normal, not
         // an error (unlike the class case).
-        assert!(img.create_or_reopen_method("Object", Side::Instance, "hash", "comparing", "hash\n\t^0").unwrap().is_some());
-        assert_eq!(img.method_source("Object", Side::Instance, "hash").unwrap().unwrap(), "hash\n\t^0");
-
-        // Removed, then reopened under the same selector.
-        img.remove_method("Object", Side::Instance, "printString").unwrap();
         assert!(img
-            .create_or_reopen_method("Object", Side::Instance, "printString", "printing", "printString\n\t^'reborn'")
+            .create_or_reopen_method("Object", Side::Instance, "hash", "comparing", "hash\n\t^0")
             .unwrap()
             .is_some());
-        assert_eq!(img.method_source("Object", Side::Instance, "printString").unwrap().unwrap(), "printString\n\t^'reborn'");
+        assert_eq!(
+            img.method_source("Object", Side::Instance, "hash")
+                .unwrap()
+                .unwrap(),
+            "hash\n\t^0"
+        );
+
+        // Removed, then reopened under the same selector.
+        img.remove_method("Object", Side::Instance, "printString")
+            .unwrap();
+        assert!(img
+            .create_or_reopen_method(
+                "Object",
+                Side::Instance,
+                "printString",
+                "printing",
+                "printString\n\t^'reborn'"
+            )
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            img.method_source("Object", Side::Instance, "printString")
+                .unwrap()
+                .unwrap(),
+            "printString\n\t^'reborn'"
+        );
 
         // Unknown class.
-        assert!(img.create_or_reopen_method("Nonexistent", Side::Instance, "foo", "cat", "foo").unwrap().is_none());
+        assert!(img
+            .create_or_reopen_method("Nonexistent", Side::Instance, "foo", "cat", "foo")
+            .unwrap()
+            .is_none());
     }
 
     #[test]
     fn set_class_definition_changes_superclass_and_ivars_only() {
         let img = seeded();
-        assert!(img.set_class_definition("Collection", Some("Object"), "elements size").unwrap());
+        assert!(img
+            .set_class_definition("Collection", Some("Object"), "elements size")
+            .unwrap());
         let roots = img.package_roots("Collections").unwrap();
         assert_eq!(roots[0].name, "Collection");
         // comment and category must survive the definition edit unchanged.
-        assert_eq!(img.class_comment("Collection").unwrap().unwrap(), "Abstract collection.");
+        assert_eq!(
+            img.class_comment("Collection").unwrap().unwrap(),
+            "Abstract collection."
+        );
         assert!(img.packages().unwrap().contains(&"Collections".to_string()));
         assert!(!img.set_class_definition("Nonexistent", None, "").unwrap());
     }

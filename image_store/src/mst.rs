@@ -43,6 +43,7 @@ pub struct ParsedClass {
     pub name: String,
     pub superclass: Option<String>, // None only for `nil subclass: Object`
     pub instance_vars: String,      // space-separated, as written
+    pub class_vars: String,         // space-separated, from `<classVars: …>`
     pub comment: String,            // the nearest preceding file-level comment
     pub methods: Vec<ParsedMethod>,
 }
@@ -211,6 +212,41 @@ impl<'a> Scanner<'a> {
     /// method body can't end it early. Returns the *whole* `selector [ ... ]`
     /// span (selector_start..closing bracket inclusive) as the method's
     /// stored source text.
+    /// True iff a `<` at the current position begins a class-level pragma
+    /// (`<classVars: …>`, `<indexable: …>`) rather than a binary-selector
+    /// method (`< aMagnitude [ … ]`, `<= other [ … ]`). A pragma is `<`
+    /// immediately followed by a keyword — an identifier then `:`; a binary
+    /// method is `<`/`<=` followed by a parameter and `[`. Non-consuming
+    /// (saves and restores position).
+    fn peek_is_class_pragma(&mut self) -> bool {
+        let save = self.pos;
+        self.advance(); // the `<`
+        let is_pragma = self.read_identifier().is_some() && {
+            self.skip_ws_and_comments();
+            self.peek() == Some(':')
+        };
+        self.pos = save;
+        is_pragma
+    }
+
+    /// Consumes a class-level pragma `< ... >` and returns its inner text
+    /// (e.g. `"classVars: Table"`). Assumes the next char is `<`. Stops at the
+    /// first `>` (class pragmas don't nest angle brackets); a missing `>`
+    /// consumes to EOF, which just ends the class scan cleanly.
+    fn read_angle_pragma(&mut self) -> String {
+        self.advance(); // the `<`
+        let start = self.pos;
+        while let Some(c) = self.peek() {
+            if c == '>' {
+                let inner = self.s[start..self.pos].to_string();
+                self.advance(); // the `>`
+                return inner;
+            }
+            self.advance();
+        }
+        self.s[start..self.pos].to_string()
+    }
+
     fn read_bracketed_body(&mut self) -> Option<&'a str> {
         self.skip_ws_and_comments();
         if self.peek() != Some('[') {
@@ -232,6 +268,16 @@ impl<'a> Scanner<'a> {
                     if depth == 0 {
                         return Some(&self.s[body_start..self.pos]);
                     }
+                }
+                Some('$') => {
+                    // A character literal `$c` — the char AFTER `$` is data,
+                    // not a delimiter, even when it is `[`, `]`, `'`, or `"`.
+                    // Without this, `String>>printOn:`'s `$'` reads as a
+                    // string-literal start and desyncs the bracket depth,
+                    // truncating the captured source (dropping the method's
+                    // closing `]`). Skip both chars as one token.
+                    self.advance(); // the `$`
+                    self.advance(); // the literal character (any char)
                 }
                 Some('"') => {
                     self.skip_comment();
@@ -287,11 +333,15 @@ pub fn parse_mst_source(text: &str) -> Vec<ParsedClass> {
             break;
         }
 
-        let Some(superclass_name) = sc.read_identifier() else { break };
+        let Some(superclass_name) = sc.read_identifier() else {
+            break;
+        };
         if !sc.eat_str("subclass:") {
             break;
         }
-        let Some(new_name) = sc.read_identifier() else { break };
+        let Some(new_name) = sc.read_identifier() else {
+            break;
+        };
         sc.skip_ws_and_comments();
         if sc.peek() != Some('[') {
             break;
@@ -323,6 +373,7 @@ pub fn parse_mst_source(text: &str) -> Vec<ParsedClass> {
             }
         }
 
+        let mut class_vars = String::new();
         let mut methods = Vec::new();
         loop {
             sc.skip_ws_and_comments();
@@ -332,6 +383,21 @@ pub fn parse_mst_source(text: &str) -> Vec<ParsedClass> {
             }
             if sc.peek().is_none() {
                 break;
+            }
+
+            // A class-level pragma, e.g. `<classVars: Table>` or
+            // `<indexable: oops>`. The method scanner MUST skip these — left
+            // unhandled, `<` reads as a binary selector, `read_bracketed_body`
+            // then finds no `[` and the whole class's method scan breaks
+            // (this dropped every one of `Character`'s methods). Method-level
+            // pragmas like `<primitive: N>` live inside a body and are
+            // captured by `read_bracketed_body`, not here.
+            if sc.peek() == Some('<') && sc.peek_is_class_pragma() {
+                let pragma = sc.read_angle_pragma();
+                if let Some(rest) = pragma.trim().strip_prefix("classVars:") {
+                    class_vars = rest.split_whitespace().collect::<Vec<_>>().join(" ");
+                }
+                continue;
             }
 
             // "NewClassName class >> selector [ body ]" vs a plain selector.
@@ -345,15 +411,37 @@ pub fn parse_mst_source(text: &str) -> Vec<ParsedClass> {
                 }
             }
 
-            let Some(selector) = sc.read_selector() else { break };
-            let Some(source) = sc.read_bracketed_body() else { break };
-            methods.push(ParsedMethod { selector, is_class_side, source: source.to_string() });
+            let Some(selector) = sc.read_selector() else {
+                break;
+            };
+            if sc.read_bracketed_body().is_none() {
+                break;
+            }
+            // Capture the FULL method text — header AND body — from `save`
+            // (before any `Name class >>` prefix) to just past the matching
+            // `]`. Storing only the bracketed body drops the parameter NAMES
+            // from the header (`read_selector` discards them) even though the
+            // body references those names, so a body-only record cannot be
+            // recompiled — which the database must be able to do to serve as
+            // the source of truth for booting the VM. This makes the code
+            // match `ParsedMethod::source`'s own "full source text" contract.
+            let source = sc.s[save..sc.pos].trim().to_string();
+            methods.push(ParsedMethod {
+                selector,
+                is_class_side,
+                source,
+            });
         }
 
         classes.push(ParsedClass {
             name: new_name,
-            superclass: if superclass_name == "nil" { None } else { Some(superclass_name) },
+            superclass: if superclass_name == "nil" {
+                None
+            } else {
+                Some(superclass_name)
+            },
             instance_vars,
+            class_vars,
             comment: pending_comment.take().unwrap_or_default(),
             methods,
         });
@@ -401,14 +489,22 @@ Object subclass: Message [
         // "class" here is an ordinary unary method (Object>>class), not a
         // class-side-methods block — exactly the corpus finding this
         // module's doc comment describes.
-        let class_method = object.methods.iter().find(|m| m.selector == "class").unwrap();
+        let class_method = object
+            .methods
+            .iter()
+            .find(|m| m.selector == "class")
+            .unwrap();
         assert!(!class_method.is_class_side);
         assert!(class_method.source.contains("primitive: 21"));
 
         let binary = object.methods.iter().find(|m| m.selector == "->").unwrap();
         assert!(binary.source.contains("Association key: self value: v"));
 
-        let keyword = object.methods.iter().find(|m| m.selector == "error:").unwrap();
+        let keyword = object
+            .methods
+            .iter()
+            .find(|m| m.selector == "error:")
+            .unwrap();
         assert!(keyword.source.contains("primitive: 95"));
 
         let message = &classes[1];
@@ -434,7 +530,11 @@ Object subclass: Message [
         assert_eq!(classes.len(), 1);
         let assoc = &classes[0];
         assert_eq!(assoc.instance_vars, "key value");
-        let ctor = assoc.methods.iter().find(|m| m.selector == "key:value:").unwrap();
+        let ctor = assoc
+            .methods
+            .iter()
+            .find(|m| m.selector == "key:value:")
+            .unwrap();
         assert!(ctor.is_class_side);
         let getter = assoc.methods.iter().find(|m| m.selector == "key").unwrap();
         assert!(!getter.is_class_side);
@@ -484,9 +584,76 @@ Object subclass: Message [
 
     #[test]
     fn parse_method_selector_handles_unary_binary_and_keyword() {
-        assert_eq!(parse_method_selector("printString\n\t^'x'"), Some("printString".to_string()));
-        assert_eq!(parse_method_selector("+ aNumber\n\t^self add: aNumber"), Some("+".to_string()));
-        assert_eq!(parse_method_selector("at: i put: v\n\t^self"), Some("at:put:".to_string()));
+        assert_eq!(
+            parse_method_selector("printString\n\t^'x'"),
+            Some("printString".to_string())
+        );
+        assert_eq!(
+            parse_method_selector("+ aNumber\n\t^self add: aNumber"),
+            Some("+".to_string())
+        );
+        assert_eq!(
+            parse_method_selector("at: i put: v\n\t^self"),
+            Some("at:put:".to_string())
+        );
         assert_eq!(parse_method_selector(""), None);
+    }
+
+    // ── S22 regression tests: the DB must reproduce COMPILABLE source ──────
+
+    #[test]
+    fn captures_the_full_method_header_including_parameter_names() {
+        // `at:put:`'s stored source must carry the `at: i put: v` header, not
+        // just the `[ body ]` — the body references `i`/`v`, so a body-only
+        // record could not be recompiled (the whole reason to store source).
+        let src = "Object subclass: Foo [\n    at: i put: v [\n        ^i + v\n    ]\n]\n";
+        let m = &parse_mst_source(src)[0].methods[0];
+        assert_eq!(m.selector, "at:put:");
+        assert!(m.source.starts_with("at: i put: v ["), "{:?}", m.source);
+    }
+
+    #[test]
+    fn character_literal_quote_does_not_truncate_the_body() {
+        // `$'` is the single-quote CHARACTER literal — its `'` must not read
+        // as a string-literal start (which desyncs bracket depth and drops
+        // the method's closing `]`). This is String>>printOn:'s exact shape.
+        let src = "Object subclass: Str [\n    printOn: s [\n        s nextPut: $'.\n        s nextPut: $'\n    ]\n    size [ ^0 ]\n]\n";
+        let c = &parse_mst_source(src)[0];
+        assert_eq!(c.methods.len(), 2, "the $' method must not swallow `size`");
+        let p = c.methods.iter().find(|m| m.selector == "printOn:").unwrap();
+        assert!(
+            p.source.trim_end().ends_with(']'),
+            "not truncated: {:?}",
+            p.source
+        );
+    }
+
+    #[test]
+    fn class_vars_pragma_is_captured_and_does_not_drop_later_methods() {
+        // `<classVars: Table>` must be captured AND must not break the method
+        // scan (it once dropped every one of Character's methods).
+        let src = "Magnitude subclass: Character [\n    <classVars: Table>\n    Character class >> value: v [\n        ^Table at: v\n    ]\n    isVowel [ ^false ]\n]\n";
+        let c = &parse_mst_source(src)[0];
+        assert_eq!(c.class_vars, "Table");
+        assert_eq!(c.methods.len(), 2, "pragma must not drop following methods");
+        assert!(c
+            .methods
+            .iter()
+            .any(|m| m.selector == "value:" && m.is_class_side));
+        assert!(c.methods.iter().any(|m| m.selector == "isVowel"));
+    }
+
+    #[test]
+    fn binary_comparison_selectors_are_not_eaten_as_class_pragmas() {
+        // `<`, `<=`, `>=` are binary SELECTORS, not `<…>` pragmas — the
+        // pragma check must not consume them (it once turned Magnitude's
+        // `< aMagnitude` / `>=` into garbage selectors).
+        let src = "Object subclass: Magnitude [\n    < aMagnitude [ ^self subclassResponsibility ]\n    <= aMagnitude [ ^(aMagnitude < self) not ]\n    >= aMagnitude [ ^(self < aMagnitude) not ]\n]\n";
+        let c = &parse_mst_source(src)[0];
+        assert!(c.class_vars.is_empty());
+        let sels: Vec<&str> = c.methods.iter().map(|m| m.selector.as_str()).collect();
+        assert!(sels.contains(&"<"), "got {sels:?}");
+        assert!(sels.contains(&"<="), "got {sels:?}");
+        assert!(sels.contains(&">="), "got {sels:?}");
     }
 }

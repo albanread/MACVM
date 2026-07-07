@@ -14,6 +14,7 @@ mod objc;
 mod preprocess;
 mod vm_host;
 mod workspace_render;
+mod world_boot;
 
 use objc::{sel, Id, Sel, NIL};
 use preprocess::Theme;

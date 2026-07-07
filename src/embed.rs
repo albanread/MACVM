@@ -33,8 +33,22 @@ use std::path::Path;
 use crate::codecache::deopt_trap;
 use crate::frontend::{self, CompileError};
 use crate::oops::Oop;
-use crate::runtime::vm_state::{set_fatal_mode, FatalMode};
 use crate::runtime::{VmError, VmOptions, VmState};
+
+pub use crate::runtime::vm_state::FatalMode;
+
+/// Overrides how a guest-fatal condition (`error:`, DNU, stack overflow,
+/// heap exhaustion) terminates on the CURRENT thread. [`VmHandle::boot`]/
+/// [`VmHandle::boot_without_world`] set [`FatalMode::ExitThread`] (the GUI's
+/// "kill the language thread, not the process" model, module doc). An
+/// embedder that would rather a guest-fatal condition abort the whole
+/// process — e.g. a test or a batch CLI runner, where a silently-dying
+/// thread would just hang the harness — calls this with
+/// [`FatalMode::ExitProcess`] AFTER booting (both settings are thread-local,
+/// so this affects every `VmHandle` driven from this thread).
+pub fn set_fatal_mode(mode: FatalMode) {
+    crate::runtime::vm_state::set_fatal_mode(mode);
+}
 
 /// A running, embedded VM instance — owns its `VmState` (and, through it,
 /// the whole heap, code cache, and loaded world) outright. See the module
@@ -145,6 +159,23 @@ impl VmHandle {
         Ok(VmHandle { vm })
     }
 
+    /// Boots a bare, genesis-only VM — the built-in classes exist (`Object`,
+    /// `Behavior`, the immediates, …) but no `world/` library is loaded. Same
+    /// thread-safety arming as [`boot`] (module doc). For an embedder that
+    /// supplies the library some other way than a `.mst` file tree — notably
+    /// loading it from the versioned image database class-by-class via
+    /// `eval` (the GUI's "load the world from the database" path, S22): boot
+    /// genesis-only, then replay each stored class definition in load order.
+    /// Never fails via `Result` (genesis itself uses `fatal_exit` for a
+    /// heap-reservation failure, like every other VM entry point).
+    pub fn boot_without_world(opts: VmOptions) -> VmHandle {
+        set_fatal_mode(FatalMode::ExitThread);
+        deopt_trap::arm_foreign_fault_handler();
+        VmHandle {
+            vm: VmState::with_options(opts),
+        }
+    }
+
     /// Compiles `source` as a single top-level item (SPEC §16.2: "compile as
     /// a doit, S5 REPL machinery, run, answer printString") and, for a doit,
     /// evaluates it and answers its `printString` — the same logic
@@ -191,6 +222,34 @@ impl VmHandle {
             Ok(None) => Ok(String::new()),
             Err(e) => Err(GuestError::Compile(e)),
         }
+    }
+
+    /// Like [`eval`](Self::eval) but runs `source` purely for effect and does
+    /// NOT compute the result's `printString`. Use this for loading class
+    /// definitions and initialization doIts: computing a result's printString
+    /// can itself invoke guest code that isn't ready yet during a boot (e.g.
+    /// `Character value:` before `Character initTable` has populated its
+    /// table), and a load doesn't want the printed value anyway. A `.mst`
+    /// file load has the same property — it executes each top item and
+    /// discards the value.
+    #[allow(unsafe_code)]
+    pub fn exec(&mut self, source: &str) -> Result<(), GuestError> {
+        let slot = deopt_trap::claim_jmp_slot();
+        // SAFETY: as `eval` — `sigsetjmp` inline at this call site, whose
+        // frame stays live for the whole recovery window.
+        let rc = unsafe { deopt_trap::sigsetjmp(deopt_trap::jmp_buf_ptr(slot), 1) };
+        if rc != 0 {
+            let (sig, pc, far) = deopt_trap::take_last_crash_info()
+                .expect("sigsetjmp returned nonzero without a recorded crash");
+            return Err(GuestError::NativeFault { sig, pc, far });
+        }
+        let item = match frontend::parser::parse_one_top_item(source) {
+            Ok(Some(item)) => item,
+            Ok(None) => return Ok(()),
+            Err(e) => return Err(GuestError::Compile(e)),
+        };
+        frontend::classdef::execute_top_item(&mut self.vm, item).map_err(GuestError::Compile)?;
+        Ok(())
     }
 
     /// Installs `sink` as where guest output (`Transcript show:`,
