@@ -102,7 +102,7 @@ fn pop_and_deliver(vm: &mut VmState, result: Oop) -> Option<Oop> {
         BCI_RESUME_CANNOT_RETURN => {
             eprintln!("macvm: resumed from cannotReturn: (VM error) — a #cannotReturn: handler must never return normally");
             let _ = vm.out.flush();
-            std::process::exit(1);
+            crate::runtime::vm_state::fatal_exit(1);
         }
         _ => {
             vm.regs.method = Some(current_frame(vm).method(&vm.stack));

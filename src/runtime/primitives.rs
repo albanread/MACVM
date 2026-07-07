@@ -1231,7 +1231,7 @@ fn prim_error(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     if crate::runtime::probe::guest_report_enabled() {
         crate::runtime::probe::fatal_guest_report(vm, &format!("error: {text}"));
     }
-    std::process::exit(1)
+    crate::runtime::vm_state::fatal_exit(1)
 }
 
 fn prim_quit_colon(vm: &mut VmState, args: &[Oop]) -> PrimResult {

@@ -117,7 +117,7 @@ pub fn dnu_fallback(vm: &mut VmState, selector: SymbolOop, receiver_klass: Klass
             &format!("DNU #{sel_str} (receiver class {klass_name})"),
         );
     }
-    std::process::exit(1);
+    crate::runtime::vm_state::fatal_exit(1);
 }
 
 #[cfg(test)]

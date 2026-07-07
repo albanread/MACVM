@@ -27,7 +27,7 @@
 
 #![allow(unsafe_code)]
 
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use crate::compiler::assembler::xr;
@@ -147,6 +147,186 @@ const CAP_CPSR: usize = 33;
 const CAP_FAR: usize = 34;
 const CAP_SIG: usize = 35;
 static CAPTURED: [AtomicU64; 36] = [const { AtomicU64::new(0) }; 36];
+
+// ── S21: per-thread foreign-fault recovery registry ──────────────────────
+//
+// PROBE's own fault handler (below) only ever redirects a fault whose pc
+// falls inside a REGISTERED code cache (the `lookup_pc_full` scan above) —
+// a fault in ordinary Rust code (e.g. `oops::wrappers`' own raw-pointer
+// dereference for an indirect `Alien`, S20 step 5, never JIT-compiled at
+// all) is classified "foreign" and left fatal (`write_foreign_verdict` +
+// `restore_default_for`). That is exactly right for a bare CLI/test run
+// (a foreign fault there really is an unrecoverable bug), but an embedded
+// `VmHandle` (S21, `docs/SPEC.md` §16) running on its own dedicated worker
+// thread needs a foreign fault to end ONLY that thread, not the process —
+// same goal as `runtime::vm_state::fatal_exit`'s `FatalMode::ExitThread`,
+// just for a genuine hardware fault instead of an ordinary guest `error:`/
+// DNU/stack-overflow condition.
+//
+// Mechanism, empirically validated (three real, deliberately-induced
+// `SIGSEGV`s in an isolated scratchpad binary before this code was
+// written): `sigsetjmp`/`siglongjmp`, called DIRECTLY from inside the
+// signal handler — unlike `panic!`/`catch_unwind` (unsound across a
+// JIT-compiled frame with no Rust unwind tables) or PROBE's own
+// PC-rewrite-to-trampoline trick (needed only for the heavier, allocating/
+// frame-walking dossier work the in-code-cache path does), `siglongjmp` is
+// itself on the async-signal-safe function list and needs neither. Proven:
+// one real SIGSEGV recovers cleanly; a SECOND real SIGSEGV, after the
+// first recovery, ALSO recovers cleanly (the test that actually matters —
+// it proves `sigsetjmp(env, 1)`'s "save the signal mask" semantics
+// correctly un-blocks SIGSEGV after `siglongjmp`; plain `setjmp`/`longjmp`
+// do NOT restore the mask, which would leave SIGSEGV blocked and a second
+// fault's behavior undefined); and the same mechanism works when the fault
+// occurs on a spawned thread rather than the one that installed the
+// handler (the real deployment shape).
+//
+// `libc` 0.2 does not expose `sigsetjmp`/`siglongjmp`/`sigjmp_buf` at all
+// (verified against the vendored crate, same gap as `ucontext_t` above) —
+// hand-declared here, with `sigjmp_buf`'s exact layout confirmed from this
+// system's own `/usr/include/.../usr/include/setjmp.h`: on `arm64` macOS,
+// `_JBLEN = (14 + 8 + 2) * 2 = 48`, `sigjmp_buf` is `int[_JBLEN + 1]` =
+// `[c_int; 49]`.
+const SIGJMP_BUF_LEN: usize = 49;
+
+extern "C" {
+    /// Callers MUST invoke this DIRECTLY, inline, at their own call site —
+    /// never through an intervening Rust wrapper function. `sigsetjmp`
+    /// captures whichever stack frame is active at the moment it runs; if
+    /// that frame belongs to a helper that then returns normally (as an
+    /// earlier version of this module's own `register_and_setjmp` wrongly
+    /// did), the frame is gone by the time a LATER fault tries to
+    /// `siglongjmp` back into it — undefined behavior (observed here as
+    /// execution silently resuming somewhere other than the intended
+    /// point, not a clean crash, making it easy to misdiagnose). This is
+    /// the exact same "cannot longjmp into a function that has already
+    /// returned" rule C itself has always had — Rust's `extern "C"` FFI
+    /// gives no compiler-level protection against getting it wrong, since
+    /// `sigsetjmp` is just an ordinary function call from Rust's own point
+    /// of view, not compiler-recognized the way it can be in C. The
+    /// function whose frame calls this must not return until the
+    /// recovery window it establishes is over (in practice: a loop that
+    /// calls this fresh each iteration, e.g. once per guest eval).
+    pub(crate) fn sigsetjmp(
+        env: *mut core::ffi::c_int,
+        savemask: core::ffi::c_int,
+    ) -> core::ffi::c_int;
+    /// Safe to call from anywhere, including from inside a signal handler
+    /// (unlike `sigsetjmp`, `siglongjmp` itself has no "which frame is
+    /// live" concern — it only ever restores a PREVIOUSLY, correctly
+    /// established `sigsetjmp` point).
+    pub(crate) fn siglongjmp(env: *mut core::ffi::c_int, val: core::ffi::c_int) -> !;
+}
+
+/// Same signal-safety discipline as the code-cache registry above: a fixed
+/// array of plain atomics (never a `Mutex`, never a `thread_local!` — the
+/// latter's lazy-init path on first touch is not obviously async-signal-safe,
+/// and this registry's whole POINT is being read from inside a handler).
+/// `0` marks an empty/retired slot (`libc::pthread_self()` is never 0 for a
+/// real thread). Each slot's own `sigjmp_buf` is stored as
+/// `[AtomicU32; SIGJMP_BUF_LEN]` (`AtomicU32` is layout-identical to the
+/// `c_int` `sigjmp_buf` itself uses, and `AtomicU32::as_ptr` gives the raw
+/// `*mut i32`/`*mut c_int` `sigsetjmp`/`siglongjmp` need) rather than a
+/// `static mut` array, matching `CAPTURED`'s own established convention in
+/// this file of using atomics even for what is conceptually a raw buffer.
+const JMP_REGISTRY_CAP: usize = 64;
+static JMP_OWNER: [AtomicU64; JMP_REGISTRY_CAP] = [const { AtomicU64::new(0) }; JMP_REGISTRY_CAP];
+static JMP_BUFS: [[AtomicU32; SIGJMP_BUF_LEN]; JMP_REGISTRY_CAP] =
+    [const { [const { AtomicU32::new(0) }; SIGJMP_BUF_LEN] }; JMP_REGISTRY_CAP];
+/// The triggering fault's `(signal, pc, far)`, published into THIS thread's
+/// own slot by the handler immediately before `siglongjmp` — read back by
+/// whatever resumes at the `sigsetjmp` point (same thread, so no ordering
+/// concern beyond plain same-thread program order) to build a real report.
+static JMP_LAST_SIG: [AtomicU64; JMP_REGISTRY_CAP] =
+    [const { AtomicU64::new(0) }; JMP_REGISTRY_CAP];
+static JMP_LAST_PC: [AtomicU64; JMP_REGISTRY_CAP] = [const { AtomicU64::new(0) }; JMP_REGISTRY_CAP];
+static JMP_LAST_FAR: [AtomicU64; JMP_REGISTRY_CAP] =
+    [const { AtomicU64::new(0) }; JMP_REGISTRY_CAP];
+static JMP_REGISTRY_LOCK: Mutex<()> = Mutex::new(());
+
+/// Claims a registry slot for the CURRENT thread (reusing a stale slot this
+/// same thread previously registered, or any retired slot, before growing —
+/// same dedup-then-append shape as `register_with_probe`) and returns its
+/// index. Pure bookkeeping — does NOT itself call `sigsetjmp` (deliberately:
+/// see [`jmp_buf_ptr`]'s own doc for why that must happen inline, at the
+/// caller's own call site, never inside a helper that would then return and
+/// invalidate the very frame a later fault needs to jump back into — an
+/// earlier version of this function called `sigsetjmp` itself and was wrong
+/// in exactly this way, caught by this module's own real-`SIGSEGV` tests).
+///
+/// Only ever called from ordinary (non-signal) code — `VmHandle::boot`
+/// (S21 step 2), once, before any guest code runs on that thread.
+pub(crate) fn claim_jmp_slot() -> usize {
+    let me = unsafe { libc::pthread_self() } as u64;
+    let _g = JMP_REGISTRY_LOCK.lock().unwrap();
+    let slot = (0..JMP_REGISTRY_CAP)
+        .find(|&i| JMP_OWNER[i].load(Ordering::Acquire) == me)
+        .or_else(|| (0..JMP_REGISTRY_CAP).find(|&i| JMP_OWNER[i].load(Ordering::Acquire) == 0))
+        .expect("deopt_trap: jmp registry overflow (JMP_REGISTRY_CAP concurrent embedded VMs)");
+    JMP_OWNER[slot].store(me, Ordering::Release);
+    slot
+}
+
+/// The raw `*mut c_int` for slot `i`'s own `sigjmp_buf` storage — pass this
+/// DIRECTLY to [`sigsetjmp`] (never copy it, never route it through another
+/// function first) at the exact call site whose frame must remain live for
+/// the whole recovery window (in practice: a loop, called fresh each
+/// iteration — e.g. `VmHandle`'s own per-eval loop, S21 step 2).
+///
+/// # Safety
+/// `i` must be a slot this thread itself claimed via [`claim_jmp_slot`] and
+/// has not yet released via [`deregister_setjmp`].
+#[allow(unsafe_code)]
+pub(crate) unsafe fn jmp_buf_ptr(i: usize) -> *mut core::ffi::c_int {
+    // SAFETY (of the cast, not the caller contract above): `JMP_BUFS[i]` is
+    // a `[AtomicU32; 49]`, layout-identical to the real `sigjmp_buf`
+    // (`[c_int; 49]`); this thread exclusively owns slot `i` once claimed
+    // (no other thread ever touches an index it doesn't own by
+    // `pthread_self()`), so treating its start as one contiguous
+    // `*mut c_int` is sound.
+    JMP_BUFS[i][0].as_ptr() as *mut core::ffi::c_int
+}
+
+/// Clears this thread's own registered slot, if any — called once a worker
+/// thread is about to end for good (a clean shutdown, or right before the
+/// `fatal_exit` that follows a caught crash), so a much-later, unrelated
+/// thread that happens to reuse the same recycled `pthread_t` value never
+/// finds a stale entry.
+pub(crate) fn deregister_setjmp() {
+    let me = unsafe { libc::pthread_self() } as u64;
+    let _g = JMP_REGISTRY_LOCK.lock().unwrap();
+    for owner in JMP_OWNER.iter() {
+        if owner.load(Ordering::Acquire) == me {
+            owner.store(0, Ordering::Release);
+        }
+    }
+}
+
+/// Async-signal-safe: does THIS (faulting) thread have a registered
+/// recovery slot? A fixed-array linear scan matched by `pthread_self()`,
+/// no lock, no allocation — the same shape as `lookup_pc_full` above, just
+/// keyed by owning thread instead of by pc range.
+fn lookup_jmp_slot_for_current_thread() -> Option<usize> {
+    let me = unsafe { libc::pthread_self() } as u64;
+    (0..JMP_REGISTRY_CAP).find(|&i| JMP_OWNER[i].load(Ordering::Acquire) == me)
+}
+
+/// Reads back (and clears) the `(signal, pc, far)` [`sig_fault_handler`]'s
+/// foreign-fault branch published for the CURRENT thread just before its
+/// `siglongjmp` — `None` if this thread never had a foreign fault recorded
+/// (e.g. a fresh boot, `sigsetjmp`'s own `0` return). Ordinary
+/// (non-signal) code only; same-thread program order makes the plain
+/// `Relaxed` loads here see whatever the handler (necessarily on this same
+/// thread, for a synchronous fault) already published.
+pub(crate) fn take_last_crash_info() -> Option<(i32, u64, u64)> {
+    let i = lookup_jmp_slot_for_current_thread()?;
+    let sig = JMP_LAST_SIG[i].swap(0, Ordering::Relaxed);
+    if sig == 0 {
+        return None;
+    }
+    let pc = JMP_LAST_PC[i].swap(0, Ordering::Relaxed);
+    let far = JMP_LAST_FAR[i].swap(0, Ordering::Relaxed);
+    Some((sig as i32, pc, far))
+}
 
 /// §4.5's backstop: `true` from the moment a fault is claimed for PROBE
 /// until the process dies. A SECOND fault while the dossier runs (the
@@ -490,7 +670,15 @@ unsafe fn restore_default_for(sig: i32) {
 /// registered code cache): raw `write(2)` of a fixed message + hand-rolled
 /// hex — no allocation, no formatting machinery, no locks. "That
 /// classification itself is the first question of every crash triage."
-unsafe fn write_foreign_verdict(sig: i32, pc: u64, far: u64) {
+///
+/// `recovering`: `false` reproduces today's exact wording (this thread —
+/// and, absent S21, the whole process — is about to die). `true` is S21's
+/// new case: an embedded `VmHandle`'s own worker thread has a registered
+/// recovery slot (`claim_jmp_slot`) and is about to `siglongjmp` back
+/// to it instead — the message says so, so a stderr log never claims
+/// "dying" immediately before evidence (a subsequent report over the
+/// `TranscriptSink` channel, S21 step 2) that it didn't.
+unsafe fn write_foreign_verdict(sig: i32, pc: u64, far: u64, recovering: bool) {
     fn put(buf: &mut [u8; 128], n: &mut usize, s: &[u8]) {
         for &b in s {
             if *n < buf.len() {
@@ -528,20 +716,28 @@ unsafe fn write_foreign_verdict(sig: i32, pc: u64, far: u64) {
     put(
         &mut buf,
         &mut n,
-        b" FOREIGN (not in any code cache); dying\n",
+        if recovering {
+            b" FOREIGN (not in any code cache); embedded VM thread recovering\n"
+        } else {
+            b" FOREIGN (not in any code cache); dying\n"
+        },
     );
     let _ = unsafe { libc::write(2, buf.as_ptr() as *const core::ffi::c_void, n) };
 }
 
 /// SA_SIGINFO handler for SIGSEGV/SIGBUS (DBG0). Same discipline as
 /// [`sigtrap_handler`]: classify, capture, rewrite `__pc`, and do ALL real
-/// work after sigreturn. Differences: (a) a reentrancy check FIRST — a
-/// fault while a dossier is already in progress means the dossier itself
-/// dereferenced something bad; restore `SIG_DFL` and die, keeping the
-/// per-step-flushed prefix; (b) faults are classified by their pc being
-/// inside a REGISTERED cache — only there is the x28-is-&VmState convention
-/// trustworthy (docs/DEBUGGER.md §4.1); everything else gets the raw-write
-/// verdict line and the default fatal disposition.
+/// work after sigreturn. Differences: (a) S21's own foreign-fault recovery
+/// check runs FIRST, entirely independent of everything below (see its own
+/// comment inline — it must never interact with `PROBE_IN_PROGRESS`, a
+/// different, process-wide, never-reset-until-death concern); (b) PROBE's
+/// own reentrancy check — a fault while a dossier is already in progress
+/// means the dossier itself dereferenced something bad; restore `SIG_DFL`
+/// and die, keeping the per-step-flushed prefix; (c) faults are classified
+/// by their pc being inside a REGISTERED cache — only there is the
+/// x28-is-&VmState convention trustworthy (docs/DEBUGGER.md §4.1);
+/// everything else gets the raw-write verdict line and the default fatal
+/// disposition.
 extern "C" fn sig_fault_handler(
     sig: i32,
     _info: *mut libc::siginfo_t,
@@ -550,6 +746,42 @@ extern "C" fn sig_fault_handler(
     // SAFETY: kernel-provided pointers for this delivery; same layout
     // contract as `sigtrap_handler`.
     unsafe {
+        // S21 (`docs/SPEC.md` §16): an embedded `VmHandle`'s own worker
+        // thread may have registered a recovery slot (`register_and_
+        // setjmp`). Checked FIRST and entirely independently of
+        // `PROBE_IN_PROGRESS` below — that flag is process-wide and never
+        // reset until the process actually dies, which is exactly wrong
+        // for this path: a successful recovery must leave a LATER,
+        // unrelated fault (on this or another thread, foreign or
+        // in-code-cache) completely unaffected, and empirically a second
+        // real fault on the SAME thread after one recovery must ALSO
+        // recover cleanly (validated in an isolated scratchpad binary
+        // before this code was written). Only fires for a GENUINELY
+        // foreign pc (`lookup_pc_full` returns no owning cache) — a fault
+        // inside a registered code cache, even on an embedded thread,
+        // still gets PROBE's real dossier treatment below unchanged (which
+        // already correctly terminates via `runtime::vm_state::fatal_exit`
+        // rather than a bare `process::exit`, per that function's own
+        // `FatalMode` — S21 step 1b).
+        if let Some(i) = lookup_jmp_slot_for_current_thread() {
+            let uc = ctx as *mut Ucontext;
+            if !uc.is_null() {
+                let mc = (*uc).uc_mcontext;
+                if !mc.is_null() {
+                    let far = (*mc).__es.__far;
+                    let pc = (*mc).__ss.__pc;
+                    let in_code_cache = lookup_pc_full(pc).map(|(_, _, p)| p).unwrap_or(0) != 0;
+                    if !in_code_cache {
+                        write_foreign_verdict(sig, pc, far, true);
+                        JMP_LAST_SIG[i].store(sig as u64, Ordering::Relaxed);
+                        JMP_LAST_PC[i].store(pc, Ordering::Relaxed);
+                        JMP_LAST_FAR[i].store(far, Ordering::Relaxed);
+                        siglongjmp(JMP_BUFS[i][0].as_ptr() as *mut core::ffi::c_int, 1);
+                    }
+                }
+            }
+        }
+
         if PROBE_IN_PROGRESS.swap(true, Ordering::AcqRel) {
             restore_default_for(sig);
             return;
@@ -571,7 +803,7 @@ extern "C" fn sig_fault_handler(
         let probe = match lookup_pc_full(pc) {
             Some((_, _, probe)) if probe != 0 => probe,
             _ => {
-                write_foreign_verdict(sig, pc, far);
+                write_foreign_verdict(sig, pc, far, false);
                 restore_default_for(sig);
                 return;
             }
@@ -1632,6 +1864,114 @@ mod tests {
         }
         deregister(lo);
         HANDLER_ARMED.store(false, Ordering::Release);
+    }
+
+    /// S21: the foreign-fault recovery path end to end, against a REAL,
+    /// deliberately-induced `SIGSEGV` (a bad-pointer read) — not simulated.
+    /// Proves `claim_jmp_slot`/`jmp_buf_ptr`/`sig_fault_handler`'s new
+    /// branch/`take_last_crash_info` compose correctly: `sigsetjmp`,
+    /// called DIRECTLY at this test closure's own call site (never through
+    /// a wrapper function — see `sigsetjmp`'s own doc for why that matters;
+    /// an earlier version of this code got exactly that wrong and this
+    /// same test caught it), "returns twice" (once normally, once via
+    /// `siglongjmp` after the real fault), and the crash info published
+    /// just before the jump is readable afterward. Run on a spawned thread
+    /// so a genuine miss in this mechanism (the fault reaching `SIG_DFL`
+    /// instead of being recovered) is exactly the failure this whole
+    /// design exists to prevent, made concrete rather than hidden.
+    #[test]
+    fn foreign_fault_recovers_via_registered_jmp_slot_on_a_real_segv() {
+        // Arms SIGTRAP/SIGSEGV/SIGBUS (idempotent — may already be armed by
+        // another test in this process; `install`'s own `HANDLER_ARMED`
+        // guard makes re-calling it safe, matching this file's established
+        // per-test convention above).
+        let mut cache = CodeCache::new(1 << 16).unwrap();
+        let _trampolines = install(&mut cache);
+
+        let handle = std::thread::spawn(|| {
+            let slot = claim_jmp_slot();
+            // SAFETY: `slot` was just claimed by this exact thread; the
+            // `sigsetjmp` call is inline, right here, at this closure's own
+            // call site — its frame stays live for the rest of the closure
+            // (the recovery window), never returning in between.
+            let rc = unsafe { sigsetjmp(jmp_buf_ptr(slot), 1) };
+            if rc == 0 {
+                // First pass: cause a REAL SIGSEGV (address 8 — the null
+                // page, always unmapped).
+                let bad = 8usize as *const u8;
+                unsafe { std::ptr::read_volatile(bad) };
+                panic!("unreachable — the segv should have recovered via siglongjmp");
+            }
+            // Resumed here via siglongjmp, not a normal return.
+            let info = take_last_crash_info();
+            deregister_setjmp();
+            info
+        });
+        let info = handle.join().expect("worker thread must complete normally");
+        let (sig, _pc, far) =
+            info.expect("expected Some((sig, pc, far)) after a recovered foreign fault");
+        assert_eq!(sig, libc::SIGSEGV);
+        assert_eq!(
+            far, 8,
+            "far (fault address) must be the real address that was read"
+        );
+    }
+
+    /// The test that actually matters for correctness, not just "does it
+    /// work once": `sigsetjmp(env, 1)`'s own "save the signal mask"
+    /// semantics must correctly un-block `SIGSEGV` after `siglongjmp`, or a
+    /// SECOND real fault's behavior is undefined (plain `setjmp`/`longjmp`
+    /// do NOT restore the mask — this is exactly the distinction that made
+    /// `sigsetjmp`/`siglongjmp` the right choice over the plain variants).
+    /// Two real, separately-induced SIGSEGVs, both recovered — `sigsetjmp`
+    /// is called FRESH each loop iteration, matching the real deployment
+    /// shape (once per guest eval), each call still inline at this same
+    /// closure's own call site.
+    #[test]
+    fn foreign_fault_recovers_from_a_second_real_segv_too() {
+        let mut cache = CodeCache::new(1 << 16).unwrap();
+        let _trampolines = install(&mut cache);
+
+        let handle = std::thread::spawn(|| {
+            let slot = claim_jmp_slot();
+            let mut recoveries = 0u32;
+            for addr in [8usize, 16usize] {
+                let rc = unsafe { sigsetjmp(jmp_buf_ptr(slot), 1) };
+                if rc == 0 {
+                    let bad = addr as *const u8;
+                    unsafe { std::ptr::read_volatile(bad) };
+                    panic!("unreachable");
+                }
+                recoveries += 1;
+                let _ = take_last_crash_info();
+            }
+            deregister_setjmp();
+            recoveries
+        });
+        assert_eq!(
+            handle.join().expect("worker thread must complete normally"),
+            2,
+            "both real SIGSEGVs must have been recovered"
+        );
+    }
+
+    /// `take_last_crash_info` must not falsely report a crash for a thread
+    /// that registered a slot but never actually faulted — `sigsetjmp`'s
+    /// own `0` return (no recovery happened yet).
+    #[test]
+    fn take_last_crash_info_is_none_before_any_fault() {
+        let mut cache = CodeCache::new(1 << 16).unwrap();
+        let _trampolines = install(&mut cache);
+
+        let handle = std::thread::spawn(|| {
+            let slot = claim_jmp_slot();
+            let rc = unsafe { sigsetjmp(jmp_buf_ptr(slot), 1) };
+            assert_eq!(rc, 0, "first call must be the ordinary, non-resumed return");
+            let info = take_last_crash_info();
+            deregister_setjmp();
+            info
+        });
+        assert_eq!(handle.join().unwrap(), None);
     }
 
     /// `read_frame_slot` reads the 8-byte oop at `fp + off` (the one licensed

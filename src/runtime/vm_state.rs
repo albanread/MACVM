@@ -112,6 +112,79 @@ impl JitMode {
     pub const DEFAULT_THRESHOLD: u32 = 1000;
 }
 
+/// S21 step 1: how a guest-fatal condition (an uncaught `error:`, DNU with
+/// no library `doesNotUnderstand:` installed, process-stack overflow, heap/
+/// eden exhaustion, a `#cannotReturn:` invariant violation, a debugger
+/// `quit`, or PROBE's own crash dossier) actually terminates. `ExitProcess`
+/// is every existing behavior, completely unchanged (`std::process::exit`,
+/// as today). `ExitThread` is new, for a `VmHandle`-embedded VM running on
+/// its own dedicated worker thread (`docs/SPEC.md` §16, the GUI's own
+/// architecture): it terminates ONLY the calling OS thread
+/// (`libc::pthread_exit`), never the process — so a bad guest program can
+/// never take down whatever embedded it.
+///
+/// Deliberately a **thread-local**, not a [`VmOptions`] field.
+/// `VmOptions { .. }` literals exist at over 100 call sites across this
+/// codebase's tests and the CLI; threading a new required field through
+/// all of them for something that answers "how should THIS THREAD behave
+/// when things go fatally wrong," not "how is THIS VM instance
+/// configured," would be both a large mechanical ripple and the wrong
+/// shape — the setting is inherently thread-scoped, matching this whole
+/// design's own "one VM, one dedicated thread" embedding model exactly.
+/// It also uniformly covers the two fatal sites (`memory::alloc`'s eden/
+/// heap exhaustion) that have no `VmState` (not even a `&VmState`) in
+/// scope at all — there is no parameter to thread a `VmOptions`-derived
+/// value through there without a much larger refactor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FatalMode {
+    ExitProcess,
+    ExitThread,
+}
+
+thread_local! {
+    static FATAL_MODE: std::cell::Cell<FatalMode> =
+        const { std::cell::Cell::new(FatalMode::ExitProcess) };
+}
+
+/// Called once, by `VmHandle::boot` (S21 step 2), before any guest code
+/// runs on that (newly spawned, dedicated) thread. Never called by the
+/// CLI or by any test — so [`fatal_exit`]'s default (`ExitProcess`) is
+/// exactly today's behavior everywhere except a `VmHandle`-embedded VM.
+pub(crate) fn set_fatal_mode(mode: FatalMode) {
+    FATAL_MODE.with(|f| f.set(mode));
+}
+
+/// The shared terminal call for every guest-fatal condition (S21 step 1) —
+/// replaces a bare `std::process::exit(code)` at each of those sites.
+/// `ExitThread`'s `pthread_exit` deliberately does NOT unwind the Rust call
+/// stack at all (no `Drop` impls run, no unwind-table walk happens) — unlike
+/// `panic!`/`catch_unwind`, it is sound regardless of whether a JIT-compiled
+/// native frame (no Rust unwind info at all) sits underneath it on the
+/// stack, which is exactly why this mechanism, not a panic-based one, is
+/// used here. Callers on the `ExitThread` path must already have reported
+/// the failure (message/stack-trace, written to `vm.out` exactly as today)
+/// BEFORE calling this — it never returns.
+#[allow(unsafe_code)]
+pub(crate) fn fatal_exit(code: i32) -> ! {
+    match FATAL_MODE.with(std::cell::Cell::get) {
+        FatalMode::ExitProcess => std::process::exit(code),
+        FatalMode::ExitThread => {
+            // SAFETY: terminates only the calling thread; never touches
+            // memory, never returns. `value` (the thread's "exit status"
+            // pointer) is unused by anything that would ever join a
+            // `pthread_exit`ed thread's `JoinHandle` (S21 step 1a's own
+            // finding: a caller must never `.join()`/poll `.is_finished()`
+            // on such a handle at all — `JoinHandle::join()`'s internal
+            // bookkeeping expects the SPAWNED thread's own normal-or-
+            // panicking completion path to run, which `pthread_exit`
+            // skips, so `join()` panics and `is_finished()` never becomes
+            // true; dropping an unjoined handle is safe, per the same
+            // experiment).
+            unsafe { libc::pthread_exit(std::ptr::null_mut()) }
+        }
+    }
+}
+
 /// S10 D6: a side-channel record of one tier transition, pushed/popped
 /// around `interpreter::compiled_call::enter_compiled` — `vm.stack` itself
 /// never grows for a compiled call (S10 compiled code pushes no frame of

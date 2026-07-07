@@ -152,7 +152,7 @@ pub unsafe fn crash_dossier(vm: &mut VmState, regs: &CapturedRegs, trigger: &str
     ring_dump(vm, &mut |line| eprintln!("[9] {line}"));
     eprintln!("==== END DOSSIER (exit 70) ====");
     flush();
-    std::process::exit(70);
+    crate::runtime::vm_state::fatal_exit(70);
 }
 
 /// The fatal-guest-error mini-dossier (docs/DEBUGGER.md §4.1's last row):

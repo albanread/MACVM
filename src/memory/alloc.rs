@@ -88,7 +88,7 @@ pub(crate) fn alloc_words_raw(
         None => {
             let size = words * WORD_SIZE;
             eprintln!("macvm: eden exhausted ({size} bytes requested)");
-            std::process::exit(70);
+            crate::runtime::vm_state::fatal_exit(70);
         }
     }
 }
@@ -156,7 +156,7 @@ pub(crate) fn alloc_indexable_bytes_raw(
 /// exact same terminal handling on a stall rather than a second copy.
 pub(crate) fn stall_exit(err: crate::memory::stall::GcStallError) -> ! {
     eprintln!("{err}");
-    std::process::exit(70);
+    crate::runtime::vm_state::fatal_exit(70);
 }
 
 // --- public layer: VmState-based, used from S2 onward -----------------------

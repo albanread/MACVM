@@ -234,7 +234,7 @@ impl ProcessStack {
     pub fn push(&mut self, v: Oop) {
         if self.try_push(v).is_err() {
             eprintln!("macvm: process stack overflow");
-            std::process::exit(70);
+            crate::runtime::vm_state::fatal_exit(70);
         }
     }
 

@@ -298,7 +298,7 @@ pub fn halt(vm: &mut VmState, method: MethodOop, bci: usize, reason: HaltReason)
             ["continue"] | ["c"] => break,
             ["quit"] => {
                 eprintln!("(halt) quit — exiting process");
-                std::process::exit(0);
+                crate::runtime::vm_state::fatal_exit(0);
             }
             ["bt"] => bt(vm),
             ["frame", n] => match n.parse::<usize>() {
