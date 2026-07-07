@@ -128,7 +128,10 @@ struct NavState {
 
 impl NavState {
     fn new(start: PathBuf) -> Self {
-        Self { history: vec![start], index: 0 }
+        Self {
+            history: vec![start],
+            index: 0,
+        }
     }
     fn current(&self) -> PathBuf {
         self.history[self.index].clone()
@@ -239,7 +242,12 @@ fn navigate_to(path: &Path) {
         display_canvas();
         return;
     }
-    let html = match preprocess::load_and_preprocess(path, current_theme(), current_font_scale_percent(), &current_transcript()) {
+    let html = match preprocess::load_and_preprocess(
+        path,
+        current_theme(),
+        current_font_scale_percent(),
+        &current_transcript(),
+    ) {
         Ok(html) => html,
         Err(e) => {
             eprintln!("macvm-gui: failed to load {}: {e}", path.display());
@@ -305,9 +313,20 @@ fn open_workspace() {
 }
 
 fn display_workspace() {
-    let text = WORKSPACE_TEXT.lock().unwrap().clone().unwrap_or_else(|| workspace_render::initial_text().to_string());
+    let text = WORKSPACE_TEXT
+        .lock()
+        .unwrap()
+        .clone()
+        .unwrap_or_else(|| workspace_render::initial_text().to_string());
     let body = workspace_render::render_workspace(&text);
-    let html = preprocess::render_generated_page("Workspace", &body, &gui_root(), current_theme(), current_font_scale_percent(), &current_transcript());
+    let html = preprocess::render_generated_page(
+        "Workspace",
+        &body,
+        &gui_root(),
+        current_theme(),
+        current_font_scale_percent(),
+        &current_transcript(),
+    );
     display_html(&html);
 }
 
@@ -336,8 +355,16 @@ fn open_canvas() {
 }
 
 fn display_canvas() {
-    let body = canvas_render::render_canvas(canvas_render::DEFAULT_WIDTH, canvas_render::DEFAULT_HEIGHT);
-    let html = preprocess::render_generated_page("Canvas", &body, &gui_root(), current_theme(), current_font_scale_percent(), &current_transcript());
+    let body =
+        canvas_render::render_canvas(canvas_render::DEFAULT_WIDTH, canvas_render::DEFAULT_HEIGHT);
+    let html = preprocess::render_generated_page(
+        "Canvas",
+        &body,
+        &gui_root(),
+        current_theme(),
+        current_font_scale_percent(),
+        &current_transcript(),
+    );
     display_html(&html);
 }
 
@@ -349,21 +376,32 @@ fn display_canvas() {
 fn display_html(html: &str) {
     let rendered_dir = gui_root().join(".rendered");
     if let Err(e) = std::fs::create_dir_all(&rendered_dir) {
-        eprintln!("macvm-gui: failed to create {}: {e}", rendered_dir.display());
+        eprintln!(
+            "macvm-gui: failed to create {}: {e}",
+            rendered_dir.display()
+        );
         return;
     }
     // A single reusable filename: navigation is synchronous from the main
     // thread and one-at-a-time, so there's no concurrent writer to race.
     let rendered_path = rendered_dir.join("current.html");
     if let Err(e) = std::fs::write(&rendered_path, html) {
-        eprintln!("macvm-gui: failed to write {}: {e}", rendered_path.display());
+        eprintln!(
+            "macvm-gui: failed to write {}: {e}",
+            rendered_path.display()
+        );
         return;
     }
 
     let Some(webview) = WEBVIEW.get() else { return };
     let target_url = make_file_url(&rendered_path);
     let access_root_url = make_file_url(&gui_root());
-    objc::send2_id(webview.0, sel("loadFileURL:allowingReadAccessToURL:"), target_url, access_root_url);
+    objc::send2_id(
+        webview.0,
+        sel("loadFileURL:allowingReadAccessToURL:"),
+        target_url,
+        access_root_url,
+    );
 }
 
 fn make_file_url(dir: &Path) -> Id {
@@ -379,13 +417,21 @@ fn make_file_url(dir: &Path) -> Id {
 /// bridge deliberately doesn't implement the block ABI).
 fn eval_js(js: &str) {
     let Some(webview) = WEBVIEW.get() else { return };
-    objc::send2_id(webview.0, sel("evaluateJavaScript:completionHandler:"), objc::nsstring(js), NIL);
+    objc::send2_id(
+        webview.0,
+        sel("evaluateJavaScript:completionHandler:"),
+        objc::nsstring(js),
+        NIL,
+    );
 }
 
 fn js_string_literal(s: &str) -> String {
     format!(
         "\"{}\"",
-        s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n").replace('\r', "")
+        s.replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n")
+            .replace('\r', "")
     )
 }
 
@@ -397,7 +443,10 @@ fn append_transcript(text: &str) {
         }
         buf.push_str(text);
     }
-    eval_js(&format!("window.macvmAppendTranscript({})", js_string_literal(text)));
+    eval_js(&format!(
+        "window.macvmAppendTranscript({})",
+        js_string_literal(text)
+    ));
 }
 
 /// Cut/Copy/Paste/Select All from `smtk.js`'s custom context menu
@@ -498,7 +547,10 @@ extern "C" fn on_script_message(_this: Id, _cmd: Sel, _controller: Id, message: 
             let Some(nav) = NAV.get() else { return };
             let current_dir = {
                 let n = nav.lock().unwrap();
-                n.current().parent().unwrap_or_else(|| Path::new("/")).to_path_buf()
+                n.current()
+                    .parent()
+                    .unwrap_or_else(|| Path::new("/"))
+                    .to_path_buf()
             };
             let target = normalize_path(&current_dir.join(&href));
             nav.lock().unwrap().go(target.clone());
@@ -510,28 +562,40 @@ extern "C" fn on_script_message(_this: Id, _cmd: Sel, _controller: Id, message: 
         // via `vm_bridge_drain`/`replace_pane`, same round trip as `doit`.
         "browserSelectPackage" => {
             if let Some(vm) = VM.get() {
-                vm.submit(vm_host::VmRequest::BrowserSelectPackage { name: dict_get_string(body, "name") });
+                vm.submit(vm_host::VmRequest::BrowserSelectPackage {
+                    name: dict_get_string(body, "name"),
+                });
             }
         }
         "browserSelectClass" => {
             if let Some(vm) = VM.get() {
-                vm.submit(vm_host::VmRequest::BrowserSelectClass { name: dict_get_string(body, "name") });
+                vm.submit(vm_host::VmRequest::BrowserSelectClass {
+                    name: dict_get_string(body, "name"),
+                });
             }
         }
         "browserSelectSide" => {
-            let side = if dict_get_string(body, "side") == "class" { vm_host::Side::Class } else { vm_host::Side::Instance };
+            let side = if dict_get_string(body, "side") == "class" {
+                vm_host::Side::Class
+            } else {
+                vm_host::Side::Instance
+            };
             if let Some(vm) = VM.get() {
                 vm.submit(vm_host::VmRequest::BrowserSelectSide { side });
             }
         }
         "browserSelectCategory" => {
             if let Some(vm) = VM.get() {
-                vm.submit(vm_host::VmRequest::BrowserSelectCategory { name: dict_get_string(body, "name") });
+                vm.submit(vm_host::VmRequest::BrowserSelectCategory {
+                    name: dict_get_string(body, "name"),
+                });
             }
         }
         "browserSelectMethod" => {
             if let Some(vm) = VM.get() {
-                vm.submit(vm_host::VmRequest::BrowserSelectMethod { selector: dict_get_string(body, "name") });
+                vm.submit(vm_host::VmRequest::BrowserSelectMethod {
+                    selector: dict_get_string(body, "name"),
+                });
             }
         }
         "browserSaveSource" => {
@@ -579,7 +643,9 @@ extern "C" fn on_script_message(_this: Id, _cmd: Sel, _controller: Id, message: 
         }
         "workspacePrintIt" => {
             if let Some(vm) = VM.get() {
-                vm.submit(vm_host::VmRequest::WorkspacePrintIt { code: dict_get_string(body, "code") });
+                vm.submit(vm_host::VmRequest::WorkspacePrintIt {
+                    code: dict_get_string(body, "code"),
+                });
             }
         }
         "workspaceTextChanged" => {
@@ -634,13 +700,19 @@ const NS_CONTROL_STATE_VALUE_OFF: i64 = 0;
 
 /// Reflect the active theme as a checkmark on every Theme-menu item.
 fn update_theme_menu_checkmarks() {
-    let Some(items) = THEME_MENU_ITEMS.get() else { return };
+    let Some(items) = THEME_MENU_ITEMS.get() else {
+        return;
+    };
     let current = current_theme();
     for (theme, item) in items {
         objc::send1_i64(
             item.0,
             sel("setState:"),
-            if *theme == current { NS_CONTROL_STATE_VALUE_ON } else { NS_CONTROL_STATE_VALUE_OFF },
+            if *theme == current {
+                NS_CONTROL_STATE_VALUE_ON
+            } else {
+                NS_CONTROL_STATE_VALUE_OFF
+            },
         );
     }
 }
@@ -696,13 +768,48 @@ extern "C" fn theme_menu_select_alto_mono(_this: Id, _cmd: Sel, _sender: Id) {
 /// them.
 fn build_theme_delegate() -> Id {
     let cls = objc::allocate_class(objc::get_class("NSObject"), "MacvmThemeDelegate");
-    objc::add_method(cls, sel("selectClassicTheme:"), theme_menu_select_classic as *const _, "v@:@");
-    objc::add_method(cls, sel("selectHiDefTheme:"), theme_menu_select_hidef as *const _, "v@:@");
-    objc::add_method(cls, sel("selectDarkTheme:"), theme_menu_select_dark as *const _, "v@:@");
-    objc::add_method(cls, sel("selectCrtAmberTheme:"), theme_menu_select_crt_amber as *const _, "v@:@");
-    objc::add_method(cls, sel("selectCrtGreenTheme:"), theme_menu_select_crt_green as *const _, "v@:@");
-    objc::add_method(cls, sel("selectSqueakTheme:"), theme_menu_select_squeak as *const _, "v@:@");
-    objc::add_method(cls, sel("selectAltoMonoTheme:"), theme_menu_select_alto_mono as *const _, "v@:@");
+    objc::add_method(
+        cls,
+        sel("selectClassicTheme:"),
+        theme_menu_select_classic as *const _,
+        "v@:@",
+    );
+    objc::add_method(
+        cls,
+        sel("selectHiDefTheme:"),
+        theme_menu_select_hidef as *const _,
+        "v@:@",
+    );
+    objc::add_method(
+        cls,
+        sel("selectDarkTheme:"),
+        theme_menu_select_dark as *const _,
+        "v@:@",
+    );
+    objc::add_method(
+        cls,
+        sel("selectCrtAmberTheme:"),
+        theme_menu_select_crt_amber as *const _,
+        "v@:@",
+    );
+    objc::add_method(
+        cls,
+        sel("selectCrtGreenTheme:"),
+        theme_menu_select_crt_green as *const _,
+        "v@:@",
+    );
+    objc::add_method(
+        cls,
+        sel("selectSqueakTheme:"),
+        theme_menu_select_squeak as *const _,
+        "v@:@",
+    );
+    objc::add_method(
+        cls,
+        sel("selectAltoMonoTheme:"),
+        theme_menu_select_alto_mono as *const _,
+        "v@:@",
+    );
     objc::register_class(cls);
     objc::alloc_init("MacvmThemeDelegate")
 }
@@ -719,12 +826,21 @@ extern "C" fn open_macvm_help(_this: Id, _cmd: Sel, _sender: Id) {
 /// reasoning as `build_theme_delegate`.
 fn build_help_delegate() -> Id {
     let cls = objc::allocate_class(objc::get_class("NSObject"), "MacvmHelpDelegate");
-    objc::add_method(cls, sel("openMacvmHelp:"), open_macvm_help as *const _, "v@:@");
+    objc::add_method(
+        cls,
+        sel("openMacvmHelp:"),
+        open_macvm_help as *const _,
+        "v@:@",
+    );
     objc::register_class(cls);
     objc::alloc_init("MacvmHelpDelegate")
 }
 
-extern "C" fn app_should_terminate_after_last_window_closed(_this: Id, _cmd: Sel, _sender: Id) -> bool {
+extern "C" fn app_should_terminate_after_last_window_closed(
+    _this: Id,
+    _cmd: Sel,
+    _sender: Id,
+) -> bool {
     true
 }
 
@@ -742,7 +858,12 @@ fn build_quit_on_last_window_delegate() -> Id {
 
 fn build_message_handler() -> Id {
     let cls = objc::allocate_class(objc::get_class("NSObject"), "MacvmScriptMessageHandler");
-    objc::add_method(cls, sel("userContentController:didReceiveScriptMessage:"), on_script_message as *const _, "v@:@@");
+    objc::add_method(
+        cls,
+        sel("userContentController:didReceiveScriptMessage:"),
+        on_script_message as *const _,
+        "v@:@@",
+    );
     objc::register_class(cls);
     objc::alloc_init("MacvmScriptMessageHandler")
 }
@@ -755,26 +876,55 @@ fn build_message_handler() -> Id {
 /// (not just one) — `performSelector:` calls can coalesce in principle, and
 /// this is cheap and correct either way.
 extern "C" fn vm_bridge_drain(_this: Id, _cmd: Sel, _arg: Id) {
-    for response in vm_host::drain_responses() {
+    let Some(vm) = VM.get() else { return };
+    for response in vm.drain_responses() {
         match response {
             vm_host::VmResponse::Transcript(text) => append_transcript(&text),
-            vm_host::VmResponse::BrowserPanes { packages_html, classes_html, categories_html, methods_html, source_html } => {
+            vm_host::VmResponse::BrowserPanes {
+                packages_html,
+                classes_html,
+                categories_html,
+                methods_html,
+                source_html,
+            } => {
                 replace_pane("macvm-browser-packages", &packages_html);
                 replace_pane("macvm-browser-classes", &classes_html);
                 replace_pane("macvm-browser-categories", &categories_html);
                 replace_pane("macvm-browser-methods", &methods_html);
                 replace_pane("macvm-browser-source", &source_html);
             }
-            vm_host::VmResponse::BrowserOpened { packages_html, classes_html, categories_html, methods_html, source_html } => {
+            vm_host::VmResponse::BrowserOpened {
+                packages_html,
+                classes_html,
+                categories_html,
+                methods_html,
+                source_html,
+            } => {
                 // The only place a fresh page gets built from real data
                 // rather than patched into an existing one — see
                 // `browser_render::assemble_panes`'s doc comment for why.
-                let body = browser_render::assemble_panes(&packages_html, &classes_html, &categories_html, &methods_html, &source_html);
-                let html = preprocess::render_generated_page("Class Browser", &body, &gui_root(), current_theme(), current_font_scale_percent(), &current_transcript());
+                let body = browser_render::assemble_panes(
+                    &packages_html,
+                    &classes_html,
+                    &categories_html,
+                    &methods_html,
+                    &source_html,
+                );
+                let html = preprocess::render_generated_page(
+                    "Class Browser",
+                    &body,
+                    &gui_root(),
+                    current_theme(),
+                    current_font_scale_percent(),
+                    &current_transcript(),
+                );
                 display_html(&html);
             }
             vm_host::VmResponse::WorkspacePrintResult { text } => {
-                eval_js(&format!("window.macvmInsertPrintResult({})", js_string_literal(&text)));
+                eval_js(&format!(
+                    "window.macvmInsertPrintResult({})",
+                    js_string_literal(&text)
+                ));
             }
             vm_host::VmResponse::CanvasCreated { id, width, height } => {
                 // The response is the authority on size, not the page's
@@ -782,10 +932,15 @@ extern "C" fn vm_bridge_drain(_this: Id, _cmd: Sel, _arg: Id) {
                 // keeps the `<canvas>` pixel buffer in sync if a future
                 // `Canvas extent:` ever requests a size other than the
                 // default this view opens with.
-                eval_js(&format!("window.macvmCanvasCreated({id}, {width}, {height})"));
+                eval_js(&format!(
+                    "window.macvmCanvasCreated({id}, {width}, {height})"
+                ));
             }
             vm_host::VmResponse::CanvasDraw { id, commands_json } => {
-                eval_js(&format!("window.macvmCanvasDraw({id}, {})", js_string_literal(&commands_json)));
+                eval_js(&format!(
+                    "window.macvmCanvasDraw({id}, {})",
+                    js_string_literal(&commands_json)
+                ));
             }
             vm_host::VmResponse::CanvasCleared { .. } => {
                 // No DOM action of its own — the paired `CanvasDraw`
@@ -794,6 +949,12 @@ extern "C" fn vm_bridge_drain(_this: Id, _cmd: Sel, _arg: Id) {
                 // This variant exists for a future GUI-side content
                 // cache/replay-on-reopen (`../docs/CANVAS.md` §7) to
                 // invalidate against, not for anything the DOM needs today.
+            }
+            vm_host::VmResponse::WorkerIdle => {
+                // Never actually delivered here — `VmHost::drain_responses`
+                // consumes the worker-liveness marker internally and never
+                // returns it (see that variant's doc). This arm exists only
+                // to keep the match exhaustive.
             }
         }
     }
@@ -820,7 +981,12 @@ fn replace_pane(dom_id: &str, html: &str) {
 
 fn build_vm_bridge() -> Id {
     let cls = objc::allocate_class(objc::get_class("NSObject"), "MacvmVmBridge");
-    objc::add_method(cls, sel("drainVmResponses:"), vm_bridge_drain as *const _, "v@:@");
+    objc::add_method(
+        cls,
+        sel("drainVmResponses:"),
+        vm_bridge_drain as *const _,
+        "v@:@",
+    );
     objc::register_class(cls);
     objc::alloc_init("MacvmVmBridge")
 }
@@ -844,7 +1010,13 @@ fn separator_item() -> Id {
 
 fn submenu(title: &str, items: &[Id]) -> Id {
     let menu_item = objc::send0(objc::get_class("NSMenuItem"), sel("alloc"));
-    let menu_item = objc::send3_id(menu_item, sel("initWithTitle:action:keyEquivalent:"), objc::nsstring(title), NIL, objc::nsstring(""));
+    let menu_item = objc::send3_id(
+        menu_item,
+        sel("initWithTitle:action:keyEquivalent:"),
+        objc::nsstring(title),
+        NIL,
+        objc::nsstring(""),
+    );
     let menu = objc::alloc_init("NSMenu");
     for &item in items {
         objc::send1_id(menu, sel("addItem:"), item);
@@ -865,12 +1037,13 @@ const NS_APPLICATION_ACTIVATION_POLICY_REGULAR: i64 = 0;
 
 fn build_menu_bar() {
     let app = objc::send0(objc::get_class("NSApplication"), sel("sharedApplication"));
-    objc::send1_i64(app, sel("setActivationPolicy:"), NS_APPLICATION_ACTIVATION_POLICY_REGULAR);
-
-    let app_menu = submenu(
-        "MACVM",
-        &[menu_item("Quit MACVM", Some("terminate:"), "q")],
+    objc::send1_i64(
+        app,
+        sel("setActivationPolicy:"),
+        NS_APPLICATION_ACTIVATION_POLICY_REGULAR,
     );
+
+    let app_menu = submenu("MACVM", &[menu_item("Quit MACVM", Some("terminate:"), "q")]);
     let file_menu = submenu(
         "File",
         &[menu_item("Close Window", Some("performClose:"), "w")],
@@ -926,7 +1099,10 @@ fn build_theme_menu() -> Id {
         menu_items.push(item);
     }
 
-    THEME_MENU_ITEMS.set(checkmark_entries).ok().expect("build_theme_menu called twice");
+    THEME_MENU_ITEMS
+        .set(checkmark_entries)
+        .ok()
+        .expect("build_theme_menu called twice");
     update_theme_menu_checkmarks();
 
     submenu("Theme", &menu_items)
@@ -964,11 +1140,26 @@ fn build_window_and_webview() {
     );
 
     let webview = objc::send0(objc::get_class("WKWebView"), sel("alloc"));
-    let webview = objc::send_frame_config_init(webview, sel("initWithFrame:configuration:"), 0.0, 0.0, 980.0, 760.0, config);
-    objc::send1_i64(webview, sel("setAutoresizingMask:"), AUTORESIZING_WIDTH_HEIGHT_SIZABLE as i64);
+    let webview = objc::send_frame_config_init(
+        webview,
+        sel("initWithFrame:configuration:"),
+        0.0,
+        0.0,
+        980.0,
+        760.0,
+        config,
+    );
+    objc::send1_i64(
+        webview,
+        sel("setAutoresizingMask:"),
+        AUTORESIZING_WIDTH_HEIGHT_SIZABLE as i64,
+    );
     objc::send1_id(window, sel("setContentView:"), webview);
 
-    WEBVIEW.set(MainThreadPtr(webview)).ok().expect("build_window_and_webview called twice");
+    WEBVIEW
+        .set(MainThreadPtr(webview))
+        .ok()
+        .expect("build_window_and_webview called twice");
 
     objc::send1_id(window, sel("makeKeyAndOrderFront:"), NIL);
 }
@@ -978,13 +1169,18 @@ fn main() {
 
     let start = start_page();
     if !start.exists() {
-        eprintln!("macvm-gui: {} not found — is CARGO_MANIFEST_DIR wired up correctly?", start.display());
+        eprintln!(
+            "macvm-gui: {} not found — is CARGO_MANIFEST_DIR wired up correctly?",
+            start.display()
+        );
         std::process::exit(1);
     }
     NAV.set(Mutex::new(NavState::new(start.clone()))).ok();
 
     let vm_bridge = build_vm_bridge();
-    VM.set(vm_host::spawn(vm_bridge, sel("drainVmResponses:"))).ok().expect("VM.set called twice");
+    VM.set(vm_host::spawn(vm_bridge, sel("drainVmResponses:")))
+        .ok()
+        .expect("VM.set called twice");
 
     build_menu_bar();
     build_window_and_webview();

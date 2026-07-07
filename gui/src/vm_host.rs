@@ -67,15 +67,18 @@
 //! mutex" — the request channel is already the synchronization.
 
 #![allow(dead_code)] // LatestSlot has no producer yet — no bulk/continuous
-                      // response exists until a real VM or smappl widget
-                      // needs one; see this module's doc comment.
+                     // response exists until a real VM or smappl widget
+                     // needs one; see this module's doc comment.
 
 use crate::browser_render::{self, BrowserSelection, SourceEditTarget};
 use crate::objc::{self, Id, Sel};
+use macvm::embed::{TranscriptSink, VmHandle};
 use macvm_mock_vm::MockWorld;
 pub use macvm_mock_vm::Side;
+use std::path::Path;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 /// GUI → VM. `Doit` is the only one with a real (stub) handler; the
 /// `BrowserSelect*` variants drive the class browser view
@@ -84,18 +87,30 @@ use std::sync::Mutex;
 /// mirror layer. Real mirror queries/accepts join `Doit` once G2 gives them
 /// something real to ask the VM thread for.
 pub enum VmRequest {
-    Doit { code: String },
+    Doit {
+        code: String,
+    },
     /// Reset the worker's `BrowserSelection` to match the fresh default
     /// state the initial page render always shows (see
     /// `main.rs::open_class_browser`) — sent once whenever the browser
     /// view (re)opens, so the worker's retained selection can't drift out
     /// of sync with what's actually on screen.
     BrowserOpen,
-    BrowserSelectPackage { name: String },
-    BrowserSelectClass { name: String },
-    BrowserSelectSide { side: Side },
-    BrowserSelectCategory { name: String },
-    BrowserSelectMethod { selector: String },
+    BrowserSelectPackage {
+        name: String,
+    },
+    BrowserSelectClass {
+        name: String,
+    },
+    BrowserSelectSide {
+        side: Side,
+    },
+    BrowserSelectCategory {
+        name: String,
+    },
+    BrowserSelectMethod {
+        selector: String,
+    },
     /// Cmd+S in the source pane's editor (`../smtk.js`) — "accept" the
     /// edited text against whatever the worker's `selection.edit_target`
     /// currently points at (a method, the class comment, the class
@@ -163,14 +178,19 @@ pub enum VmRequest {
     /// printString directly (`Result<String, GuestError>`), so this is
     /// shaped to become a near-direct caller of it, not a stand-in that'll
     /// need reshaping later.
-    WorkspacePrintIt { code: String },
+    WorkspacePrintIt {
+        code: String,
+    },
     /// "Smalltalk allocates a widget of a specific size" (`docs/CANVAS.md`
     /// §5.1) — stands in for a real `Canvas extent: w @ h` send (no VM-side
     /// primitive exists yet, same "prove the wire mechanics, don't
     /// simulate evaluation" posture as `WorkspacePrintIt`). Always
     /// (re)creates the single `id: 0` canvas — multiple simultaneous
     /// canvases are deferred (`docs/CANVAS.md` §7).
-    CanvasCreate { width: u32, height: u32 },
+    CanvasCreate {
+        width: u32,
+        height: u32,
+    },
     /// The Canvas view's (`canvas_render.rs`, `../../docs/CANVAS.md`)
     /// "Run Demo" button — same stand-in posture as `CanvasCreate`.
     CanvasRunDemo,
@@ -188,6 +208,7 @@ pub enum VmRequest {
 /// grained per-node form `docs/APPS.md` §5.1 describes; this is deliberately
 /// the simplest thing that lets the browser *view* and the *messaging
 /// protocol* be built and tested now.
+#[derive(Debug)]
 pub enum VmResponse {
     Transcript(String),
     BrowserPanes {
@@ -214,18 +235,42 @@ pub enum VmResponse {
     /// workspace's textarea right after the selection that was evaluated,
     /// rather than routing it to the transcript (`smtk.js`'s
     /// `macvmInsertPrintResult`).
-    WorkspacePrintResult { text: String },
+    WorkspacePrintResult {
+        text: String,
+    },
     /// Answers `CanvasCreate` — `main.rs` (re)sets the `<canvas>` element's
     /// `width`/`height` attributes (which, per the HTML5 canvas spec,
     /// clears its content as a side effect — matches "allocate a widget of
     /// a specific size" reading as a fresh surface, not a resize-in-place).
-    CanvasCreated { id: u32, width: u32, height: u32 },
+    CanvasCreated {
+        id: u32,
+        width: u32,
+        height: u32,
+    },
     /// Answers `CanvasRunDemo` — `commands_json` is a JSON array of
     /// `[opName, ...args]` (`docs/CANVAS.md` §5.2), executed by
     /// `smtk.js`'s `macvmCanvasDraw` against a real `CanvasRenderingContext2D`.
-    CanvasDraw { id: u32, commands_json: String },
+    CanvasDraw {
+        id: u32,
+        commands_json: String,
+    },
     /// Answers `CanvasClear`.
-    CanvasCleared { id: u32 },
+    CanvasCleared {
+        id: u32,
+    },
+    /// Internal supervisor liveness marker (S21 step 3) — NOT a UI response.
+    /// The worker sends one after fully completing each request, i.e. once
+    /// it is back to idle and provably still alive. `VmHost::drain_responses`
+    /// consumes it (clearing the in-flight timer) and never forwards it, so
+    /// the main thread never actually receives it — the arm in
+    /// `main.rs::vm_bridge_drain` exists only to satisfy match exhaustiveness.
+    /// The whole point: a worker that dies mid-request via
+    /// `FatalMode::ExitThread` (`libc::pthread_exit`, `embed.rs`) never
+    /// reaches this send, and because `pthread_exit` also leaks the request-
+    /// channel receiver (no `Drop`, so `Sender::send` keeps succeeding and
+    /// can't report the death), this absent marker is the ONLY signal the
+    /// worker is gone — see [`WORKER_RESPONSE_TIMEOUT`].
+    WorkerIdle,
 }
 
 /// `Id`/`Sel` are raw pointers, not `Send` by default. Safe to send into the
@@ -233,51 +278,217 @@ pub enum VmResponse {
 /// as arguments to `performSelector:withObject:waitUntilDone:`
 /// (`objc.rs`), which is itself documented as safe to call from any
 /// thread — unlike arbitrary AppKit/WebKit message sends, which are
-/// main-thread-only.
+/// main-thread-only. `Clone`/`Copy` (both fields are plain pointers) so
+/// `ChannelTranscript` (S21) can hold its own copy alongside the worker
+/// loop's.
+#[derive(Clone, Copy)]
 struct CrossThreadObjcRef(Id, Sel);
 unsafe impl Send for CrossThreadObjcRef {}
 
-/// Handle held on the main thread: submits requests, owns the worker
-/// thread's `JoinHandle` (dropped, i.e. detached — this is a long-lived
-/// background thread for the process's lifetime, same as the app itself).
-pub struct VmHost {
+impl CrossThreadObjcRef {
+    /// Wake the main thread to drain responses. A NIL target means "no main
+    /// thread to wake" (tests drive `drain_responses` directly) — short-
+    /// circuited here so a headless test needs no Objective-C runtime at
+    /// all, rather than relying on `objc_msgSend`-to-nil being a no-op.
+    fn notify(self) {
+        if self.0.is_null() {
+            return;
+        }
+        objc::perform_selector_on_main_thread(self.0, self.1, objc::NIL, false);
+    }
+}
+
+/// How long `VmHost::submit` waits for ANY response before assuming the
+/// worker thread is gone and respawning (S21 step 3 — "if the language
+/// thread dies, the GUI must not die"). Generous on purpose: a real
+/// Smalltalk doit can legitimately run for a while, and a false-positive
+/// respawn would abandon a still-live computation. This is the ONLY
+/// detection mechanism, not a fallback for a rarer case: a worker that
+/// terminates via `FatalMode::ExitThread` (`libc::pthread_exit`) runs no
+/// `Drop` glue at all, so the response channel never reports disconnected
+/// and `JoinHandle::join()`/`.is_finished()` panic/hang (see `embed.rs`'s
+/// module doc) — a bounded "nothing came back" timeout is the only signal
+/// available for that death mode. An ordinary Rust panic (not one of
+/// `embed.rs`'s `fatal_exit` sites) disconnects the channel immediately
+/// instead, which `submit` also handles, faster than this timeout.
+const WORKER_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The mutable state a respawn must replace atomically — kept together so
+/// "swap in a fresh worker" can never leave the request/response halves
+/// pointing at two different worker generations.
+struct HostInner {
     requests: Sender<VmRequest>,
+    responses: Receiver<VmResponse>,
+    /// Held ONLY so it can be `drop()`-ped when superseded — NEVER
+    /// `.join()`-ed or `.is_finished()`-polled (see `WORKER_RESPONSE_
+    /// TIMEOUT`'s own doc for why).
+    #[allow(dead_code)]
+    worker: std::thread::JoinHandle<()>,
+    wake: CrossThreadObjcRef,
+    world_dir: std::path::PathBuf,
+    timeout: Duration,
+    /// `Some(t)` from the moment a request is sent until the worker signals
+    /// it finished that request (a `VmResponse::WorkerIdle` marker, cleared
+    /// in `drain_responses`). Crucially NOT cleared by ordinary responses:
+    /// a fatal doit emits its error transcript (via `ChannelTranscript`)
+    /// and only THEN `pthread_exit`s, so clearing on any output would hide
+    /// exactly the death this is meant to catch. If `submit` finds this
+    /// still `Some` and older than `timeout`, the worker is presumed dead.
+    pending_since: Option<Instant>,
+}
+
+/// Handle held on the main thread: submits requests, drains responses, and
+/// transparently respawns the worker thread if it ever stops responding.
+pub struct VmHost {
+    inner: Mutex<HostInner>,
 }
 
 impl VmHost {
     pub fn submit(&self, request: VmRequest) {
-        // The only failure mode is the worker thread having panicked and
-        // dropped its receiver; nothing productive to do from here but
-        // drop the request rather than panic the UI thread over it.
-        let _ = self.requests.send(request);
+        let mut inner = self.inner.lock().unwrap();
+        if inner
+            .pending_since
+            .is_some_and(|t| t.elapsed() > inner.timeout)
+        {
+            respawn(&mut inner);
+        }
+        let request = match inner.requests.send(request) {
+            Ok(()) => {
+                inner.pending_since = Some(Instant::now());
+                return;
+            }
+            Err(mpsc::SendError(request)) => request,
+        };
+        // The worker's receiver is already gone even though we hadn't yet
+        // timed out waiting for it — an ordinary Rust panic disconnects
+        // the channel immediately (unlike a `pthread_exit` death, which
+        // disconnects nothing at all). Respawn now and deliver this
+        // request to the fresh worker instead of dropping it.
+        respawn(&mut inner);
+        let _ = inner.requests.send(request);
+        inner.pending_since = Some(Instant::now());
+    }
+
+    /// Drain whatever responses have arrived since the last call. Called
+    /// from the main-thread selector `perform_selector_on_main_thread`
+    /// triggers. `WorkerIdle` markers are consumed here (clearing the
+    /// in-flight timer) and never returned — see that variant's doc.
+    pub fn drain_responses(&self) -> Vec<VmResponse> {
+        let mut inner = self.inner.lock().unwrap();
+        let mut out = Vec::new();
+        while let Ok(response) = inner.responses.try_recv() {
+            match response {
+                VmResponse::WorkerIdle => inner.pending_since = None,
+                other => out.push(other),
+            }
+        }
+        out
     }
 }
 
-/// Response queue drained on the main thread. A `Mutex<Receiver<..>>`
-/// rather than a lock-free structure: contention is a non-issue (one
-/// producer thread, one consumer callback, low frequency), and `Receiver`
-/// needs `&mut self` for `try_recv`.
-static RESPONSES: Mutex<Option<Receiver<VmResponse>>> = Mutex::new(None);
+/// One worker generation's channel endpoints + thread handle, as produced
+/// by `spawn_worker` — grouped so a respawn always replaces all three
+/// together (never a torn mix of an old receiver with a new sender, etc).
+struct WorkerHandles {
+    requests: Sender<VmRequest>,
+    responses: Receiver<VmResponse>,
+    /// A clone of the worker's own response sender, for injecting a
+    /// supervisor-level notice (e.g. "restarted") that doesn't come from
+    /// the worker itself. `mpsc::Sender` is multi-producer by design —
+    /// holding a second clone alongside the worker's own doesn't change
+    /// anything about the channel's behavior or lifetime.
+    notices: Sender<VmResponse>,
+    worker: std::thread::JoinHandle<()>,
+}
+
+fn spawn_worker(wake: CrossThreadObjcRef, world_dir: std::path::PathBuf) -> WorkerHandles {
+    let (request_tx, request_rx) = mpsc::channel::<VmRequest>();
+    let (response_tx, response_rx) = mpsc::channel::<VmResponse>();
+    let notices = response_tx.clone();
+    let worker = std::thread::spawn(move || {
+        worker_loop(request_rx, response_tx, wake, &world_dir);
+    });
+    WorkerHandles {
+        requests: request_tx,
+        responses: response_rx,
+        notices,
+        worker,
+    }
+}
+
+/// Replaces `inner`'s worker with a brand new one (fresh channels, fresh
+/// `VmHandle`, on a fresh OS thread) and drops the stale `JoinHandle` (safe
+/// — never joined). Queues a transcript notice on the FRESH channel so the
+/// user sees why their workspace just "came back."
+fn respawn(inner: &mut HostInner) {
+    let w = spawn_worker(inner.wake, inner.world_dir.clone());
+    let _ = w.notices.send(VmResponse::Transcript(
+        "--- the language thread stopped responding; a fresh one has been started ---".to_string(),
+    ));
+    inner.requests = w.requests;
+    inner.responses = w.responses;
+    inner.worker = w.worker;
+    inner.pending_since = None;
+}
 
 /// Spawn the VM worker thread and wire it to wake `main_thread_target` (via
 /// `drain_selector`) on the main thread whenever a response is ready.
-/// `drain_selector`'s method should call [`drain_responses`] and apply each
-/// one (see `main.rs::build_vm_bridge`/`vm_bridge_drain_responses`).
+/// `drain_selector`'s method should call [`VmHost::drain_responses`] and
+/// apply each one (see `main.rs::build_vm_bridge`/`vm_bridge_drain`). The
+/// world directory defaults to `world` (relative to the process's own
+/// launch directory, same convention as the CLI's `--world`, `main.rs::
+/// load_world_with_warning`), overridable via `MACVM_WORLD_PATH` — reading
+/// (not mutating) an env var here is race-free even under a parallel test
+/// runner (see `spawn_with_world_and_timeout`'s own doc for why tests use
+/// an explicit path instead of this env var regardless).
 pub fn spawn(main_thread_target: Id, drain_selector: Sel) -> VmHost {
-    let (request_tx, request_rx) = mpsc::channel::<VmRequest>();
-    let (response_tx, response_rx) = mpsc::channel::<VmResponse>();
-    *RESPONSES.lock().unwrap() = Some(response_rx);
-
-    let wake = CrossThreadObjcRef(main_thread_target, drain_selector);
-    std::thread::spawn(move || {
-        let wake = wake; // moved in, lives for the thread's duration
-        worker_loop(request_rx, response_tx, &wake);
-    });
-
-    VmHost { requests: request_tx }
+    let world_dir = std::env::var_os("MACVM_WORLD_PATH")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("world"));
+    spawn_with_world_and_timeout(
+        main_thread_target,
+        drain_selector,
+        world_dir,
+        WORKER_RESPONSE_TIMEOUT,
+    )
 }
 
-fn worker_loop(requests: Receiver<VmRequest>, responses: Sender<VmResponse>, wake: &CrossThreadObjcRef) {
+/// `spawn`'s fully-parameterized form — a testability seam, not a second
+/// production entry point. Real callers always go through `spawn` (fixed
+/// world-directory convention, the real 30s timeout); tests need an
+/// explicit `world_dir` (`cargo test`'s working directory is the crate
+/// root, `gui/`, not the workspace root `world/` lives in — env var
+/// mutation to fix that up would race under a parallel test runner, per
+/// `tests/common/mod.rs`'s own established rule in the main crate) and a
+/// much shorter `timeout` (so a respawn test doesn't need to sleep 30 real
+/// seconds).
+fn spawn_with_world_and_timeout(
+    main_thread_target: Id,
+    drain_selector: Sel,
+    world_dir: std::path::PathBuf,
+    timeout: Duration,
+) -> VmHost {
+    let wake = CrossThreadObjcRef(main_thread_target, drain_selector);
+    let w = spawn_worker(wake, world_dir.clone());
+    VmHost {
+        inner: Mutex::new(HostInner {
+            requests: w.requests,
+            responses: w.responses,
+            worker: w.worker,
+            wake,
+            world_dir,
+            timeout,
+            pending_since: None,
+        }),
+    }
+}
+
+fn worker_loop(
+    requests: Receiver<VmRequest>,
+    responses: Sender<VmResponse>,
+    wake: CrossThreadObjcRef,
+    world_dir: &Path,
+) {
     // Owned entirely by this thread — no `Mutex`, no `static`. The UI
     // thread never touches `world`/`selection` directly, only ever asks
     // for a change via a `VmRequest`; see this module's doc comment on
@@ -290,10 +501,30 @@ fn worker_loop(requests: Receiver<VmRequest>, responses: Sender<VmResponse>, wak
         None => MockWorld::seed(),
     };
     let mut selection = BrowserSelection::default();
+
+    // S21 step 3: the real embedded VM for the Workspace's Doit/
+    // WorkspacePrintIt path (Browser/Canvas above stay on the mock — see
+    // this module's doc comment). A boot failure isn't a guest crash (it's
+    // reported here once and this worker generation simply ends); the next
+    // request submitted from the main thread will find no response arrives
+    // in time and `VmHost::submit` will respawn, retrying boot fresh.
+    let mut vm = match boot_real_vm(responses.clone(), wake, world_dir) {
+        Some(vm) => vm,
+        None => return,
+    };
+
     for request in requests {
-        let batch = handle(request, &mut world, &mut selection, image.as_ref());
+        let batch = handle(request, &mut world, &mut selection, image.as_ref(), &mut vm);
+        // Reaching HERE (rather than `pthread_exit`ing inside `handle` on a
+        // fatal guest condition) is exactly the "still alive" fact the
+        // WorkerIdle marker below reports — so it is sent unconditionally
+        // AFTER the batch, as the last thing each iteration does before
+        // blocking for the next request.
         let mut disconnected = false;
-        for response in batch {
+        for response in batch
+            .into_iter()
+            .chain(std::iter::once(VmResponse::WorkerIdle))
+        {
             if responses.send(response).is_err() {
                 disconnected = true; // main thread's receiver is gone
                 break;
@@ -302,7 +533,56 @@ fn worker_loop(requests: Receiver<VmRequest>, responses: Sender<VmResponse>, wak
         if disconnected {
             break;
         }
-        objc::perform_selector_on_main_thread(wake.0, wake.1, objc::NIL, false);
+        wake.notify();
+    }
+}
+
+/// Routes `Transcript show:`/`printOnStdout:` output (SPEC §16.2) onto the
+/// worker's own response channel as ordinary `VmResponse::Transcript`
+/// messages, waking the main thread after EVERY line rather than only once
+/// the whole request finishes. That immediacy matters most for the case
+/// this whole sprint (S21) exists to handle: a fatal guest condition writes
+/// its error message here BEFORE the worker thread terminates
+/// (`FatalMode::ExitThread`/`fatal_exit`, `embed.rs`) — batching the wake
+/// until `handle` returns would mean it never fires at all for that
+/// request, since `handle` never returns in that case.
+struct ChannelTranscript {
+    responses: Sender<VmResponse>,
+    wake: CrossThreadObjcRef,
+}
+
+impl TranscriptSink for ChannelTranscript {
+    fn show(&mut self, text: &str) {
+        if self
+            .responses
+            .send(VmResponse::Transcript(text.to_string()))
+            .is_ok()
+        {
+            self.wake.notify();
+        }
+    }
+}
+
+/// Boots the real embedded VM (SPEC §16.2, `src/embed.rs`) against
+/// `world_dir`. Reads `MACVM_JIT`/`MACVM_HEAP`/etc. from the environment
+/// like any other MACVM entry point (`VmOptions::from_env`); nothing here
+/// restricts the JIT — it is fully supported (S21's own directive).
+fn boot_real_vm(
+    responses: Sender<VmResponse>,
+    wake: CrossThreadObjcRef,
+    world_dir: &Path,
+) -> Option<VmHandle> {
+    let opts = macvm::runtime::VmOptions::from_env();
+    match VmHandle::boot(opts, world_dir) {
+        Ok(mut vm) => {
+            vm.set_transcript(Box::new(ChannelTranscript { responses, wake }));
+            Some(vm)
+        }
+        Err(e) => {
+            let _ = responses.send(VmResponse::Transcript(format!("VM boot failed: {}", e.msg)));
+            wake.notify();
+            None
+        }
     }
 }
 
@@ -372,30 +652,57 @@ fn mock_world_from_image(image: &image_store::Image) -> MockWorld {
     let mut world = MockWorld::empty();
     let classes = image.all_classes().unwrap_or_default();
     for c in &classes {
-        world.add_class(&c.name, c.superclass.as_deref(), &c.category, &c.comment, &c.instance_vars, &c.class_vars);
+        world.add_class(
+            &c.name,
+            c.superclass.as_deref(),
+            &c.category,
+            &c.comment,
+            &c.instance_vars,
+            &c.class_vars,
+        );
     }
     for c in &classes {
         for m in image.all_methods_of(&c.name).unwrap_or_default() {
-            world.add_method(&c.name, side_from_image(m.side), &m.selector, &m.category, &m.source);
+            world.add_method(
+                &c.name,
+                side_from_image(m.side),
+                &m.selector,
+                &m.category,
+                &m.source,
+            );
         }
     }
     world
 }
 
-/// Stand-in for `VmHandle::eval` (SPEC §16.2) — the exact G1 stub behavior
-/// `main.rs` used to run inline on the main thread, now running on the
-/// worker thread instead. Swap the `Doit` arm's body for a real
-/// `vm.eval(&code)` call once G2 lands; the threading around it doesn't
-/// need to change. The `BrowserSelect*` arms update `selection` then
+/// `Doit`/`WorkspacePrintIt` (S21 step 3) call the real `vm.eval` — see
+/// `boot_real_vm`. Every other request is still the Browser/Canvas mock
+/// (`docs/SPEC.md` §16.3's mirror-primitive bridge is a separate, later
+/// piece of work). The `BrowserSelect*` arms update `selection` then
 /// re-render every pane — simplest-thing-that-works at mock scale (see
 /// `VmResponse::BrowserPanes`'s doc comment). Returns a `Vec` rather than a
 /// single `VmResponse` because `BrowserSaveSource` needs to deliver two
 /// things — updated panes *and* a transcript confirmation — not because
 /// any request produces a high-frequency stream (that's `LatestSlot`'s job,
 /// see this module's doc comment).
-fn handle(request: VmRequest, world: &mut MockWorld, selection: &mut BrowserSelection, image: Option<&image_store::Image>) -> Vec<VmResponse> {
+fn handle(
+    request: VmRequest,
+    world: &mut MockWorld,
+    selection: &mut BrowserSelection,
+    image: Option<&image_store::Image>,
+    vm: &mut VmHandle,
+) -> Vec<VmResponse> {
     match request {
-        VmRequest::Doit { code } => vec![VmResponse::Transcript(format!("> {code}"))],
+        VmRequest::Doit { code } => {
+            // "Do it": evaluate for effect (Transcript show:, etc. arrive
+            // separately via ChannelTranscript) and echo what ran — the
+            // result value itself is deliberately not shown, matching
+            // "Print it"'s (WorkspacePrintIt) own distinct job below.
+            match vm.eval(&code) {
+                Ok(_) => vec![VmResponse::Transcript(format!("> {code}"))],
+                Err(e) => vec![VmResponse::Transcript(format!("> {code}\n{e}"))],
+            }
+        }
         VmRequest::BrowserOpen => {
             // No longer resets `selection` to default — that made sense
             // when the initial page render was a hardcoded mock (so the
@@ -410,12 +717,23 @@ fn handle(request: VmRequest, world: &mut MockWorld, selection: &mut BrowserSele
             // method position instead of silently discarding it. The
             // worker's own initial `BrowserSelection::default()`
             // (`worker_loop`) still covers first-ever open.
-            let VmResponse::BrowserPanes { packages_html, classes_html, categories_html, methods_html, source_html } =
-                render_browser_panes(world, selection)
+            let VmResponse::BrowserPanes {
+                packages_html,
+                classes_html,
+                categories_html,
+                methods_html,
+                source_html,
+            } = render_browser_panes(world, selection)
             else {
                 unreachable!("render_browser_panes always returns BrowserPanes")
             };
-            vec![VmResponse::BrowserOpened { packages_html, classes_html, categories_html, methods_html, source_html }]
+            vec![VmResponse::BrowserOpened {
+                packages_html,
+                classes_html,
+                categories_html,
+                methods_html,
+                source_html,
+            }]
         }
         VmRequest::BrowserSelectPackage { name } => {
             selection.package = Some(name);
@@ -499,7 +817,8 @@ fn handle(request: VmRequest, world: &mut MockWorld, selection: &mut BrowserSele
             let message = match selection.class.clone() {
                 Some(class_name) => {
                     let removed = world.remove_class(&class_name);
-                    let image_error = image.and_then(|img| describe_image_write(img.remove_class(&class_name)));
+                    let image_error =
+                        image.and_then(|img| describe_image_write(img.remove_class(&class_name)));
                     if removed {
                         selection.class = None;
                         selection.category = None;
@@ -515,13 +834,22 @@ fn handle(request: VmRequest, world: &mut MockWorld, selection: &mut BrowserSele
                 }
                 None => "Nothing selected to remove.".to_string(),
             };
-            vec![render_browser_panes(world, selection), VmResponse::Transcript(message)]
+            vec![
+                render_browser_panes(world, selection),
+                VmResponse::Transcript(message),
+            ]
         }
         VmRequest::BrowserRemoveMethod => {
             let message = match (selection.class.clone(), selection.method.clone()) {
                 (Some(class_name), Some(selector)) => {
                     let removed = world.remove_method(&class_name, selection.side, &selector);
-                    let image_error = image.and_then(|img| describe_image_write(img.remove_method(&class_name, side_to_image(selection.side), &selector)));
+                    let image_error = image.and_then(|img| {
+                        describe_image_write(img.remove_method(
+                            &class_name,
+                            side_to_image(selection.side),
+                            &selector,
+                        ))
+                    });
                     if removed {
                         selection.method = None;
                         selection.edit_target = SourceEditTarget::ClassComment;
@@ -535,9 +863,20 @@ fn handle(request: VmRequest, world: &mut MockWorld, selection: &mut BrowserSele
                 }
                 _ => "Nothing selected to remove.".to_string(),
             };
-            vec![render_browser_panes(world, selection), VmResponse::Transcript(message)]
+            vec![
+                render_browser_panes(world, selection),
+                VmResponse::Transcript(message),
+            ]
         }
-        VmRequest::BrowserSaveSource { text, saved_package, saved_class, saved_side, saved_category, saved_method, saved_target } => {
+        VmRequest::BrowserSaveSource {
+            text,
+            saved_package,
+            saved_class,
+            saved_side,
+            saved_category,
+            saved_method,
+            saved_target,
+        } => {
             // The source pane's `data-save-*` snapshot (`browser_render.rs`)
             // must still match what's actually selected right now — a
             // selection-change request queued between the render this came
@@ -547,11 +886,20 @@ fn handle(request: VmRequest, world: &mut MockWorld, selection: &mut BrowserSele
             // the panes still get re-rendered (showing current reality),
             // but the stale edit is simply dropped, same as any other
             // unsaved-edit-discarded-by-navigation case.
-            let snapshot = BrowserSelection::from_wire(&saved_package, &saved_class, &saved_side, &saved_category, &saved_method, &saved_target);
+            let snapshot = BrowserSelection::from_wire(
+                &saved_package,
+                &saved_class,
+                &saved_side,
+                &saved_category,
+                &saved_method,
+                &saved_target,
+            );
             if snapshot != *selection {
                 return vec![
                     render_browser_panes(world, selection),
-                    VmResponse::Transcript("Selection changed since this edit was opened — not saved.".to_string()),
+                    VmResponse::Transcript(
+                        "Selection changed since this edit was opened — not saved.".to_string(),
+                    ),
                 ];
             }
 
@@ -675,34 +1023,62 @@ fn handle(request: VmRequest, world: &mut MockWorld, selection: &mut BrowserSele
                 },
             };
             let message = match outcome {
-                Ok(SaveOk { what, image_error: None }) => match image {
+                Ok(SaveOk {
+                    what,
+                    image_error: None,
+                }) => match image {
                     Some(_) => format!("{what} (persisted to image)."),
                     None => format!("{what}."),
                 },
-                Ok(SaveOk { what, image_error: Some(reason) }) => format!("{what}, but failed to persist to the image: {reason}."),
+                Ok(SaveOk {
+                    what,
+                    image_error: Some(reason),
+                }) => format!("{what}, but failed to persist to the image: {reason}."),
                 Err(e) => e,
             };
-            vec![render_browser_panes(world, selection), VmResponse::Transcript(message)]
+            vec![
+                render_browser_panes(world, selection),
+                VmResponse::Transcript(message),
+            ]
         }
         VmRequest::WorkspacePrintIt { code } => {
-            // Stub — no real VM yet (`docs/APPS.md` §5.5). Deliberately
-            // *not* a plausible-looking fake result: the point of this
-            // round trip right now is proving the wire-and-insertion
-            // mechanics work, not simulating evaluation, so `main.rs`'s
-            // `open_workspace` starting comment says as much too.
-            let text = format!(" \"(no VM yet: {code})\"");
+            // "Print it": insert the real printString inline right after
+            // the selection (`main.rs`'s `WorkspacePrintResult` handler) —
+            // `eval`'s `Ok(String)` already IS that printString (e.g. a
+            // Smalltalk String's own printString already carries its own
+            // quotes), so it's inserted as-is, not re-quoted.
+            let text = match vm.eval(&code) {
+                Ok(result) => format!(" {result}"),
+                Err(e) => format!(" \"ERROR: {e}\""),
+            };
             vec![VmResponse::WorkspacePrintResult { text }]
         }
         VmRequest::CanvasCreate { width, height } => {
-            vec![VmResponse::CanvasCreated { id: CANVAS_ID, width, height }]
+            vec![VmResponse::CanvasCreated {
+                id: CANVAS_ID,
+                width,
+                height,
+            }]
         }
         VmRequest::CanvasRunDemo => {
-            vec![VmResponse::CanvasDraw { id: CANVAS_ID, commands_json: canvas_demo_commands().to_json() }]
+            vec![VmResponse::CanvasDraw {
+                id: CANVAS_ID,
+                commands_json: canvas_demo_commands().to_json(),
+            }]
         }
         VmRequest::CanvasClear => {
             let mut cmds = CanvasCommands::new();
-            cmds.call("clearRect", &[0.0.into(), 0.0.into(), 10_000.0.into(), 10_000.0.into()]);
-            vec![VmResponse::CanvasCleared { id: CANVAS_ID }, VmResponse::CanvasDraw { id: CANVAS_ID, commands_json: cmds.to_json() }]
+            cmds.call(
+                "clearRect",
+                &[0.0.into(), 0.0.into(), 10_000.0.into(), 10_000.0.into()],
+            );
+            vec![
+                VmResponse::CanvasCleared { id: CANVAS_ID },
+                VmResponse::CanvasDraw {
+                    id: CANVAS_ID,
+                    commands_json: cmds.to_json(),
+                },
+            ]
         }
     }
 }
@@ -791,13 +1167,28 @@ fn json_string(s: &str) -> String {
 /// of the whole interpreter, not just one code path through it.
 fn canvas_demo_commands() -> CanvasCommands {
     let mut c = CanvasCommands::new();
-    c.call("clearRect", &[0.0.into(), 0.0.into(), 10_000.0.into(), 10_000.0.into()]);
+    c.call(
+        "clearRect",
+        &[0.0.into(), 0.0.into(), 10_000.0.into(), 10_000.0.into()],
+    );
     c.call("fillStyle", &["steelblue".into()]);
-    c.call("fillRect", &[20.0.into(), 20.0.into(), 120.0.into(), 80.0.into()]);
+    c.call(
+        "fillRect",
+        &[20.0.into(), 20.0.into(), 120.0.into(), 80.0.into()],
+    );
     c.call("strokeStyle", &["crimson".into()]);
     c.call("lineWidth", &[3.0.into()]);
     c.call("beginPath", &[]);
-    c.call("arc", &[220.0.into(), 60.0.into(), 40.0.into(), 0.0.into(), (std::f64::consts::PI * 2.0).into()]);
+    c.call(
+        "arc",
+        &[
+            220.0.into(),
+            60.0.into(),
+            40.0.into(),
+            0.0.into(),
+            (std::f64::consts::PI * 2.0).into(),
+        ],
+    );
     c.call("stroke", &[]);
     c.call("save", &[]);
     c.call("strokeStyle", &["seagreen".into()]);
@@ -809,7 +1200,10 @@ fn canvas_demo_commands() -> CanvasCommands {
     c.call("restore", &[]);
     c.call("fillStyle", &["#222".into()]);
     c.call("font", &["16px sans-serif".into()]);
-    c.call("fillText", &["MACVM Canvas".into(), 20.0.into(), 175.0.into()]);
+    c.call(
+        "fillText",
+        &["MACVM Canvas".into(), 20.0.into(), 175.0.into()],
+    );
     c
 }
 
@@ -821,18 +1215,6 @@ fn render_browser_panes(world: &MockWorld, selection: &BrowserSelection) -> VmRe
         methods_html: browser_render::render_methods_pane(world, selection),
         source_html: browser_render::render_source_pane(world, selection),
     }
-}
-
-/// Drain whatever responses have arrived since the last call. Called from
-/// the main-thread selector `perform_selector_on_main_thread` triggers.
-pub fn drain_responses() -> Vec<VmResponse> {
-    let mut guard = RESPONSES.lock().unwrap();
-    let Some(rx) = guard.as_mut() else { return Vec::new() };
-    let mut out = Vec::new();
-    while let Ok(response) = rx.try_recv() {
-        out.push(response);
-    }
-    out
 }
 
 /// A single-value mailbox where publishing overwrites whatever's there,
@@ -848,7 +1230,9 @@ pub struct LatestSlot<T> {
 
 impl<T> LatestSlot<T> {
     pub fn new() -> Self {
-        Self { value: Mutex::new(None) }
+        Self {
+            value: Mutex::new(None),
+        }
     }
 
     /// Replace whatever value was there. The old one (if any, if unread)
@@ -874,23 +1258,76 @@ impl<T> Default for LatestSlot<T> {
 mod tests {
     use super::*;
 
+    /// The real `world/` directory, resolved via `CARGO_MANIFEST_DIR`
+    /// rather than a bare relative path: `cargo test`'s working directory
+    /// is this crate's own root (`gui/`), not the workspace root `world/`
+    /// actually lives under.
+    fn test_world_dir() -> std::path::PathBuf {
+        std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../world"))
+    }
+
+    /// A real, booted `VmHandle` (heap kept small for a test — the GUI's
+    /// own worker uses `VmOptions::from_env`'s larger default) for tests
+    /// that exercise `handle()`'s arms directly.
+    fn test_vm_handle(jit: macvm::runtime::JitMode) -> VmHandle {
+        VmHandle::boot(
+            macvm::runtime::VmOptions {
+                heap_mib: 64,
+                jit,
+                ..Default::default()
+            },
+            &test_world_dir(),
+        )
+        .expect("boot against the real world/ directory must succeed")
+    }
+
     #[test]
     fn browser_select_category_treats_empty_name_as_clearing_to_all() {
         let mut world = MockWorld::seed();
-        let mut selection = BrowserSelection { class: Some("Object".to_string()), ..Default::default() };
-        handle(VmRequest::BrowserSelectCategory { name: "printing".to_string() }, &mut world, &mut selection, None);
+        let mut selection = BrowserSelection {
+            class: Some("Object".to_string()),
+            ..Default::default()
+        };
+        let mut vm = test_vm_handle(macvm::runtime::JitMode::Off);
+        handle(
+            VmRequest::BrowserSelectCategory {
+                name: "printing".to_string(),
+            },
+            &mut world,
+            &mut selection,
+            None,
+            &mut vm,
+        );
         assert_eq!(selection.category.as_deref(), Some("printing"));
 
-        handle(VmRequest::BrowserSelectCategory { name: String::new() }, &mut world, &mut selection, None);
+        handle(
+            VmRequest::BrowserSelectCategory {
+                name: String::new(),
+            },
+            &mut world,
+            &mut selection,
+            None,
+            &mut vm,
+        );
         assert_eq!(selection.category, None);
     }
 
     #[test]
     fn browser_new_method_only_requires_a_class_not_a_category() {
         let mut world = MockWorld::seed();
-        let mut selection = BrowserSelection { class: Some("Object".to_string()), ..Default::default() };
+        let mut selection = BrowserSelection {
+            class: Some("Object".to_string()),
+            ..Default::default()
+        };
+        let mut vm = test_vm_handle(macvm::runtime::JitMode::Off);
         assert_eq!(selection.category, None); // "(all)" — no category picked
-        handle(VmRequest::BrowserNewMethod, &mut world, &mut selection, None);
+        handle(
+            VmRequest::BrowserNewMethod,
+            &mut world,
+            &mut selection,
+            None,
+            &mut vm,
+        );
         assert_eq!(selection.edit_target, SourceEditTarget::NewMethod);
     }
 
@@ -908,6 +1345,7 @@ mod tests {
             edit_target: SourceEditTarget::Method,
             ..Default::default()
         };
+        let mut vm = test_vm_handle(macvm::runtime::JitMode::Off);
         let responses = handle(
             VmRequest::BrowserSaveSource {
                 text: "printString\n\t^'HIJACKED'".to_string(),
@@ -921,12 +1359,21 @@ mod tests {
             &mut world,
             &mut selection,
             None,
+            &mut vm,
         );
         // Neither method was touched — not hash (what's *currently*
         // selected) and not printString (what the save actually said it
         // was for).
-        assert_eq!(world.method_source("Object", Side::Instance, "hash").unwrap(), "hash\n\t^self identityHash");
-        assert!(world.method_source("Object", Side::Instance, "printString").unwrap().starts_with("printString\n\t^String"));
+        assert_eq!(
+            world
+                .method_source("Object", Side::Instance, "hash")
+                .unwrap(),
+            "hash\n\t^self identityHash"
+        );
+        assert!(world
+            .method_source("Object", Side::Instance, "printString")
+            .unwrap()
+            .starts_with("printString\n\t^String"));
         let message = responses
             .iter()
             .find_map(|r| match r {
@@ -947,6 +1394,7 @@ mod tests {
             edit_target: SourceEditTarget::Method,
             ..Default::default()
         };
+        let mut vm = test_vm_handle(macvm::runtime::JitMode::Off);
         handle(
             VmRequest::BrowserSaveSource {
                 text: "hash\n\t^42".to_string(),
@@ -960,8 +1408,14 @@ mod tests {
             &mut world,
             &mut selection,
             None,
+            &mut vm,
         );
-        assert_eq!(world.method_source("Object", Side::Instance, "hash").unwrap(), "hash\n\t^42");
+        assert_eq!(
+            world
+                .method_source("Object", Side::Instance, "hash")
+                .unwrap(),
+            "hash\n\t^42"
+        );
     }
 
     #[test]
@@ -973,8 +1427,12 @@ mod tests {
         // this exercises the defensive honesty check regardless of how
         // drift could happen).
         let image = image_store::Image::open_in_memory().unwrap();
-        let mut selection =
-            BrowserSelection { class: Some("Ghost".to_string()), edit_target: SourceEditTarget::ClassComment, ..Default::default() };
+        let mut selection = BrowserSelection {
+            class: Some("Ghost".to_string()),
+            edit_target: SourceEditTarget::ClassComment,
+            ..Default::default()
+        };
+        let mut vm = test_vm_handle(macvm::runtime::JitMode::Off);
         let responses = handle(
             VmRequest::BrowserSaveSource {
                 text: "new comment".to_string(),
@@ -988,6 +1446,7 @@ mod tests {
             &mut world,
             &mut selection,
             Some(&image),
+            &mut vm,
         );
         // The mirror save still succeeds — immediate display is unaffected...
         assert_eq!(world.class_named("Ghost").unwrap().comment, "new comment");
@@ -1009,7 +1468,10 @@ mod tests {
         cmds.call("beginPath", &[]);
         cmds.call("lineTo", &[20.0.into(), 140.0.into()]);
         cmds.call("fillStyle", &["steelblue".into()]);
-        assert_eq!(cmds.to_json(), r#"[["beginPath"],["lineTo",20,140],["fillStyle","steelblue"]]"#);
+        assert_eq!(
+            cmds.to_json(),
+            r#"[["beginPath"],["lineTo",20,140],["fillStyle","steelblue"]]"#
+        );
     }
 
     #[test]
@@ -1022,20 +1484,47 @@ mod tests {
     fn canvas_create_echoes_back_the_requested_size_under_the_fixed_v1_id() {
         let mut world = MockWorld::seed();
         let mut selection = BrowserSelection::default();
-        let responses = handle(VmRequest::CanvasCreate { width: 640, height: 480 }, &mut world, &mut selection, None);
-        assert!(matches!(responses.as_slice(), [VmResponse::CanvasCreated { id: 0, width: 640, height: 480 }]));
+        let mut vm = test_vm_handle(macvm::runtime::JitMode::Off);
+        let responses = handle(
+            VmRequest::CanvasCreate {
+                width: 640,
+                height: 480,
+            },
+            &mut world,
+            &mut selection,
+            None,
+            &mut vm,
+        );
+        assert!(matches!(
+            responses.as_slice(),
+            [VmResponse::CanvasCreated {
+                id: 0,
+                width: 640,
+                height: 480
+            }]
+        ));
     }
 
     #[test]
     fn canvas_run_demo_returns_one_nonempty_draw_batch_for_the_fixed_canvas() {
         let mut world = MockWorld::seed();
         let mut selection = BrowserSelection::default();
-        let responses = handle(VmRequest::CanvasRunDemo, &mut world, &mut selection, None);
+        let mut vm = test_vm_handle(macvm::runtime::JitMode::Off);
+        let responses = handle(
+            VmRequest::CanvasRunDemo,
+            &mut world,
+            &mut selection,
+            None,
+            &mut vm,
+        );
         let [VmResponse::CanvasDraw { id, commands_json }] = responses.as_slice() else {
             panic!("expected exactly one CanvasDraw response");
         };
         assert_eq!(*id, 0);
-        assert!(commands_json.starts_with('[') && commands_json.ends_with(']'), "{commands_json}");
+        assert!(
+            commands_json.starts_with('[') && commands_json.ends_with(']'),
+            "{commands_json}"
+        );
         assert!(commands_json.contains("fillRect"), "{commands_json}");
         assert!(commands_json.contains("MACVM Canvas"), "{commands_json}");
     }
@@ -1044,8 +1533,18 @@ mod tests {
     fn canvas_clear_answers_cleared_then_a_full_canvas_clear_rect_batch() {
         let mut world = MockWorld::seed();
         let mut selection = BrowserSelection::default();
-        let responses = handle(VmRequest::CanvasClear, &mut world, &mut selection, None);
-        let [VmResponse::CanvasCleared { id: cleared_id }, VmResponse::CanvasDraw { id: draw_id, commands_json }] = responses.as_slice()
+        let mut vm = test_vm_handle(macvm::runtime::JitMode::Off);
+        let responses = handle(
+            VmRequest::CanvasClear,
+            &mut world,
+            &mut selection,
+            None,
+            &mut vm,
+        );
+        let [VmResponse::CanvasCleared { id: cleared_id }, VmResponse::CanvasDraw {
+            id: draw_id,
+            commands_json,
+        }] = responses.as_slice()
         else {
             panic!("expected [CanvasCleared, CanvasDraw]");
         };
@@ -1073,5 +1572,176 @@ mod tests {
         assert_eq!(slot.take(), None);
         slot.publish("frame-2");
         assert_eq!(slot.take(), Some("frame-2"));
+    }
+
+    // ── S21 step 3: real VmHandle wiring + restart-on-death ───────────────
+
+    fn transcript_containing(rs: &[VmResponse], needle: &str) -> bool {
+        rs.iter()
+            .any(|r| matches!(r, VmResponse::Transcript(t) if t.contains(needle)))
+    }
+
+    #[test]
+    fn doit_evaluates_through_the_real_vm_and_echoes_the_source() {
+        let mut world = MockWorld::seed();
+        let mut selection = BrowserSelection::default();
+        let mut vm = test_vm_handle(macvm::runtime::JitMode::Off);
+        let responses = handle(
+            VmRequest::Doit {
+                code: "3 + 4.".to_string(),
+            },
+            &mut world,
+            &mut selection,
+            None,
+            &mut vm,
+        );
+        // "Do it" echoes what ran (the result value itself is "Print it"'s
+        // job, not shown here) — but it went through the real evaluator, so
+        // a well-formed doit produces exactly the echo and nothing else.
+        assert!(matches!(responses.as_slice(), [VmResponse::Transcript(t)] if t.contains("3 + 4")));
+    }
+
+    #[test]
+    fn workspace_print_it_returns_the_real_printstring() {
+        let mut world = MockWorld::seed();
+        let mut selection = BrowserSelection::default();
+        let mut vm = test_vm_handle(macvm::runtime::JitMode::Off);
+        let responses = handle(
+            VmRequest::WorkspacePrintIt {
+                code: "3 + 4.".to_string(),
+            },
+            &mut world,
+            &mut selection,
+            None,
+            &mut vm,
+        );
+        let [VmResponse::WorkspacePrintResult { text }] = responses.as_slice() else {
+            panic!("expected exactly one WorkspacePrintResult, got {responses:?}");
+        };
+        // The real printString of 7 — no longer the old "(no VM yet: ...)"
+        // stub. Leading space is the inline-insertion convention.
+        assert_eq!(text, " 7");
+    }
+
+    /// "the JIT MUST be supported" (the S21 directive) — end-to-end through
+    /// the GUI's own request path, not just the embedding layer's unit test.
+    /// `Threshold(1)` compiles on the first call.
+    #[test]
+    fn workspace_print_it_works_with_the_jit_enabled() {
+        let mut world = MockWorld::seed();
+        let mut selection = BrowserSelection::default();
+        let mut vm = test_vm_handle(macvm::runtime::JitMode::Threshold(1));
+        let responses = handle(
+            VmRequest::WorkspacePrintIt {
+                code: "6 * 7.".to_string(),
+            },
+            &mut world,
+            &mut selection,
+            None,
+            &mut vm,
+        );
+        let [VmResponse::WorkspacePrintResult { text }] = responses.as_slice() else {
+            panic!("expected exactly one WorkspacePrintResult, got {responses:?}");
+        };
+        assert_eq!(text, " 42");
+    }
+
+    /// A malformed doit is a `GuestError::Compile`, surfaced as a transcript
+    /// line — NOT a thread death. The same `vm` keeps serving afterward.
+    #[test]
+    fn doit_compile_error_is_reported_and_the_vm_survives() {
+        let mut world = MockWorld::seed();
+        let mut selection = BrowserSelection::default();
+        let mut vm = test_vm_handle(macvm::runtime::JitMode::Off);
+        let responses = handle(
+            VmRequest::Doit {
+                code: "3 + + 4.".to_string(),
+            },
+            &mut world,
+            &mut selection,
+            None,
+            &mut vm,
+        );
+        assert!(transcript_containing(&responses, "error"), "{responses:?}");
+        // Same handle still works — the compile error didn't kill anything.
+        let after = handle(
+            VmRequest::WorkspacePrintIt {
+                code: "1 + 1.".to_string(),
+            },
+            &mut world,
+            &mut selection,
+            None,
+            &mut vm,
+        );
+        assert!(
+            matches!(after.as_slice(), [VmResponse::WorkspacePrintResult { text }] if text == " 2")
+        );
+    }
+
+    /// Polls `drain_responses` (accumulating across calls) until `pred`
+    /// holds or a generous deadline passes — booting the real world twice
+    /// (original + respawned worker) genuinely takes a moment.
+    fn poll_until(host: &VmHost, pred: impl Fn(&[VmResponse]) -> bool) -> Vec<VmResponse> {
+        let start = Instant::now();
+        let mut collected = Vec::new();
+        while start.elapsed() < Duration::from_secs(20) {
+            collected.extend(host.drain_responses());
+            if pred(&collected) {
+                return collected;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        collected
+    }
+
+    /// THE end-to-end proof of the whole S21 sprint: a doit that triggers a
+    /// fatal guest condition (unhandled DNU -> `error:` -> `fatal_exit` ->
+    /// `pthread_exit`) kills ONLY its worker thread; the supervisor detects
+    /// the silence (no `WorkerIdle` before the timeout), respawns a fresh
+    /// worker + VM, and that fresh worker serves the very next request. The
+    /// test process surviving to assert all this IS the "GUI must not die"
+    /// guarantee, made concrete against a real crash rather than a mock.
+    ///
+    /// Wake target is NIL — `CrossThreadObjcRef::notify` short-circuits, so
+    /// this needs no Objective-C runtime / NSApplication (headless-safe).
+    #[test]
+    fn supervisor_respawns_the_worker_after_a_fatal_doit_and_serves_the_next_request() {
+        // A NIL SEL is fine: notify() never dereferences it (NIL target).
+        let host = spawn_with_world_and_timeout(
+            objc::NIL,
+            objc::NIL,
+            test_world_dir(),
+            Duration::from_millis(150),
+        );
+
+        // 1. Fatal doit. The worker emits its "Error: does not understand …"
+        //    transcript (via ChannelTranscript) and only THEN pthread_exits —
+        //    so it never sends WorkerIdle, leaving pending_since armed.
+        host.submit(VmRequest::Doit {
+            code: "3 thisSelectorDoesNotExistAnywhereInTheBaseWorld.".to_string(),
+        });
+        let seen = poll_until(&host, |rs| transcript_containing(rs, "does not understand"));
+        assert!(
+            transcript_containing(&seen, "does not understand"),
+            "the worker must have emitted its DNU error before dying, got {seen:?}"
+        );
+
+        // 2. By now pending_since is far older than the 150ms timeout, so the
+        //    next submit presumes the worker dead, respawns a fresh worker +
+        //    VM, and routes this request to it. (If the worker were somehow
+        //    still alive, respawn is still harmless — the old one was already
+        //    committed to pthread_exit.)
+        host.submit(VmRequest::Doit {
+            code: "6 * 7.".to_string(),
+        });
+        let seen = poll_until(&host, |rs| transcript_containing(rs, "6 * 7"));
+        assert!(
+            transcript_containing(&seen, "fresh one has been started"),
+            "the respawn notice must have been delivered, got {seen:?}"
+        );
+        assert!(
+            transcript_containing(&seen, "6 * 7"),
+            "the fresh worker must have served the follow-up doit, got {seen:?}"
+        );
     }
 }

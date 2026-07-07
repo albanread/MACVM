@@ -79,7 +79,8 @@ pub fn get_class(name: &str) -> Class {
 /// `sel_registerName(name)`.
 pub fn sel(name: &str) -> Sel {
     let c = CString::new(name).unwrap();
-    let f: extern "C" fn(*const i8) -> Sel = unsafe { std::mem::transmute(sym("sel_registerName")) };
+    let f: extern "C" fn(*const i8) -> Sel =
+        unsafe { std::mem::transmute(sym("sel_registerName")) };
     f(c.as_ptr())
 }
 
@@ -104,7 +105,9 @@ pub fn string_from_nsstring(nsstr: Id) -> String {
     if ptr.is_null() {
         return String::new();
     }
-    unsafe { CStr::from_ptr(ptr) }.to_string_lossy().into_owned()
+    unsafe { CStr::from_ptr(ptr) }
+        .to_string_lossy()
+        .into_owned()
 }
 
 // ── Typed message sends, one per ABI shape actually used by main.rs ────────
@@ -155,7 +158,8 @@ pub fn send2_id(recv: Id, s: Sel, a: Id, b: Id) -> Id {
 }
 
 pub fn send3_id(recv: Id, s: Sel, a: Id, b: Id, c: Id) -> Id {
-    let f: extern "C" fn(Id, Sel, Id, Id, Id) -> Id = unsafe { std::mem::transmute(msg_send_ptr()) };
+    let f: extern "C" fn(Id, Sel, Id, Id, Id) -> Id =
+        unsafe { std::mem::transmute(msg_send_ptr()) };
     f(recv, s, a, b, c)
 }
 
@@ -182,9 +186,14 @@ pub fn send3_id(recv: Id, s: Sel, a: Id, b: Id, c: Id) -> Id {
 /// `performSelector:withObject:waitUntilDone:` (missing `OnMainThread`) and
 /// crashed the app on the very first VM response.
 pub fn perform_selector_on_main_thread(recv: Id, selector: Sel, arg: Id, wait_until_done: bool) {
-    let f: extern "C" fn(Id, Sel, Sel, Id, bool) =
-        unsafe { std::mem::transmute(msg_send_ptr()) };
-    f(recv, sel("performSelectorOnMainThread:withObject:waitUntilDone:"), selector, arg, wait_until_done)
+    let f: extern "C" fn(Id, Sel, Sel, Id, bool) = unsafe { std::mem::transmute(msg_send_ptr()) };
+    f(
+        recv,
+        sel("performSelectorOnMainThread:withObject:waitUntilDone:"),
+        selector,
+        arg,
+        wait_until_done,
+    )
 }
 
 /// `-initWithFrame:` — `CGRect`'s four `f64` fields passed as four separate

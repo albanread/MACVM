@@ -188,11 +188,16 @@ fn rewrite_smappl_placeholders(html: &str) -> String {
 }
 
 fn html_escape_attr(s: &str) -> String {
-    s.replace('&', "&amp;").replace('"', "&quot;").replace('<', "&lt;").replace('>', "&gt;")
+    s.replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 fn html_escape_text(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 /// The nine Launcher toolbar buttons (`../PLAN.md` §1) plus back/forward/home
@@ -330,10 +335,21 @@ fn inject_before_body_close(html: &str, extra: &str) -> String {
 /// do for the original file — the chrome this function injects uses
 /// absolute `file://` URLs regardless (see `gui_file_url`), so it isn't
 /// affected either way.
-pub fn load_and_preprocess(path: &Path, theme: Theme, font_scale_percent: u32, transcript: &str) -> std::io::Result<String> {
+pub fn load_and_preprocess(
+    path: &Path,
+    theme: Theme,
+    font_scale_percent: u32,
+    transcript: &str,
+) -> std::io::Result<String> {
     let raw = std::fs::read_to_string(path)?;
     let original_dir = path.parent().unwrap_or_else(|| Path::new("."));
-    Ok(preprocess_html(raw, original_dir, theme, font_scale_percent, transcript))
+    Ok(preprocess_html(
+        raw,
+        original_dir,
+        theme,
+        font_scale_percent,
+        transcript,
+    ))
 }
 
 /// The chrome-injection half of [`load_and_preprocess`], factored out so
@@ -341,11 +357,20 @@ pub fn load_and_preprocess(path: &Path, theme: Theme, font_scale_percent: u32, t
 /// browser view, `browser_render.rs`) get the exact same toolbar/status
 /// bar/theme/font-scale treatment as any corpus page, via
 /// [`render_generated_page`].
-fn preprocess_html(raw: String, original_dir: &Path, theme: Theme, font_scale_percent: u32, transcript: &str) -> String {
+fn preprocess_html(
+    raw: String,
+    original_dir: &Path,
+    theme: Theme,
+    font_scale_percent: u32,
+    transcript: &str,
+) -> String {
     let mut html = raw;
     html = rewrite_doit_links(&html);
     html = rewrite_smappl_placeholders(&html);
-    html = inject_before_head_close(&html, &chrome_head_extra(original_dir, theme, font_scale_percent));
+    html = inject_before_head_close(
+        &html,
+        &chrome_head_extra(original_dir, theme, font_scale_percent),
+    );
     html = inject_after_body_open(&html, &toolbar_html(theme));
     html = inject_before_body_close(&html, &statusbar_html(transcript));
     html
@@ -361,8 +386,18 @@ fn preprocess_html(raw: String, original_dir: &Path, theme: Theme, font_scale_pe
 /// preserving, so `base_dir` doubles as the `<base href>` target directly
 /// (contrast `load_and_preprocess`, where that's the corpus file's own
 /// parent directory).
-pub fn render_generated_page(title: &str, body_content: &str, base_dir: &Path, theme: Theme, font_scale_percent: u32, transcript: &str) -> String {
-    let raw = format!("<html><head><title>{}</title></head><body>{body_content}</body></html>", html_escape_text(title));
+pub fn render_generated_page(
+    title: &str,
+    body_content: &str,
+    base_dir: &Path,
+    theme: Theme,
+    font_scale_percent: u32,
+    transcript: &str,
+) -> String {
+    let raw = format!(
+        "<html><head><title>{}</title></head><body>{body_content}</body></html>",
+        html_escape_text(title)
+    );
     preprocess_html(raw, base_dir, theme, font_scale_percent, transcript)
 }
 
@@ -385,7 +420,10 @@ mod tests {
         let out = rewrite_smappl_placeholders(input);
         assert!(out.starts_with(r#"<span class="smappl""#), "{out}");
         assert!(out.contains("Button withImage:"), "{out}");
-        assert!(!out.contains('\n'), "collapsed whitespace should have no newlines: {out}");
+        assert!(
+            !out.contains('\n'),
+            "collapsed whitespace should have no newlines: {out}"
+        );
     }
 
     #[test]
@@ -405,14 +443,23 @@ mod tests {
     #[test]
     fn themes_pick_distinct_stylesheets_and_icon_formats() {
         let classic_head = chrome_head_extra(Path::new("."), Theme::Classic, 100);
-        assert!(classic_head.contains("assets/strongtalk.css"), "{classic_head}");
+        assert!(
+            classic_head.contains("assets/strongtalk.css"),
+            "{classic_head}"
+        );
         let hidef_head = chrome_head_extra(Path::new("."), Theme::HiDef, 100);
         assert!(hidef_head.contains("assets/hidef.css"), "{hidef_head}");
 
         let classic_toolbar = toolbar_html(Theme::Classic);
-        assert!(classic_toolbar.contains("reference/icons-png/home.png"), "{classic_toolbar}");
+        assert!(
+            classic_toolbar.contains("reference/icons-png/home.png"),
+            "{classic_toolbar}"
+        );
         let hidef_toolbar = toolbar_html(Theme::HiDef);
-        assert!(hidef_toolbar.contains("assets/icons-hidef/home.svg"), "{hidef_toolbar}");
+        assert!(
+            hidef_toolbar.contains("assets/icons-hidef/home.svg"),
+            "{hidef_toolbar}"
+        );
     }
 
     /// The five newer themes: each resolves to its own stylesheet, and —
@@ -432,17 +479,27 @@ mod tests {
             let head = chrome_head_extra(Path::new("."), theme, 100);
             assert!(head.contains(expected_css), "{theme:?}: {head}");
             let toolbar = toolbar_html(theme);
-            assert!(toolbar.contains("assets/icons-hidef/home.svg"), "{theme:?}: {toolbar}");
+            assert!(
+                toolbar.contains("assets/icons-hidef/home.svg"),
+                "{theme:?}: {toolbar}"
+            );
         }
     }
 
     #[test]
     fn theme_all_has_no_duplicate_stylesheets_and_matches_its_own_length() {
         assert_eq!(Theme::ALL.len(), 7);
-        let mut paths: Vec<&str> = Theme::ALL.iter().map(|t| t.stylesheet_relative_path()).collect();
+        let mut paths: Vec<&str> = Theme::ALL
+            .iter()
+            .map(|t| t.stylesheet_relative_path())
+            .collect();
         paths.sort_unstable();
         paths.dedup();
-        assert_eq!(paths.len(), Theme::ALL.len(), "every theme must have a distinct stylesheet");
+        assert_eq!(
+            paths.len(),
+            Theme::ALL.len(),
+            "every theme must have a distinct stylesheet"
+        );
     }
 
     #[test]

@@ -66,7 +66,10 @@ pub struct BrowserSelection {
 /// same HTML-escaping for its own textarea content, and this one-liner
 /// isn't worth its own shared-utils module just to avoid a second `use`.
 pub(crate) fn escape(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
 }
 
 fn pane_item(kind: &str, value: &str, label: &str, active: bool, extra_style: &str) -> String {
@@ -91,8 +94,14 @@ pub fn render_packages_pane(world: &MockWorld, sel: &BrowserSelection) -> String
     // `BrowserNewClass` handler defaults to the first one, same fallback
     // `render_classes_pane` already applies below) — hidden on a totally
     // empty world instead of producing a button that can't work.
-    let new_class_row = if packages.is_empty() { String::new() } else { action_button_row("new-class", "+ New Class") };
-    format!("<div class=\"st-browser-pane\" id=\"macvm-browser-packages\">{items}{new_class_row}</div>")
+    let new_class_row = if packages.is_empty() {
+        String::new()
+    } else {
+        action_button_row("new-class", "+ New Class")
+    };
+    format!(
+        "<div class=\"st-browser-pane\" id=\"macvm-browser-packages\">{items}{new_class_row}</div>"
+    )
 }
 
 fn action_button_row(action: &str, label: &str) -> String {
@@ -128,14 +137,21 @@ fn subclass_warning(world: &MockWorld, class_name: &str) -> String {
     }
     let names: Vec<String> = subs.iter().map(|c| escape(&c.name)).collect();
     let plural = if subs.len() == 1 { "" } else { "es" };
-    format!(" It has {} subclass{plural}: {}.", subs.len(), names.join(", "))
+    format!(
+        " It has {} subclass{plural}: {}.",
+        subs.len(),
+        names.join(", ")
+    )
 }
 
 /// Recursive hierarchy tree for whichever package is selected (falls back
 /// to the first package if none is selected yet) — depth-indented, same
 /// visual idiom as `strongtalk.css`'s `.st-outliner .st-node` (15px/level).
 pub fn render_classes_pane(world: &MockWorld, sel: &BrowserSelection) -> String {
-    let package = sel.package.clone().or_else(|| world.packages().first().cloned());
+    let package = sel
+        .package
+        .clone()
+        .or_else(|| world.packages().first().cloned());
     let mut out = String::new();
     if let Some(package) = &package {
         for root in world.package_roots(package) {
@@ -143,12 +159,23 @@ pub fn render_classes_pane(world: &MockWorld, sel: &BrowserSelection) -> String 
         }
     }
     if let Some(class_name) = &sel.class {
-        out.push_str(&render_remove_row("class", "Class", class_name, &subclass_warning(world, class_name)));
+        out.push_str(&render_remove_row(
+            "class",
+            "Class",
+            class_name,
+            &subclass_warning(world, class_name),
+        ));
     }
     format!("<div class=\"st-browser-pane\" id=\"macvm-browser-classes\">{out}</div>")
 }
 
-fn render_class_subtree(world: &MockWorld, sel: &BrowserSelection, class_name: &str, depth: u32, out: &mut String) {
+fn render_class_subtree(
+    world: &MockWorld,
+    sel: &BrowserSelection,
+    class_name: &str,
+    depth: u32,
+    out: &mut String,
+) {
     let active = sel.class.as_deref() == Some(class_name);
     let style = format!("padding-left: {}px", 8 + depth * 14);
     out.push_str(&pane_item("class", class_name, class_name, active, &style));
@@ -168,8 +195,16 @@ pub fn render_categories_pane(world: &MockWorld, sel: &BrowserSelection) -> Stri
          <span class=\"st-browser-side-tab{}\" data-browser-side=\"instance\">instance</span>\
          <span class=\"st-browser-side-tab{}\" data-browser-side=\"class\">class</span>\
          </div>",
-        if sel.side == Side::Instance { " active" } else { "" },
-        if sel.side == Side::Class { " active" } else { "" },
+        if sel.side == Side::Instance {
+            " active"
+        } else {
+            ""
+        },
+        if sel.side == Side::Class {
+            " active"
+        } else {
+            ""
+        },
     );
     // A leading "(all)" pseudo-category, active whenever `sel.category` is
     // `None` — which the methods pane now reads as "show every method on
@@ -229,9 +264,17 @@ pub fn render_methods_pane(world: &MockWorld, sel: &BrowserSelection) -> String 
 /// stay, real parseable `.mst` text — `vm_host.rs`'s `BrowserSaveSource`
 /// handler for both feeds the accepted text straight through
 /// `image_store::mst::parse_mst_source`.
-fn render_class_header_template(superclass: Option<&str>, class_name: &str, instance_vars: &str) -> String {
+fn render_class_header_template(
+    superclass: Option<&str>,
+    class_name: &str,
+    instance_vars: &str,
+) -> String {
     let superclass = superclass.unwrap_or("nil");
-    let ivars_line = if instance_vars.is_empty() { String::new() } else { format!("    |{instance_vars}|\n") };
+    let ivars_line = if instance_vars.is_empty() {
+        String::new()
+    } else {
+        format!("    |{instance_vars}|\n")
+    };
     format!("{superclass} subclass: {class_name} [\n{ivars_line}\n]")
 }
 
@@ -327,7 +370,14 @@ impl BrowserSelection {
     /// comparison against the worker's live selection (see this struct's
     /// own doc comment). Empty strings mean `None` — never a real
     /// package/class/category/method name in this app.
-    pub fn from_wire(package: &str, class: &str, side: &str, category: &str, method: &str, edit_target: &str) -> Self {
+    pub fn from_wire(
+        package: &str,
+        class: &str,
+        side: &str,
+        category: &str,
+        method: &str,
+        edit_target: &str,
+    ) -> Self {
         Self {
             package: opt_from_wire(package),
             class: opt_from_wire(class),
@@ -358,17 +408,23 @@ impl BrowserSelection {
 /// to create/reopen/redefine.
 pub fn render_source_pane(world: &MockWorld, sel: &BrowserSelection) -> String {
     let text = match &sel.edit_target {
-        SourceEditTarget::ClassComment => sel.class.as_deref().and_then(|n| world.class_comment(n)).unwrap_or_default(),
+        SourceEditTarget::ClassComment => sel
+            .class
+            .as_deref()
+            .and_then(|n| world.class_comment(n))
+            .unwrap_or_default(),
         SourceEditTarget::ClassDefinition => sel
             .class
             .as_deref()
             .and_then(|n| world.class_named(n))
-            .map(|c| render_class_header_template(c.superclass.as_deref(), &c.name, &c.instance_vars))
+            .map(|c| {
+                render_class_header_template(c.superclass.as_deref(), &c.name, &c.instance_vars)
+            })
             .unwrap_or_default(),
         SourceEditTarget::Method => match (&sel.class, &sel.method) {
-            (Some(class_name), Some(selector)) => {
-                world.method_source(class_name, sel.side, selector).unwrap_or_else(|| String::from("(source not found)"))
-            }
+            (Some(class_name), Some(selector)) => world
+                .method_source(class_name, sel.side, selector)
+                .unwrap_or_else(|| String::from("(source not found)")),
             _ => String::new(),
         },
         SourceEditTarget::NewMethod => render_new_method_template(),
@@ -413,7 +469,13 @@ pub fn render_source_pane(world: &MockWorld, sel: &BrowserSelection) -> String {
 /// still loading, and silently no-op (`if (el) ...` finding nothing yet).
 /// Never showing a page before its real data is in hand removes the race
 /// by construction instead of trying to win it.
-pub fn assemble_panes(packages_html: &str, classes_html: &str, categories_html: &str, methods_html: &str, source_html: &str) -> String {
+pub fn assemble_panes(
+    packages_html: &str,
+    classes_html: &str,
+    categories_html: &str,
+    methods_html: &str,
+    source_html: &str,
+) -> String {
     format!(
         "<div class=\"st-browser\" id=\"macvm-browser\">\
          <div class=\"st-browser-lists\">{packages_html}{classes_html}{categories_html}{methods_html}</div>\
@@ -447,22 +509,34 @@ mod tests {
         let sel = BrowserSelection::default();
         let html = render_packages_pane(&world, &sel);
         assert!(html.contains("data-browser-package=\"Kernel\""), "{html}");
-        assert!(html.contains("data-browser-package=\"Collections\""), "{html}");
+        assert!(
+            html.contains("data-browser-package=\"Collections\""),
+            "{html}"
+        );
         assert!(!html.contains("active"), "{html}");
     }
 
     #[test]
     fn selected_package_gets_active_class() {
         let world = MockWorld::seed();
-        let sel = BrowserSelection { package: Some("Kernel".into()), ..Default::default() };
+        let sel = BrowserSelection {
+            package: Some("Kernel".into()),
+            ..Default::default()
+        };
         let html = render_packages_pane(&world, &sel);
-        assert!(html.contains("st-browser-item active\" data-browser-package=\"Kernel\""), "{html}");
+        assert!(
+            html.contains("st-browser-item active\" data-browser-package=\"Kernel\""),
+            "{html}"
+        );
     }
 
     #[test]
     fn classes_pane_indents_by_hierarchy_depth() {
         let world = MockWorld::seed();
-        let sel = BrowserSelection { package: Some("Collections".into()), ..Default::default() };
+        let sel = BrowserSelection {
+            package: Some("Collections".into()),
+            ..Default::default()
+        };
         let html = render_classes_pane(&world, &sel);
         // Collection is a root within "Collections" (Object lives in Kernel);
         // OrderedCollection and Dictionary are one level deeper.
@@ -484,10 +558,19 @@ mod tests {
     #[test]
     fn categories_pane_shows_instance_side_categories_by_default() {
         let world = MockWorld::seed();
-        let sel = BrowserSelection { class: Some("Object".into()), ..Default::default() };
+        let sel = BrowserSelection {
+            class: Some("Object".into()),
+            ..Default::default()
+        };
         let html = render_categories_pane(&world, &sel);
-        assert!(html.contains("data-browser-category=\"printing\""), "{html}");
-        assert!(!html.contains("data-browser-category=\"instance creation\""), "{html}");
+        assert!(
+            html.contains("data-browser-category=\"printing\""),
+            "{html}"
+        );
+        assert!(
+            !html.contains("data-browser-category=\"instance creation\""),
+            "{html}"
+        );
     }
 
     #[test]
@@ -501,13 +584,19 @@ mod tests {
         let html = render_methods_pane(&world, &sel);
         assert!(html.contains("data-browser-method=\"=\""), "{html}");
         assert!(html.contains("data-browser-method=\"hash\""), "{html}");
-        assert!(!html.contains("data-browser-method=\"printString\""), "{html}");
+        assert!(
+            !html.contains("data-browser-method=\"printString\""),
+            "{html}"
+        );
     }
 
     #[test]
     fn source_pane_shows_class_comment_with_no_method_selected() {
         let world = MockWorld::seed();
-        let sel = BrowserSelection { class: Some("Object".into()), ..Default::default() };
+        let sel = BrowserSelection {
+            class: Some("Object".into()),
+            ..Default::default()
+        };
         let html = render_source_pane(&world, &sel);
         assert!(html.contains("root of the class hierarchy"), "{html}");
     }
@@ -523,7 +612,10 @@ mod tests {
             ..Default::default()
         };
         let html = render_source_pane(&world, &sel);
-        assert!(html.contains("printString\n\t^String streamContents"), "{html}");
+        assert!(
+            html.contains("printString\n\t^String streamContents"),
+            "{html}"
+        );
     }
 
     #[test]
@@ -565,7 +657,14 @@ mod tests {
             let start = html.find(&needle).unwrap() + needle.len();
             html[start..].split('"').next().unwrap().to_string()
         };
-        let rebuilt = BrowserSelection::from_wire(&get("package"), &get("class"), &get("side"), &get("category"), &get("method"), &get("target"));
+        let rebuilt = BrowserSelection::from_wire(
+            &get("package"),
+            &get("class"),
+            &get("side"),
+            &get("category"),
+            &get("method"),
+            &get("target"),
+        );
         assert_eq!(rebuilt, sel);
     }
 
@@ -580,7 +679,13 @@ mod tests {
         let world = MockWorld::seed();
         let sel = BrowserSelection::default();
         let html = render_full_browser(&world, &sel);
-        for id in ["macvm-browser-packages", "macvm-browser-classes", "macvm-browser-categories", "macvm-browser-methods", "macvm-browser-source"] {
+        for id in [
+            "macvm-browser-packages",
+            "macvm-browser-classes",
+            "macvm-browser-categories",
+            "macvm-browser-methods",
+            "macvm-browser-source",
+        ] {
             assert!(html.contains(id), "missing {id} in {html}");
         }
     }
@@ -596,11 +701,21 @@ mod tests {
     fn classes_pane_offers_remove_only_when_a_class_is_selected() {
         let world = MockWorld::seed();
         let none = render_classes_pane(&world, &BrowserSelection::default());
-        assert!(!none.contains("data-browser-action=\"remove-class\""), "{none}");
+        assert!(
+            !none.contains("data-browser-action=\"remove-class\""),
+            "{none}"
+        );
 
-        let sel = BrowserSelection { package: Some("Kernel".into()), class: Some("Object".into()), ..Default::default() };
+        let sel = BrowserSelection {
+            package: Some("Kernel".into()),
+            class: Some("Object".into()),
+            ..Default::default()
+        };
         let html = render_classes_pane(&world, &sel);
-        assert!(html.contains("data-browser-action=\"remove-class\""), "{html}");
+        assert!(
+            html.contains("data-browser-action=\"remove-class\""),
+            "{html}"
+        );
         // Object has subclasses in the seed data — the confirm strip should
         // warn about them before the store unconditionally removes it.
         assert!(html.contains("subclasses"), "{html}");
@@ -610,14 +725,30 @@ mod tests {
     #[test]
     fn methods_pane_offers_new_always_and_remove_only_when_a_method_is_selected() {
         let world = MockWorld::seed();
-        let sel = BrowserSelection { class: Some("Object".into()), category: Some("printing".into()), ..Default::default() };
+        let sel = BrowserSelection {
+            class: Some("Object".into()),
+            category: Some("printing".into()),
+            ..Default::default()
+        };
         let html = render_methods_pane(&world, &sel);
-        assert!(html.contains("data-browser-action=\"new-method\""), "{html}");
-        assert!(!html.contains("data-browser-action=\"remove-method\""), "{html}");
+        assert!(
+            html.contains("data-browser-action=\"new-method\""),
+            "{html}"
+        );
+        assert!(
+            !html.contains("data-browser-action=\"remove-method\""),
+            "{html}"
+        );
 
-        let sel_with_method = BrowserSelection { method: Some("printString".into()), ..sel };
+        let sel_with_method = BrowserSelection {
+            method: Some("printString".into()),
+            ..sel
+        };
         let html = render_methods_pane(&world, &sel_with_method);
-        assert!(html.contains("data-browser-action=\"remove-method\""), "{html}");
+        assert!(
+            html.contains("data-browser-action=\"remove-method\""),
+            "{html}"
+        );
     }
 
     #[test]
@@ -626,9 +757,15 @@ mod tests {
         // Object's instance side spans "printing" and "comparing" —
         // selecting no category ("(all)") must show methods from both,
         // not just one.
-        let sel = BrowserSelection { class: Some("Object".into()), ..Default::default() };
+        let sel = BrowserSelection {
+            class: Some("Object".into()),
+            ..Default::default()
+        };
         let html = render_methods_pane(&world, &sel);
-        assert!(html.contains("data-browser-method=\"printString\""), "{html}");
+        assert!(
+            html.contains("data-browser-method=\"printString\""),
+            "{html}"
+        );
         assert!(html.contains("data-browser-method=\"hash\""), "{html}");
     }
 
@@ -640,17 +777,29 @@ mod tests {
         // the pane must still render (not the early-return empty div) and
         // still offer "+ New Method", or there'd be no way to add the
         // class's first method.
-        let sel = BrowserSelection { class: Some("Empty".into()), ..Default::default() };
+        let sel = BrowserSelection {
+            class: Some("Empty".into()),
+            ..Default::default()
+        };
         let html = render_methods_pane(&world, &sel);
-        assert!(html.contains("data-browser-action=\"new-method\""), "{html}");
+        assert!(
+            html.contains("data-browser-action=\"new-method\""),
+            "{html}"
+        );
     }
 
     #[test]
     fn all_pseudo_category_is_active_by_default_and_reachable_by_empty_name() {
         let world = MockWorld::seed();
-        let sel = BrowserSelection { class: Some("Object".into()), ..Default::default() };
+        let sel = BrowserSelection {
+            class: Some("Object".into()),
+            ..Default::default()
+        };
         let html = render_categories_pane(&world, &sel);
-        assert!(html.contains("st-browser-item active\" data-browser-category=\"\""), "{html}");
+        assert!(
+            html.contains("st-browser-item active\" data-browser-category=\"\""),
+            "{html}"
+        );
     }
 
     #[test]
@@ -671,7 +820,11 @@ mod tests {
     #[test]
     fn source_pane_shows_new_class_template_prefilling_selected_class_as_superclass() {
         let world = MockWorld::seed();
-        let sel = BrowserSelection { class: Some("Collection".into()), edit_target: SourceEditTarget::NewClass, ..Default::default() };
+        let sel = BrowserSelection {
+            class: Some("Collection".into()),
+            edit_target: SourceEditTarget::NewClass,
+            ..Default::default()
+        };
         let html = render_source_pane(&world, &sel);
         assert!(html.contains("Collection subclass: NewClass"), "{html}");
     }
@@ -679,19 +832,30 @@ mod tests {
     #[test]
     fn source_pane_shows_class_definition_with_real_mst_syntax() {
         let world = MockWorld::seed();
-        let sel = BrowserSelection { class: Some("Object".into()), edit_target: SourceEditTarget::ClassDefinition, ..Default::default() };
+        let sel = BrowserSelection {
+            class: Some("Object".into()),
+            edit_target: SourceEditTarget::ClassDefinition,
+            ..Default::default()
+        };
         let html = render_source_pane(&world, &sel);
         // Object has no superclass — the template must spell that as the
         // real `.mst` grammar does ("nil subclass: ..."), not e.g. omit it.
         assert!(html.contains("nil subclass: Object"), "{html}");
         assert!(html.contains("st-definition-tabs"), "{html}");
-        assert!(html.contains("st-browser-side-tab active\" data-browser-action=\"edit-definition\""), "{html}");
+        assert!(
+            html.contains("st-browser-side-tab active\" data-browser-action=\"edit-definition\""),
+            "{html}"
+        );
     }
 
     #[test]
     fn definition_tab_omits_the_ivars_line_when_there_are_none() {
         let world = MockWorld::seed();
-        let sel = BrowserSelection { class: Some("Collection".into()), edit_target: SourceEditTarget::ClassDefinition, ..Default::default() };
+        let sel = BrowserSelection {
+            class: Some("Collection".into()),
+            edit_target: SourceEditTarget::ClassDefinition,
+            ..Default::default()
+        };
         let html = render_source_pane(&world, &sel);
         // The seed's Collection has no ivars recorded — the |...| line
         // should be omitted entirely rather than rendered as an empty "||".
@@ -702,7 +866,11 @@ mod tests {
     fn definition_tab_shows_real_ivars_when_present() {
         let mut world = MockWorld::empty();
         world.add_class("Point", Some("Object"), "Kernel", "An x/y pair.", "x y", "");
-        let sel = BrowserSelection { class: Some("Point".into()), edit_target: SourceEditTarget::ClassDefinition, ..Default::default() };
+        let sel = BrowserSelection {
+            class: Some("Point".into()),
+            edit_target: SourceEditTarget::ClassDefinition,
+            ..Default::default()
+        };
         let html = render_source_pane(&world, &sel);
         assert!(html.contains("|x y|"), "{html}");
         assert!(html.contains("Object subclass: Point"), "{html}");

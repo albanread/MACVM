@@ -19,13 +19,15 @@ path = "src/main.rs"
 # considered — same "Rust owns the shell, no Swift/Xcode target" outcome,
 # fewer moving parts, no external API-surface risk from an evolving crate.
 #
-# macvm-mock-vm stands in for the real `macvm` lib (SPEC A18: gui depends on
-# the VM crate) until VmHandle/mirrors exist — see mock_vm/Cargo.toml.
-# Swap this for a real `macvm` path dependency once G2 lands; nothing else
-# in this crate should need to change shape, just what's behind vm_host.rs's
-# request/response handling.
+# macvm-mock-vm still backs the Browser/Canvas views (S21 step 3: only the
+# Workspace's Doit/WorkspacePrintIt moved to the real VmHandle below — see
+# vm_host.rs's module doc). Swap the rest once the Browser gets its own
+# mirror-primitive bridge (docs/SPEC.md §16.3).
 macvm-mock-vm = { path = "mock_vm" }
 # The real (`docs/IMAGE.md`) versioned SQLite world — mirrored into a
 # `MockWorld` at startup when `MACVM_IMAGE_PATH` is set (`vm_host.rs`),
 # with edits written through to both so they persist across restarts.
 image_store = { path = "../image_store" }
+# The real VM (SPEC A18/§16.2) — VmHandle/eval/TranscriptSink for the
+# Workspace's Doit/WorkspacePrintIt (S21 step 3).
+macvm = { path = ".." }

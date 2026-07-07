@@ -65,7 +65,10 @@ mod tests {
         assert!(html.contains("id=\"macvm-workspace-input\""), "{html}");
         assert!(html.contains("foo bar baz"), "{html}");
         assert!(html.contains("data-workspace-action=\"do-it\""), "{html}");
-        assert!(html.contains("data-workspace-action=\"print-it\""), "{html}");
+        assert!(
+            html.contains("data-workspace-action=\"print-it\""),
+            "{html}"
+        );
     }
 
     #[test]
