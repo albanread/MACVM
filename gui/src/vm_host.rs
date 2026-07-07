@@ -75,10 +75,18 @@ use crate::objc::{self, Id, Sel};
 use macvm::embed::{TranscriptSink, VmHandle};
 use macvm_mock_vm::MockWorld;
 pub use macvm_mock_vm::Side;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
+
+/// The two top-level doIts the `.mst` world runs at load (`Transcript` bind +
+/// `Character initTable`). S22-B moves these into the image; until then they
+/// are replayed explicitly by [`crate::world_boot::load_world_from_image`].
+const WORLD_DOITS: &[&str] = &[
+    "Transcript := TranscriptStream new.",
+    "Character initTable.",
+];
 
 /// GUI → VM. `Doit` is the only one with a real (stub) handler; the
 /// `BrowserSelect*` variants drive the class browser view
@@ -495,23 +503,41 @@ fn worker_loop(
     // "routing a click to the right closure, and locking" for why that's
     // the right shape, not just a convenient one. `world` is `mut` now
     // that `BrowserSaveSource` can edit it (still worker-thread-only).
-    let image = open_image_from_env();
+    //
+    // S22: the versioned image database is the single source of truth. The
+    // VM boots FROM the image (genesis + `load_world_from_image`, not the
+    // `.mst` file tree), and the browser's mock mirrors the SAME image, so
+    // an edit written through to both stays consistent. The image is
+    // auto-seeded from `world/*.mst` on first run (zero setup). If the DB
+    // can't be established at all, fall back to the old `.mst` boot + mock
+    // seed so the GUI still works.
+    let image_path = resolve_image_path(world_dir);
+    let (image, mut vm) = match open_or_seed_image(world_dir, &image_path) {
+        Ok(img) => match boot_vm_from_image(&img, responses.clone(), wake) {
+            Some(vm) => (Some(img), vm),
+            // The image opened but the world load failed — most likely a
+            // STALE image written by an older importer. Fall back to the
+            // .mst boot + mock so the GUI still works, rather than
+            // respawn-looping forever on a bad image. (A boot failure was
+            // already reported to the transcript by `boot_vm_from_image`.)
+            None => match boot_real_vm(responses.clone(), wake, world_dir) {
+                Some(vm) => (None, vm),
+                None => return,
+            },
+        },
+        Err(e) => {
+            eprintln!("vm_host: {e} — falling back to .mst boot + mock world");
+            match boot_real_vm(responses.clone(), wake, world_dir) {
+                Some(vm) => (None, vm),
+                None => return,
+            }
+        }
+    };
     let mut world = match &image {
         Some(img) => mock_world_from_image(img),
         None => MockWorld::seed(),
     };
     let mut selection = BrowserSelection::default();
-
-    // S21 step 3: the real embedded VM for the Workspace's Doit/
-    // WorkspacePrintIt path (Browser/Canvas above stay on the mock — see
-    // this module's doc comment). A boot failure isn't a guest crash (it's
-    // reported here once and this worker generation simply ends); the next
-    // request submitted from the main thread will find no response arrives
-    // in time and `VmHost::submit` will respawn, retrying boot fresh.
-    let mut vm = match boot_real_vm(responses.clone(), wake, world_dir) {
-        Some(vm) => vm,
-        None => return,
-    };
 
     for request in requests {
         let batch = handle(request, &mut world, &mut selection, image.as_ref(), &mut vm);
@@ -586,19 +612,99 @@ fn boot_real_vm(
     }
 }
 
-/// `docs/IMAGE.md` §8 — an `image_store::Image` file if `MACVM_IMAGE_PATH`
-/// names one that actually opens, else `None` (falling back to the
-/// invented `MockWorld` seed, which is the whole point of keeping the mock
-/// around: zero-setup UI testing with no image file required).
-fn open_image_from_env() -> Option<image_store::Image> {
-    let path = std::env::var_os("MACVM_IMAGE_PATH")?;
-    match image_store::Image::open(std::path::Path::new(&path)) {
-        Ok(img) => Some(img),
+/// The image database path (S22): `MACVM_IMAGE_PATH` if set, else the
+/// default `<world_dir>/image.sqlite3` — so the DB is the out-of-the-box
+/// source of truth, no env var required.
+fn resolve_image_path(world_dir: &Path) -> PathBuf {
+    std::env::var_os("MACVM_IMAGE_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| world_dir.join("image.sqlite3"))
+}
+
+/// Opens the image at `image_path` (creating the file if missing), seeding
+/// it from `world_dir`'s `.mst` files the first time (when it has no
+/// classes) so a fresh checkout Just Works with zero setup. `docs/IMAGE.md`
+/// §6/§8.
+fn open_or_seed_image(world_dir: &Path, image_path: &Path) -> Result<image_store::Image, String> {
+    let image = image_store::Image::open(image_path)
+        .map_err(|e| format!("opening image {}: {e}", image_path.display()))?;
+    let empty = image
+        .all_classes()
+        .map_err(|e| format!("reading image {}: {e}", image_path.display()))?
+        .is_empty();
+    if empty {
+        let stats = image_store::import::import_world_dir(&image, world_dir)?;
+        eprintln!(
+            "vm_host: seeded {} from {} ({} classes, {} methods)",
+            image_path.display(),
+            world_dir.display(),
+            stats.classes,
+            stats.methods
+        );
+    }
+    Ok(image)
+}
+
+/// Boots the VM FROM the image (S22): genesis, then replay the whole world
+/// out of the database ([`crate::world_boot::load_world_from_image`]) rather
+/// than the `.mst` file tree. Installs the transcript sink first so any
+/// load-time output reaches the GUI. Returns `None` (reporting to the
+/// transcript) on a load failure, so the caller can end this worker
+/// generation and let the supervisor respawn.
+fn boot_vm_from_image(
+    image: &image_store::Image,
+    responses: Sender<VmResponse>,
+    wake: CrossThreadObjcRef,
+) -> Option<VmHandle> {
+    let opts = macvm::runtime::VmOptions::from_env();
+    let mut vm = VmHandle::boot_without_world(opts);
+    vm.set_transcript(Box::new(ChannelTranscript {
+        responses: responses.clone(),
+        wake,
+    }));
+    match crate::world_boot::load_world_from_image(&mut vm, image, WORLD_DOITS) {
+        Ok(stats) => {
+            eprintln!(
+                "vm_host: booted VM from image ({} classes, {} methods, {} doits)",
+                stats.classes, stats.methods, stats.doits
+            );
+            Some(vm)
+        }
         Err(e) => {
-            eprintln!("vm_host: MACVM_IMAGE_PATH={path:?} failed to open ({e}) — falling back to the mock world");
+            let _ = responses.send(VmResponse::Transcript(format!(
+                "VM boot from image failed: {e}"
+            )));
+            wake.notify();
             None
         }
     }
+}
+
+/// Wraps one method's edited `.mst` `text` as a reopen of `class_name`, so
+/// [`live_compile`] installs/replaces just that method in the running VM.
+/// The superclass (from the mock, which was just updated) is needed for the
+/// reopen — `install_class_def` checks it matches the live class. Class-side
+/// methods carry their own `<Class> class >>` prefix in the stored source,
+/// so `text` drops straight in either way.
+fn reopen_one_method(world: &MockWorld, class_name: &str, text: &str) -> String {
+    let superclass = world
+        .class_named(class_name)
+        .and_then(|c| c.superclass.clone())
+        .unwrap_or_else(|| "nil".to_string());
+    format!(
+        "{superclass} subclass: {class_name} [\n{}\n]\n",
+        text.trim()
+    )
+}
+
+/// Compiles `mst_source` into the running VM (S22-E) so a browser edit is
+/// LIVE — usable immediately — not merely saved to the mock + image. A
+/// compile failure is returned as a short string (the edit is still saved;
+/// it just isn't live until fixed), never a panic or a thread kill: a syntax
+/// error is a `GuestError::Compile`, and `exec` recovers a genuine native
+/// fault too (`embed.rs`).
+fn live_compile(vm: &mut VmHandle, mst_source: &str) -> Result<(), String> {
+    vm.exec(mst_source).map_err(|e| e.to_string())
 }
 
 fn side_to_image(side: Side) -> image_store::Side {
@@ -913,6 +1019,10 @@ fn handle(
             // but it can mean the edit doesn't survive a restart, which is
             // now reported honestly (`SaveOk`/`describe_image_write`)
             // rather than unconditionally claiming "(persisted to image)".
+            // S22-E: remember the edit KIND before the arms below mutate
+            // `selection.edit_target` (NewMethod→Method, NewClass→ClassComment),
+            // so the post-match live-compile knows how to make it live.
+            let edit_kind = selection.edit_target.clone();
             let outcome: Result<SaveOk, String> = match &selection.edit_target {
                 SourceEditTarget::ClassComment => match &selection.class {
                     Some(class_name) if world.set_class_comment(class_name, text.clone()) => {
@@ -1022,18 +1132,38 @@ fn handle(
                     None => Err("Select a package first.".to_string()),
                 },
             };
+            // S22-E: make a SUCCESSFUL edit LIVE in the running VM — not just
+            // saved to the mock + image. `text` is the edited source; the
+            // (post-edit) `selection` names the class. A ClassComment edit
+            // compiles nothing (`None`). A live-compile failure is reported
+            // but does NOT undo the save — the source is persisted; the user
+            // fixes and re-accepts.
+            let vm_live: Option<Result<(), String>> = match (&outcome, &edit_kind) {
+                (Ok(_), SourceEditTarget::Method | SourceEditTarget::NewMethod) => selection
+                    .class
+                    .clone()
+                    .map(|c| live_compile(vm, &reopen_one_method(world, &c, &text))),
+                (Ok(_), SourceEditTarget::ClassDefinition | SourceEditTarget::NewClass) => {
+                    Some(live_compile(vm, &text))
+                }
+                _ => None,
+            };
+
             let message = match outcome {
-                Ok(SaveOk {
-                    what,
-                    image_error: None,
-                }) => match image {
-                    Some(_) => format!("{what} (persisted to image)."),
-                    None => format!("{what}."),
-                },
-                Ok(SaveOk {
-                    what,
-                    image_error: Some(reason),
-                }) => format!("{what}, but failed to persist to the image: {reason}."),
+                Ok(SaveOk { what, image_error }) => {
+                    let base = match (image.is_some(), image_error) {
+                        (true, None) => format!("{what} (persisted to image)"),
+                        (_, None) => what,
+                        (_, Some(reason)) => {
+                            format!("{what}, but failed to persist to the image: {reason}")
+                        }
+                    };
+                    match vm_live {
+                        Some(Ok(())) => format!("{base} — live in the VM."),
+                        Some(Err(e)) => format!("{base}; saved but NOT live in the VM: {e}."),
+                        None => format!("{base}."),
+                    }
+                }
                 Err(e) => e,
             };
             vec![
@@ -1736,11 +1866,23 @@ mod tests {
     /// this needs no Objective-C runtime / NSApplication (headless-safe).
     #[test]
     fn supervisor_respawns_the_worker_after_a_fatal_doit_and_serves_the_next_request() {
+        // Isolate the image to a temp dir, pre-seeded once, so the two worker
+        // generations boot from the DB (S22) without seeding or touching the
+        // repo's own world/image.sqlite3. The worker derives its image path
+        // as `<world_dir>/image.sqlite3`, so passing this temp dir as the
+        // world_dir points it here.
+        let tmp_dir = std::env::temp_dir().join(format!("macvm_respawn_{}", std::process::id()));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        {
+            let img = image_store::Image::open(&tmp_dir.join("image.sqlite3")).unwrap();
+            image_store::import::import_world_dir(&img, &test_world_dir()).unwrap();
+        }
+
         // A NIL SEL is fine: notify() never dereferences it (NIL target).
         let host = spawn_with_world_and_timeout(
             objc::NIL,
             objc::NIL,
-            test_world_dir(),
+            tmp_dir.clone(),
             Duration::from_millis(150),
         );
 
@@ -1773,5 +1915,93 @@ mod tests {
             transcript_containing(&seen, "6 * 7"),
             "the fresh worker must have served the follow-up doit, got {seen:?}"
         );
+
+        std::fs::remove_dir_all(&tmp_dir).ok();
+    }
+
+    /// S22-E: editing a method through the browser's accept path makes the
+    /// new behaviour LIVE in the running VM — a subsequent eval sees it, not
+    /// just the mock/image. The class exists in both the mock and the VM (as
+    /// it would after a DB boot); a class-side method keeps the test free of
+    /// instantiation.
+    #[test]
+    fn browser_method_edit_is_live_in_the_running_vm() {
+        let mut world = MockWorld::empty();
+        world.add_class("LiveFoo", Some("Object"), "Test", "", "", "");
+        world.add_method(
+            "LiveFoo",
+            Side::Class,
+            "ping",
+            "accessing",
+            "LiveFoo class >> ping [ ^1 ]",
+        );
+        let mut vm = test_vm_handle(macvm::runtime::JitMode::Off);
+        vm.exec("Object subclass: LiveFoo [ LiveFoo class >> ping [ ^1 ] ]")
+            .unwrap();
+        assert_eq!(
+            vm.eval("LiveFoo ping.").unwrap(),
+            "1",
+            "sanity: starts at 1"
+        );
+
+        let mut selection = BrowserSelection {
+            class: Some("LiveFoo".to_string()),
+            category: Some("accessing".to_string()),
+            method: Some("ping".to_string()),
+            side: Side::Class,
+            edit_target: SourceEditTarget::Method,
+            ..Default::default()
+        };
+        let responses = handle(
+            VmRequest::BrowserSaveSource {
+                text: "LiveFoo class >> ping [ ^42 ]".to_string(),
+                saved_package: String::new(),
+                saved_class: "LiveFoo".to_string(),
+                saved_side: "class".to_string(),
+                saved_category: "accessing".to_string(),
+                saved_method: "ping".to_string(),
+                saved_target: "method".to_string(),
+            },
+            &mut world,
+            &mut selection,
+            None,
+            &mut vm,
+        );
+
+        assert!(
+            transcript_containing(&responses, "live in the VM"),
+            "the save must report it went live, got {responses:?}"
+        );
+        // The real proof: the running VM now runs the edited method.
+        assert_eq!(
+            vm.eval("LiveFoo ping.").unwrap(),
+            "42",
+            "the browser edit must be live in the VM"
+        );
+    }
+
+    /// S22-E part A: a fresh image path is auto-seeded from `world/*.mst`
+    /// (zero setup); re-opening the same file does NOT re-seed.
+    #[test]
+    fn open_or_seed_image_seeds_then_reuses() {
+        let world_dir = std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../world"));
+        let tmp =
+            std::env::temp_dir().join(format!("macvm_seed_test_{}.sqlite3", std::process::id()));
+        std::fs::remove_file(&tmp).ok();
+
+        let img = open_or_seed_image(&world_dir, &tmp).expect("seed fresh");
+        let n = img.all_classes().unwrap().len();
+        drop(img);
+        assert!(
+            n >= 40,
+            "a fresh path must be seeded with the whole world, got {n}"
+        );
+
+        // Re-open the same file: it already has classes, so it is NOT
+        // re-seeded (same count, no duplicate-class error).
+        let img2 = open_or_seed_image(&world_dir, &tmp).expect("reopen seeded");
+        assert_eq!(img2.all_classes().unwrap().len(), n);
+        drop(img2);
+        std::fs::remove_file(&tmp).ok();
     }
 }
