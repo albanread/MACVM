@@ -977,8 +977,18 @@ impl VmState {
         // mid-compile — one small, fixed, one-time cost per VM, matching
         // `Universe::genesis` itself always building well-knowns a given
         // script may never touch.
-        let mut code_cache = CodeCache::new(DEFAULT_CODE_CACHE_CAPACITY)
-            .expect("VmState::with_options: failed to reserve JIT code cache");
+        // A genesis-time mmap failure (like `Reservation::reserve`'s own) —
+        // `fatal_exit`, not `.expect()`'s panic, so an embedded `VmHandle`
+        // (S21) loses only its own thread, not the whole process, on the
+        // same environment-limit condition that already terminates via
+        // `fatal_exit` everywhere else in the VM.
+        let mut code_cache = match CodeCache::new(DEFAULT_CODE_CACHE_CAPACITY) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("macvm: failed to reserve JIT code cache: {e}");
+                fatal_exit(71);
+            }
+        };
         let stubs = crate::codecache::stubs::install(&mut code_cache);
         // S20 step 4: publish the 3 FFI trampolines alongside `stubs`, same
         // unconditional-at-boot install — an FFI method's own eligibility

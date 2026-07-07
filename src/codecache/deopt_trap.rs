@@ -1311,6 +1311,66 @@ pub fn read_pool_oop(nm: &crate::codecache::nmethod::Nmethod, pool_ix: u32) -> O
 
 // ── install (D3): sigaction once at startup + trampoline generation ───────
 
+/// Arms the SIGSEGV/SIGBUS foreign-fault handler (+ this thread's own
+/// sigaltstack) directly, without going through [`install`]. `VmState::
+/// with_options` only calls `install` when the JIT is enabled — a pure
+/// interpreter never emits a deopt trap, so arming SIGTRAP and publishing
+/// trampolines would be pure overhead — but an embedded `VmHandle`
+/// (`embed::VmHandle::boot`, S21) needs `sig_fault_handler`'s foreign-fault
+/// recovery regardless of JIT mode: the safety directive behind it ("if the
+/// language thread dies, the GUI must not die") draws no JIT-mode
+/// exception, and `docs/SPEC.md` §16.5 itself requires the GUI's Browser
+/// accept path to run with `MACVM_JIT=off` until compiled-tier redefinition
+/// lands. Without this, an embedded `JitMode::Off` VM would have NO signal
+/// handler armed at all (`install` never runs), so any native fault (e.g.
+/// `Alien`'s raw pointer accessors, S20) would kill the whole process.
+///
+/// Deliberately unconditional — no "arm once" guard, unlike `install`'s
+/// `HANDLER_ARMED`: `sigaltstack` is a PER-THREAD kernel resource, so if two
+/// embedded `VmHandle`s ever ran on two different worker threads in the
+/// same process, each needs its OWN call to register its OWN alt-stack — an
+/// "arm once, process-wide" guard would silently leave the second thread
+/// with none. (Both threads' alt-stacks would still alias the same
+/// `ALT_STACK` buffer — concurrent faults on two simultaneously-embedded
+/// VMs racing on that shared memory is a known, out-of-scope limitation for
+/// now: today's only caller, `embed::VmHandle::boot`, is one VM on one
+/// worker thread.) Redundant calls (a JIT-enabled boot, where `install`
+/// already armed the same two signals on this same thread; or calling
+/// `boot` twice on one thread) are harmless — `sigaltstack`/`sigaction` are
+/// themselves idempotent, and both paths install the exact same
+/// `sig_fault_handler` function pointer.
+pub(crate) fn arm_foreign_fault_handler() {
+    // SAFETY: a fully zeroed, fully initialized `sigaction`/`stack_t`,
+    // matching the SA_SIGINFO 3-arg ABI `sig_fault_handler` expects — the
+    // same shape `install`'s own arm block uses below.
+    unsafe {
+        let mut alt: libc::stack_t = core::mem::zeroed();
+        alt.ss_sp = ALT_STACK.0.get() as *mut core::ffi::c_void;
+        alt.ss_size = ALT_STACK_BYTES;
+        alt.ss_flags = 0;
+        let rc = libc::sigaltstack(&alt, core::ptr::null_mut());
+        assert_eq!(
+            rc, 0,
+            "deopt_trap::arm_foreign_fault_handler: sigaltstack failed"
+        );
+
+        let mut sf: libc::sigaction = core::mem::zeroed();
+        sf.sa_sigaction = sig_fault_handler as *const () as usize;
+        sf.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
+        libc::sigemptyset(&mut sf.sa_mask);
+        let rc = libc::sigaction(libc::SIGSEGV, &sf, core::ptr::null_mut());
+        assert_eq!(
+            rc, 0,
+            "deopt_trap::arm_foreign_fault_handler: sigaction(SIGSEGV) failed"
+        );
+        let rc = libc::sigaction(libc::SIGBUS, &sf, core::ptr::null_mut());
+        assert_eq!(
+            rc, 0,
+            "deopt_trap::arm_foreign_fault_handler: sigaction(SIGBUS) failed"
+        );
+    }
+}
+
 /// Install the SIGTRAP handler and publish the deopt trampolines into `cache`.
 /// Call once at startup, after the code cache exists but before running any
 /// compiled code (the same window `stubs::install` runs in).
@@ -1972,6 +2032,35 @@ mod tests {
             info
         });
         assert_eq!(handle.join().unwrap(), None);
+    }
+
+    /// `arm_foreign_fault_handler` (S21, `embed::VmHandle::boot`'s
+    /// `JitMode::Off` case) must recover a real SIGSEGV with NO `CodeCache`/
+    /// `install` involved at all — proving the foreign-fault path does not
+    /// secretly depend on the JIT-only `install` having run first. Confirms
+    /// the actual gap this function closes: SPEC §16.5 requires the GUI's
+    /// Browser accept path to run with `MACVM_JIT=off`, and `with_options`
+    /// never calls `install` in that mode.
+    #[test]
+    fn arm_foreign_fault_handler_recovers_without_install_or_code_cache() {
+        let handle = std::thread::spawn(|| {
+            arm_foreign_fault_handler();
+            let slot = claim_jmp_slot();
+            let rc = unsafe { sigsetjmp(jmp_buf_ptr(slot), 1) };
+            if rc == 0 {
+                let bad = 8usize as *const u8;
+                unsafe { std::ptr::read_volatile(bad) };
+                panic!("unreachable — the segv should have recovered via siglongjmp");
+            }
+            let info = take_last_crash_info();
+            deregister_setjmp();
+            info
+        });
+        let info = handle.join().expect("worker thread must complete normally");
+        let (sig, _pc, far) =
+            info.expect("expected Some((sig, pc, far)) after a recovered foreign fault");
+        assert_eq!(sig, libc::SIGSEGV);
+        assert_eq!(far, 8);
     }
 
     /// `read_frame_slot` reads the 8-byte oop at `fp + off` (the one licensed

@@ -28,8 +28,10 @@ pub struct Reservation {
 impl Reservation {
     /// Reserve `size` bytes of address space (`PROT_NONE`,
     /// `MAP_PRIVATE|MAP_ANON`). `size` is rounded up to the system page size.
-    /// Exits the process (not a panic — an environment limit, not a VM bug)
-    /// if the OS refuses the reservation.
+    /// Calls `fatal_exit` (not a panic — an environment limit, not a VM bug)
+    /// if the OS refuses the reservation: the whole process for the CLI/
+    /// tests, or just the calling thread for an embedded `VmHandle` (S21) —
+    /// see `runtime::vm_state::fatal_exit`'s own doc.
     pub fn reserve(size: usize) -> Reservation {
         let size = round_up(size, page_size());
         // SAFETY: a fixed-shape mmap call with a null hint address (the
@@ -50,7 +52,7 @@ impl Reservation {
                 "macvm: failed to reserve {size} bytes: {}",
                 std::io::Error::last_os_error()
             );
-            std::process::exit(71);
+            crate::runtime::vm_state::fatal_exit(71);
         }
         Reservation {
             base: ptr as usize,
@@ -75,7 +77,8 @@ impl Reservation {
     }
 
     /// Make `[off, off+len)` (page-rounded outward) readable and writable.
-    /// Exits the process if `mprotect` fails. No-op in `test_heap` mode.
+    /// Calls `fatal_exit` if `mprotect` fails (see `reserve`'s own doc). No-op
+    /// in `test_heap` mode.
     pub fn commit(&self, off: usize, len: usize) {
         if self.test_box.is_some() {
             return;
@@ -98,7 +101,7 @@ impl Reservation {
                 "macvm: failed to commit {len} bytes at offset {off}: {}",
                 std::io::Error::last_os_error()
             );
-            std::process::exit(71);
+            crate::runtime::vm_state::fatal_exit(71);
         }
     }
 
@@ -106,7 +109,7 @@ impl Reservation {
     /// macOS, not `MADV_DONTNEED`) then `mprotect(PROT_NONE)` over
     /// `[off, off+len)`, page-rounded outward. Reclaimed memory is NOT
     /// guaranteed zeroed on a later re-`commit` (lesson 5 — callers must
-    /// never assume it). No-op in `test_heap` mode. Exits the process on
+    /// never assume it). No-op in `test_heap` mode. Calls `fatal_exit` on
     /// failure, same policy as `commit`.
     pub fn decommit(&self, off: usize, len: usize) {
         if self.test_box.is_some() {
@@ -133,7 +136,7 @@ impl Reservation {
                 "macvm: failed to decommit {len} bytes at offset {off}: {}",
                 std::io::Error::last_os_error()
             );
-            std::process::exit(71);
+            crate::runtime::vm_state::fatal_exit(71);
         }
     }
 

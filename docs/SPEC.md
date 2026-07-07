@@ -1092,22 +1092,42 @@ VM internals; everything crosses one seam. What the *core* must provide:
   (transcript, rendered fragments) returns via a channel drained on the main
   thread into `evaluateJavaScript`.
 
-### 16.2 `VmHandle` — the embedding API (Rust)
+### 16.2 `VmHandle` — the embedding API (Rust) *(REVISED — S21, `src/embed.rs`)*
 ```rust
 pub struct VmHandle { /* owns VmState + world, lives on the VM thread */ }
 impl VmHandle {
-    pub fn boot(opts: VmOptions) -> Result<VmHandle, VmError>;   // genesis + world
+    pub fn boot(opts: VmOptions, world_dir: &Path) -> Result<VmHandle, VmError>;
+        // genesis + world; world_dir explicit (not hardcoded) for testability —
+        // see boot's own doc comment
     pub fn eval(&mut self, source: &str) -> Result<String, GuestError>;
         // compile as a doit (S5 REPL machinery), run, answer printString
     pub fn set_transcript(&mut self, sink: Box<dyn TranscriptSink>);
-    pub fn mirrors(&mut self) -> Mirrors<'_>;                    // §16.3
+    pub fn mirrors(&mut self) -> Mirrors<'_>;                    // §16.3, NOT YET BUILT
 }
+pub enum GuestError { Compile(CompileError), NativeFault { sig: i32, pc: u64, far: u64 } }
 pub trait TranscriptSink: Send { fn show(&mut self, text: &str); }
 ```
 `Transcript`'s primitive path (§10 `printOnStdout:`) routes through the
 `VmState`-held sink; the default sink is stdout, the GUI installs a channel
-sink. Guest errors surface as `GuestError` values (message + Smalltalk stack
-trace string), never as Rust panics.
+sink. Guest errors surface as `GuestError` values, never as Rust panics —
+`Compile` for a source that failed to lex/parse/codegen, `NativeFault` for a
+genuinely recovered SIGSEGV/SIGBUS in ordinary (non-JIT) native code (S20's
+`Alien` raw pointer accessors are the only source of these today).
+
+**Thread-safety model (S21, not in the original sketch above):** a
+`VmHandle` MUST be driven from a dedicated thread the caller is prepared to
+see disappear out from under it. `boot` arms `FatalMode::ExitThread`
+(`runtime::vm_state`) so every guest-fatal condition (`error:`, DNU, stack
+overflow, heap exhaustion, a genesis-time mmap failure) terminates only the
+calling thread (`libc::pthread_exit`, which does not unwind — safe
+regardless of any JIT-compiled frames on the stack) rather than the whole
+process; the JIT is fully supported in this mode, unrestricted. The caller
+must never call `.join()`/`.is_finished()` on that thread's `JoinHandle` —
+see `src/embed.rs`'s module doc for why (a `pthread_exit`-terminated thread
+never completes `JoinHandle`'s own bookkeeping). See
+`src/codecache/deopt_trap.rs`'s `arm_foreign_fault_handler` for the
+mechanism, which works regardless of `opts.jit` (needed because §16.5 below
+requires `MACVM_JIT=off` for the Browser's accept path).
 
 ### 16.3 Mirrors — the reflection surface (needed by G3/G4) *(REVISED — A19)*
 **Mirrors are Smalltalk-side objects backed by small, dumb VM primitives** —
