@@ -2,37 +2,20 @@
  REAL world/world.list (sprint_s06_detail.md step 6: 'point_demo.mst now
  prints via printString'). point_demo.mst itself stays untouched — it's
  also exercised with NO world loaded at all (it_cli.rs's world_missing),
- which this variant can't be since it needs Transcript/printString/+."
+ which this variant can't be since it needs Transcript/printString/+.
 
-Object subclass: Point [
-    | x y |
-    Point class >> new [
-        <primitive: 23>
-        ^self
-    ]
-    setX: ax y: ay [
-        x := ax.
-        y := ay
-    ]
-    x [ ^x ]
-    y [ ^y ]
-    + p [
-        ^(Point new) setX: x + p x y: y + p y
-    ]
-    printOn: s [
-        s nextPut: $(.
-        x printOn: s.
-        s nextPutAll: ', '.
-        y printOn: s.
-        s nextPut: $)
-    ]
-]
+ Uses the REAL world Point class (world/28_point.mst) rather than a
+ throwaway stand-in of its own — this file used to define its own
+ `Object subclass: Point [...]`, which predates 28_point.mst being added
+ to the base world and started tripping 'cannot change shape of existing
+ class Point' once both existed (found 2026-07-08). The real Point's own
+ constructor is `x:y:`, not `new` + `setX:y:`, and its `printOn:` uses
+ `@` (`x@y`), not a parenthesized pair — this file now exercises exactly
+ that real API instead of shadowing it."
 
-P1 := Point new.
-P1 setX: 1 y: 2.
+P1 := Point x: 1 y: 2.
 Transcript show: 'Point creation ok'; cr.
-P2 := Point new.
-P2 setX: 3 y: 4.
+P2 := Point x: 3 y: 4.
 P3 := P1 + P2.
 Transcript show: 'Point + ok'; cr.
 Transcript show: P3 printString; cr.
