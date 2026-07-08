@@ -75,8 +75,24 @@ possible angles worth evaluating on the day:
    actually compile both arms, not just re-guess which one is dominant).
 
 **Where to start looking, concretely:** `src/compiler/ir.rs` (`Ir::SmiCmpVal`,
-`Ir::SmiCmpBr`, `Ir::UncommonTrap`, `classify_smi_send`), `src/compiler/recompile.rs`,
+`Ir::SmiCmpBr`, `Ir::UncommonTrap`, `classify_smi_send`), `src/runtime/recompile.rs`,
 `docs/PERF.md`'s S15 A6/A7 section, `world/bench/richards.mst:330`.
+
+**Confirmed a general problem, and `sieve` is the CANONICAL repro (2026-07-08).**
+Gap 1 is not Richards-specific — `world/bench/sieve.mst` hits the identical
+storm and is a far cleaner development target (one small method, one hot
+bytecode, no scheduler machinery or 7-arg constructors around it). Evidence
+(release, `MACVM_JIT=threshold=1`): sieve is dead flat vs the interpreter
+(~87 ms both), yet it DOES compile (`MACVM_TRACE=stats`: `compilations=60`,
+`osr_entries=30`, `contexts_allocated=0`) — it just storms on one branch
+(`MACVM_TRACE=deopt`: `nm=8 bci=155` repeatedly, `deopt_count=65 [trap 65]`,
+`recompiles=18`, `recompile_declined_ineffective=0`). The
+`recompiles=18` / `declined=0` pair is the precise fingerprint of "two arms
+equally likely but the dominant one keeps *shifting*": every recompile finds
+a changed profile, so `recompile.rs` keeps chasing a moving target instead
+of converging (exactly the "it fires but still re-guesses" outcome point 2
+above predicted). Full numbers in `docs/PERF.md` ("Dual-arm branch storm"
+entry). Develop and gate the fix against sieve first, then re-check Richards.
 
 ## Gap 2 — methods with argc > 5 are never compile targets, period
 

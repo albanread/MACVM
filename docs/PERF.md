@@ -183,3 +183,35 @@ And the A/B surfaced something the record didn't yet know: the PRE-fix
 build SIGSEGVs on sieve under BOTH JIT thresholds in release — the OSR
 uninitialized-slot bug again, cured by the same fix. Net: nothing slower,
 two benchmarks (sieve JIT, richards t=1) went from crashing to correct.
+
+# Dual-arm branch storm — sieve is the canonical repro (2026-07-08)
+
+Representative-benchmark sweep after the primitive-shim work (release,
+`--world world`; richards/deltablue self-timed, fib/factorial self-timed
+via `millisecondClock`, arith/dispatch process-timed incl. ~10 ms boot):
+
+| Benchmark | interp (off) | jit t=1 | speedup | shape |
+|---|---|---|---|---|
+| arith (`sumTo: 5M`) | 1280 ms | ~10 ms | >100x | tight fused smi loop |
+| fib(32) | 1637 ms | 15 ms | ~109x | recursion + dispatch + fused arith |
+| factorial 20! x200k | 6989 ms | 890 ms | ~7.9x | smi `*` + overflow→LargeInteger |
+| factorial 500! x300 | 72325 ms | 4386 ms | ~16.5x | bignum multiply + allocation |
+| deltablue (10x10) | 213 ms | 113 ms | ~1.9x | constraint solver |
+| dispatch | 1870 ms | ~20 ms | ~90x | send/IC dispatch |
+| **sieve (8190 x10)** | **87 ms** | **88 ms** | **~1.0x** | **dual-arm branch storm** |
+
+**sieve is the canonical "dual-arm" repro** (`weekend_work.md` Gap 1's
+balanced two-way branch, confirmed as a general problem, not Richards-
+specific). It DOES compile — `MACVM_TRACE=stats`: `compilations=60`,
+`osr_entries=30`, `contexts_allocated=0` (block/Context elision works) —
+but `MACVM_TRACE=deopt` shows a recurring speculative-trap storm at ONE
+site (`nm=8 bci=155`, `deopt_count=65 [trap 65]`) with `recompiles=18` and
+`recompile_declined_ineffective=0`. That last pair is the signature: every
+recompile finds a *changed* profile → the dominant arm is genuinely
+oscillating (the two arms are ~equally likely and keep shifting), so
+`recompile.rs` chases a moving target, burns `MAX_VERSIONS`, and falls back
+to permanent deopts. Speculation fundamentally can't win a balanced branch;
+the fix is two-arm (poly-arm) compilation — compile BOTH arms as native
+code joined by a real conditional, no trap on either side. Cleaner repro
+than Richards (one method, one bci, no scheduler/7-arg-constructor noise),
+so it is the development + golden target for the fix.
