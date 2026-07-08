@@ -10,18 +10,24 @@
  Date.dlt's own working subset: construction from an explicit day/month/
  year, comparison, accessors, weekday/month name lookup, printing.
 
- `Date class>>today` and `Time class>>now`/`dateAndTimeNow`/`clockValue`/
- `millisecondClockValue` are also NOT ported — these need a real
- wall-clock/calendar primitive (Windows `SYSTEMTIME` in the original),
- and MACVM has none: its own `millisecondClock`
- (src/runtime/primitives.rs, prim_millisecond_clock) is
- `vm.start_instant.elapsed()`, elapsed time since the VM started — the
+ `Date class>>today` and `Time class>>now`/`dateAndTimeNow`/`clockValue`
+ are still NOT ported — these need a real wall-clock/calendar primitive
+ (Windows `SYSTEMTIME` in the original), and MACVM's own internal
+ `millisecondClock` (src/runtime/primitives.rs, prim_millisecond_clock)
+ is `vm.start_instant.elapsed()`, elapsed time since the VM started — the
  exact same 'not a calendar clock' semantics Strongtalk's own
  `clockValue` doc comment already admits ('elapsed time since Smalltalk
  started'), not a source of wall-clock time either. Calling `today`/`now`
  on these classes is a plain doesNotUnderstand, same as every other
  deliberately-unported method in this whole porting effort (Point's
  Rectangle methods, Bag's `=`, ...) — no stub is added for it.
+
+ `Time class>>millisecondClockValue` IS now implemented (S22) — not a port
+ of Strongtalk's own version (which just read Windows' SYSTEMTIME), but a
+ real wall-clock primitive built via FFI (docs/FFI.md): milliseconds since
+ the Unix epoch, from clock_gettime(CLOCK_REALTIME). See the real Time
+ class's own doc comment, right at the definition, for the mmap-scratch-
+ buffer/struct-layout mechanics.
 
  Time.dlt, by contrast, IS fully implemented in the original: it's just
  'seconds since midnight' integer arithmetic (fromSeconds:/hour/minute/
@@ -120,9 +126,57 @@ Object subclass: Date [
 
 Object subclass: Time [
     | seconds |
+    <classVars: ClockBuffer>
 
     Time class >> fromSeconds: s [
         ^self basicNew initSeconds: s
+    ]
+
+    "millisecondClockValue — S22, via FFI (docs/FFI.md), filling exactly the
+     gap this file's own header comment named: a real wall-clock primitive
+     MACVM's internal millisecondClock (elapsed-since-VM-start) never was.
+     clock_gettime(CLOCK_REALTIME, &ts) needs a pointer argument, but FFI
+     argument marshaling only accepts plain SmallIntegers (src/runtime/
+     ffi.rs's marshal_g) — there is no way to pass an Alien object itself as
+     an arg. So ClockBuffer holds the ADDRESS (a plain integer) of a 16-byte
+     scratch region obtained via a real mmap call (mmap-owned memory is the
+     right choice for a buffer handed OUT to native code as a pointer,
+     precisely because it's outside the GC heap and can never move mid-call
+     — unlike a direct Alien's inline bytes, which live inside a Smalltalk
+     object); lazily allocated once and reused forever after.
+     struct timespec { long tv_sec; long tv_nsec; } is 16 bytes, both
+     fields plain 8-byte longs at offsets 0/8 — confirmed by compiling and
+     running a real C probe against this machine's headers (not assumed),
+     which is also why clock_gettime was chosen over gettimeofday's
+     struct timeval: timeval's tv_usec is a 4-byte int, needing an accessor
+     width Alien doesn't expose; timespec maps directly onto the existing
+     signedLongAt: accessor with no width mismatch at all."
+    Time class >> ffiMmapAddr: a1 length: a2 prot: a3 flags: a4 fd: a5 offset: a6 [
+        <primitive: FFI function: #mmap ret: #g args: #(g g g g g g)>
+    ]
+    Time class >> ffiClockGettime: clockId timespec: addr [
+        <primitive: FFI function: #clock_gettime ret: #g args: #(g g)>
+    ]
+    Time class >> clockBufferAddress [
+        ClockBuffer isNil ifTrue: [
+            "PROT_READ|PROT_WRITE=3, MAP_PRIVATE|MAP_ANON=4098 (0x1002) —
+             real macOS/arm64 flag values, same as world/tests/
+             30_ffi_alien_tests.mst's own proven mmap capstone call."
+            ClockBuffer := self ffiMmapAddr: 0 length: 16 prot: 3 flags: 4098 fd: -1 offset: 0.
+        ].
+        ^ClockBuffer
+    ]
+    "Milliseconds since the Unix epoch (CLOCK_REALTIME=0) — real wall-clock
+     time, not elapsed-since-VM-start. Verified live: two calls a few
+     milliseconds apart return distinct, correctly-ordered values."
+    Time class >> millisecondClockValue [
+        | addr ts sec nsec |
+        addr := self clockBufferAddress.
+        self ffiClockGettime: 0 timespec: addr.
+        ts := Alien forAddress: addr size: 16.
+        sec := ts signedLongAt: 1.
+        nsec := ts signedLongAt: 9.
+        ^(sec * 1000) + (nsec // 1000000)
     ]
     initSeconds: s [
         seconds := s.
