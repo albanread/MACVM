@@ -78,21 +78,40 @@ possible angles worth evaluating on the day:
 `Ir::SmiCmpBr`, `Ir::UncommonTrap`, `classify_smi_send`), `src/runtime/recompile.rs`,
 `docs/PERF.md`'s S15 A6/A7 section, `world/bench/richards.mst:330`.
 
-**Confirmed a general problem, and `sieve` is the CANONICAL repro (2026-07-08).**
-Gap 1 is not Richards-specific — `world/bench/sieve.mst` hits the identical
-storm and is a far cleaner development target (one small method, one hot
-bytecode, no scheduler machinery or 7-arg constructors around it). Evidence
-(release, `MACVM_JIT=threshold=1`): sieve is dead flat vs the interpreter
-(~87 ms both), yet it DOES compile (`MACVM_TRACE=stats`: `compilations=60`,
-`osr_entries=30`, `contexts_allocated=0`) — it just storms on one branch
-(`MACVM_TRACE=deopt`: `nm=8 bci=155` repeatedly, `deopt_count=65 [trap 65]`,
-`recompiles=18`, `recompile_declined_ineffective=0`). The
-`recompiles=18` / `declined=0` pair is the precise fingerprint of "two arms
-equally likely but the dominant one keeps *shifting*": every recompile finds
-a changed profile, so `recompile.rs` keeps chasing a moving target instead
-of converging (exactly the "it fires but still re-guesses" outcome point 2
-above predicted). Full numbers in `docs/PERF.md` ("Dual-arm branch storm"
-entry). Develop and gate the fix against sieve first, then re-check Richards.
+**CORRECTION (2026-07-08, via the debugger — supersedes both this section's
+`processWork:` guess AND a since-deleted claim that `sieve` was the canonical
+repro).** `MACVM_TRACE=deopt` + `MACVM_DBG_REEXEC` + `MACVM_DBG_IR` on a warm
+run (`threshold=2000`) show the dominant Richards storm is NOT here and NOT a
+balanced boolean branch:
+
+- **Site:** `addInput:checkPriority:` **bci=21** — `nm=38` (plus recompiles
+  `nm=41`/`nm=42`) account for **160,555 of 160,674 deopts** (99.9%). The IR
+  node is `GuardKlass { obj: VReg(2), expect: PoolLit(5), fail: BlockId(10) }`
+  at bci8 whose fail lands on `UncommonTrap { bci: 21 }` — i.e. a
+  **receiver-klass guard on a mono-inlined send** (S14 step 4b/5), not the
+  `SmiCmpVal`/`SmiCmpBr` branch this section assumed. `processWork:` does
+  contain a `SmiCmpBr` but it is not the dominant deopt cost.
+- **Cause:** genuine polymorphism, not a balanced/shifting boolean. The
+  method runs on four Task subclasses (Idle/Worker/Handler/Device); the
+  compiler inlined a `priority`/`packetPending:` accessor betting one klass,
+  so the guard fails on the others. It is **threshold-independent** (826k
+  deopts at t=1 from cold-compile ON TOP; 160k at t=2000 steady-state) —
+  warming can't fix it because the site really is polymorphic.
+- **`sieve` is NOT the repro.** Its flatness is a `threshold=1` compile-cold
+  artifact (`Empty`-IC sends lowered to `Untaken → Trap` before the loop
+  ran); at `threshold=2000` it has only 30 deopts and is still flat for an
+  unrelated short-workload/compile-timing reason. Do not gate on sieve.
+- **Numbers corrected:** Richards is **2.4×** at `threshold=2000` (off 207 ms
+  / jit 85 ms), not the "1.1×" above — that figure was `threshold=1`, the
+  cold-compile worst case. The whole S15 T5 table was measured at
+  `threshold=1` and understates the JIT.
+- **Fix (revised):** detect a klass-guard/inline site that deopts past a
+  threshold and **de-speculate it — recompile the send polymorphically**
+  (real send or S14 step 6 `DominantWithSlowPath`), not "compile both branch
+  arms." Open puzzle: `addInput:checkPriority:` already recompiles 18× and
+  still storms, so `recompile.rs` is not switching this site to poly — that
+  is the actual thing to fix. Gate on Richards `addInput:checkPriority:`
+  bci=21 deopts → ~0. Full evidence in `docs/PERF.md`.
 
 ## Gap 2 — methods with argc > 5 are never compile targets, period
 

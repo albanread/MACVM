@@ -200,18 +200,44 @@ via `millisecondClock`, arith/dispatch process-timed incl. ~10 ms boot):
 | dispatch | 1870 ms | ~20 ms | ~90x | send/IC dispatch |
 | **sieve (8190 x10)** | **87 ms** | **88 ms** | **~1.0x** | **dual-arm branch storm** |
 
-**sieve is the canonical "dual-arm" repro** (`weekend_work.md` Gap 1's
-balanced two-way branch, confirmed as a general problem, not Richards-
-specific). It DOES compile — `MACVM_TRACE=stats`: `compilations=60`,
-`osr_entries=30`, `contexts_allocated=0` (block/Context elision works) —
-but `MACVM_TRACE=deopt` shows a recurring speculative-trap storm at ONE
-site (`nm=8 bci=155`, `deopt_count=65 [trap 65]`) with `recompiles=18` and
-`recompile_declined_ineffective=0`. That last pair is the signature: every
-recompile finds a *changed* profile → the dominant arm is genuinely
-oscillating (the two arms are ~equally likely and keep shifting), so
-`recompile.rs` chases a moving target, burns `MAX_VERSIONS`, and falls back
-to permanent deopts. Speculation fundamentally can't win a balanced branch;
-the fix is two-arm (poly-arm) compilation — compile BOTH arms as native
-code joined by a real conditional, no trap on either side. Cleaner repro
-than Richards (one method, one bci, no scheduler/7-arg-constructor noise),
-so it is the development + golden target for the fix.
+**CORRECTION (2026-07-08, via `MACVM_TRACE=deopt`/`MACVM_DBG_REEXEC`/
+`MACVM_DBG_IR` — an earlier draft of this entry crowned sieve the "dual-arm"
+repro; the debugger overturned that. Recorded honestly.):**
+
+- **Sieve is NOT a balanced-branch storm.** Its `threshold=1` flatness (65
+  deopts) is a *compile-cold* artifact: at `threshold=1` the method compiles
+  before its loop body has run, so its send ICs are all `Empty`, and the
+  compiler lowers `Empty`-IC sends to `Untaken → UncommonTrap` (dead-code
+  speculation) — then the loop runs and they all trap. Across the threshold
+  sweep sieve is flat at EVERY setting (94-96 ms) and at `threshold=2000`
+  has only **30 deopts** — no storm. Its high-threshold flatness is
+  compile-timing on a short (~95 ms) workload, not speculation. Not the
+  repro we thought.
+
+- **The real speculation storm is Richards**, and it is NOT in
+  `processWork:` (weekend_work.md Gap 1's guess, also eyeballed) and NOT a
+  balanced boolean branch. The debugger pins it to **`addInput:checkPriority:`
+  bci=21** — a `GuardKlass { obj, expect } fail → UncommonTrap` (block1
+  @bci8 → block10 @bci21 in the warm IR). It is a **receiver-klass guard on
+  a mono-inlined send** (S14 step 4b/5): the compiler inlined a
+  `priority`/`packetPending:` accessor betting one Task subclass, but
+  Richards runs four (Idle/Worker/Handler/Device) through this method, so the
+  guard fails ~half the calls. **160,555 of 160,674 deopts** are this one
+  site, and it is **threshold-independent** (826k at t=1, 160k at t=2000 —
+  the steady-state storm survives full warmup because the site is genuinely
+  polymorphic, not cold).
+
+- **Richards is ~2.4×, not 1.1×.** The "1.1×" on record was measured at
+  `threshold=1` (the cold-compile worst case, 826k deopts). Warmed up
+  realistically (`threshold=2000`): **off 207 ms vs 85 ms = 2.4×**, deopts
+  160k. The benchmark harness's `threshold=1` convention systematically
+  understates the JIT. (Threshold sweep: sieve 94/95/96/95 ms at
+  off/1/100/2000; richards 207/191/91/85 ms.)
+
+- **The fix** is still the "detect an over-deopting speculation site, then
+  de-speculate" shape, but "de-speculate" here = **stop mono-inlining that
+  send; dispatch it polymorphically** (a real send, or S14 step 6's existing
+  `DominantWithSlowPath`), NOT "compile both branch arms." Gate on Richards
+  `addInput:checkPriority:` (deopts at bci=21 → ~0). Open puzzle: it already
+  recompiles 18× (nm 38/41/42) and still storms — the recompiler isn't
+  switching this site to poly; that is the thing to fix.
