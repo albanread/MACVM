@@ -59,7 +59,16 @@ pub struct VmHandle {
 
 /// A guest-visible evaluation failure — never a Rust panic (module doc's
 /// safety model). `Compile` covers lex/parse/codegen errors (`eval`'s
-/// source didn't compile). `NativeFault` is a genuinely recovered SIGSEGV/
+/// source didn't compile). `RuntimeError` is an unhandled DNU or explicit
+/// `self error:` — genuinely terminal for the CURRENT computation in
+/// Smalltalk's own terms (no proceed semantics in v1), but NOT a sign the
+/// VM itself is broken, so it's recovered at this same boundary rather than
+/// tearing down the whole worker thread the way it did before this existed
+/// (`runtime::error::dnu_fallback`/`primitives::prim_error`, via
+/// `codecache::deopt_trap::raise_guest_fatal`) — this is what makes an
+/// everyday Workspace typo an ordinary recoverable error instead of a full
+/// VM respawn, matching real Smalltalk's own recoverable
+/// `doesNotUnderstand:`. `NativeFault` is a genuinely recovered SIGSEGV/
 /// SIGBUS in ordinary (non-JIT) native code — reachable today only through
 /// `Alien`'s raw pointer accessors (S20) — turned into an ordinary `Err`
 /// rather than terminating the thread, because `eval`'s own call frame is
@@ -67,6 +76,7 @@ pub struct VmHandle {
 #[derive(Debug)]
 pub enum GuestError {
     Compile(CompileError),
+    RuntimeError(String),
     NativeFault { sig: i32, pc: u64, far: u64 },
 }
 
@@ -74,6 +84,7 @@ impl std::fmt::Display for GuestError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             GuestError::Compile(e) => write!(f, "{e}"),
+            GuestError::RuntimeError(msg) => write!(f, "{msg}"),
             GuestError::NativeFault { sig, pc, far } => write!(
                 f,
                 "native fault (signal {sig}) at pc=0x{pc:x} far=0x{far:x} — recovered, this eval aborted"
@@ -184,14 +195,21 @@ impl VmHandle {
     /// `source`.
     ///
     /// Never panics or exits the process/thread on a GUEST failure (a
-    /// compile error, or a recovered native fault) — both become `Err`, per
-    /// the module doc's safety model. A VM-fatal condition (guest `error:`,
-    /// DNU, stack overflow, heap exhaustion...) still terminates the calling
-    /// thread via `fatal_exit` — there is no Rust-level `Result` for those
-    /// today (`shiny-snacking-pine.md`'s Context section: panic/
-    /// `catch_unwind` was rejected as the mechanism because it cannot safely
-    /// unwind through a JIT-compiled frame), so `eval` simply never returns
-    /// in that case; the failure message was already written to the
+    /// compile error, an unhandled DNU/`error:`, or a recovered native
+    /// fault) — all three become `Err`, per the module doc's safety model.
+    /// A truly VM-fatal condition (stack overflow, heap exhaustion — the
+    /// VM's OWN invariants/resources, not the guest program's correctness)
+    /// still terminates the calling thread via `fatal_exit`: there is no
+    /// Rust-level `Result` for those, and shouldn't be — a full worker
+    /// respawn is the right response when the VM itself may be compromised,
+    /// unlike an ordinary DNU (`shiny-snacking-pine.md`'s Context section:
+    /// panic/`catch_unwind` was rejected as the *general* unwind mechanism
+    /// here because it cannot safely cross a JIT-compiled frame — DNU/
+    /// `error:` recovery below reuses `sigsetjmp`/`siglongjmp` instead,
+    /// precisely because that mechanism doesn't do Rust-style unwinding at
+    /// all and is already trusted through JIT frames for the native-fault
+    /// case). `eval` simply never returns for a genuinely VM-fatal
+    /// condition; the failure message was already written to the
     /// transcript sink first.
     #[allow(unsafe_code)]
     pub fn eval(&mut self, source: &str) -> Result<String, GuestError> {
@@ -199,13 +217,21 @@ impl VmHandle {
         // SAFETY: `sigsetjmp` is called directly, inline, at this exact call
         // site — its frame (this `eval` invocation) stays live for the whole
         // recovery window: control does not return to the caller until
-        // either the guest code below completes (normally or with a compile
-        // error) or a foreign fault `siglongjmp`s straight back to here.
-        // Calling `sigsetjmp` through an intervening wrapper function that
-        // itself returns before the fault happens is unsound (the S21
-        // setjmp-into-a-returned-frame bug found and fixed in
-        // `codecache::deopt_trap`) — see `deopt_trap::sigsetjmp`'s own doc.
+        // either the guest code below completes (normally, with a compile
+        // error, or with an unhandled DNU/`error:` recovered via
+        // `deopt_trap::raise_guest_fatal`) or a foreign fault `siglongjmp`s
+        // straight back to here. Calling `sigsetjmp` through an intervening
+        // wrapper function that itself returns before the fault happens is
+        // unsound (the S21 setjmp-into-a-returned-frame bug found and fixed
+        // in `codecache::deopt_trap`) — see `deopt_trap::sigsetjmp`'s own
+        // doc.
         let rc = unsafe { deopt_trap::sigsetjmp(deopt_trap::jmp_buf_ptr(slot), 1) };
+        if rc == deopt_trap::GUEST_FATAL_JMP_VAL {
+            let message = deopt_trap::take_last_guest_fatal_message().expect(
+                "sigsetjmp returned GUEST_FATAL_JMP_VAL without a recorded guest-fatal message",
+            );
+            return Err(GuestError::RuntimeError(message));
+        }
         if rc != 0 {
             let (sig, pc, far) = deopt_trap::take_last_crash_info()
                 .expect("sigsetjmp returned nonzero without a recorded crash");
@@ -415,10 +441,20 @@ mod tests {
         let (tx, rx) = mpsc::channel::<&'static str>();
         let handle = std::thread::spawn(move || {
             let mut vm = boot_test_vm(JitMode::Off);
+            // DNU/`error:` no longer belong here — `raise_guest_fatal`
+            // recovers those at `eval`'s own boundary now (see
+            // `eval_dnu_recovers_as_runtime_error_and_vm_stays_usable`
+            // below); this test exists to prove the *actually* fatal path
+            // (the VM's own invariants/resources, not the guest program's
+            // correctness) still correctly kills the thread. Unbounded
+            // self-recursion exhausts `ProcessStack` ->
+            // `interpreter::stack`'s own "process stack overflow" fatal
+            // path -> `fatal_exit`, untouched by this fix.
+            vm.eval("Object subclass: MacvmInfiniteRecursionProbe [ go [ ^self go ] ].")
+                .expect("defining the recursive-probe class must succeed");
             tx.send("reached-pre-crash-checkpoint").unwrap();
-            // Object>>doesNotUnderstand: -> self error: '...' -> fatal_exit.
             // Never returns if FatalMode::ExitThread correctly pthread_exits.
-            let _ = vm.eval("3 thisSelectorDoesNotExistAnywhereInTheBaseWorld.");
+            let _ = vm.eval("MacvmInfiniteRecursionProbe new go.");
             // Only reachable if the thread survived the "fatal" condition —
             // itself exactly the bug this test exists to catch.
             tx.send("UNREACHABLE-thread-survived-a-fatal-condition")
@@ -445,5 +481,81 @@ mod tests {
         // The strongest proof of all: this test process is still alive and
         // able to run more assertions after the fact.
         assert_eq!(2 + 2, 4);
+    }
+
+    /// The actual fix: an unhandled DNU used to be indistinguishable from a
+    /// genuinely fatal condition (see the previous test's own history) —
+    /// every everyday Workspace typo paid a full worker respawn, exactly
+    /// the "any mistake kills the VM" experience real Smalltalk's own
+    /// recoverable `doesNotUnderstand:` exists to avoid. Proves both
+    /// halves: the failure surfaces as an ordinary `Err`, AND the same
+    /// `VmHandle` keeps serving requests afterward — the second half is
+    /// the one that actually matters; a DNU that merely fails to crash but
+    /// leaves the VM unusable wouldn't be a real fix.
+    #[test]
+    fn eval_dnu_recovers_as_runtime_error_and_vm_stays_usable() {
+        let mut vm = boot_test_vm(JitMode::Off);
+        let err = vm
+            .eval("3 thisSelectorDoesNotExistAnywhereInTheBaseWorld.")
+            .expect_err("an unhandled DNU must surface as Err, not run to completion");
+        match &err {
+            GuestError::RuntimeError(msg) => assert!(
+                msg.contains("thisSelectorDoesNotExistAnywhereInTheBaseWorld"),
+                "message: {msg}"
+            ),
+            other => panic!("expected GuestError::RuntimeError, got {other:?}"),
+        }
+        let result = vm
+            .eval("6 * 7.")
+            .expect("VM must still be usable after a recovered DNU");
+        assert_eq!(result, "42");
+    }
+
+    /// `error:`'s own doc comment: "has no proceed semantics in v1" — this
+    /// only asserts it's recoverable at `eval`'s OWN boundary (abort this
+    /// one doIt, VM stays usable for the next), not that the erroring
+    /// computation itself can be resumed mid-flight.
+    #[test]
+    fn eval_error_colon_recovers_as_runtime_error_and_vm_stays_usable() {
+        let mut vm = boot_test_vm(JitMode::Off);
+        let err = vm
+            .eval("3 error: 'boom'.")
+            .expect_err("an unhandled error: must surface as Err, not run to completion");
+        match &err {
+            GuestError::RuntimeError(msg) => assert!(msg.contains("boom"), "message: {msg}"),
+            other => panic!("expected GuestError::RuntimeError, got {other:?}"),
+        }
+        let result = vm
+            .eval("6 * 7.")
+            .expect("VM must still be usable after a recovered error:");
+        assert_eq!(result, "42");
+    }
+
+    /// The riskiest part of the fix, tested directly rather than only by
+    /// analogy to the already-proven native-fault case: `raise_guest_fatal`
+    /// reuses `siglongjmp` specifically because it's already trusted to
+    /// cross JIT-compiled frames soundly (never `catch_unwind` through
+    /// them — this project's standing rule). This exercises that for real:
+    /// `go` compiles under threshold=1, and its OWN send is what DNUs, so
+    /// `go`'s COMPILED frame is still live on the stack when
+    /// `dnu_fallback` fires (S11 step 6's "DNU... from compiled code"
+    /// path) — not just an interpreter-only DNU.
+    #[test]
+    fn eval_dnu_from_a_compiled_caller_recovers_cleanly() {
+        let mut vm = boot_test_vm(JitMode::Threshold(1));
+        vm.eval(
+            "Object subclass: MacvmDnuFromCompiledProbe [ \
+                go [ ^3 thisSelectorDoesNotExistAnywhereInTheBaseWorld ] \
+            ].",
+        )
+        .expect("defining the probe class must succeed");
+        let err = vm
+            .eval("MacvmDnuFromCompiledProbe new go.")
+            .expect_err("a DNU reached through a compiled caller must still surface as Err");
+        assert!(matches!(err, GuestError::RuntimeError(_)), "{err:?}");
+        let result = vm
+            .eval("6 * 7.")
+            .expect("VM must still be usable after recovering through a compiled frame");
+        assert_eq!(result, "42");
     }
 }

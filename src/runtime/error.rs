@@ -106,18 +106,23 @@ pub fn trace_dnu(vm: &VmState, site: &str, receiver_klass: KlassOop, selector: S
 pub fn dnu_fallback(vm: &mut VmState, selector: SymbolOop, receiver_klass: KlassOop) -> ! {
     let sel_str = selector.as_string();
     let klass_name = name_of(receiver_klass.name());
-    let _ = writeln!(vm.out, "DNU #{sel_str} (receiver class {klass_name})");
+    let message = format!("DNU #{sel_str} (receiver class {klass_name})");
+    let _ = writeln!(vm.out, "{message}");
     print_stack_trace(vm);
     let _ = vm.out.flush();
     // DBG0: the fatal-DNU mini-dossier (docs/DEBUGGER.md §4.1) — the
-    // deviceInAdd:-hunt tool. `MACVM_PROBE=off` opts out.
-    if crate::runtime::probe::guest_report_enabled() {
-        crate::runtime::probe::fatal_guest_report(
-            vm,
-            &format!("DNU #{sel_str} (receiver class {klass_name})"),
-        );
+    // deviceInAdd:-hunt tool. `MACVM_PROBE=off` opts out. Skipped when a
+    // recovery is actually about to happen (embedded `VmHandle::eval`,
+    // `deopt_trap::raise_guest_fatal` below) — a full register/frame/heap
+    // dossier is right for a condition that's about to end the process, and
+    // pure noise for an everyday Workspace typo that's about to be reported
+    // and recovered from like any other doIt error.
+    if !crate::codecache::deopt_trap::has_registered_jmp_slot()
+        && crate::runtime::probe::guest_report_enabled()
+    {
+        crate::runtime::probe::fatal_guest_report(vm, &message);
     }
-    crate::runtime::vm_state::fatal_exit(1);
+    crate::codecache::deopt_trap::raise_guest_fatal(message);
 }
 
 #[cfg(test)]

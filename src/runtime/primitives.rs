@@ -1228,10 +1228,15 @@ fn prim_error(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     // mini-dossier — walkback + tier-link/anchor state + recent-history
     // ring + heap verify. No signal machinery: the interpreter is coherent
     // here. `MACVM_PROBE=off` silences it for exact-stderr golden tests.
-    if crate::runtime::probe::guest_report_enabled() {
+    // Skipped when a recovery is actually about to happen (embedded
+    // `VmHandle::eval`, `deopt_trap::raise_guest_fatal` below) — see
+    // `dnu_fallback`'s identical reasoning.
+    if !crate::codecache::deopt_trap::has_registered_jmp_slot()
+        && crate::runtime::probe::guest_report_enabled()
+    {
         crate::runtime::probe::fatal_guest_report(vm, &format!("error: {text}"));
     }
-    crate::runtime::vm_state::fatal_exit(1)
+    crate::codecache::deopt_trap::raise_guest_fatal(format!("Error: {text}"))
 }
 
 fn prim_quit_colon(vm: &mut VmState, args: &[Oop]) -> PrimResult {

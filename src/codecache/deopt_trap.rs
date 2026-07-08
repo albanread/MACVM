@@ -291,6 +291,16 @@ pub(crate) unsafe fn jmp_buf_ptr(i: usize) -> *mut core::ffi::c_int {
 /// `fatal_exit` that follows a caught crash), so a much-later, unrelated
 /// thread that happens to reuse the same recycled `pthread_t` value never
 /// finds a stale entry.
+///
+/// `#[allow(dead_code)]`: this is a deliberately-provided S21 cleanup API
+/// whose production caller — the embedded worker thread's own exit path (the
+/// `gui` language thread, or a future `VmHandle` shutdown/`Drop`) — is not
+/// yet wired; only the unit tests below exercise it today. Slot reuse is
+/// keyed by `pthread_self()`, so an unreleased slot is merely reclaimed the
+/// next time the same thread `claim_jmp_slot`s, never leaked across a live
+/// thread — hence non-urgent. Kept (rather than deleted) so wiring the
+/// shutdown path is a one-line call, not a re-derivation.
+#[allow(dead_code)]
 pub(crate) fn deregister_setjmp() {
     let me = unsafe { libc::pthread_self() } as u64;
     let _g = JMP_REGISTRY_LOCK.lock().unwrap();
@@ -326,6 +336,83 @@ pub(crate) fn take_last_crash_info() -> Option<(i32, u64, u64)> {
     let pc = JMP_LAST_PC[i].swap(0, Ordering::Relaxed);
     let far = JMP_LAST_FAR[i].swap(0, Ordering::Relaxed);
     Some((sig as i32, pc, far))
+}
+
+/// Per-slot storage for [`raise_guest_fatal`]'s message — a `String`, unlike
+/// `JMP_LAST_*` above, because every caller here runs in ORDINARY (non-signal-
+/// handler) code: `runtime::error::dnu_fallback` and `primitives::prim_error`
+/// execute during normal interpreted dispatch, never from inside
+/// `sig_fault_handler`. A `Mutex` is fine for exactly that reason — this file's
+/// own "must not touch heap allocation... " constraint (module doc) binds the
+/// async-signal-safe handler path only, not this one.
+static GUEST_FATAL_MSG: Mutex<[Option<String>; JMP_REGISTRY_CAP]> =
+    Mutex::new([const { None }; JMP_REGISTRY_CAP]);
+
+/// The `siglongjmp` resume value [`raise_guest_fatal`] uses — distinct from
+/// [`sig_fault_handler`]'s own `1`, so `VmHandle::eval`'s `sigsetjmp` call
+/// site can tell "a genuine native fault was recovered" (1) apart from "the
+/// guest hit an unhandled DNU/`error:` and was recovered" (2) without
+/// consulting anything but the return value itself.
+pub(crate) const GUEST_FATAL_JMP_VAL: core::ffi::c_int = 2;
+
+/// Ordinary (non-signal) code only — is a `sigsetjmp` recovery point
+/// registered for the CURRENT thread? `runtime::error::dnu_fallback` and
+/// `primitives::prim_error` call this BEFORE building a PROBE dossier: a
+/// dossier (register/frame/heap dump) is the right response to a condition
+/// that's about to genuinely end the process, and pure noise for a routine,
+/// interactively-recovered DNU or `error:` in an embedded `VmHandle` —
+/// skip it precisely when a recovery is actually about to happen.
+pub(crate) fn has_registered_jmp_slot() -> bool {
+    lookup_jmp_slot_for_current_thread().is_some()
+}
+
+/// The recoverable half of what used to be an unconditional
+/// `runtime::vm_state::fatal_exit` call at the end of `dnu_fallback`/
+/// `prim_error`: an unhandled DNU or explicit `self error:` is a genuinely
+/// terminal condition for the CURRENT computation in Smalltalk's own terms
+/// (`error:` "has no proceed semantics in v1", `prim_error`'s own doc) —
+/// but it is NOT a sign anything about the VM itself is broken, unlike the
+/// conditions `FatalMode`/`fatal_exit` exist for (heap exhaustion, stack
+/// overflow, a genuine native fault). Tearing down the whole worker thread
+/// (`FatalMode::ExitThread`) for an everyday Workspace typo — the single
+/// most common "mistake" in interactive use — is the wrong tool: it works,
+/// but every DNU pays a full VM respawn instead of an ordinary recoverable
+/// error, exactly the "any mistake kills the Workspace" experience real
+/// Smalltalk's own recoverable `doesNotUnderstand:` was designed to avoid.
+///
+/// If this thread has a registered recovery slot (i.e. it is inside
+/// `VmHandle::eval`'s own `sigsetjmp`), publish `message` and jump straight
+/// back there with [`GUEST_FATAL_JMP_VAL`] — same `siglongjmp` mechanism
+/// `sig_fault_handler` already uses for a genuine foreign fault, chosen for
+/// the identical reason: it is a raw register/SP restore, not a Rust
+/// unwind, so it is sound to cross however many interpreted AND compiled
+/// frames sit between here and `eval`'s call site (the standing rule this
+/// project enforces elsewhere: never `catch_unwind` through JIT frames).
+/// No slot registered (plain CLI/batch use, `VmHandle` never booted) falls
+/// back to today's `fatal_exit` unchanged — this only changes behavior for
+/// the embedded case that never had a sound recovery path before.
+#[allow(unsafe_code)]
+pub(crate) fn raise_guest_fatal(message: String) -> ! {
+    if let Some(i) = lookup_jmp_slot_for_current_thread() {
+        GUEST_FATAL_MSG.lock().unwrap()[i] = Some(message);
+        unsafe {
+            siglongjmp(
+                JMP_BUFS[i][0].as_ptr() as *mut core::ffi::c_int,
+                GUEST_FATAL_JMP_VAL,
+            );
+        }
+    }
+    crate::runtime::vm_state::fatal_exit(1);
+}
+
+/// Reads back (and clears) the message [`raise_guest_fatal`] published for
+/// the CURRENT thread just before its `siglongjmp` — ordinary code only,
+/// called from `VmHandle::eval` right after `sigsetjmp` returns
+/// [`GUEST_FATAL_JMP_VAL`]. Same same-thread program-order reasoning as
+/// [`take_last_crash_info`].
+pub(crate) fn take_last_guest_fatal_message() -> Option<String> {
+    let i = lookup_jmp_slot_for_current_thread()?;
+    GUEST_FATAL_MSG.lock().unwrap()[i].take()
 }
 
 /// §4.5's backstop: `true` from the moment a fault is claimed for PROBE
