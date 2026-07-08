@@ -67,7 +67,10 @@ impl MockClass {
     }
 
     fn methods_in(&self, side: Side, category: &str) -> Vec<&MockMethod> {
-        self.methods.iter().filter(|m| m.side == side && m.category == category).collect()
+        self.methods
+            .iter()
+            .filter(|m| m.side == side && m.category == category)
+            .collect()
     }
 
     fn methods_of(&self, side: Side) -> Vec<&MockMethod> {
@@ -80,7 +83,12 @@ pub struct MockWorld {
 }
 
 fn method(selector: &str, category: &str, side: Side, source: &str) -> MockMethod {
-    MockMethod { selector: selector.into(), category: category.into(), side, source: source.into() }
+    MockMethod {
+        selector: selector.into(),
+        category: category.into(),
+        side,
+        source: source.into(),
+    }
 }
 
 impl MockWorld {
@@ -91,10 +99,20 @@ impl MockWorld {
     /// `browser_render.rs` can render from either backing store without
     /// caring which one it is.
     pub fn empty() -> Self {
-        Self { classes: Vec::new() }
+        Self {
+            classes: Vec::new(),
+        }
     }
 
-    pub fn add_class(&mut self, name: &str, superclass: Option<&str>, package: &str, comment: &str, instance_vars: &str, class_vars: &str) {
+    pub fn add_class(
+        &mut self,
+        name: &str,
+        superclass: Option<&str>,
+        package: &str,
+        comment: &str,
+        instance_vars: &str,
+        class_vars: &str,
+    ) {
         self.classes.push(MockClass {
             name: name.to_string(),
             superclass: superclass.map(str::to_string),
@@ -109,8 +127,17 @@ impl MockWorld {
     /// Returns `false` (no auto-create) if `class_name` isn't already
     /// present — same "reopen, don't silently create" contract
     /// `image_store::Image::add_method` uses.
-    pub fn add_method(&mut self, class_name: &str, side: Side, selector: &str, category: &str, source: &str) -> bool {
-        let Some(class) = self.classes.iter_mut().find(|c| c.name == class_name) else { return false };
+    pub fn add_method(
+        &mut self,
+        class_name: &str,
+        side: Side,
+        selector: &str,
+        category: &str,
+        source: &str,
+    ) -> bool {
+        let Some(class) = self.classes.iter_mut().find(|c| c.name == class_name) else {
+            return false;
+        };
         class.methods.push(method(selector, category, side, source));
         true
     }
@@ -132,9 +159,13 @@ impl MockWorld {
     /// Returns `false` if `class_name`/`side`/`selector` doesn't name an
     /// existing method.
     pub fn remove_method(&mut self, class_name: &str, side: Side, selector: &str) -> bool {
-        let Some(class) = self.class_named_mut(class_name) else { return false };
+        let Some(class) = self.class_named_mut(class_name) else {
+            return false;
+        };
         let before = class.methods.len();
-        class.methods.retain(|m| !(m.side == side && m.selector == selector));
+        class
+            .methods
+            .retain(|m| !(m.side == side && m.selector == selector));
         class.methods.len() != before
     }
 
@@ -143,7 +174,14 @@ impl MockWorld {
     /// three-way `Created`/`Reopened`/`AlreadyLive` distinction this
     /// mirrors (modulo `Reopened` never firing here, per
     /// [`ClassCreateOutcome`]'s doc comment).
-    pub fn create_or_reopen_class(&mut self, name: &str, superclass: Option<&str>, package: &str, comment: &str, instance_vars: &str) -> ClassCreateOutcome {
+    pub fn create_or_reopen_class(
+        &mut self,
+        name: &str,
+        superclass: Option<&str>,
+        package: &str,
+        comment: &str,
+        instance_vars: &str,
+    ) -> ClassCreateOutcome {
         if self.class_named(name).is_some() {
             return ClassCreateOutcome::AlreadyLive;
         }
@@ -156,9 +194,22 @@ impl MockWorld {
     /// see `image_store::Image::create_or_reopen_method`'s doc comment for
     /// why none of those three cases should be treated as an error.
     /// Returns `false` only if `class_name` doesn't exist.
-    pub fn create_or_reopen_method(&mut self, class_name: &str, side: Side, selector: &str, category: &str, source: &str) -> bool {
-        let Some(class) = self.class_named_mut(class_name) else { return false };
-        match class.methods.iter_mut().find(|m| m.side == side && m.selector == selector) {
+    pub fn create_or_reopen_method(
+        &mut self,
+        class_name: &str,
+        side: Side,
+        selector: &str,
+        category: &str,
+        source: &str,
+    ) -> bool {
+        let Some(class) = self.class_named_mut(class_name) else {
+            return false;
+        };
+        match class
+            .methods
+            .iter_mut()
+            .find(|m| m.side == side && m.selector == selector)
+        {
             Some(m) => {
                 m.category = category.to_string();
                 m.source = source.to_string();
@@ -171,8 +222,15 @@ impl MockWorld {
     /// "Accept" an edited class definition (superclass + instance
     /// variables) — see `image_store::Image::set_class_definition`'s doc
     /// comment for why `class_vars` isn't included.
-    pub fn set_class_definition(&mut self, class_name: &str, new_superclass: Option<String>, new_instance_vars: String) -> bool {
-        let Some(class) = self.class_named_mut(class_name) else { return false };
+    pub fn set_class_definition(
+        &mut self,
+        class_name: &str,
+        new_superclass: Option<String>,
+        new_instance_vars: String,
+    ) -> bool {
+        let Some(class) = self.class_named_mut(class_name) else {
+            return false;
+        };
         class.superclass = new_superclass;
         class.instance_vars = new_instance_vars;
         true
@@ -319,7 +377,10 @@ impl MockWorld {
     }
 
     pub fn classes_in_package(&self, package: &str) -> Vec<&MockClass> {
-        self.classes.iter().filter(|c| c.package == package).collect()
+        self.classes
+            .iter()
+            .filter(|c| c.package == package)
+            .collect()
     }
 
     pub fn class_named(&self, name: &str) -> Option<&MockClass> {
@@ -335,7 +396,10 @@ impl MockWorld {
     }
 
     pub fn subclasses_of(&self, name: &str) -> Vec<&MockClass> {
-        self.classes.iter().filter(|c| c.superclass.as_deref() == Some(name)).collect()
+        self.classes
+            .iter()
+            .filter(|c| c.superclass.as_deref() == Some(name))
+            .collect()
     }
 
     /// Root classes of a package's hierarchy view — a class in the package
@@ -348,13 +412,18 @@ impl MockWorld {
             .into_iter()
             .filter(|c| match &c.superclass {
                 None => true,
-                Some(super_name) => self.class_named(super_name).map(|s| s.package != package).unwrap_or(true),
+                Some(super_name) => self
+                    .class_named(super_name)
+                    .map(|s| s.package != package)
+                    .unwrap_or(true),
             })
             .collect()
     }
 
     pub fn categories(&self, class_name: &str, side: Side) -> Vec<String> {
-        self.class_named(class_name).map(|c| c.categories(side)).unwrap_or_default()
+        self.class_named(class_name)
+            .map(|c| c.categories(side))
+            .unwrap_or_default()
     }
 
     pub fn methods_in(&self, class_name: &str, side: Side, category: &str) -> Vec<MockMethod> {
@@ -370,11 +439,17 @@ impl MockWorld {
     /// require picking a category first when everything's still sitting in
     /// one anyway.
     pub fn methods_of(&self, class_name: &str, side: Side) -> Vec<MockMethod> {
-        self.class_named(class_name).map(|c| c.methods_of(side).into_iter().cloned().collect()).unwrap_or_default()
+        self.class_named(class_name)
+            .map(|c| c.methods_of(side).into_iter().cloned().collect())
+            .unwrap_or_default()
     }
 
     pub fn method_source(&self, class_name: &str, side: Side, selector: &str) -> Option<String> {
-        self.class_named(class_name)?.methods.iter().find(|m| m.side == side && m.selector == selector).map(|m| m.source.clone())
+        self.class_named(class_name)?
+            .methods
+            .iter()
+            .find(|m| m.side == side && m.selector == selector)
+            .map(|m| m.source.clone())
     }
 
     pub fn class_named_mut(&mut self, name: &str) -> Option<&mut MockClass> {
@@ -386,16 +461,32 @@ impl MockWorld {
     /// parsing/compilation here, this mock just replaces the text). Returns
     /// `false` if `class_name`/`selector` don't name an existing method,
     /// so the caller can distinguish "saved" from "nothing to save".
-    pub fn set_method_source(&mut self, class_name: &str, side: Side, selector: &str, new_source: String) -> bool {
-        let Some(class) = self.class_named_mut(class_name) else { return false };
-        let Some(m) = class.methods.iter_mut().find(|m| m.side == side && m.selector == selector) else { return false };
+    pub fn set_method_source(
+        &mut self,
+        class_name: &str,
+        side: Side,
+        selector: &str,
+        new_source: String,
+    ) -> bool {
+        let Some(class) = self.class_named_mut(class_name) else {
+            return false;
+        };
+        let Some(m) = class
+            .methods
+            .iter_mut()
+            .find(|m| m.side == side && m.selector == selector)
+        else {
+            return false;
+        };
         m.source = new_source;
         true
     }
 
     /// "Accept" an edited class comment.
     pub fn set_class_comment(&mut self, class_name: &str, new_comment: String) -> bool {
-        let Some(class) = self.class_named_mut(class_name) else { return false };
+        let Some(class) = self.class_named_mut(class_name) else {
+            return false;
+        };
         class.comment = new_comment;
         true
     }
@@ -423,7 +514,11 @@ mod tests {
     #[test]
     fn subclasses_of_object_include_collection_and_visual() {
         let world = MockWorld::seed();
-        let names: Vec<_> = world.subclasses_of("Object").iter().map(|c| c.name.clone()).collect();
+        let names: Vec<_> = world
+            .subclasses_of("Object")
+            .iter()
+            .map(|c| c.name.clone())
+            .collect();
         assert!(names.contains(&"Collection".to_string()));
         assert!(names.contains(&"Visual".to_string()));
         assert!(names.contains(&"Application".to_string()));
@@ -432,7 +527,11 @@ mod tests {
     #[test]
     fn package_roots_does_not_reach_into_other_packages() {
         let world = MockWorld::seed();
-        let roots: Vec<_> = world.package_roots("Collections").iter().map(|c| c.name.clone()).collect();
+        let roots: Vec<_> = world
+            .package_roots("Collections")
+            .iter()
+            .map(|c| c.name.clone())
+            .collect();
         // Collection has no in-package superclass (Object lives in Kernel),
         // so it's a root here even though it isn't a hierarchy root overall.
         assert!(roots.contains(&"Collection".to_string()));
@@ -463,7 +562,9 @@ mod tests {
     #[test]
     fn method_source_is_found_by_class_and_selector() {
         let world = MockWorld::seed();
-        let src = world.method_source("OrderedCollection", Side::Instance, "add:").unwrap();
+        let src = world
+            .method_source("OrderedCollection", Side::Instance, "add:")
+            .unwrap();
         assert!(src.starts_with("add: anObject"));
     }
 
@@ -481,7 +582,12 @@ mod tests {
         let mut world = MockWorld::seed();
         let ok = world.set_method_source("Object", Side::Instance, "hash", "hash\n\t^42".into());
         assert!(ok);
-        assert_eq!(world.method_source("Object", Side::Instance, "hash").unwrap(), "hash\n\t^42");
+        assert_eq!(
+            world
+                .method_source("Object", Side::Instance, "hash")
+                .unwrap(),
+            "hash\n\t^42"
+        );
     }
 
     #[test]
@@ -496,7 +602,10 @@ mod tests {
         let mut world = MockWorld::seed();
         let ok = world.set_class_comment("Object", "A new comment.".into());
         assert!(ok);
-        assert_eq!(world.class_named("Object").unwrap().comment, "A new comment.");
+        assert_eq!(
+            world.class_named("Object").unwrap().comment,
+            "A new comment."
+        );
     }
 
     #[test]
@@ -504,7 +613,10 @@ mod tests {
         let mut world = MockWorld::seed();
         assert!(world.remove_class("Object"));
         assert!(world.class_named("Object").is_none());
-        assert!(!world.packages().contains(&"Kernel".to_string()), "Kernel had only Object");
+        assert!(
+            !world.packages().contains(&"Kernel".to_string()),
+            "Kernel had only Object"
+        );
         // Collection's superclass string field still literally says
         // "Object" — package_roots treats that as absent, same as image_store.
         let roots = world.package_roots("Collections");
@@ -518,7 +630,9 @@ mod tests {
         let mut world = MockWorld::seed();
         assert!(world.remove_method("Object", Side::Instance, "hash"));
         assert_eq!(world.method_source("Object", Side::Instance, "hash"), None);
-        assert!(world.method_source("Object", Side::Instance, "printString").is_some());
+        assert!(world
+            .method_source("Object", Side::Instance, "printString")
+            .is_some());
         assert!(!world.remove_method("Object", Side::Instance, "hash")); // already gone
         assert!(!world.remove_method("Object", Side::Instance, "nope"));
     }
@@ -534,11 +648,20 @@ mod tests {
             world.create_or_reopen_class("Object", None, "Kernel", "Hijacked!", ""),
             ClassCreateOutcome::AlreadyLive
         );
-        assert_eq!(world.class_named("Object").unwrap().comment, "The root of the class hierarchy. Defines default behavior shared by every object.");
+        assert_eq!(
+            world.class_named("Object").unwrap().comment,
+            "The root of the class hierarchy. Defines default behavior shared by every object."
+        );
 
         world.remove_class("Collection");
         assert_eq!(
-            world.create_or_reopen_class("Collection", Some("Object"), "Collections", "Reborn.", "elements"),
+            world.create_or_reopen_class(
+                "Collection",
+                Some("Object"),
+                "Collections",
+                "Reborn.",
+                "elements"
+            ),
             ClassCreateOutcome::Created
         );
         assert_eq!(world.class_named("Collection").unwrap().comment, "Reborn.");
@@ -547,11 +670,33 @@ mod tests {
     #[test]
     fn create_or_reopen_method_creates_and_redefines() {
         let mut world = MockWorld::seed();
-        assert!(world.create_or_reopen_method("Object", Side::Instance, "printOn:", "printing", "printOn: s\n\t^s"));
-        assert_eq!(world.method_source("Object", Side::Instance, "printOn:").unwrap(), "printOn: s\n\t^s");
+        assert!(world.create_or_reopen_method(
+            "Object",
+            Side::Instance,
+            "printOn:",
+            "printing",
+            "printOn: s\n\t^s"
+        ));
+        assert_eq!(
+            world
+                .method_source("Object", Side::Instance, "printOn:")
+                .unwrap(),
+            "printOn: s\n\t^s"
+        );
 
-        assert!(world.create_or_reopen_method("Object", Side::Instance, "hash", "comparing", "hash\n\t^0"));
-        assert_eq!(world.method_source("Object", Side::Instance, "hash").unwrap(), "hash\n\t^0");
+        assert!(world.create_or_reopen_method(
+            "Object",
+            Side::Instance,
+            "hash",
+            "comparing",
+            "hash\n\t^0"
+        ));
+        assert_eq!(
+            world
+                .method_source("Object", Side::Instance, "hash")
+                .unwrap(),
+            "hash\n\t^0"
+        );
 
         assert!(!world.create_or_reopen_method("Nonexistent", Side::Instance, "foo", "cat", "foo"));
     }
@@ -559,11 +704,18 @@ mod tests {
     #[test]
     fn set_class_definition_changes_superclass_and_ivars_only() {
         let mut world = MockWorld::seed();
-        assert!(world.set_class_definition("Collection", Some("Object".to_string()), "elements size".to_string()));
+        assert!(world.set_class_definition(
+            "Collection",
+            Some("Object".to_string()),
+            "elements size".to_string()
+        ));
         let c = world.class_named("Collection").unwrap();
         assert_eq!(c.superclass.as_deref(), Some("Object"));
         assert_eq!(c.instance_vars, "elements size");
-        assert_eq!(c.comment, "Abstract superclass for objects that hold a group of elements.");
+        assert_eq!(
+            c.comment,
+            "Abstract superclass for objects that hold a group of elements."
+        );
         assert!(!world.set_class_definition("Nonexistent", None, String::new()));
     }
 }

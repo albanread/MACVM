@@ -50,9 +50,9 @@ fn extract_asm_pragma(source: &str) -> Option<String> {
 const RESERVED_REGISTERS: &[&str] = &[
     "x16", "w16", "x17", "w17", // IP0/IP1 veneer scratch
     "x18", "w18", // platform-reserved
-    "x19", "w19", "x20", "w20", "x21", "w21", "x22", "w22", "x23", "w23",
-    "x24", "w24", "x25", "w25", "x26", "w26", "x27", "w27", "x28", "w28",
-    "x29", "w29", "fp", "x30", "w30", "lr", "sp", "wsp",
+    "x19", "w19", "x20", "w20", "x21", "w21", "x22", "w22", "x23", "w23", "x24", "w24", "x25",
+    "w25", "x26", "w26", "x27", "w27", "x28", "w28", "x29", "w29", "fp", "x30", "w30", "lr", "sp",
+    "wsp",
 ];
 
 fn lint_reserved_registers(asm_text: &str) -> Vec<String> {
