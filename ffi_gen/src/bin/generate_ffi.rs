@@ -43,7 +43,10 @@ fn main() -> ExitCode {
         }
     }
 
-    print!("{}{struct_text}\n{cocoa_text}\n{posix_text}", ffi_gen::GENERATED_HEADER);
+    print!(
+        "{}{struct_text}\n{cocoa_text}\n{posix_text}",
+        ffi_gen::GENERATED_HEADER
+    );
     eprintln!(
         "generate_ffi: {} Cocoa method(s), {} POSIX function(s), {} struct(s) — forward-declared, not yet callable (docs/FFI.md §6.3)",
         cocoa.len(),

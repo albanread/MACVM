@@ -61,14 +61,20 @@ impl Db {
 
     #[cfg(test)]
     fn open_at(path: &Path) -> Result<Self, GenError> {
-        let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(GenError::Sql)?;
+        let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(GenError::Sql)?;
         Ok(Self { conn })
     }
 
     /// `method_abi`'s `ret_class`/`arg_classes` for one `(class, selector,
     /// is_class)` — the AAPCS64 shape a compiled/trampoline call needs, not
     /// the raw `@encode` string (`docs/FFI.md` §1).
-    pub fn method_abi(&self, class: &str, selector: &str, is_class: bool) -> Result<Option<Abi>, GenError> {
+    pub fn method_abi(
+        &self,
+        class: &str,
+        selector: &str,
+        is_class: bool,
+    ) -> Result<Option<Abi>, GenError> {
         self.conn
             .query_row(
                 "SELECT ret_class, arg_classes FROM method_abi WHERE class = ?1 AND selector = ?2 AND is_class = ?3",
@@ -93,12 +99,16 @@ impl Db {
     pub fn struct_layout(&self, name: &str) -> Result<Option<StructLayout>, GenError> {
         let head = self
             .conn
-            .query_row("SELECT name, size FROM structs WHERE name = ?1", [name], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
-            })
+            .query_row(
+                "SELECT name, size FROM structs WHERE name = ?1",
+                [name],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+            )
             .map(Some)
             .or_else(none_if_no_rows)?;
-        let Some((name, size)) = head else { return Ok(None) };
+        let Some((name, size)) = head else {
+            return Ok(None);
+        };
 
         let mut stmt = self
             .conn
@@ -140,13 +150,27 @@ pub struct Abi {
 
 impl Abi {
     fn from_row(ret_class: String, arg_classes: String) -> Self {
-        let arg_classes = if arg_classes.is_empty() { Vec::new() } else { arg_classes.split(',').map(str::to_string).collect() };
-        Self { ret_class, arg_classes }
+        let arg_classes = if arg_classes.is_empty() {
+            Vec::new()
+        } else {
+            arg_classes.split(',').map(str::to_string).collect()
+        };
+        Self {
+            ret_class,
+            arg_classes,
+        }
     }
 
     /// `#(g f h4 ...)` — an array-of-symbols literal for the pragma.
     fn as_smalltalk_array_literal(&self) -> String {
-        format!("#({})", self.arg_classes.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(" "))
+        format!(
+            "#({})",
+            self.arg_classes
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(" ")
+        )
     }
 }
 
@@ -169,7 +193,11 @@ pub enum GenError {
     DbNotFound,
     Sql(rusqlite::Error),
     NotFound(String),
-    UnsupportedFieldType { struct_name: String, field: String, ty: String },
+    UnsupportedFieldType {
+        struct_name: String,
+        field: String,
+        ty: String,
+    },
 }
 
 impl fmt::Display for GenError {
@@ -216,11 +244,30 @@ pub struct PosixFunctionSpec {
 /// (`docs/FFI.md` §6.1: curated is the point, Tier 2's dynamic dispatch is
 /// what reaches the rest). Exercises `f`/`h4`/`g` Cocoa shapes and the
 /// file-I/O POSIX surface `WORLD.md` §9 already wanted.
-pub fn seed_manifest() -> (Vec<CocoaMethodSpec>, Vec<PosixFunctionSpec>, &'static [&'static str]) {
+pub fn seed_manifest() -> (
+    Vec<CocoaMethodSpec>,
+    Vec<PosixFunctionSpec>,
+    &'static [&'static str],
+) {
     let cocoa = vec![
-        CocoaMethodSpec { objc_class: "NSColor", selector: "colorWithRed:green:blue:alpha:", is_class_method: true, smalltalk_class: "NSColorAlien" },
-        CocoaMethodSpec { objc_class: "NSView", selector: "frame", is_class_method: false, smalltalk_class: "NSViewAlien" },
-        CocoaMethodSpec { objc_class: "NSView", selector: "initWithFrame:", is_class_method: false, smalltalk_class: "NSViewAlien" },
+        CocoaMethodSpec {
+            objc_class: "NSColor",
+            selector: "colorWithRed:green:blue:alpha:",
+            is_class_method: true,
+            smalltalk_class: "NSColorAlien",
+        },
+        CocoaMethodSpec {
+            objc_class: "NSView",
+            selector: "frame",
+            is_class_method: false,
+            smalltalk_class: "NSViewAlien",
+        },
+        CocoaMethodSpec {
+            objc_class: "NSView",
+            selector: "initWithFrame:",
+            is_class_method: false,
+            smalltalk_class: "NSViewAlien",
+        },
     ];
     let posix = vec![
         // `open`'s real declaration is variadic (`open(path, flags, ...)`) —
@@ -230,10 +277,22 @@ pub fn seed_manifest() -> (Vec<CocoaMethodSpec>, Vec<PosixFunctionSpec>, &'stati
         // variadic tail (`docs/FFI.md` §7: no variadic calling-convention
         // story here or in cocoa_data itself) — so the manifest's arity
         // must match the fixed-arg count, not the full C prototype's.
-        PosixFunctionSpec { c_name: "open", smalltalk_selector: "openPath:flags:" },
-        PosixFunctionSpec { c_name: "read", smalltalk_selector: "readFd:buffer:count:" },
-        PosixFunctionSpec { c_name: "write", smalltalk_selector: "writeFd:buffer:count:" },
-        PosixFunctionSpec { c_name: "close", smalltalk_selector: "closeFd:" },
+        PosixFunctionSpec {
+            c_name: "open",
+            smalltalk_selector: "openPath:flags:",
+        },
+        PosixFunctionSpec {
+            c_name: "read",
+            smalltalk_selector: "readFd:buffer:count:",
+        },
+        PosixFunctionSpec {
+            c_name: "write",
+            smalltalk_selector: "writeFd:buffer:count:",
+        },
+        PosixFunctionSpec {
+            c_name: "close",
+            smalltalk_selector: "closeFd:",
+        },
         PosixFunctionSpec {
             c_name: "mmap",
             smalltalk_selector: "mmapAddr:length:prot:flags:fd:offset:",
@@ -261,7 +320,11 @@ fn selector_parts(selector: &str) -> Vec<String> {
     if !selector.contains(':') {
         return vec![selector.to_string()];
     }
-    selector.split(':').filter(|s| !s.is_empty()).map(|s| format!("{s}:")).collect()
+    selector
+        .split(':')
+        .filter(|s| !s.is_empty())
+        .map(|s| format!("{s}:"))
+        .collect()
 }
 
 /// One method's `.mst` body — the message pattern line plus a
@@ -276,17 +339,37 @@ fn method_text(pattern: &str, primitive_pragma: &str) -> String {
 pub fn generate_cocoa_method(db: &Db, spec: &CocoaMethodSpec) -> Result<String, GenError> {
     let abi = db
         .method_abi(spec.objc_class, spec.selector, spec.is_class_method)?
-        .ok_or_else(|| GenError::NotFound(format!("{}{}{}", spec.objc_class, if spec.is_class_method { " class>>" } else { ">>" }, spec.selector)))?;
+        .ok_or_else(|| {
+            GenError::NotFound(format!(
+                "{}{}{}",
+                spec.objc_class,
+                if spec.is_class_method {
+                    " class>>"
+                } else {
+                    ">>"
+                },
+                spec.selector
+            ))
+        })?;
 
     let is_keyword = spec.selector.contains(':');
     let parts = selector_parts(spec.selector);
     let pattern = if is_keyword {
         let names = param_names(parts.len());
-        parts.iter().zip(&names).map(|(kw, name)| format!("{kw} {name}")).collect::<Vec<_>>().join(" ")
+        parts
+            .iter()
+            .zip(&names)
+            .map(|(kw, name)| format!("{kw} {name}"))
+            .collect::<Vec<_>>()
+            .join(" ")
     } else {
         spec.selector.to_string()
     };
-    let full_pattern = if spec.is_class_method { format!("{} class >> {pattern}", spec.smalltalk_class) } else { pattern };
+    let full_pattern = if spec.is_class_method {
+        format!("{} class >> {pattern}", spec.smalltalk_class)
+    } else {
+        pattern
+    };
 
     let pragma = format!(
         "<primitive: FFI selector: #{} class: #{} classSide: {} ret: #{} args: {}>",
@@ -300,7 +383,9 @@ pub fn generate_cocoa_method(db: &Db, spec: &CocoaMethodSpec) -> Result<String, 
 }
 
 pub fn generate_posix_function(db: &Db, spec: &PosixFunctionSpec) -> Result<String, GenError> {
-    let abi = db.posix_function_abi(spec.c_name)?.ok_or_else(|| GenError::NotFound(spec.c_name.to_string()))?;
+    let abi = db
+        .posix_function_abi(spec.c_name)?
+        .ok_or_else(|| GenError::NotFound(spec.c_name.to_string()))?;
 
     // A manifest selector with no colon (e.g. a hypothetical zero-arg
     // `getpid`) means arity 0, same convention `generate_cocoa_method` uses
@@ -320,11 +405,24 @@ pub fn generate_posix_function(db: &Db, spec: &PosixFunctionSpec) -> Result<Stri
     }
     let pattern = if is_keyword {
         let names = param_names(parts.len());
-        format!("FFIPosix class >> {}", parts.iter().zip(&names).map(|(kw, name)| format!("{kw} {name}")).collect::<Vec<_>>().join(" "))
+        format!(
+            "FFIPosix class >> {}",
+            parts
+                .iter()
+                .zip(&names)
+                .map(|(kw, name)| format!("{kw} {name}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        )
     } else {
         format!("FFIPosix class >> {}", spec.smalltalk_selector)
     };
-    let pragma = format!("<primitive: FFI function: #{} ret: #{} args: {}>", spec.c_name, abi.ret_class, abi.as_smalltalk_array_literal());
+    let pragma = format!(
+        "<primitive: FFI function: #{} ret: #{} args: {}>",
+        spec.c_name,
+        abi.ret_class,
+        abi.as_smalltalk_array_literal()
+    );
     Ok(method_text(&pattern, &pragma))
 }
 
@@ -351,7 +449,13 @@ fn field_accessor(struct_name: &str, field: &StructField) -> Result<String, GenE
         "f" => "floatAt:",
         "q" | "Q" => "signedLongAt:",
         "^" => "unsignedLongAt:",
-        other => return Err(GenError::UnsupportedFieldType { struct_name: struct_name.to_string(), field: field.name.clone(), ty: other.to_string() }),
+        other => {
+            return Err(GenError::UnsupportedFieldType {
+                struct_name: struct_name.to_string(),
+                field: field.name.clone(),
+                ty: other.to_string(),
+            })
+        }
     };
     Ok(format!(
         "    {name} [ ^self {getter} {idx} ]\n    {name}: aNumber [ ^self {getter} {idx} put: aNumber ]\n",
@@ -360,7 +464,9 @@ fn field_accessor(struct_name: &str, field: &StructField) -> Result<String, GenE
 }
 
 pub fn generate_struct_accessor_class(db: &Db, struct_name: &str) -> Result<String, GenError> {
-    let layout = db.struct_layout(struct_name)?.ok_or_else(|| GenError::NotFound(struct_name.to_string()))?;
+    let layout = db
+        .struct_layout(struct_name)?
+        .ok_or_else(|| GenError::NotFound(struct_name.to_string()))?;
     let class_name = format!("{struct_name}Alien");
     let mut body = String::new();
     for field in &layout.fields {
@@ -445,7 +551,10 @@ mod tests {
 
     #[test]
     fn selector_parts_splits_keyword_selectors() {
-        assert_eq!(selector_parts("colorWithRed:green:blue:alpha:"), vec!["colorWithRed:", "green:", "blue:", "alpha:"]);
+        assert_eq!(
+            selector_parts("colorWithRed:green:blue:alpha:"),
+            vec!["colorWithRed:", "green:", "blue:", "alpha:"]
+        );
         assert_eq!(selector_parts("frame"), vec!["frame"]);
     }
 
@@ -458,15 +567,24 @@ mod tests {
             is_class_method: true,
             smalltalk_class: "NSColorAlien",
         };
-        let text = generate_cocoa_method(&db, &spec).expect("NSColor colorWithRed:green:blue:alpha: must exist in cocoa.sqlite");
-        assert!(text.contains("NSColorAlien class >> colorWithRed: a1 green: a2 blue: a3 alpha: a4"), "{text}");
+        let text = generate_cocoa_method(&db, &spec)
+            .expect("NSColor colorWithRed:green:blue:alpha: must exist in cocoa.sqlite");
+        assert!(
+            text.contains("NSColorAlien class >> colorWithRed: a1 green: a2 blue: a3 alpha: a4"),
+            "{text}"
+        );
         assert!(text.contains("ret: #g args: #(f f f f)"), "{text}");
     }
 
     #[test]
     fn generated_frame_method_is_h4_with_no_args() {
         require_db!(db);
-        let spec = CocoaMethodSpec { objc_class: "NSView", selector: "frame", is_class_method: false, smalltalk_class: "NSViewAlien" };
+        let spec = CocoaMethodSpec {
+            objc_class: "NSView",
+            selector: "frame",
+            is_class_method: false,
+            smalltalk_class: "NSViewAlien",
+        };
         let text = generate_cocoa_method(&db, &spec).unwrap();
         assert!(text.contains("frame ["), "{text}");
         assert!(text.contains("ret: #h4 args: #()"), "{text}");
@@ -475,7 +593,12 @@ mod tests {
     #[test]
     fn generated_init_with_frame_takes_an_h4_argument() {
         require_db!(db);
-        let spec = CocoaMethodSpec { objc_class: "NSView", selector: "initWithFrame:", is_class_method: false, smalltalk_class: "NSViewAlien" };
+        let spec = CocoaMethodSpec {
+            objc_class: "NSView",
+            selector: "initWithFrame:",
+            is_class_method: false,
+            smalltalk_class: "NSViewAlien",
+        };
         let text = generate_cocoa_method(&db, &spec).unwrap();
         assert!(text.contains("ret: #g args: #(h4)"), "{text}");
     }
@@ -483,16 +606,25 @@ mod tests {
     #[test]
     fn generated_mmap_matches_the_real_posix_abi() {
         require_db!(db);
-        let spec = PosixFunctionSpec { c_name: "mmap", smalltalk_selector: "mmapAddr:length:prot:flags:fd:offset:" };
+        let spec = PosixFunctionSpec {
+            c_name: "mmap",
+            smalltalk_selector: "mmapAddr:length:prot:flags:fd:offset:",
+        };
         let text = generate_posix_function(&db, &spec).unwrap();
-        assert!(text.contains("mmapAddr: a1 length: a2 prot: a3 flags: a4 fd: a5 offset: a6"), "{text}");
+        assert!(
+            text.contains("mmapAddr: a1 length: a2 prot: a3 flags: a4 fd: a5 offset: a6"),
+            "{text}"
+        );
         assert!(text.contains("ret: #g args: #(g g g g g g)"), "{text}");
     }
 
     #[test]
     fn posix_manifest_arity_mismatch_is_a_generation_error_not_a_panic() {
         require_db!(db);
-        let spec = PosixFunctionSpec { c_name: "mmap", smalltalk_selector: "mmapWrong:" }; // 1 keyword part, mmap takes 6
+        let spec = PosixFunctionSpec {
+            c_name: "mmap",
+            smalltalk_selector: "mmapWrong:",
+        }; // 1 keyword part, mmap takes 6
         let err = generate_posix_function(&db, &spec).unwrap_err();
         assert!(matches!(err, GenError::NotFound(_)), "{err}");
     }
@@ -504,14 +636,20 @@ mod tests {
         assert!(text.contains("Alien subclass: CGPointAlien"), "{text}");
         assert!(text.contains("x [ ^self doubleAt: 1 ]"), "{text}");
         assert!(text.contains("y [ ^self doubleAt: 9 ]"), "{text}"); // offset 8 -> Alien index 9
-        // The setter is a two-keyword send reusing the getter's own
-        // keyword (`self doubleAt: 1 put: aNumber`), not a bogus combined
-        // "doubleAt:put:" token before the index arg — a real bug an
-        // earlier version of this generator had, caught only by actually
-        // running it (`cargo run --bin generate_ffi`), not by a test that
-        // only checked the getter.
-        assert!(text.contains("x: aNumber [ ^self doubleAt: 1 put: aNumber ]"), "{text}");
-        assert!(text.contains("y: aNumber [ ^self doubleAt: 9 put: aNumber ]"), "{text}");
+                                                                     // The setter is a two-keyword send reusing the getter's own
+                                                                     // keyword (`self doubleAt: 1 put: aNumber`), not a bogus combined
+                                                                     // "doubleAt:put:" token before the index arg — a real bug an
+                                                                     // earlier version of this generator had, caught only by actually
+                                                                     // running it (`cargo run --bin generate_ffi`), not by a test that
+                                                                     // only checked the getter.
+        assert!(
+            text.contains("x: aNumber [ ^self doubleAt: 1 put: aNumber ]"),
+            "{text}"
+        );
+        assert!(
+            text.contains("y: aNumber [ ^self doubleAt: 9 put: aNumber ]"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -532,10 +670,19 @@ mod tests {
 
         let nsview = classes.iter().find(|c| c.name == "NSViewAlien").unwrap();
         assert_eq!(nsview.methods.len(), 2); // frame, initWithFrame:
-        assert!(nsview.methods.iter().any(|m| m.selector == "frame" && !m.is_class_side));
-        assert!(nsview.methods.iter().any(|m| m.selector == "initWithFrame:" && !m.is_class_side));
+        assert!(nsview
+            .methods
+            .iter()
+            .any(|m| m.selector == "frame" && !m.is_class_side));
+        assert!(nsview
+            .methods
+            .iter()
+            .any(|m| m.selector == "initWithFrame:" && !m.is_class_side));
 
         let nscolor = classes.iter().find(|c| c.name == "NSColorAlien").unwrap();
-        assert!(nscolor.methods.iter().any(|m| m.selector == "colorWithRed:green:blue:alpha:" && m.is_class_side));
+        assert!(nscolor
+            .methods
+            .iter()
+            .any(|m| m.selector == "colorWithRed:green:blue:alpha:" && m.is_class_side));
     }
 }
