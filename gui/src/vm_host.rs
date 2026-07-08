@@ -2088,4 +2088,90 @@ mod tests {
 
         std::fs::remove_dir_all(&tmp_dir).ok();
     }
+
+    /// FFI (S20) and the DB-boot world loader (S22) had never been exercised
+    /// TOGETHER before — `world/tests/30_ffi_alien_tests.mst` proves FFI
+    /// works, but it isn't in `world.list`, so it's never part of the seeded
+    /// image; the actual GUI boots via `load_world_from_image`
+    /// (`boot_without_world` + two-phase replay), not the `.mst` file tree a
+    /// plain `VmHandle::boot` would use. This defines the exact same
+    /// `<primitive: FFI function: #getpid ret: #g args: #()>` class the S20
+    /// test uses, live, against a DB-booted VM (the real Workspace/browser
+    /// path — `live_compile`), and checks a real OS pid comes back.
+    #[test]
+    fn ffi_works_through_a_db_booted_vm() {
+        let world_dir = test_world_dir();
+        let tmp =
+            std::env::temp_dir().join(format!("macvm_ffi_probe_{}.sqlite3", std::process::id()));
+        std::fs::remove_file(&tmp).ok();
+        let image = open_or_seed_image(&world_dir, &tmp).expect("seed");
+
+        let mut vm = VmHandle::boot_without_world(macvm::runtime::VmOptions {
+            heap_mib: 64,
+            jit: macvm::runtime::JitMode::Off,
+            ..Default::default()
+        });
+        crate::world_boot::load_world_from_image(&mut vm, &image, WORLD_DOITS).expect("db load");
+
+        vm.exec(
+            "Object subclass: FFIProbe [\n\
+             FFIProbe class >> getpid [\n\
+             <primitive: FFI function: #getpid ret: #g args: #()>\n\
+             ]\n\
+             ]",
+        )
+        .expect("FFI class must compile against a DB-booted VM");
+        let pid: i64 = vm
+            .eval("FFIProbe getpid.")
+            .expect("getpid must run")
+            .parse()
+            .expect("must answer a plain integer");
+        assert!(pid > 0, "expected a real positive pid, got {pid}");
+
+        std::fs::remove_file(&tmp).ok();
+    }
+
+    /// `Time class>>millisecondClockValue` (`world/30_date_time.mst`, S22) —
+    /// a real wall-clock FFI primitive (`clock_gettime`) combined with a
+    /// `<classVars:>`-cached mmap scratch buffer and Alien struct reads, all
+    /// through the actual DB-boot path the real GUI uses. Checks two calls a
+    /// moment apart return distinct, increasing, real epoch-millisecond
+    /// values — not just that it runs without erroring.
+    #[test]
+    fn time_millisecond_clock_value_works_through_a_db_booted_vm() {
+        let world_dir = test_world_dir();
+        let tmp =
+            std::env::temp_dir().join(format!("macvm_clock_probe_{}.sqlite3", std::process::id()));
+        std::fs::remove_file(&tmp).ok();
+        let image = open_or_seed_image(&world_dir, &tmp).expect("seed");
+
+        let mut vm = VmHandle::boot_without_world(macvm::runtime::VmOptions {
+            heap_mib: 64,
+            jit: macvm::runtime::JitMode::Off,
+            ..Default::default()
+        });
+        crate::world_boot::load_world_from_image(&mut vm, &image, WORLD_DOITS).expect("db load");
+
+        let parse_ms = |vm: &mut VmHandle| -> i64 {
+            vm.eval("Time millisecondClockValue.")
+                .expect("millisecondClockValue must run")
+                .parse()
+                .expect("must answer a plain integer")
+        };
+        let first = parse_ms(&mut vm);
+        let second = parse_ms(&mut vm);
+
+        // Sane epoch range (after 2023-01-01) — catches "answered garbage/
+        // uninitialized memory" without pinning an exact value.
+        assert!(
+            first > 1_672_531_200_000,
+            "not a plausible epoch ms: {first}"
+        );
+        assert!(
+            second >= first,
+            "the clock must not go backwards between two calls: {first} then {second}"
+        );
+
+        std::fs::remove_file(&tmp).ok();
+    }
 }
