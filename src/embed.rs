@@ -57,6 +57,26 @@ pub struct VmHandle {
     vm: VmState,
 }
 
+/// Releases this thread's `sigsetjmp` recovery slot when the handle is
+/// dropped. `eval`/`exec` claim one via `deopt_trap::claim_jmp_slot`
+/// (idempotent per thread); in the embedded model the worker thread owns its
+/// `VmHandle` and drops it on its own way out — a clean `worker_loop` return,
+/// the common restart-on-death path where an idle worker exits as its request
+/// channel is dropped — so `deregister_setjmp` runs on the very thread that
+/// claimed the slot and frees it. Without this, every respawn would strand a
+/// slot owned by a now-dead `pthread_t`, overflowing the fixed-size registry
+/// after `JMP_REGISTRY_CAP` restarts. `deregister_setjmp` is keyed by
+/// `pthread_self()`, so a `VmHandle` dropped on a thread that never claimed a
+/// slot is simply a no-op there — safe on any thread. (A worker torn down via
+/// `pthread_exit` — a genuinely fatal, unrecovered condition — skips `Drop`
+/// by design; that path is rare now that DNU/`error:` recover in-thread, and
+/// its slot is reclaimed if that `pthread_t` value is ever reused.)
+impl Drop for VmHandle {
+    fn drop(&mut self) {
+        crate::codecache::deopt_trap::deregister_setjmp();
+    }
+}
+
 /// A guest-visible evaluation failure — never a Rust panic (module doc's
 /// safety model). `Compile` covers lex/parse/codegen errors (`eval`'s
 /// source didn't compile). `RuntimeError` is an unhandled DNU or explicit

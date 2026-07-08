@@ -292,15 +292,13 @@ pub(crate) unsafe fn jmp_buf_ptr(i: usize) -> *mut core::ffi::c_int {
 /// thread that happens to reuse the same recycled `pthread_t` value never
 /// finds a stale entry.
 ///
-/// `#[allow(dead_code)]`: this is a deliberately-provided S21 cleanup API
-/// whose production caller — the embedded worker thread's own exit path (the
-/// `gui` language thread, or a future `VmHandle` shutdown/`Drop`) — is not
-/// yet wired; only the unit tests below exercise it today. Slot reuse is
-/// keyed by `pthread_self()`, so an unreleased slot is merely reclaimed the
-/// next time the same thread `claim_jmp_slot`s, never leaked across a live
-/// thread — hence non-urgent. Kept (rather than deleted) so wiring the
-/// shutdown path is a one-line call, not a re-derivation.
-#[allow(dead_code)]
+/// Wired from [`crate::embed::VmHandle`]'s `Drop`: the embedded worker owns
+/// its `VmHandle` and drops it on a clean exit, so this runs on the very
+/// thread that `claim_jmp_slot`'d and frees its slot. Without it, every
+/// restart-on-death respawn would strand a slot owned by a now-dead
+/// `pthread_t`, overflowing the fixed registry after `JMP_REGISTRY_CAP`
+/// restarts. Keyed by `pthread_self()`, so calling it from a thread that
+/// never claimed a slot is a harmless no-op.
 pub(crate) fn deregister_setjmp() {
     let me = unsafe { libc::pthread_self() } as u64;
     let _g = JMP_REGISTRY_LOCK.lock().unwrap();
