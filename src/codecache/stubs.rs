@@ -46,6 +46,9 @@ pub const KIND_ALLOC_SLOW: u64 = 5;
 /// oops are covered by its OWN oop map at the recorded pc, via the
 /// `FrameView::Compiled` the walker emits right after the adapter.
 pub const KIND_DEOPT_BRIDGE: u64 = 6;
+/// A compiled method's own primitive-call shim (`compiler::driver`'s
+/// shimmable-primitive eligibility). See [`build_stub_call_primitive`].
+pub const KIND_CALL_PRIMITIVE: u64 = 7;
 
 /// D5's shared stub skeleton, part 1: anchor + AAPCS frame + RootSpill
 /// (x0..x5). Every stub that calls into Rust starts with this; follow with
@@ -184,6 +187,11 @@ pub struct Stubs {
     /// and the size in bytes in x1 (S11 step 8). Callee-shaped (plain `ret`,
     /// result oop in x0), same contract as `must_be_boolean`.
     pub alloc_slow: CodeHandle,
+    /// A shimmable primitive-bearing method's own shim prologue `bl`s here
+    /// with `prim_id` in x10, `receiver + real args` count in x11, and
+    /// x0..x5 already the real receiver+args (`compiler::driver`'s
+    /// shimmable-primitive eligibility). See [`build_stub_call_primitive`].
+    pub call_primitive: CodeHandle,
     /// S13 D1 §2b: the shared `not_entrant_stub` — a now-`NotEntrant`
     /// nmethod's `entry`/`verified_entry` are patched (by
     /// `nmethod::make_not_entrant`) to `b not_entrant_stub`, so a future call
@@ -228,6 +236,9 @@ impl Stubs {
     }
     pub fn alloc_slow_addr(&self) -> u64 {
         self.alloc_slow.base as u64
+    }
+    pub fn call_primitive_addr(&self) -> u64 {
+        self.call_primitive.base as u64
     }
     /// S13 §2b: the address `make_not_entrant` patches an invalidated
     /// nmethod's `entry`/`verified_entry` to branch to.
@@ -327,6 +338,12 @@ pub fn install(cache: &mut CodeCache) -> Stubs {
         .expect("stubs::install: code cache too small for deopt_return");
     cache.publish(h10, &deopt_return_blob);
 
+    let call_primitive_blob = build_stub_call_primitive();
+    let h11 = cache
+        .alloc(call_primitive_blob.code.len())
+        .expect("stubs::install: code cache too small for call_primitive");
+    cache.publish(h11, &call_primitive_blob);
+
     Stubs {
         call_stub: h1,
         stub_poll: h2,
@@ -338,6 +355,7 @@ pub fn install(cache: &mut CodeCache) -> Stubs {
         alloc_slow: h8,
         not_entrant: h9,
         deopt_return: h10,
+        call_primitive: h11,
     }
 }
 
@@ -1520,6 +1538,110 @@ fn build_stub_alloc_slow() -> CodeBlob {
     a.emit("ret", &[]);
 
     a.finish()
+}
+
+/// A shimmable primitive-bearing method's own compiled entry (`compiler::
+/// driver`'s eligibility, `compiler::emit`'s shim prologue) puts
+/// `prim_id` in x10 and `receiver + real args` count in x11 — deliberately
+/// NOT x0/x1 (unlike `stub_alloc_slow`'s klass_bits/size_bytes): x0..x5
+/// here are the METHOD's own receiver+args, and `emit_stub_prologue`'s
+/// RootSpill save below is exactly what makes them `rt_call_primitive`'s
+/// own `&[Oop]` args slice — colliding them with this stub's own scalar
+/// parameters would corrupt the very data being marshaled. x10/x11 survive
+/// both `emit_stub_prologue` (only saves x0..x7) and `emit_stub_kind_tag`
+/// (scratches x9, not x10/x11).
+///
+/// Unlike `stub_alloc_slow`, this does NOT override x0 with the raw result
+/// after the epilogue — x0..x7 must come back to the CALLER exactly as it
+/// had them: on `PrimResult::Fail`, the calling method's own shim prologue
+/// falls through to its normal compiled bytecode body using x0 as `self`,
+/// same as any ordinary compiled entry (SPEC's own pinned calling
+/// convention). The tagged result travels in x16 instead, which
+/// `emit_stub_epilogue`'s x0..x7 reload never touches.
+fn build_stub_call_primitive() -> CodeBlob {
+    let mut a = JasmAssembler::new();
+
+    emit_stub_prologue(&mut a);
+    emit_stub_kind_tag(&mut a, KIND_CALL_PRIMITIVE);
+    a.emit("mov", &[x(2), x(11)]); // argc_plus_recv -> x2
+    a.emit("mov", &[x(1), x(10)]); // prim_id -> x1
+    a.emit("mov", &[x(0), x(28)]); // vm
+    let lit = a.literal_u64(
+        rt_call_primitive as *const () as u64,
+        Some(RelocKind::RuntimeAddr),
+    );
+    a.call_far(lit);
+    a.emit("mov", &[x(16), x(0)]); // tagged result -> x16, survives the epilogue's x0..x7 reload
+    emit_stub_epilogue(&mut a);
+    a.emit("ret", &[]);
+
+    a.finish()
+}
+
+/// # Safety
+/// Only ever reached via `blr` from `stub_call_primitive`'s own
+/// hand-assembled listing above, never called directly from Rust — `vm`
+/// must be `x28` (D4's own invariant, established by `call_stub`).
+///
+/// Reads the calling method's own receiver+args back out of RootSpill
+/// (`[fp − ROOTSPILL_BYTES, fp)`, `emit_stub_prologue`'s own layout — same
+/// formula `memory::roots`'s own RootSpill walk uses) rather than being
+/// handed a pointer, since that memory is exactly where `emit_stub_
+/// prologue` just archived x0..x7 — no separate marshaling needed. Calls
+/// `prim_id`'s own `PrimFn` exactly as `interpreter::send::try_primitive`
+/// does, and returns a tagged `u64`: the real oop's raw bits on `Ok`, or
+/// [`crate::oops::layout::PRIM_FAIL_SENTINEL`] on `Fail`. `Activated`
+/// (the `value`/`ensure:`/`ifCurtailed:` family) can never reach here —
+/// `compiler::driver`'s shimmable-primitive eligibility excludes every
+/// primitive capable of it, enforced here by the `debug_assert` below, not
+/// silently assumed.
+pub unsafe extern "C" fn rt_call_primitive(
+    vm: *mut VmState,
+    prim_id: u64,
+    argc_plus_recv: u64,
+) -> u64 {
+    // SAFETY: this function's own contract, guaranteed by `stub_call_primitive`.
+    let vm = unsafe { &mut *vm };
+    debug_assert_ne!(
+        vm.reg_block.last_compiled_fp, 0,
+        "rt_call_primitive: anchor must be set by stub_call_primitive's prologue before this call"
+    );
+    let desc = crate::runtime::primitives::prim_by_id(prim_id as u16).unwrap_or_else(|| {
+        panic!("rt_call_primitive: unknown primitive id {prim_id} -- driver.rs baked a bad literal")
+    });
+    let fp = vm.reg_block.last_compiled_fp;
+    let rootspill_base = fp - crate::oops::layout::ROOTSPILL_BYTES as u64;
+    let n = argc_plus_recv as usize;
+    debug_assert!(
+        n <= crate::oops::layout::ROOTSPILL_SLOTS,
+        "rt_call_primitive: {n} args exceeds ROOTSPILL_SLOTS -- driver.rs's own argc<=5 \
+         eligibility cap (receiver+5=6) should make this impossible"
+    );
+    let mut buf = [crate::oops::Oop::from_raw(0); crate::oops::layout::ROOTSPILL_SLOTS];
+    for (i, slot) in buf.iter_mut().enumerate().take(n) {
+        // SAFETY: `rootspill_base + 8*i` is exactly the address
+        // `emit_stub_prologue`'s own `stp x_i, x_{i+1}, [sp, #8*i]` wrote,
+        // for `i` in `0..n <= ROOTSPILL_SLOTS` (asserted above).
+        let addr = (rootspill_base + 8 * i as u64) as *const u64;
+        *slot = crate::oops::Oop::from_raw(unsafe { *addr });
+    }
+    match (desc.f)(vm, &buf[..n]) {
+        crate::runtime::primitives::PrimResult::Ok(v) => v.raw(),
+        crate::runtime::primitives::PrimResult::Fail => {
+            debug_assert!(
+                desc.can_fail,
+                "rt_call_primitive: primitive {} Failed but its own PrimDesc.can_fail is false",
+                desc.name
+            );
+            crate::oops::layout::PRIM_FAIL_SENTINEL
+        }
+        crate::runtime::primitives::PrimResult::Activated => unreachable!(
+            "rt_call_primitive: primitive {} returned Activated -- compiler::driver's \
+             shimmable-primitive eligibility must exclude every Activated-capable primitive \
+             (the value family, ensure:, ifCurtailed:) -- this is a compiler bug, not a guest one",
+            desc.name
+        ),
+    }
 }
 
 /// # Safety

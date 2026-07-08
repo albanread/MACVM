@@ -26,6 +26,18 @@ pub const MARK_TAG: u64 = 0b11; // only as header word 0
 /// Distinct full values, so a single exact `cmp x0, #6` never confuses them.
 pub const NLR_SENTINEL: u64 = 0b0110; // = 6
 
+/// A third RESERVED_TAG sentinel, same family as `NLR_SENTINEL` (an extra
+/// bit beyond the bare tag, so `BAILOUT_SENTINEL`'s plain `0b10` — a
+/// different, already-established meaning: give up on compiled execution
+/// entirely, go interpret — can never collide with this): a compiled
+/// primitive-call shim's own signal for `PrimResult::Fail` (`compiler::
+/// driver`'s shimmable-primitive eligibility, `codecache::stubs::
+/// rt_call_primitive`). Distinct from BAILOUT specifically because Fail
+/// does NOT mean "leave compiled code" — it means "continue in this SAME
+/// compiled frame, running the method's own bytecode fallback body",
+/// exactly mirroring the interpreter's own `PrimitiveOutcome::Fallthrough`.
+pub const PRIM_FAIL_SENTINEL: u64 = 0b1010; // = 10
+
 /// SPEC §7.6 (amended per S7 review, `sprint_s07_detail.md` "SPEC-QUESTION"):
 /// Rust can't rewrite live stale locals/handles the way a moving GC does in
 /// a language with a rewritable-roots runtime, so the enforceable

@@ -32,6 +32,83 @@ type CompiledIcState = crate::codecache::nmethod::IcState;
 /// already-eligible method, fused fast path vs. a real `CallSend`.
 pub(crate) const SMI_INLINE: [i64; 12] = [1, 2, 3, 6, 7, 8, 10, 11, 12, 13, 14, 15];
 
+/// Primitive ids that must NEVER become a compiled entry via
+/// `is_shimmable_primitive` below, regardless of `can_allocate`/`can_fail` —
+/// every other primitive returns only `PrimResult::Ok`/`Fail`, a shape
+/// `codecache::stubs::rt_call_primitive`'s generic mechanism handles
+/// uniformly (Fail falls through to the method's own compiled bytecode
+/// body; an allocating primitive is already GC-safe by construction, since
+/// `stub_call_primitive` uses the exact same anchor+RootSpill machinery
+/// every other Rust-calling stub relies on — `memory::roots::
+/// real_oop_rootspill_slots`'s `AdapterKind::CallPrimitive` arm). These
+/// don't: `PrimResult::Activated` means the primitive already pushed a
+/// real interpreter frame and reassigned `vm.regs` itself (`runtime::
+/// primitives::PrimResult`'s own doc) — the `value`/`value:`/`value:value:`/
+/// `value:value:value:`/`valueWithArguments:` family (50-54) and
+/// `ensure:`/`ifCurtailed:` (60-61). A generic "call it, check Ok-vs-Fail"
+/// shim has no way to represent "control transferred to a brand new
+/// activation" — that's a materially different, bespoke protocol, not a
+/// smaller version of this one (`docs/next_architecture.md`'s own framing).
+const PRIM_ACTIVATES_FRAME: [i64; 7] = [50, 51, 52, 53, 54, 60, 61];
+
+/// Primitive ids that ALREADY have a bespoke, more-specialized send-site
+/// fusion in `compiler::ir` and therefore must NEVER become an independently
+/// compiled entry via `is_shimmable_primitive` — they are "already compiled"
+/// in the precise sense the user asked us to skip. Every one of `ir`'s fusion
+/// detectors (`is_smi_inlinable`/`array_op_kind`/`alloc_site_klass` and their
+/// `_on` inline twins, plus `classify_smi_send`) reads a mono send site's
+/// target via `MethodOop::try_from(ic.target())` and *relies* on that
+/// succeeding — a plain, never-independently-compiled `MethodOop` is the only
+/// thing a mono IC ever pointed at, historically, because no primitive-bearing
+/// method could be compiled. Relaxing eligibility for these would let e.g.
+/// `SmallInteger>>#+` acquire its own nmethod; the caller's IC target then
+/// stops being a plain `MethodOop`, `try_from` returns `None`, and the fused
+/// fast path silently downgrades to a generic `CallSend` (or, in
+/// `classify_smi_send`, hits its hard `.expect`). The already-fused set is
+/// [`SMI_INLINE`] (arithmetic/comparison on `SmallInteger`) plus `basicNew`
+/// (23, `ir::PRIM_BASIC_NEW`, inline-allocated by `alloc_site_klass`) and the
+/// Array element ops `at:` (26) / `at:put:` (27) (`array_op_kind`). NOT
+/// included: `basicNew:` (24) is never fused (only bare `basicNew` is), so it
+/// stays a legitimate generic shim.
+const PRIM_ALREADY_FUSED: [i64; 15] = [
+    1, 2, 3, 6, 7, 8, 10, 11, 12, 13, 14, 15, // SMI_INLINE
+    23, // basicNew (alloc_site_klass)
+    26, // Array>>at:  (array_op_kind)
+    27, // Array>>at:put: (array_op_kind)
+];
+
+/// Primitive ids whose implementation reads `vm.prim_arg(i)` — i.e.
+/// `vm.stack[vm.prim_arg_base + i]` — to return the *relocated* receiver
+/// re-read from its rooted operand-stack slot after the collection they
+/// trigger (the S12-step-7 moving-GC fix: a young receiver may move DURING
+/// the primitive, so `args[0]`, a pre-GC copy, is stale). `gcScavenge` (93)
+/// and `gcFull` (94) are the two such primitives. The compiled shim path
+/// NEVER sets `vm.prim_arg_base` (only `interpreter::send::try_primitive`
+/// does), so a shimmed 93/94 would return whatever stale index
+/// `prim_arg_base` last held — an arbitrary oop from some paused interpreter
+/// frame, not the receiver. They are the ONLY shimmable-by-the-other-rules
+/// primitives that read `prim_arg_base`: `valueWithArguments:`/`ensure:`/
+/// `ifCurtailed:` also touch the operand stack but are already excluded by
+/// `PRIM_ACTIVATES_FRAME`. Kept interpreter-only.
+const PRIM_READS_ARG_BASE: [i64; 2] = [93, 94];
+
+/// `true` iff `prim_id` can become a compiled primitive-call shim
+/// (`emit::emit`'s prologue, driven by `eligibility_detail` below). Four
+/// exclusions: `PRIM_ACTIVATES_FRAME`'s list, `PRIM_ALREADY_FUSED`'s list,
+/// `PRIM_READS_ARG_BASE`'s list, and `crate::oops::layout::PRIM_ID_FFI` —
+/// FFI's own dispatch (`runtime::ffi::dispatch_ffi_primitive`) has a
+/// variable-arity argument shape the fixed colon-counted-argc `PrimDesc`
+/// table was never built to represent (`interpreter::send::try_primitive`'s
+/// own doc on why FFI is intercepted before the generic `prim_by_id` lookup
+/// even runs) — it is its own, later piece of work, not a shimmable
+/// `PrimDesc` entry at all.
+fn is_shimmable_primitive(prim_id: i64) -> bool {
+    prim_id != crate::oops::layout::PRIM_ID_FFI
+        && !PRIM_ACTIVATES_FRAME.contains(&prim_id)
+        && !PRIM_ALREADY_FUSED.contains(&prim_id)
+        && !PRIM_READS_ARG_BASE.contains(&prim_id)
+}
+
 /// D1 point 3, "tunable".
 const FRAME_BUDGET_SLOTS: i32 = 60;
 /// D1 point 4, "tunable".
@@ -112,15 +189,16 @@ fn eligibility_detail(vm: &VmState, method: MethodOop) -> Eligibility {
     // whose block escapes still returns NoPermanent (via the pre-pass).
     if method.is_block()
         || method.argc() > 5
-        || method.primitive() != 0
+        || (method.primitive() != 0 && !is_shimmable_primitive(method.primitive()))
         || method.bytecode_len() > MAX_BYTECODE_LEN
     {
         if vm.options.trace.is_enabled("jit") {
             eprintln!(
-                "[jit] NoPermanent reason: block={} argc={} prim={} bc_len={}",
+                "[jit] NoPermanent reason: block={} argc={} prim={} shimmable={} bc_len={}",
                 method.is_block(),
                 method.argc(),
                 method.primitive(),
+                method.primitive() == 0 || is_shimmable_primitive(method.primitive()),
                 method.bytecode_len()
             );
         }
@@ -558,6 +636,17 @@ fn compile_method_full(
     let stub_poll_addr = vm.stubs.stub_poll_addr();
     let must_be_boolean_addr = vm.stubs.must_be_boolean_addr();
     let alloc_slow_addr = vm.stubs.alloc_slow_addr();
+    let call_primitive_addr = vm.stubs.call_primitive_addr();
+    // `eligibility_detail` already confirmed (via `is_shimmable_primitive`)
+    // that a nonzero `method.primitive()` here is safe to compile a shim
+    // for — `argc_plus_recv` is the method's OWN argc+1 (receiver), never
+    // the send-site `IcSite::argc` (there is no inline cache for this —
+    // it's an unconditional call baked in at compile time).
+    let prim_shim: Option<(i64, u8)> = if method.primitive() != 0 {
+        Some((method.primitive(), method.argc() as u8 + 1))
+    } else {
+        None
+    };
     let guard = emit::EntryGuard {
         smi_klass_bits: vm.universe.smi_klass.oop().raw(),
         key_klass_bits: rcvr_klass.oop().raw(),
@@ -715,6 +804,8 @@ fn compile_method_full(
             stub_poll_addr,
             must_be_boolean_addr,
             alloc_slow_addr,
+            call_primitive_addr,
+            prim_shim,
             Some(guard),
             osr_req.as_ref(),
         );
@@ -902,6 +993,7 @@ fn compile_method_full(
         oopmaps,
         ic_sites,
         poll_bci,
+        prim_call_argc_plus_recv: prim_shim.map(|(_, argc_plus_recv)| argc_plus_recv),
         deopt_scopes,
         deopt_pcdescs,
         // S14 step 4b: the inline dependencies the converter recorded (one
@@ -1491,12 +1583,38 @@ mod tests {
         );
     }
 
-    /// D1 point 3: a method with a primitive attached stays interpreted —
-    /// its own Rust fast path is already fast, and S10's bailout-by-
-    /// restart soundness argument doesn't extend to primitives (which
-    /// really do call into Rust and can allocate).
+    /// Primitive 21 (`class`) is an ordinary Ok/Fail primitive with no
+    /// bespoke send-site fusion — shimmable (`is_shimmable_primitive`), so a
+    /// method carrying it is now eligible. Corrected replacement for the old
+    /// `eligible_rejects_primitive_method`, which asserted D1's original
+    /// blanket rejection ("a method with a primitive attached stays
+    /// interpreted... S10's bailout-by-restart soundness argument doesn't
+    /// extend to primitives") — true when it was written (before
+    /// `codecache::stubs::rt_call_primitive` existed to make a primitive-call
+    /// site itself GC-safe), superseded since. NB: a *fused* primitive such
+    /// as 1 (`+`) would NOT be eligible — see
+    /// `eligible_rejects_already_fused_primitive_method`.
     #[test]
-    fn eligible_rejects_primitive_method() {
+    fn eligible_accepts_shimmable_primitive_method() {
+        let mut vm = test_vm();
+        let mut b = BytecodeBuilder::new();
+        b.push_self();
+        b.ret_tos();
+        let sel = vm.universe.intern(b"class");
+        let method = b.finish(&mut vm, sel, 0, 0);
+        method.set_primitive(21);
+        assert!(eligible(&vm, method));
+    }
+
+    /// The already-fused dozen-plus (`PRIM_ALREADY_FUSED`) must NOT become
+    /// independently compiled: doing so would leave a caller's mono IC target
+    /// no longer a plain `MethodOop`, silently defeating `ir`'s more-
+    /// specialized `is_smi_inlinable`/`array_op_kind`/`alloc_site_klass`
+    /// fusion (and tripping `classify_smi_send`'s hard `.expect`). Primitive 1
+    /// (`+`, SMI_INLINE) is the representative — a fused site compiles it
+    /// inline, so the method itself is deliberately kept interpreted.
+    #[test]
+    fn eligible_rejects_already_fused_primitive_method() {
         let mut vm = test_vm();
         let mut b = BytecodeBuilder::new();
         b.push_self();
@@ -1505,6 +1623,79 @@ mod tests {
         let sel = vm.universe.intern(b"+");
         let method = b.finish(&mut vm, sel, 1, 0);
         method.set_primitive(1);
+        assert!(!eligible(&vm, method));
+    }
+
+    /// A primitive that reads `vm.prim_arg_base` (here 93 = `gcScavenge`)
+    /// must stay interpreter-only: the compiled shim never sets
+    /// `prim_arg_base`, so a shimmed 93/94 would return a stale operand-stack
+    /// oop instead of the (relocated) receiver (`PRIM_READS_ARG_BASE`'s own
+    /// doc). Even though `gcScavenge` neither fails nor is fused — it would
+    /// otherwise sail through `is_shimmable_primitive` — it must be rejected.
+    #[test]
+    fn eligible_rejects_arg_base_reading_primitive_method() {
+        let mut vm = test_vm();
+        let mut b = BytecodeBuilder::new();
+        b.push_self();
+        b.ret_tos();
+        let sel = vm.universe.intern(b"gcScavenge");
+        let method = b.finish(&mut vm, sel, 0, 0);
+        method.set_primitive(93);
+        assert!(!eligible(&vm, method));
+    }
+
+    /// `PRIM_ALREADY_FUSED` must stay a strict superset of [`SMI_INLINE`] —
+    /// the two lists are maintained by hand and a drift (adding an id to
+    /// `SMI_INLINE` without mirroring it here) would re-introduce exactly the
+    /// fusion-defeating hazard this exclusion exists to prevent. Also pins the
+    /// three non-SMI fused ids (`basicNew` 23, Array `at:` 26 / `at:put:` 27).
+    #[test]
+    fn already_fused_covers_smi_inline_and_alloc_and_array_ops() {
+        for p in SMI_INLINE {
+            assert!(
+                PRIM_ALREADY_FUSED.contains(&p),
+                "SMI_INLINE primitive {p} must also be in PRIM_ALREADY_FUSED"
+            );
+            assert!(
+                !is_shimmable_primitive(p),
+                "fused primitive {p} must not shim"
+            );
+        }
+        for p in [23, 26, 27] {
+            assert!(
+                !is_shimmable_primitive(p),
+                "fused primitive {p} must not shim"
+            );
+        }
+        // The prim_arg_base readers (gcScavenge/gcFull) are excluded too.
+        assert!(
+            !is_shimmable_primitive(93),
+            "gcScavenge reads prim_arg_base -- must not shim"
+        );
+        assert!(
+            !is_shimmable_primitive(94),
+            "gcFull reads prim_arg_base -- must not shim"
+        );
+        // A non-fused Ok/Fail primitive still shims.
+        assert!(is_shimmable_primitive(21)); // class
+        assert!(is_shimmable_primitive(24)); // basicNew: (NOT fused)
+    }
+
+    /// The half of the OLD blanket rejection that's still correct: a
+    /// primitive capable of `PrimResult::Activated` (here, 50 = `value`,
+    /// the block-activation family) can never be shimmed — the generic
+    /// "call it, branch on Ok-vs-Fail" mechanism has no way to represent
+    /// "control transferred to a brand new activation" (see
+    /// `PRIM_ACTIVATES_FRAME`'s own doc).
+    #[test]
+    fn eligible_rejects_frame_activating_primitive_method() {
+        let mut vm = test_vm();
+        let mut b = BytecodeBuilder::new();
+        b.push_self();
+        b.ret_tos();
+        let sel = vm.universe.intern(b"value");
+        let method = b.finish(&mut vm, sel, 0, 0);
+        method.set_primitive(50);
         assert!(!eligible(&vm, method));
     }
 
@@ -1670,7 +1861,7 @@ mod tests {
 
         let mut asm = JasmAssembler::new();
         let (_blob, _pcs, _ve, _ic, safepoint_pcs, _osr_off) =
-            emit::emit(&mut asm, &ir_method, &ra, 0, 0, 0, None, None);
+            emit::emit(&mut asm, &ir_method, &ra, 0, 0, 0, 0, None, None, None);
         assert_eq!(
             safepoint_pcs.len(),
             2,
@@ -1824,7 +2015,7 @@ mod tests {
 
         let mut asm = JasmAssembler::new();
         let (_blob, _pcs, _ve, _ic, safepoint_pcs, _osr_off) =
-            emit::emit(&mut asm, &ir_method, &ra, 0, 0, 0, None, None);
+            emit::emit(&mut asm, &ir_method, &ra, 0, 0, 0, 0, None, None, None);
 
         let (blob, pcdescs) = build_deopt_metadata(&ir_method, &ra, &safepoint_pcs);
 

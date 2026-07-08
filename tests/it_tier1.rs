@@ -162,6 +162,8 @@ fn run_ir_raw() {
         stubs.stub_poll_addr(),
         stubs.must_be_boolean_addr(),
         stubs.alloc_slow_addr(),
+        stubs.call_primitive_addr(),
+        None,
         None,
         None,
     );
@@ -212,6 +214,8 @@ fn build_and_publish(cache: &mut CodeCache, stub_poll_addr: u64, method: &IrMeth
         stub_poll_addr,
         0,
         0,
+        0,
+        None,
         None,
         None,
     );
@@ -413,6 +417,8 @@ fn run_ir_raw_forces_spill() {
         stubs.stub_poll_addr(),
         stubs.must_be_boolean_addr(),
         stubs.alloc_slow_addr(),
+        stubs.call_primitive_addr(),
+        None,
         None,
         None,
     );
@@ -1536,6 +1542,8 @@ fn compile_and_get_listing(vm: &VmState, method: MethodOop) -> String {
         0xDEAD_BEEF_0000_0000,
         0xDEAD_BEEF_0000_0001,
         0xDEAD_BEEF_0000_0002,
+        0xDEAD_BEEF_0000_0003,
+        None,
         None,
         None,
     );
@@ -1954,6 +1962,134 @@ fn compiled_result_equals_interpreted() {
     );
 }
 
+// ── compiled shimmable-primitive shims ───────────────────────────────────
+// The proof that opening `driver::eligibility_detail`'s gate to primitives
+// (`is_shimmable_primitive`) actually EXECUTES a primitive-bearing method
+// correctly once compiled — `emit::emit_prim_shim` +
+// `stubs::build_stub_call_primitive`/`rt_call_primitive` end to end. Every
+// existing test passed before this feature existed and none exercises a
+// COMPILED primitive method, so this is the one that would catch a broken
+// shim.
+
+/// Both shim exits, cross-checked against a fresh interpreted `run_method`
+/// (a true differential — compiled and interpreted primitive dispatch must
+/// agree):
+///
+/// * `class` (primitive 21, `can_fail: false`): the shim calls the
+///   primitive and returns its real result. A distinguishing fallback body
+///   (`^self`) proves the shim ran and NOT the body — `class` of an Array is
+///   the Array klass, never the array object itself.
+/// * `size` (primitive 28, `can_fail: true`): the SAME compiled method takes
+///   BOTH shim exits by receiver — an Array yields `Ok(count)` (the shim
+///   returns it), a SmallInteger yields `Fail`, which must fall through to
+///   the method's own compiled bytecode body (`^ -1`).
+///
+/// Invoked at `verified_entry_off` (past the S14 customization guard, which
+/// is orthogonal to the shim and would otherwise reject a receiver klass
+/// other than the one compiled for): these send-free bodies never use the
+/// customization assumption, so one nmethod serves every receiver klass.
+#[test]
+fn compiled_prim_shim_ok_and_fail_paths() {
+    let mut vm = test_vm();
+    let object_klass = vm.universe.object_klass;
+    let array_klass = vm.universe.array_klass;
+
+    // `class` (21): never-fail Ok path. `^self` fallback returns the
+    // receiver; the shim returns its klass instead.
+    let class_method = {
+        let sel = vm.universe.intern(b"probeClass");
+        let mut b = BytecodeBuilder::new();
+        b.ret_self();
+        let m = b.finish(&mut vm, sel, 0, 0);
+        m.set_primitive(21);
+        m
+    };
+    let class_id = driver::compile_method(&mut vm, object_klass, class_method)
+        .expect("a primitive-21 (class) method must be shim-eligible and compile");
+
+    // `size` (28): Ok on an Array, Fail -> fallthrough (`^ -1`) on a smi.
+    // `prim_fails` must be set — the interpreter's own `try_primitive`
+    // debug-asserts it before taking the Fail branch.
+    let size_method = {
+        let sel = vm.universe.intern(b"probeSize");
+        let mut b = BytecodeBuilder::new();
+        b.push_smi_i8(-1);
+        b.ret_tos();
+        let m = b.finish(&mut vm, sel, 0, 0);
+        m.set_primitive(28);
+        m.set_flags(0, 0, false, false, true, false, 0);
+        m
+    };
+    let size_id = driver::compile_method(&mut vm, object_klass, size_method)
+        .expect("a primitive-28 (size) method must be shim-eligible and compile");
+
+    // Build the Array receiver AFTER both compiles: neither `class` nor
+    // `size` allocates and gc_stress is off, so nothing moves it hereafter.
+    let arr = alloc::alloc_indexable_oops(&mut vm, array_klass, 3).oop();
+    let smi = SmallInt::new(0).oop();
+
+    let stubs = vm.stubs;
+    let verified = |vm: &VmState, id| {
+        let nm = vm.code_table.get(id).expect("installed");
+        (unsafe { nm.code.base.add(nm.verified_entry_off as usize) }) as u64
+    };
+    let class_entry = verified(&vm, class_id);
+    let size_entry = verified(&vm, size_id);
+
+    // class(array) -> the Array klass (shim result); interp agrees; and it is
+    // NOT the array itself (which is what the `^self` fallback would give).
+    let interp_class = macvm::interpreter::run_method(&mut vm, class_method, arr, &[]);
+    assert_eq!(
+        interp_class,
+        array_klass.oop(),
+        "interp: class of an Array is Array"
+    );
+    let compiled_class = stubs.invoke(class_entry, &mut vm, &[arr.raw()]);
+    assert_eq!(
+        compiled_class,
+        array_klass.oop().raw(),
+        "compiled `class` shim must return the receiver's klass (proves the shim ran, not `^self`)"
+    );
+    assert_ne!(
+        compiled_class,
+        arr.raw(),
+        "sanity: the shim result is the klass, not the receiver"
+    );
+
+    // size(array) -> 3 (shim Ok path); interp agrees.
+    let interp_size_ok = macvm::interpreter::run_method(&mut vm, size_method, arr, &[]);
+    assert_eq!(
+        interp_size_ok,
+        SmallInt::new(3).oop(),
+        "interp: size of a 3-element Array is 3"
+    );
+    let compiled_size_ok = stubs.invoke(size_entry, &mut vm, &[arr.raw()]);
+    assert_eq!(
+        compiled_size_ok,
+        SmallInt::new(3).oop().raw(),
+        "compiled `size` shim Ok path must return the element count"
+    );
+
+    // size(smi) -> -1 (shim Fail -> fall through to `^ -1`); interp agrees.
+    let interp_size_fail = macvm::interpreter::run_method(&mut vm, size_method, smi, &[]);
+    assert_eq!(
+        interp_size_fail,
+        SmallInt::new(-1).oop(),
+        "interp: size of a smi Fails and runs the `^ -1` body"
+    );
+    let compiled_size_fail = stubs.invoke(size_entry, &mut vm, &[smi.raw()]);
+    assert_eq!(
+        compiled_size_fail,
+        SmallInt::new(-1).oop().raw(),
+        "compiled `size` shim Fail path must fall through to the `^ -1` compiled body"
+    );
+}
+
+// The allocating-primitive + GC-safety proof lives in tests/it_gc_jit.rs
+// (`compiled_prim_shim_basicnew_under_gc_stress`), which owns the canonical
+// base-frame setup a real collection under a compiled frame requires — see
+// docs/prim_shims.md §5.
+
 // ── mixed_trace_golden (tests_s10.md gate item 4, integration item 6) ─────
 
 fn check_golden_trace(name: &str, actual: &str) {
@@ -2355,6 +2491,8 @@ fn mono_resolve_patches_call_site_and_dispatches() {
         vm.stubs.stub_poll_addr(),
         vm.stubs.must_be_boolean_addr(),
         vm.stubs.alloc_slow_addr(),
+        vm.stubs.call_primitive_addr(),
+        None,
         None,
         None,
     );
@@ -2397,6 +2535,7 @@ fn mono_resolve_patches_call_site_and_dispatches() {
         oopmaps: Vec::new(),
         ic_sites,
         poll_bci: None,
+        prim_call_argc_plus_recv: None,
         deopt_scopes: Vec::new(),
         deopt_pcdescs: Vec::new(),
         inline_deps: Vec::new(),
@@ -2524,6 +2663,8 @@ fn build_c2i_scenario(vm: &mut VmState) -> (u64, KlassOop, NmethodId) {
         vm.stubs.stub_poll_addr(),
         vm.stubs.must_be_boolean_addr(),
         vm.stubs.alloc_slow_addr(),
+        vm.stubs.call_primitive_addr(),
+        None,
         None,
         None,
     );
@@ -2566,6 +2707,7 @@ fn build_c2i_scenario(vm: &mut VmState) -> (u64, KlassOop, NmethodId) {
         oopmaps: Vec::new(),
         ic_sites,
         poll_bci: None,
+        prim_call_argc_plus_recv: None,
         deopt_scopes: Vec::new(),
         deopt_pcdescs: Vec::new(),
         inline_deps: Vec::new(),
@@ -2757,6 +2899,8 @@ fn full_ic_lattice_mono_to_pic_to_mega() {
         vm.stubs.stub_poll_addr(),
         vm.stubs.must_be_boolean_addr(),
         vm.stubs.alloc_slow_addr(),
+        vm.stubs.call_primitive_addr(),
+        None,
         None,
         None,
     );
@@ -2799,6 +2943,7 @@ fn full_ic_lattice_mono_to_pic_to_mega() {
         oopmaps: Vec::new(),
         ic_sites,
         poll_bci: None,
+        prim_call_argc_plus_recv: None,
         deopt_scopes: Vec::new(),
         deopt_pcdescs: Vec::new(),
         inline_deps: Vec::new(),
@@ -2984,6 +3129,8 @@ fn dnu_from_compiled_code_reaches_does_not_understand() {
         vm.stubs.stub_poll_addr(),
         vm.stubs.must_be_boolean_addr(),
         vm.stubs.alloc_slow_addr(),
+        vm.stubs.call_primitive_addr(),
+        None,
         None,
         None,
     );
@@ -3026,6 +3173,7 @@ fn dnu_from_compiled_code_reaches_does_not_understand() {
         oopmaps: Vec::new(),
         ic_sites,
         poll_bci: None,
+        prim_call_argc_plus_recv: None,
         deopt_scopes: Vec::new(),
         deopt_pcdescs: Vec::new(),
         inline_deps: Vec::new(),

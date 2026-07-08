@@ -408,6 +408,8 @@ fn compiled_mono_caller_guard_keeps_key_klass_alive() {
         vm.stubs.stub_poll_addr(),
         vm.stubs.must_be_boolean_addr(),
         vm.stubs.alloc_slow_addr(),
+        vm.stubs.call_primitive_addr(),
+        None,
         None,
         None,
     );
@@ -450,6 +452,7 @@ fn compiled_mono_caller_guard_keeps_key_klass_alive() {
         oopmaps: Vec::new(),
         ic_sites,
         poll_bci: None,
+        prim_call_argc_plus_recv: None,
         deopt_scopes: Vec::new(),
         deopt_pcdescs: Vec::new(),
         inline_deps: Vec::new(),
@@ -556,6 +559,8 @@ fn install_loop_nmethod(
         vm.stubs.stub_poll_addr(),
         vm.stubs.must_be_boolean_addr(),
         vm.stubs.alloc_slow_addr(),
+        vm.stubs.call_primitive_addr(),
+        None,
         None,
         None,
     );
@@ -620,6 +625,7 @@ fn install_loop_nmethod(
         oopmaps,
         ic_sites,
         poll_bci: None,
+        prim_call_argc_plus_recv: None,
         deopt_scopes: Vec::new(),
         deopt_pcdescs: Vec::new(),
         inline_deps: Vec::new(),
@@ -902,6 +908,111 @@ fn mid_loop_forced_scavenge() {
         ),
         "the scav site must have gone mono on iteration 1 and STAYED valid across every \
          scavenge (update_keys keeps its guard-klass mirror current)"
+    );
+}
+
+/// Primitive-shim GC-safety (docs/prim_shims.md §4-5): a JIT-compiled method
+/// carrying `<primitive: 24>` (`basicNew:`) allocates INSIDE its own shim
+/// call (`stub_call_primitive` → `rt_call_primitive` → `alloc::*`). Under
+/// `gc_stress` every such allocation forces a real scavenge while the
+/// `AdapterKind::CallPrimitive` stub frame is the innermost native frame — so
+/// the walker must traverse it and scan exactly `prim_call_argc_plus_recv`
+/// (= method.argc()+1 = 2) RootSpill slots as roots. A wrong count would
+/// scan stale non-oop registers as oops and corrupt the heap (or panic).
+///
+/// Driven via the REAL `enter_compiled` (never raw `stubs::invoke`, which
+/// leaves no `TierLink::IntoCompiled` and would panic the walker at the
+/// call_stub boundary), with the canonical base frame this file establishes
+/// everywhere: push a root, run a throwaway `idleWarm` so a sentinel-
+/// terminated entry-frame remnant exists for `walk_frames` to bottom out on,
+/// then push the receiver+arg. Compiled customized to `klass_of(receiver)`
+/// (Array's metaclass) so the entry guard matches. A co-rooted YOUNG canary,
+/// pushed under the base frame, must survive every collection with its ivar
+/// intact — proof the walker did not corrupt the heap while walking the
+/// CallPrimitive frame.
+#[test]
+fn compiled_prim_shim_basicnew_under_gc_stress() {
+    const N: usize = 16;
+    let mut vm = VmState::with_options(VmOptions {
+        heap_mib: 64,
+        trace: Default::default(),
+        gc_stress: true,
+        gc_stress_full_period: None,
+        eden_kb: Some(256),
+        jit: JitMode::Off,
+    });
+
+    // `probeNew: n` == `<primitive: 24> ^self`: Array class + non-negative smi
+    // → a fresh n-element Array (the `^self` fallback is never taken).
+    let sel = vm.universe.intern(b"probeNew:");
+    let mut b = BytecodeBuilder::new();
+    b.ret_self();
+    let method = b.finish(&mut vm, sel, 1, 0);
+    method.set_primitive(24);
+    method.set_flags(1, 0, false, false, true, false, 0);
+
+    // enter_compiled enters at entry_off (the S14 guard); customize to the
+    // receiver's OWN klass = klass_of(Array-the-class) = Array's metaclass.
+    let recv0 = vm.universe.array_klass.oop();
+    let recv_klass = klass_of(&vm, recv0);
+    let id = driver::compile_method(&mut vm, recv_klass, method)
+        .expect("primitive-24 (basicNew:) method must be shim-eligible and compile");
+
+    // A YOUNG canary with a recognizable ivar, rooted on the operand stack
+    // UNDER the base frame.
+    let object_klass = vm.universe.object_klass;
+    let canary_klass = vm.universe.new_klass(
+        object_klass,
+        "ShimCanary",
+        Format::Slots,
+        false,
+        HEADER_WORDS + 1,
+    );
+    let canary = alloc::alloc_slots(&mut vm, canary_klass);
+    canary.set_body_oop(0, SmallInt::new(1234).oop());
+
+    // Base frame: root the canary FIRST, then run a throwaway interpreted
+    // method so its dead-remnant entry frame — sentinel intact — sits above
+    // the canary for the walker to terminate on.
+    vm.stack.push(canary.oop());
+    let idle_sel = vm.universe.intern(b"idleWarm");
+    let mut ib = BytecodeBuilder::new();
+    ib.ret_self();
+    let idle_method = ib.finish(&mut vm, idle_sel, 0, 0);
+    let _ = macvm::interpreter::run_method(&mut vm, idle_method, SmallInt::new(0).oop(), &[]);
+
+    let scav_before = vm.universe.gc_stats.scavenge_count;
+    for n in 0..N {
+        let recv = vm.universe.array_klass.oop(); // permanent; re-read for clarity
+        let count = SmallInt::new(n as i64).oop();
+        vm.stack.push(recv);
+        vm.stack.push(count);
+        assert_eq!(
+            enter_compiled(&mut vm, id, 1),
+            EnterResult::Completed,
+            "compiled basicNew: {n} must complete (guard matched, shim ran)"
+        );
+        let result = vm.stack.pop();
+        let arr = macvm::oops::wrappers::ArrayOop::try_from(result)
+            .unwrap_or_else(|| panic!("compiled basicNew: {n} shim must return an Array"));
+        assert_eq!(
+            arr.len(),
+            n,
+            "the shim must allocate an n-element Array across a stressed collection"
+        );
+    }
+
+    assert!(
+        vm.universe.gc_stats.scavenge_count > scav_before,
+        "gc_stress must have forced real scavenges through the CallPrimitive frame"
+    );
+
+    // The co-rooted young canary survived every collection uncorrupted.
+    let canary_now = MemOop::try_from(vm.stack.pop()).expect("canary survived as a mem oop");
+    assert_eq!(
+        canary_now.body_oop(0),
+        SmallInt::new(1234).oop(),
+        "the co-rooted young canary's ivar must survive the collections intact"
     );
 }
 

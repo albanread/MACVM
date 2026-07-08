@@ -375,6 +375,30 @@ fn real_oop_rootspill_slots(vm: &VmState, kind: AdapterKind, caller_pc: u64) -> 
     match kind {
         AdapterKind::MustBeBoolean => 1,
         AdapterKind::AllocSlow => 1,
+        // Unlike AllocSlow's fixed 1 (a single klass oop), a primitive
+        // call's own receiver+args count varies by primitive — read the
+        // COMPILED CALLER's own count via caller_pc, same nmethod lookup
+        // `Resolve|C2i|Mega|Dnu` use below, just a plain field instead of
+        // an IcSite (there is no inline cache for a primitive-call site —
+        // it's an unconditional call baked in at method-compile time, so
+        // `Nmethod::prim_call_argc_plus_recv` is set once, directly from
+        // `method.argc()`, not per-call-site like `IcSite::argc`).
+        AdapterKind::CallPrimitive => {
+            let nm_id = vm.code_table.find_by_pc(caller_pc).unwrap_or_else(|| {
+                panic!(
+                    "each_code_root: CallPrimitive's own caller_pc {caller_pc:#x} is not inside \
+                     any alive nmethod -- the anchor/tier-link chain and the code table disagree"
+                )
+            });
+            let nmethod = vm.code_table.get(nm_id).expect("just found by find_by_pc");
+            nmethod.prim_call_argc_plus_recv.unwrap_or_else(|| {
+                panic!(
+                    "each_code_root: nmethod {nm_id:?} tagged its anchor CallPrimitive but has \
+                     no prim_call_argc_plus_recv -- compile-time bookkeeping and the emitted \
+                     shim have drifted apart"
+                )
+            }) as usize
+        }
         // S14 step 9: the synthetic deopt-bridge anchor owns NO spill slots —
         // it marks an ABANDONED compiled frame whose oops were already
         // materialized into interpreter frames (covered by the linear stack

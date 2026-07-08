@@ -66,8 +66,8 @@
 
 use crate::codecache::nmethod::NmethodId;
 use crate::codecache::stubs::{
-    KIND_ALLOC_SLOW, KIND_C2I, KIND_DEOPT_BRIDGE, KIND_DNU, KIND_MEGA, KIND_MUST_BE_BOOLEAN,
-    KIND_RESOLVE,
+    KIND_ALLOC_SLOW, KIND_C2I, KIND_CALL_PRIMITIVE, KIND_DEOPT_BRIDGE, KIND_DNU, KIND_MEGA,
+    KIND_MUST_BE_BOOLEAN, KIND_RESOLVE,
 };
 use crate::interpreter::stack::Frame;
 use crate::oops::layout::ENTRY_FRAME_SENTINEL;
@@ -87,6 +87,13 @@ pub enum AdapterKind {
     Dnu,
     MustBeBoolean,
     AllocSlow,
+    /// A compiled method's own primitive-call shim, mid-call into a
+    /// `PrimFn` (`compiler::driver`'s shimmable-primitive eligibility,
+    /// `codecache::stubs::rt_call_primitive`). Owns exactly the calling
+    /// method's own `receiver + real args` RootSpill slots — see
+    /// `memory::roots::real_oop_rootspill_slots`, which reads the count
+    /// from `Nmethod::prim_call_argc_plus_recv` via the caller_pc.
+    CallPrimitive,
     Poll,
     /// S14 step 9: not a real adapter — the synthetic anchor
     /// [`deopt_bridge_link`] plants so a walk during `interpret_active` can
@@ -111,6 +118,7 @@ impl AdapterKind {
             KIND_DNU => AdapterKind::Dnu,
             KIND_MUST_BE_BOOLEAN => AdapterKind::MustBeBoolean,
             KIND_ALLOC_SLOW => AdapterKind::AllocSlow,
+            KIND_CALL_PRIMITIVE => AdapterKind::CallPrimitive,
             // The deopt trampolines' record (see `KIND_DEOPT_BRIDGE`'s own
             // doc): same walker semantics as the synthetic bridge link —
             // no RootSpill slots, pass through to the deoptee frame.
@@ -1010,6 +1018,7 @@ mod tests {
             oopmaps: Vec::new(),
             ic_sites: Vec::new(),
             poll_bci: None,
+            prim_call_argc_plus_recv: None,
             deopt_scopes: Vec::new(),
             deopt_pcdescs: Vec::new(),
             inline_deps: Vec::new(),

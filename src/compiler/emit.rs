@@ -270,6 +270,11 @@ struct Emitter<'a> {
     /// Same reasoning again, for `codecache::stubs::Stubs::alloc_slow` — the
     /// `Ir::Alloc` fast path's overflow edge `bl`s here (S11 step 8, D7).
     alloc_slow_lit: LiteralId,
+    /// Same reasoning again, for `codecache::stubs::Stubs::call_primitive` —
+    /// a shimmable primitive-bearing method's own entry-prologue shim
+    /// `bl`s here (`compiler::driver`'s shimmable-primitive eligibility).
+    /// See [`emit_prim_shim`].
+    call_primitive_lit: LiteralId,
     /// `IrMethod.call_sites`, indexed by `Ir::CallSend.site` — see that
     /// field's own doc.
     call_sites: &'a [CallSiteInfo],
@@ -710,6 +715,58 @@ impl<'a> Emitter<'a> {
     /// `commit`. `Alloc` is a regalloc SAFEPOINT (`regalloc::
     /// is_safepoint`), so every vreg live across it is already spilled
     /// before the slow path's `bl` clobbers a caller-saved register.
+    /// A shimmable primitive-bearing method's own entry-prologue prefix
+    /// (`compiler::driver`'s eligibility, called once from `emit` above,
+    /// before the block loop — never a mid-method `Ir` node, since a
+    /// primitive is always tried before any of the method's own bytecode
+    /// runs). `prim_id`/`argc_plus_recv` travel in x10/x11 specifically —
+    /// NOT x0/x1 — because x0..x5 here are the method's own real
+    /// receiver+args (D5.1's pinned entry convention), and
+    /// `stub_call_primitive`'s own `emit_stub_prologue` archives EXACTLY
+    /// those into RootSpill as the primitive's `&[Oop]` args slice;
+    /// colliding them with scalar parameters would corrupt the very data
+    /// being marshaled (`codecache::stubs::build_stub_call_primitive`'s own
+    /// doc has the full reasoning, including why x10/x11 survive both
+    /// `emit_stub_prologue`, which only saves x0..x7, and
+    /// `emit_stub_kind_tag`, which scratches x9).
+    ///
+    /// On return, x16 carries the tagged result (`Ok` oop bits, or
+    /// [`crate::oops::layout::PRIM_FAIL_SENTINEL`] on `Fail`) — x0..x7 come
+    /// back to EXACTLY what they were before the call
+    /// (`emit_stub_epilogue`'s own x0..x7 reload from RootSpill, never
+    /// overridden for this stub unlike `stub_alloc_slow`), so the `Fail`
+    /// arm can simply fall through into the block loop below with no
+    /// restore of its own: it runs exactly as if this were an ordinary
+    /// (non-primitive) compiled method entry, x0 already `self`.
+    fn emit_prim_shim(&mut self, prim_id: i64, argc_plus_recv: u8, epilogue: Label) {
+        let fail = self.asm.new_label();
+        self.asm.emit("movz", &[x(10), imm(prim_id)]);
+        self.asm.emit("movz", &[x(11), imm(argc_plus_recv as i64)]);
+        self.asm.call_far(self.call_primitive_lit);
+        // This method's OWN frame, as the CALLER, has nothing regalloc-
+        // tracked live yet (position 0, before any real IR has run) — an
+        // empty oopmap here is correct, not a gap: the receiver+args live
+        // during the call are covered separately, by RootSpill via
+        // `AdapterKind::CallPrimitive` (this call's own doc, `emit`'s call
+        // site above). Still pushed, for the same reason every other
+        // Rust-calling site is: ANY call that can trigger a GC needs a
+        // PcDesc/oopmap entry at its own return address, even one that
+        // happens to describe zero live vregs.
+        self.safepoints.push(SafepointPc {
+            pc_off: self.asm.offset(),
+            bci: self.current_bci,
+            position: self.pos,
+        });
+        self.asm.emit(
+            "cmp",
+            &[x(16), imm(crate::oops::layout::PRIM_FAIL_SENTINEL as i64)],
+        );
+        self.asm.b_cond(Cond::Eq, fail);
+        self.asm.emit("mov", &[x(0), x(16)]);
+        self.asm.b(epilogue);
+        self.asm.bind(fail);
+    }
+
     fn emit_alloc(&mut self, dst: VReg, klass: PoolLit, size_words: u32) {
         use crate::oops::layout::{
             HEADER_WORDS, MEM_TAG, VMREG_EDEN_END_OFFSET, VMREG_EDEN_TOP_ADDR_OFFSET, WORD_SIZE,
@@ -1221,6 +1278,8 @@ pub fn emit(
     stub_poll_addr: u64,
     must_be_boolean_addr: u64,
     alloc_slow_addr: u64,
+    call_primitive_addr: u64,
+    prim_shim: Option<(i64, u8)>,
     guard: Option<EntryGuard>,
     osr: Option<&EmitOsr>,
 ) -> (
@@ -1243,6 +1302,7 @@ pub fn emit(
     let stub_poll_lit = asm.literal_u64(stub_poll_addr, Some(RelocKind::RuntimeAddr));
     let must_be_boolean_lit = asm.literal_u64(must_be_boolean_addr, Some(RelocKind::RuntimeAddr));
     let alloc_slow_lit = asm.literal_u64(alloc_slow_addr, Some(RelocKind::RuntimeAddr));
+    let call_primitive_lit = asm.literal_u64(call_primitive_addr, Some(RelocKind::RuntimeAddr));
 
     if let Some(g) = &guard {
         emit_entry_guard(asm, g);
@@ -1262,6 +1322,7 @@ pub fn emit(
         stub_poll_lit,
         must_be_boolean_lit,
         alloc_slow_lit,
+        call_primitive_lit,
         call_sites: &method.call_sites,
         ic_sites: Vec::new(),
         pos: 0,
@@ -1312,6 +1373,20 @@ pub fn emit(
         for &slot in &regalloc.deopt_nil_init_slots {
             emit_spill_access(e.asm, "str", x(16), slot);
         }
+    }
+
+    // A shimmable primitive is ALWAYS tried before any of the method's own
+    // bytecode runs (Smalltalk's own primitive semantics) — so this needs
+    // no mid-method IR node, just a prologue prefix emitted once, here,
+    // before the block loop below. `current_bci`/`pos` are both still at
+    // their initial 0 (nothing in the IR has executed), which is exactly
+    // right: the resulting SafepointPc's oopmap correctly describes zero
+    // regalloc-tracked live vregs (there are none yet) — the receiver+args
+    // live oops during the call are covered separately, via RootSpill and
+    // `AdapterKind::CallPrimitive` (`memory::roots::real_oop_rootspill_slots`),
+    // not via this frame's own oopmap.
+    if let Some((prim_id, argc_plus_recv)) = prim_shim {
+        e.emit_prim_shim(prim_id, argc_plus_recv, epilogue);
     }
 
     let mut block_pcs = Vec::with_capacity(method.blocks.len());
@@ -1731,7 +1806,7 @@ mod tests {
         let ra = regalloc::regalloc(&method);
         let mut asm = JasmAssembler::new();
         let (_blob, block_pcs, _verified_entry_off, _ic_sites, _safepoints, _osr_off) =
-            emit(&mut asm, &method, &ra, 0, 0, 0, None, None);
+            emit(&mut asm, &method, &ra, 0, 0, 0, 0, None, None, None);
 
         assert_eq!(
             block_pcs.len(),
@@ -1810,7 +1885,7 @@ mod tests {
         let ra = regalloc::regalloc(&method);
         let mut asm = JasmAssembler::new();
         let (blob, _pcs, _verified_entry_off, _ic_sites, _safepoints, _osr_off) =
-            emit(&mut asm, &method, &ra, 0, 0, 0, None, None);
+            emit(&mut asm, &method, &ra, 0, 0, 0, 0, None, None, None);
 
         let mnemonics: Vec<&str> = blob.listing.iter().map(|l| mnemonic(l)).collect();
         let asr_pos = mnemonics.iter().position(|&m| m == "asr");
@@ -1882,7 +1957,7 @@ mod tests {
         let ra = regalloc::regalloc(&near);
         let mut asm = JasmAssembler::new();
         let (blob, _pcs, _verified_entry_off, _ic_sites, _safepoints, _osr_off) =
-            emit(&mut asm, &near, &ra, 0, 0, 0, None, None);
+            emit(&mut asm, &near, &ra, 0, 0, 0, 0, None, None, None);
         let near_mnemonics: Vec<String> = blob.listing.iter().map(|l| mnemonic(l)).collect();
         assert!(
             near_mnemonics.iter().any(|m| m == "ldur"),
@@ -1899,7 +1974,7 @@ mod tests {
         let ra2 = regalloc::regalloc(&far);
         let mut asm2 = JasmAssembler::new();
         let (blob2, _pcs2, _verified_entry_off2, _ic_sites2, _safepoints, _osr_off) =
-            emit(&mut asm2, &far, &ra2, 0, 0, 0, None, None);
+            emit(&mut asm2, &far, &ra2, 0, 0, 0, 0, None, None, None);
         let mnemonics: Vec<String> = blob2.listing.iter().map(|l| mnemonic(l)).collect();
         assert!(
             mnemonics.iter().any(|m| m == "sub"),
@@ -1956,7 +2031,7 @@ mod tests {
         let ra = regalloc::regalloc(&with_barrier);
         let mut asm = JasmAssembler::new();
         let (blob, _pcs, _verified_entry_off, _ic_sites, _safepoints, _osr_off) =
-            emit(&mut asm, &with_barrier, &ra, 0, 0, 0, None, None);
+            emit(&mut asm, &with_barrier, &ra, 0, 0, 0, 0, None, None, None);
         let mnemonics: Vec<String> = blob.listing.iter().map(|l| mnemonic(l)).collect();
         assert!(
             mnemonics.iter().any(|m| m == "stur" || m == "str"),
@@ -1977,8 +2052,18 @@ mod tests {
         let without_barrier = make(false);
         let ra2 = regalloc::regalloc(&without_barrier);
         let mut asm2 = JasmAssembler::new();
-        let (blob2, _pcs2, _verified_entry_off2, _ic_sites2, _safepoints, _osr_off) =
-            emit(&mut asm2, &without_barrier, &ra2, 0, 0, 0, None, None);
+        let (blob2, _pcs2, _verified_entry_off2, _ic_sites2, _safepoints, _osr_off) = emit(
+            &mut asm2,
+            &without_barrier,
+            &ra2,
+            0,
+            0,
+            0,
+            0,
+            None,
+            None,
+            None,
+        );
         let mnemonics2: Vec<String> = blob2.listing.iter().map(|l| mnemonic(l)).collect();
         assert!(
             mnemonics2.iter().any(|m| m == "stur" || m == "str"),
@@ -2048,7 +2133,7 @@ mod tests {
         let ra = regalloc::regalloc(&method);
         let mut asm = JasmAssembler::new();
         let (blob, _pcs, _ve, _ic, _safepoints, _osr_off) =
-            emit(&mut asm, &method, &ra, 0, 0, 0xAABB, None, None);
+            emit(&mut asm, &method, &ra, 0, 0, 0xAABB, 0, None, None, None);
         let listing = blob.listing.join("\n");
         let mnemonic = |l: &str| l.split_whitespace().nth(2).unwrap_or("").to_string();
         let mnemonics: Vec<String> = blob.listing.iter().map(|l| mnemonic(l)).collect();
@@ -2133,7 +2218,7 @@ mod tests {
             resolve_addr: 0x3000,
         };
         let (blob, _pcs, verified_entry_off, _ic_sites, _safepoints, _osr_off) =
-            emit(&mut asm, &method, &ra, 0, 0, 0, Some(guard), None);
+            emit(&mut asm, &method, &ra, 0, 0, 0, 0, None, Some(guard), None);
 
         // `verified_entry_off` must land exactly on the S10-era prologue's
         // own first instruction (`stp x29,x30,...`) -- found empirically in
@@ -2233,7 +2318,7 @@ mod tests {
             resolve_addr: 0x3000,
         };
         let (blob, _pcs, _verified_entry_off, _ic_sites, _safepoints, _osr_off) =
-            emit(&mut asm, &method, &ra, 0, 0, 0, Some(guard), None);
+            emit(&mut asm, &method, &ra, 0, 0, 0, 0, None, Some(guard), None);
 
         let oop_relocs: Vec<&crate::compiler::assembler::Reloc> = blob
             .relocs
@@ -2344,7 +2429,7 @@ mod tests {
         let ra = regalloc::regalloc(&method);
         let mut asm = JasmAssembler::new();
         let (blob, _pcs, _verified_entry_off, ic_sites, _safepoints, _osr_off) =
-            emit(&mut asm, &method, &ra, 0, 0, 0, None, None);
+            emit(&mut asm, &method, &ra, 0, 0, 0, 0, None, None, None);
 
         assert_eq!(
             ic_sites.len(),
