@@ -594,6 +594,27 @@ ports; the benchmarks' own 4-mode gates stay red until these are fixed):
    census over `nm.pcdescs` for slot 41 (the DBGPIC reporter is one
    eprintln away), then the regalloc interval for that vreg.
 
+10. closure_a2_value_dispatch_nlr.mst — S24 A2 value-dispatch fast path +
+    NLR relay. A compiled `callBlock:` invokes a compiled block via a
+    `value:` site that `resolve_target_entry` routed to the shared
+    `stub_value_dispatch[1]` (argc 1); the block does a non-local return
+    (`^i * x`) which originates in the block's own compiled code
+    (`rt_nlr_originate`), returns `NLR_SENTINEL` straight to `callBlock:`'s
+    value site (the stub TAIL-jumped, so the block returns to the site, not
+    through any wrapper), and the site's existing `emit_nlr_check` relays it
+    to the home — "zero new NLR plumbing at the site" (design §2.3). Proves
+    the A2 fast path is taken (MACVM_TRACE=stats: value_dispatch_hits>0) and
+    that the tail-jump's returns-to-the-site contract holds for the NLR
+    case, not just the ordinary-result case.
+
+    Gate: prints "30" three times (i=3 -> ^3*10) under MACVM_JIT=off,
+    threshold=1, and threshold=1 + MACVM_DEOPT_STRESS=64 (the invalidation
+    hammer — block nmethods retired round-robin while the value-dispatch
+    stub probes them, Risk 5's core). The full DEOPT_STRESS=64 x threshold=1
+    world soak is byte-identical to the interpreter, covering the
+    br-into-freed/rewritten-code and wrong-block-with-valid-closure hazards
+    across the whole suite.
+
 All repros above also reproduce (or, for BUG A/C, used to) via the full
 benchmarks:
   MACVM_JIT=threshold=1 ./target/release/macvm run world/bench/richards.mst  --world world

@@ -316,6 +316,20 @@ pub struct VmStats {
     pub ic_patch_declined_cache_full: u64,
     /// S15 A8: Pic→Mega promotions (site went megamorphic).
     pub mega_transitions: u64,
+    /// S24 A2: a compiled `value`-family send site's block-dispatch stub
+    /// tail-jumped straight to a compiled block nmethod (the fast path —
+    /// `rt_value_target` found an Alive `by_block` entry, no interpreter
+    /// crossing). The headline metric that A2 is firing at all: it stays 0
+    /// until a compiled method contains a `value`-family send whose block
+    /// is itself compiled (which, pre-A3, is rare — most `value:` sites live
+    /// in still-interpreted closure creators).
+    pub value_dispatch_hits: u64,
+    /// S24 A2: a `value`-family dispatch stub fell back to interpreting
+    /// `value:` (`rt_value_fallback`) — block not yet compiled, or a
+    /// non-closure/wrong-argc receiver. The fallback's nested interpretation
+    /// still enters an already-compiled block body (via A1's `activate_block`
+    /// hook), so this is not a "slow" path per se, just "not the tail-jump".
+    pub value_dispatch_fallbacks: u64,
     /// S15 A8 (tier balance): successful tier-1 compilations installed
     /// (all levels — `Nmethod.level` is 1 until the policy ladder lands).
     pub compilations: u64,
@@ -351,6 +365,10 @@ pub fn format_vm_stats(vm: &VmState) -> String {
         format!(
             "[stats] ic_patch_declined_cache_full={}",
             s.ic_patch_declined_cache_full
+        ),
+        format!(
+            "[stats] value_dispatch_hits={} value_dispatch_fallbacks={}",
+            s.value_dispatch_hits, s.value_dispatch_fallbacks
         ),
         format!("[stats] compilations={}", s.compilations),
         format!("[stats] recompiles={}", s.recompiles),

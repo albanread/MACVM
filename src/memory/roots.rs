@@ -454,7 +454,17 @@ fn real_oop_rootspill_slots(vm: &VmState, kind: AdapterKind, caller_pc: u64) -> 
             "each_code_root: stub_poll never tags the anchor (S10 D5.6) -- walk_frames must \
              never produce FrameView::Adapter{{kind: Poll, ..}} (see its own module doc)"
         ),
-        AdapterKind::Resolve | AdapterKind::C2i | AdapterKind::Mega | AdapterKind::Dnu => {
+        // S24 A2: `ValueDispatch` joins this arm verbatim — it is reached
+        // from an ordinary `value`-family `Ir::CallSend` site whose own
+        // `IcSite::argc` (`1 + block args`) is EXACTLY the closure+args
+        // RootSpill live count the fallback's nested interpretation may GC
+        // across (`build_stub_value_dispatch`'s own RootSpill layout is the
+        // shared `emit_stub_prologue` x0..x7 spill).
+        AdapterKind::Resolve
+        | AdapterKind::C2i
+        | AdapterKind::Mega
+        | AdapterKind::Dnu
+        | AdapterKind::ValueDispatch => {
             let nm_id = vm.code_table.find_by_pc(caller_pc).unwrap_or_else(|| {
                 panic!(
                     "each_code_root: {kind:?}'s own caller_pc {caller_pc:#x} is not inside any \

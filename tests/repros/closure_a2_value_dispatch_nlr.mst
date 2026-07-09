@@ -1,0 +1,14 @@
+Object subclass: N2 [
+    N2 class >> callBlock: aBlock [
+        ^aBlock value: 10
+    ]
+    N2 class >> find: n [
+        | r |
+        r := 0.
+        1 to: n do: [:i | r := self callBlock: [:x | (i = 3) ifTrue: [^i * x]. x] ].
+        ^r
+    ]
+]
+Transcript show: (N2 find: 5) printString; cr.
+Transcript show: (N2 find: 5) printString; cr.
+Transcript show: (N2 find: 5) printString; cr.

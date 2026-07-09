@@ -55,6 +55,15 @@ pub const KIND_CALL_PRIMITIVE: u64 = 7;
 /// RootSpill live slots = 2 (x0 = closure, x1 = value). See
 /// [`build_stub_nlr_originate`].
 pub const KIND_NLR_ORIGINATE: u64 = 8;
+/// S24 A2 (closure compilation): a compiled `value`-family send site's
+/// direct block dispatch (`docs/closure_compilation_design.md` §2.3). The
+/// stub probes `by_block` for the receiver closure and either tail-jumps
+/// to the block nmethod or falls back to interpreting `value:`. RootSpill
+/// live slots = the caller site's own `IcSite::argc` (`1 + block args`,
+/// exactly as `Resolve|C2i|Mega|Dnu` recover it — the fallback's nested
+/// interpretation can GC while closure+args sit in RootSpill). See
+/// [`build_stub_value_dispatch`].
+pub const KIND_VALUE_DISPATCH: u64 = 9;
 
 /// D5's shared stub skeleton, part 1: anchor + AAPCS frame + RootSpill
 /// (x0..x5). Every stub that calls into Rust starts with this; follow with
@@ -204,6 +213,15 @@ pub struct Stubs {
     /// through the block's own epilogue (`closure_compilation_design.md`
     /// §2.4). See [`build_stub_nlr_originate`].
     pub nlr_originate: CodeHandle,
+    /// S24 A2: the four shared `value`-family block-dispatch stubs, indexed
+    /// by block argc 0..=3 (`value`/`value:`/`value:value:`/
+    /// `value:value:value:`). `resolve_target_entry` patches a compiled
+    /// `value`-family send site's `bl` at one of these instead of the
+    /// generic c2i adapter; the stub probes `by_block` and tail-jumps to
+    /// the block nmethod, or falls back to interpreting `value:`
+    /// (`closure_compilation_design.md` §2.3). See
+    /// [`build_stub_value_dispatch`].
+    pub value_dispatch: [CodeHandle; 4],
     /// S13 D1 §2b: the shared `not_entrant_stub` — a now-`NotEntrant`
     /// nmethod's `entry`/`verified_entry` are patched (by
     /// `nmethod::make_not_entrant`) to `b not_entrant_stub`, so a future call
@@ -256,6 +274,12 @@ impl Stubs {
     /// [`build_stub_nlr_originate`]).
     pub fn nlr_originate_addr(&self) -> u64 {
         self.nlr_originate.base as u64
+    }
+    /// S24 A2: the `value`-family dispatch stub for a block of arity `argc`
+    /// (0..=3) — `resolve_target_entry`'s own patch target for a
+    /// `value`-family site (see [`build_stub_value_dispatch`]).
+    pub fn value_dispatch_addr(&self, argc: usize) -> u64 {
+        self.value_dispatch[argc].base as u64
     }
     /// S13 §2b: the address `make_not_entrant` patches an invalidated
     /// nmethod's `entry`/`verified_entry` to branch to.
@@ -367,6 +391,16 @@ pub fn install(cache: &mut CodeCache) -> Stubs {
         .expect("stubs::install: code cache too small for nlr_originate");
     cache.publish(h12, &nlr_originate_blob);
 
+    // S24 A2: one `value`-family dispatch stub per argc 0..=3.
+    let value_dispatch = std::array::from_fn(|argc| {
+        let blob = build_stub_value_dispatch(argc as u64);
+        let h = cache.alloc(blob.code.len()).unwrap_or_else(|| {
+            panic!("stubs::install: code cache too small for value_dispatch[{argc}]")
+        });
+        cache.publish(h, &blob);
+        h
+    });
+
     Stubs {
         call_stub: h1,
         stub_poll: h2,
@@ -380,6 +414,7 @@ pub fn install(cache: &mut CodeCache) -> Stubs {
         deopt_return: h10,
         call_primitive: h11,
         nlr_originate: h12,
+        value_dispatch,
     }
 }
 
@@ -548,6 +583,30 @@ pub(crate) fn resolve_target_entry(
     method: MethodOop,
     use_verified: bool,
 ) -> u64 {
+    // S24 A2 (design §2.3, review MINOR (a)): a `value`-family send routes to
+    // the shared per-argc block-dispatch stub, NOT a c2i adapter. Placed
+    // FIRST, before the `code_table.lookup` below, so EVERY lattice state
+    // inherits it — a fresh Unresolved site, a Mono re-patch, and each pair
+    // of a PIC promoted after a non-closure receiver all resolve their
+    // `(BlockClosure, value:)` target here identically. (The value
+    // primitives are never compiled as methods — `driver::eligible` rejects
+    // `primitive() != 0` unless shimmable, and 50..=53 are not shimmable —
+    // so the `Some(target_id)` arm below can never fire for them anyway;
+    // this check just makes the routing explicit and lattice-uniform.) A
+    // `super value:` send never reaches here — it goes through
+    // `resolve_super_target_entry`, left untouched, so its interpreted
+    // re-dispatch keeps correct super semantics.
+    let prim = method.primitive();
+    if (50..=53).contains(&prim) {
+        let argc = (prim - 50) as usize; // 50->value(0) .. 53->value:value:value:(3)
+        debug_assert_eq!(
+            selector.as_string().matches(':').count(),
+            argc,
+            "resolve_target_entry: value primitive {prim} vs selector {} arity disagree",
+            selector.as_string()
+        );
+        return vm.stubs.value_dispatch_addr(argc);
+    }
     match vm.code_table.lookup(k, selector) {
         Some(target_id) => {
             let target_nm = vm
@@ -1799,6 +1858,213 @@ pub unsafe extern "C" fn rt_nlr_originate(vm: *mut VmState, closure_bits: u64, v
         value: crate::oops::Oop::from_raw(value_bits),
         closure: Some(closure_oop),
     });
+}
+
+/// S24 A2: a `value`-family send site's block-dispatch stub, one per block
+/// arity `argc` (0..=3) — `closure_compilation_design.md` §2.3. On entry x0
+/// is the receiver closure and x1..x_argc its args (the block calling
+/// convention a normal send marshals). The stub:
+///
+/// 1. `emit_stub_prologue` spills x0..x7 to RootSpill and sets the anchor
+///    (`KIND_VALUE_DISPATCH`) — so the fallback's nested interpretation is
+///    GC-walkable, closure+args covered (`real_oop_rootspill_slots`'s
+///    `ValueDispatch` arm reads the site's own `IcSite::argc`).
+/// 2. Probes [`rt_value_target`] `(vm, closure, argc)` → the block
+///    nmethod's entry, or 0.
+/// 3. Nonzero: restore the registers (`emit_stub_epilogue`) and TAIL-jump
+///    to the block entry — the block returns DIRECTLY to the original send
+///    site (its own `emit_nlr_check` relays an `NLR_SENTINEL` with zero new
+///    plumbing, exactly as for any compiled callee).
+/// 4. Zero: [`rt_value_fallback`] interprets `value:` (byte-identical to a
+///    cold `value:` send — including the block-not-compiled, non-closure,
+///    and wrong-argc cases), returning the result the way `c2i_shared`
+///    does (parked in x16 across the epilogue's own x0 reload).
+///
+/// The argc is baked (per-stub), so neither runtime fn needs a call-site
+/// lookup — the fast path is stub-prologue + one probe + tail-jump.
+fn build_stub_value_dispatch(argc: u64) -> CodeBlob {
+    let mut a = JasmAssembler::new();
+
+    emit_stub_prologue(&mut a);
+    emit_stub_kind_tag(&mut a, KIND_VALUE_DISPATCH);
+    // rt_value_target(vm, closure_bits, argc) -> entry addr or 0.
+    a.emit("mov", &[x(1), x(0)]); // closure_bits -> x1 (x0 was the receiver closure)
+    a.emit("mov", &[x(0), x(28)]); // vm
+    a.emit("movz", &[x(2), imm(argc as i64)]); // argc (baked)
+    let target_lit = a.literal_u64(
+        rt_value_target as *const () as u64,
+        Some(RelocKind::RuntimeAddr),
+    );
+    a.call_far(target_lit);
+
+    let fallback = a.new_label();
+    a.cbz(xr(0), fallback);
+    // Fast path: entry in x0. Park it in x16 (spared by the epilogue's own
+    // x0..x7 reload), restore the closure+args, tail-jump.
+    a.emit("mov", &[x(16), x(0)]);
+    emit_stub_epilogue(&mut a);
+    a.emit("br", &[x(16)]);
+
+    // Fallback: interpret `value:` — NO baked method oop (a shared per-argc
+    // stub cannot carry one without a #93-family staleness bug); the helper
+    // re-resolves `(klass_of(closure), value-selector)` itself.
+    a.bind(fallback);
+    a.emit("mov", &[x(0), x(28)]); // vm
+    a.emit("sub", &[x(1), x(29), imm(ROOTSPILL_BYTES as i64)]); // argv = &RootSpill
+    a.emit("movz", &[x(2), imm(argc as i64)]); // argc (baked)
+    let fallback_lit = a.literal_u64(
+        rt_value_fallback as *const () as u64,
+        Some(RelocKind::RuntimeAddr),
+    );
+    a.call_far(fallback_lit);
+    a.emit("mov", &[x(16), x(0)]); // result -> x16, survives the epilogue's own x0 reload
+    emit_stub_epilogue(&mut a);
+    a.emit("mov", &[x(0), x(16)]); // restore the real result
+    a.emit("ret", &[]);
+
+    a.finish()
+}
+
+/// # Safety
+/// Only ever reached via `blr` from `build_stub_value_dispatch`'s own
+/// hand-assembled listing, never called directly from Rust — `vm` must be
+/// `x28` (D4's invariant, established by `call_stub`). Does NOT allocate and
+/// does NOT run any guest code, so it opens no GC window of its own; the
+/// anchor its caller set is belt-and-braces (the fallback, not this probe,
+/// is what can collect).
+///
+/// The Alive-only `by_block` probe (design §2.3, review §4 BLOCKER): returns
+/// the block nmethod's `entry` ONLY for a genuine closure whose arity
+/// matches the site and whose body is compiled AND Alive. Every other
+/// case — non-closure receiver, wrong argc, uncompiled/NotEntrant/zombie
+/// block — returns 0, routing to [`rt_value_fallback`], which reproduces the
+/// interpreter's exact `value:` semantics (including the resulting error for
+/// the non-closure/wrong-argc cases).
+pub unsafe extern "C" fn rt_value_target(vm: *mut VmState, closure_bits: u64, argc: u64) -> u64 {
+    // SAFETY: this function's own contract, guaranteed by the stub.
+    let vm = unsafe { &mut *vm };
+    debug_assert_ne!(
+        vm.reg_block.last_compiled_fp, 0,
+        "rt_value_target: anchor must be set by the value-dispatch stub's prologue"
+    );
+    let Some(closure) = crate::oops::wrappers::ClosureOop::try_from(Oop::from_raw(closure_bits))
+    else {
+        return 0; // non-closure -> fallback interprets value: (byte-identical error)
+    };
+    let blk = closure.method();
+    if blk.argc() as u64 != argc {
+        return 0; // wrongArgc -> fallback interprets (byte-identical error)
+    }
+    let Some(id) = vm.code_table.lookup_block(blk) else {
+        return 0; // not compiled, or NotEntrant/zombie (lookup_block is Alive-only)
+    };
+    let nm = vm
+        .code_table
+        .get(id)
+        .expect("rt_value_target: lookup_block just returned this id");
+    // A block nmethod has no entry guard (verified_entry == entry, A1), so
+    // either offset is safe to `br` to with x0 = closure.
+    let entry = nm.code.base as u64 + nm.entry_off as u64;
+    vm.stats.value_dispatch_hits += 1;
+    entry
+}
+
+/// # Safety
+/// Only ever reached via `blr` from `build_stub_value_dispatch`'s fallback
+/// branch, never called directly from Rust — `vm` must be `x28`. `argv`
+/// points at the stub's own RootSpill (`1 + argc` live `u64`s: the closure
+/// at `[0]`, its args at `[1..=argc]`), valid for this call only.
+///
+/// The block-not-compiled (and non-closure / wrong-argc) fallback: interpret
+/// `value:` EXACTLY as a cold interpreted send would, by re-resolving the
+/// `value`-family selector for `argc` on the receiver's ACTUAL klass and
+/// running it reentrantly. This funnels a genuine closure straight back into
+/// A1's `activate_block` (which bumps the block's counter, so warmup happens
+/// naturally through the fallback, and enters the compiled body once it
+/// exists); a non-closure or a receiver with no such method DNUs, matching
+/// the interpreter byte-for-byte. Modeled on [`rt_interpret_call`]/[`rt_dnu`]:
+/// the `TierLink::IntoInterpreter` anchor is what an escaping non-local
+/// return (the block does `^`) uses to find the compiled boundary and relay
+/// its `NLR_SENTINEL` back through the original send site.
+pub unsafe extern "C" fn rt_value_fallback(vm: *mut VmState, argv: *const u64, argc: u64) -> u64 {
+    // SAFETY: this function's own contract, guaranteed by the stub.
+    let vm = unsafe { &mut *vm };
+    debug_assert_ne!(
+        vm.reg_block.last_compiled_fp, 0,
+        "rt_value_fallback: anchor must be set by the value-dispatch stub's prologue"
+    );
+    vm.stats.value_dispatch_fallbacks += 1;
+
+    let n = argc as usize;
+    // SAFETY: `argv[0]` is the receiver closure, `argv[1..=n]` its args —
+    // the stub's RootSpill layout (`emit_stub_prologue`'s x0..x7 spill),
+    // read exactly like `rt_dnu`/`rt_call_primitive` read theirs.
+    let receiver = Oop::from_raw(unsafe { *argv });
+    let args: Vec<Oop> = (0..n)
+        .map(|i| Oop::from_raw(unsafe { *argv.add(1 + i) }))
+        .collect();
+
+    // The `value`-family selector is fixed by the baked argc.
+    let sel_name: &[u8] = match argc {
+        0 => b"value",
+        1 => b"value:",
+        2 => b"value:value:",
+        3 => b"value:value:value:",
+        _ => unreachable!("value-dispatch stubs exist only for argc 0..=3, got {argc}"),
+    };
+    let sel = vm.universe.intern(sel_name);
+    let k = klass_of(vm, receiver);
+
+    // `TierLink::IntoInterpreter` around the nested run: the same anchor
+    // `rt_interpret_call` pushes so an escaping NLR finds this C→I boundary
+    // (`compiled_ret_pc` is the original `value:` site's return address, set
+    // as the stub's own `last_compiled_pc`). The reentrant run returns the
+    // ordinary result, or `NLR_SENTINEL` if the block's `^` escaped past
+    // here — which the original send site's `emit_nlr_check` then relays.
+    let scope = crate::memory::handles::HandleScope::enter(vm);
+    let receiver_h = scope.handle(vm, receiver);
+    let sel_h = scope.handle(vm, sel.oop());
+    let k_h = scope.handle(vm, k);
+    vm.tier_links.push(TierLink::IntoInterpreter {
+        compiled_fp: vm.reg_block.last_compiled_fp,
+        compiled_ret_pc: vm.reg_block.last_compiled_pc,
+    });
+    let result = match lookup(vm, k, sel) {
+        Some(method) => crate::interpreter::run_method_reentrant(vm, method, receiver, &args),
+        None => {
+            // DNU — mirror `rt_dnu`'s recipe (Message on a handle-parked
+            // array, `#doesNotUnderstand:` via a full lookup). Reachable
+            // only for a non-closure receiver whose klass has no `value:`
+            // (a mono value-site whose block var was reassigned) — the
+            // interpreter DNUs identically.
+            let array_klass = vm.universe.array_klass;
+            let args_array = crate::memory::alloc::alloc_indexable_oops(vm, array_klass, n);
+            for (i, a) in args.iter().enumerate() {
+                args_array.at_put(i, *a);
+            }
+            let array_h = scope.handle(vm, args_array.oop());
+            let message_klass = vm.universe.message_klass;
+            let msg = crate::memory::alloc::alloc_slots(vm, message_klass);
+            msg.set_body_oop(0, sel_h.get(vm));
+            msg.set_body_oop(1, array_h.get(vm));
+            let sel_dnu = vm.universe.sel_does_not_understand;
+            match lookup(vm, k_h.get(vm), sel_dnu) {
+                Some(dnu_method) => crate::interpreter::run_method_reentrant(
+                    vm,
+                    dnu_method,
+                    receiver_h.get(vm),
+                    &[msg.oop()],
+                ),
+                None => {
+                    let sel_sym = crate::oops::wrappers::SymbolOop::try_from(sel_h.get(vm))
+                        .expect("rt_value_fallback: the value selector is always a Symbol");
+                    crate::runtime::error::dnu_fallback(vm, sel_sym, k_h.get(vm))
+                }
+            }
+        }
+    };
+    vm.tier_links.pop();
+    result.raw()
 }
 
 /// # Safety
