@@ -4572,24 +4572,30 @@ fn compiled_escaping_block_stays_interpreted() {
     b.ret_self();
     let stash = b.finish(&mut vm, stash_sel, 0, 0);
 
-    // Ineligible: the escape pre-pass finds a non-elidable closure site.
+    // S24 A3a: the escaping block `[42]` is non-capturing, transitively
+    // NLR-free, and non-captures_ctx — so it is no longer a reject; the
+    // method compiles with an `Ir::AllocClosure` (real closure + dead-home
+    // sentinel) rather than staying interpreted (was the S14 7-I gate).
     assert!(
-        !driver::eligible(&vm, stash),
-        "a method that stores a closure (escaping) must stay interpreted (7-I gate)"
+        driver::eligible(&vm, stash),
+        "S24 A3a: a method storing an NLR-free non-ctx closure is eligible"
     );
     assert!(
-        driver::compile_method(&mut vm, holder, stash).is_none(),
-        "an escaping-closure method must not compile"
+        driver::compile_method(&mut vm, holder, stash).is_some(),
+        "S24 A3a: the escaping-closure method compiles"
     );
 
-    // The interpreter still runs it: returns self, and instvar0 holds the closure.
+    // Correctness is unchanged: `stash` returns self, and instvar0 holds a
+    // valid closure. (The interpreter path is verified here; the COMPILED
+    // path's closure-construction is covered byte-identically by the world
+    // differential + tests/repros/closure_a3a_*.mst.)
     let obj = alloc::alloc_slots(&mut vm, holder).oop();
     let result = macvm::interpreter::run_method(&mut vm, stash, obj, &[]);
-    assert_eq!(result.raw(), obj.raw(), "interp: `stash` returns self");
+    assert_eq!(result.raw(), obj.raw(), "`stash` returns self");
     let stored = MemOop::try_from(obj).unwrap().body_oop(0);
     assert!(
         macvm::oops::wrappers::ClosureOop::try_from(stored).is_some(),
-        "the escaping closure was stored into instvar0 by the interpreter"
+        "the escaping closure was stored into instvar0"
     );
 }
 
@@ -5437,14 +5443,16 @@ fn deopt_inside_inlined_loop_callee_rebuilds_frames() {
     );
 }
 
-/// SOUNDNESS regression (S14 7-IV-b): a phantom closure whose liveness SPANS an
-/// unrelated safepoint must NOT elide. `stash [ b := [42]. self poke. ^b value ]`
-/// — at the cold `self poke` deopt, the elided closure has no compiled location,
-/// so temp `b` would materialize as nil and the interpreter's `b value` would be
-/// a nil send. The escape analysis now rejects the shape (stays interpreted, and
-/// the interpreter still runs it correctly).
+/// S24 A3a (was S14 7-IV-b's `phantom_live_across_safepoint_stays_interpreted`):
+/// `stash [ b := [42]. self poke. ^b value ]` — a closure live across the
+/// unrelated `self poke` safepoint. Under S14's phantom ELISION this had no
+/// compiled location (a deopt would materialize `b` as nil), so it was
+/// rejected. A3a ALLOCATES the closure as a REAL object in a frame slot — the
+/// exact fix for that hazard: it survives the safepoint (oopmap-covered) and
+/// deopt materializes it via `ValueLoc::FrameSlot`. So the method now compiles;
+/// `^b value` dispatches through A2. Result is `42` either tier.
 #[test]
-fn phantom_live_across_safepoint_stays_interpreted() {
+fn escaping_closure_live_across_safepoint_now_compiles() {
     let mut vm = test_vm();
     install_value_prims(&mut vm);
     let smi_klass = vm.universe.smi_klass;
@@ -5474,10 +5482,12 @@ fn phantom_live_across_safepoint_stays_interpreted() {
     let m = b.finish(&mut vm, sel, 0, 1);
 
     assert!(
-        !driver::eligible(&vm, m),
-        "a phantom live across an unrelated safepoint must NOT compile (deopt would nil it)"
+        driver::eligible(&vm, m),
+        "S24 A3a: an escaping closure live across a safepoint is a REAL \
+         allocated object (survives the safepoint), so it now compiles"
     );
-    // The interpreter is still correct for the same shape.
+    // Correctness unchanged (the compiled path is covered byte-identically by
+    // the world differential + tests/repros/closure_a3a_*.mst).
     let r = macvm::interpreter::run_method(&mut vm, m, SmallInt::new(3).oop(), &[]);
     assert_eq!(r.raw(), SmallInt::new(42).oop().raw());
 }

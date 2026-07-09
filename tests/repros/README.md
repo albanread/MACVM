@@ -615,6 +615,31 @@ ports; the benchmarks' own 4-mode gates stay red until these are fixed):
     br-into-freed/rewritten-code and wrong-block-with-valid-closure hazards
     across the whole suite.
 
+11. closure_a3a_escaping_incrementer.mst — S24 A3a: the first compiled
+    ESCAPING closure. `incrementer [ ^[:x | x + 1] ]` creates a
+    non-capturing, transitively-NLR-free, non-ctx block and RETURNS it (it
+    escapes — a compiled frame cannot be its home). A3a compiles the
+    creator with `Ir::AllocClosure` (a real `BlockClosure` allocated in the
+    compiled frame: method@16, home@24 = the dead-home sentinel, ncopied@32,
+    copied[0]@40 = self, value-captures@48+) instead of rejecting the whole
+    method (the S14 "escaping → interpreted" gate). `run: 5` sums
+    `(incrementer) value: i` for i in 1..5 = 20.
+
+    Gate: prints "20" three times under MACVM_JIT=off AND threshold=1
+    (+ GC_STRESS / DEOPT_STRESS). The full world suite is byte-identical
+    off vs t=1/t=200 with 32 escaping-closure methods (do:, collect:,
+    TestRunner>>report, ...) now compiling.
+
+    Two bugs found during the A3a shakeout (both via the world differential,
+    before the stress matrix): (a) a size-word off-by-one that allocated the
+    closure one word short — `copied[0]=self` stored past the object into
+    eden (silent heap corruption; the isolated repro survived by luck, the
+    world suite crashed in GC); (b) TWO debug-only sp-conservation asserts
+    (`interpret_active`, `enter_compiled`) that did not account for
+    `Smalltalk quit:` stopping the dispatch loop mid-unwind — A3a made
+    `TestRunner>>report` (the sole quit:-ing method) the first COMPILED one
+    to quit through a deopt reexecution. Both gated on `vm.exit_requested`.
+
 All repros above also reproduce (or, for BUG A/C, used to) via the full
 benchmarks:
   MACVM_JIT=threshold=1 ./target/release/macvm run world/bench/richards.mst  --world world

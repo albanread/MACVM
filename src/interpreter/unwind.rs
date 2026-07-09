@@ -213,6 +213,18 @@ pub fn continue_unwind(
         return UnwindStep::Escaped;
     }
     if !home_is_live(vm, home) {
+        // S24 A3a: `proc == 1` is the compiled creator's DEAD-HOME SENTINEL
+        // (`home_dead_sentinel`). Reaching it means an NLR escaped from a
+        // closure the transitive-NLR-free gate should have kept from ever
+        // originating one — a compiler/eligibility bug, not a guest
+        // condition. Turn it into a loud panic instead of a silently-wrong
+        // `#cannotReturn:` (design §2.7). A genuine dead interpreter home has
+        // proc == 0.
+        debug_assert_ne!(
+            home.proc, 1,
+            "NLR through an A3 dead-home closure -- the transitive-NLR-free \
+             eligibility gate was violated"
+        );
         // `Some(step)`: the `cannotReturn:` handler was compiled and itself
         // unwound by a further NLR (see `cannot_return`'s own doc) — the
         // nested unwind's outcome supersedes the plain `CannotReturn`.

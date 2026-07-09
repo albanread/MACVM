@@ -190,13 +190,20 @@ pub fn enter_compiled(vm: &mut VmState, nm_id: NmethodId, argc: u8) -> EnterResu
         ));
     }
 
-    debug_assert_eq!(
-        vm.stack.sp,
-        base + argc_usize + 1,
+    // `exit_requested` exception (S24 A3a): a `Smalltalk quit:` executed
+    // inside this compiled call (or a deopt reexecution of it) stops the
+    // dispatch loop mid-unwind, so `sp` legitimately does NOT return to the
+    // entry watermark — the process is exiting. `vm.stack.sp = base` below
+    // still restores the invariant for the (irrelevant) remainder. Same
+    // exception as `interpret_active`'s own watermark assert.
+    debug_assert!(
+        vm.exit_requested || vm.stack.sp == base + argc_usize + 1,
         "enter_compiled: a completed (non-bailout) compiled call must leave vm.stack.sp exactly \
-         where it entered (every runtime-stub re-entry — c2i, dnu, must-be-boolean — restores \
-         the activation it borrowed, and a GC under the frame rewrites slots in place, never \
-         pushes or pops)"
+         where it entered ({} != {}) (every runtime-stub re-entry — c2i, dnu, must-be-boolean — \
+         restores the activation it borrowed, and a GC under the frame rewrites slots in place, \
+         never pushes or pops)",
+        vm.stack.sp,
+        base + argc_usize + 1
     );
     vm.stack.sp = base;
     push(vm, Oop::from_raw(result_bits));

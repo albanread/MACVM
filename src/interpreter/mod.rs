@@ -330,11 +330,21 @@ pub fn interpret_active(vm: &mut VmState, resume: DeoptResume) -> Oop {
     // The sentinel-stop above truncated sp back to the outermost frame's
     // receiver slot == `base_sp` and deactivated. Cross-check, then restore the
     // ambient outer activation this deopt interrupted.
-    debug_assert_eq!(
-        vm.stack.sp, resume.base_sp,
+    //
+    // EXCEPT when `exit_requested` is set: a `Smalltalk quit:` executed during
+    // the nested run makes `dispatch_from`'s loop STOP EARLY (SPEC §6 — the
+    // loop exits after the current activation returns, but a quit deeper than
+    // the outermost materialized frame stops it mid-unwind), so `sp` legitimately
+    // does NOT reach `base_sp`. The process is exiting imminently; the height is
+    // moot. (S24 A3a surfaced this: `TestRunner class>>report` — the sole
+    // `quit:`-ing method — became the first COMPILED method to quit through a
+    // deopt reexecution once escaping-`do:`-block creators compile.)
+    debug_assert!(
+        vm.exit_requested || vm.stack.sp == resume.base_sp,
         "interpret_active: the nested run must pop back to the base_sp watermark \
-         (the ENTRY_FRAME_SENTINEL stop), not {} (a materializer/height bug)",
-        vm.stack.sp
+         (the ENTRY_FRAME_SENTINEL stop), not {} != {} (a materializer/height bug)",
+        vm.stack.sp,
+        resume.base_sp
     );
     vm.stack.restore_activation(resume.saved_activation);
     vm.regs = resume.saved_regs;

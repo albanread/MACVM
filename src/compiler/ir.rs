@@ -3890,11 +3890,138 @@ impl<'a> Translator<'a> {
                     .expect("nlr_tos: block compilation must carry the closure vreg");
                 code.push(Ir::NlrReturn { closure, value });
             }
-            Instr::PushClosure { .. } => {
-                panic!(
-                    "translate_instr: {instr:?} should have been rejected by driver::eligible \
-                     (D1 / S24 A1's no-PushClosure block gate) -- compiler bug if this fires"
-                )
+            Instr::PushClosure { lit, ncopied } => {
+                // S24 A3a (design §2.7): allocate a REAL BlockClosure for an
+                // ESCAPING site (the escape pass proved it transitively
+                // NLR-free + non-`captures_ctx`; the driver gate accepted M).
+                // Elidable sites never reach here — `translate_site_instr`
+                // handles them as phantoms and returns `Some`. Pure IR
+                // composition: `Ir::Alloc` (which nil-inits the whole body,
+                // emit.rs) + straight-line `StoreField` initializers, no new
+                // emit or stub. Layout (`oops::layout`, `make_closure` is the
+                // interpreter twin): method@16, home@24, ncopied-size@32,
+                // copied[j]@40+8j (copied[0]=self, value-captures @48+).
+                debug_assert!(
+                    self.escape
+                        .as_ref()
+                        .is_some_and(|e| e.is_escaping_site(bci)),
+                    "PushClosure reached translate_instr but is not an escaping A3a site"
+                );
+                let block = MethodOop::try_from(self.method.literals().at(lit as usize))
+                    .expect("push_closure literal is not a CompiledBlock");
+                debug_assert!(
+                    !block.captures_ctx(),
+                    "A3a: an escaping block must be non-captures_ctx (has_ctx is A3b)"
+                );
+                let n_value_captures = ncopied as usize;
+                debug_assert!(
+                    stack.len() >= n_value_captures,
+                    "push_closure: {n_value_captures} value-captures but stack has {}",
+                    stack.len()
+                );
+                let base = stack.len() - n_value_captures;
+                // The captures are ordinary values, never elidable phantoms (a
+                // closure captured into another closure ESCAPES, so the escape
+                // pass never leaves it a live Site here).
+                debug_assert!(
+                    stack_sites[base..].iter().all(|s| s.is_none()),
+                    "push_closure: a value-capture is a phantom block-site"
+                );
+
+                // A `push_closure` deopts by RE-EXECUTING (the interpreter
+                // rebuilds the closure via `make_closure`), so its recorded
+                // stack must still carry the value-captures the bytecode pops —
+                // snapshot BEFORE the truncate below.
+                let deopt_stack = stack.clone();
+                deopt.push((
+                    code.len() as u32,
+                    DeoptRaw {
+                        stack: deopt_stack,
+                        bci,
+                        kind: SafepointKind::Alloc,
+                        reexecute: true,
+                        stack_closures: Vec::new(),
+                        inline: None,
+                    },
+                ));
+
+                // total copied slots = 1 (copied[0]=self) + value captures
+                // (A3a: captures_ctx=false, so no copied[1]=ctx slot). Body =
+                // [method, home, ncopied-size] (3) + copied (`total`);
+                // +HEADER_WORDS(2). Mirrors `alloc_closure`'s own
+                // `words = nis(4) + 1 + total`.
+                let total = 1 + n_value_captures;
+                let size_words = (crate::oops::layout::HEADER_WORDS + 3 + total) as u32;
+                let closure_klass = self.vm.universe.closure_klass;
+                let klass_lit = self
+                    .pool
+                    .intern(closure_klass.oop().raw(), Some(RelocKind::Oop));
+                let dst = self.fresh(true);
+                code.push(Ir::Alloc {
+                    dst,
+                    klass: klass_lit,
+                    size_words,
+                });
+                // method@16
+                let blk_lit = self.pool.intern(block.oop().raw(), Some(RelocKind::Oop));
+                let blk_v = self.fresh(true);
+                code.push(Ir::ConstPool {
+                    dst: blk_v,
+                    lit: blk_lit,
+                });
+                code.push(Ir::StoreField {
+                    obj: dst,
+                    byte_off: 16,
+                    val: blk_v,
+                    barrier: false,
+                });
+                // home@24 = the structurally-dead sentinel (a smi; §2.7)
+                let home_v = self.fresh(false);
+                code.push(Ir::ConstSmi {
+                    dst: home_v,
+                    value: crate::oops::home_ref::home_dead_sentinel().value(),
+                });
+                code.push(Ir::StoreField {
+                    obj: dst,
+                    byte_off: 24,
+                    val: home_v,
+                    barrier: false,
+                });
+                // ncopied-size word@32 = total (a smi; alloc_closure's own
+                // `set_raw_body_word(size_idx, SmallInt::new(ncopied))`)
+                let size_v = self.fresh(false);
+                code.push(Ir::ConstSmi {
+                    dst: size_v,
+                    value: total as i64,
+                });
+                code.push(Ir::StoreField {
+                    obj: dst,
+                    byte_off: 32,
+                    val: size_v,
+                    barrier: false,
+                });
+                // copied[0]@40 = self (the home receiver — M is the home)
+                code.push(Ir::StoreField {
+                    obj: dst,
+                    byte_off: 40,
+                    val: self.self_vreg,
+                    barrier: false,
+                });
+                // copied[1+i]@48+8i = value captures, in stack order (deepest
+                // ⇒ copied[1]), matching `make_closure`'s `set_copied(1+i,
+                // stack[base+i])`. Initializing stores into a fresh young
+                // object ⇒ no card barrier.
+                for i in 0..n_value_captures {
+                    let cap = stack[base + i];
+                    code.push(Ir::StoreField {
+                        obj: dst,
+                        byte_off: (40 + 8 * (1 + i)) as i32,
+                        val: cap,
+                        barrier: false,
+                    });
+                }
+                stack.truncate(base);
+                stack.push(dst);
             }
         }
         // S14 step 7-I: `stack_sites` is resynced to `stack`'s new length by the
@@ -3940,6 +4067,17 @@ impl<'a> Translator<'a> {
             // `stack_sites`; the vreg is never read (its only consumer, the
             // value-send, reads `stack_sites`, not the vreg).
             Instr::PushClosure { .. } => {
+                // S24 A3a: an ESCAPING site allocates a real closure — fall
+                // through (`None`) to `translate_instr`'s main match, which
+                // emits the `Ir::Alloc` + `StoreField` lowering. Only a
+                // proven-ELIDABLE site becomes a phantom here.
+                if self
+                    .escape
+                    .as_ref()
+                    .is_some_and(|e| e.is_escaping_site(bci))
+                {
+                    return None;
+                }
                 stack.push(self.self_vreg);
                 stack_sites.push(Some(bci));
                 Some(None)

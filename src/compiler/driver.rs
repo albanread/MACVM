@@ -261,17 +261,17 @@ fn eligibility_detail(vm: &VmState, method: MethodOop) -> Eligibility {
     };
     let escape = if has_closure {
         let e = crate::compiler::escape::analyze(method);
-        if !e.all_elidable {
-            // Some closure escapes (or is unspliceable) — cannot compile M.
-            // S24 A3a will relax this to also accept escaping sites when
-            // `!method.has_ctx() && e.all_escaping_a3a_compilable(method)`
-            // (the classification + transitive NLR-free scan are already
-            // built and tested in `escape.rs`); the remaining A3a work is the
-            // `Ir::AllocClosure` lowering (`Ir::Alloc` + straight-line
-            // `StoreField` initializers + the dead-home sentinel) and its
-            // deopt-scope wiring. Kept as the ordinary reject until that lands
-            // so the gate never deems a method eligible that `ir::convert`
-            // cannot yet lower.
+        // S24 A3a (design §2.7): an ESCAPING closure is no longer an outright
+        // reject — if M is NOT `has_ctx` and every escaping block is
+        // transitively NLR-free + non-`captures_ctx`, `ir::convert` allocates
+        // a real `BlockClosure` (`Ir::Alloc` + `StoreField` inits, dead-home
+        // sentinel) instead of splicing. `all_elidable` (S14 splice-everything)
+        // still compiles unchanged; the `has_ctx` + escaping-Context case is
+        // A3b (needs the Context prologue + `CtxLoc::Materialized`).
+        let a3a_escaping_ok = !method.has_ctx() && e.all_escaping_a3a_compilable(method);
+        if !e.all_elidable && !a3a_escaping_ok {
+            // An escaping closure a compiled frame cannot yet represent
+            // (has_ctx, or an NLR-bearing / ctx-capturing escaping block).
             return Eligibility::NoPermanent;
         }
         Some(e)
@@ -1631,15 +1631,20 @@ mod tests {
         );
     }
 
-    /// S14 step 7-I: an ESCAPING closure (stored into an instvar → a compiled
-    /// frame cannot be its `home_frame_ref`) keeps the whole method interpreted
-    /// — the "inline-or-gated" soundness boundary.
+    /// S24 A3a (was S14 step 7-I's `eligible_rejects_escaping_closure`): an
+    /// ESCAPING closure stored into an instvar is no longer a reject — the
+    /// block here (`[self]`) is non-capturing, transitively NLR-free, and
+    /// non-`captures_ctx`, so A3a compiles the method with an `Ir::AllocClosure`
+    /// (real closure + dead-home sentinel) instead of keeping it interpreted.
+    /// The reject now applies only to escaping blocks that are NLR-bearing or
+    /// `captures_ctx` (the latter deferred to A3b) — covered by
+    /// `escape.rs`'s own classification tests.
     #[test]
-    fn eligible_rejects_escaping_closure() {
+    fn eligible_compiles_escaping_nlr_free_non_ctx_closure() {
         let mut vm = test_vm();
         let holder = vm.universe.new_klass(
             vm.universe.object_klass,
-            "S14EscapeUnit",
+            "S24A3aEscapeUnit",
             crate::oops::Format::Slots,
             false,
             crate::oops::layout::HEADER_WORDS + 1,
@@ -1656,8 +1661,8 @@ mod tests {
         let method = b.finish(&mut vm, sel, 0, 0);
         crate::runtime::lookup::install_method(&mut vm, holder, sel, method);
         assert!(
-            !eligible(&vm, method),
-            "a stored (escaping) closure keeps the method interpreted (7-I gate)"
+            eligible(&vm, method),
+            "S24 A3a: a stored NLR-free non-ctx closure allocates + compiles"
         );
     }
 

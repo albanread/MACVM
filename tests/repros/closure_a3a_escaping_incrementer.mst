@@ -1,0 +1,9 @@
+Object subclass: A3 [
+    A3 class >> incrementer [ ^[:x | x + 1] ]
+    A3 class >> run: m [
+        | b s | b := A3 incrementer. s := 0.
+        1 to: m do: [:i | s := s + (b value: i) ]. ^s ]
+]
+Transcript show: (A3 run: 5) printString; cr.
+Transcript show: (A3 run: 5) printString; cr.
+Transcript show: (A3 run: 5) printString; cr.
