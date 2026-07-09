@@ -60,9 +60,17 @@ Gate: DeltaBlue >= 5x, interpreted tail < 10%, no richards/fib regression (§4).
 
 ### 1.1 Object model: CompiledBlock and BlockClosure (SPEC §4.4, §5.4)
 
-- A `CompiledBlock` is a full CompiledMethod object with `is_block=1`; its `holder` is the
-  **home method**, not a class (`docs/SPEC.md:339-341`). It has its own `literals`, its own
-  `ics` Array, and — critically for triggers — its own `counters` word. Flags word packs
+- A `CompiledBlock` is a full CompiledMethod object with `is_block=1`. **[REVIEW
+  CORRECTION §2b]** Its `holder` is the **KLASS**, not the home method:
+  `install_method` runs `patch_block_holders` (`src/runtime/lookup.rs:210-226`), which
+  recursively stamps the installing klass into every CompiledBlock reachable through the
+  method's literal pool — precisely so super sends inside blocks resolve
+  (`ic::resolve` reads `caller.holder()` where caller is the executing CompiledBlock,
+  `ic.rs:176-196`). SPEC.md:339-341's "holder is the home method" is STALE against the
+  code (separate SPEC correction to file). Consequence: there is NO in-object path from
+  a CompiledBlock to its home method — nothing in this design may assume one. It has
+  its own `literals`, its own `ics` Array, and — critically for triggers — its own
+  `counters` word. Flags word packs
   `argc:4 | ntemps:8 | nctx:8 | has_ctx:1 | captures_ctx:1 | is_block:1 | prim_fails:1`
   (`docs/SPEC.md:331-332`).
 - `BlockClosure { method, home_frame_ref, copied[] }` (`docs/SPEC.md:413-424`). Pinned
@@ -312,12 +320,16 @@ methods above run fully interpreted. That combination is the 16.3% tail.
   "entry-sentinel spoof around an Activated primitive" makes this nest correctly). The
   klass guard is USELESS for discrimination — every closure is a `closure_klass` instance,
   so the site is permanently "mono" while dispatching arbitrarily many distinct blocks.
-- One open verification item found while reading: `Ir::Bailout` still lowers to "return
-  `BAILOUT_SENTINEL` through the epilogue" (`emit.rs:1643-1649`), and only
-  `enter_compiled` checks that sentinel (`compiled_call.rs:150`) — compiled send sites
-  check NLR only. §2.3 therefore forbids block nmethods from containing `Ir::Bailout` at
-  all (traps instead), and slice 2's pre-work includes confirming how (or whether)
-  bailing nmethods are ever linked compiled-to-compiled today.
+- ~~One open verification item~~ **RESOLVED by review §7**: `Ir::Bailout` is ALREADY
+  never constructed by `convert()` — the dead-block placeholder is `Ir::RetSelf`
+  (`ir.rs:5016`; the comment at `ir.rs:4990` mentioning "trivial Ir::Bailout blocks" is
+  stale), and an existing test asserts the invariant outright ("Ir::Bailout must never
+  be constructed by convert()", `ir.rs:5725-5730`, standing since S14 step 3 made smi
+  fail paths UncommonTraps). So no current nmethod can return `BAILOUT_SENTINEL`
+  mid-body; `EnterResult::Bailout` is legacy belt-and-braces, and §2.1's
+  no-bailout-in-block-IR rule is simply the existing global invariant made explicit.
+  Keep the `compile_block` assert and cite the existing test; no slice-2 pre-work
+  needed.
 
 ## 2. Phase A — compiled block bodies + compiled value: dispatch
 
@@ -369,11 +381,18 @@ CompiledBlock. Two consequences:
 
 - *Registry*: `code_table.by_key` is (klass, selector)-keyed; block nmethods instead
   register in a new `CodeTable::by_block: HashMap<u64 /*CompiledBlock oop bits*/,
-  NmethodId>`, with entries (a) removed on flush exactly where `by_key` entries are
-  removed, and (b) **rehashed after every moving GC** — the AdapterTable S15 #93 lesson
-  (`docs/prim_shims.md` context; MEMORY: "c2i-adapter cache keyed by raw method-oop bits,
-  never rehashed" was a silent wrong-selector bug). Mirror the adapters' now-fixed rehash
-  hook, same GC phase.
+  NmethodId>`. **[AMENDED per review §4]** Lifecycle mirrors `by_key` EXACTLY:
+  (a) entries are unhooked in `set_not_entrant` (`nmethod.rs:664-680`) under the same
+  successor guard (only remove if the entry still names this id — recompilation
+  installs the replacement FIRST), NOT "on flush" (by_key is unhooked at invalidation
+  time; a NotEntrant nmethod is never in either table); (b) keys are **rehashed under
+  both collectors** by riding `CodeTable::update_keys`/`rehash` (`nmethod.rs:695-800`
+  — scavenge passes its scavenge_oop closure, full GC passes forward_chase), which is
+  the REAL raw-oop-key precedent. (The review corrected this design's earlier claim:
+  AdapterTable's #93 fix was verify-on-hit, and its keys are still never rehashed —
+  verify-on-hit alone would leak here via address-reuse false-hits orphaning nmethods,
+  so by_block rides the CodeTable phases; optionally ALSO verify-on-hit against the
+  nmethod's pool word as defense in depth, plus a debug validate pass after full GC.)
 - *Liveness*: the block nmethod's oop pool holds the CompiledBlock (methods already ride
   pools — `Nmethod::oops_do`, `nmethod.rs:485+`), keeping it alive while the code lives.
   No `key_klass` weakness games needed: `is_block` nmethods simply skip the S12 D5
@@ -391,16 +410,46 @@ CompiledBlock. Two consequences:
   sentinel "no customization" klass; every fusion decision that would consult
   `rcvr_klass` for self-sends must see "unknown" (self-sends stay generic sends in block
   bodies, v1).
+- *Super-sends inside B* **[ADDED per review §2b — a hidden win]**: work through the
+  standard path with NO new machinery, because `patch_block_holders` stamps the KLASS
+  into every installed CompiledBlock's holder (§1.1 correction) — `ir.rs:2918-2921`'s
+  `KlassOop::try_from(self.method.holder())` succeeds for block compilations exactly as
+  for methods. Sound without an entry klass guard: super lookup start is site-static
+  (`holder.superclass()`, ic.rs:176-180), and instvar layouts are prefix-stable down
+  the subtree — the same argument that makes instvar access guard-free above. (Edge,
+  pre-existing: a block in a never-installed doIt has an unpatched holder and a super
+  send there panics the interpreter TODAY, ic.rs:189-190 — not this design's problem;
+  the eligibility scan may simply decline `send_super` when
+  `KlassOop::try_from(holder)` fails.)
 
 **Invocation counting + trigger.** `activate_block` already bumps B's own invocation
 counter on every activation (`blocks.rs:57`), from BOTH doors (interpreted `value:` sends,
 and compiled `value:` sends that today detour through c2i → `rt_interpret_call` →
 `try_primitive` → `activate_block`). The trigger mirrors `activate_method`'s: in
 `activate_block`, after `bump_invocation`, if `JitMode::Threshold(n)` and counter >= n and
-!B.compile_disabled(), call `compile_block(vm, B)`; on success, enter compiled immediately
-(below); on `NoPermanent`, set `compile_disabled` so the check never re-fires. Placing the
-trigger in `activate_block` (not at value-send sites) gets every call path for free and
-needs no IC-shape changes.
+!B.compile_disabled(), **first probe `by_block` for an existing Alive nmethod and reuse
+it** (the send.rs:203-207-style reuse-Alive check — without it, invalidation churn under
+DEOPT_STRESS re-compiles storms), else call `compile_block(vm, B)`; on success, enter
+compiled immediately (below); on `NoPermanent`, set `compile_disabled` so the check never
+re-fires. Placing the trigger in `activate_block` (not at value-send sites) gets every
+call path for free and needs no IC-shape changes.
+
+**Recompile-on-trap for block nmethods** **[ADDED per review §5 — A1 scope, not
+optional]**: `rt_uncommon_trap` → `note_uncommon_trap` (`recompile.rs:42`) resolves the
+method via `lookup(nm.key_klass, nm.key_selector)` on every LIMIT-th trap — meaningless
+for a block nmethod (filler key → early return → a trap-dense block, which §2.1's
+no-Bailout rule guarantees, re-traps FOREVER; or worse, a filler that accidentally
+resolves version-churns an unrelated method). `note_uncommon_trap` must branch on
+`nm.is_block` BEFORE the key lookup: resolve B from the nmethod's own oop pool,
+`snapshot_profile` over B's own ics (works unchanged — blocks own their `ics`,
+blocks.rs:579-587), recompile via `compile_block_versioned` (install-first into
+by_block, then `make_not_entrant_lazy` the old one — mirroring recompile.rs:88-107).
+The nmethod gains an `is_block` flag (or the filler key is a documented sentinel value
+that `lookup()` can never resolve); `key_selector` for a block nmethod naturally holds
+the `#aBlock` placeholder (builder.rs:597) — fine once the branch exists. Also note:
+block-internal loops never OSR (`rt_osr_request`'s dispatch-truth guard, osr.rs:94, can
+never hold for the placeholder selector) — acceptable for the gate; a trap-then-
+reinterpret loopy block tiers back up only at its next `value:`.
 
 **Entering compiled block code from the interpreter.** `enter_compiled`
 (`compiled_call.rs:61-200`) already does EXACTLY the right thing: it reads
@@ -413,10 +462,12 @@ is invoked as `enter_compiled(vm, nm_id, argc)` with zero changes to that functi
 fn prim_valueN(vm, args):
     closure = ClosureOop::try_from(args[0])?          // unchanged
     blk = closure.method()
-    if blk.argc() != N: return Fail                    // unchanged semantics
-    if let Some(nm) = vm.code_table.by_block(blk):     // NEW fast path
+    if blk.argc() != N: return Fail                    // unchanged semantics; argc check
+                                                       // BEFORE the by_block probe (tier
+                                                       // consistency, review §7)
+    if let Some(nm) = vm.code_table.by_block(blk):     // NEW fast path — Alive ONLY
         match enter_compiled(vm, nm, N) {
-            Completed  => return Ok(top-of-stack result convention)
+            Completed  => return Ok(vm.stack.pop())    // see stack-discipline note
             Bailout    => fall through to activate_block (restart-from-bci-0 is sound:
                           the block prologue is pure loads)
             Nlr(step)  => return the new PrimResult::Nlr(step)   // see below
@@ -426,6 +477,23 @@ fn prim_valueN(vm, args):
 
 Two integration notes:
 
+- **Stack discipline of the Completed arm [PINNED per review §1a/§2a]**:
+  `enter_compiled` on Completed has ALREADY done `vm.stack.sp = base; push(result)`
+  (compiled_call.rs:197-198) — receiver+args gone, result deposited. `prim_valueN`
+  therefore POPS the deposited result and returns it as `PrimResult::Ok(popped)`;
+  `try_primitive`'s Ok arm then restores `vm.stack.sp = base` ABSOLUTELY (an index
+  computed before the prim ran, send.rs:96-106) and the dispatch pushes the value —
+  net effect exactly correct. This correctness hangs on (a) the restore being absolute,
+  not relative, and (b) nothing allocating between the pop and the push — pin BOTH with
+  a comment + debug_assert at the prim_valueN site, and cover with a differential whose
+  result is consumed immediately (`(blk value: x) + 1`). The new `PrimResult::Nlr` arm
+  must NOT go through the `sp = base` path at all (after an NLR the stack belongs to a
+  different activation) — `try_primitive` gains a fourth `PrimitiveOutcome` arm that
+  touches nothing, and `run_method`'s try_primitive caller (send.rs:51-69) gets the
+  same mapping. All arms are exhaustive-match-enforced; the full ripple list is:
+  `try_primitive`, `run_method`/`run_method_reentrant`, and `rt_call_primitive`
+  (codecache/stubs.rs), which gets
+  `Nlr(_) => unreachable!("50-54/60-61 are PRIM_ACTIVATES_FRAME-excluded")`.
 - `PrimResult` gains an `Nlr(UnwindStep)` arm, produced ONLY here. The prim call sites in
   `interpreter::send` already handle `SendOutcome::Nlr` for the compiled-send path (S11
   step 7's fixes, cited at `driver.rs:171-182`); this arm maps onto the same handling.
@@ -436,8 +504,19 @@ Two integration notes:
   unconditionally: it arms the handler as a marker on the protected block's interpreter
   frame (`primitives.rs:1038-1043`); a compiled activation has no marker slot. Split
   `activate_block` into the public trigger-bearing entry (used by prims 50-53) and
-  `activate_block_interp` (used by 54/60/61 and by the deopt/fallback paths). Blocks
-  invoked under `ensure:` run interpreted in v1 — correct, just not accelerated.
+  `activate_block_interp` (used by everything else). **[AMENDED per review §2a — the
+  split must route ALL EIGHT callers explicitly; two were previously unlisted and are
+  correctness-critical]**: prims 50-53 (primitives.rs:966,973,980,987) → trigger-bearing
+  entry; prim 54 (:1010), prims 60/61 (:1038), AND the two unwind.rs handler
+  activations — `intercept_ensure_return` (unwind.rs:131) and `continue_unwind`'s
+  Marked arm (unwind.rs:228) — → `activate_block_interp`, ALWAYS. The unwind sites set
+  `vm.regs.bci = BCI_RESUME_ENSURE_RET / BCI_RESUME_UNWIND` immediately before the call
+  so the new frame's saved_bci carries the resume sentinel (blocks.rs:66-68); a
+  compiled handler activation would have no interpreter frame to carry it — the parked
+  result/token would be orphaned and dispatch would resume at a sentinel bci (stack
+  corruption, loud at threshold=1). Handler activations stay interpreted in this arc,
+  same rationale as 60/61's marker arming. Blocks invoked under `ensure:` run
+  interpreted in v1 — correct, just not accelerated.
 
 ### 2.2 Calling convention for a compiled block
 
@@ -507,10 +586,20 @@ stub_value_dispatch (kind tag KIND_VALUE_DISPATCH, one per argc 0..3 or argc in 
    `value:` bytecode-fallback error semantics, byte-for-byte).
 2. `blk = closure.method(); blk.argc() != argc` → 0 (wrongArgc → same interpreted error
    path).
-3. `by_block.get(blk)` → `Some(nm)` with `nm.state` Alive-or-NotEntrant → return
-   `nm.entry` (NotEntrant's patched entry routes to the deopt path by design — the same
-   self-healing property `enter_compiled` relies on, `compiled_call.rs:85-97`).
-   Else → 0. Optionally: bump B's invocation counter here on the fallback path so warmup
+3. `by_block.get(blk)` → `Some(nm)` **with `nm.state == NmState::Alive` ONLY** →
+   return `nm.entry`. Anything else → 0 (interpret). **[AMENDED per review §4 BLOCKER
+   — the previous "Alive-or-NotEntrant, patched entry routes to the deopt path" was a
+   misreading of two mechanisms and would abort the VM (A1 door: not_entrant_stub is a
+   RESOLVE stub, stubs.rs:858-876, whose rt_resolve_send panics on a non-send-site
+   return address) or livelock (A2 door: entry→resolve→re-route→entry cycle).
+   `enter_compiled` has NO NotEntrant self-healing; its callers guarantee Alive
+   (send.rs:319-330, :203-207).]** With the §2.1 amendment, a NotEntrant nmethod is
+   never IN by_block at all (unhooked in set_not_entrant under the successor guard), so
+   the Alive check is belt-and-braces; in-flight activations of an invalidated block
+   nmethod drain via the standard §2c return-redirect + §2d poll paths, which operate
+   on frames and return addresses, not entries. Drained blocks recompile via the
+   activate_block counter trigger (with its reuse-Alive check).
+   Optionally: bump B's invocation counter here on the fallback path so warmup
    works even for blocks only ever invoked from compiled sites (mirrors the c2i escape
    hatch's rationale, `stubs.rs:1174-1189`).
 
@@ -547,6 +636,20 @@ Redefinition/recompilation coherence: the site never caches the block entry (it
 re-probes every call), so `make_not_entrant(block nm)` takes effect on the NEXT probe
 with no site patching; in-flight activations drain via the standard poll/return-redirect
 deopt paths. The one hazard (probe-to-`br` window vs invalidation) is Risk 5 in §5.
+**[ADDED per review §4 MINORs]** (a) The value-family routing check
+(selector ∈ {value..value:value:value:} ∧ target primitive ∈ {50..53}) must live in
+`resolve_target_entry` (stubs.rs:520-549) — not only in rt_resolve_send's Unresolved
+arm — so every lattice state (mono re-patch, PIC promotion after a non-closure
+receiver) inherits it; otherwise a site that ever goes poly silently falls back to c2i
+forever. (b) The stub's fallback bakes NO method oop (a shared per-argc stub cannot
+carry a per-method pool word the way c2i adapters do — a baked-but-unmaintained oop is
+a #93-family bug): the fallback calls a Rust helper that re-looks-up
+(klass_of(x0), selector) itself before `rt_interpret_call`, which re-validates
+dispatch truth anyway (stubs.rs:1107-1149). (c) Live-edit leak, accepted + observable:
+redefining a method M does NOT invalidate the block nmethods of M's OLD literal frame
+(semantically correct — old closures must keep running old code), so they are immortal
+until flush; add a MACVM_TRACE=jit counter (`block_nmethods_orphaned`) so churn under
+browser live-edit is visible rather than silent.
 
 ### 2.4 NLR from a compiled block
 
@@ -570,11 +673,28 @@ emit:  x0 = closure vreg, x1 = value vreg
        bl  stub_nlr_originate          ; anchor + kind tag; RootSpill live = 2 (x0, x1)
        ; rt_nlr_originate(vm, closure_bits, value_bits):
        ;     debug_assert!(vm.nlr_state.is_none())    // enter_compiled:64-68 precedent
-       ;     vm.nlr_state = Some(NlrState { home: unpack(closure.home()), value })
+       ;     vm.nlr_state = Some(NlrState { home: unpack(closure.home()), value,
+       ;                                    closure: Some(closure) })   // review §2 BLOCKER
        ;     no allocation, no lookup, no GC window
        x0 = NLR_SENTINEL
        b   epilogue
 ```
+
+**[AMENDED per review §2 BLOCKER — the originating closure MUST ride the escape.]**
+`cannot_return_current_closure` (unwind.rs:374-380) reads the closure from the CURRENT
+frame's receiver-arg slot and `.expect`s a Closure — sound today only because
+interpreted `nlr_tos` runs inside the block's own frame. With compiled origination the
+block's native frame is GONE by the time `continue_unwind` runs the liveness check; the
+current interpreter frame is the value:-SENDER's, whose receiver-arg is almost never a
+Closure — `m value` after `makeBlock ^[^1]`'s home returned would PANIC the VM in
+release (or silently send #cannotReturn: to a wrong closure). Fix: `NlrState` gains an
+`Option<ClosureOop>` (parked only by rt_nlr_originate; interpreted origination leaves
+it None and is untouched); `continue_unwind`'s dead-home arm calls the EXISTING public
+`cannot_return(vm, closure, value)` (unwind.rs:391) when a parked closure is present,
+falling back to `cannot_return_current_closure` otherwise. NlrState is not a GC root
+today and stays that way — the no-alloc-in-transit contract (compiled_call.rs:170-178)
+covers the added oop for exactly the same reason it covers `value`. Repro (3) in §4
+MUST exercise this compiled-block dead-home path specifically.
 
 The block's native frame unwinds through its own ordinary epilogue carrying the sentinel;
 every compiled frame above relays via its existing per-site check
@@ -587,7 +707,7 @@ there the four required cases are EXISTING behavior, not new code:
 |---|---|
 | home interpreted + live | `continue_unwind` scan → `ReachedHome` → `pop_frames_above` + `do_return` (`unwind.rs:185-189`) |
 | home interpreted + live, ensure:/ifCurtailed: between | scan reports `Marked` before boundaries (`unwind.rs:311-315`); handlers run innermost-first with UnwindTokens; re-escapes re-park (`unwind.rs:211-235, 246-267`) |
-| home dead (returned before the block ran) | `home_is_live` fails → `cannot_return_current_closure` → `#cannotReturn:` (`unwind.rs:176-184, 374-406`). Note the interpreter reads the closure from the current frame's receiver slot — on this path the current frame IS an interpreter frame (the unwind resumes interpreter-side), so that read is unchanged |
+| home dead (returned before the block ran) | `home_is_live` fails → **the parked `NlrState.closure` routes to `cannot_return(vm, closure, value)` directly** (amendment above — the current-frame receiver-slot read is WRONG for compiled origination; the sender's frame is current, not a block frame) → `#cannotReturn:` (`unwind.rs:176-184, 374-406`) |
 | home compiled | **cannot occur in A1-A3** (above). A4 sketch below |
 | ensure: BETWEEN two compiled frames | impossible — prims 60/61 are interpreter-only (§2.6), so markers live only on interpreter frames, which sit in interpreter segments the scan already covers |
 
@@ -599,7 +719,11 @@ unwinding re-parks state only AFTER the previous state was consumed by `continue
 **BlockCannotReturn timing**: the interpreter delays the liveness check until
 `continue_unwind` runs it; the compiled origination does the same (park + sentinel without
 checking) — liveness is evaluated exactly once, at the same point in the sequence the
-interpreter evaluates it. No behavioral drift for the differential tests to catch.
+interpreter evaluates it. The VALUE of the check is timing-identical; what differed —
+and what the amendment above fixes — was the CONTEXT of the failure handler (which
+frame is current when the check fails), which `cannot_return_current_closure` depended
+on. With the parked closure, the handler no longer reads frame context at all on the
+compiled-origination path.
 
 **A4 sketch (deferred, for the record)**: a compiled home would need (a) a frame serial
 stamped into a fixed spill slot at prologue of any closure-creating compiled method,
@@ -607,8 +731,12 @@ stamped into a fixed spill slot at prologue of any closure-creating compiled met
 sentinel arrival at any site, compares `vm.nlr_state.home` against its own (serial, fp)
 and either consumes-and-delivers (x0 = value → epilogue) or keeps relaying, and (d) deopt
 of the home preserving the ORIGINAL serial in the materialized frame so parked HomeRefs
-stay valid. It is ~a sprint of its own; nothing in the DeltaBlue gate needs it
-(`inputsKnown:` is reached via Phase B splicing instead, §3).
+stay valid. It is ~a sprint of its own. **[AMENDED per review §5a]** The gate case for
+cutting it is the residual-tail argument, NOT "inputsKnown: via Phase B" (B4 cannot
+splice inputsKnown:'s multi-basic-block body — §3): under A1+A2, inputsKnown:'s BLOCK
+compiles standalone (A1 allows NlrTos + multi-BB) and `inputsDo:` compiles; only the
+small creator method stays interpreted (push_closure + one send + returns), a bounded,
+named residual in §4's tail arithmetic.
 
 ### 2.5 Deopt correctness for block frames
 
@@ -703,8 +831,17 @@ The six DeltaBlue orchestrators stay interpreted under A1+A2 (they trip the esca
 §1.6). A3 opens `eligibility_detail` for a method M with escaping closures when EVERY
 escaping closure site s in M satisfies:
 
-- the block B_s (and transitively any blocks IT creates — vacuous in v1 since block
-  bodies with `PushClosure` don't compile anyway) contains NO `NlrTos`;
+- the block B_s — **and transitively every block reachable through B_s's `PushClosure`
+  literals** — contains NO `NlrTos`. **[AMENDED per review §2 MAJOR: the transitive
+  scan is LOAD-BEARING, not vacuous.]** Whether B_s itself compiles is irrelevant: an
+  interpreted B_s still creates its inner blocks, and `home_ref_for_new_closure`
+  (blocks.rs:186-204) copies the enclosing closure's home VERBATIM when the current
+  frame is a block frame — so an A3 dead-home sentinel would propagate into a nested
+  `[:y | ^y]`'s home, turning a legal NLR (M's compiled frame still live!) into
+  `cannotReturn:` in release / the debug assert's panic. The scan is statically
+  decidable and cheap: `PushClosure <lit>` names a CompiledBlock literal, so recurse
+  through the literal tree (B_s's literals → inner CompiledBlocks → their bytecode)
+  looking for `NlrTos`; memoize per CompiledBlock;
 - B_s is otherwise arbitrary (multi-basic-block bodies are FINE — B_s is not being
   spliced, it runs as its own A1 nmethod or interpreted; `block_is_spliceable` is NOT the
   gate here);
@@ -731,7 +868,13 @@ sites the escape pass marks escaping:
   materializer** (`scopes.rs:337`, `deopt.rs:734-737`); S13 built it, S14 just never
   emitted it. The driver's `has_ctx && escape.is_none()` reject (`driver.rs:277-279`) and
   the all-elidable requirement (`driver.rs:262-267`) relax accordingly: has_ctx compiles
-  when (elidable ∨ NLR-free-escaping) covers every site.
+  when (elidable ∨ NLR-free-escaping) covers every site. **[PINNED per review §5]**:
+  the SEPARATE OSR guard at `driver.rs:601` (`osr_bci.is_some() && (has_ctx ||
+  method_has_closure)` → decline) **STAYS UNTOUCHED** — it is not part of this
+  relaxation. Removing it would let an OSR entry bind a compiled ctx_vreg to a FRESH
+  Context while live closures alias the interpreted frame's old one — Risk 2's
+  world-split, in the flagship benchmark (`removePropagateFrom:` = whileTrue: +
+  escaping closures = an OSR trigger the day A3 lands).
 - The materializer needs NO ElidedClosure for these sites — the closure is a real object
   in a real slot; `ValueLoc::FrameSlot` covers it.
 
@@ -793,16 +936,24 @@ each one small, each independently testable:
   No "real send on the slow path" variant in v1: a real send would need the closure to
   EXIST on that path, i.e. partial escape — trap-and-materialize sidesteps that whole
   problem and matches the project's Self-style lazy-cold-path posture (`driver.rs:407-418`).
-- **B4 — NLR blocks with sends, spliced.** `inputsKnown:`'s block (`^false` + sends)
-  trips `has_nlr && has_send` (`escape.rs:170-178`) because a deopt inside the spliced
-  block would hand the interpreter an `nlr_tos` with no real closure. With A1's
-  materializer extension in hand the fix is mechanical: record the block's receiver-slot
-  as `ValueLoc::ElidedClosure` in the spliced `is_block` scope, so ANY deopt inside it
-  materializes a real closure whose `home = (root fp, serial)` — and root IS the home for
-  a spliced block (`deopt.rs:146-147`) — making the interpreted `nlr_tos` sound. The
-  spliced fast path's own NLR remains what 7-III already does: a branch to the root's
-  epilogue (`sprint_s14_detail.md` step 1: "assign result vreg of H + branch to H's
-  epilogue"), with the same ensure:-decline rule.
+- **B4 — deopt-soundness for spliced NLR blocks** **[RESCOPED per review §5a — B4 does
+  NOT unlock `inputsKnown:`]**: removes the `has_nlr && has_send` gate
+  (`escape.rs:170-178`) — a deopt inside a spliced NLR block currently would hand the
+  interpreter an `nlr_tos` with no real closure. With A1's materializer extension in
+  hand the fix is mechanical: record the block's receiver-slot as
+  `ValueLoc::ElidedClosure` in the spliced `is_block` scope, so ANY deopt inside it
+  materializes a real closure whose `home = (root fp, serial)` — and root IS the home
+  for a spliced block (`deopt.rs:146-147`) — making the interpreted `nlr_tos` sound.
+  The spliced fast path's own NLR remains what 7-III already does: a branch to the
+  root's epilogue, with the same ensure:-decline rule. **What B4 does NOT do**:
+  `inputsKnown:`'s block is MULTI-basic-block (or:/ifFalse: chains,
+  deltablue.mst:322-324) and `block_is_spliceable` rejects it at `escape.rs:140`
+  (`cfg.blocks.len() != 1`) BEFORE the gate B4 removes — and single-BB is structural
+  across every splice mechanism (ir.rs:1259, :1536-1542, :3446). Widening that is a
+  real compiler-construction chunk (nested CFG inlining at an interior value: site) —
+  a possible future B5, NOT in this arc. `inputsKnown:` in the committed scope: its
+  block compiles standalone via A1, `inputsDo:` compiles, and its small creator method
+  stays interpreted — the named residual in §4's tail arithmetic.
 
 **Why B composes with A rather than replacing it**: B erases closure + dispatch + frame
 for the MONO/dominant fast path of each caller×iterator pair, but every path B cannot
@@ -836,7 +987,7 @@ HOME) is what gets cut, and it is cut from the whole arc (A4), not just the firs
 
 | slice | contents | lands when |
 |---|---|---|
-| A1 | block eligibility + `compile_block` + by_block registry (with GC rehash) + convention prologue + root-is_block materializer arm + `Ir::NlrReturn`/`rt_nlr_originate` + `prim_value0..3` enter-compiled hook + `activate_block_interp` split for 54/60/61 | tests below green |
+| A1 | block eligibility + `compile_block` + by_block registry (unhook in set_not_entrant; rehash via CodeTable::update_keys/rehash) + convention prologue + root-is_block materializer arm + `Ir::NlrReturn`/`rt_nlr_originate` (NlrState carries the closure) + `prim_value0..3` enter-compiled hook (Alive-only probe; PrimResult::Nlr + PrimitiveOutcome 4th arm ripple) + `activate_block_interp` split routing ALL 8 callers (54/60/61 + unwind.rs:131/:228) + `note_uncommon_trap` is_block branch + `compile_block_versioned` + per-method tail attribution | tests below green |
 | A2 | `stub_value_dispatch` + `rt_value_target` + `KIND_VALUE_DISPATCH` walker/roots arm + value-family site resolution routes to it | A1 soaked |
 | A3 | `Ir::AllocClosure` + dead-home sentinel + `CtxLoc::Materialized` emission + eligibility relax (NLR-free escaping sites) | A2 soaked |
 | B1-B4 | escape.rs widenings per §3, each its own commit | A-series soaked; B1 first (flagship unlock), then B2 (budget, measured), B3, B4 |
@@ -874,10 +1025,15 @@ warm 62ms = 3.4x; this doc's fresh run: off 265ms/102.9M bytecodes, warm 71ms/16
 
 1. **DeltaBlue >= 5.0x** interp/best (perf.sh table row).
 2. **Interpreted tail < 10%**: `MACVM_TRACE=count` bytecodes at `MACVM_JIT=off` vs warm
-   threshold run; warm/off < 0.10 (today 0.163). Track per-slice: A1 should cut the
-   block-body share; A3 the orchestrator share; B the remainder. If the tail stalls above
-   10% with A+B landed, re-run the §1.6 census before reaching for A4 — the residue names
-   itself.
+   threshold run; warm/off < 0.10 (today 0.163). **[ADOPTED per review §6 — must-do
+   during A1, not optional]**: add per-METHOD interpreted-bytecode attribution (a
+   counter keyed by the executing method under MACVM_TRACE=count, ~2h) so the tail
+   split — block bodies vs orchestrator bodies vs warmup vs the permanent residue
+   (54/60/61-protected blocks, `inputsKnown:`'s creator per §3-B4, PushClosure-bearing
+   and has_ctx blocks, which A1's own gate also declines) — is ARITHMETIC before three
+   slices are committed, not a qualitative census. Track per-slice: A1 should cut the
+   block-body share; A3 the orchestrator share; B the remainder. If the tail stalls
+   above 10% with A+B landed, the attribution names the residue directly.
 3. **No regression**: richards >= 16x (the a2bfd8b result), fib/arith/sieve within noise.
    Richards is the canary for B-series changes (its blocks are the ELIDED kind — B must
    not perturb S14's existing splices), and for A2's resolve-path change (value-family
@@ -1005,10 +1161,13 @@ frames" similarly cannot occur before A4: interpreter homes don't deopt.)*
   recompilation system as the natural home for it (a level-2 block compile could
   customize off observed `copied[0]` feedback).
 - **Extending HomeRef to name compiled frames now** (A4 in v1): the serial-registry +
-  landing-pad design (§2.4 sketch) is coherent but is a sprint of its own, and §1.6's
-  census shows zero DeltaBlue methods need it once B4 splices `inputsKnown:`. The
+  landing-pad design (§2.4 sketch) is coherent but is a sprint of its own, and the
+  committed scope's residual is small and bounded (**[corrected per review §5a]**: NOT
+  "zero methods need it once B4 splices inputsKnown:" — B4 cannot splice it; the
+  residual is inputsKnown:'s small creator method, named in §4's tail arithmetic). The
   project's history (S14 deferring exactly this, correctly) supports cutting it again —
-  this time with the boundary drawn PRECISELY (NLR-free gate at A3, statically checked).
+  this time with the boundary drawn PRECISELY (transitive NLR-free gate at A3,
+  statically checked).
 - **Materializing a real Context for every compiled block activation** (Self-style
   uniform environments): would erase S14's elision wins and regress richards — the
   design keeps elision as the preferred path and adds compiled REAL contexts only where
