@@ -996,6 +996,7 @@ fn compile_method_full(
         ic_sites,
         poll_bci,
         prim_call_argc_plus_recv: prim_shim.map(|(_, argc_plus_recv)| argc_plus_recv),
+        block_method: None,
         deopt_scopes,
         deopt_pcdescs,
         // S14 step 4b: the inline dependencies the converter recorded (one

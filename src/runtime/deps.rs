@@ -179,6 +179,7 @@ mod tests {
             ic_sites: Vec::new(),
             poll_bci: None,
             prim_call_argc_plus_recv: None,
+            block_method: None,
             deopt_scopes: Vec::new(),
             deopt_pcdescs: Vec::new(),
             inline_deps: Vec::new(),

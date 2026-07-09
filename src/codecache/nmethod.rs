@@ -15,7 +15,7 @@ use smallvec::SmallVec;
 use crate::codecache::guard::JitWriteGuard;
 use crate::codecache::CodeHandle;
 use crate::compiler::assembler::{Reloc, RelocKind};
-use crate::oops::wrappers::{KlassOop, MemOop, SymbolOop};
+use crate::oops::wrappers::{KlassOop, MemOop, MethodOop, SymbolOop};
 use crate::oops::Oop;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -219,6 +219,19 @@ pub struct Nmethod {
     /// of RootSpill's slots are live oops for `AdapterKind::CallPrimitive` —
     /// exactly the receiver+args the shim spilled, no more.
     pub prim_call_argc_plus_recv: Option<u8>,
+    /// S24 A1 (closure compilation): `Some(B)` iff this nmethod compiles
+    /// CompiledBlock B's body. Registered in [`CodeTable::by_block`] keyed
+    /// on B's oop bits instead of `by_key` (its `key_klass`/`key_selector`
+    /// are fillers — closure_klass and the `#aBlock` placeholder — never
+    /// consulted for lookup). A Rust-side oop field with the same GC
+    /// discipline as `key_selector`: ALWAYS visited by
+    /// [`CodeTable::update_keys`] under both collectors, and
+    /// [`CodeTable::rehash`] rebuilds `by_block` from it — which is what
+    /// makes the raw-bits map safe across moving GC (#93's lesson by
+    /// construction). `note_uncommon_trap` branches on this BEFORE its key
+    /// lookup (adversarial-review §5); the S12 D5 weak-key sweep skips
+    /// block nmethods.
+    pub block_method: Option<MethodOop>,
     /// S13: the packed deopt scope-descriptor blob (`compiler::scopes`
     /// format — LEB128 scope records + safepoint records). Empty until S13
     /// step 3 records real sites from emit. The GC never scans this: every
@@ -350,6 +363,7 @@ impl Nmethod {
             ic_sites: Vec::new(),
             poll_bci: None,
             prim_call_argc_plus_recv: None,
+            block_method: None,
             deopt_scopes: Vec::new(),
             deopt_pcdescs: Vec::new(),
             inline_deps: Vec::new(),
@@ -363,6 +377,14 @@ impl Nmethod {
 pub struct CodeTable {
     slots: Vec<Option<Nmethod>>,
     by_key: HashMap<(u64, u64), NmethodId>,
+    /// S24 A1: CompiledBlock-oop bits → that block's nmethod (design §2.1,
+    /// amended). Lifecycle mirrors `by_key` EXACTLY: unhooked in
+    /// `set_not_entrant`/`mark_zombie` under the same successor guard, and
+    /// rehashed under BOTH collectors by `update_keys`/`rehash` (the keys
+    /// are always live — each block nmethod's oop pool pins its
+    /// CompiledBlock, so every key has a forwarding pointer at GC time; the
+    /// #93/AdapterTable raw-key lesson applied by construction).
+    by_block: HashMap<u64, NmethodId>,
     /// S15: `(klass, selector, osr_bci)` → OSR-entry nmethod. Same weak /
     /// rebuild-after-GC / conditional-retirement discipline as `by_key`.
     osr_table: HashMap<(u64, u64, u16), NmethodId>,
@@ -382,6 +404,27 @@ impl CodeTable {
     /// will create them; S10 never does, so this always appends for now —
     /// still correct either way, and means S12 doesn't have to touch this
     /// method at all).
+    /// S24 A1: the `by_block` key for a block nmethod (`None` for methods).
+    fn slots_block_key(&self, nm: &Nmethod) -> Option<u64> {
+        nm.block_method.map(|b| b.oop().raw())
+    }
+
+    /// S24 A1: the Alive nmethod compiled for CompiledBlock `b`, if any.
+    /// Callers require `NmState::Alive` semantics (adversarial-review
+    /// BLOCKER §4): a NotEntrant block nmethod was already unhooked in
+    /// `set_not_entrant`, so a hit here is Alive by construction — the
+    /// state check below is belt-and-braces, same posture as
+    /// `send_generic`'s own validate-before-enter.
+    pub fn lookup_block(&self, b: MethodOop) -> Option<NmethodId> {
+        let id = self.by_block.get(&b.oop().raw()).copied()?;
+        let nm = self.slots.get(id.0 as usize)?.as_ref()?;
+        if matches!(nm.state, NmState::Alive) {
+            Some(id)
+        } else {
+            None
+        }
+    }
+
     pub fn install(&mut self, mut nm: Nmethod) -> NmethodId {
         let key = (nm.key_klass.oop().raw(), nm.key_selector.oop().raw());
         let base = nm.code.base as u64;
@@ -395,8 +438,20 @@ impl CodeTable {
             }
         };
         nm.id = id;
+        let block_key = self.slots_block_key(&nm);
         self.slots[id.0 as usize] = Some(nm);
-        self.by_key.insert(key, id);
+        match block_key {
+            // S24 A1: a block nmethod is keyed by its CompiledBlock's oop
+            // bits in `by_block`; its key_klass/key_selector are fillers
+            // that must NEVER enter `by_key` (they would collide across
+            // every block: (closure_klass, #aBlock)).
+            Some(bk) => {
+                self.by_block.insert(bk, id);
+            }
+            None => {
+                self.by_key.insert(key, id);
+            }
+        }
 
         let pos = self.by_addr.partition_point(|&(b, _)| b < base);
         self.by_addr.insert(pos, (base, id));
@@ -631,6 +686,21 @@ impl CodeTable {
         if self.by_key.get(&key) == Some(&id) {
             self.by_key.remove(&key);
         }
+        // S24 A1: the by_block twin, same successor guard — recompilation
+        // installs the replacement FIRST (compile_block_versioned mirrors
+        // recompile.rs's install-first rule), so only remove the entry if
+        // it still names THIS id.
+        if let Some(bk) = self
+            .slots
+            .get(id.0 as usize)
+            .and_then(|s| s.as_ref())
+            .and_then(|nm| nm.block_method)
+            .map(|b| b.oop().raw())
+        {
+            if self.by_block.get(&bk) == Some(&id) {
+                self.by_block.remove(&bk);
+            }
+        }
     }
 
     /// S13 D1 §2a: mark `id` `NotEntrant` and unhook it from `by_key`, so a
@@ -675,6 +745,21 @@ impl CodeTable {
         // orphan the replacement from every future `lookup`.
         if self.by_key.get(&key) == Some(&id) {
             self.by_key.remove(&key);
+        }
+        // S24 A1: the by_block twin, same successor guard — recompilation
+        // installs the replacement FIRST (compile_block_versioned mirrors
+        // recompile.rs's install-first rule), so only remove the entry if
+        // it still names THIS id.
+        if let Some(bk) = self
+            .slots
+            .get(id.0 as usize)
+            .and_then(|s| s.as_ref())
+            .and_then(|nm| nm.block_method)
+            .map(|b| b.oop().raw())
+        {
+            if self.by_block.get(&bk) == Some(&id) {
+                self.by_block.remove(&bk);
+            }
         }
     }
 
@@ -734,6 +819,15 @@ impl CodeTable {
             }
             let ns = f(nm.key_selector.oop());
             nm.key_selector = unsafe { SymbolOop::from_oop_unchecked(ns) };
+            // S24 A1: the block nmethod's own CompiledBlock — ALWAYS
+            // visited (never weak): `rehash` rebuilds `by_block` from this
+            // field, and `note_uncommon_trap`'s is_block branch derefs it,
+            // so a moving GC must keep it current exactly like
+            // `key_selector` above.
+            if let Some(b) = nm.block_method {
+                let nb = f(b.oop());
+                nm.block_method = Some(unsafe { MethodOop::from_oop_unchecked(nb) });
+            }
             // S11 D3: each IcSite's own selector is the SAME kind of
             // Rust-side (not MAP_JIT) oop field as key_selector above —
             // the machine-code pool word carrying the same selector
@@ -789,6 +883,7 @@ impl CodeTable {
     /// changes out from under it exactly like `LookupCache`'s own entries.
     pub fn rehash(&mut self) {
         self.by_key.clear();
+        self.by_block.clear();
         self.osr_table.clear();
         for nm in self.slots.iter().flatten() {
             // Only ALIVE nmethods re-enter either map: retirement REMOVED a
@@ -798,6 +893,13 @@ impl CodeTable {
             // sitting in a LOWER (reused) slot. (Latent since S12's rehash;
             // made observable by S15's osr_table sharing the discipline.)
             if !matches!(nm.state, NmState::Alive) {
+                continue;
+            }
+            if let Some(b) = nm.block_method {
+                // S24 A1: a block nmethod re-enters by_block (its filler
+                // key must never enter by_key — it would collide across
+                // every block).
+                self.by_block.insert(b.oop().raw(), nm.id);
                 continue;
             }
             let key = (nm.key_klass.oop().raw(), nm.key_selector.oop().raw());
@@ -888,6 +990,7 @@ mod tests {
             ic_sites: Vec::new(),
             poll_bci: None,
             prim_call_argc_plus_recv: None,
+            block_method: None,
             deopt_scopes: Vec::new(),
             deopt_pcdescs: Vec::new(),
             inline_deps: Vec::new(),
