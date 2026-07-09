@@ -241,3 +241,38 @@ repro; the debugger overturned that. Recorded honestly.):**
   `addInput:checkPriority:` (deopts at bci=21 → ~0). Open puzzle: it already
   recompiles 18× (nm 38/41/42) and still storms — the recompiler isn't
   switching this site to poly; that is the thing to fix.
+
+## RESOLVED (2026-07-09, commit a2bfd8b): the IC stomp in activate_method
+
+The "open puzzle" above cracked the case: the recompiler wasn't switching
+the site to poly because the IC never STAYED poly. `interpreter::send::
+activate_method`'s over-threshold path unconditionally rewrote the caller's
+IC to Mono-compiled(current receiver klass) on every dispatch —
+`ic_transition` would upgrade Mono(A)→Poly[A,B] and the very next
+over-threshold dispatch stomped it back to Mono(B). The IC ping-ponged
+between Mono states forever: `snapshot_profile`'s tag-only hash never
+changed (8,501 "profile unchanged" declines, 0 recompiles in one warm run),
+and each customized compile baked whichever klass was last stomped in as a
+mono-inline KlassGuard whose fail-edge trap then fired on ~every other
+call. Proven with the in-tree debugger: at every reexecution the receiver's
+klass EQUALED the live IC guard (the interpreter never missed!) while the
+baked pool word held a different klass — a Mono→Mono re-key that
+`ic_transition` cannot produce; the only writer capable was the stomp.
+
+Fix (one gated seed in `activate_method`): seed the IC only from Empty or
+same-klass Mono; never downgrade Poly/Mega or re-key a different-klass
+Mono. The preserved Poly tag lets the EXISTING recompile machinery re-lower
+the send (DominantWithSlowPath / plain Call) — no new mechanism needed.
+
+| Benchmark | interp (off) | jit t=1 | jit t=2000 | best/interp |
+|---|---|---|---|---|
+| richards (before) | 208 | 191 (826k deopts) | 85 (160,674 deopts) | 2.4x |
+| **richards (after)** | 208 | **18** (30k deopts, 58 recompiles) | **13** (**2 deopts**, 1 recompile) | **16x** |
+| deltablue (before) | 208 | 113 | — | 1.9x |
+| **deltablue (after)** | 208 | — | **62** | **3.4x** |
+| sieve | 88 | — | 93 (count 1899 correct) | ~1.0x (separate: threshold=1 cold-compile artifact + short workload) |
+
+Correctness: Bench's own checkResult (error: on mismatch) passed on every
+run; full test suite green (19 binaries); stress matrix over 4,609 world
+tests × {GC_STRESS=1, GC_STRESS=full:64, DEOPT_STRESS=64} × threshold=1 —
+0 failures. The S15 T5 gate ("richards ≥ 5.0") is now PASSED at 16x.

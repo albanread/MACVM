@@ -1,8 +1,19 @@
 # Weekend work: closing the Richards JIT perf gap (S15 T5 gate)
 
-Picking this up when there's more token budget to spend on it. This doc
-captures exactly what's already measured and known — the goal on the day is
-to go straight to implementation, not re-derive the diagnosis.
+> **GAP 1 RESOLVED before the weekend (2026-07-09, commit a2bfd8b) — and
+> the diagnosis below, plus both corrections layered onto it, all had the
+> wrong culprit.** The storm was neither a balanced two-way branch
+> (original Gap 1) nor an unhealable poly-inline site (first correction):
+> it was `interpreter::send::activate_method` STOMPING the caller's IC to
+> Mono-compiled(current receiver klass) on every over-threshold dispatch,
+> destroying the Poly feedback the recompile machinery needed to re-lower
+> the site. One gated seed (only from Empty / same-klass Mono) fixed it:
+> **richards 208→13 ms = 16× (T5 ≥5.0 PASSED), deopts 160,674→2;
+> deltablue 208→62 ms = 3.4×.** Full story: `docs/PERF.md` "RESOLVED"
+> entry. Gap 2 (7-arg constructors) and Gap 3 (residency pool) below
+> remain open and are now the live weekend candidates, along with
+> `docs/dual_arm_design.md`'s cold-OSR-profile finding (sieve's separate,
+> milder issue: OSR compiles before ICs warm → cold Untaken traps).
 
 ## The gate, and where it stands
 
