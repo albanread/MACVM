@@ -60,6 +60,36 @@ pub struct ClosureEscape {
 }
 
 impl ClosureEscape {
+    /// S24 A3: is the `push_closure` at `bci` an ESCAPING site (flows out /
+    /// unspliceable / branch-consumed / cross-block-live)? `ir::convert`
+    /// consults this to decide whether to SPLICE the block (elidable) or
+    /// ALLOCATE a real closure (`Ir::AllocClosure`, escaping). A site is
+    /// escaping iff it is in `self.escaping`.
+    pub fn is_escaping_site(&self, bci: usize) -> bool {
+        self.escaping.contains(&bci)
+    }
+
+    /// S24 A3a (design §2.7): can EVERY escaping site in M be compiled as an
+    /// ALLOCATED closure? True iff every escaping site's block is transitively
+    /// NLR-free (the dead-home soundness gate) AND does NOT capture the home's
+    /// Context (the has_ctx path is A3b). Combined with the driver's own
+    /// `!method.has_ctx()` guard, this is the A3a eligibility relaxation:
+    /// `all_elidable` (splice everything, S14) OR every escaping closure is an
+    /// allocatable non-ctx NLR-free block. An empty `escaping` set (the
+    /// all-elidable case) returns true vacuously.
+    pub fn all_escaping_a3a_compilable(&self, method: MethodOop) -> bool {
+        self.escaping.iter().all(|&bci| {
+            let (instr, _) = decode_at(method, bci);
+            let Instr::PushClosure { lit, .. } = instr else {
+                return false;
+            };
+            let Some(block) = MethodOop::try_from(method.literals().at(lit as usize)) else {
+                return false;
+            };
+            !block.captures_ctx() && block_transitively_nlr_free(block)
+        })
+    }
+
     /// The site id a `value`-send at `bci` splices — `Some` only for a proven
     /// good use (a matching-argc value-family send on a live, elidable Site).
     /// `ir::convert`'s splicer uses this; a `None` here at a value-send bci
@@ -81,6 +111,47 @@ impl ClosureEscape {
             .copied()
             .filter(|(s, _)| !self.escaping.contains(s))
     }
+}
+
+/// S24 A3 (design §2.7, review §2 MAJOR — this scan is LOAD-BEARING, not
+/// vacuous): is `block`, AND every block transitively reachable through its
+/// own `push_closure` literals, free of `nlr_tos`? A creator M may stamp the
+/// dead-home sentinel (`home_dead_sentinel`) into a closure ONLY when this
+/// holds. The reason is the inner-block case: an interpreted inner block
+/// created while B_s runs gets its home copied VERBATIM from B_s's own
+/// closure (`home_ref_for_new_closure`, blocks.rs) — so a dead-home sentinel
+/// on B_s would poison a nested legal `[:y | ^y]`'s home, turning a valid NLR
+/// (M's compiled frame still live) into a wrong `#cannotReturn:`. Statically
+/// decidable and cheap: scan B_s's bytecode for `NlrTos`; recurse through
+/// each `PushClosure` literal. `visited` guards a (pathological) cyclic
+/// literal graph — a re-visit returns "free so far" because any `NlrTos`
+/// under it was already found on the first descent.
+pub fn block_transitively_nlr_free(block: MethodOop) -> bool {
+    fn scan(m: MethodOop, visited: &mut HashSet<u64>) -> bool {
+        if !visited.insert(m.oop().raw()) {
+            return true;
+        }
+        let len = m.bytecode_len();
+        let mut bci = 0;
+        while bci < len {
+            let (instr, next) = decode_at(m, bci);
+            match instr {
+                Instr::NlrTos => return false,
+                Instr::PushClosure { lit, .. } => {
+                    if let Some(inner) = MethodOop::try_from(m.literals().at(lit as usize)) {
+                        if inner.is_block() && !scan(inner, visited) {
+                            return false;
+                        }
+                    }
+                }
+                _ => {}
+            }
+            bci = next;
+        }
+        true
+    }
+    let mut visited = HashSet::new();
+    scan(block, &mut visited)
 }
 
 /// The `value`-family selectors 7-I splices (`value`, `value:`, `value:value:`,
@@ -776,6 +847,114 @@ mod tests {
         let e = analyze(m);
         assert!(!e.all_elidable, "a stored closure escapes");
         assert_eq!(e.escaping.len(), 1);
+    }
+
+    // --- S24 A3: transitive NLR-free scan + escaping-site classification ---
+
+    #[test]
+    fn transitive_nlr_free_flat_block() {
+        let mut vm = test_vm();
+        let mut b = BytecodeBuilder::new();
+        // A block with no NlrTos anywhere.
+        let free = b.build_block(&mut vm, 0, 0, false, 0, false, |blk, _vm| {
+            blk.push_smi_i8(7);
+            blk.block_return_tos();
+        });
+        // A block that DOES an NLR.
+        let nlr = b.build_block(&mut vm, 0, 0, false, 0, false, |blk, _vm| {
+            blk.push_smi_i8(7);
+            blk.nlr_tos();
+        });
+        b.push_closure(free, 0);
+        b.push_closure(nlr, 0);
+        b.ret_self();
+        let sel = vm.universe.intern(b"m");
+        let m = b.finish(&mut vm, sel, 0, 0);
+        let free_blk = MethodOop::try_from(m.literals().at(free as usize)).unwrap();
+        let nlr_blk = MethodOop::try_from(m.literals().at(nlr as usize)).unwrap();
+        assert!(block_transitively_nlr_free(free_blk), "no NlrTos -> free");
+        assert!(
+            !block_transitively_nlr_free(nlr_blk),
+            "own NlrTos -> not free"
+        );
+    }
+
+    #[test]
+    fn transitive_nlr_free_recurses_into_inner_block() {
+        let mut vm = test_vm();
+        let mut b = BytecodeBuilder::new();
+        // Outer block has no NlrTos of its own, but creates an inner block that
+        // DOES — the transitive scan must reject the outer (an interpreted
+        // outer still creates the NLR-bearing inner, whose home the dead-home
+        // sentinel would poison).
+        let outer = b.build_block(&mut vm, 0, 0, false, 0, false, |blk, vm2| {
+            let inner = blk.build_block(vm2, 0, 0, false, 0, false, |i, _vm| {
+                i.push_smi_i8(1);
+                i.nlr_tos();
+            });
+            blk.push_closure(inner, 0);
+            blk.block_return_tos();
+        });
+        b.push_closure(outer, 0);
+        b.ret_self();
+        let sel = vm.universe.intern(b"m");
+        let m = b.finish(&mut vm, sel, 0, 0);
+        let outer_blk = MethodOop::try_from(m.literals().at(outer as usize)).unwrap();
+        assert!(
+            !block_transitively_nlr_free(outer_blk),
+            "an inner block's NlrTos is transitively visible -> not free"
+        );
+    }
+
+    #[test]
+    fn a3a_classifies_escaping_nlr_free_non_ctx_block() {
+        let mut vm = test_vm();
+        let mut b = BytecodeBuilder::new();
+        // A non-capturing, NLR-free block stored into an instvar → escapes,
+        // and is A3a-compilable (allocatable).
+        let lit = b.build_block(&mut vm, 0, 0, false, 0, false, |blk, _vm| {
+            blk.push_smi_i8(1);
+            blk.block_return_tos();
+        });
+        let site = b.here();
+        b.push_closure(lit, 0);
+        b.store_instvar_pop(0);
+        b.ret_self();
+        let sel = vm.universe.intern(b"m");
+        let m = b.finish(&mut vm, sel, 0, 0);
+        let e = analyze(m);
+        assert!(!e.all_elidable, "stored closure escapes");
+        assert!(
+            e.is_escaping_site(site),
+            "the push_closure site is escaping"
+        );
+        assert!(
+            e.all_escaping_a3a_compilable(m),
+            "an escaping NLR-free non-ctx block is A3a-compilable"
+        );
+    }
+
+    #[test]
+    fn a3a_rejects_escaping_nlr_bearing_block() {
+        let mut vm = test_vm();
+        let mut b = BytecodeBuilder::new();
+        // An NLR-bearing block stored into an instvar → escapes AND is NOT
+        // A3a-compilable (the dead-home sentinel would misdeliver its `^`).
+        let lit = b.build_block(&mut vm, 0, 0, false, 0, false, |blk, _vm| {
+            blk.push_smi_i8(1);
+            blk.nlr_tos();
+        });
+        b.push_closure(lit, 0);
+        b.store_instvar_pop(0);
+        b.ret_self();
+        let sel = vm.universe.intern(b"m");
+        let m = b.finish(&mut vm, sel, 0, 0);
+        let e = analyze(m);
+        assert!(!e.all_elidable, "stored closure escapes");
+        assert!(
+            !e.all_escaping_a3a_compilable(m),
+            "an escaping NLR-bearing block is NOT A3a-compilable"
+        );
     }
 
     /// (c) a block passed as an ARG to a non-value send → escaping.

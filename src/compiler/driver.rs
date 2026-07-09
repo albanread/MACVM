@@ -263,6 +263,15 @@ fn eligibility_detail(vm: &VmState, method: MethodOop) -> Eligibility {
         let e = crate::compiler::escape::analyze(method);
         if !e.all_elidable {
             // Some closure escapes (or is unspliceable) — cannot compile M.
+            // S24 A3a will relax this to also accept escaping sites when
+            // `!method.has_ctx() && e.all_escaping_a3a_compilable(method)`
+            // (the classification + transitive NLR-free scan are already
+            // built and tested in `escape.rs`); the remaining A3a work is the
+            // `Ir::AllocClosure` lowering (`Ir::Alloc` + straight-line
+            // `StoreField` initializers + the dead-home sentinel) and its
+            // deopt-scope wiring. Kept as the ordinary reject until that lands
+            // so the gate never deems a method eligible that `ir::convert`
+            // cannot yet lower.
             return Eligibility::NoPermanent;
         }
         Some(e)

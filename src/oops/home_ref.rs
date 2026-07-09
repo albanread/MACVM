@@ -47,9 +47,37 @@ pub fn unpack_home_ref(s: SmallInt) -> HomeRef {
     }
 }
 
+/// S24 A3: the STRUCTURALLY-DEAD home a compiled method stamps into every
+/// escaping closure it allocates (`closure_compilation_design.md` §2.7).
+/// `proc = 1` is reserved for exactly this: `home_is_live`'s very first
+/// check is `home.proc != 0 -> false` (v1 is single-process, so any
+/// non-zero proc "names nothing"), so an NLR that ever reached this home
+/// would take the dead-home `#cannotReturn:` path. It never does: A3 only
+/// compiles a creator when every closure it makes is TRANSITIVELY NLR-free
+/// (the eligibility gate), so `nlr_tos` — the sole reader of `home` — is
+/// statically absent from these closures' bodies. `continue_unwind`
+/// debug-asserts `home.proc != 1` to turn any future gate violation into a
+/// loud panic instead of a silently-wrong `#cannotReturn:`. serial/fp are 0
+/// (irrelevant once proc rejects).
+pub fn home_dead_sentinel() -> SmallInt {
+    pack_home_ref(HomeRef {
+        proc: 1,
+        serial: 0,
+        fp: 0,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dead_sentinel_has_proc_one() {
+        // S24 A3: the dead-home sentinel must unpack to proc==1 so
+        // `home_is_live`'s first check rejects it structurally.
+        let h = unpack_home_ref(home_dead_sentinel());
+        assert_eq!(h.proc, 1, "dead sentinel proc must be 1");
+    }
 
     #[test]
     fn home_ref_roundtrip() {
