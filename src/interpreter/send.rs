@@ -214,7 +214,45 @@ pub fn activate_method(
                     // longer be trusted here.
                     let caller = vm.regs.method.expect("activate_method: no active method");
                     let epoch = vm.ic_epoch;
-                    InterpreterIc::at(caller, ic_idx).set_mono_compiled(vm, k, id, epoch);
+                    // THE RICHARDS STORM FIX (2026-07-09): seed the caller's
+                    // IC only when doing so LOSES no receiver-klass history —
+                    // Empty (first observation) or Mono on the SAME klass (a
+                    // pure interpreted→compiled target upgrade, incl. the
+                    // post-recompile re-seed the S14 compile-storm fix above
+                    // relies on). An UNCONDITIONAL `set_mono_compiled` here
+                    // stomped a genuinely polymorphic site back to
+                    // Mono(current receiver) on every over-threshold
+                    // dispatch: `ic_transition` would upgrade Mono(A)→
+                    // Poly[A,B], and this line immediately rewrote it to
+                    // Mono(B) — so the IC ping-ponged between Mono states
+                    // forever, `feedback::snapshot_profile`'s tag-only hash
+                    // never changed, `recompile::note_uncommon_trap` declined
+                    // every recompile as "profile unchanged", and each
+                    // customized compile of the CALLER baked whichever klass
+                    // had been stomped in last as a mono-inline KlassGuard —
+                    // whose fail-edge UncommonTrap then fired on roughly
+                    // every other call, ~160k deopts per warm Richards run
+                    // (`addInput:checkPriority:`'s `oldTask priority` site,
+                    // four Task subclasses; docs/PERF.md "Dual-arm branch
+                    // storm" CORRECTION entry has the full diagnosis).
+                    // Leaving a Poly/Mega/other-klass-Mono IC untouched costs
+                    // nothing: `enter_compiled` below runs either way (the
+                    // IC write is a dispatch cache, never load-bearing), and
+                    // the preserved Poly tag is exactly what lets the
+                    // existing recompile machinery re-lower the caller's
+                    // send to DominantWithSlowPath/Call — real dispatch, no
+                    // trap — which kills the storm through the front door.
+                    let seed_ok = match crate::interpreter::ic::ic_state(caller, ic_idx) {
+                        crate::interpreter::ic::IcState::Empty => true,
+                        crate::interpreter::ic::IcState::Mono => {
+                            InterpreterIc::at(caller, ic_idx).guard().raw() == k.oop().raw()
+                        }
+                        crate::interpreter::ic::IcState::Poly(_)
+                        | crate::interpreter::ic::IcState::Mega => false,
+                    };
+                    if seed_ok {
+                        InterpreterIc::at(caller, ic_idx).set_mono_compiled(vm, k, id, epoch);
+                    }
                 }
                 match enter_compiled(vm, id, argc) {
                     EnterResult::Completed => return SendOutcome::Normal,
