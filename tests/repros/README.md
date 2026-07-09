@@ -494,6 +494,58 @@ ports; the benchmarks' own 4-mode gates stay red until these are fixed):
      for t in off 1 10 100 1000; do MACVM_JIT=threshold=$t \
        ./target/debug/macvm run tests/repros/c2i_mono_klass_mismatch.mst --world world; done
 
+5. closure_nlr_ensure_two_frames.mst — S24 A1 shakeout bug 7 (silent
+   wrong answer: SKIPPED ensure: handler). A compiled `[^7]`'s NLR
+   through two ensure-protected interpreted frames ran only the OUTER
+   handler (prints "7 1 #outer" then a guest index error instead of
+   "7 2 #inner #outer"). Root cause: `prim_ensure_like` activated the
+   PROTECTED block via the trigger-bearing `activate_block`, which at
+   low thresholds compiles the block and completes it INSIDE the
+   primitive — no interpreter frame, so the `Activated` arm that arms
+   the ensure marker never ran. The marker protocol (normal-return
+   interception in `do_return` AND the NLR scan) requires the marker to
+   live on the protected block's interpreter frame; the fix routes the
+   activation through `activate_block_interp`, exactly like the handler
+   activations in `unwind.rs`. Found by the world-suite byte-differential
+   at threshold=1 (DispatchTests>>testEnsureOrderThroughTwoFrames), which
+   also gates it permanently.
+
+   Gate: prints "7 2 #inner #outer" (4 lines, exit 0) under BOTH
+   MACVM_JIT=off and MACVM_JIT=threshold=1.
+
+6. closure_dead_home_cannot_return.mst — S24 A1 dead-home delivery
+   (adversarial-review BLOCKER 2's scenario, expect-death). A COMPILED
+   NLR block whose home frame already returned must deliver
+   `#cannotReturn:` to the ORIGINATING closure — parked in
+   `NlrState.closure` by `rt_nlr_originate` — not to the current frame's
+   receiver slot (the block's native frame is gone by liveness-check
+   time; the current frame is the value-sender's). The world defines no
+   `cannotReturn:`, so correct behavior is the fatal DNU cascade NAMING
+   the closure's class.
+
+   Gate: exits nonzero with "DNU #cannotReturn: (receiver class
+   BlockClosure)" on stdout under BOTH MACVM_JIT=off and
+   MACVM_JIT=threshold=1 (automated as it_world.rs's
+   `dead_home_nlr_names_the_closure_both_tiers`). Stack-trace depth
+   legitimately differs by tier (compiled frames don't print as
+   interpreted lines).
+
+7. closure_deopt_in_block_ctx_writes.mst — S24 A1 deopt-in-compiled-block
+   (design 4's repro 2, distilled from the sieve benchmark during the A1
+   shakeout). Captured-ctx blocks (`a`/`c`/`k` are home-method temps
+   mutated inside `do:`/`whileTrue:` blocks) compiled at threshold=1 and
+   deopted mid-iteration must land their ctx writes in the HOME frame the
+   interpreter resumes from — the root-is_block materializer arm rebuilds
+   the block's interpreter frame with copied(0)/copied(1) ALIASED to the
+   live closure's own fields (identity, never fresh copies), so writes
+   made before the trap stay visible after it. During the shakeout this
+   scenario surfaced the regalloc closure-vreg pin, the Frame::verify
+   block shapes, and the `note_uncommon_trap` is_block branch.
+
+   Gate: prints "1 1 1" (3 lines, exit 0) under MACVM_JIT=off AND under
+   MACVM_JIT=threshold=1 with MACVM_DEOPT_STRESS=64 (round-robin
+   invalidation forces mid-block deopts continuously).
+
 All repros above also reproduce (or, for BUG A/C, used to) via the full
 benchmarks:
   MACVM_JIT=threshold=1 ./target/release/macvm run world/bench/richards.mst  --world world

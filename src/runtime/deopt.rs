@@ -532,10 +532,37 @@ pub fn deoptimize_frame(vm: &mut VmState, frame: FrameView) -> DeoptResume {
         // (7-II-b). A method frame uses its own recorded `CtxLoc` (M6 proper).
         if vf.scope.is_block && prev_fp != crate::oops::layout::ENTRY_FRAME_SENTINEL {
             let home_ctx = Frame {
-                fp: root_fp.expect("is_block frame is never outermost"),
+                fp: root_fp.expect("a SPLICED is_block frame is never outermost"),
             }
             .context(&vm.stack);
             Frame { fp: fp_new }.set_context(&mut vm.stack, home_ctx);
+        } else if vf.scope.is_block {
+            // S24 A1 (design §2.5): the ROOT-block arm — a STANDALONE-
+            // compiled block deopted. Mirror `activate_block_interp`
+            // step-for-step: the receiver-ARG slot already holds the
+            // CLOSURE (the root scope's receiver ValueLoc records the
+            // closure vreg), so derive FP+4 = copied[0] (the home
+            // receiver) and alias FP+3 = copied[1] iff captures_ctx else
+            // nil — IDENTITY, never a fresh Context (Risk 2: one Context
+            // object shared with the home; a copy would split the world).
+            // No allocation on this path.
+            let f = Frame { fp: fp_new };
+            let closure_oop = vm.stack.get(f.receiver_slot(&vm.stack));
+            let closure = crate::oops::wrappers::ClosureOop::try_from(closure_oop).expect(
+                "root-block scope's receiver ValueLoc must hold the closure \
+                 (driver records block_closure_vreg there)",
+            );
+            let blk = closure.method();
+            vm.stack.set(
+                fp_new + crate::oops::layout::FRAME_RECEIVER,
+                closure.copied(0),
+            );
+            let ctx = if blk.captures_ctx() {
+                closure.copied(1)
+            } else {
+                vm.universe.nil_obj
+            };
+            f.set_context(&mut vm.stack, ctx);
         } else {
             materialize_context(vm, frame.nm, &frame, &vf.scope.ctx, fp_new);
         }

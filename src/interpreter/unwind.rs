@@ -128,7 +128,7 @@ fn intercept_ensure_return(
     vm.stack.push(result); // parked below the handler's own activation
     vm.stack.push(handler.oop());
     vm.regs.bci = BCI_RESUME_ENSURE_RET; // consumed by activate_block as the new frame's saved_bci
-    let activated = super::blocks::activate_block(vm, handler, 0);
+    let activated = super::blocks::activate_block_interp(vm, handler, 0);
     debug_assert_eq!(
         activated,
         PrimResult::Activated,
@@ -190,12 +190,33 @@ pub fn continue_unwind(
     value: Oop,
     originating_closure: Option<Oop>,
 ) -> UnwindStep {
+    // S24 A1: the spoofed-fp primitive window. `run_method` sets
+    // `vm.stack.fp = ENTRY_FRAME_SENTINEL` around its top-level
+    // `try_primitive` attempt (interpreter::mod's own spoof), and
+    // `activate_block`'s enter-compiled hook can surface a compiled block's
+    // NLR inside that window — with NO interpreter frame in this
+    // activation, any frame-walking here would read `Frame { fp: MAX }`
+    // (overflow). The unwind necessarily crosses this boundary: park and
+    // escape; the boundary's resume re-enters `continue_unwind` with a real
+    // fp, where liveness is validated exactly once as always ("re-validates
+    // on every entry", this fn's own contract).
+    if vm.stack.fp == crate::oops::layout::ENTRY_FRAME_SENTINEL as usize {
+        debug_assert!(
+            vm.nlr_state.is_none(),
+            "continue_unwind: an NLR is escaping while one is already parked"
+        );
+        vm.nlr_state = Some(crate::runtime::vm_state::NlrState {
+            home,
+            value,
+            closure: originating_closure,
+        });
+        return UnwindStep::Escaped;
+    }
     if !home_is_live(vm, home) {
         // `Some(step)`: the `cannotReturn:` handler was compiled and itself
         // unwound by a further NLR (see `cannot_return`'s own doc) — the
         // nested unwind's outcome supersedes the plain `CannotReturn`.
-        let nested = match originating_closure
-            .and_then(|o| crate::oops::wrappers::ClosureOop::try_from(o))
+        let nested = match originating_closure.and_then(crate::oops::wrappers::ClosureOop::try_from)
         {
             Some(closure) => cannot_return(vm, closure, value),
             None => cannot_return_current_closure(vm, value),
@@ -252,7 +273,7 @@ pub fn continue_unwind(
             // plain `value` send's shape), same as `intercept_ensure_return`.
             vm.stack.push(handler.oop());
             vm.regs.bci = BCI_RESUME_UNWIND; // consumed by activate_block as the new frame's saved_bci
-            let activated = super::blocks::activate_block(vm, handler, 0);
+            let activated = super::blocks::activate_block_interp(vm, handler, 0);
             debug_assert_eq!(
                 activated,
                 PrimResult::Activated,

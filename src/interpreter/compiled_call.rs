@@ -89,6 +89,10 @@ pub fn enter_compiled(vm: &mut VmState, nm_id: NmethodId, argc: u8) -> EnterResu
     // drained NotEntrant code.)
     if vm.pending_deopt_flag
         && vm.compiled_depth == 0
+        // S24 A1: never sweep inside a deopt's nested resume — the native
+        // chain above is mid-deopt and not walkable (VmState::
+        // deopt_resume_depth's own doc has the full account).
+        && vm.deopt_resume_depth == 0
         && vm
             .code_table
             .get(nm_id)

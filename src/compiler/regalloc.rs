@@ -803,6 +803,27 @@ pub struct RegallocResult {
 pub fn regalloc(method: &IrMethod) -> RegallocResult {
     let (block_order, mut intervals, safepoint_positions, block_start_pos, extra_oop_live) =
         compute_intervals(method);
+    // S24 A1 (design Risk 1): PIN the block compilation's closure vreg live
+    // for the whole method — the root deopt scope's receiver ValueLoc names
+    // its spill slot, and `Ir::NlrReturn` reads it, at ANY safepoint. A
+    // liveness-derived interval would end at the closure's last textual use
+    // (often the entry prologue), leaving the recorded slot dead/garbage at
+    // a later deopt (found immediately by depth3_deopt: the standalone-
+    // compiled block's receiver slot held junk). Widening the interval end
+    // to the method's last position makes spill-all keep the slot canonical
+    // and every liveness-intersected oopmap include it — one slot, and the
+    // whole analysis dimension disappears.
+    if let Some(cv) = method.block_closure_vreg {
+        // +2: resolve_frame_loc/build_for_position use STRICT upper bounds
+        // (`iv.end > pos`), so ending exactly AT the last position would
+        // resolve Nil at the final safepoint -- the very deopt this exists
+        // for (observed: scope_recv=Nil on depth3's block deopt).
+        let max_pos = intervals.iter().map(|iv| iv.end).max().unwrap_or(0) + 2;
+        if let Some(iv) = intervals.iter_mut().find(|iv| iv.vreg == cv) {
+            iv.end = max_pos;
+            iv.crosses_safepoint = true;
+        }
+    }
     let (frame_slots, slot_is_oop) = allocate(&mut intervals);
     // S14 perf recovery: call-free spilled intervals also get a resident
     // register (slots stay canonical; see LiveInterval::resident_reg).
@@ -851,6 +872,7 @@ mod tests {
             argc: 0,
             ntemps: 0,
             ctx_vregs: Vec::new(),
+            block_closure_vreg: None,
             safepoints: Vec::new(),
             true_lit: PoolLit(0),
             false_lit: PoolLit(0),

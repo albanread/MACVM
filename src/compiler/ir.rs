@@ -538,6 +538,12 @@ pub struct IrMethod {
     pub pool: Vec<PoolEntry>,
     pub argc: u8,
     pub ntemps: u8,
+    /// S24 A1: `Some(closure vreg)` iff this is a BLOCK compilation — the
+    /// driver's deopt-scope recording uses it as the root scope's
+    /// `receiver` ValueLoc (the materialized interpreter block frame's
+    /// receiver-ARG slot holds the CLOSURE, `activate_block_interp`'s own
+    /// shape; the FP+4 receiver copy is derived as `copied[0]`).
+    pub block_closure_vreg: Option<VReg>,
     /// S14 step 7-II-b: the vregs holding M's promoted captured temps (one per
     /// ctx-slot) when M's heap Context is elided; empty otherwise.
     /// `build_deopt_metadata` records `CtxLoc::Elided` over their frame slots so
@@ -3874,7 +3880,10 @@ impl<'a> Translator<'a> {
             }
             Instr::NlrTos => {
                 // S24 A1 (design §2.4): non-local return origination.
-                debug_assert!(self.method.is_block(), "nlr_tos outside a block compilation");
+                debug_assert!(
+                    self.method.is_block(),
+                    "nlr_tos outside a block compilation"
+                );
                 let value = stack.pop().expect("nlr_tos: empty simulated stack");
                 let closure = self
                     .block_closure_vreg
@@ -5557,6 +5566,7 @@ pub fn convert(vm: &VmState, rcvr_klass: KlassOop, method: MethodOop, cfg: &Cfg)
         argc: method.argc() as u8,
         ntemps: method.ntemps() as u8,
         ctx_vregs,
+        block_closure_vreg,
         safepoints: Vec::new(),
         true_lit,
         false_lit,

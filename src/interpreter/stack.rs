@@ -447,12 +447,34 @@ impl Frame {
             self.fp
         );
         // FRAME_RECEIVER is the fast copy of the caller-pushed receiver
-        // (`push_frame` copies `stack[fp - argc - 1]` into `fp + 4`).
-        assert_eq!(
-            self.receiver(st),
-            st.get(self.fp - argc - 1),
-            "Frame::verify: FRAME_RECEIVER copy disagrees with the arg-area receiver"
-        );
+        // (`push_frame` copies `stack[fp - argc - 1]` into `fp + 4`) —
+        // EXCEPT for a BLOCK frame (S24 A1 / SPEC §5.4): its receiver-ARG
+        // slot holds the CLOSURE (what `value:` dispatched on) while FP+4
+        // holds the captured home receiver, `closure.copied(0)`
+        // (`activate_block_interp`'s shape, mirrored by the deopt
+        // materializer's root-block arm).
+        if method.is_block() {
+            // Two legal block-frame shapes:
+            // (a) activate_block_interp / the S24 root-block materializer
+            //     arm: arg slot = the CLOSURE, FP+4 = closure.copied(0);
+            // (b) an S14 SPLICED-block materialization, whose scope recorded
+            //     the same value in both (the pre-S24 equal-copy shape).
+            let arg = st.get(self.fp - argc - 1);
+            let shape_a = crate::oops::wrappers::ClosureOop::try_from(arg)
+                .is_some_and(|cl| self.receiver(st) == cl.copied(0));
+            let shape_b = self.receiver(st) == arg;
+            assert!(
+                shape_a || shape_b,
+                "Frame::verify: block frame is neither activate-shaped \
+                 (arg=closure, FP+4=copied[0]) nor spliced-shaped (FP+4 == arg)"
+            );
+        } else {
+            assert_eq!(
+                self.receiver(st),
+                st.get(self.fp - argc - 1),
+                "Frame::verify: FRAME_RECEIVER copy disagrees with the arg-area receiver"
+            );
+        }
         // The fixed temps must all be present below sp.
         assert!(
             self.fp + FRAME_TEMPS_BASE + method.ntemps() <= st.sp,

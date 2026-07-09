@@ -46,6 +46,10 @@ pub(crate) enum PrimitiveOutcome {
     Fallthrough,
     Result(Oop),
     Activated,
+    /// S24 A1: relay of a compiled block's already-run NLR unwind
+    /// (`PrimResult::Nlr`) — consumers map it exactly like
+    /// `SendOutcome::Nlr`, touching neither `sp` nor `vm.regs`.
+    Nlr(crate::interpreter::unwind::UnwindStep),
 }
 
 /// The primitive half of SPEC §5.3 step 5 — factored out of
@@ -120,6 +124,12 @@ pub(crate) fn try_primitive(vm: &mut VmState, m: MethodOop, argc: u8) -> Primiti
             // resume dispatch, push no result.
             PrimitiveOutcome::Activated
         }
+        // S24 A1: a compiled block's non-local return already unwound via
+        // `continue_unwind` — relay the step and touch NOTHING (in
+        // particular not `sp`: after an NLR the stack belongs to a
+        // different activation; `base` may be past sp or inside a live
+        // frame — the amended design's §2.1 discipline).
+        PrimResult::Nlr(step) => PrimitiveOutcome::Nlr(step),
     }
 }
 
@@ -273,6 +283,10 @@ pub fn activate_method(
             return SendOutcome::Normal;
         }
         PrimitiveOutcome::Activated => return SendOutcome::Normal,
+        // S24 A1: identical relay to EnterResult::Nlr above — the unwind
+        // already ran; the caller's own SendOutcome::Nlr handling (S11
+        // D6.3) takes it from here.
+        PrimitiveOutcome::Nlr(step) => return SendOutcome::Nlr(step),
         PrimitiveOutcome::Fallthrough => {}
     }
 

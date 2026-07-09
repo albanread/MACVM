@@ -1114,7 +1114,11 @@ fn compile_method_full(
         // `by_block` (install() routes on this); key_klass/key_selector
         // above are fillers for blocks (closure_klass + #aBlock), never
         // consulted for lookup.
-        block_method: if method.is_block() { Some(method) } else { None },
+        block_method: if method.is_block() {
+            Some(method)
+        } else {
+            None
+        },
         deopt_scopes,
         deopt_pcdescs,
         // S14 step 4b: the inline dependencies the converter recorded (one
@@ -1231,8 +1235,18 @@ fn build_deopt_metadata(
                                             // The ROOT (caller) scope — the depth-1 shape S13 always built:
                                             // this method's own receiver (VReg 0) + unified slots
                                             // (VReg 1..=n_slots), `sender: None`, root method_pool_ix.
-                let root_receiver =
-                    resolve_frame_loc(ir::VReg(0), position, intervals, extra_oop_live);
+                                            // S24 A1: a BLOCK compilation's root scope records the
+                                            // CLOSURE as its receiver (design §2.5 — the materialized
+                                            // interpreter block frame's receiver-ARG slot holds the
+                                            // closure, activate_block_interp's own shape; FP+4 is
+                                            // derived as copied[0] by the materializer's root-block
+                                            // arm). A method root records self (VReg 0) as always.
+                let root_receiver = resolve_frame_loc(
+                    ir_method.block_closure_vreg.unwrap_or(ir::VReg(0)),
+                    position,
+                    intervals,
+                    extra_oop_live,
+                );
                 let root_slots = (0..n_slots)
                     .map(|i| {
                         resolve_frame_loc(
@@ -1273,7 +1287,10 @@ fn build_deopt_metadata(
                 let scope = match &raw.inline {
                     None => rec.begin_scope(ScopeDescData {
                         method_pool_ix: root_method_ix,
-                        is_block: false,
+                        // S24 A1: true for a standalone block compilation —
+                        // the materializer's root-block arm keys on
+                        // "is_block AND outermost".
+                        is_block: ir_method.block_closure_vreg.is_some(),
                         sender: None,
                         receiver: root_receiver,
                         slots: root_slots,
@@ -1294,7 +1311,7 @@ fn build_deopt_metadata(
                         }
                         let mut prev_scope = rec.begin_scope(ScopeDescData {
                             method_pool_ix: root_method_ix,
-                            is_block: false,
+                            is_block: ir_method.block_closure_vreg.is_some(),
                             sender: None,
                             receiver: root_receiver,
                             slots: root_slots,
@@ -1746,7 +1763,10 @@ mod tests {
 
         let id = compile_block(&mut vm, blk).expect("identity block must compile");
         let nm = vm.code_table.get(id).expect("installed");
-        assert!(nm.block_method.is_some(), "block nmethod carries its CompiledBlock");
+        assert!(
+            nm.block_method.is_some(),
+            "block nmethod carries its CompiledBlock"
+        );
         assert_eq!(
             vm.code_table.lookup_block(blk),
             Some(id),

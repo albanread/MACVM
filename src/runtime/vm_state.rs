@@ -712,6 +712,25 @@ pub struct VmState {
     /// unconditionally compiled in — CONVENTIONS §3's channel list). Printed
     /// to stderr at process exit by `main.rs`.
     pub bytecode_count: u64,
+    /// S24 A1 (closure-compilation design §4 gate 2, adopted per review
+    /// §6): per-METHOD share of `bytecode_count`, so the interpreted TAIL
+    /// of a warm run is attributable by arithmetic — which methods/blocks
+    /// still interpret, and how much each contributes — rather than by
+    /// qualitative census. Keyed by the resolved `Holder>>selector` LABEL
+    /// (not the method oop's bits): labels are resolved while the method
+    /// is provably live (at run start, holding the very oop the dispatch
+    /// loop is executing), so a GC move mid-run merely re-resolves the
+    /// same label and the counts merge — raw-bits keying would silently
+    /// mis-attribute after an address recycle (task #93's lesson).
+    /// Populated only under `MACVM_TRACE=count`; dumped sorted by
+    /// `main.rs` at exit.
+    pub count_by_method: std::collections::HashMap<String, u64>,
+    /// The attribution run-length cache: `(method bits, label, run)` for
+    /// the method the dispatch loop is CURRENTLY inside. The hot-path cost
+    /// of attribution is one u64 compare + increment per bytecode; the
+    /// HashMap and label resolution are only touched when the executing
+    /// method CHANGES (≈ per send/return), in `count_switch_method`.
+    pub count_cur: Option<(u64, String, u64)>,
     /// S13 deopt counters (`sprint_s13_detail.md` D5 M1). Bumped by
     /// `runtime::deopt::deoptimize_frame` every time a compiled frame is
     /// materialized back into interpreter frame(s); read by tests and (later)
@@ -834,6 +853,16 @@ pub struct VmState {
     /// unrelated compiled call); cleared only when the unwind finally
     /// returns from home.
     pub nlr_state: Option<NlrState>,
+    /// S24 A1: >0 while a deopt's nested interpreted resume
+    /// (`interpret_active`) is running. `enter_compiled`'s opportunistic
+    /// zombie sweep must not walk frames in this window: the deopt
+    /// machinery has already zeroed `compiled_depth` (the abandoned frame
+    /// no longer counts) while the NATIVE chain above still holds the
+    /// mid-deopt call_stub crossings whose tier links were consumed —
+    /// `walk_frames` would hit "call_stub with no matching link". Found the
+    /// moment activate_block's enter-compiled hook made a `value:` send
+    /// inside a deopt resume reach enter_compiled.
+    pub deopt_resume_depth: u32,
     /// Test-only one-shot hook (tests_s10.md's `mixed_trace_golden`, gate
     /// item 4): compiled code is send-free (D1), so nothing inside it can
     /// call a `printStackTrace` primitive directly — a test sets this
@@ -1036,6 +1065,8 @@ impl VmState {
             exit_code: None,
             start_instant: Instant::now(),
             bytecode_count: 0,
+            count_by_method: std::collections::HashMap::new(),
+            count_cur: None,
             stats: VmStats::default(),
             // S13 D7: OFF here (env-free constructor); `new()` turns it on from
             // `MACVM_DEOPT_STRESS`, tests set the fields directly.
@@ -1060,6 +1091,7 @@ impl VmState {
             compiled_depth: 0,
             pending_deopts: HashMap::new(),
             nlr_state: None,
+            deopt_resume_depth: 0,
             trace_on_poll: false,
             pending_deopt_flag: false,
             test_walk_capture: None,

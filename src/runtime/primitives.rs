@@ -28,6 +28,14 @@ pub enum PrimResult {
     /// site must push NO result and just return to dispatch; pushing one
     /// would corrupt the new frame's temp area by one slot.
     Activated,
+    /// S24 A1: a COMPILED block body invoked by `activate_block`'s
+    /// enter-compiled fast path performed a non-local return, and
+    /// `continue_unwind` has ALREADY run — this is its outcome, to be
+    /// relayed exactly like `EnterResult::Nlr`/`SendOutcome::Nlr` (S11
+    /// D6.3). Produced ONLY by `interpreter::blocks::activate_block`; the
+    /// consumer must NOT touch the operand stack (`sp = base` would be
+    /// wrong — after an NLR the stack belongs to a different activation).
+    Nlr(crate::interpreter::unwind::UnwindStep),
 }
 
 pub type PrimFn = fn(vm: &mut VmState, args: &[Oop]) -> PrimResult;
@@ -1007,7 +1015,7 @@ fn prim_value_with_arguments(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     for i in 0..n {
         vm.stack.push(arr.at(i));
     }
-    crate::interpreter::blocks::activate_block(vm, cl, n)
+    crate::interpreter::blocks::activate_block_interp(vm, cl, n)
 }
 
 /// SPEC §5.4 Algorithm 6: `ensure:`/`ifCurtailed:` both activate the
@@ -1035,7 +1043,15 @@ fn prim_ensure_like(
     // above) so `sp - 1` lands on `protected`, matching a plain `value`
     // send's stack shape exactly.
     vm.stack.sp -= 1;
-    match crate::interpreter::blocks::activate_block(vm, protected, 0) {
+    // `activate_block_interp`, NOT the trigger-bearing `activate_block`
+    // (S24 A1): the marker set below lives ON the protected block's
+    // interpreter frame — it is what `do_return` intercepts for the
+    // normal-completion handler run and what `continue_unwind`'s scan
+    // finds for the NLR case. The compiled path completes the whole block
+    // INSIDE the primitive (no frame, `Completed`/`Nlr`, never
+    // `Activated`), so a compiled protected block would skip its handler
+    // on BOTH paths.
+    match crate::interpreter::blocks::activate_block_interp(vm, protected, 0) {
         PrimResult::Activated => {
             let frame = crate::interpreter::stack::Frame { fp: vm.stack.fp };
             frame.set_marker(&mut vm.stack, handler.oop(), kind);
@@ -1646,6 +1662,7 @@ mod tests {
             }
             PrimResult::Fail => panic!("basicNew on Array must not fail"),
             PrimResult::Activated => unreachable!("basicNew never activates"),
+            PrimResult::Nlr(_) => unreachable!("basicNew never NLRs"),
         }
         assert_eq!(call(23, &mut vm, &[double_klass.oop()]), PrimResult::Fail);
 

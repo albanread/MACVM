@@ -1,0 +1,22 @@
+Object subclass: N [
+    N class >> callWith: aBlock log: log [
+        [ aBlock value ] ensure: [ log add: #inner ].
+        ^99
+    ]
+    N class >> go: log [
+        [ self callWith: [ ^7 ] log: log ] ensure: [ log add: #outer ].
+        ^42
+    ]
+]
+Object subclass: Driver [
+    Driver class >> run [
+        | log r |
+        log := OrderedCollection new.
+        r := N go: log.
+        Transcript show: r printString; cr.
+        Transcript show: log size printString; cr.
+        Transcript show: (log at: 1) printString; cr.
+        Transcript show: (log at: 2) printString; cr.
+    ]
+]
+Driver run.

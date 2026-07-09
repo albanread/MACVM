@@ -1750,6 +1750,7 @@ mod tests {
             argc,
             ntemps: 0,
             ctx_vregs: Vec::new(),
+            block_closure_vreg: None,
             safepoints: Vec::new(),
             true_lit: PoolLit(0),
             false_lit: PoolLit(0),
@@ -2077,8 +2078,19 @@ mod tests {
         let with_barrier = make(true);
         let ra = regalloc::regalloc(&with_barrier);
         let mut asm = JasmAssembler::new();
-        let (blob, _pcs, _verified_entry_off, _ic_sites, _safepoints, _osr_off) =
-            emit(&mut asm, &with_barrier, &ra, 0, 0, 0, 0, 0, None, None, None);
+        let (blob, _pcs, _verified_entry_off, _ic_sites, _safepoints, _osr_off) = emit(
+            &mut asm,
+            &with_barrier,
+            &ra,
+            0,
+            0,
+            0,
+            0,
+            0,
+            None,
+            None,
+            None,
+        );
         let mnemonics: Vec<String> = blob.listing.iter().map(|l| mnemonic(l)).collect();
         assert!(
             mnemonics.iter().any(|m| m == "stur" || m == "str"),
@@ -2167,6 +2179,7 @@ mod tests {
             argc: 0,
             ntemps: 0,
             ctx_vregs: Vec::new(),
+            block_closure_vreg: None,
             safepoints: Vec::new(),
             true_lit: PoolLit(0),
             false_lit: PoolLit(0),
@@ -2265,8 +2278,19 @@ mod tests {
             key_klass_bits: 0x2000,
             resolve_addr: 0x3000,
         };
-        let (blob, _pcs, verified_entry_off, _ic_sites, _safepoints, _osr_off) =
-            emit(&mut asm, &method, &ra, 0, 0, 0, 0, 0, None, Some(guard), None);
+        let (blob, _pcs, verified_entry_off, _ic_sites, _safepoints, _osr_off) = emit(
+            &mut asm,
+            &method,
+            &ra,
+            0,
+            0,
+            0,
+            0,
+            0,
+            None,
+            Some(guard),
+            None,
+        );
 
         // `verified_entry_off` must land exactly on the S10-era prologue's
         // own first instruction (`stp x29,x30,...`) -- found empirically in
@@ -2365,8 +2389,19 @@ mod tests {
             key_klass_bits: 0x2000,
             resolve_addr: 0x3000,
         };
-        let (blob, _pcs, _verified_entry_off, _ic_sites, _safepoints, _osr_off) =
-            emit(&mut asm, &method, &ra, 0, 0, 0, 0, 0, None, Some(guard), None);
+        let (blob, _pcs, _verified_entry_off, _ic_sites, _safepoints, _osr_off) = emit(
+            &mut asm,
+            &method,
+            &ra,
+            0,
+            0,
+            0,
+            0,
+            0,
+            None,
+            Some(guard),
+            None,
+        );
 
         let oop_relocs: Vec<&crate::compiler::assembler::Reloc> = blob
             .relocs
@@ -2447,6 +2482,7 @@ mod tests {
             argc: 3,
             ntemps: 0,
             ctx_vregs: Vec::new(),
+            block_closure_vreg: None,
             safepoints: Vec::new(),
             true_lit: PoolLit(0),
             false_lit: PoolLit(0),

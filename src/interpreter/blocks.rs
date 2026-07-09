@@ -52,9 +52,82 @@ pub fn maybe_alloc_context(
 pub fn activate_block(vm: &mut VmState, closure: ClosureOop, argc: usize) -> PrimResult {
     let blk = closure.method();
     if blk.argc() != argc {
+        return PrimResult::Fail; // argc check BEFORE any probe: tier consistency
+    }
+    let count = super::send::bump_invocation(blk);
+
+    // S24 A1 (design §2.1): the compiled-block fast path + compile trigger.
+    // Placing both HERE (not at value-send sites) covers every call path —
+    // interpreted `value:` sends and compiled sites' pre-A2 c2i detour both
+    // funnel through prims 50-53 into this function — with no IC-shape
+    // changes. Prim 54 / 60 / 61 and the unwind.rs handler activations call
+    // [`activate_block_interp`] directly: their spread/marker/resume
+    // protocols have no compiled counterpart (adversarial review §2a — a
+    // compiled handler activation would orphan the BCI_RESUME_* sentinel).
+    if let crate::runtime::JitMode::Threshold(n) = vm.options.jit {
+        // Reuse an Alive nmethod FIRST (the send.rs:195-210 compile-storm
+        // lesson: invalidation churn must re-USE, not re-compile).
+        let mut nm_id = vm.code_table.lookup_block(blk);
+        if nm_id.is_none() && count >= n as i64 && !blk.compile_disabled() {
+            // v1 gate that only the CLOSURE can reveal: value captures
+            // (ncopied beyond receiver+context) need prologue pre-loads the
+            // A1 convention doesn't emit. One creation site per
+            // CompiledBlock ⇒ the same B always has the same ncopied, so
+            // declining is permanent — disable rather than re-check.
+            if closure.ncopied() == 1 + blk.captures_ctx() as usize {
+                nm_id = crate::compiler::driver::compile_block(vm, blk);
+            } else {
+                blk.set_compile_disabled();
+            }
+        }
+        if let Some(id) = nm_id {
+            match crate::interpreter::compiled_call::enter_compiled(vm, id, argc as u8) {
+                crate::interpreter::compiled_call::EnterResult::Completed => {
+                    // `enter_compiled` already did `sp = base; push(result)`
+                    // (compiled_call.rs Completed contract). Pop it and hand
+                    // it back as `Ok`: `try_primitive`'s Ok arm restores
+                    // `sp = base` ABSOLUTELY (an index computed before the
+                    // prim ran, send.rs) and the dispatch pushes the value —
+                    // net-correct BECAUSE the restore is absolute and
+                    // nothing allocates between this pop and that push
+                    // (design §2.1's pinned stack-discipline note).
+                    // Raw sp math, NOT the floor-checked pop(): this runs
+                    // inside try_primitive's window where `run_method` may
+                    // have SPOOFED vm.stack.fp to the entry sentinel
+                    // (usize::MAX — mod.rs's own primitive-attempt spoof),
+                    // so pop()'s `fp + header` floor computation overflows
+                    // in debug. Same raw-sp discipline try_primitive itself
+                    // uses.
+                    let result = vm.stack.get(vm.stack.sp - 1);
+                    vm.stack.sp -= 1;
+                    return PrimResult::Ok(result);
+                }
+                crate::interpreter::compiled_call::EnterResult::Bailout => {
+                    // Restart-from-bci-0 interpreted is sound: the block
+                    // prologue is pure loads, and no observable effect can
+                    // precede a bailout (D1's own argument).
+                }
+                crate::interpreter::compiled_call::EnterResult::Nlr(step) => {
+                    return PrimResult::Nlr(step);
+                }
+            }
+        }
+    }
+    activate_block_interp(vm, closure, argc)
+}
+
+/// SPEC §5.4 Algorithm 3, the INTERPRETED activation — [`activate_block`]'s
+/// slow path, and the DIRECT entry for prim 54 (`valueWithArguments:`),
+/// prims 60/61 (`ensure:`/`ifCurtailed:` — the marker lives on this
+/// interpreter frame), and unwind.rs's two handler activations (their
+/// `BCI_RESUME_*` saved-bci protocol requires an interpreter frame). Does
+/// NOT bump the invocation counter — the wrapper does (direct callers'
+/// activations deliberately don't feed the compile trigger in v1).
+pub fn activate_block_interp(vm: &mut VmState, closure: ClosureOop, argc: usize) -> PrimResult {
+    let blk = closure.method();
+    if blk.argc() != argc {
         return PrimResult::Fail;
     }
-    super::send::bump_invocation(blk);
 
     // Push the fixed frame slots exactly like a plain method activation
     // (`interpreter::push_frame`), except FRAME_RECEIVER is the closure's

@@ -1665,6 +1665,12 @@ pub unsafe extern "C" fn rt_call_primitive(
              (the value family, ensure:, ifCurtailed:) -- this is a compiler bug, not a guest one",
             desc.name
         ),
+        crate::runtime::primitives::PrimResult::Nlr(_) => unreachable!(
+            "rt_call_primitive: primitive {} returned Nlr -- only activate_block's \
+             enter-compiled hook produces it, and prims 50-54/60-61 are \
+             PRIM_ACTIVATES_FRAME-excluded from shims (review §7's ripple note)",
+            desc.name
+        ),
     }
 }
 

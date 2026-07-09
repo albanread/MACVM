@@ -50,6 +50,13 @@ pub fn note_uncommon_trap(vm: &mut VmState, id: NmethodId) {
     let key_klass = nm.key_klass;
     let method_sel = nm.key_selector;
     let old_hash = nm.profile_hash;
+    // S24 A1 (adversarial review §5): a BLOCK nmethod's key pair is a
+    // filler — `lookup(key_klass, key_selector)` below would either
+    // early-return (leaving a trap-dense cold block re-trapping FOREVER)
+    // or resolve an UNRELATED method under (closure_klass, #aBlock) and
+    // version-churn it. Branch BEFORE the key lookup: the CompiledBlock is
+    // carried on the nmethod itself with key_selector's GC discipline.
+    let block_method = nm.block_method;
 
     let count = {
         let nm = vm.code_table.get_mut(id).expect("checked Alive just above");
@@ -61,6 +68,36 @@ pub fn note_uncommon_trap(vm: &mut VmState, id: NmethodId) {
     }
     if version >= MAX_VERSIONS {
         return; // thrash cap: live with the deopts
+    }
+
+    // S24 A1: the block branch — same LIMIT/version/profile discipline as
+    // methods, but resolved via `block_method` and replaced via
+    // `compile_block_versioned` + the by_block successor guard.
+    if let Some(blk) = block_method {
+        let now_hash = crate::compiler::feedback::snapshot_profile(vm, blk);
+        if now_hash == old_hash {
+            vm.stats.recompile_declined_ineffective += 1;
+            let nm = vm.code_table.get_mut(id).expect("still present");
+            nm.trap_count = 0;
+            return;
+        }
+        match crate::compiler::driver::compile_block_versioned(vm, blk, version + 1) {
+            Some(_) => {
+                vm.stats.recompiles += 1;
+                if vm.options.trace.is_enabled("deopt") {
+                    eprintln!(
+                        "[deopt] recompiled BLOCK nm={} v{} (trap storm)",
+                        id.0, version
+                    );
+                }
+                crate::codecache::flush::make_not_entrant_lazy(vm, id);
+            }
+            None => {
+                let nm = vm.code_table.get_mut(id).expect("still present");
+                nm.version = MAX_VERSIONS;
+            }
+        }
+        return;
     }
 
     // The compiled method: resolve back from the key (the nmethod's key names

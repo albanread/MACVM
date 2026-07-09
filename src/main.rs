@@ -130,7 +130,7 @@ fn cmd_run(args: &[String], debug: bool) {
     }
 
     let result = macvm::frontend::world::load_file(&mut vm, Path::new(file));
-    print_bytecode_count(&vm);
+    print_bytecode_count(&mut vm);
     print_gc_bridge_stats(&vm);
     print_vm_stats(&vm);
     match result {
@@ -145,9 +145,36 @@ fn cmd_run(args: &[String], debug: bool) {
 /// `MACVM_TRACE=count` (S6 PERF procedure) — printed to stderr so golden
 /// stdout transcripts (fib/sieve/point_demo) stay exact regardless of
 /// whether the flag is set.
-fn print_bytecode_count(vm: &VmState) {
+fn print_bytecode_count(vm: &mut VmState) {
     if vm.options.trace.is_enabled("count") {
         eprintln!("bytecodes: {}", vm.bytecode_count);
+        // S24 A1 (design §4 gate 2): the interpreted tail, attributed.
+        // Flush the still-open run first (`count_cur`'s doc), then one
+        // line per method, descending, with cumulative share — the top of
+        // this list IS the answer to "what still interprets, and why".
+        if let Some((_, label, run)) = vm.count_cur.take() {
+            *vm.count_by_method.entry(label).or_insert(0) += run;
+        }
+        let mut rows: Vec<(&String, &u64)> = vm.count_by_method.iter().collect();
+        rows.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+        let total = vm.bytecode_count.max(1) as f64;
+        let mut cum = 0u64;
+        for (label, n) in rows.iter().take(40) {
+            cum += **n;
+            eprintln!(
+                "bytecodes-by-method: {n:>12} {:5.1}% (cum {:5.1}%) {label}",
+                100.0 * **n as f64 / total,
+                100.0 * cum as f64 / total
+            );
+        }
+        if rows.len() > 40 {
+            let rest: u64 = rows[40..].iter().map(|(_, n)| **n).sum();
+            eprintln!(
+                "bytecodes-by-method: {rest:>12} {:5.1}% (cum 100.0%) ... {} more methods",
+                100.0 * rest as f64 / total,
+                rows.len() - 40
+            );
+        }
     }
 }
 

@@ -217,3 +217,52 @@ fn error_kills_with_trace() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// S24 A1 (adversarial-review BLOCKER 2): a compiled NLR block whose home
+/// frame already returned must deliver `#cannotReturn:` to the ORIGINATING
+/// closure — `rt_nlr_originate` parks it in `NlrState.closure`; the block's
+/// own native frame is gone by liveness-check time, so reading the current
+/// frame's receiver slot would name the value-sender's receiver instead.
+/// The world defines no `cannotReturn:`, so the correct observable is the
+/// fatal DNU cascade NAMING the closure's class — identically under both
+/// tiers. (Repro ledger: tests/repros/closure_dead_home_cannot_return.mst.)
+#[test]
+fn dead_home_nlr_names_the_closure_both_tiers() {
+    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/repros/closure_dead_home_cannot_return.mst");
+    for jit in ["off", "threshold=1"] {
+        let out = Command::new(bin_path())
+            .args([
+                "run",
+                script.to_str().unwrap(),
+                "--world",
+                world_dir().to_str().unwrap(),
+            ])
+            .env("MACVM_JIT", jit)
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("spawn macvm");
+
+        assert_ne!(
+            out.status.code().unwrap_or(-1),
+            0,
+            "dead-home NLR must be fatal (MACVM_JIT={jit})"
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("invoking"),
+            "the doit must reach the invocation first (MACVM_JIT={jit}), got:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("cannotReturn:") && stdout.contains("BlockClosure"),
+            "expected the DNU to name #cannotReturn: on the closure's class \
+             (MACVM_JIT={jit}), got:\n{stdout}"
+        );
+        assert!(
+            !stdout.contains("unreachable"),
+            "execution must not continue past the dead-home NLR (MACVM_JIT={jit})"
+        );
+    }
+}

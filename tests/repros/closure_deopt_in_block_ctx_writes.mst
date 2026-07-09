@@ -1,0 +1,18 @@
+Object subclass: T [
+    T class >> go [ | a n c k | n := 12.
+        2 timesRepeat: [
+            a := Array new: n.
+            1 to: n do: [:x | a at: x put: true ].
+            c := 0.
+            1 to: n do: [:i |
+                (a at: i) ifTrue: [
+                    k := i + i.
+                    [ k <= n ] whileTrue: [
+                        a at: k put: false.
+                        k := k + i ].
+                    c := c + 1 ] ] ].
+        ^c ]
+]
+Transcript show: T go printString. Transcript cr.
+Transcript show: T go printString. Transcript cr.
+Transcript show: T go printString. Transcript cr.

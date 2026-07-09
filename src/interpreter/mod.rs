@@ -166,6 +166,28 @@ pub fn run_method(vm: &mut VmState, method: MethodOop, receiver: Oop, args: &[Oo
         // 9's NLR scenario; latent until then because no c2i target could
         // BE a value-family primitive under the step-7 eligibility gate.
         send::PrimitiveOutcome::Activated => return dispatch(vm),
+        // S24 A1: a compiled block NLR'd out of this top-level `value:`
+        // send; `continue_unwind` already ran. Map its outcome exactly like
+        // OP_NLR_TOS's own match: a delivered home value returns; an escape
+        // past this entry hands the sentinel to the (reentrant) caller to
+        // relay; a handler / #cannotReturn: activation is now current with
+        // `vm.regs` stamped — run it (the Activated precedent: fp must NOT
+        // be "restored" over a live frame).
+        send::PrimitiveOutcome::Nlr(step) => {
+            return match step {
+                unwind::UnwindStep::ReturnedFromHome(Some(r)) => {
+                    vm.stack.fp = saved_fp;
+                    vm.regs.bci = saved_bci;
+                    r
+                }
+                unwind::UnwindStep::Escaped => {
+                    Oop::from_raw_unchecked(crate::oops::layout::NLR_SENTINEL)
+                }
+                unwind::UnwindStep::ReturnedFromHome(None)
+                | unwind::UnwindStep::RanHandler
+                | unwind::UnwindStep::CannotReturn => dispatch(vm),
+            };
+        }
         send::PrimitiveOutcome::Fallthrough => {
             vm.stack.fp = saved_fp;
             vm.regs.bci = saved_bci;
@@ -296,6 +318,8 @@ pub fn run_method_reentrant(
 pub fn interpret_active(vm: &mut VmState, resume: DeoptResume) -> Oop {
     let scope = crate::memory::handles::HandleScope::enter(vm);
     let saved_method_h = resume.saved_regs.method.map(|m| scope.handle(vm, m.oop()));
+    // S24 A1: mark the deopt-resume window (see VmState::deopt_resume_depth).
+    vm.deopt_resume_depth += 1;
 
     // `vm.stack.fp` is the innermost materialized frame (deopt left it there);
     // its method is the frame header's own, and `resume.resume_bci` is M5's
@@ -322,6 +346,7 @@ pub fn interpret_active(vm: &mut VmState, resume: DeoptResume) -> Oop {
                 .expect("interpret_active: saved outer method survived the nested deopt run"),
         );
     }
+    vm.deopt_resume_depth -= 1;
     result
 }
 
@@ -367,6 +392,29 @@ fn dispatch(vm: &mut VmState) -> Oop {
 /// bci 0 (every `bci`/`method` write inside is relative, and the frame header
 /// the accessors read is already the resumed frame). The two entries are the
 /// ONLY callers; the loop's internal resumes (post-send, post-return) reload
+/// The attribution cache missed: flush the finished run into
+/// `count_by_method` and start a run for `method`, resolving its
+/// `Holder>>selector` label NOW, while the oop in hand is the live one the
+/// dispatch loop is about to execute (see `count_by_method`'s doc for why
+/// labels must never be resolved from stored bits later).
+#[cold]
+fn count_switch_method(vm: &mut VmState, method: MethodOop) {
+    if let Some((_, label, run)) = vm.count_cur.take() {
+        *vm.count_by_method.entry(label).or_insert(0) += run;
+    }
+    let sel = crate::runtime::error::name_of(method.selector());
+    let holder = match crate::oops::wrappers::KlassOop::try_from(method.holder()) {
+        Some(k) => crate::runtime::error::name_of(k.name()),
+        None => "?".to_string(),
+    };
+    let label = if method.is_block() {
+        format!("{holder}>>{sel} [block]")
+    } else {
+        format!("{holder}>>{sel}")
+    };
+    vm.count_cur = Some((method.oop().raw(), label, 1));
+}
+
 /// `method`/`bci` themselves and never re-enter here.
 fn dispatch_from(vm: &mut VmState, mut method: MethodOop, mut bci: usize) -> Oop {
     loop {
@@ -380,6 +428,13 @@ fn dispatch_from(vm: &mut VmState, mut method: MethodOop, mut bci: usize) -> Oop
         }
         if vm.options.trace.is_enabled("count") {
             vm.bytecode_count += 1;
+            // S24 A1 per-method attribution (`count_by_method`'s doc):
+            // same-method bytecodes cost one compare; the cold fn runs
+            // only when the executing method changes.
+            match &mut vm.count_cur {
+                Some((bits, _, run)) if *bits == method.oop().raw() => *run += 1,
+                _ => count_switch_method(vm, method),
+            }
         }
         // DBG1 (docs/DEBUGGER.md §2): every debug check — breakpoint AND
         // step — folds under this ONE master branch, so a non-debugging

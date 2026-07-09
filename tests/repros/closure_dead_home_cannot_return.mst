@@ -1,0 +1,15 @@
+Object subclass: DH [
+    DH class >> make [
+        ^[ ^7 ]
+    ]
+]
+Object subclass: Driver [
+    Driver class >> run [
+        | b |
+        b := DH make.
+        Transcript show: 'invoking'; cr.
+        b value.
+        Transcript show: 'unreachable'; cr.
+    ]
+]
+Driver run.
