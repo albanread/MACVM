@@ -163,6 +163,7 @@ fn run_ir_raw() {
         stubs.must_be_boolean_addr(),
         stubs.alloc_slow_addr(),
         stubs.call_primitive_addr(),
+        stubs.nlr_originate_addr(),
         None,
         None,
         None,
@@ -212,6 +213,7 @@ fn build_and_publish(cache: &mut CodeCache, stub_poll_addr: u64, method: &IrMeth
         method,
         &regalloc_result,
         stub_poll_addr,
+        0,
         0,
         0,
         0,
@@ -418,6 +420,7 @@ fn run_ir_raw_forces_spill() {
         stubs.must_be_boolean_addr(),
         stubs.alloc_slow_addr(),
         stubs.call_primitive_addr(),
+        stubs.nlr_originate_addr(),
         None,
         None,
         None,
@@ -1543,6 +1546,7 @@ fn compile_and_get_listing(vm: &VmState, method: MethodOop) -> String {
         0xDEAD_BEEF_0000_0001,
         0xDEAD_BEEF_0000_0002,
         0xDEAD_BEEF_0000_0003,
+        0xDEAD_BEEF_0000_0004,
         None,
         None,
         None,
@@ -2208,8 +2212,9 @@ fn threshold1_tiny_code_cache_exhausts_gracefully() {
     // one -- tuned empirically against the actual current size rather than
     // hand-estimated, and re-tune again whenever emit.rs's own prologue
     // shape changes enough to matter (a golden-test-like maintenance cost,
-    // not a correctness one).
-    let leave_free = 2048usize;
+    // not a correctness one). Retuned 2048 -> 3072 when S24 A1's
+    // unconditional `nlr_originate` pool literal nudged per-method size up.
+    let leave_free = 3072usize;
     let prefill = macvm::codecache::DEFAULT_CODE_CACHE_CAPACITY.saturating_sub(leave_free);
     vm.code_cache
         .alloc(prefill)
@@ -2492,6 +2497,7 @@ fn mono_resolve_patches_call_site_and_dispatches() {
         vm.stubs.must_be_boolean_addr(),
         vm.stubs.alloc_slow_addr(),
         vm.stubs.call_primitive_addr(),
+        vm.stubs.nlr_originate_addr(),
         None,
         None,
         None,
@@ -2664,6 +2670,7 @@ fn build_c2i_scenario(vm: &mut VmState) -> (u64, KlassOop, NmethodId) {
         vm.stubs.must_be_boolean_addr(),
         vm.stubs.alloc_slow_addr(),
         vm.stubs.call_primitive_addr(),
+        vm.stubs.nlr_originate_addr(),
         None,
         None,
         None,
@@ -2900,6 +2907,7 @@ fn full_ic_lattice_mono_to_pic_to_mega() {
         vm.stubs.must_be_boolean_addr(),
         vm.stubs.alloc_slow_addr(),
         vm.stubs.call_primitive_addr(),
+        vm.stubs.nlr_originate_addr(),
         None,
         None,
         None,
@@ -3130,6 +3138,7 @@ fn dnu_from_compiled_code_reaches_does_not_understand() {
         vm.stubs.must_be_boolean_addr(),
         vm.stubs.alloc_slow_addr(),
         vm.stubs.call_primitive_addr(),
+        vm.stubs.nlr_originate_addr(),
         None,
         None,
         None,

@@ -288,6 +288,19 @@ pub enum Ir {
         val: VReg,
     },
     RetSelf,
+    /// S24 A1 (closure compilation, design §2.4): a compiled BLOCK body's
+    /// `nlr_tos` — park the non-local return via
+    /// `codecache::stubs::rt_nlr_originate` (x0 = `closure`, x1 = `value`),
+    /// then return `NLR_SENTINEL` through the block's own epilogue; every
+    /// compiled frame above relays via its existing per-site NLR check
+    /// (S11 step 9), and the first interpreter boundary resumes
+    /// `continue_unwind`. A terminator, like `Ret` — only ever produced by
+    /// a block compilation (`convert`'s `is_block` mode; a METHOD's `^` is
+    /// `return_tos`, never `nlr_tos`).
+    NlrReturn {
+        closure: VReg,
+        value: VReg,
+    },
     Bailout {
         reason: BailoutReason,
     },
@@ -327,6 +340,10 @@ impl Ir {
                 }
             }
             Ir::Ret { val } => f(*val),
+            Ir::NlrReturn { closure, value } => {
+                f(*closure);
+                f(*value);
+            }
             // `self` is always `VReg(0)` by this module's own construction
             // (`convert()`'s `let self_vreg = VReg(0);` below) -- RetSelf
             // reads it exactly like `Ret{val}` reads `val`. Omitting this
@@ -382,6 +399,7 @@ impl Ir {
             | Ir::UncommonTrap { .. }
             | Ir::Ret { .. }
             | Ir::RetSelf
+            | Ir::NlrReturn { .. }
             | Ir::Bailout { .. } => {}
         }
     }
@@ -4643,6 +4661,10 @@ fn map_uses(op: &mut Ir, mut f: impl FnMut(VReg) -> VReg) {
             }
         }
         Ir::Ret { val } => *val = f(*val),
+        Ir::NlrReturn { closure, value } => {
+            *closure = f(*closure);
+            *value = f(*value);
+        }
         // RetSelf's implicit VReg(0) use is never a copy-prop target (VReg(0)
         // is the multi-use self param, never a single-def Move dst).
         Ir::RetSelf

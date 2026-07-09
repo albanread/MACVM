@@ -275,6 +275,9 @@ struct Emitter<'a> {
     /// `bl`s here (`compiler::driver`'s shimmable-primitive eligibility).
     /// See [`emit_prim_shim`].
     call_primitive_lit: LiteralId,
+    /// S24 A1: `stub_nlr_originate`'s address — `Ir::NlrReturn`'s `bl`
+    /// target (a block compilation's `nlr_tos` lowering).
+    nlr_originate_lit: LiteralId,
     /// `IrMethod.call_sites`, indexed by `Ir::CallSend.site` — see that
     /// field's own doc.
     call_sites: &'a [CallSiteInfo],
@@ -1279,6 +1282,7 @@ pub fn emit(
     must_be_boolean_addr: u64,
     alloc_slow_addr: u64,
     call_primitive_addr: u64,
+    nlr_originate_addr: u64,
     prim_shim: Option<(i64, u8)>,
     guard: Option<EntryGuard>,
     osr: Option<&EmitOsr>,
@@ -1303,6 +1307,7 @@ pub fn emit(
     let must_be_boolean_lit = asm.literal_u64(must_be_boolean_addr, Some(RelocKind::RuntimeAddr));
     let alloc_slow_lit = asm.literal_u64(alloc_slow_addr, Some(RelocKind::RuntimeAddr));
     let call_primitive_lit = asm.literal_u64(call_primitive_addr, Some(RelocKind::RuntimeAddr));
+    let nlr_originate_lit = asm.literal_u64(nlr_originate_addr, Some(RelocKind::RuntimeAddr));
 
     if let Some(g) = &guard {
         emit_entry_guard(asm, g);
@@ -1323,6 +1328,7 @@ pub fn emit(
         must_be_boolean_lit,
         alloc_slow_lit,
         call_primitive_lit,
+        nlr_originate_lit,
         call_sites: &method.call_sites,
         ic_sites: Vec::new(),
         pos: 0,
@@ -1640,6 +1646,47 @@ fn emit_ir(e: &mut Emitter, ir: &Ir, next_in_order: Option<BlockId>) {
             let epi = e.epilogue;
             e.asm.b(epi);
         }
+        Ir::NlrReturn { closure, value } => {
+            // S24 A1 (design §2.4): park the non-local return via
+            // `rt_nlr_originate(vm, closure, value)`, then carry
+            // `NLR_SENTINEL` through the block's own epilogue — every
+            // compiled frame above relays it via its existing per-site NLR
+            // check (S11 step 9). Marshal through
+            // x16/x17 FIRST: `closure`/`value` may live in any assigned
+            // register including x0/x1 themselves, and a direct
+            // `mov x0, <rc>; mov x1, <rv>` would clobber a source that
+            // happens to be x0 before it is read (the same aliasing hazard
+            // `call_stub`'s own doc describes for its x0..x3 shuffle).
+            // x16/x17 are the established never-allocated scratches.
+            let rc = e.resolve(closure, 16);
+            if rc.num != 16 {
+                e.asm.emit("mov", &[x(16), Operand::Reg(rc)]);
+            }
+            let rv = e.resolve(value, 17);
+            if rv.num != 17 {
+                e.asm.emit("mov", &[x(17), Operand::Reg(rv)]);
+            }
+            e.asm.emit("mov", &[x(0), x(16)]);
+            e.asm.emit("mov", &[x(1), x(17)]);
+            e.asm.call_far(e.nlr_originate_lit);
+            // Same discipline as every other Rust-reaching call site: a
+            // PcDesc at the return address so a stress-era walk can
+            // classify this frame (`rt_nlr_originate` itself never
+            // allocates — the closure/value oops are covered by the stub's
+            // own RootSpill via `AdapterKind::NlrOriginate`, not by this
+            // frame's oopmap).
+            e.safepoints.push(SafepointPc {
+                pc_off: e.asm.offset(),
+                bci: e.current_bci,
+                position: e.pos,
+            });
+            e.asm.emit(
+                "movz",
+                &[x(0), imm(crate::oops::layout::NLR_SENTINEL as i64)],
+            );
+            let epi = e.epilogue;
+            e.asm.b(epi);
+        }
         Ir::Bailout {
             reason: BailoutReason::SmiOpFailed,
         } => {
@@ -1806,7 +1853,7 @@ mod tests {
         let ra = regalloc::regalloc(&method);
         let mut asm = JasmAssembler::new();
         let (_blob, block_pcs, _verified_entry_off, _ic_sites, _safepoints, _osr_off) =
-            emit(&mut asm, &method, &ra, 0, 0, 0, 0, None, None, None);
+            emit(&mut asm, &method, &ra, 0, 0, 0, 0, 0, None, None, None);
 
         assert_eq!(
             block_pcs.len(),
@@ -1885,7 +1932,7 @@ mod tests {
         let ra = regalloc::regalloc(&method);
         let mut asm = JasmAssembler::new();
         let (blob, _pcs, _verified_entry_off, _ic_sites, _safepoints, _osr_off) =
-            emit(&mut asm, &method, &ra, 0, 0, 0, 0, None, None, None);
+            emit(&mut asm, &method, &ra, 0, 0, 0, 0, 0, None, None, None);
 
         let mnemonics: Vec<&str> = blob.listing.iter().map(|l| mnemonic(l)).collect();
         let asr_pos = mnemonics.iter().position(|&m| m == "asr");
@@ -1957,7 +2004,7 @@ mod tests {
         let ra = regalloc::regalloc(&near);
         let mut asm = JasmAssembler::new();
         let (blob, _pcs, _verified_entry_off, _ic_sites, _safepoints, _osr_off) =
-            emit(&mut asm, &near, &ra, 0, 0, 0, 0, None, None, None);
+            emit(&mut asm, &near, &ra, 0, 0, 0, 0, 0, None, None, None);
         let near_mnemonics: Vec<String> = blob.listing.iter().map(|l| mnemonic(l)).collect();
         assert!(
             near_mnemonics.iter().any(|m| m == "ldur"),
@@ -1974,7 +2021,7 @@ mod tests {
         let ra2 = regalloc::regalloc(&far);
         let mut asm2 = JasmAssembler::new();
         let (blob2, _pcs2, _verified_entry_off2, _ic_sites2, _safepoints, _osr_off) =
-            emit(&mut asm2, &far, &ra2, 0, 0, 0, 0, None, None, None);
+            emit(&mut asm2, &far, &ra2, 0, 0, 0, 0, 0, None, None, None);
         let mnemonics: Vec<String> = blob2.listing.iter().map(|l| mnemonic(l)).collect();
         assert!(
             mnemonics.iter().any(|m| m == "sub"),
@@ -2031,7 +2078,7 @@ mod tests {
         let ra = regalloc::regalloc(&with_barrier);
         let mut asm = JasmAssembler::new();
         let (blob, _pcs, _verified_entry_off, _ic_sites, _safepoints, _osr_off) =
-            emit(&mut asm, &with_barrier, &ra, 0, 0, 0, 0, None, None, None);
+            emit(&mut asm, &with_barrier, &ra, 0, 0, 0, 0, 0, None, None, None);
         let mnemonics: Vec<String> = blob.listing.iter().map(|l| mnemonic(l)).collect();
         assert!(
             mnemonics.iter().any(|m| m == "stur" || m == "str"),
@@ -2056,6 +2103,7 @@ mod tests {
             &mut asm2,
             &without_barrier,
             &ra2,
+            0,
             0,
             0,
             0,
@@ -2133,7 +2181,7 @@ mod tests {
         let ra = regalloc::regalloc(&method);
         let mut asm = JasmAssembler::new();
         let (blob, _pcs, _ve, _ic, _safepoints, _osr_off) =
-            emit(&mut asm, &method, &ra, 0, 0, 0xAABB, 0, None, None, None);
+            emit(&mut asm, &method, &ra, 0, 0, 0xAABB, 0, 0, None, None, None);
         let listing = blob.listing.join("\n");
         let mnemonic = |l: &str| l.split_whitespace().nth(2).unwrap_or("").to_string();
         let mnemonics: Vec<String> = blob.listing.iter().map(|l| mnemonic(l)).collect();
@@ -2218,7 +2266,7 @@ mod tests {
             resolve_addr: 0x3000,
         };
         let (blob, _pcs, verified_entry_off, _ic_sites, _safepoints, _osr_off) =
-            emit(&mut asm, &method, &ra, 0, 0, 0, 0, None, Some(guard), None);
+            emit(&mut asm, &method, &ra, 0, 0, 0, 0, 0, None, Some(guard), None);
 
         // `verified_entry_off` must land exactly on the S10-era prologue's
         // own first instruction (`stp x29,x30,...`) -- found empirically in
@@ -2318,7 +2366,7 @@ mod tests {
             resolve_addr: 0x3000,
         };
         let (blob, _pcs, _verified_entry_off, _ic_sites, _safepoints, _osr_off) =
-            emit(&mut asm, &method, &ra, 0, 0, 0, 0, None, Some(guard), None);
+            emit(&mut asm, &method, &ra, 0, 0, 0, 0, 0, None, Some(guard), None);
 
         let oop_relocs: Vec<&crate::compiler::assembler::Reloc> = blob
             .relocs
@@ -2429,7 +2477,7 @@ mod tests {
         let ra = regalloc::regalloc(&method);
         let mut asm = JasmAssembler::new();
         let (blob, _pcs, _verified_entry_off, ic_sites, _safepoints, _osr_off) =
-            emit(&mut asm, &method, &ra, 0, 0, 0, 0, None, None, None);
+            emit(&mut asm, &method, &ra, 0, 0, 0, 0, 0, None, None, None);
 
         assert_eq!(
             ic_sites.len(),
