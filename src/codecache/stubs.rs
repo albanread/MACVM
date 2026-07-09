@@ -755,11 +755,22 @@ pub unsafe extern "C" fn rt_resolve_send(vm: *mut VmState, ret_addr: u64, argv: 
     // touch, or a mono/pic guard rejecting the receiver) — hits never leave
     // compiled code, so misses are the whole observable.
     vm.stats.ic_misses += 1;
-    let (caller_id, caller_code, site_off, site_idx, selector, _argc) =
+    let (caller_id, caller_code, site_off, site_idx, selector, argc) =
         find_caller_site(vm, ret_addr);
     let site = &vm.code_table.get(caller_id).unwrap().ic_sites[site_idx];
     let prev_state = site.state;
     let super_klass = site.super_klass;
+
+    // DBG5 (compiled_send_auditor_design.md §1): FORCE-COLD inline caches.
+    // When the compiled-send auditor is armed (`MACVM_TRACE=calls`, and later
+    // step-call), compute+return the correct target but NEVER memoize it —
+    // skip `patch_branch26_at` and the `IcState` write below, so the site
+    // stays `Unresolved` and the NEXT send re-enters here, making every
+    // compiled send observable at this one choke point with zero codegen
+    // change. Observation-only: the `Unresolved` arm is the already-correct
+    // general dispatch, so results are byte-identical — only speed and
+    // visibility change (the sprint's headline gate).
+    let force_cold = vm.options.trace.is_enabled("calls");
 
     // S13 step 10d: a `send_super` site re-dispatches from its STATIC
     // holder-superclass (D4.6), NEVER the receiver's klass — skipping subclass
@@ -776,10 +787,12 @@ pub unsafe extern "C" fn rt_resolve_send(vm: *mut VmState, ret_addr: u64, argv: 
             return vm.stubs.dnu_addr();
         };
         let target = resolve_super_target_entry(vm, sk, selector, method);
-        vm.code_cache
-            .patch_branch26_at(caller_code, site_off, target);
-        vm.code_table.get_mut(caller_id).unwrap().ic_sites[site_idx].state =
-            IcState::Mono { klass: sk, target };
+        if !force_cold {
+            vm.code_cache
+                .patch_branch26_at(caller_code, site_off, target);
+            vm.code_table.get_mut(caller_id).unwrap().ic_sites[site_idx].state =
+                IcState::Mono { klass: sk, target };
+        }
         return target;
     }
 
@@ -791,6 +804,45 @@ pub unsafe extern "C" fn rt_resolve_send(vm: *mut VmState, ret_addr: u64, argv: 
     let Some(method) = lookup(vm, k, selector) else {
         return vm.stubs.dnu_addr();
     };
+
+    // DBG5 (compiled_send_auditor_design.md §1): under the auditor, dispatch
+    // EXACTLY as a first-touch `Unresolved` site would and return — WITHOUT
+    // entering the `match prev_state` below. That match's poly arms
+    // (`Mono→Pic`, `Pic→Pic`) build and FREE PIC stubs eagerly *while
+    // computing* `patch` (before any gate), so merely skipping the final
+    // `patch_branch26_at` would leave a site whose freed stub is still named
+    // by its `bl` — a dangling jump the byte-identical gate can't see. Ordinary
+    // sites are born `Unresolved` (driver.rs: `super_resolutions` is `Some`
+    // only for super sites) and force-cold keeps them there, so those arms are
+    // unreachable today; short-circuiting here makes that robust by
+    // construction against future compile-time IC seeding, not just by that
+    // emergent invariant. `resolve_target_entry(..false)` is the identical
+    // call the `Unresolved` arm makes.
+    if force_cold {
+        debug_assert!(
+            matches!(prev_state, IcState::Unresolved),
+            "force-cold reached an ordinary site in state {prev_state:?}, not Unresolved — \
+             compile-time IC seeding changed the born state; the short-circuit stays correct \
+             (fresh resolve, no memoization) but this tripwire flags that the poly-arm \
+             free/build machinery is now reachable and its gating must be re-audited"
+        );
+        let t = resolve_target_entry(vm, k, selector, method, false);
+        // §D1 tracer: `MACVM_TRACE=calls` logs one line per (now every) send.
+        let sel = selector.as_string();
+        let kname = crate::memory::print_oop(&vm.universe, k.name());
+        let tier = if method.primitive() != 0 {
+            format!("prim({})", method.primitive())
+        } else if vm.code_table.lookup(k, selector).is_some() {
+            "C".to_string()
+        } else {
+            "I".to_string()
+        };
+        eprintln!(
+            "[calls] nm={}#{site_idx} #{sel} recv={kname} → {tier} argc={argc}",
+            caller_id.0
+        );
+        return t;
+    }
 
     // `patch_target`: what the SITE's own `bl` gets repointed to (governs
     // every FUTURE call through it). `ret_target`: the address THIS
@@ -918,6 +970,8 @@ pub unsafe extern "C" fn rt_resolve_send(vm: *mut VmState, ret_addr: u64, argv: 
         ),
     };
 
+    // force_cold never reaches here — it returns at the short-circuit above,
+    // deliberately BEFORE this poly machinery (see §1 rationale there).
     if let Some((patch_target, new_state)) = patch {
         vm.code_cache
             .patch_branch26_at(caller_code, site_off, patch_target);
