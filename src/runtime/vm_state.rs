@@ -307,6 +307,13 @@ pub struct VmStats {
     pub ic_misses: u64,
     /// S15 A8: PIC growths (a Pic-state site adding a klass pair).
     pub pic_extends: u64,
+    /// S24 A1 hardening: `rt_resolve_send` left a send site unpatched
+    /// because the code cache could not fit the PIC/mega stub the
+    /// transition wanted (the graceful-degradation path — see the `patch`
+    /// binding's doc in `rt_resolve_send`). A nonzero value means the
+    /// cache is full: dispatch stays correct but poly sites resolve
+    /// through the runtime on every miss.
+    pub ic_patch_declined_cache_full: u64,
     /// S15 A8: Pic→Mega promotions (site went megamorphic).
     pub mega_transitions: u64,
     /// S15 A8 (tier balance): successful tier-1 compilations installed
@@ -341,6 +348,10 @@ pub fn format_vm_stats(vm: &VmState) -> String {
         format!("[stats] ic_misses={}", s.ic_misses),
         format!("[stats] pic_extends={}", s.pic_extends),
         format!("[stats] mega_transitions={}", s.mega_transitions),
+        format!(
+            "[stats] ic_patch_declined_cache_full={}",
+            s.ic_patch_declined_cache_full
+        ),
         format!("[stats] compilations={}", s.compilations),
         format!("[stats] recompiles={}", s.recompiles),
         format!(
@@ -1023,7 +1034,21 @@ impl VmState {
         // (S21) loses only its own thread, not the whole process, on the
         // same environment-limit condition that already terminates via
         // `fatal_exit` everywhere else in the VM.
-        let mut code_cache = match CodeCache::new(DEFAULT_CODE_CACHE_CAPACITY) {
+        // `MACVM_CODE_CACHE=<MiB>` (S24 A1 hardening): pin the code-cache
+        // reservation, chiefly to make EXHAUSTION cheap to reach on
+        // purpose — the graceful-degradation ladder (`rt_resolve_send`'s
+        // unpatched-site fallback, `driver`'s compile decline) is
+        // otherwise only reachable by filling the full default, which no
+        // reasonable workload does. `MACVM_CODE_CACHE=1` + DEOPT_STRESS
+        // is the standing soak for that path. Parsed here, not in
+        // `VmOptions` (102 construction sites; the cache is per-VM
+        // plumbing, not test-relevant configuration).
+        let cache_capacity = std::env::var("MACVM_CODE_CACHE")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .map(|mib| mib.clamp(1, 1024) << 20)
+            .unwrap_or(DEFAULT_CODE_CACHE_CAPACITY);
+        let mut code_cache = match CodeCache::new(cache_capacity) {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("macvm: failed to reserve JIT code cache: {e}");

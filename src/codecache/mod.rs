@@ -42,7 +42,16 @@ fn round_up16(n: usize) -> usize {
 /// `VmState::with_options`'s unconditional reservation (S10 D6) — paid even
 /// under `JitMode::Off`, since it's one `mmap` reservation, not a working
 /// set: nothing is written until the first real `publish`.
-pub const DEFAULT_CODE_CACHE_CAPACITY: usize = 1 << 20;
+///
+/// 16 MiB (S24 A1): the original 1 MiB was sized for S10's handful of
+/// arithmetic methods; whole-world `threshold=1` now compiles every
+/// method AND every eligible block, and recompile-on-trap keeps up to
+/// `MAX_VERSIONS` generations while NotEntrant predecessors await their
+/// full-GC sweep — deltablue at t=1 under DEOPT_STRESS legitimately
+/// exceeded 1 MiB with everything working as designed (caught by the A1
+/// benchmark stress matrix). Still one lazy reservation: untouched pages
+/// cost address space only.
+pub const DEFAULT_CODE_CACHE_CAPACITY: usize = 1 << 24;
 
 /// A reservation within a [`CodeCache`]'s region. `len` is how much space
 /// this handle actually owns — which may exceed what was requested from

@@ -740,27 +740,40 @@ pub unsafe extern "C" fn rt_resolve_send(vm: *mut VmState, ret_addr: u64, argv: 
     // but this call already has (k, method) in hand, so it skips straight
     // to the real target instead of bouncing through the trampoline's own
     // fresh lookup).
-    let (patch_target, ret_target, new_state) = match prev_state {
+    // `patch` is `None` ONLY on code-cache exhaustion in a poly arm (S24
+    // A1 hardening): the site is left EXACTLY as it was — old patch
+    // target, old state, old PIC stub (if any) still installed — and this
+    // one dispatch proceeds to `ret_target` directly. Every further miss
+    // re-enters here and re-attempts; if space frees up (a full-GC sweep
+    // of drained NotEntrant nmethods), the site heals itself. Slow,
+    // correct, and it can never abort the VM the way the old
+    // `expect`-on-alloc did (deltablue t=1 under DEOPT_STRESS filled the
+    // cache with everything working as designed).
+    let (patch, ret_target) = match prev_state {
         IcState::Unresolved => {
             let t = resolve_target_entry(vm, k, selector, method, false);
             (
+                Some((
+                    t,
+                    IcState::Mono {
+                        klass: k,
+                        target: t,
+                    },
+                )),
                 t,
-                t,
-                IcState::Mono {
-                    klass: k,
-                    target: t,
-                },
             )
         }
         IcState::Mono { klass, .. } if klass == k => {
             let t = resolve_target_entry(vm, k, selector, method, false);
             (
+                Some((
+                    t,
+                    IcState::Mono {
+                        klass: k,
+                        target: t,
+                    },
+                )),
                 t,
-                t,
-                IcState::Mono {
-                    klass: k,
-                    target: t,
-                },
             )
         }
         IcState::Mono { klass: old_k, .. } => {
@@ -770,39 +783,74 @@ pub unsafe extern "C" fn rt_resolve_send(vm: *mut VmState, ret_addr: u64, argv: 
             let new_t = resolve_target_entry(vm, k, selector, method, true);
             let resolve_addr = vm.stubs.resolve_addr();
             let smi_klass_bits = vm.universe.smi_klass.oop().raw();
-            let stub = vm.pic_table.build(
-                &mut vm.code_cache,
-                smi_klass_bits,
-                resolve_addr,
-                vec![(old_k, old_t), (k, new_t)],
-            );
-            (stub.base as u64, new_t, IcState::Pic { stub })
+            let patch = vm
+                .pic_table
+                .build(
+                    &mut vm.code_cache,
+                    smi_klass_bits,
+                    resolve_addr,
+                    vec![(old_k, old_t), (k, new_t)],
+                )
+                .map(|stub| (stub.base as u64, IcState::Pic { stub }));
+            (patch, new_t)
         }
         IcState::Pic { stub } => {
             let mut pairs = vm.pic_table.pairs_of(stub).to_vec();
             let new_t = resolve_target_entry(vm, k, selector, method, true);
-            if pairs.len() < PIC_MAX_ENTRIES {
-                vm.stats.pic_extends += 1;
+            // A klass ALREADY in the PIC re-resolving means its baked
+            // target went stale (its nmethod was invalidated/recompiled —
+            // DEOPT_STRESS does this constantly; organic recompiles do it
+            // occasionally): RE-KEY that pair in place. Appending instead
+            // would (a) be unreachable dispatch — the guard chain takes
+            // the FIRST match — and (b) collapse to a DUPLICATE klass
+            // pool word via `literal_u64`'s by-value interning, so
+            // `klass_pool_offs` lists one slot twice and `each_code_root`
+            // visits it twice per collection — the second visit hands the
+            // just-forwarded TO-SPACE address back to `scavenge_oop`,
+            // tripping its double-copy guard (deltablue at threshold=1
+            // under DEOPT_STRESS; latent since S13's lazy invalidation,
+            // unmasked by A1's block-compile volume).
+            if let Some(existing) = pairs.iter_mut().find(|p| p.0 == k) {
+                existing.1 = new_t;
+                let resolve_addr = vm.stubs.resolve_addr();
+                let smi_klass_bits = vm.universe.smi_klass.oop().raw();
+                let patch = vm
+                    .pic_table
+                    .build(&mut vm.code_cache, smi_klass_bits, resolve_addr, pairs)
+                    .map(|new_stub| {
+                        vm.pic_table.free(&mut vm.code_cache, stub);
+                        (new_stub.base as u64, IcState::Pic { stub: new_stub })
+                    });
+                (patch, new_t)
+            } else if pairs.len() < PIC_MAX_ENTRIES {
                 pairs.push((k, new_t));
                 let resolve_addr = vm.stubs.resolve_addr();
                 let smi_klass_bits = vm.universe.smi_klass.oop().raw();
-                let new_stub =
-                    vm.pic_table
-                        .build(&mut vm.code_cache, smi_klass_bits, resolve_addr, pairs);
-                vm.pic_table.free(&mut vm.code_cache, stub);
-                (new_stub.base as u64, new_t, IcState::Pic { stub: new_stub })
+                // Build FIRST, free the old stub only on success — on
+                // exhaustion the old (still-installed) PIC keeps serving
+                // its existing klasses; only `k` re-resolves per miss.
+                let patch = vm
+                    .pic_table
+                    .build(&mut vm.code_cache, smi_klass_bits, resolve_addr, pairs)
+                    .map(|new_stub| {
+                        vm.stats.pic_extends += 1;
+                        vm.pic_table.free(&mut vm.code_cache, stub);
+                        (new_stub.base as u64, IcState::Pic { stub: new_stub })
+                    });
+                (patch, new_t)
             } else {
-                vm.stats.mega_transitions += 1;
-                vm.pic_table.free(&mut vm.code_cache, stub);
                 let mega_shared_addr = vm.stubs.mega_shared_addr();
-                let mega_stub =
-                    vm.mega_table
-                        .get_or_make(&mut vm.code_cache, mega_shared_addr, selector);
-                (
-                    mega_stub.base as u64,
-                    new_t,
-                    IcState::Mega { stub: mega_stub },
-                )
+                // Same order: mint the mega trampoline BEFORE freeing the
+                // full PIC it replaces.
+                let patch = vm
+                    .mega_table
+                    .get_or_make(&mut vm.code_cache, mega_shared_addr, selector)
+                    .map(|mega_stub| {
+                        vm.stats.mega_transitions += 1;
+                        vm.pic_table.free(&mut vm.code_cache, stub);
+                        (mega_stub.base as u64, IcState::Mega { stub: mega_stub })
+                    });
+                (patch, new_t)
             }
         }
         IcState::Mega { .. } => unreachable!(
@@ -811,13 +859,17 @@ pub unsafe extern "C" fn rt_resolve_send(vm: *mut VmState, ret_addr: u64, argv: 
         ),
     };
 
-    vm.code_cache
-        .patch_branch26_at(caller_code, site_off, patch_target);
-    vm.code_table
-        .get_mut(caller_id)
-        .expect("caller nmethod is still installed -- this call is running ON it")
-        .ic_sites[site_idx]
-        .state = new_state;
+    if let Some((patch_target, new_state)) = patch {
+        vm.code_cache
+            .patch_branch26_at(caller_code, site_off, patch_target);
+        vm.code_table
+            .get_mut(caller_id)
+            .expect("caller nmethod is still installed -- this call is running ON it")
+            .ic_sites[site_idx]
+            .state = new_state;
+    } else {
+        vm.stats.ic_patch_declined_cache_full += 1;
+    }
 
     // Debugger (DBG3 companion): `MACVM_DBG_RESOLVE=1` traces every
     // compiled-IC miss resolution — receiver klass, prior site state, and
@@ -830,9 +882,13 @@ pub unsafe extern "C" fn rt_resolve_send(vm: *mut VmState, ret_addr: u64, argv: 
         let sel = selector.as_string();
         let is_c2i = vm.code_table.lookup(k, selector).is_none();
         let kname = crate::memory::print_oop(&vm.universe, k.name());
+        let patch_desc = match &patch {
+            Some((t, _)) => format!("{t:#x}"),
+            None => "declined(cache-full)".to_string(),
+        };
         eprintln!(
             "RESOLVE sel=#{sel} recv={:#x} klass={kname} prev={prev_state:?} \
-             c2i={is_c2i} ret_target={ret_target:#x} patch_target={patch_target:#x}",
+             c2i={is_c2i} ret_target={ret_target:#x} patch_target={patch_desc}",
             receiver.raw(),
         );
     }

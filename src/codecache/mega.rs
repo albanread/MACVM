@@ -31,21 +31,24 @@ impl MegaTable {
     /// Returns `selector`'s own `mega_<sel>` trampoline handle, building
     /// and caching one on first request. Returns the full `CodeHandle`
     /// (not just its address) since `IcState::Mega{stub}` needs one.
+    /// `None` when the code cache cannot fit the trampoline (same
+    /// degrade-don't-abort contract as `PicTable::build` — the caller
+    /// leaves the send site unpatched and every miss keeps resolving
+    /// through `rt_resolve_send`: slow, correct, and self-healing if
+    /// cache space ever frees up).
     pub fn get_or_make(
         &mut self,
         cache: &mut CodeCache,
         stub_mega_shared_addr: u64,
         selector: SymbolOop,
-    ) -> CodeHandle {
+    ) -> Option<CodeHandle> {
         let key = selector.oop().raw();
         if let Some(m) = self.by_selector.get(&key) {
-            return m.handle;
+            return Some(m.handle);
         }
         let blob = build_mega_trampoline(selector, stub_mega_shared_addr);
         let selector_pool_off = blob.literal_off; // selector is the first literal interned
-        let h = cache
-            .alloc(blob.code.len())
-            .expect("MegaTable::get_or_make: code cache too small for a mega trampoline");
+        let h = cache.alloc(blob.code.len())?;
         cache.publish(h, &blob);
         self.by_selector.insert(
             key,
@@ -54,7 +57,7 @@ impl MegaTable {
                 selector_pool_off,
             },
         );
-        h
+        Some(h)
     }
 
     /// D8-adjacent (pre-S12 bridge): visits every cached trampoline's own
@@ -191,7 +194,10 @@ mod tests {
         let mut vm = test_vm();
         let sel = vm.universe.intern(b"foo:"); // fresh -- young, in Eden
         let old_bits = sel.oop().raw();
-        let handle = vm.mega_table.get_or_make(&mut vm.code_cache, 0xC0FFEE, sel);
+        let handle = vm
+            .mega_table
+            .get_or_make(&mut vm.code_cache, 0xC0FFEE, sel)
+            .expect("test cache has room");
 
         crate::memory::scavenge::scavenge(&mut vm).expect("scavenge must succeed");
 
@@ -225,7 +231,9 @@ mod tests {
         let mut vm = test_vm();
         let sel = vm.universe.intern(b"bar:");
         let old_bits = sel.oop().raw();
-        vm.mega_table.get_or_make(&mut vm.code_cache, 0xC0FFEE, sel);
+        vm.mega_table
+            .get_or_make(&mut vm.code_cache, 0xC0FFEE, sel)
+            .expect("test cache has room");
 
         crate::memory::fullgc::full_gc(&mut vm).expect("full gc must succeed");
 

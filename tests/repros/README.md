@@ -546,6 +546,54 @@ ports; the benchmarks' own 4-mode gates stay red until these are fixed):
    MACVM_JIT=threshold=1 with MACVM_DEOPT_STRESS=64 (round-robin
    invalidation forces mid-block deopts continuously).
 
+8. (no .mst — full-bench-only) PIC duplicate-klass pool word — S24 A1
+   benchmark-stress finding, FIXED (rt_resolve_send re-key arm). Under
+   DEOPT_STRESS=64 at threshold=1, deltablue ABORTED: round-robin
+   invalidation retires a PIC entry's target nmethod; the next K-receiver
+   dispatch re-enters `rt_resolve_send` with K ALREADY in the PIC's
+   pairs, and the extend arm blindly APPENDED (K, new_target). The
+   duplicate is unreachable dispatch (guard chain takes the first match)
+   AND `literal_u64`'s by-value interning collapses both guards to ONE
+   pool word listed TWICE in `klass_pool_offs` — so `each_code_root`
+   visits the same slot twice per collection, and the second visit hands
+   the just-forwarded TO-SPACE address to `scavenge_oop`'s double-copy
+   guard. The append-churn also burned the code cache (the original
+   1 MiB exhaustion abort was THIS, not legitimate volume). Fix: re-key
+   the existing pair in place; `PicTable::build` now debug-asserts pair
+   klasses pairwise distinct; PIC/mega alloc failure degrades to an
+   unpatched site instead of panicking; `MACVM_CODE_CACHE=<MiB>` pins the
+   reservation for exhaustion soaks.
+
+   Gate: deltablue + richards under {GC_STRESS=1, GC_STRESS=full:64,
+   DEOPT_STRESS=64} x threshold=200 all exit 0 (the metric-driven
+   config); DEOPT_STRESS=64 x threshold=1 exits 0 (was the abort).
+
+9. (no .mst — full-bench-only) STILL OPEN, t=1-only: one-cycle-missed
+   spill slot in a cold-compiled loop. deltablue under GC_STRESS=1 or
+   GC_STRESS=full:64 at threshold=1 (BOTH pre-date S24 A1 — reproduced
+   byte-identically on a2bfd8b — and neither reproduces at
+   threshold=200, where the same suite+benches are fully green).
+   Deterministic dossier (MACVM_DBGPIC=1, debug build):
+     DBGPIC STALE-SLOT nm=217 block=false ret_pc=+0xc44 slot=41
+       word=0x300480269 scavs=16020   (nm 217 = DeltaBlue class>>
+       projectionTest:, 4368 bytes, 88 frame slots, cold-compiled)
+   The word is a PREVIOUS cycle's to-space address: slot 41 was skipped
+   by (at least) one collection's walk and caught by the next —
+   GC_STRESS=full:64 shows the same defect as a full-GC mark reading a
+   scavenge FORWARDING header (mark.rs:37). MACVM_DBG_IR listing: slot
+   41 is a loop-carried spilled vreg (deep slot, x19-addressed:
+   `sub x19, x29, #336`); prologue nil-fill at +0xe4, loop-body stores
+   at +0xcd8/+0xd0c, reloads at +0xd14/+0xd34 — the failing safepoint
+   +0xc44 sits INSIDE the loop before the body's stores, so the vreg is
+   live across the backedge and must be map-LIVE at every safepoint in
+   the range. Suspected: a per-safepoint oop-map hole for
+   live-across-backedge spill slots (BUG D root-cause-1's loop-widening
+   family). Ruled out by instrumentation: PIC/mega/adapter tables
+   (pre-scan clean), duplicate frames in one walk (fp-dup check clean),
+   OSR seeding (no OSR entries in the run). Next step: per-safepoint map
+   census over `nm.pcdescs` for slot 41 (the DBGPIC reporter is one
+   eprintln away), then the regalloc interval for that vreg.
+
 All repros above also reproduce (or, for BUG A/C, used to) via the full
 benchmarks:
   MACVM_JIT=threshold=1 ./target/release/macvm run world/bench/richards.mst  --world world

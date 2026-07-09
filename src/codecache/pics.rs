@@ -50,22 +50,40 @@ impl PicTable {
     /// read by anything until now; removed once this pass confirmed it
     /// really doesn't need it, rather than leaving it as permanent
     /// speculative dead code.
+    /// `None` when the code cache cannot fit the stub (S24 A1 hardening:
+    /// deltablue at threshold=1 under DEOPT_STRESS legitimately filled the
+    /// old 1 MiB cache and ABORTED here — a PIC is an optimization, so
+    /// exhaustion must degrade, never panic; `rt_resolve_send` falls back
+    /// down its dispatch ladder, ultimately leaving the site unpatched).
     pub fn build(
         &mut self,
         cache: &mut CodeCache,
         smi_klass_bits: u64,
         resolve_addr: u64,
         pairs: Vec<(KlassOop, u64)>,
-    ) -> CodeHandle {
+    ) -> Option<CodeHandle> {
         debug_assert!(
             !pairs.is_empty() && pairs.len() <= PIC_MAX_ENTRIES,
             "PicTable::build: {} pairs (must be 1..={PIC_MAX_ENTRIES})",
             pairs.len()
         );
+        // No duplicate klasses: besides being unreachable dispatch (the
+        // guard chain takes the first match), a duplicate collapses to ONE
+        // interned pool word listed TWICE in `klass_pool_offs`, and the GC
+        // root walk visiting the same slot twice per cycle trips
+        // `scavenge_oop`'s to-space double-copy guard. `rt_resolve_send`'s
+        // re-key arm maintains this; this assert catches any future
+        // duplicate source at BUILD time instead of one scavenge later.
+        debug_assert!(
+            {
+                let mut ks: Vec<u64> = pairs.iter().map(|p| p.0.oop().raw()).collect();
+                ks.sort_unstable();
+                ks.windows(2).all(|w| w[0] != w[1])
+            },
+            "PicTable::build: duplicate klass in PIC pairs"
+        );
         let (blob, klass_pool_offs) = build_pic_stub(&pairs, smi_klass_bits, resolve_addr);
-        let h = cache
-            .alloc(blob.code.len())
-            .expect("PicTable::build: code cache too small for a PIC stub");
+        let h = cache.alloc(blob.code.len())?;
         cache.publish(h, &blob);
         self.by_handle.insert(
             h.base as u64,
@@ -75,7 +93,7 @@ impl PicTable {
                 klass_pool_offs,
             },
         );
-        h
+        Some(h)
     }
 
     /// The pairs a currently-live PIC (found by its own stub handle) was
@@ -117,6 +135,29 @@ impl PicTable {
     /// `adapters::AdapterTable::oops_do` (a receiver klass compared
     /// against can be young).
     pub fn oops_do(&mut self, f: &mut dyn FnMut(&mut u64)) {
+        // DBGPIC overlap check: two live PICs must never own overlapping
+        // code-cache ranges (a double-free / freelist-corruption symptom
+        // would surface as the same pool word scanned twice -> the
+        // scavenge to-space guard).
+        #[cfg(debug_assertions)]
+        {
+            let mut ranges: Vec<(usize, usize)> = self
+                .by_handle
+                .values()
+                .map(|d| (d.handle.base as usize, d.handle.len))
+                .collect();
+            ranges.sort_unstable();
+            for w in ranges.windows(2) {
+                assert!(
+                    w[0].0 + w[0].1 <= w[1].0,
+                    "PicTable: OVERLAPPING live PIC stubs [{:#x}+{}] and [{:#x}+{}]",
+                    w[0].0,
+                    w[0].1,
+                    w[1].0,
+                    w[1].1
+                );
+            }
+        }
         let mut guard = JitWriteGuard::new();
         for d in self.by_handle.values() {
             guard.note(d.handle.base, d.handle.len);
@@ -132,6 +173,30 @@ impl PicTable {
                 // `guard`, noted for this exact range).
                 let addr = unsafe { d.handle.base.add(off as usize) } as *mut u64;
                 unsafe { f(&mut *addr) };
+            }
+        }
+    }
+
+    /// DBGPIC: pre-scan every registered PIC's klass pool words against
+    /// the given to-space range BEFORE the collector visits them, and
+    /// report any word that is ALREADY a to-space address — the
+    /// double-copy panic's input, but with the owning PIC identified.
+    /// Debug-diagnosis only.
+    pub fn scan_report(&self, to_start: usize, to_top: usize) {
+        for d in self.by_handle.values() {
+            for (i, &off) in d.klass_pool_offs.iter().enumerate() {
+                let addr = unsafe { d.handle.base.add(off as usize) } as *const u64;
+                let word = unsafe { std::ptr::read(addr) };
+                let a = word as usize & !0x7;
+                if a >= to_start && a < to_top {
+                    eprintln!(
+                        "DBGPIC PRE-SCAN ANOMALY pic_base={:#x} len={} slot={i} off={off} word={word:#x} pairs_klass={:#x} npairs={}",
+                        d.handle.base as usize,
+                        d.handle.len,
+                        d.pairs.get(i).map(|p| p.0.oop().raw()).unwrap_or(0),
+                        d.pairs.len()
+                    );
+                }
             }
         }
     }
@@ -280,6 +345,34 @@ mod tests {
     }
 
     #[test]
+    fn pic_build_degrades_to_none_on_cache_exhaustion() {
+        // S24 A1 hardening regression: a full code cache must yield
+        // `None` (rt_resolve_send leaves the site unpatched), never
+        // panic — the old `expect` here ABORTED deltablue at threshold=1
+        // under DEOPT_STRESS once blocks joined the compile population.
+        let mut vm = test_vm();
+        // Smallest legal cache: page-granular, and exhausted by design —
+        // fill it with one dummy alloc spanning (almost) everything.
+        // (`CodeCache::new` rounds up to page granularity — 16 KiB on
+        // Apple Silicon — so "fill it" must mean: alloc until refusal.)
+        let mut cache = CodeCache::new(1 << 12).unwrap();
+        while cache.alloc(32).is_some() {}
+        let mut pics = PicTable::new();
+        let k1 = new_klass(&mut vm, "PicX");
+        let k2 = new_klass(&mut vm, "PicY");
+        let got = pics.build(
+            &mut cache,
+            0x9000,
+            0xDEAD_0000,
+            vec![(k1, 0x1000u64), (k2, 0x2000u64)],
+        );
+        assert!(
+            got.is_none(),
+            "exhausted cache must decline the PIC, not panic"
+        );
+    }
+
+    #[test]
     fn pic_table_build_pairs_of_free_round_trip() {
         let mut vm = test_vm();
         let mut cache = CodeCache::new(1 << 20).unwrap();
@@ -288,7 +381,9 @@ mod tests {
         let k2 = new_klass(&mut vm, "PicD");
         let pairs = vec![(k1, 0x1000u64), (k2, 0x2000u64)];
 
-        let h = pics.build(&mut cache, 0x9000, 0xDEAD_0000, pairs.clone());
+        let h = pics
+            .build(&mut cache, 0x9000, 0xDEAD_0000, pairs.clone())
+            .expect("test cache has room");
         assert_eq!(pics.pairs_of(h), pairs.as_slice());
         assert!(cache.contains(h.base as u64));
 
@@ -316,7 +411,9 @@ mod tests {
         let k1 = new_klass(&mut vm, "PicE");
         let old_bits = k1.oop().raw();
 
-        let h = pics.build(&mut cache, 0x9000, 0xDEAD_0000, vec![(k1, 0x1000)]);
+        let h = pics
+            .build(&mut cache, 0x9000, 0xDEAD_0000, vec![(k1, 0x1000)])
+            .expect("test cache has room");
 
         let new_bits = old_bits ^ 0x1000;
         pics.oops_do(&mut |w| {

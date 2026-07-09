@@ -434,12 +434,15 @@ mod tests {
         let c_code = install_blob(&mut vm, 16);
         let smi_klass_bits = vm.universe.smi_klass.oop().raw();
         let resolve_addr = vm.stubs.resolve_addr();
-        let pic_stub = vm.pic_table.build(
-            &mut vm.code_cache,
-            smi_klass_bits,
-            resolve_addr,
-            vec![(klass_x, 0xDEAD_0000), (klass_y, a_entry)],
-        );
+        let pic_stub = vm
+            .pic_table
+            .build(
+                &mut vm.code_cache,
+                smi_klass_bits,
+                resolve_addr,
+                vec![(klass_x, 0xDEAD_0000), (klass_y, a_entry)],
+            )
+            .expect("test cache has room");
         let mut c_nm = fake_nmethod(klass_c, other_sel, c_code);
         c_nm.ic_sites.push(IcSite {
             off: 0,
