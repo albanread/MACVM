@@ -649,8 +649,14 @@ pub(crate) fn instr_stack_delta(method: MethodOop, instr: &Instr) -> i32 {
         Instr::Send { ic, .. } => -(InterpreterIc::at(method, *ic).argc() as i32),
         Instr::JumpFwd(_) | Instr::JumpBack(_) => 0,
         Instr::BrTrueFwd(_) | Instr::BrFalseFwd(_) => -1,
-        Instr::ReturnTos => -1,
-        Instr::ReturnSelf | Instr::BlockReturnTos | Instr::NlrTos => 0,
+        // S24 A1: `block_return_tos` and `nlr_tos` both POP their value
+        // (`interpreter::mod`'s own handlers: `let r = pop(vm)` /
+        // `let value = pop(vm)`) — while blocks were compile-ineligible
+        // these two rows were never consulted and sat at a harmless 0;
+        // block compilation makes them load-bearing for
+        // `compute_entry_depths`' accounting.
+        Instr::ReturnTos | Instr::BlockReturnTos | Instr::NlrTos => -1,
+        Instr::ReturnSelf => 0,
     }
 }
 
@@ -903,6 +909,15 @@ struct Translator<'a> {
     /// (matching `alloc_context`'s nil-fill). The deopt root scope records
     /// `CtxLoc::Elided` over these so the materializer rebuilds a real Context.
     ctx_vregs: Vec<VReg>,
+    /// S24 A1: Some iff compiling a CompiledBlock body (`convert`'s
+    /// is_block mode) — the closure param vreg (x0 at entry), pinned live
+    /// for the whole body (deopt reads it; NlrReturn reads it).
+    block_closure_vreg: Option<VReg>,
+    /// S24 A1: Some iff is_block AND captures_ctx — the HOME Context oop
+    /// (`closure.copied[1]`), through which depth-0 ctx-temp ops do REAL
+    /// barriered Context-slot loads/stores (never the elided-ctx vreg
+    /// Moves a method compilation uses).
+    block_ctx_vreg: Option<VReg>,
     /// S11 step 7 (D1): a smi-inlined fail edge, or a `not_bool` edge, no
     /// longer bails the whole method out to the interpreter — it computes
     /// a real fallback value (`CallSend`/`CallRuntime`) and REJOINS normal
@@ -3787,27 +3802,80 @@ impl<'a> Translator<'a> {
             // eligible — a `depth != 0` was rejected by `driver::eligible`.
             Instr::PushCtxTemp { depth, idx } => {
                 debug_assert_eq!(depth, 0, "compiled ctx-temp access must be depth 0");
-                let dst = self.fresh(true);
-                code.push(Ir::Move {
-                    dst,
-                    src: self.ctx_vregs[idx as usize],
-                });
-                stack.push(dst);
+                if let Some(ctx) = self.block_ctx_vreg {
+                    // S24 A1 (design §2.2): inside a compiled BLOCK, depth-0
+                    // ctx temps live in the REAL home Context object
+                    // (`closure.copied[1]`, loaded into `ctx` by the entry
+                    // prologue) — the compiled mirror of `activate_block`'s
+                    // FP+3 aliasing. Context body layout (`oops::context`):
+                    // [0]=home_hint, [1]=size slot, [2+i]=slot i.
+                    let dst = self.fresh(true);
+                    code.push(Ir::LoadField {
+                        dst,
+                        obj: ctx,
+                        byte_off: (crate::oops::layout::BODY_OFFSET + 8 * (2 + idx as usize))
+                            as i32,
+                    });
+                    stack.push(dst);
+                } else {
+                    let dst = self.fresh(true);
+                    code.push(Ir::Move {
+                        dst,
+                        src: self.ctx_vregs[idx as usize],
+                    });
+                    stack.push(dst);
+                }
             }
             Instr::StoreCtxTempPop { depth, idx } => {
                 debug_assert_eq!(depth, 0, "compiled ctx-temp access must be depth 0");
                 let v = stack
                     .pop()
                     .expect("store_ctx_temp_pop: empty simulated stack");
-                code.push(Ir::Move {
-                    dst: self.ctx_vregs[idx as usize],
-                    src: v,
-                });
+                if let Some(ctx) = self.block_ctx_vreg {
+                    // Real, barriered Context-slot store — the home
+                    // (interpreted or otherwise) reads the SAME object, so
+                    // identity and the card table both matter (Risk 2's
+                    // one-Context invariant).
+                    code.push(Ir::StoreField {
+                        obj: ctx,
+                        byte_off: (crate::oops::layout::BODY_OFFSET + 8 * (2 + idx as usize))
+                            as i32,
+                        val: v,
+                        barrier: true,
+                    });
+                } else {
+                    code.push(Ir::Move {
+                        dst: self.ctx_vregs[idx as usize],
+                        src: v,
+                    });
+                }
             }
-            Instr::PushClosure { .. } | Instr::BlockReturnTos | Instr::NlrTos => {
+            Instr::BlockReturnTos => {
+                // S24 A1: a block's LOCAL return (fall-off-the-end) — the
+                // exact `Ret` shape `return_tos` lowers to; delivered to the
+                // value:-sender like any compiled return.
+                debug_assert!(
+                    self.method.is_block(),
+                    "block_return_tos outside a block compilation"
+                );
+                let val = stack
+                    .pop()
+                    .expect("block_return_tos: empty simulated stack");
+                code.push(Ir::Ret { val });
+            }
+            Instr::NlrTos => {
+                // S24 A1 (design §2.4): non-local return origination.
+                debug_assert!(self.method.is_block(), "nlr_tos outside a block compilation");
+                let value = stack.pop().expect("nlr_tos: empty simulated stack");
+                let closure = self
+                    .block_closure_vreg
+                    .expect("nlr_tos: block compilation must carry the closure vreg");
+                code.push(Ir::NlrReturn { closure, value });
+            }
+            Instr::PushClosure { .. } => {
                 panic!(
                     "translate_instr: {instr:?} should have been rejected by driver::eligible \
-                     (D1) -- compiler bug if this fires"
+                     (D1 / S24 A1's no-PushClosure block gate) -- compiler bug if this fires"
                 )
             }
         }
@@ -4904,6 +4972,24 @@ pub fn convert(vm: &VmState, rcvr_klass: KlassOop, method: MethodOop, cfg: &Cfg)
             VReg(n)
         })
         .collect();
+    // S24 A1: a block compilation's environment vregs (design §2.2). The
+    // closure arrives as Param 0 (the value:-send's receiver slot, exactly
+    // what `enter_compiled`/the A2 stub already marshal into x0); `self`
+    // and the home Context are prologue-synthesized LoadFields off it.
+    let block_closure_vreg: Option<VReg> = if method.is_block() {
+        let n = vregs.len() as u32;
+        vregs.push(VRegInfo { is_oop: true });
+        Some(VReg(n))
+    } else {
+        None
+    };
+    let block_ctx_vreg: Option<VReg> = if method.is_block() && method.captures_ctx() {
+        let n = vregs.len() as u32;
+        vregs.push(VRegInfo { is_oop: true });
+        Some(VReg(n))
+    } else {
+        None
+    };
     let mut t = Translator {
         vm,
         method,
@@ -4914,6 +5000,8 @@ pub fn convert(vm: &VmState, rcvr_klass: KlassOop, method: MethodOop, cfg: &Cfg)
         self_vreg,
         temp_vregs: temp_vregs.clone(),
         ctx_vregs: ctx_vregs.clone(),
+        block_closure_vreg,
+        block_ctx_vreg,
         next_extra_block: cfg.blocks.len() as u32,
         blocks_by_id: (0..cfg.blocks.len()).map(|_| None).collect(),
         call_sites: Vec::new(),
@@ -5060,30 +5148,81 @@ pub fn convert(vm: &VmState, rcvr_klass: KlassOop, method: MethodOop, cfg: &Cfg)
         // to empty, and the continuation's own ops renumber from 0).
         let mut deopt: Vec<(u32, DeoptRaw)> = Vec::new();
         if b == 0 {
-            code.push(Ir::Param {
-                dst: self_vreg,
-                index: 0,
-            });
-            for (i, &tv) in temp_vregs.iter().enumerate().take(method.argc()) {
+            if let Some(closure_vreg) = block_closure_vreg {
+                // S24 A1 (design §2.2): a BLOCK compilation's entry. Param 0
+                // is the CLOSURE (the value:-send's receiver — exactly what
+                // `enter_compiled` marshals into x0); `self` is the home
+                // receiver, `copied[0]`; the home Context (iff captures_ctx)
+                // is `copied[1]`. All plain LoadFields — no allocation, no
+                // safepoint. Closure body layout (`oops::closure`):
+                // [0]=method, [1]=home, [2]=ncopied(size slot), [3+i]=copied[i].
+                use crate::oops::layout::{BODY_OFFSET, CLOSURE_NAMED_WORDS};
+                let copied_base = CLOSURE_NAMED_WORDS + 1; // past the size slot
                 code.push(Ir::Param {
-                    dst: tv,
-                    index: (i + 1) as u8,
+                    dst: closure_vreg,
+                    index: 0,
                 });
-            }
-            for &tv in temp_vregs.iter().skip(method.argc()) {
-                code.push(Ir::ConstPool {
-                    dst: tv,
-                    lit: nil_lit,
+                for (i, &tv) in temp_vregs.iter().enumerate().take(method.argc()) {
+                    code.push(Ir::Param {
+                        dst: tv,
+                        index: (i + 1) as u8,
+                    });
+                }
+                code.push(Ir::LoadField {
+                    dst: self_vreg,
+                    obj: closure_vreg,
+                    byte_off: (BODY_OFFSET + 8 * copied_base) as i32,
                 });
-            }
-            // S14 step 7-II-b: nil-init the promoted ctx-temp vregs (M's elided
-            // Context's slots start nil, matching `alloc_context`'s nil-fill —
-            // so a ctx-temp read before it is written yields nil).
-            for &cv in ctx_vregs.iter() {
-                code.push(Ir::ConstPool {
-                    dst: cv,
-                    lit: nil_lit,
+                if let Some(ctx) = block_ctx_vreg {
+                    code.push(Ir::LoadField {
+                        dst: ctx,
+                        obj: closure_vreg,
+                        byte_off: (BODY_OFFSET + 8 * (copied_base + 1)) as i32,
+                    });
+                }
+                // Local temps nil-init. Value captures would be pre-loads
+                // here instead — v1 declines capture-bearing closures at the
+                // compile trigger (`ncopied > 1 + captures_ctx`), so every
+                // non-arg temp is a plain local (activate_block's own
+                // convention with zero captures).
+                for &tv in temp_vregs.iter().skip(method.argc()) {
+                    code.push(Ir::ConstPool {
+                        dst: tv,
+                        lit: nil_lit,
+                    });
+                }
+                debug_assert!(
+                    ctx_vregs.is_empty(),
+                    "convert(is_block): has_ctx blocks are compile-ineligible in A1, \
+                     so a block never owns elided-ctx vregs"
+                );
+            } else {
+                code.push(Ir::Param {
+                    dst: self_vreg,
+                    index: 0,
                 });
+                for (i, &tv) in temp_vregs.iter().enumerate().take(method.argc()) {
+                    code.push(Ir::Param {
+                        dst: tv,
+                        index: (i + 1) as u8,
+                    });
+                }
+                for &tv in temp_vregs.iter().skip(method.argc()) {
+                    code.push(Ir::ConstPool {
+                        dst: tv,
+                        lit: nil_lit,
+                    });
+                }
+                // S14 step 7-II-b: nil-init the promoted ctx-temp vregs (M's
+                // elided Context's slots start nil, matching `alloc_context`'s
+                // nil-fill — so a ctx-temp read before it is written yields
+                // nil).
+                for &cv in ctx_vregs.iter() {
+                    code.push(Ir::ConstPool {
+                        dst: cv,
+                        lit: nil_lit,
+                    });
+                }
             }
         }
 
