@@ -314,3 +314,30 @@ origination, root-is_block deopt materializer). Numbers via
   cold compiles get no feedback-driven code. Stress and perf runs now
   also gate on threshold=200 (metric-driven compiles), release builds,
   all modes in parallel.
+
+## 2026-07-09 (S24 A2, commit 0401df7) — direct value-family dispatch
+
+Compiled `value`-family sends now tail-jump straight to the block nmethod
+via a shared per-argc dispatch stub (`by_block` probe), replacing the c2i
+adapter + nested interpreter activation. `scripts/perf.sh --release`:
+
+| benchmark | interp (ms) | jit t=1 | jit t=1000 | best/interp |
+|---|---|---|---|---|
+| richards | 204 | 19 | 12 | 17.0x |
+| deltablue | 213 | 34 | 41 | **6.3x** |
+
+- **DeltaBlue 5.3x -> 6.3x** — the warm run dropped 43->34ms purely from
+  the value-dispatch fast path. `MACVM_TRACE=stats` on deltablue t=200:
+  `value_dispatch_hits=1741710 value_dispatch_fallbacks=1516` — 99.9% of
+  `value:` sends in compiled methods tail-jump; the 1516 fallbacks are cold
+  warmup before each block compiles. (My pre-implementation caution that A2
+  might barely fire before A3 was wrong: deltablue's compiled constraint
+  methods send `value:` heavily.)
+- richards ~17x (noise vs A1's 16.8x — its blocks are the S14-elided kind,
+  few standalone `value:` sites); arith/fib/sieve unchanged.
+- Interpreted tail UNCHANGED from A1's 0.139: A2 changes how compiled
+  `value:` sites dispatch, not which methods compile. A3 (compiling the
+  closure-creating orchestrators) is what closes the tail toward <10%.
+- Correctness: world byte-identical vs interpreter at t=1 AND t=200, plain
+  and under {GC_STRESS=1, DEOPT_STRESS=64}; benches x 3 stress modes x
+  t=200 all green; cargo test 833/0.
