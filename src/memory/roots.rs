@@ -375,6 +375,10 @@ fn real_oop_rootspill_slots(vm: &VmState, kind: AdapterKind, caller_pc: u64) -> 
     match kind {
         AdapterKind::MustBeBoolean => 1,
         AdapterKind::AllocSlow => 1,
+        // S24 A1: a compiled block's NLR origination — exactly x0 (the
+        // closure) and x1 (the NLR value), both genuine oops, fixed by
+        // `emit`'s `Ir::NlrReturn` lowering (`stub_nlr_originate`'s doc).
+        AdapterKind::NlrOriginate => 2,
         // Unlike AllocSlow's fixed 1 (a single klass oop), a primitive
         // call's own receiver+args count varies by primitive — read the
         // COMPILED CALLER's own count via caller_pc, same nmethod lookup

@@ -261,6 +261,18 @@ pub struct PendingDeopt {
 pub struct NlrState {
     pub home: crate::oops::home_ref::HomeRef,
     pub value: crate::oops::Oop,
+    /// S24 A1: the ORIGINATING closure, parked only by compiled-block NLR
+    /// origination (`codecache::stubs::rt_nlr_originate`) — interpreted
+    /// `nlr_tos` leaves this `None` and behaves exactly as before. Carried
+    /// so [`crate::interpreter::unwind::continue_unwind`]'s dead-home arm
+    /// can deliver `#cannotReturn:` to the REAL closure: with compiled
+    /// origination the block's native frame is gone by the time the
+    /// liveness check runs, so `cannot_return_current_closure`'s
+    /// read-the-current-frame's-receiver-slot strategy would find the
+    /// value:-SENDER's receiver instead (adversarial-review BLOCKER §2 — a
+    /// release `.expect` abort on legal guest code). Same
+    /// no-allocation-in-transit contract as `value`; not a GC root.
+    pub closure: Option<crate::oops::Oop>,
 }
 
 /// S13 deopt counters (`sprint_s13_detail.md` D5 M1). Its own small struct

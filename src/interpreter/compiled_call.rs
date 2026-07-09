@@ -182,7 +182,7 @@ pub fn enter_compiled(vm: &mut VmState, nm_id: NmethodId, argc: u8) -> EnterResu
             .take()
             .expect("enter_compiled: NLR sentinel returned but no NlrState is parked");
         return EnterResult::Nlr(crate::interpreter::unwind::continue_unwind(
-            vm, st.home, st.value,
+            vm, st.home, st.value, st.closure,
         ));
     }
 

@@ -172,12 +172,35 @@ pub enum UnwindStep {
 /// running marked handlers innermost-first. Re-validates `home`'s liveness
 /// on *every* entry (a handler may have changed the world before this is
 /// re-entered via `RESUME_UNWIND`).
-pub fn continue_unwind(vm: &mut VmState, home: HomeRef, value: Oop) -> UnwindStep {
+///
+/// `originating_closure` (S24 A1): the closure whose `nlr_tos` started this
+/// unwind, when the caller has it — the interpreted origination in
+/// `dispatch` reads it off the block frame anyway, and COMPILED origination
+/// (`rt_nlr_originate`) parks it in `NlrState.closure` — so the dead-home
+/// arm can deliver `#cannotReturn:` to the REAL closure instead of reading
+/// the current frame's receiver slot. That read is only valid when the
+/// current frame IS the originating block's own interpreter frame; with a
+/// compiled origination the block's native frame is already gone and the
+/// current frame is the value:-sender's (adversarial-review BLOCKER §2).
+/// `None` (the `resume_unwind` token path) keeps the legacy current-frame
+/// fallback, whose reachable cases are all interpreter-origination shapes.
+pub fn continue_unwind(
+    vm: &mut VmState,
+    home: HomeRef,
+    value: Oop,
+    originating_closure: Option<Oop>,
+) -> UnwindStep {
     if !home_is_live(vm, home) {
         // `Some(step)`: the `cannotReturn:` handler was compiled and itself
         // unwound by a further NLR (see `cannot_return`'s own doc) — the
         // nested unwind's outcome supersedes the plain `CannotReturn`.
-        return match cannot_return_current_closure(vm, value) {
+        let nested = match originating_closure
+            .and_then(|o| crate::oops::wrappers::ClosureOop::try_from(o))
+        {
+            Some(closure) => cannot_return(vm, closure, value),
+            None => cannot_return_current_closure(vm, value),
+        };
+        return match nested {
             None => UnwindStep::CannotReturn,
             Some(step) => step,
         };
@@ -205,7 +228,11 @@ pub fn continue_unwind(vm: &mut VmState, home: HomeRef, value: Oop) -> UnwindSte
                 vm.nlr_state.is_none(),
                 "continue_unwind: an NLR is escaping while one is already parked"
             );
-            vm.nlr_state = Some(crate::runtime::vm_state::NlrState { home, value });
+            vm.nlr_state = Some(crate::runtime::vm_state::NlrState {
+                home,
+                value,
+                closure: originating_closure,
+            });
             UnwindStep::Escaped
         }
         ScanResult::Marked(mfp, handler) => {
@@ -256,7 +283,10 @@ fn resume_unwind(vm: &mut VmState) -> Option<Oop> {
         SmallInt::try_from(token.at(0)).expect("resume_unwind: token[0] is not a smi"),
     );
     let value = token.at(1);
-    match continue_unwind(vm, home, value) {
+    // Token path: the originating closure's identity is not carried in the
+    // UnwindToken (home/value only) — the legacy current-frame fallback
+    // covers this path's reachable (interpreter-origination) shapes.
+    match continue_unwind(vm, home, value, None) {
         UnwindStep::ReturnedFromHome(r) => r,
         UnwindStep::RanHandler | UnwindStep::CannotReturn => None,
         // S11 D6.3: the resumed unwind crossed a c2i boundary — propagate

@@ -49,6 +49,12 @@ pub const KIND_DEOPT_BRIDGE: u64 = 6;
 /// A compiled method's own primitive-call shim (`compiler::driver`'s
 /// shimmable-primitive eligibility). See [`build_stub_call_primitive`].
 pub const KIND_CALL_PRIMITIVE: u64 = 7;
+/// S24 A1 (closure compilation): a compiled BLOCK body's `nlr_tos` parking
+/// its non-local return (`docs/closure_compilation_design.md` §2.4 —
+/// origination only; all propagation is the existing S11 sentinel relay).
+/// RootSpill live slots = 2 (x0 = closure, x1 = value). See
+/// [`build_stub_nlr_originate`].
+pub const KIND_NLR_ORIGINATE: u64 = 8;
 
 /// D5's shared stub skeleton, part 1: anchor + AAPCS frame + RootSpill
 /// (x0..x5). Every stub that calls into Rust starts with this; follow with
@@ -192,6 +198,12 @@ pub struct Stubs {
     /// x0..x5 already the real receiver+args (`compiler::driver`'s
     /// shimmable-primitive eligibility). See [`build_stub_call_primitive`].
     pub call_primitive: CodeHandle,
+    /// S24 A1: a compiled BLOCK body's `nlr_tos` lowering `bl`s here with
+    /// x0 = the closure, x1 = the NLR value; `rt_nlr_originate` parks
+    /// `vm.nlr_state` and the emitted continuation returns `NLR_SENTINEL`
+    /// through the block's own epilogue (`closure_compilation_design.md`
+    /// §2.4). See [`build_stub_nlr_originate`].
+    pub nlr_originate: CodeHandle,
     /// S13 D1 §2b: the shared `not_entrant_stub` — a now-`NotEntrant`
     /// nmethod's `entry`/`verified_entry` are patched (by
     /// `nmethod::make_not_entrant`) to `b not_entrant_stub`, so a future call
@@ -239,6 +251,11 @@ impl Stubs {
     }
     pub fn call_primitive_addr(&self) -> u64 {
         self.call_primitive.base as u64
+    }
+    /// S24 A1: `emit`'s `Ir::NlrReturn` lowering `bl`s here (see
+    /// [`build_stub_nlr_originate`]).
+    pub fn nlr_originate_addr(&self) -> u64 {
+        self.nlr_originate.base as u64
     }
     /// S13 §2b: the address `make_not_entrant` patches an invalidated
     /// nmethod's `entry`/`verified_entry` to branch to.
@@ -344,6 +361,12 @@ pub fn install(cache: &mut CodeCache) -> Stubs {
         .expect("stubs::install: code cache too small for call_primitive");
     cache.publish(h11, &call_primitive_blob);
 
+    let nlr_originate_blob = build_stub_nlr_originate();
+    let h12 = cache
+        .alloc(nlr_originate_blob.code.len())
+        .expect("stubs::install: code cache too small for nlr_originate");
+    cache.publish(h12, &nlr_originate_blob);
+
     Stubs {
         call_stub: h1,
         stub_poll: h2,
@@ -356,6 +379,7 @@ pub fn install(cache: &mut CodeCache) -> Stubs {
         not_entrant: h9,
         deopt_return: h10,
         call_primitive: h11,
+        nlr_originate: h12,
     }
 }
 
@@ -1642,6 +1666,77 @@ pub unsafe extern "C" fn rt_call_primitive(
             desc.name
         ),
     }
+}
+
+/// S24 A1: a compiled block body's `nlr_tos` origination
+/// (`closure_compilation_design.md` §2.4). The emitted lowering `bl`s here
+/// with x0 = the closure, x1 = the NLR value; this stub only parks the
+/// state — the emitted continuation materializes `NLR_SENTINEL` in x0 and
+/// branches to the block's own epilogue, from where every compiled frame
+/// above relays via its existing per-site `emit_nlr_check` (S11 step 9's
+/// machinery, unchanged). `emit_stub_prologue`'s RootSpill save is what
+/// makes x0/x1 (closure, value) GC-visible while `rt_nlr_originate` runs —
+/// `memory::roots::real_oop_rootspill_slots`'s `NlrOriginate` arm reads
+/// exactly 2 live slots (fixed, like `MustBeBoolean`/`AllocSlow`), though
+/// the runtime fn itself never allocates.
+fn build_stub_nlr_originate() -> CodeBlob {
+    let mut a = JasmAssembler::new();
+
+    emit_stub_prologue(&mut a);
+    emit_stub_kind_tag(&mut a, KIND_NLR_ORIGINATE);
+    a.emit("mov", &[x(2), x(1)]); // value -> x2
+    a.emit("mov", &[x(1), x(0)]); // closure -> x1
+    a.emit("mov", &[x(0), x(28)]); // vm
+    let lit = a.literal_u64(
+        rt_nlr_originate as *const () as u64,
+        Some(RelocKind::RuntimeAddr),
+    );
+    a.call_far(lit);
+    emit_stub_epilogue(&mut a);
+    a.emit("ret", &[]);
+
+    a.finish()
+}
+
+/// # Safety
+/// Only ever reached via `blr` from `stub_nlr_originate`'s own
+/// hand-assembled listing above, never called directly from Rust — `vm`
+/// must be `x28` (D4's own invariant, established by `call_stub`).
+///
+/// Parks the in-flight non-local return: `home` unpacked from the closure's
+/// own `home` field, `value` as given, and — the adversarial-review
+/// BLOCKER-§2 fix — the ORIGINATING closure itself, so
+/// `continue_unwind`'s dead-home arm can deliver `#cannotReturn:` to the
+/// real closure (the block's native frame is gone by the time the liveness
+/// check runs; the legacy read-the-current-frame's-receiver-slot strategy
+/// would find the value:-sender's receiver instead). Liveness is
+/// deliberately NOT checked here — parking without checking preserves the
+/// interpreter's exact evaluation point (the check happens once, in
+/// `continue_unwind`, same as interpreted `nlr_tos`). No allocation, no
+/// lookup, no GC window.
+pub unsafe extern "C" fn rt_nlr_originate(vm: *mut VmState, closure_bits: u64, value_bits: u64) {
+    // SAFETY: this function's own contract, guaranteed by `stub_nlr_originate`.
+    let vm = unsafe { &mut *vm };
+    debug_assert_ne!(
+        vm.reg_block.last_compiled_fp, 0,
+        "rt_nlr_originate: anchor must be set by stub_nlr_originate's prologue before this call"
+    );
+    debug_assert!(
+        vm.nlr_state.is_none(),
+        "rt_nlr_originate: an NLR is originating while one is already parked \
+         (enter_compiled's own invariant, compiled_call.rs)"
+    );
+    let closure_oop = crate::oops::Oop::from_raw(closure_bits);
+    let closure = crate::oops::wrappers::ClosureOop::try_from(closure_oop).expect(
+        "rt_nlr_originate: x0 must be the block's own closure (the emitted lowering \
+         passes the pinned closure vreg) -- compiler bug, not a guest one",
+    );
+    let home = crate::oops::home_ref::unpack_home_ref(closure.home());
+    vm.nlr_state = Some(crate::runtime::vm_state::NlrState {
+        home,
+        value: crate::oops::Oop::from_raw(value_bits),
+        closure: Some(closure_oop),
+    });
 }
 
 /// # Safety

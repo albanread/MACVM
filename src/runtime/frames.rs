@@ -67,7 +67,7 @@
 use crate::codecache::nmethod::NmethodId;
 use crate::codecache::stubs::{
     KIND_ALLOC_SLOW, KIND_C2I, KIND_CALL_PRIMITIVE, KIND_DEOPT_BRIDGE, KIND_DNU, KIND_MEGA,
-    KIND_MUST_BE_BOOLEAN, KIND_RESOLVE,
+    KIND_MUST_BE_BOOLEAN, KIND_NLR_ORIGINATE, KIND_RESOLVE,
 };
 use crate::interpreter::stack::Frame;
 use crate::oops::layout::ENTRY_FRAME_SENTINEL;
@@ -94,6 +94,11 @@ pub enum AdapterKind {
     /// `memory::roots::real_oop_rootspill_slots`, which reads the count
     /// from `Nmethod::prim_call_argc_plus_recv` via the caller_pc.
     CallPrimitive,
+    /// S24 A1: a compiled BLOCK body mid-`rt_nlr_originate` (parking a
+    /// non-local return — `codecache::stubs::build_stub_nlr_originate`).
+    /// Owns exactly 2 RootSpill slots, fixed (x0 = the closure, x1 = the
+    /// NLR value), like `MustBeBoolean`/`AllocSlow`'s fixed arms.
+    NlrOriginate,
     Poll,
     /// S14 step 9: not a real adapter — the synthetic anchor
     /// [`deopt_bridge_link`] plants so a walk during `interpret_active` can
@@ -119,6 +124,7 @@ impl AdapterKind {
             KIND_MUST_BE_BOOLEAN => AdapterKind::MustBeBoolean,
             KIND_ALLOC_SLOW => AdapterKind::AllocSlow,
             KIND_CALL_PRIMITIVE => AdapterKind::CallPrimitive,
+            KIND_NLR_ORIGINATE => AdapterKind::NlrOriginate,
             // The deopt trampolines' record (see `KIND_DEOPT_BRIDGE`'s own
             // doc): same walker semantics as the synthetic bridge link —
             // no RootSpill slots, pass through to the deoptee frame.

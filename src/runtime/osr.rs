@@ -192,7 +192,7 @@ pub fn rt_osr_request(vm: &mut VmState, fp: usize, target_bci: u16) -> OsrOutcom
             .take()
             .expect("rt_osr_request: NLR sentinel returned but no NlrState is parked");
         return OsrOutcome::Nlr(crate::interpreter::unwind::continue_unwind(
-            vm, st.home, st.value,
+            vm, st.home, st.value, st.closure,
         ));
     }
 

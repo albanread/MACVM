@@ -766,7 +766,7 @@ fn dispatch_from(vm: &mut VmState, mut method: MethodOop, mut bci: usize) -> Oop
                 let closure = crate::oops::wrappers::ClosureOop::try_from(closure_oop)
                     .expect("nlr_tos: block frame's receiver slot is not a Closure");
                 let home = crate::oops::home_ref::unpack_home_ref(closure.home());
-                match unwind::continue_unwind(vm, home, value) {
+                match unwind::continue_unwind(vm, home, value, Some(closure.oop())) {
                     unwind::UnwindStep::ReturnedFromHome(Some(result)) => return result,
                     // S11 D6.3: `home` is beyond a compiled frame — this
                     // interpreter activation was discarded and `vm.nlr_state`
