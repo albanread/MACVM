@@ -395,6 +395,111 @@ fn eligibility_detail(vm: &VmState, method: MethodOop) -> Eligibility {
     Eligibility::Yes
 }
 
+/// S24 A1 (design §2.1, amended): eligibility for compiling a
+/// CompiledBlock body as its own nmethod. Structural gates: argc <= 3 (the
+/// `value`..`value:value:value:` arity range), no `has_ctx` (a block that
+/// allocates its own Context is a later slice), no `PushClosure` (nested
+/// closure creation — later slice; also what makes A3's transitive
+/// NLR-free scan vacuous for compiled block BODIES in v1), ctx-temp access
+/// at depth 0 only and only when `captures_ctx` (the home Context arrives
+/// as `copied[1]`), the standard bytecode-length / send-site-argc / frame
+/// budget caps. `NlrTos`/`BlockReturnTos` are ALLOWED — that is the point
+/// (§2.4: in A1 every closure's home is an interpreter frame). Value
+/// captures are declined at the TRIGGER (the closure's `ncopied` is a
+/// creation-site property the block alone cannot reveal), not here.
+fn eligibility_detail_block(vm: &VmState, method: MethodOop) -> Eligibility {
+    debug_assert!(method.is_block());
+    if method.argc() > 3 || method.has_ctx() || method.bytecode_len() > MAX_BYTECODE_LEN {
+        if vm.options.trace.is_enabled("jit") {
+            eprintln!(
+                "[jit] block NoPermanent: argc={} has_ctx={} bc_len={}",
+                method.argc(),
+                method.has_ctx(),
+                method.bytecode_len()
+            );
+        }
+        return Eligibility::NoPermanent;
+    }
+    let mut verdict = Eligibility::Yes;
+    let mut bci = 0usize;
+    while bci < method.bytecode_len() {
+        let (instr, next) = decode_at(method, bci);
+        match instr {
+            Instr::PushSelf
+            | Instr::PushNil
+            | Instr::PushTrue
+            | Instr::PushFalse
+            | Instr::PushSmi(_)
+            | Instr::PushLiteral(_)
+            | Instr::PushTemp(_)
+            | Instr::StoreTemp(_)
+            | Instr::StoreTempPop(_)
+            | Instr::PushInstvar(_)
+            | Instr::PushGlobal(_)
+            | Instr::Pop
+            | Instr::Dup
+            | Instr::JumpFwd(_)
+            | Instr::JumpBack(_)
+            | Instr::BrTrueFwd(_)
+            | Instr::BrFalseFwd(_)
+            | Instr::ReturnTos
+            | Instr::ReturnSelf
+            | Instr::StoreInstvarPop(_)
+            | Instr::StoreGlobalPop(_)
+            // The block's own returns — local and non-local — are exactly
+            // what `convert`'s is_block mode lowers (Ret / NlrReturn).
+            | Instr::BlockReturnTos
+            | Instr::NlrTos => {}
+            Instr::Send { ic, super_ } => {
+                if crate::interpreter::ic::InterpreterIc::at(method, ic).argc() > 7 {
+                    return Eligibility::NoPermanent; // register-marshaling cap
+                }
+                if !super_ {
+                    verdict = verdict.worse(mono_smi_inline_send(vm, method, ic));
+                    if verdict == Eligibility::NoPermanent {
+                        return Eligibility::NoPermanent;
+                    }
+                }
+            }
+            Instr::PushClosure { .. } => return Eligibility::NoPermanent,
+            Instr::PushCtxTemp { depth, .. } | Instr::StoreCtxTempPop { depth, .. } => {
+                if depth != 0 || !method.captures_ctx() {
+                    return Eligibility::NoPermanent;
+                }
+            }
+        }
+        bci = next;
+    }
+    if verdict != Eligibility::Yes {
+        return verdict;
+    }
+    let cfg = decode::decode(method);
+    let (_, max_stack) = ir::compute_entry_depths(method, &cfg);
+    if method.ntemps() as i32 + max_stack > FRAME_BUDGET_SLOTS {
+        return Eligibility::NoPermanent;
+    }
+    Eligibility::Yes
+}
+
+/// S24 A1: compile CompiledBlock `blk`'s body as its own nmethod,
+/// registered in `CodeTable::by_block`. `rcvr_klass` is the
+/// no-customization filler (`closure_klass`): a block nmethod has no entry
+/// guard and never self-devirts (`ir::Translator::devirt_self_target`
+/// declines for blocks), so the customization key is never consulted.
+pub fn compile_block(vm: &mut VmState, blk: MethodOop) -> Option<NmethodId> {
+    compile_block_versioned(vm, blk, 0)
+}
+
+/// S24 A1: [`compile_block`] with an explicit version — the
+/// `note_uncommon_trap` is_block branch passes `old.version + 1`, mirroring
+/// `compile_method_versioned`'s recompile discipline (install-first; the
+/// by_block successor guard relies on it).
+pub fn compile_block_versioned(vm: &mut VmState, blk: MethodOop, version: u8) -> Option<NmethodId> {
+    debug_assert!(blk.is_block(), "compile_block: not a CompiledBlock");
+    let closure_klass = vm.universe.closure_klass;
+    compile_method_full(vm, closure_klass, blk, version, None)
+}
+
 /// D1 point 2: `ic_idx`'s own site must already be `Mono`, guarded on
 /// `SmallInteger`, targeting a method whose primitive is in [`SMI_INLINE`]
 /// — OR (S11 D7) a mono `basicNew` site, which `ir.rs` compiles to an
@@ -565,7 +670,12 @@ fn compile_method_full(
     version: u8,
     osr_bci: Option<u16>,
 ) -> Option<NmethodId> {
-    match eligibility_detail(vm, method) {
+    let elig = if method.is_block() {
+        eligibility_detail_block(vm, method)
+    } else {
+        eligibility_detail(vm, method)
+    };
+    match elig {
         Eligibility::Yes => {}
         Eligibility::NoPermanent => {
             method.set_compile_disabled();
@@ -808,7 +918,11 @@ fn compile_method_full(
             call_primitive_addr,
             nlr_originate_addr,
             prim_shim,
-            Some(guard),
+            // S24 A1: a block nmethod has NO receiver-klass customization
+            // (design §2.1 — every closure is a closure_klass instance;
+            // instvar soundness comes from prefix-stable layouts, not an
+            // entry guard), so verified_entry == entry.
+            if method.is_block() { None } else { Some(guard) },
             osr_req.as_ref(),
         );
 
@@ -996,7 +1110,11 @@ fn compile_method_full(
         ic_sites,
         poll_bci,
         prim_call_argc_plus_recv: prim_shim.map(|(_, argc_plus_recv)| argc_plus_recv),
-        block_method: None,
+        // S24 A1: a block nmethod registers under its CompiledBlock in
+        // `by_block` (install() routes on this); key_klass/key_selector
+        // above are fillers for blocks (closure_klass + #aBlock), never
+        // consulted for lookup.
+        block_method: if method.is_block() { Some(method) } else { None },
         deopt_scopes,
         deopt_pcdescs,
         // S14 step 4b: the inline dependencies the converter recorded (one
@@ -1261,6 +1379,7 @@ fn build_deopt_metadata(
 mod tests {
     use super::*;
     use crate::bytecode::builder::BytecodeBuilder;
+    use crate::oops::smi::SmallInt;
     use crate::runtime::vm_state::VmOptions;
 
     fn test_vm() -> VmState {
@@ -1607,6 +1726,105 @@ mod tests {
         let method = b.finish(&mut vm, sel, 0, 0);
         method.set_primitive(21);
         assert!(eligible(&vm, method));
+    }
+
+    /// S24 A1 smoke: a send-free block body compiles and RUNS via its raw
+    /// entry (blocks have no entry guard: verified_entry == entry). `[:x |
+    /// x]` — the identity block — proves Param wiring (closure in x0, arg
+    /// in x1 -> unified temp 0) end to end.
+    #[test]
+    fn compiled_block_identity_runs() {
+        let mut vm = test_vm();
+        let sel = vm.universe.intern(b"aBlock");
+        let mut b = BytecodeBuilder::new();
+        b.push_temp(0);
+        b.block_return_tos();
+        let blk = b.finish(&mut vm, sel, 1, 0);
+        // set_flags(argc, ntemps, has_ctx, is_block, prim_fails, captures_ctx, nctx)
+        blk.set_flags(1, 0, false, true, false, false, 0);
+        assert!(blk.is_block());
+
+        let id = compile_block(&mut vm, blk).expect("identity block must compile");
+        let nm = vm.code_table.get(id).expect("installed");
+        assert!(nm.block_method.is_some(), "block nmethod carries its CompiledBlock");
+        assert_eq!(
+            vm.code_table.lookup_block(blk),
+            Some(id),
+            "by_block finds the Alive block nmethod"
+        );
+
+        // A minimal closure: ncopied=1 (copied[0] = home receiver).
+        let closure = crate::memory::alloc::alloc_closure(&mut vm, 1);
+        closure.set_method(blk);
+        closure.set_copied(0, SmallInt::new(77).oop());
+        closure.set_home(SmallInt::new(0)); // never read: no NlrTos in the body
+
+        let entry = {
+            let nm = vm.code_table.get(id).unwrap();
+            assert_eq!(nm.verified_entry_off, 0, "no entry guard for blocks");
+            nm.code.base as u64 + nm.entry_off as u64
+        };
+        let stubs = vm.stubs;
+        let arg = SmallInt::new(41).oop();
+        let out = stubs.invoke(entry, &mut vm, &[closure.oop().raw(), arg.raw()]);
+        assert_eq!(out, arg.raw(), "identity block must return its argument");
+    }
+
+    /// S24 A1 smoke: `[ self ]` — push_self inside a block reads the HOME
+    /// receiver, i.e. the prologue's `LoadField closure.copied[0]`, not the
+    /// closure itself (the design §2.2 environment synthesis).
+    #[test]
+    fn compiled_block_self_is_home_receiver() {
+        let mut vm = test_vm();
+        let sel = vm.universe.intern(b"aBlock");
+        let mut b = BytecodeBuilder::new();
+        b.push_self();
+        b.block_return_tos();
+        let blk = b.finish(&mut vm, sel, 0, 0);
+        blk.set_flags(0, 0, false, true, false, false, 0);
+
+        let id = compile_block(&mut vm, blk).expect("[self] block must compile");
+        let closure = crate::memory::alloc::alloc_closure(&mut vm, 1);
+        closure.set_method(blk);
+        let home_recv = SmallInt::new(123456).oop();
+        closure.set_copied(0, home_recv);
+        closure.set_home(SmallInt::new(0));
+
+        let entry = {
+            let nm = vm.code_table.get(id).unwrap();
+            nm.code.base as u64 + nm.entry_off as u64
+        };
+        let stubs = vm.stubs;
+        let out = stubs.invoke(entry, &mut vm, &[closure.oop().raw()]);
+        assert_eq!(
+            out,
+            home_recv.raw(),
+            "self inside a compiled block is copied[0], never the closure"
+        );
+    }
+
+    /// S24 A1: the block eligibility gate's rejects.
+    #[test]
+    fn block_eligibility_rejects_v1_exclusions() {
+        let mut vm = test_vm();
+        let sel = vm.universe.intern(b"aBlock");
+        // argc 4 (> value:value:value:'s 3) -> NoPermanent.
+        let mut b = BytecodeBuilder::new();
+        b.push_temp(0);
+        b.block_return_tos();
+        let blk = b.finish(&mut vm, sel, 4, 0);
+        blk.set_flags(4, 0, false, true, false, false, 0);
+        assert!(compile_block(&mut vm, blk).is_none(), "argc>3 must decline");
+        // ctx-temp access without captures_ctx -> NoPermanent.
+        let mut b2 = BytecodeBuilder::new();
+        b2.push_ctx_temp(0, 0);
+        b2.block_return_tos();
+        let blk2 = b2.finish(&mut vm, sel, 0, 0);
+        blk2.set_flags(0, 0, false, true, false, false, 0);
+        assert!(
+            compile_block(&mut vm, blk2).is_none(),
+            "ctx access without captures_ctx must decline"
+        );
     }
 
     /// The already-fused dozen-plus (`PRIM_ALREADY_FUSED`) must NOT become

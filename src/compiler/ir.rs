@@ -1174,6 +1174,15 @@ impl<'a> Translator<'a> {
         k: KlassOop,
         selector: crate::oops::wrappers::SymbolOop,
     ) -> Option<MethodOop> {
+        // S24 A1: NEVER devirtualize self-sends in a block compilation —
+        // `self` inside a block is the HOME receiver (any klass in the home
+        // holder's subtree), while `k` here would be the no-customization
+        // closure_klass filler; resolving against it would splice the WRONG
+        // method (design §2.1: self-sends stay generic sends in block
+        // bodies, v1).
+        if self.method.is_block() {
+            return None;
+        }
         let target = crate::compiler::feedback::resolve_method_ro(self.vm, k, selector)?;
         let smi_fusable = k.oop().raw() == self.vm.universe.smi_klass.oop().raw()
             && crate::compiler::driver::SMI_INLINE.contains(&target.primitive());
