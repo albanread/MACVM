@@ -276,3 +276,41 @@ Correctness: Bench's own checkResult (error: on mismatch) passed on every
 run; full test suite green (19 binaries); stress matrix over 4,609 world
 tests × {GC_STRESS=1, GC_STRESS=full:64, DEOPT_STRESS=64} × threshold=1 —
 0 failures. The S15 T5 gate ("richards ≥ 5.0") is now PASSED at 16x.
+
+## 2026-07-09 (S24 A1, commits 979daf0..db378fa) — compiled closures land
+
+First slice of closure compilation: standalone block bodies compile
+(`by_block` registry, closure calling convention, compiled-block NLR
+origination, root-is_block deopt materializer). Numbers via
+`scripts/perf.sh --release` (t=1/t=1000 columns) on the A1 code:
+
+| benchmark | interp (ms) | jit t=1 | jit t=1000 | best/interp |
+|---|---|---|---|---|
+| richards | 218 | 19 | 13 | 16.8x |
+| deltablue | 229 | 43 | 55 | **5.3x** |
+
+- **DeltaBlue gate (>=5.0x) PASSED already at A1** — the design expected
+  this to need A2/A3. Block-iteration backbone (do:/detect:-style bodies)
+  no longer interprets. Was 3.4x at the IC-stomp fix (a2bfd8b).
+- richards 16.8x: the >=16x no-regression gate holds (blocks there are
+  the S14-ELIDED kind; A1 must not and did not perturb the splices).
+- arith 1447 -> 11ms (131x), fib/sieve unchanged — gate 3 noise band.
+- Interpreted tail (MACVM_TRACE=count, deltablue warm t=2000 vs off):
+  14,316,872 / 102,901,203 = **0.139** (pre-A1 doc baseline 0.163;
+  gate 2 target <0.10 is A3's job). The NEW per-method attribution
+  (`bytecodes-by-method:` lines) shows the residue is entirely the
+  A3-target creator methods (constraintsConsuming:do:, makePlan:, ...)
+  — ZERO `[block]` entries in the top 40: A1 did exactly its share.
+- Correctness: world suite byte-identical vs interpreter at t=1 AND
+  t=200, plain and under {GC_STRESS=1, GC_STRESS=full:64,
+  DEOPT_STRESS=64}; deltablue+richards under the same matrix at t=200
+  all green. Two real bugs found by the benchmark half of the matrix:
+  the PIC duplicate-klass GC corruption (FIXED, db378fa — also the true
+  cause of the "cache exhaustion" abort) and the t=1-only stale-slot
+  (task #125, pre-existing, full dossier in tests/repros/README.md
+  entry 9).
+- Measurement policy note: threshold=1 stays the DIFFERENTIAL oracle
+  (compile everything, compare bytes); it is NOT a perf configuration —
+  cold compiles get no feedback-driven code. Stress and perf runs now
+  also gate on threshold=200 (metric-driven compiles), release builds,
+  all modes in parallel.
