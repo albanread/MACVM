@@ -528,6 +528,18 @@ fn blockarg_candidate_ok(
     let Some(blk) = MethodOop::try_from(method.literals().at(lit as usize)) else {
         return false;
     };
+    // S24 B5 step 5: the compiler engine (H6 cur_id threading in ir.rs)
+    // fully supports multi-BB blocks here, but the predicate stays STRICT
+    // until the deopt materializer's cross-frame read hazard is fixed:
+    // allocations inside deoptimize_frame (phantom/B4 closure synthesis,
+    // Elided-ctx Contexts) can scavenge, and the DeoptBridge walker
+    // deliberately bridges PAST the dead compiled frame, so its spill
+    // slots are never GC-updated -- any read_value AFTER an earlier
+    // frame's allocating fixup reads stale pre-move addresses. Flipping
+    // this to block_is_spliceable_cfg made deltablue's depth-3
+    // constraintsConsuming:do: shape deopt-storm straight into that
+    // window (caught by B4's Frame::verify tripwire). Fix = resolve every
+    // dead-frame read before ANY materializer allocation, then flip this.
     if !block_is_spliceable(blk) {
         return false;
     }
@@ -610,11 +622,9 @@ pub fn analyze(vm: &crate::runtime::vm_state::VmState, method: MethodOop) -> Clo
                 sites.insert(bci);
                 let block = MethodOop::try_from(method.literals().at(lit as usize))
                     .expect("push_closure literal is not a CompiledBlock");
-                // S24 B5: direct-value sites accept forward-only multi-BB
-                // bodies (grafted); the blockarg path re-checks the STRICT
-                // predicate in blockarg_candidate_ok and declines multi-BB
-                // there (its transfer arm then marks the site escaping — the
-                // A-series closure path) until step 5.
+                // S24 B5: both site kinds (direct value, block-arg) accept
+                // forward-only multi-BB bodies via the relaxed predicate;
+                // blockarg_candidate_ok re-checks the same predicate.
                 if !block_is_spliceable_cfg(block) {
                     escaping.insert(bci);
                 }

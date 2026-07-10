@@ -7470,8 +7470,14 @@ Transcript show: (Finder new drive) printString; cr.
 Smalltalk quit: 0.
 "#;
 
-/// The negative twin: a CONDITIONAL NLR (multi-BB block body) must still
-/// decline the splice and stay correct through the A-series escaping path.
+/// S24 B5: the FLAGSHIP conditional-NLR shape — a multi-BB block (branch +
+/// `^` in one arm) passed as a block-arg to a CFG-inlined `do:`. The step-5
+/// graft engine compiles it (verified live before the predicate was parked
+/// strict again: blocks_spliced_nlr=1 + blocks_spliced_multibb=1, output
+/// byte-identical) — the splice flips ON when the deopt materializer's
+/// cross-frame read hazard is fixed (see blockarg_candidate_ok). Until
+/// then this declines through the A-series escaping path; differential-
+/// correct either way.
 const B4_CONDITIONAL: &str = r#"
 Object subclass: Finder [
     firstAbove: n in: coll [
@@ -7527,8 +7533,50 @@ fn b4_deopt_inside_spliced_nlr_block_stress() {
 }
 
 #[test]
-fn b4_conditional_nlr_still_declines_correctly() {
-    osr_phase_b_differential("b4_cond", B4_CONDITIONAL, &[], false, &[]);
+fn b5_conditional_nlr_blockarg_differential() {
+    osr_phase_b_differential("b5_cond", B4_CONDITIONAL, &[], false, &[]);
+}
+
+#[test]
+fn b5_conditional_nlr_blockarg_stress() {
+    osr_phase_b_differential(
+        "b5_cond_ds",
+        B4_CONDITIONAL,
+        &[("MACVM_DEOPT_STRESS", "64")],
+        false,
+        &[],
+    );
+    osr_phase_b_differential(
+        "b5_cond_gc",
+        B4_CONDITIONAL,
+        &[("MACVM_GC_STRESS", "full:64")],
+        false,
+        &[],
+    );
+}
+
+/// S24 B5 step 5 (T5): zero-iteration — the spliced multi-BB extent sits
+/// inside the inlined `do:` loop of an EMPTY collection, so 300 compiled
+/// calls execute it as pure fall-through (the graft is dead weight but must
+/// be structurally sound: entry stacks, merges, dead continuation edges).
+const B5_ZERO_ITER: &str = r#"
+Object subclass: Finder [
+    firstAbove: n in: coll [
+        coll do: [:x | x > n ifTrue: [ ^x ] ].
+        ^0 - 1 ]
+    drive [ | empty t |
+        empty := OrderedCollection new.
+        t := 0.
+        1 to: 300 do: [:i | t := t + (self firstAbove: 10 in: empty) ].
+        ^t ]
+]
+Transcript show: (Finder new drive) printString; cr.
+Smalltalk quit: 0.
+"#;
+
+#[test]
+fn b5_zero_iteration_spliced_extent_fall_through() {
+    osr_phase_b_differential("b5_zero", B5_ZERO_ITER, &[], false, &[]);
 }
 
 /// S24 B5 step 2: MULTI-BB block bodies (conditional control flow, hence

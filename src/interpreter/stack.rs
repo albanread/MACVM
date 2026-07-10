@@ -468,7 +468,12 @@ impl Frame {
             assert!(
                 shape_a,
                 "Frame::verify: block frame must be activate-shaped \
-                 (arg slot = closure, FP+4 = closure.copied(0))"
+                 (arg slot = closure, FP+4 = closure.copied(0)); \
+                 arg={:#x} is_closure={} copied0={:?} fp4_receiver={:#x}",
+                arg.raw(),
+                crate::oops::wrappers::ClosureOop::try_from(arg).is_some(),
+                crate::oops::wrappers::ClosureOop::try_from(arg).map(|cl| cl.copied(0).raw()),
+                self.receiver(st).raw()
             );
         } else {
             assert_eq!(

@@ -2208,6 +2208,11 @@ impl<'a> Translator<'a> {
             GraftMode::Method => (false, None),
             GraftMode::Block { parent } => (true, parent),
         };
+        if is_block_graft {
+            // Both graft consumers (direct value sites, in-callee blockarg
+            // value sites) route here — the one place the stat can't miss.
+            self.spliced_multibb += 1;
+        }
         let _ = deopt; // caller-block deopt vec unused: guard cold path is its own block
                        // Same exact-arm-set validation as `try_inline_nonleaf` (see the
                        // comment there): the CFG walk aborts on shapes outside its arm list,
@@ -2364,6 +2369,16 @@ impl<'a> Translator<'a> {
             };
             let cfg_block = &ccfg.blocks[b];
             let mut cstack = entry_stack.clone();
+            // S24 B5 step 5 (H6 cur_id threading): the IrBlock id the CURRENT
+            // accumulating segment of callee block `b` will be finished as.
+            // A multi-BB block graft at an in-callee value site SPLITS the
+            // segment (mirroring the root loop's split protocol): the pre-
+            // split segment ends with a Jump to the graft entry, and the
+            // graft's continuation becomes the new segment. Predecessor
+            // edges into `b` still target `ir_ids[b]` (the FIRST segment);
+            // the terminator, `exit_stacks[b]`, and merge-moves land in the
+            // FINAL segment via this variable.
+            let mut cur_id = ir_ids[b];
             // S14 step 7-IV-c: parallel phantom shadow — `true` where the
             // callee's sim stack holds the block-arg PHANTOM (pushed by
             // `push_temp arg_ix`). Never survives a block boundary
@@ -2503,6 +2518,10 @@ impl<'a> Translator<'a> {
                         if recv_is_phantom {
                             let (_, blk, blk_pool_ix) =
                                 blockarg.expect("phantom shadow set without a blockarg");
+                            // Snapshot BEFORE popping: the recursive graft
+                            // derives its caller_pending_stack (this callee's
+                            // stack below phantom+args) from the pre-pop view.
+                            let pre_pop_cstack = cstack.clone();
                             let mut blk_args: Vec<VReg> = (0..inner_argc)
                                 .map(|_| {
                                     cstack_ph.pop();
@@ -2516,6 +2535,60 @@ impl<'a> Translator<'a> {
                                 !cstack_ph.iter().any(|&ph| ph),
                                 "cfg splice: phantom below a value site (transparency bug)"
                             );
+                            // S24 B5 step 5: a multi-BB block grafts via the
+                            // CFG engine (depth 3: block <- callee <- root),
+                            // splitting this callee block's segment. The
+                            // recursion allocates its own fresh IrBlock ids
+                            // (no collision with ir_ids) and finishes its own
+                            // blocks; its continuation becomes our new
+                            // segment. mem::take per segment keeps bdeopt's
+                            // per-block code indices correct (they restart at
+                            // 0 in the new segment's bcode).
+                            if crate::compiler::decode::decode(blk).blocks.len() > 1 {
+                                let (res, entry_id, cont_id) = self
+                                    .try_inline_cfg(
+                                        blk,
+                                        None,
+                                        dep_klass,
+                                        inner_sel,
+                                        self.self_vreg,
+                                        &blk_args,
+                                        inner_bci,
+                                        &pre_pop_cstack,
+                                        &mut bcode,
+                                        &mut bdeopt,
+                                        None,
+                                        GraftMode::Block {
+                                            parent: Some(Box::new(inline_proto.clone())),
+                                        },
+                                    )
+                                    .expect(
+                                        "cfg splice: escape proved the block-arg's multi-BB \
+                                         body graftable but the graft declined (compiler bug)",
+                                    );
+                                let mut seg_code = std::mem::take(&mut bcode);
+                                let seg_deopt = std::mem::take(&mut bdeopt);
+                                seg_code.push(Ir::Jump { target: entry_id });
+                                self.finish_block(IrBlock {
+                                    id: cur_id,
+                                    bci: send_bci,
+                                    code: seg_code,
+                                    entry_stack: if cur_id == ir_ids[b] {
+                                        entry_stack.clone()
+                                    } else {
+                                        // A split-off continuation's own
+                                        // entry_stack is never consulted
+                                        // (root split protocol's rule).
+                                        Vec::new()
+                                    },
+                                    deopt_sites: seg_deopt,
+                                });
+                                cur_id = cont_id;
+                                cstack.push(res);
+                                cstack_ph.push(false);
+                                bci = next;
+                                continue;
+                            }
                             // The block's slots: value args alias + fresh nils.
                             let mut bslots: Vec<VReg> =
                                 Vec::with_capacity(blk.argc() + blk.ntemps());
@@ -2912,10 +2985,14 @@ impl<'a> Translator<'a> {
 
             exit_stacks[b] = Some(cstack);
             self.finish_block(IrBlock {
-                id: ir_ids[b],
+                id: cur_id,
                 bci: send_bci,
                 code: bcode,
-                entry_stack,
+                entry_stack: if cur_id == ir_ids[b] {
+                    entry_stack
+                } else {
+                    Vec::new() // split-off tail segment; entry never consulted
+                },
                 deopt_sites: bdeopt,
             });
         }
@@ -4516,7 +4593,6 @@ impl<'a> Translator<'a> {
                 stack_sites.pop();
                 stack.pop().expect("value-send: missing operand");
             }
-            self.spliced_multibb += 1;
             stack.push(result);
             stack_sites.push(None);
             debug_assert!(
