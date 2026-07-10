@@ -284,6 +284,49 @@ fn block_is_spliceable(block: MethodOop) -> bool {
     true
 }
 
+/// S24 B5: the RELAXED spliceable predicate for direct-value sites — a block
+/// body may now be a small forward-only CFG (frontend-inlined ifTrue:/and:/
+/// or: chains, hence CONDITIONAL `^`), grafted through `try_inline_cfg`'s
+/// Block mode rather than the linear walk. Accepts any number of CFG blocks
+/// whose terminators are Return / Fallthrough / forward Jump / Branch.
+/// Still declines (unchanged from the strict predicate): an owned heap
+/// Context (`has_ctx` — nested-depth machinery), BACK-edges (loops in
+/// blocks: a novel LoopPoll-in-is_block deopt shape with no payoff shape
+/// needing it, v1), super sends, nested closures, depth≠0 ctx access.
+/// The blockarg path keeps the strict single-BB predicate until B5 step 5.
+fn block_is_spliceable_cfg(block: MethodOop) -> bool {
+    if block.has_ctx() {
+        return false;
+    }
+    let cfg = decode::decode(block);
+    for b in &cfg.blocks {
+        match b.terminator {
+            Terminator::Return | Terminator::Fallthrough(_) | Terminator::Branch { .. } => {}
+            Terminator::Jump { is_backward, .. } => {
+                if is_backward {
+                    return false;
+                }
+            }
+        }
+    }
+    let len = block.bytecode_len();
+    let mut bci = 0;
+    while bci < len {
+        let (instr, next) = decode_at(block, bci);
+        match instr {
+            Instr::Send { super_: true, .. } | Instr::PushClosure { .. } => return false,
+            Instr::PushCtxTemp { depth, .. } | Instr::StoreCtxTempPop { depth, .. }
+                if depth != 0 =>
+            {
+                return false
+            }
+            _ => {}
+        }
+        bci = next;
+    }
+    true
+}
+
 /// Per-block abstract entry state: the operand stack (bottom-first) and the
 /// unified arg/temp array, both carrying [`AV`]s.
 #[derive(Clone, PartialEq, Eq)]
@@ -556,10 +599,19 @@ pub fn analyze(vm: &crate::runtime::vm_state::VmState, method: MethodOop) -> Clo
                 sites.insert(bci);
                 let block = MethodOop::try_from(method.literals().at(lit as usize))
                     .expect("push_closure literal is not a CompiledBlock");
-                if !block_is_spliceable(block) {
+                // S24 B5: direct-value sites accept forward-only multi-BB
+                // bodies (grafted); the blockarg path re-checks the STRICT
+                // predicate in blockarg_candidate_ok and declines multi-BB
+                // there (its transfer arm then marks the site escaping — the
+                // A-series closure path) until step 5.
+                if !block_is_spliceable_cfg(block) {
                     escaping.insert(bci);
                 }
-                site_has_sends.insert(bci, !crate::compiler::inline::is_leaf(block));
+                // H5: a multi-BB body introduces safepoints WITHOUT sends
+                // (each Branch's not_bool trap edge) — the stale-alias rule
+                // must treat the splice as safepoint-bearing either way.
+                let multi_bb = decode::decode(block).blocks.len() != 1;
+                site_has_sends.insert(bci, !crate::compiler::inline::is_leaf(block) || multi_bb);
             }
             bci = next;
         }

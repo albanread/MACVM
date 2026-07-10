@@ -372,6 +372,9 @@ pub struct VmStats {
     /// execution. The per-gate "did the NLR block actually splice" signal;
     /// nonzero proves the B4 gate relaxation is firing.
     pub blocks_spliced_nlr: u64,
+    /// S24 B5: multi-BB block bodies grafted (per compile) — nonzero proves
+    /// the CFG graft is firing for conditional-NLR / branchy block shapes.
+    pub blocks_spliced_multibb: u64,
 }
 
 /// The `MACVM_TRACE=stats` dump (`main.rs::print_vm_stats`) and RUSTTCL's
@@ -423,6 +426,10 @@ pub fn format_vm_stats(vm: &VmState) -> String {
         ),
         format!("[stats] osr_ctx_adopted={}", s.osr_ctx_adopted),
         format!("[stats] blocks_spliced_nlr={}", s.blocks_spliced_nlr),
+        format!(
+            "[stats] blocks_spliced_multibb={}",
+            s.blocks_spliced_multibb
+        ),
         format!("[stats] scavenge_count={}", g.scavenge_count),
         format!(
             "[stats] scavenge_us_total={} scavenge_us_max={}",

@@ -561,6 +561,8 @@ pub struct IrMethod {
     /// S24 B4: count of spliced blocks containing a `^` in this compile —
     /// the driver bumps `vm.stats.blocks_spliced_nlr` from it.
     pub spliced_nlr: u32,
+    /// S24 B5: count of multi-BB block bodies grafted in this compile.
+    pub spliced_multibb: u32,
     pub safepoints: Vec<SafepointId>,
     /// Always present (`convert` interns them unconditionally) — `emit.rs`
     /// has no `VmState` of its own to intern `true_obj`/`false_obj` on
@@ -909,6 +911,19 @@ impl PoolBuilder {
 /// in-graft deopt), depth-0 ctx-temp access routed through the home Context,
 /// and NO inline dependency (a literal block is not a dispatched callee — no
 /// redefinition can retarget it).
+/// S24 B5: what [`Translator::splice_block`] did with the value-send.
+enum SpliceOutcome {
+    /// Single-BB linear splice completed in the CURRENT block; result pushed.
+    Done,
+    /// The (single-BB) body ended in a terminating trap/NLR — the caller
+    /// must stop translating its current block.
+    Trapped,
+    /// S24 B5: a multi-BB body was GRAFTED — the caller must end its current
+    /// block (pending_jump_target is armed at the graft entry) and continue
+    /// translating in the returned continuation block.
+    Continuation(BlockId),
+}
+
 enum GraftMode {
     Method,
     // Constructed by B5 step 2 (block_is_spliceable_cfg + splice routing);
@@ -926,6 +941,8 @@ struct Translator<'a> {
     /// S24 B4: spliced blocks whose body contained a `^` — transferred to
     /// `IrMethod.spliced_nlr`, bumped into `vm.stats` by the driver.
     spliced_nlr: u32,
+    /// S24 B5: multi-BB block bodies grafted this compile.
+    spliced_multibb: u32,
     /// S14 step 5 (customization, A3): the receiver klass K this compilation
     /// is FOR. The nmethod's entry guard proves every receiver has exactly
     /// this klass, so a send whose receiver is provably `self` dispatches
@@ -4317,10 +4334,15 @@ impl<'a> Translator<'a> {
                 }
                 let target = self.escape.as_ref().and_then(|e| e.value_send_target(bci));
                 if let Some(site) = target {
-                    if self.splice_block(site, ic, bci, stack, stack_sites, code, deopt) {
-                        *trapped = true;
+                    match self.splice_block(site, ic, bci, stack, stack_sites, code, deopt) {
+                        SpliceOutcome::Trapped => {
+                            *trapped = true;
+                            Some(None)
+                        }
+                        SpliceOutcome::Done => Some(None),
+                        // S24 B5: multi-BB graft — continue in its continuation.
+                        SpliceOutcome::Continuation(cont) => Some(Some(cont)),
                     }
-                    Some(None)
                 } else {
                     None
                 }
@@ -4361,7 +4383,7 @@ impl<'a> Translator<'a> {
         stack_sites: &mut Vec<Option<usize>>,
         code: &mut Vec<Ir>,
         deopt: &mut Vec<(u32, DeoptRaw)>,
-    ) -> bool {
+    ) -> SpliceOutcome {
         // Resolve the CompiledBlock from the `push_closure` literal at `site_bci`.
         let (site_instr, _) = decode_at(self.method, site_bci);
         let lit = match site_instr {
@@ -4377,6 +4399,57 @@ impl<'a> Translator<'a> {
             block.argc(),
             "splice_block: value-send argc must match block argc (escape guaranteed)"
         );
+
+        // S24 B5 step 2: probe the body's CFG BEFORE touching the sim stack.
+        // A multi-BB body (frontend-inlined ifTrue:/and:/or: inside the
+        // block — hence CONDITIONAL `^`) grafts through the SAME engine
+        // method inlining uses (GraftMode::Block), which mints its own
+        // IrBlocks + continuation; the linear walk below keeps the proven
+        // single-BB path. This is a COMMITTED site (the phantom receiver has
+        // no runtime value), so the graft must succeed — mirrored from
+        // splice_blockarg_send's own expect.
+        let block_cfg = crate::compiler::decode::decode(block);
+        let single_bb = block_cfg.blocks.len() == 1
+            && matches!(
+                block_cfg.blocks[0].terminator,
+                crate::compiler::decode::Terminator::Return
+            );
+        if !single_bb {
+            let args: Vec<VReg> = stack[stack.len() - argc..].to_vec();
+            let pre_pop_stack = stack.clone();
+            let selector = InterpreterIc::at(self.method, ic).selector();
+            let (result, entry_id, continuation_id) = self
+                .try_inline_cfg(
+                    block,
+                    None, // no guard: the receiver is statically the literal block
+                    self.rcvr_klass, // unused in Block mode (no inline dep)
+                    selector,
+                    self.self_vreg, // the block's home self
+                    &args,
+                    send_bci,
+                    &pre_pop_stack,
+                    code,
+                    deopt,
+                    None,
+                    GraftMode::Block { parent: None },
+                )
+                .expect(
+                    "splice_block: escape proved the block CFG-graftable but the graft                      declined (compiler bug)",
+                );
+            for _ in 0..(argc + 1) {
+                stack_sites.pop();
+                stack.pop().expect("value-send: missing operand");
+            }
+            self.spliced_multibb += 1;
+            stack.push(result);
+            stack_sites.push(None);
+            debug_assert!(
+                self.pending_jump_target.is_none(),
+                "block graft: a pending jump target is already armed"
+            );
+            self.pending_jump_target = Some(entry_id);
+            return SpliceOutcome::Continuation(continuation_id);
+        }
 
         // Pop the value-send's args (real vregs) + the phantom receiver, keeping
         // `stack`/`stack_sites` in lockstep. An arg is never a block-site (an
@@ -4397,18 +4470,11 @@ impl<'a> Translator<'a> {
         // access inside the block body).
         let block_self = self.self_vreg;
 
-        // Re-validate the spliceable shape (escape's `block_is_spliceable` proved
-        // it; the arity is site-specific). If it somehow fails we have already
-        // popped the operands and cannot cleanly recover — assert.
-        let block_cfg = crate::compiler::decode::decode(block);
+        // Arity re-check (the shape was routed above; the arity is
+        // site-specific). Operands are already popped — no clean recovery.
         assert!(
-            block_cfg.blocks.len() == 1
-                && matches!(
-                    block_cfg.blocks[0].terminator,
-                    crate::compiler::decode::Terminator::Return
-                )
-                && block.argc() == blk_args.len(),
-            "splice_block: escape proved spliceable but shape re-check failed"
+            block.argc() == blk_args.len(),
+            "splice_block: escape proved spliceable but arity re-check failed"
         );
 
         // Callee slots: args alias the value-send operands (no stores); temps
@@ -4454,11 +4520,11 @@ impl<'a> Translator<'a> {
             code,
             deopt,
         ) {
-            Err(()) => true,
+            Err(()) => SpliceOutcome::Trapped,
             Ok(result) => {
                 stack.push(result);
                 stack_sites.push(None);
-                false
+                SpliceOutcome::Done
             }
         }
     }
@@ -5388,6 +5454,7 @@ pub fn convert(vm: &VmState, rcvr_klass: KlassOop, method: MethodOop, cfg: &Cfg)
         vm,
         method,
         spliced_nlr: 0,
+        spliced_multibb: 0,
         rcvr_klass,
         self_devirt: false,
         vregs,
@@ -5983,6 +6050,7 @@ pub fn convert(vm: &VmState, rcvr_klass: KlassOop, method: MethodOop, cfg: &Cfg)
         ctx_vregs,
         method_ctx_vreg: method_ctx_vreg.map(|v| (v, method.nctx())),
         spliced_nlr: t.spliced_nlr,
+        spliced_multibb: t.spliced_multibb,
         block_closure_vreg,
         safepoints: Vec::new(),
         true_lit,

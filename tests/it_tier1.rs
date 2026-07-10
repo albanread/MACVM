@@ -141,6 +141,7 @@ fn run_ir_raw() {
         block_closure_vreg: None,
         method_ctx_vreg: None,
         spliced_nlr: 0,
+        spliced_multibb: 0,
         safepoints: Vec::new(),
         // Unused: this method has no SmiCmpVal/BoolBr, so emit.rs never
         // dereferences these against the (also empty) pool.
@@ -277,6 +278,7 @@ fn mul_method() -> IrMethod {
         block_closure_vreg: None,
         method_ctx_vreg: None,
         spliced_nlr: 0,
+        spliced_multibb: 0,
         safepoints: Vec::new(),
         true_lit: PoolLit(0),
         false_lit: PoolLit(0),
@@ -402,6 +404,7 @@ fn run_ir_raw_forces_spill() {
         block_closure_vreg: None,
         method_ctx_vreg: None,
         spliced_nlr: 0,
+        spliced_multibb: 0,
         safepoints: Vec::new(),
         true_lit: PoolLit(0),
         false_lit: PoolLit(0),
@@ -2484,6 +2487,7 @@ fn mono_resolve_patches_call_site_and_dispatches() {
         block_closure_vreg: None,
         method_ctx_vreg: None,
         spliced_nlr: 0,
+        spliced_multibb: 0,
         safepoints: Vec::new(),
         true_lit: PoolLit(0),
         false_lit: PoolLit(0),
@@ -2661,6 +2665,7 @@ fn build_c2i_scenario(vm: &mut VmState) -> (u64, KlassOop, NmethodId) {
         block_closure_vreg: None,
         method_ctx_vreg: None,
         spliced_nlr: 0,
+        spliced_multibb: 0,
         safepoints: Vec::new(),
         true_lit: PoolLit(0),
         false_lit: PoolLit(0),
@@ -2902,6 +2907,7 @@ fn full_ic_lattice_mono_to_pic_to_mega() {
         block_closure_vreg: None,
         method_ctx_vreg: None,
         spliced_nlr: 0,
+        spliced_multibb: 0,
         safepoints: Vec::new(),
         true_lit: PoolLit(0),
         false_lit: PoolLit(0),
@@ -3137,6 +3143,7 @@ fn dnu_from_compiled_code_reaches_does_not_understand() {
         block_closure_vreg: None,
         method_ctx_vreg: None,
         spliced_nlr: 0,
+        spliced_multibb: 0,
         safepoints: Vec::new(),
         true_lit: PoolLit(0),
         false_lit: PoolLit(0),
@@ -7512,4 +7519,127 @@ fn b4_deopt_inside_spliced_nlr_block_stress() {
 #[test]
 fn b4_conditional_nlr_still_declines_correctly() {
     osr_phase_b_differential("b4_cond", B4_CONDITIONAL, &[], false, &[]);
+}
+
+/// S24 B5 step 2: MULTI-BB block bodies (conditional control flow, hence
+/// conditional `^`) now splice at direct value-family sends, grafted through
+/// try_inline_cfg's Block mode. Builder-built (the real frontend inlines
+/// `[..] value` at parse time, so the shape cannot be written in source).
+/// The block ICs are warmed by two interpreted runs BEFORE compiling, so the
+/// graft lowers the block's `<`/`+` to real fused branches, not cold traps.
+fn b5_home_and_block(
+    vm: &mut VmState,
+    all_arms_nlr: bool,
+) -> (macvm::oops::wrappers::MethodOop, SymbolOop) {
+    let smi_klass = vm.universe.smi_klass;
+    let lt_sel = vm.universe.intern(b"<");
+    let plus_sel = vm.universe.intern(b"+");
+    let value1_sel = vm.universe.intern(b"value:");
+
+    let mut b = BytecodeBuilder::new();
+    let lit = b.build_block(vm, 1, 0, false, 0, false, |blk, vm| {
+        // [:x | (x < 10) ifTrue: [^111]. x + 1]      (both-exits)
+        // [:x | (x < 10) ifTrue: [^111]. ^222]       (all-arms-NLR)
+        blk.push_temp(0);
+        blk.push_smi_i8(10);
+        blk.send(vm, lt_sel, 1);
+        let els = blk.new_label();
+        blk.br_false_fwd(els);
+        blk.push_smi_i8(111);
+        blk.nlr_tos();
+        blk.bind(els);
+        if all_arms_nlr {
+            blk.push_smi_i8(94); // i8 range
+            blk.nlr_tos();
+        } else {
+            blk.push_temp(0);
+            blk.push_smi_i8(1);
+            blk.send(vm, plus_sel, 1);
+            blk.block_return_tos();
+        }
+    });
+    // m: x [ ^([block] value: x) + 100 ]  — the +100 is DEAD when every arm NLRs.
+    b.push_closure(lit, 0);
+    b.push_temp(0);
+    b.send(vm, value1_sel, 1);
+    b.push_smi_i8(100);
+    b.send(vm, plus_sel, 1);
+    b.ret_tos();
+    let m_sel = vm
+        .universe
+        .intern(if all_arms_nlr { b"b5nlr:" } else { b"b5both:" });
+    let m = b.finish(vm, m_sel, 1, 0);
+    install_method(vm, smi_klass, m_sel, m);
+    (m, m_sel)
+}
+
+fn b5_run(vm: &mut VmState, m: macvm::oops::wrappers::MethodOop, x: i64) -> i64 {
+    let recv = SmallInt::new(0).oop();
+    let r = macvm::interpreter::run_method(vm, m, recv, &[SmallInt::new(x).oop()]);
+    SmallInt::try_from(r)
+        .map(|s| s.value())
+        .expect("smi result")
+}
+
+#[test]
+fn b5_multibb_conditional_nlr_splices_both_exits() {
+    let mut vm = loop_test_vm(); // Threshold(1); smi prims installed
+    install_value_prims(&mut vm);
+    let (m, _) = b5_home_and_block(&mut vm, false);
+    let smi_klass = vm.universe.smi_klass;
+
+    // Interpreter oracle + block-IC warmup (compile below sees warm ICs).
+    let i_nlr = b5_run(&mut vm, m, 5); // block NLRs 111 -> m answers 111 (no +100)
+    let i_fall = b5_run(&mut vm, m, 50); // block answers 51 -> +100 -> 151
+    assert_eq!((i_nlr, i_fall), (111, 151), "interpreter oracle");
+
+    let before_multibb = vm.stats.blocks_spliced_multibb;
+    let before_nlr = vm.stats.blocks_spliced_nlr;
+    let id = driver::compile_method(&mut vm, smi_klass, m).expect("B5: multi-BB body must compile");
+    assert!(
+        vm.stats.blocks_spliced_multibb > before_multibb,
+        "the multi-BB graft must fire"
+    );
+    assert!(
+        vm.stats.blocks_spliced_nlr > before_nlr,
+        "the grafted body's ^ must count"
+    );
+
+    // Compiled: both exits byte-agree with the interpreter.
+    let recv = SmallInt::new(0).oop();
+    for (x, want) in [(5i64, 111i64), (50, 151), (9, 111), (10, 111)] {
+        // (x=10: 10 < 10 is false -> 10 + 1 + 100 = 111 via the fall-out arm)
+        vm.stack.push(recv);
+        vm.stack.push(SmallInt::new(x).oop());
+        assert_eq!(enter_compiled(&mut vm, id, 1), EnterResult::Completed);
+        let got = SmallInt::try_from(vm.stack.pop()).map(|s| s.value());
+        assert_eq!(got, Some(want), "compiled b5both: {x}");
+    }
+}
+
+#[test]
+fn b5_multibb_all_arms_nlr_dead_continuation() {
+    let mut vm = loop_test_vm();
+    install_value_prims(&mut vm);
+    let (m, _) = b5_home_and_block(&mut vm, true);
+    let smi_klass = vm.universe.smi_klass;
+
+    let i_a = b5_run(&mut vm, m, 5); // ^111
+    let i_b = b5_run(&mut vm, m, 50); // ^94  (the i8-adjusted constant)
+    assert_eq!(
+        (i_a, i_b),
+        (111, 94),
+        "interpreter oracle (the +100 is dead)"
+    );
+
+    let id = driver::compile_method(&mut vm, smi_klass, m)
+        .expect("B5: all-arms-NLR body must compile (continuation is dead but well-formed)");
+    let recv = SmallInt::new(0).oop();
+    for (x, want) in [(5i64, 111i64), (50, 94)] {
+        vm.stack.push(recv);
+        vm.stack.push(SmallInt::new(x).oop());
+        assert_eq!(enter_compiled(&mut vm, id, 1), EnterResult::Completed);
+        let got = SmallInt::try_from(vm.stack.pop()).map(|s| s.value());
+        assert_eq!(got, Some(want), "compiled b5nlr: {x}");
+    }
 }
