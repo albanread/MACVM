@@ -341,3 +341,39 @@ adapter + nested interpreter activation. `scripts/perf.sh --release`:
 - Correctness: world byte-identical vs interpreter at t=1 AND t=200, plain
   and under {GC_STRESS=1, DEOPT_STRESS=64}; benches x 3 stress modes x
   t=200 all green; cargo test 833/0.
+
+## S24 A3 — compiled closure creation (A3a escaping non-ctx, A3b materialize Context)
+
+2026-07-10, commits 96faa0a (A3a), fb01b7a (A3b), 70b5513 + 9de470b (review
+remediation). Release, MacBook arm64, `world/bench/*` via `Bench run:`.
+
+| benchmark | interp (ms) | jit t=200 | jit t=1000 | best/interp |
+|---|---|---|---|---|
+| richards | 204 | 20 | 13 | 15.7x (held) |
+| deltablue | 214 | 33 | 33 | **6.5x** |
+
+- **deltablue 6.3x -> 6.5x** and, far more important, the A3b tail methods
+  (constraintsConsuming:do:, addConstraintsConsuming:to:, printOn:) now
+  COMPILE — closure-creating methods with captured temps get a real
+  materialized Context. T5 >=5.0 gate: PASSED.
+- **The benchmark run was the detector for two release-observable bugs the
+  world differential missed** (both fixed, see tests/repros/):
+  1. `rt_alloc_slow` still enforced D7's Slots-only contract and allocated
+     `nis` words ignoring the site size — a Closure/Context Alloc overflowing
+     eden returned a too-short object and the continuation corrupted the
+     neighbor (deltablue DNU #value: under real allocation pressure; every
+     small repro stayed on the inline fast path). Latent since A3a.
+  2. a has_ctx method whose FIRST bytecode is a loop header re-ran the
+     block-0 prologue every iteration (per-iteration Context snapshots vs the
+     interpreter's ONE shared Context — silent wrong answers). Now declined.
+- Remaining deltablue tail at t=200: 8.9M interpreted bytecodes, led by
+  ScaleConstraint>>execute (39.8%) + recalculate (13.0%) — the next
+  eligibility targets (B-phase).
+- Correctness: world byte-identical off vs t=200 (release), plain and under
+  {GC_STRESS=1, GC_STRESS=full:64, DEOPT_STRESS=64}; loop-header +
+  tiny-eden repros green under DEOPT_STRESS/GC_STRESS; 633 lib + full
+  integration suites green.
+- Process note: fb01b7a's post-commit code review (8 finder angles) filed 10
+  findings; the two live ones were fixed same-day and the CtxLoc::None
+  bci-fingerprint (three finders converged) was re-keyed to ctx-vreg
+  liveness before it could bite under organic NotEntrant deopts.
