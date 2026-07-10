@@ -2159,15 +2159,45 @@ pub unsafe extern "C" fn rt_alloc_slow(vm: *mut VmState, klass_bits: u64, size_b
     let klass = KlassOop::try_from(Oop::from_raw(klass_bits)).expect(
         "rt_alloc_slow: klass_bits must be a genuine KlassOop -- the Alloc site's own RelocKind::Oop pool word",
     );
-    debug_assert!(
-        matches!(klass.format(), crate::oops::klass::Format::Slots),
-        "rt_alloc_slow: only Format::Slots basicNew is inlined (D7)"
-    );
-    debug_assert_eq!(
-        klass.non_indexable_size() * crate::oops::layout::WORD_SIZE,
-        size_bytes as usize,
-        "rt_alloc_slow: the Alloc site's baked size must match the klass's own non_indexable_size"
-    );
+    // S24 A3 widening of D7's contract: `Ir::Alloc` is no longer only inlined
+    // `basicNew` of Format::Slots — `Ir::AllocClosure` (A3a) and the
+    // materialize-Context prologue (A3b) emit it for Format::Closure and
+    // Format::Context, whose site-baked `size_bytes` covers the VARIABLE tail
+    // (`nis + 1 + n` words), NOT `nis`. The original slow path ignored
+    // `size_bytes` and always ran `alloc_slots` (nis words) — correct for
+    // Slots, but for a Closure/Context it returned an object `n+1` words too
+    // SHORT, and the compiled continuation's size/copied/slot stores then
+    // corrupted the neighboring heap object. Debug builds aborted on the old
+    // Format::Slots assert below; release builds corrupted silently — found
+    // as deltablue's doesNotUnderstand #value: at threshold=200 (the closure
+    // volume A3b added made the slow path reachable under real allocation
+    // pressure; every small repro stayed on the inline fast path). Dispatch
+    // by format to the interpreter's OWN allocators, which produce exactly
+    // the fast path's layout (nil-filled body; their size-slot store is
+    // idempotent with the compiled continuation's own).
+    let words = size_bytes as usize / crate::oops::layout::WORD_SIZE;
+    let nis = klass.non_indexable_size();
+    match klass.format() {
+        crate::oops::klass::Format::Slots => {
+            debug_assert_eq!(
+                nis * crate::oops::layout::WORD_SIZE,
+                size_bytes as usize,
+                "rt_alloc_slow: a Slots Alloc site's baked size must match the klass's own \
+                 non_indexable_size"
+            );
+        }
+        crate::oops::klass::Format::Closure | crate::oops::klass::Format::Context => {
+            debug_assert!(
+                words > nis,
+                "rt_alloc_slow: a Closure/Context Alloc site's baked size must cover the \
+                 size slot and tail (words {words} <= nis {nis})"
+            );
+        }
+        other => unreachable!(
+            "rt_alloc_slow: Ir::Alloc is only ever emitted for Slots (inlined basicNew), \
+             Closure (AllocClosure), or Context (materialize prologue) — got {other:?}"
+        ),
+    }
     // S12 D3 test hook (`VmState::test_walk_capture`'s own doc): this is
     // one of the six anchor-setting stubs, so it's a real place a test can
     // observe `runtime::frames::walk_frames` against a genuine in-flight
@@ -2268,7 +2298,25 @@ pub unsafe extern "C" fn rt_alloc_slow(vm: *mut VmState, klass_bits: u64, size_b
         });
         vm.test_scavenge_probe = Some(result);
     }
-    crate::memory::alloc::alloc_slots(vm, klass).oop().raw()
+    match klass.format() {
+        crate::oops::klass::Format::Closure => {
+            debug_assert_eq!(
+                klass.oop().raw(),
+                vm.universe.closure_klass.oop().raw(),
+                "rt_alloc_slow: a Format::Closure Alloc site's klass must be THE closure klass"
+            );
+            crate::memory::alloc::alloc_closure(vm, words - nis - 1).oop().raw()
+        }
+        crate::oops::klass::Format::Context => {
+            debug_assert_eq!(
+                klass.oop().raw(),
+                vm.universe.context_klass.oop().raw(),
+                "rt_alloc_slow: a Format::Context Alloc site's klass must be THE context klass"
+            );
+            crate::memory::alloc::alloc_context(vm, words - nis - 1).oop().raw()
+        }
+        _ => crate::memory::alloc::alloc_slots(vm, klass).oop().raw(),
+    }
 }
 
 /// S13 step 10b: `rt_poll`'s return, split across two registers by the

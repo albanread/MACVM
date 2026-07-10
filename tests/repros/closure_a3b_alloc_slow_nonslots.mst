@@ -1,0 +1,39 @@
+"S24 A3b shakeout: rt_alloc_slow only handled Format::Slots (D7's original
+ contract), but Ir::AllocClosure (A3a) and the materialize-Context prologue
+ (A3b) emit Ir::Alloc for Closure/Context klasses whose site size covers the
+ VARIABLE tail. On eden overflow the slow path allocated nis words (too
+ short) and the compiled continuation's stores corrupted the neighboring
+ object. Debug builds aborted at the Format::Slots assert; release corrupted
+ silently — surfaced as deltablue's doesNotUnderstand #value: at
+ threshold=200 (only under real allocation pressure; small repros stay on
+ the inline fast path — hence MACVM_EDEN=64 below to force the slow path).
+
+ Run:    MACVM_EDEN=64 MACVM_JIT=threshold=200 macvm run <this> --world world
+ Expect: s=1500 (byte-identical to MACVM_JIT=off). Pre-fix debug builds
+ abort at stubs.rs rt_alloc_slow's format assert; pre-fix release builds
+ corrupt the heap once any closure/Context Alloc overflows eden.
+
+ Shape mirrors deltablue Planner>>constraintsConsuming:do: — a materialize
+ method (block arg + send-result temp both ctx-captured) whose escaping
+ capturing block contains a nested and:-block and value:'s the block arg."
+Object subclass: Item [
+    isOk [ ^true ]
+]
+Object subclass: CCRepro [
+    marker [ ^999 ]
+    consuming: coll do: aBlock [ | det |
+        det := self marker.
+        coll do: [:c | ((c ~~ det) and: [ c isOk ]) ifTrue: [ aBlock value: c ] ].
+    ]
+    run: iters [ | s coll |
+        coll := OrderedCollection new.
+        1 to: 5 do: [:i | coll add: Item new ].
+        s := 0.
+        1 to: iters do: [:i | | t |
+            t := 0.
+            self consuming: coll do: [:c | t := t + 1 ].
+            s := s + t ].
+        ^s ]
+]
+Transcript show: 's='; show: (CCRepro new run: 300) printString; cr.
+Smalltalk quit: 0.
