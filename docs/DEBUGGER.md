@@ -548,6 +548,56 @@ what let the task-#88 investigation compare "what the compiler baked" against
   `AssertUnwindSafe` wrappers are sound only because every post-catch path
   terminates the process.
 
+### 4.6 PROBE live mode — the compiled-send auditor (DBG5)
+
+Full design: `docs/compiled_send_auditor_design.md`. PROBE §4.1–4.5 above is
+*post-mortem* — it fires on a crash. DBG5 makes the same never-deopt,
+freeze-the-frame discipline available **live, at every compiled send boundary**,
+closing the gap §6 deferred as "step-into compiled callees" — a deferral whose
+premise (pin to tier-0, debug in HALT) *fails* for the one bug class it didn't
+anticipate: GC/oopmap/deopt-metadata faults that **exist only in compiled
+execution and vanish when you deopt** (BUG D, task #94, S24 A3b's materialized-
+Context crash). HALT can only show a green interpreter run of those; PROBE
+post-mortem shows a downstream symptom (the `scavenge_oop` SIGSEGV) whose cause
+is already gone.
+
+**Mechanism — force-cold ICs.** The one runtime choke point every non-hit
+compiled send already funnels through is `rt_resolve_send`. In auditor mode it
+computes+returns the correct target but **short-circuits before the poly/mega
+machinery and never memoizes the site** (stays `Unresolved`), so the next send
+re-enters — every compiled send is observable with zero codegen change, no
+`brk`, no hardware single-step. Observation-only: the `Unresolved` arm is the
+already-correct general dispatch, so results are **byte-identical** (the headline
+gate). The short-circuit sits *ahead* of the poly arms deliberately — they
+free/build PIC stubs eagerly while computing the patch, so a later gate would
+dangle a freed `bl`; a `debug_assert` tripwire flags any future compile-time IC
+seeding that changes the born state.
+
+Three read-only modes over that choke point:
+
+- **`MACVM_TRACE=calls`** — one `[calls] nm#site #sel recv=<klass> → <tier>` line
+  per compiled send. The "which send is live right now?" log. (Scope: ordinary
+  dynamic sends; super-hits and DNU are not traced. `ic_misses` inflates —
+  stderr-only stat — so never combine with an IC-transition-asserting repro.)
+- **`MACVM_TRACE=oops`** — at every GC, scans each live compiled frame's oop-map
+  slots and flags any mem-tagged word pointing into no used heap region, **before
+  the collector dereferences it**. Reuses PROBE's `annotate_value` region
+  classifier; a cheap `oop_is_suspect` pre-filter keeps a healthy GC silent.
+  Turns A3b's `exit=139` into `⚠SUSPECT nm=31 slot=4 word=0x1 →OUTSIDE-HEAP`.
+- **`MACVM_STEP_CALLS=1`** — interactive: stop at each send boundary, service
+  `bt | slots [N] | step | continue | quit`, never deopting. `slots` shares the
+  collector's exact slot walk + the `oops` classifier. No `print`-eval (§4.5).
+
+### 4.7 What PROBE live mode does not do
+
+- **No `print`-eval** — evaluation runs the interpreter + heap, the very things
+  PROBE distrusts (§4.5). Slot/register reads cover the debugging need.
+- **No mutation** — read-only, like all of PROBE (§3.3's deferred mid-stack
+  deopt is HALT's territory, not this).
+- **Not exhaustive tracing** — a super-hit never enters `rt_resolve_send`, so it
+  is invisible to `calls`/`step-call`; the log is "every ordinary dynamic send",
+  not "every send".
+
 ---
 
 ## 5. Environment & CLI surface (additions)
@@ -564,6 +614,9 @@ what let the task-#88 investigation compare "what the compiler baked" against
 | `MACVM_DBG_IR=<selector>` | (debug builds) dump every compile of that selector at TWO levels: the IR (blocks, instructions, literal pool with resolved values) AND the emitted listing (the assembler's per-instruction lines — the only view that shows spill stores). The layers between `describe` (bytecode) and `disasm-native` (published machine code) |
 | `MACVM_DBG_RESOLVE=1` | (debug builds) one stderr line per compiled-IC miss resolution: receiver klass, prior site state, whether the target is a c2i adapter. Compiled dispatch is otherwise invisible — hits never leave compiled code, so this IS the complete transition log |
 | `MACVM_DBG_REEXEC=1` | (debug builds) one stderr line per value the deopt materializer pushes for a reexecute site's recorded operand stack (`nm`, `bci`, `ValueLoc`, value, receiver). The runtime half of `MACVM_DBG_IR`'s compile-time story: compare what the scope RECORDED against what the frame slot actually HELD. Two entries printing the same address was the tell that closed task #94 (stale slot aliasing a recycled eden-base allocation) |
+| `MACVM_TRACE=calls` | (DBG5 §4.6, release-capable) force-cold ICs + one `[calls] nm#site #sel recv=<klass> → <tier> argc=<n>` line per compiled send. The complete live compiled-dispatch log (superset of `MACVM_DBG_RESOLVE`'s misses-only). Byte-identical results; `ic_misses` inflates (stderr stat) so don't mix with IC-transition-asserting repros |
+| `MACVM_TRACE=oops` | (DBG5 §4.6, release-capable) at every GC, flag any live compiled-frame oop-map slot holding a mem-tagged word in no used heap region — BEFORE the collector derefs it. Silent on healthy code; `⚠SUSPECT nm=… slot=… word=… →OUTSIDE-HEAP` on a wild/stale spill (localized S24 A3b in one line) |
+| `MACVM_STEP_CALLS=1` | (DBG5 §4.6) interactive step-call auditor: stop at each compiled send boundary, service `bt | slots [N] | step|s | continue|c | quit`, never deopting. Force-colds ICs like `calls`; independent of `MACVM_DEBUG` |
 
 ---
 
@@ -576,6 +629,14 @@ deferred — they need hardware single-step, Mach-exception territory, per
 §4.3). All three shipped waves are exposed to RUSTTCL (`dbg`, `bp`,
 `bp-clear`, `bp-list`, `ring`), and the fatal-error/DNU paths route to
 both the PROBE mini-dossier and (when armed) a HALT stop.**
+
+**Status (2026-07-10): DBG5 — PROBE live mode (§4.6) DONE (`MACVM_TRACE=calls`,
+`MACVM_TRACE=oops`, `MACVM_STEP_CALLS`). This reverses the "step-into compiled
+callees" deferral below with the case it did not anticipate — compiled+GC bugs
+that vanish under tier-0 pinning — using the auditor choke point (force-cold
+`rt_resolve_send`) rather than the hardware single-step the deferral assumed
+was required. Validated by localizing the live S24 A3b GC crash to
+`nm=31 slot=4 word=0x1` at threshold=200. Design: `compiled_send_auditor_design.md`.**
 
 - **DBG0 — PROBE dossier** (no interactivity): SIGSEGV/SIGBUS handlers +
   sigaltstack + register-capture buffer + probe trampoline + crash report
@@ -608,10 +669,14 @@ both the PROBE mini-dossier and (when armed) a HALT stop.**
 - *Synchronous mid-stack deopt* (mutate a live compiled frame's temps) —
   needs new frame-surgery machinery; read-only + convert-on-return covers
   the debugging need (§3.3).
-- *Step-into compiled callees* — vanishes under breakpoint pinning; not
-  worth a per-call debug check in compiled code (§3.4).
+- *Step-into compiled callees* — ~~vanishes under breakpoint pinning; not
+  worth a per-call debug check in compiled code (§3.4)~~ **REVERSED by DBG5
+  (§4.6, 2026-07-10):** the premise fails for compiled+GC bugs that vanish
+  under pinning; DBG5 delivers it via the force-cold `rt_resolve_send` choke
+  point (no per-call codegen check — the cost lives in the runtime resolve
+  path, which force-cold makes total only in debug mode).
 - *Hardware watchpoints / single-step* — Mach exception server territory
-  (§4.3); the auditor choke point covers the known cases.
+  (§4.3); the auditor choke point (now realized as DBG5) covers the known cases.
 - *Fix-and-continue* — shape known (R3 + install + restart), belongs to the
   W-debugger wave (§3.5).
 - *Remote debug protocol* (DAP etc.) — the GuiHost seam is the natural
