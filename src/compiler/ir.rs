@@ -895,6 +895,30 @@ impl PoolBuilder {
 /// Owns the state accumulated across every block's translation (`vregs`,
 /// `pool`) plus the read-only per-method context every block needs
 /// (`self_vreg`/`temp_vregs`) — a struct instead of a long parameter list
+/// S24 B5: what kind of body [`Translator::try_inline_cfg`] is grafting.
+///
+/// `Method` — a (possibly devirtualized) METHOD callee: klass-guarded unless
+/// statically resolved, `InlineSite { is_block: false, parent: None }`,
+/// eligibility via `is_inline_eligible_cfg`, and a redefinition dependency
+/// recorded. `Block` — S24 B5, a literal BLOCK's body grafted into its home
+/// compilation: no guard (the receiver is statically the literal block —
+/// there is nothing to guard), `is_block: true` with the given parent chain
+/// (depth-3: block ← inlined callee ← root), eligibility proved by
+/// `escape::block_is_spliceable_cfg` up front, `NlrTos` legal (a return from
+/// the HOME compilation, `Ir::Ret` — B4's deopt closure synthesis covers any
+/// in-graft deopt), depth-0 ctx-temp access routed through the home Context,
+/// and NO inline dependency (a literal block is not a dispatched callee — no
+/// redefinition can retarget it).
+enum GraftMode {
+    Method,
+    // Constructed by B5 step 2 (block_is_spliceable_cfg + splice routing);
+    // inert in step 1's byte-identical refactor.
+    #[allow(dead_code)]
+    Block {
+        parent: Option<Box<InlineSite>>,
+    },
+}
+
 /// threaded through every helper.
 struct Translator<'a> {
     vm: &'a VmState,
@@ -2146,13 +2170,19 @@ impl<'a> Translator<'a> {
         code: &mut Vec<Ir>,
         deopt: &mut Vec<(u32, DeoptRaw)>,
         blockarg: Option<(usize, MethodOop, u32)>,
+        mode: GraftMode,
     ) -> Option<(VReg, BlockId, BlockId)> {
+        // S24 B5 step 1: destructured once — the walk consults plain locals.
+        let (is_block_graft, graft_parent): (bool, Option<Box<InlineSite>>) = match mode {
+            GraftMode::Method => (false, None),
+            GraftMode::Block { parent } => (true, parent),
+        };
         let _ = deopt; // caller-block deopt vec unused: guard cold path is its own block
                        // Same exact-arm-set validation as `try_inline_nonleaf` (see the
                        // comment there): the CFG walk aborts on shapes outside its arm list,
                        // so this splicer proves its own eligibility instead of trusting the
                        // caller's budget gate.
-        if !crate::compiler::inline::is_inline_eligible_cfg(callee) {
+        if !is_block_graft && !crate::compiler::inline::is_inline_eligible_cfg(callee) {
             return None;
         }
         let ccfg = crate::compiler::decode::decode(callee);
@@ -2245,8 +2275,8 @@ impl<'a> Translator<'a> {
             slots: callee_slots.clone(),
             sender_bci: send_bci as u16,
             caller_pending_stack,
-            is_block: false,
-            parent: None,
+            is_block: is_block_graft,
+            parent: graft_parent,
             // S14 step 7-IV-c: the block-arg temp holds a PHANTOM (its vreg is
             // an unread filler) — every in-callee deopt scope materializes the
             // real closure for that slot.
@@ -2695,6 +2725,78 @@ impl<'a> Translator<'a> {
                         returned = true;
                         break;
                     }
+                    // S24 B5 (Block graft only): the block's own `^value` at
+                    // the value-send — joins the continuation exactly like a
+                    // method callee's ReturnTos.
+                    Instr::BlockReturnTos if is_block_graft => {
+                        let v = cstack
+                            .pop()
+                            .expect("cfg graft: block_return_tos empty stack");
+                        bcode.push(Ir::Move {
+                            dst: result_vreg,
+                            src: v,
+                        });
+                        bcode.push(Ir::Jump {
+                            target: continuation_id,
+                        });
+                        returned = true;
+                        break;
+                    }
+                    // S24 B5 (Block graft only): `^expr` — a return from the
+                    // HOME compilation (the block's home is the root; B4's
+                    // materializer closure synthesis makes any in-graft deopt's
+                    // interpreted nlr_tos sound). No join edge: control leaves M.
+                    Instr::NlrTos if is_block_graft => {
+                        let val = cstack.pop().expect("cfg graft: nlr_tos empty stack");
+                        self.spliced_nlr += 1;
+                        bcode.push(Ir::Ret { val });
+                        returned = true;
+                        break;
+                    }
+                    // S24 B5 (Block graft only): depth-0 ctx-temp access routes
+                    // through the HOME Context — identical to the linear splice
+                    // walk's arms (materialize form via method_ctx_vreg, elided
+                    // form via ctx_vregs).
+                    Instr::PushCtxTemp { depth, idx } if is_block_graft => {
+                        debug_assert_eq!(depth, 0, "graft ctx-temp access must be depth 0");
+                        let dst = self.fresh(true);
+                        if let Some(ctx) = self.method_ctx_vreg {
+                            bcode.push(Ir::LoadField {
+                                dst,
+                                obj: ctx,
+                                byte_off: (crate::oops::layout::BODY_OFFSET
+                                    + 8 * (2 + idx as usize))
+                                    as i32,
+                            });
+                        } else {
+                            bcode.push(Ir::Move {
+                                dst,
+                                src: self.ctx_vregs[idx as usize],
+                            });
+                        }
+                        cstack.push(dst);
+                    }
+                    Instr::StoreCtxTempPop { depth, idx } if is_block_graft => {
+                        debug_assert_eq!(depth, 0, "graft ctx-temp access must be depth 0");
+                        let v = cstack
+                            .pop()
+                            .expect("cfg graft: store_ctx_temp_pop empty stack");
+                        if let Some(ctx) = self.method_ctx_vreg {
+                            bcode.push(Ir::StoreField {
+                                obj: ctx,
+                                byte_off: (crate::oops::layout::BODY_OFFSET
+                                    + 8 * (2 + idx as usize))
+                                    as i32,
+                                val: v,
+                                barrier: true,
+                            });
+                        } else {
+                            bcode.push(Ir::Move {
+                                dst: self.ctx_vregs[idx as usize],
+                                src: v,
+                            });
+                        }
+                    }
                     // Branch/jump opcodes are the block's own terminator —
                     // handled below from the decoded `Terminator` (they need the
                     // remapped target ids).
@@ -2703,7 +2805,7 @@ impl<'a> Translator<'a> {
                     | Instr::BrTrueFwd(_)
                     | Instr::BrFalseFwd(_) => {}
                     other => unreachable!(
-                        "cfg splice: {other:?} passed is_inline_eligible_cfg but has no arm"
+                        "cfg splice: {other:?} passed the graft eligibility gate but has no arm"
                     ),
                 }
                 bci = next;
@@ -2787,7 +2889,9 @@ impl<'a> Translator<'a> {
             });
         }
 
-        self.record_inline_dep(dep_klass, selector);
+        if !is_block_graft {
+            self.record_inline_dep(dep_klass, selector);
+        }
         Some((result_vreg, ir_ids[0], continuation_id))
     }
 
@@ -3068,6 +3172,7 @@ impl<'a> Translator<'a> {
                             code,
                             deopt,
                             None,
+                            GraftMode::Method,
                         ) {
                             stack.push(result);
                             debug_assert!(self.pending_jump_target.is_none());
@@ -3384,6 +3489,7 @@ impl<'a> Translator<'a> {
                             code,
                             deopt,
                             None,
+                            GraftMode::Method,
                         ) {
                             self.self_devirt = true;
                             stack.push(result);
@@ -3718,6 +3824,7 @@ impl<'a> Translator<'a> {
                         code,
                         deopt,
                         None,
+                        GraftMode::Method,
                     ) {
                         stack.push(result);
                         debug_assert!(
@@ -4841,6 +4948,7 @@ impl<'a> Translator<'a> {
                 code,
                 deopt,
                 Some((arg_ix, blk, blk_pool_ix)),
+                GraftMode::Method,
             )
             .expect(
                 "splice_blockarg_send: escape proved the callee CFG-inlinable but the \
