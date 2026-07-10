@@ -760,6 +760,14 @@ fn materialize_context(
         }
         CtxLoc::Materialized(loc) => {
             let c = read_value(vm, nmethod_ref(vm, id), frame, *loc);
+            // T6 (S24 L2 phase B): with the 9de470b liveness keying,
+            // `Materialized` is only ever recorded where the ctx vreg is
+            // live — the slot must hold the real (possibly OSR-adopted)
+            // Context, never nil/garbage. Identity is the whole contract.
+            debug_assert!(
+                crate::oops::wrappers::ContextOop::try_from(c).is_some(),
+                "CtxLoc::Materialized resolved to a non-Context (T6)"
+            );
             Frame { fp }.set_context(&mut vm.stack, c);
         }
         CtxLoc::Elided { temps } => {

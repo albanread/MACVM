@@ -356,6 +356,17 @@ pub struct VmStats {
     /// S15: OSR requests declined (version cap / effectiveness / not
     /// compilable) — the loop kept interpreting, counter reset.
     pub osr_declined: u64,
+    /// S24 L2 phase B: OSR compiles declined because the has_ctx method is
+    /// the ELIDED form (`all_elidable`) — the one adoption-unsound case
+    /// (the interpreted prefix may have leaked a real closure over the
+    /// frame Context that elided vreg writes would split from). This is
+    /// the evidence counter for ever revisiting write-through (design R1).
+    pub osr_declined_elided_ctx: u64,
+    /// S24 L2 phase B: OSR transfers that ADOPTED the interpreter frame's
+    /// heap Context into the materialize-form nmethod's ctx vreg (identity
+    /// preserved — pre-OSR closures and post-OSR compiled code share the
+    /// ONE Context).
+    pub osr_ctx_adopted: u64,
 }
 
 /// The `MACVM_TRACE=stats` dump (`main.rs::print_vm_stats`) and RUSTTCL's
@@ -401,6 +412,11 @@ pub fn format_vm_stats(vm: &VmState) -> String {
         ),
         format!("[stats] osr_entries={}", s.osr_entries),
         format!("[stats] osr_declined={}", s.osr_declined),
+        format!(
+            "[stats] osr_declined_elided_ctx={}",
+            s.osr_declined_elided_ctx
+        ),
+        format!("[stats] osr_ctx_adopted={}", s.osr_ctx_adopted),
         format!("[stats] scavenge_count={}", g.scavenge_count),
         format!(
             "[stats] scavenge_us_total={} scavenge_us_max={}",

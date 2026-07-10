@@ -7222,3 +7222,174 @@ fn osr_phase_a_blockarg_deopt_stress() {
         &[("MACVM_DEOPT_STRESS", "64")],
     );
 }
+
+/// S24 L2 step 4 (phase B): has_ctx MATERIALIZE-form OSR via Context
+/// ADOPTION. Same harness shape as phase A, plus stderr stat needles.
+fn osr_phase_b_differential(
+    name: &str,
+    program: &str,
+    extra_env: &[(&str, &str)],
+    expect_osr: bool,
+    needles: &[&str],
+) {
+    let exe = env!("CARGO_BIN_EXE_macvm");
+    let dir = std::env::temp_dir().join(format!("macvm_osrB_{}_{name}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("prog.mst");
+    std::fs::write(&file, program).unwrap();
+    let world = concat!(env!("CARGO_MANIFEST_DIR"), "/world");
+
+    let run = |jit: &str, env_pairs: &[(&str, &str)]| {
+        let mut c = Command::new(exe);
+        c.args(["run", file.to_str().unwrap(), "--world", world])
+            .env("MACVM_JIT", jit)
+            .env("MACVM_TRACE", "stats")
+            .env("MACVM_PROBE", "off")
+            .env_remove("MACVM_GC_STRESS")
+            .env_remove("MACVM_DEOPT_STRESS")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        for (k, v) in env_pairs {
+            c.env(k, v);
+        }
+        let out = c.output().expect("spawn macvm");
+        assert!(
+            out.status.success(),
+            "[{name}] run must complete (jit={jit}); stderr tail:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+                .lines()
+                .rev()
+                .take(10)
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        (
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+
+    let (oracle, _) = run("off", &[]);
+    let (got, stderr) = run("threshold=200", extra_env);
+    std::fs::remove_dir_all(&dir).ok();
+    assert_eq!(
+        got, oracle,
+        "[{name}] must be byte-identical to the interpreter"
+    );
+    let osr_line = stderr
+        .lines()
+        .find(|l| l.contains("osr_entries="))
+        .unwrap_or("")
+        .to_string();
+    if expect_osr {
+        assert!(
+            !osr_line.contains("osr_entries=0"),
+            "[{name}] must OSR (called once): {osr_line}"
+        );
+    } else {
+        assert!(
+            osr_line.contains("osr_entries=0"),
+            "[{name}] must NOT OSR (elided form declines): {osr_line}"
+        );
+    }
+    for n in needles {
+        assert!(
+            stderr.lines().any(|l| l.contains(n)),
+            "[{name}] stderr must contain '{n}'"
+        );
+    }
+}
+
+/// THE ADOPTION FLAGSHIP: a has_ctx method whose escaping closures capture a
+/// ctx temp `k` — one created BEFORE the hot loop, one DURING it. Both must
+/// see the FINAL k after the loop: the pre-OSR (interpreter-created) closure
+/// holds the frame's heap Context at copied[1]; the OSR entry ADOPTS that
+/// same Context into method_ctx_vreg; the post-OSR compiled AllocClosure
+/// captures the SAME object. One Context, by identity — 9de470b's
+/// per-iteration-snapshot class is the failure this proves absent.
+const OSR_B_ADOPTION: &str = r#"
+Object subclass: CtxLoop [
+    run [ | k acc |
+        k := 0.
+        acc := OrderedCollection new.
+        acc add: [ k ].
+        1 to: 20000 do: [:i |
+            k := k + 1.
+            i = 10000 ifTrue: [ acc add: [ k ] ] ].
+        ^(acc at: 1) value + (acc at: 2) value + k ]
+]
+Transcript show: (CtxLoop new run) printString; cr.
+Smalltalk quit: 0.
+"#;
+
+#[test]
+fn osr_phase_b_ctx_adoption_identity() {
+    osr_phase_b_differential("adopt", OSR_B_ADOPTION, &[], true, &["osr_ctx_adopted="]);
+}
+
+#[test]
+fn osr_phase_b_ctx_adoption_deopt_stress() {
+    // Invalidation churn forces deopt of the OSR frame mid-loop: the
+    // materializer hands the SAME adopted Context back (identity round
+    // trip), the interpreter keeps mutating it, and re-OSR re-adopts it.
+    osr_phase_b_differential(
+        "adopt_ds",
+        OSR_B_ADOPTION,
+        &[("MACVM_DEOPT_STRESS", "64")],
+        true,
+        &[],
+    );
+}
+
+#[test]
+fn osr_phase_b_ctx_adoption_gc_stress() {
+    // The adopted Context tenures under full-GC stress; compiled ctx-temp
+    // stores exercise the card barrier on an old-space Context.
+    osr_phase_b_differential(
+        "adopt_gc",
+        OSR_B_ADOPTION,
+        &[("MACVM_GC_STRESS", "full:64")],
+        true,
+        &[],
+    );
+}
+
+/// The ELIDED form (all_elidable has_ctx) is the one adoption-unsound case
+/// and must decline OSR. The real frontend inlines `[..] value` at parse
+/// time (no closure is ever emitted), so the shape is hand-built here: a
+/// has_ctx home whose literal capturing block is pushed and immediately
+/// value-sent — escape::analyze marks the site elidable, all_elidable holds,
+/// and compile_method_osr must return None with the evidence counter bumped
+/// (while a NORMAL compile of the same method stays allowed).
+#[test]
+fn osr_phase_b_elided_form_declines() {
+    let mut vm = loop_test_vm();
+    let smi_klass = vm.universe.smi_klass;
+    let value_sel = vm.universe.intern(b"value");
+
+    let mut b = BytecodeBuilder::new();
+    let lit = b.build_block(&mut vm, 0, 0, false, 0, true, |blk, _vm| {
+        // Body reads ctx temp 0 of the home — enough to be a capturing
+        // block; the exact ops don't matter for the GATE (never compiled).
+        blk.push_ctx_temp(0, 0);
+        blk.block_return_tos();
+    });
+    b.push_closure(lit, 0);
+    b.send(&mut vm, value_sel, 0);
+    b.ret_tos();
+    let sel = vm.universe.intern(b"elidedCtx");
+    let m = b.finish(&mut vm, sel, 0, 0);
+    m.set_flags(0, 0, true, false, false, false, 1); // has_ctx, nctx=1
+    install_method(&mut vm, smi_klass, sel, m);
+
+    let before = vm.stats.osr_declined_elided_ctx;
+    assert!(
+        driver::compile_method_osr(&mut vm, smi_klass, m, 0).is_none(),
+        "all_elidable has_ctx must decline OSR (adoption-unsound elided form)"
+    );
+    assert_eq!(
+        vm.stats.osr_declined_elided_ctx,
+        before + 1,
+        "the decline must be observable (the R1 evidence counter)"
+    );
+}

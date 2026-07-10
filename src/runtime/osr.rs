@@ -120,6 +120,32 @@ pub fn rt_osr_request(vm: &mut VmState, fp: usize, target_bci: u16) -> OsrOutcom
             .as_ref()
             .expect("an osr_table hit carries an OsrMap");
         debug_assert_eq!(map.osr_bci, target_bci);
+        // T4 (S24 L2 phase B): a Context transfer pair ADOPTS the frame's
+        // heap Context by identity — it must BE one. `activate_method`
+        // allocates it eagerly for every has_ctx activation, so nil here is
+        // a torn frame or a flags/activation mismatch: decline fail-soft,
+        // BEFORE any frame mutation (the pack is read-only, but packing nil
+        // would hand compiled ctx-temp ops a nil base).
+        if map
+            .slots
+            .iter()
+            .any(|s| matches!(s.src, crate::compiler::scopes::OsrSource::Context))
+        {
+            let ctx = frame.context(&vm.stack);
+            if ctx.raw() == vm.universe.nil_obj.raw() {
+                debug_assert!(
+                    false,
+                    "OSR Context adoption: has_ctx frame with a nil context (T4)"
+                );
+                vm.stats.osr_declined += 1;
+                return OsrOutcome::Declined;
+            }
+            debug_assert!(
+                crate::oops::wrappers::ContextOop::try_from(ctx).is_some(),
+                "OSR Context adoption: frame context is not a Context (T4)"
+            );
+            vm.stats.osr_ctx_adopted += 1;
+        }
         let entry = nm.code.base as u64 + map.entry_off as u64;
         let ntemps_base = fp + FRAME_TEMPS_BASE;
         let operand_base = ntemps_base + method.ntemps();

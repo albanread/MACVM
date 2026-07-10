@@ -743,14 +743,38 @@ fn compile_method_full(
     // proof — `all_escaping_nlr_free`, checked in eligibility over the same
     // bytecode the interpreter ran — means the real-HomeRef-vs-dead-sentinel
     // asymmetry is never consulted; the frame-serial check is the runtime
-    // backstop). `has_ctx` stays declined until phase B (Context adoption,
-    // osr_closure_design.md step 4).
+    // backstop). `has_ctx` (phase B, osr_closure_design.md step 4): a
+    // MATERIALIZE-form has_ctx method OSRs by ADOPTING the interpreter
+    // frame's existing heap Context into `method_ctx_vreg` — one more
+    // transfer pair, zero codegen changes; identity is what makes it sound
+    // (closures created interpretively BEFORE the OSR hold that same
+    // Context at copied[1]; both tiers' ctx traffic keeps flowing through
+    // the ONE object, and a later deopt hands it back unchanged). The one
+    // UNSOUND case is the ELIDED form (`all_elidable`): the interpreted
+    // prefix may have leaked a real closure over the frame Context through
+    // a dynamically-dispatched block-arg send the static-plus-mono-IC
+    // 7-IV-c proof never saw, and elided ctx-vreg writes would split from
+    // it. Decline OSR only — normal-call compiles stay elided (R1
+    // write-through rejected: it would pessimize every call to serve a
+    // rare OSR; `osr_declined_elided_ctx` collects the evidence for ever
+    // revisiting).
     if osr_bci.is_some() && method.has_ctx() {
-        return None;
+        let e = crate::compiler::escape::analyze(method);
+        if e.all_elidable {
+            vm.stats.osr_declined_elided_ctx += 1;
+            return None;
+        }
     }
 
     let cfg = decode::decode(method);
     let ir_method = ir::convert(vm, rcvr_klass, method, &cfg);
+    // T8 (osr_closure_design.md): the pre-decode gate above and convert's
+    // own materialize decision must agree — an OSR-compiled has_ctx method
+    // is ALWAYS the materialize form (same `escape::analyze` inputs).
+    debug_assert!(
+        !(osr_bci.is_some() && method.has_ctx()) || ir_method.method_ctx_vreg.is_some(),
+        "gate/form disagreement: OSR-compiling a has_ctx method that convert did not materialize"
+    );
     // Debugger (DBG3 companion): `MACVM_DBG_IR=<selector>` dumps every
     // compile of a matching selector at the IR level — blocks, instructions,
     // and the full literal pool with resolved values — the layer BETWEEN
@@ -865,6 +889,18 @@ fn compile_method_full(
         for (j, &v) in entry_stack.iter().enumerate() {
             sources.push((OsrSource::StackSlot(j as u16), v));
         }
+        // S24 L2 phase B: ADOPT the interpreter frame's heap Context into
+        // the materialized ctx vreg — the packer's `OsrSource::Context` arm
+        // has existed since S15, never emitted until now. Resolution is
+        // guaranteed FrameSlot: the regalloc pin keeps the vreg live to
+        // method end with `crosses_safepoint` (⇒ spilled), and the header
+        // is never block 0 for a compilable has_ctx method (the 9de470b
+        // loop-header eligibility decline — load-bearing here: adoption
+        // must bypass the prologue's Alloc, which stays on the normal-call
+        // path only).
+        if let Some((cv, _nctx)) = ir_method.method_ctx_vreg {
+            sources.push((OsrSource::Context, cv));
+        }
         let mut copies = Vec::new();
         let mut slots = Vec::new();
         for (src, v) in sources {
@@ -906,6 +942,17 @@ fn compile_method_full(
                 // be named by any scope (scopes resolve through the same
                 // intervals) — the entry block's nil-fill covers those.
                 ValueLoc::Nil => {
+                    // T1 (phase B): the Context source must resolve to a
+                    // FrameSlot — the pin makes anything else a compiler
+                    // bug. Fail-soft in release (decline the OSR compile).
+                    if matches!(src, OsrSource::Context) {
+                        debug_assert!(
+                            false,
+                            "materialized ctx vreg dead at the OSR header despite the \
+                             regalloc pin (T1)"
+                        );
+                        return None;
+                    }
                     if !matches!(src, OsrSource::StackSlot(_)) {
                         let slot_home = regalloc_result.intervals.iter().find_map(|iv| {
                             if iv.vreg == v {

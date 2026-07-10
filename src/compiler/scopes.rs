@@ -93,8 +93,13 @@ pub enum OsrSource {
     Slot(u16),
     /// Interpreter operand-stack element i at the loop header (0 = bottom).
     StackSlot(u16),
-    /// The frame's heap Context oop (methods with `has_ctx`) — unused while
-    /// v1 declines OSR for `has_ctx` methods, carried for format stability.
+    /// The frame's heap Context oop — S24 L2 phase B: the OSR entry ADOPTS
+    /// the interpreter frame's existing Context into the materialize-form
+    /// nmethod's `method_ctx_vreg` spill home, BY IDENTITY (pre-OSR closures
+    /// hold the same object at `copied[1]`; a later deopt hands it back
+    /// unchanged; re-OSR re-adopts). Emitted for `has_ctx` materialize
+    /// compiles only; the elided form declines OSR
+    /// (`osr_declined_elided_ctx`).
     Context,
 }
 
