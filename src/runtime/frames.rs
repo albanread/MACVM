@@ -889,8 +889,15 @@ mod tests {
     /// safepoint) chain, executed for real (not hand-faked memory) —
     /// `walk_frames`, run from inside `rt_alloc_slow` via `test_walk_
     /// capture`, must report exactly, innermost first: the alloc_slow
-    /// stub itself, `spawn`'s own compiled frame, the `call_stub`
-    /// boundary, then the interpreted entry.
+    /// stub itself, `spawn`'s own compiled frame, then the `call_stub`
+    /// boundary. This is a TOP-LEVEL `enter_compiled` — the warmup
+    /// `run_method` completed and deactivated its entry frame, so no live
+    /// interpreted frame exists below the boundary; the tier link records
+    /// `ENTRY_FRAME_SENTINEL` and the walk ends there. (It used to report
+    /// the DEAD entry-frame remnant as a 4th, `Interpreted` frame — an
+    /// accident of the stale `vm.stack.fp` the link captured, which the B5
+    /// step-3 gc-stress deopt test caught chasing overwritten remnant
+    /// slots into an unbounded walk.)
     #[test]
     fn walker_classifies_all_kinds() {
         let mut vm = test_vm();
@@ -909,7 +916,7 @@ mod tests {
             .take()
             .expect("hook must have fired")
             .expect("walk_frames must not have panicked");
-        assert_eq!(seen.len(), 4, "{seen:?}");
+        assert_eq!(seen.len(), 3, "{seen:?}");
         assert!(
             matches!(
                 seen[0],
@@ -926,11 +933,9 @@ mod tests {
         );
         assert!(
             matches!(seen[2], FrameView::CallStub { .. }),
-            "next must be the call_stub boundary: {seen:?}"
-        );
-        assert!(
-            matches!(seen[3], FrameView::Interpreted { .. }),
-            "outermost must be the interpreted entry: {seen:?}"
+            "outermost must be the call_stub boundary (the entry link is the \
+             sentinel — no live interpreted frame exists below a top-level \
+             enter_compiled): {seen:?}"
         );
     }
 

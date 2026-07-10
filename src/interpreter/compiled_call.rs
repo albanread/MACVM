@@ -128,7 +128,19 @@ pub fn enter_compiled(vm: &mut VmState, nm_id: NmethodId, argc: u8) -> EnterResu
         .collect();
 
     vm.tier_links.push(TierLink::IntoCompiled {
-        interp_frame: vm.stack.fp,
+        // Record the sentinel — not the stale `fp` a completed prior entry
+        // frame leaves behind (`deactivate` clears `has_frame` only) — when
+        // NO interpreter frame is live below this call: `walk_frames`
+        // consumes this link and would otherwise chase dead slot words as a
+        // frame chain (unbounded). Production dispatch always has a live
+        // frame here; the no-frame case is a top-level `enter_compiled`
+        // (tests, embedders), whose walk must bottom out exactly like
+        // `run_method`'s own spoof / the OSR entry-frame link (osr.rs).
+        interp_frame: if vm.stack.has_frame() {
+            vm.stack.fp
+        } else {
+            crate::oops::layout::ENTRY_FRAME_SENTINEL as usize
+        },
         entry_sp: vm.stack.sp as u64,
         nm_id,
     });
