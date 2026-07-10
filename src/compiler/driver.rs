@@ -261,17 +261,20 @@ fn eligibility_detail(vm: &VmState, method: MethodOop) -> Eligibility {
     };
     let escape = if has_closure {
         let e = crate::compiler::escape::analyze(method);
-        // S24 A3a (design §2.7): an ESCAPING closure is no longer an outright
-        // reject — if M is NOT `has_ctx` and every escaping block is
-        // transitively NLR-free + non-`captures_ctx`, `ir::convert` allocates
-        // a real `BlockClosure` (`Ir::Alloc` + `StoreField` inits, dead-home
-        // sentinel) instead of splicing. `all_elidable` (S14 splice-everything)
-        // still compiles unchanged; the `has_ctx` + escaping-Context case is
-        // A3b (needs the Context prologue + `CtxLoc::Materialized`).
-        let a3a_escaping_ok = !method.has_ctx() && e.all_escaping_a3a_compilable(method);
-        if !e.all_elidable && !a3a_escaping_ok {
-            // An escaping closure a compiled frame cannot yet represent
-            // (has_ctx, or an NLR-bearing / ctx-capturing escaping block).
+        // S24 A3 (design §2.7): an ESCAPING closure is no longer an outright
+        // reject — `ir::convert` allocates a real `BlockClosure`
+        // (`Ir::Alloc` + `StoreField` inits, dead-home sentinel) when every
+        // escaping block is transitively NLR-free. A3a: non-`captures_ctx`
+        // blocks (no Context). A3b: a `captures_ctx` block forces M's
+        // (`has_ctx`) Context to be MATERIALIZED in the prologue
+        // (`method_ctx_vreg`), stored into the escaping closure's `copied[1]`.
+        // `all_elidable` (S14 splice-everything, incl. 7-II-b Context ELISION)
+        // still compiles unchanged. The transitive-NLR-free scan is the one
+        // hard soundness gate.
+        let escaping_ok = e.all_escaping_nlr_free(method);
+        if !e.all_elidable && !escaping_ok {
+            // An NLR-bearing escaping block (its `^` would misdeliver through
+            // the dead-home sentinel) — cannot compile M.
             return Eligibility::NoPermanent;
         }
         Some(e)
@@ -1275,7 +1278,26 @@ fn build_deopt_metadata(
                 // `CtxLoc::Elided` over those vregs' frame slots so a deopt allocs
                 // a fresh Context and fills it (materializer M6). No ctx-vregs →
                 // M never owned a Context → `None` (unchanged S13 behaviour).
-                let root_ctx = if ir_method.ctx_vregs.is_empty() {
+                let root_ctx = if let Some(ctx_vreg) = ir_method.method_ctx_vreg {
+                    // S24 A3b: M MATERIALIZED its heap Context (an escaping
+                    // capturing closure needs a real one). A deopt REUSES that
+                    // same object by identity (materializer M6's
+                    // `Materialized` arm) — the escaped closures reference it
+                    // too (Risk 2). EXCEPT the prologue ctx-alloc safepoint
+                    // itself (bci 0, empty operand stack): the Context is not
+                    // yet live there, and its reexecute re-enters at bci 0
+                    // where `activate_method` re-allocates it — so `None`.
+                    if raw.bci == 0 && raw.stack.is_empty() {
+                        CtxLoc::None
+                    } else {
+                        CtxLoc::Materialized(resolve_frame_loc(
+                            ctx_vreg,
+                            position,
+                            intervals,
+                            extra_oop_live,
+                        ))
+                    }
+                } else if ir_method.ctx_vregs.is_empty() {
                     CtxLoc::None
                 } else {
                     CtxLoc::Elided {

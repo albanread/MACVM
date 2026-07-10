@@ -549,6 +549,12 @@ pub struct IrMethod {
     /// `build_deopt_metadata` records `CtxLoc::Elided` over their frame slots so
     /// a deopt rebuilds a real Context.
     pub ctx_vregs: Vec<VReg>,
+    /// S24 A3b: Some iff M's heap Context is MATERIALIZED (the prologue
+    /// allocated it into this vreg; ctx-temps and escaping closures' copied[1]
+    /// read it). `build_deopt_metadata` records `CtxLoc::Materialized` over
+    /// its frame slot so a deopt REUSES the SAME Context (identity — Risk 2).
+    /// Mutually exclusive with a non-empty `ctx_vregs`.
+    pub method_ctx_vreg: Option<VReg>,
     pub safepoints: Vec<SafepointId>,
     /// Always present (`convert` interns them unconditionally) — `emit.rs`
     /// has no `VmState` of its own to intern `true_obj`/`false_obj` on
@@ -924,6 +930,14 @@ struct Translator<'a> {
     /// barriered Context-slot loads/stores (never the elided-ctx vreg
     /// Moves a method compilation uses).
     block_ctx_vreg: Option<VReg>,
+    /// S24 A3b: Some iff M is a `has_ctx` METHOD whose Context is
+    /// MATERIALIZED (the prologue allocates it — some capturing closure
+    /// escapes, so the Context cannot be elided). Depth-0 ctx-temp ops go
+    /// through it exactly like `block_ctx_vreg`; the AllocClosure lowering
+    /// stores it into an escaping capturing block's `copied[1]`. Mutually
+    /// exclusive with `block_ctx_vreg` (a method is not a block) and with
+    /// the elided `ctx_vregs` promotion (7-II-b).
+    method_ctx_vreg: Option<VReg>,
     /// S11 step 7 (D1): a smi-inlined fail edge, or a `not_bool` edge, no
     /// longer bails the whole method out to the interpreter — it computes
     /// a real fallback value (`CallSend`/`CallRuntime`) and REJOINS normal
@@ -3817,13 +3831,16 @@ impl<'a> Translator<'a> {
             // eligible — a `depth != 0` was rejected by `driver::eligible`.
             Instr::PushCtxTemp { depth, idx } => {
                 debug_assert_eq!(depth, 0, "compiled ctx-temp access must be depth 0");
-                if let Some(ctx) = self.block_ctx_vreg {
+                if let Some(ctx) = self.block_ctx_vreg.or(self.method_ctx_vreg) {
                     // S24 A1 (design §2.2): inside a compiled BLOCK, depth-0
                     // ctx temps live in the REAL home Context object
                     // (`closure.copied[1]`, loaded into `ctx` by the entry
                     // prologue) — the compiled mirror of `activate_block`'s
-                    // FP+3 aliasing. Context body layout (`oops::context`):
-                    // [0]=home_hint, [1]=size slot, [2+i]=slot i.
+                    // FP+3 aliasing. S24 A3b: in a MATERIALIZING method they
+                    // live in the prologue-allocated Context (`method_ctx_vreg`)
+                    // — the SAME object escaping closures capture (Risk 2).
+                    // Context body layout (`oops::context`): [0]=home_hint,
+                    // [1]=size slot, [2+i]=slot i.
                     let dst = self.fresh(true);
                     code.push(Ir::LoadField {
                         dst,
@@ -3846,7 +3863,7 @@ impl<'a> Translator<'a> {
                 let v = stack
                     .pop()
                     .expect("store_ctx_temp_pop: empty simulated stack");
-                if let Some(ctx) = self.block_ctx_vreg {
+                if let Some(ctx) = self.block_ctx_vreg.or(self.method_ctx_vreg) {
                     // Real, barriered Context-slot store — the home
                     // (interpreted or otherwise) reads the SAME object, so
                     // identity and the card table both matter (Risk 2's
@@ -3909,9 +3926,16 @@ impl<'a> Translator<'a> {
                 );
                 let block = MethodOop::try_from(self.method.literals().at(lit as usize))
                     .expect("push_closure literal is not a CompiledBlock");
+                // S24 A3a: copied[0]=self only. A3b: a captures_ctx block also
+                // takes copied[1] = M's MATERIALIZED Context (the SAME object,
+                // Risk 2), so `value_base` (where the stack captures land)
+                // shifts to 2. Mirrors `make_closure`'s `value_base = 1 +
+                // captures_ctx`.
+                let captures_ctx = block.captures_ctx();
+                let value_base = 1 + captures_ctx as usize;
                 debug_assert!(
-                    !block.captures_ctx(),
-                    "A3a: an escaping block must be non-captures_ctx (has_ctx is A3b)"
+                    !captures_ctx || self.method_ctx_vreg.is_some(),
+                    "A3b: a captures_ctx escaping block requires M to have materialized its Context"
                 );
                 let n_value_captures = ncopied as usize;
                 debug_assert!(
@@ -3945,12 +3969,11 @@ impl<'a> Translator<'a> {
                     },
                 ));
 
-                // total copied slots = 1 (copied[0]=self) + value captures
-                // (A3a: captures_ctx=false, so no copied[1]=ctx slot). Body =
-                // [method, home, ncopied-size] (3) + copied (`total`);
-                // +HEADER_WORDS(2). Mirrors `alloc_closure`'s own
+                // total copied slots = value_base (self [+ ctx]) + value
+                // captures. Body = [method, home, ncopied-size] (3) + copied
+                // (`total`); +HEADER_WORDS(2). Mirrors `alloc_closure`'s own
                 // `words = nis(4) + 1 + total`.
-                let total = 1 + n_value_captures;
+                let total = value_base + n_value_captures;
                 let size_words = (crate::oops::layout::HEADER_WORDS + 3 + total) as u32;
                 let closure_klass = self.vm.universe.closure_klass;
                 let klass_lit = self
@@ -4007,15 +4030,28 @@ impl<'a> Translator<'a> {
                     val: self.self_vreg,
                     barrier: false,
                 });
-                // copied[1+i]@48+8i = value captures, in stack order (deepest
-                // ⇒ copied[1]), matching `make_closure`'s `set_copied(1+i,
-                // stack[base+i])`. Initializing stores into a fresh young
-                // object ⇒ no card barrier.
+                // A3b: copied[1]@48 = M's materialized Context (the SAME object
+                // M's own ctx-temp ops address — one Context by identity).
+                if captures_ctx {
+                    let ctx = self
+                        .method_ctx_vreg
+                        .expect("captures_ctx escaping block: M must have a materialized Context");
+                    code.push(Ir::StoreField {
+                        obj: dst,
+                        byte_off: 48,
+                        val: ctx,
+                        barrier: false,
+                    });
+                }
+                // copied[value_base+i]@40+8*(value_base+i) = value captures, in
+                // stack order (deepest ⇒ copied[value_base]), matching
+                // `make_closure`'s `set_copied(value_base+i, stack[base+i])`.
+                // Initializing stores into a fresh young object ⇒ no barrier.
                 for i in 0..n_value_captures {
                     let cap = stack[base + i];
                     code.push(Ir::StoreField {
                         obj: dst,
-                        byte_off: (40 + 8 * (1 + i)) as i32,
+                        byte_off: (40 + 8 * (value_base + i)) as i32,
                         val: cap,
                         barrier: false,
                     });
@@ -4653,14 +4689,27 @@ impl<'a> Translator<'a> {
                 // captured temps. A ctx-less (`captures_ctx`) block's frame
                 // aliases M's Context, so it addresses M's ctx-temps at depth 0 —
                 // the SAME promoted `ctx_vregs` M itself uses. `depth != 0` was
-                // rejected by `block_is_spliceable`.
+                // rejected by `block_is_spliceable`. S24 A3b: if M MATERIALIZES
+                // its Context (an escaping capturing block forced a real
+                // object), the spliced block must access that SAME object, not
+                // the elided vregs — else the inlined and escaped views split
+                // (Risk 2).
                 Instr::PushCtxTemp { depth, idx } => {
                     debug_assert_eq!(depth, 0, "block ctx-temp access must be depth 0");
                     let dst = self.fresh(true);
-                    code.push(Ir::Move {
-                        dst,
-                        src: self.ctx_vregs[idx as usize],
-                    });
+                    if let Some(ctx) = self.method_ctx_vreg {
+                        code.push(Ir::LoadField {
+                            dst,
+                            obj: ctx,
+                            byte_off: (crate::oops::layout::BODY_OFFSET + 8 * (2 + idx as usize))
+                                as i32,
+                        });
+                    } else {
+                        code.push(Ir::Move {
+                            dst,
+                            src: self.ctx_vregs[idx as usize],
+                        });
+                    }
                     bstack.push(dst);
                 }
                 Instr::StoreCtxTempPop { depth, idx } => {
@@ -4668,10 +4717,20 @@ impl<'a> Translator<'a> {
                     let v = bstack
                         .pop()
                         .expect("block splice: store_ctx_temp_pop on empty stack");
-                    code.push(Ir::Move {
-                        dst: self.ctx_vregs[idx as usize],
-                        src: v,
-                    });
+                    if let Some(ctx) = self.method_ctx_vreg {
+                        code.push(Ir::StoreField {
+                            obj: ctx,
+                            byte_off: (crate::oops::layout::BODY_OFFSET + 8 * (2 + idx as usize))
+                                as i32,
+                            val: v,
+                            barrier: true,
+                        });
+                    } else {
+                        code.push(Ir::Move {
+                            dst: self.ctx_vregs[idx as usize],
+                            src: v,
+                        });
+                    }
                 }
                 // `block_is_spliceable` still rejects super/closure/NLR and
                 // depth>0 ctx access, and the single-block shape excludes
@@ -5105,6 +5164,37 @@ pub fn convert(vm: &VmState, rcvr_klass: KlassOop, method: MethodOop, cfg: &Cfg)
 
     let block_id = |i: BlockIndex| BlockId(i as u32);
 
+    // S14 step 7-I / S24 A3: the escape pre-pass, iff M creates a literal
+    // closure. Hoisted before the vreg allocation because A3b's
+    // materialize-vs-elide decision below depends on it.
+    let escape: Option<crate::compiler::escape::ClosureEscape> = {
+        let mut has_closure = false;
+        let mut b = 0usize;
+        let bc_len = method.bytecode_len();
+        while b < bc_len {
+            let (instr, next) = decode_at(method, b);
+            if matches!(instr, Instr::PushClosure { .. }) {
+                has_closure = true;
+                break;
+            }
+            b = next;
+        }
+        if has_closure {
+            Some(crate::compiler::escape::analyze(method))
+        } else {
+            None
+        }
+    };
+    // S24 A3b (design §2.7): M owns a heap Context AND compiles via the
+    // ESCAPING path (some closure escapes — not `all_elidable`), so the
+    // Context CANNOT be elided (an escaping capturing closure needs a REAL
+    // Context in `copied[1]`). The prologue MATERIALIZES it and every
+    // depth-0 ctx-temp op goes through it, exactly like A1's block
+    // `copied[1]`. When `all_elidable` (every capturing block inlines), the
+    // Context still elides (7-II-b) and this stays false.
+    let materialize_ctx =
+        method.has_ctx() && !method.is_block() && escape.as_ref().is_some_and(|e| !e.all_elidable);
+
     let self_vreg = VReg(0);
     let mut vregs = vec![VRegInfo { is_oop: true }];
     // `temp_vregs[i]` is the unified arg/temp slot `Frame::temp_index` also
@@ -5121,13 +5211,27 @@ pub fn convert(vm: &VmState, rcvr_klass: KlassOop, method: MethodOop, cfg: &Cfg)
         .collect();
     // S14 step 7-II-b: a vreg per M ctx-slot (only when M is `has_ctx` — its
     // heap Context is elided and its captured temps live in these vregs).
-    let ctx_vregs: Vec<VReg> = (0..method.nctx())
-        .map(|_| {
-            let n = vregs.len() as u32;
-            vregs.push(VRegInfo { is_oop: true });
-            VReg(n)
-        })
-        .collect();
+    // S24 A3b: a MATERIALIZE method routes every ctx-temp through its real heap
+    // Context (`method_ctx_vreg`), so these elided 7-II-b promotion vregs are
+    // VESTIGIAL — and mutually exclusive with `method_ctx_vreg` by design (its
+    // doc). Allocating them anyway made each an `is_oop` vreg the deopt scope
+    // keeps live method-wide but which nothing ever writes OR nil-fills (the
+    // materialize prologue's Context-alloc branch skips the elided nil-init at
+    // §5516), leaving a live oopmap slot holding stack garbage at a GC
+    // safepoint — the A3b crash (`printOn:` slot 4 = raw 0x1, localized by
+    // `MACVM_TRACE=oops`). Enforce the exclusivity here: no elided vregs when
+    // materializing.
+    let ctx_vregs: Vec<VReg> = if materialize_ctx {
+        Vec::new()
+    } else {
+        (0..method.nctx())
+            .map(|_| {
+                let n = vregs.len() as u32;
+                vregs.push(VRegInfo { is_oop: true });
+                VReg(n)
+            })
+            .collect()
+    };
     // S24 A1: a block compilation's environment vregs (design §2.2). The
     // closure arrives as Param 0 (the value:-send's receiver slot, exactly
     // what `enter_compiled`/the A2 stub already marshal into x0); `self`
@@ -5146,6 +5250,17 @@ pub fn convert(vm: &VmState, rcvr_klass: KlassOop, method: MethodOop, cfg: &Cfg)
     } else {
         None
     };
+    // S24 A3b: the vreg holding M's own MATERIALIZED heap Context (the
+    // prologue allocates it; ctx-temp ops and the AllocClosure `copied[1]`
+    // store both read it). Distinct from `ctx_vregs` (7-II-b's ELIDED
+    // per-slot promotion) — mutually exclusive per method.
+    let method_ctx_vreg: Option<VReg> = if materialize_ctx {
+        let n = vregs.len() as u32;
+        vregs.push(VRegInfo { is_oop: true });
+        Some(VReg(n))
+    } else {
+        None
+    };
     let mut t = Translator {
         vm,
         method,
@@ -5158,6 +5273,7 @@ pub fn convert(vm: &VmState, rcvr_klass: KlassOop, method: MethodOop, cfg: &Cfg)
         ctx_vregs: ctx_vregs.clone(),
         block_closure_vreg,
         block_ctx_vreg,
+        method_ctx_vreg,
         next_extra_block: cfg.blocks.len() as u32,
         blocks_by_id: (0..cfg.blocks.len()).map(|_| None).collect(),
         call_sites: Vec::new(),
@@ -5169,29 +5285,9 @@ pub fn convert(vm: &VmState, rcvr_klass: KlassOop, method: MethodOop, cfg: &Cfg)
         level: 1,
         const_class: HashMap::new(),
         // S14 step 7-I: run the escape pre-pass iff M creates a literal closure.
-        // The driver already proved `all_elidable` for such a method before
-        // reaching here, so a `Some` result always means every closure site is a
-        // splicable good use. A closure-free method pays nothing (skips the scan
-        // AND the pre-pass) — keeping non-closure methods' listing goldens
-        // byte-stable.
-        escape: {
-            let mut has_closure = false;
-            let mut b = 0usize;
-            let bc_len = method.bytecode_len();
-            while b < bc_len {
-                let (instr, next) = decode_at(method, b);
-                if matches!(instr, Instr::PushClosure { .. }) {
-                    has_closure = true;
-                    break;
-                }
-                b = next;
-            }
-            if has_closure {
-                Some(crate::compiler::escape::analyze(method))
-            } else {
-                None
-            }
-        },
+        // Hoisted above (A3b needs it for the materialize decision); a
+        // closure-free method's `escape` is `None` and pays nothing.
+        escape,
         temp_sites: vec![None; method.argc() + method.ntemps()],
         pending_jump_target: None,
     };
@@ -5241,6 +5337,16 @@ pub fn convert(vm: &VmState, rcvr_klass: KlassOop, method: MethodOop, cfg: &Cfg)
             .word(),
         None,
     );
+    // S24 A3b: the Context klass, interned once for the prologue Context
+    // allocation of a MATERIALIZING has_ctx method.
+    let ctx_klass_lit = if materialize_ctx {
+        Some(
+            t.pool
+                .intern(vm.universe.context_klass.oop().raw(), Some(RelocKind::Oop)),
+        )
+    } else {
+        None
+    };
 
     let mut exit_stacks: Vec<Option<Vec<VReg>>> = vec![None; cfg.blocks.len()];
 
@@ -5369,15 +5475,62 @@ pub fn convert(vm: &VmState, rcvr_klass: KlassOop, method: MethodOop, cfg: &Cfg)
                         lit: nil_lit,
                     });
                 }
-                // S14 step 7-II-b: nil-init the promoted ctx-temp vregs (M's
-                // elided Context's slots start nil, matching `alloc_context`'s
-                // nil-fill — so a ctx-temp read before it is written yields
-                // nil).
-                for &cv in ctx_vregs.iter() {
-                    code.push(Ir::ConstPool {
-                        dst: cv,
-                        lit: nil_lit,
+                if let Some(ctx) = method_ctx_vreg {
+                    // S24 A3b (design §2.7): MATERIALIZE M's own heap Context
+                    // in the prologue — an escaping capturing closure will
+                    // store this SAME object into its `copied[1]` (Risk 2:
+                    // one Context by identity). `Ir::Alloc` nil-inits the whole
+                    // body (`emit.rs`), so home_hint@16 (nil — M is a method,
+                    // no enclosing chain) and the nctx slots@32+ are already
+                    // nil; only the size word@24 needs a store. Layout mirrors
+                    // `alloc_context`: [0]=home_hint, [1]=size, [2+i]=slot.
+                    let nctx = method.nctx();
+                    let size_words = (crate::oops::layout::HEADER_WORDS + 2 + nctx) as u32;
+                    // The prologue alloc is a GC safepoint (never deopts in
+                    // practice — no trap/poll/return-redirect here); its
+                    // reexecute point is method entry (bci 0), where the
+                    // interpreter's own `activate_method` re-allocates the
+                    // Context. The Context is NOT yet live at this safepoint,
+                    // so `build_deopt_metadata` records `CtxLoc::None` here
+                    // (keyed on this being the ctx-alloc site).
+                    deopt.push((
+                        code.len() as u32,
+                        DeoptRaw {
+                            stack: Vec::new(),
+                            bci: 0,
+                            kind: SafepointKind::Alloc,
+                            reexecute: true,
+                            stack_closures: Vec::new(),
+                            inline: None,
+                        },
+                    ));
+                    code.push(Ir::Alloc {
+                        dst: ctx,
+                        klass: ctx_klass_lit.expect("materialize_ctx => ctx_klass_lit interned"),
+                        size_words,
                     });
+                    let size_v = t.fresh(false);
+                    code.push(Ir::ConstSmi {
+                        dst: size_v,
+                        value: nctx as i64,
+                    });
+                    code.push(Ir::StoreField {
+                        obj: ctx,
+                        byte_off: (crate::oops::layout::BODY_OFFSET + 8) as i32,
+                        val: size_v,
+                        barrier: false,
+                    });
+                } else {
+                    // S14 step 7-II-b: nil-init the promoted ctx-temp vregs (M's
+                    // elided Context's slots start nil, matching
+                    // `alloc_context`'s nil-fill — so a ctx-temp read before it
+                    // is written yields nil).
+                    for &cv in ctx_vregs.iter() {
+                        code.push(Ir::ConstPool {
+                            dst: cv,
+                            lit: nil_lit,
+                        });
+                    }
                 }
             }
         }
@@ -5704,6 +5857,7 @@ pub fn convert(vm: &VmState, rcvr_klass: KlassOop, method: MethodOop, cfg: &Cfg)
         argc: method.argc() as u8,
         ntemps: method.ntemps() as u8,
         ctx_vregs,
+        method_ctx_vreg,
         block_closure_vreg,
         safepoints: Vec::new(),
         true_lit,

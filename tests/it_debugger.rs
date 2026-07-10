@@ -324,9 +324,8 @@ fn step_call_stops_at_compiled_send_and_inspects_without_changing_result() {
         tail(&stderr)
     );
     // `step` advanced to a second send before `continue` finished the run.
-    assert_eq!(
+    assert!(
         stderr.matches("▸ send #speak").count() >= 2,
-        true,
         "step must advance to the next send; stderr:\n{stderr}"
     );
 }

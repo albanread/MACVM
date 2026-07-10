@@ -90,6 +90,28 @@ impl ClosureEscape {
         })
     }
 
+    /// S24 A3b (design §2.7): can EVERY escaping site be compiled as an
+    /// allocated closure, allowing `captures_ctx` blocks? True iff every
+    /// escaping site's block is transitively NLR-free — the ONLY hard gate
+    /// (the dead-home soundness rule). A3a's `all_escaping_a3a_compilable`
+    /// additionally required `!captures_ctx`; A3b lifts that because a
+    /// `has_ctx` creator now MATERIALIZES its Context (`ir::convert`'s
+    /// `method_ctx_vreg`) so an escaping capturing closure gets a real
+    /// `copied[1]`. The driver's own `has_ctx`-materialize logic covers the
+    /// Context; this only gates NLR-freeness.
+    pub fn all_escaping_nlr_free(&self, method: MethodOop) -> bool {
+        self.escaping.iter().all(|&bci| {
+            let (instr, _) = decode_at(method, bci);
+            let Instr::PushClosure { lit, .. } = instr else {
+                return false;
+            };
+            let Some(block) = MethodOop::try_from(method.literals().at(lit as usize)) else {
+                return false;
+            };
+            block_transitively_nlr_free(block)
+        })
+    }
+
     /// The site id a `value`-send at `bci` splices — `Some` only for a proven
     /// good use (a matching-argc value-family send on a live, elidable Site).
     /// `ir::convert`'s splicer uses this; a `None` here at a value-send bci
@@ -870,8 +892,8 @@ mod tests {
         b.ret_self();
         let sel = vm.universe.intern(b"m");
         let m = b.finish(&mut vm, sel, 0, 0);
-        let free_blk = MethodOop::try_from(m.literals().at(free as usize)).unwrap();
-        let nlr_blk = MethodOop::try_from(m.literals().at(nlr as usize)).unwrap();
+        let free_blk = MethodOop::try_from(m.literals().at(free)).unwrap();
+        let nlr_blk = MethodOop::try_from(m.literals().at(nlr)).unwrap();
         assert!(block_transitively_nlr_free(free_blk), "no NlrTos -> free");
         assert!(
             !block_transitively_nlr_free(nlr_blk),
@@ -899,7 +921,7 @@ mod tests {
         b.ret_self();
         let sel = vm.universe.intern(b"m");
         let m = b.finish(&mut vm, sel, 0, 0);
-        let outer_blk = MethodOop::try_from(m.literals().at(outer as usize)).unwrap();
+        let outer_blk = MethodOop::try_from(m.literals().at(outer)).unwrap();
         assert!(
             !block_transitively_nlr_free(outer_blk),
             "an inner block's NlrTos is transitively visible -> not free"

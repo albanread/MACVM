@@ -824,6 +824,22 @@ pub fn regalloc(method: &IrMethod) -> RegallocResult {
             iv.crosses_safepoint = true;
         }
     }
+    // S24 A3b (design Risk 1/2): PIN M's MATERIALIZED Context vreg live for
+    // the whole method — EVERY safepoint's root deopt scope names its slot
+    // (`CtxLoc::Materialized`), and it is the SAME object escaped closures
+    // reference. Its compiled uses end at the last ctx-temp op, but an
+    // uncommon-trap that TERMINATES a block before that op would leave the
+    // slot dead — `resolve_frame_loc` then returns `Nil`, the materializer
+    // writes nil into the rebuilt frame's Context, and a ctx-temp read after
+    // the deopt corrupts (observed: `printOn:` with a captured stream, ctxloc
+    // -> Nil at the trap). Same one-slot pin as `block_closure_vreg` above.
+    if let Some(cv) = method.method_ctx_vreg {
+        let max_pos = intervals.iter().map(|iv| iv.end).max().unwrap_or(0) + 2;
+        if let Some(iv) = intervals.iter_mut().find(|iv| iv.vreg == cv) {
+            iv.end = max_pos;
+            iv.crosses_safepoint = true;
+        }
+    }
     let (frame_slots, slot_is_oop) = allocate(&mut intervals);
     // S14 perf recovery: call-free spilled intervals also get a resident
     // register (slots stay canonical; see LiveInterval::resident_reg).
@@ -873,6 +889,7 @@ mod tests {
             ntemps: 0,
             ctx_vregs: Vec::new(),
             block_closure_vreg: None,
+            method_ctx_vreg: None,
             safepoints: Vec::new(),
             true_lit: PoolLit(0),
             false_lit: PoolLit(0),
