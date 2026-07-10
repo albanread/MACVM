@@ -558,6 +558,9 @@ pub struct IrMethod {
     /// is not yet live (the prologue alloc itself; see `root_ctx`'s match).
     /// Mutually exclusive with a non-empty `ctx_vregs`.
     pub method_ctx_vreg: Option<(VReg, usize)>,
+    /// S24 B4: count of spliced blocks containing a `^` in this compile —
+    /// the driver bumps `vm.stats.blocks_spliced_nlr` from it.
+    pub spliced_nlr: u32,
     pub safepoints: Vec<SafepointId>,
     /// Always present (`convert` interns them unconditionally) — `emit.rs`
     /// has no `VmState` of its own to intern `true_obj`/`false_obj` on
@@ -896,6 +899,9 @@ impl PoolBuilder {
 struct Translator<'a> {
     vm: &'a VmState,
     method: MethodOop,
+    /// S24 B4: spliced blocks whose body contained a `^` — transferred to
+    /// `IrMethod.spliced_nlr`, bumped into `vm.stats` by the driver.
+    spliced_nlr: u32,
     /// S14 step 5 (customization, A3): the receiver klass K this compilation
     /// is FOR. The nmethod's entry guard proves every receiver has exactly
     /// this klass, so a send whose receiver is provably `self` dispatches
@@ -4494,17 +4500,23 @@ impl<'a> Translator<'a> {
                     result = Some(block_self);
                     break;
                 }
-                // 7-III: `^expr` (non-local return). The block's home is M (the
-                // block is created + value'd in M), so the NLR is just a RETURN
-                // FROM M — `Ir::Ret` of the value. Control leaves the method, so
-                // (like a trap) the caller must finish the current block. The
-                // `ensure:` decline (SPEC A7 Step 1) is automatic: an M with
-                // `ensure:` fails the escape gate (its handler block escapes).
-                // `block_is_spliceable` restricts NLR blocks to SEND-FREE, so no
-                // in-block deopt runs the interpreter's `nlr_tos` (which would
-                // need a synthesized home-ref closure).
+                // 7-III / S24 B4: `^expr` (non-local return). The block's home
+                // is M (the block is created + value'd in M), so the NLR is
+                // just a RETURN FROM M — `Ir::Ret` of the value. Control
+                // leaves the method, so (like a trap) the caller must finish
+                // the current block. Since B4 the block may ALSO contain
+                // sends: an in-block deopt at one rebuilds an is_block frame
+                // whose receiver-arg slot the materializer fills with a
+                // SYNTHESIZED home-ref closure (deopt.rs M6), so the
+                // interpreter's `nlr_tos` works unmodified. Markers can't
+                // intervene: ensure:/ifCurtailed: plant markers only on the
+                // protected block's own fresh interpreter activation, are
+                // primitive methods excluded from inlining AND block-arg
+                // splicing, and a protected block lexically containing an
+                // NLR block fails block_transitively_nlr_free at eligibility.
                 Instr::NlrTos => {
                     let val = bstack.pop().expect("block splice: nlr_tos on empty stack");
+                    self.spliced_nlr += 1;
                     code.push(Ir::Ret { val });
                     trapped = true;
                     break;
@@ -5267,6 +5279,7 @@ pub fn convert(vm: &VmState, rcvr_klass: KlassOop, method: MethodOop, cfg: &Cfg)
     let mut t = Translator {
         vm,
         method,
+        spliced_nlr: 0,
         rcvr_klass,
         self_devirt: false,
         vregs,
@@ -5861,6 +5874,7 @@ pub fn convert(vm: &VmState, rcvr_klass: KlassOop, method: MethodOop, cfg: &Cfg)
         ntemps: method.ntemps() as u8,
         ctx_vregs,
         method_ctx_vreg: method_ctx_vreg.map(|v| (v, method.nctx())),
+        spliced_nlr: t.spliced_nlr,
         block_closure_vreg,
         safepoints: Vec::new(),
         true_lit,

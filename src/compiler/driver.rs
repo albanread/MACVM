@@ -787,6 +787,8 @@ fn compile_method_full(
         !(osr_bci.is_some() && method.has_ctx()) || ir_method.method_ctx_vreg.is_some(),
         "gate/form disagreement: OSR-compiling a has_ctx method that convert did not materialize"
     );
+    // S24 B4 observable: spliced-NLR blocks in this compile.
+    vm.stats.blocks_spliced_nlr += ir_method.spliced_nlr as u64;
     // Debugger (DBG3 companion): `MACVM_DBG_IR=<selector>` dumps every
     // compile of a matching selector at the IR level — blocks, instructions,
     // and the full literal pool with resolved values — the layer BETWEEN

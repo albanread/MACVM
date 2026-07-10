@@ -260,15 +260,27 @@ fn block_is_spliceable(block: MethodOop) -> bool {
         }
         bci = next;
     }
-    // 7-III: an NLR block must be SEND-FREE for now. A send-ful NLR block that
-    // deopted at an inner send would rebuild an is_block frame and then run the
-    // interpreter's `nlr_tos`, which reads a real closure's `home_ref` from the
-    // block frame's receiver slot — but we elided the closure. A send-free NLR
-    // block never deopts inside, so the interpreter never runs its `nlr_tos`.
-    // (Synthesizing a home-ref closure for send-ful NLR blocks is a later slice.)
-    if has_nlr && has_send {
-        return false;
-    }
+    // S24 B4: NLR blocks may now splice even WITH sends — the old 7-III
+    // "send-free only" gate is gone. Both executors of a spliced `^` are
+    // sound: COMPILED, `nlr_tos` lowers to `Ir::Ret` of the home compilation
+    // (the block's home is by construction the compilation root, so the NLR
+    // IS a return from M — no closure consulted); INTERPRETED (post-deopt),
+    // the only way interpretation reaches the block's `nlr_tos` is through
+    // the materializer (every interpreter-visible entry into a spliced
+    // extent is a deopt safepoint carrying an is_block scope), and the B4
+    // materializer arm synthesizes a REAL home-ref closure into the rebuilt
+    // frame's receiver-arg slot (deopt.rs M6) — exactly the slot OP_NLR_TOS
+    // reads, with home_ref packing the same-materialization root's
+    // fp+serial. ensure:/ifCurtailed: markers cannot sit between the home
+    // and the spliced NLR within one materialized chain: (i) markers are
+    // planted only by prim_ensure_like on the protected block's own fresh
+    // INTERPRETER activation — never on method frames, never inside
+    // compiled extents; (ii) ensure:/ifCurtailed: are primitive methods,
+    // excluded from inlining and from block-arg splicing, so no marked
+    // frame can be interior to a materialized chain; (iii) a protected
+    // block lexically containing an NLR block fails
+    // block_transitively_nlr_free at eligibility.
+    let _ = (has_nlr, has_send);
     true
 }
 

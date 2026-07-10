@@ -454,19 +454,21 @@ impl Frame {
         // (`activate_block_interp`'s shape, mirrored by the deopt
         // materializer's root-block arm).
         if method.is_block() {
-            // Two legal block-frame shapes:
-            // (a) activate_block_interp / the S24 root-block materializer
-            //     arm: arg slot = the CLOSURE, FP+4 = closure.copied(0);
-            // (b) an S14 SPLICED-block materialization, whose scope recorded
-            //     the same value in both (the pre-S24 equal-copy shape).
+            // S24 B4: ONE legal block-frame shape — activate-shaped: arg
+            // slot = the CLOSURE, FP+4 = closure.copied(0). Producers:
+            // `activate_block_interp` and BOTH deopt-materializer block arms
+            // (the A1 root-block arm reads the recorded closure; the spliced
+            // arm SYNTHESIZES a home-ref closure into the arg slot since
+            // B4). The old shape (b) — FP+4 == arg, both holding M's self —
+            // is dead; its removal makes this verify a hard tripwire that
+            // the B4 synthesis ran on every spliced-block deopt.
             let arg = st.get(self.fp - argc - 1);
             let shape_a = crate::oops::wrappers::ClosureOop::try_from(arg)
                 .is_some_and(|cl| self.receiver(st) == cl.copied(0));
-            let shape_b = self.receiver(st) == arg;
             assert!(
-                shape_a || shape_b,
-                "Frame::verify: block frame is neither activate-shaped \
-                 (arg=closure, FP+4=copied[0]) nor spliced-shaped (FP+4 == arg)"
+                shape_a,
+                "Frame::verify: block frame must be activate-shaped \
+                 (arg slot = closure, FP+4 = closure.copied(0))"
             );
         } else {
             assert_eq!(

@@ -367,6 +367,11 @@ pub struct VmStats {
     /// preserved — pre-OSR closures and post-OSR compiled code share the
     /// ONE Context).
     pub osr_ctx_adopted: u64,
+    /// S24 B4: spliced blocks whose body contained a `^` (nlr_tos lowered
+    /// to `Ir::Ret` of the home compilation) — counted per COMPILE, not per
+    /// execution. The per-gate "did the NLR block actually splice" signal;
+    /// nonzero proves the B4 gate relaxation is firing.
+    pub blocks_spliced_nlr: u64,
 }
 
 /// The `MACVM_TRACE=stats` dump (`main.rs::print_vm_stats`) and RUSTTCL's
@@ -417,6 +422,7 @@ pub fn format_vm_stats(vm: &VmState) -> String {
             s.osr_declined_elided_ctx
         ),
         format!("[stats] osr_ctx_adopted={}", s.osr_ctx_adopted),
+        format!("[stats] blocks_spliced_nlr={}", s.blocks_spliced_nlr),
         format!("[stats] scavenge_count={}", g.scavenge_count),
         format!(
             "[stats] scavenge_us_total={} scavenge_us_max={}",

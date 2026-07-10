@@ -531,11 +531,38 @@ pub fn deoptimize_frame(vm: &mut VmState, frame: FrameView) -> DeoptResume {
         // Correct for both a nil-Context home (7-II) and an elided-Context home
         // (7-II-b). A method frame uses its own recorded `CtxLoc` (M6 proper).
         if vf.scope.is_block && prev_fp != crate::oops::layout::ENTRY_FRAME_SENTINEL {
-            let home_ctx = Frame {
-                fp: root_fp.expect("a SPLICED is_block frame is never outermost"),
-            }
-            .context(&vm.stack);
+            let root = root_fp.expect("a SPLICED is_block frame is never outermost");
+            let home_ctx = Frame { fp: root }.context(&vm.stack);
             Frame { fp: fp_new }.set_context(&mut vm.stack, home_ctx);
+            // S24 B4: a spliced block frame must be ACTIVATE-SHAPED — a REAL
+            // closure (home_ref = the just-materialized root's fp+serial) in
+            // the receiver-ARG slot — so an interpreted `nlr_tos` after this
+            // deopt works unmodified (it reads the closure's home_ref from
+            // exactly that slot, mod.rs's OP_NLR_TOS). Before B4 this slot
+            // held the scope's recorded receiver (M's self) and the splice
+            // gate forbade NLR+send blocks precisely because reaching an
+            // interpreted nlr_tos here would ClosureOop-expect-panic. FP+4
+            // keeps the home self `push_frame` copied — which equals
+            // closure.copied(0) by construction (`materialize_closure` reads
+            // the root's receiver), the activate_block_interp split. The
+            // allocation is GC-safe here for the same reason the phantom-slot
+            // materialization below is: this frame and the root are pushed
+            // and rooted, and FP+3's Context is a process-stack slot a moving
+            // collection updates.
+            let closure = materialize_closure(vm, frame.nm, root, vf.scope.method_pool_ix);
+            #[cfg(debug_assertions)]
+            {
+                let m = crate::oops::wrappers::ClosureOop::try_from(closure)
+                    .expect("materialize_closure returns a closure")
+                    .method();
+                debug_assert!(
+                    m.is_block(),
+                    "spliced is_block scope's method_pool_ix must name a CompiledBlock"
+                );
+            }
+            let f = Frame { fp: fp_new };
+            let slot = f.receiver_slot(&vm.stack);
+            vm.stack.set(slot, closure);
         } else if vf.scope.is_block {
             // S24 A1 (design §2.5): the ROOT-block arm — a STANDALONE-
             // compiled block deopted. Mirror `activate_block_interp`

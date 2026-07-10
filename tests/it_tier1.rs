@@ -140,6 +140,7 @@ fn run_ir_raw() {
         ctx_vregs: Vec::new(),
         block_closure_vreg: None,
         method_ctx_vreg: None,
+        spliced_nlr: 0,
         safepoints: Vec::new(),
         // Unused: this method has no SmiCmpVal/BoolBr, so emit.rs never
         // dereferences these against the (also empty) pool.
@@ -275,6 +276,7 @@ fn mul_method() -> IrMethod {
         ctx_vregs: Vec::new(),
         block_closure_vreg: None,
         method_ctx_vreg: None,
+        spliced_nlr: 0,
         safepoints: Vec::new(),
         true_lit: PoolLit(0),
         false_lit: PoolLit(0),
@@ -399,6 +401,7 @@ fn run_ir_raw_forces_spill() {
         ctx_vregs: Vec::new(),
         block_closure_vreg: None,
         method_ctx_vreg: None,
+        spliced_nlr: 0,
         safepoints: Vec::new(),
         true_lit: PoolLit(0),
         false_lit: PoolLit(0),
@@ -2480,6 +2483,7 @@ fn mono_resolve_patches_call_site_and_dispatches() {
         ctx_vregs: Vec::new(),
         block_closure_vreg: None,
         method_ctx_vreg: None,
+        spliced_nlr: 0,
         safepoints: Vec::new(),
         true_lit: PoolLit(0),
         false_lit: PoolLit(0),
@@ -2656,6 +2660,7 @@ fn build_c2i_scenario(vm: &mut VmState) -> (u64, KlassOop, NmethodId) {
         ctx_vregs: Vec::new(),
         block_closure_vreg: None,
         method_ctx_vreg: None,
+        spliced_nlr: 0,
         safepoints: Vec::new(),
         true_lit: PoolLit(0),
         false_lit: PoolLit(0),
@@ -2896,6 +2901,7 @@ fn full_ic_lattice_mono_to_pic_to_mega() {
         ctx_vregs: Vec::new(),
         block_closure_vreg: None,
         method_ctx_vreg: None,
+        spliced_nlr: 0,
         safepoints: Vec::new(),
         true_lit: PoolLit(0),
         false_lit: PoolLit(0),
@@ -3130,6 +3136,7 @@ fn dnu_from_compiled_code_reaches_does_not_understand() {
         ctx_vregs: Vec::new(),
         block_closure_vreg: None,
         method_ctx_vreg: None,
+        spliced_nlr: 0,
         safepoints: Vec::new(),
         true_lit: PoolLit(0),
         false_lit: PoolLit(0),
@@ -7392,4 +7399,117 @@ fn osr_phase_b_elided_form_declines() {
         before + 1,
         "the decline must be observable (the R1 evidence counter)"
     );
+}
+
+/// S24 B4: NLR blocks WITH sends now splice. Subprocess differentials via
+/// the phase-B harness (byte-identical to the interpreter + stat needles).
+///
+/// The positive shape: an UNCONDITIONAL `^` in a single-BB block with a send
+/// — `coll do: [:x | ^x + k]` returns the first element + k; empty coll
+/// falls through to the post-loop ^-1. Warmed past threshold so the caller
+/// compiles and the do: block-arg splices.
+const B4_FIRST: &str = r#"
+Object subclass: Finder [
+    firstPlus: k in: coll [
+        coll do: [:x | ^x + k ].
+        ^0 - 1 ]
+    drive [ | coll empty t |
+        coll := OrderedCollection new.
+        coll add: 10; add: 20; add: 30.
+        empty := OrderedCollection new.
+        t := 0.
+        1 to: 300 do: [:i | t := t + (self firstPlus: i in: coll) ].
+        t := t + (self firstPlus: 5 in: empty).
+        ^t ]
+]
+Transcript show: (Finder new drive) printString; cr.
+Smalltalk quit: 0.
+"#;
+
+/// The H1 kill-shot: a deopt INSIDE the spliced NLR block. Warm with smi
+/// elements (the in-block `x + k` compiles as a guarded smi add), then call
+/// with a LargeInteger element (built by overflow-promotion) — the receiver
+/// klass flips, the in-block guard deopts, the materializer must synthesize
+/// the home-ref closure, and the INTERPRETED nlr_tos must return from the
+/// home method with the right value. Before B4's materializer arm this
+/// panicked at OP_NLR_TOS's ClosureOop expect.
+const B4_DEOPT: &str = r#"
+Object subclass: Finder [
+    firstPlus: k in: coll [
+        coll do: [:x | ^x + k ].
+        ^0 - 1 ]
+    drive [ | coll big cold t |
+        coll := OrderedCollection new.
+        coll add: 10; add: 20.
+        t := 0.
+        1 to: 300 do: [:i | t := t + (self firstPlus: i in: coll) ].
+        big := 1.
+        62 timesRepeat: [ big := big * 2 ].
+        cold := OrderedCollection new.
+        cold add: big.
+        ^t + (self firstPlus: 1 in: cold) ]
+]
+Transcript show: (Finder new drive) printString; cr.
+Smalltalk quit: 0.
+"#;
+
+/// The negative twin: a CONDITIONAL NLR (multi-BB block body) must still
+/// decline the splice and stay correct through the A-series escaping path.
+const B4_CONDITIONAL: &str = r#"
+Object subclass: Finder [
+    firstAbove: n in: coll [
+        coll do: [:x | x > n ifTrue: [ ^x ] ].
+        ^0 - 1 ]
+    drive [ | coll t |
+        coll := OrderedCollection new.
+        coll add: 5; add: 15; add: 25.
+        t := 0.
+        1 to: 300 do: [:i | t := t + (self firstAbove: 10 in: coll) ].
+        t := t + (self firstAbove: 99 in: coll).
+        ^t ]
+]
+Transcript show: (Finder new drive) printString; cr.
+Smalltalk quit: 0.
+"#;
+
+#[test]
+fn b4_nlr_send_block_splices() {
+    osr_phase_b_differential("b4_first", B4_FIRST, &[], false, &[]);
+    // The splice observable: at least one NLR block spliced at compile time.
+    // (expect_osr=false: nothing here needs OSR — calls cross the threshold.)
+}
+
+#[test]
+fn b4_nlr_splice_observable() {
+    // Direct stat needle: the caller compiles at t=200 and the do: block-arg
+    // splice runs the NlrTos arm.
+    osr_phase_b_differential("b4_stat", B4_FIRST, &[], false, &["blocks_spliced_nlr="]);
+}
+
+#[test]
+fn b4_deopt_inside_spliced_nlr_block() {
+    osr_phase_b_differential("b4_deopt", B4_DEOPT, &[], false, &[]);
+}
+
+#[test]
+fn b4_deopt_inside_spliced_nlr_block_stress() {
+    osr_phase_b_differential(
+        "b4_deopt_ds",
+        B4_DEOPT,
+        &[("MACVM_DEOPT_STRESS", "64")],
+        false,
+        &[],
+    );
+    osr_phase_b_differential(
+        "b4_deopt_gc",
+        B4_DEOPT,
+        &[("MACVM_GC_STRESS", "full:64")],
+        false,
+        &[],
+    );
+}
+
+#[test]
+fn b4_conditional_nlr_still_declines_correctly() {
+    osr_phase_b_differential("b4_cond", B4_CONDITIONAL, &[], false, &[]);
 }
