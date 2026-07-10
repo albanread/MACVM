@@ -5183,7 +5183,7 @@ pub fn convert(vm: &VmState, rcvr_klass: KlassOop, method: MethodOop, cfg: &Cfg)
             b = next;
         }
         if has_closure {
-            Some(crate::compiler::escape::analyze(method))
+            Some(crate::compiler::escape::analyze(vm, method))
         } else {
             None
         }

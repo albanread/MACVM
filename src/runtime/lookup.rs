@@ -128,13 +128,24 @@ pub fn lookup(vm: &mut VmState, klass: KlassOop, selector: SymbolOop) -> Option<
     if let Some(m) = vm.lookup_cache.probe(klass, selector) {
         return Some(m);
     }
+    let hit = lookup_uncached(vm, klass, selector);
+    if let Some(m) = hit {
+        vm.lookup_cache.insert(klass, selector, m);
+    }
+    hit
+}
 
+/// The raw dictionary-chain walk without the cache — for callers that only
+/// hold `&VmState` (S24 B1: `escape::blockarg_candidate_ok` resolving a
+/// mono-compiled IC's NmethodId back to its method during the compile-time
+/// escape pre-pass). Identical dispatch semantics to [`lookup`], minus the
+/// memoization.
+pub fn lookup_uncached(vm: &VmState, klass: KlassOop, selector: SymbolOop) -> Option<MethodOop> {
     let nil = vm.universe.nil_obj;
     let mut k = klass;
     loop {
         if let Some(dict) = MethodDictOop::try_from(k.methods()) {
             if let Some(m) = dict.probe(vm, selector) {
-                vm.lookup_cache.insert(klass, selector, m);
                 return Some(m);
             }
         }

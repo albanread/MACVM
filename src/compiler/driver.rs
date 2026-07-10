@@ -260,7 +260,7 @@ fn eligibility_detail(vm: &VmState, method: MethodOop) -> Eligibility {
         found
     };
     let escape = if has_closure {
-        let e = crate::compiler::escape::analyze(method);
+        let e = crate::compiler::escape::analyze(vm, method);
         // S24 A3 (design §2.7): an ESCAPING closure is no longer an outright
         // reject — `ir::convert` allocates a real `BlockClosure`
         // (`Ir::Alloc` + `StoreField` inits, dead-home sentinel) when every
@@ -771,7 +771,7 @@ fn compile_method_full(
     // rare OSR; `osr_declined_elided_ctx` collects the evidence for ever
     // revisiting).
     if osr_bci.is_some() && method.has_ctx() {
-        let e = crate::compiler::escape::analyze(method);
+        let e = crate::compiler::escape::analyze(vm, method);
         if e.all_elidable {
             vm.stats.osr_declined_elided_ctx += 1;
             return None;

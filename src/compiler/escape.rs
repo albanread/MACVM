@@ -452,7 +452,13 @@ fn block_arg_transparent(d: MethodOop, arg_ix: usize, blk_argc: usize) -> bool {
 /// block-arg budget (SPEC §8.4's block-argument bonus — inlining the callee is
 /// what unlocks inlining its block argument), the block itself fits the plain
 /// budget, and the callee is transparent in that arg.
-fn blockarg_candidate_ok(method: MethodOop, ic: u16, arg_ix: usize, site_bci: usize) -> bool {
+fn blockarg_candidate_ok(
+    vm: &crate::runtime::vm_state::VmState,
+    method: MethodOop,
+    ic: u16,
+    arg_ix: usize,
+    site_bci: usize,
+) -> bool {
     let (instr, _) = decode_at(method, site_bci);
     let Instr::PushClosure { lit, .. } = instr else {
         return false;
@@ -467,10 +473,30 @@ fn blockarg_candidate_ok(method: MethodOop, ic: u16, arg_ix: usize, site_bci: us
         return false;
     }
     let site = InterpreterIc::at(method, ic);
-    let Some(d) = MethodOop::try_from(site.target()) else {
-        // A mono site whose target is an nmethod id — resolvable in principle,
-        // conservative for now.
-        return false;
+    // S24 B1: a mono site's target is either the MethodOop itself or — when
+    // the callee compiled before this caller (set_mono_compiled's seed; far
+    // MORE common since trigger unification compiles callees earlier) — a
+    // smi NmethodId. The old code bailed conservatively on the smi form,
+    // which meant the HOTTEST callees (compiled ones!) were exactly the ones
+    // that never block-arg-inlined. Resolve the id through the code table's
+    // (key_klass, key_selector) via dynamic lookup — dispatch-truth included
+    // by construction (lookup returns what a send finds TODAY, so a
+    // redefined/shadowed method never inlines stale).
+    let d = match MethodOop::try_from(site.target()) {
+        Some(d) => d,
+        None => {
+            let resolved = crate::oops::smi::SmallInt::try_from(site.target())
+                .map(|s| crate::codecache::nmethod::NmethodId(s.value() as u32))
+                .and_then(|id| vm.code_table.get(id))
+                .filter(|nm| matches!(nm.state, crate::codecache::nmethod::NmState::Alive))
+                .and_then(|nm| {
+                    crate::runtime::lookup::lookup_uncached(vm, nm.key_klass, nm.key_selector)
+                });
+            match resolved {
+                Some(d) => d,
+                None => return false,
+            }
+        }
     };
     if d.primitive() != 0
         || d.argc() != site.argc() as usize
@@ -494,7 +520,7 @@ fn blockarg_candidate_ok(method: MethodOop, ic: u16, arg_ix: usize, site_bci: us
 /// A method with NO `push_closure` yields `all_elidable == true` trivially (an
 /// empty `sites` set) — the driver only runs this when M contains a
 /// `push_closure`, but the result is well-defined either way.
-pub fn analyze(method: MethodOop) -> ClosureEscape {
+pub fn analyze(vm: &crate::runtime::vm_state::VmState, method: MethodOop) -> ClosureEscape {
     let cfg = decode::decode(method);
     let n_slots = method.argc() + method.ntemps();
 
@@ -553,6 +579,7 @@ pub fn analyze(method: MethodOop) -> ClosureEscape {
             .clone()
             .expect("escape: worklisted block has no entry state");
         transfer_block(
+            vm,
             method,
             &cfg,
             b,
@@ -621,6 +648,7 @@ fn pop_escape(st: &mut State, escaping: &mut HashSet<usize>) {
 /// was built from, over `[bci_start, bci_end)`.
 #[allow(clippy::too_many_arguments)]
 fn transfer_block(
+    vm: &crate::runtime::vm_state::VmState,
     method: MethodOop,
     cfg: &Cfg,
     b: usize,
@@ -707,7 +735,13 @@ fn transfer_block(
                     let good_blockarg = phantom_args.len() == 1
                         && matches!(recv, AV::Other)
                         && !super_
-                        && blockarg_candidate_ok(method, ic, phantom_args[0].0, phantom_args[0].1);
+                        && blockarg_candidate_ok(
+                            vm,
+                            method,
+                            ic,
+                            phantom_args[0].0,
+                            phantom_args[0].1,
+                        );
                     if good_blockarg {
                         let (arg_ix, s) = phantom_args[0];
                         blockarg_sends.insert(bci, (s, arg_ix));
@@ -840,7 +874,7 @@ mod tests {
         let sel = vm.universe.intern(b"m");
         let m = b.finish(&mut vm, sel, 0, 0);
 
-        let e = analyze(m);
+        let e = analyze(&vm, m);
         assert!(
             e.all_elidable,
             "a directly-invoked literal block is elidable"
@@ -866,7 +900,7 @@ mod tests {
         let sel = vm.universe.intern(b"m");
         let m = b.finish(&mut vm, sel, 0, 0);
 
-        let e = analyze(m);
+        let e = analyze(&vm, m);
         assert!(!e.all_elidable, "a stored closure escapes");
         assert_eq!(e.escaping.len(), 1);
     }
@@ -944,7 +978,7 @@ mod tests {
         b.ret_self();
         let sel = vm.universe.intern(b"m");
         let m = b.finish(&mut vm, sel, 0, 0);
-        let e = analyze(m);
+        let e = analyze(&vm, m);
         assert!(!e.all_elidable, "stored closure escapes");
         assert!(
             e.is_escaping_site(site),
@@ -971,7 +1005,7 @@ mod tests {
         b.ret_self();
         let sel = vm.universe.intern(b"m");
         let m = b.finish(&mut vm, sel, 0, 0);
-        let e = analyze(m);
+        let e = analyze(&vm, m);
         assert!(!e.all_elidable, "stored closure escapes");
         assert!(
             !e.all_escaping_a3a_compilable(m),
@@ -996,7 +1030,7 @@ mod tests {
         let sel = vm.universe.intern(b"m");
         let m = b.finish(&mut vm, sel, 0, 0);
 
-        let e = analyze(m);
+        let e = analyze(&vm, m);
         assert!(!e.all_elidable, "a closure passed as an arg escapes");
         assert_eq!(e.escaping.len(), 1);
     }
@@ -1037,7 +1071,7 @@ mod tests {
         let sel = vm.universe.intern(b"m");
         let m = b.finish(&mut vm, sel, 0, 1);
 
-        let e = analyze(m);
+        let e = analyze(&vm, m);
         assert!(
             !e.all_elidable,
             "two distinct sites merging into one temp slot both escape"
@@ -1065,7 +1099,7 @@ mod tests {
         let sel = vm.universe.intern(b"m");
         let m = b.finish(&mut vm, sel, 0, 1);
 
-        let e = analyze(m);
+        let e = analyze(&vm, m);
         assert!(
             e.all_elidable,
             "a site stored to and reloaded from a temp, then value'd, is elidable"
@@ -1108,7 +1142,7 @@ mod tests {
         let sel = vm.universe.intern(b"m");
         let m = b.finish(&mut vm, sel, 0, 0);
 
-        let e = analyze(m);
+        let e = analyze(&vm, m);
         assert!(
             !e.all_elidable,
             "a block whose body itself pushes a closure is not spliceable → escaping"
@@ -1139,7 +1173,7 @@ mod tests {
         let sel = vm.universe.intern(b"m");
         let m = b.finish(&mut vm, sel, 0, 0);
 
-        let e = analyze(m);
+        let e = analyze(&vm, m);
         assert!(
             e.all_elidable,
             "a directly-invoked block with an ordinary send is spliceable (7-II)"
@@ -1166,7 +1200,7 @@ mod tests {
         let sel = vm.universe.intern(b"m");
         let m = b.finish(&mut vm, sel, 0, 0);
 
-        let e = analyze(m);
+        let e = analyze(&vm, m);
         assert!(
             !e.all_elidable,
             "a block with a super send is not spliceable → escaping"
@@ -1191,7 +1225,7 @@ mod tests {
         let sel = vm.universe.intern(b"m");
         let m = b.finish(&mut vm, sel, 0, 0);
 
-        let e = analyze(m);
+        let e = analyze(&vm, m);
         assert!(
             !e.all_elidable,
             "a value-send whose argc mismatches the block's argc escapes the site"
@@ -1220,7 +1254,7 @@ mod tests {
         let sel = vm.universe.intern(b"m");
         let m = b.finish(&mut vm, sel, 0, 0);
 
-        let e = analyze(m);
+        let e = analyze(&vm, m);
         assert!(
             e.all_elidable,
             "a send-free captures_ctx block is spliceable in 7-II-b"
@@ -1247,7 +1281,7 @@ mod tests {
         let sel = vm.universe.intern(b"m");
         let m = b.finish(&mut vm, sel, 0, 0);
 
-        let e = analyze(m);
+        let e = analyze(&vm, m);
         assert!(
             e.all_elidable,
             "a send-ful capturing block is spliceable in 7-II-b-ii"
