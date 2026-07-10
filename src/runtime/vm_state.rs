@@ -316,6 +316,15 @@ pub struct VmStats {
     pub ic_patch_declined_cache_full: u64,
     /// S15 A8: Pic→Mega promotions (site went megamorphic).
     pub mega_transitions: u64,
+    /// S24 B-phase (stale-PIC-c2i fix): a Pic-state site's pair whose target
+    /// was a c2i adapter (baked before the callee compiled) was re-keyed to
+    /// the freshly compiled nmethod by `rt_interpret_call`'s upgrade hook.
+    /// Before this existed, such a pair dispatched its klass through the
+    /// interpreter for the caller's whole lifetime — deltablue's t=200 tail
+    /// (ScaleConstraint>>execute, 39.8% of interpreted bytecodes) was exactly
+    /// this. A PIC guard HIT never re-enters `rt_resolve_send`, so the c2i
+    /// crossing itself is the only place the staleness is observable.
+    pub c2i_pic_rekeys: u64,
     /// S24 A2: a compiled `value`-family send site's block-dispatch stub
     /// tail-jumped straight to a compiled block nmethod (the fast path —
     /// `rt_value_target` found an Alive `by_block` entry, no interpreter
@@ -362,6 +371,7 @@ pub fn format_vm_stats(vm: &VmState) -> String {
         format!("[stats] ic_misses={}", s.ic_misses),
         format!("[stats] pic_extends={}", s.pic_extends),
         format!("[stats] mega_transitions={}", s.mega_transitions),
+        format!("[stats] c2i_pic_rekeys={}", s.c2i_pic_rekeys),
         format!(
             "[stats] ic_patch_declined_cache_full={}",
             s.ic_patch_declined_cache_full

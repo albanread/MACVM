@@ -1441,6 +1441,8 @@ pub unsafe extern "C" fn rt_interpret_call(
                     // region's coincidental site can only match if it sends
                     // the SAME selector, in which case the link is correct
                     // for it too.
+                    let site_state = site.state;
+                    let site_super = site.super_klass;
                     if is_mono_k && site.super_klass.is_none() && site_sel == sel {
                         let nm = vm.code_table.get(id).expect("just compiled/looked up");
                         let target = nm.code.base as u64 + nm.entry_off as u64;
@@ -1448,6 +1450,62 @@ pub unsafe extern "C" fn rt_interpret_call(
                             .patch_branch26_at(caller_code, site_off, target);
                         vm.code_table.get_mut(caller_id).unwrap().ic_sites[site_idx].state =
                             IcState::Mono { klass: k, target };
+                    } else if let (IcState::Pic { stub }, None) = (site_state, site_super) {
+                        // S24 B-phase (stale-PIC-c2i fix; mechanism confirmed
+                        // by the fb01b7a review's understand pass): this
+                        // site's PIC has a pair (k -> c2i adapter) baked
+                        // BEFORE the callee compiled. The PIC guard HITS for
+                        // k, so `rt_resolve_send`'s re-key arm is unreachable
+                        // for it forever — adapters have no not-entrant
+                        // lifecycle, PIC growth copies pairs verbatim, and
+                        // install does no caller-IC work (adapters.rs's own
+                        // doc records the eager repatch as deferred since S11
+                        // step 10). Result: k dispatched its FULL body
+                        // interpreted for the caller's whole lifetime —
+                        // deltablue's dominant t=200 tail. Heal it HERE, the
+                        // one place the staleness is observable: re-key the
+                        // k pair in place to the freshly compiled target and
+                        // rebuild the stub (immutable-PIC discipline D3.4,
+                        // build-before-free, degrade-on-cache-full — all
+                        // exactly `rt_resolve_send`'s own Pic re-key arm).
+                        // `site_sel == sel` guards the task-#93 reused-region
+                        // hazard, same as the Mono arm above.
+                        if site_sel == sel {
+                            let mut pairs = vm.pic_table.pairs_of(stub).to_vec();
+                            if let Some(pair) = pairs.iter_mut().find(|p| p.0 == k) {
+                                // The same call rt_resolve_send's PIC arms
+                                // make: verified entry (the guard chain
+                                // already proved the klass).
+                                let new_t = resolve_target_entry(vm, k, sel, method, true);
+                                if pair.1 != new_t {
+                                    pair.1 = new_t;
+                                    let resolve_addr = vm.stubs.resolve_addr();
+                                    let smi_klass_bits = vm.universe.smi_klass.oop().raw();
+                                    if let Some(new_stub) = vm.pic_table.build(
+                                        &mut vm.code_cache,
+                                        smi_klass_bits,
+                                        resolve_addr,
+                                        pairs,
+                                    ) {
+                                        vm.stats.c2i_pic_rekeys += 1;
+                                        vm.pic_table.free(&mut vm.code_cache, stub);
+                                        vm.code_cache.patch_branch26_at(
+                                            caller_code,
+                                            site_off,
+                                            new_stub.base as u64,
+                                        );
+                                        vm.code_table.get_mut(caller_id).unwrap().ic_sites
+                                            [site_idx]
+                                            .state = IcState::Pic { stub: new_stub };
+                                    } else {
+                                        // Cache full: leave the old PIC
+                                        // installed — correct, just slow;
+                                        // the established degrade pattern.
+                                        vm.stats.ic_patch_declined_cache_full += 1;
+                                    }
+                                }
+                            }
+                        }
                     } else if is_mono_k && site.super_klass.is_none() {
                         #[cfg(debug_assertions)]
                         if std::env::var("MACVM_DBG_RESOLVE").is_ok() {
@@ -2305,7 +2363,9 @@ pub unsafe extern "C" fn rt_alloc_slow(vm: *mut VmState, klass_bits: u64, size_b
                 vm.universe.closure_klass.oop().raw(),
                 "rt_alloc_slow: a Format::Closure Alloc site's klass must be THE closure klass"
             );
-            crate::memory::alloc::alloc_closure(vm, words - nis - 1).oop().raw()
+            crate::memory::alloc::alloc_closure(vm, words - nis - 1)
+                .oop()
+                .raw()
         }
         crate::oops::klass::Format::Context => {
             debug_assert_eq!(
@@ -2313,7 +2373,9 @@ pub unsafe extern "C" fn rt_alloc_slow(vm: *mut VmState, klass_bits: u64, size_b
                 vm.universe.context_klass.oop().raw(),
                 "rt_alloc_slow: a Format::Context Alloc site's klass must be THE context klass"
             );
-            crate::memory::alloc::alloc_context(vm, words - nis - 1).oop().raw()
+            crate::memory::alloc::alloc_context(vm, words - nis - 1)
+                .oop()
+                .raw()
         }
         _ => crate::memory::alloc::alloc_slots(vm, klass).oop().raw(),
     }
