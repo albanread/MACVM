@@ -377,3 +377,26 @@ remediation). Release, MacBook arm64, `world/bench/*` via `Bench run:`.
   findings; the two live ones were fixed same-day and the CtxLoc::None
   bci-fingerprint (three finders converged) was re-keyed to ctx-vreg
   liveness before it could bite under organic NotEntrant deopts.
+
+## S24 B-phase L1 — stale PIC-c2i heal (e3a3f00)
+
+2026-07-10. The B-phase understand pass (3-reader + adversarial-verify
+workflow) found the deltablue tail was a DISPATCH FREEZE, not eligibility: PIC
+pairs baked (klass -> c2i) before the callee compiled never upgrade. One lazy
+re-key arm in rt_interpret_call's upgrade hook:
+
+| benchmark | interp (ms) | jit t=200 | jit t=1000 | best/interp |
+|---|---|---|---|---|
+| richards | 204 | 12 | 12 | **17.0x** |
+| deltablue | 214 | 11 | 11 | **19.5x** |
+
+- deltablue **6.5x -> 19.5x** (33 -> 11ms); richards 20 -> 12ms at t=200 (its
+  t=1000 record now holds at ALL realistic thresholds). c2i_pic_rekeys=19.
+- Remaining deltablue tail (2.8M interpreted bytecodes): the sub-threshold
+  DRIVER methods (projectionTest: 32%, chainTest: 24%, makePlan: 15% — all
+  called ~103x < 200 and OSR-ineligible because they contain closures,
+  driver.rs:750). L2 target: extend the OSR envelope to closure-bearing
+  methods. B1-B4 (block-arg inlining wideners) mapped from the design doc
+  thereafter.
+- Correctness: world byte-identical off vs t=200 plain + all three stress
+  modes; deltablue correct under DEOPT_STRESS (re-key x invalidation churn).
