@@ -892,6 +892,7 @@ mod tests {
             method_ctx_vreg: None,
             spliced_nlr: 0,
             spliced_multibb: 0,
+            splice_declined_budget: 0,
             safepoints: Vec::new(),
             true_lit: PoolLit(0),
             false_lit: PoolLit(0),

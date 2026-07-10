@@ -142,6 +142,7 @@ fn run_ir_raw() {
         method_ctx_vreg: None,
         spliced_nlr: 0,
         spliced_multibb: 0,
+        splice_declined_budget: 0,
         safepoints: Vec::new(),
         // Unused: this method has no SmiCmpVal/BoolBr, so emit.rs never
         // dereferences these against the (also empty) pool.
@@ -279,6 +280,7 @@ fn mul_method() -> IrMethod {
         method_ctx_vreg: None,
         spliced_nlr: 0,
         spliced_multibb: 0,
+        splice_declined_budget: 0,
         safepoints: Vec::new(),
         true_lit: PoolLit(0),
         false_lit: PoolLit(0),
@@ -405,6 +407,7 @@ fn run_ir_raw_forces_spill() {
         method_ctx_vreg: None,
         spliced_nlr: 0,
         spliced_multibb: 0,
+        splice_declined_budget: 0,
         safepoints: Vec::new(),
         true_lit: PoolLit(0),
         false_lit: PoolLit(0),
@@ -2491,6 +2494,7 @@ fn mono_resolve_patches_call_site_and_dispatches() {
         method_ctx_vreg: None,
         spliced_nlr: 0,
         spliced_multibb: 0,
+        splice_declined_budget: 0,
         safepoints: Vec::new(),
         true_lit: PoolLit(0),
         false_lit: PoolLit(0),
@@ -2669,6 +2673,7 @@ fn build_c2i_scenario(vm: &mut VmState) -> (u64, KlassOop, NmethodId) {
         method_ctx_vreg: None,
         spliced_nlr: 0,
         spliced_multibb: 0,
+        splice_declined_budget: 0,
         safepoints: Vec::new(),
         true_lit: PoolLit(0),
         false_lit: PoolLit(0),
@@ -2911,6 +2916,7 @@ fn full_ic_lattice_mono_to_pic_to_mega() {
         method_ctx_vreg: None,
         spliced_nlr: 0,
         spliced_multibb: 0,
+        splice_declined_budget: 0,
         safepoints: Vec::new(),
         true_lit: PoolLit(0),
         false_lit: PoolLit(0),
@@ -3147,6 +3153,7 @@ fn dnu_from_compiled_code_reaches_does_not_understand() {
         method_ctx_vreg: None,
         spliced_nlr: 0,
         spliced_multibb: 0,
+        splice_declined_budget: 0,
         safepoints: Vec::new(),
         true_lit: PoolLit(0),
         false_lit: PoolLit(0),
@@ -7837,5 +7844,84 @@ fn b5_deopt_inside_grafted_block_gc_stress() {
     assert!(
         vm.universe.gc_stats.scavenge_count > scav0,
         "gc_stress must have forced real scavenges through the deopt window"
+    );
+}
+
+/// S24 B5 step 4 (T4): the blockarg BLOCK-side budget bonus. sumUp:'s tiny
+/// block (well under 1x per_call_cost) spliced before this step — the
+/// existing compiled_blockarg_do_pattern test pins that control. This padded
+/// sibling's block costs strictly BETWEEN 1x and 2x per_call_cost: under the
+/// old 1x block gate `blockarg_candidate_ok` declined it (site ESCAPING →
+/// the A3 closure path); with the 2x bonus it splices. Premises are
+/// self-checking so a builder-encoding change speaks instead of silently
+/// hollowing the test out. Differential-correct against the interpreter.
+#[test]
+fn b5_step4_blockarg_block_budget_bonus() {
+    let mut vm = test_vm();
+    install_value_prims(&mut vm);
+    let smi_klass = vm.universe.smi_klass;
+    let (_upto, _le, _plus) = upto_scenario(&mut vm);
+
+    // `b5sum44: n [ |sum| sum := 0. n upTo: [:e | sum := sum + e +1 +1 ... ].
+    //  ^sum ]` — the block padded with chained `+ 1` sends into the bonus band.
+    let plus_sel = vm.universe.intern(b"+");
+    let upto_sel = vm.universe.intern(b"upTo:");
+    let sel = vm.universe.intern(b"b5sum44:");
+    let mut b = BytecodeBuilder::new();
+    let lit = b.build_block(&mut vm, 1, 0, false, 0, true, |blk, vm| {
+        blk.push_ctx_temp(0, 0); // sum
+        blk.push_temp(0); // e
+        blk.send(vm, plus_sel, 1);
+        for _ in 0..6 {
+            blk.push_smi_i8(1);
+            blk.send(vm, plus_sel, 1);
+        }
+        blk.store_ctx_temp_pop(0, 0);
+        blk.push_ctx_temp(0, 0);
+        blk.block_return_tos();
+    });
+    b.push_smi_i8(0);
+    b.store_ctx_temp_pop(0, 0);
+    b.push_temp(0);
+    b.push_closure(lit, 0);
+    b.send(&mut vm, upto_sel, 1);
+    b.pop();
+    b.push_ctx_temp(0, 0);
+    b.ret_tos();
+    let m = b.finish(&mut vm, sel, 1, 0);
+    m.set_flags(1, 0, true, false, false, false, 1); // argc 1, has_ctx, nctx=1
+    let block = MethodOop::try_from(m.literals().at(lit)).unwrap();
+
+    // Premise: strictly between the plain and doubled budgets.
+    let cost = macvm::compiler::inline::inline_cost(block);
+    let plain = macvm::compiler::inline::budget_for_level(1).per_call_cost;
+    assert!(
+        cost > plain && cost <= plain * 2,
+        "the padded block (cost {cost}) must sit in the bonus band ({plain}, {}]",
+        plain * 2
+    );
+
+    // Interpreter oracle — also warms every IC (upTo: mono via the real send).
+    let self_smi = SmallInt::new(1).oop();
+    let interp = macvm::interpreter::run_method(&mut vm, m, self_smi, &[SmallInt::new(5).oop()]);
+    let want = SmallInt::try_from(interp).expect("smi sum").value();
+    assert_eq!(want, 45, "sum of (e + 6) for e in 1..=5");
+
+    // The flip this step buys: the ONLY closure site in m classifies
+    // spliceable (elidable), not escaping.
+    let esc = macvm::compiler::escape::analyze(&vm, m);
+    assert!(
+        esc.all_elidable,
+        "2x block bonus must flip the bonus-band block-arg site to spliced"
+    );
+
+    let id = driver::compile_method(&mut vm, smi_klass, m).expect("must compile");
+    vm.stack.push(self_smi);
+    vm.stack.push(SmallInt::new(5).oop());
+    assert_eq!(enter_compiled(&mut vm, id, 1), EnterResult::Completed);
+    assert_eq!(
+        SmallInt::try_from(vm.stack.pop()).map(|s| s.value()),
+        Some(want),
+        "compiled b5sum44: differential"
     );
 }

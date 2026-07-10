@@ -375,6 +375,9 @@ pub struct VmStats {
     /// S24 B5: multi-BB block bodies grafted (per compile) — nonzero proves
     /// the CFG graft is firing for conditional-NLR / branchy block shapes.
     pub blocks_spliced_multibb: u64,
+    /// S24 B5 step 4: method-inline decisions demoted to plain sends by the
+    /// cumulative total_bytes budget.
+    pub splice_declined_budget: u64,
 }
 
 /// The `MACVM_TRACE=stats` dump (`main.rs::print_vm_stats`) and RUSTTCL's
@@ -429,6 +432,10 @@ pub fn format_vm_stats(vm: &VmState) -> String {
         format!(
             "[stats] blocks_spliced_multibb={}",
             s.blocks_spliced_multibb
+        ),
+        format!(
+            "[stats] splice_declined_budget={}",
+            s.splice_declined_budget
         ),
         format!("[stats] scavenge_count={}", g.scavenge_count),
         format!(

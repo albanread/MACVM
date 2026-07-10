@@ -563,6 +563,9 @@ pub struct IrMethod {
     pub spliced_nlr: u32,
     /// S24 B5: count of multi-BB block bodies grafted in this compile.
     pub spliced_multibb: u32,
+    /// S24 B5 step 4: method-inline sites demoted to a plain `CallSend`
+    /// because the cumulative `total_bytes` budget would have been exceeded.
+    pub splice_declined_budget: u32,
     pub safepoints: Vec<SafepointId>,
     /// Always present (`convert` interns them unconditionally) — `emit.rs`
     /// has no `VmState` of its own to intern `true_obj`/`false_obj` on
@@ -943,6 +946,15 @@ struct Translator<'a> {
     spliced_nlr: u32,
     /// S24 B5: multi-BB block bodies grafted this compile.
     spliced_multibb: u32,
+    /// S24 B5 step 4: cumulative bytecode bytes committed to inlined/spliced
+    /// bodies this compile (`inline_cost` of every grafted callee and block).
+    /// Enforced against `InlineBudget::total_bytes` ONLY at declinable
+    /// method-inline decisions (fallback = plain `CallSend`); COMMITTED block
+    /// splices (value sites, blockarg sites — no legal convert-time fallback)
+    /// count toward it but are never declined by it (design amendment A1).
+    budget_bytes_used: u32,
+    /// S24 B5 step 4: declinable inline decisions demoted over-budget.
+    splice_declined_budget: u32,
     /// S14 step 5 (customization, A3): the receiver klass K this compilation
     /// is FOR. The nmethod's entry guard proves every receiver has exactly
     /// this klass, so a send whose receiver is provably `self` dispatches
@@ -1589,6 +1601,7 @@ impl<'a> Translator<'a> {
         }
         let result = result.expect("inline splice: single-return leaf must produce a result");
 
+        self.budget_commit(callee);
         self.record_inline_dep(dep_klass, selector);
         Some(result)
     }
@@ -2098,6 +2111,7 @@ impl<'a> Translator<'a> {
             bci = next;
         }
 
+        self.budget_commit(callee);
         self.record_inline_dep(dep_klass, selector);
         if trapped {
             Some(NonLeafOutcome::Trapped)
@@ -2906,10 +2920,30 @@ impl<'a> Translator<'a> {
             });
         }
 
+        self.budget_commit(callee);
         if !is_block_graft {
             self.record_inline_dep(dep_klass, selector);
         }
         Some((result_vreg, ir_ids[0], continuation_id))
+    }
+
+    /// S24 B5 step 4: commit a grafted body's bytes to the cumulative
+    /// budget. Called at every splice success exit (leaf, non-leaf, CFG in
+    /// both graft modes, and the linear block-body walk) — committed sites
+    /// included, so the counter reflects real emitted volume.
+    fn budget_commit(&mut self, callee: MethodOop) {
+        self.budget_bytes_used = self
+            .budget_bytes_used
+            .saturating_add(crate::compiler::inline::inline_cost(callee));
+    }
+
+    /// Whether grafting `callee` would push the compile past
+    /// `InlineBudget::total_bytes`. Consulted ONLY at declinable decisions.
+    fn budget_would_exceed(&self, callee: MethodOop) -> bool {
+        let budget = crate::compiler::inline::budget_for_level(self.level);
+        self.budget_bytes_used
+            .saturating_add(crate::compiler::inline::inline_cost(callee))
+            > budget.total_bytes
     }
 
     fn record_inline_dep(&mut self, klass: KlassOop, selector: SymbolOop) {
@@ -3134,6 +3168,17 @@ impl<'a> Translator<'a> {
                         && (crate::compiler::inline::is_leaf(target)
                             || crate::compiler::inline::is_inline_eligible_nonleaf(target)
                             || crate::compiler::inline::is_inline_eligible_cfg(target))
+                        // S24 B5 step 4: cumulative total_bytes — declinable
+                        // here (falls to the plain send tail), evaluated LAST
+                        // so a shape-ineligible site never counts as a
+                        // budget decline.
+                        && {
+                            let over = self.budget_would_exceed(target);
+                            if over {
+                                self.splice_declined_budget += 1;
+                            }
+                            !over
+                        }
                     {
                         let pre_pop_stack = {
                             let mut s = stack.clone();
@@ -3447,6 +3492,17 @@ impl<'a> Translator<'a> {
                         && (crate::compiler::inline::is_leaf(target)
                             || crate::compiler::inline::is_inline_eligible_nonleaf(target)
                             || crate::compiler::inline::is_inline_eligible_cfg(target))
+                        // S24 B5 step 4: cumulative total_bytes — declinable
+                        // here (falls to the plain send tail), evaluated LAST
+                        // so a shape-ineligible site never counts as a
+                        // budget decline.
+                        && {
+                            let over = self.budget_would_exceed(target);
+                            if over {
+                                self.splice_declined_budget += 1;
+                            }
+                            !over
+                        }
                     {
                         let pre_pop_stack = stack.clone();
                         let mut real_args: Vec<VReg> = (0..real_argc)
@@ -3614,6 +3670,26 @@ impl<'a> Translator<'a> {
                     crate::compiler::inline::decide_with_budget(&feedback, &budget, smi_bits)
                 } else {
                     crate::compiler::inline::InlineDecision::Call
+                };
+                // S24 B5 step 4: the cumulative `total_bytes` budget is
+                // enforced HERE — a declinable decision whose fallback is the
+                // plain `CallSend` tail below. (Committed block splices are
+                // counted but never declined; amendment A1.)
+                let feedback_inline = match feedback_inline {
+                    crate::compiler::inline::InlineDecision::Inline { callee, .. }
+                        if self.budget_would_exceed(callee) =>
+                    {
+                        self.splice_declined_budget += 1;
+                        crate::compiler::inline::InlineDecision::Call
+                    }
+                    crate::compiler::inline::InlineDecision::DominantWithSlowPath {
+                        case_method,
+                        ..
+                    } if self.budget_would_exceed(case_method) => {
+                        self.splice_declined_budget += 1;
+                        crate::compiler::inline::InlineDecision::Call
+                    }
+                    other => other,
                 };
                 // S14 step 6: a POLY site with a dominant case — inline the
                 // dominant LEAF body behind a klass guard whose FAIL edge is a
@@ -4550,6 +4626,9 @@ impl<'a> Translator<'a> {
         code: &mut Vec<Ir>,
         deopt: &mut Vec<(u32, DeoptRaw)>,
     ) -> Result<VReg, ()> {
+        // S24 B5 step 4: a committed splice — count it toward the cumulative
+        // budget up front (never declined here; amendment A1).
+        self.budget_commit(block);
         // S14 step 5: a spliced block's home self is the ROOT method's own
         // `self` whenever `block_self == self_vreg` (the only shape today),
         // so its klass is statically the customization klass.
@@ -5455,6 +5534,8 @@ pub fn convert(vm: &VmState, rcvr_klass: KlassOop, method: MethodOop, cfg: &Cfg)
         method,
         spliced_nlr: 0,
         spliced_multibb: 0,
+        budget_bytes_used: 0,
+        splice_declined_budget: 0,
         rcvr_klass,
         self_devirt: false,
         vregs,
@@ -6051,6 +6132,7 @@ pub fn convert(vm: &VmState, rcvr_klass: KlassOop, method: MethodOop, cfg: &Cfg)
         method_ctx_vreg: method_ctx_vreg.map(|v| (v, method.nctx())),
         spliced_nlr: t.spliced_nlr,
         spliced_multibb: t.spliced_multibb,
+        splice_declined_budget: t.splice_declined_budget,
         block_closure_vreg,
         safepoints: Vec::new(),
         true_lit,

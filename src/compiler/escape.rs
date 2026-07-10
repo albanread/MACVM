@@ -298,6 +298,13 @@ fn block_is_spliceable_cfg(block: MethodOop) -> bool {
     if block.has_ctx() {
         return false;
     }
+    // S24 B5 step 4: the block-side 2x budget bonus. Enforced HERE, at
+    // classification time (an over-budget block simply escapes -> the A3
+    // closure path), never at convert time -- splice sites are committed.
+    let budget = crate::compiler::inline::budget_for_level(1);
+    if crate::compiler::inline::inline_cost(block) > budget.per_call_cost * 2 {
+        return false;
+    }
     let cfg = decode::decode(block);
     for b in &cfg.blocks {
         match b.terminator {
@@ -560,8 +567,12 @@ fn blockarg_candidate_ok(
         return false;
     }
     let budget = crate::compiler::inline::budget_for_level(1);
+    // S24 B5 step 4: the block now gets the SAME 2x bonus as the callee --
+    // the flagship 44-byte conditional-NLR blocks sit between 1x (30) and
+    // 2x (60), and a spliced block replaces a full closure allocation plus
+    // a dynamic value-dispatch, easily worth a method-inline's slack.
     if crate::compiler::inline::inline_cost(d) > budget.per_call_cost * 2
-        || crate::compiler::inline::inline_cost(blk) > budget.per_call_cost
+        || crate::compiler::inline::inline_cost(blk) > budget.per_call_cost * 2
     {
         return false;
     }

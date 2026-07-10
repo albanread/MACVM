@@ -790,6 +790,7 @@ fn compile_method_full(
     // S24 B4/B5 observables: spliced-NLR blocks + multi-BB grafts.
     vm.stats.blocks_spliced_nlr += ir_method.spliced_nlr as u64;
     vm.stats.blocks_spliced_multibb += ir_method.spliced_multibb as u64;
+    vm.stats.splice_declined_budget += ir_method.splice_declined_budget as u64;
     // Debugger (DBG3 companion): `MACVM_DBG_IR=<selector>` dumps every
     // compile of a matching selector at the IR level — blocks, instructions,
     // and the full literal pool with resolved values — the layer BETWEEN
