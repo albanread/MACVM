@@ -1518,14 +1518,17 @@ fn method_named(vm: &mut VmState, klass: KlassOop, selector: &str) -> MethodOop 
 /// `SmallInteger` methods at all (`world/06_smallinteger.mst` isn't
 /// loaded), matching every other real-arithmetic test in this session.
 fn install_smi_prim(vm: &mut VmState, name: &[u8], argc: usize, prim: i64) {
-    let smi_klass = vm.universe.smi_klass;
     let sel = vm.universe.intern(name);
     let mut b = BytecodeBuilder::new();
     b.push_self();
     b.ret_self();
     let m = b.finish(vm, sel, argc, 0);
     m.set_primitive(prim);
-    let sel = vm.universe.intern(name); // re-intern: finish may have moved things
+    // Re-derive BOTH post-finish: under gc_stress, finish's allocations
+    // scavenge and move the pre-captured copies (the re-intern is a pure
+    // table hit — no alloc — so `m` stays put across these reads).
+    let sel = vm.universe.intern(name);
+    let smi_klass = vm.universe.smi_klass;
     macvm::runtime::lookup::install_method(vm, smi_klass, sel, m);
 }
 
@@ -7642,4 +7645,197 @@ fn b5_multibb_all_arms_nlr_dead_continuation() {
         let got = SmallInt::try_from(vm.stack.pop()).map(|s| s.value());
         assert_eq!(got, Some(want), "compiled b5nlr: {x}");
     }
+}
+
+/// S24 B5 step 3 (deopt-shape hardening, T2): a deopt INSIDE a non-first BB
+/// of a grafted multi-BB block. The NLR arm contains a send (`x double`)
+/// deliberately left COLD (warmup only ever takes the fall-out arm), so the
+/// graft lowers that whole arm to a terminating UncommonTrap with a
+/// reexecute is_block scope at the ARM's own block-bci. Executing the arm
+/// compiled → trap → the materializer rebuilds M's frame + a BLOCK frame
+/// (B4's synthesized home-ref closure in the receiver-arg slot) → the
+/// interpreter runs `x double` and then the block's `^` — an INTERPRETED
+/// nlr_tos through the synthesized closure, returning from M past its dead
+/// +100 continuation. The multi-BB twin of B4's H1 kill-shot.
+/// Stale-oop hygiene (the gc_stress variant runs scavenge-per-alloc): every
+/// symbol/klass is read FRESH at its use point — a local captured before an
+/// allocating builder call is a stale address after the scavenge it forces.
+fn b5_deopt_home(vm: &mut VmState) -> macvm::oops::wrappers::MethodOop {
+    // smi >> double [ ^self + self ]  (cold until the NLR arm first runs)
+    let mut db = BytecodeBuilder::new();
+    db.push_self();
+    db.push_self();
+    let plus = vm.universe.intern(b"+");
+    db.send(vm, plus, 1);
+    db.ret_tos();
+    let dbl = vm.universe.intern(b"double");
+    let dm = db.finish(vm, dbl, 0, 0);
+    let dbl = vm.universe.intern(b"double"); // pure hit post-finish
+    let k = vm.universe.smi_klass;
+    install_method(vm, k, dbl, dm);
+
+    let mut b = BytecodeBuilder::new();
+    let lit = b.build_block(vm, 1, 0, false, 0, false, |blk, vm| {
+        // [:x | (x < 10) ifTrue: [ ^x double ]. x + 1]
+        blk.push_temp(0);
+        blk.push_smi_i8(10);
+        let lt = vm.universe.intern(b"<");
+        blk.send(vm, lt, 1);
+        let els = blk.new_label();
+        blk.br_false_fwd(els);
+        blk.push_temp(0);
+        let dbl = vm.universe.intern(b"double");
+        blk.send(vm, dbl, 0);
+        blk.nlr_tos();
+        blk.bind(els);
+        blk.push_temp(0);
+        blk.push_smi_i8(1);
+        let plus = vm.universe.intern(b"+");
+        blk.send(vm, plus, 1);
+        blk.block_return_tos();
+    });
+    b.push_closure(lit, 0);
+    b.push_temp(0);
+    let value1 = vm.universe.intern(b"value:");
+    b.send(vm, value1, 1);
+    b.push_smi_i8(100);
+    let plus = vm.universe.intern(b"+");
+    b.send(vm, plus, 1);
+    b.ret_tos();
+    let m_sel = vm.universe.intern(b"b5deopt:");
+    let m = b.finish(vm, m_sel, 1, 0);
+    let m_sel = vm.universe.intern(b"b5deopt:"); // pure hit post-finish
+    let k = vm.universe.smi_klass;
+    install_method(vm, k, m_sel, m);
+    m
+}
+
+#[test]
+fn b5_deopt_inside_nlr_arm_bb_of_grafted_block() {
+    let mut vm = loop_test_vm();
+    install_value_prims(&mut vm);
+    let m = b5_deopt_home(&mut vm);
+    let smi_klass = vm.universe.smi_klass;
+
+    // Warm ONLY the fall-out arm (x >= 10): `<`, `+`, and M's own sends warm;
+    // the NLR arm's `double` IC stays COLD.
+    assert_eq!(b5_run(&mut vm, m, 50), 151);
+    assert_eq!(b5_run(&mut vm, m, 20), 121);
+
+    let before_multibb = vm.stats.blocks_spliced_multibb;
+    let id = driver::compile_method(&mut vm, smi_klass, m).expect("must compile");
+    assert!(
+        vm.stats.blocks_spliced_multibb > before_multibb,
+        "graft fired"
+    );
+
+    // Fall-out arm compiled: no deopt.
+    let recv = SmallInt::new(0).oop();
+    let d0 = vm.stats.deopt_count;
+    vm.stack.push(recv);
+    vm.stack.push(SmallInt::new(50).oop());
+    assert_eq!(enter_compiled(&mut vm, id, 1), EnterResult::Completed);
+    assert_eq!(
+        SmallInt::try_from(vm.stack.pop()).map(|s| s.value()),
+        Some(151)
+    );
+    assert_eq!(vm.stats.deopt_count, d0, "hot arm must not deopt");
+
+    // NLR arm: the cold-send trap fires INSIDE the arm's BB → deopt → the
+    // interpreter finishes `x double` and the block's `^` — answer 2x, the
+    // +100 skipped, exactly the interpreter oracle.
+    vm.stack.push(recv);
+    vm.stack.push(SmallInt::new(5).oop());
+    assert_eq!(enter_compiled(&mut vm, id, 1), EnterResult::Completed);
+    assert_eq!(
+        SmallInt::try_from(vm.stack.pop()).map(|s| s.value()),
+        Some(10),
+        "post-deopt interpreted nlr_tos must return 5 double = 10 from M"
+    );
+    assert!(
+        vm.stats.deopt_count > d0,
+        "the NLR-arm trap must have deopted"
+    );
+
+    // Both exits again, alternating (T3: both paths stay correct post-deopt).
+    for (x, want) in [(50i64, 151i64), (3, 6), (12, 113), (9, 18)] {
+        vm.stack.push(recv);
+        vm.stack.push(SmallInt::new(x).oop());
+        assert_eq!(enter_compiled(&mut vm, id, 1), EnterResult::Completed);
+        assert_eq!(
+            SmallInt::try_from(vm.stack.pop()).map(|s| s.value()),
+            Some(want),
+            "alternating exits x={x}"
+        );
+    }
+}
+
+/// The same shape under a gc_stress VM: every allocation scavenges, so the
+/// B4 closure synthesis inside the deopt (an allocation in the materializer)
+/// runs with a moving collector breathing on it, and the grafted block's
+/// scope reconstruction must stay coherent.
+#[test]
+fn b5_deopt_inside_grafted_block_gc_stress() {
+    let mut vm = VmState::with_options(VmOptions {
+        heap_mib: 64,
+        trace: Default::default(),
+        gc_stress: true,
+        gc_stress_full_period: None,
+        eden_kb: None,
+        jit: JitMode::Threshold(1),
+    });
+    install_smi_prim(&mut vm, b"+", 1, 1);
+    install_smi_prim(&mut vm, b"<", 1, 10);
+    install_value_prims(&mut vm);
+    let _ = b5_deopt_home(&mut vm); // returned handle is stale-prone; re-derive below
+                                    // Tenure-first discipline (it_gc_jit's own pattern): threshold 0 promotes
+                                    // everything live to OLD gen — which scavenges never move — so handles
+                                    // looked up after this settling scavenge stay valid. Set it IMMEDIATELY
+                                    // before the settle: the adaptive policy at the end of every scavenge
+                                    // (scavenge.rs:540) rewrites the threshold, so setting it any earlier is
+                                    // undone by the stress scavenges the setup allocations themselves force.
+    vm.universe.tenuring_threshold = 0;
+    macvm::memory::scavenge::scavenge(&mut vm).expect("settling scavenge");
+    vm.universe.tenuring_threshold = 127;
+    let smi_klass = vm.universe.smi_klass;
+    let m_sel = vm.universe.intern(b"b5deopt:");
+    let m =
+        macvm::runtime::lookup::lookup_uncached(&vm, smi_klass, m_sel).expect("b5deopt: installed");
+
+    assert_eq!(b5_run(&mut vm, m, 50), 151);
+    assert_eq!(b5_run(&mut vm, m, 20), 121);
+    let id = driver::compile_method(&mut vm, smi_klass, m).expect("must compile");
+
+    // Canonical it_gc_jit base frame: root a slot, then run a throwaway
+    // interpreted `idleWarm` so a sentinel-terminated entry-frame remnant
+    // sits above it for walk_frames to bottom out on — the deopt's closure
+    // synthesis allocates, gc_stress scavenges, and the scavenge WALKS.
+    vm.stack.push(SmallInt::new(0).oop());
+    let idle_sel = vm.universe.intern(b"idleWarm");
+    let mut ib = BytecodeBuilder::new();
+    ib.ret_self();
+    let idle_method = ib.finish(&mut vm, idle_sel, 0, 0);
+    let _ = macvm::interpreter::run_method(&mut vm, idle_method, SmallInt::new(0).oop(), &[]);
+
+    let d0 = vm.stats.deopt_count;
+    let scav0 = vm.universe.gc_stats.scavenge_count;
+    let recv = SmallInt::new(0).oop();
+    for (x, want) in [(5i64, 10i64), (50, 151), (7, 14)] {
+        vm.stack.push(recv);
+        vm.stack.push(SmallInt::new(x).oop());
+        assert_eq!(enter_compiled(&mut vm, id, 1), EnterResult::Completed);
+        assert_eq!(
+            SmallInt::try_from(vm.stack.pop()).map(|s| s.value()),
+            Some(want),
+            "gc-stress x={x}"
+        );
+    }
+    assert!(
+        vm.stats.deopt_count > d0,
+        "the NLR-arm trap must have deopted"
+    );
+    assert!(
+        vm.universe.gc_stats.scavenge_count > scav0,
+        "gc_stress must have forced real scavenges through the deopt window"
+    );
 }
