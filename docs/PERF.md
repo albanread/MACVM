@@ -436,3 +436,31 @@ triggers with zero new dispatch state.
 S24 arc summary to date: interp -> 6-7ms on both flagship benches
 (A1 5.3x -> A2 6.3x -> A3 6.5x -> L1 19.5x -> L2 30.6x deltablue;
 richards 16x -> 17x -> 34x).
+
+## S24 L2 steps 3-5+7 — OSR closure envelope: phases A+B (51401dc, c0c51cd, d01a67a)
+
+2026-07-10. The envelope proper, per osr_closure_design.md. Phase A: non-ctx
+closure-bearing methods OSR (phantom-temp packing proven + T7/T9 tripwires).
+Phase B: has_ctx materialize-form OSR via **Context ADOPTION** — one transfer
+pair, zero codegen changes; identity is the soundness story (pre-OSR closures,
+post-OSR AllocClosures, and deopt all share the ONE Context); the elided form
+declines (osr_declined_elided_ctx, the R1 evidence counter). Step 5: OSR
+compiles inherit the key's version (MAX_VERSIONS accumulates across re-arms).
+
+| benchmark | interp (ms) | jit t=200 | best/interp |
+|---|---|---|---|
+| **ctxloop** (new) | 134 | **1** | **134x** |
+| deltablue | 214 | 7 | 30.6x (held) |
+| richards | 204 | 7 | ~30x (held) |
+
+- ctxloop is the envelope's own gate: has_ctx + escaping accumulator closure
+  + 100k-iteration loop, called ONCE — only OSR can tier it, and its
+  checkResult is SELF-VERIFYING for adoption (per-iteration-snapshot
+  semantics would answer wrong). One run composes the whole L2 pipeline:
+  osr_entries=1, osr_ctx_adopted=1, trigger_unifications=1.
+- Tests: adoption-identity flagship (plain + DEOPT_STRESS + GC_STRESS),
+  phase-A shapes x stress, elided-decline pinned in-process, tripwires
+  T1/T4/T6/T7/T8/T9. World byte-identical off vs {t=1,t=200} + stress.
+- Remaining from the design: step 6's gate-s24-l2 justfile recipe + debug
+  transfer-buffer verifier (hardening, deferred); B1/B3 (inputsKnown:) is
+  the next deltablue-tail item.
