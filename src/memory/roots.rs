@@ -250,6 +250,15 @@ where
         }
     }
 
+    // DBG5 (compiled_send_auditor_design.md §D2): the at-GC oop-slot scan.
+    // `MACVM_TRACE=oops` reports every live compiled-frame oop slot that holds
+    // a mem-tagged word NOT pointing into any used heap region — a wild/freed
+    // pointer or a stale/uninitialized spill (the A3b `0x…01`), named by
+    // nm/slot/ret_pc AT THE MOMENT GC is about to trace it, i.e. BEFORE
+    // `scavenge_oop` dereferences it and SIGSEGVs downstream. Hoisted here so
+    // the per-slot check is a single bool, not a channel lookup.
+    let trace_oops = vm.options.trace.is_enabled("oops");
+
     for fv in frames {
         match fv {
             FrameView::Compiled { fp, ret_pc, nm } => {
@@ -285,6 +294,18 @@ where
                     // verify` at compile time).
                     let addr = (fp - 8 * (slot as u64 + 1)) as *mut u64;
                     let old = Oop::from_raw(unsafe { *addr });
+                    // DBG5 §D2: flag a corrupt slot the instant GC reaches it,
+                    // BEFORE `f` (scavenge_oop/mark) dereferences it. Cheap
+                    // no-alloc pre-check; the allocating `annotate_value`
+                    // formatter runs only for the handful of suspects.
+                    if trace_oops && crate::runtime::probe::oop_is_suspect(vm, old.raw()) {
+                        eprintln!(
+                            "[oops] ⚠SUSPECT nm={} fp={fp:#x} ret_pc={ret_pc:#x} slot={slot} word={:#x} {}",
+                            nm.0,
+                            old.raw(),
+                            crate::runtime::probe::annotate_value(vm, old.raw()),
+                        );
+                    }
                     #[cfg(debug_assertions)]
                     if std::env::var("MACVM_DBGPIC").is_ok() {
                         let a = old.raw() as usize & !0x7;

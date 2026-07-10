@@ -455,6 +455,34 @@ pub fn annotate_value(vm: &VmState, v: u64) -> String {
     notes.join(" ")
 }
 
+/// DBG5 (compiled_send_auditor_design.md §D2): the cheap, allocation-free
+/// companion to [`annotate_value`]. Is `v` a mem-tagged word that does NOT
+/// point into any USED heap region (eden/from/to/old, each up to its own
+/// `top`)? That is the exact signature of a corrupt oop slot — a wild/freed
+/// pointer, or the `0x…01` (`MEM_TAG` on a null base) an uninitialized or
+/// stale spill slot leaves (the A3b materialized-Context crash). smi/nil/mark
+/// words and every in-range live oop return `false`. Used to pre-filter the
+/// `MACVM_TRACE=oops` at-GC scan so `annotate_value`'s formatting/allocation
+/// only runs for genuinely suspect slots, not the thousands of healthy ones.
+/// Mirrors `annotate_value`'s own `target_region` range check exactly; the
+/// §4.5 rule (range-check before any deref) is preserved — this NEVER
+/// dereferences `v`, it only classifies its address arithmetic.
+pub fn oop_is_suspect(vm: &VmState, v: u64) -> bool {
+    if v & TAG_MASK != MEM_TAG {
+        return false;
+    }
+    let ra = (v - MEM_TAG) as usize;
+    let eden = &vm.universe.eden;
+    let from = &vm.universe.from;
+    let to = &vm.universe.to;
+    let old = &vm.universe.old;
+    let in_used_region = (ra >= eden.start && ra < eden.top)
+        || (ra >= from.start && ra < from.top)
+        || (ra >= to.start && ra < to.top)
+        || (old.bounds.contains(ra) && ra < old.top);
+    !in_used_region
+}
+
 /// Dossier step 4: for the nearest safepoint, print where the compiler
 /// SAYS each value lives and what is actually there.
 fn claims_vs_reality(
@@ -706,6 +734,37 @@ mod tests {
         assert!(s.starts_with(&format!("{{\"schema\": {DOSSIER_SCHEMA}")));
         assert!(s.contains("test \\\"quoted\\\""));
         assert!(s.contains("a\\nb"));
+    }
+
+    /// DBG5 §D2: the `oop_is_suspect` classifier that drives `MACVM_TRACE=oops`.
+    /// The at-GC scan's silence gate proves it doesn't false-positive on real
+    /// code; this proves the other half — that it FLAGS a corrupt word — so a
+    /// silent scan means "clean", not "broken".
+    #[test]
+    fn oop_is_suspect_flags_only_wild_mem_pointers() {
+        use crate::oops::layout::MEM_TAG;
+        use crate::runtime::vm_state::{VmOptions, VmState};
+        use crate::runtime::JitMode;
+        let vm = VmState::with_options(VmOptions {
+            heap_mib: 64,
+            trace: Default::default(),
+            gc_stress: false,
+            gc_stress_full_period: None,
+            eden_kb: None,
+            jit: JitMode::Off,
+        });
+        // Real heap oops are never suspect (this also proves nil/true/klass
+        // live in a used region, so a healthy slot holding them stays silent).
+        assert!(!oop_is_suspect(&vm, vm.universe.nil_obj.raw()));
+        assert!(!oop_is_suspect(&vm, vm.universe.true_obj.raw()));
+        assert!(!oop_is_suspect(&vm, vm.universe.object_klass.oop().raw()));
+        // Non-mem-tagged words are legal slot contents, never suspect.
+        assert!(!oop_is_suspect(&vm, 0)); // raw 0 / smi 0
+        assert!(!oop_is_suspect(&vm, (5i64 << 2) as u64)); // smi 5
+                                                           // The A3b signature: MEM_TAG on a null base → untagged addr 0.
+        assert!(oop_is_suspect(&vm, MEM_TAG));
+        // A wild high-address mem oop in no region.
+        assert!(oop_is_suspect(&vm, 0x7fff_0000_0000 | MEM_TAG));
     }
 
     #[test]
