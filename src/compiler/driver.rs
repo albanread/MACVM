@@ -678,21 +678,6 @@ pub fn compile_method_versioned(
 /// entry block. Declines (None) when the method/header shape is outside the
 /// v1 OSR envelope — the caller resets the loop counter and keeps
 /// interpreting.
-/// S15: does `method`'s bytecode create any literal closure? OSR v1
-/// declines such methods (see `compile_method_full`'s envelope comment).
-fn method_has_closure(method: MethodOop) -> bool {
-    let len = method.bytecode_len();
-    let mut bci = 0;
-    while bci < len {
-        let (instr, next) = decode_at(method, bci);
-        if matches!(instr, Instr::PushClosure { .. }) {
-            return true;
-        }
-        bci = next;
-    }
-    false
-}
-
 pub fn compile_method_osr(
     vm: &mut VmState,
     rcvr_klass: KlassOop,
@@ -741,13 +726,26 @@ fn compile_method_full(
         }
     }
 
-    // S15 A2 v1 OSR envelope: no `has_ctx` (the interpreter frame already
-    // owns a materialized Context; compiling root ctx-access through the
-    // incoming Context oop is a later slice — the flagship loop shapes,
-    // frontend-inlined to:do:/whileTrue:, are ctx-free) and no closures
-    // (escape-mode operand stacks can hold phantoms the transfer buffer
-    // cannot represent).
-    if osr_bci.is_some() && (method.has_ctx() || method_has_closure(method)) {
+    // S24 L2 step 3 OSR envelope (phase A — was S15 A2 v1's "no has_ctx, no
+    // closures"): non-ctx closure-BEARING methods now OSR. The v1 comment's
+    // worry ("escape-mode operand stacks can hold phantoms the transfer
+    // buffer cannot represent") is real but does not apply at the points OSR
+    // actually enters: loop-HEADER entry stacks are phantom-free by ir.rs's
+    // own invariant (pinned below by the plan-builder tripwire, which
+    // debug-asserts and release-DECLINES if a `stack_closures` fact ever
+    // covers a header's entry stack). Phantom TEMPS at the header are fine:
+    // a live one packs the interpreter's REAL closure oop into the filler
+    // vreg's spill home (valid, GC-safe, and never read — every compiled use
+    // was CFG-spliced against the elision); dead-but-homed ones use the
+    // existing packing + method-end widening; homeless ones are omitted and
+    // covered by the entry block's nil-fill. Pre-loop A3a escaping closures
+    // in temps transfer as ordinary oops via the Slot arm (their NLR-free
+    // proof — `all_escaping_nlr_free`, checked in eligibility over the same
+    // bytecode the interpreter ran — means the real-HomeRef-vs-dead-sentinel
+    // asymmetry is never consulted; the frame-serial check is the runtime
+    // backstop). `has_ctx` stays declined until phase B (Context adoption,
+    // osr_closure_design.md step 4).
+    if osr_bci.is_some() && method.has_ctx() {
         return None;
     }
 
@@ -821,6 +819,38 @@ fn compile_method_full(
             .block_start_pos
             .get(&header_ix.try_into().ok()?)?;
         let entry_stack = &ir_method.blocks[header_ix].entry_stack;
+
+        // S24 L2 step 3 tripwire T9: the whole phase-A envelope leans on the
+        // invariant that a loop HEADER's entry stack never holds an
+        // elided-closure phantom (phantoms have no spill home, so the
+        // transfer buffer cannot represent one — the v1 envelope's original
+        // worry). Cross-check it against the deopt facts: a `stack_closures`
+        // index BELOW the header's entry-stack depth anywhere in the method
+        // means a phantom occupies the persistent region of the operand
+        // stack that exists across the header — conservative over-match
+        // (pre-loop deep-stack sites can false-positive), but structured
+        // loops have EMPTY header stacks so the scan is trivially clean
+        // today; a violation debug-asserts and release-DECLINES rather than
+        // packing an unrepresentable value.
+        let header_depth = entry_stack.len();
+        if header_depth > 0 {
+            let phantom_below_header = ir_method.blocks.iter().any(|b| {
+                b.deopt_sites.iter().any(|(_, raw)| {
+                    raw.stack_closures
+                        .iter()
+                        .any(|&(ix, _)| (ix as usize) < header_depth)
+                })
+            });
+            if phantom_below_header {
+                debug_assert!(
+                    false,
+                    "OSR header entry stack (depth {header_depth}) may hold an \
+                     elided-closure phantom — the transfer buffer cannot \
+                     represent it (T9)"
+                );
+                return None;
+            }
+        }
 
         use crate::compiler::scopes::{OsrSlot, OsrSource, ValueLoc};
         let n_slots = method.argc() + method.ntemps();
@@ -921,6 +951,15 @@ fn compile_method_full(
                             }
                         }
                     }
+                }
+                // S24 L2 step 3 tripwire T7: `resolve_frame_loc` never
+                // returns `ElidedClosure` today (the phantom override is
+                // applied later, in `build_deopt_metadata`) — but if a
+                // future refactor ever surfaces one here, DECLINE the OSR
+                // compile fail-soft instead of the debug-abort below: a
+                // phantom has no spill home for the transfer buffer to fill.
+                ValueLoc::ElidedClosure(_) => {
+                    return None;
                 }
                 other => {
                     debug_assert!(

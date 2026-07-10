@@ -6677,7 +6677,9 @@ fn osr_compile_emits_entry_and_map() {
     assert_eq!(enter_compiled(&mut vm, id, 1), EnterResult::Completed);
     assert_eq!(vm.stack.pop().raw(), SmallInt::new(n).oop().raw());
 
-    // v1 envelope: a closure-bearing method declines OSR.
+    // S24 L2 step 3 envelope (phase A): a NON-ctx closure-bearing method now
+    // COMPILES via OSR (the v1 "no closures" decline is gone) — pinned
+    // positively here; the subprocess osr_phase_a_* tests prove behavior.
     let value_sel = vm.universe.intern(b"value");
     let mut cb = BytecodeBuilder::new();
     let lit = cb.build_block(&mut vm, 0, 0, false, 0, false, |blk, _vm| {
@@ -6690,8 +6692,20 @@ fn osr_compile_emits_entry_and_map() {
     let wb_sel = vm.universe.intern(b"withBlock");
     let cm = cb.finish(&mut vm, wb_sel, 0, 0);
     assert!(
-        driver::compile_method_osr(&mut vm, smi_klass, cm, 0).is_none(),
-        "closure-bearing methods are outside the v1 OSR envelope"
+        driver::compile_method_osr(&mut vm, smi_klass, cm, 0).is_some(),
+        "phase A: non-ctx closure-bearing methods are inside the OSR envelope"
+    );
+
+    // ...while has_ctx stays declined until phase B (Context adoption).
+    let mut hb = BytecodeBuilder::new();
+    hb.push_smi_i8(1);
+    hb.ret_tos();
+    let hc_sel = vm.universe.intern(b"withCtx");
+    let hm = hb.finish(&mut vm, hc_sel, 0, 0);
+    hm.set_flags(0, 0, true, false, false, false, 1); // has_ctx, nctx=1
+    assert!(
+        driver::compile_method_osr(&mut vm, smi_klass, hm, 0).is_none(),
+        "phase B pending: has_ctx methods still decline OSR"
     );
 }
 
@@ -7061,4 +7075,150 @@ fn inlined_classvar_store_compiles() {
     std::fs::remove_dir_all(&dir).ok();
     assert!(out.status.success(), "must not abort");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "7\n");
+}
+
+/// S24 L2 step 3 (envelope phase A): non-ctx closure-BEARING methods now OSR.
+/// Subprocess differential harness: run one .mst at MACVM_JIT=off (oracle) and
+/// again at threshold=200 with extra env, assert identical stdout AND that at
+/// least one OSR fired (the method is called ONCE, so only the backedge
+/// trigger can compile it).
+fn osr_phase_a_differential(name: &str, program: &str, extra_env: &[(&str, &str)]) {
+    let exe = env!("CARGO_BIN_EXE_macvm");
+    let dir = std::env::temp_dir().join(format!("macvm_osrA_{}_{name}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("prog.mst");
+    std::fs::write(&file, program).unwrap();
+    let world = concat!(env!("CARGO_MANIFEST_DIR"), "/world");
+
+    let run = |jit: &str, env_pairs: &[(&str, &str)]| {
+        let mut c = Command::new(exe);
+        c.args(["run", file.to_str().unwrap(), "--world", world])
+            .env("MACVM_JIT", jit)
+            .env("MACVM_TRACE", "stats")
+            .env("MACVM_PROBE", "off")
+            .env_remove("MACVM_GC_STRESS")
+            .env_remove("MACVM_DEOPT_STRESS")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        for (k, v) in env_pairs {
+            c.env(k, v);
+        }
+        let out = c.output().expect("spawn macvm");
+        assert!(
+            out.status.success(),
+            "[{name}] run must complete (jit={jit}, env={env_pairs:?}); stderr tail:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+                .lines()
+                .rev()
+                .take(10)
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        (
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+
+    let (oracle, _) = run("off", &[]);
+    let (got, stderr) = run("threshold=200", extra_env);
+    std::fs::remove_dir_all(&dir).ok();
+    assert_eq!(
+        got, oracle,
+        "[{name}] threshold=200 output must be byte-identical to the interpreter"
+    );
+    let osr_line = stderr
+        .lines()
+        .find(|l| l.contains("osr_entries="))
+        .unwrap_or("");
+    assert!(
+        !osr_line.contains("osr_entries=0"),
+        "[{name}] the hot loop (called once) must tier up via OSR — phase A \
+         must not decline this shape; stats: {osr_line}"
+    );
+}
+
+/// Pre-loop A3a escaping closure held in a temp (the Slot transfer arm packs
+/// the real closure oop), value:-sent from the hot loop. Non-ctx: the block
+/// captures nothing; the method's temps are only touched by inlined
+/// control-flow blocks. Under the OLD envelope this whole method was
+/// OSR-declined for merely CONTAINING a closure.
+const OSR_A_ESCAPING: &str = r#"
+Object subclass: LoopA [
+    run [ | b s |
+        b := [:x | x * 2 ].
+        s := 0.
+        1 to: 20000 do: [:i | s := s + (b value: i) ].
+        ^s ]
+]
+Transcript show: (LoopA new run) printString; cr.
+Smalltalk quit: 0.
+"#;
+
+/// A literal non-capturing block passed to do: INSIDE the hot loop — the
+/// 7-IV-c shape (block-arg send): phantom temp in the inlined extent when
+/// do: CFG-inlines, or per-iteration escaping closure when it doesn't;
+/// either way phase A must OSR the enclosing method and stay differential.
+const OSR_A_BLOCKARG: &str = r#"
+Object subclass: Cell [
+    | n |
+    init [ n := 0 ]
+    bump [ n := n + 1 ]
+    count [ ^n ]
+]
+Object subclass: LoopB [
+    run: coll [ | i |
+        i := 0.
+        [ i < 15000 ] whileTrue: [
+            coll do: [:x | x bump ].
+            i := i + 1 ].
+        ^(coll at: 1) count + (coll at: 2) count ]
+]
+Object subclass: DriverB [
+    go [ | coll |
+        coll := OrderedCollection new.
+        coll add: Cell new init; add: Cell new init.
+        ^LoopB new run: coll ]
+]
+Transcript show: (DriverB new go) printString; cr.
+Smalltalk quit: 0.
+"#;
+
+#[test]
+fn osr_phase_a_escaping_closure_pre_loop() {
+    osr_phase_a_differential("escaping", OSR_A_ESCAPING, &[]);
+}
+
+#[test]
+fn osr_phase_a_escaping_closure_deopt_stress() {
+    osr_phase_a_differential(
+        "escaping_ds",
+        OSR_A_ESCAPING,
+        &[("MACVM_DEOPT_STRESS", "64")],
+    );
+}
+
+#[test]
+fn osr_phase_a_escaping_closure_gc_stress() {
+    // GC_STRESS exercises the packed closure oop's currency across
+    // collections (the interval widening keeps the slot GC-scanned).
+    osr_phase_a_differential(
+        "escaping_gc",
+        OSR_A_ESCAPING,
+        &[("MACVM_GC_STRESS", "full:64")],
+    );
+}
+
+#[test]
+fn osr_phase_a_blockarg_in_loop() {
+    osr_phase_a_differential("blockarg", OSR_A_BLOCKARG, &[]);
+}
+
+#[test]
+fn osr_phase_a_blockarg_deopt_stress() {
+    osr_phase_a_differential(
+        "blockarg_ds",
+        OSR_A_BLOCKARG,
+        &[("MACVM_DEOPT_STRESS", "64")],
+    );
 }
