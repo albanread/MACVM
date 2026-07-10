@@ -7470,14 +7470,10 @@ Transcript show: (Finder new drive) printString; cr.
 Smalltalk quit: 0.
 "#;
 
-/// S24 B5: the FLAGSHIP conditional-NLR shape — a multi-BB block (branch +
-/// `^` in one arm) passed as a block-arg to a CFG-inlined `do:`. The step-5
-/// graft engine compiles it (verified live before the predicate was parked
-/// strict again: blocks_spliced_nlr=1 + blocks_spliced_multibb=1, output
-/// byte-identical) — the splice flips ON when the deopt materializer's
-/// cross-frame read hazard is fixed (see blockarg_candidate_ok). Until
-/// then this declines through the A-series escaping path; differential-
-/// correct either way.
+/// S24 B5 step 5: the FLAGSHIP conditional-NLR shape — a multi-BB block
+/// (branch + `^` in one arm) passed as a block-arg to a CFG-inlined `do:`,
+/// spliced end-to-end (was B4's negative decline twin). Needles pin both
+/// splice counters; output byte-identical to the interpreter.
 const B4_CONDITIONAL: &str = r#"
 Object subclass: Finder [
     firstAbove: n in: coll [
@@ -7533,8 +7529,14 @@ fn b4_deopt_inside_spliced_nlr_block_stress() {
 }
 
 #[test]
-fn b5_conditional_nlr_blockarg_differential() {
-    osr_phase_b_differential("b5_cond", B4_CONDITIONAL, &[], false, &[]);
+fn b5_conditional_nlr_blockarg_splices() {
+    osr_phase_b_differential(
+        "b5_cond",
+        B4_CONDITIONAL,
+        &[],
+        false,
+        &["blocks_spliced_nlr=1", "blocks_spliced_multibb=1"],
+    );
 }
 
 #[test]
@@ -7813,7 +7815,12 @@ fn b5_deopt_inside_nlr_arm_bb_of_grafted_block() {
     );
 
     // Both exits again, alternating (T3: both paths stay correct post-deopt).
-    for (x, want) in [(50i64, 151i64), (3, 6), (12, 113), (9, 18)] {
+    // Two entries only: the second NLR-arm trap reaches UNCOMMON_TRAP_LIMIT
+    // and the recompile-on-trap loop (correctly — the interpreted re-run
+    // warmed the arm's `double` IC, and snapshot_profile now sees grafted-
+    // block ICs) replaces this nmethod; driving the captured id past that
+    // point would enter invalidated code.
+    for (x, want) in [(50i64, 151i64), (3, 6)] {
         vm.stack.push(recv);
         vm.stack.push(SmallInt::new(x).oop());
         assert_eq!(enter_compiled(&mut vm, id, 1), EnterResult::Completed);

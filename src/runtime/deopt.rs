@@ -419,6 +419,38 @@ pub fn deoptimize_frame(vm: &mut VmState, frame: FrameView) -> DeoptResume {
     // iteration; later frames' closure/context materialization reads the root
     // frame's receiver/context/serial from it.
     let mut root_fp: Option<usize> = None;
+    // S24 B5 step 5b: the materializer's ALLOCATING fixups are deferred to a
+    // single phase AFTER every dead-frame `read_value` has completed. An
+    // allocation here can scavenge, and the DeoptBridge walker deliberately
+    // bridges PAST the trapped compiled frame — its spill slots are never
+    // GC-updated — so a read_value issued after any allocation would hand
+    // back a stale pre-move address (proven live: deltablue's depth-3
+    // spliced-block deopt storm; B4's Frame::verify caught copied0 fresh vs
+    // FP+4 stale). Every value a deferred fixup needs is rooted first:
+    // process-stack slots for the frames, `deopt_hs` handles for Elided-ctx
+    // temps.
+    enum LateFixup {
+        ElidedCtx {
+            fp: usize,
+            temps: Vec<crate::memory::handles::Handle<Oop>>,
+        },
+        SplicedBlock {
+            fp: usize,
+            pool_ix: u32,
+        },
+        Phantom {
+            fp: usize,
+            slot_ix: usize,
+            pool_ix: u32,
+        },
+        SiteElided {
+            stack_ix: usize,
+            pool_ix: u32,
+        },
+    }
+    let deopt_hs = crate::memory::handles::HandleScope::enter(vm);
+    let mut fixups: Vec<LateFixup> = Vec::new();
+
     // Track the innermost frame's fp so M5/M6/M7 can address it after all
     // pushes (a later `push_frame` cannot move an earlier frame — the stack
     // only grows — so this stays valid).
@@ -531,38 +563,19 @@ pub fn deoptimize_frame(vm: &mut VmState, frame: FrameView) -> DeoptResume {
         // Correct for both a nil-Context home (7-II) and an elided-Context home
         // (7-II-b). A method frame uses its own recorded `CtxLoc` (M6 proper).
         if vf.scope.is_block && prev_fp != crate::oops::layout::ENTRY_FRAME_SENTINEL {
-            let root = root_fp.expect("a SPLICED is_block frame is never outermost");
-            let home_ctx = Frame { fp: root }.context(&vm.stack);
-            Frame { fp: fp_new }.set_context(&mut vm.stack, home_ctx);
-            // S24 B4: a spliced block frame must be ACTIVATE-SHAPED — a REAL
-            // closure (home_ref = the just-materialized root's fp+serial) in
-            // the receiver-ARG slot — so an interpreted `nlr_tos` after this
-            // deopt works unmodified (it reads the closure's home_ref from
-            // exactly that slot, mod.rs's OP_NLR_TOS). Before B4 this slot
-            // held the scope's recorded receiver (M's self) and the splice
-            // gate forbade NLR+send blocks precisely because reaching an
-            // interpreted nlr_tos here would ClosureOop-expect-panic. FP+4
-            // keeps the home self `push_frame` copied — which equals
-            // closure.copied(0) by construction (`materialize_closure` reads
-            // the root's receiver), the activate_block_interp split. The
-            // allocation is GC-safe here for the same reason the phantom-slot
-            // materialization below is: this frame and the root are pushed
-            // and rooted, and FP+3's Context is a process-stack slot a moving
-            // collection updates.
-            let closure = materialize_closure(vm, frame.nm, root, vf.scope.method_pool_ix);
-            #[cfg(debug_assertions)]
-            {
-                let m = crate::oops::wrappers::ClosureOop::try_from(closure)
-                    .expect("materialize_closure returns a closure")
-                    .method();
-                debug_assert!(
-                    m.is_block(),
-                    "spliced is_block scope's method_pool_ix must name a CompiledBlock"
-                );
-            }
-            let f = Frame { fp: fp_new };
-            let slot = f.receiver_slot(&vm.stack);
-            vm.stack.set(slot, closure);
+            // S24 B4 (deferred to the fixup phase, B5 step 5b): FP+3 must
+            // alias the ROOT frame's Context and the receiver-ARG slot must
+            // hold a synthesized home-ref closure so an interpreted nlr_tos
+            // works unmodified. BOTH wait: the root's Context may itself be
+            // an Elided-ctx fixup (allocated later), and the synthesis
+            // allocates. FP+4 keeps the home self `push_frame` copied —
+            // which equals closure.copied(0) by construction (the fixup
+            // reads the rooted root frame's receiver).
+            root_fp.expect("a SPLICED is_block frame is never outermost");
+            fixups.push(LateFixup::SplicedBlock {
+                fp: fp_new,
+                pool_ix: vf.scope.method_pool_ix,
+            });
         } else if vf.scope.is_block {
             // S24 A1 (design §2.5): the ROOT-block arm — a STANDALONE-
             // compiled block deopted. Mirror `activate_block_interp`
@@ -591,16 +604,35 @@ pub fn deoptimize_frame(vm: &mut VmState, frame: FrameView) -> DeoptResume {
             };
             f.set_context(&mut vm.stack, ctx);
         } else {
-            materialize_context(vm, frame.nm, &frame, &vf.scope.ctx, fp_new);
+            match &vf.scope.ctx {
+                // Allocates — defer; temps read NOW (pre-allocation) into
+                // GC-rooted handles the fixup phase drains.
+                CtxLoc::Elided { temps } => {
+                    let handles: Vec<crate::memory::handles::Handle<Oop>> = temps
+                        .iter()
+                        .map(|&loc| {
+                            let v = read_value(vm, nmethod_ref(vm, frame.nm), &frame, loc);
+                            deopt_hs.handle(vm, v)
+                        })
+                        .collect();
+                    fixups.push(LateFixup::ElidedCtx {
+                        fp: fp_new,
+                        temps: handles,
+                    });
+                }
+                other => materialize_context(vm, frame.nm, &frame, other, fp_new),
+            }
         }
 
-        // S14 step 7-IV-b: materialize this frame's ELIDED-CLOSURE slots now —
-        // the frame (and the root) are pushed and rooted, so the allocation is
-        // GC-safe, and `set_temp` overwrites the nil placeholders.
+        // S14 step 7-IV-b: this frame's ELIDED-CLOSURE slots — allocations,
+        // deferred; `set_temp` overwrites the nil placeholders in the fixup
+        // phase.
         for &(slot_ix, pool_ix) in &phantom_slots {
-            let root = root_fp.expect("root frame exists by now");
-            let closure = materialize_closure(vm, frame.nm, root, pool_ix);
-            Frame { fp: fp_new }.set_temp(&mut vm.stack, slot_ix, closure);
+            fixups.push(LateFixup::Phantom {
+                fp: fp_new,
+                slot_ix,
+                pool_ix,
+            });
         }
 
         if vf.is_innermost {
@@ -625,8 +657,14 @@ pub fn deoptimize_frame(vm: &mut VmState, frame: FrameView) -> DeoptResume {
             for &loc in &site_stack {
                 let v = match loc {
                     ValueLoc::ElidedClosure(pool_ix) => {
-                        let root = root_fp.expect("root frame exists by now");
-                        materialize_closure(vm, frame.nm, root, pool_ix)
+                        // Allocates — push a nil placeholder at this exact
+                        // slot and let the fixup phase overwrite it (B5 5b).
+                        root_fp.expect("root frame exists by now");
+                        fixups.push(LateFixup::SiteElided {
+                            stack_ix: vm.stack.sp,
+                            pool_ix,
+                        });
+                        vm.universe.nil_obj
                     }
                     _ => read_value(vm, nmethod_ref(vm, frame.nm), &frame, loc),
                 };
@@ -698,6 +736,58 @@ pub fn deoptimize_frame(vm: &mut VmState, frame: FrameView) -> DeoptResume {
         }
 
         prev_fp = fp_new as i64;
+    }
+
+    // ── Fixup phase (B5 step 5b): every dead-frame read is done; every
+    //    source a fixup needs is rooted (process-stack slots, `deopt_hs`
+    //    handles). Allocations here may scavenge freely — GC updates the
+    //    rooted sources and the already-pushed frames alike. Frame order
+    //    (fixups were recorded outermost-first) guarantees the ROOT's own
+    //    Elided-ctx Context exists before a spliced block's FP+3 alias
+    //    reads it. ─────────────────────────────────────────────────────
+    for fx in fixups {
+        match fx {
+            LateFixup::ElidedCtx { fp, temps } => {
+                let context = crate::memory::alloc::alloc_context(vm, temps.len());
+                for (i, h) in temps.iter().enumerate() {
+                    context.set_slot(i, h.get(vm));
+                }
+                Frame { fp }.set_context(&mut vm.stack, context.oop());
+            }
+            LateFixup::SplicedBlock { fp, pool_ix } => {
+                let root = root_fp.expect("a SPLICED is_block frame is never outermost");
+                let home_ctx = Frame { fp: root }.context(&vm.stack);
+                Frame { fp }.set_context(&mut vm.stack, home_ctx);
+                let closure = materialize_closure(vm, frame.nm, root, pool_ix);
+                #[cfg(debug_assertions)]
+                {
+                    let m = crate::oops::wrappers::ClosureOop::try_from(closure)
+                        .expect("materialize_closure returns a closure")
+                        .method();
+                    debug_assert!(
+                        m.is_block(),
+                        "spliced is_block scope's method_pool_ix must name a CompiledBlock"
+                    );
+                }
+                let f = Frame { fp };
+                let slot = f.receiver_slot(&vm.stack);
+                vm.stack.set(slot, closure);
+            }
+            LateFixup::Phantom {
+                fp,
+                slot_ix,
+                pool_ix,
+            } => {
+                let root = root_fp.expect("root frame exists by now");
+                let closure = materialize_closure(vm, frame.nm, root, pool_ix);
+                Frame { fp }.set_temp(&mut vm.stack, slot_ix, closure);
+            }
+            LateFixup::SiteElided { stack_ix, pool_ix } => {
+                let root = root_fp.expect("root frame exists by now");
+                let closure = materialize_closure(vm, frame.nm, root, pool_ix);
+                vm.stack.set(stack_ix, closure);
+            }
+        }
     }
 
     // ── M7: every materialized frame must be indistinguishable from an
@@ -797,24 +887,11 @@ fn materialize_context(
             );
             Frame { fp }.set_context(&mut vm.stack, c);
         }
-        CtxLoc::Elided { temps } => {
-            // Read every temp value first (plain oops, no live raw reads
-            // across the allocation), rooted in a HandleScope so the
-            // allocation's GC updates them.
-            let scope = crate::memory::handles::HandleScope::enter(vm);
-            let handles: Vec<_> = temps
-                .iter()
-                .map(|&loc| {
-                    let v = read_value(vm, nmethod_ref(vm, id), frame, loc);
-                    scope.handle(vm, v)
-                })
-                .collect();
-            let context = crate::memory::alloc::alloc_context(vm, handles.len());
-            for (i, h) in handles.iter().enumerate() {
-                context.set_slot(i, h.get(vm));
-            }
-            Frame { fp }.set_context(&mut vm.stack, context.oop());
-        }
+        CtxLoc::Elided { .. } => unreachable!(
+            "CtxLoc::Elided allocates and is handled by deoptimize_frame's \
+             deferred fixup phase (B5 5b) — never materialize it here, where \
+             a later dead-frame read_value would see stale pre-move addresses"
+        ),
     }
 }
 

@@ -186,30 +186,53 @@ pub(crate) fn resolve_method_ro(
 /// A klass-set-preserving change (same-tag re-targeting) is invisible here,
 /// but redefinition already invalidates through the dependency index.
 pub fn snapshot_profile(_vm: &VmState, method: MethodOop) -> u64 {
-    use crate::interpreter::ic::{ic_state, IcState};
     let mut h: u64 = 0xcbf2_9ce4_8422_2325; // FNV-1a offset basis
-    let mut fnv = |byte: u8| {
-        h ^= byte as u64;
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    snapshot_into(method, &mut h, 0);
+    h
+}
+
+/// One method's (or block's) send-IC states folded into `h`, recursing into
+/// literal blocks (S24 B5 5b): a compile GRAFTS block bodies inline and reads
+/// THEIR ICs for lowering decisions, so a trap inside a grafted block that
+/// warms only the block's own IC must still flip the profile hash — before
+/// this, `note_uncommon_trap` hashed the root method alone and declined the
+/// recompile forever ("profile unchanged"), a permanent deopt storm on
+/// deltablue's constraintsConsuming:do: once multi-BB blockarg splicing
+/// landed. `depth` seeds each nesting level so identical IC layouts at
+/// different levels don't cancel.
+fn snapshot_into(method: MethodOop, h: &mut u64, depth: u8) {
+    use crate::interpreter::ic::{ic_state, IcState};
+    let fnv = |h: &mut u64, byte: u8| {
+        *h ^= byte as u64;
+        *h = h.wrapping_mul(0x0000_0100_0000_01b3);
     };
+    fnv(h, 0xB5);
+    fnv(h, depth);
     let len = method.bytecode_len();
     let mut bci = 0;
     while bci < len {
         let (instr, next) = decode_at(method, bci);
-        if let Instr::Send { ic, super_: false } = instr {
-            let tag: u8 = match ic_state(method, ic) {
-                IcState::Empty => 0,
-                IcState::Mono => 1,
-                IcState::Poly(_) => 2,
-                IcState::Mega => 3,
-            };
-            fnv(ic as u8);
-            fnv((ic >> 8) as u8);
-            fnv(tag);
+        match instr {
+            Instr::Send { ic, super_: false } => {
+                let tag: u8 = match ic_state(method, ic) {
+                    IcState::Empty => 0,
+                    IcState::Mono => 1,
+                    IcState::Poly(_) => 2,
+                    IcState::Mega => 3,
+                };
+                fnv(h, ic as u8);
+                fnv(h, (ic >> 8) as u8);
+                fnv(h, tag);
+            }
+            Instr::PushClosure { lit, .. } => {
+                if let Some(blk) = MethodOop::try_from(method.literals().at(lit as usize)) {
+                    snapshot_into(blk, h, depth.saturating_add(1));
+                }
+            }
+            _ => {}
         }
         bci = next;
     }
-    h
 }
 
 #[cfg(test)]

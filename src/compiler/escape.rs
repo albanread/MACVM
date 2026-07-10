@@ -200,100 +200,6 @@ fn selector_bytes(method: MethodOop, ic: u16) -> Vec<u8> {
         .into_bytes()
 }
 
-/// Is the CompiledBlock at `push_closure` site `s` (the literal `MethodOop`)
-/// itself spliceable? Defers captured/owned-Context blocks and any body
-/// containing a super-send / closure / ctx-temp / NLR opcode (later slices). A
-/// `block_return_tos` IS allowed (it is the block's own return). Requires the
-/// single-straight-line shape the splicer handles: exactly one basic block
-/// ending in a return terminator.
-///
-/// **7-II**: an ordinary (non-super) `Send` inside the block body IS allowed —
-/// `splice_block` lowers it to a `CallSend`/cold-trap inside the inlined block,
-/// recording an `is_block` in-body deopt scope. A deopt there rebuilds the
-/// block's own (method-shaped) activation frame soundly, because the block
-/// frame's only structural difference — the closure in its receiver-arg slot —
-/// is read ONLY by `nlr_tos` / nested `push_closure`, both still gated out.
-/// (7-I had restricted this to send-free blocks while `runtime/deopt.rs`'s
-/// `is_block` handling was unproven; 7-II proves it and lifts the restriction.)
-fn block_is_spliceable(block: MethodOop) -> bool {
-    // Non-capturing, no owned Context. A block that captures the enclosing
-    // Context or owns its own heap Context needs captured-temp promotion (the
-    // next slice) — gated out here.
-    // A block that owns its OWN heap Context (`has_ctx`) needs nested-context
-    // depth machinery — gated. A `captures_ctx` block (it reads/writes the HOME
-    // method's captured temps) IS spliceable in 7-II-b (its ctx-temps promote to
-    // the home's vregs).
-    if block.has_ctx() {
-        return false;
-    }
-    // Single straight-line block ending in a return — the exact shape
-    // `splice_block` handles. Validated against the SAME decode CFG the splicer
-    // re-validates against, so the two agree by construction.
-    let cfg = decode::decode(block);
-    if cfg.blocks.len() != 1 || !matches!(cfg.blocks[0].terminator, Terminator::Return) {
-        return false;
-    }
-    // 7-II-b-ii: a `captures_ctx` block MAY have ordinary sends. 7-III: a block
-    // MAY contain `nlr_tos` (`^expr`) — inlined into its home M, the NLR is just
-    // a return from M (`Ir::Ret`); the `ensure:` decline (SPEC A7 Step 1) is
-    // AUTOMATIC because any M with `ensure:`/`ifCurtailed:` fails the escape gate
-    // (its handler block escapes as a non-value arg). Still gated: super sends,
-    // nested closures, depth>0 (nested-context) ctx access.
-    let mut has_nlr = false;
-    let mut has_send = false;
-    let len = block.bytecode_len();
-    let mut bci = 0;
-    while bci < len {
-        let (instr, next) = decode_at(block, bci);
-        match instr {
-            Instr::Send { super_: true, .. } | Instr::PushClosure { .. } => return false,
-            Instr::Send { .. } => has_send = true,
-            Instr::NlrTos => has_nlr = true,
-            // ctx-temp access is DEPTH 0 only (M's own Context, which a ctx-less
-            // block's frame aliases). A `depth != 0` (nested context) is gated.
-            Instr::PushCtxTemp { depth, .. } | Instr::StoreCtxTempPop { depth, .. }
-                if depth != 0 =>
-            {
-                return false
-            }
-            _ => {}
-        }
-        bci = next;
-    }
-    // S24 B4: NLR blocks may now splice even WITH sends — the old 7-III
-    // "send-free only" gate is gone. Both executors of a spliced `^` are
-    // sound: COMPILED, `nlr_tos` lowers to `Ir::Ret` of the home compilation
-    // (the block's home is by construction the compilation root, so the NLR
-    // IS a return from M — no closure consulted); INTERPRETED (post-deopt),
-    // the only way interpretation reaches the block's `nlr_tos` is through
-    // the materializer (every interpreter-visible entry into a spliced
-    // extent is a deopt safepoint carrying an is_block scope), and the B4
-    // materializer arm synthesizes a REAL home-ref closure into the rebuilt
-    // frame's receiver-arg slot (deopt.rs M6) — exactly the slot OP_NLR_TOS
-    // reads, with home_ref packing the same-materialization root's
-    // fp+serial. ensure:/ifCurtailed: markers cannot sit between the home
-    // and the spliced NLR within one materialized chain: (i) markers are
-    // planted only by prim_ensure_like on the protected block's own fresh
-    // INTERPRETER activation — never on method frames, never inside
-    // compiled extents; (ii) ensure:/ifCurtailed: are primitive methods,
-    // excluded from inlining and from block-arg splicing, so no marked
-    // frame can be interior to a materialized chain; (iii) a protected
-    // block lexically containing an NLR block fails
-    // block_transitively_nlr_free at eligibility.
-    let _ = (has_nlr, has_send);
-    true
-}
-
-/// S24 B5: the RELAXED spliceable predicate for direct-value sites — a block
-/// body may now be a small forward-only CFG (frontend-inlined ifTrue:/and:/
-/// or: chains, hence CONDITIONAL `^`), grafted through `try_inline_cfg`'s
-/// Block mode rather than the linear walk. Accepts any number of CFG blocks
-/// whose terminators are Return / Fallthrough / forward Jump / Branch.
-/// Still declines (unchanged from the strict predicate): an owned heap
-/// Context (`has_ctx` — nested-depth machinery), BACK-edges (loops in
-/// blocks: a novel LoopPoll-in-is_block deopt shape with no payoff shape
-/// needing it, v1), super sends, nested closures, depth≠0 ctx access.
-/// The blockarg path keeps the strict single-BB predicate until B5 step 5.
 fn block_is_spliceable_cfg(block: MethodOop) -> bool {
     if block.has_ctx() {
         return false;
@@ -528,19 +434,12 @@ fn blockarg_candidate_ok(
     let Some(blk) = MethodOop::try_from(method.literals().at(lit as usize)) else {
         return false;
     };
-    // S24 B5 step 5: the compiler engine (H6 cur_id threading in ir.rs)
-    // fully supports multi-BB blocks here, but the predicate stays STRICT
-    // until the deopt materializer's cross-frame read hazard is fixed:
-    // allocations inside deoptimize_frame (phantom/B4 closure synthesis,
-    // Elided-ctx Contexts) can scavenge, and the DeoptBridge walker
-    // deliberately bridges PAST the dead compiled frame, so its spill
-    // slots are never GC-updated -- any read_value AFTER an earlier
-    // frame's allocating fixup reads stale pre-move addresses. Flipping
-    // this to block_is_spliceable_cfg made deltablue's depth-3
-    // constraintsConsuming:do: shape deopt-storm straight into that
-    // window (caught by B4's Frame::verify tripwire). Fix = resolve every
-    // dead-frame read before ANY materializer allocation, then flip this.
-    if !block_is_spliceable(blk) {
+    // S24 B5 step 5: block-arg sites accept the same relaxed forward-only
+    // multi-BB predicate as direct value sites (the graft engine handles
+    // both; the in-callee split is the H6 cur_id threading in ir.rs).
+    // Flipped ON after the deopt materializer's cross-frame read hazard
+    // was closed (the deferred-fixup phase in deoptimize_frame, B5 5b).
+    if !block_is_spliceable_cfg(blk) {
         return false;
     }
     if !matches!(ic_state(method, ic), IcState::Mono) {
