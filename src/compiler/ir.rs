@@ -553,8 +553,11 @@ pub struct IrMethod {
     /// allocated it into this vreg; ctx-temps and escaping closures' copied[1]
     /// read it). `build_deopt_metadata` records `CtxLoc::Materialized` over
     /// its frame slot so a deopt REUSES the SAME Context (identity — Risk 2).
+    /// The second element is M's `nctx()` — the driver needs it to size the
+    /// fresh `CtxLoc::Elided` fallback for the one window where the ctx vreg
+    /// is not yet live (the prologue alloc itself; see `root_ctx`'s match).
     /// Mutually exclusive with a non-empty `ctx_vregs`.
-    pub method_ctx_vreg: Option<VReg>,
+    pub method_ctx_vreg: Option<(VReg, usize)>,
     pub safepoints: Vec<SafepointId>,
     /// Always present (`convert` interns them unconditionally) — `emit.rs`
     /// has no `VmState` of its own to intern `true_obj`/`false_obj` on
@@ -5857,7 +5860,7 @@ pub fn convert(vm: &VmState, rcvr_klass: KlassOop, method: MethodOop, cfg: &Cfg)
         argc: method.argc() as u8,
         ntemps: method.ntemps() as u8,
         ctx_vregs,
-        method_ctx_vreg,
+        method_ctx_vreg: method_ctx_vreg.map(|v| (v, method.nctx())),
         block_closure_vreg,
         safepoints: Vec::new(),
         true_lit,

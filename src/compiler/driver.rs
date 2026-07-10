@@ -289,6 +289,33 @@ fn eligibility_detail(vm: &VmState, method: MethodOop) -> Eligibility {
     if method.has_ctx() && escape.is_none() {
         return Eligibility::NoPermanent;
     }
+    // S24 A3b review follow-up (found by the ccloop repro, silent wrong
+    // answers): if M's FIRST bytecode is a loop header (some jump_back
+    // targets bci 0), CFG block 0 — where `ir::convert` emits the has_ctx
+    // prologue (the materialize Context alloc, or 7-II-b's elided ctx-vreg
+    // nil-inits) — is re-entered on EVERY back edge, re-running the prologue
+    // per iteration: a materialized Context is re-allocated (each escaping
+    // closure captures its own per-iteration snapshot instead of the ONE
+    // shared Context the interpreter gives them) and elided ctx vregs are
+    // re-nil'ed (captured-temp mutations lost). Decline — fail-soft, the
+    // method stays interpreted. The shape needs a has_ctx method with NO
+    // captured params (their bci-0 capture stores would push the loop header
+    // past bci 0) and a loop as its first statement — rare enough that a
+    // synthetic non-branch-target entry block isn't yet warranted.
+    if method.has_ctx() {
+        let mut b = 0usize;
+        while b < method.bytecode_len() {
+            let (instr, next) = decode_at(method, b);
+            if let Instr::JumpBack(d) = instr {
+                // jump_back target = next_bci − distance (builder.rs) — a
+                // target of 0 means block 0 is a loop header.
+                if next == d as usize {
+                    return Eligibility::NoPermanent;
+                }
+            }
+            b = next;
+        }
+    }
 
     let mut verdict = Eligibility::Yes;
     let mut bci = 0usize;
@@ -1278,24 +1305,42 @@ fn build_deopt_metadata(
                 // `CtxLoc::Elided` over those vregs' frame slots so a deopt allocs
                 // a fresh Context and fills it (materializer M6). No ctx-vregs →
                 // M never owned a Context → `None` (unchanged S13 behaviour).
-                let root_ctx = if let Some(ctx_vreg) = ir_method.method_ctx_vreg {
+                let root_ctx = if let Some((ctx_vreg, nctx)) = ir_method.method_ctx_vreg {
                     // S24 A3b: M MATERIALIZED its heap Context (an escaping
                     // capturing closure needs a real one). A deopt REUSES that
                     // same object by identity (materializer M6's
                     // `Materialized` arm) — the escaped closures reference it
-                    // too (Risk 2). EXCEPT the prologue ctx-alloc safepoint
-                    // itself (bci 0, empty operand stack): the Context is not
-                    // yet live there, and its reexecute re-enters at bci 0
-                    // where `activate_method` re-allocates it — so `None`.
-                    if raw.bci == 0 && raw.stack.is_empty() {
-                        CtxLoc::None
-                    } else {
-                        CtxLoc::Materialized(resolve_frame_loc(
-                            ctx_vreg,
-                            position,
-                            intervals,
-                            extra_oop_live,
-                        ))
+                    // too (Risk 2). Keyed on the ctx vreg's ACTUAL LIVENESS,
+                    // not a site fingerprint: the fb01b7a review found the
+                    // original `bci == 0 && stack.is_empty()` key collided
+                    // with real deopt-capable safepoints (a root loop-poll
+                    // when M's first statement is a loop; an inlined callee's
+                    // loop-poll recording CALLEE-relative bci 0; a bci-0
+                    // AllocClosure) — stamping `CtxLoc::None` on their root
+                    // scope left a deopted has_ctx frame with a NIL context
+                    // while the escaped closures still held the real one
+                    // (ctx_temp_walk panic / nil copied[1]). The vreg is dead
+                    // only BEFORE its prologue def (the ctx-alloc safepoint
+                    // itself); everywhere else the pin (regalloc) keeps it
+                    // live, so `resolve_frame_loc` distinguishes the two
+                    // cases exactly.
+                    match resolve_frame_loc(ctx_vreg, position, intervals, extra_oop_live) {
+                        // Pre-def window (the prologue alloc's own safepoint):
+                        // hand the interpreter a FRESH nil-filled Context via
+                        // the Elided path — NOT `CtxLoc::None`. The deopt
+                        // materializer never re-runs `activate_method` (the
+                        // original comment's claim that it re-allocates at
+                        // bci 0 was wrong), so `None` would leave a has_ctx
+                        // frame with no context; re-execution from bci 0
+                        // re-runs the frontend's param→ctx-slot copies into
+                        // the fresh one, which is exactly activation's own
+                        // sequence. Unreachable today (Alloc-kind sites don't
+                        // deopt via trap/return/poll) but correct if that
+                        // ever changes.
+                        crate::compiler::scopes::ValueLoc::Nil => CtxLoc::Elided {
+                            temps: vec![crate::compiler::scopes::ValueLoc::Nil; nctx],
+                        },
+                        live => CtxLoc::Materialized(live),
                     }
                 } else if ir_method.ctx_vregs.is_empty() {
                     CtxLoc::None

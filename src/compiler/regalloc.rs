@@ -833,7 +833,7 @@ pub fn regalloc(method: &IrMethod) -> RegallocResult {
     // writes nil into the rebuilt frame's Context, and a ctx-temp read after
     // the deopt corrupts (observed: `printOn:` with a captured stream, ctxloc
     // -> Nil at the trap). Same one-slot pin as `block_closure_vreg` above.
-    if let Some(cv) = method.method_ctx_vreg {
+    if let Some((cv, _nctx)) = method.method_ctx_vreg {
         let max_pos = intervals.iter().map(|iv| iv.end).max().unwrap_or(0) + 2;
         if let Some(iv) = intervals.iter_mut().find(|iv| iv.vreg == cv) {
             iv.end = max_pos;

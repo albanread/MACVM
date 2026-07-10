@@ -1,0 +1,28 @@
+"Collider (b): materialize method whose FIRST bytecode is its loop header
+ (no params; the only ctx temp is assigned INSIDE the loop, so no bci-0
+ ctx-capture stores precede the loop). The escaping closure captures `last`."
+Object subclass: LoopRepro [
+    | coll sink |
+    setup [ | i |
+        coll := OrderedCollection new.
+        i := 0.
+        [ i < 5 ] whileTrue: [ i := i + 1. coll add: i ].
+        sink := OrderedCollection new ]
+    pump [ | last |
+        [ coll isEmpty ] whileFalse: [
+            last := coll removeFirst.
+            sink add: [:v | v + last ] ] ]
+    drain [ | s |
+        s := 0.
+        sink do: [:b | s := s + (b value: 100) ].
+        ^s ]
+    go [ self setup. self pump. ^self drain ]
+]
+Object subclass: Driver [
+    run: iters [ | s r |
+        s := 0.
+        1 to: iters do: [:n | r := LoopRepro new go. s := s + r ].
+        ^s ]
+]
+Transcript show: 's='; show: (Driver new run: 300) printString; cr.
+Smalltalk quit: 0.
