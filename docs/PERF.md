@@ -400,3 +400,39 @@ re-key arm in rt_interpret_call's upgrade hook:
   thereafter.
 - Correctness: world byte-identical off vs t=200 plain + all three stress
   modes; deltablue correct under DEOPT_STRESS (re-key x invalidation churn).
+
+## S24 L2 steps 1-2 — counters bit fix + trigger unification (d609251)
+
+2026-07-10. The L2 design pass (3-reader + 3-design panel + judge workflow)
+CORRECTED the premise: 3 of deltablue's 4 tail drivers have zero closures and
+already OSR-compile — the tail was sub-threshold CALL entry (calls never
+consult by_key until the invocation counter crosses). Fix, user-decided
+policy: "the loop counters have detected in a different way that the method
+containing the loop is hot; the method is now hot" — a by_key install
+saturates the invocation counter to the threshold, unifying the two profile
+triggers with zero new dispatch state.
+
+| benchmark | interp (ms) | jit t=200 | best/interp |
+|---|---|---|---|
+| richards | 204 | **6** | **34.0x** |
+| deltablue | 214 | **7** | **30.6x** |
+
+- deltablue **19.5x -> 30.6x**, richards **17x -> 34x** (its loop methods
+  were also OSR-earned + call-starved). trigger_unifications=3 per bench.
+- Also fixed en route (found by the design pass's read phase): the
+  COUNTERS_COMPILE_DISABLED_BIT sat inside the S15 loop-counter field —
+  loopy NoPermanent methods re-attempted compilation every 10k backedges
+  forever (unguided re-compilation). Now bit 33; tripwire test pins it.
+- Remaining deltablue tail (1.74M bc): pre-first-OSR warmup of the drivers
+  (~55%) + AbstractConstraint>>inputsKnown: (14.5%, loop-free — the B1/B3
+  block-arg-inlining flagship). Envelope steps 3-6 (OSR for closure-bearing
+  methods via Context adoption) next per the design; measured by the new
+  ctxloop.mst when built.
+- Correctness: world byte-identical off vs t=200 plain + all three stress
+  modes; benches correct under stress; new send-based integration test
+  proves a sub-threshold call enters an OSR-earned nmethod (<50 dispatched
+  bytecodes vs ~800 interpreted).
+
+S24 arc summary to date: interp -> 6-7ms on both flagship benches
+(A1 5.3x -> A2 6.3x -> A3 6.5x -> L1 19.5x -> L2 30.6x deltablue;
+richards 16x -> 17x -> 34x).
