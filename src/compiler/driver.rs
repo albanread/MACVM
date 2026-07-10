@@ -684,7 +684,19 @@ pub fn compile_method_osr(
     method: MethodOop,
     osr_bci: u16,
 ) -> Option<NmethodId> {
-    compile_method_full(vm, rcvr_klass, method, 0, Some(osr_bci))
+    // S24 L2 step 5 (H7, version-churn coupling): inherit the key's CURRENT
+    // generation instead of hardwiring 0. Before this, a trap-retired OSR
+    // nmethod's recompile (osr_bci=None → the replacement has no OSR entry)
+    // left the still-hot loop re-arming a FRESH v0 every 10k backedges —
+    // `note_uncommon_trap`'s MAX_VERSIONS cap reset each rebirth and the
+    // compile churn was unbounded. Inheriting lets the cap accumulate
+    // across OSR re-arms exactly like call-path recompiles.
+    let version = crate::oops::wrappers::SymbolOop::try_from(method.selector())
+        .and_then(|sel| vm.code_table.lookup(rcvr_klass, sel))
+        .and_then(|id| vm.code_table.get(id))
+        .map(|nm| nm.version)
+        .unwrap_or(0);
+    compile_method_full(vm, rcvr_klass, method, version, Some(osr_bci))
 }
 
 fn compile_method_full(

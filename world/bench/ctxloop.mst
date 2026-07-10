@@ -1,0 +1,63 @@
+"ctxloop — S24 L2 phase B's payoff gate: a has_ctx method with an ESCAPING
+ accumulator closure and a 100k-iteration hot loop, called ONCE per timing
+ run. No invocation count ever justifies a call-path compile; only the
+ backedge counter (OSR, with Context ADOPTION) can tier it. Ratio vs
+ MACVM_JIT=off is the envelope's own number, independent of deltablue.
+
+ The Bench class is the verbatim inline copy convention (see deltablue.mst's
+ header comment)."
+
+Object subclass: CtxLoopBench [
+    CtxLoopBench class >> setUp [ ]
+    CtxLoopBench class >> runOne [
+        | probe k total |
+        k := 0.
+        probe := [ k ].
+        1 to: 100000 do: [:i | k := k + 1 ].
+        total := probe value + k.
+        ^total
+    ]
+    CtxLoopBench class >> checkResult: r [
+        ^r = 200000
+    ]
+]
+
+Object subclass: Bench [
+    <classVars: Times>
+
+    Bench class >> vmStats [
+        <primitive: 111>
+        ^nil
+    ]
+
+    Bench class >> run: benchClass named: name inner: inner outer: outer [
+        | t0 t1 r ms |
+        Times := OrderedCollection new.
+        3 timesRepeat: [
+            benchClass setUp.
+            r := benchClass runOne.
+            (benchClass checkResult: r)
+                ifFalse: [ self error: 'benchmark warmup produced a wrong result' ] ].
+        outer timesRepeat: [
+            benchClass setUp.
+            t0 := Smalltalk millisecondClock.
+            inner timesRepeat: [
+                r := benchClass runOne.
+                (benchClass checkResult: r)
+                    ifFalse: [ self error: 'benchmark produced a wrong result' ] ].
+            t1 := Smalltalk millisecondClock.
+            Times add: t1 - t0 ].
+        ms := self median: Times.
+        Transcript show: name; show: ' '; show: inner printString;
+            show: ' '; show: ms printString; cr.
+        ^ms
+    ]
+
+    Bench class >> median: coll [
+        | sorted |
+        sorted := coll asSortedCollection.
+        ^sorted at: (sorted size + 1) // 2
+    ]
+]
+
+Bench run: CtxLoopBench named: 'ctxloop' inner: 5 outer: 10.
