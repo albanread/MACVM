@@ -86,6 +86,12 @@ pub struct DebugState {
     /// `install_method` like `pending`, so a pin can name a class defined
     /// in the file about to run.
     pub pending_pins: Vec<(String, String)>,
+    /// DBG5 (compiled_send_auditor_design.md §D3): `MACVM_STEP_CALLS=1` (or the
+    /// RUSTTCL `step-call` verb) arms the interactive step-call auditor — a
+    /// nested command loop at every compiled send boundary (`rt_resolve_send`,
+    /// which force-cold makes total). Like `MACVM_TRACE=calls` it forces ICs
+    /// cold; unlike it, it stops and services commands instead of just logging.
+    pub step_calls: bool,
 }
 
 impl DebugState {
@@ -337,6 +343,102 @@ pub fn halt(vm: &mut VmState, method: MethodOop, bci: usize, reason: HaltReason)
                 );
             }
             other => eprintln!("unknown: {other:?} (try help)"),
+        }
+    }
+    vm.debug.session_depth -= 1;
+}
+
+/// DBG5 §D3 (compiled_send_auditor_design.md): the interactive step-call
+/// auditor — a nested command loop at a COMPILED send boundary, entered from
+/// `rt_resolve_send`'s force-cold short-circuit when `vm.debug.step_calls` is
+/// armed. This is PROBE's discipline live (never deopt, freeze the frame,
+/// read-only): it shows the send about to happen and services inspection
+/// commands until the user resumes. Reuses HALT's loop shape and `bt`, but
+/// NOTHING here mutates a frame or evaluates Smalltalk (§4.5 — `print`-eval is
+/// HALT's job). Commands read stdin, output stderr (guest stdout untouched).
+///
+/// `step`/`s` resumes and stops at the NEXT send (force-cold guarantees one);
+/// `continue`/`c` disarms and lets the run finish (still force-cold if
+/// `MACVM_TRACE=calls` is also on, just no more prompts).
+pub fn step_call_prompt(
+    vm: &mut VmState,
+    caller: crate::codecache::nmethod::NmethodId,
+    site_idx: usize,
+    selector: SymbolOop,
+    recv_klass: KlassOop,
+    argc: u8,
+) {
+    // Reentrancy: a `bt`/`slots` command must not itself re-open a prompt via
+    // the send hook — same session_depth guard HALT uses (§3.6).
+    if vm.debug.session_depth > 0 {
+        return;
+    }
+    vm.debug.session_depth += 1;
+    let sel = selector.as_string();
+    let kname = crate::runtime::error::name_of(recv_klass.name());
+    eprintln!(
+        "▸ send #{sel} to {kname}  (from nm={}#{site_idx}, argc={argc})",
+        caller.0
+    );
+
+    // Snapshot the live compiled frames (fp, ret_pc, nm) for the `slots` verb —
+    // walk_frames only lends `&VmState`, so collect before the command loop's
+    // own `&mut` uses (`step_calls` write, session_depth).
+    let mut compiled: Vec<(u64, u64, crate::codecache::nmethod::NmethodId)> = Vec::new();
+    crate::runtime::frames::walk_frames(vm, |fv| {
+        if let crate::runtime::frames::FrameView::Compiled { fp, ret_pc, nm } = fv {
+            compiled.push((fp, ret_pc, nm));
+        }
+    });
+
+    let stdin = std::io::stdin();
+    loop {
+        eprint!("(auditor) ");
+        let _ = std::io::stderr().flush();
+        let mut line = String::new();
+        match stdin.lock().read_line(&mut line) {
+            Ok(0) => {
+                // EOF: a scripted session that ends its input means "run to
+                // completion" — disarm so we don't prompt forever, then resume.
+                eprintln!("(eof — continuing)");
+                vm.debug.step_calls = false;
+                break;
+            }
+            Ok(_) => {}
+            Err(_) => break,
+        }
+        match line.split_whitespace().collect::<Vec<&str>>().as_slice() {
+            [] => {}
+            ["step"] | ["s"] => break, // stay armed → stop at the next send
+            ["continue"] | ["c"] => {
+                vm.debug.step_calls = false;
+                break;
+            }
+            ["quit"] => {
+                eprintln!("(auditor) quit — exiting process");
+                crate::runtime::vm_state::fatal_exit(0);
+            }
+            ["bt"] => bt(vm),
+            ["slots"] => match compiled.first() {
+                Some(&(fp, ret_pc, nm)) => {
+                    crate::memory::roots::dump_frame_oops(vm, fp, nm, ret_pc)
+                }
+                None => eprintln!("(auditor) no compiled frame on the stack"),
+            },
+            ["slots", n] => match n.parse::<usize>() {
+                Ok(n) if n < compiled.len() => {
+                    let (fp, ret_pc, nm) = compiled[n];
+                    crate::memory::roots::dump_frame_oops(vm, fp, nm, ret_pc);
+                }
+                _ => eprintln!(
+                    "(auditor) slots: frame 0..{}",
+                    compiled.len().saturating_sub(1)
+                ),
+            },
+            ["help"] => {
+                eprintln!("bt | slots [N] | step|s (→ next send) | continue|c | quit")
+            }
+            other => eprintln!("(auditor) unknown: {other:?} (try help)"),
         }
     }
     vm.debug.session_depth -= 1;

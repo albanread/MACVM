@@ -769,8 +769,11 @@ pub unsafe extern "C" fn rt_resolve_send(vm: *mut VmState, ret_addr: u64, argv: 
     // compiled send observable at this one choke point with zero codegen
     // change. Observation-only: the `Unresolved` arm is the already-correct
     // general dispatch, so results are byte-identical — only speed and
-    // visibility change (the sprint's headline gate).
-    let force_cold = vm.options.trace.is_enabled("calls");
+    // visibility change (the sprint's headline gate). Either the `calls`
+    // tracer (§D1) or the interactive `step-call` auditor (§D3) forces cold.
+    let trace_calls = vm.options.trace.is_enabled("calls");
+    let step_calls = vm.debug.step_calls;
+    let force_cold = trace_calls || step_calls;
 
     // S13 step 10d: a `send_super` site re-dispatches from its STATIC
     // holder-superclass (D4.6), NEVER the receiver's klass — skipping subclass
@@ -828,19 +831,26 @@ pub unsafe extern "C" fn rt_resolve_send(vm: *mut VmState, ret_addr: u64, argv: 
         );
         let t = resolve_target_entry(vm, k, selector, method, false);
         // §D1 tracer: `MACVM_TRACE=calls` logs one line per (now every) send.
-        let sel = selector.as_string();
-        let kname = crate::memory::print_oop(&vm.universe, k.name());
-        let tier = if method.primitive() != 0 {
-            format!("prim({})", method.primitive())
-        } else if vm.code_table.lookup(k, selector).is_some() {
-            "C".to_string()
-        } else {
-            "I".to_string()
-        };
-        eprintln!(
-            "[calls] nm={}#{site_idx} #{sel} recv={kname} → {tier} argc={argc}",
-            caller_id.0
-        );
+        if trace_calls {
+            let sel = selector.as_string();
+            let kname = crate::memory::print_oop(&vm.universe, k.name());
+            let tier = if method.primitive() != 0 {
+                format!("prim({})", method.primitive())
+            } else if vm.code_table.lookup(k, selector).is_some() {
+                "C".to_string()
+            } else {
+                "I".to_string()
+            };
+            eprintln!(
+                "[calls] nm={}#{site_idx} #{sel} recv={kname} → {tier} argc={argc}",
+                caller_id.0
+            );
+        }
+        // §D3 interactive auditor: stop at this send boundary and service
+        // read-only inspection commands (reentrancy-guarded inside).
+        if step_calls {
+            crate::runtime::debug::step_call_prompt(vm, caller_id, site_idx, selector, k, argc);
+        }
         return t;
     }
 

@@ -254,3 +254,79 @@ fn auditor_calls_traces_compiled_sends_without_changing_result() {
 fn tail(s: &str) -> String {
     s.lines().rev().take(12).collect::<Vec<_>>().join("\n")
 }
+
+/// DBG5 §D3: the interactive step-call auditor. `MACVM_STEP_CALLS=1` stops at
+/// each compiled send boundary and services read-only inspection commands.
+/// Scripted stdin (commands in, transcript on stderr), same discipline as the
+/// HALT session goldens above — but at a COMPILED send, showing the compiled
+/// frame + its oop slots, never deopting.
+fn run_step_calls(program: &str, script: &str) -> (i32, String, String) {
+    static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let exe = env!("CARGO_BIN_EXE_macvm");
+    let dir = std::env::temp_dir().join(format!("macvm_dbg5sc_{}_{seq}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("prog.mst");
+    std::fs::write(&file, program).unwrap();
+    let mut child = Command::new(exe)
+        .arg("run")
+        .arg(&file)
+        .arg("--world")
+        .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/world"))
+        .env("MACVM_STEP_CALLS", "1")
+        .env("MACVM_JIT", "threshold=200")
+        .env("MACVM_PROBE", "off")
+        .env_remove("MACVM_GC_STRESS")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn macvm");
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(script.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().expect("wait macvm");
+    let _ = std::fs::remove_dir_all(&dir);
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+#[test]
+fn step_call_stops_at_compiled_send_and_inspects_without_changing_result() {
+    // bt at the first send, dump the compiled frame's slots, advance one send,
+    // then run to completion.
+    let (code, stdout, stderr) = run_step_calls(AUDITOR_POLY, "bt\nslots\nstep\ncontinue\n");
+    assert_eq!(code, 0, "stderr tail: {}", tail(&stderr));
+    // Result is unchanged — the auditor is a pure observer at the send boundary.
+    assert!(stdout.contains("sum=3000"), "stdout: {stdout}");
+    // Stopped at a compiled #speak send boundary.
+    assert!(
+        stderr.contains("▸ send #speak"),
+        "expected a send-boundary prompt; stderr tail:\n{}",
+        tail(&stderr)
+    );
+    // `bt` shows the compiled callee over its interpreted callers (mixed-tier).
+    assert!(
+        stderr.contains("[compiled] Zoo>>") && stderr.contains("[interp]   Zoo>>total:"),
+        "bt must show the mixed-tier stack; stderr tail:\n{}",
+        tail(&stderr)
+    );
+    // `slots` dumps the live compiled frame's oop slots (all healthy here).
+    assert!(
+        stderr.contains("[oops] nm=") && stderr.contains("mark:ok"),
+        "slots must dump the frame's oop slots; stderr tail:\n{}",
+        tail(&stderr)
+    );
+    // `step` advanced to a second send before `continue` finished the run.
+    assert_eq!(
+        stderr.matches("▸ send #speak").count() >= 2,
+        true,
+        "step must advance to the next send; stderr:\n{stderr}"
+    );
+}

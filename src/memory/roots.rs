@@ -399,6 +399,56 @@ where
     vm.mega_table = mega_table;
 }
 
+/// DBG5 §D2 (on-demand): read-only dump of ONE compiled frame's live oop-map
+/// slots at `ret_pc` — every slot's raw word + PROBE region/plausibility
+/// annotation, suspects flagged. Uses the EXACT slot-address formula the
+/// collector's `FrameView::Compiled` arm above uses (`fp − 8·(slot+1)`) and
+/// the same `oop_is_suspect`/`annotate_value` classifier the at-GC scan uses,
+/// so the interactive `slots` verb (DBG5 §D3) can never disagree with the
+/// collector about which slots are live or which are corrupt. Never mutates.
+///
+/// # Safety contract
+/// `fp` must be a live compiled frame's own x29 and `nm`/`ret_pc` its
+/// installed nmethod + return safepoint — exactly what `walk_frames` yields
+/// (the only intended caller). Reads one stack word per live slot; the word
+/// is then classified WITHOUT being dereferenced (§4.5), so a corrupt slot is
+/// reported, never followed.
+pub fn dump_frame_oops(
+    vm: &VmState,
+    fp: u64,
+    nm: crate::codecache::nmethod::NmethodId,
+    ret_pc: u64,
+) {
+    let Some(nmethod) = vm.code_table.get(nm) else {
+        eprintln!("[oops] nm={nm:?} not installed (fp={fp:#x})");
+        return;
+    };
+    let slots: Vec<u16> = nmethod.oopmap_at(ret_pc).iter_slots().collect();
+    if slots.is_empty() {
+        eprintln!(
+            "[oops] nm={} fp={fp:#x} ret_pc={ret_pc:#x}: no live oop slots here",
+            nm.0
+        );
+        return;
+    }
+    for slot in slots {
+        // SAFETY: contract above — `fp` is a live compiled frame's x29 and the
+        // oopmap only names slots the emitter reserved frame space for.
+        let addr = (fp - 8 * (slot as u64 + 1)) as *const u64;
+        let word = unsafe { *addr };
+        let flag = if crate::runtime::probe::oop_is_suspect(vm, word) {
+            "⚠SUSPECT "
+        } else {
+            ""
+        };
+        eprintln!(
+            "[oops] {flag}nm={} fp={fp:#x} slot={slot} word={word:#x} {}",
+            nm.0,
+            crate::runtime::probe::annotate_value(vm, word),
+        );
+    }
+}
+
 /// D4.1's per-kind RootSpill interpretation: how many of the EIGHT
 /// generically-spilled `x0..x7` words (starting from slot 0) are genuinely
 /// live oops for `kind` — the rest may hold stale, non-oop register content

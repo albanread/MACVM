@@ -106,6 +106,14 @@ fn cmd_run(args: &[String], debug: bool) {
         &world_dir.unwrap_or_else(|| PathBuf::from("world")),
     );
 
+    // DBG5 §D3: arm the interactive step-call auditor from the environment.
+    // Independent of MACVM_DEBUG — it stops at compiled SEND boundaries, not
+    // bytecode breakpoints, and force-colds ICs the same way MACVM_TRACE=calls
+    // does (observation-only; the guest's answer is unchanged).
+    if std::env::var("MACVM_STEP_CALLS").is_ok() {
+        vm.debug.step_calls = true;
+    }
+
     let debug_spec = std::env::var("MACVM_DEBUG").unwrap_or_default();
     let pin_spec = std::env::var("MACVM_PIN").unwrap_or_default();
     if debug || !debug_spec.is_empty() || !pin_spec.is_empty() {
