@@ -306,9 +306,16 @@ pub const LOOP_COUNTER_LIMIT: i64 = 10_000;
 /// S10 D1: set by `compiler::driver::compile_method` when `eligible`
 /// rejects a method, so the interpreter's counter-overflow trigger doesn't
 /// re-attempt (and re-reject) the same never-compilable method every 10k
-/// sends. Bit 16 — the lowest of SPEC §4.4's reserved range, disjoint from
-/// `COUNTERS_INVOCATION_MASK`'s bits 0-15.
-pub const COUNTERS_COMPILE_DISABLED_BIT: i64 = 1 << 16;
+/// sends. Bit 33 (S24 L2 step 1): the ORIGINAL bit 16 predated S15, whose
+/// loop counter then claimed bits 16-31 — `bump_loop_counter`/
+/// `reset_loop_counter` do masked RMWs over that whole field, so ONE
+/// backedge through a loopy compile-disabled method silently clobbered the
+/// disable bit and the method re-attempted (and re-rejected) compilation
+/// every trigger, forever — exactly the unguided re-compilation D1 exists
+/// to prevent. Bit 32 is `COUNTERS_HAS_BP_BIT`; 33 is the next bit clear of
+/// the invocation (0-15) and loop (16-31) fields, preserved by both fields'
+/// masked read-modify-write updates.
+pub const COUNTERS_COMPILE_DISABLED_BIT: i64 = 1 << 33;
 
 /// DBG1 (docs/DEBUGGER.md §2): set on any method carrying at least one
 /// breakpoint, so the dispatch hook's hash lookup runs only inside methods

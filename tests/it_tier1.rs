@@ -6776,6 +6776,113 @@ fn osr_transitions_running_loop_via_jump_back() {
     assert_eq!(SmallInt::try_from(r2).map(|s| s.value()), Some(expected));
 }
 
+/// S24 L2 step 2 — TRIGGER UNIFICATION ("the loop counters have detected in
+/// a different way that the method containing the loop is hot; the method is
+/// now hot"). At a HIGH invocation threshold, a method's loop crosses the
+/// backedge limit and OSR-installs a by_key nmethod; the install saturates
+/// the invocation counter, so the NEXT CALL — far below the threshold —
+/// enters the nmethod instead of interpreting end-to-end. Before this, the
+/// OSR-earned nmethod served loop entries only and every call interpreted
+/// until call #threshold (deltablue's driver-method tail).
+#[test]
+fn trigger_unification_routes_subthreshold_calls_into_osr_earned_nmethod() {
+    use macvm::runtime::vm_state::TraceFlags;
+    let mut vm = VmState::with_options(VmOptions {
+        heap_mib: 64,
+        // `count` enables vm.bytecode_count — the observable that proves the
+        // second call ran compiled (an interpreted run would dispatch
+        // thousands of bytecodes; a compiled entry dispatches ~none).
+        trace: TraceFlags::parse("count"),
+        gc_stress: false,
+        gc_stress_full_period: None,
+        eden_kb: None,
+        jit: JitMode::Threshold(1000),
+    });
+    install_smi_prim(&mut vm, b"+", 1, 1);
+    install_smi_prim(&mut vm, b"<", 1, 10);
+    let smi_klass = vm.universe.smi_klass;
+    let lt_sel = vm.universe.intern(b"<");
+    let plus_sel = vm.universe.intern(b"+");
+
+    // Same osrSum: shape as osr_transitions_running_loop_via_jump_back.
+    let mut b = BytecodeBuilder::new();
+    b.push_smi_i8(0);
+    b.store_temp_pop(1);
+    b.push_smi_i8(0);
+    b.store_temp_pop(2);
+    let hdr = b.new_label();
+    b.bind(hdr);
+    b.push_temp(1);
+    b.push_temp(0);
+    b.send(&mut vm, lt_sel, 1);
+    let end = b.new_label();
+    b.br_false_fwd(end);
+    b.push_temp(2);
+    b.push_temp(1);
+    b.send(&mut vm, plus_sel, 1);
+    b.store_temp_pop(2);
+    b.push_temp(1);
+    b.push_smi_i8(1);
+    b.send(&mut vm, plus_sel, 1);
+    b.store_temp_pop(1);
+    b.jump_back(hdr);
+    b.bind(end);
+    b.push_temp(2);
+    b.ret_tos();
+    let m_sel = vm.universe.intern(b"osrSum:");
+    let method = b.finish(&mut vm, m_sel, 1, 2);
+    install_method(&mut vm, smi_klass, m_sel, method);
+
+    // Call 1: crosses the 10k-backedge limit mid-loop → OSR compile + entry.
+    // The install saturates the invocation counter to the threshold.
+    let n = 25_000i64;
+    let expected: i64 = (0..n).sum();
+    let recv = SmallInt::new(0).oop();
+    let r1 = macvm::interpreter::run_method(&mut vm, method, recv, &[SmallInt::new(n).oop()]);
+    assert_eq!(SmallInt::try_from(r1).map(|s| s.value()), Some(expected));
+    assert_eq!(vm.stats.osr_entries, 1, "the loop OSR'd once");
+    assert_eq!(
+        vm.stats.trigger_unifications, 1,
+        "the OSR-earned install must saturate the invocation counter (call \
+         count 1 << threshold 1000)"
+    );
+    assert!(
+        (method.counters() & macvm::oops::layout::COUNTERS_INVOCATION_MASK) >= 1000,
+        "invocation counter saturated to the threshold"
+    );
+
+    // Call 2 must be a REAL SEND (run_method is the top-level entry and
+    // bypasses activate_method's threshold gate entirely — only sends
+    // consult it). `callIt: n [ ^0 osrSum: n ]`, itself interpreted (called
+    // once, far below threshold): its osrSum: send hits the gate, which the
+    // saturated counter now passes, entering the nmethod's NORMAL entry.
+    // n=100: only 100 backedges — no OSR possible; the ~50-bytecode budget
+    // proves the CALLEE ran compiled (interpreting its 100-iteration loop
+    // would dispatch ~800+).
+    let mut cb = BytecodeBuilder::new();
+    cb.push_smi_i8(0);
+    cb.push_temp(0);
+    cb.send(&mut vm, m_sel, 1);
+    cb.ret_tos();
+    let call_sel = vm.universe.intern(b"callIt:");
+    let caller = cb.finish(&mut vm, call_sel, 1, 0);
+    install_method(&mut vm, smi_klass, call_sel, caller);
+
+    let before = vm.bytecode_count;
+    let n2 = 100i64;
+    let expected2: i64 = (0..n2).sum();
+    let r2 = macvm::interpreter::run_method(&mut vm, caller, recv, &[SmallInt::new(n2).oop()]);
+    assert_eq!(SmallInt::try_from(r2).map(|s| s.value()), Some(expected2));
+    let dispatched = vm.bytecode_count - before;
+    assert!(
+        dispatched < 50,
+        "the osrSum: send must enter the compiled nmethod (an interpreted \
+         run of its 100-iteration loop dispatches ~800 bytecodes; got \
+         {dispatched})"
+    );
+    assert_eq!(vm.stats.osr_entries, 1, "no second OSR needed or taken");
+}
+
 /// S15 step 5 (A5) — the OSR x deopt round trip: the activation goes
 /// interpreted -> OSR-compiled -> (uncommon trap mid-loop) -> interpreted,
 /// and nobody upstream can tell. The loop's body contains a branch UNTAKEN

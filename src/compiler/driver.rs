@@ -1202,6 +1202,23 @@ fn compile_method_full(
             id,
         );
     }
+    // S24 L2 step 2 — TRIGGER UNIFICATION (user-decided policy: "the loop
+    // counters have detected in a different way that the method containing
+    // the loop is hot; the method is now hot"). A by_key install means SOME
+    // profile counter earned a compile; saturate the invocation counter to
+    // the threshold so `activate_method`'s existing gate routes every future
+    // CALL into it too. Before this, an OSR-earned nmethod served loop
+    // entries while every call of the same method interpreted end-to-end
+    // until call #threshold — deltablue's driver methods (~103 calls,
+    // threshold 200) ran 56% of the remaining interpreted tail that way.
+    // No-op for threshold-triggered installs (counter already ≥ n); never
+    // lowers; adds NO new compilation (install already happened — the
+    // no-unguided-compilation guardrail holds by construction).
+    if let crate::runtime::JitMode::Threshold(n) = vm.options.jit {
+        if method.saturate_invocation(n as i64) {
+            vm.stats.trigger_unifications += 1;
+        }
+    }
     if vm.options.trace.is_enabled("jit") {
         eprintln!(
             "[jit] compiled {} -> nmethod {} ({} bytes, {} frame slots)",

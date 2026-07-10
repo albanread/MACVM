@@ -342,6 +342,14 @@ pub struct VmStats {
     /// S15 A8 (tier balance): successful tier-1 compilations installed
     /// (all levels — `Nmethod.level` is 1 until the policy ladder lands).
     pub compilations: u64,
+    /// S24 L2 step 2 (trigger unification): installs where saturating the
+    /// method's invocation counter to the threshold actually RAISED it —
+    /// i.e. compiles earned by the loop/backedge counter (OSR) or the
+    /// version ladder, whose methods' future CALLS would previously have
+    /// interpreted end-to-end until the invocation counter crossed on its
+    /// own. "The loop counters have detected in a different way that the
+    /// method containing the loop is hot; the method is now hot."
+    pub trigger_unifications: u64,
     /// S15: OSR transitions actually taken (interpreter frame replaced by
     /// a compiled frame mid-loop).
     pub osr_entries: u64,
@@ -372,6 +380,7 @@ pub fn format_vm_stats(vm: &VmState) -> String {
         format!("[stats] pic_extends={}", s.pic_extends),
         format!("[stats] mega_transitions={}", s.mega_transitions),
         format!("[stats] c2i_pic_rekeys={}", s.c2i_pic_rekeys),
+        format!("[stats] trigger_unifications={}", s.trigger_unifications),
         format!(
             "[stats] ic_patch_declined_cache_full={}",
             s.ic_patch_declined_cache_full

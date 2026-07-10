@@ -61,16 +61,26 @@ method OSR-compiles today (`osr_entries >= 1`, by_key nmethod exists).
 stale-comment fixes; tripwire test (disable survives `bump_loop_counter`×3 +
 `reset_loop_counter`; counter unaliased). Gates: suites + world differentials.
 
-**Step 2 — Sub-threshold entry (THE deltablue payoff).**
-`COUNTERS_HAS_NMETHOD_BIT = 1 << 34` + masked accessors (NOT whole-word
-writes); set after successful `install()` in `compile_method_full`; **never
-cleared** on invalidation or lookup miss (per-method hint vs per-(klass,sel)
-lookup — clearing on miss would strip polymorphic methods; staleness is
-filtered by the existing Alive-filtered lookup, and `set_compile_disabled`'s
-whole-word write clears it exactly when wanted, i.e. breakpoints).
-`activate_method`: `if (over_threshold || m.has_nmethod_hint()) &&
-!m.compile_disabled()` → existing lookup; **never compile** sub-threshold
-(`existing` only). Stats: `subthreshold_entries`. Payoff gate: interpreted-bc
+**Step 2 — Trigger unification (THE deltablue payoff; USER-DECIDED 2026-07-10,
+replacing the hint-bit draft — see R15).** Policy, in the user's words: "the
+loop counters have detected in a different way that the method containing the
+loop is hot; the method is now hot." Mechanism: when `compile_method_full`
+successfully installs a `by_key` nmethod, **saturate the method's invocation
+counter up to the threshold** (`saturate_invocation(m, n)`: masked RMW on bits
+0-15, `max(cur, min(n, COUNTERS_INVOCATION_MAX))` — never lowers). For
+threshold-triggered compiles this is a no-op (counter already ≥ n); for
+OSR-triggered and versioned installs it fast-forwards, so `activate_method`'s
+EXISTING gate (`bumped >= n && !compile_disabled`) routes every future call
+into the nmethod with zero new dispatch machinery. No new counters-word bit;
+no new branch in `activate_method`. Consequences accepted with the policy:
+after a later invalidation the method recompiles on the next call like any
+hot method (it IS hot); a new receiver klass's customized compile may be
+minted on first call post-saturation (consistent with over-threshold
+behavior today; profile-justified at method granularity, which is the
+granularity the counters have). The principle guardrail holds: saturation
+happens only on a profile-triggered install — no compilation ever happens
+that no counter justified. Stats: `trigger_unifications` (count of installs
+where saturation actually raised the counter). Payoff gate: interpreted-bc
 histogram — projectionTest:/chainTest: tails (~1.55M bc) collapse to warmup
 prefixes.
 
@@ -157,14 +167,21 @@ arithmetic (osr_entries=6). R10 clear-hint-on-miss: strips polymorphic
 methods. R11 hint bit at 17 / whole-word flag writes: inside the counter
 field / clobbers counters. R12 permanent decline bit for elided-ctx OSR: state
 for a once-per-10k-backedge cost. R14 attacking `inputsKnown:` in L2:
-loop-free — B1/B3 territory.
+loop-free — B1/B3 territory. R15 the hint-bit draft of Step 2
+(`COUNTERS_HAS_NMETHOD_BIT` + an `over || hint` dispatch branch): superseded
+by trigger unification (user call, 2026-07-10) — it was a parallel mechanism
+where saturating the existing counter unifies the two profile triggers with
+zero new dispatch state; its lapse-to-interpretation-after-invalidation
+behavior also contradicted the "the method is now hot" policy.
 
-## 6. Open questions (need the user's call)
+## 6. Open questions — RESOLVED (2026-07-10)
 
-1. **Priority after Step 2:** complete the envelope (Steps 3-6, ~4 small gated
-   steps, serves the compile-coverage arc; recommendation: yes) or jump to
-   B1/B3 (`inputsKnown:` — deltablue's only remaining permanent tail)?
-2. **Step 1's semantic ride-along:** relocating the bit makes loopy
-   NoPermanent methods *actually stay* compile-disabled (today they clobber
-   the bit and re-attempt forever). Almost certainly the intent — but say the
-   word if you want it measured separately first.
+1. **Priority after Step 2:** envelope first (Steps 3-6) per recommendation;
+   re-rank against B1/B3 after Step 2's measurement lands.
+2. **Step 1's semantic ride-along:** proceed. The user's premature-optimization
+   principle IS the ride-along's effect — loopy NoPermanent methods staying
+   disabled is the documented S10-D1 intent; today's re-attempt-forever
+   behavior is the accidental unguided compilation.
+3. **Step 2 mechanism:** trigger unification (counter saturation), user-decided
+   — "the loop counters have detected in a different way that the method
+   containing the loop is hot; the method is now hot."

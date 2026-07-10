@@ -158,6 +158,30 @@ impl MethodOop {
         self.set_counters(crate::oops::layout::COUNTERS_COMPILE_DISABLED_BIT);
     }
 
+    /// S24 L2 step 2 (trigger unification, user-decided policy): "the loop
+    /// counters have detected in a different way that the method containing
+    /// the loop is hot; the method is now hot." Called by
+    /// `compile_method_full` after a successful `by_key` install — raises the
+    /// invocation counter to (at least) the tier-up threshold so
+    /// `activate_method`'s EXISTING `bumped >= n` gate routes every future
+    /// call into the nmethod, unifying the two profile triggers (invocation
+    /// count and loop backedges) with zero new dispatch state. Masked RMW on
+    /// bits 0-15 only; never lowers; a threshold-triggered install is a
+    /// no-op (counter already ≥ n). Returns true when it actually raised the
+    /// counter (i.e. this install was loop/backedge-earned — the
+    /// `trigger_unifications` stat).
+    pub fn saturate_invocation(self, n: i64) -> bool {
+        use crate::oops::layout::{COUNTERS_INVOCATION_MASK, COUNTERS_INVOCATION_MAX};
+        let c = self.counters();
+        let cur = c & COUNTERS_INVOCATION_MASK;
+        let want = n.clamp(0, COUNTERS_INVOCATION_MAX);
+        if cur >= want {
+            return false;
+        }
+        self.set_counters((c & !COUNTERS_INVOCATION_MASK) | want);
+        true
+    }
+
     /// DBG1: clears ONLY the compile-disabled bit (breakpoint removal
     /// restores tier-up eligibility; recompilation then happens naturally
     /// by counters).
@@ -240,6 +264,65 @@ mod tests {
             eden_kb: None,
             jit: crate::runtime::JitMode::Off,
         })
+    }
+
+    /// S24 L2 step 1 (T14): `compile_disabled` must survive the S15 loop
+    /// counter's masked RMWs. The original bit 16 sat INSIDE the loop field
+    /// (bits 16-31), so one `bump_loop_counter` clobbered it and a loopy
+    /// NoPermanent method re-attempted compilation forever.
+    #[test]
+    fn compile_disabled_survives_loop_counter_rmw() {
+        let mut vm = test_vm();
+        let m = crate::memory::alloc::alloc_method(&mut vm, 1);
+
+        m.set_compile_disabled();
+        for _ in 0..3 {
+            crate::runtime::osr::bump_loop_counter(m);
+        }
+        assert!(
+            m.compile_disabled(),
+            "bump_loop_counter's bits-16-31 RMW must not clobber the disable bit"
+        );
+        crate::runtime::osr::reset_loop_counter(m);
+        assert!(
+            m.compile_disabled(),
+            "reset_loop_counter must not clobber the disable bit"
+        );
+        // And the flag must not alias INTO the counter: with the bit set,
+        // the first bump yields loop-count 1, not a poisoned value.
+        let crossed = crate::runtime::osr::bump_loop_counter(m);
+        assert!(!crossed, "count 1 must not read as >= LOOP_COUNTER_LIMIT");
+    }
+
+    /// S24 L2 step 2: trigger unification's counter mechanics.
+    #[test]
+    fn saturate_invocation_raises_never_lowers() {
+        let mut vm = test_vm();
+        let m = crate::memory::alloc::alloc_method(&mut vm, 1);
+
+        // Cold method: saturation raises to the threshold and reports it.
+        assert!(m.saturate_invocation(200));
+        assert_eq!(
+            m.counters() & crate::oops::layout::COUNTERS_INVOCATION_MASK,
+            200
+        );
+        // Idempotent / never lowers.
+        assert!(!m.saturate_invocation(200));
+        assert!(!m.saturate_invocation(100));
+        assert_eq!(
+            m.counters() & crate::oops::layout::COUNTERS_INVOCATION_MASK,
+            200
+        );
+        // Preserves the flag bits outside the invocation field.
+        m.set_has_bp();
+        assert!(m.saturate_invocation(300));
+        assert!(m.has_bp());
+        // Clamped to the field ceiling for absurd thresholds.
+        assert!(m.saturate_invocation(1 << 40));
+        assert_eq!(
+            m.counters() & crate::oops::layout::COUNTERS_INVOCATION_MASK,
+            crate::oops::layout::COUNTERS_INVOCATION_MAX
+        );
     }
 
     #[test]
