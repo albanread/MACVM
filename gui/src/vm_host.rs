@@ -1111,6 +1111,7 @@ fn handle(
             let q = query.replace('\'', "''");
             let code = match tool.as_str() {
                 "senders" => format!("SendersView of: '{q}'"),
+                "definition" => format!("DefinitionsView of: '{q}'"),
                 _ => format!("ImplementorsView of: '{q}'"),
             };
             let html = render_and_inject(vm, image, &code).unwrap_or_else(|| {
@@ -2116,6 +2117,36 @@ mod tests {
         assert!(
             html.contains("Implementors of") && html.contains("data-open-class=\"Point\""),
             "must list Point among printOn: implementors (a drill-link), got a {}-char result",
+            html.len()
+        );
+    }
+
+    /// Find Definition does a case-insensitive substring search over class
+    /// names.
+    #[test]
+    fn find_definition_matches_class_names() {
+        OPEN_OUTLINERS.with(|o| o.borrow_mut().clear());
+        let mut world = MockWorld::seed();
+        let mut sel = BrowserSelection::default();
+        let mut vm = test_vm_handle(macvm::runtime::JitMode::Off);
+        let responses = handle(
+            VmRequest::Find {
+                tool: "definition".to_string(),
+                query: "collect".to_string(),
+            },
+            &mut world,
+            &mut sel,
+            None,
+            &mut vm,
+        );
+        let html = match responses.as_slice() {
+            [VmResponse::FindResults { html }] => html.clone(),
+            other => panic!("expected FindResults, got {other:?}"),
+        };
+        assert!(
+            html.contains("data-open-class=\"Collection\"")
+                && html.contains("data-open-class=\"OrderedCollection\""),
+            "'collect' must match Collection classes, got {}-char result",
             html.len()
         );
     }

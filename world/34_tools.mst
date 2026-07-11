@@ -346,3 +346,52 @@ Visual subclass: SendersView [
         html raw: '</div>'.
     ]
 ]
+
+"--- DefinitionsView: classes whose name matches a query (Find definition,
+     APPS.md §5.4). Case-insensitive substring over class names. ---"
+Visual subclass: DefinitionsView [
+    | query |
+    DefinitionsView class >> of: aString [
+        ^self basicNew setQuery: aString
+    ]
+    setQuery: q [
+        query := q.
+        ^self
+    ]
+    htmlFragment [
+        | html count |
+        html := HtmlWriter new.
+        html raw: '<div class="st-find-results"><div class="st-find-head">Classes matching &#8220;'.
+        html escaped: query.
+        html raw: '&#8221;</div>'.
+        count := 0.
+        ClassMirror allClasses do: [ :c | | m |
+            m := ClassMirror on: c.
+            (self contains: m name sub: query) ifTrue: [
+                count := count + 1.
+                html raw: '<div class="st-find-item"><span class="st-class-link" data-open-class="'.
+                html escaped: m name.
+                html raw: '">'.
+                html escaped: m name.
+                html raw: '</span></div>' ] ].
+        count = 0 ifTrue: [ html raw: '<div class="st-find-empty">(no matching classes)</div>' ].
+        html raw: '</div>'.
+        ^html contents
+    ]
+    "Case-insensitive: does `sub` occur anywhere in `hay`?"
+    contains: hay sub: sub [
+        | h n |
+        h := hay asLowercase.
+        n := sub asLowercase.
+        n size = 0 ifTrue: [ ^true ].
+        n size > h size ifTrue: [ ^false ].
+        1 to: h size - n size + 1 do: [ :i |
+            (self matches: n in: h at: i) ifTrue: [ ^true ] ].
+        ^false
+    ]
+    matches: sub in: hay at: pos [
+        1 to: sub size do: [ :j |
+            ((hay at: pos + j - 1) = (sub at: j)) ifFalse: [ ^false ] ].
+        ^true
+    ]
+]

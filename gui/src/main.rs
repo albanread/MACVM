@@ -506,6 +506,7 @@ fn open_find(tool: &str) {
 fn display_find(tool: &str) {
     let (title, placeholder) = match tool {
         "senders" => ("Senders", "selector, e.g. printOn:"),
+        "definition" => ("Find Definition", "class name, e.g. Collection"),
         _ => ("Implementors", "selector, e.g. printOn:"),
     };
     // The results div carries a widget id + hierarchy root so clicking a
@@ -763,6 +764,7 @@ extern "C" fn on_script_message(_this: Id, _cmd: Sel, _controller: Id, message: 
                     navigate_to(&doc_index);
                 }
                 "userHierarchy" => open_class_outliner(),
+                "find" => open_find("definition"),
                 "implementors" => open_find("implementors"),
                 "senders" => open_find("senders"),
                 "hierarchy" => open_class_browser(),
