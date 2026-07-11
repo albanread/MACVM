@@ -191,6 +191,19 @@ pub(crate) fn dispatch_ffi_primitive(vm: &mut VmState, m: MethodOop, argc: u8) -
         }
     }
 
+    // Every argument is now marshaled into `argv_g`/`argv_f`, and no
+    // `Fallthrough` (which needs the args left on the stack for the method's
+    // bytecode fallback) can happen past this point — so restore the operand
+    // stack to the receiver slot, the exact convention `try_primitive` applies
+    // to a table primitive's own `Ok` (`vm.stack.sp = base`). The FFI path
+    // returns straight out of `try_primitive` and so bypassed that truncation;
+    // leaving the receiver+args on the stack was masked in the interpreter
+    // (the calling method's return truncates them) but diverged a COMPILED
+    // caller's static stack model, tripping `enter_compiled`'s sp assert
+    // (`compiled_call.rs`) — e.g. `Time millisecondClockValue` twice under the
+    // JIT. The caller pushes the result at `base`, leaving exactly `[result]`.
+    vm.stack.sp = base;
+
     // Resolve fresh on EVERY call — a deliberate, documented scope cut for
     // a later performance pass (a per-descriptor resolved-address cache),
     // not an oversight: this step's brief is "make the pragma callable at

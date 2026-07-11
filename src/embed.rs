@@ -594,6 +594,27 @@ mod tests {
         assert!(count > 20, "the seed world has many classes, got {count}");
     }
 
+    /// Regression: `dispatch_ffi_primitive` left the receiver+args on the
+    /// operand stack instead of truncating to `base` like every table
+    /// primitive. Masked in the interpreter (the calling method's return
+    /// truncates them), but a COMPILED caller tracks the stack statically, so
+    /// the divergence tripped `enter_compiled`'s sp assert
+    /// (`compiled_call.rs`) — `Time millisecondClockValue` twice under the JIT
+    /// aborted the process. Under `Threshold(1)` the second call runs the
+    /// compiled `millisecondClockValue` (which calls an FFI primitive), so a
+    /// clean return proves the stack is balanced.
+    #[test]
+    fn ffi_primitive_under_jit_keeps_the_operand_stack_balanced() {
+        let mut vm = boot_test_vm(JitMode::Threshold(1));
+        let out = vm
+            .eval("[ Time millisecondClockValue. Time millisecondClockValue ] value.")
+            .expect("an FFI primitive called from a compiled method must not corrupt the stack");
+        assert!(
+            out.parse::<i64>().map(|n| n > 0).unwrap_or(false),
+            "expected a positive epoch-ms value, got {out:?}"
+        );
+    }
+
     #[test]
     fn eval_compile_error_surfaces_as_err_not_panic() {
         let mut vm = boot_test_vm(JitMode::Off);
