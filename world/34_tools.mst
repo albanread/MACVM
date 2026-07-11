@@ -60,6 +60,13 @@ Object subclass: ClassMirror [
         "Fallback (a non-behavior argument fails the primitive): no selectors."
         ^Array new: 0
     ]
+    "R2 (docs/APPS.md §3): the primitive number of aBehavior's method for
+     aSelector — 0 = not a primitive, a positive id = a table primitive, -1 =
+     an FFI primitive. Lets the browser show primitive methods read-only."
+    ClassMirror class >> primitiveOf: aBehavior selector: aSelector [
+        <primitive: 62>
+        ^0
+    ]
     setClass: c [
         klass := c.
         ^self
@@ -173,8 +180,8 @@ Visual subclass: ClassOutliner [
          methods stay closed (source on demand). Many classes are abstract
          (their methods live on subclasses), so a Subclasses section lets you
          drill down to where the code actually is — e.g. Boolean -> True/False."
-        self side: 'instance' selectors: mirror instanceSelectors on: html.
-        self side: 'class' selectors: mirror classSelectors on: html.
+        self side: 'instance' selectors: mirror instanceSelectors behavior: mirror theClass on: html.
+        self side: 'class' selectors: mirror classSelectors behavior: mirror theClass class on: html.
         self subclassesOn: html.
         html raw: '</div></div></div>'.
         ^html contents
@@ -197,42 +204,54 @@ Visual subclass: ClassOutliner [
             html raw: '</span></span></div>' ].
         html raw: '</div></div>'.
     ]
-    side: label selectors: sels on: html [
+    side: label selectors: sels behavior: behavior on: html [
         "A side (instance/class) whose children are its selectors, rendered
-         open; each selector is itself a collapsible node whose body is an
-         empty `<pre>` tagged with the (class, side, selector) — the GUI worker
-         / headless renderer fill it from image_store (the source of truth for
-         method text — the running VM keeps no source). No source available
-         (a .mst-booted VM with no image) just leaves it blank."
+         open; each selector is a collapsible node. A NORMAL method's body is
+         the editable source box; a PRIMITIVE method's body is a read-only note
+         (its implementation is VM C code, not Smalltalk source you can edit)."
         html raw: '<div class="st-node open"><span class="st-header st-side">'.
         html raw: '<span class="st-tw" data-tw>&#9662; </span>'.
         html escaped: label.
         html raw: ' side ('.
         html raw: sels size printString.
         html raw: ')</span><div class="st-children">'.
-        sels do: [ :sel |
+        sels do: [ :sel | | prim |
+            prim := ClassMirror primitiveOf: behavior selector: sel.
             html raw: '<div class="st-node closed"><span class="st-header st-selector">'.
             html raw: '<span class="st-tw" data-tw>&#9656; </span>'.
             html escaped: sel asString.
+            prim = 0 ifFalse: [ html raw: ' <span class="st-prim-badge">primitive</span>' ].
             html raw: '</span><div class="st-children" style="display:none">'.
-            "An editable, syntax-coloured source box: the class browser's own
-             overlay editor (a transparent .st-code-input textarea over a
-             highlighted .st-code-highlight <pre>, coloured live client-side by
-             smtk.js's highlightSmalltalk — no round trip). The worker/headless
-             renderer fills the textarea from image_store; Cmd+S accepts,
-             versioning the edit back into the DB (smtk.js smapplAccept)."
-            html raw: '<div class="st-code-editor st-smappl-editor">'.
-            html raw: '<pre class="st-code-highlight" aria-hidden="true"></pre>'.
-            html raw: '<textarea class="st-smappl-src st-code-input" spellcheck="false" data-src-class="'.
-            html escaped: mirror name.
-            html raw: '" data-src-side="'.
-            html raw: label.
-            html raw: '" data-src-sel="'.
-            html escaped: sel asString.
-            html raw: '"></textarea>'.
-            html raw: '</div>'.
-            html raw: '<div class="st-smappl-hint">&#8984;S to accept (versioned)</div>'.
+            prim = 0
+                ifTrue:  [ self editorFor: sel side: label on: html ]
+                ifFalse: [ self primNote: prim on: html ].
             html raw: '</div></div>' ].
         html raw: '</div></div>'.
+    ]
+    "The editable, syntax-coloured source box: the class browser's own overlay
+     editor (a transparent .st-code-input textarea over a highlighted
+     .st-code-highlight <pre>, coloured live client-side by smtk.js's
+     highlightSmalltalk — no round trip). The worker/headless renderer fills
+     the textarea from image_store; Cmd+S accepts, versioning the edit."
+    editorFor: sel side: label on: html [
+        html raw: '<div class="st-code-editor st-smappl-editor">'.
+        html raw: '<pre class="st-code-highlight" aria-hidden="true"></pre>'.
+        html raw: '<textarea class="st-smappl-src st-code-input" spellcheck="false" data-src-class="'.
+        html escaped: mirror name.
+        html raw: '" data-src-side="'.
+        html raw: label.
+        html raw: '" data-src-sel="'.
+        html escaped: sel asString.
+        html raw: '"></textarea>'.
+        html raw: '</div>'.
+        html raw: '<div class="st-smappl-hint">&#8984;S to accept (versioned)</div>'.
+    ]
+    "A read-only note for a primitive method (VM-implemented, not editable)."
+    primNote: prim on: html [
+        html raw: '<div class="st-prim-note">'.
+        prim < 0
+            ifTrue:  [ html raw: '&#10216;FFI primitive&#10217;' ]
+            ifFalse: [ html raw: '&#10216;primitive ', prim printString, '&#10217;' ].
+        html raw: ' — implemented in the VM, not editable.</div>'.
     ]
 ]

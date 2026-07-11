@@ -566,6 +566,41 @@ mod tests {
         assert_eq!(empty, "0", "a non-behavior has no selectors");
     }
 
+    /// `primitiveOf:selector:` (R2) distinguishes a primitive method (VM code,
+    /// shown read-only in the browser) from an ordinary Smalltalk one — and
+    /// the ClassOutliner renders the two differently.
+    #[test]
+    fn primitive_methods_render_read_only() {
+        let mut vm = boot_test_vm(JitMode::Off);
+        // Alien>>byteAt: is a table primitive; Point>>x is ordinary Smalltalk.
+        assert_ne!(
+            vm.eval("ClassMirror primitiveOf: Alien selector: #byteAt:.").unwrap(),
+            "0",
+            "byteAt: must report a primitive number"
+        );
+        assert_eq!(
+            vm.eval("ClassMirror primitiveOf: Point selector: #x.").unwrap(),
+            "0",
+            "an ordinary method has no primitive"
+        );
+        // Alien's browser shows read-only primitive notes and no editors.
+        let alien = vm
+            .render_fragment("ClassOutliner for: (ClassMirror on: Alien)")
+            .expect("render Alien");
+        assert!(
+            alien.contains("st-prim-note") && !alien.contains("st-smappl-src"),
+            "primitive methods must be read-only notes, not editors"
+        );
+        // Point's browser is all editable.
+        let point = vm
+            .render_fragment("ClassOutliner for: (ClassMirror on: Point)")
+            .expect("render Point");
+        assert!(
+            point.contains("st-smappl-src") && !point.contains("st-prim-note"),
+            "ordinary methods must be editable"
+        );
+    }
+
     /// A `visual=` shape not yet buildable (needs a later Phase-W wave — the
     /// `CodeView` substrate) surfaces as `Err`, so the GUI falls back to the
     /// G0 placeholder box rather than breaking the page.

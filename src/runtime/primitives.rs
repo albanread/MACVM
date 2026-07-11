@@ -349,6 +349,16 @@ pub static PRIMITIVES: &[PrimDesc] = &[
         can_allocate: false,
         can_fail: true,
     },
+    // R2 reflection (docs/APPS.md §3). Kept in id order — `prim_by_id`
+    // binary-searches, so the table must stay sorted.
+    PrimDesc {
+        id: 62,
+        name: "primitiveOf:selector:",
+        f: prim_primitive_of,
+        argc: 2,
+        can_allocate: false,
+        can_fail: true,
+    },
     PrimDesc {
         id: 90,
         name: "quit",
@@ -1249,6 +1259,25 @@ fn prim_selectors_of(vm: &mut VmState, args: &[Oop]) -> PrimResult {
         });
     }
     PrimResult::Ok(result.oop())
+}
+
+/// R2 reflection: the primitive number of `behavior`'s method for `selector`
+/// (`args[1]` = behavior, `args[2]` = selector Symbol). `0` = not a primitive
+/// (or the method isn't defined here); a positive id is a table primitive;
+/// `-1` (`PRIM_ID_FFI`) is an FFI primitive. Lets a tool show primitive
+/// methods read-only rather than as an editable source box.
+fn prim_primitive_of(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    let Some(behavior) = KlassOop::try_from(args[1]) else {
+        return PrimResult::Fail;
+    };
+    let Some(sel) = crate::oops::wrappers::SymbolOop::try_from(args[2]) else {
+        return PrimResult::Fail;
+    };
+    let n = match crate::oops::method_dict::MethodDictOop::try_from(behavior.methods()) {
+        Some(dict) => dict.probe(vm, sel).map(|m| m.primitive()).unwrap_or(0),
+        None => 0,
+    };
+    PrimResult::Ok(SmallInt::new(n).oop())
 }
 
 /// A behavior's own `MethodDictionary`, or `None` if it isn't a behavior or
