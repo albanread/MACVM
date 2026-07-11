@@ -31,11 +31,15 @@ pub fn render_canvas(width: u32, height: u32) -> String {
     // knowledge; any other pixel drawing is just another button/Workspace eval.
     let mandelbrot_code =
         format!("Mandelbrot new pixelsForWidth: {width} height: {height}");
+    // The libm function-plot demo (world/37_waves.mst) — the VECTOR command
+    // path (`canvasEval`), same generic transport, different pipeline.
+    let waves_code = format!("WaveChart new commandsForWidth: {width} height: {height}");
     format!(
         "<div class=\"st-canvas-view\" id=\"macvm-canvas-view\">\
          <div class=\"st-browser-action-row st-canvas-actions\">\
          <button type=\"button\" class=\"st-browser-new-button\" data-canvas-action=\"run-demo\">Run Demo</button>\
          <button type=\"button\" class=\"st-browser-new-button\" data-canvas-action=\"eval-pixels\" data-canvas-eval=\"{mandelbrot_code}\">Mandelbrot</button>\
+         <button type=\"button\" class=\"st-browser-new-button\" data-canvas-action=\"eval\" data-canvas-eval=\"{waves_code}\">Waves</button>\
          <button type=\"button\" class=\"st-browser-new-button\" data-canvas-action=\"clear\">Clear</button>\
          </div>\
          <div class=\"st-lowered st-canvas-surface\">\
@@ -62,6 +66,10 @@ mod tests {
         assert!(html.contains("data-canvas-action=\"eval-pixels\""), "{html}");
         assert!(
             html.contains("data-canvas-eval=\"Mandelbrot new pixelsForWidth: 420 height: 220\""),
+            "{html}"
+        );
+        assert!(
+            html.contains("data-canvas-eval=\"WaveChart new commandsForWidth: 420 height: 220\""),
             "{html}"
         );
         assert!(html.contains("data-canvas-action=\"clear\""), "{html}");

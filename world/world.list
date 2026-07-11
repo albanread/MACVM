@@ -49,3 +49,5 @@
 # floats' Mandelbrot demo that fills one.
 36_pixmap.mst
 35_mandelbrot.mst
+# Canvas demo: libm function plot (sin/cos/exp) via the vector command path.
+37_waves.mst

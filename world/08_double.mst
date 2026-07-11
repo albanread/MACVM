@@ -34,6 +34,24 @@ Number subclass: Double [
     ~= aNumber [
         ^(self = aNumber) not
     ]
+    sin [
+        <primitive: 121>
+    ]
+    cos [
+        <primitive: 122>
+    ]
+    tan [
+        <primitive: 123>
+    ]
+    exp [
+        <primitive: 124>
+    ]
+    ln [
+        <primitive: 125>
+    ]
+    atan [
+        <primitive: 126>
+    ]
     sqrt [
         <primitive: 106>
     ]

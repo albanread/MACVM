@@ -1,0 +1,86 @@
+"37_waves.mst — a function-plot demo for the Canvas view (docs/CANVAS.md
+ §5.2 vector path): sine, cosine, and a damped sine drawn as stroked paths.
+
+ The point of the exercise: every y value is computed in real Smalltalk
+ Double arithmetic through the new libm primitives (sin/cos/exp,
+ world/08_double.mst 121/122/124) with the surrounding maths fused to native
+ FP by the float fast-path — so a plotted curve costs one libm call per
+ point plus register arithmetic. The batch itself is the docs/CANVAS.md
+ §5.2 JSON command array, drawn by the GUI in one macvmCanvasDraw pass; the
+ Canvas view's Waves button routes it through the generic CanvasEval, whose
+ transcript line reports the compute time."
+Object subclass: WaveChart [
+    | stream w h midY amp |
+
+    WaveChart class >> new [ ^self basicNew ]
+
+    "The full command batch for a `width` x `height` chart."
+    commandsForWidth: width height: height [
+        | twoPi t y decay |
+        w := width. h := height.
+        midY := h asDouble / 2.0.
+        amp := h asDouble * 0.38.
+        twoPi := 6.283185307179586.
+        stream := WriteStream on: String new.
+        stream nextPutAll: '[["clearRect",0,0,'.
+        self putNum: w; put: ','.
+        self putNum: h; put: ']'.
+        "axes: midline + quarter gridlines"
+        self strokeStyle: 'rgba(128,128,128,0.5)' width: 1.0.
+        self lineFrom: 0.0 y: midY toX: w asDouble y: midY.
+        self strokeStyle: 'rgba(128,128,128,0.25)' width: 1.0.
+        self lineFrom: 0.0 y: midY - amp toX: w asDouble y: midY - amp.
+        self lineFrom: 0.0 y: midY + amp toX: w asDouble y: midY + amp.
+        "sin — two full periods across the width"
+        self curve: [ :x | t := x / w asDouble * twoPi * 2.0. t sin ]
+             color: 'rgb(91,157,255)'.
+        "cos"
+        self curve: [ :x | t := x / w asDouble * twoPi * 2.0. t cos ]
+             color: 'rgb(80,200,120)'.
+        "damped sine: sin(4 cycles) * e^(-x/w * 3)"
+        self curve: [ :x |
+                t := x / w asDouble * twoPi * 4.0.
+                decay := (0.0 - (x / w asDouble * 3.0)) exp.
+                t sin * decay ]
+             color: 'rgb(240,140,80)'.
+        stream nextPutAll: ']'.
+        ^stream contents
+    ]
+
+    "One stroked polyline: yFn maps pixel-x to [-1, 1]."
+    curve: yFn color: c [
+        | x y |
+        self strokeStyle: c width: 2.0.
+        stream nextPutAll: ',["beginPath"]'.
+        x := 0.0.
+        y := midY - ((yFn value: x) * amp).
+        stream nextPutAll: ',["moveTo",'.
+        self putNum: x truncated; put: ','.
+        self putNum: y truncated; put: ']'.
+        [ x < w asDouble ] whileTrue: [
+            x := x + 2.0.
+            y := midY - ((yFn value: x) * amp).
+            stream nextPutAll: ',["lineTo",'.
+            self putNum: x truncated; put: ','.
+            self putNum: y truncated; put: ']' ].
+        stream nextPutAll: ',["stroke"]'.
+    ]
+
+    strokeStyle: c width: lw [
+        stream nextPutAll: ',["strokeStyle","'.
+        stream nextPutAll: c.
+        stream nextPutAll: '"],["lineWidth",'.
+        self putNum: lw truncated; put: ']'.
+    ]
+
+    lineFrom: x0 y: y0 toX: x1 y: y1 [
+        stream nextPutAll: ',["beginPath"],["moveTo",'.
+        self putNum: x0 truncated; put: ','.
+        self putNum: y0 truncated; put: '],["lineTo",'.
+        self putNum: x1 truncated; put: ','.
+        self putNum: y1 truncated; put: '],["stroke"]'.
+    ]
+
+    putNum: n [ stream nextPutAll: n printString ]
+    put: aString [ stream nextPutAll: aString ]
+]

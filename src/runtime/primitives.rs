@@ -628,6 +628,59 @@ pub static PRIMITIVES: &[PrimDesc] = &[
         can_allocate: true,
         can_fail: true,
     },
+    // ── libm transcendentals (float fast-path companions): unary Double
+    //    receivers, exactly `sqrt`(106)'s shape — the shim makes them
+    //    compiled-callable, and the surrounding arithmetic fuses to native
+    //    FP, so a plotted curve is one libm call per point plus register
+    //    maths. ──────────────────────────────────────────────────────────
+    PrimDesc {
+        id: 121,
+        name: "sin",
+        f: prim_double_sin,
+        argc: 0,
+        can_allocate: true,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 122,
+        name: "cos",
+        f: prim_double_cos,
+        argc: 0,
+        can_allocate: true,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 123,
+        name: "tan",
+        f: prim_double_tan,
+        argc: 0,
+        can_allocate: true,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 124,
+        name: "exp",
+        f: prim_double_exp,
+        argc: 0,
+        can_allocate: true,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 125,
+        name: "ln",
+        f: prim_double_ln,
+        argc: 0,
+        can_allocate: true,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 126,
+        name: "atan",
+        f: prim_double_atan,
+        argc: 0,
+        can_allocate: true,
+        can_fail: true,
+    },
 ];
 
 pub fn prim_by_id(id: u16) -> Option<&'static PrimDesc> {
@@ -1511,6 +1564,28 @@ fn prim_double_eq(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     }
 }
 
+/// libm transcendentals — one shape, six functions: unbox the Double
+/// receiver, call the (state-preserving, AAPCS64) libm routine via Rust's
+/// f64 methods, box the result. Fails only on a non-Double receiver.
+macro_rules! prim_double_unary {
+    ($name:ident, $method:ident) => {
+        fn $name(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+            match crate::oops::wrappers::DoubleOop::try_from(args[0]) {
+                Some(a) => {
+                    PrimResult::Ok(alloc::alloc_double(vm, a.value().$method()).oop())
+                }
+                None => PrimResult::Fail,
+            }
+        }
+    };
+}
+prim_double_unary!(prim_double_sin, sin);
+prim_double_unary!(prim_double_cos, cos);
+prim_double_unary!(prim_double_tan, tan);
+prim_double_unary!(prim_double_exp, exp);
+prim_double_unary!(prim_double_ln, ln);
+prim_double_unary!(prim_double_atan, atan);
+
 fn prim_double_sqrt(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     match crate::oops::wrappers::DoubleOop::try_from(args[0]) {
         Some(a) => PrimResult::Ok(alloc::alloc_double(vm, a.value().sqrt()).oop()),
@@ -1684,6 +1759,12 @@ mod tests {
             (118, "size"),
             (119, "new:"),
             (120, "forAddress:size:"),
+            (121, "sin"),
+            (122, "cos"),
+            (123, "tan"),
+            (124, "exp"),
+            (125, "ln"),
+            (126, "atan"),
         ];
         assert_eq!(
             PRIMITIVES.len(),
