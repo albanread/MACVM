@@ -464,3 +464,30 @@ compiles inherit the key's version (MAX_VERSIONS accumulates across re-arms).
 - Remaining from the design: step 6's gate-s24-l2 justfile recipe + debug
   transfer-buffer verifier (hardening, deferred); B1/B3 (inputsKnown:) is
   the next deltablue-tail item.
+
+## S24 B5 — multi-BB block splicing + B3 self-devirt (b587e8e … f4953c1)
+
+2026-07-11. The payoff layer: conditional-NLR blocks (branch + `^` in one arm)
+now splice at direct value sends AND at block-arg sites, and self-receiver
+block-arg sends devirtualize per the customization klass so the flagship
+`self inputsDo: [...]` shape (Poly IC) compiles.
+
+| benchmark | interp (ms) | jit t=200 | best/interp |
+|---|---|---|---|
+| deltablue | 214 | **4** | **53.5x** |
+| richards | 204 | 6-7 | ~30x (held) |
+| ctxloop | 134 | 1 | 134x (held) |
+
+- Arc: A1 5.3x → L1 19.5x → L2 30.6x → B5 step 5b 42.8x (5ms) → B3 53.5x (4ms).
+- Step 5b closed a pre-existing deopt-materializer stale-read hazard (allocations
+  reordered behind all dead-frame reads via a deferred fixup phase) and a
+  recompile deopt-storm (snapshot_profile now recurses into grafted blocks).
+- B3: AV::Slf narrow self-provenance in escape ≡ convert's receiver==self_vreg;
+  the resolution mode rides in the map so both passes resolve one callee; a
+  klass-sensitive NoPermanent maps to NoRetryLater (never poisons the shared
+  method's method-wide compile_disabled bit). Guard-free splice, lookup-shaped
+  inline dep on (rcvr_klass, selector).
+- deltablue interpreted tail: inputsKnown: (14.6%) left the interpreted-tail
+  list; makePlan:/chainTest:/projectionTest: (loop-driver bodies) now dominate.
+- Gate every step: world byte-identical off vs {t=1,t=200} + GC_STRESS=1/full:64
+  + DEOPT_STRESS=64; full lib+integration suites; clippy+fmt.
