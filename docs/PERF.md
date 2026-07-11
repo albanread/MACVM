@@ -491,3 +491,36 @@ block-arg sends devirtualize per the customization klass so the flagship
   list; makePlan:/chainTest:/projectionTest: (loop-driver bodies) now dominate.
 - Gate every step: world byte-identical off vs {t=1,t=200} + GC_STRESS=1/full:64
   + DEOPT_STRESS=64; full lib+integration suites; clippy+fmt.
+
+## S24 — OSR cold-send provenance: no Untaken→Trap under OSR (sieve 90ms→9ms)
+
+2026-07-11. Debugger-driven (DBG_IR ladder) root-cause of the sieve deopt-thrash
+found via the JIT-coverage census. The three hotness signals — invocation
+counter, loop counter, OSR — OR together to TRIGGER a compile (trigger
+unification, L2 step 2), but each certifies a different region as profiled:
+the invocation signal the whole body, the loop/OSR signal only the loop's
+executed part. The S14-step-3 `Untaken→Trap` speculation assumed whole-body
+coverage but fired under loop/OSR provenance too, so a not-yet-reached send
+(cold IC only because the OSR-entered loop hadn't exited yet) was trapped and
+deopted the instant the loop exited — an endless OSR-compile→trap→interpret
+cycle. Fix: `convert` gains `osr`; under OSR the four `decide→Trap` cold-send
+sites emit a plain `CallSend` instead (`cold_send_traps() == !osr`). "Reliable,
+not merely fast" (the Strongtalk lesson — fast-but-crashes is a demo).
+
+| bench | before | after |
+|---|---|---|
+| **sieve** ms | ~90 | **9 (~10×)** |
+| sieve deopts | 30 | **0** |
+| sieve OSR entries | 30 (re-thrash) | **1** (stays compiled) |
+| sieve JIT coverage | 4.5% | **97.1%** |
+| deltablue / richards / ctxloop | 4 / 6 / 1 | unchanged |
+
+- Whole class of "hot work lives inside loops, method called once" (OSR-only
+  methods) goes from ~5% to ~97% compiled.
+- Gate: 635 lib + 101 it_tier1 + all 16 integration suites; world differential
+  IDENTICAL off vs t=200/t=1/GC_STRESS=1/GC_STRESS=full:64/DEOPT_STRESS=64;
+  clippy+fmt clean. Adversarial review (3 lenses) SOUND — CallSend at an
+  Untaken site is the always-correct general lowering (the trap was only a
+  feedback-warming speculation); all 20 UncommonTrap sites classified, gate
+  complete; the reverse perf-cliff (cold error paths as CallSends under OSR)
+  negligible, hits no frame/spill limit.

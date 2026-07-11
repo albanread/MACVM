@@ -969,6 +969,17 @@ struct Translator<'a> {
     /// receiver, so `driver`/`rt_resolve_send` must refuse the compiled link
     /// (fall back to the c2i adapter) when this is set on the target.
     self_devirt: bool,
+    /// This is an OSR-entry compile (triggered by a loop back-edge counter,
+    /// mid-activation) rather than a normal entry-point compile (triggered
+    /// by the invocation counter). It gates [`Translator::cold_send_traps`]:
+    /// the three hotness signals (invocation / loop / OSR) OR together to
+    /// TRIGGER a compile (trigger unification, L2 step 2), but each certifies
+    /// a DIFFERENT region as profiled — the invocation signal covers the
+    /// whole body, the loop/OSR signal only the loop's executed part. An
+    /// `Untaken` (cold-IC) send is genuinely "cold" only under whole-body
+    /// coverage; under OSR it may just be not-reached-YET, so trapping it
+    /// would deopt the instant the loop exits (the sieve deopt-thrash).
+    osr: bool,
     vregs: Vec<VRegInfo>,
     pool: PoolBuilder,
     self_vreg: VReg,
@@ -2014,7 +2025,7 @@ impl<'a> Translator<'a> {
                     let inner_static_self = inner_recv == callee_self
                         && callee_self_klass
                             .is_some_and(|k| self.devirt_self_target(k, inner_sel).is_some());
-                    if !inner_static_self {
+                    if !inner_static_self && self.cold_send_traps() {
                         if let crate::compiler::inline::InlineDecision::Trap =
                             crate::compiler::inline::decide(&inner_fb)
                         {
@@ -2754,7 +2765,7 @@ impl<'a> Translator<'a> {
                         let inner_static_self = inner_recv == callee_self
                             && callee_self_klass
                                 .is_some_and(|k| self.devirt_self_target(k, inner_sel).is_some());
-                        if !inner_static_self {
+                        if !inner_static_self && self.cold_send_traps() {
                             if let crate::compiler::inline::InlineDecision::Trap =
                                 crate::compiler::inline::decide(&inner_fb)
                             {
@@ -3021,6 +3032,19 @@ impl<'a> Translator<'a> {
         self.budget_bytes_used
             .saturating_add(crate::compiler::inline::inline_cost(callee))
             > budget.total_bytes
+    }
+
+    /// Whether an `Untaken` (cold-IC) send may be speculatively lowered to a
+    /// terminating uncommon trap (S14 step 3) rather than a real `CallSend`.
+    /// True only for a whole-body-profiled compile — i.e. NOT an OSR entry.
+    /// See the `osr` field's doc: under OSR the not-yet-dispatched site is
+    /// "not reached yet", not "cold", so a trap there deopts on loop exit
+    /// (the sieve thrash — a compiled method that could never STAY compiled).
+    /// Reliability over speculation: emit the plain dispatch instead. Applies
+    /// uniformly to the four cold-send decision sites (root send, inlined
+    /// leaf/nonleaf body, block-arg in-callee graft, spliced block body).
+    fn cold_send_traps(&self) -> bool {
+        !self.osr
     }
 
     fn record_inline_dep(&mut self, klass: KlassOop, selector: SymbolOop) {
@@ -3669,7 +3693,7 @@ impl<'a> Translator<'a> {
                 // as the lazy `CallSend` below and resolves on first call.
                 let feedback =
                     crate::compiler::feedback::read_send_site(self.vm, self.method, ic, None);
-                if self_send_target.is_none() {
+                if self_send_target.is_none() && self.cold_send_traps() {
                     if let crate::compiler::inline::InlineDecision::Trap =
                         crate::compiler::inline::decide(&feedback)
                     {
@@ -4971,7 +4995,7 @@ impl<'a> Translator<'a> {
                     let inner_static_self = inner_recv == block_self
                         && block_self_klass
                             .is_some_and(|k| self.devirt_self_target(k, inner_sel).is_some());
-                    if !inner_static_self {
+                    if !inner_static_self && self.cold_send_traps() {
                         if let crate::compiler::inline::InlineDecision::Trap =
                             crate::compiler::inline::decide(&inner_fb)
                         {
@@ -5539,7 +5563,13 @@ pub(crate) fn copy_propagate(m: &mut IrMethod) {
     }
 }
 
-pub fn convert(vm: &VmState, rcvr_klass: KlassOop, method: MethodOop, cfg: &Cfg) -> IrMethod {
+pub fn convert(
+    vm: &VmState,
+    rcvr_klass: KlassOop,
+    method: MethodOop,
+    cfg: &Cfg,
+    osr: bool,
+) -> IrMethod {
     let (entry_depth, _max_stack_depth) = compute_entry_depths(method, cfg);
     let sources = entry_stack_sources(cfg, &entry_depth);
 
@@ -5661,6 +5691,7 @@ pub fn convert(vm: &VmState, rcvr_klass: KlassOop, method: MethodOop, cfg: &Cfg)
         splice_declined_budget: 0,
         rcvr_klass,
         self_devirt: false,
+        osr,
         vregs,
         pool: PoolBuilder::new(),
         self_vreg,
@@ -6343,7 +6374,7 @@ mod tests {
         // call_site, no site_feedback entry, but ONE UncommonTrap deopt site.
         {
             let cfg = decode::decode(method);
-            let ir = convert(&vm, vm.universe.smi_klass, method, &cfg);
+            let ir = convert(&vm, vm.universe.smi_klass, method, &cfg, false);
             assert_eq!(
                 ir.site_feedback.len(),
                 ir.call_sites.len(),
@@ -6371,7 +6402,7 @@ mod tests {
         let epoch = vm.ic_epoch;
         InterpreterIc::at(method, 0).set_mono(&mut vm, klass, target, epoch);
         let cfg = decode::decode(method);
-        let ir = convert(&vm, vm.universe.smi_klass, method, &cfg);
+        let ir = convert(&vm, vm.universe.smi_klass, method, &cfg, false);
         assert_eq!(
             ir.call_sites.len(),
             1,
@@ -6425,7 +6456,7 @@ mod tests {
         InterpreterIc::at(method, 0).set_mono(&mut vm, recv_klass, val, epoch);
 
         let cfg = decode::decode(method);
-        let ir = convert(&vm, vm.universe.smi_klass, method, &cfg);
+        let ir = convert(&vm, vm.universe.smi_klass, method, &cfg, false);
 
         // No CallSend for the inlined site.
         assert_eq!(ir.call_sites.len(), 0, "inlined leaf → no CallSend");
@@ -6497,7 +6528,7 @@ mod tests {
         InterpreterIc::at(method, 0).set_mono(&mut vm, smi_klass, id_method, epoch);
 
         let cfg = decode::decode(method);
-        let ir = convert(&vm, vm.universe.smi_klass, method, &cfg);
+        let ir = convert(&vm, vm.universe.smi_klass, method, &cfg, false);
         assert_eq!(ir.call_sites.len(), 0, "^self inlined, no CallSend");
         let smi_guards = ir
             .blocks
@@ -6545,7 +6576,7 @@ mod tests {
         ic.set_mono(&mut vm, smi_klass, plus_method, epoch);
 
         let cfg = decode::decode(method);
-        let ir = convert(&vm, vm.universe.smi_klass, method, &cfg);
+        let ir = convert(&vm, vm.universe.smi_klass, method, &cfg, false);
 
         let (fail, a, b_) = ir.blocks[0]
             .code
@@ -6638,7 +6669,7 @@ mod tests {
         ic.set_mono(&mut vm, smi_klass, lt_method, epoch);
 
         let cfg = decode::decode(method);
-        let ir = convert(&vm, vm.universe.smi_klass, method, &cfg);
+        let ir = convert(&vm, vm.universe.smi_klass, method, &cfg, false);
 
         let block0 = &ir.blocks[0];
         assert!(
@@ -6678,7 +6709,7 @@ mod tests {
         let method = b.finish(&mut vm, sel, 0, 0);
 
         let cfg = decode::decode(method);
-        let ir = convert(&vm, vm.universe.smi_klass, method, &cfg);
+        let ir = convert(&vm, vm.universe.smi_klass, method, &cfg, false);
 
         // Same block layout as decode::tests::leaders_if_else: 0=condition,
         // 1=true arm, 2=false arm, 3=merge.
@@ -6719,7 +6750,7 @@ mod tests {
         let method = b.finish(&mut vm, sel, 0, 0);
 
         let cfg = decode::decode(method);
-        let ir = convert(&vm, vm.universe.smi_klass, method, &cfg);
+        let ir = convert(&vm, vm.universe.smi_klass, method, &cfg, false);
 
         // 2 real blocks (push+jump, then the target) -- S11 step 7: no
         // extra synthetic block anymore unless one is actually NEEDED (a
@@ -6768,7 +6799,7 @@ mod tests {
         let method = b.finish(&mut vm, sel, 0, 1);
 
         let cfg = decode::decode(method);
-        let ir = convert(&vm, vm.universe.smi_klass, method, &cfg);
+        let ir = convert(&vm, vm.universe.smi_klass, method, &cfg, false);
 
         let stored_vreg = ir.blocks[0]
             .code

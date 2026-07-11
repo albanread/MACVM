@@ -1549,7 +1549,7 @@ fn compile_and_get_listing(vm: &VmState, method: MethodOop) -> String {
     let cfg = macvm::compiler::decode::decode(method);
     let holder = KlassOop::try_from(method.holder())
         .expect("golden methods are frontend-loaded, holder always set");
-    let ir = macvm::compiler::ir::convert(vm, holder, method, &cfg);
+    let ir = macvm::compiler::ir::convert(vm, holder, method, &cfg, false);
     let ra = regalloc::regalloc(&ir);
     let mut asm = JasmAssembler::new();
     // None: this helper predates S11's guard and backs the already-committed
@@ -3561,7 +3561,7 @@ fn allocation_fast_and_slow() {
 
     // The detection must fire: an inline Ir::Alloc, not a generic CallSend.
     let cfg = decode::decode(method);
-    let ir_method = ir::convert(&vm, vm.universe.smi_klass, method, &cfg);
+    let ir_method = ir::convert(&vm, vm.universe.smi_klass, method, &cfg, false);
     assert!(
         ir_method
             .blocks
@@ -3853,7 +3853,7 @@ fn deopt_resolve_frame_loc_from_real_regalloc() {
     InterpreterIc::at(method, 1).set_mono(&mut vm, obj_klass, baz_target, epoch);
 
     let cfg = decode::decode(method);
-    let ir = ir::convert(&vm, vm.universe.smi_klass, method, &cfg);
+    let ir = ir::convert(&vm, vm.universe.smi_klass, method, &cfg, false);
     let ra = regalloc::regalloc(&ir);
 
     assert!(
@@ -5181,7 +5181,7 @@ fn convert_nonfused_boolbr_into_merge() {
         "branchy boolean-temp method is eligible"
     );
     let cfg = decode::decode(m);
-    let ir = macvm::compiler::ir::convert(&vm, vm.universe.smi_klass, m, &cfg);
+    let ir = macvm::compiler::ir::convert(&vm, vm.universe.smi_klass, m, &cfg, false);
     assert!(!ir.blocks.is_empty());
 
     // And the differential: interp vs compiled, both polarities.
@@ -6159,7 +6159,7 @@ fn self_send_devirt_inlines_guard_free() {
 
     // No GuardKlass anywhere in the IR (the entry guard is the only check).
     let cfg = decode::decode(m);
-    let ir = macvm::compiler::ir::convert(&vm, k, m, &cfg);
+    let ir = macvm::compiler::ir::convert(&vm, k, m, &cfg, false);
     for blk in &ir.blocks {
         for op in &blk.code {
             assert!(
@@ -6573,7 +6573,7 @@ fn inlined_trap_deopt_restores_nonempty_pending_stack() {
     // Structural pin: the spliced `next` body's in-body trap must carry a
     // NON-empty caller pending stack — the shape this regression is about.
     let cfg = decode::decode(btw_m);
-    let ir = macvm::compiler::ir::convert(&vm, k, btw_m, &cfg);
+    let ir = macvm::compiler::ir::convert(&vm, k, btw_m, &cfg, false);
     let has_nonempty_pending = ir.blocks.iter().any(|b| {
         b.deopt_sites.iter().any(|d| {
             d.1.inline
@@ -6921,15 +6921,20 @@ fn trigger_unification_routes_subthreshold_calls_into_osr_earned_nmethod() {
     assert_eq!(vm.stats.osr_entries, 1, "no second OSR needed or taken");
 }
 
-/// S15 step 5 (A5) — the OSR x deopt round trip: the activation goes
-/// interpreted -> OSR-compiled -> (uncommon trap mid-loop) -> interpreted,
-/// and nobody upstream can tell. The loop's body contains a branch UNTAKEN
-/// during the first 10k backedges (so the OSR compile lowers its send to a
-/// cold trap) that becomes TAKEN later — firing the trap INSIDE the OSR
-/// frame. S13 materializes the mid-loop interpreter frame from the OSR
-/// frame's ordinary scope descs and the nested run finishes the loop.
+/// S24 (OSR cold-send provenance): an OSR compile must NOT lower a
+/// not-yet-dispatched send to a cold trap. The loop's body has a branch
+/// UNTAKEN during the first 10k backedges — its `poke` send is `Empty` at
+/// OSR-compile time — that becomes TAKEN later. This USED to lower the send
+/// to an Untaken trap, so the OSR frame deopted the instant the branch was
+/// first taken (the sieve deopt-thrash in miniature). Now, because the
+/// compile is OSR (loop-signal provenance, not whole-body coverage), the
+/// cold send compiles as a plain `CallSend`: the newly-taken branch runs
+/// IN COMPILED CODE, the frame stays compiled, and NO deopt fires. Result
+/// is identical; the mechanism is "reliable, not merely fast". (OSR×deopt
+/// round-trip via a SOUND trigger — invalidation — is covered by the
+/// `osr_phase_*_deopt_stress` subprocess rows.)
 #[test]
-fn osr_frame_deopts_mid_loop_and_finishes_interpreted() {
+fn osr_frame_stays_compiled_across_newly_taken_cold_branch() {
     let mut vm = loop_test_vm();
     let smi_klass = vm.universe.smi_klass;
     let lt_sel = vm.universe.intern(b"<");
@@ -6987,9 +6992,11 @@ fn osr_frame_deopts_mid_loop_and_finishes_interpreted() {
     let method = b.finish(&mut vm, m_sel, 1, 2);
     install_method(&mut vm, smi_klass, m_sel, method);
 
-    // n=16_000: OSR at backedge 10_000 (branch still untaken -> the trap IS
-    // in the compiled loop); the branch turns true at i=15_001 -> trap ->
-    // deopt -> the rest runs interpreted. s counts the taken iterations.
+    // n=16_000: OSR at backedge 10_000 (the `i>15000` branch still untaken,
+    // so `self poke` is Empty -> the OLD compiler lowered it to a trap in
+    // the compiled loop). The branch turns true at i=15_001; under the fix
+    // the compiled loop just CALLS poke there — no deopt. s counts the taken
+    // iterations.
     let n = 16_000i64;
     let expected = n - 15_001; // i = 15_001 .. 15_999
     let recv = SmallInt::new(0).oop();
@@ -6998,12 +7005,14 @@ fn osr_frame_deopts_mid_loop_and_finishes_interpreted() {
     assert_eq!(
         SmallInt::try_from(result).map(|s| s.value()),
         Some(expected),
-        "interpreted -> OSR-compiled -> deopt -> interpreted must be seamless"
+        "the OSR-compiled loop must produce the right sum with the branch \
+         taken in compiled code"
     );
     assert_eq!(vm.stats.osr_entries, 1, "the loop OSR'd once");
-    assert!(
-        vm.stats.deopt_count > deopts_before,
-        "the cold branch's trap fired INSIDE the OSR frame"
+    assert_eq!(
+        vm.stats.deopt_count, deopts_before,
+        "the newly-taken cold branch must NOT deopt — the OSR frame stays \
+         compiled (S24 cold-send provenance: no Untaken trap under OSR)"
     );
 }
 
