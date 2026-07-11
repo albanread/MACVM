@@ -261,13 +261,16 @@ Each is a NEON streaming loop: `ld1 {v.4s}, [pa], #16` / `ld1 {v2.4s}, [pb], #16
 tail for the non-multiple remainder.
 
 **Two ways to get there, staged:**
-- **(v2) hand-written NEON primitives — SHIPPED (`1f23ba7`).** `+@` (elementwise
-  add), `sum`, `dot:` as explicit `core::arch::aarch64` intrinsic kernels in
+- **(v2) hand-written NEON primitives — SHIPPED (`1f23ba7`, `82a45e3`).** `+@`
+  (elementwise add), `scale:` (elementwise ×scalar), `sum`, `dot:`, `max`, `min`
+  as explicit `core::arch::aarch64` intrinsic kernels in
   `src/runtime/simd_kernels.rs` (a `float64x2_t` stream + a scalar tail; the one
   `runtime` module that opts back into `unsafe`). Explicit intrinsics on
   purpose — a bulk kernel drives the silicon deliberately, NOT a scalar loop
   left to rustc/LLVM to maybe vectorize. The whole loop is one primitive call,
   so the interpreter and the JIT (which shims the primitive) run identical code.
+  `max`/`min` are order-independent (bit-exact); the FP `sum`/`dot:` use the
+  defined fast pairwise order (Part D).
 - **(research) JIT auto-vectorization** of a Smalltalk `1 to: n do:` loop:
   dependence analysis, alignment/tail handling, lane masking. Much harder, a
   separate arc — and note OUR JIT does not auto-vectorize today, so this is net-
