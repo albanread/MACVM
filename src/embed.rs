@@ -708,6 +708,45 @@ mod tests {
         );
     }
 
+    /// Float fast-path deopt-sunk boxing (`docs/float_fastpath_design.md`):
+    /// an intermediate `FBox` pinned only by a later fused op's reexecute
+    /// stack moves into that op's fail block. If the later op deopts (a
+    /// non-Double ARG — the IC only guards receivers), the interpreter
+    /// re-executes the send and must see the CORRECT boxed intermediate,
+    /// built by the sunk box on the cold path. Wrong bits here would be a
+    /// silent wrong answer, so this pins the exact fallback values.
+    #[test]
+    fn float_fuse_deopt_reboxes_sunk_intermediates_correctly() {
+        let mut vm = boot_test_vm(JitMode::Threshold(10));
+        vm.exec(
+            "Object subclass: FSinkT [ mix: a with: b plus: c [ ^a * b + c ] \
+             chain: a with: b [ ^2.0 * a * b + 0.5 ] ]",
+        )
+        .expect("class definition");
+        // Warm the fused sites mono-Double, past the threshold.
+        vm.exec(
+            "[ | f | f := FSinkT new. 1 to: 500 do: [ :i | \
+             f mix: 3.5 with: 2.0 plus: 1.25. f chain: 1.5 with: 0.25 ] ] value.",
+        )
+        .expect("warmup");
+        // The + arg-unbox fails: reexec needs the sunk box of 3.5*2.0 = 7.0.
+        assert_eq!(
+            vm.eval("FSinkT new mix: 3.5 with: 2.0 plus: 1").expect("mixed"),
+            "8.0"
+        );
+        // Mid-chain deopt: the second * fails; its reexec stack holds the
+        // sunk box of 2.0*1.5 = 3.0 → 3.0*2 = 6.0 (int fallback) + 0.5.
+        assert_eq!(
+            vm.eval("FSinkT new chain: 1.5 with: 2").expect("chained"),
+            "6.5"
+        );
+        // And the pure-Double path still answers exactly.
+        assert_eq!(
+            vm.eval("FSinkT new mix: 3.5 with: 2.0 plus: 1.25").expect("pure"),
+            "8.25"
+        );
+    }
+
     /// A `visual=` that returns a `Glue` spacer (the side-effecting shape,
     /// gui/smappl.md §3 shape 6) renders to an invisible fixed-width span.
     #[test]

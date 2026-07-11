@@ -5867,6 +5867,112 @@ pub(crate) fn reduce_float_boxes(m: &mut IrMethod) {
         }
     }
 
+    // ── Rule 3a: deopt-sunk boxing. An intermediate FBox whose boxed
+    // result is referenced ONLY by trap-only fail blocks' reexecute
+    // metadata (a LATER fused op's DeoptRaw.stack — the interpreter needs
+    // the real boxed Double if that op deopts) moves INTO those fail
+    // blocks: the box executes only when a deopt actually happens, and the
+    // hot path allocates nothing for it. No new deopt machinery — the
+    // DeoptRaw still names an ordinary boxed oop vreg; its def just lives
+    // in the cold block now, and the existing deopt-live spill discipline
+    // covers it at the trap. Conservative gates: zero op uses, zero
+    // entry-stack uses (a cross-block operand-stack value stays boxed), and
+    // every referencing block is exactly `[UncommonTrap]`. ────────────────
+    {
+        let nv = m.vregs.len();
+        let mut op_used = vec![false; nv];
+        let mut entry_used = vec![false; nv];
+        // vreg → referencing block indices (deopt metadata only).
+        let mut deopt_refs: Vec<Vec<usize>> = vec![Vec::new(); nv];
+        for (bi, b) in m.blocks.iter().enumerate() {
+            for op in &b.code {
+                op.uses(|v| op_used[v.0 as usize] = true);
+            }
+            for v in &b.entry_stack {
+                entry_used[v.0 as usize] = true;
+            }
+            for (_, raw) in &b.deopt_sites {
+                for v in &raw.stack {
+                    deopt_refs[v.0 as usize].push(bi);
+                }
+                let mut lvl = raw.inline.as_ref();
+                while let Some(site) = lvl {
+                    deopt_refs[site.receiver.0 as usize].push(bi);
+                    for v in &site.slots {
+                        deopt_refs[v.0 as usize].push(bi);
+                    }
+                    for v in &site.caller_pending_stack {
+                        deopt_refs[v.0 as usize].push(bi);
+                    }
+                    lvl = site.parent.as_deref();
+                }
+            }
+        }
+        let trap_only: Vec<bool> = m
+            .blocks
+            .iter()
+            .map(|b| b.code.len() == 1 && matches!(b.code[0], Ir::UncommonTrap { .. }))
+            .collect();
+
+        // Collect (home block, op index, target blocks, op clone) first;
+        // mutate after — insertions into fail blocks must not disturb the
+        // scan, and a home block's own indices re-key on deletion.
+        let mut deletions: Vec<Vec<usize>> = vec![Vec::new(); m.blocks.len()];
+        let mut insertions: Vec<Vec<Ir>> = (0..m.blocks.len()).map(|_| Vec::new()).collect();
+        for (bi, b) in m.blocks.iter().enumerate() {
+            for (i, op) in b.code.iter().enumerate() {
+                let Ir::FBox { dst, src } = op else { continue };
+                let d = dst.0 as usize;
+                if op_used[d] || entry_used[d] || deopt_refs[d].is_empty() {
+                    continue;
+                }
+                if !deopt_refs[d].iter().all(|&t| trap_only[t] && t != bi) {
+                    continue;
+                }
+                deletions[bi].push(i);
+                let mut targets = deopt_refs[d].clone();
+                targets.sort_unstable();
+                targets.dedup();
+                for t in targets {
+                    insertions[t].push(Ir::FBox { dst: *dst, src: *src });
+                }
+            }
+        }
+        for (bi, b) in m.blocks.iter_mut().enumerate() {
+            if !deletions[bi].is_empty() {
+                let dels = &deletions[bi];
+                let mut removed_before: Vec<u32> = vec![0; b.code.len() + 1];
+                let mut removed = 0u32;
+                for i in 0..b.code.len() {
+                    removed_before[i] = removed;
+                    if dels.contains(&i) {
+                        removed += 1;
+                    }
+                }
+                removed_before[b.code.len()] = removed;
+                let mut idx = 0usize;
+                b.code.retain(|_| {
+                    let keep = !dels.contains(&idx);
+                    idx += 1;
+                    keep
+                });
+                for (ci, _) in b.deopt_sites.iter_mut() {
+                    *ci -= removed_before[*ci as usize];
+                }
+            }
+            let ins = std::mem::take(&mut insertions[bi]);
+            if !ins.is_empty() {
+                let k = ins.len() as u32;
+                for (ci, _) in b.deopt_sites.iter_mut() {
+                    *ci += k;
+                }
+                for (j, op) in ins.into_iter().enumerate() {
+                    b.code.insert(j, op);
+                }
+            }
+        }
+    }
+
     // ── Rule 3: whole-method use census, then delete unused FBoxes. ─────
     let n = m.vregs.len();
     let mut used = vec![false; n];
