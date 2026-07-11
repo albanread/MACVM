@@ -60,6 +60,22 @@ impl Theme {
         Theme::AltoMono,
     ];
 
+    /// Parse a CLI theme name (case-insensitive, dashes optional) — used by
+    /// the headless `macvm-gui render` "eyes" command.
+    pub fn from_cli_name(name: &str) -> Option<Theme> {
+        let key: String = name.chars().filter(|c| *c != '-' && *c != '_').flat_map(|c| c.to_lowercase()).collect();
+        Theme::ALL.into_iter().find(|t| {
+            let label: String = t.menu_label().chars().filter(|c| *c != '-' && *c != ' ').flat_map(|c| c.to_lowercase()).collect();
+            label == key
+        })
+    }
+
+    /// Absolute path to this theme's stylesheet file (for inlining it into a
+    /// self-contained headless render).
+    pub fn stylesheet_path(self) -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(self.stylesheet_relative_path())
+    }
+
     /// Native Theme-menu label.
     pub fn menu_label(self) -> &'static str {
         match self {
@@ -125,6 +141,68 @@ pub fn rewrite_smappl_icons(html: &str, theme: Theme) -> String {
         rest = &rest[val_start + q + 1..];
     }
     out
+}
+
+/// Reverse of [`html_escape_attr`] — turn an escaped `data-code` attribute
+/// value back into the raw Smalltalk source. `&amp;` is undone last so a
+/// literal `&lt;` in the source round-trips correctly.
+fn unescape_attr(s: &str) -> String {
+    s.replace("&quot;", "\"")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+}
+
+/// Resolve every smappl placeholder span (from [`rewrite_smappl_placeholders`])
+/// in `html` to its rendered widget fragment, the way the live GUI does
+/// asynchronously — but synchronously, for the headless renderer (`macvm-gui
+/// render`, the offline "eyes" on a page). `render(code)` evaluates one
+/// `visual=` expression (`VmHandle::render_fragment`); `None` (an unbuildable
+/// shape) leaves the placeholder box in place, exactly the live fallback.
+/// Icon `data-icon` names are themed via [`rewrite_smappl_icons`].
+pub fn resolve_smappl_spans(
+    html: &str,
+    theme: Theme,
+    mut render: impl FnMut(&str) -> Option<String>,
+) -> String {
+    const OPEN: &str = "<span class=\"smappl\" data-widget-id=\"";
+    let mut out = String::with_capacity(html.len());
+    let mut rest = html;
+    loop {
+        let Some(pos) = rest.find(OPEN) else {
+            out.push_str(rest);
+            break;
+        };
+        let Some(tag_end_rel) = rest[pos..].find('>') else {
+            out.push_str(rest);
+            break;
+        };
+        let after_open = pos + tag_end_rel + 1;
+        let Some(close_rel) = rest[after_open..].find("</span>") else {
+            out.push_str(rest);
+            break;
+        };
+        let span_end = after_open + close_rel + "</span>".len();
+        let opening_tag = &rest[pos..after_open];
+
+        out.push_str(&rest[..pos]);
+        let code = attr_value(opening_tag, "data-code").as_deref().map(unescape_attr);
+        let replaced = match code.as_deref().and_then(&mut render) {
+            Some(frag) => rewrite_smappl_icons(&frag, theme),
+            None => rest[pos..span_end].to_string(), // leave the placeholder box
+        };
+        out.push_str(&replaced);
+        rest = &rest[span_end..];
+    }
+    out
+}
+
+/// Value of `name="..."` within a single tag, or `None` if absent.
+fn attr_value(tag: &str, name: &str) -> Option<String> {
+    let needle = format!("{name}=\"");
+    let start = tag.find(&needle)? + needle.len();
+    let len = tag[start..].find('"')?;
+    Some(tag[start..start + len].to_string())
 }
 
 /// Absolute `file://` URL for a path under the `gui/` crate root
@@ -464,6 +542,49 @@ mod tests {
             !out.contains('\n'),
             "collapsed whitespace should have no newlines: {out}"
         );
+    }
+
+    #[test]
+    fn resolve_smappl_spans_swaps_rendered_and_keeps_placeholder_on_none() {
+        // Two placeholder spans (as rewrite_smappl_placeholders emits them).
+        let html = "before \
+            <span class=\"smappl\" data-widget-id=\"s0\" data-code=\"Glue xRigid: 4\">Glue xRigid: 4</span> \
+            mid \
+            <span class=\"smappl\" data-widget-id=\"s1\" data-code=\"CodeView forString\">CodeView forString</span> \
+            after";
+        let out = resolve_smappl_spans(&html, Theme::Classic, |code| {
+            if code.starts_with("Glue") {
+                Some("<span class=\"glue\"></span>".to_string())
+            } else {
+                None // unbuildable → leave the placeholder
+            }
+        });
+        assert!(out.contains("<span class=\"glue\"></span>"), "rendered span swapped in: {out}");
+        assert!(
+            out.contains("data-code=\"CodeView forString\""),
+            "the None (unbuildable) span keeps its placeholder: {out}"
+        );
+        assert!(out.starts_with("before ") && out.ends_with(" after"), "surrounding text intact: {out}");
+    }
+
+    #[test]
+    fn resolve_smappl_spans_unescapes_data_code_for_the_renderer() {
+        // A code value with an escaped char must reach the renderer raw.
+        let html = r#"<span class="smappl" data-widget-id="s0" data-code="a &lt; b">x</span>"#;
+        let mut seen = String::new();
+        let _ = resolve_smappl_spans(html, Theme::Classic, |code| {
+            seen = code.to_string();
+            Some(String::new())
+        });
+        assert_eq!(seen, "a < b", "data-code must be HTML-unescaped for the VM");
+    }
+
+    #[test]
+    fn theme_from_cli_name_is_case_and_dash_insensitive() {
+        assert_eq!(Theme::from_cli_name("classic"), Some(Theme::Classic));
+        assert_eq!(Theme::from_cli_name("Hi-Def"), Some(Theme::HiDef));
+        assert_eq!(Theme::from_cli_name("crtamber"), Some(Theme::CrtAmber));
+        assert_eq!(Theme::from_cli_name("nonsense"), None);
     }
 
     #[test]

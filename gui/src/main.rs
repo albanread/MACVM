@@ -219,6 +219,96 @@ fn macvm_help_index() -> PathBuf {
 /// read access to the whole `gui/` root covers the rendered file, the
 /// original page's own directory (so *its* relative links/images keep
 /// resolving), and `assets/`/`reference/icons-png/` in one grant.
+/// `macvm-gui render <page.html> [--theme NAME] [--world DIR] [-o OUT]` — the
+/// headless "eyes" command. Runs the full page pipeline (preprocess + real-VM
+/// smappl resolution + icon theming) with NO Cocoa window, inlines the theme
+/// CSS so the output is self-contained, and writes it (default:
+/// `gui/.rendered/headless.html`). View it in a browser to see exactly what a
+/// corpus page renders as — the offline substitute for driving the native
+/// WKWebView (which this objc bridge can't snapshot: no block ABI for
+/// `takeSnapshotWithConfiguration:`).
+fn cmd_render(args: &[String]) {
+    let mut page: Option<PathBuf> = None;
+    let mut theme = preprocess::Theme::Classic;
+    let mut world_dir = PathBuf::from("world");
+    let mut out: Option<PathBuf> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--theme" => {
+                i += 1;
+                theme = args
+                    .get(i)
+                    .and_then(|n| preprocess::Theme::from_cli_name(n))
+                    .unwrap_or(preprocess::Theme::Classic);
+            }
+            "--world" => {
+                i += 1;
+                if let Some(d) = args.get(i) {
+                    world_dir = PathBuf::from(d);
+                }
+            }
+            "-o" | "--out" => {
+                i += 1;
+                out = args.get(i).map(PathBuf::from);
+            }
+            other if page.is_none() => page = Some(PathBuf::from(other)),
+            _ => {}
+        }
+        i += 1;
+    }
+    let Some(page) = page else {
+        eprintln!("usage: macvm-gui render <page.html> [--theme NAME] [--world DIR] [-o OUT]");
+        std::process::exit(2);
+    };
+
+    let chromed = match preprocess::load_and_preprocess(&page, theme, 100, "Ready") {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("render: cannot read {}: {e}", page.display());
+            std::process::exit(1);
+        }
+    };
+
+    let mut vm = match macvm::embed::VmHandle::boot(macvm::runtime::VmOptions::default(), &world_dir)
+    {
+        Ok(vm) => vm,
+        Err(e) => {
+            eprintln!("render: VM boot failed: {e:?}");
+            std::process::exit(1);
+        }
+    };
+    // One-shot CLI on the main thread: a genuinely-fatal render should exit
+    // the process cleanly rather than pthread_exit the main thread.
+    macvm::embed::set_fatal_mode(macvm::embed::FatalMode::ExitProcess);
+
+    let resolved =
+        preprocess::resolve_smappl_spans(&chromed, theme, |code| vm.render_fragment(code).ok());
+
+    // Inline the theme CSS so the file renders self-contained (the chrome's
+    // own `file://` stylesheet link won't resolve when served over http).
+    let css = std::fs::read_to_string(theme.stylesheet_path()).unwrap_or_default();
+    let style = format!("<style>{css}</style>");
+    let self_contained = if resolved.contains("</head>") {
+        resolved.replacen("</head>", &format!("{style}</head>"), 1)
+    } else {
+        format!("{style}{resolved}")
+    };
+
+    let out = out.unwrap_or_else(|| {
+        let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        p.push(".rendered");
+        std::fs::create_dir_all(&p).ok();
+        p.push("headless.html");
+        p
+    });
+    if let Err(e) = std::fs::write(&out, self_contained) {
+        eprintln!("render: cannot write {}: {e}", out.display());
+        std::process::exit(1);
+    }
+    println!("{}", out.display());
+}
+
 fn navigate_to(path: &Path) {
     if path == browser_view_marker() {
         // Back/forward/refresh landing back on the browser marker: NAV
@@ -1235,6 +1325,15 @@ fn build_window_and_webview() {
 }
 
 fn main() {
+    // Headless "eyes" command — render a page (with all smappls resolved by a
+    // real VM) to self-contained HTML, no Cocoa window. Guarded before
+    // `objc::bootstrap()` so it runs anywhere, not just a windowing session.
+    let cli: Vec<String> = std::env::args().skip(1).collect();
+    if cli.first().map(String::as_str) == Some("render") {
+        cmd_render(&cli[1..]);
+        return;
+    }
+
     objc::bootstrap();
 
     let start = start_page();
