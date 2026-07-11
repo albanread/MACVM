@@ -63,7 +63,7 @@ allocating. See [`docs/PERF.md`](docs/PERF.md) for the arc and methodology.
   both running **under live, moving compiled frames** via precise oop-maps and a
   mixed-tier frame walker.
 - **Interpreter** — a simple dispatch-based bytecode baseline tier (a
-  fetch-decode-`match` loop, not Forth-style threaded code) with inline caches.
+  fetch-decode-`match` loop) with inline caches.
 - **Tier-1 optimizing JIT** — a vendored pure-Rust AArch64 encoder (JASM) behind
   the `Assembler` trait; PICs and type feedback; method + block inlining;
   per-klass **customization** with self-send and block-arg **devirtualization**;
