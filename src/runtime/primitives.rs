@@ -360,6 +360,14 @@ pub static PRIMITIVES: &[PrimDesc] = &[
         can_fail: true,
     },
     PrimDesc {
+        id: 63,
+        name: "methodSends:selector:target:",
+        f: prim_method_sends,
+        argc: 3,
+        can_allocate: false,
+        can_fail: true,
+    },
+    PrimDesc {
         id: 90,
         name: "quit",
         f: prim_quit,
@@ -1278,6 +1286,42 @@ fn prim_primitive_of(vm: &mut VmState, args: &[Oop]) -> PrimResult {
         None => 0,
     };
     PrimResult::Ok(SmallInt::new(n).oop())
+}
+
+/// R2 reflection (senders): does `behavior`'s method for `msel` (`args[2]`)
+/// SEND `target` (`args[3]`)? Scans the method's inline-cache side table
+/// (`ics`, one stride-`IC_STRIDE` slot per send site, the selector at
+/// `IC_SEL_OFFSET`) — selectors are interned, so an identity compare suffices.
+/// `false` if the method is undefined here. (Sends inlined by the compiler —
+/// `ifTrue:` etc. — have no IC and so aren't counted, same limit Strongtalk's
+/// own senders had.)
+fn prim_method_sends(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    use crate::oops::layout::{IC_SEL_OFFSET, IC_STRIDE};
+    let Some(behavior) = KlassOop::try_from(args[1]) else {
+        return PrimResult::Fail;
+    };
+    let Some(msel) = crate::oops::wrappers::SymbolOop::try_from(args[2]) else {
+        return PrimResult::Fail;
+    };
+    let Some(target) = crate::oops::wrappers::SymbolOop::try_from(args[3]) else {
+        return PrimResult::Fail;
+    };
+    let m = match crate::oops::method_dict::MethodDictOop::try_from(behavior.methods()) {
+        Some(dict) => dict.probe(vm, msel),
+        None => None,
+    };
+    let Some(m) = m else {
+        return PrimResult::Ok(vm.universe.false_obj);
+    };
+    let ics = m.ics();
+    let target_bits = target.oop().raw();
+    let sites = ics.len() / IC_STRIDE;
+    for i in 0..sites {
+        if ics.at(i * IC_STRIDE + IC_SEL_OFFSET).raw() == target_bits {
+            return PrimResult::Ok(vm.universe.true_obj);
+        }
+    }
+    PrimResult::Ok(vm.universe.false_obj)
 }
 
 /// A behavior's own `MethodDictionary`, or `None` if it isn't a behavior or

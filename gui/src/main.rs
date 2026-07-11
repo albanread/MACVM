@@ -764,6 +764,7 @@ extern "C" fn on_script_message(_this: Id, _cmd: Sel, _controller: Id, message: 
                 }
                 "userHierarchy" => open_class_outliner(),
                 "implementors" => open_find("implementors"),
+                "senders" => open_find("senders"),
                 "hierarchy" => open_class_browser(),
                 "workspace" => open_workspace(),
                 "canvas" => open_canvas(),

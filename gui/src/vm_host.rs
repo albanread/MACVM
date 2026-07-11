@@ -2120,6 +2120,35 @@ mod tests {
         );
     }
 
+    /// The Senders find tool lists methods that SEND the selector (an IC-table
+    /// scan) — Object>>printString sends printOn:.
+    #[test]
+    fn find_senders_lists_methods_that_send_the_selector() {
+        OPEN_OUTLINERS.with(|o| o.borrow_mut().clear());
+        let mut world = MockWorld::seed();
+        let mut sel = BrowserSelection::default();
+        let mut vm = test_vm_handle(macvm::runtime::JitMode::Off);
+        let responses = handle(
+            VmRequest::Find {
+                tool: "senders".to_string(),
+                query: "printOn:".to_string(),
+            },
+            &mut world,
+            &mut sel,
+            None,
+            &mut vm,
+        );
+        let html = match responses.as_slice() {
+            [VmResponse::FindResults { html }] => html.clone(),
+            other => panic!("expected FindResults, got {other:?}"),
+        };
+        assert!(
+            html.contains("Senders of") && html.contains("data-open-class=\"Object\""),
+            "Object>>printString sends printOn:, so Object must appear, got {}-char result",
+            html.len()
+        );
+    }
+
     /// Drill-down: clicking a class in a hierarchy outliner opens that class's
     /// method browser (a ClassOutliner with editors) in the same widget, with a
     /// back link to the hierarchy.
