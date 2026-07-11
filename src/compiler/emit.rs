@@ -1500,6 +1500,17 @@ pub fn emit(
 
 fn emit_ir(e: &mut Emitter, ir: &Ir, next_in_order: Option<BlockId>) {
     match *ir {
+        // Float fast-path (`docs/float_fastpath_design.md`): the IR vocabulary
+        // exists, but lowering to native `fmul`/`fadd`/guard/box lands with the
+        // FP register pool (regalloc task). Until convert produces these,
+        // nothing reaches here — this arm is the compile-time proof of that.
+        Ir::FUnbox { .. }
+        | Ir::FBox { .. }
+        | Ir::FArith { .. }
+        | Ir::FCmpBr { .. }
+        | Ir::FCmpVal { .. } => {
+            unreachable!("float fast-path IR op reached emit before lowering is wired: {ir:?}")
+        }
         Ir::ConstSmi { dst, value } => {
             let d = e.dest_target(dst);
             emit_mov_imm64(e.asm, d, (value << 2) as u64);
@@ -1773,7 +1784,7 @@ mod tests {
     /// proven correct end to end and gives `pcdesc_block_starts` a real
     /// multi-block method to check without re-deriving one.
     fn branchy_method() -> IrMethod {
-        let vregs: Vec<VRegInfo> = (0..7).map(|_| VRegInfo { is_oop: true }).collect();
+        let vregs: Vec<VRegInfo> = (0..7).map(|_| VRegInfo { is_oop: true, is_fp: false }).collect();
         let block0 = IrBlock {
             id: BlockId(0),
             bci: 0,
@@ -1895,7 +1906,7 @@ mod tests {
     /// it does for add/sub, so this sequence is the only correct one).
     #[test]
     fn emit_smi_mul_overflow_seq() {
-        let vregs: Vec<VRegInfo> = (0..4).map(|_| VRegInfo { is_oop: true }).collect();
+        let vregs: Vec<VRegInfo> = (0..4).map(|_| VRegInfo { is_oop: true, is_fp: false }).collect();
         let block0 = IrBlock {
             id: BlockId(0),
             bci: 0,
@@ -1980,7 +1991,7 @@ mod tests {
     #[test]
     fn emit_ldur_vs_untag_split() {
         let make = |index: u8| {
-            let vregs: Vec<VRegInfo> = (0..2).map(|_| VRegInfo { is_oop: true }).collect();
+            let vregs: Vec<VRegInfo> = (0..2).map(|_| VRegInfo { is_oop: true, is_fp: false }).collect();
             let byte_off = crate::oops::layout::BODY_OFFSET as i32 + 8 * index as i32;
             let block0 = IrBlock {
                 id: BlockId(0),
@@ -2050,7 +2061,7 @@ mod tests {
     #[test]
     fn barrier_emitted_conditions() {
         let make = |barrier: bool| {
-            let vregs: Vec<VRegInfo> = (0..2).map(|_| VRegInfo { is_oop: true }).collect();
+            let vregs: Vec<VRegInfo> = (0..2).map(|_| VRegInfo { is_oop: true, is_fp: false }).collect();
             let block0 = IrBlock {
                 id: BlockId(0),
                 bci: 0,
@@ -2165,7 +2176,7 @@ mod tests {
                 entry_stack: Vec::new(),
                 deopt_sites: Vec::new(),
             }],
-            vregs: vec![VRegInfo { is_oop: true }],
+            vregs: vec![VRegInfo { is_oop: true, is_fp: false }],
             pool: vec![
                 PoolEntry {
                     value: 0x1111,
@@ -2264,7 +2275,7 @@ mod tests {
     /// branch a real receiver would take).
     #[test]
     fn entry_guard_smi_and_heap() {
-        let vregs = vec![VRegInfo { is_oop: true }];
+        let vregs = vec![VRegInfo { is_oop: true, is_fp: false }];
         let block0 = IrBlock {
             id: BlockId(0),
             bci: 0,
@@ -2371,7 +2382,7 @@ mod tests {
     /// literals and an ordinary body literal in one method.
     #[test]
     fn pool_relocs_after_literal_off() {
-        let vregs = vec![VRegInfo { is_oop: true }];
+        let vregs = vec![VRegInfo { is_oop: true, is_fp: false }];
         let block0 = IrBlock {
             id: BlockId(0),
             bci: 0,
@@ -2446,7 +2457,7 @@ mod tests {
     /// actually occur, rather than merely being reasoned about.
     #[test]
     fn ic_site_recorded_per_send() {
-        let vregs: Vec<VRegInfo> = (0..6).map(|_| VRegInfo { is_oop: true }).collect();
+        let vregs: Vec<VRegInfo> = (0..6).map(|_| VRegInfo { is_oop: true, is_fp: false }).collect();
         let block0 = IrBlock {
             id: BlockId(0),
             bci: 0,

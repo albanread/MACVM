@@ -934,7 +934,7 @@ mod tests {
         };
         let method = hand_method(
             vec![block],
-            vec![VRegInfo { is_oop: true }, VRegInfo { is_oop: true }],
+            vec![VRegInfo { is_oop: true, is_fp: false }, VRegInfo { is_oop: true, is_fp: false }],
         );
 
         let (_order, intervals, _safepoints, _bsp, _extra) = compute_intervals(&method);
@@ -969,7 +969,7 @@ mod tests {
             entry_stack: Vec::new(),
             deopt_sites: Vec::new(),
         };
-        let method = hand_method(vec![block0, block1], vec![VRegInfo { is_oop: true }]);
+        let method = hand_method(vec![block0, block1], vec![VRegInfo { is_oop: true, is_fp: false }]);
 
         let (order, intervals, _safepoints, _bsp, _extra) = compute_intervals(&method);
         assert_eq!(
@@ -1005,7 +1005,7 @@ mod tests {
             entry_stack: Vec::new(),
             deopt_sites: Vec::new(),
         };
-        let method = hand_method(vec![block], vec![VRegInfo { is_oop: true }]);
+        let method = hand_method(vec![block], vec![VRegInfo { is_oop: true, is_fp: false }]);
 
         let (_order, mut intervals, _safepoints, _bsp, _extra) = compute_intervals(&method);
         assert!(
@@ -1306,7 +1306,7 @@ mod tests {
 
         let method = hand_method(
             vec![entry, header, body, exit, bailout],
-            (0..6).map(|_| VRegInfo { is_oop: true }).collect(),
+            (0..6).map(|_| VRegInfo { is_oop: true, is_fp: false }).collect(),
         );
         let (order, intervals, _safepoints, _bsp, _extra) = compute_intervals(&method);
 

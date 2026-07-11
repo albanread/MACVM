@@ -64,6 +64,11 @@ pub struct SafepointId(pub u32);
 
 pub struct VRegInfo {
     pub is_oop: bool,
+    /// Float fast-path (`docs/float_fastpath_design.md`): this vreg holds an
+    /// UNBOXED `f64` and must be allocated to the FP register file (`d0`–`d31`),
+    /// independently of the x0–x15 GPR linear-scan. An fp vreg is never an oop
+    /// (`is_oop == false`), so the GC root walker/oop-map ignore it.
+    pub is_fp: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -74,6 +79,16 @@ pub enum SmiOp {
     And,
     Or,
     Xor,
+}
+
+/// Float fast-path (`docs/float_fastpath_design.md`) arithmetic op — the
+/// `Double` primitives 100–103, lowered to native `fadd`/`fsub`/`fmul`/`fdiv`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FArithOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -209,6 +224,47 @@ pub enum Ir {
         b: VReg,
         fail: BlockId,
     },
+    /// ── Float fast-path (`docs/float_fastpath_design.md`) ──────────────────
+    /// Unbox a boxed `Double` oop into an FP vreg. GUARDED: `src` must be a
+    /// Double, else branch to `fail` (a cold `UncommonTrap` re-executing the
+    /// send at tier-0, exactly like `SmiArith`'s fail). `dst` is an fp vreg.
+    FUnbox {
+        dst: VReg,
+        src: VReg,
+        fail: BlockId,
+    },
+    /// Box an FP vreg into a freshly-allocated `Double` oop. The only heap
+    /// traffic on the float path; a regalloc SAFEPOINT (`Alloc`-shaped). `src`
+    /// is an fp vreg, `dst` an ordinary oop vreg.
+    FBox {
+        dst: VReg,
+        src: VReg,
+    },
+    /// Native FP arithmetic on two fp vregs → an fp vreg. No guard, no alloc,
+    /// no send: `fadd`/`fsub`/`fmul`/`fdiv`.
+    FArith {
+        op: FArithOp,
+        dst: VReg,
+        a: VReg,
+        b: VReg,
+    },
+    /// Float comparison fused with a branch (the `FCmpBr` analog of
+    /// `SmiCmpBr`): `fcmp` + `b.cond`. `a`/`b` are fp vregs.
+    FCmpBr {
+        op: CmpOp,
+        a: VReg,
+        b: VReg,
+        if_true: BlockId,
+        if_false: BlockId,
+    },
+    /// Float comparison NOT fused with a branch — materializes `true`/`false`
+    /// into an oop vreg `dst`. `a`/`b` are fp vregs.
+    FCmpVal {
+        op: CmpOp,
+        dst: VReg,
+        a: VReg,
+        b: VReg,
+    },
     Jump {
         target: BlockId,
     },
@@ -323,6 +379,11 @@ impl Ir {
                 f(*a);
                 f(*b);
             }
+            Ir::FArith { a, b, .. } | Ir::FCmpBr { a, b, .. } | Ir::FCmpVal { a, b, .. } => {
+                f(*a);
+                f(*b);
+            }
+            Ir::FUnbox { src, .. } | Ir::FBox { src, .. } => f(*src),
             Ir::ArrayAt { arr, idx, .. } => {
                 f(*arr);
                 f(*idx);
@@ -387,10 +448,15 @@ impl Ir {
             | Ir::ArrayAtPut { dst, .. }
             | Ir::SmiCmpVal { dst, .. }
             | Ir::CallSend { dst, .. }
+            | Ir::FUnbox { dst, .. }
+            | Ir::FBox { dst, .. }
+            | Ir::FArith { dst, .. }
+            | Ir::FCmpVal { dst, .. }
             | Ir::Alloc { dst, .. } => f(*dst),
             Ir::CallRuntime { dst: Some(d), .. } => f(*d),
             Ir::StoreField { .. }
             | Ir::SmiCmpBr { .. }
+            | Ir::FCmpBr { .. }
             | Ir::Jump { .. }
             | Ir::BoolBr { .. }
             | Ir::GuardKlass { .. }
@@ -1098,7 +1164,23 @@ struct Translator<'a> {
 impl<'a> Translator<'a> {
     fn fresh(&mut self, is_oop: bool) -> VReg {
         let id = self.vregs.len() as u32;
-        self.vregs.push(VRegInfo { is_oop });
+        self.vregs.push(VRegInfo {
+            is_oop,
+            is_fp: false,
+        });
+        VReg(id)
+    }
+
+    /// A fresh UNBOXED-`f64` vreg for the float fast-path
+    /// (`docs/float_fastpath_design.md`) — routed to the FP register file by
+    /// regalloc, never an oop.
+    #[allow(dead_code)] // wired by classify_double_send (next step)
+    fn fresh_fp(&mut self) -> VReg {
+        let id = self.vregs.len() as u32;
+        self.vregs.push(VRegInfo {
+            is_oop: false,
+            is_fp: true,
+        });
         VReg(id)
     }
 
@@ -5332,6 +5414,11 @@ fn map_uses(op: &mut Ir, mut f: impl FnMut(VReg) -> VReg) {
             *a = f(*a);
             *b = f(*b);
         }
+        Ir::FArith { a, b, .. } | Ir::FCmpBr { a, b, .. } | Ir::FCmpVal { a, b, .. } => {
+            *a = f(*a);
+            *b = f(*b);
+        }
+        Ir::FUnbox { src, .. } | Ir::FBox { src, .. } => *src = f(*src),
         Ir::ArrayAt { arr, idx, .. } => {
             *arr = f(*arr);
             *idx = f(*idx);
@@ -5617,7 +5704,7 @@ pub fn convert(
         method.has_ctx() && !method.is_block() && escape.as_ref().is_some_and(|e| !e.all_elidable);
 
     let self_vreg = VReg(0);
-    let mut vregs = vec![VRegInfo { is_oop: true }];
+    let mut vregs = vec![VRegInfo { is_oop: true, is_fp: false }];
     // `temp_vregs[i]` is the unified arg/temp slot `Frame::temp_index` also
     // uses (SPEC §5.1): `0..argc` are args, `argc..argc+ntemps` are the
     // method's own local temps — `method.ntemps()` alone is only the
@@ -5626,7 +5713,7 @@ pub fn convert(
     // `argc + ntemps` total entries, not `ntemps`.
     let temp_vregs: Vec<VReg> = (0..method.argc() + method.ntemps())
         .map(|i| {
-            vregs.push(VRegInfo { is_oop: true });
+            vregs.push(VRegInfo { is_oop: true, is_fp: false });
             VReg((i + 1) as u32)
         })
         .collect();
@@ -5648,7 +5735,7 @@ pub fn convert(
         (0..method.nctx())
             .map(|_| {
                 let n = vregs.len() as u32;
-                vregs.push(VRegInfo { is_oop: true });
+                vregs.push(VRegInfo { is_oop: true, is_fp: false });
                 VReg(n)
             })
             .collect()
@@ -5659,14 +5746,14 @@ pub fn convert(
     // and the home Context are prologue-synthesized LoadFields off it.
     let block_closure_vreg: Option<VReg> = if method.is_block() {
         let n = vregs.len() as u32;
-        vregs.push(VRegInfo { is_oop: true });
+        vregs.push(VRegInfo { is_oop: true, is_fp: false });
         Some(VReg(n))
     } else {
         None
     };
     let block_ctx_vreg: Option<VReg> = if method.is_block() && method.captures_ctx() {
         let n = vregs.len() as u32;
-        vregs.push(VRegInfo { is_oop: true });
+        vregs.push(VRegInfo { is_oop: true, is_fp: false });
         Some(VReg(n))
     } else {
         None
@@ -5677,7 +5764,7 @@ pub fn convert(
     // per-slot promotion) — mutually exclusive per method.
     let method_ctx_vreg: Option<VReg> = if materialize_ctx {
         let n = vregs.len() as u32;
-        vregs.push(VRegInfo { is_oop: true });
+        vregs.push(VRegInfo { is_oop: true, is_fp: false });
         Some(VReg(n))
     } else {
         None
