@@ -93,6 +93,40 @@ impl Theme {
     }
 }
 
+/// Resolve the `data-icon="resources/NAME.bmp"` attributes a smappl `Button
+/// withImage:` fragment carries (`world/33_smappl.mst`) into a themed icon:
+/// inserts a `src` pointing at the active theme's asset for NAME. Keyed by
+/// *logical name*, not the literal path (`gui/smappl.md` §5), so the corpus
+/// text stays byte-identical (D-G4) while what actually loads follows the
+/// theme. A path that doesn't reduce to a known cataloged name is left
+/// as-is (no `src`) — the fall-through the doc describes.
+pub fn rewrite_smappl_icons(html: &str, theme: Theme) -> String {
+    const NEEDLE: &str = "data-icon=\"";
+    let mut out = String::with_capacity(html.len());
+    let mut rest = html;
+    loop {
+        let Some(pos) = rest.find(NEEDLE) else {
+            out.push_str(rest);
+            break;
+        };
+        let val_start = pos + NEEDLE.len();
+        let Some(q) = rest[val_start..].find('"') else {
+            out.push_str(rest);
+            break;
+        };
+        let path = &rest[val_start..val_start + q];
+        let stripped = path.strip_prefix("resources/").unwrap_or(path);
+        let name = stripped.strip_suffix(".bmp").unwrap_or(stripped);
+        out.push_str(&rest[..pos]);
+        if !name.is_empty() {
+            out.push_str(&format!("src=\"{}\" ", theme.icon_url(name)));
+        }
+        out.push_str(&rest[pos..val_start + q + 1]); // keep the data-icon="..." attr
+        rest = &rest[val_start + q + 1..];
+    }
+    out
+}
+
 /// Absolute `file://` URL for a path under the `gui/` crate root
 /// (`CARGO_MANIFEST_DIR`, baked in at build time — fine for a dev/test
 /// shell run via `cargo run`; revisit if this ever ships as an app bundle).
@@ -429,6 +463,24 @@ mod tests {
         assert!(
             !out.contains('\n'),
             "collapsed whitespace should have no newlines: {out}"
+        );
+    }
+
+    #[test]
+    fn smappl_icon_resolves_to_a_themed_src() {
+        let frag = r#"<img class="smappl-icon" width="20" height="20" data-icon="resources/edit.bmp">"#;
+        let classic = rewrite_smappl_icons(frag, Theme::Classic);
+        assert!(
+            classic.contains("src=\"") && classic.contains("reference/icons-png/edit.png"),
+            "classic theme resolves the logical name to a png, got {classic}"
+        );
+        // The original data-icon attribute is preserved (byte-identical corpus).
+        assert!(classic.contains(r#"data-icon="resources/edit.bmp""#), "{classic}");
+        // A different theme picks a different asset for the same name.
+        let dark = rewrite_smappl_icons(frag, Theme::Dark);
+        assert!(
+            dark.contains("assets/icons-hidef/edit.svg"),
+            "dark theme resolves to the svg, got {dark}"
         );
     }
 

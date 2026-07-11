@@ -999,7 +999,11 @@ extern "C" fn vm_bridge_drain(_this: Id, _cmd: Sel, _arg: Id) {
                 // Swap the placeholder span with `data-widget-id == id` for
                 // the rendered widget (D-G5, ../smappl.md). smtk.js locates it
                 // by the widget id rather than a DOM `id`, so this can't
-                // collide with the page's own element ids.
+                // collide with the page's own element ids. Icon buttons carry
+                // a `data-icon` logical name resolved to the active theme's
+                // asset here (theme is a main-thread concept; the worker that
+                // built the fragment doesn't know it — ../smappl.md §5).
+                let html = preprocess::rewrite_smappl_icons(&html, current_theme());
                 eval_js(&format!(
                     "window.macvmRenderSmappl({}, {})",
                     js_string_literal(&id),

@@ -105,7 +105,7 @@ Visual subclass: Button [
         id := SmapplRegistry register: self.
         inner := iconName isNil
             ifTrue: [ label ]
-            ifFalse: [ '<img class="smappl-icon" data-icon="', iconName, '">' ].
+            ifFalse: [ '<img class="smappl-icon" width="20" height="20" data-icon="', iconName, '">' ].
         ^'<button class="smappl-button bevel-raised" data-widget-action="', id, '">', inner, '</button>'
     ]
 ]
