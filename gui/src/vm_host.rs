@@ -265,6 +265,17 @@ pub enum VmRequest {
     CanvasEval {
         code: String,
     },
+    /// Generic "let Smalltalk paint a pixel buffer" (`docs/CANVAS.md` pixel
+    /// path): evaluate `code`, which answers a `width*height*4` RGBA
+    /// `ByteArray` (a `Pixmap`'s bytes, `world/36_pixmap.mst`), and blit it to
+    /// the canvas in one `putImageData`. The right primitive for a per-pixel
+    /// image (the Mandelbrot) vs `CanvasEval`'s vector command batch. Generic —
+    /// the worker holds no knowledge of what is drawn.
+    CanvasEvalPixels {
+        code: String,
+        width: u32,
+        height: u32,
+    },
     /// Clears the canvas — a single `clearRect` batch, not a separate
     /// code path (`docs/CANVAS.md` §5.3: "full redraw" is a command-batch
     /// convention, not a different channel).
@@ -324,6 +335,18 @@ pub enum VmResponse {
     CanvasDraw {
         id: u32,
         commands_json: String,
+    },
+    /// Answers `CanvasEvalPixels` — a `width`x`height` RGBA image, base64 of
+    /// the raw `ByteArray` (`docs/CANVAS.md` pixel path). `main.rs` hands it to
+    /// `smtk.js`'s `macvmCanvasPutPixels`, which decodes it into an `ImageData`
+    /// and `putImageData`s it onto the canvas in one blit. Base64 because
+    /// `evaluateJavaScript` carries a JS source string, not binary — the
+    /// `WKURLSchemeHandler` path (module doc) is the scale-up for animation.
+    CanvasPixels {
+        id: u32,
+        width: u32,
+        height: u32,
+        base64: String,
     },
     /// Answers `CanvasClear`.
     CanvasCleared {
@@ -1550,6 +1573,41 @@ fn handle(
                 Err(e) => vec![VmResponse::Transcript(format!("canvas eval failed: {e}"))],
             }
         }
+        VmRequest::CanvasEvalPixels {
+            code,
+            width,
+            height,
+        } => {
+            // Real Smalltalk fills an RGBA Pixmap; `code` answers its raw
+            // ByteArray. Rust base64s the bytes for the evaluateJavaScript hop
+            // (module doc) — no vector command batch, no per-pixel strings.
+            // Wall-clock compute time reported to the transcript, same as
+            // CanvasEval. A short/failed buffer degrades to a transcript note.
+            let started = std::time::Instant::now();
+            match vm.eval_to_bytes(&code) {
+                Ok(bytes) => {
+                    let ms = started.elapsed().as_millis();
+                    let expected = (width as usize) * (height as usize) * 4;
+                    if bytes.len() != expected {
+                        vec![VmResponse::Transcript(format!(
+                            "canvas pixels: expected {expected} bytes for {width}x{height}, got {}",
+                            bytes.len()
+                        ))]
+                    } else {
+                        vec![
+                            VmResponse::CanvasPixels {
+                                id: CANVAS_ID,
+                                width,
+                                height,
+                                base64: base64_encode(&bytes),
+                            },
+                            VmResponse::Transcript(format!("canvas: computed in {ms} ms")),
+                        ]
+                    }
+                }
+                Err(e) => vec![VmResponse::Transcript(format!("canvas pixels failed: {e}"))],
+            }
+        }
         VmRequest::CanvasClear => {
             let mut cmds = CanvasCommands::new();
             cmds.call(
@@ -1625,6 +1683,34 @@ impl CanvasCommands {
     pub fn to_json(&self) -> String {
         format!("[{}]", self.commands.join(","))
     }
+}
+
+/// Standard base64 (RFC 4648, `+`/`/`, `=` padding) — hand-rolled to avoid a
+/// dependency for the one place bulk binary crosses `evaluateJavaScript` (a
+/// `CanvasPixels` RGBA buffer). `atob` on the JS side decodes it.
+fn base64_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as usize;
+        let b1 = chunk.get(1).copied().unwrap_or(0) as usize;
+        let b2 = chunk.get(2).copied().unwrap_or(0) as usize;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(ALPHABET[(n >> 18) & 63] as char);
+        out.push(ALPHABET[(n >> 12) & 63] as char);
+        out.push(if chunk.len() > 1 {
+            ALPHABET[(n >> 6) & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[n & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
 }
 
 /// Minimal JSON string escaping — only what this fixed command/color/text
@@ -2015,15 +2101,15 @@ mod tests {
 
     #[test]
     fn canvas_eval_runs_real_smalltalk_and_draws_its_command_batch() {
-        // The generic path (docs/CANVAS.md): arbitrary Smalltalk answers a
-        // command batch, drawn as a CanvasDraw. Here the Mandelbrot demo — the
-        // GUI itself holds no Mandelbrot knowledge, it just forwarded the code.
+        // The generic vector path (docs/CANVAS.md §5.2): arbitrary Smalltalk
+        // answers a command-batch String, drawn as a CanvasDraw. A String
+        // literal answers itself, so the GUI holds no per-drawing knowledge.
         let mut world = MockWorld::seed();
         let mut selection = BrowserSelection::default();
         let mut vm = test_vm_handle(macvm::runtime::JitMode::Off);
         let responses = handle(
             VmRequest::CanvasEval {
-                code: "Mandelbrot new commandsForWidth: 60 height: 45 cell: 5".to_string(),
+                code: "'[[\"fillRect\",0,0,10,10]]'".to_string(),
             },
             &mut world,
             &mut selection,
@@ -2036,20 +2122,80 @@ mod tests {
             panic!("expected [CanvasDraw, Transcript(timing)], got {responses:?}");
         };
         assert_eq!(*id, 0);
-        assert!(
-            commands_json.starts_with("[[\"clearRect\",0,0,60,45]"),
-            "batch must open by clearing the requested surface, got {}",
-            &commands_json[..commands_json.len().min(60)]
-        );
-        assert!(commands_json.contains("fillRect"), "{commands_json}");
-        assert!(
-            commands_json.contains("rgb(0,0,0)"),
-            "the set interior must appear — the float compute must have run"
-        );
+        assert_eq!(commands_json, "[[\"fillRect\",0,0,10,10]]");
         assert!(
             timing.contains("ms"),
             "the compute time must be reported to the transcript, got {timing:?}"
         );
+    }
+
+    #[test]
+    fn canvas_eval_pixels_blits_a_real_smalltalk_pixmap() {
+        // The generic pixel path (docs/CANVAS.md): Smalltalk fills a Pixmap and
+        // answers its RGBA ByteArray; the worker base64s it into CanvasPixels.
+        // Here the Mandelbrot — the GUI just forwarded the code + canvas size.
+        let mut world = MockWorld::seed();
+        let mut selection = BrowserSelection::default();
+        let mut vm = test_vm_handle(macvm::runtime::JitMode::Off);
+        let responses = handle(
+            VmRequest::CanvasEvalPixels {
+                code: "Mandelbrot new pixelsForWidth: 40 height: 30".to_string(),
+                width: 40,
+                height: 30,
+            },
+            &mut world,
+            &mut selection,
+            None,
+            &mut vm,
+        );
+        let [VmResponse::CanvasPixels {
+            id,
+            width,
+            height,
+            base64,
+        }, VmResponse::Transcript(timing)] = responses.as_slice()
+        else {
+            panic!("expected [CanvasPixels, Transcript(timing)], got {responses:?}");
+        };
+        assert_eq!((*id, *width, *height), (0, 40, 30));
+        // base64 of 40*30*4 = 4800 bytes → 6400 chars (4800 is divisible by 3,
+        // so no padding).
+        assert_eq!(base64.len(), 6400, "base64 length must match 40x30 RGBA");
+        assert!(timing.contains("ms"), "must report compute time, got {timing:?}");
+    }
+
+    #[test]
+    fn canvas_eval_pixels_reports_a_size_mismatch_instead_of_blitting() {
+        // If the answered buffer isn't width*height*4, degrade to a transcript
+        // note rather than putImageData a wrong-sized buffer.
+        let mut world = MockWorld::seed();
+        let mut selection = BrowserSelection::default();
+        let mut vm = test_vm_handle(macvm::runtime::JitMode::Off);
+        let responses = handle(
+            VmRequest::CanvasEvalPixels {
+                code: "Mandelbrot new pixelsForWidth: 40 height: 30".to_string(),
+                width: 41, // deliberately wrong
+                height: 30,
+            },
+            &mut world,
+            &mut selection,
+            None,
+            &mut vm,
+        );
+        assert!(
+            matches!(responses.as_slice(), [VmResponse::Transcript(t)] if t.contains("expected")),
+            "a size mismatch must surface as a transcript note, got {responses:?}"
+        );
+    }
+
+    #[test]
+    fn base64_encode_matches_known_vectors() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+        assert_eq!(base64_encode(&[0, 255, 0, 255]), "AP8A/w==");
     }
 
     #[test]

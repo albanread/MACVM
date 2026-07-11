@@ -235,15 +235,45 @@ path for real Smalltalk to draw, added without any per-drawing GUI code:
   k`); a future GUI-side loop can post them on a timer/`requestAnimationFrame`
   without any new message type.
 
-**The Mandelbrot demo** (`world/35_mandelbrot.mst`, the tour's
-`fastfloats.html` `Mandelbrot new launch`) is the first real caller: it
-computes the set in JIT-compiled `Double` arithmetic (the "fast floats" that
-page is about) and emits a run-length-encoded fillRect batch. The Canvas
-view's **Mandelbrot** button carries `Mandelbrot new commandsForWidth:height:`
-(sized to the canvas) in its `data-canvas-eval` — proving the whole pipeline
-from genuine Smalltalk, with the GUI still generic. No VM-side `Canvas`
-primitive is needed (§7 stays deferred); the batch is built entirely in
-image-side Smalltalk and transported as a string.
+### The pixel-buffer (pixmap) path — built now
+
+For a per-pixel image (the Mandelbrot), vector `fillRect` commands are the
+wrong primitive: even run-length-encoded, a 420x220 fractal is a ~600 KB JSON
+batch of ~10k ops that the JS side must parse and replay. The pixel path
+replaces that with a raw buffer blitted in ONE `putImageData`:
+
+- `world/36_pixmap.mst` — `Pixmap` (a `width*height*4` RGBA `ByteArray`,
+  `atX:y:r:g:b:` writing four bytes per pixel, row-major, matching
+  `ImageData.data`). No strings, no commands — the hot path only does primitive
+  byte stores.
+- `VmRequest::CanvasEvalPixels { code, width, height }` — generic, like
+  `CanvasEval` but the code answers an RGBA `ByteArray`
+  (`VmHandle::eval_to_bytes`, raw bytes, no UTF-8). The worker checks the size,
+  base64s it, and answers `VmResponse::CanvasPixels`. `main.rs` →
+  `smtk.js macvmCanvasPutPixels`, which `atob`s it into an `ImageData` and
+  `putImageData`s it. Base64 because `evaluateJavaScript` carries a source
+  string, not binary; the `WKURLSchemeHandler` `macvm-pixels://<id>` path (the
+  `vm_host.rs` module doc) is the scale-up for animation/high-frequency frames.
+- The Canvas view's **Mandelbrot** button carries `Mandelbrot new
+  pixelsForWidth:height:` in `data-canvas-eval` with action `eval-pixels`.
+
+**Measured vs the fillRect path** (release, warmed, native 420x220): compute
+746 ms → **458 ms** (the ~288 ms of string-building is gone), recompiles 2 →
+**0**, allocation 708 MB → 595 MB, and the JS side does one blit instead of
+replaying 10,685 ops. What remains (595 MB / ~9 deopts) is the boxed-`Double`
+arithmetic in `escapeAtRe:im:` — the "fast floats" gap the tour names, which
+needs unboxed-double JIT support (a separate VM feature, not this path).
+
+**The `Mandelbrot` itself** computes the set in JIT-compiled `Double`
+arithmetic and writes RGB straight into the Pixmap — no VM-side `Canvas`
+primitive is needed (§7 stays deferred); the buffer is built entirely in
+image-side Smalltalk.
+
+**Method-arity note (docs/VMregisters.md §2, weekend_work.md Gap 2):** the JIT
+caps a compilable method at 5 args. `Pixmap>>atX:y:r:g:b:` is exactly 5, so it
+compiles; the earlier `emitOn:color:x:y:w:h:` (6 args) never did and ran
+interpreted. Raising the cap is deferred — for now the fix is to keep
+image-side methods ≤ 5 args.
 
 ## 7. Deferred
 

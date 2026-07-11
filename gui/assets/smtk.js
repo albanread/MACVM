@@ -532,6 +532,22 @@
         post({ kind: "canvasEval", code: evalBtn.getAttribute("data-canvas-eval") || "" });
         return;
       }
+      // Generic pixel path (docs/CANVAS.md): the control's data-canvas-eval
+      // answers a width*height*4 RGBA buffer; blit it via putImageData. The
+      // canvas element itself is the authority on width/height (its pixel
+      // buffer size), so the Smalltalk buffer and the blit always agree.
+      const pixBtn = ev.target.closest('[data-canvas-action="eval-pixels"]');
+      if (pixBtn) {
+        ev.preventDefault();
+        const cv = document.getElementById("macvm-canvas-0");
+        post({
+          kind: "canvasEvalPixels",
+          code: pixBtn.getAttribute("data-canvas-eval") || "",
+          width: String(cv ? cv.width : 0),
+          height: String(cv ? cv.height : 0),
+        });
+        return;
+      }
       const clearBtn = ev.target.closest('[data-canvas-action="clear"]');
       if (clearBtn) {
         ev.preventDefault();
@@ -576,6 +592,34 @@
       else if (CANVAS_PROPERTIES.has(name)) ctx[name] = args[0];
       else console.warn("macvm canvas: unknown op", name);
     }
+  };
+
+  // vm_host::VmResponse::CanvasPixels arrives here (main.rs): a width*height*4
+  // RGBA buffer, base64-encoded (docs/CANVAS.md pixel path). Decode it into an
+  // ImageData and blit in one putImageData — the right primitive for a
+  // per-pixel image (the Mandelbrot), vs thousands of fillRect commands. atob
+  // gives a binary string; copy its char codes straight into the ImageData's
+  // Uint8ClampedArray (RGBA layout matches the Pixmap byte order).
+  window.macvmCanvasPutPixels = function (id, width, height, base64) {
+    const canvas = document.getElementById("macvm-canvas-" + id);
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    let bin;
+    try {
+      bin = atob(base64);
+    } catch (e) {
+      console.warn("macvm canvas: malformed base64 pixels", e);
+      return;
+    }
+    const need = width * height * 4;
+    if (bin.length !== need) {
+      console.warn("macvm canvas: pixel buffer size mismatch", bin.length, need);
+      return;
+    }
+    const img = ctx.createImageData(width, height);
+    const data = img.data;
+    for (let i = 0; i < need; i++) data[i] = bin.charCodeAt(i);
+    ctx.putImageData(img, 0, 0);
   };
 
   // vm_host::VmResponse::CanvasCreated arrives here (main.rs). The response

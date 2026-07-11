@@ -923,6 +923,20 @@ extern "C" fn on_script_message(_this: Id, _cmd: Sel, _controller: Id, message: 
                 });
             }
         }
+        "canvasEvalPixels" => {
+            // Generic pixel path: the clicked control's `data-canvas-eval`
+            // answers a width*height*4 RGBA buffer, blitted via putImageData.
+            // width/height arrive as strings (only dict_get_string exists).
+            if let Some(vm) = VM.get() {
+                let width = dict_get_string(body, "width").parse().unwrap_or(0);
+                let height = dict_get_string(body, "height").parse().unwrap_or(0);
+                vm.submit(vm_host::VmRequest::CanvasEvalPixels {
+                    code: dict_get_string(body, "code"),
+                    width,
+                    height,
+                });
+            }
+        }
         "canvasClear" => {
             if let Some(vm) = VM.get() {
                 vm.submit(vm_host::VmRequest::CanvasClear);
@@ -1290,6 +1304,19 @@ extern "C" fn vm_bridge_drain(_this: Id, _cmd: Sel, _arg: Id) {
                 eval_js(&format!(
                     "window.macvmCanvasDraw({id}, {})",
                     js_string_literal(&commands_json)
+                ));
+            }
+            vm_host::VmResponse::CanvasPixels {
+                id,
+                width,
+                height,
+                base64,
+            } => {
+                // Blit the RGBA buffer in one putImageData (docs/CANVAS.md pixel
+                // path). smtk.js decodes the base64 into an ImageData.
+                eval_js(&format!(
+                    "window.macvmCanvasPutPixels({id}, {width}, {height}, {})",
+                    js_string_literal(&base64)
                 ));
             }
             vm_host::VmResponse::CanvasCleared { .. } => {

@@ -444,6 +444,50 @@ impl VmHandle {
         }
     }
 
+    /// Evaluates `code` (wrapped `[<code>] value`, like
+    /// [`eval_to_string`](Self::eval_to_string)) and returns the answered
+    /// `ByteArray`/`String`'s bytes RAW — no UTF-8 conversion, so arbitrary
+    /// binary is preserved. Used for bulk pixel data: `Mandelbrot new
+    /// pixelsForWidth:height:` answers a `w*h*4` RGBA `ByteArray`
+    /// (`world/36_pixmap.mst`, `docs/CANVAS.md` pixel path). A non-byte-indexable
+    /// answer is an `Err`.
+    #[allow(unsafe_code)]
+    pub fn eval_to_bytes(&mut self, code: &str) -> Result<Vec<u8>, GuestError> {
+        let source = format!("([{code}] value).");
+        let slot = deopt_trap::claim_jmp_slot();
+        // SAFETY: as `render_fragment` — `sigsetjmp` inline at this call site,
+        // whose frame stays live for the whole recovery window.
+        let rc = unsafe { deopt_trap::sigsetjmp(deopt_trap::jmp_buf_ptr(slot), 1) };
+        if rc == deopt_trap::GUEST_FATAL_JMP_VAL {
+            let message = deopt_trap::take_last_guest_fatal_message().expect(
+                "sigsetjmp returned GUEST_FATAL_JMP_VAL without a recorded guest-fatal message",
+            );
+            return Err(GuestError::RuntimeError(message));
+        }
+        if rc != 0 {
+            let (sig, pc, far) = deopt_trap::take_last_crash_info()
+                .expect("sigsetjmp returned nonzero without a recorded crash");
+            return Err(GuestError::NativeFault { sig, pc, far });
+        }
+        let item = match frontend::parser::parse_one_top_item(&source) {
+            Ok(Some(item)) => item,
+            Ok(None) => return Ok(Vec::new()),
+            Err(e) => return Err(GuestError::Compile(e)),
+        };
+        match frontend::classdef::execute_top_item(&mut self.vm, item) {
+            Ok(Some(result)) => {
+                let b = crate::oops::wrappers::ByteArrayOop::try_from(result).ok_or_else(|| {
+                    GuestError::RuntimeError("expression did not answer a ByteArray".to_string())
+                })?;
+                let mut bytes = Vec::new();
+                b.copy_bytes_out(&mut bytes);
+                Ok(bytes)
+            }
+            Ok(None) => Ok(Vec::new()),
+            Err(e) => Err(GuestError::Compile(e)),
+        }
+    }
+
     /// Installs `sink` as where guest output (`Transcript show:`,
     /// `printOnStdout:`) goes from now on. Default is stdout
     /// (`VmState::with_options`) — an embedder calls this once, right after
@@ -630,46 +674,37 @@ mod tests {
     }
 
     /// The Canvas Mandelbrot demo (`world/35_mandelbrot.mst`,
-    /// `docs/CANVAS.md`): `Mandelbrot new commandsForWidth:height:` computes
-    /// the set in real Smalltalk `Double` arithmetic and answers a Canvas
-    /// draw-command batch (§5.2 JSON). The batch must be a valid, non-trivial
-    /// command array that opens with a `clearRect` and paints both interior
-    /// (black) and escaped (coloured) runs — i.e. the float compute really
+    /// `docs/CANVAS.md` pixel path): `Mandelbrot new pixelsForWidth:height:`
+    /// computes the set in real Smalltalk `Double` arithmetic and fills a
+    /// `Pixmap`, answering its raw `w*h*4` RGBA `ByteArray`. The buffer must be
+    /// exactly the right size, fully opaque, and contain both interior (black)
+    /// and escaped (coloured) pixels — i.e. the float compute really
     /// discriminated points, not painted one flat colour.
     #[test]
-    fn mandelbrot_computes_a_canvas_command_batch() {
+    fn mandelbrot_fills_an_rgba_pixmap() {
         let mut vm = boot_test_vm(JitMode::Threshold(1));
-        let json = vm
-            .eval_to_string("Mandelbrot new commandsForWidth: 120 height: 90 cell: 6")
-            .expect("Mandelbrot must answer a command-batch String");
+        let (w, h) = (120usize, 90usize);
+        let bytes = vm
+            .eval_to_bytes(&format!("Mandelbrot new pixelsForWidth: {w} height: {h}"))
+            .expect("Mandelbrot must answer an RGBA ByteArray");
 
+        assert_eq!(bytes.len(), w * h * 4, "buffer must be exactly w*h*4 RGBA");
+        // Every alpha byte (every 4th) must be fully opaque.
         assert!(
-            json.starts_with("[[\"clearRect\",0,0,120,90]"),
-            "batch must open by clearing the 120x90 surface, got {}",
-            &json[..json.len().min(80)]
+            bytes.iter().skip(3).step_by(4).all(|&a| a == 255),
+            "every pixel must be opaque (alpha 255)"
         );
-        assert!(json.ends_with(']'), "batch must be a closed JSON array");
+        // A black interior pixel exists (some point reached maxIter)...
+        let has_black = bytes
+            .chunks(4)
+            .any(|p| p[0] == 0 && p[1] == 0 && p[2] == 0);
+        // ...and a non-black escaped pixel exists (the bands).
+        let has_colour = bytes
+            .chunks(4)
+            .any(|p| p[0] != 0 || p[1] != 0 || p[2] != 0);
         assert!(
-            json.contains("\"fillStyle\"") && json.contains("\"fillRect\""),
-            "batch must paint filled runs"
-        );
-        // Interior of the set → black; escaped points → coloured bands. Both
-        // present ⇒ the Double iteration actually varied across the plane.
-        assert!(
-            json.contains("rgb(0,0,0)"),
-            "the set interior (black) must appear — the escape loop must reach maxIter somewhere"
-        );
-        assert!(
-            json.matches("\"fillStyle\"").count() > 5,
-            "a real fractal has many colour runs, got {} fillStyle ops",
-            json.matches("\"fillStyle\"").count()
-        );
-        // It must be parseable as the wire format (array of [op, ...args]),
-        // sanity-checked structurally: balanced brackets, no stray characters.
-        assert_eq!(
-            json.matches('[').count(),
-            json.matches(']').count(),
-            "brackets must balance in the emitted JSON"
+            has_black && has_colour,
+            "the fractal must have both interior (black) and escaped (coloured) pixels"
         );
     }
 

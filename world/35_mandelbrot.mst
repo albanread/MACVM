@@ -1,17 +1,14 @@
 "35_mandelbrot.mst — the Strongtalk 'fast floats' Mandelbrot demo
  (gui/reference/pages/tour/fastfloats.html: `Mandelbrot new launch`), rebuilt
- on the MACVM Canvas view (docs/CANVAS.md).
+ on the MACVM Canvas view as a PIXMAP (docs/CANVAS.md pixel-buffer path).
 
  The set is computed HERE, in real Smalltalk Double arithmetic — the
  JIT-compiled `<primitive: 100..>` float ops that ARE the 'fast floats' the
- tour page is about (world/08_double.mst). Each escape count maps to a colour,
- and the whole image is emitted as one Canvas draw-command batch (the
- docs/CANVAS.md §5.2 JSON array of [op, ...args]). Rust only transports that
- string — no VM-side Canvas primitive is needed (§7 leaves those deferred), so
- this proves the Canvas pipeline end to end from genuine Smalltalk, not a mock.
-
- Run-length encoded per scanline (one fillRect per constant-colour run), so the
- batch is a few thousand ops rather than one-per-pixel."
+ tour page is about (world/08_double.mst). Each escape count maps to an RGB
+ triple written straight into a Pixmap (world/36_pixmap.mst) — no colour
+ strings, no fillRect command batch. The buffer crosses to the GUI once and is
+ blitted in a single putImageData. Rust only transports the bytes; no VM-side
+ Canvas primitive is needed (docs/CANVAS.md §7 stays deferred)."
 Object subclass: Mandelbrot [
     | maxIter |
     Mandelbrot class >> new [ ^self basicNew init ]
@@ -34,63 +31,35 @@ Object subclass: Mandelbrot [
         ^n
     ]
 
-    "Escape count -> CSS rgb() string. Decimal channels, so no hex formatting
-     is needed; inside the set is black, escaped points get colourful bands."
-    colorFor: n [
-        | r g b |
-        n >= maxIter ifTrue: [ ^'rgb(0,0,0)' ].
-        r := (n * 8) \\ 256.
-        g := (n * 5) \\ 256.
-        b := 64 + ((n * 11) \\ 192).
-        ^'rgb(', r printString, ',', g printString, ',', b printString, ')'
-    ]
-
-    "Default full-set view over a `w` x `h` canvas, at native pixel
-     resolution (cell: 1 — one canvas pixel per computed point)."
-    commandsForWidth: w height: h [
-        ^self commandsForWidth: w height: h cell: 1
-    ]
-
-    "The Canvas draw-command batch (docs/CANVAS.md §5.2 JSON) for the set drawn
-     into a `w` x `h` surface in `cell`-sized square blocks. Square pixels: the
-     imaginary axis is centred on 0 and scaled by the SAME step as the real
-     axis, so the set is never stretched by the canvas aspect ratio."
-    commandsForWidth: w height: h cell: cell [
-        | s cols rows rmin step imin ci cr runColor runStart color |
-        cols := w // cell. rows := h // cell.
-        rmin := 0.0 - 2.5. step := 3.5 / cols.
-        imin := 0.0 - ((rows * step) / 2.0).
-        s := WriteStream on: String new.
-        s nextPutAll: '[["clearRect",0,0,'.
-        s nextPutAll: w printString. s nextPutAll: ','.
-        s nextPutAll: h printString. s nextPutAll: ']'.
-        0 to: rows - 1 do: [ :py |
+    "Render the full set into a fresh `w` x `h` Pixmap and answer it. Square
+     pixels: the imaginary axis is centred on 0 and scaled by the SAME step as
+     the real axis, so the set is never stretched by the canvas aspect ratio.
+     Inside the set is black; escaped points get colourful bands (decimal
+     channels, computed with plain integer math — no strings)."
+    pixmapForWidth: w height: h [
+        | pm rmin step imin ci cr n r g b |
+        pm := Pixmap width: w height: h.
+        rmin := 0.0 - 2.5.
+        step := 3.5 / w.
+        imin := 0.0 - ((h * step) / 2.0).
+        0 to: h - 1 do: [ :py |
             ci := imin + (py * step).
-            runColor := nil. runStart := 0.
-            0 to: cols - 1 do: [ :px |
+            0 to: w - 1 do: [ :px |
                 cr := rmin + (px * step).
-                color := self colorFor: (self escapeAtRe: cr im: ci).
-                (runColor isNil or: [ color = runColor ])
+                n := self escapeAtRe: cr im: ci.
+                n >= maxIter
+                    ifTrue: [ r := 0. g := 0. b := 0 ]
                     ifFalse: [
-                        self emitOn: s color: runColor
-                             x: runStart * cell y: py * cell
-                             w: (px - runStart) * cell h: cell.
-                        runStart := px ].
-                runColor := color ].
-            self emitOn: s color: runColor
-                 x: runStart * cell y: py * cell
-                 w: (cols - runStart) * cell h: cell ].
-        s nextPutAll: ']'.
-        ^s contents
+                        r := (n * 8) \\ 256.
+                        g := (n * 5) \\ 256.
+                        b := 64 + ((n * 11) \\ 192) ].
+                pm atX: px y: py r: r g: g b: b ] ].
+        ^pm
     ]
 
-    "One constant-colour run: set the fill then paint the rectangle."
-    emitOn: s color: c x: x y: y w: rw h: rh [
-        s nextPutAll: ',["fillStyle","'. s nextPutAll: c.
-        s nextPutAll: '"],["fillRect",'.
-        s nextPutAll: x printString. s nextPutAll: ','.
-        s nextPutAll: y printString. s nextPutAll: ','.
-        s nextPutAll: rw printString. s nextPutAll: ','.
-        s nextPutAll: rh printString. s nextPutAll: ']'.
+    "The raw RGBA buffer the GUI blits (docs/CANVAS.md pixel path) — a
+     `w`*`h`*4 ByteArray."
+    pixelsForWidth: w height: h [
+        ^(self pixmapForWidth: w height: h) bytes
     ]
 ]

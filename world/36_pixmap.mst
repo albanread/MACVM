@@ -1,0 +1,42 @@
+"36_pixmap.mst — a raw RGBA pixel buffer (docs/CANVAS.md pixel-buffer path).
+
+ A Pixmap is width*height*4 bytes of RGBA, written directly by Smalltalk with
+ byte stores — NO per-pixel strings and NO vector draw commands. It is the
+ right primitive for a per-pixel image (like the Mandelbrot): the whole buffer
+ crosses to the GUI once and is blitted in a single `putImageData`, instead of
+ tens of thousands of `fillRect` commands built as a ~600 KB JSON string.
+
+ Row-major, one byte per channel in R,G,B,A order — exactly the browser's
+ `ImageData.data` layout, so the GUI writes the buffer straight in with no
+ repacking."
+Object subclass: Pixmap [
+    | width height bytes |
+    Pixmap class >> width: w height: h [
+        ^self basicNew setWidth: w height: h
+    ]
+    setWidth: w height: h [
+        width := w.
+        height := h.
+        bytes := ByteArray new: w * h * 4.
+        ^self
+    ]
+    width [ ^width ]
+    height [ ^height ]
+    "The raw RGBA buffer — what the GUI transports and blits (Alpha is written
+     opaque per pixel by atX:y:r:g:b:, so a freshly-filled Pixmap needs no
+     separate clear)."
+    bytes [ ^bytes ]
+
+    "Write pixel (x, y) as opaque r/g/b (each 0..255). 5 args (+ self) — under
+     the JIT's method-entry arity cap (docs/VMregisters.md §2), so this
+     compiles; the byteAt:put: stores are primitives, so the hot path never
+     allocates."
+    atX: x y: y r: r g: g b: b [
+        | o |
+        o := ((y * width) + x) * 4.
+        bytes at: o + 1 put: r.
+        bytes at: o + 2 put: g.
+        bytes at: o + 3 put: b.
+        bytes at: o + 4 put: 255.
+    ]
+]

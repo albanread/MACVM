@@ -45,5 +45,7 @@
 33_smappl.mst
 # Phase W: reflection mirrors + outliner tools (docs/APPS.md).
 34_tools.mst
-# Canvas demo: the Strongtalk 'fast floats' Mandelbrot on the Canvas view (docs/CANVAS.md).
+# Canvas: RGBA pixel buffer (docs/CANVAS.md pixel path) + the Strongtalk 'fast
+# floats' Mandelbrot demo that fills one.
+36_pixmap.mst
 35_mandelbrot.mst
