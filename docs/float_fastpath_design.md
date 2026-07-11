@@ -318,3 +318,20 @@ SmallInteger).
   loop-carried temps, displacing exactly the values whose residency pays.
   Revisit only together with a use-density (not length) residency heuristic;
   do not re-land as-is.
+
+- **FMA / multiply-add contraction (`fmadd`, DELIBERATELY NOT ADOPTED):** the
+  pass is trivial — match `FArith(Add, FArith(Mul, a, b), c)` (+ commuted/`Sub`
+  variants, single-use mul) → an `FMulAdd` op; the encoder already has
+  `fmadd`/`fmsub`/`fnmadd`/`fnmsub`. It is not in because FMA rounds ONCE
+  where the interpreter's separate boxed `*` then `+` rounds TWICE — so it
+  cannot be bit-identical to the interpreter, by construction (the interpreter
+  physically can't fuse across two primitive calls with a boxed intermediate).
+  That collides with the invariant this whole arc is verified against
+  (JIT ≡ interpreter, to the bit — the checksum goldens and float differentials
+  are sharp `assert_eq`, and a real miscompile would hide inside any ULP
+  tolerance). Payoff is ~1 fused op per ~15-instruction escape iteration
+  (only `(2.0·zr)·zi + ci` qualifies; `zr2±zi2` are sub/multi-use), i.e.
+  ~5-8% for a last-ULP divergence and a re-baselined golden. **Decision:
+  bit-exact interpreter parity is preferred over the contraction speedup.**
+  Revisit only if a workload ever makes the tradeoff worth an explicit
+  "IEEE-contraction-permitted" mode gated separately from the strict path.
