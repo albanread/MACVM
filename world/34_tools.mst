@@ -166,7 +166,12 @@ Visual subclass: ClassOutliner [
         ^html contents
     ]
     side: label selectors: sels on: html [
-        "A collapsible side (instance/class) whose children are its selectors."
+        "A collapsible side (instance/class) whose children are its selectors;
+         each selector is itself a collapsible node whose body is an empty
+         `<pre>` tagged with the (class, side, selector) — the GUI worker /
+         headless renderer fill it from image_store (the source of truth for
+         method text — the running VM keeps no source). No source available
+         (a .mst-booted VM with no image) just leaves it blank."
         html raw: '<div class="st-node closed"><span class="st-header st-side">'.
         html raw: '<span class="st-tw" data-tw>&#9656; </span>'.
         html escaped: label.
@@ -174,10 +179,17 @@ Visual subclass: ClassOutliner [
         html raw: sels size printString.
         html raw: ')</span><div class="st-children" style="display:none">'.
         sels do: [ :sel |
-            html raw: '<div class="st-node"><span class="st-header st-selector">'.
-            html raw: '<span class="st-tw-leaf"></span>'.
+            html raw: '<div class="st-node closed"><span class="st-header st-selector">'.
+            html raw: '<span class="st-tw" data-tw>&#9656; </span>'.
             html escaped: sel asString.
-            html raw: '</span></div>' ].
+            html raw: '</span><div class="st-children" style="display:none">'.
+            html raw: '<pre class="st-code" data-src-class="'.
+            html escaped: mirror name.
+            html raw: '" data-src-side="'.
+            html raw: label.
+            html raw: '" data-src-sel="'.
+            html escaped: sel asString.
+            html raw: '"></pre></div></div>' ].
         html raw: '</div></div>'.
     ]
 ]

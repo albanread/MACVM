@@ -285,6 +285,25 @@ fn cmd_render(args: &[String]) {
     let resolved =
         preprocess::resolve_smappl_spans(&chromed, theme, |code| vm.render_fragment(code).ok());
 
+    // Fill ClassOutliner method-source blocks from an image_store DB beside the
+    // world, if one exists (the source of method text — the VM keeps none).
+    let image_path = world_dir.join("image.sqlite3");
+    let resolved = if image_path.exists() {
+        match image_store::Image::open(&image_path) {
+            Ok(img) => preprocess::inject_method_sources(&resolved, |c, s, sel| {
+                let side = if s == "class" {
+                    image_store::Side::Class
+                } else {
+                    image_store::Side::Instance
+                };
+                img.method_source(c, side, sel).ok().flatten()
+            }),
+            Err(_) => resolved,
+        }
+    } else {
+        resolved
+    };
+
     // Inline the theme CSS and smtk.js so the file renders self-contained and
     // interactive (the chrome's own `file://` stylesheet/script links won't
     // resolve when served over http). smtk.js's `post()` no-ops without a
@@ -312,6 +331,39 @@ fn cmd_render(args: &[String]) {
         std::process::exit(1);
     }
     println!("{}", out.display());
+}
+
+/// `macvm-gui seed [--world DIR]` — import `world/*.mst` into
+/// `<world_dir>/image.sqlite3` without launching the GUI. Headless complement
+/// to `render`: the class browser and the ClassOutliner's method-source
+/// blocks read their text from this DB (the running VM keeps no source).
+fn cmd_seed(args: &[String]) {
+    let mut world_dir = PathBuf::from("world");
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--world" {
+            i += 1;
+            if let Some(d) = args.get(i) {
+                world_dir = PathBuf::from(d);
+            }
+        }
+        i += 1;
+    }
+    let image_path = world_dir.join("image.sqlite3");
+    let image = match image_store::Image::open(&image_path) {
+        Ok(img) => img,
+        Err(e) => {
+            eprintln!("seed: cannot open {}: {e}", image_path.display());
+            std::process::exit(1);
+        }
+    };
+    match image_store::import::import_world_dir(&image, &world_dir) {
+        Ok(stats) => println!("seeded {} ({stats:?})", image_path.display()),
+        Err(e) => {
+            eprintln!("seed: import failed: {e}");
+            std::process::exit(1);
+        }
+    }
 }
 
 fn navigate_to(path: &Path) {
@@ -1334,9 +1386,10 @@ fn main() {
     // real VM) to self-contained HTML, no Cocoa window. Guarded before
     // `objc::bootstrap()` so it runs anywhere, not just a windowing session.
     let cli: Vec<String> = std::env::args().skip(1).collect();
-    if cli.first().map(String::as_str) == Some("render") {
-        cmd_render(&cli[1..]);
-        return;
+    match cli.first().map(String::as_str) {
+        Some("render") => return cmd_render(&cli[1..]),
+        Some("seed") => return cmd_seed(&cli[1..]),
+        _ => {}
     }
 
     objc::bootstrap();

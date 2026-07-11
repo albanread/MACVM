@@ -877,7 +877,23 @@ fn handle(
             // remains (the swallow-to-fallback contract, `../smappl.md` §2),
             // rather than surfacing the error onto the page.
             match vm.render_fragment(&code) {
-                Ok(html) => vec![VmResponse::SmapplFragment { id, html }],
+                Ok(html) => {
+                    // A ClassOutliner leaves empty <pre> source blocks the VM
+                    // can't fill (it keeps no method source) — enrich them from
+                    // image_store here (crate::preprocess::inject_method_sources).
+                    let html = match image {
+                        Some(img) => crate::preprocess::inject_method_sources(&html, |c, s, sel| {
+                            let side = if s == "class" {
+                                image_store::Side::Class
+                            } else {
+                                image_store::Side::Instance
+                            };
+                            img.method_source(c, side, sel).ok().flatten()
+                        }),
+                        None => html,
+                    };
+                    vec![VmResponse::SmapplFragment { id, html }]
+                }
                 Err(_) => vec![],
             }
         }
@@ -1861,6 +1877,52 @@ mod tests {
             unbuildable.is_empty(),
             "an unbuildable shape must yield no fragment, got {unbuildable:?}"
         );
+    }
+
+    /// A `ClassOutliner` rendered through `handle` gets its method-source
+    /// `<pre>` blocks filled from image_store (the VM keeps no source) —
+    /// exercises the full worker seam incl. `inject_method_sources`.
+    #[test]
+    fn class_outliner_source_is_filled_from_the_image() {
+        let world_dir = test_world_dir();
+        let tmp = std::env::temp_dir()
+            .join(format!("macvm_co_src_{}.sqlite3", std::process::id()));
+        std::fs::remove_file(&tmp).ok();
+        let image = open_or_seed_image(&world_dir, &tmp).expect("seed");
+
+        let mut vm = VmHandle::boot_without_world(macvm::runtime::VmOptions {
+            heap_mib: 64,
+            jit: macvm::runtime::JitMode::Off,
+            ..Default::default()
+        });
+        crate::world_boot::load_world_from_image(&mut vm, &image, WORLD_DOITS).expect("db load");
+
+        let mut world = MockWorld::seed();
+        let mut selection = BrowserSelection::default();
+        let responses = handle(
+            VmRequest::SmapplRender {
+                id: "s0".to_string(),
+                code: "ClassOutliner for: (ClassMirror on: Point)".to_string(),
+            },
+            &mut world,
+            &mut selection,
+            Some(&image),
+            &mut vm,
+        );
+        let html = match responses.as_slice() {
+            [VmResponse::SmapplFragment { html, .. }] => html.clone(),
+            other => panic!("expected one SmapplFragment, got {other:?}"),
+        };
+        // Point>>printOn:'s source body (from the image) must be spliced into
+        // its selector node's <pre> — a snippet unique to the source, not the
+        // selector list.
+        assert!(
+            html.contains("nextPutAll:") && html.contains("st-code"),
+            "the class outliner must carry Point's method source, got a {}-char fragment",
+            html.len()
+        );
+
+        std::fs::remove_file(&tmp).ok();
     }
 
     /// The real GUI boots from a DB image (S22), not `world/*.mst` directly.

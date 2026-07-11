@@ -197,6 +197,53 @@ pub fn resolve_smappl_spans(
     out
 }
 
+/// Fill the empty `<pre class="st-code" data-src-class data-src-side
+/// data-src-sel></pre>` placeholders a `ClassOutliner` fragment emits
+/// (`world/34_tools.mst`) with method source. The running VM keeps no source
+/// — it lives in image_store — so the worker (and the headless renderer)
+/// enrich the VM-rendered fragment here. `source_of(class, side, selector)`
+/// returns the text (or `None`, leaving the block blank). Reused by both call
+/// sites so they can't drift.
+pub fn inject_method_sources(
+    html: &str,
+    mut source_of: impl FnMut(&str, &str, &str) -> Option<String>,
+) -> String {
+    const OPEN: &str = "<pre class=\"st-code\"";
+    let mut out = String::with_capacity(html.len());
+    let mut rest = html;
+    loop {
+        let Some(pos) = rest.find(OPEN) else {
+            out.push_str(rest);
+            break;
+        };
+        let Some(gt) = rest[pos..].find('>') else {
+            out.push_str(rest);
+            break;
+        };
+        let tag_end = pos + gt + 1;
+        let tag = rest[pos..tag_end].to_string();
+        if rest[tag_end..].find("</pre>").is_none() {
+            out.push_str(rest);
+            break;
+        }
+        // Emit up to and including the opening tag, then the resolved source
+        // as its content; the original (empty) body and the `</pre>` are left
+        // for the next iteration / final push.
+        out.push_str(&rest[..tag_end]);
+        if let (Some(c), Some(s), Some(sel)) = (
+            attr_value(&tag, "data-src-class"),
+            attr_value(&tag, "data-src-side"),
+            attr_value(&tag, "data-src-sel"),
+        ) {
+            if let Some(src) = source_of(&unescape_attr(&c), &s, &unescape_attr(&sel)) {
+                out.push_str(&html_escape_text(src.trim_end()));
+            }
+        }
+        rest = &rest[tag_end..];
+    }
+    out
+}
+
 /// Value of `name="..."` within a single tag, or `None` if absent.
 fn attr_value(tag: &str, name: &str) -> Option<String> {
     let needle = format!("{name}=\"");
@@ -565,6 +612,27 @@ mod tests {
             "the None (unbuildable) span keeps its placeholder: {out}"
         );
         assert!(out.starts_with("before ") && out.ends_with(" after"), "surrounding text intact: {out}");
+    }
+
+    #[test]
+    fn inject_method_sources_fills_empty_pre_blocks() {
+        // Two selector nodes; one has source, one (a `<=` selector, escaped in
+        // the attr) resolves to None and stays blank.
+        let html = concat!(
+            r#"<pre class="st-code" data-src-class="Point" data-src-side="instance" data-src-sel="x"></pre>"#,
+            r#"<pre class="st-code" data-src-class="Point" data-src-side="instance" data-src-sel="&lt;="></pre>"#,
+        );
+        let out = inject_method_sources(html, |cls, side, sel| {
+            assert_eq!((cls, side), ("Point", "instance"));
+            match sel {
+                "x" => Some("x [ ^x ]".to_string()),
+                "<=" => None, // the escaped attr must reach us unescaped
+                other => panic!("unexpected selector {other}"),
+            }
+        });
+        assert!(out.contains("x [ ^x ]"), "source spliced into the block: {out}");
+        // The None block stays empty.
+        assert!(out.contains(r#"data-src-sel="&lt;="></pre>"#), "blank block preserved: {out}");
     }
 
     #[test]

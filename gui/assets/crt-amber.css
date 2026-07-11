@@ -351,3 +351,5 @@ ul li::before {
 .smappl-button:active { background: color-mix(in srgb, currentColor 30%, transparent); }
 .smappl-icon { vertical-align: middle; }
 .glue { vertical-align: middle; }
+
+.st-code { font-family: var(--st-font-code); font-size: var(--st-size-code, var(--st-size-body)); white-space: pre-wrap; margin: 2px 0 6px; color: var(--st-black, inherit); }

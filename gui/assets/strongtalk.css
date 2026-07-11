@@ -362,3 +362,5 @@ ul { list-style-type: disc; } /* Symbol ch.183 middle-dot bullet */
               inset -2px -2px 0 var(--st-gray),
               inset  2px  2px 0 var(--st-bevel-light);
 }
+
+.st-code { font-family: var(--st-font-code); font-size: var(--st-size-code, var(--st-size-body)); white-space: pre-wrap; margin: 2px 0 6px; color: var(--st-black, inherit); }
