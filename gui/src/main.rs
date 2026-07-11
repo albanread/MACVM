@@ -840,6 +840,7 @@ extern "C" fn on_script_message(_this: Id, _cmd: Sel, _controller: Id, message: 
                     side: dict_get_string(body, "side"),
                     sel: dict_get_string(body, "sel"),
                     text: dict_get_string(body, "text"),
+                    widget_id: dict_get_string(body, "widgetId"),
                 });
             }
         }

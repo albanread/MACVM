@@ -187,8 +187,17 @@ pub fn resolve_smappl_spans(
 
         out.push_str(&rest[..pos]);
         let code = attr_value(opening_tag, "data-code").as_deref().map(unescape_attr);
+        let widget_id = attr_value(opening_tag, "data-widget-id");
         let replaced = match code.as_deref().and_then(&mut render) {
-            Some(frag) => rewrite_smappl_icons(&frag, theme),
+            Some(frag) => {
+                let themed = rewrite_smappl_icons(&frag, theme);
+                // Tag the fragment root with the span's id so a later live
+                // refresh can re-find it (matches the worker's own tagging).
+                match &widget_id {
+                    Some(id) => tag_widget_id(&themed, id),
+                    None => themed,
+                }
+            }
             None => rest[pos..span_end].to_string(), // leave the placeholder box
         };
         out.push_str(&replaced);
@@ -242,6 +251,23 @@ pub fn inject_method_sources(
         rest = &rest[tag_end..];
     }
     out
+}
+
+/// Stamp `data-widget-id` onto a rendered fragment's root element, so a live
+/// refresh can re-find the fragment after the original placeholder span it
+/// replaced is gone (`smtk.js`'s `macvmRenderSmappl`). Shared by the worker
+/// (`vm_host`) and the headless renderer so both tag identically.
+pub fn tag_widget_id(html: &str, id: &str) -> String {
+    match html.find('<') {
+        Some(lt) => {
+            let rel = html[lt + 1..]
+                .find(|c: char| c.is_whitespace() || c == '>')
+                .map(|i| lt + 1 + i)
+                .unwrap_or(html.len());
+            format!("{} data-widget-id=\"{}\"{}", &html[..rel], id, &html[rel..])
+        }
+        None => html.to_string(),
+    }
 }
 
 /// Value of `name="..."` within a single tag, or `None` if absent.
@@ -606,7 +632,11 @@ mod tests {
                 None // unbuildable → leave the placeholder
             }
         });
-        assert!(out.contains("<span class=\"glue\"></span>"), "rendered span swapped in: {out}");
+        // The rendered fragment is swapped in AND tagged with the span's id.
+        assert!(
+            out.contains("class=\"glue\"") && out.contains("data-widget-id=\"s0\""),
+            "rendered span swapped in and tagged: {out}"
+        );
         assert!(
             out.contains("data-code=\"CodeView forString\""),
             "the None (unbuildable) span keeps its placeholder: {out}"

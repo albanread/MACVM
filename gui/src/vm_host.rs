@@ -126,6 +126,9 @@ pub enum VmRequest {
         side: String,
         sel: String,
         text: String,
+        /// The `data-widget-id` of the outliner being edited — left out of the
+        /// post-accept live refresh so its editor isn't yanked out mid-edit.
+        widget_id: String,
     },
     /// Reset the worker's `BrowserSelection` to match the fresh default
     /// state the initial page render always shows (see
@@ -854,6 +857,66 @@ fn mock_world_from_image(image: &image_store::Image) -> MockWorld {
     world
 }
 
+thread_local! {
+    /// The open smappl outliners on the current page — the `ToolRegistry`
+    /// (`docs/APPS.md` §7): `(widget_id, visual= code)`. Populated as each
+    /// outliner renders; consulted after an accept to live-refresh the others
+    /// so an edit in one view shows up in the rest without a page reload. Kept
+    /// thread-local on the single-threaded worker so `handle`'s signature (and
+    /// its ~15 test call sites) stay put. Bounded: `data-widget-id`s restart
+    /// at `s0` per page, so re-rendering a page replaces its own entries.
+    static OPEN_OUTLINERS: std::cell::RefCell<Vec<(String, String)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Render a `visual=` expression and fill any ClassOutliner source blocks from
+/// image_store (the VM keeps no method source). `None` on a render failure.
+fn render_and_inject(
+    vm: &mut VmHandle,
+    image: Option<&image_store::Image>,
+    code: &str,
+) -> Option<String> {
+    let html = vm.render_fragment(code).ok()?;
+    Some(match image {
+        Some(img) => crate::preprocess::inject_method_sources(&html, |c, s, sel| {
+            let side = if s == "class" {
+                image_store::Side::Class
+            } else {
+                image_store::Side::Instance
+            };
+            img.method_source(c, side, sel).ok().flatten()
+        }),
+        None => html,
+    })
+}
+
+use crate::preprocess::tag_widget_id;
+
+/// Re-render every open outliner except `skip_id` (the one being edited, whose
+/// DOM must not be disrupted mid-edit) and answer fragment updates for them —
+/// the live half of the `ToolRegistry` (`docs/APPS.md` §7). Called after an
+/// accept so a change shows up across all open outliners.
+fn refresh_open_outliners(
+    vm: &mut VmHandle,
+    image: Option<&image_store::Image>,
+    skip_id: &str,
+) -> Vec<VmResponse> {
+    let entries: Vec<(String, String)> = OPEN_OUTLINERS.with(|o| o.borrow().clone());
+    let mut out = Vec::new();
+    for (id, code) in entries {
+        if id == skip_id {
+            continue;
+        }
+        if let Some(html) = render_and_inject(vm, image, &code) {
+            out.push(VmResponse::SmapplFragment {
+                html: tag_widget_id(&html, &id),
+                id,
+            });
+        }
+    }
+    out
+}
+
 /// `Doit`/`WorkspacePrintIt` (S21 step 3) call the real `vm.eval` — see
 /// `boot_real_vm`. Every other request is still the Browser/Canvas mock
 /// (`docs/SPEC.md` §16.3's mirror-primitive bridge is a separate, later
@@ -887,25 +950,24 @@ fn handle(
             // built yet fails cleanly — answer nothing so the placeholder box
             // remains (the swallow-to-fallback contract, `../smappl.md` §2),
             // rather than surfacing the error onto the page.
-            match vm.render_fragment(&code) {
-                Ok(html) => {
-                    // A ClassOutliner leaves empty <pre> source blocks the VM
-                    // can't fill (it keeps no method source) — enrich them from
-                    // image_store here (crate::preprocess::inject_method_sources).
-                    let html = match image {
-                        Some(img) => crate::preprocess::inject_method_sources(&html, |c, s, sel| {
-                            let side = if s == "class" {
-                                image_store::Side::Class
-                            } else {
-                                image_store::Side::Instance
-                            };
-                            img.method_source(c, side, sel).ok().flatten()
-                        }),
-                        None => html,
-                    };
-                    vec![VmResponse::SmapplFragment { id, html }]
+            match render_and_inject(vm, image, &code) {
+                Some(html) => {
+                    // Register open outliners in the ToolRegistry so an accept
+                    // elsewhere can live-refresh them (docs/APPS.md §7);
+                    // replace any prior entry for this widget id (page reload).
+                    if html.contains("st-outliner") {
+                        OPEN_OUTLINERS.with(|o| {
+                            let mut v = o.borrow_mut();
+                            v.retain(|(wid, _)| wid != &id);
+                            v.push((id.clone(), code.clone()));
+                        });
+                    }
+                    vec![VmResponse::SmapplFragment {
+                        html: tag_widget_id(&html, &id),
+                        id,
+                    }]
                 }
-                Err(_) => vec![],
+                None => vec![],
             }
         }
         VmRequest::SmapplAction { action_id } => {
@@ -923,6 +985,7 @@ fn handle(
             side,
             sel,
             text,
+            widget_id,
         } => {
             // Reuse the class browser's proven accept path (BrowserSaveSource):
             // (1) VERSION the edit into image_store — a new method_versions row,
@@ -958,7 +1021,12 @@ fn handle(
                 },
                 Err(e) => format!("{cls}>>{sel}: image write FAILED (not versioned): {e}"),
             };
-            vec![VmResponse::Transcript(versioned)]
+            // Live-refresh every OTHER open outliner so the edit shows up
+            // across all views on the page (ToolRegistry, docs/APPS.md §7);
+            // the edited outliner (`widget_id`) is skipped so its editor stays.
+            let mut responses = vec![VmResponse::Transcript(versioned)];
+            responses.extend(refresh_open_outliners(vm, image, &widget_id));
+            responses
         }
         VmRequest::BrowserOpen => {
             // No longer resets `selection` to default — that made sense
@@ -1932,11 +2000,79 @@ mod tests {
         );
     }
 
+    /// View sync (ToolRegistry, docs/APPS.md §7): with two outliners open, an
+    /// accept in one live-refreshes the OTHER (so the edit shows everywhere)
+    /// but skips the one being edited (so its editor isn't yanked mid-edit).
+    #[test]
+    fn accept_refreshes_other_open_outliners_but_not_the_edited_one() {
+        OPEN_OUTLINERS.with(|o| o.borrow_mut().clear());
+        let world_dir = test_world_dir();
+        let tmp = std::env::temp_dir()
+            .join(format!("macvm_sync_{}.sqlite3", std::process::id()));
+        std::fs::remove_file(&tmp).ok();
+        let image = open_or_seed_image(&world_dir, &tmp).expect("seed");
+        let mut vm = VmHandle::boot_without_world(macvm::runtime::VmOptions {
+            heap_mib: 64,
+            jit: macvm::runtime::JitMode::Off,
+            ..Default::default()
+        });
+        crate::world_boot::load_world_from_image(&mut vm, &image, WORLD_DOITS).expect("db load");
+        let mut world = MockWorld::seed();
+        let mut sel = BrowserSelection::default();
+
+        // Two open Point outliners: s0 (being edited) and s1 (a bystander).
+        for id in ["s0", "s1"] {
+            handle(
+                VmRequest::SmapplRender {
+                    id: id.to_string(),
+                    code: "ClassOutliner for: (ClassMirror on: Point)".to_string(),
+                },
+                &mut world,
+                &mut sel,
+                Some(&image),
+                &mut vm,
+            );
+        }
+
+        let responses = handle(
+            VmRequest::SmapplAccept {
+                cls: "Point".to_string(),
+                side: "instance".to_string(),
+                sel: "y".to_string(),
+                text: "y [ ^42 ]".to_string(),
+                widget_id: "s0".to_string(), // the edited outliner
+            },
+            &mut world,
+            &mut sel,
+            Some(&image),
+            &mut vm,
+        );
+
+        let refreshed: Vec<&str> = responses
+            .iter()
+            .filter_map(|r| match r {
+                VmResponse::SmapplFragment { id, html } => {
+                    assert!(html.contains("^42"), "refresh must carry the new source");
+                    Some(id.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            refreshed,
+            vec!["s1"],
+            "only the bystander outliner refreshes; the edited one (s0) is skipped, got {refreshed:?}"
+        );
+
+        std::fs::remove_file(&tmp).ok();
+    }
+
     /// Accepting a ClassOutliner edit VERSIONS it into image_store (a new
     /// `method_versions` row, never an overwrite — the user's explicit
     /// requirement) AND live-compiles it into the running VM.
     #[test]
     fn smappl_accept_versions_the_edit_and_makes_it_live() {
+        OPEN_OUTLINERS.with(|o| o.borrow_mut().clear());
         let world_dir = test_world_dir();
         let tmp = std::env::temp_dir()
             .join(format!("macvm_accept_{}.sqlite3", std::process::id()));
@@ -1969,6 +2105,7 @@ mod tests {
                 side: "instance".to_string(),
                 sel: "y".to_string(),
                 text: "y [ ^x ]".to_string(),
+                widget_id: String::new(),
             },
             &mut world,
             &mut selection,

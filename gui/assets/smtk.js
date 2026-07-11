@@ -330,12 +330,14 @@
       if (!input) return;
       if ((ev.metaKey || ev.ctrlKey) && (ev.key === "s" || ev.key === "S")) {
         ev.preventDefault();
+        const host = input.closest("[data-widget-id]");
         post({
           kind: "smapplAccept",
           cls: input.getAttribute("data-src-class") || "",
           side: input.getAttribute("data-src-side") || "",
           sel: input.getAttribute("data-src-sel") || "",
           text: input.value,
+          widgetId: host ? host.getAttribute("data-widget-id") || "" : "",
         });
       }
     },
@@ -622,10 +624,50 @@
     });
   }
 
-  // vm_host::VmResponse::SmapplFragment arrives here (main.rs).
+  // The open/expanded nodes of an outliner, keyed by their header text — so a
+  // live refresh (re-rendered fragment) can restore the tree to how the user
+  // had it rather than snapping everything shut.
+  // A node's stable key = its header text minus the toggle glyph (which flips
+  // ▾/▸ with open state, so it must not be part of the key).
+  function nodeKey(header) {
+    const tw = header.querySelector(":scope > .st-tw");
+    let t = header.textContent;
+    if (tw) t = t.replace(tw.textContent, "");
+    return t.trim();
+  }
+  function captureOpenNodes(root) {
+    const open = new Set();
+    root.querySelectorAll(".st-node > .st-children").forEach(function (kids) {
+      if (kids.style.display !== "none") {
+        const header = kids.parentElement.querySelector(":scope > .st-header");
+        if (header) open.add(nodeKey(header));
+      }
+    });
+    return open;
+  }
+  function restoreOpenNodes(root, open) {
+    root.querySelectorAll(".st-node > .st-header").forEach(function (header) {
+      const kids = header.parentElement.querySelector(":scope > .st-children");
+      const tw = header.querySelector(":scope > .st-tw[data-tw]");
+      if (kids && tw && open.has(nodeKey(header))) {
+        kids.style.display = "";
+        tw.innerHTML = "▾ ";
+      }
+    });
+  }
+
+  // vm_host::VmResponse::SmapplFragment arrives here (main.rs). Matches the
+  // placeholder span on first render OR an already-rendered fragment's root on
+  // a live refresh (both carry data-widget-id).
   window.macvmRenderSmappl = function (widgetId, html) {
-    const span = document.querySelector('span.smappl[data-widget-id="' + widgetId + '"]');
-    if (span) span.outerHTML = html;
+    const el = document.querySelector('[data-widget-id="' + widgetId + '"]');
+    if (!el) return;
+    const open = el.classList && el.classList.contains("smappl") ? null : captureOpenNodes(el);
+    el.outerHTML = html;
+    if (open) {
+      const fresh = document.querySelector('[data-widget-id="' + widgetId + '"]');
+      if (fresh) restoreOpenNodes(fresh, open);
+    }
     // A ClassOutliner fragment carries `.st-code-editor` source editors —
     // paint their syntax highlighting now that they're in the DOM.
     if (window.macvmHighlightCodeEditors) window.macvmHighlightCodeEditors();
