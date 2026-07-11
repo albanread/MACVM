@@ -82,6 +82,49 @@ allocating. See [`docs/PERF.md`](docs/PERF.md) for the arc and methodology.
 - **Scripting** — an embedded RUSTTCL console for driving the VM and its
   debugger ([`docs/RUSTTCL.md`](docs/RUSTTCL.md)).
 
+### Fast floating point
+
+Strongtalk's tour promised "fast floats" — eliminating the allocation for
+intermediate results within a method. MACVM implements that promise in the
+tier-1 JIT as **float regions**: a mono-`Double` send site (the inline cache
+is the type oracle) compiles to a guarded unbox, native `fmul`/`fadd`/`fcmp`,
+and a box only where a boxed value is actually observed. Inside a region there
+is **no allocation, no GC interaction, and no message send — just assembler
+maths and libm calls**:
+
+- **A second register file.** Unboxed floats live in `d0`–`d7` scratch plus a
+  `d8`–`d15` write-through residency tier, fully independent of the GPR
+  allocator. A raw `f64` is invisible to the moving GC (never in an oop map,
+  never scanned), which is what makes registers-across-safepoints cheap here.
+- **A box/unbox reducer.** `FUnbox(FBox x) → x` cancellation, dead-box
+  elimination, deopt-sunk boxing (an intermediate needed only by deopt
+  metadata is boxed *in the trap's own cold block*), literal folding, and
+  **float-temp promotion** — a temp that provably always holds a `Double`
+  lives as a raw `f64` across the whole loop, safepoints included.
+- **Honest deoptimization.** One new deopt-map kind (`DoubleSlot`) tells the
+  materializer "this frame slot is raw float bits — box it back"; everything
+  else reuses the existing trap/reexecute machinery, verified by pinned
+  forced-deopt-mid-loop regressions.
+- **libm transcendentals** — `sin cos tan exp ln atan sqrt` as primitives;
+  libm preserves the callee-saved `d`-registers, so a plotted curve costs one
+  library call per point plus register arithmetic.
+
+Measured on the GUI's Mandelbrot demo (420×220, release, Apple Silicon), each
+layer removing a *category* of cost:
+
+| stage | time | allocation per render |
+|-------|------|-----------------------|
+| boxed sends (before) | 746 ms | 708 MB |
+| pixel-buffer output | 458 ms | 595 MB |
+| float-region fuse | 180 ms | 595 MB |
+| sunk boxing + temp promotion | 166 ms | 4 MB |
+| strength-reduced coordinates | 38 ms | 0 |
+| **d-register residency** | **25 ms** | **0** |
+
+**~30× end to end, with zero allocation, zero deopts, and one scavenge-free
+heap per render.** Full design, the measured-and-rejected variants included,
+in [`docs/float_fastpath_design.md`](docs/float_fastpath_design.md).
+
 ### Design & planning docs
 
 | Doc | Contents |
@@ -90,6 +133,7 @@ allocating. See [`docs/PERF.md`](docs/PERF.md) for the arc and methodology.
 | [`docs/SPRINTS.md`](docs/SPRINTS.md) | The phased implementation plan (S0–S15 core, S16+ stretch) and its status |
 | [`docs/DESIGN.md`](docs/DESIGN.md) | High-level architecture + decisions of record (D1–D13) |
 | [`docs/PERF.md`](docs/PERF.md) | The performance record: every optimization arc, measured |
+| [`docs/float_fastpath_design.md`](docs/float_fastpath_design.md) | Unboxed float regions: the IR review, the reducer, the `d`-register file, `DoubleSlot` deopt |
 | [`docs/arm64.md`](docs/arm64.md) | Machine-level design: MAP_JIT/W^X, AAPCS64, PAC, relocs, oop maps, deopt glue |
 | [`docs/reference-vm-analysis.md`](docs/reference-vm-analysis.md) | Source-anchored analysis of Self, Strongtalk, JASM, and the MacNCL GC |
 | [`docs/sprints/`](docs/sprints/README.md) | Per-sprint implementation guidance + test plans (the sprint logs) |
