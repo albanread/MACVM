@@ -390,6 +390,12 @@ fn navigate_to(path: &Path) {
         display_canvas();
         return;
     }
+    if path == class_outliner_view_marker() {
+        // Rebuild the smappl class-outliner page; its `<smappl>` resolves
+        // via the worker on load, same as any corpus page.
+        display_class_outliner();
+        return;
+    }
     let html = match preprocess::load_and_preprocess(
         path,
         current_theme(),
@@ -458,6 +464,39 @@ fn open_workspace() {
         nav.lock().unwrap().go(workspace_view_marker());
     }
     display_workspace();
+}
+
+/// The "User hierarchy" toolbar button (`preprocess::TOOLBAR_BUTTONS`) — a
+/// full-page class browser built on the smappl `ClassHierarchyOutliner`
+/// (click a class name to drill into its editable method browser). Distinct
+/// from the "Full hierarchy" button, which opens the older MockWorld browser.
+fn class_outliner_view_marker() -> PathBuf {
+    gui_root().join(".class-outliner-view")
+}
+
+fn open_class_outliner() {
+    if let Some(nav) = NAV.get() {
+        nav.lock().unwrap().go(class_outliner_view_marker());
+    }
+    display_class_outliner();
+}
+
+fn display_class_outliner() {
+    // A `<smappl>` tag: `render_generated_page` rewrites it to a placeholder
+    // span (like any corpus page), and smtk.js resolves it via the worker on
+    // load — no smappl evaluation happens here on the main thread.
+    let body = "<h1>Class Browser</h1>\
+        <p>Click a class name to open its methods; the &#9656; toggles subclasses.</p>\
+        <smappl visual=\"ClassHierarchyOutliner imbeddedVisualForClass: Object\">";
+    let html = preprocess::render_generated_page(
+        "Class Browser",
+        body,
+        &gui_root(),
+        current_theme(),
+        current_font_scale_percent(),
+        &current_transcript(),
+    );
+    display_html(&html);
 }
 
 fn display_workspace() {
@@ -675,6 +714,7 @@ extern "C" fn on_script_message(_this: Id, _cmd: Sel, _controller: Id, message: 
                     }
                     navigate_to(&doc_index);
                 }
+                "userHierarchy" => open_class_outliner(),
                 "hierarchy" => open_class_browser(),
                 "workspace" => open_workspace(),
                 "canvas" => open_canvas(),
