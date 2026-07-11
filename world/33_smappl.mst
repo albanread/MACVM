@@ -57,6 +57,19 @@ Object subclass: Visual [
         "Click hook; a plain Visual does nothing."
         ^self
     ]
+    "Corpus decoration chain (gui/smappl.md §3.4-3.5): these wrap a Visual in
+     a border/hrule frame on-screen. For the HTML bridge they are identity —
+     the border lives in CSS (.st-outliner) — so the whole
+     `... topVisualWithHRule: false withBorder: (Border standard3DRaised: true)`
+     tail just answers the receiver, which still responds to #htmlFragment."
+    topVisualWithHRule: aBool [ ^self ]
+    withBorder: aBorder [ ^self ]
+    with3DBorder [ ^self ]
+]
+
+"--- Border: a decoration descriptor (identity for the HTML bridge) ---"
+Object subclass: Border [
+    Border class >> standard3DRaised: aBool [ ^self ]
 ]
 
 "--- Glue: an invisible rigid spacer (gui/smappl.md §3 shape 6) ---"

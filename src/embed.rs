@@ -514,6 +514,58 @@ mod tests {
         );
     }
 
+    /// Phase-W method nodes: `ClassOutliner for: (ClassMirror on: Point)`
+    /// renders the class's own instance- and class-side selectors (the
+    /// `selectorsOf:` R2 primitive → sorted selector leaves), including the
+    /// full corpus decoration chain (`topVisualWithHRule:`/`withBorder:`/
+    /// `Border standard3DRaised:`, all identity for HTML).
+    #[test]
+    fn render_fragment_class_outliner_lists_selectors() {
+        let mut vm = boot_test_vm(JitMode::Off);
+        // The corpus decoration chain is two sends (note the inner parens):
+        // `(x topVisualWithHRule: false) withBorder: (...)` — gui/smappl.md §3.4.
+        let html = vm
+            .render_fragment(
+                "((ClassOutliner for: (ClassMirror on: Point)) topVisualWithHRule: false) \
+                 withBorder: (Border standard3DRaised: true)",
+            )
+            .expect("the class outliner must render");
+        assert!(
+            html.contains("st-classoutliner") && html.contains("Point"),
+            "must be a class outliner for Point, got {html:?}"
+        );
+        assert!(
+            html.contains("instance side") && html.contains("class side"),
+            "must show both sides, got {html:?}"
+        );
+        // Point's own instance selectors (x, +, printOn:) and a class-side one
+        // (origin) must appear.
+        assert!(
+            html.contains(">x<") || html.contains("st-selector\">x"),
+            "instance selectors must be listed, got {html:?}"
+        );
+        assert!(html.contains("printOn:") && html.contains("origin"), "got {html:?}");
+    }
+
+    /// The `selectorsOf:` primitive answers a class's own selectors and fails
+    /// gracefully on a non-behavior.
+    #[test]
+    fn selectors_of_primitive() {
+        let mut vm = boot_test_vm(JitMode::Off);
+        let n = vm
+            .eval("(ClassMirror selectorsOf: Point) size.")
+            .expect("selectorsOf: must run")
+            .parse::<i64>()
+            .expect("size is an integer");
+        assert!(n > 5, "Point defines many instance selectors, got {n}");
+        // A non-behavior fails the primitive and hits the method's fallback
+        // body (an empty Array) rather than erroring.
+        let empty = vm
+            .eval("(ClassMirror selectorsOf: 3) size.")
+            .expect("selectorsOf: on a non-behavior falls back cleanly");
+        assert_eq!(empty, "0", "a non-behavior has no selectors");
+    }
+
     /// A `visual=` shape not yet buildable (needs a later Phase-W wave — the
     /// `CodeView` substrate) surfaces as `Err`, so the GUI falls back to the
     /// G0 placeholder box rather than breaking the page.

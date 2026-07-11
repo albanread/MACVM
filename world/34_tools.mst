@@ -52,6 +52,14 @@ Object subclass: ClassMirror [
     ClassMirror class >> allClasses [
         <primitive: 98>
     ]
+    "R2 (docs/APPS.md §3): a behavior's own (not inherited) selectors, as an
+     Array of Symbols in unspecified order. Pass a class for instance
+     selectors, `aClass class` (the metaclass) for class-side selectors."
+    ClassMirror class >> selectorsOf: aBehavior [
+        <primitive: 99>
+        "Fallback (a non-behavior argument fails the primitive): no selectors."
+        ^Array new: 0
+    ]
     setClass: c [
         klass := c.
         ^self
@@ -69,6 +77,13 @@ Object subclass: ClassMirror [
         ClassMirror allClasses do: [ :c |
             (c superclass == klass) ifTrue: [ subs add: (ClassMirror on: c) ] ].
         ^subs
+    ]
+    "Own selectors, alphabetically sorted (Symbol < Symbol is String compare)."
+    instanceSelectors [
+        ^(ClassMirror selectorsOf: klass) asSortedCollection
+    ]
+    classSelectors [
+        ^(ClassMirror selectorsOf: klass class) asSortedCollection
     ]
 ]
 
@@ -120,5 +135,49 @@ Visual subclass: ClassHierarchyOutliner [
             html raw: '</div>'.
         ].
         html raw: '</div>'.
+    ]
+]
+
+"--- ClassOutliner: a single class's methods, instance + class side (§3.4) ---"
+Visual subclass: ClassOutliner [
+    | mirror |
+    "Accept a ClassMirror or a bare class (the corpus uses `for: (ClassMirror
+     on: X)`; be lenient)."
+    ClassOutliner class >> for: aMirrorOrClass [
+        ^self basicNew setMirror:
+            ((aMirrorOrClass isKindOf: ClassMirror)
+                ifTrue: [ aMirrorOrClass ]
+                ifFalse: [ ClassMirror on: aMirrorOrClass ])
+    ]
+    setMirror: m [
+        mirror := m.
+        ^self
+    ]
+    htmlFragment [
+        | html |
+        html := HtmlWriter new.
+        html raw: '<div class="st-outliner st-classoutliner">'.
+        html raw: '<div class="st-node open"><span class="st-header st-class">'.
+        html escaped: mirror name.
+        html raw: '</span><div class="st-children">'.
+        self side: 'instance' selectors: mirror instanceSelectors on: html.
+        self side: 'class' selectors: mirror classSelectors on: html.
+        html raw: '</div></div></div>'.
+        ^html contents
+    ]
+    side: label selectors: sels on: html [
+        "A collapsible side (instance/class) whose children are its selectors."
+        html raw: '<div class="st-node closed"><span class="st-header st-side">'.
+        html raw: '<span class="st-tw" data-tw>&#9656; </span>'.
+        html escaped: label.
+        html raw: ' side ('.
+        html raw: sels size printString.
+        html raw: ')</span><div class="st-children" style="display:none">'.
+        sels do: [ :sel |
+            html raw: '<div class="st-node"><span class="st-header st-selector">'.
+            html raw: '<span class="st-tw-leaf"></span>'.
+            html escaped: sel asString.
+            html raw: '</span></div>' ].
+        html raw: '</div></div>'.
     ]
 ]

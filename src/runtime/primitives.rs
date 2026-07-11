@@ -421,6 +421,14 @@ pub static PRIMITIVES: &[PrimDesc] = &[
         can_allocate: true,
         can_fail: false,
     },
+    PrimDesc {
+        id: 99,
+        name: "selectorsOf:",
+        f: prim_selectors_of,
+        argc: 1,
+        can_allocate: true,
+        can_fail: true,
+    },
     // --- Double group (S6, SPEC §1.3) ------------------------------------
     PrimDesc {
         id: 100,
@@ -1201,6 +1209,53 @@ fn prim_all_classes(vm: &mut VmState, _args: &[Oop]) -> PrimResult {
         }
     }
     PrimResult::Ok(result.oop())
+}
+
+/// R2 reflection (`docs/APPS.md` §3): the selectors a behavior defines *in
+/// its own* method dictionary (not inherited), as an `Array` of `Symbol`s in
+/// unspecified order (the caller sorts). `args[1]` is the behavior — pass a
+/// class for its instance selectors, `aClass class` (the metaclass) for its
+/// class-side selectors. A behavior with no method dictionary yet answers an
+/// empty `Array`.
+///
+/// GC-safe: the behavior is handle-rooted across `alloc_indexable_oops` (which
+/// may scavenge and move it), and its dictionary is re-derived after the
+/// allocation rather than cached across it.
+fn prim_selectors_of(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    if KlassOop::try_from(args[1]).is_none() {
+        return PrimResult::Fail; // not a behavior
+    }
+    let scope = crate::memory::handles::HandleScope::enter(vm);
+    let behavior_h = scope.handle(vm, args[1]);
+
+    // Pass 1: count (allocation-free).
+    let mut count = 0usize;
+    if let Some(dict) = selector_dict(vm, behavior_h.get(vm)) {
+        dict.each_pair(vm, |_sel, _m| count += 1);
+    }
+
+    // Allocate the result (may move the heap).
+    let array_klass = vm.universe.array_klass;
+    let result = alloc::alloc_indexable_oops(vm, array_klass, count);
+
+    // Pass 2: re-derive the (possibly moved) dictionary and fill.
+    if let Some(dict) = selector_dict(vm, behavior_h.get(vm)) {
+        let mut j = 0usize;
+        dict.each_pair(vm, |sel, _m| {
+            if j < count {
+                result.at_put(j, sel.oop());
+                j += 1;
+            }
+        });
+    }
+    PrimResult::Ok(result.oop())
+}
+
+/// A behavior's own `MethodDictionary`, or `None` if it isn't a behavior or
+/// has no dictionary yet.
+fn selector_dict(_vm: &VmState, behavior: Oop) -> Option<crate::oops::method_dict::MethodDictOop> {
+    let k = KlassOop::try_from(behavior)?;
+    crate::oops::method_dict::MethodDictOop::try_from(k.methods())
 }
 
 fn prim_gc_stats(vm: &mut VmState, args: &[Oop]) -> PrimResult {
