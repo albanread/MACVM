@@ -1,10 +1,13 @@
 # SIMD vector support — design
 
-**Status:** levels 1 AND 2 shipped. Level 1 — `Float64x2` (`70b9475`) +
-`Float32x4` value classes with the NEON JIT fuse `Ir::VecArith{kind}` →
-`.2d`/`.4s` (`541b1b2`, `cfd8c4f`), ~13–15× over the interpreter. Level 2 —
-`FloatArray` + explicit hand-written NEON bulk-kernel primitives `+@`/`sum`/
-`dot:` (`1f23ba7`), in `src/runtime/simd_kernels.rs`. Reductions ship in the
+**Status:** levels 1 AND 2 shipped. Level 1 — `Float64x2` (`70b9475`),
+`Float32x4`, and `Int32x4` value classes with the NEON JIT fuse
+`Ir::VecArith{kind}` → float `fadd/… .2d`/`.4s` or integer `add/sub/mul .4s`
+(`541b1b2`, `cfd8c4f`, `b7f6eab`), ~13–15× over the interpreter. `Int32x4`
+arithmetic wraps on 32-bit overflow (no vector integer divide); its reductions
+are bit-exact (integer add is associative). Level 2 — `FloatArray` + explicit
+hand-written NEON bulk-kernel primitives `+@`/`sum`/`dot:` (`1f23ba7`), in
+`src/runtime/simd_kernels.rs`. Reductions ship in the
 **fast pairwise order** (a `float64x2_t` accumulator + `faddp.2d`), the chosen
 tradeoff (Part D) — deterministic (so interpreter ≡ JIT, both being one
 primitive) but NOT the scalar left-fold, which `FloatArray>>sequentialSum`
