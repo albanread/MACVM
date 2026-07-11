@@ -1,10 +1,15 @@
 # SIMD vector support — design
 
-**Status:** designed, not built. Same posture as `docs/CANVAS.md` /
-`docs/float_fastpath_design.md` — the shape is pinned here in full; no code has
-landed. This is tier-1 compiler work plus a small value-class family and a set
-of bulk-array kernels; the interpreter's dispatch loop and the object model's
-core are untouched.
+**Status:** level-1 `Float64x2` shipped, both tiers. Increment 1 (the value
+class + interpreter primitives, `70b9475`) and Increment 2 (the NEON JIT fuse —
+`Ir::Vec2Arith` → `f{add,sub,mul,div} v.2d`, `541b1b2`) are built, verified
+byte-identical across `MACVM_JIT` off/threshold and `MACVM_GC_STRESS`, and
+measured ~15× over the interpreter (16M ops: 3.8s → 0.26s). Still designed-not-
+built below Increment 2: the reducer/q-pool generalization (Part C1/C2), the
+v8–v15 residency subtlety (C3), `ValueLoc::VectorSlot` deopt (C4), `Float32x4`,
+and the `FloatArray` bulk kernels + reductions (Parts D/E). The rest of this doc
+pins those in full. The interpreter's dispatch loop and the object model's core
+stay untouched throughout.
 
 **Goal.** Use the hardware's NEON lanes the way you would in a low-level
 language: a value type that *is* a bundle of 2/4/8/16 contiguous lanes, whole-
@@ -109,6 +114,18 @@ width — `Gpr | F64 | V128{arr}`):
 | `VExtract { dst, src, arr, lane }` | `umov`/`mov` a lane to a gpr/`d` |
 | `VReduce { kind, arr, dst, src }` | across-lane / pairwise tree (§D) |
 | `VConst { dst, bits: [u8;16] }` | `movi`/pool-load a constant vector |
+
+**As built (Increment 2, `Float64x2` only).** The first slice does NOT split
+`VUnbox`/`VArith`/`VBox` into separate ops with vector vregs — instead a single
+fused `Ir::Vec2Arith { op, dst, a, b, fail }` (where `a`/`b`/`dst` are ordinary
+**oop** vregs) lowers the whole guard → `ldr q` → `f…v.2d` → inline-box run
+internally with FIXED scratch `q16`/`q17` (v16/v17 are caller-saved, disjoint
+from the fp allocatable pool `d0–d7` and the residency pool `d8–d15`, so no live
+fp vreg is clobbered). This "box-per-op" shape means **zero allocator, reducer,
+or `RegClass` changes** — the tradeoff is one box alloc per op and no
+cross-op vector-value residency. Splitting into the `VUnbox`/`VArith`/`VBox`
+table above (so the reducer can cancel adjacent box/unbox and keep a vector live
+in a `q`-register across ops) is Increment 2b, and is what unlocks C1–C4 below.
 
 ### B4. Bit-exact parity is preserved for elementwise ops
 
