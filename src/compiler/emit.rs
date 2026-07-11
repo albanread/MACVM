@@ -269,6 +269,8 @@ struct Emitter<'a> {
     float64x2_klass_lit: PoolLit,
     /// SIMD: the `Float32x4` klass — same role for a `.4s` `VecArith`.
     float32x4_klass_lit: PoolLit,
+    /// SIMD: the `Int32x4` klass — same role for an integer `.4s` `VecArith`.
+    int32x4_klass_lit: PoolLit,
     /// Float fast-path: per-vreg FP-class flags (`VRegInfo::is_fp`) — `Move`
     /// dispatches GPR vs FP lowering on them (a promoted float temp's store
     /// is an fp-to-fp move).
@@ -295,6 +297,8 @@ struct Emitter<'a> {
     box_float64x2_lit: LiteralId,
     /// SIMD: the `Float32x4` box stub — same role for a `.4s` `VecArith`.
     box_float32x4_lit: LiteralId,
+    /// SIMD: the `Int32x4` box stub — same role for an integer `.4s` `VecArith`.
+    box_int32x4_lit: LiteralId,
     /// Same reasoning again, for `codecache::stubs::Stubs::call_primitive` —
     /// a shimmable primitive-bearing method's own entry-prologue shim
     /// `bl`s here (`compiler::driver`'s shimmable-primitive eligibility).
@@ -1054,19 +1058,21 @@ impl<'a> Emitter<'a> {
         use crate::compiler::ir::VecKind;
         use crate::oops::layout::{MEM_TAG, VMREG_EDEN_END_OFFSET, VMREG_EDEN_TOP_ADDR_OFFSET};
         let cold = self.block_label(fail);
-        // The three (and only) kind-dependent choices.
+        // The kind-dependent choices: guard/box klass, box stub, arrangement.
         let klass = match kind {
             VecKind::F64x2 => self.literal_ids[self.float64x2_klass_lit.0 as usize],
             VecKind::F32x4 => self.literal_ids[self.float32x4_klass_lit.0 as usize],
+            VecKind::I32x4 => self.literal_ids[self.int32x4_klass_lit.0 as usize],
         };
         let box_stub = match kind {
             VecKind::F64x2 => self.box_float64x2_lit,
             VecKind::F32x4 => self.box_float32x4_lit,
+            VecKind::I32x4 => self.box_int32x4_lit,
         };
-        // `.2d` (two f64) vs `.4s` (four f32) arrangement for the arith op.
+        // `.2d` (two f64) vs `.4s` (four 32-bit lanes, f32 OR i32) arrangement.
         let varr = |n: u8| match kind {
             VecKind::F64x2 => v2d(n),
-            VecKind::F32x4 => v4s(n),
+            VecKind::F32x4 | VecKind::I32x4 => v4s(n),
         };
 
         // ── Guard + unbox receiver `a` into q16. Guard mirrors emit_funbox:
@@ -1093,12 +1099,19 @@ impl<'a> Emitter<'a> {
         self.asm.b_cond(Cond::Ne, cold);
         self.asm.emit("ldr", &[q(17), mem(17, 16)]); // b's 128-bit body -> v17
 
-        // ── Elementwise NEON arithmetic: v16.<arr> = v16.<arr> op v17.<arr>. ─
-        let mnem = match op {
-            FArithOp::Add => "fadd",
-            FArithOp::Sub => "fsub",
-            FArithOp::Mul => "fmul",
-            FArithOp::Div => "fdiv",
+        // ── Elementwise NEON arithmetic: v16.<arr> = v16.<arr> op v17.<arr>.
+        //    Integer kinds use `add/sub/mul` (wrapping); float kinds `fadd/…`.
+        let mnem = match (kind.is_int(), op) {
+            (false, FArithOp::Add) => "fadd",
+            (false, FArithOp::Sub) => "fsub",
+            (false, FArithOp::Mul) => "fmul",
+            (false, FArithOp::Div) => "fdiv",
+            (true, FArithOp::Add) => "add",
+            (true, FArithOp::Sub) => "sub",
+            (true, FArithOp::Mul) => "mul",
+            (true, FArithOp::Div) => unreachable!(
+                "Int32x4 has no vector divide — vec_arith_op never yields Div for an integer kind"
+            ),
         };
         self.asm.emit(mnem, &[varr(16), varr(16), varr(17)]);
 
@@ -1626,6 +1639,7 @@ pub fn emit(
     box_double_addr: u64,
     box_float64x2_addr: u64,
     box_float32x4_addr: u64,
+    box_int32x4_addr: u64,
     call_primitive_addr: u64,
     nlr_originate_addr: u64,
     prim_shim: Option<(i64, u8)>,
@@ -1654,6 +1668,7 @@ pub fn emit(
     let box_double_lit = asm.literal_u64(box_double_addr, Some(RelocKind::RuntimeAddr));
     let box_float64x2_lit = asm.literal_u64(box_float64x2_addr, Some(RelocKind::RuntimeAddr));
     let box_float32x4_lit = asm.literal_u64(box_float32x4_addr, Some(RelocKind::RuntimeAddr));
+    let box_int32x4_lit = asm.literal_u64(box_int32x4_addr, Some(RelocKind::RuntimeAddr));
     let call_primitive_lit = asm.literal_u64(call_primitive_addr, Some(RelocKind::RuntimeAddr));
     let nlr_originate_lit = asm.literal_u64(nlr_originate_addr, Some(RelocKind::RuntimeAddr));
 
@@ -1676,6 +1691,7 @@ pub fn emit(
         double_klass_lit: method.double_klass_lit,
         float64x2_klass_lit: method.float64x2_klass_lit,
         float32x4_klass_lit: method.float32x4_klass_lit,
+        int32x4_klass_lit: method.int32x4_klass_lit,
         vreg_is_fp: method.vregs.iter().map(|v| v.is_fp).collect(),
         stub_poll_lit,
         must_be_boolean_lit,
@@ -1683,6 +1699,7 @@ pub fn emit(
         box_double_lit,
         box_float64x2_lit,
         box_float32x4_lit,
+        box_int32x4_lit,
         call_primitive_lit,
         nlr_originate_lit,
         call_sites: &method.call_sites,
@@ -2166,6 +2183,7 @@ mod tests {
             double_klass_lit: PoolLit(0),
             float64x2_klass_lit: PoolLit(0),
             float32x4_klass_lit: PoolLit(0),
+            int32x4_klass_lit: PoolLit(0),
             call_sites: Vec::new(),
             site_feedback: Vec::new(),
             inline_deps: Vec::new(),
@@ -2264,7 +2282,7 @@ mod tests {
         let ra = regalloc::regalloc(&method);
         let mut asm = JasmAssembler::new();
         let (_blob, block_pcs, _verified_entry_off, _ic_sites, _safepoints, _osr_off) =
-            emit(&mut asm, &method, &ra, 0, 0, 0, 0, 0, 0, 0, 0, None, None, None);
+            emit(&mut asm, &method, &ra, 0, 0, 0, 0, 0, 0, 0, 0, 0, None, None, None);
 
         assert_eq!(
             block_pcs.len(),
@@ -2343,7 +2361,7 @@ mod tests {
         let ra = regalloc::regalloc(&method);
         let mut asm = JasmAssembler::new();
         let (blob, _pcs, _verified_entry_off, _ic_sites, _safepoints, _osr_off) =
-            emit(&mut asm, &method, &ra, 0, 0, 0, 0, 0, 0, 0, 0, None, None, None);
+            emit(&mut asm, &method, &ra, 0, 0, 0, 0, 0, 0, 0, 0, 0, None, None, None);
 
         let mnemonics: Vec<&str> = blob.listing.iter().map(|l| mnemonic(l)).collect();
         let asr_pos = mnemonics.iter().position(|&m| m == "asr");
@@ -2415,7 +2433,7 @@ mod tests {
         let ra = regalloc::regalloc(&near);
         let mut asm = JasmAssembler::new();
         let (blob, _pcs, _verified_entry_off, _ic_sites, _safepoints, _osr_off) =
-            emit(&mut asm, &near, &ra, 0, 0, 0, 0, 0, 0, 0, 0, None, None, None);
+            emit(&mut asm, &near, &ra, 0, 0, 0, 0, 0, 0, 0, 0, 0, None, None, None);
         let near_mnemonics: Vec<String> = blob.listing.iter().map(|l| mnemonic(l)).collect();
         assert!(
             near_mnemonics.iter().any(|m| m == "ldur"),
@@ -2432,7 +2450,7 @@ mod tests {
         let ra2 = regalloc::regalloc(&far);
         let mut asm2 = JasmAssembler::new();
         let (blob2, _pcs2, _verified_entry_off2, _ic_sites2, _safepoints, _osr_off) =
-            emit(&mut asm2, &far, &ra2, 0, 0, 0, 0, 0, 0, 0, 0, None, None, None);
+            emit(&mut asm2, &far, &ra2, 0, 0, 0, 0, 0, 0, 0, 0, 0, None, None, None);
         let mnemonics: Vec<String> = blob2.listing.iter().map(|l| mnemonic(l)).collect();
         assert!(
             mnemonics.iter().any(|m| m == "sub"),
@@ -2500,6 +2518,7 @@ mod tests {
             0,
             0,
             0,
+            0,
             None,
             None,
             None,
@@ -2528,6 +2547,7 @@ mod tests {
             &mut asm2,
             &without_barrier,
             &ra2,
+            0,
             0,
             0,
             0,
@@ -2609,6 +2629,7 @@ mod tests {
             double_klass_lit: PoolLit(0),
             float64x2_klass_lit: PoolLit(0),
             float32x4_klass_lit: PoolLit(0),
+            int32x4_klass_lit: PoolLit(0),
             call_sites: Vec::new(),
             site_feedback: Vec::new(),
             inline_deps: Vec::new(),
@@ -2618,7 +2639,7 @@ mod tests {
         let ra = regalloc::regalloc(&method);
         let mut asm = JasmAssembler::new();
         let (blob, _pcs, _ve, _ic, _safepoints, _osr_off) =
-            emit(&mut asm, &method, &ra, 0, 0, 0xAABB, 0, 0, 0, 0, 0, None, None, None);
+            emit(&mut asm, &method, &ra, 0, 0, 0xAABB, 0, 0, 0, 0, 0, 0, None, None, None);
         let listing = blob.listing.join("\n");
         let mnemonic = |l: &str| l.split_whitespace().nth(2).unwrap_or("").to_string();
         let mnemonics: Vec<String> = blob.listing.iter().map(|l| mnemonic(l)).collect();
@@ -2706,6 +2727,7 @@ mod tests {
             &mut asm,
             &method,
             &ra,
+            0,
             0,
             0,
             0,
@@ -2828,6 +2850,7 @@ mod tests {
             0,
             0,
             0,
+            0,
             None,
             Some(guard),
             None,
@@ -2926,6 +2949,7 @@ mod tests {
             double_klass_lit: PoolLit(0),
             float64x2_klass_lit: PoolLit(0),
             float32x4_klass_lit: PoolLit(0),
+            int32x4_klass_lit: PoolLit(0),
             call_sites: vec![
                 CallSiteInfo {
                     selector: test_selector(b"foo"),
@@ -2951,7 +2975,7 @@ mod tests {
         let ra = regalloc::regalloc(&method);
         let mut asm = JasmAssembler::new();
         let (blob, _pcs, _verified_entry_off, ic_sites, _safepoints, _osr_off) =
-            emit(&mut asm, &method, &ra, 0, 0, 0, 0, 0, 0, 0, 0, None, None, None);
+            emit(&mut asm, &method, &ra, 0, 0, 0, 0, 0, 0, 0, 0, 0, None, None, None);
 
         assert_eq!(
             ic_sites.len(),

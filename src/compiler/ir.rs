@@ -97,10 +97,22 @@ pub enum FArithOp {
 /// choices differ; the guard/unbox/box skeleton is identical.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VecKind {
-    /// `Float64x2` — two f64 lanes, `fadd/… v.2d`.
+    /// `Float64x2` — two f64 lanes, float `fadd/… v.2d`.
     F64x2,
-    /// `Float32x4` — four f32 lanes, `fadd/… v.4s`.
+    /// `Float32x4` — four f32 lanes, float `fadd/… v.4s`.
     F32x4,
+    /// `Int32x4` — four i32 lanes, INTEGER `add/sub/mul v.4s` (no vector
+    /// divide). The arrangement token is `.4s` like `F32x4`; the OPCODE
+    /// (`add` vs `fadd`) is what distinguishes integer from float.
+    I32x4,
+}
+
+impl VecKind {
+    /// True for the integer lane types — selects integer NEON opcodes
+    /// (`add`/`sub`/`mul`) over the floating (`fadd`/`fsub`/`fmul`/`fdiv`).
+    pub fn is_int(self) -> bool {
+        matches!(self, VecKind::I32x4)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -713,6 +725,8 @@ pub struct IrMethod {
     /// a `.4s` `VecArith` (its box likewise reuses `mark_double_lit`; only the
     /// klass and the NEON arrangement differ).
     pub float32x4_klass_lit: PoolLit,
+    /// SIMD: the `Int32x4` klass oop — same role for an integer `.4s` `VecArith`.
+    pub int32x4_klass_lit: PoolLit,
     /// S11 D3: one entry per `Ir::CallSend` site, indexed by its own
     /// `site: u16` — mirrors `pool`'s own "small side table, indexed by a
     /// compact id embedded in the `Ir`" shape. `emit.rs` has no `VmState`/
@@ -1008,12 +1022,15 @@ fn vec_arith_op(kind: VecKind, prim: i64) -> Option<FArithOp> {
     let base = match kind {
         VecKind::F64x2 => 129,
         VecKind::F32x4 => 136,
+        VecKind::I32x4 => 150,
     };
     match prim - base {
         0 => Some(FArithOp::Add),
         1 => Some(FArithOp::Sub),
         2 => Some(FArithOp::Mul),
-        3 => Some(FArithOp::Div),
+        // NEON has no vector integer divide, so `Int32x4` stops at `*` — its
+        // `at:` (prim 153, offset 3) must NOT be mistaken for a divide.
+        3 if !kind.is_int() => Some(FArithOp::Div),
         _ => None,
     }
 }
@@ -1028,6 +1045,7 @@ fn classify_vec_send(vm: &VmState, method: MethodOop, ic_idx: u16, kind: VecKind
     let klass = match kind {
         VecKind::F64x2 => vm.universe.float64x2_klass,
         VecKind::F32x4 => vm.universe.float32x4_klass,
+        VecKind::I32x4 => vm.universe.int32x4_klass,
     };
     debug_assert_eq!(
         ic.guard().raw(),
@@ -1590,6 +1608,8 @@ impl<'a> Translator<'a> {
             (VecKind::F64x2, self.vm.universe.float64x2_klass)
         } else if guard == self.vm.universe.float32x4_klass.oop().raw() {
             (VecKind::F32x4, self.vm.universe.float32x4_klass)
+        } else if guard == self.vm.universe.int32x4_klass.oop().raw() {
+            (VecKind::I32x4, self.vm.universe.int32x4_klass)
         } else {
             return None;
         };
@@ -6787,6 +6807,9 @@ pub fn convert(
     let float32x4_klass_lit = t
         .pool
         .intern(vm.universe.float32x4_klass.oop().raw(), Some(RelocKind::Oop));
+    let int32x4_klass_lit = t
+        .pool
+        .intern(vm.universe.int32x4_klass.oop().raw(), Some(RelocKind::Oop));
     // S24 A3b: the Context klass, interned once for the prologue Context
     // allocation of a MATERIALIZING has_ctx method.
     let ctx_klass_lit = if materialize_ctx {
@@ -7321,6 +7344,7 @@ pub fn convert(
         double_klass_lit,
         float64x2_klass_lit,
         float32x4_klass_lit,
+        int32x4_klass_lit,
         call_sites: t.call_sites,
         site_feedback: t.site_feedback,
         inline_deps: t.inline_deps,

@@ -66,8 +66,8 @@
 
 use crate::codecache::nmethod::NmethodId;
 use crate::codecache::stubs::{
-    KIND_ALLOC_SLOW, KIND_BOX_DOUBLE, KIND_BOX_FLOAT32X4, KIND_BOX_FLOAT64X2, KIND_C2I,
-    KIND_CALL_PRIMITIVE, KIND_DEOPT_BRIDGE, KIND_DNU, KIND_MEGA, KIND_MUST_BE_BOOLEAN,
+    KIND_ALLOC_SLOW, KIND_BOX_DOUBLE, KIND_BOX_FLOAT32X4, KIND_BOX_FLOAT64X2, KIND_BOX_INT32X4,
+    KIND_C2I, KIND_CALL_PRIMITIVE, KIND_DEOPT_BRIDGE, KIND_DNU, KIND_MEGA, KIND_MUST_BE_BOOLEAN,
     KIND_NLR_ORIGINATE, KIND_RESOLVE, KIND_VALUE_DISPATCH,
 };
 use crate::interpreter::stack::Frame;
@@ -120,6 +120,8 @@ pub enum AdapterKind {
     /// SIMD: a compiled `Ir::VecArith`'s eden-overflow tail for a `Float32x4`
     /// (`build_stub_box_float32x4`). Zero RootSpill oop slots, as `BoxFloat64x2`.
     BoxFloat32x4,
+    /// SIMD: same, for an `Int32x4` (`build_stub_box_int32x4`). Zero slots.
+    BoxInt32x4,
     Poll,
     /// S14 step 9: not a real adapter — the synthetic anchor
     /// [`deopt_bridge_link`] plants so a walk during `interpret_active` can
@@ -150,6 +152,7 @@ impl AdapterKind {
             KIND_BOX_DOUBLE => AdapterKind::BoxDouble,
             KIND_BOX_FLOAT64X2 => AdapterKind::BoxFloat64x2,
             KIND_BOX_FLOAT32X4 => AdapterKind::BoxFloat32x4,
+            KIND_BOX_INT32X4 => AdapterKind::BoxInt32x4,
             // The deopt trampolines' record (see `KIND_DEOPT_BRIDGE`'s own
             // doc): same walker semantics as the synthetic bridge link —
             // no RootSpill slots, pass through to the deoptee frame.

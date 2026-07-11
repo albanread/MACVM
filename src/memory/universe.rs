@@ -122,6 +122,7 @@ pub struct Universe {
     /// value-class family.
     pub float64x2_klass: KlassOop,
     pub float32x4_klass: KlassOop,
+    pub int32x4_klass: KlassOop,
     /// SIMD level 2 (`docs/SIMD.md` Part E): `FloatArray` — a contiguous
     /// `Format::IndexableBytes` buffer of N f64 lanes (`n*8` bytes, GC-skipped
     /// body) that the NEON bulk kernels (`+@`/`sum`/`dot:`) stream over.
@@ -510,6 +511,17 @@ impl Universe {
             true,
             HEADER_WORDS + 2
         );
+        // SIMD: Int32x4 — four 32-bit INTEGER lanes (the other half of "2/4/8
+        // 32-bit lanes"). Same 16-byte raw body as Float32x4; the primitives
+        // read it as i32 and the NEON fuse uses integer `add/sub/mul v.4s`.
+        // Integer add is associative → its reductions are bit-exact.
+        let int32x4_klass = remaining_klass!(
+            "Int32x4",
+            object_klass.oop(),
+            Format::Double,
+            true,
+            HEADER_WORDS + 2
+        );
         let array_klass = remaining_klass!(
             "Array",
             arrayed_collection_klass.oop(),
@@ -726,6 +738,7 @@ impl Universe {
             double_klass,
             float64x2_klass,
             float32x4_klass,
+            int32x4_klass,
             float_array_klass,
             string_klass,
             symbol_klass,

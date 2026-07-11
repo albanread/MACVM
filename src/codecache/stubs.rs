@@ -81,6 +81,10 @@ pub const KIND_BOX_FLOAT64X2: u64 = 11;
 /// `KIND_BOX_FLOAT64X2` (x0/x1 are two raw 64-bit halves of the 128-bit lane
 /// body, never oops → zero RootSpill oop slots). See [`build_stub_box_float32x4`].
 pub const KIND_BOX_FLOAT32X4: u64 = 12;
+/// SIMD: `Ir::VecArith`'s eden-overflow tail for an `Int32x4` — same shape as
+/// the float box kinds (x0/x1 are two raw 64-bit halves of the 128-bit lane
+/// body, never oops → zero RootSpill oop slots). See [`build_stub_box_int32x4`].
+pub const KIND_BOX_INT32X4: u64 = 13;
 
 /// D5's shared stub skeleton, part 1: anchor + AAPCS frame + RootSpill
 /// (x0..x5). Every stub that calls into Rust starts with this; follow with
@@ -238,6 +242,9 @@ pub struct Stubs {
     /// as `box_float64x2` (x0/x1 = the two 64-bit halves of the `.4s` result).
     /// See [`build_stub_box_float32x4`].
     pub box_float32x4: CodeHandle,
+    /// SIMD: `Ir::VecArith`'s eden-overflow tail for an `Int32x4` — same shape.
+    /// See [`build_stub_box_int32x4`].
+    pub box_int32x4: CodeHandle,
     /// S24 A1: a compiled BLOCK body's `nlr_tos` lowering `bl`s here with
     /// x0 = the closure, x1 = the NLR value; `rt_nlr_originate` parks
     /// `vm.nlr_state` and the emitted continuation returns `NLR_SENTINEL`
@@ -314,6 +321,10 @@ impl Stubs {
     /// SIMD: `emit`'s `Ir::VecArith` (`Float32x4`) slow edge `bl`s here.
     pub fn box_float32x4_addr(&self) -> u64 {
         self.box_float32x4.base as u64
+    }
+    /// SIMD: `emit`'s `Ir::VecArith` (`Int32x4`) slow edge `bl`s here.
+    pub fn box_int32x4_addr(&self) -> u64 {
+        self.box_int32x4.base as u64
     }
     /// S24 A1: `emit`'s `Ir::NlrReturn` lowering `bl`s here (see
     /// [`build_stub_nlr_originate`]).
@@ -464,6 +475,12 @@ pub fn install(cache: &mut CodeCache) -> Stubs {
         .expect("stubs::install: code cache too small for box_float32x4");
     cache.publish(h15, &box_f32x4_blob);
 
+    let box_i32x4_blob = build_stub_box_int32x4();
+    let h16 = cache
+        .alloc(box_i32x4_blob.code.len())
+        .expect("stubs::install: code cache too small for box_int32x4");
+    cache.publish(h16, &box_i32x4_blob);
+
     Stubs {
         call_stub: h1,
         stub_poll: h2,
@@ -481,6 +498,7 @@ pub fn install(cache: &mut CodeCache) -> Stubs {
         box_double: h13,
         box_float64x2: h14,
         box_float32x4: h15,
+        box_int32x4: h16,
     }
 }
 
@@ -2000,6 +2018,57 @@ pub unsafe extern "C" fn rt_box_float32x4(vm: *mut VmState, half0: u64, half1: u
         f32::from_bits((half1 >> 32) as u32),
     ];
     crate::memory::alloc::alloc_float32x4(vm, lanes).raw()
+}
+
+/// SIMD: `stub_box_int32x4` — `Ir::VecArith`'s eden-overflow tail for an
+/// `Int32x4`. Identical shape to the float box stubs (the body is a 16-byte
+/// raw lane blob): x0/x1 hold the two 64-bit halves of the `.4s` result (each
+/// packs two i32 lanes), neither an oop. Marshals `rt_box_int32x4(vm, half0,
+/// half1)`; answers the tagged oop.
+fn build_stub_box_int32x4() -> CodeBlob {
+    let mut a = JasmAssembler::new();
+
+    emit_stub_prologue(&mut a);
+    emit_stub_kind_tag(&mut a, KIND_BOX_INT32X4);
+    a.emit("mov", &[x(2), x(1)]); // half1 -> x2
+    a.emit("mov", &[x(1), x(0)]); // half0 -> x1
+    a.emit("mov", &[x(0), x(28)]); // vm
+    let lit = a.literal_u64(
+        rt_box_int32x4 as *const () as u64,
+        Some(RelocKind::RuntimeAddr),
+    );
+    a.call_far(lit);
+    a.emit("mov", &[x(16), x(0)]);
+    emit_stub_epilogue(&mut a);
+    a.emit("mov", &[x(0), x(16)]);
+    a.emit("ret", &[]);
+
+    a.finish()
+}
+
+/// # Safety
+/// Only ever reached via `blr` from `stub_box_int32x4`'s own hand-assembled
+/// listing above, never called directly from Rust.
+///
+/// `half0`/`half1` are the two raw 64-bit halves of the `.4s` result (each
+/// packs two i32 lanes in NEON element order); NEITHER is an oop. Unpacks them
+/// into the four i32 lanes and allocates a fresh `Int32x4` (the repack is the
+/// identity on the raw words, so the boxed object is byte-for-byte the inline
+/// fast path's).
+pub unsafe extern "C" fn rt_box_int32x4(vm: *mut VmState, half0: u64, half1: u64) -> u64 {
+    // SAFETY: this function's own contract, guaranteed by stub_box_int32x4.
+    let vm = unsafe { &mut *vm };
+    debug_assert_ne!(
+        vm.reg_block.last_compiled_fp, 0,
+        "rt_box_int32x4: anchor must be set by stub_box_int32x4's prologue before this call"
+    );
+    let lanes = [
+        half0 as u32 as i32,
+        (half0 >> 32) as u32 as i32,
+        half1 as u32 as i32,
+        (half1 >> 32) as u32 as i32,
+    ];
+    crate::memory::alloc::alloc_int32x4(vm, lanes).raw()
 }
 
 /// D7: `stub_alloc_slow` — the inline-allocation fast path's overflow tail.

@@ -860,6 +860,57 @@ pub static PRIMITIVES: &[PrimDesc] = &[
         can_allocate: true,
         can_fail: true,
     },
+    // SIMD Int32x4 (docs/SIMD.md) — 4-lane i32. `+ - *` fuse to NEON integer
+    // `add/sub/mul v.4s` (is_int32x4 via the fuse's vec_arith_op, base 150);
+    // there is NO vector integer divide, so no `/`.
+    PrimDesc {
+        id: 148,
+        name: "x:y:z:w:",
+        f: prim_i4_xyzw,
+        argc: 4,
+        can_allocate: true,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 149,
+        name: "splat:",
+        f: prim_i4_splat,
+        argc: 1,
+        can_allocate: true,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 150,
+        name: "+",
+        f: prim_i4_add,
+        argc: 1,
+        can_allocate: true,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 151,
+        name: "-",
+        f: prim_i4_sub,
+        argc: 1,
+        can_allocate: true,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 152,
+        name: "*",
+        f: prim_i4_mul,
+        argc: 1,
+        can_allocate: true,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 153,
+        name: "at:",
+        f: prim_i4_at,
+        argc: 1,
+        can_allocate: true,
+        can_fail: true,
+    },
 ];
 
 pub fn prim_by_id(id: u16) -> Option<&'static PrimDesc> {
@@ -1939,6 +1990,98 @@ fn prim_x4_at(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     PrimResult::Ok(alloc::alloc_double(vm, lanes[(i - 1) as usize] as f64).oop())
 }
 
+// ── SIMD Int32x4 helpers + primitives (docs/SIMD.md) ──────────────────────
+//
+// Read the four i32 lanes of an Int32x4 (KLASS-checked). Lanes unpack in NEON
+// `.4s` element order, identical to Float32x4's layout — only the type
+// (32-bit two's-complement integer) differs. Arithmetic WRAPS on 32-bit
+// overflow, matching NEON `add/sub/mul v.4s` (a fixed-width lane is not a
+// promote-to-BigInt Smalltalk integer — you asked for 32-bit lanes).
+fn as_int32x4(vm: &VmState, o: Oop) -> Option<[i32; 4]> {
+    let m = MemOop::try_from(o)?;
+    if m.klass().oop().raw() != vm.universe.int32x4_klass.oop().raw() {
+        return None;
+    }
+    let w0 = m.body_word_raw(0);
+    let w1 = m.body_word_raw(1);
+    Some([
+        w0 as u32 as i32,
+        (w0 >> 32) as u32 as i32,
+        w1 as u32 as i32,
+        (w1 >> 32) as u32 as i32,
+    ])
+}
+
+/// A scalar lane argument truncated to a 32-bit lane: a SmallInteger's low 32
+/// bits (C-style narrowing — consistent with the wrapping arithmetic).
+fn as_scalar_i32(o: Oop) -> Option<i32> {
+    SmallInt::try_from(o).map(|n| n.value() as i32)
+}
+
+/// `Int32x4 x: a y: b z: c w: d` (class-side; args = [class, a, b, c, d]).
+fn prim_i4_xyzw(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    match (
+        as_scalar_i32(args[1]),
+        as_scalar_i32(args[2]),
+        as_scalar_i32(args[3]),
+        as_scalar_i32(args[4]),
+    ) {
+        (Some(a), Some(b), Some(c), Some(d)) => {
+            PrimResult::Ok(alloc::alloc_int32x4(vm, [a, b, c, d]))
+        }
+        _ => PrimResult::Fail,
+    }
+}
+
+/// `Int32x4 splat: v` — broadcast one integer to all four lanes.
+fn prim_i4_splat(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    match as_scalar_i32(args[1]) {
+        Some(v) => PrimResult::Ok(alloc::alloc_int32x4(vm, [v, v, v, v])),
+        None => PrimResult::Fail,
+    }
+}
+
+/// Elementwise WRAPPING integer op on two Int32x4 — each lane a single 32-bit
+/// two's-complement op, bit-identical to the `.4s` NEON lane (the invariant the
+/// JIT fuse honours). NO divide: NEON has no vector integer divide.
+macro_rules! prim_i4_binop {
+    ($name:ident, $op:ident) => {
+        fn $name(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+            match (as_int32x4(vm, args[0]), as_int32x4(vm, args[1])) {
+                (Some(a), Some(b)) => PrimResult::Ok(alloc::alloc_int32x4(
+                    vm,
+                    [
+                        a[0].$op(b[0]),
+                        a[1].$op(b[1]),
+                        a[2].$op(b[2]),
+                        a[3].$op(b[3]),
+                    ],
+                )),
+                _ => PrimResult::Fail,
+            }
+        }
+    };
+}
+prim_i4_binop!(prim_i4_add, wrapping_add);
+prim_i4_binop!(prim_i4_sub, wrapping_sub);
+prim_i4_binop!(prim_i4_mul, wrapping_mul);
+
+/// `anInt32x4 at: i` — lane 1..4 as a SmallInteger (an i32 always fits).
+fn prim_i4_at(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    let lanes = match as_int32x4(vm, args[0]) {
+        Some(v) => v,
+        None => return PrimResult::Fail,
+    };
+    let i = match SmallInt::try_from(args[1]) {
+        Some(n) => n.value(),
+        None => return PrimResult::Fail,
+    };
+    if !(1..=4).contains(&i) {
+        return PrimResult::Fail;
+    }
+    PrimResult::Ok(SmallInt::new(lanes[(i - 1) as usize] as i64).oop())
+}
+
 // ── SIMD level 2: FloatArray + NEON bulk kernels (docs/SIMD.md Part E) ─────
 //
 // A FloatArray is a Format::IndexableBytes buffer of N f64 lanes (N*8 bytes,
@@ -2277,6 +2420,55 @@ mod tests {
         assert_eq!(x4_lane(&mut vm, moved, 4), 3.25);
     }
 
+    /// SIMD Int32x4 (`docs/SIMD.md`): 4-lane integer arithmetic WRAPS on 32-bit
+    /// overflow (matching NEON `add/mul v.4s`), lane access answers a
+    /// SmallInteger, and the raw 16-byte bodies survive GC (same `int32x4_klass`
+    /// GC-root regression lock as the other value classes).
+    fn i4_lane(vm: &mut VmState, v: Oop, i: i64) -> i64 {
+        match call(153, vm, &[v, smi(i)]) {
+            PrimResult::Ok(o) => SmallInt::try_from(o).unwrap().value(),
+            other => panic!("i4 at: failed: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn int32x4_wrapping_arithmetic_and_gc_survival() {
+        // Part 1 — arithmetic incl. 32-bit wrap, gc_stress OFF.
+        let mut vm = test_vm();
+        let a = alloc::alloc_int32x4(&mut vm, [1, 2, 3, i32::MAX]);
+        let b = alloc::alloc_int32x4(&mut vm, [10, 20, 30, 1]);
+        let sum = match call(150 /* + */, &mut vm, &[a, b]) {
+            PrimResult::Ok(o) => o,
+            other => panic!("i4 + failed: {other:?}"),
+        };
+        assert_eq!(i4_lane(&mut vm, sum, 1), 11);
+        assert_eq!(i4_lane(&mut vm, sum, 2), 22);
+        assert_eq!(i4_lane(&mut vm, sum, 3), 33);
+        // i32::MAX + 1 wraps to i32::MIN.
+        assert_eq!(i4_lane(&mut vm, sum, 4), i32::MIN as i64);
+        let prod = match call(152 /* * */, &mut vm, &[a, b]) {
+            PrimResult::Ok(o) => o,
+            other => panic!("i4 * failed: {other:?}"),
+        };
+        assert_eq!(i4_lane(&mut vm, prod, 1), 10);
+        assert_eq!(i4_lane(&mut vm, prod, 4), i32::MAX as i64); // MAX*1
+
+        // Part 2 — GC-root survival (int32x4_klass must be a GC root).
+        let slot = vm.stack.sp;
+        let keep = alloc::alloc_int32x4(&mut vm, [42, -99, 7, -1]);
+        vm.stack.push(keep);
+        let nil = vm.universe.nil_obj;
+        for _ in 0..8 {
+            call_rooted(93 /* gcScavenge */, &mut vm, nil);
+            let _fresh = alloc::alloc_int32x4(&mut vm, [1, 2, 3, 4]);
+        }
+        let moved = vm.stack.get(slot);
+        assert_eq!(i4_lane(&mut vm, moved, 1), 42);
+        assert_eq!(i4_lane(&mut vm, moved, 2), -99);
+        assert_eq!(i4_lane(&mut vm, moved, 3), 7);
+        assert_eq!(i4_lane(&mut vm, moved, 4), -1);
+    }
+
     /// SIMD level 2 (`docs/SIMD.md` Part E): the FloatArray NEON bulk-kernel
     /// primitives (`+@`/`sum`/`dot:`) compute correctly, and `float_array_klass`
     /// is a GC root (same regression lock as the value classes — a moved-but-
@@ -2448,6 +2640,12 @@ mod tests {
             (145, "+@"),
             (146, "sum"),
             (147, "dot:"),
+            (148, "x:y:z:w:"),
+            (149, "splat:"),
+            (150, "+"),
+            (151, "-"),
+            (152, "*"),
+            (153, "at:"),
         ];
         assert_eq!(
             PRIMITIVES.len(),

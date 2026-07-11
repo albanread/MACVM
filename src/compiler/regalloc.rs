@@ -968,6 +968,7 @@ mod tests {
             double_klass_lit: PoolLit(0),
             float64x2_klass_lit: PoolLit(0),
             float32x4_klass_lit: PoolLit(0),
+            int32x4_klass_lit: PoolLit(0),
             call_sites: Vec::new(),
             site_feedback: Vec::new(),
             inline_deps: Vec::new(),

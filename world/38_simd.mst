@@ -41,6 +41,50 @@ Object subclass: Float64x2 [
     ]
 ]
 
+"Int32x4 — a 4-lane 32-bit INTEGER vector: the SAME 16-byte RAW body as
+ Float32x4, read as four two's-complement i32 lanes. `+ - *` fuse to NEON
+ integer `add/sub/mul v.4s` and WRAP on 32-bit overflow (a fixed-width lane is
+ not a promote-to-BigInt Smalltalk integer). There is no vector integer divide.
+ `hsum` is a genuine reduction, and because integer add IS associative it is
+ bit-exact regardless of lane-combination order (unlike the FP reductions,
+ docs/SIMD.md Part D). Lane access answers a SmallInteger."
+Object subclass: Int32x4 [
+    Int32x4 class >> x: a y: b z: c w: d [ <primitive: 148> ]
+    Int32x4 class >> splat: v [ <primitive: 149> ]
+
+    + other [ <primitive: 150> ]
+    - other [ <primitive: 151> ]
+    * other [ <primitive: 152> ]
+
+    "Lane access, 1-based (Smalltalk convention): answers a SmallInteger."
+    at: i [ <primitive: 153> ]
+    x [ ^self at: 1 ]
+    y [ ^self at: 2 ]
+    z [ ^self at: 3 ]
+    w [ ^self at: 4 ]
+
+    "Horizontal sum of the four lanes (exact — integer add is associative)."
+    hsum [ ^self x + self y + self z + self w ]
+
+    printOn: aStream [
+        aStream nextPutAll: 'Int32x4('.
+        aStream nextPutAll: self x printString.
+        aStream nextPutAll: ', '.
+        aStream nextPutAll: self y printString.
+        aStream nextPutAll: ', '.
+        aStream nextPutAll: self z printString.
+        aStream nextPutAll: ', '.
+        aStream nextPutAll: self w printString.
+        aStream nextPutAll: ')'
+    ]
+    printString [
+        | s |
+        s := WriteStream on: String new.
+        self printOn: s.
+        ^s contents
+    ]
+]
+
 "Float32x4 — a 4-lane f32 vector: the SAME fixed 16-byte RAW body as
  Float64x2 (Format::Double, GC-skipped), but read as four single-precision
  lanes packed in NEON `.4s` element order. Each elementwise op is per-lane

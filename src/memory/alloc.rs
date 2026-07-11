@@ -468,6 +468,21 @@ pub fn alloc_float32x4(vm: &mut VmState, lanes: [f32; 4]) -> Oop {
     obj.oop()
 }
 
+/// SIMD (`docs/SIMD.md`): a fresh 4-lane i32 vector — the SAME 16-byte RAW body
+/// as `Float32x4`, read as four 32-bit integers. Lanes pack in NEON `.4s`
+/// element order (little-endian: lane 0/1 in word 0 low/high, 2/3 in word 1),
+/// so `ldr q,[obj+16]` loads `v.4s` with element `i` == `lanes[i]`.
+pub fn alloc_int32x4(vm: &mut VmState, lanes: [i32; 4]) -> Oop {
+    let klass = vm.universe.int32x4_klass;
+    let words = klass.non_indexable_size();
+    let obj = alloc_words(vm, words, klass.oop(), false);
+    let w0 = (lanes[0] as u32 as u64) | ((lanes[1] as u32 as u64) << 32);
+    let w1 = (lanes[2] as u32 as u64) | ((lanes[3] as u32 as u64) << 32);
+    obj.set_raw_body_word(0, w0);
+    obj.set_raw_body_word(1, w1);
+    obj.oop()
+}
+
 /// A klass-shaped object whose klass field is `meta`. As with the raw
 /// variant, `format`/`non_indexable_size`/`superclass` must be set by the
 /// caller immediately after (genesis + S5's `subclass:`).

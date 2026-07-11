@@ -151,6 +151,11 @@ fn decode_fp_vector(word: u32) -> Option<String> {
         0x4EA0_D400 => Some(("fsub", "4s")),
         0x6E20_DC00 => Some(("fmul", "4s")),
         0x6E20_FC00 => Some(("fdiv", "4s")),
+        // SIMD Int32x4: integer 3-same `.4s` (Q=1, size=10) — `add/sub/mul`
+        // (base `0x…8400`/`0x…9C00` | Q | size); no vector integer divide.
+        0x4EA0_8400 => Some(("add", "4s")),
+        0x6EA0_8400 => Some(("sub", "4s")),
+        0x4EA0_9C00 => Some(("mul", "4s")),
         _ => None,
     };
     if let Some((mnem, arr)) = arith {
@@ -980,6 +985,10 @@ mod tests {
             ("fsub v16.4s, v16.4s, v17.4s", "fsub v16.4s, v16.4s, v17.4s"),
             ("fmul v16.4s, v16.4s, v17.4s", "fmul v16.4s, v16.4s, v17.4s"),
             ("fdiv v16.4s, v16.4s, v17.4s", "fdiv v16.4s, v16.4s, v17.4s"),
+            // SIMD Int32x4 integer .4s (add/sub/mul; no vector divide).
+            ("add v16.4s, v16.4s, v17.4s", "add v16.4s, v16.4s, v17.4s"),
+            ("sub v16.4s, v16.4s, v17.4s", "sub v16.4s, v16.4s, v17.4s"),
+            ("mul v16.4s, v16.4s, v17.4s", "mul v16.4s, v16.4s, v17.4s"),
             ("ldr q16, [x17, #16]", "ldr q16, [x17, #16]"),
             ("str q16, [x19, #16]", "str q16, [x19, #16]"),
             ("umov x0, v16.d[0]", "umov x0, v16.d[0]"),

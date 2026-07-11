@@ -104,6 +104,7 @@ where
         double_klass,
         float64x2_klass,
         float32x4_klass,
+        int32x4_klass,
         float_array_klass,
         string_klass,
         symbol_klass,
@@ -532,6 +533,8 @@ fn real_oop_rootspill_slots(vm: &VmState, kind: AdapterKind, caller_pc: u64) -> 
         AdapterKind::BoxFloat64x2 => 0,
         // SIMD: likewise stub_box_float32x4's x0/x1 (two raw 64-bit lane halves).
         AdapterKind::BoxFloat32x4 => 0,
+        // SIMD: likewise stub_box_int32x4's x0/x1 (two raw 64-bit lane halves).
+        AdapterKind::BoxInt32x4 => 0,
         AdapterKind::Poll => unreachable!(
             "each_code_root: stub_poll never tags the anchor (S10 D5.6) -- walk_frames must \
              never produce FrameView::Adapter{{kind: Poll, ..}} (see its own module doc)"
