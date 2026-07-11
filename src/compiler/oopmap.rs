@@ -180,6 +180,7 @@ mod tests {
             start,
             end,
             is_oop,
+            is_fp: false,
             crosses_safepoint: true,
             crosses_call: false,
             resident_reg: None,

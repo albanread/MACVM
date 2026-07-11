@@ -38,6 +38,12 @@ pub struct LiveInterval {
     pub start: u32,
     pub end: u32,
     pub is_oop: bool,
+    /// Float fast-path (`docs/float_fastpath_design.md`): this vreg is an
+    /// UNBOXED `f64` — allocated from the FP `d0`–`d7` pool (disjoint from
+    /// the x0–x15 GPR scan; never resident, never an oop-map entry). A
+    /// crossing-safepoint fp interval spills exactly like a GPR one; its
+    /// slot is non-oop (`is_oop == false`), so the GC skips it.
+    pub is_fp: bool,
     /// True iff some `CallSend`/`CallRuntime`/`Alloc` position `p` satisfies
     /// `start <= p && end > p` — defined by, not merely used at, that
     /// safepoint (an interval whose only reference IS the safepoint's own
@@ -80,6 +86,9 @@ fn is_safepoint(ir: &Ir) -> bool {
         Ir::CallSend { .. }
             | Ir::CallRuntime { .. }
             | Ir::Alloc { .. }
+            // Float fast-path: FBox allocates (inline bump + overflow `bl
+            // stub_box_double`) — a safepoint exactly like `Alloc`.
+            | Ir::FBox { .. }
             | Ir::UncommonTrap { .. }
             | Ir::Poll
     )
@@ -113,10 +122,17 @@ fn successors(block: &IrBlock) -> Vec<BlockId> {
                 succs.push(*if_false);
                 succs.push(*fail);
             }
+            Ir::FCmpBr {
+                if_true, if_false, ..
+            } => {
+                succs.push(*if_true);
+                succs.push(*if_false);
+            }
             Ir::SmiArith { fail, .. }
             | Ir::SmiCmpVal { fail, .. }
             | Ir::ArrayAt { fail, .. }
-            | Ir::ArrayAtPut { fail, .. } => succs.push(*fail),
+            | Ir::ArrayAtPut { fail, .. }
+            | Ir::FUnbox { fail, .. } => succs.push(*fail),
             Ir::GuardKlass { fail, .. } => succs.push(*fail),
             // S11 D7: `Alloc` is self-contained (fast path + internal slow
             // call, `emit::emit_alloc`) — no slow CFG successor. It stays a
@@ -590,6 +606,7 @@ pub fn compute_intervals(
                 start,
                 end,
                 is_oop: method.vregs[vid as usize].is_oop,
+                is_fp: method.vregs[vid as usize].is_fp,
                 crosses_safepoint,
                 crosses_call,
                 assignment: None,
@@ -611,6 +628,13 @@ pub fn compute_intervals(
 /// in v1, x24–x28 VM registers, x29/x30/sp — none of those are
 /// allocatable.
 const NUM_ALLOCATABLE_REGS: u8 = 16;
+/// Float fast-path FP pool: `d0`–`d7`, caller-saved scratch — zero
+/// prologue/epilogue cost, clobbered by any call, which is safe because a
+/// crossing-safepoint fp interval is spilled (spill-all) exactly like a GPR
+/// one. `d8`–`d15` (callee-saved; the write-through residency tier) and
+/// `d16`/`d17` (emit's fp spill scratch, mirroring x16/x17) stay out of the
+/// pool.
+const NUM_FP_ALLOCATABLE_REGS: u8 = 8;
 
 /// D3.5's policy, in order: (1) every `crosses_safepoint` interval spills
 /// unconditionally, whole-lifetime, before the main scan even starts — the
@@ -637,6 +661,11 @@ pub fn assign_residents(intervals: &mut [LiveInterval]) {
     let mut pool: Vec<u8> = vec![21, 22, 23];
     let mut reg_used = [false; NUM_ALLOCATABLE_REGS as usize];
     for iv in intervals.iter() {
+        // An fp interval's Reg(n) names dN, not xN — a different file
+        // entirely; it neither occupies nor frees a GPR here.
+        if iv.is_fp {
+            continue;
+        }
         if let Some(Assignment::Reg(r)) = iv.assignment {
             reg_used[r as usize] = true;
         }
@@ -651,6 +680,7 @@ pub fn assign_residents(intervals: &mut [LiveInterval]) {
     let mut order: Vec<usize> = (0..intervals.len())
         .filter(|&i| {
             matches!(intervals[i].assignment, Some(Assignment::Spill(_)))
+                && !intervals[i].is_fp // residents are GPRs; fp reloads stay explicit
                 && !intervals[i].crosses_call
                 && intervals[i].end > intervals[i].start
         })
@@ -687,27 +717,49 @@ pub fn allocate(intervals: &mut [LiveInterval]) -> (u16, Vec<bool>) {
         .collect();
     order.sort_by_key(|&i| intervals[i].start);
 
+    // Two independent register files (docs/float_fastpath_design.md B4):
+    // GPR x0..x15 for ordinary vregs, FP d0..d7 (caller-saved scratch — no
+    // prologue cost) for unboxed-f64 vregs. Same linear scan, two disjoint
+    // free/active pools selected by `is_fp`; eviction only ever considers
+    // the same class (a d-reg can't satisfy a GPR interval or vice versa).
     let mut active: Vec<usize> = Vec::new();
+    let mut active_fp: Vec<usize> = Vec::new();
     let mut free_regs: Vec<u8> = (0..NUM_ALLOCATABLE_REGS).rev().collect();
+    let mut free_fp_regs: Vec<u8> = (0..NUM_FP_ALLOCATABLE_REGS).rev().collect();
 
     for i in order {
         let start = intervals[i].start;
-        active.retain(|&j| {
-            if intervals[j].end < start {
-                if let Some(Assignment::Reg(r)) = intervals[j].assignment {
-                    free_regs.push(r);
-                }
-                false
+        let is_fp = intervals[i].is_fp;
+        {
+            let (act, free) = if is_fp {
+                (&mut active_fp, &mut free_fp_regs)
             } else {
-                true
-            }
-        });
-
-        if let Some(r) = free_regs.pop() {
-            intervals[i].assignment = Some(Assignment::Reg(r));
-            active.push(i);
+                (&mut active, &mut free_regs)
+            };
+            act.retain(|&j| {
+                if intervals[j].end < start {
+                    if let Some(Assignment::Reg(r)) = intervals[j].assignment {
+                        free.push(r);
+                    }
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        // Also expire the OTHER class's dead intervals so its free list is
+        // current when its next interval starts (harmless bookkeeping).
+        let (act, free) = if is_fp {
+            (&mut active_fp, &mut free_fp_regs)
         } else {
-            let (pos_in_active, &furthest) = active
+            (&mut active, &mut free_regs)
+        };
+
+        if let Some(r) = free.pop() {
+            intervals[i].assignment = Some(Assignment::Reg(r));
+            act.push(i);
+        } else {
+            let (pos_in_active, &furthest) = act
                 .iter()
                 .enumerate()
                 .max_by_key(|&(_, &j)| intervals[j].end)
@@ -721,9 +773,9 @@ pub fn allocate(intervals: &mut [LiveInterval]) -> (u16, Vec<bool>) {
                     _ => unreachable!("active intervals always hold a register"),
                 };
                 spill(&mut intervals[furthest], &mut slot_is_oop);
-                active.remove(pos_in_active);
+                act.remove(pos_in_active);
                 intervals[i].assignment = Some(Assignment::Reg(r));
-                active.push(i);
+                act.push(i);
             } else {
                 spill(&mut intervals[i], &mut slot_is_oop);
             }
@@ -898,6 +950,8 @@ mod tests {
             false_lit: PoolLit(0),
             nil_lit: PoolLit(0),
             mark_slots_lit: PoolLit(0),
+            mark_double_lit: PoolLit(0),
+            double_klass_lit: PoolLit(0),
             call_sites: Vec::new(),
             site_feedback: Vec::new(),
             inline_deps: Vec::new(),
@@ -1030,6 +1084,7 @@ mod tests {
                 start: 0,
                 end: 5,
                 is_oop: true,
+                is_fp: false,
                 crosses_safepoint: true,
                 crosses_call: false,
                 resident_reg: None,
@@ -1040,6 +1095,7 @@ mod tests {
                 start: 0,
                 end: 5,
                 is_oop: false,
+                is_fp: false,
                 crosses_safepoint: true,
                 crosses_call: false,
                 resident_reg: None,
@@ -1075,6 +1131,7 @@ mod tests {
             start: 0,
             end: 10,
             is_oop: true,
+            is_fp: false,
             crosses_safepoint: true,
             crosses_call: false,
             resident_reg: None,
@@ -1093,6 +1150,7 @@ mod tests {
             start: 0,
             end: 10,
             is_oop: true,
+            is_fp: false,
             crosses_safepoint: true,
             crosses_call: false,
             resident_reg: None,
@@ -1111,6 +1169,7 @@ mod tests {
             start: 0,
             end: 999,
             is_oop: false,
+            is_fp: false,
             crosses_safepoint: false,
             crosses_call: false,
             resident_reg: None,
@@ -1122,6 +1181,7 @@ mod tests {
                 start: 0,
                 end: 10,
                 is_oop: false,
+                is_fp: false,
                 crosses_safepoint: false,
                 crosses_call: false,
                 resident_reg: None,

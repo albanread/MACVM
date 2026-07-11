@@ -124,6 +124,63 @@ fn decode(word: u32) -> Option<String> {
         .or_else(|| decode_data3(word))
         .or_else(|| decode_ldst_pair(word))
         .or_else(|| decode_ldst(word))
+        .or_else(|| decode_fp_scalar(word))
+}
+
+/// Float fast-path (`docs/float_fastpath_design.md`): the scalar
+/// double-precision FP forms `emit`'s FUnbox/FBox/FArith/FCmp lowerings
+/// produce — 2-source arithmetic, `fcmp`, `fmov` gpr↔fp, `scvtf`, and the
+/// unsigned-scaled-offset FP `ldr`/`str`. Only ftype=01 (double) decodes;
+/// anything else keeps the honest `.word` fallback.
+fn decode_fp_scalar(word: u32) -> Option<String> {
+    let rd = word & 0x1F;
+    let rn = (word >> 5) & 0x1F;
+    let rm = (word >> 16) & 0x1F;
+    // 2-source: 0x1E60_0800 | opc<<12 (double ftype already folded in).
+    if word & 0xFFE0_8C00 == 0x1E60_0800 {
+        let mnem = match (word >> 12) & 0xF {
+            0 => "fmul",
+            1 => "fdiv",
+            2 => "fadd",
+            3 => "fsub",
+            4 => "fmax",
+            5 => "fmin",
+            6 => "fmaxnm",
+            7 => "fminnm",
+            8 => "fnmul",
+            _ => return None,
+        };
+        return Some(format!("{mnem} d{rd}, d{rn}, d{rm}"));
+    }
+    // fcmp/fcmpe dN, dM: 0x1E60_2000 (+0x10 for fcmpe; +8 for #0.0 form).
+    if word & 0xFFE0_FC07 == 0x1E60_2000 {
+        let e = if word & 0x10 != 0 { "fcmpe" } else { "fcmp" };
+        if word & 0x8 != 0 {
+            return Some(format!("{e} d{rn}, #0.0"));
+        }
+        return Some(format!("{e} d{rn}, d{rm}"));
+    }
+    // fmov x<->d: 0x9E66_0000 (fmov Xd, Dn) / 0x9E67_0000 (fmov Dd, Xn).
+    if word & 0xFFFF_FC00 == 0x9E66_0000 {
+        return Some(format!("fmov x{rd}, d{rn}"));
+    }
+    if word & 0xFFFF_FC00 == 0x9E67_0000 {
+        return Some(format!("fmov d{rd}, x{rn}"));
+    }
+    // scvtf Dd, Xn: 0x9E62_0000.
+    if word & 0xFFFF_FC00 == 0x9E62_0000 {
+        return Some(format!("scvtf d{rd}, x{rn}"));
+    }
+    // FP scalar ldr/str, 64-bit unsigned scaled offset: 0xFD40/0xFD00.
+    if word & 0xFFC0_0000 == 0xFD40_0000 {
+        let imm = ((word >> 10) & 0xFFF) * 8;
+        return Some(format!("ldr d{rd}, [x{rn}, #{imm}]"));
+    }
+    if word & 0xFFC0_0000 == 0xFD00_0000 {
+        let imm = ((word >> 10) & 0xFFF) * 8;
+        return Some(format!("str d{rd}, [x{rn}, #{imm}]"));
+    }
+    None
 }
 
 /// `nop`, `ret`/`br`/`blr`, `brk #imm`.

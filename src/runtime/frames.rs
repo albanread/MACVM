@@ -66,8 +66,8 @@
 
 use crate::codecache::nmethod::NmethodId;
 use crate::codecache::stubs::{
-    KIND_ALLOC_SLOW, KIND_C2I, KIND_CALL_PRIMITIVE, KIND_DEOPT_BRIDGE, KIND_DNU, KIND_MEGA,
-    KIND_MUST_BE_BOOLEAN, KIND_NLR_ORIGINATE, KIND_RESOLVE, KIND_VALUE_DISPATCH,
+    KIND_ALLOC_SLOW, KIND_BOX_DOUBLE, KIND_C2I, KIND_CALL_PRIMITIVE, KIND_DEOPT_BRIDGE, KIND_DNU,
+    KIND_MEGA, KIND_MUST_BE_BOOLEAN, KIND_NLR_ORIGINATE, KIND_RESOLVE, KIND_VALUE_DISPATCH,
 };
 use crate::interpreter::stack::Frame;
 use crate::oops::layout::ENTRY_FRAME_SENTINEL;
@@ -106,6 +106,11 @@ pub enum AdapterKind {
     /// `IcSite::argc` RootSpill slots — the closure + its args — recovered
     /// via `caller_pc` exactly like `Resolve|C2i|Mega|Dnu`.
     ValueDispatch,
+    /// Float fast-path: a compiled `Ir::FBox`'s eden-overflow tail
+    /// mid-`rt_box_double` (`codecache::stubs::build_stub_box_double`).
+    /// Owns ZERO RootSpill oop slots: its x0 carries raw f64 payload bits,
+    /// not an oop — scanning it would treat float bits as a heap pointer.
+    BoxDouble,
     Poll,
     /// S14 step 9: not a real adapter — the synthetic anchor
     /// [`deopt_bridge_link`] plants so a walk during `interpret_active` can
@@ -133,6 +138,7 @@ impl AdapterKind {
             KIND_CALL_PRIMITIVE => AdapterKind::CallPrimitive,
             KIND_NLR_ORIGINATE => AdapterKind::NlrOriginate,
             KIND_VALUE_DISPATCH => AdapterKind::ValueDispatch,
+            KIND_BOX_DOUBLE => AdapterKind::BoxDouble,
             // The deopt trampolines' record (see `KIND_DEOPT_BRIDGE`'s own
             // doc): same walker semantics as the synthetic bridge link —
             // no RootSpill slots, pass through to the deoptee frame.

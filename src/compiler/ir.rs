@@ -648,6 +648,14 @@ pub struct IrMethod {
     /// to intern on demand, exactly like `true_lit`/`false_lit`.
     pub nil_lit: PoolLit,
     pub mark_slots_lit: PoolLit,
+    /// Float fast-path (`docs/float_fastpath_design.md`): the pristine mark
+    /// word an inline `FBox` stamps into a fresh `Double` — RAW contents
+    /// (`with_tagged_contents(false)`: the body is an f64 bit pattern the GC
+    /// must never scan), unlike `mark_slots_lit`'s tagged form.
+    pub mark_double_lit: PoolLit,
+    /// The Double klass oop (`RelocKind::Oop` — a moving GC keeps it
+    /// current), for `FBox`'s header stamp and `FUnbox`'s klass guard.
+    pub double_klass_lit: PoolLit,
     /// S11 D3: one entry per `Ir::CallSend` site, indexed by its own
     /// `site: u16` — mirrors `pool`'s own "small side table, indexed by a
     /// compact id embedded in the `Ir`" shape. `emit.rs` has no `VmState`/
@@ -930,6 +938,50 @@ fn classify_smi_send(vm: &VmState, method: MethodOop, ic_idx: u16) -> SmiSendKin
         other => panic!(
             "classify_smi_send: primitive {other} is not in SMI_INLINE -- driver::eligible \
              should have rejected this method (compiler bug if this fires)"
+        ),
+    }
+}
+
+/// Float fast-path (`docs/float_fastpath_design.md` B2 rule 1): the
+/// `classify_smi_send` analog for a mono-Double-guarded send site. The IC is
+/// the type oracle: every observed receiver was a Double, and the resolved
+/// target is one of the `Double` arithmetic/compare primitives — so the send
+/// collapses to unbox/native-op/box with an uncommon-trap fail edge.
+enum DoubleSendKind {
+    Arith(FArithOp),
+    Cmp(CmpOp),
+}
+
+fn classify_double_send(vm: &VmState, method: MethodOop, ic_idx: u16) -> DoubleSendKind {
+    let ic = InterpreterIc::at(method, ic_idx);
+    assert_eq!(
+        ic.guard().raw(),
+        vm.universe.double_klass.oop().raw(),
+        "classify_double_send: IC {ic_idx} is not mono-Double-guarded -- is_double_inlinable \
+         should have rejected this site (compiler bug if this fires)"
+    );
+    // Resolve via (guard klass, selector), NOT the raw target slot: Double's
+    // arithmetic methods are shimmable and tier up early, so a warm site's
+    // mono target is usually a smi NmethodId, not a MethodOop (the exact
+    // staleness `feedback::resolve_target` guards against — and unlike the
+    // smi prims, which are compile_disabled forever, Double methods DO
+    // compile, so the smi fuse never needed this).
+    let target = crate::compiler::feedback::resolve_method_ro(
+        vm,
+        vm.universe.double_klass,
+        ic.selector(),
+    )
+    .expect("classify_double_send: Double must understand an is_double_inlinable selector");
+    match target.primitive() {
+        100 => DoubleSendKind::Arith(FArithOp::Add),
+        101 => DoubleSendKind::Arith(FArithOp::Sub),
+        102 => DoubleSendKind::Arith(FArithOp::Mul),
+        103 => DoubleSendKind::Arith(FArithOp::Div),
+        104 => DoubleSendKind::Cmp(CmpOp::Lt),
+        105 => DoubleSendKind::Cmp(CmpOp::Eq),
+        other => panic!(
+            "classify_double_send: primitive {other} is not in DOUBLE_INLINE -- \
+             is_double_inlinable should have rejected this site (compiler bug if this fires)"
         ),
     }
 }
@@ -1396,6 +1448,27 @@ impl<'a> Translator<'a> {
             return false;
         };
         crate::compiler::driver::SMI_INLINE.contains(&target.primitive())
+    }
+
+    /// Float fast-path: `is_smi_inlinable`'s Double twin — a mono-Double-
+    /// guarded site whose resolved method is a `DOUBLE_INLINE` arithmetic/
+    /// compare primitive fuses to `FUnbox`/`FArith`/`FBox` instead of a
+    /// `CallSend`. Resolves via (guard klass, selector) rather than the raw
+    /// IC target: a warm Double site's mono target is usually a tiered-up
+    /// smi NmethodId, not a MethodOop (see `classify_double_send`).
+    fn is_double_inlinable(&self, ic_idx: u16) -> bool {
+        let ic = InterpreterIc::at(self.method, ic_idx);
+        if ic.guard().raw() != self.vm.universe.double_klass.oop().raw() {
+            return false;
+        }
+        let Some(target) = crate::compiler::feedback::resolve_method_ro(
+            self.vm,
+            self.vm.universe.double_klass,
+            ic.selector(),
+        ) else {
+            return false;
+        };
+        crate::compiler::driver::DOUBLE_INLINE.contains(&target.primitive())
     }
 
     /// S11 D7: is this send site an inline-allocatable `X basicNew`? Returns
@@ -3587,6 +3660,72 @@ impl<'a> Translator<'a> {
                     });
                 }
                 stack.push(dst);
+            }
+            // Float fast-path (docs/float_fastpath_design.md B2 rule 1): a
+            // mono-Double arithmetic/compare send collapses to guarded
+            // unboxes + one native FP op (+ a box for arithmetic). Same
+            // fail-only trap-block shape as the array intrinsics above: the
+            // fail edge re-executes the WHOLE send interpreted (a non-Double
+            // operand — the IC only ever guards the receiver — takes the
+            // primitive's own Smalltalk fallback, byte-identical semantics).
+            Instr::Send { ic, .. } if self.is_double_inlinable(ic) => {
+                let reexec_stack = stack.clone();
+                let fail_id = self.fresh_block_id();
+                self.finish_block(IrBlock {
+                    id: fail_id,
+                    bci,
+                    code: vec![Ir::UncommonTrap { bci }],
+                    entry_stack: Vec::new(),
+                    deopt_sites: vec![(
+                        0,
+                        DeoptRaw {
+                            stack: reexec_stack,
+                            bci,
+                            kind: SafepointKind::UncommonTrap,
+                            reexecute: true,
+                            stack_closures: Vec::new(),
+                            inline: None,
+                        },
+                    )],
+                });
+                let b = stack.pop().expect("double fuse: missing arg operand");
+                let a = stack.pop().expect("double fuse: missing receiver operand");
+                let ua = self.fresh_fp();
+                let ub = self.fresh_fp();
+                code.push(Ir::FUnbox {
+                    dst: ua,
+                    src: a,
+                    fail: fail_id,
+                });
+                code.push(Ir::FUnbox {
+                    dst: ub,
+                    src: b,
+                    fail: fail_id,
+                });
+                match classify_double_send(self.vm, self.method, ic) {
+                    DoubleSendKind::Arith(op) => {
+                        let fd = self.fresh_fp();
+                        code.push(Ir::FArith {
+                            op,
+                            dst: fd,
+                            a: ua,
+                            b: ub,
+                        });
+                        let dst = self.fresh(true);
+                        code.push(Ir::FBox { dst, src: fd });
+                        stack.push(dst);
+                    }
+                    DoubleSendKind::Cmp(op) => {
+                        let dst = self.fresh(true);
+                        code.push(Ir::FCmpVal {
+                            op,
+                            dst,
+                            a: ua,
+                            b: ub,
+                        });
+                        stack.push(dst);
+                    }
+                }
             }
             // D1's "arbitrary send/send_w in ANY IC state": every send this
             // step's own smi-inline guard above doesn't handle (Poly, Mega,
@@ -5850,6 +5989,19 @@ pub fn convert(
             .word(),
         None,
     );
+    // Float fast-path: a fresh Double's mark (raw, untagged contents — the
+    // f64 payload must never be scanned as an oop) + the Double klass, for
+    // FBox/FUnbox. Interned unconditionally like mark_slots_lit (the pool
+    // dedups; a method with no Double sends just carries two idle words).
+    let mark_double_lit = t.pool.intern(
+        crate::oops::mark::Mark::pristine()
+            .with_tagged_contents(false)
+            .word(),
+        None,
+    );
+    let double_klass_lit = t
+        .pool
+        .intern(vm.universe.double_klass.oop().raw(), Some(RelocKind::Oop));
     // S24 A3b: the Context klass, interned once for the prologue Context
     // allocation of a MATERIALIZING has_ctx method.
     let ctx_klass_lit = if materialize_ctx {
@@ -6380,6 +6532,8 @@ pub fn convert(
         false_lit,
         nil_lit,
         mark_slots_lit,
+        mark_double_lit,
+        double_klass_lit,
         call_sites: t.call_sites,
         site_feedback: t.site_feedback,
         inline_deps: t.inline_deps,

@@ -64,6 +64,13 @@ pub const KIND_NLR_ORIGINATE: u64 = 8;
 /// interpretation can GC while closure+args sit in RootSpill). See
 /// [`build_stub_value_dispatch`].
 pub const KIND_VALUE_DISPATCH: u64 = 9;
+/// Float fast-path (`docs/float_fastpath_design.md`): `Ir::FBox`'s inline
+/// eden-bump overflow tail — box an unboxed `f64` into a fresh `Double`.
+/// x0 carries the RAW PAYLOAD BITS, not an oop, so this kind owns **zero**
+/// live RootSpill oop slots (`memory::roots::real_oop_rootspill_slots`) —
+/// scanning x0 as an oop would treat float bits as a heap pointer. See
+/// [`build_stub_box_double`].
+pub const KIND_BOX_DOUBLE: u64 = 10;
 
 /// D5's shared stub skeleton, part 1: anchor + AAPCS frame + RootSpill
 /// (x0..x5). Every stub that calls into Rust starts with this; follow with
@@ -207,6 +214,11 @@ pub struct Stubs {
     /// x0..x5 already the real receiver+args (`compiler::driver`'s
     /// shimmable-primitive eligibility). See [`build_stub_call_primitive`].
     pub call_primitive: CodeHandle,
+    /// Float fast-path: `Ir::FBox`'s eden-overflow tail — x0 = the raw f64
+    /// payload BITS (not an oop; zero RootSpill oop slots). Allocates and
+    /// initializes a `Double`, answering its tagged oop in x0. See
+    /// [`build_stub_box_double`].
+    pub box_double: CodeHandle,
     /// S24 A1: a compiled BLOCK body's `nlr_tos` lowering `bl`s here with
     /// x0 = the closure, x1 = the NLR value; `rt_nlr_originate` parks
     /// `vm.nlr_state` and the emitted continuation returns `NLR_SENTINEL`
@@ -269,6 +281,11 @@ impl Stubs {
     }
     pub fn call_primitive_addr(&self) -> u64 {
         self.call_primitive.base as u64
+    }
+    /// Float fast-path: `emit`'s `Ir::FBox` slow edge `bl`s here (see
+    /// [`build_stub_box_double`]).
+    pub fn box_double_addr(&self) -> u64 {
+        self.box_double.base as u64
     }
     /// S24 A1: `emit`'s `Ir::NlrReturn` lowering `bl`s here (see
     /// [`build_stub_nlr_originate`]).
@@ -401,6 +418,12 @@ pub fn install(cache: &mut CodeCache) -> Stubs {
         h
     });
 
+    let box_double_blob = build_stub_box_double();
+    let h13 = cache
+        .alloc(box_double_blob.code.len())
+        .expect("stubs::install: code cache too small for box_double");
+    cache.publish(h13, &box_double_blob);
+
     Stubs {
         call_stub: h1,
         stub_poll: h2,
@@ -415,6 +438,7 @@ pub fn install(cache: &mut CodeCache) -> Stubs {
         call_primitive: h11,
         nlr_originate: h12,
         value_dispatch,
+        box_double: h13,
     }
 }
 
@@ -1770,6 +1794,55 @@ pub unsafe extern "C" fn rt_must_be_boolean(vm: *mut VmState, val: u64) -> u64 {
         Some(m) => crate::interpreter::run_method_reentrant(vm, m, t, &[]).raw(),
         None => crate::runtime::error::dnu_fallback(vm, sel, k),
     }
+}
+
+/// Float fast-path (`docs/float_fastpath_design.md`): `stub_box_double` —
+/// `Ir::FBox`'s eden-overflow tail. The compiled fast path bump-allocates
+/// and stores the payload inline; on overflow it `bl`s here with the RAW
+/// f64 payload bits in x0 (NOT an oop — `KIND_BOX_DOUBLE` reports zero
+/// RootSpill oop slots, so a GC never scans it). Same callee-shaped
+/// skeleton as `stub_alloc_slow`. Marshals into `rt_box_double(vm, bits)`;
+/// answers the fresh `Double`'s tagged oop in x0.
+fn build_stub_box_double() -> CodeBlob {
+    let mut a = JasmAssembler::new();
+
+    emit_stub_prologue(&mut a);
+    emit_stub_kind_tag(&mut a, KIND_BOX_DOUBLE);
+    a.emit("mov", &[x(1), x(0)]); // payload bits -> x1, before x0 is overwritten
+    a.emit("mov", &[x(0), x(28)]); // vm
+    let lit = a.literal_u64(
+        rt_box_double as *const () as u64,
+        Some(RelocKind::RuntimeAddr),
+    );
+    a.call_far(lit);
+    a.emit("mov", &[x(16), x(0)]); // result -> x16, survives the epilogue's own x0 reload
+    emit_stub_epilogue(&mut a);
+    a.emit("mov", &[x(0), x(16)]); // restore the real result
+    a.emit("ret", &[]);
+
+    a.finish()
+}
+
+/// # Safety
+/// Only ever reached via `blr` from `stub_box_double`'s own hand-assembled
+/// listing above (through `call_far`), never called directly from Rust.
+///
+/// `bits` is a raw `f64` bit pattern (never an oop). Allocates a fresh
+/// boxed `Double` — this can scavenge, which is exactly why the compiled
+/// fast path's overflow lands here rather than growing eden inline — and
+/// answers its tagged oop. The payload is stored HERE (not by the compiled
+/// continuation) so the object is fully formed before any further
+/// safepoint can observe it.
+pub unsafe extern "C" fn rt_box_double(vm: *mut VmState, bits: u64) -> u64 {
+    // SAFETY: this function's own contract, guaranteed by `stub_box_double`.
+    let vm = unsafe { &mut *vm };
+    debug_assert_ne!(
+        vm.reg_block.last_compiled_fp, 0,
+        "rt_box_double: anchor must be set by stub_box_double's prologue before this call"
+    );
+    crate::memory::alloc::alloc_double(vm, f64::from_bits(bits))
+        .oop()
+        .raw()
 }
 
 /// D7: `stub_alloc_slow` — the inline-allocation fast path's overflow tail.
