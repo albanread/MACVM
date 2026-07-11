@@ -75,6 +75,44 @@ SequenceableCollection subclass: OrderedCollection [
         lastIndex := lastIndex - 1.
         ^v
     ]
+    "Remove the element at logical index i (1-based), shifting the tail down
+     one slot and niling the freed slot. The mutating core the remove:-family
+     builds on (Strongtalk AddableSequenceableCollection>>removeAt:)."
+    removeAtIndex: i [
+        | v |
+        (i between: 1 and: self size) ifFalse: [ ^self error: 'index out of range' ].
+        v := self at: i.
+        i to: self size - 1 do: [:j |
+            array at: firstIndex + j - 1 put: (array at: firstIndex + j) ].
+        array at: lastIndex put: nil.
+        lastIndex := lastIndex - 1.
+        ^v
+    ]
+    "Remove the first element equal to oldObject; evaluate anExceptionBlock if
+     none. Reuses the inherited indexOf:ifAbsent:."
+    remove: oldObject ifAbsent: anExceptionBlock [
+        | i |
+        i := self indexOf: oldObject ifAbsent: [ ^anExceptionBlock value ].
+        ^self removeAtIndex: i
+    ]
+    remove: oldObject [
+        ^self remove: oldObject ifAbsent: [ self error: 'object not found' ]
+    ]
+    "Remove one occurrence of each element of aCollection; answers it."
+    removeAll: aCollection [
+        aCollection do: [:each | self remove: each ].
+        ^aCollection
+    ]
+    "Remove every element for which aBlock answers true; answers self."
+    removeAllSuchThat: aBlock [
+        | keep |
+        keep := OrderedCollection new.
+        self do: [:each | (aBlock value: each) ifFalse: [ keep add: each ] ].
+        array := keep asArray.
+        firstIndex := 1.
+        lastIndex := keep size.
+        ^self
+    ]
     at: i [
         (i between: 1 and: self size) ifFalse: [ ^self error: 'index out of range' ].
         ^array at: firstIndex + i - 1

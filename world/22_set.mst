@@ -45,6 +45,39 @@ HashedCollection subclass: Set [
     includes: anObject [
         ^(elements at: (self scanFor: anObject)) notNil
     ]
+    "Remove anObject; evaluate aBlock if absent. Open-addressing deletion:
+     nil the slot, then HEAL the following cluster (fixCollisionsFrom:) so no
+     later element is stranded past the new gap — this keeps the class's
+     no-tombstone invariant (scanFor: is unchanged)."
+    remove: anObject ifAbsent: aBlock [
+        | i |
+        i := self scanFor: anObject.
+        (elements at: i) isNil ifTrue: [ ^aBlock value ].
+        elements at: i put: nil.
+        tally := tally - 1.
+        self fixCollisionsFrom: i.
+        ^anObject
+    ]
+    remove: anObject [
+        ^self remove: anObject ifAbsent: [ self error: 'object not found' ]
+    ]
+    removeAll: aCollection [
+        aCollection do: [:each | self remove: each ].
+        ^aCollection
+    ]
+    "Re-probe every occupied slot from just after `index` up to the next nil,
+     re-inserting each at its correct scanFor: position (which may move it up
+     into the freed gap). The standard Squeak/Pharo heal after a deletion."
+    fixCollisionsFrom: index [
+        | cap i probe |
+        cap := elements size.
+        i := index.
+        [ i := i = cap ifTrue: [ 1 ] ifFalse: [ i + 1 ].
+          probe := elements at: i.
+          probe notNil ] whileTrue: [
+            elements at: i put: nil.
+            elements at: (self scanFor: probe) put: probe ]
+    ]
     printOn: s [
         s nextPutAll: 'Set ('.
         self do: [:each | each printOn: s. s nextPut: $  ].

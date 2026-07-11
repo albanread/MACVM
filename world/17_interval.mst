@@ -64,4 +64,17 @@ Magnitude subclass: Number [
     to: stop by: step [
         ^Interval from: self to: stop by: step
     ]
+
+    "The stepped counted loop (Strongtalk Integer>>to:by:do:). Unlike the
+     1-step `to:do:`, this is NOT compiler-inlined, so without this method
+     `1 to: 10 by: 2 do: [...]` doesNotUnderstand. Handles both directions:
+     a negative step counts DOWN while i >= stop."
+    to: stop by: step do: aBlock [
+        | i |
+        i := self.
+        step < 0
+            ifTrue: [ [ i >= stop ] whileTrue: [ aBlock value: i. i := i + step ] ]
+            ifFalse: [ [ i <= stop ] whileTrue: [ aBlock value: i. i := i + step ] ].
+        ^self
+    ]
 ]
