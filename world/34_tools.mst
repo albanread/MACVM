@@ -105,7 +105,12 @@ Visual subclass: ClassHierarchyOutliner [
     htmlFragment [
         | html |
         html := HtmlWriter new.
-        html raw: '<div class="st-outliner">'.
+        "The root class name is stamped on the outliner so a drill-down into a
+         class (ClassOutliner) can offer a `back to hierarchy` that returns
+         here (smtk.js smapplOpenClass/smapplOpenHierarchy -> vm_host)."
+        html raw: '<div class="st-outliner" data-hierarchy-root="'.
+        html escaped: rootMirror name.
+        html raw: '">'.
         "The root renders open; its descendants render collapsed (a browsable
          tree, not one giant wall). Collapse/expand is client-side in
          smtk.js — the whole tree ships once, cheap at world scale; a truly
@@ -125,6 +130,10 @@ Visual subclass: ClassHierarchyOutliner [
             ifFalse: [ isOpen
                 ifTrue:  [ html raw: '<span class="st-tw" data-tw>&#9662; </span>' ]
                 ifFalse: [ html raw: '<span class="st-tw" data-tw>&#9656; </span>' ] ].
+        "The class name opens its method browser (ClassOutliner) on click."
+        html raw: '<span class="st-class-link" data-open-class="'.
+        html escaped: mirror name.
+        html raw: '">'.
         html escaped: mirror name.
         html raw: '</span>'.
         subs isEmpty ifFalse: [

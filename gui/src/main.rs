@@ -844,6 +844,24 @@ extern "C" fn on_script_message(_this: Id, _cmd: Sel, _controller: Id, message: 
                 });
             }
         }
+        "smapplOpenClass" => {
+            // Drill from a hierarchy outliner into a class's method browser.
+            if let Some(vm) = VM.get() {
+                vm.submit(vm_host::VmRequest::SmapplOpenClass {
+                    cls: dict_get_string(body, "cls"),
+                    root: dict_get_string(body, "root"),
+                    widget_id: dict_get_string(body, "widgetId"),
+                });
+            }
+        }
+        "smapplOpenHierarchy" => {
+            if let Some(vm) = VM.get() {
+                vm.submit(vm_host::VmRequest::SmapplOpenHierarchy {
+                    root: dict_get_string(body, "root"),
+                    widget_id: dict_get_string(body, "widgetId"),
+                });
+            }
+        }
         _ => {}
     }
 }

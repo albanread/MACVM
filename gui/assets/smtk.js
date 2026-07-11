@@ -77,6 +77,34 @@
         return;
       }
 
+      // Drill down: a class name in a hierarchy outliner opens that class's
+      // method browser (ClassOutliner, with editors) in place; the back link
+      // re-opens the hierarchy. Both replace the same widget (by data-widget-id).
+      const openClass = ev.target.closest(".st-class-link[data-open-class]");
+      if (openClass) {
+        ev.preventDefault();
+        const host = openClass.closest("[data-widget-id]");
+        const root = openClass.closest("[data-hierarchy-root]");
+        post({
+          kind: "smapplOpenClass",
+          cls: openClass.getAttribute("data-open-class") || "",
+          widgetId: host ? host.getAttribute("data-widget-id") || "" : "",
+          root: root ? root.getAttribute("data-hierarchy-root") || "" : "",
+        });
+        return;
+      }
+      const backLink = ev.target.closest(".st-class-link[data-open-hierarchy]");
+      if (backLink) {
+        ev.preventDefault();
+        const host = backLink.closest("[data-widget-id]");
+        post({
+          kind: "smapplOpenHierarchy",
+          root: backLink.getAttribute("data-open-hierarchy") || "",
+          widgetId: host ? host.getAttribute("data-widget-id") || "" : "",
+        });
+        return;
+      }
+
       // A rendered smappl widget (Button etc., ../smappl.md §3) — the
       // fragment carries the opaque action id the VM worker stored in
       // SmapplRegistry; clicking posts it back so `SmapplRegistry fire:`

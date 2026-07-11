@@ -130,6 +130,21 @@ pub enum VmRequest {
         /// post-accept live refresh so its editor isn't yanked out mid-edit.
         widget_id: String,
     },
+    /// Drill down: a class name in a hierarchy outliner was clicked. Replace
+    /// that widget (`widget_id`) with the class's method browser (a
+    /// `ClassOutliner`, with editable source), carrying a back link to `root`'s
+    /// hierarchy.
+    SmapplOpenClass {
+        cls: String,
+        root: String,
+        widget_id: String,
+    },
+    /// The back link in a drilled-down ClassOutliner: re-open `root`'s
+    /// hierarchy in that widget.
+    SmapplOpenHierarchy {
+        root: String,
+        widget_id: String,
+    },
     /// Reset the worker's `BrowserSelection` to match the fresh default
     /// state the initial page render always shows (see
     /// `main.rs::open_class_browser`) — sent once whenever the browser
@@ -1027,6 +1042,51 @@ fn handle(
             let mut responses = vec![VmResponse::Transcript(versioned)];
             responses.extend(refresh_open_outliners(vm, image, &widget_id));
             responses
+        }
+        VmRequest::SmapplOpenClass {
+            cls,
+            root,
+            widget_id,
+        } => {
+            let code = format!("ClassOutliner for: (ClassMirror on: {cls})");
+            match render_and_inject(vm, image, &code) {
+                Some(inner) => {
+                    // Wrap with a back link to the hierarchy; the wrapper is
+                    // the fragment root the widget-id is stamped on.
+                    let wrapped = format!(
+                        "<div class=\"st-classbrowser\"><div class=\"st-back\">\
+                         <span class=\"st-class-link\" data-open-hierarchy=\"{root}\">\
+                         &#8249; {root} hierarchy</span></div>{inner}</div>"
+                    );
+                    OPEN_OUTLINERS.with(|o| {
+                        let mut v = o.borrow_mut();
+                        v.retain(|(wid, _)| wid != &widget_id);
+                        v.push((widget_id.clone(), code));
+                    });
+                    vec![VmResponse::SmapplFragment {
+                        html: tag_widget_id(&wrapped, &widget_id),
+                        id: widget_id,
+                    }]
+                }
+                None => vec![VmResponse::Transcript(format!("(cannot open {cls})"))],
+            }
+        }
+        VmRequest::SmapplOpenHierarchy { root, widget_id } => {
+            let code = format!("ClassHierarchyOutliner imbeddedVisualForClass: {root}");
+            match render_and_inject(vm, image, &code) {
+                Some(html) => {
+                    OPEN_OUTLINERS.with(|o| {
+                        let mut v = o.borrow_mut();
+                        v.retain(|(wid, _)| wid != &widget_id);
+                        v.push((widget_id.clone(), code));
+                    });
+                    vec![VmResponse::SmapplFragment {
+                        html: tag_widget_id(&html, &widget_id),
+                        id: widget_id,
+                    }]
+                }
+                None => vec![VmResponse::Transcript(format!("(cannot open {root} hierarchy)"))],
+            }
         }
         VmRequest::BrowserOpen => {
             // No longer resets `selection` to default — that made sense
@@ -1998,6 +2058,73 @@ mod tests {
             unbuildable.is_empty(),
             "an unbuildable shape must yield no fragment, got {unbuildable:?}"
         );
+    }
+
+    /// Drill-down: clicking a class in a hierarchy outliner opens that class's
+    /// method browser (a ClassOutliner with editors) in the same widget, with a
+    /// back link to the hierarchy.
+    #[test]
+    fn open_class_drills_into_a_method_browser_with_a_back_link() {
+        OPEN_OUTLINERS.with(|o| o.borrow_mut().clear());
+        let world_dir = test_world_dir();
+        let tmp = std::env::temp_dir()
+            .join(format!("macvm_drill_{}.sqlite3", std::process::id()));
+        std::fs::remove_file(&tmp).ok();
+        let image = open_or_seed_image(&world_dir, &tmp).expect("seed");
+        let mut vm = VmHandle::boot_without_world(macvm::runtime::VmOptions {
+            heap_mib: 64,
+            jit: macvm::runtime::JitMode::Off,
+            ..Default::default()
+        });
+        crate::world_boot::load_world_from_image(&mut vm, &image, WORLD_DOITS).expect("db load");
+        let mut world = MockWorld::seed();
+        let mut sel = BrowserSelection::default();
+
+        let opened = handle(
+            VmRequest::SmapplOpenClass {
+                cls: "Point".to_string(),
+                root: "Object".to_string(),
+                widget_id: "s0".to_string(),
+            },
+            &mut world,
+            &mut sel,
+            Some(&image),
+            &mut vm,
+        );
+        let html = match opened.as_slice() {
+            [VmResponse::SmapplFragment { id, html }] if id == "s0" => html.clone(),
+            other => panic!("expected a SmapplFragment for s0, got {other:?}"),
+        };
+        assert!(
+            html.contains("st-classoutliner")
+                && html.contains("st-smappl-src")
+                && html.contains("instance side"),
+            "drilling into Point must show its method browser with editors, got a {}-char fragment",
+            html.len()
+        );
+        assert!(
+            html.contains("data-open-hierarchy=\"Object\""),
+            "the class browser must carry a back link to the Object hierarchy: {html}"
+        );
+
+        // Back re-opens the hierarchy in the same widget.
+        let back = handle(
+            VmRequest::SmapplOpenHierarchy {
+                root: "Object".to_string(),
+                widget_id: "s0".to_string(),
+            },
+            &mut world,
+            &mut sel,
+            Some(&image),
+            &mut vm,
+        );
+        assert!(
+            matches!(back.as_slice(), [VmResponse::SmapplFragment { id, html }]
+                if id == "s0" && html.contains("st-outliner") && html.contains("data-open-class")),
+            "back must re-open the clickable hierarchy, got {back:?}"
+        );
+
+        std::fs::remove_file(&tmp).ok();
     }
 
     /// View sync (ToolRegistry, docs/APPS.md §7): with two outliners open, an
