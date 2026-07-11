@@ -9,26 +9,34 @@
 # JIT is fully supported.
 #
 # Usage:
-#   ./run-gui.sh                          # debug build, JIT ON by default
+#   ./run-gui.sh                          # release build (default), JIT ON
 #                                         # (gui_vm_options: threshold=10 when
 #                                         #  MACVM_JIT is unset)
+#   ./run-gui.sh --debug                  # unoptimized build — ONLY for chasing
+#                                         # a crash; ~47x slower on compute-heavy
+#                                         # work (e.g. the Mandelbrot canvas demo)
 #   MACVM_JIT=off ./run-gui.sh            # force the pure interpreter
 #   MACVM_JIT=threshold=1 ./run-gui.sh    # compile aggressively (first call)
 #   MACVM_IMAGE_PATH=world/image.sqlite3 ./run-gui.sh   # point browser at an image
-#   ./run-gui.sh --release                # optimized build (snappier UI)
 #
-# Any extra arguments after --release pass through to the app.
+# Release is the default because debug is unoptimized Rust: the JIT compiler,
+# GC, and the allocation/dispatch runtime helpers all run ~47x slower, which is
+# very visible on compute-heavy Smalltalk (the Mandelbrot canvas demo is 0.7s
+# release vs 33s debug). Use --debug only when a release crash needs debugging.
+#
+# Any extra arguments after --debug pass through to the app.
 set -euo pipefail
 
 # Repo root — so relative paths (world/, assets, image) resolve regardless of
 # where the script is invoked from.
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
-profile_flag=()
-bin_dir="debug"
-if [[ "${1:-}" == "--release" ]]; then
-	profile_flag=(--release)
-	bin_dir="release"
+# Release by default; --debug opts into the unoptimized build.
+profile_flag=(--release)
+bin_dir="release"
+if [[ "${1:-}" == "--debug" ]]; then
+	profile_flag=()
+	bin_dir="debug"
 	shift
 fi
 
