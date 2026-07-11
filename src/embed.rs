@@ -747,6 +747,86 @@ mod tests {
         );
     }
 
+    /// Float fast-path step 5b (`docs/float_fastpath_design.md` B5): PROMOTED
+    /// float temps live as raw f64 frame slots across safepoints; the deopt
+    /// map records `ValueLoc::DoubleSlot` and the materializer boxes them.
+    /// This test forces an uncommon trap IN THE MIDDLE of a loop whose float
+    /// temps are promoted (a fused site warmed mono-Double, then handed an
+    /// integer receiver at iteration 500): the materializer must rebuild
+    /// `a`/`b` exactly from their raw slots, and the remaining ~500
+    /// iterations run interpreted on the rebuilt frame. Wrong bits anywhere
+    /// would change the final sum. Asserts a deopt actually fired, so the
+    /// path can never silently stop being exercised.
+    #[test]
+    fn float_temp_promotion_materializes_raw_slots_on_a_midloop_deopt() {
+        let mut vm = boot_test_vm(JitMode::Threshold(10));
+        vm.exec(
+            "Object subclass: WTestT [ run: coll [ | a b i x | \
+             a := 1.5. b := 0.25. i := 0. x := 0.0. \
+             [ i < 1000 ] whileTrue: [ \
+                 a := a * 1.001. b := b + a. \
+                 x := (coll at: i + 1) + 2.0. i := i + 1 ]. \
+             ^b + x ] ]",
+        )
+        .expect("class definition");
+        vm.exec(
+            "[ | w good | w := WTestT new. good := Array new: 1000. \
+             1 to: 1000 do: [ :k | good at: k put: 0.5 ]. \
+             1 to: 30 do: [ :k | w run: good ] ] value.",
+        )
+        .expect("warmup");
+        let clean = vm
+            .eval("WTestT new run: ((1 to: 1000) inject: (Array new: 1000) into: [ :a :k | a at: k put: 0.5. a ])")
+            .unwrap_or_default();
+        let deopts_before = vm.vm.stats.deopt_count;
+        // Poison element 501: iteration 500's fused `+ 2.0` receiver is an
+        // integer → trap mid-loop with promoted a/b live.
+        let poisoned = vm
+            .eval(
+                "[ | bad | bad := Array new: 1000. \
+                 1 to: 1000 do: [ :k | bad at: k put: 0.5 ]. \
+                 bad at: 501 put: 7. \
+                 WTestT new run: bad ] value.",
+            )
+            .expect("poisoned run");
+        assert!(
+            vm.vm.stats.deopt_count > deopts_before,
+            "the poisoned run must actually deopt mid-loop (else this test \
+             is not exercising DoubleSlot materialization)"
+        );
+        // Interpreter truth for the poisoned input: 0.5+2.0 everywhere except
+        // element 501 (7 + 2.0 = 9.0 — but x is overwritten each iteration,
+        // so only the LAST element's x survives; the sum differs from `clean`
+        // only through the b accumulation being identical and x identical) —
+        // compare against the same expression run fully interpreted instead
+        // of hand-computing.
+        let mut interp = boot_test_vm(JitMode::Off);
+        interp
+            .exec(
+                "Object subclass: WTestT [ run: coll [ | a b i x | \
+                 a := 1.5. b := 0.25. i := 0. x := 0.0. \
+                 [ i < 1000 ] whileTrue: [ \
+                     a := a * 1.001. b := b + a. \
+                     x := (coll at: i + 1) + 2.0. i := i + 1 ]. \
+                 ^b + x ] ]",
+            )
+            .expect("class definition (interp)");
+        let interp_poisoned = interp
+            .eval(
+                "[ | bad | bad := Array new: 1000. \
+                 1 to: 1000 do: [ :k | bad at: k put: 0.5 ]. \
+                 bad at: 501 put: 7. \
+                 WTestT new run: bad ] value.",
+            )
+            .expect("poisoned run (interp)");
+        assert_eq!(
+            poisoned, interp_poisoned,
+            "mid-loop deopt with promoted float temps must be byte-identical \
+             to the interpreter"
+        );
+        assert!(!clean.is_empty(), "clean run sanity");
+    }
+
     /// A `visual=` that returns a `Glue` spacer (the side-effecting shape,
     /// gui/smappl.md §3 shape 6) renders to an invisible fixed-width span.
     #[test]

@@ -75,7 +75,13 @@ pub fn resolve_frame_loc(
                 || extra_oop_live.iter().any(|&(v, p)| v == vreg && p == pos))
         {
             if let Some(Assignment::Spill(slot)) = iv.assignment {
-                return ValueLoc::FrameSlot(-8 * (slot.0 as i32 + 1));
+                let off = -8 * (slot.0 as i32 + 1);
+                // Float fast-path: an unboxed-f64 vreg's slot holds raw bits,
+                // not an oop — the materializer must box, not adopt.
+                if iv.is_fp {
+                    return ValueLoc::DoubleSlot(off);
+                }
+                return ValueLoc::FrameSlot(off);
             }
         }
     }
@@ -291,6 +297,12 @@ pub enum ValueLoc {
     /// never elides), and the root frame is fully built (incl. its M6
     /// Context) before any inlined frame's values are read.
     ElidedClosure(u32),
+    /// Float fast-path (`docs/float_fastpath_design.md` B5): the frame slot
+    /// at byte offset `off` holds a RAW `f64` bit pattern (an unboxed float
+    /// temp/copy — `VRegInfo::is_fp`), NOT an oop. The materializer BOXES it
+    /// (`alloc_double`) into the rebuilt interpreter frame; the oop map
+    /// already marks the slot non-oop, so the GC never scans it.
+    DoubleSlot(i32),
 }
 
 impl ValueLoc {
@@ -313,6 +325,10 @@ impl ValueLoc {
                 out.push(4);
                 write_uleb(out, ix as u64);
             }
+            ValueLoc::DoubleSlot(off) => {
+                out.push(5);
+                write_sleb(out, off as i64);
+            }
         }
     }
 
@@ -325,6 +341,7 @@ impl ValueLoc {
             2 => ValueLoc::FrameSlot(read_sleb(buf, pos) as i32),
             3 => ValueLoc::Nil,
             4 => ValueLoc::ElidedClosure(read_uleb(buf, pos) as u32),
+            5 => ValueLoc::DoubleSlot(read_sleb(buf, pos) as i32),
             other => panic!("ValueLoc::read: bad tag {other}"),
         }
     }

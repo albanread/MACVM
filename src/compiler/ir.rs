@@ -265,6 +265,15 @@ pub enum Ir {
         a: VReg,
         b: VReg,
     },
+    /// An unboxed `f64` constant (the float-temp promotion's rewrite of a
+    /// `Move` from a boxed Double literal — `zr := 0.0`). `bits` is the raw
+    /// bit pattern, baked into code (`movz/movk` + `fmov`): the VALUE of an
+    /// immutable Double literal never changes even when the boxed object
+    /// moves, so no pool/reloc is involved at all.
+    FConst {
+        dst: VReg,
+        bits: u64,
+    },
     Jump {
         target: BlockId,
     },
@@ -420,6 +429,7 @@ impl Ir {
             Ir::RetSelf => f(VReg(0)),
             Ir::ConstSmi { .. }
             | Ir::ConstPool { .. }
+            | Ir::FConst { .. }
             | Ir::Param { .. }
             | Ir::Jump { .. }
             | Ir::Alloc { .. }
@@ -452,6 +462,7 @@ impl Ir {
             | Ir::FBox { dst, .. }
             | Ir::FArith { dst, .. }
             | Ir::FCmpVal { dst, .. }
+            | Ir::FConst { dst, .. }
             | Ir::Alloc { dst, .. } => f(*dst),
             Ir::CallRuntime { dst: Some(d), .. } => f(*d),
             Ir::StoreField { .. }
@@ -5584,6 +5595,7 @@ fn map_uses(op: &mut Ir, mut f: impl FnMut(VReg) -> VReg) {
         Ir::RetSelf
         | Ir::ConstSmi { .. }
         | Ir::ConstPool { .. }
+        | Ir::FConst { .. }
         | Ir::Param { .. }
         | Ir::Jump { .. }
         | Ir::Alloc { .. }
@@ -5789,6 +5801,327 @@ pub(crate) fn copy_propagate(m: &mut IrMethod) {
     }
 }
 
+/// Float fast-path rule 4 (`docs/float_fastpath_design.md` B5): FLOAT-TEMP
+/// PROMOTION — a method temp that provably always holds a Double becomes an
+/// unboxed fp vreg, living raw across the whole loop (including safepoints:
+/// spill-all parks it in a non-oop frame slot; `resolve_frame_loc` records
+/// `ValueLoc::DoubleSlot`, and the deopt materializer boxes it back).
+///
+/// A temp `t` qualifies iff ALL hold:
+/// - every real def is `Move { t, s }` with `s` an `FBox` result or a boxed
+///   Double literal (`ConstPool` of a Double oop — rewritten to `FConst`);
+/// - its mandatory nil-init (`ConstPool { t, nil }`) is provably DEAD: a
+///   qualifying def occurs in the ENTRY block before any use of `t` and
+///   before any safepoint (so neither the program nor a deopt can ever
+///   observe the nil — Smalltalk's read-before-write would otherwise DNU
+///   where promoted code would silently read a stale f64);
+/// - every use is an `FUnbox { _, src: t }` (rewritten to a direct fp read,
+///   guard deleted — the value is a Double by construction) or a
+///   `Move { c, t }` whose `c` is DEOPT-ONLY (an operand-stack copy pinned
+///   by reexecute metadata: `c` is promoted alongside `t`, and its DeoptRaw
+///   references become `DoubleSlot` automatically);
+/// - `t` appears in no merge entry stack.
+///
+/// GATED OFF for OSR compiles: the OSR entry copies INTERPRETER slot values
+/// (boxed oops) into compiled frame slots — an fp slot would need an
+/// unbox-with-guard at OSR entry, deferred.
+fn promote_float_temps(m: &mut IrMethod) {
+    use std::collections::HashMap;
+    let n = m.vregs.len();
+
+    // ── Whole-method censuses. ──────────────────────────────────────────
+    let mut fbox_src: HashMap<u32, VReg> = HashMap::new(); // FBox dst → fp src
+    let mut const_double: HashMap<u32, u64> = HashMap::new(); // ConstPool dst → f64 bits
+    let mut op_uses: Vec<u32> = vec![0; n];
+    let mut entry_used = vec![false; n];
+    let mut funbox_uses: Vec<u32> = vec![0; n];
+    let mut move_copy_of: Vec<Vec<u32>> = vec![Vec::new(); n]; // t → its copies c
+    let mut bad_def = vec![false; n];
+    let mut move_defs: Vec<u32> = vec![0; n];
+    let mut nil_init_def: Vec<u32> = vec![0; n];
+    let mut deopt_used = vec![false; n];
+
+    for b in &m.blocks {
+        for v in &b.entry_stack {
+            entry_used[v.0 as usize] = true;
+        }
+        for (_, raw) in &b.deopt_sites {
+            for v in &raw.stack {
+                deopt_used[v.0 as usize] = true;
+            }
+            let mut lvl = raw.inline.as_ref();
+            while let Some(site) = lvl {
+                deopt_used[site.receiver.0 as usize] = true;
+                for v in &site.slots {
+                    deopt_used[v.0 as usize] = true;
+                }
+                for v in &site.caller_pending_stack {
+                    deopt_used[v.0 as usize] = true;
+                }
+                lvl = site.parent.as_deref();
+            }
+        }
+        for op in &b.code {
+            op.uses(|v| op_uses[v.0 as usize] += 1);
+            match op {
+                Ir::FBox { dst, src } => {
+                    fbox_src.insert(dst.0, *src);
+                }
+                Ir::ConstPool { dst, lit } => {
+                    let e = &m.pool[lit.0 as usize];
+                    if e.kind == Some(RelocKind::Oop) {
+                        if let Some(d) = crate::oops::wrappers::DoubleOop::try_from(
+                            crate::oops::Oop::from_raw(e.value),
+                        ) {
+                            const_double.insert(dst.0, d.value().to_bits());
+                        }
+                    }
+                    // Def classification: EXACTLY the nil literal is the
+                    // mandatory temp nil-init; any other ConstPool def (a
+                    // Symbol, a non-Double literal…) disqualifies outright.
+                    if *lit == m.nil_lit {
+                        nil_init_def[dst.0 as usize] += 1;
+                    } else {
+                        bad_def[dst.0 as usize] = true;
+                    }
+                }
+                Ir::FUnbox { src, .. } => funbox_uses[src.0 as usize] += 1,
+                Ir::Move { dst, src } => {
+                    move_copy_of[src.0 as usize].push(dst.0);
+                    move_defs[dst.0 as usize] += 1;
+                }
+                _ => {}
+            }
+            // Non-Move/non-ConstPool defs disqualify their targets.
+            if !matches!(op, Ir::Move { .. } | Ir::ConstPool { .. }) {
+                op.defs(|v| bad_def[v.0 as usize] = true);
+            }
+        }
+    }
+
+    // ── Qualification. ──────────────────────────────────────────────────
+    let mut qualified: Vec<u32> = Vec::new();
+    'cand: for t in 1..n as u32 {
+        let ti = t as usize;
+        if m.vregs[ti].is_fp
+            || move_defs[ti] == 0
+            || bad_def[ti]
+            || entry_used[ti]
+            || nil_init_def[ti] > 1
+        {
+            continue;
+        }
+        // Uses: only FUnbox srcs + Move copies (each verified deopt-only).
+        let copies = &move_copy_of[ti];
+        if op_uses[ti] != funbox_uses[ti] + copies.len() as u32 {
+            continue;
+        }
+        for &c in copies {
+            let ci = c as usize;
+            if op_uses[ci] != 0
+                || entry_used[ci]
+                || move_defs[ci] != 1
+                || nil_init_def[ci] != 0
+                || bad_def[ci]
+            {
+                continue 'cand;
+            }
+        }
+        // Every Move def's source is an FBox result or a Double constant.
+        for b in &m.blocks {
+            for op in &b.code {
+                if let Ir::Move { dst, src } = op {
+                    if dst.0 == t
+                        && !fbox_src.contains_key(&src.0)
+                        && !const_double.contains_key(&src.0)
+                    {
+                        continue 'cand;
+                    }
+                }
+            }
+        }
+        // Every FUnbox of t must be cleanly cancellable: all uses of its dst
+        // are IN THE SAME BLOCK, after the unbox, before any redefinition of
+        // t (the redefinition hazard), and account for the dst's every use.
+        for b in &m.blocks {
+            for (i, op) in b.code.iter().enumerate() {
+                let u = match op {
+                    Ir::FUnbox { dst, src, .. } if src.0 == t => dst.0,
+                    _ => continue,
+                };
+                // Deleting the FUnbox deletes u's only def — u must not be
+                // named by any deopt metadata.
+                if deopt_used[u as usize] {
+                    continue 'cand;
+                }
+                let mut in_window = 0u32;
+                let mut redefined = false;
+                for later in &b.code[i + 1..] {
+                    let mut uses_u = false;
+                    later.uses(|v| {
+                        if v.0 == u {
+                            uses_u = true;
+                        }
+                    });
+                    if uses_u {
+                        if redefined {
+                            continue 'cand; // stranded past a redefinition
+                        }
+                        in_window += 1;
+                    }
+                    let mut defs_t = false;
+                    later.defs(|v| {
+                        if v.0 == t {
+                            defs_t = true;
+                        }
+                    });
+                    if defs_t {
+                        redefined = true;
+                    }
+                }
+                if in_window != op_uses[u as usize] {
+                    continue 'cand; // cross-block use of the unboxed value
+                }
+            }
+        }
+        // Dead nil-init: a qualifying Move def in the ENTRY block before any
+        // use of t and before any safepoint — so neither the program nor a
+        // deopt can ever observe the nil this promotion erases.
+        let entry = &m.blocks[0];
+        let mut ok = false;
+        for op in &entry.code {
+            if is_safepoint_op(op) {
+                break;
+            }
+            let mut used_here = false;
+            op.uses(|v| {
+                if v.0 == t {
+                    used_here = true;
+                }
+            });
+            if used_here {
+                break;
+            }
+            if let Ir::Move { dst, .. } = op {
+                if dst.0 == t {
+                    ok = true;
+                    break;
+                }
+            }
+        }
+        if !ok {
+            continue;
+        }
+        qualified.push(t);
+    }
+    if qualified.is_empty() {
+        return;
+    }
+
+    // ── Rewrite (shapes pre-verified above — no bail-outs from here). ───
+    let mut is_promoted = vec![false; n];
+    for &t in &qualified {
+        is_promoted[t as usize] = true;
+        m.vregs[t as usize].is_fp = true;
+        m.vregs[t as usize].is_oop = false;
+        for &c in &move_copy_of[t as usize] {
+            m.vregs[c as usize].is_fp = true;
+            m.vregs[c as usize].is_oop = false;
+        }
+    }
+    for b in &mut m.blocks {
+        let len = b.code.len();
+        let mut delete = vec![false; len];
+        for i in 0..len {
+            let replace: Option<Ir> = match &b.code[i] {
+                Ir::ConstPool { dst, .. } if is_promoted[dst.0 as usize] => {
+                    // The provably-dead nil-init — value irrelevant; an
+                    // FConst keeps the def so interval shapes are unchanged.
+                    Some(Ir::FConst { dst: *dst, bits: 0 })
+                }
+                Ir::Move { dst, src } if is_promoted[dst.0 as usize] => {
+                    if let Some(&fp) = fbox_src.get(&src.0) {
+                        Some(Ir::Move { dst: *dst, src: fp })
+                    } else if let Some(&bits) = const_double.get(&src.0) {
+                        Some(Ir::FConst { dst: *dst, bits })
+                    } else {
+                        unreachable!("promotion qualified a def it can't rewrite")
+                    }
+                }
+                _ => None,
+            };
+            if let Some(new_op) = replace {
+                b.code[i] = new_op;
+                continue;
+            }
+            let (u, t) = match &b.code[i] {
+                Ir::FUnbox { dst, src, .. } if is_promoted[src.0 as usize] => (dst.0, *src),
+                _ => continue,
+            };
+            for later in b.code[i + 1..].iter_mut() {
+                rewrite_uses(later, u, t);
+            }
+            delete[i] = true;
+        }
+        if delete.iter().any(|&d| d) {
+            let mut removed = 0u32;
+            let mut removed_before: Vec<u32> = vec![0; len + 1];
+            for (i, item) in delete.iter().enumerate() {
+                removed_before[i] = removed;
+                if *item {
+                    removed += 1;
+                }
+            }
+            removed_before[len] = removed;
+            let mut idx = 0usize;
+            b.code.retain(|_| {
+                let keep = !delete[idx];
+                idx += 1;
+                keep
+            });
+            for (ci, _) in b.deopt_sites.iter_mut() {
+                *ci -= removed_before[*ci as usize];
+            }
+        }
+    }
+}
+
+/// `op` reads `from` → make it read `to` (fp positions only — the promotion
+/// only ever rewrites fp-valued reads: FArith/FCmp*/FBox sources and fp
+/// Moves).
+fn rewrite_uses(op: &mut Ir, from: u32, to: VReg) {
+    match op {
+        Ir::FArith { a, b, .. } | Ir::FCmpVal { a, b, .. } | Ir::FCmpBr { a, b, .. } => {
+            if a.0 == from {
+                *a = to;
+            }
+            if b.0 == from {
+                *b = to;
+            }
+        }
+        Ir::FBox { src, .. } | Ir::FUnbox { src, .. } | Ir::Move { src, .. } => {
+            if src.0 == from {
+                *src = to;
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Op-level safepoint test for the promotion's dead-nil-init gate — mirrors
+/// `regalloc::is_safepoint` (kept in sync by the shared-variant match).
+fn is_safepoint_op(ir: &Ir) -> bool {
+    matches!(
+        ir,
+        Ir::CallSend { .. }
+            | Ir::CallRuntime { .. }
+            | Ir::Alloc { .. }
+            | Ir::FBox { .. }
+            | Ir::UncommonTrap { .. }
+            | Ir::Poll
+    )
+}
+
 /// Float fast-path (`docs/float_fastpath_design.md` B2 rules 2–3): the
 /// box/unbox cancellation reducer. Per block, forward:
 ///
@@ -5807,7 +6140,7 @@ pub(crate) fn copy_propagate(m: &mut IrMethod) {
 ///
 /// Runs after [`copy_propagate`] (which collapses the Move chains between an
 /// `FBox` and its consumer `FUnbox`, making rule 2's def visible in-block).
-pub(crate) fn reduce_float_boxes(m: &mut IrMethod) {
+pub(crate) fn reduce_float_boxes(m: &mut IrMethod, osr: bool) {
     // ── Rule 2: per-block cancel. ────────────────────────────────────────
     for b in &mut m.blocks {
         let mut boxed_src: HashMap<u32, VReg> = HashMap::new(); // FBox dst → fp src
@@ -5865,6 +6198,13 @@ pub(crate) fn reduce_float_boxes(m: &mut IrMethod) {
         for (ci, _) in b.deopt_sites.iter_mut() {
             *ci -= removed_before[*ci as usize];
         }
+    }
+
+    // ── Rule 4 (docs B5): float-temp promotion — before the sink/census
+    // so the temp-store FBoxes it orphans die in rule 3 below. OSR compiles
+    // are gated out (the OSR entry copies boxed interpreter slots).
+    if !osr {
+        promote_float_temps(m);
     }
 
     // ── Rule 3a: deopt-sunk boxing. An intermediate FBox whose boxed
@@ -6776,7 +7116,7 @@ pub fn convert(
         method_pool_ix,
     };
     copy_propagate(&mut irm);
-    reduce_float_boxes(&mut irm);
+    reduce_float_boxes(&mut irm, osr);
     irm
 }
 

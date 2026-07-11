@@ -262,6 +262,10 @@ struct Emitter<'a> {
     /// klass (`IrMethod::mark_double_lit`/`double_klass_lit`).
     mark_double_lit: PoolLit,
     double_klass_lit: PoolLit,
+    /// Float fast-path: per-vreg FP-class flags (`VRegInfo::is_fp`) — `Move`
+    /// dispatches GPR vs FP lowering on them (a promoted float temp's store
+    /// is an fp-to-fp move).
+    vreg_is_fp: Vec<bool>,
     /// Absolute address of the once-published `stub_poll` (`codecache::
     /// stubs`) — a runtime value `Poll`'s far call embeds as a pool
     /// constant, since `bl`'s ±128 MB range can't reach it directly and
@@ -1511,6 +1515,7 @@ pub fn emit(
         mark_slots_lit: method.mark_slots_lit,
         mark_double_lit: method.mark_double_lit,
         double_klass_lit: method.double_klass_lit,
+        vreg_is_fp: method.vregs.iter().map(|v| v.is_fp).collect(),
         stub_poll_lit,
         must_be_boolean_lit,
         alloc_slow_lit,
@@ -1700,6 +1705,14 @@ fn emit_ir(e: &mut Emitter, ir: &Ir, next_in_order: Option<BlockId>) {
             if_true,
             if_false,
         } => e.emit_fcmp_br(op, a, b, if_true, if_false),
+        Ir::FConst { dst, bits } => {
+            // Raw f64 bits baked into code: movz/movk into x16, fmov to the
+            // fp destination. Position- and GC-independent (see the IR doc).
+            emit_mov_imm64(e.asm, xr(16), bits);
+            let dd = e.dest_target_fp(dst);
+            e.asm.emit("fmov", &[d(dd), x(16)]);
+            e.commit_fp(dst, dd);
+        }
         Ir::ConstSmi { dst, value } => {
             let d = e.dest_target(dst);
             emit_mov_imm64(e.asm, d, (value << 2) as u64);
@@ -1717,12 +1730,27 @@ fn emit_ir(e: &mut Emitter, ir: &Ir, next_in_order: Option<BlockId>) {
             }
         }
         Ir::Move { dst, src } => {
-            let rs = e.resolve(src, 16);
-            let d = e.dest_target(dst);
-            if d.num != rs.num {
-                e.asm.emit("mov", &[Operand::Reg(d), Operand::Reg(rs)]);
+            // Float fast-path: a promoted float temp's store/copy is an
+            // fp-to-fp move — d-register file, fp spill access.
+            if e.vreg_is_fp[dst.0 as usize] {
+                debug_assert!(
+                    e.vreg_is_fp[src.0 as usize],
+                    "fp Move from a non-fp source (promotion bug)"
+                );
+                let ds = e.resolve_fp(src, 16);
+                let dd = e.dest_target_fp(dst);
+                if dd != ds {
+                    e.asm.emit("fmov", &[d(dd), d(ds)]);
+                }
+                e.commit_fp(dst, dd);
+            } else {
+                let rs = e.resolve(src, 16);
+                let dr = e.dest_target(dst);
+                if dr.num != rs.num {
+                    e.asm.emit("mov", &[Operand::Reg(dr), Operand::Reg(rs)]);
+                }
+                e.commit(dst, dr);
             }
-            e.commit(dst, d);
         }
         Ir::Param { dst, index } => {
             let abi = xr(index);

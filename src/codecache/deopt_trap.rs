@@ -1360,6 +1360,17 @@ pub fn read_frame_slot(fp: usize, off: i32) -> Oop {
     Oop::from_raw(unsafe { core::ptr::read(addr) })
 }
 
+/// [`read_frame_slot`] for a slot holding a RAW `f64` bit pattern
+/// (`ValueLoc::DoubleSlot`, the float fast-path's unboxed temps) — same
+/// contract, but returns the bits WITHOUT constructing an `Oop`:
+/// `Oop::from_raw`'s debug validation rejects any word whose low bits look
+/// like a mark tag, which ~a quarter of genuine doubles do.
+pub fn read_frame_slot_raw(fp: usize, off: i32) -> u64 {
+    let addr = (fp as isize + off as isize) as *const u64;
+    // SAFETY: contract above — `fp + off` is an 8-byte-aligned live slot.
+    unsafe { core::ptr::read(addr) }
+}
+
 /// Read the live oop at oop-pool index `pool_ix` of `nm` — the second door
 /// (alongside [`read_frame_slot`]) the `#![deny(unsafe_code)]` materializer
 /// (`runtime/deopt.rs`) uses to reach a raw code-cache word. A `ValueLoc::

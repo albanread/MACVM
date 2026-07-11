@@ -26,7 +26,7 @@
 
 #![deny(unsafe_code)]
 
-use crate::codecache::deopt_trap::{read_frame_slot, read_pool_oop};
+use crate::codecache::deopt_trap::{read_frame_slot, read_frame_slot_raw, read_pool_oop};
 use crate::codecache::nmethod::{Nmethod, NmethodId};
 use crate::compiler::scopes::{CtxLoc, DecodedScope, DeoptState, ValueLoc};
 use crate::interpreter::stack::{Frame, FrameActivation};
@@ -136,6 +136,15 @@ fn read_value(vm: &VmState, nm: &Nmethod, fv: &FrameView, loc: ValueLoc) -> Oop 
             "read_value: ValueLoc::ElidedClosure outside a frame-slot/site-stack \
              position (compiler bug — phantoms are only recorded in inlined-scope \
              slots and reexecute site stacks)"
+        ),
+        // Float fast-path: a raw-f64 slot must be BOXED on materialization,
+        // which allocates — handled at each looped call site (scope slots,
+        // pending stacks, reexecute site stacks), which have `&mut vm` and
+        // GC-safe ordering; this plain reader cannot.
+        ValueLoc::DoubleSlot(_) => unreachable!(
+            "read_value: ValueLoc::DoubleSlot outside a slot/stack position \
+             (compiler bug — fp vregs are only ever temps or operand-stack \
+             copies, never receivers or ctx locations)"
         ),
     }
 }
@@ -487,6 +496,10 @@ pub fn deoptimize_frame(vm: &mut VmState, frame: FrameView) -> DeoptResume {
         // read a nil placeholder now, remember the slot, and materialize AFTER
         // the frame is pushed (everything rooted, `set_temp` overwrites).
         let mut phantom_slots: Vec<(usize, u32)> = Vec::new();
+        // Float fast-path (B5): a raw-f64 temp slot. Read the BITS now (bits
+        // are GC-immune, unlike the other raw `Oop`s here), box AFTER the
+        // frame is pushed and everything is rooted.
+        let mut double_slots: Vec<(usize, u64)> = Vec::new();
         let slot_vals: Vec<Oop> = vf
             .scope
             .slots
@@ -495,6 +508,10 @@ pub fn deoptimize_frame(vm: &mut VmState, frame: FrameView) -> DeoptResume {
             .map(|(i, &loc)| match loc {
                 ValueLoc::ElidedClosure(pool_ix) => {
                     phantom_slots.push((i, pool_ix));
+                    vm.universe.nil_obj
+                }
+                ValueLoc::DoubleSlot(off) => {
+                    double_slots.push((i, read_frame_slot_raw(frame.fp, off)));
                     vm.universe.nil_obj
                 }
                 _ => read_value(vm, nm_ref, &frame, loc),
@@ -531,6 +548,16 @@ pub fn deoptimize_frame(vm: &mut VmState, frame: FrameView) -> DeoptResume {
         for (t, &v) in slot_vals[argc..].iter().enumerate() {
             f.set_temp(&mut vm.stack, argc + t, v);
         }
+        // Float fast-path: box the raw-f64 temps over their nil placeholders.
+        // GC-safe HERE (not in the read loop above): the frame is pushed, so
+        // every already-written value is rooted on the process stack, and the
+        // bits themselves cannot be invalidated by the allocation's scavenge.
+        // The process stack never moves, so `fp_new` stays valid across it.
+        for &(slot_ix, bits) in &double_slots {
+            let d = crate::memory::alloc::alloc_double(vm, f64::from_bits(bits));
+            let f = Frame { fp: fp_new };
+            f.set_temp(&mut vm.stack, slot_ix, d.oop());
+        }
 
         // A NON-innermost frame's frozen operand stack (its child's
         // `SenderLink.pending_stack`) goes ABOVE its own header+temps — the
@@ -546,7 +573,17 @@ pub fn deoptimize_frame(vm: &mut VmState, frame: FrameView) -> DeoptResume {
         // step-9 soak gate.)
         if !vf.is_innermost {
             for &loc in &vf.pending_stack {
-                let v = read_value(vm, nmethod_ref(vm, frame.nm), &frame, loc);
+                // Float fast-path: a frozen operand-stack entry may be a raw
+                // f64 (an unboxed float copy live across an inlined send).
+                // Alloc-then-push is GC-safe here: every previously pushed
+                // value is already rooted, and the bits are GC-immune.
+                let v = match loc {
+                    ValueLoc::DoubleSlot(off) => {
+                        let bits = read_frame_slot_raw(frame.fp, off);
+                        crate::memory::alloc::alloc_double(vm, f64::from_bits(bits)).oop()
+                    }
+                    _ => read_value(vm, nmethod_ref(vm, frame.nm), &frame, loc),
+                };
                 vm.stack.push(v);
             }
         }
@@ -656,6 +693,14 @@ pub fn deoptimize_frame(vm: &mut VmState, frame: FrameView) -> DeoptResume {
             // already rooted on the process stack.
             for &loc in &site_stack {
                 let v = match loc {
+                    // Float fast-path: a reexecute stack entry that lived as a
+                    // raw f64 (an unboxed float copy) — box it for the
+                    // interpreter. Alloc-then-push is GC-safe here (previously
+                    // pushed values rooted; the bits are GC-immune).
+                    ValueLoc::DoubleSlot(off) => {
+                        let bits = read_frame_slot_raw(frame.fp, off);
+                        crate::memory::alloc::alloc_double(vm, f64::from_bits(bits)).oop()
+                    }
                     ValueLoc::ElidedClosure(pool_ix) => {
                         // Allocates — push a nil placeholder at this exact
                         // slot and let the fixup phase overwrite it (B5 5b).
