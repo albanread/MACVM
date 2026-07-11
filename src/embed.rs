@@ -302,9 +302,17 @@ impl VmHandle {
     /// fragment the image renders for it (GUI D-G5 / `docs/APPS.md` §6: the
     /// Visual renders *itself* to HTML; Rust only transports the string).
     /// `code` is the raw `visual=` source; this wraps it as
-    /// `(Visual coerce: (<code>)) htmlFragment` — the exact
-    /// `ElementSMAPPL.dlt` shape (`gui/smappl.md` §2) — and hands back the
-    /// resulting `String`'s raw bytes.
+    /// `(Visual coerce: ([<code>] value)) htmlFragment` — the
+    /// `ElementSMAPPL.dlt` shape (`gui/smappl.md` §2) with the body run through
+    /// a block — and hands back the resulting `String`'s raw bytes.
+    ///
+    /// The `[…] value` wrapper is load-bearing: several corpus visuals are
+    /// multi-statement with temp declarations (`progenv2.html`'s
+    /// `| h v | h := (ClassHierarchyOutliner for: …) filterOn…; orSubclasses.
+    /// v := … . v`). Those can't be spliced straight into `(Visual coerce:
+    /// (…))` — `(| h v | …)` is a parse error — but a block accepts temps and
+    /// statements and answers its last expression, so wrapping evaluates both
+    /// single-expression and multi-statement bodies uniformly.
     ///
     /// Unlike [`eval`](Self::eval) this does NOT run `printString` on the
     /// result: `htmlFragment` already answers a `String`, and printString
@@ -315,7 +323,7 @@ impl VmHandle {
     /// page, matching `ElementSMAPPL`'s own `ifError:` discipline.
     #[allow(unsafe_code)]
     pub fn render_fragment(&mut self, code: &str) -> Result<String, GuestError> {
-        let source = format!("(Visual coerce: ({code})) htmlFragment.");
+        let source = format!("(Visual coerce: ([{code}] value)) htmlFragment.");
         let slot = deopt_trap::claim_jmp_slot();
         // SAFETY: as `eval` — `sigsetjmp` inline at this call site, whose frame
         // stays live for the whole recovery window.
@@ -606,6 +614,30 @@ mod tests {
         assert!(
             html.contains("style=\"display:none\""),
             "descendant subtrees must start collapsed, got {html:?}"
+        );
+    }
+
+    /// progenv2.html's filtered-hierarchy visual is multi-statement with temp
+    /// declarations (`| h v | h := (ClassHierarchyOutliner for: …) filterOn…;
+    /// orSubclasses. v := (h topVisualWithHRule: false) withBorder: …. v`).
+    /// The `[…] value` wrapper must let it render (a live, unfiltered outliner)
+    /// rather than trip a parse error on the leading `| h v |`.
+    #[test]
+    fn render_fragment_handles_a_multi_statement_visual_with_temps() {
+        let mut vm = boot_test_vm(JitMode::Off);
+        let html = vm
+            .render_fragment(
+                "| h v | \
+                 h := (ClassHierarchyOutliner for: (ClassMirror on: Object)) \
+                     filterOnCommentsContaining: '%HTML'; orSubclasses. \
+                 v := (h topVisualWithHRule: false) \
+                     withBorder: (Border standard3DRaised: true). \
+                 v",
+            )
+            .expect("a multi-statement visual with temps must render, not parse-fail");
+        assert!(
+            html.contains("st-outliner") && html.contains("data-hierarchy-root=\"Object\""),
+            "the cascade+temps body must yield the live Object outliner, got {html:?}"
         );
     }
 

@@ -115,6 +115,18 @@ Visual subclass: ClassHierarchyOutliner [
         rootMirror := m.
         ^self
     ]
+    "Corpus filter chain (gui/smappl.md §3.3): progenv2.html narrows the
+     embedded hierarchy to HTML-related classes (filterOnCommentsContaining:
+     '%HTML'), ui.html to UI classes (filterOnUIUserClasses); `orSubclasses`
+     widens a filtered set back to include subclasses. MACVM keeps NO class
+     comments, and this world lacks those library classes, so the filters
+     can't actually select — they answer self and the full rooted tree renders
+     (a live, browsable embedded outliner, just unfiltered). Honest
+     degradation, not a dead placeholder box; wire real filtering when class
+     comments and those classes exist."
+    filterOnCommentsContaining: aString [ ^self ]
+    filterOnUIUserClasses [ ^self ]
+    orSubclasses [ ^self ]
     htmlFragment [
         | html |
         html := HtmlWriter new.
