@@ -405,6 +405,45 @@ impl VmHandle {
         }
     }
 
+    /// Evaluates `code` (wrapped `[<code>] value`, so multi-statement bodies
+    /// with temps are fine — see [`render_fragment`](Self::render_fragment))
+    /// and returns the answered `String`'s raw bytes. Used for image-side code
+    /// that builds a plain string payload rather than a widget fragment — e.g.
+    /// `Mandelbrot new commandsForWidth:height:` answering a Canvas
+    /// draw-command batch (`docs/CANVAS.md` §5.2). A non-`String` answer is an
+    /// `Err`, like `render_fragment`'s own non-`String` case.
+    #[allow(unsafe_code)]
+    pub fn eval_to_string(&mut self, code: &str) -> Result<String, GuestError> {
+        let source = format!("([{code}] value).");
+        let slot = deopt_trap::claim_jmp_slot();
+        // SAFETY: as `render_fragment` — `sigsetjmp` inline at this call site,
+        // whose frame stays live for the whole recovery window.
+        let rc = unsafe { deopt_trap::sigsetjmp(deopt_trap::jmp_buf_ptr(slot), 1) };
+        if rc == deopt_trap::GUEST_FATAL_JMP_VAL {
+            let message = deopt_trap::take_last_guest_fatal_message().expect(
+                "sigsetjmp returned GUEST_FATAL_JMP_VAL without a recorded guest-fatal message",
+            );
+            return Err(GuestError::RuntimeError(message));
+        }
+        if rc != 0 {
+            let (sig, pc, far) = deopt_trap::take_last_crash_info()
+                .expect("sigsetjmp returned nonzero without a recorded crash");
+            return Err(GuestError::NativeFault { sig, pc, far });
+        }
+        let item = match frontend::parser::parse_one_top_item(&source) {
+            Ok(Some(item)) => item,
+            Ok(None) => return Ok(String::new()),
+            Err(e) => return Err(GuestError::Compile(e)),
+        };
+        match frontend::classdef::execute_top_item(&mut self.vm, item) {
+            Ok(Some(result)) => fragment_bytes(result).ok_or_else(|| {
+                GuestError::RuntimeError("expression did not answer a String".to_string())
+            }),
+            Ok(None) => Ok(String::new()),
+            Err(e) => Err(GuestError::Compile(e)),
+        }
+    }
+
     /// Installs `sink` as where guest output (`Transcript show:`,
     /// `printOnStdout:`) goes from now on. Default is stdout
     /// (`VmState::with_options`) — an embedder calls this once, right after
@@ -567,6 +606,50 @@ mod tests {
             vm.fire_widget_action(&sid).expect("firing must succeed"),
             None,
             "a non-String action result must not produce an overlay"
+        );
+    }
+
+    /// The Canvas Mandelbrot demo (`world/35_mandelbrot.mst`,
+    /// `docs/CANVAS.md`): `Mandelbrot new commandsForWidth:height:` computes
+    /// the set in real Smalltalk `Double` arithmetic and answers a Canvas
+    /// draw-command batch (§5.2 JSON). The batch must be a valid, non-trivial
+    /// command array that opens with a `clearRect` and paints both interior
+    /// (black) and escaped (coloured) runs — i.e. the float compute really
+    /// discriminated points, not painted one flat colour.
+    #[test]
+    fn mandelbrot_computes_a_canvas_command_batch() {
+        let mut vm = boot_test_vm(JitMode::Threshold(1));
+        let json = vm
+            .eval_to_string("Mandelbrot new commandsForWidth: 120 height: 90 cell: 6")
+            .expect("Mandelbrot must answer a command-batch String");
+
+        assert!(
+            json.starts_with("[[\"clearRect\",0,0,120,90]"),
+            "batch must open by clearing the 120x90 surface, got {}",
+            &json[..json.len().min(80)]
+        );
+        assert!(json.ends_with(']'), "batch must be a closed JSON array");
+        assert!(
+            json.contains("\"fillStyle\"") && json.contains("\"fillRect\""),
+            "batch must paint filled runs"
+        );
+        // Interior of the set → black; escaped points → coloured bands. Both
+        // present ⇒ the Double iteration actually varied across the plane.
+        assert!(
+            json.contains("rgb(0,0,0)"),
+            "the set interior (black) must appear — the escape loop must reach maxIter somewhere"
+        );
+        assert!(
+            json.matches("\"fillStyle\"").count() > 5,
+            "a real fractal has many colour runs, got {} fillStyle ops",
+            json.matches("\"fillStyle\"").count()
+        );
+        // It must be parseable as the wire format (array of [op, ...args]),
+        // sanity-checked structurally: balanced brackets, no stray characters.
+        assert_eq!(
+            json.matches('[').count(),
+            json.matches(']').count(),
+            "brackets must balance in the emitted JSON"
         );
     }
 

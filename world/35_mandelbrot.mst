@@ -1,0 +1,95 @@
+"35_mandelbrot.mst — the Strongtalk 'fast floats' Mandelbrot demo
+ (gui/reference/pages/tour/fastfloats.html: `Mandelbrot new launch`), rebuilt
+ on the MACVM Canvas view (docs/CANVAS.md).
+
+ The set is computed HERE, in real Smalltalk Double arithmetic — the
+ JIT-compiled `<primitive: 100..>` float ops that ARE the 'fast floats' the
+ tour page is about (world/08_double.mst). Each escape count maps to a colour,
+ and the whole image is emitted as one Canvas draw-command batch (the
+ docs/CANVAS.md §5.2 JSON array of [op, ...args]). Rust only transports that
+ string — no VM-side Canvas primitive is needed (§7 leaves those deferred), so
+ this proves the Canvas pipeline end to end from genuine Smalltalk, not a mock.
+
+ Run-length encoded per scanline (one fillRect per constant-colour run), so the
+ batch is a few thousand ops rather than one-per-pixel."
+Object subclass: Mandelbrot [
+    | maxIter |
+    Mandelbrot class >> new [ ^self basicNew init ]
+    init [ maxIter := 64. ^self ]
+    maxIter: n [ maxIter := n. ^self ]
+
+    "Escape count for c = cr + ci*i: iterations until |z| > 2, capped at
+     maxIter (== inside the set). Pure Double arithmetic — this is the hot
+     method the JIT compiles, keeping zr2/zi2 to spend one multiply each per
+     step instead of three."
+    escapeAtRe: cr im: ci [
+        | zr zi zr2 zi2 n |
+        zr := 0.0. zi := 0.0. zr2 := 0.0. zi2 := 0.0. n := 0.
+        [ (zr2 + zi2 < 4.0) and: [ n < maxIter ] ] whileTrue: [
+            zi := (2.0 * zr * zi) + ci.
+            zr := (zr2 - zi2) + cr.
+            zr2 := zr * zr.
+            zi2 := zi * zi.
+            n := n + 1 ].
+        ^n
+    ]
+
+    "Escape count -> CSS rgb() string. Decimal channels, so no hex formatting
+     is needed; inside the set is black, escaped points get colourful bands."
+    colorFor: n [
+        | r g b |
+        n >= maxIter ifTrue: [ ^'rgb(0,0,0)' ].
+        r := (n * 8) \\ 256.
+        g := (n * 5) \\ 256.
+        b := 64 + ((n * 11) \\ 192).
+        ^'rgb(', r printString, ',', g printString, ',', b printString, ')'
+    ]
+
+    "Default full-set view over a `w` x `h` canvas."
+    commandsForWidth: w height: h [
+        ^self commandsForWidth: w height: h cell: 3
+    ]
+
+    "The Canvas draw-command batch (docs/CANVAS.md §5.2 JSON) for the set drawn
+     into a `w` x `h` surface in `cell`-sized square blocks. Square pixels: the
+     imaginary axis is centred on 0 and scaled by the SAME step as the real
+     axis, so the set is never stretched by the canvas aspect ratio."
+    commandsForWidth: w height: h cell: cell [
+        | s cols rows rmin step imin ci cr runColor runStart color |
+        cols := w // cell. rows := h // cell.
+        rmin := 0.0 - 2.5. step := 3.5 / cols.
+        imin := 0.0 - ((rows * step) / 2.0).
+        s := WriteStream on: String new.
+        s nextPutAll: '[["clearRect",0,0,'.
+        s nextPutAll: w printString. s nextPutAll: ','.
+        s nextPutAll: h printString. s nextPutAll: ']'.
+        0 to: rows - 1 do: [ :py |
+            ci := imin + (py * step).
+            runColor := nil. runStart := 0.
+            0 to: cols - 1 do: [ :px |
+                cr := rmin + (px * step).
+                color := self colorFor: (self escapeAtRe: cr im: ci).
+                (runColor isNil or: [ color = runColor ])
+                    ifFalse: [
+                        self emitOn: s color: runColor
+                             x: runStart * cell y: py * cell
+                             w: (px - runStart) * cell h: cell.
+                        runStart := px ].
+                runColor := color ].
+            self emitOn: s color: runColor
+                 x: runStart * cell y: py * cell
+                 w: (cols - runStart) * cell h: cell ].
+        s nextPutAll: ']'.
+        ^s contents
+    ]
+
+    "One constant-colour run: set the fill then paint the rectangle."
+    emitOn: s color: c x: x y: y w: rw h: rh [
+        s nextPutAll: ',["fillStyle","'. s nextPutAll: c.
+        s nextPutAll: '"],["fillRect",'.
+        s nextPutAll: x printString. s nextPutAll: ','.
+        s nextPutAll: y printString. s nextPutAll: ','.
+        s nextPutAll: rw printString. s nextPutAll: ','.
+        s nextPutAll: rh printString. s nextPutAll: ']'.
+    ]
+]

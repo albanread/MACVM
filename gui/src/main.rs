@@ -913,6 +913,16 @@ extern "C" fn on_script_message(_this: Id, _cmd: Sel, _controller: Id, message: 
                 vm.submit(vm_host::VmRequest::CanvasRunDemo);
             }
         }
+        "canvasEval" => {
+            // Generic: whatever Smalltalk the clicked control carried in its
+            // `data-canvas-eval` attribute is evaluated and its command-batch
+            // answer drawn. The GUI holds no per-drawing knowledge.
+            if let Some(vm) = VM.get() {
+                vm.submit(vm_host::VmRequest::CanvasEval {
+                    code: dict_get_string(body, "code"),
+                });
+            }
+        }
         "canvasClear" => {
             if let Some(vm) = VM.get() {
                 vm.submit(vm_host::VmRequest::CanvasClear);

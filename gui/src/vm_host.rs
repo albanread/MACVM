@@ -255,6 +255,16 @@ pub enum VmRequest {
     /// The Canvas view's (`canvas_render.rs`, `../../docs/CANVAS.md`)
     /// "Run Demo" button — same stand-in posture as `CanvasCreate`.
     CanvasRunDemo,
+    /// Generic "let Smalltalk drive the canvas": evaluate `code` (any
+    /// expression answering a command-batch String, `docs/CANVAS.md` §5.2) and
+    /// draw the result. This is the general-purpose path — the GUI carries an
+    /// opaque code string and gets back an opaque command string, exactly like
+    /// `Doit`; it holds NO knowledge of what is being drawn. The Mandelbrot
+    /// demo (`world/35_mandelbrot.mst`) is just one caller; any drawing or
+    /// animation frame (`anim frameAt: k`) uses the same message unchanged.
+    CanvasEval {
+        code: String,
+    },
     /// Clears the canvas — a single `clearRect` batch, not a separate
     /// code path (`docs/CANVAS.md` §5.3: "full redraw" is a command-batch
     /// convention, not a different channel).
@@ -1517,6 +1527,19 @@ fn handle(
                 commands_json: canvas_demo_commands().to_json(),
             }]
         }
+        VmRequest::CanvasEval { code } => {
+            // Real Smalltalk builds the whole batch (docs/CANVAS.md §5.2); Rust
+            // only transports the string. Generic — the worker neither knows
+            // nor cares what `code` draws. A compute failure is echoed to the
+            // transcript like a doit, not dropped.
+            match vm.eval_to_string(&code) {
+                Ok(commands_json) => vec![VmResponse::CanvasDraw {
+                    id: CANVAS_ID,
+                    commands_json,
+                }],
+                Err(e) => vec![VmResponse::Transcript(format!("canvas eval failed: {e}"))],
+            }
+        }
         VmRequest::CanvasClear => {
             let mut cmds = CanvasCommands::new();
             cmds.call(
@@ -1978,6 +2001,61 @@ mod tests {
         );
         assert!(commands_json.contains("fillRect"), "{commands_json}");
         assert!(commands_json.contains("MACVM Canvas"), "{commands_json}");
+    }
+
+    #[test]
+    fn canvas_eval_runs_real_smalltalk_and_draws_its_command_batch() {
+        // The generic path (docs/CANVAS.md): arbitrary Smalltalk answers a
+        // command batch, drawn as a CanvasDraw. Here the Mandelbrot demo — the
+        // GUI itself holds no Mandelbrot knowledge, it just forwarded the code.
+        let mut world = MockWorld::seed();
+        let mut selection = BrowserSelection::default();
+        let mut vm = test_vm_handle(macvm::runtime::JitMode::Off);
+        let responses = handle(
+            VmRequest::CanvasEval {
+                code: "Mandelbrot new commandsForWidth: 60 height: 45 cell: 5".to_string(),
+            },
+            &mut world,
+            &mut selection,
+            None,
+            &mut vm,
+        );
+        let [VmResponse::CanvasDraw { id, commands_json }] = responses.as_slice() else {
+            panic!("expected exactly one CanvasDraw response, got {responses:?}");
+        };
+        assert_eq!(*id, 0);
+        assert!(
+            commands_json.starts_with("[[\"clearRect\",0,0,60,45]"),
+            "batch must open by clearing the requested surface, got {}",
+            &commands_json[..commands_json.len().min(60)]
+        );
+        assert!(commands_json.contains("fillRect"), "{commands_json}");
+        assert!(
+            commands_json.contains("rgb(0,0,0)"),
+            "the set interior must appear — the float compute must have run"
+        );
+    }
+
+    #[test]
+    fn canvas_eval_reports_a_bad_expression_to_the_transcript_not_a_draw() {
+        // A generic eval that can't produce a batch must degrade to a
+        // transcript note, never a broken draw or a panic.
+        let mut world = MockWorld::seed();
+        let mut selection = BrowserSelection::default();
+        let mut vm = test_vm_handle(macvm::runtime::JitMode::Off);
+        let responses = handle(
+            VmRequest::CanvasEval {
+                code: "42".to_string(), // answers an Integer, not a batch String
+            },
+            &mut world,
+            &mut selection,
+            None,
+            &mut vm,
+        );
+        assert!(
+            matches!(responses.as_slice(), [VmResponse::Transcript(t)] if t.contains("canvas eval failed")),
+            "a non-String answer must surface as a transcript note, got {responses:?}"
+        );
     }
 
     #[test]

@@ -23,10 +23,18 @@ pub const DEFAULT_HEIGHT: u32 = 220;
 /// first render matters: setting size via CSS alone would stretch/blur
 /// whatever gets drawn instead of giving it a native-resolution surface).
 pub fn render_canvas(width: u32, height: u32) -> String {
+    // The Mandelbrot button carries its Smalltalk in `data-canvas-eval`, sized
+    // to this canvas, and posts through the generic `canvasEval` path
+    // (smtk.js/main.rs) — the GUI holds no Mandelbrot knowledge, and any other
+    // drawing is just another button (or Workspace eval) with a different
+    // expression. See `../docs/CANVAS.md`.
+    let mandelbrot_code =
+        format!("Mandelbrot new commandsForWidth: {width} height: {height}");
     format!(
         "<div class=\"st-canvas-view\" id=\"macvm-canvas-view\">\
          <div class=\"st-browser-action-row st-canvas-actions\">\
          <button type=\"button\" class=\"st-browser-new-button\" data-canvas-action=\"run-demo\">Run Demo</button>\
+         <button type=\"button\" class=\"st-browser-new-button\" data-canvas-action=\"eval\" data-canvas-eval=\"{mandelbrot_code}\">Mandelbrot</button>\
          <button type=\"button\" class=\"st-browser-new-button\" data-canvas-action=\"clear\">Clear</button>\
          </div>\
          <div class=\"st-lowered st-canvas-surface\">\
@@ -47,6 +55,14 @@ mod tests {
         assert!(html.contains("width=\"420\""), "{html}");
         assert!(html.contains("height=\"220\""), "{html}");
         assert!(html.contains("data-canvas-action=\"run-demo\""), "{html}");
+        // The Mandelbrot demo routes through the GENERIC eval path, carrying
+        // its Smalltalk (sized to this canvas) in a data attribute — no
+        // Mandelbrot-specific canvas action exists.
+        assert!(html.contains("data-canvas-action=\"eval\""), "{html}");
+        assert!(
+            html.contains("data-canvas-eval=\"Mandelbrot new commandsForWidth: 420 height: 220\""),
+            "{html}"
+        );
         assert!(html.contains("data-canvas-action=\"clear\""), "{html}");
     }
 

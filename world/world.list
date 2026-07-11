@@ -45,3 +45,5 @@
 33_smappl.mst
 # Phase W: reflection mirrors + outliner tools (docs/APPS.md).
 34_tools.mst
+# Canvas demo: the Strongtalk 'fast floats' Mandelbrot on the Canvas view (docs/CANVAS.md).
+35_mandelbrot.mst

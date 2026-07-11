@@ -215,6 +215,36 @@ function macvmCanvasDraw(id, commandsJson) {
 Called from Rust exactly like every other page mutation:
 `eval_js(&format!("window.macvmCanvasDraw({id}, {})", js_string_literal(&commands_json)))`.
 
+## 6a. Generic "Smalltalk drives the canvas" (built now)
+
+`Run Demo` (§4) still uses Rust-mock content, but there is now a **generic**
+path for real Smalltalk to draw, added without any per-drawing GUI code:
+
+- `VmRequest::CanvasEval { code: String }` — the worker evaluates `code`
+  (`VmHandle::eval_to_string`, wrapping `[<code>] value` so multi-statement
+  bodies work) and, if it answers a `String`, returns it as an ordinary
+  `VmResponse::CanvasDraw` batch. The GUI carries an opaque code string in,
+  gets an opaque command string back — it holds no knowledge of what is drawn,
+  exactly like `Doit`. A non-`String`/failed eval degrades to a transcript
+  note, never a broken draw.
+- The trigger is data-driven: any control with a `data-canvas-eval="<expr>"`
+  attribute (canvas action `"eval"`) posts its expression through this one
+  path (`smtk.js` → `main.rs`). Adding another drawing is a new button with a
+  different expression (or a Workspace eval), never new Rust/JS.
+- **Animation-ready**: a frame is just another `CanvasEval` (`anim frameAt:
+  k`); a future GUI-side loop can post them on a timer/`requestAnimationFrame`
+  without any new message type.
+
+**The Mandelbrot demo** (`world/35_mandelbrot.mst`, the tour's
+`fastfloats.html` `Mandelbrot new launch`) is the first real caller: it
+computes the set in JIT-compiled `Double` arithmetic (the "fast floats" that
+page is about) and emits a run-length-encoded fillRect batch. The Canvas
+view's **Mandelbrot** button carries `Mandelbrot new commandsForWidth:height:`
+(sized to the canvas) in its `data-canvas-eval` — proving the whole pipeline
+from genuine Smalltalk, with the GUI still generic. No VM-side `Canvas`
+primitive is needed (§7 stays deferred); the batch is built entirely in
+image-side Smalltalk and transported as a string.
+
 ## 7. Deferred
 
 - The VM-side `Canvas` class and its `<primitive: N>` bodies — the real

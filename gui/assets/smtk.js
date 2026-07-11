@@ -521,6 +521,17 @@
         post({ kind: "canvasRunDemo" });
         return;
       }
+      // Generic "Smalltalk draws to the canvas": any control carrying
+      // data-canvas-eval posts its expression through the same canvasEval
+      // path; the VM evaluates it and its command-batch answer is drawn. The
+      // Mandelbrot button is just one such control — no per-drawing JS. The
+      // compute runs on the worker thread, so the UI stays responsive.
+      const evalBtn = ev.target.closest('[data-canvas-action="eval"]');
+      if (evalBtn) {
+        ev.preventDefault();
+        post({ kind: "canvasEval", code: evalBtn.getAttribute("data-canvas-eval") || "" });
+        return;
+      }
       const clearBtn = ev.target.closest('[data-canvas-action="clear"]');
       if (clearBtn) {
         ev.preventDefault();
