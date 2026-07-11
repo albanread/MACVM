@@ -439,6 +439,18 @@ pub fn alloc_double(vm: &mut VmState, v: f64) -> DoubleOop {
     unsafe { DoubleOop::from_oop_unchecked(obj.oop()) }
 }
 
+/// SIMD (`docs/SIMD.md`): a fresh 2-lane f64 vector — a 16-byte RAW body
+/// (`Format::Double`, GC-skipped) holding lanes `a` (word 0) and `b` (word 1),
+/// exactly the layout the JIT vector fast-path will `ldr q` from `[obj+16]`.
+pub fn alloc_float64x2(vm: &mut VmState, a: f64, b: f64) -> Oop {
+    let klass = vm.universe.float64x2_klass;
+    let words = klass.non_indexable_size();
+    let obj = alloc_words(vm, words, klass.oop(), false);
+    obj.set_raw_body_word(0, a.to_bits());
+    obj.set_raw_body_word(1, b.to_bits());
+    obj.oop()
+}
+
 /// A klass-shaped object whose klass field is `meta`. As with the raw
 /// variant, `format`/`non_indexable_size`/`superclass` must be set by the
 /// caller immediately after (genesis + S5's `subclass:`).

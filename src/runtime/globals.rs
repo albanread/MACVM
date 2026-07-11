@@ -60,6 +60,7 @@ pub(crate) fn bootstrap_well_known(vm: &mut VmState) {
         smi_klass,
         character_klass,
         double_klass,
+        float64x2_klass,
         string_klass,
         symbol_klass,
         array_klass,

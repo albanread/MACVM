@@ -115,6 +115,12 @@ pub struct Universe {
     pub smi_klass: KlassOop,
     pub character_klass: KlassOop,
     pub double_klass: KlassOop,
+    /// SIMD (`docs/SIMD.md`): a 2-lane `f64` vector — a fixed 16-byte RAW body
+    /// (`Format::Double`, GC-skips the body; size is klass-driven, so a 2-word
+    /// body Just Works). Boxed at rest; the JIT vector fast-path loads it into
+    /// a `q`-register with `ldr q,[obj+16]`. The first of the `FloatNxM`
+    /// value-class family.
+    pub float64x2_klass: KlassOop,
     pub string_klass: KlassOop,
     pub symbol_klass: KlassOop,
     pub array_klass: KlassOop,
@@ -477,6 +483,17 @@ impl Universe {
             true,
             HEADER_WORDS + 1
         );
+        // SIMD (docs/SIMD.md): Float64x2 — same raw-body Format::Double as a
+        // scalar Double, but a 2-word (16-byte) body for two f64 lanes. The GC
+        // skips a Format::Double body regardless of its klass-driven size, so
+        // this is GC-safe by construction.
+        let float64x2_klass = remaining_klass!(
+            "Float64x2",
+            object_klass.oop(),
+            Format::Double,
+            true,
+            HEADER_WORDS + 2
+        );
         let array_klass = remaining_klass!(
             "Array",
             arrayed_collection_klass.oop(),
@@ -679,6 +696,7 @@ impl Universe {
             smi_klass,
             character_klass,
             double_klass,
+            float64x2_klass,
             string_klass,
             symbol_klass,
             array_klass,

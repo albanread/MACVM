@@ -1,0 +1,42 @@
+"38_simd.mst — SIMD vector value classes (docs/SIMD.md, level 1).
+
+ Float64x2 is a 2-lane f64 vector: a fixed 16-byte RAW body (the genesis klass
+ uses Format::Double, so the GC skips the body — world/universe.rs). This is
+ the interpreter baseline — the analog of Double's own primitive methods; the
+ JIT vector fast-path (VUnbox/VArith/VBox → NEON `fadd v.2d`) fuses these the
+ same way the float fast-path fused Double. Elementwise ops are per-lane
+ bit-identical to scalar Double arithmetic, which the fast-path must also
+ honour. Reopens the genesis klass (like Number subclass: Double)."
+Object subclass: Float64x2 [
+    Float64x2 class >> x: a y: b [ <primitive: 127> ]
+    Float64x2 class >> splat: v [ <primitive: 128> ]
+
+    + other [ <primitive: 129> ]
+    - other [ <primitive: 130> ]
+    * other [ <primitive: 131> ]
+    / other [ <primitive: 132> ]
+
+    "Lane access, 1-based (Smalltalk convention): answers a Double."
+    at: i [ <primitive: 133> ]
+    x [ ^self at: 1 ]
+    y [ ^self at: 2 ]
+
+    "Horizontal sum of the two lanes (a scalar Double). A 2-lane reduction is
+     associativity-free — only wider FP reductions carry the ordering caveat
+     docs/SIMD.md §D documents."
+    hsum [ ^self x + self y ]
+
+    printOn: aStream [
+        aStream nextPutAll: 'Float64x2('.
+        aStream nextPutAll: self x printString.
+        aStream nextPutAll: ', '.
+        aStream nextPutAll: self y printString.
+        aStream nextPutAll: ')'
+    ]
+    printString [
+        | s |
+        s := WriteStream on: String new.
+        self printOn: s.
+        ^s contents
+    ]
+]

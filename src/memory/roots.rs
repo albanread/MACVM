@@ -102,6 +102,7 @@ where
         smi_klass,
         character_klass,
         double_klass,
+        float64x2_klass,
         string_klass,
         symbol_klass,
         array_klass,

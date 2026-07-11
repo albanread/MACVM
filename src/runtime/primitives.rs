@@ -681,6 +681,67 @@ pub static PRIMITIVES: &[PrimDesc] = &[
         can_allocate: true,
         can_fail: true,
     },
+    // ── SIMD Float64x2 (docs/SIMD.md): the interpreter baseline for the
+    //    2-lane f64 vector value class — the analog of Double's own
+    //    primitives, which the JIT vector fast-path will later fuse to NEON.
+    //    Lane math is done here in scalar f64 (bit-identical to per-lane
+    //    Double arithmetic, which the fast-path must also match). ──────────
+    PrimDesc {
+        id: 127,
+        name: "x:y:",
+        f: prim_x2_xy,
+        argc: 2,
+        can_allocate: true,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 128,
+        name: "splat:",
+        f: prim_x2_splat,
+        argc: 1,
+        can_allocate: true,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 129,
+        name: "+",
+        f: prim_x2_add,
+        argc: 1,
+        can_allocate: true,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 130,
+        name: "-",
+        f: prim_x2_sub,
+        argc: 1,
+        can_allocate: true,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 131,
+        name: "*",
+        f: prim_x2_mul,
+        argc: 1,
+        can_allocate: true,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 132,
+        name: "/",
+        f: prim_x2_div,
+        argc: 1,
+        can_allocate: true,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 133,
+        name: "at:",
+        f: prim_x2_at,
+        argc: 1,
+        can_allocate: true,
+        can_fail: true,
+    },
 ];
 
 pub fn prim_by_id(id: u16) -> Option<&'static PrimDesc> {
@@ -1586,6 +1647,91 @@ prim_double_unary!(prim_double_exp, exp);
 prim_double_unary!(prim_double_ln, ln);
 prim_double_unary!(prim_double_atan, atan);
 
+// ── SIMD Float64x2 helpers + primitives (docs/SIMD.md) ────────────────────
+//
+// Read the two f64 lanes of a Float64x2 receiver — checks the KLASS, not the
+// format: Float64x2 shares `Format::Double` with a scalar Double (both raw
+// bodies), so a format-based wrapper would silently read a Double's single
+// lane as a vector. body_word_raw{0,1} are the two 16-byte-body lanes.
+fn as_float64x2(vm: &VmState, o: Oop) -> Option<(f64, f64)> {
+    let m = MemOop::try_from(o)?;
+    if m.klass().oop().raw() != vm.universe.float64x2_klass.oop().raw() {
+        return None;
+    }
+    Some((
+        f64::from_bits(m.body_word_raw(0)),
+        f64::from_bits(m.body_word_raw(1)),
+    ))
+}
+
+/// A scalar lane argument (a constructor operand): a Double, or a
+/// SmallInteger coerced — so `Float64x2 x: 1 y: 2` is as friendly as
+/// `x: 1.0 y: 2.0`.
+fn as_scalar_f64(vm: &VmState, o: Oop) -> Option<f64> {
+    if let Some(n) = SmallInt::try_from(o) {
+        return Some(n.value() as f64);
+    }
+    let m = MemOop::try_from(o)?;
+    if m.klass().oop().raw() != vm.universe.double_klass.oop().raw() {
+        return None;
+    }
+    Some(f64::from_bits(m.body_word_raw(0)))
+}
+
+/// `Float64x2 x: a y: b` (class-side; args = [class, a, b]).
+fn prim_x2_xy(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    match (as_scalar_f64(vm, args[1]), as_scalar_f64(vm, args[2])) {
+        (Some(a), Some(b)) => PrimResult::Ok(alloc::alloc_float64x2(vm, a, b)),
+        _ => PrimResult::Fail,
+    }
+}
+
+/// `Float64x2 splat: v` — broadcast one scalar to both lanes.
+fn prim_x2_splat(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    match as_scalar_f64(vm, args[1]) {
+        Some(v) => PrimResult::Ok(alloc::alloc_float64x2(vm, v, v)),
+        None => PrimResult::Fail,
+    }
+}
+
+/// Elementwise binary op on two Float64x2 — each lane a single IEEE f64 op,
+/// bit-identical to the per-lane scalar Double op (the invariant the JIT
+/// vector fast-path must also honour).
+macro_rules! prim_x2_binop {
+    ($name:ident, $op:tt) => {
+        fn $name(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+            match (as_float64x2(vm, args[0]), as_float64x2(vm, args[1])) {
+                (Some((a0, a1)), Some((b0, b1))) => {
+                    PrimResult::Ok(alloc::alloc_float64x2(vm, a0 $op b0, a1 $op b1))
+                }
+                _ => PrimResult::Fail,
+            }
+        }
+    };
+}
+prim_x2_binop!(prim_x2_add, +);
+prim_x2_binop!(prim_x2_sub, -);
+prim_x2_binop!(prim_x2_mul, *);
+prim_x2_binop!(prim_x2_div, /);
+
+/// `aFloat64x2 at: i` — lane 1 or 2 as a Double (1-based, Smalltalk).
+fn prim_x2_at(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    let (a, b) = match as_float64x2(vm, args[0]) {
+        Some(v) => v,
+        None => return PrimResult::Fail,
+    };
+    let i = match SmallInt::try_from(args[1]) {
+        Some(n) => n.value(),
+        None => return PrimResult::Fail,
+    };
+    let lane = match i {
+        1 => a,
+        2 => b,
+        _ => return PrimResult::Fail,
+    };
+    PrimResult::Ok(alloc::alloc_double(vm, lane).oop())
+}
+
 fn prim_double_sqrt(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     match crate::oops::wrappers::DoubleOop::try_from(args[0]) {
         Some(a) => PrimResult::Ok(alloc::alloc_double(vm, a.value().sqrt()).oop()),
@@ -1679,6 +1825,59 @@ mod tests {
         (prim_by_id(id).unwrap().f)(vm, args)
     }
 
+    /// SIMD Float64x2 (`docs/SIMD.md`): elementwise ops are bit-identical to
+    /// per-lane scalar Double arithmetic, and the raw 16-byte vector bodies
+    /// survive GC. The GC point is a REGRESSION LOCK: `float64x2_klass` must be
+    /// a GC root (`memory::roots`) — it was missed on first wiring, and a
+    /// moved-but-not-updated klass pointer read poison mid-alloc. The
+    /// alloc-churn loop under `gc_stress` forces the exact scavenge that
+    /// caught it.
+    fn x2_lane(vm: &mut VmState, v: Oop, i: i64) -> f64 {
+        match call(133, vm, &[v, smi(i)]) {
+            PrimResult::Ok(o) => f64::from_bits(MemOop::try_from(o).unwrap().body_word_raw(0)),
+            other => panic!("x2 at: failed: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn float64x2_arithmetic_and_gc_survival() {
+        // Part 1 — bit-identity, gc_stress OFF: a handful of allocations
+        // trigger no GC, so the raw local oops stay put; each lane must equal
+        // the per-lane scalar Double op.
+        let mut vm = test_vm();
+        let va = alloc::alloc_float64x2(&mut vm, 1.5, 2.5);
+        let vb = alloc::alloc_float64x2(&mut vm, 2.0, 4.0);
+        let prod = match call(131, &mut vm, &[va, vb]) {
+            PrimResult::Ok(o) => o,
+            other => panic!("x2 * failed: {other:?}"),
+        };
+        let half = alloc::alloc_float64x2(&mut vm, 0.5, 0.5);
+        let sum = match call(129, &mut vm, &[prod, half]) {
+            PrimResult::Ok(o) => o,
+            other => panic!("x2 + failed: {other:?}"),
+        };
+        assert_eq!(x2_lane(&mut vm, sum, 1), 1.5 * 2.0 + 0.5);
+        assert_eq!(x2_lane(&mut vm, sum, 2), 2.5 * 4.0 + 0.5);
+
+        // Part 2 — GC-root survival (the regression lock). Root a vector on
+        // the process stack (a real GC root, as the interpreter does), force
+        // scavenges that MOVE the klass and the vector, and allocate a NEW
+        // vector across each — that alloc reads `float64x2_klass`, which must
+        // stay a live root or it poison-reads a moved klass. The rooted
+        // vector's lanes must survive intact.
+        let slot = vm.stack.sp;
+        let keep = alloc::alloc_float64x2(&mut vm, 42.0, 99.0);
+        vm.stack.push(keep);
+        let nil = vm.universe.nil_obj;
+        for _ in 0..8 {
+            call_rooted(93 /* gcScavenge */, &mut vm, nil);
+            let _fresh = alloc::alloc_float64x2(&mut vm, 1.0, 2.0); // uses the (moved) klass
+        }
+        let moved = vm.stack.get(slot); // the GC updated this root in place
+        assert_eq!(x2_lane(&mut vm, moved, 1), 42.0);
+        assert_eq!(x2_lane(&mut vm, moved, 2), 99.0);
+    }
+
     /// `tests_s06.md`'s `prim_ids_frozen`: a regression lock on the id→name
     /// map every `.mst` `<primitive: N>` binds against. This registry
     /// deliberately diverges from `sprint_s06_detail.md`'s suggested
@@ -1765,6 +1964,13 @@ mod tests {
             (124, "exp"),
             (125, "ln"),
             (126, "atan"),
+            (127, "x:y:"),
+            (128, "splat:"),
+            (129, "+"),
+            (130, "-"),
+            (131, "*"),
+            (132, "/"),
+            (133, "at:"),
         ];
         assert_eq!(
             PRIMITIVES.len(),
