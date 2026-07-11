@@ -183,16 +183,22 @@ Visual subclass: ClassOutliner [
             html raw: '<span class="st-tw" data-tw>&#9656; </span>'.
             html escaped: sel asString.
             html raw: '</span><div class="st-children" style="display:none">'.
-            "An editable source box (the worker/headless renderer fills it from
-             image_store); Cmd+S accepts, versioning the edit back into the DB
-             (smtk.js smapplAccept -> vm_host)."
-            html raw: '<textarea class="st-smappl-src" spellcheck="false" rows="4" data-src-class="'.
+            "An editable, syntax-coloured source box: the class browser's own
+             overlay editor (a transparent .st-code-input textarea over a
+             highlighted .st-code-highlight <pre>, coloured live client-side by
+             smtk.js's highlightSmalltalk — no round trip). The worker/headless
+             renderer fills the textarea from image_store; Cmd+S accepts,
+             versioning the edit back into the DB (smtk.js smapplAccept)."
+            html raw: '<div class="st-code-editor st-smappl-editor">'.
+            html raw: '<pre class="st-code-highlight" aria-hidden="true"></pre>'.
+            html raw: '<textarea class="st-smappl-src st-code-input" spellcheck="false" data-src-class="'.
             html escaped: mirror name.
             html raw: '" data-src-side="'.
             html raw: label.
             html raw: '" data-src-sel="'.
             html escaped: sel asString.
             html raw: '"></textarea>'.
+            html raw: '</div>'.
             html raw: '<div class="st-smappl-hint">&#8984;S to accept (versioned)</div>'.
             html raw: '</div></div>' ].
         html raw: '</div></div>'.

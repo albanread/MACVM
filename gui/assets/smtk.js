@@ -626,6 +626,9 @@
   window.macvmRenderSmappl = function (widgetId, html) {
     const span = document.querySelector('span.smappl[data-widget-id="' + widgetId + '"]');
     if (span) span.outerHTML = html;
+    // A ClassOutliner fragment carries `.st-code-editor` source editors —
+    // paint their syntax highlighting now that they're in the DOM.
+    if (window.macvmHighlightCodeEditors) window.macvmHighlightCodeEditors();
   };
 
   // The script tag lives in <head> (chrome_head_extra), so <body> — and
