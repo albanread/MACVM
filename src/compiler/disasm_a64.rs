@@ -125,6 +125,49 @@ fn decode(word: u32) -> Option<String> {
         .or_else(|| decode_ldst_pair(word))
         .or_else(|| decode_ldst(word))
         .or_else(|| decode_fp_scalar(word))
+        .or_else(|| decode_fp_vector(word))
+}
+
+/// SIMD NEON fast-path (`docs/SIMD.md`): the 128-bit vector forms `emit`'s
+/// `Ir::Vec2Arith` lowering produces — the `.2d` elementwise arithmetic
+/// (`fadd`/`fsub`/`fmul`/`fdiv`), the `q`-register `ldr`/`str` (unboxing the
+/// two lanes / storing the boxed result), and the `umov Xd, Vn.d[i]` that
+/// marshals a lane into a GPR for the box slow-path stub. Only these forms
+/// decode; any other NEON encoding keeps the honest `.word` fallback.
+fn decode_fp_vector(word: u32) -> Option<String> {
+    let rd = word & 0x1F;
+    let rn = (word >> 5) & 0x1F;
+    let rm = (word >> 16) & 0x1F;
+    // 3-same FP arithmetic, arrangement `.2d` (Q=1 bit30, sz=1 bit22). The
+    // mask keeps the op/U/sz/Q signature, clearing Rm/Rn/Rd. Bases from
+    // `vendor::wfasm::a64::encode` (`0x…D400`/`…FC00` | Q | sz).
+    let arith = match word & 0xFFE0_FC00 {
+        0x4E60_D400 => Some("fadd"),
+        0x4EE0_D400 => Some("fsub"),
+        0x6E60_DC00 => Some("fmul"),
+        0x6E60_FC00 => Some("fdiv"),
+        _ => None,
+    };
+    if let Some(mnem) = arith {
+        return Some(format!("{mnem} v{rd}.2d, v{rn}.2d, v{rm}.2d"));
+    }
+    // `ldr`/`str q`, 128-bit unsigned scaled offset (scale 16): 0x3DC0/0x3D80.
+    if word & 0xFFC0_0000 == 0x3DC0_0000 {
+        let imm = ((word >> 10) & 0xFFF) * 16;
+        return Some(format!("ldr q{rd}, [x{rn}, #{imm}]"));
+    }
+    if word & 0xFFC0_0000 == 0x3D80_0000 {
+        let imm = ((word >> 10) & 0xFFF) * 16;
+        return Some(format!("str q{rd}, [x{rn}, #{imm}]"));
+    }
+    // umov Xd, Vn.d[i]: base 0x4E00_3C00; imm5 (bits[20:16]) = 0b01000 for a
+    // D lane, with the index in bit4 (imm5 = 8 + 16*index). `rm` above IS the
+    // imm5 field here (same bit position).
+    if word & 0xFFE0_FC00 == 0x4E00_3C00 && rm & 0xF == 0x8 {
+        let index = (rm >> 4) & 1;
+        return Some(format!("umov x{rd}, v{rn}.d[{index}]"));
+    }
+    None
 }
 
 /// Float fast-path (`docs/float_fastpath_design.md`): the scalar
@@ -921,6 +964,17 @@ mod tests {
             ("ret", "ret"),
             ("brk #0xde00", "brk #0xde00"),
             ("nop", "nop"),
+            // SIMD NEON fast-path (docs/SIMD.md): the exact forms
+            // emit::emit_vec2arith produces — .2d arithmetic, q ldr/str, and
+            // the lane umov. Round-trips through the vendored encoder.
+            ("fadd v16.2d, v16.2d, v17.2d", "fadd v16.2d, v16.2d, v17.2d"),
+            ("fsub v16.2d, v16.2d, v17.2d", "fsub v16.2d, v16.2d, v17.2d"),
+            ("fmul v16.2d, v16.2d, v17.2d", "fmul v16.2d, v16.2d, v17.2d"),
+            ("fdiv v16.2d, v16.2d, v17.2d", "fdiv v16.2d, v16.2d, v17.2d"),
+            ("ldr q16, [x17, #16]", "ldr q16, [x17, #16]"),
+            ("str q16, [x19, #16]", "str q16, [x19, #16]"),
+            ("umov x0, v16.d[0]", "umov x0, v16.d[0]"),
+            ("umov x1, v16.d[1]", "umov x1, v16.d[1]"),
         ] {
             assert_eq!(disasm_word(asm_word(asm)), expect, "golden for `{asm}`");
         }

@@ -525,6 +525,9 @@ fn real_oop_rootspill_slots(vm: &VmState, kind: AdapterKind, caller_pc: u64) -> 
         // Float fast-path: stub_box_double's x0 is a raw f64 bit pattern,
         // never an oop — zero live slots, or GC would chase float bits.
         AdapterKind::BoxDouble => 0,
+        // SIMD: stub_box_float64x2's x0/x1 are two raw f64 lane bit patterns,
+        // never oops — zero live slots, same reasoning as BoxDouble.
+        AdapterKind::BoxFloat64x2 => 0,
         AdapterKind::Poll => unreachable!(
             "each_code_root: stub_poll never tags the anchor (S10 D5.6) -- walk_frames must \
              never produce FrameView::Adapter{{kind: Poll, ..}} (see its own module doc)"

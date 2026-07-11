@@ -9,7 +9,7 @@
 //! corpus; the compiler never calls it — P6). [`JasmAssembler`]
 //! (`crate::compiler::jasm_assembler`) is the only implementor.
 
-pub use crate::vendor::wfasm::a64::parse::{Addr, Mem, Operand, Reg, RegClass};
+pub use crate::vendor::wfasm::a64::parse::{Addr, Arr, ElemSize, Mem, Operand, Reg, RegClass};
 
 /// Why a code word / pool word needs runtime attention. Recorded per site.
 /// `Hash` (beyond the `Eq` an enum this small would derive anyway) is for
@@ -185,6 +185,28 @@ pub fn d(n: u8) -> Operand {
 /// no zero-register-as-base form — so [`mem`]/[`mem_pre`]/[`mem_post`] set
 /// it from `base == 31` directly rather than requiring callers to route
 /// through this helper.)
+/// A 128-bit FP/SIMD register (`q0`..`q31`) — the whole vector; `d(n)` is its
+/// low 64 bits. SIMD (`docs/SIMD.md`): `ldr q`/`str q` move a Float64x2's
+/// 16-byte body.
+pub fn q(n: u8) -> Operand {
+    Operand::Reg(Reg {
+        class: RegClass::Q,
+        num: n,
+        is_sp: false,
+    })
+}
+/// A `.2d` vector operand (`v3.2d`) — two f64 lanes, for `fadd`/`fmul`/… .
+pub fn v2d(n: u8) -> Operand {
+    Operand::VReg { num: n, arr: Arr::D2 }
+}
+/// A double lane element (`v3.d[i]`) — `umov`/`ins` a single f64 lane.
+pub fn vd_lane(n: u8, lane: u8) -> Operand {
+    Operand::VElem {
+        num: n,
+        esize: ElemSize::D,
+        index: lane,
+    }
+}
 pub fn sp() -> Operand {
     Operand::Reg(Reg {
         class: RegClass::X,

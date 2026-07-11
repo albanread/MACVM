@@ -274,6 +274,24 @@ pub enum Ir {
         dst: VReg,
         bits: u64,
     },
+    /// ── SIMD NEON fast-path (`docs/SIMD.md`, Increment 2) ──────────────────
+    /// A fused mono-`Float64x2` elementwise arithmetic send (`+`/`-`/`*`/`/`),
+    /// the vector analog of `FUnbox`+`FArith`+`FBox` collapsed into ONE op:
+    /// `a`/`b`/`dst` are ordinary OOP vregs (boxed `Float64x2`), and emit.rs
+    /// lowers the whole guard→unbox→`fadd v.2d`→box internally with fixed
+    /// scratch `q`-registers — NO vector vregs, so the allocator/reducer are
+    /// untouched (v1 box-per-op; the reducer/q-pool generalization is later).
+    /// GUARDED like `FUnbox`: a non-`Float64x2` `a` or `b` branches to `fail`
+    /// (a cold `UncommonTrap` re-executing the send at tier-0 — the primitive's
+    /// own Smalltalk fallback, byte-identical). Allocates the result box, so it
+    /// is a regalloc SAFEPOINT (`is_safepoint_op`).
+    Vec2Arith {
+        op: FArithOp,
+        dst: VReg,
+        a: VReg,
+        b: VReg,
+        fail: BlockId,
+    },
     Jump {
         target: BlockId,
     },
@@ -393,6 +411,10 @@ impl Ir {
                 f(*b);
             }
             Ir::FUnbox { src, .. } | Ir::FBox { src, .. } => f(*src),
+            Ir::Vec2Arith { a, b, .. } => {
+                f(*a);
+                f(*b);
+            }
             Ir::ArrayAt { arr, idx, .. } => {
                 f(*arr);
                 f(*idx);
@@ -463,6 +485,7 @@ impl Ir {
             | Ir::FArith { dst, .. }
             | Ir::FCmpVal { dst, .. }
             | Ir::FConst { dst, .. }
+            | Ir::Vec2Arith { dst, .. }
             | Ir::Alloc { dst, .. } => f(*dst),
             Ir::CallRuntime { dst: Some(d), .. } => f(*d),
             Ir::StoreField { .. }
@@ -667,6 +690,11 @@ pub struct IrMethod {
     /// The Double klass oop (`RelocKind::Oop` — a moving GC keeps it
     /// current), for `FBox`'s header stamp and `FUnbox`'s klass guard.
     pub double_klass_lit: PoolLit,
+    /// SIMD (`docs/SIMD.md`): the `Float64x2` klass oop (`RelocKind::Oop`), for
+    /// `Vec2Arith`'s operand guards and the result box's header stamp. Its box
+    /// reuses `mark_double_lit` — both share `Format::Double` (a raw 16-byte
+    /// body the GC skips), so the mark word is identical; only the klass differs.
+    pub float64x2_klass_lit: PoolLit,
     /// S11 D3: one entry per `Ir::CallSend` site, indexed by its own
     /// `site: u16` — mirrors `pool`'s own "small side table, indexed by a
     /// compact id embedded in the `Ir`" shape. `emit.rs` has no `VmState`/
@@ -951,6 +979,50 @@ fn classify_smi_send(vm: &VmState, method: MethodOop, ic_idx: u16) -> SmiSendKin
              should have rejected this method (compiler bug if this fires)"
         ),
     }
+}
+
+/// SIMD (`docs/SIMD.md`): map a `Float64x2` primitive number to the NEON
+/// arithmetic op it fuses to (`+`=129, `-`=130, `*`=131, `/`=132; world/
+/// 38_simd.mst). `None` for any non-arith primitive (`x:y:`/`splat:`/`at:`),
+/// which stays an ordinary send. The single source of truth for both
+/// `is_float64x2_inlinable`'s gate and the fuse arm's op selection.
+fn float64x2_arith_op(prim: i64) -> Option<FArithOp> {
+    match prim {
+        129 => Some(FArithOp::Add),
+        130 => Some(FArithOp::Sub),
+        131 => Some(FArithOp::Mul),
+        132 => Some(FArithOp::Div),
+        _ => None,
+    }
+}
+
+/// SIMD (`docs/SIMD.md`): the `classify_double_send` analog for a
+/// mono-`Float64x2`-guarded site — resolves the NEON arithmetic op the site's
+/// `Ir::Vec2Arith` computes. Always an arith op (unlike Double, `Float64x2`
+/// has no fused compares), so it returns `FArithOp` directly. Only ever called
+/// from the fuse arm after `is_float64x2_inlinable` has already vetted the
+/// site, so both `expect`s are compiler-bug guards, not runtime conditions.
+fn classify_float64x2_send(vm: &VmState, method: MethodOop, ic_idx: u16) -> FArithOp {
+    let ic = InterpreterIc::at(method, ic_idx);
+    debug_assert_eq!(
+        ic.guard().raw(),
+        vm.universe.float64x2_klass.oop().raw(),
+        "classify_float64x2_send: IC {ic_idx} is not mono-Float64x2-guarded -- \
+         is_float64x2_inlinable should have rejected this site"
+    );
+    let target = crate::compiler::feedback::resolve_method_ro(
+        vm,
+        vm.universe.float64x2_klass,
+        ic.selector(),
+    )
+    .expect("classify_float64x2_send: Float64x2 must understand an is_float64x2_inlinable selector");
+    float64x2_arith_op(target.primitive()).unwrap_or_else(|| {
+        panic!(
+            "classify_float64x2_send: primitive {} is not an arith op -- \
+             is_float64x2_inlinable should have rejected this site (compiler bug)",
+            target.primitive()
+        )
+    })
 }
 
 /// Float fast-path (`docs/float_fastpath_design.md` B2 rule 1): the
@@ -1480,6 +1552,29 @@ impl<'a> Translator<'a> {
             return false;
         };
         crate::compiler::driver::DOUBLE_INLINE.contains(&target.primitive())
+    }
+
+    /// SIMD NEON fast-path (`docs/SIMD.md`): the `Float64x2` analog of
+    /// `is_double_inlinable`. True when this send site is mono-guarded on the
+    /// `Float64x2` klass and resolves to one of the four elementwise
+    /// arithmetic primitives (`+`/`-`/`*`/`/`, prims 129–132) — the sends that
+    /// fuse to a single guarded `Ir::Vec2Arith` (NEON `fadd v.2d` + box).
+    /// Resolves via (guard klass, selector) rather than the raw IC target, for
+    /// the same reason as `is_double_inlinable`: a warm site's mono target is
+    /// usually a tiered-up smi NmethodId, not a MethodOop.
+    fn is_float64x2_inlinable(&self, ic_idx: u16) -> bool {
+        let ic = InterpreterIc::at(self.method, ic_idx);
+        if ic.guard().raw() != self.vm.universe.float64x2_klass.oop().raw() {
+            return false;
+        }
+        let Some(target) = crate::compiler::feedback::resolve_method_ro(
+            self.vm,
+            self.vm.universe.float64x2_klass,
+            ic.selector(),
+        ) else {
+            return false;
+        };
+        float64x2_arith_op(target.primitive()).is_some()
     }
 
     /// S11 D7: is this send site an inline-allocatable `X basicNew`? Returns
@@ -3738,6 +3833,47 @@ impl<'a> Translator<'a> {
                     }
                 }
             }
+            // SIMD NEON fast-path (docs/SIMD.md, Increment 2): a mono-Float64x2
+            // arithmetic send (+/-/*/ /) collapses to ONE guarded
+            // `Ir::Vec2Arith` — emit lowers guard(both operands are Float64x2)
+            // → `ldr q` unbox → `fadd/… v.2d` → box internally. Same fail-only
+            // trap-block shape as the double fuse above: a non-Float64x2 operand
+            // (the IC only guards the receiver) re-executes the WHOLE send
+            // interpreted, taking the primitive's own Smalltalk fallback —
+            // byte-identical semantics.
+            Instr::Send { ic, .. } if self.is_float64x2_inlinable(ic) => {
+                let reexec_stack = stack.clone();
+                let fail_id = self.fresh_block_id();
+                self.finish_block(IrBlock {
+                    id: fail_id,
+                    bci,
+                    code: vec![Ir::UncommonTrap { bci }],
+                    entry_stack: Vec::new(),
+                    deopt_sites: vec![(
+                        0,
+                        DeoptRaw {
+                            stack: reexec_stack,
+                            bci,
+                            kind: SafepointKind::UncommonTrap,
+                            reexecute: true,
+                            stack_closures: Vec::new(),
+                            inline: None,
+                        },
+                    )],
+                });
+                let b = stack.pop().expect("float64x2 fuse: missing arg operand");
+                let a = stack.pop().expect("float64x2 fuse: missing receiver operand");
+                let op = classify_float64x2_send(self.vm, self.method, ic);
+                let dst = self.fresh(true);
+                code.push(Ir::Vec2Arith {
+                    op,
+                    dst,
+                    a,
+                    b,
+                    fail: fail_id,
+                });
+                stack.push(dst);
+            }
             // D1's "arbitrary send/send_w in ANY IC state": every send this
             // step's own smi-inline guard above doesn't handle (Poly, Mega,
             // mono-but-non-smi, mono-smi-but-not-inlinable) still compiles
@@ -5569,6 +5705,10 @@ fn map_uses(op: &mut Ir, mut f: impl FnMut(VReg) -> VReg) {
             *b = f(*b);
         }
         Ir::FUnbox { src, .. } | Ir::FBox { src, .. } => *src = f(*src),
+        Ir::Vec2Arith { a, b, .. } => {
+            *a = f(*a);
+            *b = f(*b);
+        }
         Ir::ArrayAt { arr, idx, .. } => {
             *arr = f(*arr);
             *idx = f(*idx);
@@ -6117,6 +6257,7 @@ fn is_safepoint_op(ir: &Ir) -> bool {
             | Ir::CallRuntime { .. }
             | Ir::Alloc { .. }
             | Ir::FBox { .. }
+            | Ir::Vec2Arith { .. }
             | Ir::UncommonTrap { .. }
             | Ir::Poll
     )
@@ -6616,6 +6757,10 @@ pub fn convert(
     let double_klass_lit = t
         .pool
         .intern(vm.universe.double_klass.oop().raw(), Some(RelocKind::Oop));
+    // SIMD: the Float64x2 klass, for Vec2Arith's guards + box header (docs/SIMD.md).
+    let float64x2_klass_lit = t
+        .pool
+        .intern(vm.universe.float64x2_klass.oop().raw(), Some(RelocKind::Oop));
     // S24 A3b: the Context klass, interned once for the prologue Context
     // allocation of a MATERIALIZING has_ctx method.
     let ctx_klass_lit = if materialize_ctx {
@@ -7148,6 +7293,7 @@ pub fn convert(
         mark_slots_lit,
         mark_double_lit,
         double_klass_lit,
+        float64x2_klass_lit,
         call_sites: t.call_sites,
         site_feedback: t.site_feedback,
         inline_deps: t.inline_deps,

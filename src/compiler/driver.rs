@@ -862,6 +862,7 @@ fn compile_method_full(
     let must_be_boolean_addr = vm.stubs.must_be_boolean_addr();
     let alloc_slow_addr = vm.stubs.alloc_slow_addr();
     let box_double_addr = vm.stubs.box_double_addr();
+    let box_float64x2_addr = vm.stubs.box_float64x2_addr();
     let call_primitive_addr = vm.stubs.call_primitive_addr();
     let nlr_originate_addr = vm.stubs.nlr_originate_addr();
     // `eligibility_detail` already confirmed (via `is_shimmable_primitive`)
@@ -1096,6 +1097,7 @@ fn compile_method_full(
             must_be_boolean_addr,
             alloc_slow_addr,
             box_double_addr,
+            box_float64x2_addr,
             call_primitive_addr,
             nlr_originate_addr,
             prim_shim,
@@ -2342,7 +2344,7 @@ mod tests {
 
         let mut asm = JasmAssembler::new();
         let (_blob, _pcs, _ve, _ic, safepoint_pcs, _osr_off) =
-            emit::emit(&mut asm, &ir_method, &ra, 0, 0, 0, 0, 0, 0, None, None, None);
+            emit::emit(&mut asm, &ir_method, &ra, 0, 0, 0, 0, 0, 0, 0, None, None, None);
         assert_eq!(
             safepoint_pcs.len(),
             2,
@@ -2496,7 +2498,7 @@ mod tests {
 
         let mut asm = JasmAssembler::new();
         let (_blob, _pcs, _ve, _ic, safepoint_pcs, _osr_off) =
-            emit::emit(&mut asm, &ir_method, &ra, 0, 0, 0, 0, 0, 0, None, None, None);
+            emit::emit(&mut asm, &ir_method, &ra, 0, 0, 0, 0, 0, 0, 0, None, None, None);
 
         let (blob, pcdescs) = build_deopt_metadata(&ir_method, &ra, &safepoint_pcs);
 
