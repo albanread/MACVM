@@ -285,14 +285,19 @@ fn cmd_render(args: &[String]) {
     let resolved =
         preprocess::resolve_smappl_spans(&chromed, theme, |code| vm.render_fragment(code).ok());
 
-    // Inline the theme CSS so the file renders self-contained (the chrome's
-    // own `file://` stylesheet link won't resolve when served over http).
+    // Inline the theme CSS and smtk.js so the file renders self-contained and
+    // interactive (the chrome's own `file://` stylesheet/script links won't
+    // resolve when served over http). smtk.js's `post()` no-ops without a
+    // native host, so client-side behavior (outliner expand/collapse) still
+    // works in a plain browser.
+    let gui_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let css = std::fs::read_to_string(theme.stylesheet_path()).unwrap_or_default();
-    let style = format!("<style>{css}</style>");
+    let js = std::fs::read_to_string(gui_root.join("assets/smtk.js")).unwrap_or_default();
+    let head = format!("<style>{css}</style><script>{js}</script>");
     let self_contained = if resolved.contains("</head>") {
-        resolved.replacen("</head>", &format!("{style}</head>"), 1)
+        resolved.replacen("</head>", &format!("{head}</head>"), 1)
     } else {
-        format!("{style}{resolved}")
+        format!("{head}{resolved}")
     };
 
     let out = out.unwrap_or_else(|| {

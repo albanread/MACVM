@@ -60,6 +60,23 @@
         return;
       }
 
+      // Outliner expand/collapse (world/34_tools.mst ClassHierarchyOutliner).
+      // The whole tree is shipped once; toggling a node's glyph shows/hides
+      // its children subtree entirely client-side — no VM round trip (a truly
+      // lazy server-rendered toggle, D-G5, is a later step for large trees).
+      const tw = ev.target.closest(".st-tw[data-tw]");
+      if (tw) {
+        ev.preventDefault();
+        const node = tw.closest(".st-node");
+        const children = node && node.querySelector(":scope > .st-children");
+        if (children) {
+          const collapsed = children.style.display === "none";
+          children.style.display = collapsed ? "" : "none";
+          tw.innerHTML = collapsed ? "▾ " : "▸ "; // ▾ open / ▸ closed
+        }
+        return;
+      }
+
       // A rendered smappl widget (Button etc., ../smappl.md §3) — the
       // fragment carries the opaque action id the VM worker stored in
       // SmapplRegistry; clicking posts it back so `SmapplRegistry fire:`

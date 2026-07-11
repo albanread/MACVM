@@ -502,6 +502,16 @@ mod tests {
             html.contains("Behavior") && html.contains("Magnitude"),
             "the tree must include Object's subclasses, got {html:?}"
         );
+        // Collapsible structure: a toggle glyph, nested children containers,
+        // and descendants collapsed by default (only the root is open).
+        assert!(
+            html.contains("st-tw") && html.contains("st-children"),
+            "nodes must be collapsible (toggle glyph + children container), got {html:?}"
+        );
+        assert!(
+            html.contains("style=\"display:none\""),
+            "descendant subtrees must start collapsed, got {html:?}"
+        );
     }
 
     /// A `visual=` shape not yet buildable (needs a later Phase-W wave — the

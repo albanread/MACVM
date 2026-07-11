@@ -91,16 +91,34 @@ Visual subclass: ClassHierarchyOutliner [
         | html |
         html := HtmlWriter new.
         html raw: '<div class="st-outliner">'.
-        self render: rootMirror on: html.
+        "The root renders open; its descendants render collapsed (a browsable
+         tree, not one giant wall). Collapse/expand is client-side in
+         smtk.js — the whole tree ships once, cheap at world scale; a truly
+         lazy server round trip (D-G5 toggle protocol) is a later step for
+         large trees."
+        self render: rootMirror on: html open: true.
         html raw: '</div>'.
         ^html contents
     ]
-    render: mirror on: html [
+    render: mirror on: html open: isOpen [
+        | subs |
+        subs := mirror subclassMirrors.
         html raw: '<div class="st-node">'.
         html raw: '<span class="st-header st-class">'.
+        subs isEmpty
+            ifTrue: [ html raw: '<span class="st-tw-leaf"></span>' ]
+            ifFalse: [ isOpen
+                ifTrue:  [ html raw: '<span class="st-tw" data-tw>&#9662; </span>' ]
+                ifFalse: [ html raw: '<span class="st-tw" data-tw>&#9656; </span>' ] ].
         html escaped: mirror name.
         html raw: '</span>'.
-        mirror subclassMirrors do: [ :sub | self render: sub on: html ].
+        subs isEmpty ifFalse: [
+            isOpen
+                ifTrue:  [ html raw: '<div class="st-children">' ]
+                ifFalse: [ html raw: '<div class="st-children" style="display:none">' ].
+            subs do: [ :sub | self render: sub on: html open: false ].
+            html raw: '</div>'.
+        ].
         html raw: '</div>'.
     ]
 ]
