@@ -5789,6 +5789,135 @@ pub(crate) fn copy_propagate(m: &mut IrMethod) {
     }
 }
 
+/// Float fast-path (`docs/float_fastpath_design.md` B2 rules 2–3): the
+/// box/unbox cancellation reducer. Per block, forward:
+///
+/// - **Rule 2 — `FUnbox(FBox x) → x`.** An `FUnbox` whose source is an
+///   in-block `FBox` result is DELETED (with its klass guard: the value is
+///   provably a Double — the box just made it) and downstream fp reads
+///   (`FArith`/`FCmp*`/`FBox` sources) rewrite to the original unboxed value.
+///   Sound across safepoints: if the rewritten fp value's interval now
+///   crosses one, regalloc's fp spill-all parks it in a non-oop slot.
+/// - **Rule 3 — dead-box elimination.** An `FBox` whose boxed result has no
+///   remaining use anywhere — ops, deopt metadata (a later fused op's
+///   reexecute stack legitimately pins an intermediate box: the interpreter
+///   needs the REAL boxed Double on re-execution), or a merge entry stack —
+///   is deleted. This is where the allocation disappears. (Sinking a
+///   deopt-pinned box into its fail block — deferred; see the design doc.)
+///
+/// Runs after [`copy_propagate`] (which collapses the Move chains between an
+/// `FBox` and its consumer `FUnbox`, making rule 2's def visible in-block).
+pub(crate) fn reduce_float_boxes(m: &mut IrMethod) {
+    // ── Rule 2: per-block cancel. ────────────────────────────────────────
+    for b in &mut m.blocks {
+        let mut boxed_src: HashMap<u32, VReg> = HashMap::new(); // FBox dst → fp src
+        let mut fp_alias: HashMap<u32, VReg> = HashMap::new(); // FUnbox dst → fp value
+        let mut keep: Vec<bool> = Vec::with_capacity(b.code.len());
+        let mut removed = 0u32;
+        let mut removed_before: Vec<u32> = vec![0; b.code.len() + 1];
+        for (i, op) in b.code.iter_mut().enumerate() {
+            removed_before[i] = removed;
+            if !fp_alias.is_empty() {
+                match op {
+                    Ir::FArith { a, b: rb, .. }
+                    | Ir::FCmpVal { a, b: rb, .. }
+                    | Ir::FCmpBr { a, b: rb, .. } => {
+                        if let Some(&r) = fp_alias.get(&a.0) {
+                            *a = r;
+                        }
+                        if let Some(&r) = fp_alias.get(&rb.0) {
+                            *rb = r;
+                        }
+                    }
+                    Ir::FBox { src, .. } => {
+                        if let Some(&r) = fp_alias.get(&src.0) {
+                            *src = r;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let deletable = if let Ir::FUnbox { dst, src, .. } = op {
+                match boxed_src.get(&src.0) {
+                    Some(&fp) => {
+                        fp_alias.insert(dst.0, fp);
+                        true
+                    }
+                    None => false,
+                }
+            } else {
+                false
+            };
+            if let Ir::FBox { dst, src } = op {
+                boxed_src.insert(dst.0, *src);
+            }
+            keep.push(!deletable);
+            if deletable {
+                removed += 1;
+            }
+        }
+        removed_before[b.code.len()] = removed;
+        if removed == 0 {
+            continue;
+        }
+        let mut it = keep.iter();
+        b.code.retain(|_| *it.next().unwrap());
+        for (ci, _) in b.deopt_sites.iter_mut() {
+            *ci -= removed_before[*ci as usize];
+        }
+    }
+
+    // ── Rule 3: whole-method use census, then delete unused FBoxes. ─────
+    let n = m.vregs.len();
+    let mut used = vec![false; n];
+    for b in &m.blocks {
+        for op in &b.code {
+            op.uses(|v| used[v.0 as usize] = true);
+        }
+        for (_, raw) in &b.deopt_sites {
+            for v in &raw.stack {
+                used[v.0 as usize] = true;
+            }
+            let mut lvl = raw.inline.as_ref();
+            while let Some(site) = lvl {
+                used[site.receiver.0 as usize] = true;
+                for v in &site.slots {
+                    used[v.0 as usize] = true;
+                }
+                for v in &site.caller_pending_stack {
+                    used[v.0 as usize] = true;
+                }
+                lvl = site.parent.as_deref();
+            }
+        }
+        for v in &b.entry_stack {
+            used[v.0 as usize] = true;
+        }
+    }
+    for b in &mut m.blocks {
+        let mut keep: Vec<bool> = Vec::with_capacity(b.code.len());
+        let mut removed = 0u32;
+        let mut removed_before: Vec<u32> = vec![0; b.code.len() + 1];
+        for (i, op) in b.code.iter().enumerate() {
+            removed_before[i] = removed;
+            let dead = matches!(op, Ir::FBox { dst, .. } if !used[dst.0 as usize]);
+            keep.push(!dead);
+            if dead {
+                removed += 1;
+            }
+        }
+        removed_before[b.code.len()] = removed;
+        if removed == 0 {
+            continue;
+        }
+        let mut it = keep.iter();
+        b.code.retain(|_| *it.next().unwrap());
+        for (ci, _) in b.deopt_sites.iter_mut() {
+            *ci -= removed_before[*ci as usize];
+        }
+    }
+}
+
 pub fn convert(
     vm: &VmState,
     rcvr_klass: KlassOop,
@@ -6541,6 +6670,7 @@ pub fn convert(
         method_pool_ix,
     };
     copy_propagate(&mut irm);
+    reduce_float_boxes(&mut irm);
     irm
 }
 
