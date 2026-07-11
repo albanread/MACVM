@@ -193,24 +193,61 @@ a pathological method would overflow, the reducer simply does **not** unbox the
 offending value (it stays a boxed `CallSend`) — a correctness-preserving
 fallback, never a spill slot.
 
-### B5. Safepoints & deopt (the correctness crux)
+### B5. Safepoints & deopt (the correctness crux) — REVISED
 
-Two increments, shippable in order:
+**Scope review (2026-07-11) collapsed the original v1/v2 split.** The key
+structural fact: spill-all-at-safepoints exists solely so the **moving GC**
+can find and update live oops, and the GC only scans **frame slots** — never
+registers (`oopmap.rs` is slot-indexed; spill-all is what makes that sound).
+A raw `f64` is exempt from that entire reason: the GC neither scans `d`-regs
+nor needs to update a float. So floats may legitimately stay in registers
+across safepoints; the only consumer that needs the value there is the
+**deopt materializer**.
 
-- **v1 — reify at safepoints.** At any `Alloc`/`Poll`/`CallSend` inside what
-  would be a region, box the live floats first. The oop map and the deopt
-  materializer then only ever see **boxed** Doubles — **zero new deopt
-  machinery**. This already kills every *intermediate* box (rules 2–3); a
-  loop-carried temp is boxed once per back-edge instead of ~9× per iteration.
-  Big win, minimal risk. (For `escapeAtRe:im:`: ~9 allocs/iter → 4.)
-- **v2 — carry unboxed across the back-edge poll (zero-alloc).** The
-  safepoint's oop map marks the slot **non-oop** (GC skips a raw `f64`), and
-  the deopt map gains one new entry kind: `DeoptSlot::Double { dreg }` →
-  "materialize by boxing `dK`". Now `zr/zi/zr2/zi2` survive the poll unboxed and
-  the loop allocates **nothing**. This is the only genuinely new correctness
-  surface, and — given this VM's deopt-materializer history (S13/S14 bugs) —
-  it is the piece to design first and verify hardest (differential golden
-  values with `MACVM_PIN` on the method, `MACVM_DEOPT_STRESS`).
+The mechanism is already in the tree: S14's **write-through residency**
+(x21–x23) — the value lives in a callee-saved register, every def ALSO writes
+the canonical frame slot, and deopt/oop-maps read slots unchanged. Applied to
+floats:
+
+- A loop-carried float lives in a **callee-saved `d8`–`d15`** register for its
+  whole interval, crossing `Poll`s (and libm calls) without dying.
+- Each def write-throughs to its frame slot (`str dK, [fp,#slot]` — ~1 cycle,
+  off the dependency path). The oop map marks the slot **non-oop**.
+- The deopt map gains ONE new entry kind — `DeoptSlot::Double { slot }`:
+  "this interpreter temp is a raw f64 in frame slot N; box it on
+  materialize." No trampoline changes, no reading registers out of signal
+  frames.
+
+Reify (actually box) is then needed only where boxed state is *observed*: a
+real `CallSend`'s argument, a store to a heap slot, or `^` of a Double.
+Given this VM's deopt-materializer history (S13/S14), `DeoptSlot::Double` is
+the piece to verify hardest: differential golden values with `MACVM_PIN`,
+`MACVM_DEOPT_STRESS`, and a forced-deopt-mid-loop test that checks the boxed
+temps match the interpreter's.
+
+### B5a. Scope review: method-local vs class-wide (decided)
+
+Considered and REJECTED: spreading unboxed representation to **instance
+variables** ("all the slots in a class"). That changes *object layout*, which
+leaves the compiler entirely: per-class layout maps in the scavenger/full GC
+(today every slots-object slot is scanned as an oop), representation checks in
+the interpreter's `push_ivar`/`store_ivar`, a class-layout migration or
+permanent guard when a non-Double is stored (V8's field-deprecation tarpit;
+SpiderMonkey shipped "unboxed objects" and later deleted the feature),
+plus reflection/`image_store`/redefinition fidelity. A VM-wide representation
+project, not compiler work — and Strongtalk itself drew the same line
+(fast floats were method-local).
+
+The goal *behind* class-wide — covering a class's float helpers — has a
+sanctioned path already in the tree: the **depth-1 inliner + S24 splicing**.
+Inlining a small float method into its hot caller merges their regions, so the
+operands never box to cross the call, because there is no call. Widen regions
+by inlining, not by new object layout.
+
+Mandelbrot check: method-local + across-safepoint registers makes
+`escapeAtRe:im:`'s loop allocate **zero** (2 `FUnbox` per pixel at entry;
+`^n` is a smi; `maxIter` is a smi ivar — no float ivar exists in the hot
+path). Class-wide would buy it nothing.
 
 ### B6. Scope (matches Strongtalk and keeps it small)
 
