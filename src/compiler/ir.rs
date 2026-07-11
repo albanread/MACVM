@@ -6200,6 +6200,45 @@ pub(crate) fn reduce_float_boxes(m: &mut IrMethod, osr: bool) {
         }
     }
 
+    // ── Rule 2.5: FUnbox of a Double LITERAL folds to FConst. The guard is
+    // provably true (the pool word IS a Double) and an immutable literal's
+    // VALUE is a compile-time constant even though the boxed object moves —
+    // so the guard, the untag, and the payload load all vanish into a
+    // register constant. The ConstPool def stays (reexecute stacks may pin
+    // the boxed literal); if dead it just materializes an unused pool word.
+    {
+        use std::collections::HashMap;
+        let mut const_double: HashMap<u32, u64> = HashMap::new();
+        for b in &m.blocks {
+            for op in &b.code {
+                if let Ir::ConstPool { dst, lit } = op {
+                    let e = &m.pool[lit.0 as usize];
+                    if e.kind == Some(RelocKind::Oop) {
+                        if let Some(d) = crate::oops::wrappers::DoubleOop::try_from(
+                            crate::oops::Oop::from_raw(e.value),
+                        ) {
+                            const_double.insert(dst.0, d.value().to_bits());
+                        }
+                    }
+                }
+            }
+        }
+        if !const_double.is_empty() {
+            for b in &mut m.blocks {
+                for op in b.code.iter_mut() {
+                    let (dst, bits) = match op {
+                        Ir::FUnbox { dst, src, .. } => match const_double.get(&src.0) {
+                            Some(&bits) => (*dst, bits),
+                            None => continue,
+                        },
+                        _ => continue,
+                    };
+                    *op = Ir::FConst { dst, bits };
+                }
+            }
+        }
+    }
+
     // ── Rule 4 (docs B5): float-temp promotion — before the sink/census
     // so the temp-store FBoxes it orphans die in rule 3 below. OSR compiles
     // are gated out (the OSR entry copies boxed interpreter slots).

@@ -299,3 +299,22 @@ SmallInteger).
 - `src/compiler/ir.rs` `classify_smi_send` / `Ir::SmiArith` — the working
   template rule 1 mirrors.
 - `docs/SPEC.md` decision log should gain an entry recording this design.
+
+## Addendum — measured follow-on results (2026-07-11)
+
+- **`FUnbox(Double literal) → FConst` folding (rule 2.5, SHIPPED):** a
+  literal's unbox guard is provably true and its VALUE is a compile-time
+  constant even though the boxed object moves — guard/untag/load fold to a
+  register constant. Sound, general; on the Mandelbrot flagship it is inside
+  measurement noise (the per-iteration `2.0` unbox was ~7 of ~40 loop
+  instructions).
+- **Entry-hoisted argument unboxes (rule 5, MEASURED AND REJECTED):** hoist
+  each in-loop `FUnbox(arg)` to one entry-block unbox (fail = UncommonTrap at
+  bci 0, empty reexecute stack — sound, nothing has executed yet; gated !osr
+  since an OSR entry skips the entry block). Interleaved A/B on the flagship:
+  **24 ms → 27 ms, a consistent 12% REGRESSION.** Mechanism: the hoisted fp
+  vregs span the whole method — the LONGEST intervals — and assign_residents
+  packs longest-first, so they take d-registers ahead of the short hot
+  loop-carried temps, displacing exactly the values whose residency pays.
+  Revisit only together with a use-density (not length) residency heuristic;
+  do not re-land as-is.
