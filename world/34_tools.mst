@@ -1,0 +1,106 @@
+"34_tools.mst — the first Phase-W reflection tools (docs/APPS.md §2/§5/§6),
+ enough to render the start page's own smappl:
+   <smappl visual='ClassHierarchyOutliner imbeddedVisualForClass: Object'>
+
+ Layers (APPS.md §1): a VM reflection primitive (allClasses, R1) → a
+ Smalltalk mirror (ClassMirror) → a tool (ClassHierarchyOutliner, a Visual
+ from 33_smappl.mst) → an HtmlWriter fragment. VmHandle::render_fragment
+ sends the tool #htmlFragment and splices the answer into the page (D-G5).
+
+ Scope: a static, fully-expanded class-NAME tree — proves the
+ primitive→mirror→HtmlWriter→fragment path end to end. Deferred to later
+ waves: lazy expand/collapse (D-G5 toggle messages), method/category nodes
+ (needs a selectorsOf: primitive, APPS.md R2), filtering, and the
+ ClassOutliner/Border chain. subclassMirrors re-sweeps allClasses per node
+ (O(n^2)); fine at world scale, revisit when it matters."
+
+"--- HtmlWriter: the fragment builder (docs/APPS.md §6) ---"
+Object subclass: HtmlWriter [
+    | stream |
+    HtmlWriter class >> new [
+        ^self basicNew init
+    ]
+    init [
+        stream := WriteStream on: String new.
+        ^self
+    ]
+    raw: aString [
+        stream nextPutAll: aString.
+        ^self
+    ]
+    escaped: aString [
+        aString do: [ :ch |
+            ch = $< ifTrue: [ stream nextPutAll: '&lt;' ]
+            ifFalse: [ ch = $> ifTrue: [ stream nextPutAll: '&gt;' ]
+            ifFalse: [ ch = $& ifTrue: [ stream nextPutAll: '&amp;' ]
+            ifFalse: [ stream nextPut: ch ] ] ] ].
+        ^self
+    ]
+    contents [
+        ^stream contents
+    ]
+]
+
+"--- ClassMirror: source-level reflection of a class (docs/APPS.md §2) ---"
+Object subclass: ClassMirror [
+    | klass |
+    ClassMirror class >> on: aClass [
+        ^self basicNew setClass: aClass
+    ]
+    "R1 (docs/APPS.md §3): every class object, as an Array. The VM keeps no
+     subclass index — subclasses are computed image-side by filtering this."
+    ClassMirror class >> allClasses [
+        <primitive: 98>
+    ]
+    setClass: c [
+        klass := c.
+        ^self
+    ]
+    theClass [
+        ^klass
+    ]
+    name [
+        ^klass name asString
+    ]
+    "Direct subclasses as ClassMirrors, via the allClasses sweep."
+    subclassMirrors [
+        | subs |
+        subs := OrderedCollection new.
+        ClassMirror allClasses do: [ :c |
+            (c superclass == klass) ifTrue: [ subs add: (ClassMirror on: c) ] ].
+        ^subs
+    ]
+]
+
+"--- ClassHierarchyOutliner: a class tree, rendered to HTML (APPS.md §5.2) ---"
+Visual subclass: ClassHierarchyOutliner [
+    | rootMirror |
+    "The start page's shorthand (gui/smappl.md §3.3): answer a Visual for the
+     hierarchy rooted at aClass."
+    ClassHierarchyOutliner class >> imbeddedVisualForClass: aClass [
+        ^self basicNew setRoot: (ClassMirror on: aClass)
+    ]
+    ClassHierarchyOutliner class >> for: aMirror [
+        ^self basicNew setRoot: aMirror
+    ]
+    setRoot: m [
+        rootMirror := m.
+        ^self
+    ]
+    htmlFragment [
+        | html |
+        html := HtmlWriter new.
+        html raw: '<div class="st-outliner">'.
+        self render: rootMirror on: html.
+        html raw: '</div>'.
+        ^html contents
+    ]
+    render: mirror on: html [
+        html raw: '<div class="st-node">'.
+        html raw: '<span class="st-header st-class">'.
+        html escaped: mirror name.
+        html raw: '</span>'.
+        mirror subclassMirrors do: [ :sub | self render: sub on: html ].
+        html raw: '</div>'.
+    ]
+]

@@ -1844,12 +1844,13 @@ mod tests {
             "a clean action fire returns no error responses, got {fired:?}"
         );
 
-        // A shape that needs the (unbuilt) mirror stack renders nothing, so
-        // the GUI keeps showing the G0 placeholder box.
+        // A shape that isn't built yet (an unknown tool class — e.g. the
+        // CodeView shape, gui/smappl.md §3.5) renders nothing, so the GUI
+        // keeps showing the G0 placeholder box.
         let unbuildable = handle(
             VmRequest::SmapplRender {
                 id: "s1".to_string(),
-                code: "ClassHierarchyOutliner imbeddedVisualForClass: Object".to_string(),
+                code: "CodeView forString".to_string(),
             },
             &mut world,
             &mut selection,
@@ -1888,6 +1889,17 @@ mod tests {
         assert!(
             html.contains("smappl-button") && html.contains("DB"),
             "the DB-booted world must render a live button, got {html:?}"
+        );
+
+        // The Phase-W outliner (allClasses primitive + ClassMirror +
+        // HtmlWriter, world/34_tools.mst) must also survive the DB round trip
+        // — this is the start page's own smappl.
+        let tree = vm
+            .render_fragment("ClassHierarchyOutliner imbeddedVisualForClass: Object")
+            .expect("the hierarchy outliner must render through a DB-booted VM");
+        assert!(
+            tree.contains("st-outliner") && tree.contains("Object") && tree.contains("Behavior"),
+            "the DB-booted world must render the class-hierarchy tree, got {tree:?}"
         );
 
         std::fs::remove_file(&tmp).ok();

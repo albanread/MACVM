@@ -413,6 +413,14 @@ pub static PRIMITIVES: &[PrimDesc] = &[
         can_allocate: true,
         can_fail: false,
     },
+    PrimDesc {
+        id: 98,
+        name: "allClasses",
+        f: prim_all_classes,
+        argc: 0,
+        can_allocate: true,
+        can_fail: false,
+    },
     // --- Double group (S6, SPEC §1.3) ------------------------------------
     PrimDesc {
         id: 100,
@@ -1142,6 +1150,59 @@ fn prim_gc_full(vm: &mut VmState, args: &[Oop]) -> PrimResult {
 /// cosmetic. `can_allocate: true` (the result Array itself allocates); no
 /// arg oops are read after the allocation, so there is nothing here for
 /// that to invalidate.
+/// R1 reflection (`docs/APPS.md` §3): every class object in the system, as an
+/// `Array`. Walks the global namespace (`vm.universe.smalltalk`: slot 0 is the
+/// tally, then `tally` Associations) and collects each association value that
+/// is a klass — the image-side `ClassMirror` filters these by `superclass` to
+/// compute subclasses (the VM keeps no subclass index, exactly as Strongtalk's
+/// `ClassVMMirror` walks `Smalltalk classesDo:`). Receiver/args are ignored.
+///
+/// GC-safe two-pass: pass 1 counts (no allocation); `alloc_indexable_oops` may
+/// then scavenge, so pass 2 re-reads `vm.universe.smalltalk` (a scanned root,
+/// updated across the collection) rather than caching any oop across the alloc.
+fn prim_all_classes(vm: &mut VmState, _args: &[Oop]) -> PrimResult {
+    fn tally_of(vm: &VmState) -> (ArrayOop, usize) {
+        let arr = ArrayOop::try_from(vm.universe.smalltalk)
+            .expect("allClasses: the global namespace is not an Array");
+        let tally = SmallInt::try_from(arr.at(0))
+            .expect("allClasses: globals tally is not a smi")
+            .value() as usize;
+        (arr, tally)
+    }
+    let is_class = |assoc: Oop| -> Option<Oop> {
+        let value = MemOop::try_from(assoc)
+            .expect("allClasses: globals slot is not an Association")
+            .body_oop(1);
+        KlassOop::try_from(value).map(|_| value)
+    };
+
+    // Pass 1: count (allocation-free).
+    let (arr, tally) = tally_of(vm);
+    let mut count = 0usize;
+    for i in 0..tally {
+        if is_class(arr.at(1 + i)).is_some() {
+            count += 1;
+        }
+    }
+
+    // Allocate the result (may move the heap).
+    let array_klass = vm.universe.array_klass;
+    let result = alloc::alloc_indexable_oops(vm, array_klass, count);
+
+    // Pass 2: re-read the (possibly moved) namespace root and fill.
+    let (arr, tally) = tally_of(vm);
+    let mut j = 0usize;
+    for i in 0..tally {
+        if let Some(value) = is_class(arr.at(1 + i)) {
+            if j < count {
+                result.at_put(j, value);
+                j += 1;
+            }
+        }
+    }
+    PrimResult::Ok(result.oop())
+}
+
 fn prim_gc_stats(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     let smi = |v: u64| SmallInt::new(v as i64).oop();
     let u = &vm.universe;

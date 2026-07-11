@@ -481,20 +481,55 @@ mod tests {
         );
     }
 
-    /// A `visual=` shape not yet buildable (needs the Phase-W mirror stack)
-    /// surfaces as `Err`, so the GUI can fall back to the G0 placeholder box
-    /// rather than break the page.
+    /// Phase-W first tool: the start page's own smappl
+    /// (`ClassHierarchyOutliner imbeddedVisualForClass: Object`) renders to a
+    /// real class-hierarchy tree — the `allClasses` reflection primitive →
+    /// `ClassMirror` subclass sweep → `HtmlWriter` fragment path, end to end.
     #[test]
-    fn render_fragment_unknown_shape_is_err_not_panic() {
+    fn render_fragment_class_hierarchy_outliner() {
+        let mut vm = boot_test_vm(JitMode::Off);
+        let html = vm
+            .render_fragment("ClassHierarchyOutliner imbeddedVisualForClass: Object")
+            .expect("the hierarchy outliner must render");
+        assert!(
+            html.contains("st-outliner") && html.contains("Object"),
+            "must be an outliner tree rooted at Object, got {html:?}"
+        );
+        // Real subclasses computed from the allClasses sweep must appear —
+        // Behavior and Magnitude are both direct or indirect subclasses of
+        // Object in the seed world.
+        assert!(
+            html.contains("Behavior") && html.contains("Magnitude"),
+            "the tree must include Object's subclasses, got {html:?}"
+        );
+    }
+
+    /// A `visual=` shape not yet buildable (needs a later Phase-W wave — the
+    /// `CodeView` substrate) surfaces as `Err`, so the GUI falls back to the
+    /// G0 placeholder box rather than breaking the page.
+    #[test]
+    fn render_fragment_unbuilt_shape_is_err_not_panic() {
         let mut vm = boot_test_vm(JitMode::Off);
         let err = vm
-            .render_fragment("ClassHierarchyOutliner imbeddedVisualForClass: Object")
+            .render_fragment("CodeView forString")
             .expect_err("an unbuilt widget shape must fail, not render");
-        // Compile (unknown global) is the expected shape here.
         match err {
             GuestError::Compile(_) | GuestError::RuntimeError(_) => {}
             other => panic!("expected Compile/RuntimeError, got {other:?}"),
         }
+    }
+
+    /// The `allClasses` reflection primitive answers a non-empty set that
+    /// includes the well-known genesis classes.
+    #[test]
+    fn all_classes_primitive_enumerates_the_world() {
+        let mut vm = boot_test_vm(JitMode::Off);
+        let count = vm
+            .eval("ClassMirror allClasses size.")
+            .expect("allClasses must run")
+            .parse::<i64>()
+            .expect("size is an integer");
+        assert!(count > 20, "the seed world has many classes, got {count}");
     }
 
     #[test]

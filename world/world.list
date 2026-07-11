@@ -43,3 +43,5 @@
 32_object_protocol_gaps.mst
 # G2 smappl: image-side Visual/Button/Glue widget layer (gui/smappl.md).
 33_smappl.mst
+# Phase W: reflection mirrors + outliner tools (docs/APPS.md).
+34_tools.mst

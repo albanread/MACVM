@@ -384,13 +384,33 @@ period Win95 raised bevel under the classic `strongtalk.css` theme and a
 `src/embed.rs` and `gui/src/vm_host.rs` (including a **DB-boot** render, the
 path the real GUI actually uses — S22 fidelity risk).
 
-**G2+ remainder (needs the Phase-W mirror stack, `docs/APPS.md` §2/§6):**
-- The **outliner and `CodeView` shapes** (§3.3–3.5) — including
-  `startPage.html`'s own `ClassHierarchyOutliner imbeddedVisualForClass:
-  Object`, the most prominent smappl in the corpus. These need `ClassMirror`/
-  `MethodMirror` + an `HtmlWriter`/`ToolNode` framework; until W2 they fail
-  the render and stay the G0 placeholder box (§3's "anything else renders as
-  the placeholder", already the built behavior).
+**G2 hierarchy outliner (done — the start page's own smappl):**
+`startPage.html`'s `ClassHierarchyOutliner imbeddedVisualForClass: Object`
+now renders a real, live class-hierarchy tree. The first Phase-W layers back
+it (`docs/APPS.md` §1's stack): a VM reflection primitive (`allClasses`, R1
+— `src/runtime/primitives.rs`, id 98; walks the global namespace, returns
+every class object) → an image-side `ClassMirror` (`world/34_tools.mst`:
+`name`/`superclass`/`subclassMirrors`, subclasses computed by filtering
+`allClasses`, since the VM keeps no subclass index — exactly Strongtalk's
+`ClassVMMirror` approach) → a `ClassHierarchyOutliner` `Visual` whose
+`htmlFragment` walks the tree → an `HtmlWriter` (§6's fragment builder:
+`raw:`/`escaped:`/`contents`). Rendered with the existing `.st-outliner`/
+`.st-node`/`.st-header` CSS (a G0/G3 deliverable). Covered by embed +
+DB-boot tests; verified visually.
+
+**G2+ remainder (needs later Phase-W waves, `docs/APPS.md` §2/§6):**
+- **Lazy expand/collapse** — the tree is currently rendered fully expanded
+  in one shot; the D-G5 toggle protocol (`{kind:"toggle", nodeId}` →
+  `ToolNode>>toggle`, per-node fragment push) and the node-id/DOM-id
+  registry (§2's caching analog) are the next layer.
+- **Method/category nodes** inside a class (a class's selectors, categories,
+  and method source) — needs a `selectorsOf:` reflection primitive (R2) and
+  a `MethodMirror`; not built.
+- The **`ClassOutliner` (§3.4) and `CodeView` (§3.5) shapes** — the
+  single-class browser embed and the embedded editor. `ClassOutliner` needs
+  the `for:`/`topVisualWithHRule:`/`withBorder:`/`Border` chain; `CodeView`
+  needs the `TextView` substrate. Until then they fail the render and stay
+  the G0 placeholder box (§3's "anything else renders as the placeholder").
 - Per-element **caching across relayout** (`visualRegistry` → `ToolNode`'s
   node-id/DOM-id registry) so expand/collapse and button state survive
   reflow — the slice re-renders on each load rather than caching.
