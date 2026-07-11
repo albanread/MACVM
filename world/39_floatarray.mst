@@ -1,0 +1,64 @@
+"39_floatarray.mst — SIMD level 2 (docs/SIMD.md Part E): FloatArray, a
+ contiguous buffer of N f64 lanes (a fixed Format::IndexableBytes RAW body,
+ GC-skipped — world/universe.rs) that the explicit-NEON bulk kernels stream
+ over. Reopens the genesis klass (like Number subclass: Double / Object
+ subclass: Float64x2), which preserves the genesis IndexableBytes format.
+
+ The bulk kernels are hand-written NEON <primitive:>s (runtime/primitives.rs):
+ `+@` (elementwise sum, per-lane bit-identical to scalar Double add) and the
+ reductions `sum`/`dot:`, which use a DEFINED fast pairwise order — NOT the
+ scalar left-to-right fold, so they differ from `inject:into:` in the low bits
+ (docs/SIMD.md Part D). `sequentialSum` is the exact scalar fold for code that
+ needs bit-parity with a hand-written loop."
+ArrayedCollection subclass: FloatArray [
+    "N zeroed f64 lanes."
+    FloatArray class >> new: n [ <primitive: 141> ]
+
+    "Build from any indexable of Numbers (Array, Interval, ...)."
+    FloatArray class >> from: aCollection [
+        | fa i |
+        fa := self new: aCollection size.
+        i := 1.
+        aCollection do: [ :x | fa at: i put: x. i := i + 1 ].
+        ^fa
+    ]
+
+    "Lane access, 1-based (Smalltalk convention): answers/takes a Double."
+    at: i [ <primitive: 142> ]
+    at: i put: aDouble [ <primitive: 143> ]
+    size [ <primitive: 144> ]
+
+    "Elementwise sum of two equal-length arrays -> a new FloatArray. Per-lane
+     bit-identical to a scalar Double add."
+    +@ other [ <primitive: 145> ]
+
+    "Fast NEON reductions (docs/SIMD.md Part D): a DEFINED pairwise order, not
+     the scalar left-fold."
+    sum [ <primitive: 146> ]
+    dot: other [ <primitive: 147> ]
+
+    "The exact scalar left-to-right fold, for code that needs bit-parity with a
+     hand-written `inject:into:` loop (differs from `sum` in the low bits)."
+    sequentialSum [
+        | s |
+        s := 0.0.
+        1 to: self size do: [ :i | s := s + (self at: i) ].
+        ^s
+    ]
+
+    do: aBlock [ 1 to: self size do: [ :i | aBlock value: (self at: i) ] ]
+
+    printOn: aStream [
+        aStream nextPutAll: 'FloatArray('.
+        1 to: self size do: [ :i |
+            i > 1 ifTrue: [ aStream nextPutAll: ' ' ].
+            aStream nextPutAll: (self at: i) printString ].
+        aStream nextPutAll: ')'
+    ]
+    printString [
+        | s |
+        s := WriteStream on: String new.
+        self printOn: s.
+        ^s contents
+    ]
+]

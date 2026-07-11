@@ -122,6 +122,10 @@ pub struct Universe {
     /// value-class family.
     pub float64x2_klass: KlassOop,
     pub float32x4_klass: KlassOop,
+    /// SIMD level 2 (`docs/SIMD.md` Part E): `FloatArray` — a contiguous
+    /// `Format::IndexableBytes` buffer of N f64 lanes (`n*8` bytes, GC-skipped
+    /// body) that the NEON bulk kernels (`+@`/`sum`/`dot:`) stream over.
+    pub float_array_klass: KlassOop,
     pub string_klass: KlassOop,
     pub symbol_klass: KlassOop,
     pub array_klass: KlassOop,
@@ -520,6 +524,18 @@ impl Universe {
             true,
             HEADER_WORDS
         );
+        // SIMD level 2 (docs/SIMD.md Part E): FloatArray — same IndexableBytes
+        // shape as ByteArray (raw GC-skipped body, no named ivars), but its
+        // primitives read/write the body as f64 lanes and the NEON bulk kernels
+        // (+@/sum/dot:) stream over it. A genesis klass because IndexableBytes
+        // can't be requested from a plain `.mst` subclass.
+        let float_array_klass = remaining_klass!(
+            "FloatArray",
+            arrayed_collection_klass.oop(),
+            Format::IndexableBytes,
+            true,
+            HEADER_WORDS
+        );
         // S20 step 5 (docs/FFI.md §4): `Alien`, right after `ByteArray`
         // since they share `Format::IndexableBytes` — but superclass
         // `object_klass`, NOT `bytearray_klass`/`arrayed_collection_klass`
@@ -710,6 +726,7 @@ impl Universe {
             double_klass,
             float64x2_klass,
             float32x4_klass,
+            float_array_klass,
             string_klass,
             symbol_klass,
             array_klass,

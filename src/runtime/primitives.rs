@@ -802,6 +802,64 @@ pub static PRIMITIVES: &[PrimDesc] = &[
         can_allocate: true,
         can_fail: true,
     },
+    // SIMD level 2: FloatArray (docs/SIMD.md Part E) — element access + the
+    // explicit-NEON bulk kernels (+@ elementwise, sum/dot: fast reductions).
+    PrimDesc {
+        id: 141,
+        name: "new:",
+        f: prim_farray_new,
+        argc: 1,
+        can_allocate: true,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 142,
+        name: "at:",
+        f: prim_farray_at,
+        argc: 1,
+        can_allocate: true,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 143,
+        name: "at:put:",
+        f: prim_farray_at_put,
+        argc: 2,
+        can_allocate: false,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 144,
+        name: "size",
+        f: prim_farray_size,
+        argc: 0,
+        can_allocate: false,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 145,
+        name: "+@",
+        f: prim_farray_add,
+        argc: 1,
+        can_allocate: true,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 146,
+        name: "sum",
+        f: prim_farray_sum,
+        argc: 0,
+        can_allocate: true,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 147,
+        name: "dot:",
+        f: prim_farray_dot,
+        argc: 1,
+        can_allocate: true,
+        can_fail: true,
+    },
 ];
 
 pub fn prim_by_id(id: u16) -> Option<&'static PrimDesc> {
@@ -1881,6 +1939,149 @@ fn prim_x4_at(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     PrimResult::Ok(alloc::alloc_double(vm, lanes[(i - 1) as usize] as f64).oop())
 }
 
+// ── SIMD level 2: FloatArray + NEON bulk kernels (docs/SIMD.md Part E) ─────
+//
+// A FloatArray is a Format::IndexableBytes buffer of N f64 lanes (N*8 bytes,
+// GC-skipped body). Lane j (0-based) lives at body word (1 + j) — word 0 is
+// the byte-count size slot (alloc_indexable_bytes). Klass-checked, like the
+// vector value classes.
+fn as_float_array(vm: &VmState, o: Oop) -> Option<MemOop> {
+    let m = MemOop::try_from(o)?;
+    (m.klass().oop().raw() == vm.universe.float_array_klass.oop().raw()).then_some(m)
+}
+
+/// f64 lane count = byte length / 8.
+fn float_array_len(m: MemOop) -> usize {
+    m.indexable_len() / 8
+}
+
+/// Copy the lanes out into an owned `Vec<f64>` — done BEFORE any result
+/// allocation so a scavenge can't leave a dangling body pointer (the vector
+/// value classes' GC lesson). The kernels then run on the slice, which LLVM
+/// auto-vectorizes to NEON `fadd v.2d` etc.
+fn float_array_lanes(m: MemOop) -> Vec<f64> {
+    let n = float_array_len(m);
+    (0..n).map(|j| f64::from_bits(m.body_word_raw(1 + j))).collect()
+}
+
+// The FloatArray bulk kernels are EXPLICIT hand-written NEON — see
+// `crate::runtime::simd_kernels` (the one module allowed `unsafe` for hardware
+// intrinsics). NOT a scalar loop left to rustc/LLVM to maybe vectorize: a
+// `<primitive:>` bulk op deliberately uses the hardware (docs/SIMD.md Part E).
+use crate::runtime::simd_kernels::{neon_add, pairwise_dot, pairwise_sum};
+
+/// `FloatArray new: n` (class-side; args = [class, n]) — n zeroed f64 lanes.
+fn prim_farray_new(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    let n = match SmallInt::try_from(args[1]) {
+        Some(k) if k.value() >= 0 => k.value() as usize,
+        _ => return PrimResult::Fail,
+    };
+    let nbytes = match n.checked_mul(8) {
+        Some(b) => b,
+        None => return PrimResult::Fail,
+    };
+    let klass = vm.universe.float_array_klass;
+    PrimResult::Ok(alloc::alloc_indexable_bytes(vm, klass, nbytes).oop())
+}
+
+/// `FloatArray >> size` → lane count.
+fn prim_farray_size(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    match as_float_array(vm, args[0]) {
+        Some(m) => PrimResult::Ok(SmallInt::new(float_array_len(m) as i64).oop()),
+        None => PrimResult::Fail,
+    }
+}
+
+/// `FloatArray >> at: i` → the i-th lane as a Double (1-based).
+fn prim_farray_at(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    let m = match as_float_array(vm, args[0]) {
+        Some(m) => m,
+        None => return PrimResult::Fail,
+    };
+    let i = match SmallInt::try_from(args[1]) {
+        Some(k) => k.value(),
+        None => return PrimResult::Fail,
+    };
+    if i < 1 || i as usize > float_array_len(m) {
+        return PrimResult::Fail;
+    }
+    let lane = f64::from_bits(m.body_word_raw(1 + (i as usize - 1)));
+    PrimResult::Ok(alloc::alloc_double(vm, lane).oop())
+}
+
+/// `FloatArray >> at: i put: aDouble` → aDouble (1-based; SmallInteger coerced).
+fn prim_farray_at_put(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    let m = match as_float_array(vm, args[0]) {
+        Some(m) => m,
+        None => return PrimResult::Fail,
+    };
+    let i = match SmallInt::try_from(args[1]) {
+        Some(k) => k.value(),
+        None => return PrimResult::Fail,
+    };
+    if i < 1 || i as usize > float_array_len(m) {
+        return PrimResult::Fail;
+    }
+    let v = match as_scalar_f64(vm, args[2]) {
+        Some(v) => v,
+        None => return PrimResult::Fail,
+    };
+    m.set_body_word_raw(1 + (i as usize - 1), v.to_bits());
+    PrimResult::Ok(args[2])
+}
+
+/// `FloatArray >> +@ other` → a NEW FloatArray of the elementwise sums.
+/// Per-lane exact (bit-identical to scalar Double add — the elementwise
+/// discipline, docs/SIMD.md §B4). Fails on a length mismatch.
+fn prim_farray_add(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    let (ma, mb) = match (as_float_array(vm, args[0]), as_float_array(vm, args[1])) {
+        (Some(a), Some(b)) => (a, b),
+        _ => return PrimResult::Fail,
+    };
+    let n = float_array_len(ma);
+    if n != float_array_len(mb) {
+        return PrimResult::Fail;
+    }
+    // Copy both operands out BEFORE allocating the result (the alloc may GC).
+    let a = float_array_lanes(ma);
+    let b = float_array_lanes(mb);
+    let mut c = vec![0.0f64; n];
+    neon_add(&a, &b, &mut c); // explicit `fadd v.2d` stream + scalar tail
+    let klass = vm.universe.float_array_klass;
+    let out = alloc::alloc_indexable_bytes(vm, klass, n * 8);
+    // No allocation between here and the last write — `out` cannot move.
+    for (i, &ci) in c.iter().enumerate() {
+        out.as_mem().set_body_word_raw(1 + i, ci.to_bits());
+    }
+    PrimResult::Ok(out.oop())
+}
+
+/// `FloatArray >> sum` → Double (fast pairwise NEON reduction, docs/SIMD.md D).
+fn prim_farray_sum(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    let m = match as_float_array(vm, args[0]) {
+        Some(m) => m,
+        None => return PrimResult::Fail,
+    };
+    let a = float_array_lanes(m);
+    PrimResult::Ok(alloc::alloc_double(vm, pairwise_sum(&a)).oop())
+}
+
+/// `FloatArray >> dot: other` → Double (fast pairwise NEON reduction). Fails
+/// on a length mismatch.
+fn prim_farray_dot(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    let (ma, mb) = match (as_float_array(vm, args[0]), as_float_array(vm, args[1])) {
+        (Some(a), Some(b)) => (a, b),
+        _ => return PrimResult::Fail,
+    };
+    let n = float_array_len(ma);
+    if n != float_array_len(mb) {
+        return PrimResult::Fail;
+    }
+    let a = float_array_lanes(ma);
+    let b = float_array_lanes(mb);
+    PrimResult::Ok(alloc::alloc_double(vm, pairwise_dot(&a, &b)).oop())
+}
+
 fn prim_double_sqrt(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     match crate::oops::wrappers::DoubleOop::try_from(args[0]) {
         Some(a) => PrimResult::Ok(alloc::alloc_double(vm, a.value().sqrt()).oop()),
@@ -2076,6 +2277,70 @@ mod tests {
         assert_eq!(x4_lane(&mut vm, moved, 4), 3.25);
     }
 
+    /// SIMD level 2 (`docs/SIMD.md` Part E): the FloatArray NEON bulk-kernel
+    /// primitives (`+@`/`sum`/`dot:`) compute correctly, and `float_array_klass`
+    /// is a GC root (same regression lock as the value classes — a moved-but-
+    /// unrooted klass poison-reads mid-alloc). `sum`/`dot:` verify against the
+    /// DEFINED pairwise order, NOT a scalar fold (docs/SIMD.md Part D).
+    fn make_farray(vm: &mut VmState, xs: &[f64]) -> Oop {
+        let k = vm.universe.float_array_klass;
+        let arr = alloc::alloc_indexable_bytes(vm, k, xs.len() * 8);
+        for (i, &x) in xs.iter().enumerate() {
+            arr.as_mem().set_body_word_raw(1 + i, x.to_bits());
+        }
+        arr.oop()
+    }
+
+    #[test]
+    fn float_array_kernels_and_gc_survival() {
+        // Part 1 — kernel correctness (gc_stress OFF; raw locals stay put).
+        let mut vm = test_vm();
+        let a = make_farray(&mut vm, &[1.5, 2.5, 3.5, 4.5, 5.5]);
+        let b = make_farray(&mut vm, &[0.5, 0.5, 0.5, 0.5, 0.5]);
+        // +@ → elementwise (per-lane exact).
+        let c = match call(145, &mut vm, &[a, b]) {
+            PrimResult::Ok(o) => o,
+            other => panic!("+@ failed: {other:?}"),
+        };
+        for (i, expect) in [2.0, 3.0, 4.0, 5.0, 6.0].iter().enumerate() {
+            let lane = f64::from_bits(MemOop::try_from(c).unwrap().body_word_raw(1 + i));
+            assert_eq!(lane, *expect);
+        }
+        // sum → the DEFINED pairwise order: (a0+a2+a4) + (a1+a3).
+        let sum = match call(146, &mut vm, &[a]) {
+            PrimResult::Ok(o) => crate::oops::wrappers::DoubleOop::try_from(o).unwrap().value(),
+            other => panic!("sum failed: {other:?}"),
+        };
+        assert_eq!(sum, (1.5 + 3.5 + 5.5) + (2.5 + 4.5));
+        // dot → same pairwise order over the products.
+        let dot = match call(147, &mut vm, &[a, b]) {
+            PrimResult::Ok(o) => crate::oops::wrappers::DoubleOop::try_from(o).unwrap().value(),
+            other => panic!("dot failed: {other:?}"),
+        };
+        assert_eq!(
+            dot,
+            (1.5 * 0.5 + 3.5 * 0.5 + 5.5 * 0.5) + (2.5 * 0.5 + 4.5 * 0.5)
+        );
+
+        // Part 2 — GC-root survival (float_array_klass must be a GC root). Root
+        // a FloatArray on the stack, force scavenges that MOVE the klass and the
+        // array, and allocate a NEW array across each (that alloc reads the
+        // klass). The rooted array's lanes must survive intact.
+        let slot = vm.stack.sp;
+        let keep = make_farray(&mut vm, &[42.0, 99.0, -7.0]);
+        vm.stack.push(keep);
+        let nil = vm.universe.nil_obj;
+        for _ in 0..8 {
+            call_rooted(93 /* gcScavenge */, &mut vm, nil);
+            let _fresh = make_farray(&mut vm, &[1.0, 2.0, 3.0, 4.0]);
+        }
+        let moved = vm.stack.get(slot);
+        let m = MemOop::try_from(moved).unwrap();
+        assert_eq!(f64::from_bits(m.body_word_raw(1)), 42.0);
+        assert_eq!(f64::from_bits(m.body_word_raw(2)), 99.0);
+        assert_eq!(f64::from_bits(m.body_word_raw(3)), -7.0);
+    }
+
     /// `tests_s06.md`'s `prim_ids_frozen`: a regression lock on the id→name
     /// map every `.mst` `<primitive: N>` binds against. This registry
     /// deliberately diverges from `sprint_s06_detail.md`'s suggested
@@ -2176,6 +2441,13 @@ mod tests {
             (138, "*"),
             (139, "/"),
             (140, "at:"),
+            (141, "new:"),
+            (142, "at:"),
+            (143, "at:put:"),
+            (144, "size"),
+            (145, "+@"),
+            (146, "sum"),
+            (147, "dot:"),
         ];
         assert_eq!(
             PRIMITIVES.len(),

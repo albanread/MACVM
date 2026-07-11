@@ -22,6 +22,7 @@ pub mod osr;
 pub mod primitives;
 pub mod probe;
 pub mod recompile;
+pub mod simd_kernels; // SIMD level 2: explicit hand-written NEON bulk kernels (docs/SIMD.md Part E)
 pub mod vm_state;
 
 pub use vm_state::{InterpRegs, JitMode, TierLink, TraceFlags, VmOptions, VmRegBlock, VmState};

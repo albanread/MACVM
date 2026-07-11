@@ -104,6 +104,7 @@ where
         double_klass,
         float64x2_klass,
         float32x4_klass,
+        float_array_klass,
         string_klass,
         symbol_klass,
         array_klass,
