@@ -145,6 +145,12 @@ pub enum VmRequest {
         root: String,
         widget_id: String,
     },
+    /// A find-tool query (Implementors/Senders, docs/APPS.md §5.4): render the
+    /// result list image-side and return it for the find page's results div.
+    Find {
+        tool: String,
+        query: String,
+    },
     /// Reset the worker's `BrowserSelection` to match the fresh default
     /// state the initial page render always shows (see
     /// `main.rs::open_class_browser`) — sent once whenever the browser
@@ -318,6 +324,11 @@ pub enum VmResponse {
     /// for the rendered widget `html` (D-G5).
     SmapplFragment {
         id: String,
+        html: String,
+    },
+    /// Answers [`VmRequest::Find`] — `main.rs` fills the find page's results
+    /// container with `html`.
+    FindResults {
         html: String,
     },
     /// Internal supervisor liveness marker (S21 step 3) — NOT a UI response.
@@ -1094,6 +1105,19 @@ fn handle(
                 }
                 None => vec![VmResponse::Transcript(format!("(cannot open {root} hierarchy)"))],
             }
+        }
+        VmRequest::Find { tool, query } => {
+            // Double single-quotes for the Smalltalk string literal.
+            let q = query.replace('\'', "''");
+            let code = match tool.as_str() {
+                "senders" => format!("SendersView of: '{q}'"),
+                _ => format!("ImplementorsView of: '{q}'"),
+            };
+            let html = render_and_inject(vm, image, &code).unwrap_or_else(|| {
+                "<div class=\"st-find-empty\">(this find tool isn't available yet)</div>"
+                    .to_string()
+            });
+            vec![VmResponse::FindResults { html }]
         }
         VmRequest::BrowserOpen => {
             // No longer resets `selection` to default — that made sense
@@ -2064,6 +2088,35 @@ mod tests {
         assert!(
             unbuildable.is_empty(),
             "an unbuildable shape must yield no fragment, got {unbuildable:?}"
+        );
+    }
+
+    /// The Implementors find tool lists every class that defines the selector,
+    /// each a drill-link into that class's browser.
+    #[test]
+    fn find_implementors_lists_classes_that_define_the_selector() {
+        OPEN_OUTLINERS.with(|o| o.borrow_mut().clear());
+        let mut world = MockWorld::seed();
+        let mut sel = BrowserSelection::default();
+        let mut vm = test_vm_handle(macvm::runtime::JitMode::Off);
+        let responses = handle(
+            VmRequest::Find {
+                tool: "implementors".to_string(),
+                query: "printOn:".to_string(),
+            },
+            &mut world,
+            &mut sel,
+            None,
+            &mut vm,
+        );
+        let html = match responses.as_slice() {
+            [VmResponse::FindResults { html }] => html.clone(),
+            other => panic!("expected FindResults, got {other:?}"),
+        };
+        assert!(
+            html.contains("Implementors of") && html.contains("data-open-class=\"Point\""),
+            "must list Point among printOn: implementors (a drill-link), got a {}-char result",
+            html.len()
         );
     }
 

@@ -255,3 +255,46 @@ Visual subclass: ClassOutliner [
         html raw: ' — implemented in the VM, not editable.</div>'.
     ]
 ]
+
+"--- ImplementorsView: every class that defines a selector (find tool,
+     docs/APPS.md §5.4). A Visual so render_fragment can drive it. ---"
+Visual subclass: ImplementorsView [
+    | query |
+    ImplementorsView class >> of: aString [
+        ^self basicNew setQuery: aString
+    ]
+    setQuery: q [
+        query := q.
+        ^self
+    ]
+    htmlFragment [
+        | html count |
+        html := HtmlWriter new.
+        html raw: '<div class="st-find-results"><div class="st-find-head">Implementors of &#8220;'.
+        html escaped: query.
+        html raw: '&#8221;</div>'.
+        count := 0.
+        ClassMirror allClasses do: [ :c | | m |
+            m := ClassMirror on: c.
+            (self defines: (ClassMirror selectorsOf: c))
+                ifTrue: [ count := count + 1. self item: m side: 'instance' on: html ].
+            (self defines: (ClassMirror selectorsOf: c class))
+                ifTrue: [ count := count + 1. self item: m side: 'class' on: html ] ].
+        count = 0 ifTrue: [ html raw: '<div class="st-find-empty">(no implementors)</div>' ].
+        html raw: '</div>'.
+        ^html contents
+    ]
+    "Does this selector list contain `query` (compared by name)?"
+    defines: sels [
+        ^(sels detect: [ :s | s asString = query ] ifNone: [ nil ]) notNil
+    ]
+    item: mirror side: side on: html [
+        html raw: '<div class="st-find-item"><span class="st-class-link" data-open-class="'.
+        html escaped: mirror name.
+        html raw: '">'.
+        html escaped: mirror name.
+        html raw: '</span> <span class="st-find-side">', side, '</span> &#187; '.
+        html escaped: query.
+        html raw: '</div>'.
+    ]
+]

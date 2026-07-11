@@ -346,3 +346,9 @@ ul li::before {
 .st-prim-note { font-style: italic; color: var(--st-gray, #808080); font-family: var(--st-font-code); font-size: var(--st-size-code, var(--st-size-body)); margin: 2px 0 6px; }
 
 .st-transcript { margin-top: max(220px, 30vh); }
+
+.st-find-input { display:block; width: 60%; margin: 6px 0 10px; padding: 3px 6px; font-family: var(--st-font-code); font-size: var(--st-size-body); box-sizing: border-box; }
+.st-find-head { font-weight: bold; margin: 8px 0 6px; }
+.st-find-item { margin: 1px 0; }
+.st-find-side { color: var(--st-gray, #808080); font-size: 0.9em; }
+.st-find-empty { color: var(--st-gray, #808080); font-style: italic; margin: 8px 0; }

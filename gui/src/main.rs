@@ -396,6 +396,14 @@ fn navigate_to(path: &Path) {
         display_class_outliner();
         return;
     }
+    if let Some(tool) = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|n| n.strip_prefix(".find-"))
+    {
+        display_find(tool);
+        return;
+    }
     let html = match preprocess::load_and_preprocess(
         path,
         current_theme(),
@@ -479,6 +487,46 @@ fn open_class_outliner() {
         nav.lock().unwrap().go(class_outliner_view_marker());
     }
     display_class_outliner();
+}
+
+/// The find-tool pages (Implementors / Senders / Find definition) — a search
+/// input over the reflection layer (docs/APPS.md §5.4). Distinct marker per
+/// tool so back/forward/refresh rebuild the right one.
+fn find_view_marker(tool: &str) -> PathBuf {
+    gui_root().join(format!(".find-{tool}"))
+}
+
+fn open_find(tool: &str) {
+    if let Some(nav) = NAV.get() {
+        nav.lock().unwrap().go(find_view_marker(tool));
+    }
+    display_find(tool);
+}
+
+fn display_find(tool: &str) {
+    let (title, placeholder) = match tool {
+        "senders" => ("Senders", "selector, e.g. printOn:"),
+        _ => ("Implementors", "selector, e.g. printOn:"),
+    };
+    // The results div carries a widget id + hierarchy root so clicking a
+    // result (a .st-class-link) drills into that class via the same
+    // smapplOpenClass path the outliner uses.
+    let body = format!(
+        "<h1>{title}</h1>\
+         <p>Type a selector and press Enter.</p>\
+         <input class=\"st-find-input\" type=\"text\" data-find-tool=\"{tool}\" \
+          placeholder=\"{placeholder}\" autocomplete=\"off\" spellcheck=\"false\">\
+         <div id=\"find-results\" data-widget-id=\"find\" data-hierarchy-root=\"Object\"></div>"
+    );
+    let html = preprocess::render_generated_page(
+        title,
+        &body,
+        &gui_root(),
+        current_theme(),
+        current_font_scale_percent(),
+        &current_transcript(),
+    );
+    display_html(&html);
 }
 
 fn display_class_outliner() {
@@ -715,6 +763,7 @@ extern "C" fn on_script_message(_this: Id, _cmd: Sel, _controller: Id, message: 
                     navigate_to(&doc_index);
                 }
                 "userHierarchy" => open_class_outliner(),
+                "implementors" => open_find("implementors"),
                 "hierarchy" => open_class_browser(),
                 "workspace" => open_workspace(),
                 "canvas" => open_canvas(),
@@ -899,6 +948,14 @@ extern "C" fn on_script_message(_this: Id, _cmd: Sel, _controller: Id, message: 
                 vm.submit(vm_host::VmRequest::SmapplOpenHierarchy {
                     root: dict_get_string(body, "root"),
                     widget_id: dict_get_string(body, "widgetId"),
+                });
+            }
+        }
+        "find" => {
+            if let Some(vm) = VM.get() {
+                vm.submit(vm_host::VmRequest::Find {
+                    tool: dict_get_string(body, "tool"),
+                    query: dict_get_string(body, "query"),
                 });
             }
         }
@@ -1212,6 +1269,14 @@ extern "C" fn vm_bridge_drain(_this: Id, _cmd: Sel, _arg: Id) {
                 // This variant exists for a future GUI-side content
                 // cache/replay-on-reopen (`../docs/CANVAS.md` §7) to
                 // invalidate against, not for anything the DOM needs today.
+            }
+            vm_host::VmResponse::FindResults { html } => {
+                // Fill the find page's results container (keeping its
+                // data-widget-id so a result click can drill via smapplOpenClass).
+                eval_js(&format!(
+                    "window.macvmSetFindResults({})",
+                    js_string_literal(&html)
+                ));
             }
             vm_host::VmResponse::SmapplFragment { id, html } => {
                 // Swap the placeholder span with `data-widget-id == id` for

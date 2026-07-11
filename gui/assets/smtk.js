@@ -377,6 +377,29 @@
     true
   );
 
+  // Find tools (Implementors/Senders): Enter in the search box runs the query
+  // (vm_host VmRequest::Find); results land via macvmSetFindResults.
+  document.addEventListener(
+    "keydown",
+    function (ev) {
+      const input = ev.target.closest(".st-find-input");
+      if (!input) return;
+      if (ev.key === "Enter") {
+        ev.preventDefault();
+        const q = input.value.trim();
+        if (q) post({ kind: "find", tool: input.getAttribute("data-find-tool") || "", query: q });
+      }
+    },
+    true
+  );
+
+  // vm_host::VmResponse::FindResults arrives here (main.rs). Fill the results
+  // container (keeping its data-widget-id so a result click can drill).
+  window.macvmSetFindResults = function (html) {
+    const el = document.getElementById("find-results");
+    if (el) el.innerHTML = html;
+  };
+
   // ── Workspace (workspace_render.rs) ────────────────────────────────────
   //
   // Do it/Print it act on the current selection, or the whole buffer if
