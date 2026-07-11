@@ -169,24 +169,47 @@ Visual subclass: ClassOutliner [
         html raw: '<div class="st-node open"><span class="st-header st-class">'.
         html escaped: mirror name.
         html raw: '</span><div class="st-children">'.
+        "Sides render OPEN so their method lists show at a glance; individual
+         methods stay closed (source on demand). Many classes are abstract
+         (their methods live on subclasses), so a Subclasses section lets you
+         drill down to where the code actually is — e.g. Boolean -> True/False."
         self side: 'instance' selectors: mirror instanceSelectors on: html.
         self side: 'class' selectors: mirror classSelectors on: html.
+        self subclassesOn: html.
         html raw: '</div></div></div>'.
         ^html contents
     ]
+    subclassesOn: html [
+        | subs |
+        subs := mirror subclassMirrors.
+        subs isEmpty ifTrue: [ ^self ].
+        html raw: '<div class="st-node open"><span class="st-header st-side">'.
+        html raw: '<span class="st-tw" data-tw>&#9662; </span>subclasses ('.
+        html raw: subs size printString.
+        html raw: ')</span><div class="st-children">'.
+        subs do: [ :sub |
+            html raw: '<div class="st-node"><span class="st-header st-class">'.
+            html raw: '<span class="st-tw-leaf"></span>'.
+            html raw: '<span class="st-class-link" data-open-class="'.
+            html escaped: sub name.
+            html raw: '">'.
+            html escaped: sub name.
+            html raw: '</span></span></div>' ].
+        html raw: '</div></div>'.
+    ]
     side: label selectors: sels on: html [
-        "A collapsible side (instance/class) whose children are its selectors;
-         each selector is itself a collapsible node whose body is an empty
-         `<pre>` tagged with the (class, side, selector) — the GUI worker /
-         headless renderer fill it from image_store (the source of truth for
+        "A side (instance/class) whose children are its selectors, rendered
+         open; each selector is itself a collapsible node whose body is an
+         empty `<pre>` tagged with the (class, side, selector) — the GUI worker
+         / headless renderer fill it from image_store (the source of truth for
          method text — the running VM keeps no source). No source available
          (a .mst-booted VM with no image) just leaves it blank."
-        html raw: '<div class="st-node closed"><span class="st-header st-side">'.
-        html raw: '<span class="st-tw" data-tw>&#9656; </span>'.
+        html raw: '<div class="st-node open"><span class="st-header st-side">'.
+        html raw: '<span class="st-tw" data-tw>&#9662; </span>'.
         html escaped: label.
         html raw: ' side ('.
         html raw: sels size printString.
-        html raw: ')</span><div class="st-children" style="display:none">'.
+        html raw: ')</span><div class="st-children">'.
         sels do: [ :sel |
             html raw: '<div class="st-node closed"><span class="st-header st-selector">'.
             html raw: '<span class="st-tw" data-tw>&#9656; </span>'.

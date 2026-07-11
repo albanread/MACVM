@@ -1053,8 +1053,12 @@ fn handle(
                 Some(inner) => {
                     // Wrap with a back link to the hierarchy; the wrapper is
                     // the fragment root the widget-id is stamped on.
+                    // `data-hierarchy-root` on the wrapper lets a nested drill
+                    // (a subclass link inside this browser, e.g. Boolean→True)
+                    // keep the same back-to-hierarchy target.
                     let wrapped = format!(
-                        "<div class=\"st-classbrowser\"><div class=\"st-back\">\
+                        "<div class=\"st-classbrowser\" data-hierarchy-root=\"{root}\">\
+                         <div class=\"st-back\">\
                          <span class=\"st-class-link\" data-open-hierarchy=\"{root}\">\
                          &#8249; {root} hierarchy</span></div>{inner}</div>"
                     );
