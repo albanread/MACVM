@@ -4,7 +4,7 @@
 //! published into the same [`CodeCache`] real compiled methods live in.
 
 use crate::compiler::assembler::{
-    imm, mem, mem_post, mem_pre, sp, x, xr, Assembler, CodeBlob, Cond, RelocKind,
+    d,    imm, mem, mem_post, mem_pre, sp, x, xr, Assembler, CodeBlob, Cond, RelocKind,
 };
 use crate::compiler::jasm_assembler::JasmAssembler;
 use crate::oops::layout::{
@@ -455,12 +455,19 @@ pub fn install(cache: &mut CodeCache) -> Stubs {
 fn build_call_stub() -> CodeBlob {
     let mut a = JasmAssembler::new();
 
-    a.emit("stp", &[x(29), x(30), mem_pre(31, -96)]);
+    a.emit("stp", &[x(29), x(30), mem_pre(31, -160)]);
     a.emit("stp", &[x(19), x(20), mem(31, 16)]);
     a.emit("stp", &[x(21), x(22), mem(31, 32)]);
     a.emit("stp", &[x(23), x(24), mem(31, 48)]);
     a.emit("stp", &[x(25), x(26), mem(31, 64)]);
     a.emit("stp", &[x(27), x(28), mem(31, 80)]);
+    // Float fast-path residency: compiled code may hold unboxed float temps
+    // in d8–d15 (AAPCS64 callee-saved) — preserve them for the Rust caller,
+    // exactly like x19–x28 above.
+    a.emit("stp", &[d(8), d(9), mem(31, 96)]);
+    a.emit("stp", &[d(10), d(11), mem(31, 112)]);
+    a.emit("stp", &[d(12), d(13), mem(31, 128)]);
+    a.emit("stp", &[d(14), d(15), mem(31, 144)]);
     a.emit("mov", &[x(29), sp()]);
 
     // Move incoming params to scratch (caller-saved, x9-x11) registers
@@ -480,12 +487,16 @@ fn build_call_stub() -> CodeBlob {
 
     a.emit("blr", &[x(9)]);
 
+    a.emit("ldp", &[d(14), d(15), mem(31, 144)]);
+    a.emit("ldp", &[d(12), d(13), mem(31, 128)]);
+    a.emit("ldp", &[d(10), d(11), mem(31, 112)]);
+    a.emit("ldp", &[d(8), d(9), mem(31, 96)]);
     a.emit("ldp", &[x(27), x(28), mem(31, 80)]);
     a.emit("ldp", &[x(25), x(26), mem(31, 64)]);
     a.emit("ldp", &[x(23), x(24), mem(31, 48)]);
     a.emit("ldp", &[x(21), x(22), mem(31, 32)]);
     a.emit("ldp", &[x(19), x(20), mem(31, 16)]);
-    a.emit("ldp", &[x(29), x(30), mem_post(31, 96)]);
+    a.emit("ldp", &[x(29), x(30), mem_post(31, 160)]);
     a.emit("ret", &[]);
 
     a.finish()

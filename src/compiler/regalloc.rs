@@ -677,10 +677,18 @@ pub fn assign_residents(intervals: &mut [LiveInterval]) {
     }
 
     let mut taken: Vec<Vec<(u32, u32)>> = vec![Vec::new(); pool.len()];
+    // Float fast-path residency: spilled fp intervals get a callee-saved
+    // d8–d15 register the same way (write-through: the canonical non-oop
+    // slot stays authoritative for deopt; reads prefer the register). Same
+    // !crosses_call gate — a resident interval never spans a CallSend, so
+    // compiled callees can't clobber it; the Poll/Alloc/FBox SLOW paths
+    // (`bl` into Rust, which uses d8–d15 freely) already re-load residents.
+    // Floats need no GC resync at all beyond that — a raw f64 never moves.
+    let fp_pool: Vec<u8> = (8..16).collect();
+    let mut fp_taken: Vec<Vec<(u32, u32)>> = vec![Vec::new(); fp_pool.len()];
     let mut order: Vec<usize> = (0..intervals.len())
         .filter(|&i| {
             matches!(intervals[i].assignment, Some(Assignment::Spill(_)))
-                && !intervals[i].is_fp // residents are GPRs; fp reloads stay explicit
                 && !intervals[i].crosses_call
                 && intervals[i].end > intervals[i].start
         })
@@ -688,9 +696,14 @@ pub fn assign_residents(intervals: &mut [LiveInterval]) {
     order.sort_by_key(|&i| std::cmp::Reverse(intervals[i].end - intervals[i].start));
     for i in order {
         let (s, e) = (intervals[i].start, intervals[i].end);
-        for (ri, reg) in pool.iter().enumerate() {
-            if taken[ri].iter().all(|&(ts, te)| e <= ts || te <= s) {
-                taken[ri].push((s, e));
+        let (p, t) = if intervals[i].is_fp {
+            (&fp_pool, &mut fp_taken)
+        } else {
+            (&pool, &mut taken)
+        };
+        for (ri, reg) in p.iter().enumerate() {
+            if t[ri].iter().all(|&(ts, te)| e <= ts || te <= s) {
+                t[ri].push((s, e));
                 intervals[i].resident_reg = Some(*reg);
                 break;
             }

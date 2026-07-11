@@ -323,7 +323,7 @@ struct Emitter<'a> {
     /// SLOW paths reload every entry live at the site (their `bl` may have
     /// GC'd, moving the oops the resident registers point at; the canonical
     /// slots were updated by the GC's frame walk).
-    resident_reloads: Vec<(u32, u32, u8, crate::compiler::regalloc::SpillSlot)>,
+    resident_reloads: Vec<(u32, u32, u8, crate::compiler::regalloc::SpillSlot, bool /*is_fp*/)>,
 }
 
 impl<'a> Emitter<'a> {
@@ -384,14 +384,18 @@ impl<'a> Emitter<'a> {
     /// position (its own emission happens after the whole body, where
     /// `self.pos` is past everything).
     fn emit_resident_reloads_at(&mut self, pos: u32) {
-        let live: Vec<(u8, crate::compiler::regalloc::SpillSlot)> = self
+        let live: Vec<(u8, crate::compiler::regalloc::SpillSlot, bool)> = self
             .resident_reloads
             .iter()
-            .filter(|&&(s, e, _, _)| s <= pos && e > pos)
-            .map(|&(_, _, rr, slot)| (rr, slot))
+            .filter(|&&(s, e, _, _, _)| s <= pos && e > pos)
+            .map(|&(_, _, rr, slot, fp)| (rr, slot, fp))
             .collect();
-        for (rr, slot) in live {
-            emit_spill_access(self.asm, "ldr", x(rr), slot);
+        for (rr, slot, fp) in live {
+            if fp {
+                self.fp_spill_access("ldr", rr, slot);
+            } else {
+                emit_spill_access(self.asm, "ldr", x(rr), slot);
+            }
         }
     }
 
@@ -893,6 +897,14 @@ impl<'a> Emitter<'a> {
     /// d-register; a spilled one reloads into `d16`/`d17` (the fp scratch
     /// pair mirroring x16/x17 — never allocated, caller-saved).
     fn resolve_fp(&mut self, v: VReg, scratch_d: u8) -> u8 {
+        // A resident d-register mirrors the canonical slot at every
+        // instruction boundary (write-through in commit_fp) — read it, skip
+        // the load. Floats need no GC-driven invalidation (a raw f64 never
+        // moves); the Poll/Alloc/FBox slow paths reload after their Rust
+        // `bl`s, which may clobber d8–d15.
+        if let Some(rr) = self.resident[v.0 as usize] {
+            return rr;
+        }
         match self.assignment_of(v) {
             Assignment::Reg(r) => r,
             Assignment::Spill(slot) => {
@@ -913,7 +925,13 @@ impl<'a> Emitter<'a> {
         if let Assignment::Spill(slot) = self.assignment_of(dst) {
             self.fp_spill_access("str", computed_in, slot);
         }
-        // fp vregs are never resident (assign_residents filters them).
+        // Write-through residency: mirror the def into the resident
+        // d-register (the slot above stays canonical — deopt reads it).
+        if let Some(rr) = self.resident[dst.0 as usize] {
+            if rr != computed_in {
+                self.asm.emit("fmov", &[d(rr), d(computed_in)]);
+            }
+        }
     }
 
     /// Unbox a boxed `Double` into a d-register. Guard shape mirrors
@@ -1540,7 +1558,9 @@ pub fn emit(
             .intervals
             .iter()
             .filter_map(|iv| match (iv.resident_reg, iv.assignment) {
-                (Some(rr), Some(Assignment::Spill(slot))) => Some((iv.start, iv.end, rr, slot)),
+                (Some(rr), Some(Assignment::Spill(slot))) => {
+                    Some((iv.start, iv.end, rr, slot, iv.is_fp))
+                }
                 _ => None,
             })
             .collect(),
