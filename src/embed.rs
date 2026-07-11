@@ -298,6 +298,58 @@ impl VmHandle {
         Ok(())
     }
 
+    /// Evaluates a `<smappl visual="...">` expression and returns the HTML
+    /// fragment the image renders for it (GUI D-G5 / `docs/APPS.md` §6: the
+    /// Visual renders *itself* to HTML; Rust only transports the string).
+    /// `code` is the raw `visual=` source; this wraps it as
+    /// `(Visual coerce: (<code>)) htmlFragment` — the exact
+    /// `ElementSMAPPL.dlt` shape (`gui/smappl.md` §2) — and hands back the
+    /// resulting `String`'s raw bytes.
+    ///
+    /// Unlike [`eval`](Self::eval) this does NOT run `printString` on the
+    /// result: `htmlFragment` already answers a `String`, and printString
+    /// would re-quote it. A non-`String` result (a widget shape whose
+    /// `htmlFragment` isn't built yet, so the send DNUs, or `coerce:` let a
+    /// non-Visual through) surfaces as `Err` and the caller shows the G0
+    /// placeholder box — errors are swallowed to a fallback, never a broken
+    /// page, matching `ElementSMAPPL`'s own `ifError:` discipline.
+    #[allow(unsafe_code)]
+    pub fn render_fragment(&mut self, code: &str) -> Result<String, GuestError> {
+        let source = format!("(Visual coerce: ({code})) htmlFragment.");
+        let slot = deopt_trap::claim_jmp_slot();
+        // SAFETY: as `eval` — `sigsetjmp` inline at this call site, whose frame
+        // stays live for the whole recovery window.
+        let rc = unsafe { deopt_trap::sigsetjmp(deopt_trap::jmp_buf_ptr(slot), 1) };
+        if rc == deopt_trap::GUEST_FATAL_JMP_VAL {
+            let message = deopt_trap::take_last_guest_fatal_message().expect(
+                "sigsetjmp returned GUEST_FATAL_JMP_VAL without a recorded guest-fatal message",
+            );
+            return Err(GuestError::RuntimeError(message));
+        }
+        if rc != 0 {
+            let (sig, pc, far) = deopt_trap::take_last_crash_info()
+                .expect("sigsetjmp returned nonzero without a recorded crash");
+            return Err(GuestError::NativeFault { sig, pc, far });
+        }
+        let item = match frontend::parser::parse_one_top_item(&source) {
+            Ok(Some(item)) => item,
+            Ok(None) => return Ok(String::new()),
+            Err(e) => return Err(GuestError::Compile(e)),
+        };
+        match frontend::classdef::execute_top_item(&mut self.vm, item) {
+            Ok(Some(result)) => match fragment_bytes(result) {
+                Some(html) => Ok(html),
+                // The fragment method answered a non-String — treat as a
+                // render failure so the caller falls back to the placeholder.
+                None => Err(GuestError::RuntimeError(
+                    "smappl visual did not render to a String".to_string(),
+                )),
+            },
+            Ok(None) => Ok(String::new()),
+            Err(e) => Err(GuestError::Compile(e)),
+        }
+    }
+
     /// Installs `sink` as where guest output (`Transcript show:`,
     /// `printOnStdout:`) goes from now on. Default is stdout
     /// (`VmState::with_options`) — an embedder calls this once, right after
@@ -323,6 +375,17 @@ fn print_result(vm: &mut VmState, result: Oop) -> String {
         }
     }
     crate::memory::print_oop(&vm.universe, result)
+}
+
+/// Raw bytes of a guest `String`/`ByteArray` result, or `None` if `result`
+/// isn't byte-indexable. Used by [`VmHandle::render_fragment`] to return an
+/// HTML fragment verbatim, without the printString requoting `print_result`
+/// would apply.
+fn fragment_bytes(result: Oop) -> Option<String> {
+    let b = crate::oops::wrappers::ByteArrayOop::try_from(result)?;
+    let mut bytes = Vec::new();
+    b.copy_bytes_out(&mut bytes);
+    Some(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 #[cfg(test)]
@@ -362,6 +425,76 @@ mod tests {
         let mut vm = boot_test_vm(JitMode::Threshold(1));
         let result = vm.eval("6 * 7.").expect("6 * 7 must evaluate cleanly");
         assert_eq!(result, "42");
+    }
+
+    /// G2 smappl slice: a `visual=` labeled-button expression renders to a
+    /// live beveled `<button>` fragment (image-side, per D-G5) whose
+    /// `data-widget-action` id fires the stored action closure on click.
+    #[test]
+    fn render_fragment_builds_a_button_and_fires_its_action() {
+        struct VecSink(Arc<Mutex<Vec<String>>>);
+        impl TranscriptSink for VecSink {
+            fn show(&mut self, text: &str) {
+                self.0.lock().unwrap().push(text.to_string());
+            }
+        }
+
+        let mut vm = boot_test_vm(JitMode::Off);
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        vm.set_transcript(Box::new(VecSink(captured.clone())));
+
+        let html = vm
+            .render_fragment(
+                "Button labeled: 'Press Me!' action: [ :b | Transcript show: 'clicked' ]",
+            )
+            .expect("a labeled button must render to an HTML fragment");
+        assert!(
+            html.contains("smappl-button") && html.contains("Press Me!"),
+            "fragment must be a beveled button carrying its label, got {html:?}"
+        );
+        // The id the fragment advertises is what a click posts back.
+        let id_start = html.find("data-widget-action=\"").expect("fragment has an action id")
+            + "data-widget-action=\"".len();
+        let id_end = html[id_start..].find('"').unwrap() + id_start;
+        let id = &html[id_start..id_end];
+
+        vm.exec(&format!("SmapplRegistry fire: '{id}'."))
+            .expect("firing the registered widget id must run its action");
+        let lines = captured.lock().unwrap();
+        assert!(
+            lines.iter().any(|l| l.contains("clicked")),
+            "firing the button's id must run its action closure, got {lines:?}"
+        );
+    }
+
+    /// A `visual=` that returns a `Glue` spacer (the side-effecting shape,
+    /// gui/smappl.md §3 shape 6) renders to an invisible fixed-width span.
+    #[test]
+    fn render_fragment_glue_is_an_invisible_spacer() {
+        let mut vm = boot_test_vm(JitMode::Off);
+        let html = vm
+            .render_fragment("Glue xRigid: 12")
+            .expect("Glue must render to a fragment");
+        assert!(
+            html.contains("class=\"glue\"") && html.contains("width:12px"),
+            "Glue must render as a 12px spacer, got {html:?}"
+        );
+    }
+
+    /// A `visual=` shape not yet buildable (needs the Phase-W mirror stack)
+    /// surfaces as `Err`, so the GUI can fall back to the G0 placeholder box
+    /// rather than break the page.
+    #[test]
+    fn render_fragment_unknown_shape_is_err_not_panic() {
+        let mut vm = boot_test_vm(JitMode::Off);
+        let err = vm
+            .render_fragment("ClassHierarchyOutliner imbeddedVisualForClass: Object")
+            .expect_err("an unbuilt widget shape must fail, not render");
+        // Compile (unknown global) is the expected shape here.
+        match err {
+            GuestError::Compile(_) | GuestError::RuntimeError(_) => {}
+            other => panic!("expected Compile/RuntimeError, got {other:?}"),
+        }
     }
 
     #[test]

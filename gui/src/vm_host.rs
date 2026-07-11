@@ -98,6 +98,24 @@ pub enum VmRequest {
     Doit {
         code: String,
     },
+    /// A `<smappl visual="CODE">` on the current page (`../smappl.md`): render
+    /// the `visual=` expression to an HTML fragment (`VmHandle::render_fragment`,
+    /// D-G5). `id` is the placeholder span's `data-widget-id`; the worker
+    /// answers [`VmResponse::SmapplFragment`] with the same `id` so `main.rs`
+    /// can swap the right span. A shape that can't be built yet (needs the
+    /// Phase-W mirror stack) renders nothing — the placeholder box stays.
+    SmapplRender {
+        id: String,
+        code: String,
+    },
+    /// A rendered smappl widget was clicked (`smtk.js`): run its action
+    /// closure. `action_id` is the opaque id the widget carries in
+    /// `data-widget-action`, stored image-side in `SmapplRegistry`; the
+    /// worker runs `SmapplRegistry fire: action_id`, whose transcript/effects
+    /// flow back over the normal channels (`../PLAN.md` G1).
+    SmapplAction {
+        action_id: String,
+    },
     /// Reset the worker's `BrowserSelection` to match the fresh default
     /// state the initial page render always shows (see
     /// `main.rs::open_class_browser`) — sent once whenever the browser
@@ -265,6 +283,13 @@ pub enum VmResponse {
     /// Answers `CanvasClear`.
     CanvasCleared {
         id: u32,
+    },
+    /// Answers [`VmRequest::SmapplRender`] — `main.rs` calls `smtk.js`'s
+    /// `macvmRenderSmappl(id, html)` to swap the placeholder span with `id`
+    /// for the rendered widget `html` (D-G5).
+    SmapplFragment {
+        id: String,
+        html: String,
     },
     /// Internal supervisor liveness marker (S21 step 3) — NOT a UI response.
     /// The worker sends one after fully completing each request, i.e. once
@@ -844,6 +869,26 @@ fn handle(
             match vm.eval(&code) {
                 Ok(_) => vec![VmResponse::Transcript(format!("> {code}"))],
                 Err(e) => vec![VmResponse::Transcript(format!("> {code}\n{e}"))],
+            }
+        }
+        VmRequest::SmapplRender { id, code } => {
+            // Render the widget image-side (D-G5). A shape that can't be
+            // built yet fails cleanly — answer nothing so the placeholder box
+            // remains (the swallow-to-fallback contract, `../smappl.md` §2),
+            // rather than surfacing the error onto the page.
+            match vm.render_fragment(&code) {
+                Ok(html) => vec![VmResponse::SmapplFragment { id, html }],
+                Err(_) => vec![],
+            }
+        }
+        VmRequest::SmapplAction { action_id } => {
+            // Fire the widget's stored action closure. Any Transcript output
+            // it produces arrives separately via ChannelTranscript; a failure
+            // is echoed to the transcript like a doit rather than dropped.
+            let code = format!("SmapplRegistry fire: '{action_id}'.");
+            match vm.exec(&code) {
+                Ok(()) => vec![],
+                Err(e) => vec![VmResponse::Transcript(format!("{e}"))],
             }
         }
         VmRequest::BrowserOpen => {
@@ -1746,6 +1791,106 @@ mod tests {
     fn transcript_containing(rs: &[VmResponse], needle: &str) -> bool {
         rs.iter()
             .any(|r| matches!(r, VmResponse::Transcript(t) if t.contains(needle)))
+    }
+
+    /// G2 smappl slice: a `<smappl>` render request evaluates the `visual=`
+    /// code and answers a live button fragment; the fragment's advertised
+    /// action id fires the widget's closure; an unbuildable shape answers no
+    /// fragment (the placeholder box stays). Exercises the worker seam
+    /// (`handle`) end to end, the same path `main.rs` drives.
+    #[test]
+    fn smappl_render_and_action_round_trip_through_handle() {
+        let mut world = MockWorld::seed();
+        let mut selection = BrowserSelection::default();
+        let mut vm = test_vm_handle(macvm::runtime::JitMode::Off);
+
+        let rendered = handle(
+            VmRequest::SmapplRender {
+                id: "s0".to_string(),
+                code: "Button labeled: 'Hi' action: [ :b | Transcript show: 'fired' ]".to_string(),
+            },
+            &mut world,
+            &mut selection,
+            None,
+            &mut vm,
+        );
+        let (id, html) = match rendered.as_slice() {
+            [VmResponse::SmapplFragment { id, html }] => (id.clone(), html.clone()),
+            other => panic!("expected one SmapplFragment, got {other:?}"),
+        };
+        assert_eq!(id, "s0", "the answer must carry back the placeholder's id");
+        assert!(
+            html.contains("smappl-button") && html.contains("Hi"),
+            "must render a live beveled button carrying its label, got {html:?}"
+        );
+
+        // The action id the fragment advertises fires the stored closure.
+        let marker = "data-widget-action=\"";
+        let start = html.find(marker).expect("fragment has an action id") + marker.len();
+        let end = html[start..].find('"').unwrap() + start;
+        let action_id = html[start..end].to_string();
+        let fired = handle(
+            VmRequest::SmapplAction { action_id },
+            &mut world,
+            &mut selection,
+            None,
+            &mut vm,
+        );
+        // A clean fire produces no UI response of its own (its Transcript
+        // output goes to the sink, absent in this direct test) — the point is
+        // it ran without surfacing an error back.
+        assert!(
+            fired.is_empty(),
+            "a clean action fire returns no error responses, got {fired:?}"
+        );
+
+        // A shape that needs the (unbuilt) mirror stack renders nothing, so
+        // the GUI keeps showing the G0 placeholder box.
+        let unbuildable = handle(
+            VmRequest::SmapplRender {
+                id: "s1".to_string(),
+                code: "ClassHierarchyOutliner imbeddedVisualForClass: Object".to_string(),
+            },
+            &mut world,
+            &mut selection,
+            None,
+            &mut vm,
+        );
+        assert!(
+            unbuildable.is_empty(),
+            "an unbuildable shape must yield no fragment, got {unbuildable:?}"
+        );
+    }
+
+    /// The real GUI boots from a DB image (S22), not `world/*.mst` directly.
+    /// `33_smappl.mst` must survive that import/export round trip — S22 found
+    /// several image_store fidelity bugs, so a widget rendering through the
+    /// `.mst` boot is no guarantee it renders through the DB boot the shell
+    /// actually uses. Seed → DB-boot → render the same button.
+    #[test]
+    fn smappl_renders_through_a_db_booted_vm() {
+        let world_dir = test_world_dir();
+        let tmp =
+            std::env::temp_dir().join(format!("macvm_smappl_db_{}.sqlite3", std::process::id()));
+        std::fs::remove_file(&tmp).ok();
+        let image = open_or_seed_image(&world_dir, &tmp).expect("seed");
+
+        let mut vm = VmHandle::boot_without_world(macvm::runtime::VmOptions {
+            heap_mib: 64,
+            jit: macvm::runtime::JitMode::Off,
+            ..Default::default()
+        });
+        crate::world_boot::load_world_from_image(&mut vm, &image, WORLD_DOITS).expect("db load");
+
+        let html = vm
+            .render_fragment("Button labeled: 'DB' action: [ :b | b ]")
+            .expect("the smappl classes must render through a DB-booted VM");
+        assert!(
+            html.contains("smappl-button") && html.contains("DB"),
+            "the DB-booted world must render a live button, got {html:?}"
+        );
+
+        std::fs::remove_file(&tmp).ok();
     }
 
     #[test]

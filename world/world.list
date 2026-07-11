@@ -41,3 +41,5 @@
 30_date_time.mst
 31_readwritestream.mst
 32_object_protocol_gaps.mst
+# G2 smappl: image-side Visual/Button/Glue widget layer (gui/smappl.md).
+33_smappl.mst

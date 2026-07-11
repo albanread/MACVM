@@ -352,25 +352,52 @@ concrete addition to G2's task list rather than an open question.
 
 ## 6. Current MACVM status and what's next
 
-**Today (G0):** `src/preprocess.rs`'s `rewrite_smappl_placeholders` rewrites
-every `<smappl visual="CODE">` (no closing tag, multiline values collapsed
-to a single line) into an inert `<span class="smappl" data-code="CODE">`
-showing the collapsed code as its own label — a correct, cited-accurate
-implementation of the *parsing* half of `smappl` (§2 above), with none of
-the *evaluation* half yet (§2's `Smalltalk evaluate:ifError:` / `Visual
-coerce:` step, §3's vocabulary, §4's fragment rendering).
+**G0 (parsing half, done earlier):** `gui/src/preprocess.rs`'s
+`rewrite_smappl_placeholders` rewrites every `<smappl visual="CODE">` (no
+closing tag, multiline values collapsed to a single line) into a
+`<span class="smappl" data-code="CODE">` — a correct, cited-accurate
+implementation of the *parsing* half of `smappl` (§2 above).
 
-**G2+ (needs core eval + reflection, `PLAN.md` §6 / `docs/APPS.md`):**
-- Evaluate `visual=` the same way `doit=` will be evaluated (`VmHandle::eval`,
-  SPEC §16.1–16.2), swallowing errors into the transcript per §2's
-  `ifError:` behavior rather than surfacing them as broken pages.
-- Coerce/require the result to be one of the vocabulary shapes in §3 — a
-  fixed, closed set for G2 (per `PLAN.md` §5's risk note: "anything else
-  renders as the G0 placeholder box").
-- Render via `HtmlWriter` (`docs/APPS.md` §6) using the Visual→CSS mapping
-  in §4, reusing the per-element caching idea (`visualRegistry` →
-  `ToolNode`'s node-id/DOM-id registry) so expand/collapse and button state
-  survive relayout the same way it did in real Strongtalk.
+**G2 first live slice (done — button/glue/side-effect shapes 1, 2, 6):** the
+*evaluation* half now runs for the shapes that don't need reflection. The
+placeholder span additionally carries a `data-widget-id`; on page load
+`smtk.js` posts `{kind:"smappl", id, code}` per span, the GUI worker calls
+`VmHandle::render_fragment` (`src/embed.rs`), and `main.rs` swaps the span's
+`outerHTML` for the answer (D-G5). `render_fragment` wraps the source as
+`(Visual coerce: (CODE)) htmlFragment.` — exactly §2's `ElementSMAPPL` shape
+— and returns the resulting `String`'s **raw** bytes (not a `printString`,
+which would re-quote it); a render failure is swallowed to an `Err` so the
+GUI keeps the G0 placeholder box, matching §2's `ifError:` discipline.
+
+The Visuals render **themselves** to HTML image-side (`world/33_smappl.mst`,
+per `docs/APPS.md` §6 / amendment A19 — Rust only transports the string):
+`Visual` (`coerce:`/`htmlFragment`), `Glue xRigid:`, and `Button
+labeled:action:` / `withImage:action:`. Live widget actions are closures
+kept in `SmapplRegistry` (a `<classVars:>` id→widget dictionary — the
+`visualRegistry` analog of §2), keyed by the opaque id the fragment carries
+in `data-widget-action`; a click posts `{kind:"smapplAction", id}` and the
+worker runs `SmapplRegistry fire: id` (`../PLAN.md` G1's "route by opaque id
+through a worker-owned handler table"). CSS: `.smappl-button` renders the
+period Win95 raised bevel under the classic `strongtalk.css` theme and a
+`currentColor`-keyed flat button under the six alternative themes (the
+`--st-*` bevel is invisible on the dark/`--hd-*` themes). Covered by tests in
+`src/embed.rs` and `gui/src/vm_host.rs` (including a **DB-boot** render, the
+path the real GUI actually uses — S22 fidelity risk).
+
+**G2+ remainder (needs the Phase-W mirror stack, `docs/APPS.md` §2/§6):**
+- The **outliner and `CodeView` shapes** (§3.3–3.5) — including
+  `startPage.html`'s own `ClassHierarchyOutliner imbeddedVisualForClass:
+  Object`, the most prominent smappl in the corpus. These need `ClassMirror`/
+  `MethodMirror` + an `HtmlWriter`/`ToolNode` framework; until W2 they fail
+  the render and stay the G0 placeholder box (§3's "anything else renders as
+  the placeholder", already the built behavior).
+- Per-element **caching across relayout** (`visualRegistry` → `ToolNode`'s
+  node-id/DOM-id registry) so expand/collapse and button state survive
+  reflow — the slice re-renders on each load rather than caching.
 - Route `Image fromFile: (FilePath for: 'resources/NAME.bmp')` through
-  `Theme::icon_url(NAME)` (§5) instead of loading the literal path, so
-  smappl-built buttons theme correctly for free.
+  `Theme::icon_url(NAME)` (§5) instead of carrying the raw path in
+  `data-icon`, so icon buttons theme for free. The `Image`/`FilePath` stubs
+  in `world/33_smappl.mst` already reduce a `withImage:` argument to its
+  logical name; the Rust-side theme resolution is the missing half.
+- **HTML-escape** widget label text (the shipped corpus labels are
+  ASCII-safe, so the slice omits it).

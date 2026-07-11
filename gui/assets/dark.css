@@ -305,3 +305,24 @@ ul li::before {
 }
 ::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.26); }
 ::-webkit-scrollbar-button { width: 0; height: 0; display: none; }
+
+
+/* ---- smappl live widgets (G2): theme-neutral button (../smappl.md §3). ---- */
+/* The classic strongtalk.css theme overrides this with the period Win95 */
+/* bevel; the alternative themes here render a flat button visible on any */
+/* background by keying off currentColor (the theme's own text color). */
+.smappl-button {
+  font: inherit;
+  padding: 3px 12px;
+  margin: 0 3px;
+  color: inherit;
+  background: color-mix(in srgb, currentColor 10%, transparent);
+  border: 1px solid color-mix(in srgb, currentColor 45%, transparent);
+  border-radius: 4px;
+  box-shadow: none;
+  cursor: pointer;
+}
+.smappl-button:hover  { background: color-mix(in srgb, currentColor 18%, transparent); }
+.smappl-button:active { background: color-mix(in srgb, currentColor 30%, transparent); }
+.smappl-icon { vertical-align: middle; }
+.glue { vertical-align: middle; }

@@ -665,6 +665,25 @@ extern "C" fn on_script_message(_this: Id, _cmd: Sel, _controller: Id, message: 
         "editAction" => {
             send_edit_action(&dict_get_string(body, "action"));
         }
+        "smappl" => {
+            // A `<smappl>` placeholder on the loaded page asks to be rendered
+            // (smtk.js posts one per span on load). The worker evaluates the
+            // `visual=` code and answers a fragment (D-G5, ../smappl.md).
+            if let Some(vm) = VM.get() {
+                vm.submit(vm_host::VmRequest::SmapplRender {
+                    id: dict_get_string(body, "id"),
+                    code: dict_get_string(body, "code"),
+                });
+            }
+        }
+        "smapplAction" => {
+            // A rendered smappl widget was clicked — fire its action closure.
+            if let Some(vm) = VM.get() {
+                vm.submit(vm_host::VmRequest::SmapplAction {
+                    action_id: dict_get_string(body, "actionId"),
+                });
+            }
+        }
         _ => {}
     }
 }
@@ -975,6 +994,17 @@ extern "C" fn vm_bridge_drain(_this: Id, _cmd: Sel, _arg: Id) {
                 // This variant exists for a future GUI-side content
                 // cache/replay-on-reopen (`../docs/CANVAS.md` §7) to
                 // invalidate against, not for anything the DOM needs today.
+            }
+            vm_host::VmResponse::SmapplFragment { id, html } => {
+                // Swap the placeholder span with `data-widget-id == id` for
+                // the rendered widget (D-G5, ../smappl.md). smtk.js locates it
+                // by the widget id rather than a DOM `id`, so this can't
+                // collide with the page's own element ids.
+                eval_js(&format!(
+                    "window.macvmRenderSmappl({}, {})",
+                    js_string_literal(&id),
+                    js_string_literal(&html)
+                ));
             }
             vm_host::VmResponse::WorkerIdle => {
                 // Never actually delivered here — `VmHost::drain_responses`

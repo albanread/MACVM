@@ -60,6 +60,18 @@
         return;
       }
 
+      // A rendered smappl widget (Button etc., ../smappl.md §3) — the
+      // fragment carries the opaque action id the VM worker stored in
+      // SmapplRegistry; clicking posts it back so `SmapplRegistry fire:`
+      // runs the widget's action closure (../PLAN.md G1: route by id
+      // through the worker-owned handler table).
+      const widgetAction = ev.target.closest("[data-widget-action]");
+      if (widgetAction) {
+        ev.preventDefault();
+        post({ kind: "smapplAction", actionId: widgetAction.getAttribute("data-widget-action") || "" });
+        return;
+      }
+
       const toolbtn = ev.target.closest(".st-toolbtn");
       if (toolbtn) {
         ev.preventDefault();
@@ -551,10 +563,36 @@
     if (ev.key === "Escape") closeContextMenu();
   });
 
+  // ── smappl widgets (../smappl.md, ../src/preprocess.rs) ────────────────
+  //
+  // Each `<span class="smappl" data-widget-id data-code>` is an inert G0
+  // placeholder until the VM renders its `visual=` expression. On load we
+  // post one `{kind:"smappl"}` per span; the worker answers with an HTML
+  // fragment that `main.rs` hands to `macvmRenderSmappl`, which swaps the
+  // span for the live widget (D-G5). A shape the VM can't build yet just
+  // never gets swapped, so the placeholder box remains — no broken page.
+
+  function requestSmapplRenders() {
+    document.querySelectorAll("span.smappl[data-widget-id]").forEach(function (span) {
+      post({
+        kind: "smappl",
+        id: span.getAttribute("data-widget-id") || "",
+        code: span.getAttribute("data-code") || "",
+      });
+    });
+  }
+
+  // vm_host::VmResponse::SmapplFragment arrives here (main.rs).
+  window.macvmRenderSmappl = function (widgetId, html) {
+    const span = document.querySelector('span.smappl[data-widget-id="' + widgetId + '"]');
+    if (span) span.outerHTML = html;
+  };
+
   // The script tag lives in <head> (chrome_head_extra), so <body> — and
   // any .st-code-editor in it — doesn't exist yet when this file first
   // runs; the initial highlight has to wait for the DOM to actually load.
   document.addEventListener("DOMContentLoaded", function () {
     window.macvmHighlightCodeEditors();
+    requestSmapplRenders();
   });
 })();

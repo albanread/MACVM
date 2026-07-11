@@ -1,0 +1,145 @@
+"33_smappl.mst — the image-side half of the `<smappl visual=...>` tag
+ (gui/smappl.md §3 shapes 1/2/6: icon button, labeled button, glue/side-effect).
+
+ A visual= expression evaluates to a Visual; `VmHandle::render_fragment`
+ sends it #htmlFragment and splices the answer into the page (GUI decision
+ D-G5 / docs/APPS.md §6: the Visual renders ITSELF to HTML — Rust only
+ transports the string). Live widget actions are closures kept in
+ SmapplRegistry, keyed by an opaque id the rendered HTML carries in
+ `data-widget-action`; a click posts {kind:smapplAction,id}, which the GUI
+ worker turns into `SmapplRegistry fire: id` (gui/PLAN.md G1: route by opaque
+ id through a worker-owned handler table).
+
+ Scope: the button/glue/side-effect shapes only. The outliner/CodeView
+ shapes (gui/smappl.md §3.3-3.5) need the Phase-W mirror stack (docs/APPS.md
+ §2) and render as the G0 placeholder box until then. HTML escaping of labels
+ is deliberately omitted here (the shipped corpus labels are ASCII-safe) — a
+ follow-up when arbitrary label text becomes reachable."
+
+"--- SmapplRegistry: opaque-id -> live widget (the visualRegistry analog) ---"
+Object subclass: SmapplRegistry [
+    <classVars: Widgets Counter>
+
+    SmapplRegistry class >> reset [
+        Widgets := Dictionary new.
+        Counter := 0.
+    ]
+    SmapplRegistry class >> register: aVisual [
+        "Stash a widget under a fresh opaque id and answer the id."
+        | id |
+        Widgets isNil ifTrue: [ self reset ].
+        Counter := Counter + 1.
+        id := 'w', Counter printString.
+        Widgets at: id put: aVisual.
+        ^id
+    ]
+    SmapplRegistry class >> fire: id [
+        "A rendered widget was clicked: run its action. Unknown id = no-op
+         (a stale fragment from before the last reset)."
+        Widgets isNil ifTrue: [ ^nil ].
+        ^(Widgets at: id ifAbsent: [ ^nil ]) activate
+    ]
+]
+
+"--- Visual: base of the embeddable widget hierarchy ---"
+Object subclass: Visual [
+    Visual class >> coerce: anObject [
+        "The generic dynamic cast ElementSMAPPL uses (gui/smappl.md §2). MACVM
+         trusts the value; a non-Visual falls through to #htmlFragment, whose
+         DNU render_fragment turns into the placeholder box."
+        ^anObject
+    ]
+    htmlFragment [
+        "Default: an inert placeholder. Real widgets override."
+        ^'<span class="smappl-box">smappl</span>'
+    ]
+    activate [
+        "Click hook; a plain Visual does nothing."
+        ^self
+    ]
+]
+
+"--- Glue: an invisible rigid spacer (gui/smappl.md §3 shape 6) ---"
+Visual subclass: Glue [
+    | size |
+    Glue class >> xRigid: n [
+        ^self basicNew setSize: n
+    ]
+    setSize: n [
+        size := n.
+        ^self
+    ]
+    htmlFragment [
+        ^'<span class="glue" style="display:inline-block;width:', size printString, 'px"></span>'
+    ]
+]
+
+"--- Button: labeled (shape 2) and icon (shape 1) push buttons ---"
+Visual subclass: Button [
+    | label iconName action |
+    Button class >> labeled: aString action: aBlock [
+        ^self basicNew setLabel: aString action: aBlock
+    ]
+    Button class >> withImage: anImage action: aBlock [
+        "anImage answers a logical icon name (see Image>>logicalName). The GUI
+         resolves it to a theme-appropriate asset at insertion time
+         (gui/smappl.md §5), so the image side stays theme-agnostic."
+        ^self basicNew setIcon: anImage logicalName action: aBlock
+    ]
+    setLabel: aString action: aBlock [
+        label := aString.
+        action := aBlock.
+        ^self
+    ]
+    setIcon: aName action: aBlock [
+        iconName := aName.
+        action := aBlock.
+        ^self
+    ]
+    activate [
+        action isNil ifTrue: [ ^self ].
+        ^action value: self
+    ]
+    htmlFragment [
+        | id inner |
+        id := SmapplRegistry register: self.
+        inner := iconName isNil
+            ifTrue: [ label ]
+            ifFalse: [ '<img class="smappl-icon" data-icon="', iconName, '">' ].
+        ^'<button class="smappl-button bevel-raised" data-widget-action="', id, '">', inner, '</button>'
+    ]
+]
+
+"--- Image/FilePath: just enough to carry an icon path (gui/smappl.md §5) ---"
+Object subclass: FilePath [
+    | path |
+    FilePath class >> for: aString [
+        ^self basicNew setPath: aString
+    ]
+    setPath: s [
+        path := s.
+        ^self
+    ]
+    path [
+        ^path
+    ]
+]
+
+Object subclass: Image [
+    | source |
+    Image class >> fromFile: aFilePath [
+        ^self basicNew setSource: aFilePath
+    ]
+    setSource: fp [
+        source := fp.
+        ^self
+    ]
+    logicalName [
+        "The raw path, e.g. 'resources/edit.bmp'; the GUI strips the
+         resources/ prefix and .bmp suffix and maps the name through the
+         active theme (gui/smappl.md §5)."
+        ^source path
+    ]
+]
+
+SmapplRegistry reset.

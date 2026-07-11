@@ -136,14 +136,18 @@ fn rewrite_doit_links(html: &str) -> String {
 }
 
 /// Rewrite `<smappl visual="CODE">` (no closing tag in the corpus — see
-/// this module's doc comment) → a self-contained, styled placeholder
-/// `<span>` naming the code, per G0's scope ("smappl placeholder =
-/// lowered-bevel box naming its code" — `../PLAN.md` §G0). G2 replaces this
-/// with a real server-rendered fragment (D-G5); this function only needs to
-/// exist until then.
+/// this module's doc comment) → a placeholder `<span>` carrying the code and
+/// a stable `data-widget-id`. The span starts as the G0 lowered-bevel box
+/// naming its code; on page load `smtk.js` posts a `{kind:"smappl"}` message
+/// per span, the VM worker renders the `visual=` expression to an HTML
+/// fragment (`VmHandle::render_fragment`, D-G5), and `main.rs` swaps the
+/// span's `outerHTML` for it — so the box is only what the user sees for the
+/// instant before the live widget arrives, or permanently if the shape isn't
+/// buildable yet (the render fails and the box stays).
 fn rewrite_smappl_placeholders(html: &str) -> String {
     let mut out = String::with_capacity(html.len());
     let mut rest = html;
+    let mut widget_seq = 0usize;
     loop {
         let Some(tag_start) = rest.find("<smappl") else {
             out.push_str(rest);
@@ -178,10 +182,12 @@ fn rewrite_smappl_placeholders(html: &str) -> String {
         // single-line attribute value is simpler to read/debug either way.
         let collapsed = code.split_whitespace().collect::<Vec<_>>().join(" ");
         out.push_str(&format!(
-            "<span class=\"smappl\" data-code=\"{}\">{}</span>",
+            "<span class=\"smappl\" data-widget-id=\"s{}\" data-code=\"{}\">{}</span>",
+            widget_seq,
             html_escape_attr(&collapsed),
             html_escape_text(&collapsed)
         ));
+        widget_seq += 1;
         rest = &after_close_quote[tag_end_rel + 1..];
     }
     out
