@@ -7980,3 +7980,201 @@ fn b5_step4_blockarg_block_budget_bonus() {
         "compiled b5sum44: differential"
     );
 }
+
+/// S24 B5 step 6 (B3): THE FLAGSHIP SHAPE — a conditional-NLR block passed
+/// to a SELF-send (`self inputsDo: [...]`) whose IC is genuinely POLY (the
+/// method is inherited by two klasses with different inputsDo:). Each
+/// customized compile devirtualizes the send per its OWN rcvr_klass and
+/// grafts that klass's inputsDo: with the block spliced inside. The two
+/// callees produce DIFFERENT answers (CA's inputs cross the threshold, CB's
+/// don't), so a wrong-callee devirt flips the output — the differential is
+/// the soundness oracle, the needles pin that the splice actually fired.
+const B3_POLY_SELF_BLOCKARG: &str = r#"
+Object subclass: CA [
+    inputsDo: aBlock [ aBlock value: 5. aBlock value: 15 ]
+    known: n [ self inputsDo: [:v | v > n ifTrue: [ ^false ] ]. ^true ]
+]
+CA subclass: CB [
+    inputsDo: aBlock [ aBlock value: 2 ]
+]
+Object subclass: B3Drive [
+    drive [ | a b t |
+        a := CA new. b := CB new. t := 0.
+        1 to: 300 do: [:i |
+            (a known: 10) ifTrue: [ t := t + 1 ].
+            (b known: 10) ifTrue: [ t := t + 100 ] ].
+        ^t ]
+]
+Transcript show: (B3Drive new drive) printString; cr.
+Smalltalk quit: 0.
+"#;
+
+#[test]
+fn b3_poly_self_blockarg_devirt_splices() {
+    osr_phase_b_differential(
+        "b3_poly",
+        B3_POLY_SELF_BLOCKARG,
+        &[],
+        false,
+        &["blocks_spliced_multibb=3", "blocks_spliced_nlr=3"],
+    );
+}
+
+#[test]
+fn b3_poly_self_blockarg_stress() {
+    osr_phase_b_differential(
+        "b3_poly_ds",
+        B3_POLY_SELF_BLOCKARG,
+        &[("MACVM_DEOPT_STRESS", "64")],
+        false,
+        &[],
+    );
+    osr_phase_b_differential(
+        "b3_poly_gc",
+        B3_POLY_SELF_BLOCKARG,
+        &[("MACVM_GC_STRESS", "full:64")],
+        false,
+        &[],
+    );
+}
+
+/// S24 B3 (escape half): a self-receiver block-arg send with an UNTAKEN IC
+/// classifies per the analysis klass — devirt resolves k>>iter: statically,
+/// so `analyze_customized(Some(k))` splices where klass-free `analyze`
+/// (Mono required) marks the site escaping. The devirt consult also sets
+/// `klass_sensitive` (the driver's NoPermanent-vs-NoRetryLater pivot).
+#[test]
+fn b3_escape_self_blockarg_devirt_classification() {
+    let mut vm = test_vm();
+    let smi_klass = vm.universe.smi_klass;
+
+    // smi >> iter: aBlock [ aBlock value: 42. ^self ] — block-arg transparent.
+    let value1_sel = vm.universe.intern(b"value:");
+    let iter_sel = vm.universe.intern(b"iter:");
+    let mut ib = BytecodeBuilder::new();
+    ib.push_temp(0);
+    ib.push_smi_i8(42);
+    ib.send(&mut vm, value1_sel, 1);
+    ib.pop();
+    ib.ret_self();
+    let iter = ib.finish(&mut vm, iter_sel, 1, 0);
+    install_method(&mut vm, smi_klass, iter_sel, iter);
+
+    // m [ self iter: [:v | v + 1]. ^self ] — the iter: IC is UNTAKEN (never
+    // run interpreted), which the devirt path ignores entirely.
+    let plus_sel = vm.universe.intern(b"+");
+    let m_sel = vm.universe.intern(b"b3m");
+    let mut b = BytecodeBuilder::new();
+    let lit = b.build_block(&mut vm, 1, 0, false, 0, false, |blk, vm| {
+        blk.push_temp(0);
+        blk.push_smi_i8(1);
+        blk.send(vm, plus_sel, 1);
+        blk.block_return_tos();
+    });
+    b.push_self();
+    b.push_closure(lit, 0);
+    b.send(&mut vm, iter_sel, 1);
+    b.pop();
+    b.ret_self();
+    let m = b.finish(&mut vm, m_sel, 0, 0);
+    install_method(&mut vm, smi_klass, m_sel, m);
+
+    // Klass-free: Mono required, IC untaken → site escapes.
+    let e_none = macvm::compiler::escape::analyze(&vm, m);
+    assert!(
+        !e_none.all_elidable,
+        "no klass, untaken IC: site must escape"
+    );
+    assert!(
+        !e_none.klass_sensitive,
+        "the devirt path was never consulted"
+    );
+
+    // Customized: statically resolves smi>>iter:, splices, flags sensitivity.
+    let e_k = macvm::compiler::escape::analyze_customized(&vm, m, Some(smi_klass));
+    assert!(
+        e_k.all_elidable,
+        "customized analysis must devirt the self-send and splice the block"
+    );
+    assert!(e_k.klass_sensitive, "the devirt path decided the verdict");
+}
+
+/// S24 B3 (the poisoning regression): a klass-SENSITIVE ineligibility must
+/// NOT set the method-wide compile_disabled bit. `bad:`'s iter: under
+/// KBad has a super send (not CFG-inlinable) → the site escapes → the
+/// NLR-bearing block makes M ineligible UNDER KBAD — but the same shared
+/// method compiles fine under KGood, whose iter: is clean. Before B3's
+/// NoRetryLater mapping, the KBad attempt would set_compile_disabled and
+/// permanently block KGood's compile too.
+#[test]
+fn b3_klass_sensitive_nopermanent_does_not_poison() {
+    let mut vm = test_vm();
+    install_value_prims(&mut vm);
+    let object_klass = vm.universe.object_klass;
+    let kgood = vm.universe.new_klass(
+        object_klass,
+        "KGood",
+        macvm::oops::klass::Format::Slots,
+        false,
+        macvm::oops::layout::HEADER_WORDS,
+    );
+    let kbad = vm.universe.new_klass(
+        object_klass,
+        "KBad",
+        macvm::oops::klass::Format::Slots,
+        false,
+        macvm::oops::layout::HEADER_WORDS,
+    );
+
+    let value1_sel = vm.universe.intern(b"value:");
+    let iter_sel = vm.universe.intern(b"iter:");
+    // KGood>>iter: aBlock [ aBlock value: 7. ^self ]
+    let mut gb = BytecodeBuilder::new();
+    gb.push_temp(0);
+    gb.push_smi_i8(7);
+    gb.send(&mut vm, value1_sel, 1);
+    gb.pop();
+    gb.ret_self();
+    let good_iter = gb.finish(&mut vm, iter_sel, 1, 0);
+    install_method(&mut vm, kgood, iter_sel, good_iter);
+    // KBad>>iter: aBlock [ super foo. ^self ] — super send: never inlinable.
+    let foo_sel = vm.universe.intern(b"foo");
+    let mut bb = BytecodeBuilder::new();
+    bb.push_self();
+    bb.send_super(&mut vm, foo_sel, 0);
+    bb.pop();
+    bb.ret_self();
+    let bad_iter = bb.finish(&mut vm, iter_sel, 1, 0);
+    install_method(&mut vm, kbad, iter_sel, bad_iter);
+
+    // Shared m (installed on Object): self iter: [:v | ^nil]. The NLR block
+    // makes an ESCAPING classification fatal (NLR-bearing escaping block).
+    let m_sel = vm.universe.intern(b"b3shared");
+    let mut b = BytecodeBuilder::new();
+    let lit = b.build_block(&mut vm, 1, 0, false, 0, false, |blk, _vm| {
+        blk.push_nil();
+        blk.nlr_tos();
+    });
+    b.push_self();
+    b.push_closure(lit, 0);
+    b.send(&mut vm, iter_sel, 1);
+    b.pop();
+    b.ret_self();
+    let m = b.finish(&mut vm, m_sel, 0, 0);
+    install_method(&mut vm, object_klass, m_sel, m);
+
+    // Under KBad: ineligible (iter: has a super send) — but klass-SENSITIVE,
+    // so the method-wide bit must stay clear.
+    assert!(driver::compile_method(&mut vm, kbad, m).is_none());
+    assert!(
+        !m.compile_disabled(),
+        "a klass-sensitive ineligibility must not poison the shared method"
+    );
+    // Under KGood: compiles, block spliced.
+    let before = vm.stats.blocks_spliced_nlr;
+    assert!(
+        driver::compile_method(&mut vm, kgood, m).is_some(),
+        "the same shared method must compile under the good klass"
+    );
+    assert!(vm.stats.blocks_spliced_nlr > before, "NLR block spliced");
+}

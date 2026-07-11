@@ -24,14 +24,21 @@ use std::collections::{HashMap, HashSet};
 use crate::bytecode::opcode::{decode_at, Instr};
 use crate::compiler::decode::{self, Cfg, Terminator};
 use crate::interpreter::ic::{ic_state, IcState, InterpreterIc};
-use crate::oops::wrappers::MethodOop;
+use crate::oops::wrappers::{KlassOop, MethodOop};
 
 /// Abstract value of one operand-stack slot or temp slot. `Site(bci)` names the
 /// `push_closure` bci that produced this (still-tracked) closure reference;
-/// `Other` is any value whose closure-identity we don't (or no longer) track.
+/// `Slf` (S24 B5 step 6 / B3) is a value pushed by `push_self` that has NOT
+/// round-tripped through a temp — deliberately NARROW so it coincides
+/// exactly with `ir::convert`'s own `receiver == self_vreg` check at the
+/// same send (both track direct stack flow from push_self; a temp store
+/// degrades it to `Other` here because convert may not alias the temp slot
+/// to `self_vreg`). `Other` is any value whose identity we don't (or no
+/// longer) track.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum AV {
     Site(usize),
+    Slf,
     Other,
 }
 
@@ -56,7 +63,13 @@ pub struct ClosureEscape {
     /// send passing the site's block as its ONLY block argument to a callee
     /// proven BLOCK-ARG TRANSPARENT ([`block_arg_transparent`]): the callee
     /// will be CFG-inlined and the block spliced at its `value` sites inside.
-    blockarg_sends: HashMap<usize, (usize, usize)>,
+    blockarg_sends: HashMap<usize, (usize, usize, bool)>,
+    /// S24 B3: true iff any block-arg classification consulted the
+    /// `rcvr_klass` self-devirt path — the whole verdict is then a function
+    /// of the customization klass. The driver maps a klass-sensitive
+    /// NoPermanent to NoRetryLater so the METHOD-WIDE compile_disabled bit
+    /// is never set from a per-klass answer (another klass may compile).
+    pub klass_sensitive: bool,
 }
 
 impl ClosureEscape {
@@ -127,11 +140,8 @@ impl ClosureEscape {
 
     /// S14 step 7-IV-c: the `(site id, arg index)` a BLOCK-ARG send at `bci`
     /// threads into its inlined callee — `Some` only for a proven good use.
-    pub fn blockarg_send_target(&self, bci: usize) -> Option<(usize, usize)> {
-        self.blockarg_sends
-            .get(&bci)
-            .copied()
-            .filter(|(s, _)| !self.escaping.contains(s))
+    pub fn blockarg_send_target(&self, bci: usize) -> Option<(usize, usize, bool)> {
+        self.blockarg_sends.get(&bci).copied()
     }
 }
 
@@ -254,6 +264,12 @@ struct State {
 fn merge_slot(slot: AV, incoming: AV, escaping: &mut HashSet<usize>) -> AV {
     match (slot, incoming) {
         (AV::Site(a), AV::Site(b)) if a == b => AV::Site(a),
+        // S24 B3: `Slf` dies at ANY join — even Slf∨Slf. A CFG merge gives
+        // convert a FRESH merge vreg (never `self_vreg`), so a merged self
+        // would break the `devirt ⇒ receiver == self_vreg` correspondence
+        // (`(c ifTrue:[self] ifFalse:[self]) iter: [...]`). Straight-line
+        // flow only — exactly convert's aliasing domain.
+        (AV::Slf, AV::Slf) => AV::Other,
         (a, b) if a == b => a,
         // A Site meeting anything else (or a different Site): both sites lose
         // precise tracking → escape, and the merged slot is opaque.
@@ -420,62 +436,81 @@ fn block_arg_transparent(d: MethodOop, arg_ix: usize, blk_argc: usize) -> bool {
 /// block-arg budget (SPEC §8.4's block-argument bonus — inlining the callee is
 /// what unlocks inlining its block argument), the block itself fits the plain
 /// budget, and the callee is transparent in that arg.
+#[allow(clippy::too_many_arguments)]
 fn blockarg_candidate_ok(
     vm: &crate::runtime::vm_state::VmState,
     method: MethodOop,
     ic: u16,
     arg_ix: usize,
     site_bci: usize,
-) -> bool {
+    recv_is_self: bool,
+    rcvr_klass: Option<KlassOop>,
+    klass_sensitive: &mut bool,
+) -> Option<bool> {
     let (instr, _) = decode_at(method, site_bci);
     let Instr::PushClosure { lit, .. } = instr else {
-        return false;
+        return None;
     };
-    let Some(blk) = MethodOop::try_from(method.literals().at(lit as usize)) else {
-        return false;
-    };
+    let blk = MethodOop::try_from(method.literals().at(lit as usize))?;
     // S24 B5 step 5: block-arg sites accept the same relaxed forward-only
     // multi-BB predicate as direct value sites (the graft engine handles
     // both; the in-callee split is the H6 cur_id threading in ir.rs).
     // Flipped ON after the deopt materializer's cross-frame read hazard
     // was closed (the deferred-fixup phase in deoptimize_frame, B5 5b).
     if !block_is_spliceable_cfg(blk) {
-        return false;
-    }
-    if !matches!(ic_state(method, ic), IcState::Mono) {
-        return false;
+        return None;
     }
     let site = InterpreterIc::at(method, ic);
-    // S24 B1: a mono site's target is either the MethodOop itself or — when
-    // the callee compiled before this caller (set_mono_compiled's seed; far
-    // MORE common since trigger unification compiles callees earlier) — a
-    // smi NmethodId. The old code bailed conservatively on the smi form,
-    // which meant the HOTTEST callees (compiled ones!) were exactly the ones
-    // that never block-arg-inlined. Resolve the id through the code table's
-    // (key_klass, key_selector) via dynamic lookup — dispatch-truth included
-    // by construction (lookup returns what a send finds TODAY, so a
-    // redefined/shadowed method never inlines stale).
-    let d = match MethodOop::try_from(site.target()) {
-        Some(d) => d,
-        None => {
-            let resolved = crate::oops::smi::SmallInt::try_from(site.target())
-                .map(|s| crate::codecache::nmethod::NmethodId(s.value() as u32))
-                .and_then(|id| vm.code_table.get(id))
-                .filter(|nm| matches!(nm.state, crate::codecache::nmethod::NmState::Alive))
-                .and_then(|nm| {
-                    crate::runtime::lookup::lookup_uncached(vm, nm.key_klass, nm.key_selector)
-                });
-            match resolved {
-                Some(d) => d,
-                None => return false,
-            }
+    // S24 B5 step 6 (B3): a SELF-receiver site with a known customization
+    // klass devirtualizes — resolve statically per rcvr_klass, IGNORING the
+    // IC entirely. The IC of a shared method is receiver-klass-agnostic: it
+    // may be Poly (many klasses' callees — the inputsDo: shape), or even
+    // Mono on a DIFFERENT customization's klass, in which case a guarded
+    // splice would fail its guard on every call here. Convert's
+    // splice_blockarg_send mirrors this branch bit-identically (keyed on
+    // receiver == self_vreg, which AV::Slf's narrow tracking matches by
+    // construction) via the same resolve_method_ro. The verdict now depends
+    // on rcvr_klass, so flag it: a NoPermanent computed from a
+    // klass-sensitive analysis must not set the method-wide
+    // compile_disabled bit (another klass may compile fine).
+    let (d, devirt) = if let (true, Some(k)) = (recv_is_self, rcvr_klass) {
+        *klass_sensitive = true;
+        let d = crate::compiler::feedback::resolve_method_ro(vm, k, site.selector())?;
+        (d, true)
+    } else {
+        if !matches!(ic_state(method, ic), IcState::Mono) {
+            return None;
         }
+        // S24 B1: a mono site's target is either the MethodOop itself or —
+        // when the callee compiled before this caller (set_mono_compiled's
+        // seed; far MORE common since trigger unification compiles callees
+        // earlier) — a smi NmethodId. The old code bailed conservatively on
+        // the smi form, which meant the HOTTEST callees (compiled ones!)
+        // were exactly the ones that never block-arg-inlined. Resolve the id
+        // through the code table's (key_klass, key_selector) via dynamic
+        // lookup — dispatch-truth included by construction (lookup returns
+        // what a send finds TODAY, so a redefined/shadowed method never
+        // inlines stale).
+        let d = match MethodOop::try_from(site.target()) {
+            Some(d) => d,
+            None => {
+                let resolved = crate::oops::smi::SmallInt::try_from(site.target())
+                    .map(|s| crate::codecache::nmethod::NmethodId(s.value() as u32))
+                    .and_then(|id| vm.code_table.get(id))
+                    .filter(|nm| matches!(nm.state, crate::codecache::nmethod::NmState::Alive))
+                    .and_then(|nm| {
+                        crate::runtime::lookup::lookup_uncached(vm, nm.key_klass, nm.key_selector)
+                    });
+                resolved?
+            }
+        };
+        (d, false)
     };
     if d.primitive() != 0
         || d.argc() != site.argc() as usize
         || !crate::compiler::inline::is_inline_eligible_cfg(d)
     {
-        return false;
+        return None;
     }
     let budget = crate::compiler::inline::budget_for_level(1);
     // S24 B5 step 4: the block now gets the SAME 2x bonus as the callee --
@@ -485,9 +520,12 @@ fn blockarg_candidate_ok(
     if crate::compiler::inline::inline_cost(d) > budget.per_call_cost * 2
         || crate::compiler::inline::inline_cost(blk) > budget.per_call_cost * 2
     {
-        return false;
+        return None;
     }
-    block_arg_transparent(d, arg_ix, blk.argc())
+    if !block_arg_transparent(d, arg_ix, blk.argc()) {
+        return None;
+    }
+    Some(devirt)
 }
 
 /// The escape pre-pass. `method` is M (the ROOT method being considered for
@@ -498,13 +536,35 @@ fn blockarg_candidate_ok(
 /// empty `sites` set) — the driver only runs this when M contains a
 /// `push_closure`, but the result is well-defined either way.
 pub fn analyze(vm: &crate::runtime::vm_state::VmState, method: MethodOop) -> ClosureEscape {
+    analyze_customized(vm, method, None)
+}
+
+/// S24 B5 step 6 (B3): [`analyze`] with the compilation's CUSTOMIZATION
+/// klass. A SELF-receiver block-arg send then devirtualizes: the callee
+/// resolves statically per `rcvr_klass` (the nmethod's entry guard proves
+/// every receiver has exactly this klass), independent of the send's IC —
+/// which, on a method shared across receiver klasses, is Poly or even Mono
+/// on a DIFFERENT customization's callee. Every production caller
+/// (eligibility, the driver's OSR/has_ctx gate, `ir::convert`'s recompute)
+/// passes the SAME `Some(rcvr_klass)` for one compile, so all analysis runs
+/// agree; `None` (tests, klass-free contexts) disables devirt — identical
+/// to the pre-B3 behavior.
+pub fn analyze_customized(
+    vm: &crate::runtime::vm_state::VmState,
+    method: MethodOop,
+    rcvr_klass: Option<KlassOop>,
+) -> ClosureEscape {
     let cfg = decode::decode(method);
     let n_slots = method.argc() + method.ntemps();
 
     let mut sites: HashSet<usize> = HashSet::new();
     let mut escaping: HashSet<usize> = HashSet::new();
     let mut value_sends: HashMap<usize, usize> = HashMap::new();
-    let mut blockarg_sends: HashMap<usize, (usize, usize)> = HashMap::new();
+    let mut blockarg_sends: HashMap<usize, (usize, usize, bool)> = HashMap::new();
+    // S24 B3: set when any blockarg classification CONSULTED the rcvr_klass
+    // devirt path — the verdict then depends on the klass, and the driver
+    // must not cache a NoPermanent method-wide (see eligibility_detail).
+    let mut klass_sensitive = false;
     // site bci → does its block body contain any `Send`? (Its splice then has
     // in-body safepoints — see the stale-alias rule in `transfer_block`.)
     let mut site_has_sends: HashMap<usize, bool> = HashMap::new();
@@ -546,6 +606,7 @@ pub fn analyze(vm: &crate::runtime::vm_state::VmState, method: MethodOop) -> Clo
             escaping,
             value_sends,
             blockarg_sends,
+            klass_sensitive: false,
         };
     }
 
@@ -573,6 +634,8 @@ pub fn analyze(vm: &crate::runtime::vm_state::VmState, method: MethodOop) -> Clo
             &mut escaping,
             &mut value_sends,
             &mut blockarg_sends,
+            rcvr_klass,
+            &mut klass_sensitive,
         );
         // SOUNDNESS (S14 7-IV-b): a Site still LIVE at a block boundary WITH
         // SUCCESSORS escapes. A phantom closure has no compiled location — any
@@ -615,6 +678,7 @@ pub fn analyze(vm: &crate::runtime::vm_state::VmState, method: MethodOop) -> Clo
         escaping,
         value_sends,
         blockarg_sends,
+        klass_sensitive,
     }
 }
 
@@ -641,7 +705,9 @@ fn transfer_block(
     site_has_sends: &HashMap<usize, bool>,
     escaping: &mut HashSet<usize>,
     value_sends: &mut HashMap<usize, usize>,
-    blockarg_sends: &mut HashMap<usize, (usize, usize)>,
+    blockarg_sends: &mut HashMap<usize, (usize, usize, bool)>,
+    rcvr_klass: Option<KlassOop>,
+    klass_sensitive: &mut bool,
 ) {
     let cfg_block = &cfg.blocks[b];
     let mut bci = cfg_block.bci_start;
@@ -655,11 +721,14 @@ fn transfer_block(
             Instr::PushTemp(t) => st.stack.push(st.temps[t as usize]),
             Instr::StoreTempPop(t) => {
                 let v = st.stack.pop().unwrap_or(AV::Other);
-                st.temps[t as usize] = v;
+                // `Slf` dies at a temp store (see the AV doc): convert's
+                // matching check is on the receiver VREG, and a temp slot
+                // may hold a copy rather than `self_vreg` itself.
+                st.temps[t as usize] = if v == AV::Slf { AV::Other } else { v };
             }
             Instr::StoreTemp(t) => {
                 let v = *st.stack.last().unwrap_or(&AV::Other);
-                st.temps[t as usize] = v;
+                st.temps[t as usize] = if v == AV::Slf { AV::Other } else { v };
             }
             Instr::Dup => {
                 let v = *st.stack.last().unwrap_or(&AV::Other);
@@ -670,9 +739,11 @@ fn transfer_block(
                 // elidable) — OK, NO escape.
                 st.stack.pop();
             }
+            // S24 B3: `self` is tracked (narrowly — see `AV::Slf`) so a
+            // self-receiver block-arg send can devirtualize per rcvr_klass.
+            Instr::PushSelf => st.stack.push(AV::Slf),
             // Pushes that never carry a Site — push Other.
-            Instr::PushSelf
-            | Instr::PushNil
+            Instr::PushNil
             | Instr::PushTrue
             | Instr::PushFalse
             | Instr::PushSmi(_)
@@ -712,23 +783,36 @@ fn transfer_block(
                     .enumerate()
                     .filter_map(|(k, &a)| match a {
                         AV::Site(s) => Some((argc - 1 - k, s)),
-                        AV::Other => None,
+                        AV::Slf | AV::Other => None,
                     })
                     .collect();
                 if !phantom_args.is_empty() {
-                    let good_blockarg = phantom_args.len() == 1
-                        && matches!(recv, AV::Other)
+                    let good_blockarg = if phantom_args.len() == 1
+                        && matches!(recv, AV::Other | AV::Slf)
                         && !super_
-                        && blockarg_candidate_ok(
+                    {
+                        blockarg_candidate_ok(
                             vm,
                             method,
                             ic,
                             phantom_args[0].0,
                             phantom_args[0].1,
-                        );
-                    if good_blockarg {
+                            recv == AV::Slf,
+                            rcvr_klass,
+                            klass_sensitive,
+                        )
+                    } else {
+                        None
+                    };
+                    // The RESOLUTION MODE rides in the map (S24 B3): convert
+                    // must not re-decide "is the receiver self" — its vreg
+                    // aliasing could disagree with this pass's AV::Slf flow,
+                    // and the two sides resolving DIFFERENT callees would
+                    // splice a body whose transparency was never proven.
+                    // One decision, made here, obeyed there.
+                    if let Some(devirt) = good_blockarg {
                         let (arg_ix, s) = phantom_args[0];
-                        blockarg_sends.insert(bci, (s, arg_ix));
+                        blockarg_sends.insert(bci, (s, arg_ix, devirt));
                     } else {
                         for &(_, s) in &phantom_args {
                             escaping.insert(s);
@@ -765,7 +849,7 @@ fn transfer_block(
                         // send (super dispatch), escapes.
                         escaping.insert(s);
                     }
-                    AV::Other => {}
+                    AV::Slf | AV::Other => {}
                 }
                 // SOUNDNESS (S14 7-IV-b): any Site still LIVE (stack or temp)
                 // across a SAFEPOINT escapes. A phantom closure has no compiled

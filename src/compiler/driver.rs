@@ -159,7 +159,9 @@ impl Eligibility {
 /// itself calls `eligibility_detail` directly, since it needs the
 /// permanent-vs-retry distinction `bool` collapses away.
 pub fn eligible(vm: &VmState, method: MethodOop) -> bool {
-    eligibility_detail(vm, method) == Eligibility::Yes
+    // No customization klass: the B3 self-devirt path stays off, matching
+    // the klass-free question this wrapper asks (tests only).
+    eligibility_detail(vm, method, None) == Eligibility::Yes
 }
 
 /// D1 point 2 (mono-smi-inline gate): a `Send` site only clears eligibility
@@ -180,7 +182,11 @@ pub fn eligible(vm: &VmState, method: MethodOop) -> bool {
 /// later step gives C2I reentrancy the depth of testing D1's fuller text
 /// deserves — `docs/sprints/sprint_s11_detail.md` has a SPEC-QUESTION on
 /// this gap.
-fn eligibility_detail(vm: &VmState, method: MethodOop) -> Eligibility {
+fn eligibility_detail(
+    vm: &VmState,
+    method: MethodOop,
+    rcvr_klass: Option<KlassOop>,
+) -> Eligibility {
     // S14 step 7-II-b: `has_ctx` (M owns a heap Context because a nested block
     // captures its temps) is NO LONGER an outright reject — the escape pre-pass
     // below gates it: a has_ctx method always creates a capturing closure, so it
@@ -260,7 +266,7 @@ fn eligibility_detail(vm: &VmState, method: MethodOop) -> Eligibility {
         found
     };
     let escape = if has_closure {
-        let e = crate::compiler::escape::analyze(vm, method);
+        let e = crate::compiler::escape::analyze_customized(vm, method, rcvr_klass);
         // S24 A3 (design §2.7): an ESCAPING closure is no longer an outright
         // reject — `ir::convert` allocates a real `BlockClosure`
         // (`Ir::Alloc` + `StoreField` inits, dead-home sentinel) when every
@@ -274,13 +280,26 @@ fn eligibility_detail(vm: &VmState, method: MethodOop) -> Eligibility {
         let escaping_ok = e.all_escaping_nlr_free(method);
         if !e.all_elidable && !escaping_ok {
             // An NLR-bearing escaping block (its `^` would misdeliver through
-            // the dead-home sentinel) — cannot compile M.
-            return Eligibility::NoPermanent;
+            // the dead-home sentinel) — cannot compile M. S24 B3: when the
+            // classification consulted the rcvr_klass devirt path, this
+            // verdict is a function of the CUSTOMIZATION klass — another
+            // klass's inputsDo: may splice fine. NoRetryLater (sets nothing)
+            // instead of NoPermanent (which sets the METHOD-WIDE
+            // compile_disabled bit and would poison every other klass).
+            return if e.klass_sensitive {
+                Eligibility::NoRetryLater
+            } else {
+                Eligibility::NoPermanent
+            };
         }
         Some(e)
     } else {
         None
     };
+    // S24 B3: klass-sensitivity of the analysis, for the site-verdict loop
+    // below — an escape-classified site skips its IC check there, so a
+    // NoPermanent from an UNclassified site may flip under another klass.
+    let ks = escape.as_ref().is_some_and(|e| e.klass_sensitive);
     // S14 step 7-II-b: a `has_ctx` method's Context elides ONLY because every
     // capturing block is inlined. A has_ctx method with NO (elidable) closure has
     // nothing justifying the elision — real frontend output never produces one
@@ -364,7 +383,15 @@ fn eligibility_detail(vm: &VmState, method: MethodOop) -> Eligibility {
                 if !super_ {
                     verdict = verdict.worse(mono_smi_inline_send(vm, method, ic));
                     if verdict == Eligibility::NoPermanent {
-                        return Eligibility::NoPermanent; // short-circuit: nothing later can undo this
+                        // Short-circuit: nothing later can undo this. S24 B3:
+                        // under a klass-sensitive analysis a site failing
+                        // HERE may be escape-classified (and skipped) under
+                        // another klass — don't poison the method-wide bit.
+                        return if ks {
+                            Eligibility::NoRetryLater
+                        } else {
+                            Eligibility::NoPermanent
+                        };
                     }
                 }
             }
@@ -709,7 +736,11 @@ fn compile_method_full(
     let elig = if method.is_block() {
         eligibility_detail_block(vm, method)
     } else {
-        eligibility_detail(vm, method)
+        // S24 B3: the customization klass reaches the escape pre-pass so
+        // self-receiver block-arg sends devirtualize. Every analysis run of
+        // this compile (here, the OSR gate below, convert's recompute) sees
+        // the SAME Some(rcvr_klass) — the front-5 agreement invariant.
+        eligibility_detail(vm, method, Some(rcvr_klass))
     };
     match elig {
         Eligibility::Yes => {}
@@ -771,7 +802,7 @@ fn compile_method_full(
     // rare OSR; `osr_declined_elided_ctx` collects the evidence for ever
     // revisiting).
     if osr_bci.is_some() && method.has_ctx() {
-        let e = crate::compiler::escape::analyze(vm, method);
+        let e = crate::compiler::escape::analyze_customized(vm, method, Some(rcvr_klass));
         if e.all_elidable {
             vm.stats.osr_declined_elided_ctx += 1;
             return None;

@@ -4468,7 +4468,7 @@ impl<'a> Translator<'a> {
                 // ARGUMENT into a transparent, CFG-inlinable mono callee — the
                 // `do:` pattern). MUST splice: the phantom has no runtime value,
                 // so there is no Call fallback.
-                if let Some((site, arg_ix)) = self
+                if let Some((site, arg_ix, devirt)) = self
                     .escape
                     .as_ref()
                     .and_then(|e| e.blockarg_send_target(bci))
@@ -4476,6 +4476,7 @@ impl<'a> Translator<'a> {
                     let cont = self.splice_blockarg_send(
                         site,
                         arg_ix,
+                        devirt,
                         ic,
                         bci,
                         stack,
@@ -5102,10 +5103,12 @@ impl<'a> Translator<'a> {
     /// `pending_jump_target` with D's entry block, and returns the
     /// continuation the caller must adopt as its `split`.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn splice_blockarg_send(
         &mut self,
         site_bci: usize,
         arg_ix: usize,
+        devirt: bool,
         ic: u16,
         send_bci: usize,
         stack: &mut Vec<VReg>,
@@ -5113,9 +5116,9 @@ impl<'a> Translator<'a> {
         code: &mut Vec<Ir>,
         deopt: &mut Vec<(u32, DeoptRaw)>,
     ) -> BlockId {
-        // Resolve B from its push_closure literal, D + guard klass from the
-        // send's own (mono) feedback — the SAME IC state the escape pre-pass
-        // read moments ago in this no-GC compile window.
+        // Resolve B from its push_closure literal; D per the RESOLUTION MODE
+        // the escape pre-pass recorded (S24 B3) — one decision, made there,
+        // obeyed here, so the two passes can never resolve different callees.
         let (site_instr, _) = decode_at(self.method, site_bci);
         let lit = match site_instr {
             Instr::PushClosure { lit, .. } => lit,
@@ -5125,21 +5128,46 @@ impl<'a> Translator<'a> {
             .expect("splice_blockarg_send: push_closure literal is not a CompiledBlock");
         let blk_pool_ix = self.pool.intern(blk.oop().raw(), Some(RelocKind::Oop)).0;
 
-        let feedback = crate::compiler::feedback::read_send_site(self.vm, self.method, ic, None);
-        let (guard_klass, callee) = match &feedback {
-            crate::compiler::feedback::SiteFeedback::Mono { klass, method } => (*klass, *method),
-            other => unreachable!(
-                "splice_blockarg_send: escape proved a mono block-arg site but feedback is \
-                 {other:?} (compiler bug — IC state cannot change mid-compile)"
-            ),
-        };
-        let guard_shape = if guard_klass.oop().raw() == self.vm.universe.smi_klass.oop().raw() {
-            GuardShape::SmiTest
-        } else {
-            GuardShape::KlassTest
-        };
         let selector = InterpreterIc::at(self.method, ic).selector();
         let argc = InterpreterIc::at(self.method, ic).argc() as usize;
+
+        // S24 B3: a DEVIRTUALIZED site (self receiver, callee resolved per
+        // the customization klass) splices GUARD-FREE — the nmethod's entry
+        // guard already proved every receiver has exactly rcvr_klass, the
+        // same convention as the S14 step-5 self-send devirt. dep_klass =
+        // rcvr_klass keeps the lookup-shaped inline dep sound (redefining or
+        // shadowing rcvr_klass>>selector invalidates this nmethod). A
+        // guarded site resolves D + guard klass from the send's own (mono)
+        // feedback — the SAME IC state the escape pre-pass read moments ago
+        // in this no-GC compile window.
+        let (guard, dep_klass, callee) = if devirt {
+            let callee =
+                crate::compiler::feedback::resolve_method_ro(self.vm, self.rcvr_klass, selector)
+                    .expect(
+                        "splice_blockarg_send: escape devirt-resolved this site against the \
+                         same rcvr_klass moments ago in this no-GC compile window (compiler \
+                         bug)",
+                    );
+            (None, self.rcvr_klass, callee)
+        } else {
+            let feedback =
+                crate::compiler::feedback::read_send_site(self.vm, self.method, ic, None);
+            let (guard_klass, callee) = match &feedback {
+                crate::compiler::feedback::SiteFeedback::Mono { klass, method } => {
+                    (*klass, *method)
+                }
+                other => unreachable!(
+                    "splice_blockarg_send: escape proved a mono block-arg site but feedback \
+                     is {other:?} (compiler bug — IC state cannot change mid-compile)"
+                ),
+            };
+            let guard_shape = if guard_klass.oop().raw() == self.vm.universe.smi_klass.oop().raw() {
+                GuardShape::SmiTest
+            } else {
+                GuardShape::KlassTest
+            };
+            (Some((guard_klass, guard_shape)), guard_klass, callee)
+        };
 
         // Pop operands (keeping the phantom shadow in lockstep). The phantom
         // arg's vreg is a filler; its POSITION is what matters (arg_ix).
@@ -5156,11 +5184,20 @@ impl<'a> Translator<'a> {
             .pop()
             .expect("blockarg send: missing receiver operand");
 
+        // Tripwire for the one residual divergence class: a devirt site's
+        // receiver must BE the self vreg (escape's narrow AV::Slf tracks
+        // exactly direct push_self/dup flow, which convert aliases as
+        // self_vreg by construction).
+        debug_assert!(
+            !devirt || receiver == self.self_vreg,
+            "devirt blockarg site's receiver vreg is not self_vreg (escape/convert \
+             self-provenance divergence)"
+        );
         let (result, entry_id, continuation_id) = self
             .try_inline_cfg(
                 callee,
-                Some((guard_klass, guard_shape)),
-                guard_klass,
+                guard,
+                dep_klass,
                 selector,
                 receiver,
                 &args,
@@ -5524,7 +5561,17 @@ pub fn convert(vm: &VmState, rcvr_klass: KlassOop, method: MethodOop, cfg: &Cfg)
             b = next;
         }
         if has_closure {
-            Some(crate::compiler::escape::analyze(vm, method))
+            // S24 B3: same Some(rcvr_klass) as the driver's two analysis
+            // runs — all three must agree (front-5). Blocks never reach
+            // here (no PushClosure in a compiled block's own bytecode),
+            // but guard anyway: a block compile's rcvr_klass is the
+            // closure_klass filler, meaningless for devirt.
+            let k = if method.is_block() {
+                None
+            } else {
+                Some(rcvr_klass)
+            };
+            Some(crate::compiler::escape::analyze_customized(vm, method, k))
         } else {
             None
         }
