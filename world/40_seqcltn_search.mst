@@ -1,0 +1,158 @@
+"40_seqcltn_search.mst — the SequenceableCollection search/copy protocol
+ ported from Strongtalk (StrongtalkSource/SequenceableCollection.dlt), the
+ everyday methods real code reaches for. Split by where they can work:
+
+ - READ-ONLY search methods on SequenceableCollection (need only at:/size, so
+   they work on String, Array, OrderedCollection, Interval alike).
+ - COLLECTION-BUILDING methods on ArrayedCollection, which build via
+   `self class new: n` + at:put: — that pattern only produces a usable object
+   for the indexable classes (Array/String/ByteArray); OrderedCollection's
+   `new:` does not init, so the builders live one level down where they work.
+
+ Reopens the genesis classes (Collection subclass: SequenceableCollection and
+ SequenceableCollection subclass: ArrayedCollection)."
+
+Collection subclass: SequenceableCollection [
+    "Index of the first/last element satisfying aBlock, or 0 if none
+     (Strongtalk SequenceableCollection>>findFirst:/findLast:)."
+    findFirst: aBlock [
+        1 to: self size do: [:i | (aBlock value: (self at: i)) ifTrue: [ ^i ] ].
+        ^0
+    ]
+    findLast: aBlock [
+        self size to: 1 by: -1 do: [:i | (aBlock value: (self at: i)) ifTrue: [ ^i ] ].
+        ^0
+    ]
+    count: aBlock [
+        | n |
+        n := 0.
+        self do: [:each | (aBlock value: each) ifTrue: [ n := n + 1 ] ].
+        ^n
+    ]
+    "Iterate in reverse order."
+    reverseDo: aBlock [
+        self size to: 1 by: -1 do: [:i | aBlock value: (self at: i) ]
+    ]
+    "Pairwise iteration: aBlock gets (self at: i) and (other at: i). Both must
+     be the same size."
+    with: aCollection do: aBlock [
+        self size = aCollection size
+            ifFalse: [ ^self error: 'with:do: collections must be the same size' ].
+        1 to: self size do: [:i | aBlock value: (self at: i) value: (aCollection at: i) ]
+    ]
+    "Does sub occur at exactly `index` (1-based)? The shared inner test for the
+     subcollection search + copyReplaceAll:."
+    matchesSubCollection: sub at: index [
+        1 to: sub size do: [:j |
+            (self at: index + j - 1) = (sub at: j) ifFalse: [ ^false ] ].
+        ^true
+    ]
+    "Index of the first occurrence of the subcollection at or after `start`
+     (Strongtalk indexOfSubCollection:startingAt:ifAbsent:). Substring search
+     over String, subsequence search over Array."
+    indexOfSubCollection: sub startingAt: start ifAbsent: exceptionBlock [
+        | n m |
+        n := self size.
+        m := sub size.
+        m = 0 ifTrue: [ ^exceptionBlock value ].
+        start to: n - m + 1 do: [:i |
+            (self matchesSubCollection: sub at: i) ifTrue: [ ^i ] ].
+        ^exceptionBlock value
+    ]
+    indexOfSubCollection: sub startingAt: start [
+        ^self indexOfSubCollection: sub startingAt: start ifAbsent: [ 0 ]
+    ]
+    indexOfSubCollection: sub [
+        ^self indexOfSubCollection: sub startingAt: 1 ifAbsent: [ 0 ]
+    ]
+    includesSubCollection: sub [
+        ^(self indexOfSubCollection: sub) > 0
+    ]
+    "Same elements in the same order (no class check, unlike =)."
+    hasSameElementsAndOrderAs: other [
+        self size = other size ifFalse: [ ^false ].
+        1 to: self size do: [:i | (self at: i) = (other at: i) ifFalse: [ ^false ] ].
+        ^true
+    ]
+    "Is every adjacent pair ordered by aBlock (a sortBlock: aBlock value: a
+     value: b answers true when a may precede b)?"
+    isSortedBy: aBlock [
+        2 to: self size do: [:i |
+            (aBlock value: (self at: i - 1) value: (self at: i)) ifFalse: [ ^false ] ].
+        ^true
+    ]
+    isSorted [
+        ^self isSortedBy: [:a :b | a <= b ]
+    ]
+]
+
+SequenceableCollection subclass: ArrayedCollection [
+    "Pairwise collect into a new collection of self's kind."
+    with: aCollection collect: aBlock [
+        | r |
+        self size = aCollection size
+            ifFalse: [ ^self error: 'with:collect: collections must be the same size' ].
+        r := self class new: self size.
+        1 to: self size do: [:i |
+            r at: i put: (aBlock value: (self at: i) value: (aCollection at: i)) ].
+        ^r
+    ]
+    "A copy with newElement appended."
+    copyWith: newElement [
+        | r n |
+        n := self size.
+        r := self class new: n + 1.
+        1 to: n do: [:i | r at: i put: (self at: i) ].
+        r at: n + 1 put: newElement.
+        ^r
+    ]
+    "A copy with every element equal to oldElement removed."
+    copyWithout: oldElement [
+        | r keep j |
+        keep := self count: [:each | each ~= oldElement ].
+        r := self class new: keep.
+        j := 1.
+        1 to: self size do: [:i |
+            (self at: i) ~= oldElement
+                ifTrue: [ r at: j put: (self at: i). j := j + 1 ] ].
+        ^r
+    ]
+    "Replace every non-overlapping occurrence of oldSub with newSub, answering
+     a new collection (Strongtalk copyReplaceAll:with:). Sizes the result from
+     a first counting pass, so newSub need not match oldSub's length — this is
+     the everyday string find-and-replace."
+    copyReplaceAll: oldSub with: newSub [
+        | m n matches newLen r i j |
+        m := oldSub size.
+        n := self size.
+        (m = 0 or: [ m > n ]) ifTrue: [ ^self copyFrom: 1 to: n ].
+        matches := 0.
+        i := 1.
+        [ i <= (n - m + 1) ] whileTrue: [
+            (self matchesSubCollection: oldSub at: i)
+                ifTrue: [ matches := matches + 1. i := i + m ]
+                ifFalse: [ i := i + 1 ] ].
+        newLen := n + (matches * (newSub size - m)).
+        r := self class new: newLen.
+        i := 1.
+        j := 1.
+        [ i <= n ] whileTrue: [
+            (i <= (n - m + 1) and: [ self matchesSubCollection: oldSub at: i ])
+                ifTrue: [
+                    1 to: newSub size do: [:k | r at: j put: (newSub at: k). j := j + 1 ].
+                    i := i + m ]
+                ifFalse: [ r at: j put: (self at: i). j := j + 1. i := i + 1 ] ].
+        ^r
+    ]
+    "Replace the slice start..stop with replacement (any length), answering a
+     new collection."
+    copyReplaceFrom: start to: stop with: replacement [
+        | r j |
+        r := self class new: self size - (stop - start + 1) + replacement size.
+        j := 1.
+        1 to: start - 1 do: [:i | r at: j put: (self at: i). j := j + 1 ].
+        1 to: replacement size do: [:i | r at: j put: (replacement at: i). j := j + 1 ].
+        stop + 1 to: self size do: [:i | r at: j put: (self at: i). j := j + 1 ].
+        ^r
+    ]
+]

@@ -107,6 +107,50 @@ ArrayedCollection subclass: String [
         1 to: self size do: [:i | (self at: i) = aChar ifTrue: [ ^i ] ].
         ^0
     ]
+    "A copy with leading and trailing separator characters removed
+     (Strongtalk ReadString>>withBlanksTrimmed). All-blank -> empty string."
+    withBlanksTrimmed [
+        | first last |
+        first := self findFirst: [:c | c isSeparator not ].
+        first = 0 ifTrue: [ ^self class new: 0 ].
+        last := self findLast: [:c | c isSeparator not ].
+        ^self copyFrom: first to: last
+    ]
+    trimBlanks [
+        ^self withBlanksTrimmed
+    ]
+    "Case-insensitive equality (Strongtalk sameAs:)."
+    sameAs: aString [
+        self size = aString size ifFalse: [ ^false ].
+        1 to: self size do: [:i |
+            (self at: i) asLowercase = (aString at: i) asLowercase ifFalse: [ ^false ] ].
+        ^true
+    ]
+    startsWith: aString [
+        aString size > self size ifTrue: [ ^false ].
+        ^self matchesSubCollection: aString at: 1
+    ]
+    endsWith: aString [
+        aString size > self size ifTrue: [ ^false ].
+        ^self matchesSubCollection: aString at: self size - aString size + 1
+    ]
+    "Parse a signed decimal integer; nil on any non-digit (after an optional
+     leading $-). Uses Character>>digitValue."
+    asInteger [
+        | n i sign d |
+        self isEmpty ifTrue: [ ^nil ].
+        i := 1.
+        sign := 1.
+        (self at: 1) = $- ifTrue: [ sign := -1. i := 2 ].
+        i > self size ifTrue: [ ^nil ].
+        n := 0.
+        [ i <= self size ] whileTrue: [
+            d := (self at: i) digitValue.
+            (d < 0 or: [ d > 9 ]) ifTrue: [ ^nil ].
+            n := n * 10 + d.
+            i := i + 1 ].
+        ^n * sign
+    ]
     String class >> with: aChar [
         | r |
         r := self new: 1.

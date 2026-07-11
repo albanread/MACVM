@@ -55,3 +55,7 @@
 38_simd.mst
 # SIMD level 2 (docs/SIMD.md Part E) — FloatArray + explicit-NEON bulk kernels.
 39_floatarray.mst
+# SequenceableCollection search/copy protocol (Strongtalk port).
+40_seqcltn_search.mst
+# String splitting utilities (need OrderedCollection; Strongtalk port).
+41_string_text.mst

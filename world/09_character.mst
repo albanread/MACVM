@@ -73,6 +73,41 @@ Magnitude subclass: Character [
         (value >= 65 and: [ value <= 90 ]) ifTrue: [ ^Character value: value + 32 ].
         ^self
     ]
+    isUppercase [
+        ^value >= 65 and: [ value <= 90 ]
+    ]
+    isLowercase [
+        ^value >= 97 and: [ value <= 122 ]
+    ]
+    isLetterOrDigit [
+        ^self isLetter or: [ self isDigit ]
+    ]
+    "A whitespace/layout character: space, tab, LF, form-feed, or CR."
+    isSeparator [
+        ^value = 32 or: [ value = 9 or: [ value = 10
+            or: [ value = 12 or: [ value = 13 ] ] ] ]
+    ]
+    isSpace [
+        ^value = 32
+    ]
+    "Radix-digit value: $0..$9 -> 0..9, $A..$Z / $a..$z -> 10..35 (case-
+     insensitive), else -1. The basis for Integer readFrom: / radix parsing
+     (Strongtalk Character>>digitValue)."
+    digitValue [
+        (value >= 48 and: [ value <= 57 ]) ifTrue: [ ^value - 48 ].
+        (value >= 65 and: [ value <= 90 ]) ifTrue: [ ^value - 55 ].
+        (value >= 97 and: [ value <= 122 ]) ifTrue: [ ^value - 87 ].
+        ^-1
+    ]
+]
+
+Magnitude subclass: Character [
+    "The Character for radix-digit value n: 0..9 -> $0..$9, 10..35 -> $A..$Z.
+     Inverse of digitValue; the basis for radix printing."
+    Character class >> digitValue: n [
+        n < 10 ifTrue: [ ^Character value: n + 48 ].
+        ^Character value: n + 55
+    ]
 ]
 
 Character initTable.

@@ -1,0 +1,44 @@
+"41_string_text.mst — String splitting utilities that answer an
+ OrderedCollection (Strongtalk-style tokenize/substrings). These MUST live in
+ a file that loads AFTER 15_ordered.mst: MACVM resolves a global class name
+ (OrderedCollection) at method-compile time, and String is defined back in
+ 12_string.mst (file 12) before OrderedCollection (file 15) exists. The rest
+ of String's text protocol (withBlanksTrimmed/sameAs:/startsWith:/asInteger)
+ needs no late class and stays in 12_string.mst. Reopens String."
+
+ArrayedCollection subclass: String [
+    "Split on runs of one or more separator characters (isSeparator),
+     answering an OrderedCollection of the non-empty pieces."
+    substrings [
+        | result n i start |
+        result := OrderedCollection new.
+        n := self size.
+        i := 1.
+        [ i <= n ] whileTrue: [
+            [ i <= n and: [ (self at: i) isSeparator ] ] whileTrue: [ i := i + 1 ].
+            i <= n ifTrue: [
+                start := i.
+                [ i <= n and: [ (self at: i) isSeparator not ] ] whileTrue: [ i := i + 1 ].
+                result add: (self copyFrom: start to: i - 1) ] ].
+        ^result
+    ]
+    "Split on any character in aSeparatorString."
+    substrings: aSeparatorString [
+        | result n i start |
+        result := OrderedCollection new.
+        n := self size.
+        i := 1.
+        [ i <= n ] whileTrue: [
+            [ i <= n and: [ aSeparatorString includesChar: (self at: i) ] ]
+                whileTrue: [ i := i + 1 ].
+            i <= n ifTrue: [
+                start := i.
+                [ i <= n and: [ (aSeparatorString includesChar: (self at: i)) not ] ]
+                    whileTrue: [ i := i + 1 ].
+                result add: (self copyFrom: start to: i - 1) ] ].
+        ^result
+    ]
+    tokenize: aSeparatorString [
+        ^self substrings: aSeparatorString
+    ]
+]
