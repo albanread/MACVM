@@ -37,7 +37,8 @@ design is in [`docs/reference-vm-analysis.md`](docs/reference-vm-analysis.md).
 ## Status — working, and it compiles
 
 MACVM boots a real Smalltalk object world and runs programs on a **two-tier
-engine**: a threaded-code interpreter plus a **tier-1 optimizing JIT** that
+engine**: a simple dispatch-based bytecode interpreter plus a **tier-1
+optimizing JIT** that
 recompiles hot code with type feedback and deoptimizes safely. On the standard
 benchmarks the JIT owns essentially all of the runtime:
 
@@ -61,7 +62,8 @@ allocating. See [`docs/PERF.md`](docs/PERF.md) for the arc and methodology.
 - **Garbage collection** — generational scavenge + a full compacting collector,
   both running **under live, moving compiled frames** via precise oop-maps and a
   mixed-tier frame walker.
-- **Interpreter** — a threaded-code baseline tier with inline caches.
+- **Interpreter** — a simple dispatch-based bytecode baseline tier (a
+  fetch-decode-`match` loop, not Forth-style threaded code) with inline caches.
 - **Tier-1 optimizing JIT** — a vendored pure-Rust AArch64 encoder (JASM) behind
   the `Assembler` trait; PICs and type feedback; method + block inlining;
   per-klass **customization** with self-send and block-arg **devirtualization**;
