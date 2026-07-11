@@ -52,9 +52,13 @@ ArrayedCollection subclass: String [
     >= other [
         ^(self compare: other) >= 0
     ]
-    "Copies ALL of src (read from src's own index 1) into self[from..to]."
+    "Copies ALL of src (read from src's own index 1) into self[from..to].
+     The primitive is a bulk byte memcpy; the fallback (a non-byte src, e.g.
+     an Array of Characters) degrades to element-by-element rather than
+     failing the primitive with no body."
     replaceFrom: from to: to with: src [
         <primitive: 43>
+        from to: to do: [:i | self at: i put: (src at: i - from + 1) ].
     ]
     , other [
         | r |

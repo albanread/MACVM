@@ -18,10 +18,18 @@ Object subclass: WriteStream [
         position := 0.
     ]
     grow [
+        self growTo: (collection size max: 4) * 2.
+    ]
+    "Grow the backing collection to at least `minSize`, moving the live
+     prefix with the bulk `replaceFrom:to:with:` primitive (a memcpy for
+     byte collections) rather than element-by-element — the char-by-char
+     copy here was a big part of why building large strings was slow."
+    growTo: minSize [
         | newSize newColl |
-        newSize := (collection size max: 4) * 2.
+        newSize := collection size max: 4.
+        [ newSize < minSize ] whileTrue: [ newSize := newSize * 2 ].
         newColl := collection class new: newSize.
-        1 to: position do: [:i | newColl at: i put: (collection at: i) ].
+        position > 0 ifTrue: [ newColl replaceFrom: 1 to: position with: collection ].
         collection := newColl.
     ]
     nextPut: e [
@@ -30,12 +38,22 @@ Object subclass: WriteStream [
         collection at: position put: e.
         ^e
     ]
+    "Bulk append via one `replaceFrom:to:with:` (a memcpy for byte
+     collections) instead of a per-element `nextPut:` loop."
     nextPutAll: aColl [
-        aColl do: [:e | self nextPut: e ].
+        | n |
+        n := aColl size.
+        n = 0 ifTrue: [ ^aColl ].
+        (position + n) > collection size ifTrue: [ self growTo: position + n ].
+        collection replaceFrom: position + 1 to: position + n with: aColl.
+        position := position + n.
         ^aColl
     ]
     contents [
-        ^collection copyFrom: 1 to: position
+        | r |
+        r := collection class new: position.
+        position > 0 ifTrue: [ r replaceFrom: 1 to: position with: collection ].
+        ^r
     ]
     << anObject [
         anObject isString ifTrue: [ self nextPutAll: anObject. ^self ].

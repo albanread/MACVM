@@ -149,6 +149,13 @@ ArrayedCollection subclass: Array [
         (i between: 1 and: self size) ifFalse: [ ^absentBlock value ].
         ^self at: i
     ]
+    "Element-by-element (Arrays hold oops, so there's no byte-memcpy
+     primitive); lets WriteStream-on-Array use the same bulk-copy protocol
+     Strings do (18_writestream.mst's grow/nextPutAll:/contents)."
+    replaceFrom: from to: to with: src [
+        from to: to do: [:i | self at: i put: (src at: i - from + 1) ].
+        ^self
+    ]
     collect: aBlock [
         | r |
         r := Array new: self size.
