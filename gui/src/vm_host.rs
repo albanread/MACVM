@@ -667,16 +667,19 @@ impl TranscriptSink for ChannelTranscript {
 /// VM options for the GUI's own worker. Same as `VmOptions::from_env`
 /// (`MACVM_JIT`/`MACVM_HEAP`/… all honored), except the JIT defaults to ON
 /// when `MACVM_JIT` is unset — the GUI runs real programs interactively, and
-/// the JIT is the whole point. `threshold=2000` compiles a method once it's
-/// genuinely hot rather than on first call, so startup and cold code stay
-/// cheap while hot loops get compiled. `MACVM_JIT` still overrides
-/// (including `MACVM_JIT=off`); the library default (`from_env` → off) is
-/// deliberately left alone so the test suite keeps its pure-interpreter
-/// baseline (gate scripts opt in explicitly).
+/// the JIT is the whole point. `threshold=10` compiles a method after a brief
+/// warmup: the *interactive* workload (tool/outliner rendering) is many
+/// methods each called dozens of times, not one 2000-iteration hot loop, so a
+/// high threshold (the old 2000) never compiled the UI code and left it
+/// interpreter-slow; 10 gets it compiled within the first render or two while
+/// still not compiling genuinely one-shot boot code. `MACVM_JIT` still
+/// overrides (including `MACVM_JIT=off`); the library default
+/// (`from_env` → off) is deliberately left alone so the test suite keeps its
+/// pure-interpreter baseline (gate scripts opt in explicitly).
 fn gui_vm_options() -> macvm::runtime::VmOptions {
     let mut opts = macvm::runtime::VmOptions::from_env();
     if std::env::var_os("MACVM_JIT").is_none() {
-        opts.jit = macvm::runtime::JitMode::Threshold(2000);
+        opts.jit = macvm::runtime::JitMode::Threshold(10);
     }
     opts
 }

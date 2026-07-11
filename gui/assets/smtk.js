@@ -60,26 +60,11 @@
         return;
       }
 
-      // Outliner expand/collapse (world/34_tools.mst ClassHierarchyOutliner).
-      // The whole tree is shipped once; toggling a node's glyph shows/hides
-      // its children subtree entirely client-side — no VM round trip (a truly
-      // lazy server-rendered toggle, D-G5, is a later step for large trees).
-      const tw = ev.target.closest(".st-tw[data-tw]");
-      if (tw) {
-        ev.preventDefault();
-        const node = tw.closest(".st-node");
-        const children = node && node.querySelector(":scope > .st-children");
-        if (children) {
-          const collapsed = children.style.display === "none";
-          children.style.display = collapsed ? "" : "none";
-          tw.innerHTML = collapsed ? "▾ " : "▸ "; // ▾ open / ▸ closed
-        }
-        return;
-      }
-
-      // Drill down: a class name in a hierarchy outliner opens that class's
-      // method browser (ClassOutliner, with editors) in place; the back link
-      // re-opens the hierarchy. Both replace the same widget (by data-widget-id).
+      // Drill down: a class NAME in a hierarchy outliner opens that class's
+      // method browser (ClassOutliner, with editors); the back link re-opens
+      // the hierarchy. Checked BEFORE the header toggle below so clicking the
+      // name drills rather than expanding subclasses. Both replace the same
+      // widget (by data-widget-id).
       const openClass = ev.target.closest(".st-class-link[data-open-class]");
       if (openClass) {
         ev.preventDefault();
@@ -103,6 +88,26 @@
           widgetId: host ? host.getAttribute("data-widget-id") || "" : "",
         });
         return;
+      }
+
+      // Outliner expand/collapse (world/34_tools.mst). The WHOLE header row is
+      // the toggle target — clicking anywhere on "▸ instance side (3)" or a
+      // selector/class row toggles it, not just the tiny glyph. The subtree is
+      // shown/hidden entirely client-side (no VM round trip). A leaf header
+      // (no ▾/▸ glyph) does nothing; the editor textarea lives in .st-children,
+      // a sibling of the header, so editing never triggers a toggle.
+      const header = ev.target.closest(".st-header");
+      if (header) {
+        const tw = header.querySelector(":scope > .st-tw[data-tw]");
+        const node = header.closest(".st-node");
+        const children = node && node.querySelector(":scope > .st-children");
+        if (tw && children) {
+          ev.preventDefault();
+          const collapsed = children.style.display === "none";
+          children.style.display = collapsed ? "" : "none";
+          tw.innerHTML = collapsed ? "▾ " : "▸ "; // ▾ open / ▸ closed
+          return;
+        }
       }
 
       // A rendered smappl widget (Button etc., ../smappl.md §3) — the

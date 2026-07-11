@@ -339,3 +339,5 @@ ul li::before {
 .st-class-link { cursor: pointer; color: var(--st-blue, #0000FF); }
 .st-class-link:hover { text-decoration: underline; }
 .st-back { margin: 2px 0 6px; font-weight: bold; }
+
+.st-node > .st-header:has(> .st-tw[data-tw]) { cursor: pointer; }

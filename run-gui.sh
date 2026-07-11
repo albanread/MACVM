@@ -9,8 +9,11 @@
 # JIT is fully supported.
 #
 # Usage:
-#   ./run-gui.sh                          # debug build, JIT off (fastest boot)
-#   MACVM_JIT=threshold=1 ./run-gui.sh    # exercise the tier-1 JIT
+#   ./run-gui.sh                          # debug build, JIT ON by default
+#                                         # (gui_vm_options: threshold=10 when
+#                                         #  MACVM_JIT is unset)
+#   MACVM_JIT=off ./run-gui.sh            # force the pure interpreter
+#   MACVM_JIT=threshold=1 ./run-gui.sh    # compile aggressively (first call)
 #   MACVM_IMAGE_PATH=world/image.sqlite3 ./run-gui.sh   # point browser at an image
 #   ./run-gui.sh --release                # optimized build (snappier UI)
 #
@@ -32,7 +35,7 @@ fi
 echo "▸ building macvm-gui (${bin_dir})…"
 cargo build -p macvm-gui "${profile_flag[@]}"
 
-echo "▸ launching MACVM GUI  (MACVM_JIT=${MACVM_JIT:-off})"
+echo "▸ launching MACVM GUI  (MACVM_JIT=${MACVM_JIT:-threshold=10 (GUI default)})"
 # exec so the app takes over this process — the script blocks until you quit
 # the app, and Ctrl-C / the window's close button end it cleanly.
 exec "./target/${bin_dir}/macvm-gui" "$@"
