@@ -110,6 +110,21 @@
         }
       }
 
+      // Modal dialog overlay (Visual>>promptOk:, the differences2.html
+      // "Press Me!" demo): the OK button or a click on the backdrop dismisses
+      // it. Handled BEFORE the widget-action branch because the OK button is a
+      // .smappl-button but deliberately carries no data-widget-action (the
+      // corpus continuation is always []), so it must close, not post.
+      const modalOk = ev.target.closest(".st-modal-ok");
+      const onBackdrop =
+        ev.target.classList && ev.target.classList.contains("st-modal");
+      if (modalOk || onBackdrop) {
+        ev.preventDefault();
+        const overlay = ev.target.closest(".st-modal");
+        if (overlay) overlay.remove();
+        return;
+      }
+
       // A rendered smappl widget (Button etc., ../smappl.md §3) — the
       // fragment carries the opaque action id the VM worker stored in
       // SmapplRegistry; clicking posts it back so `SmapplRegistry fire:`
@@ -658,7 +673,13 @@
   );
 
   document.addEventListener("keydown", function (ev) {
-    if (ev.key === "Escape") closeContextMenu();
+    if (ev.key === "Escape") {
+      closeContextMenu();
+      // Esc also dismisses an open modal dialog overlay (Visual>>promptOk:).
+      document.querySelectorAll(".st-modal").forEach(function (m) {
+        m.remove();
+      });
+    }
   });
 
   // ── smappl widgets (../smappl.md, ../src/preprocess.rs) ────────────────
@@ -727,6 +748,25 @@
     // A ClassOutliner fragment carries `.st-code-editor` source editors —
     // paint their syntax highlighting now that they're in the DOM.
     if (window.macvmHighlightCodeEditors) window.macvmHighlightCodeEditors();
+  };
+
+  // vm_host::VmResponse::SmapplOverlay arrives here (main.rs): a live widget
+  // action (Visual>>promptOk:, the "Press Me!" demo) answered a modal dialog
+  // fragment. Float it over the page; clicking OK / the backdrop / Esc removes
+  // it (the document click + keydown handlers above own the close). Only one
+  // dialog at a time — a fresh one replaces any still-open overlay.
+  window.macvmShowOverlay = function (html) {
+    document.querySelectorAll(".st-modal").forEach(function (m) {
+      m.remove();
+    });
+    const host = document.createElement("div");
+    host.innerHTML = html;
+    const overlay = host.firstElementChild;
+    if (!overlay) return;
+    document.body.appendChild(overlay);
+    // Focus the OK button so Enter/Space also dismisses (native-dialog feel).
+    const ok = overlay.querySelector(".st-modal-ok");
+    if (ok) ok.focus();
   };
 
   // The script tag lives in <head> (chrome_head_extra), so <body> — and

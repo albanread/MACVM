@@ -350,6 +350,53 @@ impl VmHandle {
         }
     }
 
+    /// Fires a live widget's stored action closure (`SmapplRegistry fire:
+    /// '<id>'`) and, if that closure answers a `String`, hands back its raw
+    /// bytes — the HTML overlay a dialog action produces (`Visual>>promptOk:…`,
+    /// the differences2.html "Press Me!" demo). A non-`String` answer is a
+    /// pure side-effect action (an icon button's `[:b | …]`) and yields
+    /// `Ok(None)` — no overlay. Any `Transcript` output the action makes still
+    /// flows separately via the transcript sink.
+    ///
+    /// This is [`render_fragment`](Self::render_fragment)'s sibling: same
+    /// signal-guarded top-item execution, but it wraps the `fire:` send instead
+    /// of `htmlFragment` and treats a non-`String` result as "nothing to show"
+    /// rather than a render error.
+    #[allow(unsafe_code)]
+    pub fn fire_widget_action(&mut self, action_id: &str) -> Result<Option<String>, GuestError> {
+        // action_id is a worker-minted 'wN' id (SmapplRegistry), never user
+        // text, so it needs no quoting — but guard the assumption cheaply.
+        debug_assert!(action_id.bytes().all(|b| b.is_ascii_alphanumeric()));
+        let source = format!("SmapplRegistry fire: '{action_id}'.");
+        let slot = deopt_trap::claim_jmp_slot();
+        // SAFETY: as `render_fragment` — `sigsetjmp` inline at this call site,
+        // whose frame stays live for the whole recovery window.
+        let rc = unsafe { deopt_trap::sigsetjmp(deopt_trap::jmp_buf_ptr(slot), 1) };
+        if rc == deopt_trap::GUEST_FATAL_JMP_VAL {
+            let message = deopt_trap::take_last_guest_fatal_message().expect(
+                "sigsetjmp returned GUEST_FATAL_JMP_VAL without a recorded guest-fatal message",
+            );
+            return Err(GuestError::RuntimeError(message));
+        }
+        if rc != 0 {
+            let (sig, pc, far) = deopt_trap::take_last_crash_info()
+                .expect("sigsetjmp returned nonzero without a recorded crash");
+            return Err(GuestError::NativeFault { sig, pc, far });
+        }
+        let item = match frontend::parser::parse_one_top_item(&source) {
+            Ok(Some(item)) => item,
+            Ok(None) => return Ok(None),
+            Err(e) => return Err(GuestError::Compile(e)),
+        };
+        match frontend::classdef::execute_top_item(&mut self.vm, item) {
+            // A String answer is the dialog overlay; anything else (self, nil)
+            // is a side-effect-only action, so there is nothing to inject.
+            Ok(Some(result)) => Ok(fragment_bytes(result)),
+            Ok(None) => Ok(None),
+            Err(e) => Err(GuestError::Compile(e)),
+        }
+    }
+
     /// Installs `sink` as where guest output (`Transcript show:`,
     /// `printOnStdout:`) goes from now on. Default is stdout
     /// (`VmState::with_options`) — an embedder calls this once, right after
@@ -464,6 +511,54 @@ mod tests {
         assert!(
             lines.iter().any(|l| l.contains("clicked")),
             "firing the button's id must run its action closure, got {lines:?}"
+        );
+    }
+
+    /// The differences2.html "Press Me!" demo: a labeled button whose action
+    /// is `b promptOk:title:type:action:`. Firing it must answer the modal
+    /// dialog's HTML (a String) — `fire_widget_action` surfaces that as the
+    /// overlay to float; a pure side-effect action instead answers `None`.
+    #[test]
+    fn firing_a_promptok_action_yields_the_dialog_overlay_html() {
+        let mut vm = boot_test_vm(JitMode::Off);
+
+        // The exact corpus shape (differences2.html), collapsed to one line.
+        let html = vm
+            .render_fragment(
+                "Button labeled: 'Press Me!' action: [ :b | \
+                 b promptOk: 'The UI can do native things easily.' \
+                 title: 'It works!' type: #info action: [] ]",
+            )
+            .expect("the Press Me button must render");
+        let id_start = html.find("data-widget-action=\"").expect("has an action id")
+            + "data-widget-action=\"".len();
+        let id_end = html[id_start..].find('"').unwrap() + id_start;
+        let id = html[id_start..id_end].to_string();
+
+        let overlay = vm
+            .fire_widget_action(&id)
+            .expect("firing must succeed")
+            .expect("a promptOk action must answer dialog HTML, not None");
+        assert!(
+            overlay.contains("st-modal")
+                && overlay.contains("st-modal-info")
+                && overlay.contains("It works!")
+                && overlay.contains("The UI can do native things easily.")
+                && overlay.contains("st-modal-ok"),
+            "overlay must be an info modal carrying title, message and an OK button, got {overlay:?}"
+        );
+
+        // A side-effect-only action (no String answer) yields no overlay.
+        let side = vm
+            .render_fragment("Button labeled: 'x' action: [ :b | 1 + 1 ]")
+            .expect("button renders");
+        let s0 = side.find("data-widget-action=\"").unwrap() + "data-widget-action=\"".len();
+        let s1 = side[s0..].find('"').unwrap() + s0;
+        let sid = side[s0..s1].to_string();
+        assert_eq!(
+            vm.fire_widget_action(&sid).expect("firing must succeed"),
+            None,
+            "a non-String action result must not produce an overlay"
         );
     }
 

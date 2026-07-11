@@ -1313,6 +1313,15 @@ extern "C" fn vm_bridge_drain(_this: Id, _cmd: Sel, _arg: Id) {
                     js_string_literal(&html)
                 ));
             }
+            vm_host::VmResponse::SmapplOverlay { html } => {
+                // A live widget action popped a modal dialog (Visual>>promptOk:,
+                // the "Press Me!" demo). Float it over the current page; smtk.js
+                // owns the overlay lifecycle (backdrop click / OK / Esc close).
+                eval_js(&format!(
+                    "if(window.macvmShowOverlay)window.macvmShowOverlay({})",
+                    js_string_literal(&html)
+                ));
+            }
             vm_host::VmResponse::WorkerIdle => {
                 // Never actually delivered here — `VmHost::drain_responses`
                 // consumes the worker-liveness marker internally and never

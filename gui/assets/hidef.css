@@ -373,3 +373,43 @@ ul li::before {
 .st-find-item { margin: 1px 0; }
 .st-find-side { color: var(--st-gray, #808080); font-size: 0.9em; }
 .st-find-empty { color: var(--st-gray, #808080); font-style: italic; margin: 8px 0; }
+
+/* ── Modal dialog overlay (Visual>>promptOk:, the differences2.html
+   "Press Me!" native-button demo). Injected by smtk.js macvmShowOverlay;
+   OK / backdrop / Esc dismiss it. Shared --hd-* scheme, so identical across
+   the six modern themes. ── */
+.st-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.45);
+}
+.st-modal-box {
+  min-width: 280px;
+  max-width: min(90vw, 440px);
+  background: var(--hd-surface, #222);
+  color: var(--hd-text, #eee);
+  border: 1px solid var(--hd-border, rgba(128, 128, 128, 0.3));
+  border-top: 3px solid var(--hd-accent, #5b9dff);
+  border-radius: var(--hd-radius, 8px);
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
+  padding: var(--hd-space-3, 14px);
+  font-family: var(--hd-font-body, sans-serif);
+}
+.st-modal-warning { border-top-color: #f5a623; }
+.st-modal-error   { border-top-color: var(--hd-danger, #f87171); }
+.st-modal-title {
+  font-weight: 600;
+  font-size: 1.05em;
+  margin-bottom: var(--hd-space-2, 8px);
+}
+.st-modal-title:empty { display: none; }
+.st-modal-msg { line-height: 1.4; }
+.st-modal-actions {
+  margin-top: var(--hd-space-3, 14px);
+  text-align: right;
+}
+.st-modal-ok { min-width: 72px; }

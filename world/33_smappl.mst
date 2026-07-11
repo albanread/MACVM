@@ -57,6 +57,29 @@ Object subclass: Visual [
         "Click hook; a plain Visual does nothing."
         ^self
     ]
+    promptOk: aString title: aTitle type: aSymbol action: aBlock [
+        "The native modal dialog a widget action pops (gui/smappl.md §3 shape 2
+         — differences2.html's 'Press Me!' button: `b promptOk: msg title: t
+         type: #info action: []`). Answers the dialog as an HTML overlay
+         fragment; the GUI worker recognises a String result from `fire:` and
+         injects it (VmResponse::SmapplOverlay). Faithful to A19 — the image
+         describes the dialog, Rust only displays it.
+
+         `aSymbol` (#info/#warning/#error) picks the accent. `aBlock` is the
+         after-OK continuation; the shipped corpus always passes [], so OK just
+         closes the overlay client-side and the block is not run — wire it when
+         a non-empty continuation becomes reachable. Label text isn't escaped
+         (corpus strings are ASCII-safe), matching Button>>htmlFragment."
+        | kind |
+        kind := aSymbol == #warning
+            ifTrue: [ 'warning' ]
+            ifFalse: [ aSymbol == #error ifTrue: [ 'error' ] ifFalse: [ 'info' ] ].
+        ^'<div class="st-modal" data-modal><div class="st-modal-box st-modal-', kind, '">',
+         '<div class="st-modal-title">', aTitle, '</div>',
+         '<div class="st-modal-msg">', aString, '</div>',
+         '<div class="st-modal-actions"><button class="smappl-button bevel-raised st-modal-ok">OK</button></div>',
+         '</div></div>'
+    ]
     "Corpus decoration chain (gui/smappl.md §3.4-3.5): these wrap a Visual in
      a border/hrule frame on-screen. For the HTML bridge they are identity —
      the border lives in CSS (.st-outliner) — so the whole

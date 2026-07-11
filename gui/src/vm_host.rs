@@ -331,6 +331,13 @@ pub enum VmResponse {
     FindResults {
         html: String,
     },
+    /// A live widget action asked to pop a modal dialog (`Visual>>promptOk:…`,
+    /// the differences2.html "Press Me!" demo) — `main.rs` calls `smtk.js`'s
+    /// `macvmShowOverlay(html)` to float `html` over the current page. Only a
+    /// `String`-answering action produces this; side-effect actions don't.
+    SmapplOverlay {
+        html: String,
+    },
     /// Internal supervisor liveness marker (S21 step 3) — NOT a UI response.
     /// The worker sends one after fully completing each request, i.e. once
     /// it is back to idle and provably still alive. `VmHost::drain_responses`
@@ -1000,12 +1007,15 @@ fn handle(
             }
         }
         VmRequest::SmapplAction { action_id } => {
-            // Fire the widget's stored action closure. Any Transcript output
-            // it produces arrives separately via ChannelTranscript; a failure
-            // is echoed to the transcript like a doit rather than dropped.
-            let code = format!("SmapplRegistry fire: '{action_id}'.");
-            match vm.exec(&code) {
-                Ok(()) => vec![],
+            // Fire the widget's stored action closure. A String answer is a
+            // modal dialog to float over the page (Visual>>promptOk:…); any
+            // other answer is a pure side-effect action, so nothing is shown.
+            // Transcript output the action makes arrives separately via
+            // ChannelTranscript; a failure is echoed to the transcript like a
+            // doit rather than dropped.
+            match vm.fire_widget_action(&action_id) {
+                Ok(Some(html)) => vec![VmResponse::SmapplOverlay { html }],
+                Ok(None) => vec![],
                 Err(e) => vec![VmResponse::Transcript(format!("{e}"))],
             }
         }
