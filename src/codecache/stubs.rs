@@ -71,12 +71,16 @@ pub const KIND_VALUE_DISPATCH: u64 = 9;
 /// scanning x0 as an oop would treat float bits as a heap pointer. See
 /// [`build_stub_box_double`].
 pub const KIND_BOX_DOUBLE: u64 = 10;
-/// SIMD NEON fast-path (`docs/SIMD.md`, Increment 2): `Ir::Vec2Arith`'s
+/// SIMD NEON fast-path (`docs/SIMD.md`, Increment 2): `Ir::VecArith`'s
 /// eden-overflow tail — box a NEON result into a fresh `Float64x2`. x0/x1
 /// carry the RAW LANE BITS (two f64 patterns), not oops, so this kind owns
 /// **zero** live RootSpill oop slots (exactly like `KIND_BOX_DOUBLE`). See
 /// [`build_stub_box_float64x2`].
 pub const KIND_BOX_FLOAT64X2: u64 = 11;
+/// SIMD: `Ir::VecArith`'s eden-overflow tail for a `Float32x4` — same shape as
+/// `KIND_BOX_FLOAT64X2` (x0/x1 are two raw 64-bit halves of the 128-bit lane
+/// body, never oops → zero RootSpill oop slots). See [`build_stub_box_float32x4`].
+pub const KIND_BOX_FLOAT32X4: u64 = 12;
 
 /// D5's shared stub skeleton, part 1: anchor + AAPCS frame + RootSpill
 /// (x0..x5). Every stub that calls into Rust starts with this; follow with
@@ -225,11 +229,15 @@ pub struct Stubs {
     /// initializes a `Double`, answering its tagged oop in x0. See
     /// [`build_stub_box_double`].
     pub box_double: CodeHandle,
-    /// SIMD NEON fast-path: `Ir::Vec2Arith`'s eden-overflow tail — x0/x1 = the
+    /// SIMD NEON fast-path: `Ir::VecArith`'s eden-overflow tail — x0/x1 = the
     /// two raw f64 lane BITS (not oops; zero RootSpill oop slots). Allocates
     /// and initializes a `Float64x2`, answering its tagged oop in x0. See
     /// [`build_stub_box_float64x2`].
     pub box_float64x2: CodeHandle,
+    /// SIMD: `Ir::VecArith`'s eden-overflow tail for a `Float32x4` — same shape
+    /// as `box_float64x2` (x0/x1 = the two 64-bit halves of the `.4s` result).
+    /// See [`build_stub_box_float32x4`].
+    pub box_float32x4: CodeHandle,
     /// S24 A1: a compiled BLOCK body's `nlr_tos` lowering `bl`s here with
     /// x0 = the closure, x1 = the NLR value; `rt_nlr_originate` parks
     /// `vm.nlr_state` and the emitted continuation returns `NLR_SENTINEL`
@@ -298,10 +306,14 @@ impl Stubs {
     pub fn box_double_addr(&self) -> u64 {
         self.box_double.base as u64
     }
-    /// SIMD: `emit`'s `Ir::Vec2Arith` slow edge `bl`s here (see
+    /// SIMD: `emit`'s `Ir::VecArith` slow edge `bl`s here (see
     /// [`build_stub_box_float64x2`]).
     pub fn box_float64x2_addr(&self) -> u64 {
         self.box_float64x2.base as u64
+    }
+    /// SIMD: `emit`'s `Ir::VecArith` (`Float32x4`) slow edge `bl`s here.
+    pub fn box_float32x4_addr(&self) -> u64 {
+        self.box_float32x4.base as u64
     }
     /// S24 A1: `emit`'s `Ir::NlrReturn` lowering `bl`s here (see
     /// [`build_stub_nlr_originate`]).
@@ -446,6 +458,12 @@ pub fn install(cache: &mut CodeCache) -> Stubs {
         .expect("stubs::install: code cache too small for box_float64x2");
     cache.publish(h14, &box_f64x2_blob);
 
+    let box_f32x4_blob = build_stub_box_float32x4();
+    let h15 = cache
+        .alloc(box_f32x4_blob.code.len())
+        .expect("stubs::install: code cache too small for box_float32x4");
+    cache.publish(h15, &box_f32x4_blob);
+
     Stubs {
         call_stub: h1,
         stub_poll: h2,
@@ -462,6 +480,7 @@ pub fn install(cache: &mut CodeCache) -> Stubs {
         value_dispatch,
         box_double: h13,
         box_float64x2: h14,
+        box_float32x4: h15,
     }
 }
 
@@ -1880,7 +1899,7 @@ pub unsafe extern "C" fn rt_box_double(vm: *mut VmState, bits: u64) -> u64 {
 }
 
 /// SIMD NEON fast-path (`docs/SIMD.md`): `stub_box_float64x2` —
-/// `Ir::Vec2Arith`'s eden-overflow tail. The compiled fast path bump-
+/// `Ir::VecArith`'s eden-overflow tail. The compiled fast path bump-
 /// allocates the 32-byte box and stores the NEON result (`str q`) inline; on
 /// overflow it `bl`s here with the two RAW lane bit patterns in x0 (lane 0)
 /// and x1 (lane 1) — NEITHER is an oop (`KIND_BOX_FLOAT64X2` reports zero
@@ -1929,6 +1948,58 @@ pub unsafe extern "C" fn rt_box_float64x2(vm: *mut VmState, lane0: u64, lane1: u
         "rt_box_float64x2: anchor must be set by stub_box_float64x2's prologue before this call"
     );
     crate::memory::alloc::alloc_float64x2(vm, f64::from_bits(lane0), f64::from_bits(lane1)).raw()
+}
+
+/// SIMD: `stub_box_float32x4` — `Ir::VecArith`'s eden-overflow tail for a
+/// `Float32x4`. Identical to `stub_box_float64x2` (the box layout is
+/// klass-agnostic — a 16-byte raw body): x0/x1 hold the two 64-bit halves of
+/// the `.4s` result register (each packs two f32 lanes), neither an oop.
+/// Marshals `rt_box_float32x4(vm, half0, half1)`; answers the tagged oop.
+fn build_stub_box_float32x4() -> CodeBlob {
+    let mut a = JasmAssembler::new();
+
+    emit_stub_prologue(&mut a);
+    emit_stub_kind_tag(&mut a, KIND_BOX_FLOAT32X4);
+    a.emit("mov", &[x(2), x(1)]); // half1 -> x2
+    a.emit("mov", &[x(1), x(0)]); // half0 -> x1
+    a.emit("mov", &[x(0), x(28)]); // vm
+    let lit = a.literal_u64(
+        rt_box_float32x4 as *const () as u64,
+        Some(RelocKind::RuntimeAddr),
+    );
+    a.call_far(lit);
+    a.emit("mov", &[x(16), x(0)]);
+    emit_stub_epilogue(&mut a);
+    a.emit("mov", &[x(0), x(16)]);
+    a.emit("ret", &[]);
+
+    a.finish()
+}
+
+/// # Safety
+/// Only ever reached via `blr` from `stub_box_float32x4`'s own hand-assembled
+/// listing above, never called directly from Rust.
+///
+/// `half0`/`half1` are the two raw 64-bit halves of the `.4s` result (each
+/// packs two f32 lanes in NEON element order); NEITHER is an oop. Unpacks them
+/// into the four f32 lanes and allocates a fresh `Float32x4` — this can
+/// scavenge, which is why the compiled fast path's overflow lands here. The
+/// unpack→`alloc_float32x4` repack is bit-exact (it is the identity on the raw
+/// words), so the boxed object is byte-for-byte the inline fast path's.
+pub unsafe extern "C" fn rt_box_float32x4(vm: *mut VmState, half0: u64, half1: u64) -> u64 {
+    // SAFETY: this function's own contract, guaranteed by stub_box_float32x4.
+    let vm = unsafe { &mut *vm };
+    debug_assert_ne!(
+        vm.reg_block.last_compiled_fp, 0,
+        "rt_box_float32x4: anchor must be set by stub_box_float32x4's prologue before this call"
+    );
+    let lanes = [
+        f32::from_bits(half0 as u32),
+        f32::from_bits((half0 >> 32) as u32),
+        f32::from_bits(half1 as u32),
+        f32::from_bits((half1 >> 32) as u32),
+    ];
+    crate::memory::alloc::alloc_float32x4(vm, lanes).raw()
 }
 
 /// D7: `stub_alloc_slow` — the inline-allocation fast path's overflow tail.

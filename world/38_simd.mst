@@ -40,3 +40,48 @@ Object subclass: Float64x2 [
         ^s contents
     ]
 ]
+
+"Float32x4 — a 4-lane f32 vector: the SAME fixed 16-byte RAW body as
+ Float64x2 (Format::Double, GC-skipped), but read as four single-precision
+ lanes packed in NEON `.4s` element order. Each elementwise op is per-lane
+ bit-identical to a scalar f32 op, which the JIT `.4s` fuse (VecArith) must
+ also honour. Lane access answers a Double (exact f32->f64 widening)."
+Object subclass: Float32x4 [
+    Float32x4 class >> x: a y: b z: c w: d [ <primitive: 134> ]
+    Float32x4 class >> splat: v [ <primitive: 135> ]
+
+    + other [ <primitive: 136> ]
+    - other [ <primitive: 137> ]
+    * other [ <primitive: 138> ]
+    / other [ <primitive: 139> ]
+
+    "Lane access, 1-based (Smalltalk convention): answers a Double."
+    at: i [ <primitive: 140> ]
+    x [ ^self at: 1 ]
+    y [ ^self at: 2 ]
+    z [ ^self at: 3 ]
+    w [ ^self at: 4 ]
+
+    "Horizontal sum of the four lanes (a scalar Double). Wider FP reductions
+     carry the ordering caveat docs/SIMD.md D documents; this fixed left-to-
+     right fold is the interpreter's own definition."
+    hsum [ ^self x + self y + self z + self w ]
+
+    printOn: aStream [
+        aStream nextPutAll: 'Float32x4('.
+        aStream nextPutAll: self x printString.
+        aStream nextPutAll: ', '.
+        aStream nextPutAll: self y printString.
+        aStream nextPutAll: ', '.
+        aStream nextPutAll: self z printString.
+        aStream nextPutAll: ', '.
+        aStream nextPutAll: self w printString.
+        aStream nextPutAll: ')'
+    ]
+    printString [
+        | s |
+        s := WriteStream on: String new.
+        self printOn: s.
+        ^s contents
+    ]
+]

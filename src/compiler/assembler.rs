@@ -199,6 +199,10 @@ pub fn q(n: u8) -> Operand {
 pub fn v2d(n: u8) -> Operand {
     Operand::VReg { num: n, arr: Arr::D2 }
 }
+/// A `.4s` vector operand (`v3.4s`) — four f32 lanes (SIMD `Float32x4`).
+pub fn v4s(n: u8) -> Operand {
+    Operand::VReg { num: n, arr: Arr::S4 }
+}
 /// A double lane element (`v3.d[i]`) — `umov`/`ins` a single f64 lane.
 pub fn vd_lane(n: u8, lane: u8) -> Operand {
     Operand::VElem {

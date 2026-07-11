@@ -121,6 +121,7 @@ pub struct Universe {
     /// a `q`-register with `ldr q,[obj+16]`. The first of the `FloatNxM`
     /// value-class family.
     pub float64x2_klass: KlassOop,
+    pub float32x4_klass: KlassOop,
     pub string_klass: KlassOop,
     pub symbol_klass: KlassOop,
     pub array_klass: KlassOop,
@@ -494,6 +495,17 @@ impl Universe {
             true,
             HEADER_WORDS + 2
         );
+        // SIMD: Float32x4 — the 4-lane f32 companion. SAME 16-byte raw body as
+        // Float64x2 (four f32 = two words), so an identical HEADER_WORDS + 2
+        // klass shape; only the lane interpretation (in the primitives / the
+        // `.4s` NEON arrangement) differs.
+        let float32x4_klass = remaining_klass!(
+            "Float32x4",
+            object_klass.oop(),
+            Format::Double,
+            true,
+            HEADER_WORDS + 2
+        );
         let array_klass = remaining_klass!(
             "Array",
             arrayed_collection_klass.oop(),
@@ -697,6 +709,7 @@ impl Universe {
             character_klass,
             double_klass,
             float64x2_klass,
+            float32x4_klass,
             string_klass,
             symbol_klass,
             array_klass,

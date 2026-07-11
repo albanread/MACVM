@@ -129,7 +129,7 @@ fn decode(word: u32) -> Option<String> {
 }
 
 /// SIMD NEON fast-path (`docs/SIMD.md`): the 128-bit vector forms `emit`'s
-/// `Ir::Vec2Arith` lowering produces — the `.2d` elementwise arithmetic
+/// `Ir::VecArith` lowering produces — the `.2d` elementwise arithmetic
 /// (`fadd`/`fsub`/`fmul`/`fdiv`), the `q`-register `ldr`/`str` (unboxing the
 /// two lanes / storing the boxed result), and the `umov Xd, Vn.d[i]` that
 /// marshals a lane into a GPR for the box slow-path stub. Only these forms
@@ -138,18 +138,23 @@ fn decode_fp_vector(word: u32) -> Option<String> {
     let rd = word & 0x1F;
     let rn = (word >> 5) & 0x1F;
     let rm = (word >> 16) & 0x1F;
-    // 3-same FP arithmetic, arrangement `.2d` (Q=1 bit30, sz=1 bit22). The
-    // mask keeps the op/U/sz/Q signature, clearing Rm/Rn/Rd. Bases from
-    // `vendor::wfasm::a64::encode` (`0x…D400`/`…FC00` | Q | sz).
+    // 3-same FP arithmetic, arrangement `.2d` (Q=1 bit30, sz=1 bit22) or `.4s`
+    // (Q=1, sz=0). The mask keeps the op/U/sz/Q signature, clearing Rm/Rn/Rd.
+    // Bases from `vendor::wfasm::a64::encode` (`0x…D400`/`…FC00` | Q | sz): the
+    // `.4s` forms drop the sz bit (0x0040_0000) that the `.2d` forms carry.
     let arith = match word & 0xFFE0_FC00 {
-        0x4E60_D400 => Some("fadd"),
-        0x4EE0_D400 => Some("fsub"),
-        0x6E60_DC00 => Some("fmul"),
-        0x6E60_FC00 => Some("fdiv"),
+        0x4E60_D400 => Some(("fadd", "2d")),
+        0x4EE0_D400 => Some(("fsub", "2d")),
+        0x6E60_DC00 => Some(("fmul", "2d")),
+        0x6E60_FC00 => Some(("fdiv", "2d")),
+        0x4E20_D400 => Some(("fadd", "4s")),
+        0x4EA0_D400 => Some(("fsub", "4s")),
+        0x6E20_DC00 => Some(("fmul", "4s")),
+        0x6E20_FC00 => Some(("fdiv", "4s")),
         _ => None,
     };
-    if let Some(mnem) = arith {
-        return Some(format!("{mnem} v{rd}.2d, v{rn}.2d, v{rm}.2d"));
+    if let Some((mnem, arr)) = arith {
+        return Some(format!("{mnem} v{rd}.{arr}, v{rn}.{arr}, v{rm}.{arr}"));
     }
     // `ldr`/`str q`, 128-bit unsigned scaled offset (scale 16): 0x3DC0/0x3D80.
     if word & 0xFFC0_0000 == 0x3DC0_0000 {
@@ -971,6 +976,10 @@ mod tests {
             ("fsub v16.2d, v16.2d, v17.2d", "fsub v16.2d, v16.2d, v17.2d"),
             ("fmul v16.2d, v16.2d, v17.2d", "fmul v16.2d, v16.2d, v17.2d"),
             ("fdiv v16.2d, v16.2d, v17.2d", "fdiv v16.2d, v16.2d, v17.2d"),
+            ("fadd v16.4s, v16.4s, v17.4s", "fadd v16.4s, v16.4s, v17.4s"),
+            ("fsub v16.4s, v16.4s, v17.4s", "fsub v16.4s, v16.4s, v17.4s"),
+            ("fmul v16.4s, v16.4s, v17.4s", "fmul v16.4s, v16.4s, v17.4s"),
+            ("fdiv v16.4s, v16.4s, v17.4s", "fdiv v16.4s, v16.4s, v17.4s"),
             ("ldr q16, [x17, #16]", "ldr q16, [x17, #16]"),
             ("str q16, [x19, #16]", "str q16, [x19, #16]"),
             ("umov x0, v16.d[0]", "umov x0, v16.d[0]"),

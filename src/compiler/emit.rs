@@ -48,8 +48,8 @@
 //! [`emit_mov_imm64`] does the multi-instruction expansion itself.
 
 use crate::compiler::assembler::{
-    d, imm, mem, q, sp, v2d, vd_lane, x, xr, Assembler, CodeBlob, Cond, Label, LiteralId, Operand,
-    Reg, RelocKind,
+    d, imm, mem, q, sp, v2d, v4s, vd_lane, x, xr, Assembler, CodeBlob, Cond, Label, LiteralId,
+    Operand, Reg, RelocKind,
 };
 use crate::compiler::ir::{
     BailoutReason, BlockId, CallSiteInfo, CmpOp, FArithOp, GuardShape, Ir, IrMethod, PoolLit,
@@ -263,10 +263,12 @@ struct Emitter<'a> {
     /// klass (`IrMethod::mark_double_lit`/`double_klass_lit`).
     mark_double_lit: PoolLit,
     double_klass_lit: PoolLit,
-    /// SIMD (`docs/SIMD.md`): the `Float64x2` klass — `Ir::Vec2Arith`'s operand
+    /// SIMD (`docs/SIMD.md`): the `Float64x2` klass — `Ir::VecArith`'s operand
     /// guards + result-box header stamp (`IrMethod::float64x2_klass_lit`). The
     /// box reuses `mark_double_lit` (shared `Format::Double` raw body).
     float64x2_klass_lit: PoolLit,
+    /// SIMD: the `Float32x4` klass — same role for a `.4s` `VecArith`.
+    float32x4_klass_lit: PoolLit,
     /// Float fast-path: per-vreg FP-class flags (`VRegInfo::is_fp`) — `Move`
     /// dispatches GPR vs FP lowering on them (a promoted float temp's store
     /// is an fp-to-fp move).
@@ -288,9 +290,11 @@ struct Emitter<'a> {
     /// eden-overflow edge `bl`s here with the raw payload bits in x0.
     box_double_lit: LiteralId,
     /// SIMD (`docs/SIMD.md`): `codecache::stubs::Stubs::box_float64x2` —
-    /// `Ir::Vec2Arith`'s eden-overflow edge `bl`s here with the two raw lane
+    /// `Ir::VecArith`'s eden-overflow edge `bl`s here with the two raw lane
     /// bit patterns in x0/x1.
     box_float64x2_lit: LiteralId,
+    /// SIMD: the `Float32x4` box stub — same role for a `.4s` `VecArith`.
+    box_float32x4_lit: LiteralId,
     /// Same reasoning again, for `codecache::stubs::Stubs::call_primitive` —
     /// a shimmable primitive-bearing method's own entry-prologue shim
     /// `bl`s here (`compiler::driver`'s shimmable-primitive eligibility).
@@ -1023,35 +1027,60 @@ impl<'a> Emitter<'a> {
         self.commit(dst, dreg);
     }
 
-    /// SIMD NEON fast-path (`docs/SIMD.md`): lower a fused `Ir::Vec2Arith` — a
-    /// mono-`Float64x2` elementwise arithmetic send — to guard + `ldr q` unbox
-    /// + one `fadd/… v.2d` + box. Uses FIXED scratch q-registers `q16`/`q17`
-    /// (v16/v17 are caller-saved, never in the fp allocatable pool `d0–d7` nor
-    /// the residency pool `d8–d15`, so no live fp vreg is clobbered — the same
-    /// reasoning as the scalar path's `d16`/`d17` fp scratch), so the allocator
-    /// and float reducer are untouched (v1 box-per-op). GUARDS mirror
-    /// `emit_funbox` (reject smi, then klass word == `Float64x2`); the BOX
-    /// mirrors `emit_fbox`'s inline eden-bump + a `stub_box_float64x2` slow
-    /// tail, but 32 bytes (`HEADER_WORDS + 2`) with a single `str q` payload and
-    /// two lane words passed to the stub. Both operands guard to the SAME
-    /// `fail` block (a non-`Float64x2` operand re-executes the send).
-    fn emit_vec2arith(&mut self, op: FArithOp, dst: VReg, a: VReg, b: VReg, fail: BlockId) {
+    /// SIMD NEON fast-path (`docs/SIMD.md`): lower a fused `Ir::VecArith` — a
+    /// mono-vector elementwise arithmetic send — to guard + `ldr q` unbox + one
+    /// `f… v.<arr>` + box. `kind` selects three things and NOTHING else (both
+    /// vector classes are 16-byte raw bodies): the guard/box klass literal, the
+    /// NEON arrangement (`.2d` for `Float64x2`, `.4s` for `Float32x4`), and the
+    /// box stub. Uses FIXED scratch q-registers `q16`/`q17` (v16/v17 are
+    /// caller-saved, never in the fp allocatable pool `d0–d7` nor the residency
+    /// pool `d8–d15`, so no live fp vreg is clobbered — the same reasoning as
+    /// the scalar path's `d16`/`d17` fp scratch), so the allocator and float
+    /// reducer are untouched (v1 box-per-op). GUARDS mirror `emit_funbox`
+    /// (reject smi, then klass word); the BOX mirrors `emit_fbox`'s inline
+    /// eden-bump + a `stub_box_*` slow tail, but 32 bytes (`HEADER_WORDS + 2`)
+    /// with a single `str q` payload and the two 64-bit halves of `q16` passed
+    /// to the stub. Both operands guard to the SAME `fail` block (a wrong-klass
+    /// operand re-executes the send).
+    fn emit_vecarith(
+        &mut self,
+        kind: crate::compiler::ir::VecKind,
+        op: FArithOp,
+        dst: VReg,
+        a: VReg,
+        b: VReg,
+        fail: BlockId,
+    ) {
+        use crate::compiler::ir::VecKind;
         use crate::oops::layout::{MEM_TAG, VMREG_EDEN_END_OFFSET, VMREG_EDEN_TOP_ADDR_OFFSET};
         let cold = self.block_label(fail);
-        let f64x2_klass = self.literal_ids[self.float64x2_klass_lit.0 as usize];
+        // The three (and only) kind-dependent choices.
+        let klass = match kind {
+            VecKind::F64x2 => self.literal_ids[self.float64x2_klass_lit.0 as usize],
+            VecKind::F32x4 => self.literal_ids[self.float32x4_klass_lit.0 as usize],
+        };
+        let box_stub = match kind {
+            VecKind::F64x2 => self.box_float64x2_lit,
+            VecKind::F32x4 => self.box_float32x4_lit,
+        };
+        // `.2d` (two f64) vs `.4s` (four f32) arrangement for the arith op.
+        let varr = |n: u8| match kind {
+            VecKind::F64x2 => v2d(n),
+            VecKind::F32x4 => v4s(n),
+        };
 
         // ── Guard + unbox receiver `a` into q16. Guard mirrors emit_funbox:
-        //    reject a smi (tag bits 00), then klass word == Float64x2. ──────
+        //    reject a smi (tag bits 00), then klass word == kind's klass. ────
         let ra = self.resolve(a, 16);
         self.asm.emit("tst", &[Operand::Reg(ra), imm(3)]);
         self.asm.b_cond(Cond::Eq, cold);
         // Untagged base FIRST (x17), before x16 is reused (ra itself may BE x16).
         self.asm.emit("sub", &[x(17), Operand::Reg(ra), imm(1)]);
         self.asm.emit("ldr", &[x(16), mem(17, 8)]);
-        self.asm.ldr_literal(xr(19), f64x2_klass);
+        self.asm.ldr_literal(xr(19), klass);
         self.asm.emit("cmp", &[x(16), x(19)]);
         self.asm.b_cond(Cond::Ne, cold);
-        self.asm.emit("ldr", &[q(16), mem(17, 16)]); // a's two lanes -> v16
+        self.asm.emit("ldr", &[q(16), mem(17, 16)]); // a's 128-bit body -> v16
 
         // ── Guard + unbox arg `b` into q17 (a is fully consumed into v16). ─
         let rb = self.resolve(b, 16);
@@ -1059,25 +1088,27 @@ impl<'a> Emitter<'a> {
         self.asm.b_cond(Cond::Eq, cold);
         self.asm.emit("sub", &[x(17), Operand::Reg(rb), imm(1)]);
         self.asm.emit("ldr", &[x(16), mem(17, 8)]);
-        self.asm.ldr_literal(xr(19), f64x2_klass);
+        self.asm.ldr_literal(xr(19), klass);
         self.asm.emit("cmp", &[x(16), x(19)]);
         self.asm.b_cond(Cond::Ne, cold);
-        self.asm.emit("ldr", &[q(17), mem(17, 16)]); // b's two lanes -> v17
+        self.asm.emit("ldr", &[q(17), mem(17, 16)]); // b's 128-bit body -> v17
 
-        // ── Elementwise NEON arithmetic: v16.2d = v16.2d op v17.2d. ────────
+        // ── Elementwise NEON arithmetic: v16.<arr> = v16.<arr> op v17.<arr>. ─
         let mnem = match op {
             FArithOp::Add => "fadd",
             FArithOp::Sub => "fsub",
             FArithOp::Mul => "fmul",
             FArithOp::Div => "fdiv",
         };
-        self.asm.emit(mnem, &[v2d(16), v2d(16), v2d(17)]);
+        self.asm.emit(mnem, &[varr(16), varr(16), varr(17)]);
 
-        // ── Box the result into a fresh Float64x2 (mirrors emit_fbox, 32B). ─
+        // ── Box the result into a fresh vector (mirrors emit_fbox, 32B). The
+        //    layout is klass-agnostic — a 16-byte raw body — so only the header
+        //    klass differs; `str q16` writes both 64-bit halves at once. ──────
         let dreg = self.dest_target(dst);
         let slow = self.asm.new_label();
         let done = self.asm.new_label();
-        let size_bytes: i64 = 32; // mark + klass + two f64 lanes
+        let size_bytes: i64 = 32; // mark + klass + 16-byte raw lane body
 
         self.asm
             .emit("ldr", &[x(20), mem(28, VMREG_EDEN_TOP_ADDR_OFFSET as i64)]);
@@ -1092,18 +1123,18 @@ impl<'a> Emitter<'a> {
         self.asm
             .ldr_literal(xr(17), self.literal_ids[self.mark_double_lit.0 as usize]);
         self.asm.emit("str", &[x(17), mem(19, 0)]);
-        self.asm.ldr_literal(xr(17), f64x2_klass);
+        self.asm.ldr_literal(xr(17), klass);
         self.asm.emit("str", &[x(17), mem(19, 8)]);
-        self.asm.emit("str", &[q(16), mem(19, 16)]); // both lanes, one store
+        self.asm.emit("str", &[q(16), mem(19, 16)]); // full 128-bit body, one store
         self.asm
             .emit("add", &[Operand::Reg(dreg), x(19), imm(MEM_TAG as i64)]);
         self.asm.b(done);
 
-        // Slow path: the two lane bit patterns -> x0/x1, stub allocs+stores+tags.
+        // Slow path: the two 64-bit halves of q16 -> x0/x1, stub allocs+stores+tags.
         self.asm.bind(slow);
         self.asm.emit("umov", &[x(0), vd_lane(16, 0)]);
         self.asm.emit("umov", &[x(1), vd_lane(16, 1)]);
-        self.asm.call_far(self.box_float64x2_lit);
+        self.asm.call_far(box_stub);
         self.safepoints.push(SafepointPc {
             pc_off: self.asm.offset(),
             bci: self.current_bci,
@@ -1594,6 +1625,7 @@ pub fn emit(
     alloc_slow_addr: u64,
     box_double_addr: u64,
     box_float64x2_addr: u64,
+    box_float32x4_addr: u64,
     call_primitive_addr: u64,
     nlr_originate_addr: u64,
     prim_shim: Option<(i64, u8)>,
@@ -1621,6 +1653,7 @@ pub fn emit(
     let alloc_slow_lit = asm.literal_u64(alloc_slow_addr, Some(RelocKind::RuntimeAddr));
     let box_double_lit = asm.literal_u64(box_double_addr, Some(RelocKind::RuntimeAddr));
     let box_float64x2_lit = asm.literal_u64(box_float64x2_addr, Some(RelocKind::RuntimeAddr));
+    let box_float32x4_lit = asm.literal_u64(box_float32x4_addr, Some(RelocKind::RuntimeAddr));
     let call_primitive_lit = asm.literal_u64(call_primitive_addr, Some(RelocKind::RuntimeAddr));
     let nlr_originate_lit = asm.literal_u64(nlr_originate_addr, Some(RelocKind::RuntimeAddr));
 
@@ -1642,12 +1675,14 @@ pub fn emit(
         mark_double_lit: method.mark_double_lit,
         double_klass_lit: method.double_klass_lit,
         float64x2_klass_lit: method.float64x2_klass_lit,
+        float32x4_klass_lit: method.float32x4_klass_lit,
         vreg_is_fp: method.vregs.iter().map(|v| v.is_fp).collect(),
         stub_poll_lit,
         must_be_boolean_lit,
         alloc_slow_lit,
         box_double_lit,
         box_float64x2_lit,
+        box_float32x4_lit,
         call_primitive_lit,
         nlr_originate_lit,
         call_sites: &method.call_sites,
@@ -1828,13 +1863,14 @@ fn emit_ir(e: &mut Emitter, ir: &Ir, next_in_order: Option<BlockId>) {
         Ir::FBox { dst, src } => e.emit_fbox(dst, src),
         Ir::FArith { op, dst, a, b } => e.emit_farith(op, dst, a, b),
         // ── SIMD NEON fast-path (`docs/SIMD.md`) ───────────────────────────
-        Ir::Vec2Arith {
+        Ir::VecArith {
+            kind,
             op,
             dst,
             a,
             b,
             fail,
-        } => e.emit_vec2arith(op, dst, a, b, fail),
+        } => e.emit_vecarith(kind, op, dst, a, b, fail),
         Ir::FCmpVal { op, dst, a, b } => e.emit_fcmp_val(op, dst, a, b),
         Ir::FCmpBr {
             op,
@@ -2129,6 +2165,7 @@ mod tests {
             mark_double_lit: PoolLit(0),
             double_klass_lit: PoolLit(0),
             float64x2_klass_lit: PoolLit(0),
+            float32x4_klass_lit: PoolLit(0),
             call_sites: Vec::new(),
             site_feedback: Vec::new(),
             inline_deps: Vec::new(),
@@ -2227,7 +2264,7 @@ mod tests {
         let ra = regalloc::regalloc(&method);
         let mut asm = JasmAssembler::new();
         let (_blob, block_pcs, _verified_entry_off, _ic_sites, _safepoints, _osr_off) =
-            emit(&mut asm, &method, &ra, 0, 0, 0, 0, 0, 0, 0, None, None, None);
+            emit(&mut asm, &method, &ra, 0, 0, 0, 0, 0, 0, 0, 0, None, None, None);
 
         assert_eq!(
             block_pcs.len(),
@@ -2306,7 +2343,7 @@ mod tests {
         let ra = regalloc::regalloc(&method);
         let mut asm = JasmAssembler::new();
         let (blob, _pcs, _verified_entry_off, _ic_sites, _safepoints, _osr_off) =
-            emit(&mut asm, &method, &ra, 0, 0, 0, 0, 0, 0, 0, None, None, None);
+            emit(&mut asm, &method, &ra, 0, 0, 0, 0, 0, 0, 0, 0, None, None, None);
 
         let mnemonics: Vec<&str> = blob.listing.iter().map(|l| mnemonic(l)).collect();
         let asr_pos = mnemonics.iter().position(|&m| m == "asr");
@@ -2378,7 +2415,7 @@ mod tests {
         let ra = regalloc::regalloc(&near);
         let mut asm = JasmAssembler::new();
         let (blob, _pcs, _verified_entry_off, _ic_sites, _safepoints, _osr_off) =
-            emit(&mut asm, &near, &ra, 0, 0, 0, 0, 0, 0, 0, None, None, None);
+            emit(&mut asm, &near, &ra, 0, 0, 0, 0, 0, 0, 0, 0, None, None, None);
         let near_mnemonics: Vec<String> = blob.listing.iter().map(|l| mnemonic(l)).collect();
         assert!(
             near_mnemonics.iter().any(|m| m == "ldur"),
@@ -2395,7 +2432,7 @@ mod tests {
         let ra2 = regalloc::regalloc(&far);
         let mut asm2 = JasmAssembler::new();
         let (blob2, _pcs2, _verified_entry_off2, _ic_sites2, _safepoints, _osr_off) =
-            emit(&mut asm2, &far, &ra2, 0, 0, 0, 0, 0, 0, 0, None, None, None);
+            emit(&mut asm2, &far, &ra2, 0, 0, 0, 0, 0, 0, 0, 0, None, None, None);
         let mnemonics: Vec<String> = blob2.listing.iter().map(|l| mnemonic(l)).collect();
         assert!(
             mnemonics.iter().any(|m| m == "sub"),
@@ -2462,6 +2499,7 @@ mod tests {
             0,
             0,
             0,
+            0,
             None,
             None,
             None,
@@ -2490,6 +2528,7 @@ mod tests {
             &mut asm2,
             &without_barrier,
             &ra2,
+            0,
             0,
             0,
             0,
@@ -2569,6 +2608,7 @@ mod tests {
             mark_double_lit: PoolLit(0),
             double_klass_lit: PoolLit(0),
             float64x2_klass_lit: PoolLit(0),
+            float32x4_klass_lit: PoolLit(0),
             call_sites: Vec::new(),
             site_feedback: Vec::new(),
             inline_deps: Vec::new(),
@@ -2578,7 +2618,7 @@ mod tests {
         let ra = regalloc::regalloc(&method);
         let mut asm = JasmAssembler::new();
         let (blob, _pcs, _ve, _ic, _safepoints, _osr_off) =
-            emit(&mut asm, &method, &ra, 0, 0, 0xAABB, 0, 0, 0, 0, None, None, None);
+            emit(&mut asm, &method, &ra, 0, 0, 0xAABB, 0, 0, 0, 0, 0, None, None, None);
         let listing = blob.listing.join("\n");
         let mnemonic = |l: &str| l.split_whitespace().nth(2).unwrap_or("").to_string();
         let mnemonics: Vec<String> = blob.listing.iter().map(|l| mnemonic(l)).collect();
@@ -2666,6 +2706,7 @@ mod tests {
             &mut asm,
             &method,
             &ra,
+            0,
             0,
             0,
             0,
@@ -2786,6 +2827,7 @@ mod tests {
             0,
             0,
             0,
+            0,
             None,
             Some(guard),
             None,
@@ -2883,6 +2925,7 @@ mod tests {
             mark_double_lit: PoolLit(0),
             double_klass_lit: PoolLit(0),
             float64x2_klass_lit: PoolLit(0),
+            float32x4_klass_lit: PoolLit(0),
             call_sites: vec![
                 CallSiteInfo {
                     selector: test_selector(b"foo"),
@@ -2908,7 +2951,7 @@ mod tests {
         let ra = regalloc::regalloc(&method);
         let mut asm = JasmAssembler::new();
         let (blob, _pcs, _verified_entry_off, ic_sites, _safepoints, _osr_off) =
-            emit(&mut asm, &method, &ra, 0, 0, 0, 0, 0, 0, 0, None, None, None);
+            emit(&mut asm, &method, &ra, 0, 0, 0, 0, 0, 0, 0, 0, None, None, None);
 
         assert_eq!(
             ic_sites.len(),

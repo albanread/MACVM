@@ -133,7 +133,7 @@ fn successors(block: &IrBlock) -> Vec<BlockId> {
             | Ir::ArrayAt { fail, .. }
             | Ir::ArrayAtPut { fail, .. }
             | Ir::FUnbox { fail, .. }
-            | Ir::Vec2Arith { fail, .. } => succs.push(*fail),
+            | Ir::VecArith { fail, .. } => succs.push(*fail),
             Ir::GuardKlass { fail, .. } => succs.push(*fail),
             // S11 D7: `Alloc` is self-contained (fast path + internal slow
             // call, `emit::emit_alloc`) — no slow CFG successor. It stays a
@@ -967,6 +967,7 @@ mod tests {
             mark_double_lit: PoolLit(0),
             double_klass_lit: PoolLit(0),
             float64x2_klass_lit: PoolLit(0),
+            float32x4_klass_lit: PoolLit(0),
             call_sites: Vec::new(),
             site_feedback: Vec::new(),
             inline_deps: Vec::new(),

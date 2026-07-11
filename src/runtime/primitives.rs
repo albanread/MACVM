@@ -742,6 +742,66 @@ pub static PRIMITIVES: &[PrimDesc] = &[
         can_allocate: true,
         can_fail: true,
     },
+    // SIMD Float32x4 (docs/SIMD.md) — the 4-lane f32 companion to Float64x2.
+    // `x:y:z:w:` is the only 4-arg constructor; the rest mirror Float64x2's
+    // elementwise ops, guarded on the Float32x4 klass (the fast-path fuse's
+    // is_float32x4_inlinable maps 136-139 → `.4s` NEON arithmetic).
+    PrimDesc {
+        id: 134,
+        name: "x:y:z:w:",
+        f: prim_x4_xyzw,
+        argc: 4,
+        can_allocate: true,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 135,
+        name: "splat:",
+        f: prim_x4_splat,
+        argc: 1,
+        can_allocate: true,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 136,
+        name: "+",
+        f: prim_x4_add,
+        argc: 1,
+        can_allocate: true,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 137,
+        name: "-",
+        f: prim_x4_sub,
+        argc: 1,
+        can_allocate: true,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 138,
+        name: "*",
+        f: prim_x4_mul,
+        argc: 1,
+        can_allocate: true,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 139,
+        name: "/",
+        f: prim_x4_div,
+        argc: 1,
+        can_allocate: true,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 140,
+        name: "at:",
+        f: prim_x4_at,
+        argc: 1,
+        can_allocate: true,
+        can_fail: true,
+    },
 ];
 
 pub fn prim_by_id(id: u16) -> Option<&'static PrimDesc> {
@@ -1732,6 +1792,95 @@ fn prim_x2_at(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     PrimResult::Ok(alloc::alloc_double(vm, lane).oop())
 }
 
+// ── SIMD Float32x4 helpers + primitives (docs/SIMD.md) ────────────────────
+//
+// Read the four f32 lanes of a Float32x4 receiver (KLASS-checked, like
+// Float64x2 — it too shares Format::Double). Lanes unpack in NEON `.4s`
+// element order: lane 0/1 = low/high 32 bits of body word 0, lane 2/3 = word
+// 1. This MUST match `alloc::alloc_float32x4`'s packing and the `ldr q`/`.4s`
+// the JIT fuse uses, so the interpreter and compiled tiers agree bit-for-bit.
+fn as_float32x4(vm: &VmState, o: Oop) -> Option<[f32; 4]> {
+    let m = MemOop::try_from(o)?;
+    if m.klass().oop().raw() != vm.universe.float32x4_klass.oop().raw() {
+        return None;
+    }
+    let w0 = m.body_word_raw(0);
+    let w1 = m.body_word_raw(1);
+    Some([
+        f32::from_bits(w0 as u32),
+        f32::from_bits((w0 >> 32) as u32),
+        f32::from_bits(w1 as u32),
+        f32::from_bits((w1 >> 32) as u32),
+    ])
+}
+
+/// A scalar lane argument narrowed to f32 (a constructor operand): a Double or
+/// a SmallInteger, rounded to f32 — the SAME single-precision rounding the
+/// `.4s` lanes carry.
+fn as_scalar_f32(vm: &VmState, o: Oop) -> Option<f32> {
+    as_scalar_f64(vm, o).map(|v| v as f32)
+}
+
+/// `Float32x4 x: a y: b z: c w: d` (class-side; args = [class, a, b, c, d]).
+fn prim_x4_xyzw(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    match (
+        as_scalar_f32(vm, args[1]),
+        as_scalar_f32(vm, args[2]),
+        as_scalar_f32(vm, args[3]),
+        as_scalar_f32(vm, args[4]),
+    ) {
+        (Some(a), Some(b), Some(c), Some(d)) => {
+            PrimResult::Ok(alloc::alloc_float32x4(vm, [a, b, c, d]))
+        }
+        _ => PrimResult::Fail,
+    }
+}
+
+/// `Float32x4 splat: v` — broadcast one scalar to all four lanes.
+fn prim_x4_splat(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    match as_scalar_f32(vm, args[1]) {
+        Some(v) => PrimResult::Ok(alloc::alloc_float32x4(vm, [v, v, v, v])),
+        None => PrimResult::Fail,
+    }
+}
+
+/// Elementwise binary op on two Float32x4 — each lane a single IEEE f32 op,
+/// bit-identical to the `.4s` NEON lane (the invariant the JIT fuse honours).
+macro_rules! prim_x4_binop {
+    ($name:ident, $op:tt) => {
+        fn $name(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+            match (as_float32x4(vm, args[0]), as_float32x4(vm, args[1])) {
+                (Some(a), Some(b)) => PrimResult::Ok(alloc::alloc_float32x4(
+                    vm,
+                    [a[0] $op b[0], a[1] $op b[1], a[2] $op b[2], a[3] $op b[3]],
+                )),
+                _ => PrimResult::Fail,
+            }
+        }
+    };
+}
+prim_x4_binop!(prim_x4_add, +);
+prim_x4_binop!(prim_x4_sub, -);
+prim_x4_binop!(prim_x4_mul, *);
+prim_x4_binop!(prim_x4_div, /);
+
+/// `aFloat32x4 at: i` — lane 1..4 as a Double (exact f32→f64 widening, no
+/// rounding). 1-based (Smalltalk convention).
+fn prim_x4_at(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    let lanes = match as_float32x4(vm, args[0]) {
+        Some(v) => v,
+        None => return PrimResult::Fail,
+    };
+    let i = match SmallInt::try_from(args[1]) {
+        Some(n) => n.value(),
+        None => return PrimResult::Fail,
+    };
+    if !(1..=4).contains(&i) {
+        return PrimResult::Fail;
+    }
+    PrimResult::Ok(alloc::alloc_double(vm, lanes[(i - 1) as usize] as f64).oop())
+}
+
 fn prim_double_sqrt(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     match crate::oops::wrappers::DoubleOop::try_from(args[0]) {
         Some(a) => PrimResult::Ok(alloc::alloc_double(vm, a.value().sqrt()).oop()),
@@ -1878,6 +2027,55 @@ mod tests {
         assert_eq!(x2_lane(&mut vm, moved, 2), 99.0);
     }
 
+    /// SIMD Float32x4 (`docs/SIMD.md`): the 4-lane f32 companion. Each lane is
+    /// a single-precision op — bit-identical to the `.4s` NEON lane the JIT
+    /// fuse emits (all test values are exact in f32, so `at:`'s f32→f64
+    /// widening is lossless and the asserts are sharp). Same GC-root
+    /// regression lock as Float64x2: `float32x4_klass` must be in
+    /// `memory::roots`, or an alloc after a scavenge poison-reads a moved klass.
+    fn x4_lane(vm: &mut VmState, v: Oop, i: i64) -> f64 {
+        match call(140, vm, &[v, smi(i)]) {
+            PrimResult::Ok(o) => f64::from_bits(MemOop::try_from(o).unwrap().body_word_raw(0)),
+            other => panic!("x4 at: failed: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn float32x4_arithmetic_and_gc_survival() {
+        // Part 1 — bit-identity, gc_stress OFF.
+        let mut vm = test_vm();
+        let va = alloc::alloc_float32x4(&mut vm, [1.5, 2.5, 3.5, 4.5]);
+        let vb = alloc::alloc_float32x4(&mut vm, [2.0, 4.0, 8.0, 16.0]);
+        let prod = match call(138 /* x4 * */, &mut vm, &[va, vb]) {
+            PrimResult::Ok(o) => o,
+            other => panic!("x4 * failed: {other:?}"),
+        };
+        let half = alloc::alloc_float32x4(&mut vm, [0.5, 0.5, 0.5, 0.5]);
+        let sum = match call(136 /* x4 + */, &mut vm, &[prod, half]) {
+            PrimResult::Ok(o) => o,
+            other => panic!("x4 + failed: {other:?}"),
+        };
+        assert_eq!(x4_lane(&mut vm, sum, 1), ((1.5f32 * 2.0) + 0.5) as f64);
+        assert_eq!(x4_lane(&mut vm, sum, 2), ((2.5f32 * 4.0) + 0.5) as f64);
+        assert_eq!(x4_lane(&mut vm, sum, 3), ((3.5f32 * 8.0) + 0.5) as f64);
+        assert_eq!(x4_lane(&mut vm, sum, 4), ((4.5f32 * 16.0) + 0.5) as f64);
+
+        // Part 2 — GC-root survival (the regression lock, as for Float64x2).
+        let slot = vm.stack.sp;
+        let keep = alloc::alloc_float32x4(&mut vm, [42.0, 99.0, -7.0, 3.25]);
+        vm.stack.push(keep);
+        let nil = vm.universe.nil_obj;
+        for _ in 0..8 {
+            call_rooted(93 /* gcScavenge */, &mut vm, nil);
+            let _fresh = alloc::alloc_float32x4(&mut vm, [1.0, 2.0, 3.0, 4.0]);
+        }
+        let moved = vm.stack.get(slot);
+        assert_eq!(x4_lane(&mut vm, moved, 1), 42.0);
+        assert_eq!(x4_lane(&mut vm, moved, 2), 99.0);
+        assert_eq!(x4_lane(&mut vm, moved, 3), -7.0);
+        assert_eq!(x4_lane(&mut vm, moved, 4), 3.25);
+    }
+
     /// `tests_s06.md`'s `prim_ids_frozen`: a regression lock on the id→name
     /// map every `.mst` `<primitive: N>` binds against. This registry
     /// deliberately diverges from `sprint_s06_detail.md`'s suggested
@@ -1971,6 +2169,13 @@ mod tests {
             (131, "*"),
             (132, "/"),
             (133, "at:"),
+            (134, "x:y:z:w:"),
+            (135, "splat:"),
+            (136, "+"),
+            (137, "-"),
+            (138, "*"),
+            (139, "/"),
+            (140, "at:"),
         ];
         assert_eq!(
             PRIMITIVES.len(),
