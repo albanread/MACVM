@@ -1,17 +1,20 @@
 # SIMD vector support — design
 
-**Status:** level-1 value vectors shipped for BOTH native NEON widths, both
-tiers. `Float64x2` — value class (`70b9475`) + NEON fuse `.2d` (`541b1b2`); and
-`Float32x4` — value class + NEON fuse `.4s`, generalizing the fuse to a
-kind-carrying `Ir::VecArith` (`cfd8c4f`). All built, verified byte-identical
-across `MACVM_JIT` off/threshold and `MACVM_GC_STRESS`, and measured ~13–15×
-over the interpreter (2 f64 or 4 f32 lanes per instruction). Still
-designed-not-built: the reducer/q-pool generalization (Part C1/C2, so a vector
-stays live in a `q`-register across ops instead of box-per-op), the v8–v15
-residency subtlety (C3), `ValueLoc::VectorSlot` deopt (C4), and the `FloatArray`
-bulk kernels + reductions (Parts D/E). The rest of this doc pins those in full.
-The interpreter's dispatch loop and the object model's core stay untouched
-throughout.
+**Status:** levels 1 AND 2 shipped. Level 1 — `Float64x2` (`70b9475`) +
+`Float32x4` value classes with the NEON JIT fuse `Ir::VecArith{kind}` →
+`.2d`/`.4s` (`541b1b2`, `cfd8c4f`), ~13–15× over the interpreter. Level 2 —
+`FloatArray` + explicit hand-written NEON bulk-kernel primitives `+@`/`sum`/
+`dot:` (`1f23ba7`), in `src/runtime/simd_kernels.rs`. Reductions ship in the
+**fast pairwise order** (a `float64x2_t` accumulator + `faddp.2d`), the chosen
+tradeoff (Part D) — deterministic (so interpreter ≡ JIT, both being one
+primitive) but NOT the scalar left-fold, which `FloatArray>>sequentialSum`
+provides for bit-parity. All verified byte-identical across `MACVM_JIT`
+off/threshold and `MACVM_GC_STRESS`. Still designed-not-built: the reducer/q-pool
+generalization (Part C1/C2, so a vector stays live in a `q`-register across ops
+instead of box-per-op), the v8–v15 residency subtlety (C3),
+`ValueLoc::VectorSlot` deopt (C4), integer vectors, and JIT auto-vectorization of
+`1 to: n do:` loops (E2 research). The interpreter's dispatch loop and the object
+model's core stay untouched throughout.
 
 **Goal.** Use the hardware's NEON lanes the way you would in a low-level
 language: a value type that *is* a bundle of 2/4/8/16 contiguous lanes, whole-
@@ -255,13 +258,18 @@ Each is a NEON streaming loop: `ld1 {v.4s}, [pa], #16` / `ld1 {v2.4s}, [pb], #16
 tail for the non-multiple remainder.
 
 **Two ways to get there, staged:**
-- **(v2) hand-written NEON primitives.** `FloatArray>>addArray:`, `dot:`,
-  `scale:`, `sum` as Rust/asm kernels (like the FFI trampolines). Simplest, the
-  biggest immediate win, and needs no JIT loop-vectorization — the whole loop is
-  one primitive call. This is the recommended first array path.
+- **(v2) hand-written NEON primitives — SHIPPED (`1f23ba7`).** `+@` (elementwise
+  add), `sum`, `dot:` as explicit `core::arch::aarch64` intrinsic kernels in
+  `src/runtime/simd_kernels.rs` (a `float64x2_t` stream + a scalar tail; the one
+  `runtime` module that opts back into `unsafe`). Explicit intrinsics on
+  purpose — a bulk kernel drives the silicon deliberately, NOT a scalar loop
+  left to rustc/LLVM to maybe vectorize. The whole loop is one primitive call,
+  so the interpreter and the JIT (which shims the primitive) run identical code.
 - **(research) JIT auto-vectorization** of a Smalltalk `1 to: n do:` loop:
   dependence analysis, alignment/tail handling, lane masking. Much harder, a
-  separate arc; the primitives cover the common kernels without it.
+  separate arc — and note OUR JIT does not auto-vectorize today, so this is net-
+  new compiler work, not a switch to flip; the primitives cover the common
+  kernels without it.
 
 ---
 
