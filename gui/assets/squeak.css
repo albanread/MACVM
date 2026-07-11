@@ -331,3 +331,6 @@ ul li::before {
 .glue { vertical-align: middle; }
 
 .st-code { font-family: var(--st-font-code); font-size: var(--st-size-code, var(--st-size-body)); white-space: pre-wrap; margin: 2px 0 6px; color: var(--st-black, inherit); }
+
+.st-smappl-src { display:block; width: 90%; min-height: 4.5em; font-family: var(--st-font-code); font-size: var(--st-size-code, var(--st-size-body)); margin: 2px 0; padding: 3px; box-sizing: border-box; white-space: pre; }
+.st-smappl-hint { font-size: 9px; color: var(--st-gray, #808080); margin: 0 0 6px; }

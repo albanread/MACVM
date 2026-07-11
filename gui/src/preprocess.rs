@@ -197,18 +197,18 @@ pub fn resolve_smappl_spans(
     out
 }
 
-/// Fill the empty `<pre class="st-code" data-src-class data-src-side
-/// data-src-sel></pre>` placeholders a `ClassOutliner` fragment emits
+/// Fill the empty `<textarea class="st-smappl-src" data-src-class data-src-side
+/// data-src-sel></textarea>` source editors a `ClassOutliner` fragment emits
 /// (`world/34_tools.mst`) with method source. The running VM keeps no source
 /// — it lives in image_store — so the worker (and the headless renderer)
 /// enrich the VM-rendered fragment here. `source_of(class, side, selector)`
-/// returns the text (or `None`, leaving the block blank). Reused by both call
+/// returns the text (or `None`, leaving the box empty). Reused by both call
 /// sites so they can't drift.
 pub fn inject_method_sources(
     html: &str,
     mut source_of: impl FnMut(&str, &str, &str) -> Option<String>,
 ) -> String {
-    const OPEN: &str = "<pre class=\"st-code\"";
+    const OPEN: &str = "<textarea class=\"st-smappl-src";
     let mut out = String::with_capacity(html.len());
     let mut rest = html;
     loop {
@@ -222,7 +222,7 @@ pub fn inject_method_sources(
         };
         let tag_end = pos + gt + 1;
         let tag = rest[pos..tag_end].to_string();
-        if rest[tag_end..].find("</pre>").is_none() {
+        if rest[tag_end..].find("</textarea>").is_none() {
             out.push_str(rest);
             break;
         }
@@ -616,11 +616,11 @@ mod tests {
 
     #[test]
     fn inject_method_sources_fills_empty_pre_blocks() {
-        // Two selector nodes; one has source, one (a `<=` selector, escaped in
-        // the attr) resolves to None and stays blank.
+        // Two selector editors; one has source, one (a `<=` selector, escaped
+        // in the attr) resolves to None and stays blank.
         let html = concat!(
-            r#"<pre class="st-code" data-src-class="Point" data-src-side="instance" data-src-sel="x"></pre>"#,
-            r#"<pre class="st-code" data-src-class="Point" data-src-side="instance" data-src-sel="&lt;="></pre>"#,
+            r#"<textarea class="st-smappl-src" data-src-class="Point" data-src-side="instance" data-src-sel="x"></textarea>"#,
+            r#"<textarea class="st-smappl-src" data-src-class="Point" data-src-side="instance" data-src-sel="&lt;="></textarea>"#,
         );
         let out = inject_method_sources(html, |cls, side, sel| {
             assert_eq!((cls, side), ("Point", "instance"));
@@ -630,9 +630,9 @@ mod tests {
                 other => panic!("unexpected selector {other}"),
             }
         });
-        assert!(out.contains("x [ ^x ]"), "source spliced into the block: {out}");
-        // The None block stays empty.
-        assert!(out.contains(r#"data-src-sel="&lt;="></pre>"#), "blank block preserved: {out}");
+        assert!(out.contains("x [ ^x ]"), "source spliced into the editor: {out}");
+        // The None editor stays empty.
+        assert!(out.contains(r#"data-src-sel="&lt;="></textarea>"#), "blank editor preserved: {out}");
     }
 
     #[test]

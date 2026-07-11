@@ -451,6 +451,42 @@ impl Image {
     /// prune to `RETENTION_LIMIT`. Returns `false` (no auto-create) if
     /// `class_name`/`side`/`selector` doesn't already name a method — same
     /// contract as `macvm-mock-vm::MockWorld::set_method_source`.
+    /// A class's current superclass name (`None` if the class is unknown or
+    /// its superclass is `nil`, e.g. `Object`). Used to reconstruct a
+    /// method-reopen (`<super> subclass: <Class> [ ... ]`) for live-compile.
+    pub fn superclass_of(&self, class_name: &str) -> rusqlite::Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT lcv.superclass_name FROM classes c \
+                 JOIN latest_class_versions lcv ON lcv.class_id = c.class_id \
+                 WHERE c.name = ?1 AND lcv.deleted = 0",
+                params![class_name],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map(|opt| opt.flatten())
+    }
+
+    /// How many versions of this method are retained (each accepted edit adds
+    /// one, capped at [`RETENTION_LIMIT`]). `0` if the method is unknown.
+    /// Lets callers confirm an edit was versioned, not overwritten, and backs
+    /// a future version-history view.
+    pub fn method_version_count(
+        &self,
+        class_name: &str,
+        side: Side,
+        selector: &str,
+    ) -> rusqlite::Result<i64> {
+        let Some(method_id) = self.method_id_of(class_name, side, selector)? else {
+            return Ok(0);
+        };
+        self.conn.query_row(
+            "SELECT COUNT(*) FROM method_versions WHERE method_id = ?1",
+            params![method_id],
+            |r| r.get(0),
+        )
+    }
+
     pub fn set_method_source(
         &self,
         class_name: &str,

@@ -116,6 +116,17 @@ pub enum VmRequest {
     SmapplAction {
         action_id: String,
     },
+    /// Cmd+S in a ClassOutliner source editor (`smtk.js`): accept an edited
+    /// method. The worker **versions** it back into image_store
+    /// (`set_method_source` → a new `method_versions` row, never an overwrite)
+    /// AND live-compiles it into the running VM — the same proven path the
+    /// class browser's `BrowserSaveSource` uses.
+    SmapplAccept {
+        cls: String,
+        side: String,
+        sel: String,
+        text: String,
+    },
     /// Reset the worker's `BrowserSelection` to match the fresh default
     /// state the initial page render always shows (see
     /// `main.rs::open_class_browser`) — sent once whenever the browser
@@ -906,6 +917,48 @@ fn handle(
                 Ok(()) => vec![],
                 Err(e) => vec![VmResponse::Transcript(format!("{e}"))],
             }
+        }
+        VmRequest::SmapplAccept {
+            cls,
+            side,
+            sel,
+            text,
+        } => {
+            // Reuse the class browser's proven accept path (BrowserSaveSource):
+            // (1) VERSION the edit into image_store — a new method_versions row,
+            //     never an overwrite (the user's explicit requirement);
+            // (2) mirror it into `world` so the browser view stays consistent;
+            // (3) live-compile it into the running VM so it takes effect now.
+            let img_side = if side == "class" {
+                image_store::Side::Class
+            } else {
+                image_store::Side::Instance
+            };
+            let mirror_side = if side == "class" {
+                Side::Class
+            } else {
+                Side::Instance
+            };
+            world.set_method_source(&cls, mirror_side, &sel, text.clone());
+            let versioned = image
+                .map(|img| img.set_method_source(&cls, img_side, &sel, &text))
+                .transpose();
+            // Reopen source needs the real superclass. image_store is the
+            // authoritative source (the running VM has it too, but the mock
+            // `world` may not — it isn't synced to arbitrary VM classes).
+            let superclass = image
+                .and_then(|img| img.superclass_of(&cls).ok().flatten())
+                .or_else(|| world.class_named(&cls).and_then(|c| c.superclass.clone()))
+                .unwrap_or_else(|| "nil".to_string());
+            let reopen = format!("{superclass} subclass: {cls} [\n{}\n]\n", text.trim());
+            let versioned = match versioned {
+                Ok(_) => match live_compile(vm, &reopen) {
+                    Ok(()) => format!("Accepted {cls}>>{sel} — versioned to the image and live"),
+                    Err(e) => format!("Accepted {cls}>>{sel} to the image, but compile failed: {e}"),
+                },
+                Err(e) => format!("{cls}>>{sel}: image write FAILED (not versioned): {e}"),
+            };
+            vec![VmResponse::Transcript(versioned)]
         }
         VmRequest::BrowserOpen => {
             // No longer resets `selection` to default — that made sense
@@ -1879,6 +1932,82 @@ mod tests {
         );
     }
 
+    /// Accepting a ClassOutliner edit VERSIONS it into image_store (a new
+    /// `method_versions` row, never an overwrite — the user's explicit
+    /// requirement) AND live-compiles it into the running VM.
+    #[test]
+    fn smappl_accept_versions_the_edit_and_makes_it_live() {
+        let world_dir = test_world_dir();
+        let tmp = std::env::temp_dir()
+            .join(format!("macvm_accept_{}.sqlite3", std::process::id()));
+        std::fs::remove_file(&tmp).ok();
+        let image = open_or_seed_image(&world_dir, &tmp).expect("seed");
+
+        let mut vm = VmHandle::boot_without_world(macvm::runtime::VmOptions {
+            heap_mib: 64,
+            jit: macvm::runtime::JitMode::Off,
+            ..Default::default()
+        });
+        crate::world_boot::load_world_from_image(&mut vm, &image, WORLD_DOITS).expect("db load");
+        let mut world = MockWorld::seed();
+        let mut selection = BrowserSelection::default();
+
+        let versions_before = image
+            .method_version_count("Point", image_store::Side::Instance, "y")
+            .unwrap();
+        assert_eq!(
+            vm.eval("(Point x: 7 y: 2) y.").unwrap(),
+            "2",
+            "sanity: Point>>y returns the y ivar"
+        );
+
+        // Redefine Point>>y to return the x ivar — proves redefinition is live
+        // AND that reopening preserved the ivars.
+        let responses = handle(
+            VmRequest::SmapplAccept {
+                cls: "Point".to_string(),
+                side: "instance".to_string(),
+                sel: "y".to_string(),
+                text: "y [ ^x ]".to_string(),
+            },
+            &mut world,
+            &mut selection,
+            Some(&image),
+            &mut vm,
+        );
+        assert!(
+            transcript_containing(&responses, "versioned"),
+            "accept must report it versioned the edit, got {responses:?}"
+        );
+
+        // 1. A NEW version row exists (not an overwrite).
+        let versions_after = image
+            .method_version_count("Point", image_store::Side::Instance, "y")
+            .unwrap();
+        assert_eq!(
+            versions_after,
+            versions_before + 1,
+            "each accept must add exactly one method_versions row"
+        );
+        // 2. The latest version in the DB is the edited text.
+        assert_eq!(
+            image
+                .method_source("Point", image_store::Side::Instance, "y")
+                .unwrap()
+                .as_deref(),
+            Some("y [ ^x ]"),
+            "the image's latest version must be the edit"
+        );
+        // 3. The running VM now runs the redefined method (ivars preserved).
+        assert_eq!(
+            vm.eval("(Point x: 7 y: 2) y.").unwrap(),
+            "7",
+            "the edit must be live in the VM, with the x ivar preserved"
+        );
+
+        std::fs::remove_file(&tmp).ok();
+    }
+
     /// A `ClassOutliner` rendered through `handle` gets its method-source
     /// `<pre>` blocks filled from image_store (the VM keeps no source) —
     /// exercises the full worker seam incl. `inject_method_sources`.
@@ -1917,7 +2046,7 @@ mod tests {
         // its selector node's <pre> — a snippet unique to the source, not the
         // selector list.
         assert!(
-            html.contains("nextPutAll:") && html.contains("st-code"),
+            html.contains("nextPutAll:") && html.contains("st-smappl-src"),
             "the class outliner must carry Point's method source, got a {}-char fragment",
             html.len()
         );

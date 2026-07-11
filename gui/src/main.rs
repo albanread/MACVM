@@ -831,6 +831,18 @@ extern "C" fn on_script_message(_this: Id, _cmd: Sel, _controller: Id, message: 
                 });
             }
         }
+        "smapplAccept" => {
+            // Cmd+S in a ClassOutliner source editor — version the edit into
+            // the image and live-compile it.
+            if let Some(vm) = VM.get() {
+                vm.submit(vm_host::VmRequest::SmapplAccept {
+                    cls: dict_get_string(body, "cls"),
+                    side: dict_get_string(body, "side"),
+                    sel: dict_get_string(body, "sel"),
+                    text: dict_get_string(body, "text"),
+                });
+            }
+        }
         _ => {}
     }
 }

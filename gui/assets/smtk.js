@@ -319,6 +319,29 @@
     true
   );
 
+  // Cmd+S (or Ctrl+S) inside a ClassOutliner smappl source editor accepts the
+  // edit — vm_host versions it back into image_store (never an overwrite) and
+  // live-compiles it into the running VM. Scoped to `.st-smappl-src` so it
+  // can't collide with the class browser's own `.st-browser-source` Cmd+S.
+  document.addEventListener(
+    "keydown",
+    function (ev) {
+      const input = ev.target.closest(".st-smappl-src");
+      if (!input) return;
+      if ((ev.metaKey || ev.ctrlKey) && (ev.key === "s" || ev.key === "S")) {
+        ev.preventDefault();
+        post({
+          kind: "smapplAccept",
+          cls: input.getAttribute("data-src-class") || "",
+          side: input.getAttribute("data-src-side") || "",
+          sel: input.getAttribute("data-src-sel") || "",
+          text: input.value,
+        });
+      }
+    },
+    true
+  );
+
   // ── Workspace (workspace_render.rs) ────────────────────────────────────
   //
   // Do it/Print it act on the current selection, or the whole buffer if

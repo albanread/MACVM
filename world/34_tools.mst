@@ -183,13 +183,18 @@ Visual subclass: ClassOutliner [
             html raw: '<span class="st-tw" data-tw>&#9656; </span>'.
             html escaped: sel asString.
             html raw: '</span><div class="st-children" style="display:none">'.
-            html raw: '<pre class="st-code" data-src-class="'.
+            "An editable source box (the worker/headless renderer fills it from
+             image_store); Cmd+S accepts, versioning the edit back into the DB
+             (smtk.js smapplAccept -> vm_host)."
+            html raw: '<textarea class="st-smappl-src" spellcheck="false" rows="4" data-src-class="'.
             html escaped: mirror name.
             html raw: '" data-src-side="'.
             html raw: label.
             html raw: '" data-src-sel="'.
             html escaped: sel asString.
-            html raw: '"></pre></div></div>' ].
+            html raw: '"></textarea>'.
+            html raw: '<div class="st-smappl-hint">&#8984;S to accept (versioned)</div>'.
+            html raw: '</div></div>' ].
         html raw: '</div></div>'.
     ]
 ]
