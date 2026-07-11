@@ -33,7 +33,9 @@ if [[ "${1:-}" == "--release" ]]; then
 fi
 
 echo "▸ building macvm-gui (${bin_dir})…"
-cargo build -p macvm-gui "${profile_flag[@]}"
+# Bash 3.2 (macOS default) treats "${arr[@]}" on an empty array as an unbound
+# variable under `set -u`; the `[@]+…` form expands to nothing when empty.
+cargo build -p macvm-gui ${profile_flag[@]+"${profile_flag[@]}"}
 
 echo "▸ launching MACVM GUI  (MACVM_JIT=${MACVM_JIT:-threshold=10 (GUI default)})"
 # exec so the app takes over this process — the script blocks until you quit
