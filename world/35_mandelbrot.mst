@@ -15,7 +15,7 @@
 Object subclass: Mandelbrot [
     | maxIter |
     Mandelbrot class >> new [ ^self basicNew init ]
-    init [ maxIter := 64. ^self ]
+    init [ maxIter := 120. ^self ]
     maxIter: n [ maxIter := n. ^self ]
 
     "Escape count for c = cr + ci*i: iterations until |z| > 2, capped at
@@ -45,9 +45,10 @@ Object subclass: Mandelbrot [
         ^'rgb(', r printString, ',', g printString, ',', b printString, ')'
     ]
 
-    "Default full-set view over a `w` x `h` canvas."
+    "Default full-set view over a `w` x `h` canvas, at native pixel
+     resolution (cell: 1 — one canvas pixel per computed point)."
     commandsForWidth: w height: h [
-        ^self commandsForWidth: w height: h cell: 3
+        ^self commandsForWidth: w height: h cell: 1
     ]
 
     "The Canvas draw-command batch (docs/CANVAS.md §5.2 JSON) for the set drawn

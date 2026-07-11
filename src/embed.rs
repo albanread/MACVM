@@ -509,6 +509,26 @@ mod tests {
         assert_eq!(result, "7");
     }
 
+    /// A bare Do-it (no terminating period) must evaluate, not fail with
+    /// "expected '.' after statement". This is how every GUI doit arrives —
+    /// the tour's `doit="Mandelbrot new launch"` and a Workspace "Do it" on a
+    /// selected expression both lack a trailing period.
+    #[test]
+    fn eval_tolerates_a_missing_trailing_period() {
+        let mut vm = boot_test_vm(JitMode::Off);
+        assert_eq!(
+            vm.eval("3 + 4").expect("a bare expression must evaluate without a trailing period"),
+            "7"
+        );
+        // A trailing period still works (unchanged).
+        assert_eq!(vm.eval("10 * 2.").expect("with period still fine"), "20");
+        // Genuine trailing garbage after a complete statement is still an error.
+        assert!(
+            vm.eval("3 + 4  5").is_err(),
+            "two statements without a separating period must still be rejected"
+        );
+    }
+
     /// "the JIT MUST be supported" (the S21 directive this whole module
     /// exists to satisfy) — `boot`/`eval` place no restriction on
     /// `opts.jit` at all. `Threshold(1)` compiles on the very first call,

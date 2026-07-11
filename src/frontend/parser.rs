@@ -1121,7 +1121,13 @@ pub fn parse_one_top_item(input: &str) -> Result<Option<TopItem>, CompileError> 
         TopItem::ClassDef(p.parse_class_def()?)
     } else {
         let stmt = p.parse_statement()?;
-        p.expect(&Tok::Period, "expected '.' after statement")?;
+        // A single REPL/doit statement needs NO terminating period — a bare
+        // `3 + 4` or a tour `doit="Mandelbrot new launch"` is complete as-is
+        // (standard Smalltalk Do-it). Require the period only when more input
+        // follows, so genuine trailing garbage (`3 + 4  5`) is still an error.
+        if !matches!(p.cur.0, Tok::Eof) {
+            p.expect(&Tok::Period, "expected '.' after statement")?;
+        }
         TopItem::DoIt(stmt)
     };
     Ok(Some(item))

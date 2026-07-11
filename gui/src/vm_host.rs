@@ -1531,12 +1531,22 @@ fn handle(
             // Real Smalltalk builds the whole batch (docs/CANVAS.md §5.2); Rust
             // only transports the string. Generic — the worker neither knows
             // nor cares what `code` draws. A compute failure is echoed to the
-            // transcript like a doit, not dropped.
+            // transcript like a doit, not dropped. The wall-clock compute time
+            // is reported to the transcript (matching the Strongtalk Mandelbrot
+            // demo, which prints its compute time in ms) — generic, so ANY
+            // canvas drawing gets a timing readout, not just the Mandelbrot.
+            let started = std::time::Instant::now();
             match vm.eval_to_string(&code) {
-                Ok(commands_json) => vec![VmResponse::CanvasDraw {
-                    id: CANVAS_ID,
-                    commands_json,
-                }],
+                Ok(commands_json) => {
+                    let ms = started.elapsed().as_millis();
+                    vec![
+                        VmResponse::CanvasDraw {
+                            id: CANVAS_ID,
+                            commands_json,
+                        },
+                        VmResponse::Transcript(format!("canvas: computed in {ms} ms")),
+                    ]
+                }
                 Err(e) => vec![VmResponse::Transcript(format!("canvas eval failed: {e}"))],
             }
         }
@@ -2020,8 +2030,10 @@ mod tests {
             None,
             &mut vm,
         );
-        let [VmResponse::CanvasDraw { id, commands_json }] = responses.as_slice() else {
-            panic!("expected exactly one CanvasDraw response, got {responses:?}");
+        let [VmResponse::CanvasDraw { id, commands_json }, VmResponse::Transcript(timing)] =
+            responses.as_slice()
+        else {
+            panic!("expected [CanvasDraw, Transcript(timing)], got {responses:?}");
         };
         assert_eq!(*id, 0);
         assert!(
@@ -2033,6 +2045,10 @@ mod tests {
         assert!(
             commands_json.contains("rgb(0,0,0)"),
             "the set interior must appear — the float compute must have run"
+        );
+        assert!(
+            timing.contains("ms"),
+            "the compute time must be reported to the transcript, got {timing:?}"
         );
     }
 
