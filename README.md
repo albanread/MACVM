@@ -127,6 +127,26 @@ layer removing a *category* of cost:
 heap per render.** Full design, the measured-and-rejected variants included,
 in [`docs/float_fastpath_design.md`](docs/float_fastpath_design.md).
 
+**How close is that to C?** The honest external yardstick — the *identical*
+Mandelbrot kernel hand-ported to C (same 420×220, same escape loop and
+coordinate accumulation, checksum-verified equal work), compiled with the same
+Apple `clang`, warmed, best-of-30 on the same machine:
+
+| engine | time | vs C ‑O2 |
+|--------|------|----------|
+| C, ‑O2 (== ‑O3 ‑march=native) | 4.6 ms | 1.0× |
+| C, ‑O0 | 13.1 ms | 2.9× |
+| **MACVM tier‑1 JIT** | **25.2 ms** | **5.5×** |
+| MACVM interpreter | 3406 ms | 745× |
+
+So the tier‑1 JIT lands **~1.9× off *unoptimized* C and ~5.5× off optimized
+C** — solid-baseline-JIT territory for a dynamic language (the "~30×" above is
+against our own interpreter floor, not against C; absolute times are the fair
+measure). The remaining gap to ‑O2 is specific and known: no FMA fusion
+(`fmul; fadd` vs a single `fmadd`), and `escapeAtRe:im:` is still a per‑pixel
+compiled *send* rather than inlined into the pixel loop the way C inlines
+`escape()`.
+
 ### Design & planning docs
 
 | Doc | Contents |
