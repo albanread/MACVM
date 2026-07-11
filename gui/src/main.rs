@@ -366,21 +366,26 @@ fn cmd_seed(args: &[String]) {
     }
 }
 
-fn navigate_to(path: &Path) {
+/// Displays `path` (a view marker or a corpus file). Returns `false` if a file
+/// load failed — the caller must NOT commit a failed target to history, or a
+/// broken relative link's bad path becomes `current()` and the next relative
+/// click resolves against it, compounding (the documentation-tour
+/// `tour/tour/tour/…` bug). Marker views always succeed.
+fn navigate_to(path: &Path) -> bool {
     if path == browser_view_marker() {
         // Back/forward/refresh landing back on the browser marker: NAV
         // already points here (unlike `open_class_browser`, which pushes
         // it), so just re-request current state — same "never show a page
         // before its data arrives" rule applies on the way back in, too.
         request_browser_open();
-        return;
+        return true;
     }
     if path == workspace_view_marker() {
         // Unlike the browser marker, this rebuilds and displays the page
         // directly — see `open_workspace`'s doc comment for why there's no
         // VM round trip (or content persistence) involved here.
         display_workspace();
-        return;
+        return true;
     }
     if path == canvas_view_marker() {
         // Same shape as the workspace marker: rebuild and display directly.
@@ -388,13 +393,13 @@ fn navigate_to(path: &Path) {
         // limitation `open_workspace`'s doc comment already notes for its
         // own content — see `open_canvas`'s doc comment.
         display_canvas();
-        return;
+        return true;
     }
     if path == class_outliner_view_marker() {
         // Rebuild the smappl class-outliner page; its `<smappl>` resolves
         // via the worker on load, same as any corpus page.
         display_class_outliner();
-        return;
+        return true;
     }
     if let Some(tool) = path
         .file_name()
@@ -402,7 +407,7 @@ fn navigate_to(path: &Path) {
         .and_then(|n| n.strip_prefix(".find-"))
     {
         display_find(tool);
-        return;
+        return true;
     }
     let html = match preprocess::load_and_preprocess(
         path,
@@ -413,10 +418,11 @@ fn navigate_to(path: &Path) {
         Ok(html) => html,
         Err(e) => {
             eprintln!("macvm-gui: failed to load {}: {e}", path.display());
-            return;
+            return false;
         }
     };
     display_html(&html);
+    true
 }
 
 /// Render the class browser's initial state and display it — shared by
@@ -793,8 +799,19 @@ extern "C" fn on_script_message(_this: Id, _cmd: Sel, _controller: Id, message: 
                     .to_path_buf()
             };
             let target = normalize_path(&current_dir.join(&href));
-            nav.lock().unwrap().go(target.clone());
-            navigate_to(&target);
+            // Commit to history only if the page actually loads. A broken link
+            // otherwise makes its non-existent path `current()`, so the next
+            // relative click resolves against it and the path compounds
+            // (documentation-tour `tour/tour/…`). On failure the displayed page
+            // and `current()` are both unchanged.
+            if navigate_to(&target) {
+                nav.lock().unwrap().go(target);
+            } else {
+                eval_js(&format!(
+                    "if(window.macvmSetStatus)window.macvmSetStatus({})",
+                    js_string_literal(&format!("Not found: {href}"))
+                ));
+            }
         }
         // Class browser view (`browser_render.rs`, `../PLAN.md`'s "hierarchy"
         // toolbar action) — each of these just submits a request to the VM
