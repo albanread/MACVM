@@ -8,6 +8,14 @@ departure from Strongtalk's own design (Strongtalk's interpreter was
 mostly eliminated the boundary: always compile, even cheaply, re-optimize
 what gets hot.
 
+> **UPDATE 2026-07-11 — the compiler-coverage arc this essay charts is now
+> MET.** Primitive-bearing methods compile via a shared primitive-shim
+> (`docs/prim_shims.md`; 44/66 shimmed); escaping non-NLR closures compile
+> (S24 A3) and closures generally compile+splice inline (S24 A1-A3, B1-B5).
+> ~98.7% of methods that run now compile; deltablue 214ms->4ms (53x). The
+> dated gate/roadmap sections below describe an already-traversed path, kept
+> for the architectural argument.
+
 **This is not a big-bang rewrite.** The framing that makes it tractable:
 getting to always-compile is *literally* the project's own already-underway
 arc — keep widening the tier-1 eligibility gate, sprint over sprint, same

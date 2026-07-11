@@ -1,6 +1,8 @@
 # S24 B-phase L2 — OSR for closure-bearing methods + sub-threshold entry
 
-**Status:** designed, pre-implementation. Product of a 3-reader + 3-design-panel
+**Status:** LANDED (S24 B-phase L2). Commits d609251 (steps 1-2), 51401dc (step 3
+phase A), c0c51cd (step 4 phase B Context ADOPTION), d01a67a (steps 5+7).
+deltablue 30.6x, richards 34x, ctxloop 134x. Product of a 3-reader + 3-design-panel
 + judge workflow (wf_2fef6e9f-5a7, 2026-07-10; full transcripts in the session
 workflow dir). Base design = "symmetry-first" (score 35/40), with grafts from
 "risk-first" (32) — baseline pin, version-churn fix, `ctxloop.mst` microbench,

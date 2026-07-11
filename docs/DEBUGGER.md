@@ -1,7 +1,9 @@
 # MACVM Debugger Design — HALT and PROBE
 
-**Status:** Design v2 — revised after a line-level substrate audit (2026-07-06);
-DBG0 implementation in progress. v2 changes: PROBE's walkback is a NEW
+**Status:** Design v2 implemented — DBG0-DBG3 complete and gated (crash
+dossier; HALT + mixed-tier backtrace; a64 disassembler) and DBG5 PROBE live
+mode complete (MACVM_TRACE=calls/oops, MACVM_STEP_CALLS); DBG4 (W-debugger)
+deferred. See §6 for per-wave status. v2 changes: PROBE's walkback is a NEW
 raw-fp-seeded walker (the vanilla walker provably panics at any async
 mid-nmethod crash — §4.2); fault-hardening rules added (§4.5 — catch_unwind
 does not catch SIGSEGV); the "static state only" claim corrected to the

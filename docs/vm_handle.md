@@ -180,16 +180,16 @@ specific feature, not a limitation of `VmHandle` itself.)
 
 - **`mirrors()`** — `docs/SPEC.md`'s design sketch for `VmHandle` includes
   a `mirrors()` method returning a reflection surface for building class
-  browsers, inspectors, and similar tools. It is not implemented — the
-  actual `src/embed.rs` today has exactly the three methods above.
-- **No real consumer in this repo yet.** The GUI (`gui/`) is the intended
-  first user of `VmHandle`, but as of this writing its worker thread
-  (`gui/src/vm_host.rs`) still runs a hand-written stub, not the real
-  `VmHandle` — its own doc comments say so explicitly. If you're looking
-  for a working example of `VmHandle` embedded in a full application,
-  there isn't one yet; the test suite in `src/embed.rs` (7 tests, all
-  exercising real scenarios against the real `world/` image) is the most
-  complete example available today.
+  browsers, inspectors, and similar tools. `mirrors()` remains the one
+  unimplemented piece — but `src/embed.rs` today exposes more than the three
+  methods above: `boot`, `boot_without_world`, `eval`, `exec`, and
+  `set_transcript`, plus the module-level `set_fatal_mode` / `FatalMode`.
+- **The GUI is now the real first consumer.** `gui/src/vm_host.rs` boots a
+  `VmHandle` and evaluates workspace/page doits via `vm.eval`, and
+  live-compiles class-browser edits via `vm.exec`, all behind a
+  restart-on-death supervisor (S21 step 3 / S22-E). The test suite in
+  `src/embed.rs` (7 tests, all exercising real scenarios against the real
+  `world/` image) remains the most self-contained example.
 
 ## Quick reference
 

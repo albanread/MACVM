@@ -20,7 +20,7 @@ Silicon (arm64)**.
 | D3 | **64-bit throughout** | fixed | Both originals are 32-bit; widening re-derives tags, mark word, smi range, floats — do it once, cleanly. §3.1 |
 | D4 | **Modernize where flagged** | fixed | 64-bit mark word (no age/size punning), NaN-boxed/heap doubles (not Self's truncated-exponent floats), SSA-ish IR + linear-scan regalloc, immutable bytecode + side-table ICs. |
 | D5 | **Adaptive compilation kept from Self/Strongtalk** | fixed | Inline caches → PICs → type feedback → optimizing recompilation → deoptimization. The crown jewels; present in both. §4 |
-| D6 | **Codegen backend: vendor JASM's Rust AArch64 encoder** | leaning | Pure-Rust, LLVM-MC-verified, with a working `MAP_JIT` loader. Wrapped behind the `Assembler` trait. §5 |
+| D6 | **Codegen backend: vendor JASM's Rust AArch64 encoder** | fixed | Pure-Rust, LLVM-MC-verified, with a working `MAP_JIT` loader. Wrapped behind the `Assembler` trait. §5 |
 | D7 | **Baseline tier: threaded-code interpreter** | fixed | Fast start, gathers IC feedback, serves as deopt target. §4.1 |
 | D8 | Tag scheme: **2-bit, Int=00/Mem=01/Mark=11**, 62-bit smis | fixed | Pinned in `SPEC.md` §2.1–2.2 (with explicit 64-bit mark-word fields). |
 | D9 | Floats: **heap-boxed Double** (NaN-boxing shelved) | fixed | `SPEC.md` §1.3; isolated behind oops accessors, revisitable. |
@@ -189,5 +189,6 @@ dependency at all.
 All questions previously listed here were closed by [`SPEC.md`](SPEC.md) — see
 decisions D8–D13 in §0 and `SPEC.md` §14. Remaining genuinely-open item:
 
-- [ ] Confirm D6 (JASM vendor) via the Sprint S9 spike wrapping `encode`
-      behind the `Assembler` trait.
+- [x] Confirm D6 (JASM vendor) via the Sprint S9 spike wrapping `encode`
+      behind the `Assembler` trait. — DONE in S9: vendored and shipping as
+      `JasmAssembler` behind the `Assembler` trait (the sole codegen backend).

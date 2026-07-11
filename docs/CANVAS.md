@@ -4,10 +4,11 @@ Design for a Smalltalk-allocatable drawing surface: Smalltalk code (once
 the compiler/VM side is ready) allocates a canvas of a given size and
 sends it batches of drawing commands, rendered via the browser's own
 Canvas 2D API. Same posture as `docs/FFI.md`/`docs/ASM.md`: designed in
-full, but only the GUI-side half is built now — the VM-side primitives
-that would let real Smalltalk code drive this don't exist yet (S12/S13
-are still compiler/deopt work), so this stays a side track that touches
-neither `src/compiler` nor `src/interpreter`.
+full, but only the GUI-side half is built now — the VM-side `Canvas` class
+and its `<primitive:>` bodies simply haven't been built yet (the GUI-side
+rendering half, committed 3daaf72, is the only implemented portion), so
+this stays a side track that touches neither `src/compiler` nor
+`src/interpreter`.
 
 ## 0. Scope and non-goals
 
@@ -217,9 +218,10 @@ Called from Rust exactly like every other page mutation:
 ## 7. Deferred
 
 - The VM-side `Canvas` class and its `<primitive: N>` bodies — the real
-  point at which this becomes usable from Smalltalk at all. Needs S12/S13
-  compiler work to land first (this whole feature is explicitly a side
-  track staying out of that work's way).
+  point at which this becomes usable from Smalltalk at all. Simply haven't
+  been built yet (this whole feature is explicitly a side track staying out
+  of the compiler/deopt work's way); the GUI-side rendering half, committed
+  3daaf72, is the only implemented portion.
 - Multiple simultaneous canvases (`id` is already threaded through the
   protocol for this reason, but v1's GUI side only ever creates/targets a
   single `macvm-canvas-0`).

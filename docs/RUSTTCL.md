@@ -166,11 +166,9 @@ first.
 **Caveat**: `load` (like `macvm run`) has no protection against a runtime
 error with no `#doesNotUnderstand:`/handler installed reaching MACVM's
 `error:` primitive, which hard-exits the whole process (`-> !`, by
-design — this is a research VM without a debugger-style recovery path
-yet). Loading a file that hits one takes the *entire RUSTTCL session*
-down with it, not just that command — genuinely happened while drafting
-this doc: `MACVM_JIT=threshold=1 macvm rusttcl` then `load
-world/bench/richards.mst` reliably reproduces a real, still-open bug (a
-`doesNotUnderstand: #deviceInAdd:` under aggressive JIT). If a `load`
+design — DBG0-5 exist, but the debugger is not armed on the `load`
+path). Loading a file that hits one takes the *entire RUSTTCL session*
+down with it, not just that command: an unhandled error reaching
+`error:` with no handler hard-exits the shell. If a `load`
 needs to survive whatever the file does, run it once via plain `macvm
 run` first to characterize the risk.

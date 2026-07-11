@@ -1,7 +1,9 @@
 # S24 B5 — multi-basic-block block splicing (design record)
 
 **Status:** designed + adversarially verified (workflow wf_1c5c7ca1-e2d,
-2026-07-10; verdict REFUTED:false). Implementation in progress. Prerequisites:
+2026-07-10; verdict REFUTED:false). LANDED — all steps shipped. 4a412f5 (step1),
+b587e8e (step2), 4c58fbd (step3), 2d8c1ad (step4), 5bcfb09+6a51a8c (step5),
+f4953c1 (step6/B3). deltablue 214ms->4ms (53.5x). Prerequisites:
 B1 (1598654), B4 (d47714d — the deopt story: any in-splice deopt synthesizes a
 home-ref closure, so B5 is pure compiler-frontend work).
 

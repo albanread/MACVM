@@ -1,6 +1,9 @@
 # Compiled-Send Auditor — PROBE live mode (DBG5 candidate)
 
-**Status:** design, pre-review. Extends `docs/DEBUGGER.md` (§0, §4, §6).
+**Status:** IMPLEMENTED as DBG5 (commits 7580e55, ef2d294, 27f1450, b7599fd),
+folded into docs/DEBUGGER.md. Ships MACVM_TRACE=calls, MACVM_TRACE=oops,
+MACVM_STEP_CALLS via force-cold ICs; localized the S24 A3b materialized-Context
+GC crash. Extends `docs/DEBUGGER.md` (§0, §4, §6).
 Sprint on clean `main` (HEAD 96faa0a, S24 A3a); the S24 A3b WIP is stashed and
 returns after this lands — its GC crash is DBG5's first real customer.
 

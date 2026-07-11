@@ -1126,8 +1126,7 @@ must never call `.join()`/`.is_finished()` on that thread's `JoinHandle` —
 see `src/embed.rs`'s module doc for why (a `pthread_exit`-terminated thread
 never completes `JoinHandle`'s own bookkeeping). See
 `src/codecache/deopt_trap.rs`'s `arm_foreign_fault_handler` for the
-mechanism, which works regardless of `opts.jit` (needed because §16.5 below
-requires `MACVM_JIT=off` for the Browser's accept path).
+mechanism, which works regardless of `opts.jit`.
 
 ### 16.3 Mirrors — the reflection surface (needed by G3/G4) *(REVISED — A19)*
 **Mirrors are Smalltalk-side objects backed by small, dumb VM primitives** —
@@ -1151,6 +1150,6 @@ Controlled by `MACVM_KEEP_SOURCE` (default **on**; `=0` for memory-lean runs).
 
 ### 16.5 Redefinition caveat
 Interpreter-tier method redefinition is safe from S3 (IC self-heal + lookup
-flush). **Compiled-tier** redefinition requires S13's dependency invalidation —
-until S13 lands, the GUI's accept path (G4) must run the VM with
-`MACVM_JIT=off`.
+flush). **Compiled-tier** redefinition is now safe via S13's dependency
+invalidation (landed), so the GUI's accept path (G4) runs with the JIT enabled
+(default on); no `MACVM_JIT=off` workaround is required.

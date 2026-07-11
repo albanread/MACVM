@@ -21,14 +21,16 @@ S20 entry to point here.
 - **Designed and partially built now**: the whole architecture (§§1–7), and a
   working, tested generator crate (§6) that queries `cocoa_data/cocoa.sqlite`
   and emits real Smalltalk-syntax bindings for a small curated manifest.
-- **Not built now**: the VM-side calling primitive and its JIT trampoline
-  (§5) — the part that would actually execute a native call. That's the real
-  S20 implementation sprint, scheduled after S12–S14 (deopt/GC-under-compiled/
-  inlining) are further along, per the "without disrupting compiler work"
-  instruction this side project runs under. The generator's output is
-  forward-declared against that not-yet-existing primitive (§6.3), same as
-  `world/*.mst` already forward-declares against primitives some sprints
-  haven't reached yet (e.g. process primitives, per `WORLD.md` §9).
+- **Built now (S20)**: the Tier-1 POSIX/libc calling path is built and
+  callable — the VM-side calling primitive and its shape-keyed trampoline (§5)
+  that actually execute a native call. dlsym symbol resolution,
+  `ffi_stubs.rs`'s shape-keyed trampolines, the FFI primitive dispatched via
+  `runtime/ffi`, the `<primitive: FFI ...>` pragma frontend (§6.3), and the
+  `Alien` type are all in; the generator's output now runs against a primitive
+  that exists.
+- **Not built now**: Tier-2 Cocoa/ObjC dispatch — the
+  `doesNotUnderstand:`-based `objc_msgSend` path (§3) — remains the scheduled
+  remainder of the S20 implementation work.
 - **Not attempted**: passing a Smalltalk closure as a native callback/block
   (§7) — genuinely harder than everything else here, explicitly deferred.
 
@@ -300,7 +302,7 @@ later, still-to-be-built runtime piece will consume.
      arity check (which caught this) is itself a test
      (`posix_manifest_arity_mismatch_is_a_generation_error_not_a_panic`).
 
-### 6.3 What the generated output looks like (forward-declared, not yet callable)
+### 6.3 What the generated output looks like (now runs — the Tier-1 FFI primitive exists)
 
 Real output, `cargo run -p ffi_gen --bin generate_ffi`, verified against the
 live database while writing this doc (not hand-typed to look plausible):
@@ -345,12 +347,12 @@ text — real keyword parts don't always make distinct, valid Smalltalk
 identifiers on their own, and generated code doesn't need to read as
 hand-written (the header comment already says so).
 
-The `<primitive: FFI ...>` pragma is intentionally forward-declared against a
-primitive that doesn't exist yet (no `FFI` primitive group is registered in
-`src/runtime/primitives.rs` today) — the same honest gap `world/*.mst` already
-carries in a few places for primitives future sprints haven't reached. The
-generator's contract is "produce the right *declaration*, resolvable the
-moment the real primitive exists," not "produce something that runs today."
+The `<primitive: FFI ...>` pragma now resolves against the Tier-1 `FFI`
+primitive that exists (dispatched via `src/runtime/ffi`) — the honest
+forward-declared gap `world/*.mst` still carries in a few places for
+primitives future sprints haven't reached is, for Tier-1 FFI, now closed. The
+generator's contract — "produce the right *declaration*, resolvable the moment
+the real primitive exists" — is met: the primitive exists.
 
 ## 7. Explicitly deferred
 

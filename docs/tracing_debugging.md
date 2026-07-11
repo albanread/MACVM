@@ -63,7 +63,7 @@ collection that relocates it.
 itself doesn't know or care what any given name means; it just tests
 membership. That means any code anywhere in the VM can gate a trace line
 behind a new channel name without touching the parser. As of this writing,
-five channel names actually gate something:
+nine channel names actually gate something:
 
 | Channel | Where | What it prints |
 |---|---|---|
@@ -72,10 +72,14 @@ five channel names actually gate something:
 | `gc` | scavenger, full collector, `main.rs` at exit | One line per collection, plus a summary counter at exit |
 | `jit` | tier-1 compiler driver | Compilation attempts, successes, and failures |
 | `deopt` | deopt/recompile machinery | One line per deoptimization or recompilation decision |
+| `dnu` | interpreter DNU path | An interpreter `doesNotUnderstand:` mini-dossier |
+| `calls` | DBG5: compiled send sites | Forces ICs cold; one line per compiled send |
+| `oops` | DBG5: every GC | Per-GC compiled-frame oop-map slot auditor |
+| `stats` | `main.rs` at exit | The `__vmStats` counter block dumped at exit |
 
-Two more names — `ic` and `stats` — appear in the project's own conventions
-document as reserved for future use. They parse fine (the channel set is
-open-ended by design) but nothing currently reads them. If you pass
+One more name — `ic` — appears in the project's own conventions
+document as reserved for future use. It parses fine (the channel set is
+open-ended by design) but nothing currently reads it. If you pass
 `MACVM_TRACE=ic`, it is accepted and does precisely nothing yet.
 
 All trace output goes to **stderr**, never stdout — deliberately, so that a

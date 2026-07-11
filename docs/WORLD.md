@@ -184,9 +184,11 @@ shims (SUnitNameResolver etc.) exactly as upstream intended.
   primitives** (`{{<libc ExternalProxy read/write/…>}}`,
   UnixFileDescriptor.dlt:75-149). MACVM's minimal tool surface for now:
   Transcript write, `millisecondClockValue` (both in SPEC §10). When
-  in-image files matter: ~10 primitives or the Alien route — designed in
-  [`docs/FFI.md`](FFI.md) (S20, extended to POSIX/BSD via `cocoa_data`), not
-  built yet.
+  in-image files matter: ~10 primitives or the Alien route. The FFI Tier-1
+  POSIX/libc calling path (open/read/write/close/mmap + the Alien type) is now
+  built and callable — designed in [`docs/FFI.md`](FFI.md) (S20, extended to
+  POSIX/BSD via `cocoa_data`); dedicated in-image file classes still to be
+  layered on top.
 - **Benchmarks** (feeds S15): Richards = 13 classes/1.0 KLOC
   (RichardsBenchmarks.dlt + RB* support), DeltaBlue = 12 classes/1.5 KLOC
   (Planner.dlt etc.), Stanford micro-suite ≈29 benchmarks with a
@@ -274,7 +276,7 @@ which core sprint is currently green. Full design: [`IMAGE.md`](IMAGE.md).
 
 W-waves interleave with core sprints; W1 can start the moment S6 is green.
 
-W1 porting is underway ahead of schedule as a non-disruptive side track
-(same posture as S20/S23) while the core sprints are on S12/S13 — see
+The core sprints (through S24) are now complete; W1 library porting is well
+underway as a non-disruptive side track (same posture as S20/S23) — see
 [`docs/PORTING_JOURNAL.md`](PORTING_JOURNAL.md) for the running list of
 primitives/methods it's finding missing along the way.

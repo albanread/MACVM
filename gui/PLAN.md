@@ -219,8 +219,11 @@ with a demo gate.
   toolbar; "doit → transcript echo" round trip.
 - **Gate:** clicking `Collect Garbage` on the start page produces a
   transcript entry via the full JS↔Rust round trip.
-- **Status: done** for the stub host (no VM yet, so doits echo their source
-  text rather than evaluate — real evaluation is G2). Also went slightly
+- **Status: done** for the stub host (no VM yet then, so doits echoed their
+  source text rather than evaluate — real evaluation was G2). **UPDATE
+  (2026-07-11):** the stub was since replaced by a real `VmHandle` worker
+  (S21 step 3 / S22-E) — doits now evaluate via `VmHandle::eval` and browser
+  edits live-compile via `exec`; the G2 smappl half remains open. Also went slightly
   beyond the stub scope: `reference/pages/documentation/` is now the *real*
   Strongtalk documentation corpus (copied byte-identical, including
   `keyboard.html`/`internal/`/`mixins/`/`type-system/`), giving "Browse

@@ -14,6 +14,10 @@
 > `docs/PERF.md` "RESOLVED" entry). This doc's own fix proposal is
 > therefore NOT implemented; its cold-OSR-profile analysis stands as the
 > open, lower-priority sieve follow-up.
+>
+> **UPDATE 2026-07-11:** fixed in de7e20e — OSR compiles no longer lower
+> Untaken sites to UncommonTrap (sieve ~90ms/storm -> ~9ms, deopts 30->0).
+> The two durable findings above still stand.
 
 Status: DESIGN ONLY (no source changed). Written 2026-07-08.
 Grounded in release+debug runs of `world/bench/sieve.mst`, the debug

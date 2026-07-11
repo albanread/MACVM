@@ -8,6 +8,8 @@ interactive edits — made by *clicking around in the browser*, not by hand-
 editing `.mst` files in a text editor — have somewhere durable, versioned,
 and undo-able to live.
 
+**Status (S22):** image_store built; DB→VM boot loader and GUI live-compile+persist wiring landed.
+
 ## 0. This is not the S16 snapshot
 
 Worth being precise about up front, since both are "persistence for the
@@ -209,9 +211,11 @@ one really is GUI-only test scaffolding). Owns:
   addMethod:category:ifFail:`) is the **live, in-VM** counterpart to
   `set_method_source` here — once G2/W3 land, a real accept both compiles
   into the live heap *and* should persist to the image, so a restart
-  doesn't lose the edit. That wiring is future work (needs the real mirror
-  layer); today the mock browser calls `set_method_source` directly with
-  no compiler involved, exactly like `macvm-mock-vm` does now.
+  doesn't lose the edit. That mirror-layer wiring is still future work
+  (needs the real mirror layer). The mock browser used to call
+  `set_method_source` directly with no compiler involved, exactly like
+  `macvm-mock-vm` did; as of S22 the GUI live-compiles edits via `vm.exec`
+  and persists them to the `image_store` DB.
 - `SPEC.md` A16 (`Smalltalk methodSources` IdentityDictionary, the **live**
   in-heap source registry) is populated *from* this image at boot, the same
   way it's populated from `.mst` text today — this format is upstream of

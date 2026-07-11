@@ -1,6 +1,6 @@
 # Primitive Shims — compiling `<primitive: N>` methods
 
-Status: implemented, uncommitted. Design synthesised from a four-part read-only
+Status: implemented and committed (8402ef8). Design synthesised from a four-part read-only
 review of the as-built code (walker/GC subsystem, shim mechanism, test harness,
 primitive semantics). This document is the authority for *why* the mechanism is
 shaped the way it is and *which* primitives it covers.
@@ -186,4 +186,4 @@ oopmap. The safepoint must still exist so the walk's `Compiled` step
 
 `cargo test --lib --tests` (unit + integration), then a targeted run of the two
 new integration tests, then `cargo clippy` and `cargo fmt --check` on the touched
-files. Left uncommitted per the standing rule.
+files. Committed as 8402ef8.
