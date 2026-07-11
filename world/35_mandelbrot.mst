@@ -40,12 +40,18 @@ Object subclass: Mandelbrot [
         | pm rmin step imin ci cr n r g b |
         pm := Pixmap width: w height: h.
         rmin := 0.0 - 2.5.
-        step := 3.5 / w.
-        imin := 0.0 - ((h * step) / 2.0).
+        step := 3.5 / w asDouble.
+        imin := 0.0 - ((h asDouble * step) / 2.0).
+        "Strength-reduced coordinates: ci/cr ACCUMULATE by `+ step` (pure
+         double-double, fused to native fadd) instead of recomputing
+         `int * step` per pixel — a mixed smi x double send whose primitive
+         fails every call (the receiver is the int) and takes the boxed
+         asDouble fallback, and whose fused caller sites were the source of
+         the recurring uncommon traps in the render stats."
+        ci := imin.
         0 to: h - 1 do: [ :py |
-            ci := imin + (py * step).
+            cr := rmin.
             0 to: w - 1 do: [ :px |
-                cr := rmin + (px * step).
                 n := self escapeAtRe: cr im: ci.
                 n >= maxIter
                     ifTrue: [ r := 0. g := 0. b := 0 ]
@@ -53,7 +59,9 @@ Object subclass: Mandelbrot [
                         r := (n * 8) \\ 256.
                         g := (n * 5) \\ 256.
                         b := 64 + ((n * 11) \\ 192) ].
-                pm atX: px y: py r: r g: g b: b ] ].
+                pm atX: px y: py r: r g: g b: b.
+                cr := cr + step ].
+            ci := ci + step ].
         ^pm
     ]
 
