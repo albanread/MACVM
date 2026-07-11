@@ -32,10 +32,20 @@ ArrayedCollection subclass: FloatArray [
      bit-identical to a scalar Double add."
     +@ other [ <primitive: 145> ]
 
+    "Elementwise multiply by a scalar -> a new FloatArray (per-lane exact)."
+    scale: aNumber [ <primitive: 154> ]
+
     "Fast NEON reductions (docs/SIMD.md Part D): a DEFINED pairwise order, not
      the scalar left-fold."
     sum [ <primitive: 146> ]
     dot: other [ <primitive: 147> ]
+
+    "Largest / smallest lane (fmax/fmin reductions — order-independent, so
+     bit-exact). An empty array has no max/min: the primitive fails and we
+     raise a readable error rather than return a garbage lane."
+    max [ <primitive: 155> self isEmpty ifTrue: [ ^self error: 'max of empty FloatArray' ] ]
+    min [ <primitive: 156> self isEmpty ifTrue: [ ^self error: 'min of empty FloatArray' ] ]
+    isEmpty [ ^self size = 0 ]
 
     "The exact scalar left-to-right fold, for code that needs bit-parity with a
      hand-written `inject:into:` loop (differs from `sum` in the low bits)."

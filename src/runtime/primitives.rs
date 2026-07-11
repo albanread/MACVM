@@ -911,6 +911,33 @@ pub static PRIMITIVES: &[PrimDesc] = &[
         can_allocate: true,
         can_fail: true,
     },
+    // SIMD level 2: more FloatArray NEON kernels — scale: (elementwise ×scalar)
+    // + max/min reductions (docs/SIMD.md Part E; max/min are order-independent
+    // so bit-exact, unlike the FP sum).
+    PrimDesc {
+        id: 154,
+        name: "scale:",
+        f: prim_farray_scale,
+        argc: 1,
+        can_allocate: true,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 155,
+        name: "max",
+        f: prim_farray_max,
+        argc: 0,
+        can_allocate: true,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 156,
+        name: "min",
+        f: prim_farray_min,
+        argc: 0,
+        can_allocate: true,
+        can_fail: true,
+    },
 ];
 
 pub fn prim_by_id(id: u16) -> Option<&'static PrimDesc> {
@@ -2111,7 +2138,9 @@ fn float_array_lanes(m: MemOop) -> Vec<f64> {
 // `crate::runtime::simd_kernels` (the one module allowed `unsafe` for hardware
 // intrinsics). NOT a scalar loop left to rustc/LLVM to maybe vectorize: a
 // `<primitive:>` bulk op deliberately uses the hardware (docs/SIMD.md Part E).
-use crate::runtime::simd_kernels::{neon_add, pairwise_dot, pairwise_sum};
+use crate::runtime::simd_kernels::{
+    neon_add, neon_max, neon_min, neon_scale, pairwise_dot, pairwise_sum,
+};
 
 /// `FloatArray new: n` (class-side; args = [class, n]) — n zeroed f64 lanes.
 fn prim_farray_new(vm: &mut VmState, args: &[Oop]) -> PrimResult {
@@ -2223,6 +2252,58 @@ fn prim_farray_dot(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     let a = float_array_lanes(ma);
     let b = float_array_lanes(mb);
     PrimResult::Ok(alloc::alloc_double(vm, pairwise_dot(&a, &b)).oop())
+}
+
+/// `FloatArray >> scale: aNumber` → a NEW FloatArray of the lanes times the
+/// scalar (`explicit `fmul v.2d`; per-lane bit-identical to scalar multiply).
+fn prim_farray_scale(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    let ma = match as_float_array(vm, args[0]) {
+        Some(m) => m,
+        None => return PrimResult::Fail,
+    };
+    let k = match as_scalar_f64(vm, args[1]) {
+        Some(k) => k,
+        None => return PrimResult::Fail,
+    };
+    let n = float_array_len(ma);
+    // Copy out BEFORE allocating the result (the alloc may GC).
+    let a = float_array_lanes(ma);
+    let mut c = vec![0.0f64; n];
+    neon_scale(&a, k, &mut c);
+    let klass = vm.universe.float_array_klass;
+    let out = alloc::alloc_indexable_bytes(vm, klass, n * 8);
+    for (i, &ci) in c.iter().enumerate() {
+        out.as_mem().set_body_word_raw(1 + i, ci.to_bits());
+    }
+    PrimResult::Ok(out.oop())
+}
+
+/// `FloatArray >> max` → Double, the largest lane (explicit `fmax v.2d`
+/// reduction; order-independent, so bit-exact). Fails on an EMPTY array (no
+/// maximum) — the world method turns that into a sensible error.
+fn prim_farray_max(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    let m = match as_float_array(vm, args[0]) {
+        Some(m) => m,
+        None => return PrimResult::Fail,
+    };
+    if float_array_len(m) == 0 {
+        return PrimResult::Fail;
+    }
+    let a = float_array_lanes(m);
+    PrimResult::Ok(alloc::alloc_double(vm, neon_max(&a)).oop())
+}
+
+/// `FloatArray >> min` → Double, the smallest lane (`fmin v.2d`). Fails on empty.
+fn prim_farray_min(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    let m = match as_float_array(vm, args[0]) {
+        Some(m) => m,
+        None => return PrimResult::Fail,
+    };
+    if float_array_len(m) == 0 {
+        return PrimResult::Fail;
+    }
+    let a = float_array_lanes(m);
+    PrimResult::Ok(alloc::alloc_double(vm, neon_min(&a)).oop())
 }
 
 fn prim_double_sqrt(vm: &mut VmState, args: &[Oop]) -> PrimResult {
@@ -2646,6 +2727,9 @@ mod tests {
             (151, "-"),
             (152, "*"),
             (153, "at:"),
+            (154, "scale:"),
+            (155, "max"),
+            (156, "min"),
         ];
         assert_eq!(
             PRIMITIVES.len(),
