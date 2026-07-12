@@ -326,6 +326,21 @@
     const input = editor.querySelector(".st-code-input");
     const pre = editor.querySelector(".st-code-highlight");
     if (!input) return;
+    // The ClassOutliner's inline per-method editor (.st-smappl-editor) is a
+    // deliberate fixed-height box (CSS `height: 8em`) sitting inside a
+    // shrink-to-fit tree node. That node hugs the editor, so a parent-relative
+    // autosize cap is circular — `parent.bottom - editor.top` is just the
+    // editor's own height, which collapses the box to a sliver and (once small)
+    // keeps it small. Leave its CSS height untouched; only the backdrop's scroll
+    // still needs to track the textarea. (Autosizing every method to its full
+    // source would also make a browsed class's tree absurdly tall.)
+    if (editor.classList.contains("st-smappl-editor")) {
+      if (pre) {
+        pre.scrollTop = input.scrollTop;
+        pre.scrollLeft = input.scrollLeft;
+      }
+      return;
+    }
     // cap = the room from the editor's top to the bottom of its pane (measured
     // before we touch the height, so the editor's top is its settled position).
     let cap = Infinity;
@@ -365,8 +380,11 @@
       // Autosize hugs the text: our explicit height must drive the box, so
       // take it out of the `flex: 1` regime (whose `flex-basis: 0%` would
       // otherwise collapse it and ignore `height`) with `flex: 0 0 auto`.
-      // Harmless where the editor isn't a flex item.
-      editor.style.flex = "0 0 auto";
+      // The fixed-height inline outliner editor doesn't autosize (see
+      // measureCodeEditor), so leave its flex alone.
+      if (!editor.classList.contains("st-smappl-editor")) {
+        editor.style.flex = "0 0 auto";
+      }
       input.addEventListener(
         "scroll",
         function () {
