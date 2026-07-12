@@ -11,6 +11,10 @@ Object subclass: TranscriptStream [
     show: aString [
         self basicPrint: aString
     ]
+    showCr: aString [
+        self show: aString.
+        self cr
+    ]
     cr [
         self basicPrint: '
 '
