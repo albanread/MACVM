@@ -1,4 +1,4 @@
-# MACVM inspired by StrongTalk
+# MACVM inspired by Strongtalk
 
 ## Motivation
 
