@@ -108,6 +108,17 @@ pub fn import_world_dir(image: &Image, world_dir: &Path) -> Result<ImportStats, 
                         }
                     }
                 }
+                // Record this method's home file (last file wins for a method
+                // reopened across files) so `export` writes edits/deletions back
+                // into the right `.mst`.
+                image
+                    .set_method_home_file(&parsed.name, side, &method.selector, filename)
+                    .map_err(|e| {
+                        format!(
+                            "{filename}: set_method_home_file({}>>{}): {e}",
+                            parsed.name, method.selector
+                        )
+                    })?;
             }
         }
     }

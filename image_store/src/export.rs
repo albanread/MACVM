@@ -40,7 +40,60 @@ pub struct ExportStats {
     pub files_changed: usize,
     pub methods_updated: usize,
     pub methods_added: usize,
+    pub methods_removed: usize,
     pub classes_added: usize,
+}
+
+/// Remove a method's block from a file's text: the parsed `source` plus the
+/// indentation before it and the newline after, so no ragged blank line is left.
+fn remove_block(text: &str, source: &str) -> Option<String> {
+    let pos = text.find(source)?;
+    let bytes = text.as_bytes();
+    let mut start = pos;
+    while start > 0 && matches!(bytes[start - 1], b' ' | b'\t') {
+        start -= 1;
+    }
+    let mut end = pos + source.len();
+    if text[end..].starts_with('\n') {
+        end += 1;
+    }
+    let mut out = String::with_capacity(text.len());
+    out.push_str(&text[..start]);
+    out.push_str(&text[end..]);
+    Some(out)
+}
+
+/// A `Super subclass: Name [ … ]` block for the additions file or a home-file
+/// reopening. `with_header` includes the class's ivars/classVars (a brand-new
+/// class needs them; a reopening that only adds methods doesn't).
+fn class_block(
+    superclass: &str,
+    name: &str,
+    instance_vars: &str,
+    class_vars: &str,
+    method_sources: &[String],
+    with_header: bool,
+) -> String {
+    let mut s = format!("{superclass} subclass: {name} [\n");
+    if with_header {
+        if !instance_vars.trim().is_empty() {
+            s.push_str(&format!("    | {} |\n", instance_vars.trim()));
+        }
+        if !class_vars.trim().is_empty() {
+            s.push_str(&format!("    <classVars: {}>\n", class_vars.trim()));
+        }
+    }
+    for src in method_sources {
+        // Indent to the class-body level with 4 spaces on the FIRST line only —
+        // the method body keeps its own internal indentation, matching the
+        // hand-authored files AND the parser's captured source, so a re-parse
+        // equals the stored source and re-export stays idempotent (no churn).
+        s.push_str("    ");
+        s.push_str(src.trim_end());
+        s.push('\n');
+    }
+    s.push_str("]\n");
+    s
 }
 
 /// The `.mst` filenames named in `world.list`, in load order (comments and blank
@@ -112,7 +165,11 @@ pub fn export_world_dir(image: &Image, world_dir: &Path) -> Result<ExportStats, 
 
     let mut stats = ExportStats::default();
 
-    // ── Pass 1: splice changed method bodies into the files that own them ──
+    // ── Pass 1: reconcile each file's methods with the image ──
+    //   Live + changed → splice the new body (only into the LAST file that
+    //                    defines it; earlier overrides stay exactly as written);
+    //   Deleted (tombstone) → remove the method from the file (every occurrence);
+    //   Absent (unknown to the image) → leave untouched — never delete blindly.
     for (idx, f) in files.iter().enumerate() {
         let text =
             fs::read_to_string(f).map_err(|e| format!("reading {}: {e}", f.display()))?;
@@ -121,32 +178,33 @@ pub fn export_world_dir(image: &Image, world_dir: &Path) -> Result<ExportStats, 
             for m in &c.methods {
                 let side_str = if m.is_class_side { "class" } else { "instance" };
                 let key = (c.name.clone(), side_str.to_string(), m.selector.clone());
-                // Only the last file that defines this method carries its
-                // effective source; earlier occurrences are intentional
-                // overrides and stay exactly as written.
-                if last_occ.get(&key) != Some(&idx) {
-                    continue;
-                }
                 let side = if m.is_class_side {
                     crate::Side::Class
                 } else {
                     crate::Side::Instance
                 };
-                let db = image
-                    .method_source(&c.name, side, &m.selector)
-                    .map_err(|e| format!("querying {}>>{}: {e}", c.name, m.selector))?;
-                if let Some(db_src) = db {
-                    if db_src != m.source {
-                        // The parsed source is a verbatim, unique substring of the
-                        // file (a selector can't repeat within a class), so a
-                        // single find/replace is exact.
-                        if let Some(pos) = new_text.find(&m.source) {
-                            new_text.replace_range(pos..pos + m.source.len(), &db_src);
-                            stats.methods_updated += 1;
+                match image
+                    .method_presence(&c.name, side, &m.selector)
+                    .map_err(|e| format!("querying {}>>{}: {e}", c.name, m.selector))?
+                {
+                    crate::MethodPresence::Live(db_src) => {
+                        if last_occ.get(&key) == Some(&idx) && db_src != m.source {
+                            // The parsed source is a verbatim, unique substring of
+                            // the file, so a single find/replace is exact.
+                            if let Some(pos) = new_text.find(&m.source) {
+                                new_text.replace_range(pos..pos + m.source.len(), &db_src);
+                                stats.methods_updated += 1;
+                            }
                         }
                     }
+                    crate::MethodPresence::Deleted => {
+                        if let Some(removed) = remove_block(&new_text, &m.source) {
+                            new_text = removed;
+                            stats.methods_removed += 1;
+                        }
+                    }
+                    crate::MethodPresence::Absent => {}
                 }
-                // db == None → the method was deleted in the image; v1 leaves it.
             }
         }
         if new_text != text {
@@ -155,73 +213,94 @@ pub fn export_world_dir(image: &Image, world_dir: &Path) -> Result<ExportStats, 
         }
     }
 
-    // ── Pass 2: regenerate the additions file from everything with no home ──
-    let mut blocks = String::new();
+    // ── Pass 2: place homeless methods (created in the image, not yet in any
+    // file) into their class's home file where one is known — appended there as
+    // a reopening block, next to the class's other methods — else into the
+    // catch-all additions file (with the full definition for a brand-new class).
+    let mut additions = String::new();
+    let mut home_appends: HashMap<String, String> = HashMap::new();
     for c in image
         .all_classes()
         .map_err(|e| format!("listing classes: {e}"))?
     {
-        let methods = image
+        // `all_methods_of` returns only live (non-deleted) methods.
+        let homeless: Vec<String> = image
             .all_methods_of(&c.name)
-            .map_err(|e| format!("listing {}'s methods: {e}", c.name))?;
-        let homeless: Vec<_> = methods
+            .map_err(|e| format!("listing {}'s methods: {e}", c.name))?
             .into_iter()
             .filter(|m| {
                 !present.contains(&(c.name.clone(), m.side.as_str().to_string(), m.selector.clone()))
             })
+            .map(|m| m.source)
             .collect();
         if homeless.is_empty() {
             continue;
         }
-        // A class with NO methods in any hand-authored file is itself new, so it
-        // needs its full definition (ivars/classVars); a class merely gaining a
-        // method is reopened with just that method.
         let is_new_class = !present.iter().any(|(cls, _, _)| cls == &c.name);
-        if is_new_class {
-            stats.classes_added += 1;
-        }
-        stats.methods_added += homeless.len();
-
         let superclass = c.superclass.as_deref().unwrap_or("Object");
-        blocks.push_str(&format!("{superclass} subclass: {} [\n", c.name));
-        if is_new_class {
-            if !c.instance_vars.trim().is_empty() {
-                blocks.push_str(&format!("    | {} |\n", c.instance_vars.trim()));
+        let home = if is_new_class {
+            None
+        } else {
+            image
+                .class_home_file(&c.name)
+                .map_err(|e| format!("home of {}: {e}", c.name))?
+        };
+        match home {
+            Some(hf) if hf != ADDITIONS_FILE && entries.iter().any(|e| e == &hf) => {
+                let block = class_block(superclass, &c.name, "", "", &homeless, false);
+                home_appends
+                    .entry(hf)
+                    .or_default()
+                    .push_str(&format!("\n{block}"));
+                stats.methods_added += homeless.len();
             }
-            if !c.class_vars.trim().is_empty() {
-                blocks.push_str(&format!("    <classVars: {}>\n", c.class_vars.trim()));
+            _ => {
+                additions.push_str(&class_block(
+                    superclass,
+                    &c.name,
+                    &c.instance_vars,
+                    &c.class_vars,
+                    &homeless,
+                    is_new_class,
+                ));
+                additions.push('\n');
+                if is_new_class {
+                    stats.classes_added += 1;
+                }
+                stats.methods_added += homeless.len();
             }
         }
-        for m in &homeless {
-            // Stored source is already in class-block form (instance methods bare,
-            // class methods carrying their `Name class >>` prefix), so emit as-is.
-            for line in m.source.trim_end().lines() {
-                blocks.push_str("    ");
-                blocks.push_str(line);
-                blocks.push('\n');
-            }
-        }
-        blocks.push_str("]\n\n");
     }
 
+    // Append the home-file reopening blocks.
+    for (fname, appended) in home_appends {
+        let path = world_dir.join(&fname);
+        let mut text =
+            fs::read_to_string(&path).map_err(|e| format!("reading {}: {e}", path.display()))?;
+        if !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(&appended);
+        fs::write(&path, &text).map_err(|e| format!("writing {}: {e}", path.display()))?;
+        stats.files_changed += 1;
+    }
+
+    // The additions file (brand-new classes + methods with no home).
     let additions_path = world_dir.join(ADDITIONS_FILE);
     let existing = fs::read_to_string(&additions_path).unwrap_or_default();
-    if blocks.is_empty() {
-        // Nothing homeless: leave a header-only file (or none) so a stale export
-        // doesn't linger, but only touch disk if it actually changes.
+    if additions.is_empty() {
         if additions_path.exists() && !existing.is_empty() {
             fs::write(&additions_path, "")
                 .map_err(|e| format!("clearing {}: {e}", additions_path.display()))?;
             stats.files_changed += 1;
         }
     } else {
-        let content = format!("{ADDITIONS_HEADER}\n{blocks}");
+        let content = format!("{ADDITIONS_HEADER}\n{additions}");
         if existing != content {
             fs::write(&additions_path, &content)
                 .map_err(|e| format!("writing {}: {e}", additions_path.display()))?;
             stats.files_changed += 1;
         }
-        // Make sure it re-imports next time.
         ensure_in_world_list(world_dir, &entries)?;
     }
 
@@ -275,31 +354,53 @@ mod tests {
         // Idempotent again after the edit.
         assert_eq!(export_world_dir(&image, &dir).unwrap(), ExportStats::default());
 
-        // 3) A brand-new method with no home lands in the additions file.
+        // 3) New method on an EXISTING class → appended to that class's home
+        // file (next to its siblings), not the catch-all additions file.
         image
             .create_or_reopen_method("Foo", Side::Instance, "reset", "", "reset [\n        x := 0\n    ]")
             .unwrap();
         let s = export_world_dir(&image, &dir).unwrap();
-        assert_eq!(s.methods_added, 1, "one homeless method, got {s:?}");
-        let adds = fs::read_to_string(dir.join(ADDITIONS_FILE)).unwrap();
-        assert!(adds.contains("Object subclass: Foo ["), "reopening block: {adds}");
-        assert!(adds.contains("reset ["), "new method in additions: {adds}");
+        assert_eq!(s.methods_added, 1, "one new method, got {s:?}");
+        let foo_txt = fs::read_to_string(dir.join("10_foo.mst")).unwrap();
+        assert!(foo_txt.contains("reset ["), "new method appended to home file: {foo_txt}");
+        assert!(
+            !dir.join(ADDITIONS_FILE).exists()
+                || fs::read_to_string(dir.join(ADDITIONS_FILE)).unwrap().is_empty(),
+            "a homed method must not spill into the additions file"
+        );
+        assert_eq!(export_world_dir(&image, &dir).unwrap(), ExportStats::default());
 
-        // 4) Round-trip: re-import the exported tree → same method sources.
+        // 4) Delete a method in the image → removed from its file, siblings kept.
+        image.remove_method("Foo", Side::Instance, "bump").unwrap();
+        let s = export_world_dir(&image, &dir).unwrap();
+        assert_eq!(s.methods_removed, 1, "one deletion exported, got {s:?}");
+        let foo_txt = fs::read_to_string(dir.join("10_foo.mst")).unwrap();
+        assert!(!foo_txt.contains("bump ["), "deleted method gone: {foo_txt}");
+        assert!(foo_txt.contains("x ["), "other methods kept: {foo_txt}");
+
+        // 5) A brand-new class → the additions file, with its full definition.
+        let lo = image.next_load_order().unwrap();
+        image.add_class("Gadget", Some("Object"), "", "", "", "", lo).unwrap();
+        image
+            .create_or_reopen_method("Gadget", Side::Instance, "go", "", "go [ ^42 ]")
+            .unwrap();
+        let s = export_world_dir(&image, &dir).unwrap();
+        assert_eq!((s.classes_added, s.methods_added), (1, 1), "{s:?}");
+        let adds = fs::read_to_string(dir.join(ADDITIONS_FILE)).unwrap();
+        assert!(adds.contains("Object subclass: Gadget ["), "new class in additions: {adds}");
+
+        // 6) Round-trip: re-import the exported tree.
         let image2 = Image::open(&dir.join("image2.sqlite3")).unwrap();
         crate::import::import_world_dir(&image2, &dir).unwrap();
-        assert_eq!(
-            image2.method_source("Foo", Side::Instance, "x").unwrap(),
-            image.method_source("Foo", Side::Instance, "x").unwrap(),
-            "edited method round-trips"
-        );
         assert!(
-            image2
-                .method_source("Foo", Side::Instance, "reset")
-                .unwrap()
-                .is_some(),
+            image2.method_source("Foo", Side::Instance, "reset").unwrap().is_some(),
             "added method round-trips"
         );
+        assert!(
+            image2.method_source("Foo", Side::Instance, "bump").unwrap().is_none(),
+            "deleted method stays gone"
+        );
+        assert!(image2.class_exists("Gadget").unwrap(), "new class round-trips");
 
         let _ = fs::remove_dir_all(&dir);
     }

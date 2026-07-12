@@ -86,6 +86,20 @@ pub enum ClassCreateOutcome {
     AlreadyLive,
 }
 
+/// Whether a `(class, side, selector)` method is currently defined — lets the
+/// exporter tell an intentional deletion (a tombstone) apart from a method that
+/// was simply never in the image, so it only ever *removes* the former from a
+/// world file (never a benignly-unknown method).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MethodPresence {
+    /// The method exists and its latest version is live; carries that source.
+    Live(String),
+    /// The method exists but its latest version is a deletion tombstone.
+    Deleted,
+    /// No such method record at all.
+    Absent,
+}
+
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS classes (
     class_id    INTEGER PRIMARY KEY,
@@ -111,6 +125,7 @@ CREATE TABLE IF NOT EXISTS methods (
     class_id   INTEGER NOT NULL REFERENCES classes(class_id),
     selector   TEXT NOT NULL,
     side       TEXT NOT NULL CHECK(side IN ('instance','class')),
+    source_file TEXT,
     UNIQUE(class_id, selector, side)
 );
 CREATE TABLE IF NOT EXISTS method_versions (
@@ -180,11 +195,29 @@ fn migrate_add_deleted_columns(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// Add the `methods.source_file` provenance column to a pre-existing database
+/// (the world file each method came from — used by `export` to write an edit,
+/// or a deletion, back into the right `.mst`). Same PRAGMA-guarded shape as
+/// [`migrate_add_deleted_columns`]; a no-op on a fresh DB where `SCHEMA` already
+/// created it.
+fn migrate_add_source_file(conn: &Connection) -> rusqlite::Result<()> {
+    let has_col = conn
+        .prepare("PRAGMA table_info(methods)")?
+        .query_map([], |r| r.get::<_, String>(1))?
+        .filter_map(|r| r.ok())
+        .any(|name| name == "source_file");
+    if !has_col {
+        conn.execute("ALTER TABLE methods ADD COLUMN source_file TEXT", [])?;
+    }
+    Ok(())
+}
+
 impl Image {
     pub fn open(path: &Path) -> rusqlite::Result<Self> {
         let conn = Connection::open(path)?;
         conn.execute_batch(SCHEMA)?;
         migrate_add_deleted_columns(&conn)?;
+        migrate_add_source_file(&conn)?;
         Ok(Self { conn })
     }
 
@@ -192,6 +225,7 @@ impl Image {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch(SCHEMA)?;
         migrate_add_deleted_columns(&conn)?;
+        migrate_add_source_file(&conn)?;
         Ok(Self { conn })
     }
 
@@ -507,6 +541,69 @@ impl Image {
             }
         }
         Ok(inserted)
+    }
+
+    /// Whether a method is live / a deletion tombstone / absent
+    /// ([`MethodPresence`]) — the exporter uses it to remove a method from a
+    /// world file only when it was intentionally deleted, never when it's merely
+    /// unknown to the image.
+    pub fn method_presence(
+        &self,
+        class_name: &str,
+        side: Side,
+        selector: &str,
+    ) -> rusqlite::Result<MethodPresence> {
+        let row: Option<(String, i64)> = self
+            .conn
+            .query_row(
+                "SELECT lmv.source, lmv.deleted FROM classes c \
+                 JOIN methods m ON m.class_id = c.class_id \
+                 JOIN latest_method_versions lmv ON lmv.method_id = m.method_id \
+                 WHERE c.name = ?1 AND m.side = ?2 AND m.selector = ?3",
+                params![class_name, side.as_str(), selector],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        Ok(match row {
+            None => MethodPresence::Absent,
+            Some((_, deleted)) if deleted != 0 => MethodPresence::Deleted,
+            Some((source, _)) => MethodPresence::Live(source),
+        })
+    }
+
+    /// Record which world file a method lives in (its export home) — set by the
+    /// importer as it reads each file, and by the GUI when a method is created.
+    /// A no-op if the method row doesn't exist.
+    pub fn set_method_home_file(
+        &self,
+        class_name: &str,
+        side: Side,
+        selector: &str,
+        file: &str,
+    ) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE methods SET source_file = ?4 \
+             WHERE class_id = (SELECT class_id FROM classes WHERE name = ?1) \
+             AND side = ?2 AND selector = ?3",
+            params![class_name, side.as_str(), selector, file],
+        )?;
+        Ok(())
+    }
+
+    /// The world file most of `class_name`'s methods live in — where `export`
+    /// puts a newly-created method instead of the catch-all additions file.
+    /// `None` if none of the class's methods has a recorded home yet.
+    pub fn class_home_file(&self, class_name: &str) -> rusqlite::Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT m.source_file FROM classes c \
+                 JOIN methods m ON m.class_id = c.class_id \
+                 WHERE c.name = ?1 AND m.source_file IS NOT NULL \
+                 GROUP BY m.source_file ORDER BY COUNT(*) DESC LIMIT 1",
+                params![class_name],
+                |r| r.get(0),
+            )
+            .optional()
     }
 
     // ── Mutations — every save is an INSERT, never an UPDATE ──────────────
