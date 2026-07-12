@@ -35,6 +35,16 @@ static WEBVIEW: OnceLock<MainThreadPtr> = OnceLock::new();
 /// game view is installed, the WKWebView's own `.window` goes nil, so it can't
 /// be re-derived from the webview — it must be held separately).
 static WINDOW: OnceLock<MainThreadPtr> = OnceLock::new();
+/// The game-loop frame timer's target object (a `MacvmGameTimer` instance whose
+/// `gameTick:` IMP is [`on_game_tick`]), created lazily on the first
+/// `StartLoop`. Main-thread only (`docs/gamepane_design.md` M4).
+static GAME_TIMER_TARGET: OnceLock<MainThreadPtr> = OnceLock::new();
+
+thread_local! {
+    /// The currently-scheduled frame `NSTimer` (NIL when the loop is stopped).
+    /// Main-thread only.
+    static GAME_TIMER: std::cell::Cell<Id> = const { std::cell::Cell::new(NIL) };
+}
 static NAV: OnceLock<Mutex<NavState>> = OnceLock::new();
 
 /// The GUI's handle onto the VM worker thread (`vm_host.rs`, SPEC §16.1 /
@@ -679,8 +689,73 @@ fn display_game_pane() {
     };
     if let Some(window) = WINDOW.get() {
         objc::send1_id(window.0, sel("setContentView:"), view);
+        // Make the key-capable game view first responder so keyDown:/keyUp:
+        // populate HELD_KEYS while the game is focused (docs/gamepane_design.md).
+        objc::send1_id(window.0, sel("makeFirstResponder:"), view);
     }
     game_pane::render_native_frame();
+}
+
+// ── Game-loop frame driver (docs/gamepane_design.md M4) ─────────────────────
+
+/// The `MacvmGameTimer` target object whose `gameTick:` runs [`on_game_tick`].
+fn build_game_timer_target() -> Id {
+    let cls = objc::allocate_class(objc::get_class("NSObject"), "MacvmGameTimer");
+    objc::add_method(cls, sel("gameTick:"), on_game_tick as *const _, "v@:@");
+    objc::register_class(cls);
+    objc::alloc_init("MacvmGameTimer")
+}
+
+/// NSTimer callback (~60 Hz on the main run loop while a game loop runs): if the
+/// worker is idle, submit exactly one `GameStep` carrying this tick's held keys.
+/// Single-outstanding — a still-running step means we skip, never pile up.
+/// Rendering happens later, when the step's draw commands drain (not here).
+extern "C" fn on_game_tick(_this: Id, _cmd: Sel, _timer: Id) {
+    let Some(vm) = VM.get() else { return };
+    if !vm.is_idle() {
+        return;
+    }
+    let keys = current_game_key_mask();
+    vm.submit(vm_host::VmRequest::GameStep { keys });
+}
+
+/// Pack MacGamePane's process-global held-key table into the bitmask
+/// `GamePane>>keyHeld:` reads (bit 0=Left … 5=B), by macOS virtual key code.
+fn current_game_key_mask() -> i64 {
+    // Left, Right, Up, Down, Space (A), Z (B) — matches GamePane class>>keyLeft…keyB.
+    const CODES: [u16; 6] = [123, 124, 126, 125, 49, 6];
+    let mut mask = 0i64;
+    for (bit, code) in CODES.iter().enumerate() {
+        if macgamepane_graphics::input::key_held(*code) {
+            mask |= 1 << bit;
+        }
+    }
+    mask
+}
+
+/// Start (or restart) the frame timer — called on `StartLoop` (`GamePane>>run`).
+pub(crate) fn start_game_loop_timer() {
+    let target = GAME_TIMER_TARGET
+        .get_or_init(|| MainThreadPtr(build_game_timer_target()))
+        .0;
+    GAME_TIMER.with(|t| {
+        let existing = t.get();
+        if existing != NIL {
+            objc::send0(existing, sel("invalidate"));
+        }
+        t.set(objc::scheduled_timer(1.0 / 60.0, target, sel("gameTick:"), true));
+    });
+}
+
+/// Stop the frame timer — called on `StopLoop` (`GamePane>>stop`).
+pub(crate) fn stop_game_loop_timer() {
+    GAME_TIMER.with(|t| {
+        let existing = t.get();
+        if existing != NIL {
+            objc::send0(existing, sel("invalidate"));
+            t.set(NIL);
+        }
+    });
 }
 
 fn display_canvas() {
@@ -1820,11 +1895,24 @@ fn main() {
     build_window_and_webview();
     navigate_to(&start);
 
-    // M2 demo trigger (docs/gamepane_design.md): open straight into the native
-    // game pane so the on-screen render path can be exercised without a UI
-    // control yet. A real toolbar button uses the `gamePane` action instead.
+    // Demo trigger (docs/gamepane_design.md): open the native game pane and
+    // start a real Smalltalk-driven frame loop — a red disc sweeping across a
+    // black field, its position a function of the clock, presented each tick.
+    // Exercises the whole M4 path (timer -> GameStep -> step block -> draw ->
+    // present). A real toolbar button uses the `gamePane` action instead.
     if std::env::var_os("MACVM_GAMEPANE_DEMO").is_some() {
         open_game_pane();
+        if let Some(vm) = VM.get() {
+            vm.submit(vm_host::VmRequest::Doit {
+                code: "GamePane new onStep: [ | x | \
+                         x := (Time millisecondClockValue // 8) \\\\ 320. \
+                         GamePane new cls: 0; \
+                           paletteAt: 16 r: 240 g: 80 b: 40; \
+                           disc: x y: 120 radius: 24 color: 16; \
+                           present ]; run."
+                    .to_string(),
+            });
+        }
     }
 
     let app = objc::send0(objc::get_class("NSApplication"), sel("sharedApplication"));

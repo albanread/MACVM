@@ -137,8 +137,12 @@ pub fn ensure_native_view(w: u32, h: u32) -> Option<objc::Id> {
                 let device = metal::Device::system_default()?;
                 let queue = device.new_command_queue();
 
+                // A key-capable view (MacGamePane's MacGamePaneKeyView) so
+                // keyDown:/keyUp: populate HELD_KEYS while the game is focused
+                // (docs/gamepane_design.md M4). Register the class first.
+                macgamepane_graphics::input::key_capable_view_class();
                 let view = objc::send_frame_init(
-                    objc::send0(objc::get_class("NSView"), objc::sel("alloc")),
+                    objc::send0(objc::get_class("MacGamePaneKeyView"), objc::sel("alloc")),
                     objc::sel("initWithFrame:"),
                     0.0,
                     0.0,
@@ -208,6 +212,14 @@ thread_local! {
 /// the headless-VM behaviour on the core side.
 pub fn apply_command(cmd: &macvm::embed::GameCommand) {
     use macvm::embed::GameCommand as C;
+    // Loop control drives the main-thread frame timer and doesn't touch the
+    // pane, so handle it before the pane check (it works even if no pane view
+    // is currently shown).
+    match cmd {
+        C::StartLoop => return crate::start_game_loop_timer(),
+        C::StopLoop => return crate::stop_game_loop_timer(),
+        _ => {}
+    }
     NATIVE.with(|cell| {
         let mut slot = cell.borrow_mut();
         let Some(n) = slot.as_mut() else { return };
@@ -234,9 +246,7 @@ pub fn apply_command(cmd: &macvm::embed::GameCommand) {
                 DIRTY.with(|d| d.set(false));
                 return;
             }
-            // The frame loop's main-thread timer is wired in M4b; these carry
-            // the intent but do not draw, so they never mark the pane dirty.
-            C::StartLoop | C::StopLoop => return,
+            C::StartLoop | C::StopLoop => unreachable!("handled before the pane check"),
         }
         DIRTY.with(|d| d.set(true));
     });

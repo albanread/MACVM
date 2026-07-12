@@ -98,6 +98,14 @@ pub enum VmRequest {
     Doit {
         code: String,
     },
+    /// One frame tick of a running game loop (`docs/gamepane_design.md` M4):
+    /// run `GamePane stepWithKeys: keys`. The GUI's frame timer submits this
+    /// once per tick to an IDLE worker (single-outstanding via
+    /// [`VmHost::is_idle`]), so the step block runs as a fresh top-level
+    /// request, never nested inside a still-running eval.
+    GameStep {
+        keys: i64,
+    },
     /// A `<smappl visual="CODE">` on the current page (`../smappl.md`): render
     /// the `visual=` expression to an HTML fragment (`VmHandle::render_fragment`,
     /// D-G5). `id` is the placeholder span's `data-widget-id`; the worker
@@ -507,6 +515,13 @@ pub struct VmHost {
 }
 
 impl VmHost {
+    /// Is the worker idle (no request in flight)? The game-loop timer gates on
+    /// this so it never queues a second `GameStep` before the previous frame's
+    /// step returns — single-outstanding backpressure (`docs/gamepane_design.md`).
+    pub fn is_idle(&self) -> bool {
+        self.inner.lock().unwrap().pending_since.is_none()
+    }
+
     pub fn submit(&self, request: VmRequest) {
         let mut inner = self.inner.lock().unwrap();
         if inner
@@ -1222,6 +1237,17 @@ fn handle(
             match vm.eval(&code) {
                 Ok(_) => vec![VmResponse::Transcript(format!("> {code}"))],
                 Err(e) => vec![VmResponse::Transcript(format!("> {code}\n{e}"))],
+            }
+        }
+        VmRequest::GameStep { keys } => {
+            // One frame: run the registered step block with this tick's held
+            // keys. The block's drawing reaches the GUI via the game sink
+            // (VmResponse::Game), NOT this return value — so answer nothing
+            // (echoing every frame to the transcript would flood it). A step
+            // that errors is reported once and the loop keeps ticking.
+            match vm.eval(&format!("GamePane stepWithKeys: {keys}.")) {
+                Ok(_) => vec![],
+                Err(e) => vec![VmResponse::Transcript(format!("game step error: {e}"))],
             }
         }
         VmRequest::SmapplRender { id, code } => {

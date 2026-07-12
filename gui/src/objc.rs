@@ -205,6 +205,24 @@ pub fn send_frame_init(recv: Id, s: Sel, x: f64, y: f64, w: f64, h: f64) -> Id {
     f(recv, s, x, y, w, h)
 }
 
+/// `+[NSTimer scheduledTimerWithTimeInterval:target:selector:userInfo:repeats:]`
+/// — a repeating timer on the current (main) run loop. `target` must implement
+/// `selector` as a `v@:@` method (self, cmd, the timer). `userInfo` is `nil`.
+/// Returns the scheduled `NSTimer` (send it `invalidate` to stop it).
+pub fn scheduled_timer(interval: f64, target: Id, selector: Sel, repeats: bool) -> Id {
+    let f: extern "C" fn(Id, Sel, f64, Id, Sel, Id, bool) -> Id =
+        unsafe { std::mem::transmute(msg_send_ptr()) };
+    f(
+        get_class("NSTimer"),
+        sel("scheduledTimerWithTimeInterval:target:selector:userInfo:repeats:"),
+        interval,
+        target,
+        selector,
+        NIL,
+        repeats,
+    )
+}
+
 /// `-initWithContentRect:styleMask:backing:defer:` on `NSWindow`.
 pub fn send_window_init(
     recv: Id,
