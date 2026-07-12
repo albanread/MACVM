@@ -163,11 +163,19 @@ pub enum VmRequest {
         root: String,
         widget_id: String,
     },
-    /// A find-tool query (Implementors/Senders, docs/APPS.md §5.4): render the
-    /// result list image-side and return it for the find page's results div.
+    /// A find-tool query (docs/APPS.md §5.4). Definition + Implementors are
+    /// answered directly from image_store (SQL, no VM round trip); Senders still
+    /// needs the VM's IC-table scan. Result HTML goes back for the find page's
+    /// results div.
     Find {
         tool: String,
         query: String,
+    },
+    /// The option list for a find view's combobox (`<datalist>`) — class names
+    /// for Find-Definition, selectors for Implementors/Senders. Requested once
+    /// when a find page loads; answered from image_store.
+    FindOptions {
+        tool: String,
     },
     /// Reset the worker's `BrowserSelection` to match the fresh default
     /// state the initial page render always shows (see
@@ -381,6 +389,12 @@ pub enum VmResponse {
     /// container with `html`.
     FindResults {
         html: String,
+    },
+    /// Answers [`VmRequest::FindOptions`] — `main.rs` populates the find page's
+    /// `<datalist>` (`macvmSetFindOptions`) so its combobox offers `options`.
+    FindOptions {
+        tool: String,
+        options: Vec<String>,
     },
     /// A live widget action asked to pop a modal dialog (`Visual>>promptOk:…`,
     /// the differences2.html "Press Me!" demo) — `main.rs` calls `smtk.js`'s
@@ -979,6 +993,66 @@ fn render_and_inject(
 
 use crate::preprocess::tag_widget_id;
 
+/// The "tool unavailable" fallback (no image handle, or a failed render).
+fn find_unavailable() -> String {
+    "<div class=\"st-find-empty\">(this find tool isn't available)</div>".to_string()
+}
+
+fn find_results_wrap(head: &str, body: &str) -> String {
+    format!("<div class=\"st-find-results\"><div class=\"st-find-head\">{head}</div>{body}</div>")
+}
+
+/// Find-Definition results — every class whose name contains `query`
+/// (case-insensitive) — in the same `.st-find-*` structure the old Smalltalk
+/// `DefinitionsView` produced, so smtk.js's result-click drill-in
+/// (`.st-class-link[data-open-class]`) keeps working unchanged.
+fn render_definition_results(img: &image_store::Image, query: &str) -> String {
+    let needle = query.to_lowercase();
+    let hits: Vec<String> = img
+        .class_names()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|n| n.to_lowercase().contains(&needle))
+        .collect();
+    let head = format!(
+        "Classes matching \u{201c}{}\u{201d}",
+        crate::preprocess::html_escape_text(query)
+    );
+    if hits.is_empty() {
+        return find_results_wrap(&head, "<div class=\"st-find-empty\">(no matching classes)</div>");
+    }
+    let items: String = hits
+        .iter()
+        .map(|n| {
+            let e = crate::preprocess::html_escape_text(n);
+            format!("<div class=\"st-find-item\"><span class=\"st-class-link\" data-open-class=\"{e}\">{e}</span></div>")
+        })
+        .collect();
+    find_results_wrap(&head, &items)
+}
+
+/// Implementors results — every class implementing `query` as a selector, on
+/// either side, from image_store (SQL, no VM round trip).
+fn render_implementors_results(img: &image_store::Image, query: &str) -> String {
+    let hits = img.implementors_of(query).unwrap_or_default();
+    let head = format!("Implementors of {}", crate::preprocess::html_escape_text(query));
+    if hits.is_empty() {
+        return find_results_wrap(&head, "<div class=\"st-find-empty\">(no implementors)</div>");
+    }
+    let items: String = hits
+        .iter()
+        .map(|(name, side)| {
+            let e = crate::preprocess::html_escape_text(name);
+            let s = match side {
+                image_store::Side::Class => "class",
+                image_store::Side::Instance => "instance",
+            };
+            format!("<div class=\"st-find-item\"><span class=\"st-class-link\" data-open-class=\"{e}\">{e}</span> <span class=\"st-find-side\">{s}</span></div>")
+        })
+        .collect();
+    find_results_wrap(&head, &items)
+}
+
 /// Re-render every open outliner except `skip_id` (the one being edited, whose
 /// DOM must not be disrupted mid-edit) and answer fragment updates for them —
 /// the live half of the `ToolRegistry` (`docs/APPS.md` §7). Called after an
@@ -1292,18 +1366,35 @@ fn handle(
             }
         }
         VmRequest::Find { tool, query } => {
-            // Double single-quotes for the Smalltalk string literal.
-            let q = query.replace('\'', "''");
-            let code = match tool.as_str() {
-                "senders" => format!("SendersView of: '{q}'"),
-                "definition" => format!("DefinitionsView of: '{q}'"),
-                _ => format!("ImplementorsView of: '{q}'"),
+            let q = query.trim();
+            // Definition + Implementors: answered straight from image_store (SQL)
+            // — the image is kept in sync with the running VM, so no reflection
+            // round trip is needed. Senders still needs the VM's IC-table scan
+            // (referenced selectors aren't stored in the image), so it keeps the
+            // render_fragment path.
+            let html = match tool.as_str() {
+                "definition" => image
+                    .map(|img| render_definition_results(img, q))
+                    .unwrap_or_else(find_unavailable),
+                "senders" => {
+                    let sq = q.replace('\'', "''");
+                    render_and_inject(vm, image, &format!("SendersView of: '{sq}'"))
+                        .unwrap_or_else(find_unavailable)
+                }
+                _ => image
+                    .map(|img| render_implementors_results(img, q))
+                    .unwrap_or_else(find_unavailable),
             };
-            let html = render_and_inject(vm, image, &code).unwrap_or_else(|| {
-                "<div class=\"st-find-empty\">(this find tool isn't available yet)</div>"
-                    .to_string()
-            });
             vec![VmResponse::FindResults { html }]
+        }
+        VmRequest::FindOptions { tool } => {
+            let options = image
+                .map(|img| match tool.as_str() {
+                    "definition" => img.class_names().unwrap_or_default(),
+                    _ => img.all_selectors().unwrap_or_default(),
+                })
+                .unwrap_or_default();
+            vec![VmResponse::FindOptions { tool, options }]
         }
         VmRequest::BrowserOpen => {
             // No longer resets `selection` to default — that made sense
@@ -2492,6 +2583,12 @@ mod tests {
         let mut world = MockWorld::seed();
         let mut sel = BrowserSelection::default();
         let mut vm = test_vm_handle(macvm::runtime::JitMode::Off);
+        // Implementors is now answered from image_store (SQL), so the find tools
+        // need the image the real GUI always has.
+        let tmp =
+            std::env::temp_dir().join(format!("macvm_find_impl_{}.sqlite3", std::process::id()));
+        std::fs::remove_file(&tmp).ok();
+        let image = open_or_seed_image(&test_world_dir(), &tmp).expect("seed");
         let responses = handle(
             VmRequest::Find {
                 tool: "implementors".to_string(),
@@ -2499,7 +2596,7 @@ mod tests {
             },
             &mut world,
             &mut sel,
-            None,
+            Some(&image),
             &mut vm,
         );
         let html = match responses.as_slice() {
@@ -2511,6 +2608,7 @@ mod tests {
             "must list Point among printOn: implementors (a drill-link), got a {}-char result",
             html.len()
         );
+        std::fs::remove_file(&tmp).ok();
     }
 
     /// Find Definition does a case-insensitive substring search over class
@@ -2521,6 +2619,10 @@ mod tests {
         let mut world = MockWorld::seed();
         let mut sel = BrowserSelection::default();
         let mut vm = test_vm_handle(macvm::runtime::JitMode::Off);
+        let tmp =
+            std::env::temp_dir().join(format!("macvm_find_def_{}.sqlite3", std::process::id()));
+        std::fs::remove_file(&tmp).ok();
+        let image = open_or_seed_image(&test_world_dir(), &tmp).expect("seed");
         let responses = handle(
             VmRequest::Find {
                 tool: "definition".to_string(),
@@ -2528,7 +2630,7 @@ mod tests {
             },
             &mut world,
             &mut sel,
-            None,
+            Some(&image),
             &mut vm,
         );
         let html = match responses.as_slice() {
@@ -2541,6 +2643,7 @@ mod tests {
             "'collect' must match Collection classes, got {}-char result",
             html.len()
         );
+        std::fs::remove_file(&tmp).ok();
     }
 
     /// The Senders find tool lists methods that SEND the selector (an IC-table

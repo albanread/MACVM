@@ -512,11 +512,16 @@ fn display_find(tool: &str) {
     // The results div carries a widget id + hierarchy root so clicking a
     // result (a .st-class-link) drills into that class via the same
     // smapplOpenClass path the outliner uses.
+    // A dropdown+search combobox: the text input filters as you type against a
+    // <datalist> of options (class names / selectors) that smtk.js requests from
+    // the worker (image_store) on load — `VmRequest::FindOptions`. Pick an option
+    // or type freely, then Enter runs the query.
     let body = format!(
         "<h1>{title}</h1>\
-         <p>Type a selector and press Enter.</p>\
+         <p>Type or pick from the list, then press Enter.</p>\
          <input class=\"st-find-input\" type=\"text\" data-find-tool=\"{tool}\" \
-          placeholder=\"{placeholder}\" autocomplete=\"off\" spellcheck=\"false\">\
+          list=\"st-find-options\" placeholder=\"{placeholder}\" autocomplete=\"off\" spellcheck=\"false\">\
+         <datalist id=\"st-find-options\"></datalist>\
          <div id=\"find-results\" data-widget-id=\"find\" data-hierarchy-root=\"Object\"></div>"
     );
     let html = preprocess::render_generated_page(
@@ -1026,6 +1031,14 @@ extern "C" fn on_script_message(_this: Id, _cmd: Sel, _controller: Id, message: 
                 });
             }
         }
+        "findOptions" => {
+            // A find page loaded — fetch its combobox options from image_store.
+            if let Some(vm) = VM.get() {
+                vm.submit(vm_host::VmRequest::FindOptions {
+                    tool: dict_get_string(body, "tool"),
+                });
+            }
+        }
         _ => {}
     }
 }
@@ -1356,6 +1369,14 @@ extern "C" fn vm_bridge_drain(_this: Id, _cmd: Sel, _arg: Id) {
                 eval_js(&format!(
                     "window.macvmSetFindResults({})",
                     js_string_literal(&html)
+                ));
+            }
+            vm_host::VmResponse::FindOptions { tool: _, options } => {
+                // Populate the find page's <datalist> combobox from image_store.
+                let items: Vec<String> = options.iter().map(|o| js_string_literal(o)).collect();
+                eval_js(&format!(
+                    "window.macvmSetFindOptions([{}])",
+                    items.join(",")
                 ));
             }
             vm_host::VmResponse::SmapplFragment { id, html } => {

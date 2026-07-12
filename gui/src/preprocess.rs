@@ -385,7 +385,7 @@ fn html_escape_attr(s: &str) -> String {
         .replace('>', "&gt;")
 }
 
-fn html_escape_text(s: &str) -> String {
+pub(crate) fn html_escape_text(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")

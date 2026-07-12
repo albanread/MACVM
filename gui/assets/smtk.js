@@ -581,6 +581,27 @@
     if (el) el.innerHTML = html;
   };
 
+  // vm_host::VmResponse::FindOptions -> fill the find page's <datalist> so the
+  // input becomes a dropdown+search combobox (type to filter, or pick an
+  // option, then Enter). Options are class names / selectors from image_store.
+  window.macvmSetFindOptions = function (options) {
+    const dl = document.getElementById("st-find-options");
+    if (!dl) return;
+    dl.innerHTML = "";
+    (options || []).forEach(function (o) {
+      const opt = document.createElement("option");
+      opt.value = o; // setter escapes — no manual HTML building
+      dl.appendChild(opt);
+    });
+  };
+
+  // On load, ask the worker (image_store) for this find page's combobox options.
+  function requestFindOptions() {
+    document.querySelectorAll(".st-find-input[data-find-tool]").forEach(function (inp) {
+      post({ kind: "findOptions", tool: inp.getAttribute("data-find-tool") || "" });
+    });
+  }
+
   // ── Workspace (workspace_render.rs) ────────────────────────────────────
   //
   // Do it/Print it act on the current selection, or the whole buffer if
@@ -996,5 +1017,6 @@
   document.addEventListener("DOMContentLoaded", function () {
     window.macvmHighlightCodeEditors();
     requestSmapplRenders();
+    requestFindOptions();
   });
 })();

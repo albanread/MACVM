@@ -395,6 +395,56 @@ impl Image {
         rows.collect()
     }
 
+    /// Every class name (latest, non-deleted) in load order — the option list
+    /// for the find views' class combobox, and the corpus for a class-name
+    /// substring search (Find Definition), done in SQL rather than a VM round
+    /// trip now that the image is kept in sync with the running VM.
+    pub fn class_names(&self) -> rusqlite::Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT c.name FROM classes c \
+             JOIN latest_class_versions lcv ON lcv.class_id = c.class_id \
+             WHERE lcv.deleted = 0 ORDER BY c.load_order",
+        )?;
+        let rows = stmt.query_map([], |r| r.get(0))?;
+        rows.collect()
+    }
+
+    /// Every distinct selector implemented anywhere (either side), sorted — the
+    /// option list for the implementors/senders combobox.
+    pub fn all_selectors(&self) -> rusqlite::Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT m.selector FROM methods m \
+             JOIN latest_method_versions lmv ON lmv.method_id = m.method_id \
+             WHERE lmv.deleted = 0 ORDER BY m.selector",
+        )?;
+        let rows = stmt.query_map([], |r| r.get(0))?;
+        rows.collect()
+    }
+
+    /// Every class implementing `selector` (either side) at its latest version —
+    /// the Implementors query in SQL instead of a VM reflection round trip.
+    /// Returns `(class_name, side)` sorted for a stable result list.
+    pub fn implementors_of(&self, selector: &str) -> rusqlite::Result<Vec<(String, Side)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT c.name, m.side FROM classes c \
+             JOIN methods m ON m.class_id = c.class_id \
+             JOIN latest_method_versions lmv ON lmv.method_id = m.method_id \
+             WHERE m.selector = ?1 AND lmv.deleted = 0 ORDER BY c.name, m.side",
+        )?;
+        let rows = stmt.query_map(params![selector], |r| {
+            let side: String = r.get(1)?;
+            Ok((
+                r.get::<_, String>(0)?,
+                if side == "class" {
+                    Side::Class
+                } else {
+                    Side::Instance
+                },
+            ))
+        })?;
+        rows.collect()
+    }
+
     // ── Mutations — every save is an INSERT, never an UPDATE ──────────────
 
     /// Create a class with its first version. For the importer (§6) and
