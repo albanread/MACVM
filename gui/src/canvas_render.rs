@@ -34,12 +34,18 @@ pub fn render_canvas(width: u32, height: u32) -> String {
     // The libm function-plot demo (world/37_waves.mst) — the VECTOR command
     // path (`canvasEval`), same generic transport, different pipeline.
     let waves_code = format!("WaveChart new commandsForWidth: {width} height: {height}");
+    // The live perf view (world/42_benchdash.mst) — same generic VECTOR command
+    // path as Waves. The expression runs a set of micro-benchmarks IN-IMAGE and
+    // answers a cold-vs-warm bar-chart command batch, so a click is a real
+    // measurement, not a static picture.
+    let bench_code = format!("BenchmarkDashboard chartForWidth: {width} height: {height}");
     format!(
         "<div class=\"st-canvas-view\" id=\"macvm-canvas-view\">\
          <div class=\"st-browser-action-row st-canvas-actions\">\
          <button type=\"button\" class=\"st-browser-new-button\" data-canvas-action=\"run-demo\">Run Demo</button>\
          <button type=\"button\" class=\"st-browser-new-button\" data-canvas-action=\"eval-pixels\" data-canvas-eval=\"{mandelbrot_code}\">Mandelbrot</button>\
          <button type=\"button\" class=\"st-browser-new-button\" data-canvas-action=\"eval\" data-canvas-eval=\"{waves_code}\">Waves</button>\
+         <button type=\"button\" class=\"st-browser-new-button\" data-canvas-action=\"eval\" data-canvas-eval=\"{bench_code}\">Benchmarks</button>\
          <button type=\"button\" class=\"st-browser-new-button\" data-canvas-action=\"clear\">Clear</button>\
          </div>\
          <div class=\"st-lowered st-canvas-surface\">\
@@ -70,6 +76,12 @@ mod tests {
         );
         assert!(
             html.contains("data-canvas-eval=\"WaveChart new commandsForWidth: 420 height: 220\""),
+            "{html}"
+        );
+        assert!(
+            html.contains(
+                "data-canvas-eval=\"BenchmarkDashboard chartForWidth: 420 height: 220\""
+            ),
             "{html}"
         );
         assert!(html.contains("data-canvas-action=\"clear\""), "{html}");

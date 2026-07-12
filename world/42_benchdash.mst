@@ -1,0 +1,179 @@
+"42_benchdash.mst — a live 'perf view' for the Canvas (docs/CANVAS.md vector
+ path). Runs a fixed set of recognizable micro-benchmarks IN-IMAGE and renders,
+ per benchmark, a COLD bar (the first run — includes JIT tier-up/compilation)
+ and a WARM bar (median of the runs after). One click shows both absolute speed
+ and the JIT warm-up settling — the honest perf story, and a view you can't
+ misread the way a stale doc number gets misread. Self-contained: its own
+ benchmarks, no dependency on world/bench/. The GUI Benchmarks button routes
+ `BenchmarkDashboard chartForWidth:height:` through the generic CanvasEval."
+Object subclass: BenchmarkDashboard [
+    | stream |
+
+    BenchmarkDashboard class >> new [ ^self basicNew ]
+
+    "── the benchmarks: each answers a deterministic result (a light sanity
+        check that we really computed something), sized for a measurable warm
+        time and to exercise a different VM path. ──"
+
+    BenchmarkDashboard class >> benchArith [
+        | s |
+        s := 0.
+        1 to: 1500000 do: [:i | s := s + (i * i) - (i * 3) ].
+        ^s
+    ]
+    BenchmarkDashboard class >> fib: n [
+        n < 2 ifTrue: [ ^n ].
+        ^(self fib: n - 1) + (self fib: n - 2)
+    ]
+    BenchmarkDashboard class >> benchFib [
+        ^self fib: 30
+    ]
+    BenchmarkDashboard class >> benchSieve [
+        | count |
+        count := 0.
+        4 timesRepeat: [ count := self sieveOnce ].
+        ^count
+    ]
+    BenchmarkDashboard class >> sieveOnce [
+        | flags count size |
+        size := 8190.
+        flags := Array new: size.
+        1 to: size do: [:x | flags at: x put: true ].
+        count := 0.
+        1 to: size do: [:i |
+            (flags at: i) ifTrue: [
+                | prime k |
+                prime := i + i + 1.
+                k := i + prime.
+                [ k <= size ] whileTrue: [ flags at: k put: false. k := k + prime ].
+                count := count + 1 ] ].
+        ^count
+    ]
+    BenchmarkDashboard class >> benchDict [
+        | d sum |
+        d := Dictionary new.
+        1 to: 8000 do: [:i | d at: i put: i * i ].
+        sum := 0.
+        1 to: 8000 do: [:i | sum := sum + (d at: i) ].
+        ^sum
+    ]
+    BenchmarkDashboard class >> benchAlloc [
+        | last |
+        last := nil.
+        1 to: 200000 do: [:i | last := Association key: i value: last ].
+        ^last key
+    ]
+
+    "── timing ──"
+
+    "Run aBlock `reps` times; answer {coldMs. warmMedianMs}: the first run alone
+     (cold, with compilation) then the median of the rest (warm)."
+    BenchmarkDashboard class >> time: aBlock reps: reps [
+        | t0 cold warm |
+        t0 := Smalltalk millisecondClock.
+        aBlock value.
+        cold := Smalltalk millisecondClock - t0.
+        warm := OrderedCollection new.
+        (reps - 1) timesRepeat: [
+            t0 := Smalltalk millisecondClock.
+            aBlock value.
+            warm add: Smalltalk millisecondClock - t0 ].
+        ^Array with: cold with: (self median: warm)
+    ]
+    BenchmarkDashboard class >> median: aCollection [
+        | sorted n |
+        aCollection isEmpty ifTrue: [ ^0 ].
+        sorted := SortedCollection new.
+        aCollection do: [:x | sorted add: x ].
+        n := sorted size.
+        ^sorted at: (n + 1) // 2
+    ]
+
+    "Answer an OrderedCollection of {name. coldMs. warmMs} rows."
+    BenchmarkDashboard class >> run [
+        | rows |
+        rows := OrderedCollection new.
+        rows add: (self row: 'arith' block: [ self benchArith ]).
+        rows add: (self row: 'fib'   block: [ self benchFib ]).
+        rows add: (self row: 'sieve' block: [ self benchSieve ]).
+        rows add: (self row: 'dict'  block: [ self benchDict ]).
+        rows add: (self row: 'alloc' block: [ self benchAlloc ]).
+        ^rows
+    ]
+    BenchmarkDashboard class >> row: name block: aBlock [
+        | t |
+        t := self time: aBlock reps: 6.
+        ^Array with: name with: (t at: 1) with: (t at: 2)
+    ]
+
+    "── chart: paired cold/warm horizontal bars, one band per benchmark ──"
+
+    "The Canvas command batch (docs/CANVAS.md) for a width x height chart."
+    BenchmarkDashboard class >> chartForWidth: width height: height [
+        ^self new renderRows: self run width: width height: height
+    ]
+
+    renderRows: rows width: w height: h [
+        | titleH bandH labelW valueW barX0 barMaxW maxMs |
+        titleH := 26.
+        bandH := (h - titleH) // (rows size max: 1).
+        labelW := 46.
+        valueW := 58.
+        barX0 := labelW.
+        barMaxW := w - labelW - valueW.
+        maxMs := 1.
+        rows do: [:r | maxMs := maxMs max: ((r at: 2) max: (r at: 3)) ].
+        stream := WriteStream on: String new.
+        stream nextPutAll: '[["clearRect",0,0,'.
+        self num: w. self put: ','. self num: h. self put: ']'.
+        "title"
+        self fill: 'rgb(150,162,178)'.
+        self font: 'bold 13px -apple-system,system-ui,sans-serif'.
+        self align: 'left'.
+        self text: 'Benchmarks — cold (compile) vs warm ms' x: 8 y: 17.
+        "bands"
+        rows doWithIndex: [:r :i |
+            | top nameY coldLen warmLen coldY warmY barH |
+            top := titleH + (i - 1 * bandH).
+            barH := (bandH - 10) // 2.
+            coldY := top + 3.
+            warmY := coldY + barH + 2.
+            nameY := top + (bandH // 2) + 3.
+            coldLen := ((r at: 2) * barMaxW) // maxMs.
+            warmLen := ((r at: 3) * barMaxW) // maxMs.
+            "name"
+            self fill: 'rgb(150,162,178)'.
+            self font: '12px -apple-system,system-ui,sans-serif'.
+            self align: 'left'.
+            self text: (r at: 1) x: 6 y: nameY.
+            "cold bar (amber) + label"
+            self fill: 'rgb(240,150,70)'.
+            self rectX: barX0 y: coldY w: (coldLen max: 1) h: barH.
+            self fill: 'rgb(150,162,178)'.
+            self text: (r at: 2) printString, ' ms' x: barX0 + (coldLen max: 1) + 5 y: coldY + barH - 1.
+            "warm bar (green) + label"
+            self fill: 'rgb(80,200,120)'.
+            self rectX: barX0 y: warmY w: (warmLen max: 1) h: barH.
+            self fill: 'rgb(150,162,178)'.
+            self text: (r at: 3) printString, ' ms' x: barX0 + (warmLen max: 1) + 5 y: warmY + barH - 1 ].
+        stream nextPutAll: ']'.
+        ^stream contents
+    ]
+
+    "── JSON command helpers (mirror WaveChart) ──"
+    fill: c [ stream nextPutAll: ',["fillStyle","'. stream nextPutAll: c. stream nextPutAll: '"]' ]
+    font: f [ stream nextPutAll: ',["font","'. stream nextPutAll: f. stream nextPutAll: '"]' ]
+    align: a [ stream nextPutAll: ',["textAlign","'. stream nextPutAll: a. stream nextPutAll: '"]' ]
+    rectX: x y: y w: bw h: bh [
+        stream nextPutAll: ',["fillRect",'.
+        self num: x; put: ','; num: y; put: ','; num: bw; put: ','; num: bh; put: ']'.
+    ]
+    text: s x: x y: y [
+        stream nextPutAll: ',["fillText","'.
+        stream nextPutAll: s.
+        stream nextPutAll: '",'.
+        self num: x; put: ','; num: y; put: ']'.
+    ]
+    num: n [ stream nextPutAll: n truncated printString ]
+    put: aString [ stream nextPutAll: aString ]
+]

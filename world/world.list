@@ -59,3 +59,5 @@
 40_seqcltn_search.mst
 # String splitting utilities (need OrderedCollection; Strongtalk port).
 41_string_text.mst
+# Benchmark dashboard: live cold/warm perf bar chart on the Canvas.
+42_benchdash.mst
