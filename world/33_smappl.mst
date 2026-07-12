@@ -226,14 +226,6 @@ Object subclass: HTMLView [
     launch [ ^'macvm-nav:documentation' ]
 ]
 
-"`TextEditor new launch` / `(TextEditor on: (FilePath for: '…')) launch` — the
- startPage.html edit button and doit links. A text editor maps to the workspace."
-Object subclass: TextEditor [
-    TextEditor class >> new [ ^self basicNew ]
-    TextEditor class >> on: aFilePath [ ^self basicNew ]
-    launch [ ^'macvm-nav:workspace' ]
-]
-
 "Browsable placeholders for the tour's `imbeddedVisualForClass: Application`
  (startPage.html) and `ClassOutliner for: (ClassMirror on: Test)`
  (virtualmachine2.html) demos — Strongtalk classes MACVM has no equivalent for.
