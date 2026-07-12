@@ -436,10 +436,22 @@ fn toolbar_html(theme: Theme) -> String {
 /// instead of always resetting to a blank "Ready." greeting, which used to
 /// make any navigation (even just a theme switch) silently erase it.
 fn statusbar_html(transcript: &str) -> String {
+    // Newest-first: the persisted buffer is chronological (oldest → newest, the
+    // order `append_transcript` writes it), so reverse the lines for display —
+    // the most recent entry sits at the top of the pane, matching the live
+    // prepend `macvmAppendTranscript` does. The log text lives in its own
+    // `#macvm-transcript-log` child, NOT directly in `#macvm-transcript`,
+    // because `macvmAppendTranscript`/`macvmClearTranscript` set that child's
+    // `.textContent` — which would otherwise wipe out the sibling Clear button.
+    let log: String = transcript.split('\n').rev().collect::<Vec<_>>().join("\n");
     format!(
-        "<div class=\"st-transcript st-lowered\" id=\"macvm-transcript\" style=\"height: 72px\">{}</div>\
+        "<div class=\"st-transcript st-lowered\" id=\"macvm-transcript\" style=\"height: 72px\">\
+         <button type=\"button\" class=\"st-transcript-clear\" data-action=\"clearTranscript\" \
+         title=\"Clear the transcript\">Clear</button>\
+         <div class=\"st-transcript-log\" id=\"macvm-transcript-log\">{}</div>\
+         </div>\
          <div class=\"st-statusbar st-raised\"><span class=\"st-field\" id=\"macvm-status\">Ready</span></div>",
-        html_escape_text(transcript)
+        html_escape_text(&log)
     )
 }
 
@@ -488,7 +500,13 @@ fn chrome_layout_style() -> String {
      body { margin: 0; display: flex; flex-direction: column; overflow: hidden; }\
      #macvm-toolbar { flex: 0 0 auto; z-index: 5; }\
      #macvm-scroll { flex: 1 1 auto; min-height: 0; overflow-y: auto; overflow-x: hidden; }\
-     #macvm-transcript { flex: 0 0 auto; margin-top: 0; }\
+     #macvm-transcript { flex: 0 0 auto; margin-top: 0; position: relative; overflow: hidden; }\
+     #macvm-transcript-log { height: 100%; overflow-y: auto; overflow-x: hidden; overscroll-behavior: contain; }\
+     .st-transcript-clear { position: absolute; top: 3px; right: 3px; z-index: 2; \
+       font-family: var(--st-font-widget, sans-serif); font-size: 11px; line-height: 1.2; \
+       padding: 1px 6px; cursor: pointer; background: var(--st-background-gray, #c0c0c0); \
+       color: var(--st-foreground, #000); border: 1px solid var(--st-gray, #808080); }\
+     .st-transcript-clear:active { box-shadow: inset 1px 1px 0 var(--st-gray, #808080); }\
      .st-statusbar { flex: 0 0 auto; }\
      #macvm-scroll > .st-workspace, #macvm-scroll > .st-browser { height: 100%; }\
      </style>"
@@ -724,6 +742,25 @@ mod tests {
         assert_eq!(Theme::from_cli_name("Hi-Def"), Some(Theme::HiDef));
         assert_eq!(Theme::from_cli_name("crtamber"), Some(Theme::CrtAmber));
         assert_eq!(Theme::from_cli_name("nonsense"), None);
+    }
+
+    #[test]
+    fn transcript_renders_newest_first_with_a_clear_button() {
+        // The persisted buffer is chronological; the pane must show it reversed
+        // (newest at the top) inside a `#macvm-transcript-log` child, with the
+        // Clear button as a sibling that a textContent write won't clobber.
+        let out = statusbar_html("first\nsecond\nthird");
+        let log = &out[out
+            .find("macvm-transcript-log")
+            .expect("log wrapper present")..];
+        let p3 = log.find("third").expect("third present");
+        let p2 = log.find("second").expect("second present");
+        let p1 = log.find("first").expect("first present");
+        assert!(p3 < p2 && p2 < p1, "newest-first (third→second→first): {out}");
+        assert!(
+            out.contains(r#"data-action="clearTranscript""#),
+            "clear button present: {out}"
+        );
     }
 
     #[test]

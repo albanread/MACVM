@@ -785,6 +785,14 @@ extern "C" fn on_script_message(_this: Id, _cmd: Sel, _controller: Id, message: 
                 other => append_transcript(&format!("(toolbar: {other} — not wired yet)")),
             }
         }
+        "clearTranscript" => {
+            // Empty the persisted history so the clear survives navigation (the
+            // next page's `statusbar_html` renders from this buffer), then clear
+            // the live pane to match — same native-drives-the-DOM shape as
+            // `append_transcript`.
+            TRANSCRIPT.lock().unwrap().clear();
+            eval_js("window.macvmClearTranscript && window.macvmClearTranscript()");
+        }
         "navigate" => {
             let href = dict_get_string(body, "href");
             let Some(nav) = NAV.get() else { return };

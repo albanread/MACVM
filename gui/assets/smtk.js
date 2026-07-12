@@ -144,6 +144,16 @@
         return;
       }
 
+      // The transcript's Clear button: ask the host to empty the persisted
+      // buffer; it clears the pane back via macvmClearTranscript (so a clear
+      // survives navigation instead of the old text re-rendering next page).
+      const clearBtn = ev.target.closest('[data-action="clearTranscript"]');
+      if (clearBtn) {
+        ev.preventDefault();
+        post({ kind: "clearTranscript" });
+        return;
+      }
+
       // Class browser view (browser_render.rs) — each pane item posts its
       // own selection kind; the VM worker thread re-renders the affected
       // panes and the Rust host patches them back in (main.rs::replace_pane).
@@ -250,13 +260,21 @@
   };
 
   window.macvmAppendTranscript = function (text) {
-    const el = document.getElementById("macvm-transcript");
-    if (!el) return;
-    el.textContent += "\n" + text;
-    // The transcript is now pinned to the bottom of the window in a fixed
-    // ~72px band; keep the newest line in view so fresh output isn't hidden
-    // below the fold of that little pane.
-    el.scrollTop = el.scrollHeight;
+    const log = document.getElementById("macvm-transcript-log");
+    if (!log) return;
+    // Newest-first: prepend at the top so the most recent line is always the
+    // first thing visible in the pinned ~72px pane, then snap the scroll to the
+    // top so it's actually shown (older lines scroll away below).
+    log.textContent = log.textContent ? text + "\n" + log.textContent : text;
+    log.scrollTop = 0;
+  };
+
+  // Clear the transcript log. Called by the host after it empties the persisted
+  // buffer (main.rs's `clearTranscript` handler), so the pane and the buffer
+  // stay in step — the same native-drives-the-DOM shape as macvmAppendTranscript.
+  window.macvmClearTranscript = function () {
+    const log = document.getElementById("macvm-transcript-log");
+    if (log) log.textContent = "";
   };
 
   // ── Class browser source editor (browser_render.rs) ────────────────────
