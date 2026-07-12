@@ -466,6 +466,35 @@ fn font_scale_style(font_scale_percent: u32) -> String {
     format!("<style>body {{ zoom: {font_scale_percent}%; }}</style>")
 }
 
+/// Pin the app chrome: the toolbar to the top of the window and the transcript
+/// + status bar to the bottom, with the page's own content (wrapped in
+/// `#macvm-scroll` by [`preprocess_html`]) scrolling endlessly in the band
+/// between them. One `<style>` injected after the theme stylesheet, so it wins
+/// on document order without editing all seven theme files. It replaces the
+/// themes' normal-flow chrome — including the old `.st-transcript { margin-top:
+/// 30vh }` push-down that used to *fake* a bottom-anchored transcript on short
+/// pages (it scrolled away with everything else once a page got tall).
+///
+/// `body` becomes a fixed-height flex column (`height: 100%` + `overflow:
+/// hidden`), the toolbar and the bottom bars are non-shrinking end caps
+/// (`flex: 0 0 auto`), and only `#macvm-scroll` scrolls (`flex: 1` +
+/// `min-height: 0` so it can shrink below its content and actually scroll —
+/// the classic flexbox-scroll gotcha). The two "fill the viewport" views
+/// (`.st-workspace`, `.st-browser`, formerly sized `calc(100vh - 120px)` to
+/// dodge the chrome by hand) just fill the scroll band now.
+fn chrome_layout_style() -> String {
+    "<style>\
+     html, body { height: 100%; }\
+     body { margin: 0; display: flex; flex-direction: column; overflow: hidden; }\
+     #macvm-toolbar { flex: 0 0 auto; z-index: 5; }\
+     #macvm-scroll { flex: 1 1 auto; min-height: 0; overflow-y: auto; overflow-x: hidden; }\
+     #macvm-transcript { flex: 0 0 auto; margin-top: 0; }\
+     .st-statusbar { flex: 0 0 auto; }\
+     #macvm-scroll > .st-workspace, #macvm-scroll > .st-browser { height: 100%; }\
+     </style>"
+        .to_string()
+}
+
 fn chrome_head_extra(original_dir: &Path, theme: Theme, font_scale_percent: u32) -> String {
     // The `<meta charset>` matters even though the original corpus files
     // don't declare one: none of them use non-ASCII bytes, so the gap was
@@ -474,11 +503,12 @@ fn chrome_head_extra(original_dir: &Path, theme: Theme, font_scale_percent: u32)
     // without an explicit charset WKWebView guessed a Latin-1-ish encoding
     // and mangled it. Declaring UTF-8 here covers every loaded page.
     format!(
-        "<meta charset=\"utf-8\">\n{}\n<link rel=\"stylesheet\" href=\"{}\">\n<script src=\"{}\"></script>\n{}",
+        "<meta charset=\"utf-8\">\n{}\n<link rel=\"stylesheet\" href=\"{}\">\n<script src=\"{}\"></script>\n{}\n{}",
         base_href_tag(original_dir),
         gui_file_url(theme.stylesheet_relative_path()),
         gui_file_url("assets/smtk.js"),
         font_scale_style(font_scale_percent),
+        chrome_layout_style(),
     )
 }
 
@@ -562,8 +592,19 @@ fn preprocess_html(
         &html,
         &chrome_head_extra(original_dir, theme, font_scale_percent),
     );
-    html = inject_after_body_open(&html, &toolbar_html(theme));
-    html = inject_before_body_close(&html, &statusbar_html(transcript));
+    // Wrap the page's own content in a single scrolling pane (`#macvm-scroll`)
+    // so `chrome_layout_style` can pin the toolbar above it and the transcript/
+    // status bar below it while the content scrolls endlessly in between. The
+    // toolbar goes just inside `<body>` and opens the wrapper; the wrapper
+    // closes just before the bottom bars, right before `</body>`.
+    html = inject_after_body_open(
+        &html,
+        &format!(
+            "{}<div class=\"st-scroll\" id=\"macvm-scroll\">",
+            toolbar_html(theme)
+        ),
+    );
+    html = inject_before_body_close(&html, &format!("</div>{}", statusbar_html(transcript)));
     html
 }
 

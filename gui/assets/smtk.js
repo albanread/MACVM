@@ -251,7 +251,12 @@
 
   window.macvmAppendTranscript = function (text) {
     const el = document.getElementById("macvm-transcript");
-    if (el) el.textContent += "\n" + text;
+    if (!el) return;
+    el.textContent += "\n" + text;
+    // The transcript is now pinned to the bottom of the window in a fixed
+    // ~72px band; keep the newest line in view so fresh output isn't hidden
+    // below the fold of that little pane.
+    el.scrollTop = el.scrollHeight;
   };
 
   // ── Class browser source editor (browser_render.rs) ────────────────────
