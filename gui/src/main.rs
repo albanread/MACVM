@@ -366,6 +366,45 @@ fn cmd_seed(args: &[String]) {
     }
 }
 
+/// `macvm-gui export --world DIR` — write the image back over `DIR`'s
+/// `world/*.mst` (in place, surgically) so interactive edits can be reviewed and
+/// checked into source control. Headless complement to `seed` (the reverse
+/// direction); the GUI's File ▸ "Save World to Files" runs the same code.
+fn cmd_export(args: &[String]) {
+    let mut world_dir = PathBuf::from("world");
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--world" {
+            i += 1;
+            if let Some(d) = args.get(i) {
+                world_dir = PathBuf::from(d);
+            }
+        }
+        i += 1;
+    }
+    let image_path = std::env::var_os("MACVM_IMAGE_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| world_dir.join("image.sqlite3"));
+    let image = match image_store::Image::open(&image_path) {
+        Ok(img) => img,
+        Err(e) => {
+            eprintln!("export: cannot open {}: {e}", image_path.display());
+            std::process::exit(1);
+        }
+    };
+    match image_store::export::export_world_dir(&image, &world_dir) {
+        Ok(stats) => println!(
+            "exported {} -> {} ({stats:?})",
+            image_path.display(),
+            world_dir.display()
+        ),
+        Err(e) => {
+            eprintln!("export: failed: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
 /// Displays `path` (a view marker or a corpus file). Returns `false` if a file
 /// load failed — the caller must NOT commit a failed target to history, or a
 /// broken relative link's bad path becomes `current()` and the next relative
@@ -1494,6 +1533,38 @@ fn submenu(title: &str, items: &[Id]) -> Id {
 /// caught by actually running the shell rather than just reading the code.
 const NS_APPLICATION_ACTIVATION_POLICY_REGULAR: i64 = 0;
 
+// File-menu world I/O: submit to the worker (which owns the image + world_dir),
+// result reported to the transcript.
+extern "C" fn save_world_to_files(_this: Id, _cmd: Sel, _sender: Id) {
+    if let Some(vm) = VM.get() {
+        vm.submit(vm_host::VmRequest::ExportWorld);
+    }
+}
+
+extern "C" fn load_world_from_files(_this: Id, _cmd: Sel, _sender: Id) {
+    if let Some(vm) = VM.get() {
+        vm.submit(vm_host::VmRequest::ImportWorld);
+    }
+}
+
+fn build_world_io_delegate() -> Id {
+    let cls = objc::allocate_class(objc::get_class("NSObject"), "MacvmWorldIoDelegate");
+    objc::add_method(
+        cls,
+        sel("saveWorldToFiles:"),
+        save_world_to_files as *const _,
+        "v@:@",
+    );
+    objc::add_method(
+        cls,
+        sel("loadWorldFromFiles:"),
+        load_world_from_files as *const _,
+        "v@:@",
+    );
+    objc::register_class(cls);
+    objc::alloc_init("MacvmWorldIoDelegate")
+}
+
 fn build_menu_bar() {
     let app = objc::send0(objc::get_class("NSApplication"), sel("sharedApplication"));
     objc::send1_i64(
@@ -1503,9 +1574,21 @@ fn build_menu_bar() {
     );
 
     let app_menu = submenu("MACVM", &[menu_item("Quit MACVM", Some("terminate:"), "q")]);
+    // File menu: window control + world ↔ files (image_store export/import), so
+    // interactive edits can be checked into source control and pulled back.
+    let world_io_delegate = build_world_io_delegate();
+    let save_world_item = menu_item("Save World to Files", Some("saveWorldToFiles:"), "");
+    objc::send1_id(save_world_item, sel("setTarget:"), world_io_delegate);
+    let load_world_item = menu_item("Load World from Files", Some("loadWorldFromFiles:"), "");
+    objc::send1_id(load_world_item, sel("setTarget:"), world_io_delegate);
     let file_menu = submenu(
         "File",
-        &[menu_item("Close Window", Some("performClose:"), "w")],
+        &[
+            menu_item("Close Window", Some("performClose:"), "w"),
+            separator_item(),
+            save_world_item,
+            load_world_item,
+        ],
     );
     let edit_menu = submenu(
         "Edit",
@@ -1641,6 +1724,7 @@ fn main() {
     match cli.first().map(String::as_str) {
         Some("render") => return cmd_render(&cli[1..]),
         Some("seed") => return cmd_seed(&cli[1..]),
+        Some("export") => return cmd_export(&cli[1..]),
         _ => {}
     }
 

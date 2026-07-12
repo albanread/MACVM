@@ -177,6 +177,13 @@ pub enum VmRequest {
     FindOptions {
         tool: String,
     },
+    /// File ▸ "Save World to Files" — write the image back over `world/*.mst`
+    /// (`image_store::export`, surgical) so interactive edits can be checked into
+    /// source control. Handled in `worker_loop` (it holds `world_dir`).
+    ExportWorld,
+    /// File ▸ "Load World from Files" — re-import `world/*.mst` into the image
+    /// (the `seed` direction). Takes effect in the running VM after a restart.
+    ImportWorld,
     /// Reset the worker's `BrowserSelection` to match the fresh default
     /// state the initial page render always shows (see
     /// `main.rs::open_class_browser`) — sent once whenever the browser
@@ -698,7 +705,13 @@ fn worker_loop(
     let mut selection = BrowserSelection::default();
 
     for request in requests {
-        let batch = handle(request, &mut world, &mut selection, image.as_ref(), &mut vm);
+        // Export/import touch the world/*.mst file tree, so they're serviced
+        // here where `world_dir` is in scope (`handle` has no `world_dir`).
+        let batch = match request {
+            VmRequest::ExportWorld => vec![export_world_response(image.as_ref(), world_dir)],
+            VmRequest::ImportWorld => vec![import_world_response(image.as_ref(), world_dir)],
+            other => handle(other, &mut world, &mut selection, image.as_ref(), &mut vm),
+        };
         // Reaching HERE (rather than `pthread_exit`ing inside `handle` on a
         // fatal guest condition) is exactly the "still alive" fact the
         // WorkerIdle marker below reports — so it is sent unconditionally
@@ -826,6 +839,45 @@ fn open_or_seed_image(world_dir: &Path, image_path: &Path) -> Result<image_store
         _ => {}
     }
     Ok(image)
+}
+
+/// File ▸ "Save World to Files" — write the image back over `world/*.mst`
+/// (surgically), reporting the result to the transcript.
+fn export_world_response(image: Option<&image_store::Image>, world_dir: &Path) -> VmResponse {
+    let msg = match image {
+        None => "Save World: no image database is loaded.".to_string(),
+        Some(img) => match image_store::export::export_world_dir(img, world_dir) {
+            Ok(s) => format!(
+                "Saved world to {} — {} file(s) changed ({} method(s) updated, {} added, {} new class(es)). Review with `git diff`.",
+                world_dir.display(),
+                s.files_changed,
+                s.methods_updated,
+                s.methods_added,
+                s.classes_added
+            ),
+            Err(e) => format!("Save World failed: {e}"),
+        },
+    };
+    VmResponse::Transcript(msg)
+}
+
+/// File ▸ "Load World from Files" — re-import `world/*.mst` into the image (the
+/// seed direction). Live only after a VM restart.
+fn import_world_response(image: Option<&image_store::Image>, world_dir: &Path) -> VmResponse {
+    let msg = match image {
+        None => "Load World: no image database is loaded.".to_string(),
+        Some(img) => match image_store::import::import_world_dir(img, world_dir) {
+            Ok(stats) => {
+                let sends = img.backfill_method_sends().unwrap_or(0);
+                format!(
+                    "Loaded world from {} into the image ({stats:?}, {sends} send-edges). Restart the VM (VM menu) to run the changes.",
+                    world_dir.display()
+                )
+            }
+            Err(e) => format!("Load World failed: {e}"),
+        },
+    };
+    VmResponse::Transcript(msg)
 }
 
 /// Boots the VM FROM the image (S22): genesis, then replay the whole world
@@ -1422,6 +1474,10 @@ fn handle(
                 })
                 .unwrap_or_default();
             vec![VmResponse::FindOptions { tool, options }]
+        }
+        // Serviced in `worker_loop` (needs `world_dir`); never reaches `handle`.
+        VmRequest::ExportWorld | VmRequest::ImportWorld => {
+            unreachable!("world I/O is handled in worker_loop")
         }
         VmRequest::BrowserOpen => {
             // No longer resets `selection` to default — that made sense

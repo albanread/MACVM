@@ -13,6 +13,7 @@
 //! below — see `docs/IMAGE.md` §4 for why "latest" is always computed, not
 //! a stored pointer that could drift out of sync.
 
+pub mod export;
 pub mod import;
 pub mod mst;
 
