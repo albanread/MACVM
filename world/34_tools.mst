@@ -252,6 +252,13 @@ Visual subclass: ClassOutliner [
         mirror := m.
         ^self
     ]
+    "The corpus pre-opens one method on-screen (virtualmachine2.html:
+     `openSide: true selector: #simpleTest:`). MACVM's fragment already renders
+     every selector (collapsed, client-side expandable in smtk.js), so this is a
+     no-op — it just has to exist for the embed to build."
+    openSide: aBool selector: aSelector [
+        ^self
+    ]
     htmlFragment [
         | html |
         html := HtmlWriter new.
