@@ -64,6 +64,25 @@ pub fn import_world_dir(image: &Image, world_dir: &Path) -> Result<ImportStats, 
                     )
                     .map_err(|e| format!("{filename}: add_class({}): {e}", parsed.name))?;
                 stats.classes += 1;
+            } else {
+                // The class already exists (a later file re-opens it, or an
+                // incremental reseed re-imports it): re-apply its shell so a
+                // changed superclass/ivars/classVars isn't silently dropped —
+                // methods alone are updated below. Without this, adding a
+                // `<classVars: …>` pragma and reseeding left the vars empty and
+                // broke image boot.
+                image
+                    .reimport_class_shell(
+                        &parsed.name,
+                        parsed.superclass.as_deref(),
+                        &category,
+                        &parsed.comment,
+                        &parsed.instance_vars,
+                        &parsed.class_vars,
+                    )
+                    .map_err(|e| {
+                        format!("{filename}: reimport_class_shell({}): {e}", parsed.name)
+                    })?;
             }
             for method in &parsed.methods {
                 let side = if method.is_class_side {

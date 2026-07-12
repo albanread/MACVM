@@ -778,6 +778,57 @@ impl Image {
         Ok(true)
     }
 
+    /// Re-import a live class's full *shell* (superclass, category, comment,
+    /// instance vars, AND class vars) to match a re-parsed `.mst`, inserting a
+    /// fresh version only if anything actually changed. This is what the world
+    /// importer ([`crate::import`]) needs for a class that already exists:
+    /// unlike [`Self::set_class_definition`] it DOES update `class_vars`, and
+    /// unlike [`Self::create_or_reopen_class`] it applies to a live class. Its
+    /// absence was a real bug — an incremental reseed after adding a
+    /// `<classVars: …>` pragma silently kept the old (empty) vars, so booting
+    /// the image failed to compile methods that referenced them. Returns
+    /// `false` if `class_name` doesn't exist.
+    pub fn reimport_class_shell(
+        &self,
+        class_name: &str,
+        superclass: Option<&str>,
+        category: &str,
+        comment: &str,
+        instance_vars: &str,
+        class_vars: &str,
+    ) -> rusqlite::Result<bool> {
+        let Some(class_id) = self.class_id_of(class_name)? else {
+            return Ok(false);
+        };
+        let (cur_sc, cur_cat, cur_com, cur_iv, cur_cv): (String, String, String, String, String) =
+            self.conn.query_row(
+                "SELECT COALESCE(superclass_name, ''), category, comment, instance_vars, class_vars \
+                 FROM latest_class_versions WHERE class_id = ?1",
+                params![class_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )?;
+        // No churn if the shell is unchanged.
+        if cur_sc == superclass.unwrap_or("")
+            && cur_cat == category
+            && cur_com == comment
+            && cur_iv == instance_vars
+            && cur_cv == class_vars
+        {
+            return Ok(false);
+        }
+        self.insert_class_version(
+            class_id,
+            superclass,
+            category,
+            comment,
+            instance_vars,
+            class_vars,
+            false,
+        )?;
+        self.prune_class_versions(class_id)?;
+        Ok(true)
+    }
+
     /// Soft-delete: insert one more version identical to the latest except
     /// `deleted=1` — reuses the exact insert/prune path every other edit
     /// above uses, so [`undo_method`](Self::undo_method) needs *no changes
@@ -1131,6 +1182,37 @@ impl Image {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reimport_class_shell_updates_class_vars() {
+        // The exact bug behind the blank-editors regression: a class first
+        // imported WITHOUT class vars (M3 GamePane), then re-imported WITH them
+        // (M4 GamePane). Before the fix, an incremental reseed kept the old
+        // (empty) vars, so image boot failed to compile methods referencing them.
+        let img = Image::open_in_memory().unwrap();
+        let lo = img.next_load_order().unwrap();
+        img.add_class("Widget", Some("Object"), "GUI", "", "", "", lo)
+            .unwrap();
+
+        let changed = img
+            .reimport_class_shell("Widget", Some("Object"), "GUI", "", "", "State Count")
+            .unwrap();
+        assert!(changed, "adding class vars is a real change");
+
+        let cvars = img
+            .all_classes()
+            .unwrap()
+            .into_iter()
+            .find(|c| c.name == "Widget")
+            .unwrap()
+            .class_vars;
+        assert_eq!(cvars, "State Count", "the reimported shell carries the class vars");
+
+        // A no-op reimport (identical shell) reports no change — no version churn.
+        assert!(!img
+            .reimport_class_shell("Widget", Some("Object"), "GUI", "", "", "State Count")
+            .unwrap());
+    }
 
     fn seeded() -> Image {
         let img = Image::open_in_memory().unwrap();
