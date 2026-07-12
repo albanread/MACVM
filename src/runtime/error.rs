@@ -69,18 +69,32 @@ pub fn print_stack_trace(vm: &mut VmState) {
     print_frame_line(vm, top_method, top_bci);
 
     let mut fp = vm.stack.fp;
-    loop {
+    // Bounded so a corrupt/cyclic chain can't spin forever, and every frame
+    // read is the non-panicking variant: when the erroring activation was
+    // entered from compiled code the walk reaches a boundary whose slots aren't
+    // valid interpreter-frame words, and STOPPING there (a truncated trace) is
+    // the right answer — aborting the VM from inside its own error reporter is
+    // not (the `Frame::saved_fp: not a smi` crash this replaces).
+    for _ in 0..MAX_TRACE_FRAMES {
         let frame = Frame { fp };
-        let saved_fp = frame.saved_fp(&vm.stack);
-        if saved_fp == ENTRY_FRAME_SENTINEL {
-            break;
-        }
-        let caller_bci = frame.saved_bci(&vm.stack);
+        let saved_fp = match frame.saved_fp_opt(&vm.stack) {
+            Some(v) if v != ENTRY_FRAME_SENTINEL => v,
+            _ => break,
+        };
+        let caller_bci = frame.saved_bci_opt(&vm.stack).unwrap_or(0);
         fp = saved_fp as usize;
-        let caller_method = Frame { fp }.method(&vm.stack);
+        let caller_method = match (Frame { fp }).method_opt(&vm.stack) {
+            Some(m) => m,
+            None => break,
+        };
         print_frame_line(vm, caller_method, caller_bci);
     }
 }
+
+/// A hard ceiling on trace depth — defends the walker against a cyclic or
+/// corrupt `saved_fp` chain (a deep-but-legitimate stack still prints in full;
+/// real ones never approach this).
+const MAX_TRACE_FRAMES: usize = 4096;
 
 /// `MACVM_TRACE=dnu` (RUSTTCL's `trace dnu on`, same channel): one line per
 /// `doesNotUnderstand:` dispatch, printed BEFORE the `Message` send/lookup

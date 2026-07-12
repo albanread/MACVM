@@ -304,6 +304,43 @@ impl Frame {
             .value() as usize
     }
 
+    // ── Non-panicking reads for the error-trace walker ───────────────────────
+    //
+    // `runtime::error::print_stack_trace` chases `saved_fp` frame-to-frame, but
+    // when the erroring activation was entered FROM compiled code the chain can
+    // reach a boundary it cannot cross: a compiled frame keeps NO interpreter
+    // frame on `vm.stack`, so the slot the walker would read as the next
+    // `saved_fp`/method isn't the smi/CompiledMethod the panicking readers above
+    // assume — and an error report aborting the whole process is strictly worse
+    // than a truncated trace. These answer `None` at such a boundary (or on an
+    // out-of-range `fp`) so the walker stops instead of panicking.
+    pub fn saved_fp_opt(self, st: &ProcessStack) -> Option<i64> {
+        // `checked_add`: `fp` may be the entry sentinel (`usize::MAX`) when the
+        // erroring frame was entered straight from compiled code — a plain add
+        // would WRAP to a small in-range index and read a garbage "saved_fp".
+        let idx = self.fp.checked_add(FRAME_SAVED_FP)?;
+        if idx >= st.capacity() {
+            return None;
+        }
+        SmallInt::try_from(st.get(idx)).map(|s| s.value())
+    }
+
+    pub fn saved_bci_opt(self, st: &ProcessStack) -> Option<usize> {
+        let idx = self.fp.checked_add(FRAME_SAVED_BCI)?;
+        if idx >= st.capacity() {
+            return None;
+        }
+        SmallInt::try_from(st.get(idx)).map(|s| s.value() as usize)
+    }
+
+    pub fn method_opt(self, st: &ProcessStack) -> Option<MethodOop> {
+        let idx = self.fp.checked_add(FRAME_METHOD)?;
+        if idx >= st.capacity() {
+            return None;
+        }
+        MethodOop::try_from(st.get(idx))
+    }
+
     pub fn context(self, st: &ProcessStack) -> Oop {
         st.get(self.fp + FRAME_CONTEXT)
     }

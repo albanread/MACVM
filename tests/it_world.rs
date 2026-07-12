@@ -218,6 +218,66 @@ fn error_kills_with_trace() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// Regression: raising an error from a frame that was entered from COMPILED
+/// code must not crash the VM's own error reporter. `print_stack_trace` chases
+/// `saved_fp` frame-to-frame; at the interpreter/compiled boundary that slot
+/// isn't a valid interpreter word, and the old panicking readers aborted the
+/// whole process (`Frame::saved_fp: not a smi`, SIGABRT — a GUI bug report). A
+/// clean guest error exits with a normal code; a SIGABRT is a SIGNAL kill, so
+/// `status.code()` is `None` — that (not the exit VALUE) is what this asserts.
+#[test]
+fn error_from_compiled_frame_does_not_abort() {
+    let dir = std::env::temp_dir().join(format!("macvm_compiled_err_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let script = dir.join("boom.mst");
+    // `work:` is called ~100x so it tiers up; at i>40 it raises from inside the
+    // now-compiled frame — the exact shape of the reported crash.
+    std::fs::write(
+        &script,
+        "Object subclass: BoomC [\n\
+         \x20 BoomC class >> work: i [ i > 40 ifTrue: [ ^self error: 'boom' ]. ^i + 1 ]\n\
+         \x20 BoomC class >> run [ | s | s := 0. 1 to: 100 do: [:i | s := s + (self work: i) ]. ^s ]\n\
+         ]\n\
+         BoomC run.\n",
+    )
+    .unwrap();
+
+    let out = Command::new(bin_path())
+        .args([
+            "run",
+            script.to_str().unwrap(),
+            "--world",
+            world_dir().to_str().unwrap(),
+        ])
+        .env("MACVM_JIT", "threshold=10")
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("spawn macvm");
+
+    // The crash was a SIGABRT → killed by a signal → `code()` is None. A clean
+    // guest error exits with an actual code. So: it must have exited normally.
+    assert!(
+        out.status.code().is_some(),
+        "VM was killed by a signal (the print_stack_trace abort), status: {:?}\nstderr:\n{}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("not a smi"),
+        "the error reporter panicked, stderr:\n{stderr}"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("boom"),
+        "expected the error message in stdout, got:\n{stdout}"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// S24 A1 (adversarial-review BLOCKER 2): a compiled NLR block whose home
 /// frame already returned must deliver `#cannotReturn:` to the ORIGINATING
 /// closure — `rt_nlr_originate` parks it in `NlrState.closure`; the block's
