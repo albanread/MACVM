@@ -130,6 +130,12 @@ CREATE TABLE IF NOT EXISTS method_bytecode (
     compiler_tag       TEXT NOT NULL,
     compiled_at        INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS method_sends (
+    method_version_id INTEGER NOT NULL REFERENCES method_versions(version_id),
+    selector          TEXT NOT NULL,
+    PRIMARY KEY (method_version_id, selector)
+);
+CREATE INDEX IF NOT EXISTS idx_method_sends_selector ON method_sends(selector);
 CREATE VIEW IF NOT EXISTS latest_class_versions AS
     SELECT cv.* FROM class_versions cv
     WHERE cv.version_number = (SELECT MAX(version_number) FROM class_versions WHERE class_id = cv.class_id);
@@ -443,6 +449,63 @@ impl Image {
             ))
         })?;
         rows.collect()
+    }
+
+    /// Every method whose LATEST source SENDS `selector` — the Senders query,
+    /// answered from the `method_sends` index (populated by
+    /// [`Image::backfill_method_sends`] / on every method write) instead of a VM
+    /// IC-table scan. Returns `(class_name, sending_method_selector, side)`.
+    pub fn senders_of(&self, selector: &str) -> rusqlite::Result<Vec<(String, String, Side)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT c.name, m.selector, m.side \
+             FROM method_sends ms \
+             JOIN latest_method_versions lmv ON lmv.version_id = ms.method_version_id \
+             JOIN methods m ON m.method_id = lmv.method_id \
+             JOIN classes c ON c.class_id = m.class_id \
+             WHERE ms.selector = ?1 AND lmv.deleted = 0 \
+             ORDER BY c.name, m.selector, m.side",
+        )?;
+        let rows = stmt.query_map(params![selector], |r| {
+            let side: String = r.get(2)?;
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                if side == "class" {
+                    Side::Class
+                } else {
+                    Side::Instance
+                },
+            ))
+        })?;
+        rows.collect()
+    }
+
+    /// Populate `method_sends` for every live method version that has no rows
+    /// yet — a one-time backfill so an image seeded before senders-indexing
+    /// gains it without a full re-import. Idempotent (re-run is cheap; a method
+    /// that genuinely sends nothing is simply re-scanned to no effect). Returns
+    /// the number of (version, selector) edges inserted.
+    pub fn backfill_method_sends(&self) -> rusqlite::Result<usize> {
+        let pending: Vec<(i64, String)> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT mv.version_id, mv.source FROM method_versions mv \
+                 WHERE mv.deleted = 0 \
+                 AND mv.version_id NOT IN (SELECT DISTINCT method_version_id FROM method_sends)",
+            )?;
+            let it =
+                stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+            it.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut inserted = 0usize;
+        for (version_id, source) in pending {
+            for selector in crate::mst::sent_selectors(&source) {
+                inserted += self.conn.execute(
+                    "INSERT OR IGNORE INTO method_sends (method_version_id, selector) VALUES (?1, ?2)",
+                    params![version_id, selector],
+                )?;
+            }
+        }
+        Ok(inserted)
     }
 
     // ── Mutations — every save is an INSERT, never an UPDATE ──────────────
@@ -853,6 +916,19 @@ impl Image {
             "INSERT INTO method_versions (method_id, version_number, category, source, edited_at, deleted) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![method_id, next, category, source, now_secs(), deleted as i64],
         )?;
+        let version_id = self.conn.last_insert_rowid();
+        // Persist the selectors this version SENDS, so "senders" is an accurate
+        // SQL query, not a VM IC-scan (crate::mst::sent_selectors parses them
+        // out of the source, keyword parts regrouped). A deleted tombstone
+        // sends nothing.
+        if !deleted {
+            for selector in crate::mst::sent_selectors(source) {
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO method_sends (method_version_id, selector) VALUES (?1, ?2)",
+                    params![version_id, selector],
+                )?;
+            }
+        }
         Ok(())
     }
 

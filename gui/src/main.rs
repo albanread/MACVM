@@ -352,7 +352,13 @@ fn cmd_seed(args: &[String]) {
         }
     };
     match image_store::import::import_world_dir(&image, &world_dir) {
-        Ok(stats) => println!("seeded {} ({stats:?})", image_path.display()),
+        Ok(stats) => {
+            let sends = image.backfill_method_sends().unwrap_or(0);
+            println!(
+                "seeded {} ({stats:?}, {sends} send-edges indexed)",
+                image_path.display()
+            );
+        }
         Err(e) => {
             eprintln!("seed: import failed: {e}");
             std::process::exit(1);

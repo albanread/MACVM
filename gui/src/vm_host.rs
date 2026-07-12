@@ -819,6 +819,12 @@ fn open_or_seed_image(world_dir: &Path, image_path: &Path) -> Result<image_store
             stats.methods
         );
     }
+    // Ensure the senders index (method_sends) is populated: a no-op once full, a
+    // one-time backfill on an image seeded before senders-indexing existed.
+    match image.backfill_method_sends() {
+        Ok(n) if n > 0 => eprintln!("vm_host: backfilled {n} method-send edges for senders"),
+        _ => {}
+    }
     Ok(image)
 }
 
@@ -1048,6 +1054,30 @@ fn render_implementors_results(img: &image_store::Image, query: &str) -> String 
                 image_store::Side::Instance => "instance",
             };
             format!("<div class=\"st-find-item\"><span class=\"st-class-link\" data-open-class=\"{e}\">{e}</span> <span class=\"st-find-side\">{s}</span></div>")
+        })
+        .collect();
+    find_results_wrap(&head, &items)
+}
+
+/// Senders results — every method whose latest source sends `query`, from the
+/// `method_sends` index (image_store::senders_of), no VM round trip. Each row
+/// drills into the sending class and names the sending method.
+fn render_senders_results(img: &image_store::Image, query: &str) -> String {
+    let hits = img.senders_of(query).unwrap_or_default();
+    let head = format!("Senders of {}", crate::preprocess::html_escape_text(query));
+    if hits.is_empty() {
+        return find_results_wrap(&head, "<div class=\"st-find-empty\">(no senders)</div>");
+    }
+    let items: String = hits
+        .iter()
+        .map(|(cls, msel, side)| {
+            let ec = crate::preprocess::html_escape_text(cls);
+            let em = crate::preprocess::html_escape_text(msel);
+            let s = match side {
+                image_store::Side::Class => "class",
+                image_store::Side::Instance => "instance",
+            };
+            format!("<div class=\"st-find-item\"><span class=\"st-class-link\" data-open-class=\"{ec}\">{ec}</span> &raquo; {em} <span class=\"st-find-side\">{s}</span></div>")
         })
         .collect();
     find_results_wrap(&head, &items)
@@ -1367,20 +1397,17 @@ fn handle(
         }
         VmRequest::Find { tool, query } => {
             let q = query.trim();
-            // Definition + Implementors: answered straight from image_store (SQL)
+            // All three tools are now answered straight from image_store (SQL)
             // — the image is kept in sync with the running VM, so no reflection
-            // round trip is needed. Senders still needs the VM's IC-table scan
-            // (referenced selectors aren't stored in the image), so it keeps the
-            // render_fragment path.
+            // round trip is needed. Senders reads the `method_sends` index
+            // (referenced selectors parsed from source at save/seed time).
             let html = match tool.as_str() {
                 "definition" => image
                     .map(|img| render_definition_results(img, q))
                     .unwrap_or_else(find_unavailable),
-                "senders" => {
-                    let sq = q.replace('\'', "''");
-                    render_and_inject(vm, image, &format!("SendersView of: '{sq}'"))
-                        .unwrap_or_else(find_unavailable)
-                }
+                "senders" => image
+                    .map(|img| render_senders_results(img, q))
+                    .unwrap_or_else(find_unavailable),
                 _ => image
                     .map(|img| render_implementors_results(img, q))
                     .unwrap_or_else(find_unavailable),
@@ -2646,14 +2673,20 @@ mod tests {
         std::fs::remove_file(&tmp).ok();
     }
 
-    /// The Senders find tool lists methods that SEND the selector (an IC-table
-    /// scan) — Object>>printString sends printOn:.
+    /// The Senders find tool lists methods that SEND the selector — now from the
+    /// image's `method_sends` index (parsed from source), not a VM IC-scan.
+    /// Object>>printString sends printOn:.
     #[test]
     fn find_senders_lists_methods_that_send_the_selector() {
         OPEN_OUTLINERS.with(|o| o.borrow_mut().clear());
         let mut world = MockWorld::seed();
         let mut sel = BrowserSelection::default();
         let mut vm = test_vm_handle(macvm::runtime::JitMode::Off);
+        // Senders reads method_sends; open_or_seed_image seeds AND backfills it.
+        let tmp =
+            std::env::temp_dir().join(format!("macvm_find_send_{}.sqlite3", std::process::id()));
+        std::fs::remove_file(&tmp).ok();
+        let image = open_or_seed_image(&test_world_dir(), &tmp).expect("seed");
         let responses = handle(
             VmRequest::Find {
                 tool: "senders".to_string(),
@@ -2661,7 +2694,7 @@ mod tests {
             },
             &mut world,
             &mut sel,
-            None,
+            Some(&image),
             &mut vm,
         );
         let html = match responses.as_slice() {
@@ -2670,9 +2703,10 @@ mod tests {
         };
         assert!(
             html.contains("Senders of") && html.contains("data-open-class=\"Object\""),
-            "Object>>printString sends printOn:, so Object must appear, got {}-char result",
+            "Object>>printString sends printOn:, so Object must appear, got {}-char result: {html}",
             html.len()
         );
+        std::fs::remove_file(&tmp).ok();
     }
 
     /// Drill-down: clicking a class in a hierarchy outliner opens that class's

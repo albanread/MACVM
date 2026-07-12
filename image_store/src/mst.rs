@@ -309,6 +309,441 @@ pub fn parse_method_selector(source: &str) -> Option<String> {
     Scanner::new(source).read_selector()
 }
 
+/// Every DISTINCT selector *sent* by a method's body — the data behind an
+/// accurate, VM-free "senders" query (`Image::senders_of`). A compact
+/// recursive-descent walk of the stored `pattern [ ... ]` source that:
+///   - skips the method's own defining pattern (its keyword parts aren't sends);
+///   - groups keyword message parts back into whole selectors (`at:put:`), which
+///     a flat text search can't do because they're split across arguments;
+///   - is comment / string / char / symbol-literal aware, so `"a comment"`,
+///     `'at: put:'`, or the literal `#at:put:` never masquerade as sends.
+/// Deliberately scoped to the real corpus's Smalltalk, same as the rest of this
+/// module — not a general compiler front end.
+pub fn sent_selectors(method_source: &str) -> Vec<String> {
+    let mut s = SendScan {
+        sc: Scanner::new(method_source),
+        out: Vec::new(),
+    };
+    s.method();
+    s.out.sort();
+    s.out.dedup();
+    s.out
+}
+
+struct SendScan<'a> {
+    sc: Scanner<'a>,
+    out: Vec<String>,
+}
+
+impl<'a> SendScan<'a> {
+    fn method(&mut self) {
+        // Skip the defining message pattern — its keyword parts define the
+        // method, they are not sends.
+        self.sc.read_selector();
+        self.sc.skip_ws_and_comments();
+        // Body is usually `pattern [ ... ]` (imported form); a freshly-typed
+        // template may be bare (`pattern\n ...`). Consume an opening body `[`
+        // if present, then parse the statement sequence either way.
+        if self.sc.peek() == Some('[') {
+            self.sc.advance();
+        }
+        self.sequence();
+    }
+
+    /// temps? pragma* ( statement ('.' statement?)* )? — stops at a closer.
+    fn sequence(&mut self) {
+        self.temps();
+        loop {
+            self.sc.skip_ws_and_comments();
+            match self.sc.peek() {
+                None | Some(']') | Some('}') | Some(')') => break,
+                Some('.') => {
+                    self.sc.advance();
+                }
+                Some('<') => self.skip_pragma(),
+                Some('^') => {
+                    self.sc.advance();
+                    self.statement_expr();
+                }
+                _ => self.statement_expr(),
+            }
+        }
+    }
+
+    /// One statement's expression, with a progress guard so a token the grammar
+    /// doesn't model can never spin the sequence loop forever.
+    fn statement_expr(&mut self) {
+        let before = self.sc.pos;
+        self.expression();
+        if self.sc.pos == before {
+            self.sc.advance(); // unmodelled char — skip it and keep going
+        }
+    }
+
+    /// Optional `| a b |` temp declaration at the head of a sequence. Rolls back
+    /// if what follows isn't actually a temp list (so a leading binary-or, which
+    /// can't really occur with no receiver, is never mistaken for one).
+    fn temps(&mut self) {
+        self.sc.skip_ws_and_comments();
+        if self.sc.peek() != Some('|') {
+            return;
+        }
+        let save = self.sc.pos;
+        self.sc.advance();
+        loop {
+            self.sc.skip_ws_and_comments();
+            match self.sc.peek() {
+                Some('|') => {
+                    self.sc.advance();
+                    return;
+                }
+                Some(c) if c.is_alphabetic() || c == '_' => {
+                    self.sc.read_identifier();
+                }
+                _ => {
+                    self.sc.pos = save;
+                    return;
+                }
+            }
+        }
+    }
+
+    fn skip_pragma(&mut self) {
+        self.sc.advance(); // '<'
+        loop {
+            match self.sc.peek() {
+                None | Some('>') => {
+                    self.sc.advance();
+                    return;
+                }
+                Some('\'') => self.sc.skip_string_literal(),
+                Some(_) => {
+                    self.sc.advance();
+                }
+            }
+        }
+    }
+
+    fn expression(&mut self) {
+        // assignment: `id := expr` (the `:=` isn't a send)
+        self.sc.skip_ws_and_comments();
+        let save = self.sc.pos;
+        if matches!(self.sc.peek(), Some(c) if c.is_alphabetic() || c == '_') {
+            self.sc.read_identifier();
+            self.sc.skip_ws_and_comments();
+            if self.sc.s[self.sc.pos..].starts_with(":=") {
+                self.sc.pos += 2;
+                self.expression();
+                return;
+            }
+        }
+        self.sc.pos = save;
+        self.cascade();
+    }
+
+    // cascade := keywordExpr (';' message)*
+    fn cascade(&mut self) {
+        self.keyword_expr();
+        loop {
+            self.sc.skip_ws_and_comments();
+            if self.sc.peek() == Some(';') {
+                self.sc.advance();
+                self.cascade_message();
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// A message after `;` in a cascade — unary / binary / keyword on the
+    /// (implicit) cascade receiver.
+    fn cascade_message(&mut self) {
+        self.sc.skip_ws_and_comments();
+        if let Some(kw) = self.try_keyword_selector() {
+            self.out.push(kw);
+        } else if let Some(op) = self.try_binary_op() {
+            self.out.push(op);
+            self.unary_expr();
+        } else {
+            self.unary_chain_only();
+        }
+    }
+
+    // keywordExpr := binaryExpr (keyword binaryExpr)*
+    fn keyword_expr(&mut self) {
+        self.binary_expr();
+        let mut sel = String::new();
+        loop {
+            if let Some(part) = self.try_keyword_part() {
+                sel.push_str(&part); // includes the ':'
+                self.binary_expr();
+            } else {
+                break;
+            }
+        }
+        if !sel.is_empty() {
+            self.out.push(sel);
+        }
+    }
+
+    // binaryExpr := unaryExpr (binOp unaryExpr)*
+    fn binary_expr(&mut self) {
+        self.unary_expr();
+        loop {
+            if let Some(op) = self.try_binary_op() {
+                self.out.push(op);
+                self.unary_expr();
+            } else {
+                break;
+            }
+        }
+    }
+
+    // unaryExpr := primary unarySelector*
+    fn unary_expr(&mut self) {
+        self.primary();
+        self.unary_chain_only();
+    }
+
+    fn unary_chain_only(&mut self) {
+        while let Some(u) = self.try_unary_selector() {
+            self.out.push(u);
+        }
+    }
+
+    fn primary(&mut self) {
+        self.sc.skip_ws_and_comments();
+        match self.sc.peek() {
+            Some('(') => {
+                self.sc.advance();
+                self.expression();
+                self.expect(')');
+            }
+            Some('[') => self.block(),
+            Some('{') => {
+                self.sc.advance();
+                self.brace_array();
+            }
+            Some('\'') => self.sc.skip_string_literal(),
+            Some('$') => {
+                self.sc.advance();
+                self.sc.advance(); // the quoted character
+            }
+            Some('#') => self.eat_hash_literal(),
+            Some('-') if self.digit_follows_dash() => self.eat_number(),
+            Some(c) if c.is_ascii_digit() => self.eat_number(),
+            Some(c) if c.is_alphabetic() || c == '_' => {
+                self.sc.read_identifier(); // a bare variable / pseudo / class read
+            }
+            _ => {} // caller's progress guard handles anything unmodelled
+        }
+    }
+
+    fn block(&mut self) {
+        self.sc.advance(); // '['
+        // Optional block arguments: `:a :b |`
+        self.sc.skip_ws_and_comments();
+        if self.sc.peek() == Some(':') {
+            loop {
+                self.sc.skip_ws_and_comments();
+                if self.sc.peek() == Some(':') {
+                    self.sc.advance();
+                    self.sc.read_identifier();
+                } else {
+                    break;
+                }
+            }
+            self.sc.skip_ws_and_comments();
+            if self.sc.peek() == Some('|') {
+                self.sc.advance();
+            }
+        }
+        self.sequence();
+        self.expect(']');
+    }
+
+    /// Dynamic array `{ expr . expr }` — its elements are real expressions, so
+    /// their sends count.
+    fn brace_array(&mut self) {
+        loop {
+            self.sc.skip_ws_and_comments();
+            match self.sc.peek() {
+                None | Some('}') => {
+                    self.sc.advance();
+                    return;
+                }
+                Some('.') => {
+                    self.sc.advance();
+                }
+                _ => self.statement_expr(),
+            }
+        }
+    }
+
+    /// `#foo` / `#at:put:` / `#+` symbols, `#(...)` literal arrays, `#[...]`
+    /// byte arrays, `#'quoted'` — all literals, no sends inside.
+    fn eat_hash_literal(&mut self) {
+        self.sc.advance(); // '#'
+        match self.sc.peek() {
+            Some('(') => self.skip_balanced('(', ')'),
+            Some('[') => self.skip_balanced('[', ']'),
+            Some('\'') => self.sc.skip_string_literal(),
+            Some(c) if Scanner::is_binary_char(c) => {
+                while matches!(self.sc.peek(), Some(c) if Scanner::is_binary_char(c)) {
+                    self.sc.advance();
+                }
+            }
+            _ => {
+                // #keyword:part: or #unary — identifier chars plus ':'
+                while matches!(self.sc.peek(), Some(c) if c.is_alphanumeric() || c == '_' || c == ':')
+                {
+                    self.sc.advance();
+                }
+            }
+        }
+    }
+
+    /// Skip a bracketed literal, string/comment-aware and balanced (a literal
+    /// array can nest another).
+    fn skip_balanced(&mut self, open: char, close: char) {
+        self.sc.advance(); // the opener
+        let mut depth = 1;
+        while depth > 0 {
+            match self.sc.peek() {
+                None => return,
+                Some('\'') => self.sc.skip_string_literal(),
+                Some('"') => {
+                    self.sc.skip_comment();
+                }
+                Some(c) => {
+                    if c == open {
+                        depth += 1;
+                    } else if c == close {
+                        depth -= 1;
+                    }
+                    self.sc.advance();
+                }
+            }
+        }
+    }
+
+    fn eat_number(&mut self) {
+        // Lenient: an optional leading '-', then digits and the characters that
+        // can appear in radix / float / exponent / scaled literals. Good enough
+        // to consume the token so it isn't mis-read as sends.
+        if self.sc.peek() == Some('-') {
+            self.sc.advance();
+        }
+        while matches!(self.sc.peek(), Some(c) if c.is_alphanumeric() || c == 'r') {
+            self.sc.advance();
+        }
+        // A decimal point only continues the number if a digit follows (else
+        // it's a statement separator).
+        if self.sc.peek() == Some('.') {
+            let after = self.sc.s[self.sc.pos..].chars().nth(1);
+            if matches!(after, Some(d) if d.is_ascii_digit()) {
+                self.sc.advance(); // '.'
+                while matches!(self.sc.peek(), Some(c) if c.is_alphanumeric() || c == '-') {
+                    self.sc.advance();
+                }
+            }
+        }
+    }
+
+    fn digit_follows_dash(&self) -> bool {
+        matches!(self.sc.s[self.sc.pos..].chars().nth(1), Some(d) if d.is_ascii_digit())
+    }
+
+    /// A keyword message part `ident:` at the cursor (not `ident:=`). Consumes
+    /// and returns `"ident:"`, or rolls back and returns `None`.
+    fn try_keyword_part(&mut self) -> Option<String> {
+        self.sc.skip_ws_and_comments();
+        let save = self.sc.pos;
+        let Some(id) = self.plain_identifier() else {
+            return None;
+        };
+        if self.sc.peek() == Some(':') && self.sc.s[self.sc.pos..].chars().nth(1) != Some('=') {
+            self.sc.advance(); // ':'
+            Some(format!("{id}:"))
+        } else {
+            self.sc.pos = save;
+            None
+        }
+    }
+
+    /// A whole keyword selector starting at the cursor (`kw: arg kw2: arg…`) —
+    /// used for cascade messages. Returns the combined selector, args consumed.
+    fn try_keyword_selector(&mut self) -> Option<String> {
+        let save = self.sc.pos;
+        let Some(first) = self.try_keyword_part() else {
+            self.sc.pos = save;
+            return None;
+        };
+        let mut sel = first;
+        self.binary_expr();
+        while let Some(part) = self.try_keyword_part() {
+            sel.push_str(&part);
+            self.binary_expr();
+        }
+        Some(sel)
+    }
+
+    /// A binary operator at the cursor. `:=`/`:` never qualify (`:` isn't a
+    /// binary char); a leading `-` before a digit is a negative literal, not an
+    /// operator, and is left for `primary`.
+    fn try_binary_op(&mut self) -> Option<String> {
+        self.sc.skip_ws_and_comments();
+        match self.sc.peek() {
+            Some('-') if self.digit_follows_dash() => None,
+            Some(c) if Scanner::is_binary_char(c) => {
+                let start = self.sc.pos;
+                while matches!(self.sc.peek(), Some(c) if Scanner::is_binary_char(c)) {
+                    self.sc.advance();
+                }
+                Some(self.sc.s[start..self.sc.pos].to_string())
+            }
+            _ => None,
+        }
+    }
+
+    /// A unary selector at the cursor: an identifier NOT followed by `:` (that
+    /// would be a keyword part). Consumes and returns it, or rolls back.
+    fn try_unary_selector(&mut self) -> Option<String> {
+        self.sc.skip_ws_and_comments();
+        let save = self.sc.pos;
+        let Some(id) = self.plain_identifier() else {
+            return None;
+        };
+        self.sc.skip_ws_and_comments();
+        if self.sc.peek() == Some(':') {
+            self.sc.pos = save; // keyword part — not a unary send
+            None
+        } else {
+            Some(id)
+        }
+    }
+
+    /// Read a bare identifier WITHOUT `read_identifier`'s leading trivia skip
+    /// (callers control trivia so roll-backs are exact).
+    fn plain_identifier(&mut self) -> Option<String> {
+        let start = self.sc.pos;
+        if !matches!(self.sc.peek(), Some(c) if c.is_alphabetic() || c == '_') {
+            return None;
+        }
+        while matches!(self.sc.peek(), Some(c) if c.is_alphanumeric() || c == '_') {
+            self.sc.advance();
+        }
+        Some(self.sc.s[start..self.sc.pos].to_string())
+    }
+
+    fn expect(&mut self, ch: char) {
+        self.sc.skip_ws_and_comments();
+        if self.sc.peek() == Some(ch) {
+            self.sc.advance();
+        }
+    }
+}
+
 /// Parse one `.mst` file's full text into its class definitions. Malformed
 /// input (anything not matching the grammar this module's doc comment
 /// describes) stops parsing at the point of confusion and returns whatever
@@ -597,6 +1032,47 @@ Object subclass: Message [
             Some("at:put:".to_string())
         );
         assert_eq!(parse_method_selector(""), None);
+    }
+
+    #[test]
+    fn sent_selectors_extracts_unary_binary_and_grouped_keyword_sends() {
+        let sel = |src: &str| sent_selectors(src);
+        let want = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<String>>();
+
+        // The method's own pattern is NOT a send; the body's send is.
+        assert_eq!(
+            sel("printOn: aStream [ aStream nextPutAll: 'hi' ]"),
+            want(&["nextPutAll:"])
+        );
+        // Keyword parts split across args are grouped back into one selector.
+        assert_eq!(sel("store [ ^dict at: k put: v ]"), want(&["at:put:"]));
+        // A nested keyword send inside an argument is its own selector.
+        assert_eq!(
+            sel("f [ ^self bar: (a baz: b) qux: c ]"),
+            want(&["bar:qux:", "baz:"])
+        );
+        // Unary chain + binary operator.
+        assert_eq!(
+            sel("g [ ^self size + other length ]"),
+            want(&["+", "length", "size"])
+        );
+        // Every cascade message counts (deduped).
+        assert_eq!(sel("h [ s show: 'a'; nl; show: 'b' ]"), want(&["nl", "show:"]));
+        // Comments, strings, symbol literals, temps, and `:=` are NOT sends.
+        assert_eq!(
+            sel("j [ | a | a := #at:put:. \"do: it\" ^'x , y' ]"),
+            want(&[])
+        );
+        // A negative literal is not a binary '-'; a real subtraction is.
+        assert_eq!(sel("k [ ^self clampTo: -3 ]"), want(&["clampTo:"]));
+        assert_eq!(sel("m [ ^x - 3 ]"), want(&["-"]));
+        // A block body's sends count; its args don't.
+        assert_eq!(sel("n [ items do: [:e | e printNl ] ]"), want(&["do:", "printNl"]));
+        // A primitive pragma is not a send.
+        assert_eq!(
+            sel("p [ <primitive: 60> ^self basicAt: i ]"),
+            want(&["basicAt:"])
+        );
     }
 
     // ── S22 regression tests: the DB must reproduce COMPILABLE source ──────
