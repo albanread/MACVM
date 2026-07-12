@@ -361,16 +361,22 @@ fn rewrite_smappl_placeholders(html: &str) -> String {
             continue;
         };
 
-        // Collapsed for both the attribute and the visible text: this is a
-        // G0 placeholder only (D-G5's real server-rendered fragment lands
-        // in G2), so raw source whitespace fidelity doesn't matter, and a
-        // single-line attribute value is simpler to read/debug either way.
-        let collapsed = code.split_whitespace().collect::<Vec<_>>().join(" ");
+        // The visual= value is an HTML attribute, so it arrives HTML-ENCODED (a
+        // `<` in the Smalltalk source is written `&lt;`). Decode it once to the
+        // true source, and keep its NEWLINES verbatim in data-code — a CodeView
+        // `model:` string is multi-line and collapsing it would flatten the
+        // displayed code (and any other widget with a multi-line string arg).
+        // data-code re-encodes for the attribute; resolve_smappl_spans / smtk.js
+        // decode it again before the VM — one clean round-trip, so source with
+        // `<`/`>`/`&` no longer reaches the evaluator double-encoded. The visible
+        // placeholder box stays whitespace-collapsed (it's only the G0 fallback).
+        let source = unescape_attr(code);
+        let placeholder_text = source.split_whitespace().collect::<Vec<_>>().join(" ");
         out.push_str(&format!(
             "<span class=\"smappl\" data-widget-id=\"s{}\" data-code=\"{}\">{}</span>",
             widget_seq,
-            html_escape_attr(&collapsed),
-            html_escape_text(&collapsed)
+            html_escape_attr(&source),
+            html_escape_text(&placeholder_text)
         ));
         widget_seq += 1;
         rest = &after_close_quote[tag_end_rel + 1..];
@@ -510,6 +516,7 @@ fn chrome_layout_style() -> String {
      .st-statusbar { flex: 0 0 auto; }\
      #macvm-scroll > .st-workspace, #macvm-scroll > .st-browser { height: 100%; }\
      .st-add-node > .st-header { opacity: 0.7; font-style: italic; }\
+     .st-smappl-codeview { height: 15em; width: 100%; }\
      </style>"
         .to_string()
 }
@@ -670,10 +677,14 @@ mod tests {
         let input = "<smappl visual=\" Button\n\t\t\twithImage: (Image fromFile: 'x')\n\t\t\taction: [ :b | ]\t\">";
         let out = rewrite_smappl_placeholders(input);
         assert!(out.starts_with(r#"<span class="smappl""#), "{out}");
-        assert!(out.contains("Button withImage:"), "{out}");
+        // data-code preserves the source (newlines kept — a multi-line CodeView
+        // model: must survive); the VISIBLE placeholder box text is collapsed.
+        assert!(out.contains(r#"data-code=""#), "{out}");
+        let head = out.split("</span>").next().unwrap();
+        let visible = head.rsplit('>').next().unwrap();
         assert!(
-            !out.contains('\n'),
-            "collapsed whitespace should have no newlines: {out}"
+            visible.contains("Button withImage:") && !visible.contains('\n'),
+            "visible box text is collapsed to one line: {visible:?}"
         );
     }
 

@@ -41,6 +41,51 @@ Object subclass: HtmlWriter [
     ]
 ]
 
+"--- CodeView: an embedded source view/editor — smappl shape 5 (gui/smappl.md
+ §3.5). The corpus (tour/progenv4.html, progenv6.html) writes
+ `((CodeView forString) doneBlock: [...]; model: 'source') imbeddedVisual
+ with3DBorder withBorder: (Border standard3DRaised: true)`. It renders the
+ source into the SAME transparent-textarea-over-highlighted-<pre> editor the
+ class browser uses (smtk.js hardens + syntax-colours any `.st-code-editor`), so
+ an inline method illustration reads exactly like a browsed method. The source
+ the VM receives is already HTML-UNESCAPED (preprocess::resolve_smappl unescapes
+ data-code for the evaluator), so it holds real `<`/`>`/`&` — `escaped:` puts
+ them back for the textarea. Subclasses Visual (33_smappl.mst) to inherit the
+ identity `with3DBorder`/`withBorder:` decoration chain. `doneBlock:` (the accept
+ callback) is retained but not wired — the corpus views are read-along source
+ illustrations, not accepting editors; wire it when an accepting embed appears
+ (mirror the outliner's smapplAccept). ---"
+Visual subclass: CodeView [
+    | source doneBlock |
+    CodeView class >> forString [
+        "TextView's generic factory in Strongtalk; here just a fresh instance."
+        ^self basicNew
+    ]
+    doneBlock: aBlock [
+        doneBlock := aBlock.
+        ^self
+    ]
+    model: aString [
+        source := aString.
+        ^self
+    ]
+    imbeddedVisual [
+        "Application>>imbeddedVisual builds the on-screen widget; the HTML bridge
+         is identity — the receiver already answers #htmlFragment."
+        ^self
+    ]
+    htmlFragment [
+        | html |
+        html := HtmlWriter new.
+        html raw: '<div class="st-code-editor st-smappl-editor st-smappl-codeview">'.
+        html raw: '<pre class="st-code-highlight" aria-hidden="true"></pre>'.
+        html raw: '<textarea class="st-code-input" spellcheck="false">'.
+        html escaped: (source isNil ifTrue: [ '' ] ifFalse: [ source ]).
+        html raw: '</textarea></div>'.
+        ^html contents
+    ]
+]
+
 "--- ClassMirror: source-level reflection of a class (docs/APPS.md §2) ---"
 Object subclass: ClassMirror [
     | klass |

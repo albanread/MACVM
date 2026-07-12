@@ -2639,13 +2639,12 @@ mod tests {
             "a clean action fire returns no error responses, got {fired:?}"
         );
 
-        // A shape that isn't built yet (an unknown tool class — e.g. the
-        // CodeView shape, gui/smappl.md §3.5) renders nothing, so the GUI
-        // keeps showing the G0 placeholder box.
+        // A shape that genuinely isn't built (an unknown send) renders nothing,
+        // so the GUI keeps the G0 placeholder box.
         let unbuildable = handle(
             VmRequest::SmapplRender {
                 id: "s1".to_string(),
-                code: "CodeView forString".to_string(),
+                code: "Object doesNotExistXyz".to_string(),
             },
             &mut world,
             &mut selection,
@@ -2655,6 +2654,24 @@ mod tests {
         assert!(
             unbuildable.is_empty(),
             "an unbuildable shape must yield no fragment, got {unbuildable:?}"
+        );
+
+        // CodeView (gui/smappl.md §3.5) IS built now — it renders a source box,
+        // with the source HTML-escaped once (a `<` in the source → `&lt;`).
+        let codeview = handle(
+            VmRequest::SmapplRender {
+                id: "s2".to_string(),
+                code: "(CodeView forString) model: 'a < b'".to_string(),
+            },
+            &mut world,
+            &mut selection,
+            None,
+            &mut vm,
+        );
+        assert!(
+            codeview.iter().any(|r| matches!(r, VmResponse::SmapplFragment { html, .. }
+                if html.contains("st-smappl-codeview") && html.contains("a &lt; b"))),
+            "CodeView renders a source box with escaped source, got {codeview:?}"
         );
     }
 
