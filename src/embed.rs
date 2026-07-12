@@ -1367,6 +1367,49 @@ mod tests {
     }
 
     #[test]
+    fn catcher_demo_game_launches_and_steps_without_error() {
+        // The whole engine end to end in one Smalltalk class: launch the game,
+        // then drive 100 frames with Right held. Crossing coinY=216 within
+        // 72 frames runs resolveCatch (input compare + Sound play), so this
+        // catches any missing world method (e.g. and:) as a DNU, not a hang.
+        struct VecGameSink(Arc<Mutex<Vec<GameCommand>>>);
+        impl GameSink for VecGameSink {
+            fn emit(&mut self, cmd: GameCommand) {
+                self.0.lock().unwrap().push(cmd);
+            }
+        }
+
+        let mut vm = boot_test_vm(JitMode::Off);
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        vm.set_game_sink(Box::new(VecGameSink(captured.clone())));
+
+        vm.eval("Catcher launch.")
+            .expect("Catcher launch must run cleanly");
+        for _ in 0..100 {
+            vm.eval("GamePane stepWithKeys: 2.")
+                .expect("a game step (Right held) must not error");
+        }
+
+        let cmds = captured.lock().unwrap();
+        assert!(
+            cmds.iter().any(|c| matches!(c, GameCommand::StartLoop)),
+            "launch starts the frame loop"
+        );
+        assert!(
+            cmds.iter().any(|c| matches!(c, GameCommand::DefineSprite { .. })),
+            "the paddle + coin sprites are defined"
+        );
+        assert!(
+            cmds.iter().any(|c| matches!(c, GameCommand::Present)),
+            "each frame presents"
+        );
+        assert!(
+            cmds.iter().any(|c| matches!(c, GameCommand::PlaySound { .. })),
+            "a catch or miss within 100 frames plays a sound (runs resolveCatch)"
+        );
+    }
+
+    #[test]
     fn set_transcript_routes_transcript_show_to_the_sink() {
         struct VecSink(Arc<Mutex<Vec<String>>>);
         impl TranscriptSink for VecSink {

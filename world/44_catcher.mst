@@ -1,0 +1,60 @@
+"44_catcher.mst — a tiny demo game: CATCH THE FALLING COIN. Move the paddle with
+ the Left/Right arrow keys; catching the coin scores a point and plays a coin
+ sound, a miss plays a hurt sound, and the white bar at the top tracks the score.
+ One small Smalltalk class exercising the whole game engine at once — drawing,
+ sprites, keyboard input, audio, and the 60fps frame loop (docs/gamepane_design.md).
+ Launch it from the Workspace with:  Catcher launch"
+
+Object subclass: Catcher [
+    | pane paddle coin playerX coinX coinY score |
+
+    Catcher class >> launch [
+        "Open the game pane and start the game."
+        ^self new start
+    ]
+
+    start [
+        pane := GamePane new.
+        pane paletteAt: 16 r: 18 g: 22 b: 44.      "background"
+        pane paletteAt: 17 r: 255 g: 255 b: 255.   "score bar"
+        paddle := pane defineSprite: 'ffffffffffff/ffffffffffff'.  "12x2 paddle"
+        paddle colorAt: 15 r: 90 g: 200 b: 255.
+        coin := pane defineSprite: '0ff0/ffff/ffff/0ff0'.          "4x4 coin"
+        coin colorAt: 15 r: 255 g: 215 b: 0.
+        playerX := 150.
+        coinX := 120.
+        coinY := 0.
+        score := 0.
+        pane onStep: [ self step ]; run.
+        ^self
+    ]
+
+    step [
+        "One frame: read input, run the physics, then draw."
+        (pane keyHeld: GamePane keyLeft)  ifTrue: [ playerX := playerX - 5 ].
+        (pane keyHeld: GamePane keyRight) ifTrue: [ playerX := playerX + 5 ].
+        playerX < 0 ifTrue: [ playerX := 0 ].
+        playerX > 296 ifTrue: [ playerX := 296 ].
+        coinY := coinY + 3.
+        coinY > 216 ifTrue: [ self resolveCatch ].
+        self draw.
+    ]
+
+    resolveCatch [
+        "The coin reached the bottom: a hit if it overlaps the paddle."
+        ((coinX > (playerX - 6)) and: [ coinX < (playerX + 14) ])
+            ifTrue: [ score := score + 1. Sound coin play ]
+            ifFalse: [ Sound hurt play ].
+        score > 60 ifTrue: [ score := 60 ].
+        coinY := 0.
+        coinX := Time millisecondClockValue \\ 300.
+    ]
+
+    draw [
+        pane cls: 16.
+        pane fill: 4 y: 4 width: (score * 5) height: 6 color: 17.
+        paddle moveTo: playerX y: 226.
+        coin moveTo: coinX y: coinY.
+        pane present.
+    ]
+]

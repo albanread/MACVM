@@ -64,3 +64,5 @@
 # GamePane: drive the native Metal game pane from Smalltalk (M3 slice,
 # docs/gamepane_design.md). Numbered game primitives (id block 200+).
 43_gamepane.mst
+# Catcher: a tiny demo game exercising the whole engine (docs/gamepane_design.md).
+44_catcher.mst

@@ -1903,23 +1903,11 @@ fn main() {
     if std::env::var_os("MACVM_GAMEPANE_DEMO").is_some() {
         open_game_pane();
         if let Some(vm) = VM.get() {
-            // A block-wrapped doit (block temps are legal; top-level ones are
-            // not): define a cyan sprite, then run a loop that sweeps a red disc
-            // across the background and glides the sprite along the top — the
-            // step block closes over `ship`, kept alive via the class-var-held
-            // StepBlock. Exercises drawing + sprites + the loop together.
+            // Launch the Catcher demo game (world/44_catcher.mst): move the
+            // paddle with Left/Right to catch the falling coin. Exercises the
+            // whole engine — drawing, sprites, input, audio, the frame loop.
             vm.submit(vm_host::VmRequest::Doit {
-                code: "[ | ship | \
-                         ship := GamePane new defineSprite: 'ffff/f00f/f00f/ffff'. \
-                         ship colorAt: 15 r: 80 g: 220 b: 255. \
-                         GamePane new onStep: [ | x | \
-                           x := (Time millisecondClockValue // 8) \\\\ 320. \
-                           GamePane new cls: 0; \
-                             paletteAt: 16 r: 240 g: 80 b: 40; \
-                             disc: x y: 160 radius: 20 color: 16. \
-                           ship moveTo: (Time millisecondClockValue // 6) \\\\ 300 y: 60. \
-                           GamePane new present ]; run ] value."
-                    .to_string(),
+                code: "Catcher launch.".to_string(),
             });
         }
     }
