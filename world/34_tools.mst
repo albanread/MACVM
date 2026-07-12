@@ -136,6 +136,8 @@ Visual subclass: ClassHierarchyOutliner [
         html raw: '<div class="st-outliner" data-hierarchy-root="'.
         html escaped: rootMirror name.
         html raw: '">'.
+        "A '＋ new class' affordance at the top of the hierarchy (defined below)."
+        self newClassNodeOn: html.
         "The root renders open; its descendants render collapsed (a browsable
          tree, not one giant wall). Collapse/expand is client-side in
          smtk.js — the whole tree ships once, cheap at world scale; a truly
@@ -144,6 +146,24 @@ Visual subclass: ClassHierarchyOutliner [
         self render: rootMirror on: html open: true.
         html raw: '</div>'.
         ^html contents
+    ]
+    "A collapsible '＋ new class' node: expand it to reveal a class-definition
+     template; Cmd+S in that editor CREATES the class (name/superclass parsed
+     from the source), versions it into the image, and live-compiles it
+     (smtk.js .st-smappl-new-class-src -> smapplNewClass -> vm_host). It reuses
+     the ordinary node/twisty markup so the existing client-side expand works."
+    newClassNodeOn: html [
+        html raw: '<div class="st-node closed st-add-node"><span class="st-header st-selector">'.
+        html raw: '<span class="st-tw" data-tw>&#9656; </span>&#43; new class</span>'.
+        html raw: '<div class="st-children" style="display:none">'.
+        html raw: '<div class="st-code-editor st-smappl-editor">'.
+        html raw: '<pre class="st-code-highlight" aria-hidden="true"></pre>'.
+        html raw: '<textarea class="st-smappl-new-class-src st-code-input" spellcheck="false">'.
+        html raw: 'Object subclass: NewClass [
+]'.
+        html raw: '</textarea></div>'.
+        html raw: '<div class="st-smappl-hint">&#8984;S to create (versioned)</div>'.
+        html raw: '</div></div>'.
     ]
     render: mirror on: html open: isOpen [
         | subs |
@@ -244,6 +264,30 @@ Visual subclass: ClassOutliner [
                 ifTrue:  [ self editorFor: sel side: label on: html ]
                 ifFalse: [ self primNote: prim on: html ].
             html raw: '</div></div>' ].
+        "'＋ new method' affordance at the end of this side's method list."
+        self newMethodNodeFor: label on: html.
+        html raw: '</div></div>'.
+    ]
+    "A collapsible '＋ new method' node for a side: expand it to reveal a blank
+     method template; Cmd+S CREATES the method (selector parsed from the message
+     pattern), versions it into the image, and live-compiles it (smtk.js
+     .st-smappl-new-method-src -> smapplNewMethod -> vm_host). `label` is the
+     side ('instance'/'class'); the target class rides on data-src-class."
+    newMethodNodeFor: label on: html [
+        html raw: '<div class="st-node closed st-add-node"><span class="st-header st-selector">'.
+        html raw: '<span class="st-tw" data-tw>&#9656; </span>&#43; new method</span>'.
+        html raw: '<div class="st-children" style="display:none">'.
+        html raw: '<div class="st-code-editor st-smappl-editor">'.
+        html raw: '<pre class="st-code-highlight" aria-hidden="true"></pre>'.
+        html raw: '<textarea class="st-smappl-new-method-src st-code-input" spellcheck="false" data-src-class="'.
+        html escaped: mirror name.
+        html raw: '" data-src-side="'.
+        html raw: label.
+        html raw: '">'.
+        html raw: 'messageSelector
+    "Say what this method does."'.
+        html raw: '</textarea></div>'.
+        html raw: '<div class="st-smappl-hint">&#8984;S to create (versioned)</div>'.
         html raw: '</div></div>'.
     ]
     "The editable, syntax-coloured source box: the class browser's own overlay

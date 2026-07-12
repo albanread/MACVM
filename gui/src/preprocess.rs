@@ -509,6 +509,7 @@ fn chrome_layout_style() -> String {
      .st-transcript-clear:active { box-shadow: inset 1px 1px 0 var(--st-gray, #808080); }\
      .st-statusbar { flex: 0 0 auto; }\
      #macvm-scroll > .st-workspace, #macvm-scroll > .st-browser { height: 100%; }\
+     .st-add-node > .st-header { opacity: 0.7; font-style: italic; }\
      </style>"
         .to_string()
 }

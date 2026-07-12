@@ -982,6 +982,24 @@ extern "C" fn on_script_message(_this: Id, _cmd: Sel, _controller: Id, message: 
                 });
             }
         }
+        "smapplNewMethod" => {
+            // Cmd+S in an outliner "＋ new method" template — create the method.
+            if let Some(vm) = VM.get() {
+                vm.submit(vm_host::VmRequest::SmapplNewMethod {
+                    cls: dict_get_string(body, "cls"),
+                    side: dict_get_string(body, "side"),
+                    text: dict_get_string(body, "text"),
+                });
+            }
+        }
+        "smapplNewClass" => {
+            // Cmd+S in an outliner "＋ new class" template — create the class.
+            if let Some(vm) = VM.get() {
+                vm.submit(vm_host::VmRequest::SmapplNewClass {
+                    text: dict_get_string(body, "text"),
+                });
+            }
+        }
         "smapplOpenClass" => {
             // Drill from a hierarchy outliner into a class's method browser.
             if let Some(vm) = VM.get() {

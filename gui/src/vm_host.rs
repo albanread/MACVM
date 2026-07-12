@@ -130,6 +130,24 @@ pub enum VmRequest {
         /// post-accept live refresh so its editor isn't yanked out mid-edit.
         widget_id: String,
     },
+    /// Outliner "＋ new method": create a brand-new method on `cls`/`side` from
+    /// the typed template source — the selector is parsed from its message
+    /// pattern (`image_store::mst::parse_method_selector`). Versions it into the
+    /// image (`create_or_reopen_method`, a fresh `method_versions` row) AND
+    /// live-compiles it, then refreshes every open outliner so it appears. The
+    /// create-side analog of [`SmapplAccept`] (which only edits existing ones).
+    SmapplNewMethod {
+        cls: String,
+        side: String,
+        text: String,
+    },
+    /// Outliner "＋ new class": create a brand-new class (plus any methods in the
+    /// definition) from the typed class-definition source, version it into the
+    /// image (`create_or_reopen_class`), live-compile it, and refresh every open
+    /// outliner so it appears.
+    SmapplNewClass {
+        text: String,
+    },
     /// Drill down: a class name in a hierarchy outliner was clicked. Replace
     /// that widget (`widget_id`) with the class's method browser (a
     /// `ClassOutliner`, with editable source), carrying a back link to `root`'s
@@ -1098,6 +1116,130 @@ fn handle(
             // the edited outliner (`widget_id`) is skipped so its editor stays.
             let mut responses = vec![VmResponse::Transcript(versioned)];
             responses.extend(refresh_open_outliners(vm, image, &widget_id));
+            responses
+        }
+        VmRequest::SmapplNewMethod { cls, side, text } => {
+            // Create a NEW method — the same create_or_reopen_method + live
+            // compile the class browser's BrowserSaveSource NewMethod arm uses,
+            // but stateless (cls/side ride in the message, like SmapplAccept).
+            let mirror_side = if side == "class" {
+                Side::Class
+            } else {
+                Side::Instance
+            };
+            let img_side = side_to_image(mirror_side);
+            let category = "as yet unclassified";
+            let msg = match image_store::mst::parse_method_selector(&text) {
+                None => "Could not parse a message pattern from the method source.".to_string(),
+                Some(selector) => {
+                    world.create_or_reopen_method(&cls, mirror_side, &selector, category, &text);
+                    let image_err = image.and_then(|img| {
+                        match img.create_or_reopen_method(&cls, img_side, &selector, category, &text) {
+                            Ok(Some(_)) => None,
+                            Ok(None) => Some("class not found in the image".to_string()),
+                            Err(e) => Some(e.to_string()),
+                        }
+                    });
+                    let reopen = reopen_one_method(world, &cls, &text);
+                    match (image_err, live_compile(vm, &reopen)) {
+                        (None, Ok(())) => {
+                            format!("Added {cls}>>{selector} — versioned to the image and live")
+                        }
+                        (None, Err(e)) => {
+                            format!("Added {cls}>>{selector} to the image, but compile failed: {e}")
+                        }
+                        (Some(ie), _) => format!("{cls}>>{selector}: image write issue: {ie}"),
+                    }
+                }
+            };
+            // skip_id "" — refresh EVERY open outliner (including the one that
+            // launched this) so the new method shows up in the tree.
+            let mut responses = vec![VmResponse::Transcript(msg)];
+            responses.extend(refresh_open_outliners(vm, image, ""));
+            responses
+        }
+        VmRequest::SmapplNewClass { text } => {
+            // Create a NEW class (+ its methods) — the BrowserSaveSource
+            // NewClass arm's logic, stateless. The outliner isn't package-scoped,
+            // so the class gets an empty category (the schema's own default).
+            let msg = match image_store::mst::parse_mst_source(&text).into_iter().next() {
+                None => "Could not parse the class definition — check the syntax.".to_string(),
+                Some(pc) if world.class_named(&pc.name).is_some() => {
+                    format!("A class named {} already exists.", pc.name)
+                }
+                Some(pc) => {
+                    let new_name = pc.name.clone();
+                    world.create_or_reopen_class(
+                        &pc.name,
+                        pc.superclass.as_deref(),
+                        "",
+                        "",
+                        &pc.instance_vars,
+                    );
+                    let mut image_err = image.and_then(|img| {
+                        match img.create_or_reopen_class(
+                            &pc.name,
+                            pc.superclass.as_deref(),
+                            "",
+                            "",
+                            &pc.instance_vars,
+                        ) {
+                            Ok(image_store::ClassCreateOutcome::AlreadyLive) => {
+                                Some(format!("image already has a live class named {new_name}"))
+                            }
+                            Ok(_) => None,
+                            Err(e) => Some(e.to_string()),
+                        }
+                    });
+                    let mut failed = 0usize;
+                    for m in &pc.methods {
+                        let side = if m.is_class_side {
+                            Side::Class
+                        } else {
+                            Side::Instance
+                        };
+                        world.create_or_reopen_method(
+                            &new_name,
+                            side,
+                            &m.selector,
+                            "as yet unclassified",
+                            &m.source,
+                        );
+                        if let Some(img) = image {
+                            if img
+                                .create_or_reopen_method(
+                                    &new_name,
+                                    side_to_image(side),
+                                    &m.selector,
+                                    "as yet unclassified",
+                                    &m.source,
+                                )
+                                .is_err()
+                            {
+                                failed += 1;
+                            }
+                        }
+                    }
+                    if failed > 0 {
+                        let note = format!("{failed} method(s) failed to persist to the image");
+                        image_err = Some(match image_err {
+                            Some(e) => format!("{e}; {note}"),
+                            None => note,
+                        });
+                    }
+                    match (image_err, live_compile(vm, &text)) {
+                        (None, Ok(())) => {
+                            format!("Created {new_name} — versioned to the image and live")
+                        }
+                        (None, Err(e)) => {
+                            format!("Created {new_name} in the image, but compile failed: {e}")
+                        }
+                        (Some(ie), _) => format!("Created {new_name}, but image issue: {ie}"),
+                    }
+                }
+            };
+            let mut responses = vec![VmResponse::Transcript(msg)];
+            responses.extend(refresh_open_outliners(vm, image, ""));
             responses
         }
         VmRequest::SmapplOpenClass {
@@ -2559,6 +2701,99 @@ mod tests {
             refreshed,
             vec!["s1"],
             "only the bystander outliner refreshes; the edited one (s0) is skipped, got {refreshed:?}"
+        );
+
+        std::fs::remove_file(&tmp).ok();
+    }
+
+    /// The outliner "＋ new method" / "＋ new class" affordances CREATE (not
+    /// edit): the selector/class name is parsed from the typed template, and
+    /// the result is versioned into image_store — the same create backend the
+    /// class browser uses, reached statelessly.
+    #[test]
+    fn outliner_creates_and_versions_a_new_method_and_class() {
+        OPEN_OUTLINERS.with(|o| o.borrow_mut().clear());
+        let world_dir = test_world_dir();
+        let tmp =
+            std::env::temp_dir().join(format!("macvm_newmc_{}.sqlite3", std::process::id()));
+        std::fs::remove_file(&tmp).ok();
+        let image = open_or_seed_image(&world_dir, &tmp).expect("seed");
+        let mut vm = VmHandle::boot_without_world(macvm::runtime::VmOptions {
+            heap_mib: 64,
+            jit: macvm::runtime::JitMode::Off,
+            ..Default::default()
+        });
+        crate::world_boot::load_world_from_image(&mut vm, &image, WORLD_DOITS).expect("db load");
+        let mut world = MockWorld::seed();
+        let mut sel = BrowserSelection::default();
+
+        // ＋ new method on an existing class (Point) — selector parsed from src.
+        let r = handle(
+            VmRequest::SmapplNewMethod {
+                cls: "Point".to_string(),
+                side: "instance".to_string(),
+                text: "tripled\n\t^self * 3".to_string(),
+            },
+            &mut world,
+            &mut sel,
+            Some(&image),
+            &mut vm,
+        );
+        assert!(
+            r.iter().any(|resp| matches!(resp, VmResponse::Transcript(t) if t.contains("Added Point>>tripled"))),
+            "new-method transcript, got {r:?}"
+        );
+        assert_eq!(
+            image
+                .method_source("Point", image_store::Side::Instance, "tripled")
+                .unwrap()
+                .as_deref()
+                .map(|s| s.contains("^self * 3")),
+            Some(true),
+            "the new method must be versioned into the image"
+        );
+
+        // ＋ new class — the class AND its inline method both get versioned.
+        let r = handle(
+            VmRequest::SmapplNewClass {
+                text: "Object subclass: WidgetX [\n\tspin [ ^1 ]\n]".to_string(),
+            },
+            &mut world,
+            &mut sel,
+            Some(&image),
+            &mut vm,
+        );
+        assert!(
+            r.iter().any(|resp| matches!(resp, VmResponse::Transcript(t) if t.contains("Created WidgetX"))),
+            "new-class transcript, got {r:?}"
+        );
+        assert!(
+            image.class_exists("WidgetX").unwrap(),
+            "the new class must exist in the image"
+        );
+        assert_eq!(
+            image
+                .method_source("WidgetX", image_store::Side::Instance, "spin")
+                .unwrap()
+                .as_deref()
+                .map(|s| s.contains("^1")),
+            Some(true),
+            "the new class's method must be versioned too"
+        );
+
+        // Creating the same class again is rejected, not duplicated.
+        let dup = handle(
+            VmRequest::SmapplNewClass {
+                text: "Object subclass: WidgetX [\n]".to_string(),
+            },
+            &mut world,
+            &mut sel,
+            Some(&image),
+            &mut vm,
+        );
+        assert!(
+            dup.iter().any(|resp| matches!(resp, VmResponse::Transcript(t) if t.contains("already exists"))),
+            "duplicate class must be refused, got {dup:?}"
         );
 
         std::fs::remove_file(&tmp).ok();

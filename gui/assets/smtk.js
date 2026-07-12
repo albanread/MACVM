@@ -529,6 +529,35 @@
     true
   );
 
+  // Cmd+S inside an outliner "＋ new method" / "＋ new class" template editor
+  // CREATES (not edits): vm_host parses the selector / class name out of the
+  // typed source, versions it into the image, and live-compiles it. Scoped to
+  // the distinct `.st-smappl-new-*-src` classes so it never collides with the
+  // edit-existing `.st-smappl-src` handler above.
+  document.addEventListener(
+    "keydown",
+    function (ev) {
+      if (!((ev.metaKey || ev.ctrlKey) && (ev.key === "s" || ev.key === "S"))) return;
+      const nm = ev.target.closest(".st-smappl-new-method-src");
+      if (nm) {
+        ev.preventDefault();
+        post({
+          kind: "smapplNewMethod",
+          cls: nm.getAttribute("data-src-class") || "",
+          side: nm.getAttribute("data-src-side") || "",
+          text: nm.value,
+        });
+        return;
+      }
+      const nc = ev.target.closest(".st-smappl-new-class-src");
+      if (nc) {
+        ev.preventDefault();
+        post({ kind: "smapplNewClass", text: nc.value });
+      }
+    },
+    true
+  );
+
   // Find tools (Implementors/Senders): Enter in the search box runs the query
   // (vm_host VmRequest::Find); results land via macvmSetFindResults.
   document.addEventListener(
