@@ -10,8 +10,28 @@
  entries start at 16. In a headless VM (no game sink) every primitive silently
  fails and returns self, so this class is harmless to load outside the GUI."
 
+"--- Sprite: a handle to a placed sprite instance (docs/gamepane_design.md).
+ Defined before GamePane so GamePane>>defineSprite: can reference it. ---"
+Object subclass: Sprite [
+    | pane id |
+    Sprite class >> pane: aPane id: anId [
+        ^self new setPane: aPane id: anId
+    ]
+    setPane: aPane id: anId [ pane := aPane. id := anId. ^self ]
+    moveTo: x y: y [
+        "Move this sprite to (x, y)."
+        pane primMoveSprite: id x: x y: y.
+        ^self
+    ]
+    colorAt: index r: r g: g b: b [
+        "Set this sprite's palette entry `index` (0..15) to an RGB colour."
+        pane primSpriteColor: id index: index r: r g: g b: b.
+        ^self
+    ]
+]
+
 Object subclass: GamePane [
-    <classVars: StepBlock Keys>
+    <classVars: StepBlock Keys NextId>
 
     clearR: r g: g b: b [
         "Clear the pane to an opaque RGB colour (each 0..255) and present it."
@@ -80,6 +100,22 @@ Object subclass: GamePane [
         ^GamePane keyHeld: keyCode
     ]
 
+    "--- sprites (docs/gamepane_design.md) ---"
+
+    defineSprite: hexRows [
+        "Define a sprite from '/'-separated hex-row art (4 bits/pixel, so up to
+         16 colours per sprite; e.g. 'f0f/0f0/f0f' is 3x3) and place it; answer
+         a Sprite handle. Set its colours with colorAt:r:g:b: and move it with
+         moveTo:y:."
+        | id |
+        id := GamePane nextId.
+        self primDefineSprite: id rows: hexRows.
+        ^Sprite pane: self id: id
+    ]
+    primDefineSprite: id rows: hexRows [ <primitive: 210> ^self ]
+    primSpriteColor: id index: index r: r g: g b: b [ <primitive: 211> ^self ]
+    primMoveSprite: id x: x y: y [ <primitive: 212> ^self ]
+
     GamePane class >> stepWithKeys: mask [
         "Run one frame: record the held-key bitmask, then run the step block.
          Called by the GUI's frame timer via a GameStep request, once per tick
@@ -96,6 +132,13 @@ Object subclass: GamePane [
     GamePane class >> reset [
         StepBlock := nil.
         Keys := 0.
+    ]
+    GamePane class >> nextId [
+        "A fresh monotonic sprite id. The GUI registry maps it to MacGamePane's
+         own def/instance ids (docs/gamepane_design.md)."
+        NextId isNil ifTrue: [ NextId := 0 ].
+        NextId := NextId + 1.
+        ^NextId
     ]
 
     "Game-key bit positions (the GUI packs these from the held-key table)."

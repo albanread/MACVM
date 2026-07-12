@@ -168,6 +168,22 @@ pub enum GameCommand {
     StartLoop,
     /// Stop the frame loop. `GamePane>>stop`.
     StopLoop,
+    /// Define a sprite from `/`-separated hex-row art (4 bits/pixel, palette
+    /// index per cell) and place an instance of it, both keyed by the VM-chosen
+    /// `id` so later `SpriteColor`/`MoveSprite` can address it. `id` is a
+    /// monotonic counter minted Smalltalk-side; the GUI registry maps it to
+    /// MacGamePane's own def/instance ids.
+    DefineSprite { id: i64, rows: String },
+    /// Set sprite `id`'s palette entry `index` (0..15) to an opaque RGB colour.
+    SpriteColor {
+        id: i64,
+        index: u8,
+        r: u8,
+        g: u8,
+        b: u8,
+    },
+    /// Move sprite `id`'s instance to `(x, y)`.
+    MoveSprite { id: i64, x: i64, y: i64 },
 }
 
 /// Where game-primitive commands go — the game analogue of [`TranscriptSink`].
@@ -1259,6 +1275,38 @@ mod tests {
             *captured.lock().unwrap(),
             vec![GameCommand::Cls { index: 7 }],
             "Left held -> cls:7 only; Right not held -> no cls:8"
+        );
+    }
+
+    #[test]
+    fn sprite_commands_reach_the_sink_from_smalltalk() {
+        struct VecGameSink(Arc<Mutex<Vec<GameCommand>>>);
+        impl GameSink for VecGameSink {
+            fn emit(&mut self, cmd: GameCommand) {
+                self.0.lock().unwrap().push(cmd);
+            }
+        }
+
+        let mut vm = boot_test_vm(JitMode::Off);
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        vm.set_game_sink(Box::new(VecGameSink(captured.clone())));
+
+        // defineSprite: mints id 1 and emits DefineSprite; the returned Sprite's
+        // cascade emits SpriteColor then MoveSprite for that same id.
+        vm.eval(
+            "(GamePane new defineSprite: 'f0f/0f0/f0f') \
+               colorAt: 15 r: 240 g: 240 b: 0; \
+               moveTo: 100 y: 80.",
+        )
+        .expect("the sprite doit must evaluate cleanly");
+        assert_eq!(
+            *captured.lock().unwrap(),
+            vec![
+                GameCommand::DefineSprite { id: 1, rows: "f0f/0f0/f0f".to_string() },
+                GameCommand::SpriteColor { id: 1, index: 15, r: 240, g: 240, b: 0 },
+                GameCommand::MoveSprite { id: 1, x: 100, y: 80 },
+            ],
+            "define/color/move must reach the sink for the minted sprite id"
         );
     }
 

@@ -118,6 +118,14 @@ struct NativePane {
     queue: metal::CommandQueue,
     layer: metal::MetalLayer,
     pane: IndexedPane,
+    /// The GPU sprite layer, composited over the indexed background each frame.
+    sprites: macgamepane_graphics::sprites::Sprites,
+    /// VM-minted sprite id -> (MacGamePane def id, instance id). Monotonic keys
+    /// (Smalltalk-side counter), so a stale key from a previous VM generation
+    /// simply misses this map rather than aliasing a live sprite
+    /// (docs/gamepane_design.md — a HashMap miss is safe; array-index reuse was
+    /// the S15 #93 hazard). Registry teardown on VM restart is a follow-up.
+    sprite_ids: std::collections::HashMap<i64, (usize, usize)>,
     w: u32,
     h: u32,
 }
@@ -163,9 +171,20 @@ pub fn ensure_native_view(w: u32, h: u32) -> Option<objc::Id> {
 
                 let mut pane = IndexedPane::new(&device, w, h, w, h).ok()?;
                 load_test_palette(&mut pane);
+                let sprites = macgamepane_graphics::sprites::Sprites::new(&device).ok()?;
 
                 // `device` is moved in last; every borrow of it above is done.
-                *slot = Some(NativePane { view, device, queue, layer, pane, w, h });
+                *slot = Some(NativePane {
+                    view,
+                    device,
+                    queue,
+                    layer,
+                    pane,
+                    sprites,
+                    sprite_ids: std::collections::HashMap::new(),
+                    w,
+                    h,
+                });
             }
         }
         cell.borrow().as_ref().map(|n| n.view)
@@ -183,6 +202,10 @@ fn present_native(n: &mut NativePane) {
     let cb = n.queue.new_command_buffer();
     n.pane
         .render(cb, drawable.texture(), metal::MTLLoadAction::Clear);
+    // Composite the sprite layer over the indexed background (its own render
+    // loads rather than clears the target).
+    n.sprites
+        .render(cb, drawable.texture(), 0.0, 0.0, n.w as f64, n.h as f64);
     cb.present_drawable(drawable);
     cb.commit();
 }
@@ -241,6 +264,22 @@ pub fn apply_command(cmd: &macvm::embed::GameCommand) {
             } => n.pane.line(*x0, *y0, *x1, *y1, *index),
             C::FillRect { x, y, w, h, index } => n.pane.fill_rect(*x, *y, *w, *h, *index),
             C::Disc { cx, cy, r, index } => n.pane.disc(*cx, *cy, *r, *index),
+            C::DefineSprite { id, rows } => {
+                if let Some(def) = n.sprites.define_sprite(rows) {
+                    let inst = n.sprites.place(def, 0.0, 0.0);
+                    n.sprite_ids.insert(*id, (def, inst));
+                }
+            }
+            C::SpriteColor { id, index, r, g, b } => {
+                if let Some(&(def, _)) = n.sprite_ids.get(id) {
+                    n.sprites.sprite_rgb(def, *index, *r, *g, *b);
+                }
+            }
+            C::MoveSprite { id, x, y } => {
+                if let Some(&(_, inst)) = n.sprite_ids.get(id) {
+                    n.sprites.move_to(inst, *x as f64, *y as f64);
+                }
+            }
             C::Present => {
                 present_native(n);
                 DIRTY.with(|d| d.set(false));

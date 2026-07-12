@@ -1903,13 +1903,22 @@ fn main() {
     if std::env::var_os("MACVM_GAMEPANE_DEMO").is_some() {
         open_game_pane();
         if let Some(vm) = VM.get() {
+            // A block-wrapped doit (block temps are legal; top-level ones are
+            // not): define a cyan sprite, then run a loop that sweeps a red disc
+            // across the background and glides the sprite along the top — the
+            // step block closes over `ship`, kept alive via the class-var-held
+            // StepBlock. Exercises drawing + sprites + the loop together.
             vm.submit(vm_host::VmRequest::Doit {
-                code: "GamePane new onStep: [ | x | \
-                         x := (Time millisecondClockValue // 8) \\\\ 320. \
-                         GamePane new cls: 0; \
-                           paletteAt: 16 r: 240 g: 80 b: 40; \
-                           disc: x y: 120 radius: 24 color: 16; \
-                           present ]; run."
+                code: "[ | ship | \
+                         ship := GamePane new defineSprite: 'ffff/f00f/f00f/ffff'. \
+                         ship colorAt: 15 r: 80 g: 220 b: 255. \
+                         GamePane new onStep: [ | x | \
+                           x := (Time millisecondClockValue // 8) \\\\ 320. \
+                           GamePane new cls: 0; \
+                             paletteAt: 16 r: 240 g: 80 b: 40; \
+                             disc: x y: 160 radius: 20 color: 16. \
+                           ship moveTo: (Time millisecondClockValue // 6) \\\\ 300 y: 60. \
+                           GamePane new present ]; run ] value."
                     .to_string(),
             });
         }

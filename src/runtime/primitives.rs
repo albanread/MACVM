@@ -1019,6 +1019,30 @@ pub static PRIMITIVES: &[PrimDesc] = &[
         can_allocate: false,
         can_fail: true,
     },
+    PrimDesc {
+        id: 210,
+        name: "GamePane>>primDefineSprite:rows:",
+        f: prim_game_define_sprite,
+        argc: 2,
+        can_allocate: false,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 211,
+        name: "GamePane>>primSpriteColor:index:r:g:b:",
+        f: prim_game_sprite_color,
+        argc: 5,
+        can_allocate: false,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 212,
+        name: "GamePane>>primMoveSprite:x:y:",
+        f: prim_game_move_sprite,
+        argc: 3,
+        can_allocate: false,
+        can_fail: true,
+    },
 ];
 
 pub fn prim_by_id(id: u16) -> Option<&'static PrimDesc> {
@@ -1160,6 +1184,52 @@ fn prim_game_run(vm: &mut VmState, args: &[Oop]) -> PrimResult {
 /// `stop` (209): stop the frame loop.
 fn prim_game_stop(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     game_emit(vm, GameCommand::StopLoop);
+    PrimResult::Ok(args[0])
+}
+
+/// A String/ByteArray argument as a Rust `String`, or `None` (fail).
+fn smi_str(oop: Oop) -> Option<String> {
+    let b = ByteArrayOop::try_from(oop)?;
+    let mut buf = Vec::new();
+    b.copy_bytes_out(&mut buf);
+    String::from_utf8(buf).ok()
+}
+
+/// `primDefineSprite:rows:` (210): define a sprite from hex-row art and place
+/// it, keyed by the VM-minted `id`.
+fn prim_game_define_sprite(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    let (Some(id), Some(rows)) = (smi_i64(args[1]), smi_str(args[2])) else {
+        return PrimResult::Fail;
+    };
+    game_emit(vm, GameCommand::DefineSprite { id, rows });
+    PrimResult::Ok(args[0])
+}
+
+/// `primSpriteColor:index:r:g:b:` (211): set sprite `id`'s palette entry
+/// `index` (0..=15) to an RGB colour.
+fn prim_game_sprite_color(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    let (Some(id), Some(index), Some(r), Some(g), Some(b)) = (
+        smi_i64(args[1]),
+        smi_byte(args[2]),
+        smi_byte(args[3]),
+        smi_byte(args[4]),
+        smi_byte(args[5]),
+    ) else {
+        return PrimResult::Fail;
+    };
+    if index > 15 {
+        return PrimResult::Fail; // sprite palettes hold 16 entries
+    }
+    game_emit(vm, GameCommand::SpriteColor { id, index, r, g, b });
+    PrimResult::Ok(args[0])
+}
+
+/// `primMoveSprite:x:y:` (212): move sprite `id`'s instance to `(x, y)`.
+fn prim_game_move_sprite(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    let (Some(id), Some(x), Some(y)) = (smi_i64(args[1]), smi_i64(args[2]), smi_i64(args[3])) else {
+        return PrimResult::Fail;
+    };
+    game_emit(vm, GameCommand::MoveSprite { id, x, y });
     PrimResult::Ok(args[0])
 }
 
@@ -2957,6 +3027,9 @@ mod tests {
             (207, "GamePane>>present"),
             (208, "GamePane>>run"),
             (209, "GamePane>>stop"),
+            (210, "GamePane>>primDefineSprite:rows:"),
+            (211, "GamePane>>primSpriteColor:index:r:g:b:"),
+            (212, "GamePane>>primMoveSprite:x:y:"),
         ];
         assert_eq!(
             PRIMITIVES.len(),
