@@ -358,6 +358,14 @@ fn synth_preset(preset: u8) -> macgamepane_audio::synth::Sound {
     }
 }
 
+/// Drop the native game pane and its GPU resources (main thread), so the next
+/// open builds a fresh one — no leftover sprites or stale scene. Called when
+/// the game is closed (Escape); the NSView is swapped out of the window first.
+pub fn teardown() {
+    NATIVE.with(|cell| *cell.borrow_mut() = None);
+    DIRTY.with(|d| d.set(false));
+}
+
 /// Present the pane if any drawing has happened since the last present (main
 /// thread). Called once after each response-drain batch, so a frame's worth of
 /// draw commands with no explicit `present` still shows exactly once.

@@ -711,12 +711,36 @@ fn build_game_timer_target() -> Id {
 /// Single-outstanding — a still-running step means we skip, never pile up.
 /// Rendering happens later, when the step's draw commands drain (not here).
 extern "C" fn on_game_tick(_this: Id, _cmd: Sel, _timer: Id) {
+    // Escape closes the game and returns to the GUI, from any game (no per-game
+    // handling needed). macOS virtual key code 53 = Escape.
+    if macgamepane_graphics::input::key_held(53) {
+        close_game_pane();
+        return;
+    }
     let Some(vm) = VM.get() else { return };
     if !vm.is_idle() {
         return;
     }
     let keys = current_game_key_mask();
     vm.submit(vm_host::VmRequest::GameStep { keys });
+}
+
+/// Close the game pane and return to the GUI (bound to Escape): stop the frame
+/// loop, restore the WKWebView (by navigating back to the pre-game page, whose
+/// load swaps the content view back — see `display_html`), make it first
+/// responder, then drop the native pane so a reopen starts fresh. Order matters:
+/// swap the game view out of the window *before* freeing its GPU resources.
+fn close_game_pane() {
+    stop_game_loop_timer();
+    let prev = NAV
+        .get()
+        .and_then(|n| n.lock().unwrap().back())
+        .unwrap_or_else(start_page);
+    navigate_to(&prev);
+    if let (Some(window), Some(webview)) = (WINDOW.get(), WEBVIEW.get()) {
+        objc::send1_id(window.0, sel("makeFirstResponder:"), webview.0);
+    }
+    game_pane::teardown();
 }
 
 /// Pack MacGamePane's process-global held-key table into the bitmask
