@@ -10,6 +10,7 @@
 
 mod browser_render;
 mod canvas_render;
+mod game_pane;
 mod objc;
 mod preprocess;
 mod vm_host;
