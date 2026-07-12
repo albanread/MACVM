@@ -188,19 +188,13 @@ fn start_page() -> PathBuf {
     gui_root().join("reference/pages/startPage.html")
 }
 
-/// The *real* Strongtalk documentation corpus (`reference/pages/
-/// documentation/`, copied byte-identical from `../../strongtalk-repo` —
-/// see `../PLAN.md`'s crate-layout note) — what `startPage.html`'s own
-/// "Browse Documentation" link and the toolbar's Documentation button both
-/// point at, faithfully matching what those pointed at in real Strongtalk.
-fn documentation_index() -> PathBuf {
-    gui_root().join("reference/pages/documentation/index.html")
-}
-
-/// MACVM's own authored help viewer (`reference/pages/macvm-help/`) — not
-/// part of the Strongtalk corpus, so it lives at a separate path rather
-/// than colliding with the real `documentation/index.html` above. Reachable
-/// from the native Help menu, not the toolbar (see `build_menu_bar`).
+/// MACVM's own authored help viewer (`reference/pages/macvm-help/`) — the
+/// MACVM documentation and tour. This is what the toolbar's Documentation
+/// button, the start page's "Browse Documentation" link, and the native
+/// Help menu all open. The original Strongtalk documentation corpus
+/// (`reference/pages/documentation/`, copied byte-identical from
+/// `../../strongtalk-repo`) is kept as reference material and reached via a
+/// link from this index, not as the primary documentation.
 fn macvm_help_index() -> PathBuf {
     gui_root().join("reference/pages/macvm-help/index.html")
 }
@@ -763,7 +757,10 @@ extern "C" fn on_script_message(_this: Id, _cmd: Sel, _controller: Id, message: 
                     navigate_to(&home);
                 }
                 "documentation" => {
-                    let doc_index = documentation_index();
+                    // The toolbar Documentation button opens MACVM's own help
+                    // (which hosts the MACVM tour). The Strongtalk reference
+                    // corpus is still reachable as a link from that index.
+                    let doc_index = macvm_help_index();
                     if let Some(nav) = NAV.get() {
                         nav.lock().unwrap().go(doc_index.clone());
                     }
