@@ -1,0 +1,164 @@
+<html>
+<head><title>MACVM &mdash; Predefined Primitives</title></head>
+<body>
+
+<h2 align="center">Predefined Primitives</h2>
+
+<p align="left">A primitive is a VM operation a method can run before its
+Smalltalk body. A method marked <code>&lt;primitive: N&gt;</code> tries
+primitive <code>N</code> first; if the primitive <strong>succeeds</strong>,
+the method returns its result immediately, and if it <strong>fails</strong>,
+execution falls through to the ordinary Smalltalk code below &mdash; which is
+how, for example, <code>SmallInteger&nbsp;+</code> handles overflow by
+promoting to a large integer. There are <strong>106 numbered
+primitives</strong>; the tables below group them by area.</p>
+
+<p align="left">The columns: <em>No.</em> is the primitive number written in
+the pragma; <em>Selector</em> is the message it implements; <em>Args</em> is
+the argument count <em>excluding</em> the receiver; and <em>Notes</em> record
+whether it may allocate (and so reach the garbage collector) and whether it
+can fail into the Smalltalk fallback. The optimizing compiler shims most of
+these directly into native code.</p>
+
+<h3 align="left">SmallInteger arithmetic &amp; comparison</h3><p align="left">Integer math and ordering on tagged small integers. Each fails (falling back to the Smalltalk body) on overflow or a non-integer argument &mdash; which is how large-integer promotion and mixed-type coercion happen.</p><table>
+<tr><td align="right"><strong>No.</strong></td><td align="left"><strong>Selector</strong></td><td align="right"><strong>Args</strong></td><td align="left"><strong>Notes</strong></td></tr>
+<tr><td align="right">1</td><td align="left"><code>+</code></td><td align="right">1</td><td align="left">can fail</td></tr>
+<tr><td align="right">2</td><td align="left"><code>-</code></td><td align="right">1</td><td align="left">can fail</td></tr>
+<tr><td align="right">3</td><td align="left"><code>*</code></td><td align="right">1</td><td align="left">can fail</td></tr>
+<tr><td align="right">4</td><td align="left"><code>//</code></td><td align="right">1</td><td align="left">can fail</td></tr>
+<tr><td align="right">5</td><td align="left"><code>\\</code></td><td align="right">1</td><td align="left">can fail</td></tr>
+<tr><td align="right">6</td><td align="left"><code>bitAnd:</code></td><td align="right">1</td><td align="left">can fail</td></tr>
+<tr><td align="right">7</td><td align="left"><code>bitOr:</code></td><td align="right">1</td><td align="left">can fail</td></tr>
+<tr><td align="right">8</td><td align="left"><code>bitXor:</code></td><td align="right">1</td><td align="left">can fail</td></tr>
+<tr><td align="right">9</td><td align="left"><code>bitShift:</code></td><td align="right">1</td><td align="left">can fail</td></tr>
+<tr><td align="right">10</td><td align="left"><code>&lt;</code></td><td align="right">1</td><td align="left">can fail</td></tr>
+<tr><td align="right">11</td><td align="left"><code>&lt;=</code></td><td align="right">1</td><td align="left">can fail</td></tr>
+<tr><td align="right">12</td><td align="left"><code>&gt;</code></td><td align="right">1</td><td align="left">can fail</td></tr>
+<tr><td align="right">13</td><td align="left"><code>&gt;=</code></td><td align="right">1</td><td align="left">can fail</td></tr>
+<tr><td align="right">14</td><td align="left"><code>=</code></td><td align="right">1</td><td align="left">can fail</td></tr>
+<tr><td align="right">15</td><td align="left"><code>~=</code></td><td align="right">1</td><td align="left">can fail</td></tr>
+</table><h3 align="left">General object</h3><p align="left">Identity, class, allocation, and slot access common to all objects.</p><table>
+<tr><td align="right"><strong>No.</strong></td><td align="left"><strong>Selector</strong></td><td align="right"><strong>Args</strong></td><td align="left"><strong>Notes</strong></td></tr>
+<tr><td align="right">20</td><td align="left"><code>identityHash</code></td><td align="right">0</td><td align="left">cannot fail</td></tr>
+<tr><td align="right">21</td><td align="left"><code>class</code></td><td align="right">0</td><td align="left">cannot fail</td></tr>
+<tr><td align="right">22</td><td align="left"><code>==</code></td><td align="right">1</td><td align="left">cannot fail</td></tr>
+<tr><td align="right">23</td><td align="left"><code>basicNew</code></td><td align="right">0</td><td align="left">allocates; can fail</td></tr>
+<tr><td align="right">24</td><td align="left"><code>basicNew:</code></td><td align="right">1</td><td align="left">allocates; can fail</td></tr>
+<tr><td align="right">25</td><td align="left"><code>instVarAt:</code></td><td align="right">1</td><td align="left">can fail</td></tr>
+<tr><td align="right">26</td><td align="left"><code>at:</code></td><td align="right">1</td><td align="left">can fail</td></tr>
+<tr><td align="right">27</td><td align="left"><code>at:put:</code></td><td align="right">2</td><td align="left">can fail</td></tr>
+<tr><td align="right">28</td><td align="left"><code>size</code></td><td align="right">0</td><td align="left">can fail</td></tr>
+</table><h3 align="left">Indexed &amp; byte objects</h3><p align="left">Element and raw-byte access for arrays and byte objects (strings, symbols).</p><table>
+<tr><td align="right"><strong>No.</strong></td><td align="left"><strong>Selector</strong></td><td align="right"><strong>Args</strong></td><td align="left"><strong>Notes</strong></td></tr>
+<tr><td align="right">40</td><td align="left"><code>byteAt:</code></td><td align="right">1</td><td align="left">can fail</td></tr>
+<tr><td align="right">41</td><td align="left"><code>byteAt:put:</code></td><td align="right">2</td><td align="left">can fail</td></tr>
+<tr><td align="right">42</td><td align="left"><code>byteSize</code></td><td align="right">0</td><td align="left">can fail</td></tr>
+<tr><td align="right">43</td><td align="left"><code>replaceFrom:to:with:</code></td><td align="right">3</td><td align="left">can fail</td></tr>
+<tr><td align="right">44</td><td align="left"><code>hashBytes</code></td><td align="right">0</td><td align="left">can fail</td></tr>
+<tr><td align="right">45</td><td align="left"><code>compare:</code></td><td align="right">1</td><td align="left">can fail</td></tr>
+</table><h3 align="left">Block evaluation</h3><p align="left">Invoking a <code>BlockClosure</code>. The compiler splices most literal blocks inline; these back the cases that survive as real closures.</p><table>
+<tr><td align="right"><strong>No.</strong></td><td align="left"><strong>Selector</strong></td><td align="right"><strong>Args</strong></td><td align="left"><strong>Notes</strong></td></tr>
+<tr><td align="right">50</td><td align="left"><code>value</code></td><td align="right">0</td><td align="left">can fail</td></tr>
+<tr><td align="right">51</td><td align="left"><code>value:</code></td><td align="right">1</td><td align="left">can fail</td></tr>
+<tr><td align="right">52</td><td align="left"><code>value:value:</code></td><td align="right">2</td><td align="left">can fail</td></tr>
+<tr><td align="right">53</td><td align="left"><code>value:value:value:</code></td><td align="right">3</td><td align="left">can fail</td></tr>
+<tr><td align="right">54</td><td align="left"><code>valueWithArguments:</code></td><td align="right">1</td><td align="left">can fail</td></tr>
+</table><h3 align="left">Unwind protection &amp; reflection</h3><p align="left"><code>ensure:</code> / <code>ifCurtailed:</code> run a block on the way out (including a non-local return), and two reflective queries over the method dictionaries.</p><table>
+<tr><td align="right"><strong>No.</strong></td><td align="left"><strong>Selector</strong></td><td align="right"><strong>Args</strong></td><td align="left"><strong>Notes</strong></td></tr>
+<tr><td align="right">60</td><td align="left"><code>ensure:</code></td><td align="right">1</td><td align="left">can fail</td></tr>
+<tr><td align="right">61</td><td align="left"><code>ifCurtailed:</code></td><td align="right">1</td><td align="left">can fail</td></tr>
+<tr><td align="right">62</td><td align="left"><code>primitiveOf:selector:</code></td><td align="right">2</td><td align="left">can fail</td></tr>
+<tr><td align="right">63</td><td align="left"><code>methodSends:selector:target:</code></td><td align="right">3</td><td align="left">can fail</td></tr>
+</table><h3 align="left">System</h3><p align="left">Process control, output, timing, and explicit garbage collection and statistics.</p><table>
+<tr><td align="right"><strong>No.</strong></td><td align="left"><strong>Selector</strong></td><td align="right"><strong>Args</strong></td><td align="left"><strong>Notes</strong></td></tr>
+<tr><td align="right">90</td><td align="left"><code>quit</code></td><td align="right">0</td><td align="left">cannot fail</td></tr>
+<tr><td align="right">91</td><td align="left"><code>printOnStdout:</code></td><td align="right">1</td><td align="left">can fail</td></tr>
+<tr><td align="right">92</td><td align="left"><code>millisecondClock</code></td><td align="right">0</td><td align="left">cannot fail</td></tr>
+<tr><td align="right">93</td><td align="left"><code>gcScavenge</code></td><td align="right">0</td><td align="left">allocates; cannot fail</td></tr>
+<tr><td align="right">94</td><td align="left"><code>gcFull</code></td><td align="right">0</td><td align="left">allocates; cannot fail</td></tr>
+<tr><td align="right">95</td><td align="left"><code>error:</code></td><td align="right">1</td><td align="left">cannot fail</td></tr>
+<tr><td align="right">96</td><td align="left"><code>quit:</code></td><td align="right">1</td><td align="left">cannot fail</td></tr>
+<tr><td align="right">97</td><td align="left"><code>gcStats</code></td><td align="right">0</td><td align="left">allocates; cannot fail</td></tr>
+<tr><td align="right">98</td><td align="left"><code>allClasses</code></td><td align="right">0</td><td align="left">allocates; cannot fail</td></tr>
+<tr><td align="right">99</td><td align="left"><code>selectorsOf:</code></td><td align="right">1</td><td align="left">allocates; can fail</td></tr>
+<tr><td align="right">111</td><td align="left"><code>__vmStats</code></td><td align="right">0</td><td align="left">allocates; cannot fail</td></tr>
+</table><h3 align="left">Double (floating point)</h3><p align="left">Boxed double-precision arithmetic and conversions. The JIT unboxes these into native register math inside a float region (see the tour's <a href="tour/fastfloats.html">Fast Floating Point</a> page).</p><table>
+<tr><td align="right"><strong>No.</strong></td><td align="left"><strong>Selector</strong></td><td align="right"><strong>Args</strong></td><td align="left"><strong>Notes</strong></td></tr>
+<tr><td align="right">100</td><td align="left"><code>+</code></td><td align="right">1</td><td align="left">allocates; can fail</td></tr>
+<tr><td align="right">101</td><td align="left"><code>-</code></td><td align="right">1</td><td align="left">allocates; can fail</td></tr>
+<tr><td align="right">102</td><td align="left"><code>*</code></td><td align="right">1</td><td align="left">allocates; can fail</td></tr>
+<tr><td align="right">103</td><td align="left"><code>/</code></td><td align="right">1</td><td align="left">allocates; can fail</td></tr>
+<tr><td align="right">104</td><td align="left"><code>&lt;</code></td><td align="right">1</td><td align="left">can fail</td></tr>
+<tr><td align="right">105</td><td align="left"><code>=</code></td><td align="right">1</td><td align="left">can fail</td></tr>
+<tr><td align="right">106</td><td align="left"><code>sqrt</code></td><td align="right">0</td><td align="left">allocates; can fail</td></tr>
+<tr><td align="right">107</td><td align="left"><code>floor</code></td><td align="right">0</td><td align="left">can fail</td></tr>
+<tr><td align="right">108</td><td align="left"><code>asDouble</code></td><td align="right">0</td><td align="left">allocates; can fail</td></tr>
+<tr><td align="right">109</td><td align="left"><code>printDigits</code></td><td align="right">0</td><td align="left">allocates; can fail</td></tr>
+<tr><td align="right">110</td><td align="left"><code>asSymbol</code></td><td align="right">0</td><td align="left">allocates; can fail</td></tr>
+</table><h3 align="left">libm transcendentals</h3><p align="left">Elementary functions, wired straight to the platform math library.</p><table>
+<tr><td align="right"><strong>No.</strong></td><td align="left"><strong>Selector</strong></td><td align="right"><strong>Args</strong></td><td align="left"><strong>Notes</strong></td></tr>
+<tr><td align="right">121</td><td align="left"><code>sin</code></td><td align="right">0</td><td align="left">allocates; can fail</td></tr>
+<tr><td align="right">122</td><td align="left"><code>cos</code></td><td align="right">0</td><td align="left">allocates; can fail</td></tr>
+<tr><td align="right">123</td><td align="left"><code>tan</code></td><td align="right">0</td><td align="left">allocates; can fail</td></tr>
+<tr><td align="right">124</td><td align="left"><code>exp</code></td><td align="right">0</td><td align="left">allocates; can fail</td></tr>
+<tr><td align="right">125</td><td align="left"><code>ln</code></td><td align="right">0</td><td align="left">allocates; can fail</td></tr>
+<tr><td align="right">126</td><td align="left"><code>atan</code></td><td align="right">0</td><td align="left">allocates; can fail</td></tr>
+</table><h3 align="left">Alien (raw memory)</h3><p align="left">Typed reads and writes over a raw address range &mdash; the foundation of the FFI (see <a href="tour/environment.html">the environment</a> and <code>docs/FFI.md</code>).</p><table>
+<tr><td align="right"><strong>No.</strong></td><td align="left"><strong>Selector</strong></td><td align="right"><strong>Args</strong></td><td align="left"><strong>Notes</strong></td></tr>
+<tr><td align="right">112</td><td align="left"><code>byteAt:</code></td><td align="right">1</td><td align="left">can fail</td></tr>
+<tr><td align="right">113</td><td align="left"><code>byteAt:put:</code></td><td align="right">2</td><td align="left">can fail</td></tr>
+<tr><td align="right">114</td><td align="left"><code>signedLongAt:</code></td><td align="right">1</td><td align="left">can fail</td></tr>
+<tr><td align="right">115</td><td align="left"><code>signedLongAt:put:</code></td><td align="right">2</td><td align="left">can fail</td></tr>
+<tr><td align="right">116</td><td align="left"><code>doubleAt:</code></td><td align="right">1</td><td align="left">allocates; can fail</td></tr>
+<tr><td align="right">117</td><td align="left"><code>doubleAt:put:</code></td><td align="right">2</td><td align="left">can fail</td></tr>
+<tr><td align="right">118</td><td align="left"><code>size</code></td><td align="right">0</td><td align="left">can fail</td></tr>
+<tr><td align="right">119</td><td align="left"><code>new:</code></td><td align="right">1</td><td align="left">allocates; can fail</td></tr>
+<tr><td align="right">120</td><td align="left"><code>forAddress:size:</code></td><td align="right">2</td><td align="left">allocates; can fail</td></tr>
+</table><h3 align="left">SIMD vectors</h3><p align="left">NEON vector values &mdash; <code>Float64x2</code> (127&ndash;133), <code>Float32x4</code> (134&ndash;140), and <code>Int32x4</code> (148&ndash;153). See the tour's <a href="tour/simd.html">SIMD</a> page.</p><table>
+<tr><td align="right"><strong>No.</strong></td><td align="left"><strong>Selector</strong></td><td align="right"><strong>Args</strong></td><td align="left"><strong>Notes</strong></td></tr>
+<tr><td align="right">127</td><td align="left"><code>x:y:</code></td><td align="right">2</td><td align="left">allocates; can fail</td></tr>
+<tr><td align="right">128</td><td align="left"><code>splat:</code></td><td align="right">1</td><td align="left">allocates; can fail</td></tr>
+<tr><td align="right">129</td><td align="left"><code>+</code></td><td align="right">1</td><td align="left">allocates; can fail</td></tr>
+<tr><td align="right">130</td><td align="left"><code>-</code></td><td align="right">1</td><td align="left">allocates; can fail</td></tr>
+<tr><td align="right">131</td><td align="left"><code>*</code></td><td align="right">1</td><td align="left">allocates; can fail</td></tr>
+<tr><td align="right">132</td><td align="left"><code>/</code></td><td align="right">1</td><td align="left">allocates; can fail</td></tr>
+<tr><td align="right">133</td><td align="left"><code>at:</code></td><td align="right">1</td><td align="left">allocates; can fail</td></tr>
+<tr><td align="right">134</td><td align="left"><code>x:y:z:w:</code></td><td align="right">4</td><td align="left">allocates; can fail</td></tr>
+<tr><td align="right">135</td><td align="left"><code>splat:</code></td><td align="right">1</td><td align="left">allocates; can fail</td></tr>
+<tr><td align="right">136</td><td align="left"><code>+</code></td><td align="right">1</td><td align="left">allocates; can fail</td></tr>
+<tr><td align="right">137</td><td align="left"><code>-</code></td><td align="right">1</td><td align="left">allocates; can fail</td></tr>
+<tr><td align="right">138</td><td align="left"><code>*</code></td><td align="right">1</td><td align="left">allocates; can fail</td></tr>
+<tr><td align="right">139</td><td align="left"><code>/</code></td><td align="right">1</td><td align="left">allocates; can fail</td></tr>
+<tr><td align="right">140</td><td align="left"><code>at:</code></td><td align="right">1</td><td align="left">allocates; can fail</td></tr>
+<tr><td align="right">148</td><td align="left"><code>x:y:z:w:</code></td><td align="right">4</td><td align="left">allocates; can fail</td></tr>
+<tr><td align="right">149</td><td align="left"><code>splat:</code></td><td align="right">1</td><td align="left">allocates; can fail</td></tr>
+<tr><td align="right">150</td><td align="left"><code>+</code></td><td align="right">1</td><td align="left">allocates; can fail</td></tr>
+<tr><td align="right">151</td><td align="left"><code>-</code></td><td align="right">1</td><td align="left">allocates; can fail</td></tr>
+<tr><td align="right">152</td><td align="left"><code>*</code></td><td align="right">1</td><td align="left">allocates; can fail</td></tr>
+<tr><td align="right">153</td><td align="left"><code>at:</code></td><td align="right">1</td><td align="left">allocates; can fail</td></tr>
+</table><h3 align="left">FloatArray</h3><p align="left">Bulk NEON kernels over contiguous float buffers.</p><table>
+<tr><td align="right"><strong>No.</strong></td><td align="left"><strong>Selector</strong></td><td align="right"><strong>Args</strong></td><td align="left"><strong>Notes</strong></td></tr>
+<tr><td align="right">141</td><td align="left"><code>new:</code></td><td align="right">1</td><td align="left">allocates; can fail</td></tr>
+<tr><td align="right">142</td><td align="left"><code>at:</code></td><td align="right">1</td><td align="left">allocates; can fail</td></tr>
+<tr><td align="right">143</td><td align="left"><code>at:put:</code></td><td align="right">2</td><td align="left">can fail</td></tr>
+<tr><td align="right">144</td><td align="left"><code>size</code></td><td align="right">0</td><td align="left">can fail</td></tr>
+<tr><td align="right">145</td><td align="left"><code>+@</code></td><td align="right">1</td><td align="left">allocates; can fail</td></tr>
+<tr><td align="right">146</td><td align="left"><code>sum</code></td><td align="right">0</td><td align="left">allocates; can fail</td></tr>
+<tr><td align="right">147</td><td align="left"><code>dot:</code></td><td align="right">1</td><td align="left">allocates; can fail</td></tr>
+<tr><td align="right">154</td><td align="left"><code>scale:</code></td><td align="right">1</td><td align="left">allocates; can fail</td></tr>
+<tr><td align="right">155</td><td align="left"><code>max</code></td><td align="right">0</td><td align="left">allocates; can fail</td></tr>
+<tr><td align="right">156</td><td align="left"><code>min</code></td><td align="right">0</td><td align="left">allocates; can fail</td></tr>
+</table>
+
+<h3 align="left">The FFI primitive</h3>
+
+<p align="left">One primitive is not numbered in the table above: an
+<code>&lt;primitive: FFI &hellip;&gt;</code> pragma marks a method as a
+foreign call. It carries a sentinel id (<code>-1</code>) and a descriptor of
+the C function and its argument shape rather than a fixed number, and
+dispatches through the FFI trampolines. See <code>docs/FFI.md</code>.</p>
+
+<p align="left"><a href="index.html">Back to the Documentation Index</a></p>
+
+</body>
+</html>

@@ -1,0 +1,85 @@
+<html>
+<head><title>MACVM &mdash; The Bytecode Set</title></head>
+<body>
+
+<h2 align="center">The Bytecode Set</h2>
+
+<p align="left">A MACVM method is compiled to a compact stack-machine
+bytecode. The interpreter runs it with a fetch-decode-<code>match</code> loop
+&mdash; it reads the opcode byte and its operands inline &mdash; and the
+optimizing compiler decodes the same bytes into a control-flow graph. There
+are just <strong>31 instructions</strong>. The opcode values below are the
+external wire format and are never renumbered.</p>
+
+<p align="left">A few conventions: an <code>&lt;i8&gt;</code> operand is a
+signed byte; <code>&lt;u8&gt;</code> an unsigned byte; <code>&lt;u16&gt;</code>
+a little-endian unsigned 16-bit value. &ldquo;The stack&rdquo; is the current
+activation's operand stack, and slot/index operands are small integers into
+the method's temps, literals, or the receiver's fields. The <em>Bytes</em>
+column is the total instruction length including operands.</p>
+
+<h3 align="left">Pushing values onto the stack</h3><table>
+<tr><td align="left"><strong>Instruction</strong></td><td align="left"><strong>Value</strong></td><td align="left"><strong>Operands</strong></td><td align="right"><strong>Bytes</strong></td><td align="left"><strong>Effect</strong></td></tr>
+<tr><td align="left"><code>push_self</code></td><td align="left"><code>0x00</code></td><td align="left"><code>&mdash;</code></td><td align="right">1</td><td align="left">Push the receiver, <code>self</code>.</td></tr>
+<tr><td align="left"><code>push_nil</code></td><td align="left"><code>0x01</code></td><td align="left"><code>&mdash;</code></td><td align="right">1</td><td align="left">Push <code>nil</code>.</td></tr>
+<tr><td align="left"><code>push_true</code></td><td align="left"><code>0x02</code></td><td align="left"><code>&mdash;</code></td><td align="right">1</td><td align="left">Push <code>true</code>.</td></tr>
+<tr><td align="left"><code>push_false</code></td><td align="left"><code>0x03</code></td><td align="left"><code>&mdash;</code></td><td align="right">1</td><td align="left">Push <code>false</code>.</td></tr>
+<tr><td align="left"><code>push_smi</code></td><td align="left"><code>0x04</code></td><td align="left"><code>&lt;i8&gt;</code></td><td align="right">2</td><td align="left">Push a small integer literal in <code>-128..127</code>.</td></tr>
+<tr><td align="left"><code>push_literal</code></td><td align="left"><code>0x05</code></td><td align="left"><code>&lt;u8 index&gt;</code></td><td align="right">2</td><td align="left">Push <code>literal[index]</code> from the method's literal frame.</td></tr>
+<tr><td align="left"><code>push_literal_w</code></td><td align="left"><code>0x12</code></td><td align="left"><code>&lt;u16 index&gt;</code></td><td align="right">3</td><td align="left">Wide <code>push_literal</code> &mdash; for a literal index &ge; 256.</td></tr>
+<tr><td align="left"><code>push_temp</code></td><td align="left"><code>0x06</code></td><td align="left"><code>&lt;u8 slot&gt;</code></td><td align="right">2</td><td align="left">Push a temporary or argument slot (the two share one index space).</td></tr>
+<tr><td align="left"><code>push_instvar</code></td><td align="left"><code>0x09</code></td><td align="left"><code>&lt;u8 index&gt;</code></td><td align="right">2</td><td align="left">Push an instance variable of the receiver.</td></tr>
+<tr><td align="left"><code>push_global</code></td><td align="left"><code>0x0B</code></td><td align="left"><code>&lt;u8 lit&gt;</code></td><td align="right">2</td><td align="left">Push a global's value (the literal is its <code>Association</code>).</td></tr>
+<tr><td align="left"><code>push_ctx_temp</code></td><td align="left"><code>0x0F</code></td><td align="left"><code>&lt;u8 depth&gt; &lt;u8 idx&gt;</code></td><td align="right">3</td><td align="left">Push a captured temp from an enclosing <code>Context</code> at <code>depth</code>.</td></tr>
+<tr><td align="left"><code>push_closure</code></td><td align="left"><code>0x11</code></td><td align="left"><code>&lt;u8 lit&gt; &lt;u8 ncopied&gt;</code></td><td align="right">3</td><td align="left">Build a <code>BlockClosure</code> from a block literal, copying <code>ncopied</code> outer values.</td></tr>
+</table><h3 align="left">Storing values</h3><table>
+<tr><td align="left"><strong>Instruction</strong></td><td align="left"><strong>Value</strong></td><td align="left"><strong>Operands</strong></td><td align="right"><strong>Bytes</strong></td><td align="left"><strong>Effect</strong></td></tr>
+<tr><td align="left"><code>store_temp</code></td><td align="left"><code>0x07</code></td><td align="left"><code>&lt;u8 slot&gt;</code></td><td align="right">2</td><td align="left">Store the top of stack into a temp; leaves it on the stack.</td></tr>
+<tr><td align="left"><code>store_temp_pop</code></td><td align="left"><code>0x08</code></td><td align="left"><code>&lt;u8 slot&gt;</code></td><td align="right">2</td><td align="left">Pop the top of stack into a temp.</td></tr>
+<tr><td align="left"><code>store_instvar_pop</code></td><td align="left"><code>0x0A</code></td><td align="left"><code>&lt;u8 index&gt;</code></td><td align="right">2</td><td align="left">Pop into an instance variable (with the GC write barrier).</td></tr>
+<tr><td align="left"><code>store_global_pop</code></td><td align="left"><code>0x0C</code></td><td align="left"><code>&lt;u8 lit&gt;</code></td><td align="right">2</td><td align="left">Pop into a global's <code>Association</code> value.</td></tr>
+<tr><td align="left"><code>store_ctx_temp_pop</code></td><td align="left"><code>0x10</code></td><td align="left"><code>&lt;u8 depth&gt; &lt;u8 idx&gt;</code></td><td align="right">3</td><td align="left">Pop into a captured <code>Context</code> temp at <code>depth</code>.</td></tr>
+</table><h3 align="left">Stack manipulation</h3><table>
+<tr><td align="left"><strong>Instruction</strong></td><td align="left"><strong>Value</strong></td><td align="left"><strong>Operands</strong></td><td align="right"><strong>Bytes</strong></td><td align="left"><strong>Effect</strong></td></tr>
+<tr><td align="left"><code>pop</code></td><td align="left"><code>0x0D</code></td><td align="left"><code>&mdash;</code></td><td align="right">1</td><td align="left">Discard the top of stack.</td></tr>
+<tr><td align="left"><code>dup</code></td><td align="left"><code>0x0E</code></td><td align="left"><code>&mdash;</code></td><td align="right">1</td><td align="left">Duplicate the top of stack.</td></tr>
+</table><h3 align="left">Message sends</h3><table>
+<tr><td align="left"><strong>Instruction</strong></td><td align="left"><strong>Value</strong></td><td align="left"><strong>Operands</strong></td><td align="right"><strong>Bytes</strong></td><td align="left"><strong>Effect</strong></td></tr>
+<tr><td align="left"><code>send</code></td><td align="left"><code>0x20</code></td><td align="left"><code>&lt;u8 ic&gt;</code></td><td align="right">2</td><td align="left">Send a message. <code>ic</code> indexes the send-site / inline-cache table, which carries the selector and argument count.</td></tr>
+<tr><td align="left"><code>send_super</code></td><td align="left"><code>0x21</code></td><td align="left"><code>&lt;u8 ic&gt;</code></td><td align="right">2</td><td align="left">A <code>super</code> send &mdash; lookup starts above the sending method's class.</td></tr>
+<tr><td align="left"><code>send_w</code></td><td align="left"><code>0x22</code></td><td align="left"><code>&lt;u16 ic&gt;</code></td><td align="right">3</td><td align="left">Wide <code>send</code> &mdash; for a send-site index &ge; 256.</td></tr>
+<tr><td align="left"><code>send_super_w</code></td><td align="left"><code>0x23</code></td><td align="left"><code>&lt;u16 ic&gt;</code></td><td align="right">3</td><td align="left">Wide <code>super</code> send.</td></tr>
+</table><h3 align="left">Jumps and branches</h3><table>
+<tr><td align="left"><strong>Instruction</strong></td><td align="left"><strong>Value</strong></td><td align="left"><strong>Operands</strong></td><td align="right"><strong>Bytes</strong></td><td align="left"><strong>Effect</strong></td></tr>
+<tr><td align="left"><code>jump_fwd</code></td><td align="left"><code>0x30</code></td><td align="left"><code>&lt;u16 dist&gt;</code></td><td align="right">3</td><td align="left">Unconditional forward jump.</td></tr>
+<tr><td align="left"><code>jump_back</code></td><td align="left"><code>0x31</code></td><td align="left"><code>&lt;u16 dist&gt;</code></td><td align="right">3</td><td align="left">Unconditional backward jump (a loop back-edge; where the JIT counts loop trips and may enter compiled code).</td></tr>
+<tr><td align="left"><code>br_true_fwd</code></td><td align="left"><code>0x32</code></td><td align="left"><code>&lt;u16 dist&gt;</code></td><td align="right">3</td><td align="left">Pop the top of stack; branch forward if it is <code>true</code> (a non-boolean is an error).</td></tr>
+<tr><td align="left"><code>br_false_fwd</code></td><td align="left"><code>0x33</code></td><td align="left"><code>&lt;u16 dist&gt;</code></td><td align="right">3</td><td align="left">Pop the top of stack; branch forward if it is <code>false</code>.</td></tr>
+</table><h3 align="left">Returns</h3><table>
+<tr><td align="left"><strong>Instruction</strong></td><td align="left"><strong>Value</strong></td><td align="left"><strong>Operands</strong></td><td align="right"><strong>Bytes</strong></td><td align="left"><strong>Effect</strong></td></tr>
+<tr><td align="left"><code>return_tos</code></td><td align="left"><code>0x40</code></td><td align="left"><code>&mdash;</code></td><td align="right">1</td><td align="left">Return the top of stack from the method.</td></tr>
+<tr><td align="left"><code>return_self</code></td><td align="left"><code>0x41</code></td><td align="left"><code>&mdash;</code></td><td align="right">1</td><td align="left">Return <code>self</code>.</td></tr>
+<tr><td align="left"><code>block_return_tos</code></td><td align="left"><code>0x42</code></td><td align="left"><code>&mdash;</code></td><td align="right">1</td><td align="left">Return the top of stack from a block, to the block's caller.</td></tr>
+<tr><td align="left"><code>nlr_tos</code></td><td align="left"><code>0x43</code></td><td align="left"><code>&mdash;</code></td><td align="right">1</td><td align="left">Non-local return: return the top of stack from the block's <em>home</em> method.</td></tr>
+</table>
+
+<h3 align="left">Notes</h3>
+
+<ul>
+	<li><p align="left">Temps and arguments share one index space
+	(<code>push_temp</code>), so argument 0 is simply temp 0.</p></li>
+	<li><p align="left">A send carries no selector inline &mdash; the
+	<code>ic</code> operand names a send site, whose inline cache remembers the
+	selector, the argument count, and the receiver classes seen so far. That
+	cache is the type feedback the optimizing compiler reads.</p></li>
+	<li><p align="left"><code>push_closure</code>, <code>push_ctx_temp</code>,
+	<code>block_return_tos</code>, and <code>nlr_tos</code> are the block and
+	closure instructions; the compiler splices most blocks inline rather than
+	building a real closure (see the tour's
+	<a href="tour/optimization.html">Optimizing Compiler</a> page).</p></li>
+</ul>
+
+<p align="left"><a href="index.html">Back to the Documentation Index</a></p>
+
+</body>
+</html>
