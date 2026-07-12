@@ -4,33 +4,47 @@
 
 <h2 align="center">MACVM Help &amp; Documentation</h2>
 
-<p>This is documentation for the <strong>MACVM GUI shell</strong> itself —
-written locally for this project, not part of the original Strongtalk page
-corpus under <code>reference/pages/</code>. It exists so the "Browse
-Documentation" link on the <a href="../startPage.html">Start Page</a> goes
-somewhere real, and so there is genuine content to click through while
-testing the shell.</p>
+<p>Documentation for <strong>MACVM</strong> and its GUI shell, written for
+this project &mdash; not part of the original Strongtalk page corpus under
+<code>reference/pages/</code>, which describes a different system. These
+pages are themselves live MACVM pages: the <code>doit</code> links below run
+real Smalltalk in the embedded VM.</p>
 
-<h3 align="left">Topics</h3>
+<h3 align="left">The MACVM Tour</h3>
+
+<p>A guided tour of what MACVM is and does, modelled on the classic
+Strongtalk system tour but honest about MACVM's own design and its measured
+results:</p>
 
 <ul>
-	<li><a href="gui-shell.html">About this GUI shell</a> — the toolbar,
-	status bar, transcript, <code>doit=</code> links, and the
+	<li><a href="tour/toc.html"><strong>Start the tour &rarr;</strong></a>
+	&mdash; introduction, the virtual machine, the optimizing compiler, fast
+	floating point, the programming environment, introspection &amp;
+	reliability, and how MACVM relates to Strongtalk.</li>
+</ul>
+
+<h3 align="left">The GUI shell</h3>
+
+<ul>
+	<li><a href="gui-shell.html">About this GUI shell</a> &mdash; the
+	toolbar, status bar, transcript, <code>doit=</code> links, and the
 	<code>smappl</code> tag.</li>
-	<li><a href="architecture.html">MACVM architecture</a> — what MACVM is,
-	and how it relates to Self and Strongtalk.</li>
-	<li><a href="toolbar.html">Toolbar reference</a> — what each of the
-	eleven toolbar buttons does today, and what's still a stub.</li>
+	<li><a href="architecture.html">MACVM architecture</a> &mdash; what MACVM
+	is, and how it relates to Self and Strongtalk.</li>
+	<li><a href="toolbar.html">Toolbar reference</a> &mdash; what each toolbar
+	button does today.</li>
 </ul>
 
 <h3 align="left">Try It</h3>
 
-<p>A <code>doit</code> link, to exercise the click → transcript round trip
-from right here:
-<a doit="Transcript show: 'Hello from the documentation page'">Say hello</a></p>
+<p>A <code>doit</code> link runs its Smalltalk in the VM and prints to the
+Transcript &mdash; this one really executes:
+<a doit="Transcript showCr: '6 times 7 = ', (6 * 7) printString">Compute 6 &times; 7</a></p>
 
-<p>An <code>smappl</code> tag, rendered as the G0 placeholder it is today
-(see <a href="gui-shell.html">About this GUI shell</a> for what that means):
+<p>The <code>smappl</code> tag embeds a live widget by evaluating an
+expression. Widget evaluation is a later phase, so today it renders as an
+inert placeholder box naming the code (see
+<a href="gui-shell.html">About this GUI shell</a>):
 <smappl visual="HelpPage exampleWidget"></p>
 
 <h3 align="left">&nbsp;</h3>

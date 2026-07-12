@@ -1,0 +1,107 @@
+<html>
+<head><title>How MACVM Relates to Strongtalk</title></head>
+<body>
+
+<h3 align="right">
+<a href="toc.html">Contents</a> |
+<a href="debugging.html">&lt;== Prev</a> |
+<a href="conclusion.html">Next ==&gt;</a></h3>
+
+<h2 align="center">How MACVM Relates to Strongtalk</h2>
+
+<p align="left">MACVM is a re-implementation from Strongtalk's published
+design, not a fork of its source. So it is worth being precise about the
+family resemblance &mdash; what carries over unchanged, what was deliberately
+left behind, and what is genuinely new. One thing runs through all three
+lists without qualification: the language. The syntax and the basic
+semantics are Smalltalk-80 throughout, exactly as they were in Strongtalk.</p>
+
+<h3 align="left">What MACVM keeps</h3>
+
+<ul>
+	<li><p align="left"><strong>The class model.</strong> Direct tagged
+	pointers, a two-word <code>[mark][klass]</code> header, a two-bit tag for
+	smi&nbsp;vs&nbsp;oop, and <em>no object table</em> &mdash; Strongtalk's
+	object model, kept intact. Self's prototype/map model was evaluated and
+	set aside.</p></li>
+
+	<li><p align="left"><strong>Adaptive optimization.</strong> Inline
+	caches, PICs, type feedback, method and block inlining, per-klass
+	customization, and correct <em>deoptimization</em> when a speculation
+	breaks &mdash; the Self&nbsp;&rarr;&nbsp;Strongtalk engine, reproduced
+	and extended.</p></li>
+
+	<li><p align="left"><strong>The live-HTML environment.</strong> Pages
+	that <em>execute</em> Smalltalk (<code>doit</code>) and embed widgets
+	(<code>smappl</code>). That is the Strongtalk "live page" idea, and it is
+	the surface you are reading this tour on.</p></li>
+
+	<li><p align="left"><strong>The fast-float ambition &mdash; now
+	delivered.</strong> Strongtalk sketched an experimental fast-float scheme
+	and left it unfinished. MACVM finished it: a mono-<code>Double</code> send
+	site compiles to a guarded unbox, native <code>fmul</code>/<code>fadd</code>/<code>fcmp</code>,
+	and a box only where a boxed value is actually observed. See the Fast
+	Floating Point page.</p></li>
+</ul>
+
+<h3 align="left">What it drops, or has not built yet</h3>
+
+<ul>
+	<li><p align="left"><strong>The optional static type system.</strong>
+	Strongtalk's most famous idea &mdash; a pluggable, provably-sound type
+	layer that never changed run-time semantics &mdash; is <em>not
+	implemented</em> in MACVM. It may come one day; it is not here.</p></li>
+
+	<li><p align="left"><strong>Mixins.</strong> Strongtalk's mixin-based
+	inheritance is not implemented. MACVM uses ordinary single
+	inheritance.</p></li>
+
+	<li><p align="left"><strong>The glyph-based flyweight UI.</strong>
+	Strongtalk drew its whole interface from lightweight glyphs. MACVM does
+	not &mdash; it hosts a native Cocoa window around a single
+	<code>WKWebView</code> and renders the interface as HTML.</p></li>
+
+	<li><p align="left"><strong>Native / green threads with async C
+	callouts.</strong> Not yet. The FFI is synchronous Tier-1 POSIX
+	(<code>dlsym</code> + shape-keyed trampolines + an <code>Alien</code>
+	raw-memory type); Tier-2 Cocoa dispatch and concurrency are future
+	work.</p></li>
+</ul>
+
+<h3 align="left">What is new</h3>
+
+<ul>
+	<li><p align="left"><strong>Rust.</strong> The whole VM is new Rust
+	&mdash; interpreter, optimizing compiler, garbage collector &mdash; owing
+	nothing to Strongtalk's source code.</p></li>
+
+	<li><p align="left"><strong>Apple-Silicon-first.</strong> arm64
+	throughout, with a hardened JIT (<code>MAP_JIT</code> / W^X) and
+	pointer-authentication awareness. Not a port of an x86 design.</p></li>
+
+	<li><p align="left"><strong>A SQLite image store.</strong> Offline image
+	editing plus a DB&nbsp;&rarr;&nbsp;VM boot loader that reconstructs the
+	world <em>byte-identically</em> to a classic image boot.</p></li>
+
+	<li><p align="left"><strong>Measured reliability.</strong> The
+	interpreter is a differential oracle: compiled output must be
+	byte-identical to interpreted output, gated against GC and deopt stress
+	matrices. Fast-but-crashes is the thing MACVM was built <em>not</em> to
+	be.</p></li>
+
+	<li><p align="left"><strong>Near-total compiled coverage that stays
+	compiled.</strong> About 98.7% of the methods that run compile; on real
+	workloads 98.6&mdash;99.8% of executed work runs as compiled native code,
+	closures included &mdash; and stays that way.</p></li>
+</ul>
+
+<p align="left">The one thing that has not moved an inch is the language
+itself. A live link, to prove it: this runs ordinary Smalltalk-80, evaluated
+left-to-right through binary operators just as you would expect &mdash;
+<a doit="Transcript showCr: '3 + 4 * 2 = ', (3 + 4 * 2) printString">Run 3 + 4 * 2</a>
+&mdash; which prints <code>14</code>, not <code>11</code>.</p>
+
+<h3 align="right"><a href="conclusion.html"><strong>Next ==&gt;</strong></a></h3>
+
+</body>
+</html>

@@ -1,0 +1,150 @@
+<html>
+<head><title>A Tour of MACVM &mdash; The Optimizing Compiler</title></head>
+<body>
+
+<h3 align="right">
+<a href="toc.html">Contents</a> |
+<a href="virtualmachine.html">&lt;== Prev</a> |
+<a href="fastfloats.html">Next ==&gt;</a></h3>
+
+<h2 align="center">The Optimizing Compiler</h2>
+
+<p align="left">Here is the heart of the thing. MACVM runs on two tiers. The
+first is a simple dispatch-based bytecode interpreter &mdash; a
+fetch&ndash;decode&ndash;match loop that starts instantly and asks no
+questions. The second is a tier-1 optimizing JIT that compiles hot methods
+to native arm64 code. The strategy is the one Self pioneered and Strongtalk
+carried into a class-based world: <strong>run first, then recompile</strong>.
+You never pay to optimize code that only runs once, and by the time a method
+is hot you know something the interpreter had to discover the hard way &mdash;
+what types actually flow through it.</p>
+
+<h3 align="left">Type feedback: the inline cache is the oracle</h3>
+
+<p align="left">Every send site starts monomorphic. The first time
+<code>anObject foo</code> executes, the interpreter records the receiver's
+klass and the method it dispatched to, right there at the call site &mdash;
+an <strong>inline cache</strong>. Hit the same klass again and the lookup is
+free. When a second klass shows up, the inline cache grows into a
+<strong>polymorphic inline cache</strong> (a PIC): a small guarded list of
+the klasses actually seen here, in this program, on this data.</p>
+
+<p align="left">That PIC is not just a dispatch accelerator. It is a
+<em>record of measured fact</em>. When the JIT compiles the method, the PIC
+tells it exactly which receiver types occur at every send &mdash; so the
+compiler never has to guess, and never has to fall back to a slow general
+lookup for the cases that never happen. The inline cache is the type oracle.
+No declarations, no annotations; the running program is the specification.</p>
+
+<h3 align="left">Inlining, customization, devirtualization</h3>
+
+<p align="left">Armed with that feedback, the compiler does the aggressive
+things:</p>
+
+<ul>
+	<li><p align="left"><strong>Method inlining</strong> &mdash; a monomorphic
+	send whose target is known is replaced by the target's body, turning a call
+	into straight-line code and exposing everything inside it to further
+	optimization.</p></li>
+
+	<li><p align="left"><strong>Block inlining</strong> &mdash; literal blocks
+	do not become heap-allocated closures that get invoked later. They
+	<em>splice inline</em> at the point of use, including multi-basic-block
+	blocks that carry a non-local <code>^</code> return out of an enclosing
+	method. A <code>whileTrue:</code> or an <code>ifTrue:ifFalse:</code>
+	compiles to exactly the branch you would have written by hand.</p></li>
+
+	<li><p align="left"><strong>Per-klass customization</strong> &mdash; a
+	method is compiled <em>once per receiver klass</em>. Inside the customized
+	copy the receiver's type is a constant, so its own <code>self</code> sends
+	resolve statically and inline in turn.</p></li>
+
+	<li><p align="left"><strong>Devirtualization</strong> &mdash; and so the
+	self-sends and the block arguments that Smalltalk leans on for everything
+	stop being dynamic dispatch. A customized method's <code>self foo</code>
+	becomes a direct call or an inline body; a block passed as an argument is
+	invoked at a known site rather than through a general value-send.</p></li>
+</ul>
+
+<h3 align="left">Why speculating is safe: deoptimization and OSR</h3>
+
+<p align="left">All of this is speculation. The compiler bet that the klasses
+it saw are the klasses it will keep seeing. Sometimes that bet is wrong
+&mdash; you redefine a method, or a receiver of a klass this site never
+witnessed finally turns up. The reason MACVM can speculate so aggressively is
+that it can always <strong>bail out correctly</strong>.</p>
+
+<p align="left">When a guard fails, the running native frame is
+<strong>deoptimized</strong>: the compiled activation is reconstructed as
+interpreter frames, live values back in their proper slots, and execution
+continues in the interpreter exactly as if the method had never been compiled.
+No wrong answer is ever produced &mdash; the fall-back is not a fast
+approximation, it is the same computation. The reverse door is
+<strong>on-stack replacement</strong> (OSR): a loop that turns out to be hot
+while it is <em>already running</em> can be entered in compiled form
+mid-flight, without waiting for the next call. Deopt is how you leave the fast
+tier safely; OSR is how you enter it early.</p>
+
+<p align="left">Because bailing back is always correct, the compiler is free
+to be greedy. Speculation costs nothing when it is right and nothing but a
+recompile when it is wrong.</p>
+
+<h3 align="left">Compiler coverage achieved</h3>
+
+<p align="left">This is the milestone. The goal was never "optimize the inner
+loop of a benchmark" &mdash; it was to make the optimizing compiler carry
+<em>essentially all</em> of a real program. It does.</p>
+
+<ul>
+	<li><p align="left"><strong>~98.7%</strong> of the methods that actually
+	run get compiled to native code. The remainder are native primitives, which
+	are already native &mdash; they lose nothing by staying that way.</p></li>
+
+	<li><p align="left">On real workloads, <strong>98.6&ndash;99.8%</strong> of
+	executed bytecode-work runs as compiled native code &mdash; closures
+	included &mdash; and <em>stays</em> compiled. The system reaches steady
+	state and holds it, rather than thrashing between tiers.</p></li>
+</ul>
+
+<p align="left">And the speedups, interpreter versus JIT, measured on a
+fanless MacBook Air:</p>
+
+<ul>
+	<li><p align="left"><code>deltablue</code> &mdash; 214&nbsp;ms &rarr;
+	4&nbsp;ms, about <strong>53&times;</strong>.</p></li>
+	<li><p align="left"><code>richards</code> &mdash; ~205&nbsp;ms &rarr;
+	~6&nbsp;ms, about <strong>34&times;</strong>.</p></li>
+	<li><p align="left"><code>sieve</code> &mdash; 88&nbsp;ms &rarr;
+	9&nbsp;ms, about <strong>10&times;</strong>.</p></li>
+	<li><p align="left"><code>ctxloop</code> (a closure/OSR microbenchmark)
+	&mdash; 134&nbsp;ms &rarr; 1&nbsp;ms, about
+	<strong>134&times;</strong>.</p></li>
+</ul>
+
+<p align="left">The closure microbenchmark is the interesting one: it is
+almost entirely block invocation and a hot loop, exactly the shape that a
+naive compiler leaves on the table. Splicing the blocks inline and entering
+via OSR is what turns 134&nbsp;ms into 1.</p>
+
+<h3 align="left">See a send resolve</h3>
+
+<p align="left">The doit below runs entirely in compiled code once it is hot.
+Nothing exotic &mdash; just arithmetic sent to a SmallInteger &mdash; but the
+same machinery described above is what makes it a native multiply rather than
+a dispatch:
+<a doit="Transcript showCr: 'deltablue: the JIT saves ', (214 - 4) printString, ' ms'">Run the saving</a>.
+And a second, concatenating a string with an integer result:
+<a doit="Transcript showCr: 'ctxloop is ', (134 * 1) printString, 'x faster compiled'">Run the ratio</a>.</p>
+
+<p align="left">Everything in this chapter &mdash; the tiers, the type
+feedback, the inlining, the deopt fall-back &mdash; rests on one property from
+the previous page: the garbage collector runs underneath live, moving compiled
+frames. That is what lets compiled code keep values in registers across a
+collection. Without it, none of the speculation would be safe. With it, the
+next chapter can go a step further and keep <em>unboxed floating-point</em>
+values in registers too.</p>
+
+<h3 align="right"><a href="fastfloats.html"><strong>Next ==&gt;</strong></a></h3>
+
+</body>
+</html>

@@ -8,34 +8,39 @@
 each one does today:</p>
 
 <ul>
-	<li><strong>Back</strong> — go to the previous page in this window's
+	<li><strong>Back</strong> &mdash; go to the previous page in this window's
 	local history. Wired up.</li>
-	<li><strong>Forward</strong> — go to the next page in this window's local
+	<li><strong>Forward</strong> &mdash; go to the next page in this window's local
 	history. Wired up.</li>
-	<li><strong>Start page</strong> — return to
+	<li><strong>Start page</strong> &mdash; return to
 	<a href="../startPage.html">startPage.html</a>. Wired up.</li>
-	<li><strong>Find definition</strong> — look up a class or method
-	definition. Not wired yet — needs a running VM to look anything up in.</li>
-	<li><strong>Implementors</strong> — list the methods that implement a
-	given message selector. Not wired yet, same reason.</li>
-	<li><strong>Senders</strong> — list the methods that send a given
-	selector. Not wired yet, same reason.</li>
-	<li><strong>User hierarchy</strong> — browse the class hierarchy rooted
-	at user-defined classes. Not wired yet.</li>
-	<li><strong>Full hierarchy</strong> — browse the complete class
-	hierarchy. Not wired yet.</li>
-	<li><strong>Workspace</strong> — open a blank scratch page for
-	evaluating expressions. Not wired yet.</li>
-	<li><strong>Text editor</strong> — open the built-in text editor. Not
+	<li><strong>Find definition</strong> &mdash; look up a class or method
+	definition. Wired to the VM's browser: it resolves against the real
+	object world.</li>
+	<li><strong>Implementors</strong> &mdash; list the methods that implement a
+	given message selector. Wired to the VM's browser.</li>
+	<li><strong>Senders</strong> &mdash; list the methods that send a given
+	selector. Wired to the VM's browser.</li>
+	<li><strong>User hierarchy</strong> &mdash; browse the class hierarchy rooted
+	at user-defined classes. Wired to the VM's browser.</li>
+	<li><strong>Full hierarchy</strong> &mdash; browse the complete class
+	hierarchy. Wired to the VM's browser.</li>
+	<li><strong>Workspace</strong> &mdash; open a blank scratch page for
+	evaluating expressions. Backed by the embedded VM &mdash; the expressions you
+	type run for real.</li>
+	<li><strong>Text editor</strong> &mdash; open the built-in text editor. Not
 	wired yet.</li>
-	<li><strong>Documentation</strong> — open this help viewer. Wired up.</li>
+	<li><strong>Documentation</strong> &mdash; open this help viewer. Wired up.</li>
 </ul>
 
-<p>"Not wired yet" buttons still log a note to the transcript when clicked,
-so clicking them is safe to try — they just don't do anything useful until
-MACVM has a VM behind the shell (see
-<a href="architecture.html">MACVM architecture</a>) to actually look up
-classes, methods, and senders against.</p>
+<p>The class-lookup and browser buttons are now backed by MACVM's real object
+world through the embedded VM (see
+<a href="architecture.html">MACVM architecture</a>): they look up, list, and
+browse against the live class dictionary rather than a stub. Better still,
+the browser is a full editor &mdash; a method you change is
+<strong>live-compiled</strong> into the running world and
+<strong>persisted to the SQLite image store</strong>, so the edit survives a
+restart.</p>
 
 <p><a href="index.html">Back to Documentation Index</a></p>
 

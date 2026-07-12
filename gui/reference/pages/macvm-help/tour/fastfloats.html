@@ -1,0 +1,116 @@
+<html>
+<head><title>A Tour of MACVM &mdash; Fast Floating Point</title></head>
+<body>
+
+<h3 align="right">
+<a href="toc.html">Contents</a> |
+<a href="optimization.html">&lt;== Prev</a> |
+<a href="environment.html">Next ==&gt;</a></h3>
+
+<h2 align="center">Fast Floating Point</h2>
+
+<p align="left">The introduction promised a page that <em>finishes</em>
+something. This is it. Strongtalk shipped an experimental fast-float scheme
+and was honest that it was unfinished: it leaned on a special
+<code>&lt;FloatVal&gt;</code> annotation that was <strong>never integrated
+with the type system</strong>, it made the programmer write the box and
+unbox by hand, and it could not carry an unboxed double <strong>across a
+method boundary</strong>. A sketch of the right idea, left on the bench.</p>
+
+<p align="left">MACVM finishes it, and does so without asking the programmer
+for anything. There is no annotation. You write ordinary Smalltalk float
+arithmetic; the compiler does the rest.</p>
+
+<h3 align="left">Float regions</h3>
+
+<p align="left">The mechanism is the <em>float region</em>. At a send site
+where the inline cache has only ever seen <code>Double</code>, the IC
+<em>is</em> the type oracle &mdash; that is why no <code>&lt;FloatVal&gt;</code>
+annotation is needed. The compiler emits a guarded unbox, then native
+<code>fmul</code> / <code>fadd</code> / <code>fcmp</code>, and a re-box
+<strong>only</strong> where a boxed value is actually observed. Inside the
+region there is no allocation, no GC interaction, and no message send at
+all &mdash; just floating-point instructions.</p>
+
+<p align="left">A few pieces make that hold together:</p>
+
+<ul>
+	<li><p align="left">a <strong>second register file</strong> &mdash;
+	unboxed floats live in <code>d0</code>&ndash;<code>d7</code> scratch plus
+	a <code>d8</code>&ndash;<code>d15</code> write-through residency tier,
+	independent of the integer register allocator. A raw <code>f64</code> is
+	invisible to the moving GC: it is never in an oop map, so the collector
+	can run underneath the loop and simply never sees it;</p></li>
+
+	<li><p align="left">a <strong>box/unbox reducer</strong> &mdash;
+	<code>FUnbox(FBox x)</code> cancels to <code>x</code>, dead boxes are
+	eliminated, and boxing that is only needed on the deopt path is
+	<em>sunk</em> there. <strong>Float-temp promotion</strong> then lifts a
+	temporary that always holds a <code>Double</code> to a raw
+	<code>f64</code> that lives across the whole loop;</p></li>
+
+	<li><p align="left">one new deopt-map kind, <strong>DoubleSlot</strong>,
+	which tells the materializer &ldquo;this stack slot is raw float bits &mdash;
+	box it back&rdquo; if we ever have to bail to the interpreter. That is what
+	lets an unboxed double survive across a method boundary that Strongtalk
+	could not cross;</p></li>
+
+	<li><p align="left"><strong>libm transcendentals</strong> &mdash;
+	<code>sin</code>, <code>cos</code>, <code>tan</code>, <code>exp</code>,
+	<code>ln</code>, <code>atan</code>, <code>sqrt</code> wired in as
+	primitives, so a real numeric kernel never has to leave the region.</p></li>
+</ul>
+
+<h3 align="left">Measured, not proposed</h3>
+
+<p align="left">The proof is the GUI's Mandelbrot demo &mdash;
+420&nbsp;&times;&nbsp;220, release build, on a fanless Apple-Silicon
+MacBook Air. Each layer above removes a whole category of cost, and you can
+watch it fall:</p>
+
+<table>
+<tr><th align="left">Stage</th><th align="right">Time</th><th align="right">Allocation / render</th></tr>
+<tr><td align="left">boxed sends (baseline)</td><td align="right">746&nbsp;ms</td><td align="right">708&nbsp;MB</td></tr>
+<tr><td align="left">pixel-buffer output</td><td align="right">458&nbsp;ms</td><td align="right">595&nbsp;MB</td></tr>
+<tr><td align="left">float-region fuse</td><td align="right">180&nbsp;ms</td><td align="right">595&nbsp;MB</td></tr>
+<tr><td align="left">sunk boxing + temp promotion</td><td align="right">166&nbsp;ms</td><td align="right">4&nbsp;MB</td></tr>
+<tr><td align="left">strength-reduced coordinates</td><td align="right">38&nbsp;ms</td><td align="right">0</td></tr>
+<tr><td align="left">d-register residency</td><td align="right">25&nbsp;ms</td><td align="right">0</td></tr>
+</table>
+
+<p align="left">That is roughly <strong>30&times; end to end</strong>, and
+the last two rows are the interesting ones: <strong>zero allocation, zero
+deopts, one scavenge-free heap per render</strong>. The inner loop touches
+neither the allocator nor the collector. There is also a hand-ported C
+version of the identical kernel, built with the same clang and taken as the
+best of thirty runs, kept as an external yardstick &mdash; and the final
+MACVM figure lands right up against it. The point is not the exact numbers;
+it is that ordinary Smalltalk float code, with no annotations, reaches the
+neighbourhood of hand-written C.</p>
+
+<p align="left">Live evaluation is real on these pages, so here is the tour's
+running proof with integers &mdash; click it and watch the Transcript:
+<a doit="Transcript showCr: 'escape radius squared = ', (2 * 2) printString">Run 2 squared</a>.
+Float arithmetic runs through exactly the same evaluator; it simply takes the
+fast path described above.</p>
+
+<h3 align="left">The widget, honestly</h3>
+
+<p align="left">A live Mandelbrot ought to render right here, inline:</p>
+
+<smappl visual="Mandelbrot extent: 420@220">
+
+<p align="left">Today that is a <strong>placeholder</strong> &mdash; the
+<code>smappl</code> tag currently draws an inert box naming the code rather
+than running it, because live widgets are still on the list of things to
+wire up. The measurements above, though, are real: they come from the same
+kernel, run for real, not from a mock-up.</p>
+
+<p align="left">The full derivation &mdash; the reducer rules, the residency
+tiers, and the <code>DoubleSlot</code> deopt map &mdash; is written up in
+<code>docs/float_fastpath_design.md</code>.</p>
+
+<h3 align="right"><a href="environment.html"><strong>Next ==&gt;</strong></a></h3>
+
+</body>
+</html>

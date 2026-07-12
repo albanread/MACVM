@@ -1,0 +1,107 @@
+<html>
+<head><title>A Tour of MACVM &mdash; Introspection &amp; Reliability</title></head>
+<body>
+
+<h3 align="right">
+<a href="toc.html">Contents</a> |
+<a href="environment.html">&lt;== Prev</a> |
+<a href="differences.html">Next ==&gt;</a></h3>
+
+<h2 align="center">Introspection &amp; Reliability</h2>
+
+<p align="left">The one lesson Strongtalk teaches most clearly is a
+negative one. It executed Smalltalk faster than anything before it, and it
+ran for perhaps ten minutes before it fell over. A fast VM that crashes is a
+<em>demo</em>; a VM you can actually work in is a <em>system</em>. That gap
+is not closed by heroics in a debugger after the fact &mdash; you can spend
+a great many enjoyable hours there and never win. It is closed by building
+so that the crash never happens, and by having the tools to prove it. That
+proof is what this page is about, and it is the real reason MACVM stands up.</p>
+
+<h3 align="left">A debugger that survives the fault</h3>
+
+<p align="left">MACVM ships a layered debugger, <code>DBG0</code> through
+<code>DBG5</code>, built for a machine where interpreted frames and compiled
+native frames are stacked on top of one another. Its features climb from
+"what happened" to "why the machine emitted this exact instruction":</p>
+
+<ul>
+	<li><p align="left">a <strong>PROBE crash dossier</strong> &mdash; on a
+	fault it captures the registers and a full <em>mixed-tier backtrace</em>,
+	walking interpreter and compiled frames as one stack. It is written to
+	<em>survive a foreign fault</em>: a wild memory access down in JIT-compiled
+	code does not take the process out silently &mdash; it hands you the
+	scene;</p></li>
+
+	<li><p align="left"><strong>breakpoints</strong> and a
+	<strong>mixed-tier backtrace</strong> you can ask for on demand, so a hot
+	compiled method and a cold interpreted one read as a single call
+	chain;</p></li>
+
+	<li><p align="left">an <strong>arm64 disassembler</strong> and
+	<strong>IR dumps</strong>, for reading the compiler's actual output &mdash;
+	the intermediate form on the way in, and the AArch64 the assembler emitted
+	on the way out;</p></li>
+
+	<li><p align="left"><strong>step-between-calls</strong>, to advance the
+	machine one send at a time across the tier boundary.</p></li>
+</ul>
+
+<h3 align="left">Tracing channels</h3>
+
+<p align="left">Below the debugger sits a set of always-available tracing
+channels, switched on through the <code>MACVM_TRACE</code> environment
+variable. Each answers a different "what is the engine doing right now"
+question, and they compose:</p>
+
+<ul>
+	<li><p align="left"><code>bytecode</code> and <code>count</code> &mdash;
+	the interpreter's fetch&ndash;decode stream, and how often each site
+	runs;</p></li>
+
+	<li><p align="left"><code>gc</code>, <code>jit</code> and
+	<code>deopt</code> &mdash; collections, compilations, and every
+	deoptimization with its reason;</p></li>
+
+	<li><p align="left"><code>dnu</code>, <code>calls</code>,
+	<code>oops</code> and <code>stats</code> &mdash; does-not-understand
+	dispatch, the call trail, object references, and a running summary.</p></li>
+</ul>
+
+<h3 align="left">The differential discipline</h3>
+
+<p align="left">All of that is instrumentation. The thing that actually
+keeps MACVM stable is a rule, and it is simple enough to state in one
+sentence: <strong>the interpreter is the oracle, and the compiler is not
+allowed to disagree with it.</strong> The simple dispatch-based interpreter
+is small enough to trust by inspection. So it is treated as the definition of
+what the program <em>means</em>, and the optimizing compiler &mdash; with all
+its inline caches, customization, inlining, deoptimization and on-stack
+replacement &mdash; is held to producing <em>byte-identical</em> output to
+it. Not "close enough". Identical.</p>
+
+<p align="left">Every JIT change is gated against that equality, and against
+<strong>GC and deoptimization stress matrices</strong> on top of it: the same
+work run while the scavenger and the full compacting collector move frames
+underneath live compiled code, and while speculation is deliberately broken
+to force deopts. A change that makes a benchmark faster but shifts a single
+bit, or that survives a normal run but not a run under moving-GC stress, does
+not land. This is unglamorous and it is the entire reason the earlier pages
+could quote their numbers without an asterisk.</p>
+
+<p align="left">You can watch the oracle answer from right here &mdash;
+clicking runs the code in the VM, and the compiler is obliged to compute the
+same thing to the bit:
+<a doit="Transcript showCr: 'interpreter and compiler must agree: ', (6 * 7) printString">Run 6 * 7</a>
+&nbsp;
+<a doit="Transcript showCr: 'sum = ', (2 + 2) printString">Run 2 + 2</a></p>
+
+<p align="left">Fast-but-crashes is a demo. A VM held bit-for-bit to a
+trusted oracle, under a collector that moves the ground beneath it, is a
+system. That is the point &mdash; and the next page sets out plainly what
+MACVM keeps from Strongtalk, what it drops, and what is new.</p>
+
+<h3 align="right"><a href="differences.html"><strong>Next ==&gt;</strong></a></h3>
+
+</body>
+</html>

@@ -1,0 +1,91 @@
+<html>
+<head><title>A Tour of MACVM &mdash; Introduction</title></head>
+<body>
+
+<h3 align="right">
+<a href="toc.html">Contents</a> |
+<a href="virtualmachine.html"><strong>Next ==&gt;</strong></a></h3>
+
+<h1 align="center">A Tour of MACVM</h1>
+
+<h4 align="left">Introduction</h4>
+
+<p align="left">MACVM is a virtual machine for Smalltalk, written from
+scratch in Rust for macOS on Apple Silicon (arm64). It is in the
+<strong>Self &rarr; Strongtalk</strong> lineage: a class-based object model
+with an <em>adaptive optimizing compiler</em> driven by type feedback. It
+runs a real object world, and it runs it fast &mdash; on the standard
+benchmarks the optimizing compiler owns essentially all of the runtime.</p>
+
+<p align="left">This page you are reading is itself a MACVM document: a plain
+HTML file, shown in a native window, extended with two live tags &mdash; a
+link that <em>executes</em> Smalltalk instead of navigating, and a tag that
+embeds a live widget inline. That is the Strongtalk "live page" idea, and it
+is where this tour comes from.</p>
+
+<h3 align="left">The system that inspired it</h3>
+
+<p align="left">Strongtalk was a fundamental redesign of Smalltalk-80,
+developed in secret at Animorphic Systems in the mid-1990s and later released
+by Sun as unsupported software. Its virtual machine executed Smalltalk far
+faster than any implementation before it, using adaptive optimization &mdash;
+run first, then recompile hot code with type feedback &mdash; the technique
+the Self group pioneered and that later became the core of Sun's production
+Java VM.</p>
+
+<p align="left">The released Strongtalk was fascinating, complex, and
+completely unstable. It ran well enough for a few minutes before crashing:
+a wonderful ten-minute demo, and unusable for anything more. It is easy to
+spend a great many enjoyable hours in a debugger trying to stabilize code
+like that and never succeed &mdash; the ideas were sound, but the artifact
+could not be made to stand up.</p>
+
+<p align="left">MACVM is the other approach. Decades later, with modern
+tooling, it is far easier to <em>re-implement</em> a design from its
+documentation than to repair the original. So MACVM is built to a large
+extent on Strongtalk's published design and its excellent documentation,
+cheating from that record wherever cheating is possible &mdash; while owing
+nothing to its source code. The bytecode interpreter and the optimizing
+compiler are new Rust; the assembler is reused from a sister project; the
+garbage collector, unavoidably, is new.</p>
+
+<h3 align="left">What this tour covers</h3>
+
+<p align="left">Like the Strongtalk tour it is modelled on, this document
+assumes you know Smalltalk and dives into the interesting parts:</p>
+
+<ul>
+	<li><p align="left">a <strong>two-tier engine</strong> &mdash; a simple
+	dispatch-based bytecode interpreter that starts instantly, and a tier-1
+	optimizing JIT that recompiles hot code with type feedback and
+	<em>deoptimizes</em> safely when its assumptions break;</p></li>
+
+	<li><p align="left"><strong>near-total compiled coverage</strong> &mdash;
+	almost every method that runs is compiled to native code, closures
+	included, and <em>stays</em> compiled;</p></li>
+
+	<li><p align="left"><strong>fast floating point</strong> that fulfils the
+	experimental promise Strongtalk sketched but never finished &mdash;
+	measured, not merely proposed;</p></li>
+
+	<li><p align="left">a <strong>garbage collector that runs underneath
+	live, moving compiled frames</strong>, which is what makes all of the
+	above safe;</p></li>
+
+	<li><p align="left">and an almost absurd level of
+	<strong>introspection and debugging</strong>, backed by extensive tests
+	&mdash; because the one lesson Strongtalk teaches most clearly is that
+	fast-but-crashes is a demo, not a system. Reliability is the whole
+	point.</p></li>
+</ul>
+
+<p align="left">A live link, to prove the "executes Smalltalk" claim from
+right here. Clicking it runs the code in the VM and prints to the
+Transcript:
+<a doit="Transcript showCr: 'Hello from the MACVM tour &mdash; 3 + 4 = ', (3 + 4) printString">Run 3 + 4</a></p>
+
+<h3 align="right"><a href="virtualmachine.html"><strong>Begin the Tour
+==&gt;</strong></a></h3>
+
+</body>
+</html>

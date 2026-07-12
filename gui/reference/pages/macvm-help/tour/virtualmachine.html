@@ -1,0 +1,114 @@
+<html>
+<head><title>A Tour of MACVM &mdash; The Virtual Machine</title></head>
+<body>
+
+<h3 align="right">
+<a href="toc.html">Contents</a> |
+<a href="intro.html">&lt;== Prev</a> |
+<a href="optimization.html">Next ==&gt;</a></h3>
+
+<h2 align="center">The Virtual Machine</h2>
+
+<p align="left">Before the clever part &mdash; the adaptive compiler on the
+next page &mdash; there has to be an object world for it to run on, and a
+garbage collector underneath that. MACVM keeps these deliberately plain,
+because everything interesting later depends on them being correct. Two
+choices here are worth dwelling on: how an object is represented, and how the
+heap is collected while compiled code is running on top of it.</p>
+
+<h3 align="left">The object model</h3>
+
+<p align="left">MACVM is <strong>class-based</strong>, in the Strongtalk
+line. Every object is an instance of a class, and behaviour lives in the
+class, not in the object. Self's prototype-and-map model &mdash; where an
+object carries its own map and clones its prototype &mdash; was evaluated and
+deliberately set aside. The class model is simpler to reason about, and it is
+what Smalltalk programmers already expect.</p>
+
+<p align="left">An object reference is a <strong>direct tagged
+pointer</strong>. The reference <em>is</em> the object's machine address, with
+information packed into its low bits &mdash; a <strong>2-bit tag</strong> that
+tells a <code>SmallInteger</code> (an <em>smi</em>, whose value rides inside
+the pointer itself) apart from an ordinary object pointer (an <em>oop</em>).
+So small integers are immediates: they never touch the heap, never allocate,
+and never trouble the collector. The arithmetic below runs entirely in tagged
+pointers &mdash; no object is created to hold the result:
+<a doit="Transcript showCr: 'no allocation here: ', (6 * 7) printString">Run 6 &times; 7</a></p>
+
+<p align="left">A heap object begins with a <strong>two-word header</strong>,
+<code>[mark][klass]</code>. The <code>mark</code> word carries the garbage
+collector's and identity bookkeeping; the <code>klass</code> word points at
+the object's class. That is the whole overhead &mdash; two words, then the
+instance's own fields.</p>
+
+<h3 align="left">Why no object table</h3>
+
+<p align="left">This is the choice that pays for itself later. Smalltalk-80
+and many classic systems place an <em>object table</em> between a reference
+and the object: every reference is an index into a table, and the table entry
+holds the real address. That indirection is genuinely convenient &mdash; it
+makes <code>become:</code> nearly free and lets the collector relocate an
+object by rewriting a single table slot. But it charges a memory indirection
+on <em>every</em> field access, forever.</p>
+
+<p align="left">MACVM has <strong>no object table</strong>. A pointer is the
+address, so reading a field is a single load. The bill for that speed comes
+due in exactly one place: when the collector moves an object, there is no
+table slot to patch &mdash; it must find and rewrite <em>every</em> pointer to
+that object, wherever it lives. That is the hard part, and it is where the
+next section goes.</p>
+
+<h3 align="left">The garbage collector</h3>
+
+<p align="left">There are two collectors, of a familiar shape. A
+<strong>generational scavenge</strong> handles the young generation, on the
+usual bet that most objects die young; a <strong>full compacting
+collector</strong> sweeps and compacts the whole heap when it must. Nothing
+exotic in the algorithms themselves. The interesting engineering is
+<em>when</em> they are allowed to run.</p>
+
+<p align="left">Both of them run <strong>underneath live, moving compiled
+frames</strong>. This is the sentence that matters. When the optimizing
+compiler has native code on the stack, that code is holding <code>oop</code>s
+in registers and stack slots for speed. If the collector then relocates the
+objects those references point at &mdash; and a compacting collector relocates
+almost everything &mdash; every one of those live references, down in the CPU
+registers of a running method, has to be found and updated. Precisely. Miss
+one, or mistake a raw integer for a pointer, and the system dies.</p>
+
+<h3 align="left">Collecting underneath live, moving code</h3>
+
+<p align="left">Two mechanisms make that safe:</p>
+
+<ul>
+	<li><p align="left"><strong>Precise oop-maps.</strong> At every safepoint
+	where a collection can happen, the compiler has recorded exactly which
+	registers and stack slots hold <code>oop</code>s and which hold raw
+	non-pointer bits. The collector reads that map, so it updates real
+	references and never touches a raw integer.</p></li>
+
+	<li><p align="left">A <strong>mixed-tier frame walker.</strong> A real
+	stack is not uniform &mdash; it interleaves interpreter frames with
+	compiled frames from possibly different methods and tiers. The walker
+	understands the whole mixture and visits the roots in each frame correctly,
+	whichever tier produced it.</p></li>
+</ul>
+
+<p align="left">The payoff is precisely the freedom the optimizer needs: it
+is <strong>safe for compiled code to keep values in registers across a GC
+safepoint</strong>. Without precise maps you would have to spill every live
+value to a fixed format before any collection, or forbid the collector from
+running in the middle of a method at all &mdash; and either one throws away
+the register residency that makes native code fast. With them, hot values stay
+in registers <em>and</em> the collector is free to move the heap out from
+under a running method. The plain object model up top is what lets these two
+pieces stay honest about what is and isn't a pointer.</p>
+
+<p align="left">That is the foundation. The next page is what stands on it:
+the adaptive compiler that fills those registers, and how it gives them up
+again &mdash; safely &mdash; when a speculation turns out to be wrong.</p>
+
+<h3 align="right"><a href="optimization.html"><strong>Next ==&gt;</strong></a></h3>
+
+</body>
+</html>

@@ -16,6 +16,15 @@ The plan of record is [`PLAN.md`](PLAN.md). Reference material copied from
 | `reference/pages/tour/` | The full Strongtalk tour — written *for* the Strongtalk HTML browser, so it doubles as a rendering/behavior test corpus (live embedded outliners, doit links, toolbar documentation) |
 | `assets/` | Processed assets that ship with the MACVM GUI (populated during implementation) |
 
+MACVM's **own** in-app documentation — written for this system, not copied
+from Strongtalk — lives under
+[`reference/pages/macvm-help/`](reference/pages/macvm-help/): a
+[MACVM tour](reference/pages/macvm-help/tour/toc.html) modelled on the
+Strongtalk tour above but describing MACVM's real design and measured
+results, plus GUI-shell/architecture/toolbar help. It is reached from the
+start page's "Browse Documentation" link, and its `doit` links execute in the
+embedded VM for real.
+
 Two HTML extensions define the "live page" model (see any page in
 `reference/pages/`):
 

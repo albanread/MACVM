@@ -1,0 +1,98 @@
+<html>
+<head><title>A Tour of MACVM &mdash; The Programming Environment</title></head>
+<body>
+
+<h3 align="right">
+<a href="toc.html">Contents</a> |
+<a href="fastfloats.html">&lt;== Prev</a> |
+<a href="debugging.html">Next ==&gt;</a></h3>
+
+<h2 align="center">The Programming Environment</h2>
+
+<p align="left">The window you are reading this in is the whole environment.
+It is a native Cocoa <code>NSWindow</code> holding a single
+<code>WKWebView</code>, and nothing else. Only the top menu bar is native
+AppKit; the toolbar across the top and the status bar along the bottom are
+plain HTML, injected into every page as it loads. So a "screen" in MACVM is
+just an HTML document &mdash; like this one &mdash; and the environment is
+the set of documents you can navigate between, edit, and run.</p>
+
+<p align="left">This is Strongtalk's live-page idea, kept almost verbatim.
+A document is static HTML until you reach for one of two extension tags,
+and then it becomes live.</p>
+
+<h3 align="left">The two live tags</h3>
+
+<p align="left">The first is <code>&lt;a doit="..."&gt;</code>. It looks like
+an ordinary link, but instead of navigating it hands its Smalltalk source to
+the embedded VM and evaluates it &mdash; for real, on the same object world
+you are running. This one is fully wired. Here it is doing arithmetic and
+printing to the Transcript:</p>
+
+<ul>
+	<li><p align="left"><a doit="Transcript showCr: (6 * 7) printString">Show
+	6 * 7</a> &mdash; evaluates <code>6 * 7</code> and writes the answer to
+	the Transcript.</p></li>
+
+	<li><p align="left"><a doit="Transcript showCr: 'sum = ', (2 + 2) printString">Show
+	a labelled sum</a> &mdash; string concatenation with <code>,</code> around
+	a real integer result.</p></li>
+</ul>
+
+<p align="left">There is no compile step you have to think about: the
+optimizing compiler is underneath every one of these, so a hot doit is
+native code just like everything else. A doit is the smallest unit of live
+programming in the system &mdash; a link that is also a workspace.</p>
+
+<p align="left">The second tag is <code>&lt;smappl visual="..."&gt;</code>,
+which is meant to embed a live widget inline in the page &mdash; a button, a
+field, a small view built from Smalltalk. <strong>Be warned:</strong> today
+this is only a placeholder. It renders as an inert, lowered-bevel box naming
+the code it <em>would</em> run; the VM does not yet evaluate it. Here is one,
+honestly labelled as such:</p>
+
+<smappl visual="Button label: 'Click me' action: [Transcript showCr: 'clicked']">
+
+<p align="left">When live <code>smappl</code> lands, that box becomes a real
+button wired to that block. For now it is a promissory note, and the tour
+will not pretend otherwise.</p>
+
+<h3 align="left">The class browser</h3>
+
+<p align="left">The browser is wired, and it is where real work happens. You
+pick a package, then a class, then a method, and its source appears in an
+editable pane. Change the source, accept it, and the method is
+<em>live-compiled</em> into the running world &mdash; the next send goes to
+your new code, with the adaptive compiler recompiling it as it heats up, and
+any stale optimized code deoptimized out from under itself so nothing runs a
+version that no longer exists.</p>
+
+<p align="left">Crucially, that edit does not vanish when you quit. It is
+persisted to the image store, so the world you build stays built.</p>
+
+<h3 align="left">The image store, and booting from it</h3>
+
+<p align="left">The image store is a SQLite database that holds the object
+world as editable rows &mdash; classes, methods, source. You can edit it
+offline, outside a running VM, which is a genuinely useful thing to be able
+to do to a Smalltalk image. On startup a DB&rarr;VM boot loader reconstructs
+the live world from that database, and it does so <em>byte-identically</em>
+to booting from a classic <code>.mst</code> source image &mdash; verified by
+a differential test, not by hope. The database is the source of truth, and
+the browser is one live editor onto it.</p>
+
+<h3 align="left">Themes</h3>
+
+<p align="left">The native <strong>Theme</strong> menu restyles the whole
+environment without touching a single page. <strong>Classic</strong> is the
+period-accurate Strongtalk look &mdash; pixel icons, Win95-style bevels.
+<strong>Hi-Def</strong> is a flat, modern skin. There are others besides
+&mdash; dark, Squeak, CRT green and amber, an Alto-style monochrome. Every
+theme is just a stylesheet swapped into the same <code>WKWebView</code>, and
+every one renders these exact same pages. The content is HTML; the look is a
+menu choice.</p>
+
+<h3 align="right"><a href="debugging.html"><strong>Next ==&gt;</strong></a></h3>
+
+</body>
+</html>
