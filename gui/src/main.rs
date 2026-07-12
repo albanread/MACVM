@@ -1402,6 +1402,33 @@ extern "C" fn restart_vm_thread(_this: Id, _cmd: Sel, _sender: Id) {
     }
 }
 
+/// The Demos menu's "Catcher" item: open the native game pane and start the
+/// Catcher demo game (`world/44_catcher.mst`). Same path as the
+/// `MACVM_GAMEPANE_DEMO` launch trigger.
+extern "C" fn run_catcher_demo(_this: Id, _cmd: Sel, _sender: Id) {
+    open_game_pane();
+    if let Some(vm) = VM.get() {
+        vm.submit(vm_host::VmRequest::Doit {
+            code: "Catcher launch.".to_string(),
+        });
+    }
+}
+
+/// Target object for the Demos menu's items — not stored long-term (same
+/// reasoning as `build_vm_delegate`: `alloc_init`'s retain keeps it alive for
+/// the app's lifetime).
+fn build_demos_delegate() -> Id {
+    let cls = objc::allocate_class(objc::get_class("NSObject"), "MacvmDemosDelegate");
+    objc::add_method(
+        cls,
+        sel("runCatcherDemo:"),
+        run_catcher_demo as *const _,
+        "v@:@",
+    );
+    objc::register_class(cls);
+    objc::alloc_init("MacvmDemosDelegate")
+}
+
 /// Target object for the VM menu's item — same not-stored-long-term
 /// reasoning as `build_theme_delegate`.
 fn build_vm_delegate() -> Id {
@@ -1753,6 +1780,13 @@ fn build_menu_bar() {
     objc::send1_id(restart_item, sel("setTarget:"), vm_delegate);
     let vm_menu = submenu("VM", &[restart_item]);
 
+    // The Demos menu: launch a Smalltalk demo game in the native game pane
+    // (docs/gamepane_design.md).
+    let demos_delegate = build_demos_delegate();
+    let catcher_item = menu_item("Catcher — catch the coin (← →)", Some("runCatcherDemo:"), "");
+    objc::send1_id(catcher_item, sel("setTarget:"), demos_delegate);
+    let demos_menu = submenu("Demos", &[catcher_item]);
+
     let theme_menu = build_theme_menu();
     let help_delegate = build_help_delegate();
     let help_item = menu_item("MACVM GUI Shell Help", Some("openMacvmHelp:"), "");
@@ -1761,7 +1795,7 @@ fn build_menu_bar() {
 
     let main_menu = objc::alloc_init("NSMenu");
     for &item in &[
-        app_menu, file_menu, edit_menu, vm_menu, theme_menu, help_menu,
+        app_menu, file_menu, edit_menu, vm_menu, demos_menu, theme_menu, help_menu,
     ] {
         objc::send1_id(main_menu, sel("addItem:"), item);
     }

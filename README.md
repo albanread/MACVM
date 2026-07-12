@@ -79,6 +79,13 @@ allocating. See [`docs/PERF.md`](docs/PERF.md) for the arc and methodology.
   Strongtalk-style environment that runs the language on a dedicated thread and
   survives a guest-thread crash ([`docs/vm_handle.md`](docs/vm_handle.md),
   [`gui/PLAN.md`](gui/PLAN.md)).
+- **Game engine** — a native Metal game pane driven entirely from Smalltalk: an
+  8-bit indexed drawing surface, retained GPU sprites, a 60 fps frame loop with
+  keyboard input, and sound effects + ABC-notation music through AVFoundation,
+  via the [MacGamePane](https://github.com/albanread/MacGamePane) engine
+  ([`docs/gamepane_design.md`](docs/gamepane_design.md)). `Catcher`
+  ([`world/44_catcher.mst`](world/44_catcher.mst)) is a small playable game
+  written in Smalltalk — open it from the GUI's **Demos** menu.
 - **Scripting** — an embedded RUSTTCL console for driving the VM and its
   debugger ([`docs/RUSTTCL.md`](docs/RUSTTCL.md)).
 
