@@ -31,3 +31,10 @@ image_store = { path = "../image_store" }
 # The real VM (SPEC A18/§16.2) — VmHandle/eval/TranscriptSink for the
 # Workspace's Doit/WorkspacePrintIt (S21 step 3).
 macvm = { path = ".." }
+# MacGamePane game engine (docs/gamepane_design.md). The GUI crate owns AppKit,
+# so the native Metal game pane is built in here. Path dep to the sibling repo
+# for the M0 coupling proof (a vendor-vs-path decision is deferred — §6). `metal`
+# is a NEW MACVM dependency, pinned to 0.33 to match MacGamePane's boundary types
+# (metal::Device / CommandBufferRef / TextureRef) so the handles type-match.
+macgamepane-graphics = { path = "../../MacGamePane/graphics" }
+metal = "0.33"
