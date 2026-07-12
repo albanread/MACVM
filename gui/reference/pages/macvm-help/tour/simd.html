@@ -1,0 +1,116 @@
+<html>
+<head><title>A Tour of MACVM &mdash; SIMD Vector Arithmetic</title></head>
+<body>
+
+<h3 align="right">
+<a href="toc.html">Contents</a> |
+<a href="fastfloats.html">&lt;== Prev</a> |
+<a href="environment.html"><strong>Next ==&gt;</strong></a></h3>
+
+<h2 align="center">SIMD Vector Arithmetic</h2>
+
+<p align="left">The previous page took a single <code>Double</code> out of its
+box and did the arithmetic in a register. SIMD is that same idea one register
+width up. The Apple Silicon NEON unit works on 128-bit vectors &mdash; two
+64-bit lanes, or four 32-bit lanes &mdash; and a single instruction operates on
+every lane at once. MACVM exposes that directly: a value that <em>is</em> a
+bundle of lanes, whole-vector arithmetic on it, and the same operations streamed
+over arrays.</p>
+
+<h3 align="left">Vector values</h3>
+
+<p align="left">A small family of <strong>immutable value classes</strong>, one
+per 128-bit NEON arrangement:</p>
+
+<ul>
+	<li><p align="left"><code>Float64x2</code> &mdash; two 64-bit floats
+	(<code>.2d</code>);</p></li>
+	<li><p align="left"><code>Float32x4</code> &mdash; four 32-bit floats
+	(<code>.4s</code>);</p></li>
+	<li><p align="left"><code>Int32x4</code> &mdash; four 32-bit integers
+	(<code>.4s</code>); arithmetic wraps on 32-bit overflow, and there is no
+	vector integer divide.</p></li>
+</ul>
+
+<p align="left">Each is a fixed 16-byte value object whose body the garbage
+collector never scans &mdash; exactly the treatment a boxed <code>Double</code>
+already gets, just eight bytes wider. It is boxed at rest (128 bits will not fit
+in a 64-bit tagged word) and register-resident only inside a compiled region.
+The protocol reads the way you would hope:</p>
+
+<ul>
+	<li><p align="left"><code>Float32x4 splat: 1.5</code> &mdash; broadcast one
+	value to all four lanes; <code>Float32x4 x: 1.0 y: 2.0 z: 3.0 w: 4.0</code>
+	&mdash; a lane constructor.</p></li>
+	<li><p align="left"><code>v1 + v2</code>, <code>v1 * v2</code>,
+	<code>v1 min: v2</code>, <code>v1 sqrt</code> &mdash; elementwise, one NEON
+	instruction each.</p></li>
+	<li><p align="left"><code>v1 at: 2</code> &mdash; extract a lane;
+	<code>v1 sum</code>, <code>v1 dot: v2</code> &mdash; horizontal
+	reductions.</p></li>
+</ul>
+
+<p align="left">When the inline cache at an arithmetic send has only ever seen
+one vector class, the compiler fuses the whole send &mdash; guard, unbox with a
+single <code>ldr&nbsp;q</code>, the native <code>fadd</code>/<code>fmul</code>
+over the arrangement, and the re-box &mdash; into a short straight run of NEON.
+It measures roughly <strong>13&ndash;15&times; over the interpreter</strong>.</p>
+
+<h3 align="left">Honest about the lanes</h3>
+
+<p align="left">Elementwise operations keep the same parity discipline as the
+scalar float path. Lane <em>i</em> of <code>Float64x2 + Float64x2</code> is
+exactly <code>Double + Double</code> for lane <em>i</em>, so a four-wide
+<code>Float32x4 +</code> is bit-identical to four scalar
+<code>Float32 +</code>s. The goldens stay sharp, and (as with the scalar
+fast-multiply-add decision) elementwise ops deliberately use the non-fused
+instructions so the per-lane result never rounds differently.</p>
+
+<p align="left">Reductions are the one place where honesty is required.
+Combining lanes with a pairwise tree reorders the additions, and floating-point
+addition is <em>not</em> associative &mdash; so a floating <code>sum</code> is
+not bit-identical to a sequential left-fold. MACVM does not pretend otherwise: a
+reduction is its <em>own</em> operation with a <strong>defined lane-combination
+order</strong> (verified against that definition, not against a scalar loop),
+and a separate <code>sequentialSum</code> is available when the exact scalar
+result is what you need. Integer reductions have no such caveat &mdash; integer
+addition is associative, so <code>Int32x4 sum</code> is exact regardless of
+order.</p>
+
+<h3 align="left">Streaming over arrays</h3>
+
+<p align="left">Above the individual vectors sits <code>FloatArray</code>: a
+contiguous, GC-skip buffer of floats, and a set of <strong>bulk kernels</strong>
+that run whole-array operations as NEON loops &mdash; <code>a +@ b</code>
+(elementwise sum), <code>a scale: k</code>, <code>a dot: b</code>,
+<code>a sum</code>, <code>a max</code>, <code>a min</code>. These are written as
+explicit NEON intrinsics, on purpose: a bulk kernel should drive the silicon
+deliberately, not be a scalar loop left to an optimizer to maybe vectorize
+&mdash; MACVM has its own compiler and does not hope. Because the whole loop is
+a single primitive, the interpreter and the JIT run the identical code.</p>
+
+<h3 align="left">Where it pays</h3>
+
+<p align="left">The vector path drops straight in wherever the work is
+lane-independent: array add, multiply and scale, dot products, colour-matrix and
+coordinate transforms, DSP filters, and packing a pixel buffer four pixels at a
+time. It does <em>not</em> drop in where the control flow is data-dependent
+&mdash; the Mandelbrot <em>escape</em> loop, for instance, has a per-pixel trip
+count, so doing four pixels at once needs a lane mask that retires escaped lanes
+one at a time. That is a genuine algorithm rewrite, not a free win, and it is
+left as an advanced path rather than pretended into the value model here.</p>
+
+<p align="left">A live link &mdash; the arithmetic here is ordinary, but the
+theme is not: a <code>Float32x4</code> is four thirty-two-bit lanes, so
+<a doit="Transcript showCr: 'Float32x4 is 4 lanes of 32 bits = ', (4 * 32) printString, ' bits, done at once'">count the bits</a>.</p>
+
+<p align="left">SIMD is still growing &mdash; keeping a vector live in a register
+across several operations, vector-slot deoptimization, wider integer types, and
+teaching the compiler to vectorize ordinary <code>1 to: n do:</code> loops are
+all future work. The full design, and what is shipped versus deferred, is in
+<code>docs/SIMD.md</code>.</p>
+
+<h3 align="right"><a href="environment.html"><strong>Next ==&gt;</strong></a></h3>
+
+</body>
+</html>
