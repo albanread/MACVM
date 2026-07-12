@@ -1,4 +1,4 @@
-# MACVM
+# MACVM inspired by StrongTalk
 
 ## Motivation
 
@@ -8,20 +8,18 @@ This is the most complex compiler project here in my repos, and like the other
 projects, it may take a while before it is turned into a useful system.
 
 This is not a history lesson, it just my experience.
-Strongtalk was released first as interesting documentation, which I really enjoyed reading, 
-then as full c++ source code, at the time it was able to execute Smalltalk at high
-speed, the repo that was released was fascinating, complex and completely unstable. 
+Strongtalk was released to the public first (2002) as interesting documentation, which I really enjoyed reading, 
+then as full c++ source code; at the time it was able to execute Smalltalk at high
+speed, and the repo that was released was fascinating, ambitious, and richly engineered.
 
-It operated well enough to run for a few minutes before crashing, so it might have worked as a ten minute demo, but was totally unusable. 
-I wasted a lot of enjoyable time with a debugger attempting to debug and stabilize it, which I was never able to do.
+I spent many enjoyable hours exploring it, and came away impressed by the design. Strongtalk — and Self before it — pioneered adaptive optimization: polymorphic inline caches, type feedback, and deoptimization, the ideas that went on to power the Java HotSpot VM. On top of that, Strongtalk added an optional static type system and a live, hypertext programming environment. There is a great deal of brilliant engineering there to learn from and build on.
 
-Decades later software technology and AI has made life far simpler, it is much easier to write compilers now, and I typically find re-implementation is much easier than trying to get any original broken code to work.
+Decades later software technology and AI have made life far simpler, it is much easier to write compilers now, and I find re-implementing a strong, well-documented design one of the most rewarding ways to work.
 
-So the compiler here is a project based to a large extent on the design and documentation of Strongtalk, I am cheating to the maximum extent possible, the bytecode interpeter and compiler are written in rust, my assembler is reused in the compiler, the gc unfortunately has to be new. 
+So the compiler here is a project based to a large extent on the design and documentation of Strongtalk, I am cheating to the maximum extent possible, the bytecode interpreter and compiler are written in rust, my assembler is reused in the compiler, the gc unfortunately has to be new. 
 This compiler also has the almost absurd level of introspection and debugging needed to create something this complex, and extensive tests, which I hope will lead to reliability.
 
 --
-
 
 A research virtual machine for macOS on Apple Silicon (arm64), in the
 **Self → Strongtalk** lineage: a **class-based object model** with an
@@ -86,9 +84,10 @@ allocating. See [`docs/PERF.md`](docs/PERF.md) for the arc and methodology.
 
 ### Fast floating point
 
-Strongtalk's tour promised "fast floats" — eliminating the allocation for
-intermediate results within a method. MACVM implements that promise in the
-tier-1 JIT as **float regions**: a mono-`Double` send site (the inline cache
+Strongtalk's tour introduced the idea of "fast floats" — eliminating the
+allocation for intermediate results within a method — and sketched an
+experimental scheme for it. MACVM builds that idea out fully in the tier-1
+JIT as **float regions**: a mono-`Double` send site (the inline cache
 is the type oracle) compiles to a guarded unbox, native `fmul`/`fadd`/`fcmp`,
 and a box only where a boxed value is actually observed. Inside a region there
 is **no allocation, no GC interaction, and no message send — just assembler

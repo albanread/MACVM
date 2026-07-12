@@ -33,16 +33,18 @@ run first, then recompile hot code with type feedback &mdash; the technique
 the Self group pioneered and that later became the core of Sun's production
 Java VM.</p>
 
-<p align="left">The released Strongtalk was fascinating, complex, and
-completely unstable. It ran well enough for a few minutes before crashing:
-a wonderful ten-minute demo, and unusable for anything more. It is easy to
-spend a great many enjoyable hours in a debugger trying to stabilize code
-like that and never succeed &mdash; the ideas were sound, but the artifact
-could not be made to stand up.</p>
+<p align="left">There is a great deal to admire in it beyond raw speed.
+Strongtalk paired that adaptive optimizer with the first workable
+<em>optional</em> static type system for Smalltalk &mdash; typed where you
+want it, untyped where you do not, with no cost to performance either way
+&mdash; and with a live, hypertext programming environment, the very idea
+these pages are built on. Its object model &mdash; classes with direct
+pointers and no object table &mdash; is the one MACVM adopts. It is a deep
+well of good ideas.</p>
 
-<p align="left">MACVM is the other approach. Decades later, with modern
-tooling, it is far easier to <em>re-implement</em> a design from its
-documentation than to repair the original. So MACVM is built to a large
+<p align="left">MACVM is a fresh take on that design. Decades later, with
+modern tooling, re-implementing a well-documented design in a modern
+language is a rewarding way to work. So MACVM is built to a large
 extent on Strongtalk's published design and its excellent documentation,
 cheating from that record wherever cheating is possible &mdash; while owing
 nothing to its source code. The bytecode interpreter and the optimizing
@@ -74,9 +76,9 @@ assumes you know Smalltalk and dives into the interesting parts:</p>
 
 	<li><p align="left">and an almost absurd level of
 	<strong>introspection and debugging</strong>, backed by extensive tests
-	&mdash; because the one lesson Strongtalk teaches most clearly is that
-	fast-but-crashes is a demo, not a system. Reliability is the whole
-	point.</p></li>
+	&mdash; because a virtual machine you can trust for real work has to be
+	dependable as well as fast. Reliability is treated here as a
+	first-class goal.</p></li>
 </ul>
 
 <p align="left">A live link, to prove the "executes Smalltalk" claim from

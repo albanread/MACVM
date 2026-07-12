@@ -9,17 +9,18 @@
 
 <h2 align="center">Fast Floating Point</h2>
 
-<p align="left">The introduction promised a page that <em>finishes</em>
-something. This is it. Strongtalk shipped an experimental fast-float scheme
-and was honest that it was unfinished: it leaned on a special
-<code>&lt;FloatVal&gt;</code> annotation that was <strong>never integrated
-with the type system</strong>, it made the programmer write the box and
-unbox by hand, and it could not carry an unboxed double <strong>across a
-method boundary</strong>. A sketch of the right idea, left on the bench.</p>
+<p align="left">This page is about carrying one of Strongtalk's ideas all
+the way through. Strongtalk introduced an experimental fast-float scheme and
+was clear about where it stopped: it used a special
+<code>&lt;FloatVal&gt;</code> annotation, kept separate from the type
+system; the programmer wrote the box and unbox by hand; and an unboxed
+double could not travel <strong>across a method boundary</strong>. It was
+exactly the right idea, and an early sketch of it &mdash; the kind of
+groundwork that makes the finished version possible.</p>
 
-<p align="left">MACVM finishes it, and does so without asking the programmer
-for anything. There is no annotation. You write ordinary Smalltalk float
-arithmetic; the compiler does the rest.</p>
+<p align="left">MACVM builds it out, and does so without asking the
+programmer for anything. There is no annotation. You write ordinary
+Smalltalk float arithmetic; the compiler does the rest.</p>
 
 <h3 align="left">Float regions</h3>
 
@@ -52,8 +53,8 @@ all &mdash; just floating-point instructions.</p>
 	<li><p align="left">one new deopt-map kind, <strong>DoubleSlot</strong>,
 	which tells the materializer &ldquo;this stack slot is raw float bits &mdash;
 	box it back&rdquo; if we ever have to bail to the interpreter. That is what
-	lets an unboxed double survive across a method boundary that Strongtalk
-	could not cross;</p></li>
+	lets an unboxed double travel freely across a method boundary &mdash; the
+	step that carries the original idea past where it first stopped;</p></li>
 
 	<li><p align="left"><strong>libm transcendentals</strong> &mdash;
 	<code>sin</code>, <code>cos</code>, <code>tan</code>, <code>exp</code>,

@@ -9,14 +9,14 @@
 
 <h2 align="center">Introspection &amp; Reliability</h2>
 
-<p align="left">The one lesson Strongtalk teaches most clearly is a
-negative one. It executed Smalltalk faster than anything before it, and it
-ran for perhaps ten minutes before it fell over. A fast VM that crashes is a
-<em>demo</em>; a VM you can actually work in is a <em>system</em>. That gap
-is not closed by heroics in a debugger after the fact &mdash; you can spend
-a great many enjoyable hours there and never win. It is closed by building
-so that the crash never happens, and by having the tools to prove it. That
-proof is what this page is about, and it is the real reason MACVM stands up.</p>
+<p align="left">A virtual machine you can trust for real work has to be
+dependable as well as fast &mdash; and dependability does not come from
+heroics in a debugger after the fact. It comes from building so that
+failures are caught early, and from having the tools to prove the machine is
+behaving. That proof is what this page is about, and MACVM invests heavily
+in it. Self and Strongtalk were pioneers of deep, live introspection into a
+running system; MACVM carries that spirit into its own tooling and leans on
+it hard.</p>
 
 <h3 align="left">A debugger that survives the fault</h3>
 
@@ -96,9 +96,9 @@ same thing to the bit:
 &nbsp;
 <a doit="Transcript showCr: 'sum = ', (2 + 2) printString">Run 2 + 2</a></p>
 
-<p align="left">Fast-but-crashes is a demo. A VM held bit-for-bit to a
-trusted oracle, under a collector that moves the ground beneath it, is a
-system. That is the point &mdash; and the next page sets out plainly what
+<p align="left">A VM held bit-for-bit to a trusted oracle, under a collector
+that moves the ground beneath it, is a machine you can build on with
+confidence. That is the goal &mdash; and the next page sets out plainly what
 MACVM keeps from Strongtalk, what it drops, and what is new.</p>
 
 <h3 align="right"><a href="differences.html"><strong>Next ==&gt;</strong></a></h3>
