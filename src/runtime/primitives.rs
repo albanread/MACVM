@@ -938,12 +938,68 @@ pub static PRIMITIVES: &[PrimDesc] = &[
         can_allocate: true,
         can_fail: true,
     },
-    // --- game group (docs/gamepane_design.md M3): id block 200+ ---
+    // --- game group (docs/gamepane_design.md): id block 200+ ---
     PrimDesc {
         id: 200,
         name: "GamePane>>clearR:g:b:",
         f: prim_game_clear,
         argc: 3,
+        can_allocate: false,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 201,
+        name: "GamePane>>paletteAt:r:g:b:",
+        f: prim_game_palette,
+        argc: 4,
+        can_allocate: false,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 202,
+        name: "GamePane>>cls:",
+        f: prim_game_cls,
+        argc: 1,
+        can_allocate: false,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 203,
+        name: "GamePane>>point:y:color:",
+        f: prim_game_pset,
+        argc: 3,
+        can_allocate: false,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 204,
+        name: "GamePane>>line:y:to:y:color:",
+        f: prim_game_line,
+        argc: 5,
+        can_allocate: false,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 205,
+        name: "GamePane>>fill:y:width:height:color:",
+        f: prim_game_fillrect,
+        argc: 5,
+        can_allocate: false,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 206,
+        name: "GamePane>>disc:y:radius:color:",
+        f: prim_game_disc,
+        argc: 4,
+        can_allocate: false,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 207,
+        name: "GamePane>>present",
+        f: prim_game_present,
+        argc: 0,
         can_allocate: false,
         can_fail: true,
     },
@@ -956,28 +1012,126 @@ pub fn prim_by_id(id: u16) -> Option<&'static PrimDesc> {
         .map(|i| &PRIMITIVES[i])
 }
 
-// --- game group (docs/gamepane_design.md M3) --------------------------------
+// --- game group (docs/gamepane_design.md, id block 200+) --------------------
+//
+// Each primitive validates its Smalltalk SmallInt arguments, then emits a
+// `GameCommand` over `vm.game_sink` and returns the receiver (`self`). A bad
+// argument fails the primitive so the Smalltalk fallback (`^self`) runs — no
+// value ever reaches an `assert!`-panicking engine setter. A headless VM (no
+// sink installed) silently drops the command.
 
-/// Extract a Smalltalk `SmallInt` argument as a `0..=255` colour byte, or
-/// `None` (which fails the primitive) if it is not a SmallInt in range.
+use crate::embed::GameCommand;
+
+/// A `SmallInt` argument as a `0..=255` colour/palette byte, or `None` (fail).
 fn smi_byte(oop: Oop) -> Option<u8> {
     u8::try_from(SmallInt::try_from(oop)?.value()).ok()
 }
 
-/// `GamePane>>clearR:g:b:` (primitive 200): emit a [`crate::embed::GameCommand::ClearTo`]
-/// to the native game pane. `args = [receiver, r, g, b]`, each a SmallInt in
-/// `0..=255`; out-of-range fails the primitive (the boundary validates before
-/// the value ever reaches an `assert!`-panicking engine setter). In a headless
-/// VM with no game sink installed, the command is silently dropped. Returns the
-/// receiver (`self`).
+/// A `SmallInt` argument as an `i64` coordinate, or `None` (fail).
+fn smi_i64(oop: Oop) -> Option<i64> {
+    Some(SmallInt::try_from(oop)?.value())
+}
+
+/// Emit `cmd` to the game pane if a sink is installed (else drop it).
+fn game_emit(vm: &mut VmState, cmd: GameCommand) {
+    if let Some(sink) = vm.game_sink.as_mut() {
+        sink.emit(cmd);
+    }
+}
+
+/// `clearR:g:b:` (200): clear to an opaque RGB colour and present.
 fn prim_game_clear(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     let (Some(r), Some(g), Some(b)) = (smi_byte(args[1]), smi_byte(args[2]), smi_byte(args[3]))
     else {
         return PrimResult::Fail;
     };
-    if let Some(sink) = vm.game_sink.as_mut() {
-        sink.emit(crate::embed::GameCommand::ClearTo { r, g, b });
+    game_emit(vm, GameCommand::ClearTo { r, g, b });
+    PrimResult::Ok(args[0])
+}
+
+/// `paletteAt:r:g:b:` (201): set palette entry `index` (16..=255) to RGB.
+fn prim_game_palette(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    let (Some(index), Some(r), Some(g), Some(b)) = (
+        smi_byte(args[1]),
+        smi_byte(args[2]),
+        smi_byte(args[3]),
+        smi_byte(args[4]),
+    ) else {
+        return PrimResult::Fail;
+    };
+    if index < 16 {
+        return PrimResult::Fail; // set_rgb asserts index >= 16
     }
+    game_emit(vm, GameCommand::PaletteAt { index, r, g, b });
+    PrimResult::Ok(args[0])
+}
+
+/// `cls:` (202): clear the pane to palette `index` (0..=255).
+fn prim_game_cls(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    let Some(index) = smi_byte(args[1]) else {
+        return PrimResult::Fail;
+    };
+    game_emit(vm, GameCommand::Cls { index });
+    PrimResult::Ok(args[0])
+}
+
+/// `point:y:color:` (203): plot a pixel.
+fn prim_game_pset(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    let (Some(x), Some(y), Some(index)) = (smi_i64(args[1]), smi_i64(args[2]), smi_byte(args[3]))
+    else {
+        return PrimResult::Fail;
+    };
+    game_emit(vm, GameCommand::Pset { x, y, index });
+    PrimResult::Ok(args[0])
+}
+
+/// `line:y:to:y:color:` (204): draw a line.
+fn prim_game_line(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    let (Some(x0), Some(y0), Some(x1), Some(y1), Some(index)) = (
+        smi_i64(args[1]),
+        smi_i64(args[2]),
+        smi_i64(args[3]),
+        smi_i64(args[4]),
+        smi_byte(args[5]),
+    ) else {
+        return PrimResult::Fail;
+    };
+    game_emit(vm, GameCommand::Line { x0, y0, x1, y1, index });
+    PrimResult::Ok(args[0])
+}
+
+/// `fill:y:width:height:color:` (205): fill a rectangle.
+fn prim_game_fillrect(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    let (Some(x), Some(y), Some(w), Some(h), Some(index)) = (
+        smi_i64(args[1]),
+        smi_i64(args[2]),
+        smi_i64(args[3]),
+        smi_i64(args[4]),
+        smi_byte(args[5]),
+    ) else {
+        return PrimResult::Fail;
+    };
+    game_emit(vm, GameCommand::FillRect { x, y, w, h, index });
+    PrimResult::Ok(args[0])
+}
+
+/// `disc:y:radius:color:` (206): fill a disc.
+fn prim_game_disc(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    let (Some(cx), Some(cy), Some(r), Some(index)) = (
+        smi_i64(args[1]),
+        smi_i64(args[2]),
+        smi_i64(args[3]),
+        smi_byte(args[4]),
+    ) else {
+        return PrimResult::Fail;
+    };
+    game_emit(vm, GameCommand::Disc { cx, cy, r, index });
+    PrimResult::Ok(args[0])
+}
+
+/// `present` (207): upload the CPU buffer and show the frame.
+fn prim_game_present(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    game_emit(vm, GameCommand::Present);
     PrimResult::Ok(args[0])
 }
 
@@ -2764,8 +2918,15 @@ mod tests {
             (154, "scale:"),
             (155, "max"),
             (156, "min"),
-            // game group (docs/gamepane_design.md M3)
+            // game group (docs/gamepane_design.md)
             (200, "GamePane>>clearR:g:b:"),
+            (201, "GamePane>>paletteAt:r:g:b:"),
+            (202, "GamePane>>cls:"),
+            (203, "GamePane>>point:y:color:"),
+            (204, "GamePane>>line:y:to:y:color:"),
+            (205, "GamePane>>fill:y:width:height:color:"),
+            (206, "GamePane>>disc:y:radius:color:"),
+            (207, "GamePane>>present"),
         ];
         assert_eq!(
             PRIMITIVES.len(),

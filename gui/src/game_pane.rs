@@ -194,22 +194,61 @@ pub fn render_native_frame() {
     });
 }
 
+thread_local! {
+    /// Set when a drawing command has mutated the pane since the last present,
+    /// so a whole batch of draw commands (a frame) costs one present. See
+    /// [`present_if_dirty`].
+    static DIRTY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Apply a [`macvm::embed::GameCommand`] from the VM to the on-screen native
-/// pane and present (main thread, `docs/gamepane_design.md` M3). A no-op if the
-/// pane isn't currently built/shown — the command is simply dropped, matching
+/// pane (main thread, `docs/gamepane_design.md`). Drawing commands mutate the
+/// CPU buffer only and mark the pane dirty; `Present` shows the frame. A no-op
+/// if the pane isn't currently built/shown — the command is dropped, matching
 /// the headless-VM behaviour on the core side.
 pub fn apply_command(cmd: &macvm::embed::GameCommand) {
+    use macvm::embed::GameCommand as C;
     NATIVE.with(|cell| {
         let mut slot = cell.borrow_mut();
         let Some(n) = slot.as_mut() else { return };
         match cmd {
-            macvm::embed::GameCommand::ClearTo { r, g, b } => {
+            C::PaletteAt { index, r, g, b } => n.pane.set_rgb(*index, *r, *g, *b),
+            C::Cls { index } => n.pane.cls(*index),
+            C::ClearTo { r, g, b } => {
                 // Reuse palette index 16 as the fill colour, clear FRONT to it.
                 n.pane.set_rgb(pal::BG, *r, *g, *b);
                 n.pane.cls(pal::BG);
             }
+            C::Pset { x, y, index } => n.pane.pset(*x, *y, *index),
+            C::Line {
+                x0,
+                y0,
+                x1,
+                y1,
+                index,
+            } => n.pane.line(*x0, *y0, *x1, *y1, *index),
+            C::FillRect { x, y, w, h, index } => n.pane.fill_rect(*x, *y, *w, *h, *index),
+            C::Disc { cx, cy, r, index } => n.pane.disc(*cx, *cy, *r, *index),
+            C::Present => {
+                present_native(n);
+                DIRTY.with(|d| d.set(false));
+                return;
+            }
         }
-        present_native(n);
+        DIRTY.with(|d| d.set(true));
+    });
+}
+
+/// Present the pane if any drawing has happened since the last present (main
+/// thread). Called once after each response-drain batch, so a frame's worth of
+/// draw commands with no explicit `present` still shows exactly once.
+pub fn present_if_dirty() {
+    NATIVE.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let Some(n) = slot.as_mut() else { return };
+        if DIRTY.with(|d| d.replace(false)) {
+            present_native(n);
+        }
     });
 }
 

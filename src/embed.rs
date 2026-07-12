@@ -123,13 +123,45 @@ pub trait TranscriptSink: Send {
 }
 
 /// A structured command from a game-primitive to the native game pane
-/// (`docs/gamepane_design.md` M3). The core VM defines only this vocabulary;
-/// the GUI applies each command to the real Metal pane. Deliberately small —
-/// this is the M3 vertical slice; sprite/palette/present commands follow.
+/// (`docs/gamepane_design.md`). The core VM defines only this vocabulary; the
+/// GUI applies each to the real Metal pane (`gui/src/game_pane.rs`). Drawing
+/// commands mutate the pane's CPU buffer only; `Present` uploads and shows the
+/// frame — so a whole frame's drawing costs one present, not one per op.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GameCommand {
-    /// Clear the pane to an opaque RGB colour and present it.
+    /// Set palette entry `index` (16..=255) to an opaque RGB colour.
+    PaletteAt { index: u8, r: u8, g: u8, b: u8 },
+    /// Clear the pane to palette `index` (0..=255).
+    Cls { index: u8 },
+    /// Clear the pane to an opaque RGB colour (convenience: uses palette 16).
     ClearTo { r: u8, g: u8, b: u8 },
+    /// Plot a pixel at `(x, y)` in palette `index`.
+    Pset { x: i64, y: i64, index: u8 },
+    /// Draw a line from `(x0, y0)` to `(x1, y1)` in palette `index`.
+    Line {
+        x0: i64,
+        y0: i64,
+        x1: i64,
+        y1: i64,
+        index: u8,
+    },
+    /// Fill a `w`x`h` rectangle at `(x, y)` in palette `index`.
+    FillRect {
+        x: i64,
+        y: i64,
+        w: i64,
+        h: i64,
+        index: u8,
+    },
+    /// Fill a disc of radius `r` centred at `(cx, cy)` in palette `index`.
+    Disc {
+        cx: i64,
+        cy: i64,
+        r: i64,
+        index: u8,
+    },
+    /// Upload the CPU buffer and present the frame.
+    Present,
 }
 
 /// Where game-primitive commands go — the game analogue of [`TranscriptSink`].
@@ -1120,6 +1152,46 @@ mod tests {
         assert!(
             captured.lock().unwrap().is_empty(),
             "an out-of-range colour must emit no game command"
+        );
+    }
+
+    #[test]
+    fn game_drawing_commands_reach_the_sink_in_order() {
+        struct VecGameSink(Arc<Mutex<Vec<GameCommand>>>);
+        impl GameSink for VecGameSink {
+            fn emit(&mut self, cmd: GameCommand) {
+                self.0.lock().unwrap().push(cmd);
+            }
+        }
+
+        let mut vm = boot_test_vm(JitMode::Off);
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        vm.set_game_sink(Box::new(VecGameSink(captured.clone())));
+        // A cascade (all messages to one `GamePane new`) — top-level `| temp |`
+        // declarations aren't valid in the doit dialect.
+        vm.eval(
+            "GamePane new \
+               paletteAt: 16 r: 10 g: 20 b: 30; \
+               cls: 16; \
+               point: 5 y: 7 color: 16; \
+               line: 0 y: 0 to: 9 y: 9 color: 16; \
+               fill: 1 y: 2 width: 3 height: 4 color: 16; \
+               disc: 8 y: 8 radius: 2 color: 16; \
+               present.",
+        )
+        .expect("the drawing doit must evaluate cleanly");
+        assert_eq!(
+            *captured.lock().unwrap(),
+            vec![
+                GameCommand::PaletteAt { index: 16, r: 10, g: 20, b: 30 },
+                GameCommand::Cls { index: 16 },
+                GameCommand::Pset { x: 5, y: 7, index: 16 },
+                GameCommand::Line { x0: 0, y0: 0, x1: 9, y1: 9, index: 16 },
+                GameCommand::FillRect { x: 1, y: 2, w: 3, h: 4, index: 16 },
+                GameCommand::Disc { cx: 8, cy: 8, r: 2, index: 16 },
+                GameCommand::Present,
+            ],
+            "every drawing method must reach the sink as its command, in order"
         );
     }
 

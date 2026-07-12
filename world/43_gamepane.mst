@@ -1,17 +1,54 @@
 "43_gamepane.mst — GamePane: drive the native Metal game pane from Smalltalk
- (docs/gamepane_design.md, milestone M3). Its methods speak numbered game
- primitives (the id-200+ block in src/runtime/primitives.rs) that emit
- GameCommands over the VM->GUI game channel; the GUI applies each to the native
- CAMetalLayer pane (gui/src/game_pane.rs). In a headless VM (no game sink
- installed) the primitive silently drops the command and returns self, so this
- class is harmless to load outside the GUI."
+ (docs/gamepane_design.md). Its methods speak numbered game primitives (the
+ id-200+ block in src/runtime/primitives.rs) that emit GameCommands over the
+ VM->GUI game channel; the GUI applies each to the native CAMetalLayer pane
+ (gui/src/game_pane.rs). Drawing methods mutate the pane's buffer only; the GUI
+ presents a whole batch of them (a frame) with a single flush, so `present` is
+ optional for one-shot drawing (the drain presents anything dirty).
+
+ Colour arguments are 0..255; palette index 0 is transparent, and user palette
+ entries start at 16. In a headless VM (no game sink) every primitive silently
+ fails and returns self, so this class is harmless to load outside the GUI."
 
 Object subclass: GamePane [
     clearR: r g: g b: b [
-        "Clear the native game pane to an opaque RGB colour (each 0..255) and
-         present it. Fails silently (returns self) if r/g/b are out of range or
-         no game pane is attached."
+        "Clear the pane to an opaque RGB colour (each 0..255) and present it."
         <primitive: 200>
+        ^self
+    ]
+    paletteAt: index r: r g: g b: b [
+        "Set palette entry `index` (16..255) to an opaque RGB colour."
+        <primitive: 201>
+        ^self
+    ]
+    cls: index [
+        "Clear the pane to palette `index` (0..255)."
+        <primitive: 202>
+        ^self
+    ]
+    point: x y: y color: c [
+        "Plot a pixel at (x, y) in palette colour `c`."
+        <primitive: 203>
+        ^self
+    ]
+    line: x0 y: y0 to: x1 y: y1 color: c [
+        "Draw a line from (x0, y0) to (x1, y1) in palette colour `c`."
+        <primitive: 204>
+        ^self
+    ]
+    fill: x y: y width: w height: h color: c [
+        "Fill a w x h rectangle at (x, y) in palette colour `c`."
+        <primitive: 205>
+        ^self
+    ]
+    disc: cx y: cy radius: r color: c [
+        "Fill a disc of radius `r` centred at (cx, cy) in palette colour `c`."
+        <primitive: 206>
+        ^self
+    ]
+    present [
+        "Show the frame drawn so far."
+        <primitive: 207>
         ^self
     ]
 ]

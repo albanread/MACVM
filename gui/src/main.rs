@@ -1523,6 +1523,9 @@ extern "C" fn vm_bridge_drain(_this: Id, _cmd: Sel, _arg: Id) {
             }
         }
     }
+    // A whole batch of game draw commands (a frame) presents exactly once,
+    // here, after they've all been applied to the pane (game_pane.rs).
+    game_pane::present_if_dirty();
 }
 
 /// Replace a browser pane's entire element (its `outerHTML`, not just its
