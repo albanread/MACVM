@@ -181,6 +181,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 
 [[package]]
+name = "macgamepane-audio"
+version = "0.0.0"
+dependencies = [
+ "macgamepane-objc",
+]
+
+[[package]]
 name = "macgamepane-graphics"
 version = "0.0.0"
 dependencies = [
@@ -208,6 +215,7 @@ version = "0.0.0"
 dependencies = [
  "core-graphics-types",
  "image_store",
+ "macgamepane-audio",
  "macgamepane-graphics",
  "macvm",
  "macvm-mock-vm",

@@ -184,6 +184,10 @@ pub enum GameCommand {
     },
     /// Move sprite `id`'s instance to `(x, y)`.
     MoveSprite { id: i64, x: i64, y: i64 },
+    /// Play a named SFX preset (0=coin, 1=jump, 2=zap, 3=shoot, 4=explode,
+    /// 5=powerup, 6=hurt, 7=click, 8=bang, 9=blip) on the one shared `Sfx`
+    /// engine. `Sound coin play`.
+    PlaySound { preset: u8 },
 }
 
 /// Where game-primitive commands go — the game analogue of [`TranscriptSink`].
@@ -1307,6 +1311,34 @@ mod tests {
                 GameCommand::MoveSprite { id: 1, x: 100, y: 80 },
             ],
             "define/color/move must reach the sink for the minted sprite id"
+        );
+    }
+
+    #[test]
+    fn sound_play_reaches_the_sink_from_smalltalk() {
+        struct VecGameSink(Arc<Mutex<Vec<GameCommand>>>);
+        impl GameSink for VecGameSink {
+            fn emit(&mut self, cmd: GameCommand) {
+                self.0.lock().unwrap().push(cmd);
+            }
+        }
+
+        let mut vm = boot_test_vm(JitMode::Off);
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        vm.set_game_sink(Box::new(VecGameSink(captured.clone())));
+
+        // `Sound <preset> play` reaches the sink as PlaySound{preset} — the
+        // named presets map to 0..9. (Headless: the command, not actual audio.)
+        vm.eval("Sound coin play.")
+            .expect("Sound coin play must evaluate cleanly");
+        vm.eval("Sound bang play.")
+            .expect("Sound bang play must evaluate cleanly");
+        assert_eq!(
+            *captured.lock().unwrap(),
+            vec![
+                GameCommand::PlaySound { preset: 0 }, // coin
+                GameCommand::PlaySound { preset: 8 }, // bang
+            ]
         );
     }
 

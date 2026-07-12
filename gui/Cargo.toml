@@ -37,6 +37,7 @@ macvm = { path = ".." }
 # is a NEW MACVM dependency, pinned to 0.33 to match MacGamePane's boundary types
 # (metal::Device / CommandBufferRef / TextureRef) so the handles type-match.
 macgamepane-graphics = { path = "../../MacGamePane/graphics" }
+macgamepane-audio = { path = "../../MacGamePane/audio" }
 metal = "0.33"
 # CGSize for CAMetalLayer::set_drawable_size (same version the graphics crate
 # and the metal crate already use).

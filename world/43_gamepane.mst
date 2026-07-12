@@ -149,3 +149,23 @@ Object subclass: GamePane [
     GamePane class >> keyA     [ ^4 ]
     GamePane class >> keyB     [ ^5 ]
 ]
+
+"--- Sound: a named SFX preset played on the one shared engine
+ (docs/gamepane_design.md). `Sound coin play`. ---"
+Object subclass: Sound [
+    | preset |
+    Sound class >> preset: n [ ^self new setPreset: n ]
+    Sound class >> coin    [ ^self preset: 0 ]
+    Sound class >> jump    [ ^self preset: 1 ]
+    Sound class >> zap     [ ^self preset: 2 ]
+    Sound class >> shoot   [ ^self preset: 3 ]
+    Sound class >> explode [ ^self preset: 4 ]
+    Sound class >> powerup [ ^self preset: 5 ]
+    Sound class >> hurt    [ ^self preset: 6 ]
+    Sound class >> click   [ ^self preset: 7 ]
+    Sound class >> bang    [ ^self preset: 8 ]
+    Sound class >> blip    [ ^self preset: 9 ]
+    setPreset: n [ preset := n. ^self ]
+    play [ "Play this sound." self primPlay: preset. ^self ]
+    primPlay: n [ <primitive: 213> ^self ]
+]

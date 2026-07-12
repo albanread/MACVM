@@ -241,6 +241,7 @@ pub fn apply_command(cmd: &macvm::embed::GameCommand) {
     match cmd {
         C::StartLoop => return crate::start_game_loop_timer(),
         C::StopLoop => return crate::stop_game_loop_timer(),
+        C::PlaySound { preset } => return play_sound(*preset),
         _ => {}
     }
     NATIVE.with(|cell| {
@@ -285,10 +286,66 @@ pub fn apply_command(cmd: &macvm::embed::GameCommand) {
                 DIRTY.with(|d| d.set(false));
                 return;
             }
-            C::StartLoop | C::StopLoop => unreachable!("handled before the pane check"),
+            C::StartLoop | C::StopLoop | C::PlaySound { .. } => {
+                unreachable!("handled before the pane check")
+            }
         }
         DIRTY.with(|d| d.set(true));
     });
+}
+
+// ── Audio (docs/gamepane_design.md) ─────────────────────────────────────────
+
+thread_local! {
+    /// The one shared SFX engine, created + started lazily on the main thread —
+    /// exactly one per session, since starting two `AVAudioEngine`s
+    /// concurrently aborts the process. Bit N of `DEFINED_SFX` marks preset N's
+    /// slot as already synthesized + defined.
+    static SFX: std::cell::RefCell<Option<macgamepane_audio::playback::Sfx>> =
+        const { std::cell::RefCell::new(None) };
+    static DEFINED_SFX: std::cell::Cell<u16> = const { std::cell::Cell::new(0) };
+}
+
+/// Play SFX preset `preset` (0..=9) on the one shared engine, creating and
+/// starting it on first use. A no-op if no audio device is available.
+pub fn play_sound(preset: u8) {
+    SFX.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if slot.is_none() {
+            let mut sfx = macgamepane_audio::playback::Sfx::new();
+            if !sfx.start() {
+                return; // no audio device — drop the sound silently
+            }
+            *slot = Some(sfx);
+        }
+        let sfx = slot.as_mut().unwrap();
+        // Synthesize + define each preset's slot exactly once.
+        let bit = 1u16 << preset.min(15);
+        if DEFINED_SFX.with(|d| d.get()) & bit == 0 {
+            let sound = synth_preset(preset);
+            sfx.define(preset as usize, &sound);
+            DEFINED_SFX.with(|d| d.set(d.get() | bit));
+        }
+        sfx.play(preset as usize);
+    });
+}
+
+/// Synthesize a named preset `Sound` (deterministic; some presets take an RNG).
+fn synth_preset(preset: u8) -> macgamepane_audio::synth::Sound {
+    use macgamepane_audio::synth as s;
+    let mut rng = s::Lcg::new(0x9E37_79B9 ^ preset as u32);
+    match preset {
+        0 => s::coin(0.15),
+        1 => s::jump(0.20),
+        2 => s::zap(0.30, &mut rng),
+        3 => s::shoot(0.15, &mut rng),
+        4 => s::explode(1.0, 0.50, &mut rng),
+        5 => s::powerup(0.40),
+        6 => s::hurt(0.30, &mut rng),
+        7 => s::click(0.05, &mut rng),
+        8 => s::bang(0.40, &mut rng),
+        _ => s::blip(660.0, 0.12),
+    }
 }
 
 /// Present the pane if any drawing has happened since the last present (main

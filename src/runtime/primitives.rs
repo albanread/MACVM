@@ -1043,6 +1043,14 @@ pub static PRIMITIVES: &[PrimDesc] = &[
         can_allocate: false,
         can_fail: true,
     },
+    PrimDesc {
+        id: 213,
+        name: "Sound>>primPlay:",
+        f: prim_game_play_sound,
+        argc: 1,
+        can_allocate: false,
+        can_fail: true,
+    },
 ];
 
 pub fn prim_by_id(id: u16) -> Option<&'static PrimDesc> {
@@ -1230,6 +1238,15 @@ fn prim_game_move_sprite(vm: &mut VmState, args: &[Oop]) -> PrimResult {
         return PrimResult::Fail;
     };
     game_emit(vm, GameCommand::MoveSprite { id, x, y });
+    PrimResult::Ok(args[0])
+}
+
+/// `primPlay:` (213): play SFX preset `n` (0..=9) on the shared engine.
+fn prim_game_play_sound(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    let Some(preset) = smi_byte(args[1]) else {
+        return PrimResult::Fail;
+    };
+    game_emit(vm, GameCommand::PlaySound { preset });
     PrimResult::Ok(args[0])
 }
 
@@ -3030,6 +3047,7 @@ mod tests {
             (210, "GamePane>>primDefineSprite:rows:"),
             (211, "GamePane>>primSpriteColor:index:r:g:b:"),
             (212, "GamePane>>primMoveSprite:x:y:"),
+            (213, "Sound>>primPlay:"),
         ];
         assert_eq!(
             PRIMITIVES.len(),
