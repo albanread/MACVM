@@ -410,6 +410,13 @@ pub enum VmResponse {
     SmapplOverlay {
         html: String,
     },
+    /// A live widget action asked to open a native view (a tour-page toolbar
+    /// button — `Launcher launchers anElement browseStartPage`, etc.). The action
+    /// answers a `'macvm-nav:TARGET'` marker; `main.rs` routes `target` through
+    /// the same toolbar dispatch a native toolbar click uses.
+    SmapplNavigate {
+        target: String,
+    },
     /// Internal supervisor liveness marker (S21 step 3) — NOT a UI response.
     /// The worker sends one after fully completing each request, i.e. once
     /// it is back to idle and provably still alive. `VmHost::drain_responses`
@@ -1221,7 +1228,14 @@ fn handle(
             // ChannelTranscript; a failure is echoed to the transcript like a
             // doit rather than dropped.
             match vm.fire_widget_action(&action_id) {
-                Ok(Some(html)) => vec![VmResponse::SmapplOverlay { html }],
+                // A `'macvm-nav:TARGET'` answer is a navigation request (a tour
+                // toolbar button); any other String is a modal-dialog overlay.
+                Ok(Some(answer)) => match answer.strip_prefix("macvm-nav:") {
+                    Some(target) => vec![VmResponse::SmapplNavigate {
+                        target: target.to_string(),
+                    }],
+                    None => vec![VmResponse::SmapplOverlay { html: answer }],
+                },
                 Ok(None) => vec![],
                 Err(e) => vec![VmResponse::Transcript(format!("{e}"))],
             }
@@ -2637,6 +2651,40 @@ mod tests {
         assert!(
             fired.is_empty(),
             "a clean action fire returns no error responses, got {fired:?}"
+        );
+
+        // A tour-page toolbar button (its action answers a 'macvm-nav:…' marker
+        // via the Launcher stubs) fires to a SmapplNavigate the GUI routes
+        // through its toolbar dispatch.
+        let nav = handle(
+            VmRequest::SmapplRender {
+                id: "sn".to_string(),
+                code: "Button labeled: 'H' action: [ :b | Launcher launchers anElement browseStartPage ]"
+                    .to_string(),
+            },
+            &mut world,
+            &mut selection,
+            None,
+            &mut vm,
+        );
+        let nav_html = match nav.as_slice() {
+            [VmResponse::SmapplFragment { html, .. }] => html.clone(),
+            other => panic!("expected nav button fragment, got {other:?}"),
+        };
+        let ns = nav_html.find(marker).expect("nav fragment has an action id") + marker.len();
+        let ne = nav_html[ns..].find('"').unwrap() + ns;
+        let nav_fired = handle(
+            VmRequest::SmapplAction {
+                action_id: nav_html[ns..ne].to_string(),
+            },
+            &mut world,
+            &mut selection,
+            None,
+            &mut vm,
+        );
+        assert!(
+            matches!(nav_fired.as_slice(), [VmResponse::SmapplNavigate { target }] if target == "home"),
+            "a tour toolbar button fires to a navigation request, got {nav_fired:?}"
         );
 
         // A shape that genuinely isn't built (an unknown send) renders nothing,

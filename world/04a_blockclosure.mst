@@ -27,4 +27,11 @@ Object subclass: BlockClosure [
     ifCurtailed: aBlock [
         <primitive: 61>
     ]
+    fork [
+        "Strongtalk runs the receiver on a background process. MACVM is
+         single-threaded, and the corpus's only #fork is progenv.html's
+         comment-preload sweep (a first-page-load speedup MACVM doesn't need), so
+         skip it entirely and answer self rather than block on it inline."
+        ^self
+    ]
 ]

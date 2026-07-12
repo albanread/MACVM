@@ -178,4 +178,52 @@ Object subclass: Image [
     ]
 ]
 
+"--- Environment tool stubs (gui/smappl.md §3.6 doit/action vocabulary) ---
+ The tour pages' toolbar buttons act on Strongtalk's Launcher/Workspace/
+ CodeEditor/HTMLView. MACVM has no Smalltalk UI (the environment is HTML/JS), so
+ these are thin stubs that (a) COMPILE — which is what lets the surrounding
+ `Button withImage: ... action: [ :b | Launcher launchers anElement browseStartPage ]`
+ expressions build a LIVE button instead of failing to the G0 placeholder — and
+ (b) answer a `'macvm-nav:TARGET'` marker string. When such a button is clicked,
+ the worker (vm_host SmapplAction) recognises the prefix and routes TARGET to the
+ matching native toolbar action (main.rs), so the click opens MACVM's equivalent
+ view. TARGET values are the toolbar action names: home / hierarchy /
+ userHierarchy / find / implementors / senders / workspace / documentation."
+
+"The clicked launcher element: the corpus sends it browse/open/find messages;
+ each answers the navigation marker for MACVM's matching view."
+Object subclass: LauncherElement [
+    browseStartPage [ ^'macvm-nav:home' ]
+    openClassHierarchyOutliner [ ^'macvm-nav:hierarchy' ]
+    openUserClassHierarchyOutliner [ ^'macvm-nav:userHierarchy' ]
+    findDefinition [ ^'macvm-nav:find' ]
+    findImplementors [ ^'macvm-nav:implementors' ]
+    findSenders [ ^'macvm-nav:senders' ]
+    "Strongtalk runs a find on the session process; here just evaluate the block
+     and answer its marker (`l inSessionProcessDo: [ l findImplementors ]`)."
+    inSessionProcessDo: aBlock [ ^aBlock value ]
+]
+
+"`Launcher launchers anElement` → the LauncherElement above."
+Object subclass: Launcher [
+    Launcher class >> launchers [ ^self ]
+    Launcher class >> anElement [ ^LauncherElement basicNew ]
+]
+
+"`Workspace new launch` / `CodeEditor new launch` / `HTMLView forDoc launch`."
+Object subclass: Workspace [
+    Workspace class >> new [ ^self basicNew ]
+    launch [ ^'macvm-nav:workspace' ]
+]
+
+Object subclass: CodeEditor [
+    CodeEditor class >> new [ ^self basicNew ]
+    launch [ ^'macvm-nav:workspace' ]
+]
+
+Object subclass: HTMLView [
+    HTMLView class >> forDoc [ ^self basicNew ]
+    launch [ ^'macvm-nav:documentation' ]
+]
+
 SmapplRegistry reset.

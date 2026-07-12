@@ -767,6 +767,60 @@ fn dict_get_string(dict: Id, key: &str) -> String {
     objc::string_from_nsstring(value)
 }
 
+/// Run a toolbar action by name — shared by the native toolbar buttons
+/// (`kind:"toolbar"`) and by a tour page's smappl button navigating to its
+/// MACVM equivalent (`VmResponse::SmapplNavigate`, e.g. `Launcher launchers
+/// anElement openClassHierarchyOutliner` → `hierarchy`). Action names match the
+/// `TOOLBAR_BUTTONS` data-action strings.
+fn navigate_toolbar(button: &str) {
+    match button {
+        "goBack" => {
+            if let Some(path) = NAV.get().and_then(|n| n.lock().unwrap().back()) {
+                navigate_to(&path);
+            }
+        }
+        "goForward" => {
+            if let Some(path) = NAV.get().and_then(|n| n.lock().unwrap().forward()) {
+                navigate_to(&path);
+            }
+        }
+        "home" => {
+            let home = start_page();
+            if let Some(nav) = NAV.get() {
+                nav.lock().unwrap().go(home.clone());
+            }
+            navigate_to(&home);
+        }
+        "documentation" => {
+            // The toolbar Documentation button opens MACVM's own help (which
+            // hosts the MACVM tour). The Strongtalk reference corpus is still
+            // reachable as a link from that index.
+            let doc_index = macvm_help_index();
+            if let Some(nav) = NAV.get() {
+                nav.lock().unwrap().go(doc_index.clone());
+            }
+            navigate_to(&doc_index);
+        }
+        "userHierarchy" => open_class_outliner(),
+        "find" => open_find("definition"),
+        "implementors" => open_find("implementors"),
+        "senders" => open_find("senders"),
+        "hierarchy" => open_class_browser(),
+        "workspace" => open_workspace(),
+        "canvas" => open_canvas(),
+        "refresh" => reload_current_page(),
+        "biggerText" => {
+            bump_font_scale(FONT_SCALE_STEP as i32);
+            reload_current_page();
+        }
+        "smallerText" => {
+            bump_font_scale(-(FONT_SCALE_STEP as i32));
+            reload_current_page();
+        }
+        other => append_transcript(&format!("(toolbar: {other} — not wired yet)")),
+    }
+}
+
 // ── WKScriptMessageHandler: userContentController:didReceiveScriptMessage: ─
 
 extern "C" fn on_script_message(_this: Id, _cmd: Sel, _controller: Id, message: Id) {
@@ -786,55 +840,7 @@ extern "C" fn on_script_message(_this: Id, _cmd: Sel, _controller: Id, message: 
                 vm.submit(vm_host::VmRequest::Doit { code });
             }
         }
-        "toolbar" => {
-            let button = dict_get_string(body, "button");
-            match button.as_str() {
-                "goBack" => {
-                    if let Some(path) = NAV.get().and_then(|n| n.lock().unwrap().back()) {
-                        navigate_to(&path);
-                    }
-                }
-                "goForward" => {
-                    if let Some(path) = NAV.get().and_then(|n| n.lock().unwrap().forward()) {
-                        navigate_to(&path);
-                    }
-                }
-                "home" => {
-                    let home = start_page();
-                    if let Some(nav) = NAV.get() {
-                        nav.lock().unwrap().go(home.clone());
-                    }
-                    navigate_to(&home);
-                }
-                "documentation" => {
-                    // The toolbar Documentation button opens MACVM's own help
-                    // (which hosts the MACVM tour). The Strongtalk reference
-                    // corpus is still reachable as a link from that index.
-                    let doc_index = macvm_help_index();
-                    if let Some(nav) = NAV.get() {
-                        nav.lock().unwrap().go(doc_index.clone());
-                    }
-                    navigate_to(&doc_index);
-                }
-                "userHierarchy" => open_class_outliner(),
-                "find" => open_find("definition"),
-                "implementors" => open_find("implementors"),
-                "senders" => open_find("senders"),
-                "hierarchy" => open_class_browser(),
-                "workspace" => open_workspace(),
-                "canvas" => open_canvas(),
-                "refresh" => reload_current_page(),
-                "biggerText" => {
-                    bump_font_scale(FONT_SCALE_STEP as i32);
-                    reload_current_page();
-                }
-                "smallerText" => {
-                    bump_font_scale(-(FONT_SCALE_STEP as i32));
-                    reload_current_page();
-                }
-                other => append_transcript(&format!("(toolbar: {other} — not wired yet)")),
-            }
-        }
+        "toolbar" => navigate_toolbar(&dict_get_string(body, "button")),
         "clearTranscript" => {
             // Empty the persisted history so the clear survives navigation (the
             // next page's `statusbar_html` renders from this buffer), then clear
@@ -1447,6 +1453,12 @@ extern "C" fn vm_bridge_drain(_this: Id, _cmd: Sel, _arg: Id) {
                     "if(window.macvmShowOverlay)window.macvmShowOverlay({})",
                     js_string_literal(&html)
                 ));
+            }
+            vm_host::VmResponse::SmapplNavigate { target } => {
+                // A tour page's toolbar button (Launcher/Workspace/…) — open the
+                // MACVM view its action maps to, via the same dispatch a native
+                // toolbar click uses.
+                navigate_toolbar(&target);
             }
             vm_host::VmResponse::WorkerIdle => {
                 // Never actually delivered here — `VmHost::drain_responses`
