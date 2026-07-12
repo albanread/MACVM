@@ -96,6 +96,100 @@ pub fn render_test_scene_offscreen(w: u32, h: u32) -> Option<Vec<u8>> {
     Some(buf)
 }
 
+// ── On-screen native pane (M2b) ────────────────────────────────────────────
+//
+// A layer-hosting `NSView` backed by a `CAMetalLayer`, rendered into on the
+// **main thread** — the design's rule that all Metal + all panes are
+// main-thread single-owned. The view is installed as the window's content view
+// (swapping the WKWebView out) and restored when navigating away. Mirrors
+// MacGamePane's own `GameWindow` layer wiring, minus the window (MACVM already
+// has one). Input, the VM->gui command channel, and the frame loop are later
+// milestones; this renders one static frame.
+
+use crate::objc;
+use metal::foreign_types::ForeignType;
+
+/// The live native pane: its GPU objects, its `CAMetalLayer`-hosting `NSView`,
+/// and the CPU-side `IndexedPane`. All fields are touched only on the main
+/// thread (see the module doc), so it lives in a main-thread `thread_local`.
+struct NativePane {
+    view: objc::Id,
+    device: metal::Device,
+    queue: metal::CommandQueue,
+    layer: metal::MetalLayer,
+    pane: IndexedPane,
+    w: u32,
+    h: u32,
+}
+
+thread_local! {
+    static NATIVE: std::cell::RefCell<Option<NativePane>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Build the native pane once (main thread) and return its `NSView` to install
+/// as the window content view. `None` if this Mac has no Metal device.
+pub fn ensure_native_view(w: u32, h: u32) -> Option<objc::Id> {
+    NATIVE.with(|cell| {
+        {
+            let mut slot = cell.borrow_mut();
+            if slot.is_none() {
+                let device = metal::Device::system_default()?;
+                let queue = device.new_command_queue();
+
+                let view = objc::send_frame_init(
+                    objc::send0(objc::get_class("NSView"), objc::sel("alloc")),
+                    objc::sel("initWithFrame:"),
+                    0.0,
+                    0.0,
+                    w as f64,
+                    h as f64,
+                );
+                // Layer-hosting: set our CAMetalLayer, then wantsLayer. The
+                // fixed-size drawable is upscaled by CA to fill the window.
+                let layer = metal::MetalLayer::new();
+                layer.set_device(&device);
+                layer.set_pixel_format(metal::MTLPixelFormat::BGRA8Unorm);
+                layer.set_drawable_size(core_graphics_types::geometry::CGSize::new(
+                    w as f64, h as f64,
+                ));
+                objc::send1_id(view, objc::sel("setLayer:"), layer.as_ptr() as objc::Id);
+                objc::send1_bool(view, objc::sel("setWantsLayer:"), true);
+                objc::send1_i64(view, objc::sel("setAutoresizingMask:"), 18); // width|height sizable
+
+                let mut pane = IndexedPane::new(&device, w, h, w, h).ok()?;
+                load_test_palette(&mut pane);
+
+                // `device` is moved in last; every borrow of it above is done.
+                *slot = Some(NativePane { view, device, queue, layer, pane, w, h });
+            }
+        }
+        cell.borrow().as_ref().map(|n| n.view)
+    })
+}
+
+/// Draw the test scene into the layer's next drawable and present (main thread).
+/// A no-op if the native pane hasn't been built or no drawable is ready.
+pub fn render_native_frame() {
+    NATIVE.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let Some(n) = slot.as_mut() else { return };
+        draw_test_scene(&mut n.pane, n.w as i64, n.h as i64);
+        n.pane.upload();
+        let Some(drawable) = n.layer.next_drawable() else { return };
+        let cb = n.queue.new_command_buffer();
+        n.pane
+            .render(cb, drawable.texture(), metal::MTLLoadAction::Clear);
+        cb.present_drawable(drawable);
+        cb.commit();
+    });
+}
+
+/// The pane's logical resolution (fixed for now; the drawable is upscaled to
+/// fill the window — see the design's "Resize" note).
+pub const PANE_W: u32 = 320;
+pub const PANE_H: u32 = 240;
+
 #[cfg(test)]
 mod tests {
     use super::*;

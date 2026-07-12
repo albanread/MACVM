@@ -31,6 +31,10 @@ unsafe impl Send for MainThreadPtr {}
 unsafe impl Sync for MainThreadPtr {}
 
 static WEBVIEW: OnceLock<MainThreadPtr> = OnceLock::new();
+/// The `NSWindow`, stored so the game pane can swap its content view (once the
+/// game view is installed, the WKWebView's own `.window` goes nil, so it can't
+/// be re-derived from the webview — it must be held separately).
+static WINDOW: OnceLock<MainThreadPtr> = OnceLock::new();
 static NAV: OnceLock<Mutex<NavState>> = OnceLock::new();
 
 /// The GUI's handle onto the VM worker thread (`vm_host.rs`, SPEC §16.1 /
@@ -183,6 +187,13 @@ fn workspace_view_marker() -> PathBuf {
 /// (`canvas_render.rs`, `../docs/CANVAS.md`).
 fn canvas_view_marker() -> PathBuf {
     gui_root().join(".canvas-view")
+}
+
+/// Same idea, for the native Metal game pane (`game_pane.rs`,
+/// `../docs/gamepane_design.md`). Unlike the other markers this swaps a native
+/// `NSView` in as the window content view, not HTML into the WKWebView.
+fn game_view_marker() -> PathBuf {
+    gui_root().join(".game-view")
 }
 
 fn start_page() -> PathBuf {
@@ -441,6 +452,12 @@ fn navigate_to(path: &Path) -> bool {
         display_class_outliner();
         return true;
     }
+    if path == game_view_marker() {
+        // Swap the native Metal game pane in as the window content view and
+        // render a frame — not HTML into the WKWebView (see `game_pane.rs`).
+        display_game_pane();
+        return true;
+    }
     if let Some(tool) = path
         .file_name()
         .and_then(|n| n.to_str())
@@ -641,6 +658,31 @@ fn open_canvas() {
     }
 }
 
+/// Opens the native Metal game pane (`game_pane.rs`,
+/// `../docs/gamepane_design.md`) — the toolbar's `gamePane` action and the
+/// `MACVM_GAMEPANE_DEMO` env trigger. Pushes the marker and swaps the native
+/// view in, mirroring `open_canvas`'s marker/display split.
+fn open_game_pane() {
+    if let Some(nav) = NAV.get() {
+        nav.lock().unwrap().go(game_view_marker());
+    }
+    display_game_pane();
+}
+
+/// Swap the native game pane's `NSView` in as the window content view (out of
+/// the WKWebView) and render one frame. Main thread only. A no-op with a note
+/// if this Mac has no Metal device.
+fn display_game_pane() {
+    let Some(view) = game_pane::ensure_native_view(game_pane::PANE_W, game_pane::PANE_H) else {
+        append_transcript("(game pane: no Metal device available)");
+        return;
+    };
+    if let Some(window) = WINDOW.get() {
+        objc::send1_id(window.0, sel("setContentView:"), view);
+    }
+    game_pane::render_native_frame();
+}
+
 fn display_canvas() {
     let body =
         canvas_render::render_canvas(canvas_render::DEFAULT_WIDTH, canvas_render::DEFAULT_HEIGHT);
@@ -661,6 +703,16 @@ fn display_canvas() {
 /// and its doc comment's reasoning — without going through a corpus file
 /// on disk first.
 fn display_html(html: &str) {
+    // If the native game pane swapped itself in as the content view, restore
+    // the WKWebView before loading HTML — only the game pane ever swaps it out,
+    // so this is a no-op on every other navigation.
+    if let (Some(window), Some(webview)) = (WINDOW.get(), WEBVIEW.get()) {
+        let current = objc::send0(window.0, sel("contentView"));
+        if current != webview.0 {
+            objc::send1_id(window.0, sel("setContentView:"), webview.0);
+        }
+    }
+
     let rendered_dir = gui_root().join(".rendered");
     if let Err(e) = std::fs::create_dir_all(&rendered_dir) {
         eprintln!(
@@ -809,6 +861,7 @@ fn navigate_toolbar(button: &str) {
         "hierarchy" => open_class_browser(),
         "workspace" => open_workspace(),
         "canvas" => open_canvas(),
+        "gamePane" => open_game_pane(),
         "refresh" => reload_current_page(),
         "biggerText" => {
             bump_font_scale(FONT_SCALE_STEP as i32);
@@ -1725,6 +1778,7 @@ fn build_window_and_webview() {
         .set(MainThreadPtr(webview))
         .ok()
         .expect("build_window_and_webview called twice");
+    WINDOW.set(MainThreadPtr(window)).ok();
 
     objc::send1_id(window, sel("makeKeyAndOrderFront:"), NIL);
 }
@@ -1761,6 +1815,13 @@ fn main() {
     build_menu_bar();
     build_window_and_webview();
     navigate_to(&start);
+
+    // M2 demo trigger (docs/gamepane_design.md): open straight into the native
+    // game pane so the on-screen render path can be exercised without a UI
+    // control yet. A real toolbar button uses the `gamePane` action instead.
+    if std::env::var_os("MACVM_GAMEPANE_DEMO").is_some() {
+        open_game_pane();
+    }
 
     let app = objc::send0(objc::get_class("NSApplication"), sel("sharedApplication"));
     // Quit when the (only) window closes, so a `cargo run` test session
