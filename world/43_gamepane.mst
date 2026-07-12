@@ -169,3 +169,13 @@ Object subclass: Sound [
     play [ "Play this sound." self primPlay: preset. ^self ]
     primPlay: n [ <primitive: 213> ^self ]
 ]
+
+"--- Tune: an ABC-notation chiptune, played once in the background
+ (docs/gamepane_design.md). `(Tune fromAbc: 'C C G G A A G2') playOnce`. ---"
+Object subclass: Tune [
+    | abc |
+    Tune class >> fromAbc: aString [ ^self new setAbc: aString ]
+    setAbc: aString [ abc := aString. ^self ]
+    playOnce [ "Play this tune once in the background." self primPlayTune: abc. ^self ]
+    primPlayTune: s [ <primitive: 214> ^self ]
+]

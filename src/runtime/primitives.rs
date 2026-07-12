@@ -1051,6 +1051,14 @@ pub static PRIMITIVES: &[PrimDesc] = &[
         can_allocate: false,
         can_fail: true,
     },
+    PrimDesc {
+        id: 214,
+        name: "Tune>>primPlayTune:",
+        f: prim_game_play_tune,
+        argc: 1,
+        can_allocate: false,
+        can_fail: true,
+    },
 ];
 
 pub fn prim_by_id(id: u16) -> Option<&'static PrimDesc> {
@@ -1247,6 +1255,15 @@ fn prim_game_play_sound(vm: &mut VmState, args: &[Oop]) -> PrimResult {
         return PrimResult::Fail;
     };
     game_emit(vm, GameCommand::PlaySound { preset });
+    PrimResult::Ok(args[0])
+}
+
+/// `primPlayTune:` (214): play an ABC-notation tune once in the background.
+fn prim_game_play_tune(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    let Some(abc) = smi_str(args[1]) else {
+        return PrimResult::Fail;
+    };
+    game_emit(vm, GameCommand::PlayTune { abc });
     PrimResult::Ok(args[0])
 }
 
@@ -3048,6 +3065,7 @@ mod tests {
             (211, "GamePane>>primSpriteColor:index:r:g:b:"),
             (212, "GamePane>>primMoveSprite:x:y:"),
             (213, "Sound>>primPlay:"),
+            (214, "Tune>>primPlayTune:"),
         ];
         assert_eq!(
             PRIMITIVES.len(),

@@ -188,6 +188,9 @@ pub enum GameCommand {
     /// 5=powerup, 6=hurt, 7=click, 8=bang, 9=blip) on the one shared `Sfx`
     /// engine. `Sound coin play`.
     PlaySound { preset: u8 },
+    /// Play an ABC-notation tune once in the background (a chiptune via the
+    /// engine's ABC->MIDI path). `(Tune fromAbc: '...') playOnce`.
+    PlayTune { abc: String },
 }
 
 /// Where game-primitive commands go — the game analogue of [`TranscriptSink`].
@@ -1339,6 +1342,27 @@ mod tests {
                 GameCommand::PlaySound { preset: 0 }, // coin
                 GameCommand::PlaySound { preset: 8 }, // bang
             ]
+        );
+    }
+
+    #[test]
+    fn tune_playonce_reaches_the_sink_from_smalltalk() {
+        struct VecGameSink(Arc<Mutex<Vec<GameCommand>>>);
+        impl GameSink for VecGameSink {
+            fn emit(&mut self, cmd: GameCommand) {
+                self.0.lock().unwrap().push(cmd);
+            }
+        }
+
+        let mut vm = boot_test_vm(JitMode::Off);
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        vm.set_game_sink(Box::new(VecGameSink(captured.clone())));
+
+        vm.eval("(Tune fromAbc: 'C D E') playOnce.")
+            .expect("Tune playOnce must evaluate cleanly");
+        assert_eq!(
+            *captured.lock().unwrap(),
+            vec![GameCommand::PlayTune { abc: "C D E".to_string() }]
         );
     }
 

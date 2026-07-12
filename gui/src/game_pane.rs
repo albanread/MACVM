@@ -242,6 +242,7 @@ pub fn apply_command(cmd: &macvm::embed::GameCommand) {
         C::StartLoop => return crate::start_game_loop_timer(),
         C::StopLoop => return crate::stop_game_loop_timer(),
         C::PlaySound { preset } => return play_sound(*preset),
+        C::PlayTune { abc } => return play_tune(abc),
         _ => {}
     }
     NATIVE.with(|cell| {
@@ -286,7 +287,7 @@ pub fn apply_command(cmd: &macvm::embed::GameCommand) {
                 DIRTY.with(|d| d.set(false));
                 return;
             }
-            C::StartLoop | C::StopLoop | C::PlaySound { .. } => {
+            C::StartLoop | C::StopLoop | C::PlaySound { .. } | C::PlayTune { .. } => {
                 unreachable!("handled before the pane check")
             }
         }
@@ -328,6 +329,15 @@ pub fn play_sound(preset: u8) {
         }
         sfx.play(preset as usize);
     });
+}
+
+/// Play an ABC-notation tune once in the background (the engine's ABC->MIDI
+/// path spawns its own player thread; non-blocking). A no-op if the ABC doesn't
+/// parse to any notes.
+pub fn play_tune(abc: &str) {
+    if let Some(tune) = macgamepane_audio::abc::parse_tune(abc) {
+        let _ = macgamepane_audio::playback::play_tune_non_blocking(&tune);
+    }
 }
 
 /// Synthesize a named preset `Sound` (deterministic; some presets take an RNG).
