@@ -304,12 +304,104 @@
     if (input && pre) pre.innerHTML = highlightSmalltalk(input.value);
   }
 
+  // ── Editor hardening ────────────────────────────────────────────────────
+  //
+  // The transparent <textarea> and the highlighted <pre> beneath it are a
+  // stack that must behave as ONE surface. As shipped they didn't: nothing
+  // synced the <pre>'s scroll to the textarea's, both were `overflow:auto`,
+  // and nothing measured the text — so scrolling drifted the highlight away
+  // from the caret, two scrollbars fought, and the box never sized to its
+  // content. These two functions fix all three, THEME-AGNOSTICALLY (inline
+  // styles only — the 7 theme CSS files are left untouched): the <pre> becomes
+  // a pure backdrop that mirrors the textarea's scroll, only the textarea
+  // scrolls, both reserve a scrollbar gutter so they wrap identically (the
+  // caret lands on the right glyph), and the editor autosizes to the text up
+  // to the room its pane affords, then scrolls.
+
+  // Size the editor box to its text: measure the true content height from the
+  // textarea's own layout (scrollHeight already accounts for font/wrap/tabs
+  // and, with border-box, padding), clamp to the room between the editor's top
+  // and the bottom of its pane, and keep the backdrop's scroll in step.
+  function measureCodeEditor(editor) {
+    const input = editor.querySelector(".st-code-input");
+    const pre = editor.querySelector(".st-code-highlight");
+    if (!input) return;
+    // cap = the room from the editor's top to the bottom of its pane (measured
+    // before we touch the height, so the editor's top is its settled position).
+    let cap = Infinity;
+    const parent = editor.parentElement;
+    if (parent) {
+      const pr = parent.getBoundingClientRect();
+      const er = editor.getBoundingClientRect();
+      const padB = parseFloat(getComputedStyle(parent).paddingBottom) || 0;
+      cap = Math.max(0, pr.bottom - er.top - padB);
+    }
+    // scrollHeight never reports LESS than the visible box, so to size DOWN to
+    // a short method we must collapse the box first, then read the true content
+    // height (one synchronous reflow), then size to it — clamped to the pane.
+    editor.style.height = "0px";
+    const contentH = input.scrollHeight;
+    editor.style.height = Math.min(contentH, cap) + "px";
+    if (pre) {
+      pre.scrollTop = input.scrollTop;
+      pre.scrollLeft = input.scrollLeft;
+    }
+  }
+
+  function hardenCodeEditor(editor) {
+    const input = editor.querySelector(".st-code-input");
+    const pre = editor.querySelector(".st-code-highlight");
+    if (!input || !pre) return;
+    highlightEditor(editor);
+    if (!editor.__macvmHardened) {
+      editor.__macvmHardened = true;
+      // The <pre> is a backdrop only: never its own scrollbar, only moved to
+      // mirror the textarea (which is the single scroller).
+      pre.style.overflow = "hidden";
+      // Reserve a stable gutter on both so the textarea's scrollbar can't
+      // narrow its text and drift its wrap away from the <pre>'s.
+      input.style.scrollbarGutter = "stable";
+      pre.style.scrollbarGutter = "stable";
+      // Autosize hugs the text: our explicit height must drive the box, so
+      // take it out of the `flex: 1` regime (whose `flex-basis: 0%` would
+      // otherwise collapse it and ignore `height`) with `flex: 0 0 auto`.
+      // Harmless where the editor isn't a flex item.
+      editor.style.flex = "0 0 auto";
+      input.addEventListener(
+        "scroll",
+        function () {
+          pre.scrollTop = input.scrollTop;
+          pre.scrollLeft = input.scrollLeft;
+        },
+        { passive: true }
+      );
+    }
+    measureCodeEditor(editor);
+  }
+
+  function remeasureAll() {
+    document.querySelectorAll(".st-code-editor").forEach(measureCodeEditor);
+  }
+
   // Called after every pane patch (main.rs::replace_pane) and once on
-  // initial page load (below) — idempotent, cheap at mock scale, so no
-  // need to track "did this one already get highlighted."
+  // initial page load (below) — idempotent (per-editor `__macvmHardened`
+  // guard), cheap at mock scale. A second measure on the NEXT frame catches
+  // the case where this fires before the pane's flex layout has settled (an
+  // early measure collapses the box); the font-load pass below covers the
+  // metrics changing when the code font finishes loading.
   window.macvmHighlightCodeEditors = function () {
-    document.querySelectorAll(".st-code-editor").forEach(highlightEditor);
+    document.querySelectorAll(".st-code-editor").forEach(hardenCodeEditor);
+    requestAnimationFrame(remeasureAll);
   };
+
+  // Re-measure when the window resizes (the pane's available height, hence the
+  // autosize cap, changes) and once the code font has actually loaded (its
+  // metrics decide the content height — measuring against a fallback font
+  // mis-sizes the box).
+  window.addEventListener("resize", remeasureAll);
+  if (document.fonts && document.fonts.ready) {
+    document.fonts.ready.then(remeasureAll);
+  }
 
   // Live re-highlight as the user types; the workspace's own textarea
   // (id-scoped, not every `.st-code-input`) also pushes its latest value
@@ -324,7 +416,11 @@
       const input = ev.target.closest(".st-code-input");
       if (!input) return;
       const editor = input.closest(".st-code-editor");
-      if (editor) highlightEditor(editor);
+      if (editor) {
+        highlightEditor(editor);
+        // Re-autosize + re-sync the backdrop as the text changes.
+        measureCodeEditor(editor);
+      }
       if (input.id === "macvm-workspace-input") {
         post({ kind: "workspaceTextChanged", text: input.value });
       }
