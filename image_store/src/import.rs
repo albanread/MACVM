@@ -66,17 +66,12 @@ pub fn import_world_dir(image: &Image, world_dir: &Path) -> Result<ImportStats, 
                 stats.classes += 1;
             } else {
                 // The class already exists (a later file re-opens it, or an
-                // incremental reseed re-imports it): re-apply its shell so a
-                // changed superclass/ivars/classVars isn't silently dropped —
-                // methods alone are updated below. Without this, adding a
-                // `<classVars: …>` pragma and reseeding left the vars empty and
-                // broke image boot.
+                // incremental reseed re-imports it): MERGE its declared vars so
+                // adding a `<classVars: …>` pragma is picked up — but a
+                // method-only reopen (no pragma) does not wipe existing vars.
                 image
                     .reimport_class_shell(
                         &parsed.name,
-                        parsed.superclass.as_deref(),
-                        &category,
-                        &parsed.comment,
                         &parsed.instance_vars,
                         &parsed.class_vars,
                     )

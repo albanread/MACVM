@@ -778,51 +778,48 @@ impl Image {
         Ok(true)
     }
 
-    /// Re-import a live class's full *shell* (superclass, category, comment,
-    /// instance vars, AND class vars) to match a re-parsed `.mst`, inserting a
-    /// fresh version only if anything actually changed. This is what the world
-    /// importer ([`crate::import`]) needs for a class that already exists:
-    /// unlike [`Self::set_class_definition`] it DOES update `class_vars`, and
-    /// unlike [`Self::create_or_reopen_class`] it applies to a live class. Its
-    /// absence was a real bug — an incremental reseed after adding a
-    /// `<classVars: …>` pragma silently kept the old (empty) vars, so booting
-    /// the image failed to compile methods that referenced them. Returns
-    /// `false` if `class_name` doesn't exist.
+    /// Re-import a live class's declared vars from a re-parsed `.mst`, **merging**
+    /// (unioning) the parsed instance/class vars into what's stored rather than
+    /// replacing — a fresh version only if that adds something. This is what the
+    /// world importer ([`crate::import`]) needs for a class that already exists:
+    /// unlike [`Self::set_class_definition`] it can add `class_vars`, and unlike
+    /// [`Self::create_or_reopen_class`] it applies to a live class.
+    ///
+    /// Merge (not overwrite) is essential because a class is often *reopened* in
+    /// the same file to add methods WITHOUT restating its `<classVars: …>` — an
+    /// overwrite would wipe them (this bit `Character`, whose `Table` was lost on
+    /// its second definition, breaking image boot). Adding a var incrementally
+    /// still works; only *removing* one needs a full reseed. Superclass/category/
+    /// comment are left as first defined. Returns `false` if the class doesn't
+    /// exist or nothing new was added.
     pub fn reimport_class_shell(
         &self,
         class_name: &str,
-        superclass: Option<&str>,
-        category: &str,
-        comment: &str,
         instance_vars: &str,
         class_vars: &str,
     ) -> rusqlite::Result<bool> {
         let Some(class_id) = self.class_id_of(class_name)? else {
             return Ok(false);
         };
-        let (cur_sc, cur_cat, cur_com, cur_iv, cur_cv): (String, String, String, String, String) =
+        let (sc, cat, com, cur_iv, cur_cv): (Option<String>, String, String, String, String) =
             self.conn.query_row(
-                "SELECT COALESCE(superclass_name, ''), category, comment, instance_vars, class_vars \
+                "SELECT superclass_name, category, comment, instance_vars, class_vars \
                  FROM latest_class_versions WHERE class_id = ?1",
                 params![class_id],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
             )?;
-        // No churn if the shell is unchanged.
-        if cur_sc == superclass.unwrap_or("")
-            && cur_cat == category
-            && cur_com == comment
-            && cur_iv == instance_vars
-            && cur_cv == class_vars
-        {
-            return Ok(false);
+        let merged_iv = union_space_separated(&cur_iv, instance_vars);
+        let merged_cv = union_space_separated(&cur_cv, class_vars);
+        if merged_iv == cur_iv && merged_cv == cur_cv {
+            return Ok(false); // nothing new — no version churn
         }
         self.insert_class_version(
             class_id,
-            superclass,
-            category,
-            comment,
-            instance_vars,
-            class_vars,
+            sc.as_deref(),
+            &cat,
+            &com,
+            &merged_iv,
+            &merged_cv,
             false,
         )?;
         self.prune_class_versions(class_id)?;
@@ -1179,39 +1176,52 @@ impl Image {
     }
 }
 
+/// Union two space-separated variable lists: `existing` order preserved, plus
+/// any names in `additions` not already present. The world importer uses this
+/// to MERGE (not replace) a reopened class's declared vars.
+fn union_space_separated(existing: &str, additions: &str) -> String {
+    let mut out: Vec<&str> = existing.split_whitespace().collect();
+    for a in additions.split_whitespace() {
+        if !out.contains(&a) {
+            out.push(a);
+        }
+    }
+    out.join(" ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn cvars_of(img: &Image, name: &str) -> String {
+        img.all_classes()
+            .unwrap()
+            .into_iter()
+            .find(|c| c.name == name)
+            .unwrap()
+            .class_vars
+    }
+
     #[test]
-    fn reimport_class_shell_updates_class_vars() {
-        // The exact bug behind the blank-editors regression: a class first
-        // imported WITHOUT class vars (M3 GamePane), then re-imported WITH them
-        // (M4 GamePane). Before the fix, an incremental reseed kept the old
-        // (empty) vars, so image boot failed to compile methods referencing them.
+    fn reimport_class_shell_merges_class_vars_without_wiping() {
         let img = Image::open_in_memory().unwrap();
         let lo = img.next_load_order().unwrap();
+        // First seeded WITHOUT class vars (the M3 GamePane situation).
         img.add_class("Widget", Some("Object"), "GUI", "", "", "", lo)
             .unwrap();
 
-        let changed = img
-            .reimport_class_shell("Widget", Some("Object"), "GUI", "", "", "State Count")
-            .unwrap();
-        assert!(changed, "adding class vars is a real change");
+        // A reopen that adds `<classVars: …>` ADDS them (the GamePane fix).
+        assert!(img.reimport_class_shell("Widget", "", "State Count").unwrap());
+        assert_eq!(cvars_of(&img, "Widget"), "State Count");
 
-        let cvars = img
-            .all_classes()
-            .unwrap()
-            .into_iter()
-            .find(|c| c.name == "Widget")
-            .unwrap()
-            .class_vars;
-        assert_eq!(cvars, "State Count", "the reimported shell carries the class vars");
+        // A method-only reopen (no pragma -> empty vars) must NOT wipe them —
+        // the Character regression. An empty addition merges to a no-op.
+        assert!(!img.reimport_class_shell("Widget", "", "").unwrap());
+        assert_eq!(cvars_of(&img, "Widget"), "State Count");
 
-        // A no-op reimport (identical shell) reports no change — no version churn.
-        assert!(!img
-            .reimport_class_shell("Widget", Some("Object"), "GUI", "", "", "State Count")
-            .unwrap());
+        // Adding a further var unions it in (order preserved).
+        assert!(img.reimport_class_shell("Widget", "", "Total").unwrap());
+        assert_eq!(cvars_of(&img, "Widget"), "State Count Total");
     }
 
     fn seeded() -> Image {

@@ -336,6 +336,25 @@ mod tests {
     }
 
     #[test]
+    fn world_image_installs_all_classes_without_error() {
+        // Seed a fresh image from the real world/ tree and boot it. This is
+        // where a class-var pragma that didn't round-trip through the importer
+        // shows up: a class reopened WITHOUT restating `<classVars: …>` (e.g.
+        // Character's second definition) must keep its vars, or method
+        // installation fails with "undeclared variable". Regression guard for
+        // the blank-editors bug.
+        let (image, path) = seed_image();
+        let mut vm = VmHandle::boot_without_world(opts());
+        let doits = ["Transcript := TranscriptStream new.", "Character initTable."];
+        let result = load_world_from_image(&mut vm, &image, &doits);
+        std::fs::remove_file(&path).ok();
+        match result {
+            Ok(stats) => assert!(stats.classes >= 40, "expected the whole world, got {stats:?}"),
+            Err(e) => panic!("world image failed to install: {e}"),
+        }
+    }
+
+    #[test]
     fn db_boot_leaves_transcript_usable() {
         // `Transcript := TranscriptStream new.` is one of the doIts; without
         // it, `Transcript show:` would fail — the GUI's own output depends on
