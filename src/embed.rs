@@ -122,6 +122,23 @@ pub trait TranscriptSink: Send {
     fn show(&mut self, text: &str);
 }
 
+/// A structured command from a game-primitive to the native game pane
+/// (`docs/gamepane_design.md` M3). The core VM defines only this vocabulary;
+/// the GUI applies each command to the real Metal pane. Deliberately small —
+/// this is the M3 vertical slice; sprite/palette/present commands follow.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GameCommand {
+    /// Clear the pane to an opaque RGB colour and present it.
+    ClearTo { r: u8, g: u8, b: u8 },
+}
+
+/// Where game-primitive commands go — the game analogue of [`TranscriptSink`].
+/// `Send` because the GUI's sink hands commands across the worker-to-main
+/// thread channel, exactly like the transcript sink hands text.
+pub trait GameSink: Send {
+    fn emit(&mut self, cmd: GameCommand);
+}
+
 /// Adapts a `TranscriptSink` into the plain `std::io::Write` that
 /// `VmState::out` already expects — SPEC §16.2's sink trait is
 /// guest-output-shaped (whole strings), `Write` is byte-shaped; this is the
@@ -494,6 +511,14 @@ impl VmHandle {
     /// `boot`, before the first `eval`.
     pub fn set_transcript(&mut self, sink: Box<dyn TranscriptSink>) {
         self.vm.out = Box::new(SinkWriter(sink));
+    }
+
+    /// Installs `sink` as where game-primitive commands go
+    /// (`docs/gamepane_design.md` M3) — the game analogue of `set_transcript`.
+    /// Default is `None` (a headless VM silently drops game commands); the GUI
+    /// installs a channel-backed sink once, right after `boot`.
+    pub fn set_game_sink(&mut self, sink: Box<dyn GameSink>) {
+        self.vm.game_sink = Some(sink);
     }
 }
 
@@ -1047,6 +1072,55 @@ mod tests {
             GuestError::Compile(_) => {}
             other => panic!("expected GuestError::Compile, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn set_game_sink_routes_game_commands_from_a_smalltalk_doit() {
+        // The M3 vertical slice end to end: a Smalltalk doit -> GamePane
+        // primitive (id 200) -> GameCommand -> the installed sink. Headless,
+        // deterministic, no GPU/window — this is the real proof of the VM->GUI
+        // game channel (docs/gamepane_design.md M3).
+        struct VecGameSink(Arc<Mutex<Vec<GameCommand>>>);
+        impl GameSink for VecGameSink {
+            fn emit(&mut self, cmd: GameCommand) {
+                self.0.lock().unwrap().push(cmd);
+            }
+        }
+
+        let mut vm = boot_test_vm(JitMode::Off);
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        vm.set_game_sink(Box::new(VecGameSink(captured.clone())));
+        vm.eval("GamePane new clearR: 200 g: 40 b: 40.")
+            .expect("GamePane>>clearR:g:b: must evaluate cleanly");
+        assert_eq!(
+            *captured.lock().unwrap(),
+            vec![GameCommand::ClearTo { r: 200, g: 40, b: 40 }],
+            "the game sink must capture exactly the ClearTo command"
+        );
+    }
+
+    #[test]
+    fn game_primitive_fails_on_out_of_range_colour_and_emits_nothing() {
+        // r=300 is out of 0..=255, so `smi_byte` fails, the primitive fails,
+        // and the method falls through to `^self` — no command emitted. This
+        // is the design's rule: validate at the primitive boundary before a
+        // value can reach an assert!-panicking engine setter.
+        struct VecGameSink(Arc<Mutex<Vec<GameCommand>>>);
+        impl GameSink for VecGameSink {
+            fn emit(&mut self, cmd: GameCommand) {
+                self.0.lock().unwrap().push(cmd);
+            }
+        }
+
+        let mut vm = boot_test_vm(JitMode::Off);
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        vm.set_game_sink(Box::new(VecGameSink(captured.clone())));
+        vm.eval("GamePane new clearR: 300 g: 0 b: 0.")
+            .expect("an out-of-range colour must not crash — the primitive just fails");
+        assert!(
+            captured.lock().unwrap().is_empty(),
+            "an out-of-range colour must emit no game command"
+        );
     }
 
     #[test]

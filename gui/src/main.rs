@@ -1385,6 +1385,7 @@ extern "C" fn vm_bridge_drain(_this: Id, _cmd: Sel, _arg: Id) {
     for response in vm.drain_responses() {
         match response {
             vm_host::VmResponse::Transcript(text) => append_transcript(&text),
+            vm_host::VmResponse::Game(cmd) => game_pane::apply_command(&cmd),
             vm_host::VmResponse::BrowserPanes {
                 packages_html,
                 classes_html,

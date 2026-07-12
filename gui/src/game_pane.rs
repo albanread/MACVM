@@ -168,20 +168,48 @@ pub fn ensure_native_view(w: u32, h: u32) -> Option<objc::Id> {
     })
 }
 
-/// Draw the test scene into the layer's next drawable and present (main thread).
-/// A no-op if the native pane hasn't been built or no drawable is ready.
+/// Upload the pane's CPU buffer and present it into the layer's next drawable
+/// (main thread). A no-op if no drawable is ready (the compositor occasionally
+/// has none — skip the frame, not an error).
+fn present_native(n: &mut NativePane) {
+    n.pane.upload();
+    let Some(drawable) = n.layer.next_drawable() else {
+        return;
+    };
+    let cb = n.queue.new_command_buffer();
+    n.pane
+        .render(cb, drawable.texture(), metal::MTLLoadAction::Clear);
+    cb.present_drawable(drawable);
+    cb.commit();
+}
+
+/// Draw the test scene into the pane and present (main thread). A no-op if the
+/// native pane hasn't been built.
 pub fn render_native_frame() {
     NATIVE.with(|cell| {
         let mut slot = cell.borrow_mut();
         let Some(n) = slot.as_mut() else { return };
         draw_test_scene(&mut n.pane, n.w as i64, n.h as i64);
-        n.pane.upload();
-        let Some(drawable) = n.layer.next_drawable() else { return };
-        let cb = n.queue.new_command_buffer();
-        n.pane
-            .render(cb, drawable.texture(), metal::MTLLoadAction::Clear);
-        cb.present_drawable(drawable);
-        cb.commit();
+        present_native(n);
+    });
+}
+
+/// Apply a [`macvm::embed::GameCommand`] from the VM to the on-screen native
+/// pane and present (main thread, `docs/gamepane_design.md` M3). A no-op if the
+/// pane isn't currently built/shown — the command is simply dropped, matching
+/// the headless-VM behaviour on the core side.
+pub fn apply_command(cmd: &macvm::embed::GameCommand) {
+    NATIVE.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let Some(n) = slot.as_mut() else { return };
+        match cmd {
+            macvm::embed::GameCommand::ClearTo { r, g, b } => {
+                // Reuse palette index 16 as the fill colour, clear FRONT to it.
+                n.pane.set_rgb(pal::BG, *r, *g, *b);
+                n.pane.cls(pal::BG);
+            }
+        }
+        present_native(n);
     });
 }
 

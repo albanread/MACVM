@@ -782,6 +782,12 @@ pub struct VmState {
     /// transcript assertions don't need a subprocess before S5's golden
     /// runner exists.
     pub out: Box<dyn Write>,
+    /// Where game-primitive commands go (`docs/gamepane_design.md` M3): the
+    /// game analogue of `out`. `None` by default (headless/CLI); the GUI
+    /// installs a sink that hands `GameCommand`s across the worker-to-main
+    /// channel to the native Metal pane. The core VM only defines the
+    /// vocabulary, never touches Metal.
+    pub game_sink: Option<Box<dyn crate::embed::GameSink>>,
     /// Set by the `quit`/`quit:` primitive; the dispatch loop exits (after
     /// the current activation returns) once this is true.
     pub exit_requested: bool,
@@ -1159,6 +1165,7 @@ impl VmState {
             lookup_cache: LookupCache::new(),
             prim_arg_base: 0,
             out: Box::new(std::io::stdout()),
+            game_sink: None,
             exit_requested: false,
             exit_code: None,
             start_instant: Instant::now(),

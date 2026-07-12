@@ -72,7 +72,7 @@
 
 use crate::browser_render::{self, BrowserSelection, SourceEditTarget};
 use crate::objc::{self, Id, Sel};
-use macvm::embed::{TranscriptSink, VmHandle};
+use macvm::embed::{GameCommand, GameSink, TranscriptSink, VmHandle};
 use macvm_mock_vm::MockWorld;
 pub use macvm_mock_vm::Side;
 use std::path::{Path, PathBuf};
@@ -326,6 +326,10 @@ pub enum VmRequest {
 #[derive(Debug)]
 pub enum VmResponse {
     Transcript(String),
+    /// A game-primitive command (`docs/gamepane_design.md` M3) emitted by the
+    /// worker via `ChannelGameSink`; `main.rs` applies it to the native Metal
+    /// game pane (`game_pane::apply_command`) on the main thread.
+    Game(GameCommand),
     BrowserPanes {
         packages_html: String,
         classes_html: String,
@@ -767,6 +771,23 @@ impl TranscriptSink for ChannelTranscript {
     }
 }
 
+/// The game analogue of [`ChannelTranscript`] (`docs/gamepane_design.md` M3):
+/// a worker-thread [`GameSink`] that forwards each `GameCommand` over the same
+/// response channel as `VmResponse::Game`, waking the main thread so
+/// `main.rs`'s drain applies it to the native Metal pane.
+struct ChannelGameSink {
+    responses: Sender<VmResponse>,
+    wake: CrossThreadObjcRef,
+}
+
+impl GameSink for ChannelGameSink {
+    fn emit(&mut self, cmd: GameCommand) {
+        if self.responses.send(VmResponse::Game(cmd)).is_ok() {
+            self.wake.notify();
+        }
+    }
+}
+
 /// VM options for the GUI's own worker. Same as `VmOptions::from_env`
 /// (`MACVM_JIT`/`MACVM_HEAP`/… all honored), except the JIT defaults to ON
 /// when `MACVM_JIT` is unset — the GUI runs real programs interactively, and
@@ -798,7 +819,11 @@ fn boot_real_vm(
     let opts = gui_vm_options();
     match VmHandle::boot(opts, world_dir) {
         Ok(mut vm) => {
-            vm.set_transcript(Box::new(ChannelTranscript { responses, wake }));
+            vm.set_transcript(Box::new(ChannelTranscript {
+                responses: responses.clone(),
+                wake,
+            }));
+            vm.set_game_sink(Box::new(ChannelGameSink { responses, wake }));
             Some(vm)
         }
         Err(e) => {
@@ -901,6 +926,10 @@ fn boot_vm_from_image(
     let opts = gui_vm_options();
     let mut vm = VmHandle::boot_without_world(opts);
     vm.set_transcript(Box::new(ChannelTranscript {
+        responses: responses.clone(),
+        wake,
+    }));
+    vm.set_game_sink(Box::new(ChannelGameSink {
         responses: responses.clone(),
         wake,
     }));

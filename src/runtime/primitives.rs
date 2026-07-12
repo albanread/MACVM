@@ -938,6 +938,15 @@ pub static PRIMITIVES: &[PrimDesc] = &[
         can_allocate: true,
         can_fail: true,
     },
+    // --- game group (docs/gamepane_design.md M3): id block 200+ ---
+    PrimDesc {
+        id: 200,
+        name: "GamePane>>clearR:g:b:",
+        f: prim_game_clear,
+        argc: 3,
+        can_allocate: false,
+        can_fail: true,
+    },
 ];
 
 pub fn prim_by_id(id: u16) -> Option<&'static PrimDesc> {
@@ -945,6 +954,31 @@ pub fn prim_by_id(id: u16) -> Option<&'static PrimDesc> {
         .binary_search_by_key(&id, |d| d.id)
         .ok()
         .map(|i| &PRIMITIVES[i])
+}
+
+// --- game group (docs/gamepane_design.md M3) --------------------------------
+
+/// Extract a Smalltalk `SmallInt` argument as a `0..=255` colour byte, or
+/// `None` (which fails the primitive) if it is not a SmallInt in range.
+fn smi_byte(oop: Oop) -> Option<u8> {
+    u8::try_from(SmallInt::try_from(oop)?.value()).ok()
+}
+
+/// `GamePane>>clearR:g:b:` (primitive 200): emit a [`crate::embed::GameCommand::ClearTo`]
+/// to the native game pane. `args = [receiver, r, g, b]`, each a SmallInt in
+/// `0..=255`; out-of-range fails the primitive (the boundary validates before
+/// the value ever reaches an `assert!`-panicking engine setter). In a headless
+/// VM with no game sink installed, the command is silently dropped. Returns the
+/// receiver (`self`).
+fn prim_game_clear(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    let (Some(r), Some(g), Some(b)) = (smi_byte(args[1]), smi_byte(args[2]), smi_byte(args[3]))
+    else {
+        return PrimResult::Fail;
+    };
+    if let Some(sink) = vm.game_sink.as_mut() {
+        sink.emit(crate::embed::GameCommand::ClearTo { r, g, b });
+    }
+    PrimResult::Ok(args[0])
 }
 
 // --- smi group (SPEC §10 appendix) ------------------------------------------
@@ -2730,6 +2764,8 @@ mod tests {
             (154, "scale:"),
             (155, "max"),
             (156, "min"),
+            // game group (docs/gamepane_design.md M3)
+            (200, "GamePane>>clearR:g:b:"),
         ];
         assert_eq!(
             PRIMITIVES.len(),

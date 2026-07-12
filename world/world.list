@@ -61,3 +61,6 @@
 41_string_text.mst
 # Benchmark dashboard: live cold/warm perf bar chart on the Canvas.
 42_benchdash.mst
+# GamePane: drive the native Metal game pane from Smalltalk (M3 slice,
+# docs/gamepane_design.md). Numbered game primitives (id block 200+).
+43_gamepane.mst

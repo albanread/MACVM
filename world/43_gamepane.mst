@@ -1,0 +1,17 @@
+"43_gamepane.mst — GamePane: drive the native Metal game pane from Smalltalk
+ (docs/gamepane_design.md, milestone M3). Its methods speak numbered game
+ primitives (the id-200+ block in src/runtime/primitives.rs) that emit
+ GameCommands over the VM->GUI game channel; the GUI applies each to the native
+ CAMetalLayer pane (gui/src/game_pane.rs). In a headless VM (no game sink
+ installed) the primitive silently drops the command and returns self, so this
+ class is harmless to load outside the GUI."
+
+Object subclass: GamePane [
+    clearR: r g: g b: b [
+        "Clear the native game pane to an opaque RGB colour (each 0..255) and
+         present it. Fails silently (returns self) if r/g/b are out of range or
+         no game pane is attached."
+        <primitive: 200>
+        ^self
+    ]
+]
