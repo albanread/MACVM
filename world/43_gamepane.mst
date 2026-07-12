@@ -11,6 +11,8 @@
  fails and returns self, so this class is harmless to load outside the GUI."
 
 Object subclass: GamePane [
+    <classVars: StepBlock Keys>
+
     clearR: r g: g b: b [
         "Clear the pane to an opaque RGB colour (each 0..255) and present it."
         <primitive: 200>
@@ -51,4 +53,56 @@ Object subclass: GamePane [
         <primitive: 207>
         ^self
     ]
+
+    "--- the frame loop (docs/gamepane_design.md M4) ---"
+
+    onStep: aBlock [
+        "Register the per-frame block. It is held in a class variable, so it is
+         GC-rooted for the whole game (and so is everything it closes over)."
+        StepBlock := aBlock.
+        ^self
+    ]
+    run [
+        "Start the frame loop: the GUI's main-thread timer begins pulling one
+         frame per tick. Returns immediately — the loop is owned by the timer,
+         not by a blocking Smalltalk loop."
+        <primitive: 208>
+        ^self
+    ]
+    stop [
+        "Stop the frame loop."
+        <primitive: 209>
+        ^self
+    ]
+    keyHeld: keyCode [
+        "Is game key `keyCode` (see GamePane class>>keyLeft etc.) held this
+         frame? Only meaningful inside the step block."
+        ^GamePane keyHeld: keyCode
+    ]
+
+    GamePane class >> stepWithKeys: mask [
+        "Run one frame: record the held-key bitmask, then run the step block.
+         Called by the GUI's frame timer via a GameStep request, once per tick
+         on an idle worker (never nested)."
+        Keys := mask.
+        StepBlock isNil ifFalse: [ StepBlock value ].
+        ^self
+    ]
+    GamePane class >> keyHeld: keyCode [
+        "Bit `keyCode` of the current held-key mask."
+        Keys isNil ifTrue: [ ^false ].
+        ^(Keys bitAnd: (1 bitShift: keyCode)) ~= 0
+    ]
+    GamePane class >> reset [
+        StepBlock := nil.
+        Keys := 0.
+    ]
+
+    "Game-key bit positions (the GUI packs these from the held-key table)."
+    GamePane class >> keyLeft  [ ^0 ]
+    GamePane class >> keyRight [ ^1 ]
+    GamePane class >> keyUp    [ ^2 ]
+    GamePane class >> keyDown  [ ^3 ]
+    GamePane class >> keyA     [ ^4 ]
+    GamePane class >> keyB     [ ^5 ]
 ]

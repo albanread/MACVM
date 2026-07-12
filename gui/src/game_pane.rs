@@ -234,6 +234,9 @@ pub fn apply_command(cmd: &macvm::embed::GameCommand) {
                 DIRTY.with(|d| d.set(false));
                 return;
             }
+            // The frame loop's main-thread timer is wired in M4b; these carry
+            // the intent but do not draw, so they never mark the pane dirty.
+            C::StartLoop | C::StopLoop => return,
         }
         DIRTY.with(|d| d.set(true));
     });

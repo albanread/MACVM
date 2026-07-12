@@ -162,6 +162,12 @@ pub enum GameCommand {
     },
     /// Upload the CPU buffer and present the frame.
     Present,
+    /// Start the frame loop: the GUI's main-thread timer begins pulling one
+    /// `GameStep` per tick (single-outstanding) to run the registered step
+    /// block. `GamePane>>run`.
+    StartLoop,
+    /// Stop the frame loop. `GamePane>>stop`.
+    StopLoop,
 }
 
 /// Where game-primitive commands go — the game analogue of [`TranscriptSink`].
@@ -1192,6 +1198,67 @@ mod tests {
                 GameCommand::Present,
             ],
             "every drawing method must reach the sink as its command, in order"
+        );
+    }
+
+    #[test]
+    fn frame_loop_run_registers_a_step_block_the_gui_can_pull() {
+        struct VecGameSink(Arc<Mutex<Vec<GameCommand>>>);
+        impl GameSink for VecGameSink {
+            fn emit(&mut self, cmd: GameCommand) {
+                self.0.lock().unwrap().push(cmd);
+            }
+        }
+
+        let mut vm = boot_test_vm(JitMode::Off);
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        vm.set_game_sink(Box::new(VecGameSink(captured.clone())));
+
+        // Registering a step block and calling `run` emits StartLoop and
+        // returns immediately (no blocking loop).
+        vm.eval("GamePane new onStep: [ GamePane new cls: 3 ]; run.")
+            .expect("onStep:/run must evaluate cleanly");
+        assert_eq!(*captured.lock().unwrap(), vec![GameCommand::StartLoop]);
+
+        // A GUI frame tick (`GamePane stepWithKeys:`) runs the step block, so
+        // its drawing reaches the sink — the pull the GUI timer performs.
+        captured.lock().unwrap().clear();
+        vm.eval("GamePane stepWithKeys: 0.")
+            .expect("stepWithKeys: must run the step block");
+        assert_eq!(
+            *captured.lock().unwrap(),
+            vec![GameCommand::Cls { index: 3 }]
+        );
+    }
+
+    #[test]
+    fn frame_loop_keyheld_reads_the_tick_key_mask() {
+        struct VecGameSink(Arc<Mutex<Vec<GameCommand>>>);
+        impl GameSink for VecGameSink {
+            fn emit(&mut self, cmd: GameCommand) {
+                self.0.lock().unwrap().push(cmd);
+            }
+        }
+
+        let mut vm = boot_test_vm(JitMode::Off);
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        vm.set_game_sink(Box::new(VecGameSink(captured.clone())));
+
+        // The step block draws cls:7 only when Left is held, cls:8 only when
+        // Right is. A tick with mask 5 (bits 0=Left and 2=Up) must run cls:7
+        // and not cls:8 — proving keyHeld: reads the mask stepWithKeys: set.
+        vm.eval(
+            "GamePane new onStep: [ \
+               (GamePane keyHeld: GamePane keyLeft)  ifTrue: [ GamePane new cls: 7 ]. \
+               (GamePane keyHeld: GamePane keyRight) ifTrue: [ GamePane new cls: 8 ] ].",
+        )
+        .expect("onStep: must evaluate cleanly");
+        vm.eval("GamePane stepWithKeys: 5.")
+            .expect("stepWithKeys: must run");
+        assert_eq!(
+            *captured.lock().unwrap(),
+            vec![GameCommand::Cls { index: 7 }],
+            "Left held -> cls:7 only; Right not held -> no cls:8"
         );
     }
 

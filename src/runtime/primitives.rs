@@ -1003,6 +1003,22 @@ pub static PRIMITIVES: &[PrimDesc] = &[
         can_allocate: false,
         can_fail: true,
     },
+    PrimDesc {
+        id: 208,
+        name: "GamePane>>run",
+        f: prim_game_run,
+        argc: 0,
+        can_allocate: false,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 209,
+        name: "GamePane>>stop",
+        f: prim_game_stop,
+        argc: 0,
+        can_allocate: false,
+        can_fail: true,
+    },
 ];
 
 pub fn prim_by_id(id: u16) -> Option<&'static PrimDesc> {
@@ -1132,6 +1148,18 @@ fn prim_game_disc(vm: &mut VmState, args: &[Oop]) -> PrimResult {
 /// `present` (207): upload the CPU buffer and show the frame.
 fn prim_game_present(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     game_emit(vm, GameCommand::Present);
+    PrimResult::Ok(args[0])
+}
+
+/// `run` (208): start the frame loop (the GUI timer begins pulling GameSteps).
+fn prim_game_run(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    game_emit(vm, GameCommand::StartLoop);
+    PrimResult::Ok(args[0])
+}
+
+/// `stop` (209): stop the frame loop.
+fn prim_game_stop(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    game_emit(vm, GameCommand::StopLoop);
     PrimResult::Ok(args[0])
 }
 
@@ -2927,6 +2955,8 @@ mod tests {
             (205, "GamePane>>fill:y:width:height:color:"),
             (206, "GamePane>>disc:y:radius:color:"),
             (207, "GamePane>>present"),
+            (208, "GamePane>>run"),
+            (209, "GamePane>>stop"),
         ];
         assert_eq!(
             PRIMITIVES.len(),
