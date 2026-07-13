@@ -732,6 +732,18 @@ extern "C" fn on_game_tick(_this: Id, _cmd: Sel, _timer: Id) {
 /// swap the game view out of the window *before* freeing its GPU resources.
 fn close_game_pane() {
     stop_game_loop_timer();
+    // Reset the VM-side game state so the closed demo leaves nothing behind:
+    // GamePane>>reset nils the registered step block (releasing the demo object
+    // it closes over) and clears the held-key mask. teardown() below drops the
+    // native pane's own state; together that is a full reset, so the next demo
+    // launch starts clean. Queued to the worker (FIFO), so a later launch runs
+    // after it. (NextId stays monotonic by design — that is what keeps a stale
+    // sprite id from aliasing a fresh one; see gamepane_design.md.)
+    if let Some(vm) = VM.get() {
+        vm.submit(vm_host::VmRequest::Doit {
+            code: "GamePane reset.".to_string(),
+        });
+    }
     let prev = NAV
         .get()
         .and_then(|n| n.lock().unwrap().back())

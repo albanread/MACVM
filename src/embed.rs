@@ -1244,6 +1244,46 @@ mod tests {
     }
 
     #[test]
+    fn gamepane_reset_stops_the_running_demo() {
+        // Escape's close path submits `GamePane reset.` (gui close_game_pane).
+        // Prove the VM-side contract it relies on: reset nils the registered
+        // step block, so a later frame tick runs nothing and draws nothing —
+        // the demo leaves no state behind.
+        struct VecGameSink(Arc<Mutex<Vec<GameCommand>>>);
+        impl GameSink for VecGameSink {
+            fn emit(&mut self, cmd: GameCommand) {
+                self.0.lock().unwrap().push(cmd);
+            }
+        }
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let mut vm = boot_test_vm(JitMode::Threshold(10));
+        vm.set_game_sink(Box::new(VecGameSink(captured.clone())));
+
+        vm.exec("MandelZoom launch.").expect("launch must run");
+        // A frame while running draws (emits Pset commands).
+        vm.exec("GamePane stepWithKeys: 0.").expect("a step must run");
+        assert!(
+            captured
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|c| matches!(c, GameCommand::Pset { .. })),
+            "a running demo's frame must draw pixels"
+        );
+
+        // Reset (what Escape does), then tick again: nothing draws.
+        vm.exec("GamePane reset.").expect("reset must run");
+        captured.lock().unwrap().clear();
+        vm.exec("GamePane stepWithKeys: 0.")
+            .expect("a post-reset step must run");
+        let after = captured.lock().unwrap();
+        assert!(
+            after.is_empty(),
+            "after reset the step block is gone, so a tick draws nothing, got {after:?}"
+        );
+    }
+
+    #[test]
     fn game_primitive_fails_on_out_of_range_colour_and_emits_nothing() {
         // r=300 is out of 0..=255, so `smi_byte` fails, the primitive fails,
         // and the method falls through to `^self` — no command emitted. This
