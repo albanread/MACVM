@@ -157,6 +157,64 @@ measure). The remaining gap to ‑O2 is specific and known: no FMA fusion
 compiled *send* rather than inlined into the pixel loop the way C inlines
 `escape()`.
 
+### Why there's no `become:`
+
+MACVM has no `become:` — the Smalltalk primitive that swaps one object's
+identity for another's, redirecting every reference in the system at once. This
+is a deliberate omission, and it's worth being honest about the cost before the
+justification.
+
+**What we lose.** `become:` is the classic tool for three things, and we give
+all three up:
+
+- **Live schema migration.** Add an instance variable to a class and, with
+  `become:`, you can reshape every *existing* instance in place while preserving
+  its identity and every reference to it. Without it, instances keep their old
+  shape until they are recreated — so objects built up in memory during a
+  session can't be upgraded live.
+- **Transparent replacement.** Proxies, lazy-loading stubs that resolve into the
+  real object, futures, copy-on-write — anything that substitutes one object for
+  another while everyone holding a reference keeps working. `become:` does this
+  atomically; we must use explicit indirection (a handle, or `doesNotUnderstand:`
+  forwarding), which leaks into the API and means identity (`==`) is the
+  wrapper's, not the target's.
+- **`becomeForward:` bulk redirection**, used by image loaders and some
+  compaction tricks.
+
+These are real capabilities, not corner cases — a Smalltalker who reaches for
+`become:` will find it missing.
+
+**Why it's gone.** MACVM — like Strongtalk and Self before it — represents an
+object reference as the **raw machine address of the object body**, not as an
+index into an object table. That is the choice that makes a field access a
+single load and lets the JIT cache classes at send sites, build PICs, and
+inline — the whole basis of the adaptive optimizer. But it also means
+"redirect every reference to A so it points to B" has no cheap implementation:
+there is no table slot to swap, only every pointer in both heap generations,
+every root, every live stack frame, and every machine register to find and
+rewrite. Strongtalk *does* keep a `become:` primitive and implements it exactly
+that way — `deoptimize_all()` followed by a full-heap scan — and its own tour
+calls it "prohibitively slow" and "not supported." For an optimizing VM the scan
+is only half the cost: a `become:` that changes an object's class invalidates
+every cached class in the code cache, and one that reshapes an object
+invalidates the fixed field offsets baked into compiled code, forcing a global
+deoptimization. `become:` fights everything the compiler is built to do.
+
+**Why we can afford to skip it — MACVM is not image-based.** There is no
+persistent snapshot of the live object heap (the `image.sqlite3` MACVM can boot
+from is a database of class/method *source*, not a heap dump). A snapshot is
+what historically *made* `become:` load-bearing: a decades-old living image can
+never be restarted, so its objects must be migrated in place. MACVM instead
+rebuilds its entire world from source — `.mst` files, or the SQLite source
+database — on every boot, and that boot takes **well under a second** for the
+whole standard world. So the dominant use of `become:` — evolving a class whose
+instances you can't afford to lose — is answered by editing the source and
+restarting, not by mutating a live heap. Class redefinition itself already goes
+through the deoptimize-and-recompile path the VM has for exactly this. The
+residual, real loss is schema-migrating or transparently proxying objects
+*within a single running session* — and that is the price we pay, knowingly,
+for direct pointers and a fast JIT.
+
 ### Design & planning docs
 
 | Doc | Contents |
