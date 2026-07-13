@@ -320,12 +320,12 @@ Visual subclass: ClassOutliner [
         "Instance and class variables, read from the LIVE VM via ClassMirror
          (primitives 157/158) — the dynamic, VM-exercising half of the dual
          placement. Shown above the methods (a class's shape, then its
-         behaviour). Leaf nodes: a variable is just a name, nothing to open."
-        self varGroup: 'instance variables' names: mirror instanceVariables on: html.
-        self varGroup: 'class variables' names: mirror classVariables on: html.
+         behaviour). Each group renders even when empty so its '＋ add'
+         affordance is always reachable."
+        self varGroup: 'instance variables' kind: 'instance' names: mirror instanceVariables on: html.
+        self varGroup: 'class variables' kind: 'class' names: mirror classVariables on: html.
     ]
-    varGroup: label names: names on: html [
-        names isEmpty ifTrue: [ ^self ].
+    varGroup: label kind: kind names: names on: html [
         html raw: '<div class="st-node open"><span class="st-header st-side">'.
         html raw: '<span class="st-tw" data-tw>&#9662; </span>'.
         html escaped: label.
@@ -337,6 +337,27 @@ Visual subclass: ClassOutliner [
             html raw: '<span class="st-tw-leaf"></span>'.
             html escaped: n asString.
             html raw: '</span></div>' ].
+        self addVarNodeFor: kind on: html.
+        html raw: '</div></div>'.
+    ]
+    addVarNodeFor: kind on: html [
+        "A collapsible '＋ add {kind} variable' node: expand it to reveal a
+         single-line name field; Enter/Cmd+S adds the variable (smtk.js
+         .st-smappl-new-var-src -> smapplAddVar -> vm_host). A CLASS variable goes
+         live immediately; an INSTANCE variable is persisted and applies on the
+         next VM restart (instance shape is fixed once a class is defined). The
+         target class rides on data-src-class; `kind` = 'instance'|'class'."
+        html raw: '<div class="st-node closed st-add-node"><span class="st-header st-selector">'.
+        html raw: '<span class="st-tw" data-tw>&#9656; </span>&#43; add '.
+        html raw: kind.
+        html raw: ' variable</span><div class="st-children" style="display:none">'.
+        html raw: '<input type="text" class="st-smappl-new-var-src" spellcheck="false" data-src-class="'.
+        html escaped: mirror name.
+        html raw: '" data-var-kind="'.
+        html raw: kind.
+        html raw: '" placeholder="'.
+        html raw: kind.
+        html raw: ' variable name"><div class="st-smappl-hint">&#8617; or &#8984;S to add</div>'.
         html raw: '</div></div>'.
     ]
     side: label selectors: sels behavior: behavior on: html [

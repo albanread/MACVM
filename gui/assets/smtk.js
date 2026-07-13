@@ -558,6 +558,32 @@
     true
   );
 
+  // Outliner "＋ add instance/class variable" — a single-line name field. Enter
+  // or Cmd/Ctrl+S submits (vm_host SmapplAddVar): the name is unioned into the
+  // class's stored shell, the result lands in the transcript, and the outliner
+  // refreshes. A class variable shows immediately (it goes live); an instance
+  // variable needs a VM restart (instance shape is fixed once a class exists).
+  document.addEventListener(
+    "keydown",
+    function (ev) {
+      const nv = ev.target.closest(".st-smappl-new-var-src");
+      if (!nv) return;
+      const submit =
+        ev.key === "Enter" ||
+        ((ev.metaKey || ev.ctrlKey) && (ev.key === "s" || ev.key === "S"));
+      if (!submit) return;
+      ev.preventDefault();
+      post({
+        kind: "smapplAddVar",
+        cls: nv.getAttribute("data-src-class") || "",
+        varKind: nv.getAttribute("data-var-kind") || "instance",
+        name: nv.value,
+      });
+      nv.value = "";
+    },
+    true
+  );
+
   // Find tools (Implementors/Senders): Enter in the search box runs the query
   // (vm_host VmRequest::Find); results land via macvmSetFindResults.
   document.addEventListener(

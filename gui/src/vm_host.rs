@@ -156,6 +156,17 @@ pub enum VmRequest {
     SmapplNewClass {
         text: String,
     },
+    /// Outliner "＋ add instance/class variable": union a new variable NAME into
+    /// the class's stored shell (image `reimport_class_shell`). A class variable
+    /// also goes live immediately (reopening a class to append a `<classVars: …>`
+    /// entry is not a shape change), so the outliner shows it at once; an
+    /// instance variable is a shape change the running VM's fixed object layout
+    /// can't apply, so it persists and takes effect on the next VM restart.
+    SmapplAddVar {
+        cls: String,
+        is_class_var: bool,
+        name: String,
+    },
     /// Drill down: a class name in a hierarchy outliner was clicked. Replace
     /// that widget (`widget_id`) with the class's method browser (a
     /// `ClassOutliner`, with editable source), carrying a back link to `root`'s
@@ -1014,6 +1025,15 @@ fn reopen_one_method(world: &MockWorld, class_name: &str, text: &str) -> String 
     )
 }
 
+/// A conservative check that `s` is a usable variable name — a Smalltalk-style
+/// identifier (a letter or `_`, then letters/digits/`_`). Guards the outliner's
+/// add-variable path from persisting junk into a class's stored shell.
+fn is_valid_var_name(s: &str) -> bool {
+    let mut chars = s.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
 /// Compiles `mst_source` into the running VM (S22-E) so a browser edit is
 /// LIVE — usable immediately — not merely saved to the mock + image. A
 /// compile failure is returned as a short string (the edit is still saved;
@@ -1492,6 +1512,69 @@ fn handle(
                             format!("Created {new_name} in the image, but compile failed: {e}")
                         }
                         (Some(ie), _) => format!("Created {new_name}, but image issue: {ie}"),
+                    }
+                }
+            };
+            let mut responses = vec![VmResponse::Transcript(msg)];
+            responses.extend(refresh_open_outliners(vm, image, ""));
+            responses
+        }
+        VmRequest::SmapplAddVar {
+            cls,
+            is_class_var,
+            name,
+        } => {
+            let name = name.trim().to_string();
+            let msg = if name.is_empty() {
+                "Enter a variable name.".to_string()
+            } else if !is_valid_var_name(&name) {
+                format!("'{name}' is not a valid variable name (letters, digits, _).")
+            } else if world.class_named(&cls).is_none() {
+                format!("No class named {cls}.")
+            } else {
+                // Union the new name into the class's stored shell (idempotent).
+                let (iv, cv): (&str, &str) = if is_class_var {
+                    ("", name.as_str())
+                } else {
+                    (name.as_str(), "")
+                };
+                let image_err = image.and_then(|img| {
+                    img.reimport_class_shell(&cls, iv, cv)
+                        .err()
+                        .map(|e| e.to_string())
+                });
+                if is_class_var {
+                    // A class variable is a separate association, not part of the
+                    // instance shape — reopening the class to append it compiles
+                    // cleanly and takes effect immediately.
+                    let sc = world
+                        .class_named(&cls)
+                        .and_then(|c| c.superclass.clone())
+                        .unwrap_or_else(|| "Object".to_string());
+                    let def = format!("{sc} subclass: {cls} [\n    <classVars: {name}>\n]");
+                    match (image_err, live_compile(vm, &def)) {
+                        (None, Ok(())) => {
+                            format!("Added class variable {name} to {cls} — live in the VM.")
+                        }
+                        (None, Err(e)) => format!(
+                            "Added class variable {name} to {cls} in the image, but not live: {e}."
+                        ),
+                        (Some(ie), _) => {
+                            format!("Added class variable {name} to {cls}, but image issue: {ie}.")
+                        }
+                    }
+                } else {
+                    // An instance variable grows every instance's shape, which the
+                    // running VM's fixed object layout can't do live (no instance
+                    // migration) — persisted now, applied on the next VM restart.
+                    match image_err {
+                        None => format!(
+                            "Added instance variable {name} to {cls} — restart the GUI to apply it \
+                             to the running VM (instance shape is fixed once a class is defined)."
+                        ),
+                        Some(ie) => {
+                            format!("Added instance variable {name} to {cls}, but image issue: {ie}.")
+                        }
                     }
                 }
             };
@@ -2843,6 +2926,71 @@ mod tests {
             "must list Point among printOn: implementors (a drill-link), got a {}-char result",
             html.len()
         );
+        std::fs::remove_file(&tmp).ok();
+    }
+
+    /// Outliner "＋ add variable": a class variable goes LIVE (reflection shows
+    /// it at once); an instance variable is a shape change the running VM can't
+    /// apply, so it persists for the next boot and is NOT live; junk is rejected.
+    #[test]
+    fn add_variable_class_var_is_live_instance_var_awaits_restart() {
+        OPEN_OUTLINERS.with(|o| o.borrow_mut().clear());
+        let tmp =
+            std::env::temp_dir().join(format!("macvm_addvar_{}.sqlite3", std::process::id()));
+        std::fs::remove_file(&tmp).ok();
+        let image = open_or_seed_image(&test_world_dir(), &tmp).expect("seed");
+        // Mirror the image (so the mock's Point superclass matches the VM's — the
+        // class-var reopen would otherwise be rejected for a superclass mismatch).
+        let mut world = mock_world_from_image(&image);
+        let mut sel = BrowserSelection::default();
+        let mut vm = test_vm_handle(macvm::runtime::JitMode::Off);
+        let add = |world: &mut MockWorld, sel: &mut BrowserSelection, vm: &mut VmHandle, cv: bool, name: &str| {
+            handle(
+                VmRequest::SmapplAddVar {
+                    cls: "Point".to_string(),
+                    is_class_var: cv,
+                    name: name.to_string(),
+                },
+                world,
+                sel,
+                Some(&image),
+                vm,
+            )
+        };
+
+        // Class variable -> live.
+        let r = add(&mut world, &mut sel, &mut vm, true, "Origin");
+        assert!(
+            matches!(r.first(), Some(VmResponse::Transcript(m)) if m.contains("live")),
+            "class var must report live, got {r:?}"
+        );
+        assert!(
+            vm.eval("ClassMirror classVariablesOf: Point")
+                .expect("eval")
+                .contains("Origin"),
+            "class var must be live in the VM"
+        );
+
+        // Instance variable -> persisted but NOT live (fixed shape).
+        let r2 = add(&mut world, &mut sel, &mut vm, false, "z");
+        assert!(
+            matches!(r2.first(), Some(VmResponse::Transcript(m)) if m.contains("restart")),
+            "instance var must report restart-to-apply, got {r2:?}"
+        );
+        assert!(
+            !vm.eval("ClassMirror instanceVariablesOf: Point")
+                .expect("eval")
+                .contains("#z"),
+            "instance var must NOT be live (shape change)"
+        );
+
+        // Junk name -> rejected.
+        let r3 = add(&mut world, &mut sel, &mut vm, false, "3bad");
+        assert!(
+            matches!(r3.first(), Some(VmResponse::Transcript(m)) if m.contains("not a valid")),
+            "invalid name must be rejected, got {r3:?}"
+        );
+
         std::fs::remove_file(&tmp).ok();
     }
 

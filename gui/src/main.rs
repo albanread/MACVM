@@ -1430,6 +1430,16 @@ extern "C" fn on_script_message(_this: Id, _cmd: Sel, _controller: Id, message: 
                 });
             }
         }
+        "smapplAddVar" => {
+            // ⏎/Cmd+S in an outliner "＋ add instance/class variable" field.
+            if let Some(vm) = VM.get() {
+                vm.submit(vm_host::VmRequest::SmapplAddVar {
+                    cls: dict_get_string(body, "cls"),
+                    is_class_var: dict_get_string(body, "varKind") == "class",
+                    name: dict_get_string(body, "name"),
+                });
+            }
+        }
         "smapplOpenClass" => {
             // Drill from a hierarchy outliner into a class's method browser.
             if let Some(vm) = VM.get() {
@@ -1647,20 +1657,20 @@ extern "C" fn restart_vm_thread(_this: Id, _cmd: Sel, _sender: Id) {
     }
 }
 
-/// The Demos menu's "Catcher" item: open the native game pane and start the
-/// Catcher demo game (`world/44_catcher.mst`). Same path as the
+/// The Demos menu's "Breakout" item: open the native game pane and start the
+/// Breakout demo game (`world/44_breakout.mst`). Same path as the
 /// `MACVM_GAMEPANE_DEMO` launch trigger.
-extern "C" fn run_catcher_demo(_this: Id, _cmd: Sel, _sender: Id) {
+extern "C" fn run_breakout_demo(_this: Id, _cmd: Sel, _sender: Id) {
     open_game_pane();
     if let Some(vm) = VM.get() {
         vm.submit(vm_host::VmRequest::Doit {
-            code: "Catcher launch.".to_string(),
+            code: "Breakout launch.".to_string(),
         });
     }
 }
 
 /// The Demos menu's "Mandelbrot" item: open the native game pane and start the
-/// zooming-Mandelbrot demo (`world/45_mandelzoom.mst`). Same path as Catcher.
+/// zooming-Mandelbrot demo (`world/45_mandelzoom.mst`). Same path as Breakout.
 extern "C" fn run_mandel_demo(_this: Id, _cmd: Sel, _sender: Id) {
     open_game_pane();
     if let Some(vm) = VM.get() {
@@ -1677,8 +1687,8 @@ fn build_demos_delegate() -> Id {
     let cls = objc::allocate_class(objc::get_class("NSObject"), "MacvmDemosDelegate");
     objc::add_method(
         cls,
-        sel("runCatcherDemo:"),
-        run_catcher_demo as *const _,
+        sel("runBreakoutDemo:"),
+        run_breakout_demo as *const _,
         "v@:@",
     );
     objc::add_method(
@@ -2047,11 +2057,11 @@ fn build_menu_bar() {
     // The Demos menu: launch a Smalltalk demo game in the native game pane
     // (docs/gamepane_design.md).
     let demos_delegate = build_demos_delegate();
-    let catcher_item = menu_item("Catcher — catch the coin (← →)", Some("runCatcherDemo:"), "");
-    objc::send1_id(catcher_item, sel("setTarget:"), demos_delegate);
+    let breakout_item = menu_item("Breakout — clear the wall (← →)", Some("runBreakoutDemo:"), "");
+    objc::send1_id(breakout_item, sel("setTarget:"), demos_delegate);
     let mandel_item = menu_item("Mandelbrot — a live zooming dive", Some("runMandelDemo:"), "");
     objc::send1_id(mandel_item, sel("setTarget:"), demos_delegate);
-    let demos_menu = submenu("Demos", &[catcher_item, mandel_item]);
+    let demos_menu = submenu("Demos", &[breakout_item, mandel_item]);
 
     let theme_menu = build_theme_menu();
     let help_delegate = build_help_delegate();
@@ -2199,7 +2209,7 @@ fn main() {
     // start a real Smalltalk-driven frame loop, exercising the whole M4 path
     // (timer -> GameStep -> step block -> draw -> present). The env value picks
     // the demo — "mandel" for the zooming Mandelbrot (world/45_mandelzoom.mst),
-    // anything else for Catcher (world/44_catcher.mst). The Demos menu items
+    // anything else for Breakout (world/44_breakout.mst). The Demos menu items
     // run the same doits.
     if let Some(demo) = std::env::var_os("MACVM_GAMEPANE_DEMO") {
         open_game_pane();
@@ -2207,7 +2217,7 @@ fn main() {
             let code = if demo.to_string_lossy().eq_ignore_ascii_case("mandel") {
                 "MandelZoom launch."
             } else {
-                "Catcher launch."
+                "Breakout launch."
             };
             vm.submit(vm_host::VmRequest::Doit {
                 code: code.to_string(),
