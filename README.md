@@ -200,6 +200,12 @@ differential oracle every JIT change is gated against (compiled output must be
 byte-identical to interpreted output). Tests: `cargo test`; the stress matrix
 (GC / deopt) and world differentials are in `tests/` and the `justfile` gates.
 
+The GUI boots from a SQLite **image** (`world/image.sqlite3`) rebuilt from the
+`world/*.mst` source. After changing a world class, rebuild it with
+`./reseed-world.sh` (build + fresh reseed + boot-check) — see
+[`docs/managingtheworld.md`](docs/managingtheworld.md) for the full workflow and
+gotchas.
+
 ## Lineage & licensing
 
 Self and Strongtalk were released under BSD-style licenses. Code adapted from
