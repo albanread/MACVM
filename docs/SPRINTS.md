@@ -339,7 +339,7 @@ interleaves with it; every wave lands with in-language tests.
   `GameStep` per tick (the worker stays strictly serial); `run` returns
   immediately with the step-block GC-rooted in a class variable. Full design and
   the M0–M4 milestone ladder in [`gamepane_design.md`](gamepane_design.md);
-  `world/43_gamepane.mst` (GamePane/Sprite/Sound/Tune) + the `Catcher`
+  `world/43_gamepane.mst` (GamePane/Sprite/Sound/Tune) + the `Breakout`
   (`world/44`) and `MandelZoom` (`world/45`) demos, reachable from the GUI's
   native **Demos** menu. Same non-disruptive side-track posture as S20/S23.
 

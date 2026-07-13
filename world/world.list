@@ -64,8 +64,9 @@
 # GamePane: drive the native Metal game pane from Smalltalk (M3 slice,
 # docs/gamepane_design.md). Numbered game primitives (id block 200+).
 43_gamepane.mst
-# Catcher: a tiny demo game exercising the whole engine (docs/gamepane_design.md).
-44_catcher.mst
+# Breakout: a small but complete demo game exercising the whole engine
+# (paddle/ball/brick physics, input, SFX, frame loop; docs/gamepane_design.md).
+44_breakout.mst
 # MandelZoom: a zooming Mandelbrot rendered live in the game pane (reuses
 # Mandelbrot>>escapeAtRe:im:; progressive per-frame render, docs/gamepane_design.md).
 45_mandelzoom.mst

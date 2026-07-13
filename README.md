@@ -84,8 +84,9 @@ allocating. See [`docs/PERF.md`](docs/PERF.md) for the arc and methodology.
   keyboard input, and sound effects + ABC-notation music through AVFoundation,
   via the [MacGamePane](https://github.com/albanread/MacGamePane) engine
   ([`docs/gamepane_design.md`](docs/gamepane_design.md)). Two demos ship in the
-  GUI's **Demos** menu, both written in Smalltalk: `Catcher`
-  ([`world/44_catcher.mst`](world/44_catcher.mst)), a small playable game, and
+  GUI's **Demos** menu, both written in Smalltalk: `Breakout`
+  ([`world/44_breakout.mst`](world/44_breakout.mst)), a small but complete
+  paddle-ball-bricks game, and
   `MandelZoom` ([`world/45_mandelzoom.mst`](world/45_mandelzoom.mst)), a live
   zooming Mandelbrot rendered pixel-by-pixel through the game channel (reusing
   the JIT-compiled `Mandelbrot` escape-time float math).

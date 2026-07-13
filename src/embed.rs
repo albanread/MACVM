@@ -1676,11 +1676,14 @@ mod tests {
     }
 
     #[test]
-    fn catcher_demo_game_launches_and_steps_without_error() {
+    fn breakout_demo_game_launches_and_steps_without_error() {
         // The whole engine end to end in one Smalltalk class: launch the game,
-        // then drive 100 frames with Right held. Crossing coinY=216 within
-        // 72 frames runs resolveCatch (input compare + Sound play), so this
-        // catches any missing world method (e.g. and:) as a DNU, not a hang.
+        // then drive 120 frames with no keys held. The ball starts at y=200
+        // heading up at 3px/frame, so it reaches the brick wall (y<110) within
+        // ~32 frames and hitBricks fires — knocking out a brick and playing a
+        // blip. Driving well past that exercises the wall/paddle/brick physics
+        // (all integer SmallInteger sends), so any missing world method (`//`,
+        // `abs`, `min:`, `max:`, `and:`) surfaces as a DNU here, not a hang.
         struct VecGameSink(Arc<Mutex<Vec<GameCommand>>>);
         impl GameSink for VecGameSink {
             fn emit(&mut self, cmd: GameCommand) {
@@ -1692,11 +1695,11 @@ mod tests {
         let captured = Arc::new(Mutex::new(Vec::new()));
         vm.set_game_sink(Box::new(VecGameSink(captured.clone())));
 
-        vm.eval("Catcher launch.")
-            .expect("Catcher launch must run cleanly");
-        for _ in 0..100 {
-            vm.eval("GamePane stepWithKeys: 2.")
-                .expect("a game step (Right held) must not error");
+        vm.eval("Breakout launch.")
+            .expect("Breakout launch must run cleanly");
+        for _ in 0..120 {
+            vm.eval("GamePane stepWithKeys: 0.")
+                .expect("a game step must not error");
         }
 
         let cmds = captured.lock().unwrap();
@@ -1705,8 +1708,12 @@ mod tests {
             "launch starts the frame loop"
         );
         assert!(
-            cmds.iter().any(|c| matches!(c, GameCommand::DefineSprite { .. })),
-            "the paddle + coin sprites are defined"
+            cmds.iter().any(|c| matches!(c, GameCommand::FillRect { .. })),
+            "bricks and the paddle draw as filled rects"
+        );
+        assert!(
+            cmds.iter().any(|c| matches!(c, GameCommand::Disc { .. })),
+            "the ball draws as a disc"
         );
         assert!(
             cmds.iter().any(|c| matches!(c, GameCommand::Present)),
@@ -1714,7 +1721,73 @@ mod tests {
         );
         assert!(
             cmds.iter().any(|c| matches!(c, GameCommand::PlaySound { .. })),
-            "a catch or miss within 100 frames plays a sound (runs resolveCatch)"
+            "the ball clears a brick within 120 frames, playing a sound (runs hitBricks)"
+        );
+    }
+
+    #[test]
+    fn breakout_soaks_without_soft_lock_or_out_of_bounds() {
+        // A long soak that would catch the two ways this physics could go wrong:
+        // (1) the ball tunneling out of the field or an integer going haywire
+        //     (assert every drawn ball centre stays in bounds), and (2) a
+        //     soft-lock — the ball trapped in a cycle that clears no more bricks
+        //     (assert brick-clear blips keep coming across the whole run, not
+        //     just at the start). The paddle sweeps left/right in a triangle
+        //     wave to simulate real play, so the board clears and resets repeat.
+        struct VecGameSink(Arc<Mutex<Vec<GameCommand>>>);
+        impl GameSink for VecGameSink {
+            fn emit(&mut self, cmd: GameCommand) {
+                self.0.lock().unwrap().push(cmd);
+            }
+        }
+
+        let mut vm = boot_test_vm(JitMode::Off);
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        vm.set_game_sink(Box::new(VecGameSink(captured.clone())));
+        vm.eval("Breakout launch.")
+            .expect("Breakout launch must run cleanly");
+
+        // A triangle-wave key mask: 80 frames Right (2), then 80 frames Left (1).
+        let mut sounds_in_first_half = 0usize;
+        let mut sounds_in_second_half = 0usize;
+        const FRAMES: usize = 4000;
+        for f in 0..FRAMES {
+            let mask = if (f / 80) % 2 == 0 { 2 } else { 1 };
+            {
+                let mut buf = captured.lock().unwrap();
+                buf.clear();
+            }
+            vm.eval(&format!("GamePane stepWithKeys: {mask}."))
+                .unwrap_or_else(|e| panic!("frame {f} must not error: {e}"));
+            let buf = captured.lock().unwrap();
+            for c in buf.iter() {
+                if let GameCommand::Disc { cx, cy, .. } = c {
+                    assert!(
+                        (0..=320).contains(cx) && (0..=240).contains(cy),
+                        "frame {f}: ball centre ({cx},{cy}) left the field — a physics escape"
+                    );
+                }
+                if matches!(c, GameCommand::PlaySound { .. }) {
+                    if f < FRAMES / 2 {
+                        sounds_in_first_half += 1;
+                    } else {
+                        sounds_in_second_half += 1;
+                    }
+                }
+            }
+        }
+
+        // Progress must continue throughout — a soft-lock would fall silent
+        // after the ball got stuck, so the second half must also clear bricks.
+        assert!(
+            sounds_in_first_half > 5,
+            "the ball should clear many bricks early ({sounds_in_first_half} sounds)"
+        );
+        assert!(
+            sounds_in_second_half > 5,
+            "the game must keep making progress in the second half — no soft-lock \
+             ({sounds_in_second_half} sounds in frames {}..{FRAMES})",
+            FRAMES / 2
         );
     }
 

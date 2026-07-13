@@ -1,0 +1,195 @@
+"44_breakout.mst — BREAKOUT, a small but complete demo game for the native Metal
+ game pane (docs/gamepane_design.md). Move the paddle with the Left/Right arrow
+ keys; the ball bounces off the walls, the paddle, and the brick wall, knocking
+ out a brick (and scoring a point + a blip) on each hit. Miss the ball off the
+ bottom and you lose one of three lives; clear every brick and the board rebuilds.
+ It never dead-ends — lose all your lives or clear the wall and it just resets —
+ so it makes a good looping demo.
+
+ One Smalltalk class exercises the whole engine at once: palette + rectangle +
+ disc drawing, keyboard input, SFX, and the 60fps frame loop. The physics is
+ plain integer arithmetic (JIT-compiled SmallInteger sends), deterministic, and
+ tuned so the ball can never tunnel through a brick (|velocity| < a brick) nor
+ soft-lock (the vertical speed is a constant 3, and a dead-centre paddle hit is
+ nudged off perfectly-vertical). In a headless VM (no game sink) every game
+ primitive silently fails and returns self, so loading this class outside the GUI
+ is harmless. Launch it from the Demos menu, or a Workspace:  Breakout launch
+
+ Geometry (the pane is 320x240): a 10x6 brick wall on a 32x14 cell grid starting
+ at y=26 (bricks inset to 28x10); a 44x5 paddle at y=224; a radius-3 ball; the
+ top HUD strip is the top 16px (score bar left, remaining lives right)."
+Object subclass: Breakout [
+    | pane bx by vx vy paddleX score lives bricks bricksLeft |
+
+    Breakout class >> launch [
+        "Open the game pane and start a new game."
+        ^self new start
+    ]
+
+    start [
+        pane := GamePane new.
+        self buildPalette.
+        paddleX := 138.            "(320 - 44) // 2, centred"
+        score := 0.
+        lives := 3.
+        self buildBricks.
+        self resetBall.
+        pane onStep: [ self step ]; run.
+        ^self
+    ]
+
+    buildPalette [
+        "16 = background, 17 = HUD white, 18 = paddle, 19 = ball, 20..25 = the
+         six brick-row colours (a warm-to-cool rainbow, top row hottest)."
+        pane paletteAt: 16 r: 18  g: 18  b: 32.
+        pane paletteAt: 17 r: 255 g: 255 b: 255.
+        pane paletteAt: 18 r: 90  g: 200 b: 255.
+        pane paletteAt: 19 r: 255 g: 240 b: 120.
+        pane paletteAt: 20 r: 220 g: 60  b: 60.
+        pane paletteAt: 21 r: 240 g: 140 b: 40.
+        pane paletteAt: 22 r: 235 g: 220 b: 60.
+        pane paletteAt: 23 r: 90  g: 200 b: 90.
+        pane paletteAt: 24 r: 70  g: 130 b: 230.
+        pane paletteAt: 25 r: 170 g: 90  b: 220.
+        ^self
+    ]
+
+    buildBricks [
+        "A fresh full wall: 10 columns x 6 rows of alive flags (1 = present),
+         stored row-major and 1-indexed to match the ByteArray."
+        bricks := ByteArray new: 60.
+        0 to: 59 do: [ :i | bricks at: i + 1 put: 1 ].
+        bricksLeft := 60.
+        ^self
+    ]
+
+    resetBall [
+        "Put the ball just above the paddle centre, heading up (negative y) with
+         a small, never-zero, sideways drift so it cannot start dead-vertical."
+        bx := paddleX + 22.
+        by := 200.
+        vx := (Time millisecondClockValue \\ 2) = 0 ifTrue: [ 2 ] ifFalse: [ -2 ].
+        vy := 0 - 3.
+        ^self
+    ]
+
+    step [
+        "One frame: read input, advance the ball, resolve every collision, draw."
+        self input.
+        self move.
+        self bouncePaddle.
+        self hitBricks.
+        self checkBottom.
+        self draw.
+        ^self
+    ]
+
+    input [
+        "Slide the paddle with the arrow keys and clamp it to the field."
+        (pane keyHeld: GamePane keyLeft)  ifTrue: [ paddleX := paddleX - 6 ].
+        (pane keyHeld: GamePane keyRight) ifTrue: [ paddleX := paddleX + 6 ].
+        paddleX := (paddleX max: 0) min: 276.   "320 - 44"
+        ^self
+    ]
+
+    move [
+        "Advance the ball and bounce it off the three walls. The vertical speed
+         magnitude is preserved by every bounce (only the sign flips), so the
+         ball is never faster than 3px/frame down its short axis and cannot
+         tunnel a 10px-tall brick."
+        bx := bx + vx.
+        by := by + vy.
+        bx <= 3   ifTrue: [ bx := 3.   vx := vx abs ].
+        bx >= 317 ifTrue: [ bx := 317. vx := vx abs negated ].
+        by <= 19  ifTrue: [ by := 19.  vy := vy abs ].   "16 (HUD) + radius"
+        ^self
+    ]
+
+    bouncePaddle [
+        "If the ball is falling into the paddle band and overlaps it, bounce up
+         and steer: the horizontal speed comes from where on the paddle it hit
+         (centre = straight, edges = sharp), clamped and never left exactly zero."
+        | offset |
+        (vy > 0
+          and: [ (by + 3) >= 224
+          and: [ (by - 3) <= 229
+          and: [ (bx >= (paddleX - 3)) and: [ bx <= (paddleX + 47) ] ] ] ])
+            ifTrue: [
+                by := 220.
+                vy := vy abs negated.
+                "Symmetric english: dividing the MAGNITUDE and reapplying the
+                 sign keeps the straight-up zone exactly on the paddle centre
+                 (`//` floors toward -inf, so dividing a signed offset would bias
+                 it sideways). A dead-centre hit is nudged off perfect-vertical."
+                offset := bx - (paddleX + 22).
+                vx := (offset abs // 6) min: 4.
+                offset < 0 ifTrue: [ vx := vx negated ].
+                vx = 0 ifTrue: [
+                    vx := (Time millisecondClockValue \\ 2) = 0
+                        ifTrue: [ 1 ] ifFalse: [ -1 ] ].
+                Sound click play ].
+        ^self
+    ]
+
+    hitBricks [
+        "If the ball centre sits in a live brick cell, knock it out, score, blip,
+         and bounce vertically. col/row are clamped defensively; the two y-guards
+         cheaply skip the (common) case of the ball being outside the wall."
+        | col row idx |
+        by < 26   ifTrue: [ ^self ].
+        by >= 110 ifTrue: [ ^self ].          "26 + 6*14, below the wall"
+        col := ((bx // 32) max: 0) min: 9.
+        row := (((by - 26) // 14) max: 0) min: 5.
+        idx := (row * 10) + col + 1.
+        (bricks at: idx) = 0 ifTrue: [ ^self ].
+        bricks at: idx put: 0.
+        bricksLeft := bricksLeft - 1.
+        score := score + 1.
+        vy := vy negated.
+        Sound blip play.
+        bricksLeft <= 0 ifTrue: [ Sound powerup play. self resetGame ].
+        ^self
+    ]
+
+    checkBottom [
+        "Ball past the bottom edge: a miss."
+        by > 236 ifTrue: [ self loseLife ].
+        ^self
+    ]
+
+    loseLife [
+        lives := lives - 1.
+        Sound hurt play.
+        lives <= 0 ifTrue: [ ^self resetGame ].
+        self resetBall.
+        ^self
+    ]
+
+    resetGame [
+        "Rebuild the wall and start over — the demo loops forever."
+        self buildBricks.
+        score := 0.
+        lives := 3.
+        self resetBall.
+        ^self
+    ]
+
+    draw [
+        pane cls: 16.
+        "The brick wall."
+        0 to: 5 do: [ :row |
+            0 to: 9 do: [ :col |
+                (bricks at: (row * 10) + col + 1) ~= 0 ifTrue: [
+                    pane fill: (col * 32) + 2 y: (26 + (row * 14)) + 2
+                         width: 28 height: 10 color: 20 + row ] ] ].
+        "Paddle and ball."
+        pane fill: paddleX y: 224 width: 44 height: 5 color: 18.
+        pane disc: bx y: by radius: 3 color: 19.
+        "HUD: score bar (top-left) and one marker per remaining life (top-right)."
+        pane fill: 4 y: 4 width: ((score * 3) min: 300) height: 5 color: 17.
+        0 to: lives - 1 do: [ :i |
+            pane fill: 300 - (i * 10) y: 4 width: 7 height: 6 color: 19 ].
+        pane present.
+        ^self
+    ]
+]
