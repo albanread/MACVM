@@ -73,6 +73,14 @@ Object subclass: GamePane [
         <primitive: 207>
         ^self
     ]
+    blit: aByteArray [
+        "Overwrite the whole pane from a ByteArray of width*height palette
+         indices (row-major, 0 at top-left) in ONE command — the bulk path for a
+         CPU-generated frame, far cheaper than a point:y:color: per pixel. The
+         batch drain presents it; `present` is optional."
+        <primitive: 215>
+        ^self
+    ]
 
     "--- the frame loop (docs/gamepane_design.md M4) ---"
 

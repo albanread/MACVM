@@ -1059,6 +1059,14 @@ pub static PRIMITIVES: &[PrimDesc] = &[
         can_allocate: false,
         can_fail: true,
     },
+    PrimDesc {
+        id: 215,
+        name: "GamePane>>blit:",
+        f: prim_game_blit,
+        argc: 1,
+        can_allocate: false,
+        can_fail: true,
+    },
 ];
 
 pub fn prim_by_id(id: u16) -> Option<&'static PrimDesc> {
@@ -1264,6 +1272,19 @@ fn prim_game_play_tune(vm: &mut VmState, args: &[Oop]) -> PrimResult {
         return PrimResult::Fail;
     };
     game_emit(vm, GameCommand::PlayTune { abc });
+    PrimResult::Ok(args[0])
+}
+
+/// `blit:` (215): overwrite the active pane buffer from a `ByteArray` of
+/// palette indices (row-major) in one command — the bulk path for a
+/// CPU-generated frame. A non-`ByteArray` argument fails.
+fn prim_game_blit(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    let Some(bytes) = ByteArrayOop::try_from(args[1]) else {
+        return PrimResult::Fail;
+    };
+    let mut data = Vec::new();
+    bytes.copy_bytes_out(&mut data);
+    game_emit(vm, GameCommand::Blit { data });
     PrimResult::Ok(args[0])
 }
 
@@ -3066,6 +3087,7 @@ mod tests {
             (212, "GamePane>>primMoveSprite:x:y:"),
             (213, "Sound>>primPlay:"),
             (214, "Tune>>primPlayTune:"),
+            (215, "GamePane>>blit:"),
         ];
         assert_eq!(
             PRIMITIVES.len(),

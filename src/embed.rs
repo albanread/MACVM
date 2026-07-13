@@ -160,6 +160,10 @@ pub enum GameCommand {
         r: i64,
         index: u8,
     },
+    /// Overwrite the whole active buffer from a row-major slice of palette
+    /// indices (`GamePane>>blit:`). The bulk path for CPU-generated frames — one
+    /// command instead of one `Pset` per pixel.
+    Blit { data: Vec<u8> },
     /// Upload the CPU buffer and present the frame.
     Present,
     /// Start the frame loop: the GUI's main-thread timer begins pulling one
@@ -1181,6 +1185,10 @@ mod tests {
                             b[y as usize * W + x as usize] = index;
                         }
                     }
+                    GameCommand::Blit { data } => {
+                        let n = data.len().min(b.len());
+                        b[..n].copy_from_slice(&data[..n]);
+                    }
                     // PaletteAt/Present/StartLoop don't affect the index buffer.
                     _ => {}
                 }
@@ -1195,12 +1203,10 @@ mod tests {
         vm.set_game_sink(Box::new(Raster(buf.clone())));
         vm.exec("MandelZoom launch.")
             .expect("MandelZoom launch must run");
-        // One full frame = 240 rows / 8 rows-per-step = 30 steps. The first
-        // frame is at scale 3.5, so it shows the whole set.
-        for _ in 0..30 {
-            vm.exec("GamePane stepWithKeys: 0.")
-                .expect("a game step must run");
-        }
+        // Each tick computes a whole frame and blits it, so one step suffices;
+        // the first frame is at scale 3.5, so it shows the whole set.
+        vm.exec("GamePane stepWithKeys: 0.")
+            .expect("a game step must run");
 
         let pixels = buf.lock().unwrap();
         let inside = pixels.iter().filter(|&&p| p == 16).count();
@@ -1260,15 +1266,15 @@ mod tests {
         vm.set_game_sink(Box::new(VecGameSink(captured.clone())));
 
         vm.exec("MandelZoom launch.").expect("launch must run");
-        // A frame while running draws (emits Pset commands).
+        // A frame while running draws (MandelZoom blits a whole frame).
         vm.exec("GamePane stepWithKeys: 0.").expect("a step must run");
         assert!(
             captured
                 .lock()
                 .unwrap()
                 .iter()
-                .any(|c| matches!(c, GameCommand::Pset { .. })),
-            "a running demo's frame must draw pixels"
+                .any(|c| matches!(c, GameCommand::Blit { .. })),
+            "a running demo's frame must draw"
         );
 
         // Reset (what Escape does), then tick again: nothing draws.

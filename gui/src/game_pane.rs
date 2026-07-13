@@ -266,6 +266,7 @@ pub fn apply_command(cmd: &macvm::embed::GameCommand) {
             } => n.pane.line(*x0, *y0, *x1, *y1, *index),
             C::FillRect { x, y, w, h, index } => n.pane.fill_rect(*x, *y, *w, *h, *index),
             C::Disc { cx, cy, r, index } => n.pane.disc(*cx, *cy, *r, *index),
+            C::Blit { data } => n.pane.blit(data),
             C::DefineSprite { id, rows } => {
                 if let Some(def) = n.sprites.define_sprite(rows) {
                     let inst = n.sprites.place(def, 0.0, 0.0);
