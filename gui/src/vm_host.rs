@@ -1543,6 +1543,11 @@ fn handle(
                         .err()
                         .map(|e| e.to_string())
                 });
+                // Mirror into the mock so the Rust browser (image-based) shows
+                // the variable at once — the dual-placement counterpart to the
+                // outliner, which reflects the live VM (so an instance var there
+                // waits for a restart, but here it appears immediately).
+                world.add_var(&cls, is_class_var, name.as_str());
                 if is_class_var {
                     // A class variable is a separate association, not part of the
                     // instance shape — reopening the class to append it compiles
@@ -1580,6 +1585,11 @@ fn handle(
             };
             let mut responses = vec![VmResponse::Transcript(msg)];
             responses.extend(refresh_open_outliners(vm, image, ""));
+            // Refresh the browser too, if it's the open view (replace_pane is a
+            // no-op when its panes aren't on the page — so this is safe from the
+            // outliner as well). The mock was just updated, so the added
+            // variable shows in the categories pane immediately.
+            responses.push(render_browser_panes(world, selection));
             responses
         }
         VmRequest::SmapplOpenClass {

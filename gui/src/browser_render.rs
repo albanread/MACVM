@@ -213,6 +213,33 @@ pub fn render_categories_pane(world: &MockWorld, sel: &BrowserSelection) -> Stri
     // `data-browser-category=""` reuses the exact same click plumbing
     // (`smtk.js`) real categories use; `BrowserSelectCategory`'s handler
     // (`vm_host.rs`) treats an empty name as clearing back to `None`.
+    // The selected side's variables (instance vars on the instance side, class
+    // vars on the class side), read from the mock (image mirror), with a "＋ add"
+    // field. This is the image-based half of the dual placement — a variable
+    // added here shows IMMEDIATELY (unlike the outliner, which reflects the live
+    // VM and so waits for a restart on an instance var). The field reuses the
+    // outliner's `.st-smappl-new-var-src` handler (smtk.js) → smapplAddVar.
+    let vars_section = world
+        .class_named(class_name)
+        .map(|c| {
+            let (label, vars, kind) = if sel.side == Side::Class {
+                ("class variables", c.class_vars.as_str(), "class")
+            } else {
+                ("instance variables", c.instance_vars.as_str(), "instance")
+            };
+            let items: String = vars
+                .split_whitespace()
+                .map(|v| format!("<div class=\"st-browser-var-item\">{}</div>", escape(v)))
+                .collect();
+            format!(
+                "<div class=\"st-browser-vars\"><div class=\"st-browser-vars-label\">{label}</div>\
+                 {items}<input type=\"text\" class=\"st-smappl-new-var-src st-browser-var-add\" \
+                 spellcheck=\"false\" data-src-class=\"{}\" data-var-kind=\"{kind}\" \
+                 placeholder=\"＋ add {kind} variable\"></div>",
+                escape(class_name),
+            )
+        })
+        .unwrap_or_default();
     let all_item = pane_item("category", "", "(all)", sel.category.is_none(), "");
     let categories = world.categories(class_name, sel.side);
     let items: String = categories
@@ -222,7 +249,7 @@ pub fn render_categories_pane(world: &MockWorld, sel: &BrowserSelection) -> Stri
             pane_item("category", cat, cat, active, "")
         })
         .collect();
-    format!("<div class=\"st-browser-pane\" id=\"macvm-browser-categories\">{side_tabs}{all_item}{items}</div>")
+    format!("<div class=\"st-browser-pane\" id=\"macvm-browser-categories\">{side_tabs}{vars_section}{all_item}{items}</div>")
 }
 
 pub fn render_methods_pane(world: &MockWorld, sel: &BrowserSelection) -> String {
@@ -817,6 +844,44 @@ mod tests {
         // No class vars → no empty pragma (would read as a mistake).
         let bare = render_class_header_template(Some("Object"), "Bare", "", "");
         assert!(!bare.contains("classVars"), "{bare}");
+    }
+
+    #[test]
+    fn categories_pane_shows_variables_with_a_side_aware_add_field() {
+        let mut world = MockWorld::empty();
+        world.add_class("Widget", Some("Object"), "Test", "", "x y", "Registry");
+
+        // Instance side: instance vars + an instance-kind add field.
+        let sel = BrowserSelection {
+            class: Some("Widget".into()),
+            side: Side::Instance,
+            ..Default::default()
+        };
+        let html = render_categories_pane(&world, &sel);
+        assert!(html.contains("instance variables"), "label: {html}");
+        assert!(html.contains(">x</div>") && html.contains(">y</div>"), "ivars shown: {html}");
+        assert!(
+            html.contains("st-smappl-new-var-src") && html.contains("data-var-kind=\"instance\""),
+            "instance add field: {html}"
+        );
+
+        // Class side: class vars + a class-kind add field.
+        let sel_c = BrowserSelection {
+            class: Some("Widget".into()),
+            side: Side::Class,
+            ..Default::default()
+        };
+        let html_c = render_categories_pane(&world, &sel_c);
+        assert!(
+            html_c.contains("class variables") && html_c.contains(">Registry</div>"),
+            "class vars: {html_c}"
+        );
+        assert!(html_c.contains("data-var-kind=\"class\""), "class add field: {html_c}");
+
+        // Image-based: a mock add shows IMMEDIATELY (no restart).
+        world.add_var("Widget", false, "z");
+        let html2 = render_categories_pane(&world, &sel);
+        assert!(html2.contains(">z</div>"), "added ivar shows at once: {html2}");
     }
 
     #[test]

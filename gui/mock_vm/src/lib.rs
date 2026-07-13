@@ -236,6 +236,30 @@ impl MockWorld {
         true
     }
 
+    /// Union a variable NAME into a class's instance (or class) variable list,
+    /// mirroring `image_store::Image::reimport_class_shell` so the browser's
+    /// mirror shows an added variable at once (idempotent). Returns `false` if
+    /// the class is unknown.
+    pub fn add_var(&mut self, class_name: &str, is_class_var: bool, name: &str) -> bool {
+        let Some(class) = self.class_named_mut(class_name) else {
+            return false;
+        };
+        let field = if is_class_var {
+            &mut class.class_vars
+        } else {
+            &mut class.instance_vars
+        };
+        if !field.split_whitespace().any(|v| v == name) {
+            if field.is_empty() {
+                *field = name.to_string();
+            } else {
+                field.push(' ');
+                field.push_str(name);
+            }
+        }
+        true
+    }
+
     /// A small, invented class hierarchy across two packages — enough
     /// shape (multiple packages, a real subclass tree, instance *and*
     /// class-side methods, several categories per class) to exercise every
