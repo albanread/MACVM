@@ -687,6 +687,13 @@ fn display_game_pane() {
         append_transcript("(game pane: no Metal device available)");
         return;
     };
+    // Start each game session with a clean held-key table. HELD_KEYS is only
+    // cleared by a keyUp: delivered to the game view, so the Escape that closed
+    // the PREVIOUS game — its keyUp: went to the webview that replaced the pane,
+    // never to us — would otherwise still read as held here, and the frame
+    // loop's level-triggered Escape check would close this new game on its very
+    // first tick. Clearing on open fixes that "second demo exits immediately".
+    macgamepane_graphics::input::clear_all();
     if let Some(window) = WINDOW.get() {
         objc::send1_id(window.0, sel("setContentView:"), view);
         // Make the key-capable game view first responder so keyDown:/keyUp:
