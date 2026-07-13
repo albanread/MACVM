@@ -268,6 +268,7 @@ fn render_class_header_template(
     superclass: Option<&str>,
     class_name: &str,
     instance_vars: &str,
+    class_vars: &str,
 ) -> String {
     let superclass = superclass.unwrap_or("nil");
     let ivars_line = if instance_vars.is_empty() {
@@ -275,7 +276,16 @@ fn render_class_header_template(
     } else {
         format!("    |{instance_vars}|\n")
     };
-    format!("{superclass} subclass: {class_name} [\n{ivars_line}\n]")
+    // Class vars are a `<classVars: A B>` body pragma (the image half of the
+    // dual placement — the Smalltalk outliner shows the same names via live
+    // reflection). Emitted only when there are some, and as real parseable
+    // `.mst` so the definition tab round-trips through `parse_mst_source`.
+    let cvars_line = if class_vars.trim().is_empty() {
+        String::new()
+    } else {
+        format!("    <classVars: {}>\n", class_vars.trim())
+    };
+    format!("{superclass} subclass: {class_name} [\n{ivars_line}{cvars_line}\n]")
 }
 
 /// Blank "New Class" template — prefills the superclass with whichever
@@ -283,7 +293,7 @@ fn render_class_header_template(
 /// I'm looking at" is the common case; falls back to `Object` otherwise.
 fn render_new_class_template(sel: &BrowserSelection) -> String {
     let superclass = sel.class.as_deref().unwrap_or("Object");
-    render_class_header_template(Some(superclass), "NewClass", "")
+    render_class_header_template(Some(superclass), "NewClass", "", "")
 }
 
 /// Blank "New Method" template. The placeholder word is itself a valid
@@ -418,7 +428,12 @@ pub fn render_source_pane(world: &MockWorld, sel: &BrowserSelection) -> String {
             .as_deref()
             .and_then(|n| world.class_named(n))
             .map(|c| {
-                render_class_header_template(c.superclass.as_deref(), &c.name, &c.instance_vars)
+                render_class_header_template(
+                    c.superclass.as_deref(),
+                    &c.name,
+                    &c.instance_vars,
+                    &c.class_vars,
+                )
             })
             .unwrap_or_default(),
         SourceEditTarget::Method => match (&sel.class, &sel.method) {
@@ -786,6 +801,22 @@ mod tests {
             html.contains("data-browser-action=\"new-method\""),
             "{html}"
         );
+    }
+
+    #[test]
+    fn class_definition_shows_instance_and_class_variables() {
+        // The image half of the dual placement: the definition view must show
+        // BOTH the |instance vars| line and the <classVars: …> pragma (the
+        // latter was previously omitted), as round-trippable .mst.
+        let def = render_class_header_template(Some("Object"), "Widget", "x y", "Registry Count");
+        assert!(def.contains("|x y|"), "instance vars: {def}");
+        assert!(
+            def.contains("<classVars: Registry Count>"),
+            "class vars: {def}"
+        );
+        // No class vars → no empty pragma (would read as a mistake).
+        let bare = render_class_header_template(Some("Object"), "Bare", "", "");
+        assert!(!bare.contains("classVars"), "{bare}");
     }
 
     #[test]

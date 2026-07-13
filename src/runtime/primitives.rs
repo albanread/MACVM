@@ -938,6 +938,23 @@ pub static PRIMITIVES: &[PrimDesc] = &[
         can_allocate: true,
         can_fail: true,
     },
+    // --- variable reflection (docs/APPS.md §3, the variable half of R2) ---
+    PrimDesc {
+        id: 157,
+        name: "instanceVariablesOf:",
+        f: prim_instance_variables_of,
+        argc: 1,
+        can_allocate: true,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 158,
+        name: "classVariablesOf:",
+        f: prim_class_variables_of,
+        argc: 1,
+        can_allocate: true,
+        can_fail: true,
+    },
     // --- game group (docs/gamepane_design.md): id block 200+ ---
     PrimDesc {
         id: 200,
@@ -1916,6 +1933,69 @@ fn prim_selectors_of(vm: &mut VmState, args: &[Oop]) -> PrimResult {
                 j += 1;
             }
         });
+    }
+    PrimResult::Ok(result.oop())
+}
+
+/// R2 reflection (`docs/APPS.md` §3): a class's OWN instance-variable names (not
+/// inherited), as an `Array` of `Symbol`s in declaration order — the variable
+/// half of source-level reflection, the analogue of `selectorsOf:`. `args[1]` is
+/// the class. A FRESH array is answered (never the Klass's own `inst_var_names`
+/// array), so a caller can't mutate the class's shape. GC-safe: the behavior is
+/// handle-rooted across the allocation and its names array is re-derived after.
+fn prim_instance_variables_of(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    if KlassOop::try_from(args[1]).is_none() {
+        return PrimResult::Fail; // not a behavior
+    }
+    let scope = crate::memory::handles::HandleScope::enter(vm);
+    let behavior_h = scope.handle(vm, args[1]);
+
+    let count = KlassOop::try_from(behavior_h.get(vm))
+        .and_then(|k| ArrayOop::try_from(k.inst_var_names()))
+        .map(|a| a.len())
+        .unwrap_or(0);
+    let array_klass = vm.universe.array_klass;
+    let result = alloc::alloc_indexable_oops(vm, array_klass, count);
+
+    if let Some(names) =
+        KlassOop::try_from(behavior_h.get(vm)).and_then(|k| ArrayOop::try_from(k.inst_var_names()))
+    {
+        for i in 0..count.min(names.len()) {
+            result.at_put(i, names.at(i));
+        }
+    }
+    PrimResult::Ok(result.oop())
+}
+
+/// R2 reflection: a class's OWN class-variable names, as an `Array` of `Symbol`s.
+/// The Klass stores class vars as `Association`s (name -> value binding); this
+/// answers just the keys (`body_oop(0)`). Same freshness + GC contract as
+/// `instanceVariablesOf:`. No allocation happens inside the fill loop, so the
+/// re-derived associations stay valid throughout.
+fn prim_class_variables_of(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    if KlassOop::try_from(args[1]).is_none() {
+        return PrimResult::Fail; // not a behavior
+    }
+    let scope = crate::memory::handles::HandleScope::enter(vm);
+    let behavior_h = scope.handle(vm, args[1]);
+
+    let count = KlassOop::try_from(behavior_h.get(vm))
+        .and_then(|k| ArrayOop::try_from(k.class_vars()))
+        .map(|a| a.len())
+        .unwrap_or(0);
+    let array_klass = vm.universe.array_klass;
+    let result = alloc::alloc_indexable_oops(vm, array_klass, count);
+
+    let nil = vm.universe.nil_obj;
+    if let Some(assocs) =
+        KlassOop::try_from(behavior_h.get(vm)).and_then(|k| ArrayOop::try_from(k.class_vars()))
+    {
+        for i in 0..count.min(assocs.len()) {
+            let key = MemOop::try_from(assocs.at(i))
+                .map(|m| m.body_oop(0))
+                .unwrap_or(nil);
+            result.at_put(i, key);
+        }
     }
     PrimResult::Ok(result.oop())
 }
@@ -3071,6 +3151,8 @@ mod tests {
             (154, "scale:"),
             (155, "max"),
             (156, "min"),
+            (157, "instanceVariablesOf:"),
+            (158, "classVariablesOf:"),
             // game group (docs/gamepane_design.md)
             (200, "GamePane>>clearR:g:b:"),
             (201, "GamePane>>paletteAt:r:g:b:"),

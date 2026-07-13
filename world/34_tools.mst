@@ -118,6 +118,18 @@ Object subclass: ClassMirror [
         <primitive: 63>
         ^false
     ]
+    "R2 (docs/APPS.md §3): a class's OWN instance-variable names, as an Array of
+     Symbols in declaration (slot) order — the variable half of reflection, the
+     analogue of selectorsOf:."
+    ClassMirror class >> instanceVariablesOf: aBehavior [
+        <primitive: 157>
+        ^Array new: 0
+    ]
+    "R2: a class's OWN class-variable names, as an Array of Symbols."
+    ClassMirror class >> classVariablesOf: aBehavior [
+        <primitive: 158>
+        ^Array new: 0
+    ]
     setClass: c [
         klass := c.
         ^self
@@ -142,6 +154,15 @@ Object subclass: ClassMirror [
     ]
     classSelectors [
         ^(ClassMirror selectorsOf: klass class) asSortedCollection
+    ]
+    "Own variables, kept in DECLARATION order (slot order is meaningful, unlike
+     selectors) — the dynamic, VM-exercising half of the dual placement; the Rust
+     browser renders the same names from the image without touching the VM."
+    instanceVariables [
+        ^ClassMirror instanceVariablesOf: klass
+    ]
+    classVariables [
+        ^ClassMirror classVariablesOf: klass
     ]
 ]
 
@@ -270,6 +291,7 @@ Visual subclass: ClassOutliner [
          methods stay closed (source on demand). Many classes are abstract
          (their methods live on subclasses), so a Subclasses section lets you
          drill down to where the code actually is — e.g. Boolean -> True/False."
+        self variablesOn: html.
         self side: 'instance' selectors: mirror instanceSelectors behavior: mirror theClass on: html.
         self side: 'class' selectors: mirror classSelectors behavior: mirror theClass class on: html.
         self subclassesOn: html.
@@ -292,6 +314,29 @@ Visual subclass: ClassOutliner [
             html raw: '">'.
             html escaped: sub name.
             html raw: '</span></span></div>' ].
+        html raw: '</div></div>'.
+    ]
+    variablesOn: html [
+        "Instance and class variables, read from the LIVE VM via ClassMirror
+         (primitives 157/158) — the dynamic, VM-exercising half of the dual
+         placement. Shown above the methods (a class's shape, then its
+         behaviour). Leaf nodes: a variable is just a name, nothing to open."
+        self varGroup: 'instance variables' names: mirror instanceVariables on: html.
+        self varGroup: 'class variables' names: mirror classVariables on: html.
+    ]
+    varGroup: label names: names on: html [
+        names isEmpty ifTrue: [ ^self ].
+        html raw: '<div class="st-node open"><span class="st-header st-side">'.
+        html raw: '<span class="st-tw" data-tw>&#9662; </span>'.
+        html escaped: label.
+        html raw: ' ('.
+        html raw: names size printString.
+        html raw: ')</span><div class="st-children">'.
+        names do: [ :n |
+            html raw: '<div class="st-node"><span class="st-header st-var">'.
+            html raw: '<span class="st-tw-leaf"></span>'.
+            html escaped: n asString.
+            html raw: '</span></div>' ].
         html raw: '</div></div>'.
     ]
     side: label selectors: sels behavior: behavior on: html [

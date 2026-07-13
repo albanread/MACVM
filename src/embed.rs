@@ -1444,6 +1444,32 @@ mod tests {
     }
 
     #[test]
+    fn class_mirror_reflects_instance_and_class_variable_names() {
+        // The dynamic half of the dual placement: live VM reflection (the new
+        // primitives 157/158, surfaced through ClassMirror) reports a class's
+        // OWN variable names — what the Smalltalk outliner draws its variables
+        // section from, the Rust browser drawing the same names from the image.
+        let mut vm = boot_test_vm(JitMode::Off);
+        let iv = vm
+            .eval("ClassMirror instanceVariablesOf: MandelZoom")
+            .expect("instanceVariablesOf: must eval");
+        assert!(
+            iv.contains("centerR") && iv.contains("scale"),
+            "instance var names: {iv}"
+        );
+        let cv = vm
+            .eval("ClassMirror classVariablesOf: Character")
+            .expect("classVariablesOf: must eval");
+        assert!(cv.contains("Table"), "class var names: {cv}");
+        // A non-behavior argument fails the primitive -> the empty-array
+        // fallback in ClassMirror, not a crash.
+        let none = vm
+            .eval("ClassMirror instanceVariablesOf: 42")
+            .expect("a non-behavior must not crash");
+        assert_eq!(none, "#()", "a non-behavior yields the empty-array fallback");
+    }
+
+    #[test]
     fn game_primitive_fails_on_out_of_range_colour_and_emits_nothing() {
         // r=300 is out of 0..=255, so `smi_byte` fails, the primitive fails,
         // and the method falls through to `^self` — no command emitted. This
