@@ -72,12 +72,12 @@
 
 use crate::browser_render::{self, BrowserSelection, SourceEditTarget};
 use crate::objc::{self, Id, Sel};
-use macvm::embed::{GameCommand, GameSink, TranscriptSink, VmHandle};
+use macvm::embed::{GameCommand, GameSink, TranscriptSink, VmHandle, VmLiveStats, VmMetrics};
 use macvm_mock_vm::MockWorld;
 pub use macvm_mock_vm::Side;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// The two top-level doIts the `.mst` world runs at load (`Transcript` bind +
@@ -321,6 +321,10 @@ pub enum VmRequest {
     /// code path (`docs/CANVAS.md` §5.3: "full redraw" is a command-batch
     /// convention, not a different channel).
     CanvasClear,
+    /// Poll for a metrics snapshot (the GUI's periodic dashboard sampler,
+    /// `main.rs`). The worker answers with `VmResponse::Metrics`. Cheap — a
+    /// field read of live counters, no eval.
+    GetMetrics,
 }
 
 /// VM → GUI. `Transcript` is what the G1 stub host already produces.
@@ -334,6 +338,14 @@ pub enum VmRequest {
 #[derive(Debug)]
 pub enum VmResponse {
     Transcript(String),
+    /// Answer to `VmRequest::GetMetrics`: a snapshot of the VM's runtime
+    /// counters for the toolbar metrics dashboard (`main.rs`).
+    Metrics(VmMetrics),
+    /// Sent once right after (each) boot: a clone of this VM's per-VM live-
+    /// signal block, so the main-thread sampler can read `compiled_depth`
+    /// off-thread for the interpreter/compiler ratio. Consumed by
+    /// `drain_responses` (like `WorkerIdle`), never forwarded to the UI.
+    LiveStats(Arc<VmLiveStats>),
     /// A game-primitive command (`docs/gamepane_design.md` M3) emitted by the
     /// worker via `ChannelGameSink`; `main.rs` applies it to the native Metal
     /// game pane (`game_pane::apply_command`) on the main thread.
@@ -506,6 +518,11 @@ struct HostInner {
     /// exactly the death this is meant to catch. If `submit` finds this
     /// still `Some` and older than `timeout`, the worker is presumed dead.
     pending_since: Option<Instant>,
+    /// This VM generation's per-VM live-signal block (delivered by the boot-time
+    /// `LiveStats` response), for the metrics sampler to read `compiled_depth`
+    /// off-thread. `None` until the worker announces it just after boot; a
+    /// respawn's new VM announces a fresh one, replacing this.
+    live_stats: Option<Arc<VmLiveStats>>,
 }
 
 /// Handle held on the main thread: submits requests, drains responses, and
@@ -574,10 +591,18 @@ impl VmHost {
         while let Ok(response) = inner.responses.try_recv() {
             match response {
                 VmResponse::WorkerIdle => inner.pending_since = None,
+                VmResponse::LiveStats(arc) => inner.live_stats = Some(arc),
                 other => out.push(other),
             }
         }
         out
+    }
+
+    /// A clone of the current VM's per-VM live-signal block, once the worker
+    /// has announced it (just after boot). The metrics sampler reads
+    /// `compiled_depth` from it off-thread — no request, no lock on the VM.
+    pub fn live_stats(&self) -> Option<Arc<VmLiveStats>> {
+        self.inner.lock().unwrap().live_stats.clone()
     }
 }
 
@@ -678,6 +703,7 @@ fn spawn_with_world_and_timeout(
             world_dir,
             timeout,
             pending_since: None,
+            live_stats: None,
         }),
     }
 }
@@ -729,6 +755,11 @@ fn worker_loop(
         None => MockWorld::seed(),
     };
     let mut selection = BrowserSelection::default();
+
+    // Announce this VM's per-VM live-signal block to the main thread once, so
+    // the metrics sampler can read compiled_depth off-thread (a respawn boots a
+    // fresh VM and re-announces its block). Consumed by drain_responses.
+    let _ = responses.send(VmResponse::LiveStats(vm.live_stats()));
 
     for request in requests {
         // Export/import touch the world/*.mst file tree, so they're serviced
@@ -1250,6 +1281,7 @@ fn handle(
                 Err(e) => vec![VmResponse::Transcript(format!("game step error: {e}"))],
             }
         }
+        VmRequest::GetMetrics => vec![VmResponse::Metrics(vm.metrics())],
         VmRequest::SmapplRender { id, code } => {
             // Render the widget image-side (D-G5). A shape that can't be
             // built yet fails cleanly — answer nothing so the placeholder box

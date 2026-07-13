@@ -801,6 +801,208 @@ pub(crate) fn stop_game_loop_timer() {
     });
 }
 
+// ── VM metrics dashboard (native sampler → ring buffer → toolbar) ────────────
+//
+// A main-thread NSTimer samples THIS VM's live signals (`compiled_depth`, via
+// the per-VM `Arc` the worker handed over at boot) at ~15 Hz, and about once a
+// second polls a full counter snapshot (`VmRequest::GetMetrics`). Each snapshot
+// folds that second's worth of exec-mode samples into one `MetricsSample` and
+// pushes it into a bounded RING BUFFER; the ring is processed into the current
+// readout plus tiny sparklines and shipped to the webview toolbar
+// (`#macvm-metrics`). Everything is per-VM — the atomic lives in the VM's own
+// `Arc` and the ring is per this `VmHost` — so several VMs never blend.
+
+/// Ring capacity — one sample per snapshot (~1 Hz) ⇒ ~2 minutes of history.
+const METRICS_RING_CAP: usize = 120;
+/// Sampler ticks per snapshot poll: a 15 Hz timer, poll ~once a second.
+const METRICS_TICKS_PER_POLL: u32 = 15;
+/// Points sent to the webview per sparkline (the tail of the ring).
+const METRICS_SPARK_POINTS: usize = 48;
+
+/// One processed metrics sample (~one per second), the unit stored in the ring.
+#[derive(Clone, Copy, Default)]
+struct MetricsSample {
+    heap_used: u64,
+    heap_cap: u64,
+    alloc_rate: u64, // bytes/sec since the previous sample
+    nmethods: u64,
+    code_used: u64,
+    scavenges: u64,
+    full_gcs: u64,
+    compiled_frac: f32, // interp/compiler execution ratio this window (0..1); NaN if idle
+}
+
+#[derive(Default)]
+struct MetricsState {
+    ring: std::collections::VecDeque<MetricsSample>,
+    prev_alloc: u64,
+    have_prev_alloc: bool,
+    tick: u32,
+    compiled_ticks: u32, // exec-mode accumulators over the current window
+    busy_ticks: u32,
+    poll_pending: bool, // single-outstanding GetMetrics
+}
+
+static METRICS_TIMER_TARGET: OnceLock<MainThreadPtr> = OnceLock::new();
+thread_local! {
+    static METRICS: std::cell::RefCell<MetricsState> =
+        std::cell::RefCell::new(MetricsState::default());
+    static METRICS_TIMER: std::cell::Cell<Id> = const { std::cell::Cell::new(NIL) };
+}
+
+/// The ~15 Hz sampler tick (main thread). Records whether the VM is executing
+/// compiled code right now (from its per-VM live-signal `Arc`), and once a
+/// second asks the worker for a full counter snapshot.
+extern "C" fn on_metrics_tick(_this: Id, _cmd: Sel, _timer: Id) {
+    let Some(vm) = VM.get() else { return };
+    // Exec-mode sample: only meaningful while the VM is busy (idle == neither
+    // interpreting nor compiling). compiled_depth > 0 == in compiled code.
+    if !vm.is_idle() {
+        let in_compiled = vm
+            .live_stats()
+            .is_some_and(|ls| ls.compiled_depth.load(Ordering::Relaxed) > 0);
+        METRICS.with(|m| {
+            let mut m = m.borrow_mut();
+            m.busy_ticks += 1;
+            if in_compiled {
+                m.compiled_ticks += 1;
+            }
+        });
+    }
+    // Once per ~second: request a snapshot (single-outstanding, no pile-up).
+    let want_poll = METRICS.with(|m| {
+        let mut m = m.borrow_mut();
+        m.tick += 1;
+        if m.tick >= METRICS_TICKS_PER_POLL {
+            m.tick = 0;
+            if !m.poll_pending {
+                m.poll_pending = true;
+                return true;
+            }
+        }
+        false
+    });
+    if want_poll {
+        vm.submit(vm_host::VmRequest::GetMetrics);
+    }
+}
+
+fn build_metrics_timer_target() -> Id {
+    let cls = objc::allocate_class(objc::get_class("NSObject"), "MacvmMetricsTimer");
+    objc::add_method(cls, sel("metricsTick:"), on_metrics_tick as *const _, "v@:@");
+    objc::register_class(cls);
+    objc::alloc_init("MacvmMetricsTimer")
+}
+
+/// Start the always-on metrics sampler (~15 Hz). Called once at app launch.
+fn start_metrics_timer() {
+    let target = METRICS_TIMER_TARGET
+        .get_or_init(|| MainThreadPtr(build_metrics_timer_target()))
+        .0;
+    METRICS_TIMER.with(|t| {
+        if t.get() == NIL {
+            t.set(objc::scheduled_timer(
+                1.0 / 15.0,
+                target,
+                sel("metricsTick:"),
+                true,
+            ));
+        }
+    });
+}
+
+/// A counter snapshot came back: fold the window's exec-mode samples into one
+/// ring sample, then render the ring to the toolbar.
+fn metrics_on_snapshot(m: macvm::embed::VmMetrics) {
+    let payload = METRICS.with(|st| {
+        let mut st = st.borrow_mut();
+        st.poll_pending = false;
+
+        let alloc_rate = if st.have_prev_alloc {
+            m.bytes_allocated.saturating_sub(st.prev_alloc)
+        } else {
+            0
+        };
+        st.prev_alloc = m.bytes_allocated;
+        st.have_prev_alloc = true;
+
+        let compiled_frac = if st.busy_ticks > 0 {
+            st.compiled_ticks as f32 / st.busy_ticks as f32
+        } else {
+            // Idle window: carry the last known ratio rather than snap to 0.
+            st.ring.back().map_or(f32::NAN, |s| s.compiled_frac)
+        };
+        st.compiled_ticks = 0;
+        st.busy_ticks = 0;
+
+        st.ring.push_back(MetricsSample {
+            heap_used: m.eden_used + m.old_used,
+            heap_cap: m.eden_capacity + m.old_reserved,
+            alloc_rate,
+            nmethods: m.nmethods,
+            code_used: m.code_used,
+            scavenges: m.scavenges,
+            full_gcs: m.full_gcs,
+            compiled_frac,
+        });
+        while st.ring.len() > METRICS_RING_CAP {
+            st.ring.pop_front();
+        }
+        build_metrics_payload(&st)
+    });
+    eval_js(&format!(
+        "if(window.macvmSetMetrics)window.macvmSetMetrics({payload})"
+    ));
+}
+
+/// Serialize the ring's tail into the compact JSON the toolbar renderer wants:
+/// current values plus short sparkline arrays (a `null` ratio point == idle).
+fn build_metrics_payload(st: &MetricsState) -> String {
+    let last = st.ring.back().copied().unwrap_or_default();
+    let skip = st.ring.len().saturating_sub(METRICS_SPARK_POINTS);
+    let frac_str = |f: f32| {
+        if f.is_nan() {
+            "null".to_string()
+        } else {
+            format!("{f:.3}")
+        }
+    };
+    let heap_spark: Vec<String> = st
+        .ring
+        .iter()
+        .skip(skip)
+        .map(|s| s.heap_used.to_string())
+        .collect();
+    let alloc_spark: Vec<String> = st
+        .ring
+        .iter()
+        .skip(skip)
+        .map(|s| s.alloc_rate.to_string())
+        .collect();
+    let ratio_spark: Vec<String> = st
+        .ring
+        .iter()
+        .skip(skip)
+        .map(|s| frac_str(s.compiled_frac))
+        .collect();
+    format!(
+        "{{\"heapUsed\":{},\"heapCap\":{},\"allocRate\":{},\"nmethods\":{},\"codeUsed\":{},\
+         \"scavenges\":{},\"fullGcs\":{},\"compiledFrac\":{},\
+         \"heapSpark\":[{}],\"allocSpark\":[{}],\"ratioSpark\":[{}]}}",
+        last.heap_used,
+        last.heap_cap,
+        last.alloc_rate,
+        last.nmethods,
+        last.code_used,
+        last.scavenges,
+        last.full_gcs,
+        frac_str(last.compiled_frac),
+        heap_spark.join(","),
+        alloc_spark.join(","),
+        ratio_spark.join(","),
+    )
+}
+
 fn display_canvas() {
     let body =
         canvas_render::render_canvas(canvas_render::DEFAULT_WIDTH, canvas_render::DEFAULT_HEIGHT);
@@ -1677,11 +1879,13 @@ extern "C" fn vm_bridge_drain(_this: Id, _cmd: Sel, _arg: Id) {
                 // toolbar click uses.
                 navigate_toolbar(&target);
             }
-            vm_host::VmResponse::WorkerIdle => {
+            vm_host::VmResponse::Metrics(m) => metrics_on_snapshot(m),
+            vm_host::VmResponse::WorkerIdle | vm_host::VmResponse::LiveStats(_) => {
                 // Never actually delivered here — `VmHost::drain_responses`
-                // consumes the worker-liveness marker internally and never
-                // returns it (see that variant's doc). This arm exists only
-                // to keep the match exhaustive.
+                // consumes the worker-liveness marker and the boot-time
+                // live-stats handoff internally and never returns them (see
+                // those variants' docs). These arms exist only to keep the
+                // match exhaustive.
             }
         }
     }
@@ -2017,6 +2221,8 @@ fn main() {
     // MacModula2's demo lifecycle (src/newm2-runtime/src/objc.rs).
     let delegate = build_quit_on_last_window_delegate();
     objc::send1_id(app, sel("setDelegate:"), delegate);
+    // Start the always-on metrics sampler that feeds the toolbar dashboard.
+    start_metrics_timer();
     objc::send1_bool(app, sel("activateIgnoringOtherApps:"), true);
     objc::send0(app, sel("run"));
 }

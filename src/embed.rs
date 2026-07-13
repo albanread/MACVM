@@ -204,6 +204,52 @@ pub trait GameSink: Send {
     fn emit(&mut self, cmd: GameCommand);
 }
 
+/// Per-VM, lock-free live signals a monitor (e.g. the GUI metrics dashboard)
+/// samples at high frequency WITHOUT going through the VM's request queue — so
+/// they stay live even while the VM is busy inside a long doit. One block per
+/// `VmState`, shared out by `Arc`; deliberately NOT a process global, so
+/// several VMs in one process each keep their own signals (a global would blend
+/// them). Sampling is a plain relaxed atomic load — no lock, no worker round-trip.
+#[derive(Debug, Default)]
+pub struct VmLiveStats {
+    /// Mirror of `VmState::compiled_depth` — the number of nested compiled
+    /// activations currently on the native stack. A sampler reads `> 0` as
+    /// "executing compiled code right now", which (sampled over time while the
+    /// VM is busy) gives the interpreter/compiler execution ratio.
+    pub compiled_depth: std::sync::atomic::AtomicU32,
+}
+
+/// A snapshot of a VM's slower runtime counters for the metrics dashboard —
+/// read on the worker thread by [`VmHandle::metrics`] (a cheap field read, no
+/// allocation, no GC) and shipped to the GUI. Bytes are raw; the GUI diffs
+/// successive snapshots for rates (e.g. allocation/sec) and keeps a ring of
+/// them for graphs. The interpreter/compiler ratio is NOT here — it is sampled
+/// live from [`VmLiveStats`], because at the moment the worker services a
+/// metrics request its Smalltalk stack is empty.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct VmMetrics {
+    // ── memory (bytes) ──
+    pub eden_used: u64,
+    pub eden_capacity: u64,
+    pub old_used: u64,
+    pub old_committed: u64,
+    pub old_reserved: u64,
+    // ── GC ──
+    pub scavenges: u64,
+    pub full_gcs: u64,
+    pub bytes_allocated: u64,
+    pub last_reclaimed: u64,
+    // ── compiled code ──
+    pub nmethods: u64,
+    pub code_used: u64,
+    pub code_capacity: u64,
+    // ── JIT activity ──
+    pub compilations: u64,
+    pub deopts: u64,
+    pub osr_entries: u64,
+    pub ic_misses: u64,
+}
+
 /// Adapts a `TranscriptSink` into the plain `std::io::Write` that
 /// `VmState::out` already expects — SPEC §16.2's sink trait is
 /// guest-output-shaped (whole strings), `Write` is byte-shaped; this is the
@@ -584,6 +630,41 @@ impl VmHandle {
     /// installs a channel-backed sink once, right after `boot`.
     pub fn set_game_sink(&mut self, sink: Box<dyn GameSink>) {
         self.vm.game_sink = Some(sink);
+    }
+
+    /// Hand a monitor a clone of THIS VM's live-signal block (a per-VM `Arc`, no
+    /// global) so it can sample `compiled_depth` at high frequency off-thread,
+    /// without a request round-trip — the basis of the interpreter/compiler
+    /// ratio. Safe to call once at boot and keep.
+    pub fn live_stats(&self) -> std::sync::Arc<VmLiveStats> {
+        self.vm.live_stats.clone()
+    }
+
+    /// Snapshot this VM's slower runtime counters for the metrics dashboard.
+    /// A cheap read of existing fields — no allocation, no GC. Runs on the
+    /// worker thread (the VM's owner).
+    pub fn metrics(&self) -> VmMetrics {
+        let vm = &self.vm;
+        let u = &vm.universe;
+        let (code_lo, code_hi) = vm.code_cache.bounds();
+        VmMetrics {
+            eden_used: (u.eden.top - u.eden.start) as u64,
+            eden_capacity: (u.eden.end - u.eden.start) as u64,
+            old_used: (u.old.top - u.old.bounds.start) as u64,
+            old_committed: (u.old.committed_end - u.old.bounds.start) as u64,
+            old_reserved: (u.old.bounds.end - u.old.bounds.start) as u64,
+            scavenges: u.gc_stats.scavenge_count,
+            full_gcs: u.gc_stats.full_gc_count,
+            bytes_allocated: u.gc_stats.bytes_allocated,
+            last_reclaimed: u.gc_stats.last_reclaimed_bytes,
+            nmethods: vm.code_table.iter_alive().count() as u64,
+            code_used: vm.code_cache.used_bytes() as u64,
+            code_capacity: code_hi.saturating_sub(code_lo),
+            compilations: vm.stats.compilations,
+            deopts: vm.stats.deopt_count,
+            osr_entries: vm.stats.osr_entries,
+            ic_misses: vm.stats.ic_misses,
+        }
     }
 }
 
@@ -1286,6 +1367,79 @@ mod tests {
         assert!(
             after.is_empty(),
             "after reset the step block is gone, so a tick draws nothing, got {after:?}"
+        );
+    }
+
+    #[test]
+    fn metrics_snapshot_reports_live_counters() {
+        let mut vm = boot_test_vm(JitMode::Threshold(1));
+        let m0 = vm.metrics();
+        assert!(m0.eden_capacity > 0, "eden must report a capacity");
+        assert!(m0.code_capacity > 0, "the code cache must report a capacity");
+        // Run a hot looping method (so it compiles) that also allocates enough
+        // to force a scavenge (so the GC byte counter moves).
+        vm.exec(
+            "Object subclass: MetricProbe [ \
+               loop: n [ | s | s := 0. 1 to: n do: [:i | s := s + i]. ^s ] \
+               churn: n [ 1 to: n do: [:i | Array new: 8] ] ].",
+        )
+        .expect("probe class must compile");
+        for _ in 0..30 {
+            vm.exec("MetricProbe new loop: 5000; churn: 3000.")
+                .expect("workload must run");
+        }
+        let m1 = vm.metrics();
+        assert!(
+            m1.bytes_allocated > m0.bytes_allocated,
+            "allocation must move the GC byte counter"
+        );
+        assert!(
+            m1.nmethods > 0 && m1.compilations > 0,
+            "the hot method must have compiled (nmethods={}, compilations={})",
+            m1.nmethods,
+            m1.compilations
+        );
+    }
+
+    #[test]
+    fn live_stats_lets_a_monitor_observe_compiled_execution_off_thread() {
+        // The interpreter/compiler ratio depends on a monitor sampling a VM's
+        // `compiled_depth` from ANOTHER thread while the VM runs. Prove it: warm
+        // a method until it compiles, then sample its live_stats from a second
+        // thread during a long compiled loop and confirm the sampler sees
+        // `compiled_depth > 0`. The block is per-VM (an Arc), never a global.
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+        let mut vm = boot_test_vm(JitMode::Threshold(1));
+        vm.exec("Object subclass: MetricProbe [ loop: n [ | s | s := 0. 1 to: n do: [:i | s := s + i]. ^s ] ].")
+            .expect("probe class");
+        for _ in 0..30 {
+            vm.exec("MetricProbe new loop: 3000.").expect("warmup");
+        }
+        assert!(
+            vm.metrics().compilations > 0,
+            "the probe loop must have compiled before we sample it"
+        );
+
+        let live = vm.live_stats();
+        let stop = Arc::new(AtomicBool::new(false));
+        let max_depth = Arc::new(AtomicU32::new(0));
+        let sampler = {
+            let (live, stop, max_depth) = (live.clone(), stop.clone(), max_depth.clone());
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let d = live.compiled_depth.load(Ordering::Relaxed);
+                    max_depth.fetch_max(d, Ordering::Relaxed);
+                }
+            })
+        };
+        // A long compiled run — the sampler thread should catch compiled_depth>0.
+        vm.exec("MetricProbe new loop: 40000000.")
+            .expect("long compiled run");
+        stop.store(true, Ordering::Relaxed);
+        sampler.join().unwrap();
+        assert!(
+            max_depth.load(Ordering::Relaxed) > 0,
+            "an off-thread monitor must observe compiled_depth > 0 during a compiled loop"
         );
     }
 

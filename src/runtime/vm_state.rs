@@ -915,6 +915,11 @@ pub struct VmState {
     /// case in S10 — S11's `IntoInterpreter` links are what would make
     /// this something other than a redundant count).
     pub compiled_depth: u32,
+    /// This VM's live-signal block (per-VM, no global): a monitor samples it
+    /// off-thread. `compiled_depth` above is mirrored into it at the two
+    /// interp->compiled boundary sites, so the GUI can derive an
+    /// interpreter/compiler ratio without a request round-trip.
+    pub live_stats: std::sync::Arc<crate::embed::VmLiveStats>,
     /// S13 D1 §2c: in-flight activations of `NotEntrant` nmethods whose
     /// callee return-address slots have been redirected to
     /// `deopt_return_trampoline`, keyed by the redirected activation's OWN FP
@@ -1194,6 +1199,7 @@ impl VmState {
             deopt_trampolines,
             tier_links: Vec::new(),
             compiled_depth: 0,
+            live_stats: std::sync::Arc::new(crate::embed::VmLiveStats::default()),
             pending_deopts: HashMap::new(),
             nlr_state: None,
             deopt_resume_depth: 0,

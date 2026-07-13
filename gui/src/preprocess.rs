@@ -433,7 +433,14 @@ fn toolbar_html(theme: Theme) -> String {
             )
         })
         .collect();
-    format!("<div class=\"st-toolbar st-raised\" id=\"macvm-toolbar\">{buttons}</div>")
+    // The metrics mini-dashboard lives at the right end of the toolbar (pushed
+    // there by `margin-left:auto`); the native sampler fills it via
+    // `window.macvmSetMetrics` (main.rs / smtk.js). Empty until the first
+    // snapshot arrives.
+    format!(
+        "<div class=\"st-toolbar st-raised\" id=\"macvm-toolbar\">{buttons}\
+         <div id=\"macvm-metrics\" class=\"st-metrics\" title=\"VM &amp; GC metrics\"></div></div>"
+    )
 }
 
 /// `transcript` is the persisted history (`main.rs`'s `TRANSCRIPT`, appended
@@ -504,7 +511,17 @@ fn chrome_layout_style() -> String {
     "<style>\
      html, body { height: 100%; }\
      body { margin: 0; display: flex; flex-direction: column; overflow: hidden; }\
-     #macvm-toolbar { flex: 0 0 auto; z-index: 5; }\
+     #macvm-toolbar { flex: 0 0 auto; z-index: 5; display: flex; align-items: center; }\
+     #macvm-metrics { margin-left: auto; display: flex; align-items: center; gap: 9px; \
+       padding: 0 8px; white-space: nowrap; overflow: hidden; \
+       font-family: var(--st-font-widget, ui-monospace, monospace); \
+       font-size: 11px; line-height: 1.1; color: var(--st-foreground, #202020); }\
+     .st-metric { display: flex; flex-direction: column; align-items: flex-start; gap: 1px; }\
+     .st-metric-l { font-size: 8px; letter-spacing: 0.04em; text-transform: uppercase; opacity: 0.55; }\
+     .st-metric-v { font-variant-numeric: tabular-nums; }\
+     .st-metric svg { display: block; opacity: 0.85; }\
+     .st-metric-bar { width: 52px; height: 5px; background: var(--st-gray, #9a9a9a); }\
+     .st-metric-bar > i { display: block; height: 100%; width: 0; background: var(--st-blue, #2b6cff); }\
      #macvm-scroll { flex: 1 1 auto; min-height: 0; overflow-y: auto; overflow-x: hidden; }\
      #macvm-transcript { flex: 0 0 auto; margin-top: 0; position: relative; overflow: hidden; }\
      #macvm-transcript-log { height: 100%; overflow-y: auto; overflow-x: hidden; overscroll-behavior: contain; }\

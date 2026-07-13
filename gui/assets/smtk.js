@@ -1014,6 +1014,82 @@
   // The script tag lives in <head> (chrome_head_extra), so <body> — and
   // any .st-code-editor in it — doesn't exist yet when this file first
   // runs; the initial highlight has to wait for the DOM to actually load.
+  // Native-driven VM/GC metrics dashboard: main.rs samples the VM into a ring
+  // buffer and pushes one snapshot here about once a second
+  // (`window.macvmSetMetrics`). We only render — a few compact cells with tiny
+  // inline-SVG sparklines — into #macvm-metrics at the right of the toolbar.
+  window.macvmSetMetrics = function (m) {
+    var el = document.getElementById("macvm-metrics");
+    if (!el || !m) return;
+    function bytes(b) {
+      if (b >= 1073741824) return (b / 1073741824).toFixed(1) + "G";
+      if (b >= 1048576) return (b / 1048576).toFixed(1) + "M";
+      if (b >= 1024) return (b / 1024).toFixed(0) + "K";
+      return (b | 0) + "B";
+    }
+    // Tiny sparkline from an array (nulls = gaps). lo/hi fix the scale (e.g.
+    // 0..1 for a ratio); omit for auto min..max.
+    function spark(arr, w, h, lo, hi) {
+      var n = arr ? arr.length : 0,
+        i,
+        v,
+        pts = [];
+      if (n < 2) return "";
+      if (lo == null) {
+        lo = Infinity;
+        hi = -Infinity;
+        for (i = 0; i < n; i++) {
+          v = arr[i];
+          if (v == null) continue;
+          if (v < lo) lo = v;
+          if (v > hi) hi = v;
+        }
+        if (!isFinite(lo)) return "";
+      }
+      var span = hi - lo || 1;
+      for (i = 0; i < n; i++) {
+        v = arr[i];
+        if (v == null) continue;
+        var x = (i / (n - 1)) * (w - 1) + 0.5;
+        var y = h - 0.5 - ((v - lo) / span) * (h - 1);
+        pts.push(x.toFixed(1) + "," + y.toFixed(1));
+      }
+      return (
+        '<svg width="' + w + '" height="' + h + '" viewBox="0 0 ' + w + " " + h + '">' +
+        '<polyline fill="none" stroke="currentColor" stroke-width="1" points="' +
+        pts.join(" ") +
+        '"/></svg>'
+      );
+    }
+    function cell(label, value, extra, title) {
+      return (
+        '<div class="st-metric"' + (title ? ' title="' + title + '"' : "") + ">" +
+        '<span class="st-metric-l">' + label + "</span>" +
+        '<span class="st-metric-v">' + value + "</span>" +
+        (extra || "") +
+        "</div>"
+      );
+    }
+    var ramPct = m.heapCap ? Math.min(100, (m.heapUsed / m.heapCap) * 100) : 0;
+    var ramBar =
+      '<div class="st-metric-bar"><i style="width:' + ramPct.toFixed(0) + '%"></i></div>';
+    var ratio = m.compiledFrac == null ? "&mdash;" : Math.round(m.compiledFrac * 100) + "%";
+    var ratioTitle =
+      m.compiledFrac == null
+        ? "idle"
+        : Math.round(m.compiledFrac * 100) +
+          "% compiled / " +
+          Math.round((1 - m.compiledFrac) * 100) +
+          "% interpreted";
+    el.innerHTML =
+      cell("mem", bytes(m.heapUsed) + "/" + bytes(m.heapCap), ramBar,
+        (ramPct.toFixed(0)) + "% of heap used") +
+      cell("jit", ratio, spark(m.ratioSpark, 46, 12, 0, 1), ratioTitle) +
+      cell("code", (m.nmethods | 0) + " nm", "", bytes(m.codeUsed) + " code cache") +
+      cell("alloc", bytes(m.allocRate) + "/s", spark(m.allocSpark, 40, 12), "allocation rate") +
+      cell("gc", (m.scavenges | 0) + "·" + (m.fullGcs | 0), "", "scavenges · full GCs");
+  };
+
   document.addEventListener("DOMContentLoaded", function () {
     window.macvmHighlightCodeEditors();
     requestSmapplRenders();

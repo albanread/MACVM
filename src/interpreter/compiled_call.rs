@@ -156,12 +156,23 @@ pub fn enter_compiled(vm: &mut VmState, nm_id: NmethodId, argc: u8) -> EnterResu
     // `VmRegBlock::eden_top_addr`'s own doc for the replacement's full
     // reasoning.
     vm.compiled_depth += 1;
+    // Publish the depth to this VM's live-signal block so an off-thread monitor
+    // (the GUI metrics dashboard) can sample "are we in compiled code" without a
+    // request round-trip — the basis of the interpreter/compiler ratio. Per-VM
+    // Arc, so multiple VMs never blend. One relaxed store per interp->compiled
+    // transition (not per compiled call): negligible.
+    vm.live_stats
+        .compiled_depth
+        .store(vm.compiled_depth, std::sync::atomic::Ordering::Relaxed);
 
     let stubs = vm.stubs;
     let result_bits = stubs.invoke(entry, vm, &argv);
 
     vm.tier_links.pop();
     vm.compiled_depth -= 1;
+    vm.live_stats
+        .compiled_depth
+        .store(vm.compiled_depth, std::sync::atomic::Ordering::Relaxed);
 
     if result_bits == BAILOUT_SENTINEL {
         return EnterResult::Bailout;
