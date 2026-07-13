@@ -64,9 +64,17 @@ and `emit_stub_kind_tag` (scratches x9). `PRIM_FAIL_SENTINEL = 0b1010` is a
 
 ## 3. Which primitives are shimmed — the classification
 
-Of the 66 entries in the `PRIMITIVES` table: **44 shimmed, 22 excluded** (plus the
-FFI sentinel, which is not a table row). Three exclusion sets, each with a distinct
-reason:
+> As-built classification for the ~66-entry table at the time of this work. The
+> table has since grown (SIMD, unboxed-float, FFI, and the game group at ids
+> 200–215 were added in later passes); those groups are **not** shimmed —
+> they're either fused/inlined (float/SIMD), the FFI dispatch path, or
+> pane-independent effect primitives (the game group emits a `GameCommand` and
+> returns `self`, so a normal interpreted call is fine). The mechanism and the
+> exclusion *reasons* below are unchanged; only the counts have moved.
+
+Of the (then) 66 entries in the `PRIMITIVES` table: **44 shimmed, 22 excluded**
+(plus the FFI sentinel, which is not a table row). Three exclusion sets, each with
+a distinct reason:
 
 ### `PRIM_ACTIVATES_FRAME` = {50,51,52,53,54,60,61}
 `value`/`value:`/`value:value:`/`value:value:value:`/`valueWithArguments:`/

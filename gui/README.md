@@ -37,3 +37,16 @@ Two HTML extensions define the "live page" model (see any page in
 Everything else — outliner browsers with open/close toggles
 (`openItem.bmp`/`closedItem.bmp`), 3D-raised borders, launcher toolbar —
 is documented with source anchors in `PLAN.md`.
+
+## Native game pane
+
+Beyond the WKWebView, the window can host a native **Metal game pane**
+(`src/game_pane.rs`) driven entirely from Smalltalk via the
+[MacGamePane](https://github.com/albanread/MacGamePane) engine — an 8-bit indexed
+drawing surface, retained GPU sprites, a 60 fps frame loop with keyboard input,
+and sound + ABC music. The **Demos** menu launches the `Catcher` demo game into
+it; Escape closes the pane back to the browser. It boots the real embedded VM
+from the SQLite world image (not the mock). See
+[`../docs/gamepane_design.md`](../docs/gamepane_design.md) for the architecture
+and [`../docs/managingtheworld.md`](../docs/managingtheworld.md) for the
+world/image reseed workflow the GUI depends on.

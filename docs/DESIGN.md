@@ -156,11 +156,16 @@ Strongtalk's scheme, modernized:
   build this from day one, or bootstrap with a conservative stack scan and add
   precision before the moving collector ships.
 
-## 7. macOS integration (later)
+## 7. macOS integration
 
 Reuse the `objc_msgSend`/Cocoa bridge pattern proven in MacModula2
-(`../MacModula2/src/newm2-runtime/src/objc.rs`) so MACVM objects can eventually
-send messages to real Cocoa objects. Out of scope until the core VM runs.
+(`../MacModula2/src/newm2-runtime/src/objc.rs`) so MACVM objects can send
+messages to real Cocoa objects. **Realized** across three surfaces: the GUI
+(`gui/`, a Cocoa/WKWebView environment); the FFI's POSIX/Cocoa dispatch
+([`FFI.md`](FFI.md), `dlsym` + shape-keyed trampolines + `Alien`); and the native
+**game engine** — Smalltalk driving Metal rendering and AVFoundation audio
+through the [MacGamePane](https://github.com/albanread/MacGamePane) engine
+([`gamepane_design.md`](gamepane_design.md)), reachable from the GUI's Demos menu.
 
 ## 8. Type system — explicitly out of VM scope
 

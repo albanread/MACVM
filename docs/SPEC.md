@@ -955,14 +955,17 @@ handles/safepoint), `can_fail`. *(Amended per S3/S4 review: `Activated` added.)*
 | Symbol | `intern` |
 | control | `ensure: ifCurtailed:` (set frame markers) |
 | system | `quit gcScavenge gcFull gcStats millisecondClock printOnStdout: sourceCompile: error:` (dev hooks; `gcStats` returns a pinned Array of counters — soak tests and S14's Context-elision gate read it; `error:` prints message + Smalltalk stack trace and terminates, §6.3) |
+| game (ids 200–215) | `GamePane` drawing/palette/present + frame-loop (`run`/`stepWithKeys:`), `Sprite` define/move/colour, `Sound`/`Tune` audio — each validates its args, emits a `GameCommand` over the VM→GUI game sink, and returns `self` (`docs/gamepane_design.md`) |
 
 `sourceCompile:` exposes the Rust source compiler to Smalltalk (later enables
 an in-language `compile:` and eventually a self-hosted tools story).
 
-The full, current id-by-id table (56 primitives as actually implemented,
-cross-checked against `primitives.rs`'s own `prim_ids_frozen` regression
-test) is in `docs/ISA.md` — this section's groupings are the design intent,
-that document is the exhaustive, load-bearing reference.
+Later passes added the SIMD (`docs/SIMD.md`), unboxed-float (`docs/float_fastpath_design.md`),
+FFI (`docs/FFI.md`), and game (`docs/gamepane_design.md`) groups, so the table is
+now larger. The full, current id-by-id table — cross-checked against
+`primitives.rs`'s own `prim_ids_frozen` regression test — is in `docs/ISA.md`;
+this section's groupings are the design intent, that document is the exhaustive,
+load-bearing reference.
 
 ## 11. Concurrency — deferred by design
 

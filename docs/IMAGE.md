@@ -188,13 +188,19 @@ one really is GUI-only test scaffolding). Owns:
   `undo_method()`/`undo_class()` and `insert_class_at()`/`reorder_class()`
   for load order) so the GUI browser can point at *either* the mock or a
   real image with minimal glue — see §8.
-- A `.mst` importer (`world/*.mst` → rows), run once to seed an image from
-  the existing hand-authored world. **The `.mst` files stay the checked-in
-  source of truth for the S6 seed library** — the importer is repeatable
-  and one-directional (`.mst` → image), not a replacement for git-tracked
-  `.mst` authoring. An export-back-to-`.mst` direction (image → text, for
-  diffing/reviewing interactive edits) is a natural follow-up but not
-  required for the browser to be useful today.
+- A `.mst` importer (`world/*.mst` → rows, `import::import_world_dir`), used to
+  (re)seed an image from the hand-authored world. **The `.mst` files stay the
+  checked-in source of truth** — the importer is repeatable. Re-seeding an
+  existing image is incremental: methods are re-imported latest-wins, and a
+  reopened class's declared vars are **merged** (`reimport_class_shell` unions
+  instance/class vars — a method-only reopen never wipes an existing
+  `<classVars: …>`). Removing a var, renaming, or changing a superclass needs a
+  **fresh** rebuild (delete the image first). The `./reseed-world.sh` script and
+  [`managingtheworld.md`](managingtheworld.md) wrap this workflow (build + fresh
+  reseed + boot-check); reach for a fresh reseed after any class-shell change.
+- An **exporter** (image → `world/*.mst`, `export::export_world_dir`,
+  `macvm-gui export --world world`) round-trips interactive edits back into
+  git-diffable text.
 
 ## 7. Relationship to `WORLD.md` and `SPEC.md` §3.2 (updated below)
 
@@ -246,6 +252,8 @@ its own doc comment):
   unaffected — the bytecode cache in §5 is purely a boot-time convenience).
 - No multi-user/concurrent-writer story — one image file, one GUI process,
   same as everything else in this project today.
-- No image → `.mst` export tool yet (§6) — round-tripping edited image
-  content back into reviewable, git-diffable text is real future work, not
-  required for the browser to be useful now.
+
+*(Update, later passes: the GUI now boots the real VM from the image (S22, not
+the mock), live-compiles browser edits and persists them, and the image →
+`.mst` exporter is built (§6). See [`managingtheworld.md`](managingtheworld.md)
+for the operational reseed/export workflow.)*

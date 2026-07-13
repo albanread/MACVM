@@ -62,7 +62,16 @@ rather than bytecode-level micro-specialization, keeping the set small
 
 ## Primitives
 
-56 primitives, grouped by receiver type, each bound to Smalltalk source via
+> **Snapshot — not exhaustive.** The id-by-id table below covers the original
+> core set (ids ≤ ~110). Later passes added many more groups — unboxed float
+> (`float_fastpath_design.md`), SIMD (`SIMD.md`), FFI (`FFI.md`), and the game
+> group at ids 200–215 (`gamepane_design.md`) — so the live `PRIMITIVES` table
+> is now ~124 entries. **The authoritative current list is the source itself:**
+> `src/runtime/primitives.rs` and its `prim_ids_frozen` regression test (and the
+> generated GUI reference page `gui/reference/pages/macvm-help/primitives.html`).
+> This document remains the design-level reference for how a primitive behaves.
+
+Grouped by receiver type, each bound to Smalltalk source via
 `<primitive: N>`. Every primitive validates its own receiver/argument
 shapes; a validation failure is always `PrimResult::Fail` (the interpreter
 falls through to the method's ordinary bytecode body as a fallback), never

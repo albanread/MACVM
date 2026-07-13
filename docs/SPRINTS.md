@@ -331,6 +331,17 @@ interleaves with it; every wave lands with in-language tests.
   A working, tested preview tool (`asm_preview`, already built) proves the
   mechanism against real worked examples; the frontend parser and installer
   themselves are this sprint's still-to-build work.
+- **Native game engine** — a retro game pane driven entirely from Smalltalk:
+  a linked-in primitive group (ids 200–215) emits drawing/sprite/audio commands
+  over a `GameSink` channel (mirroring `TranscriptSink`) that the GUI renders on
+  a native Metal pane via the `MacGamePane` sister crate (Metal graphics +
+  AVFoundation audio). Frame loop is a main-thread `NSTimer` pulling one
+  `GameStep` per tick (the worker stays strictly serial); `run` returns
+  immediately with the step-block GC-rooted in a class variable. Full design and
+  the M0–M4 milestone ladder in [`gamepane_design.md`](gamepane_design.md);
+  `world/43_gamepane.mst` (GamePane/Sprite/Sound/Tune) + the `Catcher`
+  (`world/44`) and `MandelZoom` (`world/45`) demos, reachable from the GUI's
+  native **Demos** menu. Same non-disruptive side-track posture as S20/S23.
 
 ---
 
