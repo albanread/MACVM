@@ -2,9 +2,12 @@
  (docs/gamepane_design.md). Its methods speak numbered game primitives (the
  id-200+ block in src/runtime/primitives.rs) that emit GameCommands over the
  VM->GUI game channel; the GUI applies each to the native CAMetalLayer pane
- (gui/src/game_pane.rs). Drawing methods mutate the pane's buffer only; the GUI
- presents a whole batch of them (a frame) with a single flush, so `present` is
- optional for one-shot drawing (the drain presents anything dirty).
+ (gui/src/game_pane.rs). Drawing methods mutate the pane's buffer only.
+ **Inside the frame loop (onStep:), end every frame with `present`** — that is
+ the one moment the GUI shows the frame, and drawing without it flickers or
+ freezes (the GUI deliberately does NOT auto-present mid-loop, so a half-drawn
+ frame is never shown). For a one-shot draw OUTSIDE the loop (a Workspace doit),
+ `present` is optional — the response drain shows anything dirty.
 
  Colour arguments are 0..255; palette index 0 is transparent, and user palette
  entries start at 16. In a headless VM (no game sink) every primitive silently
@@ -76,8 +79,8 @@ Object subclass: GamePane [
     blit: aByteArray [
         "Overwrite the whole pane from a ByteArray of width*height palette
          indices (row-major, 0 at top-left) in ONE command — the bulk path for a
-         CPU-generated frame, far cheaper than a point:y:color: per pixel. The
-         batch drain presents it; `present` is optional."
+         CPU-generated frame, far cheaper than a point:y:color: per pixel.
+         Follow it with `present` to show the frame (required inside the loop)."
         <primitive: 215>
         ^self
     ]

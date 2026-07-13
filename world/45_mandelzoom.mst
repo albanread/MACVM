@@ -79,6 +79,7 @@ Object subclass: MandelZoom [
                 i := i + 1.
                 cr := cr + stepc ] ].
         pane blit: buf.
+        pane present.        "show the frame — every frame in the loop presents"
         scale := scale * zoomStep.
         scale < 0.00005 ifTrue: [ scale := 3.5 ].
         ^self
