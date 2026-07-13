@@ -801,6 +801,14 @@ pub(crate) fn stop_game_loop_timer() {
     });
 }
 
+/// True while the native game-pane frame loop is running (the 60 Hz timer is
+/// scheduled). `game_pane::present_if_dirty` uses this to stay out of the way
+/// during the loop, so a frame is shown only by its own explicit `Present` and
+/// never mid-stream (the anti-flicker invariant — see `present_if_dirty`).
+pub(crate) fn game_loop_active() -> bool {
+    GAME_TIMER.with(|t| t.get() != NIL)
+}
+
 // ── VM metrics dashboard (native sampler → ring buffer → toolbar) ────────────
 //
 // A main-thread NSTimer samples THIS VM's live signals (`compiled_depth`, via

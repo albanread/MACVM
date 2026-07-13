@@ -368,9 +368,21 @@ pub fn teardown() {
 }
 
 /// Present the pane if any drawing has happened since the last present (main
-/// thread). Called once after each response-drain batch, so a frame's worth of
-/// draw commands with no explicit `present` still shows exactly once.
+/// thread). Called once after each response-drain batch, so a one-shot draw
+/// with no explicit `present` (e.g. a Workspace doit) still shows exactly once.
+///
+/// **Not** during the frame loop. A frame's draw commands stream to the main
+/// thread one at a time (`ChannelGameSink::emit` wakes per command), so a drain
+/// can land BETWEEN a frame's opening `cls` and its closing `present` — and
+/// presenting that dirty-but-half-drawn buffer here is exactly what makes a
+/// redraw-every-frame game flash (a full-screen `cls` shows as a black flicker).
+/// While the loop runs, each frame's own explicit `Present` is the single
+/// correct moment to show it (by then the whole frame has accumulated in the
+/// buffer, however the commands were split across drains), so we stand down.
 pub fn present_if_dirty() {
+    if crate::game_loop_active() {
+        return;
+    }
     NATIVE.with(|cell| {
         let mut slot = cell.borrow_mut();
         let Some(n) = slot.as_mut() else { return };
