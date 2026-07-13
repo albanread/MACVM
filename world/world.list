@@ -66,3 +66,6 @@
 43_gamepane.mst
 # Catcher: a tiny demo game exercising the whole engine (docs/gamepane_design.md).
 44_catcher.mst
+# MandelZoom: a zooming Mandelbrot rendered live in the game pane (reuses
+# Mandelbrot>>escapeAtRe:im:; progressive per-frame render, docs/gamepane_design.md).
+45_mandelzoom.mst

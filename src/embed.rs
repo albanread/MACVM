@@ -1161,6 +1161,89 @@ mod tests {
     }
 
     #[test]
+    fn mandelzoom_renders_the_set_through_the_game_channel() {
+        // The MandelZoom demo (world/45_mandelzoom.mst) really renders the
+        // Mandelbrot set through the VM->GUI game channel: drive its per-frame
+        // draw commands into a 320x240 palette-indexed buffer (exactly as the
+        // native pane's CPU buffer would receive them) and assert the rendered
+        // structure — a filled interior plus a many-banded exterior. Headless,
+        // no GPU/window — same proof style as the sink test above.
+        const W: usize = 320;
+        const H: usize = 240;
+        struct Raster(Arc<Mutex<Vec<u8>>>);
+        impl GameSink for Raster {
+            fn emit(&mut self, cmd: GameCommand) {
+                let mut b = self.0.lock().unwrap();
+                match cmd {
+                    GameCommand::Cls { index } => b.iter_mut().for_each(|p| *p = index),
+                    GameCommand::Pset { x, y, index } => {
+                        if x >= 0 && y >= 0 && (x as usize) < W && (y as usize) < H {
+                            b[y as usize * W + x as usize] = index;
+                        }
+                    }
+                    // PaletteAt/Present/StartLoop don't affect the index buffer.
+                    _ => {}
+                }
+            }
+        }
+
+        let buf = Arc::new(Mutex::new(vec![0u8; W * H]));
+        // A low JIT threshold so the hot escape loop compiles quickly (it is
+        // the JIT's strong suit); the rendered pixels are identical to the
+        // interpreter's (same Double semantics).
+        let mut vm = boot_test_vm(JitMode::Threshold(10));
+        vm.set_game_sink(Box::new(Raster(buf.clone())));
+        vm.exec("MandelZoom launch.")
+            .expect("MandelZoom launch must run");
+        // One full frame = 240 rows / 8 rows-per-step = 30 steps. The first
+        // frame is at scale 3.5, so it shows the whole set.
+        for _ in 0..30 {
+            vm.exec("GamePane stepWithKeys: 0.")
+                .expect("a game step must run");
+        }
+
+        let pixels = buf.lock().unwrap();
+        let inside = pixels.iter().filter(|&&p| p == 16).count();
+        let mut seen = [false; 256];
+        for &p in pixels.iter() {
+            seen[p as usize] = true;
+        }
+        let exterior_colours = seen.iter().skip(17).filter(|&&s| s).count();
+
+        // A recognizable set: a substantial filled interior (the cardioid and
+        // bulbs have real area) and a many-banded exterior (the escape-time
+        // gradient), not a monochrome fill.
+        let total = (W * H) as f64;
+        assert!(
+            inside as f64 > total * 0.10 && (inside as f64) < total * 0.60,
+            "interior (palette 16) should be a real fraction of the frame, got {inside}/{}",
+            W * H
+        );
+        assert!(
+            exterior_colours > 20,
+            "exterior should show many escape bands, got {exterior_colours} distinct colours"
+        );
+
+        // Eyeball aid (visible under `--nocapture`): a downsampled ASCII view,
+        // interior '#', exterior shaded by escape band.
+        let ramp = [' ', '.', ':', '-', '=', '+', '*', '%'];
+        let (cols, rows) = (80usize, 40usize);
+        let mut art = String::from("\nMandelZoom frame @ scale 3.5 (whole set):\n");
+        for ry in 0..rows {
+            for rx in 0..cols {
+                let p = pixels[(ry * H / rows) * W + (rx * W / cols)];
+                art.push(if p == 16 {
+                    '#'
+                } else {
+                    ramp[(p as usize) % ramp.len()]
+                });
+            }
+            art.push('\n');
+        }
+        println!("{art}");
+    }
+
+    #[test]
     fn game_primitive_fails_on_out_of_range_colour_and_emits_nothing() {
         // r=300 is out of 0..=255, so `smi_byte` fails, the primitive fails,
         // and the method falls through to `^self` — no command emitted. This

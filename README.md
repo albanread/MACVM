@@ -83,9 +83,12 @@ allocating. See [`docs/PERF.md`](docs/PERF.md) for the arc and methodology.
   8-bit indexed drawing surface, retained GPU sprites, a 60 fps frame loop with
   keyboard input, and sound effects + ABC-notation music through AVFoundation,
   via the [MacGamePane](https://github.com/albanread/MacGamePane) engine
-  ([`docs/gamepane_design.md`](docs/gamepane_design.md)). `Catcher`
-  ([`world/44_catcher.mst`](world/44_catcher.mst)) is a small playable game
-  written in Smalltalk — open it from the GUI's **Demos** menu.
+  ([`docs/gamepane_design.md`](docs/gamepane_design.md)). Two demos ship in the
+  GUI's **Demos** menu, both written in Smalltalk: `Catcher`
+  ([`world/44_catcher.mst`](world/44_catcher.mst)), a small playable game, and
+  `MandelZoom` ([`world/45_mandelzoom.mst`](world/45_mandelzoom.mst)), a live
+  zooming Mandelbrot rendered pixel-by-pixel through the game channel (reusing
+  the JIT-compiled `Mandelbrot` escape-time float math).
 - **Scripting** — an embedded RUSTTCL console for driving the VM and its
   debugger ([`docs/RUSTTCL.md`](docs/RUSTTCL.md)).
 

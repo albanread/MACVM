@@ -1438,6 +1438,17 @@ extern "C" fn run_catcher_demo(_this: Id, _cmd: Sel, _sender: Id) {
     }
 }
 
+/// The Demos menu's "Mandelbrot" item: open the native game pane and start the
+/// zooming-Mandelbrot demo (`world/45_mandelzoom.mst`). Same path as Catcher.
+extern "C" fn run_mandel_demo(_this: Id, _cmd: Sel, _sender: Id) {
+    open_game_pane();
+    if let Some(vm) = VM.get() {
+        vm.submit(vm_host::VmRequest::Doit {
+            code: "MandelZoom launch.".to_string(),
+        });
+    }
+}
+
 /// Target object for the Demos menu's items — not stored long-term (same
 /// reasoning as `build_vm_delegate`: `alloc_init`'s retain keeps it alive for
 /// the app's lifetime).
@@ -1447,6 +1458,12 @@ fn build_demos_delegate() -> Id {
         cls,
         sel("runCatcherDemo:"),
         run_catcher_demo as *const _,
+        "v@:@",
+    );
+    objc::add_method(
+        cls,
+        sel("runMandelDemo:"),
+        run_mandel_demo as *const _,
         "v@:@",
     );
     objc::register_class(cls);
@@ -1809,7 +1826,9 @@ fn build_menu_bar() {
     let demos_delegate = build_demos_delegate();
     let catcher_item = menu_item("Catcher — catch the coin (← →)", Some("runCatcherDemo:"), "");
     objc::send1_id(catcher_item, sel("setTarget:"), demos_delegate);
-    let demos_menu = submenu("Demos", &[catcher_item]);
+    let mandel_item = menu_item("Mandelbrot — a live zooming dive", Some("runMandelDemo:"), "");
+    objc::send1_id(mandel_item, sel("setTarget:"), demos_delegate);
+    let demos_menu = submenu("Demos", &[catcher_item, mandel_item]);
 
     let theme_menu = build_theme_menu();
     let help_delegate = build_help_delegate();
@@ -1954,18 +1973,21 @@ fn main() {
     navigate_to(&start);
 
     // Demo trigger (docs/gamepane_design.md): open the native game pane and
-    // start a real Smalltalk-driven frame loop — a red disc sweeping across a
-    // black field, its position a function of the clock, presented each tick.
-    // Exercises the whole M4 path (timer -> GameStep -> step block -> draw ->
-    // present). A real toolbar button uses the `gamePane` action instead.
-    if std::env::var_os("MACVM_GAMEPANE_DEMO").is_some() {
+    // start a real Smalltalk-driven frame loop, exercising the whole M4 path
+    // (timer -> GameStep -> step block -> draw -> present). The env value picks
+    // the demo — "mandel" for the zooming Mandelbrot (world/45_mandelzoom.mst),
+    // anything else for Catcher (world/44_catcher.mst). The Demos menu items
+    // run the same doits.
+    if let Some(demo) = std::env::var_os("MACVM_GAMEPANE_DEMO") {
         open_game_pane();
         if let Some(vm) = VM.get() {
-            // Launch the Catcher demo game (world/44_catcher.mst): move the
-            // paddle with Left/Right to catch the falling coin. Exercises the
-            // whole engine — drawing, sprites, input, audio, the frame loop.
+            let code = if demo.to_string_lossy().eq_ignore_ascii_case("mandel") {
+                "MandelZoom launch."
+            } else {
+                "Catcher launch."
+            };
             vm.submit(vm_host::VmRequest::Doit {
-                code: "Catcher launch.".to_string(),
+                code: code.to_string(),
             });
         }
     }

@@ -1,0 +1,94 @@
+"45_mandelzoom.mst — a demo that renders a zooming Mandelbrot set LIVE in the
+ native Metal game pane (docs/gamepane_design.md). Launch it from the Demos menu
+ (or a Workspace) with:  MandelZoom launch
+
+ The escape-time arithmetic is the same JIT-compiled Double math the Canvas
+ Mandelbrot uses — this demo reuses `Mandelbrot>>escapeAtRe:im:`
+ (world/35_mandelbrot.mst) unchanged, so it is exercising the 'fast floats' the
+ tour is about (world/08_double.mst). What is new is WHERE the pixels go: the
+ game pane draws one `point:y:color:` primitive per pixel (there is no bulk
+ blit command — gui/src/embed.rs GameCommand), so a whole 320x240 frame would be
+ 76,800 commands. That is too much to recompute every tick, so instead of one
+ giant frame this paints a BAND of rows per frame inside the 60fps step block:
+ cheap per tick (~8 rows = 2,560 points), it sweeps top-to-bottom, and when a
+ full image is done it zooms in a notch and sweeps again — an endless dive that
+ keeps every frame light, the way the pane's frame loop wants (design doc M4:
+ per-frame work stays small, the timer owns the loop).
+
+ Palette (game-pane colours are 0..255; index 0 is transparent, user entries
+ start at 16): entry 16 is the near-black interior; entries 17..255 are a
+ colourful band cycled by escape count. In a headless VM every game primitive
+ silently fails, so loading this class outside the GUI is harmless."
+Object subclass: MandelZoom [
+    | pane mb maxIter centerR centerI scale zoomStep rowsDone rowsPerFrame |
+
+    MandelZoom class >> launch [
+        "Open the game pane and start the zooming render."
+        ^self new start
+    ]
+
+    start [
+        pane := GamePane new.
+        maxIter := 200.
+        mb := Mandelbrot new maxIter: maxIter.
+        self buildPalette.
+        "A classic zoom target on the boundary (the 'seahorse valley'); Double
+         precision stays clean until we are ~1e-13 wide, far past our reset."
+        centerR := 0.0 - 0.743643887037151.
+        centerI := 0.131825904205330.
+        scale := 3.5.          "width of the view in complex units"
+        zoomStep := 0.97.      "multiply the view width by this each full sweep"
+        rowsPerFrame := 8.     "rows painted per 60fps tick — keeps a frame cheap"
+        rowsDone := 0.
+        pane cls: 16.          "start on the interior colour before the first sweep"
+        pane onStep: [ self step ]; run.
+        ^self
+    ]
+
+    buildPalette [
+        "Interior = a deep near-black blue (entry 16); 17..255 = a cyclic
+         colour band, the same decimal-channel bands the Canvas Mandelbrot uses
+         (world/35_mandelbrot.mst), baked into the palette once."
+        | k r g b |
+        pane paletteAt: 16 r: 8 g: 8 b: 24.
+        k := 0.
+        [ k < 239 ] whileTrue: [
+            r := (k * 8) \\ 256.
+            g := (k * 5) \\ 256.
+            b := 64 + ((k * 11) \\ 192).
+            pane paletteAt: 17 + k r: r g: g b: b.
+            k := k + 1 ].
+        ^self
+    ]
+
+    step [
+        "One frame: paint the next `rowsPerFrame` rows of the current view. When
+         the sweep reaches the bottom, zoom in a notch and start over (resetting
+         to the whole set once we have dived a long way, so it loops forever)."
+        | stepc rmin imin py last cr ci n idx |
+        stepc := scale / 320.0.
+        rmin := centerR - (scale / 2.0).
+        imin := centerI - ((240.0 * stepc) / 2.0).
+        last := rowsDone + rowsPerFrame.
+        last > 240 ifTrue: [ last := 240 ].
+        py := rowsDone.
+        [ py < last ] whileTrue: [
+            ci := imin + (py asDouble * stepc).
+            cr := rmin.
+            0 to: 319 do: [ :px |
+                n := mb escapeAtRe: cr im: ci.
+                idx := n >= maxIter
+                    ifTrue: [ 16 ]
+                    ifFalse: [ 17 + (n \\ 239) ].
+                pane point: px y: py color: idx.
+                cr := cr + stepc ].
+            py := py + 1 ].
+        rowsDone := py.
+        pane present.
+        rowsDone >= 240 ifTrue: [
+            rowsDone := 0.
+            scale := scale * zoomStep.
+            scale < 0.00005 ifTrue: [ scale := 3.5 ] ].
+        ^self
+    ]
+]
