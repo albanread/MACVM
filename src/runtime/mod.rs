@@ -18,6 +18,7 @@ pub mod ffi;
 pub mod frames;
 pub mod globals;
 pub mod lookup;
+pub mod mop; // MOP object pickle — multi-Smalltalk workers M0 (docs/multi-smalltalk-worker.md §4)
 pub mod osr;
 pub mod primitives;
 pub mod probe;

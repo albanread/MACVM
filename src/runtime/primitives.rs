@@ -1084,6 +1084,24 @@ pub static PRIMITIVES: &[PrimDesc] = &[
         can_allocate: false,
         can_fail: true,
     },
+    // Worker group (docs/multi-smalltalk-worker.md §5): 220–226 land with M1;
+    // the MOP pickle pair ships first (M0) so the format is provable solo.
+    PrimDesc {
+        id: 227,
+        name: "Worker class>>pickle:",
+        f: prim_mop_pickle,
+        argc: 1,
+        can_allocate: true,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 228,
+        name: "Worker class>>unpickle:",
+        f: prim_mop_unpickle,
+        argc: 1,
+        can_allocate: true,
+        can_fail: true,
+    },
 ];
 
 pub fn prim_by_id(id: u16) -> Option<&'static PrimDesc> {
@@ -1177,7 +1195,16 @@ fn prim_game_line(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     ) else {
         return PrimResult::Fail;
     };
-    game_emit(vm, GameCommand::Line { x0, y0, x1, y1, index });
+    game_emit(
+        vm,
+        GameCommand::Line {
+            x0,
+            y0,
+            x1,
+            y1,
+            index,
+        },
+    );
     PrimResult::Ok(args[0])
 }
 
@@ -1267,7 +1294,8 @@ fn prim_game_sprite_color(vm: &mut VmState, args: &[Oop]) -> PrimResult {
 
 /// `primMoveSprite:x:y:` (212): move sprite `id`'s instance to `(x, y)`.
 fn prim_game_move_sprite(vm: &mut VmState, args: &[Oop]) -> PrimResult {
-    let (Some(id), Some(x), Some(y)) = (smi_i64(args[1]), smi_i64(args[2]), smi_i64(args[3])) else {
+    let (Some(id), Some(x), Some(y)) = (smi_i64(args[1]), smi_i64(args[2]), smi_i64(args[3]))
+    else {
         return PrimResult::Fail;
     };
     game_emit(vm, GameCommand::MoveSprite { id, x, y });
@@ -1303,6 +1331,52 @@ fn prim_game_blit(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     bytes.copy_bytes_out(&mut data);
     game_emit(vm, GameCommand::Blit { data });
     PrimResult::Ok(args[0])
+}
+
+// --- worker group: MOP pickle (docs/multi-smalltalk-worker.md §5, M0) --------
+//
+// The copy-passing boundary's serializer, exposed as its own primitives so
+// the whole format is testable in ONE VM with zero threads. Ids 220–226 (the
+// registry/spawn/send half) land with M1; only 227/228 exist yet.
+
+/// `pickle:` (227): serialize an object graph to a MOP ByteArray. Fails
+/// (never panics) on unpicklable kinds — blocks, contexts, methods, classes,
+/// aliens — and on the size/depth guards; the world method's fallback body
+/// turns that into a clean Smalltalk error.
+fn prim_mop_pickle(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    // Pickling is read-only by construction (`mop::pickle` takes `&VmState`,
+    // so its identity map's addresses stay stable); the result ByteArray is
+    // allocated only afterwards.
+    let bytes = match crate::runtime::mop::pickle(vm, args[1]) {
+        Ok(b) => b,
+        Err(_) => return PrimResult::Fail,
+    };
+    let ba = alloc::alloc_indexable_bytes(vm, vm.universe.bytearray_klass, bytes.len());
+    for (i, b) in bytes.iter().enumerate() {
+        ba.byte_at_put(i, *b);
+    }
+    PrimResult::Ok(ba.oop())
+}
+
+/// `unpickle:` (228): rebuild an object graph from a MOP ByteArray. The
+/// bytes are copied out FIRST (unpickling allocates, so the source may move
+/// mid-build); any malformed/truncated/unknown-class input fails cleanly.
+fn prim_mop_unpickle(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    let Some(src) = ByteArrayOop::try_from(args[1]) else {
+        return PrimResult::Fail;
+    };
+    // Exactly a ByteArray — not any bytes-format object (a String or Alien
+    // holding pickle bytes would be a type confusion worth failing loudly).
+    let src_m = MemOop::try_from(args[1]).expect("ByteArrayOop implies a mem oop");
+    if src_m.klass().oop().raw() != vm.universe.bytearray_klass.oop().raw() {
+        return PrimResult::Fail;
+    }
+    let mut buf = Vec::new();
+    src.copy_bytes_out(&mut buf);
+    match crate::runtime::mop::unpickle(vm, &buf) {
+        Ok(o) => PrimResult::Ok(o),
+        Err(_) => PrimResult::Fail,
+    }
 }
 
 // --- smi group (SPEC §10 appendix) ------------------------------------------
@@ -2249,9 +2323,7 @@ macro_rules! prim_double_unary {
     ($name:ident, $method:ident) => {
         fn $name(vm: &mut VmState, args: &[Oop]) -> PrimResult {
             match crate::oops::wrappers::DoubleOop::try_from(args[0]) {
-                Some(a) => {
-                    PrimResult::Ok(alloc::alloc_double(vm, a.value().$method()).oop())
-                }
+                Some(a) => PrimResult::Ok(alloc::alloc_double(vm, a.value().$method()).oop()),
                 None => PrimResult::Fail,
             }
         }
@@ -2552,7 +2624,9 @@ fn float_array_len(m: MemOop) -> usize {
 /// auto-vectorizes to NEON `fadd v.2d` etc.
 fn float_array_lanes(m: MemOop) -> Vec<f64> {
     let n = float_array_len(m);
-    (0..n).map(|j| f64::from_bits(m.body_word_raw(1 + j))).collect()
+    (0..n)
+        .map(|j| f64::from_bits(m.body_word_raw(1 + j)))
+        .collect()
 }
 
 // The FloatArray bulk kernels are EXPLICIT hand-written NEON — see
@@ -3002,13 +3076,17 @@ mod tests {
         }
         // sum → the DEFINED pairwise order: (a0+a2+a4) + (a1+a3).
         let sum = match call(146, &mut vm, &[a]) {
-            PrimResult::Ok(o) => crate::oops::wrappers::DoubleOop::try_from(o).unwrap().value(),
+            PrimResult::Ok(o) => crate::oops::wrappers::DoubleOop::try_from(o)
+                .unwrap()
+                .value(),
             other => panic!("sum failed: {other:?}"),
         };
         assert_eq!(sum, (1.5 + 3.5 + 5.5) + (2.5 + 4.5));
         // dot → same pairwise order over the products.
         let dot = match call(147, &mut vm, &[a, b]) {
-            PrimResult::Ok(o) => crate::oops::wrappers::DoubleOop::try_from(o).unwrap().value(),
+            PrimResult::Ok(o) => crate::oops::wrappers::DoubleOop::try_from(o)
+                .unwrap()
+                .value(),
             other => panic!("dot failed: {other:?}"),
         };
         assert_eq!(
@@ -3170,6 +3248,8 @@ mod tests {
             (213, "Sound>>primPlay:"),
             (214, "Tune>>primPlayTune:"),
             (215, "GamePane>>blit:"),
+            (227, "Worker class>>pickle:"),
+            (228, "Worker class>>unpickle:"),
         ];
         assert_eq!(
             PRIMITIVES.len(),

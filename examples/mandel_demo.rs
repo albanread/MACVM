@@ -50,7 +50,12 @@ impl GameSink for Sink {
     fn emit(&mut self, cmd: GameCommand) {
         let mut g = self.0.lock().unwrap();
         match cmd {
-            GameCommand::PaletteAt { index, r, g: green, b } => {
+            GameCommand::PaletteAt {
+                index,
+                r,
+                g: green,
+                b,
+            } => {
                 g.palette[index as usize] = (r, green, b);
             }
             GameCommand::Blit { data } => {
