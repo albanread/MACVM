@@ -43,7 +43,7 @@ benchmarks the JIT owns essentially all of the runtime:
 | benchmark | interpreter | JIT (tier-1) | speedup |
 |-----------|-------------|--------------|---------|
 | deltablue | 214 ms | **4 ms** | **53×** |
-| richards  | ~205 ms | ~6 ms | ~34× |
+| richards  | ~205 ms | 6–7 ms | ~30× |
 | sieve     | 88 ms | 9 ms | ~10× |
 | ctxloop (closure/OSR) | 134 ms | 1 ms | 134× |
 
@@ -71,14 +71,24 @@ allocating. See [`docs/PERF.md`](docs/PERF.md) for the arc and methodology.
   elision / materialization / adoption across the tier boundary.
 - **FFI** — Tier-1 POSIX via `dlsym` + shape-keyed native-call trampolines +
   an `Alien` raw-memory type ([`docs/FFI.md`](docs/FFI.md)).
+- **SIMD** — NEON vector support in two layers: `Float64x2` / `Float32x4` /
+  `Int32x4` **value classes** whose arithmetic the JIT fuses to single NEON
+  instructions, and `FloatArray` **bulk kernels** (`+@`, `sum`, `dot:`,
+  `scale:`, `min`/`max`) as explicit hand-written NEON in Rust
+  ([`docs/SIMD.md`](docs/SIMD.md)).
 - **Debugger** — crash-dossier (PROBE), breakpoints, mixed-tier backtrace, an
   a64 disassembler, IR dumps, and step-between-calls ([`docs/DEBUGGER.md`](docs/DEBUGGER.md)).
 - **Image store** — offline SQLite image editing + a DB→VM boot loader that
   reconstructs the world byte-identically to a `.mst` boot ([`docs/IMAGE.md`](docs/IMAGE.md)).
 - **Embedding + GUI** — a `VmHandle` library API and a Cocoa/WKWebView
-  Strongtalk-style environment that runs the language on a dedicated thread and
-  survives a guest-thread crash ([`docs/vm_handle.md`](docs/vm_handle.md),
-  [`gui/PLAN.md`](gui/PLAN.md)).
+  Strongtalk-style **programming environment** that runs the language on a
+  dedicated thread and survives a guest-thread crash: a live **class browser**
+  whose accepts compile into the running VM *and* persist to the image, an
+  outliner (new class / new method / add variable), **find tools**
+  (definitions, implementors, senders — SQLite-indexed), a **Workspace** with
+  do-it/print-it, a **Canvas** drawing widget, a live **VM/GC metrics
+  dashboard** in the toolbar, and a built-in help + tour
+  ([`docs/vm_handle.md`](docs/vm_handle.md), [`gui/PLAN.md`](gui/PLAN.md)).
 - **Game engine** — a native Metal game pane driven entirely from Smalltalk: an
   8-bit indexed drawing surface, retained GPU sprites, a 60 fps frame loop with
   keyboard input, and sound effects + ABC-notation music through AVFoundation,
@@ -103,6 +113,11 @@ allocating. See [`docs/PERF.md`](docs/PERF.md) for the arc and methodology.
   `#workerDied` message. `ParallelMandel` measures **~2.65 CPUs of sustained
   utilization with 4 workers** on the live zooming Mandelbrot — visibly faster
   than the single-VM dive ([`docs/multi-smalltalk-worker.md`](docs/multi-smalltalk-worker.md)).
+- **The object world** — ~82 classes / 840+ methods of hand-written and
+  Strongtalk-ported library (`world/*.mst`): full collections + streams
+  protocol, Dictionary/Set/OrderedCollection, String/Character text utilities,
+  Fraction and LargeInteger arithmetic, an in-language test suite, and the
+  Richards / DeltaBlue / Stanford benchmark ports in `world/bench/`.
 - **Scripting** — an embedded RUSTTCL console for driving the VM and its
   debugger ([`docs/RUSTTCL.md`](docs/RUSTTCL.md)).
 
@@ -237,7 +252,10 @@ for direct pointers and a fast JIT.
 | [`docs/DESIGN.md`](docs/DESIGN.md) | High-level architecture + decisions of record (D1–D13) |
 | [`docs/PERF.md`](docs/PERF.md) | The performance record: every optimization arc, measured |
 | [`docs/float_fastpath_design.md`](docs/float_fastpath_design.md) | Unboxed float regions: the IR review, the reducer, the `d`-register file, `DoubleSlot` deopt |
-| [`docs/SIMD.md`](docs/SIMD.md) | SIMD vector support (designed): `FloatNxM` value classes, the NEON fast-path generalizing the scalar float region, bulk-array kernels + reductions |
+| [`docs/SIMD.md`](docs/SIMD.md) | SIMD vector support (built): `Float64x2`/`Float32x4`/`Int32x4` value classes fused to NEON by the JIT, plus `FloatArray` bulk kernels + reductions |
+| [`docs/FFI.md`](docs/FFI.md) | The foreign-function interface: `dlsym` resolution, shape-keyed trampolines, the `<primitive: FFI …>` pragma, and the `Alien` raw-memory type |
+| [`docs/DEBUGGER.md`](docs/DEBUGGER.md) | The debugging ladder: PROBE crash dossiers, breakpoints, mixed-tier backtraces, the a64 disassembler, IR dumps |
+| [`docs/ASM.md`](docs/ASM.md) / [`docs/CANVAS.md`](docs/CANVAS.md) | Side-track designs with working preview tools: hand-written native-AArch64 methods (`<asm:>`), and the GUI Canvas widget |
 | [`docs/gamepane_design.md`](docs/gamepane_design.md) | The native Metal game engine driven from Smalltalk (MacGamePane): the frame/threading architecture, drawing/sprite/audio command channel, and the milestone ladder |
 | [`docs/multi-smalltalk-worker.md`](docs/multi-smalltalk-worker.md) | Primary/worker VM parallelism (built, M0–M4): spawn worker VMs from Smalltalk, communicate by deep-copy message passing (the MOP pickle), no shared state — Erlang-style share-nothing across heaps; capstone = the 4-worker parallel Mandelbrot |
 | [`docs/IMAGE.md`](docs/IMAGE.md) / [`docs/managingtheworld.md`](docs/managingtheworld.md) | The versioned SQLite world image, and the practical world/image reseed workflow (`./reseed-world.sh`) |
@@ -261,6 +279,8 @@ for direct pointers and a fast JIT.
 | `src/rusttcl/` | Embedded RUSTTCL console |
 | `world/` | The object world / image sources, tests, benchmarks |
 | `gui/` | Strongtalk-style HTML GUI (Cocoa + WKWebView) |
+| `image_store/` | The versioned SQLite class/method source database (importer, exporter, send-index) |
+| `examples/` | Embedding examples (`mandel_demo`: boot a fresh VM, run a demo headless, exit) |
 | `docs/` | Design notes, specs, per-sprint guidance |
 
 ## Building & running
@@ -278,6 +298,9 @@ differential oracle every JIT change is gated against (compiled output must be
 byte-identical to interpreted output). Tests: `cargo test`; the stress matrix
 (GC / deopt) and world differentials are in `tests/` and the `justfile` gates.
 
+The GUI launches with `./run-gui.sh` (release build; the **Demos** menu holds
+Breakout and the three Mandelbrots, including the 4-worker parallel dive).
+`./run-mandelvm.sh` runs the standalone one-dive demo window that exits itself.
 The GUI boots from a SQLite **image** (`world/image.sqlite3`) rebuilt from the
 `world/*.mst` source. After changing a world class, rebuild it with
 `./reseed-world.sh` (build + fresh reseed + boot-check) — see
