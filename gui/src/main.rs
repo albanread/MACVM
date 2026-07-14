@@ -1746,6 +1746,21 @@ extern "C" fn run_mandel_demo(_this: Id, _cmd: Sel, _sender: Id) {
     }
 }
 
+/// The Demos menu's "Mandelbrot — parallel workers" item: the multi-Smalltalk-
+/// worker capstone (docs/multi-smalltalk-worker.md M4). `ParallelMandel` spawns
+/// 4 worker VMs from Smalltalk (`Worker spawn:` — the vm_host-registered boot
+/// closure boots each from the same image) and computes every frame of the
+/// zooming dive in parallel bands; the GUI VM only assembles and blits. Runs in
+/// the GUI's own VM, so the browser/Workspace machinery is untouched.
+extern "C" fn run_parallel_mandel_demo(_this: Id, _cmd: Sel, _sender: Id) {
+    open_game_pane();
+    if let Some(vm) = VM.get() {
+        vm.submit(vm_host::VmRequest::Doit {
+            code: "ParallelMandel launch.".to_string(),
+        });
+    }
+}
+
 /// The Demos menu's "Mandelbrot — spawned VM" item: the real multi-VM demo.
 /// Spins up a genuinely SECOND VM instance (its own worker thread + fresh
 /// `VmHandle`, booted from the image — independent of the GUI's own `VM`), runs
@@ -1854,6 +1869,12 @@ fn build_demos_delegate() -> Id {
         cls,
         sel("runSpawnedMandelDemo:"),
         run_spawned_mandel_demo as *const _,
+        "v@:@",
+    );
+    objc::add_method(
+        cls,
+        sel("runParallelMandelDemo:"),
+        run_parallel_mandel_demo as *const _,
         "v@:@",
     );
     objc::register_class(cls);
@@ -2226,7 +2247,16 @@ fn build_menu_bar() {
         "",
     );
     objc::send1_id(spawned_item, sel("setTarget:"), demos_delegate);
-    let demos_menu = submenu("Demos", &[breakout_item, mandel_item, spawned_item]);
+    let parallel_item = menu_item(
+        "Mandelbrot — parallel workers (4 VMs)",
+        Some("runParallelMandelDemo:"),
+        "",
+    );
+    objc::send1_id(parallel_item, sel("setTarget:"), demos_delegate);
+    let demos_menu = submenu(
+        "Demos",
+        &[breakout_item, mandel_item, spawned_item, parallel_item],
+    );
 
     let theme_menu = build_theme_menu();
     let help_delegate = build_help_delegate();

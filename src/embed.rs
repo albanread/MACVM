@@ -2020,6 +2020,123 @@ mod tests {
     }
 
     #[test]
+    fn parallel_mandel_computes_a_full_frame_across_worker_vms() {
+        // The M4 capstone, headless: ParallelMandel fans one frame out to 4
+        // worker VMs (a band each), the continuations assemble `buf`, and the
+        // completed round blits. Drive the two doit streams a GUI would run —
+        // frame ticks + inbox dispatches — until the blit lands, then assert
+        // EVERY band really computed (no band left zero) and the image is a
+        // recognizable set (filled interior + many-banded exterior), i.e. the
+        // work genuinely happened in the workers.
+        struct Raster(Arc<Mutex<Option<Vec<u8>>>>);
+        impl GameSink for Raster {
+            fn emit(&mut self, cmd: GameCommand) {
+                if let GameCommand::Blit { data } = cmd {
+                    *self.0.lock().unwrap() = Some(data);
+                }
+            }
+        }
+        // JIT ON both sides: a band is ~19k escape-time iterations — the
+        // debug INTERPRETER needs ~8s+ per band (the MandelZoom test compiles
+        // for the same reason); each worker's own tier-1 JIT makes it seconds.
+        let mut vm = boot_test_vm(JitMode::Threshold(10));
+        vm.set_worker_boot(Arc::new(|| {
+            VmHandle::boot(
+                VmOptions {
+                    heap_mib: 64,
+                    jit: JitMode::Threshold(10),
+                    ..Default::default()
+                },
+                Path::new("world"),
+            )
+        }));
+        let frame = Arc::new(Mutex::new(None));
+        vm.set_game_sink(Box::new(Raster(frame.clone())));
+        vm.exec("ParallelMandel launch.")
+            .expect("ParallelMandel launch must run cleanly");
+        // Interleave ticks and dispatches (the GUI's timer + WorkerInbox), with
+        // a real wait for the workers' first boot+compute.
+        for _ in 0..1200 {
+            vm.exec("Worker dispatchInbox.").expect("dispatch");
+            vm.exec("GamePane stepWithKeys: 0.").expect("tick");
+            if frame.lock().unwrap().is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        let got = frame.lock().unwrap().clone();
+        let Some(pixels) = got else {
+            panic!("no frame blitted — the parallel round never completed");
+        };
+        assert_eq!(pixels.len(), 320 * 240);
+        // Every band computed: an unanswered band would still be all zeros
+        // (palette 0 is never written by computeBand:).
+        for band in 0..4 {
+            let rows = &pixels[band * 60 * 320..(band + 1) * 60 * 320];
+            let zeros = rows.iter().filter(|&&p| p == 0).count();
+            assert!(
+                zeros == 0,
+                "band {band} has {zeros} unwritten pixels — its worker never answered"
+            );
+        }
+        // And it is really the set (same shape checks as the MandelZoom test).
+        let inside = pixels.iter().filter(|&&p| p == 16).count() as f64;
+        let mut seen = [false; 256];
+        for &p in &pixels {
+            seen[p as usize] = true;
+        }
+        let exterior = seen.iter().skip(17).filter(|&&s| s).count();
+        let total = (320 * 240) as f64;
+        assert!(
+            inside > total * 0.10 && inside < total * 0.60,
+            "interior fraction off: {inside}/{total}"
+        );
+        assert!(exterior > 20, "too few escape bands: {exterior}");
+    }
+
+    #[test]
+    fn worker_transcript_forwards_to_the_primary() {
+        // M2: a worker's `Transcript show:` (its vm.out) arrives on the
+        // PRIMARY's transcript, [w<id>]-tagged, through the ordinary inbox —
+        // a worker never owns a console of its own.
+        struct VecSink(Arc<Mutex<Vec<String>>>);
+        impl TranscriptSink for VecSink {
+            fn show(&mut self, text: &str) {
+                self.0.lock().unwrap().push(text.to_string());
+            }
+        }
+        let mut vm = boot_worker_primary();
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        vm.set_transcript(Box::new(VecSink(captured.clone())));
+        vm.exec(
+            "WkTest w1: (Worker spawn: 'Worker onMessage: [:m | Transcript show: ''hello from the worker'']').",
+        )
+        .expect("spawn the printing worker");
+        vm.exec("WkTest w1 send: 1.").expect("poke it");
+        vm.exec("Worker runLoopWhile: [ WkTest tickCapped: 8 ].")
+            .expect("run the loop a few beats");
+        let lines = captured.lock().unwrap();
+        assert!(
+            lines.iter().any(|l| l.contains("[w1] hello from the worker")),
+            "the worker's transcript line must arrive tagged on the primary's transcript, got {lines:?}"
+        );
+    }
+
+    #[test]
+    fn worker_spawn_cap_is_enforced() {
+        let mut vm = boot_worker_primary();
+        vm.exec("1 to: 16 do: [:i | Worker spawn ].")
+            .expect("16 spawns fit under the cap");
+        assert!(
+            vm.exec("Worker spawn.").is_err(),
+            "the 17th spawn must raise"
+        );
+        // Tidy up: drop every channel so the (still booting) workers exit.
+        vm.exec("1 to: 16 do: [:i | (Worker new setId: i) terminate ].")
+            .expect("terminate all");
+    }
+
+    #[test]
     fn worker_spawn_without_boot_fn_fails_cleanly() {
         // The GamePane posture: with no registered boot closure the world
         // class is harmless — spawn raises a clean error, nothing hangs.

@@ -34,6 +34,10 @@ Object subclass: WorkerMessage [
         "Is this the system death notice ({#workerDied. id})?"
         ^(payload isKindOf: Array) and: [ (payload size = 2) and: [ (payload at: 1) == #workerDied ] ]
     ]
+    isWorkerTranscript [
+        "Is this a forwarded worker transcript line ({#workerTranscript. id. text})?"
+        ^(payload isKindOf: Array) and: [ (payload size = 3) and: [ (payload at: 1) == #workerTranscript ] ]
+    ]
 ]
 
 Object subclass: Worker [
@@ -96,23 +100,9 @@ Object subclass: Worker [
        us (or the run loop slept into a message) — never called in a poll loop ──"
     Worker class >> onReply: aBlock [ ReplyHandler := aBlock ]
     Worker class >> dispatchInbox [
-        "Handle every queued worker→primary envelope: a matching pending
-         continuation wins; otherwise the general reply handler. (Dictionary
-         has no removeKey:, so a fired continuation is tombstoned with nil —
-         correlation ids are unique, so a tombstone is never rekeyed.)"
-        | env corr k msg |
-        [ (env := self primPoll) notNil ] whileTrue: [
-            corr := env at: 2.
-            msg := WorkerMessage from: (env at: 1)
-                                payload: (self unpickle: (env at: 3)).
-            k := (PendingReplies notNil and: [ corr ~= 0 ])
-                ifTrue: [ PendingReplies at: corr ifAbsent: [ nil ] ]
-                ifFalse: [ nil ].
-            k isNil
-                ifTrue: [ ReplyHandler isNil ifFalse: [ ReplyHandler value: msg ] ]
-                ifFalse: [
-                    PendingReplies at: corr put: nil.
-                    k value: msg payload ] ]
+        "Handle every queued worker→primary envelope."
+        | env |
+        [ (env := self primPoll) notNil ] whileTrue: [ self dispatchOne: env ]
     ]
 
     "── the headless event loop: sleep-until-woken, dispatch, repeat ──"
@@ -130,12 +120,18 @@ Object subclass: Worker [
                 self dispatchInbox ] ]
     ]
     Worker class >> dispatchOne: env [
-        "Route one already-taken envelope (from runLoopWhile:'s await) through
-         the same continuation-or-handler logic as dispatchInbox."
+        "Route one envelope: a forwarded worker transcript shows on OUR
+         transcript; then a matching pending continuation wins; otherwise the
+         general reply handler. (Dictionary has no removeKey:, so a fired
+         continuation is tombstoned with nil — correlation ids are unique, so
+         a tombstone is never rekeyed.)"
         | corr k msg |
         corr := env at: 2.
         msg := WorkerMessage from: (env at: 1)
                             payload: (self unpickle: (env at: 3)).
+        msg isWorkerTranscript ifTrue: [
+            Transcript show: (msg payload at: 3).
+            ^self ].
         k := (PendingReplies notNil and: [ corr ~= 0 ])
             ifTrue: [ PendingReplies at: corr ifAbsent: [ nil ] ]
             ifFalse: [ nil ].

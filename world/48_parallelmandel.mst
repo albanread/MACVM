@@ -1,0 +1,141 @@
+"48_parallelmandel.mst — ParallelMandel: the multi-Smalltalk-worker capstone
+ (docs/multi-smalltalk-worker.md M4). The SAME zooming Mandelbrot dive as
+ MandelZoom (world/45), but each frame is computed IN PARALLEL by N worker VMs
+ — one horizontal band each, every worker its own heap + JIT + core — while
+ this, the primary VM, only assembles the bands and blits the frame. With N
+ workers the frame computes ~N times faster than the single-VM MandelZoom: the
+ parallelism is real, and visible as a faster dive.
+
+ How a frame flows (all async, zero polling — §3.1's router):
+   step (frame tick):  round complete? -> blit + present + zoom + kick next
+   kickRound:          send {y0. rows. cR. cI. scale} to each worker
+                       with a continuation that copies the band into `buf`
+   worker:             ParallelMandel computeBand: params  (the same class,
+                       loaded from the same image — pure compute, no pane)
+ Replies arrive as WorkerInbox dispatches between frame ticks, so band copies
+ interleave with GameStep on the one strictly-serial primary thread.
+
+ Launch from the Demos menu, or a Workspace:  ParallelMandel launch
+ (Needs a worker-boot registration — the GUI provides one; a plain CLI run
+ without one raises 'cannot spawn' cleanly.)"
+Object subclass: ParallelMandel [
+    | pane buf workers pendingBands centerR centerI scale zoomStep |
+
+    ParallelMandel class >> launch [
+        "Spawn the band workers and start the parallel dive."
+        ^self new start
+    ]
+    ParallelMandel class >> workerCount [ ^4 ]
+    ParallelMandel class >> maxIter [ ^150 ]
+
+    "── the worker half: pure compute (runs inside each worker VM) ──"
+    ParallelMandel class >> computeBand: params [
+        "params = {y0. rows. centerR. centerI. scale}; answer {y0. bytes}
+         where bytes is rows*320 palette indices (row-major from y0). The
+         escape-time Double math is Mandelbrot>>escapeAtRe:im: (world/35),
+         JIT-compiled in THIS worker's own tier-1 compiler."
+        | y0 rows cR cI sc mb stepc rmin imin bytes i ci cr n |
+        y0 := params at: 1.
+        rows := params at: 2.
+        cR := params at: 3.
+        cI := params at: 4.
+        sc := params at: 5.
+        mb := Mandelbrot new maxIter: self maxIter.
+        stepc := sc / 320.0.
+        rmin := cR - (sc / 2.0).
+        imin := cI - ((240.0 * stepc) / 2.0).
+        bytes := ByteArray new: rows * 320.
+        i := 1.
+        y0 to: y0 + rows - 1 do: [ :py |
+            ci := imin + (py asDouble * stepc).
+            cr := rmin.
+            1 to: 320 do: [ :px |
+                n := mb escapeAtRe: cr im: ci.
+                bytes at: i put: (n >= self maxIter
+                    ifTrue: [ 16 ]
+                    ifFalse: [ 17 + (n \\ 239) ]).
+                i := i + 1.
+                cr := cr + stepc ] ].
+        ^Array with: y0 with: bytes
+    ]
+
+    "── the primary half: spawn, orchestrate, assemble, show ──"
+    start [
+        pane := GamePane new.
+        self buildPalette.
+        buf := ByteArray new: 320 * 240.
+        centerR := 0.0 - 0.743643887037151.   "the seahorse valley, as world/45"
+        centerI := 0.131825904205330.
+        scale := 3.5.
+        zoomStep := 0.9.
+        workers := Array new: self class workerCount.
+        1 to: workers size do: [ :k |
+            workers at: k put: (Worker spawn:
+                'Worker onMessage: [:m | Worker reply: (ParallelMandel computeBand: m payload)]') ].
+        self kickRound.
+        pane onStep: [ self step ]; run.
+        ^self
+    ]
+
+    buildPalette [
+        "Identical to MandelZoom's: 16 = near-black interior, 17..255 a
+         cyclic colour band keyed by escape count."
+        | k |
+        pane paletteAt: 16 r: 8 g: 8 b: 24.
+        k := 0.
+        [ k < 239 ] whileTrue: [
+            pane paletteAt: 17 + k
+                 r: (k * 8) \\ 256
+                 g: (k * 5) \\ 256
+                 b: 64 + ((k * 11) \\ 192).
+            k := k + 1 ].
+        ^self
+    ]
+
+    kickRound [
+        "Fan this frame out: one band request per worker, each with a
+         continuation that lands the band in `buf`. Fully async — the primary
+         goes straight back to sleep; band replies dispatch between ticks."
+        | rows |
+        rows := 240 // workers size.
+        pendingBands := workers size.
+        1 to: workers size do: [ :k |
+            (workers at: k)
+                send: (self paramsForBand: (k - 1) * rows rows: rows)
+                onReply: [ :r | self bandArrived: r ] ].
+        ^self
+    ]
+    paramsForBand: y0 rows: rows [
+        | p |
+        p := Array new: 5.
+        p at: 1 put: y0.
+        p at: 2 put: rows.
+        p at: 3 put: centerR.
+        p at: 4 put: centerI.
+        p at: 5 put: scale.
+        ^p
+    ]
+    bandArrived: r [
+        "A worker's band: copy it into the frame at its y-offset."
+        | y0 bytes base |
+        y0 := r at: 1.
+        bytes := r at: 2.
+        base := y0 * 320.
+        1 to: bytes size do: [ :i | buf at: base + i put: (bytes at: i) ].
+        pendingBands := pendingBands - 1.
+        ^self
+    ]
+
+    step [
+        "Frame tick: only when EVERY band of the current round has landed do
+         we show the frame and kick the next round — the pane never shows a
+         torn frame, and a slow band simply lets ticks pass (no busy work)."
+        pendingBands = 0 ifTrue: [
+            pane blit: buf.
+            pane present.
+            scale := scale * zoomStep.
+            scale < 0.00005 ifTrue: [ scale := 3.5 ].
+            self kickRound ].
+        ^self
+    ]
+]

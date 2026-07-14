@@ -233,6 +233,26 @@ pub(crate) fn encode_worker_died(id: i64) -> Vec<u8> {
     out
 }
 
+/// The transcript-forwarding control message (workers M2): the MOP encoding
+/// of `{#workerTranscript. id. text}` — a worker's `Transcript show:` (and
+/// its error traces, which also write through `vm.out`) delivered to the
+/// primary through the ordinary inbox and shown on ITS transcript.
+pub(crate) fn encode_worker_transcript(id: i64, text: &str) -> Vec<u8> {
+    let mut out = MAGIC.to_vec();
+    out.push(TAG_ARRAY);
+    write_varint(&mut out, 3);
+    let name = b"workerTranscript";
+    out.push(TAG_SYMBOL);
+    write_varint(&mut out, name.len() as u64);
+    out.extend_from_slice(name);
+    out.push(TAG_SMI);
+    write_varint(&mut out, zigzag(id));
+    out.push(TAG_STRING);
+    write_varint(&mut out, text.len() as u64);
+    out.extend_from_slice(text.as_bytes());
+    out
+}
+
 #[allow(clippy::too_many_lines)] // one exhaustive dispatch, mirrored by `up`
 fn pk(
     vm: &VmState,

@@ -488,11 +488,20 @@ it plays no role in message delivery. Headless embeddings need none of this:
 
 | # | contents | size | gate |
 |---|---|---|---|
-| **M0** | MOP pickler/unpickler + prims 227/228, one-VM round-trip suite | `M` | every §10-M0 test green; zero other code touched |
-| **M1** | `WorkerRegistry` on `VmState`, `set_worker_boot`, worker thread loop, prims 220–226 | `M` | headless echo ping-pong + crash-isolation tests green |
-| **M2** | `world/47_worker.mst` (Worker/WorkerMessage), dispatchPending/reply:, `send:onReply:` continuations + dispatchInbox, `runLoopWhile:`, died-notification, transcript forwarding | `M` | in-language echo + died-notification demos run via CLI, event-driven end to end |
-| **M3** | GUI wake hook (`set_inbox_wake` → main-thread poke → `dispatchInbox` doit) | `S` | Workspace: spawn, `send:onReply:`, see the continuation fire asynchronously with no timer involved |
-| **M4** | **ParallelMandel** (`world/48`): the MandelZoom frame split into N bands, one per worker, primary assembles + blits; Demos menu item | `M` | visibly faster with more workers; speedup recorded in PERF.md |
+| **M0** ✅ | MOP pickler/unpickler + prims 227/228, one-VM round-trip suite (1ea6984) | `M` | every §10-M0 test green; zero other code touched |
+| **M1** ✅ | `WorkerState` on `VmState`, `set_worker_boot`, worker thread loop, prims 220–226, `world/47_worker.mst` (c95f0be) | `M` | headless echo ping-pong + crash-isolation tests green |
+| **M2** ✅ | `send:onReply:` continuations + dispatchInbox, `runLoopWhile:`, died-notification, `[wN]`-tagged transcript forwarding, spawn cap | `M` | in-language echo + died-notification + forwarding tests, event-driven end to end |
+| **M3** ✅ | GUI wake hook: `set_inbox_wake` queues a `VmRequest::WorkerInbox` from the worker's thread → the primary VM thread's own `recv()` sleep services a silent `Worker dispatchInbox.` (no main-thread hop needed) | `S` | vm_host test: a reply reaches its handler with no timer, no manual dispatch |
+| **M4** ✅ | **ParallelMandel** (`world/48`): each frame of the dive split into N bands, one per worker VM, primary assembles + blits; Demos menu item | `M` | headless gate: full frame, every band computed by its worker, recognizable set |
+
+**As-built amendments:** `Worker spawn: initSource` — the spawn primitive (220)
+takes an init doit run ONCE in the fresh worker, which is how its
+`onMessage:` handler gets installed (the design's bare `spawn` is sugar for
+`spawn: nil`). Envelopes surface guest-side as 3-slot `{from. corr. bytes}`
+Arrays. `Dictionary` has no `removeKey:`, so fired continuations tombstone
+their entry with nil (correlation ids are unique — never rekeyed). Control
+messages (`#workerDied`, `#workerTranscript`) are hand-encoded MOP built
+Rust-side (`mop::encode_worker_*`) and route in `Worker>>dispatchOne:`.
 
 M4 is the capstone for the same reason Catcher/Breakout were: it exercises
 everything at once — spawn, big ByteArray payloads both ways, assembly,

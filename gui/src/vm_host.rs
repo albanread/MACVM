@@ -106,6 +106,14 @@ pub enum VmRequest {
     GameStep {
         keys: i64,
     },
+    /// Worker envelopes are waiting in this (primary) VM's inbox
+    /// (docs/multi-smalltalk-worker.md §3.1, M3): run `Worker dispatchInbox.`
+    /// so continuations/handlers fire. Queued — coalesced — by the inbox wake
+    /// hook FROM a worker thread the moment its send lands; the primary VM
+    /// thread's ordinary `requests.recv()` sleep is what it interrupts, so
+    /// delivery is event-driven with zero polling. Deliberately silent on
+    /// success (a per-wake `> …` echo would flood the transcript).
+    WorkerInbox,
     /// A `<smappl visual="CODE">` on the current page (`../smappl.md`): render
     /// the `visual=` expression to an HTML fragment (`VmHandle::render_fragment`,
     /// D-G5). `id` is the placeholder span's `data-widget-id`; the worker
@@ -636,8 +644,13 @@ fn spawn_worker(wake: CrossThreadObjcRef, world_dir: std::path::PathBuf) -> Work
     let (request_tx, request_rx) = mpsc::channel::<VmRequest>();
     let (response_tx, response_rx) = mpsc::channel::<VmResponse>();
     let notices = response_tx.clone();
+    // The worker loop gets its OWN request sender: the multi-Smalltalk-worker
+    // inbox wake (M3) queues a `WorkerInbox` request from a worker VM's thread
+    // the moment an envelope lands — the send is the wake, and this thread's
+    // `requests.recv()` sleep is what it interrupts.
+    let self_tx = request_tx.clone();
     let worker = std::thread::spawn(move || {
-        worker_loop(request_rx, response_tx, wake, &world_dir);
+        worker_loop(request_rx, response_tx, self_tx, wake, &world_dir);
     });
     WorkerHandles {
         requests: request_tx,
@@ -722,6 +735,7 @@ fn spawn_with_world_and_timeout(
 fn worker_loop(
     requests: Receiver<VmRequest>,
     responses: Sender<VmResponse>,
+    self_requests: Sender<VmRequest>,
     wake: CrossThreadObjcRef,
     world_dir: &Path,
 ) {
@@ -766,6 +780,37 @@ fn worker_loop(
         None => MockWorld::seed(),
     };
     let mut selection = BrowserSelection::default();
+
+    // Multi-Smalltalk workers, M3 (docs/multi-smalltalk-worker.md §9): this
+    // VM is a worker-spawning PRIMARY. Workers boot plain from the SAME
+    // image (no GUI sinks — their transcript forwards through the inbox,
+    // [wN]-tagged), and an inbound envelope wakes THIS thread by queueing a
+    // WorkerInbox request from the sending worker's thread: event-driven,
+    // coalesced, zero polling.
+    let boot: macvm::runtime::workers::WorkerBootFn = match &image {
+        Some(_) => {
+            let img_path = image_path.clone();
+            Arc::new(move || {
+                let img = image_store::Image::open(&img_path).map_err(|e| {
+                    macvm::runtime::VmError {
+                        msg: format!("worker image open: {e}"),
+                    }
+                })?;
+                let mut h = VmHandle::boot_without_world(gui_vm_options());
+                crate::world_boot::load_world_from_image(&mut h, &img, WORLD_DOITS)
+                    .map_err(|msg| macvm::runtime::VmError { msg })?;
+                Ok(h)
+            })
+        }
+        None => {
+            let dir = world_dir.to_path_buf();
+            Arc::new(move || VmHandle::boot(gui_vm_options(), &dir))
+        }
+    };
+    vm.set_worker_boot(boot);
+    vm.set_inbox_wake(Arc::new(move || {
+        let _ = self_requests.send(VmRequest::WorkerInbox);
+    }));
 
     // Announce this VM's per-VM live-signal block to the main thread once, so
     // the metrics sampler can read compiled_depth off-thread (a respawn boots a
@@ -1299,6 +1344,16 @@ fn handle(
             match vm.eval(&format!("GamePane stepWithKeys: {keys}.")) {
                 Ok(_) => vec![],
                 Err(e) => vec![VmResponse::Transcript(format!("game step error: {e}"))],
+            }
+        }
+        VmRequest::WorkerInbox => {
+            // Drain + dispatch every queued worker envelope (continuations,
+            // handlers, forwarded transcripts). Silent on success — the wake
+            // hook queues one of these per burst (coalesced), and anything
+            // user-visible arrives separately via ChannelTranscript/game sink.
+            match vm.eval("Worker dispatchInbox.") {
+                Ok(_) => vec![],
+                Err(e) => vec![VmResponse::Transcript(format!("worker inbox error: {e}"))],
             }
         }
         VmRequest::GetMetrics => vec![VmResponse::Metrics(vm.metrics())],
@@ -3609,6 +3664,44 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         collected
+    }
+
+    /// Multi-Smalltalk workers M3, end to end through the REAL host loop: a
+    /// spawned worker VM's reply reaches its handler with NO frame timer and
+    /// NO manual dispatch anywhere — the worker's send fires the inbox wake,
+    /// which queues a `WorkerInbox` request from the worker's own thread, and
+    /// the primary VM thread's ordinary `recv()` sleep services it
+    /// (docs/multi-smalltalk-worker.md §3.1/§9: event-driven, zero polling).
+    #[test]
+    fn worker_reply_is_dispatched_by_the_inbox_wake() {
+        let tmp_dir =
+            std::env::temp_dir().join(format!("macvm_wkwake_{}", std::process::id()));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        {
+            let img = image_store::Image::open(&tmp_dir.join("image.sqlite3")).unwrap();
+            image_store::import::import_world_dir(&img, &test_world_dir()).unwrap();
+        }
+        let host = spawn_with_world_and_timeout(
+            objc::NIL,
+            objc::NIL,
+            tmp_dir,
+            Duration::from_secs(30),
+        );
+        host.submit(VmRequest::Doit {
+            code: "Worker onReply: [:m | Transcript show: 'WKREPLY ', m payload printString]."
+                .to_string(),
+        });
+        host.submit(VmRequest::Doit {
+            code: "(Worker spawn: 'Worker onMessage: [:m | Worker reply: m payload + 1]') send: 41."
+                .to_string(),
+        });
+        // From here on, NOTHING drives the primary except the wake: the reply
+        // envelope must arrive, queue WorkerInbox, dispatch, and print.
+        let seen = poll_until(&host, |rs| transcript_containing(rs, "WKREPLY 42"));
+        assert!(
+            transcript_containing(&seen, "WKREPLY 42"),
+            "the worker's reply must be dispatched by the inbox wake alone, got {seen:?}"
+        );
     }
 
     /// THE end-to-end proof of the whole S21 sprint: a doit that triggers a

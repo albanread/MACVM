@@ -76,3 +76,6 @@
 # Worker: primary/worker VM parallelism, copy-passing messages over MOP pickles
 # (docs/multi-smalltalk-worker.md; prims 220-228). Harmless with no worker role.
 47_worker.mst
+# ParallelMandel: the worker capstone — the MandelZoom dive computed in
+# parallel bands by N worker VMs, assembled + blitted by the primary (M4).
+48_parallelmandel.mst

@@ -188,6 +188,45 @@ fn died_envelope(id: u32) -> Envelope {
     }
 }
 
+/// A worker's transcript, forwarded (M2): everything the worker writes to
+/// its `vm.out` — `Transcript show:`, error traces — becomes a
+/// `{#workerTranscript. id. text}` control envelope through the same inbox
+/// as every data message; the primary's dispatch shows it, `[w<id>]`-tagged,
+/// on ITS transcript. A worker never owns a console of its own.
+struct ForwardTranscript {
+    id: u32,
+    to_primary: InboxSender,
+    /// Are we at the start of an output line? `vm.out` writes arrive as many
+    /// small fragments (an error trace is dozens of `write!` pieces); tagging
+    /// every fragment would shred the output with `[w1]`s. Instead each
+    /// fragment forwards immediately (nothing is ever held back — an
+    /// unterminated `Transcript show:` still arrives at once) and the tag is
+    /// inserted only at line starts.
+    at_line_start: bool,
+}
+
+impl crate::embed::TranscriptSink for ForwardTranscript {
+    fn show(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let tag = format!("[w{}] ", self.id);
+        let mut out = String::with_capacity(text.len() + tag.len());
+        for piece in text.split_inclusive('\n') {
+            if self.at_line_start {
+                out.push_str(&tag);
+            }
+            out.push_str(piece);
+            self.at_line_start = piece.ends_with('\n');
+        }
+        let _ = self.to_primary.send(Envelope {
+            from: self.id,
+            corr: 0,
+            bytes: crate::runtime::mop::encode_worker_transcript(i64::from(self.id), &out),
+        });
+    }
+}
+
 /// Spawn a worker VM (prim 220). Fails (None) with no registered primary
 /// role/boot fn, or at the cap. The `init` doit (if any) runs once in the
 /// fresh worker before its dispatch loop — how a worker gets its
@@ -233,6 +272,13 @@ fn worker_main(
         return;
     };
     handle.install_worker_role(id, to_primary.clone());
+    // From here on, everything the worker prints (Transcript, error traces)
+    // reaches the primary's transcript instead of a stray stdout (M2).
+    handle.set_transcript(Box::new(ForwardTranscript {
+        id,
+        to_primary: to_primary.clone(),
+        at_line_start: true,
+    }));
     if let Some(src) = init {
         if handle.exec(src).is_err() {
             let _ = to_primary.send(died_envelope(id));
