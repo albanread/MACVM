@@ -36,13 +36,12 @@ part that works.</p>
 	<code>doesNotUnderstand:</code>-driven message dispatch out to native
 	Cocoa objects.</p></li>
 
-	<li><p align="left"><strong>An in-image tool library</strong> &mdash;
-	mirrors, browsers, and an inspector written in Smalltalk itself rather
-	than in the Rust host.</p></li>
-
-	<li><p align="left"><strong>Live <code>smappl</code> widgets</strong>
-	&mdash; today the tag renders an inert placeholder box naming its code;
-	wiring it to real evaluation is future work.</p></li>
+	<li><p align="left"><strong>An in-image inspector</strong> &mdash; a live
+	object inspector written in Smalltalk. (Class mirrors and browsers already
+	live in the image &mdash; <code>ClassMirror</code>,
+	<code>ClassHierarchyOutliner</code>, <code>ClassOutliner</code> &mdash;
+	beside their Rust counterparts, and <code>smappl</code> widgets now render
+	live rather than as placeholders.)</p></li>
 
 	<li><p align="left"><strong>Green threads with async C
 	callouts</strong> &mdash; concurrency the FFI does not yet
