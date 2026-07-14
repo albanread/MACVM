@@ -107,6 +107,10 @@ allocating. See [`docs/PERF.md`](docs/PERF.md) for the arc and methodology.
   GC on its own OS thread) that communicate with the primary by **deep-copy
   message passing** (the MOP pickle) — Erlang-style share-nothing, no shared
   state, no identity across heaps, consistent with the `become:` stance below.
+  A primary can hold a pool of **up to 16 concurrent worker VMs**, each
+  independently addressable (`send:onReply:` per worker) — a star topology:
+  every worker talks only to the primary, and workers don't spawn sub-workers
+  (a v1 rule the registry design doesn't preclude lifting later).
   Fully asynchronous: replies run as `send:onReply:` continuations, delivery is
   event-driven (the send itself wakes the sleeping receiver), and there is no
   polling anywhere. A crashed worker dies alone and is reported as an ordinary
