@@ -331,6 +331,17 @@ interleaves with it; every wave lands with in-language tests.
   A working, tested preview tool (`asm_preview`, already built) proves the
   mechanism against real worked examples; the frontend parser and installer
   themselves are this sprint's still-to-build work.
+- **Multi-Smalltalk workers** — primary/worker VM parallelism with
+  copy-passing messages, no shared state: the primary VM spawns worker VMs
+  (each its own heap/JIT/thread — the spawned-VM demo proved coexistence),
+  exchanging deep-copied object graphs over channels via a tagged pickle
+  format (MOP) and a new primitive group (ids 220–229). Zero changes to the
+  VM core's execution model — each heap stays strictly single-threaded;
+  orthogonal to S17 green processes (concurrency within one heap vs
+  parallelism across heaps). Full design + M0–M4 milestone ladder
+  (capstone: ParallelMandel, the Mandelbrot frame computed by N workers) in
+  [`multi-smalltalk-worker.md`](multi-smalltalk-worker.md). Same
+  non-disruptive side-track posture as S20/S23.
 - **Native game engine** — a retro game pane driven entirely from Smalltalk:
   a linked-in primitive group (ids 200–215) emits drawing/sprite/audio commands
   over a `GameSink` channel (mirroring `TranscriptSink`) that the GUI renders on
