@@ -41,6 +41,15 @@ static WINDOW: OnceLock<MainThreadPtr> = OnceLock::new();
 /// `pane stop` → `StopLoop`) there is no browser to return to and the whole app
 /// quits instead. Read by [`on_game_loop_stopped`] and [`on_game_tick`].
 static MANDELVM: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// True while the "Mandelbrot — spawned VM" demo is running: a genuinely SECOND
+/// VM instance (`DEMO_VM`) drives the game pane while the GUI's own `VM` keeps
+/// serving the Workspace/browser untouched. Routes the frame timer + Escape/stop
+/// to the spawned VM and its teardown instead of the main VM. See
+/// [`run_spawned_mandel_demo`] / [`teardown_spawned_demo`].
+static DEMO_VM_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// The bridge object whose `drainDemoVm:` selector drains `DEMO_VM`'s responses
+/// (built once, on first use).
+static DEMO_VM_BRIDGE: OnceLock<MainThreadPtr> = OnceLock::new();
 /// The game-loop frame timer's target object (a `MacvmGameTimer` instance whose
 /// `gameTick:` IMP is [`on_game_tick`]), created lazily on the first
 /// `StartLoop`. Main-thread only (`docs/gamepane_design.md` M4).
@@ -50,6 +59,13 @@ thread_local! {
     /// The currently-scheduled frame `NSTimer` (NIL when the loop is stopped).
     /// Main-thread only.
     static GAME_TIMER: std::cell::Cell<Id> = const { std::cell::Cell::new(NIL) };
+    /// The second, spawned VM instance behind the "Mandelbrot — spawned VM" demo
+    /// (a full `VmHost`: its own worker thread + fresh `VmHandle`, independent of
+    /// the GUI's own `VM`). `Some` only while that demo is on screen; dropped at
+    /// teardown, which closes its request channel and lets its worker exit.
+    /// Main-thread only (spawned, driven, and dropped all from the main thread).
+    static DEMO_VM: std::cell::RefCell<Option<vm_host::VmHost>> =
+        const { std::cell::RefCell::new(None) };
 }
 static NAV: OnceLock<Mutex<NavState>> = OnceLock::new();
 
@@ -724,23 +740,37 @@ fn build_game_timer_target() -> Id {
 /// Single-outstanding — a still-running step means we skip, never pile up.
 /// Rendering happens later, when the step's draw commands drain (not here).
 extern "C" fn on_game_tick(_this: Id, _cmd: Sel, _timer: Id) {
-    // Escape closes the game and returns to the GUI, from any game (no per-game
-    // handling needed). macOS virtual key code 53 = Escape. In the standalone
-    // mandelvm demo there is no GUI to return to, so Escape ends the demo — same
-    // path as the dive finishing naturally.
+    // Escape ends the game. Normally that returns to the browser
+    // (`close_game_pane`); in the standalone mandelvm demo it quits the app, and
+    // in the spawned-VM demo it tears the second VM down — both via the frame
+    // loop's stop path. macOS virtual key code 53 = Escape.
     if macgamepane_graphics::input::key_held(53) {
-        if MANDELVM.load(std::sync::atomic::Ordering::Relaxed) {
+        if DEMO_VM_ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
+            || MANDELVM.load(std::sync::atomic::Ordering::Relaxed)
+        {
             on_game_loop_stopped();
         } else {
             close_game_pane();
         }
         return;
     }
+    let keys = current_game_key_mask();
+    // The spawned-VM demo drives the SECOND VM instance; every other game runs in
+    // the GUI's own VM. Same single-outstanding backpressure (`is_idle`) either way.
+    if DEMO_VM_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
+        DEMO_VM.with(|d| {
+            if let Some(vm) = d.borrow().as_ref() {
+                if vm.is_idle() {
+                    vm.submit(vm_host::VmRequest::GameStep { keys });
+                }
+            }
+        });
+        return;
+    }
     let Some(vm) = VM.get() else { return };
     if !vm.is_idle() {
         return;
     }
-    let keys = current_game_key_mask();
     vm.submit(vm_host::VmRequest::GameStep { keys });
 }
 
@@ -827,7 +857,11 @@ pub(crate) fn game_loop_active() -> bool {
 /// ending means the app (and its VM instance) exits.
 pub(crate) fn on_game_loop_stopped() {
     stop_game_loop_timer();
-    if MANDELVM.load(std::sync::atomic::Ordering::Relaxed) {
+    if DEMO_VM_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
+        // The spawned-VM demo ended: drop that second instance, return to the GUI.
+        teardown_spawned_demo();
+    } else if MANDELVM.load(std::sync::atomic::Ordering::Relaxed) {
+        // The standalone `mandelvm` window has nothing to return to: quit.
         let app = objc::send0(objc::get_class("NSApplication"), sel("sharedApplication"));
         objc::send1_id(app, sel("terminate:"), NIL);
     }
@@ -1712,6 +1746,93 @@ extern "C" fn run_mandel_demo(_this: Id, _cmd: Sel, _sender: Id) {
     }
 }
 
+/// The Demos menu's "Mandelbrot — spawned VM" item: the real multi-VM demo.
+/// Spins up a genuinely SECOND VM instance (its own worker thread + fresh
+/// `VmHandle`, booted from the image — independent of the GUI's own `VM`), runs
+/// the single-dive `MandelVM` in it in the game pane, and tears that instance
+/// back down when the dive ends (`on_game_loop_stopped` → `teardown_spawned_demo`).
+/// The GUI's own VM never pauses — it keeps serving the Workspace/browser.
+extern "C" fn run_spawned_mandel_demo(_this: Id, _cmd: Sel, _sender: Id) {
+    if DEMO_VM_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
+        return; // one spawned demo at a time
+    }
+    let bridge = DEMO_VM_BRIDGE
+        .get_or_init(|| MainThreadPtr(build_demo_vm_bridge()))
+        .0;
+    // Spawn the second VM: its own OS thread, its own VmHandle booted fresh from
+    // the image, its own response channel drained by `drainDemoVm:`.
+    let demo = vm_host::spawn(bridge, sel("drainDemoVm:"));
+    DEMO_VM.with(|d| *d.borrow_mut() = Some(demo));
+    DEMO_VM_ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+    append_transcript("--- spawned a fresh VM instance to run MandelVM (one dive, then it exits) ---");
+    open_game_pane();
+    DEMO_VM.with(|d| {
+        if let Some(vm) = d.borrow().as_ref() {
+            vm.submit(vm_host::VmRequest::Doit {
+                code: "MandelVM launch.".to_string(),
+            });
+        }
+    });
+}
+
+/// Drain the SPAWNED demo VM's responses (a separate channel from the main
+/// `VM`'s) and apply its game-draw commands to the shared pane. Collect the batch
+/// first and release the `DEMO_VM` borrow BEFORE applying: a `StopLoop` in the
+/// batch runs `teardown_spawned_demo`, which drops `DEMO_VM` and so needs a fresh
+/// borrow. `MandelVM` emits only game (and, on error, transcript) responses.
+extern "C" fn demo_vm_bridge_drain(_this: Id, _cmd: Sel, _arg: Id) {
+    let responses = DEMO_VM.with(|d| {
+        d.borrow()
+            .as_ref()
+            .map(|vm| vm.drain_responses())
+            .unwrap_or_default()
+    });
+    for response in responses {
+        match response {
+            vm_host::VmResponse::Game(cmd) => game_pane::apply_command(&cmd),
+            vm_host::VmResponse::Transcript(text) => append_transcript(&text),
+            _ => {} // the mandel demo produces nothing else
+        }
+    }
+    game_pane::present_if_dirty();
+}
+
+/// The bridge object whose `drainDemoVm:` selector runs [`demo_vm_bridge_drain`]
+/// when the spawned VM's worker wakes the main thread.
+fn build_demo_vm_bridge() -> Id {
+    let cls = objc::allocate_class(objc::get_class("NSObject"), "MacvmDemoVmBridge");
+    objc::add_method(
+        cls,
+        sel("drainDemoVm:"),
+        demo_vm_bridge_drain as *const _,
+        "v@:@",
+    );
+    objc::register_class(cls);
+    objc::alloc_init("MacvmDemoVmBridge")
+}
+
+/// End the spawned-VM demo: swap the browser back in (the main VM's content),
+/// drop the native pane, then drop the spawned `DEMO_VM` — closing its request
+/// channel lets its worker thread exit. The GUI's own `VM` is untouched
+/// throughout, so the Workspace/browser is live again immediately. Order matters:
+/// restore the webview BEFORE freeing the pane's GPU resources (as
+/// `close_game_pane`), and take the `DEMO_VM` borrow only after the drain that
+/// triggered us has released it.
+fn teardown_spawned_demo() {
+    DEMO_VM_ACTIVE.store(false, std::sync::atomic::Ordering::Relaxed);
+    let prev = NAV
+        .get()
+        .and_then(|n| n.lock().unwrap().back())
+        .unwrap_or_else(start_page);
+    navigate_to(&prev);
+    if let (Some(window), Some(webview)) = (WINDOW.get(), WEBVIEW.get()) {
+        objc::send1_id(window.0, sel("makeFirstResponder:"), webview.0);
+    }
+    game_pane::teardown();
+    DEMO_VM.with(|d| *d.borrow_mut() = None);
+    append_transcript("--- MandelVM finished; the spawned VM instance was torn down (the GUI VM never paused) ---");
+}
+
 /// Target object for the Demos menu's items — not stored long-term (same
 /// reasoning as `build_vm_delegate`: `alloc_init`'s retain keeps it alive for
 /// the app's lifetime).
@@ -1727,6 +1848,12 @@ fn build_demos_delegate() -> Id {
         cls,
         sel("runMandelDemo:"),
         run_mandel_demo as *const _,
+        "v@:@",
+    );
+    objc::add_method(
+        cls,
+        sel("runSpawnedMandelDemo:"),
+        run_spawned_mandel_demo as *const _,
         "v@:@",
     );
     objc::register_class(cls);
@@ -2093,7 +2220,13 @@ fn build_menu_bar() {
     objc::send1_id(breakout_item, sel("setTarget:"), demos_delegate);
     let mandel_item = menu_item("Mandelbrot — a live zooming dive", Some("runMandelDemo:"), "");
     objc::send1_id(mandel_item, sel("setTarget:"), demos_delegate);
-    let demos_menu = submenu("Demos", &[breakout_item, mandel_item]);
+    let spawned_item = menu_item(
+        "Mandelbrot — in a spawned VM (one dive)",
+        Some("runSpawnedMandelDemo:"),
+        "",
+    );
+    objc::send1_id(spawned_item, sel("setTarget:"), demos_delegate);
+    let demos_menu = submenu("Demos", &[breakout_item, mandel_item, spawned_item]);
 
     let theme_menu = build_theme_menu();
     let help_delegate = build_help_delegate();
