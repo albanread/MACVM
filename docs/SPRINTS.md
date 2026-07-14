@@ -304,7 +304,10 @@ interleaves with it; every wave lands with in-language tests.
   calling curated libc functions directly, both ABI-driven by `cocoa_data`
   (a sibling repo's shared SQLite mirror of the macOS Obj-C + POSIX surface).
   Full design in [`docs/FFI.md`](FFI.md) (written as a non-disruptive side
-  track, alongside but independent of S11–S14): two tiers (dynamic
+  track, alongside but independent of S11–S14) — Tier 1 is BUILT (S20 steps
+  1–6); Tier 2's memory-model/threading/callback contract is designed in
+  [`cocoa_bridge_design.md`](cocoa_bridge_design.md) (C0–C5 ladder,
+  capstone: a native Cocoa window built from a Workspace doit): two tiers (dynamic
   `doesNotUnderstand:`-based Cocoa dispatch reusing S11's PIC machinery for
   caching; a direct compiler-primitive path for POSIX calls), an `Alien`-style
   byte-array-backed representation reusing existing `IndexableBytes`

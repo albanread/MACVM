@@ -203,12 +203,13 @@ kind of PIC entry.
   at the right byte offset (`frame origin x` → `self doubleAt: 1` if that's
   where `CGPoint`'s `x` lands). Real Strongtalk never needed per-struct
   primitives either — this preserves that.
-- **Pointer/object wrapping and GC** is flagged, not fully resolved, here: an
-  `id` a Smalltalk oop wraps needs a retain on wrap and a release when the
-  wrapping oop is collected (finalization), or MACVM will leak or
-  over-release real Cocoa objects. This needs MACVM's GC to know about
-  externally-retained references — a real design point for the actual S20
-  implementation sprint, sketched but not closed here.
+- **Pointer/object wrapping and GC** — originally flagged open here; now
+  CLOSED by [`cocoa_bridge_design.md`](cocoa_bridge_design.md): retain-on-wrap
+  with a +1-family (alloc/new/copy) classifier, explicit release-with-poison +
+  scoped `poolDo:` in v1 (no finalization dependency; leak-side failure bias),
+  and — the punchline — **zero GC changes**: the `id` lives in a GC-opaque
+  bytes payload (the Alien mechanism), the retain count is the external root,
+  and neither memory manager ever traverses the other's graph.
 
 ## 5. The native call mechanism
 
