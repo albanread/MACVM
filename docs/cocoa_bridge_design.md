@@ -51,15 +51,22 @@ discipline this bridge needs, on an easier opponent: **two memory managers
 never see each other's pointers; everything that crosses is a copy or a
 stable ticket**. Cocoa is a third memory manager. Same rule, three clauses:
 
-1. **A Cocoa reference lives in Smalltalk only inside an `ObjcRef`** — the
-   `Alien` mechanism (`runtime/alien.rs`), precisely: the raw `id` is stored
-   **smi-tagged in a named slot** (`AlienOop::external_addr`'s exact idiom —
-   `SmallInt` in, `SmallInt` out). The GC *does* scan that slot and sees a
-   perfectly valid SmallInteger — it never chases it, because a smi IS an
-   oop, just an immediate one. (macOS arm64 userspace addresses are ≤ 2^47,
-   far inside smi range, asserted at wrap time.) The GC may move the
-   *wrapper* freely; the ObjC heap never moves the *target*; neither
-   collector ever traverses the other's graph.
+1. **A Cocoa reference lives in Smalltalk only inside an `ObjcRef`**, whose
+   raw `id` is stored as **8 raw bytes in the indexable byte tail** — the one
+   place the collector genuinely never walks (`oops/heap.rs`: the byte tail
+   of an `IndexableBytes` object is never oop-scanned; named slots ARE). This
+   is deliberately **not** `Alien`'s named-slot smi idiom, and the reviewer
+   pass established why it must not be: an ObjC `id` is not always a plain
+   address. arm64 **tagged-pointer objects** (small `NSNumber`s,
+   `NSTaggedPointerString`, `NSDate`…) set bit 63 — out of smi range, so
+   `SmallInt::new` would panic on wrap (the C0 gate's own `processName` can
+   return a tagged-pointer string!) — and a raw word in a *named* slot would
+   be oop-scanned, where an id whose low bits look like `MEM_TAG` gets
+   "relocated" and corrupts the heap. `Alien` gets away with its smi slot
+   only because `mmap`/`malloc` addresses are untagged and ≤ 2^47; Cocoa
+   offers no such guarantee. Byte tail, full 64 bits, no exceptions. The GC
+   may move the *wrapper* freely; the ObjC heap never moves the *target*;
+   neither collector ever traverses the other's graph.
 2. **No oop is ever stored ObjC-side.** A Cocoa object that needs to refer
    back to Smalltalk (a delegate, a target/action, a callback) holds a
    **ticket**: a plain integer index into a VM-side, GC-rooted registry
@@ -96,15 +103,35 @@ at doit boundaries (a natural quiescent point: no Cocoa call is in flight
 between doits). `poolDo:` then exists for tight loops *within* a doit, not
 as the only line of defense. This is a C0 requirement, not a refinement —
 without it every +0 return leaks its autorelease reference invisibly.
+(Async work hopped to the main thread needs no extra pool: it runs inside
+the AppKit run loop's own per-cycle pools.)
+
+**Prior art, same house:** NewBCPL's Cocoa support (`../MacBCPL`,
+`docs/memory_model.md`) landed on exactly this arrangement — a pool
+wrapping every run plus a `POOL { … }` block construct
+(`bcpl_autorelease_pool_push/pop` at the braces) with the standard
+"don't stash a +0 out of the pool" contract. `poolDo:` is that construct
+wearing Smalltalk syntax; the pattern is already proven one language over.
 
 ### 3.2 The +1 family — mechanize Cocoa's naming convention, don't fight it
 
 Cocoa's ownership rules are conventions over selector names, and they are
 mechanical — it's exactly the analysis ARC's compiler performs:
 
-- Selectors beginning `alloc`, `new`, `copy`, `mutableCopy` return an
-  object the caller **already owns** (+1). Wrapping one of these results
-  skips the bridge retain (retaining again would leak).
+- Selectors in the `alloc`, `new`, `copy`, `mutableCopy`, and **`init`**
+  families return an object the caller **already owns** (+1). Wrapping one
+  of these results skips the bridge retain (retaining again would leak).
+- The **`init` family is special twice over**: it also *consumes* the
+  receiver's +1 and may return a *different* object (class clusters do this
+  routinely). So after an init-family send the bridge **poisons the
+  receiver's wrapper** (its ownership was transferred) and wraps the result
+  at +1 — mechanizing the "always use the init result, never the alloc
+  result" rule instead of trusting the programmer to remember it. (Without
+  this, the doc's own headline example — `alloc initWithContentRect:…` —
+  would both over-retain the result and leave a dangling receiver wrapper.)
+- **Family membership is ARC's exact rule, not a bare prefix test**: the
+  prefix must be followed by a non-lowercase character — `copyright` and
+  `newButtonTitle` are NOT in the `copy`/`new` families and return +0.
 - Everything else returns +0 (borrowed / autoreleased) — bridge retains.
 
 The classifier is a prefix test at resolution time, cached in the same PIC
@@ -142,9 +169,9 @@ unbuilt). The v1 design refuses to pretend otherwise:
 
 This is the punchline of the contract, and worth stating flatly: **the GC
 is not modified.** No new root kind, no scan hook, no pin bit, no
-finalizer queue (v1). An `ObjcRef` is an ordinary object whose payload slot
-holds a smi — scanned, valid, and inert to the collector by the same proven
-mechanism `Alien`'s external addresses already use. The retain count *is* the external root — Cocoa's
+finalizer queue (v1). An `ObjcRef` is an ordinary bytes-format object whose
+payload lives in the byte tail the collector never walks — invisible not by
+exemption but by the object model's own rules. The retain count *is* the external root — Cocoa's
 own memory manager holds the object alive on our behalf, which is what
 reference counting is for. The enormous runtime keeps its memory model; the
 small VM keeps its; the contract is eight bytes of opaque payload and a
@@ -200,9 +227,15 @@ the world method's fallback raises an ordinary Smalltalk error, S21's
 recovery applies if unhandled, the process never dies. (Cocoa exceptions
 are programmer errors by Apple's own doctrine, so "Smalltalk error, doit
 aborted, VM fine" is exactly proportionate.) A genuine crash *inside* a
-Cocoa call — a `SIGSEGV` in framework code — is already covered: PROBE's
-foreign-fault recovery (S21 step 1c) was built for precisely this and has
-been catching bad `Alien` dereferences since S20.
+Cocoa call — a `SIGSEGV` in framework code — is caught by PROBE's
+foreign-fault recovery (S21 step 1c), so the **process** survives. But be
+honest about what that recovery is: a `siglongjmp` out of Apple's frames,
+abandoning whatever cleanup they were mid-way through — a held framework
+lock or half-mutated internal state stays that way. So a framework fault is
+survivable-but-suspect: the bridge reports it, marks the Cocoa subsystem
+poisoned for the session, and recommends a restart — the same
+"survive, report, don't pretend" posture as a dead worker, not
+business-as-usual.
 
 ## 6. Callbacks: Cocoa calls Smalltalk
 
@@ -253,10 +286,10 @@ the one the GUI already uses for its own delegates
 | | contents | gate |
 |---|---|---|
 | **C0** | `ObjcRef` klass (Alien-mechanism payload) + retain-on-wrap / explicit-release-with-poison + the exception shim + id/scalar shapes through the existing FFI trampolines. Foundation only, VM thread only, headless. | unit + world tests: `NSProcessInfo processName` round-trips; poisoned ref fails cleanly; wrap/release counters balance under `MACVM_TRACE=cocoa`; GC_STRESS soak with churning wrappers |
-| **C1** | Marshalling breadth from `cocoa_data`: BOOL/NSUInteger/double, `NSString`↔`String` copy bridging, HFA struct set, the +1-family classifier | differential tests against known ABI shapes; leak-counter gate |
+| **C1** | Marshalling breadth from `cocoa_data`: BOOL/NSUInteger/double, `NSString`↔`String` copy bridging, HFA struct set, the +1-family classifier (incl. the init-family transfer rule) | differential tests against known ABI shapes; leak-counter gate; **an oversized selector (>8 args) through the shim** — the FFI arc's argv-overflow bug, re-gated at the new entry point |
 | **C2** | `doesNotUnderstand:` dispatch on `ObjcRef` + PIC-cached resolution (+ the `#class`-collision escape prefix, per `ObjectiveCAlien`) | a Workspace doit drives Foundation with keyword sends; PIC hit-rate visible in stats |
 | **C3** | Threading: sync main-thread hop (with the thread assert) + async hop riding the worker-inbox transport | vm_host test: an AppKit call from the VM thread completes; deadlock invariant test |
-| **C4** | Callbacks: `MacvmAction` tickets + registry + target/action | GUI test: an `NSButton` runs a Smalltalk block |
+| **C4** | Callbacks: `MacvmAction` tickets + registry + target/action. The `poolDo:` mint-list lives **in-heap** (a rooted Smalltalk collection, never a Rust-side `Vec` of oops) — designing away the BUG-A stale-oop-across-allocation class rather than gating it | GUI test: an `NSButton` runs a Smalltalk block; **GC_STRESS soak through a `poolDo:` + callback dispatch with a live mint-list** |
 | **C5** | **Capstone: CocoaPad** — a native `NSWindow` + text field + button built entirely from a Workspace doit, event round-trip and all | on-screen (user), plus a headless registry/envelope test |
 
 Verification throughout follows the standing rules: RELEASE + PARALLEL
@@ -278,6 +311,10 @@ tests before it earns features).
 - **docs/multi-smalltalk-worker.md** — the boundary philosophy (copies and
   tickets), the inbox transport the async hop and callbacks ride, and the
   poison-on-death discipline the wrapper borrows.
+- **NewBCPL (`../MacBCPL`)** — the sister language's Cocoa support:
+  per-run bottom pools + a `POOL { … }` scoped-drain construct
+  (`docs/memory_model.md`), the direct precedent for the bottom-pool +
+  `poolDo:` arrangement here.
 - **SPRINTS Phase E, S20 step 7** — this design is that step's design
   deliverable; implementation follows the milestone ladder above as its own
   side-track arc.
