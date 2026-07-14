@@ -1,0 +1,24 @@
+"46_mandelvm.mst — MandelVM: the standalone-window demo behind `run-mandelvm.sh`
+ (and `macvm-gui mandelvm`). It is MandelZoom that dives exactly ONCE and then
+ STOPS, so the demo has a natural end: reaching the depth limit sends `pane stop`,
+ which the GUI's standalone mandelvm mode turns into 'quit the app'. That closes
+ the whole loop the exploration was about — spin up a fresh VM instance, run the
+ demo, and exit the instance when the demo ends (docs/gamepane_design.md).
+
+ It reuses ALL of MandelZoom's compute + render (world/45_mandelzoom.mst) by
+ subclassing it and overriding just the end-of-dive hook. In a headless VM every
+ game primitive silently fails, so loading this class outside the GUI is harmless."
+MandelZoom subclass: MandelVM [
+    MandelVM class >> launch [
+        "Open the game pane and run a single dive (given its own explicit launch
+         so it never depends on class-side method inheritance)."
+        ^self new start
+    ]
+
+    diveBottomed [
+        "One dive is the whole demo: stop the frame loop instead of re-diving.
+         `pane stop` emits StopLoop; the GUI's mandelvm mode quits on it."
+        pane stop.
+        ^self
+    ]
+]

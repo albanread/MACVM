@@ -240,7 +240,7 @@ pub fn apply_command(cmd: &macvm::embed::GameCommand) {
     // is currently shown).
     match cmd {
         C::StartLoop => return crate::start_game_loop_timer(),
-        C::StopLoop => return crate::stop_game_loop_timer(),
+        C::StopLoop => return crate::on_game_loop_stopped(),
         C::PlaySound { preset } => return play_sound(*preset),
         C::PlayTune { abc } => return play_tune(abc),
         _ => {}

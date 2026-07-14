@@ -1331,6 +1331,54 @@ mod tests {
     }
 
     #[test]
+    fn mandelvm_dives_once_then_stops_itself() {
+        // MandelVM (world/46_mandelvm.mst) is MandelZoom that dives ONCE and then
+        // ends — the standalone-window demo's "run, then exit" contract. Drive it
+        // past one full dive and assert it (a) rendered real frames and (b) told
+        // the host to stop (StopLoop, from `pane stop`), which is what makes the
+        // `macvm-gui mandelvm` window quit itself. Also proves subclassing works
+        // (MandelVM inherits MandelZoom's compute + overrides only diveBottomed).
+        struct VecGameSink(Arc<Mutex<Vec<GameCommand>>>);
+        impl GameSink for VecGameSink {
+            fn emit(&mut self, cmd: GameCommand) {
+                self.0.lock().unwrap().push(cmd);
+            }
+        }
+
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let mut vm = boot_test_vm(JitMode::Threshold(10));
+        vm.set_game_sink(Box::new(VecGameSink(captured.clone())));
+        vm.exec("MandelVM launch.")
+            .expect("MandelVM launch must run cleanly");
+        // One dive is ~106 frames (scale 3.5 * 0.9^n < 0.00005); drive well past
+        // it. Once stopped, later steps keep re-stopping — harmless.
+        let mut stopped_at = None;
+        for frame in 0..140 {
+            vm.exec("GamePane stepWithKeys: 0.")
+                .expect("a game step must not error");
+            if stopped_at.is_none()
+                && captured
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|c| matches!(c, GameCommand::StopLoop))
+            {
+                stopped_at = Some(frame);
+            }
+        }
+
+        let cmds = captured.lock().unwrap();
+        assert!(
+            cmds.iter().any(|c| matches!(c, GameCommand::Blit { .. })),
+            "MandelVM must render real frames (blits)"
+        );
+        assert!(
+            stopped_at.is_some(),
+            "MandelVM must end its dive with a StopLoop (pane stop) within 140 frames"
+        );
+    }
+
+    #[test]
     fn gamepane_reset_stops_the_running_demo() {
         // Escape's close path submits `GamePane reset.` (gui close_game_pane).
         // Prove the VM-side contract it relies on: reset nils the registered

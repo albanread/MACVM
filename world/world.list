@@ -70,3 +70,6 @@
 # MandelZoom: a zooming Mandelbrot rendered live in the game pane (reuses
 # Mandelbrot>>escapeAtRe:im:; progressive per-frame render, docs/gamepane_design.md).
 45_mandelzoom.mst
+# MandelVM: MandelZoom that dives once then stops — the standalone-window demo
+# (macvm-gui mandelvm / run-mandelvm.sh) that quits when the demo ends.
+46_mandelvm.mst

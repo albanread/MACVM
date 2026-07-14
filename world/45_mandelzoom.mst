@@ -81,7 +81,15 @@ Object subclass: MandelZoom [
         pane blit: buf.
         pane present.        "show the frame — every frame in the loop presents"
         scale := scale * zoomStep.
-        scale < 0.00005 ifTrue: [ scale := 3.5 ].
+        scale < 0.00005 ifTrue: [ self diveBottomed ].
+        ^self
+    ]
+
+    diveBottomed [
+        "Reached the depth limit of one zoom dive. MandelZoom loops forever, so
+         reset to the whole set and dive again. A subclass (MandelVM) overrides
+         this to END instead."
+        scale := 3.5.
         ^self
     ]
 ]

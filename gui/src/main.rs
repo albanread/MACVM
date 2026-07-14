@@ -35,6 +35,12 @@ static WEBVIEW: OnceLock<MainThreadPtr> = OnceLock::new();
 /// game view is installed, the WKWebView's own `.window` goes nil, so it can't
 /// be re-derived from the webview — it must be held separately).
 static WINDOW: OnceLock<MainThreadPtr> = OnceLock::new();
+/// Set when `macvm-gui mandelvm` runs (the standalone MandelVM demo,
+/// `run-mandelvm.sh`): the window hosts only the game pane, so when the demo's
+/// frame loop stops (the dive finishes → `MandelVM>>diveBottomed` sends
+/// `pane stop` → `StopLoop`) there is no browser to return to and the whole app
+/// quits instead. Read by [`on_game_loop_stopped`] and [`on_game_tick`].
+static MANDELVM: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// The game-loop frame timer's target object (a `MacvmGameTimer` instance whose
 /// `gameTick:` IMP is [`on_game_tick`]), created lazily on the first
 /// `StartLoop`. Main-thread only (`docs/gamepane_design.md` M4).
@@ -719,9 +725,15 @@ fn build_game_timer_target() -> Id {
 /// Rendering happens later, when the step's draw commands drain (not here).
 extern "C" fn on_game_tick(_this: Id, _cmd: Sel, _timer: Id) {
     // Escape closes the game and returns to the GUI, from any game (no per-game
-    // handling needed). macOS virtual key code 53 = Escape.
+    // handling needed). macOS virtual key code 53 = Escape. In the standalone
+    // mandelvm demo there is no GUI to return to, so Escape ends the demo — same
+    // path as the dive finishing naturally.
     if macgamepane_graphics::input::key_held(53) {
-        close_game_pane();
+        if MANDELVM.load(std::sync::atomic::Ordering::Relaxed) {
+            on_game_loop_stopped();
+        } else {
+            close_game_pane();
+        }
         return;
     }
     let Some(vm) = VM.get() else { return };
@@ -807,6 +819,18 @@ pub(crate) fn stop_game_loop_timer() {
 /// never mid-stream (the anti-flicker invariant — see `present_if_dirty`).
 pub(crate) fn game_loop_active() -> bool {
     GAME_TIMER.with(|t| t.get() != NIL)
+}
+
+/// A game's frame loop has stopped — the guest sent `StopLoop` (`pane stop`),
+/// e.g. `MandelVM` after finishing its one dive. Always stops the timer; in the
+/// standalone `mandelvm` mode there is no browser to fall back to, so the demo
+/// ending means the app (and its VM instance) exits.
+pub(crate) fn on_game_loop_stopped() {
+    stop_game_loop_timer();
+    if MANDELVM.load(std::sync::atomic::Ordering::Relaxed) {
+        let app = objc::send0(objc::get_class("NSApplication"), sel("sharedApplication"));
+        objc::send1_id(app, sel("terminate:"), NIL);
+    }
 }
 
 // ── VM metrics dashboard (native sampler → ring buffer → toolbar) ────────────
@@ -2192,6 +2216,12 @@ fn main() {
         _ => {}
     }
 
+    // `macvm-gui mandelvm` — the standalone MandelVM demo window. It flows through
+    // the normal windowed setup below (bootstrap, window, a fresh VM worker), then
+    // opens straight into the game pane running MandelVM instead of the browser,
+    // and quits itself when the dive ends (see `on_game_loop_stopped`).
+    let mandelvm_mode = cli.first().map(|s| s == "mandelvm").unwrap_or(false);
+
     objc::bootstrap();
 
     let start = start_page();
@@ -2219,7 +2249,18 @@ fn main() {
     // the demo — "mandel" for the zooming Mandelbrot (world/45_mandelzoom.mst),
     // anything else for Breakout (world/44_breakout.mst). The Demos menu items
     // run the same doits.
-    if let Some(demo) = std::env::var_os("MACVM_GAMEPANE_DEMO") {
+    if mandelvm_mode {
+        // Standalone MandelVM demo: skip the browser, open the game pane, and
+        // run the single-dive MandelVM. `MANDELVM` makes the frame loop's stop
+        // (dive finished, or Escape) quit the app instead of returning to a page.
+        MANDELVM.store(true, std::sync::atomic::Ordering::Relaxed);
+        open_game_pane();
+        if let Some(vm) = VM.get() {
+            vm.submit(vm_host::VmRequest::Doit {
+                code: "MandelVM launch.".to_string(),
+            });
+        }
+    } else if let Some(demo) = std::env::var_os("MACVM_GAMEPANE_DEMO") {
         open_game_pane();
         if let Some(vm) = VM.get() {
             let code = if demo.to_string_lossy().eq_ignore_ascii_case("mandel") {
