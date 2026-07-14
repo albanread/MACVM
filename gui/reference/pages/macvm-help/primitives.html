@@ -148,6 +148,29 @@ these directly into native code.</p>
 <tr><td align="right">154</td><td align="left"><code>scale:</code></td><td align="right">1</td><td align="left">allocates; can fail</td></tr>
 <tr><td align="right">155</td><td align="left"><code>max</code></td><td align="right">0</td><td align="left">allocates; can fail</td></tr>
 <tr><td align="right">156</td><td align="left"><code>min</code></td><td align="right">0</td><td align="left">allocates; can fail</td></tr>
+</table><h3 align="left">Native game pane</h3><p align="left">Ids
+200&ndash;215 drive the native Metal game pane from Smalltalk (drawing,
+palette, sprites, the frame loop, sound and ABC music). Each validates its
+arguments, emits a <code>GameCommand</code> over the VM&rarr;GUI game channel,
+and answers <code>self</code>; in a headless VM they fail silently. See
+<code>world/43_gamepane.mst</code> and <code>docs/gamepane_design.md</code>.</p>
+
+<h3 align="left">Multi-VM workers</h3><p align="left">Spawn and talk to
+<em>worker VMs</em> &mdash; each its own heap, JIT, and GC on its own OS
+thread. Everything that crosses a VM boundary is a <em>deep copy</em> carried
+as MOP pickle bytes; no oop is ever visible to two VMs. All fail cleanly in a
+VM with no worker role. See <code>world/47_worker.mst</code> and
+<code>docs/multi-smalltalk-worker.md</code>.</p><table>
+<tr><td align="right"><strong>No.</strong></td><td align="left"><strong>Selector</strong></td><td align="right"><strong>Args</strong></td><td align="left"><strong>Notes</strong></td></tr>
+<tr><td align="right">220</td><td align="left"><code>primSpawn:</code></td><td align="right">1</td><td align="left">boot a worker VM; the argument doit runs once in it (installs its <code>onMessage:</code> handler); can fail</td></tr>
+<tr><td align="right">221</td><td align="left"><code>primSend:corr:bytes:</code></td><td align="right">3</td><td align="left">enqueue a message envelope and fire the coalesced inbox wake; can fail</td></tr>
+<tr><td align="right">222</td><td align="left"><code>primPoll</code></td><td align="right">0</td><td align="left">next envelope <code>{from. corr. bytes}</code> or nil; allocates</td></tr>
+<tr><td align="right">223</td><td align="left"><code>primAwaitInbox:</code></td><td align="right">1</td><td align="left">sleep in the inbox up to N&nbsp;ms &mdash; the headless run loop's heart; allocates; primary-only</td></tr>
+<tr><td align="right">224</td><td align="left"><code>primTerminate:</code></td><td align="right">1</td><td align="left">drop the worker's channel; its thread exits; can fail</td></tr>
+<tr><td align="right">225</td><td align="left"><code>primAlive:</code></td><td align="right">1</td><td align="left">liveness as last detected; can fail</td></tr>
+<tr><td align="right">226</td><td align="left"><code>primSelfId</code></td><td align="right">0</td><td align="left">0 in the primary, i &ge; 1 inside worker i</td></tr>
+<tr><td align="right">227</td><td align="left"><code>pickle:</code></td><td align="right">1</td><td align="left">object graph &rarr; MOP ByteArray (deep copy; refuses blocks/contexts/classes/aliens); allocates; can fail</td></tr>
+<tr><td align="right">228</td><td align="left"><code>unpickle:</code></td><td align="right">1</td><td align="left">MOP ByteArray &rarr; a fresh object graph in THIS heap; allocates; can fail</td></tr>
 </table>
 
 <h3 align="left">The FFI primitive</h3>

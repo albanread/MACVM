@@ -44,8 +44,10 @@ Beyond the WKWebView, the window can host a native **Metal game pane**
 (`src/game_pane.rs`) driven entirely from Smalltalk via the
 [MacGamePane](https://github.com/albanread/MacGamePane) engine — an 8-bit indexed
 drawing surface, retained GPU sprites, a 60 fps frame loop with keyboard input,
-and sound + ABC music. The **Demos** menu launches the `Breakout` demo game into
-it; Escape closes the pane back to the browser. It boots the real embedded VM
+and sound + ABC music. The **Demos** menu launches `Breakout`, the zooming
+`Mandelbrot`, the same dive in a *spawned second VM*, and the multi-VM
+showpiece — `ParallelMandel`, every frame computed in bands by **4 worker VMs**
+(docs/multi-smalltalk-worker.md); Escape closes the pane back to the browser. It boots the real embedded VM
 from the SQLite world image (not the mock). See
 [`../docs/gamepane_design.md`](../docs/gamepane_design.md) for the architecture
 and [`../docs/managingtheworld.md`](../docs/managingtheworld.md) for the

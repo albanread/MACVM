@@ -524,3 +524,22 @@ not merely fast" (the Strongtalk lesson — fast-but-crashes is a demo).
   feedback-warming speculation); all 20 UncommonTrap sites classified, gate
   complete; the reverse perf-cliff (cold error paths as CallSends under OSR)
   negligible, hits no frame/spill limit.
+
+## Multi-VM workers — ParallelMandel scalability (2026-07-15)
+
+The multi-Smalltalk-worker capstone (`docs/multi-smalltalk-worker.md`, worlds
+47/48): the live zooming Mandelbrot with every frame computed in parallel
+bands by 4 worker VMs (each its own heap + tier-1 JIT on its own OS thread),
+the primary VM only assembling bands (via `send:onReply:` continuations, MOP
+deep-copy messages) and blitting complete frames.
+
+- **~2.65 CPUs of sustained utilization with 4 workers** (measured on-screen,
+  release GUI, Demos → "Mandelbrot — parallel workers") — visibly faster than
+  the single-VM `MandelZoom` dive. The gap to 4.0 is the honest price of the
+  model: the primary's band assembly + pickle/unpickle copies + the serial
+  blit, plus band-boundary imbalance (interior-heavy bands finish last).
+- Headless gate (`parallel_mandel_computes_a_full_frame_across_worker_vms`):
+  full 320×240 frame with every band verified computed by its worker — 1.29 s
+  in a debug build (workers at `Threshold(10)`; the JIT-off first cut needed
+  ~8 s+ *per band*, the usual reminder that compute workers must warm their
+  own JIT).

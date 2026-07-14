@@ -83,13 +83,26 @@ allocating. See [`docs/PERF.md`](docs/PERF.md) for the arc and methodology.
   8-bit indexed drawing surface, retained GPU sprites, a 60 fps frame loop with
   keyboard input, and sound effects + ABC-notation music through AVFoundation,
   via the [MacGamePane](https://github.com/albanread/MacGamePane) engine
-  ([`docs/gamepane_design.md`](docs/gamepane_design.md)). Two demos ship in the
-  GUI's **Demos** menu, both written in Smalltalk: `Breakout`
+  ([`docs/gamepane_design.md`](docs/gamepane_design.md)). The GUI's **Demos**
+  menu ships four, all written in Smalltalk: `Breakout`
   ([`world/44_breakout.mst`](world/44_breakout.mst)), a small but complete
-  paddle-ball-bricks game, and
-  `MandelZoom` ([`world/45_mandelzoom.mst`](world/45_mandelzoom.mst)), a live
-  zooming Mandelbrot rendered pixel-by-pixel through the game channel (reusing
-  the JIT-compiled `Mandelbrot` escape-time float math).
+  paddle-ball-bricks game; `MandelZoom`
+  ([`world/45_mandelzoom.mst`](world/45_mandelzoom.mst)), a live zooming
+  Mandelbrot (the JIT-compiled escape-time float math); the same dive run in a
+  **spawned second VM**; and `ParallelMandel`
+  ([`world/48_parallelmandel.mst`](world/48_parallelmandel.mst)) — the dive
+  with **every frame computed in parallel bands by 4 worker VMs** (below).
+- **Multi-VM workers** — true multicore parallelism, driven entirely from
+  Smalltalk: `Worker spawn:` boots **worker VMs** (each its own heap, JIT, and
+  GC on its own OS thread) that communicate with the primary by **deep-copy
+  message passing** (the MOP pickle) — Erlang-style share-nothing, no shared
+  state, no identity across heaps, consistent with the `become:` stance below.
+  Fully asynchronous: replies run as `send:onReply:` continuations, delivery is
+  event-driven (the send itself wakes the sleeping receiver), and there is no
+  polling anywhere. A crashed worker dies alone and is reported as an ordinary
+  `#workerDied` message. `ParallelMandel` measures **~2.65 CPUs of sustained
+  utilization with 4 workers** on the live zooming Mandelbrot — visibly faster
+  than the single-VM dive ([`docs/multi-smalltalk-worker.md`](docs/multi-smalltalk-worker.md)).
 - **Scripting** — an embedded RUSTTCL console for driving the VM and its
   debugger ([`docs/RUSTTCL.md`](docs/RUSTTCL.md)).
 
@@ -226,7 +239,7 @@ for direct pointers and a fast JIT.
 | [`docs/float_fastpath_design.md`](docs/float_fastpath_design.md) | Unboxed float regions: the IR review, the reducer, the `d`-register file, `DoubleSlot` deopt |
 | [`docs/SIMD.md`](docs/SIMD.md) | SIMD vector support (designed): `FloatNxM` value classes, the NEON fast-path generalizing the scalar float region, bulk-array kernels + reductions |
 | [`docs/gamepane_design.md`](docs/gamepane_design.md) | The native Metal game engine driven from Smalltalk (MacGamePane): the frame/threading architecture, drawing/sprite/audio command channel, and the milestone ladder |
-| [`docs/multi-smalltalk-worker.md`](docs/multi-smalltalk-worker.md) | Primary/worker VM parallelism (designed): spawn worker VMs from Smalltalk, communicate by deep-copy message passing (the MOP pickle), no shared state — Erlang-style share-nothing across heaps |
+| [`docs/multi-smalltalk-worker.md`](docs/multi-smalltalk-worker.md) | Primary/worker VM parallelism (built, M0–M4): spawn worker VMs from Smalltalk, communicate by deep-copy message passing (the MOP pickle), no shared state — Erlang-style share-nothing across heaps; capstone = the 4-worker parallel Mandelbrot |
 | [`docs/IMAGE.md`](docs/IMAGE.md) / [`docs/managingtheworld.md`](docs/managingtheworld.md) | The versioned SQLite world image, and the practical world/image reseed workflow (`./reseed-world.sh`) |
 | [`docs/arm64.md`](docs/arm64.md) | Machine-level design: MAP_JIT/W^X, AAPCS64, PAC, relocs, oop maps, deopt glue |
 | [`docs/reference-vm-analysis.md`](docs/reference-vm-analysis.md) | Source-anchored analysis of Self, Strongtalk, JASM, and the MacNCL GC |

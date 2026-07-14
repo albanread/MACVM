@@ -32,6 +32,15 @@ rather than Self's prototype/map model.</p>
 	that: a direct <code>objc_msgSend</code> bridge to Cocoa/AppKit/WebKit,
 	the same approach already proven in sibling projects, rather than a
 	cross-platform toolkit.</li>
+	<li><strong>Multi-VM parallelism</strong> &mdash; Smalltalk code spawns
+	<em>worker VMs</em> (each with its own heap, JIT, and GC on its own OS
+	thread) and exchanges messages with them by <em>deep copy</em> &mdash;
+	Erlang-style share-nothing parallelism, no shared state, no identity
+	across heaps. Replies run as continuations
+	(<code>send:onReply:</code>); the primary never waits and never polls.
+	The Demos menu's &ldquo;Mandelbrot &mdash; parallel workers&rdquo;
+	computes every frame in bands across 4 worker VMs. See
+	<code>docs/multi-smalltalk-worker.md</code>.</li>
 </ul>
 
 <h3 align="left">Where things live</h3>
