@@ -12,9 +12,10 @@ parallelism, driven entirely from the language.
 ```smalltalk
 | w |
 w := Worker spawn.
-w send: #lengthOf with: 'hello'.
-Worker onReply: [:msg | Transcript show: msg payload printString].
-"...later..."  w terminate.
+w send: { #lengthOf. 'hello' }
+  onReply: [:r | Transcript show: r printString].   "fires when the reply lands"
+"the primary is already free — it sleeps until the router wakes it"
+w terminate.
 ```
 
 ## 1. Goal and non-goals
@@ -22,6 +23,15 @@ Worker onReply: [:msg | Transcript show: msg payload printString].
 **Goal.** True multicore parallelism for Smalltalk programs: N workers = N
 cores computing simultaneously, with a communication model simple enough to
 reason about — *everything that crosses a VM boundary is a copy*.
+
+**Async by design.** The primary **never waits** on a worker. Every send is
+fire-and-forget; every reply arrives as an *event* that wakes the primary,
+which spends its idle time genuinely asleep (today's primary VM thread already
+sleeps in `request_rx.recv()` between doits — `vm_host::worker_loop`; this
+design rides that same sleep). Replies are handled by **continuations**
+(`send:…onReply: [:r | …]`, correlation-id matched), never by blocking. There
+is no polling anywhere in the system: the event router (§3.1) is the inbox
+channel plus a wake hook, and the *send itself is the wake*.
 
 **Non-goals (v1):**
 
@@ -95,7 +105,11 @@ assembly of proven parts.
     outbound channel (worker id = index + 1).
   - `inbox_rx: Receiver<Envelope>` / `inbox_tx: Sender<Envelope>` — ONE
     shared inbound channel; every worker holds a clone of `inbox_tx`.
-    `Envelope { from: u32, bytes: Vec<u8> }`.
+    `Envelope { from: u32, corr: u64, bytes: Vec<u8> }` (`corr` = a
+    sender-assigned correlation id, §6, so replies can find their
+    continuation).
+  - `inbox_wake: Option<InboxWakeFn>` + `wake_pending: AtomicBool` — the
+    router's wake hook and its coalescing flag (§3.1).
   - The registry holds **no oops and no JoinHandles it ever joins** — only
     channel endpoints and detached thread handles (dropped, never `.join()`ed,
     per the S21 rule).
@@ -118,6 +132,48 @@ assembly of proven parts.
 - **Bytes only.** Nothing but `Vec<u8>` ever crosses a thread boundary. No
   oop is ever visible to two VMs; GC on either side needs no coordination
   whatsoever. This single invariant is what makes the whole design safe.
+
+### 3.1 The event router — how a sleeping primary is woken
+
+The primary spends most of its life asleep, and the design keeps it that way:
+**no polling exists anywhere in the system.** The "router" is not a thread or
+a component — it is the inbox channel plus a registered wake hook, and the
+send itself is the wake event:
+
+```
+worker thread:  inbox_tx.send(envelope);
+                if !wake_pending.swap(true) { inbox_wake(); }   // coalesced
+```
+
+```rust
+// src/embed.rs — registered by the embedder, the GameSink pattern again
+pub type InboxWakeFn = Arc<dyn Fn() + Send + Sync>;
+impl VmHandle { pub fn set_inbox_wake(&mut self, f: InboxWakeFn); }
+```
+
+- **In the GUI:** the wake fn pokes the main thread
+  (`performSelectorOnMainThread` — the exact `ChannelGameSink::emit`
+  send-then-`wake.notify()` pattern already shipping), and the main thread
+  submits one `Worker dispatchInbox.` doit to the primary. The primary VM
+  thread wakes from its ordinary `request_rx.recv()` sleep, dispatches
+  *every* queued envelope serially **between doits** (never mid-doit — the
+  strictly-serial invariant holds), and goes back to sleep. If the primary is
+  busy in a long doit, the request simply queues; delivery latency is "end of
+  current doit", not a timer tick.
+- **Headless/CLI:** there is no host loop, so the primary's event loop *is*
+  the inbox: `Worker runLoop` blocks in `inbox_rx.recv_timeout()` inside a
+  primitive. That block **is the sleep** — the OS channel wakeup is the
+  router, with zero latency and zero spin. (This is not "the primary
+  waiting" on any particular worker: it is the idle state itself, identical
+  in character to `worker_loop`'s own `recv()`.)
+- **Coalescing:** a burst of N envelopes produces one wake (`wake_pending`,
+  the game pane's `DIRTY`-flag discipline). The flag clears at the *start*
+  of a drain; a send racing in after the clear sets it again and produces at
+  most one harmless extra `dispatchInbox` — the classic eventfd pattern,
+  never a lost wakeup.
+- **Worker death rides the same path:** the registry synthesizes the
+  `#workerDied` envelope and fires the same wake — one delivery mechanism
+  for everything, including failure.
 
 ### How a worker boots: the registered boot-closure
 
@@ -231,9 +287,9 @@ no-op/fail harmlessly when the facility isn't wired (no boot-fn, bad id).
 | id | selector (world-side) | semantics |
 |---|---|---|
 | 220 | `Worker class >> primSpawn` | boot a worker via the registered boot-fn; answer its SmallInteger id (≥1); fail if no boot-fn or at the worker cap (default 16) |
-| 221 | `primSend: id bytes: aByteArray` | enqueue bytes on worker `id`'s channel; fail if unknown/dead id. From a *worker*, `id` must be 0 (the primary) — the reply path |
-| 222 | `primPoll` | next `Envelope` for THIS vm as a 2-slot Array `{fromId. bytes}`, or nil — non-blocking. In the primary: reads the shared inbox. In a worker: reads the staged pending message (set by its host loop) |
-| 223 | `primPollBlocking: timeoutMs` | as 222 but blocks the calling VM's thread up to the timeout. **Primary-only**; a worker's dispatch loop already blocks in Rust between doits |
+| 221 | `primSend: id corr: c bytes: aByteArray` | enqueue an envelope on worker `id`'s channel **and fire the coalesced wake** (§3.1); fail if unknown/dead id. From a *worker*, `id` must be 0 (the primary) — the reply path echoes the inbound `corr` |
+| 222 | `primPoll` | next `Envelope` for THIS vm as a 3-slot Array `{fromId. corr. bytes}`, or nil — non-blocking, used *inside* a dispatch that the wake already triggered (never as a poll loop). In the primary: reads the shared inbox. In a worker: reads the staged pending message (set by its host loop) |
+| 223 | `primAwaitInbox: timeoutMs` | the headless run-loop's heart: sleep in `inbox_rx.recv_timeout()` until an envelope arrives (→ as 222) or the timeout (→ nil). This block IS the primary's idle sleep — the channel send is the wake; zero spin, zero polling. **Primary-only** (a worker's host loop already sleeps in Rust between doits) |
 | 224 | `primTerminate: id` | drop worker `id`'s tx (its thread exits on next recv) and mark it dead; idempotent |
 | 225 | `primAlive: id` | boolean; false after death is *detected* (send-failure or died-envelope), not instantly at crash |
 | 226 | `primSelfId` | 0 in the primary, i ≥ 1 in worker i — lets shared world code know which side it's on |
@@ -248,7 +304,7 @@ One class, mirroring `GamePane`'s class-var-rooted-handler pattern:
 ```smalltalk
 Object subclass: Worker [
     | id |
-    <classVars: Handler ReplyHandler>
+    <classVars: Handler ReplyHandler PendingReplies NextCorr CurrentCorr>
 
     "── spawning (primary side) ──"
     Worker class >> spawn [
@@ -257,21 +313,21 @@ Object subclass: Worker [
     setId: anId [ id := anId. ^self ]
     id [ ^id ]
 
-    "── sending: everything is pickled — a copy, never a reference ──"
+    "── sending: always async, always a copy, never a wait ──"
     send: aPayload [
-        self primSend: id bytes: (Worker pickle: aPayload). ^self
+        "Fire-and-forget; any eventual reply goes to the general onReply:."
+        self primSend: id corr: 0 bytes: (Worker pickle: aPayload). ^self
     ]
-    send: selectorSymbol with: args [
-        "Convention sugar: a 2-element Array {selector. args}."
-        ^self send: { selectorSymbol. args }
-    ]
-    request: aPayload timeoutMs: ms [
-        "Synchronous convenience: send, then block for THIS worker's reply.
-         Replies from other workers arriving meanwhile are queued for the
-         reply handler, not lost. Blocks the calling VM — fine headless;
-         in the GUI it stalls the workspace for up to ms (documented)."
-        self send: aPayload.
-        ^Worker awaitReplyFrom: id timeoutMs: ms
+    send: aPayload onReply: aBlock [
+        "The async request pattern: send now, run the continuation when THIS
+         message's reply arrives (correlation-id matched). The primary never
+         blocks — it sleeps until the router wakes it (§3.1)."
+        | c |
+        c := Worker nextCorr.
+        PendingReplies isNil ifTrue: [ PendingReplies := Dictionary new ].
+        PendingReplies at: c put: aBlock.               "GC-rooted class var"
+        self primSend: id corr: c bytes: (Worker pickle: aPayload).
+        ^self
     ]
     terminate [ self primTerminate: id. ^self ]
     isAlive [ ^self primAlive: id ]
@@ -281,30 +337,54 @@ Object subclass: Worker [
     Worker class >> onMessage: aBlock [ Handler := aBlock ]      "GC-rooted"
     Worker class >> dispatchPending [
         | env | env := self primPoll.  env isNil ifTrue: [ ^self ].
+        CurrentCorr := env at: 2.        "so reply: can echo it back"
         Handler isNil ifFalse: [
             Handler value: (WorkerMessage from: (env at: 1)
-                            payload: (self unpickle: (env at: 2))) ]
+                            payload: (self unpickle: (env at: 3))) ]
     ]
     Worker class >> reply: aPayload [
-        "From a worker's handler: answer the primary."
-        self primSend: 0 bytes: (self pickle: aPayload)
+        "From a worker's handler: answer the primary, echoing the inbound
+         correlation id so the sender's continuation fires."
+        self primSend: 0 corr: CurrentCorr bytes: (self pickle: aPayload)
     ]
 
-    "── receiving, primary side ──"
+    "── receiving, primary side: dispatchInbox is only ever run because the
+       router woke us — it is never called in a poll loop ──"
     Worker class >> onReply: aBlock [ ReplyHandler := aBlock ]
-    Worker class >> drainReplies [
-        "Run the reply handler for every queued worker→primary message.
-         Called by the GUI pump when the primary is idle, or manually."
-        | env |
+    Worker class >> dispatchInbox [
+        "Handle every queued worker→primary envelope: a matching pending
+         continuation wins; otherwise the general reply handler."
+        | env corr k |
         [ (env := self primPoll) notNil ] whileTrue: [
-            ReplyHandler isNil ifFalse: [
-                ReplyHandler value: (WorkerMessage from: (env at: 1)
-                                     payload: (self unpickle: (env at: 2))) ] ]
+            corr := env at: 2.
+            k := (PendingReplies notNil and: [ corr ~= 0 ])
+                ifTrue: [ PendingReplies removeKey: corr ifAbsent: [ nil ] ]
+                ifFalse: [ nil ].
+            k isNil
+                ifTrue: [ ReplyHandler isNil ifFalse: [
+                    ReplyHandler value: (WorkerMessage from: (env at: 1)
+                                         payload: (self unpickle: (env at: 3))) ] ]
+                ifFalse: [ k value: (self unpickle: (env at: 3)) ] ]
+    ]
+
+    "── the headless event loop: sleep-until-woken, dispatch, repeat ──"
+    Worker class >> runLoopWhile: conditionBlock [
+        "A CLI program's main loop after kicking off its sends: sleep in the
+         inbox (primAwaitInbox: blocks in recv — the OS wake IS the router),
+         dispatch what arrived, until the condition turns false. The GUI never
+         calls this — its run loop is AppKit's, fed by the wake hook."
+        [ conditionBlock value ] whileTrue: [
+            (self primAwaitInbox: 250) isNil ifFalse: [ self dispatchInbox ] ]
+    ]
+    Worker class >> nextCorr [
+        NextCorr isNil ifTrue: [ NextCorr := 0 ].
+        NextCorr := NextCorr + 1. ^NextCorr
     ]
 
     Worker class >> pickle: x [ <primitive: 227> self error: 'unpicklable' ]
     Worker class >> unpickle: b [ <primitive: 228> self error: 'bad pickle' ]
-    "…primSpawn/primSend/primPoll/… <primitive: 220..226> stubs…"
+    "…primSpawn/primSend:corr:bytes:/primPoll/primAwaitInbox:/…
+       <primitive: 220..226> stubs…"
 ]
 
 "WorkerMessage: from (0 = primary, else worker id), payload, and
@@ -324,9 +404,15 @@ worker "just works".
 
 ## 7. Delivery semantics (the contract)
 
-1. **Asynchronous, buffered, unbounded (v1).** `send:` never blocks;
-   channels are unbounded like the game channel. (Bounded mailboxes ride the
-   reserved prim 229 later.)
+1. **Asynchronous end to end.** `send:` never blocks; replies never poll.
+   Delivery is event-driven: enqueue → coalesced wake → dispatched between
+   doits (§3.1). The primary's idle state is a genuine sleep (`recv()`), and
+   an arriving envelope is what ends it. There is **no blocking request
+   primitive**: "waiting for a reply" is expressed as a continuation
+   (`send:onReply:`), and a CLI program that has nothing else to do sleeps in
+   `runLoopWhile:` — which is the idle sleep itself, not a wait on any
+   particular worker. Channels are buffered and unbounded (v1; bounded
+   mailboxes ride the reserved prim 229 later).
 2. **Per-pair FIFO.** Messages primary→worker-i arrive in send order
    (mpsc guarantee); likewise worker-i→primary. **No global order** across
    different workers.
@@ -354,12 +440,25 @@ worker "just works".
 ## 9. GUI integration (one small pump)
 
 The primary VM in the GUI is `vm_host`'s worker thread, so worker channels
-hang off *that* `VmState` with no GUI knowledge. Reactive delivery needs one
-addition: the registry sets a per-VM atomic `inbox_nonempty` flag (a
-`VmLiveStats` sibling — the multi-VM-safe pattern from the metrics dashboard);
-the existing ~15 Hz metrics timer checks it and, if the host `is_idle`,
-submits `Doit { "Worker drainReplies." }`. Headless embeddings poll or use
-`primPollBlocking:` and need nothing.
+hang off *that* `VmState` with no GUI knowledge. Reactive delivery is the wake
+hook from §3.1, wired at boot alongside `set_game_sink`:
+
+```rust
+// gui boot: the wake fn pokes the main thread; the main thread submits the
+// dispatch doit. Both hops are the existing ChannelGameSink machinery.
+vm.set_inbox_wake(Arc::new(move || wake.notify_worker_inbox()));
+// main-thread handler:  VM.submit(Doit { "Worker dispatchInbox." })
+```
+
+End to end: worker `send` → coalesced main-thread poke → one queued doit →
+the primary wakes from `recv()`, runs `dispatchInbox` (all queued envelopes,
+continuations first), sleeps again. **No timer is involved and nothing polls**;
+latency is one runloop turn (µs–ms) when idle, or "end of the current doit"
+when busy — the same delivery character as every game/transcript event today.
+A slow supervisor sweep (piggybacked on the existing metrics tick) exists only
+as the *dead-worker* fallback detector, mirroring `WORKER_RESPONSE_TIMEOUT` —
+it plays no role in message delivery. Headless embeddings need none of this:
+`runLoopWhile:` sleeps directly in the inbox (§5, prim 223).
 
 ## 10. Verification plan (per the standing rules)
 
@@ -368,9 +467,12 @@ submits `Doit { "Worker drainReplies." }`. Headless embeddings poll or use
   contexts/aliens/classes; size caps; truncated-input fuzz (must fail, never
   panic); differential structural-equality sweep on random graphs.
 - **M1 integration (headless, `embed.rs` style):** spawn an echo worker,
-  ping-pong 10k messages, assert order + content; spawn-to-cap; terminate +
-  re-spawn; `GC_STRESS` on both sides while unpickling large graphs
-  (the HandleScope proof).
+  ping-pong 10k messages **through `runLoopWhile:`/`primAwaitInbox:` with no
+  polling anywhere**, assert order + content + that every wake was coalesced
+  (wake count ≤ envelope count, ≥ drain count); correlation ids route each
+  reply to its own continuation with interleaved workers; spawn-to-cap;
+  terminate + re-spawn; `GC_STRESS` on both sides while unpickling large
+  graphs (the HandleScope proof).
 - **M2:** worker that `error:`s mid-dispatch → primary gets `#workerDied`,
   process survives, remaining workers unaffected (the S21 test, N-wide);
   worker Transcript forwarding.
@@ -387,8 +489,8 @@ submits `Doit { "Worker drainReplies." }`. Headless embeddings poll or use
 |---|---|---|---|
 | **M0** | MOP pickler/unpickler + prims 227/228, one-VM round-trip suite | `M` | every §10-M0 test green; zero other code touched |
 | **M1** | `WorkerRegistry` on `VmState`, `set_worker_boot`, worker thread loop, prims 220–226 | `M` | headless echo ping-pong + crash-isolation tests green |
-| **M2** | `world/47_worker.mst` (Worker/WorkerMessage), dispatchPending/reply/request:, died-notification, transcript forwarding | `M` | in-language echo + died-notification demos run via CLI |
-| **M3** | GUI pump (inbox flag + idle-time drainReplies) | `S` | Workspace: spawn, send, see the reply land asynchronously |
+| **M2** | `world/47_worker.mst` (Worker/WorkerMessage), dispatchPending/reply:, `send:onReply:` continuations + dispatchInbox, `runLoopWhile:`, died-notification, transcript forwarding | `M` | in-language echo + died-notification demos run via CLI, event-driven end to end |
+| **M3** | GUI wake hook (`set_inbox_wake` → main-thread poke → `dispatchInbox` doit) | `S` | Workspace: spawn, `send:onReply:`, see the continuation fire asynchronously with no timer involved |
 | **M4** | **ParallelMandel** (`world/48`): the MandelZoom frame split into N bands, one per worker, primary assembles + blits; Demos menu item | `M` | visibly faster with more workers; speedup recorded in PERF.md |
 
 M4 is the capstone for the same reason Catcher/Breakout were: it exercises
