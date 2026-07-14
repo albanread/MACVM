@@ -1084,8 +1084,64 @@ pub static PRIMITIVES: &[PrimDesc] = &[
         can_allocate: false,
         can_fail: true,
     },
-    // Worker group (docs/multi-smalltalk-worker.md §5): 220–226 land with M1;
-    // the MOP pickle pair ships first (M0) so the format is provable solo.
+    // Worker group (docs/multi-smalltalk-worker.md §5) — spawn/send/poll (M1)
+    // + the MOP pickle pair (M0, provable solo).
+    PrimDesc {
+        id: 220,
+        name: "Worker class>>primSpawn:",
+        f: prim_worker_spawn,
+        argc: 1,
+        can_allocate: false,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 221,
+        name: "Worker class>>primSend:corr:bytes:",
+        f: prim_worker_send,
+        argc: 3,
+        can_allocate: false,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 222,
+        name: "Worker class>>primPoll",
+        f: prim_worker_poll,
+        argc: 0,
+        can_allocate: true,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 223,
+        name: "Worker class>>primAwaitInbox:",
+        f: prim_worker_await,
+        argc: 1,
+        can_allocate: true,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 224,
+        name: "Worker class>>primTerminate:",
+        f: prim_worker_terminate,
+        argc: 1,
+        can_allocate: false,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 225,
+        name: "Worker class>>primAlive:",
+        f: prim_worker_alive,
+        argc: 1,
+        can_allocate: false,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 226,
+        name: "Worker class>>primSelfId",
+        f: prim_worker_self_id,
+        argc: 0,
+        can_allocate: false,
+        can_fail: true,
+    },
     PrimDesc {
         id: 227,
         name: "Worker class>>pickle:",
@@ -1377,6 +1433,153 @@ fn prim_mop_unpickle(vm: &mut VmState, args: &[Oop]) -> PrimResult {
         Ok(o) => PrimResult::Ok(o),
         Err(_) => PrimResult::Fail,
     }
+}
+
+/// A smi argument as a worker id (≥ 0; 0 means the primary on the reply path).
+fn smi_worker_id(oop: Oop) -> Option<u32> {
+    let v = SmallInt::try_from(oop)?.value();
+    u32::try_from(v).ok()
+}
+
+/// Read a String argument's UTF-8 content; `None` for anything else.
+fn string_arg(vm: &VmState, oop: Oop) -> Option<String> {
+    let m = MemOop::try_from(oop)?;
+    if m.klass().oop().raw() != vm.universe.string_klass.oop().raw() {
+        return None;
+    }
+    let b = ByteArrayOop::try_from(oop)?;
+    let mut buf = Vec::new();
+    b.copy_bytes_out(&mut buf);
+    Some(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// Build the guest-facing envelope `{fromId. corr. bytes}` — a 3-slot Array.
+/// Allocation order + HandleScope: the ByteArray first (rooted), then the
+/// Array (whose alloc may move the bytes; refetch through the handle).
+fn envelope_to_oop(vm: &mut VmState, env: crate::runtime::workers::Envelope) -> Oop {
+    let scope = crate::memory::handles::HandleScope::enter(vm);
+    let k_bytes = vm.universe.bytearray_klass;
+    let ba = alloc::alloc_indexable_bytes(vm, k_bytes, env.bytes.len());
+    for (i, b) in env.bytes.iter().enumerate() {
+        ba.byte_at_put(i, *b);
+    }
+    let ba_h = scope.handle(vm, ba.oop());
+    let k_arr = vm.universe.array_klass;
+    let arr = alloc::alloc_indexable_oops(vm, k_arr, 3);
+    arr.at_put(0, SmallInt::new(i64::from(env.from)).oop());
+    arr.at_put(1, SmallInt::new(env.corr as i64).oop());
+    arr.at_put(2, ba_h.get(vm));
+    arr.oop()
+}
+
+/// `primSpawn:` (220): boot a worker VM via the registered boot closure and
+/// answer its id; the argument is an init doit source String (run once in
+/// the fresh worker — how its `Worker onMessage:` handler gets installed) or
+/// nil for none. Fails with no boot fn registered, from a worker (star
+/// topology), or at the cap.
+fn prim_worker_spawn(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    let init = if args[1].raw() == vm.universe.nil_obj.raw() {
+        None
+    } else {
+        match string_arg(vm, args[1]) {
+            Some(s) => Some(s),
+            None => return PrimResult::Fail,
+        }
+    };
+    match crate::runtime::workers::spawn(vm, init) {
+        Some(id) => PrimResult::Ok(SmallInt::new(i64::from(id)).oop()),
+        None => PrimResult::Fail,
+    }
+}
+
+/// `primSend:corr:bytes:` (221): enqueue a MOP ByteArray on worker `id`'s
+/// channel (or, from a worker, `id` 0 = the primary — echoing `corr` routes
+/// the reply to its continuation). The send fires the coalesced inbox wake
+/// (§3.1) on the receiving side's router.
+fn prim_worker_send(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    let Some(id) = smi_worker_id(args[1]) else {
+        return PrimResult::Fail;
+    };
+    let Some(corr) = SmallInt::try_from(args[2]).and_then(|s| u64::try_from(s.value()).ok()) else {
+        return PrimResult::Fail;
+    };
+    let Some(bytes) = ByteArrayOop::try_from(args[3]) else {
+        return PrimResult::Fail;
+    };
+    let mut buf = Vec::new();
+    bytes.copy_bytes_out(&mut buf);
+    if crate::runtime::workers::send(vm, id, corr, buf) {
+        PrimResult::Ok(args[0])
+    } else {
+        PrimResult::Fail
+    }
+}
+
+/// `primPoll` (222): the next envelope for THIS vm as `{fromId. corr. bytes}`,
+/// or nil — non-blocking, called from inside a wake-triggered dispatch (never
+/// a poll loop). Primary: the shared inbox. Worker: the staged pending
+/// message its host loop parked.
+fn prim_worker_poll(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    let _ = args;
+    let Some(ws) = vm.workers.as_mut() else {
+        return PrimResult::Ok(vm.universe.nil_obj);
+    };
+    match ws.poll() {
+        Some(env) => PrimResult::Ok(envelope_to_oop(vm, env)),
+        None => PrimResult::Ok(vm.universe.nil_obj),
+    }
+}
+
+/// `primAwaitInbox:` (223): the headless run loop's sleep — block in the
+/// inbox up to `timeoutMs`, answering the envelope or nil. This block IS the
+/// primary's idle state (the channel send is the wake; zero spin). Primary
+/// only.
+fn prim_worker_await(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    let Some(ms) = SmallInt::try_from(args[1]).and_then(|s| u64::try_from(s.value()).ok()) else {
+        return PrimResult::Fail;
+    };
+    let Some(ws) = vm.workers.as_mut() else {
+        return PrimResult::Fail;
+    };
+    match ws.await_inbox(ms) {
+        Some(env) => PrimResult::Ok(envelope_to_oop(vm, env)),
+        None => PrimResult::Ok(vm.universe.nil_obj),
+    }
+}
+
+/// `primTerminate:` (224): drop worker `id`'s channel (its thread exits on
+/// its next recv) and mark it dead. Idempotent.
+fn prim_worker_terminate(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    let Some(id) = smi_worker_id(args[1]) else {
+        return PrimResult::Fail;
+    };
+    if crate::runtime::workers::terminate(vm, id) {
+        PrimResult::Ok(args[0])
+    } else {
+        PrimResult::Fail
+    }
+}
+
+/// `primAlive:` (225): is worker `id` believed alive? False once death is
+/// DETECTED (failed send / terminate), not instantly at crash.
+fn prim_worker_alive(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    let Some(id) = smi_worker_id(args[1]) else {
+        return PrimResult::Fail;
+    };
+    let b = crate::runtime::workers::alive(vm, id);
+    PrimResult::Ok(if b {
+        vm.universe.true_obj
+    } else {
+        vm.universe.false_obj
+    })
+}
+
+/// `primSelfId` (226): 0 in the primary, i ≥ 1 in worker i — lets shared
+/// world code know which side of the boundary it is on.
+fn prim_worker_self_id(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    let _ = args;
+    let id = vm.workers.as_ref().map_or(0, |ws| ws.self_id());
+    PrimResult::Ok(SmallInt::new(i64::from(id)).oop())
 }
 
 // --- smi group (SPEC §10 appendix) ------------------------------------------
@@ -3248,6 +3451,13 @@ mod tests {
             (213, "Sound>>primPlay:"),
             (214, "Tune>>primPlayTune:"),
             (215, "GamePane>>blit:"),
+            (220, "Worker class>>primSpawn:"),
+            (221, "Worker class>>primSend:corr:bytes:"),
+            (222, "Worker class>>primPoll"),
+            (223, "Worker class>>primAwaitInbox:"),
+            (224, "Worker class>>primTerminate:"),
+            (225, "Worker class>>primAlive:"),
+            (226, "Worker class>>primSelfId"),
             (227, "Worker class>>pickle:"),
             (228, "Worker class>>unpickle:"),
         ];

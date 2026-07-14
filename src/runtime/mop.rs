@@ -216,6 +216,23 @@ fn read_bytes_out(o: Oop) -> Vec<u8> {
     buf
 }
 
+/// A hand-built control message for the worker registry (workers M1, §8):
+/// the MOP encoding of `{#workerDied. id}`, produced Rust-side (no VM in
+/// hand — the sender may be a dying worker thread) yet unpickling exactly
+/// like any guest-made message. One delivery mechanism for everything.
+pub(crate) fn encode_worker_died(id: i64) -> Vec<u8> {
+    let mut out = MAGIC.to_vec();
+    out.push(TAG_ARRAY);
+    write_varint(&mut out, 2);
+    let name = b"workerDied";
+    out.push(TAG_SYMBOL);
+    write_varint(&mut out, name.len() as u64);
+    out.extend_from_slice(name);
+    out.push(TAG_SMI);
+    write_varint(&mut out, zigzag(id));
+    out
+}
+
 #[allow(clippy::too_many_lines)] // one exhaustive dispatch, mirrored by `up`
 fn pk(
     vm: &VmState,

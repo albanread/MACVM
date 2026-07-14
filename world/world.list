@@ -73,3 +73,6 @@
 # MandelVM: MandelZoom that dives once then stops — the standalone-window demo
 # (macvm-gui mandelvm / run-mandelvm.sh) that quits when the demo ends.
 46_mandelvm.mst
+# Worker: primary/worker VM parallelism, copy-passing messages over MOP pickles
+# (docs/multi-smalltalk-worker.md; prims 220-228). Harmless with no worker role.
+47_worker.mst

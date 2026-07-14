@@ -412,6 +412,16 @@ impl VmHandle {
         // SAFETY: as `eval` — `sigsetjmp` inline at this call site, whose
         // frame stays live for the whole recovery window.
         let rc = unsafe { deopt_trap::sigsetjmp(deopt_trap::jmp_buf_ptr(slot), 1) };
+        if rc == deopt_trap::GUEST_FATAL_JMP_VAL {
+            // Guest fatal (error:, DNU, …) mid-exec — the same recovery arm
+            // `eval` has. (Missing here until the worker M1 tests ran the
+            // first-ever `error:` through `exec`: the fall-through hit the
+            // native-fault expect below and panicked instead of Err-ing.)
+            let message = deopt_trap::take_last_guest_fatal_message().expect(
+                "sigsetjmp returned GUEST_FATAL_JMP_VAL without a recorded guest-fatal message",
+            );
+            return Err(GuestError::RuntimeError(message));
+        }
         if rc != 0 {
             let (sig, pc, far) = deopt_trap::take_last_crash_info()
                 .expect("sigsetjmp returned nonzero without a recorded crash");
@@ -630,6 +640,55 @@ impl VmHandle {
     /// installs a channel-backed sink once, right after `boot`.
     pub fn set_game_sink(&mut self, sink: Box<dyn GameSink>) {
         self.vm.game_sink = Some(sink);
+    }
+
+    /// Registers how THIS vm spawns worker VMs (docs/multi-smalltalk-worker.md
+    /// §3, workers M1) — the `GameSink` pattern: the CLI/tests pass a
+    /// `VmHandle::boot(opts, world_dir)` closure, the GUI its image-boot path,
+    /// so a worker's world matches the primary's. Installing the boot fn is
+    /// what makes this VM the PRIMARY (creates its inbox + registry); without
+    /// it, `Worker spawn` fails cleanly. The closure runs ON each new worker
+    /// thread.
+    pub fn set_worker_boot(&mut self, f: crate::runtime::workers::WorkerBootFn) {
+        self.vm.workers = Some(Box::new(
+            crate::runtime::workers::WorkerState::new_primary(f),
+        ));
+    }
+
+    /// Registers the router's wake hook (§3.1): fired — coalesced — whenever
+    /// a worker envelope lands in this (primary) VM's inbox, so a sleeping
+    /// host can submit a `Worker dispatchInbox.` doit. Headless embeddings
+    /// skip this and sleep in `Worker runLoopWhile:` instead (the channel
+    /// wakeup IS the router there). Call after `set_worker_boot`.
+    pub fn set_inbox_wake(&mut self, f: crate::runtime::workers::InboxWakeFn) {
+        if let Some(ws) = self.vm.workers.as_ref() {
+            ws.set_wake(f);
+        }
+    }
+
+    /// Take on the Worker role (called by the worker thread body right after
+    /// boot, before any guest code): this VM is worker `self_id`, replying to
+    /// the primary through `to_primary`.
+    pub(crate) fn install_worker_role(
+        &mut self,
+        self_id: u32,
+        to_primary: crate::runtime::workers::InboxSender,
+    ) {
+        self.vm.workers = Some(Box::new(crate::runtime::workers::WorkerState::new_worker(
+            self_id, to_primary,
+        )));
+    }
+
+    /// Park an inbound envelope in the Worker-role staging slot (the
+    /// `GameStep` pattern): the host loop calls this, then execs
+    /// `Worker dispatchPending.`, whose `primPoll` takes it. Rust bytes only
+    /// — nothing here is visible to the GC.
+    pub(crate) fn stage_pending(&mut self, env: crate::runtime::workers::Envelope) {
+        if let Some(ws) = self.vm.workers.as_mut() {
+            if let crate::runtime::workers::WorkerState::Worker { pending, .. } = &mut **ws {
+                *pending = Some(env);
+            }
+        }
     }
 
     /// Hand a monitor a clone of THIS VM's live-signal block (a per-VM `Arc`, no
@@ -1836,6 +1895,162 @@ mod tests {
             "the game must keep making progress in the second half — no soft-lock \
              ({sounds_in_second_half} sounds in frames {}..{FRAMES})",
             FRAMES / 2
+        );
+    }
+
+    // ── multi-Smalltalk workers, M1 (docs/multi-smalltalk-worker.md §10) ──
+
+    /// The standard test primary: boots the real world and registers the
+    /// worker boot closure (same world, same options) — the CLI shape.
+    fn boot_worker_primary() -> VmHandle {
+        let mut vm = boot_test_vm(JitMode::Off);
+        vm.set_worker_boot(Arc::new(|| {
+            VmHandle::boot(
+                VmOptions {
+                    heap_mib: 64,
+                    jit: JitMode::Off,
+                    ..Default::default()
+                },
+                Path::new("world"),
+            )
+        }));
+        // A tiny in-language scoreboard for the async assertions: replies
+        // bump Count (and Bad on a wrong value); the run loop's condition
+        // bumps Tick so a broken loop bails instead of hanging the suite.
+        vm.exec(
+            "Object subclass: WkTest [
+                <classVars: Count Bad Tick Died W1 W2>
+                WkTest class >> reset [ Count := 0. Bad := 0. Tick := 0. Died := 0 ]
+                WkTest class >> w1: w [ W1 := w ]
+                WkTest class >> w1 [ ^W1 ]
+                WkTest class >> w2: w [ W2 := w ]
+                WkTest class >> w2 [ ^W2 ]
+                WkTest class >> bump: ok [
+                    Count := Count + 1.
+                    ok ifFalse: [ Bad := Bad + 1 ] ]
+                WkTest class >> noteDied [ Died := Died + 1 ]
+                WkTest class >> count [ ^Count ]
+                WkTest class >> bad [ ^Bad ]
+                WkTest class >> died [ ^Died ]
+                WkTest class >> tickCapped: n [ Tick := Tick + 1. ^Tick < n ]
+            ]",
+        )
+        .expect("WkTest scoreboard must compile");
+        vm.exec("WkTest reset.").expect("reset");
+        vm
+    }
+
+    #[test]
+    fn worker_echo_ping_pong_with_correlated_continuations() {
+        // The M1 gate: a spawned worker VM echoes 200 correlated requests;
+        // every reply routes to ITS OWN continuation (r = i * 2, checked
+        // in-language); the primary never polls — it sleeps in runLoopWhile:
+        // (primAwaitInbox: recv_timeout) and is woken by the sends.
+        let mut vm = boot_worker_primary();
+        // NB: `exec` runs ONE top item per call, so each statement is its own
+        // doit; state persists in WkTest's class vars.
+        vm.exec("WkTest w1: (Worker spawn: 'Worker onMessage: [:m | Worker reply: m payload * 2]').")
+            .expect("spawn the echo worker");
+        vm.exec("1 to: 200 do: [:i | WkTest w1 send: i onReply: [:r | WkTest bump: r = (i * 2)] ].")
+            .expect("send 200 correlated requests");
+        vm.exec("Worker runLoopWhile: [ (WkTest tickCapped: 100) and: [ WkTest count < 200 ] ].")
+            .expect("run the event loop until all replies land");
+        assert_eq!(
+            vm.eval("WkTest count").expect("count").trim(),
+            "200",
+            "every reply must arrive"
+        );
+        assert_eq!(
+            vm.eval("WkTest bad").expect("bad").trim(),
+            "0",
+            "every reply must reach ITS OWN continuation with the right value"
+        );
+    }
+
+    #[test]
+    fn worker_crash_is_isolated_and_reported_as_a_message() {
+        // §8: a worker whose handler errors dies ALONE — the primary gets a
+        // {#workerDied. id} message through the ordinary inbox, the process
+        // survives, and a sibling worker keeps answering afterwards.
+        let mut vm = boot_worker_primary();
+        vm.exec("WkTest w1: (Worker spawn: 'Worker onMessage: [:m | nil error: ''boom'']').")
+            .expect("spawn the crasher");
+        vm.exec("WkTest w2: (Worker spawn: 'Worker onMessage: [:m | Worker reply: m payload]').")
+            .expect("spawn the echo sibling");
+        vm.exec("Worker onReply: [:m | m isWorkerDied ifTrue: [ WkTest noteDied ] ].")
+            .expect("install the reply handler");
+        vm.exec("WkTest w1 send: 1.").expect("poke the crasher");
+        vm.exec("Worker runLoopWhile: [ (WkTest tickCapped: 100) and: [ WkTest died < 1 ] ].")
+            .expect("run until the death notice lands");
+        vm.exec("WkTest w2 send: 42 onReply: [:r | WkTest bump: r = 42 ].")
+            .expect("ask the sibling");
+        vm.exec("Worker runLoopWhile: [ (WkTest tickCapped: 200) and: [ WkTest count < 1 ] ].")
+            .expect("run until the sibling answers");
+        assert_eq!(
+            vm.eval("WkTest died").expect("died").trim(),
+            "1",
+            "the crash must arrive as one #workerDied message"
+        );
+        assert_eq!(
+            vm.eval("WkTest count").expect("count").trim(),
+            "1",
+            "the sibling worker must still answer after the crash"
+        );
+    }
+
+    #[test]
+    fn worker_terminate_and_liveness() {
+        let mut vm = boot_worker_primary();
+        vm.exec("WkTest w1: (Worker spawn: 'Worker onMessage: [:m | Worker reply: m payload]').")
+            .expect("spawn");
+        vm.exec("WkTest w1 isAlive ifFalse: [ nil error: 'freshly spawned worker must be alive' ].")
+            .expect("fresh worker is alive");
+        vm.exec("WkTest w1 terminate.").expect("terminate");
+        vm.exec("WkTest w1 isAlive ifTrue: [ nil error: 'terminated worker must not be alive' ].")
+            .expect("terminated worker is not alive");
+        // Sending to a terminated worker raises (primSend fails -> the world
+        // method's error fallback), surfacing as a GuestError here.
+        assert!(
+            vm.exec(
+                "(Worker new setId: 1) send: 5."
+            )
+            .is_err(),
+            "send to a terminated worker must raise"
+        );
+    }
+
+    #[test]
+    fn worker_spawn_without_boot_fn_fails_cleanly() {
+        // The GamePane posture: with no registered boot closure the world
+        // class is harmless — spawn raises a clean error, nothing hangs.
+        let mut vm = boot_test_vm(JitMode::Off);
+        assert!(
+            vm.exec("Worker spawn.").is_err(),
+            "spawn with no boot fn must raise, not hang or panic"
+        );
+    }
+
+    #[test]
+    fn worker_inbox_wake_fires_and_coalesces() {
+        // §3.1: the send itself is the wake, coalesced by the pending flag —
+        // a burst of N replies produces at least one wake and at most N.
+        let mut vm = boot_worker_primary();
+        let wakes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let w2 = wakes.clone();
+        vm.set_inbox_wake(Arc::new(move || {
+            w2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }));
+        vm.exec("WkTest w1: (Worker spawn: 'Worker onMessage: [:m | Worker reply: m payload]').")
+            .expect("spawn");
+        vm.exec("1 to: 50 do: [:i | WkTest w1 send: i onReply: [:r | WkTest bump: true] ].")
+            .expect("send the burst");
+        vm.exec("Worker runLoopWhile: [ (WkTest tickCapped: 100) and: [ WkTest count < 50 ] ].")
+            .expect("run until the burst is answered");
+        assert_eq!(vm.eval("WkTest count").expect("count").trim(), "50");
+        let n = wakes.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            (1..=50).contains(&n),
+            "wakes must fire and coalesce: got {n} for 50 replies"
         );
     }
 

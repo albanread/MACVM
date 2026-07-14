@@ -1,0 +1,168 @@
+"47_worker.mst — Worker: primary/worker VM parallelism with copy-passing
+ messages (docs/multi-smalltalk-worker.md). The primary VM spawns worker VMs
+ (each its own heap/JIT/OS thread); EVERYTHING that crosses a VM boundary is a
+ deep copy carried as MOP pickle bytes (prims 227/228) — no shared state, no
+ identity across heaps, ever. Async by design: the primary never waits; replies
+ run as continuations (send:onReply:, correlation-id matched), and delivery is
+ event-driven (the send itself wakes the receiver's router — §3.1).
+
+   | w |
+   w := Worker spawn: 'Worker onMessage: [:m | Worker reply: m payload]'.
+   w send: #(1 2 3) onReply: [:r | Transcript show: r printString].
+   Worker runLoopWhile: [ ...still waiting... ].     'headless only'
+   w terminate.
+
+ The spawn argument is an init doit run ONCE in the fresh worker — how its
+ onMessage: handler gets installed. In the worker, each inbound message runs
+ `Worker dispatchPending.` (driven by its host thread, strictly serial, one
+ message to completion at a time). Worker death arrives as an ordinary message
+ whose payload is {#workerDied. id} — one delivery mechanism for everything.
+
+ In a VM with no worker role (no boot fn registered — plain CLI runs, tests
+ that never spawn), every primitive fails cleanly: spawn raises, poll answers
+ nil, so loading this class is harmless anywhere (the GamePane posture)."
+
+"--- WorkerMessage: what handlers receive — who sent it (0 = the primary,
+ else the worker id) and the rebuilt payload copy. ---"
+Object subclass: WorkerMessage [
+    | from payload |
+    WorkerMessage class >> from: f payload: p [ ^self new setFrom: f payload: p ]
+    setFrom: f payload: p [ from := f. payload := p. ^self ]
+    from [ ^from ]
+    payload [ ^payload ]
+    isWorkerDied [
+        "Is this the system death notice ({#workerDied. id})?"
+        ^(payload isKindOf: Array) and: [ (payload size = 2) and: [ (payload at: 1) == #workerDied ] ]
+    ]
+]
+
+Object subclass: Worker [
+    | id |
+    <classVars: Handler ReplyHandler PendingReplies NextCorr CurrentCorr>
+
+    "── spawning (primary side) ──"
+    Worker class >> spawn: initSource [
+        "Boot a fresh worker VM (same world as this one, via the embedder's
+         registered boot closure) and run `initSource` once in it — install
+         its onMessage: handler there. Answers a Worker handle."
+        | i |
+        i := self primSpawn: initSource.
+        i isNil ifTrue: [ ^self error: 'cannot spawn a worker (no boot registered, or at the cap)' ].
+        ^self new setId: i
+    ]
+    Worker class >> spawn [ ^self spawn: nil ]
+    setId: anId [ id := anId. ^self ]
+    id [ ^id ]
+
+    "── sending: always async, always a copy, never a wait ──"
+    send: aPayload [
+        "Fire-and-forget; any eventual reply goes to the general onReply:."
+        self class primSend: id corr: 0 bytes: (Worker pickle: aPayload).
+        ^self
+    ]
+    send: aPayload onReply: aBlock [
+        "The async request pattern: send now, run the continuation when THIS
+         message's reply lands (correlation-id matched). The primary never
+         blocks — it sleeps until the router wakes it."
+        | c |
+        c := Worker nextCorr.
+        PendingReplies isNil ifTrue: [ PendingReplies := Dictionary new ].
+        PendingReplies at: c put: aBlock.               "GC-rooted class var"
+        self class primSend: id corr: c bytes: (Worker pickle: aPayload).
+        ^self
+    ]
+    terminate [ self class primTerminate: id. ^self ]
+    isAlive [ ^self class primAlive: id ]
+
+    "── receiving, worker side: the host loop execs `Worker dispatchPending.`
+       once per inbound message (the GameStep staging pattern) ──"
+    Worker class >> onMessage: aBlock [ Handler := aBlock ]
+    Worker class >> dispatchPending [
+        | env |
+        env := self primPoll.
+        env isNil ifTrue: [ ^self ].
+        CurrentCorr := env at: 2.        "so reply: echoes it back"
+        Handler isNil ifFalse: [
+            Handler value: (WorkerMessage from: (env at: 1)
+                                         payload: (self unpickle: (env at: 3))) ]
+    ]
+    Worker class >> reply: aPayload [
+        "From inside a worker's handler: answer the primary, echoing the
+         inbound correlation id so the sender's continuation fires."
+        self primSend: 0 corr: CurrentCorr bytes: (self pickle: aPayload)
+    ]
+
+    "── receiving, primary side: dispatchInbox runs because the router woke
+       us (or the run loop slept into a message) — never called in a poll loop ──"
+    Worker class >> onReply: aBlock [ ReplyHandler := aBlock ]
+    Worker class >> dispatchInbox [
+        "Handle every queued worker→primary envelope: a matching pending
+         continuation wins; otherwise the general reply handler. (Dictionary
+         has no removeKey:, so a fired continuation is tombstoned with nil —
+         correlation ids are unique, so a tombstone is never rekeyed.)"
+        | env corr k msg |
+        [ (env := self primPoll) notNil ] whileTrue: [
+            corr := env at: 2.
+            msg := WorkerMessage from: (env at: 1)
+                                payload: (self unpickle: (env at: 3)).
+            k := (PendingReplies notNil and: [ corr ~= 0 ])
+                ifTrue: [ PendingReplies at: corr ifAbsent: [ nil ] ]
+                ifFalse: [ nil ].
+            k isNil
+                ifTrue: [ ReplyHandler isNil ifFalse: [ ReplyHandler value: msg ] ]
+                ifFalse: [
+                    PendingReplies at: corr put: nil.
+                    k value: msg payload ] ]
+    ]
+
+    "── the headless event loop: sleep-until-woken, dispatch, repeat ──"
+    Worker class >> runLoopWhile: conditionBlock [
+        "A CLI program's main loop after kicking off its sends: sleep in the
+         inbox (primAwaitInbox: blocks in the channel — the OS wake IS the
+         router; zero spin), dispatch what arrived, until the condition turns
+         false. The GUI never calls this — its run loop is AppKit's, fed by
+         the registered wake hook."
+        | env |
+        [ conditionBlock value ] whileTrue: [
+            env := self primAwaitInbox: 250.
+            env isNil ifFalse: [
+                self dispatchOne: env.
+                self dispatchInbox ] ]
+    ]
+    Worker class >> dispatchOne: env [
+        "Route one already-taken envelope (from runLoopWhile:'s await) through
+         the same continuation-or-handler logic as dispatchInbox."
+        | corr k msg |
+        corr := env at: 2.
+        msg := WorkerMessage from: (env at: 1)
+                            payload: (self unpickle: (env at: 3)).
+        k := (PendingReplies notNil and: [ corr ~= 0 ])
+            ifTrue: [ PendingReplies at: corr ifAbsent: [ nil ] ]
+            ifFalse: [ nil ].
+        k isNil
+            ifTrue: [ ReplyHandler isNil ifFalse: [ ReplyHandler value: msg ] ]
+            ifFalse: [
+                PendingReplies at: corr put: nil.
+                k value: msg payload ]
+    ]
+    Worker class >> nextCorr [
+        NextCorr isNil ifTrue: [ NextCorr := 0 ].
+        NextCorr := NextCorr + 1.
+        ^NextCorr
+    ]
+    Worker class >> selfId [
+        "0 in the primary, i >= 1 inside worker i."
+        ^self primSelfId
+    ]
+
+    "── the numbered primitives (docs/multi-smalltalk-worker.md §5) ──"
+    Worker class >> pickle: x [ <primitive: 227> ^self error: 'unpicklable (blocks/contexts/classes/aliens cannot cross a VM boundary)' ]
+    Worker class >> unpickle: b [ <primitive: 228> ^self error: 'bad pickle bytes' ]
+    Worker class >> primSpawn: initString [ <primitive: 220> ^nil ]
+    Worker class >> primSend: i corr: c bytes: b [ <primitive: 221> ^self error: 'cannot send (unknown or dead worker)' ]
+    Worker class >> primPoll [ <primitive: 222> ^nil ]
+    Worker class >> primAwaitInbox: ms [ <primitive: 223> ^nil ]
+    Worker class >> primTerminate: i [ <primitive: 224> ^self ]
+    Worker class >> primAlive: i [ <primitive: 225> ^false ]
+    Worker class >> primSelfId [ <primitive: 226> ^0 ]
+]

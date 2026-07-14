@@ -20,6 +20,7 @@ pub mod globals;
 pub mod lookup;
 pub mod mop; // MOP object pickle — multi-Smalltalk workers M0 (docs/multi-smalltalk-worker.md §4)
 pub mod osr;
+pub mod workers; // primary/worker registry + channels — workers M1 (docs/multi-smalltalk-worker.md §3)
 pub mod primitives;
 pub mod probe;
 pub mod recompile;

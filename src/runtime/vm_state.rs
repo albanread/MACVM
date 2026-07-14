@@ -788,6 +788,12 @@ pub struct VmState {
     /// channel to the native Metal pane. The core VM only defines the
     /// vocabulary, never touches Metal.
     pub game_sink: Option<Box<dyn crate::embed::GameSink>>,
+    /// Multi-Smalltalk-worker role + channels (docs/multi-smalltalk-worker.md
+    /// §3, workers M1): `Primary` on a VM that registered a worker boot fn,
+    /// `Worker` inside each spawned VM, `None` everywhere else — every worker
+    /// primitive fails cleanly when this is `None`, so the world class is
+    /// harmless in any embedding (the game-sink posture).
+    pub workers: Option<Box<crate::runtime::workers::WorkerState>>,
     /// Set by the `quit`/`quit:` primitive; the dispatch loop exits (after
     /// the current activation returns) once this is true.
     pub exit_requested: bool,
@@ -1171,6 +1177,7 @@ impl VmState {
             prim_arg_base: 0,
             out: Box::new(std::io::stdout()),
             game_sink: None,
+            workers: None,
             exit_requested: false,
             exit_code: None,
             start_instant: Instant::now(),
