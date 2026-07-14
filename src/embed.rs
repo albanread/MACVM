@@ -2577,6 +2577,208 @@ mod tests {
         }
     }
 
+    // ── Cocoa bridge C2 gates (DNU dispatch + cached shape resolution) ──
+
+    #[test]
+    fn cocoa_c2_keyword_sends_drive_foundation() {
+        let _serial = cocoa_serial();
+        // The design's own acceptance shape: a Workspace-style doit drives
+        // Foundation with ordinary Smalltalk keyword sends — alloc/init
+        // (ownership families through DNU), a void append, an NSUInteger
+        // read-back. No send:args:ret: anywhere.
+        let mut vm = boot_test_vm(JitMode::Off);
+        vm.exec("Object subclass: CocoaDnu [ <classVars: A S> CocoaDnu class >> a: x [ A := x ] CocoaDnu class >> a [ ^A ] CocoaDnu class >> s: x [ S := x ] CocoaDnu class >> s [ ^S ] ]")
+            .expect("holder");
+        let (w0, r0, c0) = crate::runtime::objc_bridge::counters();
+        vm.exec("CocoaDnu a: ((Cocoa classNamed: 'NSMutableString') alloc).")
+            .expect("alloc through DNU (+1 family)");
+        vm.exec("CocoaDnu s: (CocoaDnu a) init.")
+            .expect("init through DNU (consumes the receiver)");
+        // The C2 review's gate gap, closed: the init-consume must fire on
+        // the DNU path (prim 241), not just C1's explicit send: (prim 231).
+        assert_eq!(
+            vm.eval("CocoaDnu a isValid").unwrap().trim(),
+            "false",
+            "init through DNU must consume the alloc receiver"
+        );
+        assert_eq!(vm.eval("CocoaDnu s isValid").unwrap().trim(), "true");
+        vm.exec("CocoaDnu s appendString: 'hello'.")
+            .expect("void keyword send");
+        vm.exec("CocoaDnu s appendString: ' world'.")
+            .expect("second append");
+        assert_eq!(
+            vm.eval("CocoaDnu s length").expect("NSUInteger ret").trim(),
+            "11"
+        );
+        let s = vm.eval("CocoaDnu s asString").expect("description");
+        assert!(s.contains("hello world"), "got {s}");
+        vm.exec("CocoaDnu s release.").expect("tidy");
+        let (w1, r1, c1) = crate::runtime::objc_bridge::counters();
+        // classNamed: wrap + alloc wrap + init wrap = 3 (the inline class
+        // wrapper leaks by design — leak-side bias, classes are immortal).
+        assert_eq!(w1 - w0, 3, "class, alloc, init-result wraps");
+        assert_eq!(r1 - r0, 1, "one release (the result)");
+        assert_eq!(c1 - c0, 1, "one DNU init-family consume");
+    }
+
+    #[test]
+    fn cocoa_c2_encoding_driven_coercion() {
+        let _serial = cocoa_serial();
+        let mut vm = boot_test_vm(JitMode::Off);
+        // The CALLEE's signature decides the register class now: a
+        // SmallInteger 3 passed to numberWithDouble: (encoding `d`)
+        // coerces to d0 — under C1's tag-driven marshal it would have
+        // ridden a GPR and the callee read garbage.
+        let d = vm
+            .eval("((Cocoa classNamed: 'NSNumber') numberWithDouble: 3) doubleValue")
+            .expect("int→double coercion");
+        assert_eq!(d.trim(), "3.0");
+        // #i32 via the encoding (`i`), no explicit token needed.
+        let n = vm
+            .eval("((Cocoa classNamed: 'NSNumber') numberWithInteger: -5) intValue")
+            .expect("negative int return");
+        assert_eq!(n.trim(), "-5");
+        // BOOL via the encoding, both polarities.
+        assert_eq!(
+            vm.eval("(Cocoa nsString: 'abc') isEqualToString: 'abc'")
+                .expect("bool true")
+                .trim(),
+            "true"
+        );
+        assert_eq!(
+            vm.eval("(Cocoa nsString: 'abc') isEqualToString: 'xyz'")
+                .expect("bool false")
+                .trim(),
+            "false"
+        );
+        // float (f32) argument AND return — the s-register path.
+        let f = vm
+            .eval("((Cocoa classNamed: 'NSNumber') numberWithFloat: 2.5) floatValue")
+            .expect("f32 round-trip");
+        assert_eq!(f.trim(), "2.5");
+        // A `c` return is a signed CHAR, answered as a SmallInteger — on
+        // arm64 BOOL encodes `B`, so Bool-ifying `c` returned true for
+        // charValue 65 (the C2 review's silent-wrong-answer finding).
+        let c = vm
+            .eval("((Cocoa classNamed: 'NSNumber') numberWithInteger: 65) charValue")
+            .expect("char return");
+        assert_eq!(c.trim(), "65", "charValue answers the char, not true");
+        let cn = vm
+            .eval("((Cocoa classNamed: 'NSNumber') numberWithInteger: -5) charValue")
+            .expect("negative char return");
+        assert_eq!(cn.trim(), "-5", "char sign-extends from 8 bits");
+        // Manual reference counting is refused at EVERY send path —
+        // ownership belongs to the bridge, and `dealloc` through DNU
+        // would be a use-after-free (C2 review).
+        assert!(
+            vm.exec("(Cocoa nsString: 'x') primSendAuto: 'retain' args: #().")
+                .is_err(),
+            "raw retain must be refused"
+        );
+        assert!(
+            vm.exec("(Cocoa nsString: 'x') send: 'dealloc'.").is_err(),
+            "dealloc must be refused on the C1 path too"
+        );
+    }
+
+    #[test]
+    fn cocoa_c2_struct_shapes_via_dnu() {
+        let _serial = cocoa_serial();
+        let mut vm = boot_test_vm(JitMode::Off);
+        vm.exec("Object subclass: CocoaDnS [ <classVars: R P> CocoaDnS class >> r: x [ R := x ] CocoaDnS class >> r [ ^R ] CocoaDnS class >> p: x [ P := x ] CocoaDnS class >> p [ ^P ] ]")
+            .expect("holder");
+        // NSRange return, resolved from the encoding — an Array answer.
+        vm.exec("CocoaDnS r: ((Cocoa nsString: 'hello world') rangeOfString: 'world').")
+            .expect("rangeOfString: via DNU");
+        assert_eq!(vm.eval("CocoaDnS r at: 1").unwrap().trim(), "6");
+        assert_eq!(vm.eval("CocoaDnS r at: 2").unwrap().trim(), "5");
+        // A CGPoint ARGUMENT is an Array of 2 numbers under the encoding-
+        // driven marshal; the HFA result comes back as an Array of Doubles.
+        vm.exec("CocoaDnS p: (((Cocoa classNamed: 'NSValue') valueWithPoint: (Array with: 3.5 with: 4.5)) pointValue).")
+            .expect("CGPoint round-trip via DNU");
+        assert_eq!(vm.eval("CocoaDnS p at: 1").unwrap().trim(), "3.5");
+        assert_eq!(vm.eval("CocoaDnS p at: 2").unwrap().trim(), "4.5");
+    }
+
+    #[test]
+    fn cocoa_c2_shape_cache_hits_are_visible_in_stats() {
+        let _serial = cocoa_serial();
+        // The design's "PIC hit-rate visible in stats": repeated DNU sends
+        // of one selector cost ONE runtime resolution; the rest are cache
+        // hits, and __vmStats surfaces both counters.
+        let mut vm = boot_test_vm(JitMode::Off);
+        vm.exec("Object subclass: CocoaHit [ <classVars: N> CocoaHit class >> n: x [ N := x ] CocoaHit class >> n [ ^N ] ]")
+            .expect("holder");
+        vm.exec("CocoaHit n: (Cocoa nsString: 'hit rate').")
+            .expect("receiver");
+        let (h0, m0) = crate::runtime::objc_bridge::shape_stats();
+        vm.exec("1 to: 20 do: [:i | CocoaHit n length ].")
+            .expect("20 DNU sends of one selector");
+        let (h1, m1) = crate::runtime::objc_bridge::shape_stats();
+        assert!(
+            m1 - m0 <= 2,
+            "one selector on one class must resolve at most twice (got {} misses)",
+            m1 - m0
+        );
+        assert!(
+            h1 - h0 >= 18,
+            "the remaining sends must be cache hits (got {})",
+            h1 - h0
+        );
+        let stats = crate::runtime::vm_state::format_vm_stats(&vm.vm);
+        assert!(
+            stats.contains("cocoa_shape_hits="),
+            "the hit-rate must be visible in the stats surface, got:\n{stats}"
+        );
+        vm.exec("CocoaHit n release.").expect("tidy");
+    }
+
+    #[test]
+    fn cocoa_c2_unknown_selector_and_non_cocoa_dnu_fail_cleanly() {
+        let _serial = cocoa_serial();
+        let mut vm = boot_test_vm(JitMode::Off);
+        // An unknown ObjC selector: resolution fails, the world fallback
+        // raises, the VM lives on.
+        assert!(
+            vm.exec("(Cocoa nsString: 'x') fooBarBazQux.").is_err(),
+            "an unresolvable selector must raise cleanly"
+        );
+        assert_eq!(vm.eval("3 + 4").unwrap().trim(), "7");
+        // Object's own doesNotUnderstand: is untouched — a non-Cocoa DNU
+        // still errors the classic way (regression guard).
+        assert!(
+            vm.exec("3 fooBarBazQux.").is_err(),
+            "ordinary DNU must still raise"
+        );
+        // A keyword-arity mismatch against the real signature also fails
+        // cleanly (length declares no arguments).
+        assert!(
+            vm.exec("(Cocoa nsString: 'x') primSendAuto: 'length' args: #(1 2).")
+                .is_err(),
+            "an arity mismatch must raise cleanly"
+        );
+    }
+
+    #[test]
+    fn cocoa_c2_dnu_sends_survive_the_jit() {
+        let _serial = cocoa_serial();
+        // DNU sends from COMPILED callers: threshold-1 compiles the loop
+        // method immediately, so the ObjcRef sends flow through the
+        // compiled DNU path (S11 step 6's rt_dnu → Message → ObjcRef>>
+        // doesNotUnderstand:) rather than the interpreter's.
+        let mut vm = boot_test_vm(JitMode::Threshold(1));
+        vm.exec("Object subclass: CocoaJit [ <classVars: N> CocoaJit class >> n: x [ N := x ] CocoaJit class >> n [ ^N ] CocoaJit class >> sum [ | t | t := 0. 1 to: 50 do: [:i | t := t + CocoaJit n length ]. ^t ] ]")
+            .expect("holder + hot loop");
+        vm.exec("CocoaJit n: (Cocoa nsString: 'jitted').")
+            .expect("receiver");
+        assert_eq!(
+            vm.eval("CocoaJit sum").expect("hot DNU loop").trim(),
+            "300",
+            "50 × length('jitted'=6) through compiled DNU sends"
+        );
+        vm.exec("CocoaJit n release.").expect("tidy");
+    }
+
     #[test]
     fn cocoa_c1_oversized_send_fails_cleanly() {
         let _serial = cocoa_serial();

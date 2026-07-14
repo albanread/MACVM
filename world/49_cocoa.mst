@@ -107,6 +107,55 @@ Object subclass: ObjcRef [
         "A send answering a CGRect: an Array {x. y. w. h} of Doubles."
         ^self send: selName args: #() ret: #rect
     ]
+
+    "── C2: doesNotUnderstand: dispatch ──────────────────────────────────
+     Any Smalltalk unary/keyword send an ObjcRef doesn't natively answer
+     becomes an Objective-C message — the selector text is identical in
+     both languages. The ABI shape comes from the live runtime's own
+     method signature (method_getTypeEncoding), cached per class×selector,
+     so arguments marshal by the CALLEE's declared types (a SmallInteger
+     passed where a double is declared coerces correctly). Results map:
+     objects wrap as ObjcRef (ownership families honored), BOOL→Boolean,
+     integers→SmallInteger, float/double→Double, void→self, CGPoint/
+     CGRect/NSRange→Arrays of numbers, char*→String.
+
+       calendar := (Cocoa classNamed: 'NSCalendar') currentCalendar.
+       s := ((Cocoa classNamed: 'NSMutableString') alloc) init.
+       s appendString: 'hello'.
+
+     COLLISIONS: selectors ObjcRef/Object really implement never reach
+     here — notably `class` (escape: objcClass), `hash` (wrapper identity
+     hash, NOT NSObject -hash), `isValid` (wrapper-poison check, NOT
+     NSTimer's -isValid), `printString`, `release` (the bridge's own),
+     and `=`/`==` which compare WRAPPER identity — two ObjcRefs on the
+     same object are not `=`; use `isEqual:` for ObjC equality. Manual
+     reference counting (`retain`/`autorelease`/`dealloc`/`retainCount`)
+     is refused outright at every send path: ownership belongs to the
+     bridge (wrap/release/poolDo:), never to guest code."
+    doesNotUnderstand: aMessage [
+        ^self primSendAuto: aMessage selector asString args: aMessage arguments
+    ]
+    primSendAuto: selName args: argArray [
+        <primitive: 241>
+        ^self error: 'Cocoa does not understand (or cannot marshal): ', selName printString
+    ]
+    objcClass [
+        "The #class collision escape: the receiver's OBJECTIVE-C class
+         (Smalltalk `class` answers ObjcRef, as it must)."
+        ^self send: 'class'
+    ]
+    copy [
+        "Objective-C -copy (+1 family — the result is owned; release it).
+         Defined EXPLICITLY so a future Object>>copy can never shadow it:
+         a Smalltalk shallow copy would duplicate the id tail and mint two
+         wrappers owning ONE reference — the double-release the design
+         forbids (C2 review's landmine finding)."
+        ^self send: 'copy'
+    ]
+    asString [
+        "The receiver's description, as a Smalltalk String."
+        ^self sendString: 'description'
+    ]
 ]
 
 Object subclass: Cocoa [

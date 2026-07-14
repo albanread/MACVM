@@ -42,6 +42,7 @@ use crate::oops::wrappers::{ByteArrayOop, MemOop};
 use crate::oops::Oop;
 use crate::runtime::vm_state::VmState;
 use std::cell::Cell;
+use std::collections::HashMap;
 use std::ffi::CString;
 use std::os::raw::{c_char, c_void};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -86,6 +87,8 @@ pub enum RetKind {
     IntPair = 4,
     /// void — nothing read.
     Void = 5,
+    /// float — `s0`, widened to double by the shim.
+    F32 = 6,
 }
 
 /// A general send's raw result registers: `gpr` holds `x0`/`x1`, `fpr`
@@ -112,6 +115,14 @@ struct Syms {
     objc_release: unsafe extern "C" fn(*mut c_void),
     pool_push: unsafe extern "C" fn() -> *mut c_void,
     pool_pop: unsafe extern "C" fn(*mut c_void),
+    // C2 shape resolution: ask the LIVE runtime for a method's @encode
+    // signature. `object_getClass` answers the metaclass for a class
+    // object, whose *instance* methods ARE the class methods — so
+    // `class_getInstanceMethod(object_getClass(target), sel)` resolves
+    // uniformly for instance and class sends.
+    object_get_class: unsafe extern "C" fn(*mut c_void) -> *mut c_void,
+    class_get_instance_method: unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void,
+    method_get_type_encoding: unsafe extern "C" fn(*mut c_void) -> *const c_char,
 }
 
 static SYMS: OnceLock<Option<Syms>> = OnceLock::new();
@@ -186,6 +197,22 @@ fn syms() -> Option<&'static Syms> {
                 std::mem::transmute::<u64, unsafe extern "C" fn(*mut c_void)>(resolve(
                     "objc_autoreleasePoolPop",
                 )?)
+            },
+            object_get_class: unsafe {
+                std::mem::transmute::<u64, unsafe extern "C" fn(*mut c_void) -> *mut c_void>(
+                    resolve("object_getClass")?,
+                )
+            },
+            class_get_instance_method: unsafe {
+                std::mem::transmute::<
+                    u64,
+                    unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void,
+                >(resolve("class_getInstanceMethod")?)
+            },
+            method_get_type_encoding: unsafe {
+                std::mem::transmute::<u64, unsafe extern "C" fn(*mut c_void) -> *const c_char>(
+                    resolve("method_getTypeEncoding")?,
+                )
             },
         })
     })
@@ -383,7 +410,312 @@ pub fn release(vm: &mut VmState, o: Oop) -> bool {
     true
 }
 
+// ── C2: shape resolution from the live runtime ─────────────────────────────
+//
+// The bridge never guesses a method's ABI: it asks libobjc for the method's
+// `@encode` signature (`method_getTypeEncoding`) and parses it into a
+// [`Shape`] — the same information `cocoa_data`'s offline tables mirror,
+// taken from the authoritative source at runtime. Parsed shapes are cached
+// per (class, selector) with hit/miss counters (the design's "PIC-cached
+// resolution" — one process-wide map rather than per-send-site PICs in C2;
+// per-site caching can ride the real PIC entries when DNU sends compile).
+
+/// One argument's marshalling class, from its `@encode` token. Integer
+/// tokens carry their DECLARED width: the marshaller range-checks against
+/// it, and any argument narrower than 8 bytes REFUSES to spill to the
+/// stack (Darwin packs non-variadic stack args to natural size — an
+/// 8-byte spill word for a declared `int` would shift every later stack
+/// offset; the C2 review's mis-marshal finding).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ObjcArg {
+    /// `@` object / `#` Class — an ObjcRef, nil, or a String (temp NSString).
+    Id,
+    /// `B` — true/false (or 0/1). 8 bits: never spills.
+    Bool,
+    /// `c s i l q` / `C S I L Q` — a SmallInteger, range-checked against
+    /// the declared width (`l`/`L` are 32-bit BY DEFINITION in @encode).
+    /// Only the 64-bit widths may spill.
+    Int { signed: bool, bits: u8 },
+    /// `d` — a Double or a SmallInteger (coerced; the register class is
+    /// decided by the CALLEE's signature now, not the argument's tag).
+    F64,
+    /// `f` — as F64, then narrowed; the f32 bits ride the d-register's low
+    /// half, exactly where the callee's `s` register view reads. Never
+    /// spills (a spilled float packs to 4 bytes).
+    F32,
+    /// `:` — a selector name as a String/Symbol.
+    Sel,
+    /// `{CGPoint=dd}` / `{CGSize=dd}` — an Array of 2 numbers (2 FPR slots).
+    Point,
+    /// `{CGRect=...}` — an Array of 4 numbers (4 FPR slots).
+    Rect,
+    /// `{_NSRange=QQ}` — an Array of 2 non-negative SmallIntegers (2 GPRs).
+    Range,
+}
+
+/// A method's return class, from its `@encode` token. Integer returns
+/// carry their width: the result is truncated to the declared width and
+/// sign-/zero-extended from there (the #i32 lesson generalized — a `c`
+/// return is a signed char answered as a SmallInteger, NOT a Boolean:
+/// on arm64 BOOL encodes as `B`, so a live `c` is a genuine char).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ObjcRet {
+    Id,
+    /// `B` only.
+    Bool,
+    Int {
+        signed: bool,
+        bits: u8,
+    },
+    F64,
+    F32,
+    Void,
+    Point,
+    Rect,
+    Range,
+    /// `*` — a C string, copied out.
+    CharStar,
+}
+
+/// A resolved method shape: what to marshal in, what to read back.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Shape {
+    pub ret: ObjcRet,
+    pub args: Vec<ObjcArg>,
+}
+
+/// Skip an `@encode` token's method-signature qualifiers (`r n N o O R V`)
+/// and return the rest.
+fn skip_qualifiers(s: &str) -> &str {
+    s.trim_start_matches(['r', 'n', 'N', 'o', 'O', 'R', 'V'])
+}
+
+/// Consume ONE type token from the front of `s`; answer (token, rest).
+/// Struct/array/union tokens are consumed with brace matching.
+fn split_type(s: &str) -> Option<(&str, &str)> {
+    let s = skip_qualifiers(s);
+    let mut chars = s.char_indices();
+    let (_, first) = chars.next()?;
+    let (open, close) = match first {
+        '{' => ('{', '}'),
+        '[' => ('[', ']'),
+        '(' => ('(', ')'),
+        '^' => {
+            // A pointer: `^` then one pointee type.
+            let (_, rest) = split_type(&s[1..])?;
+            let taken = s.len() - rest.len();
+            return Some((&s[..taken], rest));
+        }
+        _ => return Some(s.split_at(1)),
+    };
+    let mut depth = 1usize;
+    for (i, c) in chars {
+        if c == open {
+            depth += 1;
+        } else if c == close {
+            depth -= 1;
+            if depth == 0 {
+                return Some(s.split_at(i + 1));
+            }
+        }
+    }
+    None // unbalanced — malformed encoding
+}
+
+/// An integer token's (signedness, width). `l`/`L` are 32-bit BY
+/// DEFINITION in @encode, even on LP64 (Apple's type-encoding doc).
+fn int_width(byte: u8) -> Option<(bool, u8)> {
+    match byte {
+        b'c' => Some((true, 8)),
+        b's' => Some((true, 16)),
+        b'i' | b'l' => Some((true, 32)),
+        b'q' => Some((true, 64)),
+        b'C' => Some((false, 8)),
+        b'S' => Some((false, 16)),
+        b'I' | b'L' => Some((false, 32)),
+        b'Q' => Some((false, 64)),
+        _ => None,
+    }
+}
+
+/// Classify one consumed type token as an argument class. `None` = a shape
+/// C2 doesn't marshal (raw pointers, unknown structs, unions, arrays…).
+fn classify_arg(tok: &str) -> Option<ObjcArg> {
+    let first = *tok.as_bytes().first()?;
+    if let Some((signed, bits)) = int_width(first) {
+        return Some(ObjcArg::Int { signed, bits });
+    }
+    match first {
+        b'@' | b'#' => Some(ObjcArg::Id),
+        b'B' => Some(ObjcArg::Bool),
+        b'd' => Some(ObjcArg::F64),
+        b'f' => Some(ObjcArg::F32),
+        b':' => Some(ObjcArg::Sel),
+        b'{' => match struct_name(tok)? {
+            "CGPoint" | "NSPoint" | "CGSize" | "NSSize" => Some(ObjcArg::Point),
+            "CGRect" | "NSRect" => Some(ObjcArg::Rect),
+            "_NSRange" | "NSRange" => Some(ObjcArg::Range),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn classify_ret(tok: &str) -> Option<ObjcRet> {
+    let first = *tok.as_bytes().first()?;
+    if let Some((signed, bits)) = int_width(first) {
+        return Some(ObjcRet::Int { signed, bits });
+    }
+    match first {
+        b'@' | b'#' => Some(ObjcRet::Id),
+        b'B' => Some(ObjcRet::Bool),
+        b'd' => Some(ObjcRet::F64),
+        b'f' => Some(ObjcRet::F32),
+        b'v' => Some(ObjcRet::Void),
+        b'*' => Some(ObjcRet::CharStar),
+        b'{' => match struct_name(tok)? {
+            "CGPoint" | "NSPoint" | "CGSize" | "NSSize" => Some(ObjcRet::Point),
+            "CGRect" | "NSRect" => Some(ObjcRet::Rect),
+            "_NSRange" | "NSRange" => Some(ObjcRet::Range),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// `{CGRect={CGPoint=dd}{CGSize=dd}}` → `CGRect`.
+fn struct_name(tok: &str) -> Option<&str> {
+    let inner = tok.strip_prefix('{')?;
+    let end = inner.find(['=', '}'])?;
+    Some(&inner[..end])
+}
+
+/// Parse a full method `@encode` string (`ret self _cmd args…`, each type
+/// followed by ignorable stack-offset digits) into a [`Shape`]. `None` for
+/// anything C2 can't marshal — the caller fails cleanly.
+pub fn parse_type_encoding(enc: &str) -> Option<Shape> {
+    fn strip_digits(s: &str) -> &str {
+        s.trim_start_matches(|c: char| c.is_ascii_digit())
+    }
+    let (ret_tok, rest) = split_type(enc)?;
+    let ret = classify_ret(ret_tok)?;
+    // self (`@`) and _cmd (`:`), mandatory in every method signature.
+    let rest = strip_digits(rest);
+    let (self_tok, rest) = split_type(rest)?;
+    if !self_tok.starts_with('@') {
+        return None;
+    }
+    let rest = strip_digits(rest);
+    let (cmd_tok, mut rest) = split_type(rest)?;
+    if !cmd_tok.starts_with(':') {
+        return None;
+    }
+    let mut args = Vec::new();
+    loop {
+        rest = strip_digits(rest);
+        if rest.is_empty() {
+            return Some(Shape { ret, args });
+        }
+        let (tok, r) = split_type(rest)?;
+        args.push(classify_arg(tok)?);
+        rest = r;
+    }
+}
+
+/// The process-wide shape cache + the design's visible hit-rate counters.
+/// Keyed by (Class pointer, selector). ObjC classes are never unloaded on
+/// macOS, so a Class pointer is a stable key for the process's lifetime.
+/// A cached `None` ("no such method") is sticky by design — categories
+/// loaded AFTER first resolution won't be seen for that exact class×
+/// selector until restart, an accepted C2 simplification.
+type ShapeCache = std::sync::RwLock<HashMap<(u64, String), Option<Shape>>>;
+static SHAPES: OnceLock<ShapeCache> = OnceLock::new();
+static SHAPE_HITS: AtomicU64 = AtomicU64::new(0);
+static SHAPE_MISSES: AtomicU64 = AtomicU64::new(0);
+
+pub fn shape_stats() -> (u64, u64) {
+    (
+        SHAPE_HITS.load(Ordering::Relaxed),
+        SHAPE_MISSES.load(Ordering::Relaxed),
+    )
+}
+
+/// Resolve `selector`'s ABI shape on `target`'s class, from the cache or
+/// the live runtime. `None`: no such method, or a shape C2 can't marshal.
+/// Bridge-produced pointers only (see `wrap`'s note).
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub fn resolve_shape(target: *mut c_void, selector: &str) -> Option<Shape> {
+    let s = syms()?;
+    let cls = unsafe { (s.object_get_class)(target) };
+    if cls.is_null() {
+        return None;
+    }
+    let key = (cls as u64, selector.to_string());
+    let cache = SHAPES.get_or_init(|| std::sync::RwLock::new(HashMap::new()));
+    if let Some(hit) = cache.read().ok()?.get(&key) {
+        SHAPE_HITS.fetch_add(1, Ordering::Relaxed);
+        return hit.clone();
+    }
+    SHAPE_MISSES.fetch_add(1, Ordering::Relaxed);
+    let csel = CString::new(selector).ok()?;
+    let sel = unsafe { (s.sel_register_name)(csel.as_ptr()) };
+    let m = unsafe { (s.class_get_instance_method)(cls, sel) };
+    if m.is_null() {
+        // The class doesn't implement it TODAY — deliberately NOT cached:
+        // a framework/category loaded later (S20's dlopen) can add methods
+        // to existing classes, and a sticky negative entry would keep the
+        // selector dead forever (C2 review). Missing methods are the rare
+        // path; re-probing them is cheap.
+        return None;
+    }
+    let enc = unsafe { (s.method_get_type_encoding)(m) };
+    let shape = if enc.is_null() {
+        None
+    } else {
+        let text = unsafe { std::ffi::CStr::from_ptr(enc) }
+            .to_string_lossy()
+            .into_owned();
+        // An unparseable encoding IS cached (as None): it's a stable
+        // property of an existing method, not a loadable gap.
+        parse_type_encoding(&text)
+    };
+    cache.write().ok()?.insert(key, shape.clone());
+    shape
+}
+
+/// Selectors the bridge refuses to send RAW: manual reference-counting and
+/// deallocation belong to the bridge's own ownership machinery (`wrap`/
+/// `release`/the pool), never to guest code — `dealloc` through DNU is a
+/// use-after-free, a raw `retain`/`autorelease` unbalances counts the
+/// counters can't see (C2 review). Exact matches only: `retainCount` is
+/// blocked too (meaningless under ARC-era runtimes and an attractive
+/// nuisance); family selectors like `retainedValue` are NOT blocked.
+pub fn is_manual_memory_selector(selector: &str) -> bool {
+    matches!(
+        selector,
+        "retain" | "release" | "autorelease" | "dealloc" | "retainCount"
+    )
+}
+
 // ── sends ───────────────────────────────────────────────────────────────────
+
+/// Copy a runtime-owned C string to owned bytes (a `*` return — valid
+/// under the bottom pool; copy before anything can drain it).
+/// Bridge-produced pointers only (see `wrap`'s note).
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub fn cstr_bytes(p: *const c_char) -> Option<Vec<u8>> {
+    if p.is_null() {
+        return None;
+    }
+    Some(unsafe { std::ffi::CStr::from_ptr(p) }.to_bytes().to_vec())
+}
+
+/// Intern an Objective-C selector by name (for `:`-class arguments).
+pub fn register_selector(name: &str) -> Option<*mut c_void> {
+    let s = syms()?;
+    let c = CString::new(name).ok()?;
+    Some(unsafe { (s.sel_register_name)(c.as_ptr()) })
+}
 
 /// Look up an Objective-C class by name. NULL if unknown.
 pub fn class_named(name: &str) -> Option<*mut c_void> {
@@ -544,5 +876,108 @@ mod tests {
         // `copy` — and an ordinary selector is Plus0.
         assert_eq!(selector_family("length"), Family::Plus0);
         assert_eq!(selector_family("description"), Family::Plus0);
+    }
+
+    /// The `@encode` parser, pinned against real signatures the macOS
+    /// runtime hands back (offsets vary by arch/method — the parser must
+    /// skip any digit run).
+    #[test]
+    fn type_encoding_parser_handles_real_signatures() {
+        // -[NSString length]: NSUInteger, no args.
+        let s = parse_type_encoding("Q16@0:8").unwrap();
+        assert_eq!(
+            s.ret,
+            ObjcRet::Int {
+                signed: false,
+                bits: 64
+            }
+        );
+        assert!(s.args.is_empty());
+        // -[NSMutableString appendString:]: void, one id.
+        let s = parse_type_encoding("v24@0:8@16").unwrap();
+        assert_eq!(s.ret, ObjcRet::Void);
+        assert_eq!(s.args, vec![ObjcArg::Id]);
+        // -[NSString rangeOfString:]: NSRange return.
+        let s = parse_type_encoding("{_NSRange=QQ}32@0:8@16").unwrap();
+        assert_eq!(s.ret, ObjcRet::Range);
+        assert_eq!(s.args, vec![ObjcArg::Id]);
+        // +[NSValue valueWithRect:]: id ret, one CGRect (nested struct).
+        let s = parse_type_encoding("@48@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16").unwrap();
+        assert_eq!(s.ret, ObjcRet::Id);
+        assert_eq!(s.args, vec![ObjcArg::Rect]);
+        // -[NSValue pointValue]: CGPoint return.
+        let s = parse_type_encoding("{CGPoint=dd}16@0:8").unwrap();
+        assert_eq!(s.ret, ObjcRet::Point);
+        // -[NSNumber intValue]: int (32-bit signed), BOOL, char, long, float.
+        assert_eq!(
+            parse_type_encoding("i16@0:8").unwrap().ret,
+            ObjcRet::Int {
+                signed: true,
+                bits: 32
+            }
+        );
+        assert_eq!(parse_type_encoding("B16@0:8").unwrap().ret, ObjcRet::Bool);
+        // `c` is a GENUINE signed char on arm64 (BOOL is `B`) — a char
+        // return answers a SmallInteger, never a Boolean (C2 review:
+        // charValue 65 must be 65, not true).
+        assert_eq!(
+            parse_type_encoding("c16@0:8").unwrap().ret,
+            ObjcRet::Int {
+                signed: true,
+                bits: 8
+            }
+        );
+        // `l` is 32-bit BY DEFINITION in @encode, even on LP64.
+        assert_eq!(
+            parse_type_encoding("l16@0:8").unwrap().ret,
+            ObjcRet::Int {
+                signed: true,
+                bits: 32
+            }
+        );
+        assert_eq!(parse_type_encoding("f16@0:8").unwrap().ret, ObjcRet::F32);
+        // -[NSString compare:options:]: NSInteger ret, id + NSUInteger.
+        let s = parse_type_encoding("q32@0:8@16Q24").unwrap();
+        assert_eq!(
+            s.ret,
+            ObjcRet::Int {
+                signed: true,
+                bits: 64
+            }
+        );
+        assert_eq!(
+            s.args,
+            vec![
+                ObjcArg::Id,
+                ObjcArg::Int {
+                    signed: false,
+                    bits: 64
+                }
+            ]
+        );
+        // Const-qualified char* return (-[NSString UTF8String]: r*).
+        let s = parse_type_encoding("r*16@0:8").unwrap();
+        assert_eq!(s.ret, ObjcRet::CharStar);
+        // SEL argument (-[NSObject respondsToSelector:]: B ret, : arg).
+        let s = parse_type_encoding("B24@0:8:16").unwrap();
+        assert_eq!(s.ret, ObjcRet::Bool);
+        assert_eq!(s.args, vec![ObjcArg::Sel]);
+        // Unmarshalable shapes answer None, never panic: a raw pointer
+        // arg, an unknown struct, a union, a variadic-ish garbage tail.
+        assert!(parse_type_encoding("v24@0:8^v16").is_none());
+        assert!(parse_type_encoding("{NSDecimal=...}16@0:8").is_none());
+        assert!(parse_type_encoding("(aUnion=id)16@0:8").is_none());
+        assert!(parse_type_encoding("").is_none());
+        assert!(parse_type_encoding("{unbalanced").is_none());
+        // Double arg coercion class + f32 arg class parse correctly
+        // (+[NSNumber numberWithDouble:] / numberWithFloat:).
+        assert_eq!(
+            parse_type_encoding("@24@0:8d16").unwrap().args,
+            vec![ObjcArg::F64]
+        );
+        assert_eq!(
+            parse_type_encoding("@24@0:8f16").unwrap().args,
+            vec![ObjcArg::F32]
+        );
     }
 }

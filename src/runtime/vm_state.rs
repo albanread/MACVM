@@ -454,6 +454,13 @@ pub fn format_vm_stats(vm: &VmState) -> String {
         format!("[stats] contexts_allocated={}", g.context_allocs),
         format!("[stats] code_bytes_alive={code_alive}"),
         format!("[stats] code_bytes_zombie={code_zombie}"),
+        {
+            // C2 (docs/cocoa_bridge_design.md §8): the DNU shape-cache
+            // hit rate. Process-wide (the cache is shared by every VM in
+            // the process), reported here so `__vmStats` shows it.
+            let (hits, misses) = crate::runtime::objc_bridge::shape_stats();
+            format!("[stats] cocoa_shape_hits={hits} cocoa_shape_misses={misses}")
+        },
     ]
     .join("\n")
 }

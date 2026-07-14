@@ -43,6 +43,7 @@ enum {
     MACVM_RET_HFA4 = 3,    // CGRect / NSRect                  -> out_fpr[0..4]
     MACVM_RET_INTPAIR = 4, // NSRange (16-byte integer struct) -> out_gpr[0..2]
     MACVM_RET_VOID = 5,    // void — nothing read after the call
+    MACVM_RET_F32 = 6,     // float — s0, widened to double    -> out_fpr[0]
 };
 
 typedef struct { double a, b; } macvm_hfa2;
@@ -97,6 +98,12 @@ long macvm_try_msgsend(void *target, void *sel, const unsigned long *gpr,
         }
         case MACVM_RET_VOID:
             ((void (*)(MACVM_ARG_TYPES))objc_msgSend)(MACVM_ARG_VALUES);
+            break;
+        case MACVM_RET_F32:
+            // A float return lives in s0 — the float-returning cast makes
+            // the compiler read exactly that; widening to double is exact.
+            out_fpr[0] = (double)((float (*)(MACVM_ARG_TYPES))objc_msgSend)(
+                MACVM_ARG_VALUES);
             break;
         case MACVM_RET_GPR:
         default:
