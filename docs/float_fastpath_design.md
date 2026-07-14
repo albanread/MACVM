@@ -1,9 +1,21 @@
 # Unboxed method-local float math — IR review + reducer design
 
-**Status:** designed, not built. Same posture as `docs/CANVAS.md`/`docs/ASM.md`
-— the shape is pinned in full here; no code has landed. This is tier-1
-compiler work only (`src/compiler/`); the interpreter and the runtime
-primitive table are unchanged.
+**Status:** SHIPPED — this design is fully built in the tier-1 JIT
+(`src/compiler/`). The mono-`Double` fuse, the box/unbox reducer
+(`FUnbox(FBox x)→x` cancellation, dead-box elimination, deopt-sunk boxing,
+literal folding, and float-temp promotion), the second register file (`d0`–`d7`
+scratch plus a `d8`–`d15` write-through residency tier), and the `DoubleSlot`
+deopt-map kind all landed, with libm `sin/cos/tan/exp/ln/atan/sqrt` shipped as
+companion primitives. The motivating Mandelbrot inner loop is now
+**allocation-free** and several times faster, verified byte-identical across
+`MACVM_JIT` off/threshold and `MACVM_GC_STRESS` (see the README's *Fast floating
+point* section and `docs/PERF.md`); SIMD vectors (`Float64x2`/`Float32x4`/
+`Int32x4` + `FloatArray` NEON kernels) shipped on top of it (`docs/SIMD.md`).
+Remaining follow-ons only: loop-invariant hoisting of the unbox guard, deeper
+fp-register residency, and int↔float conversion. (It began life as a design doc
+in the same posture as `docs/CANVAS.md`/`docs/ASM.md` — the shape pinned before
+any code landed — but unlike those, it has since shipped.) The interpreter's
+dispatch loop is unchanged throughout.
 
 **Motivation (measured).** The Canvas Mandelbrot (`world/35_mandelbrot.mst`)
 spends ~460 ms and allocates ~595 MB per 420×220 render. A disassembly of the
