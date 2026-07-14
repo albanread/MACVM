@@ -43,13 +43,17 @@ part that works.</p>
 	beside their Rust counterparts, and <code>smappl</code> widgets now render
 	live rather than as placeholders.)</p></li>
 
-	<li><p align="left"><strong>Green threads with async C
-	callouts</strong> &mdash; concurrency the FFI does not yet
-	offer.</p></li>
-
 	<li><p align="left"><strong>An optional static type system</strong>
 	&mdash; Strongtalk's, if it is ever built here.</p></li>
 </ul>
+
+<p align="left"><em>Not</em> on that list, by choice: green threads. MACVM's
+concurrency model is multiple <em>real</em> VMs, each on its own OS thread
+&mdash; a fresh VM thread starts in well under 25&nbsp;ms on modern hardware, so
+a second (or tenth) VM is cheap. Cooperative threads inside a single VM would
+mean a scheduler, hand-rolled stacks, and a whole second story about async C
+callouts, all to approximate what real OS threads already give us. So it is a
+non-goal, not a to-do.</p>
 
 <p align="left">Strongtalk showed how much was possible at once: a Smalltalk
 that ran at serious speed, with an adaptive optimizer, an optional type
