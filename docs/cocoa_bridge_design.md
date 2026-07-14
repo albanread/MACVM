@@ -131,7 +131,11 @@ mechanical — it's exactly the analysis ARC's compiler performs:
   would both over-retain the result and leave a dangling receiver wrapper.)
 - **Family membership is ARC's exact rule, not a bare prefix test**: the
   prefix must be followed by a non-lowercase character — `copyright` and
-  `newButtonTitle` are NOT in the `copy`/`new` families and return +0.
+  `initialize` are NOT in the `copy`/`init` families and return +0. (Note
+  the rule's famous sharp edge, faithfully reproduced: `newButtonTitle`
+  IS in the `new` family — "new" + uppercase 'B' — exactly as clang
+  classifies it; that's why `objc_method_family(none)` exists, and why
+  the escape hatch below covers convention-violating corners.)
 - Everything else returns +0 (borrowed / autoreleased) — bridge retains.
 
 The classifier is a prefix test at resolution time, cached in the same PIC
@@ -139,6 +143,13 @@ entry as the ABI shape (`FFI.md` §3), so it costs nothing per call. It can
 be wrong only where Cocoa itself violates its convention — rare, documented
 cases; the escape hatch is an explicit `asRetained` / `asBorrowed` override
 on the wrapper for the odd corner, never a global heuristic change.
+(Honest residual, from the C1 adversarial review: clang's real analysis is
+name + return-type + annotations — a family-NAMED method marked
+`NS_RETURNS_NOT_RETAINED` / `objc_method_family(none)` returns +0, and a
+name-only classifier will skip a retain it needed, erring toward
+over-release for exactly those annotated corners. The bridge can't see
+annotations at runtime; the mitigation is the explicit override above, and
+C2's `cocoa_data`-driven resolution can carry a curated exception list.)
 
 ### 3.3 Release: explicit and poisoning (v1), finalization later (v2)
 

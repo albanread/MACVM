@@ -49,17 +49,59 @@ use std::sync::OnceLock;
 
 // The shim (objc_shim.m): CALLS the send inside @try; a caught NSException
 // comes back as status 1 + description bytes. Never unwinds into Rust.
+// One general entry (C1): the full AAPCS64 outgoing model — 6 GPR words
+// (x2..x7), 8 FPR doubles (d0..d7), 4 spilled stack words — plus a
+// return-kind token selecting which result registers the shim reads.
 extern "C" {
-    fn macvm_try_msgsend2(
+    #[allow(clippy::too_many_arguments)]
+    fn macvm_try_msgsend(
         target: *mut c_void,
         sel: *mut c_void,
-        a: *mut c_void,
-        b: *mut c_void,
-        out: *mut *mut c_void,
+        gpr: *const u64,
+        fpr: *const f64,
+        stack: *const u64,
+        ret_kind: i64,
+        out_gpr: *mut u64,
+        out_fpr: *mut f64,
         excbuf: *mut c_char,
         cap: u64,
     ) -> i64;
 }
+
+/// Which result registers a send reads back — mirrors `objc_shim.m`'s
+/// `MACVM_RET_*` tokens (keep in sync). The C1 vocabulary is exactly the
+/// register-classifiable subset of `cocoa_data`'s ABI tokens: `g`, `f`,
+/// `h2`, `h4`, `i2`, `v` (docs/FFI.md §1); larger/sret shapes are deferred.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RetKind {
+    /// id / NSInteger / BOOL / pointer — `x0`.
+    Gpr = 0,
+    /// double / CGFloat — `d0`.
+    Fpr = 1,
+    /// CGPoint / CGSize (2-double HFA) — `d0..d1`.
+    Hfa2 = 2,
+    /// CGRect (4-double HFA) — `d0..d3`.
+    Hfa4 = 3,
+    /// NSRange (16-byte integer composite) — `x0..x1`.
+    IntPair = 4,
+    /// void — nothing read.
+    Void = 5,
+}
+
+/// A general send's raw result registers: `gpr` holds `x0`/`x1`, `fpr`
+/// holds `d0..d3`. Which of them mean anything is the caller's `RetKind`.
+#[derive(Clone, Copy, Default)]
+pub struct SendOut {
+    pub gpr: [u64; 2],
+    pub fpr: [f64; 4],
+}
+
+/// The AAPCS64 argument-slot capacities the general send offers (mirroring
+/// the shim's fixed shape): 6 GPR words (x2..x7 — x0/x1 are self/_cmd),
+/// 8 FPR doubles, 4 shared spill/stack words.
+pub const SEND_GPR_SLOTS: usize = 6;
+pub const SEND_FPR_SLOTS: usize = 8;
+pub const SEND_STACK_SLOTS: usize = 4;
 
 /// The libobjc entry points the bridge needs, resolved once. Foundation is
 /// dlopen'd alongside so `objc_getClass("NSProcessInfo")` etc. resolve.
@@ -75,14 +117,19 @@ struct Syms {
 static SYMS: OnceLock<Option<Syms>> = OnceLock::new();
 
 /// Lifetime wrap/release balance — the design's permanent leak tripwire.
-/// Process-wide (all VMs), monotonic; tests assert deltas.
+/// Process-wide (all VMs), monotonic; tests assert deltas. `CONSUMED`
+/// counts init-family ownership transfers (design §3.2): the receiver
+/// wrapper gave up its +1 TO the init call rather than to `objc_release`,
+/// so quiescent balance is `WRAPS == RELEASES + CONSUMED`.
 static WRAPS: AtomicU64 = AtomicU64::new(0);
 static RELEASES: AtomicU64 = AtomicU64::new(0);
+static CONSUMED: AtomicU64 = AtomicU64::new(0);
 
-pub fn counters() -> (u64, u64) {
+pub fn counters() -> (u64, u64, u64) {
     (
         WRAPS.load(Ordering::Relaxed),
         RELEASES.load(Ordering::Relaxed),
+        CONSUMED.load(Ordering::Relaxed),
     )
 }
 
@@ -223,6 +270,97 @@ pub fn wrap(vm: &mut VmState, id: *mut c_void) -> Oop {
 }
 use std::io::Write;
 
+// ── the +1-family classifier (design §3.2, C1) ─────────────────────────────
+
+/// What a selector's name promises about its result's ownership — ARC's
+/// exact method-family analysis, mechanized.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Family {
+    /// Ordinary selector: the result is +0 (borrowed/autoreleased) — the
+    /// bridge retains on wrap.
+    Plus0,
+    /// `alloc` / `new` / `copy` / `mutableCopy` family: the result is
+    /// already +1 (caller-owned) — wrapping must NOT retain again.
+    Plus1,
+    /// `init` family: +1 result AND the receiver's own +1 was consumed by
+    /// the call (class clusters may return a different object) — the
+    /// receiver's wrapper must be poisoned-without-release.
+    Init,
+}
+
+/// ARC's family rule, verbatim (clang's `objc-arc` docs): ignoring leading
+/// underscores, the selector's first component begins with the family name
+/// followed by a character that is NOT a lowercase letter. So `copy`,
+/// `copyWithZone:`, `_copyDeep` are in the copy family; `copyright` and
+/// `newButtonTitle` and `initialize` are NOT in any family.
+pub fn selector_family(selector: &str) -> Family {
+    let s = selector.trim_start_matches('_');
+    let in_family = |prefix: &str| -> bool {
+        s.strip_prefix(prefix)
+            .is_some_and(|rest| !rest.chars().next().is_some_and(|c| c.is_ascii_lowercase()))
+    };
+    if in_family("init") {
+        Family::Init
+    } else if in_family("alloc")
+        || in_family("new")
+        || in_family("copy")
+        || in_family("mutableCopy")
+    {
+        Family::Plus1
+    } else {
+        Family::Plus0
+    }
+}
+
+/// Wrap a send RESULT, honoring the producing selector's family: a
+/// +1-family result is already caller-owned, so the bridge retain is
+/// skipped (retaining again would leak); everything else wraps normally.
+/// The `WRAPS` counter still ticks either way — it counts "wrapper minted
+/// owning one strong reference," which is true in both cases.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub fn wrap_result(vm: &mut VmState, id: *mut c_void, selector: &str) -> Oop {
+    if id.is_null() {
+        return vm.universe.nil_obj;
+    }
+    match selector_family(selector) {
+        Family::Plus0 => wrap(vm, id),
+        Family::Plus1 | Family::Init => {
+            WRAPS.fetch_add(1, Ordering::Relaxed);
+            let k = vm.universe.objcref_klass;
+            let b = alloc::alloc_indexable_bytes(vm, k, 8);
+            for (i, byte) in (id as u64).to_le_bytes().iter().enumerate() {
+                b.byte_at_put(i, *byte);
+            }
+            if vm.options.trace.is_enabled("cocoa") {
+                let _ = writeln!(vm.out, "[cocoa] wrap {:p} (+1 family, no retain)", id);
+            }
+            b.oop()
+        }
+    }
+}
+
+/// The init-family receiver transfer (design §3.2): after a successful
+/// init-family send the receiver's +1 belongs to the callee — poison the
+/// wrapper WITHOUT `objc_release` (its reference was consumed, not
+/// dropped), mechanizing "always use the init result, never the alloc
+/// result." Balance accounting goes to `CONSUMED`. No-op (false) if the
+/// oop isn't a live ObjcRef. Never allocates — safe to call while other
+/// raw ids are in hand.
+pub fn consume_receiver(vm: &mut VmState, o: Oop) -> bool {
+    let Some(id) = read_id(vm, o) else {
+        return false;
+    };
+    let b = ByteArrayOop::try_from(o).expect("read_id proved bytes-ness");
+    for i in 0..8 {
+        b.byte_at_put(i, 0);
+    }
+    CONSUMED.fetch_add(1, Ordering::Relaxed);
+    if vm.options.trace.is_enabled("cocoa") {
+        let _ = writeln!(vm.out, "[cocoa] consume {:p} (init family transfer)", id);
+    }
+    true
+}
+
 /// Release-with-poison (design §3.3): `objc_release` the target, then zero
 /// the tail so every later send through this wrapper fails cleanly. False
 /// if the wrapper was already poisoned (double release refused — the bias
@@ -260,29 +398,35 @@ pub fn class_named(name: &str) -> Option<*mut c_void> {
     }
 }
 
-/// One bridged send: up to two GPR arguments, GPR result, exception-caught.
-/// `Err` carries the caught NSException's description.
-/// Bridge-produced pointers only (see `wrap`'s note).
+/// The general bridged send (C1): the full marshaled register model in,
+/// the raw result registers out, exception-caught. `Err` carries the
+/// caught NSException's description. Bridge-produced pointers only (see
+/// `wrap`'s note).
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
-pub fn try_send(
+pub fn try_send_full(
     target: *mut c_void,
     selector: &str,
-    a: *mut c_void,
-    b: *mut c_void,
-) -> Result<*mut c_void, String> {
+    gpr: &[u64; SEND_GPR_SLOTS],
+    fpr: &[f64; SEND_FPR_SLOTS],
+    stack: &[u64; SEND_STACK_SLOTS],
+    ret: RetKind,
+) -> Result<SendOut, String> {
     let s = syms().ok_or_else(|| "Objective-C runtime unavailable".to_string())?;
     ensure_pool(s);
     let csel = CString::new(selector).map_err(|_| "selector contains NUL".to_string())?;
     let sel = unsafe { (s.sel_register_name)(csel.as_ptr()) };
-    let mut out: *mut c_void = std::ptr::null_mut();
+    let mut out = SendOut::default();
     let mut excbuf = [0u8; 512];
     let rc = unsafe {
-        macvm_try_msgsend2(
+        macvm_try_msgsend(
             target,
             sel,
-            a,
-            b,
-            &mut out,
+            gpr.as_ptr(),
+            fpr.as_ptr(),
+            stack.as_ptr(),
+            ret as i64,
+            out.gpr.as_mut_ptr(),
+            out.fpr.as_mut_ptr(),
             excbuf.as_mut_ptr() as *mut c_char,
             excbuf.len() as u64,
         )
@@ -295,6 +439,43 @@ pub fn try_send(
     }
 }
 
+/// One bridged send: up to two GPR arguments, GPR result, exception-caught
+/// — the C0 shape, now a thin view over [`try_send_full`].
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub fn try_send(
+    target: *mut c_void,
+    selector: &str,
+    a: *mut c_void,
+    b: *mut c_void,
+) -> Result<*mut c_void, String> {
+    let mut gpr = [0u64; SEND_GPR_SLOTS];
+    gpr[0] = a as u64;
+    gpr[1] = b as u64;
+    let out = try_send_full(
+        target,
+        selector,
+        &gpr,
+        &[0.0; SEND_FPR_SLOTS],
+        &[0u64; SEND_STACK_SLOTS],
+        RetKind::Gpr,
+    )?;
+    Ok(out.gpr[0] as *mut c_void)
+}
+
+/// Copy an `NSString` id's UTF-8 bytes out into owned Rust memory (the
+/// `UTF8String` buffer is autoreleased/interior — the copy must happen
+/// before the pool drains or the string dies).
+/// Bridge-produced pointers only (see `wrap`'s note).
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub fn nsstring_utf8_bytes(ns: *mut c_void) -> Result<Vec<u8>, String> {
+    let utf8 = try_send(ns, "UTF8String", std::ptr::null_mut(), std::ptr::null_mut())?;
+    if utf8.is_null() {
+        return Err("UTF8String answered NULL".to_string());
+    }
+    let cstr = unsafe { std::ffi::CStr::from_ptr(utf8 as *const c_char) };
+    Ok(cstr.to_bytes().to_vec())
+}
+
 /// A send whose result is an `NSString`: copies its UTF-8 bytes out
 /// immediately (the intermediate NSString stays +0 under the bottom pool —
 /// never wrapped, never retained; the bytes are owned Rust before any
@@ -304,12 +485,7 @@ pub fn try_send_string(target: *mut c_void, selector: &str) -> Result<Vec<u8>, S
     if ns.is_null() {
         return Err(format!("{selector} answered nil, not a string"));
     }
-    let utf8 = try_send(ns, "UTF8String", std::ptr::null_mut(), std::ptr::null_mut())?;
-    if utf8.is_null() {
-        return Err("UTF8String answered NULL".to_string());
-    }
-    let cstr = unsafe { std::ffi::CStr::from_ptr(utf8 as *const c_char) };
-    Ok(cstr.to_bytes().to_vec())
+    nsstring_utf8_bytes(ns)
 }
 
 /// Build an `NSString` from Rust bytes (`stringWithUTF8String:` — a +0
@@ -327,5 +503,46 @@ pub fn nsstring_from(bytes: &[u8]) -> Result<*mut c_void, String> {
         Err("stringWithUTF8String: answered nil".to_string())
     } else {
         Ok(ns)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// ARC's method-family rule, pinned against its own documented edge
+    /// cases — the difference between a prefix TEST and a prefix RULE is
+    /// exactly `copyright` vs `copy`.
+    #[test]
+    fn selector_family_matches_arcs_exact_rule() {
+        // In-family: the prefix followed by a non-lowercase character.
+        assert_eq!(selector_family("alloc"), Family::Plus1);
+        assert_eq!(selector_family("new"), Family::Plus1);
+        assert_eq!(selector_family("copy"), Family::Plus1);
+        assert_eq!(selector_family("copyWithZone:"), Family::Plus1);
+        assert_eq!(selector_family("mutableCopy"), Family::Plus1);
+        assert_eq!(selector_family("mutableCopyWithZone:"), Family::Plus1);
+        assert_eq!(selector_family("newTaskWithURL:"), Family::Plus1);
+        assert_eq!(selector_family("init"), Family::Init);
+        assert_eq!(selector_family("initWithString:"), Family::Init);
+        // Leading underscores are ignored, per the rule.
+        assert_eq!(selector_family("_init"), Family::Init);
+        assert_eq!(selector_family("__copy"), Family::Plus1);
+        // NOT in a family: the prefix runs into a lowercase letter.
+        assert_eq!(selector_family("copyright"), Family::Plus0);
+        assert_eq!(selector_family("initialize"), Family::Plus0);
+        // `newButtonTitle` IS in the new family — "new" followed by a
+        // non-lowercase 'B'. That's ARC's real (and famously surprising)
+        // behavior, the reason `objc_method_family(none)` exists; matching
+        // clang exactly is the point, and the odd corner's escape hatch is
+        // an explicit override on the wrapper (design §3.2), not a
+        // different rule.
+        assert_eq!(selector_family("newButtonTitle"), Family::Plus1);
+        assert_eq!(selector_family("allocate"), Family::Plus0);
+        assert_eq!(selector_family("newton"), Family::Plus0);
+        // `mutableCopy` is its own family, not a lowercase-collision of
+        // `copy` — and an ordinary selector is Plus0.
+        assert_eq!(selector_family("length"), Family::Plus0);
+        assert_eq!(selector_family("description"), Family::Plus0);
     }
 }

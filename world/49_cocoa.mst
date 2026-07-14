@@ -36,7 +36,9 @@ Object subclass: ObjcRef [
         ^self error: 'Cocoa send failed: ', selName printString
     ]
     sendI64: selName [
-        "A send answering an integer (NSInteger/BOOL), as a SmallInteger."
+        "A send answering an NSInteger/NSUInteger (a full 64-bit register),
+         as a SmallInteger. For a C `int` return use `send:args:ret:` with
+         #i32 (sign-extends from 32 bits); for BOOL use sendBool:."
         <primitive: 234>
         ^self error: 'Cocoa integer send failed: ', selName printString
     ]
@@ -53,6 +55,57 @@ Object subclass: ObjcRef [
     isValid [
         <primitive: 239>
         ^false
+    ]
+
+    "── the C1 general send ──────────────────────────────────────────────
+     Any mix of arguments (each is nil, true/false, a SmallInteger, a
+     Double, a String — bridged to a temp NSString — or an ObjcRef), the
+     result read back per retToken: #id #i64 #i32 #f64 #bool #str #void
+     #range #point #size #rect (use #i32 for a C `int` return — #i64 on a
+     32-bit return misreads negatives). A struct-by-value argument is its
+     fields in order: an NSRange is two SmallIntegers, a CGPoint two
+     Doubles, a CGRect four Doubles — but the struct must fit ENTIRELY in
+     its register class's remaining slots (a composite straddling into the
+     spill area lands wrong; C2's shape tables will guard this). Up to 6
+     integer-class + 8 double-class register arguments, then 4 spill slots
+     for 8-byte scalars only — beyond that the send fails cleanly.
+     Selector families are honored (docs/cocoa_bridge_design.md §3.2):
+     alloc/new/copy/mutableCopy/init results arrive already-owned (no
+     double retain), and an init-family send invalidates the receiver
+     (class clusters may swap the object — always use init's result)."
+    send: selName args: argArray ret: retToken [
+        <primitive: 240>
+        ^self error: 'Cocoa send failed: ', selName printString
+    ]
+    send: selName args: argArray [
+        "General send answering an ObjcRef (or nil)."
+        ^self send: selName args: argArray ret: #id
+    ]
+    sendBool: selName [
+        "A send answering an Objective-C BOOL, as true/false."
+        ^self send: selName args: #() ret: #bool
+    ]
+    sendBool: selName args: argArray [
+        ^self send: selName args: argArray ret: #bool
+    ]
+    sendF64: selName [
+        "A send answering a double/CGFloat, as a Double."
+        ^self send: selName args: #() ret: #f64
+    ]
+    sendF64: selName args: argArray [
+        ^self send: selName args: argArray ret: #f64
+    ]
+    sendRange: selName args: argArray [
+        "A send answering an NSRange: an Array {location. length}."
+        ^self send: selName args: argArray ret: #range
+    ]
+    sendPoint: selName [
+        "A send answering a CGPoint/NSSize: an Array of 2 Doubles."
+        ^self send: selName args: #() ret: #point
+    ]
+    sendRect: selName [
+        "A send answering a CGRect: an Array {x. y. w. h} of Doubles."
+        ^self send: selName args: #() ret: #rect
     ]
 ]
 

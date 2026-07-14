@@ -2318,11 +2318,11 @@ mod tests {
     fn cocoa_c0_wrap_release_counters_balance() {
         let _serial = cocoa_serial();
         let mut vm = boot_test_vm(JitMode::Off);
-        let (w0, r0) = crate::runtime::objc_bridge::counters();
+        let (w0, r0, _) = crate::runtime::objc_bridge::counters();
         vm.exec("(Cocoa nsString: 'one') release.").expect("1");
         vm.exec("(Cocoa nsString: 'two') release.").expect("2");
         vm.exec("(Cocoa nsString: 'three') release.").expect("3");
-        let (w1, r1) = crate::runtime::objc_bridge::counters();
+        let (w1, r1, _) = crate::runtime::objc_bridge::counters();
         assert_eq!(w1 - w0, 3, "three wraps");
         assert_eq!(r1 - r0, 3, "three releases — balanced");
     }
@@ -2358,6 +2358,241 @@ mod tests {
             .expect("the survivor must still answer after heavy GC");
         assert!(s.contains("SURVIVOR"), "got {s}");
         vm.exec("CocoaG k release.").expect("tidy");
+    }
+
+    // ── Cocoa bridge C1 gates (marshalling breadth + ownership families) ─
+    //
+    // Every ABI shape asserted here was cross-checked against cocoa_data's
+    // register classification (docs/FFI.md §1 tokens) before being pinned:
+    // numberWithDouble: takes `f`; rangeOfString: returns `i2` (x0/x1);
+    // valueWithPoint:/pointValue are `h2` (d0/d1); valueWithRect:/rectValue
+    // are `h4` (d0..d3); dateWithEra:…nanosecond: is 8 `g` args — six ride
+    // x2..x7, the last two cross on the STACK.
+
+    #[test]
+    fn cocoa_c1_double_and_bool_marshal_both_directions() {
+        let _serial = cocoa_serial();
+        let mut vm = boot_test_vm(JitMode::Off);
+        // A Double ARGUMENT (FPR class) and a double RESULT (d0) in one
+        // round trip through NSNumber.
+        let d = vm
+            .eval(
+                "((Cocoa classNamed: 'NSNumber') send: 'numberWithDouble:' args: #(2.75) ret: #id) \
+                 sendF64: 'doubleValue'",
+            )
+            .expect("double round-trip");
+        assert_eq!(d.trim(), "2.75");
+        // A BOOL result (w0's low byte, masked) — both polarities, with a
+        // String argument auto-bridged to a temp NSString each time.
+        let t = vm
+            .eval("(Cocoa nsString: 'abc') sendBool: 'isEqualToString:' args: #('abc')")
+            .expect("bool true");
+        assert_eq!(t.trim(), "true");
+        let f = vm
+            .eval("(Cocoa nsString: 'abc') sendBool: 'isEqualToString:' args: #('xyz')")
+            .expect("bool false");
+        assert_eq!(f.trim(), "false");
+        // The adversarial-review regression (#i32): a C `int` return is
+        // w0-only — read as #i64, intValue's -5 would arrive as 2^32-5, a
+        // silently wrong (in-smi-range!) answer. #i32 sign-extends.
+        let n = vm
+            .eval(
+                "((Cocoa classNamed: 'NSNumber') send: 'numberWithInteger:' with: -5) \
+                 send: 'intValue' args: #() ret: #i32",
+            )
+            .expect("negative int return");
+        assert_eq!(n.trim(), "-5", "#i32 must sign-extend w0");
+    }
+
+    #[test]
+    fn cocoa_c1_nsrange_returns_the_x0_x1_pair() {
+        let _serial = cocoa_serial();
+        let mut vm = boot_test_vm(JitMode::Off);
+        vm.exec("Object subclass: CocoaRg [ <classVars: R> CocoaRg class >> r: x [ R := x ] CocoaRg class >> r [ ^R ] ]")
+            .expect("holder");
+        vm.exec("CocoaRg r: ((Cocoa nsString: 'hello world') sendRange: 'rangeOfString:' args: #('world')).")
+            .expect("rangeOfString:");
+        assert_eq!(vm.eval("CocoaRg r at: 1").unwrap().trim(), "6", "location");
+        assert_eq!(vm.eval("CocoaRg r at: 2").unwrap().trim(), "5", "length");
+        // An NSException thrown through the NEW general entry point is
+        // still caught — the @try boundary moved with the shim.
+        assert!(
+            vm.exec("(Cocoa nsString: 'x') send: 'noSuchSelectorZyx' args: #() ret: #range.")
+                .is_err(),
+            "the exception must surface as a Smalltalk error, not kill the VM"
+        );
+        assert_eq!(vm.eval("3 + 4").unwrap().trim(), "7");
+    }
+
+    #[test]
+    fn cocoa_c1_hfa_point_and_rect_round_trip() {
+        let _serial = cocoa_serial();
+        // The flat-register model's HFA payoff: a CGPoint argument IS two
+        // Doubles (d0/d1), a CGRect four — and the HFA RESULTS come back
+        // out of d0..d3. Headless Foundation round-trip through NSValue.
+        let mut vm = boot_test_vm(JitMode::Off);
+        vm.exec("Object subclass: CocoaHf [ <classVars: P R> CocoaHf class >> p: x [ P := x ] CocoaHf class >> p [ ^P ] CocoaHf class >> r: x [ R := x ] CocoaHf class >> r [ ^R ] ]")
+            .expect("holder");
+        vm.exec("CocoaHf p: (((Cocoa classNamed: 'NSValue') send: 'valueWithPoint:' args: #(3.5 4.5) ret: #id) sendPoint: 'pointValue').")
+            .expect("point round-trip");
+        assert_eq!(vm.eval("CocoaHf p at: 1").unwrap().trim(), "3.5");
+        assert_eq!(vm.eval("CocoaHf p at: 2").unwrap().trim(), "4.5");
+        vm.exec("CocoaHf r: (((Cocoa classNamed: 'NSValue') send: 'valueWithRect:' args: #(1.5 2.5 30.25 40.75) ret: #id) sendRect: 'rectValue').")
+            .expect("rect round-trip");
+        assert_eq!(vm.eval("CocoaHf r at: 1").unwrap().trim(), "1.5");
+        assert_eq!(vm.eval("CocoaHf r at: 2").unwrap().trim(), "2.5");
+        assert_eq!(vm.eval("CocoaHf r at: 3").unwrap().trim(), "30.25");
+        assert_eq!(vm.eval("CocoaHf r at: 4").unwrap().trim(), "40.75");
+    }
+
+    #[test]
+    fn cocoa_c1_eight_arg_send_spills_to_the_stack() {
+        let _serial = cocoa_serial();
+        // dateWithEra:year:month:day:hour:minute:second:nanosecond: is 8
+        // GPR-class arguments: era..minute ride x2..x7, SECOND and
+        // nanosecond cross on the stack words. Reading the second back
+        // (45) proves the stack path end-to-end against a real Foundation
+        // method — the FFI arc's argv-overflow bug, re-gated as a
+        // wired-through feature instead of a crash.
+        let mut vm = boot_test_vm(JitMode::Off);
+        vm.exec("Object subclass: CocoaCal [ <classVars: C D> CocoaCal class >> c: x [ C := x ] CocoaCal class >> c [ ^C ] CocoaCal class >> d: x [ D := x ] CocoaCal class >> d [ ^D ] ]")
+            .expect("holder");
+        vm.exec("CocoaCal c: ((Cocoa classNamed: 'NSCalendar') send: 'currentCalendar').")
+            .expect("calendar");
+        vm.exec("CocoaCal c send: 'setTimeZone:' args: (Array with: ((Cocoa classNamed: 'NSTimeZone') send: 'timeZoneForSecondsFromGMT:' with: 0)) ret: #void.")
+            .expect("pin UTC so the read-back is deterministic");
+        vm.exec("CocoaCal d: (CocoaCal c send: 'dateWithEra:year:month:day:hour:minute:second:nanosecond:' args: #(1 2026 7 14 12 30 45 0) ret: #id).")
+            .expect("the 8-arg send");
+        // NSCalendarUnitSecond = 128 (cocoa_data's enum table).
+        let s = vm
+            .eval("CocoaCal c send: 'component:fromDate:' args: (Array with: 128 with: CocoaCal d) ret: #i64")
+            .expect("read the second back");
+        assert_eq!(s.trim(), "45", "second=45 crossed via the stack words");
+    }
+
+    #[test]
+    fn cocoa_c1_alloc_init_transfers_ownership_and_balances() {
+        let _serial = cocoa_serial();
+        // The +1-family classifier live (design §3.2): alloc's result is
+        // already owned (no double retain), init CONSUMES the alloc
+        // receiver (its wrapper poisons — class clusters may swap the
+        // object) and answers a +1 result. The counters must balance as
+        // wraps == releases + consumed.
+        let mut vm = boot_test_vm(JitMode::Off);
+        vm.exec("Object subclass: CocoaOwn [ <classVars: K A B> CocoaOwn class >> k: x [ K := x ] CocoaOwn class >> k [ ^K ] CocoaOwn class >> a: x [ A := x ] CocoaOwn class >> a [ ^A ] CocoaOwn class >> b: x [ B := x ] CocoaOwn class >> b [ ^B ] ]")
+            .expect("holder");
+        let (w0, r0, c0) = crate::runtime::objc_bridge::counters();
+        vm.exec("CocoaOwn k: (Cocoa classNamed: 'NSMutableString').")
+            .expect("class");
+        vm.exec("CocoaOwn a: (CocoaOwn k send: 'alloc').")
+            .expect("alloc (+1 family)");
+        vm.exec("CocoaOwn b: (CocoaOwn a send: 'init').")
+            .expect("init (consumes the receiver)");
+        assert_eq!(
+            vm.eval("CocoaOwn a isValid").unwrap().trim(),
+            "false",
+            "init consumed the alloc receiver — its wrapper must be poisoned"
+        );
+        assert_eq!(vm.eval("CocoaOwn b isValid").unwrap().trim(), "true");
+        // The initialized object actually works (append via the temp-
+        // NSString bridge, then read back).
+        vm.exec("CocoaOwn b send: 'appendString:' args: #('grown') ret: #void.")
+            .expect("append");
+        let s = vm
+            .eval("CocoaOwn b sendString: 'description'")
+            .expect("read");
+        assert!(s.contains("grown"), "got {s}");
+        vm.exec("CocoaOwn b release.").expect("release the result");
+        vm.exec("CocoaOwn k release.")
+            .expect("release the class wrapper");
+        let (w1, r1, c1) = crate::runtime::objc_bridge::counters();
+        assert_eq!(w1 - w0, 3, "three wraps: class, alloc, init result");
+        assert_eq!(r1 - r0, 2, "two releases: result + class wrapper");
+        assert_eq!(c1 - c0, 1, "one init-family consume");
+        assert_eq!(
+            (w1 - w0),
+            (r1 - r0) + (c1 - c0),
+            "ownership balance: wraps == releases + consumed"
+        );
+        // A +1-family selector through a path that can't take ownership is
+        // REFUSED before sending (C1 review findings): the +1 result would
+        // leak invisibly behind an integer/string return. The receiver is
+        // pre-minted so the refused sends themselves are the only thing
+        // between the two counter snapshots.
+        vm.exec("CocoaOwn a: (Cocoa nsString: 'x').")
+            .expect("a fresh receiver for the refusal checks");
+        let (w2, r2, c2) = crate::runtime::objc_bridge::counters();
+        assert!(
+            vm.exec("CocoaOwn a sendI64: 'copy'.").is_err(),
+            "sendI64: must refuse a +1-family selector"
+        );
+        assert!(
+            vm.exec("CocoaOwn a send: 'copy' args: #() ret: #str.")
+                .is_err(),
+            "a +1-family selector with a non-#id ret token must be refused"
+        );
+        let (w3, r3, c3) = crate::runtime::objc_bridge::counters();
+        assert_eq!(
+            (w3, r3, c3),
+            (w2, r2, c2),
+            "refused sends must not move any counter"
+        );
+        vm.exec("CocoaOwn a release.").expect("tidy");
+    }
+
+    #[test]
+    fn cocoa_c1_hfa_results_survive_gc_stress() {
+        let _serial = cocoa_serial();
+        // The write-barrier regression (C1 review finding 1): the
+        // point/rect result arm allocates the array THEN each Double, so a
+        // mid-loop scavenge can promote the array — the subsequent stores
+        // must go through the barrier door or an old→new slot goes
+        // invisible and dangles. Under gc_stress every allocation
+        // collects, exercising every promote/store interleaving the
+        // adaptive tenuring policy produces.
+        let mut vm = VmHandle::boot(
+            VmOptions {
+                heap_mib: 64,
+                gc_stress: true,
+                jit: JitMode::Off,
+                ..Default::default()
+            },
+            Path::new("world"),
+        )
+        .expect("gc-stress boot");
+        vm.exec("Object subclass: CocoaHfG [ <classVars: R> CocoaHfG class >> r: x [ R := x ] CocoaHfG class >> r [ ^R ] ]")
+            .expect("holder");
+        for i in 0..25 {
+            vm.exec("CocoaHfG r: (((Cocoa classNamed: 'NSValue') send: 'valueWithRect:' args: #(1.5 2.5 30.25 40.75) ret: #id) sendRect: 'rectValue').")
+                .expect("rect round-trip under stress");
+            // Force more churn between construction and the reads.
+            vm.exec("(Cocoa nsString: 'churn') release.")
+                .expect("churn");
+            for (ix, want) in [(1, "1.5"), (2, "2.5"), (3, "30.25"), (4, "40.75")] {
+                let got = vm
+                    .eval(&format!("CocoaHfG r at: {ix}"))
+                    .expect("element read must not dangle");
+                assert_eq!(got.trim(), want, "iteration {i}, slot {ix}");
+            }
+        }
+    }
+
+    #[test]
+    fn cocoa_c1_oversized_send_fails_cleanly() {
+        let _serial = cocoa_serial();
+        // 11 GPR-class arguments = 6 registers + 4 stack words + 1 too
+        // many: the prim must FAIL (world fallback raises) rather than
+        // overflow any buffer — the FFI arc's argv-overflow lesson,
+        // re-gated at this entry point.
+        let mut vm = boot_test_vm(JitMode::Off);
+        assert!(
+            vm.exec(
+                "(Cocoa nsString: 'x') send: 'whatever:' args: #(1 2 3 4 5 6 7 8 9 10 11) ret: #id."
+            )
+            .is_err(),
+            "an oversized call shape must raise cleanly"
+        );
+        assert_eq!(vm.eval("3 + 4").unwrap().trim(), "7");
     }
 
     #[test]

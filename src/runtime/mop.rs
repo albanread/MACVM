@@ -376,6 +376,17 @@ fn pk(
     if kraw == u.alien_klass.oop().raw() {
         return Err(PickleErr::Unpicklable("Alien (raw pointer)"));
     }
+    if kraw == u.objcref_klass.oop().raw() {
+        // An ObjcRef's byte tail is a retained `id` owned by THIS wrapper
+        // on THIS thread (cocoa_bridge_design.md §3.1). Copying the bytes
+        // would clone ownership without a retain — two wrappers, one +1,
+        // a cross-VM double-release waiting to happen, invisible to the
+        // wrap/release counters. Refused, exactly like Alien (C1
+        // adversarial-review finding).
+        return Err(PickleErr::Unpicklable(
+            "ObjcRef (a retained Cocoa reference)",
+        ));
+    }
     let subkind = match k.format() {
         Format::Slots => SUBKIND_SLOTS,
         Format::IndexableOops => SUBKIND_OOPS,
@@ -984,12 +995,21 @@ mod tests {
             alloc::alloc_indexable_bytes(&mut vm, k, 16)
         }
         .oop();
+        // An ObjcRef's tail is a RETAINED id owned by this wrapper on this
+        // thread — copying the bytes clones ownership without a retain
+        // (cross-VM double-release). Refused like Alien (C1 review).
+        let objcref = {
+            let k = vm.universe.objcref_klass;
+            alloc::alloc_indexable_bytes(&mut vm, k, 8)
+        }
+        .oop();
         for (o, what) in [
             (closure, "closure"),
             (context, "context"),
             (method, "method"),
             (a_class, "class"),
             (alien, "alien"),
+            (objcref, "objcref"),
         ] {
             assert!(
                 matches!(pickle(&vm, o), Err(PickleErr::Unpicklable(_))),

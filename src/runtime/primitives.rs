@@ -12,7 +12,7 @@ use crate::memory::alloc;
 use crate::oops::klass::Format;
 use crate::oops::layout::{HEADER_WORDS, SMI_MAX, SMI_MIN};
 use crate::oops::smi::SmallInt;
-use crate::oops::wrappers::{ArrayOop, ByteArrayOop, KlassOop, MemOop};
+use crate::oops::wrappers::{ArrayOop, ByteArrayOop, DoubleOop, KlassOop, MemOop};
 use crate::oops::Oop;
 use crate::runtime::vm_state::VmState;
 
@@ -1239,6 +1239,14 @@ pub static PRIMITIVES: &[PrimDesc] = &[
         can_allocate: false,
         can_fail: true,
     },
+    PrimDesc {
+        id: 240,
+        name: "ObjcRef>>primSend:args:ret:",
+        f: prim_cocoa_send_general,
+        argc: 3,
+        can_allocate: true,
+        can_fail: true,
+    },
 ];
 
 pub fn prim_by_id(id: u16) -> Option<&'static PrimDesc> {
@@ -1678,6 +1686,21 @@ fn cocoa_exception_fail(vm: &mut VmState, selector: &str, desc: &str) -> PrimRes
     PrimResult::Fail
 }
 
+/// A String OR Symbol argument's text (both are byte-format; only the
+/// klass differs) — the general send's selector/ret-token arguments read
+/// naturally as either `'id'` or `#id`.
+fn text_arg(vm: &VmState, oop: Oop) -> Option<String> {
+    let m = MemOop::try_from(oop)?;
+    let k = m.klass().oop().raw();
+    if k != vm.universe.string_klass.oop().raw() && k != vm.universe.symbol_klass.oop().raw() {
+        return None;
+    }
+    let b = ByteArrayOop::try_from(oop)?;
+    let mut buf = Vec::new();
+    b.copy_bytes_out(&mut buf);
+    Some(String::from_utf8_lossy(&buf).into_owned())
+}
+
 /// C0 argument marshalling (design §2 clause 3): copies and ids only.
 fn cocoa_marshal_arg(vm: &VmState, o: Oop) -> Option<*mut std::os::raw::c_void> {
     if o.raw() == vm.universe.nil_obj.raw() {
@@ -1701,7 +1724,12 @@ fn prim_cocoa_class_named(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     }
 }
 
-/// The shared send core for 231/232/233: n GPR args, id result, wrapped.
+/// The shared send core for 231/232/233: n GPR args, id result, wrapped —
+/// through the +1-family classifier (C1): an `alloc`/`new`/`copy`/
+/// `mutableCopy`/`init` result is already caller-owned so the wrap skips
+/// its retain, and an init-family send consumes the RECEIVER's ownership
+/// (poison-without-release, BEFORE the allocating wrap — `args[0]` would
+/// be stale after a scavenge).
 fn cocoa_send_n(vm: &mut VmState, args: &[Oop], argn: usize) -> PrimResult {
     let Some(target) = crate::runtime::objc_bridge::read_id(vm, args[0]) else {
         return PrimResult::Fail; // not an ObjcRef, or poisoned
@@ -1716,9 +1744,250 @@ fn cocoa_send_n(vm: &mut VmState, args: &[Oop], argn: usize) -> PrimResult {
         };
         gpr[i] = m;
     }
+    let fam = crate::runtime::objc_bridge::selector_family(&sel);
     match crate::runtime::objc_bridge::try_send(target, &sel, gpr[0], gpr[1]) {
-        Ok(r) => PrimResult::Ok(crate::runtime::objc_bridge::wrap(vm, r)),
-        Err(desc) => cocoa_exception_fail(vm, &sel, &desc),
+        Ok(r) => {
+            if fam == crate::runtime::objc_bridge::Family::Init {
+                crate::runtime::objc_bridge::consume_receiver(vm, args[0]);
+            }
+            PrimResult::Ok(crate::runtime::objc_bridge::wrap_result(vm, r, &sel))
+        }
+        Err(desc) => {
+            // ns_consumes_self: init consumed the receiver even on a
+            // throw — a live wrapper here would over-release later.
+            if fam == crate::runtime::objc_bridge::Family::Init {
+                crate::runtime::objc_bridge::consume_receiver(vm, args[0]);
+            }
+            cocoa_exception_fail(vm, &sel, &desc)
+        }
+    }
+}
+
+/// `ObjcRef >> primSend:args:ret:` (240) — the C1 general send: any mix of
+/// up to 6 GPR-class + 8 FPR-class arguments, spilling to 4 shared stack
+/// words in declaration order — AAPCS64's exact stage-C rule for SCALAR
+/// 8-byte arguments. Two honest limits of the flat model (adversarial-
+/// review findings, deliberately deferred to C2's `cocoa_data`-driven
+/// shapes): a struct-by-value argument must fit ENTIRELY in its class's
+/// remaining registers (a composite that would straddle the register/
+/// stack boundary is placed differently by the real ABI — whole-composite
+/// to stack, registers left idle — which this per-scalar model can't
+/// express), and a spilled argument narrower than 8 bytes (BOOL/int in
+/// stack position) packs to natural size under Darwin, not a full word.
+///
+/// Argument marshalling (flat register model — design §2 clause 3):
+///   nil→NULL, true/false→1/0, SmallInteger→GPR word, ObjcRef→its id,
+///   Double→FPR double, String→a temp NSString (+0 under the bottom pool).
+/// A register-resident struct-by-value argument IS its fields in
+/// consecutive slots under this model: an NSRange argument is two
+/// SmallIntegers, a CGPoint two Doubles, a CGRect four Doubles.
+///
+/// Ret tokens (the register-classifiable subset of `cocoa_data`'s ABI
+/// vocabulary): #id #i64 #i32 #f64 #bool #str #void #range #point #size
+/// #rect. #i32 exists because a callee returning C `int` writes only w0
+/// (zero-extended) — reading it as #i64 makes a negative int a huge
+/// positive smi, silently; #i32 sign-extends from bit 31 instead.
+/// More args than slots, an unknown token, or an unmarshalable argument
+/// all FAIL cleanly (the world fallback raises) — the FFI arc's
+/// argv-overflow lesson, applied at this entry point from day one.
+fn prim_cocoa_send_general(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    use crate::runtime::objc_bridge::{
+        self, RetKind, SEND_FPR_SLOTS, SEND_GPR_SLOTS, SEND_STACK_SLOTS,
+    };
+
+    let Some(target) = objc_bridge::read_id(vm, args[0]) else {
+        return PrimResult::Fail;
+    };
+    let Some(sel) = text_arg(vm, args[1]) else {
+        return PrimResult::Fail;
+    };
+    let Some(arr) = ArrayOop::try_from(args[2]) else {
+        return PrimResult::Fail;
+    };
+    let Some(ret_tok) = text_arg(vm, args[3]) else {
+        return PrimResult::Fail;
+    };
+    let ret = match ret_tok.as_str() {
+        "id" => RetKind::Gpr,
+        "i64" | "i32" => RetKind::Gpr,
+        "bool" => RetKind::Gpr,
+        "str" => RetKind::Gpr,
+        "f64" => RetKind::Fpr,
+        "point" | "size" => RetKind::Hfa2,
+        "rect" => RetKind::Hfa4,
+        "range" => RetKind::IntPair,
+        "void" => RetKind::Void,
+        _ => return PrimResult::Fail,
+    };
+    // Ownership gate (C1 adversarial-review findings): a +1-family
+    // selector (alloc/new/copy/mutableCopy/init) answers an object the
+    // caller must OWN — only #id can take that ownership. Any other ret
+    // token would leak the +1 invisibly (no wrap, no counter), so the
+    // send is refused BEFORE it runs (no side effects).
+    let fam = objc_bridge::selector_family(&sel);
+    if fam != objc_bridge::Family::Plus0 && ret_tok != "id" {
+        return PrimResult::Fail;
+    }
+
+    // Marshal every argument to plain native words BEFORE the call (and
+    // before any Smalltalk allocation) — GPR class fills x2..x7 then the
+    // shared stack words; FPR class fills d0..d7 then the same stack words,
+    // in declaration order, per AAPCS64.
+    let mut gpr = [0u64; SEND_GPR_SLOTS];
+    let mut fpr = [0.0f64; SEND_FPR_SLOTS];
+    let mut stack = [0u64; SEND_STACK_SLOTS];
+    let (mut ng, mut nf, mut ns) = (0usize, 0usize, 0usize);
+    for i in 0..arr.len() {
+        let a = arr.at(i);
+        // FPR class: a Double argument.
+        if let Some(d) = DoubleOop::try_from(a) {
+            if nf < SEND_FPR_SLOTS {
+                fpr[nf] = d.value();
+                nf += 1;
+            } else if ns < SEND_STACK_SLOTS {
+                stack[ns] = d.value().to_bits();
+                ns += 1;
+            } else {
+                return PrimResult::Fail; // oversized call shape
+            }
+            continue;
+        }
+        // Everything else is GPR class.
+        let word = if a.raw() == vm.universe.nil_obj.raw() {
+            0u64
+        } else if a.raw() == vm.universe.true_obj.raw() {
+            1u64
+        } else if a.raw() == vm.universe.false_obj.raw() {
+            0u64
+        } else if let Some(smi) = SmallInt::try_from(a) {
+            smi.value() as u64
+        } else if let Some(id) = objc_bridge::read_id(vm, a) {
+            id as u64
+        } else if let Some(s) = string_arg(vm, a) {
+            // A temp NSString: +0 autoreleased under the bottom pool —
+            // alive for the call, never wrapped, never retained.
+            match objc_bridge::nsstring_from(s.as_bytes()) {
+                Ok(ns_id) => ns_id as u64,
+                Err(desc) => return cocoa_exception_fail(vm, &sel, &desc),
+            }
+        } else {
+            return PrimResult::Fail; // unmarshalable argument type
+        };
+        if ng < SEND_GPR_SLOTS {
+            gpr[ng] = word;
+            ng += 1;
+        } else if ns < SEND_STACK_SLOTS {
+            stack[ns] = word;
+            ns += 1;
+        } else {
+            return PrimResult::Fail; // oversized call shape
+        }
+    }
+
+    let out = match objc_bridge::try_send_full(target, &sel, &gpr, &fpr, &stack, ret) {
+        Ok(o) => o,
+        Err(desc) => {
+            // ns_consumes_self: an init-family send consumed the receiver
+            // even when it THREW — leaving the wrapper live would let a
+            // later release over-release (the one direction the design
+            // forbids). Consume on both outcomes.
+            if fam == objc_bridge::Family::Init {
+                objc_bridge::consume_receiver(vm, args[0]);
+            }
+            return cocoa_exception_fail(vm, &sel, &desc);
+        }
+    };
+
+    // An init-family send consumed the receiver's ownership — poison it
+    // FIRST (allocation-free; `args[0]` is still valid because nothing
+    // has allocated since entry).
+    if fam == objc_bridge::Family::Init {
+        objc_bridge::consume_receiver(vm, args[0]);
+    }
+
+    // Result construction — the only allocating region of this primitive.
+    match ret_tok.as_str() {
+        "id" => PrimResult::Ok(objc_bridge::wrap_result(
+            vm,
+            out.gpr[0] as *mut std::os::raw::c_void,
+            &sel,
+        )),
+        "i64" => {
+            let v = out.gpr[0] as i64;
+            if (crate::oops::layout::SMI_MIN..=crate::oops::layout::SMI_MAX).contains(&v) {
+                PrimResult::Ok(SmallInt::new(v).oop())
+            } else {
+                PrimResult::Fail
+            }
+        }
+        "i32" => {
+            // A C `int` return lives in w0 (upper bits zero) — sign-extend
+            // from bit 31 so `intValue`'s -5 answers -5, not 2^32-5.
+            let v = out.gpr[0] as u32 as i32 as i64;
+            PrimResult::Ok(SmallInt::new(v).oop())
+        }
+        "bool" => {
+            // BOOL comes back in w0's low byte; AAPCS64 leaves the upper
+            // bits unspecified — mask before judging.
+            PrimResult::Ok(if (out.gpr[0] & 0xFF) != 0 {
+                vm.universe.true_obj
+            } else {
+                vm.universe.false_obj
+            })
+        }
+        "f64" => PrimResult::Ok(alloc::alloc_double(vm, out.fpr[0]).oop()),
+        "str" => {
+            let ns = out.gpr[0] as *mut std::os::raw::c_void;
+            if ns.is_null() {
+                return PrimResult::Fail;
+            }
+            match objc_bridge::nsstring_utf8_bytes(ns) {
+                Ok(bytes) => {
+                    let k = vm.universe.string_klass;
+                    let s = alloc::alloc_indexable_bytes(vm, k, bytes.len());
+                    for (i, b) in bytes.iter().enumerate() {
+                        s.byte_at_put(i, *b);
+                    }
+                    PrimResult::Ok(s.oop())
+                }
+                Err(desc) => cocoa_exception_fail(vm, &sel, &desc),
+            }
+        }
+        "void" => PrimResult::Ok(vm.universe.nil_obj),
+        "range" => {
+            let (loc, len) = (out.gpr[0] as i64, out.gpr[1] as i64);
+            let smi_ok =
+                |v: i64| (crate::oops::layout::SMI_MIN..=crate::oops::layout::SMI_MAX).contains(&v);
+            if !smi_ok(loc) || !smi_ok(len) {
+                return PrimResult::Fail; // NSNotFound territory — report, don't wrap wrong
+            }
+            let a = alloc::alloc_indexable_oops(vm, vm.universe.array_klass, 2);
+            a.at_put(0, SmallInt::new(loc).oop());
+            a.at_put(1, SmallInt::new(len).oop());
+            PrimResult::Ok(a.oop())
+        }
+        "point" | "size" | "rect" => {
+            let n = if ret_tok == "rect" { 4 } else { 2 };
+            // The array must survive each alloc_double (which may move it)
+            // — handle-rooted, re-derived per store. The store goes through
+            // the write-barrier door (`store_tail_oop`), NOT bare `at_put`:
+            // a mid-loop scavenge can PROMOTE the array (and re-clean its
+            // card once no slot points young), after which a bare store of
+            // the next fresh Double is an old→new reference no future
+            // scavenge would ever see — the C1 adversarial review's
+            // dangling-slot scenario under tenuring-threshold 0.
+            let scope = crate::memory::handles::HandleScope::enter(vm);
+            let arr_out = alloc::alloc_indexable_oops(vm, vm.universe.array_klass, n);
+            let arr_h = scope.handle(vm, arr_out.oop());
+            for i in 0..n {
+                let d = alloc::alloc_double(vm, out.fpr[i]);
+                let arr_now =
+                    MemOop::try_from(arr_h.get(vm)).expect("handle-rooted array survived the move");
+                crate::memory::store::store_tail_oop(vm, arr_now, i, d.oop());
+            }
+            PrimResult::Ok(arr_h.get(vm))
+        }
+        _ => PrimResult::Fail, // unreachable: token validated above
     }
 }
 
@@ -1734,9 +2003,11 @@ fn prim_cocoa_send2(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     cocoa_send_n(vm, args, 2)
 }
 
-/// `ObjcRef >> primSendI64:` (234): a send whose GPR result is an integer
-/// (NSInteger/NSUInteger/BOOL), answered as a SmallInteger. Fails if the
-/// value can't be a smi (a >2^61 NSUInteger — report, don't wrap wrong).
+/// `ObjcRef >> primSendI64:` (234): a send whose GPR result is an
+/// NSInteger/NSUInteger, answered as a SmallInteger. Fails if the value
+/// can't be a smi (a >2^61 NSUInteger — report, don't wrap wrong), and
+/// REFUSES +1-family selectors before sending (the result would be an
+/// owned object this integer path can never own — C1 review finding).
 fn prim_cocoa_send_i64(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     let Some(target) = crate::runtime::objc_bridge::read_id(vm, args[0]) else {
         return PrimResult::Fail;
@@ -1744,6 +2015,11 @@ fn prim_cocoa_send_i64(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     let Some(sel) = string_arg(vm, args[1]) else {
         return PrimResult::Fail;
     };
+    if crate::runtime::objc_bridge::selector_family(&sel)
+        != crate::runtime::objc_bridge::Family::Plus0
+    {
+        return PrimResult::Fail;
+    }
     match crate::runtime::objc_bridge::try_send(
         target,
         &sel,
@@ -1765,6 +2041,8 @@ fn prim_cocoa_send_i64(vm: &mut VmState, args: &[Oop]) -> PrimResult {
 /// `ObjcRef >> primSendString:` (235): a send answering an NSString, copied
 /// out as a fresh Smalltalk String (design §2 clause 3 — data crosses by
 /// copy; the intermediate NSString stays +0 under the bottom pool).
+/// +1-family selectors are refused before sending, same as 234: the +1
+/// NSString would leak invisibly behind the copy.
 fn prim_cocoa_send_string(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     let Some(target) = crate::runtime::objc_bridge::read_id(vm, args[0]) else {
         return PrimResult::Fail;
@@ -1772,6 +2050,11 @@ fn prim_cocoa_send_string(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     let Some(sel) = string_arg(vm, args[1]) else {
         return PrimResult::Fail;
     };
+    if crate::runtime::objc_bridge::selector_family(&sel)
+        != crate::runtime::objc_bridge::Family::Plus0
+    {
+        return PrimResult::Fail;
+    }
     match crate::runtime::objc_bridge::try_send_string(target, &sel) {
         Ok(bytes) => {
             let k = vm.universe.string_klass;
@@ -3714,6 +3997,7 @@ mod tests {
             (237, "Cocoa class>>primNSString:"),
             (238, "Cocoa class>>primDrainPool"),
             (239, "ObjcRef>>primIsValid"),
+            (240, "ObjcRef>>primSend:args:ret:"),
         ];
         assert_eq!(
             PRIMITIVES.len(),
