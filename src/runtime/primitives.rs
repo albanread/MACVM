@@ -1158,6 +1158,87 @@ pub static PRIMITIVES: &[PrimDesc] = &[
         can_allocate: true,
         can_fail: true,
     },
+    // cocoa bridge C0 (docs/cocoa_bridge_design.md §8, prims 230-239).
+    PrimDesc {
+        id: 230,
+        name: "Cocoa class>>primClassNamed:",
+        f: prim_cocoa_class_named,
+        argc: 1,
+        can_allocate: true,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 231,
+        name: "ObjcRef>>primSend:",
+        f: prim_cocoa_send0,
+        argc: 1,
+        can_allocate: true,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 232,
+        name: "ObjcRef>>primSend:with:",
+        f: prim_cocoa_send1,
+        argc: 2,
+        can_allocate: true,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 233,
+        name: "ObjcRef>>primSend:with:with:",
+        f: prim_cocoa_send2,
+        argc: 3,
+        can_allocate: true,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 234,
+        name: "ObjcRef>>primSendI64:",
+        f: prim_cocoa_send_i64,
+        argc: 1,
+        can_allocate: true,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 235,
+        name: "ObjcRef>>primSendString:",
+        f: prim_cocoa_send_string,
+        argc: 1,
+        can_allocate: true,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 236,
+        name: "ObjcRef>>primRelease",
+        f: prim_cocoa_release,
+        argc: 0,
+        can_allocate: false,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 237,
+        name: "Cocoa class>>primNSString:",
+        f: prim_cocoa_nsstring,
+        argc: 1,
+        can_allocate: true,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 238,
+        name: "Cocoa class>>primDrainPool",
+        f: prim_cocoa_drain_pool,
+        argc: 0,
+        can_allocate: false,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 239,
+        name: "ObjcRef>>primIsValid",
+        f: prim_cocoa_is_valid,
+        argc: 0,
+        can_allocate: false,
+        can_fail: true,
+    },
 ];
 
 pub fn prim_by_id(id: u16) -> Option<&'static PrimDesc> {
@@ -1580,6 +1661,168 @@ fn prim_worker_self_id(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     let _ = args;
     let id = vm.workers.as_ref().map_or(0, |ws| ws.self_id());
     PrimResult::Ok(SmallInt::new(i64::from(id)).oop())
+}
+
+// --- cocoa group: the bridge C0 (docs/cocoa_bridge_design.md §8) ------------
+//
+// ObjcRef sends + ownership + the class/NSString entry points. Every send
+// goes through the @try shim (objc_bridge::try_send) — an NSException comes
+// back as a description, is written to the transcript, and the prim FAILS
+// (the world method's fallback raises a Smalltalk error; the VM never sees
+// an ObjC unwind). Marshalling in C0: ObjcRef → its id, nil → NULL,
+// SmallInteger → the value as a GPR word. Everything else fails.
+
+/// Report a caught NSException to the transcript, then fail the prim.
+fn cocoa_exception_fail(vm: &mut VmState, selector: &str, desc: &str) -> PrimResult {
+    let _ = writeln!(vm.out, "Cocoa exception in {selector}: {desc}");
+    PrimResult::Fail
+}
+
+/// C0 argument marshalling (design §2 clause 3): copies and ids only.
+fn cocoa_marshal_arg(vm: &VmState, o: Oop) -> Option<*mut std::os::raw::c_void> {
+    if o.raw() == vm.universe.nil_obj.raw() {
+        return Some(std::ptr::null_mut());
+    }
+    if let Some(smi) = SmallInt::try_from(o) {
+        return Some(smi.value() as *mut std::os::raw::c_void);
+    }
+    crate::runtime::objc_bridge::read_id(vm, o)
+}
+
+/// `Cocoa class >> primClassNamed:` (230): an ObjcRef on the named
+/// Objective-C class, or fail if no such class is registered.
+fn prim_cocoa_class_named(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    let Some(name) = string_arg(vm, args[1]) else {
+        return PrimResult::Fail;
+    };
+    match crate::runtime::objc_bridge::class_named(&name) {
+        Some(cls) => PrimResult::Ok(crate::runtime::objc_bridge::wrap(vm, cls)),
+        None => PrimResult::Fail,
+    }
+}
+
+/// The shared send core for 231/232/233: n GPR args, id result, wrapped.
+fn cocoa_send_n(vm: &mut VmState, args: &[Oop], argn: usize) -> PrimResult {
+    let Some(target) = crate::runtime::objc_bridge::read_id(vm, args[0]) else {
+        return PrimResult::Fail; // not an ObjcRef, or poisoned
+    };
+    let Some(sel) = string_arg(vm, args[1]) else {
+        return PrimResult::Fail;
+    };
+    let mut gpr = [std::ptr::null_mut(); 2];
+    for i in 0..argn {
+        let Some(m) = cocoa_marshal_arg(vm, args[2 + i]) else {
+            return PrimResult::Fail;
+        };
+        gpr[i] = m;
+    }
+    match crate::runtime::objc_bridge::try_send(target, &sel, gpr[0], gpr[1]) {
+        Ok(r) => PrimResult::Ok(crate::runtime::objc_bridge::wrap(vm, r)),
+        Err(desc) => cocoa_exception_fail(vm, &sel, &desc),
+    }
+}
+
+/// `ObjcRef >> primSend:` (231) / `primSend:with:` (232) /
+/// `primSend:with:with:` (233).
+fn prim_cocoa_send0(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    cocoa_send_n(vm, args, 0)
+}
+fn prim_cocoa_send1(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    cocoa_send_n(vm, args, 1)
+}
+fn prim_cocoa_send2(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    cocoa_send_n(vm, args, 2)
+}
+
+/// `ObjcRef >> primSendI64:` (234): a send whose GPR result is an integer
+/// (NSInteger/NSUInteger/BOOL), answered as a SmallInteger. Fails if the
+/// value can't be a smi (a >2^61 NSUInteger — report, don't wrap wrong).
+fn prim_cocoa_send_i64(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    let Some(target) = crate::runtime::objc_bridge::read_id(vm, args[0]) else {
+        return PrimResult::Fail;
+    };
+    let Some(sel) = string_arg(vm, args[1]) else {
+        return PrimResult::Fail;
+    };
+    match crate::runtime::objc_bridge::try_send(
+        target,
+        &sel,
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+    ) {
+        Ok(r) => {
+            let v = r as i64;
+            if (crate::oops::layout::SMI_MIN..=crate::oops::layout::SMI_MAX).contains(&v) {
+                PrimResult::Ok(SmallInt::new(v).oop())
+            } else {
+                PrimResult::Fail
+            }
+        }
+        Err(desc) => cocoa_exception_fail(vm, &sel, &desc),
+    }
+}
+
+/// `ObjcRef >> primSendString:` (235): a send answering an NSString, copied
+/// out as a fresh Smalltalk String (design §2 clause 3 — data crosses by
+/// copy; the intermediate NSString stays +0 under the bottom pool).
+fn prim_cocoa_send_string(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    let Some(target) = crate::runtime::objc_bridge::read_id(vm, args[0]) else {
+        return PrimResult::Fail;
+    };
+    let Some(sel) = string_arg(vm, args[1]) else {
+        return PrimResult::Fail;
+    };
+    match crate::runtime::objc_bridge::try_send_string(target, &sel) {
+        Ok(bytes) => {
+            let k = vm.universe.string_klass;
+            let s = alloc::alloc_indexable_bytes(vm, k, bytes.len());
+            for (i, b) in bytes.iter().enumerate() {
+                s.byte_at_put(i, *b);
+            }
+            PrimResult::Ok(s.oop())
+        }
+        Err(desc) => cocoa_exception_fail(vm, &sel, &desc),
+    }
+}
+
+/// `ObjcRef >> primRelease` (236): release-with-poison. A double release
+/// fails cleanly (the leak-side bias, design §3.3).
+fn prim_cocoa_release(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    if crate::runtime::objc_bridge::release(vm, args[0]) {
+        PrimResult::Ok(args[0])
+    } else {
+        PrimResult::Fail
+    }
+}
+
+/// `Cocoa class >> primNSString:` (237): a Smalltalk String copied into a
+/// fresh NSString, wrapped (+0 return → wrap retains).
+fn prim_cocoa_nsstring(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    let Some(s) = string_arg(vm, args[1]) else {
+        return PrimResult::Fail;
+    };
+    match crate::runtime::objc_bridge::nsstring_from(s.as_bytes()) {
+        Ok(ns) => PrimResult::Ok(crate::runtime::objc_bridge::wrap(vm, ns)),
+        Err(desc) => cocoa_exception_fail(vm, "stringWithUTF8String:", &desc),
+    }
+}
+
+/// `Cocoa class >> primDrainPool` (238): drain + renew this thread's bottom
+/// pool (the `poolDo:` mechanism, v1-lite).
+fn prim_cocoa_drain_pool(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    let _ = vm;
+    crate::runtime::objc_bridge::drain_pool_at_doit_boundary();
+    PrimResult::Ok(args[0])
+}
+
+/// `ObjcRef >> primIsValid` (239): false once poisoned.
+fn prim_cocoa_is_valid(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    let b = crate::runtime::objc_bridge::read_id(vm, args[0]).is_some();
+    PrimResult::Ok(if b {
+        vm.universe.true_obj
+    } else {
+        vm.universe.false_obj
+    })
 }
 
 // --- smi group (SPEC §10 appendix) ------------------------------------------
@@ -3460,6 +3703,17 @@ mod tests {
             (226, "Worker class>>primSelfId"),
             (227, "Worker class>>pickle:"),
             (228, "Worker class>>unpickle:"),
+            // cocoa bridge C0 (docs/cocoa_bridge_design.md)
+            (230, "Cocoa class>>primClassNamed:"),
+            (231, "ObjcRef>>primSend:"),
+            (232, "ObjcRef>>primSend:with:"),
+            (233, "ObjcRef>>primSend:with:with:"),
+            (234, "ObjcRef>>primSendI64:"),
+            (235, "ObjcRef>>primSendString:"),
+            (236, "ObjcRef>>primRelease"),
+            (237, "Cocoa class>>primNSString:"),
+            (238, "Cocoa class>>primDrainPool"),
+            (239, "ObjcRef>>primIsValid"),
         ];
         assert_eq!(
             PRIMITIVES.len(),

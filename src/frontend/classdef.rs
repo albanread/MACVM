@@ -265,6 +265,14 @@ pub fn execute_top_item(vm: &mut VmState, item: TopItem) -> Result<Option<Oop>, 
             install_class_def(vm, &mut c)?;
             Ok(None)
         }
-        TopItem::DoIt(stmt) => Ok(Some(execute_do_it(vm, stmt)?)),
+        TopItem::DoIt(stmt) => {
+            let r = execute_do_it(vm, stmt)?;
+            // Cocoa bridge pool hygiene (docs/cocoa_bridge_design.md §3.1):
+            // a doit boundary is the natural quiescent point to drain +
+            // renew this thread's bottom autorelease pool. A cheap
+            // thread-local no-op on threads that never touched Cocoa.
+            crate::runtime::objc_bridge::drain_pool_at_doit_boundary();
+            Ok(Some(r))
+        }
     }
 }

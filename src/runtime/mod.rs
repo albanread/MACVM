@@ -19,13 +19,14 @@ pub mod frames;
 pub mod globals;
 pub mod lookup;
 pub mod mop; // MOP object pickle — multi-Smalltalk workers M0 (docs/multi-smalltalk-worker.md §4)
+pub mod objc_bridge; // Cocoa bridge C0 — ObjcRef + ownership + bottom pool (docs/cocoa_bridge_design.md)
 pub mod osr;
-pub mod workers; // primary/worker registry + channels — workers M1 (docs/multi-smalltalk-worker.md §3)
 pub mod primitives;
 pub mod probe;
 pub mod recompile;
 pub mod simd_kernels; // SIMD level 2: explicit hand-written NEON bulk kernels (docs/SIMD.md Part E)
 pub mod vm_state;
+pub mod workers; // primary/worker registry + channels — workers M1 (docs/multi-smalltalk-worker.md §3)
 
 pub use vm_state::{InterpRegs, JitMode, TierLink, TraceFlags, VmOptions, VmRegBlock, VmState};
 

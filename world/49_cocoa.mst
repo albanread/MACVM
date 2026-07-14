@@ -1,0 +1,84 @@
+"49_cocoa.mst — the Cocoa bridge, C0 (docs/cocoa_bridge_design.md). ObjcRef
+ wraps one retained Objective-C object (the raw id lives in the wrapper's
+ byte tail, invisible to the moving GC); Cocoa is the class-side facade.
+ Everything that crosses the boundary is a copy or a retained reference —
+ no live pointer is ever shared between the two memory managers.
+
+   | pi |
+   pi := (Cocoa classNamed: 'NSProcessInfo') send: 'processInfo'.
+   Transcript showCr: (pi sendString: 'processName').
+   pi release.
+
+ Ownership (v1): every wrap retains; `release` releases AND poisons the
+ wrapper (later sends fail cleanly — like a terminated worker). An
+ unreleased wrapper leaks its reference — deliberately: a leak is
+ diagnosable (MACVM_TRACE=cocoa), an over-release corrupts Cocoa. Use
+ `Cocoa poolDo: [...]` around bursts; the VM also drains its bottom
+ autorelease pool after every doit. A caught NSException prints to the
+ Transcript and raises an ordinary Smalltalk error — the VM never dies.
+ In a build without the Objective-C runtime every primitive fails cleanly."
+Object subclass: ObjcRef [
+    "The id lives in the byte tail; instances are minted only by the
+     bridge (Cocoa classNamed:/nsString:, and send results)."
+    send: selName [
+        "Send an Objective-C message (no arguments); answer the result as
+         an ObjcRef, or nil for a nil result."
+        <primitive: 231>
+        ^self error: 'Cocoa send failed: ', selName printString
+    ]
+    send: selName with: a [
+        "One argument: an ObjcRef, nil, or a SmallInteger."
+        <primitive: 232>
+        ^self error: 'Cocoa send failed: ', selName printString
+    ]
+    send: selName with: a with: b [
+        <primitive: 233>
+        ^self error: 'Cocoa send failed: ', selName printString
+    ]
+    sendI64: selName [
+        "A send answering an integer (NSInteger/BOOL), as a SmallInteger."
+        <primitive: 234>
+        ^self error: 'Cocoa integer send failed: ', selName printString
+    ]
+    sendString: selName [
+        "A send answering an NSString, copied out as a Smalltalk String."
+        <primitive: 235>
+        ^self error: 'Cocoa string send failed: ', selName printString
+    ]
+    release [
+        "Release the wrapped object and poison this wrapper. Once."
+        <primitive: 236>
+        ^self error: 'release on an invalid (already released?) ObjcRef'
+    ]
+    isValid [
+        <primitive: 239>
+        ^false
+    ]
+]
+
+Object subclass: Cocoa [
+    Cocoa class >> classNamed: aName [
+        "An ObjcRef on the named Objective-C class."
+        <primitive: 230>
+        ^self error: 'no Objective-C class named ', aName printString
+    ]
+    Cocoa class >> nsString: aString [
+        "A fresh NSString holding aString's characters (a copy)."
+        <primitive: 237>
+        ^self error: 'Cocoa nsString: failed'
+    ]
+    Cocoa class >> drainPool [
+        "Drain + renew this thread's bottom autorelease pool."
+        <primitive: 238>
+        ^self
+    ]
+    Cocoa class >> poolDo: aBlock [
+        "Run aBlock, then drain autoreleased garbage it generated. (C0-lite:
+         wrapped ObjcRefs still need their own release; the mint-list
+         version arrives with C4 — docs/cocoa_bridge_design.md §3.3.)"
+        | r |
+        r := aBlock value.
+        self drainPool.
+        ^r
+    ]
+]

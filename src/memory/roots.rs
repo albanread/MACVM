@@ -111,6 +111,7 @@ where
         array_klass,
         bytearray_klass,
         alien_klass,
+        objcref_klass,
         association_klass,
         methoddict_klass,
         method_klass,

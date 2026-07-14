@@ -79,3 +79,6 @@
 # ParallelMandel: the worker capstone — the MandelZoom dive computed in
 # parallel bands by N worker VMs, assembled + blitted by the primary (M4).
 48_parallelmandel.mst
+# Cocoa bridge C0: ObjcRef (retained id in a GC-opaque byte tail) + the Cocoa
+# facade (docs/cocoa_bridge_design.md; prims 230-239). Fails cleanly headless.
+49_cocoa.mst

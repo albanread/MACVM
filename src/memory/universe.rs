@@ -146,6 +146,13 @@ pub struct Universe {
     /// fixes the klass's SHAPE (`nis_words` can't be expressed by the
     /// `subclass:` parser, only by this same `remaining_klass!` machinery).
     pub alien_klass: KlassOop,
+    /// `ObjcRef` (Cocoa bridge C0, docs/cocoa_bridge_design.md §2): a
+    /// bytes-format wrapper whose 8-byte tail holds a raw Objective-C `id`.
+    /// ZERO named words on purpose — the id must live in the byte tail (the
+    /// one storage the collector never walks), NOT in Alien's named smi
+    /// slot: arm64 tagged-pointer ids set bit 63 (out of smi range) and a
+    /// raw word in a scanned slot would corrupt the heap.
+    pub objcref_klass: KlassOop,
     pub association_klass: KlassOop,
     pub methoddict_klass: KlassOop,
     pub method_klass: KlassOop,
@@ -574,6 +581,16 @@ impl Universe {
             true,
             HEADER_WORDS + ALIEN_NAMED_WORDS
         );
+        // ObjcRef: bytes format, untagged tail, NO named words (its own
+        // implicit size slot at body-word 0, tail from body-word 1) — see
+        // the `objcref_klass` field doc for why the tail, not a named slot.
+        let objcref_klass = remaining_klass!(
+            "ObjcRef",
+            object_klass.oop(),
+            Format::IndexableBytes,
+            true,
+            HEADER_WORDS
+        );
         let association_klass = remaining_klass!(
             "Association",
             object_klass.oop(),
@@ -745,6 +762,7 @@ impl Universe {
             array_klass,
             bytearray_klass,
             alien_klass,
+            objcref_klass,
             association_klass,
             methoddict_klass,
             method_klass,
@@ -1071,6 +1089,8 @@ mod tests {
             // Alien: NOT under ArrayedCollection (see `Universe::alien_klass`'s
             // own doc comment) — direct `Object` subclass, S20 step 5.
             (u.alien_klass, u.object_klass),
+            // ObjcRef: Cocoa bridge C0 — same direct-Object posture as Alien.
+            (u.objcref_klass, u.object_klass),
             (u.string_klass, u.arrayed_collection_klass),
             (u.symbol_klass, u.string_klass),
             (u.behavior_klass, u.object_klass),

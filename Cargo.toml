@@ -32,6 +32,12 @@ path = "src/bin/asm_preview.rs"
 name = "macvm"
 path = "src/lib.rs"
 
+[build-dependencies]
+# Compiles the one Objective-C file the Cocoa bridge needs (the @try/@catch
+# exception shim, src/runtime/objc_shim.m) — "the one new build dependency
+# this design admits" (docs/cocoa_bridge_design.md §5).
+cc = "1"
+
 [dependencies]
 libc = "0.2"
 # Vendored wfasm (S9, src/vendor/wfasm/) uses anyhow for its own error

@@ -154,12 +154,7 @@ pub enum GameCommand {
         index: u8,
     },
     /// Fill a disc of radius `r` centred at `(cx, cy)` in palette `index`.
-    Disc {
-        cx: i64,
-        cy: i64,
-        r: i64,
-        index: u8,
-    },
+    Disc { cx: i64, cy: i64, r: i64, index: u8 },
     /// Overwrite the whole active buffer from a row-major slice of palette
     /// indices (`GamePane>>blit:`). The bulk path for CPU-generated frames — one
     /// command instead of one `Pset` per pixel.
@@ -650,9 +645,9 @@ impl VmHandle {
     /// it, `Worker spawn` fails cleanly. The closure runs ON each new worker
     /// thread.
     pub fn set_worker_boot(&mut self, f: crate::runtime::workers::WorkerBootFn) {
-        self.vm.workers = Some(Box::new(
-            crate::runtime::workers::WorkerState::new_primary(f),
-        ));
+        self.vm.workers = Some(Box::new(crate::runtime::workers::WorkerState::new_primary(
+            f,
+        )));
     }
 
     /// Registers the router's wake hook (§3.1): fired — coalesced — whenever
@@ -791,7 +786,8 @@ mod tests {
     fn eval_tolerates_a_missing_trailing_period() {
         let mut vm = boot_test_vm(JitMode::Off);
         assert_eq!(
-            vm.eval("3 + 4").expect("a bare expression must evaluate without a trailing period"),
+            vm.eval("3 + 4")
+                .expect("a bare expression must evaluate without a trailing period"),
             "7"
         );
         // A trailing period still works (unchanged).
@@ -841,7 +837,9 @@ mod tests {
             "fragment must be a beveled button carrying its label, got {html:?}"
         );
         // The id the fragment advertises is what a click posts back.
-        let id_start = html.find("data-widget-action=\"").expect("fragment has an action id")
+        let id_start = html
+            .find("data-widget-action=\"")
+            .expect("fragment has an action id")
             + "data-widget-action=\"".len();
         let id_end = html[id_start..].find('"').unwrap() + id_start;
         let id = &html[id_start..id_end];
@@ -871,7 +869,9 @@ mod tests {
                  title: 'It works!' type: #info action: [] ]",
             )
             .expect("the Press Me button must render");
-        let id_start = html.find("data-widget-action=\"").expect("has an action id")
+        let id_start = html
+            .find("data-widget-action=\"")
+            .expect("has an action id")
             + "data-widget-action=\"".len();
         let id_end = html[id_start..].find('"').unwrap() + id_start;
         let id = html[id_start..id_end].to_string();
@@ -925,13 +925,9 @@ mod tests {
             "every pixel must be opaque (alpha 255)"
         );
         // A black interior pixel exists (some point reached maxIter)...
-        let has_black = bytes
-            .chunks(4)
-            .any(|p| p[0] == 0 && p[1] == 0 && p[2] == 0);
+        let has_black = bytes.chunks(4).any(|p| p[0] == 0 && p[1] == 0 && p[2] == 0);
         // ...and a non-black escaped pixel exists (the bands).
-        let has_colour = bytes
-            .chunks(4)
-            .any(|p| p[0] != 0 || p[1] != 0 || p[2] != 0);
+        let has_colour = bytes.chunks(4).any(|p| p[0] != 0 || p[1] != 0 || p[2] != 0);
         assert!(
             has_black && has_colour,
             "the fractal must have both interior (black) and escaped (coloured) pixels"
@@ -961,7 +957,8 @@ mod tests {
         .expect("warmup");
         // The + arg-unbox fails: reexec needs the sunk box of 3.5*2.0 = 7.0.
         assert_eq!(
-            vm.eval("FSinkT new mix: 3.5 with: 2.0 plus: 1").expect("mixed"),
+            vm.eval("FSinkT new mix: 3.5 with: 2.0 plus: 1")
+                .expect("mixed"),
             "8.0"
         );
         // Mid-chain deopt: the second * fails; its reexec stack holds the
@@ -972,7 +969,8 @@ mod tests {
         );
         // And the pure-Double path still answers exactly.
         assert_eq!(
-            vm.eval("FSinkT new mix: 3.5 with: 2.0 plus: 1.25").expect("pure"),
+            vm.eval("FSinkT new mix: 3.5 with: 2.0 plus: 1.25")
+                .expect("pure"),
             "8.25"
         );
     }
@@ -1158,7 +1156,10 @@ mod tests {
             html.contains(">x<") || html.contains("st-selector\">x"),
             "instance selectors must be listed, got {html:?}"
         );
-        assert!(html.contains("printOn:") && html.contains("origin"), "got {html:?}");
+        assert!(
+            html.contains("printOn:") && html.contains("origin"),
+            "got {html:?}"
+        );
     }
 
     /// The `selectorsOf:` primitive answers a class's own selectors and fails
@@ -1188,12 +1189,14 @@ mod tests {
         let mut vm = boot_test_vm(JitMode::Off);
         // Alien>>byteAt: is a table primitive; Point>>x is ordinary Smalltalk.
         assert_ne!(
-            vm.eval("ClassMirror primitiveOf: Alien selector: #byteAt:.").unwrap(),
+            vm.eval("ClassMirror primitiveOf: Alien selector: #byteAt:.")
+                .unwrap(),
             "0",
             "byteAt: must report a primitive number"
         );
         assert_eq!(
-            vm.eval("ClassMirror primitiveOf: Point selector: #x.").unwrap(),
+            vm.eval("ClassMirror primitiveOf: Point selector: #x.")
+                .unwrap(),
             "0",
             "an ordinary method has no primitive"
         );
@@ -1299,7 +1302,11 @@ mod tests {
             .expect("GamePane>>clearR:g:b: must evaluate cleanly");
         assert_eq!(
             *captured.lock().unwrap(),
-            vec![GameCommand::ClearTo { r: 200, g: 40, b: 40 }],
+            vec![GameCommand::ClearTo {
+                r: 200,
+                g: 40,
+                b: 40
+            }],
             "the game sink must capture exactly the ClearTo command"
         );
     }
@@ -1455,7 +1462,8 @@ mod tests {
 
         vm.exec("MandelZoom launch.").expect("launch must run");
         // A frame while running draws (MandelZoom blits a whole frame).
-        vm.exec("GamePane stepWithKeys: 0.").expect("a step must run");
+        vm.exec("GamePane stepWithKeys: 0.")
+            .expect("a step must run");
         assert!(
             captured
                 .lock()
@@ -1482,7 +1490,10 @@ mod tests {
         let mut vm = boot_test_vm(JitMode::Threshold(1));
         let m0 = vm.metrics();
         assert!(m0.eden_capacity > 0, "eden must report a capacity");
-        assert!(m0.code_capacity > 0, "the code cache must report a capacity");
+        assert!(
+            m0.code_capacity > 0,
+            "the code cache must report a capacity"
+        );
         // Run a hot looping method (so it compiles) that also allocates enough
         // to force a scavenge (so the GC byte counter moves).
         vm.exec(
@@ -1573,7 +1584,10 @@ mod tests {
         let none = vm
             .eval("ClassMirror instanceVariablesOf: 42")
             .expect("a non-behavior must not crash");
-        assert_eq!(none, "#()", "a non-behavior yields the empty-array fallback");
+        assert_eq!(
+            none, "#()",
+            "a non-behavior yields the empty-array fallback"
+        );
     }
 
     #[test]
@@ -1628,12 +1642,38 @@ mod tests {
         assert_eq!(
             *captured.lock().unwrap(),
             vec![
-                GameCommand::PaletteAt { index: 16, r: 10, g: 20, b: 30 },
+                GameCommand::PaletteAt {
+                    index: 16,
+                    r: 10,
+                    g: 20,
+                    b: 30
+                },
                 GameCommand::Cls { index: 16 },
-                GameCommand::Pset { x: 5, y: 7, index: 16 },
-                GameCommand::Line { x0: 0, y0: 0, x1: 9, y1: 9, index: 16 },
-                GameCommand::FillRect { x: 1, y: 2, w: 3, h: 4, index: 16 },
-                GameCommand::Disc { cx: 8, cy: 8, r: 2, index: 16 },
+                GameCommand::Pset {
+                    x: 5,
+                    y: 7,
+                    index: 16
+                },
+                GameCommand::Line {
+                    x0: 0,
+                    y0: 0,
+                    x1: 9,
+                    y1: 9,
+                    index: 16
+                },
+                GameCommand::FillRect {
+                    x: 1,
+                    y: 2,
+                    w: 3,
+                    h: 4,
+                    index: 16
+                },
+                GameCommand::Disc {
+                    cx: 8,
+                    cy: 8,
+                    r: 2,
+                    index: 16
+                },
                 GameCommand::Present,
             ],
             "every drawing method must reach the sink as its command, in order"
@@ -1725,9 +1765,22 @@ mod tests {
         assert_eq!(
             *captured.lock().unwrap(),
             vec![
-                GameCommand::DefineSprite { id: 1, rows: "f0f/0f0/f0f".to_string() },
-                GameCommand::SpriteColor { id: 1, index: 15, r: 240, g: 240, b: 0 },
-                GameCommand::MoveSprite { id: 1, x: 100, y: 80 },
+                GameCommand::DefineSprite {
+                    id: 1,
+                    rows: "f0f/0f0/f0f".to_string()
+                },
+                GameCommand::SpriteColor {
+                    id: 1,
+                    index: 15,
+                    r: 240,
+                    g: 240,
+                    b: 0
+                },
+                GameCommand::MoveSprite {
+                    id: 1,
+                    x: 100,
+                    y: 80
+                },
             ],
             "define/color/move must reach the sink for the minted sprite id"
         );
@@ -1778,7 +1831,9 @@ mod tests {
             .expect("Tune playOnce must evaluate cleanly");
         assert_eq!(
             *captured.lock().unwrap(),
-            vec![GameCommand::PlayTune { abc: "C D E".to_string() }]
+            vec![GameCommand::PlayTune {
+                abc: "C D E".to_string()
+            }]
         );
     }
 
@@ -1815,7 +1870,8 @@ mod tests {
             "launch starts the frame loop"
         );
         assert!(
-            cmds.iter().any(|c| matches!(c, GameCommand::FillRect { .. })),
+            cmds.iter()
+                .any(|c| matches!(c, GameCommand::FillRect { .. })),
             "bricks and the paddle draw as filled rects"
         );
         assert!(
@@ -1827,7 +1883,8 @@ mod tests {
             "each frame presents"
         );
         assert!(
-            cmds.iter().any(|c| matches!(c, GameCommand::PlaySound { .. })),
+            cmds.iter()
+                .any(|c| matches!(c, GameCommand::PlaySound { .. })),
             "the ball clears a brick within 120 frames, playing a sound (runs hitBricks)"
         );
     }
@@ -1949,10 +2006,14 @@ mod tests {
         let mut vm = boot_worker_primary();
         // NB: `exec` runs ONE top item per call, so each statement is its own
         // doit; state persists in WkTest's class vars.
-        vm.exec("WkTest w1: (Worker spawn: 'Worker onMessage: [:m | Worker reply: m payload * 2]').")
-            .expect("spawn the echo worker");
-        vm.exec("1 to: 200 do: [:i | WkTest w1 send: i onReply: [:r | WkTest bump: r = (i * 2)] ].")
-            .expect("send 200 correlated requests");
+        vm.exec(
+            "WkTest w1: (Worker spawn: 'Worker onMessage: [:m | Worker reply: m payload * 2]').",
+        )
+        .expect("spawn the echo worker");
+        vm.exec(
+            "1 to: 200 do: [:i | WkTest w1 send: i onReply: [:r | WkTest bump: r = (i * 2)] ].",
+        )
+        .expect("send 200 correlated requests");
         vm.exec("Worker runLoopWhile: [ (WkTest tickCapped: 100) and: [ WkTest count < 200 ] ].")
             .expect("run the event loop until all replies land");
         assert_eq!(
@@ -2003,18 +2064,17 @@ mod tests {
         let mut vm = boot_worker_primary();
         vm.exec("WkTest w1: (Worker spawn: 'Worker onMessage: [:m | Worker reply: m payload]').")
             .expect("spawn");
-        vm.exec("WkTest w1 isAlive ifFalse: [ nil error: 'freshly spawned worker must be alive' ].")
-            .expect("fresh worker is alive");
+        vm.exec(
+            "WkTest w1 isAlive ifFalse: [ nil error: 'freshly spawned worker must be alive' ].",
+        )
+        .expect("fresh worker is alive");
         vm.exec("WkTest w1 terminate.").expect("terminate");
         vm.exec("WkTest w1 isAlive ifTrue: [ nil error: 'terminated worker must not be alive' ].")
             .expect("terminated worker is not alive");
         // Sending to a terminated worker raises (primSend fails -> the world
         // method's error fallback), surfacing as a GuestError here.
         assert!(
-            vm.exec(
-                "(Worker new setId: 1) send: 5."
-            )
-            .is_err(),
+            vm.exec("(Worker new setId: 1) send: 5.").is_err(),
             "send to a terminated worker must raise"
         );
     }
@@ -2169,6 +2229,135 @@ mod tests {
             (1..=50).contains(&n),
             "wakes must fire and coalesce: got {n} for 50 replies"
         );
+    }
+
+    // ── Cocoa bridge C0 gates (docs/cocoa_bridge_design.md §8) ──────────
+
+    /// The wrap/release counters are process-wide and the test harness is
+    /// parallel — every Cocoa test takes this lock so counter deltas (and
+    /// pool traffic) can't interleave.
+    fn cocoa_serial() -> std::sync::MutexGuard<'static, ()> {
+        static L: Mutex<()> = Mutex::new(());
+        L.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[test]
+    fn cocoa_c0_process_name_round_trips() {
+        let _serial = cocoa_serial();
+        // The canonical C0 gate: a real Foundation object, a real send, a
+        // real NSString copied back — on the VM thread, headless.
+        let mut vm = boot_test_vm(JitMode::Off);
+        let name = vm
+            .eval("((Cocoa classNamed: 'NSProcessInfo') send: 'processInfo') sendString: 'processName'")
+            .expect("the processName round-trip must run cleanly");
+        assert!(
+            name.contains("macvm"),
+            "processName should be this test binary's name, got {name}"
+        );
+    }
+
+    #[test]
+    fn cocoa_c0_tagged_pointer_ids_survive_the_byte_tail() {
+        let _serial = cocoa_serial();
+        // The adversarial-review regression: small NSNumbers and short
+        // NSStrings are TAGGED POINTERS (bit 63 set) — they would have
+        // panicked SmallInt::new under the named-slot idiom and been
+        // corrupted by an oop scan as raw words. In the byte tail they are
+        // just bytes.
+        let mut vm = boot_test_vm(JitMode::Off);
+        let n = vm
+            .eval("((Cocoa classNamed: 'NSNumber') send: 'numberWithInteger:' with: 42) sendI64: 'integerValue'")
+            .expect("tagged-pointer NSNumber round-trip");
+        assert_eq!(n.trim(), "42");
+        let s = vm
+            .eval("(Cocoa nsString: 'hi') sendString: 'uppercaseString'")
+            .expect("tagged-pointer NSString round-trip");
+        assert!(s.contains("HI"), "expected HI, got {s}");
+    }
+
+    #[test]
+    fn cocoa_c0_release_poisons_and_double_release_fails() {
+        let _serial = cocoa_serial();
+        let mut vm = boot_test_vm(JitMode::Off);
+        vm.exec("Object subclass: CocoaT [ <classVars: R> CocoaT class >> r: x [ R := x ] CocoaT class >> r [ ^R ] ]")
+            .expect("holder");
+        vm.exec("CocoaT r: (Cocoa nsString: 'poison me').")
+            .expect("wrap");
+        assert_eq!(vm.eval("CocoaT r isValid").unwrap().trim(), "true");
+        vm.exec("CocoaT r release.").expect("first release");
+        assert_eq!(vm.eval("CocoaT r isValid").unwrap().trim(), "false");
+        assert!(
+            vm.exec("CocoaT r sendString: 'description'.").is_err(),
+            "a send through a poisoned wrapper must raise"
+        );
+        assert!(
+            vm.exec("CocoaT r release.").is_err(),
+            "a double release must raise (leak-side bias, never over-release)"
+        );
+    }
+
+    #[test]
+    fn cocoa_c0_nsexception_is_caught_not_fatal() {
+        let _serial = cocoa_serial();
+        // An unrecognized ObjC selector throws NSInvalidArgumentException;
+        // the shim catches it, the prim fails, Smalltalk raises — and the
+        // VM keeps working afterwards.
+        let mut vm = boot_test_vm(JitMode::Off);
+        assert!(
+            vm.exec("(Cocoa nsString: 'x') send: 'thisSelectorDoesNotExistXyzzy'.")
+                .is_err(),
+            "the NSException must surface as a Smalltalk error"
+        );
+        assert_eq!(
+            vm.eval("3 + 4").expect("the VM must still work").trim(),
+            "7"
+        );
+    }
+
+    #[test]
+    fn cocoa_c0_wrap_release_counters_balance() {
+        let _serial = cocoa_serial();
+        let mut vm = boot_test_vm(JitMode::Off);
+        let (w0, r0) = crate::runtime::objc_bridge::counters();
+        vm.exec("(Cocoa nsString: 'one') release.").expect("1");
+        vm.exec("(Cocoa nsString: 'two') release.").expect("2");
+        vm.exec("(Cocoa nsString: 'three') release.").expect("3");
+        let (w1, r1) = crate::runtime::objc_bridge::counters();
+        assert_eq!(w1 - w0, 3, "three wraps");
+        assert_eq!(r1 - r0, 3, "three releases — balanced");
+    }
+
+    #[test]
+    fn cocoa_c0_wrappers_survive_gc_stress_churn() {
+        let _serial = cocoa_serial();
+        // The moving-GC gate: wrappers churn (and one stays live) while
+        // every allocation collects. The wrapper OOPS move constantly; the
+        // ids in their byte tails must not.
+        let mut vm = VmHandle::boot(
+            VmOptions {
+                heap_mib: 64,
+                gc_stress: true,
+                jit: JitMode::Off,
+                ..Default::default()
+            },
+            Path::new("world"),
+        )
+        .expect("gc-stress boot");
+        vm.exec("Object subclass: CocoaG [ <classVars: K> CocoaG class >> k: x [ K := x ] CocoaG class >> k [ ^K ] ]")
+            .expect("holder");
+        // A long-lived wrapper that will be moved by many collections…
+        vm.exec("CocoaG k: (Cocoa nsString: 'survivor').")
+            .expect("keep");
+        // …while churn wraps + releases around it.
+        for _ in 0..40 {
+            vm.exec("(Cocoa nsString: 'churn') release.")
+                .expect("churn");
+        }
+        let s = vm
+            .eval("CocoaG k sendString: 'uppercaseString'")
+            .expect("the survivor must still answer after heavy GC");
+        assert!(s.contains("SURVIVOR"), "got {s}");
+        vm.exec("CocoaG k release.").expect("tidy");
     }
 
     #[test]
