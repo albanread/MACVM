@@ -49,7 +49,8 @@ channel plus a wake hook, and the *send itself is the wake*.
   is concurrency *within one heap* — cooperative, shared-state, zero-copy.
   Workers are parallelism *across heaps* — preemptive (the OS schedules the
   threads), share-nothing. They are orthogonal and compose: a future S17
-  process could `Worker request:` without blocking its siblings.
+  process could sleep in `Worker runLoopWhile:` without blocking its
+  siblings.
 
 **Why copy-passing first?** It requires **zero changes to the VM core's
 execution model**. Each VM stays strictly single-threaded on its own OS
