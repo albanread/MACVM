@@ -1,0 +1,56 @@
+"37_dict_point_set_ext_tests.mst — DictPointSetExtTests: Dictionary/Point/Set
+ convenience added in world/56_dict_point_set_ext.mst."
+
+TestCase subclass: DictPointSetExtTests [
+    runAll [
+        self runTest: #testDictPresent do: [ self testDictPresent ].
+        self runTest: #testKeyAtValue do: [ self testKeyAtValue ].
+        self runTest: #testAssociations do: [ self testAssociations ].
+        self runTest: #testPointDist do: [ self testPointDist ].
+        self runTest: #testPointDot do: [ self testPointDot ].
+        self runTest: #testSetAlgebra do: [ self testSetAlgebra ].
+    ]
+
+    dict [ ^Dictionary new at: #a put: 1; at: #b put: 2; at: #c put: 3; yourself ]
+
+    testDictPresent [
+        self assert: (self dict at: #b ifPresent: [:v | v * 10 ]) = 20.
+        self assert: (self dict at: #z ifPresent: [:v | v ]) isNil.
+        self assert: (self dict at: #b ifPresent: [:v | v ] ifAbsent: [ -1 ]) = 2.
+        self assert: (self dict at: #z ifPresent: [:v | v ] ifAbsent: [ -1 ]) = -1.
+    ]
+
+    testKeyAtValue [
+        self assert: (self dict keyAtValue: 2) = #b.
+        self assert: (self dict keyAtValue: 99) isNil.
+    ]
+
+    testAssociations [
+        | assocs |
+        assocs := self dict associations.
+        self assert: assocs size = 3.
+        "every association's value is the dict's value for its key"
+        assocs do: [:a | self assert: (self dict at: a key) = a value ].
+    ]
+
+    testPointDist [
+        self assert: ((3@4) dist: (0@0)) = 5.0.
+        self assert: ((0@0) dist: (3@4)) = 5.0.
+        self assert: ((3@4) dist: (3@4)) = 0.0.
+    ]
+
+    testPointDot [
+        self assert: ((1@2) dotProduct: (3@4)) = 11.
+        self assert: ((2@3) dotProduct: (0@0)) = 0.
+    ]
+
+    testSetAlgebra [
+        | a b |
+        a := Set withAll: #(1 2 3).
+        b := Set withAll: #(2 3 4).
+        self assert: (a & b) asSortedCollection asArray = #(2 3).
+        self assert: (a | b) size = 4.
+        self assert: (a difference: b) asSortedCollection asArray = #(1).
+        self assert: (a intersection: b) asSortedCollection asArray = #(2 3).
+    ]
+]

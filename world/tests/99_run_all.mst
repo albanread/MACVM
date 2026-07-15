@@ -40,4 +40,5 @@ TestRunner run: CollectionExtTests.
 TestRunner run: StringStreamExtTests.
 TestRunner run: ObjectExtTests.
 TestRunner run: IterationExtTests.
+TestRunner run: DictPointSetExtTests.
 TestRunner report.

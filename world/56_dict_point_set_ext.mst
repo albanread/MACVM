@@ -1,0 +1,65 @@
+"56_dict_point_set_ext.mst — Dictionary / Point / Set convenience a probe found
+ missing, pure Smalltalk on the existing classes. Additive only (no existing
+ method changed); built on includesKey:/at:/keysDo:, Point x/y/squared/sqrt
+ (sqrt from world/51), and Set do:/includes:/add:/addAll:."
+
+HashedCollection subclass: Dictionary [
+    "Evaluate aBlock with the value at key if present; else answer nil."
+    at: key ifPresent: aBlock [
+        ^(self includesKey: key)
+            ifTrue: [ aBlock value: (self at: key) ]
+            ifFalse: [ nil ]
+    ]
+    at: key ifPresent: presentBlock ifAbsent: absentBlock [
+        ^(self includesKey: key)
+            ifTrue: [ presentBlock value: (self at: key) ]
+            ifFalse: [ absentBlock value ]
+    ]
+
+    "The first key mapping to aValue (=), or nil."
+    keyAtValue: aValue [
+        self keysDo: [:k | (self at: k) = aValue ifTrue: [ ^k ] ].
+        ^nil
+    ]
+
+    "The key->value associations, as an Array."
+    associations [
+        | result |
+        result := OrderedCollection new.
+        self keysDo: [:k | result add: (k -> (self at: k)) ].
+        ^result asArray
+    ]
+]
+
+Object subclass: Point [
+    "Euclidean distance to aPoint."
+    dist: aPoint [
+        ^((self x - aPoint x) squared + (self y - aPoint y) squared) sqrt
+    ]
+    dotProduct: aPoint [ ^(self x * aPoint x) + (self y * aPoint y) ]
+]
+
+HashedCollection subclass: Set [
+    "Set algebra — all answer a fresh Set."
+    & aCollection [
+        | result |
+        result := Set new.
+        self do: [:e | (aCollection includes: e) ifTrue: [ result add: e ] ].
+        ^result
+    ]
+    | aCollection [
+        | result |
+        result := Set new.
+        result addAll: self.
+        result addAll: aCollection.
+        ^result
+    ]
+    intersection: aCollection [ ^self & aCollection ]
+    union: aCollection [ ^self | aCollection ]
+    difference: aCollection [
+        | result |
+        result := Set new.
+        self do: [:e | (aCollection includes: e) ifFalse: [ result add: e ] ].
+        ^result
+    ]
+]
