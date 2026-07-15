@@ -156,9 +156,10 @@ pub fn scavenge_oop(vm: &mut VmState, oop: Oop) -> Oop {
     if addr >= vm.universe.to.start && addr < vm.universe.to.top {
         panic!(
             "scavenge_oop: handed a TO-SPACE address {addr:#x} mid-cycle \
-             (to=[{:#x},{:#x})) — double-copy imminent\n{}",
+             (to=[{:#x},{:#x})) during [{}] — double-copy imminent\n{}",
             vm.universe.to.start,
             vm.universe.to.top,
+            super::roots::ROOT_SECTION.with(|s| s.get()),
             std::backtrace::Backtrace::force_capture()
         );
     }
@@ -448,9 +449,20 @@ pub fn scavenge(vm: &mut VmState) -> Result<ScavengeReport, GcStallError> {
 
     // --- root scan (A3 step 3) ------------------------------------------
     if std::env::var("MACVM_DBG_ROOTS").is_ok() {
+        eprintln!(
+            "RDBG ===== scavenge #{} from=[{:#x},{:#x}) to=[{:#x},{:#x}) eden_used={} compiled_depth={}",
+            vm.universe.gc_stats.scavenge_count + 1,
+            vm.universe.from.start,
+            vm.universe.from.top,
+            vm.universe.to.start,
+            vm.universe.to.end,
+            eden_used_before,
+            vm.compiled_depth,
+        );
         audit_roots(vm);
     }
     super::roots::for_each_root(vm, scavenge_oop);
+    super::roots::section("dirty-cards");
     dirty_card_scan(vm, old_top_before);
 
     // S10/S11/S12 D4.1: nmethod/adapter/PIC/mega pool oops, AND (S12) any
@@ -473,6 +485,7 @@ pub fn scavenge(vm: &mut VmState) -> Result<ScavengeReport, GcStallError> {
         return Err(err);
     }
 
+    super::roots::section("cheney-trace");
     // --- Cheney fixed point (A3 step 4) ----------------------------------
     let mut to_scan = vm.universe.to.start;
     let mut old_scan = old_top_before;

@@ -48,17 +48,26 @@ use crate::runtime::vm_state::{InterpRegs, VmState};
 ///   has no materialized caller). At depth > 1 the header is the CALLER's resume
 ///   (where the caller picks up when the inlined callee returns), distinct from
 ///   this start bci.
-/// - `saved_activation` / `saved_regs` — the AMBIENT outer interpreter state
+/// - `saved_activation` — the AMBIENT outer stack activation (plain ints)
 ///   snapshotted at M2, BEFORE the M3 pushes clobbered `vm.stack.fp`/`sp`;
-///   `interpret_active` restores them after the run so a paused outer
+///   `interpret_active` restores it after the run so a paused outer
 ///   activation (the I→C→deopt case) resumes intact — the same reentrancy
 ///   guard `run_method_reentrant` performs at the C→I seam.
+///
+/// Deliberately NOT carried here: the ambient `vm.regs`. An `InterpRegs`
+/// copy holds `method` as a bare oop, and this struct lives ACROSS the M3–M6
+/// materializer, whose allocations can scavenge — the live `vm.regs.method`
+/// is kept current by the interp-regs-mirror root, but a copy in this struct
+/// is invisible to the root walker and goes stale (found live: GC_STRESS
+/// deltablue died on the scavenger's to-space tripwire two cycles after a
+/// deopt, via a handle minted FROM the stale copy). `interpret_active`
+/// snapshots `vm.regs` itself, at its own entry — after materialization,
+/// when the mirror-rooted value is GC-current.
 #[derive(Copy, Clone, Debug)]
 pub struct DeoptResume {
     pub base_sp: usize,
     pub resume_bci: usize,
     pub saved_activation: FrameActivation,
-    pub saved_regs: InterpRegs,
 }
 
 /// The compiled physical frame to deoptimize (`sprint_s13_detail.md` D5).
@@ -407,14 +416,15 @@ pub fn deoptimize_frame(vm: &mut VmState, frame: FrameView) -> DeoptResume {
     // ── M2: record the ProcessStack watermark. The nested run (M8) ends
     //    when the outermost frame's ENTRY_FRAME_SENTINEL return pops the
     //    stack back to here. Snapshot the AMBIENT outer interpreter state
-    //    (activation + regs) NOW, before the M3 pushes repoint
+    //    (activation only) NOW, before the M3 pushes repoint
     //    `vm.stack.fp`/`sp` — `interpret_active` restores it after the run so
     //    a paused outer activation (I→C→deopt) survives, the same reentrancy
-    //    guard `run_method_reentrant` applies at the C→I seam. `vm.regs`
-    //    holds `method` as a bare oop, re-rooted across the run there. ──────
+    //    guard `run_method_reentrant` applies at the C→I seam. The ambient
+    //    `vm.regs` is deliberately NOT copied here: a copy would sit un-rooted
+    //    across M3-M6 materializer allocations and go stale (DeoptResume's
+    //    own doc) — interpret_active snapshots it at its entry instead. ──────
     let base_sp = vm.stack.sp;
     let saved_activation = vm.stack.save_activation();
-    let saved_regs = vm.regs;
 
     // ── M3: push each virtual frame, outermost → innermost. ──────────────
     // `saved_fp` links each frame to the previous materialized frame's FP;
@@ -855,7 +865,6 @@ pub fn deoptimize_frame(vm: &mut VmState, frame: FrameView) -> DeoptResume {
         base_sp,
         resume_bci,
         saved_activation,
-        saved_regs,
     }
 }
 

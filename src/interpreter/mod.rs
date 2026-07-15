@@ -316,8 +316,18 @@ pub fn run_method_reentrant(
 /// return back INTO this frame would read; the live `dispatch_from` entry is
 /// what starts it running NOW — the two must agree, and both are M5's value).
 pub fn interpret_active(vm: &mut VmState, resume: DeoptResume) -> Oop {
+    // Snapshot the ambient outer regs HERE — after the materializer's
+    // allocations — never in `deoptimize_frame`. The live `vm.regs.method`
+    // is kept GC-current by the interp-regs-mirror root across every
+    // collection the materializer triggered; a copy taken BEFORE
+    // materialization (the old `DeoptResume.saved_regs`) sat un-rooted
+    // through those collections and went stale — the GC_STRESS deltablue
+    // to-space-tripwire bug: the handle below was then minted FROM the
+    // stale copy, laundering a dead address back into `vm.regs.method`
+    // after the run.
+    let saved_regs = vm.regs;
     let scope = crate::memory::handles::HandleScope::enter(vm);
-    let saved_method_h = resume.saved_regs.method.map(|m| scope.handle(vm, m.oop()));
+    let saved_method_h = saved_regs.method.map(|m| scope.handle(vm, m.oop()));
     // S24 A1: mark the deopt-resume window (see VmState::deopt_resume_depth).
     vm.deopt_resume_depth += 1;
 
@@ -347,7 +357,7 @@ pub fn interpret_active(vm: &mut VmState, resume: DeoptResume) -> Oop {
         resume.base_sp
     );
     vm.stack.restore_activation(resume.saved_activation);
-    vm.regs = resume.saved_regs;
+    vm.regs = saved_regs;
     if let Some(h) = saved_method_h {
         // Post-run the heap is coherent (any nested collection has completed),
         // so validating `try_from` is fine here — same as `run_method_reentrant`.

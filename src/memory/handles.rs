@@ -162,6 +162,30 @@ impl HandleScope {
             vm.handle_arena.gen.push(0);
             0
         };
+        if std::env::var("MACVM_DBG_ROOTS").is_ok() {
+            eprintln!(
+                "RDBG handle-create [{index}] = {:#x} (scav#{})",
+                val.as_oop().raw(),
+                vm.universe.gc_stats.scavenge_count,
+            );
+            // Catch a stale capture at its source: a mem oop whose mark word
+            // no longer parses as a live header was already collected/moved —
+            // the caller is holding a pre-GC Rust-side copy.
+            let o = val.as_oop();
+            if o.is_mem() {
+                let m = crate::oops::wrappers::MemOop::try_from(o).unwrap();
+                let w = m.mark_word_raw();
+                let plausible = w & crate::oops::layout::TAG_MASK == crate::oops::layout::MARK_TAG
+                    && w & 0b100 != 0;
+                if !plausible {
+                    eprintln!(
+                        "RDBG handle-create STALE CAPTURE [{index}] = {:#x}\n{}",
+                        o.raw(),
+                        std::backtrace::Backtrace::force_capture()
+                    );
+                }
+            }
+        }
         vm.handle_arena.slots.push(val.as_oop());
         Handle {
             index: index as u32,

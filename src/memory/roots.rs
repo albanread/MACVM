@@ -32,11 +32,25 @@ use crate::runtime::vm_state::VmState;
 /// needs it for `to`-space bookkeeping; a full GC's mark-push and
 /// forward-chase transforms don't touch `vm`, but share the signature so one
 /// generic walker serves all three collector-supplied transforms.
+thread_local! {
+    /// Which root section is currently being walked — purely diagnostic:
+    /// the scavenger's to-space tripwire (`scavenge_oop`) includes it in its
+    /// panic so a bad root names its own family instead of just a raw
+    /// address. One store per section per collection; costs nothing.
+    pub static ROOT_SECTION: std::cell::Cell<&'static str> =
+        const { std::cell::Cell::new("<not in a root walk>") };
+}
+
+pub(crate) fn section(label: &'static str) {
+    ROOT_SECTION.with(|s| s.set(label));
+}
+
 pub fn for_each_root<F>(vm: &mut VmState, mut f: F)
 where
     F: FnMut(&mut VmState, Oop) -> Oop,
 {
     // --- well-known singleton oops -----------------------------------------
+    section("universe-singletons");
     let o = vm.universe.nil_obj;
     vm.universe.nil_obj = f(vm, o);
     let o = vm.universe.true_obj;
@@ -46,6 +60,7 @@ where
     let o = vm.universe.smalltalk;
     vm.universe.smalltalk = f(vm, o);
 
+    section("well-known-selectors");
     // --- well-known selectors (separate Universe-field copies of Symbols
     // already covered by the symbol-table root below — S7-10 root-scan gap:
     // these dangle on their own after the first collection otherwise) ------
@@ -80,6 +95,7 @@ where
         sel_cannot_return
     );
 
+    section("well-known-klasses");
     // --- well-known klasses --------------------------------------------------
     macro_rules! root_klass {
         ($($field:ident),* $(,)?) => {
@@ -132,6 +148,7 @@ where
         system_dictionary_klass,
     );
 
+    section("symbol-table");
     // --- symbol table (probed by content hash — bucket positions never
     // depend on address, so this is an in-place UPDATE for every collector,
     // never a flush; see fullgc.rs's phase-C table for why that matters) ----
@@ -142,6 +159,7 @@ where
         }
     }
 
+    section("process-stack");
     // --- process stack: every live slot 0..sp. Smi-encoded saved_fp/bci
     // links pass through any of the three transforms unchanged (none of
     // scavenge_oop/mark-push/forward-chase touch a non-mem oop) — SPEC
@@ -153,6 +171,7 @@ where
         vm.stack.set(i, nv);
     }
 
+    section("handle-arena");
     // --- handle arena: every slot 0..len (SPEC §7.6). Never truncated by
     // any collector, only by `HandleScope::drop` — rewritten in place. -----
     let n = vm.handle_arena.len();
@@ -166,6 +185,7 @@ where
         vm.handle_arena.slots_mut()[i] = nv;
     }
 
+    section("cocoa-mint-stack");
     // --- Cocoa C4 mint-list stack: each entry is a live Array oop the
     // bridge appends freshly minted ObjcRefs to inside a `poolDo:` scope
     // (vm_state.rs `cocoa_mint_stack`). Rewritten in place, exactly the
@@ -177,6 +197,7 @@ where
         vm.cocoa_mint_stack[i] = nv;
     }
 
+    section("interp-regs-mirror");
     // --- interpreter regs mirror: `vm.regs.method`, a second copy of the
     // executing frame's method the process-stack scan doesn't reach
     // (S7-10) --------------------------------------------------------------
@@ -234,6 +255,7 @@ pub fn each_code_root<F>(vm: &mut VmState, include_key_klass: bool, mut f: F)
 where
     F: FnMut(&mut VmState, Oop) -> Oop,
 {
+    section("compiled-frame-slots+rootspill");
     // --- 1. native frame roots: compiled spill slots + adapter RootSpill
     // slots. Collected into an owned `Vec` FIRST, exactly like
     // `frames.rs`'s own test module does: `walk_frames` only ever hands out
@@ -377,11 +399,13 @@ where
         }
     }
 
+    section("code-tables-oops");
     // --- 2. code-embedded oops: the four tables' own existing `oops_do`/
     // `update_keys`/`rehash` methods (S10/S11, already correct for both
     // collectors since S11 step 10's scavenge-key fix) — bridged to `f`'s
     // `(vm, Oop) -> Oop` shape via the take-and-restore dance explained in
     // this function's own doc comment above. --------------------------
+    section("code-table");
     let mut code_table = std::mem::take(&mut vm.code_table);
     code_table.oops_do(include_key_klass, &mut |word| {
         *word = f(vm, Oop::from_raw(*word)).raw();
@@ -390,12 +414,14 @@ where
     code_table.rehash();
     vm.code_table = code_table;
 
+    section("adapter-table");
     let mut adapters = std::mem::take(&mut vm.adapters);
     adapters.oops_do(&mut |word| {
         *word = f(vm, Oop::from_raw(*word)).raw();
     });
     vm.adapters = adapters;
 
+    section("pic-table");
     let mut pic_table = std::mem::take(&mut vm.pic_table);
     #[cfg(debug_assertions)]
     if std::env::var("MACVM_DBGPIC").is_ok() {
@@ -407,6 +433,7 @@ where
     pic_table.update_keys(&mut |oop| f(vm, oop));
     vm.pic_table = pic_table;
 
+    section("mega-table");
     let mut mega_table = std::mem::take(&mut vm.mega_table);
     mega_table.oops_do(&mut |word| {
         *word = f(vm, Oop::from_raw(*word)).raw();
