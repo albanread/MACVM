@@ -146,13 +146,51 @@ impl Theme {
     }
 
     /// The monochrome silhouette set (`assets/icons-mono/`) the toolbar's
-    /// `currentColor`-masked spans use (`toolbar_html`). Separate from
-    /// `icon_url`'s colored hidef set on purpose: masking needs glyph-only
-    /// alpha (the hidef icons carry an opaque background card, which a mask
-    /// renders as a solid blob), while smappl `<img>` icons still want the
-    /// colored set.
-    fn mono_icon_url(icon: &str) -> String {
-        gui_file_url(&format!("assets/icons-mono/{icon}.svg"))
+    /// `currentColor`-masked spans use (`toolbar_html`), embedded at compile
+    /// time and served as a `data:` URI. Separate from `icon_url`'s colored
+    /// hidef set on purpose: masking needs glyph-only alpha (the hidef icons
+    /// carry an opaque background card, which a mask renders as a solid
+    /// blob), while smappl `<img>` icons still want the colored set. A `data:`
+    /// URI rather than a `file://` one because WKWebView does NOT load CSS
+    /// mask-image subresources from file:// pages (a blocked mask masks
+    /// everything away — the icons simply vanish in the real app, while an
+    /// http-served harness shows them fine).
+    fn mono_icon_data_url(icon: &str) -> Option<String> {
+        let svg = match icon {
+            "goBack" => include_str!("../assets/icons-mono/goBack.svg"),
+            "goForward" => include_str!("../assets/icons-mono/goForward.svg"),
+            "home" => include_str!("../assets/icons-mono/home.svg"),
+            "open" => include_str!("../assets/icons-mono/open.svg"),
+            "implementors" => include_str!("../assets/icons-mono/implementors.svg"),
+            "senders" => include_str!("../assets/icons-mono/senders.svg"),
+            "userHierarchy" => include_str!("../assets/icons-mono/userHierarchy.svg"),
+            "hierarchy" => include_str!("../assets/icons-mono/hierarchy.svg"),
+            "blankSheet" => include_str!("../assets/icons-mono/blankSheet.svg"),
+            "texteditor" => include_str!("../assets/icons-mono/texteditor.svg"),
+            "documentation" => include_str!("../assets/icons-mono/documentation.svg"),
+            "abstract" => include_str!("../assets/icons-mono/abstract.svg"),
+            "refresh" => include_str!("../assets/icons-mono/refresh.svg"),
+            "smallerText" => include_str!("../assets/icons-mono/smallerText.svg"),
+            "biggerText" => include_str!("../assets/icons-mono/biggerText.svg"),
+            _ => return None,
+        };
+        // Minimal percent-encoding for a data: URI that must survive inside
+        // url('…') inside a double-quoted HTML style attribute.
+        let mut enc = String::with_capacity(svg.len() * 2);
+        for c in svg.trim().chars() {
+            match c {
+                '%' => enc.push_str("%25"),
+                '#' => enc.push_str("%23"),
+                '"' => enc.push_str("%22"),
+                '<' => enc.push_str("%3C"),
+                '>' => enc.push_str("%3E"),
+                '\'' => enc.push_str("%27"),
+                '\n' => enc.push_str("%0A"),
+                ' ' => enc.push_str("%20"),
+                other => enc.push(other),
+            }
+        }
+        Some(format!("data:image/svg+xml,{enc}"))
     }
 }
 
@@ -479,15 +517,15 @@ fn toolbar_html(theme: Theme) -> String {
             // chrome_layout_style), so each icon takes that theme's own ink
             // colour automatically — no per-theme filter, and nothing left
             // hidef-blue or crushed to black.
-            let glyph = if theme == Theme::Classic {
-                let icon_url = theme.icon_url(icon);
-                format!("<img src=\"{icon_url}\" alt=\"{title}\">")
-            } else {
-                let icon_url = Theme::mono_icon_url(icon);
-                format!(
+            let glyph = match Theme::mono_icon_data_url(icon) {
+                Some(data_url) if theme != Theme::Classic => format!(
                     "<span class=\"st-ico\" role=\"img\" aria-label=\"{title}\" \
-                     style=\"-webkit-mask-image:url('{icon_url}');mask-image:url('{icon_url}')\"></span>"
-                )
+                     style=\"-webkit-mask-image:url('{data_url}');mask-image:url('{data_url}')\"></span>"
+                ),
+                _ => {
+                    let icon_url = theme.icon_url(icon);
+                    format!("<img src=\"{icon_url}\" alt=\"{title}\">")
+                }
             };
             format!("<button class=\"st-toolbtn\" data-action=\"{action}\" title=\"{title}\">{glyph}</button>")
         })
@@ -903,7 +941,7 @@ mod tests {
         );
         let hidef_toolbar = toolbar_html(Theme::HiDef);
         assert!(
-            hidef_toolbar.contains("assets/icons-mono/home.svg")
+            hidef_toolbar.contains("data:image/svg+xml")
                 && hidef_toolbar.contains("mask-image"),
             "{hidef_toolbar}"
         );
@@ -929,7 +967,7 @@ mod tests {
                 );
             } else {
                 assert!(
-                    toolbar.contains("assets/icons-mono/home.svg")
+                    toolbar.contains("data:image/svg+xml")
                         && toolbar.contains("st-ico"),
                     "{theme:?}: {toolbar}"
                 );
