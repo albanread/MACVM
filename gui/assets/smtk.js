@@ -995,14 +995,42 @@
     true
   );
 
+  // Collapse every currently-expanded outliner node back to its glyph-closed
+  // state (mirrors the .st-header click toggle above, in reverse, for the
+  // whole page). A node is collapsible only if its header carries a ▾/▸
+  // twist glyph AND it has a .st-children subtree — leaf rows and editor
+  // panes have no glyph and are left alone.
+  function collapseAllOutliners() {
+    var n = 0;
+    document.querySelectorAll(".st-node").forEach(function (node) {
+      var header = node.querySelector(":scope > .st-header");
+      if (!header) return;
+      var tw = header.querySelector(":scope > .st-tw[data-tw]");
+      var children = node.querySelector(":scope > .st-children");
+      if (tw && children && children.style.display !== "none") {
+        children.style.display = "none";
+        tw.innerHTML = "▸ ";
+        n++;
+      }
+    });
+    return n;
+  }
+
   document.addEventListener("keydown", function (ev) {
-    if (ev.key === "Escape") {
+    if (ev.key !== "Escape") return;
+    // Escape unwinds the topmost transient thing: an open context menu or
+    // modal overlay (Visual>>promptOk:) takes priority; only when none is
+    // open does Escape collapse the class outliner.
+    var hadMenu = !!activeContextMenu;
+    var modals = document.querySelectorAll(".st-modal");
+    if (hadMenu || modals.length) {
       closeContextMenu();
-      // Esc also dismisses an open modal dialog overlay (Visual>>promptOk:).
-      document.querySelectorAll(".st-modal").forEach(function (m) {
+      modals.forEach(function (m) {
         m.remove();
       });
+      return;
     }
+    collapseAllOutliners();
   });
 
   // ── smappl widgets (../smappl.md, ../src/preprocess.rs) ────────────────
