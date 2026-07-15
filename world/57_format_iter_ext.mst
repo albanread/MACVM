@@ -1,0 +1,113 @@
+"57_format_iter_ext.mst — number formatting + collection extras a probe found
+ missing, pure Smalltalk on the existing classes. Built on rounded/printString/
+ streamContents:/\\ ///at:put:/do:/addAll:/at:ifAbsentPut:/removeFirst/reverseDo:."
+
+Magnitude subclass: Number [
+    "Round to the nearest multiple of aNumber (e.g. 3.14159 roundTo: 0.01 -> 3.14)."
+    roundTo: aNumber [ ^(self / aNumber) rounded * aNumber ]
+
+    "printString left-padded with aChar to at least width characters."
+    printPaddedWith: aChar to: width [
+        | s |
+        s := self printString.
+        ^String streamContents: [:str |
+            (width - s size) timesRepeat: [ str nextPut: aChar ].
+            str nextPutAll: s ]
+    ]
+]
+
+Number subclass: Fraction [
+    "Rounding, missing on Fraction (only truncated existed) — needed by
+     roundTo: when the quotient is fractional (e.g. 17 roundTo: 5). floor
+     uses // (which already floors); ceiling and rounded build on it."
+    floor [ ^self numerator // self denominator ]
+    ceiling [ ^self negated floor negated ]
+    "round-half-up, in pure INTEGER arithmetic: floor((2n + d) / 2d). Done
+     this way (not `(self + 1/2) truncated`) to sidestep the VM's mixed
+     Fraction arithmetic coercion gap — denominator is always positive."
+    rounded [ ^((2 * self numerator) + self denominator) // (2 * self denominator) ]
+]
+
+Number subclass: Integer [
+    "This integer written in the given radix (2..36), e.g. 255 printString: 16 -> 'ff'."
+    printString: radix [
+        | n neg chars stack |
+        self = 0 ifTrue: [ ^'0' ].
+        n := self abs. neg := self < 0.
+        chars := '0123456789abcdefghijklmnopqrstuvwxyz'.
+        stack := OrderedCollection new.
+        [ n > 0 ] whileTrue: [
+            stack addFirst: (chars at: (n \\ radix) + 1).
+            n := n // radix ].
+        ^String streamContents: [:s |
+            neg ifTrue: [ s nextPut: $- ].
+            stack do: [:c | s nextPut: c ] ]
+    ]
+]
+
+Object subclass: Collection [
+    "collect: each element to a collection, then concatenate them all."
+    flatCollect: aBlock [
+        | result |
+        result := OrderedCollection new.
+        self do: [:e | result addAll: (aBlock value: e) ].
+        ^result asArray
+    ]
+
+    "The element for which aBlock answers the largest / smallest value."
+    detectMax: aBlock [
+        | best bestVal any |
+        any := false.
+        self do: [:e | | v |
+            v := aBlock value: e.
+            (any not or: [ v > bestVal ]) ifTrue: [ best := e. bestVal := v. any := true ] ].
+        ^best
+    ]
+    detectMin: aBlock [
+        | best bestVal any |
+        any := false.
+        self do: [:e | | v |
+            v := aBlock value: e.
+            (any not or: [ v < bestVal ]) ifTrue: [ best := e. bestVal := v. any := true ] ].
+        ^best
+    ]
+
+    "Partition into a Dictionary keyed by aBlock's value, each value an
+     OrderedCollection of the elements that produced that key."
+    groupBy: aBlock [
+        | groups |
+        groups := Dictionary new.
+        self do: [:e | (groups at: (aBlock value: e) ifAbsentPut: [ OrderedCollection new ]) add: e ].
+        ^groups
+    ]
+]
+
+Collection subclass: SequenceableCollection [
+    "Replace every element equal to oldObject with newObject, in place."
+    replaceAll: oldObject with: newObject [
+        1 to: self size do: [:i |
+            (self at: i) = oldObject ifTrue: [ self at: i put: newObject ] ].
+        ^self
+    ]
+]
+
+SequenceableCollection subclass: OrderedCollection [
+    "Insert every element of aCollection at the front, order preserved."
+    addAllFirst: aCollection [
+        aCollection reverseDo: [:e | self addFirst: e ].
+        ^aCollection
+    ]
+    "Remove and answer the first / last n elements."
+    removeFirst: n [
+        | result |
+        result := OrderedCollection new.
+        n timesRepeat: [ result add: self removeFirst ].
+        ^result
+    ]
+    removeLast: n [
+        | result |
+        result := OrderedCollection new.
+        n timesRepeat: [ result add: self removeLast ].
+        ^result
+    ]
+]

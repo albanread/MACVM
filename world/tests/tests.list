@@ -41,4 +41,5 @@ tier1.mst
 35_object_ext_tests.mst
 36_iteration_ext_tests.mst
 37_dict_point_set_ext_tests.mst
+38_format_iter_ext_tests.mst
 99_run_all.mst
