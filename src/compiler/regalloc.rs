@@ -682,9 +682,9 @@ pub fn compute_intervals(
     )
 }
 
-/// x0–x15 (`arm64.md` §3); x16/x17 scratch, x18 platform, x19–x23 unused
-/// in v1, x24–x28 VM registers, x29/x30/sp — none of those are
-/// allocatable.
+/// x0–x15 (`arm64.md` §3); x16/x17 scratch, x18 platform, x19/x20 alloc
+/// scratch, x21–x27 the S14 residency pool (below), x28 = &VmState,
+/// x29/x30/sp — none of those are linear-scan allocatable.
 const NUM_ALLOCATABLE_REGS: u8 = 16;
 /// Float fast-path FP pool: `d0`–`d7`, caller-saved scratch — zero
 /// prologue/epilogue cost, clobbered by any call, which is safe because a
@@ -710,13 +710,16 @@ const NUM_FP_ALLOCATABLE_REGS: u8 = 8;
 /// variables win the registers. The slot stays canonical (write-through); see
 /// [`LiveInterval::resident_reg`].
 pub fn assign_residents(intervals: &mut [LiveInterval]) {
-    // Base pool: x21–x23 (callee-saved, never touched by emit's scratches
-    // x16/x17/x19/x20 or the ABI paths). EXTENDED by every x6–x15 register
-    // the main allocator left GLOBALLY unused in this method — in the
-    // spill-heavy hot methods residency exists for, nearly all of them (the
-    // whole point is that spill-all left the register file idle). x0–x5 stay
-    // out (ABI argument/result/alloc-slow paths write them mid-body).
-    let mut pool: Vec<u8> = vec![21, 22, 23];
+    // Base pool: x21–x27 (callee-saved, never touched by emit's scratches
+    // x16/x17/x19/x20 or the ABI paths; x24–x27 had no role of MACVM's own —
+    // VMregisters.md — and build_call_stub already saves the whole x19–x28
+    // bank at the boundary, so claiming them here costs nothing anywhere).
+    // EXTENDED by every x6–x15 register the main allocator left GLOBALLY
+    // unused in this method — in the spill-heavy hot methods residency exists
+    // for, nearly all of them (the whole point is that spill-all left the
+    // register file idle). x0–x5 stay out (ABI argument/result/alloc-slow
+    // paths write them mid-body).
+    let mut pool: Vec<u8> = vec![21, 22, 23, 24, 25, 26, 27];
     let mut reg_used = [false; NUM_ALLOCATABLE_REGS as usize];
     for iv in intervals.iter() {
         // An fp interval's Reg(n) names dN, not xN — a different file
