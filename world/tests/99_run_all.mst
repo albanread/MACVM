@@ -38,4 +38,5 @@ TestRunner run: NilMacroTests.
 TestRunner run: NumberExtTests.
 TestRunner run: CollectionExtTests.
 TestRunner run: StringStreamExtTests.
+TestRunner run: ObjectExtTests.
 TestRunner report.

@@ -1,0 +1,64 @@
+"35_object_ext_tests.mst — ObjectExtTests: the small Object/Boolean/Character/
+ Symbol/String conveniences added in world/54_object_ext.mst."
+
+TestCase subclass: ObjectExtTests [
+    runAll [
+        self runTest: #testAsString do: [ self testAsString ].
+        self runTest: #testPrintReturnsSelf do: [ self testPrintReturnsSelf ].
+        self runTest: #testBooleanLogic do: [ self testBooleanLogic ].
+        self runTest: #testCharacterTo do: [ self testCharacterTo ].
+        self runTest: #testSymbolNumArgs do: [ self testSymbolNumArgs ].
+        self runTest: #testStringWith do: [ self testStringWith ].
+    ]
+
+    testAsString [
+        self assert: 3 asString = '3'.
+        self assert: (3/4) asString = '3/4'.
+        self assert: nil asString = 'nil'.
+        self assert: true asString = 'true'.
+        "String and Symbol keep their own (more specific) asString"
+        self assert: 'hi' asString = 'hi'.
+        self assert: #foo asString = 'foo'.
+    ]
+
+    "printNl/displayNl print AND answer the receiver."
+    testPrintReturnsSelf [
+        self assert: (3 printNl) = 3.
+        self assert: (42 displayNl) = 42.
+        self assert: ('x' printNl) = 'x'.
+    ]
+
+    testBooleanLogic [
+        self assert: (true xor: false).
+        self deny: (true xor: true).
+        self deny: (false xor: false).
+        self assert: (false xor: true).
+        self assert: (true eqv: true).
+        self assert: (false eqv: false).
+        self deny: (true eqv: false).
+    ]
+
+    testCharacterTo [
+        | cs |
+        cs := $a to: $e.
+        self assert: cs size = 5.
+        self assert: cs first = $a.
+        self assert: cs last = $e.
+        self assert: ($a to: $c) = #($a $b $c).
+        self assert: ($a to: $a) size = 1.
+    ]
+
+    testSymbolNumArgs [
+        self assert: #foo numArgs = 0.
+        self assert: #foo:bar: numArgs = 2.
+        self assert: #at:put: numArgs = 2.
+        self assert: #+ numArgs = 1.
+        self assert: #<= numArgs = 1.
+    ]
+
+    testStringWith [
+        self assert: (String with: $h with: $i) = 'hi'.
+        self assert: (String with: $a with: $b with: $c) = 'abc'.
+        self assert: (String with: $a with: $b with: $c with: $d) = 'abcd'.
+    ]
+]

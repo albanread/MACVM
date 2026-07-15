@@ -1,0 +1,55 @@
+"54_object_ext.mst — small Object/Boolean/Character/Symbol/String conveniences a
+ probe found missing, all pure Smalltalk on the existing classes. Reopens each
+ with its correct superclass header; built on printString/displayString/Transcript,
+ Character asInteger/value:, Interval collect:, and String new:/at:put:."
+
+nil subclass: Object [
+    "Print-and-return-self conveniences (the classic REPL/debug helpers)."
+    printNl [ Transcript showCr: self printString. ^self ]
+    displayNl [ Transcript showCr: self displayString. ^self ]
+
+    "A plain-text rendering. String/Symbol keep their own (return self / the
+     bare characters); everything else falls back to displayString here."
+    asString [ ^self displayString ]
+]
+
+Object subclass: Boolean [
+    xor: aBoolean [ ^(self = aBoolean) not ]
+    eqv: aBoolean [ ^self = aBoolean ]
+]
+
+Magnitude subclass: Character [
+    "An Array of the characters from self up to aCharacter inclusive."
+    to: aCharacter [
+        ^(self asInteger to: aCharacter asInteger) collect: [:i | Character value: i ]
+    ]
+]
+
+String subclass: Symbol [
+    "The number of arguments this selector takes: keyword selectors count
+     their colons, a binary selector is 1, a unary selector is 0."
+    numArgs [
+        | s colons |
+        s := self asString.
+        s isEmpty ifTrue: [ ^0 ].
+        colons := 0.
+        s do: [:c | c = $: ifTrue: [ colons := colons + 1 ] ].
+        colons > 0 ifTrue: [ ^colons ].
+        (s at: 1) isLetter ifTrue: [ ^0 ].
+        ^1
+    ]
+]
+
+ArrayedCollection subclass: String [
+    "Fixed constructors mirroring Array's — String only had the 1-arg with:."
+    String class >> with: a with: b [
+        | s | s := self new: 2. s at: 1 put: a. s at: 2 put: b. ^s
+    ]
+    String class >> with: a with: b with: c [
+        | s | s := self new: 3. s at: 1 put: a. s at: 2 put: b. s at: 3 put: c. ^s
+    ]
+    String class >> with: a with: b with: c with: d [
+        | s | s := self new: 4.
+        s at: 1 put: a. s at: 2 put: b. s at: 3 put: c. s at: 4 put: d. ^s
+    ]
+]
