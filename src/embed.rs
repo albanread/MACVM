@@ -1266,14 +1266,17 @@ mod tests {
         );
     }
 
-    /// A `visual=` shape not yet buildable (needs a later Phase-W wave — the
-    /// `CodeView` substrate) surfaces as `Err`, so the GUI falls back to the
-    /// G0 placeholder box rather than breaking the page.
+    /// A `visual=` shape that doesn't resolve to a real widget class surfaces
+    /// as `Err`, so the GUI falls back to the G0 placeholder box rather than
+    /// breaking the page. (Originally probed `CodeView`, which was since built
+    /// — the contract is graceful failure for ANY unbuildable shape, so this
+    /// now names a class that will never exist, keeping the test independent of
+    /// which widgets happen to be implemented.)
     #[test]
     fn render_fragment_unbuilt_shape_is_err_not_panic() {
         let mut vm = boot_test_vm(JitMode::Off);
         let err = vm
-            .render_fragment("CodeView forString")
+            .render_fragment("NoSuchWidgetClass forString")
             .expect_err("an unbuilt widget shape must fail, not render");
         match err {
             GuestError::Compile(_) | GuestError::RuntimeError(_) => {}
