@@ -62,10 +62,21 @@ semantics are Smalltalk-80 throughout, exactly as they were in Strongtalk.</p>
 	<code>WKWebView</code> and renders the interface as HTML.</p></li>
 
 	<li><p align="left"><strong>Native / green threads with async C
-	callouts.</strong> Not yet. The FFI is synchronous Tier-1 POSIX
-	(<code>dlsym</code> + shape-keyed trampolines + an <code>Alien</code>
-	raw-memory type); Tier-2 Cocoa dispatch and concurrency are future
-	work.</p></li>
+	callouts.</strong> Different shape, same power. Strongtalk multiplexed
+	green threads inside one image; MACVM keeps each VM strictly
+	single-threaded and gets its concurrency by running <em>multiple whole
+	VMs</em>, each on its own native thread with its own heap &mdash; a
+	primary and up to 16 workers exchanging deep-copied messages
+	(<code>Worker spawn:</code> / <code>send:onReply:</code>, star
+	topology, no shared state; the <em>parallel workers</em> Mandelbrot
+	demo computes every frame in bands across 4 VMs). C callouts are
+	synchronous by design: Tier-1 POSIX FFI (<code>dlsym</code> +
+	shape-keyed trampolines + an <code>Alien</code> raw-memory type) plus
+	the full Cocoa bridge &mdash; Objective-C messages as ordinary keyword
+	sends, AppKit across the main-thread hop, and button callbacks
+	arriving as ordinary queued messages between doits (see
+	<a href="../cocoa.html">Cocoa from Smalltalk</a>). A blocking callout
+	parks only its own VM; the others keep running.</p></li>
 </ul>
 
 <h3 align="left">What is new</h3>
