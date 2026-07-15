@@ -43,6 +43,28 @@ pub enum Theme {
     /// Xerox Alto/Star, the monochrome bitmap-display era Smalltalk itself
     /// was born on (1970s-early 80s) — `assets/alto-mono.css`.
     AltoMono,
+    /// Self — the direct ancestor (README's Self→Strongtalk lineage) and the
+    /// birthplace of the outliner UI; warm-gray Sun-workstation look —
+    /// `assets/self.css`.
+    SelfLang,
+    /// Smalltalk-80 "Blue Book" — the canonical original: 1-bit black-on-white
+    /// with dithered gray and the Blue Book's blue — `assets/smalltalk80.css`.
+    Smalltalk80,
+    /// Pharo — today's mainstream living Smalltalk; modern flat blue/graphite —
+    /// `assets/pharo.css`.
+    Pharo,
+    /// BYTE, August 1981 — the issue that introduced Smalltalk-80 (the balloon
+    /// cover); warm cream-paper palette — `assets/byte81.css`.
+    Byte81,
+    /// Solarized Light — Ethan Schoonover's beloved code palette —
+    /// `assets/solarized-light.css`.
+    SolarizedLight,
+    /// Solarized Dark — the dark half of the Solarized pair —
+    /// `assets/solarized-dark.css`.
+    SolarizedDark,
+    /// High Contrast — an accessibility theme: maximum contrast, larger type —
+    /// `assets/high-contrast.css`.
+    HighContrast,
 }
 
 impl Theme {
@@ -50,7 +72,7 @@ impl Theme {
     /// source of truth `main.rs::build_theme_menu` walks to build the menu
     /// and the checkmark list, so adding a theme never means updating two
     /// separate lists by hand.
-    pub const ALL: [Theme; 7] = [
+    pub const ALL: [Theme; 14] = [
         Theme::Classic,
         Theme::HiDef,
         Theme::Dark,
@@ -58,6 +80,13 @@ impl Theme {
         Theme::CrtGreen,
         Theme::Squeak,
         Theme::AltoMono,
+        Theme::SelfLang,
+        Theme::Smalltalk80,
+        Theme::Pharo,
+        Theme::Byte81,
+        Theme::SolarizedLight,
+        Theme::SolarizedDark,
+        Theme::HighContrast,
     ];
 
     /// Parse a CLI theme name (case-insensitive, dashes optional) — used by
@@ -86,6 +115,13 @@ impl Theme {
             Theme::CrtGreen => "CRT Green",
             Theme::Squeak => "Squeak Morphic",
             Theme::AltoMono => "Alto Mono",
+            Theme::SelfLang => "Self",
+            Theme::Smalltalk80 => "Smalltalk-80",
+            Theme::Pharo => "Pharo",
+            Theme::Byte81 => "BYTE 1981",
+            Theme::SolarizedLight => "Solarized Light",
+            Theme::SolarizedDark => "Solarized Dark",
+            Theme::HighContrast => "High Contrast",
         }
     }
 
@@ -98,6 +134,13 @@ impl Theme {
             Theme::CrtGreen => "assets/crt-green.css",
             Theme::Squeak => "assets/squeak.css",
             Theme::AltoMono => "assets/alto-mono.css",
+            Theme::SelfLang => "assets/self.css",
+            Theme::Smalltalk80 => "assets/smalltalk80.css",
+            Theme::Pharo => "assets/pharo.css",
+            Theme::Byte81 => "assets/byte81.css",
+            Theme::SolarizedLight => "assets/solarized-light.css",
+            Theme::SolarizedDark => "assets/solarized-dark.css",
+            Theme::HighContrast => "assets/high-contrast.css",
         }
     }
 
@@ -872,7 +915,7 @@ mod tests {
 
     #[test]
     fn theme_all_has_no_duplicate_stylesheets_and_matches_its_own_length() {
-        assert_eq!(Theme::ALL.len(), 7);
+        assert_eq!(Theme::ALL.len(), 14);
         let mut paths: Vec<&str> = Theme::ALL
             .iter()
             .map(|t| t.stylesheet_relative_path())
