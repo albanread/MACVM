@@ -166,6 +166,17 @@ where
         vm.handle_arena.slots_mut()[i] = nv;
     }
 
+    // --- Cocoa C4 mint-list stack: each entry is a live Array oop the
+    // bridge appends freshly minted ObjcRefs to inside a `poolDo:` scope
+    // (vm_state.rs `cocoa_mint_stack`). Rewritten in place, exactly the
+    // handle-arena pattern. --------------------------------------------
+    let n = vm.cocoa_mint_stack.len();
+    for i in 0..n {
+        let v = vm.cocoa_mint_stack[i];
+        let nv = f(vm, v);
+        vm.cocoa_mint_stack[i] = nv;
+    }
+
     // --- interpreter regs mirror: `vm.regs.method`, a second copy of the
     // executing frame's method the process-stack scan doesn't reach
     // (S7-10) --------------------------------------------------------------

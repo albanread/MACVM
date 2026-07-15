@@ -299,7 +299,9 @@ pub fn wrap(vm: &mut VmState, id: *mut c_void) -> Oop {
     if vm.options.trace.is_enabled("cocoa") {
         let _ = writeln!(vm.out, "[cocoa] wrap {:p}", id);
     }
-    b.oop()
+    let o = b.oop();
+    mint_note(vm, o);
+    o
 }
 use std::io::Write;
 
@@ -379,7 +381,9 @@ pub fn wrap_owned(vm: &mut VmState, id: *mut c_void) -> Oop {
     if vm.options.trace.is_enabled("cocoa") {
         let _ = writeln!(vm.out, "[cocoa] wrap {:p} (already owned, no retain)", id);
     }
-    b.oop()
+    let o = b.oop();
+    mint_note(vm, o);
+    o
 }
 
 /// The init-family receiver transfer (design §3.2): after a successful
@@ -1194,5 +1198,164 @@ mod tests {
             parse_type_encoding("@24@0:8f16").unwrap().args,
             vec![ObjcArg::F32]
         );
+    }
+}
+
+// ── C4: callbacks — Cocoa calls Smalltalk (design §6) ───────────────────────
+//
+// The reverse direction never touches an oop: ONE runtime-registered ObjC
+// trampoline class, `MacvmAction`, whose fire IMP looks up a Rust registry
+// entry and posts a PRE-PICKLED `{#cocoaEvent. ticket}` envelope through
+// the primary's `InboxSender` — the worker transport, delivery, and
+// coalesced wake, unmodified. The envelope bytes are pickled at action-
+// CREATION time (on the VM thread, where a VmState exists), so the IMP —
+// which AppKit invokes on the MAIN thread — is completely VM-free:
+// registry lookup, channel send, return. Dispatch happens between doits
+// on the VM thread (`Worker dispatchInbox` → the world's Actions
+// registry), preserving the strictly-serial invariant.
+
+/// Envelope `from` for Cocoa-originated events — never a real worker id
+/// (worker ids are small and monotonic from 1).
+pub const COCOA_PEER_ID: u32 = u32::MAX;
+
+struct ActionEntry {
+    sender: crate::runtime::workers::InboxSender,
+    bytes: Vec<u8>,
+}
+
+static ACTIONS: OnceLock<std::sync::RwLock<HashMap<usize, ActionEntry>>> = OnceLock::new();
+static MACVM_ACTION_CLASS: OnceLock<Option<usize>> = OnceLock::new();
+
+/// The fire IMP — invoked BY Cocoa (target/action) on whatever thread the
+/// control lives on (main, for AppKit). No oop, no VmState, no lock held
+/// across anything blocking: registry read, envelope send (coalesced wake
+/// inside), done. An unknown instance (never registered — impossible
+/// through the bridge) or a closed inbox (the primary is exiting) drops
+/// the event silently: a late click during teardown is not an error.
+extern "C" fn macvm_action_fire(this: *mut c_void, _cmd: *mut c_void, _sender: *mut c_void) {
+    if let Some(reg) = ACTIONS.get() {
+        if let Ok(map) = reg.read() {
+            if let Some(e) = map.get(&(this as usize)) {
+                let _ = e.sender.send(crate::runtime::workers::Envelope {
+                    from: COCOA_PEER_ID,
+                    corr: 0,
+                    bytes: e.bytes.clone(),
+                });
+            }
+        }
+    }
+}
+
+/// Register the `MacvmAction` class with the ObjC runtime, once.
+fn macvm_action_class() -> Option<*mut c_void> {
+    MACVM_ACTION_CLASS
+        .get_or_init(|| {
+            let alloc_pair = resolve("objc_allocateClassPair")?;
+            let register_pair = resolve("objc_registerClassPair")?;
+            let add_method = resolve("class_addMethod")?;
+            let s = syms()?;
+            let superclass = {
+                let c = CString::new("NSObject").ok()?;
+                let sc = unsafe { (s.objc_get_class)(c.as_ptr()) };
+                if sc.is_null() {
+                    return None;
+                }
+                sc
+            };
+            type AllocPair = unsafe extern "C" fn(*mut c_void, *const c_char, usize) -> *mut c_void;
+            type RegisterPair = unsafe extern "C" fn(*mut c_void);
+            type AddMethod = unsafe extern "C" fn(
+                *mut c_void,
+                *mut c_void,
+                extern "C" fn(*mut c_void, *mut c_void, *mut c_void),
+                *const c_char,
+            ) -> u8;
+            let name = CString::new("MacvmAction").ok()?;
+            let cls = unsafe {
+                std::mem::transmute::<u64, AllocPair>(alloc_pair)(superclass, name.as_ptr(), 0)
+            };
+            if cls.is_null() {
+                return None; // name collision — a previous registration owns it
+            }
+            let sel = register_selector("macvmFire:")?;
+            let types = CString::new("v@:@").ok()?;
+            unsafe {
+                std::mem::transmute::<u64, AddMethod>(add_method)(
+                    cls,
+                    sel,
+                    macvm_action_fire,
+                    types.as_ptr(),
+                );
+                std::mem::transmute::<u64, RegisterPair>(register_pair)(cls);
+            }
+            Some(cls as usize)
+        })
+        .map(|p| p as *mut c_void)
+}
+
+/// Mint one `MacvmAction` instance bound to a pre-pickled fire payload.
+/// Answers a +1 id (alloc/init — the caller wraps with [`wrap_owned`]).
+/// Registry entries live for the process (design §6: tickets are never
+/// reused; a dead ticket's late fire is dropped WORLD-side, and the few
+/// bytes here are not worth a reclamation protocol before finalization).
+pub fn new_action(
+    sender: crate::runtime::workers::InboxSender,
+    bytes: Vec<u8>,
+) -> Result<*mut c_void, String> {
+    let cls =
+        macvm_action_class().ok_or_else(|| "MacvmAction class registration failed".to_string())?;
+    let inst = try_send(cls, "alloc", std::ptr::null_mut(), std::ptr::null_mut())?;
+    let inst = try_send(inst, "init", std::ptr::null_mut(), std::ptr::null_mut())?;
+    if inst.is_null() {
+        return Err("MacvmAction alloc/init answered nil".to_string());
+    }
+    ACTIONS
+        .get_or_init(|| std::sync::RwLock::new(HashMap::new()))
+        .write()
+        .map_err(|_| "action registry poisoned".to_string())?
+        .insert(inst as usize, ActionEntry { sender, bytes });
+    Ok(inst)
+}
+
+/// C4 `poolDo:` mint-note: append a freshly minted wrapper to the OPEN
+/// mint-list (top of `vm.cocoa_mint_stack`), growing the in-heap Array
+/// when full. The list layout is `[count(smi), w1, w2, …]`. Everything
+/// here is barrier-correct (`store_tail_oop`) and handle-rooted across
+/// the one allocation (growth) — the design's point: the list the GC must
+/// know about IS a heap object, so the GC already knows about it.
+fn mint_note(vm: &mut VmState, wrapper: Oop) {
+    use crate::oops::smi::SmallInt;
+    use crate::oops::wrappers::ArrayOop;
+    let Some(&top) = vm.cocoa_mint_stack.last() else {
+        return; // no open pool scope — the common case, zero cost
+    };
+    let Some(arr) = ArrayOop::try_from(top) else {
+        return;
+    };
+    let count = SmallInt::try_from(arr.at(0))
+        .map(|s| s.value())
+        .unwrap_or(0)
+        .max(0) as usize;
+    let cap = arr.len() - 1;
+    if count < cap {
+        // No allocation on this path — `top`/`wrapper` stay valid raw.
+        let m = MemOop::try_from(top).expect("mint list is a mem oop");
+        crate::memory::store::store_tail_oop(vm, m, 1 + count, wrapper);
+        arr.at_put(0, SmallInt::new((count + 1) as i64).oop()); // smi: barrier-exempt
+    } else {
+        // Grow (doubling): the ONE allocating path — wrapper + old list
+        // ride handles across it.
+        let scope = crate::memory::handles::HandleScope::enter(vm);
+        let w_h = scope.handle(vm, wrapper);
+        let old_h = scope.handle(vm, top);
+        let bigger = alloc::alloc_indexable_oops(vm, vm.universe.array_klass, 2 + cap * 2);
+        let old = ArrayOop::try_from(old_h.get(vm)).expect("handle-rooted list survived");
+        let big_m = MemOop::try_from(bigger.oop()).expect("fresh array is a mem oop");
+        for i in 1..=count {
+            crate::memory::store::store_tail_oop(vm, big_m, i, old.at(i));
+        }
+        crate::memory::store::store_tail_oop(vm, big_m, 1 + count, w_h.get(vm));
+        bigger.at_put(0, SmallInt::new((count + 1) as i64).oop());
+        *vm.cocoa_mint_stack.last_mut().expect("stack non-empty") = bigger.oop();
     }
 }

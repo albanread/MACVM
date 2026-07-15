@@ -801,6 +801,12 @@ pub struct VmState {
     /// primitive fails cleanly when this is `None`, so the world class is
     /// harmless in any embedding (the game-sink posture).
     pub workers: Option<Box<crate::runtime::workers::WorkerState>>,
+    /// Cocoa C4 (`poolDo:`): the in-heap mint-list stack — each entry is a
+    /// live Array oop (`[count(smi), wrapper...]`) the bridge appends every
+    /// freshly minted ObjcRef to while a pool scope is open. IN-HEAP and
+    /// rooted (memory/roots.rs) by design: a Rust-side Vec of wrapper oops
+    /// would be the BUG-A stale-oop-across-allocation class all over again.
+    pub cocoa_mint_stack: Vec<crate::oops::Oop>,
     /// Set by the `quit`/`quit:` primitive; the dispatch loop exits (after
     /// the current activation returns) once this is true.
     pub exit_requested: bool,
@@ -1185,6 +1191,7 @@ impl VmState {
             out: Box::new(std::io::stdout()),
             game_sink: None,
             workers: None,
+            cocoa_mint_stack: Vec::new(),
             exit_requested: false,
             exit_code: None,
             start_instant: Instant::now(),

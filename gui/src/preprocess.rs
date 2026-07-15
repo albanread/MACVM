@@ -50,9 +50,6 @@ pub enum Theme {
     /// Smalltalk-80 "Blue Book" — the canonical original: 1-bit black-on-white
     /// with dithered gray and the Blue Book's blue — `assets/smalltalk80.css`.
     Smalltalk80,
-    /// Pharo — today's mainstream living Smalltalk; modern flat blue/graphite —
-    /// `assets/pharo.css`.
-    Pharo,
     /// BYTE, August 1981 — the issue that introduced Smalltalk-80 (the balloon
     /// cover); warm cream-paper palette — `assets/byte81.css`.
     Byte81,
@@ -72,7 +69,7 @@ impl Theme {
     /// source of truth `main.rs::build_theme_menu` walks to build the menu
     /// and the checkmark list, so adding a theme never means updating two
     /// separate lists by hand.
-    pub const ALL: [Theme; 14] = [
+    pub const ALL: [Theme; 13] = [
         Theme::Classic,
         Theme::HiDef,
         Theme::Dark,
@@ -82,7 +79,6 @@ impl Theme {
         Theme::AltoMono,
         Theme::SelfLang,
         Theme::Smalltalk80,
-        Theme::Pharo,
         Theme::Byte81,
         Theme::SolarizedLight,
         Theme::SolarizedDark,
@@ -117,7 +113,6 @@ impl Theme {
             Theme::AltoMono => "Alto Mono",
             Theme::SelfLang => "Self",
             Theme::Smalltalk80 => "Smalltalk-80",
-            Theme::Pharo => "Pharo",
             Theme::Byte81 => "BYTE 1981",
             Theme::SolarizedLight => "Solarized Light",
             Theme::SolarizedDark => "Solarized Dark",
@@ -136,7 +131,6 @@ impl Theme {
             Theme::AltoMono => "assets/alto-mono.css",
             Theme::SelfLang => "assets/self.css",
             Theme::Smalltalk80 => "assets/smalltalk80.css",
-            Theme::Pharo => "assets/pharo.css",
             Theme::Byte81 => "assets/byte81.css",
             Theme::SolarizedLight => "assets/solarized-light.css",
             Theme::SolarizedDark => "assets/solarized-dark.css",
@@ -470,10 +464,20 @@ fn toolbar_html(theme: Theme) -> String {
         .iter()
         .map(|(icon, action, title)| {
             let icon_url = theme.icon_url(icon);
-            format!(
-                "<button class=\"st-toolbtn\" data-action=\"{action}\" title=\"{title}\">\
-                 <img src=\"{icon_url}\" alt=\"{title}\"></button>"
-            )
+            // Classic keeps its period PNG pixel-art (masking would flatten it);
+            // every other theme renders the shared monochrome SVG set as a
+            // `currentColor` mask (`.st-ico`, chrome_layout_style), so each icon
+            // takes that theme's own text colour automatically — no per-theme
+            // filter, and nothing left hidef-blue or crushed to black.
+            let glyph = if theme == Theme::Classic {
+                format!("<img src=\"{icon_url}\" alt=\"{title}\">")
+            } else {
+                format!(
+                    "<span class=\"st-ico\" role=\"img\" aria-label=\"{title}\" \
+                     style=\"-webkit-mask-image:url('{icon_url}');mask-image:url('{icon_url}')\"></span>"
+                )
+            };
+            format!("<button class=\"st-toolbtn\" data-action=\"{action}\" title=\"{title}\">{glyph}</button>")
         })
         .collect();
     // The metrics mini-dashboard lives at the right end of the toolbar (pushed
@@ -915,7 +919,7 @@ mod tests {
 
     #[test]
     fn theme_all_has_no_duplicate_stylesheets_and_matches_its_own_length() {
-        assert_eq!(Theme::ALL.len(), 14);
+        assert_eq!(Theme::ALL.len(), 13);
         let mut paths: Vec<&str> = Theme::ALL
             .iter()
             .map(|t| t.stylesheet_relative_path())

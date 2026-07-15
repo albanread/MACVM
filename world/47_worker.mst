@@ -34,6 +34,11 @@ Object subclass: WorkerMessage [
         "Is this the system death notice ({#workerDied. id})?"
         ^(payload isKindOf: Array) and: [ (payload size = 2) and: [ (payload at: 1) == #workerDied ] ]
     ]
+    isCocoaEvent [
+        "Is this a Cocoa callback fire ({#cocoaEvent. ticket} — C4, the
+         bridge's MacvmAction posts these through the same inbox)?"
+        ^(payload isKindOf: Array) and: [ (payload size = 2) and: [ (payload at: 1) == #cocoaEvent ] ]
+    ]
     isWorkerTranscript [
         "Is this a forwarded worker transcript line ({#workerTranscript. id. text})?"
         ^(payload isKindOf: Array) and: [ (payload size = 3) and: [ (payload at: 1) == #workerTranscript ] ]
@@ -42,7 +47,7 @@ Object subclass: WorkerMessage [
 
 Object subclass: Worker [
     | id |
-    <classVars: Handler ReplyHandler PendingReplies NextCorr CurrentCorr>
+    <classVars: Handler ReplyHandler PendingReplies NextCorr CurrentCorr CocoaEventHandler>
 
     "── spawning (primary side) ──"
     Worker class >> spawn: initSource [
@@ -99,6 +104,11 @@ Object subclass: Worker [
     "── receiving, primary side: dispatchInbox runs because the router woke
        us (or the run loop slept into a message) — never called in a poll loop ──"
     Worker class >> onReply: aBlock [ ReplyHandler := aBlock ]
+    Worker class >> onCocoaEvent: aBlock [
+        "C4: the Cocoa bridge's dispatch hook — installed lazily by
+         Cocoa action: (49_cocoa.mst loads after this file, so the
+         reference must run at runtime, not compile time)."
+        CocoaEventHandler := aBlock ]
     Worker class >> dispatchInbox [
         "Handle every queued worker→primary envelope."
         | env |
@@ -131,6 +141,10 @@ Object subclass: Worker [
                             payload: (self unpickle: (env at: 3)).
         msg isWorkerTranscript ifTrue: [
             Transcript show: (msg payload at: 3).
+            ^self ].
+        msg isCocoaEvent ifTrue: [
+            CocoaEventHandler isNil ifFalse: [
+                CocoaEventHandler value: (msg payload at: 2) ].
             ^self ].
         k := (PendingReplies notNil and: [ corr ~= 0 ])
             ifTrue: [ PendingReplies at: corr ifAbsent: [ nil ] ]

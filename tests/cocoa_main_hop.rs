@@ -118,6 +118,35 @@ fn main() {
             dispatched >= 4,
             "the hops must have DISPATCHED (not run inline): {dispatched}"
         );
+
+        // C4 × C3: a callback FIRED FROM THE REAL MAIN THREAD — exactly
+        // what an AppKit button does. The hopped macvmFire: runs the IMP
+        // on main; it posts the envelope; the VM dispatches it between
+        // doits. The full AppKit wiring, minus the pixels (C5's job).
+        vm.set_worker_boot(std::sync::Arc::new(|| {
+            VmHandle::boot(
+                VmOptions {
+                    heap_mib: 64,
+                    jit: JitMode::Off,
+                    ..Default::default()
+                },
+                Path::new("world"),
+            )
+        }));
+        vm.exec("Object subclass: HopCb [ <classVars: N A> HopCb class >> reset [ N := 0 ] HopCb class >> bump [ N := N + 1 ] HopCb class >> n [ ^N ] HopCb class >> a: x [ A := x ] HopCb class >> a [ ^A ] ]")
+            .expect("holder");
+        vm.exec("HopCb reset.").expect("reset");
+        vm.exec("HopCb a: (Cocoa action: [ HopCb bump ]).")
+            .expect("action");
+        vm.exec("HopCb a sendMain: 'macvmFire:' args: (Array with: nil).")
+            .expect("fire ON the main thread via the hop");
+        vm.exec("Worker dispatchInbox.").expect("dispatch");
+        assert_eq!(
+            vm.eval("HopCb n").expect("count").trim(),
+            "1",
+            "a main-thread fire must reach the Smalltalk block"
+        );
+
         done_vm.store(true, Ordering::Release);
     });
 

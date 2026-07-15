@@ -1263,6 +1263,30 @@ pub static PRIMITIVES: &[PrimDesc] = &[
         can_allocate: true,
         can_fail: true,
     },
+    PrimDesc {
+        id: 243,
+        name: "Cocoa class>>primNewAction:",
+        f: prim_cocoa_new_action,
+        argc: 1,
+        can_allocate: true,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 244,
+        name: "Cocoa class>>primPoolPush",
+        f: prim_cocoa_pool_push,
+        argc: 0,
+        can_allocate: true,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 245,
+        name: "Cocoa class>>primPoolPop",
+        f: prim_cocoa_pool_pop,
+        argc: 0,
+        can_allocate: false,
+        can_fail: true,
+    },
 ];
 
 pub fn prim_by_id(id: u16) -> Option<&'static PrimDesc> {
@@ -2524,6 +2548,60 @@ fn prim_cocoa_is_valid(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     } else {
         vm.universe.false_obj
     })
+}
+
+/// `Cocoa class >> primNewAction:` (243) — C4: mint a `MacvmAction`
+/// target/action trampoline bound to `ticket`. The `{#cocoaEvent. ticket}`
+/// fire payload is pickled HERE, on the VM thread, and stored with the
+/// registry entry — the ObjC-side fire IMP never sees a VmState. Fails
+/// cleanly without a worker role (no inbox to post to) — actions belong
+/// to the primary VM.
+fn prim_cocoa_new_action(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    if SmallInt::try_from(args[1]).is_none() {
+        return PrimResult::Fail;
+    }
+    let Some(sender) = crate::runtime::workers::primary_inbox_sender(vm) else {
+        return PrimResult::Fail;
+    };
+    // Build {#cocoaEvent. ticket} in-heap, pickle it, drop the oops. The
+    // interned Symbol rides a handle across the Array allocation; the
+    // ticket is a smi (an immediate — no move can stale it).
+    let scope = crate::memory::handles::HandleScope::enter(vm);
+    let sym = vm.universe.intern(b"cocoaEvent");
+    let sym_h = scope.handle(vm, sym.oop());
+    let arr = alloc::alloc_indexable_oops(vm, vm.universe.array_klass, 2);
+    arr.at_put(0, sym_h.get(vm));
+    arr.at_put(1, args[1]);
+    let Ok(bytes) = crate::runtime::mop::pickle(vm, arr.oop()) else {
+        return PrimResult::Fail;
+    };
+    match crate::runtime::objc_bridge::new_action(sender, bytes) {
+        Ok(inst) => PrimResult::Ok(crate::runtime::objc_bridge::wrap_owned(vm, inst)),
+        Err(desc) => cocoa_exception_fail(vm, "macvmAction", &desc),
+    }
+}
+
+/// `Cocoa class >> primPoolPush` (244) — open a `poolDo:` mint-list scope:
+/// a fresh in-heap list `[count(smi)=0, 8 slots]` pushed on the rooted
+/// stack. Every wrapper minted while the scope is open is appended
+/// (objc_bridge::mint_note), surviving any number of collections because
+/// the list IS a heap object.
+fn prim_cocoa_pool_push(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    let arr = alloc::alloc_indexable_oops(vm, vm.universe.array_klass, 9);
+    arr.at_put(0, SmallInt::new(0).oop());
+    vm.cocoa_mint_stack.push(arr.oop());
+    PrimResult::Ok(args[0])
+}
+
+/// `Cocoa class >> primPoolPop` (245) — close the innermost mint-list
+/// scope and answer its list (`[count, w1..wN, nils…]`) for the world's
+/// release sweep. Fails if no scope is open (an unbalanced pop).
+fn prim_cocoa_pool_pop(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    let _ = args;
+    match vm.cocoa_mint_stack.pop() {
+        Some(o) => PrimResult::Ok(o),
+        None => PrimResult::Fail,
+    }
 }
 
 // --- smi group (SPEC §10 appendix) ------------------------------------------
@@ -4418,6 +4496,9 @@ mod tests {
             (240, "ObjcRef>>primSend:args:ret:"),
             (241, "ObjcRef>>primSendAuto:args:"),
             (242, "ObjcRef>>primSendMainAuto:args:"),
+            (243, "Cocoa class>>primNewAction:"),
+            (244, "Cocoa class>>primPoolPush"),
+            (245, "Cocoa class>>primPoolPop"),
         ];
         assert_eq!(
             PRIMITIVES.len(),

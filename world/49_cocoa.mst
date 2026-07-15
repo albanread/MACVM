@@ -206,7 +206,27 @@ Object subclass: ObjcRef [
     ]
 ]
 
+"CocoaPool — what a poolDo: block receives (C4, design §3.3): keep: marks
+ a wrapper as surviving the scope; everything else minted inside is
+ released on the way out."
+Object subclass: CocoaPool [
+    | kept |
+    CocoaPool class >> new [
+        | p |
+        p := self basicNew.
+        p init.
+        ^p
+    ]
+    init [ kept := OrderedCollection new ]
+    keep: anObjcRef [
+        kept add: anObjcRef.
+        ^anObjcRef
+    ]
+    isKept: w [ ^kept includes: w ]
+]
+
 Object subclass: Cocoa [
+    <classVars: Actions NextTicket>
     Cocoa class >> classNamed: aName [
         "An ObjcRef on the named Objective-C class."
         <primitive: 230>
@@ -223,12 +243,80 @@ Object subclass: Cocoa [
         ^self
     ]
     Cocoa class >> poolDo: aBlock [
-        "Run aBlock, then drain autoreleased garbage it generated. (C0-lite:
-         wrapped ObjcRefs still need their own release; the mint-list
-         version arrives with C4 — docs/cocoa_bridge_design.md §3.3.)"
-        | r |
-        r := aBlock value.
+        "Design §3.3 for real (C4): every ObjcRef minted in the dynamic
+         extent is released on the way out unless the block keeps it:
+             s := Cocoa poolDo: [:p | p keep: (Cocoa nsString: 'mine')].
+         The mint-list lives IN-HEAP (prims 244/245; rooted in the VM) so
+         the moving GC can never stale it — the BUG-A class designed away
+         rather than gated. Nesting works (the scopes stack). An error
+         inside the block aborts the doit with the scope still open; the
+         embedded supervisor's VM restart clears it (no exception system
+         to unwind through yet)."
+        | r pool minted n w |
+        self primPoolPush.
+        pool := CocoaPool new.
+        r := aBlock value: pool.
+        minted := self primPoolPop.
+        n := minted at: 1.
+        1 to: n do: [:i |
+            w := minted at: 1 + i.
+            ((pool isKept: w) or: [ w isValid not ])
+                ifFalse: [ w release ] ].
         self drainPool.
         ^r
+    ]
+    Cocoa class >> primPoolPush [
+        <primitive: 244>
+        ^self error: 'Cocoa pool push failed'
+    ]
+    Cocoa class >> primPoolPop [
+        <primitive: 245>
+        ^self error: 'Cocoa pool pop without an open pool scope'
+    ]
+
+    "── C4: callbacks — Cocoa calls Smalltalk (design §6) ────────────────
+     `Cocoa action: [ ... ]` answers a MacvmAction ObjcRef for
+     target/action wiring:
+         btn setTarget: act.  btn setAction: 'macvmFire:'.
+     A fire (any thread) posts {#cocoaEvent. ticket} through the worker
+     inbox; `Worker dispatchInbox` (GUI-wake-driven, M3) runs the block
+     BETWEEN doits on the VM thread — a callback never interrupts
+     Smalltalk mid-send. Tickets are monotonic, never reused; a fire for
+     an unregistered ticket is dropped silently. TWO CARE NOTES (C4
+     review): (1) an action wrapper minted inside a poolDo: scope must be
+     `keep:`-ed or the sweep releases it under the control that targets
+     it; (2) a handler that raises aborts dispatchInbox mid-queue — the
+     envelopes behind it wait for the NEXT inbox arrival (delayed, never
+     lost). Inner-scope `keep:` means MANUAL ownership from then on — a
+     kept wrapper is not re-noted in any outer scope."
+    Cocoa class >> action: aBlock [
+        | t |
+        Actions isNil ifTrue: [
+            Actions := Dictionary new.
+            NextTicket := 0.
+            Worker onCocoaEvent: [:tk | Cocoa dispatchAction: tk] ].
+        NextTicket := NextTicket + 1.
+        t := NextTicket.
+        Actions at: t put: aBlock.
+        ^self primNewAction: t
+    ]
+    Cocoa class >> primNewAction: ticket [
+        <primitive: 243>
+        ^self error: 'Cocoa action creation failed (no worker role in this VM?)'
+    ]
+    Cocoa class >> dispatchAction: ticket [
+        "Run the registered handler; a dead/unknown ticket is dropped
+         (a late fire during teardown is not an error)."
+        | h |
+        Actions isNil ifTrue: [ ^self ].
+        h := Actions at: ticket ifAbsent: [ nil ].
+        h isNil ifTrue: [ ^self ].
+        h value
+    ]
+    Cocoa class >> unregisterAction: ticket [
+        "Tombstone the handler (Dictionary has no removeKey: — the
+         PendingReplies pattern); tickets are never reused, so a
+         tombstone is never rekeyed."
+        Actions isNil ifFalse: [ Actions at: ticket put: nil ]
     ]
 ]

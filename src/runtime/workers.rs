@@ -135,6 +135,11 @@ impl WorkerState {
         }
     }
 
+    /// CONTRACT (C4 review): the wake hook runs on whatever thread sends
+    /// an envelope — worker threads AND the Cocoa fire IMP (any thread,
+    /// possibly main, holding the bridge's action-registry read lock). It
+    /// must NOT block and must NOT re-enter the bridge/VM; enqueue-and-
+    /// return only (the GUI's is an unbounded-channel send + async wake).
     pub fn set_wake(&self, f: InboxWakeFn) {
         if let WorkerState::Primary { inbox_tx, .. } = self {
             *inbox_tx.wake.lock().unwrap() = Some(f);
@@ -383,4 +388,17 @@ pub fn alive(vm: &VmState, id: u32) -> bool {
         return false;
     };
     links.get(id as usize - 1).map(|l| l.alive).unwrap_or(false)
+}
+
+/// The PRIMARY's own inbox sender, cloned for the Cocoa bridge (C4): a
+/// `MacvmAction` fire on the main thread posts its `{#cocoaEvent. ticket}`
+/// envelope here — the same transport, delivery, and coalesced wake worker
+/// messages use, unmodified (design §6). `None` in a worker VM (its inbox
+/// is the router-fed staging slot, not a channel — Cocoa UI belongs to the
+/// primary) or when no worker role exists.
+pub fn primary_inbox_sender(vm: &crate::runtime::vm_state::VmState) -> Option<InboxSender> {
+    match vm.workers.as_deref() {
+        Some(WorkerState::Primary { inbox_tx, .. }) => Some(inbox_tx.clone()),
+        _ => None,
+    }
 }

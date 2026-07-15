@@ -373,6 +373,14 @@ impl VmHandle {
             let message = deopt_trap::take_last_guest_fatal_message().expect(
                 "sigsetjmp returned GUEST_FATAL_JMP_VAL without a recorded guest-fatal message",
             );
+            // A doit that died inside a `Cocoa poolDo:` left its mint-list
+            // scope open — from then on EVERY wrapper minted anywhere would
+            // append to a stale rooted list forever (the C4 review's
+            // poisoned-machinery finding). A pool scope is lexical and can
+            // never legitimately span doits, so a surviving VM clears the
+            // stack here. (The abandoned lists' wrappers leak their +1 —
+            // leak-side, as always.)
+            self.vm.cocoa_mint_stack.clear();
             return Err(GuestError::RuntimeError(message));
         }
         if rc != 0 {
@@ -415,6 +423,14 @@ impl VmHandle {
             let message = deopt_trap::take_last_guest_fatal_message().expect(
                 "sigsetjmp returned GUEST_FATAL_JMP_VAL without a recorded guest-fatal message",
             );
+            // A doit that died inside a `Cocoa poolDo:` left its mint-list
+            // scope open — from then on EVERY wrapper minted anywhere would
+            // append to a stale rooted list forever (the C4 review's
+            // poisoned-machinery finding). A pool scope is lexical and can
+            // never legitimately span doits, so a surviving VM clears the
+            // stack here. (The abandoned lists' wrappers leak their +1 —
+            // leak-side, as always.)
+            self.vm.cocoa_mint_stack.clear();
             return Err(GuestError::RuntimeError(message));
         }
         if rc != 0 {
@@ -465,6 +481,14 @@ impl VmHandle {
             let message = deopt_trap::take_last_guest_fatal_message().expect(
                 "sigsetjmp returned GUEST_FATAL_JMP_VAL without a recorded guest-fatal message",
             );
+            // A doit that died inside a `Cocoa poolDo:` left its mint-list
+            // scope open — from then on EVERY wrapper minted anywhere would
+            // append to a stale rooted list forever (the C4 review's
+            // poisoned-machinery finding). A pool scope is lexical and can
+            // never legitimately span doits, so a surviving VM clears the
+            // stack here. (The abandoned lists' wrappers leak their +1 —
+            // leak-side, as always.)
+            self.vm.cocoa_mint_stack.clear();
             return Err(GuestError::RuntimeError(message));
         }
         if rc != 0 {
@@ -517,6 +541,14 @@ impl VmHandle {
             let message = deopt_trap::take_last_guest_fatal_message().expect(
                 "sigsetjmp returned GUEST_FATAL_JMP_VAL without a recorded guest-fatal message",
             );
+            // A doit that died inside a `Cocoa poolDo:` left its mint-list
+            // scope open — from then on EVERY wrapper minted anywhere would
+            // append to a stale rooted list forever (the C4 review's
+            // poisoned-machinery finding). A pool scope is lexical and can
+            // never legitimately span doits, so a surviving VM clears the
+            // stack here. (The abandoned lists' wrappers leak their +1 —
+            // leak-side, as always.)
+            self.vm.cocoa_mint_stack.clear();
             return Err(GuestError::RuntimeError(message));
         }
         if rc != 0 {
@@ -556,6 +588,14 @@ impl VmHandle {
             let message = deopt_trap::take_last_guest_fatal_message().expect(
                 "sigsetjmp returned GUEST_FATAL_JMP_VAL without a recorded guest-fatal message",
             );
+            // A doit that died inside a `Cocoa poolDo:` left its mint-list
+            // scope open — from then on EVERY wrapper minted anywhere would
+            // append to a stale rooted list forever (the C4 review's
+            // poisoned-machinery finding). A pool scope is lexical and can
+            // never legitimately span doits, so a surviving VM clears the
+            // stack here. (The abandoned lists' wrappers leak their +1 —
+            // leak-side, as always.)
+            self.vm.cocoa_mint_stack.clear();
             return Err(GuestError::RuntimeError(message));
         }
         if rc != 0 {
@@ -595,6 +635,14 @@ impl VmHandle {
             let message = deopt_trap::take_last_guest_fatal_message().expect(
                 "sigsetjmp returned GUEST_FATAL_JMP_VAL without a recorded guest-fatal message",
             );
+            // A doit that died inside a `Cocoa poolDo:` left its mint-list
+            // scope open — from then on EVERY wrapper minted anywhere would
+            // append to a stale rooted list forever (the C4 review's
+            // poisoned-machinery finding). A pool scope is lexical and can
+            // never legitimately span doits, so a surviving VM clears the
+            // stack here. (The abandoned lists' wrappers leak their +1 —
+            // leak-side, as always.)
+            self.vm.cocoa_mint_stack.clear();
             return Err(GuestError::RuntimeError(message));
         }
         if rc != 0 {
@@ -2783,6 +2831,147 @@ mod tests {
             "the onMain proxy must raise too"
         );
         assert_eq!(vm.eval("3 + 4").unwrap().trim(), "7");
+    }
+
+    // ── Cocoa bridge C4 gates (callbacks + the in-heap mint-list) ───────
+
+    #[test]
+    fn cocoa_c4_action_fires_and_dead_ticket_drops() {
+        let _serial = cocoa_serial();
+        // The full callback circle, headless: Cocoa action: registers a
+        // block + mints a MacvmAction; a `macvmFire:` send (through DNU!)
+        // posts the {#cocoaEvent. ticket} envelope; Worker dispatchInbox
+        // runs the block BETWEEN doits on the VM thread.
+        let mut vm = boot_worker_primary();
+        vm.exec("Object subclass: CocoaCb [ <classVars: N A> CocoaCb class >> reset [ N := 0 ] CocoaCb class >> bump [ N := N + 1 ] CocoaCb class >> n [ ^N ] CocoaCb class >> a: x [ A := x ] CocoaCb class >> a [ ^A ] ]")
+            .expect("holder");
+        vm.exec("CocoaCb reset.").expect("reset");
+        vm.exec("CocoaCb a: (Cocoa action: [ CocoaCb bump ]).")
+            .expect("register the action");
+        vm.exec("CocoaCb a macvmFire: nil.").expect("fire 1");
+        vm.exec("CocoaCb a macvmFire: nil.").expect("fire 2");
+        assert_eq!(
+            vm.eval("CocoaCb n").unwrap().trim(),
+            "0",
+            "fires queue; nothing runs mid-doit (the strictly-serial rule)"
+        );
+        vm.exec("Worker dispatchInbox.").expect("dispatch");
+        assert_eq!(vm.eval("CocoaCb n").unwrap().trim(), "2");
+        // Unregister: a late fire for a dead ticket is dropped silently
+        // (tickets are monotonic from 1 in a fresh VM).
+        vm.exec("Cocoa unregisterAction: 1.").expect("tombstone");
+        vm.exec("CocoaCb a macvmFire: nil.").expect("late fire");
+        vm.exec("Worker dispatchInbox.").expect("dispatch again");
+        assert_eq!(
+            vm.eval("CocoaCb n").unwrap().trim(),
+            "2",
+            "a dead ticket's fire must be dropped, not an error"
+        );
+        assert_eq!(vm.eval("3 + 4").unwrap().trim(), "7");
+    }
+
+    #[test]
+    fn cocoa_c4_pool_releases_minted_keeps_kept() {
+        let _serial = cocoa_serial();
+        let mut vm = boot_test_vm(JitMode::Off);
+        vm.exec("Object subclass: CocoaPl [ <classVars: K> CocoaPl class >> k: x [ K := x ] CocoaPl class >> k [ ^K ] ]")
+            .expect("holder");
+        let (w0, r0, _) = crate::runtime::objc_bridge::counters();
+        vm.exec("CocoaPl k: (Cocoa poolDo: [:p | (Cocoa nsString: 'a'). (Cocoa nsString: 'b'). p keep: (Cocoa nsString: 'kept') ]).")
+            .expect("poolDo: with 3 mints, 1 kept");
+        let (w1, r1, _) = crate::runtime::objc_bridge::counters();
+        assert_eq!(w1 - w0, 3, "three wrappers minted in the scope");
+        assert_eq!(r1 - r0, 2, "the two non-kept were released on the way out");
+        assert_eq!(vm.eval("CocoaPl k isValid").unwrap().trim(), "true");
+        let s = vm.eval("CocoaPl k sendString: 'description'").unwrap();
+        assert!(s.contains("kept"), "got {s}");
+        vm.exec("CocoaPl k release.").expect("tidy");
+    }
+
+    #[test]
+    fn cocoa_c4_pool_and_callbacks_survive_gc_stress() {
+        let _serial = cocoa_serial();
+        // The design's own C4 soak gate: poolDo: scopes with enough mints
+        // to force in-heap mint-list GROWTH (past the initial 8 slots),
+        // interleaved with callback fires + dispatch, every allocation
+        // collecting. The mint-list arrays move constantly; being rooted
+        // heap objects, nothing dangles and the release sweep stays exact.
+        let mut vm = VmHandle::boot(
+            VmOptions {
+                heap_mib: 64,
+                gc_stress: true,
+                jit: JitMode::Off,
+                ..Default::default()
+            },
+            Path::new("world"),
+        )
+        .expect("gc-stress boot");
+        vm.set_worker_boot(Arc::new(|| {
+            VmHandle::boot(
+                VmOptions {
+                    heap_mib: 64,
+                    jit: JitMode::Off,
+                    ..Default::default()
+                },
+                Path::new("world"),
+            )
+        }));
+        vm.exec("Object subclass: CocoaSk [ <classVars: N A K> CocoaSk class >> reset [ N := 0 ] CocoaSk class >> bump [ N := N + 1 ] CocoaSk class >> n [ ^N ] CocoaSk class >> a: x [ A := x ] CocoaSk class >> a [ ^A ] CocoaSk class >> k: x [ K := x ] CocoaSk class >> k [ ^K ] ]")
+            .expect("holder");
+        vm.exec("CocoaSk reset.").expect("reset");
+        vm.exec("CocoaSk a: (Cocoa action: [ CocoaSk bump ]).")
+            .expect("action");
+        let (w0, r0, _) = crate::runtime::objc_bridge::counters();
+        for i in 0..10 {
+            // 12 mints per scope: growth from 8 → 16 slots mid-scope.
+            vm.exec("CocoaSk k: (Cocoa poolDo: [:p | 1 to: 11 do: [:j | Cocoa nsString: 'churn' ]. p keep: (Cocoa nsString: 'kept') ]).")
+                .expect("pool scope under stress");
+            vm.exec("CocoaSk a macvmFire: nil.").expect("fire");
+            vm.exec("Worker dispatchInbox.").expect("dispatch");
+            let k = vm.eval("CocoaSk k sendString: 'description'").unwrap();
+            assert!(k.contains("kept"), "iteration {i}: got {k}");
+            vm.exec("CocoaSk k release.").expect("tidy the survivor");
+        }
+        assert_eq!(vm.eval("CocoaSk n").unwrap().trim(), "10");
+        let (w1, r1, _) = crate::runtime::objc_bridge::counters();
+        assert_eq!(w1 - w0, 120, "12 mints × 10 scopes");
+        assert_eq!(
+            r1 - r0,
+            120,
+            "11 swept per scope + the kept one released after — balanced"
+        );
+    }
+
+    #[test]
+    fn cocoa_c4_error_in_pool_scope_clears_the_stack() {
+        let _serial = cocoa_serial();
+        // The C4 review's F1: a doit that raises INSIDE poolDo: aborts with
+        // the scope still pushed — the recovery arm must clear the stack,
+        // or every future mint (anywhere) appends to a stale rooted list
+        // forever.
+        let mut vm = boot_test_vm(JitMode::Off);
+        assert!(
+            vm.exec("Cocoa poolDo: [:p | (Cocoa nsString: 'doomed'). Cocoa error: 'boom' ].")
+                .is_err(),
+            "the block's error must abort the doit"
+        );
+        vm.exec("Object subclass: CocoaEr [ <classVars: S> CocoaEr class >> s: x [ S := x ] CocoaEr class >> s [ ^S ] ]")
+            .expect("holder");
+        let (_, r0, _) = crate::runtime::objc_bridge::counters();
+        // A mint OUTSIDE any scope after the abort…
+        vm.exec("CocoaEr s: (Cocoa nsString: 'free agent').")
+            .expect("mint outside any scope");
+        // …must survive a subsequent balanced poolDo: untouched.
+        vm.exec("Cocoa poolDo: [:p | Cocoa nsString: 'swept' ].")
+            .expect("a later balanced scope");
+        let (_, r1, _) = crate::runtime::objc_bridge::counters();
+        assert_eq!(r1 - r0, 1, "only the in-scope mint was swept");
+        assert_eq!(
+            vm.eval("CocoaEr s isValid").unwrap().trim(),
+            "true",
+            "the free agent must not have been swept into a stale scope"
+        );
+        vm.exec("CocoaEr s release.").expect("tidy");
     }
 
     #[test]
