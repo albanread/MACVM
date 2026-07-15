@@ -15,7 +15,10 @@ provides for bit-parity. All verified byte-identical across `MACVM_JIT`
 off/threshold and `MACVM_GC_STRESS`. Still designed-not-built: the reducer/q-pool
 generalization (Part C1/C2, so a vector stays live in a `q`-register across ops
 instead of box-per-op), the v8–v15 residency subtlety (C3),
-`ValueLoc::VectorSlot` deopt (C4), integer vectors, and JIT auto-vectorization of
+`ValueLoc::VectorSlot` deopt (C4) — **the full implementation-grade design for
+those is now `docs/simd_qpool_design.md`** (milestones Q1–Q4; it refines C2/C3:
+Q values reside in `q16`–`q31`, not the scalar `d8`–`d15` pool, because no
+register survives a call at 128 bits) — plus JIT auto-vectorization of
 `1 to: n do:` loops (E2 research). The interpreter's dispatch loop and the object
 model's core stay untouched throughout.
 
