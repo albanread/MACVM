@@ -470,6 +470,63 @@ pub fn compute_intervals(
             }
         }
     }
+    // GC_STRESS head-2 fix (deltablue `projectionTest:`): an exact deopt
+    // fact `(v, P)` lying OUTSIDE v's `[min_def, max_use]`, with a loop
+    // range connecting P to the interval, is PROOF the value is
+    // loop-carried — the deopt metadata at P (a loop-head send's recorded
+    // operand stack) reads the PREVIOUS iteration's value, which flows to P
+    // around the back edge. The exact fact alone makes only P's own oop map
+    // claim the slot; the safepoints in the loop TAIL (between the def and
+    // the back edge) claim nothing, so under stress the slot sat unscanned
+    // for 13 scavenges while its object moved, and P's map then handed the
+    // rotted address to the collector (the to-space tripwire, nm slot 41,
+    // rel_pc 0xc44 vs 0xd50–0xeb8).
+    //
+    // The fix is MAP-ONLY, deliberately: v is already spill-assigned (every
+    // deopt-referenced vreg is force-spilled below) and every def writes its
+    // canonical slot, so between defs the slot always holds v's last value —
+    // the GC just needs to be TOLD about it at the loop's other safepoints.
+    // So this adds exact `(v, safepoint)` facts for every safepoint inside
+    // the connecting loop range, leaving the interval — and therefore
+    // register allocation, spill decisions, and every emitted instruction —
+    // byte-identical. (The first cut widened the INTERVAL instead: sound,
+    // but the widening cascaded through the fixpoint below and measured
+    // +104% on deltablue. Never tax the mutator for a GC-visibility fact.)
+    // BUG D's precision rule below is untouched: wholly-inside temps have no
+    // out-of-interval exact facts. A straight-line exact fact (task #94's
+    // case: a trap position past the last use, no loop) matches no loop
+    // range containing both and stays exact.
+    {
+        let mut loop_map_facts: std::collections::HashSet<(u32, u32)> =
+            std::collections::HashSet::new();
+        for &(v, p) in &deopt_live_exact {
+            let s = *min_def.get(&v).unwrap_or(&u32::MAX);
+            let e = *max_use.get(&v).unwrap_or(&0);
+            if s == u32::MAX {
+                continue; // never defined in compiled code — the [0,0] path below
+            }
+            if p >= s && p <= e {
+                continue; // fact already inside the interval
+            }
+            for &(ls, le) in &loop_ranges {
+                let contains_p = ls <= p && p <= le;
+                let touches_interval = s <= le && e >= ls;
+                if contains_p && touches_interval {
+                    for &sp in &safepoint_positions {
+                        // Only the GAP safepoints: the strictly-inside window
+                        // of the interval is already map-live via the normal
+                        // interval test; duplicating those would only bloat
+                        // the fact list the oopmap builder filters per call.
+                        if sp >= ls && sp <= le && !(sp > s && sp < e) {
+                            loop_map_facts.insert((v, sp));
+                        }
+                    }
+                }
+            }
+        }
+        deopt_live_exact.extend(loop_map_facts);
+    }
+
     let mut changed = true;
     while changed {
         changed = false;

@@ -56,6 +56,17 @@ pub fn build_for_position(
     extra_oop_live: &[(VReg, u32)],
 ) -> OopMap {
     let mut map = OopMap::empty();
+    // One pass over the facts per POSITION (not per interval × position):
+    // the head-2 fix legitimately multiplied the fact count (loop-carried
+    // slots get one fact per in-loop safepoint), and deltablue's steady
+    // trap→recompile churn turned a per-interval linear `.any()` into a
+    // measured +103% wall regression — of pure COMPILE time. The mutator
+    // never touches this; keep the builder linear in the facts.
+    let exact_here: std::collections::HashSet<u32> = extra_oop_live
+        .iter()
+        .filter(|&&(_, p)| p == position)
+        .map(|&(v, _)| v.0)
+        .collect();
     for iv in intervals {
         if !iv.is_oop {
             continue;
@@ -63,10 +74,8 @@ pub fn build_for_position(
         let Some(Assignment::Spill(slot)) = iv.assignment else {
             continue;
         };
-        let live = (iv.start < position && iv.end > position)
-            || extra_oop_live
-                .iter()
-                .any(|&(v, p)| v == iv.vreg && p == position);
+        let live =
+            (iv.start < position && iv.end > position) || exact_here.contains(&iv.vreg.0);
         if live {
             debug_assert!(
                 slot.0 < frame_slots,
