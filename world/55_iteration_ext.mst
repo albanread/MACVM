@@ -1,0 +1,42 @@
+"55_iteration_ext.mst — indexed-iteration and reduction protocol a probe found
+ missing, plus an Interval>>reversed fix. Pure Smalltalk on the existing classes,
+ built on do:/doWithIndex:/inject:into:/at:put:/size/asArray/reversed."
+
+Object subclass: Collection [
+    "Sum of the block's value over each element (0 for an empty collection)."
+    sum: aBlock [ ^self inject: 0 into: [:acc :e | acc + (aBlock value: e) ] ]
+
+    "Reduce with no seed — combine elements left to right using the FIRST as
+     the initial accumulator. Empty is an error (no seed to answer)."
+    fold: aBlock [
+        | acc any |
+        any := false. acc := nil.
+        self do: [:e |
+            any ifTrue: [ acc := aBlock value: acc value: e ]
+                ifFalse: [ acc := e. any := true ] ].
+        any ifFalse: [ ^self error: 'fold: an empty collection' ].
+        ^acc
+    ]
+]
+
+Collection subclass: SequenceableCollection [
+    "value-then-index iteration (the Squeak-cased alias of doWithIndex:)."
+    withIndexDo: aBlock [ ^self doWithIndex: aBlock ]
+
+    "collect: with the 1-based index available (value, index) -> Array."
+    withIndexCollect: aBlock [
+        | result i |
+        result := Array new: self size.
+        i := 0.
+        self do: [:e | i := i + 1. result at: i put: (aBlock value: e value: i) ].
+        ^result
+    ]
+    collectWithIndex: aBlock [ ^self withIndexCollect: aBlock ]
+]
+
+SequenceableCollection subclass: Interval [
+    "An Interval is immutable, so the inherited reversed (which builds via
+     at:put:) fails on it — answer a reversed Array instead."
+    reversed [ ^self asArray reversed ]
+    reverse [ ^self reversed ]
+]
