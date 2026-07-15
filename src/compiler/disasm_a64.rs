@@ -213,6 +213,15 @@ fn decode_fp_scalar(word: u32) -> Option<String> {
         }
         return Some(format!("{e} d{rn}, d{rm}"));
     }
+    // fmov d<-d (register): 0x1E60_4000. The single most common instruction
+    // in float-heavy compiled code — every unboxed temp shuffle between the
+    // d8-d15 residency registers and emit's d16/d17 scratch is one of these —
+    // and it read as a bare `.word` until this arm existed, which is exactly
+    // the code a float disassembly is wanted for (found reading the
+    // Mandelbrot inner loop, docs/mandelbrot_walkthrough.md).
+    if word & 0xFFFF_FC00 == 0x1E60_4000 {
+        return Some(format!("fmov d{rd}, d{rn}"));
+    }
     // fmov x<->d: 0x9E66_0000 (fmov Xd, Dn) / 0x9E67_0000 (fmov Dd, Xn).
     if word & 0xFFFF_FC00 == 0x9E66_0000 {
         return Some(format!("fmov x{rd}, d{rn}"));
