@@ -13,11 +13,15 @@ done: the object world, the dispatch-based bytecode interpreter, generational
 scavenge plus a full compacting collector running underneath live, moving
 compiled frames, and the adaptive optimizing compiler &mdash; inline caches,
 customization, method and block inlining, deoptimization, on-stack
-replacement. Around that core sit a Tier-1 POSIX FFI, GUI embedding through a
-crash-surviving <code>VmHandle</code>, a SQLite image store with a
-byte-identical DB&nbsp;&rarr;&nbsp;VM boot loader, and full closure
-compilation &mdash; literal blocks that splice inline rather than
-allocate.</p>
+replacement. Around that core sit a Tier-1 POSIX FFI <em>and</em> the full
+Cocoa bridge (Objective-C objects as ordinary Smalltalk receivers, AppKit
+across the main-thread hop, button callbacks as blocks &mdash; see
+<a href="../cocoa.html">Cocoa from Smalltalk</a>), multi-VM concurrency
+(a primary plus worker VMs on their own threads, deep-copied messages),
+GUI embedding through a crash-surviving <code>VmHandle</code>, a SQLite
+image store with a byte-identical DB&nbsp;&rarr;&nbsp;VM boot loader, and
+full closure compilation &mdash; literal blocks that splice inline rather
+than allocate.</p>
 
 <p align="left">Two theses are settled. <strong>Compiler coverage is
 achieved</strong> &mdash; almost everything that runs, runs compiled, and
@@ -32,10 +36,6 @@ part that works.</p>
 <h3 align="left">Still open</h3>
 
 <ul>
-	<li><p align="left"><strong>Tier-2 Cocoa FFI</strong> &mdash;
-	<code>doesNotUnderstand:</code>-driven message dispatch out to native
-	Cocoa objects.</p></li>
-
 	<li><p align="left"><strong>An in-image inspector</strong> &mdash; a live
 	object inspector written in Smalltalk. (Class mirrors and browsers already
 	live in the image &mdash; <code>ClassMirror</code>,
