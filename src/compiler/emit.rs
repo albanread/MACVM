@@ -426,6 +426,26 @@ impl<'a> Emitter<'a> {
         }
     }
 
+    /// O1 (compute-into-resident): like [`Self::dest_target`], but a
+    /// resident-spilled dst computes STRAIGHT INTO its resident register —
+    /// `commit` then stores the slot from it and `refresh_resident` sees
+    /// nothing to mirror, dropping the old `op->x16; str x16; mov rr,x16`
+    /// triple to `op->rr; str rr`. ONLY safe for defs whose lowering never
+    /// reads a source AFTER first writing dst (single data instructions —
+    /// ARM reads all operands before writeback, so dst aliasing a source is
+    /// fine — and pure immediate/literal materializations). A fail edge
+    /// taken after the write (smi overflow) still deopts correctly: the
+    /// canonical slot is untouched until `commit`, and trap paths terminate,
+    /// so the momentarily-divergent resident is never read. Multi-instruction
+    /// lowerings that re-read sources (Mul, array ops' guard chains) keep
+    /// the x16 dest-scratch convention.
+    fn dest_target_direct(&self, dst: VReg) -> Reg {
+        if let Some(rr) = self.resident[dst.0 as usize] {
+            return xr(rr);
+        }
+        self.dest_target(dst)
+    }
+
     fn commit(&mut self, dst: VReg, computed_in: Reg) {
         if let Assignment::Spill(slot) = self.assignment_of(dst) {
             emit_spill_access(self.asm, "str", Operand::Reg(computed_in), slot);
@@ -445,7 +465,7 @@ impl<'a> Emitter<'a> {
         let ra = self.resolve(a, 16);
         let rb = self.resolve(b, 17);
         self.emit_tag_check(ra, rb, fail);
-        let d = self.dest_target(dst);
+        let d = self.dest_target_direct(dst);
         let mnem = match op {
             SmiOp::Add => "adds",
             SmiOp::Sub => "subs",
@@ -1905,7 +1925,7 @@ fn emit_ir(e: &mut Emitter, ir: &Ir, next_in_order: Option<BlockId>) {
             e.commit_fp(dst, dd);
         }
         Ir::ConstSmi { dst, value } => {
-            let d = e.dest_target(dst);
+            let d = e.dest_target_direct(dst);
             emit_mov_imm64(e.asm, d, (value << 2) as u64);
             e.commit(dst, d);
         }
@@ -1914,9 +1934,14 @@ fn emit_ir(e: &mut Emitter, ir: &Ir, next_in_order: Option<BlockId>) {
             match e.assignment_of(dst) {
                 Assignment::Reg(r) => e.asm.ldr_literal(xr(r), lit_id),
                 Assignment::Spill(slot) => {
-                    e.asm.ldr_literal(xr(16), lit_id);
-                    emit_spill_access(e.asm, "str", x(16), slot);
-                    e.refresh_resident(dst, xr(16));
+                    // O1: load straight into the resident register when there
+                    // is one (a pure literal load reads no sources - alias-
+                    // safe); the slot store comes from it and refresh is then
+                    // a no-op.
+                    let dl = e.dest_target_direct(dst);
+                    e.asm.ldr_literal(dl, lit_id);
+                    emit_spill_access(e.asm, "str", Operand::Reg(dl), slot);
+                    e.refresh_resident(dst, dl);
                 }
             }
         }
@@ -1936,7 +1961,7 @@ fn emit_ir(e: &mut Emitter, ir: &Ir, next_in_order: Option<BlockId>) {
                 e.commit_fp(dst, dd);
             } else {
                 let rs = e.resolve(src, 16);
-                let dr = e.dest_target(dst);
+                let dr = e.dest_target_direct(dst);
                 if dr.num != rs.num {
                     e.asm.emit("mov", &[Operand::Reg(dr), Operand::Reg(rs)]);
                 }
