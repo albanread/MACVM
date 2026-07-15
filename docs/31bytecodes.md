@@ -29,6 +29,20 @@ the instruction set is trivial *because* the dispatch is universal — and the
 whole burden of performance moves to one question: **how do you make a send
 cheap?** The compiler is the answer to that question.
 
+The one deliberate exception is **control flow**. `ifTrue:`, `ifFalse:`,
+`and:`, `or:`, `whileTrue:`, `whileFalse:`, `timesRepeat:`, `to:do:`, the
+`ifNil:`/`ifNotNil:` family, and `repeat` *look* like ordinary sends to
+block arguments, but the AST→bytecode front-end recognizes them and emits
+`BR_TRUE_FWD`/`JUMP_BACK` directly, dissolving the block bodies inline
+instead of allocating closures. This is the sole front-end "optimization,"
+and it earns its place for a reason nothing else does: it is what gives the
+JIT a real control-flow graph to work on, and what keeps a method that
+branches from being dragged out-of-line by an escaping closure. Every other
+optimization is deferred downstream to the JIT, where the type feedback and
+deoptimization that make optimism safe actually live — the front-end has
+neither, so anything it folded would be weaker (no types) and unsound (no
+guard to deoptimize when a redefinition breaks the assumption).
+
 ## Part 2 — What the compiler knows that the bytecode doesn't say
 
 If the bytecode were all the compiler had, `SEND #+` could never become an
