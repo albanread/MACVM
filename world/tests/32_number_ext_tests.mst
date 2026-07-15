@@ -1,0 +1,87 @@
+"32_number_ext_tests.mst — NumberExtTests: the Number-tower protocol added in
+ world/51_number_ext.mst (powers, roots, factorial, lcm:, quo:/rem:, reciprocal,
+ isPrime, asFloat/asInteger). All pure Smalltalk on the existing numeric classes."
+
+TestCase subclass: NumberExtTests [
+    runAll [
+        self runTest: #testFactorial do: [ self testFactorial ].
+        self runTest: #testRaisedTo do: [ self testRaisedTo ].
+        self runTest: #testSqrt do: [ self testSqrt ].
+        self runTest: #testCoercion do: [ self testCoercion ].
+        self runTest: #testLcm do: [ self testLcm ].
+        self runTest: #testQuoRem do: [ self testQuoRem ].
+        self runTest: #testReciprocal do: [ self testReciprocal ].
+        self runTest: #testIsPrime do: [ self testIsPrime ].
+    ]
+
+    testFactorial [
+        self assert: 0 factorial = 1.
+        self assert: 1 factorial = 1.
+        self assert: 5 factorial = 120.
+        self assert: 10 factorial = 3628800.
+        "grows past SmallInteger into LargeInteger, exactly"
+        self assert: 21 factorial = 51090942171709440000.
+    ]
+
+    testRaisedTo [
+        self assert: (2 raisedTo: 0) = 1.
+        self assert: (2 raisedTo: 10) = 1024.
+        self assert: (3 raisedTo: 4) = 81.
+        self assert: (3 ** 4) = 81.
+        self assert: (2 raisedTo: 100) = 1267650600228229401496703205376.
+        "negative exponent -> reciprocal Fraction"
+        self assert: (2 raisedTo: -2) = (1/4).
+        self assert: (2.0 raisedTo: 3) = 8.0.
+    ]
+
+    testSqrt [
+        self assert: 9 sqrt = 3.0.
+        self assert: 16 sqrt = 4.0.
+        self assert: (1/4) sqrt = 0.5.
+        self assert: (2 sqrt * 2 sqrt - 2.0) abs < 0.0000001.
+    ]
+
+    testCoercion [
+        self assert: 5 asFloat = 5.0.
+        self assert: (1/2) asFloat = 0.5.
+        self assert: 2.5 asInteger = 2.
+        self assert: 2.5 truncated = 2.
+        self assert: (7/2) asInteger = 3.
+    ]
+
+    testLcm [
+        self assert: (4 lcm: 6) = 12.
+        self assert: (3 lcm: 5) = 15.
+        self assert: (0 lcm: 5) = 0.
+        self assert: (6 lcm: 4) = 12.
+    ]
+
+    "quo:/rem: truncate toward zero (unlike // and \\ which floor);
+     rem: carries the sign of the dividend."
+    testQuoRem [
+        self assert: (7 quo: 2) = 3.
+        self assert: (-7 quo: 2) = -3.
+        self assert: (7 rem: 2) = 1.
+        self assert: (-7 rem: 2) = -1.
+        self assert: (7 rem: -2) = 1.
+        "the defining identity, both signs"
+        self assert: ((-7 quo: 2) * 2) + (-7 rem: 2) = -7.
+        self assert: ((7 quo: 3) * 3) + (7 rem: 3) = 7.
+    ]
+
+    testReciprocal [
+        self assert: 5 reciprocal = (1/5).
+        self assert: 2.0 reciprocal = 0.5.
+        self assert: (1/3) reciprocal = 3.
+    ]
+
+    testIsPrime [
+        self assert: 2 isPrime.
+        self assert: 3 isPrime.
+        self assert: 97 isPrime.
+        self deny: 1 isPrime.
+        self deny: 0 isPrime.
+        self deny: 8 isPrime.
+        self deny: 91 isPrime.
+    ]
+]

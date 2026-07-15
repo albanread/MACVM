@@ -1,0 +1,89 @@
+"51_number_ext.mst — the missing Number-tower protocol, all pure Smalltalk on
+ the existing numeric classes (Magnitude>Number>Integer>SmallInteger/LargeInteger,
+ Number>Double, Number>Fraction). Reopens each class to ADD methods — the same
+ class-reopen idiom world/17 and world/28 already use on Number.
+
+ Fills gaps a probe found DNUing: powers (raisedTo:/**), roots (sqrt),
+ factorial, lcm:, truncated division (quo:/rem:), reciprocal, isPrime, and
+ Integer<->Float coercion (asFloat/asInteger). Everything here is built on
+ methods that already work: Double>>sqrt, Integer>>gcd:/even/// /\\, Number>>
+ abs/sign, Integer*Float coercion (5 * 1.0 => 5.0), and the inlined loops."
+
+Magnitude subclass: Number [
+    "1/self — a Fraction for integers, a Float for floats."
+    reciprocal [ ^1 / self ]
+
+    "Real square root, via the Double primitive. Negatives are refused
+     (no complex numbers) rather than returning a NaN silently."
+    sqrt [
+        self < 0 ifTrue: [ ^self error: 'sqrt of a negative number' ].
+        ^self asFloat sqrt
+    ]
+
+    "self raised to an INTEGER power — fast exponentiation by squaring.
+     A negative exponent yields the reciprocal; a non-integer exponent is
+     refused (exp/ln are not available yet) rather than silently wrong."
+    raisedTo: aNumber [
+        | result base n |
+        aNumber isInteger ifFalse: [
+            ^self error: 'raisedTo: only supports integer exponents' ].
+        aNumber = 0 ifTrue: [ ^1 ].
+        aNumber < 0 ifTrue: [ ^(self raisedTo: aNumber negated) reciprocal ].
+        result := 1.
+        base := self.
+        n := aNumber.
+        [ n > 0 ] whileTrue: [
+            n odd ifTrue: [ result := result * base ].
+            n := n // 2.
+            n > 0 ifTrue: [ base := base * base ] ].
+        ^result
+    ]
+
+    ** aNumber [ ^self raisedTo: aNumber ]
+]
+
+Number subclass: Integer [
+    "An exact Integer as the nearest Float."
+    asFloat [ ^self * 1.0 ]
+
+    factorial [
+        | result |
+        self < 0 ifTrue: [ ^self error: 'factorial of a negative integer' ].
+        result := 1.
+        2 to: self do: [:i | result := result * i ].
+        ^result
+    ]
+
+    "Least common multiple, always non-negative; 0 with either operand zero."
+    lcm: anInteger [
+        (self = 0 or: [ anInteger = 0 ]) ifTrue: [ ^0 ].
+        ^(self abs // (self gcd: anInteger)) * anInteger abs
+    ]
+
+    "Truncated division and its remainder — round toward zero, UNLIKE
+     // and \\ which floor. `rem:` carries the sign of the dividend."
+    quo: aNumber [ ^(self abs // aNumber abs) * (self sign * aNumber sign) ]
+    rem: aNumber [ ^self - ((self quo: aNumber) * aNumber) ]
+
+    isPrime [
+        | i |
+        self < 2 ifTrue: [ ^false ].
+        self = 2 ifTrue: [ ^true ].
+        self even ifTrue: [ ^false ].
+        i := 3.
+        [ i * i <= self ] whileTrue: [
+            self \\ i = 0 ifTrue: [ ^false ].
+            i := i + 2 ].
+        ^true
+    ]
+]
+
+Number subclass: Double [
+    asFloat [ ^self ]
+    asInteger [ ^self truncated ]
+]
+
+Number subclass: Fraction [
+    asFloat [ ^self numerator asFloat / self denominator asFloat ]
+    asInteger [ ^self truncated ]
+]

@@ -86,3 +86,4 @@
 # CocoaPad: the bridge capstone (C5) — a native NSWindow/field/button built
 # in Smalltalk (onMain sends + Cocoa action:); Demos-menu launched.
 50_cocoapad.mst
+51_number_ext.mst
