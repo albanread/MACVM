@@ -1,0 +1,44 @@
+"39_final_ext_tests.mst — FinalExtTests: logarithms, string whitespace
+ constants, and Association ordering (world/58_final_ext.mst)."
+
+TestCase subclass: FinalExtTests [
+    runAll [
+        self runTest: #testLog do: [ self testLog ].
+        self runTest: #testFloorLog do: [ self testFloorLog ].
+        self runTest: #testStringConstants do: [ self testStringConstants ].
+        self runTest: #testAssociationOrder do: [ self testAssociationOrder ].
+    ]
+
+    testLog [
+        self assert: 100 log = 2.0.
+        self assert: (8 log: 2) = 3.0.
+        self assert: (1 log: 10) = 0.0.
+    ]
+
+    "floorLog: is EXACT (repeated division), unlike floor of the float log —
+     1000 log is 2.9999996, which would wrongly floor to 2."
+    testFloorLog [
+        self assert: (8 floorLog: 2) = 3.
+        self assert: (1000 floorLog: 10) = 3.
+        self assert: (255 floorLog: 2) = 7.
+        self assert: (256 floorLog: 2) = 8.
+        self assert: (1 floorLog: 2) = 0.
+    ]
+
+    testStringConstants [
+        self assert: String cr size = 1.
+        self assert: String cr first asInteger = 13.
+        self assert: String lf first asInteger = 10.
+        self assert: String tab first asInteger = 9.
+        self assert: String space = ' '.
+        self assert: 'hello' asUppercaseFirst = 'Hello'.
+    ]
+
+    testAssociationOrder [
+        self assert: ((3 -> 4) < (5 -> 6)).
+        self deny: ((5 -> 1) < (2 -> 9)).
+        self assert: ((3 -> 9) <= (3 -> 1)).
+        "a collection of associations now sorts by key"
+        self assert: ((#(#c #a #b) collect: [:s | s -> 1 ]) asSortedCollection first key) = #a.
+    ]
+]

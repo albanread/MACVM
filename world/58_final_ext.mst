@@ -1,0 +1,38 @@
+"58_final_ext.mst — last round of low-hanging pure-Smalltalk conveniences:
+ logarithms, string whitespace constants, and Association ordering. Built on
+ asFloat/ln (from world/51 + Double), // , capitalized (world/53), key."
+
+Magnitude subclass: Number [
+    "Base-10 and arbitrary-base logarithms (answer Floats)."
+    log [ ^self asFloat ln / 10 asFloat ln ]
+    log: base [ ^self asFloat ln / base asFloat ln ]
+
+    "floor(log_base(self)) computed EXACTLY by repeated division — avoids the
+     float log family's rounding (e.g. 8 floorLog: 2 must be 3, not 2)."
+    floorLog: base [
+        | n count |
+        (self <= 0 or: [ base <= 1 ]) ifTrue: [ ^self error: 'floorLog: out of domain' ].
+        n := self. count := 0.
+        [ n >= base ] whileTrue: [ n := n // base. count := count + 1 ].
+        ^count
+    ]
+]
+
+ArrayedCollection subclass: String [
+    asUppercaseFirst [ ^self capitalized ]
+
+    "Single-character whitespace strings (String cr/lf/tab/space), handy for
+     building text — Character cr etc. give the Character, these give a String."
+    String class >> cr [ ^String with: (Character value: 13) ]
+    String class >> lf [ ^String with: (Character value: 10) ]
+    String class >> tab [ ^String with: (Character value: 9) ]
+    String class >> space [ ^String with: (Character value: 32) ]
+]
+
+Object subclass: Association [
+    "Order associations by key (so a collection of them sorts sensibly)."
+    < anAssociation [ ^self key < anAssociation key ]
+    <= anAssociation [ ^self key <= anAssociation key ]
+    > anAssociation [ ^self key > anAssociation key ]
+    >= anAssociation [ ^self key >= anAssociation key ]
+]

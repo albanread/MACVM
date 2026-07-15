@@ -42,4 +42,5 @@ TestRunner run: ObjectExtTests.
 TestRunner run: IterationExtTests.
 TestRunner run: DictPointSetExtTests.
 TestRunner run: FormatIterExtTests.
+TestRunner run: FinalExtTests.
 TestRunner report.
