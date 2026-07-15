@@ -896,7 +896,19 @@
     }
   }
 
-  function openContextMenu(x, y, items) {
+  // The clipboard actually works like this: the SELECTED TEXT is captured
+  // at menu-OPEN time (clicking a menu item can collapse the selection or
+  // move focus, which is why routing bare cut:/copy: through the native
+  // responder chain silently did nothing against a WKWebView), carried on
+  // the menu context, and shipped WITH the editAction message — the Rust
+  // side writes it straight onto NSPasteboard. Cut deletes the field range
+  // here in JS; Select All is pure JS; Paste asks Rust for the pasteboard
+  // string, which comes back through macvmPasteText below.
+  function fieldSelection(el) {
+    return el.value.substring(el.selectionStart || 0, el.selectionEnd || 0);
+  }
+
+  function openContextMenu(x, y, items, ctx) {
     closeContextMenu();
     const menu = document.createElement("div");
     menu.className = "st-context-menu";
@@ -909,7 +921,7 @@
       item.addEventListener("click", function (ev) {
         ev.preventDefault();
         closeContextMenu();
-        post({ kind: "editAction", action: action });
+        runEditAction(action, ctx);
       });
       menu.appendChild(item);
     });
@@ -917,14 +929,57 @@
     activeContextMenu = menu;
   }
 
+  function runEditAction(action, ctx) {
+    ctx = ctx || {};
+    const field = ctx.field || null;
+    if (action === "selectAll") {
+      if (field) field.select();
+      else if (window.getSelection)
+        window.getSelection().selectAllChildren(document.body);
+      return;
+    }
+    if (action === "copy" || action === "cut") {
+      const text = ctx.text || "";
+      if (action === "cut" && field && text.length > 0) {
+        // Delete the captured range from the field ourselves — the
+        // responder-chain cut: never reached it either.
+        field.setRangeText("", ctx.selStart, ctx.selEnd, "start");
+        field.dispatchEvent(new Event("input", { bubbles: true }));
+      }
+      if (text.length > 0) post({ kind: "editAction", action: "copy", text: text });
+      return;
+    }
+    if (action === "paste") {
+      if (field) field.focus();
+      post({ kind: "editAction", action: "paste" });
+    }
+  }
+
+  // Rust answers a paste request with the pasteboard string: insert it at
+  // the focused field's cursor (replacing any selection).
+  window.macvmPasteText = function (text) {
+    const el = document.activeElement;
+    if (!el || !el.matches || !el.matches("textarea, input")) return;
+    el.setRangeText(text, el.selectionStart || 0, el.selectionEnd || 0, "end");
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+  };
+
   document.addEventListener(
     "contextmenu",
     function (ev) {
       ev.preventDefault();
-      if (ev.target.closest("textarea, input")) {
-        openContextMenu(ev.clientX, ev.clientY, EDITABLE_FIELD_MENU_ITEMS);
+      const field = ev.target.closest("textarea, input");
+      if (field) {
+        openContextMenu(ev.clientX, ev.clientY, EDITABLE_FIELD_MENU_ITEMS, {
+          field: field,
+          text: fieldSelection(field),
+          selStart: field.selectionStart || 0,
+          selEnd: field.selectionEnd || 0,
+        });
       } else if (window.getSelection && window.getSelection().toString().length > 0) {
-        openContextMenu(ev.clientX, ev.clientY, SELECTION_MENU_ITEMS);
+        openContextMenu(ev.clientX, ev.clientY, SELECTION_MENU_ITEMS, {
+          text: window.getSelection().toString(),
+        });
       } else {
         closeContextMenu();
       }

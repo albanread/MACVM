@@ -1198,6 +1198,41 @@ fn send_edit_action(action: &str) {
     objc::send3_id(app, sel("sendAction:to:from:"), sel(sel_name), NIL, NIL);
 }
 
+/// The REAL clipboard (the responder-chain route above never reliably
+/// reached a WKWebView selection — the user-visible "copy does nothing"
+/// bug): smtk.js captures the selected text at context-menu-open time and
+/// ships it with the editAction message; this writes it straight onto the
+/// general NSPasteboard. `"public.utf8-plain-text"` is
+/// NSPasteboardTypeString's underlying UTI — used literally so the bridge
+/// needs no AppKit constant linkage.
+fn pasteboard_write(text: &str) {
+    let pb = objc::send0(objc::get_class("NSPasteboard"), sel("generalPasteboard"));
+    objc::send0(pb, sel("clearContents"));
+    objc::send2_id(
+        pb,
+        sel("setString:forType:"),
+        objc::nsstring(text),
+        objc::nsstring("public.utf8-plain-text"),
+    );
+}
+
+/// The paste half: read the general pasteboard's string (empty when it
+/// holds no text) — smtk.js inserts it at the focused field's cursor via
+/// `macvmPasteText`.
+fn pasteboard_read() -> String {
+    let pb = objc::send0(objc::get_class("NSPasteboard"), sel("generalPasteboard"));
+    let ns = objc::send1_id(
+        pb,
+        sel("stringForType:"),
+        objc::nsstring("public.utf8-plain-text"),
+    );
+    if ns.is_null() {
+        String::new()
+    } else {
+        objc::string_from_nsstring(ns)
+    }
+}
+
 fn dict_get_string(dict: Id, key: &str) -> String {
     if dict.is_null() {
         return String::new();
@@ -1444,7 +1479,30 @@ extern "C" fn on_script_message(_this: Id, _cmd: Sel, _controller: Id, message: 
             }
         }
         "editAction" => {
-            send_edit_action(&dict_get_string(body, "action"));
+            let action = dict_get_string(body, "action");
+            match action.as_str() {
+                // Copy: the selected text rode in with the message
+                // (captured at menu-open in smtk.js) — write it to the
+                // real pasteboard. An empty payload falls back to the
+                // old responder-chain path (harmless, occasionally right).
+                "copy" => {
+                    let text = dict_get_string(body, "text");
+                    if text.is_empty() {
+                        send_edit_action("copy");
+                    } else {
+                        pasteboard_write(&text);
+                    }
+                }
+                // Paste: read the pasteboard and hand the string back to
+                // the page; smtk.js inserts it at the focused cursor.
+                "paste" => {
+                    let text = pasteboard_read();
+                    if !text.is_empty() {
+                        eval_js(&format!("macvmPasteText({})", js_string_literal(&text)));
+                    }
+                }
+                other => send_edit_action(other),
+            }
         }
         "smappl" => {
             // A `<smappl>` placeholder on the loaded page asks to be rendered
