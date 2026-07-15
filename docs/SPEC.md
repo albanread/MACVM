@@ -956,6 +956,9 @@ handles/safepoint), `can_fail`. *(Amended per S3/S4 review: `Activated` added.)*
 | control | `ensure: ifCurtailed:` (set frame markers) |
 | system | `quit gcScavenge gcFull gcStats millisecondClock printOnStdout: sourceCompile: error:` (dev hooks; `gcStats` returns a pinned Array of counters — soak tests and S14's Context-elision gate read it; `error:` prints message + Smalltalk stack trace and terminates, §6.3) |
 | game (ids 200–215) | `GamePane` drawing/palette/present + frame-loop (`run`/`stepWithKeys:`), `Sprite` define/move/colour, `Sound`/`Tune` audio — each validates its args, emits a `GameCommand` over the VM→GUI game sink, and returns `self` (`docs/gamepane_design.md`) |
+| workers (ids 220–228) | `Worker` spawn/send/poll/await/terminate + the MOP pickle (`pickle:`/`unpickle:`) — multi-VM message passing, deep-copy only (`docs/multi-smalltalk-worker.md`) |
+| Cocoa (ids 230–245) | ObjC sends (fixed-arity, auto-shape, and the main-thread hop), NSString bridging, autorelease pools, target/action callbacks (`docs/cocoa_bridge_design.md`) |
+| reflection (ids 246–248) | `respondsTo:` (method-dict chain lookup), `shallowCopy` (same-klass, same-size, slots copied verbatim), `numArgs` (a block's argc) — the three that cannot be written in Smalltalk; `copy` = `shallowCopy` + `postCopy` sits on top in `world/59_reflection.mst` (`docs/ISA.md`) |
 
 `sourceCompile:` exposes the Rust source compiler to Smalltalk (later enables
 an in-language `compile:` and eventually a self-hosted tools story).

@@ -62,14 +62,48 @@ rather than bytecode-level micro-specialization, keeping the set small
 
 ## Primitives
 
-> **Snapshot — not exhaustive.** The id-by-id table below covers the original
-> core set (ids ≤ ~110). Later passes added many more groups — unboxed float
-> (`float_fastpath_design.md`), SIMD (`SIMD.md`), FFI (`FFI.md`), and the game
-> group at ids 200–215 (`gamepane_design.md`) — so the live `PRIMITIVES` table
-> is now ~124 entries. **The authoritative current list is the source itself:**
-> `src/runtime/primitives.rs` and its `prim_ids_frozen` regression test (and the
-> generated GUI reference page `gui/reference/pages/macvm-help/primitives.html`).
-> This document remains the design-level reference for how a primitive behaves.
+> **Scope.** The live `PRIMITIVES` table is **153 entries, ids 1–248**
+> (`src/runtime/primitives.rs`; its `prim_ids_frozen` test pins every id→name
+> pair and fails the build if the table grows without this being revisited —
+> that test, not this file, is the authority).
+>
+> The **id map** below covers all 153 and names the owning document for each
+> group. The **id-by-id table** that follows details the core set (ids ≤110)
+> and the reflection group (246–248); the later groups are documented
+> id-by-id in their own design docs rather than duplicated here, because that
+> is where their semantics actually live.
+
+### Id map — every group, and where it is documented
+
+| Ids | Group | Documented in |
+|---|---|---|
+| 1–15 | smi arithmetic / comparison | this file, below |
+| 20–28 | oops (identity, class, basicNew, instVar/indexed access) | this file, below |
+| 40–45 | ByteArray/String bytes | this file, below |
+| 50–54 | BlockClosure `value` family | this file, below |
+| 60–61 | control (`ensure:`, `ifCurtailed:`) — set frame markers | this file, below; error-path curtailment in `src/interpreter/unwind.rs` |
+| 62–64 | method reflection (`primitiveOf:selector:`, `methodSends:selector:target:`, `perform:withArguments:`) | this file, below |
+| 90–97 | system dev hooks (quit, GC, clock, `error:`, `gcStats`) | this file, below |
+| 98–99 | class enumeration (`allClasses`, `selectorsOf:`) | `APPS.md` |
+| 100–109 | Double arithmetic | this file, below |
+| 110 | `Symbol asSymbol` | this file, below |
+| 111 | `__vmStats` dev hook | `PERF.md` |
+| 112–120 | Alien raw memory (byte/long/double at:, `new:`, `forAddress:size:`) | `FFI.md` |
+| 121–126 | Double transcendentals (`sin cos tan exp ln atan`) | `float_fastpath_design.md` |
+| 127–133 | `Float64x2` construct / arithmetic / `at:` | `SIMD.md` |
+| 134–140 | `Float32x4` construct / arithmetic / `at:` | `SIMD.md` |
+| 141–147 | `FloatArray` element access + NEON bulk kernels (`+@`, `sum`, `dot:`) | `SIMD.md` |
+| 148–156 | `Int32x4` construct / arithmetic, `FloatArray scale:/max/min` | `SIMD.md` |
+| 157–158 | variable reflection (`instanceVariablesOf:`, `classVariablesOf:`) | `APPS.md` §3 |
+| 200–215 | game pane: drawing, palette, sprites, frame loop, audio, `blit:` | `gamepane_design.md` |
+| 220–228 | multi-VM workers: spawn/send/poll/terminate + the MOP pickle | `multi-smalltalk-worker.md` |
+| 230–245 | Cocoa bridge: ObjC sends, NSString, pools, actions | `cocoa_bridge_design.md` |
+| 246–248 | reflection (`respondsTo:`, `shallowCopy`, `numArgs`) | this file, below |
+
+Ids are never reused or renumbered: `prim_ids_frozen` locks the whole
+sequence, and a `<primitive: N>` pragma in a `.mst` (or in an image) is a
+permanent reference to a specific meaning. Gaps (16–19, 29–39, 46–49, 55–59,
+65–89, 159–199, 216–219, 229) are deliberate room for each group to grow.
 
 Grouped by receiver type, each bound to Smalltalk source via
 `<primitive: N>`. Every primitive validates its own receiver/argument
@@ -139,6 +173,9 @@ always succeed once dispatched).
 | 108 | `asDouble` | Double | 0 | Yes | Yes | Converts a smi receiver to a Double. |
 | 109 | `printDigits` | Double | 0 | Yes | Yes | Answers a shortest-round-trip decimal string for the receiver (`"nan"`/`"inf"`/`"-inf"` for non-finite values; always includes a decimal point for finite ones). |
 | 110 | `asSymbol` | Symbol | 0 | Yes | Yes | Interns the receiver's bytes (a String) as a Symbol, answering the canonical, unique instance. |
+| 246 | `respondsTo:` | reflection | 1 | No | Yes | Answers whether a lookup from the receiver's klass finds the argument selector — the same method-dictionary chain walk (and lookup cache) real dispatch uses. Fails if the argument is not a Symbol. Deliberately a primitive rather than Smalltalk over `selectorsOf:` (98/99), which would materialize an Array of every selector at every level of the superclass chain just to answer a Boolean. |
+| 247 | `shallowCopy` | reflection | 0 | Yes | Yes | Answers a fresh object of the receiver's exact klass and size, with every named instance variable and indexed element copied verbatim — one level deep, so the elements themselves are shared. Fails for immediates (smis, characters) and for value-like or internal formats (Double, Klass, Method, Closure, Context, Process), where `Object>>shallowCopy`'s fallback answers `self`. **Allocates**, so it can scavenge and move its own receiver: the receiver is held in a handle across the allocation and re-read from it (`alloc_words` roots the klass itself). Callers want `copy` (= `shallowCopy` + `postCopy`), not this: a bare shallowCopy of a collection shares the original's internal storage. |
+| 248 | `numArgs` | reflection | 0 | No | Yes | Answers a BlockClosure's declared argument count, off its CompiledBlock. Fails if the receiver is not a closure. |
 
 Id ranges are deliberately non-contiguous (15/9/6/5/2/8/10/1 used, with gaps
 at e.g. 16–19, 29–39, 46–49, 55–59, 62–89, 98–99) — headroom for each group

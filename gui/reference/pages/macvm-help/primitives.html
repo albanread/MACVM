@@ -10,7 +10,7 @@ primitive <code>N</code> first; if the primitive <strong>succeeds</strong>,
 the method returns its result immediately, and if it <strong>fails</strong>,
 execution falls through to the ordinary Smalltalk code below &mdash; which is
 how, for example, <code>SmallInteger&nbsp;+</code> handles overflow by
-promoting to a large integer. There are <strong>106 numbered
+promoting to a large integer. There are <strong>153 numbered
 primitives</strong>; the tables below group them by area.</p>
 
 <p align="left">The columns: <em>No.</em> is the primitive number written in
@@ -63,12 +63,18 @@ these directly into native code.</p>
 <tr><td align="right">52</td><td align="left"><code>value:value:</code></td><td align="right">2</td><td align="left">can fail</td></tr>
 <tr><td align="right">53</td><td align="left"><code>value:value:value:</code></td><td align="right">3</td><td align="left">can fail</td></tr>
 <tr><td align="right">54</td><td align="left"><code>valueWithArguments:</code></td><td align="right">1</td><td align="left">can fail</td></tr>
-</table><h3 align="left">Unwind protection &amp; reflection</h3><p align="left"><code>ensure:</code> / <code>ifCurtailed:</code> run a block on the way out (including a non-local return), and two reflective queries over the method dictionaries.</p><table>
+</table><h3 align="left">Unwind protection &amp; reflection</h3><p align="left"><code>ensure:</code>
+and <code>ifCurtailed:</code> arm a cleanup block on the protected block's own
+frame; it runs on <em>every</em> way out &mdash; normal completion, a non-local
+return, and an unhandled error (<code>self error:</code>, a DNU), which
+curtails everything between the failure and the entry frame. Alongside them,
+reflective queries over the method dictionaries.</p><table>
 <tr><td align="right"><strong>No.</strong></td><td align="left"><strong>Selector</strong></td><td align="right"><strong>Args</strong></td><td align="left"><strong>Notes</strong></td></tr>
-<tr><td align="right">60</td><td align="left"><code>ensure:</code></td><td align="right">1</td><td align="left">can fail</td></tr>
-<tr><td align="right">61</td><td align="left"><code>ifCurtailed:</code></td><td align="right">1</td><td align="left">can fail</td></tr>
+<tr><td align="right">60</td><td align="left"><code>ensure:</code></td><td align="right">1</td><td align="left">runs the cleanup on every exit path; can fail</td></tr>
+<tr><td align="right">61</td><td align="left"><code>ifCurtailed:</code></td><td align="right">1</td><td align="left">runs the cleanup only when the block is curtailed (non-local return or error); can fail</td></tr>
 <tr><td align="right">62</td><td align="left"><code>primitiveOf:selector:</code></td><td align="right">2</td><td align="left">can fail</td></tr>
 <tr><td align="right">63</td><td align="left"><code>methodSends:selector:target:</code></td><td align="right">3</td><td align="left">can fail</td></tr>
+<tr><td align="right">64</td><td align="left"><code>perform:withArguments:</code></td><td align="right">2</td><td align="left">send a selector chosen at runtime, args in an Array; allocates; can fail</td></tr>
 </table><h3 align="left">System</h3><p align="left">Process control, output, timing, and explicit garbage collection and statistics.</p><table>
 <tr><td align="right"><strong>No.</strong></td><td align="left"><strong>Selector</strong></td><td align="right"><strong>Args</strong></td><td align="left"><strong>Notes</strong></td></tr>
 <tr><td align="right">90</td><td align="left"><code>quit</code></td><td align="right">0</td><td align="left">cannot fail</td></tr>
@@ -81,6 +87,8 @@ these directly into native code.</p>
 <tr><td align="right">97</td><td align="left"><code>gcStats</code></td><td align="right">0</td><td align="left">allocates; cannot fail</td></tr>
 <tr><td align="right">98</td><td align="left"><code>allClasses</code></td><td align="right">0</td><td align="left">allocates; cannot fail</td></tr>
 <tr><td align="right">99</td><td align="left"><code>selectorsOf:</code></td><td align="right">1</td><td align="left">allocates; can fail</td></tr>
+<tr><td align="right">157</td><td align="left"><code>instanceVariablesOf:</code></td><td align="right">1</td><td align="left">a class's own instance-variable names, as an Array; allocates; can fail</td></tr>
+<tr><td align="right">158</td><td align="left"><code>classVariablesOf:</code></td><td align="right">1</td><td align="left">a class's own class-variable names, as an Array; allocates; can fail</td></tr>
 <tr><td align="right">111</td><td align="left"><code>__vmStats</code></td><td align="right">0</td><td align="left">allocates; cannot fail</td></tr>
 </table><h3 align="left">Double (floating point)</h3><p align="left">Boxed double-precision arithmetic and conversions. The JIT unboxes these into native register math inside a float region (see the tour's <a href="tour/fastfloats.html">Fast Floating Point</a> page).</p><table>
 <tr><td align="right"><strong>No.</strong></td><td align="left"><strong>Selector</strong></td><td align="right"><strong>Args</strong></td><td align="left"><strong>Notes</strong></td></tr>
@@ -171,6 +179,44 @@ VM with no worker role. See <code>world/47_worker.mst</code> and
 <tr><td align="right">226</td><td align="left"><code>primSelfId</code></td><td align="right">0</td><td align="left">0 in the primary, i &ge; 1 inside worker i</td></tr>
 <tr><td align="right">227</td><td align="left"><code>pickle:</code></td><td align="right">1</td><td align="left">object graph &rarr; MOP ByteArray (deep copy; refuses blocks/contexts/classes/aliens); allocates; can fail</td></tr>
 <tr><td align="right">228</td><td align="left"><code>unpickle:</code></td><td align="right">1</td><td align="left">MOP ByteArray &rarr; a fresh object graph in THIS heap; allocates; can fail</td></tr>
+</table>
+
+<h3 align="left">Cocoa bridge</h3><p align="left">Objective-C objects as ordinary
+Smalltalk receivers. An <code>ObjcRef</code> wraps an ObjC <code>id</code> in
+its byte tail; sends go out through the real ObjC runtime, with AppKit work
+hopped to the main thread. Foundation reads as plain Smalltalk because
+<code>doesNotUnderstand:</code> routes unknown selectors here. See
+<code>world/49_cocoa.mst</code> and <code>docs/cocoa_bridge_design.md</code>.</p><table>
+<tr><td align="right"><strong>No.</strong></td><td align="left"><strong>Selector</strong></td><td align="right"><strong>Args</strong></td><td align="left"><strong>Notes</strong></td></tr>
+<tr><td align="right">230</td><td align="left"><code>primClassNamed:</code></td><td align="right">1</td><td align="left">look up an ObjC class by name &rarr; ObjcRef; allocates; can fail</td></tr>
+<tr><td align="right">231</td><td align="left"><code>primSend:</code></td><td align="right">1</td><td align="left">send a 0-argument selector; allocates; can fail</td></tr>
+<tr><td align="right">232</td><td align="left"><code>primSend:with:</code></td><td align="right">2</td><td align="left">send a 1-argument selector; allocates; can fail</td></tr>
+<tr><td align="right">233</td><td align="left"><code>primSend:with:with:</code></td><td align="right">3</td><td align="left">send a 2-argument selector; allocates; can fail</td></tr>
+<tr><td align="right">234</td><td align="left"><code>primSendI64:</code></td><td align="right">1</td><td align="left">send returning a machine integer rather than an object; can fail</td></tr>
+<tr><td align="right">235</td><td align="left"><code>primSendString:</code></td><td align="right">1</td><td align="left">send returning an NSString, answered as a Smalltalk String; allocates; can fail</td></tr>
+<tr><td align="right">236</td><td align="left"><code>primRelease</code></td><td align="right">0</td><td align="left">release the wrapped id and invalidate the ref; can fail</td></tr>
+<tr><td align="right">237</td><td align="left"><code>primNSString:</code></td><td align="right">1</td><td align="left">Smalltalk String &rarr; NSString; allocates; can fail</td></tr>
+<tr><td align="right">238</td><td align="left"><code>primDrainPool</code></td><td align="right">0</td><td align="left">drain the current autorelease pool</td></tr>
+<tr><td align="right">239</td><td align="left"><code>primIsValid</code></td><td align="right">0</td><td align="left">has this ref been released?</td></tr>
+<tr><td align="right">240</td><td align="left"><code>primSend:args:ret:</code></td><td align="right">3</td><td align="left">send with an explicit argument/return shape; allocates; can fail</td></tr>
+<tr><td align="right">241</td><td align="left"><code>primSendAuto:args:</code></td><td align="right">2</td><td align="left">send, deriving the ABI shape from the live runtime's own method signature; allocates; can fail</td></tr>
+<tr><td align="right">242</td><td align="left"><code>primSendMainAuto:args:</code></td><td align="right">2</td><td align="left">the same, hopped to the main thread and waited on &mdash; AppKit's rule; allocates; can fail</td></tr>
+<tr><td align="right">243</td><td align="left"><code>primNewAction:</code></td><td align="right">1</td><td align="left">wrap a Smalltalk block as an ObjC target/action; the fire posts an event to the VM inbox; allocates; can fail</td></tr>
+<tr><td align="right">244</td><td align="left"><code>primPoolPush</code></td><td align="right">0</td><td align="left">open a <code>poolDo:</code> mint-list scope (rooted in-heap)</td></tr>
+<tr><td align="right">245</td><td align="left"><code>primPoolPop</code></td><td align="right">0</td><td align="left">close it; the abort path clears the stack</td></tr>
+</table>
+
+<h3 align="left">Reflection</h3><p align="left">The three questions a program can
+ask about itself that Smalltalk cannot answer in Smalltalk. <code>copy</code>
+is <em>not</em> here: it is ordinary Smalltalk (<code>shallowCopy</code> then
+<code>postCopy</code>) in <code>world/59_reflection.mst</code> &mdash; the
+second step matters, because a shallow copy shares whatever its slots point
+at, so collections override <code>postCopy</code> to un-share their internal
+storage.</p><table>
+<tr><td align="right"><strong>No.</strong></td><td align="left"><strong>Selector</strong></td><td align="right"><strong>Args</strong></td><td align="left"><strong>Notes</strong></td></tr>
+<tr><td align="right">246</td><td align="left"><code>respondsTo:</code></td><td align="right">1</td><td align="left">does a lookup from the receiver's class find this selector? the same chain walk real dispatch uses; can fail (non-Symbol argument)</td></tr>
+<tr><td align="right">247</td><td align="left"><code>shallowCopy</code></td><td align="right">0</td><td align="left">a fresh object of the same class and size, slots copied verbatim (one level deep &mdash; elements are shared); allocates; fails for immediates and value/internal shapes, where the fallback answers <code>self</code></td></tr>
+<tr><td align="right">248</td><td align="left"><code>numArgs</code></td><td align="right">0</td><td align="left">a block's declared argument count; can fail</td></tr>
 </table>
 
 <h3 align="left">The FFI primitive</h3>
