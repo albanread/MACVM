@@ -1,0 +1,87 @@
+"33_collection_ext_tests.mst — CollectionExtTests: the Collection protocol added
+ in world/52_collection_ext.mst (reductions, empty-guards, slices, sort, withAll:)."
+
+TestCase subclass: CollectionExtTests [
+    runAll [
+        self runTest: #testReductions do: [ self testReductions ].
+        self runTest: #testIncludesAll do: [ self testIncludesAll ].
+        self runTest: #testEmptyGuards do: [ self testEmptyGuards ].
+        self runTest: #testSlices do: [ self testSlices ].
+        self runTest: #testAccessors do: [ self testAccessors ].
+        self runTest: #testCopyReverse do: [ self testCopyReverse ].
+        self runTest: #testSort do: [ self testSort ].
+        self runTest: #testWithAll do: [ self testWithAll ].
+    ]
+
+    testReductions [
+        self assert: #(1 2 3 4) sum = 10.
+        self assert: (1 to: 100) sum = 5050.
+        self assert: #(10 5 8 1) max = 10.
+        self assert: #(10 5 8 1) min = 1.
+        self assert: #(2 4 6) average = 4.
+        self assert: #(42) sum = 42.
+        self assert: #(42) max = 42.
+    ]
+
+    testIncludesAll [
+        self assert: (#(1 2 3 4) includesAll: #(1 3)).
+        self deny: (#(1 2 3) includesAll: #(1 9)).
+        self assert: (#(1 2 3) includesAll: #()).
+        self assert: (#(1 2 3) includesAny: #(9 2)).
+        self deny: (#(1 2 3) includesAny: #(8 9)).
+    ]
+
+    testEmptyGuards [
+        self assert: (#() ifEmpty: [ 42 ]) = 42.
+        self assert: (#(1) ifEmpty: [ 42 ]) = #(1).
+        self assert: (#() ifNotEmpty: [ 42 ]) isNil.
+        self assert: (#(1 2) ifNotEmpty: [ 99 ]) = 99.
+        self assert: (#() ifEmpty: [ 1 ] ifNotEmpty: [ 2 ]) = 1.
+        self assert: (#(7) ifEmpty: [ 1 ] ifNotEmpty: [ 2 ]) = 2.
+        self assert: (#(7) ifNotEmpty: [ 2 ] ifEmpty: [ 1 ]) = 2.
+    ]
+
+    testSlices [
+        self assert: (#(1 2 3 4 5) first: 2) = #(1 2).
+        self assert: (#(1 2 3 4 5) last: 2) = #(4 5).
+        self assert: #(1 2 3 4) allButFirst = #(2 3 4).
+        self assert: #(1 2 3 4) allButLast = #(1 2 3).
+        self assert: (#(1 2 3 4) allButFirst: 2) = #(3 4).
+        self assert: (#(1 2 3 4) allButLast: 2) = #(1 2).
+        self assert: #(1) allButFirst = #().
+        self assert: #(1) allButLast = #().
+    ]
+
+    testAccessors [
+        self assert: #(10 20 30 40) second = 20.
+        self assert: #(10 20 30 40) third = 30.
+        self assert: #(10 20 30 40) fourth = 40.
+    ]
+
+    testCopyReverse [
+        | a c |
+        self assert: #(1 2 3) copy = #(1 2 3).
+        self assert: #(1 2 3) reverse = #(3 2 1).
+        "copy is independent of the original"
+        a := Array withAll: #(1 2 3).
+        c := a copy.
+        c at: 1 put: 99.
+        self assert: (a at: 1) = 1.
+    ]
+
+    testSort [
+        self assert: #(3 1 4 1 5) sorted = #(1 1 3 4 5).
+        self assert: (#(3 1 4) sorted: [:x :y | x > y ]) = #(4 3 1).
+        "sort mutates in place and answers the receiver"
+        self assert: (Array withAll: #(5 3 8 1)) sort = #(1 3 5 8).
+        self assert: ((Array withAll: #(5 3 8 1)) sort: [:x :y | x > y ]) = #(8 5 3 1).
+    ]
+
+    testWithAll [
+        self assert: (Array withAll: #(5 3 8)) = #(5 3 8).
+        self assert: (Array withAll: (1 to: 4)) = #(1 2 3 4).
+        self assert: (OrderedCollection withAll: #(3 1 2)) asArray = #(3 1 2).
+        self assert: (Set withAll: #(1 2 2 3)) size = 3.
+        self assert: (Bag withAll: #(1 1 2)) size = 3.
+    ]
+]

@@ -87,3 +87,4 @@
 # in Smalltalk (onMain sends + Cocoa action:); Demos-menu launched.
 50_cocoapad.mst
 51_number_ext.mst
+52_collection_ext.mst

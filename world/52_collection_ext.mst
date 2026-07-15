@@ -1,0 +1,112 @@
+"52_collection_ext.mst — the common Collection protocol a probe found missing,
+ all pure Smalltalk on the existing classes (Object>Collection>Sequenceable
+ Collection>ArrayedCollection>Array/String, and OrderedCollection/Interval).
+ Reopens Collection and SequenceableCollection to ADD methods (the world/40
+ reopen idiom), built on do:/inject:into:/isEmpty/includes:/at:/size/
+ copyFrom:to:/reversed/at:put:/asSortedCollection — all of which already work.
+
+ Fills: sum/max/min/average, includesAll:, ifEmpty:/ifNotEmpty: family,
+ first:/last:/allButFirst.../second..fourth, copy, reverse, sort/sorted."
+
+Object subclass: Collection [
+    "Reductions. Empty is an error (there is no meaningful identity for max/min,
+     and matching Pharo, sum of empty is refused rather than assumed 0)."
+    sum [
+        | total any |
+        any := false. total := 0.
+        self do: [:e | any ifTrue: [ total := total + e ] ifFalse: [ total := e. any := true ]].
+        any ifFalse: [ ^self error: 'sum of an empty collection' ].
+        ^total
+    ]
+    max [
+        | best any |
+        any := false. best := nil.
+        self do: [:e | any ifTrue: [ e > best ifTrue: [ best := e ] ] ifFalse: [ best := e. any := true ]].
+        any ifFalse: [ ^self error: 'max of an empty collection' ].
+        ^best
+    ]
+    min [
+        | best any |
+        any := false. best := nil.
+        self do: [:e | any ifTrue: [ e < best ifTrue: [ best := e ] ] ifFalse: [ best := e. any := true ]].
+        any ifFalse: [ ^self error: 'min of an empty collection' ].
+        ^best
+    ]
+    average [ ^self sum / self size ]
+
+    includesAll: aCollection [
+        aCollection do: [:e | (self includes: e) ifFalse: [ ^false ] ].
+        ^true
+    ]
+    includesAny: aCollection [
+        aCollection do: [:e | (self includes: e) ifTrue: [ ^true ] ].
+        ^false
+    ]
+
+    "Empty-guards. The block is evaluated with no argument (the common
+     `coll ifNotEmpty: [ ... ]` form)."
+    ifEmpty: aBlock [ ^self isEmpty ifTrue: [ aBlock value ] ifFalse: [ self ] ]
+    ifNotEmpty: aBlock [ ^self isEmpty ifTrue: [ nil ] ifFalse: [ aBlock value ] ]
+    ifEmpty: emptyBlock ifNotEmpty: notEmptyBlock [
+        ^self isEmpty ifTrue: [ emptyBlock value ] ifFalse: [ notEmptyBlock value ]
+    ]
+    ifNotEmpty: notEmptyBlock ifEmpty: emptyBlock [
+        ^self isEmpty ifTrue: [ emptyBlock value ] ifFalse: [ notEmptyBlock value ]
+    ]
+]
+
+Object subclass: Collection [
+    "The `withAll:` constructor: a new instance holding every element of
+     aCollection. Works for any GROWABLE collection (OrderedCollection/Set/Bag
+     — `new` gives an empty one and `addAll:` fills it); Array overrides below
+     because a fixed-size array can't grow."
+    Collection class >> withAll: aCollection [
+        ^self new addAll: aCollection; yourself
+    ]
+]
+
+ArrayedCollection subclass: Array [
+    Array class >> withAll: aCollection [
+        | arr i |
+        arr := self new: aCollection size.
+        i := 0.
+        aCollection do: [:e | i := i + 1. arr at: i put: e ].
+        ^arr
+    ]
+]
+
+Collection subclass: SequenceableCollection [
+    "Prefix / suffix slices (copyFrom:to: clamps an empty range to an empty
+     result, so the edge cases fall out for free)."
+    first: n [ ^self copyFrom: 1 to: n ]
+    last: n [ ^self copyFrom: self size - n + 1 to: self size ]
+    allButFirst [ ^self copyFrom: 2 to: self size ]
+    allButFirst: n [ ^self copyFrom: n + 1 to: self size ]
+    allButLast [ ^self copyFrom: 1 to: self size - 1 ]
+    allButLast: n [ ^self copyFrom: 1 to: self size - n ]
+
+    second [ ^self at: 2 ]
+    third [ ^self at: 3 ]
+    fourth [ ^self at: 4 ]
+
+    "A shallow copy of the sequence (same species as copyFrom:to' returns)."
+    copy [ ^self copyFrom: 1 to: self size ]
+    reverse [ ^self reversed ]
+
+    "Non-destructive sorts return a fresh Array; sort/sort: order the
+     receiver IN PLACE (via at:put:) and answer it."
+    sorted [ ^self asSortedCollection asArray ]
+    sorted: aSortBlock [ ^(self asSortedCollection: aSortBlock) asArray ]
+    sort [
+        | ordered |
+        ordered := self sorted.
+        1 to: self size do: [:i | self at: i put: (ordered at: i) ].
+        ^self
+    ]
+    sort: aSortBlock [
+        | ordered |
+        ordered := self sorted: aSortBlock.
+        1 to: self size do: [:i | self at: i put: (ordered at: i) ].
+        ^self
+    ]
+]

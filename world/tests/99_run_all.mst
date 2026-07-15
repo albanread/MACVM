@@ -36,4 +36,5 @@ TestRunner run: ObjectProtocolGapsTests.
 TestRunner run: FFIAlienTests.
 TestRunner run: NilMacroTests.
 TestRunner run: NumberExtTests.
+TestRunner run: CollectionExtTests.
 TestRunner report.
