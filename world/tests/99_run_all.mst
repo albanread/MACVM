@@ -45,4 +45,5 @@ TestRunner run: FormatIterExtTests.
 TestRunner run: FinalExtTests.
 TestRunner run: NumberCoercionTests.
 TestRunner run: ReflectionTests.
+TestRunner run: CurtailmentTests.
 TestRunner report.

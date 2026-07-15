@@ -1,0 +1,80 @@
+"42_curtailment_tests.mst — CurtailmentTests: the ensure:/ifCurtailed:
+ contract on the two paths a Smalltalk test can observe — normal completion
+ and non-local return. These are the REGRESSION half: unwind.rs's new
+ run_curtailment_blocks_on_error must not disturb the paths that already
+ worked.
+
+ The ERROR path (the actual fix) cannot be asserted from in here: an
+ unhandled error escapes to the doit boundary, and with no exception system
+ there is nothing in-language to catch it — a failing case would abort the
+ suite rather than report. It is covered instead by
+ `embed::tests::ensure_block_runs_when_the_protected_block_errors`, which
+ uses VmHandle::eval's guest-fatal recovery to run the erroring doit, catch
+ the escape as an Err, and then read back what the cleanup recorded."
+
+TestCase subclass: CurtailmentTests [
+    runAll [
+        self runTest: #testEnsureOnNormalCompletion do: [ self testEnsureOnNormalCompletion ].
+        self runTest: #testEnsureOnNonLocalReturn do: [ self testEnsureOnNonLocalReturn ].
+        self runTest: #testEnsureOrderInnermostFirst do: [ self testEnsureOrderInnermostFirst ].
+        self runTest: #testIfCurtailedNotRunOnNormalCompletion do: [ self testIfCurtailedNotRunOnNormalCompletion ].
+        self runTest: #testIfCurtailedRunsOnNonLocalReturn do: [ self testIfCurtailedRunsOnNonLocalReturn ].
+        self runTest: #testEnsureAnswersProtectedValue do: [ self testEnsureAnswersProtectedValue ].
+    ]
+
+    testEnsureOnNormalCompletion [
+        | log |
+        log := OrderedCollection new.
+        [ log add: #body ] ensure: [ log add: #cleanup ].
+        self assert: log asArray = #(#body #cleanup).
+    ]
+
+    "The value of `[...] ensure: [...]` is the PROTECTED block's, never the
+     cleanup's."
+    testEnsureAnswersProtectedValue [
+        self assert: ([ 42 ] ensure: [ 99 ]) = 42.
+    ]
+
+    testEnsureOnNonLocalReturn [
+        | log |
+        log := OrderedCollection new.
+        self nlrThrough: log.
+        self assert: log asArray = #(#body #cleanup).
+    ]
+    nlrThrough: log [
+        [ log add: #body. ^#returned ] ensure: [ log add: #cleanup ].
+        ^#notReached
+    ]
+
+    testEnsureOrderInnermostFirst [
+        | log |
+        log := OrderedCollection new.
+        self nestedNlr: log.
+        self assert: log asArray = #(#body #inner #outer).
+    ]
+    nestedNlr: log [
+        [[ log add: #body. ^#done ] ensure: [ log add: #inner ]]
+            ensure: [ log add: #outer ].
+        ^#notReached
+    ]
+
+    "ifCurtailed: runs ONLY when the block is curtailed — not on a normal
+     return."
+    testIfCurtailedNotRunOnNormalCompletion [
+        | log |
+        log := OrderedCollection new.
+        [ log add: #body ] ifCurtailed: [ log add: #curtailed ].
+        self assert: log asArray = #(#body).
+    ]
+
+    testIfCurtailedRunsOnNonLocalReturn [
+        | log |
+        log := OrderedCollection new.
+        self curtailThrough: log.
+        self assert: log asArray = #(#body #curtailed).
+    ]
+    curtailThrough: log [
+        [ log add: #body. ^#returned ] ifCurtailed: [ log add: #curtailed ].
+        ^#notReached
+    ]
+]

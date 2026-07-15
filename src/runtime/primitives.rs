@@ -3638,6 +3638,11 @@ fn prim_error(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     {
         crate::runtime::probe::fatal_guest_report(vm, &format!("error: {text}"));
     }
+    // An error curtails everything between here and the entry frame, so the
+    // armed ensure:/ifCurtailed: blocks must run — the jump below is a raw
+    // register restore that would otherwise skip straight past them. After
+    // the report above, so the error's own diagnosis stays intact.
+    crate::interpreter::unwind::run_curtailment_blocks_on_error(vm);
     crate::codecache::deopt_trap::raise_guest_fatal(format!("Error: {text}"))
 }
 

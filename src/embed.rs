@@ -1333,6 +1333,75 @@ mod tests {
         }
     }
 
+    /// `ensure:`/`ifCurtailed:` must fire when the protected block ERRORS —
+    /// not only on normal completion and non-local return. Before
+    /// `unwind::run_curtailment_blocks_on_error`, an unhandled error did not
+    /// unwind at all (it `siglongjmp`ed past every frame from inside
+    /// `prim_error`), so `[stream do: ...] ensure: [stream close]` silently
+    /// left the stream open.
+    ///
+    /// This lives here rather than in the world suite because asserting it
+    /// needs something that can CATCH the escape: `eval`'s guest-fatal
+    /// recovery turns the unhandled error into an `Err`, leaving the VM alive
+    /// so the next `eval` can read back what the cleanup recorded.
+    #[test]
+    fn ensure_block_runs_when_the_protected_block_errors() {
+        let mut vm = boot_test_vm(JitMode::Off);
+        vm.eval(
+            "Object subclass: CurtailProbe [ \
+                 <classVars: Log> \
+                 CurtailProbe class >> log [ ^Log ifNil: [ Log := OrderedCollection new ] ] \
+                 CurtailProbe class >> reset [ Log := OrderedCollection new ] \
+                 boom [ [ CurtailProbe log add: #body. self error: 'boom' ] \
+                          ensure: [ CurtailProbe log add: #cleanup ] ] \
+                 dnuBoom [ [ CurtailProbe log add: #body. nil zorkNoSuchSelector ] \
+                             ensure: [ CurtailProbe log add: #cleanup ] ] \
+                 curtailed [ [ self error: 'boom' ] \
+                               ifCurtailed: [ CurtailProbe log add: #curtailed ] ] \
+                 nested [ [[ self error: 'boom' ] ensure: [ CurtailProbe log add: #inner ]] \
+                            ensure: [ CurtailProbe log add: #outer ] ] \
+                 ]",
+        )
+        .expect("class definition");
+
+        // 1. explicit `self error:` — the cleanup runs, and the error still
+        //    surfaces as an ordinary recoverable Err (the VM stays alive).
+        vm.eval("CurtailProbe reset").expect("reset");
+        let err = vm.eval("CurtailProbe new boom").expect_err("must error");
+        assert!(matches!(err, GuestError::RuntimeError(_)), "got {err:?}");
+        let log = vm.eval("CurtailProbe log printString").expect("read log");
+        assert!(
+            log.contains("body") && log.contains("cleanup"),
+            "ensure: block did not run on the error path: {log}"
+        );
+
+        // 2. an unhandled DNU takes the other fatal route (`dnu_fallback`).
+        vm.eval("CurtailProbe reset").expect("reset");
+        vm.eval("CurtailProbe new dnuBoom").expect_err("DNU must error");
+        let log = vm.eval("CurtailProbe log printString").expect("read log");
+        assert!(
+            log.contains("cleanup"),
+            "ensure: block did not run on the DNU path: {log}"
+        );
+
+        // 3. an error curtails, so ifCurtailed: fires too.
+        vm.eval("CurtailProbe reset").expect("reset");
+        vm.eval("CurtailProbe new curtailed").expect_err("must error");
+        let log = vm.eval("CurtailProbe log printString").expect("read log");
+        assert!(
+            log.contains("curtailed"),
+            "ifCurtailed: block did not run on the error path: {log}"
+        );
+
+        // 4. nested handlers run innermost-first.
+        vm.eval("CurtailProbe reset").expect("reset");
+        vm.eval("CurtailProbe new nested").expect_err("must error");
+        let log = vm.eval("CurtailProbe log printString").expect("read log");
+        let inner = log.find("inner").expect("inner cleanup ran");
+        let outer = log.find("outer").expect("outer cleanup ran");
+        assert!(inner < outer, "cleanups ran outermost-first: {log}");
+    }
+
     #[test]
     fn set_game_sink_routes_game_commands_from_a_smalltalk_doit() {
         // The M3 vertical slice end to end: a Smalltalk doit -> GamePane

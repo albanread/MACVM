@@ -393,6 +393,107 @@ fn innermost_marked_frame(vm: &VmState, from_fp: usize, home_fp: usize) -> ScanR
     }
 }
 
+/// Runs every armed `ensure:`/`ifCurtailed:` block between the current frame
+/// and the entry boundary, innermost-first, because the guest is about to be
+/// curtailed by an UNHANDLED ERROR (`self error:`, an unhandled DNU) rather
+/// than by a return or a non-local return.
+///
+/// Why this exists: `ensure:`/`ifCurtailed:` used to fire on exactly two
+/// paths — normal completion (`do_return`'s marker intercept) and a non-local
+/// return (`continue_unwind`'s scan) — but NOT on an error, because an error
+/// does not unwind at all: it `siglongjmp`s straight past every frame from
+/// deep inside `prim_error`/`dnu_fallback` (`deopt_trap::raise_guest_fatal`,
+/// a raw register restore chosen precisely so it can cross JIT frames). So
+/// `[stream do: ...] ensure: [stream close]` silently did NOT close the
+/// stream if the body errored — the machinery shipped honouring half its own
+/// contract. This is called from those two sites, with `vm` still in hand,
+/// just BEFORE the jump.
+///
+/// Both kinds run here: an error curtails the protected block, and that is
+/// exactly `ifCurtailed:`'s trigger and part of `ensure:`'s "always".
+///
+/// Scope, stated honestly: this walks the INTERPRETER frame chain. That is
+/// where every `ensure:` marker lives by construction (`prim_ensure_like`
+/// activates the protected block with `activate_block_interp` specifically so
+/// the marker has an interpreter frame to live on), but the walk still stops
+/// at a c2i boundary (`ENTRY_FRAME_SENTINEL`) — an `ensure:` whose protected
+/// block called INTO compiled code that then called back OUT through an entry
+/// frame is not reached. That is the same boundary `innermost_marked_frame`
+/// reports as `CrossedBoundary`; handling it needs the parked-unwind protocol
+/// and belongs with a real exception system, not here.
+pub fn run_curtailment_blocks_on_error(vm: &mut VmState) {
+    // Re-entrancy guard: a cleanup block is ordinary Smalltalk and may itself
+    // error, which would land back in `prim_error` and re-enter this walk —
+    // unbounded recursion over the same frames. One curtailment pass per
+    // error; a cleanup that errors just loses its own remaining cleanups.
+    if vm.curtailing_on_error {
+        return;
+    }
+    vm.curtailing_on_error = true;
+
+    // Collect first, run second. Running a block re-enters the interpreter and
+    // can GC, which MOVES the closures — so they are held in a HandleScope,
+    // never as bare oops across the nested runs. The frames themselves stay
+    // put (this only pushes above `sp`; nothing below is popped).
+    let scope = crate::memory::handles::HandleScope::enter(vm);
+    let mut handlers = Vec::new();
+    let mut fp = vm.stack.fp;
+    if fp != ENTRY_FRAME_SENTINEL as usize {
+        loop {
+            let frame = Frame { fp };
+            if let MarkerClass::Handler(h) = marker_class(vm, frame) {
+                // Clear it now: the marker must not fire a second time via
+                // `do_return`'s intercept if this frame is ever returned
+                // through, and must not be re-collected by a nested pass.
+                let nil = vm.universe.nil_obj;
+                frame.clear_marker(&mut vm.stack, nil);
+                handlers.push(scope.handle(vm, h.oop()));
+            }
+            let Some(saved_fp) = frame.saved_fp_opt(&vm.stack) else {
+                break; // a boundary the walker can't cross (see the doc above)
+            };
+            if saved_fp == ENTRY_FRAME_SENTINEL {
+                break;
+            }
+            fp = saved_fp as usize;
+        }
+    }
+
+    for h in handlers {
+        let closure = h.get(vm);
+        if let Some(c) = ClosureOop::try_from(closure) {
+            run_block_to_completion(vm, c);
+        }
+    }
+    vm.curtailing_on_error = false;
+}
+
+/// Runs a 0-arg block to completion from Rust, on a fresh entry frame, and
+/// restores the ambient activation afterwards — `run_method_reentrant`'s
+/// shape (interpreter/mod.rs) for a closure instead of a method. The
+/// spoofed `ENTRY_FRAME_SENTINEL` is what makes the block's own return stop
+/// the nested dispatch instead of delivering into whatever frame happens to
+/// be current.
+fn run_block_to_completion(vm: &mut VmState, closure: ClosureOop) {
+    if closure.method().argc() != 0 {
+        return; // ensure:/ifCurtailed: only ever arm 0-arg blocks
+    }
+    let saved_activation = vm.stack.save_activation();
+    let saved_regs = vm.regs;
+
+    vm.stack.push(closure.oop()); // the receiver slot a `value` send would leave
+    vm.stack.fp = ENTRY_FRAME_SENTINEL as usize;
+    vm.regs.bci = 0;
+    if let crate::runtime::primitives::PrimResult::Activated =
+        crate::interpreter::blocks::activate_block_interp(vm, closure, 0)
+    {
+        super::dispatch(vm);
+    }
+
+    vm.stack.restore_activation(saved_activation);
+    vm.regs = saved_regs;
+}
+
 /// Discards every frame from the current one down to (exclusive of)
 /// `target_fp` — no `do_return`, no handler runs; any marker/token an
 /// intermediate frame carries is abandoned wholesale (SPEC §5.4's

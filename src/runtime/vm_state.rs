@@ -977,6 +977,14 @@ pub struct VmState {
     /// moment activate_block's enter-compiled hook made a `value:` send
     /// inside a deopt resume reach enter_compiled.
     pub deopt_resume_depth: u32,
+    /// Re-entrancy guard for `unwind::run_curtailment_blocks_on_error`: true
+    /// while an unhandled error is running the `ensure:`/`ifCurtailed:` blocks
+    /// between the erroring frame and the entry boundary. A cleanup block is
+    /// ordinary Smalltalk and may itself error, which would land back in
+    /// `prim_error` and re-enter the same walk over the same frames forever;
+    /// one curtailment pass per error, and a cleanup that errors simply
+    /// forfeits its own remaining cleanups.
+    pub curtailing_on_error: bool,
     /// Test-only one-shot hook (tests_s10.md's `mixed_trace_golden`, gate
     /// item 4): compiled code is send-free (D1), so nothing inside it can
     /// call a `printStackTrace` primitive directly — a test sets this
@@ -1224,6 +1232,7 @@ impl VmState {
             pending_deopts: HashMap::new(),
             nlr_state: None,
             deopt_resume_depth: 0,
+            curtailing_on_error: false,
             trace_on_poll: false,
             pending_deopt_flag: false,
             test_walk_capture: None,

@@ -136,6 +136,10 @@ pub fn dnu_fallback(vm: &mut VmState, selector: SymbolOop, receiver_klass: Klass
     {
         crate::runtime::probe::fatal_guest_report(vm, &message);
     }
+    // See `prim_error`'s identical call: an unhandled DNU curtails everything
+    // up to the entry frame, so the armed ensure:/ifCurtailed: blocks run here
+    // — the jump below skips every frame without touching them.
+    crate::interpreter::unwind::run_curtailment_blocks_on_error(vm);
     crate::codecache::deopt_trap::raise_guest_fatal(message);
 }
 

@@ -2834,10 +2834,17 @@ mod tests {
              got:\n{}",
             guard_lines.join("\n")
         );
-        assert!(
-            guard_mnemonics.iter().filter(|&&m| m == "ldr").count() >= 3,
-            "guard must load smi_klass, key_klass, and resolve_addr as literals (>=3 ldr) -- \
-             got:\n{}",
+        // O3: this guard is HEAP-keyed (key_klass_bits != smi_klass_bits), so
+        // the smi arm is dead — a smi receiver can never match a heap klass —
+        // and its literal is not emitted at all. Exactly two literal loads
+        // remain: key_klass and resolve_addr. (`entry_guard_smi_keyed_keeps_
+        // merged_shape` covers the other arm, where the smi literal IS the
+        // klass being compared and all three loads stay.)
+        assert_eq!(
+            guard_mnemonics.iter().filter(|&&m| m == "ldr").count(),
+            2,
+            "a heap-keyed guard loads key_klass and resolve_addr and NOTHING else -- the smi \
+             klass literal is dead weight when a smi can never match. got:\n{}",
             guard_lines.join("\n")
         );
         assert!(
@@ -2854,6 +2861,62 @@ mod tests {
             !guard_mnemonics.contains(&"blr") && !guard_mnemonics.contains(&"bl"),
             "guard must NEVER touch x30 (blr/bl) -- D4.1's invariant that the send site's own \
              return address survives a guard miss untouched -- got:\n{}",
+            guard_lines.join("\n")
+        );
+    }
+
+    /// O3's other arm: when the customization key IS the smi klass, the smi
+    /// case is the MATCHING one, not dead — so the merged shape stays, smi
+    /// literal and all. This is the guard that must NOT be specialized; it
+    /// exists to keep the heap specialization from being over-applied.
+    #[test]
+    fn entry_guard_smi_keyed_keeps_merged_shape() {
+        let vregs = vec![VRegInfo {
+            is_oop: true,
+            is_fp: false,
+        }];
+        let block0 = IrBlock {
+            id: BlockId(0),
+            bci: 0,
+            code: vec![
+                Ir::Param {
+                    dst: VReg(0),
+                    index: 0,
+                },
+                Ir::RetSelf,
+            ],
+            entry_stack: Vec::new(),
+            deopt_sites: Vec::new(),
+        };
+        let method = hand_method(vec![block0], vregs, 1);
+        let ra = regalloc::regalloc(&method);
+        let mut asm = JasmAssembler::new();
+        // key == smi: a SmallInteger-customized nmethod.
+        let guard = EntryGuard {
+            smi_klass_bits: 0x1000,
+            key_klass_bits: 0x1000,
+            resolve_addr: 0x3000,
+        };
+        let (blob, _pcs, verified_entry_off, _ic_sites, _safepoints, _osr_off) = emit(
+            &mut asm, &method, &ra, 0, 0, 0, 0, 0, 0, 0, 0, 0, None, Some(guard), None,
+        );
+        let guard_lines: Vec<&str> = blob
+            .listing
+            .iter()
+            .filter(|l| line_pc_off(l) < verified_entry_off)
+            .map(|s| s.as_str())
+            .collect();
+        let guard_mnemonics: Vec<&str> = guard_lines.iter().map(|l| mnemonic(l)).collect();
+        assert_eq!(
+            guard_mnemonics.iter().filter(|&&m| m == "ldr").count(),
+            3,
+            "a smi-keyed guard keeps all three literal loads (smi_klass, key_klass, \
+             resolve_addr) -- the smi arm is the one that MATCHES here. got:\n{}",
+            guard_lines.join("\n")
+        );
+        assert!(
+            guard_mnemonics.contains(&"ldur"),
+            "the merged guard still loads a heap receiver's klass word via ldur -- got:\n{}",
             guard_lines.join("\n")
         );
     }
@@ -2919,10 +2982,16 @@ mod tests {
             .iter()
             .filter(|r| matches!(r.kind, RelocKind::Oop | RelocKind::KeyKlassOop))
             .collect();
+        // key_klass (KeyKlassOop) + the body's own ConstPool (Oop). The
+        // smi-klass Oop that used to make this three is gone: O3 emits no smi
+        // literal for a heap-keyed guard. The COUNT is incidental here — what
+        // this test pins is the loop below: every oop reloc, whatever their
+        // number, must live in the POOL and never inside the instruction
+        // stream, where GC could not rewrite it.
         assert!(
-            oop_relocs.len() >= 3,
-            "expected smi_klass (Oop) + key_klass (KeyKlassOop) + the body's own ConstPool \
-             (Oop), got {}: {:?}",
+            oop_relocs.len() >= 2,
+            "expected at least key_klass (KeyKlassOop) + the body's own ConstPool (Oop), \
+             got {}: {:?}",
             oop_relocs.len(),
             blob.relocs
         );
