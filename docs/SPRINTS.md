@@ -305,15 +305,16 @@ interleaves with it; every wave lands with in-language tests.
   (a sibling repo's shared SQLite mirror of the macOS Obj-C + POSIX surface).
   Full design in [`docs/FFI.md`](FFI.md) (written as a non-disruptive side
   track, alongside but independent of S11–S14) — Tier 1 is BUILT (S20 steps
-  1–6); Tier 2's memory-model/threading/callback contract is designed in
-  [`cocoa_bridge_design.md`](cocoa_bridge_design.md) (C0–C5 ladder,
-  capstone: a native Cocoa window built from a Workspace doit): two tiers (dynamic
+  1–6); Tier 2 is also BUILT — the C0–C5 ladder of
+  [`cocoa_bridge_design.md`](cocoa_bridge_design.md) shipped in full
+  (ObjcRef ownership, DNU dispatch, main-thread hop, callbacks, and the
+  CocoaPad capstone — a native Cocoa window built from a Workspace-style
+  demo; prims 230–245): two tiers (dynamic
   `doesNotUnderstand:`-based Cocoa dispatch reusing S11's PIC machinery for
   caching; a direct compiler-primitive path for POSIX calls), an `Alien`-style
   byte-array-backed representation reusing existing `IndexableBytes`
-  primitives, and a working, tested offline generator crate (`ffi_gen`,
-  already built) that emits real `.mst` bindings — forward-declared against a
-  VM-side primitive this sprint still has to build. Distinct from the Phase G
+  primitives, and a working, tested offline generator crate (`ffi_gen`)
+  that emits real `.mst` bindings. Distinct from the Phase G
   GUI shell, which is Rust-side hand-rolled `dlopen`/`objc_msgSend`
   (`gui/src/objc.rs`) and needs none of this.
 - **S21 Mixins** — Strongtalk's mixin model on the reserved klass slot.

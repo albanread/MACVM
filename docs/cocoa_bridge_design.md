@@ -1,6 +1,9 @@
 # The Cocoa bridge — a moving GC meets a reference-counted runtime
 
-**Status: design.** This document closes the point `FFI.md` §4 deliberately
+**Status: built — C0–C5 all shipped** (prims 230–245 in
+`src/runtime/primitives.rs`, `world/49_cocoa.mst` + `world/50_cocoapad.mst`,
+CocoaPad on the Demos menu); this document is the design record.
+It closes the point `FFI.md` §4 deliberately
 left open — *"an `id` a Smalltalk oop wraps needs a retain on wrap and a
 release when the wrapping oop is collected … a real design point, sketched
 but not closed here"* — and adds the threading, callback, and exception

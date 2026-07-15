@@ -10,10 +10,13 @@
 > the site. One gated seed (only from Empty / same-klass Mono) fixed it:
 > **richards 208→13 ms = 16× (T5 ≥5.0 PASSED), deopts 160,674→2;
 > deltablue 208→62 ms = 3.4×.** Full story: `docs/PERF.md` "RESOLVED"
-> entry. Gap 2 (7-arg constructors) and Gap 3 (residency pool) below
-> remain open and are now the live weekend candidates, along with
-> `docs/dual_arm_design.md`'s cold-OSR-profile finding (sieve's separate,
-> milder issue: OSR compiles before ICs warm → cold Untaken traps).
+> entry. **Gap 3 (residency pool) has since been CLOSED** (commit
+> e24c9be — pool widened `x21`-`x23` → `x21`-`x27`, exactly the one-line
+> fix its section prescribes), and `docs/dual_arm_design.md`'s
+> cold-OSR-profile finding (sieve's separate, milder issue: OSR compiles
+> before ICs warm → cold Untaken traps) was **fixed in de7e20e** (no
+> Untaken→Trap under OSR). Only **Gap 2 (7-arg constructors)** below
+> remains open.
 
 ## The gate, and where it stands
 
@@ -287,7 +290,11 @@ been burned by before.
 If the napkin math doesn't clearly beat Gap 1's payoff, don't do either
 option — leave it capped at 7.
 
-## Gap 3 — S14 residency pool may be leaving free registers unused (unmeasured, found 2026-07-08)
+## Gap 3 — S14 residency pool may be leaving free registers unused (found 2026-07-08; RESOLVED)
+
+> **RESOLVED (commit e24c9be):** the pool initializer was widened to
+> `vec![21, 22, 23, 24, 25, 26, 27]` (`regalloc.rs`), exactly the
+> one-line fix described below. Kept as written for the record.
 
 Not from Richards specifically — found while documenting register
 conventions ([`VMregisters.md`](VMregisters.md)). Flagging here since it's
