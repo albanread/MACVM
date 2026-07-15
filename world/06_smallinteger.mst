@@ -54,19 +54,31 @@ Integer subclass: SmallInteger [
     hash [
         ^self
     ]
+    "The Fraction arms below: the primitive only handles SmallInteger args, so
+     every other type lands in the fallback — which previously assumed Double
+     or Integer and sent `asLargeInteger` to whatever arrived, so `2 + (1/2)`
+     was a doesNotUnderstand. They DELEGATE to the Fraction (whose ops already
+     coerce an Integer arg) rather than wrapping self in a `self/1` Fraction:
+     `numerator:denominator:` collapses a denominator of 1 back to a plain
+     Integer, so a self/1 wrapper would re-dispatch to this same method with
+     the same argument — the infinite recursion 23_fraction.mst's own `/`
+     comment documents."
     + aNumber [
         <primitive: 1>
         aNumber isDouble ifTrue: [ ^self asDouble + aNumber ].
+        aNumber isFraction ifTrue: [ ^aNumber + self ].          "+ commutes"
         ^self asLargeInteger + aNumber asLargeInteger
     ]
     - aNumber [
         <primitive: 2>
         aNumber isDouble ifTrue: [ ^self asDouble - aNumber ].
+        aNumber isFraction ifTrue: [ ^aNumber negated + self ].  "a-b = (-b)+a"
         ^self asLargeInteger - aNumber asLargeInteger
     ]
     * aNumber [
         <primitive: 3>
         aNumber isDouble ifTrue: [ ^self asDouble * aNumber ].
+        aNumber isFraction ifTrue: [ ^aNumber * self ].          "* commutes"
         ^self asLargeInteger * aNumber asLargeInteger
     ]
     // aNumber [
@@ -91,9 +103,17 @@ Integer subclass: SmallInteger [
     bitShift: aNumber [
         <primitive: 9>
     ]
+    "`<` cross-multiplies against the Fraction directly (denominator is always
+     positive — Fraction's own reduce invariant — so the inequality direction
+     is preserved). NOT `^aNumber > self`: Fraction>>> is itself `^aNumber <
+     self`, which would bounce straight back here forever. `<=` needs no arm of
+     its own — it delegates to this `<` and to `=` (which correctly answers
+     false: a reduced Fraction is never a whole number). `>`/`>=` already work
+     via `^aNumber < self` into Fraction>><."
     < aNumber [
         <primitive: 10>
         aNumber isDouble ifTrue: [ ^self asDouble < aNumber ].
+        aNumber isFraction ifTrue: [ ^(self * aNumber denominator) < aNumber numerator ].
         ^(self asLargeInteger < aNumber asLargeInteger)
     ]
     <= aNumber [

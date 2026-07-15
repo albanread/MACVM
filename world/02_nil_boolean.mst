@@ -103,6 +103,13 @@ nil subclass: Object [
     isDouble [
         ^false
     ]
+    "Defined HERE, beside its sibling predicates, rather than in
+     23_fraction.mst where Fraction itself lives: SmallInteger's arithmetic
+     fallbacks (06) test `aNumber isFraction`, and they run long before
+     file 23 loads (e.g. smallInt + largeInt during 07-22)."
+    isFraction [
+        ^false
+    ]
     isCharacter [
         ^false
     ]

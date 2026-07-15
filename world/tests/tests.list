@@ -43,4 +43,5 @@ tier1.mst
 37_dict_point_set_ext_tests.mst
 38_format_iter_ext_tests.mst
 39_final_ext_tests.mst
+40_number_coercion_tests.mst
 99_run_all.mst

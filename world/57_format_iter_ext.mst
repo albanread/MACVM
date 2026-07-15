@@ -22,9 +22,11 @@ Number subclass: Fraction [
      uses // (which already floors); ceiling and rounded build on it."
     floor [ ^self numerator // self denominator ]
     ceiling [ ^self negated floor negated ]
-    "round-half-up, in pure INTEGER arithmetic: floor((2n + d) / 2d). Done
-     this way (not `(self + 1/2) truncated`) to sidestep the VM's mixed
-     Fraction arithmetic coercion gap — denominator is always positive."
+    "round-half-up, in pure INTEGER arithmetic: floor((2n + d) / 2d) —
+     denominator is always positive (Fraction's reduce invariant). Kept in
+     integer form rather than `(self + (self sign / 2)) truncated`: it is
+     exact and allocates no intermediate Fraction. (It originally also dodged
+     the Integer+Fraction coercion bug — since fixed in world/02+06.)"
     rounded [ ^((2 * self numerator) + self denominator) // (2 * self denominator) ]
 ]
 

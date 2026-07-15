@@ -1,0 +1,74 @@
+"40_number_coercion_tests.mst — NumberCoercionTests: mixed Integer/Fraction
+ arithmetic. Every `Integer op Fraction` below was a doesNotUnderstand
+ (asLargeInteger) before the world/02+06 coercion fix — SmallInteger's
+ arithmetic fallback assumed the argument was a Double or an Integer and
+ never handled a Fraction."
+
+TestCase subclass: NumberCoercionTests [
+    runAll [
+        self runTest: #testIntegerPlusFraction do: [ self testIntegerPlusFraction ].
+        self runTest: #testIntegerMinusFraction do: [ self testIntegerMinusFraction ].
+        self runTest: #testIntegerTimesFraction do: [ self testIntegerTimesFraction ].
+        self runTest: #testIntegerCompareFraction do: [ self testIntegerCompareFraction ].
+        self runTest: #testCommutativity do: [ self testCommutativity ].
+        self runTest: #testIdentities do: [ self testIdentities ].
+        self runTest: #testStillWorks do: [ self testStillWorks ].
+    ]
+
+    testIntegerPlusFraction [
+        self assert: (2 + (1/2)) = (5/2).
+        self assert: (1 + (1/2)) = (3/2).
+        self assert: (0 + (1/2)) = (1/2).
+        "a result that lands on a whole number collapses back to an Integer"
+        self assert: ((1/2) + (1/2)) = 1.
+    ]
+
+    testIntegerMinusFraction [
+        self assert: (2 - (1/2)) = (3/2).
+        self assert: (1 - (1/2)) = (1/2).
+        self assert: (0 - (1/2)) = ((0 - 1)/2).
+        self assert: (2 - (1/2) - (1/2)) = 1.
+    ]
+
+    testIntegerTimesFraction [
+        self assert: (3 * (1/2)) = (3/2).
+        self assert: (2 * (1/2)) = 1.
+        self assert: (0 * (1/2)) = 0.
+        self assert: (4 * (3/4)) = 3.
+    ]
+
+    "< cross-multiplies; <= delegates to < and =; > / >= already worked."
+    testIntegerCompareFraction [
+        self deny: (3 < (1/2)).
+        self assert: (0 < (1/2)).
+        self assert: ((0 - 1) < (1/2)).
+        self deny: (3 <= (1/2)).
+        self assert: (3 > (1/2)).
+        self assert: (3 >= (1/2)).
+        self deny: (3 = (1/2)).
+        self assert: (3 ~= (1/2)).
+        "min:/max: ride on < , so they were broken too"
+        self assert: (3 min: (1/2)) = (1/2).
+        self assert: (3 max: (1/2)) = 3.
+    ]
+
+    testCommutativity [
+        self assert: (2 + (1/2)) = ((1/2) + 2).
+        self assert: (3 * (1/2)) = ((1/2) * 3).
+    ]
+
+    testIdentities [
+        self assert: ((2 - (1/2)) + (1/2)) = 2.
+        self assert: ((2 + (1/2)) * 2) = 5.
+        self assert: ((3 * (1/2)) / (1/2)) = 3.
+    ]
+
+    "the paths that already worked must keep working"
+    testStillWorks [
+        self assert: ((1/2) + (1/3)) = (5/6).
+        self assert: (1 / (1/2)) = 2.
+        self assert: (2 + 3) = 5.
+        self assert: (2 + 0.5) = 2.5.
+        self assert: (2 < 3).
+    ]
+]
