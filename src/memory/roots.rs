@@ -342,6 +342,25 @@ where
                     .oopmap_at(ret_pc)
                     .iter_slots()
                     .collect();
+                // MACVM_DBGPIC_NM=<id>: one nmethod's per-cycle GC view — the
+                // ret_pc its oop-map is looked up at and whether a slot of
+                // interest is covered. For catching "this frame's slots were
+                // skipped / mapped differently for exactly one cycle" bugs.
+                if let Ok(want) = std::env::var("MACVM_DBGPIC_NM") {
+                    if want.parse::<u32>().ok() == Some(nm.0) {
+                        let nm_ref = vm.code_table.get(nm).expect("checked above");
+                        let base = nm_ref.code.base as u64;
+                                                    let sel = nm_ref.key_selector.as_string();
+                        eprintln!(
+                            "DBGPIC-NM nm={} sel={sel} scav#{} fp={fp:#x} rel_pc={:#x} map_slots={} has41={}",
+                            nm.0,
+                            vm.universe.gc_stats.scavenge_count,
+                            ret_pc - base,
+                            slots.len(),
+                            slots.contains(&41),
+                        );
+                    }
+                }
                 for slot in slots {
                     // SAFETY: `fp` is a live compiled frame's own x29
                     // (`walk_frames`'s own invariant — established by

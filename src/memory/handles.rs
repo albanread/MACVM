@@ -162,7 +162,14 @@ impl HandleScope {
             vm.handle_arena.gen.push(0);
             0
         };
-        if std::env::var("MACVM_DBG_ROOTS").is_ok() {
+        // Cached once: `env::var` takes a global lock and scans the whole
+        // environment — on THIS path (every handle creation; deltablue's
+        // c2i/deopt reentrancy mints millions) an uncached check measured a
+        // 2x whole-benchmark regression. Debug envs are process-start facts;
+        // capture them once.
+        static DBG_ROOTS: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var("MACVM_DBG_ROOTS").is_ok());
+        if *DBG_ROOTS {
             eprintln!(
                 "RDBG handle-create [{index}] = {:#x} (scav#{})",
                 val.as_oop().raw(),
