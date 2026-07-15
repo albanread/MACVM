@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Cocoa from Smalltalk</title>
+</head>
+<body>
+
+<h2 align="left">Cocoa from Smalltalk</h2>
+
+<p>MACVM can talk to macOS directly: Foundation and AppKit objects are
+ordinary Smalltalk receivers. You look a class up once, and from there
+Objective-C messages are just keyword sends &mdash; the selector text is
+identical in both languages.</p>
+
+<pre>
+    s := (Cocoa classNamed: 'NSMutableString') alloc init.
+    s appendString: 'hello'.
+    s length.                "→ 5"
+    s asString.              "→ its -description, as a Smalltalk String"
+    s release.
+</pre>
+
+<h3 align="left">How it works (the two-sentence version)</h3>
+
+<p>A Cocoa object lives in Smalltalk as an <code>ObjcRef</code> &mdash; a
+tiny wrapper holding one retained reference; the two memory managers never
+see each other's pointers. Any message an <code>ObjcRef</code> doesn't
+itself understand is forwarded to Objective-C, with the argument and
+return types read from the live runtime's own method signatures &mdash;
+so integers, floats, booleans, strings, and the small structs
+(<code>NSRange</code>, <code>CGPoint</code>, <code>CGRect</code>) all
+convert automatically, in both directions.</p>
+
+<h3 align="left">What converts to what</h3>
+
+<ul>
+	<li>Smalltalk <code>String</code> arguments become temporary
+	<code>NSString</code>s; <code>NSString</code>-returning selectors used
+	via <code>sendString:</code> / <code>asString</code> come back as
+	Smalltalk Strings.</li>
+	<li>Integers, Doubles, and <code>true</code>/<code>false</code> map to
+	the declared C types &mdash; passing <code>3</code> where a
+	<code>double</code> is declared does the right thing.</li>
+	<li><code>NSRange</code> results are 2-element Arrays
+	<code>{location. length}</code>; <code>CGPoint</code>/<code>CGRect</code>
+	are Arrays of 2/4 Doubles. Struct <em>arguments</em> are written the
+	same way: a frame rectangle is
+	<code>(Array with: x with: y with: w with: h)</code>.</li>
+	<li>Everything else comes back as another <code>ObjcRef</code>.</li>
+</ul>
+
+<h3 align="left">Ownership: release, poolDo:, and the safety bias</h3>
+
+<p>Every wrapper owns exactly one reference. Send <code>release</code>
+when you are done; a released wrapper is <em>poisoned</em> &mdash; later
+sends raise cleanly, and a double release refuses. Cocoa's naming
+conventions are honored automatically: <code>alloc</code>,
+<code>new</code>, <code>copy</code>, and <code>init</code> results arrive
+already-owned, and <code>init</code> invalidates the receiver it consumed
+(always use init's result). For bursts of temporaries, let the pool do
+the releasing:</p>
+
+<pre>
+    s := Cocoa poolDo: [:pool |
+        (Cocoa nsString: 'scratch').          "swept on exit"
+        pool keep: (Cocoa nsString: 'mine')]. "survives; release it yourself"
+</pre>
+
+<p>The bridge always errs toward a <em>leak</em>, never a double-free: a
+forgotten release wastes a few bytes; manual reference counting
+(<code>retain</code>/<code>dealloc</code>&hellip;) is refused outright.
+An <code>NSException</code> is caught and re-raised as an ordinary
+Smalltalk error &mdash; the VM never dies.</p>
+
+<h3 align="left">AppKit: onMain and actions</h3>
+
+<p>AppKit is main-thread-only, and the VM runs on its own thread. Prefix
+any UI send with <code>onMain</code> and it runs on the main thread,
+synchronously:</p>
+
+<pre>
+    win onMain makeKeyAndOrderFront: nil.
+</pre>
+
+<p>Buttons call back the other way: <code>Cocoa action:</code> turns a
+block into a target/action pair. The click is queued and your block runs
+on the VM thread between doits &mdash; callbacks never interrupt
+running Smalltalk.</p>
+
+<pre>
+    act := Cocoa action: [ Transcript showCr: 'clicked!' ].
+    btn onMain setTarget: act.
+    btn onMain setAction: 'macvmFire:'.
+</pre>
+
+<h3 align="left">CocoaPad — the demo</h3>
+
+<p><strong>Demos &rarr; CocoaPad</strong> builds a native window &mdash;
+an <code>NSWindow</code>, a text field, and a button &mdash; entirely in
+Smalltalk (<code>world/50_cocoapad.mst</code>, class <code>CocoaPad</code>;
+browse it!). Click <em>Say hello</em> and the round trip completes:
+AppKit fires the action on the main thread, the event crosses to the VM
+thread, <code>CocoaPad clicked</code> runs, and it answers by writing
+into the text field back through the main-thread hop. Everything above,
+in about sixty lines.</p>
+
+<h3 align="left">Name collisions and escapes</h3>
+
+<p>A few selectors are Smalltalk's own and never reach Objective-C:
+<code>class</code> (use <code>objcClass</code>), <code>hash</code>,
+<code>printString</code>, <code>isValid</code>, <code>release</code>, and
+<code>=</code>/<code>==</code> (wrapper identity &mdash; use
+<code>isEqual:</code> for Cocoa equality). For those, or any unusual
+shape, the explicit form is always available:
+<code>ref send: 'class'</code> or
+<code>ref send: 'sel:' args: {&hellip;} ret: #i64</code>.</p>
+
+<p>The full internal design &mdash; memory model, thread rules,
+exception handling &mdash; is in
+<code>docs/cocoa_bridge_design.md</code>.</p>
+
+</body>
+</html>

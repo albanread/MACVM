@@ -125,6 +125,36 @@ allocating. See [`docs/PERF.md`](docs/PERF.md) for the arc and methodology.
 - **Scripting** — an embedded RUSTTCL console for driving the VM and its
   debugger ([`docs/RUSTTCL.md`](docs/RUSTTCL.md)).
 
+### Cocoa from Smalltalk
+
+MACVM talks to macOS directly. Foundation and AppKit objects are ordinary
+Smalltalk receivers — look a class up once and Objective-C messages are
+plain keyword sends, with argument and return types read from the live
+runtime's own method signatures:
+
+```smalltalk
+s := (Cocoa classNamed: 'NSMutableString') alloc init.
+s appendString: 'hello'.
+s length.                        "→ 5"
+
+win onMain makeKeyAndOrderFront: nil.          "AppKit runs on the main thread"
+act := Cocoa action: [ Transcript showCr: 'clicked!' ].
+btn onMain setTarget: act.  btn onMain setAction: 'macvmFire:'.
+```
+
+A Cocoa object lives in Smalltalk as an `ObjcRef` holding one retained
+reference — the moving GC and Objective-C's reference counting never see
+each other's pointers, exceptions are caught at the boundary, and the
+bridge always errs toward a leak, never a double-free (`release`,
+`poolDo:`, and ARC's naming conventions do the bookkeeping). Button
+clicks travel back over the same inbox the worker VMs use and run
+between doits on the VM thread. The **Demos → CocoaPad** menu item
+builds a native `NSWindow` with a live button entirely from
+`world/50_cocoapad.mst`; the design is in
+[`docs/cocoa_bridge_design.md`](docs/cocoa_bridge_design.md), the user
+guide in the in-app help (Help → MACVM Documentation → Cocoa from
+Smalltalk).
+
 ### Fast floating point
 
 Strongtalk's tour introduced the idea of "fast floats" — eliminating the
