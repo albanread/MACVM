@@ -269,7 +269,6 @@ where
     // visits every one of its slots twice — the second visit hands the
     // just-forwarded to-space value back to `scavenge_oop` (its
     // double-copy guard). Dump and abort HERE, with identities, instead.
-    #[cfg(debug_assertions)]
     if std::env::var("MACVM_DBGPIC").is_ok() {
         let mut fps: Vec<u64> = frames
             .iter()
@@ -296,6 +295,29 @@ where
     // `scavenge_oop` dereferences it and SIGSEGVs downstream. Hoisted here so
     // the per-slot check is a single bool, not a channel lookup.
     let trace_oops = vm.options.trace.is_enabled("oops");
+
+    // MACVM_DBGPIC_FRAMES: the whole frame stack's extents each walk — verbose,
+    // for hunting frame-overlap / long-lived-frame root bugs (the deopt-bridge
+    // GC_STRESS head-2 hunt); kept behind its own var so plain DBGPIC stays
+    // readable.
+    if std::env::var("MACVM_DBGPIC_FRAMES").is_ok() {
+        for fv in &frames {
+            match fv {
+                FrameView::Compiled { fp, nm, .. } => {
+                    let fs = vm.code_table.get(*nm).map(|n| n.frame_slots).unwrap_or(0);
+                    eprintln!(
+                        "DBGPIC frame nm={} fp={fp:#x} slots={fs} extent=[{:#x},{fp:#x})",
+                        nm.0,
+                        fp - 8 * (fs as u64 + 1)
+                    );
+                }
+                FrameView::Adapter { fp, kind, .. } => {
+                    eprintln!("DBGPIC frame ADAPTER {kind:?} fp={fp:#x} rootspill=[{:#x},{fp:#x})", fp - ROOTSPILL_BYTES as u64);
+                }
+                _ => {}
+            }
+        }
+    }
 
     for fv in frames {
         match fv {
@@ -344,15 +366,16 @@ where
                             crate::runtime::probe::annotate_value(vm, old.raw()),
                         );
                     }
-                    #[cfg(debug_assertions)]
                     if std::env::var("MACVM_DBGPIC").is_ok() {
                         let a = old.raw() as usize & !0x7;
                         if a >= vm.universe.to.start && a < vm.universe.to.top {
                             let nm_ref = vm.code_table.get(nm).expect("checked above");
                             eprintln!(
-                                "DBGPIC STALE-SLOT nm={} block={} fp={fp:#x} ret_pc={ret_pc:#x} code_base={:#x} slot={slot} word={:#x} scavs={}",
+                                "DBGPIC STALE-SLOT nm={} block={} frame_slots={} fp={fp:#x} ret_pc={ret_pc:#x} rel_pc={:#x} code_base={:#x} slot={slot} word={:#x} scavs={}",
                                 nm.0,
                                 nm_ref.block_method.is_some(),
+                                nm_ref.frame_slots,
+                                ret_pc - nm_ref.code.base as u64,
                                 nm_ref.code.base as usize,
                                 old.raw(),
                                 vm.universe.gc_stats.scavenge_count
