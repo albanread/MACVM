@@ -407,6 +407,3 @@ ul li::before {
 }
 .st-modal-ok { min-width: 72px; }
 
-/* B/W theme: render the blue/red-accented hidef SVG icons as black silhouettes
-   so the toolbar stays monochrome. */
-.st-toolbar button img, .st-icon, .smappl-icon { filter: brightness(0); }

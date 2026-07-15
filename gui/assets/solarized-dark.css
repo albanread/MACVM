@@ -383,3 +383,9 @@ ul li::before {
   text-align: right;
 }
 .st-modal-ok { min-width: 72px; }
+
+/* Toolbar icons (the shared icons-mono silhouettes, masked by currentColor —
+   preprocess::toolbar_html): tint them with this theme's accent rather than
+   plain ink, keeping the colored-toolbar identity. Retro/monochrome themes
+   deliberately leave this out and take the ink colour. */
+.st-toolbar .st-ico { color: var(--hd-accent); }

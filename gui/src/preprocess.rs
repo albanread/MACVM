@@ -144,6 +144,16 @@ impl Theme {
             _ => gui_file_url(&format!("assets/icons-hidef/{icon}.svg")),
         }
     }
+
+    /// The monochrome silhouette set (`assets/icons-mono/`) the toolbar's
+    /// `currentColor`-masked spans use (`toolbar_html`). Separate from
+    /// `icon_url`'s colored hidef set on purpose: masking needs glyph-only
+    /// alpha (the hidef icons carry an opaque background card, which a mask
+    /// renders as a solid blob), while smappl `<img>` icons still want the
+    /// colored set.
+    fn mono_icon_url(icon: &str) -> String {
+        gui_file_url(&format!("assets/icons-mono/{icon}.svg"))
+    }
 }
 
 /// Resolve the `data-icon="resources/NAME.bmp"` attributes a smappl `Button
@@ -463,15 +473,17 @@ fn toolbar_html(theme: Theme) -> String {
     let buttons: String = TOOLBAR_BUTTONS
         .iter()
         .map(|(icon, action, title)| {
-            let icon_url = theme.icon_url(icon);
             // Classic keeps its period PNG pixel-art (masking would flatten it);
-            // every other theme renders the shared monochrome SVG set as a
-            // `currentColor` mask (`.st-ico`, chrome_layout_style), so each icon
-            // takes that theme's own text colour automatically — no per-theme
-            // filter, and nothing left hidef-blue or crushed to black.
+            // every other theme renders the monochrome silhouette set
+            // (`icons-mono/`) as a `currentColor` mask (`.st-ico`,
+            // chrome_layout_style), so each icon takes that theme's own ink
+            // colour automatically — no per-theme filter, and nothing left
+            // hidef-blue or crushed to black.
             let glyph = if theme == Theme::Classic {
+                let icon_url = theme.icon_url(icon);
                 format!("<img src=\"{icon_url}\" alt=\"{title}\">")
             } else {
+                let icon_url = Theme::mono_icon_url(icon);
                 format!(
                     "<span class=\"st-ico\" role=\"img\" aria-label=\"{title}\" \
                      style=\"-webkit-mask-image:url('{icon_url}');mask-image:url('{icon_url}')\"></span>"
@@ -581,6 +593,9 @@ fn chrome_layout_style() -> String {
      #macvm-scroll > .st-workspace, #macvm-scroll > .st-browser { height: 100%; }\
      .st-add-node > .st-header { opacity: 0.7; font-style: italic; }\
      .st-smappl-codeview { height: 15em; width: 100%; }\
+     .st-ico { display: inline-block; width: 24px; height: 24px; background-color: currentColor; \
+       -webkit-mask-repeat: no-repeat; -webkit-mask-position: center; -webkit-mask-size: contain; \
+       mask-repeat: no-repeat; mask-position: center; mask-size: contain; vertical-align: middle; }\
      </style>"
         .to_string()
 }
@@ -888,32 +903,37 @@ mod tests {
         );
         let hidef_toolbar = toolbar_html(Theme::HiDef);
         assert!(
-            hidef_toolbar.contains("assets/icons-hidef/home.svg"),
+            hidef_toolbar.contains("assets/icons-mono/home.svg")
+                && hidef_toolbar.contains("mask-image"),
             "{hidef_toolbar}"
         );
     }
 
-    /// The five newer themes: each resolves to its own stylesheet, and —
-    /// since only `Classic` has its own icon set — every one of them
-    /// reuses HiDef's SVG icons (recolored via CSS `filter` in the CRT/
-    /// monochrome themes' own stylesheets, not a different icon set).
+    /// Every non-Classic theme: its own stylesheet, and the SAME monochrome
+    /// silhouette icon set rendered as a `currentColor` mask (`.st-ico`), so
+    /// the toolbar takes each theme's ink automatically — only `Classic`
+    /// keeps its period PNG pixel-art as plain `<img>`s.
     #[test]
-    fn newer_themes_pick_their_own_stylesheet_but_share_hidef_icons() {
-        let cases: [(Theme, &str); 5] = [
-            (Theme::Dark, "assets/dark.css"),
-            (Theme::CrtAmber, "assets/crt-amber.css"),
-            (Theme::CrtGreen, "assets/crt-green.css"),
-            (Theme::Squeak, "assets/squeak.css"),
-            (Theme::AltoMono, "assets/alto-mono.css"),
-        ];
-        for (theme, expected_css) in cases {
+    fn non_classic_themes_share_the_mono_mask_icons() {
+        for theme in Theme::ALL {
             let head = chrome_head_extra(Path::new("."), theme, 100);
-            assert!(head.contains(expected_css), "{theme:?}: {head}");
-            let toolbar = toolbar_html(theme);
             assert!(
-                toolbar.contains("assets/icons-hidef/home.svg"),
-                "{theme:?}: {toolbar}"
+                head.contains(theme.stylesheet_relative_path()),
+                "{theme:?}: {head}"
             );
+            let toolbar = toolbar_html(theme);
+            if theme == Theme::Classic {
+                assert!(
+                    toolbar.contains("reference/icons-png/home.png"),
+                    "{theme:?}: {toolbar}"
+                );
+            } else {
+                assert!(
+                    toolbar.contains("assets/icons-mono/home.svg")
+                        && toolbar.contains("st-ico"),
+                    "{theme:?}: {toolbar}"
+                );
+            }
         }
     }
 
