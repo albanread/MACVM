@@ -72,7 +72,7 @@
 00011c  aa1003f7  mov [Reg(Reg { class: X, num: 23, is_sp: false }), Reg(Reg { class: X, num: 16, is_sp: false })]
 000120  b9402390  ldr [Reg(Reg { class: W, num: 16, is_sp: false }), Mem(Mem { base: Reg { class: X, num: 28, is_sp: false }, addr: Offset(32) })]
 000124  b4000010  cbz Reg { class: X, num: 16, is_sp: false } L11
-000128  58000010  ldr Reg { class: X, num: 16, is_sp: false }, =lit5
+000128  58000010  ldr Reg { class: X, num: 16, is_sp: false }, =lit10
 00012c  d63f0200  blr [Reg(Reg { class: X, num: 16, is_sp: false })]
 000130  f85f83b5  ldr [Reg(Reg { class: X, num: 21, is_sp: false }), Mem(Mem { base: Reg { class: X, num: 29, is_sp: false }, addr: Offset(-8) })]
 000134  f85e83b6  ldr [Reg(Reg { class: X, num: 22, is_sp: false }), Mem(Mem { base: Reg { class: X, num: 29, is_sp: false }, addr: Offset(-24) })]

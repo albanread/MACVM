@@ -358,7 +358,7 @@ fn compiled_mono_caller_guard_keeps_key_klass_alive() {
     // `callHot`: one param (the receiver), one send of `hot` against it --
     // self=x0 -- mirrors `mono_resolve_patches_call_site_and_dispatches`'s
     // own caller shape exactly.
-    let vregs: Vec<VRegInfo> = (0..2).map(|_| VRegInfo { is_oop: true }).collect();
+    let vregs: Vec<VRegInfo> = (0..2).map(|_| VRegInfo { is_oop: true, is_fp: false }).collect();
     let block0 = IrBlock {
         id: BlockId(0),
         bci: 0,
@@ -394,6 +394,11 @@ fn compiled_mono_caller_guard_keeps_key_klass_alive() {
         false_lit: PoolLit(0),
         nil_lit: PoolLit(0),
         mark_slots_lit: PoolLit(0),
+        mark_double_lit: PoolLit(0),
+        double_klass_lit: PoolLit(0),
+        float64x2_klass_lit: PoolLit(0),
+        float32x4_klass_lit: PoolLit(0),
+        int32x4_klass_lit: PoolLit(0),
         call_sites: vec![CallSiteInfo {
             selector: hot_sel,
             argc: 0,
@@ -413,6 +418,10 @@ fn compiled_mono_caller_guard_keeps_key_klass_alive() {
         vm.stubs.stub_poll_addr(),
         vm.stubs.must_be_boolean_addr(),
         vm.stubs.alloc_slow_addr(),
+        vm.stubs.box_double_addr(),
+        vm.stubs.box_float64x2_addr(),
+        vm.stubs.box_float32x4_addr(),
+        vm.stubs.box_int32x4_addr(),
         vm.stubs.call_primitive_addr(),
         vm.stubs.nlr_originate_addr(),
         None,
@@ -549,6 +558,11 @@ fn install_loop_nmethod(
         false_lit: PoolLit(2),
         nil_lit: PoolLit(0),
         mark_slots_lit: PoolLit(3),
+        mark_double_lit: PoolLit(0),
+        double_klass_lit: PoolLit(0),
+        float64x2_klass_lit: PoolLit(0),
+        float32x4_klass_lit: PoolLit(0),
+        int32x4_klass_lit: PoolLit(0),
         call_sites,
         site_feedback: Vec::new(),
         inline_deps: Vec::new(),
@@ -571,6 +585,10 @@ fn install_loop_nmethod(
         vm.stubs.stub_poll_addr(),
         vm.stubs.must_be_boolean_addr(),
         vm.stubs.alloc_slow_addr(),
+        vm.stubs.box_double_addr(),
+        vm.stubs.box_float64x2_addr(),
+        vm.stubs.box_float32x4_addr(),
+        vm.stubs.box_int32x4_addr(),
         vm.stubs.call_primitive_addr(),
         vm.stubs.nlr_originate_addr(),
         None,
@@ -736,11 +754,11 @@ fn mid_loop_forced_scavenge() {
     // the whole method, the slot each of the ~100 scavenges must find
     // and rewrite.
     let vregs: Vec<VRegInfo> = vec![
-        VRegInfo { is_oop: true },  // v0 self
-        VRegInfo { is_oop: false }, // v1 i
-        VRegInfo { is_oop: false }, // v2 N
-        VRegInfo { is_oop: true },  // v3 send result (dead)
-        VRegInfo { is_oop: false }, // v4 const 1
+        VRegInfo { is_oop: true, is_fp: false },  // v0 self
+        VRegInfo { is_oop: false, is_fp: false }, // v1 i
+        VRegInfo { is_oop: false, is_fp: false }, // v2 N
+        VRegInfo { is_oop: true, is_fp: false },  // v3 send result (dead)
+        VRegInfo { is_oop: false, is_fp: false }, // v4 const 1
     ];
     let blocks = vec![
         IrBlock {
@@ -1063,11 +1081,11 @@ fn mid_loop_alloc_edge_forced_scavenge() {
 
     // Loop: same skeleton as the send flagship, body = inline Alloc.
     let vregs: Vec<VRegInfo> = vec![
-        VRegInfo { is_oop: true },  // v0 self
-        VRegInfo { is_oop: false }, // v1 i
-        VRegInfo { is_oop: false }, // v2 N
-        VRegInfo { is_oop: true },  // v3 alloc result (dead)
-        VRegInfo { is_oop: false }, // v4 const 1
+        VRegInfo { is_oop: true, is_fp: false },  // v0 self
+        VRegInfo { is_oop: false, is_fp: false }, // v1 i
+        VRegInfo { is_oop: false, is_fp: false }, // v2 N
+        VRegInfo { is_oop: true, is_fp: false },  // v3 alloc result (dead)
+        VRegInfo { is_oop: false, is_fp: false }, // v4 const 1
     ];
     let mut pool = base_pool(&vm);
     let chunk_klass_lit = PoolLit(pool.len() as u32);

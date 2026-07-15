@@ -54,7 +54,7 @@ fn run_ir_raw() {
     let stubs = stubs::install(&mut cache);
 
     // vregs: 0=self, 1=a, 2=b, 3=sum, 4=const10, 5=result_true, 6=result_false
-    let vregs: Vec<VRegInfo> = (0..7).map(|_| VRegInfo { is_oop: true }).collect();
+    let vregs: Vec<VRegInfo> = (0..7).map(|_| VRegInfo { is_oop: true, is_fp: false }).collect();
 
     let block0 = IrBlock {
         id: BlockId(0),
@@ -150,6 +150,11 @@ fn run_ir_raw() {
         false_lit: PoolLit(0),
         nil_lit: PoolLit(0),
         mark_slots_lit: PoolLit(0),
+        mark_double_lit: PoolLit(0),
+        double_klass_lit: PoolLit(0),
+        float64x2_klass_lit: PoolLit(0),
+        float32x4_klass_lit: PoolLit(0),
+        int32x4_klass_lit: PoolLit(0),
         call_sites: Vec::new(),
         site_feedback: Vec::new(),
         inline_deps: Vec::new(),
@@ -167,6 +172,10 @@ fn run_ir_raw() {
         stubs.stub_poll_addr(),
         stubs.must_be_boolean_addr(),
         stubs.alloc_slow_addr(),
+        stubs.box_double_addr(),
+        stubs.box_float64x2_addr(),
+        stubs.box_float32x4_addr(),
+        stubs.box_int32x4_addr(),
         stubs.call_primitive_addr(),
         stubs.nlr_originate_addr(),
         None,
@@ -222,6 +231,10 @@ fn build_and_publish(cache: &mut CodeCache, stub_poll_addr: u64, method: &IrMeth
         0,
         0,
         0,
+        0,
+        0,
+        0,
+        0,
         None,
         None,
         None,
@@ -271,7 +284,7 @@ fn mul_method() -> IrMethod {
     };
     IrMethod {
         blocks: vec![block0, block1],
-        vregs: (0..4).map(|_| VRegInfo { is_oop: true }).collect(),
+        vregs: (0..4).map(|_| VRegInfo { is_oop: true, is_fp: false }).collect(),
         pool: Vec::new(),
         argc: 2,
         ntemps: 0,
@@ -286,6 +299,11 @@ fn mul_method() -> IrMethod {
         false_lit: PoolLit(0),
         nil_lit: PoolLit(0),
         mark_slots_lit: PoolLit(0),
+        mark_double_lit: PoolLit(0),
+        double_klass_lit: PoolLit(0),
+        float64x2_klass_lit: PoolLit(0),
+        float32x4_klass_lit: PoolLit(0),
+        int32x4_klass_lit: PoolLit(0),
         call_sites: Vec::new(),
         site_feedback: Vec::new(),
         inline_deps: Vec::new(),
@@ -347,7 +365,7 @@ fn run_ir_raw_forces_spill() {
     let stubs = stubs::install(&mut cache);
 
     let n = 20u32;
-    let mut vregs: Vec<VRegInfo> = vec![VRegInfo { is_oop: true }]; // v0 = self
+    let mut vregs: Vec<VRegInfo> = vec![VRegInfo { is_oop: true, is_fp: false }]; // v0 = self
     let mut code = vec![Ir::Param {
         dst: VReg(0),
         index: 0,
@@ -355,7 +373,7 @@ fn run_ir_raw_forces_spill() {
 
     // v1..=v20: constants 1..=20, all defined up front (all live at once).
     for i in 1..=n {
-        vregs.push(VRegInfo { is_oop: true });
+        vregs.push(VRegInfo { is_oop: true, is_fp: false });
         code.push(Ir::ConstSmi {
             dst: VReg(i),
             value: i as i64,
@@ -367,7 +385,7 @@ fn run_ir_raw_forces_spill() {
     let bailout = BlockId(1);
     let mut acc = VReg(1);
     for i in 2..=n {
-        vregs.push(VRegInfo { is_oop: true });
+        vregs.push(VRegInfo { is_oop: true, is_fp: false });
         let dst = VReg(n + i - 1);
         code.push(Ir::SmiArith {
             op: SmiOp::Add,
@@ -413,6 +431,11 @@ fn run_ir_raw_forces_spill() {
         false_lit: PoolLit(0),
         nil_lit: PoolLit(0),
         mark_slots_lit: PoolLit(0),
+        mark_double_lit: PoolLit(0),
+        double_klass_lit: PoolLit(0),
+        float64x2_klass_lit: PoolLit(0),
+        float32x4_klass_lit: PoolLit(0),
+        int32x4_klass_lit: PoolLit(0),
         call_sites: Vec::new(),
         site_feedback: Vec::new(),
         inline_deps: Vec::new(),
@@ -434,6 +457,10 @@ fn run_ir_raw_forces_spill() {
         stubs.stub_poll_addr(),
         stubs.must_be_boolean_addr(),
         stubs.alloc_slow_addr(),
+        stubs.box_double_addr(),
+        stubs.box_float64x2_addr(),
+        stubs.box_float32x4_addr(),
+        stubs.box_int32x4_addr(),
         stubs.call_primitive_addr(),
         stubs.nlr_originate_addr(),
         None,
@@ -1481,6 +1508,15 @@ fn golden_dir() -> std::path::PathBuf {
 }
 
 fn check_golden_lst(name: &str, actual: &str) {
+    // `blob.listing` is populated only in DEBUG builds (the assembler's
+    // listing channel is compiled out in release), so a release run would
+    // compare — or, under UPDATE_GOLDEN, overwrite the file with — emptiness.
+    // The standing rule: listing goldens are debug-canonical; compare and
+    // regenerate in debug only.
+    if !cfg!(debug_assertions) {
+        eprintln!("check_golden_lst({name}): skipped — listings are debug-only");
+        return;
+    }
     let path = golden_dir().join(format!("{name}.lst.expected"));
     if std::env::var("UPDATE_GOLDEN").is_ok() {
         std::fs::write(&path, actual).expect("write golden");
@@ -1563,6 +1599,10 @@ fn compile_and_get_listing(vm: &VmState, method: MethodOop) -> String {
         0xDEAD_BEEF_0000_0000,
         0xDEAD_BEEF_0000_0001,
         0xDEAD_BEEF_0000_0002,
+        0xDEAD_BEEF_0000_0005,
+        0xDEAD_BEEF_0000_0006,
+        0xDEAD_BEEF_0000_0007,
+        0xDEAD_BEEF_0000_0008,
         0xDEAD_BEEF_0000_0003,
         0xDEAD_BEEF_0000_0004,
         None,
@@ -2233,7 +2273,14 @@ fn threshold1_tiny_code_cache_exhausts_gracefully() {
     // not a correctness one). Retuned 2048 -> 3072 when S24 A1's
     // unconditional `nlr_originate` pool literal nudged per-method size up.
     let leave_free = 3072usize;
-    let prefill = macvm::codecache::DEFAULT_CODE_CACHE_CAPACITY.saturating_sub(leave_free);
+    // Relative to the REMAINING space, not the raw capacity: the stub bank
+    // is allocated inside this same cache at boot and has grown steadily
+    // (FFI trampolines, value stubs, mega trampolines, the Cocoa bridge…),
+    // so capacity-minus-headroom can exceed what is actually free.
+    let used = vm.code_cache.used_bytes();
+    let prefill = macvm::codecache::DEFAULT_CODE_CACHE_CAPACITY
+        .saturating_sub(used)
+        .saturating_sub(leave_free);
     vm.code_cache
         .alloc(prefill)
         .expect("prefilling most of a freshly-constructed cache must itself succeed");
@@ -2456,7 +2503,7 @@ fn mono_resolve_patches_call_site_and_dispatches() {
 
     // Caller: one param (the target receiver), one send of `foo:with:`
     // against two fresh smi constants -- self=x0, arg0=x1, arg1=x2.
-    let vregs: Vec<VRegInfo> = (0..4).map(|_| VRegInfo { is_oop: true }).collect();
+    let vregs: Vec<VRegInfo> = (0..4).map(|_| VRegInfo { is_oop: true, is_fp: false }).collect();
     let block0 = IrBlock {
         id: BlockId(0),
         bci: 0,
@@ -2500,6 +2547,11 @@ fn mono_resolve_patches_call_site_and_dispatches() {
         false_lit: PoolLit(0),
         nil_lit: PoolLit(0),
         mark_slots_lit: PoolLit(0),
+        mark_double_lit: PoolLit(0),
+        double_klass_lit: PoolLit(0),
+        float64x2_klass_lit: PoolLit(0),
+        float32x4_klass_lit: PoolLit(0),
+        int32x4_klass_lit: PoolLit(0),
         call_sites: vec![CallSiteInfo {
             selector: foo_sel,
             argc: 3,
@@ -2519,6 +2571,10 @@ fn mono_resolve_patches_call_site_and_dispatches() {
         vm.stubs.stub_poll_addr(),
         vm.stubs.must_be_boolean_addr(),
         vm.stubs.alloc_slow_addr(),
+        vm.stubs.box_double_addr(),
+        vm.stubs.box_float64x2_addr(),
+        vm.stubs.box_float32x4_addr(),
+        vm.stubs.box_int32x4_addr(),
         vm.stubs.call_primitive_addr(),
         vm.stubs.nlr_originate_addr(),
         None,
@@ -2635,7 +2691,7 @@ fn build_c2i_scenario(vm: &mut VmState) -> (u64, KlassOop, NmethodId) {
     let foo_method = fb.finish(vm, foo_sel, 2, 0);
     install_method(vm, target_klass, foo_sel, foo_method);
 
-    let vregs: Vec<VRegInfo> = (0..4).map(|_| VRegInfo { is_oop: true }).collect();
+    let vregs: Vec<VRegInfo> = (0..4).map(|_| VRegInfo { is_oop: true, is_fp: false }).collect();
     let block0 = IrBlock {
         id: BlockId(0),
         bci: 0,
@@ -2679,6 +2735,11 @@ fn build_c2i_scenario(vm: &mut VmState) -> (u64, KlassOop, NmethodId) {
         false_lit: PoolLit(0),
         nil_lit: PoolLit(0),
         mark_slots_lit: PoolLit(0),
+        mark_double_lit: PoolLit(0),
+        double_klass_lit: PoolLit(0),
+        float64x2_klass_lit: PoolLit(0),
+        float32x4_klass_lit: PoolLit(0),
+        int32x4_klass_lit: PoolLit(0),
         call_sites: vec![CallSiteInfo {
             selector: foo_sel,
             argc: 3,
@@ -2698,6 +2759,10 @@ fn build_c2i_scenario(vm: &mut VmState) -> (u64, KlassOop, NmethodId) {
         vm.stubs.stub_poll_addr(),
         vm.stubs.must_be_boolean_addr(),
         vm.stubs.alloc_slow_addr(),
+        vm.stubs.box_double_addr(),
+        vm.stubs.box_float64x2_addr(),
+        vm.stubs.box_float32x4_addr(),
+        vm.stubs.box_int32x4_addr(),
         vm.stubs.call_primitive_addr(),
         vm.stubs.nlr_originate_addr(),
         None,
@@ -2886,7 +2951,7 @@ fn full_ic_lattice_mono_to_pic_to_mega() {
     }
 
     // Caller: one param (the target receiver), one send of `foo`.
-    let vregs: Vec<VRegInfo> = (0..2).map(|_| VRegInfo { is_oop: true }).collect();
+    let vregs: Vec<VRegInfo> = (0..2).map(|_| VRegInfo { is_oop: true, is_fp: false }).collect();
     let block0 = IrBlock {
         id: BlockId(0),
         bci: 0,
@@ -2922,6 +2987,11 @@ fn full_ic_lattice_mono_to_pic_to_mega() {
         false_lit: PoolLit(0),
         nil_lit: PoolLit(0),
         mark_slots_lit: PoolLit(0),
+        mark_double_lit: PoolLit(0),
+        double_klass_lit: PoolLit(0),
+        float64x2_klass_lit: PoolLit(0),
+        float32x4_klass_lit: PoolLit(0),
+        int32x4_klass_lit: PoolLit(0),
         call_sites: vec![CallSiteInfo {
             selector: foo_sel,
             argc: 1,
@@ -2941,6 +3011,10 @@ fn full_ic_lattice_mono_to_pic_to_mega() {
         vm.stubs.stub_poll_addr(),
         vm.stubs.must_be_boolean_addr(),
         vm.stubs.alloc_slow_addr(),
+        vm.stubs.box_double_addr(),
+        vm.stubs.box_float64x2_addr(),
+        vm.stubs.box_float32x4_addr(),
+        vm.stubs.box_int32x4_addr(),
         vm.stubs.call_primitive_addr(),
         vm.stubs.nlr_originate_addr(),
         None,
@@ -3123,7 +3197,7 @@ fn dnu_from_compiled_code_reaches_does_not_understand() {
 
     // Caller: one param (the target receiver), one send of a selector
     // nothing anywhere implements -- must genuinely miss and reach rt_dnu.
-    let vregs: Vec<VRegInfo> = (0..2).map(|_| VRegInfo { is_oop: true }).collect();
+    let vregs: Vec<VRegInfo> = (0..2).map(|_| VRegInfo { is_oop: true, is_fp: false }).collect();
     let block0 = IrBlock {
         id: BlockId(0),
         bci: 0,
@@ -3159,6 +3233,11 @@ fn dnu_from_compiled_code_reaches_does_not_understand() {
         false_lit: PoolLit(0),
         nil_lit: PoolLit(0),
         mark_slots_lit: PoolLit(0),
+        mark_double_lit: PoolLit(0),
+        double_klass_lit: PoolLit(0),
+        float64x2_klass_lit: PoolLit(0),
+        float32x4_klass_lit: PoolLit(0),
+        int32x4_klass_lit: PoolLit(0),
         call_sites: vec![CallSiteInfo {
             selector: unknown_sel,
             argc: 1,
@@ -3178,6 +3257,10 @@ fn dnu_from_compiled_code_reaches_does_not_understand() {
         vm.stubs.stub_poll_addr(),
         vm.stubs.must_be_boolean_addr(),
         vm.stubs.alloc_slow_addr(),
+        vm.stubs.box_double_addr(),
+        vm.stubs.box_float64x2_addr(),
+        vm.stubs.box_float32x4_addr(),
+        vm.stubs.box_int32x4_addr(),
         vm.stubs.call_primitive_addr(),
         vm.stubs.nlr_originate_addr(),
         None,
