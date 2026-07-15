@@ -80,6 +80,31 @@ Object subclass: Worker [
         self class primSend: id corr: c bytes: (Worker pickle: aPayload).
         ^self
     ]
+
+    "── RPC: call a method by name in the worker (§5) ────────────────────
+     `w call: #sieveUpTo: on: #PrimeSieve args: #(10000) onReply: [:r | …]`
+     runs `PrimeSieve sieveUpTo: 10000` in the worker VM and delivers the
+     (deep-copied) result to the continuation. The class must exist in the
+     shared world; the selector and args pickle across as data. Both are
+     async — the primary never blocks. An error (unknown class, argc
+     mismatch) runs `onError:` with the message; the default logs it. A
+     method that itself RAISES sends no reply, so neither block fires — v1
+     has no cross-VM exception delivery (design §5)."
+    call: aSelector on: aClassName args: anArray onReply: aBlock [
+        ^self call: aSelector on: aClassName args: anArray
+              onReply: aBlock
+              onError: [ :msg | Transcript showCr: 'worker RPC error: ', msg ]
+    ]
+    call: aSelector on: aClassName args: anArray onReply: aBlock onError: anErrorBlock [
+        ^self send: (Array with: #rpc with: aClassName with: aSelector with: anArray)
+              onReply: [ :reply |
+                  (reply isKindOf: Array)
+                      ifFalse: [ anErrorBlock value: 'malformed RPC reply' ]
+                      ifTrue: [
+                          (reply at: 1) == #rpcOk
+                              ifTrue: [ aBlock value: (reply at: 2) ]
+                              ifFalse: [ anErrorBlock value: (reply at: 2) ] ] ]
+    ]
     terminate [ self class primTerminate: id. ^self ]
     isAlive [ ^self class primAlive: id ]
 
@@ -87,13 +112,47 @@ Object subclass: Worker [
        once per inbound message (the GameStep staging pattern) ──"
     Worker class >> onMessage: aBlock [ Handler := aBlock ]
     Worker class >> dispatchPending [
-        | env |
+        | env payload |
         env := self primPoll.
         env isNil ifTrue: [ ^self ].
         CurrentCorr := env at: 2.        "so reply: echoes it back"
+        payload := self unpickle: (env at: 3).
+        "RPC (docs/multi-smalltalk-worker.md §5): an {#rpc. class. sel. args}
+         payload is served directly — a worker booted with only the shared
+         world answers RPCs with no onMessage: handler installed. Any other
+         payload goes to the user handler as before."
+        (self isRpcRequest: payload) ifTrue: [ ^self serveRpc: payload ].
         Handler isNil ifFalse: [
-            Handler value: (WorkerMessage from: (env at: 1)
-                                         payload: (self unpickle: (env at: 3))) ]
+            Handler value: (WorkerMessage from: (env at: 1) payload: payload) ]
+    ]
+
+    "── RPC service: call a method by name (§5) ──────────────────────────
+     Both VMs load the same codebase, so a class the primary names, the
+     worker has too. The primary sends {#rpc. targetClassName. selector.
+     argsArray}; the worker resolves the class, `perform:withArguments:`,
+     and replies {#rpcOk. result} — or {#rpcError. why} for an unknown
+     class or an argc mismatch. A method that itself raises aborts this
+     dispatch doit and sends NO reply (the primary's continuation never
+     fires); v1 has no cross-VM exception delivery, by design."
+    Worker class >> isRpcRequest: p [
+        ^(p isKindOf: Array) and: [ (p size = 4) and: [ (p at: 1) == #rpc ] ]
+    ]
+    Worker class >> serveRpc: p [
+        | target |
+        target := self classNamed: (p at: 2).
+        target isNil ifTrue: [
+            ^self reply: (Array with: #rpcError
+                                with: 'no such class: ', (p at: 2) printString) ].
+        self reply: (Array with: #rpcOk
+                           with: (target perform: (p at: 3) withArguments: (p at: 4)))
+    ]
+    Worker class >> classNamed: aSymbol [
+        "Resolve a class by name in this worker's world, via the allClasses
+         reflection sweep (34_tools.mst) — O(classes), fine for RPC."
+        | want |
+        want := aSymbol asString.
+        ClassMirror allClasses do: [ :c | c name asString = want ifTrue: [ ^c ] ].
+        ^nil
     ]
     Worker class >> reply: aPayload [
         "From inside a worker's handler: answer the primary, echoing the

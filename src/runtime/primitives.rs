@@ -368,6 +368,14 @@ pub static PRIMITIVES: &[PrimDesc] = &[
         can_fail: true,
     },
     PrimDesc {
+        id: 64,
+        name: "perform:withArguments:",
+        f: prim_perform_with_arguments,
+        argc: 2,
+        can_allocate: true,
+        can_fail: true,
+    },
+    PrimDesc {
         id: 90,
         name: "quit",
         f: prim_quit,
@@ -3153,6 +3161,54 @@ fn prim_gc_full(vm: &mut VmState, args: &[Oop]) -> PrimResult {
 /// GC-safe two-pass: pass 1 counts (no allocation); `alloc_indexable_oops` may
 /// then scavenge, so pass 2 re-reads `vm.universe.smalltalk` (a scanned root,
 /// updated across the collection) rather than caching any oop across the alloc.
+/// `Object >> perform:withArguments:` (64) — a dynamic send: look the
+/// `selector` (a Symbol) up on the receiver's class and invoke the found
+/// method with the elements of `argsArray` spread as its arguments,
+/// answering the result. This is Smalltalk's reflective "call a method by
+/// name" and the mechanism behind the worker-VM RPC layer
+/// (docs/multi-smalltalk-worker.md): a Symbol and an argument Array both
+/// pickle across a VM boundary, so a primary can name a method for a
+/// worker to run.
+///
+/// Fails cleanly (the world fallback raises) on: a non-Symbol selector, a
+/// non-Array args, an argc mismatch between the array and the resolved
+/// method, or a selector the receiver's class does not implement
+/// (`doesNotUnderstand:` territory — reported by the world method rather
+/// than silently). The heavy lifting is [`run_method_reentrant`], the same
+/// synchronous-nested-invoke `rt_dnu` uses: it handles a primitive,
+/// compiled, or interpreted target uniformly and returns the result oop.
+fn prim_perform_with_arguments(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    let receiver = args[0];
+    let Some(sel) = crate::oops::wrappers::SymbolOop::try_from(args[1]) else {
+        return PrimResult::Fail;
+    };
+    let Some(arr) = ArrayOop::try_from(args[2]) else {
+        return PrimResult::Fail;
+    };
+    let n = arr.len();
+    let k = klass_of(vm, receiver);
+    let Some(method) = crate::runtime::lookup::lookup(vm, k, sel) else {
+        return PrimResult::Fail; // not understood — world fallback raises
+    };
+    if method.argc() != n {
+        return PrimResult::Fail; // wrong number of arguments for this method
+    }
+    // Root the receiver, the resolved method, and every argument across
+    // the nested run (which allocates freely), then materialize the call
+    // slice fresh immediately before invoking — nothing allocates between
+    // `get` and `run_method_reentrant`'s own receiver/args push.
+    let scope = crate::memory::handles::HandleScope::enter(vm);
+    let recv_h = scope.handle(vm, receiver);
+    let method_h = scope.handle(vm, method.oop());
+    let arg_hs: Vec<_> = (0..n).map(|i| scope.handle(vm, arr.at(i))).collect();
+    let recv = recv_h.get(vm);
+    let m = crate::oops::wrappers::MethodOop::try_from(method_h.get(vm))
+        .expect("rooted method survived the scope");
+    let argv: Vec<Oop> = arg_hs.iter().map(|h| h.get(vm)).collect();
+    let result = crate::interpreter::run_method_reentrant(vm, m, recv, &argv);
+    PrimResult::Ok(result)
+}
+
 fn prim_all_classes(vm: &mut VmState, _args: &[Oop]) -> PrimResult {
     fn tally_of(vm: &VmState) -> (ArrayOop, usize) {
         let arr = ArrayOop::try_from(vm.universe.smalltalk)
@@ -4387,6 +4443,7 @@ mod tests {
             (61, "ifCurtailed:"),
             (62, "primitiveOf:selector:"),
             (63, "methodSends:selector:target:"),
+            (64, "perform:withArguments:"),
             (90, "quit"),
             (91, "printOnStdout:"),
             (92, "millisecondClock"),

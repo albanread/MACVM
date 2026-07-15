@@ -2027,8 +2027,8 @@ mod tests {
         // bumps Tick so a broken loop bails instead of hanging the suite.
         vm.exec(
             "Object subclass: WkTest [
-                <classVars: Count Bad Tick Died W1 W2>
-                WkTest class >> reset [ Count := 0. Bad := 0. Tick := 0. Died := 0 ]
+                <classVars: Count Bad Tick Died W1 W2 Rpc>
+                WkTest class >> reset [ Count := 0. Bad := 0. Tick := 0. Died := 0. Rpc := nil ]
                 WkTest class >> w1: w [ W1 := w ]
                 WkTest class >> w1 [ ^W1 ]
                 WkTest class >> w2: w [ W2 := w ]
@@ -2040,6 +2040,8 @@ mod tests {
                 WkTest class >> count [ ^Count ]
                 WkTest class >> bad [ ^Bad ]
                 WkTest class >> died [ ^Died ]
+                WkTest class >> rpc: r [ Rpc := r ]
+                WkTest class >> rpc [ ^Rpc ]
                 WkTest class >> tickCapped: n [ Tick := Tick + 1. ^Tick < n ]
             ]",
         )
@@ -2076,6 +2078,98 @@ mod tests {
             vm.eval("WkTest bad").expect("bad").trim(),
             "0",
             "every reply must reach ITS OWN continuation with the right value"
+        );
+    }
+
+    #[test]
+    fn perform_calls_a_method_by_name() {
+        // `perform:withArguments:` (prim 64) + its arity sugar: a Symbol
+        // names a method and the real method body runs — a primitive, an
+        // interpreted, or (JIT on) a compiled one, uniformly.
+        let mut vm = boot_test_vm(JitMode::Off);
+        assert_eq!(vm.eval("3 perform: #+ with: 4").unwrap().trim(), "7");
+        assert_eq!(vm.eval("'abcd' perform: #size").unwrap().trim(), "4");
+        assert_eq!(
+            vm.eval("#(10 20 30) perform: #at: with: 2").unwrap().trim(),
+            "20"
+        );
+        assert_eq!(
+            vm.eval("10 perform: #between:and: withArguments: (Array with: 5 with: 15)")
+                .unwrap()
+                .trim(),
+            "true"
+        );
+        assert_eq!(
+            vm.eval("5 perform: #+ withArguments: (Array with: 100)")
+                .unwrap()
+                .trim(),
+            "105"
+        );
+        // A selector the receiver doesn't understand fails cleanly (the
+        // world fallback raises); the VM lives on.
+        assert!(
+            vm.exec("3 perform: #totallyBogusSelectorXyzzy.").is_err(),
+            "an unknown selector must raise, not silently no-op"
+        );
+        // An argument-count mismatch also fails cleanly.
+        assert!(
+            vm.exec("3 perform: #+ withArguments: (Array with: 1 with: 2).")
+                .is_err(),
+            "argc mismatch must raise"
+        );
+        assert_eq!(vm.eval("6 * 7").unwrap().trim(), "42");
+    }
+
+    #[test]
+    fn worker_rpc_calls_a_method_by_name() {
+        // The multi-VM RPC (§5): a worker booted with NO onMessage: handler
+        // still serves RPCs from the shared world. The primary names a
+        // class + selector + args; the worker resolves the class, performs
+        // the method, and the (deep-copied) result returns to the
+        // continuation. Target Array class>>with:with:with: — a shared-world
+        // class-side method, so the worker (its own fresh VM/heap) has it.
+        let mut vm = boot_worker_primary();
+        vm.exec("WkTest w1: (Worker spawn: '').")
+            .expect("spawn a bare RPC-serving worker (empty init)");
+        vm.exec(
+            "WkTest w1 call: #with:with:with: on: #Array args: #(10 20 30) \
+             onReply: [:r | WkTest rpc: r ].",
+        )
+        .expect("issue the RPC");
+        vm.exec("Worker runLoopWhile: [ (WkTest tickCapped: 200) and: [ WkTest rpc isNil ] ].")
+            .expect("await the reply");
+        assert_eq!(
+            vm.eval("WkTest rpc size").expect("result size").trim(),
+            "3",
+            "the result Array must return deep-copied"
+        );
+        assert_eq!(vm.eval("WkTest rpc at: 2").expect("elem").trim(), "20");
+    }
+
+    #[test]
+    fn worker_rpc_unknown_class_reports_an_error() {
+        // A named class the worker doesn't have: the worker replies an
+        // error envelope (not a value), so the onError: branch fires and
+        // the onReply: block does not — no crash, no hang.
+        let mut vm = boot_worker_primary();
+        vm.exec("WkTest w1: (Worker spawn: '').").expect("spawn");
+        vm.exec(
+            "WkTest w1 call: #foo on: #NoSuchClassXyzzy args: #() \
+             onReply: [:r | WkTest rpc: r ] \
+             onError: [:msg | WkTest bump: false ].",
+        )
+        .expect("issue the RPC to a missing class");
+        vm.exec("Worker runLoopWhile: [ (WkTest tickCapped: 200) and: [ WkTest count < 1 ] ].")
+            .expect("await the error reply");
+        assert_eq!(
+            vm.eval("WkTest count").unwrap().trim(),
+            "1",
+            "the onError: branch must have fired exactly once"
+        );
+        assert_eq!(
+            vm.eval("WkTest rpc isNil").unwrap().trim(),
+            "true",
+            "the onReply: value branch must NOT have fired"
         );
     }
 

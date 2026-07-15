@@ -76,3 +76,23 @@ Collection subclass: Bag [
         ^true
     ]
 ]
+
+"── perform: arity sugar (Object) ─────────────────────────────────────────
+ The zero-through-three-argument spellings of `perform:withArguments:`
+ (01_object.mst, primitive 64). Kept here, not in 01_object, because they
+ build an Array to hand to the primitive and `Array` is not bound until
+ 10_array.mst — far later in the load order than Object's own file."
+nil subclass: Object [
+    perform: aSymbol [
+        ^self perform: aSymbol withArguments: (Array new: 0)
+    ]
+    perform: aSymbol with: a [
+        ^self perform: aSymbol withArguments: (Array with: a)
+    ]
+    perform: aSymbol with: a with: b [
+        ^self perform: aSymbol withArguments: (Array with: a with: b)
+    ]
+    perform: aSymbol with: a with: b with: c [
+        ^self perform: aSymbol withArguments: (Array with: a with: b with: c)
+    ]
+]

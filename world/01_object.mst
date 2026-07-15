@@ -41,6 +41,25 @@ nil subclass: Object [
     doesNotUnderstand: aMessage [
         self error: 'does not understand ' , aMessage selector asString
     ]
+
+    "── reflective send: call a method by name ───────────────────────────
+     `anObject perform: #foo:bar: withArguments: #(1 2)` looks the selector
+     up on the receiver's class and runs the found method with the array's
+     elements as its arguments — the primitive resolves and invokes the
+     real method (interpreted, compiled, or itself a primitive, uniformly).
+     A Symbol and an argument Array both cross a VM boundary as copies, so
+     this is also the mechanism the worker-VM RPC layer uses to let a
+     primary name a method for a worker to run (Worker>>call:..., see
+     47_worker.mst / docs/multi-smalltalk-worker.md). Fails cleanly (this
+     fallback raises) on a bad selector/args, an argument-count mismatch,
+     or a selector the receiver does not understand. The `perform:` /
+     `perform:with:` … arity sugar is in 32_object_protocol_gaps.mst (it
+     references Array, which is not yet bound this early in the load)."
+    perform: aSymbol withArguments: anArray [
+        <primitive: 64>
+        ^self error: 'perform: ' , aSymbol printString ,
+            ' failed — not understood, or wrong number of arguments'
+    ]
 ]
 
 Object subclass: Message [
