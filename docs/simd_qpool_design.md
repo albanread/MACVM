@@ -121,11 +121,32 @@ The scalar invariant is kept verbatim, with one addition:
    hot case, e.g. an unrolled lane loop — residents never touch memory except
    the write-through stores.
 
-**Explicitly deferred (measure first):** widening `call_stub` to save/restore
-full `q8`–`q15` (+128 bytes of frame) to make residency survive calls, as
-SIMD.md C3 sketches. v1's reload-from-slot needs no frame change and its cost
-is bounded and local; adopt the wide save only if a real workload shows
-safepoint reloads dominating.
+**Rejected, not deferred: any save/restore of vector registers on the call
+path.** Widening `call_stub` (or compiled prologues) to preserve `q8`–`q15` at
+128 bits costs `4× stp q` + `4× ldp q` — 8 instructions and **256 bytes of
+memory traffic per call round-trip**, plus 128 bytes of frame per activation —
+charged to EVERY send in EVERY program to subsidize the rare method that holds
+a vector across a call. The send path is this VM's most-optimized artifact and
+its most sensitive: one hash lookup in the interpreter dispatch prologue
+measured ~7% whole-program (and was rejected for it); richards swung 16× on
+IC-path behavior; deltablue's 4 ms IS millions of sends. Against a ~5–15-cycle
+send, the save/restore is a several-× regression of the send itself, and its
+D-cache pollution (256 B of dead register bits streamed per call) taxes code
+that never touches a vector. The asymmetry is decisive: v1's reload costs one
+`ldr q` per live resident per crossed safepoint — zero instructions in any
+method without live vectors — while a call-path save costs every caller
+everywhere. It also cannot even be made airtight: Rust-compiled runtime code
+follows AAPCS64 and clobbers `v8`–`v15` upper halves at every VM↔Rust `bl`,
+so the tax would have to wrap every stub crossing too.
+
+**The governing principle (the scalar tier's, made explicit): the residency
+tier only exploits ABI guarantees that already exist — it never buys new ones
+with call-path instructions.** `d8`–`d15` scalar residency was free because
+AAPCS64 already preserves those 64 bits; nothing preserves 128, so the design
+treats registers as a call-free-span cache over the canonical slot, full stop.
+If safepoint reloads ever dominate a real vector profile, the remedies are
+in-loop and self-funding — poll placement/elision, unrolling (one reload
+amortized over N iterations), LICM of invariant reloads — never a call tax.
 
 ## 5. Frame slots — 16 bytes, and their alignment
 

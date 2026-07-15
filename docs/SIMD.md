@@ -187,13 +187,16 @@ safepoint. That slot is already the source of truth for deopt (the write-through
 residency invariant), so the reload is correct by construction — it just costs
 one `ldr q` per crossed safepoint that the scalar path did not need.
 
-Two implementations, pick per-measurement:
-- **(v1) reload-from-slot:** a vector's residency register is valid only within
-  a call-free span; at/after a safepoint, reads reload from the slot. Zero new
-  prologue cost. Recommended first.
-- **(later) widen `call_stub`:** save/restore full `q8`–`q15` (frame grows
-  another 128 bytes), making 128-bit residency survive calls like the scalar
-  case. Trade frame size for the reload; measure before adopting.
+The implementation is **reload-from-slot**: a vector's residency register is
+valid only within a call-free span; at/after a safepoint, reads reload from the
+slot. Zero new prologue cost, zero cost to any method without live vectors.
+The once-sketched alternative — widening `call_stub` to save/restore
+`q8`–`q15` — is **rejected, not deferred**: it charges 8 instructions + 256 B
+of memory traffic to every send in every program to subsidize the rare
+vector-across-call method, on the VM's most cycle-sensitive path (see
+`docs/simd_qpool_design.md` §4 for the full argument and the governing
+principle: the residency tier only exploits ABI guarantees that already exist,
+never buys new ones with call-path instructions).
 
 ### C4. Deopt — one new `ValueLoc` kind
 
