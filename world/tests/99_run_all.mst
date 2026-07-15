@@ -37,4 +37,5 @@ TestRunner run: FFIAlienTests.
 TestRunner run: NilMacroTests.
 TestRunner run: NumberExtTests.
 TestRunner run: CollectionExtTests.
+TestRunner run: StringStreamExtTests.
 TestRunner report.

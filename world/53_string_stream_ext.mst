@@ -1,0 +1,113 @@
+"53_string_stream_ext.mst — String + Stream convenience a probe found missing,
+ pure Smalltalk on the existing classes (String, ReadStream, WriteStream).
+ Reopens each; built on methods/ivars that already work: String at:/size/
+ copyFrom:to:/,/substrings:/asInteger/isSeparator/isDigit/digitValue, the
+ stream collection+position cursor, and the Number-tower asFloat/raisedTo:
+ added in world/51."
+
+ArrayedCollection subclass: String [
+    "Strip leading and trailing separators (space/tab/newline)."
+    trimSeparators [
+        | start stop |
+        start := 1.
+        [ start <= self size and: [ (self at: start) isSeparator ] ]
+            whileTrue: [ start := start + 1 ].
+        stop := self size.
+        [ stop >= start and: [ (self at: stop) isSeparator ] ]
+            whileTrue: [ stop := stop - 1 ].
+        ^self copyFrom: start to: stop
+    ]
+
+    "First character uppercased, the rest unchanged."
+    capitalized [
+        self isEmpty ifTrue: [ ^self ].
+        ^(self copyFrom: 1 to: 1) asUppercase , (self copyFrom: 2 to: self size)
+    ]
+
+    "Squeak-cased alias of substrings:."
+    subStrings: separators [ ^self substrings: separators ]
+
+    includesSubstring: aString [
+        | limit |
+        aString isEmpty ifTrue: [ ^true ].
+        limit := self size - aString size + 1.
+        1 to: limit do: [:i |
+            (self copyFrom: i to: i + aString size - 1) = aString ifTrue: [ ^true ] ].
+        ^false
+    ]
+
+    "A WriteStream that appends to a fresh copy of this string's species."
+    writeStream [ ^WriteStream on: (String new: 0) ]
+
+    "Parse an integer or a simple decimal (optional leading '-'). Non-numeric
+     prefixes yield 0, matching Smalltalk's lenient asNumber."
+    asNumber [
+        | s i neg intPart fracPart fracLen result |
+        s := self trimSeparators.
+        s isEmpty ifTrue: [ ^0 ].
+        i := 1. neg := false.
+        (s at: 1) = $- ifTrue: [ neg := true. i := 2 ].
+        intPart := 0.
+        [ i <= s size and: [ (s at: i) isDigit ] ] whileTrue: [
+            intPart := (intPart * 10) + (s at: i) digitValue. i := i + 1 ].
+        (i <= s size and: [ (s at: i) = $. ]) ifFalse: [
+            neg ifTrue: [ ^intPart negated ]. ^intPart ].
+        i := i + 1. fracPart := 0. fracLen := 0.
+        [ i <= s size and: [ (s at: i) isDigit ] ] whileTrue: [
+            fracPart := (fracPart * 10) + (s at: i) digitValue.
+            fracLen := fracLen + 1. i := i + 1 ].
+        result := intPart asFloat + (fracPart asFloat / (10 raisedTo: fracLen)).
+        neg ifTrue: [ ^result negated ].
+        ^result
+    ]
+
+    String class >> streamContents: aBlock [
+        | s |
+        s := WriteStream on: (String new: 0).
+        aBlock value: s.
+        ^s contents
+    ]
+]
+
+Object subclass: ReadStream [
+    "Read the next n elements as one same-species slice."
+    next: anInteger [
+        | result |
+        result := collection copyFrom: position + 1 to: position + anInteger.
+        position := position + anInteger.
+        ^result
+    ]
+
+    "Read up to (and consuming) the first occurrence of anObject; the
+     delimiter itself is not included in the answer. Reaching the end
+     returns everything remaining."
+    upTo: anObject [
+        | start result |
+        start := position.
+        [ self atEnd or: [ (collection at: position + 1) = anObject ] ]
+            whileFalse: [ position := position + 1 ].
+        result := collection copyFrom: start + 1 to: position.
+        self atEnd ifFalse: [ position := position + 1 ].
+        ^result
+    ]
+
+    "If the next element equals anObject, consume it and answer true."
+    peekFor: anObject [
+        self atEnd ifTrue: [ ^false ].
+        (self peek = anObject) ifTrue: [ self next. ^true ].
+        ^false
+    ]
+
+    nextLine [ ^self upTo: (Character value: 10) ]
+
+    skipSeparators [
+        [ self atEnd not and: [ (collection at: position + 1) isSeparator ] ]
+            whileTrue: [ position := position + 1 ]
+    ]
+]
+
+Object subclass: WriteStream [
+    "Append anObject's printString (the printable representation), unlike
+     nextPutAll: which needs an already-string argument."
+    print: anObject [ self nextPutAll: anObject printString ]
+]

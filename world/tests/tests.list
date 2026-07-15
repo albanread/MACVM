@@ -37,4 +37,5 @@ tier1.mst
 31_nil_macro_tests.mst
 32_number_ext_tests.mst
 33_collection_ext_tests.mst
+34_string_stream_ext_tests.mst
 99_run_all.mst

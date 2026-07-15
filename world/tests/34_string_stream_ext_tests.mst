@@ -1,0 +1,84 @@
+"34_string_stream_ext_tests.mst — StringStreamExtTests: the String + Stream
+ convenience added in world/53_string_stream_ext.mst (trimSeparators, capitalized,
+ includesSubstring:, asNumber, streamContents:, next:/upTo:/peekFor:/nextLine)."
+
+TestCase subclass: StringStreamExtTests [
+    | nl |
+    runAll [
+        nl := Character value: 10.
+        self runTest: #testTrim do: [ self testTrim ].
+        self runTest: #testCapitalized do: [ self testCapitalized ].
+        self runTest: #testIncludesSubstring do: [ self testIncludesSubstring ].
+        self runTest: #testSubStrings do: [ self testSubStrings ].
+        self runTest: #testAsNumber do: [ self testAsNumber ].
+        self runTest: #testStreamContents do: [ self testStreamContents ].
+        self runTest: #testReadNext do: [ self testReadNext ].
+        self runTest: #testUpTo do: [ self testUpTo ].
+        self runTest: #testPeekForNextLine do: [ self testPeekForNextLine ].
+    ]
+
+    testTrim [
+        self assert: '  hi there  ' trimSeparators = 'hi there'.
+        self assert: 'nopad' trimSeparators = 'nopad'.
+        self assert: '   ' trimSeparators = ''.
+        self assert: '' trimSeparators = ''.
+    ]
+
+    testCapitalized [
+        self assert: 'hello' capitalized = 'Hello'.
+        self assert: 'Hello' capitalized = 'Hello'.
+        self assert: '' capitalized = ''.
+    ]
+
+    testIncludesSubstring [
+        self assert: ('hello world' includesSubstring: 'o w').
+        self assert: ('hello' includesSubstring: 'hello').
+        self assert: ('hello' includesSubstring: '').
+        self deny: ('hello' includesSubstring: 'xyz').
+        self deny: ('hi' includesSubstring: 'longer').
+    ]
+
+    testSubStrings [
+        self assert: ('a,b,c' subStrings: ',') asArray = #('a' 'b' 'c').
+    ]
+
+    testAsNumber [
+        self assert: '42' asNumber = 42.
+        self assert: '-7' asNumber = -7.
+        self assert: '3.5' asNumber = 3.5.
+        self assert: '-2.25' asNumber = -2.25.
+        self assert: '0' asNumber = 0.
+        self assert: 'abc' asNumber = 0.
+        self assert: '  10  ' asNumber = 10.
+    ]
+
+    testStreamContents [
+        self assert: (String streamContents: [:s | s nextPutAll: 'x='; print: 42 ]) = 'x=42'.
+        self assert: (String streamContents: [:s | 1 to: 3 do: [:i | s print: i ]]) = '123'.
+    ]
+
+    testReadNext [
+        self assert: ((ReadStream on: 'hello') next: 3) = 'hel'.
+        self assert: ((ReadStream on: #(1 2 3 4 5)) next: 2) = #(1 2).
+    ]
+
+    testUpTo [
+        | rs |
+        rs := ReadStream on: 'a,b,c'.
+        self assert: (rs upTo: $,) = 'a'.
+        self assert: (rs upTo: $,) = 'b'.
+        self assert: (rs upTo: $,) = 'c'.
+        "no delimiter -> rest of stream"
+        self assert: ((ReadStream on: 'abc') upTo: $z) = 'abc'.
+    ]
+
+    testPeekForNextLine [
+        | rs two |
+        self assert: ((ReadStream on: 'abc') peekFor: $a).
+        self deny: ((ReadStream on: 'abc') peekFor: $z).
+        two := String streamContents: [:s | s nextPutAll: 'line1'; nextPut: nl; nextPutAll: 'line2' ].
+        rs := ReadStream on: two.
+        self assert: rs nextLine = 'line1'.
+        self assert: rs nextLine = 'line2'.
+    ]
+]
