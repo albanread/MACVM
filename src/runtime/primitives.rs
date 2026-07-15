@@ -1295,6 +1295,31 @@ pub static PRIMITIVES: &[PrimDesc] = &[
         can_allocate: false,
         can_fail: true,
     },
+    // --- reflection group ----------------------------------------------
+    PrimDesc {
+        id: 246,
+        name: "respondsTo:",
+        f: prim_responds_to,
+        argc: 1,
+        can_allocate: false,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 247,
+        name: "shallowCopy",
+        f: prim_shallow_copy,
+        argc: 0,
+        can_allocate: true,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 248,
+        name: "numArgs",
+        f: prim_block_num_args,
+        argc: 0,
+        can_allocate: false,
+        can_fail: true,
+    },
 ];
 
 pub fn prim_by_id(id: u16) -> Option<&'static PrimDesc> {
@@ -3070,6 +3095,92 @@ fn prim_ensure_like(
     }
 }
 
+// --- reflection group ---------------------------------------------------------
+
+/// `anObject respondsTo: #foo` — does a lookup from the receiver's klass find
+/// the selector? Answers the question directly through the SAME chain walk
+/// (and lookup cache) real dispatch uses, rather than the Smalltalk-level
+/// alternative of materializing every class's `selectorsOf:` Array up the
+/// superclass chain just to test membership.
+fn prim_responds_to(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    let Some(sel) = crate::oops::wrappers::SymbolOop::try_from(args[1]) else {
+        return PrimResult::Fail; // not a Symbol
+    };
+    let klass = klass_of(vm, args[0]);
+    let found = crate::runtime::lookup::lookup(vm, klass, sel).is_some();
+    PrimResult::Ok(bool_oop(vm, found))
+}
+
+/// `anObject shallowCopy` — a fresh object of the receiver's exact klass and
+/// size, with every named instance variable and every indexed element copied
+/// verbatim (one level deep; the elements themselves are shared).
+///
+/// FAILS (so the Smalltalk fallback answers `self`) for anything that is not a
+/// copyable heap shape: immediates (smis/chars), Doubles, and the internal
+/// Klass/Method/Closure/Context/Process formats — all either value-like or
+/// not meaningfully duplicable. `Symbol` is IndexableBytes and so *would* copy
+/// here; 32_object_ext.mst overrides it back to `^self`, because a Symbol's
+/// whole contract is that identity IS equality.
+fn prim_shallow_copy(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    let Some(src) = MemOop::try_from(args[0]) else {
+        return PrimResult::Fail; // immediate — the fallback answers self
+    };
+    let klass = src.klass();
+    let format = klass.format();
+    let named = klass.non_indexable_size() - HEADER_WORDS;
+    let len = match format {
+        Format::Slots => 0,
+        Format::IndexableOops | Format::IndexableBytes => src.indexable_len(),
+        _ => return PrimResult::Fail,
+    };
+
+    // The allocation below can scavenge, which MOVES the receiver — every read
+    // of `src` after it must go through the handle, never the stale local.
+    // (`alloc_words` roots the klass it is handed itself, so `klass` needs no
+    // handle of its own.)
+    let scope = crate::memory::handles::HandleScope::enter(vm);
+    let src_h = scope.handle(vm, args[0]);
+    let copy = match format {
+        Format::Slots => alloc::alloc_slots(vm, klass),
+        Format::IndexableOops => alloc::alloc_indexable_oops(vm, klass, len).as_mem(),
+        Format::IndexableBytes => alloc::alloc_indexable_bytes(vm, klass, len).as_mem(),
+        _ => unreachable!("format was filtered above"),
+    };
+    let src = MemOop::try_from(src_h.get(vm)).expect("receiver is still a mem oop after the copy");
+
+    for i in 0..named {
+        copy.set_body_oop(i, src.body_oop(i));
+    }
+    match format {
+        // Body layout is [named ivars][size slot][elements] — element i sits
+        // at body index `named + 1 + i` (`heap::instance_size_words`).
+        Format::IndexableOops => {
+            for i in 0..len {
+                copy.set_body_oop(named + 1 + i, src.body_oop(named + 1 + i));
+            }
+        }
+        // Bytes go through the tail byte accessors, NOT body_oop: raw byte
+        // words are not oops, and Oop::from_raw's debug validation rejects
+        // arbitrary bit patterns.
+        Format::IndexableBytes => {
+            for i in 0..len {
+                copy.set_tail_byte_at(i, src.tail_byte_at(i));
+            }
+        }
+        _ => {}
+    }
+    PrimResult::Ok(copy.oop())
+}
+
+/// `aBlock numArgs` — the block's declared argument count, straight off its
+/// CompiledBlock.
+fn prim_block_num_args(_vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    let Some(closure) = crate::oops::wrappers::ClosureOop::try_from(args[0]) else {
+        return PrimResult::Fail;
+    };
+    PrimResult::Ok(SmallInt::new(closure.method().argc() as i64).oop())
+}
+
 fn prim_ensure(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     prim_ensure_like(vm, args, crate::interpreter::stack::MarkerKind::Ensure)
 }
@@ -4556,6 +4667,9 @@ mod tests {
             (243, "Cocoa class>>primNewAction:"),
             (244, "Cocoa class>>primPoolPush"),
             (245, "Cocoa class>>primPoolPop"),
+            (246, "respondsTo:"),
+            (247, "shallowCopy"),
+            (248, "numArgs"),
         ];
         assert_eq!(
             PRIMITIVES.len(),

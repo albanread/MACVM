@@ -1,0 +1,88 @@
+"59_reflection.mst — the reflection protocol, on three new VM primitives
+ (246 respondsTo:, 247 shallowCopy, 248 numArgs — src/runtime/primitives.rs).
+ These genuinely need the VM: respondsTo: walks the method-dictionary chain
+ through the same lookup real dispatch uses; shallowCopy allocates a
+ same-klass, same-size object and copies its slots verbatim; numArgs reads a
+ block's CompiledBlock argc. None is expressible in Smalltalk alone."
+
+nil subclass: Object [
+    "Does the receiver's class (or any superclass) implement aSymbol?"
+    respondsTo: aSymbol [ <primitive: 246> ^self primitiveFailed: #respondsTo: ]
+
+    "A new object of the same class with the same instance variables and
+     indexed elements — one level deep, so the elements are SHARED with the
+     original. The primitive fails for immediates (smis, characters) and for
+     value-like or internal shapes (Double, Klass, Method, Closure, Context,
+     Process); for those a copy IS the receiver, which is what the fallback
+     answers."
+    shallowCopy [ <primitive: 247> ^self ]
+
+    "`copy` = shallowCopy + postCopy, Smalltalk's standard two-step. The
+     second step matters: a shallowCopy duplicates the object's own slots but
+     SHARES whatever they point at, so a collection that keeps its elements in
+     an internal array hands the copy the SAME array — mutating the copy would
+     write through to the original (verified: an OrderedCollection shallowCopy
+     `at:1 put: 99` changed the original). Each such class overrides postCopy
+     below to un-share its storage; for everything else postCopy is identity."
+    copy [ ^self shallowCopy postCopy ]
+
+    "Hook: fix up a fresh shallowCopy's shared internals. Answer self."
+    postCopy [ ^self ]
+
+    "Raised by a primitive that failed for a reason the fallback can't
+     paper over — currently only respondsTo: with a non-Symbol argument."
+    primitiveFailed: aSelector [
+        ^self error: 'primitive failed: ', aSelector printString
+    ]
+]
+
+"Identity-critical classes: their whole contract is that there is exactly ONE
+ of each value, so copying must answer the receiver, not a look-alike. The
+ shallowCopy primitive would happily duplicate a Symbol (it is
+ IndexableBytes, same shape as String) and the singletons (Slots), which
+ would silently break `#foo == #foo` and `true == true`."
+String subclass: Symbol [
+    shallowCopy [ ^self ]
+]
+
+Object subclass: Boolean [
+    shallowCopy [ ^self ]
+]
+
+Object subclass: UndefinedObject [
+    shallowCopy [ ^self ]
+]
+
+"A Character is a value: copying one is meaningless, and answering a
+ look-alike would make `$a copy == $a` false."
+Magnitude subclass: Character [
+    shallowCopy [ ^self ]
+]
+
+Object subclass: BlockClosure [
+    "The number of arguments this block takes: [:a :b | ...] numArgs = 2."
+    numArgs [ <primitive: 248> ^self primitiveFailed: #numArgs ]
+]
+
+"--- postCopy: un-share each collection's internal storage -----------------
+ Without these, `aCollection copy` hands back an object pointing at the
+ ORIGINAL's element array. Overriding postCopy (rather than copy) keeps the
+ shallowCopy's other instance variables intact — notably SortedCollection's
+ sortBlock, which a `self class withAll: self` rebuild would silently drop."
+
+SequenceableCollection subclass: OrderedCollection [
+    postCopy [ array := array shallowCopy. ^self ]
+]
+
+HashedCollection subclass: Set [
+    postCopy [ elements := elements shallowCopy. ^self ]
+]
+
+HashedCollection subclass: Dictionary [
+    postCopy [ keys := keys shallowCopy. vals := vals shallowCopy. ^self ]
+]
+
+Collection subclass: Bag [
+    "contents is a Dictionary — copy it properly (its own postCopy runs)."
+    postCopy [ contents := contents copy. ^self ]
+]

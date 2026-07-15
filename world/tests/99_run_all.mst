@@ -44,4 +44,5 @@ TestRunner run: DictPointSetExtTests.
 TestRunner run: FormatIterExtTests.
 TestRunner run: FinalExtTests.
 TestRunner run: NumberCoercionTests.
+TestRunner run: ReflectionTests.
 TestRunner report.

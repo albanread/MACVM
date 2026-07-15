@@ -1,0 +1,88 @@
+"41_reflection_tests.mst — ReflectionTests: respondsTo:, shallowCopy/copy/
+ postCopy, and BlockClosure>>numArgs (world/59_reflection.mst + VM prims
+ 246/247/248)."
+
+TestCase subclass: ReflectionTests [
+    runAll [
+        self runTest: #testRespondsTo do: [ self testRespondsTo ].
+        self runTest: #testNumArgs do: [ self testNumArgs ].
+        self runTest: #testCopyEqualNotIdentical do: [ self testCopyEqualNotIdentical ].
+        self runTest: #testCopyIsIndependent do: [ self testCopyIsIndependent ].
+        self runTest: #testCopyKeepsIdentityForValues do: [ self testCopyKeepsIdentityForValues ].
+        self runTest: #testSortedCollectionCopyKeepsSortBlock do: [ self testSortedCollectionCopyKeepsSortBlock ].
+    ]
+
+    testRespondsTo [
+        self assert: (3 respondsTo: #printString).
+        self assert: (3 respondsTo: #+).
+        self assert: (3 respondsTo: #factorial).
+        self assert: ('hi' respondsTo: #asUppercase).
+        self assert: (nil respondsTo: #isNil).
+        self deny: (3 respondsTo: #noSuchSelectorAnywhere).
+        self deny: (3 respondsTo: #asUppercase).
+    ]
+
+    testNumArgs [
+        self assert: [] numArgs = 0.
+        self assert: [:x | x] numArgs = 1.
+        self assert: [:a :b | a] numArgs = 2.
+        self assert: [:a :b :c | a] numArgs = 3.
+    ]
+
+    testCopyEqualNotIdentical [
+        self assert: #(1 2 3) copy = #(1 2 3).
+        self deny: #(1 2 3) copy == #(1 2 3).
+        self assert: 'abc' copy = 'abc'.
+        self deny: 'abc' copy == 'abc'.
+        self assert: (3@4) copy = (3@4).
+        self deny: (3@4) copy == (3@4).
+    ]
+
+    "The postCopy half: a copy must not share the original's storage."
+    testCopyIsIndependent [
+        | a b d d2 s s2 |
+        a := Array withAll: #(1 2 3).
+        b := a copy.
+        b at: 1 put: 99.
+        self assert: (a at: 1) = 1.
+
+        a := OrderedCollection withAll: #(1 2 3).
+        b := a copy.
+        b at: 1 put: 99.
+        b add: 4.
+        self assert: (a at: 1) = 1.
+        self assert: a size = 3.
+
+        s := Set withAll: #(1 2).
+        s2 := s copy.
+        s2 add: 99.
+        self assert: s size = 2.
+
+        d := Dictionary new at: #x put: 1; yourself.
+        d2 := d copy.
+        d2 at: #y put: 2.
+        self assert: d size = 1.
+        self assert: (d2 at: #x) = 1.
+    ]
+
+    "Values and singletons: a copy IS the receiver, or identity breaks."
+    testCopyKeepsIdentityForValues [
+        self assert: #foo copy == #foo.
+        self assert: #foo shallowCopy == #foo.
+        self assert: true copy == true.
+        self assert: false copy == false.
+        self assert: nil copy == nil.
+        self assert: 3 copy == 3.
+        self assert: $a copy == $a.
+        self assert: 2.5 copy == 2.5.
+    ]
+
+    "postCopy (not a rebuild) is why the sortBlock survives."
+    testSortedCollectionCopyKeepsSortBlock [
+        | sc c |
+        sc := #(3 1 2) asSortedCollection: [:x :y | x > y ].
+        c := sc copy.
+        c add: 5.
+        self assert: c asArray = #(5 3 2 1).
+    ]
+]

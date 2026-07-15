@@ -89,8 +89,12 @@ Collection subclass: SequenceableCollection [
     third [ ^self at: 3 ]
     fourth [ ^self at: 4 ]
 
-    "A shallow copy of the sequence (same species as copyFrom:to' returns)."
-    copy [ ^self copyFrom: 1 to: self size ]
+    "NOTE: no `copy` here. It used to be `^self copyFrom: 1 to: self size`,
+     which worked for Array/String but DNU'd on OrderedCollection (whose
+     copyFrom:to: builds via at:put:) and errored on Symbol ('symbols are
+     immutable'). world/59 supplies the real one — Object>>copy =
+     shallowCopy + postCopy, on the shallowCopy primitive — which covers
+     every sequence correctly, including those two."
     reverse [ ^self reversed ]
 
     "Non-destructive sorts return a fresh Array; sort/sort: order the
