@@ -176,6 +176,30 @@ pub fn inline_block_positions(
         // into a real send), which is exactly how sieve's whole `run` — and
         // every hot loop inside it — stayed interpreted forever.
         ("timesRepeat:", 1) if block_argc(&args[0]) == Some(0) => Some(vec![BlockPos::Arg(0)]),
+        // The nil-guard family. `ifNotNil:`'s block optionally takes the
+        // (non-nil) receiver value as its single param — so 0 OR 1 arg is
+        // inlinable there; the `ifNil:` block is always 0-arg. All desugar
+        // to an identity test against nil plus dissolved bodies (codegen).
+        ("ifNil:", 1) if block_argc(&args[0]) == Some(0) => Some(vec![BlockPos::Arg(0)]),
+        ("ifNotNil:", 1) if matches!(block_argc(&args[0]), Some(0) | Some(1)) => {
+            Some(vec![BlockPos::Arg(0)])
+        }
+        ("ifNil:ifNotNil:", 2)
+            if block_argc(&args[0]) == Some(0)
+                && matches!(block_argc(&args[1]), Some(0) | Some(1)) =>
+        {
+            Some(vec![BlockPos::Arg(0), BlockPos::Arg(1)])
+        }
+        ("ifNotNil:ifNil:", 2)
+            if matches!(block_argc(&args[0]), Some(0) | Some(1))
+                && block_argc(&args[1]) == Some(0) =>
+        {
+            Some(vec![BlockPos::Arg(0), BlockPos::Arg(1)])
+        }
+        // `[body] repeat` — an unconditional loop over a literal 0-arg block
+        // receiver. Exits only via a `^`/non-local return inside the body;
+        // the back-edge poll keeps it interruptible and GC-safe.
+        ("repeat", 0) if block_argc(receiver) == Some(0) => Some(vec![BlockPos::Receiver]),
         ("to:do:", 2) if block_argc(&args[1]) == Some(1) => {
             let Expr::Block(b) = &args[1] else {
                 unreachable!()

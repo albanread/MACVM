@@ -34,4 +34,5 @@ TestRunner run: DateTimeTests.
 TestRunner run: ReadWriteStreamTests.
 TestRunner run: ObjectProtocolGapsTests.
 TestRunner run: FFIAlienTests.
+TestRunner run: NilMacroTests.
 TestRunner report.

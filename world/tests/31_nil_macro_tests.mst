@@ -1,0 +1,82 @@
+"31_nil_macro_tests.mst — NilMacroTests: the ifNil:/ifNotNil: family and
+ `repeat`, all inlined to jumps by the front-end (capture.rs +
+ codegen.rs::emit_inlined). Verifies Smalltalk value semantics: the
+ receiver is evaluated once, is the not-nil result, and doubles as
+ ifNotNil:'s nil result; the ifNotNil: block optionally binds it."
+
+TestCase subclass: NilMacroTests [
+    | effects |
+
+    runAll [
+        self runTest: #testIfNil do: [ self testIfNil ].
+        self runTest: #testIfNotNil do: [ self testIfNotNil ].
+        self runTest: #testIfNotNilBinding do: [ self testIfNotNilBinding ].
+        self runTest: #testIfNilIfNotNil do: [ self testIfNilIfNotNil ].
+        self runTest: #testIfNotNilIfNil do: [ self testIfNotNilIfNil ].
+        self runTest: #testReceiverEvaluatedOnce do: [ self testReceiverEvaluatedOnce ].
+        self runTest: #testNested do: [ self testNested ].
+        self runTest: #testRepeat do: [ self testRepeat ].
+        self runTest: #testNlrThroughRepeat do: [ self testNlrThroughRepeat ].
+    ]
+
+    testIfNil [
+        self assert: (nil ifNil: [ 'A' ]) = 'A'.
+        self assert: (5 ifNil: [ 'A' ]) = 5.
+        self assert: (nil ifNil: [ nil ]) isNil.
+    ]
+
+    testIfNotNil [
+        self assert: (nil ifNotNil: [ 'B' ]) isNil.
+        self assert: (7 ifNotNil: [ 'B' ]) = 'B'.
+    ]
+
+    testIfNotNilBinding [
+        self assert: (nil ifNotNil: [ :v | v + 1 ]) isNil.
+        self assert: (9 ifNotNil: [ :v | v + 1 ]) = 10.
+    ]
+
+    testIfNilIfNotNil [
+        self assert: (nil ifNil: [ 10 ] ifNotNil: [ :v | v * 2 ]) = 10.
+        self assert: (6 ifNil: [ 10 ] ifNotNil: [ :v | v * 2 ]) = 12.
+        self assert: (6 ifNil: [ 10 ] ifNotNil: [ 20 ]) = 20.
+    ]
+
+    testIfNotNilIfNil [
+        self assert: (nil ifNotNil: [ :v | v ] ifNil: [ 99 ]) = 99.
+        self assert: (4 ifNotNil: [ :v | v ] ifNil: [ 99 ]) = 4.
+    ]
+
+    "The receiver expression must run exactly once, even though the
+     construct references it twice (test and result)."
+    testReceiverEvaluatedOnce [
+        effects := 0.
+        self bumpNil ifNil: [ 'was nil' ].
+        self assert: effects = 1.
+        effects := 0.
+        self bumpVal ifNotNil: [ :v | v ].
+        self assert: effects = 1.
+    ]
+
+    testNested [
+        self assert: (nil ifNil: [ 3 ifNotNil: [ :v | v + 40 ] ]) = 43.
+        self assert: (8 ifNotNil: [ :v | v ifNil: [ 0 ] ]) = 8.
+    ]
+
+    "`repeat` is an unconditional loop exited only by a non-local return."
+    testRepeat [
+        self assert: self countToFive = 5.
+    ]
+
+    testNlrThroughRepeat [
+        self assert: (self firstOver: 100 from: 30 by: 25) = 105.
+    ]
+
+    "helpers"
+    bumpNil [ effects := effects + 1. ^nil ]
+    bumpVal [ effects := effects + 1. ^42 ]
+    countToFive [ | n | n := 0. [ n := n + 1. n >= 5 ifTrue: [ ^n ] ] repeat ]
+    firstOver: limit from: start by: step [
+        | n | n := start.
+        [ n > limit ifTrue: [ ^n ]. n := n + step ] repeat
+    ]
+]

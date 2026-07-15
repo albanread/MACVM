@@ -22,16 +22,6 @@ use crate::oops::Oop;
 use crate::runtime::frames::{walk_frames, AdapterKind, FrameView};
 use crate::runtime::vm_state::VmState;
 
-/// Visits every live root oop, replacing each in place with `f`'s result.
-/// Order: well-known singleton oops, well-known selectors, well-known
-/// klasses, symbol table, process stack, handle arena, interpreter regs
-/// mirror — matching S7's original scan order exactly (some tests pin
-/// observable scavenge behavior against it).
-///
-/// `f` takes `&mut VmState` because a scavenge's transform (`scavenge_oop`)
-/// needs it for `to`-space bookkeeping; a full GC's mark-push and
-/// forward-chase transforms don't touch `vm`, but share the signature so one
-/// generic walker serves all three collector-supplied transforms.
 thread_local! {
     /// Which root section is currently being walked — purely diagnostic:
     /// the scavenger's to-space tripwire (`scavenge_oop`) includes it in its
@@ -44,6 +34,17 @@ thread_local! {
 pub(crate) fn section(label: &'static str) {
     ROOT_SECTION.with(|s| s.set(label));
 }
+
+/// Visits every live root oop, replacing each in place with `f`'s result.
+/// Order: well-known singleton oops, well-known selectors, well-known
+/// klasses, symbol table, process stack, handle arena, interpreter regs
+/// mirror — matching S7's original scan order exactly (some tests pin
+/// observable scavenge behavior against it).
+///
+/// `f` takes `&mut VmState` because a scavenge's transform (`scavenge_oop`)
+/// needs it for `to`-space bookkeeping; a full GC's mark-push and
+/// forward-chase transforms don't touch `vm`, but share the signature so one
+/// generic walker serves all three collector-supplied transforms.
 
 pub fn for_each_root<F>(vm: &mut VmState, mut f: F)
 where

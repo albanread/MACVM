@@ -33,7 +33,7 @@ use crate::interpreter::stack::{Frame, FrameActivation};
 use crate::oops::smi::SmallInt;
 use crate::oops::wrappers::MethodOop;
 use crate::oops::Oop;
-use crate::runtime::vm_state::{InterpRegs, VmState};
+use crate::runtime::vm_state::VmState;
 
 /// What [`deoptimize_frame`] hands the nested interpreter run (D5 M8). The
 /// materializer builds the frames and repoints `vm.stack.fp`/`sp`; this

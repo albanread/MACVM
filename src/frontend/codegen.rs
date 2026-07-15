@@ -753,6 +753,87 @@ fn emit_inlined(
             b.bind(l2);
             // The dup'd receiver from setup is now TOS = the result.
         }
+        // The nil-guard family — an identity test against nil (`== nil`, a
+        // real send: `==` is the identity primitive, never redefinable, and
+        // the JIT lowers it to a register compare) plus dissolved bodies.
+        // The receiver is evaluated ONCE, kept on the stack, and doubles as
+        // the not-nil result (on the nil branch it IS nil, so it also serves
+        // as `ifNotNil:`'s nil result — no separate push).
+        "ifNil:" => {
+            emit_expr(cx, hoist, cache, b, scope_id, next_hoist_slot, receiver)?;
+            b.dup();
+            b.push_nil();
+            let eq = cx.vm.universe.intern(b"==");
+            b.send(cx.vm, eq, 1);
+            let l1 = b.new_label();
+            let l2 = b.new_label();
+            b.br_false_fwd(l1); // not nil -> receiver (still on TOS) is the result
+            b.pop(); // nil branch: drop the receiver copy
+            emit_dissolved_body(cx, hoist, cache, b, scope_id, next_hoist_slot, arg_block(0))?;
+            b.jump_fwd(l2);
+            b.bind(l1);
+            b.bind(l2);
+        }
+        "ifNotNil:" => {
+            emit_expr(cx, hoist, cache, b, scope_id, next_hoist_slot, receiver)?;
+            b.dup();
+            b.push_nil();
+            let eq = cx.vm.universe.intern(b"==");
+            b.send(cx.vm, eq, 1);
+            let l1 = b.new_label();
+            let l2 = b.new_label();
+            b.br_true_fwd(l1); // nil -> receiver copy (== nil) is the result
+            emit_ifnotnil_arm(cx, hoist, cache, b, scope_id, next_hoist_slot, arg_block(0))?;
+            b.jump_fwd(l2);
+            b.bind(l1);
+            b.bind(l2);
+        }
+        "ifNil:ifNotNil:" => {
+            emit_expr(cx, hoist, cache, b, scope_id, next_hoist_slot, receiver)?;
+            b.dup();
+            b.push_nil();
+            let eq = cx.vm.universe.intern(b"==");
+            b.send(cx.vm, eq, 1);
+            let l1 = b.new_label();
+            let l2 = b.new_label();
+            b.br_false_fwd(l1); // not nil -> the ifNotNil arm
+            b.pop(); // nil branch: drop the receiver copy
+            emit_dissolved_body(cx, hoist, cache, b, scope_id, next_hoist_slot, arg_block(0))?;
+            b.jump_fwd(l2);
+            b.bind(l1);
+            emit_ifnotnil_arm(cx, hoist, cache, b, scope_id, next_hoist_slot, arg_block(1))?;
+            b.bind(l2);
+        }
+        "ifNotNil:ifNil:" => {
+            emit_expr(cx, hoist, cache, b, scope_id, next_hoist_slot, receiver)?;
+            b.dup();
+            b.push_nil();
+            let eq = cx.vm.universe.intern(b"==");
+            b.send(cx.vm, eq, 1);
+            let l1 = b.new_label();
+            let l2 = b.new_label();
+            b.br_true_fwd(l1); // nil -> the ifNil arm
+            emit_ifnotnil_arm(cx, hoist, cache, b, scope_id, next_hoist_slot, arg_block(0))?;
+            b.jump_fwd(l2);
+            b.bind(l1);
+            b.pop(); // nil branch: drop the receiver copy (== nil)
+            emit_dissolved_body(cx, hoist, cache, b, scope_id, next_hoist_slot, arg_block(1))?;
+            b.bind(l2);
+        }
+        // `[body] repeat` — unconditional loop; the body value is discarded
+        // each turn. Control leaves only through a `^`/non-local return in the
+        // body, so the fall-through past `jump_back` is unreachable; the
+        // trailing `push_nil` exists solely to keep the static stack model
+        // balanced for that dead continuation (same posture as codegen's other
+        // documented unreachable tails).
+        "repeat" => {
+            let l0 = b.new_label();
+            b.bind(l0);
+            emit_dissolved_body(cx, hoist, cache, b, scope_id, next_hoist_slot, recv_block())?;
+            b.pop();
+            b.jump_back(l0);
+            b.push_nil();
+        }
         "to:do:" => {
             let body_blk = arg_block(1);
             let loop_var = &body_blk.params[0];
@@ -805,6 +886,34 @@ fn emit_inlined(
         _ => unreachable!("inline_block_positions returned a shape emit_inlined doesn't handle"),
     }
     Ok(())
+}
+
+/// The not-nil arm of an `ifNotNil:` construct. The receiver value is on
+/// TOS on entry: a 0-arg block discards it (`pop`), a 1-arg block binds it
+/// to the param (`store_temp_pop` into its hoist slot). Leaves the arm's
+/// value on the stack. The 1-arg path mirrors [`emit_dissolved_body`]
+/// (push scope / emit body / pop) with the binding store spliced in.
+#[allow(clippy::too_many_arguments)]
+fn emit_ifnotnil_arm(
+    cx: &mut Ctx,
+    hoist: &mut Vec<HoistScope>,
+    cache: &mut LitCache,
+    b: &mut BytecodeBuilder,
+    scope_id: u32,
+    next_hoist_slot: &mut usize,
+    blk: &BlockNode,
+) -> Result<(), CompileError> {
+    if blk.params.is_empty() {
+        b.pop();
+        emit_dissolved_body(cx, hoist, cache, b, scope_id, next_hoist_slot, blk)
+    } else {
+        push_hoist_scope(hoist, next_hoist_slot, blk);
+        let v_slot = *hoist.last().unwrap().names.get(&blk.params[0]).unwrap();
+        b.store_temp_pop(v_slot);
+        let r = emit_statement_seq(cx, hoist, cache, b, scope_id, next_hoist_slot, &blk.body);
+        hoist.pop();
+        r
+    }
 }
 
 // --- statement sequencing (method/block bodies) -----------------------------
