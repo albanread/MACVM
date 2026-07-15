@@ -2760,6 +2760,32 @@ mod tests {
     }
 
     #[test]
+    fn cocoa_c3_hop_disabled_fails_cleanly() {
+        let _serial = cocoa_serial();
+        // Headless: nothing drains the main dispatch queue, so the sync
+        // hop must FAIL CLEANLY (a Smalltalk error), never hang. Nothing
+        // in the lib-test process ever calls enable_main_hop — the real
+        // dispatch hop is proven by the harness=false integration test
+        // (tests/cocoa_main_hop.rs), which owns a genuine main thread.
+        assert!(
+            !crate::runtime::objc_bridge::main_hop_enabled(),
+            "no lib test may enable the process-wide hop"
+        );
+        let mut vm = boot_test_vm(JitMode::Off);
+        assert!(
+            vm.exec("(Cocoa classNamed: 'NSThread') sendMain: 'isMainThread' args: #().")
+                .is_err(),
+            "an un-enabled hop must raise, not hang"
+        );
+        assert!(
+            vm.exec("(Cocoa classNamed: 'NSThread') onMain isMainThread.")
+                .is_err(),
+            "the onMain proxy must raise too"
+        );
+        assert_eq!(vm.eval("3 + 4").unwrap().trim(), "7");
+    }
+
+    #[test]
     fn cocoa_c2_dnu_sends_survive_the_jit() {
         let _serial = cocoa_serial();
         // DNU sends from COMPILED callers: threshold-1 compiles the loop

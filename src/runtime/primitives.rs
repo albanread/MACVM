@@ -1255,6 +1255,14 @@ pub static PRIMITIVES: &[PrimDesc] = &[
         can_allocate: true,
         can_fail: true,
     },
+    PrimDesc {
+        id: 242,
+        name: "ObjcRef>>primSendMainAuto:args:",
+        f: prim_cocoa_send_main_auto,
+        argc: 2,
+        can_allocate: true,
+        can_fail: true,
+    },
 ];
 
 pub fn prim_by_id(id: u16) -> Option<&'static PrimDesc> {
@@ -2019,6 +2027,23 @@ fn cocoa_double_array(vm: &mut VmState, vals: &[f64]) -> Oop {
 /// such method, the shape is outside C2's vocabulary, an argument can't
 /// coerce, or a struct argument would straddle the register file.
 fn prim_cocoa_send_auto(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    cocoa_send_auto_impl(vm, args, false)
+}
+
+/// `ObjcRef >> primSendMainAuto:args:` (242) — the C3 variant: identical
+/// resolution + marshalling, dispatched synchronously ON THE MAIN THREAD
+/// (design §4 path 2 — AppKit is main-thread-only). Inline when already
+/// on main; a clean failure when no GUI host has enabled the hop.
+fn prim_cocoa_send_main_auto(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    cocoa_send_auto_impl(vm, args, true)
+}
+
+/// The shared engine behind prims 241/242 — `on_main` picks the dispatch
+/// leg ([`objc_bridge::try_send_full`] vs [`try_send_full_on_main`]);
+/// everything before and after the call is identical, including the
+/// ownership rules (the marshalled registers are plain words either way,
+/// so the main thread never sees an oop).
+fn cocoa_send_auto_impl(vm: &mut VmState, args: &[Oop], on_main: bool) -> PrimResult {
     use crate::runtime::objc_bridge::{
         self, ObjcArg, ObjcRet, RetKind, SEND_FPR_SLOTS, SEND_GPR_SLOTS, SEND_STACK_SLOTS,
     };
@@ -2242,10 +2267,41 @@ fn prim_cocoa_send_auto(vm: &mut VmState, args: &[Oop]) -> PrimResult {
         ObjcRet::Void => RetKind::Void,
     };
 
-    let out = match objc_bridge::try_send_full(target, &sel, &gpr, &fpr, &stack, ret_kind) {
+    // The hop takes result OWNERSHIP on the main thread (C3 review): a +0
+    // object result is retained INSIDE the hop (before main's pools can
+    // pop it), a char* result is copied to owned bytes there — so the VM
+    // thread always receives a +1 id (`hop_owned_id`, wrapped with
+    // wrap_owned) or owned Rust memory (`hop_bytes`), never a pointer
+    // whose lifetime main still controls.
+    let mut hop_bytes: Option<Vec<u8>> = None;
+    let hop_owned_id = on_main && shape.ret == ObjcRet::Id;
+    let send_result = if on_main {
+        let retain_result = hop_owned_id && fam == objc_bridge::Family::Plus0;
+        let copy_cstr = shape.ret == ObjcRet::CharStar;
+        objc_bridge::try_send_full_on_main_owned(
+            target,
+            &sel,
+            &gpr,
+            &fpr,
+            &stack,
+            ret_kind,
+            retain_result,
+            copy_cstr,
+        )
+        .map(|(out, bytes)| {
+            hop_bytes = bytes;
+            out
+        })
+    } else {
+        objc_bridge::try_send_full(target, &sel, &gpr, &fpr, &stack, ret_kind)
+    };
+    let out = match send_result {
         Ok(o) => o,
         Err(desc) => {
-            // ns_consumes_self holds on the throw path (C1 review).
+            // ns_consumes_self holds on the throw path (C1 review). An
+            // un-enabled hop fails BEFORE the send ran — but the hop error
+            // and a thrown NSException are indistinguishable here, and
+            // consuming on both keeps the bias leak-side either way.
             if fam == objc_bridge::Family::Init {
                 objc_bridge::consume_receiver(vm, args[0]);
             }
@@ -2258,11 +2314,17 @@ fn prim_cocoa_send_auto(vm: &mut VmState, args: &[Oop]) -> PrimResult {
 
     let smi_range = crate::oops::layout::SMI_MIN..=crate::oops::layout::SMI_MAX;
     match shape.ret {
-        ObjcRet::Id => PrimResult::Ok(objc_bridge::wrap_result(
-            vm,
-            out.gpr[0] as *mut std::os::raw::c_void,
-            &sel,
-        )),
+        ObjcRet::Id => {
+            let id = out.gpr[0] as *mut std::os::raw::c_void;
+            PrimResult::Ok(if hop_owned_id {
+                // The hop already secured the +1 ON MAIN (retain for
+                // Plus0, the family's own +1 otherwise) — a retaining
+                // wrap here would double-own.
+                objc_bridge::wrap_owned(vm, id)
+            } else {
+                objc_bridge::wrap_result(vm, id, &sel)
+            })
+        }
         ObjcRet::Bool => PrimResult::Ok(if (out.gpr[0] & 0xFF) != 0 {
             vm.universe.true_obj
         } else {
@@ -2317,11 +2379,19 @@ fn prim_cocoa_send_auto(vm: &mut VmState, args: &[Oop]) -> PrimResult {
             PrimResult::Ok(a.oop())
         }
         ObjcRet::CharStar => {
-            // Copied to owned bytes (in the unsafe-permitted bridge)
-            // BEFORE any Smalltalk allocation can drain the pool.
-            let Some(bytes) = objc_bridge::cstr_bytes(out.gpr[0] as *const std::os::raw::c_char)
-            else {
-                return PrimResult::Fail;
+            // Copied to owned bytes BEFORE any pool can drain them — on
+            // the MAIN thread for a hopped send (the copy came back in
+            // `hop_bytes`), on this thread otherwise.
+            let bytes = if on_main {
+                match hop_bytes {
+                    Some(b) => b,
+                    None => return PrimResult::Fail,
+                }
+            } else {
+                match objc_bridge::cstr_bytes(out.gpr[0] as *const std::os::raw::c_char) {
+                    Some(b) => b,
+                    None => return PrimResult::Fail,
+                }
             };
             let k = vm.universe.string_klass;
             let s = alloc::alloc_indexable_bytes(vm, k, bytes.len());
@@ -4347,6 +4417,7 @@ mod tests {
             (239, "ObjcRef>>primIsValid"),
             (240, "ObjcRef>>primSend:args:ret:"),
             (241, "ObjcRef>>primSendAuto:args:"),
+            (242, "ObjcRef>>primSendMainAuto:args:"),
         ];
         assert_eq!(
             PRIMITIVES.len(),

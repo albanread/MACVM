@@ -146,6 +146,12 @@ pub fn counters() -> (u64, u64, u64) {
 
 thread_local! {
     /// This thread's bottom autorelease pool token (null = none yet).
+    /// MAIN-thread caveat (C3): a hop's `ensure_pool` on main nests our
+    /// token inside whatever pool scope AppKit/GCD had open; their pops
+    /// drain it, leaving this token stale. Harmless as long as
+    /// `drain_pool_at_doit_boundary` is only ever called from VM-thread
+    /// sites (it is: the doit boundary and prim 238) — never call it on
+    /// main.
     static POOL: Cell<*mut c_void> = const { Cell::new(std::ptr::null_mut()) };
 }
 
@@ -351,19 +357,29 @@ pub fn wrap_result(vm: &mut VmState, id: *mut c_void, selector: &str) -> Oop {
     }
     match selector_family(selector) {
         Family::Plus0 => wrap(vm, id),
-        Family::Plus1 | Family::Init => {
-            WRAPS.fetch_add(1, Ordering::Relaxed);
-            let k = vm.universe.objcref_klass;
-            let b = alloc::alloc_indexable_bytes(vm, k, 8);
-            for (i, byte) in (id as u64).to_le_bytes().iter().enumerate() {
-                b.byte_at_put(i, *byte);
-            }
-            if vm.options.trace.is_enabled("cocoa") {
-                let _ = writeln!(vm.out, "[cocoa] wrap {:p} (+1 family, no retain)", id);
-            }
-            b.oop()
-        }
+        Family::Plus1 | Family::Init => wrap_owned(vm, id),
     }
+}
+
+/// Mint a wrapper for an id whose +1 is ALREADY in hand (a +1-family
+/// result, or a hopped result whose retain happened ON the main thread
+/// inside the hop — the C3 review's cross-thread-autorelease fix): no
+/// bridge retain, ownership recorded as-is. NULL answers `nil`.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub fn wrap_owned(vm: &mut VmState, id: *mut c_void) -> Oop {
+    if id.is_null() {
+        return vm.universe.nil_obj;
+    }
+    WRAPS.fetch_add(1, Ordering::Relaxed);
+    let k = vm.universe.objcref_klass;
+    let b = alloc::alloc_indexable_bytes(vm, k, 8);
+    for (i, byte) in (id as u64).to_le_bytes().iter().enumerate() {
+        b.byte_at_put(i, *byte);
+    }
+    if vm.options.trace.is_enabled("cocoa") {
+        let _ = writeln!(vm.out, "[cocoa] wrap {:p} (already owned, no retain)", id);
+    }
+    b.oop()
 }
 
 /// The init-family receiver transfer (design §3.2): after a successful
@@ -695,6 +711,205 @@ pub fn is_manual_memory_selector(selector: &str) -> bool {
         selector,
         "retain" | "release" | "autorelease" | "dealloc" | "retainCount"
     )
+}
+
+// ── C3: the sync main-thread hop (design §4 path 2) ─────────────────────────
+//
+// AppKit is main-thread-only; the VM lives on its own thread (S21). The
+// hop is `dispatch_sync_f` onto the main queue — the C-function form of
+// the design's performSelectorOnMainThread mechanism, no Blocks runtime
+// needed. Sync-waiting on another thread is safe HERE by architectural
+// invariant: the main thread never synchronously waits on the VM
+// (vm_host is async by construction — submit + drain-on-wake, S21/M3),
+// so no wait cycle can close. The degenerate case — already ON main
+// (a Cocoa callback context) — runs inline: that IS the correct sync
+// semantics and the non-deadlocking one.
+//
+// The hop only completes if something drains the main queue (the GUI's
+// NSApplication run loop). A headless host has no drain, so the hop is
+// GATED: [`enable_main_hop`] is called by a GUI host once its run loop is
+// (about to be) live; un-enabled, the hop fails cleanly instead of
+// hanging forever.
+
+// libdispatch/pthread entry points — plain libSystem symbols, linked, not
+// dlsym'd. `_dispatch_main_q` is the main queue object itself (what the
+// dispatch_get_main_queue() macro takes the address of).
+#[repr(C)]
+struct DispatchQueueS {
+    _opaque: [u8; 0],
+}
+extern "C" {
+    static _dispatch_main_q: DispatchQueueS;
+    fn dispatch_sync_f(queue: *mut c_void, context: *mut c_void, work: extern "C" fn(*mut c_void));
+    fn pthread_main_np() -> std::os::raw::c_int;
+}
+
+static MAIN_HOP_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Hop traffic counters: (dispatched-to-main, ran-inline-already-on-main).
+static HOPS_DISPATCHED: AtomicU64 = AtomicU64::new(0);
+static HOPS_INLINE: AtomicU64 = AtomicU64::new(0);
+
+/// A GUI host calls this once at startup, when the main run loop is (about
+/// to be) live and will drain the main queue. Never call it from a
+/// headless host: an un-drained main queue turns every hop into a hang,
+/// which is exactly what the un-enabled clean failure exists to prevent.
+pub fn enable_main_hop() {
+    MAIN_HOP_ENABLED.store(true, Ordering::Release);
+}
+
+pub fn main_hop_enabled() -> bool {
+    MAIN_HOP_ENABLED.load(Ordering::Acquire)
+}
+
+pub fn hop_stats() -> (u64, u64) {
+    (
+        HOPS_DISPATCHED.load(Ordering::Relaxed),
+        HOPS_INLINE.load(Ordering::Relaxed),
+    )
+}
+
+/// [`try_send_full`], executed on the MAIN thread, synchronously, with
+/// result OWNERSHIP taken on main too (the C3 review's cross-thread
+/// autorelease finding): a `+0` object result lives in the MAIN thread's
+/// autorelease pool, and main keeps popping pools concurrently once the
+/// hop returns — so the retain (`retain_result`) and any C-string copy
+/// (`copy_cstr`) must happen INSIDE the hop, before main moves on. By the
+/// time this returns, an object result is +1 in hand (wrap it with
+/// [`wrap_owned`], never a retaining wrap) and string bytes are owned
+/// Rust memory.
+///
+/// Every value that crosses is a plain native word or owned Rust — no oop
+/// is ever visible to the main thread, and the VM thread is blocked (not
+/// at a safepoint) for the duration, so no GC can run under the hop. The
+/// @try exception shim runs ON main; a caught NSException crosses back as
+/// the ordinary `Err` description. Honest residuals (C3 review): a
+/// non-ObjC C++ exception inside a hopped call unwinds on MAIN and kills
+/// the app (the same @catch(id) hole C0 accepted, relocated); a SIGSEGV
+/// in hopped framework code faults on main, which has no PROBE jmp slot —
+/// the process dies honestly rather than siglongjmp-ing across Apple's
+/// frames. And the standing misuse warning: driving AppKit from a NON-main
+/// thread via the plain send path (bypassing this hop) can interleave with
+/// AppKit's own internal main dispatches — use the hop for AppKit, always.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::type_complexity)]
+pub fn try_send_full_on_main_owned(
+    target: *mut c_void,
+    selector: &str,
+    gpr: &[u64; SEND_GPR_SLOTS],
+    fpr: &[f64; SEND_FPR_SLOTS],
+    stack: &[u64; SEND_STACK_SLOTS],
+    ret: RetKind,
+    retain_result: bool,
+    copy_cstr: bool,
+) -> Result<(SendOut, Option<Vec<u8>>), String> {
+    // The post-send ownership step, shared by the inline and dispatched
+    // legs — it must run on whichever thread ran the send, BEFORE that
+    // thread's pool can pop.
+    fn own_result(
+        out: &SendOut,
+        retain_result: bool,
+        copy_cstr: bool,
+    ) -> Result<Option<Vec<u8>>, String> {
+        if retain_result {
+            let p = out.gpr[0] as *mut c_void;
+            if !p.is_null() {
+                if let Some(s) = syms() {
+                    unsafe { (s.objc_retain)(p) };
+                }
+            }
+        }
+        if copy_cstr {
+            return match cstr_bytes(out.gpr[0] as *const c_char) {
+                Some(b) => Ok(Some(b)),
+                None => Err("char* result was NULL".to_string()),
+            };
+        }
+        Ok(None)
+    }
+
+    if unsafe { pthread_main_np() } == 1 {
+        // Already on main (a callback context): inline IS the sync hop —
+        // the degenerate, non-deadlocking case the design's "assert not
+        // main" clause became.
+        HOPS_INLINE.fetch_add(1, Ordering::Relaxed);
+        let out = try_send_full(target, selector, gpr, fpr, stack, ret)?;
+        let bytes = own_result(&out, retain_result, copy_cstr)?;
+        return Ok((out, bytes));
+    }
+    if !main_hop_enabled() {
+        return Err(
+            "main-thread hop unavailable: no main run loop is draining the queue \
+             (a GUI host enables it; headless VMs run Foundation on the VM thread)"
+                .to_string(),
+        );
+    }
+
+    struct HopCtx<'a> {
+        target: *mut c_void,
+        selector: &'a str,
+        gpr: &'a [u64; SEND_GPR_SLOTS],
+        fpr: &'a [f64; SEND_FPR_SLOTS],
+        stack: &'a [u64; SEND_STACK_SLOTS],
+        ret: RetKind,
+        retain_result: bool,
+        copy_cstr: bool,
+        out: Option<Result<(SendOut, Option<Vec<u8>>), String>>,
+    }
+    extern "C" fn hop_exec(ctx: *mut c_void) {
+        // Runs ON the main thread, inside dispatch_sync_f — the caller's
+        // stack frame (and everything HopCtx borrows) is pinned until
+        // this returns; the write to `out` happens-before the caller
+        // resumes (dispatch_sync_f is a full synchronization point).
+        // Nothing here can realistically panic (CString/syms are fallible,
+        // excbuf decoding is lossy) — a panic in an extern "C" fn would
+        // abort, which is the honest outcome for a broken invariant on
+        // the UI thread.
+        let c = unsafe { &mut *(ctx as *mut HopCtx) };
+        c.out = Some(
+            try_send_full(c.target, c.selector, c.gpr, c.fpr, c.stack, c.ret).and_then(|out| {
+                let bytes = own_result(&out, c.retain_result, c.copy_cstr)?;
+                Ok((out, bytes))
+            }),
+        );
+    }
+    let mut ctx = HopCtx {
+        target,
+        selector,
+        gpr,
+        fpr,
+        stack,
+        ret,
+        retain_result,
+        copy_cstr,
+        out: None,
+    };
+    unsafe {
+        dispatch_sync_f(
+            std::ptr::addr_of!(_dispatch_main_q) as *mut c_void,
+            &mut ctx as *mut HopCtx as *mut c_void,
+            hop_exec,
+        );
+    }
+    HOPS_DISPATCHED.fetch_add(1, Ordering::Relaxed);
+    ctx.out
+        .unwrap_or_else(|| Err("main-thread hop completed without a result".to_string()))
+}
+
+/// The plain-registers hop (no ownership post-step) — for results that are
+/// VALUES (BOOL/int/float/struct registers), where nothing pool-owned
+/// crosses back. Object/char* results must use
+/// [`try_send_full_on_main_owned`] instead.
+pub fn try_send_full_on_main(
+    target: *mut c_void,
+    selector: &str,
+    gpr: &[u64; SEND_GPR_SLOTS],
+    fpr: &[f64; SEND_FPR_SLOTS],
+    stack: &[u64; SEND_STACK_SLOTS],
+    ret: RetKind,
+) -> Result<SendOut, String> {
+    try_send_full_on_main_owned(target, selector, gpr, fpr, stack, ret, false, false)
+        .map(|(out, _)| out)
 }
 
 // ── sends ───────────────────────────────────────────────────────────────────

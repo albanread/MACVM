@@ -1,0 +1,138 @@
+//! Cocoa bridge C3 gate (docs/cocoa_bridge_design.md §4 path 2): the sync
+//! main-thread hop, proven END TO END against the real main queue.
+//!
+//! This is a `harness = false` integration test on purpose: libtest runs
+//! ordinary `#[test]`s on WORKER threads while the process's real main
+//! thread sits parked in `join()` — so nothing drains the main dispatch
+//! queue and a genuine `dispatch_sync` hop could never complete under the
+//! default harness. Here `main()` IS the real main thread: it boots a VM
+//! on a worker thread (the S21 model, exactly the GUI's arrangement),
+//! enables the hop, and drains the main queue via `CFRunLoopRunInMode`
+//! while the VM thread performs Smalltalk `sendMain:` calls.
+//!
+//! The proof is self-verifying: `NSThread isMainThread` answers per the
+//! CALLING thread — `false` for a plain VM-thread send, `true` through
+//! the hop. No AppKit needed (and none is initialized); the mechanism is
+//! identical for AppKit calls, which the CocoaPad capstone (C5) will
+//! exercise on-screen.
+
+use macvm::embed::VmHandle;
+use macvm::runtime::vm_state::VmOptions;
+use macvm::runtime::JitMode;
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
+#[link(name = "CoreFoundation", kind = "framework")]
+extern "C" {
+    fn CFRunLoopRunInMode(
+        mode: *const std::os::raw::c_void,
+        seconds: f64,
+        return_after_source_handled: u8,
+    ) -> i32;
+    static kCFRunLoopDefaultMode: *const std::os::raw::c_void;
+}
+
+fn main() {
+    // The inline degenerate case FIRST, from the genuine main thread: a
+    // sync hop while already on main must run inline (a Cocoa-callback
+    // context can never deadlock itself). Proven through the bridge's own
+    // entry point, before any VM exists.
+    {
+        use macvm::runtime::objc_bridge as ob;
+        let cls = ob::class_named("NSThread").expect("Foundation must resolve");
+        let out = ob::try_send_full_on_main(
+            cls,
+            "isMainThread",
+            &[0; 6],
+            &[0.0; 8],
+            &[0; 4],
+            ob::RetKind::Gpr,
+        )
+        .expect("inline-on-main hop must succeed");
+        assert_eq!(out.gpr[0] & 0xFF, 1, "on main, isMainThread must be YES");
+        let (_, inline0) = ob::hop_stats();
+        assert!(inline0 >= 1, "the inline path must have counted");
+    }
+
+    macvm::runtime::objc_bridge::enable_main_hop();
+
+    let done = Arc::new(AtomicBool::new(false));
+    let done_vm = done.clone();
+    let vm_thread = std::thread::spawn(move || {
+        let mut vm = VmHandle::boot(
+            VmOptions {
+                heap_mib: 64,
+                jit: JitMode::Off,
+                ..Default::default()
+            },
+            Path::new("world"),
+        )
+        .expect("boot against world/");
+
+        // A plain VM-thread send: NOT the main thread.
+        let off_main = vm
+            .eval("(Cocoa classNamed: 'NSThread') sendBool: 'isMainThread'")
+            .expect("plain send");
+        assert_eq!(off_main.trim(), "false", "the VM thread is not main");
+
+        // The hop: the SAME question, answered on the main thread.
+        let on_main = vm
+            .eval("(Cocoa classNamed: 'NSThread') sendMain: 'isMainThread' args: #()")
+            .expect("the sync main-thread hop must complete");
+        assert_eq!(on_main.trim(), "true", "sendMain: must run ON main");
+
+        // The onMain proxy sugar drives the identical machinery.
+        let via_proxy = vm
+            .eval("(Cocoa classNamed: 'NSThread') onMain isMainThread")
+            .expect("the onMain proxy hop must complete");
+        assert_eq!(via_proxy.trim(), "true", "onMain proxy must run ON main");
+
+        // A hopped +0 OBJECT result (the C3 review's cross-thread
+        // autorelease finding): processInfo is autoreleased into MAIN's
+        // pool; the hop must retain it ON main before returning, so the
+        // wrapper stays valid while main keeps draining. Prove it by
+        // using the wrapper for further sends, then release it.
+        vm.exec("Object subclass: HopT [ <classVars: P> HopT class >> p: x [ P := x ] HopT class >> p [ ^P ] ]")
+            .expect("holder");
+        vm.exec("HopT p: ((Cocoa classNamed: 'NSProcessInfo') sendMain: 'processInfo' args: #()).")
+            .expect("hopped +0 id result");
+        let name = vm
+            .eval("HopT p sendString: 'processName'")
+            .expect("the hopped wrapper must still be alive");
+        assert!(
+            name.contains("cocoa_main_hop"),
+            "processName should be this test binary, got {name}"
+        );
+        vm.exec("HopT p release.").expect("balanced release");
+
+        // A hopped char* result: UTF8String's buffer is pool-owned on
+        // main — the byte COPY must happen inside the hop.
+        let s = vm
+            .eval("(Cocoa nsString: 'hop bytes') sendMain: 'UTF8String' args: #()")
+            .expect("hopped char* result");
+        assert!(s.contains("hop bytes"), "got {s}");
+
+        let (dispatched, _) = macvm::runtime::objc_bridge::hop_stats();
+        assert!(
+            dispatched >= 4,
+            "the hops must have DISPATCHED (not run inline): {dispatched}"
+        );
+        done_vm.store(true, Ordering::Release);
+    });
+
+    // Drain the main queue until the VM thread finishes (or time out —
+    // a hang here IS the failure the test exists to catch).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !done.load(Ordering::Acquire) {
+        if std::time::Instant::now() > deadline {
+            eprintln!("cocoa_main_hop: FAILED — timed out draining the main queue");
+            std::process::exit(1);
+        }
+        unsafe {
+            CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.05, 0);
+        }
+    }
+    vm_thread.join().expect("the VM thread must exit cleanly");
+    println!("cocoa_main_hop: ok (dispatch hop + inline-on-main + onMain proxy)");
+}

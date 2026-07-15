@@ -58,6 +58,13 @@ default = []
 # backend-llvm = []   # emit LLVM IR
 # interp-only  = []   # baseline interpreter, no native codegen
 
+# Cocoa C3's main-thread-hop gate needs the REAL main thread (libtest runs
+# #[test]s on workers while main sits in join(), so nothing would drain the
+# main dispatch queue). harness = false makes main() the test.
+[[test]]
+name = "cocoa_main_hop"
+harness = false
+
 [profile.release]
 opt-level = 3
 lto = "thin"

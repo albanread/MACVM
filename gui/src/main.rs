@@ -2386,6 +2386,11 @@ fn main() {
     let mandelvm_mode = cli.first().map(|s| s == "mandelvm").unwrap_or(false);
 
     objc::bootstrap();
+    // Cocoa bridge C3: this process is a GUI host — NSApplication's run
+    // loop will drain the main queue, so Smalltalk's sync main-thread hop
+    // (ObjcRef>>sendMain:args: / onMain, prim 242) is live. Headless hosts
+    // never call this; there the hop fails cleanly instead of hanging.
+    macvm::runtime::objc_bridge::enable_main_hop();
 
     let start = start_page();
     if !start.exists() {

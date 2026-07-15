@@ -17,6 +17,34 @@
  autorelease pool after every doit. A caught NSException prints to the
  Transcript and raises an ordinary Smalltalk error — the VM never dies.
  In a build without the Objective-C runtime every primitive fails cleanly."
+"ObjcMainProxy — the C3 ergonomic face of the main-thread hop: `ref onMain`
+ answers a proxy whose every send runs the SAME Objective-C message on the
+ MAIN thread, synchronously (docs/cocoa_bridge_design.md §4 path 2 —
+ AppKit is main-thread-only). Defined before ObjcRef so `onMain` can
+ reference the global; its own body needs no forward names (sends are
+ late-bound). Only meaningful in a GUI host whose run loop drains the main
+ queue — headless, every send through it fails cleanly."
+Object subclass: ObjcMainProxy [
+    | ref |
+    ObjcMainProxy class >> on: anObjcRef [
+        | p |
+        p := self basicNew.
+        p setRef: anObjcRef.
+        ^p
+    ]
+    setRef: r [
+        ref := r
+    ]
+    target [
+        "The underlying ObjcRef (for release/isValid, which are wrapper
+         operations, not sends)."
+        ^ref
+    ]
+    doesNotUnderstand: aMessage [
+        ^ref sendMain: aMessage selector asString args: aMessage arguments
+    ]
+]
+
 Object subclass: ObjcRef [
     "The id lives in the byte tail; instances are minted only by the
      bridge (Cocoa classNamed:/nsString:, and send results)."
@@ -143,6 +171,26 @@ Object subclass: ObjcRef [
         "The #class collision escape: the receiver's OBJECTIVE-C class
          (Smalltalk `class` answers ObjcRef, as it must)."
         ^self send: 'class'
+    ]
+
+    "── C3: the sync main-thread hop ─────────────────────────────────────
+     AppKit is main-thread-only; these run the send ON the main thread
+     and wait (safe by the architecture's own invariant: the main thread
+     never synchronously waits on the VM, so no cycle can close). In a
+     headless host the hop fails cleanly — there is no run loop to drain
+     the queue. Already-on-main callers run inline."
+    primSendMainAuto: selName args: argArray [
+        <primitive: 242>
+        ^self error: 'Cocoa main-thread send failed (no main run loop?): ', selName printString
+    ]
+    sendMain: selName args: argArray [
+        "One send on the main thread, shape auto-resolved like sendAuto."
+        ^self primSendMainAuto: selName args: argArray
+    ]
+    onMain [
+        "A proxy that runs EVERY send on the main thread:
+           window onMain makeKeyAndOrderFront: nil."
+        ^ObjcMainProxy on: self
     ]
     copy [
         "Objective-C -copy (+1 family — the result is owned; release it).

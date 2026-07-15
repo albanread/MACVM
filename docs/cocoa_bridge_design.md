@@ -203,8 +203,14 @@ lives on its own thread (S21). Three call paths:
    (vm_host is async by construction — submit + drain-on-wake, the S21/M3
    design). No wait cycle can close. The invariant to preserve, stated as a
    rule: *main→VM communication is always async (queued requests); VM→main
-   may therefore be sync.* A debug assert in the hop primitive checks the
-   calling thread isn't main (a Cocoa callback must never sync-hop).
+   may therefore be sync.* (As built in C3, the "never sync-hop from
+   main" clause became something better than an assert: a hop invoked ON
+   main runs inline — the degenerate sync hop, correct and
+   non-deadlocking, exactly what a Cocoa-callback context needs. And the
+   C3 review added one load-bearing rule: result OWNERSHIP is taken
+   inside the hop on the main thread — a +0 object result is retained,
+   a char* copied, BEFORE main's autorelease pools can pop it — because
+   after `dispatch_sync` returns, main runs concurrently again.)
 3. **Async hop with continuation**: for fire-and-forget AppKit work and for
    anything initiated from a callback, the bridge reuses the **worker
    inbox** transport wholesale: the main thread holds an `InboxSender`
