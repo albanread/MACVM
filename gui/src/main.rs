@@ -1593,46 +1593,18 @@ fn update_theme_menu_checkmarks() {
     }
 }
 
-extern "C" fn theme_menu_select_classic(_this: Id, _cmd: Sel, _sender: Id) {
-    set_theme(Theme::Classic);
-    update_theme_menu_checkmarks();
-    reload_current_page();
-}
-
-extern "C" fn theme_menu_select_hidef(_this: Id, _cmd: Sel, _sender: Id) {
-    set_theme(Theme::HiDef);
-    update_theme_menu_checkmarks();
-    reload_current_page();
-}
-
-extern "C" fn theme_menu_select_dark(_this: Id, _cmd: Sel, _sender: Id) {
-    set_theme(Theme::Dark);
-    update_theme_menu_checkmarks();
-    reload_current_page();
-}
-
-extern "C" fn theme_menu_select_crt_amber(_this: Id, _cmd: Sel, _sender: Id) {
-    set_theme(Theme::CrtAmber);
-    update_theme_menu_checkmarks();
-    reload_current_page();
-}
-
-extern "C" fn theme_menu_select_crt_green(_this: Id, _cmd: Sel, _sender: Id) {
-    set_theme(Theme::CrtGreen);
-    update_theme_menu_checkmarks();
-    reload_current_page();
-}
-
-extern "C" fn theme_menu_select_squeak(_this: Id, _cmd: Sel, _sender: Id) {
-    set_theme(Theme::Squeak);
-    update_theme_menu_checkmarks();
-    reload_current_page();
-}
-
-extern "C" fn theme_menu_select_alto_mono(_this: Id, _cmd: Sel, _sender: Id) {
-    set_theme(Theme::AltoMono);
-    update_theme_menu_checkmarks();
-    reload_current_page();
+/// The Theme menu's single action: the clicked item's `tag` is its index into
+/// `Theme::ALL` (set in `build_theme_menu`), so ONE handler serves every theme
+/// and adding a theme is purely a `Theme::ALL` entry — no new selector or IMP,
+/// no second list to keep in sync (which is exactly how the old per-theme
+/// `selectXTheme:` handlers silently dropped newly-added themes from the menu).
+extern "C" fn theme_menu_select(_this: Id, _cmd: Sel, sender: Id) {
+    let idx = objc::send0_i64(sender, sel("tag")) as usize;
+    if let Some(&theme) = Theme::ALL.get(idx) {
+        set_theme(theme);
+        update_theme_menu_checkmarks();
+        reload_current_page();
+    }
 }
 
 /// A small target object for the Theme menu's two actions. Not stored
@@ -1644,48 +1616,8 @@ extern "C" fn theme_menu_select_alto_mono(_this: Id, _cmd: Sel, _sender: Id) {
 /// them.
 fn build_theme_delegate() -> Id {
     let cls = objc::allocate_class(objc::get_class("NSObject"), "MacvmThemeDelegate");
-    objc::add_method(
-        cls,
-        sel("selectClassicTheme:"),
-        theme_menu_select_classic as *const _,
-        "v@:@",
-    );
-    objc::add_method(
-        cls,
-        sel("selectHiDefTheme:"),
-        theme_menu_select_hidef as *const _,
-        "v@:@",
-    );
-    objc::add_method(
-        cls,
-        sel("selectDarkTheme:"),
-        theme_menu_select_dark as *const _,
-        "v@:@",
-    );
-    objc::add_method(
-        cls,
-        sel("selectCrtAmberTheme:"),
-        theme_menu_select_crt_amber as *const _,
-        "v@:@",
-    );
-    objc::add_method(
-        cls,
-        sel("selectCrtGreenTheme:"),
-        theme_menu_select_crt_green as *const _,
-        "v@:@",
-    );
-    objc::add_method(
-        cls,
-        sel("selectSqueakTheme:"),
-        theme_menu_select_squeak as *const _,
-        "v@:@",
-    );
-    objc::add_method(
-        cls,
-        sel("selectAltoMonoTheme:"),
-        theme_menu_select_alto_mono as *const _,
-        "v@:@",
-    );
+    // One action for every theme; the item's tag says which (see build_theme_menu).
+    objc::add_method(cls, sel("selectTheme:"), theme_menu_select as *const _, "v@:@");
     objc::register_class(cls);
     objc::alloc_init("MacvmThemeDelegate")
 }
@@ -2282,21 +2214,15 @@ fn build_menu_bar() {
 fn build_theme_menu() -> Id {
     let delegate = build_theme_delegate();
 
-    let actions: [(Theme, &str); 7] = [
-        (Theme::Classic, "selectClassicTheme:"),
-        (Theme::HiDef, "selectHiDefTheme:"),
-        (Theme::Dark, "selectDarkTheme:"),
-        (Theme::CrtAmber, "selectCrtAmberTheme:"),
-        (Theme::CrtGreen, "selectCrtGreenTheme:"),
-        (Theme::Squeak, "selectSqueakTheme:"),
-        (Theme::AltoMono, "selectAltoMonoTheme:"),
-    ];
-
-    let mut checkmark_entries = Vec::with_capacity(actions.len());
-    let mut menu_items = Vec::with_capacity(actions.len());
-    for (theme, action) in actions {
-        let item = menu_item(theme.menu_label(), Some(action), "");
+    // Walk Theme::ALL (the single source of truth) — one item per theme, its
+    // tag its index into ALL, every item firing the one `selectTheme:` action.
+    // Adding a theme to ALL now adds it to the menu automatically.
+    let mut checkmark_entries = Vec::with_capacity(Theme::ALL.len());
+    let mut menu_items = Vec::with_capacity(Theme::ALL.len());
+    for (idx, &theme) in Theme::ALL.iter().enumerate() {
+        let item = menu_item(theme.menu_label(), Some("selectTheme:"), "");
         objc::send1_id(item, sel("setTarget:"), delegate);
+        objc::send1_i64(item, sel("setTag:"), idx as i64);
         checkmark_entries.push((theme, MainThreadPtr(item)));
         menu_items.push(item);
     }
