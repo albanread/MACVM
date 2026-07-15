@@ -1122,3 +1122,109 @@
     requestFindOptions();
   });
 })();
+
+// ---- class-browser splitters (browser_render::assemble_panes) --------------
+// Drag a .st-splitter to resize its two neighbours. Sizes are flex-grow CSS
+// variables on #macvm-browser — the container replace_pane never swaps — so a
+// layout survives every browser refresh; they also persist to localStorage so
+// it survives reopening the browser. Double-click a splitter to reset.
+(function () {
+  var COLS = {
+    "macvm-browser-packages": "--st-bw-pkg",
+    "macvm-browser-classes": "--st-bw-cls",
+    "macvm-browser-categories": "--st-bw-cat",
+    "macvm-browser-methods": "--st-bw-mth",
+  };
+  var ALL_VARS = ["--st-bw-pkg", "--st-bw-cls", "--st-bw-cat", "--st-bw-mth",
+                  "--st-bh-lists", "--st-bh-src"];
+  var KEY = "macvm-browser-split";
+
+  function browserBox() { return document.getElementById("macvm-browser"); }
+  function persist(box) {
+    try {
+      var o = {};
+      ALL_VARS.forEach(function (v) {
+        var val = box.style.getPropertyValue(v);
+        if (val) o[v] = val;
+      });
+      localStorage.setItem(KEY, JSON.stringify(o));
+    } catch (e) { /* file:// storage may be unavailable; layout is session-only then */ }
+  }
+  function reapplySavedSplit() {
+    var box = browserBox();
+    if (!box) return;
+    try {
+      var o = JSON.parse(localStorage.getItem(KEY) || "{}");
+      Object.keys(o).forEach(function (v) { box.style.setProperty(v, o[v]); });
+    } catch (e) {}
+  }
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", reapplySavedSplit);
+  } else {
+    reapplySavedSplit();
+  }
+
+  var drag = null;
+  document.addEventListener("pointerdown", function (e) {
+    var sp = e.target.closest && e.target.closest(".st-splitter");
+    if (!sp) return;
+    var box = browserBox();
+    var prev = sp.previousElementSibling;
+    var next = sp.nextElementSibling;
+    if (!box || !prev || !next) return;
+    var row = sp.getAttribute("data-split") === "row";
+    // Freeze every pane's CURRENT pixel size into its grow var, so the first
+    // drag is pixel-true (the defaults are even 1/1/1/1 shares). Read EVERY
+    // size BEFORE writing ANY var — each write reflows the band, so an
+    // interleaved read-set loop freezes the later panes at post-reflow junk.
+    var sizes = {};
+    if (row) {
+      sizes.lists = prev.getBoundingClientRect().height;
+      sizes.src = next.getBoundingClientRect().height;
+      box.style.setProperty("--st-bh-lists", String(Math.round(sizes.lists)));
+      box.style.setProperty("--st-bh-src", String(Math.round(sizes.src)));
+    } else {
+      Object.keys(COLS).forEach(function (id) {
+        var el = document.getElementById(id);
+        if (el) sizes[id] = el.getBoundingClientRect().width;
+      });
+      Object.keys(COLS).forEach(function (id) {
+        if (sizes[id] !== undefined)
+          box.style.setProperty(COLS[id], String(Math.round(sizes[id])));
+      });
+    }
+    drag = {
+      sp: sp, row: row, box: box,
+      prevVar: row ? "--st-bh-lists" : COLS[prev.id],
+      nextVar: row ? "--st-bh-src" : COLS[next.id],
+      start: row ? e.clientY : e.clientX,
+      prevSize: row ? sizes.lists : sizes[prev.id],
+      nextSize: row ? sizes.src : sizes[next.id],
+    };
+    if (!drag.prevVar || !drag.nextVar) { drag = null; return; }
+    sp.classList.add("st-splitting");
+    sp.setPointerCapture(e.pointerId);
+    e.preventDefault();
+  });
+  document.addEventListener("pointermove", function (e) {
+    if (!drag) return;
+    var delta = (drag.row ? e.clientY : e.clientX) - drag.start;
+    var MIN = 60; // px — keep both neighbours usable
+    drag.box.style.setProperty(drag.prevVar, String(Math.round(Math.max(MIN, drag.prevSize + delta))));
+    drag.box.style.setProperty(drag.nextVar, String(Math.round(Math.max(MIN, drag.nextSize - delta))));
+  });
+  document.addEventListener("pointerup", function () {
+    if (!drag) return;
+    drag.sp.classList.remove("st-splitting");
+    persist(drag.box);
+    drag = null;
+  });
+  document.addEventListener("dblclick", function (e) {
+    var sp = e.target.closest && e.target.closest(".st-splitter");
+    if (!sp) return;
+    var box = browserBox();
+    if (!box) return;
+    ALL_VARS.forEach(function (v) { box.style.removeProperty(v); });
+    try { localStorage.removeItem(KEY); } catch (err) {}
+  });
+})();

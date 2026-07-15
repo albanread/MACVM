@@ -632,6 +632,17 @@ fn chrome_layout_style() -> String {
      .st-transcript-clear:active { box-shadow: inset 1px 1px 0 var(--st-gray, #808080); }\
      .st-statusbar { flex: 0 0 auto; }\
      #macvm-scroll > .st-workspace, #macvm-scroll > .st-browser { height: 100%; }\
+     #macvm-browser-packages { flex: var(--st-bw-pkg, 1) 1 0; min-width: 0; }\
+     #macvm-browser-classes { flex: var(--st-bw-cls, 1) 1 0; min-width: 0; }\
+     #macvm-browser-categories { flex: var(--st-bw-cat, 1) 1 0; min-width: 0; }\
+     #macvm-browser-methods { flex: var(--st-bw-mth, 1) 1 0; min-width: 0; }\
+     #macvm-browser > .st-browser-lists { flex: var(--st-bh-lists, 2) 1 0; min-height: 0; }\
+     #macvm-browser > #macvm-browser-source { flex: var(--st-bh-src, 1) 1 0; min-height: 0; }\
+     .st-splitter { flex: 0 0 6px; align-self: stretch; cursor: col-resize; touch-action: none; \
+       background: transparent; border-radius: 3px; transition: background-color 100ms ease; }\
+     .st-splitter[data-split=\"row\"] { cursor: row-resize; }\
+     .st-splitter:hover, .st-splitter.st-splitting { \
+       background: var(--hd-accent-soft, var(--st-background-gray, #c0c0c0)); }\
      .st-add-node > .st-header { opacity: 0.7; font-style: italic; }\
      .st-smappl-codeview { height: 15em; width: 100%; }\
      #macvm-toolbar button { color: inherit; }\

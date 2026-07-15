@@ -518,10 +518,19 @@ pub fn assemble_panes(
     methods_html: &str,
     source_html: &str,
 ) -> String {
+    // The `.st-splitter` divs are draggable dividers (smtk.js `pointerdown`
+    // handler): three column splitters between the four list panes and one row
+    // splitter between the lists band and the source pane. They are SIBLINGS of
+    // the panes, and the panes' sizes live as CSS variables on the persistent
+    // containers (`chrome_layout_style`) — both deliberately outside the five
+    // pane elements themselves, which `main.rs::replace_pane` swaps wholesale
+    // (outerHTML) on every browser action; splitters and sizes survive that.
+    const COL: &str = "<div class=\"st-splitter\" data-split=\"col\" title=\"Drag to resize (double-click resets)\"></div>";
+    const ROW: &str = "<div class=\"st-splitter\" data-split=\"row\" title=\"Drag to resize (double-click resets)\"></div>";
     format!(
         "<div class=\"st-browser\" id=\"macvm-browser\">\
-         <div class=\"st-browser-lists\">{packages_html}{classes_html}{categories_html}{methods_html}</div>\
-         {source_html}\
+         <div class=\"st-browser-lists\">{packages_html}{COL}{classes_html}{COL}{categories_html}{COL}{methods_html}</div>\
+         {ROW}{source_html}\
          </div>"
     )
 }
@@ -828,6 +837,25 @@ mod tests {
             html.contains("data-browser-action=\"new-method\""),
             "{html}"
         );
+    }
+
+    #[test]
+    fn assembled_browser_has_draggable_splitters_between_panes() {
+        let world = MockWorld::seed();
+        let html = render_full_browser(&world, &BrowserSelection::default());
+        // Three column splitters between the four list panes, one row splitter
+        // between the lists band and the source pane (smtk.js drags them).
+        assert_eq!(html.matches("data-split=\"col\"").count(), 3, "{html}");
+        assert_eq!(html.matches("data-split=\"row\"").count(), 1, "{html}");
+        // Order: a col splitter sits between packages and classes…
+        let pkg = html.find("id=\"macvm-browser-packages\"").unwrap();
+        let cls = html.find("id=\"macvm-browser-classes\"").unwrap();
+        let first_col = html.find("data-split=\"col\"").unwrap();
+        assert!(pkg < first_col && first_col < cls, "{html}");
+        // …and the row splitter sits after the lists band, before the source.
+        let row = html.find("data-split=\"row\"").unwrap();
+        let src = html.find("id=\"macvm-browser-source\"").unwrap();
+        assert!(row < src, "{html}");
     }
 
     #[test]
