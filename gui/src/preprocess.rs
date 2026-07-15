@@ -631,6 +631,7 @@ fn chrome_layout_style() -> String {
      #macvm-scroll > .st-workspace, #macvm-scroll > .st-browser { height: 100%; }\
      .st-add-node > .st-header { opacity: 0.7; font-style: italic; }\
      .st-smappl-codeview { height: 15em; width: 100%; }\
+     #macvm-toolbar button { color: inherit; }\
      .st-ico { display: inline-block; width: 24px; height: 24px; background-color: currentColor; \
        -webkit-mask-repeat: no-repeat; -webkit-mask-position: center; -webkit-mask-size: contain; \
        mask-repeat: no-repeat; mask-position: center; mask-size: contain; vertical-align: middle; }\
