@@ -612,13 +612,16 @@ fn chrome_layout_style() -> String {
      #macvm-metrics { margin-left: auto; display: flex; align-items: center; gap: 9px; \
        padding: 0 8px; white-space: nowrap; overflow: hidden; \
        font-family: var(--st-font-widget, ui-monospace, monospace); \
-       font-size: 11px; line-height: 1.1; color: var(--st-foreground, #202020); }\
+       font-size: 11px; line-height: 1.1; \
+       color: var(--hd-text, var(--st-foreground, #202020)); }\
      .st-metric { display: flex; flex-direction: column; align-items: flex-start; gap: 1px; }\
      .st-metric-l { font-size: 8px; letter-spacing: 0.04em; text-transform: uppercase; opacity: 0.55; }\
      .st-metric-v { font-variant-numeric: tabular-nums; }\
      .st-metric svg { display: block; opacity: 0.85; }\
-     .st-metric-bar { width: 52px; height: 5px; background: var(--st-gray, #9a9a9a); }\
-     .st-metric-bar > i { display: block; height: 100%; width: 0; background: var(--st-blue, #2b6cff); }\
+     .st-metric-bar { width: 52px; height: 5px; \
+       background: var(--hd-text-muted, var(--st-gray, #9a9a9a)); }\
+     .st-metric-bar > i { display: block; height: 100%; width: 0; \
+       background: var(--hd-accent, var(--st-blue, #2b6cff)); }\
      #macvm-scroll { flex: 1 1 auto; min-height: 0; overflow-y: auto; overflow-x: hidden; }\
      #macvm-transcript { flex: 0 0 auto; margin-top: 0; position: relative; overflow: hidden; }\
      #macvm-transcript-log { height: 100%; overflow-y: auto; overflow-x: hidden; overscroll-behavior: contain; }\

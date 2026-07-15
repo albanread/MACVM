@@ -2981,6 +2981,16 @@ mod tests {
         // no main run loop) its launch must raise cleanly — never hang or
         // crash. On-screen behavior is verified in the GUI (run-gui.sh).
         let mut vm = boot_test_vm(JitMode::Off);
+        // The launch's own Smalltalk prerequisites must exist even where
+        // AppKit doesn't — the on-screen run found Array's 4-element
+        // constructor missing (the frame rectangles), invisible headless
+        // because the NSWindow lookup fails first. Pin it directly.
+        assert_eq!(
+            vm.eval("(Array with: 1 with: 2 with: 3 with: 4) at: 4")
+                .unwrap()
+                .trim(),
+            "4"
+        );
         assert!(
             vm.exec("CocoaPad launch.").is_err(),
             "headless launch must raise (no NSWindow class / no hop)"
