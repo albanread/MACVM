@@ -1605,9 +1605,42 @@ fn intern_pool(asm: &mut dyn Assembler, method: &IrMethod) -> Vec<LiteralId> {
 /// guard's `b.eq` target is bound at the very end of this function, which
 /// is exactly that point).
 fn emit_entry_guard(asm: &mut dyn Assembler, guard: &EntryGuard) {
-    let smi_lit = asm.literal_u64(guard.smi_klass_bits, Some(RelocKind::Oop));
     let key_lit = asm.literal_u64(guard.key_klass_bits, Some(RelocKind::KeyKlassOop));
     let resolve_lit = asm.literal_u64(guard.resolve_addr, Some(RelocKind::RuntimeAddr));
+
+    if guard.key_klass_bits != guard.smi_klass_bits {
+        // O3: HEAP-customized method — the overwhelmingly common case, and
+        // this guard is the single most-executed dispatch sequence in the
+        // system (every mono hit runs it). A smi receiver can never match a
+        // heap key klass, so the smi case IS a miss: no smi-klass pool
+        // literal, no load-merge branch. Hit path: tst, b.eq(nt), ldur,
+        // ldr, cmp, b.eq — six instructions and ONE taken branch, versus
+        // the merged shape's seven and two.
+        let miss = asm.new_label();
+        let matched = asm.new_label();
+        asm.emit("tst", &[x(0), imm(3)]);
+        asm.b_cond(Cond::Eq, miss);
+        // Klass word at untagged-address + KLASS_OFFSET(8); MEM_TAG(1)
+        // biases x0 by -1 — ldur (unscaled) since 7 isn't 8-aligned.
+        asm.emit("ldur", &[x(17), mem(0, 7)]);
+        asm.ldr_literal(xr(16), key_lit);
+        asm.emit("cmp", &[x(17), x(16)]);
+        asm.b_cond(Cond::Eq, matched);
+        asm.bind(miss);
+        // Miss door: indirect through a pool-embedded address (see the
+        // smi-keyed arm below for why), leaving x30 untouched.
+        asm.ldr_literal(xr(16), resolve_lit);
+        asm.emit("br", &[x(16)]);
+        asm.bind(matched);
+        return;
+    }
+
+    // SMI-customized method: keep the original merged shape — the cmp
+    // against the pool-resident key klass stays load-bearing here (both
+    // for the guard itself and for anything that invalidates by making the
+    // key unmatchable), and smi-keyed nmethods are rare enough that the
+    // extra instruction is irrelevant.
+    let smi_lit = asm.literal_u64(guard.smi_klass_bits, Some(RelocKind::Oop));
 
     let smi_case = asm.new_label();
     let after_klass_load = asm.new_label();
