@@ -1667,6 +1667,19 @@ extern "C" fn run_breakout_demo(_this: Id, _cmd: Sel, _sender: Id) {
     }
 }
 
+/// The Demos menu's "CocoaPad" item: the Cocoa-bridge capstone (C5) — a
+/// native NSWindow + text field + button built ENTIRELY in Smalltalk
+/// (world/50_cocoapad.mst): DNU keyword sends, onMain hops, and a
+/// Smalltalk block as the button's action. No game pane — the demo makes
+/// its own window.
+extern "C" fn run_cocoapad_demo(_this: Id, _cmd: Sel, _sender: Id) {
+    if let Some(vm) = VM.get() {
+        vm.submit(vm_host::VmRequest::Doit {
+            code: "CocoaPad launch.".to_string(),
+        });
+    }
+}
+
 /// The Demos menu's "Mandelbrot" item: open the native game pane and start the
 /// zooming-Mandelbrot demo (`world/45_mandelzoom.mst`). Same path as Breakout.
 extern "C" fn run_mandel_demo(_this: Id, _cmd: Sel, _sender: Id) {
@@ -1789,6 +1802,12 @@ fn build_demos_delegate() -> Id {
         cls,
         sel("runBreakoutDemo:"),
         run_breakout_demo as *const _,
+        "v@:@",
+    );
+    objc::add_method(
+        cls,
+        sel("runCocoaPadDemo:"),
+        run_cocoapad_demo as *const _,
         "v@:@",
     );
     objc::add_method(
@@ -2185,9 +2204,21 @@ fn build_menu_bar() {
         "",
     );
     objc::send1_id(parallel_item, sel("setTarget:"), demos_delegate);
+    let cocoapad_item = menu_item(
+        "CocoaPad — a native window from Smalltalk",
+        Some("runCocoaPadDemo:"),
+        "",
+    );
+    objc::send1_id(cocoapad_item, sel("setTarget:"), demos_delegate);
     let demos_menu = submenu(
         "Demos",
-        &[breakout_item, mandel_item, spawned_item, parallel_item],
+        &[
+            breakout_item,
+            mandel_item,
+            spawned_item,
+            parallel_item,
+            cocoapad_item,
+        ],
     );
 
     let theme_menu = build_theme_menu();

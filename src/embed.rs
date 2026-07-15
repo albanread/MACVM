@@ -2975,6 +2975,20 @@ mod tests {
     }
 
     #[test]
+    fn cocoa_c5_cocoapad_fails_cleanly_headless() {
+        let _serial = cocoa_serial();
+        // The C5 demo class loads everywhere; headless (no AppKit linked,
+        // no main run loop) its launch must raise cleanly — never hang or
+        // crash. On-screen behavior is verified in the GUI (run-gui.sh).
+        let mut vm = boot_test_vm(JitMode::Off);
+        assert!(
+            vm.exec("CocoaPad launch.").is_err(),
+            "headless launch must raise (no NSWindow class / no hop)"
+        );
+        assert_eq!(vm.eval("3 + 4").unwrap().trim(), "7");
+    }
+
+    #[test]
     fn cocoa_c2_dnu_sends_survive_the_jit() {
         let _serial = cocoa_serial();
         // DNU sends from COMPILED callers: threshold-1 compiles the loop

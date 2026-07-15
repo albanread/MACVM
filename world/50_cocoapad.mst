@@ -1,0 +1,69 @@
+"50_cocoapad.mst — CocoaPad: the Cocoa-bridge capstone (C5,
+ docs/cocoa_bridge_design.md §8). A NATIVE NSWindow with a text field and
+ a button, built entirely in Smalltalk through the bridge: DNU keyword
+ sends (C2) resolve the AppKit ABI from the live runtime, every UI send
+ hops to the main thread (C3 `onMain`), and the button's target/action is
+ a Smalltalk block (C4 `Cocoa action:`). Launched from the GUI's Demos
+ menu ('CocoaPad — a native window from Smalltalk'); headless, the first
+ send fails cleanly (no AppKit / no main run loop).
+
+ Ownership notes: setReleasedWhenClosed: false is LOAD-BEARING — a
+ programmatic NSWindow defaults to releasing itself on close, which would
+ double-free under our wrapper's own +1. Repeated launches release the
+ previous window's chain first (idempotent demo, no wrapper leaks)."
+Object subclass: CocoaPad [
+    <classVars: Win Field Btn Act Count>
+
+    CocoaPad class >> launch [
+        "Build (or rebuild) the pad. Every AppKit send rides onMain."
+        | winClass fieldClass btnClass |
+        self teardown.
+        Count := 0.
+        winClass := Cocoa classNamed: 'NSWindow'.
+        fieldClass := Cocoa classNamed: 'NSTextField'.
+        btnClass := Cocoa classNamed: 'NSButton'.
+
+        Win := ((winClass onMain alloc) onMain
+            initWithContentRect: (Array with: 220.0 with: 220.0 with: 420.0 with: 170.0)
+            styleMask: 15 backing: 2 defer: false).
+        Win onMain setReleasedWhenClosed: false.
+        Win onMain setTitle: 'CocoaPad — Smalltalk inside'.
+
+        Field := ((fieldClass onMain alloc) onMain
+            initWithFrame: (Array with: 20.0 with: 95.0 with: 380.0 with: 28.0)).
+        Field onMain setStringValue: 'Press the button…'.
+        Field onMain setEditable: false.
+        (Win onMain contentView) onMain addSubview: Field.
+
+        Btn := ((btnClass onMain alloc) onMain
+            initWithFrame: (Array with: 20.0 with: 30.0 with: 200.0 with: 36.0)).
+        Btn onMain setTitle: 'Say hello'.
+        Act := Cocoa action: [ CocoaPad clicked ].
+        Btn onMain setTarget: Act.
+        Btn onMain setAction: 'macvmFire:'.
+        (Win onMain contentView) onMain addSubview: Btn.
+
+        Win onMain makeKeyAndOrderFront: nil.
+        Transcript showCr: 'CocoaPad: window up — the button runs a Smalltalk block.'
+    ]
+
+    CocoaPad class >> clicked [
+        "The C4 round trip: AppKit fired macvmFire: on the main thread;
+         the envelope crossed the inbox; this runs BETWEEN doits on the
+         VM thread — and answers by driving AppKit back through C3."
+        Count := Count + 1.
+        Field onMain setStringValue:
+            'Hello from Smalltalk!  (click ', Count printString, ')'
+    ]
+
+    CocoaPad class >> teardown [
+        "Release the previous launch's wrappers (idempotent)."
+        Win isNil ifFalse: [
+            Win onMain orderOut: nil.
+            Btn isValid ifTrue: [ Btn release ].
+            Field isValid ifTrue: [ Field release ].
+            Act isValid ifTrue: [ Act release ].
+            Win isValid ifTrue: [ Win release ].
+            Win := nil. Field := nil. Btn := nil. Act := nil ]
+    ]
+]

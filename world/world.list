@@ -83,3 +83,6 @@
 # Cocoa facade, DNU dispatch, the main-thread hop + ObjcMainProxy
 # (docs/cocoa_bridge_design.md; prims 230-242). Fails cleanly headless.
 49_cocoa.mst
+# CocoaPad: the bridge capstone (C5) — a native NSWindow/field/button built
+# in Smalltalk (onMain sends + Cocoa action:); Demos-menu launched.
+50_cocoapad.mst
