@@ -182,3 +182,169 @@ TestCase subclass: RopeTests [
         self assert: r depth <= 30.
     ]
 ]
+
+"── EditorSessionTests: the M3 gate — keystrokes in, MINIMAL damage out
+ (docs/editor_design.md M3). Proves the damage a keystroke reports is the
+ minimal correct line range: one line for a same-line edit, the renumbered tail
+ for a structural one, an empty range for a caret move — and that the encoded
+ wire form round-trips its five ints + text."
+TestCase subclass: EditorSessionTests [
+    runAll [
+        self runTest: #testMidLineInsertIsOneLine do: [ self testMidLineInsertIsOneLine ].
+        self runTest: #testNewlineIsStructural do: [ self testNewlineIsStructural ].
+        self runTest: #testBackspaceMergesLines do: [ self testBackspaceMergesLines ].
+        self runTest: #testDeleteForward do: [ self testDeleteForward ].
+        self runTest: #testCaretMovesAreEmptyDamage do: [ self testCaretMovesAreEmptyDamage ].
+        self runTest: #testHomeAndEnd do: [ self testHomeAndEnd ].
+        self runTest: #testHandleKeyDispatch do: [ self testHandleKeyDispatch ].
+        self runTest: #testEncodeShape do: [ self testEncodeShape ].
+        self runTest: #testTypeAndDeleteAgainstOracle do: [ self testTypeAndDeleteAgainstOracle ].
+    ]
+
+    nl [ ^String with: Character nl ]
+
+    "THE gate: an insert that does not cross a line boundary damages exactly one
+     line — the view repaints a single row, not the whole document."
+    testMidLineInsertIsOneLine [
+        | s d |
+        s := EditorSession openOn: 'hello', self nl, 'world'.
+        s moveRight. s moveRight.                    "caret 1 -> 3, inside 'hello'"
+        self assert: s cursorOffset equals: 3.
+        d := s handleKey: 'X'.
+        self assert: s documentString equals: ('heXllo', self nl, 'world').
+        self assert: d firstLine equals: 1.
+        self assert: d lastLine equals: 1.           "one line"
+        self assert: d totalLines equals: 2.         "unchanged"
+        self deny: d isEmpty.
+        self assert: d text equals: ('heXllo', self nl).
+        self assert: d cursorLine equals: 1.
+        self assert: d cursorColumn equals: 4.       "after 'heX'"
+    ]
+
+    "A newline splits a line: the line count grows and the tail renumbers, so the
+     damage runs from the edit line to the (new) last line."
+    testNewlineIsStructural [
+        | s d |
+        s := EditorSession openOn: 'helloworld'.
+        4 timesRepeat: [ s moveRight ].              "caret -> 5, before 'o'"
+        d := s handleKey: 'Enter'.
+        self assert: s documentString equals: ('hell', self nl, 'oworld').
+        self assert: d totalLines equals: 2.
+        self assert: d firstLine equals: 1.
+        self assert: d lastLine equals: 2.           "tail, not one line"
+        self deny: d isEmpty.
+        self assert: d cursorLine equals: 2.
+        self assert: d cursorColumn equals: 1.
+    ]
+
+    "Backspacing a newline joins two lines back into one (line count shrinks)."
+    testBackspaceMergesLines [
+        | s d |
+        s := EditorSession openOn: 'ab', self nl, 'cd'.
+        3 timesRepeat: [ s moveRight ].              "caret -> 4, just after the newline"
+        self assert: s cursorLine equals: 2.
+        d := s handleKey: 'Backspace'.               "deletes the newline at offset 3"
+        self assert: s documentString equals: 'abcd'.
+        self assert: d totalLines equals: 1.
+        self assert: d firstLine equals: 1.
+        self assert: d lastLine equals: 1.
+        "a plain within-line backspace damages just that line"
+        d := s handleKey: 'Backspace'.               "deletes 'b'"
+        self assert: s documentString equals: 'acd'.
+        self assert: d firstLine equals: 1.
+        self assert: d lastLine equals: 1.
+        self assert: d totalLines equals: 1.
+    ]
+
+    testDeleteForward [
+        | s d |
+        s := EditorSession openOn: 'abc'.
+        d := s handleKey: 'Delete'.                  "caret at 1, deletes 'a'"
+        self assert: s documentString equals: 'bc'.
+        self assert: d firstLine equals: 1.
+        self assert: d lastLine equals: 1.
+        "delete at end of document is a no-op edit, reported as caret-only"
+        s moveRight. s moveRight.
+        d := s handleKey: 'Delete'.
+        self assert: s documentString equals: 'bc'.
+        self assert: d isEmpty.
+    ]
+
+    "A caret move changes no line's text: an empty range, but the new caret."
+    testCaretMovesAreEmptyDamage [
+        | s d |
+        s := EditorSession openOn: 'ab', self nl, 'cd'.
+        d := s handleKey: 'Right'.
+        self assert: d isEmpty.
+        self assert: d cursorColumn equals: 2.
+        d := s handleKey: 'Left'.
+        self assert: d isEmpty.
+        self assert: d cursorLine equals: 1.
+        self assert: d cursorColumn equals: 1.
+        "left at the very start stays put"
+        d := s handleKey: 'Left'.
+        self assert: s cursorOffset equals: 1.
+    ]
+
+    testHomeAndEnd [
+        | s |
+        s := EditorSession openOn: 'hello', self nl, 'world'.
+        6 timesRepeat: [ s handleKey: 'Right' ].     "caret onto line 2"
+        self assert: s cursorLine equals: 2.
+        s handleKey: 'End'.
+        self assert: s cursorColumn equals: 6.       "after 'world'"
+        s handleKey: 'Home'.
+        self assert: s cursorColumn equals: 1.
+        self assert: s cursorLine equals: 2.
+    ]
+
+    "The one bridge entry point routes named keys to actions and inserts anything
+     else literally."
+    testHandleKeyDispatch [
+        | s |
+        s := EditorSession openOn: ''.
+        s handleKey: 'h'. s handleKey: 'i'.
+        s handleKey: 'Enter'.
+        s handleKey: 'y'. s handleKey: 'o'.
+        self assert: s documentString equals: ('hi', self nl, 'yo').
+        self assert: s lineCount equals: 2.
+        "a multi-character string inserts whole (paste-shaped)"
+        s handleKey: '!!!'.
+        self assert: s documentString equals: ('hi', self nl, 'yo!!!').
+    ]
+
+    "The wire form: a header line of five tab-separated ints, then the text after
+     the first newline, verbatim (text may itself contain newlines)."
+    testEncodeShape [
+        | d enc parts header |
+        d := EditorDamage first: 2 last: 3 total: 5 cursorLine: 2 cursorColumn: 4
+                          text: ('ab', self nl, 'cd').
+        enc := d encode.
+        parts := enc indexOf: Character nl.          "first newline splits header/text"
+        header := enc copyFrom: 1 to: parts - 1.
+        self assert: header equals: '2', (String with: Character tab), '3',
+            (String with: Character tab), '5', (String with: Character tab), '2',
+            (String with: Character tab), '4'.
+        self assert: (enc copyFrom: parts + 1 to: enc size) equals: ('ab', self nl, 'cd').
+    ]
+
+    "Drive a session through a scripted run of keystrokes and check the document
+     matches a hand-computed oracle at the end — end-to-end typing."
+    testTypeAndDeleteAgainstOracle [
+        | s |
+        s := EditorSession openOn: ''.
+        'abcdef' do: [ :c | s handleKey: (String with: c) ].
+        self assert: s documentString equals: 'abcdef'.
+        4 timesRepeat: [ s handleKey: 'Left' ].      "caret after 'ab'"
+        self assert: s cursorOffset equals: 3.
+        s handleKey: 'Backspace'.                    "delete 'b'"
+        self assert: s documentString equals: 'acdef'.
+        s handleKey: 'Delete'.                        "delete 'c'"
+        self assert: s documentString equals: 'adef'.
+        s handleKey: 'Enter'.                         "split: 'a' | 'def'"
+        self assert: s documentString equals: ('a', self nl, 'def').
+        self assert: s lineCount equals: 2.
+        self assert: s cursorLine equals: 2.
+        self assert: s cursorColumn equals: 1.
+    ]
+]

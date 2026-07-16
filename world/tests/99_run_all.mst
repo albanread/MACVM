@@ -47,4 +47,5 @@ TestRunner run: NumberCoercionTests.
 TestRunner run: ReflectionTests.
 TestRunner run: CurtailmentTests.
 TestRunner run: RopeTests.
+TestRunner run: EditorSessionTests.
 TestRunner report.
