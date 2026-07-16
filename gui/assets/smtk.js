@@ -1267,18 +1267,16 @@
     editorSetCaret(ta, curLine, curCol);
   };
 
-  // Map a keydown to the VM's key name, or null to let it through (a browser/OS
-  // shortcut, or a key the VM doesn't handle yet).
+  // Map a keydown to the VM's EDIT-key name, or null. Only keys that CHANGE the
+  // text are routed to the VM; navigation (arrows, Home/End, PageUp/Down) and
+  // selection are left to the textarea natively — the VM learns the caret from
+  // `at` on the next edit, so it never needs to track cursor motion itself.
   function editorKeyName(e) {
     if (e.ctrlKey || e.metaKey || e.altKey) return null;
     switch (e.key) {
       case "Enter": return "Enter";
       case "Backspace": return "Backspace";
       case "Delete": return "Delete";
-      case "ArrowLeft": return "Left";
-      case "ArrowRight": return "Right";
-      case "Home": return "Home";
-      case "End": return "End";
       case "Tab": return "\t";
       default: return e.key && e.key.length === 1 ? e.key : null;
     }
@@ -1287,17 +1285,18 @@
   document.addEventListener("keydown", function (e) {
     var ta = e.target.closest && e.target.closest(".st-editor-buffer");
     if (!ta) return;
-    // Cmd/Ctrl+S saves (the shortcut passes editorKeyName's modifier gate, so
-    // it's handled explicitly here before that).
+    // Cmd/Ctrl+S saves.
     if ((e.metaKey || e.ctrlKey) && (e.key === "s" || e.key === "S")) {
       e.preventDefault();
       post({ kind: "editorAccept" });
       return;
     }
     var key = editorKeyName(e);
-    if (key === null) return;          // shortcuts / unhandled keys pass through
+    if (key === null) return;          // navigation / shortcuts stay native
     e.preventDefault();
-    post({ kind: "editorKey", key: key });
+    // Send the textarea's REAL caret (1-based) so the VM edits where the user
+    // is, no matter how the caret got there (click, arrows, selection).
+    post({ kind: "editorKey", key: key, at: String(ta.selectionStart + 1) });
   }, true);
 
   // The Save button (data-editor-action="save").

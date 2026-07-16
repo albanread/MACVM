@@ -465,6 +465,17 @@ Object subclass: EditorSession [
             text: buffer asString
     ]
 
+    "Set the caret to a 1-based offset (clamped), then apply the key. The GUI
+     terminal (M3c) sends the textarea's REAL caret with every edit, so the VM
+     edits where the user is — the textarea owns the caret natively (mouse, all
+     arrows, selection) and the VM only needs to know it at edit time; that is
+     what keeps backspace/delete/insert landing in the right place without
+     routing every navigation key through the VM."
+    handleKey: k at: offset [
+        cursor := (offset max: 1) min: buffer size + 1.
+        ^self handleKey: k
+    ]
+
     "── the entry points the Rust bridge calls (M3b) ──
      A named special key routes to its editor action; anything else is literal
      text to insert (so a printable character arrives as its own 1-char string)."

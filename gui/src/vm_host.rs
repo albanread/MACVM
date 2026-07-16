@@ -120,12 +120,16 @@ pub enum VmRequest {
     EditorOpen {
         text: String,
     },
-    /// One key for the current editor session — a single printable string, or a
-    /// named special key (`"Enter"`, `"Backspace"`, `"Left"`, …). Like
-    /// `GameStep`, submitted to an idle worker as a fresh top-level request, so
-    /// each keystroke runs on its own. Answers an [`VmResponse::EditorDamage`].
+    /// One EDITING key for the current session — a printable string, `"Enter"`,
+    /// `"Backspace"`, or `"Delete"` — together with `at`, the textarea's real
+    /// 1-based caret offset at the moment of the key. The VM moves its cursor
+    /// there before applying the key, so the edit lands where the user is even
+    /// though navigation (mouse, arrows, selection) never round-trips through
+    /// the VM. Like `GameStep`, a fresh top-level request per key. Answers an
+    /// [`VmResponse::EditorDamage`].
     EditorKey {
         key: String,
+        at: i64,
     },
     /// An editor command by name (`"undo"`, `"redo"`; accept/close are M4/M6).
     /// Answers a full-document [`VmResponse::EditorDamage`].
@@ -1530,10 +1534,10 @@ fn handle(
             );
             editor_eval(vm, &src)
         }
-        VmRequest::EditorKey { key } => editor_eval(
+        VmRequest::EditorKey { key, at } => editor_eval(
             vm,
             &format!(
-                "(EditorSession current handleKey: {}) encode",
+                "(EditorSession current handleKey: {} at: {at}) encode",
                 smalltalk_string_literal(&key)
             ),
         ),
@@ -3901,6 +3905,7 @@ mod tests {
         let k = handle(
             VmRequest::EditorKey {
                 key: "X".to_string(),
+                at: 1, // caret at the very start (as the fresh session reports)
             },
             &mut world,
             &mut selection,

@@ -1677,11 +1677,14 @@ extern "C" fn on_script_message(_this: Id, _cmd: Sel, _controller: Id, message: 
             }
         }
         "editorKey" => {
-            // One keystroke for the current editor session; answers an
-            // EditorDamage the JS terminal patches into the buffer.
+            // One editing key for the current session, carrying the textarea's
+            // real caret offset (`at`, posted as a string) so the VM edits where
+            // the user is. Answers an EditorDamage the JS terminal patches in.
             if let Some(vm) = VM.get() {
+                let at = dict_get_string(body, "at").parse::<i64>().unwrap_or(1);
                 vm.submit(vm_host::VmRequest::EditorKey {
                     key: dict_get_string(body, "key"),
+                    at,
                 });
             }
         }
