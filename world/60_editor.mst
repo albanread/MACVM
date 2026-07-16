@@ -1,0 +1,320 @@
+"60_editor.mst — the Smalltalk text editor's model layer (docs/editor_design.md
+ M2). Package `editor` (the filename stem after the load-order prefix, so all
+ four classes file under one VMapp package — docs/editor_design.md §2.1).
+
+ A PERSISTENT rope: a balanced tree of immutable string fragments. Every edit
+ rebuilds only the root-to-leaf spine it touches and shares everything else, so
+ undo is free — keep the previous root and you have the previous document
+ exactly (TextBuffer below is a list of roots). Each node carries, besides the
+ classic `weight` (character count of its left subtree, for O(log n) indexing),
+ a newline count — WITHOUT it there is no O(log n) line lookup, and line lookup
+ is what the GUI damage-range protocol (M3) is built on, so it is in from the
+ first line, not retrofitted.
+
+ Load order note: `Rope`'s constructors NAME `RopeLeaf`/`RopeBranch` (a global
+ class reference the compiler must be able to resolve), so the three classes are
+ declared shell-first — `Rope` shell, then the two subclasses, then `Rope`
+ reopened with its real methods once both names exist. (Sending a not-yet-
+ implemented selector like `Rope empty` from a subclass is fine — it resolves at
+ RUN time; only naming a not-yet-DECLARED class is a compile error.)
+
+ Correctness-first: this is the version the M2 differential test
+ (world/tests/43_rope_tests.mst) pins against a plain-String oracle. Leaves are
+ bounded (leafMax) and the tree rebalances when a spine gets too deep, so a long
+ run of edits can't degrade at:/split into O(n) or overflow the stack — but the
+ clever incremental-rebalance and the damage-range diffing are later work."
+
+"── Rope: shell first, so RopeLeaf/RopeBranch can subclass it and its own real
+ methods (added in the reopen below) can name them. ──"
+Object subclass: Rope [ ]
+
+"── RopeLeaf: an immutable string fragment ────────────────────────────────────"
+Rope subclass: RopeLeaf [
+    | str nl |
+
+    RopeLeaf class >> on: aString [ ^self new setString: aString ]
+    setString: aString [ str := aString. nl := aString occurrencesOf: Character nl. ^self ]
+
+    str [ ^str ]
+    size [ ^str size ]
+    newlines [ ^nl ]
+    depth [ ^0 ]
+    isLeaf [ ^true ]
+    at: i [ ^str at: i ]
+    putOn: aStream [ aStream nextPutAll: str ]
+    collectLeavesInto: aColl [ str isEmpty ifFalse: [ aColl add: str ] ]
+
+    splitAt: i [
+        i <= 0 ifTrue: [ ^Array with: Rope empty with: self ].
+        i >= str size ifTrue: [ ^Array with: self with: Rope empty ].
+        ^Array with: (RopeLeaf on: (str copyFrom: 1 to: i))
+               with: (RopeLeaf on: (str copyFrom: i + 1 to: str size))
+    ]
+
+    "Newlines in [1..i-1] of this leaf, i clamped to the leaf."
+    newlinesBefore: i [
+        | last c |
+        last := (i - 1) min: str size.
+        c := 0.
+        1 to: last do: [ :k | (str at: k) = Character nl ifTrue: [ c := c + 1 ] ].
+        ^c
+    ]
+
+    "1-based offset just after the k-th newline in this leaf, or nil if it holds
+     fewer than k newlines."
+    offsetAfterNewline: k [
+        | seen |
+        seen := 0.
+        1 to: str size do: [ :idx |
+            (str at: idx) = Character nl ifTrue: [
+                seen := seen + 1.
+                seen = k ifTrue: [ ^idx + 1 ] ] ].
+        ^nil
+    ]
+]
+
+"── RopeBranch: an immutable interior node ─────────────────────────────────────
+ `weight`/`leftNls` are the left subtree's char/newline totals (the navigation
+ keys); `size`/`newlines`/`depth` are this subtree's totals, cached at
+ construction so every query is O(1) per node visited."
+Rope subclass: RopeBranch [
+    | left right weight leftNls size newlines depth |
+
+    RopeBranch class >> left: l right: r [ ^self new setLeft: l right: r ]
+    setLeft: l right: r [
+        left := l. right := r.
+        weight := l size. leftNls := l newlines.
+        size := l size + r size.
+        newlines := l newlines + r newlines.
+        depth := 1 + (l depth max: r depth).
+        ^self
+    ]
+
+    size [ ^size ]
+    newlines [ ^newlines ]
+    depth [ ^depth ]
+    at: i [ ^i <= weight ifTrue: [ left at: i ] ifFalse: [ right at: i - weight ] ]
+    putOn: aStream [ left putOn: aStream. right putOn: aStream ]
+    collectLeavesInto: aColl [ left collectLeavesInto: aColl. right collectLeavesInto: aColl ]
+
+    "Depth beyond which a rebuild is cheaper than the skew it signals. Twice the
+     depth a perfectly balanced tree of this many leaves would have (bit length
+     of the leaf count), plus slack — so a healthy tree never rebalances and a
+     degenerate spine always does."
+    balancedIfDeep [
+        | budget bits n |
+        n := (size // Rope leafMax) + 2.
+        bits := 0. [ n > 0 ] whileTrue: [ bits := bits + 1. n := n // 2 ].
+        budget := (2 * bits) + 4.
+        depth > budget ifTrue: [ ^self balanced ].
+        ^self
+    ]
+
+    splitAt: i [
+        i <= 0 ifTrue: [ ^Array with: Rope empty with: self ].
+        i >= size ifTrue: [ ^Array with: self with: Rope empty ].
+        i <= weight ifTrue: [
+            | p | p := left splitAt: i.
+            ^Array with: (p at: 1) with: ((p at: 2) concat: right) ].
+        ^[ | p | p := right splitAt: i - weight.
+           Array with: (left concat: (p at: 1)) with: (p at: 2) ] value
+    ]
+
+    newlinesBefore: i [
+        i <= weight ifTrue: [ ^left newlinesBefore: i ].
+        ^leftNls + (right newlinesBefore: i - weight)
+    ]
+
+    offsetAfterNewline: k [
+        leftNls >= k ifTrue: [ ^left offsetAfterNewline: k ].
+        ^[ | r | r := right offsetAfterNewline: k - leftNls.
+           r isNil ifTrue: [ nil ] ifFalse: [ weight + r ] ] value
+    ]
+]
+
+"── Rope reopened: the constructors + whole-rope operations, now that RopeLeaf
+ and RopeBranch are declared globals the method bodies can name. ──"
+Object subclass: Rope [
+    Rope class >> leafMax [ "the largest string a single leaf holds" ^64 ]
+
+    Rope class >> empty [ ^RopeLeaf on: '' ]
+
+    "Build a balanced rope from a String, chunking it into bounded leaves so
+     indexing starts shallow instead of relying on later edits to split it."
+    Rope class >> fromString: aString [
+        | leaves i n max |
+        n := aString size.
+        n = 0 ifTrue: [ ^self empty ].
+        leaves := OrderedCollection new.
+        i := 1.
+        max := self leafMax.
+        [ i <= n ] whileTrue: [
+            | j |
+            j := (i + max - 1) min: n.
+            leaves add: (aString copyFrom: i to: j).
+            i := j + 1 ].
+        ^self balancedFrom: leaves from: 1 to: leaves size
+    ]
+
+    "Rebuild a balanced tree from ordered leaf strings [lo..hi] — the midpoint
+     split keeps depth ~log2(count). Uses plainConcat: (a bare branch) so it
+     never re-enters the rebalance it is the target of."
+    Rope class >> balancedFrom: strings from: lo to: hi [
+        | mid |
+        lo > hi ifTrue: [ ^self empty ].
+        lo = hi ifTrue: [ ^RopeLeaf on: (strings at: lo) ].
+        mid := (lo + hi) // 2.
+        ^(self balancedFrom: strings from: lo to: mid)
+            plainConcat: (self balancedFrom: strings from: mid + 1 to: hi)
+    ]
+
+    "── recursive primitives: each concrete node overrides these ──"
+    size [ ^self subclassResponsibility ]
+    newlines [ ^self subclassResponsibility ]
+    depth [ ^self subclassResponsibility ]
+    isLeaf [ ^false ]
+    at: i [ ^self subclassResponsibility ]
+    putOn: aStream [ ^self subclassResponsibility ]
+    newlinesBefore: i [ ^self subclassResponsibility ]
+    offsetAfterNewline: k [ ^self subclassResponsibility ]
+    collectLeavesInto: aColl [ ^self subclassResponsibility ]
+
+    isEmpty [ ^self size = 0 ]
+    lineCount [ ^self newlines + 1 ]
+
+    "The whole document as one String."
+    asString [
+        | ws |
+        ws := WriteStream on: String new.
+        self putOn: ws.
+        ^ws contents
+    ]
+
+    "Characters [from..to] (1-based, inclusive) as a String; empty when to<from."
+    copyFrom: from to: to [
+        | ws |
+        ws := WriteStream on: String new.
+        from to: to do: [ :i | ws nextPut: (self at: i) ].
+        ^ws contents
+    ]
+
+    "── the persistent editing operations: each answers a NEW rope ──"
+
+    "A bare branch, no leaf-merge and no rebalance — for the balanced builder."
+    plainConcat: other [
+        self isEmpty ifTrue: [ ^other ].
+        other isEmpty ifTrue: [ ^self ].
+        ^RopeBranch left: self right: other
+    ]
+
+    "Join two ropes. Merges two small leaves into one, drops empties, and
+     rebalances if the result got too deep — so repeated appends can't build an
+     unbounded right spine."
+    concat: other [
+        | b |
+        self isEmpty ifTrue: [ ^other ].
+        other isEmpty ifTrue: [ ^self ].
+        (self isLeaf and: [ other isLeaf and: [ self size + other size <= Rope leafMax ] ])
+            ifTrue: [ ^RopeLeaf on: self asString , other asString ].
+        b := RopeBranch left: self right: other.
+        ^b balancedIfDeep
+    ]
+
+    "Split into { [1..i] . [i+1..size] } — i clamped to 0..size. Overridden by
+     both concrete nodes; never reached, but keeps the protocol explicit."
+    splitAt: i [ ^self subclassResponsibility ]
+
+    "Insert aString so it begins at position `at` (1-based): the new text is
+     old[1..at-1] , aString , old[at..size]. at=1 prepends, at=size+1 appends."
+    insert: aString at: at [
+        | parts |
+        aString isEmpty ifTrue: [ ^self ].
+        parts := self splitAt: at - 1.
+        ^((parts at: 1) concat: (Rope fromString: aString)) concat: (parts at: 2)
+    ]
+
+    "Delete characters [from..to] (1-based, inclusive); answers a new rope."
+    delete: from to: to [
+        | left right |
+        to < from ifTrue: [ ^self ].
+        left := (self splitAt: from - 1) at: 1.
+        right := (self splitAt: to) at: 2.
+        ^left concat: right
+    ]
+
+    "── line lookup, on the newline augmentation ──"
+
+    "Line number (1-based) that 1-based offset `i` sits on = 1 + newlines strictly
+     before it."
+    lineOfOffset: i [ ^1 + (self newlinesBefore: i) ]
+
+    "1-based character offset where line `n` begins (line 1 begins at 1)."
+    offsetOfLine: n [
+        n <= 1 ifTrue: [ ^1 ].
+        ^self offsetAfterNewline: n - 1
+    ]
+
+    "The text of lines [a..b] (1-based, inclusive) — what the GUI view paints.
+     Includes each line's trailing newline except, naturally, past end-of-text."
+    linesFrom: a to: b [
+        | start end |
+        start := self offsetOfLine: a.
+        end := b >= self lineCount
+            ifTrue: [ self size ]
+            ifFalse: [ (self offsetOfLine: b + 1) - 1 ].
+        ^self copyFrom: start to: end
+    ]
+
+    "Balanced rebuild of the whole rope (amortizes a skewed spine)."
+    balanced [
+        | leaves |
+        leaves := OrderedCollection new.
+        self collectLeavesInto: leaves.
+        ^Rope balancedFrom: leaves from: 1 to: leaves size
+    ]
+]
+
+"── TextBuffer: a mutable handle over an immutable rope, with free undo ────────
+ The rope is a value; this holds the current root plus a stack of prior roots.
+ Undo is O(1): pop back to a previous root — no copying, because a persistent
+ edit never mutated the shared structure. (Cursor/selection and the GUI damage
+ protocol are M3; this is the persistence the design is built on, made concrete.)"
+Object subclass: TextBuffer [
+    | root undo redo |
+
+    TextBuffer class >> on: aString [ ^self new setString: aString ]
+    TextBuffer class >> empty [ ^self on: '' ]
+    setString: aString [ root := Rope fromString: aString. undo := OrderedCollection new. redo := OrderedCollection new. ^self ]
+
+    rope [ ^root ]
+    asString [ ^root asString ]
+    size [ ^root size ]
+    lineCount [ ^root lineCount ]
+
+    "Record the current root, apply an edit, and clear the redo trail."
+    commit: aRope [
+        undo addLast: root.
+        root := aRope.
+        redo := OrderedCollection new.
+        ^self
+    ]
+
+    insert: aString at: at [ ^self commit: (root insert: aString at: at) ]
+    delete: from to: to [ ^self commit: (root delete: from to: to) ]
+
+    canUndo [ ^undo isEmpty not ]
+    canRedo [ ^redo isEmpty not ]
+
+    undo [
+        self canUndo ifFalse: [ ^self ].
+        redo addLast: root.
+        root := undo removeLast.
+        ^self
+    ]
+    redo [
+        self canRedo ifFalse: [ ^self ].
+        undo addLast: root.
+        root := redo removeLast.
+        ^self
+    ]
+]

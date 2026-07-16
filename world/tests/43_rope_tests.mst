@@ -1,0 +1,184 @@
+"43_rope_tests.mst — RopeTests: the M2 gate for the editor's rope buffer
+ (world/60_editor.mst, docs/editor_design.md M2). Unit checks for the core
+ protocol, then the real gate: a RANDOMISED DIFFERENTIAL test that drives a Rope
+ and a plain-String oracle through the same 400 random insert/delete edits and
+ asserts they never diverge — the cheapest way to trust a persistent tree
+ structure, since any indexing/splitting/rebalancing bug shows up as a mismatch.
+ Seeded, so a failure is reproducible."
+
+TestCase subclass: RopeTests [
+    runAll [
+        self runTest: #testSizeAndAt do: [ self testSizeAndAt ].
+        self runTest: #testInsert do: [ self testInsert ].
+        self runTest: #testInsertBoundaries do: [ self testInsertBoundaries ].
+        self runTest: #testDelete do: [ self testDelete ].
+        self runTest: #testDeleteBoundaries do: [ self testDeleteBoundaries ].
+        self runTest: #testLargeStringForcesBranches do: [ self testLargeStringForcesBranches ].
+        self runTest: #testLinesAgainstOracle do: [ self testLinesAgainstOracle ].
+        self runTest: #testUndoRedo do: [ self testUndoRedo ].
+        self runTest: #testDifferentialEdits do: [ self testDifferentialEdits ].
+    ]
+
+    "── helpers ──"
+    nl [ ^String with: Character nl ]
+
+    "A bounded random integer in [1..n] from `rng` (`nextInteger` is 0..maxVal)."
+    from: rng upTo: n [ ^(rng nextInteger \\ n) + 1 ]
+
+    "A short random fragment, ~1 in 10 characters a newline so the line protocol
+     gets exercised by the differential run too."
+    randomFragment: rng [
+        | n ws |
+        n := self from: rng upTo: 6.
+        ws := WriteStream on: String new.
+        n timesRepeat: [
+            | c |
+            c := rng nextInteger \\ 10.
+            ws nextPut: (c = 0 ifTrue: [ Character nl ] ifFalse: [ Character value: 97 + (c \\ 26) ]) ].
+        ^ws contents
+    ]
+
+    "── unit checks ──"
+    testSizeAndAt [
+        | r |
+        r := Rope fromString: 'hello world'.
+        self assert: r size equals: 11.
+        self deny: r isEmpty.
+        self assert: (r at: 1) equals: $h.
+        self assert: (r at: 5) equals: $o.
+        self assert: (r at: 11) equals: $d.
+        self assert: r asString equals: 'hello world'.
+        self assert: Rope empty isEmpty.
+        self assert: Rope empty size equals: 0.
+    ]
+
+    testInsert [
+        | r |
+        r := Rope fromString: 'hello world'.
+        self assert: (r insert: ', there' at: 6) asString equals: 'hello, there world'.
+        "the original is untouched — persistence"
+        self assert: r asString equals: 'hello world'.
+    ]
+
+    testInsertBoundaries [
+        | r |
+        r := Rope fromString: 'bcd'.
+        self assert: (r insert: 'a' at: 1) asString equals: 'abcd'.
+        self assert: (r insert: 'e' at: 4) asString equals: 'bcde'.
+        self assert: (r insert: '' at: 2) asString equals: 'bcd'.
+        self assert: (Rope empty insert: 'x' at: 1) asString equals: 'x'.
+    ]
+
+    testDelete [
+        | r |
+        r := Rope fromString: 'hello world'.
+        self assert: (r delete: 1 to: 6) asString equals: 'world'.
+        self assert: (r delete: 6 to: 11) asString equals: 'hello'.
+        self assert: (r delete: 3 to: 3) asString equals: 'helo world'.
+        "original untouched"
+        self assert: r asString equals: 'hello world'.
+    ]
+
+    testDeleteBoundaries [
+        | r |
+        r := Rope fromString: 'abc'.
+        self assert: (r delete: 1 to: 3) asString equals: ''.
+        self assert: (r delete: 2 to: 1) asString equals: 'abc'.
+        self assert: (r delete: 1 to: 1) asString equals: 'bc'.
+        self assert: (r delete: 3 to: 3) asString equals: 'ab'.
+    ]
+
+    "A string past leafMax must build a multi-node tree yet index and print
+     identically to the flat string."
+    testLargeStringForcesBranches [
+        | ws s r |
+        ws := WriteStream on: String new.
+        1 to: 500 do: [ :i | ws nextPut: (Character value: 97 + (i \\ 26)) ].
+        s := ws contents.
+        r := Rope fromString: s.
+        self assert: r size equals: 500.
+        self assert: r asString equals: s.
+        self deny: r isLeaf.                       "genuinely a tree"
+        self assert: r depth <= 20.                "and a balanced one"
+        self assert: (r at: 1) equals: (s at: 1).
+        self assert: (r at: 250) equals: (s at: 250).
+        self assert: (r at: 500) equals: (s at: 500).
+    ]
+
+    "lineOfOffset:/offsetOfLine:/lineCount against a manual newline scan, over a
+     doc with a leading, trailing, and empty line."
+    testLinesAgainstOracle [
+        | text r |
+        text := 'aa', self nl, 'bbb', self nl, self nl, 'c', self nl, 'dddd'.
+        r := Rope fromString: text.
+        self assert: r lineCount equals: (text occurrencesOf: Character nl) + 1.
+        "every offset reports the line a manual prefix-scan gives"
+        1 to: text size do: [ :i |
+            | want |
+            want := 1 + ((text copyFrom: 1 to: i - 1) occurrencesOf: Character nl).
+            self assert: (r lineOfOffset: i) equals: want ].
+        "offsetOfLine: round-trips — the start of line n is on line n"
+        1 to: r lineCount do: [ :ln |
+            self assert: (r lineOfOffset: (r offsetOfLine: ln)) equals: ln ].
+        "linesFrom:to: extracts the right span"
+        self assert: (r linesFrom: 2 to: 2) equals: ('bbb', self nl).
+        self assert: (r linesFrom: 5 to: 5) equals: 'dddd'.
+    ]
+
+    testUndoRedo [
+        | b |
+        b := TextBuffer on: 'abc'.
+        self deny: b canUndo.
+        b insert: 'XY' at: 2.
+        self assert: b asString equals: 'aXYbc'.
+        self assert: b canUndo.
+        b delete: 1 to: 1.
+        self assert: b asString equals: 'XYbc'.
+        b undo.
+        self assert: b asString equals: 'aXYbc'.
+        b undo.
+        self assert: b asString equals: 'abc'.
+        self deny: b canUndo.
+        b redo.
+        self assert: b asString equals: 'aXYbc'.
+        "a fresh edit clears the redo trail"
+        b insert: 'Z' at: 1.
+        self deny: b canRedo.
+        self assert: b asString equals: 'ZaXYbc'.
+    ]
+
+    "THE gate: 400 random edits on a rope vs a String oracle, never diverging.
+     Newlines in the fragments mean the tree spans many leaves and rebalances
+     mid-run, so this also exercises split/concat/rebalance under churn."
+    testDifferentialEdits [
+        | r oracle rng |
+        rng := Random newWithSeed: 1234567.
+        r := Rope fromString: 'start'.
+        oracle := 'start'.
+        1 to: 400 do: [ :step |
+            (oracle size >= 2 and: [ (rng nextInteger \\ 3) = 2 ])
+                ifTrue: [
+                    "delete [from..to]"
+                    | from to |
+                    from := self from: rng upTo: oracle size.
+                    to := from + (rng nextInteger \\ ((oracle size - from) + 1)).
+                    r := r delete: from to: to.
+                    oracle := (oracle copyFrom: 1 to: from - 1) , (oracle copyFrom: to + 1 to: oracle size) ]
+                ifFalse: [
+                    "insert a fragment before position pos"
+                    | pos frag |
+                    pos := self from: rng upTo: oracle size + 1.
+                    frag := self randomFragment: rng.
+                    r := r insert: frag at: pos.
+                    oracle := (oracle copyFrom: 1 to: pos - 1) , frag , (oracle copyFrom: pos to: oracle size) ].
+            self assert: r asString equals: oracle.
+            self assert: r size equals: oracle size ].
+        "line lookup still agrees with the oracle after all that churn"
+        1 to: r size do: [ :i |
+            | want |
+            want := 1 + ((oracle copyFrom: 1 to: i - 1) occurrencesOf: Character nl).
+            self assert: (r lineOfOffset: i) equals: want ].
+        "and the tree never degenerated into a spine"
+        self assert: r depth <= 30.
+    ]
+]

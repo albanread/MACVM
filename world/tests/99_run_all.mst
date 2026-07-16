@@ -46,4 +46,5 @@ TestRunner run: FinalExtTests.
 TestRunner run: NumberCoercionTests.
 TestRunner run: ReflectionTests.
 TestRunner run: CurtailmentTests.
+TestRunner run: RopeTests.
 TestRunner report.
