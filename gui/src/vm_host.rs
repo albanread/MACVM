@@ -116,7 +116,7 @@ pub enum VmRequest {
     WorkerInbox,
     /// Text editor (`docs/editor_design.md` M3): open a session on `text` (a
     /// class's source), replacing any prior one; answers a full-document
-    /// [`VmResponse::EditorDamage`] for the initial render.
+    /// [`VmResponse::EditorView`] for the initial render.
     EditorOpen {
         text: String,
     },
@@ -126,13 +126,13 @@ pub enum VmRequest {
     /// there before applying the key, so the edit lands where the user is even
     /// though navigation (mouse, arrows, selection) never round-trips through
     /// the VM. Like `GameStep`, a fresh top-level request per key. Answers an
-    /// [`VmResponse::EditorDamage`].
+    /// [`VmResponse::EditorView`].
     EditorKey {
         key: String,
         at: i64,
     },
     /// An editor command by name (`"undo"`, `"redo"`; accept/close are M4/M6).
-    /// Answers a full-document [`VmResponse::EditorDamage`].
+    /// Answers a full-document [`VmResponse::EditorView`].
     EditorCommand {
         name: String,
     },
@@ -398,16 +398,12 @@ pub enum VmResponse {
     /// game pane (`game_pane::apply_command`) on the main thread.
     Game(GameCommand),
     /// The reply to an editor key/command (`docs/editor_design.md` M3), decoded
-    /// from `EditorDamage>>encode`: the inclusive line range whose text changed
-    /// (`first_line > last_line` = a caret-only move, no text), that range's new
-    /// text, the document's total line count (for scrollbar sizing), and the
-    /// caret's new 1-based line/column. The JS terminal patches only these lines.
-    EditorDamage {
-        first_line: u32,
-        last_line: u32,
-        total_lines: u32,
-        cursor_line: u32,
-        cursor_column: u32,
+    /// from `EditorSession>>render`: the WHOLE buffer text (a few KB — a class)
+    /// plus the 0-based caret offset. The JS terminal blasts both into the
+    /// textarea; no incremental patching. `cursor` is ready for
+    /// `setSelectionRange`.
+    EditorView {
+        cursor: i64,
         text: String,
     },
     BrowserPanes {
@@ -1374,20 +1370,13 @@ fn smalltalk_string_literal(s: &str) -> String {
     out
 }
 
-/// Decode `EditorDamage>>encode` (five tab-separated ints on the first line,
-/// then the damaged text after the first newline) into the response the JS
-/// terminal consumes. Tolerant of a short/garbled header — a missing field
-/// reads 0, which the view treats as an empty (caret-only) damage.
-fn decode_editor_damage(enc: &str) -> VmResponse {
+/// Decode `EditorSession>>render` (the 0-based caret offset on the first line,
+/// then the whole buffer text after the first newline) into the blast the JS
+/// terminal consumes.
+fn decode_editor_view(enc: &str) -> VmResponse {
     let (header, text) = enc.split_once('\n').unwrap_or((enc, ""));
-    let n: Vec<u32> = header.split('\t').map(|s| s.parse().unwrap_or(0)).collect();
-    let g = |i: usize| n.get(i).copied().unwrap_or(0);
-    VmResponse::EditorDamage {
-        first_line: g(0),
-        last_line: g(1),
-        total_lines: g(2),
-        cursor_line: g(3),
-        cursor_column: g(4),
+    VmResponse::EditorView {
+        cursor: header.trim().parse().unwrap_or(0),
         text: text.to_string(),
     }
 }
@@ -1476,12 +1465,12 @@ fn persist_editor_class(img: &image_store::Image, text: &str) -> String {
     }
 }
 
-/// Run an editor bridge expression that answers an encoded `EditorDamage` and
-/// decode it. A guest error (e.g. no session open yet) surfaces on the
-/// transcript rather than as a bogus damage.
+/// Run an editor bridge expression that answers an `EditorSession>>render`
+/// string and decode it. A guest error (e.g. no session open yet) surfaces on
+/// the transcript rather than as a bogus view.
 fn editor_eval(vm: &mut VmHandle, src: &str) -> Vec<VmResponse> {
     match vm.eval_to_string(src) {
-        Ok(enc) => vec![decode_editor_damage(&enc)],
+        Ok(enc) => vec![decode_editor_view(&enc)],
         Err(e) => vec![VmResponse::Transcript(format!("editor error: {e}"))],
     }
 }
@@ -1529,7 +1518,7 @@ fn handle(
             // Open a session, then ask it for a full-document damage — one
             // eval, the block's last expression is the encoded record.
             let src = format!(
-                "EditorSession openOn: {}. EditorSession current fullDamage encode",
+                "EditorSession openOn: {}. EditorSession current render",
                 smalltalk_string_literal(&text)
             );
             editor_eval(vm, &src)
@@ -1537,14 +1526,14 @@ fn handle(
         VmRequest::EditorKey { key, at } => editor_eval(
             vm,
             &format!(
-                "(EditorSession current handleKey: {} at: {at}) encode",
+                "EditorSession current handleKey: {} at: {at}",
                 smalltalk_string_literal(&key)
             ),
         ),
         VmRequest::EditorCommand { name } => editor_eval(
             vm,
             &format!(
-                "(EditorSession current handleCommand: {}) encode",
+                "EditorSession current handleCommand: {}",
                 smalltalk_string_literal(&name)
             ),
         ),
@@ -3864,20 +3853,27 @@ mod tests {
         );
     }
 
-    /// The editor bridge (docs/editor_design.md M3b), end to end through the
+    /// The editor bridge (docs/editor_design.md M3), end to end through the
     /// real `handle()` dispatch: EditorOpen/EditorKey/EditorCommand → the
-    /// Smalltalk EditorSession → an encoded EditorDamage → decoded response.
-    /// Proves the wire round-trip AND the string escaping (the doc holds a `'`)
-    /// AND the minimal-damage contract (a mid-line insert reports one line).
+    /// Smalltalk EditorSession → a `render` blast → decoded EditorView. Proves
+    /// the wire round-trip, the string escaping (the doc holds a `'`), that an
+    /// edit lands at the given caret, and that the WHOLE buffer + caret come back.
     #[test]
     fn editor_bridge_open_key_and_command_round_trip() {
         let mut world = MockWorld::seed();
         let mut selection = BrowserSelection::default();
         let mut vm = test_vm_handle(macvm::runtime::JitMode::Off);
 
+        let view = |rs: &[VmResponse]| -> (i64, String) {
+            match rs {
+                [VmResponse::EditorView { cursor, text }] => (*cursor, text.clone()),
+                other => panic!("expected one EditorView, got {other:?}"),
+            }
+        };
+
         // Open on a two-line doc containing a quote — exercises the literal
-        // escaper and the full-document initial damage.
-        let open = handle(
+        // escaper; the blast is the whole doc with the caret at 0.
+        let (cur, text) = view(&handle(
             VmRequest::EditorOpen {
                 text: "ab'c\ndef".to_string(),
             },
@@ -3885,52 +3881,27 @@ mod tests {
             &mut selection,
             None,
             &mut vm,
-        );
-        match open.as_slice() {
-            [VmResponse::EditorDamage {
-                first_line,
-                last_line,
-                total_lines,
-                text,
-                ..
-            }] => {
-                assert_eq!((*first_line, *last_line, *total_lines), (1, 2, 2));
-                assert_eq!(text, "ab'c\ndef", "the quote survived the round trip");
-            }
-            other => panic!("EditorOpen: {other:?}"),
-        }
+        ));
+        assert_eq!(cur, 0);
+        assert_eq!(text, "ab'c\ndef", "the quote survived the round trip");
 
-        // Caret is at offset 1; a printable key inserts one char on line 1 —
-        // a same-line edit, so exactly one line is reported.
-        let k = handle(
+        // Insert 'X' at caret offset 3 (before 'c' on line 1) — the edit lands
+        // exactly there, and the whole buffer comes back with the new caret.
+        let (cur, text) = view(&handle(
             VmRequest::EditorKey {
                 key: "X".to_string(),
-                at: 1, // caret at the very start (as the fresh session reports)
+                at: 3,
             },
             &mut world,
             &mut selection,
             None,
             &mut vm,
-        );
-        match k.as_slice() {
-            [VmResponse::EditorDamage {
-                first_line,
-                last_line,
-                total_lines,
-                cursor_column,
-                text,
-                ..
-            }] => {
-                assert_eq!((*first_line, *last_line), (1, 1), "mid-line insert = one line");
-                assert_eq!(*total_lines, 2);
-                assert_eq!(*cursor_column, 2);
-                assert_eq!(text, "Xab'c\n", "damaged line 1, with its newline");
-            }
-            other => panic!("EditorKey: {other:?}"),
-        }
+        ));
+        assert_eq!(text, "abX'c\ndef", "inserted at the given caret, whole buffer back");
+        assert_eq!(cur, 3, "0-based caret advanced past the inserted char");
 
-        // Undo restores the original document (a full-document damage).
-        let u = handle(
+        // Undo restores the original document.
+        let (_cur, text) = view(&handle(
             VmRequest::EditorCommand {
                 name: "undo".to_string(),
             },
@@ -3938,16 +3909,8 @@ mod tests {
             &mut selection,
             None,
             &mut vm,
-        );
-        match u.as_slice() {
-            [VmResponse::EditorDamage {
-                total_lines, text, ..
-            }] => {
-                assert_eq!(text, "ab'c\ndef");
-                assert_eq!(*total_lines, 2);
-            }
-            other => panic!("EditorCommand undo: {other:?}"),
-        }
+        ));
+        assert_eq!(text, "ab'c\ndef");
     }
 
     /// The editor Save persists ONLY what changed (docs/editor_design.md M4):

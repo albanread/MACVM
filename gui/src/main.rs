@@ -2053,21 +2053,13 @@ extern "C" fn vm_bridge_drain(_this: Id, _cmd: Sel, _arg: Id) {
         match response {
             vm_host::VmResponse::Transcript(text) => append_transcript(&text),
             vm_host::VmResponse::Game(cmd) => game_pane::apply_command(&cmd),
-            vm_host::VmResponse::EditorDamage {
-                first_line,
-                last_line,
-                total_lines,
-                cursor_line,
-                cursor_column,
-                text,
-            } => {
-                // Hand the minimal change to the JS terminal, which patches only
-                // the named line range (docs/editor_design.md M3). Guarded, so
-                // it's a no-op until the terminal ships (M3c) — the headless
-                // vm_host test exercises the decode without this path.
+            vm_host::VmResponse::EditorView { cursor, text } => {
+                // Blast the whole buffer + caret into the JS terminal, which
+                // just sets textarea.value and the selection — the VM is the
+                // source of truth, so there is nothing to reconcile
+                // (docs/editor_design.md M3).
                 eval_js(&format!(
-                    "if(window.macvmEditorDamage)window.macvmEditorDamage(\
-                     {first_line},{last_line},{total_lines},{cursor_line},{cursor_column},{})",
+                    "if(window.macvmEditorView)window.macvmEditorView({cursor},{})",
                     js_string_literal(&text)
                 ));
             }

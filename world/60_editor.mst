@@ -319,53 +319,16 @@ Object subclass: TextBuffer [
     ]
 ]
 
-"── EditorDamage: what changed, and only what changed (docs/editor_design.md M3)
- The reply to one keystroke: the inclusive line range whose text changed
- (firstLine..lastLine — an EMPTY range, firstLine>lastLine, means only the caret
- moved), that range's new text, the document's total line count (so the view can
- size its scrollbar), and where the caret now sits. `encode` is the wire form the
- Rust bridge (M3b) parses: a header line of five tab-separated ints, then — after
- the first newline — the damaged text verbatim."
-Object subclass: EditorDamage [
-    | firstLine lastLine totalLines cursorLine cursorColumn text |
-
-    EditorDamage class >> first: f last: l total: t cursorLine: cl cursorColumn: cc text: s [
-        ^self new setFirst: f last: l total: t cursorLine: cl cursorColumn: cc text: s
-    ]
-    setFirst: f last: l total: t cursorLine: cl cursorColumn: cc text: s [
-        firstLine := f. lastLine := l. totalLines := t.
-        cursorLine := cl. cursorColumn := cc. text := s. ^self
-    ]
-
-    firstLine [ ^firstLine ]
-    lastLine [ ^lastLine ]
-    totalLines [ ^totalLines ]
-    cursorLine [ ^cursorLine ]
-    cursorColumn [ ^cursorColumn ]
-    text [ ^text ]
-    isEmpty [ "caret-only: no line's text changed" ^firstLine > lastLine ]
-
-    encode [
-        | ws |
-        ws := WriteStream on: String new.
-        ws nextPutAll: firstLine printString; nextPut: Character tab;
-           nextPutAll: lastLine printString; nextPut: Character tab;
-           nextPutAll: totalLines printString; nextPut: Character tab;
-           nextPutAll: cursorLine printString; nextPut: Character tab;
-           nextPutAll: cursorColumn printString; nextPut: Character nl;
-           nextPutAll: text.
-        ^ws contents
-    ]
-]
-
-"── EditorSession: the buffer + caret, driven one keystroke at a time ──────────
- Owns a TextBuffer and a 1-based caret OFFSET (1..size+1; the next insert lands
- BEFORE that position). Every key answers an EditorDamage describing the minimal
- change, computed from the rope's newline index: a same-line edit reports one
- line, a structural edit (a newline added/removed) reports from the edit line to
- the end (those lines renumbered). `EditorSession current` is the primary VM's
- one live session (M3); M5 gives each open document its own VM, hence its own
- Current, with no other change here."
+"── EditorSession: a VIEWPORT onto the rope buffer (docs/editor_design.md M3) ──
+ The editor is a view into the rope, not an owner of text spread across the JS.
+ Smalltalk owns the whole document (a TextBuffer) and the caret; the GUI textarea
+ is a dumb terminal that captures keys and paints whatever `render` hands back.
+ On every change the VM BLASTS the entire buffer text (a few KB — a class) plus
+ the caret offset; the JS just sets them. No incremental patching to drift out of
+ sync — the previous line-range `EditorDamage` scheme did drift, and this replaces
+ it. (Viewport WINDOWING — sending only the on-screen slice of a very large
+ document and scrolling it as the caret leaves the screen — is the next step; a
+ class fits on screen, so the whole buffer is the viewport for now.)"
 Object subclass: EditorSession [
     | buffer cursor |
     <classVars: Current>
@@ -374,130 +337,47 @@ Object subclass: EditorSession [
     EditorSession class >> current [ ^Current ]
     setString: aString [ buffer := TextBuffer on: aString. cursor := 1. ^self ]
 
-    "── read-only state, for the bridge and the tests ──"
     documentString [ ^buffer asString ]
     cursorOffset [ ^cursor ]
     size [ ^buffer size ]
     lineCount [ ^buffer lineCount ]
 
-    "The caret's 1-based line and column, from the current offset."
-    cursorLine [ ^buffer rope lineOfOffset: cursor ]
-    cursorColumn [ ^self columnAt: cursor line: self cursorLine ]
-    columnAt: offset line: ln [ ^offset - (buffer rope offsetOfLine: ln) + 1 ]
-
-    "── the damage builders ──"
-
-    "An edit began at `editOffset` and the document had `lb` lines before it.
-     Same line count → the one line changed; otherwise the tail renumbered."
-    damageAt: editOffset linesBefore: lb [
-        | newTotal startLine cl lastL |
-        newTotal := buffer lineCount.
-        startLine := buffer rope lineOfOffset: editOffset.
-        lastL := newTotal = lb ifTrue: [ startLine ] ifFalse: [ newTotal ].
-        cl := buffer rope lineOfOffset: cursor.
-        ^EditorDamage
-            first: startLine last: lastL total: newTotal
-            cursorLine: cl cursorColumn: (self columnAt: cursor line: cl)
-            text: (buffer rope linesFrom: startLine to: lastL)
+    "The viewport blast: the whole buffer text, preceded by a header line with
+     the 0-based caret offset the JS feeds straight to setSelectionRange
+     (VM cursor is 1-based `insert-before`, so caret = cursor - 1). The JS splits
+     on the FIRST newline: header, then the text verbatim."
+    render [
+        | ws |
+        ws := WriteStream on: String new.
+        ws nextPutAll: (cursor - 1) printString; nextPut: Character nl;
+           nextPutAll: buffer asString.
+        ^ws contents
     ]
 
-    "A caret move: no line's text changed, so an EMPTY range with the new caret."
-    cursorDamage [
-        | cl |
-        cl := buffer rope lineOfOffset: cursor.
-        ^EditorDamage
-            first: 1 last: 0 total: buffer lineCount
-            cursorLine: cl cursorColumn: (self columnAt: cursor line: cl) text: ''
-    ]
+    "── edits: mutate the buffer + caret; the entry points render ──"
+    insertString: s [ s isEmpty ifFalse: [ buffer insert: s at: cursor. cursor := cursor + s size ] ]
+    backspace [ cursor > 1 ifTrue: [ buffer delete: cursor - 1 to: cursor - 1. cursor := cursor - 1 ] ]
+    deleteForward [ cursor <= buffer size ifTrue: [ buffer delete: cursor to: cursor ] ]
 
-    "── edits: each answers an EditorDamage ──"
-    insertString: s [
-        | lb at |
-        s isEmpty ifTrue: [ ^self cursorDamage ].
-        lb := buffer lineCount.
-        at := cursor.
-        buffer insert: s at: cursor.
-        cursor := cursor + s size.
-        ^self damageAt: at linesBefore: lb
-    ]
-    insertChar: c [ ^self insertString: (String with: c) ]
-    newline [ ^self insertString: (String with: Character nl) ]
-
-    backspace [
-        | lb |
-        cursor <= 1 ifTrue: [ ^self cursorDamage ].
-        lb := buffer lineCount.
-        buffer delete: cursor - 1 to: cursor - 1.
-        cursor := cursor - 1.
-        ^self damageAt: cursor linesBefore: lb
-    ]
-    deleteForward [
-        | lb |
-        cursor > buffer size ifTrue: [ ^self cursorDamage ].
-        lb := buffer lineCount.
-        buffer delete: cursor to: cursor.
-        ^self damageAt: cursor linesBefore: lb
-    ]
-
-    "── caret movement (no text change) ──"
-    moveLeft [ cursor > 1 ifTrue: [ cursor := cursor - 1 ]. ^self cursorDamage ]
-    moveRight [ cursor <= buffer size ifTrue: [ cursor := cursor + 1 ]. ^self cursorDamage ]
-    moveToLineStart [ cursor := buffer rope offsetOfLine: self cursorLine. ^self cursorDamage ]
-    moveToLineEnd [
-        | ln nextStart |
-        ln := self cursorLine.
-        nextStart := ln >= buffer lineCount
-            ifTrue: [ buffer size + 1 ]
-            ifFalse: [ buffer rope offsetOfLine: ln + 1 ].
-        "the newline that ends this line is at nextStart-1; the caret sits before it"
-        cursor := ln >= buffer lineCount ifTrue: [ nextStart ] ifFalse: [ nextStart - 1 ].
-        ^self cursorDamage
-    ]
-
-    "The whole document as one damage record — the initial render on open, and
-     the honest answer to an edit that can change anything (undo/redo)."
-    fullDamage [
-        | cl |
-        cl := buffer rope lineOfOffset: cursor.
-        ^EditorDamage
-            first: 1 last: buffer lineCount total: buffer lineCount
-            cursorLine: cl cursorColumn: (self columnAt: cursor line: cl)
-            text: buffer asString
-    ]
-
-    "Set the caret to a 1-based offset (clamped), then apply the key. The GUI
-     terminal (M3c) sends the textarea's REAL caret with every edit, so the VM
-     edits where the user is — the textarea owns the caret natively (mouse, all
-     arrows, selection) and the VM only needs to know it at edit time; that is
-     what keeps backspace/delete/insert landing in the right place without
-     routing every navigation key through the VM."
+    "The one entry point the bridge calls per keystroke. `offset` is the
+     textarea's REAL 1-based caret (the terminal owns navigation natively — mouse,
+     arrows, selection — and tells the VM where the caret is only at edit time),
+     so the edit lands where the user is. Answers `render`."
     handleKey: k at: offset [
         cursor := (offset max: 1) min: buffer size + 1.
-        ^self handleKey: k
+        k = 'Enter' ifTrue: [ self insertString: (String with: Character nl) ]
+            ifFalse: [ k = 'Backspace' ifTrue: [ self backspace ]
+                ifFalse: [ k = 'Delete' ifTrue: [ self deleteForward ]
+                    ifFalse: [ self insertString: k ] ] ].
+        ^self render
     ]
 
-    "── the entry points the Rust bridge calls (M3b) ──
-     A named special key routes to its editor action; anything else is literal
-     text to insert (so a printable character arrives as its own 1-char string)."
-    handleKey: k [
-        k = 'Enter' ifTrue: [ ^self newline ].
-        k = 'Backspace' ifTrue: [ ^self backspace ].
-        k = 'Delete' ifTrue: [ ^self deleteForward ].
-        k = 'Left' ifTrue: [ ^self moveLeft ].
-        k = 'Right' ifTrue: [ ^self moveRight ].
-        k = 'Home' ifTrue: [ ^self moveToLineStart ].
-        k = 'End' ifTrue: [ ^self moveToLineEnd ].
-        ^self insertString: k
-    ]
-
-    "A named command. undo/redo can change the document arbitrarily, so both
-     answer a full-document damage; the caret is clamped back into range (a
-     caret that restores to its pre-edit spot is a later refinement — TextBuffer
-     tracks roots, not caret history). accept/close are M4/M6."
+    "undo/redo change the document arbitrarily; the caret is clamped back into
+     range (TextBuffer tracks roots, not caret history). Answers `render`."
     handleCommand: name [
         name = 'undo' ifTrue: [ buffer undo ].
         name = 'redo' ifTrue: [ buffer redo ].
         cursor := cursor min: buffer size + 1.
-        ^self fullDamage
+        ^self render
     ]
 ]

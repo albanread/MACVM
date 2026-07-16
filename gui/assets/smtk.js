@@ -1223,48 +1223,27 @@
   });
 
   // ── Text editor terminal (docs/editor_design.md M3) ──────────────────────
-  // The buffer is a plain <textarea>, but the VM OWNS the text: every editing
-  // key is prevented and posted as {kind:"editorKey"}, and the VM's
-  // EditorDamage reply (window.macvmEditorDamage) is the only thing that
-  // mutates the buffer. Caret moves route through the VM too, so its cursor and
-  // the textarea selection never drift. `edLines` is a local render cache the
-  // damage patches line-range by line-range; the VM stays the source of truth.
-  // (Deferred, and noted in the design: paste, mouse-click caret positioning,
-  // and IME — each would desync until it also routes through the VM.)
-  var edLines = null;
+  // A VIEWPORT onto the rope buffer: Smalltalk owns the whole document and the
+  // caret; this <textarea> is a dumb terminal. Every editing key is prevented
+  // and posted as {kind:"editorKey", at}; the VM edits its buffer and BLASTS the
+  // whole thing back (window.macvmEditorView), which just sets the value + caret.
+  // No local text state to drift — the VM is the single source of truth.
+  // Navigation (mouse, arrows, Home/End, selection) is left native; the VM only
+  // learns the caret from `at` at edit time.
   var edOpened = false;
 
   function editorBuffer() {
     return document.querySelector(".st-editor-buffer");
   }
 
-  function editorSetCaret(ta, line, col) {
-    var off = 0;
-    for (var i = 0; i < line - 1 && i < edLines.length; i++) off += edLines[i].length + 1;
-    off += col - 1;
-    if (off < 0) off = 0;
-    try { ta.setSelectionRange(off, off); } catch (e) {}
-  }
-
-  // The VM's reply to a keystroke: patch exactly the reported line range (an
-  // empty range, first>last, is a caret-only move), then place the caret.
-  window.macvmEditorDamage = function (first, last, total, curLine, curCol, text) {
+  // The VM's blast: the whole buffer text + the 0-based caret. Set both; the
+  // textarea scrolls the caret into view for us.
+  window.macvmEditorView = function (cursor, text) {
     var ta = editorBuffer();
     if (!ta) return;
-    if (edLines === null) edLines = ta.value.split("\n");
-    if (first <= last) {
-      // `text` is the damaged lines joined by newlines, with at most one
-      // trailing newline (present iff `last` isn't the final line) — strip it,
-      // so split() yields exactly (last-first+1) lines.
-      var newLines = text.replace(/\n$/, "").split("\n");
-      var delta = total - edLines.length;
-      var removeCount = (last - delta) - (first - 1);
-      if (removeCount < 0) removeCount = 0;
-      var args = [first - 1, removeCount].concat(newLines);
-      Array.prototype.splice.apply(edLines, args);
-      ta.value = edLines.join("\n");
-    }
-    editorSetCaret(ta, curLine, curCol);
+    ta.value = text;
+    var off = cursor < 0 ? 0 : cursor;
+    try { ta.setSelectionRange(off, off); } catch (e) {}
   };
 
   // Map a keydown to the VM's EDIT-key name, or null. Only keys that CHANGE the
@@ -1316,7 +1295,6 @@
     var ta = editorBuffer();
     if (!ta || edOpened) return;
     edOpened = true;
-    edLines = ta.value.split("\n");
     post({ kind: "editorSession", text: ta.value });
   }
   if (document.readyState === "loading") {

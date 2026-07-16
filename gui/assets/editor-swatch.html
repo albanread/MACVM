@@ -1,20 +1,15 @@
 <!-- editor-swatch.html — visual-verification page for the text-editor terminal
-     (../../docs/editor_design.md M3c), same posture as canvas-swatch.html:
+     (../../docs/editor_design.md M3), same posture as canvas-swatch.html:
      computer-use tools can't attach to the native `cargo run -p macvm-gui`
      app, so this exercises the real shipped `smtk.js` editor terminal against
      the real `editor_render.rs` markup through a local static server instead.
 
-     Typing in the buffer posts {kind:"editorKey", key} through the real
-     smtk.js — with no native host attached that reaches smtk.js's post()
-     console.log fallback (open devtools to confirm the right key names), since
-     there is no VM here to answer.
-
-     The "simulate EditorDamage" buttons below are NOT production markup — they
-     stand in for main.rs's vm_bridge_drain, calling straight into the real
-     window.macvmEditorDamage with the exact encoded values the Smalltalk
-     EditorSession produces (each captured against the M3a/M3b tests, not
-     hand-invented), so this checks the real JS patch/caret logic. Click them in
-     order — they tell one coherent edit story on the initial "hello / world". -->
+     Typing in the buffer posts {kind:"editorKey", key, at} through the real
+     smtk.js (open devtools to see the posts; there is no VM here to answer).
+     The "simulate blast" buttons stand in for main.rs's vm_bridge_drain,
+     calling the real window.macvmEditorView(cursor, text) with the exact
+     (cursor, whole-buffer) pairs EditorSession>>render produces — the VM owns
+     the text and blasts it whole, so the JS just sets value + caret. -->
 <meta charset="utf-8">
 <script>
   const theme = new URLSearchParams(location.search).get('theme') || 'hidef.css';
@@ -25,47 +20,38 @@
 </script>
 <div class="st-page">
   <h1>Text Editor</h1>
-  <p>Edit a class as text. Pick a class, then Enter to load it.
-     <em>(Live editing — the VM owns the text; accept lands next.)</em></p>
-  <input class="st-editor-class" type="text" list="st-editor-classes"
-         value="Demo" placeholder="class name" autocomplete="off" spellcheck="false">
-  <datalist id="st-editor-classes"><option value="Demo"></datalist>
+  <p>Edit a class as text. <em>(Live editing — the VM owns the text.)</em></p>
+  <div class="st-editor-toolbar">
+    <input class="st-editor-class" type="text" value="Demo" autocomplete="off" spellcheck="false">
+    <button type="button" class="st-editor-save" data-editor-action="save">Save</button>
+  </div>
   <textarea class="st-editor-buffer" spellcheck="false" autocomplete="off"
             autocapitalize="off" wrap="off" data-class="Demo">hello
 world</textarea>
 
   <div style="margin-top:12px; display:flex; gap:6px; flex-wrap:wrap">
-    <button id="d-open">1. open (full: "hello\nworld")</button>
-    <button id="d-insert">2. insert X @3 (one line)</button>
-    <button id="d-newline">3. Enter after heX (structural)</button>
-    <button id="d-caret">4. caret to 3,6 (empty range)</button>
-    <button id="d-bksp">5. backspace merge (structural)</button>
+    <button id="b-open">open (caret 0, "hello\nworld")</button>
+    <button id="b-insert">insert X @caret3 -> "heXllo\nworld"</button>
+    <button id="b-split">Enter @caret3 -> 3 lines</button>
+    <button id="b-bksp">backspace merge -> 2 lines</button>
   </div>
-  <pre id="expected" style="margin-top:8px; opacity:.7"></pre>
+  <pre id="note" style="margin-top:8px; opacity:.7"></pre>
 </div>
 
 <script src="smtk.js"></script>
 <script>
-  // Each value is exactly what EditorDamage>>encode produces for that edit,
-  // decoded to the (first,last,total,curLine,curCol,text) macvmEditorDamage
-  // takes — verified against world/tests/43 + the vm_host bridge test.
-  const D = {
-    open:    [1, 2, 2, 1, 1, "hello\nworld"],
-    insert:  [1, 1, 2, 1, 4, "heXllo\n"],
-    newline: [1, 3, 3, 2, 1, "heX\nllo\nworld"],
-    caret:   [1, 0, 3, 3, 6, ""],
-    bksp:    [1, 2, 2, 1, 4, "heXllo\nworld"],
+  // (cursor 0-based, whole buffer) — exactly what EditorSession>>render answers.
+  var BLASTS = {
+    "b-open":   [0, "hello\nworld"],
+    "b-insert": [3, "heXllo\nworld"],
+    "b-split":  [4, "heX\nllo\nworld"],
+    "b-bksp":   [3, "heXllo\nworld"],
   };
-  const EXPECT = {
-    open: "hello\nworld", insert: "heXllo\nworld",
-    newline: "heX\nllo\nworld", caret: "heX\nllo\nworld", bksp: "heXllo\nworld",
-  };
-  function fire(name) {
-    window.macvmEditorDamage.apply(null, D[name]);
-    document.getElementById('expected').textContent =
-      "buffer should now be:\n" + JSON.stringify(EXPECT[name]);
-  }
-  ['open', 'insert', 'newline', 'caret', 'bksp'].forEach(function (n) {
-    document.getElementById('d-' + n).addEventListener('click', function () { fire(n); });
+  Object.keys(BLASTS).forEach(function (id) {
+    document.getElementById(id).addEventListener('click', function () {
+      window.macvmEditorView.apply(null, BLASTS[id]);
+      document.getElementById('note').textContent =
+        'buffer := ' + JSON.stringify(BLASTS[id][1]) + '  caret := ' + BLASTS[id][0];
+    });
   });
 </script>
