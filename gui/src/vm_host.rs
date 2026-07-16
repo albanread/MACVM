@@ -3704,24 +3704,38 @@ mod tests {
         );
     }
 
-    /// THE end-to-end proof of the whole S21 sprint: a doit that triggers a
-    /// fatal guest condition (unhandled DNU -> `error:` -> `fatal_exit` ->
-    /// `pthread_exit`) kills ONLY its worker thread; the supervisor detects
-    /// the silence (no `WorkerIdle` before the timeout), respawns a fresh
-    /// worker + VM, and that fresh worker serves the very next request. The
-    /// test process surviving to assert all this IS the "GUI must not die"
-    /// guarantee, made concrete against a real crash rather than a mock.
+    /// The S21 "GUI must not die" guarantee, in its STRONGEST form: an
+    /// unhandled runtime error (a DNU) does not kill the worker at all — the
+    /// guest-fatal recovery (`raise_guest_fatal` -> `siglongjmp` back to
+    /// `eval`'s `sigsetjmp`, `docs/SPEC.md`) unwinds to the doit boundary, the
+    /// worker reports the error, goes idle, and serves the very next request on
+    /// the SAME VM. No thread death, no respawn, no lost state.
+    ///
+    /// This is the runtime-error twin of `doit_compile_error_is_reported_and_
+    /// the_vm_survives` (which covers a compile-time error), and it is why a
+    /// workspace typo can't restart your VM. The supervisor's respawn path —
+    /// for a genuinely wedged/dead worker — is covered separately by
+    /// `restart_swaps_in_a_fresh_worker_that_still_serves`. That the recovery
+    /// is genuinely CLEAN (the aborted doit's frames/handles don't leak onto
+    /// the surviving VM) is proven at the VM layer by
+    /// `embed::tests::eval_recovers_to_a_clean_stack_and_arena_without_accumulating`.
+    ///
+    /// (History: this test used to assert the OPPOSITE — that a DNU
+    /// `pthread_exit`s the worker and forces a respawn. That only happened
+    /// because error reporting once *panicked* in the worker thread; once that
+    /// panic was fixed the guest-fatal recovery does its job and the worker
+    /// survives, which is the behavior we actually want and now assert.)
     ///
     /// Wake target is NIL — `CrossThreadObjcRef::notify` short-circuits, so
     /// this needs no Objective-C runtime / NSApplication (headless-safe).
     #[test]
-    fn supervisor_respawns_the_worker_after_a_fatal_doit_and_serves_the_next_request() {
-        // Isolate the image to a temp dir, pre-seeded once, so the two worker
-        // generations boot from the DB (S22) without seeding or touching the
-        // repo's own world/image.sqlite3. The worker derives its image path
-        // as `<world_dir>/image.sqlite3`, so passing this temp dir as the
+    fn worker_survives_an_unhandled_runtime_error_and_serves_the_next_request() {
+        // Isolate the image to a temp dir, pre-seeded once, so the worker boots
+        // from the DB (S22) without seeding or touching the repo's own
+        // world/image.sqlite3. The worker derives its image path as
+        // `<world_dir>/image.sqlite3`, so passing this temp dir as the
         // world_dir points it here.
-        let tmp_dir = std::env::temp_dir().join(format!("macvm_respawn_{}", std::process::id()));
+        let tmp_dir = std::env::temp_dir().join(format!("macvm_survive_{}", std::process::id()));
         std::fs::create_dir_all(&tmp_dir).unwrap();
         {
             let img = image_store::Image::open(&tmp_dir.join("image.sqlite3")).unwrap();
@@ -3736,34 +3750,42 @@ mod tests {
             Duration::from_millis(150),
         );
 
-        // 1. Fatal doit. The worker emits its "Error: does not understand …"
-        //    transcript (via ChannelTranscript) and only THEN pthread_exits —
-        //    so it never sends WorkerIdle, leaving pending_since armed.
+        // 1. A doit that raises an unhandled DNU. The worker emits its "Error:
+        //    does not understand …" transcript and recovers at the doit
+        //    boundary — it does NOT die.
         host.submit(VmRequest::Doit {
             code: "3 thisSelectorDoesNotExistAnywhereInTheBaseWorld.".to_string(),
         });
         let seen = poll_until(&host, |rs| transcript_containing(rs, "does not understand"));
         assert!(
             transcript_containing(&seen, "does not understand"),
-            "the worker must have emitted its DNU error before dying, got {seen:?}"
+            "the worker must have reported its DNU error, got {seen:?}"
         );
 
-        // 2. By now pending_since is far older than the 150ms timeout, so the
-        //    next submit presumes the worker dead, respawns a fresh worker +
-        //    VM, and routes this request to it. (If the worker were somehow
-        //    still alive, respawn is still harmless — the old one was already
-        //    committed to pthread_exit.)
+        // 2. Recovery, made concrete: the worker returns to idle (it sends
+        //    WorkerIdle, which `drain_responses` turns into `pending_since =
+        //    None`) rather than dying silently — a dead worker never sends
+        //    WorkerIdle, so `is_idle` would stay false. Keep draining until it
+        //    flips (the WorkerIdle may trail the error transcript by a beat).
+        poll_until(&host, |_| host.is_idle());
+        assert!(
+            host.is_idle(),
+            "the worker must return to idle after the error — it recovered, not died"
+        );
+
+        // 3. The SAME worker serves the next request. No respawn notice, because
+        //    nothing was respawned — the recovery kept the original VM alive.
         host.submit(VmRequest::Doit {
             code: "6 * 7.".to_string(),
         });
         let seen = poll_until(&host, |rs| transcript_containing(rs, "6 * 7"));
         assert!(
-            transcript_containing(&seen, "fresh one has been started"),
-            "the respawn notice must have been delivered, got {seen:?}"
+            transcript_containing(&seen, "6 * 7"),
+            "the surviving worker must have served the follow-up doit, got {seen:?}"
         );
         assert!(
-            transcript_containing(&seen, "6 * 7"),
-            "the fresh worker must have served the follow-up doit, got {seen:?}"
+            !transcript_containing(&seen, "fresh one has been started"),
+            "no respawn should have happened — the worker survived the error, got {seen:?}"
         );
 
         std::fs::remove_dir_all(&tmp_dir).ok();

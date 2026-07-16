@@ -168,6 +168,20 @@ impl ProcessStack {
         self.has_frame = false;
     }
 
+    /// Force the stack back to a previously-captured `(sp, fp, has_frame)`
+    /// watermark, discarding everything above it wholesale. NOT for ordinary
+    /// control flow — that unwinds frame by frame (`pop`, `deactivate`,
+    /// `restore_activation`). This is the embedded guest-fatal recovery
+    /// (`embed::VmHandle::restore_after_guest_fatal`): a `siglongjmp` aborted a
+    /// doit mid-flight, skipping every normal unwind, so its abandoned frames
+    /// must be dropped in one step to return the VM to its pre-doit idle state.
+    #[inline]
+    pub fn restore_baseline(&mut self, sp: usize, fp: usize, has_frame: bool) {
+        self.sp = sp;
+        self.fp = fp;
+        self.has_frame = has_frame;
+    }
+
     /// S11 D6.1: snapshots "is a frame active, and if so where" —
     /// `interpreter::run_method_reentrant`'s own save/restore pair around
     /// a nested re-entrant call (compiled code calling back into an

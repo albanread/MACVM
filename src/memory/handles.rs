@@ -121,6 +121,24 @@ impl HandleArena {
     pub fn slots_mut(&mut self) -> &mut [Oop] {
         &mut self.slots
     }
+
+    /// Truncate back to `base_len`, vacating (generation-bumping) every slot
+    /// above it exactly as [`HandleScope::drop`] does, so any surviving
+    /// `Handle` naming a reclaimed slot goes immediately stale. The embedded
+    /// guest-fatal recovery (`embed::VmHandle::restore_after_guest_fatal`): a
+    /// `siglongjmp` aborted a doit and skipped the `Drop` of every `HandleScope`
+    /// it had open, which would otherwise leak those handles as permanent GC
+    /// roots (they accumulate across errors). A no-op when already at or below
+    /// `base_len`.
+    pub fn reset_to(&mut self, base_len: usize) {
+        let live_top = self.slots.len();
+        if base_len < live_top {
+            for g in &mut self.gen[base_len..live_top] {
+                *g = g.wrapping_add(1);
+            }
+            self.slots.truncate(base_len);
+        }
+    }
 }
 
 /// A LIFO scope: every `Handle` pushed while it's alive is truncated away

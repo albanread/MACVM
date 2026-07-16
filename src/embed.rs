@@ -55,6 +55,26 @@ pub fn set_fatal_mode(mode: FatalMode) {
 /// doc for the thread-lifetime contract every method here assumes.
 pub struct VmHandle {
     vm: VmState,
+    /// The clean idle watermark captured at the top of each `eval`/`exec`/
+    /// `render_fragment`, so a guest-fatal `siglongjmp` — which skips every
+    /// RAII `Drop` between the fault and the recovery point — can restore the
+    /// VM to exactly its pre-doit state. Without it, the aborted doit's frames
+    /// stay on `vm.stack` and its open `HandleScope`s stay in the handle arena,
+    /// and both LEAK AND ACCUMULATE across errors (a workspace of typos slowly
+    /// bloats the stack toward overflow and pins dead objects as GC roots) —
+    /// the "recover into some other state, worse than useless" failure. See
+    /// [`VmHandle::restore_after_guest_fatal`].
+    idle_baseline: IdleBaseline,
+}
+
+/// A snapshot of the VM's clean, between-doits state — see
+/// [`VmHandle::idle_baseline`].
+#[derive(Clone, Copy, Default)]
+struct IdleBaseline {
+    stack_sp: usize,
+    stack_fp: usize,
+    stack_has_frame: bool,
+    arena_len: usize,
 }
 
 /// Releases this thread's `sigsetjmp` recovery slot when the handle is
@@ -310,7 +330,10 @@ impl VmHandle {
         if let Err(e) = frontend::world::load_world(&mut vm, world_dir) {
             return Err(VmError { msg: e.to_string() });
         }
-        Ok(VmHandle { vm })
+        Ok(VmHandle {
+            vm,
+            idle_baseline: IdleBaseline::default(),
+        })
     }
 
     /// Boots a bare, genesis-only VM — the built-in classes exist (`Object`,
@@ -327,7 +350,45 @@ impl VmHandle {
         deopt_trap::arm_foreign_fault_handler();
         VmHandle {
             vm: VmState::with_options(opts),
+            idle_baseline: IdleBaseline::default(),
         }
+    }
+
+    /// Snapshot the VM's clean, between-doits watermark — call on the
+    /// initial (`rc == 0`) pass of every `sigsetjmp`-guarded entry, before any
+    /// guest code runs. Its partner [`restore_after_guest_fatal`] rewinds to it
+    /// if the doit aborts. Stored in `self` (not a `sigsetjmp`-frame local), so
+    /// it survives the `siglongjmp` that clobbers such locals.
+    #[inline]
+    fn snapshot_idle_baseline(&mut self) {
+        self.idle_baseline = IdleBaseline {
+            stack_sp: self.vm.stack.sp,
+            stack_fp: self.vm.stack.fp,
+            stack_has_frame: self.vm.stack.has_frame(),
+            arena_len: self.vm.handle_arena.len(),
+        };
+    }
+
+    /// Rewind the VM to the last [`snapshot_idle_baseline`] after a guest-fatal
+    /// `siglongjmp` landed on the recovery branch. The jump skipped every RAII
+    /// `Drop` between the fault and here, so three things the aborted doit left
+    /// behind must be reclaimed by hand or they leak AND accumulate across
+    /// errors: its abandoned frames on `vm.stack`, its still-open `HandleScope`s
+    /// in the handle arena (permanent GC roots otherwise), and any `Cocoa
+    /// poolDo:` mint-list scope. This is what makes a recovered VM genuinely
+    /// return to its ready state rather than limp on in "some other state."
+    #[inline]
+    fn restore_after_guest_fatal(&mut self) {
+        let b = self.idle_baseline;
+        self.vm
+            .stack
+            .restore_baseline(b.stack_sp, b.stack_fp, b.stack_has_frame);
+        self.vm.handle_arena.reset_to(b.arena_len);
+        // A `poolDo:` that died left its mint-list scope open — from then on
+        // every wrapper minted anywhere would append to a stale rooted list
+        // forever (the C4 review's poisoned-machinery finding). A pool scope is
+        // lexical and can never legitimately span doits.
+        self.vm.cocoa_mint_stack.clear();
     }
 
     /// Compiles `source` as a single top-level item (SPEC §16.2: "compile as
@@ -373,14 +434,11 @@ impl VmHandle {
             let message = deopt_trap::take_last_guest_fatal_message().expect(
                 "sigsetjmp returned GUEST_FATAL_JMP_VAL without a recorded guest-fatal message",
             );
-            // A doit that died inside a `Cocoa poolDo:` left its mint-list
-            // scope open — from then on EVERY wrapper minted anywhere would
-            // append to a stale rooted list forever (the C4 review's
-            // poisoned-machinery finding). A pool scope is lexical and can
-            // never legitimately span doits, so a surviving VM clears the
-            // stack here. (The abandoned lists' wrappers leak their +1 —
-            // leak-side, as always.)
-            self.vm.cocoa_mint_stack.clear();
+            // Rewind the VM to its pre-doit idle state: the `siglongjmp` that
+            // aborted this doit skipped every RAII cleanup between the fault
+            // and here, so its frames/handle-scopes/pool-scope must be
+            // reclaimed by hand (see the method) or they leak and accumulate.
+            self.restore_after_guest_fatal();
             return Err(GuestError::RuntimeError(message));
         }
         if rc != 0 {
@@ -389,6 +447,9 @@ impl VmHandle {
             return Err(GuestError::NativeFault { sig, pc, far });
         }
 
+        // Capture the clean watermark before any guest code runs, so a
+        // guest-fatal abort can rewind to exactly here (`restore_after_guest_fatal`).
+        self.snapshot_idle_baseline();
         let item = match frontend::parser::parse_one_top_item(source) {
             Ok(Some(item)) => item,
             Ok(None) => return Ok(String::new()),
@@ -423,14 +484,11 @@ impl VmHandle {
             let message = deopt_trap::take_last_guest_fatal_message().expect(
                 "sigsetjmp returned GUEST_FATAL_JMP_VAL without a recorded guest-fatal message",
             );
-            // A doit that died inside a `Cocoa poolDo:` left its mint-list
-            // scope open — from then on EVERY wrapper minted anywhere would
-            // append to a stale rooted list forever (the C4 review's
-            // poisoned-machinery finding). A pool scope is lexical and can
-            // never legitimately span doits, so a surviving VM clears the
-            // stack here. (The abandoned lists' wrappers leak their +1 —
-            // leak-side, as always.)
-            self.vm.cocoa_mint_stack.clear();
+            // Rewind the VM to its pre-doit idle state: the `siglongjmp` that
+            // aborted this doit skipped every RAII cleanup between the fault
+            // and here, so its frames/handle-scopes/pool-scope must be
+            // reclaimed by hand (see the method) or they leak and accumulate.
+            self.restore_after_guest_fatal();
             return Err(GuestError::RuntimeError(message));
         }
         if rc != 0 {
@@ -438,6 +496,9 @@ impl VmHandle {
                 .expect("sigsetjmp returned nonzero without a recorded crash");
             return Err(GuestError::NativeFault { sig, pc, far });
         }
+        // Capture the clean watermark before any guest code runs, so a
+        // guest-fatal abort can rewind to exactly here (`restore_after_guest_fatal`).
+        self.snapshot_idle_baseline();
         let item = match frontend::parser::parse_one_top_item(source) {
             Ok(Some(item)) => item,
             Ok(None) => return Ok(()),
@@ -481,14 +542,11 @@ impl VmHandle {
             let message = deopt_trap::take_last_guest_fatal_message().expect(
                 "sigsetjmp returned GUEST_FATAL_JMP_VAL without a recorded guest-fatal message",
             );
-            // A doit that died inside a `Cocoa poolDo:` left its mint-list
-            // scope open — from then on EVERY wrapper minted anywhere would
-            // append to a stale rooted list forever (the C4 review's
-            // poisoned-machinery finding). A pool scope is lexical and can
-            // never legitimately span doits, so a surviving VM clears the
-            // stack here. (The abandoned lists' wrappers leak their +1 —
-            // leak-side, as always.)
-            self.vm.cocoa_mint_stack.clear();
+            // Rewind the VM to its pre-doit idle state: the `siglongjmp` that
+            // aborted this doit skipped every RAII cleanup between the fault
+            // and here, so its frames/handle-scopes/pool-scope must be
+            // reclaimed by hand (see the method) or they leak and accumulate.
+            self.restore_after_guest_fatal();
             return Err(GuestError::RuntimeError(message));
         }
         if rc != 0 {
@@ -496,6 +554,9 @@ impl VmHandle {
                 .expect("sigsetjmp returned nonzero without a recorded crash");
             return Err(GuestError::NativeFault { sig, pc, far });
         }
+        // Capture the clean watermark before any guest code runs, so a
+        // guest-fatal abort can rewind to exactly here (`restore_after_guest_fatal`).
+        self.snapshot_idle_baseline();
         let item = match frontend::parser::parse_one_top_item(&source) {
             Ok(Some(item)) => item,
             Ok(None) => return Ok(String::new()),
@@ -541,14 +602,11 @@ impl VmHandle {
             let message = deopt_trap::take_last_guest_fatal_message().expect(
                 "sigsetjmp returned GUEST_FATAL_JMP_VAL without a recorded guest-fatal message",
             );
-            // A doit that died inside a `Cocoa poolDo:` left its mint-list
-            // scope open — from then on EVERY wrapper minted anywhere would
-            // append to a stale rooted list forever (the C4 review's
-            // poisoned-machinery finding). A pool scope is lexical and can
-            // never legitimately span doits, so a surviving VM clears the
-            // stack here. (The abandoned lists' wrappers leak their +1 —
-            // leak-side, as always.)
-            self.vm.cocoa_mint_stack.clear();
+            // Rewind the VM to its pre-doit idle state: the `siglongjmp` that
+            // aborted this doit skipped every RAII cleanup between the fault
+            // and here, so its frames/handle-scopes/pool-scope must be
+            // reclaimed by hand (see the method) or they leak and accumulate.
+            self.restore_after_guest_fatal();
             return Err(GuestError::RuntimeError(message));
         }
         if rc != 0 {
@@ -556,6 +614,9 @@ impl VmHandle {
                 .expect("sigsetjmp returned nonzero without a recorded crash");
             return Err(GuestError::NativeFault { sig, pc, far });
         }
+        // Capture the clean watermark before any guest code runs, so a
+        // guest-fatal abort can rewind to exactly here (`restore_after_guest_fatal`).
+        self.snapshot_idle_baseline();
         let item = match frontend::parser::parse_one_top_item(&source) {
             Ok(Some(item)) => item,
             Ok(None) => return Ok(None),
@@ -588,14 +649,11 @@ impl VmHandle {
             let message = deopt_trap::take_last_guest_fatal_message().expect(
                 "sigsetjmp returned GUEST_FATAL_JMP_VAL without a recorded guest-fatal message",
             );
-            // A doit that died inside a `Cocoa poolDo:` left its mint-list
-            // scope open — from then on EVERY wrapper minted anywhere would
-            // append to a stale rooted list forever (the C4 review's
-            // poisoned-machinery finding). A pool scope is lexical and can
-            // never legitimately span doits, so a surviving VM clears the
-            // stack here. (The abandoned lists' wrappers leak their +1 —
-            // leak-side, as always.)
-            self.vm.cocoa_mint_stack.clear();
+            // Rewind the VM to its pre-doit idle state: the `siglongjmp` that
+            // aborted this doit skipped every RAII cleanup between the fault
+            // and here, so its frames/handle-scopes/pool-scope must be
+            // reclaimed by hand (see the method) or they leak and accumulate.
+            self.restore_after_guest_fatal();
             return Err(GuestError::RuntimeError(message));
         }
         if rc != 0 {
@@ -603,6 +661,9 @@ impl VmHandle {
                 .expect("sigsetjmp returned nonzero without a recorded crash");
             return Err(GuestError::NativeFault { sig, pc, far });
         }
+        // Capture the clean watermark before any guest code runs, so a
+        // guest-fatal abort can rewind to exactly here (`restore_after_guest_fatal`).
+        self.snapshot_idle_baseline();
         let item = match frontend::parser::parse_one_top_item(&source) {
             Ok(Some(item)) => item,
             Ok(None) => return Ok(String::new()),
@@ -635,14 +696,11 @@ impl VmHandle {
             let message = deopt_trap::take_last_guest_fatal_message().expect(
                 "sigsetjmp returned GUEST_FATAL_JMP_VAL without a recorded guest-fatal message",
             );
-            // A doit that died inside a `Cocoa poolDo:` left its mint-list
-            // scope open — from then on EVERY wrapper minted anywhere would
-            // append to a stale rooted list forever (the C4 review's
-            // poisoned-machinery finding). A pool scope is lexical and can
-            // never legitimately span doits, so a surviving VM clears the
-            // stack here. (The abandoned lists' wrappers leak their +1 —
-            // leak-side, as always.)
-            self.vm.cocoa_mint_stack.clear();
+            // Rewind the VM to its pre-doit idle state: the `siglongjmp` that
+            // aborted this doit skipped every RAII cleanup between the fault
+            // and here, so its frames/handle-scopes/pool-scope must be
+            // reclaimed by hand (see the method) or they leak and accumulate.
+            self.restore_after_guest_fatal();
             return Err(GuestError::RuntimeError(message));
         }
         if rc != 0 {
@@ -650,6 +708,9 @@ impl VmHandle {
                 .expect("sigsetjmp returned nonzero without a recorded crash");
             return Err(GuestError::NativeFault { sig, pc, far });
         }
+        // Capture the clean watermark before any guest code runs, so a
+        // guest-fatal abort can rewind to exactly here (`restore_after_guest_fatal`).
+        self.snapshot_idle_baseline();
         let item = match frontend::parser::parse_one_top_item(&source) {
             Ok(Some(item)) => item,
             Ok(None) => return Ok(Vec::new()),
@@ -3335,6 +3396,60 @@ mod tests {
     /// `VmHandle` keeps serving requests afterward — the second half is
     /// the one that actually matters; a DNU that merely fails to crash but
     /// leaves the VM unusable wouldn't be a real fix.
+    /// The recovery must return the VM to its CLEAN idle state — not merely
+    /// leave it "usable enough" to compute `6 * 7`. A guest-fatal `siglongjmp`
+    /// skips every RAII `Drop`, so without `restore_after_guest_fatal` the
+    /// aborted doit's frames stay on `vm.stack` and its open `HandleScope`s
+    /// stay in the handle arena, and both LEAK AND ACCUMULATE across errors
+    /// (measured: stack 0 -> 60 -> 79 slots, arena 0 -> 1 -> 2, per error).
+    /// This pins the invariant the "recover into its VMapp or die" rule
+    /// demands: after any recovered error the stack and arena are byte-for-byte
+    /// back at the between-doits baseline, no matter how many errors fire.
+    #[test]
+    fn eval_recovers_to_a_clean_stack_and_arena_without_accumulating() {
+        for jit in [JitMode::Off, JitMode::Threshold(1)] {
+            let mut vm = boot_test_vm(jit);
+            // The clean baseline: a normal doit, then read the idle watermark.
+            vm.eval("3 + 4.").unwrap();
+            let base_sp = vm.vm.stack.sp;
+            let base_frame = vm.vm.stack.has_frame();
+            let base_arena = vm.vm.handle_arena.len();
+
+            // Fire a mix of erroring doits, several times over, checking after
+            // each that the VM snapped back to the exact idle baseline.
+            let bombs = [
+                "3 thisSelectorDoesNotExistAnywhereInTheBaseWorld.",
+                "(1 to: 5) inject: 0 into: [:a :b | a nope: b].",
+                "nil foo.",
+                "self error: 'boom'.",
+            ];
+            for round in 0..3 {
+                for bomb in &bombs {
+                    let _ = vm.eval(bomb); // Err expected; the point is the state after
+                    assert_eq!(
+                        vm.vm.stack.sp, base_sp,
+                        "jit={jit:?} round={round} bomb={bomb:?}: stack sp leaked \
+                         ({} vs base {base_sp})",
+                        vm.vm.stack.sp
+                    );
+                    assert_eq!(
+                        vm.vm.stack.has_frame(), base_frame,
+                        "jit={jit:?} bomb={bomb:?}: a frame was left active after recovery"
+                    );
+                    assert_eq!(
+                        vm.vm.handle_arena.len(), base_arena,
+                        "jit={jit:?} round={round} bomb={bomb:?}: handle arena leaked \
+                         ({} vs base {base_arena})",
+                        vm.vm.handle_arena.len()
+                    );
+                }
+            }
+
+            // And the VM is genuinely healthy afterward, not just clean-looking.
+            assert_eq!(vm.eval("6 * 7.").unwrap(), "42");
+        }
+    }
+
     #[test]
     fn eval_dnu_recovers_as_runtime_error_and_vm_stays_usable() {
         let mut vm = boot_test_vm(JitMode::Off);
