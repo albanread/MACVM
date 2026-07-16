@@ -10,6 +10,7 @@
 
 mod browser_render;
 mod canvas_render;
+mod editor_render;
 mod game_pane;
 mod objc;
 mod preprocess;
@@ -484,6 +485,13 @@ fn navigate_to(path: &Path) -> bool {
         display_class_outliner();
         return true;
     }
+    if path == editor_view_marker() {
+        // Rebuild the editor picker (empty buffer). A specific class is
+        // loaded via the `editorOpen` post, not the marker, so back/forward
+        // to the editor always lands on the picker — fine for M0.
+        display_editor(None);
+        return true;
+    }
     if path == game_view_marker() {
         // Swap the native Metal game pane in as the window content view and
         // render a frame — not HTML into the WKWebView (see `game_pane.rs`).
@@ -567,6 +575,58 @@ fn open_workspace() {
         nav.lock().unwrap().go(workspace_view_marker());
     }
     display_workspace();
+}
+
+/// The Smalltalk text editor (`docs/editor_design.md`, the toolbar's
+/// `texteditor` icon). M0: pick a class, see its whole source rendered from
+/// the image (`Image::class_source`) as read-only text. Later milestones make
+/// it editable, syntax-checked, and backed by a per-document worker VM.
+fn editor_view_marker() -> PathBuf {
+    gui_root().join(".editor-view")
+}
+
+/// The image the editor reads class text from — same resolution the boot path
+/// uses (`MACVM_IMAGE_PATH`, else `<world>/image.sqlite3`). The GUI keeps no
+/// global world dir on the main thread, so this mirrors the boot default.
+fn editor_image_path() -> PathBuf {
+    std::env::var_os("MACVM_IMAGE_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("world").join("image.sqlite3"))
+}
+
+fn open_editor() {
+    if let Some(nav) = NAV.get() {
+        nav.lock().unwrap().go(editor_view_marker());
+    }
+    display_editor(None);
+}
+
+/// Render the editor page. `class_name = None` shows the picker with an empty
+/// buffer; `Some(name)` renders that class's source (read-only in M0). The
+/// body itself is built by the pure, unit-tested `editor_render` module; this
+/// function is just the image read plus the Objective-C display.
+fn display_editor(class_name: Option<&str>) {
+    let image = image_store::Image::open(&editor_image_path()).ok();
+    let class_names = image
+        .as_ref()
+        .and_then(|img| img.class_names().ok())
+        .unwrap_or_default();
+    let source = class_name.and_then(|name| {
+        image
+            .as_ref()
+            .and_then(|img| img.class_source(name).ok().flatten())
+    });
+    let (current, source) = editor_render::buffer_for(class_name, source);
+    let body = editor_render::render_editor(&class_names, &current, &source);
+    let html = preprocess::render_generated_page(
+        "Text Editor",
+        &body,
+        &gui_root(),
+        current_theme(),
+        current_font_scale_percent(),
+        &current_transcript(),
+    );
+    display_html(&html);
 }
 
 /// The "User hierarchy" toolbar button (`preprocess::TOOLBAR_BUTTONS`) — a
@@ -1281,6 +1341,7 @@ fn navigate_toolbar(button: &str) {
         "senders" => open_find("senders"),
         "hierarchy" => open_class_browser(),
         "workspace" => open_workspace(),
+        "editor" => open_editor(),
         "canvas" => open_canvas(),
         "gamePane" => open_game_pane(),
         "refresh" => reload_current_page(),
@@ -1597,6 +1658,13 @@ extern "C" fn on_script_message(_this: Id, _cmd: Sel, _controller: Id, message: 
                     tool: dict_get_string(body, "tool"),
                 });
             }
+        }
+        "editorOpen" => {
+            // The editor's class picker fired (Enter on a class name). Rebuild
+            // the page with that class's source. Pure main-thread image read —
+            // no VM round trip, same as the find/inject-method-sources path.
+            let name = dict_get_string(body, "class");
+            display_editor(if name.is_empty() { None } else { Some(&name) });
         }
         _ => {}
     }

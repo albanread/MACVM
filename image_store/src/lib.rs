@@ -411,6 +411,66 @@ impl Image {
         rows.collect()
     }
 
+    /// One class at its latest version, or `None` if unknown/deleted — the
+    /// single-class companion to [`all_classes`].
+    pub fn class_named(&self, class_name: &str) -> rusqlite::Result<Option<FullClass>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT c.name, lcv.superclass_name, lcv.category, lcv.comment, lcv.instance_vars, lcv.class_vars, c.load_order \
+             FROM classes c JOIN latest_class_versions lcv ON lcv.class_id = c.class_id \
+             WHERE c.name = ?1 AND lcv.deleted = 0",
+        )?;
+        let mut rows = stmt.query_map(params![class_name], |r| {
+            Ok(FullClass {
+                name: r.get(0)?,
+                superclass: r.get(1)?,
+                category: r.get(2)?,
+                comment: r.get(3)?,
+                instance_vars: r.get(4)?,
+                class_vars: r.get(5)?,
+                load_order: r.get(6)?,
+            })
+        })?;
+        rows.next().transpose()
+    }
+
+    /// The whole class rendered as one `.mst` text block — the text editor's
+    /// fetch (`docs/editor_design.md` §5). `None` if the class is unknown.
+    ///
+    /// This is deliberately [`export::class_block`] itself, not a second
+    /// renderer: what the editor shows is exactly what the exporter would
+    /// write, and — the property the accept path depends on — a re-parse of
+    /// this text yields each method's stored source *verbatim*, so opening a
+    /// class and accepting it unchanged is a no-op rather than a churn of
+    /// version bumps. (That idempotence is `class_block`'s own documented
+    /// contract; `editor_class_source_round_trips` pins it for every class in
+    /// the image.)
+    ///
+    /// Two things are deliberately NOT in the rendering, because
+    /// `class_block` does not emit them: the class **comment** and per-method
+    /// **categories**. They are therefore neither shown nor editable here —
+    /// and, since an accept only writes back what the text contains, they are
+    /// never clobbered either. A comment-aware round trip would need a
+    /// renderer/parser pair that agree on where a comment lives; that is not
+    /// this.
+    pub fn class_source(&self, class_name: &str) -> rusqlite::Result<Option<String>> {
+        let Some(class) = self.class_named(class_name)? else {
+            return Ok(None);
+        };
+        let sources: Vec<String> = self
+            .all_methods_of(class_name)?
+            .into_iter()
+            .map(|m| m.source)
+            .collect();
+        Ok(Some(crate::export::class_block(
+            class.superclass.as_deref().unwrap_or("Object"),
+            &class.name,
+            &class.instance_vars,
+            &class.class_vars,
+            &sources,
+            true,
+        )))
+    }
+
     /// Every method (both sides, every category) belonging to `class_name`,
     /// at its latest version — the per-class companion to [`all_classes`].
     pub fn all_methods_of(&self, class_name: &str) -> rusqlite::Result<Vec<FullMethod>> {
@@ -1582,5 +1642,83 @@ mod tests {
         );
         assert!(img.packages().unwrap().contains(&"Collections".to_string()));
         assert!(!img.set_class_definition("Nonexistent", None, "").unwrap());
+    }
+
+    #[test]
+    fn class_named_reads_one_class_or_none() {
+        let img = seeded();
+        let c = img.class_named("Collection").unwrap().expect("live class");
+        assert_eq!(c.superclass.as_deref(), Some("Object"));
+        assert_eq!(c.category, "Collections");
+        assert!(img.class_named("Nonexistent").unwrap().is_none());
+    }
+
+    /// The text editor's fetch contract (`docs/editor_design.md` §5): the
+    /// rendered class must PARSE BACK to exactly the method sources the image
+    /// holds. This is what makes "open a class and accept it unchanged" a
+    /// no-op instead of a churn of version bumps — the accept path diffs
+    /// parsed-vs-stored, so any drift here would rewrite every method on every
+    /// accept, invalidating every nmethod and polluting the version history.
+    #[test]
+    fn class_source_round_trips_through_the_parser() {
+        // Real MACVM `.mst` shape — a BRACKETED method body, indented and
+        // captured verbatim, exactly as `import_world_dir` stores it (a real
+        // one from the image: `escapeAtRe: cr im: ci [\n        | zr .. |\n
+        // ..\n    ]`). The `seeded()` fixture's bare `selector\n\tbody` form
+        // is Squeak chunk format and is not a shape this world ever holds, so
+        // it cannot exercise the round trip.
+        let img = Image::open_in_memory().unwrap();
+        let lo = img.next_load_order().unwrap();
+        img.add_class("Object", None, "Kernel", "The root.", "", "", lo)
+            .unwrap();
+        let lo = img.next_load_order().unwrap();
+        img.add_class("Collection", Some("Object"), "Collections", "Abstract.", "", "", lo)
+            .unwrap();
+        img.add_method(
+            "Collection",
+            Side::Instance,
+            "do:",
+            "enumerating",
+            "do: aBlock [\n        \"iterate — a comment with a ] bracket\"\n        ^self subclassResponsibility\n    ]",
+        )
+        .unwrap();
+        img.add_method(
+            "Collection",
+            Side::Class,
+            "new:",
+            "instance creation",
+            "Collection class >> new: n [\n        ^self basicNew\n    ]",
+        )
+        .unwrap();
+        img.set_class_definition("Collection", Some("Object"), "elements size")
+            .unwrap();
+
+        let text = img.class_source("Collection").unwrap().expect("live class");
+        let parsed = crate::mst::parse_mst_source(&text);
+        assert_eq!(parsed.len(), 1, "one class block, got: {text}");
+        let pc = &parsed[0];
+        assert_eq!(pc.name, "Collection");
+        assert_eq!(pc.superclass.as_deref(), Some("Object"));
+
+        // Every stored method reappears with a BYTE-IDENTICAL source.
+        for stored in img.all_methods_of("Collection").unwrap() {
+            let want_class_side = stored.side == Side::Class;
+            let got = pc
+                .methods
+                .iter()
+                .find(|m| m.selector == stored.selector && m.is_class_side == want_class_side)
+                .unwrap_or_else(|| panic!("{} missing from:\n{text}", stored.selector));
+            assert_eq!(
+                got.source, stored.source,
+                "{} did not round-trip", stored.selector
+            );
+        }
+        assert_eq!(
+            pc.methods.len(),
+            img.all_methods_of("Collection").unwrap().len(),
+            "no extra or dropped methods"
+        );
+
+        assert!(img.class_source("Nonexistent").unwrap().is_none());
     }
 }

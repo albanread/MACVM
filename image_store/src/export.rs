@@ -66,7 +66,7 @@ fn remove_block(text: &str, source: &str) -> Option<String> {
 /// A `Super subclass: Name [ … ]` block for the additions file or a home-file
 /// reopening. `with_header` includes the class's ivars/classVars (a brand-new
 /// class needs them; a reopening that only adds methods doesn't).
-fn class_block(
+pub(crate) fn class_block(
     superclass: &str,
     name: &str,
     instance_vars: &str,

@@ -600,6 +600,23 @@
     true
   );
 
+  // Text editor (docs/editor_design.md): Enter in the class picker loads that
+  // class's source. The whole page is rebuilt server-side by display_editor
+  // (main.rs) — a pure image read, no VM round trip — so this just posts the
+  // chosen name, same shape as the find box above.
+  document.addEventListener(
+    "keydown",
+    function (ev) {
+      const input = ev.target.closest(".st-editor-class");
+      if (!input) return;
+      if (ev.key === "Enter") {
+        ev.preventDefault();
+        post({ kind: "editorOpen", class: input.value.trim() });
+      }
+    },
+    true
+  );
+
   // vm_host::VmResponse::FindResults arrives here (main.rs). Fill the results
   // container (keeping its data-widget-id so a result click can drill).
   window.macvmSetFindResults = function (html) {

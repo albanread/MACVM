@@ -646,6 +646,18 @@ fn chrome_layout_style() -> String {
      .st-add-node > .st-header { opacity: 0.7; font-style: italic; }\
      .st-smappl-codeview { height: 15em; width: 100%; }\
      #macvm-toolbar button { color: inherit; }\
+     .st-editor-class { display: block; width: 100%; max-width: 32em; margin: 0 0 8px 0; \
+       box-sizing: border-box; padding: 4px 6px; \
+       font-family: var(--st-font-widget, sans-serif); font-size: 13px; \
+       background: var(--st-background, #fff); color: var(--st-foreground, #000); \
+       border: 1px solid var(--st-gray, #808080); }\
+     .st-editor-buffer { display: block; width: 100%; box-sizing: border-box; \
+       min-height: 60vh; resize: vertical; padding: 8px; white-space: pre; \
+       tab-size: 4; overflow: auto; \
+       font-family: var(--st-font-code, ui-monospace, monospace); font-size: 13px; \
+       line-height: 1.4; background: var(--st-background, #fff); \
+       color: var(--st-foreground, #000); border: 1px solid var(--st-gray, #808080); }\
+     .st-editor-buffer[readonly] { opacity: 0.92; }\
      .st-ico { display: inline-block; width: 24px; height: 24px; background-color: currentColor; \
        -webkit-mask-repeat: no-repeat; -webkit-mask-position: center; -webkit-mask-size: contain; \
        mask-repeat: no-repeat; mask-position: center; mask-size: contain; vertical-align: middle; }\
