@@ -65,6 +65,9 @@ pub struct VmHandle {
     /// the "recover into some other state, worse than useless" failure. See
     /// [`VmHandle::restore_after_guest_fatal`].
     idle_baseline: IdleBaseline,
+    /// What to do when guest code raises an unhandled error — see
+    /// [`ErrorPolicy`]. Default [`ErrorPolicy::Resume`].
+    error_policy: ErrorPolicy,
 }
 
 /// A snapshot of the VM's clean, between-doits state — see
@@ -134,6 +137,37 @@ impl std::fmt::Display for GuestError {
 }
 
 impl std::error::Error for GuestError {}
+
+/// What a VM does when guest code raises an unhandled error — an unhandled DNU
+/// or an explicit `self error:` (NOT a compile error, and NOT a VM-fatal
+/// condition like heap exhaustion, which always terminates via `fatal_exit`).
+/// Set per-VM with [`VmHandle::set_error_policy`]; the default is [`Resume`].
+///
+/// [`Resume`]: ErrorPolicy::Resume
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ErrorPolicy {
+    /// Recover in-thread: abort the doit, rewind the VM to its clean idle
+    /// baseline ([`VmHandle::restore_after_guest_fatal`]), and hand the error
+    /// back as `Err(GuestError::RuntimeError)`. The VM stays alive and ready
+    /// for the next doit. The right choice for anything interactive and
+    /// long-lived — a REPL, the GUI Workspace, the editor — where a typo must
+    /// never restart the VM. This is what a plain `doesNotUnderstand:` is in
+    /// real Smalltalk: recoverable.
+    #[default]
+    Resume,
+    /// Terminate the worker on any unhandled guest error, exactly as a VM-fatal
+    /// condition does: [`crate::runtime::vm_state::fatal_exit`] — a
+    /// `pthread_exit` under [`FatalMode::ExitThread`], so a supervisor
+    /// (`gui::vm_host`) respawns a fresh VM, or a `process::exit` under
+    /// `ExitProcess`. For **throwaway / pooled compute workers**, where a
+    /// guaranteed-fresh VM after a failed job is safer and simpler than reusing
+    /// a recovered one. The error is already on the transcript (written by
+    /// `prim_error`/`dnu_fallback` before the unwind), so nothing is lost by
+    /// not returning it. Only meaningful with `FatalMode::ExitThread`: pairing
+    /// `Die` with `ExitProcess` exits the whole process on a guest typo, which
+    /// is never what an interactive host wants.
+    Die,
+}
 
 /// Where `Transcript show:`/`printOnStdout:` output goes (SPEC §16.2).
 /// `Send` because the GUI's sink hands output across the worker-to-main-
@@ -333,6 +367,7 @@ impl VmHandle {
         Ok(VmHandle {
             vm,
             idle_baseline: IdleBaseline::default(),
+            error_policy: ErrorPolicy::default(),
         })
     }
 
@@ -351,6 +386,7 @@ impl VmHandle {
         VmHandle {
             vm: VmState::with_options(opts),
             idle_baseline: IdleBaseline::default(),
+            error_policy: ErrorPolicy::default(),
         }
     }
 
@@ -367,6 +403,41 @@ impl VmHandle {
             stack_has_frame: self.vm.stack.has_frame(),
             arena_len: self.vm.handle_arena.len(),
         };
+    }
+
+    /// Set this VM's [`ErrorPolicy`] — how it responds when guest code raises
+    /// an unhandled error (a DNU or `self error:`). Default
+    /// [`ErrorPolicy::Resume`]. Call after boot, before serving requests; a
+    /// throwaway/pooled compute worker sets [`ErrorPolicy::Die`] so a failed
+    /// job terminates it (and the supervisor respawns a fresh VM) instead of
+    /// recovering the current one.
+    pub fn set_error_policy(&mut self, policy: ErrorPolicy) {
+        self.error_policy = policy;
+    }
+
+    /// This VM's current [`ErrorPolicy`].
+    pub fn error_policy(&self) -> ErrorPolicy {
+        self.error_policy
+    }
+
+    /// The decision at a guest-fatal recovery point, applying [`ErrorPolicy`].
+    /// Under [`ErrorPolicy::Resume`] it rewinds to the clean idle baseline and
+    /// yields the error to return as `Err`. Under [`ErrorPolicy::Die`] it never
+    /// returns: the error is already on the transcript (written before the
+    /// unwind), so it terminates the worker via `fatal_exit` — `pthread_exit`
+    /// under `FatalMode::ExitThread`, letting the supervisor respawn a fresh
+    /// VM. The `siglongjmp` that landed us here already did the hard part
+    /// (unwinding safely out of deep JIT/guest frames to this Rust frame), so
+    /// even the `Die` path terminates from a clean, ordinary call site.
+    #[inline]
+    fn handle_guest_fatal(&mut self, message: String) -> GuestError {
+        match self.error_policy {
+            ErrorPolicy::Resume => {
+                self.restore_after_guest_fatal();
+                GuestError::RuntimeError(message)
+            }
+            ErrorPolicy::Die => crate::runtime::vm_state::fatal_exit(1),
+        }
     }
 
     /// Rewind the VM to the last [`snapshot_idle_baseline`] after a guest-fatal
@@ -434,12 +505,10 @@ impl VmHandle {
             let message = deopt_trap::take_last_guest_fatal_message().expect(
                 "sigsetjmp returned GUEST_FATAL_JMP_VAL without a recorded guest-fatal message",
             );
-            // Rewind the VM to its pre-doit idle state: the `siglongjmp` that
-            // aborted this doit skipped every RAII cleanup between the fault
-            // and here, so its frames/handle-scopes/pool-scope must be
-            // reclaimed by hand (see the method) or they leak and accumulate.
-            self.restore_after_guest_fatal();
-            return Err(GuestError::RuntimeError(message));
+            // Apply this VM's error policy: Resume rewinds to the clean idle
+            // baseline and returns the error; Die terminates the worker (the
+            // message is already on the transcript). See `handle_guest_fatal`.
+            return Err(self.handle_guest_fatal(message));
         }
         if rc != 0 {
             let (sig, pc, far) = deopt_trap::take_last_crash_info()
@@ -484,12 +553,10 @@ impl VmHandle {
             let message = deopt_trap::take_last_guest_fatal_message().expect(
                 "sigsetjmp returned GUEST_FATAL_JMP_VAL without a recorded guest-fatal message",
             );
-            // Rewind the VM to its pre-doit idle state: the `siglongjmp` that
-            // aborted this doit skipped every RAII cleanup between the fault
-            // and here, so its frames/handle-scopes/pool-scope must be
-            // reclaimed by hand (see the method) or they leak and accumulate.
-            self.restore_after_guest_fatal();
-            return Err(GuestError::RuntimeError(message));
+            // Apply this VM's error policy: Resume rewinds to the clean idle
+            // baseline and returns the error; Die terminates the worker (the
+            // message is already on the transcript). See `handle_guest_fatal`.
+            return Err(self.handle_guest_fatal(message));
         }
         if rc != 0 {
             let (sig, pc, far) = deopt_trap::take_last_crash_info()
@@ -542,12 +609,10 @@ impl VmHandle {
             let message = deopt_trap::take_last_guest_fatal_message().expect(
                 "sigsetjmp returned GUEST_FATAL_JMP_VAL without a recorded guest-fatal message",
             );
-            // Rewind the VM to its pre-doit idle state: the `siglongjmp` that
-            // aborted this doit skipped every RAII cleanup between the fault
-            // and here, so its frames/handle-scopes/pool-scope must be
-            // reclaimed by hand (see the method) or they leak and accumulate.
-            self.restore_after_guest_fatal();
-            return Err(GuestError::RuntimeError(message));
+            // Apply this VM's error policy: Resume rewinds to the clean idle
+            // baseline and returns the error; Die terminates the worker (the
+            // message is already on the transcript). See `handle_guest_fatal`.
+            return Err(self.handle_guest_fatal(message));
         }
         if rc != 0 {
             let (sig, pc, far) = deopt_trap::take_last_crash_info()
@@ -602,12 +667,10 @@ impl VmHandle {
             let message = deopt_trap::take_last_guest_fatal_message().expect(
                 "sigsetjmp returned GUEST_FATAL_JMP_VAL without a recorded guest-fatal message",
             );
-            // Rewind the VM to its pre-doit idle state: the `siglongjmp` that
-            // aborted this doit skipped every RAII cleanup between the fault
-            // and here, so its frames/handle-scopes/pool-scope must be
-            // reclaimed by hand (see the method) or they leak and accumulate.
-            self.restore_after_guest_fatal();
-            return Err(GuestError::RuntimeError(message));
+            // Apply this VM's error policy: Resume rewinds to the clean idle
+            // baseline and returns the error; Die terminates the worker (the
+            // message is already on the transcript). See `handle_guest_fatal`.
+            return Err(self.handle_guest_fatal(message));
         }
         if rc != 0 {
             let (sig, pc, far) = deopt_trap::take_last_crash_info()
@@ -649,12 +712,10 @@ impl VmHandle {
             let message = deopt_trap::take_last_guest_fatal_message().expect(
                 "sigsetjmp returned GUEST_FATAL_JMP_VAL without a recorded guest-fatal message",
             );
-            // Rewind the VM to its pre-doit idle state: the `siglongjmp` that
-            // aborted this doit skipped every RAII cleanup between the fault
-            // and here, so its frames/handle-scopes/pool-scope must be
-            // reclaimed by hand (see the method) or they leak and accumulate.
-            self.restore_after_guest_fatal();
-            return Err(GuestError::RuntimeError(message));
+            // Apply this VM's error policy: Resume rewinds to the clean idle
+            // baseline and returns the error; Die terminates the worker (the
+            // message is already on the transcript). See `handle_guest_fatal`.
+            return Err(self.handle_guest_fatal(message));
         }
         if rc != 0 {
             let (sig, pc, far) = deopt_trap::take_last_crash_info()
@@ -696,12 +757,10 @@ impl VmHandle {
             let message = deopt_trap::take_last_guest_fatal_message().expect(
                 "sigsetjmp returned GUEST_FATAL_JMP_VAL without a recorded guest-fatal message",
             );
-            // Rewind the VM to its pre-doit idle state: the `siglongjmp` that
-            // aborted this doit skipped every RAII cleanup between the fault
-            // and here, so its frames/handle-scopes/pool-scope must be
-            // reclaimed by hand (see the method) or they leak and accumulate.
-            self.restore_after_guest_fatal();
-            return Err(GuestError::RuntimeError(message));
+            // Apply this VM's error policy: Resume rewinds to the clean idle
+            // baseline and returns the error; Die terminates the worker (the
+            // message is already on the transcript). See `handle_guest_fatal`.
+            return Err(self.handle_guest_fatal(message));
         }
         if rc != 0 {
             let (sig, pc, far) = deopt_trap::take_last_crash_info()
@@ -3448,6 +3507,56 @@ mod tests {
             // And the VM is genuinely healthy afterward, not just clean-looking.
             assert_eq!(vm.eval("6 * 7.").unwrap(), "42");
         }
+    }
+
+    #[test]
+    fn error_policy_defaults_to_resume_and_round_trips() {
+        let mut vm = boot_test_vm(JitMode::Off);
+        assert_eq!(vm.error_policy(), ErrorPolicy::Resume);
+        vm.set_error_policy(ErrorPolicy::Die);
+        assert_eq!(vm.error_policy(), ErrorPolicy::Die);
+        vm.set_error_policy(ErrorPolicy::Resume);
+        assert_eq!(vm.error_policy(), ErrorPolicy::Resume);
+    }
+
+    /// `ErrorPolicy::Die`: an unhandled guest error must TERMINATE the worker
+    /// (throwaway-worker semantics), not recover it. Run on a dedicated thread
+    /// with `FatalMode::ExitThread` so the `fatal_exit` is a `pthread_exit`
+    /// that kills only that thread — never `process::exit`, which would take
+    /// down the whole test binary. The thread signals "booted" before the
+    /// error and "survived" after; under `Die` the second signal must never
+    /// arrive (the thread is gone). `pthread_exit` runs no destructors, so the
+    /// `Sender` is not dropped either — hence the follow-up is a TIMEOUT, not a
+    /// disconnect. (`Resume`'s opposite behavior — the worker survives and
+    /// stays usable — is covered by the sibling recovery tests.)
+    #[test]
+    fn error_policy_die_terminates_the_worker_on_an_unhandled_error() {
+        use std::sync::mpsc;
+        let (tx, rx) = mpsc::channel::<&'static str>();
+        let _thread = std::thread::spawn(move || {
+            let mut vm = boot_test_vm(JitMode::Off); // VmHandle::boot arms ExitThread
+            vm.set_error_policy(ErrorPolicy::Die);
+            tx.send("booted").unwrap();
+            // A Resume VM returns Err here and continues to the next line; a Die
+            // VM pthread_exits inside this call and never returns.
+            let _ = vm.eval("3 thisSelectorDoesNotExistAnywhereInTheBaseWorld.");
+            let _ = tx.send("survived"); // MUST be unreachable under Die
+        });
+
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(30)).ok(),
+            Some("booted"),
+            "the worker thread must boot and arm before the error"
+        );
+        match rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(msg) => panic!(
+                "ErrorPolicy::Die did not terminate the worker — it ran past the error and sent {msg:?}"
+            ),
+            Err(mpsc::RecvTimeoutError::Timeout)
+            | Err(mpsc::RecvTimeoutError::Disconnected) => { /* worker died: correct */ }
+        }
+        // Do NOT join `_thread`: a pthread_exited thread can't be joined
+        // (JoinHandle::join would panic — see fatal_exit's own doc).
     }
 
     #[test]
