@@ -242,6 +242,21 @@ fn decode_fp_scalar(word: u32) -> Option<String> {
         let imm = ((word >> 10) & 0xFFF) * 8;
         return Some(format!("str d{rd}, [x{rn}, #{imm}]"));
     }
+    // FP scalar stur/ldur, 64-bit UNSCALED imm9: 0xFC00/0xFC40, idx(11:10)=00.
+    // Every float spill/reload is one of these — a frame slot is at a negative
+    // offset from x29, which only the unscaled form can express. `decode_ldst`
+    // deliberately rejects V=1 and handles the GP family only, so without these
+    // two arms an entire float method's spill traffic reads as bare `.word`s.
+    // (Mask covers bits 31:21 + the 11:10 index field, so the pre/post-index
+    // forms — which emit never generates for FP — correctly fall through.)
+    if word & 0xFFE0_0C00 == 0xFC40_0000 {
+        let off = sext((word >> 12) & 0x1FF, 9);
+        return Some(format!("ldur d{rd}, [x{rn}, #{off}]"));
+    }
+    if word & 0xFFE0_0C00 == 0xFC00_0000 {
+        let off = sext((word >> 12) & 0x1FF, 9);
+        return Some(format!("stur d{rd}, [x{rn}, #{off}]"));
+    }
     None
 }
 
@@ -1002,6 +1017,16 @@ mod tests {
             ("str q16, [x19, #16]", "str q16, [x19, #16]"),
             ("umov x0, v16.d[0]", "umov x0, v16.d[0]"),
             ("umov x1, v16.d[1]", "umov x1, v16.d[1]"),
+            // FP scalar spill traffic (emit::fp_spill_access). A frame slot is
+            // NEGATIVE from x29, so the encoder picks the unscaled STUR/LDUR
+            // form — note the asymmetry these pairs pin down: the vendored
+            // encoder only accepts `ldr`/`str` as the FP mnemonic and chooses
+            // scaled-vs-unscaled from the offset itself, so the input says
+            // `str` and the correct disassembly says `stur`.
+            ("str d16, [x29, #-80]", "stur d16, [x29, #-80]"),
+            ("ldr d8, [x29, #-32]", "ldur d8, [x29, #-32]"),
+            ("str d15, [x29, #-256]", "stur d15, [x29, #-256]"),
+            ("ldr d0, [x16, #0]", "ldr d0, [x16, #0]"),
         ] {
             assert_eq!(disasm_word(asm_word(asm)), expect, "golden for `{asm}`");
         }

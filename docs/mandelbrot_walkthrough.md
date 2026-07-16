@@ -98,27 +98,27 @@ The IR (`MACVM_DBG_IR=escapeAtRe:im:`) shows the result — the sends are gone:
 |---|---|---|
 | `FArith` | 8 | the Double `+ - *` sends, now raw `fadd`/`fsub`/`fmul` on unboxed values |
 | `FConst` | 10 | `0.0`, `2.0`, `4.0` as immediate bit patterns, not pool objects |
-| `FCmpVal` | 1 | `zr2 + zi2 < 4.0` |
-| `SmiCmpVal` | 1 | `n < maxIter` (tag-checked, with a trap edge) |
+| `FCmpBr` | 1 | `zr2 + zi2 < 4.0`, fused straight into the loop's branch (§5.1) |
+| `SmiCmpVal` + `BoolBr` | 1 + 1 | `n < maxIter` — *not* fused, because the inlined `and:` makes its result a phi consumed in another block (§5.2) |
 | `FBox` / `FUnbox` | 4 / 2 | the *only* survivors of boxing — see §5 |
-| `UncommonTrap` | 13 | every guard's fail edge: "the IC was wrong, rebuild an interpreter frame" |
+| `UncommonTrap` | 12 | every guard's fail edge: "the IC was wrong, rebuild an interpreter frame" |
 
 ## 4. The machine code
 
-The loop body is `+0x018c`–`+0x0440`: **174 instructions**, ending in the
-back-edge `b -0x2b4`. The arithmetic the Smalltalk actually asked for is these
+The loop body is `+0x0164`–`+0x0384`: **137 instructions**, ending in the
+back-edge `b -0x220`. The arithmetic the Smalltalk actually asked for is these
 nine:
 
 ```asm
-+0x01a4  fadd  d16, d10, d11     ; zr2 + zi2
-+0x01c8  fcmp  d13, d0           ;        < 4.0
-+0x0290  fmul  d16, d0,  d8      ; 2.0 * zr
-+0x02ac  fmul  d16, d12, d9      ;      * zi
-+0x02e4  fadd  d1,  d14, d0      ;      + ci      → zi
-+0x0310  fsub  d16, d10, d11     ; zr2 - zi2
-+0x0348  fadd  d0,  d15, d1      ;      + cr      → zr
-+0x0374  fmul  d0,  d8,  d8      ; zr * zr        → zr2
-+0x03a0  fmul  d0,  d9,  d9      ; zi * zi        → zi2
++0x0174  fadd  d16, d10, d11     ; zr2 + zi2
++0x0194  fcmp  d13, d0           ;        < 4.0
++0x022c  fmul  d16, d0,  d8      ; 2.0 * zr
++0x0240  fmul  d16, d12, d9      ;      * zi
++0x0274  fadd  d1,  d14, d0      ;      + ci      → zi
++0x0294  fsub  d16, d10, d11     ; zr2 - zi2
++0x02c8  fadd  d0,  d15, d1      ;      + cr      → zr
++0x02e8  fmul  d0,  d8,  d8      ; zr * zr        → zr2
++0x0308  fmul  d0,  d9,  d9      ; zi * zi        → zi2
 ```
 
 Eleven message sends became **nine floating-point instructions**. `zr`, `zi`,
@@ -127,34 +127,41 @@ across the whole loop. There are **no boxes, no allocation, and no calls** in
 the loop body; the one `blr` in range is the safepoint poll, dormant:
 
 ```asm
-+0x03e0  ldr  w16, [x28, #32]    ; the global poll word — 0 in steady state
-+0x03e4  cbz  x16, +0x5c         ; not armed → skip
-+0x03e8  ldr  x16, =stub_poll    ; (armed only when a GC or an invalidation
-+0x03ec  blr  x16                ;  is waiting for this loop to yield)
++0x0344  ldr  w16, [x28, #32]    ; the global poll word — 0 in steady state
++0x0348  cbz  x16, +0x3c         ; not armed → skip
++0x034c  ldr  x16, =stub_poll    ; (armed only when a GC or an invalidation
++0x0350  blr  x16                ;  is waiting for this loop to yield)
 ```
 
 This is the fast-floats result in one screen: allocation per iteration went
 from five Doubles to **zero**, which is why Mandelbrot's render went 746 ms →
 166 ms and its allocation 708 MB → 4 MB.
 
-## 5. Where the other 165 instructions go — read honestly
+## 5. Where the other 128 instructions go — read honestly
 
-Nine of 174 instructions (~5%) are the program. The rest is the cost of being
+Nine of 137 instructions (~7%) are the program. The rest is the cost of being
 a *safe, live, deoptimizable* Smalltalk, and it is worth naming precisely:
 
 | what | count | why it is there | avoidable? |
 |---|---|---|---|
-| `str d …` write-through | 18 | **The deopt tax.** S12 pins every interpreter-visible value in its canonical frame slot at every safepoint, so the GC and the deoptimizer can read a compiled frame with no register maps. Each def writes its slot *and* its register. | Only by giving deopt a register map (`ValueLoc::Register`) — a real design step, sound for non-oop values like these first. |
-| `fmov d…, d…` | 22 | Shuffles between the `d8`–`d15` residents and emit's `d16`/`d17` scratch. | Largely, by computing straight into the resident (the scalar O1 change did this for GPRs; the FP path has not had it yet). |
-| `csel` + `ldr =true/false` | 2 + 8 | **The Boolean round-trip** — see below. | Yes, and cheaply. |
+| `stur`/`str` write-through | 27 | **The deopt tax.** S12 pins every interpreter-visible value in its canonical frame slot at every safepoint, so the GC and the deoptimizer can read a compiled frame with no register maps. Each def writes its slot *and* its register. | Only by giving deopt a register map (`ValueLoc::Register`) — a real design step, sound for non-oop values like these first. **But cost it against §5.1 first.** |
+| `ldur`/`ldr` reloads + pool | 29 | The other half of write-through, plus literal-pool loads. | Partly, same way. |
+| `fmov d…, d…` | 24 | Shuffles between the `d8`–`d15` residents and emit's `d16`/`d17` scratch. | Largely, by computing straight into the resident (the scalar O1 change did this for GPRs; the FP path has not had it yet). Same caveat. |
+| branches | 19 | guard/trap edges, the `and:` merge, the back-edge | Mostly inherent |
+| **FP math** | **9** | **the program** | — |
 | poll | 3 | GC/invalidation liveness | No (2 dormant instructions is already the floor) |
-| trap/guard edges, `n` bookkeeping | rest | smi tag checks, overflow edges, loop counter | Mostly inherent |
+| `csel`, `tst`, `cmp`, `movz/k`, `sub` | rest | smi tag checks, overflow edges, the `and:` phi, loop counter | Mostly inherent |
 
-### The Boolean round-trip — a real, findable gap
+**Do not read that count column as a time budget.** It is a census of *space*.
+§5.1 measured the conversion rate between the two, and it is roughly **60:1
+against you**.
+
+### 5.1 The Boolean round-trip — and why counting instructions lied
 
 `zr2 + zi2 < 4.0` is immediately branched on (`28: send #<` then
 `30: br_false_fwd`). The machine ought to `fcmp` and branch on the flags. It
-does not:
+did not — it built the result as a heap object and then took that object apart
+again:
 
 ```asm
 +0x01c8  fcmp  d13, d0
@@ -167,18 +174,112 @@ does not:
 +0x01e8  b.eq  +0x28               ; …and finally branch
 ```
 
-The IR explains it: the compare is **`FCmpVal`** (value-producing) feeding a
-separate **`BoolBr`**, not the fused **`FCmpBr`** — which exists in the IR
-vocabulary and is exactly this pattern. The integer compare in the same loop
-has the identical shape (`SmiCmpVal` + `BoolBr`, not `SmiCmpBr`). So both
-compares in the hottest loop in the demo pay a ~9-instruction Boolean
-round-trip to express a branch the hardware already computed in `fcmp`.
+This one is now **fixed** — the float compare fuses to a single `Ir::FCmpBr`,
+and the loop's compare is three instructions:
 
-That is not a design compromise like the deopt tax — it is a selection gap:
-the fused ops are there and are not being chosen when the compare's result
-flows into an inlined `and:`/`whileTrue:` branch. Filed as a follow-on rather
-than fixed here, because the fix belongs in the translator's branch-shape
-recognition, not in this document.
+```asm
++0x01c0  fcmp  d13, d0
++0x01c4  b.mi  +0x18               ; branch straight on the flags
++0x01c8  b     +0x4
+```
+
+A second, unrelated find came out of the same disassembly. Every float spill
+was **two** instructions:
+
+```asm
++0x0188  sub  x16, x29, #80      ; materialize the slot address…
++0x018c  str  d16, [x16, #0]     ; …then store through it
+```
+
+while the integer path next to it spilled in one (`stur x16, [x29, #-112]`).
+`emit::fp_spill_access` did this unconditionally, on the belief — written in a
+comment — that the vendored encoder had no unscaled/negative-offset form for FP
+scalars. It never lacked one: `wfasm::a64::encode::ldst` falls back to
+`ldst_unscaled` for any negative offset and threads the V bit through, so
+`str d16, [x29, #-80]` always encoded fine (as `STUR`, `0xfc1b03b0`). The false
+comment cost **26 instructions in this loop alone**. `fp_spill_access` now
+mirrors `emit_spill_access` exactly: one access in imm9 range, `sub` only for
+deeper slots. (The disassembler could not decode the resulting `stur d` either
+— 40 fresh `.word`s — which is the *same* gap as `fmov d,d`. Also fixed.)
+
+### The measurement, and why the census lies
+
+Both changes together, on an Apple M4, interleaved A/B (never single-shot: this
+is a fanless Air and it throttles):
+
+| | original | + fused compare | + spill fix |
+|---|---|---|---|
+| loop body | 174 instructions | 163 (−6.3%) | **137 (−21%)** |
+| method | 1536 code bytes | 1480 | **1320 (−14%)** |
+| 900×700 @ maxIter 600 | 377.8 ms | — | **376.5 ms (−0.35%)** |
+
+**Cutting 21% of the loop's instructions bought 0.35% of its time.** That is a
+~60:1 discount, and it is the most useful number in this document. Both changes
+won every interleaved pair, so the sign is real and the magnitude is ~nothing.
+
+The loop runs ~62.7M iterations in ~330–376 ms — about 5.3–6.0 ns, i.e. **~24
+cycles per iteration** at ~4 GHz. The FP recurrence alone (`zr2`→`fsub`→`fadd`→
+`zr`→`fmul`→`zr2`, and the longer `zi` chain through two `fmul`s) is roughly
+10–15 cycles of pure latency. So the loop sits well above its dependency floor
+but is *utterly indifferent* to instruction count: 37 instructions per iteration
+vanished and the clock did not notice. They were off the critical path, behind
+perfectly-predicted branches, on a core wide enough to retire them in slots the
+FP chain was not using — and the `cmp`+`b.cond` tail was very likely macro-op
+fused in the decoder before it ever issued. (Separating those mechanisms exactly
+needs PMU counters, which this measurement does not have. The 60:1 discount does
+not depend on the split.)
+
+So both changes were kept for **code size**, not speed: 216 bytes per method,
+one whole `UncommonTrap` block deleted (a fused compare-and-branch has no
+`not_bool` edge — there is no Boolean object to fail to be a Boolean), and
+`Ir::FCmpBr`/`emit_fcmp_br` reachable at last. I-cache pressure across a real
+program with thousands of methods is not something one hot loop can show.
+
+**The lesson, which outlives both patches:** on a wide out-of-order core an
+instruction count is a bad proxy for time. The §5 table is a map of *space*.
+The 27 write-through stores and 24 `fmov` shuffles are off the critical path in
+exactly the way the `csel` and the 26 `sub`s were, and should be expected to
+carry the same ~60:1 discount. **Giving deopt a register map to kill the
+write-through stores is a real design change with real soundness risk, and this
+result predicts it would buy approximately nothing in time** — it has to be
+justified on other grounds (code size, frame size, simplicity) or not at all.
+That is worth knowing before someone spends a sprint on it. If you want this
+loop's remaining time, find out where the cycles actually go — measure the
+dependency chain and the memory round-trips. Do not read a time budget off the
+census; this document just proved that it lies by ~60×.
+
+### 5.2 Why it happened, and the half that is still there
+
+The IR named the bug. The compare was **`FCmpVal`** (value-producing) feeding a
+separate **`BoolBr`**, where the fused **`FCmpBr`** belonged — an op that had
+existed in the vocabulary all along, with a complete and correct
+`emit::emit_fcmp_br` behind it. Nothing had ever *constructed* one. The
+translator defers a fusable compare to its block's terminator via
+`pending_cmp`, and only the smi arm ever read the `fusable` flag; the double
+arm ignored it and always materialized. So `Ir::FCmpBr` was fully-built dead
+vocabulary, and the giveaway that it had never run was that nothing tested it.
+The fix reads `fusable` in the double arm too (`ir.rs`), and ships with
+`double_cmp_fused_with_branch` — the test whose absence *was* the bug.
+
+The integer compare, `n < maxIter`, looks identical in the disassembly but is
+**not** the same problem, and is still there:
+
+```
+  block 2:  SmiCmpVal { dst: VReg(26), … }   Jump → block 11
+  block 11: Move { dst: VReg(8), src: VReg(26) }   Jump → block 4
+  block 3:  Move { dst: VReg(8), src: false }      Jump → block 4
+  block 4:  BoolBr { val: VReg(8), … }
+```
+
+That is the inlined `and:`. Its result is a **phi** — `VReg(8)`, merging the
+compare's result with the short-circuit's literal `false` — and the branch that
+consumes it lives in a *different block*. `fusable` is correctly false here:
+this block's terminator is a `Jump`, not a `Branch`. Fusing it is not a
+selection fix but a jump-threading one (constant-fold the branch in block 3,
+thread block 11, merge it into block 2, then fuse), which touches merge
+bookkeeping and the threaded blocks' deopt records. Left alone deliberately —
+and per §5.1 the honest expected payoff is a fraction of a percent, so it
+should be done for the IR's sake if at all, not for the clock.
 
 ## 6. What the example is meant to show
 
@@ -190,10 +291,19 @@ recognition, not in this document.
 - **"Fast" here means the allocation is gone, not that the math got clever.**
   The arithmetic was always nine instructions. The 746 → 166 ms came from the
   five heap Doubles per iteration that are no longer there.
-- **Reading the output finds real bugs.** Writing this document surfaced two:
-  the disassembler could not decode `fmov d,d` — the most common instruction
-  in float code, printed as a bare `.word` (fixed, `disasm_a64.rs`) — and the
-  Boolean round-trip above.
+- **Instructions are not time.** Deleting **21%** of the loop's instructions
+  bought **0.35%** (§5.1). The core absorbs anything off the critical path, so
+  the census in §5 is a map of *space*; reading a time budget off it will
+  mislead you by ~60× about which taxes are worth paying down.
+- **Reading the output finds real bugs.** Writing and then re-measuring this
+  document surfaced five, none of them hypothetical: the disassembler could not
+  decode `fmov d,d` — the most common instruction in float code — nor `stur d`,
+  every float spill; the float compare never fused, because `Ir::FCmpBr` had
+  been *unreachable* since the float fast path shipped and no test noticed; a
+  false comment in `fp_spill_access` doubled every float spill for want of an
+  encoding the assembler already had; and the belief that any of it cost
+  meaningful time was itself wrong. All five were found by reading the output
+  rather than reasoning about the source.
 
 ## Cross-references
 

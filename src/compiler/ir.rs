@@ -649,6 +649,37 @@ struct PendingCmpDeopt {
     stack: Vec<VReg>,
 }
 
+/// A comparison send deferred to its block's `Branch` terminator, where the
+/// fused compare-and-branch is built (`convert`). The variant records which
+/// inline path the comparison took, because the two fused ops differ in what
+/// rides along:
+///
+///   - `Smi` is fallible (a non-smi operand, per the IC's speculation), so the
+///     terminator must build its fail block from the deopt info captured back
+///     at the send — see [`PendingCmpDeopt`].
+///   - `Float` is not. Its operands were already guard-unboxed, and `FUnbox`'s
+///     own `fail` edge owns the wrong-klass trap, so `fcmp` itself cannot fail
+///     — hence `Ir::FCmpBr` carries no `fail`, and nothing needs to ride along.
+///
+/// Both variants share the payoff: a fused compare never materializes its
+/// result, so there is no Boolean object to round-trip through, and no
+/// `not_bool` edge either (a branch on the hardware flags cannot find a
+/// non-Boolean where it expected one).
+#[derive(Clone, Debug)]
+enum PendingCmp {
+    Smi {
+        op: CmpOp,
+        a: VReg,
+        b: VReg,
+        deopt: PendingCmpDeopt,
+    },
+    Float {
+        op: CmpOp,
+        a: VReg,
+        b: VReg,
+    },
+}
+
 /// S14 step 4c: the result of [`Translator::try_inline_nonleaf`] — either the
 /// body ran to its return (`Value`), or an in-body cold send became a
 /// terminating uncommon trap (`Trapped`), so the caller must finish the current
@@ -3404,7 +3435,7 @@ impl<'a> Translator<'a> {
         stack_sites: &mut Vec<Option<usize>>,
         code: &mut Vec<Ir>,
         deopt: &mut Vec<(u32, DeoptRaw)>,
-        pending_cmp: &mut Option<(CmpOp, VReg, VReg, PendingCmpDeopt)>,
+        pending_cmp: &mut Option<PendingCmp>,
         trapped: &mut bool,
     ) -> Option<BlockId> {
         debug_assert_eq!(
@@ -3703,15 +3734,15 @@ impl<'a> Translator<'a> {
                         // to the branch site, which builds the fail block
                         // (after a/b are popped, and where `bci` is the block
                         // start, not this send).
-                        *pending_cmp = Some((
+                        *pending_cmp = Some(PendingCmp::Smi {
                             op,
                             a,
                             b,
-                            PendingCmpDeopt {
+                            deopt: PendingCmpDeopt {
                                 bci,
                                 stack: reexec_stack,
                             },
-                        ));
+                        });
                     }
                     SmiSendKind::Cmp(op) => {
                         let dst = self.fresh(true);
@@ -3860,6 +3891,18 @@ impl<'a> Translator<'a> {
                         let dst = self.fresh(true);
                         code.push(Ir::FBox { dst, src: fd });
                         stack.push(dst);
+                    }
+                    // The float analog of the smi fusion peephole (D3.2): when
+                    // the comparison's only consumer is the block's own
+                    // immediately-following branch, defer it to the terminator
+                    // (`convert`) and emit ONE `FCmpBr` — `fcmp` + `b.cond` —
+                    // instead of materializing a `true`/`false` OBJECT and then
+                    // testing that object back against the true oop to branch on
+                    // a condition `fcmp` already put in the flags. `fusable`
+                    // itself has always been true here; only the smi arm ever
+                    // read it, which left `Ir::FCmpBr` built-but-unreachable.
+                    DoubleSendKind::Cmp(op) if fusable => {
+                        *pending_cmp = Some(PendingCmp::Float { op, a: ua, b: ub });
                     }
                     DoubleSendKind::Cmp(op) => {
                         let dst = self.fresh(true);
@@ -7017,7 +7060,7 @@ pub fn convert(
         // the same block, adjacent or via a temp), so entry is all-`None`;
         // `translate_instr` maintains it in lockstep with `stack`.
         let mut stack_sites: Vec<Option<usize>> = vec![None; stack.len()];
-        let mut pending_cmp: Option<(CmpOp, VReg, VReg, PendingCmpDeopt)> = None;
+        let mut pending_cmp: Option<PendingCmp> = None;
         // S11 step 7: a fallible smi-inline op mid-block (SmiArith/
         // SmiCmpVal, never a terminator) now needs a REAL fallback that
         // REJOINS this same block's own continuation, not a bailout-and-
@@ -7234,22 +7277,39 @@ pub fn convert(
                 };
                 emit_merges(&sources, &entry_stacks, if_true, &succ_exit, &mut code);
                 emit_merges(&sources, &entry_stacks, if_false, &succ_exit, &mut code);
-                if let Some((op, a, b_, deopt_info)) = pending_cmp.take() {
-                    // S13 step 7b: `deopt_info` was captured at the fused
-                    // comparison's own smi-inline site (before its operand
-                    // pops) — `deopt_info.stack` carries `a`/`b`, and
-                    // `deopt_info.bci` is the comparison SEND's own bci (NOT
-                    // `cfg_block.bci_start`, which is the block's first
-                    // instruction) — the reexecute resume point.
-                    let fail_id = t.fail_and_branch(deopt_info.bci, deopt_info.stack);
-                    code.push(Ir::SmiCmpBr {
-                        op,
-                        a,
-                        b: b_,
-                        if_true: block_id(if_true),
-                        if_false: block_id(if_false),
-                        fail: fail_id,
-                    });
+                if let Some(pc) = pending_cmp.take() {
+                    match pc {
+                        // S13 step 7b: `deopt` was captured at the fused
+                        // comparison's own smi-inline site (before its operand
+                        // pops) — `deopt.stack` carries `a`/`b`, and
+                        // `deopt.bci` is the comparison SEND's own bci (NOT
+                        // `cfg_block.bci_start`, which is the block's first
+                        // instruction) — the reexecute resume point.
+                        PendingCmp::Smi { op, a, b: b_, deopt } => {
+                            let fail_id = t.fail_and_branch(deopt.bci, deopt.stack);
+                            code.push(Ir::SmiCmpBr {
+                                op,
+                                a,
+                                b: b_,
+                                if_true: block_id(if_true),
+                                if_false: block_id(if_false),
+                                fail: fail_id,
+                            });
+                        }
+                        // No fail edge and nothing to carry: the operands were
+                        // already guard-unboxed at the send (`FUnbox`'s own
+                        // `fail` owns the wrong-klass trap), so `fcmp` is
+                        // infallible — see `PendingCmp`.
+                        PendingCmp::Float { op, a, b: b_ } => {
+                            code.push(Ir::FCmpBr {
+                                op,
+                                a,
+                                b: b_,
+                                if_true: block_id(if_true),
+                                if_false: block_id(if_false),
+                            });
+                        }
+                    }
                 } else {
                     had_unfused_branch = true;
                     let val = *local_exit
@@ -7737,6 +7797,74 @@ mod tests {
                 .code
                 .iter()
                 .any(|op| matches!(op, Ir::SmiCmpVal { .. } | Ir::BoolBr { .. })),
+            "fusion must skip both the materialize step and the separate branch"
+        );
+    }
+
+    /// The float twin of `smi_cmp_fused_with_branch`: a mono-Double `<`
+    /// immediately consumed by `br_false_fwd` becomes a single `FCmpBr`.
+    ///
+    /// This is the test whose absence WAS the bug. `Ir::FCmpBr` and
+    /// `emit::emit_fcmp_br` both shipped complete with the float fast path, but
+    /// nothing ever CONSTRUCTED an `FCmpBr` — only the smi arm read `fusable`,
+    /// so the op sat unreachable and every Double compare paid a ~9-instruction
+    /// Boolean round-trip: materialize `true`/`false` as an OBJECT
+    /// (`ldr =true`/`ldr =false`/`csel`), then compare that object back against
+    /// the true oop (`ldr =true`/`cmp`/`b.eq`) to branch on a condition `fcmp`
+    /// had already put in the flags. Found by disassembling Mandelbrot's inner
+    /// loop (`docs/mandelbrot_walkthrough.md` §5).
+    #[test]
+    fn double_cmp_fused_with_branch() {
+        let mut vm = test_vm();
+        let lt_sel = vm.universe.intern(b"<");
+        // `is_double_inlinable`/`classify_double_send` resolve through
+        // (guard klass, selector) rather than the IC's target slot, so unlike
+        // the smi twin this needs Double to REALLY understand `<` — as
+        // primitive 104, DOUBLE_INLINE's `Cmp(Lt)`.
+        let lt_method = primitive_stub(&mut vm, lt_sel, 104);
+        let double_klass = vm.universe.double_klass;
+        crate::runtime::lookup::install_method(&mut vm, double_klass, lt_sel, lt_method);
+
+        let mut b = BytecodeBuilder::new();
+        let l1 = b.new_label();
+        let l2 = b.new_label();
+        b.push_self();
+        b.push_temp(0);
+        b.send(&mut vm, lt_sel, 1);
+        b.br_false_fwd(l1);
+        b.push_smi_i8(1);
+        b.jump_fwd(l2);
+        b.bind(l1);
+        b.push_smi_i8(0);
+        b.bind(l2);
+        b.ret_tos();
+        let sel = vm.universe.intern(b"m");
+        let method = b.finish(&mut vm, sel, 1, 0);
+
+        let ic = InterpreterIc::at(method, 0);
+        let epoch = vm.ic_epoch;
+        ic.set_mono(&mut vm, double_klass, lt_method, epoch);
+
+        let cfg = decode::decode(method);
+        let ir = convert(&vm, double_klass, method, &cfg, false);
+
+        // Scan every block, not just `blocks[0]`: the double fuse finishes its
+        // guard-fail trap block DURING the send's own translation, so the
+        // straight-line block is not necessarily first.
+        assert!(
+            ir.blocks
+                .iter()
+                .any(|blk| blk
+                    .code
+                    .iter()
+                    .any(|op| matches!(op, Ir::FCmpBr { op: CmpOp::Lt, .. }))),
+            "must fuse into a single FCmpBr"
+        );
+        assert!(
+            !ir.blocks.iter().any(|blk| blk
+                .code
+                .iter()
+                .any(|op| matches!(op, Ir::FCmpVal { .. } | Ir::BoolBr { .. }))),
             "fusion must skip both the materialize step and the separate branch"
         );
     }

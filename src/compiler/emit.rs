@@ -919,15 +919,32 @@ impl<'a> Emitter<'a> {
     /// x16 slot is reused for the literal.
     // ── Float fast-path lowering (docs/float_fastpath_design.md) ─────────
     //
-    // FP spill access always computes the slot address into a GPR scratch
-    // first (`sub x16, x29, #off; ldr/str dN, [x16]`): the vendored encoder's
-    // FP scalar load/store family has no unscaled/negative-offset form, and
-    // a frame-relative slot offset is always negative.
+    // FP spill access, the exact `emit_spill_access` shape it should always
+    // have had: a slot within the unscaled imm9 range is ONE `[x29, #off]`
+    // access (the encoder picks STUR/LDUR with V=1 for a negative offset,
+    // `wfasm::a64::encode::ldst`), and only a DEEPER slot computes the address
+    // into a GPR scratch first.
+    //
+    // This used to `sub`+access UNCONDITIONALLY, on the belief — stated in a
+    // comment here — that "the vendored encoder's FP scalar load/store family
+    // has no unscaled/negative-offset form". It does: `ldst` falls back to
+    // `ldst_unscaled` for any negative offset and threads the V bit through,
+    // so `str d16, [x29, #-80]` was always encodable. The claim was never
+    // true, and it doubled the cost of every in-range float spill — 26 of the
+    // 163 instructions in Mandelbrot's inner loop (~16%) were this.
+    //
+    // x16 (not `emit_spill_access`'s x19) stays the deep-slot scratch: the FP
+    // path's callers hold no address in x16 across a spill access, and d-regs
+    // can never alias it.
     fn fp_spill_access(&mut self, mnemonic: &str, dreg: u8, slot: crate::compiler::regalloc::SpillSlot) {
         let off = spill_offset(slot);
         debug_assert!(off < 0, "spill slots are below fp");
-        self.asm.emit("sub", &[x(16), x(29), imm(-off)]);
-        self.asm.emit(mnemonic, &[d(dreg), mem(16, 0)]);
+        if off >= -256 {
+            self.asm.emit(mnemonic, &[d(dreg), mem(29, off)]);
+        } else {
+            self.asm.emit("sub", &[x(16), x(29), imm(-off)]);
+            self.asm.emit(mnemonic, &[d(dreg), mem(16, 0)]);
+        }
     }
 
     /// `resolve` for an UNBOXED-f64 vreg: a register assignment names a
