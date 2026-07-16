@@ -1666,6 +1666,39 @@ extern "C" fn on_script_message(_this: Id, _cmd: Sel, _controller: Id, message: 
             let name = dict_get_string(body, "class");
             display_editor(if name.is_empty() { None } else { Some(&name) });
         }
+        "editorSession" => {
+            // The freshly-rendered editor page seeded its VM edit session on the
+            // loaded text (docs/editor_design.md M3). The full-document
+            // EditorDamage reply flows back through vm_bridge_drain.
+            if let Some(vm) = VM.get() {
+                vm.submit(vm_host::VmRequest::EditorOpen {
+                    text: dict_get_string(body, "text"),
+                });
+            }
+        }
+        "editorKey" => {
+            // One keystroke for the current editor session; answers an
+            // EditorDamage the JS terminal patches into the buffer.
+            if let Some(vm) = VM.get() {
+                vm.submit(vm_host::VmRequest::EditorKey {
+                    key: dict_get_string(body, "key"),
+                });
+            }
+        }
+        "editorCommand" => {
+            if let Some(vm) = VM.get() {
+                vm.submit(vm_host::VmRequest::EditorCommand {
+                    name: dict_get_string(body, "name"),
+                });
+            }
+        }
+        "editorAccept" => {
+            // Save: syntax-check + live-install + persist the diffed class. The
+            // outcome comes back on the transcript.
+            if let Some(vm) = VM.get() {
+                vm.submit(vm_host::VmRequest::EditorAccept);
+            }
+        }
         _ => {}
     }
 }

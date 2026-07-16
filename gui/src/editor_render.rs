@@ -19,12 +19,16 @@ pub fn render_editor(class_names: &[String], current: &str, source: &str) -> Str
     format!(
         "<h1>Text Editor</h1>\
          <p>Edit a class as text. Pick a class, then Enter to load it. \
-         <em>(Read-only for now — editing and accept land next.)</em></p>\
-         <input class=\"st-editor-class\" type=\"text\" list=\"st-editor-classes\" \
-          value=\"{current}\" placeholder=\"class name, e.g. Mandelbrot\" \
-          autocomplete=\"off\" spellcheck=\"false\">\
+         Save syntax-checks and updates the image.</p>\
+         <div class=\"st-editor-toolbar\">\
+           <input class=\"st-editor-class\" type=\"text\" list=\"st-editor-classes\" \
+            value=\"{current}\" placeholder=\"class name, e.g. Mandelbrot\" \
+            autocomplete=\"off\" spellcheck=\"false\">\
+           <button type=\"button\" class=\"st-editor-save\" data-editor-action=\"save\">Save</button>\
+         </div>\
          <datalist id=\"st-editor-classes\">{options}</datalist>\
-         <textarea class=\"st-editor-buffer\" spellcheck=\"false\" readonly \
+         <textarea class=\"st-editor-buffer\" spellcheck=\"false\" \
+          autocomplete=\"off\" autocapitalize=\"off\" wrap=\"off\" \
           data-class=\"{current}\">{source}</textarea>",
         current = html_escape_text(current),
         source = html_escape_text(source),
@@ -75,7 +79,10 @@ mod tests {
         assert!(html.contains("<option value=\"Mandelbrot\">"));
         assert!(html.contains("class=\"st-editor-class\""));
         assert!(html.contains("value=\"Mandelbrot\""));
-        assert!(html.contains("readonly"));
+        // M3c: the buffer is now a live editing surface (VM-authoritative), no
+        // longer readonly — smtk.js's editor terminal drives it.
+        assert!(html.contains("class=\"st-editor-buffer\""));
+        assert!(!html.contains("readonly"));
         assert!(html.contains("Object subclass: Mandelbrot"));
     }
 

@@ -132,6 +132,12 @@ pub enum VmRequest {
     EditorCommand {
         name: String,
     },
+    /// Save (accept) the current editor session: syntax-check the buffer by
+    /// compiling it into the running VM, then — only if that succeeds —
+    /// persist the class to the image, writing just the methods that actually
+    /// changed. Reports the outcome on the transcript. (docs/editor_design.md
+    /// M4, a first cut: whole-class buffer, method-granular commit.)
+    EditorAccept,
     /// A `<smappl visual="CODE">` on the current page (`../smappl.md`): render
     /// the `visual=` expression to an HTML fragment (`VmHandle::render_fragment`,
     /// D-G5). `id` is the placeholder span's `data-widget-id`; the worker
@@ -1382,6 +1388,90 @@ fn decode_editor_damage(enc: &str) -> VmResponse {
     }
 }
 
+/// Persist the editor buffer's class to the image, writing only what changed
+/// (docs/editor_design.md M4). The buffer already parsed+installed in the VM by
+/// the time we get here, so `image_store::mst` re-parses it purely to diff
+/// against what's stored: a method whose source is byte-identical is left alone
+/// (no new `method_versions` row — the version history and every live nmethod
+/// are spared a no-op churn), changed/new methods are reopened, and methods that
+/// vanished from the buffer are removed. Returns a one-line summary.
+///
+/// First-cut scope: instance/class methods and the class shell (superclass +
+/// instance vars). The class comment and class variables are not persisted here
+/// yet — a comment/classVars-aware round trip is follow-on work; a method edit,
+/// the common case, is fully covered.
+fn persist_editor_class(img: &image_store::Image, text: &str) -> String {
+    use std::collections::{HashMap, HashSet};
+    let parsed = image_store::mst::parse_mst_source(text);
+    let cls = match parsed.first() {
+        Some(c) => c,
+        None => return "nothing to save (no class definition in the buffer)".to_string(),
+    };
+    let _ = img.create_or_reopen_class(
+        &cls.name,
+        cls.superclass.as_deref(),
+        "",
+        "",
+        &cls.instance_vars,
+    );
+
+    // (selector, is_class_side) -> stored source, for the diff.
+    let stored: HashMap<(String, bool), String> = img
+        .all_methods_of(&cls.name)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|m| ((m.selector, m.side == image_store::Side::Class), m.source))
+        .collect();
+
+    let (mut changed, mut added) = (0u32, 0u32);
+    for m in &cls.methods {
+        let side = if m.is_class_side {
+            image_store::Side::Class
+        } else {
+            image_store::Side::Instance
+        };
+        match stored.get(&(m.selector.clone(), m.is_class_side)) {
+            Some(old) if *old == m.source => {}                     // unchanged: skip
+            Some(_) => {
+                let _ = img.create_or_reopen_method(&cls.name, side, &m.selector, "", &m.source);
+                changed += 1;
+            }
+            None => {
+                let _ = img.create_or_reopen_method(&cls.name, side, &m.selector, "", &m.source);
+                added += 1;
+            }
+        }
+    }
+
+    // Methods that were in the image but are gone from the buffer → removed.
+    let present: HashSet<(String, bool)> = cls
+        .methods
+        .iter()
+        .map(|m| (m.selector.clone(), m.is_class_side))
+        .collect();
+    let mut removed = 0u32;
+    for (sel, is_cls) in stored.keys() {
+        if !present.contains(&(sel.clone(), *is_cls)) {
+            let side = if *is_cls {
+                image_store::Side::Class
+            } else {
+                image_store::Side::Instance
+            };
+            let _ = img.remove_method(&cls.name, side, sel);
+            removed += 1;
+        }
+    }
+
+    if changed + added + removed == 0 {
+        format!("{} — no changes", cls.name)
+    } else {
+        format!(
+            "saved {} ({changed} changed, {added} added, {removed} removed)",
+            cls.name
+        )
+    }
+}
+
 /// Run an editor bridge expression that answers an encoded `EditorDamage` and
 /// decode it. A guest error (e.g. no session open yet) surfaces on the
 /// transcript rather than as a bogus damage.
@@ -1454,6 +1544,28 @@ fn handle(
                 smalltalk_string_literal(&name)
             ),
         ),
+        VmRequest::EditorAccept => {
+            // The buffer text lives in the VM's session — fetch it raw.
+            let text = match vm.eval_to_string("EditorSession current documentString") {
+                Ok(t) => t,
+                Err(e) => {
+                    return vec![VmResponse::Transcript(format!(
+                        "editor: nothing to save — no session ({e})"
+                    ))]
+                }
+            };
+            // Syntax-check AND live-install by compiling into the running VM.
+            // A malformed edit errors here and NOTHING is persisted — the image
+            // is the boot source, so it must never hold text the VM rejected.
+            if let Err(e) = vm.exec(&text) {
+                return vec![VmResponse::Transcript(format!("editor: not saved — {e}"))];
+            }
+            let msg = match image {
+                Some(img) => persist_editor_class(img, &text),
+                None => "installed in the running VM (no image to persist to)".to_string(),
+            };
+            vec![VmResponse::Transcript(format!("editor: {msg}"))]
+        }
         VmRequest::GetMetrics => vec![VmResponse::Metrics(vm.metrics())],
         VmRequest::SmapplRender { id, code } => {
             // Render the widget image-side (D-G5). A shape that can't be
@@ -3831,6 +3943,49 @@ mod tests {
             }
             other => panic!("EditorCommand undo: {other:?}"),
         }
+    }
+
+    /// The editor Save persists ONLY what changed (docs/editor_design.md M4):
+    /// an unchanged method must not spawn a no-op `method_versions` row (which
+    /// would churn history and invalidate the live nmethod for nothing), a
+    /// changed/new one is written, and a vanished one is removed.
+    #[test]
+    fn persist_editor_class_writes_only_the_diff() {
+        let img = image_store::Image::open_in_memory().unwrap();
+        img.create_or_reopen_class("Object", None, "Kernel", "", "").unwrap();
+        img.create_or_reopen_class("Foo", Some("Object"), "App", "", "").unwrap();
+        img.create_or_reopen_method("Foo", image_store::Side::Instance, "bar", "", "bar [ ^1 ]")
+            .unwrap();
+        img.create_or_reopen_method("Foo", image_store::Side::Instance, "gone", "", "gone [ ^0 ]")
+            .unwrap();
+        let versions_of = |sel: &str| {
+            img.method_version_count("Foo", image_store::Side::Instance, sel)
+                .unwrap()
+        };
+        assert_eq!(versions_of("bar"), 1);
+
+        // Edit `bar`, add `baz`, drop `gone`.
+        let text = "Object subclass: Foo [\n    bar [ ^2 ]\n    baz [ ^3 ]\n]\n";
+        let msg = persist_editor_class(&img, text);
+        assert!(msg.contains("1 changed"), "{msg}");
+        assert!(msg.contains("1 added"), "{msg}");
+        assert!(msg.contains("1 removed"), "{msg}");
+        assert_eq!(versions_of("bar"), 2, "bar changed -> a new version");
+        assert_eq!(
+            img.method_source("Foo", image_store::Side::Instance, "baz")
+                .unwrap()
+                .as_deref(),
+            Some("baz [ ^3 ]")
+        );
+        assert!(img
+            .method_source("Foo", image_store::Side::Instance, "gone")
+            .unwrap()
+            .is_none());
+
+        // Save again with no edits — nothing is written (no version churn).
+        let msg2 = persist_editor_class(&img, text);
+        assert!(msg2.contains("no changes"), "{msg2}");
+        assert_eq!(versions_of("bar"), 2, "an unchanged save must not re-version");
     }
 
     /// Polls `drain_responses` (accumulating across calls) until `pred`
