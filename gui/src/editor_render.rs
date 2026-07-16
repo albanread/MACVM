@@ -19,7 +19,8 @@ pub fn render_editor(class_names: &[String], current: &str, source: &str) -> Str
     format!(
         "<h1>Text Editor</h1>\
          <p>Edit a class as text. Pick a class, then Enter to load it. \
-         Save syntax-checks and updates the image.</p>\
+         Save syntax-checks and writes to the database + world files \
+         (takes effect on the next launch).</p>\
          <div class=\"st-editor-toolbar\">\
            <input class=\"st-editor-class\" type=\"text\" list=\"st-editor-classes\" \
             value=\"{current}\" placeholder=\"class name, e.g. Mandelbrot\" \

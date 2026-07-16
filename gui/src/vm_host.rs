@@ -860,6 +860,9 @@ fn worker_loop(
         let batch = match request {
             VmRequest::ExportWorld => vec![export_world_response(image.as_ref(), world_dir)],
             VmRequest::ImportWorld => vec![import_world_response(image.as_ref(), world_dir)],
+            VmRequest::EditorAccept => {
+                vec![editor_accept_response(&mut vm, image.as_ref(), world_dir)]
+            }
             other => handle(other, &mut world, &mut selection, image.as_ref(), &mut vm),
         };
         // Reaching HERE (rather than `pthread_exit`ing inside `handle` on a
@@ -1381,10 +1384,52 @@ fn decode_editor_view(enc: &str) -> VmResponse {
     }
 }
 
+/// Save (accept) the current editor buffer — to the DATABASE and the world
+/// `.mst` files, NOT the live VM (docs/editor_design.md M4). Redefining a class
+/// in the running VM cannot change its shape when it has live instances (the
+/// "cannot change shape of existing class" error), and mutating the running VM
+/// under the user is the wrong thing anyway: the image is the boot source, so
+/// the edit takes effect on the next boot. So this only READS the buffer from
+/// the session, SYNTAX-checks it with the real compiler's parser (no install),
+/// and persists — to the image (diffed) and out to `world/*.mst` (surgical).
+fn editor_accept_response(
+    vm: &mut VmHandle,
+    image: Option<&image_store::Image>,
+    world_dir: &Path,
+) -> VmResponse {
+    let text = match vm.eval_to_string("EditorSession current documentString") {
+        Ok(t) => t,
+        Err(e) => {
+            return VmResponse::Transcript(format!("editor: nothing to save — no session ({e})"))
+        }
+    };
+    // Syntax gate ONLY — the same parser that will compile this on the next
+    // boot (`frontend::parser::parse_file`), so a red here means a real
+    // compile error, and there is no live install to fail on a shape change.
+    if let Err(e) = macvm::frontend::parser::parse_file(&text) {
+        return VmResponse::Transcript(format!("editor: not saved — {e}"));
+    }
+    let img = match image {
+        Some(i) => i,
+        None => return VmResponse::Transcript("editor: not saved — no image database".to_string()),
+    };
+    let db = persist_editor_class(img, &text);
+    // Push the image's changes back out to the world .mst tree (surgical —
+    // only the changed methods are spliced), so the edit is on disk too.
+    let world = match image_store::export::export_world_dir(img, world_dir) {
+        Ok(s) => format!(
+            "; world +{} file(s), {} method(s) updated, {} added",
+            s.files_changed, s.methods_updated, s.methods_added
+        ),
+        Err(e) => format!("; world export failed: {e}"),
+    };
+    VmResponse::Transcript(format!("editor: {db}{world} (takes effect on next launch)"))
+}
+
 /// Persist the editor buffer's class to the image, writing only what changed
-/// (docs/editor_design.md M4). The buffer already parsed+installed in the VM by
-/// the time we get here, so `image_store::mst` re-parses it purely to diff
-/// against what's stored: a method whose source is byte-identical is left alone
+/// (docs/editor_design.md M4). `image_store::mst` re-parses the (already
+/// syntax-checked) buffer purely to diff against what's stored: a method whose
+/// source is byte-identical is left alone
 /// (no new `method_versions` row — the version history and every live nmethod
 /// are spared a no-op churn), changed/new methods are reopened, and methods that
 /// vanished from the buffer are removed. Returns a one-line summary.
@@ -1400,6 +1445,10 @@ fn persist_editor_class(img: &image_store::Image, text: &str) -> String {
         Some(c) => c,
         None => return "nothing to save (no class definition in the buffer)".to_string(),
     };
+    // Ensure the class exists, then update its SHAPE (superclass + instance
+    // vars) — `create_or_reopen_class` only reopens for methods, so a changed
+    // shape needs `set_class_definition` (this is exactly the edit a live VM
+    // redefinition can't do, and the reason Save goes to the database).
     let _ = img.create_or_reopen_class(
         &cls.name,
         cls.superclass.as_deref(),
@@ -1407,6 +1456,7 @@ fn persist_editor_class(img: &image_store::Image, text: &str) -> String {
         "",
         &cls.instance_vars,
     );
+    let _ = img.set_class_definition(&cls.name, cls.superclass.as_deref(), &cls.instance_vars);
 
     // (selector, is_class_side) -> stored source, for the diff.
     let stored: HashMap<(String, bool), String> = img
@@ -1537,28 +1587,6 @@ fn handle(
                 smalltalk_string_literal(&name)
             ),
         ),
-        VmRequest::EditorAccept => {
-            // The buffer text lives in the VM's session — fetch it raw.
-            let text = match vm.eval_to_string("EditorSession current documentString") {
-                Ok(t) => t,
-                Err(e) => {
-                    return vec![VmResponse::Transcript(format!(
-                        "editor: nothing to save — no session ({e})"
-                    ))]
-                }
-            };
-            // Syntax-check AND live-install by compiling into the running VM.
-            // A malformed edit errors here and NOTHING is persisted — the image
-            // is the boot source, so it must never hold text the VM rejected.
-            if let Err(e) = vm.exec(&text) {
-                return vec![VmResponse::Transcript(format!("editor: not saved — {e}"))];
-            }
-            let msg = match image {
-                Some(img) => persist_editor_class(img, &text),
-                None => "installed in the running VM (no image to persist to)".to_string(),
-            };
-            vec![VmResponse::Transcript(format!("editor: {msg}"))]
-        }
         VmRequest::GetMetrics => vec![VmResponse::Metrics(vm.metrics())],
         VmRequest::SmapplRender { id, code } => {
             // Render the widget image-side (D-G5). A shape that can't be
@@ -1927,8 +1955,8 @@ fn handle(
                 .unwrap_or_default();
             vec![VmResponse::FindOptions { tool, options }]
         }
-        // Serviced in `worker_loop` (needs `world_dir`); never reaches `handle`.
-        VmRequest::ExportWorld | VmRequest::ImportWorld => {
+        // Serviced in `worker_loop` (need `world_dir`); never reach `handle`.
+        VmRequest::ExportWorld | VmRequest::ImportWorld | VmRequest::EditorAccept => {
             unreachable!("world I/O is handled in worker_loop")
         }
         VmRequest::BrowserOpen => {
@@ -3911,6 +3939,58 @@ mod tests {
             &mut vm,
         ));
         assert_eq!(text, "ab'c\ndef");
+    }
+
+    /// Save goes to the DATABASE, not the live VM — so a SHAPE change (adding an
+    /// instance var), which a live redefinition refuses ("cannot change shape of
+    /// existing class"), now saves fine; and a syntax error is rejected by the
+    /// real parser without any install. This is the bug the user hit.
+    #[test]
+    fn editor_accept_saves_a_shape_change_and_gates_syntax() {
+        let mut vm = test_vm_handle(macvm::runtime::JitMode::Off);
+        let tmp = std::env::temp_dir().join(format!("macvm_edacc_{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let img = image_store::Image::open(&tmp.join("image.sqlite3")).unwrap();
+        img.create_or_reopen_class("Object", None, "Kernel", "", "").unwrap();
+        img.create_or_reopen_class("FooShape", Some("Object"), "App", "", "a")
+            .unwrap();
+        img.create_or_reopen_method("FooShape", image_store::Side::Instance, "m", "", "m [ ^a ]")
+            .unwrap();
+
+        // 1) A syntactically broken buffer (unclosed brackets) is rejected by
+        //    the parser — nothing saved.
+        vm.exec("EditorSession openOn: 'Object subclass: FooShape [ m [ ^a'")
+            .unwrap();
+        let bad = editor_accept_response(&mut vm, Some(&img), &tmp);
+        assert!(
+            matches!(&bad, VmResponse::Transcript(t) if t.contains("not saved")),
+            "syntax error must not save, got {bad:?}"
+        );
+
+        // 2) A SHAPE change (add instance var `b`, add method `n`) parses and
+        //    saves to the image — the old live-install path failed here.
+        vm.exec(
+            "EditorSession openOn: 'Object subclass: FooShape [ | a b | m [ ^a ] n [ ^b ] ]'",
+        )
+        .unwrap();
+        let ok = editor_accept_response(&mut vm, Some(&img), &tmp);
+        match &ok {
+            VmResponse::Transcript(t) => assert!(
+                t.contains("saved") && !t.contains("cannot change shape"),
+                "shape change must save, got {t}"
+            ),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            img.class_named("FooShape").unwrap().unwrap().instance_vars,
+            "a b",
+            "the new shape persisted"
+        );
+        assert!(img
+            .method_source("FooShape", image_store::Side::Instance, "n")
+            .unwrap()
+            .is_some());
+        std::fs::remove_dir_all(&tmp).ok();
     }
 
     /// The editor Save persists ONLY what changed (docs/editor_design.md M4):
