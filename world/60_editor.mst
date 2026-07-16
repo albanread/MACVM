@@ -454,7 +454,18 @@ Object subclass: EditorSession [
         ^self cursorDamage
     ]
 
-    "── the one entry point the Rust bridge calls (M3b) ──
+    "The whole document as one damage record — the initial render on open, and
+     the honest answer to an edit that can change anything (undo/redo)."
+    fullDamage [
+        | cl |
+        cl := buffer rope lineOfOffset: cursor.
+        ^EditorDamage
+            first: 1 last: buffer lineCount total: buffer lineCount
+            cursorLine: cl cursorColumn: (self columnAt: cursor line: cl)
+            text: buffer asString
+    ]
+
+    "── the entry points the Rust bridge calls (M3b) ──
      A named special key routes to its editor action; anything else is literal
      text to insert (so a printable character arrives as its own 1-char string)."
     handleKey: k [
@@ -466,5 +477,16 @@ Object subclass: EditorSession [
         k = 'Home' ifTrue: [ ^self moveToLineStart ].
         k = 'End' ifTrue: [ ^self moveToLineEnd ].
         ^self insertString: k
+    ]
+
+    "A named command. undo/redo can change the document arbitrarily, so both
+     answer a full-document damage; the caret is clamped back into range (a
+     caret that restores to its pre-edit spot is a later refinement — TextBuffer
+     tracks roots, not caret history). accept/close are M4/M6."
+    handleCommand: name [
+        name = 'undo' ifTrue: [ buffer undo ].
+        name = 'redo' ifTrue: [ buffer redo ].
+        cursor := cursor min: buffer size + 1.
+        ^self fullDamage
     ]
 ]
