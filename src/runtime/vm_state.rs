@@ -144,6 +144,14 @@ pub enum FatalMode {
 thread_local! {
     static FATAL_MODE: std::cell::Cell<FatalMode> =
         const { std::cell::Cell::new(FatalMode::ExitProcess) };
+    /// A hook fired on THIS thread's `ExitThread` fatal exit, immediately
+    /// before `pthread_exit`. Because `pthread_exit` runs no `Drop` glue, a
+    /// supervisor cannot otherwise learn a `VmHandle` thread has died; this is
+    /// the ONE exact death signal. Set by a supervisor (the Cocoa GUI's primary
+    /// generation) to post a "died" event to its watchdog, so a GENUINE fatal —
+    /// and only a genuine fatal, never a merely-busy VM — triggers a respawn.
+    static FATAL_HOOK: std::cell::RefCell<Option<Box<dyn Fn()>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Called once, by `VmHandle::boot` (S21 step 2), before any guest code
@@ -152,6 +160,13 @@ thread_local! {
 /// exactly today's behavior everywhere except a `VmHandle`-embedded VM.
 pub(crate) fn set_fatal_mode(mode: FatalMode) {
     FATAL_MODE.with(|f| f.set(mode));
+}
+
+/// Register (or replace) this thread's [`FATAL_HOOK`] — fired just before an
+/// `ExitThread` `pthread_exit`. No-op on the `ExitProcess` path (the process is
+/// ending anyway). Thread-scoped exactly like [`set_fatal_mode`].
+pub(crate) fn set_fatal_hook(hook: Box<dyn Fn()>) {
+    FATAL_HOOK.with(|h| *h.borrow_mut() = Some(hook));
 }
 
 /// The shared terminal call for every guest-fatal condition (S21 step 1) —
@@ -169,6 +184,15 @@ pub(crate) fn fatal_exit(code: i32) -> ! {
     match FATAL_MODE.with(std::cell::Cell::get) {
         FatalMode::ExitProcess => std::process::exit(code),
         FatalMode::ExitThread => {
+            // Signal the supervisor BEFORE the thread vanishes — `pthread_exit`
+            // below runs no Drop glue, so this hook is its only chance to learn
+            // of the death. The failure message/stack-trace was already written
+            // to `vm.out` (forwarded to the UI transcript) by the caller.
+            FATAL_HOOK.with(|h| {
+                if let Some(f) = h.borrow().as_ref() {
+                    f();
+                }
+            });
             // SAFETY: terminates only the calling thread; never touches
             // memory, never returns. `value` (the thread's "exit status"
             // pointer) is unused by anything that would ever join a

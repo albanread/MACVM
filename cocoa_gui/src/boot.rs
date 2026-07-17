@@ -67,12 +67,39 @@ pub struct WiredVms {
     pub primary_thread: JoinHandle<()>,
 }
 
+/// Boot the UI worker VM **in place on the current (main) thread** and wire it to
+/// the primary (Cocoa GUI CG4): boot the base world, flip to `ui_fatal_mode`
+/// (`ExitProcess` on main — CG0), layer the conditional `cocoaui.list`, and take
+/// on the Worker role so its `reply:`/`uiRequest:` reach the primary through
+/// `to_primary`. `id`/`to_primary` come from the primary's
+/// [`macvm::embed::VmHandle::register_hosted_worker`] (via the watchdog
+/// supervisor); on a respawn the caller re-points the role in place
+/// (`install_worker_role`), never re-booting the UI worker (it holds no durable
+/// state — `feedback_recover_clean_or_die`).
+pub fn boot_ui_worker(
+    world_dir: &std::path::Path,
+    cocoaui_list: &std::path::Path,
+    ui_fatal_mode: FatalMode,
+    id: u32,
+    to_primary: InboxSender,
+) -> Result<VmHandle, VmError> {
+    let mut ui = VmHandle::boot(vm_options(), world_dir).map_err(|e| VmError {
+        msg: format!("UI worker boot failed: {}", e.msg),
+    })?;
+    macvm::embed::set_fatal_mode(ui_fatal_mode);
+    ui.load_list(cocoaui_list).map_err(|e| VmError {
+        msg: format!("loading {} failed: {}", cocoaui_list.display(), e.msg),
+    })?;
+    ui.install_worker_role(id, to_primary);
+    Ok(ui)
+}
+
 /// VM options for a Cocoa-GUI VM — `VmOptions::from_env` (so
 /// `MACVM_JIT`/`MACVM_HEAP`/… are honored) with the JIT defaulting to ON when
 /// `MACVM_JIT` is unset. The GUI runs real programs interactively and **the
 /// embedded VM must support the JIT** (`feedback_jit_must_be_supported_embedded`)
 /// — mirrors `gui::vm_host::gui_vm_options`. `MACVM_JIT=off` still overrides.
-fn vm_options() -> VmOptions {
+pub(crate) fn vm_options() -> VmOptions {
     let mut opts = VmOptions::from_env();
     if opts.heap_mib == VmOptions::default().heap_mib && std::env::var_os("MACVM_HEAP").is_none() {
         opts.heap_mib = DEFAULT_HEAP_MIB;
@@ -101,6 +128,15 @@ fn vm_options() -> VmOptions {
 /// Returns `Err` if either VM fails to boot or the primary cannot register the
 /// UI worker — a clean error the caller reports, never a hang or a partial run
 /// loop.
+///
+/// **CG4 note:** this is the CG2 low-level *wiring seam* (primary boot + register
+/// + UI-worker boot up to the run loop, no dispatch loop and no restart). The
+/// production boot in `main.rs` now goes through the watchdog
+/// [`supervisor::PrimarySupervisor`], which runs the primary's dispatch loop and
+/// respawns it from source; this fn stays as the machine-checkable wiring gate
+/// (`boot_handshake_wires_both_vms_headless`), hence `#[allow(dead_code)]` for
+/// the non-test bin build.
+#[allow(dead_code)]
 pub fn handshake_wire_vms(
     world_dir: PathBuf,
     cocoaui_list: PathBuf,
@@ -169,6 +205,9 @@ pub fn handshake_wire_vms(
 
 /// The primary (watchdog) thread body: boot the persistent world, become a
 /// primary, register the UI worker, signal ready, poke the link once, then park.
+/// (CG2 seam; CG4 production uses [`supervisor::PrimarySupervisor`] instead — see
+/// [`handshake_wire_vms`].)
+#[allow(dead_code)]
 fn primary_thread_main(
     world_dir: PathBuf,
     wake: InboxWakeFn,

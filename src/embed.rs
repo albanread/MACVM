@@ -65,6 +65,18 @@ pub fn set_fatal_mode(mode: FatalMode) {
     crate::runtime::vm_state::set_fatal_mode(mode);
 }
 
+/// Register a hook fired on THIS thread the instant before an `ExitThread`
+/// fatal `pthread_exit` — the one exact signal a supervisor can use to learn
+/// its `VmHandle` thread has died (`pthread_exit` runs no `Drop`, so a dropped
+/// channel/`join` cannot report it). Thread-scoped like [`set_fatal_mode`];
+/// call it once on the VM's own thread after boot. The Cocoa GUI's primary
+/// generation uses this to post a "died" event to its watchdog, so ONLY a
+/// genuine fatal (never a merely-busy VM running a long doit) triggers a
+/// respawn. No-op if that thread's [`FatalMode`] is `ExitProcess`.
+pub fn set_thread_fatal_hook(hook: Box<dyn Fn()>) {
+    crate::runtime::vm_state::set_fatal_hook(hook);
+}
+
 // ── The UI worker's thread-local `*mut VmHandle` + VM generation (CG3) ────────
 //
 // design (`cocoa_gui_design.md` §3 step 4, §4.3): the UI worker — pinned to the
@@ -1102,6 +1114,39 @@ impl VmHandle {
     /// `load_world`, run before the run loop is live).
     pub fn load_list(&mut self, path: &Path) -> Result<(), VmError> {
         frontend::world::load_list(&mut self.vm, path).map_err(|e| VmError { msg: e.to_string() })
+    }
+
+    /// Flip THIS (primary) VM's transcript so its output is forwarded to the UI
+    /// worker's inbox as `{#workerTranscript. 0. text}` envelopes (Cocoa GUI
+    /// CG4, `cocoa_gui_design.md` §7.4) — the exact `ForwardTranscript` machinery
+    /// M2 uses worker→primary, direction-flipped and UNtagged (the primary is
+    /// the environment's own console, not a sub-worker). The UI worker's
+    /// `dispatchOne:` shows each line on its Transcript view. `ui_id` is the UI
+    /// worker's id in this primary's registry (from [`register_hosted_worker`]);
+    /// a no-op if there is no such live worker. Call after registering the UI
+    /// worker, re-called on each respawn (§5.1).
+    pub fn forward_transcript_to_ui(&mut self, ui_id: u32) {
+        if let Some(dest) = crate::runtime::workers::worker_inbox_sender(&self.vm, ui_id) {
+            self.set_transcript(Box::new(crate::runtime::workers::ForwardTranscript::to(
+                0, dest,
+            )));
+        }
+    }
+
+    /// Drain one inbound envelope into THIS (hosted UI worker) VM and route it —
+    /// the public face of the `stage_pending` + `exec("Worker dispatchInbox.")`
+    /// pair (Cocoa GUI CG4): the main-thread run-loop drain source calls this per
+    /// envelope it pulls off the [`crate::runtime::workers::HostedInbox`]. The UI
+    /// worker routes via `dispatchInbox` → `dispatchOne:` (NOT `dispatchPending`)
+    /// so a `#uiReply` fires its pending continuation and a `{#workerTranscript.
+    /// 0. text}` reaches the Transcript view. Errors surface as [`GuestError`]
+    /// (the caller reports; the UI worker's `ErrorPolicy::Resume` keeps it alive).
+    pub fn dispatch_hosted_envelope(
+        &mut self,
+        env: crate::runtime::workers::Envelope,
+    ) -> Result<(), GuestError> {
+        self.stage_pending(env);
+        self.exec("Worker dispatchInbox.")
     }
 
     /// Park an inbound envelope in the Worker-role staging slot (the
@@ -3077,6 +3122,251 @@ mod tests {
             primary.eval("WkTest bad").expect("bad").trim(),
             "0",
             "the continuation must see the right echoed value (21*2 = 42)"
+        );
+    }
+
+    // ── Cocoa GUI CG4: request protocol + (peer,corr) namespacing + restart ──
+
+    /// A UI worker with a tiny result scoreboard, booted in place on this thread
+    /// (base world — the request protocol lives in `47_worker.mst`, so the
+    /// conditional Cocoa layer is not needed to exercise it).
+    fn boot_ui_worker(id: u32, to_primary: crate::runtime::workers::InboxSender) -> VmHandle {
+        let mut ui = VmHandle::boot(
+            VmOptions {
+                heap_mib: 64,
+                jit: JitMode::Off,
+                ..Default::default()
+            },
+            Path::new("world"),
+        )
+        .expect("boot the UI worker VM in place");
+        ui.install_worker_role(id, to_primary);
+        ui.exec(
+            "Object subclass: UiT [ <classVars: R>
+                UiT class >> r: x [ R := x ]  UiT class >> r [ ^R ] ]",
+        )
+        .expect("UI-side scoreboard");
+        ui
+    }
+
+    /// Drive one Workspace ⌘P round-trip end to end: the UI worker ships `src`
+    /// as a `#doit`, the primary evaluates + replies, the UI worker's inbox is
+    /// drained so the continuation records the result — assert it equals
+    /// `expect` (a printString).
+    fn ui_doit_round_trip(
+        primary: &mut VmHandle,
+        ui: &mut VmHandle,
+        inbox: &crate::runtime::workers::HostedInbox,
+        src: &str,
+        expect: &str,
+    ) {
+        ui.exec("UiT r: nil.").expect("reset the scoreboard");
+        ui.exec(&format!("Worker uiDoit: '{src}' onReply: [:r | UiT r: r]."))
+            .expect("ship the doit request to the primary");
+        // The request now sits in the primary's inbox: drain + route + evaluate
+        // + reply — all on the primary, through execute_do_it.
+        primary
+            .exec("Worker dispatchInbox.")
+            .expect("the primary serves the #uiReq and replies");
+        // The reply now sits in the UI worker's inbox. The UI worker routes via
+        // dispatchInbox → dispatchOne: (NOT dispatchPending): dispatchOne: fires
+        // the pending continuation keyed by (peer 0, corr).
+        let mut drained = 0;
+        while let Some(env) = inbox.poll() {
+            ui.stage_pending(env);
+            ui.exec("Worker dispatchInbox.")
+                .expect("the UI worker routes the #uiReply to its continuation");
+            drained += 1;
+        }
+        assert!(
+            drained >= 1,
+            "the primary's #uiReply must reach the UI worker's inbox"
+        );
+        assert_eq!(
+            ui.eval("UiT r").expect("result").trim(),
+            expect,
+            "the doit ran on the primary and its result came back to the UI worker"
+        );
+    }
+
+    #[test]
+    fn ui_request_doit_round_trips_through_the_primary() {
+        // CG4 gate (cocoa_gui_design.md §7.3): a UI worker → primary {#uiReq.
+        // corr. #doit. source} runs the doit ON the primary (where the
+        // persistent objects live) through the existing execute_do_it path, and
+        // its {#uiReply. corr. result} comes back to the UI worker's
+        // continuation. Two logical VMs in one process, drains driven by this
+        // thread — the hosted-worker arrangement now carrying the request
+        // protocol.
+        let mut primary = boot_worker_primary();
+        let (id, inbox, to_primary) =
+            crate::runtime::workers::register_hosted_worker(&mut primary.vm, Arc::new(|| {}))
+                .expect("register the hosted UI worker on the primary");
+        let mut ui = boot_ui_worker(id, to_primary);
+
+        ui_doit_round_trip(&mut primary, &mut ui, &inbox, "3 + 4", "'7'");
+        // A second, different doit proves the corr advances and the loop keeps
+        // routing to the right continuation.
+        ui_doit_round_trip(&mut primary, &mut ui, &inbox, "6 * 7", "'42'");
+    }
+
+    #[test]
+    fn peer_corr_namespacing_prevents_cross_peer_continuation_collision() {
+        // Review R4 (cocoa_gui_design.md §7.3): PendingReplies keyed by corr
+        // ALONE lets peerA's corr=1 reply fire peerB's corr=1 continuation,
+        // because each VM runs its OWN NextCorr. Construct BOTH (peerA=1, corr=1)
+        // and (peerB=2, corr=1) continuations, land a distinguishable reply from
+        // each (both corr=1), and prove the RIGHT two continuations fire — not
+        // swapped, not lost (keyed by corr alone, the second registration would
+        // overwrite the first at key 1 and one continuation would vanish).
+        let mut primary = boot_worker_primary();
+        primary
+            .exec(
+                "Object subclass: R4 [ <classVars: A B>
+                    R4 class >> a: x [ A := x ]  R4 class >> b: x [ B := x ]
+                    R4 class >> a [ ^A ]  R4 class >> b [ ^B ] ]",
+            )
+            .expect("R4 scoreboard");
+        primary
+            .exec("Worker registerReply: [:p | R4 a: p] fromPeer: 1 corr: 1.")
+            .expect("register peer-1 continuation at corr 1");
+        primary
+            .exec("Worker registerReply: [:p | R4 b: p] fromPeer: 2 corr: 1.")
+            .expect("register peer-2 continuation at corr 1");
+
+        // Land a distinguishable reply from each peer, both corr=1, straight
+        // into the primary's inbox (the same transport a real worker reply uses).
+        let bytes_a = primary
+            .eval_to_bytes("Worker pickle: 'fromA'")
+            .expect("pickle A");
+        let bytes_b = primary
+            .eval_to_bytes("Worker pickle: 'fromB'")
+            .expect("pickle B");
+        let inbox = crate::runtime::workers::primary_inbox_sender(&primary.vm)
+            .expect("the primary's inbox sender");
+        inbox
+            .send(crate::runtime::workers::Envelope {
+                from: 1,
+                corr: 1,
+                bytes: bytes_a,
+            })
+            .expect("land peer-1 reply");
+        inbox
+            .send(crate::runtime::workers::Envelope {
+                from: 2,
+                corr: 1,
+                bytes: bytes_b,
+            })
+            .expect("land peer-2 reply");
+
+        primary
+            .exec("Worker dispatchInbox.")
+            .expect("route both replies");
+
+        assert_eq!(
+            primary.eval("R4 a").expect("a").trim(),
+            "'fromA'",
+            "peer 1's corr=1 reply fired peer 1's continuation"
+        );
+        assert_eq!(
+            primary.eval("R4 b").expect("b").trim(),
+            "'fromB'",
+            "peer 2's corr=1 reply fired peer 2's continuation — NOT swapped, NOT lost"
+        );
+    }
+
+    #[test]
+    fn primary_respawn_from_source_re_syncs_the_ui_worker() {
+        // CG4 §5/§5.1, the headless slice of the watchdog restart: the primary is
+        // respawned FROM SOURCE and the UI worker re-syncs — a fresh primary
+        // registers the UI worker anew, the UI worker's reply link is re-pointed
+        // to it, and the next doit round-trips. Death DETECTION (a fatal doit
+        // pthread_exiting the primary thread, caught by the watchdog) is the
+        // user's on-screen gate; this proves the respawn + re-sync + next-doit
+        // core the watchdog drives, without a real-time timeout or a real
+        // pthread_exit.
+        //
+        // The UI worker holds no durable state, so it survives the primary's
+        // death untouched (feedback_recover_clean_or_die): boot it ONCE, outside
+        // the generations.
+        let mut ui = {
+            // A throwaway link just to construct the worker; re-pointed below.
+            let mut g0 = boot_worker_primary();
+            let (id, _inbox, to_primary) =
+                crate::runtime::workers::register_hosted_worker(&mut g0.vm, Arc::new(|| {}))
+                    .expect("bootstrap link");
+            boot_ui_worker(id, to_primary)
+        };
+
+        // Generation 1: a from-source primary, the UI worker re-pointed onto it.
+        let mut gen1 = boot_worker_primary();
+        let (id1, inbox1, to_primary1) =
+            crate::runtime::workers::register_hosted_worker(&mut gen1.vm, Arc::new(|| {}))
+                .expect("register the UI worker on generation 1");
+        ui.install_worker_role(id1, to_primary1);
+        ui_doit_round_trip(&mut gen1, &mut ui, &inbox1, "6 * 7", "'42'");
+
+        // Scripted primary death: drop the whole VM generation. Its heap unmaps,
+        // its inbox receiver drops — the honest clean loss the design takes over
+        // a fake rollback (feedback_recover_clean_or_die). Any outstanding
+        // continuations to it are orphaned with the dead VM.
+        drop(gen1);
+        drop(inbox1);
+
+        // Respawn FROM SOURCE (the watchdog's boot closure) + re-register the UI
+        // worker, re-pointing its reply link onto the fresh primary — the
+        // §5.1 re-sync.
+        let mut gen2 = boot_worker_primary();
+        let (id2, inbox2, to_primary2) =
+            crate::runtime::workers::register_hosted_worker(&mut gen2.vm, Arc::new(|| {}))
+                .expect("register the UI worker on the respawned primary");
+        ui.install_worker_role(id2, to_primary2);
+
+        // The next doit works — the environment recovered and the UI re-synced.
+        ui_doit_round_trip(&mut gen2, &mut ui, &inbox2, "100 + 1", "'101'");
+    }
+
+    #[test]
+    fn primary_transcript_forwards_to_the_ui_worker() {
+        // CG4 §7.4: the primary's OWN transcript is forwarded to the UI worker's
+        // inbox (ForwardTranscript, direction-flipped, UNtagged) and the UI
+        // worker's dispatchOne: shows each line on ITS Transcript — the "primary
+        // → UI transcript sink" the on-screen Transcript view renders.
+        struct VecSink(Arc<Mutex<Vec<String>>>);
+        impl TranscriptSink for VecSink {
+            fn show(&mut self, text: &str) {
+                self.0.lock().unwrap().push(text.to_string());
+            }
+        }
+        let mut primary = boot_worker_primary();
+        let (id, inbox, to_primary) =
+            crate::runtime::workers::register_hosted_worker(&mut primary.vm, Arc::new(|| {}))
+                .expect("register the UI worker");
+        let mut ui = boot_ui_worker(id, to_primary);
+
+        // The UI worker's Transcript view stands in as a capturing sink.
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        ui.set_transcript(Box::new(VecSink(captured.clone())));
+
+        // Flip the primary's transcript to the UI worker's inbox, then write.
+        primary.forward_transcript_to_ui(id);
+        primary
+            .exec("Transcript showCr: 'hello from the primary'.")
+            .expect("primary writes to its (now forwarded) transcript");
+
+        // Drain the UI worker's inbox — dispatchOne: shows the forwarded line.
+        while let Some(env) = inbox.poll() {
+            ui.dispatch_hosted_envelope(env)
+                .expect("UI worker routes the forwarded transcript");
+        }
+        let lines = captured.lock().unwrap();
+        assert!(
+            lines.iter().any(|l| l.contains("hello from the primary")),
+            "the primary's transcript line must reach the UI worker's Transcript, got {lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains("[w0]")),
+            "the primary's own transcript must be UNtagged (no [w0]), got {lines:?}"
         );
     }
 

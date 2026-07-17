@@ -240,14 +240,22 @@ fn died_envelope(id: u32) -> Envelope {
     }
 }
 
-/// A worker's transcript, forwarded (M2): everything the worker writes to
-/// its `vm.out` — `Transcript show:`, error traces — becomes a
-/// `{#workerTranscript. id. text}` control envelope through the same inbox
-/// as every data message; the primary's dispatch shows it, `[w<id>]`-tagged,
-/// on ITS transcript. A worker never owns a console of its own.
-struct ForwardTranscript {
+/// A VM's transcript, forwarded through the inbox as `{#workerTranscript. id.
+/// text}` control envelopes — one delivery mechanism for output too. Two
+/// directions use it:
+///
+/// * **worker → primary (M2):** everything a spawned worker writes to its
+///   `vm.out` (`Transcript show:`, error traces) reaches the primary's
+///   transcript, `[w<id>]`-tagged (`id` ≥ 1) so the primary can tell workers
+///   apart.
+/// * **primary → UI worker (Cocoa GUI CG4, `cocoa_gui_design.md` §7.4):** the
+///   primary's own transcript is forwarded to the UI worker's inbox, whose
+///   `dispatchOne:` appends it to the Transcript view. `id` is 0 here (the
+///   primary is the environment's *own* console, not a sub-worker), so it is
+///   emitted UNTAGGED — `[w0]` would be noise on the primary's own lines.
+pub struct ForwardTranscript {
     id: u32,
-    to_primary: InboxSender,
+    dest: InboxSender,
     /// Are we at the start of an output line? `vm.out` writes arrive as many
     /// small fragments (an error trace is dozens of `write!` pieces); tagging
     /// every fragment would shred the output with `[w1]`s. Instead each
@@ -257,21 +265,42 @@ struct ForwardTranscript {
     at_line_start: bool,
 }
 
+impl ForwardTranscript {
+    /// A transcript sink that forwards every write to `dest`'s inbox as a
+    /// `{#workerTranscript. id. text}` envelope. `id` ≥ 1 tags each line
+    /// `[w<id>]` (a spawned worker); `id == 0` forwards untagged (the primary's
+    /// own transcript, CG4 §7.4).
+    pub fn to(id: u32, dest: InboxSender) -> ForwardTranscript {
+        ForwardTranscript {
+            id,
+            dest,
+            at_line_start: true,
+        }
+    }
+}
+
 impl crate::embed::TranscriptSink for ForwardTranscript {
     fn show(&mut self, text: &str) {
         if text.is_empty() {
             return;
         }
-        let tag = format!("[w{}] ", self.id);
-        let mut out = String::with_capacity(text.len() + tag.len());
-        for piece in text.split_inclusive('\n') {
-            if self.at_line_start {
-                out.push_str(&tag);
+        let out = if self.id == 0 {
+            // The primary's own transcript — untagged.
+            self.at_line_start = text.ends_with('\n');
+            text.to_string()
+        } else {
+            let tag = format!("[w{}] ", self.id);
+            let mut out = String::with_capacity(text.len() + tag.len());
+            for piece in text.split_inclusive('\n') {
+                if self.at_line_start {
+                    out.push_str(&tag);
+                }
+                out.push_str(piece);
+                self.at_line_start = piece.ends_with('\n');
             }
-            out.push_str(piece);
-            self.at_line_start = piece.ends_with('\n');
-        }
-        let _ = self.to_primary.send(Envelope {
+            out
+        };
+        let _ = self.dest.send(Envelope {
             from: self.id,
             corr: 0,
             bytes: crate::runtime::mop::encode_worker_transcript(i64::from(self.id), &out),
@@ -378,11 +407,7 @@ fn worker_main(
     handle.install_worker_role(id, to_primary.clone());
     // From here on, everything the worker prints (Transcript, error traces)
     // reaches the primary's transcript instead of a stray stdout (M2).
-    handle.set_transcript(Box::new(ForwardTranscript {
-        id,
-        to_primary: to_primary.clone(),
-        at_line_start: true,
-    }));
+    handle.set_transcript(Box::new(ForwardTranscript::to(id, to_primary.clone())));
     if let Some(src) = init {
         if handle.exec(src).is_err() {
             let _ = to_primary.send(died_envelope(id));
@@ -504,6 +529,20 @@ pub fn primary_inbox_sender(vm: &crate::runtime::vm_state::VmState) -> Option<In
         Some(WorkerState::Primary { inbox_tx, .. }) => Some(inbox_tx.clone()),
         _ => None,
     }
+}
+
+/// A clone of the inbox sender for worker `id` in THIS primary's registry —
+/// the link the primary `send`s that worker along. The Cocoa GUI's primary uses
+/// it to aim its transcript-forward sink at the UI worker (CG4 §7.4:
+/// `ForwardTranscript::to(0, ui_inbox)`), reusing the exact transport worker
+/// messages ride. `None` if this VM is not a primary, or there is no live worker
+/// `id`.
+pub fn worker_inbox_sender(vm: &crate::runtime::vm_state::VmState, id: u32) -> Option<InboxSender> {
+    let WorkerState::Primary { links, .. } = vm.workers.as_deref()? else {
+        return None;
+    };
+    let link = links.get(id.checked_sub(1)? as usize)?;
+    link.alive.then(|| link.inbox.clone())
 }
 
 /// THIS VM's own outbound inbox sender, whatever its role — the sender a Cocoa

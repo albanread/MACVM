@@ -1,0 +1,522 @@
+//! The primary watchdog supervisor (`cocoa_gui_design.md` §5.1, sprint CG4).
+//!
+//! The persistent primary VM — the environment's state and brain — runs on its
+//! own OS thread with a Rust-driven dispatch loop (`Worker pumpInbox:`, one beat
+//! per iteration). A **separate** watchdog thread owns that thread's life: it
+//! boots each primary *generation*, waits for its death, and on death (a fatal
+//! doit `pthread_exit`s the generation thread) or an explicit restart **respawns
+//! the primary from source** and hands the fresh `(id, to_primary, hosted_inbox)`
+//! link to the main thread as a **re-sync**. The UI worker holds no durable
+//! state, so it survives the primary's death untouched
+//! (`feedback_recover_clean_or_die`); its work is the primary's, on the primary's
+//! thread.
+//!
+//! **Never `.join()`/`.is_finished()` a generation thread** (the S21 rule,
+//! `gui/src/vm_host.rs`): a thread terminated by `FatalMode::ExitThread`'s
+//! `pthread_exit` runs no unwinding and hangs `join`. Death is observed instead
+//! as an **exact death signal** — the generation's `fatal` hook
+//! ([`macvm::embed::set_thread_fatal_hook`]) posts `Died` the instant before its
+//! `pthread_exit` — so a busy-but-live primary (a multi-second Workspace doit) is
+//! NEVER mistaken for dead (the CG4 review's must-fix; an earlier
+//! heartbeat-timeout draft would have respawned it, discarding the computation
+//! and all session-defined state). Detached generation threads are simply
+//! abandoned, never joined — the S21 model, re-homed to the watchdog thread.
+//!
+//! This module owns ONLY the primary lifecycle. `main.rs` owns the UI worker (on
+//! main), applies each re-sync ([`PrimarySupervisor::poll_resync`]) by re-pointing
+//! the UI worker's reply link + drain inbox, and drives the run loop.
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::Arc;
+use std::thread::JoinHandle;
+use std::time::Duration;
+
+use macvm::runtime::workers::{HostedInbox, InboxSender, InboxWakeFn, WorkerBootFn};
+use macvm::runtime::VmError;
+
+/// One primary generation's link to the UI worker: the worker id in the (fresh)
+/// primary's registry, the reply link the UI worker `send`s along, and the inbox
+/// the UI worker drains for primary→UI traffic. A re-sync replaces all three
+/// together — never a torn mix of an old link with a new inbox (the S21
+/// `WorkerHandles` discipline).
+pub struct PrimaryLink {
+    pub hosted_id: u32,
+    pub to_primary: InboxSender,
+    pub hosted_inbox: HostedInbox,
+}
+
+/// The dispatch-loop beat: how long each `pumpInbox:` blocks in the inbox before
+/// returning to Rust to re-check its stop flag. It bounds only how quickly a
+/// clean retire (a `Restart`) takes effect — liveness is NOT inferred from beat
+/// timing (see [`Event`]).
+const PUMP_BEAT_MS: u64 = 250;
+
+/// Bounded backoff between respawn attempts when a fresh generation fails to
+/// boot, and the cap after which the watchdog gives up: a deterministic boot
+/// failure is unrecoverable, so spinning backoff-free (the first draft) would
+/// peg a core forever with no way out.
+const RESPAWN_BACKOFF: Duration = Duration::from_millis(200);
+const MAX_CONSECUTIVE_BOOT_FAILURES: u32 = 5;
+
+/// What the watchdog blocks on. There is deliberately **no heartbeat and no
+/// timeout**: a primary running a multi-second Workspace doit (a benchmark, a
+/// loop, image work — the routine load of a Smalltalk environment) is ALIVE,
+/// not dead, and must never be respawned (that would discard the computation
+/// AND every class/global defined this session, since a respawn boots from
+/// source — CG4 review). So death is signalled EXACTLY: `Died` is posted by the
+/// generation's fatal hook ([`macvm::embed::set_thread_fatal_hook`]) the instant
+/// before its `pthread_exit`, and `Restart` is the explicit user/test respawn.
+enum Event {
+    Died,
+    #[allow(dead_code)]
+    Restart,
+}
+
+/// The main thread's handle onto the supervised primary: request a restart, and
+/// poll for a re-sync link to re-point the UI worker onto a fresh primary.
+pub struct PrimarySupervisor {
+    /// Written by [`PrimarySupervisor::restart`] (the reserved explicit-restart
+    /// path); the automatic fatal-recovery respawn arrives on the same channel
+    /// from a generation's own `Died` hook, so it needs no poke from here.
+    #[allow(dead_code)]
+    events: Sender<Event>,
+    resync_rx: Receiver<PrimaryLink>,
+    /// Detached — never joined (the watchdog outlives every generation and the
+    /// process ends by `[NSApp terminate:]`).
+    _watchdog: JoinHandle<()>,
+}
+
+impl PrimarySupervisor {
+    /// Boot the first primary generation and start the watchdog. Blocks until the
+    /// primary is up and has registered the UI worker (or reports a boot
+    /// failure), returning the supervisor + the first [`PrimaryLink`] for
+    /// `main.rs` to wire the UI worker onto. `ui_wake` is the UI worker inbox's
+    /// run-loop poke, fired whenever a primary generation `send`s it (and once
+    /// per re-sync, so main's drain source picks the new link up).
+    pub fn spawn(
+        world_boot: WorkerBootFn,
+        ui_wake: InboxWakeFn,
+    ) -> Result<(PrimarySupervisor, PrimaryLink), VmError> {
+        let (events_tx, events_rx) = mpsc::channel::<Event>();
+        let (resync_tx, resync_rx) = mpsc::channel::<PrimaryLink>();
+        // The first generation's link comes back on its own channel so `spawn`
+        // can surface a boot failure synchronously; later generations arrive as
+        // re-syncs on `resync_rx`.
+        let (first_tx, first_rx) = mpsc::channel::<Result<PrimaryLink, VmError>>();
+
+        let events_for_hb = events_tx.clone();
+        let watchdog = std::thread::Builder::new()
+            .name("macvm-cocoa-watchdog".into())
+            .spawn(move || {
+                watchdog_main(
+                    world_boot,
+                    ui_wake,
+                    events_for_hb,
+                    events_rx,
+                    first_tx,
+                    resync_tx,
+                );
+            })
+            .map_err(|e| VmError {
+                msg: format!("could not spawn the primary watchdog thread: {e}"),
+            })?;
+
+        let first = match first_rx.recv() {
+            Ok(Ok(link)) => link,
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                return Err(VmError {
+                    msg: "the primary watchdog died before the first generation registered".into(),
+                })
+            }
+        };
+        Ok((
+            PrimarySupervisor {
+                events: events_tx,
+                resync_rx,
+                _watchdog: watchdog,
+            },
+            first,
+        ))
+    }
+
+    /// Request an immediate respawn of the primary from source — the explicit
+    /// restart (a future ⌘R "Restart Environment"; the deterministic trigger the
+    /// headless supervisor gate uses). The automatic fatal-recovery path does not
+    /// need this: a fatal doit's own `Died` hook wakes the watchdog directly. The
+    /// fresh generation's link arrives on [`poll_resync`](Self::poll_resync).
+    #[allow(dead_code)]
+    pub fn restart(&self) {
+        let _ = self.events.send(Event::Restart);
+    }
+
+    /// A pending re-sync link, or `None` — the fresh primary generation the
+    /// watchdog booted after a death/restart. `main.rs` calls this from its
+    /// run-loop drain and, on `Some`, re-points the UI worker's reply link +
+    /// drain inbox onto the new primary.
+    pub fn poll_resync(&self) -> Option<PrimaryLink> {
+        self.resync_rx.try_recv().ok()
+    }
+}
+
+/// The watchdog thread body: boot generations, block until each one's `Died`
+/// signal (or an explicit restart), and respawn from source — the S21 supervisor,
+/// re-homed to a thread that is neither the primary nor main so it outlives
+/// either.
+fn watchdog_main(
+    world_boot: WorkerBootFn,
+    ui_wake: InboxWakeFn,
+    events_tx: Sender<Event>,
+    events_rx: Receiver<Event>,
+    first_tx: Sender<Result<PrimaryLink, VmError>>,
+    resync_tx: Sender<PrimaryLink>,
+) {
+    let mut generation: u64 = 0;
+    let mut consecutive_boot_failures: u32 = 0;
+    loop {
+        generation += 1;
+        // Each generation runs to death or until its stop flag is set (a clean
+        // retire on restart — a fatal instead `pthread_exit`s the thread, which
+        // this flag can no longer reach, and that is fine: it is detached).
+        let stop = Arc::new(AtomicBool::new(false));
+        let (reg_tx, reg_rx) = mpsc::channel::<Result<PrimaryLink, VmError>>();
+
+        let boot = world_boot.clone();
+        let wake = ui_wake.clone();
+        let hb = events_tx.clone();
+        let stop_for_gen = stop.clone();
+        let spawned = std::thread::Builder::new()
+            .name(format!("macvm-cocoa-primary-gen{generation}"))
+            .spawn(move || primary_generation_main(boot, wake, reg_tx, hb, stop_for_gen));
+        if let Err(e) = spawned {
+            let _ = first_tx.send(Err(VmError {
+                msg: format!("could not spawn primary generation {generation}: {e}"),
+            }));
+            return;
+        }
+
+        // Wait for this generation to register the UI worker (or report a boot
+        // failure / die before registering).
+        let link = match reg_rx.recv() {
+            Ok(Ok(link)) => {
+                consecutive_boot_failures = 0;
+                link
+            }
+            Ok(Err(e)) => {
+                if generation == 1 {
+                    let _ = first_tx.send(Err(e));
+                    return;
+                }
+                // A respawn that failed to boot: retire the flag, back off, and
+                // try again (the process is only useful with a live primary) —
+                // but give up after a run of failures rather than spin a core.
+                stop.store(true, Ordering::Release);
+                consecutive_boot_failures += 1;
+                if consecutive_boot_failures >= MAX_CONSECUTIVE_BOOT_FAILURES {
+                    eprintln!(
+                        "macvm-cocoa: primary respawn failed {consecutive_boot_failures}× \
+                         in a row ({}); giving up",
+                        e.msg
+                    );
+                    return;
+                }
+                std::thread::sleep(RESPAWN_BACKOFF);
+                continue;
+            }
+            Err(_) => {
+                // The generation thread vanished before registering.
+                if generation == 1 {
+                    let _ = first_tx.send(Err(VmError {
+                        msg: "primary generation 1 died before registering the UI worker".into(),
+                    }));
+                    return;
+                }
+                stop.store(true, Ordering::Release);
+                consecutive_boot_failures += 1;
+                if consecutive_boot_failures >= MAX_CONSECUTIVE_BOOT_FAILURES {
+                    eprintln!(
+                        "macvm-cocoa: primary respawn died before registering \
+                         {consecutive_boot_failures}× in a row; giving up"
+                    );
+                    return;
+                }
+                std::thread::sleep(RESPAWN_BACKOFF);
+                continue;
+            }
+        };
+
+        // Hand the link to main: the first generation synchronously (so `spawn`
+        // can report failure), later generations as a re-sync + a run-loop poke
+        // so main's drain source picks it up.
+        if generation == 1 {
+            if first_tx.send(Ok(link)).is_err() {
+                return; // main gone before it could receive — nothing to serve
+            }
+        } else {
+            if resync_tx.send(link).is_err() {
+                return;
+            }
+            ui_wake();
+        }
+
+        // Supervise: BLOCK until this generation posts `Died` (its fatal hook,
+        // the instant before `pthread_exit`) or an explicit `Restart` arrives.
+        // No timeout — a primary busy in a long doit is alive, not dead, and is
+        // never respawned. `stop` is best-effort (a `pthread_exit`ed thread
+        // ignores it and is simply abandoned, never joined — the S21 rule).
+        match events_rx.recv() {
+            Ok(Event::Died) | Ok(Event::Restart) => stop.store(true, Ordering::Release),
+            Err(_) => return, // supervisor dropped — nothing left to serve
+        }
+    }
+}
+
+/// One primary generation: boot the world from source, become a primary,
+/// register the UI worker, register its `Died` fatal hook, hand its link back,
+/// then run the Rust-driven dispatch loop — one `Worker pumpInbox:` beat per
+/// iteration — until its stop flag is set. A fatal doit `pthread_exit`s this
+/// thread mid-beat, but posts `Died` first so the watchdog respawns. An ordinary
+/// recoverable error (`ErrorPolicy::Resume`) surfaces as an `Err` from the beat:
+/// the VM has
+/// already rewound to its clean idle baseline, so serving simply continues — a
+/// bad doit never restarts the whole environment.
+fn primary_generation_main(
+    world_boot: WorkerBootFn,
+    ui_wake: InboxWakeFn,
+    reg_tx: Sender<Result<PrimaryLink, VmError>>,
+    events: Sender<Event>,
+    stop: Arc<AtomicBool>,
+) {
+    let mut primary = match world_boot() {
+        Ok(h) => h,
+        Err(e) => {
+            let _ = reg_tx.send(Err(VmError {
+                msg: format!("primary boot failed: {}", e.msg),
+            }));
+            return;
+        }
+    };
+    // Installing a worker-boot fn makes this VM the PRIMARY (creates its inbox +
+    // registry). It boots compute workers from the same source (CG8).
+    primary.set_worker_boot(world_boot.clone());
+
+    // Register the UI worker as an externally-hosted peer (CG1). `ui_wake` fires
+    // whenever this primary `send`s the UI worker.
+    let Some((id, hosted_inbox, to_primary)) = primary.register_hosted_worker(ui_wake) else {
+        let _ = reg_tx.send(Err(VmError {
+            msg: "register_hosted_worker failed (not a primary, or the fleet is at its cap)".into(),
+        }));
+        return;
+    };
+
+    // The primary's own transcript now forwards to the UI worker's Transcript
+    // view (§7.4), re-aimed at THIS generation's link.
+    primary.forward_transcript_to_ui(id);
+
+    // Register the death signal: the instant before a GENUINE fatal (heap/stack
+    // exhaustion, or a Die-policy error) `pthread_exit`s THIS thread, post `Died`
+    // so the watchdog respawns. Because `pthread_exit` runs no Drop glue this is
+    // the ONLY signal a dead generation can send — and it fires ONLY on a real
+    // fatal, never merely because the primary is busy in a long doit (the CG4
+    // review's must-fix: a busy primary must never be respawned).
+    macvm::embed::set_thread_fatal_hook(Box::new(move || {
+        let _ = events.send(Event::Died);
+    }));
+
+    if reg_tx
+        .send(Ok(PrimaryLink {
+            hosted_id: id,
+            to_primary,
+            hosted_inbox,
+        }))
+        .is_err()
+    {
+        return; // watchdog gone
+    }
+
+    // The dispatch loop: one `pumpInbox:` beat per iteration, re-checking the
+    // stop flag between beats so a clean `Restart` retires within one beat. A
+    // fatal doit ends this thread inside `exec` (the fatal hook posts `Died`
+    // first). A recoverable guest error rewinds the VM to its clean idle
+    // baseline and returns `Err`: keep serving — a bad doit never restarts the
+    // whole environment, and a long-running one is not death.
+    while !stop.load(Ordering::Acquire) {
+        let _ = primary.exec(&format!("Worker pumpInbox: {PUMP_BEAT_MS}."));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use macvm::embed::VmHandle;
+    use macvm::runtime::{JitMode, VmOptions};
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::AtomicUsize;
+    use std::time::Instant;
+
+    fn world_dir() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../world")
+    }
+
+    fn boot_fn() -> WorkerBootFn {
+        let world = world_dir();
+        Arc::new(move || {
+            VmHandle::boot(
+                VmOptions {
+                    heap_mib: 64,
+                    jit: JitMode::Off,
+                    ..Default::default()
+                },
+                &world,
+            )
+        })
+    }
+
+    /// Boot a UI worker on THIS thread, pointed at `link`, with a result
+    /// scoreboard — the arrangement `main.rs` builds on the main thread.
+    fn boot_ui(link: &PrimaryLink) -> VmHandle {
+        let mut ui = VmHandle::boot(
+            VmOptions {
+                heap_mib: 64,
+                jit: JitMode::Off,
+                ..Default::default()
+            },
+            &world_dir(),
+        )
+        .expect("boot the UI worker");
+        ui.install_worker_role(link.hosted_id, link.to_primary.clone());
+        ui.exec("Object subclass: UiT [ <classVars: R> UiT class >> r: x [ R := x ] UiT class >> r [ ^R ] ]")
+            .expect("UI scoreboard");
+        ui
+    }
+
+    /// Ship a `#doit` and wait (bounded) for its reply to drain back through
+    /// `link.hosted_inbox` — the primary generation's own loop serves it on its
+    /// thread. Asserts the result equals `expect`.
+    fn round_trip(ui: &mut VmHandle, link: &PrimaryLink, src: &str, expect: &str) {
+        ui.exec("UiT r: nil.").unwrap();
+        ui.exec(&format!("Worker uiDoit: '{src}' onReply: [:r | UiT r: r]."))
+            .expect("ship the doit to the supervised primary");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            while let Some(env) = link.hosted_inbox.poll() {
+                ui.dispatch_hosted_envelope(env)
+                    .expect("UI worker routes the reply");
+            }
+            if ui.eval("UiT r").unwrap().trim() == expect {
+                return;
+            }
+            if Instant::now() > deadline {
+                panic!(
+                    "no #uiReply for '{src}' within the deadline (got {:?})",
+                    ui.eval("UiT r")
+                );
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn primary_supervisor_restarts_from_source_and_the_ui_re_syncs() {
+        // CG4 §5.1: the watchdog boots the primary on its own thread, serves a
+        // doit round-trip, then on restart respawns the primary FROM SOURCE and
+        // re-syncs the UI worker onto it — the next doit works. A real threaded
+        // supervisor (the primary generation runs its own pumpInbox loop); the
+        // restart stands in for the on-screen "a fatal doit is detected and the
+        // environment restarts", which drives the identical respawn path.
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let wk = wakes.clone();
+        let ui_wake: InboxWakeFn = Arc::new(move || {
+            wk.fetch_add(1, Ordering::Relaxed);
+        });
+
+        let (sup, mut link) =
+            PrimarySupervisor::spawn(boot_fn(), ui_wake).expect("boot the supervised primary");
+        let mut ui = boot_ui(&link);
+
+        // Generation 1 serves the doit.
+        round_trip(&mut ui, &link, "6 * 7", "'42'");
+
+        // Scripted death → respawn from source. The watchdog delivers a fresh
+        // link as a re-sync; wait for it (bounded).
+        sup.restart();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let new_link = loop {
+            if let Some(l) = sup.poll_resync() {
+                break l;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the watchdog must deliver a re-sync link after a restart"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        };
+
+        // Re-sync the UI worker onto the fresh primary (what main.rs does on the
+        // run loop): re-point the reply link + swap the drain inbox.
+        ui.install_worker_role(new_link.hosted_id, new_link.to_primary.clone());
+        link = new_link;
+
+        // The next doit works — the environment recovered and the UI re-synced.
+        round_trip(&mut ui, &link, "100 + 1", "'101'");
+        assert!(
+            wakes.load(Ordering::Relaxed) >= 1,
+            "the primary→UI link must have fired the run-loop wake"
+        );
+    }
+
+    /// CG4 review must-fix: death is signalled EXACTLY, by the generation's own
+    /// fatal hook — NOT inferred from a heartbeat/timeout that a long doit would
+    /// starve. Prove the real fatal path: a doit that stack-overflows the primary
+    /// (a genuine `fatal_exit`, `ExitThread` → `pthread_exit`) fires the hook,
+    /// the watchdog respawns from source, and the next doit works. A long *live*
+    /// doit takes this same `exec` path WITHOUT a fatal, so it posts no `Died`
+    /// and is never respawned — the property the removed timeout used to violate.
+    #[test]
+    fn a_fatal_doit_signals_death_and_the_primary_respawns() {
+        let ui_wake: InboxWakeFn = Arc::new(|| {});
+        let (sup, mut link) =
+            PrimarySupervisor::spawn(boot_fn(), ui_wake).expect("boot the supervised primary");
+        let mut ui = boot_ui(&link);
+
+        // gen1 is alive and defines a self-recursive class (a class def answers
+        // nil), then we fire the fatal call WITHOUT awaiting a reply — the
+        // generation `pthread_exit`s mid-doit, so no reply ever comes.
+        round_trip(
+            &mut ui,
+            &link,
+            "Object subclass: Cg4Boom [ Cg4Boom class >> boom [ ^self boom ] ]",
+            "'nil'",
+        );
+        // No respawn has happened up to now (a live primary is never respawned).
+        assert!(
+            sup.poll_resync().is_none(),
+            "a live primary must not be respawned before any fatal"
+        );
+
+        // Fire the fatal doit: unbounded recursion overflows the process stack →
+        // `fatal_exit(70)` → the fatal hook posts `Died` → `pthread_exit`.
+        ui.exec("Worker uiDoit: 'Cg4Boom boom' onReply: [:r | UiT r: r].")
+            .expect("ship the fatal doit");
+
+        // The watchdog observes `Died` and respawns from source; wait (bounded)
+        // for the re-sync link.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let new_link = loop {
+            if let Some(l) = sup.poll_resync() {
+                break l;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "a fatal doit must post Died and the watchdog must respawn"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        };
+
+        // Re-sync onto the fresh primary; the environment recovered.
+        ui.install_worker_role(new_link.hosted_id, new_link.to_primary.clone());
+        link = new_link;
+        round_trip(&mut ui, &link, "100 + 1", "'101'");
+    }
+}

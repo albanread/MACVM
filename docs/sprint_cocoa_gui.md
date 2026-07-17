@@ -221,11 +221,30 @@ doit and the UI re-syncs.
   from source and posts a snapshot-invalidate; the UI shows "restarting…"
   and re-syncs.
 
+**CG4-review must-fix (folded before commit): death is signalled EXACTLY, not
+inferred from a heartbeat.** The first draft heartbeated between `pumpInbox:`
+beats and respawned on a timeout — but a beat doesn't return until its doit
+completes, so any Workspace computation over the timeout (a benchmark, a loop,
+image work — routine load) starved the heartbeat and spuriously respawned a
+*live* primary, discarding the result AND every class/global defined that
+session (a respawn boots from source). Fixed by a new core hook
+(`embed::set_thread_fatal_hook`, fired inside `fatal_exit` the instant before
+`pthread_exit`): only a genuine fatal posts `Died`; the watchdog blocks on it
+with no timeout, so a busy primary is never respawned. Four paired should-fixes
+also folded: the `#uiReq` reply now routes from a `(peer, corr)` **snapshotted
+before** the doit runs (a doit that dispatches can't corrupt its own reply
+routing); a re-sync clears the UI worker's pending continuations
+(`Worker abandonPending` — recover clean, no cross-restart leak) after draining
+the dying generation's inbox (its last transcript line isn't lost); and a
+bounded backoff caps the respawn loop on repeated boot failure.
+
 **Acceptance gate.** *On-screen (user):* type `3 + 4`, ⌘P → `7`; `Transcript
 showCr:` appears; a deliberately fatal doit restarts the environment and the
 next doit works. *Headless:* the `#uiReq`/`#uiReply` round-trip; a
 constructed `(peerA, corr=1)` + `(peerB, corr=1)` pair fires the *right* two
-continuations (non-collision); a scripted primary death → respawn → re-sync.
+continuations (non-collision); a scripted primary death → respawn → re-sync;
+**and a fatal (stack-overflow) doit posts `Died` → respawn → next doit works,
+while a live primary is never respawned on time alone.**
 
 **Design ref:** §6, §7.3, §7.4, §5.1, §9.1 items 4 & 9.
 

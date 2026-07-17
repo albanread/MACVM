@@ -1,23 +1,75 @@
 //! `macvm-cocoa` — the native AppKit programming environment (the second,
 //! flagged GUI mode; `cocoa_gui_design.md`). A UI worker VM pinned to the main
 //! thread is a dumb terminal that builds native views from Smalltalk through the
-//! Cocoa bridge; the persistent primary VM lives on a background thread. This
-//! bin owns the AppKit run loop; the callbacks are Smalltalk's.
+//! Cocoa bridge; the persistent primary VM lives on a background thread under a
+//! watchdog. This bin owns the AppKit run loop; the callbacks are Smalltalk's.
 //!
-//! CG2 opens the window: bootstrap AppKit, run the parked-main boot handshake
-//! ([`boot::handshake_wire_vms`]), build ONE `NSWindow` from Smalltalk (`CocoaUI
-//! startup`), and enter `[NSApp run]` with the VM at rest. ⌘Q quits clean. The
-//! delegates/reverse dispatch (CG3), the request protocol + Workspace/Transcript
-//! (CG4), and the browser (CG5+) build on this base.
+//! CG4 wires the environment: the watchdog [`supervisor::PrimarySupervisor`]
+//! boots the primary on its own thread and respawns it from source on a fatal
+//! doit; the UI worker ships Workspace selections as `#uiReq`/`#doit` requests,
+//! the primary evaluates them and replies, and a **default-mode** `CFRunLoopSource`
+//! drains the UI worker's inbox on the main thread (§8). ⌘Q quits clean.
 
 mod boot;
 mod objc;
+mod supervisor;
 
+use std::ffi::c_void;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use macvm::embed::FatalMode;
-use macvm::runtime::workers::InboxWakeFn;
+use macvm::embed::{FatalMode, VmHandle};
+use macvm::runtime::workers::{HostedInbox, InboxWakeFn, WorkerBootFn};
+
+use supervisor::{PrimaryLink, PrimarySupervisor};
+
+/// The main-thread-owned drain state the default-mode `CFRunLoopSource`'s
+/// `perform` reads (its raw pointer is the source's `info`). It owns the UI
+/// worker VM and the supervisor, and holds the CURRENT primary→UI inbox — swapped
+/// wholesale on a re-sync. Only ever touched on the main thread (the run loop is
+/// serial there), so the raw-pointer aliasing with `publish_ui_vm`'s pointer is
+/// never a concurrent access.
+struct DrainState {
+    ui: VmHandle,
+    inbox: HostedInbox,
+    supervisor: PrimarySupervisor,
+}
+
+/// The default-mode drain `perform` (CG4 §8): apply any pending re-sync (re-point
+/// the UI worker onto a freshly respawned primary, swap its drain inbox), then
+/// drain inbound `#uiReply`/`#snapshot`/transcript envelopes into the UI worker.
+/// Runs on the main thread ONLY in `NSDefaultRunLoopMode`, so a snapshot never
+/// swaps mid-tracking/modal.
+extern "C" fn drain_perform(info: *mut c_void) {
+    // SAFETY: `info` is the `&mut *Box<DrainState>` main installed; this runs on
+    // the main thread where nothing else borrows it concurrently.
+    let st = unsafe { &mut *(info as *mut DrainState) };
+
+    while let Some(link) = st.supervisor.poll_resync() {
+        // Drain the DYING generation's inbox before dropping it (CG4 review):
+        // its last buffered envelopes — the fatal doit's transcript line, any
+        // reply that landed before it died — are delivered now, else they are
+        // lost with the old inbox. Replies whose continuations DID land fire
+        // here; the never-answerable ones are abandoned by `environmentRestarted`
+        // below.
+        while let Some(env) = st.inbox.poll() {
+            let _ = st.ui.dispatch_hosted_envelope(env);
+        }
+        // Re-sync onto the fresh primary generation: re-point the reply link +
+        // swap the drain inbox (never a torn mix — replace both together).
+        st.ui
+            .install_worker_role(link.hosted_id, link.to_primary.clone());
+        st.inbox = link.hosted_inbox;
+        // Let the Smalltalk terminal recover clean (abandon dead-primary
+        // continuations) and note the restart.
+        let _ = st.ui.exec("CocoaUI environmentRestarted.");
+    }
+    while let Some(env) = st.inbox.poll() {
+        if let Err(e) = st.ui.dispatch_hosted_envelope(env) {
+            eprintln!("macvm-cocoa: UI worker drain error: {e}");
+        }
+    }
+}
 
 fn main() {
     // (design §3 step 1) AppKit init MUST be on main, before anything AppKit.
@@ -31,49 +83,83 @@ fn main() {
         PathBuf::from(std::env::var_os("MACVM_WORLD").unwrap_or_else(|| "world".into()));
     let cocoaui_list = world_dir.join("cocoaui.list");
 
-    // (design §3 steps 2–4) The parked-main boot handshake: spawn the primary on
-    // the watchdog thread, park awaiting ready, then boot the UI worker VM in
-    // place on THIS main thread (`ExitProcess` — CG0). The run-loop wake is the
-    // real main-run-loop poke (CG4 adds the default-mode drain source it feeds).
+    // The primary's boot-from-source closure — the watchdog respawns the primary
+    // from it on a fatal doit (§5.1). Same world both generations (and compute
+    // workers) boot from.
+    let world_for_boot = world_dir.clone();
+    let world_boot: WorkerBootFn =
+        Arc::new(move || VmHandle::boot(boot::vm_options(), &world_for_boot));
+
+    // The UI worker inbox's run-loop poke: signals the default-mode drain source
+    // and wakes the main run loop (§8). Fired by a primary generation whenever it
+    // `send`s the UI worker, and once per re-sync.
     let wake: InboxWakeFn = Arc::new(objc::wake_main_runloop);
-    let mut wired =
-        match boot::handshake_wire_vms(world_dir, cocoaui_list, FatalMode::ExitProcess, wake) {
-            Ok(w) => w,
+
+    // (design §5.1) Boot the supervised primary on its own thread under the
+    // watchdog; get the first primary→UI link.
+    let (sup, link): (PrimarySupervisor, PrimaryLink) =
+        match PrimarySupervisor::spawn(world_boot, wake) {
+            Ok(v) => v,
             Err(e) => {
-                eprintln!("macvm-cocoa: boot handshake failed: {}", e.msg);
+                eprintln!("macvm-cocoa: primary boot failed: {}", e.msg);
                 std::process::exit(1);
             }
         };
 
-    // (design §3 step 4) Publish the thread-local `*mut VmHandle` the CG3
-    // callback trampolines will read (a stub now — no trampolines until CG3).
-    boot::publish_ui_vm(&mut wired.ui_worker as *mut _);
+    // (design §3 step 4) Boot the UI worker VM in place on THIS main thread
+    // (`ExitProcess` — CG0), layer the Cocoa world, take on its Worker role.
+    let ui = match boot::boot_ui_worker(
+        &world_dir,
+        &cocoaui_list,
+        FatalMode::ExitProcess,
+        link.hosted_id,
+        link.to_primary.clone(),
+    ) {
+        Ok(ui) => ui,
+        Err(e) => {
+            eprintln!("macvm-cocoa: UI worker boot failed: {}", e.msg);
+            std::process::exit(1);
+        }
+    };
 
-    // (design §8) Arm the AppKit main-thread guard now the native GUI is live:
-    // from here the main thread is AppKit's, and an off-main AppKit send from a
-    // background VM is refused. Armed AFTER the boot handshake (which loads no
-    // AppKit) so boot behaves exactly as the headless handshake test, and
-    // BEFORE the first window build below. This flag is what keeps the guard a
-    // no-op for the shipping WKWebView GUI, whose worker VM resolves AppKit
-    // classes off-main by design.
+    // Own the UI worker + supervisor + current inbox in one heap box, whose stable
+    // address is the drain source's `info`.
+    let mut drain = Box::new(DrainState {
+        ui,
+        inbox: link.hosted_inbox,
+        supervisor: sup,
+    });
+
+    // (design §3 step 4) Publish the thread-local `*mut VmHandle` the CG3/CG4
+    // callback trampolines read (the Workspace ⌘P/⌘D action target dispatches
+    // through it).
+    boot::publish_ui_vm(&mut drain.ui as *mut _);
+
+    // (design §8) Arm the AppKit main-thread guard now the native GUI is live.
     macvm::runtime::objc_bridge::enable_cocoa_ui_mode();
 
-    // (design §3 step 4) Run the Smalltalk startup doit: build ONE NSWindow
-    // through the Cocoa bridge and order it front. Runs INLINE on main (the UI
-    // worker IS main, so the bridge's `onMain` hop is a no-op), then returns
-    // here with the VM at rest.
-    if let Err(e) = wired.ui_worker.exec("CocoaUI startup.") {
+    // (design §8) Install the UI worker's inbox drain as a DEFAULT-MODE
+    // CFRunLoopSource; `wake_main_runloop` signals it. Its `info` is the stable
+    // heap address of the drain state.
+    let info = &mut *drain as *mut DrainState as *mut c_void;
+    objc::install_default_mode_drain(info, drain_perform);
+
+    // (design §3 step 4) Build the window + Workspace/Transcript views + menu
+    // from Smalltalk, then return with the VM at rest.
+    if let Err(e) = drain.ui.exec("CocoaUI startup.") {
         eprintln!("macvm-cocoa: CocoaUI startup failed: {e}");
         std::process::exit(1);
     }
 
-    // A minimal main menu with a Quit item (⌘Q → `terminate:`) so the app quits
-    // cleanly. The full Smalltalk-built menu bar is CG4 (design §7/R5).
+    // A minimal main menu with a Quit item (⌘Q → `terminate:`). The Workspace
+    // Do It / Print It items are built in Smalltalk by `CocoaUI startup`.
     objc::install_quit_menu(app);
 
-    // (design §3 step 5) Enter `[NSApp run]` with the VM quiescent. Blocks until
-    // ⌘Q → `terminate:` → process exit. Every future AppKit callback is a
-    // top-level VM entry (CG3).
+    // (design §3 step 5) Enter `[NSApp run]` with the VM quiescent. Every future
+    // AppKit callback is a top-level VM entry; the drain fires in default mode.
     objc::activate(app);
     objc::run(app);
+
+    // Keep the drain state (UI worker VM, supervisor) alive for the whole run.
+    drop(drain);
 }

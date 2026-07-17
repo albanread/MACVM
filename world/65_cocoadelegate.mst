@@ -48,6 +48,9 @@ Object subclass: MacvmDelegate [
     MacvmDelegate class >> outlineSourceOn: aReceiver [ ^self on: aReceiver role: #outline ]
     MacvmDelegate class >> windowDelegateOn: aReceiver [ ^self on: aReceiver role: #window ]
     MacvmDelegate class >> textDelegateOn: aReceiver [ ^self on: aReceiver role: #text ]
+    "A menu-item/button target answering macvmDoIt:/macvmPrintIt: synchronously
+     on the main thread (CG4 Workspace ⌘D/⌘P) — the receiver implements those."
+    MacvmDelegate class >> actionTargetOn: aReceiver [ ^self on: aReceiver role: #action ]
 
     MacvmDelegate class >> primNewDelegate: aRole ticket: ticket [
         <primitive: 249>

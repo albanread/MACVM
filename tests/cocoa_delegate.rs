@@ -232,6 +232,47 @@ fn main() {
         "after a recovered SIGSEGV, the next delegate call must still dispatch"
     );
 
+    // (CG4) The action-target role: a menu item / button (a Workspace ⌘P/⌘D)
+    // dispatches SYNCHRONOUSLY on the main thread through a `MacvmActionTarget`
+    // delegate answering `macvmPrintIt:`/`macvmDoIt:` — the correct mechanism for
+    // a UI-worker-LOCAL control (a C4 `Cocoa action:` would post to the primary,
+    // unable to read the local NSTextView). This proves the dispatch seam; the
+    // shipDoit → uiRequest → primary-eval → reply round-trip is proven headless in
+    // embed.rs. (`0` return is the void shape's default from the callback door.)
+    vm.exec(
+        "Object subclass: CG4Act [ <classVars: N Which> \
+           CG4Act class >> reset [ N := 0. Which := nil ] \
+           CG4Act class >> n [ ^N ] \
+           CG4Act class >> which [ ^Which ] \
+           CG4Act class >> bump: w [ N := (N ifNil: [ 0 ]) + 1. Which := w ] \
+           macvmDoIt: sender [ CG4Act bump: #doIt ] \
+           macvmPrintIt: sender [ CG4Act bump: #printIt ] ]",
+    )
+    .expect("define the action-target receiver");
+    vm.exec("CG4Act reset.").expect("reset");
+    let act = mint(&mut vm, "action", "CG4Act new");
+    let _ = send_gpr(act, "macvmPrintIt:", std::ptr::null_mut(), std::ptr::null_mut());
+    assert_eq!(
+        vm.eval("CG4Act n").expect("n").trim(),
+        "1",
+        "a Print It menu action must dispatch synchronously to macvmPrintIt:"
+    );
+    assert_eq!(
+        vm.eval("CG4Act which").expect("which").trim(),
+        "#printIt",
+        "the right action selector must have run"
+    );
+    let _ = send_gpr(act, "macvmDoIt:", std::ptr::null_mut(), std::ptr::null_mut());
+    assert_eq!(
+        vm.eval("CG4Act n").expect("n").trim(),
+        "2",
+        "a Do It menu action must also dispatch (both selectors on one target)"
+    );
+    assert_eq!(
+        vm.eval("CG4Act which").expect("which").trim(),
+        "#doIt"
+    );
+
     // (4) Stale-fail-closed (design §4.3): re-publishing the UI worker bumps the
     // generation, so every delegate minted at the old generation — a not-yet-
     // closed window's data source after a restart — now fails closed rather than

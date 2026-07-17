@@ -43,11 +43,24 @@ Object subclass: WorkerMessage [
         "Is this a forwarded worker transcript line ({#workerTranscript. id. text})?"
         ^(payload isKindOf: Array) and: [ (payload size = 3) and: [ (payload at: 1) == #workerTranscript ] ]
     ]
+    isUiReq [
+        "Is this a UI worker → primary request ({#uiReq. corr. verb. ...} —
+         Cocoa GUI CG4, cocoa_gui_design.md §7.3)? Matched by SHAPE before any
+         correlation-id lookup, so a request never fires a same-corr pending
+         continuation (review R4)."
+        ^(payload isKindOf: Array) and: [ (payload size >= 3) and: [ (payload at: 1) == #uiReq ] ]
+    ]
+    isSnapshot [
+        "Is this a primary → UI unsolicited snapshot blast ({#snapshot. viewId.
+         generation. dataTree} — §7.1)? Corr-free; routed by shape to the
+         terminal-side view handler (the real view wiring is CG5)."
+        ^(payload isKindOf: Array) and: [ (payload size >= 4) and: [ (payload at: 1) == #snapshot ] ]
+    ]
 ]
 
 Object subclass: Worker [
     | id |
-    <classVars: Handler ReplyHandler PendingReplies NextCorr CurrentCorr CocoaEventHandler>
+    <classVars: Handler ReplyHandler PendingReplies NextCorr CurrentCorr CurrentPeer CocoaEventHandler UiReqHandler SnapshotHandler TranscriptLineHandler>
 
     "── spawning (primary side) ──"
     Worker class >> spawn: initSource [
@@ -72,11 +85,14 @@ Object subclass: Worker [
     send: aPayload onReply: aBlock [
         "The async request pattern: send now, run the continuation when THIS
          message's reply lands (correlation-id matched). The primary never
-         blocks — it sleeps until the router wakes it."
+         blocks — it sleeps until the router wakes it. The continuation is keyed
+         by (originating-peer, corr) — the reply comes back FROM this worker
+         `id`, so it is registered under `id` (review R4, cocoa_gui_design.md
+         §7.3): two peers' independent NextCorr counters can never fire the
+         wrong continuation."
         | c |
         c := Worker nextCorr.
-        PendingReplies isNil ifTrue: [ PendingReplies := Dictionary new ].
-        PendingReplies at: c put: aBlock.               "GC-rooted class var"
+        self class registerReply: aBlock fromPeer: id corr: c.
         self class primSend: id corr: c bytes: (Worker pickle: aPayload).
         ^self
     ]
@@ -116,6 +132,7 @@ Object subclass: Worker [
         env := self primPoll.
         env isNil ifTrue: [ ^self ].
         CurrentCorr := env at: 2.        "so reply: echoes it back"
+        CurrentPeer := env at: 1.        "so reply: targets the sender (0 = primary)"
         payload := self unpickle: (env at: 3).
         "RPC (docs/multi-smalltalk-worker.md §5): an {#rpc. class. sel. args}
          payload is served directly — a worker booted with only the shared
@@ -155,10 +172,26 @@ Object subclass: Worker [
         ^nil
     ]
     Worker class >> reply: aPayload [
-        "From inside a worker's handler: answer the primary, echoing the
-         inbound correlation id so the sender's continuation fires."
-        self primSend: 0 corr: CurrentCorr bytes: (self pickle: aPayload)
+        "Answer the peer that sent the message being dispatched, echoing its
+         correlation id so the sender's continuation fires. CurrentPeer is 0
+         inside a worker (the primary is a worker's only peer — behavior
+         unchanged); on the PRIMARY it is the originating worker (e.g. the UI
+         worker for a #uiReq — CG4), so a primary-side reply: routes to the
+         right terminal instead of the hardcoded primary."
+        self primSend: CurrentPeer corr: CurrentCorr bytes: (self pickle: aPayload)
     ]
+
+    Worker class >> abandonPending [
+        "Drop every outstanding send:onReply: continuation and the dispatch
+         context (CG4 review: recover CLEAN). The Cocoa GUI's UI worker calls
+         this when its primary is restarted from source: a #uiReq that was in
+         flight when the old primary died can never be answered, so its
+         continuation would otherwise linger forever and leak cumulatively across
+         restarts. This resets the UI worker to a truly clean idle state
+         (feedback_recover_clean_or_die); the terminal simply re-issues."
+        PendingReplies := Dictionary new.
+        CurrentPeer := nil.
+        CurrentCorr := nil ]
 
     "── receiving, primary side: dispatchInbox runs because the router woke
        us (or the run loop slept into a message) — never called in a poll loop ──"
@@ -188,36 +221,183 @@ Object subclass: Worker [
                 self dispatchOne: env.
                 self dispatchInbox ] ]
     ]
+    Worker class >> pumpInbox: ms [
+        "One iteration of a Rust-driven primary loop (Cocoa GUI CG4): sleep in
+         the inbox up to `ms`, dispatch what arrived (and drain the rest), then
+         RETURN to Rust — so the supervisor thread controls the cadence and can
+         heartbeat/observe liveness between beats (a `runLoopWhile:` that never
+         returns would give it no seam). Answers whether anything was dispatched.
+         The channel send IS the wake; zero spin. Primary only."
+        | env |
+        env := self primAwaitInbox: ms.
+        env isNil ifTrue: [ ^false ].
+        self dispatchOne: env.
+        self dispatchInbox.
+        ^true
+    ]
+
     Worker class >> dispatchOne: env [
-        "Route one envelope: a forwarded worker transcript shows on OUR
-         transcript; then a matching pending continuation wins; otherwise the
-         general reply handler. (Dictionary has no removeKey:, so a fired
-         continuation is tombstoned with nil — correlation ids are unique, so
-         a tombstone is never rekeyed.)"
-        | corr k msg |
+        "Route one envelope. Shape-tagged control messages (worker transcript,
+         Cocoa event, UI request, snapshot) are matched FIRST — before any
+         correlation-id lookup — so a request whose corr coincides with an
+         outstanding continuation's corr can never fire the wrong continuation
+         (review R4). Then a matching pending continuation wins, keyed by
+         (originating-peer, corr) so two peers' independent NextCorr counters
+         cannot collide; otherwise the general reply handler. (Dictionary has no
+         removeKey:, so a fired continuation is tombstoned with nil — a (peer,
+         corr) key is unique, so a tombstone is never rekeyed.)"
+        | peer corr k msg |
+        peer := env at: 1.
         corr := env at: 2.
-        msg := WorkerMessage from: (env at: 1)
+        CurrentPeer := peer.        "so a primary-side reply: targets the sender"
+        CurrentCorr := corr.        "so reply: echoes the inbound corr"
+        msg := WorkerMessage from: peer
                             payload: (self unpickle: (env at: 3)).
         msg isWorkerTranscript ifTrue: [
-            Transcript show: (msg payload at: 3).
+            "The primary's forwarded transcript (CG4 §7.4): the UI worker routes
+             it to its Transcript view via the hook; every other VM shows it on
+             its own console."
+            TranscriptLineHandler isNil
+                ifTrue: [ Transcript show: (msg payload at: 3) ]
+                ifFalse: [ TranscriptLineHandler value: (msg payload at: 3) ].
             ^self ].
         msg isCocoaEvent ifTrue: [
             CocoaEventHandler isNil ifFalse: [
                 CocoaEventHandler value: (msg payload at: 2) ].
             ^self ].
+        msg isUiReq ifTrue: [ ^self serveUiReq: msg payload ].
+        msg isSnapshot ifTrue: [
+            SnapshotHandler isNil ifFalse: [ SnapshotHandler value: msg payload ].
+            ^self ].
         k := (PendingReplies notNil and: [ corr ~= 0 ])
-            ifTrue: [ PendingReplies at: corr ifAbsent: [ nil ] ]
+            ifTrue: [ PendingReplies at: (self replyKeyFor: peer corr: corr) ifAbsent: [ nil ] ]
             ifFalse: [ nil ].
         k isNil
             ifTrue: [ ReplyHandler isNil ifFalse: [ ReplyHandler value: msg ] ]
             ifFalse: [
-                PendingReplies at: corr put: nil.
+                PendingReplies at: (self replyKeyFor: peer corr: corr) put: nil.
                 k value: msg payload ]
     ]
     Worker class >> nextCorr [
         NextCorr isNil ifTrue: [ NextCorr := 0 ].
         NextCorr := NextCorr + 1.
         ^NextCorr
+    ]
+
+    "── (peer, corr) continuation namespacing (review R4, §7.3) ──────────
+     PendingReplies is keyed by a SmallInteger packing the originating peer id
+     (0 = the primary, 1..16 = a worker) with the correlation id, so peerA's
+     corr=c and peerB's corr=c are DISTINCT keys and can never fire the wrong
+     continuation. A packed smi is used (not a 2-element Array) because Array
+     hashes by identity here — value equality without value hash would break
+     Dictionary lookup; a SmallInteger hashes by value. MAX_WORKERS is 16, so
+     five bits hold every peer id."
+    Worker class >> replyKeyFor: peer corr: corr [
+        ^(corr bitShift: 5) + peer
+    ]
+    Worker class >> registerReply: aBlock fromPeer: peer corr: corr [
+        "GC-root a continuation under its (peer, corr) key. Shared by
+         send:onReply: (replies come FROM the target worker) and uiRequest:
+         (replies come FROM the primary, peer 0)."
+        PendingReplies isNil ifTrue: [ PendingReplies := Dictionary new ].
+        PendingReplies at: (self replyKeyFor: peer corr: corr) put: aBlock
+    ]
+
+    "── the UI worker → primary request protocol (Cocoa GUI CG4, §7.3) ────
+     The UI worker (a Worker-role VM pinned to the main thread) ships a request
+     to the primary (peer 0) and runs a continuation when the reply lands. The
+     doit runs where the persistent objects live — on the primary — and the UI
+     stays responsive because the brain is elsewhere (§6)."
+    Worker class >> uiRequest: aVerb args: anArray onReply: aBlock [
+        "Ship {#uiReq. corr. verb. args...} to the primary and register the
+         continuation keyed by (0, corr). The reply comes back {#uiReply. corr.
+         payload} FROM the primary; aBlock is handed that reply payload. The
+         envelope corr IS the payload corr (one source of truth), routed by the
+         existing (peer, corr) machinery."
+        | c payload |
+        c := self nextCorr.
+        "Unwrap {#uiReply. corr. payload} → hand the continuation the payload."
+        self registerReply: [ :reply | aBlock value: (reply at: 3) ] fromPeer: 0 corr: c.
+        payload := (Array with: #uiReq with: c with: aVerb), anArray.
+        self primSend: 0 corr: c bytes: (self pickle: payload).
+        ^c
+    ]
+    Worker class >> uiDoit: aSource onReply: aBlock [
+        "Convenience: a Workspace ⌘P/⌘D — ship a selection as a #doit request
+         and run the continuation on the (String) result."
+        ^self uiRequest: #doit args: (Array with: aSource) onReply: aBlock
+    ]
+
+    "── primary-side request service (§7.3): dispatch by verb. The (peer, corr)
+       context is SNAPSHOTTED into locals at the top, BEFORE any request body
+       runs — a doit/handler can itself dispatch and clobber CurrentPeer/
+       CurrentCorr, so building the reply from the class-vars afterwards would
+       route it to the wrong peer/corr (CG4 review). ──"
+    Worker class >> replyTo: peer corr: corr payload: aPayload [
+        "Answer a SPECIFIC (peer, corr) — for the request service, which must
+         reply against a corr/peer captured before running the request body."
+        self primSend: peer corr: corr bytes: (self pickle: aPayload)
+    ]
+    Worker class >> serveUiReq: payload [
+        | verb peer corr |
+        peer := CurrentPeer. corr := CurrentCorr.
+        verb := payload at: 3.
+        verb == #doit ifTrue: [ ^self serveUiDoit: (payload at: 4) peer: peer corr: corr ].
+        verb == #refresh ifTrue: [
+            ^self replyTo: peer corr: corr payload: (Array with: #uiReply with: corr
+                                with: (self serveUiRefresh: (payload at: 4))) ].
+        verb == #select ifTrue: [
+            ^self replyTo: peer corr: corr payload: (Array with: #uiReply with: corr
+                                with: (self serveUiSelect: payload)) ].
+        verb == #saveMethod ifTrue: [
+            ^self replyTo: peer corr: corr payload: (Array with: #uiReply with: corr
+                                with: (self serveUiSaveMethod: payload)) ].
+        ^self replyTo: peer corr: corr payload: (Array with: #uiReply with: corr
+                            with: (Array with: #uiError with: 'unknown verb: ', verb printString))
+    ]
+    Worker class >> serveUiDoit: aSource peer: peer corr: corr [
+        "Evaluate the selection on the primary through the existing execute_do_it
+         path (prim 250, run inline under this dispatch's recovery guard) and
+         reply the result's printString — a pickle-safe String the terminal
+         appends. `peer`/`corr` are snapshotted by the caller BEFORE the doit runs
+         (the doit may dispatch and clobber the class-vars). A raise inside the
+         doit unwinds the whole dispatch and sends no reply (v1, the RPC path's
+         property); the watchdog restarts the environment on a genuinely fatal
+         doit (§5)."
+        | result |
+        result := self primEvalDoit: aSource.
+        ^self replyTo: peer corr: corr payload: (Array with: #uiReply with: corr with: result printString)
+    ]
+    "Per-view request handlers the browser/codeview views (CG5/CG6) install;
+     until then they answer a benign placeholder so the protocol is complete and
+     a stray request never raises."
+    Worker class >> onUiRequest: aBlock [ UiReqHandler := aBlock ]
+    Worker class >> serveUiRefresh: viewId [
+        UiReqHandler isNil ifFalse: [ ^UiReqHandler value: #refresh value: viewId ].
+        ^Array with: #uiPending with: viewId
+    ]
+    Worker class >> serveUiSelect: payload [
+        UiReqHandler isNil ifFalse: [ ^UiReqHandler value: #select value: payload ].
+        ^Array with: #uiPending with: (payload at: 4)
+    ]
+    Worker class >> serveUiSaveMethod: payload [
+        UiReqHandler isNil ifFalse: [ ^UiReqHandler value: #saveMethod value: payload ].
+        ^Array with: #uiPending with: #saveMethod
+    ]
+    "Terminal-side snapshot sink (the real view wiring is CG5); nil by default."
+    Worker class >> onSnapshot: aBlock [ SnapshotHandler := aBlock ]
+    "Terminal-side transcript sink: forwarded primary transcript lines (§7.4).
+     The UI worker installs one that appends to its Transcript view; nil
+     elsewhere (a spawned worker/plain VM shows lines on its own console)."
+    Worker class >> onTranscriptLine: aBlock [ TranscriptLineHandler := aBlock ]
+
+    Worker class >> primEvalDoit: aSource [
+        "Evaluate a doit source String on THIS (primary) VM and answer the
+         result oop (prim 250, CG4). On a compile/parse error the primitive
+         itself answers a descriptive String; this fallback body runs only if
+         the primitive is somehow absent."
+        <primitive: 250>
+        ^'error: doit evaluation primitive unavailable'
     ]
     Worker class >> selfId [
         "0 in the primary, i >= 1 inside worker i."

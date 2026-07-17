@@ -306,6 +306,19 @@ extern "C" fn imp_text_did_change(this: *mut c_void, _cmd: *mut c_void, note: *m
     dispatch(this, "textDidChange:", &[ArgVal::Id(note)], RetShape::Void);
 }
 
+// MacvmActionTarget — a menu item / button target/action (Cocoa GUI CG4): a
+// void `-(void)action:(id)sender` the UI worker answers SYNCHRONOUSLY on the
+// main thread. This is the correct mechanism for a UI-worker-LOCAL control (a
+// Workspace ⌘P/⌘D) — unlike C4 `Cocoa action:`, which posts a fire-and-forget
+// envelope to the primary and so could not read the local NSTextView and ship
+// its text. Two selectors so ⌘P and ⌘D can be distinct menu items on one target.
+extern "C" fn imp_menu_do_it(this: *mut c_void, _cmd: *mut c_void, sender: *mut c_void) {
+    dispatch(this, "macvmDoIt:", &[ArgVal::Id(sender)], RetShape::Void);
+}
+extern "C" fn imp_menu_print_it(this: *mut c_void, _cmd: *mut c_void, sender: *mut c_void) {
+    dispatch(this, "macvmPrintIt:", &[ArgVal::Id(sender)], RetShape::Void);
+}
+
 // MacvmTableSource — `NSTableViewDataSource`.
 extern "C" fn imp_number_of_rows(this: *mut c_void, _cmd: *mut c_void, table: *mut c_void) -> i64 {
     dispatch(
@@ -422,6 +435,7 @@ static WINDOW_DELEGATE_CLASS: OnceLock<Option<usize>> = OnceLock::new();
 static TEXT_DELEGATE_CLASS: OnceLock<Option<usize>> = OnceLock::new();
 static TABLE_SOURCE_CLASS: OnceLock<Option<usize>> = OnceLock::new();
 static OUTLINE_SOURCE_CLASS: OnceLock<Option<usize>> = OnceLock::new();
+static ACTION_TARGET_CLASS: OnceLock<Option<usize>> = OnceLock::new();
 
 fn window_delegate_class() -> Option<*mut c_void> {
     WINDOW_DELEGATE_CLASS
@@ -508,14 +522,30 @@ fn outline_source_class() -> Option<*mut c_void> {
         .map(|p| p as *mut c_void)
 }
 
-/// The role symbol (`#window`/`#text`/`#table`/`#outline`) → its registered
-/// delegate class. `None` for an unknown role.
+fn action_target_class() -> Option<*mut c_void> {
+    ACTION_TARGET_CLASS
+        .get_or_init(|| {
+            register_class(
+                "MacvmActionTarget",
+                &[
+                    ("macvmDoIt:", imp_ptr!(imp_menu_do_it, ImpV1), "v@:@"),
+                    ("macvmPrintIt:", imp_ptr!(imp_menu_print_it, ImpV1), "v@:@"),
+                ],
+            )
+            .map(|c| c as usize)
+        })
+        .map(|p| p as *mut c_void)
+}
+
+/// The role symbol (`#window`/`#text`/`#table`/`#outline`/`#action`) → its
+/// registered delegate class. `None` for an unknown role.
 fn role_class(role: &str) -> Option<*mut c_void> {
     match role {
         "window" => window_delegate_class(),
         "text" => text_delegate_class(),
         "table" => table_source_class(),
         "outline" => outline_source_class(),
+        "action" => action_target_class(),
         _ => None,
     }
 }
@@ -528,7 +558,7 @@ fn role_class(role: &str) -> Option<*mut c_void> {
 /// lifts C4's primary-only refusal for the UI worker (design §4.3, review item 5).
 pub fn new_delegate(role: &str, gen: u64, ticket: i64) -> Result<*mut c_void, String> {
     let cls = role_class(role).ok_or_else(|| {
-        format!("unknown delegate role '{role}' (want window/text/table/outline)")
+        format!("unknown delegate role '{role}' (want window/text/table/outline/action)")
     })?;
     let inst = crate::runtime::objc_bridge::try_send(
         cls,

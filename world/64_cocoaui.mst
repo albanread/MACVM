@@ -1,53 +1,156 @@
-"64_cocoaui.mst — CocoaUI: the Cocoa GUI's Smalltalk startup (CG2,
- docs/sprint_cocoa_gui.md CG2, docs/cocoa_gui_design.md §3 step 4). Loaded ONLY
- by the UI worker via `frontend::world::load_list(vm, world/cocoaui.list)`,
- NEVER from world/world.list — so the CLI, the WKWebView GUI, and the base test
- suite carry none of it (files 63+, the conditional layer, §12.3).
+"64_cocoaui.mst — CocoaUI: the Cocoa GUI's Smalltalk terminal (CG2 window +
+ CG4 Workspace/Transcript + request protocol). Loaded ONLY by the UI worker via
+ `frontend::world::load_list(vm, world/cocoaui.list)`, NEVER from world/world.list
+ — so the CLI, the WKWebView GUI, and the base test suite carry none of it
+ (files 63+, the conditional layer, §12.3).
 
  The UI worker VM runs pinned to the process's MAIN thread (AppKit requires it).
  The Rust `cocoa_gui` glue bootstraps NSApplication, boots this VM in place, runs
  `CocoaUI startup` once (this class), then enters [NSApp run] with the VM at rest
- — so every AppKit call below runs INLINE on main: the bridge's `onMain` hop is a
- no-op when the caller already IS main (objc_bridge try_send_full_on_main_owned's
- pthread_main_np==1 branch). Building an NSWindow off the main thread is refused
- by the §8 guard — as it should be; only this VM, on main, may.
+ — so every AppKit call below runs INLINE on main (the bridge's `onMain` hop is a
+ no-op when the caller already IS main). Building an NSWindow off the main thread
+ is refused by the §8 guard — as it should be; only this VM, on main, may.
 
- CG2 builds exactly ONE empty NSWindow with a title from Smalltalk and orders it
- front. The menu bar, the Workspace/Transcript views, the request protocol and
- the snapshot terminal arrive in CG4+. Ownership: setReleasedWhenClosed: false is
- load-bearing (a programmatic NSWindow otherwise releases itself on close, which
- would double-free under the bridge wrapper's own +1), and rebuild is idempotent
- so a restart-in-place (CG7) leaks no wrappers."
+ CG4 (docs/cocoa_gui_design.md §6, §7.3, §7.4): the window carries a Workspace
+ (top, editable) and a Transcript (bottom, read-only). ⌘P/⌘D ship the Workspace
+ text to the PRIMARY as a {#uiReq. corr. #doit. source} request — the doit runs
+ where the persistent objects live, on the primary's thread, so this UI never
+ blocks — and the {#uiReply. corr. result} appends to the Transcript. The
+ primary's own transcript is forwarded here too (§7.4). The Do It / Print It
+ controls dispatch SYNCHRONOUSLY on the main thread through a C6 action-target
+ delegate (MacvmActionTarget), the correct mechanism for a UI-worker-local
+ control (a C4 `Cocoa action:` would post to the primary, unable to read this
+ local NSTextView). Text is local to the NSTextView (§11 Q4/R9).
+
+ ON-SCREEN status: the AppKit view construction + text read/append here are the
+ USER's on-screen gate (computer-use can't attach to the bare binary). The
+ request round-trip and the (peer,corr) routing this rides are headless-proven
+ (embed.rs CG4 tests); the action dispatch is headless-proven (cocoa_delegate
+ gate). Ownership: setReleasedWhenClosed: false is load-bearing; rebuild is
+ idempotent so a restart-in-place leaks no wrappers."
 Object subclass: CocoaUI [
-    <classVars: Win>
+    <classVars: Win Workspace Transcript ActTarget TranscriptText>
 
     CocoaUI class >> title [ ^'MACVM — Cocoa (Smalltalk inside)' ]
 
     CocoaUI class >> startup [
-        "Build (or rebuild) the main window through the Cocoa bridge, on the
-         main thread, and order it front. Returns to Rust with the VM at rest;
-         Rust then calls [NSApp run]."
-        | winClass |
+        "Build (or rebuild) the main window + the Workspace/Transcript terminal
+         through the Cocoa bridge, on the main thread, and order it front.
+         Returns to Rust with the VM at rest; Rust then calls [NSApp run]."
+        | winClass tvClass content |
         self teardown.
+        TranscriptText := ''.
         winClass := Cocoa classNamed: 'NSWindow'.
+        tvClass := Cocoa classNamed: 'NSTextView'.
+
         Win := ((winClass onMain alloc) onMain
-            initWithContentRect: (Array with: 240.0 with: 240.0 with: 620.0 with: 420.0)
+            initWithContentRect: (Array with: 240.0 with: 240.0 with: 640.0 with: 460.0)
             styleMask: 15 backing: 2 defer: false).
         Win onMain setReleasedWhenClosed: false.
         Win onMain setTitle: self title.
+        content := Win onMain contentView.
+
+        "Workspace (top): editable — you type an expression here."
+        Workspace := ((tvClass onMain alloc) onMain
+            initWithFrame: (Array with: 12.0 with: 250.0 with: 616.0 with: 190.0)).
+        Workspace onMain setEditable: true.
+        Workspace onMain setString: '3 + 4'.
+        content onMain addSubview: Workspace.
+
+        "Transcript (bottom): read-only — results and the primary's transcript."
+        Transcript := ((tvClass onMain alloc) onMain
+            initWithFrame: (Array with: 12.0 with: 12.0 with: 616.0 with: 220.0)).
+        Transcript onMain setEditable: false.
+        content onMain addSubview: Transcript.
+
+        "Forwarded primary transcript lines (§7.4) append to our Transcript view."
+        Worker onTranscriptLine: [ :t | CocoaUI appendTranscript: t ].
+
+        self installMenu.
         Win onMain makeKeyAndOrderFront: nil.
-        Transcript showCr: 'CocoaUI: main window up — the interface is Smalltalk.'.
+        self appendTranscript: 'CocoaUI: ready — ⌘P evaluates the Workspace on the primary.'.
         ^Win
     ]
 
+    CocoaUI class >> installMenu [
+        "A Workspace menu with Print It (⌘P) and Do It (⌘D), targeting a C6
+         action-target delegate that dispatches SYNCHRONOUSLY on main to
+         macvmPrintIt:/macvmDoIt: here."
+        | app mainMenu wsItem wsMenu printItem doItem |
+        ActTarget := MacvmDelegate actionTargetOn: CocoaUI.
+        app := (Cocoa classNamed: 'NSApplication') onMain sharedApplication.
+        mainMenu := app onMain mainMenu.
+        mainMenu isNil ifTrue: [
+            mainMenu := (Cocoa classNamed: 'NSMenu') onMain alloc onMain init.
+            app onMain setMainMenu: mainMenu ].
+
+        wsMenu := (Cocoa classNamed: 'NSMenu') onMain alloc onMain init.
+        printItem := ((Cocoa classNamed: 'NSMenuItem') onMain alloc) onMain
+            initWithTitle: 'Print It' action: 'macvmPrintIt:' keyEquivalent: 'p'.
+        printItem onMain setTarget: ActTarget.
+        wsMenu onMain addItem: printItem.
+        doItem := ((Cocoa classNamed: 'NSMenuItem') onMain alloc) onMain
+            initWithTitle: 'Do It' action: 'macvmDoIt:' keyEquivalent: 'd'.
+        doItem onMain setTarget: ActTarget.
+        wsMenu onMain addItem: doItem.
+
+        wsItem := ((Cocoa classNamed: 'NSMenuItem') onMain alloc) onMain
+            initWithTitle: 'Workspace' action: nil keyEquivalent: ''.
+        wsItem onMain setSubmenu: wsMenu.
+        mainMenu onMain addItem: wsItem.
+    ]
+
+    "── C6 action-target callbacks (dispatched synchronously on main) ──"
+    CocoaUI class >> macvmPrintIt: sender [ ^self shipDoit ]
+    CocoaUI class >> macvmDoIt: sender [ ^self shipDoit ]
+
+    CocoaUI class >> shipDoit [
+        "Read the Workspace text and ship it to the primary as a #doit request;
+         the {#uiReply. corr. result} appends to the Transcript. The primary
+         evaluates it on ITS thread, so this UI never blocks (§6)."
+        | source |
+        source := self workspaceText.
+        source isEmpty ifTrue: [ ^self ].
+        self appendTranscript: source.
+        Worker uiDoit: source onReply: [ :result | CocoaUI appendTranscript: result ].
+    ]
+
+    CocoaUI class >> workspaceText [
+        "The Workspace NSTextView's current text as a Smalltalk String."
+        ^(Workspace onMain string) sendString: 'UTF8String'
+    ]
+
+    CocoaUI class >> appendTranscript: aString [
+        "Append a line to the Transcript view. Blast the WHOLE text each change
+         (feedback_blast_dont_patch) — never an incremental NSTextView patch."
+        TranscriptText isNil ifTrue: [ TranscriptText := '' ].
+        TranscriptText := TranscriptText, aString, (String with: Character lf).
+        Transcript isNil ifFalse: [ Transcript onMain setString: TranscriptText ].
+    ]
+
+    CocoaUI class >> environmentRestarted [
+        "The watchdog respawned the primary from source and re-synced us (§5.1).
+         Recover CLEAN (CG4 review): abandon every continuation still waiting on
+         the DEAD primary — those replies can never come — so nothing lingers or
+         leaks across restarts; then note it. The Workspace text is untouched (it
+         is local)."
+        Worker abandonPending.
+        self appendTranscript: '— environment restarted (primary respawned) —'.
+    ]
+
     CocoaUI class >> teardown [
-        "Release the previous window's wrapper (idempotent — a rebuilt or
+        "Release the previous window's wrappers (idempotent — a rebuilt or
          restarted UI leaks nothing)."
         Win isNil ifFalse: [
             Win onMain orderOut: nil.
+            ActTarget isNil ifFalse: [ ActTarget isValid ifTrue: [ ActTarget release ] ].
+            Workspace isNil ifFalse: [ Workspace isValid ifTrue: [ Workspace release ] ].
+            Transcript isNil ifFalse: [ Transcript isValid ifTrue: [ Transcript release ] ].
             Win isValid ifTrue: [ Win release ].
-            Win := nil ]
+            Win := nil. Workspace := nil. Transcript := nil. ActTarget := nil ]
     ]
 
     CocoaUI class >> window [ ^Win ]
+    CocoaUI class >> workspace [ ^Workspace ]
+    CocoaUI class >> transcriptView [ ^Transcript ]
 ]

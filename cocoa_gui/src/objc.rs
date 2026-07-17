@@ -20,6 +20,7 @@
 #![allow(dead_code)]
 
 use std::ffi::{c_void, CString};
+use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::OnceLock;
 
 pub type Id = *mut c_void;
@@ -42,12 +43,44 @@ unsafe extern "C" {
     fn dlsym(handle: *mut c_void, symbol: *const i8) -> *mut c_void;
 }
 
-// CoreFoundation, linked (not dlsym'd): the background-thread run-loop wake.
+// CoreFoundation, linked (not dlsym'd): the background-thread run-loop wake +
+// the default-mode drain source (CG4 §8).
 #[link(name = "CoreFoundation", kind = "framework")]
 extern "C" {
     fn CFRunLoopGetMain() -> *mut c_void;
     fn CFRunLoopWakeUp(rl: *mut c_void);
+    fn CFRunLoopAddSource(rl: *mut c_void, source: *mut c_void, mode: *const c_void);
+    fn CFRunLoopSourceCreate(
+        allocator: *const c_void,
+        order: isize,
+        context: *mut CFRunLoopSourceContext,
+    ) -> *mut c_void;
+    fn CFRunLoopSourceSignal(source: *mut c_void);
+    static kCFRunLoopDefaultMode: *const c_void;
 }
+
+/// A CoreFoundation version-0 run-loop source context (the only fields we set:
+/// `info` + `perform`; the rest are null callbacks). `perform` runs on the run
+/// loop's thread (main) when the source is signalled and the loop is in a mode
+/// the source belongs to.
+#[repr(C)]
+struct CFRunLoopSourceContext {
+    version: isize,
+    info: *mut c_void,
+    retain: *const c_void,
+    release: *const c_void,
+    copy_description: *const c_void,
+    equal: *const c_void,
+    hash: *const c_void,
+    schedule: *const c_void,
+    cancel: *const c_void,
+    perform: Option<extern "C" fn(*mut c_void)>,
+}
+
+/// The default-mode drain source, once created — read by [`wake_main_runloop`]
+/// (fired from background/primary threads) to signal a drain. `AtomicPtr` so the
+/// cross-thread read of a pointer main published is well-defined.
+static DRAIN_SOURCE: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 
 /// Map the frameworks the glue needs into the process so classes and C entry
 /// points resolve via `dlsym(RTLD_DEFAULT, …)`. Idempotent. MUST run on main
@@ -200,14 +233,56 @@ pub fn run(app: Id) {
     send0(app, sel("run"));
 }
 
+/// Install the UI worker's inbox drain as a **default-mode** `CFRunLoopSource`
+/// (CG4 §8) and remember it for [`wake_main_runloop`] to signal. MUST run on
+/// main. `perform` is the drain callback — CoreFoundation calls it on the main
+/// thread with `info` when the source is signalled AND the run loop is in
+/// `NSDefaultRunLoopMode`; `info` is a raw pointer to main-owned drain state.
+///
+/// Default mode ONLY, deliberately (§8): a source in the *common* modes would
+/// also fire inside AppKit's NESTED run loops (menu tracking, live resize, modal
+/// sessions) — swapping a snapshot mid-tracking throws AppKit consistency
+/// exceptions. The UI is intentionally stale during a tracking session and
+/// re-syncs when it ends (the loop returns to default mode). The source is
+/// `perform`-only (a signalled software source), never a port/timer.
+pub fn install_default_mode_drain(info: *mut c_void, perform: extern "C" fn(*mut c_void)) {
+    let mut ctx = CFRunLoopSourceContext {
+        version: 0,
+        info,
+        retain: std::ptr::null(),
+        release: std::ptr::null(),
+        copy_description: std::ptr::null(),
+        equal: std::ptr::null(),
+        hash: std::ptr::null(),
+        schedule: std::ptr::null(),
+        cancel: std::ptr::null(),
+        perform: Some(perform),
+    };
+    unsafe {
+        let source = CFRunLoopSourceCreate(std::ptr::null(), 0, &mut ctx);
+        if source.is_null() {
+            return;
+        }
+        let rl = CFRunLoopGetMain();
+        // Default mode ONLY — NOT kCFRunLoopCommonModes (§8).
+        CFRunLoopAddSource(rl, source, kCFRunLoopDefaultMode);
+        DRAIN_SOURCE.store(source, Ordering::Release);
+    }
+}
+
 /// Wake the process's main run loop from a background thread — the run-loop
 /// poke the externally-hosted UI worker's inbox wake fires when the primary
-/// `send`s it (CG1's `InboxWakeFn`, promoted to the AppKit poke here, design
-/// §8). `CFRunLoopWakeUp` is documented thread-safe. In CG2 there is nothing to
-/// drain yet, so waking is a benign nudge; CG4 adds the default-mode
-/// `CFRunLoopSource` drain this feeds.
+/// `send`s it (CG1's `InboxWakeFn`, the AppKit poke, design §8). Signals the
+/// default-mode drain source (so its `perform` runs the drain once the run loop
+/// is back in default mode) and wakes the loop. Both `CFRunLoopSourceSignal` and
+/// `CFRunLoopWakeUp` are documented thread-safe. Before the source exists (early
+/// boot) this is a bare nudge.
 pub fn wake_main_runloop() {
     unsafe {
+        let source = DRAIN_SOURCE.load(Ordering::Acquire);
+        if !source.is_null() {
+            CFRunLoopSourceSignal(source);
+        }
         let rl = CFRunLoopGetMain();
         if !rl.is_null() {
             CFRunLoopWakeUp(rl);

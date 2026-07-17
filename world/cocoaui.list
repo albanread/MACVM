@@ -8,5 +8,9 @@
 # directory; blank lines and #-comments skipped. Files reserved 63+ (01-62 are
 # taken by the base world; verify with `ls world/`).
 63_cocoaui_stub.mst
-64_cocoaui.mst
+# MacvmDelegate (the C6 delegate/action-target registry) loads BEFORE CocoaUI:
+# CG4's `CocoaUI startup` references `MacvmDelegate actionTargetOn:` for the
+# Workspace ⌘P/⌘D target, so the class must be declared when 64 compiles. The
+# list order — not the filename number — is what fixes the forward reference.
 65_cocoadelegate.mst
+64_cocoaui.mst
