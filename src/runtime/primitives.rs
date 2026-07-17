@@ -1320,6 +1320,15 @@ pub static PRIMITIVES: &[PrimDesc] = &[
         can_allocate: false,
         can_fail: true,
     },
+    // --- Cocoa bridge C6: reverse dispatch (delegates), CG3 --------------
+    PrimDesc {
+        id: 249,
+        name: "MacvmDelegate class>>primNewDelegate:ticket:",
+        f: prim_cocoa_new_delegate,
+        argc: 2,
+        can_allocate: true,
+        can_fail: true,
+    },
 ];
 
 pub fn prim_by_id(id: u16) -> Option<&'static PrimDesc> {
@@ -2594,14 +2603,17 @@ fn prim_cocoa_is_valid(vm: &mut VmState, args: &[Oop]) -> PrimResult {
 /// `Cocoa class >> primNewAction:` (243) — C4: mint a `MacvmAction`
 /// target/action trampoline bound to `ticket`. The `{#cocoaEvent. ticket}`
 /// fire payload is pickled HERE, on the VM thread, and stored with the
-/// registry entry — the ObjC-side fire IMP never sees a VmState. Fails
-/// cleanly without a worker role (no inbox to post to) — actions belong
-/// to the primary VM.
+/// registry entry — the ObjC-side fire IMP never sees a VmState. Routes to
+/// THIS VM's own inbox (`self_inbox_sender`): a Primary posts to itself
+/// (unchanged C4/CocoaPad behaviour); a Worker — the Cocoa GUI's UI worker —
+/// posts along its `to_primary` link, lifting the primary-only refusal
+/// (`cocoa_gui_design.md` §4.3, review item 5). Fails cleanly only when the VM
+/// has no worker role at all (no inbox to post to).
 fn prim_cocoa_new_action(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     if SmallInt::try_from(args[1]).is_none() {
         return PrimResult::Fail;
     }
-    let Some(sender) = crate::runtime::workers::primary_inbox_sender(vm) else {
+    let Some(sender) = crate::runtime::workers::self_inbox_sender(vm) else {
         return PrimResult::Fail;
     };
     // Build {#cocoaEvent. ticket} in-heap, pickle it, drop the oops. The
@@ -2619,6 +2631,32 @@ fn prim_cocoa_new_action(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     match crate::runtime::objc_bridge::new_action(sender, bytes) {
         Ok(inst) => PrimResult::Ok(crate::runtime::objc_bridge::wrap_owned(vm, inst)),
         Err(desc) => cocoa_exception_fail(vm, "macvmAction", &desc),
+    }
+}
+
+/// `MacvmDelegate class >> primNewDelegate:ticket:` (249) — C6 reverse dispatch
+/// (`cocoa_gui_design.md` §4, CG3): mint a per-role ObjC delegate/data-source
+/// instance (`args[1]` a role Symbol — `#window`/`#text`/`#table`/`#outline`)
+/// bound Rust-side to `(current UI-VM generation, args[2] ticket)`. The world-
+/// side `MacvmDelegate` class owns the ticket→receiver map; the ObjC selectors
+/// this instance answers dispatch synchronously as top-level entries into THIS
+/// VM (`objc_delegate`). Works from ANY VM role, including the Worker UI worker:
+/// unlike a C4 action it posts no envelope, so it needs no inbox sender (design
+/// §4.3). Answers a +1 id (alloc/init — wrapped with `wrap_owned`).
+fn prim_cocoa_new_delegate(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    let Some(role) = crate::oops::wrappers::SymbolOop::try_from(args[1]).map(|s| s.as_string())
+    else {
+        return PrimResult::Fail;
+    };
+    let Some(ticket) = SmallInt::try_from(args[2]) else {
+        return PrimResult::Fail;
+    };
+    // The generation live NOW (design §4.3): a callback later refuses to dispatch
+    // if the UI worker has since been restarted past this generation.
+    let gen = crate::embed::current_ui_vm_generation();
+    match crate::runtime::objc_delegate::new_delegate(&role, gen, ticket.value()) {
+        Ok(inst) => PrimResult::Ok(crate::runtime::objc_bridge::wrap_owned(vm, inst)),
+        Err(desc) => cocoa_exception_fail(vm, "macvmDelegate", &desc),
     }
 }
 
@@ -4683,6 +4721,7 @@ mod tests {
             (246, "respondsTo:"),
             (247, "shallowCopy"),
             (248, "numArgs"),
+            (249, "MacvmDelegate class>>primNewDelegate:ticket:"),
         ];
         assert_eq!(
             PRIMITIVES.len(),

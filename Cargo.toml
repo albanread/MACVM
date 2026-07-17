@@ -72,6 +72,15 @@ default = []
 name = "cocoa_main_hop"
 harness = false
 
+# Cocoa C6 reverse-dispatch gate (CG3): harness = false so main() is the real
+# main thread — the UI worker boots in place on main (the CG2 arrangement),
+# publishes its *mut VmHandle, and delegate IMPs dispatch as top-level entries
+# there; a forced SIGSEGV in a handler recovers via that thread's sigsetjmp,
+# which isolating the test to its own process keeps from taking other tests down.
+[[test]]
+name = "cocoa_delegate"
+harness = false
+
 [profile.release]
 opt-level = 3
 lto = "thin"

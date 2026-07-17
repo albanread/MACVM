@@ -1,0 +1,83 @@
+"65_cocoadelegate.mst — MacvmDelegate: the world-side ticket->receiver registry
+ for the Cocoa bridge C6 reverse dispatch (docs/cocoa_gui_design.md §4,
+ sprint_cocoa_gui.md CG3). Loaded ONLY by the UI worker via
+ `frontend::world::load_list(vm, world/cocoaui.list)`, never from world/world.list.
+
+ C6 is how AppKit calls a Smalltalk delegate/data-source SYNCHRONOUSLY and gets a
+ return value (a table's numberOfRowsInTableView:, a window's windowShouldClose:).
+ Rust registers a small family of per-role ObjC classes (MacvmWindowDelegate,
+ MacvmTextDelegate, MacvmTableSource, MacvmOutlineSource — src/runtime/objc_delegate.rs)
+ and, when AppKit invokes one of their selectors, runs it as a TOP-LEVEL VM entry:
+ it marshals the native args to oops and calls
+   MacvmDelegate dispatchTicket: t selector: sel arguments: args
+ which looks the ticket up here and does `receiver perform: sel withArguments: args`.
+
+ The contract (cocoa_bridge_design.md §2): NO oop is ever stored ObjC-side. The
+ ObjC delegate instance holds only a ticket (an integer); the receiver OBJECT
+ lives here, in a GC-rooted class-var Dictionary keyed by ticket — the C4 `Actions`
+ pattern. A stale delegate (from a UI worker since restarted, CG7) fails closed in
+ Rust before it ever reaches this class; an unknown/tombstoned ticket here answers
+ nil so the trampoline returns the shape's default (0 rows / nil / NO)."
+Object subclass: MacvmDelegate [
+    <classVars: Registry NextTicket>
+
+    "Register aReceiver under a fresh ticket and mint an ObjC delegate instance
+     of the given role (#window/#text/#table/#outline) bound to it. aReceiver
+     implements methods named after the ObjC selectors its role answers
+     (numberOfRowsInTableView:, windowShouldClose:, ...) and returns the value
+     AppKit expects — a data source answers from its local snapshot (design §4.1)."
+    MacvmDelegate class >> on: aReceiver role: aRole [
+        ^self primNewDelegate: aRole ticket: (self register: aReceiver)
+    ]
+
+    "Register aReceiver under a fresh ticket WITHOUT minting an ObjC instance,
+     answering the ticket. The mint split out so a caller (or a headless gate)
+     can drive the two halves — register here, mint the ObjC delegate for a role
+     separately — independently."
+    MacvmDelegate class >> register: aReceiver [
+        | t |
+        Registry isNil ifTrue: [ Registry := Dictionary new. NextTicket := 0 ].
+        NextTicket := NextTicket + 1.
+        t := NextTicket.
+        Registry at: t put: aReceiver.
+        ^t
+    ]
+
+    "Role-specific conveniences (the wrappers CG5/CG6 views build on)."
+    MacvmDelegate class >> tableSourceOn: aReceiver [ ^self on: aReceiver role: #table ]
+    MacvmDelegate class >> outlineSourceOn: aReceiver [ ^self on: aReceiver role: #outline ]
+    MacvmDelegate class >> windowDelegateOn: aReceiver [ ^self on: aReceiver role: #window ]
+    MacvmDelegate class >> textDelegateOn: aReceiver [ ^self on: aReceiver role: #text ]
+
+    MacvmDelegate class >> primNewDelegate: aRole ticket: ticket [
+        <primitive: 249>
+        ^self error: 'delegate creation failed (unknown role, or ObjC registration failed)'
+    ]
+
+    "Called BY the Rust IMP (a top-level VM entry) to run a delegate callback
+     synchronously and answer the handler's result. Fail closed: an unknown or
+     tombstoned ticket answers nil, and the trampoline marshals nil to the shape
+     default (0 / nil / NO). A handler that raises unwinds through the callback
+     door (`VmHandle::dispatch_callback`), which also answers the default and
+     keeps the run loop pumping (design §5 Layer 1) — never handled here."
+    MacvmDelegate class >> dispatchTicket: ticket selector: aSelector arguments: args [
+        | receiver |
+        Registry isNil ifTrue: [ ^nil ].
+        receiver := Registry at: ticket ifAbsent: [ nil ].
+        receiver isNil ifTrue: [ ^nil ].
+        ^receiver perform: aSelector withArguments: args
+    ]
+
+    "Tombstone a ticket (Dictionary has no removeKey: — the PendingReplies
+     pattern; tickets are never reused, so a tombstone is never rekeyed). The
+     teardown of a closed window (CG7) unregisters its delegates' tickets."
+    MacvmDelegate class >> unregister: ticket [
+        Registry isNil ifFalse: [ Registry at: ticket put: nil ]
+    ]
+
+    "Test/introspection accessor: the receiver bound to a ticket, or nil."
+    MacvmDelegate class >> receiverAt: ticket [
+        Registry isNil ifTrue: [ ^nil ].
+        ^Registry at: ticket ifAbsent: [ nil ]
+    ]
+]

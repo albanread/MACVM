@@ -164,15 +164,35 @@ VM entry, with Layer-1 recovery.
   fault in *our* code inside a callback, unwinds via the existing per-entry
   `sigsetjmp` back to the trampoline, which returns the defined default and
   reports; the run loop pumps on. No new `FatalMode` variant.
+- **Re-entrancy guard** (CG3 review, folded before commit): the top-level-entry
+  assumption is that the VM is quiescent when AppKit calls back. A *nested*
+  callback — an AppKit modal / menu-tracking / live-resize run loop pumped from
+  inside a handler — would alias a live `&mut VmState`, clobber the single
+  per-thread `sigsetjmp` slot, and overwrite the idle-baseline watermark. No
+  such path exists in CG3, but rather than rely on the assumption, a thread-local
+  `callback_active` flag makes a re-entrant callback fail **closed** (shape
+  default) BEFORE the trampoline re-borrows the `VmHandle`. This is what keeps
+  the door sound as CG5 introduces the first nesting paths.
 
 **Acceptance gate (headless, proxied — no display needed).** A registered
 `MacvmTableSource` bound to a Smalltalk object answers
 `numberOfRowsInTableView:` with a real integer when sent
 `objc_msgSend`-style from the test; a delegate whose handler raises returns
 the shape's default and the *next* delegate call still dispatches; a forced
-`SIGSEGV` inside a delegate handler recovers and the next call succeeds.
+`SIGSEGV` inside a delegate handler recovers and the next call succeeds; and a
+re-entrant callback fails closed before borrowing the VM.
 
 **Design ref:** §4, §5 Layer 1, §9.1 item 1.
+
+> **CG4 follow-up (from CG3 review, not a CG3 defect).** Delegate *lifetime*: a
+> minted delegate instance is registered process-wide, but nothing yet pins it
+> alive against GC of its guest `ObjcRef` (AppKit sets delegates *unretained*).
+> The instance→ticket registry keys on the raw pointer, so a freed-then-reused
+> pointer could return a wrong entry. Not triggerable in CG3 (delegates aren't
+> wired to real views yet, and the gate keeps its delegate alive), but CG4's
+> request protocol / world-side delegate ownership must give minted delegates a
+> definite process-lifetime pin (an extra retain, matching C4's "tickets live
+> for the process") so the registry pointer is stable.
 
 ---
 

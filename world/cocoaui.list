@@ -9,3 +9,4 @@
 # taken by the base world; verify with `ls world/`).
 63_cocoaui_stub.mst
 64_cocoaui.mst
+65_cocoadelegate.mst

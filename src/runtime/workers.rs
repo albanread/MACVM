@@ -505,3 +505,21 @@ pub fn primary_inbox_sender(vm: &crate::runtime::vm_state::VmState) -> Option<In
         _ => None,
     }
 }
+
+/// THIS VM's own outbound inbox sender, whatever its role — the sender a Cocoa
+/// trampoline minted here should post its `{#cocoaEvent. ticket}` envelope to.
+/// A **Primary** answers its own inbox (`inbox_tx`, byte-identical to
+/// [`primary_inbox_sender`], so C4/CocoaPad are unchanged); a **Worker** — the
+/// Cocoa GUI's UI worker (`cocoa_gui_design.md` §4.3) — answers its `to_primary`
+/// link, lifting C4's primary-only refusal (review item 5) so a Worker VM can
+/// mint an action at all. `None` only when no worker role exists (a bare CLI VM
+/// with no Cocoa callbacks). NB (CG3 scope): the *synchronous* C6 delegate path
+/// posts nothing and so needs no sender — it dispatches straight through the
+/// callback door; this helper is only for the C4 fire-and-forget action path.
+pub fn self_inbox_sender(vm: &crate::runtime::vm_state::VmState) -> Option<InboxSender> {
+    match vm.workers.as_deref() {
+        Some(WorkerState::Primary { inbox_tx, .. }) => Some(inbox_tx.clone()),
+        Some(WorkerState::Worker { to_primary, .. }) => Some(to_primary.clone()),
+        None => None,
+    }
+}

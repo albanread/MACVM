@@ -27,7 +27,6 @@
 //!    ([`publish_ui_vm`]) and runs `CocoaUI startup`.
 //! 5. *(main, Rust)* `main.rs` calls `[NSApp run]` with the VM at rest.
 
-use std::cell::Cell;
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -227,35 +226,30 @@ fn primary_thread_main(
     }
 }
 
-// ── The thread-local `*mut VmHandle` the callback trampolines read (CG3 stub) ──
+// ── The thread-local `*mut VmHandle` the callback trampolines read (CG3) ──────
 //
 // design §3 step 4: the UI worker publishes a thread-local raw pointer to its
-// own `VmHandle` so a future AppKit→Smalltalk callback trampoline (C6 reverse
-// dispatch, CG3) can read it and dispatch as a top-level `eval`/`perform` entry.
-// In CG2 there are no trampolines yet, so this is only published and never read
-// — a deliberate stub. It is a raw pointer (not an `Arc`/reference) precisely
-// because the trampolines are `extern "C"` IMPs invoked by AppKit with no Rust
-// lifetime to borrow against; the pointer stays valid because the UI worker
-// `VmHandle` outlives the run loop (it is dropped only at process exit, or, in
-// CG7, re-published across an in-place restart).
-
-thread_local! {
-    static UI_VM: Cell<*mut VmHandle> = const { Cell::new(std::ptr::null_mut()) };
-}
+// own `VmHandle` so an AppKit→Smalltalk callback trampoline (C6 reverse
+// dispatch, `macvm::runtime::objc_delegate`, CG3) can read it and dispatch as a
+// top-level `eval`/`perform` entry. The CANONICAL thread-local lives in the core
+// `macvm` crate (`macvm::embed`) — a core trampoline cannot reach a
+// `cocoa_gui`-crate thread-local, and a headless core gate must publish it. These
+// are thin re-exports so `main.rs` keeps calling `boot::publish_ui_vm`.
 
 /// Publish this thread's UI worker `VmHandle` for the CG3 callback trampolines
-/// (design §3 step 4). Call on the main thread after the handshake, before
-/// running `CocoaUI startup` / entering the run loop.
+/// (design §3 step 4) — the core [`macvm::embed::publish_ui_vm`]. Call on the
+/// main thread after the handshake, before running `CocoaUI startup` / entering
+/// the run loop. Bumps the UI-VM generation (stale delegates from a prior UI
+/// worker then fail closed — design §4.3).
 pub fn publish_ui_vm(p: *mut VmHandle) {
-    UI_VM.with(|c| c.set(p));
+    macvm::embed::publish_ui_vm(p);
 }
 
 /// The main thread's published UI worker `VmHandle` pointer, or null if none —
-/// the door a CG3 trampoline reads. Null-safe; unread in CG2 (the trampolines
-/// that read it arrive in CG3), so `#[allow(dead_code)]` for now.
+/// the door a CG3 trampoline reads ([`macvm::embed::ui_vm`]). Null-safe.
 #[allow(dead_code)]
 pub fn ui_vm_ptr() -> *mut VmHandle {
-    UI_VM.with(|c| c.get())
+    macvm::embed::ui_vm()
 }
 
 #[cfg(test)]

@@ -20,6 +20,7 @@ pub mod globals;
 pub mod lookup;
 pub mod mop; // MOP object pickle — multi-Smalltalk workers M0 (docs/multi-smalltalk-worker.md §4)
 pub mod objc_bridge; // Cocoa bridge C0 — ObjcRef + ownership + bottom pool (docs/cocoa_bridge_design.md)
+pub mod objc_delegate; // Cocoa bridge C6 — reverse dispatch: delegates as top-level entries (cocoa_gui_design.md §4, CG3)
 pub mod osr;
 pub mod primitives;
 pub mod probe;

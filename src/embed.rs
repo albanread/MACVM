@@ -28,7 +28,9 @@
 //! via a crash-report message sent before termination instead; dropping an
 //! unjoined handle afterward is safe.
 
+use std::cell::Cell;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::codecache::deopt_trap;
 use crate::frontend::{self, CompileError};
@@ -61,6 +63,102 @@ pub use crate::runtime::vm_state::FatalMode;
 /// mechanism.
 pub fn set_fatal_mode(mode: FatalMode) {
     crate::runtime::vm_state::set_fatal_mode(mode);
+}
+
+// ── The UI worker's thread-local `*mut VmHandle` + VM generation (CG3) ────────
+//
+// design (`cocoa_gui_design.md` §3 step 4, §4.3): the UI worker — pinned to the
+// process's main thread by AppKit — publishes a raw pointer to its own
+// `VmHandle` here, so an AppKit→Smalltalk callback trampoline (C6 reverse
+// dispatch, `runtime::objc_delegate`) can read it and dispatch as a *top-level*
+// `eval`/`perform`-style entry (through [`VmHandle::dispatch_callback`]). It is a
+// raw pointer (not an `Arc`/reference) precisely because the trampolines are
+// `extern "C"` IMPs AppKit invokes with no Rust lifetime to borrow against; the
+// pointer stays valid because the UI worker `VmHandle` outlives the run loop (it
+// is dropped only at process exit, or, in CG7, re-published across an in-place
+// restart).
+//
+// This is the CANONICAL location (`cocoa_gui/src/boot.rs` re-exports it): a core
+// callback trampoline in `runtime::objc_delegate` cannot reach a `cocoa_gui`-crate
+// thread-local, and a headless core integration test must be able to publish a
+// pointer and drive a delegate directly.
+thread_local! {
+    static UI_VM: Cell<*mut VmHandle> = const { Cell::new(std::ptr::null_mut()) };
+}
+
+/// Monotonic UI-VM generation, bumped every time a non-null `VmHandle` is
+/// published (design §4.3): a delegate records the generation live at its mint,
+/// and a callback trampoline refuses to dispatch a delegate whose recorded
+/// generation is stale — one minted against a UI worker that has since been
+/// restarted (CG7). Process-wide because delegate instances (ObjC objects) and
+/// the trampolines that fire them are process-wide; the fail-*closed* stale
+/// check never dispatches into a dead VM.
+static UI_VM_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// Publish this thread's UI worker `VmHandle` for the CG3 callback trampolines
+/// (design §3 step 4). Call on the main thread after the boot handshake, before
+/// running `CocoaUI startup` / entering `[NSApp run]`. Publishing a **non-null**
+/// pointer BUMPS the UI-VM generation, so any delegate minted against a prior
+/// (now-replaced) UI worker fails closed at its next callback (design §4.3);
+/// publishing null (teardown) only clears the door and does NOT bump.
+pub fn publish_ui_vm(p: *mut VmHandle) {
+    UI_VM.with(|c| c.set(p));
+    if !p.is_null() {
+        UI_VM_GENERATION.fetch_add(1, Ordering::Release);
+    }
+}
+
+/// The calling thread's published UI worker `VmHandle` pointer, or null if none
+/// — the door a CG3 callback trampoline reads before dispatching. Null-safe.
+pub fn ui_vm() -> *mut VmHandle {
+    UI_VM.with(|c| c.get())
+}
+
+/// The current UI-VM generation (design §4.3). A delegate mint records this
+/// value; a callback trampoline compares the delegate's recorded generation to
+/// this and fails closed on a mismatch (a stale delegate from a restarted UI
+/// worker). Zero before the first [`publish_ui_vm`], so a delegate can never be
+/// minted at generation 0 and pass the check by accident.
+pub fn current_ui_vm_generation() -> u64 {
+    UI_VM_GENERATION.load(Ordering::Acquire)
+}
+
+thread_local! {
+    /// True while a C6 delegate callback ([`VmHandle::dispatch_callback`]) is
+    /// running on THIS thread. See [`callback_active`].
+    static IN_CALLBACK: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Is a C6 delegate callback currently executing on this thread? (CG3 review.)
+///
+/// A delegate callback is a **top-level** VM entry, sound precisely because the
+/// UI worker is quiescent when AppKit calls back. A *nested* callback — an
+/// AppKit modal / menu-tracking / live-resize run loop pumped from INSIDE a
+/// handler (which CG5+ introduces) — would re-borrow the same `&mut VmState`,
+/// clobber the single per-thread `sigsetjmp` recovery slot, and overwrite the
+/// one idle-baseline watermark, so a later fault would `siglongjmp` into a
+/// returned frame and rewind to the wrong baseline. The delegate dispatch
+/// trampoline reads this flag BEFORE it re-borrows the `VmHandle` and, if a
+/// callback is already active, fails **closed** (returns the shape default —
+/// the same safe answer a stale/unknown delegate gets) instead. No such nesting
+/// path exists in CG3, but failing closed keeps the door sound in advance.
+pub fn callback_active() -> bool {
+    IN_CALLBACK.with(Cell::get)
+}
+
+/// Set/clear the [`callback_active`] flag. Private: only [`VmHandle::
+/// dispatch_callback`] owns the flag's lifecycle, and it must clear it on EVERY
+/// exit arm — including the `siglongjmp` recovery arms, which skip `Drop`, so an
+/// RAII guard cannot be used here.
+fn set_callback_active(v: bool) {
+    IN_CALLBACK.with(|c| c.set(v));
+}
+
+/// Test-only hook to drive [`callback_active`] without a real nested callback,
+/// so the trampoline's fail-closed guard is unit-testable off the main thread.
+#[cfg(test)]
+pub(crate) fn set_callback_active_for_test(v: bool) {
+    set_callback_active(v);
 }
 
 /// A running, embedded VM instance — owns its `VmState` (and, through it,
@@ -586,6 +684,93 @@ impl VmHandle {
         };
         frontend::classdef::execute_top_item(&mut self.vm, item).map_err(GuestError::Compile)?;
         Ok(())
+    }
+
+    /// The C6 reverse-dispatch callback door (`cocoa_gui_design.md` §4, §5
+    /// Layer 1): run `body` — an AppKit→Smalltalk delegate dispatch that marshals
+    /// its native arguments, performs the handler, and marshals the native return
+    /// — as a **top-level VM entry**, inside the very same per-entry `sigsetjmp`
+    /// recovery window `eval`/`exec` install. The UI worker is quiescent whenever
+    /// AppKit calls back (the run loop is Rust's, the VM at rest — design §3), so
+    /// a callback is never a re-entrant `&mut VmState`; it is this fresh entry.
+    ///
+    /// Recovery is Layer 1: a handler that `error:`s or DNUs (a guest fatal), or
+    /// a genuine native fault (`SIGSEGV`/`SIGBUS`) in our marshalling or a bad
+    /// `Alien` inside the handler, unwinds via `siglongjmp` back to HERE; the VM
+    /// is rewound to its clean idle baseline and `body`'s `default` (the return
+    /// shape's defined default — `0`/`NO`/`nil`, all zero) is answered to AppKit,
+    /// so the delegate return slot is never left undefined and the run loop pumps
+    /// on. Unlike [`eval`](Self::eval) this **always resumes** — it never consults
+    /// [`ErrorPolicy`] and never `Die`s: a delegate typo mid-run-loop must not
+    /// kill the UI worker out from under AppKit (that is the design's whole
+    /// point). A genuinely VM-fatal condition (heap exhaustion, stack overflow)
+    /// still terminates via `fatal_exit` — on the main-thread UI worker that is
+    /// `ExitProcess` (CG0), the honest outcome, not a recoverable callback error.
+    #[allow(unsafe_code)]
+    pub fn dispatch_callback(
+        &mut self,
+        default: u64,
+        body: impl FnOnce(&mut VmState) -> u64,
+    ) -> u64 {
+        use std::io::Write as _;
+        // Re-entrancy guard (CG3 review): a delegate callback is a TOP-LEVEL
+        // entry, sound only because the VM is quiescent. If one is already active
+        // on this thread — a nested AppKit callback pumped from a modal/tracking
+        // run loop inside a handler (CG5+) — fail CLOSED with the shape default
+        // rather than clobber the shared `sigsetjmp` slot + idle baseline (a
+        // later fault would `siglongjmp` into a returned frame) and alias
+        // `&mut VmState`. The delegate trampoline (`objc_delegate::dispatch`)
+        // also checks this BEFORE re-borrowing the `VmHandle`, so the aliasing
+        // `&mut` is avoided at source; this is the second line of defense for a
+        // direct caller and the one that owns the flag's lifecycle.
+        if callback_active() {
+            return default;
+        }
+        let slot = deopt_trap::claim_jmp_slot();
+        // SAFETY: as `eval` — `sigsetjmp` inline at this exact call site, whose
+        // frame (this `dispatch_callback` invocation) stays live for the whole
+        // recovery window; `body` runs deeper on the stack and any fault
+        // `siglongjmp`s straight back here.
+        let rc = unsafe { deopt_trap::sigsetjmp(deopt_trap::jmp_buf_ptr(slot), 1) };
+        if rc == deopt_trap::GUEST_FATAL_JMP_VAL {
+            // A delegate handler raised (`error:`/DNU). The error was already
+            // written to the transcript before the unwind; rewind to the clean
+            // idle baseline (never `Die` — the run loop must keep pumping) and
+            // answer the shape default. Clear the guard: the unwind skipped the
+            // normal-return clear below, and the run loop must be able to
+            // dispatch the NEXT callback.
+            let _ = deopt_trap::take_last_guest_fatal_message();
+            self.restore_after_guest_fatal();
+            set_callback_active(false);
+            return default;
+        }
+        if rc != 0 {
+            // A recovered native fault (SIGSEGV/SIGBUS) inside our marshalling or
+            // a bad `Alien` deref in the handler. Same recovery: restore + report
+            // + shape default. (No prior transcript line exists for a raw fault,
+            // unlike a guest `error:`, so name it here.)
+            let info = deopt_trap::take_last_crash_info();
+            self.restore_after_guest_fatal();
+            set_callback_active(false);
+            if let Some((sig, pc, far)) = info {
+                let _ = writeln!(
+                    self.vm.out,
+                    "[cocoa-delegate] native fault (signal {sig}) at pc=0x{pc:x} far=0x{far:x} — recovered, delegate answered its default"
+                );
+            }
+            return default;
+        }
+        // Capture the clean watermark before any guest code runs, so a fatal
+        // abort rewinds to exactly here (`restore_after_guest_fatal`).
+        self.snapshot_idle_baseline();
+        // Mark the callback active across `body` ONLY (after the `sigsetjmp`
+        // landing arms, so a fault unwinds through the arms above which clear
+        // it). Cleared explicitly on the normal-return path — an RAII guard
+        // can't be used, since a `siglongjmp` skips `Drop`.
+        set_callback_active(true);
+        let out = body(&mut self.vm);
+        set_callback_active(false);
+        out
     }
 
     /// Evaluates a `<smappl visual="...">` expression and returns the HTML
