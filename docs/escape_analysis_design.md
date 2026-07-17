@@ -111,9 +111,10 @@ This is a real arc, and its foundation (P0 inlining) is the bulk of it. Two
 honest options:
 - **Commit to the arc** if the allocation win is the priority — P0 is valuable by
   itself, and the payoff (S1–S4) is measured-to-be-real.
-- **Defer** in favor of a cheaper roadmap item (the scoped `catch:`, which is
-  unblocked and small) and take escape analysis as a later, larger project once
-  P0 inlining exists.
+- **Defer** in favor of a cheaper roadmap item and take escape analysis as a
+  later, larger project once P0 inlining exists. (The scoped `catch:` this note
+  originally suggested was subsequently REJECTED on fail-fast grounds — see
+  `docs/ROADMAP.md` item 2; the live cheap candidates are roadmap items 1/3.)
 
 Either way, the lesson stands: the win is deleting allocation, but *exposing* the
 allocation to the optimizer is the prerequisite nobody sees until they read the

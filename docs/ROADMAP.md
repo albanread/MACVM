@@ -27,12 +27,14 @@ by time and porting, not design.
   of truth (versioned SQLite + `.mst` export) and rebuilds the runtime
   reproducibly. Pharo has been moving this way for years (Iceberg/git); MACVM
   committed to the endpoint.
-- **A full ANSI exception system.** Fault isolation is handled by worker
-  crash-recovery + supervisor respawn ("let it crash"); ordinary error handling
-  by the explicit-result style (`ifAbsent:`, sentinels — Rust's `Result`/
-  `Option`). `ensure:`/`ifCurtailed:` already run on the error path. Item 2 below
-  closes the one honest residual without dragging in resumable-exception
-  machinery.
+- **Exception handling of any kind — including a scoped `catch:`.** Fault
+  isolation is handled by worker crash-recovery + supervisor respawn ("let it
+  crash"); ordinary error handling by the explicit-result style (`ifAbsent:`,
+  sentinels — Rust's `Result`/`Option`); harness-style survival of buggy code by
+  throwaway workers (`ErrorPolicy::Die`). `ensure:`/`ifCurtailed:` already run
+  on the error path, so cleanup is guaranteed — but no handler ever catches and
+  continues. An unexpected error means a bug; the response is a crash dump next
+  to the cause, not a fallback value. (See item 2 below for the full rejection.)
 - **Live `become:` / class reshaping.** Shape edits take effect on reboot; a
   save-time live migration is *designed* (`docs/become_design.md`) but shelved —
   a ~1 s reboot makes it a minor convenience, not a need.
@@ -71,21 +73,31 @@ once crashes are routine and recovery is declarative.
 - *First step:* links/monitors + a `Supervisor` with one restart strategy
   (one-for-one), driving the existing respawn.
 
-### 2. A scoped, non-resumable `catch:` / `throw:`
-**Close the one honest residual — intra-computation recovery — cheaply.** "Step
-3 of a doit failed; recover locally and continue" currently has no answer between
-worker-level and top-level abort. A block-scoped `[...] catch: [:err | ...]`
-(or `ifError:`) that unwinds to the handler, runs `ensure:` cleanups on the way,
-and delivers a value — **no `resume:`, no retry state machine** — fills it.
+### 2. ~~A scoped, non-resumable `catch:` / `throw:`~~ — REJECTED (2026-07-17)
 
-- *Why:* best value-per-effort here, and it stays in the explicit-error
-  philosophy (no invisible non-local unwinding across arbitrary code). It is
-  emphatically *not* full ANSI exceptions.
-- *Builds on:* the unwinding substrate already present (`ensure:`/`ifCurtailed:`,
-  the marker-frame walk, the guest-fatal `siglongjmp` path in `unwind.rs`).
-- *Effort/risk:* small–medium; the mechanism exists, this scopes and exposes it.
-- *First step:* a handler-marker frame + a one-shot unwind-to-marker that
-  reuses the curtailment walk.
+Proposed to close the "intra-computation recovery" residual; rejected by the
+designer on philosophy: **fail fast with a clear crash dump beats catching and
+continuing past code that has already gone wrong.** Even a non-resumable
+`catch:` resumes the *enclosing* computation whose state the failure just
+impeached, and a fallback value lets the bug travel away from its cause — the
+crash evidence ends up pointing somewhere useless. (The in-house proof is the
+recovery bug of 2026-07-16: a VM that "kept working" on a quietly corrupted
+stack. Catch-and-continue is that failure mode offered as a feature.)
+
+The cases that looked like they needed it dissolve on inspection:
+
+- *Expected* failures (absent key, bad parse) → explicit results (`ifAbsent:`,
+  sentinels), which the world library already uses pervasively.
+- *Bugs* → crash with the dump intact; the VM recovers to its clean idle
+  baseline or the worker dies. Already built and tested.
+- *Harness-style* "run possibly-buggy code and report" (test runners, the
+  benchmark dashboard) → **throwaway workers with `ErrorPolicy::Die`**, built
+  for exactly this: the erroring unit takes its corrupted world with it, the
+  harness observes the death and reports it. Nothing is resumed.
+
+The mechanism sketch (an argc-1 handler marker reusing the curtailment walk) is
+in the git history should this ever be revisited — but the objection is
+philosophical, not technical, so it should not be revisited casually.
 
 ### 3. Non-blocking I/O + sockets
 **Turn the compute engine into a system.** Isolation + many-core + let-it-crash
@@ -152,8 +164,9 @@ BEAM does exactly this for binaries.
 
 ## How to read the priority order
 
-1 and 2 are the cheapest high-leverage moves (framework + the honest gap). 3
-opens the most new ground. 4 is where compiler investment pays, on the evidence
-of our own profiling. 5 hardens the bet for scale. Pick by appetite: **2** for
-maximum value per hour, **1** to invest in MACVM's identity, **3** to unlock a
-new class of program.
+With 2 rejected (fail fast — see above) and 4 gated on its P0 inlining
+prerequisite (a committed arc, not a quick win), the live candidates are **1**,
+**3**, and **5**. 1 is now doubly on-philosophy: in a fail-fast system,
+supervision *is* the error handling, and `ErrorPolicy::Die` + respawn is its
+substrate, already built. 3 opens the most new ground. 5 hardens the bet at
+scale. Recommended order: **1**, then **3**.
