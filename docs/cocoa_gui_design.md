@@ -1,511 +1,587 @@
 # A native Cocoa GUI for MACVM — the environment, written in itself
 
-**Status: design.** A second, flagged GUI mode. The current shell
-(`gui/`, `macvm-gui`) renders its interface as HTML in a `WKWebView`. This
-document designs the alternative: **a native AppKit interface built from
-Smalltalk, through the Cocoa bridge**, in which the interface is a
-Smalltalk VM pinned to the main thread and the persistent environment is a
-Smalltalk VM behind it. It is the capstone of the Cocoa bridge (C0–C5,
-`cocoa_bridge_design.md`) and the reflective RPC work
-(`perform:withArguments:`), and needs one new bridge capability, developed
-here as **C6: reverse dispatch (delegates)**.
+**Status: design (adversarially reviewed 2026-07-17).** A second, flagged
+GUI mode. The current shell (`gui/`, `macvm-gui`) renders its interface as
+HTML in a `WKWebView`. This document designs the alternative: **a native
+AppKit interface built from Smalltalk, through the Cocoa bridge**, in which
+a Smalltalk VM pinned to the main thread *is* the interface and a Smalltalk
+VM behind it is the persistent environment. It is the capstone of the Cocoa
+bridge (C0–C5, `cocoa_bridge_design.md`) and the reflective RPC work
+(`perform:withArguments:`), and needs one new bridge capability (**C6:
+reverse dispatch, delegates**) plus a small amount of new *infrastructure*
+the review surfaced (§9).
 
 Both GUIs coexist; the WKWebView shell stays the default. Cocoa mode is a
-deliberate, flagged choice (`macvm-gui --cocoa` / `macvm-cocoa`).
+deliberate, flagged choice.
+
+> **Two design reviews reshaped this document (§9.0).** The load-bearing
+> correction: the AppKit run loop is entered **from Rust glue with the VM
+> quiescent**, so every AppKit→Smalltalk callback is an ordinary *top-level*
+> VM entry through the existing `VmHandle::eval` door — not a re-entrant
+> call into a live `&mut VmState`. That single decision makes the crash
+> recovery, the delegate dispatch, and the drain all reuse machinery that
+> exists, instead of needing new nested-recovery machinery that does not.
 
 ```smalltalk
 "the interface is Smalltalk calling AppKit; the environment is a VM behind it"
-UI window: (Workspace on: 'Transcript showCr: 3 + 4').
-UI window: (ClassBrowser on: Integer).
-UI run.        "= [NSApp run] on the main thread; events dispatch to Smalltalk"
+CocoaUI window: (Workspace on: 'Transcript showCr: 3 + 4').
+CocoaUI window: (ClassBrowser on: Integer).
+"...then Rust calls [NSApp run]; events dispatch into these objects."
 ```
 
 ## 1. Three VMs, three tiers — and which thread each lives on
 
 The decisive design fact is the **thread/role assignment**. AppKit forces
-one thing only: the interface must run on the process's main thread.
-Everything else is a choice, and the right choice is to keep the
-*persistent brain off the main thread* so it can neither freeze the UI nor
-take the process down with it.
+one thing: the interface runs on the process's main thread. Everything else
+is a choice, and the right choice keeps the *persistent brain off the main
+thread* so it can neither freeze the UI nor take the process down with it.
 
 | Tier | Thread | Role | Risk profile |
 |---|---|---|---|
-| **UI worker VM** | **main (pinned by AppKit)** | a *dumb terminal*: builds native views, runs `[NSApp run]`, answers AppKit delegate calls from a **local snapshot**, forwards events | thin, low-risk; failures mostly per-event-recoverable |
-| **Primary ST VM** | **2nd (background)** | the **persistent state**: live objects, classes-being-edited, workspace vars; boots the world, **spawns the workers (incl. the UI worker)**, runs doits, blasts snapshots to the UI | the real logic; **restartable** because it is not the main thread |
+| **UI worker VM** | **main (pinned by AppKit)** | a *dumb terminal*: builds native views, answers AppKit delegate/data-source calls from a **local snapshot**, forwards events. Quiescent between callbacks. | thin, low-risk; mostly per-event recoverable |
+| **Primary ST VM** | **2nd (background)** | the **persistent state**: live objects, classes-being-edited, workspace vars; boots the world, **registers the UI worker**, spawns compute workers, runs doits, blasts snapshots | the real logic; **restartable** because it is not the main thread |
 | **Compute worker VMs** | other background | parallel work spawned by the primary | isolated; die+respawn (M0–M4) |
 
-The two moves that make this work, and distinguish it from the naïve
-"VM on main" arrangement:
+Two moves distinguish this from the naïve "VM on main" arrangement:
 
-1. **The UI is a *worker*, not the primary.** The persistent VM — where
-   your code and objects actually live — is a background thread. The main
-   thread hosts a second VM whose only job is the display, pinned to main
-   only because Cocoa requires it. The interface is demoted from *the
-   brain* to *a display device that happens to be on a specific thread*.
+1. **The UI is a *worker*, not the primary.** The persistent VM — where your
+   code and objects live — is a background thread. The main thread hosts a
+   second VM whose only job is display, pinned to main only because Cocoa
+   requires it. The interface is demoted from *the brain* to *a display
+   device on a specific thread*.
 2. **The UI worker is a *dumb terminal* (`feedback_blast_dont_patch`).** It
-   holds a **local snapshot** of what each view should show; it renders
-   that snapshot and forwards events; it never holds authoritative state
-   and never patches incrementally. When the model changes, the primary
-   *blasts a whole fresh snapshot* and the terminal re-renders. This is the
-   editor-view lesson made structural.
+   holds a **local snapshot** of what each view should show; it renders that
+   snapshot and forwards events; it never holds authoritative state and never
+   patches incrementally. When the model changes, the primary *blasts a whole
+   fresh snapshot* and the terminal re-renders.
 
-Everything below follows from those two moves. Three consequences are
-load-bearing and get honest treatment: **the crash model is recovered
-(§5)**, **the UI never freezes on model work (§6)**, and **delegates are
-answerable synchronously without a cross-thread wait (§4)** — the last of
-which is *why* the terminal holds a snapshot.
+Everything below follows. Three consequences are load-bearing and get honest
+treatment: **the crash model is recovered (§5)**, **the UI never freezes on
+model work (§6)**, and **delegates are answered synchronously from a local
+snapshot without a cross-thread wait (§4)** — the last of which is *why* the
+terminal holds a snapshot.
 
 ## 2. Why this shape (and why "VM on main" was wrong)
 
-An earlier draft of this design put the *persistent* VM on the main thread
-and called it "the UI." That is the obvious arrangement and it is wrong,
-for two reasons this shape fixes:
+An earlier draft put the *persistent* VM on the main thread and called it
+"the UI." That is the obvious arrangement and it is wrong, for two reasons
+this shape fixes:
 
 - **Crash safety.** A fatal doit (`error:`, DNU, heap exhaustion, a native
   fault) ends in `fatal_exit`. On the main thread the only options are
   `pthread_exit` (tears the process down) or a blind `siglongjmp` through
-  AppKit frames (undefined behaviour, the reason S21 rejected unwinding
-  through JIT frames) — so "VM on main" *loses* the S21 restart-on-death
+  AppKit frames (undefined behaviour — the reason S21 rejected unwinding
+  through JIT frames). So "VM on main" *loses* the S21 restart-on-death
   model. With the persistent VM on a **background** thread, a fatal doit
-  `pthread_exit`s that thread, a supervisor respawns it, and the UI
-  terminal shows "reconnecting" and re-syncs — **S21's model, recovered
-  (§5).**
+  `pthread_exit`s that thread, a supervisor respawns it, and the UI terminal
+  shows "reconnecting" and re-syncs — **S21's model, recovered (§5).**
 - **Responsiveness.** If the persistent VM is the main thread, a long doit
-  freezes the UI *and* the coordinator. With doits on the background
-  primary, a long doit blocks the primary — not the paint loop — so the UI
-  stays live and can show progress (§6).
+  freezes the UI. With doits on the background primary, a long doit blocks
+  the primary — not the paint loop — so the UI stays live (§6).
 
-The interface must be on main; the *environment* must not be. That is the
-whole idea.
+The interface must be on main; the *environment* must not be.
 
-## 3. Boot, the flag, and how the UI worker gets onto the main thread
+## 3. Boot — the run loop is Rust's; the callbacks are Smalltalk's
 
 The two modes share the crate, the world/image, the Cocoa bridge, the
-GamePane, and `objc::bootstrap()`. `fn main()` (`gui/src/main.rs`) already
-dispatches on the first CLI arg; Cocoa mode is one more arm:
+GamePane, and `objc::bootstrap()` (factored out of the `gui` crate so both
+bins call it — §12). `fn main()` dispatches on the first CLI arg; Cocoa mode
+is one more arm:
 
 ```
 macvm-gui               → WKWebView mode (default, unchanged)
-macvm-gui --cocoa       → Cocoa mode
-macvm-cocoa             → alias (a second bin, same entry)
+macvm-cocoa             → Cocoa mode (a dedicated bin in the cocoa_gui crate)
 ```
 
-The chicken-and-egg — *the primary spawns the UI worker, but the UI worker
-must land on the main thread the process started on* — is resolved by
-parking the main thread and letting the primary drive it:
+The chicken-and-egg — *the primary registers the UI worker, but the UI
+worker must run on the main thread the process started on* — is resolved by
+booting the UI worker VM **in place on main** and letting Rust own the run
+loop. The critical correction from review (R1/item-1): **`[NSApp run]` is
+called by the Rust `cocoa_gui` glue with the UI worker VM at rest, never from
+inside a Smalltalk doit.** The VM is quiescent whenever AppKit calls back, so
+every callback is a *top-level* `VmHandle` entry (the existing `eval` door),
+not a re-entrant call into a live `&mut VmState`.
 
-1. **(main thread)** `objc::bootstrap()` — `NSApplication`, activation
-   policy, menu bar. AppKit init must be on main. (Shared with WKWebView
-   mode.)
-2. **(main thread)** Spawn the **primary VM on a background thread** and
-   then *park*, waiting on a channel for its "become the UI worker"
-   instruction.
+Boot sequence:
+
+1. **(main)** `objc::bootstrap()` — `NSApplication`, activation policy. (Menu
+   bar is built later, in Smalltalk — §7/R5.) AppKit init must be on main.
+2. **(main)** Spawn the **primary VM on a background thread** (the S21
+   supervisor owns this thread — §5). Park main on a channel awaiting the
+   primary's "UI ready" signal (the primary has booted its world and is
+   serving).
 3. **(background)** The primary boots the world (persistent state), then
-   **spawns workers** — the first of which is the special **UI worker**.
-   "Spawning" the UI worker is not creating a thread: it sends the parked
-   main thread a boot payload (the UI worker's Smalltalk boot code + its
-   link back to the primary).
-4. **(main thread)** Unparks, boots the **UI worker VM in place**, builds
-   the initial windows (a Workspace + a Transcript), installs their C6
-   delegates, orders them front, and calls `UI run` = `[NSApp run]`.
-5. From here the AppKit event loop *is* the UI worker's main loop. Each
-   event dispatches, through a C6 delegate/action trampoline, into the UI
-   worker's Smalltalk (§4); anything needing the environment is a message
-   to the primary (§6); the primary blasts snapshots back, drained on the
-   main thread between events (the M3 wake, reused, §8).
+   **registers the UI worker as an externally-hosted peer** (a new
+   `workers.rs` surface, R-item9): a worker id + a real inbox
+   `Sender<Envelope>` + a **run-loop wake** (a `performSelectorOnMainThread`
+   poke, R-item8), *without* spawning a thread — the UI worker's thread is
+   main, which already exists. It sends main the boot payload.
+4. **(main)** Boots the **UI worker VM in place** (own heap, `FatalMode::
+   ExitProcess` — R-item6, *not* `boot()`'s default `ExitThread`, which on
+   main is a headless zombie), publishes a **thread-local `*mut VmHandle`**
+   the callback trampolines read (R1), then runs the Smalltalk startup doit
+   `CocoaUI startup` — builds the menu bar, the initial windows (a Workspace
+   + a Transcript), installs their C6 delegates, orders them front — and
+   **returns to Rust**.
+5. **(main, Rust)** Calls `[NSApp run]`. The VM is now at rest. Each AppKit
+   event dispatches through a C6/C4 trampoline as a *top-level* entry into
+   the UI worker (§4); each inbox drain (snapshots, doit replies from the
+   primary) runs as a top-level entry scheduled on the run loop in **default
+   mode only** (§8/R-item12).
 
-`enable_main_hop()` (C3) is **not** used the way the WKWebView GUI uses it:
-there is no Rust-owned main to hop to. It stays available for the *reverse*
-direction — a background VM asking the UI worker to do something on main
-(§8). Neither VM's live objects are persisted (MACVM has no running-image
-save, by design); each launch rebuilds the windows by re-running the UI
-worker's boot code, exactly as the world boots from source. Durable UI
-preferences (window frames) are saved as *data* (a small plist /
-image_store table), never as pickled views.
+`enable_main_hop()` (C3) is not used the WKWebView way (no Rust-owned main to
+hop to). Neither VM's live objects are persisted (no running-image save, by
+design); each launch rebuilds the windows by re-running `CocoaUI startup`,
+exactly as the world boots from source. Durable UI prefs (window frames) are
+data (a plist / image_store table), never pickled views.
 
 ## 4. C6 — reverse dispatch: delegates answered from the local snapshot
 
-Everything an IDE does past "click a button" is a **delegate or data
-source** — `NSTableViewDataSource` answering `numberOfRowsInTableView:`,
+Everything an IDE does past "click a button" is a **delegate or data source**
+— `NSTableViewDataSource` answering `numberOfRowsInTableView:`,
 `NSOutlineViewDataSource` answering `outlineView:child:ofItem:`,
-`NSTextViewDelegate` answering `textDidChange:`. These are **synchronous
+`NSWindowDelegate` answering `windowShouldClose:`. These are **synchronous
 calls from AppKit that expect a return value now**, to paint. C4's
-`MacvmAction` is fire-and-forget target/action (void); it cannot answer a
-data source. C6 is the mechanism that can.
+`MacvmAction` is fire-and-forget (void); it cannot answer a data source. C6
+is the mechanism that can.
 
-### 4.1 Why "answer from a local snapshot" is the crux
+### 4.1 Why "answer from a local snapshot" is the crux (review: SOUND)
 
-AppKit calls the data source **synchronously on the main thread** and
-blocks until it returns. The authoritative model lives on the **primary
-(background) VM**. If the delegate had to *ask the primary* for each row —
-a synchronous main→primary wait — a busy primary would freeze the paint,
-and a primary waiting on the UI would deadlock. That is the exact wait
-cycle the worker threading model forbids.
+AppKit calls the data source **synchronously on the main thread** and blocks
+until it returns. The authoritative model lives on the **primary
+(background) VM**. If the delegate had to *ask the primary* per row — a
+synchronous main→primary wait — a busy primary would freeze the paint, and a
+primary waiting on the UI would deadlock (the exact wait cycle the worker
+threading model forbids). The dumb-terminal design dissolves it: the UI
+worker answers **from its own local snapshot**, on its own thread, with no
+wait. `numberOfRowsInTableView:` is `^snapshot rowCount` — instant, local.
+This is *why* the terminal holds a snapshot.
 
-The dumb-terminal design dissolves it: the UI worker answers **from its own
-local snapshot**, on its own thread, with no wait. The snapshot is a copy
-the primary blasted (via the pickle) the last time the model changed — a
-plain Smalltalk data structure living in the UI worker's own heap. So
-`numberOfRowsInTableView:` is `^snapshot rowCount`, answered instantly and
-locally. This is *why* the terminal holds a snapshot: to make AppKit's
-synchronous callbacks answerable without ever crossing a thread.
+### 4.2 The mechanism — a registered-IMP table (review: chosen over forwardInvocation)
 
-### 4.2 The mechanism — one forwarding trampoline, C2's marshalling in reverse
+Both reviews recommended a **registered-IMP table over `forwardInvocation:`**,
+and the inventory is decisive: G2–G5 need ~13 delegate/data-source selectors
+across ~8 type shapes, all already in the bridge's `classify_arg`/
+`classify_ret` vocabulary (id / NSInteger / BOOL / NSRange). `forwardInvocation:`
+would need those same 8 shapes *plus* NSInvocation get/set-argument plumbing
+*plus* three registered override IMPs (`respondsToSelector:`,
+`methodSignatureForSelector:`, `forwardInvocation:`) *plus* a per-instance
+allow-list — strictly more code, slower on the per-cell paint path, for
+generality an IDE does not need.
 
-One ObjC class, `MacvmDelegate : NSObject`, registered once, responding to
-arbitrary selectors via Objective-C's own dynamic message forwarding:
+So C6 is a **small family of per-role ObjC delegate classes**, each with
+exactly the selectors that role answers — the `MacvmAction` pattern
+(`objc_bridge.rs`, `macvm_action_class`) and the WKWebView menu targets
+(`gui/src/main.rs`, `add_method(cls, sel("selectTheme:"), …, "v@:@")`)
+generalized:
 
-- `respondsToSelector:` → true for the selectors the bound Smalltalk
-  object declares it handles (a per-instance allow-list, so optional
-  delegate methods stay optional and AppKit's probes answer correctly).
-- `methodSignatureForSelector:` → an `NSMethodSignature` from the
-  selector's `@encode` string (`+[NSMethodSignature signatureWithObjCTypes:]`).
-  We already resolve that string at runtime for the forward direction
-  (`objc_bridge::resolve_shape`, C2).
-- `forwardInvocation:` — the heart. Read the selector; for each argument
-  index read the raw bytes with `-getArgument:atIndex:` and **unmarshal to
-  a Smalltalk oop using C2's `classify_arg`** (native→Smalltalk: id→wrap
-  `ObjcRef`, integer→SmallInteger, double→Double, `NSString`→String,
-  struct→Array); build an argument Array; run
-  `delegate perform: selector withArguments: args` — **the reflective
-  primitive built for the worker RPC, reused verbatim** — then **marshal
-  the Smalltalk result back into the return slot with C2's `classify_ret`**
-  via `-setReturnValue:`.
+- `MacvmWindowDelegate` — `windowShouldClose:` (`B@:@`), `windowWillClose:`
+  (`v@:@`), and the app-lifecycle pair `applicationShouldTerminate:`
+  (`Q@:@`) / `applicationShouldTerminateAfterLastWindowClosed:` (`B@:@`).
+- `MacvmTextDelegate` — `textDidChange:` (`v@:@`).
+- `MacvmTableSource` — `numberOfRowsInTableView:` (`q@:@`),
+  `tableView:objectValueForTableColumn:row:` (`@@:@@q`),
+  `tableViewSelectionDidChange:` (`v@:@`).
+- `MacvmOutlineSource` — `outlineView:numberOfChildrenOfItem:` (`q@:@@`),
+  `child:ofItem:` (`@@:@q@`), `isItemExpandable:` (`B@:@@`),
+  `objectValueForTableColumn:byItem:` (`@@:@@@`),
+  `outlineViewSelectionDidChange:` (`v@:@`).
 
-So C6 is **C2's marshalling run backwards**, glued by `perform:`. The
-`@encode` vocabulary, the struct set, the width rules — all already exist
-and are already tested. New code: the two override IMPs, the NSInvocation
-get/set-argument plumbing, and a per-instance `(delegate-oop, allow-list)`
-registry (the C4 ticket registry generalized from "one action block" to
-"one Smalltalk object + its handled selectors"). It runs entirely on the
-**main thread** against the UI worker's local objects — the same-thread
-case C0–C5's callbacks made safe.
+Because each class carries only its own selectors, `respondsToSelector:` is
+**natively correct** — optional delegate methods stay optional with no
+allow-list. Each IMP is one typed `extern "C" fn` that: reads the
+ABI-delivered arguments, unmarshals each with `classify_arg` (native→Smalltalk
+oop), looks up its bound Smalltalk delegate object in the C6 registry, runs
+`delegate perform: selector withArguments: args` — **the reflective primitive
+built for the worker RPC, reused verbatim** — and marshals the result back
+with `classify_ret`. Each runs on the **main thread as a top-level VM entry**
+(R1): the trampoline reads the thread-local `*mut VmHandle`, calls
+`eval`/`perform` through the existing door (which already carries the
+per-entry `sigsetjmp` guard — §5), and returns to AppKit.
 
-### 4.3 Ownership of delegate objects
+`forwardInvocation:`/NSInvocation is deferred to an appendix, for the day an
+arbitrary-protocol delegate is actually needed.
 
-A window/table/textview **retains** its delegate (an `ObjcRef` wrapping a
-`MacvmDelegate`), which holds a **ticket** into the GC-rooted registry
-naming the UI worker's Smalltalk delegate object — no oop is ever stored
-ObjC-side (the §2 bridge contract holds). Delegates are **long-lived**:
-built outside any `poolDo:` scope, released on `windowWillClose:`. A
-never-closed window leaks its ticket, acceptably; a double-registered
-delegate is refused (monotonic tickets, C4 rule).
+### 4.3 The C6 registry — instance→ticket, VM-tagged
 
-## 5. The crash model — recovered, because the brain is off-main
+One process-wide registry maps an ObjC delegate instance pointer → a ticket
+naming the UI worker's Smalltalk delegate object (a GC root; no oop ever
+stored ObjC-side — the §2 contract holds). Entries carry a **generation/VM
+tag** (R-item4): after a UI-worker restart (§5) a stale delegate instance
+from a not-yet-closed window fails *closed* — the IMP returns a defined
+default (0 rows, `nil`, `NO`) rather than dispatching into a dead VM.
+Delegates are **long-lived** (built outside any `poolDo:`, released in the
+teardown of §5), so the mint path must work from a *Worker* VM — which C4's
+`prim_cocoa_new_action` currently refuses (R-item5); that gate is lifted for
+the UI worker, routing through the Worker's own `to_primary`/registration
+sender rather than `primary_inbox_sender`.
 
-The persistent VM being a **background** thread restores S21's
-restart-on-death model that "VM on main" would have lost:
+## 5. Crash recovery — three layers, all reusing the top-level-entry door
 
-- **A fatal doit runs on the primary (thread 2).** `error:`/DNU/stack
-  overflow/heap-exhaustion → `fatal_exit` → `pthread_exit` of the *primary*
-  thread (a background thread, so this is legal and clean) → a supervisor
-  respawns the primary from source → the UI terminal, on the main thread,
-  detects the drop, shows "environment restarting…", and re-syncs when the
-  fresh primary is up. **The UI never goes down; the environment recovers
-  exactly as a dead worker recovers today** (`feedback_recover_clean_or_die`:
-  respawn to a clean state, per-VM `ErrorPolicy::Die` for the throwaway
-  case). The persistent objects that were *not* mid-mutation are rebuilt
-  from source/image_store; a half-run doit's partial effects are lost with
-  the dead VM — which is the honest, clean outcome, not a fake rollback.
-- **A recoverable error inside a UI-worker delegate/action** (a display
-  callback that itself sends `error:`) unwinds to a **per-callback
-  `sigsetjmp` boundary** established at the C6/C4 trampoline before it calls
-  Smalltalk, via a new `FatalMode::AbortToEventLoop` that `siglongjmp`s
-  there instead of exiting. The jump target is the trampoline AppKit just
-  called, so it unwinds only the UI worker's own frames and returns
-  normally to the run loop. The one action reports and the app keeps
-  pumping. (This is S21's `sigsetjmp` recovery, relocated to the callback
-  door.)
+Because callbacks are top-level VM entries (§3/R1), recovery reuses the S21
+machinery instead of needing new nested-recovery machinery. Three layers,
+split by *where the fault happened*:
 
-A **native fault** on the main thread splits by *where it happened*, and
-PROBE (S21 §1c) already catches the signal either way — the question is
-where the `siglongjmp` lands and how much is intact:
+**Layer 1 — a recoverable error, or a fault in *our* code, inside a
+callback** (a delegate doit that sends `error:`; a bridge-marshalling bug; a
+bad `Alien`). The callback is a top-level `eval`/`perform` entry, so it
+*already* has the per-entry `sigsetjmp` guard the S21 `VmHandle` door
+installs (`embed.rs`). PROBE redirects `SIGSEGV`/`SIGBUS` too, not only guest
+`error:`. The entry unwinds its own frames back to the trampoline, which
+returns a **defined default** to AppKit (0 rows / `nil` / `NO` per the
+selector's return shape — the delegate contract must never leave the ObjC
+return slot undefined), reports to the Transcript, and the same run loop
+keeps pumping. **No new `FatalMode` variant is required for this** — it is
+the existing `eval` recovery, at the callback door. (The earlier draft's
+`FatalMode::AbortToEventLoop` is dropped; review R-item5 showed a *nested*
+recovery mode would be unsound given one jmp slot per thread, and the
+top-level-entry decision removes the need for it.)
 
-- **A fault in the UI worker's *own* code** (a bridge-marshalling bug, a
-  bad `Alien` deref, a VM fault triggered by a delegate doit) leaves AppKit
-  itself untouched — only our callback frame faulted. The **per-callback
-  `sigsetjmp` boundary catches it** (PROBE redirects `SIGSEGV`/`SIGBUS`, not
-  only guest `error:`), unwinds *our* frames back to the event-loop door,
-  and the same run loop keeps pumping. This is the common case and it is
-  fully survivable, because the thing that faulted was ours, not Apple's.
-- **A fault *inside* AppKit** (framework code dereferenced something bad)
-  leaves AppKit's internals suspect — a held window-server lock, a
-  half-mutated structure. Here the honest move is not to limp on the same
-  run loop but to **restart the GUI in place** (the third recovery layer,
-  and the reason the terminal is a *dumb* terminal): PROBE `siglongjmp`s to
-  a **top-level GUI recovery point** wrapping the build-windows + run-loop
-  sequence; the handler then abandons the UI worker VM's heap (leaked, like
-  any `siglongjmp`'d worker — acceptable), **boots a fresh UI worker VM on
-  the same main thread**, rebuilds the windows from source, re-syncs the
-  snapshots from the primary, and re-enters `[NSApp run]`. Because the UI
-  worker holds **no durable state** — the user's actual work lives on the
-  primary, on its own thread, untouched — this rebuild loses nothing but a
-  flicker. It is the exact `feedback_recover_clean_or_die` discipline of a
-  dead worker, with *respawn = rebuild in place on the main thread* rather
-  than on a new thread. `NSApplication` itself (a process singleton, mostly
-  stateless at the top) is kept, not recreated.
+**Layer 2 — a fault *inside* AppKit** (framework code dereferenced something
+bad; its internals are now suspect). Don't limp on a suspect run loop —
+**restart the GUI in place.** But the review corrected *how*: the in-place
+path, unlike a `pthread_exit` worker death, **can and must cleanly Drop the
+old UI worker `VmHandle`** (R-item3a). The handle is kept in a slot *outside*
+the top-level recovery `sigsetjmp` scope; the recovery handler:
+1. **Tears down the old UI cleanly first** (R-item3b): `orderOut:` + `close`
+   every old window, nil their delegates, invalidate the old C6/C4 registry
+   tickets, and **retire the old UI-worker peer registration** on the primary
+   (so its dead inbox stops swallowing snapshot blasts).
+2. **Drops the old `VmHandle` normally** — `Reservation::drop` munmaps the
+   heap (committed pages and all), `CodeCache` runs `deopt_trap::deregister`,
+   the thread's setjmp slot is released. This is essential, not optional:
+   leaking instead hits `REGISTRY_CAP = 128` in PROBE's registry and
+   **panics on the main thread after ~128 lifetime restarts**. Clean teardown
+   is reachable here (it is not on the `pthread_exit` path), so the design
+   takes it.
+3. **Boots a fresh UI worker VM** on main, re-registers it with the primary,
+   re-runs `CocoaUI startup`, re-syncs snapshots, returns to Rust, re-enters
+   `[NSApp run]`. `NSApplication` (the process singleton) is kept, not
+   recreated.
 
-The one thing an in-place restart cannot fix is **process-global** AppKit
-corruption — a broken window-server connection, a global lock left held —
-which makes a fresh run loop re-crash. So the GUI-restart carries a
-**restart-loop backstop**: N rebuilds within T seconds → give up, write the
-dossier, exit. Recoverable in the common case; an honest give-up in the
-pathological one — never a silent infinite re-crash.
+Lossless, because the UI worker holds **no durable state** — the user's work
+is on the primary, on its own thread, untouched.
 
-**Heap exhaustion on the UI worker** has nowhere to fail over and is fatal
-with a dossier; kept unlikely by the terminal holding only snapshots.
+**Layer 3 — process-global AppKit corruption** (a broken window-server
+connection, a global lock left held) survives a rebuild and re-crashes.
+Bounded by a **restart-loop backstop**: N rebuilds within T seconds → write
+the dossier, `ExitProcess`. Honest give-up, never a silent infinite
+re-crash. (Honesty note the review demanded: re-entering `[NSApp run]` after
+a mid-`run` `siglongjmp` across the live dispatch stack rests on
+`NSApplication` being near-stateless at the top; this is asserted, not
+proven, and is the reason Layer 3 exists as a bounded fallback rather than a
+guarantee.)
 
-The net is a pleasing symmetry and an honest durability story: **both the
-UI worker and the primary are rebuildable, low-durable-state VMs** — the
-primary respawns from source on a fatal doit, the UI worker rebuilds in
-place on an AppKit fault — and **the durable truth is neither running VM
-but the *source* (image_store + world), plus whatever data the primary
-explicitly persisted.** The running object graph is not preserved across a
-primary restart (consistent with MACVM's no-image, boots-from-source
-stance); the interface is not preserved across a UI restart. What persists
-is the code and the saved data, which is exactly what should.
+**Fatal on the primary** (a fatal doit) → `pthread_exit` of the background
+thread → the S21 supervisor (§5.1) respawns it from source → the UI terminal
+shows "environment restarting…" and re-syncs. The persistent object graph
+that was mid-mutation is lost with the dead VM (an honest clean loss, not a
+fake rollback — `feedback_recover_clean_or_die`); everything else rebuilds
+from source/image_store.
+
+**Two prerequisite infra fixes the review found, without which none of the
+above is trustworthy (§9.1):**
+- **Per-thread signal alt-stacks.** Today every thread's `sigaltstack`
+  points at one shared static `ALT_STACK` (`deopt_trap.rs`) — a
+  documented "one VM on one thread" assumption already stale under workers,
+  and this design makes concurrent faults (primary + a UI callback) *likely*;
+  two handlers on one aliased stack corrupt each other. Per-thread alt-stacks
+  are a prerequisite.
+- **`FatalMode` on main = `ExitProcess`.** `boot()` unconditionally arms
+  `ExitThread`; on the main thread a true fatal (heap exhaustion, stack
+  overflow) would `pthread_exit` main and leave a headless zombie. The UI
+  worker boots with `ExitProcess`.
+
+### 5.1 The supervisor (review: unspecified — resolved)
+
+The S21 supervisor lives today in `VmHost::submit` *on the main thread* — the
+thread this design repurposes. It moves to the **thread that spawns the
+primary** (§3 step 2): that thread stays alive as a thin watchdog, owns the
+primary's `JoinHandle`/death signal, and on primary death respawns it and
+notifies the UI worker (a snapshot-invalidate). It is not the main thread and
+not the primary, so it can outlive either.
 
 ## 6. Responsiveness — the UI stays live because the brain is elsewhere
 
 A long or infinite doit blocks the **primary (thread 2)**, not the main
-thread. The UI worker keeps painting, scrolling, and accepting input; it
-can show a spinner or a "still running…" status because its run loop is
-never held by the doit. This is the second dividend of keeping the
-persistent VM off main.
+thread. The UI worker keeps painting, scrolling, accepting input, and can
+show a spinner. A Workspace `doIt` **ships its selection source to the
+primary** (a request — §7.3; the doit runs where the persistent objects
+live), and the primary replies the result. Short doits round-trip fast; long
+doits run on the primary while the UI stays responsive, and the primary can
+*further* dispatch heavy work to **compute worker VMs** (`call:on:args:
+onReply:`, the RPC just built) so it too stays available. The framework
+offers this as one line — `aView do: source then: [:r | …]` — so "the
+interface never blocks" is the default path. Replies and snapshot blasts
+drain on the main thread in **default run-loop mode only** (§8).
 
-The doit path makes this concrete: a Workspace `doIt` **ships its source to
-the primary** (a message; the doit runs where the persistent objects live),
-and the primary replies the result, which the UI displays. So:
-
-- **short doits** (a `printIt`, a browser refresh request) round-trip fast
-  and feel synchronous;
-- **long doits** run on the primary while the UI stays responsive, and the
-  primary can *further* dispatch heavy work to **compute worker VMs**
-  (`multi-smalltalk-worker.md`) so it too stays available — the same
-  `call:on:args:onReply:` RPC just built.
-
-The GUI framework should offer this as one line — `aView do: source then:
-[:r | …]` — so "the interface never blocks" is the default path, not a
-discipline. The primary→UI reply and the primary→UI snapshot-blast are both
-drained on the main thread *between* AppKit events (the M3 wake as a
-run-loop source), never mid-event, preserving the strictly-serial invariant.
-
-## 7. The views — reuse the models, render to AppKit
+## 7. The views — models on the primary, snapshots to the terminal
 
 The web GUI's views are `Visual` subclasses in the image with real *model*
-logic — `ClassHierarchyOutliner`, `ClassOutliner`, `ImplementorsView`,
-`SendersView`, `DefinitionsView`, `CodeView`, plus `Workspace`,
-`CodeEditor`, `ClassMirror`, and the reflection tools (`world/33_smappl.mst`,
-`34_tools.mst`, `60_editor.mst`). They answer `htmlFragment` today. The
-model logic runs on the **primary** (it is the environment's knowledge of
-itself). What crosses to the UI worker is a **snapshot** the model
-produces — the same information the HTML renderer consumes, shaped as data
-instead of markup — which the UI worker's native view + data-source
-delegate renders. HTML and AppKit are two faces of one model
-(`feedback_dual_placement_not_migration`): a `htmlFragment` renderer on the
-primary, a `snapshot`/`buildCocoaView` renderer split across primary
-(snapshot) and UI worker (AppKit).
+logic (`ClassHierarchyOutliner`, `ClassOutliner`, `ImplementorsView`,
+`SendersView`, `DefinitionsView`, `CodeView`, plus `Workspace`, `CodeEditor`,
+`ClassMirror`; `world/34_tools.mst`, `60_editor.mst`). The model logic runs on
+the **primary** (it is the environment's knowledge of itself) and answers
+`htmlFragment` today. What crosses to the UI worker is a **snapshot**.
 
-The Smalltalk GUI framework splits across the two VMs:
+### 7.1 The snapshot rule (review: CONFIRMED trap — snapshots are names, not oops)
 
-- **On the primary:** the models (reusing `ClassMirror` etc.) and a
-  `snapshotFor:` method per view that produces the copyable data the
-  terminal renders; the doit executor; the snapshot-blaster.
-- **On the UI worker** (`world/5x_cocoaui/`): thin AppKit wrappers, each
-  with its C6 delegate answering from the last snapshot:
-  - **UI / CocoaApp** — menu bar, window set, the `[NSApp run]` bracket,
-    the `do:then:` worker helper.
-  - **Workspace** — an `NSTextView`; ⌘D/⌘P ship the selection to the
-    primary, append the reply.
-  - **Transcript** — an append-only `NSTextView`; the primary's transcript
-    sink targets it (a `TranscriptSink` that blasts text lines).
-  - **ClassBrowser** — the classic Smalltalk browser is `NSBrowser`/
-    `NSOutlineView`-shaped; its data source answers rows from a snapshot
-    the primary built from `ClassMirror`/`ClassHierarchyOutliner`. Selecting
-    a method opens its source in a **CodeView**.
-  - **CodeView** — an `NSTextView` with Smalltalk syntax colour
-    (`NSAttributedString` ranges — a modest marshalling add); Save ships
-    the source to the primary to recompile + image_store-write (the web
-    edit path).
-  - **Find views** — `Implementors/Senders/Definitions` as `NSTableView`s
-    over primary-built snapshots (accurate via the persisted `method_sends`
-    table).
-  - **GamePane** — drops in unchanged; already a native Metal view
-    (`gamepane_design.md`), now a window content view instead of a panel
-    beside a `WKWebView`. (A game pane driven by a compute worker updates on
-    the main thread the same way any snapshot does.)
+The pickle **refuses classes, methods, closures, contexts** (`mop.rs`), and
+the view models hold **real klass oops** (`ClassMirror` wraps a `Klass`;
+`ClassHierarchyOutliner` holds a `rootMirror`). So a snapshot can **never** be
+"pickle the mirror" — it dies at the first slot. The rule, stated explicitly:
 
-No model logic is duplicated: the primary owns *what to show*, the UI
-worker owns *how to draw it in AppKit*, and the snapshot is the wire
-between them.
+> **A snapshot is a plain nested tree of Strings, Symbols, and SmallIntegers
+> — projecting class/method *names*, never class or method oops.** This is
+> exactly what `htmlFragment` already emits (`mirror name`, not the mirror).
 
-## 8. Workers, and the star with a background centre
+Concrete shape (all pickle-safe — nested `TAG_ARRAY`/`TAG_OBJECT` of
+String/Symbol/smi; the 64 MB / 1 M-object caps are ample):
 
-Multi-VM is unchanged in shape. The **primary is the star's centre**
-(background thread); the **UI worker and the compute workers are leaves**.
-Two specifics:
+```
+{ #snapshot. viewId. generation. dataTree }
+```
 
-- **Only the UI worker may touch AppKit.** Neither the primary nor a
-  compute worker is on the main thread, so none may call an AppKit class
-  directly; UI work is a message to the UI worker, whose C6 handler does the
-  AppKit call on main. The bridge enforces it — an AppKit-prefixed send from
-  a non-main VM fails loudly (the curated main-thread class list,
-  `cocoa_bridge_design.md` §7, made a real guard). This is C3/C4 machinery
-  *in reverse and re-homed*: instead of workers hopping to a Rust-owned
-  main, they message the **UI worker VM** that owns main.
-- **Both inbox drains are run-loop sources.** The UI worker's inbox (fed by
-  the primary: snapshots, doit replies) drains on the main thread between
-  events. The primary's inbox (fed by the UI worker: events, doit requests;
-  and by compute workers: results) drains on its own background loop. The M3
-  coalesced wake schedules each without a race.
+`viewId` routes the blast to the right terminal-side view; `generation` is a
+monotonic staleness guard (a terminal drops a snapshot older than the one it
+holds). `dataTree` is per-view: for a browser, a nested Array of
+`{ nodeName. childArray }`; for a table, an Array of row Arrays of strings.
 
-## 9. Reused vs. genuinely new
+**Outline item identity (review: unaddressed — resolved).**
+`outlineView:child:ofItem:` must hand AppKit an ObjC `id` it will pass back
+later as `item`. The UI worker mints a **stable native node handle** — an
+`NSString` (or `NSNumber`) keyed by the node's *path* into the snapshot tree
+— and keeps a terminal-local path↔handle map for the current generation;
+`child:ofItem:` and `isItemExpandable:` resolve the handle back to a snapshot
+node. Handles are per-generation and discarded on re-blast.
 
-**Reused wholesale:** the Cocoa bridge C0–C5; `perform:withArguments:` (the
-delegate dispatch core); the C2 `@encode` marshalling (run in reverse for
-C6); the `VmHandle` boot + the S21 supervisor/restart + `sigsetjmp`
-recovery (the primary is restarted exactly like today's worker; the UI
-worker relocates the `sigsetjmp` to the callback door); the multi-VM star,
-the pickle (snapshots ride it), and the `call:on:args:onReply:` RPC; the
-M3 wake (both drains); the image/world and `image_store`; every view
-*model*; the GamePane.
+### 7.2 The view wrappers (terminal-side, `world/<NN>_cocoaui/`)
 
-**Genuinely new:**
-1. **C6 reverse dispatch** — `MacvmDelegate` forwarding + NSInvocation
-   plumbing + the per-instance delegate registry (§4). ~1 file
-   (`src/runtime/objc_delegate.rs`) + world methods.
-2. **`FatalMode::AbortToEventLoop`** + the per-callback `sigsetjmp` boundary
-   in the two trampolines (§5). Small, localized.
-3. **The parked-main-thread boot handshake** (§3) — main parks, primary
-   spawns the UI worker onto it. Localized to `gui/src/` + the embed boot.
-4. **A modest marshalling top-up** for text UIs (`NSAttributedString`
-   ranges, `NSColor`/`NSFont`), grown row-by-row (§7).
-5. **The two-sided Smalltalk GUI framework** — primary-side `snapshotFor:`/
-   blaster + UI-worker-side `world/5x_cocoaui/` wrappers. The bulk of the
-   typing, the least of the risk (ordinary Smalltalk over a proven bridge).
-6. **The `--cocoa` flag / `macvm-cocoa` bin** (§3).
+Thin AppKit wrappers, each with its C6 delegate answering from the last
+snapshot: **Workspace** (`NSTextView`; ⌘D/⌘P ship the *selection* to the
+primary — text is local to the NSTextView, §11 Q4/R9); **Transcript**
+(append-only `NSTextView`; §7.4); **ClassBrowser** (`NSOutlineView`/
+`NSBrowser` data-sourced from a primary-built snapshot; select a method →
+source in a CodeView); **CodeView** (`NSTextView` + Smalltalk syntax colour
+via `NSAttributedString` ranges — the marshalling top-up; Save ships source
+to the primary to recompile + image_store-write, the web edit path); **Find
+views** (`NSTableView`s over primary-built snapshots, accurate via the
+persisted `method_sends` table); **GamePane** (§7.5).
+
+### 7.3 The request protocol (review: GAP + corr-collision hazard — resolved)
+
+The UI→primary vocabulary the design was silent on, with the review's
+corr-collision fix. `PendingReplies` is keyed by `corr` alone and each VM
+runs its own `NextCorr`, so a UI-worker-initiated request with corr *c*
+arriving at a primary holding its own outstanding corr *c* fires the wrong
+continuation. Fix: **tagged requests routed by shape *before* the corr
+match**, and corr namespaced by originating peer.
+
+- UI→primary: `{ #uiReq. corr. #doit. source }`, `{ #uiReq. corr. #refresh.
+  viewId }`, `{ #uiReq. corr. #select. viewId. path }`, `{ #uiReq. corr.
+  #saveMethod. className. side. selector. source }`.
+- primary→UI: `{ #uiReply. corr. payload }` (doit results) and `{ #snapshot.
+  viewId. generation. dataTree }` (unsolicited blasts, corr-free).
+- Primary-side: `dispatchOne:` grows an `isUiReq:` branch that captures
+  `CurrentCorr` and dispatches by verb; `reply:` works primary-side (today it
+  is worker-side only). Corr keys become `(peer, corr)` so the two VMs'
+  independent counters cannot collide.
+
+### 7.4 The transcript sink (review: SOUND — existing machinery, direction-flipped)
+
+`ForwardTranscript` (`workers.rs`) already turns a VM's `vm.out` into
+`{ #workerTranscript. id. text }` envelopes through the inbox, line-tagged,
+and `dispatchOne:` displays them. The primary→UI transcript sink is this
+exact struct with the destination flipped to the UI worker's inbox (~15
+lines) — a `TranscriptSink` (`embed.rs::set_transcript`) whose per-line wake
+lands in the terminal's Transcript view. Named as reuse, not new.
+
+### 7.5 GamePane (review: render side SOUND, drive side is new)
+
+The **render** half transfers unchanged: `NativePane` is a main-thread
+`thread_local` with `apply_command`/`present_if_dirty`, independent of
+WKWebView. The **drive** half does *not* "drop in": today's 60 Hz `NSTimer`,
+the single-outstanding backpressure gated on `VmHost::is_idle`, and
+`ChannelGameSink` emitting over the WKWebView response channel are all
+VmHost-shaped. Cocoa mode rebuilds the drive: a main-thread timer the UI
+worker owns, a GameStep-as-RPC to the game's VM with corr-id backpressure,
+and a command path to the native pane (a dedicated Rust channel + run-loop
+wake, **not** 60 fps of MOP-pickled doits — the cadence is a real question
+flagged for the sprint). §9 lists this as new, not reused.
+
+## 8. Workers, the wake, and the drain
+
+Multi-VM is unchanged in shape (the primary is the star centre; UI worker and
+compute workers are leaves), with three review corrections:
+
+- **The wake in the primary→UI direction is NEW (not "M3 reused").** M3's
+  coalesced wake is a *Primary*-inbox-only mechanism; the primary→worker link
+  is a bare `Sender` with no hook (workers wake by being blocked in
+  `recv()`). The UI worker is blocked in `[NSApp run]`, not `recv()`, so its
+  inbound inbox needs a **new `InboxSender`-style wrapper whose wake is a
+  run-loop poke** — the `performSelectorOnMainThread` pattern that today
+  lives in `gui/src/vm_host.rs` (`CrossThreadObjcRef::notify`), promoted into
+  `workers.rs` as the externally-hosted-worker's wake (§9.1).
+- **The drain is default-mode-only (review: GAP).** A common-modes
+  `performSelectorOnMainThread` fires inside AppKit's *nested* run loops
+  (menu tracking, live resize, modal sessions) — swapping a snapshot
+  mid-tracking (row count changing under a live table drag) throws AppKit
+  consistency exceptions. The drain schedules in **`NSDefaultRunLoopMode`
+  only** (or a `CFRunLoopSource` added to default mode), and the design
+  accepts that **the UI is intentionally stale during a tracking session**,
+  re-syncing when it ends.
+- **Only the UI worker may touch AppKit, enforced by a new guard (review:
+  the guard does not exist yet).** `cocoa_bridge_design.md` §7 explicitly
+  ships no in-bridge main-thread guard. This design adds one: an
+  AppKit-prefixed send from a non-main VM fails loudly (a curated
+  class-prefix list). Listed as new work (§9.1).
+
+## 9. Reused vs. genuinely new — corrected against the reviews
+
+### 9.0 What the reviews changed
+
+Both reviews independently found the keystone: **enter `[NSApp run]` from
+Rust with the VM quiescent**, making every callback a top-level entry (R1/
+item-1). That correction cascaded — it eliminated the need for a nested
+`FatalMode::AbortToEventLoop`, made the per-callback recovery the existing
+`eval` door, and removed the aliased-`&mut VmState` hazard. The reviews also
+downgraded several "reused wholesale" claims to "needs generalization" (the
+wake, C4, GamePane drive, the supervisor) and found real traps (snapshots
+can't carry class oops; in-place restart must Drop or panic at 128; the
+corr-collision; the shared alt-stack; `boot()`'s main-thread FatalMode).
+
+### 9.1 Genuinely new
+
+1. **C6 reverse dispatch** — the per-role `MacvmDelegate` class family +
+   typed IMPs + the VM-tagged instance→ticket registry, all reusing
+   `perform:withArguments:` + C2 marshalling. `src/runtime/objc_delegate.rs`
+   (**in core**, beside `MacvmAction` — resolves the §12 placement
+   contradiction) + world methods.
+2. **Prerequisite signal-infra:** per-thread `sigaltstack`s (replace the
+   shared `ALT_STACK`); the UI worker boots `FatalMode::ExitProcess` on main.
+3. **The externally-hosted worker + its run-loop wake** — a `workers.rs`
+   surface to register a worker on an *existing* thread (no `thread::spawn`),
+   with a wake that pokes the run loop. (Not "localized to gui/embed".)
+4. **The UI→primary request protocol** (§7.3) + primary-side `isUiReq:`
+   dispatch, primary-side `reply:`, and `(peer, corr)` namespacing.
+5. **In-place UI restart** — the top-level recovery point, the ordered
+   teardown (windows/delegates/tickets/link), the clean `VmHandle` Drop, and
+   the N/T backstop (§5 Layer 2/3).
+6. **The AppKit main-thread guard** (§8) — the curated class-prefix refusal.
+7. **The GamePane drive path** (§7.5) — timer + backpressure + native-pane
+   command channel.
+8. **A modest marshalling top-up** — `NSAttributedString` ranges, `NSColor`/
+   `NSFont` — for the CodeView (grown row-by-row).
+9. **The two-sided Smalltalk GUI framework** — primary-side `snapshotFor:` +
+   blaster; terminal-side `world/<NN>_cocoaui/` wrappers + the menu bar
+   (built in Smalltalk — R5). The bulk of the typing, the least of the risk.
+10. **The `macvm-cocoa` bin + the parked-main boot** (§3), and the
+    **conditional world layer** — a small `load_list(vm, path)` public fn +
+    `world/cocoaui.list`, loaded only by the UI worker (R7; use file numbers
+    **63+** — 51–62 are taken).
+
+### 9.2 Reused (verified)
+
+The Cocoa bridge C0–C5; `perform:withArguments:` (the delegate dispatch
+core, verified real); the C2 `@encode` marshalling (both directions); the
+`VmHandle` boot + the S21 sigsetjmp per-entry recovery (now the callback
+door) + the supervisor pattern (re-homed to the watchdog thread); the
+multi-VM star + the pickle (snapshots ride it, projecting names) + the RPC;
+`ForwardTranscript` (the sink, direction-flipped); the image/world +
+`image_store`; every view *model*; the GamePane *render* half; N-heap
+coexistence (proven by the worker fleet).
 
 ## 10. Milestone ladder (each lands green and alone)
 
 | | Deliverable | Proof |
 |---|---|---|
-| **G0** | `--cocoa`; parked-main boot handshake: primary on thread 2 spawns the UI worker onto main; one empty `NSWindow`; `[NSApp run]`; ⌘Q quits clean | on-screen (user); headless: the two-VM boot returns `Err` cleanly with no AppKit |
-| **G1** | **C6**: `MacvmDelegate` forwarding + NSInvocation marshalling; the two recovery layers — per-callback `sigsetjmp` abort (a bad delegate doit / a fault in our code) **and** the top-level GUI-rebuild point + restart-loop backstop (an AppKit-internal fault) | headless: a delegate `perform:` returns a value AppKit-side (proxied); a raising delegate unwinds clean, next event dispatches; a forced native fault in a callback rebuilds the UI worker and re-enters the loop; the backstop trips after N/T |
-| **G2** | Workspace + Transcript over the primary: ⌘P ships source → primary evaluates → `7`; `Transcript showCr:` blasts to the native view; **kill the primary mid-doit → it respawns, UI shows "restarting" and recovers** | on-screen; headless: sink receives text; the primary-restart path re-syncs |
-| **G3** | ClassBrowser: `NSOutlineView` data-sourced from a primary-built snapshot (`ClassMirror`/`ClassHierarchyOutliner`); select class → methods → CodeView source | on-screen; headless: the data-source callbacks answer the same rows the `htmlFragment` model does (differential vs. the web model) |
-| **G4** | CodeView editing: syntax colour, Save → ship to primary → recompile + image_store (the web edit path); Find views as `NSTableView`s | on-screen; headless: an edit round-trips through image_store byte-identically to the web path |
-| **G5** | `do:then:` worker bracket; a heavy doit runs on the primary / a compute worker and updates a view while the UI stays live; GamePane as a window | on-screen: the UI stays responsive during a parallel-Mandelbrot dive driven from a native window |
+| **G0** | Prerequisite infra: per-thread alt-stacks; the externally-hosted worker + run-loop wake; `macvm-cocoa` bin + `objc::bootstrap` factored out; boot the primary (thread 2) + the UI worker on main (`ExitProcess`), one empty `NSWindow` built in Smalltalk, Rust `[NSApp run]`, ⌘Q clean | on-screen (user); headless: the two-VM boot + the externally-hosted-worker registration + a wake delivered to a parked thread; alt-stack per-thread test |
+| **G1** | **C6**: the per-role delegate class family + typed IMPs + the VM-tagged registry, dispatched as top-level entries; Layer-1 recovery (a bad delegate doit / a forced native fault in a callback returns a defined default, run loop pumps on) | headless: a delegate `perform:` returns a value AppKit-side (proxied); a raising delegate returns the default + the next event dispatches; a forced `SIGSEGV` in a callback recovers |
+| **G2** | The request protocol (§7.3) + `ForwardTranscript`-flipped sink; Workspace + Transcript: ⌘P ships selection → primary evaluates → `7`; **kill the primary mid-doit → the watchdog respawns it, UI shows "restarting" and recovers** | on-screen; headless: the `#uiReq`/`#uiReply` round-trip + `(peer,corr)` non-collision; the primary-restart re-sync |
+| **G3** | ClassBrowser: `NSOutlineView` data-sourced from a **names-only** snapshot (`{#snapshot. viewId. gen. tree}`) with the outline-handle scheme; select class → methods → CodeView source | on-screen; headless: the data-source callbacks answer the same rows the `htmlFragment` model does (differential vs. the web model), snapshot pickles clean (no class oop) |
+| **G4** | CodeView editing (syntax colour, Save → primary → recompile + image_store, the web edit path); Find views as `NSTableView`s; **UI-worker restart-in-place on a forced AppKit-internal fault** (teardown + clean Drop + reboot; the N/T backstop) | on-screen; headless: an edit round-trips through image_store byte-identically; a scripted restart Drops the old handle (no reservation/PROBE-registry leak) and reboots |
+| **G5** | `do:then:` worker bracket; a heavy doit on the primary / a compute worker updates a view while the UI stays live; GamePane as a window (the new drive path + backpressure); default-mode-only drain verified under tracking | on-screen: UI responsive during a parallel-Mandelbrot dive driven from a native window; a menu-tracking session does not corrupt a live table |
 
-G0–G2 are the real design risk (the boot handshake, reverse dispatch, the
-abort boundary, and — the payoff — proving the primary-restart recovery on
-screen). G3–G5 are mapping work over a proven base. On-screen verification
-is the user's; headless gates cover the model/marshalling/recovery seams
-(`feedback_gui_visual_verification`).
+G0–G2 hold the real design risk (the infra, top-level-entry dispatch, the
+recovery doors, the request protocol, and — the payoff — proving both
+restart paths). G3–G5 are mapping over a proven base. On-screen verification
+is the user's; headless gates cover the model/marshalling/recovery/protocol
+seams (`feedback_gui_visual_verification`).
 
-## 11. Non-goals, risks, open questions
+## 11. Non-goals, residual risks, open questions
 
-**Non-goals (v1):** Interface Builder / nib loading (views built
-imperatively); full Auto Layout (start springs/struts); persisting live
-window objects (rebuilt from source; only prefs persist); replacing the
-WKWebView GUI (it stays default).
+**Non-goals (v1):** Interface Builder / nib loading; full Auto Layout (start
+springs/struts); persisting live window objects (rebuilt from source; only
+prefs persist); replacing the WKWebView GUI.
 
-**Risks, honestly:**
-- **A native framework fault is a main-thread fault (§5)** — but not
-  automatically fatal: a fault in *our* code unwinds per-event, and a fault
-  *inside* AppKit triggers an in-place GUI rebuild (the dumb terminal holds
-  no durable state, so rebuilding costs a flicker). The residual risk is
-  **process-global AppKit corruption** that survives a rebuild and re-crashes
-  — bounded by the restart-loop backstop (give up after N/T), never an
-  infinite loop. Still the highest-stakes failure class, and the reason the
-  terminal is deliberately thin and snapshot-only.
-- **Snapshot cost / staleness** — blasting whole snapshots (blast-don't-
-  patch) is simple and drift-proof but re-sends unchanged data; for a large
-  browser this is a real cost. Mitigation: snapshot *per view*, blast only
-  the changed view, and keep snapshots coarse-but-cheap; measure before
-  optimizing toward diffs (the editor's incremental patching is the
-  cautionary tale — `feedback_blast_dont_patch`).
-- **C6 correctness** — `forwardInvocation:` marshalling is C2 in reverse;
-  its review surface (struct straddles, width truncation, ownership of
-  returned objects, a delegate that raises mid-invocation and must still
-  leave the NSInvocation return slot defined) is the C1/C2 surface and gets
-  the same adversarial treatment.
-- **Retain cycles** — window↔delegate↔UI-worker-object lifetimes need the
-  C4 ticket discipline held for long-lived objects.
+**Residual risks (post-review):**
+- **A native framework fault is a main-thread fault.** Layer-1 catches faults
+  in *our* code per-event; Layer-2 rebuilds on an AppKit-internal fault; the
+  irreducible risk is **process-global AppKit corruption** that survives a
+  rebuild, bounded by the N/T backstop. Highest-stakes class; the reason the
+  terminal is deliberately thin.
+- **Re-entering `[NSApp run]` after a mid-run `siglongjmp`** rests on
+  `NSApplication` being near-stateless at the top — asserted, not proven;
+  Layer 3 is the bounded fallback for when it isn't.
+- **Snapshot cost.** Blast-don't-patch re-sends unchanged data; per-view,
+  changed-view-only blasting keeps it cheap; measure before diffing (the
+  editor's incremental patching is the cautionary tale).
+- **UI is intentionally stale during tracking/modal sessions** (§8) — a
+  correctness *choice*, not a bug, but a visible behaviour.
 
 **Open questions for the build:**
-1. `forwardInvocation:`/NSInvocation (general) vs. a registered-IMP table
-   per selector-shape (C1-style, simpler). §4 assumes the former; G1 spikes
-   both and measures the NSInvocation cost first.
-2. Snapshot granularity and shape — per-view coarse snapshots vs. a shared
-   model cache on the UI worker; start coarse (§7).
-3. `--cocoa` flag vs. a separate `macvm-cocoa` bin — a separate bin keeps
-   the parked-main boot path out of the WKWebView `main()`.
-4. Does the UI worker run *any* IDE logic locally (fast local echo) or is
-   it purely a terminal? Start purely-terminal (all logic on the primary);
-   add local fast paths only where round-trip latency is felt.
+1. Snapshot granularity — per-view coarse trees (start here) vs. a shared
+   terminal-side model cache.
+2. GamePane cadence — a dedicated Rust command channel to the native pane
+   (favoured) vs. pickled step-doits at 60 fps (§7.5).
+3. Does the UI worker run *any* IDE logic locally, or is it purely a terminal
+   answering snapshots? Start purely-terminal; add local fast paths only where
+   round-trip latency is felt (the Workspace's NSTextView already owns its
+   text locally, which is text *storage*, not IDE logic).
 
 ## 12. Packaging — same repo, a gated workspace crate (not a fork)
 
-The change is big, which tempts a separate repo. It should not be one. The
-honest test is coupling and boundary, not size, and on both the Cocoa GUI
-fails the fork test:
+The change is big, which tempts a separate repo. It should not be one; the
+honest test is coupling and boundary, not size, and the Cocoa GUI fails the
+fork test: its load-bearing parts (the recovery changes, the boot handshake,
+C6, the reverse marshalling, the signal-infra) are **core-VM changes that
+must live in the `macvm` crate**; the view *models* are shared `world/*.mst`;
+and none of the fork justifications hold (no independent release cadence,
+consumers, or interface boundary — unlike the MacGamePane sister repo, which
+*has* a clean producer/consumer boundary). A fork would also forfeit the
+decisive property: **one core change tested against both GUIs in a single
+`cargo test`.**
 
-- **Its load-bearing parts are core-VM changes.**
-  `FatalMode::AbortToEventLoop`, the per-callback `sigsetjmp` boundary, the
-  parked-main boot handshake, the C6 delegate registry, and the reverse
-  marshalling all edit `vm_state.rs` / `objc_bridge.rs` / `embed.rs` /
-  `src/runtime/`. They *must* live in the `macvm` crate. A separate repo
-  could hold only the Smalltalk framework + the bin, leaving the engine of
-  the feature back in core — a fake split that fragments one feature across
-  two repos.
-- **The view models are shared source.** The browser/outliner/find logic
-  is the same `world/*.mst` the WKWebView GUI uses (`ClassMirror`,
-  `ClassHierarchyOutliner`, …) — one model, two renderers
-  (`feedback_dual_placement_not_migration`). Forking duplicates them or
-  creates a cross-repo world dependency.
-- **None of the real fork justifications hold** — no independent release
-  cadence (ships with the VM), no independent consumers (only MACVM users),
-  no clean interface boundary (it reaches through the VM's threading and
-  recovery). Contrast the GamePane → MacGamePane sister repo, which earned a
-  repo precisely because it *has* a clean producer/consumer boundary (a
-  self-contained native pane MACVM consumes). The Cocoa GUI is the opposite
-  shape.
-- **The decisive property a fork loses: one change, both GUIs tested at
-  once.** A pickle/bridge/worker change is validated against the WKWebView
-  *and* Cocoa GUIs in a single `cargo test`. A fork yields version skew and
-  "green in core, broken in the GUI repo, noticed weeks later."
-
-The repo is *already* a cargo workspace (`.` = core `macvm`, `gui` = the
-WKWebView bin depending on `macvm`, plus `image_store`/`ffi_gen`/…), with a
-default root build that builds `macvm` alone. The right modularity for a
-big change is therefore a **workspace member + gates**, not a repo:
+The repo is already a cargo workspace (`.` = core `macvm`, `gui` = the
+WKWebView bin depending on `macvm`, plus `image_store`/`ffi_gen`/…). The right
+modularity is a **workspace member + gates**:
 
 1. **A new `cocoa_gui` workspace crate** for the AppKit Rust glue (the
-   parked-main boot, the delegate IMPs' registration, the bin), depending on
-   `macvm` exactly as `gui` does. A default `cargo build`/`test` at the root
-   never links it — CI/headless/the core stay clean.
-2. **Core changes inert-when-off.** `AbortToEventLoop` is a dormant enum
-   variant (as `ExitThread` already coexists with `ExitProcess`); the C6
-   `objc_delegate` module compiles but is unreachable unless a delegate is
-   created — small and dormant beside the always-compiled Cocoa bridge.
-   Optionally behind a `cocoa` cargo feature if it should leave the default
-   lib entirely.
-3. **A conditionally-loaded world layer** (`world/5x_cocoaui/`, its own load
-   list) so the CLI, the WKWebView GUI, and the test suite carry none of it.
+   `[NSApp run]` owner, the delegate-class registration, the boot handshake,
+   the `macvm-cocoa` bin), depending on `macvm` as `gui` does. It also
+   inherits the GamePane path-deps (`macgamepane-graphics`/`-audio`, `metal`)
+   and the `game_pane.rs` glue — factored from `gui`, not duplicated. A
+   default root `cargo build`/`test` never links it.
+2. **Core changes inert-when-off.** The C6 `objc_delegate` module (core,
+   beside the Cocoa bridge) compiles but is unreachable unless a delegate is
+   created; the per-thread alt-stack and `ExitProcess`-on-main changes are
+   unconditional soundness fixes that help every mode. Optionally a `cocoa`
+   cargo feature gates the delegate module out of the default lib entirely.
+3. **A conditionally-loaded world layer** — `world/cocoaui.list` (files 63+),
+   loaded only by the UI worker via the new `load_list` fn, so the CLI, the
+   WKWebView GUI, and the test suite carry none of it.
 
-That is "a configuration for the build" done honestly: isolated, zero-cost
-when off, one cohesive repo where a core change cannot silently break the
-second GUI. (Open question 3 in §11 — `--cocoa` flag vs. `macvm-cocoa`
-bin — is settled by this: a dedicated bin in the new `cocoa_gui` crate, so
-the parked-main boot never complicates the WKWebView `main()`.)
+Zero-cost when off, one cohesive repo where a core change cannot silently
+break the second GUI.
 
 ## 13. Relationship to the existing docs
 
 Sits on top of, and does not re-open: `cocoa_bridge_design.md` (C0–C5),
-`multi-smalltalk-worker.md` (the star, the pickle, the RPC, the wake),
-`docs/vm_handle.md` / S21 (the boot + the restart-on-death supervisor this
-re-homes to the primary), `gamepane_design.md`, and the
-`perform:withArguments:` RPC. It is where the Cocoa bridge stops being a way
-to *call* macOS and becomes the substrate the environment is *built from* —
-with the persistent environment kept safely off the main thread, so the
-interface can be Smalltalk without the environment being hostage to it.
+`multi-smalltalk-worker.md` (the star, the pickle, the RPC), `docs/vm_handle.md`
+/ S21 (the boot, the sigsetjmp recovery re-homed to the callback door, the
+supervisor re-homed to the watchdog thread), `gamepane_design.md` (the render
+half), and the `perform:withArguments:` RPC. It is where the Cocoa bridge
+stops being a way to *call* macOS and becomes the substrate the environment
+is *built from* — with the persistent environment kept safely off the main
+thread, so the interface can be Smalltalk without the environment being
+hostage to it.
