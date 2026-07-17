@@ -1,10 +1,12 @@
 "44_posix_io_tests.mst — PosixIoTests: the slice-A gate for POSIX I/O over
  the FFI (world/61_posix_io.mst, docs/asyncio_design.md). Everything here is
- headless and network-free — pipes and kqueue only — so it runs in the
- ordinary it_world gate. The tests prove, in order: signed returns cross the
- FFI, real bytes cross a real pipe, and kqueue readiness (the foundation the
- IoWorker event loop stands on) reports exactly the right events, amounts,
- and EOF."
+ headless and never leaves the machine — pipes, kqueue, and loopback-only
+ TCP (bound to 127.0.0.1, ephemeral ports) — so it runs in the ordinary
+ it_world gate with no firewall prompt. The tests prove, in order: signed
+ returns cross the FFI, real bytes cross a real pipe, kqueue readiness (the
+ foundation the IoWorker event loop stands on) reports exactly the right
+ events, amounts, and EOF, the EVFILT_USER wake latches, and the TCP
+ binding surface round-trips."
 
 TestCase subclass: PosixIoTests [
     runAll [
@@ -16,6 +18,7 @@ TestCase subclass: PosixIoTests [
         self runTest: #testKqueueEofFlag do: [ self testKqueueEofFlag ].
         self runTest: #testUserEventTriggersAndLatches do: [ self testUserEventTriggersAndLatches ].
         self runTest: #testUserEventCrossHandlePoke do: [ self testUserEventCrossHandlePoke ].
+        self runTest: #testTcpLoopbackRoundTrip do: [ self testTcpLoopbackRoundTrip ].
     ]
 
     "pipe() into the buffer head; answers {readFd. writeFd} (two u32s)."
@@ -142,6 +145,51 @@ TestCase subclass: PosixIoTests [
         self assert: events size = 1.
         self assert: ((events at: 1) at: 2) = -10.
         kq close.
+    ]
+
+    "The whole TCP binding surface in one loopback round-trip: socket/bind
+     (127.0.0.1:0 — ephemeral port, no firewall prompt)/listen, the bound
+     port read back via getsockname, kqueue readiness ON THE LISTENER
+     (data = pending-connection count — what makes a bounded accept safe),
+     accept, and 3 real bytes client->server through a bounded read.
+     Everything stays on-machine."
+    testTcpLoopbackRoundTrip [
+        | kq buf listener port client events e conn got |
+        kq := Kqueue new.
+        buf := kq buffer.
+        listener := Posix tcpListenLoopback: 8.
+        self assert: listener >= 0.
+        port := Posix boundPortOf: listener.
+        self assert: port > 0.
+        self assert: (kq watchRead: listener) = 0.
+        self assert: (kq pollMs: 0) size = 0.       "no one connecting yet"
+
+        client := Posix tcpConnectLoopback: port.
+        self assert: client >= 0.
+
+        events := kq pollMs: 2000.
+        self assert: events size = 1.
+        e := events at: 1.
+        self assert: (e at: 1) = listener.          "the listener went readable"
+        self assert: (e at: 3) >= 1.                "data = pending connections"
+
+        conn := Posix acceptOn: listener.
+        self assert: conn >= 0.
+
+        buf byteAt: 512 put: 80. buf byteAt: 513 put: 73. buf byteAt: 514 put: 71.
+        self assert: (Posix write: client from: buf address + 512 count: 3) = 3.
+        self assert: (kq watchRead: conn) = 0.
+        events := kq pollMs: 2000.
+        self assert: events size = 1.
+        self assert: ((events at: 1) at: 1) = conn.
+        self assert: ((events at: 1) at: 3) = 3.    "3 bytes ready on the accepted fd"
+        got := Posix read: conn into: buf address + 600 count: 3.
+        self assert: got = 3.
+        self assert: (buf byteAt: 600) = 80.        "P"
+        self assert: (buf byteAt: 601) = 73.        "I"
+        self assert: (buf byteAt: 602) = 71.        "G"
+
+        Posix close: client. Posix close: conn. Posix close: listener. kq close.
     ]
 
     "Closing the write end surfaces EV_EOF (32768, the u16 top bit — so

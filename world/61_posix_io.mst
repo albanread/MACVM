@@ -25,6 +25,7 @@
                   slice-B IoWorker event loop is built on"
 
 Object subclass: Posix [
+    <classVars: Scratch>
     "── raw bindings — every one fixed-arity (no variadic tail) ──"
     Posix class >> kqueue [
         <primitive: FFI function: #kqueue ret: #g args: #()>
@@ -48,6 +49,27 @@ Object subclass: Posix [
     ]
     Posix class >> socketpairDomain: d type: t protocol: p into: svAddr [
         <primitive: FFI function: #socketpair ret: #g args: #(g g g g)>
+    ]
+    "── TCP sockets — all fixed-arity, so all FFI-reachable ──
+     AF_INET = 2, SOCK_STREAM = 1. accept/getsockname take a value-result
+     socklen POINTER (or 0/0 to ignore the peer address)."
+    Posix class >> socketDomain: d type: t protocol: p [
+        <primitive: FFI function: #socket ret: #g args: #(g g g)>
+    ]
+    Posix class >> bind: fd addr: sa len: l [
+        <primitive: FFI function: #bind ret: #g args: #(g g g)>
+    ]
+    Posix class >> listen: fd backlog: b [
+        <primitive: FFI function: #listen ret: #g args: #(g g)>
+    ]
+    Posix class >> accept: fd addr: sa lenPtr: lp [
+        <primitive: FFI function: #accept ret: #g args: #(g g g)>
+    ]
+    Posix class >> connect: fd addr: sa len: l [
+        <primitive: FFI function: #connect ret: #g args: #(g g g)>
+    ]
+    Posix class >> getsockname: fd addr: sa lenPtr: lp [
+        <primitive: FFI function: #getsockname ret: #g args: #(g g g)>
     ]
     Posix class >> mmapAddr: a length: l prot: pr flags: f fd: fd offset: o [
         <primitive: FFI function: #mmap ret: #g args: #(g g g g g g)>
@@ -139,6 +161,74 @@ Object subclass: NativeBuffer [
         self i64At: off put: ms // 1000.
         self i64At: off + 8 put: ms \\ 1000 * 1000000
     ]
+
+    "── struct sockaddr_in (Darwin, 16 bytes) ──────────────────────────
+       0  sin_len    u8 (= 16)     4  sin_addr  u32 NETWORK order
+       1  sin_family u8 (AF_INET)  8  sin_zero  [8]
+       2  sin_port   u16 NETWORK order
+     Port and address are BIG-endian (network order) — packed byte-wise,
+     deliberately not via the little-endian u16/u32 accessors. Loopback =
+     127.0.0.1; port 0 asks the kernel for an ephemeral port."
+    sockaddrInLoopbackAt: off port: port [
+        self zero: 16 at: off.
+        self byteAt: off put: 16.
+        self byteAt: off + 1 put: 2.
+        self byteAt: off + 2 put: port // 256.
+        self byteAt: off + 3 put: port \\ 256.
+        self byteAt: off + 4 put: 127.
+        self byteAt: off + 7 put: 1
+    ]
+    sockaddrInPortAt: off [
+        ^(self byteAt: off + 2) * 256 + (self byteAt: off + 3)
+    ]
+]
+
+"── Posix reopened: TCP conveniences (they need NativeBuffer, defined above —
+ the reopen-after-defining pattern, as 28_point.mst does for Number) ─────────
+ Loopback only: binding to 127.0.0.1 (never 0.0.0.0) keeps everything
+ on-machine AND avoids the macOS firewall prompt; port 0 lets the kernel
+ assign an ephemeral port, which `boundPortOf:` reads back — no hardcoded
+ ports, no collisions between parallel test runs. One lazy scratch page per
+ VM for the sockaddr/socklen arguments (each VM is strictly serial, so
+ sequential reuse is safe)."
+Object subclass: Posix [
+    Posix class >> scratch [
+        Scratch isNil ifTrue: [ Scratch := NativeBuffer page ].
+        ^Scratch
+    ]
+    Posix class >> tcpSocket [ ^self socketDomain: 2 type: 1 protocol: 0 ]
+    Posix class >> tcpListenLoopback: backlog [
+        | fd rc |
+        fd := self tcpSocket.
+        fd < 0 ifTrue: [ ^fd ].
+        self scratch sockaddrInLoopbackAt: 0 port: 0.
+        rc := self bind: fd addr: self scratch address len: 16.
+        rc < 0 ifTrue: [ ^rc ].
+        rc := self listen: fd backlog: backlog.
+        rc < 0 ifTrue: [ ^rc ].
+        ^fd
+    ]
+    Posix class >> boundPortOf: fd [
+        self scratch u32At: 64 put: 16.        "value-result socklen"
+        self getsockname: fd addr: self scratch address lenPtr: self scratch address + 64.
+        ^self scratch sockaddrInPortAt: 0
+    ]
+    "Blocking connect is safe HERE and only here: against a loopback
+     listener with backlog space, the kernel completes the handshake
+     immediately — no remote peer, no accept() needed first."
+    Posix class >> tcpConnectLoopback: port [
+        | fd rc |
+        fd := self tcpSocket.
+        fd < 0 ifTrue: [ ^fd ].
+        self scratch sockaddrInLoopbackAt: 0 port: port.
+        rc := self connect: fd addr: self scratch address len: 16.
+        rc < 0 ifTrue: [ ^rc ].
+        ^fd
+    ]
+    "Accept ignoring the peer address (0/0 is the documented 'don't care').
+     Only ever called when kevent reported a pending connection, so it
+     cannot block even on a blocking listener."
+    Posix class >> acceptOn: fd [ ^self accept: fd addr: 0 lenPtr: 0 ]
 ]
 
 "── Kqueue: the readiness engine ────────────────────────────────────────────

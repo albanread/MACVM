@@ -16,9 +16,10 @@
  Two faces, one class (class vars/methods run in the IoWorker VM; instance
  handle runs in the requester):
    worker side  — `serveOnKq:` installs the message handler over a kqueue the
-                  PRIMARY made; `handle:`/`pump:` do bounded reads.
-   primary side — `IoWorker spawn` boots one; `watchRead:onData:` registers a
-                  continuation; `startPumping`/`stopPumping` drive the loop.
+                  PRIMARY made; `handle:`/`pump:` do bounded reads and accepts.
+   primary side — `IoWorker spawn` boots one; `watchRead:onData:` /
+                  `watchAccept:onConnection:` register continuations;
+                  `startPumping`/`stopPumping` drive the loop.
 
  Cadence (the wake): the pump sleeps in an INFINITE kevent — zero CPU when
  idle, no heartbeat. The problem that creates: the worker only reads its inbox
@@ -33,8 +34,8 @@
  that wakes its own sleep busy-loops."
 
 Object subclass: IoWorker [
-    | worker kq readHandlers pumping |
-    <classVars: Kq Buf>
+    | worker kq readHandlers acceptHandlers pumping |
+    <classVars: Kq Buf Accepting>
 
     "── worker side: the server that runs INSIDE the spawned IoWorker VM ──
      The boot doit carries the primary-made kqueue's fd (fds are shared
@@ -44,12 +45,19 @@ Object subclass: IoWorker [
     IoWorker class >> serveOnKq: kqFd [
         Kq := Kqueue onFd: kqFd.
         Buf := NativeBuffer page.
+        Accepting := Dictionary new.
         Worker onMessage: [ :m | IoWorker handle: m payload ]
     ]
     "Pure kqueue mutations (no messaging), so `handle:`'s reply is the only
-     worker-only part — the rest is unit-testable in one VM."
+     worker-only part — the rest is unit-testable in one VM. A LISTENER is
+     watched with the same EVFILT_READ (readable = pending connections),
+     but must be remembered: `drain:` must accept on it, never read it."
     IoWorker class >> watchReadFd: fd [ Kq watchRead: fd ]
     IoWorker class >> unwatchReadFd: fd [ Kq unwatchRead: fd ]
+    IoWorker class >> watchAcceptFd: fd [
+        Accepting at: fd put: true.
+        Kq watchRead: fd
+    ]
 
     IoWorker class >> handle: req [
         | tag |
@@ -60,14 +68,24 @@ Object subclass: IoWorker [
         tag == #unwatchRead ifTrue: [
             self unwatchReadFd: (req at: 2).
             ^Worker reply: (Array with: #unwatched with: (req at: 2)) ].
+        tag == #watchAccept ifTrue: [
+            self watchAcceptFd: (req at: 2).
+            ^Worker reply: (Array with: #watched with: (req at: 2)) ].
         tag == #pump ifTrue: [ ^self pump: (req at: 2) ].
         Worker reply: (Array with: #err with: #unknownRequest)
     ]
 
     "Poll once (ms < 0 = block FOREVER — the poke is what ends an idle
-     sleep) and, for each readable fd, do a read BOUNDED by the kevent-
-     reported count (so it can't block even on a blocking fd); answer a
-     batch of {fd. bytes. eof} tuples. EVFILT_READ = -1; EV_EOF = 32768.
+     sleep) and answer a batch of tagged tuples:
+       {#data. fd. bytes. eof}      — a bounded read on a readable fd
+       {#accept. listener. newFd}   — one per accepted connection
+     A read is bounded by min(kevent data, page size): it can't block even
+     on a blocking fd, and a socket buffer larger than the page just
+     arrives across several pumps (kqueue is level-triggered). The bytes
+     answered are sized by the read's actual return — never stale page
+     tail. Accepts are bounded by `data` (the pending-connection count),
+     so they can't block either; a client that vanished between kevent and
+     accept just yields rc < 0, skipped. EVFILT_READ = -1; EV_EOF = 32768.
      The EVFILT_USER wake event (filter -10) falls through the filter
      guard untouched — a poke just ends the sleep with an empty batch.
      Pure (no messaging) so it is unit-testable in one VM; `pump:` wraps
@@ -78,16 +96,29 @@ Object subclass: IoWorker [
         results := OrderedCollection new.
         events do: [ :e |
             (e at: 2) = -1 ifTrue: [
-                | fd n bytes eof |
-                fd := e at: 1.
-                n := e at: 3.
-                eof := (e at: 4) >= 32768.
-                bytes := ByteArray new: n.
-                n > 0 ifTrue: [
-                    Posix read: fd into: Buf address count: n.
-                    1 to: n do: [ :i | bytes at: i put: (Buf byteAt: i - 1) ] ].
-                results add: (Array with: fd with: bytes with: eof) ] ].
+                (Accepting at: (e at: 1) ifAbsent: [ nil ]) isNil
+                    ifTrue: [ results add: (self drainData: e) ]
+                    ifFalse: [ self drainAccepts: e into: results ] ] ].
         ^results asArray
+    ]
+    IoWorker class >> drainData: e [
+        | fd n rc bytes eof |
+        fd := e at: 1.
+        n := (e at: 3) min: 4096.
+        eof := (e at: 4) >= 32768.
+        rc := n > 0 ifTrue: [ Posix read: fd into: Buf address count: n ] ifFalse: [ 0 ].
+        rc < 0 ifTrue: [ rc := 0 ].
+        bytes := ByteArray new: rc.
+        1 to: rc do: [ :i | bytes at: i put: (Buf byteAt: i - 1) ].
+        ^Array with: #data with: fd with: bytes with: eof
+    ]
+    IoWorker class >> drainAccepts: e into: results [
+        | listener newFd |
+        listener := e at: 1.
+        (e at: 3) timesRepeat: [
+            newFd := Posix acceptOn: listener.
+            newFd >= 0 ifTrue: [
+                results add: (Array with: #accept with: listener with: newFd) ] ]
     ]
     IoWorker class >> pump: ms [
         Worker reply: (Array with: #io with: (self drain: ms))
@@ -104,6 +135,7 @@ Object subclass: IoWorker [
         worker := w.
         kq := aKqueue.
         readHandlers := Dictionary new.
+        acceptHandlers := Dictionary new.
         pumping := false.
         ^self
     ]
@@ -130,13 +162,29 @@ Object subclass: IoWorker [
         self poke.
         ^self
     ]
+    "Register a continuation for a LISTENING socket's incoming connections.
+     `aBlock` is a 1-arg block `[:newFd | ...]`, fired once per accepted
+     connection (the IoWorker did the accept — bounded by the kevent-
+     reported backlog count — and the new fd is just an int in the
+     message; being process-wide, it is immediately usable here)."
+    watchAccept: fd onConnection: aBlock [
+        acceptHandlers at: fd put: aBlock.
+        worker send: (Array with: #watchAccept with: fd).
+        self poke.
+        ^self
+    ]
 
-    "Dispatch one #io batch to the registered per-fd continuations."
+    "Dispatch one #io batch of tagged tuples to the registered per-fd
+     continuations: {#data. fd. bytes. eof} and {#accept. listener. newFd}."
     deliver: batch [
         batch do: [ :io |
             | h |
-            h := readHandlers at: (io at: 1) ifAbsent: [ nil ].
-            h isNil ifFalse: [ h value: (io at: 2) value: (io at: 3) ] ]
+            (io at: 1) == #data ifTrue: [
+                h := readHandlers at: (io at: 2) ifAbsent: [ nil ].
+                h isNil ifFalse: [ h value: (io at: 3) value: (io at: 4) ] ].
+            (io at: 1) == #accept ifTrue: [
+                h := acceptHandlers at: (io at: 2) ifAbsent: [ nil ].
+                h isNil ifFalse: [ h value: (io at: 3) ] ] ]
     ]
 
     "Send one poll; its reply dispatches the data and, while `pumping`, re-arms

@@ -2362,6 +2362,67 @@ mod tests {
         );
     }
 
+    /// The sockets capstone (docs/asyncio_design.md): a TCP echo server whose
+    /// event loop is the IoWorker. One IoWorker multiplexes THREE fds at once —
+    /// the listener (accept, bounded by the kevent backlog count), the
+    /// server-side connection (read the request), and the client socket (read
+    /// the echo) — all on infinite kevent sleeps, while the primary supplies
+    /// the logic: its onConnection: continuation registers the data watch
+    /// (a mid-sleep add, so the poke is load-bearing here too) and its onData:
+    /// continuation writes the echo back DIRECTLY on the fd (legal because fds
+    /// are process-wide). Loopback only, ephemeral port, no firewall prompt.
+    #[test]
+    fn ioworker_tcp_echo_server_round_trips() {
+        let mut vm = boot_worker_primary();
+        vm.exec(
+            "Object subclass: EchoProbe [
+                <classVars: Buf Listener Client Got>
+                EchoProbe class >> setUp: iow [
+                    | port |
+                    Buf := NativeBuffer page.
+                    Got := nil.
+                    Listener := Posix tcpListenLoopback: 8.
+                    port := Posix boundPortOf: Listener.
+                    iow watchAccept: Listener onConnection: [:conn |
+                        iow watchRead: conn onData: [:bytes :eof |
+                            eof ifFalse: [ EchoProbe echo: bytes on: conn ] ] ].
+                    iow startPumping.
+                    Client := Posix tcpConnectLoopback: port.
+                    iow watchRead: Client onData: [:bytes :eof |
+                        eof ifFalse: [ Got := bytes ] ].
+                    Buf byteAt: 700 put: 80. Buf byteAt: 701 put: 73.
+                    Buf byteAt: 702 put: 78. Buf byteAt: 703 put: 71.
+                    Posix write: Client from: Buf address + 700 count: 4 ]
+                EchoProbe class >> echo: bytes on: fd [
+                    1 to: bytes size do: [ :i |
+                        Buf byteAt: 640 + i - 1 put: (bytes at: i) ].
+                    Posix write: fd from: Buf address + 640 count: bytes size ]
+                EchoProbe class >> got [ ^Got ]
+                EchoProbe class >> gotSize [ ^Got isNil ifTrue: [ -1 ] ifFalse: [ Got size ] ]
+                EchoProbe class >> sum [ | s | s := 0. Got do: [:b | s := s + b]. ^s ]
+            ]",
+        )
+        .expect("define EchoProbe");
+        vm.exec("WkTest reset.").expect("reset");
+        vm.exec("WkTest w1: IoWorker spawn.")
+            .expect("spawn the IoWorker VM");
+        vm.exec("EchoProbe setUp: WkTest w1.")
+            .expect("listen, watch accept, connect, send PING");
+        vm.exec("Worker runLoopWhile: [ (WkTest tickCapped: 200) and: [ EchoProbe got isNil ] ].")
+            .expect("run the loop until the echo comes back");
+        assert_eq!(
+            vm.eval("EchoProbe gotSize").expect("gotSize").trim(),
+            "4",
+            "the 4-byte echo came back to the client watch"
+        );
+        assert_eq!(
+            vm.eval("EchoProbe sum").expect("sum").trim(),
+            "302", // P(80) + I(73) + N(78) + G(71)
+            "the exact bytes PING round-tripped: client -> accepted conn -> \
+             echo write -> client, every hop multiplexed by the one IoWorker"
+        );
+    }
+
     #[test]
     fn perform_calls_a_method_by_name() {
         // `perform:withArguments:` (prim 64) + its arity sugar: a Symbol

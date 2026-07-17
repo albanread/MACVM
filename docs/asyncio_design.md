@@ -1,9 +1,11 @@
 # Async I/O over the POSIX FFI
 
-**Status:** slice A built + gated 2026-07-16. Roadmap item 3 — turn the worker
-model into a *system* (async I/O so I/O never blocks a VM). Pure Smalltalk + the
-S20 FFI; **zero new Rust**, by design — this exercises the FFI on its intended
-real workload.
+**Status:** slices A + B built + gated 2026-07-16/17, including the cadence
+(infinite kevent sleep + EVFILT_USER wake) and sockets (TCP echo capstone
+green). Remaining: slice C (the stream library). Roadmap item 3 — turn the
+worker model into a *system* (async I/O so I/O never blocks a VM). Pure
+Smalltalk + the S20 FFI; **zero new Rust**, by design — this exercises the FFI
+on its intended real workload.
 
 ## The bet, and the two constraints that shape it
 
@@ -139,14 +141,48 @@ IoWorker loop:
   supervisor respawns — the same `ErrorPolicy::Die` story as any worker. It fits
   the fail-fast philosophy: I/O errors are *values in messages*, not exceptions.
 
-Open questions for slice B (deliberately deferred):
-- The blocking-poll problem: `kevent` with a real timeout blocks the IoWorker's
-  thread — fine (that thread's whole job is to block on kevent), but the loop's
-  cadence vs. servicing its own mailbox needs a design (a self-pipe / the
-  existing inbox-wake writing a byte to a watched fd, so a new request wakes the
-  poll). This is the one genuinely new bit of engineering.
-- Sockets: `socket`/`bind`/`listen`/`accept` are all fixed-arity (already
-  reachable); `connect` too. A TCP echo server is the natural slice-B capstone.
+Both former open questions are now closed: the cadence (above) and sockets
+(below).
+
+### Sockets (BUILT): the TCP surface + the echo capstone
+
+Six new bindings, all fixed-arity so all FFI-reachable: `socket`, `bind`,
+`listen`, `accept`, `connect`, `getsockname`. `NativeBuffer` packs Darwin's
+`struct sockaddr_in` (16 bytes, `sin_len` first, port/address in NETWORK byte
+order — packed byte-wise, deliberately not via the little-endian accessors).
+
+Three deliberate choices:
+- **Loopback only, ephemeral ports**: the conveniences bind `127.0.0.1:0`
+  (never `0.0.0.0`) — nothing leaves the machine, macOS raises no firewall
+  prompt, and `boundPortOf:` (getsockname) reads the kernel-assigned port back,
+  so no hardcoded ports and no collisions between parallel test runs.
+- **Blocking `connect` is safe exactly once**: against a loopback listener with
+  backlog space the kernel completes the handshake immediately — no remote
+  peer, no accept() needed first. Everywhere else, readiness rules.
+- **The IoWorker accepts; the requester decides**: a listener registered via
+  `watchAccept:onConnection:` is watched with the same `EVFILT_READ`
+  (readable = pending connections, `data` = the count), and `drain:` runs
+  accepts BOUNDED by that count — can't block. The accepted fd crosses back as
+  an int in the `{#accept. listener. newFd}` tuple and is immediately usable in
+  any VM (process-wide fd table). Batch tuples are now tagged: `{#data. fd.
+  bytes. eof}` / `{#accept. listener. newFd}`.
+
+`drain:` also hardened for sockets: reads clamp to min(kevent `data`, page
+size) — a 64KB socket buffer just arrives across several pumps (kqueue is
+level-triggered) — and the delivered bytes are sized by the read's actual
+return, never stale page tail.
+
+**The capstone (`embed::ioworker_tcp_echo_server_round_trips`):** a TCP echo
+server whose event loop is the IoWorker. One IoWorker multiplexes three fds at
+once — the listener, the accepted connection, and the client socket — all on
+infinite kevent sleeps. The primary supplies the logic as continuations: its
+`onConnection:` registers the connection's data watch (a mid-sleep add — the
+EVFILT_USER poke is load-bearing here too), and its `onData:` writes the echo
+back directly on the fd. PING round-trips client → conn → echo → client in one
+test, 0.04s green; verified to redden on a truncated echo. Plus
+`PosixIoTests testTcpLoopbackRoundTrip` gating the whole binding surface
+single-VM (listener readiness `data` = pending-connection count, bounded
+accept, 3 bytes across the wire).
 
 ## Slice C — a stream library (later)
 
