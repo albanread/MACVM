@@ -272,6 +272,38 @@ core, extend G1's stub host with fixture data (PLAN.md §5) rather than
 blocking. The S5/S6 sprint docs carry addenda for the two core-side
 obligations this track adds (source registry; TranscriptSink routing).
 
+## Phase CG — Cocoa GUI track (parallel, a second GUI mode)
+
+A **native AppKit** programming environment as a second, flagged mode
+(`macvm-cocoa`) alongside the WKWebView shell — the interface built *in
+Smalltalk through the Cocoa bridge*, with a UI worker VM pinned to the main
+thread (a dumb terminal) and the persistent primary VM on a background
+thread. Design of record (adversarially reviewed, 2026-07-17):
+[`cocoa_gui_design.md`](cocoa_gui_design.md); per-sprint detail + gates:
+[`sprint_cocoa_gui.md`](sprint_cocoa_gui.md). Builds on the Cocoa bridge
+C0–C5 (`cocoa_bridge_design.md`) + `perform:withArguments:` + the multi-VM
+workers. New `cocoa_gui` workspace member; the view **models** stay shared
+with Phase G (a second renderer, not a fork). Parallel to the core; no CG
+gate blocks a core sprint.
+
+| Sprint | Size | Needs | Gate (headless seam; on-screen = user) |
+|---|---|---|---|
+| CG0 signal-infra prereqs | `S` | core only | per-thread alt-stacks: 2 VMs faulting concurrently both recover; `ExitProcess`-on-main exits the process, not a zombie |
+| CG1 hosted worker + wake + load_list | `M` | workers M0–M4 | register a worker on the *current* thread (no spawn), wake hook fires, drain+reply round-trips; `load_list` loads an extra world list |
+| CG2 crate + boot + window (G0) | `M` | CG0, CG1, bridge C0–C5 | parked-main boot completes; one Smalltalk-built `NSWindow`; `[NSApp run]` from Rust; ⌘Q clean; main-thread guard rejects a background-VM AppKit send |
+| CG3 C6 reverse dispatch (G1) | `L` | CG2, `perform:withArguments:` | a `MacvmTableSource` answers `numberOfRowsInTableView:` with a real int; a raising delegate returns the shape default + next call dispatches; a forced SIGSEGV in a callback recovers |
+| CG4 protocol + workspace + primary-restart (G2) | `L` | CG3 | `#uiReq`/`#uiReply` round-trip; `(peer,corr)` non-collision; primary death → respawn → re-sync; ⌘P → `7` |
+| CG5 ClassBrowser (G3) | `M` | CG4 | outline data-source answers the same rows the `htmlFragment` model does (differential); snapshot pickles clean (no class oop) |
+| CG6 CodeView + Find (G4a) | `M` | CG5, W4 accept path | a `#saveMethod` round-trips through `image_store` byte-identically to the web path |
+| CG7 UI restart-in-place (G4b) | `M` | CG3, CG2 | a scripted foreign fault Drops the old handle (no reservation / PROBE-registry leak across many restarts) + reboots; N/T backstop trips |
+| CG8 worker bracket + GamePane + drain (G5) | `M` | CG4; GamePane render | `do:then:` round-trip; default-mode drain not delivered in a nested mode; UI live during a parallel dive |
+
+Sequencing: **CG0 + CG1 are core-only** (soundness + infra; land before any
+AppKit code). **CG2 + CG3** hold the real risk (top-level-entry callback
+dispatch, the boot handshake, reverse dispatch); CG4+ are mapping over a
+proven base. CG7 can follow CG2+CG3 independently of the browser if crash
+resilience is the priority.
+
 ## Phase W — world track (library + apps, parallel after S6)
 
 The Smalltalk side beyond the S6 seed: the full library and the programming
