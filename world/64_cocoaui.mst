@@ -1,0 +1,53 @@
+"64_cocoaui.mst — CocoaUI: the Cocoa GUI's Smalltalk startup (CG2,
+ docs/sprint_cocoa_gui.md CG2, docs/cocoa_gui_design.md §3 step 4). Loaded ONLY
+ by the UI worker via `frontend::world::load_list(vm, world/cocoaui.list)`,
+ NEVER from world/world.list — so the CLI, the WKWebView GUI, and the base test
+ suite carry none of it (files 63+, the conditional layer, §12.3).
+
+ The UI worker VM runs pinned to the process's MAIN thread (AppKit requires it).
+ The Rust `cocoa_gui` glue bootstraps NSApplication, boots this VM in place, runs
+ `CocoaUI startup` once (this class), then enters [NSApp run] with the VM at rest
+ — so every AppKit call below runs INLINE on main: the bridge's `onMain` hop is a
+ no-op when the caller already IS main (objc_bridge try_send_full_on_main_owned's
+ pthread_main_np==1 branch). Building an NSWindow off the main thread is refused
+ by the §8 guard — as it should be; only this VM, on main, may.
+
+ CG2 builds exactly ONE empty NSWindow with a title from Smalltalk and orders it
+ front. The menu bar, the Workspace/Transcript views, the request protocol and
+ the snapshot terminal arrive in CG4+. Ownership: setReleasedWhenClosed: false is
+ load-bearing (a programmatic NSWindow otherwise releases itself on close, which
+ would double-free under the bridge wrapper's own +1), and rebuild is idempotent
+ so a restart-in-place (CG7) leaks no wrappers."
+Object subclass: CocoaUI [
+    <classVars: Win>
+
+    CocoaUI class >> title [ ^'MACVM — Cocoa (Smalltalk inside)' ]
+
+    CocoaUI class >> startup [
+        "Build (or rebuild) the main window through the Cocoa bridge, on the
+         main thread, and order it front. Returns to Rust with the VM at rest;
+         Rust then calls [NSApp run]."
+        | winClass |
+        self teardown.
+        winClass := Cocoa classNamed: 'NSWindow'.
+        Win := ((winClass onMain alloc) onMain
+            initWithContentRect: (Array with: 240.0 with: 240.0 with: 620.0 with: 420.0)
+            styleMask: 15 backing: 2 defer: false).
+        Win onMain setReleasedWhenClosed: false.
+        Win onMain setTitle: self title.
+        Win onMain makeKeyAndOrderFront: nil.
+        Transcript showCr: 'CocoaUI: main window up — the interface is Smalltalk.'.
+        ^Win
+    ]
+
+    CocoaUI class >> teardown [
+        "Release the previous window's wrapper (idempotent — a rebuilt or
+         restarted UI leaks nothing)."
+        Win isNil ifFalse: [
+            Win onMain orderOut: nil.
+            Win isValid ifTrue: [ Win release ].
+            Win := nil ]
+    ]
+
+    CocoaUI class >> window [ ^Win ]
+]

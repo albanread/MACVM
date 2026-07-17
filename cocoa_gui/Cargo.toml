@@ -1,0 +1,30 @@
+[package]
+name = "cocoa_gui"
+version = "0.0.0"
+edition = "2021"
+description = "MACVM native Cocoa/AppKit programming environment (macvm-cocoa) — the second, flagged GUI mode (docs/cocoa_gui_design.md). A UI worker VM pinned to the main thread is a dumb terminal; the persistent primary VM lives on a background thread."
+license = "BSD-2-Clause"
+publish = false
+
+[[bin]]
+name = "macvm-cocoa"
+path = "src/main.rs"
+
+[dependencies]
+# The real VM (docs/cocoa_gui_design.md §12): VmHandle boot/eval/exec, the
+# externally-hosted-worker surface (CG1), the AppKit main-thread guard (CG2),
+# FatalMode::ExitProcess (CG0). The load-bearing parts are core-VM changes that
+# live in the `macvm` crate; this crate is only the AppKit Rust glue that owns
+# [NSApp run]. Path dep exactly as the `gui` (WKWebView) crate depends on it.
+macvm = { path = ".." }
+
+# NOTE (structural decision, CG2): this crate owns a MINIMAL raw-AppKit objc
+# helper (src/objc.rs) rather than factoring `gui/src/objc.rs` into a shared
+# crate. Rationale — the boot glue needs only NSApplication / activation policy /
+# NSMenu-Quit / NSWindow-lifecycle raw sends, a small subset of the WKWebView
+# shell's helper; a fresh minimal module is lower-risk than reshaping the working
+# `gui` crate's objc.rs (which the shipping WKWebView shell depends on) into a
+# shared crate. Zero external crates for the bridge, same dependency-free
+# dlopen/dlsym/objc_msgSend approach as `gui/src/objc.rs`. If a third consumer
+# ever appears, factor then. CoreFoundation (the run-loop wake) is a linked
+# framework, declared in src/objc.rs.

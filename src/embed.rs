@@ -842,17 +842,81 @@ impl VmHandle {
         }
     }
 
+    /// Register an *externally-hosted* worker (CG1, `cocoa_gui_design.md` §3
+    /// step 3) on THIS primary VM — the surface the Cocoa GUI's boot handshake
+    /// needs from outside the crate. Delegates to
+    /// [`crate::runtime::workers::register_hosted_worker`]: mints the same
+    /// registry entry `Worker spawn` does (a normal-numbered link so
+    /// `send:`/`alive`/`terminate` target it with no special-casing) but hands
+    /// back the receiving side — `(id, HostedInbox, InboxSender)` — so the
+    /// caller can drive its own drain loop instead of a spawned thread's
+    /// recv-loop. `wake` is the caller's run-loop poke, fired (coalesced) on
+    /// every `send` to this worker. `None` if this VM is not a primary (call
+    /// [`set_worker_boot`](Self::set_worker_boot) first) or the fleet is at its
+    /// cap. See the CG1 gate `hosted_worker_registered_on_this_thread_round_trips`.
+    pub fn register_hosted_worker(
+        &mut self,
+        wake: crate::runtime::workers::InboxWakeFn,
+    ) -> Option<(
+        u32,
+        crate::runtime::workers::HostedInbox,
+        crate::runtime::workers::InboxSender,
+    )> {
+        crate::runtime::workers::register_hosted_worker(&mut self.vm, wake)
+    }
+
+    /// Send `bytes` (a MOP pickle, or empty for a bare connectivity poke) to
+    /// worker `id` from THIS primary VM, correlated by `corr` (0 =
+    /// uncorrelated) — the public face of [`crate::runtime::workers::send`], so
+    /// the Cocoa GUI's watchdog thread can drive the primary→UI-worker link
+    /// (initial snapshot blasts, CG4). Fires the worker's (coalesced) run-loop
+    /// wake. `false` if there is no such live worker.
+    pub fn send_to_worker(&mut self, id: u32, corr: u64, bytes: Vec<u8>) -> bool {
+        crate::runtime::workers::send(&mut self.vm, id, corr, bytes)
+    }
+
     /// Take on the Worker role (called by the worker thread body right after
     /// boot, before any guest code): this VM is worker `self_id`, replying to
-    /// the primary through `to_primary`.
-    pub(crate) fn install_worker_role(
+    /// the primary through `to_primary`. Also called from OUTSIDE the crate by
+    /// the Cocoa GUI's boot handshake (CG2): the UI worker is booted in place
+    /// on main, then takes on its Worker role so its future `reply:`/`send:`
+    /// reach the primary — the same wiring a spawned `worker_main` does, driven
+    /// by the run loop instead of a recv loop.
+    pub fn install_worker_role(
         &mut self,
         self_id: u32,
         to_primary: crate::runtime::workers::InboxSender,
     ) {
+        // Guard the public-API sharp edge: this overwrites `workers`, so calling
+        // it on a VM that has already become the Primary would silently drop its
+        // registry of spawned-worker links. The role is a boot-time, once-per-VM
+        // decision (a VM is EITHER the primary OR a worker); a re-role is a
+        // caller bug. Correct callers: the worker thread body, and the Cocoa
+        // GUI's boot handshake for the UI worker (never the primary).
+        debug_assert!(
+            !matches!(
+                self.vm.workers.as_deref(),
+                Some(crate::runtime::workers::WorkerState::Primary { .. })
+            ),
+            "install_worker_role would clobber a live Primary's worker registry"
+        );
         self.vm.workers = Some(Box::new(crate::runtime::workers::WorkerState::new_worker(
             self_id, to_primary,
         )));
+    }
+
+    /// Load an EXTRA world list on top of the already-booted base world (CG1,
+    /// `cocoa_gui_design.md` §12.3) — the public face of
+    /// [`crate::frontend::world::load_list`]. The Cocoa GUI's UI worker calls
+    /// this once after [`boot`](Self::boot) to layer `world/cocoaui.list` (the
+    /// `CocoaUI` view classes, files 63+) that the CLI, the WKWebView GUI, and
+    /// the base test suite carry none of. Paths in the list are relative to the
+    /// list file's own directory. A load error (bad path, compile error) is
+    /// returned as [`VmError`]; unlike [`eval`](Self::eval)/[`exec`](Self::exec)
+    /// this is not signal-guarded (it mirrors `boot`'s own unguarded
+    /// `load_world`, run before the run loop is live).
+    pub fn load_list(&mut self, path: &Path) -> Result<(), VmError> {
+        frontend::world::load_list(&mut self.vm, path).map_err(|e| VmError { msg: e.to_string() })
     }
 
     /// Park an inbound envelope in the Worker-role staging slot (the

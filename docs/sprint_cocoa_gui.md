@@ -114,15 +114,25 @@ rest. ⌘Q quits clean.
   one `NSWindow`, order front), returns to Rust; Rust calls `[NSApp run]`.
 - **`world/cocoaui.list`** gains its first file: `CocoaUI` (startup, the
   window) — pure bridge calls, on the main thread, VM quiescent between.
-- **The AppKit main-thread guard** (§8): an AppKit-prefixed send from a
-  non-main VM fails loudly (a curated class-prefix list). Small, but it
-  belongs the moment two VMs coexist.
+- **The AppKit main-thread guard** (§8): in the native Cocoa GUI, an AppKit
+  send from a non-main VM fails loudly (an exact-name curated UI-class list).
+  **Armed only under a `COCOA_UI_MODE` flag** that `macvm-cocoa` sets at
+  startup — it is a *no-op* for every other host. This gating is load-bearing,
+  not incidental: the shipping WKWebView GUI runs its single VM on a **worker**
+  thread and legitimately resolves an AppKit class off-main as the first half
+  of the C3 resolve-then-`onMain` pattern (CocoaPad, C5). An unconditional
+  guard broke that shipping demo (caught in CG2 review); the flag confines the
+  §8 rule to the mode it actually describes. Class *resolution* is thread-safe
+  and never itself the fault — the guard exists to catch an off-main AppKit
+  *use* by a background VM.
 
 **Acceptance gate.** *On-screen (user):* `macvm-cocoa` opens a native
 window titled from Smalltalk; ⌘Q quits with no crash. *Headless:* the
 two-VM boot handshake completes and returns `Err` cleanly on a machine with
-no window server (or in a `NSApp`-less harness); the main-thread guard
-rejects an AppKit send from a background VM.
+no window server (or in a `NSApp`-less harness); the pure guard decision is
+proven both ways (Cocoa mode on → off-main AppKit refused / on-main allowed;
+Cocoa mode off → nothing refused, the CocoaPad anti-regression) and
+`cocoa_main_hop` arms the guard on a genuine main thread.
 
 **Design ref:** §3, §10 G0, §9.1 items 6 & 10.
 

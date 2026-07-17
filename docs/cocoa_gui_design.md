@@ -432,9 +432,18 @@ compute workers are leaves), with three review corrections:
   re-syncing when it ends.
 - **Only the UI worker may touch AppKit, enforced by a new guard (review:
   the guard does not exist yet).** `cocoa_bridge_design.md` §7 explicitly
-  ships no in-bridge main-thread guard. This design adds one: an
-  AppKit-prefixed send from a non-main VM fails loudly (a curated
-  class-prefix list). Listed as new work (§9.1).
+  ships no in-bridge main-thread guard. This design adds one: an off-main
+  AppKit send from a non-main VM fails loudly, keyed on an **exact-name**
+  curated UI-class list (a *prefix* test would strangle Foundation, which
+  shares the `NS` prefix — CG2 review). Two further CG2-review corrections
+  are now baked in: (1) the guard is **armed only under a `COCOA_UI_MODE`
+  flag** the `macvm-cocoa` bin sets — it is a no-op for every other host,
+  because the shipping WKWebView GUI runs its single VM on a *worker* thread
+  and legitimately resolves an AppKit class off-main as the first half of the
+  C3 resolve-then-`onMain` pattern (CocoaPad, C5); an unconditional guard
+  broke that demo. (2) The fault it catches is an off-main AppKit *use* by a
+  background VM — class *resolution* is thread-safe and never itself refused.
+  Listed as new work (§9.1).
 
 ## 9. Reused vs. genuinely new — corrected against the reviews
 

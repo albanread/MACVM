@@ -53,6 +53,28 @@ fn main() {
         assert_eq!(out.gpr[0] & 0xFF, 1, "on main, isMainThread must be YES");
         let (_, inline0) = ob::hop_stats();
         assert!(inline0 >= 1, "the inline path must have counted");
+
+        // CG2 AppKit main-thread guard (cocoa_gui_design.md §8), the ON-MAIN
+        // branch of the ARMED guard — provable only from a genuine main thread
+        // (the libtest #[test] gates run off-main and cover the refused branch).
+        // Arm Cocoa mode HERE, so this exercises the real native-GUI path (not
+        // the inert default): main() IS the real main thread, so an AppKit UI
+        // class is ALLOWED (the UI worker is main) even with the guard live.
+        // This mirrors CG2's `CocoaUI startup` building NSWindow on main. The
+        // later VM-thread sends resolve only Foundation classes off-main, which
+        // the guard never blocks — so arming it does not disturb them.
+        ob::enable_cocoa_ui_mode();
+        assert!(ob::cocoa_ui_mode(), "Cocoa mode must now be armed");
+        assert!(ob::on_main_thread(), "this harness=false main() IS main");
+        assert!(
+            ob::check_appkit_main_thread("NSWindow").is_ok(),
+            "on main, AppKit UI classes must be allowed even with the guard armed"
+        );
+        assert!(ob::check_appkit_main_thread("NSView").is_ok());
+        assert!(
+            ob::check_appkit_main_thread("NSString").is_ok(),
+            "Foundation is always allowed"
+        );
     }
 
     macvm::runtime::objc_bridge::enable_main_hop();

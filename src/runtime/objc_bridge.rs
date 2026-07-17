@@ -765,6 +765,27 @@ pub fn main_hop_enabled() -> bool {
     MAIN_HOP_ENABLED.load(Ordering::Acquire)
 }
 
+/// CG2 (design §8): the AppKit main-thread guard is armed ONLY in the native
+/// Cocoa GUI (`macvm-cocoa`), where a UI worker owns the main thread and the
+/// primary/compute workers must never touch AppKit directly. It stays OFF for
+/// every other host — crucially the shipping WKWebView GUI, where the single VM
+/// runs on a *worker* thread and legitimately resolves an AppKit class off-main
+/// as the first half of the C3 resolve-then-`onMain` pattern (CocoaPad, C5). A
+/// guard that fired there would break that shipping demo, so it is opt-in.
+static COCOA_UI_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// `macvm-cocoa` calls this once at startup (design §3): from here on the main
+/// thread is AppKit's, and an off-main AppKit *send* from a background VM is a
+/// bug the guard refuses loudly. Idempotent; never unset.
+pub fn enable_cocoa_ui_mode() {
+    COCOA_UI_MODE.store(true, Ordering::Release);
+}
+
+/// Is the native Cocoa GUI's main-thread guard armed? See [`enable_cocoa_ui_mode`].
+pub fn cocoa_ui_mode() -> bool {
+    COCOA_UI_MODE.load(Ordering::Acquire)
+}
+
 pub fn hop_stats() -> (u64, u64) {
     (
         HOPS_DISPATCHED.load(Ordering::Relaxed),
@@ -936,8 +957,95 @@ pub fn register_selector(name: &str) -> Option<*mut c_void> {
     Some(unsafe { (s.sel_register_name)(c.as_ptr()) })
 }
 
+// ── AppKit main-thread guard (cocoa_gui_design.md §8) ─────────────────────────
+//
+// Only the UI worker — pinned to the process's main thread by AppKit — may
+// touch AppKit; the primary and compute-worker VMs live on background threads
+// and have no business building windows or views. The moment two VMs coexist
+// (the Cocoa GUI), an AppKit-class send from a background VM is a bug that must
+// fail LOUDLY rather than silently corrupt AppKit's main-thread-only state.
+// This is the in-bridge guard `cocoa_bridge_design.md` §7 explicitly deferred.
+//
+// The list is a CURATED set of exact AppKit UI class names, NOT an `NS*` prefix:
+// Foundation is also `NS*` (NSString/NSNumber/NSProcessInfo/NSCalendar/…), is
+// safe on any thread, and the headless bridge gates depend on it — so a prefix
+// match would wrongly strangle Foundation. Start small (design §8): exactly the
+// UI classes the IDE builds. Grow it as views are added (CG5+).
+const APPKIT_GUARDED_CLASSES: &[&str] = &[
+    "NSApplication",
+    "NSWindow",
+    "NSView",
+    "NSMenu",
+    "NSMenuItem",
+    "NSButton",
+    "NSTextView",
+    "NSTextField",
+    "NSTableView",
+    "NSOutlineView",
+    "NSScrollView",
+];
+
+/// Is `name` an AppKit UI class the main-thread guard protects? An exact-name
+/// membership test against [`APPKIT_GUARDED_CLASSES`] — deliberately NOT a
+/// prefix test (Foundation shares the `NS` prefix; see the list's note above).
+pub fn is_appkit_ui_class(name: &str) -> bool {
+    APPKIT_GUARDED_CLASSES.contains(&name)
+}
+
+/// Are we on the process's main thread — the only thread AppKit may be driven
+/// from? A thin wrap of `pthread_main_np()` (nonzero on main).
+pub fn on_main_thread() -> bool {
+    unsafe { pthread_main_np() == 1 }
+}
+
+/// The pure guard decision (design §8), split out so ALL three inputs are
+/// explicit and BOTH outcomes are deterministically unit-testable off any
+/// thread. A class is refused ONLY when all of: the native Cocoa GUI is running
+/// (`cocoa_mode`), the class is an AppKit UI class, and the caller is off the
+/// main thread. Everything else — any class outside Cocoa mode, any Foundation
+/// class, any class on the main thread — is allowed. Gating on `cocoa_mode` is
+/// what keeps the shipping WKWebView GUI working: there the single VM runs on a
+/// worker thread and legitimately resolves an AppKit class off-main before the
+/// C3 `onMain` hop (CocoaPad, C5), which a thread-only guard would wrongly break.
+fn appkit_guard(name: &str, on_main: bool, cocoa_mode: bool) -> Result<(), String> {
+    if cocoa_mode && is_appkit_ui_class(name) && !on_main {
+        return Err(format!(
+            "AppKit class '{name}' may only be used from the main-thread UI worker \
+             (cocoa_gui_design.md §8); this send came from a background VM — refused"
+        ));
+    }
+    Ok(())
+}
+
+/// Enforce the AppKit main-thread guard for `name` on the CURRENT thread
+/// (design §8). Armed only in the native Cocoa GUI ([`cocoa_ui_mode`]); a no-op
+/// for every other host (the WKWebView GUI, the CLI, the test suite). When
+/// armed: `Ok` for every Foundation class regardless of thread, and for any
+/// class on the main thread; `Err` (loud, describing the refusal) only for an
+/// AppKit UI class off the main thread. Checked at the Smalltalk-facing
+/// `primClassNamed:` primitive for a loud transcript line; class *resolution*
+/// itself is deliberately NOT blocked (it is thread-safe and the legitimate
+/// first half of the C3 resolve-then-`onMain` pattern).
+pub fn check_appkit_main_thread(name: &str) -> Result<(), String> {
+    // Foundation (and any non-AppKit class) short-circuits before any atomic or
+    // pthread call — the common path pays only a short list scan.
+    if !is_appkit_ui_class(name) {
+        return Ok(());
+    }
+    appkit_guard(name, on_main_thread(), cocoa_ui_mode())
+}
+
 /// Look up an Objective-C class by name. NULL if unknown.
 pub fn class_named(name: &str) -> Option<*mut c_void> {
+    // Design §8, ARMED ONLY IN THE NATIVE COCOA GUI ([`cocoa_ui_mode`]): a
+    // background VM may not reach AppKit UI classes. Foundation is never
+    // blocked; the main-thread UI worker is always allowed; every non-Cocoa
+    // host (the WKWebView GUI, the CLI, tests) is unaffected — there this guard
+    // is a no-op and off-main AppKit resolution (the C3 resolve-then-`onMain`
+    // pattern) proceeds as always.
+    if check_appkit_main_thread(name).is_err() {
+        return None;
+    }
     let s = syms()?;
     ensure_pool(s);
     let c = CString::new(name).ok()?;
@@ -1060,6 +1168,102 @@ pub fn nsstring_from(bytes: &[u8]) -> Result<*mut c_void, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// CG2 — the AppKit main-thread guard's pure decision (design §8), all
+    /// three inputs explicit so every outcome is deterministic off any thread.
+    /// The Cocoa-mode gate is the load-bearing dimension: OFF (the WKWebView /
+    /// CLI / test default) NOTHING is ever refused, which is what keeps the
+    /// shipping CocoaPad resolve-then-`onMain` pattern working; ON, an AppKit UI
+    /// class off-main is refused while on-main and all Foundation stay allowed.
+    #[test]
+    fn appkit_guard_blocks_ui_classes_off_main_only() {
+        let ui_classes = [
+            "NSWindow",
+            "NSView",
+            "NSApplication",
+            "NSMenu",
+            "NSButton",
+            "NSTextView",
+            "NSTableView",
+            "NSOutlineView",
+        ];
+        // COCOA MODE ON: an AppKit UI class off-main → refused; on-main → OK.
+        for ui in ui_classes {
+            assert!(
+                appkit_guard(ui, false, true).is_err(),
+                "{ui} off-main in Cocoa mode must be refused"
+            );
+            assert!(
+                appkit_guard(ui, true, true).is_ok(),
+                "{ui} on-main in Cocoa mode must be allowed (the UI worker IS main)"
+            );
+        }
+        // COCOA MODE OFF (the shipping WKWebView default): the SAME AppKit class
+        // off-main is ALLOWED — the anti-regression for CocoaPad, which resolves
+        // NSWindow on its worker thread before hopping via `onMain`.
+        for ui in ui_classes {
+            assert!(
+                appkit_guard(ui, false, false).is_ok(),
+                "{ui} off-main outside Cocoa mode must NOT be refused (CocoaPad path)"
+            );
+        }
+        // Foundation is NEVER blocked, on any thread, in any mode — the headless
+        // bridge gates (NSString/NSProcessInfo round-trips) run off-main and
+        // depend on this.
+        for f in [
+            "NSString",
+            "NSMutableString",
+            "NSNumber",
+            "NSValue",
+            "NSProcessInfo",
+            "NSCalendar",
+            "NSThread",
+            "NSDate",
+        ] {
+            for cocoa in [false, true] {
+                assert!(
+                    appkit_guard(f, false, cocoa).is_ok(),
+                    "Foundation {f} must never be blocked off-main (cocoa_mode={cocoa})"
+                );
+                assert!(appkit_guard(f, true, cocoa).is_ok());
+            }
+        }
+    }
+
+    /// CG2 — the LIVE guard through `class_named` on this libtest worker thread
+    /// (never main), with Cocoa mode OFF (the process default — nothing calls
+    /// [`enable_cocoa_ui_mode`] in the test binary). This is the CocoaPad
+    /// anti-regression: outside the native Cocoa GUI the guard is inert, so
+    /// AppKit class *resolution* off-main is NOT refused (it is the legitimate
+    /// first half of the C3 resolve-then-`onMain` pattern the WKWebView GUI's
+    /// CocoaPad demo ships), and Foundation resolves as always.
+    #[test]
+    fn guard_inert_off_main_outside_cocoa_mode() {
+        assert!(
+            !on_main_thread(),
+            "libtest #[test]s run off the process's main thread"
+        );
+        assert!(
+            !cocoa_ui_mode(),
+            "the test binary never enables Cocoa mode — the guard must be inert"
+        );
+        // The guard does NOT reject AppKit UI classes off-main here — the exact
+        // check `class_named` performs. (Whether NSWindow ultimately *resolves*
+        // depends on AppKit being loaded, which it is not headlessly; what
+        // matters is the guard is not the thing standing in the way.)
+        assert!(
+            check_appkit_main_thread("NSWindow").is_ok(),
+            "outside Cocoa mode the guard must not block AppKit resolution off-main"
+        );
+        assert!(check_appkit_main_thread("NSView").is_ok());
+        // Foundation resolves fine off-main (the runtime is linked in the test
+        // binary — the C0 gates prove it).
+        assert!(
+            class_named("NSString").is_some(),
+            "Foundation NSString must resolve off-main"
+        );
+        assert!(class_named("NSProcessInfo").is_some());
+    }
 
     /// ARC's method-family rule, pinned against its own documented edge
     /// cases — the difference between a prefix TEST and a prefix RULE is

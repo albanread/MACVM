@@ -1791,6 +1791,14 @@ fn prim_cocoa_class_named(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     let Some(name) = string_arg(vm, args[1]) else {
         return PrimResult::Fail;
     };
+    // CG2 (cocoa_gui_design.md §8): fail LOUDLY if a background VM tries to
+    // reach an AppKit UI class — only the main-thread UI worker may. The
+    // transcript line names the refusal; the primitive fails so the guest send
+    // raises rather than corrupting AppKit's main-thread-only state.
+    if let Err(msg) = crate::runtime::objc_bridge::check_appkit_main_thread(&name) {
+        let _ = writeln!(vm.out, "[cocoa-guard] {msg}");
+        return PrimResult::Fail;
+    }
     match crate::runtime::objc_bridge::class_named(&name) {
         Some(cls) => PrimResult::Ok(crate::runtime::objc_bridge::wrap(vm, cls)),
         None => PrimResult::Fail,
