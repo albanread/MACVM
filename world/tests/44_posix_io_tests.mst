@@ -14,6 +14,8 @@ TestCase subclass: PosixIoTests [
         self runTest: #testKqueueReadReadiness do: [ self testKqueueReadReadiness ].
         self runTest: #testKqueueWriteReadiness do: [ self testKqueueWriteReadiness ].
         self runTest: #testKqueueEofFlag do: [ self testKqueueEofFlag ].
+        self runTest: #testUserEventTriggersAndLatches do: [ self testUserEventTriggersAndLatches ].
+        self runTest: #testUserEventCrossHandlePoke do: [ self testUserEventCrossHandlePoke ].
     ]
 
     "pipe() into the buffer head; answers {readFd. writeFd} (two u32s)."
@@ -103,6 +105,43 @@ TestCase subclass: PosixIoTests [
         self assert: (e at: 2) = -2.            "EVFILT_WRITE"
         self assert: (e at: 3) > 0.             "writable space"
         Posix close: (fds at: 1). Posix close: (fds at: 2). kq close.
+    ]
+
+    "EVFILT_USER — the kqueue-native user signal the IoWorker's wake rides
+     on (world/62). The property under test is LATCHING: a trigger fired
+     while nobody is polling is not lost — the next poll returns it — and
+     EV_CLEAR resets it on delivery so it fires exactly once per trigger.
+     (That no-lost-wakeup guarantee is what a raw POSIX signal cannot give
+     kevent on Darwin, and why the wake is a user event, not pthread_kill.)"
+    testUserEventTriggersAndLatches [
+        | kq events e |
+        kq := Kqueue new.
+        self assert: kq registerUserEvent = 0.
+        self assert: (kq pollMs: 0) size = 0.       "registered, not fired"
+        self assert: kq triggerUserEvent = 0.       "fire with NO poller: latches"
+        events := kq pollMs: 0.
+        self assert: events size = 1.
+        e := events at: 1.
+        self assert: (e at: 1) = 0.                 "ident = the register ident"
+        self assert: (e at: 2) = -10.               "EVFILT_USER"
+        self assert: (kq pollMs: 0) size = 0.       "EV_CLEAR reset it on delivery"
+        kq close.
+    ]
+
+    "The poke path exactly as the IoWorker uses it: a SECOND Kqueue handle
+     wrapped around the SAME kernel kq fd (worker VMs share one fd table)
+     triggers the user event, and the first handle's poll sees it — two
+     NativeBuffer pages, one kernel object."
+    testUserEventCrossHandlePoke [
+        | kq poker events |
+        kq := Kqueue new.
+        kq registerUserEvent.
+        poker := Kqueue onFd: kq fd.
+        self assert: poker triggerUserEvent = 0.
+        events := kq pollMs: 200.
+        self assert: events size = 1.
+        self assert: ((events at: 1) at: 2) = -10.
+        kq close.
     ]
 
     "Closing the write end surfaces EV_EOF (32768, the u16 top bit — so

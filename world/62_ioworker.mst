@@ -15,26 +15,34 @@
 
  Two faces, one class (class vars/methods run in the IoWorker VM; instance
  handle runs in the requester):
-   worker side  — `serve` installs the message handler; `handle:`/`pump:` own
-                  the kqueue and do bounded reads.
+   worker side  — `serveOnKq:` installs the message handler over a kqueue the
+                  PRIMARY made; `handle:`/`pump:` do bounded reads.
    primary side — `IoWorker spawn` boots one; `watchRead:onData:` registers a
-                  continuation; `startPumping:`/`stopPumping` drive the loop.
+                  continuation; `startPumping`/`stopPumping` drive the loop.
 
- Cadence: `pump:` polls with a bounded timeout (a heartbeat), so the IoWorker
- stays responsive to new watch requests between polls. A true infinite-kevent
- sleep woken by a self-pipe control fd is the later efficiency refinement
- (docs/asyncio_design.md 'open questions'); bounded polling is correct and
- simple first."
+ Cadence (the wake): the pump sleeps in an INFINITE kevent — zero CPU when
+ idle, no heartbeat. The problem that creates: the worker only reads its inbox
+ BETWEEN dispatches, so a new watch request sent mid-sleep would wait forever.
+ The wake is the kqueue's own EVFILT_USER 'user signal': the primary CREATES
+ the kqueue, registers the user event, and bakes the kq fd into the boot doit —
+ so after every non-pump send it pokes (NOTE_TRIGGER on the shared fd) and the
+ sleeping kevent returns NOW. The trigger LATCHES (a poke with nobody sleeping
+ just makes the next poll return once, EV_CLEAR resets it), so send-then-poke
+ can never lose a wakeup — the race that rules out raw POSIX signals on Darwin
+ (kevent has no pselect-style atomic mask). NEVER poke a #pump send: a pump
+ that wakes its own sleep busy-loops."
 
 Object subclass: IoWorker [
-    | worker readHandlers pumping |
+    | worker kq readHandlers pumping |
     <classVars: Kq Buf>
 
     "── worker side: the server that runs INSIDE the spawned IoWorker VM ──
-     `bootSource` is the init doit `Worker spawn:` runs once there."
-    IoWorker class >> bootSource [ ^'IoWorker serve' ]
-    IoWorker class >> serve [
-        Kq := Kqueue new.
+     The boot doit carries the primary-made kqueue's fd (fds are shared
+     across VMs), so the primary can poke a kqueue it owns from birth —
+     no 'what is your kq fd?' handshake."
+    IoWorker class >> bootSourceOnKq: kqFd [ ^'IoWorker serveOnKq: ', kqFd printString ]
+    IoWorker class >> serveOnKq: kqFd [
+        Kq := Kqueue onFd: kqFd.
         Buf := NativeBuffer page.
         Worker onMessage: [ :m | IoWorker handle: m payload ]
     ]
@@ -56,14 +64,17 @@ Object subclass: IoWorker [
         Worker reply: (Array with: #err with: #unknownRequest)
     ]
 
-    "Poll once (bounded) and, for each readable fd, do a read BOUNDED by the
-     kevent-reported count (so it can't block even on a blocking fd); answer a
-     batch of {fd. bytes. eof} tuples. EVFILT_READ = -1; EV_EOF = 32768. Pure
-     (no messaging) so it is unit-testable in one VM; `pump:` wraps it in the
-     reply."
+    "Poll once (ms < 0 = block FOREVER — the poke is what ends an idle
+     sleep) and, for each readable fd, do a read BOUNDED by the kevent-
+     reported count (so it can't block even on a blocking fd); answer a
+     batch of {fd. bytes. eof} tuples. EVFILT_READ = -1; EV_EOF = 32768.
+     The EVFILT_USER wake event (filter -10) falls through the filter
+     guard untouched — a poke just ends the sleep with an empty batch.
+     Pure (no messaging) so it is unit-testable in one VM; `pump:` wraps
+     it in the reply."
     IoWorker class >> drain: ms [
         | events results |
-        events := Kq pollMs: ms.
+        events := ms < 0 ifTrue: [ Kq pollForever ] ifFalse: [ Kq pollMs: ms ].
         results := OrderedCollection new.
         events do: [ :e |
             (e at: 2) = -1 ifTrue: [
@@ -84,16 +95,31 @@ Object subclass: IoWorker [
 
     "── primary side: the handle a requester holds ──"
     IoWorker class >> spawn [
-        ^self new setWorker: (Worker spawn: self bootSource)
+        | q |
+        q := Kqueue new.
+        q registerUserEvent.
+        ^self new setWorker: (Worker spawn: (self bootSourceOnKq: q fd)) kqueue: q
     ]
-    setWorker: w [ worker := w. readHandlers := Dictionary new. pumping := false. ^self ]
+    setWorker: w kqueue: aKqueue [
+        worker := w.
+        kq := aKqueue.
+        readHandlers := Dictionary new.
+        pumping := false.
+        ^self
+    ]
     worker [ ^worker ]
+
+    "The wake: fire the kqueue's user event so a pump sleeping in an
+     infinite kevent returns NOW (and the pending request envelope gets
+     dispatched right after). Latches if nothing is sleeping — harmless."
+    poke [ kq triggerUserEvent. ^self ]
 
     "Register a continuation for fd's readable data. `aBlock` is a 2-arg block
      `[:bytes :eof | ...]`, fired once per pump that reports data on fd."
     watchRead: fd onData: aBlock [
         readHandlers at: fd put: aBlock.
         worker send: (Array with: #watchRead with: fd).
+        self poke.
         ^self
     ]
     unwatchRead: fd [
@@ -101,6 +127,7 @@ Object subclass: IoWorker [
          codebase-wide idiom); `deliver:`'s at:ifAbsent: skips a nil."
         readHandlers at: fd put: nil.
         worker send: (Array with: #unwatchRead with: fd).
+        self poke.
         ^self
     ]
 
@@ -114,15 +141,41 @@ Object subclass: IoWorker [
 
     "Send one poll; its reply dispatches the data and, while `pumping`, re-arms
      the next poll — a self-sustaining chain driven by the reply, never a spin
-     (each link only fires when the previous reply lands)."
+     (each link only fires when the previous reply lands). Deliberately NO
+     poke here — see the header (a pump waking its own sleep busy-loops)."
     pumpOnce: ms [
         worker send: (Array with: #pump with: ms)
               onReply: [ :reply |
                   self deliver: (reply at: 2).
                   pumping ifTrue: [ self pumpOnce: ms ] ]
     ]
-    startPumping: ms [ pumping := true. self pumpOnce: ms. ^self ]
-    stopPumping [ pumping := false. ^self ]
+    "The normal mode: infinite sleeps, poke-woken. `startPumping: ms` keeps
+     a bounded heartbeat available (tests, belt-and-braces callers)."
+    startPumping [ ^self startPumping: -1 ]
+    startPumping: ms [
+        pumping ifTrue: [ ^self ].
+        pumping := true.
+        self pumpOnce: ms.
+        ^self
+    ]
+    stopPumping [
+        "Stop the chain, and poke so an in-flight infinite pump returns now
+         (its reply sees pumping = false and does not re-arm)."
+        pumping := false.
+        self poke.
+        ^self
+    ]
 
-    terminate [ worker terminate. ^self ]
+    terminate [
+        "Order matters: stop re-arming FIRST (a reply landing after
+         terminate must not send #pump to a dead worker), then wake any
+         in-flight sleep so the worker can wind down. The kq fd is NOT
+         closed here: the worker thread may still be inside kevent on it,
+         and closing an fd under a sleeping kevent is undefined on Darwin —
+         one leaked fd per IoWorker lifetime is the honest price."
+        pumping := false.
+        self poke.
+        worker terminate.
+        ^self
+    ]
 ]

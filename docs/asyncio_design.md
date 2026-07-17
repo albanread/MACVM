@@ -69,11 +69,49 @@ serial worker model exactly):
   continuation; `startPumping:` kicks a self-sustaining pump chain (each poll's
   reply dispatches the batch and re-arms the next — reply-driven, never a spin).
 
-**Cadence caveat (the deferred efficiency piece):** `pump:` uses a bounded
-timeout (a heartbeat), so the IoWorker wakes every interval even when idle and
-new watch requests wait up to one interval. A true infinite-`kevent` sleep woken
-by a self-pipe control fd (below) removes both; bounded polling is correct and
-simple, and is what shipped first.
+### The cadence (BUILT): infinite sleep + the EVFILT_USER wake
+
+The first cut heartbeat-polled (bounded `kevent` timeout), so the IoWorker woke
+every interval when idle and a new watch request waited up to one interval.
+Now the pump sleeps in an **infinite `kevent`** — zero CPU when idle — and the
+primary **pokes** it awake the moment a request needs servicing.
+
+The wake had three candidate flavors; the differences are load-bearing:
+
+1. **A raw POSIX signal** (`pthread_kill` + no-op handler → the sleeping
+   `kevent` returns `EINTR`): has the classic **lost-wakeup race** — a signal
+   landing just *before* the thread enters `kevent` is consumed, and the sleep
+   proceeds forever. Linux plugs this with `epoll_pwait`'s atomic sigmask;
+   **Darwin has no pselect-analog for kevent**, so the race is unfixable. Also
+   needs new Rust (Smalltalk can't name the worker's `pthread_t`) and
+   process-global handler state. Rejected.
+2. **A self-pipe control fd** (the classic idiom): race-free (the byte sits in
+   the pipe), but costs two fds, drain-the-byte bookkeeping, and a "how does
+   the poker learn the fd" handshake. Superseded by:
+3. **`EVFILT_USER`** — kqueue's built-in *user signal*: register a user event
+   on the kq once, and any thread holding the kq fd fires it with a
+   `NOTE_TRIGGER` kevent call (concurrent kevent on one kq is the libdispatch
+   wake pattern). The trigger **latches** — fired with nobody sleeping, it just
+   makes the next poll return once, and `EV_CLEAR` resets it on delivery — so
+   send-then-poke can never lose a wakeup. No extra fds, no drain logic (the
+   worker's `drain:` filter guard already skips non-`EVFILT_READ` events).
+
+The handshake inverts away entirely: **the primary creates the kqueue**,
+registers the user event, and bakes the kq fd into the boot doit
+(`IoWorker serveOnKq: N`) — legal because worker VMs share one fd table, the
+same fact that makes the whole design work. So the primary can poke a kqueue
+it owns from the worker's birth.
+
+One rule with teeth: the poke fires after every **non-pump** send
+(`watchRead:`/`unwatchRead:`/`stopPumping`/`terminate`) and **never** on a
+`#pump` send — a pump that pokes itself wakes its own sleep and busy-loops.
+
+Gates: `PosixIoTests testUserEventTriggersAndLatches` (trigger + latch +
+`EV_CLEAR` reset) and `testUserEventCrossHandlePoke` (the two-handles-one-
+kernel-object poke shape); `embed::ioworker_infinite_pump_is_woken_by_a_mid_
+sleep_watch` starts an infinite pump FIRST, then watches + writes mid-sleep —
+verified to run 0.04s green with the poke and time out red at its 50s cap
+without it. The wake is load-bearing, not an optimization.
 
 ### (former) Slice B — original notes
 

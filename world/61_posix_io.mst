@@ -112,14 +112,19 @@ Object subclass: NativeBuffer [
       10  flags   uint16_t    2
       12  fflags  uint32_t    4"
     keventAt: off ident: fd filter: filt flags: fl [
+        ^self keventAt: off ident: fd filter: filt flags: fl fflags: 0
+    ]
+    keventAt: off ident: fd filter: filt flags: fl fflags: ff [
         | f16 |
         self zero: 32 at: off.
         self i64At: off put: fd.
-        "filter is a NEGATIVE i16 (EVFILT_READ = -1, EVFILT_WRITE = -2):
-         two's-complement it into an unsigned 16-bit field."
+        "filter is a NEGATIVE i16 (EVFILT_READ = -1, EVFILT_WRITE = -2,
+         EVFILT_USER = -10): two's-complement it into an unsigned 16-bit
+         field. fflags carries NOTE_TRIGGER for user events."
         f16 := filt < 0 ifTrue: [ filt + 65536 ] ifFalse: [ filt ].
         self u16At: off + 8 put: f16.
-        self u16At: off + 10 put: fl
+        self u16At: off + 10 put: fl.
+        self u32At: off + 12 put: ff
     ]
     keventIdentAt: off [ ^self i64At: off ]
     keventFilterAt: off [
@@ -142,14 +147,31 @@ Object subclass: NativeBuffer [
    64..319  the eventlist (up to 8 events per poll)
    384..399 the poll timespec
    512..    scratch (callers may use `buffer` for read/write payloads)
- EVFILT_READ = -1, EVFILT_WRITE = -2; EV_ADD|EV_ENABLE = 5, EV_DELETE = 2;
- EV_EOF = 32768 (the u16 top bit, so `flags >= 32768` tests it without
- needing bitAnd:)."
+ EVFILT_READ = -1, EVFILT_WRITE = -2, EVFILT_USER = -10; EV_ADD|EV_ENABLE
+ = 5, EV_DELETE = 2, EV_ADD|EV_ENABLE|EV_CLEAR = 37; NOTE_TRIGGER =
+ 16777216 (0x01000000); EV_EOF = 32768 (the u16 top bit, so `flags >=
+ 32768` tests it without needing bitAnd:).
+
+ EVFILT_USER is the kqueue-native USER SIGNAL: register it once, and any
+ thread holding the kq fd can fire it with a NOTE_TRIGGER kevent call —
+ the sleeping poll returns NOW, and a trigger fired while nobody sleeps
+ LATCHES until the next poll (EV_CLEAR resets it on delivery). That
+ latching is the no-lost-wakeup property a raw POSIX signal cannot give
+ kevent on Darwin (there is no pselect-style atomic-mask kevent), and it
+ is what the IoWorker's wake rides on (world/62). Since worker VMs share
+ one fd table, `Kqueue onFd:` lets another VM poke the SAME kernel kqueue
+ through its own handle."
 Object subclass: Kqueue [
     | kq buf |
     Kqueue class >> new [ ^self basicNew init ]
-    init [
-        kq := Posix kqueue.
+    "Wrap an EXISTING kqueue fd (made elsewhere — e.g. by the primary VM,
+     which bakes it into the IoWorker's boot doit). Own page, shared
+     kernel object; concurrent kevent calls on one kq from two threads are
+     safe (the libdispatch wake pattern)."
+    Kqueue class >> onFd: anFd [ ^self basicNew initOnFd: anFd ]
+    init [ ^self initOnFd: Posix kqueue ]
+    initOnFd: anFd [
+        kq := anFd.
         buf := NativeBuffer page.
         ^self
     ]
@@ -157,7 +179,10 @@ Object subclass: Kqueue [
     buffer [ ^buf ]
 
     change: fd filter: filt flags: fl [
-        buf keventAt: 0 ident: fd filter: filt flags: fl.
+        ^self change: fd filter: filt flags: fl fflags: 0
+    ]
+    change: fd filter: filt flags: fl fflags: ff [
+        buf keventAt: 0 ident: fd filter: filt flags: fl fflags: ff.
         ^Posix keventKq: kq changes: buf address nChanges: 1
               events: 0 nEvents: 0 timeout: 0
     ]
@@ -166,15 +191,25 @@ Object subclass: Kqueue [
     unwatchRead: fd [ ^self change: fd filter: -1 flags: 2 ]
     unwatchWrite: fd [ ^self change: fd filter: -2 flags: 2 ]
 
+    "── the user event (ident 0): register once, poke from anywhere ──"
+    registerUserEvent [ ^self change: 0 filter: -10 flags: 37 fflags: 0 ]
+    triggerUserEvent [ ^self change: 0 filter: -10 flags: 0 fflags: 16777216 ]
+
     "Poll with a millisecond timeout (0 = return immediately). Answers an
      Array of per-event Arrays {ident. filter. data. flags} — `data` is the
      byte count/space/backlog that makes bounded blocking-fd I/O safe."
     pollMs: ms [
-        | n events |
         buf timespecAt: 384 ms: ms.
+        ^self pollTimeoutPtr: buf address + 384
+    ]
+    "Block in kevent with NO timeout (NULL timespec): zero CPU until an
+     event — or the user event — arrives. The IoWorker's idle state."
+    pollForever [ ^self pollTimeoutPtr: 0 ]
+    pollTimeoutPtr: tsPtr [
+        | n events |
         n := Posix keventKq: kq changes: 0 nChanges: 0
                   events: buf address + 64 nEvents: 8
-                  timeout: buf address + 384.
+                  timeout: tsPtr.
         n < 0 ifTrue: [ ^Array new: 0 ].
         events := Array new: n.
         1 to: n do: [ :i |

@@ -2317,6 +2317,51 @@ mod tests {
         );
     }
 
+    /// The cadence (docs/asyncio_design.md): the IoWorker's pump sleeps in an
+    /// INFINITE kevent — zero idle CPU, no heartbeat — and the primary wakes it
+    /// by poking the kqueue's EVFILT_USER event after every non-pump send.
+    /// This test starts the infinite pump FIRST (the worker goes to sleep with
+    /// nothing watched) and only THEN registers the watch and writes: the watch
+    /// request can only be serviced if the poke ends the sleep. If the wake
+    /// were broken, the first pump would sleep forever, the watchRead envelope
+    /// would never be dispatched, and this test would time out red at its cap —
+    /// the poke is load-bearing, not an optimization. (The trigger LATCHES, so
+    /// every send/sleep interleaving passes — no timing sleeps needed here.)
+    #[test]
+    fn ioworker_infinite_pump_is_woken_by_a_mid_sleep_watch() {
+        let mut vm = boot_worker_primary();
+        vm.exec(
+            "Object subclass: IoProbe2 [
+                <classVars: Buf ReadFd WriteFd Got>
+                IoProbe2 class >> setUp: iow [
+                    Buf := NativeBuffer page.
+                    Posix pipeInto: Buf address.
+                    ReadFd := Buf u32At: 0. WriteFd := Buf u32At: 4.
+                    Got := nil.
+                    iow startPumping.
+                    iow watchRead: ReadFd onData: [:bytes :eof | Got := bytes ].
+                    Buf byteAt: 512 put: 72. Buf byteAt: 513 put: 73.
+                    Posix write: WriteFd from: Buf address + 512 count: 2 ]
+                IoProbe2 class >> got [ ^Got ]
+                IoProbe2 class >> sum [ | s | s := 0. Got do: [:b | s := s + b]. ^s ]
+            ]",
+        )
+        .expect("define IoProbe2");
+        vm.exec("WkTest reset.").expect("reset");
+        vm.exec("WkTest w1: IoWorker spawn.")
+            .expect("spawn the IoWorker VM");
+        vm.exec("IoProbe2 setUp: WkTest w1.")
+            .expect("infinite pump first, then watch + write mid-sleep");
+        vm.exec("Worker runLoopWhile: [ (WkTest tickCapped: 200) and: [ IoProbe2 got isNil ] ].")
+            .expect("run the loop until the read comes back");
+        assert_eq!(
+            vm.eval("IoProbe2 sum").expect("sum").trim(),
+            "145", // 72 + 73
+            "bytes written AFTER an infinite pump went to sleep still arrive: \
+             the EVFILT_USER poke woke the sleep so the watch got installed"
+        );
+    }
+
     #[test]
     fn perform_calls_a_method_by_name() {
         // `perform:withArguments:` (prim 64) + its arity sugar: a Symbol
