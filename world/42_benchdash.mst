@@ -26,7 +26,7 @@ Object subclass: BenchmarkDashboard [
         ^(self fib: n - 1) + (self fib: n - 2)
     ]
     BenchmarkDashboard class >> benchFib [
-        ^self fib: 30
+        ^self fib: 32
     ]
     BenchmarkDashboard class >> benchSieve [
         | count |
