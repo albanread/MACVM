@@ -444,7 +444,62 @@ WKWebView GUI (it stays default).
    it purely a terminal? Start purely-terminal (all logic on the primary);
    add local fast paths only where round-trip latency is felt.
 
-## 12. Relationship to the existing docs
+## 12. Packaging — same repo, a gated workspace crate (not a fork)
+
+The change is big, which tempts a separate repo. It should not be one. The
+honest test is coupling and boundary, not size, and on both the Cocoa GUI
+fails the fork test:
+
+- **Its load-bearing parts are core-VM changes.**
+  `FatalMode::AbortToEventLoop`, the per-callback `sigsetjmp` boundary, the
+  parked-main boot handshake, the C6 delegate registry, and the reverse
+  marshalling all edit `vm_state.rs` / `objc_bridge.rs` / `embed.rs` /
+  `src/runtime/`. They *must* live in the `macvm` crate. A separate repo
+  could hold only the Smalltalk framework + the bin, leaving the engine of
+  the feature back in core — a fake split that fragments one feature across
+  two repos.
+- **The view models are shared source.** The browser/outliner/find logic
+  is the same `world/*.mst` the WKWebView GUI uses (`ClassMirror`,
+  `ClassHierarchyOutliner`, …) — one model, two renderers
+  (`feedback_dual_placement_not_migration`). Forking duplicates them or
+  creates a cross-repo world dependency.
+- **None of the real fork justifications hold** — no independent release
+  cadence (ships with the VM), no independent consumers (only MACVM users),
+  no clean interface boundary (it reaches through the VM's threading and
+  recovery). Contrast the GamePane → MacGamePane sister repo, which earned a
+  repo precisely because it *has* a clean producer/consumer boundary (a
+  self-contained native pane MACVM consumes). The Cocoa GUI is the opposite
+  shape.
+- **The decisive property a fork loses: one change, both GUIs tested at
+  once.** A pickle/bridge/worker change is validated against the WKWebView
+  *and* Cocoa GUIs in a single `cargo test`. A fork yields version skew and
+  "green in core, broken in the GUI repo, noticed weeks later."
+
+The repo is *already* a cargo workspace (`.` = core `macvm`, `gui` = the
+WKWebView bin depending on `macvm`, plus `image_store`/`ffi_gen`/…), with a
+default root build that builds `macvm` alone. The right modularity for a
+big change is therefore a **workspace member + gates**, not a repo:
+
+1. **A new `cocoa_gui` workspace crate** for the AppKit Rust glue (the
+   parked-main boot, the delegate IMPs' registration, the bin), depending on
+   `macvm` exactly as `gui` does. A default `cargo build`/`test` at the root
+   never links it — CI/headless/the core stay clean.
+2. **Core changes inert-when-off.** `AbortToEventLoop` is a dormant enum
+   variant (as `ExitThread` already coexists with `ExitProcess`); the C6
+   `objc_delegate` module compiles but is unreachable unless a delegate is
+   created — small and dormant beside the always-compiled Cocoa bridge.
+   Optionally behind a `cocoa` cargo feature if it should leave the default
+   lib entirely.
+3. **A conditionally-loaded world layer** (`world/5x_cocoaui/`, its own load
+   list) so the CLI, the WKWebView GUI, and the test suite carry none of it.
+
+That is "a configuration for the build" done honestly: isolated, zero-cost
+when off, one cohesive repo where a core change cannot silently break the
+second GUI. (Open question 3 in §11 — `--cocoa` flag vs. `macvm-cocoa`
+bin — is settled by this: a dedicated bin in the new `cocoa_gui` crate, so
+the parked-main boot never complicates the WKWebView `main()`.)
+
+## 13. Relationship to the existing docs
 
 Sits on top of, and does not re-open: `cocoa_bridge_design.md` (C0–C5),
 `multi-smalltalk-worker.md` (the star, the pickle, the RPC, the wake),
