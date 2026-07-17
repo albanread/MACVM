@@ -2270,6 +2270,53 @@ mod tests {
         );
     }
 
+    /// Async I/O end to end (docs/asyncio_design.md slice B): the primary spawns
+    /// a dedicated IoWorker VM, watches a pipe's read end on it, writes bytes
+    /// from the primary, and the data comes back as a message — the IoWorker did
+    /// the kqueue poll + read on ITS thread while the primary only ever slept in
+    /// its inbox. Proves the whole stack: FFI syscalls, cross-VM fd sharing (one
+    /// process → the pipe made in the primary is valid in the IoWorker), the
+    /// kqueue readiness engine, and the message-driven pump loop.
+    #[test]
+    fn ioworker_multiplexes_a_pipe_read_back_to_the_primary() {
+        let mut vm = boot_worker_primary();
+        vm.exec(
+            "Object subclass: IoProbe [
+                <classVars: Buf ReadFd WriteFd Got>
+                IoProbe class >> setUp: iow [
+                    Buf := NativeBuffer page.
+                    Posix pipeInto: Buf address.
+                    ReadFd := Buf u32At: 0. WriteFd := Buf u32At: 4.
+                    Got := nil.
+                    iow watchRead: ReadFd onData: [:bytes :eof | Got := bytes ].
+                    Buf byteAt: 512 put: 65. Buf byteAt: 513 put: 66. Buf byteAt: 514 put: 67.
+                    Posix write: WriteFd from: Buf address + 512 count: 3.
+                    iow startPumping: 50 ]
+                IoProbe class >> gotSize [ ^Got isNil ifTrue: [ -1 ] ifFalse: [ Got size ] ]
+                IoProbe class >> got [ ^Got ]
+                IoProbe class >> sum [ | s | s := 0. Got do: [:b | s := s + b]. ^s ]
+            ]",
+        )
+        .expect("define IoProbe");
+        vm.exec("WkTest reset.").expect("reset");
+        vm.exec("WkTest w1: IoWorker spawn.")
+            .expect("spawn the IoWorker VM");
+        vm.exec("IoProbe setUp: WkTest w1.")
+            .expect("watch the pipe, write, start pumping");
+        vm.exec("Worker runLoopWhile: [ (WkTest tickCapped: 200) and: [ IoProbe got isNil ] ].")
+            .expect("run the loop until the read comes back");
+        assert_eq!(
+            vm.eval("IoProbe gotSize").expect("gotSize").trim(),
+            "3",
+            "the 3 bytes written in the primary came back via the IoWorker"
+        );
+        assert_eq!(
+            vm.eval("IoProbe sum").expect("sum").trim(),
+            "198", // 65 + 66 + 67
+            "the exact bytes (A B C) round-tripped through the kqueue read"
+        );
+    }
+
     #[test]
     fn perform_calls_a_method_by_name() {
         // `perform:withArguments:` (prim 64) + its arity sugar: a Symbol

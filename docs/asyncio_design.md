@@ -49,7 +49,33 @@ pipe; read readiness with `data` = byte count; write readiness with space;
 `EV_EOF` on peer-close. Headless, network-free (pipes + kqueue), verified to
 redden when broken.
 
-## Slice B — the `IoWorker` (next; the payoff)
+## Slice B — the `IoWorker` (BUILT: `world/62_ioworker.mst`)
+
+Built and proven end to end (`embed::ioworker_multiplexes_a_pipe_read_back_to_
+the_primary`): the primary spawns a dedicated IoWorker VM, `watchRead:onData:`
+a pipe on it, writes bytes from the primary, and the data returns as a message —
+the IoWorker did the kqueue poll + read on ITS thread while the primary only
+slept in its inbox. The load-bearing fact: worker VMs are threads in one
+process, so **file descriptors are shared** — a pipe made in the primary is
+valid in the IoWorker (fds are ints, not oops that would need pickling).
+
+Shape as built (a message-server, not an infinite loop — fits the strictly-
+serial worker model exactly):
+- Worker side: `serve` installs the handler; `handle:` routes
+  `#watchRead`/`#unwatchRead`/`#pump`; `drain:` (pure, unit-testable in one VM)
+  polls once and does a read BOUNDED by the kevent-reported count, returning
+  `{fd. bytes. eof}` tuples; `pump:` wraps it in `Worker reply:`.
+- Primary side: `IoWorker spawn`; `watchRead:onData:` registers a `[:bytes :eof|]`
+  continuation; `startPumping:` kicks a self-sustaining pump chain (each poll's
+  reply dispatches the batch and re-arms the next — reply-driven, never a spin).
+
+**Cadence caveat (the deferred efficiency piece):** `pump:` uses a bounded
+timeout (a heartbeat), so the IoWorker wakes every interval even when idle and
+new watch requests wait up to one interval. A true infinite-`kevent` sleep woken
+by a self-pipe control fd (below) removes both; bounded polling is correct and
+simple, and is what shipped first.
+
+### (former) Slice B — original notes
 
 A dedicated **I/O worker VM** running a `kevent`-driven event loop, so no other
 VM ever blocks on I/O. Shape:

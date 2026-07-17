@@ -1,0 +1,128 @@
+"62_ioworker.mst — IoWorker: a dedicated I/O worker VM that multiplexes many
+ file descriptors through one kqueue, so no other VM ever blocks on I/O
+ (docs/asyncio_design.md slice B). Pure Smalltalk on world/61 (Posix/Kqueue) +
+ the world/47 Worker channel — ZERO new Rust.
+
+ The property this delivers: the primary (and every compute worker) runs free
+ while the IoWorker sleeps in kevent on their behalf; readiness comes back as
+ ordinary worker messages. Errors are VALUES in messages, and a wedged IoWorker
+ is a throwaway the supervisor respawns — I/O never raises, never blocks a peer.
+ That is the fail-fast, let-it-crash story applied to I/O.
+
+ KEY FACT that makes it work: worker VMs are threads in ONE process, so file
+ descriptors are shared across VMs. A pipe/socket opened anywhere is valid in
+ the IoWorker — no fd needs to 'cross' a heap boundary (fds are ints, not oops).
+
+ Two faces, one class (class vars/methods run in the IoWorker VM; instance
+ handle runs in the requester):
+   worker side  — `serve` installs the message handler; `handle:`/`pump:` own
+                  the kqueue and do bounded reads.
+   primary side — `IoWorker spawn` boots one; `watchRead:onData:` registers a
+                  continuation; `startPumping:`/`stopPumping` drive the loop.
+
+ Cadence: `pump:` polls with a bounded timeout (a heartbeat), so the IoWorker
+ stays responsive to new watch requests between polls. A true infinite-kevent
+ sleep woken by a self-pipe control fd is the later efficiency refinement
+ (docs/asyncio_design.md 'open questions'); bounded polling is correct and
+ simple first."
+
+Object subclass: IoWorker [
+    | worker readHandlers pumping |
+    <classVars: Kq Buf>
+
+    "── worker side: the server that runs INSIDE the spawned IoWorker VM ──
+     `bootSource` is the init doit `Worker spawn:` runs once there."
+    IoWorker class >> bootSource [ ^'IoWorker serve' ]
+    IoWorker class >> serve [
+        Kq := Kqueue new.
+        Buf := NativeBuffer page.
+        Worker onMessage: [ :m | IoWorker handle: m payload ]
+    ]
+    "Pure kqueue mutations (no messaging), so `handle:`'s reply is the only
+     worker-only part — the rest is unit-testable in one VM."
+    IoWorker class >> watchReadFd: fd [ Kq watchRead: fd ]
+    IoWorker class >> unwatchReadFd: fd [ Kq unwatchRead: fd ]
+
+    IoWorker class >> handle: req [
+        | tag |
+        tag := req at: 1.
+        tag == #watchRead ifTrue: [
+            self watchReadFd: (req at: 2).
+            ^Worker reply: (Array with: #watched with: (req at: 2)) ].
+        tag == #unwatchRead ifTrue: [
+            self unwatchReadFd: (req at: 2).
+            ^Worker reply: (Array with: #unwatched with: (req at: 2)) ].
+        tag == #pump ifTrue: [ ^self pump: (req at: 2) ].
+        Worker reply: (Array with: #err with: #unknownRequest)
+    ]
+
+    "Poll once (bounded) and, for each readable fd, do a read BOUNDED by the
+     kevent-reported count (so it can't block even on a blocking fd); answer a
+     batch of {fd. bytes. eof} tuples. EVFILT_READ = -1; EV_EOF = 32768. Pure
+     (no messaging) so it is unit-testable in one VM; `pump:` wraps it in the
+     reply."
+    IoWorker class >> drain: ms [
+        | events results |
+        events := Kq pollMs: ms.
+        results := OrderedCollection new.
+        events do: [ :e |
+            (e at: 2) = -1 ifTrue: [
+                | fd n bytes eof |
+                fd := e at: 1.
+                n := e at: 3.
+                eof := (e at: 4) >= 32768.
+                bytes := ByteArray new: n.
+                n > 0 ifTrue: [
+                    Posix read: fd into: Buf address count: n.
+                    1 to: n do: [ :i | bytes at: i put: (Buf byteAt: i - 1) ] ].
+                results add: (Array with: fd with: bytes with: eof) ] ].
+        ^results asArray
+    ]
+    IoWorker class >> pump: ms [
+        Worker reply: (Array with: #io with: (self drain: ms))
+    ]
+
+    "── primary side: the handle a requester holds ──"
+    IoWorker class >> spawn [
+        ^self new setWorker: (Worker spawn: self bootSource)
+    ]
+    setWorker: w [ worker := w. readHandlers := Dictionary new. pumping := false. ^self ]
+    worker [ ^worker ]
+
+    "Register a continuation for fd's readable data. `aBlock` is a 2-arg block
+     `[:bytes :eof | ...]`, fired once per pump that reports data on fd."
+    watchRead: fd onData: aBlock [
+        readHandlers at: fd put: aBlock.
+        worker send: (Array with: #watchRead with: fd).
+        ^self
+    ]
+    unwatchRead: fd [
+        "Tombstone the continuation (Dictionary has no removeKey: — the
+         codebase-wide idiom); `deliver:`'s at:ifAbsent: skips a nil."
+        readHandlers at: fd put: nil.
+        worker send: (Array with: #unwatchRead with: fd).
+        ^self
+    ]
+
+    "Dispatch one #io batch to the registered per-fd continuations."
+    deliver: batch [
+        batch do: [ :io |
+            | h |
+            h := readHandlers at: (io at: 1) ifAbsent: [ nil ].
+            h isNil ifFalse: [ h value: (io at: 2) value: (io at: 3) ] ]
+    ]
+
+    "Send one poll; its reply dispatches the data and, while `pumping`, re-arms
+     the next poll — a self-sustaining chain driven by the reply, never a spin
+     (each link only fires when the previous reply lands)."
+    pumpOnce: ms [
+        worker send: (Array with: #pump with: ms)
+              onReply: [ :reply |
+                  self deliver: (reply at: 2).
+                  pumping ifTrue: [ self pumpOnce: ms ] ]
+    ]
+    startPumping: ms [ pumping := true. self pumpOnce: ms. ^self ]
+    stopPumping [ pumping := false. ^self ]
+
+    terminate [ worker terminate. ^self ]
+]
