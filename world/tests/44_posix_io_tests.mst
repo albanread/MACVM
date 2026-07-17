@@ -1,0 +1,124 @@
+"44_posix_io_tests.mst — PosixIoTests: the slice-A gate for POSIX I/O over
+ the FFI (world/61_posix_io.mst, docs/asyncio_design.md). Everything here is
+ headless and network-free — pipes and kqueue only — so it runs in the
+ ordinary it_world gate. The tests prove, in order: signed returns cross the
+ FFI, real bytes cross a real pipe, and kqueue readiness (the foundation the
+ IoWorker event loop stands on) reports exactly the right events, amounts,
+ and EOF."
+
+TestCase subclass: PosixIoTests [
+    runAll [
+        self runTest: #testNegativeReturnComesThrough do: [ self testNegativeReturnComesThrough ].
+        self runTest: #testErrnoReadable do: [ self testErrnoReadable ].
+        self runTest: #testPipeWriteRead do: [ self testPipeWriteRead ].
+        self runTest: #testKqueueReadReadiness do: [ self testKqueueReadReadiness ].
+        self runTest: #testKqueueWriteReadiness do: [ self testKqueueWriteReadiness ].
+        self runTest: #testKqueueEofFlag do: [ self testKqueueEofFlag ].
+    ]
+
+    "pipe() into the buffer head; answers {readFd. writeFd} (two u32s)."
+    pipeOn: buf [
+        | rc |
+        rc := Posix pipeInto: buf address.
+        self assert: rc = 0.
+        ^Array with: (buf u32At: 0) with: (buf u32At: 4)
+    ]
+
+    "close(-1) answers -1: a negative ssize_t crosses the #g unmarshal as a
+     negative SmallInteger, not a giant unsigned — everything downstream
+     (read counts, kevent returns) relies on this."
+    testNegativeReturnComesThrough [
+        self assert: (Posix close: -1) = -1.
+    ]
+
+    "…and the matching errno is readable through __error(): EBADF = 9."
+    testErrnoReadable [
+        Posix close: -1.
+        self assert: Posix errno = 9.
+    ]
+
+    testPipeWriteRead [
+        | buf fds wrote got |
+        buf := NativeBuffer page.
+        fds := self pipeOn: buf.
+        buf byteAt: 512 put: 65.
+        buf byteAt: 513 put: 66.
+        buf byteAt: 514 put: 67.
+        wrote := Posix write: (fds at: 2) from: buf address + 512 count: 3.
+        self assert: wrote = 3.
+        got := Posix read: (fds at: 1) into: buf address + 600 count: 3.
+        self assert: got = 3.
+        self assert: (buf byteAt: 600) = 65.
+        self assert: (buf byteAt: 601) = 66.
+        self assert: (buf byteAt: 602) = 67.
+        Posix close: (fds at: 1). Posix close: (fds at: 2).
+    ]
+
+    "The core readiness contract: nothing ready -> zero events; write 3
+     bytes -> exactly one EVFILT_READ event carrying ident = the fd and
+     data = 3 (the bounded-read amount); drain it -> zero events again."
+    testKqueueReadReadiness [
+        | kq buf fds events e |
+        kq := Kqueue new.
+        buf := kq buffer.
+        fds := self pipeOn: buf.
+        self assert: (kq watchRead: (fds at: 1)) = 0.
+
+        events := kq pollMs: 0.
+        self assert: events size = 0.
+
+        buf byteAt: 512 put: 88.
+        buf byteAt: 513 put: 89.
+        buf byteAt: 514 put: 90.
+        Posix write: (fds at: 2) from: buf address + 512 count: 3.
+
+        events := kq pollMs: 200.
+        self assert: events size = 1.
+        e := events at: 1.
+        self assert: (e at: 1) = (fds at: 1).   "ident = the watched fd"
+        self assert: (e at: 2) = -1.            "EVFILT_READ"
+        self assert: (e at: 3) = 3.             "data = readable byte count"
+
+        "a read bounded by `data` cannot block, even on a blocking fd"
+        self assert: (Posix read: (fds at: 1) into: buf address + 600 count: (e at: 3)) = 3.
+        self assert: (buf byteAt: 600) = 88.
+
+        events := kq pollMs: 0.
+        self assert: events size = 0.
+
+        Posix close: (fds at: 1). Posix close: (fds at: 2). kq close.
+    ]
+
+    "An empty pipe's write end is immediately writable, with data = the
+     buffer space a bounded write may use."
+    testKqueueWriteReadiness [
+        | kq fds events e |
+        kq := Kqueue new.
+        fds := self pipeOn: kq buffer.
+        self assert: (kq watchWrite: (fds at: 2)) = 0.
+        events := kq pollMs: 200.
+        self assert: events size = 1.
+        e := events at: 1.
+        self assert: (e at: 1) = (fds at: 2).
+        self assert: (e at: 2) = -2.            "EVFILT_WRITE"
+        self assert: (e at: 3) > 0.             "writable space"
+        Posix close: (fds at: 1). Posix close: (fds at: 2). kq close.
+    ]
+
+    "Closing the write end surfaces EV_EOF (32768, the u16 top bit — so
+     `flags >= 32768` tests it without needing bitAnd:) on the read watch:
+     how the IoWorker will distinguish 'peer gone' from 'no data yet'."
+    testKqueueEofFlag [
+        | kq fds events e |
+        kq := Kqueue new.
+        fds := self pipeOn: kq buffer.
+        kq watchRead: (fds at: 1).
+        Posix close: (fds at: 2).
+        events := kq pollMs: 200.
+        self assert: events size = 1.
+        e := events at: 1.
+        self assert: (e at: 1) = (fds at: 1).
+        self assert: (e at: 4) >= 32768.        "EV_EOF set"
+        Posix close: (fds at: 1). kq close.
+    ]
+]

@@ -48,4 +48,5 @@ TestRunner run: ReflectionTests.
 TestRunner run: CurtailmentTests.
 TestRunner run: RopeTests.
 TestRunner run: EditorSessionTests.
+TestRunner run: PosixIoTests.
 TestRunner report.

@@ -1,0 +1,193 @@
+"61_posix_io.mst — POSIX I/O through the S20 FFI (docs/asyncio_design.md
+ slice A; roadmap item 3, async I/O). Pure Smalltalk + the existing FFI —
+ zero new Rust.
+
+ The design constraint that shapes everything here: the FFI cannot call
+ VARIADIC functions (Apple arm64 puts variadic args on the stack, the
+ trampoline loads registers — docs/FFI.md §6.2), so fcntl(F_SETFL,
+ O_NONBLOCK) is out of reach. It is also unnecessary: kevent(2) reports
+ readiness WITH AMOUNTS — `data` is the readable byte count (or writable
+ space, or pending-connection count) — so a read/write/accept bounded by
+ what kevent reported never blocks, even on ordinary blocking fds.
+
+ Memory passed to the kernel comes from mmap (the S20 capstone call):
+ NativeBuffer below wraps one anonymous page whose address is a plain
+ SmallInteger for #g args AND an indirect Alien for byte access. Unlike a
+ heap object, its address is GC-stable — safe to hand to a syscall that
+ writes into it.
+
+ Layers:
+   Posix        — raw class-side FFI bindings (fixed-arity libc only)
+   NativeBuffer — one mmap'd page: address + Alien + 16/32-bit accessors
+                  (Alien natively does 1- and 8-byte; wider fields are
+                  composed little-endian) + kevent-struct pack/unpack
+   Kqueue       — watch/unwatch fds, poll events; the readiness engine the
+                  slice-B IoWorker event loop is built on"
+
+Object subclass: Posix [
+    "── raw bindings — every one fixed-arity (no variadic tail) ──"
+    Posix class >> kqueue [
+        <primitive: FFI function: #kqueue ret: #g args: #()>
+    ]
+    "kevent(kq, changelist, nchanges, eventlist, nevents, timeout) — 6 #g
+     args, the same proven arity as the mmap capstone."
+    Posix class >> keventKq: kq changes: cl nChanges: nc events: ev nEvents: ne timeout: ts [
+        <primitive: FFI function: #kevent ret: #g args: #(g g g g g g)>
+    ]
+    Posix class >> pipeInto: fdsAddr [
+        <primitive: FFI function: #pipe ret: #g args: #(g)>
+    ]
+    Posix class >> read: fd into: bufAddr count: n [
+        <primitive: FFI function: #read ret: #g args: #(g g g)>
+    ]
+    Posix class >> write: fd from: bufAddr count: n [
+        <primitive: FFI function: #write ret: #g args: #(g g g)>
+    ]
+    Posix class >> close: fd [
+        <primitive: FFI function: #close ret: #g args: #(g)>
+    ]
+    Posix class >> socketpairDomain: d type: t protocol: p into: svAddr [
+        <primitive: FFI function: #socketpair ret: #g args: #(g g g g)>
+    ]
+    Posix class >> mmapAddr: a length: l prot: pr flags: f fd: fd offset: o [
+        <primitive: FFI function: #mmap ret: #g args: #(g g g g g g)>
+    ]
+    "errno lives behind __error() on macOS — a 0-arg function answering
+     int*. Wrap the pointer as a 4-byte indirect Alien and compose the int."
+    Posix class >> errnoAddress [
+        <primitive: FFI function: #__error ret: #g args: #()>
+    ]
+    Posix class >> errno [
+        | a |
+        a := Alien forAddress: self errnoAddress size: 4.
+        ^(a byteAt: 1) + ((a byteAt: 2) * 256)
+            + ((a byteAt: 3) * 65536) + ((a byteAt: 4) * 16777216)
+    ]
+
+    "── conveniences ──"
+    "One anonymous page: PROT_READ|PROT_WRITE = 3, MAP_PRIVATE|MAP_ANON =
+     4098 (0x1002) — the capstone test's own proven macOS/arm64 values."
+    Posix class >> mmapPage [
+        ^self mmapAddr: 0 length: 4096 prot: 3 flags: 4098 fd: -1 offset: 0
+    ]
+]
+
+Object subclass: NativeBuffer [
+    | addr alien |
+    NativeBuffer class >> page [ ^self basicNew initPage ]
+    initPage [
+        addr := Posix mmapPage.
+        alien := Alien forAddress: addr size: 4096.
+        ^self
+    ]
+    address [ ^addr ]
+    "`off` is 0-based throughout this class (matching C struct offsets);
+     Alien accessors are 1-based, hence the +1s."
+    byteAt: off [ ^alien byteAt: off + 1 ]
+    byteAt: off put: v [ ^alien byteAt: off + 1 put: v ]
+    i64At: off [ ^alien signedLongAt: off + 1 ]
+    i64At: off put: v [ ^alien signedLongAt: off + 1 put: v ]
+    u16At: off put: v [
+        alien byteAt: off + 1 put: v \\ 256.
+        alien byteAt: off + 2 put: v // 256 \\ 256
+    ]
+    u16At: off [ ^(alien byteAt: off + 1) + ((alien byteAt: off + 2) * 256) ]
+    u32At: off [
+        ^(alien byteAt: off + 1) + ((alien byteAt: off + 2) * 256)
+            + ((alien byteAt: off + 3) * 65536) + ((alien byteAt: off + 4) * 16777216)
+    ]
+    u32At: off put: v [
+        alien byteAt: off + 1 put: v \\ 256.
+        alien byteAt: off + 2 put: v // 256 \\ 256.
+        alien byteAt: off + 3 put: v // 65536 \\ 256.
+        alien byteAt: off + 4 put: v // 16777216 \\ 256
+    ]
+    zero: nBytes at: off [
+        1 to: nBytes do: [ :i | alien byteAt: off + i put: 0 ]
+    ]
+
+    "── struct kevent (macOS/arm64, 32 bytes) ──────────────────────────────
+       0  ident   uintptr_t   8    16 data   intptr_t  8
+       8  filter  int16_t     2    24 udata  void*     8
+      10  flags   uint16_t    2
+      12  fflags  uint32_t    4"
+    keventAt: off ident: fd filter: filt flags: fl [
+        | f16 |
+        self zero: 32 at: off.
+        self i64At: off put: fd.
+        "filter is a NEGATIVE i16 (EVFILT_READ = -1, EVFILT_WRITE = -2):
+         two's-complement it into an unsigned 16-bit field."
+        f16 := filt < 0 ifTrue: [ filt + 65536 ] ifFalse: [ filt ].
+        self u16At: off + 8 put: f16.
+        self u16At: off + 10 put: fl
+    ]
+    keventIdentAt: off [ ^self i64At: off ]
+    keventFilterAt: off [
+        | v | v := self u16At: off + 8.
+        ^v >= 32768 ifTrue: [ v - 65536 ] ifFalse: [ v ]
+    ]
+    keventFlagsAt: off [ ^self u16At: off + 10 ]
+    keventDataAt: off [ ^self i64At: off + 16 ]
+
+    "── struct timespec (16 bytes: tv_sec i64, tv_nsec i64) ──"
+    timespecAt: off ms: ms [
+        self i64At: off put: ms // 1000.
+        self i64At: off + 8 put: ms \\ 1000 * 1000000
+    ]
+]
+
+"── Kqueue: the readiness engine ────────────────────────────────────────────
+ One kqueue fd + one page, carved:
+   0..31    the one-slot changelist (register/deregister)
+   64..319  the eventlist (up to 8 events per poll)
+   384..399 the poll timespec
+   512..    scratch (callers may use `buffer` for read/write payloads)
+ EVFILT_READ = -1, EVFILT_WRITE = -2; EV_ADD|EV_ENABLE = 5, EV_DELETE = 2;
+ EV_EOF = 32768 (the u16 top bit, so `flags >= 32768` tests it without
+ needing bitAnd:)."
+Object subclass: Kqueue [
+    | kq buf |
+    Kqueue class >> new [ ^self basicNew init ]
+    init [
+        kq := Posix kqueue.
+        buf := NativeBuffer page.
+        ^self
+    ]
+    fd [ ^kq ]
+    buffer [ ^buf ]
+
+    change: fd filter: filt flags: fl [
+        buf keventAt: 0 ident: fd filter: filt flags: fl.
+        ^Posix keventKq: kq changes: buf address nChanges: 1
+              events: 0 nEvents: 0 timeout: 0
+    ]
+    watchRead: fd [ ^self change: fd filter: -1 flags: 5 ]
+    watchWrite: fd [ ^self change: fd filter: -2 flags: 5 ]
+    unwatchRead: fd [ ^self change: fd filter: -1 flags: 2 ]
+    unwatchWrite: fd [ ^self change: fd filter: -2 flags: 2 ]
+
+    "Poll with a millisecond timeout (0 = return immediately). Answers an
+     Array of per-event Arrays {ident. filter. data. flags} — `data` is the
+     byte count/space/backlog that makes bounded blocking-fd I/O safe."
+    pollMs: ms [
+        | n events |
+        buf timespecAt: 384 ms: ms.
+        n := Posix keventKq: kq changes: 0 nChanges: 0
+                  events: buf address + 64 nEvents: 8
+                  timeout: buf address + 384.
+        n < 0 ifTrue: [ ^Array new: 0 ].
+        events := Array new: n.
+        1 to: n do: [ :i |
+            | off e |
+            off := 64 + (i - 1 * 32).
+            e := Array new: 4.
+            e at: 1 put: (buf keventIdentAt: off).
+            e at: 2 put: (buf keventFilterAt: off).
+            e at: 3 put: (buf keventDataAt: off).
+            e at: 4 put: (buf keventFlagsAt: off).
+            events at: i put: e ].
+        ^events
+    ]
+
+    close [ ^Posix close: kq ]
+]

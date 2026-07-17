@@ -47,4 +47,5 @@ tier1.mst
 41_reflection_tests.mst
 42_curtailment_tests.mst
 43_rope_tests.mst
+44_posix_io_tests.mst
 99_run_all.mst
