@@ -46,6 +46,19 @@ pub use crate::runtime::vm_state::FatalMode;
 /// thread would just hang the harness — calls this with
 /// [`FatalMode::ExitProcess`] AFTER booting (both settings are thread-local,
 /// so this affects every `VmHandle` driven from this thread).
+///
+/// **A VM booted on the process's main thread MUST set `ExitProcess` (CG0).**
+/// `boot` unconditionally arms `ExitThread`, whose terminal is
+/// `pthread_exit` — sound for a background worker thread a supervisor can
+/// respawn, but on the *main* thread a true fatal (heap exhaustion, stack
+/// overflow) would `pthread_exit` the UI thread and leave a headless zombie:
+/// the AppKit run loop's thread gone, the window frozen, the process neither
+/// alive nor dead. This is the post-boot flip the Cocoa GUI's UI worker uses
+/// (`cocoa_gui_design.md` §3 step 4, §5): boot (arms `ExitThread`) then
+/// immediately `set_fatal_mode(FatalMode::ExitProcess)`, so a true fatal
+/// exits the process (a nonzero `std::process::exit`) instead of zombifying
+/// the UI thread. No new boot option is needed — this setter is the
+/// mechanism.
 pub fn set_fatal_mode(mode: FatalMode) {
     crate::runtime::vm_state::set_fatal_mode(mode);
 }
@@ -3710,6 +3723,69 @@ mod tests {
         }
         // Do NOT join `_thread`: a pthread_exited thread can't be joined
         // (JoinHandle::join would panic — see fatal_exit's own doc).
+    }
+
+    /// CG0 Deliverable 2 — the post-boot `ExitProcess` flip that a main-thread
+    /// (UI worker) VM uses. This is the CHILD body: only runs its fatal work
+    /// when re-invoked as a subprocess with the env var set; a normal
+    /// `cargo test` run reaches it with the var UNSET and it is a harmless
+    /// no-op. It boots a VM (which arms `ExitThread`), flips to
+    /// `FatalMode::ExitProcess`, then triggers a genuine fatal (unbounded
+    /// recursion -> `ProcessStack` overflow -> `fatal_exit(70)`). Under
+    /// `ExitProcess` that reaches `std::process::exit(70)` and the WHOLE
+    /// process exits 70; it must never return.
+    #[test]
+    fn cg0_exitprocess_child_body_do_not_run_directly() {
+        if std::env::var("MACVM_CG0_EXITPROCESS_CHILD").is_err() {
+            return; // Normal test run: this is a no-op; the parent drives it.
+        }
+        let mut vm = boot_test_vm(JitMode::Off); // VmHandle::boot arms ExitThread
+        set_fatal_mode(FatalMode::ExitProcess); // the post-boot flip under test
+        vm.eval("Object subclass: MacvmCg0ExitProcessProbe [ go [ ^self go ] ].")
+            .expect("defining the recursive probe class must succeed");
+        // Unbounded recursion -> process stack overflow -> fatal_exit(70).
+        // Under ExitProcess this is std::process::exit(70), never a return.
+        let _ = vm.eval("MacvmCg0ExitProcessProbe new go.");
+        // Reachable ONLY if ExitProcess failed to exit the process. Exit 0 so
+        // the parent's `code == Some(70)` assertion fails loudly.
+        std::process::exit(0);
+    }
+
+    /// CG0 Deliverable 2 — the subprocess harness proving the mechanism. A VM
+    /// booted then set to `FatalMode::ExitProcess` (the pattern a main-thread
+    /// UI worker uses so a true fatal exits the process rather than
+    /// `pthread_exit`ing the UI thread into a zombie) must, on a genuine fatal,
+    /// exit the WHOLE process with the fatal code (70), not `pthread_exit` a
+    /// single thread. Re-invokes this very test binary, filtered to the child
+    /// body above, with the env var set, and asserts the child exited exactly
+    /// 70 — precisely the `std::process::exit(70)` `ExitProcess` produces, and
+    /// distinct from the buggy `ExitThread`-on-a-worker-thread path (a
+    /// libtest-join panic / abort with a different code).
+    #[test]
+    fn set_fatal_mode_exit_process_makes_a_true_fatal_exit_the_whole_process() {
+        use std::process::{Command, Stdio};
+        let exe = std::env::current_exe().expect("current_exe for the subprocess re-invoke");
+        let status = Command::new(exe)
+            // A unique substring filter (NOT `--exact`, which would need the
+            // full `embed::tests::…` path) -> libtest runs only this one test.
+            .arg("cg0_exitprocess_child_body_do_not_run_directly")
+            .arg("--test-threads=1")
+            .env("MACVM_CG0_EXITPROCESS_CHILD", "1")
+            // Silence the child's "process stack overflow" report / dossier.
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("spawning the child test process must succeed");
+        assert!(
+            !status.success(),
+            "under FatalMode::ExitProcess a true fatal must exit the process NONZERO, got {status:?}"
+        );
+        assert_eq!(
+            status.code(),
+            Some(70),
+            "the child must exit via std::process::exit(70) (ExitProcess on the \
+             process-stack-overflow fatal path), not pthread_exit a thread or exit 0; got {status:?}"
+        );
     }
 
     #[test]

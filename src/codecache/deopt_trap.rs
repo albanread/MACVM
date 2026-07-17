@@ -434,11 +434,69 @@ static PROBE_STACK: ProbeStack = ProbeStack(core::cell::UnsafeCell::new([0; PROB
 /// The alternate SIGNAL stack (sigaltstack) — without it `SA_ONSTACK` is
 /// inert (nothing in the tree ever installed one before DBG0) and a SIGSEGV
 /// from native-stack exhaustion could not deliver at all.
+///
+/// **Per-thread, not shared (CG0).** `sigaltstack` is a PER-THREAD kernel
+/// resource: when `SA_ONSTACK` delivers a signal the kernel runs THIS thread's
+/// handler on whatever buffer THIS thread last registered. A single shared
+/// static (the pre-CG0 shape) meant every thread's `sigaltstack` aliased the
+/// same memory, so two threads faulting at once ran their two handlers on the
+/// same buffer and corrupted each other's frames — tolerable while only one VM
+/// ran per process, but the worker fleet and the Cocoa GUI (a primary VM on a
+/// background thread + a UI callback on main) make concurrent faults *likely*.
+/// Each thread now owns its buffer: a boxed array in a `thread_local`,
+/// allocated lazily the first time this thread arms the handler, at a stable
+/// heap address the kernel holds for the thread's life. 256 KiB is far above
+/// macOS arm64's `MINSIGSTKSZ` (32 KiB), leaving ample room for the handler's
+/// own frame.
+///
+/// Lazy `thread_local` init can allocate, which is NOT async-signal-safe — but
+/// [`arm_this_threads_altstack`] runs only from [`arm_foreign_fault_handler`]/
+/// [`install`], i.e. in ordinary context at boot/arm time, strictly before any
+/// fault; the signal handler itself never touches this `thread_local`.
+///
+/// Teardown, stated honestly (CG0 review): the buffer lives for the thread's
+/// active life, but the two thread-exit paths dispose of it differently —
+/// **neither is a safety hazard**, because by the time either runs no VM/JIT
+/// code executes on the thread, so no synchronous fault can originate there.
+///   - `pthread_exit` (the `FatalMode::ExitThread` fail-fast path): TLS
+///     destructors are skipped, so the 256 KiB box is **leaked, not freed** —
+///     a real but bounded cost (one leak per die→respawn of a throwaway
+///     worker, `feedback_recover_clean_or_die`; the Cocoa UI worker's restart
+///     path (CG7) drops its `VmHandle` cleanly and does not take this route).
+///   - a clean thread exit: the TLS destructor DOES free the box, and the
+///     kernel's per-thread `sigaltstack` registration transiently still points
+///     at freed-but-still-mapped memory until the thread is fully torn down —
+///     a benign window (no signal can arrive there; freed heap is not
+///     unmapped), not a live-use hazard.
 const ALT_STACK_BYTES: usize = 256 * 1024;
-struct AltStack(core::cell::UnsafeCell<[u8; ALT_STACK_BYTES]>);
-// SAFETY: handed to the kernel via sigaltstack; the kernel serializes use.
-unsafe impl Sync for AltStack {}
-static ALT_STACK: AltStack = AltStack(core::cell::UnsafeCell::new([0; ALT_STACK_BYTES]));
+thread_local! {
+    static ALT_STACK: core::cell::RefCell<Option<Box<[u8; ALT_STACK_BYTES]>>> =
+        const { core::cell::RefCell::new(None) };
+}
+
+/// Registers THIS thread's own sigaltstack, allocating its buffer on the first
+/// call on this thread (see [`ALT_STACK`]). Ordinary-context only — never call
+/// from inside a signal handler (the lazy `thread_local` init may allocate).
+/// Idempotent: re-arming a thread just points `sigaltstack` at the same buffer.
+fn arm_this_threads_altstack() {
+    let sp = ALT_STACK.with(|cell| {
+        cell.borrow_mut()
+            .get_or_insert_with(|| Box::new([0u8; ALT_STACK_BYTES]))
+            .as_mut_ptr()
+    });
+    // SAFETY: `sp` points at this thread's own live, thread-local-owned buffer
+    // of exactly `ALT_STACK_BYTES`, valid for as long as this thread runs any
+    // code that could fault (see [`ALT_STACK`] for the exit-teardown analysis);
+    // the `stack_t` is fully zeroed then fully initialized.
+    unsafe {
+        let mut alt: libc::stack_t = core::mem::zeroed();
+        alt.ss_sp = sp as *mut core::ffi::c_void;
+        alt.ss_size = ALT_STACK_BYTES;
+        alt.ss_flags = 0;
+        let rc = libc::sigaltstack(&alt, core::ptr::null_mut());
+        assert_eq!(rc, 0, "deopt_trap: sigaltstack failed");
+    }
+}
 
 /// In-handler capture of the whole integer register file (+ fault address
 /// and signal number). Relaxed stores: the reader runs strictly after
@@ -1426,30 +1484,24 @@ pub fn read_pool_oop(nm: &crate::codecache::nmethod::Nmethod, pool_ix: u32) -> O
 /// embedded `VmHandle`s ever ran on two different worker threads in the
 /// same process, each needs its OWN call to register its OWN alt-stack — an
 /// "arm once, process-wide" guard would silently leave the second thread
-/// with none. (Both threads' alt-stacks would still alias the same
-/// `ALT_STACK` buffer — concurrent faults on two simultaneously-embedded
-/// VMs racing on that shared memory is a known, out-of-scope limitation for
-/// now: today's only caller, `embed::VmHandle::boot`, is one VM on one
-/// worker thread.) Redundant calls (a JIT-enabled boot, where `install`
-/// already armed the same two signals on this same thread; or calling
-/// `boot` twice on one thread) are harmless — `sigaltstack`/`sigaction` are
+/// with none. Each thread's alt-stack is now its own per-thread buffer
+/// ([`ALT_STACK`], CG0), so two threads faulting concurrently no longer race
+/// on shared memory — the case the worker fleet and the Cocoa GUI (a primary
+/// VM on a background thread + a UI callback on main) make likely, proven by
+/// `concurrent_foreign_faults_on_two_threads_each_recover_on_their_own_altstack`.
+/// Redundant calls (a JIT-enabled boot, where `install` already armed the
+/// same two signals on this same thread; or calling `boot` twice on one
+/// thread) are harmless — `arm_this_threads_altstack`/`sigaction` are
 /// themselves idempotent, and both paths install the exact same
 /// `sig_fault_handler` function pointer.
 pub(crate) fn arm_foreign_fault_handler() {
-    // SAFETY: a fully zeroed, fully initialized `sigaction`/`stack_t`,
-    // matching the SA_SIGINFO 3-arg ABI `sig_fault_handler` expects — the
-    // same shape `install`'s own arm block uses below.
+    // Register THIS thread's own sigaltstack (per-thread — CG0). Ordinary
+    // context here, so the lazy thread-local buffer alloc is safe.
+    arm_this_threads_altstack();
+    // SAFETY: a fully zeroed, fully initialized `sigaction`, matching the
+    // SA_SIGINFO 3-arg ABI `sig_fault_handler` expects — the same shape
+    // `install`'s own arm block uses below.
     unsafe {
-        let mut alt: libc::stack_t = core::mem::zeroed();
-        alt.ss_sp = ALT_STACK.0.get() as *mut core::ffi::c_void;
-        alt.ss_size = ALT_STACK_BYTES;
-        alt.ss_flags = 0;
-        let rc = libc::sigaltstack(&alt, core::ptr::null_mut());
-        assert_eq!(
-            rc, 0,
-            "deopt_trap::arm_foreign_fault_handler: sigaltstack failed"
-        );
-
         let mut sf: libc::sigaction = core::mem::zeroed();
         sf.sa_sigaction = sig_fault_handler as *const () as usize;
         sf.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
@@ -1506,22 +1558,23 @@ pub fn install(cache: &mut CodeCache) -> DeoptTrampolines {
     let (lo, hi) = cache.bounds();
     register_with_probe(lo, hi, hu.base as u64, ha.base as u64, hp.base as u64);
 
-    // 3. Arm the handlers on the first install only (process-global,
-    //    idempotent). SA_SIGINFO for the 3-arg form; SA_ONSTACK now actually
-    //    means something — DBG0 installs the sigaltstack below (previously
+    // 3. Register THIS thread's own sigaltstack (per-thread — CG0), on EVERY
+    //    call, before the process-global sigaction arming below. Unlike the
+    //    handler disposition (armed once, `HANDLER_ARMED`), the alt-stack is a
+    //    per-thread kernel resource: a second JIT `VmState` booting on another
+    //    thread needs its own, or its SA_ONSTACK handler has no stack to
+    //    deliver on (the exact "arm once, process-wide leaves the 2nd thread
+    //    with none" trap `arm_foreign_fault_handler`'s doc calls out). SA_ONSTACK
+    //    now actually means something — DBG0 installs the sigaltstack (previously
     //    none existed anywhere, making the flag inert).
+    arm_this_threads_altstack();
+
+    // 4. Arm the handlers on the first install only (process-global,
+    //    idempotent). SA_SIGINFO for the 3-arg form.
     if !HANDLER_ARMED.swap(true, Ordering::AcqRel) {
         // SAFETY: both handlers match the SA_SIGINFO 3-arg ABI; armed exactly
         // once (the swap above) with zeroed, fully-initialized structures.
-        // The sigaltstack buffer is a process-lifetime static.
         unsafe {
-            let mut alt: libc::stack_t = core::mem::zeroed();
-            alt.ss_sp = ALT_STACK.0.get() as *mut core::ffi::c_void;
-            alt.ss_size = ALT_STACK_BYTES;
-            alt.ss_flags = 0;
-            let rc = libc::sigaltstack(&alt, core::ptr::null_mut());
-            assert_eq!(rc, 0, "deopt_trap::install: sigaltstack failed");
-
             let mut sa: libc::sigaction = core::mem::zeroed();
             sa.sa_sigaction = sigtrap_handler as *const () as usize;
             sa.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
@@ -2157,6 +2210,77 @@ mod tests {
             info.expect("expected Some((sig, pc, far)) after a recovered foreign fault");
         assert_eq!(sig, libc::SIGSEGV);
         assert_eq!(far, 8);
+    }
+
+    /// CG0 — the test the per-thread alt-stacks exist for. Two threads each
+    /// arm the foreign-fault handler (each registering its OWN sigaltstack) and
+    /// then fault IN LOCKSTEP, many times, synchronized on a `Barrier` so their
+    /// two signal handlers run as close to simultaneously as the scheduler
+    /// allows. With the pre-CG0 single shared alt-stack, the two handlers ran
+    /// on the same buffer and stomped each other's frames — a corrupted
+    /// `siglongjmp` state, a wrong recorded fault address, or a hard crash.
+    /// With per-thread alt-stacks both recoveries are independent: each thread
+    /// must see ITS OWN fault address across every iteration, and the whole
+    /// test process must survive. Each thread faults at a DISTINCT address so a
+    /// cross-thread stomp would surface as a mismatched `far`.
+    #[test]
+    fn concurrent_foreign_faults_on_two_threads_each_recover_on_their_own_altstack() {
+        use std::sync::{Arc, Barrier};
+
+        const ITERS: usize = 300;
+        let barrier = Arc::new(Barrier::new(2));
+
+        // Each thread arms its own handler+alt-stack, claims its own jmp slot,
+        // and loops: rendezvous, `sigsetjmp`, fault at its own address, recover,
+        // assert it saw its own address. Returns the recovery count.
+        fn faulter(addr: usize, barrier: Arc<Barrier>) -> std::thread::JoinHandle<usize> {
+            std::thread::spawn(move || {
+                arm_foreign_fault_handler();
+                let slot = claim_jmp_slot();
+                let mut recoveries = 0usize;
+                for _ in 0..ITERS {
+                    // Rendezvous so both threads fault together — the race the
+                    // per-thread alt-stacks fix.
+                    barrier.wait();
+                    // SAFETY: `slot` was claimed by this exact thread; the
+                    // `sigsetjmp` is inline at this call site, whose frame stays
+                    // live for the whole recovery window (this loop body).
+                    let rc = unsafe { sigsetjmp(jmp_buf_ptr(slot), 1) };
+                    if rc == 0 {
+                        let bad = addr as *const u8;
+                        // SAFETY: a deliberate read of an always-unmapped low
+                        // address — a genuine SIGSEGV, recovered via siglongjmp.
+                        unsafe { std::ptr::read_volatile(bad) };
+                        panic!("unreachable — the segv must recover via siglongjmp");
+                    }
+                    let (sig, _pc, far) = take_last_crash_info()
+                        .expect("a recovered foreign fault must have crash info");
+                    assert_eq!(sig, libc::SIGSEGV);
+                    assert_eq!(
+                        far, addr as u64,
+                        "each thread must see ITS OWN fault address — a mismatch \
+                         means the two handlers corrupted each other's state"
+                    );
+                    recoveries += 1;
+                }
+                deregister_setjmp();
+                recoveries
+            })
+        }
+
+        // Distinct always-unmapped low addresses (both in the null page).
+        let t1 = faulter(0x8, Arc::clone(&barrier));
+        let t2 = faulter(0x10, Arc::clone(&barrier));
+        assert_eq!(
+            t1.join().expect("thread 1 must complete normally"),
+            ITERS,
+            "thread 1 must recover every fault"
+        );
+        assert_eq!(
+            t2.join().expect("thread 2 must complete normally"),
+            ITERS,
+            "thread 2 must recover every fault"
+        );
     }
 
     /// `read_frame_slot` reads the 8-byte oop at `fp + off` (the one licensed
