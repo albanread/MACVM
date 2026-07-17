@@ -217,23 +217,53 @@ restart-on-death model that "VM on main" would have lost:
   pumping. (This is S21's `sigsetjmp` recovery, relocated to the callback
   door.)
 
-Two conditions stay genuinely fatal, stated plainly:
+A **native fault** on the main thread splits by *where it happened*, and
+PROBE (S21 §1c) already catches the signal either way — the question is
+where the `siglongjmp` lands and how much is intact:
 
-- **A native fault inside AppKit on the main thread** (a SIGSEGV in
-  framework code called by a UI delegate) is caught by PROBE's foreign-fault
-  recovery (S21 §1c) so the *signal* doesn't kill us — but it survives by
-  `siglongjmp`-ing out of Apple's frames mid-mutation. The UI worker runs
-  deliberately thin code precisely to keep this rare; when it happens the
-  honest posture is: report, poison the UI subsystem, relaunch. The
-  **primary's persistent state is unaffected** (different thread, different
-  heap), so a relaunch loses only the window layout, not the environment.
-- **Heap exhaustion on the UI worker** has nowhere to fail over; fatal
-  with a crash dossier. Kept unlikely by the terminal holding only
-  snapshots, not the world.
+- **A fault in the UI worker's *own* code** (a bridge-marshalling bug, a
+  bad `Alien` deref, a VM fault triggered by a delegate doit) leaves AppKit
+  itself untouched — only our callback frame faulted. The **per-callback
+  `sigsetjmp` boundary catches it** (PROBE redirects `SIGSEGV`/`SIGBUS`, not
+  only guest `error:`), unwinds *our* frames back to the event-loop door,
+  and the same run loop keeps pumping. This is the common case and it is
+  fully survivable, because the thing that faulted was ours, not Apple's.
+- **A fault *inside* AppKit** (framework code dereferenced something bad)
+  leaves AppKit's internals suspect — a held window-server lock, a
+  half-mutated structure. Here the honest move is not to limp on the same
+  run loop but to **restart the GUI in place** (the third recovery layer,
+  and the reason the terminal is a *dumb* terminal): PROBE `siglongjmp`s to
+  a **top-level GUI recovery point** wrapping the build-windows + run-loop
+  sequence; the handler then abandons the UI worker VM's heap (leaked, like
+  any `siglongjmp`'d worker — acceptable), **boots a fresh UI worker VM on
+  the same main thread**, rebuilds the windows from source, re-syncs the
+  snapshots from the primary, and re-enters `[NSApp run]`. Because the UI
+  worker holds **no durable state** — the user's actual work lives on the
+  primary, on its own thread, untouched — this rebuild loses nothing but a
+  flicker. It is the exact `feedback_recover_clean_or_die` discipline of a
+  dead worker, with *respawn = rebuild in place on the main thread* rather
+  than on a new thread. `NSApplication` itself (a process singleton, mostly
+  stateless at the top) is kept, not recreated.
 
-The net: the *environment* (primary) is restartable and its state is the
-durable thing; the *interface* (UI worker) is disposable and mostly
-per-event-recoverable. That is the right durability split for an IDE.
+The one thing an in-place restart cannot fix is **process-global** AppKit
+corruption — a broken window-server connection, a global lock left held —
+which makes a fresh run loop re-crash. So the GUI-restart carries a
+**restart-loop backstop**: N rebuilds within T seconds → give up, write the
+dossier, exit. Recoverable in the common case; an honest give-up in the
+pathological one — never a silent infinite re-crash.
+
+**Heap exhaustion on the UI worker** has nowhere to fail over and is fatal
+with a dossier; kept unlikely by the terminal holding only snapshots.
+
+The net is a pleasing symmetry and an honest durability story: **both the
+UI worker and the primary are rebuildable, low-durable-state VMs** — the
+primary respawns from source on a fatal doit, the UI worker rebuilds in
+place on an AppKit fault — and **the durable truth is neither running VM
+but the *source* (image_store + world), plus whatever data the primary
+explicitly persisted.** The running object graph is not preserved across a
+primary restart (consistent with MACVM's no-image, boots-from-source
+stance); the interface is not preserved across a UI restart. What persists
+is the code and the saved data, which is exactly what should.
 
 ## 6. Responsiveness — the UI stays live because the brain is elsewhere
 
@@ -360,7 +390,7 @@ M3 wake (both drains); the image/world and `image_store`; every view
 | | Deliverable | Proof |
 |---|---|---|
 | **G0** | `--cocoa`; parked-main boot handshake: primary on thread 2 spawns the UI worker onto main; one empty `NSWindow`; `[NSApp run]`; ⌘Q quits clean | on-screen (user); headless: the two-VM boot returns `Err` cleanly with no AppKit |
-| **G1** | **C6**: `MacvmDelegate` forwarding + NSInvocation marshalling + the `sigsetjmp` abort boundary; a bad UI delegate doit aborts to the run loop, app survives | headless: a delegate `perform:` returns a value AppKit-side (proxied); a raising delegate unwinds clean, next event still dispatches |
+| **G1** | **C6**: `MacvmDelegate` forwarding + NSInvocation marshalling; the two recovery layers — per-callback `sigsetjmp` abort (a bad delegate doit / a fault in our code) **and** the top-level GUI-rebuild point + restart-loop backstop (an AppKit-internal fault) | headless: a delegate `perform:` returns a value AppKit-side (proxied); a raising delegate unwinds clean, next event dispatches; a forced native fault in a callback rebuilds the UI worker and re-enters the loop; the backstop trips after N/T |
 | **G2** | Workspace + Transcript over the primary: ⌘P ships source → primary evaluates → `7`; `Transcript showCr:` blasts to the native view; **kill the primary mid-doit → it respawns, UI shows "restarting" and recovers** | on-screen; headless: sink receives text; the primary-restart path re-syncs |
 | **G3** | ClassBrowser: `NSOutlineView` data-sourced from a primary-built snapshot (`ClassMirror`/`ClassHierarchyOutliner`); select class → methods → CodeView source | on-screen; headless: the data-source callbacks answer the same rows the `htmlFragment` model does (differential vs. the web model) |
 | **G4** | CodeView editing: syntax colour, Save → ship to primary → recompile + image_store (the web edit path); Find views as `NSTableView`s | on-screen; headless: an edit round-trips through image_store byte-identically to the web path |
@@ -380,11 +410,14 @@ window objects (rebuilt from source; only prefs persist); replacing the
 WKWebView GUI (it stays default).
 
 **Risks, honestly:**
-- **A native framework fault is a main-thread fault (§5)** — session-poison,
-  not a survivable worker death. Mitigated by the UI worker running thin,
-  snapshot-only code, and by the primary's state surviving on its own
-  thread — but it is the highest-stakes failure and the reason the terminal
-  is deliberately dumb.
+- **A native framework fault is a main-thread fault (§5)** — but not
+  automatically fatal: a fault in *our* code unwinds per-event, and a fault
+  *inside* AppKit triggers an in-place GUI rebuild (the dumb terminal holds
+  no durable state, so rebuilding costs a flicker). The residual risk is
+  **process-global AppKit corruption** that survives a rebuild and re-crashes
+  — bounded by the restart-loop backstop (give up after N/T), never an
+  infinite loop. Still the highest-stakes failure class, and the reason the
+  terminal is deliberately thin and snapshot-only.
 - **Snapshot cost / staleness** — blasting whole snapshots (blast-don't-
   patch) is simple and drift-proof but re-sends unchanged data; for a large
   browser this is a real cost. Mitigation: snapshot *per view*, blast only
