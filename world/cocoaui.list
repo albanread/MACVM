@@ -1,0 +1,10 @@
+# world/cocoaui.list — the conditional Cocoa GUI world layer
+# (docs/cocoa_gui_design.md §12.3, sprint_cocoa_gui.md CG1). Loaded ONLY by
+# the UI worker via `frontend::world::load_list(vm, path)` AFTER the base
+# world is up — never from world/world.list, so the CLI, the WKWebView GUI,
+# and the base test suite carry none of it.
+#
+# Same format as world.list: one .mst path per line, relative to THIS file's
+# directory; blank lines and #-comments skipped. Files reserved 63+ (01-62 are
+# taken by the base world; verify with `ls world/`).
+63_cocoaui_stub.mst

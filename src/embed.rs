@@ -1510,7 +1510,8 @@ mod tests {
 
         // 2. an unhandled DNU takes the other fatal route (`dnu_fallback`).
         vm.eval("CurtailProbe reset").expect("reset");
-        vm.eval("CurtailProbe new dnuBoom").expect_err("DNU must error");
+        vm.eval("CurtailProbe new dnuBoom")
+            .expect_err("DNU must error");
         let log = vm.eval("CurtailProbe log printString").expect("read log");
         assert!(
             log.contains("cleanup"),
@@ -1519,7 +1520,8 @@ mod tests {
 
         // 3. an error curtails, so ifCurtailed: fires too.
         vm.eval("CurtailProbe reset").expect("reset");
-        vm.eval("CurtailProbe new curtailed").expect_err("must error");
+        vm.eval("CurtailProbe new curtailed")
+            .expect_err("must error");
         let log = vm.eval("CurtailProbe log printString").expect("read log");
         assert!(
             log.contains("curtailed"),
@@ -2731,6 +2733,132 @@ mod tests {
         );
     }
 
+    // ── Cocoa GUI CG1: externally-hosted worker + run-loop wake + load_list ──
+
+    #[test]
+    fn hosted_worker_registered_on_this_thread_round_trips() {
+        // The CG1 gate (docs/cocoa_gui_design.md §3, sprint_cocoa_gui.md CG1):
+        // register a worker on the CURRENT thread with NO thread::spawn — the
+        // arrangement the UI worker needs (its thread is main, blocked in
+        // [NSApp run], not recv()). The primary `send:`s it, the caller-supplied
+        // wake fires, THIS thread drains the staged envelope + execs
+        // `Worker dispatchPending.`, the handler `reply:`s, and the reply routes
+        // to the primary's `send:onReply:` continuation — the whole no-spawn +
+        // wake path end to end, one process, two logical VMs.
+        let mut primary = boot_worker_primary();
+
+        // The run-loop-poke wake stands in for performSelectorOnMainThread
+        // (CG2); in CG1 it just counts fires so the gate can assert causality
+        // (zero before the send, >=1 after).
+        let wakes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let wakes_hook = wakes.clone();
+
+        // Register on THIS thread — no spawn. `id` shares the spawned id-space;
+        // `inbox` is what this thread drains; `to_primary` lets the hosted VM
+        // reply back to the primary (the `to_primary` a spawned worker_main
+        // gets).
+        let (id, inbox, to_primary) = crate::runtime::workers::register_hosted_worker(
+            &mut primary.vm,
+            Arc::new(move || {
+                wakes_hook.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }),
+        )
+        .expect("registering a hosted worker on a primary must succeed");
+
+        // Boot the hosted worker VM IN PLACE (no spawn), take on the Worker
+        // role replying through `to_primary`, install its echo handler —
+        // exactly what a spawned worker_main does, but driven by this thread.
+        let mut hosted = VmHandle::boot(
+            VmOptions {
+                heap_mib: 64,
+                jit: JitMode::Off,
+                ..Default::default()
+            },
+            Path::new("world"),
+        )
+        .expect("boot the hosted worker VM in place");
+        hosted.install_worker_role(id, to_primary);
+        hosted
+            .exec("Worker onMessage: [:m | Worker reply: m payload * 2].")
+            .expect("install the hosted worker's echo handler");
+
+        // The primary needs a Worker handle for this externally-registered id
+        // (no `spawn:` returned one) — build one over the id, the same
+        // `self new setId:` spawn: uses.
+        primary
+            .exec(&format!("WkTest w1: (Worker new setId: {id})."))
+            .expect("wrap the hosted worker id in a Worker handle");
+
+        // No wake yet, no drain yet.
+        assert_eq!(wakes.load(std::sync::atomic::Ordering::Relaxed), 0);
+
+        // The primary `send:`s the hosted worker — this is the wake trigger.
+        primary
+            .exec("WkTest w1 send: 21 onReply: [:r | WkTest bump: r = 42].")
+            .expect("send a correlated request to the hosted worker");
+
+        // The send fired the wake: a parked host would now know to drain.
+        assert!(
+            wakes.load(std::sync::atomic::Ordering::Relaxed) >= 1,
+            "the primary's send: must fire the hosted worker's run-loop-poke wake"
+        );
+
+        // Drain on THIS thread (what a parked host does once woken): stage each
+        // envelope into the Worker-role VM, exec dispatchPending — that runs
+        // the handler and its reply:.
+        while let Some(env) = inbox.poll() {
+            hosted.stage_pending(env);
+            hosted
+                .exec("Worker dispatchPending.")
+                .expect("dispatch the staged envelope in the hosted worker");
+        }
+
+        // The reply now sits in the primary's own inbox; drain it so the
+        // correlated continuation runs.
+        primary
+            .exec("Worker dispatchInbox.")
+            .expect("drain the primary's inbox for the reply");
+
+        assert_eq!(
+            primary.eval("WkTest count").expect("count").trim(),
+            "1",
+            "the hosted worker's reply must reach the primary's continuation"
+        );
+        assert_eq!(
+            primary.eval("WkTest bad").expect("bad").trim(),
+            "0",
+            "the continuation must see the right echoed value (21*2 = 42)"
+        );
+    }
+
+    #[test]
+    fn load_list_layers_an_extra_world_on_top_of_the_base() {
+        // The CG1 gate for the conditional world layer (docs/cocoa_gui_design.md
+        // §12.3): a class in world/cocoaui.list (63_cocoaui_stub.mst) is ABSENT
+        // from the base world and PRESENT — its method runnable — only after
+        // load_list. Proves the extra layer loads on top of a booted base world
+        // without being in world/world.list.
+        let mut vm = boot_test_vm(JitMode::Off);
+        // Absent from the base world: referencing it is an undeclared-variable
+        // compile error (surfaced as Err, never a process exit).
+        assert!(
+            vm.eval("CocoaUIStub ping").is_err(),
+            "CocoaUIStub must be absent from the base world \
+             (world.list carries none of cocoaui.list)"
+        );
+        // Layer the extra list on top of the already-booted base world.
+        crate::frontend::world::load_list(&mut vm.vm, Path::new("world/cocoaui.list"))
+            .expect("load_list must layer world/cocoaui.list cleanly");
+        // Now the fresh class resolves and its method actually runs.
+        assert_eq!(
+            vm.eval("CocoaUIStub ping")
+                .expect("CocoaUIStub ping must run after load_list")
+                .trim(),
+            "#cocoaUiStubReady",
+            "the class + method from the extra layer must be live after load_list"
+        );
+    }
+
     // ── Cocoa bridge C0 gates (docs/cocoa_bridge_design.md §8) ──────────
 
     /// The wrap/release counters are process-wide and the test harness is
@@ -3658,11 +3786,13 @@ mod tests {
                         vm.vm.stack.sp
                     );
                     assert_eq!(
-                        vm.vm.stack.has_frame(), base_frame,
+                        vm.vm.stack.has_frame(),
+                        base_frame,
                         "jit={jit:?} bomb={bomb:?}: a frame was left active after recovery"
                     );
                     assert_eq!(
-                        vm.vm.handle_arena.len(), base_arena,
+                        vm.vm.handle_arena.len(),
+                        base_arena,
                         "jit={jit:?} round={round} bomb={bomb:?}: handle arena leaked \
                          ({} vs base {base_arena})",
                         vm.vm.handle_arena.len()

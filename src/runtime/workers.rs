@@ -82,13 +82,60 @@ impl InboxSender {
         }
         Ok(())
     }
+
+    /// A sender with no wake hook — a *spawned* worker's inbound link (it
+    /// sleeps in `recv()` inside [`worker_main`], so a wake would be dead
+    /// weight; the coalesced flag is set-once-and-ignored, `send` behaves as a
+    /// bare channel push). The hosted-worker path builds its `InboxSender`
+    /// inline with a real wake instead ([`register_hosted_worker`]).
+    fn detached(tx: Sender<Envelope>) -> InboxSender {
+        InboxSender {
+            tx,
+            wake_pending: Arc::new(AtomicBool::new(false)),
+            wake: Arc::new(Mutex::new(None)),
+        }
+    }
 }
 
-/// The primary's handle onto one spawned worker: the outbound channel and
-/// liveness. The `JoinHandle` is deliberately NOT kept (detached; S21).
+/// The primary's handle onto one leaf VM (a *spawned* worker OR an
+/// *externally-hosted* one — the UI worker, `cocoa_gui_design.md` §3): the
+/// outbound inbox and liveness. The `JoinHandle` is deliberately NOT kept
+/// (detached; S21). The inbound side is an [`InboxSender`], not a bare
+/// `Sender`, so a hosted worker's link can carry a run-loop-poke wake
+/// ([`register_hosted_worker`]); a spawned worker's is [`InboxSender::detached`]
+/// (no hook — it wakes by returning from `recv()`), so `send` for it is the
+/// old bare push plus one uncontended `AtomicBool::swap` — behaviorally
+/// identical (the `None` hook can never suppress the recv wake).
 pub struct WorkerLink {
-    tx: Sender<Envelope>,
+    inbox: InboxSender,
     alive: bool,
+}
+
+/// The receiving side of an *externally-hosted* worker's inbound inbox
+/// ([`register_hosted_worker`]): the channel the host thread drains and the
+/// coalesced-wake flag it must clear at the start of each drain — the §3.1
+/// eventfd discipline, exactly as [`WorkerState::poll`] does for the primary's
+/// own inbox. The host thread owns this; it is NOT the VM (the host also owns
+/// a `Worker`-role [`crate::embed::VmHandle`] it stages drained envelopes into,
+/// then execs `Worker dispatchPending.`). Handed out INSTEAD of a
+/// `thread::spawn`, so the caller — main, blocked in `[NSApp run]`, or a test
+/// thread parked on a condvar — drives its own drain loop.
+pub struct HostedInbox {
+    rx: Receiver<Envelope>,
+    wake_pending: Arc<AtomicBool>,
+}
+
+impl HostedInbox {
+    /// Clear the coalesced-wake flag, then take the next envelope if any — one
+    /// drain step, mirroring [`WorkerState::poll`]. Clearing *first* is the
+    /// no-lost-wakeup rule: a `send` racing in after the clear re-sets the flag
+    /// and re-fires the wake, costing at most one harmless extra drain. The
+    /// host loops `while let Some(env) = inbox.poll()` to drain the burst, then
+    /// parks on its own wake until the hook fires again.
+    pub fn poll(&self) -> Option<Envelope> {
+        self.wake_pending.store(false, Ordering::Release);
+        self.rx.try_recv().ok()
+    }
 }
 
 /// Per-VM worker state, hung off [`VmState::workers`] — `Primary` on the VM
@@ -256,8 +303,60 @@ pub fn spawn(vm: &mut VmState, init: Option<String>) -> Option<u32> {
     let to_primary = inbox_tx.clone();
     // Detached on purpose (S21: never join a VM worker thread).
     std::thread::spawn(move || worker_main(id, &boot, &rx, &to_primary, init.as_deref()));
-    links.push(WorkerLink { tx, alive: true });
+    links.push(WorkerLink {
+        inbox: InboxSender::detached(tx),
+        alive: true,
+    });
     Some(id)
+}
+
+/// Register an *externally-hosted* worker on an EXISTING thread — no
+/// `thread::spawn` (`cocoa_gui_design.md` §3 step 3, §9.1 item 3). The UI
+/// worker's thread is `main`, already alive and blocked in `[NSApp run]`, so
+/// its VM cannot be born inside a spawned `worker_main`. This mints the same
+/// registry entry `spawn` does — a normal-numbered [`WorkerLink`] so `send`
+/// (prim 221), `alive` (225) and `terminate` (224) target it with no
+/// special-casing, and `MAX_WORKERS` counts it — but hands the CALLER the
+/// receiving side + boot payload instead of driving a recv loop itself:
+///
+/// * `id` — the worker id, `links.len()+1`, sharing the spawned id-space (a
+///   hosted and a spawned worker can never collide; both are positions in the
+///   one `links` Vec).
+/// * [`HostedInbox`] — the channel the host drains + the coalesced-wake flag.
+/// * [`InboxSender`] — a clone of the primary's own inbox, for the caller to
+///   pass to `VmHandle::install_worker_role` so the hosted VM's `reply:`
+///   reaches the primary (the `to_primary` a spawned `worker_main` gets).
+///
+/// `wake` is the caller-supplied run-loop poke, fired (coalesced) whenever the
+/// primary `send`s this worker — in the Cocoa GUI a `performSelectorOnMainThread`
+/// (CG2), in the CG1 gate an ordinary condvar/flag poke. Same non-blocking,
+/// no-reentry contract as [`WorkerState::set_wake`]. `None` if this VM is not a
+/// primary (a worker cannot register peers — v1 star topology) or at the cap.
+pub fn register_hosted_worker(
+    vm: &mut VmState,
+    wake: InboxWakeFn,
+) -> Option<(u32, HostedInbox, InboxSender)> {
+    let ws = vm.workers.as_mut()?;
+    let WorkerState::Primary {
+        links, inbox_tx, ..
+    } = &mut **ws
+    else {
+        return None; // only the primary registers peers (v1 star topology)
+    };
+    if links.len() >= MAX_WORKERS {
+        return None;
+    }
+    let (tx, rx) = channel::<Envelope>();
+    let id = links.len() as u32 + 1;
+    let wake_pending = Arc::new(AtomicBool::new(false));
+    let inbox = InboxSender {
+        tx,
+        wake_pending: wake_pending.clone(),
+        wake: Arc::new(Mutex::new(Some(wake))),
+    };
+    let to_primary = inbox_tx.clone();
+    links.push(WorkerLink { inbox, alive: true });
+    Some((id, HostedInbox { rx, wake_pending }, to_primary))
 }
 
 /// The worker thread body: boot (via the registered closure), take on the
@@ -329,7 +428,11 @@ pub fn send(vm: &mut VmState, id: u32, corr: u64, bytes: Vec<u8>) -> bool {
                 corr,
                 bytes,
             };
-            if link.tx.send(env).is_err() {
+            // `InboxSender::send` enqueues then fires the (coalesced) wake —
+            // a no-op for a spawned worker (detached hook), a run-loop poke
+            // for a hosted one. Its `Err` is the same dead-receiver signal the
+            // old bare `tx.send` gave.
+            if link.inbox.send(env).is_err() {
                 // The worker's receiver is gone — it died between messages.
                 // Mark it and deliver the death notice through the inbox.
                 link.alive = false;
@@ -374,7 +477,7 @@ pub fn terminate(vm: &mut VmState, id: u32) -> bool {
     // disconnects (there is no Option-dance: a fresh channel's tx dropped
     // immediately leaves our field valid but the old channel closed).
     let (dead_tx, _) = channel::<Envelope>();
-    link.tx = dead_tx;
+    link.inbox = InboxSender::detached(dead_tx);
     true
 }
 

@@ -1,0 +1,14 @@
+"63_cocoaui_stub.mst — CG1 placeholder for the conditional Cocoa GUI world
+ layer (docs/cocoa_gui_design.md §12.3, sprint_cocoa_gui.md CG1). Loaded ONLY
+ via `frontend::world::load_list(vm, world/cocoaui.list)`, NEVER from
+ world/world.list — so the CLI, the WKWebView GUI, and the base test suite
+ carry none of it. Its whole job in CG1 is to prove the extra layer compiles
+ and runs on top of an already-booted base world (a fresh class that is absent
+ from the base world, present only after load_list). The real CocoaUI /
+ view-wrapper classes arrive in CG2+ (files 64+)."
+Object subclass: CocoaUIStub [
+    "A trivial marker from the conditional layer. `ping` answers a Symbol so a
+     headless gate can prove not just that the class resolves but that a method
+     of it actually runs (an oop from the extra layer, printString-checkable)."
+    CocoaUIStub class >> ping [ ^#cocoaUiStubReady ]
+]

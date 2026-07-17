@@ -80,6 +80,56 @@ pub fn load_world(vm: &mut VmState, dir: &Path) -> Result<bool, CompileError> {
     Ok(true)
 }
 
+/// Loads an EXTRA world list (same format as `world.list`: one `.mst` path
+/// per line, relative to *this list file's own directory*; blank lines and
+/// `#`-comments skipped; duplicate entries within the list are an error) on
+/// top of an already-booted base world — the conditional-layer mechanism
+/// (`docs/cocoa_gui_design.md` §12.3, reserving files 63+). Unlike
+/// [`load_world`] it takes the list path directly (not `dir/world.list`), and
+/// it neither sets `world_loaded` nor sends `Smalltalk startUp`: the base
+/// world already did both, and this only appends more classes/methods in
+/// order. The first load error aborts the whole extra layer.
+///
+/// It is NOT wired into `world/world.list`, so the CLI, the WKWebView GUI, and
+/// the base test suite carry none of it — only a caller that explicitly opts
+/// in (the `macvm-cocoa` UI worker, for `world/cocoaui.list`) loads it.
+pub fn load_list(vm: &mut VmState, path: &Path) -> Result<(), CompileError> {
+    let list_src = std::fs::read_to_string(path).map_err(|e| CompileError {
+        path: Some(path.to_path_buf()),
+        span: Span { line: 1, col: 1 },
+        msg: format!("cannot read '{}': {e}", path.display()),
+        eof: false,
+    })?;
+    // Paths are relative to the list file's own directory (as `world.list`'s
+    // entries are relative to `world/`), so an absolute or a cwd-relative list
+    // path both resolve their entries the same way.
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+
+    let mut seen: HashSet<String> = HashSet::new();
+    for (i, raw_line) in list_src.lines().enumerate() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if !seen.insert(line.to_string()) {
+            return Err(CompileError {
+                path: Some(path.to_path_buf()),
+                span: Span {
+                    line: (i + 1) as u32,
+                    col: 1,
+                },
+                msg: format!("duplicate list entry '{line}'"),
+                eof: false,
+            });
+        }
+        load_file(vm, &dir.join(line))?;
+        if vm.exit_requested {
+            break;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
