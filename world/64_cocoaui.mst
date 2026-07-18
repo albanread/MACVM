@@ -405,7 +405,11 @@ Print it does the same and inserts the result right after it."
             title := pair at: 1. entry := pair at: 2.
             item := ((Cocoa classNamed: 'NSMenuItem') onMain alloc) onMain
                 initWithTitle: title action: 'macvmAction:' keyEquivalent: ''.
-            holder := CocoaToolbarAction on: [ Worker uiDoit: entry onReply: [ :r | ] ].
+            "Launch via the host service (TOP-LEVEL on the primary), NOT a
+             nested uiDoit — the frame loop's GC roots can't survive nesting."
+            holder := CocoaToolbarAction on: [
+                ((Cocoa classNamed: 'MacvmHostService') onMain alloc) onMain init
+                    onMain launchDemo: entry ].
             delegate := MacvmDelegate actionTargetOn: holder.
             item onMain setTarget: delegate.
             demosMenu onMain addItem: item.

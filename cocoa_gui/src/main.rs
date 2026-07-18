@@ -163,10 +163,11 @@ extern "C" fn drain_perform(info: *mut c_void) {
     if let Some(rx) = &st.ctl {
         control::serve(rx, &mut st.ui);
     }
-    // (CG10) Apply any game commands the primary's sink reported to main. The
-    // frame STEP itself runs top-level on the primary's own supervisor loop
-    // (never a nested VM entry — that trips the frame-walk invariant under GC),
-    // so nothing to submit here.
+    // (CG10) Service a stop request (close the game window on main), then apply
+    // any game commands the primary's sink reported. The frame STEP itself runs
+    // top-level on the primary's own supervisor loop (never a nested VM entry —
+    // that trips the frame-walk invariant under GC).
+    game::service_stop_on_main();
     game::drain();
     refresh_metrics(st);
 }

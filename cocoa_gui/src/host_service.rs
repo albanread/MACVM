@@ -337,6 +337,15 @@ extern "C" fn imp_request_ui_rebuild(_this: *mut c_void, _cmd: *mut c_void) -> I
     std::ptr::null_mut()
 }
 
+/// `launchDemo:` — CG10: launch a GamePane demo by its entry doit (e.g.
+/// `'MandelZoom launch'`). Flags it to run TOP-LEVEL on the primary's supervisor
+/// loop, NOT via a nested `uiDoit`/`primEvalDoit` (which corrupts the frame
+/// loop's GC roots). Answers nil.
+extern "C" fn imp_launch_demo(_this: *mut c_void, _cmd: *mut c_void, entry: Id) -> Id {
+    crate::game::request_launch(ns_to_string(entry));
+    std::ptr::null_mut()
+}
+
 type AllocPair = unsafe extern "C" fn(Id, *const c_char, usize) -> Id;
 type RegisterPair = unsafe extern "C" fn(Id);
 type AddMethod = unsafe extern "C" fn(Id, Sel, *const c_void, *const c_char) -> u8;
@@ -357,8 +366,9 @@ pub fn register() {
     type Imp0 = extern "C" fn(*mut c_void, *mut c_void) -> Id;
     type Imp1 = extern "C" fn(*mut c_void, *mut c_void, Id) -> Id;
     type Imp3 = extern "C" fn(*mut c_void, *mut c_void, Id, Id, Id) -> Id;
-    let methods: [(&str, *const c_void, &str); 13] = [
+    let methods: [(&str, *const c_void, &str); 14] = [
         ("requestUiRebuild", imp_request_ui_rebuild as Imp0 as *const c_void, "@@:"),
+        ("launchDemo:", imp_launch_demo as Imp1 as *const c_void, "@@:@"),
         ("colorizeStorage:", imp_colorize_storage as Imp1 as *const c_void, "@@:@"),
         ("implementorsOf:", imp_implementors_of as Imp1 as *const c_void, "@@:@"),
         ("sendersOf:", imp_senders_of as Imp1 as *const c_void, "@@:@"),

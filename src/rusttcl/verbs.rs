@@ -462,6 +462,12 @@ fn verb_gui(_vm: &mut Vm<'_>, args: &[Value]) -> TclResult<Value> {
         }
         "ping" => gui_request(ctx, "ping").map(Value::new),
         "rebuild" => gui_request(ctx, "rebuild").map(Value::new),
+        "game" => {
+            let entry = arg.ok_or_else(|| TclError::runtime("usage: gui game <entry doit>"))?;
+            gui_request(ctx, &format!("game {entry}")).map(Value::new)
+        }
+        "stopgame" => gui_request(ctx, "stopgame").map(Value::new),
+        "gameclose" => gui_request(ctx, "gameclose").map(Value::new),
         "eval" => {
             let src = arg.ok_or_else(|| TclError::runtime("usage: gui eval <smalltalk>"))?;
             gui_request(ctx, &format!("eval {src}")).map(Value::new)
@@ -483,7 +489,7 @@ fn verb_gui(_vm: &mut Vm<'_>, args: &[Value]) -> TclResult<Value> {
             gui_request(ctx, &format!("sleep {ms}")).map(Value::new)
         }
         other => Err(TclError::runtime(format!(
-            "gui: unknown subcommand '{other}' (connect/ping/rebuild/eval/doit/view/snap/sleep)"
+            "gui: unknown subcommand '{other}' (connect/ping/rebuild/game/stopgame/gameclose/eval/doit/view/snap/sleep)"
         ))),
     }
 }

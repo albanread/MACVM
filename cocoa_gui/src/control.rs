@@ -147,6 +147,23 @@ pub fn serve(rx: &Receiver<CtlReq>, ui: &mut macvm::embed::VmHandle) {
             crate::rebuild::request();
             crate::objc::wake_main_runloop();
             "OK rebuild requested".to_string()
+        } else if let Some(entry) = req.cmd.strip_prefix("game ") {
+            // CG10: launch a demo top-level on the primary (same path as the
+            // Demos menu), for scripted verification.
+            crate::game::request_launch(entry.to_string());
+            "OK game launched".to_string()
+        } else if req.cmd == "stopgame" {
+            crate::game::request_stop();
+            "OK game stopped".to_string()
+        } else if req.cmd == "gameclose" {
+            // CG10: exercise the red close-button path end-to-end — send the game
+            // window a real `performClose:`, which fires our `windowWillClose:`
+            // delegate exactly as a click would. Main-thread (we ARE the drain).
+            if crate::game::press_close_button() {
+                "OK close button".to_string()
+            } else {
+                "ERR no game window".to_string()
+            }
         } else {
             format!("ERR unknown command: {}", req.cmd)
         };

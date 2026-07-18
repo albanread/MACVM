@@ -44,15 +44,30 @@ const KEY_ESCAPE: u16 = 53;
 /// + the existing run-loop wake — the same shape as `ChannelGameSink`.
 static GAME_CMDS: Mutex<VecDeque<GameCommand>> = Mutex::new(VecDeque::new());
 static GAME_ACTIVE: AtomicBool = AtomicBool::new(false);
+/// A game SESSION is open — from the moment a demo is dispatched until its stop
+/// closes the window. Gates pane creation on draw commands: a demo paints its
+/// scene before StartLoop (so we create on the first command), but a stray
+/// Blit/Present from the last frame arriving AFTER a stop must NOT re-create the
+/// window we just closed.
+static SESSION_OPEN: AtomicBool = AtomicBool::new(false);
 /// The timer set "a frame tick is due"; the primary's supervisor loop consumes
 /// it and runs the step at TOP LEVEL (never a nested VM entry — a nested entry
 /// running JIT-compiled compute trips the frame-walk invariant under GC).
 static STEP_DUE: AtomicBool = AtomicBool::new(false);
-/// Escape was seen — request the primary stop the loop.
+/// Escape / close-button — request the primary stop the loop.
 static STOP_DUE: AtomicBool = AtomicBool::new(false);
 /// This tick's held-key bitmask (bit 0=Left…5=B), read on the tick, sent with
 /// the step.
 static GAME_KEY_MASK: AtomicI64 = AtomicI64::new(0);
+/// A demo entry doit to launch, run TOP-LEVEL on the primary's supervisor loop
+/// (never a nested `uiReq`/`primEvalDoit` — that corrupts the interp-regs-mirror
+/// root and the next frame's compile-GC scavenge double-copies). One demo at a
+/// time: launched only once any prior game has fully torn down.
+static PENDING_LAUNCH: Mutex<Option<String>> = Mutex::new(None);
+/// After a host-side stop closed the window, tell the supervisor to run
+/// `GamePane reset` (class-side — clears the demo's step block + keys) so the
+/// old demo stops producing frames and releases its object.
+static RESET_DUE: AtomicBool = AtomicBool::new(false);
 
 /// The primary's `GameSink`: push each command onto the shared queue and wake
 /// main. Runs on the PRIMARY's thread (`Send`); main drains. Installed by the
@@ -103,6 +118,15 @@ fn ensure_pane() {
         let Ok(sprites) = Sprites::new(&win.device) else {
             return;
         };
+        // The close button (red) must stop the demo + not dangle the window:
+        // `setReleasedWhenClosed: false` keeps the NSWindow alive (its raw ptr
+        // stays valid until we drop the pane), and a `windowWillClose:` delegate
+        // routes the close through the SAME top-level stop path as Escape.
+        let window = objc::send0(win.view, objc::sel("window"));
+        if !window.is_null() {
+            objc::send1_bool(window, objc::sel("setReleasedWhenClosed:"), false);
+            objc::send1_id(window, objc::sel("setDelegate:"), game_window_delegate());
+        }
         *cell.borrow_mut() = Some(NativeGame {
             win,
             pane,
@@ -135,15 +159,22 @@ fn start_frame_timer() {
 /// Close the game window + drop its GPU resources (main thread). Stops the
 /// timer first, orders the window out.
 fn close_window() {
+    // Close the SESSION first: a Blit/Present from the last in-flight frame may
+    // still be queued behind this stop, and the drain must NOT re-create the
+    // window we're about to close (the "window reopens after stop" bug).
+    SESSION_OPEN.store(false, Ordering::Release);
     GAME.with(|cell| {
         if let Some(g) = cell.borrow_mut().take() {
             objc::send0(g.timer, objc::sel("invalidate"));
-            objc::send1_id(g.win.view, objc::sel("removeFromSuperview"), objc::NIL);
-            // The GameWindow's own `window` field is private; ordering it out via
-            // the view's window keeps it from lingering after the pane drops.
+            // Read the window via the view FIRST (removeFromSuperview would nil
+            // view.window), detach the delegate so `close` can't re-fire our
+            // windowWillClose:, then close it — releasedWhenClosed:false keeps
+            // the object alive for the raw ptrs until this scope drops it.
             let w = objc::send0(g.win.view, objc::sel("window"));
             if !w.is_null() {
+                objc::send1_id(w, objc::sel("setDelegate:"), objc::NIL);
                 objc::send1_id(w, objc::sel("orderOut:"), objc::NIL);
+                objc::send1_id(w, objc::sel("close"), objc::NIL);
             }
         }
     });
@@ -215,6 +246,7 @@ pub fn drain() {
     for cmd in &cmds {
         match cmd {
             GameCommand::StartLoop => {
+                SESSION_OPEN.store(true, Ordering::Release);
                 ensure_pane();
                 start_frame_timer();
                 GAME_ACTIVE.store(true, Ordering::Release);
@@ -223,9 +255,13 @@ pub fn drain() {
             GameCommand::PlaySound { preset } => audio::play_sound(*preset),
             GameCommand::PlayTune { abc } => audio::play_tune(abc),
             // Every draw/palette/present command: create the pane on the FIRST
-            // one (a demo paints its opening scene before StartLoop), then apply.
+            // one of a session (a demo paints its opening scene before StartLoop).
+            // Only while a session is open — a stray frame arriving AFTER a stop
+            // must not resurrect the window (SESSION_OPEN gates the create).
             _ => {
-                ensure_pane();
+                if SESSION_OPEN.load(Ordering::Acquire) {
+                    ensure_pane();
+                }
                 GAME.with(|cell| {
                     if let Some(g) = cell.borrow_mut().as_mut() {
                         apply(g, cmd);
@@ -236,25 +272,84 @@ pub fn drain() {
     }
 }
 
-/// Is a game loop currently running? The primary's supervisor loop uses this to
-/// spin fast (so band replies + frame steps flow at ~60Hz) instead of parking
-/// in its idle metrics beat.
+/// Is a game loop currently running, or a launch pending? The primary's
+/// supervisor loop uses this to spin fast (so band replies + frame steps flow
+/// at ~60Hz) instead of parking in its idle metrics beat.
 pub fn is_active() -> bool {
     GAME_ACTIVE.load(Ordering::Acquire)
+        || RESET_DUE.load(Ordering::Acquire)
+        || PENDING_LAUNCH.lock().map(|g| g.is_some()).unwrap_or(false)
 }
 
-/// Called by the PRIMARY's supervisor loop each iteration: run one frame step at
-/// TOP LEVEL if the timer flagged one due, or stop the loop on Escape. Returns
-/// the Smalltalk to `exec` on the primary (top-level, never nested), or `None`.
-/// This is the crux fix — the step runs as a fresh top-level entry, so its
-/// JIT-compiled compute never sits under an ENTRY_FRAME_SENTINEL the frame walk
-/// mispairs during GC.
-pub fn poll_primary_step() -> Option<String> {
+/// Service a stop request on the MAIN thread (called from `drain_perform`):
+/// close the window + stop the timer HERE (a demo has no host-callable stop —
+/// `GamePane>>stop` is an instance method the class doesn't understand), and
+/// flag the supervisor to `GamePane reset` the demo's step block. This is what
+/// makes Escape / the close button / a re-launch actually dismiss the pane.
+pub fn service_stop_on_main() {
     if STOP_DUE.swap(false, Ordering::AcqRel) {
-        return Some("GamePane stop. GamePane reset.".to_string());
+        close_window(); // GAME_ACTIVE → false, timer off, window hidden
+        RESET_DUE.store(true, Ordering::Release);
     }
+}
+
+/// Launch a demo (from the Demos menu, host-side): run its entry doit TOP-LEVEL
+/// on the primary. One at a time — if a game is already running, tear it down
+/// first (the launch fires once it has). Waking the run loop is the caller's.
+pub fn request_launch(entry: String) {
+    if GAME_ACTIVE.load(Ordering::Acquire) {
+        STOP_DUE.store(true, Ordering::Release); // stop the current demo first
+    }
+    if let Ok(mut slot) = PENDING_LAUNCH.lock() {
+        *slot = Some(entry);
+    }
+    objc::wake_main_runloop();
+}
+
+/// Request the running demo stop (Escape, the close button). The supervisor
+/// runs the stop top-level; its StopLoop closes the window.
+pub fn request_stop() {
+    STOP_DUE.store(true, Ordering::Release);
+    objc::wake_main_runloop();
+}
+
+/// Press the game window's red close button for real (scripted verification of
+/// the close-button path): `performClose:` runs AppKit's full close sequence,
+/// firing our `windowWillClose:` delegate exactly as a click would. Main-thread
+/// only (the control drain calls this). Returns false if no window is open.
+pub fn press_close_button() -> bool {
+    GAME.with(|cell| {
+        if let Some(g) = cell.borrow().as_ref() {
+            let w = objc::send0(g.win.view, objc::sel("window"));
+            if !w.is_null() {
+                objc::send1_id(w, objc::sel("performClose:"), objc::NIL);
+                return true;
+            }
+        }
+        false
+    })
+}
+
+/// Called by the PRIMARY's supervisor loop each iteration: the next thing to
+/// `exec` TOP-LEVEL (never nested — a nested entry corrupts the interp-regs
+/// mirror root, crashing the next frame's compile-GC). Priority: stop the
+/// current demo, then launch a pending one once the old has torn down, then a
+/// frame step when the timer says one is due.
+pub fn poll_primary_step() -> Option<String> {
+    // A host-side stop already closed the window; reset the demo's step block
+    // (class-side, valid — unlike `GamePane stop`, which is instance-side).
+    if RESET_DUE.swap(false, Ordering::AcqRel) {
+        return Some("GamePane reset".to_string());
+    }
+    // Launch only when no game is active — i.e. the prior demo was torn down,
+    // so one runs at a time. Opening the session here (before the demo paints
+    // its first scene) lets the drain create the pane on that first command.
     if !GAME_ACTIVE.load(Ordering::Acquire) {
-        return None;
+        let launch = PENDING_LAUNCH.lock().ok().and_then(|mut g| g.take());
+        if launch.is_some() {
+            SESSION_OPEN.store(true, Ordering::Release);
+        }
+        return launch;
     }
     if !STEP_DUE.swap(false, Ordering::AcqRel) {
         return None;
@@ -271,8 +366,7 @@ pub fn poll_primary_step() -> Option<String> {
 extern "C" fn game_tick(_this: objc::Id, _cmd: objc::Sel, _timer: objc::Id) {
     use macgamepane_graphics::input::key_held;
     if key_held(KEY_ESCAPE) {
-        STOP_DUE.store(true, Ordering::Release);
-        objc::wake_main_runloop();
+        request_stop();
         return;
     }
     // Left, Right, Up, Down, Space(A), Z(B) — GamePane class>>keyLeft…keyB order.
@@ -300,6 +394,32 @@ fn game_timer_target() -> objc::Id {
             &[("gameTick:", game_tick as ImpV1 as *const std::ffi::c_void, "v@:@")],
         );
         objc::alloc_init("MacvmGameTimer") as usize
+    }) as objc::Id
+}
+
+/// The game window's `NSWindowDelegate`: its close button (red) routes through
+/// the same top-level stop as Escape, so closing the window stops the demo and
+/// frees the pane for the next one.
+extern "C" fn game_window_will_close(_this: objc::Id, _cmd: objc::Sel, _note: objc::Id) {
+    request_stop();
+}
+
+/// Register a `MacvmGameWindowDelegate` with `windowWillClose:` once; return a
+/// shared instance.
+fn game_window_delegate() -> objc::Id {
+    use std::sync::OnceLock;
+    static DELEGATE: OnceLock<usize> = OnceLock::new();
+    *DELEGATE.get_or_init(|| {
+        type ImpV1 = extern "C" fn(objc::Id, objc::Sel, objc::Id);
+        objc::register_class(
+            "MacvmGameWindowDelegate",
+            &[(
+                "windowWillClose:",
+                game_window_will_close as ImpV1 as *const std::ffi::c_void,
+                "v@:@",
+            )],
+        );
+        objc::alloc_init("MacvmGameWindowDelegate") as usize
     }) as objc::Id
 }
 
