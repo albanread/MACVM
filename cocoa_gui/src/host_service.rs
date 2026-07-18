@@ -59,6 +59,14 @@ fn image_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("world/image.sqlite3"))
 }
 
+/// The world source tree the editor accept also exports to (surgical `.mst`
+/// splice) — `MACVM_WORLD` or `world`, matching the primary's boot convention.
+fn world_dir() -> PathBuf {
+    std::env::var_os("MACVM_WORLD")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("world"))
+}
+
 /// Read an `NSString` argument's UTF-8 contents (empty for nil / non-string).
 fn ns_to_string(ns: Id) -> String {
     if ns.is_null() {
@@ -358,6 +366,107 @@ extern "C" fn imp_launch_demo(_this: *mut c_void, _cmd: *mut c_void, entry: Id) 
     std::ptr::null_mut()
 }
 
+/// `acceptEditorClass:` — the editor's whole-class accept (docs/editor_design.md
+/// M4/M5). Dual-placed here (composing the same `image_store` primitives the web
+/// GUI's `persist_editor_class` uses) so the Cocoa editor persists WITHOUT
+/// touching `gui/vm_host` — reuse without breaking the web GUI. Syntax-gate with
+/// the REAL compiler parser (a red here is a genuine compile error, the same one
+/// the next boot would hit — and there is no live install, per the design), then
+/// write ONLY the diff to the image (a byte-identical method keeps its version —
+/// no history churn, no nmethod invalidation), then splice the world `.mst` tree.
+/// Answers `OK <summary>` / `ERR <why>` for the transcript.
+extern "C" fn imp_accept_editor_class(_this: *mut c_void, _cmd: *mut c_void, text: Id) -> Id {
+    let text = ns_to_string(text);
+    if let Err(e) = macvm::frontend::parser::parse_file(&text) {
+        return objc::nsstring(&format!("ERR not saved — {e}"));
+    }
+    let img = match writer() {
+        Ok(i) => i,
+        Err(e) => return objc::nsstring(&format!("ERR no image database ({e})")),
+    };
+    let db = persist_editor_class(&img, &text);
+    let world = match image_store::export::export_world_dir(&img, &world_dir()) {
+        Ok(s) => format!(
+            "; world +{} file(s), {} updated, {} added",
+            s.files_changed, s.methods_updated, s.methods_added
+        ),
+        Err(e) => format!("; world export failed: {e}"),
+    };
+    objc::nsstring(&format!("OK {db}{world} (takes effect on next launch)"))
+}
+
+/// Persist the editor buffer's class to the image, writing only the DIFF — the
+/// web GUI's `persist_editor_class` logic, over the shared `image_store` API.
+/// Re-parses the (already syntax-checked) buffer with `image_store::mst` purely
+/// to diff against what's stored; unchanged methods are left alone, changed/new
+/// are reopened, vanished ones removed; the shell (superclass + ivars) is set
+/// via `set_class_definition` (the one edit a live redefinition can't do — why
+/// Save goes to the DB, taking effect next boot). Comment/classVars not yet
+/// round-tripped (first-cut scope, same as the web GUI). Returns a one-line
+/// summary.
+fn persist_editor_class(img: &Image, text: &str) -> String {
+    use std::collections::{HashMap, HashSet};
+    let parsed = image_store::mst::parse_mst_source(text);
+    let cls = match parsed.first() {
+        Some(c) => c,
+        None => return "nothing to save (no class definition in the buffer)".to_string(),
+    };
+    let _ = img.create_or_reopen_class(
+        &cls.name,
+        cls.superclass.as_deref(),
+        "",
+        "",
+        &cls.instance_vars,
+    );
+    let _ = img.set_class_definition(&cls.name, cls.superclass.as_deref(), &cls.instance_vars);
+
+    let stored: HashMap<(String, bool), String> = img
+        .all_methods_of(&cls.name)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|m| ((m.selector, m.side == Side::Class), m.source))
+        .collect();
+
+    let (mut changed, mut added) = (0u32, 0u32);
+    for m in &cls.methods {
+        let side = if m.is_class_side { Side::Class } else { Side::Instance };
+        match stored.get(&(m.selector.clone(), m.is_class_side)) {
+            Some(old) if *old == m.source => {}
+            Some(_) => {
+                let _ = img.create_or_reopen_method(&cls.name, side, &m.selector, "", &m.source);
+                changed += 1;
+            }
+            None => {
+                let _ = img.create_or_reopen_method(&cls.name, side, &m.selector, "", &m.source);
+                added += 1;
+            }
+        }
+    }
+
+    let present: HashSet<(String, bool)> = cls
+        .methods
+        .iter()
+        .map(|m| (m.selector.clone(), m.is_class_side))
+        .collect();
+    let mut removed = 0u32;
+    for (sel, is_cls) in stored.keys() {
+        if !present.contains(&(sel.clone(), *is_cls)) {
+            let side = if *is_cls { Side::Class } else { Side::Instance };
+            let _ = img.remove_method(&cls.name, side, sel);
+            removed += 1;
+        }
+    }
+
+    if changed + added + removed == 0 {
+        format!("{} — no changes", cls.name)
+    } else {
+        format!(
+            "saved {} ({changed} changed, {added} added, {removed} removed)",
+            cls.name
+        )
+    }
+}
+
 type AllocPair = unsafe extern "C" fn(Id, *const c_char, usize) -> Id;
 type RegisterPair = unsafe extern "C" fn(Id);
 type AddMethod = unsafe extern "C" fn(Id, Sel, *const c_void, *const c_char) -> u8;
@@ -378,9 +487,10 @@ pub fn register() {
     type Imp0 = extern "C" fn(*mut c_void, *mut c_void) -> Id;
     type Imp1 = extern "C" fn(*mut c_void, *mut c_void, Id) -> Id;
     type Imp3 = extern "C" fn(*mut c_void, *mut c_void, Id, Id, Id) -> Id;
-    let methods: [(&str, *const c_void, &str); 15] = [
+    let methods: [(&str, *const c_void, &str); 16] = [
         ("requestUiRebuild", imp_request_ui_rebuild as Imp0 as *const c_void, "@@:"),
         ("classNames", imp_class_names as Imp0 as *const c_void, "@@:"),
+        ("acceptEditorClass:", imp_accept_editor_class as Imp1 as *const c_void, "@@:@"),
         ("launchDemo:", imp_launch_demo as Imp1 as *const c_void, "@@:@"),
         ("colorizeStorage:", imp_colorize_storage as Imp1 as *const c_void, "@@:@"),
         ("implementorsOf:", imp_implementors_of as Imp1 as *const c_void, "@@:@"),

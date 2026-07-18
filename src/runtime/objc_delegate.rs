@@ -315,34 +315,6 @@ extern "C" fn imp_text_did_change(this: *mut c_void, _cmd: *mut c_void, note: *m
     dispatch(this, "textDidChange:", &[ArgVal::Id(note)], RetShape::Void);
 }
 
-// MacvmEditorTerminal — the editor buffer's NSTextViewDelegate. Its own role,
-// SEPARATE from MacvmTextDelegate, because `shouldChange` is a BOOL callback that
-// fails CLOSED (0 = NO) on a DNU: routed to the plain text delegates (Workspace,
-// browser source pane), it would block every edit those views need. This one is
-// bound only to the editor buffer, whose receiver DOES implement the handler.
-//
-// The seam: AppKit asks BEFORE it applies a user edit; we route the range edit to
-// the editor VMapp and answer NO — the native edit is blocked, and the VMapp
-// blasts the new whole-buffer text back (the display is VMapp-authored, never
-// AppKit-authored: docs/editor_design.md §4, the dumb terminal). The NSRange (16
-// bytes, two NSUInteger) arrives in two integer registers per AAPCS64, so it
-// decomposes into the `loc`/`len` args; the text view itself isn't needed.
-extern "C" fn imp_text_should_change(
-    this: *mut c_void,
-    _cmd: *mut c_void,
-    _tv: *mut c_void,
-    loc: u64,
-    len: u64,
-    repl: *mut c_void,
-) -> u8 {
-    dispatch(
-        this,
-        "editShouldReplaceAt:len:with:",
-        &[ArgVal::Int(loc as i64), ArgVal::Int(len as i64), ArgVal::Id(repl)],
-        RetShape::Bool,
-    ) as u8
-}
-
 // MacvmActionTarget — a menu item / button target/action (Cocoa GUI CG4): a
 // void `-(void)action:(id)sender` the UI worker answers SYNCHRONOUSLY on the
 // main thread. This is the correct mechanism for a UI-worker-LOCAL control (a
@@ -540,11 +512,6 @@ type ImpIdTcr =
     extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void, i64) -> *mut c_void;
 type ImpQ2 = extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void) -> i64;
 type ImpB2 = extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void) -> u8;
-/// `textView:shouldChangeTextInRange:replacementString:` — self, _cmd, textView,
-/// then the NSRange (two NSUInteger in two int registers, AAPCS64) and the
-/// replacement id; returns BOOL.
-type ImpShouldChange =
-    extern "C" fn(*mut c_void, *mut c_void, *mut c_void, u64, u64, *mut c_void) -> u8;
 type ImpIdChild =
     extern "C" fn(*mut c_void, *mut c_void, *mut c_void, i64, *mut c_void) -> *mut c_void;
 type ImpIdByItem =
@@ -552,7 +519,6 @@ type ImpIdByItem =
 
 static WINDOW_DELEGATE_CLASS: OnceLock<Option<usize>> = OnceLock::new();
 static TEXT_DELEGATE_CLASS: OnceLock<Option<usize>> = OnceLock::new();
-static EDITOR_TERMINAL_CLASS: OnceLock<Option<usize>> = OnceLock::new();
 static TABLE_SOURCE_CLASS: OnceLock<Option<usize>> = OnceLock::new();
 static OUTLINE_SOURCE_CLASS: OnceLock<Option<usize>> = OnceLock::new();
 static ACTION_TARGET_CLASS: OnceLock<Option<usize>> = OnceLock::new();
@@ -589,22 +555,6 @@ fn text_delegate_class() -> Option<*mut c_void> {
                     "textDidChange:",
                     imp_ptr!(imp_text_did_change, ImpV1),
                     "v@:@",
-                )],
-            )
-            .map(|c| c as usize)
-        })
-        .map(|p| p as *mut c_void)
-}
-
-fn editor_terminal_class() -> Option<*mut c_void> {
-    EDITOR_TERMINAL_CLASS
-        .get_or_init(|| {
-            register_class(
-                "MacvmEditorTerminal",
-                &[(
-                    "textView:shouldChangeTextInRange:replacementString:",
-                    imp_ptr!(imp_text_should_change, ImpShouldChange),
-                    "B@:@{_NSRange=QQ}@",
                 )],
             )
             .map(|c| c as usize)
@@ -700,7 +650,6 @@ fn role_class(role: &str) -> Option<*mut c_void> {
     match role {
         "window" => window_delegate_class(),
         "text" => text_delegate_class(),
-        "editterm" => editor_terminal_class(),
         "table" => table_source_class(),
         "outline" => outline_source_class(),
         "action" => action_target_class(),

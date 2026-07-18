@@ -1,31 +1,27 @@
 "68_cocoaeditor.mst — CocoaEditor: the native class text editor view (the web
  GUI's `texteditor`, as a Cocoa tab). Loaded ONLY via world/cocoaui.list, after
- 66_cocoabrowser.mst (it reuses the browser's `hostService` handle for image
- access) — so the CLI, the WKWebView GUI, and the base tests carry none of it.
+ 66_cocoabrowser.mst (it reuses the browser's `hostService` handle + reply
+ reader for image access).
 
- The picker is an NSComboBox over every class in the image (the native analog
- of the web editor's `<datalist>`: type-ahead complete OR pick from the list),
- whose action loads that class's WHOLE-CLASS `.mst` text — image_store's
- `class_source`, host-served read-only, the same idempotent round-trip text the
- web editor shows (docs/editor_design.md §5).
-
- SLICE STATUS — E1: the tab + picker + read-only source. The buffer is a plain
- read-only NSTextView here. E2 turns it into a dumb terminal onto an editor
- VMapp — a worker VM the PRIMARY spawns (Worker spawn:) to run `EditorSession`
- (the rope buffer), driven over the uiReq relay (docs/editor_design.md M5). The
- model (Rope/TextBuffer/EditorSession, world/60_editor.mst) is shared verbatim
- with the web GUI; only the DRIVER differs, so nothing here touches the web
- GUI's own editor path."
+ ARCHITECTURE (deliberately simple — the DATABASE is the source of truth):
+ pick a class, edit its whole-class `.mst` text NATIVELY in the NSTextView, then
+ Save does exactly the two things saving a class means, the SAME way the browser
+ accept already does them:
+   (a) update the PRIMARY VM   — `Worker uiDoit: text` recompiles the class live
+       (methods are mutable; a shape change is deferred to next boot — no become)
+   (b) update the DATABASE     — `hostService acceptEditorClass: text` writes the
+       diff (only changed methods re-version) + exports the world `.mst`
+ No cross-VM buffer relay: the text is a few KB and the DB round-trips it. Load
+ reads `image_store::class_source` (host); Save writes it back. The shared
+ EditorSession/Rope model (world/60) stays available for other uses; this view
+ does not drive it."
 
 Object subclass: CocoaEditor [
-    <classVars: Container Picker Buffer BufferScroll ActionDelegates LastVmId
-                EditorDelegate>
+    <classVars: Container Picker Buffer BufferScroll ActionDelegates BufferDelegate LastProbe>
 
     CocoaEditor class >> stripHeight [ ^36.0 ]
 
     CocoaEditor class >> register [
-        "Self-registration, resolved by name from `CocoaUI startup` — remove the
-         cocoaui.list line and the shell simply has no Editor tab."
         CocoaUI registerViewNamed: #editor title: 'Editor' icon: 'blankSheet'
                 container: [ self containerView ]
                 onShow: [ self refreshClassNames.
@@ -48,24 +44,27 @@ Object subclass: CocoaEditor [
         Container onMain setAutoresizingMask: CocoaUI maskWidthSizable + CocoaUI maskHeightSizable.
         Container onMain setAutoresizesSubviews: true.
 
-        "── the picker strip (top): an NSComboBox over every class + Load ──"
+        "── the picker strip: an NSComboBox over every class + Load + Save ──"
         Picker := ((Cocoa classNamed: 'NSComboBox') onMain alloc) onMain
-            initWithFrame: (Array with: 6.0 with: h - 30.0 with: w - 118.0 with: 24.0).
+            initWithFrame: (Array with: 6.0 with: h - 30.0 with: w - 232.0 with: 24.0).
         Picker onMain setCompletes: true.
         Picker onMain setNumberOfVisibleItems: 16.
         Picker onMain setPlaceholderString: 'class name, e.g. Mandelbrot'.
         Picker onMain setAutoresizingMask: CocoaUI maskWidthSizable + CocoaUI maskMinYMargin.
-        "The combo's action fires on Enter in the field AND on a dropdown pick."
         self wireAction: Picker to: [ self loadPicked ].
         Container onMain addSubview: Picker.
 
         self stripButton: 'Load'
-            frame: (Array with: w - 106.0 with: h - 31.0 with: 100.0 with: 26.0)
+            frame: (Array with: w - 220.0 with: h - 31.0 with: 104.0 with: 26.0)
             action: [ self loadPicked ].
+        self stripButton: 'Save'
+            frame: (Array with: w - 112.0 with: h - 31.0 with: 104.0 with: 26.0)
+            action: [ self save ].
 
-        "── the buffer (below the strip): scroll-wrapped, NEVER a bare NSTextView
-           (a bare one draws past its frame and bleeds through the next tab —
-           the CG7 'mess'). Read-only in E1. ──"
+        "── the buffer: a NATIVE, editable NSTextView, scroll-wrapped (a bare one
+           draws past its frame and bleeds through the next tab — the CG7 mess).
+           Substitutions off so typed source isn't mangled (the Workspace's
+           discipline). The plain text delegate recolours on every change. ──"
         BufferScroll := ((Cocoa classNamed: 'NSScrollView') onMain alloc) onMain
             initWithFrame: (Array with: 0.0 with: 0.0 with: w with: h - self stripHeight).
         BufferScroll onMain setHasVerticalScroller: true.
@@ -73,10 +72,6 @@ Object subclass: CocoaEditor [
         BufferScroll onMain setAutoresizingMask: CocoaUI maskWidthSizable + CocoaUI maskHeightSizable.
         Buffer := ((Cocoa classNamed: 'NSTextView') onMain alloc) onMain
             initWithFrame: (Array with: 0.0 with: 0.0 with: w with: h - self stripHeight).
-        "Editable, but a DUMB TERMINAL: the editorTerminal delegate intercepts
-         every user edit (shouldChange -> NO) and routes it to the VMapp, which
-         blasts the whole buffer back. Substitutions off so typed source isn't
-         mangled (the Workspace's discipline)."
         Buffer onMain setEditable: true.
         Buffer onMain setAutomaticQuoteSubstitutionEnabled: false.
         Buffer onMain setAutomaticDashSubstitutionEnabled: false.
@@ -86,8 +81,8 @@ Object subclass: CocoaEditor [
         Buffer onMain setHorizontallyResizable: false.
         Buffer onMain setString: self placeholder.
         (Buffer onMain textContainer) ifNotNil: [ :tc | tc onMain setWidthTracksTextView: true. tc release ].
-        EditorDelegate := MacvmDelegate editorTerminalOn: self.
-        Buffer onMain setDelegate: EditorDelegate.
+        BufferDelegate := MacvmDelegate textDelegateOn: self.
+        Buffer onMain setDelegate: BufferDelegate.
         BufferScroll onMain setDocumentView: Buffer.
         Container onMain addSubview: BufferScroll.
 
@@ -96,7 +91,9 @@ Object subclass: CocoaEditor [
 
     CocoaEditor class >> placeholder [
         ^'"Pick a class above (type-ahead or the dropdown), then Load — or press
-Enter in the field — to read its whole-class source here."'
+Enter in the field. Edit the source here and Save: the change compiles into the
+running VM AND is written to the image + world (methods live immediately; a
+shape change takes effect on the next launch)."'
     ]
 
     CocoaEditor class >> stripButton: title frame: rect action: aBlock [
@@ -124,9 +121,6 @@ Enter in the field — to read its whole-class source here."'
 
     "── the picker options: every class in the image (host-served) ──"
     CocoaEditor class >> refreshClassNames [
-        "`readReply:` copies the NSString reply out to a Smalltalk String AND
-         releases its +1 wrapper (the browser's leak discipline) — the host IMPs
-         answer NSStrings, never Smalltalk Strings."
         | reply names |
         Picker isNil ifTrue: [ ^self ].
         reply := CocoaBrowser readReply: (CocoaBrowser hostService onMain classNames).
@@ -135,8 +129,6 @@ Enter in the field — to read its whole-class source here."'
         names do: [ :n | n isEmpty ifFalse: [ Picker onMain addItemWithObjectValue: n ] ].
     ]
     CocoaEditor class >> splitLines: aString [
-        "Split on LF into a collection of non-empty lines (the host joins the
-         class names with newlines, same as the find queries)."
         | lines line lf |
         lines := OrderedCollection new. line := ''. lf := Character value: 10.
         aString do: [ :ch |
@@ -146,73 +138,40 @@ Enter in the field — to read its whole-class source here."'
         ^lines
     ]
 
-    "── load: fetch the class text (host), then OPEN it in the editor VMapp
-       (the primary spawns/seeds a worker VM to run EditorSession); the display
-       is whatever the VMapp blasts back. So the buffer is a terminal onto the
-       VMapp's rope, not a direct view of the image (docs/editor_design.md M5). ──"
+    "── load: read the class's whole-class source from the image (host) ──"
     CocoaEditor class >> loadPicked [
-        | name text |
+        | name src |
         Picker isNil ifTrue: [ ^self ].
         name := Picker sendString: 'stringValue'.
         (name isNil or: [ name isEmpty ]) ifTrue: [ ^self ].
-        "Fetch the whole-class round-trip text (browser's own reader: NSString→
-         String + wrapper release), then hand it to the VMapp to seed EditorSession."
-        text := CocoaBrowser hostClassSource: name.
-        (text isNil or: [ text isEmpty ])
-            ifTrue: [ ^Buffer onMain setString: '"No class named ', name, ' in the image."' ].
-        Worker uiRequest: #editorOpen args: (Array with: text)
-            onReply: [ :render | CocoaEditor paint: render ].
+        src := CocoaBrowser hostClassSource: name.
+        (src isNil or: [ src isEmpty ])
+            ifTrue: [ Buffer onMain setString: '"No class named ', name, ' in the image."' ]
+            ifFalse: [ Buffer onMain setString: src. self recolorize ].
     ]
 
-    "Paint a render blast: '<0-based caret>\n<whole buffer text>' (EditorSession
-     render) — the VMapp sends the WHOLE buffer each change (a dumb terminal,
-     feedback_blast_dont_patch). Split on the FIRST lf: the header caret, then
-     the text verbatim. (E2a leaves the buffer read-only; E2b sets the caret and
-     makes it editable.)"
-    CocoaEditor class >> paint: render [
-        | lf idx caret body |
-        (render isNil or: [ Buffer isNil ]) ifTrue: [ ^self ].
-        lf := Character value: 10.
-        idx := 0.
-        1 to: render size do: [ :i | (idx = 0 and: [ (render at: i) = lf ]) ifTrue: [ idx := i ] ].
-        idx = 0 ifTrue: [ ^Buffer onMain setString: render ].
-        caret := self parseInt: (render copyFrom: 1 to: idx - 1).
-        body := render copyFrom: idx + 1 to: render size.
-        Buffer onMain setString: body.
-        self recolorize.
-        "Place the caret where the VMapp says it is (0-based, empty selection)."
-        Buffer onMain setSelectedRange: (Array with: (caret max: 0) with: 0).
+    "── save: (a) recompile the class into the PRIMARY VM (live), (b) write the
+       image + world — the same two steps, same mechanisms, the browser accept
+       uses. `uiDoit:` runs the whole-class definition as one top item on the
+       primary (methods recompile live; a shape change is deferred to boot). ──"
+    CocoaEditor class >> save [
+        | text |
+        Buffer isNil ifTrue: [ ^self ].
+        text := self bufferText.
+        (text isNil or: [ text isEmpty ]) ifTrue: [ ^self ].
+        "(a) update the primary VM — compile it live."
+        Worker uiDoit: text onReply: [ :r | CocoaEditor notePrimary: r ].
+        "(b) update the database + world (host, diffed)."
+        CocoaUI appendTranscript: 'editor: '
+            , (CocoaBrowser readReply: (CocoaBrowser hostService onMain acceptEditorClass: text)).
     ]
-    CocoaEditor class >> parseInt: aString [
-        "The render header is a small non-negative integer string."
-        | n z d |
-        n := 0. z := $0 asInteger.
-        aString do: [ :ch | d := ch asInteger - z.
-            (d >= 0 and: [ d <= 9 ]) ifTrue: [ n := (n * 10) + d ] ].
-        ^n
+    CocoaEditor class >> notePrimary: r [
+        CocoaUI appendTranscript: 'editor: primary VM <- ' , r.
     ]
 
-    "── the dumb terminal: route a user edit to the VMapp, paint the blast ──"
-    CocoaEditor class >> routeEditAt: loc len: len with: s [
-        "s is a Smalltalk String. Relay a range edit to the editor VMapp; its
-         render (the whole new buffer + caret) blasts back to paint:."
-        Worker uiRequest: #editorEdit args: (Array with: loc with: len with: s)
-            onReply: [ :render | CocoaEditor paint: render ].
-    ]
-    CocoaEditor class >> editShouldReplaceAt: loc len: len with: repl [
-        "The editorTerminal delegate callback: AppKit is about to apply a user
-         edit (replace `len` chars at 0-based `loc` with `repl`). Route it and
-         answer false — the native edit is BLOCKED; the VMapp is the authority.
-         `repl` is an NSString id (nil for a pure deletion) — copy it out first."
-        | s |
-        s := repl isNil ifTrue: [ '' ] ifFalse: [ repl sendString: 'description' ].
-        self routeEditAt: loc len: len with: s.
-        ^false
-    ]
-
+    "── recolour (host-side; fires on load and on every native edit) ──"
+    CocoaEditor class >> textDidChange: aNote [ self recolorize ]
     CocoaEditor class >> recolorize [
-        "Same host-side colorizer the browser's source pane and the Workspace
-         use (attribute-only, so it never disturbs the text or the caret)."
         | ts |
         Buffer isNil ifTrue: [ ^self ].
         ts := Buffer onMain textStorage.
@@ -221,7 +180,7 @@ Enter in the field — to read its whole-class source here."'
         ts release.
     ]
 
-    "── scripting/automation (rusttcl `gui doit`), so I can drive + snapshot ──"
+    "── scripting/automation (rusttcl `gui doit`) so I can drive + snapshot ──"
     CocoaEditor class >> typeClass: aString [
         Picker isNil ifFalse: [ Picker onMain setStringValue: aString ]
     ]
@@ -230,44 +189,39 @@ Enter in the field — to read its whole-class source here."'
         Buffer isNil ifTrue: [ ^'' ].
         ^Buffer sendString: 'string'
     ]
-    "Ask the primary for the editor VMapp's worker id (>= 1 proves a real,
-     separate, primary-spawned VM is running the buffer) and stash it."
-    CocoaEditor class >> queryVmId [
-        Worker uiRequest: #editorVmId args: (Array new)
-            onReply: [ :r | LastVmId := r ].
+    CocoaEditor class >> setBufferText: aString [
+        "Replace the whole buffer (a scripted edit), then recolour."
+        Buffer isNil ifFalse: [ Buffer onMain setString: aString. self recolorize ]
     ]
-    CocoaEditor class >> vmId [ ^LastVmId isNil ifTrue: [ '(none)' ] ifFalse: [ LastVmId ] ]
-    "Simulate a user edit (for scripted verification) — the SAME path the
-     terminal delegate's shouldChange takes, so a test can 'type' without
-     synthetic key events: replace `len` chars at 0-based `loc` with `s`."
-    CocoaEditor class >> simulateEditAt: loc len: len with: s [
-        self routeEditAt: loc len: len with: s.
-    ]
-    CocoaEditor class >> caretOffset [
-        Buffer isNil ifTrue: [ ^-1 ].
-        ^(Buffer onMain selectedRange) at: 1
-    ]
-    CocoaEditor class >> classNameCount [
-        Picker isNil ifTrue: [ ^0 ].
-        ^Picker onMain numberOfItems
+    CocoaEditor class >> appendMethod: aString [
+        "Scripting: insert a method just before the buffer's final ] (a real edit)."
+        | t idx |
+        Buffer isNil ifTrue: [ ^self ].
+        t := self bufferText.
+        idx := t size.
+        [ idx > 0 and: [ (t at: idx) ~= $] ] ] whileTrue: [ idx := idx - 1 ].
+        idx = 0 ifTrue: [ ^self ].
+        self setBufferText: (t copyFrom: 1 to: idx - 1) , aString , (t copyFrom: idx to: t size).
     ]
 
-    CocoaEditor class >> environmentRestarted [
-        "The primary respawned (CG4 §5.1) — its image is unchanged, so just
-         refresh the picker against the fresh primary. (E2's live VMapp handle,
-         if any, is abandoned by the supervisor's abandonPending.)"
-        self refreshClassNames.
+    "Scripting: evaluate an expression on the PRIMARY VM (to confirm a Save's
+     live recompile landed) and stash the result."
+    CocoaEditor class >> probePrimary: expr [
+        Worker uiDoit: expr onReply: [ :r | LastProbe := r ].
     ]
+    CocoaEditor class >> lastProbe [ ^LastProbe isNil ifTrue: [ '(none)' ] ifFalse: [ LastProbe ] ]
+
+    CocoaEditor class >> environmentRestarted [ self refreshClassNames. ]
 
     CocoaEditor class >> teardown [
         ActionDelegates isNil ifFalse: [
             ActionDelegates do: [ :d | d isValid ifTrue: [ d release ] ] ].
-        EditorDelegate isNil ifFalse: [ EditorDelegate isValid ifTrue: [ EditorDelegate release ] ].
+        BufferDelegate isNil ifFalse: [ BufferDelegate isValid ifTrue: [ BufferDelegate release ] ].
         CocoaBrowser releaseView: Buffer.
         CocoaBrowser releaseView: BufferScroll.
         CocoaBrowser releaseView: Picker.
         CocoaBrowser releaseView: Container.
-        ActionDelegates := nil. EditorDelegate := nil. Buffer := nil. BufferScroll := nil.
+        ActionDelegates := nil. BufferDelegate := nil. Buffer := nil. BufferScroll := nil.
         Picker := nil. Container := nil.
     ]
 ]
