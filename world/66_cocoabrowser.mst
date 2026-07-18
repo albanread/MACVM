@@ -43,7 +43,7 @@
 
 Object subclass: CocoaBrowser [
     <classVars: Snapshot Handles HandleList SelectedPath Side EditMode
-                ShellSuper ShellIvars ShellCvars RemoveArmed
+                ShellSuper ShellIvars ShellCvars RemoveArmed PendingJump
                 Container VSplit HSplit ClassPane MiddlePane MethodPane
                 OutlineScroll Outline OCol SegTabs VarsCaption VarsScroll
                 VarsTable VCol AddVarField TableScroll Table TCol
@@ -84,6 +84,26 @@ Object subclass: CocoaBrowser [
             Outline onMain expandItem: (self handleFor: '') ].
         Table isNil ifFalse: [ Table onMain reloadData ].
         VarsTable isNil ifFalse: [ VarsTable onMain reloadData ].
+        "A jump requested before the first snapshot landed (a Find hit on a
+         never-opened browser) executes now the tree exists."
+        PendingJump isNil ifFalse: [
+            | j |
+            j := PendingJump.
+            PendingJump := nil.
+            self performJump: (j at: 1) side: (j at: 2) selector: (j at: 3) ].
+    ]
+
+    "── jump (the Find view's landing path; works before first open too) ──"
+    CocoaBrowser class >> jumpToClass: cls side: sideOrNil selector: selOrNil [
+        Snapshot isNil ifTrue: [
+            PendingJump := Array with: cls with: sideOrNil with: selOrNil.
+            ^self ].
+        self performJump: cls side: sideOrNil selector: selOrNil
+    ]
+    CocoaBrowser class >> performJump: cls side: sideOrNil selector: selOrNil [
+        self selectClassNamed: cls.
+        sideOrNil isNil ifFalse: [ self side: sideOrNil ].
+        selOrNil isNil ifFalse: [ self selectSelectorNamed: selOrNil ].
     ]
     CocoaBrowser class >> environmentRestarted [
         Snapshot isNil ifFalse: [ self requestRefresh ].

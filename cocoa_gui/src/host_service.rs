@@ -244,6 +244,26 @@ extern "C" fn imp_senders_of(_this: *mut c_void, _cmd: *mut c_void, selector: Id
     objc::nsstring(&text)
 }
 
+/// `definitionsOf:` — the web "Find Definition" kind: classes whose NAME
+/// contains the term, case-insensitively (`Image::class_names` filtered —
+/// the same rule the Smalltalk DefinitionsView's `contains:sub:` applies).
+/// One class name per line.
+extern "C" fn imp_definitions_of(_this: *mut c_void, _cmd: *mut c_void, term: Id) -> Id {
+    let term = ns_to_string(term).to_lowercase();
+    let text = Image::open_read_only(&image_path())
+        .ok()
+        .and_then(|img| img.class_names().ok())
+        .map(|names| {
+            names
+                .into_iter()
+                .filter(|n| n.to_lowercase().contains(&term))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default();
+    objc::nsstring(&text)
+}
+
 type AllocPair = unsafe extern "C" fn(Id, *const c_char, usize) -> Id;
 type RegisterPair = unsafe extern "C" fn(Id);
 type AddMethod = unsafe extern "C" fn(Id, Sel, *const c_void, *const c_char) -> u8;
@@ -263,9 +283,10 @@ pub fn register() {
     }
     type Imp1 = extern "C" fn(*mut c_void, *mut c_void, Id) -> Id;
     type Imp3 = extern "C" fn(*mut c_void, *mut c_void, Id, Id, Id) -> Id;
-    let methods: [(&str, *const c_void, &str); 10] = [
+    let methods: [(&str, *const c_void, &str); 11] = [
         ("implementorsOf:", imp_implementors_of as Imp1 as *const c_void, "@@:@"),
         ("sendersOf:", imp_senders_of as Imp1 as *const c_void, "@@:@"),
+        ("definitionsOf:", imp_definitions_of as Imp1 as *const c_void, "@@:@"),
         ("sourceForClass:side:selector:", imp_source_for as Imp3 as *const c_void, "@@:@@@"),
         ("classSourceFor:", imp_class_source_for as Imp1 as *const c_void, "@@:@"),
         ("classShellFor:", imp_class_shell_for as Imp1 as *const c_void, "@@:@"),

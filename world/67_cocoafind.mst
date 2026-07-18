@@ -16,8 +16,9 @@
  lands on the real method with its source showing."
 
 Object subclass: CocoaFind [
-    <classVars: Container SearchField ImplBtn SendBtn ResultsScroll Results
-                RCol ResultsFace ResultsDelegate ActionDelegates Rows Kind>
+    <classVars: Container SearchField ImplBtn SendBtn DefBtn ResultsScroll
+                Results RCol ResultsFace ResultsDelegate ActionDelegates
+                Rows Kind>
 
     CocoaFind class >> stripHeight [ ^34.0 ]
 
@@ -52,6 +53,16 @@ Object subclass: CocoaFind [
         self installRows: (CocoaBrowser readReply:
             (CocoaBrowser hostService onMain sendersOf: term))
     ]
+    CocoaFind class >> findDefinitions [
+        "The web's 'Find Definition' kind: classes whose NAME contains the
+         term (the term is a class name here, not a selector)."
+        | term |
+        term := self searchTerm.
+        term isEmpty ifTrue: [ ^self ].
+        Kind := #definitions.
+        self installRows: (CocoaBrowser readReply:
+            (CocoaBrowser hostService onMain definitionsOf: term))
+    ]
 
     "Parse 'a US b (US c)? lf ...' into Rows = Arrays {class. selector-or-nil. side}."
     CocoaFind class >> installRows: reply [
@@ -72,8 +83,11 @@ Object subclass: CocoaFind [
     CocoaFind class >> parseLine: aLine [
         | parts |
         parts := CocoaBrowser splitShell: aLine.  "same US-field splitter"
-        "implementors lines are Class US side (2 fields -> selector nil);
-         senders lines are Class US selector US side."
+        "definitions lines are a bare class name; implementors lines are
+         Class US side (2 fields -> selector nil); senders lines are
+         Class US selector US side."
+        Kind == #definitions ifTrue: [
+            ^Array with: (parts at: 1) with: nil with: 'instance' ].
         ^((parts at: 3) isEmpty and: [ Kind == #implementors ])
             ifTrue: [ Array with: (parts at: 1) with: nil with: (parts at: 2) ]
             ifFalse: [ Array with: (parts at: 1) with: (parts at: 2) with: (parts at: 3) ]
@@ -99,12 +113,16 @@ Object subclass: CocoaFind [
         (row < 0 or: [ Rows isNil or: [ row >= Rows size ] ]) ifTrue: [ ^self ].
         r := Rows at: row + 1.
         cls := r at: 1.
-        sel := (r at: 2) isNil ifTrue: [ self searchTerm ] ifFalse: [ r at: 2 ].
-        side := (r at: 3) = 'class' ifTrue: [ #class ] ifFalse: [ #instance ].
         CocoaUI switchToView: #browser.
-        CocoaBrowser selectClassNamed: cls.
-        CocoaBrowser side: side.
-        CocoaBrowser selectSelectorNamed: sel.
+        "jumpToClass: works even when the browser has never been opened —
+         it defers until the first snapshot lands. A definitions hit is the
+         CLASS itself; the other kinds continue to the method."
+        Kind == #definitions
+            ifTrue: [ CocoaBrowser jumpToClass: cls side: nil selector: nil ]
+            ifFalse: [
+                sel := (r at: 2) isNil ifTrue: [ self searchTerm ] ifFalse: [ r at: 2 ].
+                side := (r at: 3) = 'class' ifTrue: [ #class ] ifFalse: [ #instance ].
+                CocoaBrowser jumpToClass: cls side: side selector: sel ].
     ]
 
     "── build ──"
@@ -121,18 +139,21 @@ Object subclass: CocoaFind [
         Container onMain setAutoresizesSubviews: true.
 
         SearchField := ((Cocoa classNamed: 'NSTextField') onMain alloc) onMain
-            initWithFrame: (Array with: 6.0 with: h - 28.0 with: w - 260.0 with: 22.0).
-        SearchField onMain setPlaceholderString: 'selector (e.g. add:)'.
+            initWithFrame: (Array with: 6.0 with: h - 28.0 with: w - 384.0 with: 22.0).
+        SearchField onMain setPlaceholderString: 'selector or class name'.
         SearchField onMain setAutoresizingMask: CocoaUI maskWidthSizable + CocoaUI maskMinYMargin.
         self wireAction: SearchField to: [ self findImplementors ].
         Container onMain addSubview: SearchField.
 
         ImplBtn := self stripButton: 'Implementors'
-            frame: (Array with: w - 248.0 with: h - 30.0 with: 118.0 with: 24.0)
+            frame: (Array with: w - 372.0 with: h - 30.0 with: 118.0 with: 24.0)
             action: [ self findImplementors ].
         SendBtn := self stripButton: 'Senders'
-            frame: (Array with: w - 124.0 with: h - 30.0 with: 118.0 with: 24.0)
+            frame: (Array with: w - 248.0 with: h - 30.0 with: 118.0 with: 24.0)
             action: [ self findSenders ].
+        DefBtn := self stripButton: 'Definitions'
+            frame: (Array with: w - 124.0 with: h - 30.0 with: 118.0 with: 24.0)
+            action: [ self findDefinitions ].
 
         ResultsScroll := ((Cocoa classNamed: 'NSScrollView') onMain alloc) onMain
             initWithFrame: (Array with: 0.0 with: 0.0 with: w with: h - self stripHeight).
@@ -197,10 +218,12 @@ Object subclass: CocoaFind [
         CocoaBrowser releaseView: SearchField.
         CocoaBrowser releaseView: ImplBtn.
         CocoaBrowser releaseView: SendBtn.
+        CocoaBrowser releaseView: DefBtn.
         CocoaBrowser releaseView: Container.
         Rows := nil. Kind := nil. ResultsDelegate := nil. ActionDelegates := nil.
         ResultsFace := nil. RCol := nil. Results := nil. ResultsScroll := nil.
-        SearchField := nil. ImplBtn := nil. SendBtn := nil. Container := nil.
+        SearchField := nil. ImplBtn := nil. SendBtn := nil. DefBtn := nil.
+        Container := nil.
     ]
 ]
 
