@@ -264,6 +264,68 @@ extern "C" fn imp_definitions_of(_this: *mut c_void, _cmd: *mut c_void, term: Id
     objc::nsstring(&text)
 }
 
+/// `colorizeStorage:` — apply Smalltalk syntax colour to an `NSTextStorage`
+/// in ONE bridge send: read its string, scan spans ([`crate::colorize`] — the
+/// web highlighter's exact six categories), then attribute-only mutations
+/// (`beginEditing` … `endEditing`). Attributes never move the caret, so this
+/// is safe on every keystroke (the text delegate calls it from
+/// `textDidChange:`). Answers nil (no reply wrapper for the caller to leak).
+extern "C" fn imp_colorize_storage(_this: *mut c_void, _cmd: *mut c_void, storage: Id) -> Id {
+    use crate::colorize::{spans_utf16, Kind};
+    if storage.is_null() {
+        return std::ptr::null_mut();
+    }
+    let ns = objc::send0(storage, objc::sel("string"));
+    let text = ns_to_string(ns);
+    let total = objc::send0_int(ns, objc::sel("length")) as u64;
+    let spans = spans_utf16(&text);
+
+    let name_color = objc::nsstring("NSColor"); // NSForegroundColorAttributeName
+    let name_font = objc::nsstring("NSFont"); // NSFontAttributeName
+    let nscolor = objc::get_class("NSColor");
+    let color_named =
+        |sel_name: &str| -> Id { objc::send0(nscolor, objc::sel(sel_name)) };
+    let base_color = color_named("labelColor");
+    let nsfont = objc::get_class("NSFont");
+    // The pane's own face at its own size; bold via the monospaced system
+    // font at bold weight (0.4 = NSFontWeightBold).
+    let base_font = objc::send1_f64(nsfont, objc::sel("userFixedPitchFontOfSize:"), 12.0);
+    let bold_font = objc::send2_f64(
+        nsfont,
+        objc::sel("monospacedSystemFontOfSize:weight:"),
+        12.0,
+        0.4,
+    );
+
+    objc::send0(storage, objc::sel("beginEditing"));
+    // Reset the whole range to base colour + face (clears stale spans).
+    objc::send_attr(storage, name_color, base_color, 0, total);
+    objc::send_attr(storage, name_font, base_font, 0, total);
+    for (start, len, kind) in spans {
+        if start >= total {
+            continue;
+        }
+        let len = len.min(total - start); // defensive clamp: never out-of-range
+        // The web palette, in appearance-adaptive NSColors: comment gray,
+        // string brown-red, symbol teal, keyword blue bold, pseudo purple,
+        // number bold.
+        let (color_sel, bold) = match kind {
+            Kind::Comment => ("secondaryLabelColor", false),
+            Kind::Str => ("systemBrownColor", false),
+            Kind::Symbol => ("systemTealColor", false),
+            Kind::Keyword => ("systemBlueColor", true),
+            Kind::Pseudo => ("systemPurpleColor", false),
+            Kind::Number => ("labelColor", true),
+        };
+        objc::send_attr(storage, name_color, color_named(color_sel), start, len);
+        if bold {
+            objc::send_attr(storage, name_font, bold_font, start, len);
+        }
+    }
+    objc::send0(storage, objc::sel("endEditing"));
+    std::ptr::null_mut()
+}
+
 type AllocPair = unsafe extern "C" fn(Id, *const c_char, usize) -> Id;
 type RegisterPair = unsafe extern "C" fn(Id);
 type AddMethod = unsafe extern "C" fn(Id, Sel, *const c_void, *const c_char) -> u8;
@@ -283,7 +345,8 @@ pub fn register() {
     }
     type Imp1 = extern "C" fn(*mut c_void, *mut c_void, Id) -> Id;
     type Imp3 = extern "C" fn(*mut c_void, *mut c_void, Id, Id, Id) -> Id;
-    let methods: [(&str, *const c_void, &str); 11] = [
+    let methods: [(&str, *const c_void, &str); 12] = [
+        ("colorizeStorage:", imp_colorize_storage as Imp1 as *const c_void, "@@:@"),
         ("implementorsOf:", imp_implementors_of as Imp1 as *const c_void, "@@:@"),
         ("sendersOf:", imp_senders_of as Imp1 as *const c_void, "@@:@"),
         ("definitionsOf:", imp_definitions_of as Imp1 as *const c_void, "@@:@"),

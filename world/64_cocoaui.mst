@@ -55,7 +55,7 @@ Object subclass: CocoaToolbarAction [
 Object subclass: CocoaUI [
     <classVars: Win Toolbar ContentHost Transcript TranscriptScroll ActTarget
                 TranscriptText Views ActiveView ToolbarDelegates ToolbarButtons
-                MetricLabels MemBarFill MemBarWidth Workspace>
+                MetricLabels MemBarFill MemBarWidth Workspace WorkspaceTextDelegate>
 
     CocoaUI class >> title [ ^'MACVM' ]
 
@@ -293,6 +293,11 @@ Object subclass: CocoaUI [
                 userFixedPitchFontOfSize: 13.0).
             Workspace onMain setString: self placeholderText.
             Workspace onMain setAutoresizingMask: self maskWidthSizable + self maskHeightSizable.
+            "CG8: live syntax colour, same mechanism as the browser's source
+             pane (the delegate fires for programmatic setString: too)."
+            WorkspaceTextDelegate := MacvmDelegate textDelegateOn: self.
+            Workspace onMain setDelegate: WorkspaceTextDelegate.
+            self recolorizeWorkspace.
         ].
         ContentHost onMain addSubview: Workspace.
         Win onMain makeFirstResponder: Workspace.
@@ -407,6 +412,22 @@ Print it does the same and inserts the result right after it."
     "── C6 action-target callbacks (dispatched synchronously on main) ──"
     CocoaUI class >> macvmPrintIt: sender [ ^self printIt ]
     CocoaUI class >> macvmDoIt: sender [ ^self doIt ]
+    CocoaUI class >> textDidChange: aNote [ self recolorizeWorkspace ]
+    CocoaUI class >> recolorizeWorkspace [
+        "The Workspace's recolour (CG8) — the colorizer is host-side,
+         reached via the browser's cached service handle (late-bound: 66
+         loads after this file). Called by the text delegate on keystrokes
+         AND explicitly after programmatic setString: (which posts no
+         textDidChange:)."
+        | ts bc |
+        Workspace isNil ifTrue: [ ^self ].
+        bc := Worker classNamed: #CocoaBrowser.
+        bc isNil ifTrue: [ ^self ].
+        ts := Workspace onMain textStorage.
+        ts isNil ifTrue: [ ^self ].
+        bc hostService onMain colorizeStorage: ts.
+        ts release.
+    ]
 
     CocoaUI class >> evalTargetFor: full loc: loc len: len [
         "PURE (headless-testable — the CG6 gate): the selection-or-everything
@@ -464,6 +485,7 @@ Print it does the same and inserts the result right after it."
         spliced := self splice: result into: self workspaceText at: anInteger.
         Workspace onMain setString: (spliced at: 1).
         Workspace onMain setSelectedRange: (Array with: (spliced at: 2) with: 0).
+        self recolorizeWorkspace.
     ]
 
     CocoaUI class >> workspaceText [
@@ -533,6 +555,8 @@ Print it does the same and inserts the result right after it."
             ToolbarDelegates isNil ifFalse: [
                 ToolbarDelegates do: [ :d | d isValid ifTrue: [ d release ] ] ].
             Workspace isNil ifFalse: [ Workspace isValid ifTrue: [ Workspace release ] ].
+            WorkspaceTextDelegate isNil ifFalse: [ WorkspaceTextDelegate isValid ifTrue: [ WorkspaceTextDelegate release ] ].
+            WorkspaceTextDelegate := nil.
             Toolbar isNil ifFalse: [ Toolbar isValid ifTrue: [ Toolbar release ] ].
             ContentHost isNil ifFalse: [ ContentHost isValid ifTrue: [ ContentHost release ] ].
             Transcript isNil ifFalse: [ Transcript isValid ifTrue: [ Transcript release ] ].

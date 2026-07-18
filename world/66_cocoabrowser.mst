@@ -48,7 +48,7 @@ Object subclass: CocoaBrowser [
                 OutlineScroll Outline OCol SegTabs VarsCaption VarsScroll
                 VarsTable VCol AddVarField TableScroll Table TCol
                 SourcePane EditBar AcceptBtn CancelBtn ModeLabel SourceScroll
-                SourceView OutlineDelegate VarsFace VarsDelegate SelFace
+                SourceView SourceTextDelegate OutlineDelegate VarsFace VarsDelegate SelFace
                 SelDelegate ActionDelegates NewClassBtn RemoveClassBtn
                 NewMethodBtn RemoveMethodBtn Svc>
 
@@ -388,6 +388,9 @@ Object subclass: CocoaBrowser [
     CocoaBrowser class >> showSource: aString [
         SourceView isNil ifTrue: [ ^self ].
         SourceView onMain setString: aString.
+        "Programmatic setString: does NOT post textDidChange: (only user
+         keystrokes do) — recolour explicitly; the delegate covers typing."
+        self recolorize.
     ]
     CocoaBrowser class >> sourceText [
         SourceView isNil ifTrue: [ ^'' ].
@@ -399,6 +402,7 @@ Object subclass: CocoaBrowser [
         EditMode := aMode.
         SourceView onMain setEditable: true.
         SourceView onMain setString: aTemplate.
+        self recolorize.
         ModeLabel onMain setStringValue: aLabel.
         EditBar onMain setHidden: false.
         CocoaUI window onMain makeFirstResponder: SourceView.
@@ -783,8 +787,29 @@ Object subclass: CocoaBrowser [
         tc isNil ifFalse: [
             tc onMain setWidthTracksTextView: true.
             tc release ].
+        "CG8 syntax colour: a text delegate recolours on EVERY text change —
+         including programmatic setString: (which runs didChangeText), so
+         every showSource: display AND every keystroke while editing gets the
+         host-side colorizer (one bridge send; attribute-only mutations, so
+         the caret never moves)."
+        SourceTextDelegate := MacvmDelegate textDelegateOn: self.
+        SourceView onMain setDelegate: SourceTextDelegate.
         SourceScroll onMain setDocumentView: SourceView.
         SourcePane onMain addSubview: SourceScroll.
+    ]
+
+    CocoaBrowser class >> textDidChange: aNote [
+        self recolorize
+    ]
+    CocoaBrowser class >> recolorize [
+        | ts |
+        SourceView isNil ifTrue: [ ^self ].
+        ts := SourceView onMain textStorage.
+        ts isNil ifTrue: [ ^self ].
+        "colorizeStorage: answers nil (no reply wrapper to leak); the
+         textStorage wrapper itself is fresh (+1) — release once used."
+        self hostService onMain colorizeStorage: ts.
+        ts release.
     ]
 
     CocoaBrowser class >> wireAction: aControl to: aBlock [
@@ -843,7 +868,9 @@ Object subclass: CocoaBrowser [
     ]
     CocoaBrowser class >> typeSource: aString [
         "Scripting stand-in for typing into the editable source pane."
-        SourceView isNil ifFalse: [ SourceView onMain setString: aString ]
+        SourceView isNil ifFalse: [
+            SourceView onMain setString: aString.
+            self recolorize ]
     ]
     CocoaBrowser class >> typeVarName: aString [
         AddVarField isNil ifFalse: [ AddVarField onMain setStringValue: aString ]
@@ -856,6 +883,8 @@ Object subclass: CocoaBrowser [
     CocoaBrowser class >> teardown [
         self releaseHandles.
         self exitEditMode.
+        SourceTextDelegate isNil ifFalse: [ SourceTextDelegate isValid ifTrue: [ SourceTextDelegate release ] ].
+        SourceTextDelegate := nil.
         OutlineDelegate isNil ifFalse: [ OutlineDelegate isValid ifTrue: [ OutlineDelegate release ] ].
         VarsDelegate isNil ifFalse: [ VarsDelegate isValid ifTrue: [ VarsDelegate release ] ].
         SelDelegate isNil ifFalse: [ SelDelegate isValid ifTrue: [ SelDelegate release ] ].

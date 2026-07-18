@@ -166,6 +166,33 @@ pub fn send1_bool(recv: Id, s: Sel, a: bool) -> Id {
     f(recv, s, a)
 }
 
+/// `NSUInteger`-returning unary send (`length`).
+pub fn send0_int(recv: Id, s: Sel) -> i64 {
+    let f: extern "C" fn(Id, Sel) -> i64 = unsafe { std::mem::transmute(msg_send_ptr()) };
+    f(recv, s)
+}
+
+/// One `CGFloat` argument (`userFixedPitchFontOfSize:`).
+pub fn send1_f64(recv: Id, s: Sel, a: f64) -> Id {
+    let f: extern "C" fn(Id, Sel, f64) -> Id = unsafe { std::mem::transmute(msg_send_ptr()) };
+    f(recv, s, a)
+}
+
+/// Two `CGFloat` arguments (`monospacedSystemFontOfSize:weight:`).
+pub fn send2_f64(recv: Id, s: Sel, a: f64, b: f64) -> Id {
+    let f: extern "C" fn(Id, Sel, f64, f64) -> Id = unsafe { std::mem::transmute(msg_send_ptr()) };
+    f(recv, s, a, b)
+}
+
+/// `addAttribute:value:range:` — the `NSRange` passes by value as two GPR
+/// words on arm64 (location, length), after the two id arguments.
+pub fn send_attr(storage: Id, name: Id, value: Id, loc: u64, len: u64) {
+    let sel = self::sel("addAttribute:value:range:");
+    let f: extern "C" fn(Id, Sel, Id, Id, u64, u64) =
+        unsafe { std::mem::transmute(msg_send_ptr()) };
+    f(storage, sel, name, value, loc, len)
+}
+
 pub fn send3_id(recv: Id, s: Sel, a: Id, b: Id, c: Id) -> Id {
     let f: extern "C" fn(Id, Sel, Id, Id, Id) -> Id =
         unsafe { std::mem::transmute(msg_send_ptr()) };

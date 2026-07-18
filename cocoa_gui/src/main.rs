@@ -11,6 +11,7 @@
 //! drains the UI worker's inbox on the main thread (§8). ⌘Q quits clean.
 
 mod boot;
+mod colorize;
 mod control;
 mod host_service;
 mod objc;
