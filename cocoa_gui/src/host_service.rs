@@ -210,6 +210,40 @@ extern "C" fn imp_add_var(
     }
 }
 
+/// `implementorsOf:` — `Image::implementors_of` (the web find's own query):
+/// one line per implementor, `Class␟side`, newline-joined.
+extern "C" fn imp_implementors_of(_this: *mut c_void, _cmd: *mut c_void, selector: Id) -> Id {
+    let selector = ns_to_string(selector);
+    let text = Image::open_read_only(&image_path())
+        .ok()
+        .and_then(|img| img.implementors_of(&selector).ok())
+        .map(|rows| {
+            rows.iter()
+                .map(|(cls, side)| format!("{cls}{SEP}{}", if matches!(side, Side::Class) { "class" } else { "instance" }))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default();
+    objc::nsstring(&text)
+}
+
+/// `sendersOf:` — `Image::senders_of` (the `method_sends`-backed query):
+/// one line per sending method, `Class␟selector␟side`.
+extern "C" fn imp_senders_of(_this: *mut c_void, _cmd: *mut c_void, selector: Id) -> Id {
+    let selector = ns_to_string(selector);
+    let text = Image::open_read_only(&image_path())
+        .ok()
+        .and_then(|img| img.senders_of(&selector).ok())
+        .map(|rows| {
+            rows.iter()
+                .map(|(cls, sel, side)| format!("{cls}{SEP}{sel}{SEP}{}", if matches!(side, Side::Class) { "class" } else { "instance" }))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default();
+    objc::nsstring(&text)
+}
+
 type AllocPair = unsafe extern "C" fn(Id, *const c_char, usize) -> Id;
 type RegisterPair = unsafe extern "C" fn(Id);
 type AddMethod = unsafe extern "C" fn(Id, Sel, *const c_void, *const c_char) -> u8;
@@ -229,7 +263,9 @@ pub fn register() {
     }
     type Imp1 = extern "C" fn(*mut c_void, *mut c_void, Id) -> Id;
     type Imp3 = extern "C" fn(*mut c_void, *mut c_void, Id, Id, Id) -> Id;
-    let methods: [(&str, *const c_void, &str); 8] = [
+    let methods: [(&str, *const c_void, &str); 10] = [
+        ("implementorsOf:", imp_implementors_of as Imp1 as *const c_void, "@@:@"),
+        ("sendersOf:", imp_senders_of as Imp1 as *const c_void, "@@:@"),
         ("sourceForClass:side:selector:", imp_source_for as Imp3 as *const c_void, "@@:@@@"),
         ("classSourceFor:", imp_class_source_for as Imp1 as *const c_void, "@@:@"),
         ("classShellFor:", imp_class_shell_for as Imp1 as *const c_void, "@@:@"),

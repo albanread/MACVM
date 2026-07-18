@@ -263,7 +263,23 @@ Object subclass: CocoaBrowser [
         sels := self currentSelectors.
         row < sels size ifFalse: [ ^self ].
         self disarmRemove.
-        self showSelectorSource: (sels at: row + 1)
+        self showSelectorSource: (sels at: row + 1).
+        "CG8: a selected method's source is EDITABLE in place — Accept saves
+         through the same flow as + New Method (create_or_reopen_method is an
+         upsert; editing the pattern line saves under the new selector, the
+         classic browser behavior). Navigation discards unsaved edits, as the
+         web browser's own save path documents."
+        self enterMethodEdit: (sels at: row + 1)
+    ]
+    CocoaBrowser class >> enterMethodEdit: aSelector [
+        | cls |
+        cls := self selectedClassName.
+        cls isNil ifTrue: [ ^self ].
+        EditMode := #editMethod.
+        SourceView onMain setEditable: true.
+        ModeLabel onMain setStringValue:
+            'edit ' , cls , '>>' , aSelector , ' - Accept saves (image + live)'.
+        EditBar onMain setHidden: false.
     ]
 
     "── hierarchy outline callbacks (classes only; nil item -> the root row) ──"
@@ -400,6 +416,7 @@ Object subclass: CocoaBrowser [
     ]
     CocoaBrowser class >> accept [
         EditMode == #newMethod ifTrue: [ ^self acceptMethod ].
+        EditMode == #editMethod ifTrue: [ ^self acceptMethod ].
         EditMode == #newClass ifTrue: [ ^self acceptClass ].
     ]
     CocoaBrowser class >> acceptMethod [
@@ -442,9 +459,15 @@ Object subclass: CocoaBrowser [
         self exitEditMode.
     ]
     CocoaBrowser class >> cancelEdit [
+        | row sels |
         self exitEditMode.
-        SelectedPath isNil
-            ifTrue: [ self showSource: '"select a class on the left"' ]
+        SelectedPath isNil ifTrue: [ ^self showSource: '"select a class on the left"' ].
+        "A cancelled METHOD edit restores the stored source of the still-
+         selected selector; otherwise back to the class definition."
+        row := Table isNil ifTrue: [ -1 ] ifFalse: [ Table onMain selectedRow ].
+        sels := self currentSelectors.
+        (row >= 0 and: [ row < sels size ])
+            ifTrue: [ self showSelectorSource: (sels at: row + 1) ]
             ifFalse: [ self showClassDefinition ].
     ]
 

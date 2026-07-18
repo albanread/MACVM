@@ -467,6 +467,21 @@ lists the same implementors/senders the web model does.
 
 **Design ref:** §7.2, §10 G4.
 
+**As built (first two slices; syntax colour pending).** Editing arrived
+ahead of schedule inside Browser v3's Accept machinery: selecting a method
+makes the source pane editable in place, Accept saves through the SAME
+shared flow as + New Method (`image_store::flows::save_method` — an
+upsert), live-compiles the reopen on the primary over `uiDoit`, and reports
+honestly (TCL-proven: an edited `String>>asLowercase` answered its new body
+on the primary). The find views are ONE native view (`world/67_cocoafind.mst`):
+a selector field + Implementors/Senders buttons over `Image::implementors_of`
+/ `senders_of` (the persisted `method_sends` index — the web find's own
+queries) via two thin host-service adapters; selecting a hit JUMPS to the
+browser (view switch, ancestor-disclosing class select, side flip, selector
+select — the browser's scripting helpers double as the jump path).
+Remaining for CG8: syntax colour (the `NSAttributedString` marshalling
+top-up) and the Definitions find kind.
+
 ---
 
 ## CG9 — UI-worker restart-in-place (design G4, part 2) `M`

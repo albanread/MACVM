@@ -97,9 +97,10 @@ Object subclass: CocoaUI [
 
         self registerViewNamed: #workspace title: 'Workspace' icon: 'texteditor'
              activate: [ self activateWorkspaceView ].
-        "CG7: later-loading views register themselves — resolved by name so
-         this file never depends on files after it in cocoaui.list."
+        "CG7/CG8: later-loading views register themselves — resolved by name
+         so this file never depends on files after it in cocoaui.list."
         (Worker classNamed: #CocoaBrowser) ifNotNil: [ :bc | bc register ].
+        (Worker classNamed: #CocoaFind) ifNotNil: [ :fc | fc register ].
 
         "Forwarded primary transcript lines (§7.4) append to our Transcript view."
         Worker onTranscriptLine: [ :t | CocoaUI appendTranscript: t ].
@@ -527,6 +528,7 @@ Print it does the same and inserts the result right after it."
         Win isNil ifFalse: [
             Win onMain orderOut: nil.
             (Worker classNamed: #CocoaBrowser) ifNotNil: [ :bc | bc teardown ].
+            (Worker classNamed: #CocoaFind) ifNotNil: [ :fc | fc teardown ].
             ActTarget isNil ifFalse: [ ActTarget isValid ifTrue: [ ActTarget release ] ].
             ToolbarDelegates isNil ifFalse: [
                 ToolbarDelegates do: [ :d | d isValid ifTrue: [ d release ] ] ].

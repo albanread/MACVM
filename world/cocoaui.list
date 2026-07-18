@@ -18,3 +18,4 @@
 # it to register its view, so the file is optional — remove the line and the
 # shell simply has no Browser entry.
 66_cocoabrowser.mst
+67_cocoafind.mst
