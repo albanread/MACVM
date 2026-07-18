@@ -433,6 +433,19 @@ extern "C" fn imp_request_outliner_refresh(_this: *mut c_void, _cmd: *mut c_void
     crate::objc::wake_main_runloop();
     std::ptr::null_mut()
 }
+/// `requestFindQuery` — flag a pending Implementors/Senders/Definitions
+/// query (`CocoaFind`'s own `Kind`/search-term class vars already hold
+/// which) and wake the run loop. Serviced by `drain_perform` on its next
+/// pass, never nested in the button-click callback that asked — the query
+/// + `Results reloadData` used to run there directly, which is exactly the
+/// "fails closed" case view_refresh.rs's own doc describes: the query ran
+/// and populated `Rows` correctly, but the table never visually redrew.
+/// Answers nil.
+extern "C" fn imp_request_find_query(_this: *mut c_void, _cmd: *mut c_void) -> Id {
+    crate::view_refresh::request_find_query();
+    crate::objc::wake_main_runloop();
+    std::ptr::null_mut()
+}
 
 /// `showCanvasPixelsOn:base64:width:height:` — decode `base64` (the Pixmap's
 /// raw RGBA bytes, world/36_pixmap.mst) and set it on `view` (an NSImageView
@@ -605,11 +618,12 @@ pub fn register() {
     type Imp1 = extern "C" fn(*mut c_void, *mut c_void, Id) -> Id;
     type Imp3 = extern "C" fn(*mut c_void, *mut c_void, Id, Id, Id) -> Id;
     type Imp4 = extern "C" fn(*mut c_void, *mut c_void, Id, Id, Id, Id) -> Id;
-    let methods: [(&str, *const c_void, &str); 23] = [
+    let methods: [(&str, *const c_void, &str); 24] = [
         ("requestUiRebuild", imp_request_ui_rebuild as Imp0 as *const c_void, "@@:"),
         ("requestBrowserRefresh", imp_request_browser_refresh as Imp0 as *const c_void, "@@:"),
         ("requestFindRefresh", imp_request_find_refresh as Imp0 as *const c_void, "@@:"),
         ("requestOutlinerRefresh", imp_request_outliner_refresh as Imp0 as *const c_void, "@@:"),
+        ("requestFindQuery", imp_request_find_query as Imp0 as *const c_void, "@@:"),
         (
             "showCanvasPixelsOn:base64:width:height:",
             imp_show_canvas_pixels as Imp4 as *const c_void,

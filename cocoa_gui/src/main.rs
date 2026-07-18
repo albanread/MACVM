@@ -136,9 +136,10 @@ extern "C" fn drain_perform(info: *mut c_void) {
         return; // the fresh generation drains on the next pass
     }
 
-    // View refreshes (Browser tree, Find options, Outliner tree): a fresh
-    // top-level `exec` here, never inside a callback — see view_refresh.rs.
-    let (browser_due, find_due, outliner_due) = view_refresh::take_requests();
+    // View refreshes (Browser tree, Find options, Outliner tree, a pending
+    // Find query): a fresh top-level `exec` here, never inside a callback —
+    // see view_refresh.rs.
+    let (browser_due, find_due, outliner_due, find_query_due) = view_refresh::take_requests();
     if browser_due {
         let _ = st.ui.exec("CocoaBrowser doRefresh.");
     }
@@ -147,6 +148,9 @@ extern "C" fn drain_perform(info: *mut c_void) {
     }
     if outliner_due {
         let _ = st.ui.exec("CocoaOutliner doRefresh.");
+    }
+    if find_query_due {
+        let _ = st.ui.exec("CocoaFind doFindQuery.");
     }
 
     while let Some(link) = st.supervisor.poll_resync() {

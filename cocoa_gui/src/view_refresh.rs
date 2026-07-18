@@ -25,6 +25,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 static BROWSER_REFRESH_REQUESTED: AtomicBool = AtomicBool::new(false);
 static FIND_REFRESH_REQUESTED: AtomicBool = AtomicBool::new(false);
 static OUTLINER_REFRESH_REQUESTED: AtomicBool = AtomicBool::new(false);
+/// Implementors/Senders/Definitions: `CocoaFind`'s search term + kind are
+/// already-live Smalltalk class-var state (`SearchField`'s stringValue,
+/// `Kind`) by the time a button click or Enter-in-field callback fires, so
+/// unlike the three refreshes above this flag carries no payload of its own
+/// — the top-level handler just re-reads them. Added after the browser/find/
+/// outliner refreshes: `findImplementors`/`findSenders`/`findDefinitions`
+/// ran their DB query AND `Results reloadData` inline in the button's own
+/// C6 callback, missing the migration to this pattern entirely — the exact
+/// "shows no data" symptom this module's own doc already named, reproduced
+/// live (rowCount populated correctly, table never redrew).
+static FIND_QUERY_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 pub fn request_browser() {
     BROWSER_REFRESH_REQUESTED.store(true, Ordering::Release);
@@ -35,13 +46,17 @@ pub fn request_find() {
 pub fn request_outliner() {
     OUTLINER_REFRESH_REQUESTED.store(true, Ordering::Release);
 }
+pub fn request_find_query() {
+    FIND_QUERY_REQUESTED.store(true, Ordering::Release);
+}
 
 /// Take (and clear) all pending requests — called once per drain pass.
-/// Returns `(browser, find, outliner)`.
-pub fn take_requests() -> (bool, bool, bool) {
+/// Returns `(browser, find, outliner, find_query)`.
+pub fn take_requests() -> (bool, bool, bool, bool) {
     (
         BROWSER_REFRESH_REQUESTED.swap(false, Ordering::AcqRel),
         FIND_REFRESH_REQUESTED.swap(false, Ordering::AcqRel),
         OUTLINER_REFRESH_REQUESTED.swap(false, Ordering::AcqRel),
+        FIND_QUERY_REQUESTED.swap(false, Ordering::AcqRel),
     )
 }

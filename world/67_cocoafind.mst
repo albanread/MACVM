@@ -66,31 +66,50 @@ Object subclass: CocoaFind [
         line isEmpty ifFalse: [ lines add: line ].
         ^lines
     ]
+    "FLAG ONLY (never query + populate from inside a callback — see
+     view_refresh.rs / requestRefreshOptions above): a button click or
+     Enter-in-field is a C6 callback; the actual query + installRows: (which
+     ends in `Results reloadData`, itself firing NESTED C6 data-source
+     callbacks) must run top-level or it fails closed — Rows populates
+     correctly but the table never visually redraws. drain_perform services
+     the flag with a fresh top-level exec of doFindQuery."
     CocoaFind class >> findImplementors [
-        | term |
-        term := self searchTerm.
-        term isEmpty ifTrue: [ ^self ].
+        self searchTerm isEmpty ifTrue: [ ^self ].
         Kind := #implementors.
-        self installRows: (CocoaBrowser readReply:
-            (CocoaBrowser hostService onMain implementorsOf: term))
+        self requestFindQuery
     ]
     CocoaFind class >> findSenders [
-        | term |
-        term := self searchTerm.
-        term isEmpty ifTrue: [ ^self ].
+        self searchTerm isEmpty ifTrue: [ ^self ].
         Kind := #senders.
-        self installRows: (CocoaBrowser readReply:
-            (CocoaBrowser hostService onMain sendersOf: term))
+        self requestFindQuery
     ]
     CocoaFind class >> findDefinitions [
         "The web's 'Find Definition' kind: classes whose NAME contains the
          term (the term is a class name here, not a selector)."
+        self searchTerm isEmpty ifTrue: [ ^self ].
+        Kind := #definitions.
+        self requestFindQuery
+    ]
+    CocoaFind class >> requestFindQuery [
+        CocoaBrowser hostService onMain requestFindQuery
+    ]
+    "Run the query `Kind`/searchTerm already name (set by findImplementors/
+     findSenders/findDefinitions just before requesting this) and install
+     the results. Called TOP-LEVEL only (drain_perform) — see the flag-only
+     methods' own doc above."
+    CocoaFind class >> doFindQuery [
         | term |
         term := self searchTerm.
         term isEmpty ifTrue: [ ^self ].
-        Kind := #definitions.
-        self installRows: (CocoaBrowser readReply:
-            (CocoaBrowser hostService onMain definitionsOf: term))
+        Kind == #implementors ifTrue: [
+            ^self installRows: (CocoaBrowser readReply:
+                (CocoaBrowser hostService onMain implementorsOf: term)) ].
+        Kind == #senders ifTrue: [
+            ^self installRows: (CocoaBrowser readReply:
+                (CocoaBrowser hostService onMain sendersOf: term)) ].
+        Kind == #definitions ifTrue: [
+            ^self installRows: (CocoaBrowser readReply:
+                (CocoaBrowser hostService onMain definitionsOf: term)) ].
     ]
 
     "Parse 'a US b (US c)? lf ...' into Rows = Arrays {class. selector-or-nil. side}."
