@@ -380,4 +380,101 @@ Object subclass: EditorSession [
         cursor := cursor min: buffer size + 1.
         ^self render
     ]
+
+    "A RANGE edit (NSTextView-shaped, 0-based `loc`, `len` chars, replacement
+     `s`) — the native terminal's natural unit (its delegate hands us the
+     changed range, not a keystroke). Delete then insert, move the caret past
+     the insertion, answer `render`. (The web terminal keeps using handleKey:at:;
+     both drive the same rope — the model exposes whichever unit fits the
+     terminal.) Answers `render`."
+    replaceFrom: loc length: len with: s [
+        | at |
+        at := loc + 1.
+        len > 0 ifTrue: [ buffer delete: at to: loc + len ].
+        s isEmpty ifFalse: [ buffer insert: s at: at ].
+        cursor := (at + s size min: buffer size + 1) max: 1.
+        ^self render
+    ]
+]
+
+"── EditorApp: the Cocoa GUI's editor ORCHESTRATION (docs/editor_design.md M5).
+ The web GUI drives EditorSession as a `Current` singleton in the PRIMARY VM.
+ The Cocoa GUI instead runs the buffer in its OWN VMapp: a worker VM the PRIMARY
+ spawns (only a primary can) and seeds with the class text. The UI worker can't
+ spawn and can't address the worker directly (the primary is a worker's only
+ peer), so every request RELAYS through the primary:
+
+   UI worker --uiRequest:--> primary --send:onReply:--> editor VMapp
+   UI paints <-- #uiReply -- primary <---- reply: ------ EditorSession render
+
+ One class names BOTH roles because both VMs boot world.list: on the PRIMARY the
+ `…ForUi:…` methods spawn/hold/relay; in the editor WORKER `serveWorker:`
+ dispatches the relayed message to that VM's EditorSession. The web GUI never
+ sends these #uiReq verbs, so this is inert there — additive reuse of the shared
+ EditorSession model, breaking nothing."
+Object subclass: EditorApp [
+    <classVars: Vm>
+
+    "── primary side: the one editor VMapp, and the relay ──"
+    EditorApp class >> ensureVm [
+        "Spawn the editor worker on first use (or after it died) and reuse it —
+         one editor document at a time (the single Editor tab). The init doit
+         installs its message handler; EditorSession is seeded per #open."
+        (Vm isNil or: [ Vm isAlive not ]) ifTrue: [
+            Vm := Worker spawn: 'Worker onMessage: [ :m | EditorApp serveWorker: m ]' ].
+        ^Vm
+    ]
+    EditorApp class >> vm [ ^Vm ]
+
+    "Relay one payload to the VMapp; forward its reply to the UI as #uiReply.
+     peer/corr were SNAPSHOTTED by serveUiReq: before we ran, and the block
+     captures them, so the deferred reply routes to the right terminal even
+     though other dispatches run in between."
+    EditorApp class >> relay: aPayload peer: peer corr: corr [
+        self ensureVm send: aPayload
+            onReply: [ :render | Worker replyTo: peer corr: corr
+                           payload: (Array with: #uiReply with: corr with: render) ].
+    ]
+    EditorApp class >> openForUi: classText peer: peer corr: corr [
+        self relay: (Array with: #open with: classText) peer: peer corr: corr.
+    ]
+    EditorApp class >> editForUi: anArray peer: peer corr: corr [
+        "anArray = {loc. len. replacement} — a native range edit."
+        self relay: (Array with: #edit), anArray peer: peer corr: corr.
+    ]
+    EditorApp class >> commandForUi: name peer: peer corr: corr [
+        self relay: (Array with: #command with: name) peer: peer corr: corr.
+    ]
+    EditorApp class >> documentForUi: peer corr: corr [
+        self relay: (Array with: #document) peer: peer corr: corr.
+    ]
+    EditorApp class >> vmIdForUi: peer corr: corr [
+        "Proof-of-VMapp for scripted verification: the worker id (>= 1 means a
+         real, separate, primary-spawned VM)."
+        Worker replyTo: peer corr: corr
+            payload: (Array with: #uiReply with: corr with: (self ensureVm id) printString).
+    ]
+    EditorApp class >> closeForUi: peer corr: corr [
+        "Terminate the VMapp — frees its heap AND its OS thread outright (the
+         design's isolation payoff: no collection, the memory is just gone)."
+        Vm isNil ifFalse: [ Vm isAlive ifTrue: [ Vm terminate ] ].
+        Vm := nil.
+        Worker replyTo: peer corr: corr payload: (Array with: #uiReply with: corr with: 'closed').
+    ]
+
+    "── worker side: dispatch a relayed message to THIS VM's EditorSession ──"
+    EditorApp class >> serveWorker: aMessage [
+        | p verb |
+        p := aMessage payload.
+        verb := p at: 1.
+        verb == #open ifTrue: [
+            EditorSession openOn: (p at: 2). ^Worker reply: EditorSession current render ].
+        verb == #edit ifTrue: [
+            ^Worker reply: (EditorSession current replaceFrom: (p at: 2) length: (p at: 3) with: (p at: 4)) ].
+        verb == #command ifTrue: [
+            ^Worker reply: (EditorSession current handleCommand: (p at: 2)) ].
+        verb == #document ifTrue: [
+            ^Worker reply: EditorSession current documentString ].
+        ^Worker reply: (Array with: #editorError with: 'unknown editor verb: ', verb printString)
+    ]
 ]

@@ -18,7 +18,7 @@
  GUI's own editor path."
 
 Object subclass: CocoaEditor [
-    <classVars: Container Picker Buffer BufferScroll ActionDelegates>
+    <classVars: Container Picker Buffer BufferScroll ActionDelegates LastVmId>
 
     CocoaEditor class >> stripHeight [ ^36.0 ]
 
@@ -137,18 +137,39 @@ Enter in the field — to read its whole-class source here."'
         ^lines
     ]
 
-    "── load: fetch the picked class's whole-class source (host-served) ──"
+    "── load: fetch the class text (host), then OPEN it in the editor VMapp
+       (the primary spawns/seeds a worker VM to run EditorSession); the display
+       is whatever the VMapp blasts back. So the buffer is a terminal onto the
+       VMapp's rope, not a direct view of the image (docs/editor_design.md M5). ──"
     CocoaEditor class >> loadPicked [
-        "Reuse the browser's own class-source fetch (readReply: conversion +
-         wrapper release) — the same whole-class round-trip text it shows."
-        | name src |
+        | name text |
         Picker isNil ifTrue: [ ^self ].
         name := Picker sendString: 'stringValue'.
         (name isNil or: [ name isEmpty ]) ifTrue: [ ^self ].
-        src := CocoaBrowser hostClassSource: name.
-        (src isNil or: [ src isEmpty ])
-            ifTrue: [ Buffer onMain setString: '"No class named ', name, ' in the image."' ]
-            ifFalse: [ Buffer onMain setString: src. self recolorize ].
+        "Fetch the whole-class round-trip text (browser's own reader: NSString→
+         String + wrapper release), then hand it to the VMapp to seed EditorSession."
+        text := CocoaBrowser hostClassSource: name.
+        (text isNil or: [ text isEmpty ])
+            ifTrue: [ ^Buffer onMain setString: '"No class named ', name, ' in the image."' ].
+        Worker uiRequest: #editorOpen args: (Array with: text)
+            onReply: [ :render | CocoaEditor paint: render ].
+    ]
+
+    "Paint a render blast: '<0-based caret>\n<whole buffer text>' (EditorSession
+     render) — the VMapp sends the WHOLE buffer each change (a dumb terminal,
+     feedback_blast_dont_patch). Split on the FIRST lf: the header caret, then
+     the text verbatim. (E2a leaves the buffer read-only; E2b sets the caret and
+     makes it editable.)"
+    CocoaEditor class >> paint: render [
+        | lf idx body |
+        (render isNil or: [ Buffer isNil ]) ifTrue: [ ^self ].
+        lf := Character value: 10.
+        idx := 0.
+        1 to: render size do: [ :i | (idx = 0 and: [ (render at: i) = lf ]) ifTrue: [ idx := i ] ].
+        idx = 0 ifTrue: [ ^Buffer onMain setString: render ].
+        body := render copyFrom: idx + 1 to: render size.
+        Buffer onMain setString: body.
+        self recolorize.
     ]
 
     CocoaEditor class >> recolorize [
@@ -171,6 +192,13 @@ Enter in the field — to read its whole-class source here."'
         Buffer isNil ifTrue: [ ^'' ].
         ^Buffer sendString: 'string'
     ]
+    "Ask the primary for the editor VMapp's worker id (>= 1 proves a real,
+     separate, primary-spawned VM is running the buffer) and stash it."
+    CocoaEditor class >> queryVmId [
+        Worker uiRequest: #editorVmId args: (Array new)
+            onReply: [ :r | LastVmId := r ].
+    ]
+    CocoaEditor class >> vmId [ ^LastVmId isNil ifTrue: [ '(none)' ] ifFalse: [ LastVmId ] ]
     CocoaEditor class >> classNameCount [
         Picker isNil ifTrue: [ ^0 ].
         ^Picker onMain numberOfItems

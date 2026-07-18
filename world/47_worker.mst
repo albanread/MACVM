@@ -352,6 +352,26 @@ Object subclass: Worker [
         verb == #saveMethod ifTrue: [
             ^self replyTo: peer corr: corr payload: (Array with: #uiReply with: corr
                                 with: (self serveUiSaveMethod: payload)) ].
+        "── editor VMapp relay (Cocoa GUI, docs/editor_design.md M5). These do
+           NOT reply here: they hand (peer, corr) to EditorApp, which relays to
+           the spawned editor worker and replies from the ASYNC continuation
+           when the worker answers (a deferred #uiReply). EditorApp is late-
+           bound (classNamed:) so this base protocol file keeps no compile-time
+           editor dependency — the UiBrowserService pattern. The web GUI never
+           sends these verbs. ──"
+        verb == #editorOpen ifTrue: [
+            ^(self classNamed: #EditorApp) openForUi: (payload at: 4) peer: peer corr: corr ].
+        verb == #editorEdit ifTrue: [
+            ^(self classNamed: #EditorApp) editForUi: (payload copyFrom: 4 to: payload size)
+                peer: peer corr: corr ].
+        verb == #editorCommand ifTrue: [
+            ^(self classNamed: #EditorApp) commandForUi: (payload at: 4) peer: peer corr: corr ].
+        verb == #editorDocument ifTrue: [
+            ^(self classNamed: #EditorApp) documentForUi: peer corr: corr ].
+        verb == #editorVmId ifTrue: [
+            ^(self classNamed: #EditorApp) vmIdForUi: peer corr: corr ].
+        verb == #editorClose ifTrue: [
+            ^(self classNamed: #EditorApp) closeForUi: peer corr: corr ].
         ^self replyTo: peer corr: corr payload: (Array with: #uiReply with: corr
                             with: (Array with: #uiError with: 'unknown verb: ', verb printString))
     ]
