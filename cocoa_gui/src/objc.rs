@@ -220,6 +220,60 @@ pub fn install_quit_menu(app: Id) {
     send1_id(app, sel("setMainMenu:"), main_menu);
 }
 
+/// Register a minimal `NSApplication` delegate whose
+/// `applicationShouldTerminateAfterLastWindowClosed:` returns YES, and set it,
+/// so the red close button quitting the *window* also quits the *app* — without
+/// it, closing hides the window and leaves a headless process running (the
+/// on-screen "close closed the window but left the app running" report). The
+/// delegate is a process-lifetime singleton (deliberately leaked).
+pub fn install_app_delegate(app: Id) {
+    // BOOL-returning IMP: `-(BOOL)applicationShouldTerminateAfterLastWindowClosed:`
+    // → always YES (1). ObjC BOOL on arm64 is a 1-byte value; `u8` matches.
+    extern "C" fn should_terminate(_self: Id, _cmd: Sel, _app: Id) -> u8 {
+        1
+    }
+    let superclass = get_class("NSObject");
+    let cname = CString::new("MacvmCocoaAppDelegate").unwrap();
+    let alloc_pair: extern "C" fn(Class, *const i8, usize) -> Class =
+        unsafe { std::mem::transmute(sym("objc_allocateClassPair")) };
+    let cls = alloc_pair(superclass, cname.as_ptr(), 0);
+    if !cls.is_null() {
+        let add_method: extern "C" fn(Class, Sel, *const c_void, *const i8) -> u8 =
+            unsafe { std::mem::transmute(sym("class_addMethod")) };
+        let types = CString::new("B@:@").unwrap();
+        add_method(
+            cls,
+            sel("applicationShouldTerminateAfterLastWindowClosed:"),
+            should_terminate as extern "C" fn(Id, Sel, Id) -> u8 as *const c_void,
+            types.as_ptr(),
+        );
+        let register_pair: extern "C" fn(Class) =
+            unsafe { std::mem::transmute(sym("objc_registerClassPair")) };
+        register_pair(cls);
+    }
+    let del = alloc_init("MacvmCocoaAppDelegate");
+    send1_id(app, sel("setDelegate:"), del);
+}
+
+/// `objc_autoreleasePoolPush()` — push an autorelease pool, returning its token
+/// for [`autorelease_pool_pop`]. The Cocoa GUI wraps its **pre-`[NSApp run]`**
+/// startup (the window/menu build) in one explicit pool: before the run loop is
+/// live there is no CF/AppKit pool on main, so autoreleased objects would "leak
+/// with no pool in place". Once `[NSApp run]` starts, CF's own per-event and
+/// per-callout pools take over (and the bridge's bottom pool is disabled on main
+/// so it can't corrupt them).
+pub fn autorelease_pool_push() -> Id {
+    let f: extern "C" fn() -> Id = unsafe { std::mem::transmute(sym("objc_autoreleasePoolPush")) };
+    f()
+}
+
+/// `objc_autoreleasePoolPop(token)` — drain everything autoreleased since the
+/// matching [`autorelease_pool_push`].
+pub fn autorelease_pool_pop(token: Id) {
+    let f: extern "C" fn(Id) = unsafe { std::mem::transmute(sym("objc_autoreleasePoolPop")) };
+    f(token);
+}
+
 /// `[NSApp activateIgnoringOtherApps: YES]`.
 pub fn activate(app: Id) {
     send1_bool(app, sel("activateIgnoringOtherApps:"), true);

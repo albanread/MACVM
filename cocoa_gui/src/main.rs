@@ -74,6 +74,13 @@ extern "C" fn drain_perform(info: *mut c_void) {
 fn main() {
     // (design §3 step 1) AppKit init MUST be on main, before anything AppKit.
     objc::bootstrap();
+    // An explicit autorelease pool around ALL pre-`[NSApp run]` work: before the
+    // run loop is live there is no CF/AppKit pool on main, so the window/menu
+    // build's autoreleased objects would leak "with no pool in place". Drained
+    // just before `[NSApp run]`, whose own per-event/per-callout pools take over.
+    // (The bridge's bottom pool is disabled on main — it would corrupt CF's pool
+    // stack; see `objc_bridge::ensure_pool`.)
+    let startup_pool = objc::autorelease_pool_push();
     let app = objc::app_shared();
     objc::set_activation_policy_regular(app);
 
@@ -144,20 +151,29 @@ fn main() {
     let info = &mut *drain as *mut DrainState as *mut c_void;
     objc::install_default_mode_drain(info, drain_perform);
 
-    // (design §3 step 4) Build the window + Workspace/Transcript views + menu
-    // from Smalltalk, then return with the VM at rest.
+    // The app menu (⌘Q → `terminate:`) + the quit-on-last-window-close delegate
+    // MUST be installed BEFORE `CocoaUI startup`: startup's `installMenu` ADDS
+    // its Workspace submenu (⌘P/⌘D) to the EXISTING main menu. If the app menu
+    // isn't there first, startup makes its own main menu and this call's
+    // `setMainMenu:` would CLOBBER it — the ⌘P-beeps bug. Order: app menu first,
+    // Workspace second.
+    objc::install_quit_menu(app);
+    objc::install_app_delegate(app);
+
+    // (design §3 step 4) Build the window + Workspace/Transcript views + the
+    // Workspace menu from Smalltalk (added to the app menu above), then return
+    // with the VM at rest.
     if let Err(e) = drain.ui.exec("CocoaUI startup.") {
         eprintln!("macvm-cocoa: CocoaUI startup failed: {e}");
         std::process::exit(1);
     }
 
-    // A minimal main menu with a Quit item (⌘Q → `terminate:`). The Workspace
-    // Do It / Print It items are built in Smalltalk by `CocoaUI startup`.
-    objc::install_quit_menu(app);
-
     // (design §3 step 5) Enter `[NSApp run]` with the VM quiescent. Every future
     // AppKit callback is a top-level VM entry; the drain fires in default mode.
     objc::activate(app);
+    // Drain the startup pool; from here CF's own run-loop pools own the main
+    // thread's autorelease lifecycle.
+    objc::autorelease_pool_pop(startup_pool);
     objc::run(app);
 
     // Keep the drain state (UI worker VM, supervisor) alive for the whole run.

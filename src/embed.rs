@@ -3849,6 +3849,28 @@ mod tests {
     }
 
     #[test]
+    fn cocoa_nil_selector_argument_marshals_to_null_sel() {
+        // A nil SEL argument marshals to a NULL SEL, NOT a failed send — the
+        // on-screen CocoaUI bug: a submenu-holding NSMenuItem is built with
+        // `action: nil`, and the auto-marshaller rejected nil for a `:` slot,
+        // so the whole menu build (and startup) died. `respondsToSelector: nil`
+        // is `[obj respondsToSelector: NULL]` → NO, and must not raise.
+        let _serial = cocoa_serial();
+        let mut vm = boot_test_vm(JitMode::Off);
+        let r = vm
+            .eval(
+                "(Cocoa nsString: 'x') primSendAuto: 'respondsToSelector:' args: (Array with: nil)",
+            )
+            .expect("a nil SEL arg must marshal to NULL, not fail the send");
+        assert_eq!(r.trim(), "false", "respondsToSelector: NULL answers NO");
+        // The non-nil branch still resolves a real selector (else-arm guard).
+        let t = vm
+            .eval("(Cocoa nsString: 'x') primSendAuto: 'respondsToSelector:' args: (Array with: 'length')")
+            .expect("a real SEL arg still resolves");
+        assert_eq!(t.trim(), "true");
+    }
+
+    #[test]
     fn cocoa_c2_struct_shapes_via_dnu() {
         let _serial = cocoa_serial();
         let mut vm = boot_test_vm(JitMode::Off);

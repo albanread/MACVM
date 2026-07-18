@@ -227,7 +227,20 @@ fn syms() -> Option<&'static Syms> {
 
 /// Make sure THIS thread has its bottom pool (design §3.1) — called on the
 /// way into every bridged operation.
+///
+/// **NEVER on the main thread** (CG4): there, CoreFoundation/AppKit own the
+/// autorelease pool stack — a per-event pool inside `[NSApp run]`, a per-callout
+/// pool around every run-loop source0 (our default-mode drain) and timer. Our
+/// unbalanced bottom pool (pushed here, popped later by
+/// [`drain_pool_at_doit_boundary`]) would nest a token BELOW theirs; draining it
+/// pops CF's pool with it → `AutoreleasePoolPage::badPop` → a fatal
+/// `objc_autoreleasePoolInvalid` abort. On main, autoreleased objects ride CF's
+/// own pools instead (the Cocoa GUI's pre-run-loop startup gets one explicit
+/// pool from `macvm-cocoa`; everything after is inside a CF callout).
 fn ensure_pool(s: &Syms) {
+    if on_main_thread() {
+        return;
+    }
     POOL.with(|p| {
         if p.get().is_null() {
             p.set(unsafe { (s.pool_push)() });
@@ -238,8 +251,13 @@ fn ensure_pool(s: &Syms) {
 /// Doit-boundary pool hygiene: drain the bottom pool and push a fresh one,
 /// releasing every +0 autoreleased object Cocoa handed back during the doit
 /// (our wrapped refs survive — retain-on-wrap owns them independently).
-/// A cheap no-op on threads that never touched Cocoa.
+/// A cheap no-op on threads that never touched Cocoa — and ALWAYS on the main
+/// thread (see [`ensure_pool`]: popping our bottom pool there corrupts CF's pool
+/// stack, since the UI worker runs doits inside CF's own per-callout pool).
 pub fn drain_pool_at_doit_boundary() {
+    if on_main_thread() {
+        return;
+    }
     POOL.with(|p| {
         let tok = p.get();
         if !tok.is_null() {

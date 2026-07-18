@@ -116,15 +116,18 @@ Object subclass: CocoaUI [
     ]
 
     CocoaUI class >> workspaceText [
-        "The Workspace NSTextView's current text as a Smalltalk String."
-        ^(Workspace onMain string) sendString: 'UTF8String'
+        "The Workspace NSTextView's current text as a Smalltalk String. `string`
+         returns an NSString, which `sendString:` copies to a Smalltalk String —
+         NOT `UTF8String` (that returns a `char*`, which `sendString:` would
+         misread as an object id and crash). On main (a delegate callback)."
+        ^Workspace sendString: 'string'
     ]
 
     CocoaUI class >> appendTranscript: aString [
         "Append a line to the Transcript view. Blast the WHOLE text each change
          (feedback_blast_dont_patch) — never an incremental NSTextView patch."
         TranscriptText isNil ifTrue: [ TranscriptText := '' ].
-        TranscriptText := TranscriptText, aString, (String with: Character lf).
+        TranscriptText := TranscriptText, aString, String lf.
         Transcript isNil ifFalse: [ Transcript onMain setString: TranscriptText ].
     ]
 

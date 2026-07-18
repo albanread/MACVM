@@ -2208,10 +2208,37 @@ fn cocoa_send_auto_impl(vm: &mut VmState, args: &[Oop], on_main: bool) -> PrimRe
     let Some(arr) = ArrayOop::try_from(args[2]) else {
         return PrimResult::Fail;
     };
+    // `MACVM_COCOA_DIAG=1` traces each auto-send's selector, resolved ABI
+    // shape, and the reason for any failure — the channel that localized the
+    // nil-SEL menu-init bug. Cached: cocoa sends are rare, but one atomic load
+    // beats an env lookup per send.
+    let diag = {
+        use std::sync::OnceLock;
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("MACVM_COCOA_DIAG").is_some())
+    };
     let Some(shape) = objc_bridge::resolve_shape(target, &sel) else {
+        if diag {
+            eprintln!("[cocoa-diag] '{sel}' on_main={on_main}: resolve_shape FAILED");
+        }
         return PrimResult::Fail; // no such method / unmarshalable shape
     };
+    if diag {
+        eprintln!(
+            "[cocoa-diag] '{sel}' on_main={on_main} shape ret={:?} args={:?} argv_len={}",
+            shape.ret,
+            shape.args,
+            arr.len()
+        );
+    }
     if shape.args.len() != arr.len() {
+        if diag {
+            eprintln!(
+                "[cocoa-diag] '{sel}': ARITY mismatch {} != {}",
+                shape.args.len(),
+                arr.len()
+            );
+        }
         return PrimResult::Fail; // arity mismatch (a keyword-count bug)
     }
     // The ownership gate, same rule as prim 240: a +1-family result must
@@ -2219,6 +2246,12 @@ fn cocoa_send_auto_impl(vm: &mut VmState, args: &[Oop], on_main: bool) -> PrimRe
     // NAME on a non-object return is the annotated-corner smell — refuse.
     let fam = objc_bridge::selector_family(&sel);
     if fam != objc_bridge::Family::Plus0 && shape.ret != ObjcRet::Id {
+        if diag {
+            eprintln!(
+                "[cocoa-diag] '{sel}': FAMILY gate fam={fam:?} ret={:?}",
+                shape.ret
+            );
+        }
         return PrimResult::Fail;
     }
 
@@ -2360,13 +2393,21 @@ fn cocoa_send_auto_impl(vm: &mut VmState, args: &[Oop], on_main: bool) -> PrimRe
                 push_f!(f64::from_bits((v as f32).to_bits() as u64));
             }
             ObjcArg::Sel => {
-                let Some(name) = text_arg(vm, a) else {
-                    return PrimResult::Fail;
-                };
-                let Some(p) = objc_bridge::register_selector(&name) else {
-                    return PrimResult::Fail;
-                };
-                push_g!(p as u64);
+                // `nil` marshals to a NULL SEL — a legitimate AppKit idiom
+                // (e.g. a submenu-holding `NSMenuItem`'s `action: nil`, or any
+                // `target:action:` cleared to no-action). Only a NON-nil value
+                // must be a selector name.
+                if a.raw() == vm.universe.nil_obj.raw() {
+                    push_g!(0u64);
+                } else {
+                    let Some(name) = text_arg(vm, a) else {
+                        return PrimResult::Fail;
+                    };
+                    let Some(p) = objc_bridge::register_selector(&name) else {
+                        return PrimResult::Fail;
+                    };
+                    push_g!(p as u64);
+                }
             }
             ObjcArg::Point | ObjcArg::Rect => {
                 let n = if *cls == ObjcArg::Rect { 4 } else { 2 };
