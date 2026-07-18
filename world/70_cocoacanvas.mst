@@ -37,7 +37,7 @@ Object subclass: CocoaCanvas [
     CocoaCanvas class >> canvasHeight [ ^240 ]
 
     CocoaCanvas class >> register [
-        CocoaUI registerViewNamed: #canvas title: 'Canvas' icon: 'documentation'
+        CocoaUI registerViewNamed: #canvas title: 'Canvas' icon: 'canvas'
                 container: [ self containerView ]
                 onShow: [ ]
     ]
@@ -129,7 +129,14 @@ Object subclass: CocoaCanvas [
         btn := ((Cocoa classNamed: 'NSButton') onMain alloc) onMain initWithFrame: rect.
         btn onMain setTitle: title.
         btn onMain setBezelStyle: 1.
-        btn onMain setAutoresizingMask: CocoaUI maskMinXMargin + CocoaUI maskMinYMargin.
+        "No X-flexibility -> pins LEFT (maskMinXMargin's own doc: 'flexible
+         space LEFT -> pins to RIGHT', the opposite of what Mandelbrot/
+         Benchmark Chart need — they drifted right as the window widened and
+         ran into EvalField/DrawBtn. DrawBtn overrides this default right
+         after construction (its own maskMinXMargin is correct THERE, since
+         it's meant to track the right edge); ModePicker already relies on
+         this same 'unset = pinned' default."
+        btn onMain setAutoresizingMask: CocoaUI maskMinYMargin.
         holder := CocoaToolbarAction on: aBlock.
         delegate := MacvmDelegate actionTargetOn: holder.
         btn onMain setTarget: delegate.
