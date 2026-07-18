@@ -1654,6 +1654,15 @@ fn string_oop(vm: &mut VmState, s: &str) -> Oop {
 /// raising; a runtime raise unwinds to the caller's guard as any `perform` does
 /// (v1: the dispatch aborts and no reply is sent — the RPC path's documented
 /// property, `47_worker.mst`).
+///
+/// NON-shimmable (`compiler::driver::PRIM_REENTERS_INTERPRETER`, with
+/// `perform:withArguments:`): a compiled caller must reach this through the
+/// c2i adapter — whose `rt_interpret_call` brackets the crossing with
+/// `TierLink::IntoInterpreter` — never through `rt_call_primitive`, which
+/// brackets nothing. Shimmed, the first GC inside a nested doit walked the
+/// tier journal mispaired and aborted the process (the Cocoa `Worker uiDoit:`
+/// relay crash after ~10 warmed dispatches); see the driver list's own doc
+/// for why the bracket cannot live here in the `PrimFn` body instead.
 fn prim_eval_doit(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     let Some(src) = string_arg(vm, args[1]) else {
         return PrimResult::Fail;
@@ -3449,6 +3458,10 @@ fn prim_gc_full(vm: &mut VmState, args: &[Oop]) -> PrimResult {
 /// than silently). The heavy lifting is [`run_method_reentrant`], the same
 /// synchronous-nested-invoke `rt_dnu` uses: it handles a primitive,
 /// compiled, or interpreted target uniformly and returns the result oop.
+/// NON-shimmable for the same reason as `primEvalDoit:` (250) — see
+/// `compiler::driver::PRIM_REENTERS_INTERPRETER`: the nested run needs the
+/// c2i bracket when the caller is compiled, and a `PrimFn` body cannot
+/// supply it correctly for both of its entry doors.
 fn prim_perform_with_arguments(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     let receiver = args[0];
     let Some(sel) = crate::oops::wrappers::SymbolOop::try_from(args[1]) else {

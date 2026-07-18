@@ -99,21 +99,50 @@ const PRIM_ALREADY_FUSED: [i64; 15] = [
 /// `PRIM_ACTIVATES_FRAME`. Kept interpreter-only.
 const PRIM_READS_ARG_BASE: [i64; 2] = [93, 94];
 
+/// Primitive ids whose implementation SYNCHRONOUSLY re-enters the
+/// interpreter for a whole nested run (`run_method_reentrant`) as part of
+/// answering: `perform:withArguments:` (64) and `primEvalDoit:` (250, the
+/// Cocoa `Worker uiDoit:` relay's evaluator). They must stay
+/// interpreter-only entries: every OTHER compiled→interpreter crossing in
+/// the system goes through a runtime stub that brackets the nested run with
+/// `TierLink::IntoInterpreter` (`rt_interpret_call`, `rt_value_fallback`,
+/// `rt_dnu`, `rt_must_be_boolean`) so `walk_frames` can pair the nested
+/// entry frame's `ENTRY_FRAME_SENTINEL` back out to the native chain — but
+/// a `PrimFn` body cannot know which door it was called through
+/// (`interpreter::send::try_primitive`, where pushing a link would be a
+/// double-count of an already-tracked crossing, vs `rt_call_primitive`,
+/// where NOT pushing leaves the crossing untracked), so it can bracket
+/// correctly for neither. Excluding them from shims removes the second door
+/// entirely: a compiled caller reaches them via the c2i adapter, whose
+/// `rt_interpret_call` brackets correctly. Found in the wild as the Cocoa
+/// GUI abort `walk_frames: an ENTRY_FRAME_SENTINEL must pair with
+/// TierLink::IntoInterpreter, found IntoCompiled instead` — repeated
+/// Benchmark-Chart/Mandelbrot relays warmed `Worker dispatchInbox`'s chain
+/// past the JIT threshold, prim 250 started arriving via
+/// `rt_call_primitive`, and the first GC inside a nested doit walked the
+/// journal mispaired (regression-pinned by `cocoa_gui`'s
+/// `many_sequential_uidoit_relays_do_not_corrupt_tier_links`). The shim
+/// only ever saved the method-entry overhead — both primitives then
+/// parse/compile/lookup and run whole nested Smalltalk, so the win was
+/// noise; the c2i path costs the same order and is correct.
+const PRIM_REENTERS_INTERPRETER: [i64; 2] = [64, 250];
+
 /// `true` iff `prim_id` can become a compiled primitive-call shim
-/// (`emit::emit`'s prologue, driven by `eligibility_detail` below). Four
+/// (`emit::emit`'s prologue, driven by `eligibility_detail` below). Five
 /// exclusions: `PRIM_ACTIVATES_FRAME`'s list, `PRIM_ALREADY_FUSED`'s list,
-/// `PRIM_READS_ARG_BASE`'s list, and `crate::oops::layout::PRIM_ID_FFI` —
-/// FFI's own dispatch (`runtime::ffi::dispatch_ffi_primitive`) has a
-/// variable-arity argument shape the fixed colon-counted-argc `PrimDesc`
-/// table was never built to represent (`interpreter::send::try_primitive`'s
-/// own doc on why FFI is intercepted before the generic `prim_by_id` lookup
-/// even runs) — it is its own, later piece of work, not a shimmable
-/// `PrimDesc` entry at all.
+/// `PRIM_READS_ARG_BASE`'s list, `PRIM_REENTERS_INTERPRETER`'s list, and
+/// `crate::oops::layout::PRIM_ID_FFI` — FFI's own dispatch
+/// (`runtime::ffi::dispatch_ffi_primitive`) has a variable-arity argument
+/// shape the fixed colon-counted-argc `PrimDesc` table was never built to
+/// represent (`interpreter::send::try_primitive`'s own doc on why FFI is
+/// intercepted before the generic `prim_by_id` lookup even runs) — it is
+/// its own, later piece of work, not a shimmable `PrimDesc` entry at all.
 fn is_shimmable_primitive(prim_id: i64) -> bool {
     prim_id != crate::oops::layout::PRIM_ID_FFI
         && !PRIM_ACTIVATES_FRAME.contains(&prim_id)
         && !PRIM_ALREADY_FUSED.contains(&prim_id)
         && !PRIM_READS_ARG_BASE.contains(&prim_id)
+        && !PRIM_REENTERS_INTERPRETER.contains(&prim_id)
 }
 
 /// D1 point 3, "tunable".
@@ -2162,6 +2191,19 @@ mod tests {
         assert!(
             !is_shimmable_primitive(94),
             "gcFull reads prim_arg_base -- must not shim"
+        );
+        // The interpreter-reentering evaluators are excluded too: shimmed,
+        // their nested run arrives from compiled code with no
+        // TierLink::IntoInterpreter bracket and the first GC inside it walks
+        // the tier journal mispaired (the Cocoa uiDoit-relay abort; see
+        // PRIM_REENTERS_INTERPRETER's own doc).
+        assert!(
+            !is_shimmable_primitive(64),
+            "perform:withArguments: re-enters the interpreter -- must not shim"
+        );
+        assert!(
+            !is_shimmable_primitive(250),
+            "primEvalDoit: re-enters the interpreter -- must not shim"
         );
         // A non-fused Ok/Fail primitive still shims.
         assert!(is_shimmable_primitive(21)); // class

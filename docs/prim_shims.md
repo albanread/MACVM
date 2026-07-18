@@ -73,7 +73,7 @@ and `emit_stub_kind_tag` (scratches x9). `PRIM_FAIL_SENTINEL = 0b1010` is a
 > exclusion *reasons* below are unchanged; only the counts have moved.
 
 Of the (then) 66 entries in the `PRIMITIVES` table: **44 shimmed, 22 excluded**
-(plus the FFI sentinel, which is not a table row). Three exclusion sets, each with
+(plus the FFI sentinel, which is not a table row). Four exclusion sets, each with
 a distinct reason:
 
 ### `PRIM_ACTIVATES_FRAME` = {50,51,52,53,54,60,61}
@@ -110,13 +110,36 @@ whatever paused interpreter frame `prim_arg_base` last pointed into. They are th
 (`valueWithArguments:`/`ensure:`/`ifCurtailed:` also read/mutate the operand stack
 but are already excluded as `Activated`). Kept interpreter-only.
 
+### `PRIM_REENTERS_INTERPRETER` = {64,250}
+`perform:withArguments:` (64) and `primEvalDoit:` (250, the Cocoa `Worker
+uiDoit:` relay's evaluator). Both run a whole *nested interpreter entry*
+(`run_method_reentrant`) inside their `PrimFn` body. Every compiled→interpreter
+crossing must be journaled with a `TierLink::IntoInterpreter` push so
+`walk_frames` can pair the nested entry frame's sentinel back out to the native
+chain — the runtime stubs that nest (`rt_interpret_call`, `rt_value_fallback`,
+`rt_dnu`, `rt_must_be_boolean`) each push it themselves, because they *know*
+they were entered from compiled code. A `PrimFn` body cannot know its door:
+called via the interpreter's `try_primitive` the crossing is already tracked
+(pushing again double-counts), called via `rt_call_primitive` it isn't (not
+pushing leaves it untracked) — and the difference is a property of the call
+path, not recoverable from any VM state. Exclusion removes the second door: a
+compiled caller reaches these through the c2i adapter, which brackets
+correctly. Found live as the Cocoa GUI abort `walk_frames: an
+ENTRY_FRAME_SENTINEL must pair with TierLink::IntoInterpreter, found
+IntoCompiled instead` once repeated canvas doit relays warmed the `Worker
+dispatchInbox` chain past the JIT threshold; regression-pinned by `cocoa_gui`'s
+`many_sequential_uidoit_relays_do_not_corrupt_tier_links`. Cost of exclusion:
+none that matters — both primitives parse/compile/lookup and run arbitrary
+nested Smalltalk, so the saved shim entry overhead was noise.
+
 ### FFI (`PRIM_ID_FFI` = −1)
 A distinct sentinel, not a table row; intercepted before `prim_by_id` because it
 carries a variable-arity argument shape the fixed colon-counted `PrimDesc` model
 was never built for. Its own later work.
 
 `is_shimmable_primitive(id)` = `id != PRIM_ID_FFI && !PRIM_ACTIVATES_FRAME(id)
-&& !PRIM_ALREADY_FUSED(id) && !PRIM_READS_ARG_BASE(id)`.
+&& !PRIM_ALREADY_FUSED(id) && !PRIM_READS_ARG_BASE(id)
+&& !PRIM_REENTERS_INTERPRETER(id)`.
 
 ### Notes on the shimmed set
 - **Allocating primitives** (24, 97, 100-103, 106, 108-111, 116, 119, 120) are

@@ -569,4 +569,66 @@ mod tests {
         link = new_link;
         round_trip(&mut ui, &link, "100 + 1", "'101'");
     }
+
+    /// JIT ON (`crate::boot::vm_options`'s own default) -- unlike `boot_fn`/
+    /// `boot_ui` above, which pin `JitMode::Off` for tests that don't want
+    /// compiler variability. This one specifically NEEDS the JIT to reach the
+    /// bug it pins.
+    fn boot_fn_jit() -> WorkerBootFn {
+        let world = world_dir();
+        Arc::new(move || VmHandle::boot(crate::boot::vm_options(), &world))
+    }
+
+    fn boot_ui_jit(link: &PrimaryLink) -> VmHandle {
+        let mut ui = VmHandle::boot(crate::boot::vm_options(), &world_dir())
+            .expect("boot the UI worker (JIT on)");
+        ui.install_worker_role(link.hosted_id, link.to_primary.clone());
+        ui.exec("Object subclass: UiT [ <classVars: R> UiT class >> r: x [ R := x ] UiT class >> r [ ^R ] ]")
+            .expect("UI scoreboard");
+        ui
+    }
+
+    /// Bug report: "bug was from repeatedly running new benchmark: walk_frames:
+    /// an ENTRY_FRAME_SENTINEL must pair with TierLink::IntoInterpreter, found
+    /// IntoCompiled instead" -- a real VM-internal panic (non-unwinding, aborts
+    /// the process) after ~20 sequential Cocoa "Benchmark Chart" button clicks.
+    ///
+    /// Root cause: `Worker uiDoit:`'s relay runs each doit through
+    /// `dispatchInbox` -> `dispatchOne:` -> `serveUiDoit:` -> `primEvalDoit:`
+    /// (primitive 250) -> `run_method_reentrant` (the SAME nested-interpreter
+    /// door `perform:withArguments:`, primitive 64, also uses). Every
+    /// compiled-caller -> interpreter crossing must be journaled with a
+    /// `TierLink::IntoInterpreter` push (`rt_interpret_call`'s own bracket);
+    /// prim 250's was not. That is invisible while `serveUiDoit:`'s call
+    /// chain is still interpreted (no anchor, `link_idx == 0`, the walk stops
+    /// at `Mode::Done`). Once ~10 relays (`JitMode::Threshold(10)`) compile
+    /// that chain, the shimmed prim 250 started running through
+    /// `rt_call_primitive` (a COMPILED caller, anchor SET, nothing pushed) --
+    /// and the first GC inside the nested doit reached its
+    /// `ENTRY_FRAME_SENTINEL` and consumed the tier_links entry belonging to
+    /// the OUTER interpreted-doIt -> compiled-`dispatchInbox` crossing
+    /// (`compiled_call.rs`'s correctly-paired `IntoCompiled`), panicking on
+    /// the variant mismatch. A single continuous CLI loop running the same
+    /// Smalltalk never crosses through prim 250, which is why it never
+    /// reproduced.
+    ///
+    /// Fix: prims 250/64 are excluded from primitive shims
+    /// (`compiler::driver::PRIM_REENTERS_INTERPRETER`) -- a compiled caller
+    /// now reaches them via the c2i adapter, whose `rt_interpret_call`
+    /// brackets the crossing correctly. This test drives 40 SEPARATE
+    /// sequential relays through the real `Worker uiDoit:` path with JIT on
+    /// (`crate::boot::vm_options`), each allocating enough to make a GC
+    /// inside the nested run likely; before the fix it aborted the primary
+    /// thread at iteration ~15-20 with the exact reported signature.
+    #[test]
+    fn many_sequential_uidoit_relays_do_not_corrupt_tier_links() {
+        let ui_wake: InboxWakeFn = Arc::new(|| {});
+        let (_sup, link) = PrimarySupervisor::spawn(boot_fn_jit(), ui_wake)
+            .expect("boot the supervised primary (JIT on)");
+        let mut ui = boot_ui_jit(&link);
+
+        for _ in 0..40 {
+            round_trip(&mut ui, &link, "(Array new: 50000) size > 0", "'true'");
+        }
+    }
 }

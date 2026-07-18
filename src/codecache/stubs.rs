@@ -1784,7 +1784,20 @@ pub unsafe extern "C" fn rt_dnu(vm: *mut VmState, ret_addr: u64, argv: *mut u64)
     msg.set_body_oop(1, array_h.get(vm));
 
     let sel_dnu = vm.universe.sel_does_not_understand;
-    match lookup(vm, k_h.get(vm), sel_dnu) {
+    // `TierLink::IntoInterpreter` around the nested `#doesNotUnderstand:` run —
+    // the SAME bracket `rt_interpret_call`/`rt_value_fallback` push around
+    // theirs, and for the same reason: this stub is always entered from
+    // compiled code (anchor asserted above), so the nested run's entry frame
+    // needs a C→I journal record for `walk_frames` to consume when a GC lands
+    // inside the handler; without it the walk pairs the sentinel against
+    // whatever OUTER crossing is on top and panics (the `found IntoCompiled
+    // instead` class). `dnu_fallback` diverges (`-> !`), so the unbalanced
+    // push on that arm never meets another walk.
+    vm.tier_links.push(TierLink::IntoInterpreter {
+        compiled_fp: vm.reg_block.last_compiled_fp,
+        compiled_ret_pc: vm.reg_block.last_compiled_pc,
+    });
+    let result = match lookup(vm, k_h.get(vm), sel_dnu) {
         Some(dnu_method) => {
             let result = crate::interpreter::run_method_reentrant(
                 vm,
@@ -1795,7 +1808,9 @@ pub unsafe extern "C" fn rt_dnu(vm: *mut VmState, ret_addr: u64, argv: *mut u64)
             result.raw()
         }
         None => crate::runtime::error::dnu_fallback(vm, selector_h.get(vm), k_h.get(vm)),
-    }
+    };
+    vm.tier_links.pop();
+    result
 }
 
 /// D1/D5: the shared `BoolBr.not_bool` runtime helper — callee-shaped
@@ -1861,10 +1876,20 @@ pub unsafe extern "C" fn rt_must_be_boolean(vm: *mut VmState, val: u64) -> u64 {
     let t = Oop::from_raw(val);
     let k = klass_of(vm, t);
     let sel = vm.universe.sel_must_be_boolean;
-    match lookup(vm, k, sel) {
+    // Same C→I bracket as `rt_dnu` above (this stub too is always entered
+    // from compiled code), so a GC inside the nested `#mustBeBoolean` run
+    // finds the crossing journaled. `dnu_fallback` diverges; the unbalanced
+    // push on that arm never meets another walk.
+    vm.tier_links.push(TierLink::IntoInterpreter {
+        compiled_fp: vm.reg_block.last_compiled_fp,
+        compiled_ret_pc: vm.reg_block.last_compiled_pc,
+    });
+    let result = match lookup(vm, k, sel) {
         Some(m) => crate::interpreter::run_method_reentrant(vm, m, t, &[]).raw(),
         None => crate::runtime::error::dnu_fallback(vm, sel, k),
-    }
+    };
+    vm.tier_links.pop();
+    result
 }
 
 /// Float fast-path (`docs/float_fastpath_design.md`): `stub_box_double` —

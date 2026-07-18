@@ -583,6 +583,28 @@ impl VmHandle {
         // forever (the C4 review's poisoned-machinery finding). A pool scope is
         // lexical and can never legitimately span doits.
         self.vm.cocoa_mint_stack.clear();
+        // The tier journal and its companions are balanced only by the normal
+        // return paths (`enter_compiled`/`rt_interpret_call`/... each pop what
+        // they pushed); a raise that unwinds via `siglongjmp` from under
+        // compiled frames skips every one of those pops, exactly like the
+        // skipped `Drop`s above. At the idle baseline nothing compiled is
+        // active by definition, so the clean state is empty/zero across the
+        // board — a stale `IntoCompiled` left on top would make the NEXT
+        // doit's first GC walk panic (`found IntoCompiled instead`) or, with
+        // a stale anchor, walk freed native stack memory. Same for a parked
+        // NLR whose frames are gone and `pending_deopts` entries keyed by
+        // now-dead frame addresses (a recycled fp would falsely translate a
+        // live frame's return pc).
+        self.vm.tier_links.clear();
+        self.vm.compiled_depth = 0;
+        self.vm
+            .live_stats
+            .compiled_depth
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.vm.reg_block.last_compiled_fp = 0;
+        self.vm.reg_block.last_compiled_kind = 0;
+        self.vm.nlr_state = None;
+        self.vm.pending_deopts.clear();
     }
 
     /// Compiles `source` as a single top-level item (SPEC §16.2: "compile as
