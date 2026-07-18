@@ -15,6 +15,7 @@ mod colorize;
 mod control;
 mod host_service;
 mod objc;
+mod rebuild;
 mod snapshot;
 mod supervisor;
 
@@ -23,7 +24,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use macvm::embed::{FatalMode, VmHandle};
-use macvm::runtime::workers::{HostedInbox, InboxWakeFn, WorkerBootFn};
+use macvm::runtime::workers::{HostedInbox, InboxSender, InboxWakeFn, WorkerBootFn};
 
 use supervisor::{PrimaryLink, PrimarySupervisor};
 
@@ -44,6 +45,13 @@ struct DrainState {
     /// The RUSTTCL control channel's request queue (`MACVM_COCOA_CTL`), served
     /// on the main thread each drain pass. `None` when the channel is off.
     ctl: Option<std::sync::mpsc::Receiver<control::CtlReq>>,
+    /// CG9: the ingredients to rebuild the UI worker in place — the current
+    /// hosted peer id + upstream sender (re-adopted by a fresh VM), and the
+    /// world paths to boot from. Updated on a primary re-sync too.
+    hosted_id: u32,
+    to_primary: InboxSender,
+    world_dir: PathBuf,
+    cocoaui_list: PathBuf,
 }
 
 /// `1536` -> `"1.5K"`, base-1024, one decimal past the first suffix — the
@@ -116,6 +124,15 @@ extern "C" fn drain_perform(info: *mut c_void) {
     // the main thread where nothing else borrows it concurrently.
     let st = unsafe { &mut *(info as *mut DrainState) };
 
+    // (CG9) Service a UI-worker rebuild request FIRST, before any envelope
+    // dispatch — we run here on the main thread with the VM quiescent (never
+    // inside a callback), the only place it is sound to drop the UI worker's
+    // VmHandle. A request set from inside a callback only flags + wakes us.
+    if rebuild::take_request() {
+        rebuild_ui(st);
+        return; // the fresh generation drains on the next pass
+    }
+
     while let Some(link) = st.supervisor.poll_resync() {
         // Drain the DYING generation's inbox before dropping it (CG4 review):
         // its last buffered envelopes — the fatal doit's transcript line, any
@@ -130,6 +147,8 @@ extern "C" fn drain_perform(info: *mut c_void) {
         // swap the drain inbox (never a torn mix — replace both together).
         st.ui
             .install_worker_role(link.hosted_id, link.to_primary.clone());
+        st.hosted_id = link.hosted_id;
+        st.to_primary = link.to_primary.clone();
         st.inbox = link.hosted_inbox;
         // Let the Smalltalk terminal recover clean (abandon dead-primary
         // continuations) and note the restart.
@@ -144,6 +163,64 @@ extern "C" fn drain_perform(info: *mut c_void) {
         control::serve(rx, &mut st.ui);
     }
     refresh_metrics(st);
+}
+
+/// (CG9 §5 Layer 2) Rebuild the UI worker in place: ordered teardown of the old
+/// window set, a clean drop of the old `VmHandle`, a fresh UI worker re-adopting
+/// the SAME hosted peer id, and `CocoaUI startup` again — the primary and all
+/// its state untouched throughout. Runs on the main thread, VM quiescent (from
+/// `drain_perform`, never a callback). The Layer-3 backstop trips first on a
+/// rebuild storm.
+fn rebuild_ui(st: &mut DrainState) {
+    eprintln!("macvm-cocoa: rebuilding the UI worker in place…");
+    // (Layer 3) A storm trips ExitProcess before it can recurse.
+    rebuild::note_and_check_backstop();
+
+    // 1. No callback may dispatch into the VM while we tear it down and drop it:
+    //    unpublish the door (ui_vm() → null → every trampoline fails closed).
+    boot::publish_ui_vm(std::ptr::null_mut());
+
+    // 2. Ordered teardown of the OLD window set (orderOut/close/release windows
+    //    + delegates + tickets — CocoaUI teardown is idempotent). Best-effort:
+    //    if the compromised VM faults here too, the per-exec sigsetjmp recovers
+    //    it to an Err and we press on — the drop below reclaims everything the
+    //    VM owned regardless.
+    let _ = st.ui.exec("CocoaUI teardown.");
+
+    // 3. Drain + discard the OLD generation's inbox (its buffered snapshots /
+    //    transcript lines reference the dead UI's state).
+    while st.inbox.poll().is_some() {}
+
+    // 4. Boot a FRESH UI worker re-adopting the same hosted id + upstream sender
+    //    (the channel is Rust-owned, unaffected by the VM swap), then assign —
+    //    which DROPS the old handle here (Reservation munmap + deopt deregister +
+    //    setjmp-slot release; proven leak-free in embed's restart-lifecycle
+    //    gate). Boot failure is genuinely fatal — there is no GUI without a UI
+    //    worker.
+    let fresh = match boot::boot_ui_worker(
+        &st.world_dir,
+        &st.cocoaui_list,
+        FatalMode::ExitProcess,
+        st.hosted_id,
+        st.to_primary.clone(),
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("macvm-cocoa: UI worker rebuild boot failed: {} — ExitProcess", e.msg);
+            std::process::exit(71);
+        }
+    };
+    st.ui = fresh; // old VmHandle drops here
+
+    // 5. Republish the fresh door (bumps the UI-VM generation, so any old C6
+    //    delegate ticket still held by a not-yet-freed AppKit object fails
+    //    closed), then rebuild the window set.
+    boot::publish_ui_vm(&mut st.ui as *mut _);
+    if let Err(e) = st.ui.exec("CocoaUI startup.") {
+        eprintln!("macvm-cocoa: CocoaUI startup after rebuild failed: {e} — ExitProcess");
+        std::process::exit(72);
+    }
+    eprintln!("macvm-cocoa: UI worker rebuilt; primary state intact.");
 }
 
 fn main() {
@@ -216,6 +293,12 @@ fn main() {
         supervisor: sup,
         prev_alloc: None,
         ctl,
+        // CG9 rebuild ingredients — the current peer id + sender the fresh VM
+        // re-adopts, and the world paths to boot it from.
+        hosted_id: link.hosted_id,
+        to_primary: link.to_primary.clone(),
+        world_dir: world_dir.clone(),
+        cocoaui_list: cocoaui_list.clone(),
     });
 
     // (design §3 step 4) Publish the thread-local `*mut VmHandle` the CG3/CG4

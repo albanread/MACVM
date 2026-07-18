@@ -326,6 +326,17 @@ extern "C" fn imp_colorize_storage(_this: *mut c_void, _cmd: *mut c_void, storag
     std::ptr::null_mut()
 }
 
+/// `requestUiRebuild` — CG9 Layer-2 trigger: flag a full UI-worker rebuild and
+/// wake the run loop. A menu item calls this (optionally after deliberately
+/// faulting, to prove a Layer-1-recovered fault can escalate to a rebuild). The
+/// flag is serviced by `drain_perform` on the next main-thread pass, never
+/// inside this callback. Answers nil.
+extern "C" fn imp_request_ui_rebuild(_this: *mut c_void, _cmd: *mut c_void) -> Id {
+    crate::rebuild::request();
+    crate::objc::wake_main_runloop();
+    std::ptr::null_mut()
+}
+
 type AllocPair = unsafe extern "C" fn(Id, *const c_char, usize) -> Id;
 type RegisterPair = unsafe extern "C" fn(Id);
 type AddMethod = unsafe extern "C" fn(Id, Sel, *const c_void, *const c_char) -> u8;
@@ -343,9 +354,11 @@ pub fn register() {
     if cls.is_null() {
         return; // already registered (a restart re-runs boot paths)
     }
+    type Imp0 = extern "C" fn(*mut c_void, *mut c_void) -> Id;
     type Imp1 = extern "C" fn(*mut c_void, *mut c_void, Id) -> Id;
     type Imp3 = extern "C" fn(*mut c_void, *mut c_void, Id, Id, Id) -> Id;
-    let methods: [(&str, *const c_void, &str); 12] = [
+    let methods: [(&str, *const c_void, &str); 13] = [
+        ("requestUiRebuild", imp_request_ui_rebuild as Imp0 as *const c_void, "@@:"),
         ("colorizeStorage:", imp_colorize_storage as Imp1 as *const c_void, "@@:@"),
         ("implementorsOf:", imp_implementors_of as Imp1 as *const c_void, "@@:@"),
         ("sendersOf:", imp_senders_of as Imp1 as *const c_void, "@@:@"),

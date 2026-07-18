@@ -141,6 +141,12 @@ pub fn serve(rx: &Receiver<CtlReq>, ui: &mut macvm::embed::VmHandle) {
             }
         } else if req.cmd == "ping" {
             "OK pong".to_string()
+        } else if req.cmd == "rebuild" {
+            // CG9: flag a UI-worker rebuild; the NEXT drain pass performs it
+            // (dropping the current UI VmHandle can't happen mid-request).
+            crate::rebuild::request();
+            crate::objc::wake_main_runloop();
+            "OK rebuild requested".to_string()
         } else {
             format!("ERR unknown command: {}", req.cmd)
         };

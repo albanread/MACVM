@@ -437,6 +437,7 @@ fn verb_help(_vm: &mut Vm<'_>, args: &[Value]) -> TclResult<Value> {
 /// window. Subcommands:
 ///   gui connect ?port?   — connect (default 7644)
 ///   gui ping             — round-trip check
+///   gui rebuild          — request a UI-worker rebuild-in-place (CG9)
 ///   gui eval <src>       — evaluate Smalltalk on the app's UI worker, answer printString
 ///   gui doit <src>       — execute Smalltalk on the app's UI worker
 ///   gui view <name>      — switch the app's content view (sugar for a doit)
@@ -460,6 +461,7 @@ fn verb_gui(_vm: &mut Vm<'_>, args: &[Value]) -> TclResult<Value> {
             Ok(Value::new(format!("connected 127.0.0.1:{port}")))
         }
         "ping" => gui_request(ctx, "ping").map(Value::new),
+        "rebuild" => gui_request(ctx, "rebuild").map(Value::new),
         "eval" => {
             let src = arg.ok_or_else(|| TclError::runtime("usage: gui eval <smalltalk>"))?;
             gui_request(ctx, &format!("eval {src}")).map(Value::new)
@@ -481,7 +483,7 @@ fn verb_gui(_vm: &mut Vm<'_>, args: &[Value]) -> TclResult<Value> {
             gui_request(ctx, &format!("sleep {ms}")).map(Value::new)
         }
         other => Err(TclError::runtime(format!(
-            "gui: unknown subcommand '{other}' (connect/ping/eval/doit/view/snap/sleep)"
+            "gui: unknown subcommand '{other}' (connect/ping/rebuild/eval/doit/view/snap/sleep)"
         ))),
     }
 }

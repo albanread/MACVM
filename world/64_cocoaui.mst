@@ -385,6 +385,48 @@ Print it does the same and inserts the result right after it."
 
         self installViewMenuOn: mainMenu.
         self installThemeMenuOn: mainMenu.
+        self installDebugMenuOn: mainMenu.
+    ]
+
+    CocoaUI class >> installDebugMenuOn: mainMenu [
+        "CG9: a Debug menu to exercise the recovery machinery on-screen —
+         'Rebuild UI' (Layer 2: tears down + rebuilds the whole window set on
+         a fresh UI worker VM; the primary and its state are untouched) and
+         'Force Fault' (Layer 1: a deliberate bad Alien deref in a callback,
+         recovered by the C6 door to its shape default — the run loop pumps
+         on)."
+        | debugMenu debugItem pairs |
+        debugMenu := (Cocoa classNamed: 'NSMenu') onMain alloc onMain init.
+        pairs := OrderedCollection new.
+        pairs add: (Array with: 'Rebuild UI' with: [ self requestRebuild ]).
+        pairs add: (Array with: 'Force Fault (recovered)' with: [ self forceFault ]).
+        pairs do: [ :pair |
+            | title item holder delegate |
+            title := pair at: 1.
+            item := ((Cocoa classNamed: 'NSMenuItem') onMain alloc) onMain
+                initWithTitle: title action: 'macvmAction:' keyEquivalent: ''.
+            holder := CocoaToolbarAction on: (pair at: 2).
+            delegate := MacvmDelegate actionTargetOn: holder.
+            item onMain setTarget: delegate.
+            debugMenu onMain addItem: item.
+            ToolbarDelegates add: delegate ].
+        debugItem := ((Cocoa classNamed: 'NSMenuItem') onMain alloc) onMain
+            initWithTitle: 'Debug' action: nil keyEquivalent: ''.
+        debugItem onMain setSubmenu: debugMenu.
+        mainMenu onMain addItem: debugItem.
+    ]
+    CocoaUI class >> requestRebuild [
+        "Ask the host to rebuild the UI worker in place (serviced on the next
+         main-thread drain, never inside this callback)."
+        ((Cocoa classNamed: 'MacvmHostService') onMain alloc) onMain init
+            onMain requestUiRebuild.
+    ]
+    CocoaUI class >> forceFault [
+        "A deliberate native fault inside a C6 callback — the door recovers it
+         to the shape default (Layer 1). Requesting a rebuild first proves a
+         recovered fault can escalate to a full rebuild (Layer 2)."
+        self requestRebuild.
+        ^(Alien forAddress: 8 size: 8) byteAt: 1
     ]
 
     CocoaUI class >> installViewMenuOn: mainMenu [

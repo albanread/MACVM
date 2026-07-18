@@ -309,6 +309,28 @@ pub(crate) fn deregister_setjmp() {
     }
 }
 
+/// How many `sigsetjmp` recovery slots are currently owned by a live thread —
+/// the count of nonzero `JMP_OWNER` entries. Ordinary (non-signal) code only.
+/// CG9's UI-worker restart leak gate uses this: a `VmHandle` drop must
+/// `deregister_setjmp` its slot, so booting-then-dropping a UI worker N times
+/// must leave this count unchanged (never climbing toward `JMP_REGISTRY_CAP`).
+pub fn active_jmp_slots() -> usize {
+    let _g = JMP_REGISTRY_LOCK.lock().unwrap();
+    JMP_OWNER
+        .iter()
+        .filter(|o| o.load(Ordering::Acquire) != 0)
+        .count()
+}
+
+/// How many code-cache PROBE registry slots are live (`REG_PROBE` nonzero) —
+/// the sibling leak gate for the deopt/probe registry. A dropped `VmHandle`
+/// whose nmethods were flushed must not strand PROBE entries across restarts.
+pub fn active_probe_slots() -> usize {
+    (0..REGISTRY_CAP)
+        .filter(|&i| REG_PROBE[i].load(Ordering::Acquire) != 0)
+        .count()
+}
+
 /// Async-signal-safe: does THIS (faulting) thread have a registered
 /// recovery slot? A fixed-array linear scan matched by `pthread_self()`,
 /// no lock, no allocation — the same shape as `lookup_pc_full` above, just

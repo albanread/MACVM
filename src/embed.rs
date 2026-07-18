@@ -3523,6 +3523,53 @@ mod tests {
         ui_doit_round_trip(&mut primary, &mut ui, &inbox, "CGLive new bar", "'84'");
     }
 
+    /// The CG9 soundness gate: booting a UI-worker-style VmHandle, publishing
+    /// it, and dropping it — the exact restart-in-place lifecycle — must return
+    /// the fixed sigsetjmp + PROBE registries to baseline every cycle, so many
+    /// rebuilds never climb toward the caps (JMP=64, PROBE=128) the design
+    /// warns a leak would exhaust. Runs on THIS thread (so each boot/drop
+    /// claims and releases the SAME `pthread_self()` slot — the tightest case:
+    /// a stranded slot would be immediately visible as growth). JIT off keeps
+    /// the PROBE registry empty of confounding entries; the point is the
+    /// Drop→deregister→release wiring, not codegen.
+    #[test]
+    fn ui_worker_restart_lifecycle_leaks_no_registry_slots() {
+        use crate::codecache::deopt_trap::{active_jmp_slots, active_probe_slots};
+        // A hosted primary to adopt a role against (as the real UI worker does).
+        let mut primary = boot_worker_primary();
+        let (id, _inbox, to_primary) =
+            crate::runtime::workers::register_hosted_worker(&mut primary.vm, Arc::new(|| {}))
+                .expect("register the hosted UI worker");
+
+        // Baseline AFTER the primary + one UI worker exist, then dropped: the
+        // count this thread's steady state returns to.
+        let jmp_before = active_jmp_slots();
+        let probe_before = active_probe_slots();
+
+        for cycle in 0..40 {
+            let mut ui = boot_ui_worker(id, to_primary.clone());
+            publish_ui_vm(&mut ui as *mut VmHandle);
+            // Exercise it so it actually claims a slot + runs guest code.
+            assert_eq!(ui.eval("3 + 4").expect("eval").trim(), "7");
+            // Unpublish before drop (the trampolines must never read a dangling
+            // pointer) — exactly `rebuild_ui`'s order.
+            publish_ui_vm(std::ptr::null_mut());
+            drop(ui); // Drop = Reservation munmap + deopt deregister + slot release
+            assert!(
+                active_jmp_slots() <= jmp_before,
+                "cycle {cycle}: jmp slots {} exceeded baseline {jmp_before} — a restart stranded a recovery slot",
+                active_jmp_slots()
+            );
+            assert!(
+                active_probe_slots() <= probe_before,
+                "cycle {cycle}: probe slots exceeded baseline — a restart stranded a PROBE entry"
+            );
+        }
+        // Final: dead level, nowhere near the caps.
+        assert!(active_jmp_slots() <= jmp_before + 1);
+        assert!(active_jmp_slots() < 32, "jmp registry must be nowhere near its 64 cap");
+    }
+
     #[test]
     fn peer_corr_namespacing_prevents_cross_peer_continuation_collision() {
         // Review R4 (cocoa_gui_design.md §7.3): PendingReplies keyed by corr

@@ -514,6 +514,36 @@ reboots; the backstop trips after N/T.
 
 **Design ref:** §5 Layers 2 & 3, §9.1 item 5.
 
+**As built.** A rebuild is a **flag serviced on the main-thread drain**, never
+an immediate call: dropping the UI worker's `VmHandle` from inside a callback
+executing in that very VM is unsound, so a callback (Debug ▸ Rebuild UI, Debug
+▸ Force Fault, the control `rebuild` command, the `requestUiRebuild` host IMP)
+only sets `rebuild::REBUILD_REQUESTED` + wakes the run loop; `drain_perform`
+performs the rebuild on its next pass, VM quiescent. `rebuild_ui`
+(`cocoa_gui/src/main.rs`) is the ordered Layer-2 teardown: unpublish the door
+(`ui_vm()`→null, trampolines fail closed) → best-effort `CocoaUI teardown` →
+drain+discard the dead generation's inbox → **boot a fresh UI worker
+re-adopting the SAME hosted id** (the channel is Rust-owned in `DrainState`, so
+no cross-thread re-registration on the live primary is needed — a simplification
+over the design's "retire + re-register") → assign, which **drops the old
+handle** (Reservation munmap + `deopt_trap::deregister_setjmp` + setjmp-slot
+release) → republish (bumps the UI-VM generation; stale C6 tickets fail closed)
+→ `CocoaUI startup`. Layer 3: `note_and_check_backstop` (`rebuild.rs`) —
+N=5 rebuilds within T=8s → dossier + `ExitProcess`.
+
+The **leak soundness gate** landed as designed but on the tighter same-thread
+case: `embed::ui_worker_restart_lifecycle_leaks_no_registry_slots` boots +
+publishes + drops a UI worker **40×** on one thread and asserts
+`deopt_trap::active_jmp_slots()` / `active_probe_slots()` (new introspection)
+return to baseline every cycle — a stranded slot would show as immediate growth,
+and the JMP=64 / PROBE=128 caps stay untouched. On-screen (TCL-driven): a
+`CG9Holder` class-var set to 4242 on the PRIMARY survived a `gui rebuild` (the
+toolbar/transcript came back fresh — metrics reset from 508→23 compilations,
+proving a genuinely new UI VM — and the primary answered `4242` through it);
+and Debug ▸ Force Fault → signal-11 recovered by the callback door (Layer 1) →
+escalated to a full rebuild (Layer 2) → the app pinged alive with the primary
+intact.
+
 ---
 
 ## CG10 — Worker bracket + GamePane drive + tracking-safe drain (design G5) `M`
