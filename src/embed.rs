@@ -3419,59 +3419,75 @@ mod tests {
         ui.exec("CocoaBrowser installSnapshot: CGB7 mk.")
             .expect("install a small snapshot (no outline built — headless)");
 
-        // The root and its combined child list: 2 inst + 1 class + 1 subclass.
+        // Paths are 0-based SUBCLASS hops: '' = the root class node, '0' its
+        // first subclass. (The multi-pane browser: classes in the outline,
+        // selectors in the table.)
         assert_eq!(
-            ui.eval("(CocoaBrowser resolvePath: '') at: 1").expect("root kind").trim(),
-            "#class"
+            ui.eval("(CocoaBrowser resolvePath: '') at: 1").expect("root name").trim(),
+            "'Object'"
         );
         assert_eq!(
-            ui.eval("CocoaBrowser childCountOf: (CocoaBrowser resolvePath: '')")
-                .expect("root child count")
+            ui.eval("(CocoaBrowser resolvePath: '0') at: 1")
+                .expect("first subclass")
                 .trim(),
-            "4"
+            "'Kid'"
         );
-        // Child ranges: instance sel, class sel (labelled), subclass, nested.
+        // The selector pane's data model, side-aware and pure.
         assert_eq!(
-            ui.eval("CocoaBrowser labelFor: (CocoaBrowser resolvePath: '0')")
+            ui.eval("(CocoaBrowser selectorsForPath: '' side: #instance) size")
+                .expect("root instance selectors")
+                .trim(),
+            "2"
+        );
+        assert_eq!(
+            ui.eval("(CocoaBrowser selectorsForPath: '' side: #instance) at: 1")
                 .expect("first instance selector")
                 .trim(),
             "'foo'"
         );
         assert_eq!(
-            ui.eval("CocoaBrowser labelFor: (CocoaBrowser resolvePath: '2')")
+            ui.eval("(CocoaBrowser selectorsForPath: '' side: #class) at: 1")
                 .expect("the class-side selector")
                 .trim(),
-            "'class >> make'"
+            "'make'"
         );
         assert_eq!(
-            ui.eval("(CocoaBrowser resolvePath: '3') at: 1").expect("subclass kind").trim(),
-            "#class"
-        );
-        assert_eq!(
-            ui.eval("CocoaBrowser labelFor: (CocoaBrowser resolvePath: '3')")
-                .expect("subclass label")
-                .trim(),
-            "'Kid'"
-        );
-        assert_eq!(
-            ui.eval("CocoaBrowser labelFor: (CocoaBrowser resolvePath: '3.0')")
-                .expect("nested method")
+            ui.eval("(CocoaBrowser selectorsForPath: '0' side: #instance) at: 1")
+                .expect("subclass instance selector")
                 .trim(),
             "'kidM'"
         );
-        // Fail-closed: an out-of-range hop and a path THROUGH a leaf both
-        // resolve nil → zero children, empty label.
+        // The class-search helper the scripting/selection drivers build on.
         assert_eq!(
-            ui.eval("CocoaBrowser childCountOf: (CocoaBrowser resolvePath: '9')")
-                .expect("out of range")
+            ui.eval("CocoaBrowser pathToClassNamed: 'Kid'")
+                .expect("path to Kid")
                 .trim(),
-            "0"
+            "'0'"
         );
         assert_eq!(
-            ui.eval("CocoaBrowser labelFor: (CocoaBrowser resolvePath: '0.0')")
-                .expect("a path through a method leaf")
+            ui.eval("CocoaBrowser pathToClassNamed: 'Object'")
+                .expect("path to the root")
                 .trim(),
             "''"
+        );
+        assert_eq!(
+            ui.eval("(CocoaBrowser pathToClassNamed: 'NoSuch') isNil")
+                .expect("missing class")
+                .trim(),
+            "true"
+        );
+        // Fail-closed: an out-of-range hop resolves nil → empty selectors.
+        assert_eq!(
+            ui.eval("(CocoaBrowser resolvePath: '9') isNil")
+                .expect("out of range resolves nil")
+                .trim(),
+            "true"
+        );
+        assert_eq!(
+            ui.eval("(CocoaBrowser selectorsForPath: '9' side: #instance) size")
+                .expect("stale path → zero rows")
+                .trim(),
+            "0"
         );
     }
 

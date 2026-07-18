@@ -11,6 +11,7 @@
 //! drains the UI worker's inbox on the main thread (§8). ⌘Q quits clean.
 
 mod boot;
+mod control;
 mod host_service;
 mod objc;
 mod snapshot;
@@ -39,6 +40,9 @@ struct DrainState {
     /// RATE (the toolbar shows B/s, `VmMetrics` only carries the running
     /// total). `None` before the first sample (no rate yet, not zero).
     prev_alloc: Option<u64>,
+    /// The RUSTTCL control channel's request queue (`MACVM_COCOA_CTL`), served
+    /// on the main thread each drain pass. `None` when the channel is off.
+    ctl: Option<std::sync::mpsc::Receiver<control::CtlReq>>,
 }
 
 /// `1536` -> `"1.5K"`, base-1024, one decimal past the first suffix — the
@@ -135,6 +139,9 @@ extern "C" fn drain_perform(info: *mut c_void) {
             eprintln!("macvm-cocoa: UI worker drain error: {e}");
         }
     }
+    if let Some(rx) = &st.ctl {
+        control::serve(rx, &mut st.ui);
+    }
     refresh_metrics(st);
 }
 
@@ -196,6 +203,10 @@ fn main() {
         }
     };
 
+    // The RUSTTCL control channel (opt-in, loopback): its requests ride the
+    // same main-thread drain as everything else.
+    let ctl = control::start(Arc::new(objc::wake_main_runloop));
+
     // Own the UI worker + supervisor + current inbox in one heap box, whose stable
     // address is the drain source's `info`.
     let mut drain = Box::new(DrainState {
@@ -203,6 +214,7 @@ fn main() {
         inbox: link.hosted_inbox,
         supervisor: sup,
         prev_alloc: None,
+        ctl,
     });
 
     // (design §3 step 4) Publish the thread-local `*mut VmHandle` the CG3/CG4

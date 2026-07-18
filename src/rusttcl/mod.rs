@@ -36,6 +36,9 @@ pub struct RusttclCtx {
     pub vm: VmState,
     pub world_dir: PathBuf,
     pub quit: bool,
+    /// The `gui` verb's connection to a running `macvm-cocoa`'s control
+    /// channel (`MACVM_COCOA_CTL`) — None until `gui connect`.
+    pub gui_conn: Option<std::net::TcpStream>,
 }
 
 impl RusttclCtx {
@@ -59,6 +62,7 @@ impl RusttclCtx {
             vm,
             world_dir,
             quit: false,
+            gui_conn: None,
         }
     }
 }

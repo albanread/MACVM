@@ -361,6 +361,22 @@ extern "C" fn imp_object_value(
     ) as *mut c_void
 }
 
+// `NSTableViewDelegate`'s selection notification (v@:@) — a table source
+// doubles as delegate exactly like the outline source does (CG7 browser:
+// selecting a selector row shows its source).
+extern "C" fn imp_table_selection_did_change(
+    this: *mut c_void,
+    _cmd: *mut c_void,
+    note: *mut c_void,
+) {
+    dispatch(
+        this,
+        "tableViewSelectionDidChange:",
+        &[ArgVal::Id(note)],
+        RetShape::Void,
+    );
+}
+
 // MacvmOutlineSource — `NSOutlineViewDataSource`.
 extern "C" fn imp_num_children(
     this: *mut c_void,
@@ -561,6 +577,11 @@ fn table_source_class() -> Option<*mut c_void> {
                         "tableView:objectValueForTableColumn:row:",
                         imp_ptr!(imp_object_value, ImpIdTcr),
                         "@@:@@q",
+                    ),
+                    (
+                        "tableViewSelectionDidChange:",
+                        imp_ptr!(imp_table_selection_did_change, ImpV1),
+                        "v@:@",
                     ),
                 ],
             )

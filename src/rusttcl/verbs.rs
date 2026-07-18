@@ -100,6 +100,11 @@ const TABLE: &[VerbDoc] = &[
         help: "Restore tier-up eligibility for a `pin`-ed method.",
     },
     VerbDoc {
+        name: "gui",
+        usage: "gui connect ?port? | ping | eval <src> | doit <src> | view <name> | snap <path> | sleep <ms>",
+        help: "Drive a running macvm-cocoa over its MACVM_COCOA_CTL control channel: run doits on its UI worker, switch views, capture window PNGs.",
+    },
+    VerbDoc {
         name: "help",
         usage: "help [verb]",
         help: "List every RUSTTCL verb, or show one verb's full help text.",
@@ -128,6 +133,7 @@ pub fn register_macvm_verbs(registry: &mut Registry) {
     registry.register("disasm-native", Arity::exact(2), verb_disasm_native);
     registry.register("pin", Arity::exact(2), verb_pin);
     registry.register("unpin", Arity::exact(2), verb_unpin);
+    registry.register("gui", Arity::range(1, 2), verb_gui);
     registry.register("help", Arity::range(0, 1), verb_help);
     registry.register("quit", Arity::exact(0), verb_quit);
     registry.register("exit", Arity::exact(0), verb_quit);
@@ -422,6 +428,101 @@ fn verb_help(_vm: &mut Vm<'_>, args: &[Value]) -> TclResult<Value> {
             }
         }
         _ => unreachable!("Arity::range(0, 1) already rejects more than 1 arg"),
+    }
+}
+
+/// `gui` — drive a RUNNING `macvm-cocoa` over its control channel
+/// (`MACVM_COCOA_CTL=<port>`), so on-screen states are scriptable and
+/// snapshot-inspectable from a Tcl session instead of needing a human at the
+/// window. Subcommands:
+///   gui connect ?port?   — connect (default 7644)
+///   gui ping             — round-trip check
+///   gui eval <src>       — evaluate Smalltalk on the app's UI worker, answer printString
+///   gui doit <src>       — execute Smalltalk on the app's UI worker
+///   gui view <name>      — switch the app's content view (sugar for a doit)
+///   gui snap <path>      — capture the window's client area to a PNG
+///   gui sleep <ms>       — pause app-side (lets async replies land)
+fn verb_gui(_vm: &mut Vm<'_>, args: &[Value]) -> TclResult<Value> {
+    let ctx = bridge::active_ctx();
+    let sub = args[0].as_str();
+    let arg = args.get(1).map(|v| v.as_str().to_string());
+    match sub {
+        "connect" => {
+            let port: u16 = arg
+                .as_deref()
+                .unwrap_or("7644")
+                .trim()
+                .parse()
+                .map_err(|_| TclError::runtime("gui connect: port must be a number"))?;
+            let conn = std::net::TcpStream::connect(("127.0.0.1", port))
+                .map_err(|e| TclError::runtime(format!("gui connect 127.0.0.1:{port}: {e}")))?;
+            ctx.gui_conn = Some(conn);
+            Ok(Value::new(format!("connected 127.0.0.1:{port}")))
+        }
+        "ping" => gui_request(ctx, "ping").map(Value::new),
+        "eval" => {
+            let src = arg.ok_or_else(|| TclError::runtime("usage: gui eval <smalltalk>"))?;
+            gui_request(ctx, &format!("eval {src}")).map(Value::new)
+        }
+        "doit" => {
+            let src = arg.ok_or_else(|| TclError::runtime("usage: gui doit <smalltalk>"))?;
+            gui_request(ctx, &format!("doit {src}")).map(Value::new)
+        }
+        "view" => {
+            let name = arg.ok_or_else(|| TclError::runtime("usage: gui view <name>"))?;
+            gui_request(ctx, &format!("doit CocoaUI switchToView: #{name}.")).map(Value::new)
+        }
+        "snap" => {
+            let path = arg.ok_or_else(|| TclError::runtime("usage: gui snap <path>"))?;
+            gui_request(ctx, &format!("snap {path}")).map(Value::new)
+        }
+        "sleep" => {
+            let ms = arg.ok_or_else(|| TclError::runtime("usage: gui sleep <ms>"))?;
+            gui_request(ctx, &format!("sleep {ms}")).map(Value::new)
+        }
+        other => Err(TclError::runtime(format!(
+            "gui: unknown subcommand '{other}' (connect/ping/eval/doit/view/snap/sleep)"
+        ))),
+    }
+}
+
+/// One framed request/reply on the gui connection (`<len>\n<bytes>` both
+/// ways, matching `cocoa_gui/src/control.rs`). `OK`-prefixed replies answer
+/// their payload; `ERR` becomes a Tcl error.
+fn gui_request(ctx: &mut super::RusttclCtx, cmd: &str) -> TclResult<String> {
+    use std::io::{Read, Write};
+    let conn = ctx
+        .gui_conn
+        .as_mut()
+        .ok_or_else(|| TclError::runtime("gui: not connected — run `gui connect ?port?`"))?;
+    let io_err = |e: std::io::Error| TclError::runtime(format!("gui: connection error: {e}"));
+    conn.write_all(format!("{}\n", cmd.len()).as_bytes())
+        .map_err(io_err)?;
+    conn.write_all(cmd.as_bytes()).map_err(io_err)?;
+    conn.flush().map_err(io_err)?;
+    let mut len_line = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        let n = conn.read(&mut byte).map_err(io_err)?;
+        if n == 0 {
+            return Err(TclError::runtime("gui: the app closed the connection"));
+        }
+        if byte[0] == b'\n' {
+            break;
+        }
+        len_line.push(byte[0]);
+    }
+    let len: usize = String::from_utf8_lossy(&len_line)
+        .trim()
+        .parse()
+        .map_err(|_| TclError::runtime("gui: bad reply frame"))?;
+    let mut buf = vec![0u8; len];
+    conn.read_exact(&mut buf).map_err(io_err)?;
+    let reply = String::from_utf8_lossy(&buf).into_owned();
+    if let Some(rest) = reply.strip_prefix("OK") {
+        Ok(rest.trim_start().to_string())
+    } else {
+        Err(TclError::runtime(format!("gui: {reply}")))
     }
 }
 

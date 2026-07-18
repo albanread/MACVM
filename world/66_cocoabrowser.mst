@@ -1,50 +1,69 @@
-"66_cocoabrowser.mst — CocoaBrowser: the native class browser (CG7). Loaded
- ONLY via world/cocoaui.list, after 64_cocoaui.mst (CocoaUI registers it at
- startup by name, so this file is optional at runtime and absent everywhere
- else).
+"66_cocoabrowser.mst — CocoaBrowser: the native class browser (CG7), in the
+ CLASSIC multi-pane shape (the well-known Smalltalk browser, matching the
+ WKWebView GUI's own): a class-hierarchy pane, a selector pane with an
+ instance/class side toggle, and a source pane below — all separated by
+ MOVABLE NSSplitView dividers so the user adjusts the layout by dragging.
+ Loaded ONLY via world/cocoaui.list, after 64_cocoaui.mst (CocoaUI registers
+ it at startup by name, so this file is optional at runtime).
 
- The classic split, dual-placed (feedback_dual_placement_not_migration):
-   ROWS   — a names-only snapshot of the PRIMARY's live class hierarchy
+     HSplit (side by side, draggable)          VSplit (stacked, draggable)
+     ┌───────────────┬─────────────────────┐
+     │ class         │ [instance] [class]  │
+     │ hierarchy     │ selector list       │
+     │ (outline)     │ (table)             │
+     ├───────────────┴─────────────────────┤
+     │ source (read-only)                  │
+     └─────────────────────────────────────┘
+
+ Dual placement (feedback_dual_placement_not_migration):
+   ROWS   — a names-only snapshot of the PRIMARY's live hierarchy
             ({name. ivars. classVars. instSels. classSels. children} nodes,
-            UiBrowserService on the primary, shipped as {#browserTree. tree}
-            over the CG4 request protocol). Strings/Arrays only — the worker
-            pickle REFUSES class oops, so a mirror can never leak across (R3).
+            UiBrowserService, {#browserTree. tree} over the CG4 protocol);
+            the worker pickle REFUSES class oops, so a mirror can never
+            cross (R3).
    SOURCE — host-served from the SQLite image (MacvmHostService, Rust,
-            image_store) — the SAME store the WKWebView GUI reads, because
-            the VM keeps no method source. Live-defined classes therefore
-            browse (rows) but show a no-source note (text) — honest, and
-            exactly what the web GUI would show after a reseed lag.
+            image_store read-only) — the VM keeps no method source. Classes
+            defined live this session browse (rows) with an honest
+            no-source note (text).
 
- The outline is an NSOutlineView whose dataSource AND delegate are ONE
- MacvmOutlineSource (C6) bound to this class. AppKit's item objects are
- HANDLE NSStrings, one per tree path ('2.0.14'), minted on demand and cached
- by Symbol key — cached because NSOutlineView tracks expansion/selection by
- item IDENTITY, so the same node must answer the same id every time (the
- cocoa_delegate gate pins this); Symbol-keyed because String Dictionary keys
- hash by identity here and would silently defeat the cache. The wrap retains,
- so a cached handle's NSString lives until the re-blast releases it.
+ The hierarchy outline's items are HANDLE NSStrings, one per tree path
+ ('2.0.14' = 0-based subclass hops), minted on demand and cached by SYMBOL
+ key (String Dictionary keys hash by identity here and would defeat the
+ cache) — NSOutlineView tracks expansion/selection by item IDENTITY, so the
+ same node must answer the same id every time (gated in cocoa_delegate).
+ The wrap retains, so a cached handle lives until the re-blast releases it.
+ installSnapshot:'s release-BEFORE-reload order is load-bearing: reload's
+ synchronous callbacks re-mint and cache the NEW generation's handles.
 
- A class node's combined child list is [instance selectors][class selectors]
- [subclasses] — leaf, leaf, expandable — resolved by walking the snapshot
- from the root on every callback (depth ≤ hierarchy depth; human-paced).
+ ONE Smalltalk receiver (this class) serves all three delegate instances —
+ the outline's MacvmOutlineSource, the table's MacvmTableSource, and the
+ side buttons' action targets — their selector sets don't collide.
 
- Selection: outlineViewSelectionDidChange: resolves the selected item's path;
- a method leaf fetches sourceForClass:side:selector:, a class node fetches
- classSourceFor:, both through the host service, into the read-only source
- pane at the bottom."
+ Re-entrancy rule (the C6 door fails a NESTED callback closed): a selection
+ callback must never reloadData synchronously — the reload's data-source
+ callbacks would nest and answer 0 rows. Every reload triggered FROM a
+ callback is deferred to the next run-loop turn via
+ performSelector:'reloadData' withObject: nil afterDelay: 0.
+
+ Scripting (the rusttcl `gui` verb drives these — how screens get LOOKED at
+ without a human): expandAll / selectClassNamed: / selectSelectorNamed: /
+ side: — each drives the same path the equivalent click drives."
 
 Object subclass: CocoaBrowser [
-    <classVars: Snapshot Handles HandleList Container Scroll Outline Col
-                SourceView Delegate Svc>
+    <classVars: Snapshot Handles HandleList Container VSplit HSplit
+                OutlineScroll Outline OCol RightPane TableScroll Table TCol
+                SideInstBtn SideClsBtn SideDelegates SourceView
+                OutlineDelegate TableDelegate Svc SelectedPath Side>
 
-    CocoaBrowser class >> sourcePaneHeight [ ^170.0 ]
+    CocoaBrowser class >> sourcePaneHeight [ ^200.0 ]
+    CocoaBrowser class >> hierarchyWidth [ ^300.0 ]
+    CocoaBrowser class >> sideStripHeight [ ^28.0 ]
 
     "── registration (called by CocoaUI startup, by name) ──"
     CocoaBrowser class >> register [
         CocoaUI registerViewNamed: #browser title: 'Browser' icon: 'hierarchy'
                 activate: [ self activate ]
     ]
-
     CocoaBrowser class >> activate [
         Container isNil ifTrue: [ self buildView ].
         CocoaUI contentHost onMain addSubview: Container.
@@ -58,27 +77,32 @@ Object subclass: CocoaBrowser [
                 ifTrue: [ CocoaBrowser installSnapshot: (r at: 2) ] ]
     ]
     CocoaBrowser class >> installSnapshot: tree [
-        "Blast, don't patch: a fresh tree replaces everything. The order is
-         LOAD-BEARING (CG7 review): releaseHandles BEFORE reloadData, because
-         reloadData's synchronous callbacks re-mint and cache the NEW
-         generation's handles — releasing after would drop exactly those. The
-         old NSStrings can't dangle in the window between: this all runs
-         synchronously on main (no nested run loop, so AppKit cannot call
-         back mid-install), and NSOutlineView retains the items it still
-         holds until the reload."
+        "Blast, don't patch. Order is LOAD-BEARING (CG7 review):
+         releaseHandles BEFORE reloadData — reload's synchronous callbacks
+         re-mint and cache the NEW generation's handles; releasing after
+         would drop exactly those. Nothing can call back in the window
+         between (this runs synchronously on main, no nested run loop), and
+         NSOutlineView retains the items it still holds until the reload.
+         This runs from a continuation (never inside a C6 callback), so the
+         direct reloadData here is safe."
         self releaseHandles.
         Snapshot := tree.
-        Outline isNil ifFalse: [ Outline onMain reloadData ].
+        SelectedPath := nil.
+        Outline isNil ifFalse: [
+            Outline onMain reloadData.
+            "Open with the root row expanded — Object plus its immediate
+             subclasses visible, matching the web outliner's first view."
+            Outline onMain expandItem: (self handleFor: '') ].
+        Table isNil ifFalse: [ Table onMain reloadData ].
     ]
     CocoaBrowser class >> environmentRestarted [
-        "The primary respawned from source: the old tree describes a dead
-         world (session-defined classes vanished). Re-request if we ever
-         loaded one; the reply re-blasts."
+        "The primary respawned from source: session-defined classes are
+         gone. Re-request if we ever loaded; the reply re-blasts."
         Snapshot isNil ifFalse: [ self requestRefresh ].
     ]
     CocoaBrowser class >> snapshot [ ^Snapshot ]
 
-    "── path scheme: '' = the root class node; '2.0.14' = 0-based child hops ──"
+    "── the path scheme: '' = root (Object); '2.14' = 0-based SUBCLASS hops ──"
     CocoaBrowser class >> handleFor: path [
         | k h |
         Handles isNil ifTrue: [ Handles := Dictionary new. HandleList := OrderedCollection new ].
@@ -111,85 +135,144 @@ Object subclass: CocoaBrowser [
         ^out asArray
     ]
 
-    "Resolve a path against the snapshot. Answers
-       {#class. classNode} | {#imeth. classNode. sel} | {#cmeth. classNode. sel}
-     or nil for a stale/invalid path (a callback racing a re-blast) — every
-     caller treats nil as empty, so a stale handle fails CLOSED, never raises."
+    "Resolve a path to its CLASS node (the outline shows classes only), or
+     nil for a stale/invalid path — every consumer treats nil as empty, so
+     a callback racing a re-blast fails CLOSED, never raises."
     CocoaBrowser class >> resolvePath: pathString [
-        | node parts last i nI nC |
+        | node kids |
         Snapshot isNil ifTrue: [ ^nil ].
         node := Snapshot.
-        pathString = '' ifTrue: [ ^Array with: #class with: node ].
-        parts := self splitPath: pathString.
-        last := parts size.
-        1 to: last do: [ :d |
-            i := parts at: d.
-            nI := (node at: 4) size.
-            nC := (node at: 5) size.
-            i < nI ifTrue: [
-                d = last ifFalse: [ ^nil ].
-                ^Array with: #imeth with: node with: ((node at: 4) at: i + 1) ].
-            i < (nI + nC) ifTrue: [
-                d = last ifFalse: [ ^nil ].
-                ^Array with: #cmeth with: node with: ((node at: 5) at: i - nI + 1) ].
-            i - nI - nC < (node at: 6) size ifFalse: [ ^nil ].
-            node := (node at: 6) at: i - nI - nC + 1 ].
-        ^Array with: #class with: node
+        pathString = '' ifTrue: [ ^node ].
+        (self splitPath: pathString) do: [ :i |
+            kids := node at: 6.
+            i < kids size ifFalse: [ ^nil ].
+            node := kids at: i + 1 ].
+        ^node
     ]
-    CocoaBrowser class >> childCountOf: resolved [
+    "The current side's selectors of the node at `path` — pure, headless-
+     testable (the table's whole data model)."
+    CocoaBrowser class >> selectorsForPath: pathString side: aSide [
         | node |
-        resolved isNil ifTrue: [ ^0 ].
-        (resolved at: 1) == #class ifFalse: [ ^0 ].
-        node := resolved at: 2.
-        ^(node at: 4) size + (node at: 5) size + (node at: 6) size
+        node := self resolvePath: pathString.
+        node isNil ifTrue: [ ^Array new: 0 ].
+        ^aSide == #class ifTrue: [ node at: 5 ] ifFalse: [ node at: 4 ]
     ]
-    CocoaBrowser class >> labelFor: resolved [
-        resolved isNil ifTrue: [ ^'' ].
-        (resolved at: 1) == #imeth ifTrue: [ ^resolved at: 3 ].
-        (resolved at: 1) == #cmeth ifTrue: [ ^'class >> ' , (resolved at: 3) ].
-        ^(resolved at: 2) at: 1
+    CocoaBrowser class >> currentSelectors [
+        SelectedPath isNil ifTrue: [ ^Array new: 0 ].
+        ^self selectorsForPath: SelectedPath side: Side
+    ]
+    "The path to the first class named `aName` (depth-first), or nil —
+     pure; the scripting/selection helpers build on it."
+    CocoaBrowser class >> pathToClassNamed: aName [
+        ^self pathTo: aName in: Snapshot at: ''
+    ]
+    CocoaBrowser class >> pathTo: aName in: node at: path [
+        | kids found |
+        node isNil ifTrue: [ ^nil ].
+        (node at: 1) = aName ifTrue: [ ^path ].
+        kids := node at: 6.
+        1 to: kids size do: [ :i |
+            found := self pathTo: aName in: (kids at: i)
+                          at: (path = '' ifTrue: [ (i - 1) printString ]
+                                         ifFalse: [ path , '.' , (i - 1) printString ]).
+            found isNil ifFalse: [ ^found ] ].
+        ^nil
     ]
 
-    "── the C6 data-source/delegate callbacks (one receiver serves both) ──"
+    "── the hierarchy outline's C6 callbacks (classes only) ──
+     AppKit's nil item (the invisible tree top) shows exactly ONE row: the
+     root class itself (path '') — so 'Object' is visible and selectable at
+     the top, as in the web outliner. Below it, paths are subclass hops."
     CocoaBrowser class >> outlineView: ov numberOfChildrenOfItem: item [
-        ^self childCountOf: (self resolvePath: (self pathOf: item))
+        | node |
+        item isNil ifTrue: [ ^Snapshot isNil ifTrue: [ 0 ] ifFalse: [ 1 ] ].
+        node := self resolvePath: (self pathOf: item).
+        ^node isNil ifTrue: [ 0 ] ifFalse: [ (node at: 6) size ]
     ]
     CocoaBrowser class >> outlineView: ov isItemExpandable: item [
-        ^(self childCountOf: (self resolvePath: (self pathOf: item))) > 0
+        ^(self outlineView: ov numberOfChildrenOfItem: item) > 0
     ]
     CocoaBrowser class >> outlineView: ov child: i ofItem: item [
         | p |
+        item isNil ifTrue: [ ^self handleFor: '' ].
         p := self pathOf: item.
         ^self handleFor: (p = '' ifTrue: [ i printString ]
                                  ifFalse: [ p , '.' , i printString ])
     ]
     CocoaBrowser class >> outlineView: ov objectValueForTableColumn: col byItem: item [
-        ^self labelFor: (self resolvePath: (self pathOf: item))
+        | node |
+        node := self resolvePath: (self pathOf: item).
+        ^node isNil ifTrue: [ '' ] ifFalse: [ node at: 1 ]
     ]
     CocoaBrowser class >> outlineViewSelectionDidChange: aNote [
-        self showSelection
-    ]
-
-    "── selection → the source pane (host-served from the image) ──"
-    CocoaBrowser class >> showSelection [
-        | row item resolved kind node |
+        | row item |
         Outline isNil ifTrue: [ ^self ].
         row := Outline onMain selectedRow.
         row < 0 ifTrue: [ ^self ].
         item := Outline onMain itemAtRow: row.
         item isNil ifTrue: [ ^self ].
-        resolved := self resolvePath: (self pathOf: item).
-        "itemAtRow: minted a FRESH wrapper (+1) on the handle NSString — drop
-         it now the path is read, or every selection leaks one (CG7 review)."
+        SelectedPath := self pathOf: item.
+        "itemAtRow: minted a FRESH wrapper (+1) on the handle — drop it once
+         the path is read, or every selection leaks one (CG7 review)."
         item release.
-        resolved isNil ifTrue: [ ^self ].
-        kind := resolved at: 1.
-        node := resolved at: 2.
-        kind == #class ifTrue: [ ^self showSource: (self hostClassSource: (node at: 1)) ].
-        kind == #imeth ifTrue: [
-            ^self showSource: (self hostSourceClass: (node at: 1) side: 'instance' selector: (resolved at: 3)) ].
-        kind == #cmeth ifTrue: [
-            ^self showSource: (self hostSourceClass: (node at: 1) side: 'class' selector: (resolved at: 3)) ].
+        self showClassDefinition.
+        self deferReload: Table.
+    ]
+
+    "── the selector table's C6 callbacks ──"
+    CocoaBrowser class >> numberOfRowsInTableView: aTable [
+        ^self currentSelectors size
+    ]
+    CocoaBrowser class >> tableView: aTable objectValueForTableColumn: aCol row: aRow [
+        | sels |
+        sels := self currentSelectors.
+        aRow < sels size ifFalse: [ ^'' ].
+        ^sels at: aRow + 1
+    ]
+    CocoaBrowser class >> tableViewSelectionDidChange: aNote [
+        | row sels |
+        Table isNil ifTrue: [ ^self ].
+        row := Table onMain selectedRow.
+        row < 0 ifTrue: [ ^self ].
+        sels := self currentSelectors.
+        row < sels size ifFalse: [ ^self ].
+        self showSelectorSource: (sels at: row + 1)
+    ]
+
+    "── side toggle ──"
+    CocoaBrowser class >> side: aSymbol [
+        Side := aSymbol.
+        SideInstBtn isNil ifFalse: [
+            SideInstBtn onMain setState: (aSymbol == #instance ifTrue: [ 1 ] ifFalse: [ 0 ]) ].
+        SideClsBtn isNil ifFalse: [
+            SideClsBtn onMain setState: (aSymbol == #class ifTrue: [ 1 ] ifFalse: [ 0 ]) ].
+        self deferReload: Table.
+        self showClassDefinition.
+    ]
+
+    "── a reload requested from INSIDE a callback: defer one run-loop turn,
+       so the data-source callbacks it triggers are top-level, not nested
+       (nested C6 callbacks fail closed = a blank pane) ──"
+    CocoaBrowser class >> deferReload: aView [
+        aView isNil ifTrue: [ ^self ].
+        aView onMain performSelector: 'reloadData' withObject: nil afterDelay: 0.0
+    ]
+
+    "── selection → the source pane (host-served from the image) ──"
+    CocoaBrowser class >> showClassDefinition [
+        | node |
+        SelectedPath isNil ifTrue: [ ^self ].
+        node := self resolvePath: SelectedPath.
+        node isNil ifTrue: [ ^self ].
+        self showSource: (self hostClassSource: (node at: 1))
+    ]
+    CocoaBrowser class >> showSelectorSource: aSelector [
+        | node |
+        node := self resolvePath: SelectedPath.
+        node isNil ifTrue: [ ^self ].
+        self showSource: (self hostSourceClass: (node at: 1)
+                               side: (Side == #class ifTrue: [ 'class' ] ifFalse: [ 'instance' ])
+                               selector: aSelector)
     ]
     CocoaBrowser class >> hostService [
         Svc isNil ifTrue: [
@@ -201,8 +284,8 @@ Object subclass: CocoaBrowser [
         ns := self hostService onMain sourceForClass: c side: s selector: m.
         ns isNil ifTrue: [ ^'' ].
         text := ns sendString: 'description'.
-        "The reply NSString's wrapper is +1 and per-click FRESH (a whole
-         method's source text) — release once copied, or it leaks (CG7 review)."
+        "The reply NSString's wrapper is +1 and per-click fresh — release
+         once copied, or it leaks (CG7 review)."
         ns release.
         ^text
     ]
@@ -218,65 +301,194 @@ Object subclass: CocoaBrowser [
         | text |
         SourceView isNil ifTrue: [ ^self ].
         text := aString isEmpty
-            ifTrue: [ '"no source in the image for this selection (defined live this session, or a primitive-only method) — the rows are the primary''s, the text is the image''s"' ]
+            ifTrue: [ '"no source in the image for this selection (defined live this session, or a primitive-only method)"' ]
             ifFalse: [ aString ].
         SourceView onMain setString: text.
     ]
 
-    "── the view: an outline (scrolling) over a read-only source pane ──"
+    "── scripting/automation (driven by rusttcl `gui doit`) ──"
+    CocoaBrowser class >> expandAll [
+        Outline isNil ifTrue: [ ^self ].
+        Outline onMain expandItem: nil expandChildren: true
+    ]
+    CocoaBrowser class >> selectClassNamed: aName [
+        "Drive the SAME path a click drives: select the row, then run the
+         selection handler directly (programmatic selection's notification
+         policy varies; the direct call makes the behavior definite —
+         double-firing is idempotent)."
+        | path row |
+        path := self pathToClassNamed: aName.
+        path isNil ifTrue: [ ^self ].
+        row := Outline onMain rowForItem: (self handleFor: path).
+        row < 0 ifTrue: [ ^self ].
+        Outline onMain selectRowIndexes: ((Cocoa classNamed: 'NSIndexSet') onMain
+                                              indexSetWithIndex: row)
+                byExtendingSelection: false.
+        Outline onMain scrollRowToVisible: row.
+        SelectedPath := path.
+        self showClassDefinition.
+        self deferReload: Table.
+    ]
+    CocoaBrowser class >> selectSelectorNamed: aSelector [
+        | sels row |
+        sels := self currentSelectors.
+        row := 0.
+        1 to: sels size do: [ :i | (sels at: i) = aSelector ifTrue: [ row := i ] ].
+        row = 0 ifTrue: [ ^self ].
+        Table onMain selectRowIndexes: ((Cocoa classNamed: 'NSIndexSet') onMain
+                                            indexSetWithIndex: row - 1)
+              byExtendingSelection: false.
+        Table onMain scrollRowToVisible: row - 1.
+        self showSelectorSource: aSelector.
+    ]
+
+    "── the view: split panes, movable dividers ──"
     CocoaBrowser class >> buildView [
-        | host frame w h viewCls outlineH |
+        | host frame w h |
         host := CocoaUI contentHost.
         frame := host onMain frame.
         w := frame at: 3.
         h := frame at: 4.
-        outlineH := h - self sourcePaneHeight.
-        viewCls := Cocoa classNamed: 'NSView'.
-        Container := (viewCls onMain alloc) onMain
+        Side := #instance.
+        Container := ((Cocoa classNamed: 'NSView') onMain alloc) onMain
             initWithFrame: (Array with: 0.0 with: 0.0 with: w with: h).
         Container onMain setAutoresizingMask: CocoaUI maskWidthSizable + CocoaUI maskHeightSizable.
 
+        "VSplit: panes over source, horizontal divider the user can drag."
+        VSplit := ((Cocoa classNamed: 'NSSplitView') onMain alloc) onMain
+            initWithFrame: (Array with: 0.0 with: 0.0 with: w with: h).
+        VSplit onMain setVertical: false.
+        VSplit onMain setDividerStyle: 1. "thin"
+        VSplit onMain setAutoresizingMask: CocoaUI maskWidthSizable + CocoaUI maskHeightSizable.
+
+        "HSplit: hierarchy beside selectors, vertical divider."
+        HSplit := ((Cocoa classNamed: 'NSSplitView') onMain alloc) onMain
+            initWithFrame: (Array with: 0.0 with: 0.0 with: w with: h - self sourcePaneHeight).
+        HSplit onMain setVertical: true.
+        HSplit onMain setDividerStyle: 1.
+
+        self buildHierarchyPane: (Array with: 0.0 with: 0.0
+                                        with: self hierarchyWidth
+                                        with: h - self sourcePaneHeight).
+        self buildSelectorPane: (Array with: 0.0 with: 0.0
+                                       with: w - self hierarchyWidth
+                                       with: h - self sourcePaneHeight).
+        HSplit onMain addSubview: OutlineScroll.
+        HSplit onMain addSubview: RightPane.
+
+        self buildSourcePane: (Array with: 0.0 with: 0.0 with: w with: self sourcePaneHeight).
+        VSplit onMain addSubview: HSplit.
+        VSplit onMain addSubview: SourceView.
+        VSplit onMain adjustSubviews.
+        HSplit onMain adjustSubviews.
+        "Initial divider positions (drag to taste afterwards)."
+        VSplit onMain setPosition: h - self sourcePaneHeight ofDividerAtIndex: 0.
+        HSplit onMain setPosition: self hierarchyWidth ofDividerAtIndex: 0.
+        Container onMain addSubview: VSplit.
+        self showSource: '"select a class on the left, then a selector on the right"'.
+    ]
+
+    CocoaBrowser class >> buildHierarchyPane: rect [
+        OutlineScroll := ((Cocoa classNamed: 'NSScrollView') onMain alloc) onMain
+            initWithFrame: rect.
+        OutlineScroll onMain setHasVerticalScroller: true.
+        Outline := ((Cocoa classNamed: 'NSOutlineView') onMain alloc) onMain
+            initWithFrame: rect.
+        OCol := ((Cocoa classNamed: 'NSTableColumn') onMain alloc) onMain
+            initWithIdentifier: 'class'.
+        OCol onMain setWidth: 800.0.
+        Outline onMain addTableColumn: OCol.
+        Outline onMain setOutlineTableColumn: OCol.
+        Outline onMain setHeaderView: nil.
+        OutlineDelegate := MacvmDelegate outlineSourceOn: self.
+        Outline onMain setDataSource: OutlineDelegate.
+        Outline onMain setDelegate: OutlineDelegate.
+        OutlineScroll onMain setDocumentView: Outline.
+    ]
+
+    CocoaBrowser class >> buildSelectorPane: rect [
+        | w h btnClass |
+        w := rect at: 3.
+        h := rect at: 4.
+        RightPane := ((Cocoa classNamed: 'NSView') onMain alloc) onMain
+            initWithFrame: rect.
+        RightPane onMain setAutoresizesSubviews: true.
+        SideDelegates := OrderedCollection new.
+        btnClass := Cocoa classNamed: 'NSButton'.
+        SideInstBtn := self sideButton: 'instance' frame: (Array with: 6.0 with: h - 24.0 with: 84.0 with: 20.0)
+                            action: [ self side: #instance ] using: btnClass.
+        SideClsBtn := self sideButton: 'class' frame: (Array with: 96.0 with: h - 24.0 with: 84.0 with: 20.0)
+                           action: [ self side: #class ] using: btnClass.
+        SideInstBtn onMain setState: 1.
+        TableScroll := ((Cocoa classNamed: 'NSScrollView') onMain alloc) onMain
+            initWithFrame: (Array with: 0.0 with: 0.0 with: w with: h - self sideStripHeight).
+        TableScroll onMain setHasVerticalScroller: true.
+        TableScroll onMain setAutoresizingMask: CocoaUI maskWidthSizable + CocoaUI maskHeightSizable.
+        Table := ((Cocoa classNamed: 'NSTableView') onMain alloc) onMain
+            initWithFrame: (Array with: 0.0 with: 0.0 with: w with: h - self sideStripHeight).
+        TCol := ((Cocoa classNamed: 'NSTableColumn') onMain alloc) onMain
+            initWithIdentifier: 'selector'.
+        TCol onMain setWidth: 800.0.
+        Table onMain addTableColumn: TCol.
+        Table onMain setHeaderView: nil.
+        TableDelegate := MacvmDelegate tableSourceOn: self.
+        Table onMain setDataSource: TableDelegate.
+        Table onMain setDelegate: TableDelegate.
+        TableScroll onMain setDocumentView: Table.
+        RightPane onMain addSubview: TableScroll.
+    ]
+    CocoaBrowser class >> sideButton: title frame: rect action: aBlock using: btnClass [
+        | btn holder delegate |
+        btn := (btnClass onMain alloc) onMain initWithFrame: rect.
+        btn onMain setTitle: title.
+        btn onMain setButtonType: 3. "NSButtonTypePushOnPushOff — shows state"
+        btn onMain setBezelStyle: 6. "small square"
+        btn onMain setAutoresizingMask: CocoaUI maskMaxYMargin. "pin to the strip at top"
+        holder := CocoaToolbarAction on: aBlock.
+        delegate := MacvmDelegate actionTargetOn: holder.
+        btn onMain setTarget: delegate.
+        btn onMain setAction: 'macvmAction:'.
+        SideDelegates add: delegate.
+        RightPane onMain addSubview: btn.
+        ^btn
+    ]
+
+    CocoaBrowser class >> buildSourcePane: rect [
         SourceView := ((Cocoa classNamed: 'NSTextView') onMain alloc) onMain
-            initWithFrame: (Array with: 0.0 with: 0.0 with: w with: self sourcePaneHeight).
+            initWithFrame: rect.
         SourceView onMain setEditable: false.
         SourceView onMain setFont: ((Cocoa classNamed: 'NSFont') onMain
             userFixedPitchFontOfSize: 12.0).
-        SourceView onMain setAutoresizingMask: CocoaUI maskWidthSizable + CocoaUI maskMaxYMargin.
-        Container onMain addSubview: SourceView.
-
-        Scroll := ((Cocoa classNamed: 'NSScrollView') onMain alloc) onMain
-            initWithFrame: (Array with: 0.0 with: self sourcePaneHeight with: w with: outlineH).
-        Scroll onMain setAutoresizingMask: CocoaUI maskWidthSizable + CocoaUI maskHeightSizable.
-        Scroll onMain setHasVerticalScroller: true.
-
-        Outline := ((Cocoa classNamed: 'NSOutlineView') onMain alloc) onMain
-            initWithFrame: (Array with: 0.0 with: 0.0 with: w with: outlineH).
-        Col := ((Cocoa classNamed: 'NSTableColumn') onMain alloc) onMain
-            initWithIdentifier: 'c'.
-        Col onMain setWidth: w - 40.0.
-        Outline onMain addTableColumn: Col.
-        Outline onMain setOutlineTableColumn: Col.
-        Outline onMain setHeaderView: nil.
-        Delegate := MacvmDelegate outlineSourceOn: self.
-        Outline onMain setDataSource: Delegate.
-        Outline onMain setDelegate: Delegate.
-        Scroll onMain setDocumentView: Outline.
-        Container onMain addSubview: Scroll.
-        self showSource: '"select a class or method above"'.
     ]
 
     CocoaBrowser class >> teardown [
-        "Idempotent release of everything native (mirrors CocoaUI teardown,
-         which calls this by name)."
+        "Idempotent release of everything native (CocoaUI teardown calls
+         this by name). Wrap-retain makes release order irrelevant — each
+         release drops only the wrapper's own +1 (CG7 review)."
         self releaseHandles.
-        Delegate isNil ifFalse: [ Delegate isValid ifTrue: [ Delegate release ] ].
+        OutlineDelegate isNil ifFalse: [ OutlineDelegate isValid ifTrue: [ OutlineDelegate release ] ].
+        TableDelegate isNil ifFalse: [ TableDelegate isValid ifTrue: [ TableDelegate release ] ].
+        SideDelegates isNil ifFalse: [
+            SideDelegates do: [ :d | d isValid ifTrue: [ d release ] ] ].
         Svc isNil ifFalse: [ Svc isValid ifTrue: [ Svc release ] ].
-        Col isNil ifFalse: [ Col isValid ifTrue: [ Col release ] ].
+        OCol isNil ifFalse: [ OCol isValid ifTrue: [ OCol release ] ].
+        TCol isNil ifFalse: [ TCol isValid ifTrue: [ TCol release ] ].
         Outline isNil ifFalse: [ Outline isValid ifTrue: [ Outline release ] ].
-        Scroll isNil ifFalse: [ Scroll isValid ifTrue: [ Scroll release ] ].
+        Table isNil ifFalse: [ Table isValid ifTrue: [ Table release ] ].
+        OutlineScroll isNil ifFalse: [ OutlineScroll isValid ifTrue: [ OutlineScroll release ] ].
+        TableScroll isNil ifFalse: [ TableScroll isValid ifTrue: [ TableScroll release ] ].
+        SideInstBtn isNil ifFalse: [ SideInstBtn isValid ifTrue: [ SideInstBtn release ] ].
+        SideClsBtn isNil ifFalse: [ SideClsBtn isValid ifTrue: [ SideClsBtn release ] ].
+        RightPane isNil ifFalse: [ RightPane isValid ifTrue: [ RightPane release ] ].
         SourceView isNil ifFalse: [ SourceView isValid ifTrue: [ SourceView release ] ].
+        HSplit isNil ifFalse: [ HSplit isValid ifTrue: [ HSplit release ] ].
+        VSplit isNil ifFalse: [ VSplit isValid ifTrue: [ VSplit release ] ].
         Container isNil ifFalse: [ Container isValid ifTrue: [ Container release ] ].
-        Snapshot := nil. Delegate := nil. Svc := nil. Col := nil.
-        Outline := nil. Scroll := nil. SourceView := nil. Container := nil.
+        Snapshot := nil. SelectedPath := nil. OutlineDelegate := nil.
+        TableDelegate := nil. SideDelegates := nil. Svc := nil.
+        OCol := nil. TCol := nil. Outline := nil. Table := nil.
+        OutlineScroll := nil. TableScroll := nil. SideInstBtn := nil.
+        SideClsBtn := nil. RightPane := nil. SourceView := nil.
+        HSplit := nil. VSplit := nil. Container := nil.
     ]
 ]
