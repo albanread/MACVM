@@ -55,7 +55,7 @@ Object subclass: CocoaToolbarAction [
 Object subclass: CocoaUI [
     <classVars: Win Toolbar ContentHost Transcript ActTarget TranscriptText
                 Views ActiveView ToolbarDelegates ToolbarButtons MetricLabels
-                Workspace>
+                MemBarFill MemBarWidth Workspace>
 
     CocoaUI class >> title [ ^'MACVM' ]
 
@@ -121,43 +121,93 @@ Object subclass: CocoaUI [
         self buildMetricsClusterIn: Toolbar.
     ]
 
+    CocoaUI class >> metricCellWidth [ ^64.0 ]
+
     CocoaUI class >> buildMetricsClusterIn: aToolbar [
-        "Five small, right-anchored read-only labels — MEM/JIT/CODE/ALLOC/GC —
-         matching the WKWebView GUI's own toolbar metrics cluster (same
-         VmMetrics fields, same semantics; sampled off the PRIMARY by the
-         Rust watchdog and pushed here via CocoaUI updateMetrics:...).
-         Right-anchored (MinXMargin flexible) so they track the edge on resize."
-        | names w x tfClass |
+        "Five small, TIGHTLY-packed, right-anchored two-row cells — a muted
+         caption (MEM/JIT/CODE/ALLOC/GC) over its value — matching the
+         WKWebView GUI's own compact toolbar metrics cluster (same VmMetrics
+         fields/semantics; sampled off the PRIMARY by the Rust watchdog and
+         pushed here via updateMetricsMem:jit:code:alloc:gc:memPct:). The
+         whole cluster hugs the right edge (MinXMargin flexible) so it tracks
+         on resize; MEM additionally carries a small used/capacity bar — the
+         graphical touch the plain-text v1 was missing."
+        | names w x tfClass colorClass fontClass captionFont valueFont |
         tfClass := Cocoa classNamed: 'NSTextField'.
+        colorClass := Cocoa classNamed: 'NSColor'.
+        fontClass := Cocoa classNamed: 'NSFont'.
+        captionFont := fontClass onMain systemFontOfSize: 9.0.
+        valueFont := fontClass onMain monospacedDigitSystemFontOfSize: 11.0 weight: 0.0.
         names := #('GC' 'ALLOC' 'CODE' 'JIT' 'MEM').
-        w := 132.0.
+        w := self metricCellWidth.
         x := (aToolbar onMain frame) at: 3.
         MetricLabels := Dictionary new.
         names do: [ :n |
-            | tf |
+            | caption value |
             x := x - w.
-            tf := (tfClass onMain alloc) onMain
-                initWithFrame: (Array with: x with: 10.0 with: w - 6.0 with: 24.0).
-            tf onMain setEditable: false.
-            tf onMain setBordered: false.
-            tf onMain setDrawsBackground: false.
-            tf onMain setSelectable: false.
-            tf onMain setStringValue: n , ' —'.
-            tf onMain setAutoresizingMask: self maskMinXMargin.
-            aToolbar onMain addSubview: tf.
-            MetricLabels at: n asSymbol put: tf ].
+            caption := (tfClass onMain alloc) onMain
+                initWithFrame: (Array with: x with: 26.0 with: w - 8.0 with: 11.0).
+            caption onMain setEditable: false. caption onMain setBordered: false.
+            caption onMain setDrawsBackground: false. caption onMain setSelectable: false.
+            caption onMain setFont: captionFont.
+            caption onMain setTextColor: colorClass onMain secondaryLabelColor.
+            caption onMain setStringValue: n.
+            caption onMain setAutoresizingMask: self maskMinXMargin.
+            aToolbar onMain addSubview: caption.
+
+            value := (tfClass onMain alloc) onMain
+                initWithFrame: (Array with: x with: 13.0 with: w - 8.0 with: 14.0).
+            value onMain setEditable: false. value onMain setBordered: false.
+            value onMain setDrawsBackground: false. value onMain setSelectable: false.
+            value onMain setFont: valueFont.
+            value onMain setStringValue: '—'.
+            value onMain setAutoresizingMask: self maskMinXMargin.
+            aToolbar onMain addSubview: value.
+
+            MetricLabels at: n asSymbol put: value.
+            n = 'MEM' ifTrue: [ self buildMemBarAt: x width: w - 8.0 in: aToolbar ] ].
     ]
 
-    CocoaUI class >> updateMetricsMem: memStr jit: jitStr code: codeStr alloc: allocStr gc: gcStr [
-        "Called from Rust (a ~1s main-thread timer reading the primary's
-         VmMetrics via the watchdog's supervisor sample — no VM round-trip,
-         no new protocol verb) to refresh the toolbar readout in place."
+    CocoaUI class >> buildMemBarAt: x width: aWidth in: aToolbar [
+        "A 2px used/capacity bar under the MEM value: a light track (the full
+         cell width) and a darker fill (scaled by memPct, 0-100). NSBox, not
+         a CALayer-backed NSView: `setFillColor:` takes a plain NSColor
+         object — no CGColorRef return-type marshalling risk."
+        | boxClass colorClass track fill |
+        boxClass := Cocoa classNamed: 'NSBox'.
+        colorClass := Cocoa classNamed: 'NSColor'.
+        track := (boxClass onMain alloc) onMain
+            initWithFrame: (Array with: x with: 10.0 with: aWidth with: 2.0).
+        track onMain setBoxType: 4. "NSBoxCustom"
+        track onMain setBorderType: 0. "NSNoBorder"
+        track onMain setFillColor: colorClass onMain separatorColor.
+        track onMain setAutoresizingMask: self maskMinXMargin.
+        aToolbar onMain addSubview: track.
+
+        fill := (boxClass onMain alloc) onMain
+            initWithFrame: (Array with: x with: 10.0 with: 0.0 with: 2.0).
+        fill onMain setBoxType: 4.
+        fill onMain setBorderType: 0.
+        fill onMain setFillColor: colorClass onMain controlAccentColor.
+        fill onMain setAutoresizingMask: self maskMinXMargin.
+        aToolbar onMain addSubview: fill.
+        MemBarFill := fill. MemBarWidth := aWidth.
+    ]
+
+    CocoaUI class >> updateMetricsMem: memStr jit: jitStr code: codeStr alloc: allocStr gc: gcStr memPct: pct [
+        "Called from Rust (the primary's beat loop wakes the UI worker every
+         beat now — CG5 — so this fires ~4Hz with no new NSTimer) to refresh
+         the toolbar readout AND the MEM usage bar's fill width in place."
         MetricLabels isNil ifTrue: [ ^self ].
-        (MetricLabels at: #MEM ifAbsent: [ nil ]) ifNotNil: [ :tf | tf onMain setStringValue: 'MEM ' , memStr ].
-        (MetricLabels at: #JIT ifAbsent: [ nil ]) ifNotNil: [ :tf | tf onMain setStringValue: 'JIT ' , jitStr ].
-        (MetricLabels at: #CODE ifAbsent: [ nil ]) ifNotNil: [ :tf | tf onMain setStringValue: 'CODE ' , codeStr ].
-        (MetricLabels at: #ALLOC ifAbsent: [ nil ]) ifNotNil: [ :tf | tf onMain setStringValue: 'ALLOC ' , allocStr ].
-        (MetricLabels at: #GC ifAbsent: [ nil ]) ifNotNil: [ :tf | tf onMain setStringValue: 'GC ' , gcStr ].
+        (MetricLabels at: #MEM ifAbsent: [ nil ]) ifNotNil: [ :tf | tf onMain setStringValue: memStr ].
+        (MetricLabels at: #JIT ifAbsent: [ nil ]) ifNotNil: [ :tf | tf onMain setStringValue: jitStr ].
+        (MetricLabels at: #CODE ifAbsent: [ nil ]) ifNotNil: [ :tf | tf onMain setStringValue: codeStr ].
+        (MetricLabels at: #ALLOC ifAbsent: [ nil ]) ifNotNil: [ :tf | tf onMain setStringValue: allocStr ].
+        (MetricLabels at: #GC ifAbsent: [ nil ]) ifNotNil: [ :tf | tf onMain setStringValue: gcStr ].
+        MemBarFill isNil ifFalse: [
+            | f |
+            f := (pct min: 100) max: 0.
+            MemBarFill onMain setFrameSize: (Array with: MemBarWidth * f / 100.0 with: 2.0) ].
     ]
 
     "── content host: the swappable middle 'screen' ──"
@@ -385,7 +435,8 @@ Print it does the same and inserts the result right after it."
             Win isValid ifTrue: [ Win release ].
             Win := nil. Workspace := nil. Toolbar := nil. ContentHost := nil.
             Transcript := nil. ActTarget := nil. ToolbarDelegates := nil.
-            ToolbarButtons := nil. MetricLabels := nil. Views := nil ]
+            ToolbarButtons := nil. MetricLabels := nil. Views := nil.
+            MemBarFill := nil. MemBarWidth := nil ]
     ]
 
     CocoaUI class >> window [ ^Win ]

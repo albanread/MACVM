@@ -57,8 +57,9 @@ fn format_bytes(n: u64) -> String {
     }
 }
 
-/// Sample the primary's live `VmMetrics` and push a formatted readout into the
-/// toolbar (CG5) — `CocoaUI updateMetricsMem:jit:code:alloc:gc:`. Called from
+/// Sample the primary's live `VmMetrics` and push a formatted readout — plus a
+/// used/capacity percentage for the toolbar's MEM bar — into the toolbar (CG5):
+/// `CocoaUI updateMetricsMem:jit:code:alloc:gc:memPct:`. Called from
 /// `drain_perform`, which now fires ~4Hz regardless of real UI traffic (the
 /// supervisor's beat loop wakes unconditionally) — a free, already-proven
 /// tick, not a new NSTimer.
@@ -89,9 +90,12 @@ fn refresh_metrics(st: &mut DrainState) {
     };
     st.prev_alloc = Some(m.bytes_allocated);
     let gc = format!("{}·{}", m.scavenges, m.full_gcs);
+    let cap = (m.eden_capacity + m.old_committed).max(1);
+    let used = m.eden_used + m.old_used;
+    let mem_pct = ((used as f64 / cap as f64) * 100.0).round().clamp(0.0, 100.0) as i64;
 
     let doit = format!(
-        "CocoaUI updateMetricsMem: '{mem}' jit: '{jit}' code: '{code}' alloc: '{alloc_rate}' gc: '{gc}'."
+        "CocoaUI updateMetricsMem: '{mem}' jit: '{jit}' code: '{code}' alloc: '{alloc_rate}' gc: '{gc}' memPct: {mem_pct}."
     );
     let _ = st.ui.exec(&doit);
 }
