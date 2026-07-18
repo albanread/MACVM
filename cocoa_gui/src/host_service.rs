@@ -130,6 +130,17 @@ extern "C" fn imp_class_names(_this: *mut c_void, _cmd: *mut c_void) -> Id {
     objc::nsstring(&text)
 }
 
+/// `allSelectors` — every distinct selector in the image, newline-joined (the
+/// Find field's autocomplete options for Implementors/Senders).
+extern "C" fn imp_all_selectors(_this: *mut c_void, _cmd: *mut c_void) -> Id {
+    let text = Image::open_read_only(&image_path())
+        .ok()
+        .and_then(|img| img.all_selectors().ok())
+        .map(|sels| sels.join("\n"))
+        .unwrap_or_default();
+    objc::nsstring(&text)
+}
+
 /// `browseRecords` — the whole class hierarchy as flat records for the browser
 /// tree, ONE per class, fields `␟`-separated:
 ///   `name ␟ superclass ␟ instVars ␟ classVars ␟ instSelectors ␟ classSelectors`
@@ -533,9 +544,10 @@ pub fn register() {
     type Imp0 = extern "C" fn(*mut c_void, *mut c_void) -> Id;
     type Imp1 = extern "C" fn(*mut c_void, *mut c_void, Id) -> Id;
     type Imp3 = extern "C" fn(*mut c_void, *mut c_void, Id, Id, Id) -> Id;
-    let methods: [(&str, *const c_void, &str); 17] = [
+    let methods: [(&str, *const c_void, &str); 18] = [
         ("requestUiRebuild", imp_request_ui_rebuild as Imp0 as *const c_void, "@@:"),
         ("classNames", imp_class_names as Imp0 as *const c_void, "@@:"),
+        ("allSelectors", imp_all_selectors as Imp0 as *const c_void, "@@:"),
         ("browseRecords", imp_browse_records as Imp0 as *const c_void, "@@:"),
         ("acceptEditorClass:", imp_accept_editor_class as Imp1 as *const c_void, "@@:@"),
         ("launchDemo:", imp_launch_demo as Imp1 as *const c_void, "@@:@"),

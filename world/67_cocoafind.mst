@@ -25,7 +25,8 @@ Object subclass: CocoaFind [
     CocoaFind class >> register [
         CocoaUI registerViewNamed: #find title: 'Find' icon: 'implementors'
                 container: [ self containerView ]
-                onShow: [ CocoaUI window onMain makeFirstResponder: SearchField ]
+                onShow: [ self refreshOptions.
+                          CocoaUI window onMain makeFirstResponder: SearchField ]
     ]
     CocoaFind class >> containerView [
         Container isNil ifTrue: [ self buildView ].
@@ -36,6 +37,26 @@ Object subclass: CocoaFind [
     CocoaFind class >> searchTerm [
         SearchField isNil ifTrue: [ ^'' ].
         ^SearchField sendString: 'stringValue'
+    ]
+    "Fill the combobox's type-ahead options from the image (DB-queried): every
+     selector (for Implementors/Senders) + every class name (for Definitions)."
+    CocoaFind class >> refreshOptions [
+        | names |
+        SearchField isNil ifTrue: [ ^self ].
+        SearchField onMain removeAllItems.
+        names := self splitLines: (CocoaBrowser readReply: (CocoaBrowser hostService onMain allSelectors)).
+        names do: [ :n | n isEmpty ifFalse: [ SearchField onMain addItemWithObjectValue: n ] ].
+        names := self splitLines: (CocoaBrowser readReply: (CocoaBrowser hostService onMain classNames)).
+        names do: [ :n | n isEmpty ifFalse: [ SearchField onMain addItemWithObjectValue: n ] ].
+    ]
+    CocoaFind class >> splitLines: aString [
+        | lines line lf |
+        lines := OrderedCollection new. line := ''. lf := Character value: 10.
+        aString do: [ :ch |
+            ch = lf ifTrue: [ line isEmpty ifFalse: [ lines add: line ]. line := '' ]
+                    ifFalse: [ line := line , (String with: ch) ] ].
+        line isEmpty ifFalse: [ lines add: line ].
+        ^lines
     ]
     CocoaFind class >> findImplementors [
         | term |
@@ -138,12 +159,17 @@ Object subclass: CocoaFind [
         Container onMain setAutoresizingMask: CocoaUI maskWidthSizable + CocoaUI maskHeightSizable.
         Container onMain setAutoresizesSubviews: true.
 
-        SearchField := ((Cocoa classNamed: 'NSTextField') onMain alloc) onMain
-            initWithFrame: (Array with: 6.0 with: h - 28.0 with: w - 384.0 with: 22.0).
+        "A COMBOBOX with type-ahead over every selector + class name in the
+         image (not a bare field) — a name-lookup box always offers a lookup."
+        SearchField := ((Cocoa classNamed: 'NSComboBox') onMain alloc) onMain
+            initWithFrame: (Array with: 6.0 with: h - 30.0 with: w - 384.0 with: 24.0).
+        SearchField onMain setCompletes: true.
+        SearchField onMain setNumberOfVisibleItems: 14.
         SearchField onMain setPlaceholderString: 'selector or class name'.
         SearchField onMain setAutoresizingMask: CocoaUI maskWidthSizable + CocoaUI maskMinYMargin.
         self wireAction: SearchField to: [ self findImplementors ].
         Container onMain addSubview: SearchField.
+        self refreshOptions.
 
         ImplBtn := self stripButton: 'Implementors'
             frame: (Array with: w - 372.0 with: h - 30.0 with: 118.0 with: 24.0)
@@ -199,6 +225,9 @@ Object subclass: CocoaFind [
     "── scripting/automation (rusttcl `gui doit`) ──"
     CocoaFind class >> typeTerm: aString [
         SearchField isNil ifFalse: [ SearchField onMain setStringValue: aString ]
+    ]
+    CocoaFind class >> optionCount [
+        ^SearchField isNil ifTrue: [ 0 ] ifFalse: [ SearchField onMain numberOfItems ]
     ]
     CocoaFind class >> selectResult: anIndex [
         Results isNil ifTrue: [ ^self ].
