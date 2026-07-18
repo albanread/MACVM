@@ -55,7 +55,8 @@ Object subclass: CocoaToolbarAction [
 Object subclass: CocoaUI [
     <classVars: Win Toolbar ContentHost Transcript TranscriptScroll ActTarget
                 TranscriptText Views ActiveView ToolbarDelegates ToolbarButtons
-                MetricLabels MemBarFill MemBarWidth Workspace WorkspaceTextDelegate>
+                MetricLabels MemBarFill MemBarWidth Workspace WorkspaceScroll
+                WorkspaceTextDelegate>
 
     CocoaUI class >> title [ ^'MACVM' ]
 
@@ -267,13 +268,19 @@ Object subclass: CocoaUI [
          Smalltalk Array — `count`/`objectAtIndex:`, not `size`/`at:`.
          Re-fetch it fresh each iteration (never assume it live-updates as
          removeFromSuperview mutates the real subview list underneath)."
-        | entry cur |
+        | entry cur child |
         entry := Views detect: [ :e | (e at: 1) == aSymbol ] ifNone: [ nil ].
         entry isNil ifTrue: [ ^self ].
         [ (cur := ContentHost onMain subviews) count > 0 ] whileTrue: [
-            (cur objectAtIndex: 0) onMain removeFromSuperview ].
+            child := cur objectAtIndex: 0.
+            child onMain removeFromSuperview.
+            "objectAtIndex: minted a fresh +1 wrapper — drop it (leak rule)."
+            child release ].
         ActiveView := aSymbol.
         (entry at: 3) value.
+        "Repaint the whole host region: the outgoing view's stale drawing
+         must not survive under the incoming view's transparent areas."
+        ContentHost onMain setNeedsDisplay: true.
     ]
 
     "── the Workspace view (CG6: selection-or-everything, inline Print it) ──"
@@ -292,14 +299,30 @@ Object subclass: CocoaUI [
             Workspace onMain setFont: ((Cocoa classNamed: 'NSFont') onMain
                 userFixedPitchFontOfSize: 13.0).
             Workspace onMain setString: self placeholderText.
-            Workspace onMain setAutoresizingMask: self maskWidthSizable + self maskHeightSizable.
+            "Scroll-wrapped like every other text surface: a bare NSTextView
+             draws past its frame and its stale pixels bleed through the next
+             view's transparent regions after a switch (the browser-first-open
+             bug); the scroll view clips, scrolls long content, and repaints
+             its area properly."
+            Workspace onMain setVerticallyResizable: true.
+            Workspace onMain setHorizontallyResizable: false.
+            Workspace onMain setAutoresizingMask: self maskWidthSizable.
+            (Workspace onMain textContainer) ifNotNil: [ :tc |
+                tc onMain setWidthTracksTextView: true.
+                tc release ].
+            WorkspaceScroll := ((Cocoa classNamed: 'NSScrollView') onMain alloc) onMain
+                initWithFrame: (Array with: 0.0 with: 0.0
+                                      with: (frame at: 3) with: (frame at: 4)).
+            WorkspaceScroll onMain setHasVerticalScroller: true.
+            WorkspaceScroll onMain setAutoresizingMask: self maskWidthSizable + self maskHeightSizable.
+            WorkspaceScroll onMain setDocumentView: Workspace.
             "CG8: live syntax colour, same mechanism as the browser's source
              pane (the delegate fires for programmatic setString: too)."
             WorkspaceTextDelegate := MacvmDelegate textDelegateOn: self.
             Workspace onMain setDelegate: WorkspaceTextDelegate.
             self recolorizeWorkspace.
         ].
-        ContentHost onMain addSubview: Workspace.
+        ContentHost onMain addSubview: WorkspaceScroll.
         Win onMain makeFirstResponder: Workspace.
     ]
 
@@ -555,6 +578,8 @@ Print it does the same and inserts the result right after it."
             ToolbarDelegates isNil ifFalse: [
                 ToolbarDelegates do: [ :d | d isValid ifTrue: [ d release ] ] ].
             Workspace isNil ifFalse: [ Workspace isValid ifTrue: [ Workspace release ] ].
+            WorkspaceScroll isNil ifFalse: [ WorkspaceScroll isValid ifTrue: [ WorkspaceScroll release ] ].
+            WorkspaceScroll := nil.
             WorkspaceTextDelegate isNil ifFalse: [ WorkspaceTextDelegate isValid ifTrue: [ WorkspaceTextDelegate release ] ].
             WorkspaceTextDelegate := nil.
             Toolbar isNil ifFalse: [ Toolbar isValid ifTrue: [ Toolbar release ] ].
