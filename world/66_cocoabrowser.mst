@@ -73,6 +73,21 @@ Object subclass: CocoaBrowser [
        class; buildTreeFromRecords: rebuilds the nested tree from the superclass
        links. Synchronous host call — no #uiReq round-trip to the primary. ──"
     CocoaBrowser class >> requestRefresh [
+        "FLAG ONLY — never build the tree + reload from inside a callback (a
+         view-switch / restart). `requestBrowserRefresh` is a plain host call
+         (flips a Rust atomic, wakes the run loop): it does NOT touch the VM, so
+         it is safe from ANY context. `drain_perform` services the flag on its
+         next pass — a fresh top-level exec, never nested inside the callback
+         that asked (the CG9 rebuild-flag pattern; view_refresh.rs). A nested
+         build+reload here previously either failed closed (blank pane — the
+         C6 reentrancy guard) or, once JIT-compiled, crashed walk_frames
+         (ENTRY_FRAME_SENTINEL must pair with IntoInterpreter)."
+        self hostService onMain requestBrowserRefresh
+    ]
+    CocoaBrowser class >> doRefresh [
+        "The DB query + tree build + install. Called TOP-LEVEL only: by
+         drain_perform servicing the flag above, or directly (also top-level)
+         from a `gui doit` script."
         self installSnapshot: (self buildTreeFromRecords:
             (self readReply: (self hostService onMain browseRecords)))
     ]

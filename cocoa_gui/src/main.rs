@@ -19,6 +19,7 @@ mod objc;
 mod rebuild;
 mod snapshot;
 mod supervisor;
+mod view_refresh;
 
 use std::ffi::c_void;
 use std::path::PathBuf;
@@ -132,6 +133,16 @@ extern "C" fn drain_perform(info: *mut c_void) {
     if rebuild::take_request() {
         rebuild_ui(st);
         return; // the fresh generation drains on the next pass
+    }
+
+    // DB-query view refreshes (Browser tree, Find options): a fresh top-level
+    // `exec` here, never inside a callback — see view_refresh.rs.
+    let (browser_due, find_due) = view_refresh::take_requests();
+    if browser_due {
+        let _ = st.ui.exec("CocoaBrowser doRefresh.");
+    }
+    if find_due {
+        let _ = st.ui.exec("CocoaFind doRefreshOptions.");
     }
 
     while let Some(link) = st.supervisor.poll_resync() {

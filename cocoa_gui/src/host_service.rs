@@ -414,6 +414,21 @@ extern "C" fn imp_request_ui_rebuild(_this: *mut c_void, _cmd: *mut c_void) -> I
     std::ptr::null_mut()
 }
 
+/// `requestBrowserRefresh` / `requestFindRefresh` — flag the Browser tree /
+/// Find options for a DB re-query and wake the run loop. Serviced by
+/// `drain_perform` on its next pass (a fresh top-level `exec`, never nested in
+/// the callback that asked) — see view_refresh.rs for why. Answers nil.
+extern "C" fn imp_request_browser_refresh(_this: *mut c_void, _cmd: *mut c_void) -> Id {
+    crate::view_refresh::request_browser();
+    crate::objc::wake_main_runloop();
+    std::ptr::null_mut()
+}
+extern "C" fn imp_request_find_refresh(_this: *mut c_void, _cmd: *mut c_void) -> Id {
+    crate::view_refresh::request_find();
+    crate::objc::wake_main_runloop();
+    std::ptr::null_mut()
+}
+
 /// `launchDemo:` — CG10: launch a GamePane demo by its entry doit (e.g.
 /// `'MandelZoom launch'`). Flags it to run TOP-LEVEL on the primary's supervisor
 /// loop, NOT via a nested `uiDoit`/`primEvalDoit` (which corrupts the frame
@@ -544,8 +559,10 @@ pub fn register() {
     type Imp0 = extern "C" fn(*mut c_void, *mut c_void) -> Id;
     type Imp1 = extern "C" fn(*mut c_void, *mut c_void, Id) -> Id;
     type Imp3 = extern "C" fn(*mut c_void, *mut c_void, Id, Id, Id) -> Id;
-    let methods: [(&str, *const c_void, &str); 18] = [
+    let methods: [(&str, *const c_void, &str); 20] = [
         ("requestUiRebuild", imp_request_ui_rebuild as Imp0 as *const c_void, "@@:"),
+        ("requestBrowserRefresh", imp_request_browser_refresh as Imp0 as *const c_void, "@@:"),
+        ("requestFindRefresh", imp_request_find_refresh as Imp0 as *const c_void, "@@:"),
         ("classNames", imp_class_names as Imp0 as *const c_void, "@@:"),
         ("allSelectors", imp_all_selectors as Imp0 as *const c_void, "@@:"),
         ("browseRecords", imp_browse_records as Imp0 as *const c_void, "@@:"),

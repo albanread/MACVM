@@ -25,7 +25,7 @@ Object subclass: CocoaFind [
     CocoaFind class >> register [
         CocoaUI registerViewNamed: #find title: 'Find' icon: 'implementors'
                 container: [ self containerView ]
-                onShow: [ self refreshOptions.
+                onShow: [ self requestRefreshOptions.
                           CocoaUI window onMain makeFirstResponder: SearchField ]
     ]
     CocoaFind class >> containerView [
@@ -38,9 +38,17 @@ Object subclass: CocoaFind [
         SearchField isNil ifTrue: [ ^'' ].
         ^SearchField sendString: 'stringValue'
     ]
+    "FLAG ONLY (never query + populate from inside a callback — see
+     view_refresh.rs / CocoaBrowser requestRefresh for why): a plain host call
+     that flips a Rust atomic and wakes the run loop. drain_perform services it
+     with a fresh top-level exec of doRefreshOptions."
+    CocoaFind class >> requestRefreshOptions [
+        CocoaBrowser hostService onMain requestFindRefresh
+    ]
     "Fill the combobox's type-ahead options from the image (DB-queried): every
-     selector (for Implementors/Senders) + every class name (for Definitions)."
-    CocoaFind class >> refreshOptions [
+     selector (for Implementors/Senders) + every class name (for Definitions).
+     Called TOP-LEVEL only (drain_perform, or directly from a `gui doit`)."
+    CocoaFind class >> doRefreshOptions [
         | names |
         SearchField isNil ifTrue: [ ^self ].
         SearchField onMain removeAllItems.
@@ -169,7 +177,7 @@ Object subclass: CocoaFind [
         SearchField onMain setAutoresizingMask: CocoaUI maskWidthSizable + CocoaUI maskMinYMargin.
         self wireAction: SearchField to: [ self findImplementors ].
         Container onMain addSubview: SearchField.
-        self refreshOptions.
+        self requestRefreshOptions.
 
         ImplBtn := self stripButton: 'Implementors'
             frame: (Array with: w - 372.0 with: h - 30.0 with: 118.0 with: 24.0)
