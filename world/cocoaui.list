@@ -19,7 +19,11 @@
 # shell simply has no Browser entry.
 66_cocoabrowser.mst
 67_cocoafind.mst
-# CocoaEditor (the class text editor tab) also self-registers by name; E1 is
-# read-only (host-served class source), E2 makes it a dumb terminal onto a
-# primary-spawned editor VMapp (docs/editor_design.md M5).
+# CocoaEditor (the class text editor tab) also self-registers by name:
+# native NSTextView editing; Save recompiles live on the primary (uiDoit) +
+# persists the diff to the image + world (host).
 68_cocoaeditor.mst
+# CocoaOutliner (the Strongtalk-style unfolding tree, LIVE ClassMirror
+# reflection — the other half of the dual placement from CocoaBrowser's DB
+# queries) also self-registers by name.
+69_cocoaoutliner.mst

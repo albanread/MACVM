@@ -428,6 +428,11 @@ extern "C" fn imp_request_find_refresh(_this: *mut c_void, _cmd: *mut c_void) ->
     crate::objc::wake_main_runloop();
     std::ptr::null_mut()
 }
+extern "C" fn imp_request_outliner_refresh(_this: *mut c_void, _cmd: *mut c_void) -> Id {
+    crate::view_refresh::request_outliner();
+    crate::objc::wake_main_runloop();
+    std::ptr::null_mut()
+}
 
 /// `launchDemo:` — CG10: launch a GamePane demo by its entry doit (e.g.
 /// `'MandelZoom launch'`). Flags it to run TOP-LEVEL on the primary's supervisor
@@ -559,10 +564,11 @@ pub fn register() {
     type Imp0 = extern "C" fn(*mut c_void, *mut c_void) -> Id;
     type Imp1 = extern "C" fn(*mut c_void, *mut c_void, Id) -> Id;
     type Imp3 = extern "C" fn(*mut c_void, *mut c_void, Id, Id, Id) -> Id;
-    let methods: [(&str, *const c_void, &str); 20] = [
+    let methods: [(&str, *const c_void, &str); 21] = [
         ("requestUiRebuild", imp_request_ui_rebuild as Imp0 as *const c_void, "@@:"),
         ("requestBrowserRefresh", imp_request_browser_refresh as Imp0 as *const c_void, "@@:"),
         ("requestFindRefresh", imp_request_find_refresh as Imp0 as *const c_void, "@@:"),
+        ("requestOutlinerRefresh", imp_request_outliner_refresh as Imp0 as *const c_void, "@@:"),
         ("classNames", imp_class_names as Imp0 as *const c_void, "@@:"),
         ("allSelectors", imp_all_selectors as Imp0 as *const c_void, "@@:"),
         ("browseRecords", imp_browse_records as Imp0 as *const c_void, "@@:"),

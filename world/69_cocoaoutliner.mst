@@ -1,0 +1,352 @@
+"69_cocoaoutliner.mst — CocoaOutliner: a Strongtalk-style class outliner, the
+ Cocoa GUI's version of the web GUI's `ClassHierarchyOutliner`/`ClassOutliner`
+ (world/34_tools.mst). Loaded ONLY via world/cocoaui.list, after
+ 66_cocoabrowser.mst (it reuses CocoaBrowser's hostService/hostClassSource:/
+ hostSourceClass:side:selector: for SOURCE text).
+
+ ARCHITECTURE — the other half of the dual placement (docs vocabulary:
+ [[feedback_dual_placement_not_migration]]): CocoaBrowser (world/66) reads the
+ DATABASE (image_store, via host queries) — the durable, offline truth.
+ CocoaOutliner instead reads the LIVE VM via `ClassMirror` (world/34's
+ reflection layer: primitives 98/99/62/157/158 — allClasses/selectorsOf:/
+ primitiveOf:/instanceVariablesOf:/classVariablesOf:) — 'the VM codemirrors',
+ the same mechanism the web outliner used. ONE tree holds everything (class ->
+ instance vars / class vars / instance methods / class methods / subclasses,
+ all nested — Strongtalk's signature 'one outline, not separate panes' shape),
+ unlike the Browser's three-pane split.
+
+ SCOPE NOTE (honest, not a dead placeholder — the ClassHierarchyOutliner filter
+ methods set this precedent): ClassMirror reflects the UI WORKER's own VM. The
+ UI worker boots the identical world.list every VM boots from, so it structurally
+ IS the class hierarchy for browsing purposes — but a class defined via a
+ Workspace `Do it` on the PRIMARY (never mirrored onto the UI worker) will not
+ appear until a UI rebuild re-boots from world.list, or Refresh after the class
+ has been accepted through the Browser/Editor (which live-compiles + persists).
+ A primary-reflecting version would need the uiReq relay; that relay's per-edit
+ cost is exactly what the editor investigation (see [[project_editor_status]])
+ found not worth it for infrequent, coarse-grained structural browsing.
+
+ SAFETY (the crash this session fixed, [[project_gui_browser_tools]]): the tree
+ build + `NSOutlineView reloadData` NEVER runs synchronously inside a C6
+ callback — requestRefresh only flags (view_refresh.rs, CG9's rebuild-flag
+ pattern); drain_perform services it with a fresh top-level `exec`."
+
+Object subclass: CocoaOutliner [
+    <classVars: Container TopStrip RefreshBtn StatusLabel VSplit
+                OutlineScroll Outline OCol OutlineDelegate
+                SourceScroll SourceView SourceTextDelegate
+                Handles HandleList RootNode ActionDelegates>
+
+    CocoaOutliner class >> stripHeight [ ^30.0 ]
+
+    CocoaOutliner class >> register [
+        CocoaUI registerViewNamed: #outliner title: 'Outliner' icon: 'userHierarchy'
+                container: [ self containerView ]
+                onShow: [ self requestRefresh ]
+    ]
+    CocoaOutliner class >> containerView [
+        Container isNil ifTrue: [ self buildView ].
+        ^Container
+    ]
+
+    "── build ──"
+    CocoaOutliner class >> buildView [
+        | host frame w h |
+        host := CocoaUI contentHost.
+        frame := host onMain frame.
+        w := frame at: 3. h := frame at: 4.
+        ActionDelegates := OrderedCollection new.
+        Container := ((Cocoa classNamed: 'NSView') onMain alloc) onMain
+            initWithFrame: (Array with: 0.0 with: 0.0 with: w with: h).
+        Container onMain setAutoresizingMask: CocoaUI maskWidthSizable + CocoaUI maskHeightSizable.
+        Container onMain setAutoresizesSubviews: true.
+
+        self buildTopStripIn: Container width: w height: h.
+        self buildSplitIn: Container width: w height: h.
+    ]
+    CocoaOutliner class >> buildTopStripIn: aContainer width: w height: h [
+        TopStrip := ((Cocoa classNamed: 'NSView') onMain alloc) onMain
+            initWithFrame: (Array with: 0.0 with: h - self stripHeight with: w with: self stripHeight).
+        TopStrip onMain setAutoresizingMask: CocoaUI maskWidthSizable + CocoaUI maskMinYMargin.
+        RefreshBtn := ((Cocoa classNamed: 'NSButton') onMain alloc) onMain
+            initWithFrame: (Array with: 6.0 with: 3.0 with: 90.0 with: 24.0).
+        RefreshBtn onMain setTitle: 'Refresh'.
+        RefreshBtn onMain setBezelStyle: 1.
+        self wireAction: RefreshBtn to: [ self requestRefresh ].
+        TopStrip onMain addSubview: RefreshBtn.
+        StatusLabel := ((Cocoa classNamed: 'NSTextField') onMain alloc) onMain
+            initWithFrame: (Array with: 104.0 with: 7.0 with: w - 110.0 with: 16.0).
+        StatusLabel onMain setEditable: false. StatusLabel onMain setBordered: false.
+        StatusLabel onMain setDrawsBackground: false. StatusLabel onMain setSelectable: false.
+        StatusLabel onMain setTextColor: (Cocoa classNamed: 'NSColor') onMain secondaryLabelColor.
+        StatusLabel onMain setStringValue: 'live VM class hierarchy — Refresh to re-sweep'.
+        StatusLabel onMain setAutoresizingMask: CocoaUI maskWidthSizable.
+        TopStrip onMain addSubview: StatusLabel.
+        aContainer onMain addSubview: TopStrip.
+    ]
+    CocoaOutliner class >> buildSplitIn: aContainer width: w height: h [
+        | rect |
+        rect := Array with: 0.0 with: 0.0 with: w with: h - self stripHeight.
+        VSplit := ((Cocoa classNamed: 'NSSplitView') onMain alloc) onMain initWithFrame: rect.
+        VSplit onMain setVertical: false. "a horizontal divider: outline on top, source below"
+        VSplit onMain setDividerStyle: 3. "visible, draggable"
+        VSplit onMain setAutoresizingMask: CocoaUI maskWidthSizable + CocoaUI maskHeightSizable.
+
+        self buildOutlineIn: (Array with: 0.0 with: 0.0 with: w with: (h - self stripHeight) * 0.55).
+        self buildSourceIn: (Array with: 0.0 with: 0.0 with: w with: (h - self stripHeight) * 0.45).
+        VSplit onMain addSubview: OutlineScroll.
+        VSplit onMain addSubview: SourceScroll.
+        VSplit onMain adjustSubviews.
+        aContainer onMain addSubview: VSplit.
+    ]
+    CocoaOutliner class >> buildOutlineIn: rect [
+        | w h |
+        w := rect at: 3. h := rect at: 4.
+        OutlineScroll := ((Cocoa classNamed: 'NSScrollView') onMain alloc) onMain
+            initWithFrame: (Array with: 0.0 with: 0.0 with: w with: h).
+        OutlineScroll onMain setHasVerticalScroller: true.
+        OutlineScroll onMain setAutoresizingMask: CocoaUI maskWidthSizable + CocoaUI maskHeightSizable.
+        Outline := ((Cocoa classNamed: 'NSOutlineView') onMain alloc) onMain
+            initWithFrame: (Array with: 0.0 with: 0.0 with: w with: h).
+        OCol := ((Cocoa classNamed: 'NSTableColumn') onMain alloc) onMain
+            initWithIdentifier: 'item'.
+        OCol onMain setWidth: 900.0.
+        Outline onMain addTableColumn: OCol.
+        Outline onMain setOutlineTableColumn: OCol.
+        Outline onMain setHeaderView: nil.
+        Outline onMain setIndentationPerLevel: 14.0.
+        OutlineDelegate := MacvmDelegate outlineSourceOn: self.
+        Outline onMain setDataSource: OutlineDelegate.
+        Outline onMain setDelegate: OutlineDelegate.
+        OutlineScroll onMain setDocumentView: Outline.
+    ]
+    CocoaOutliner class >> buildSourceIn: rect [
+        | w h |
+        w := rect at: 3. h := rect at: 4.
+        SourceScroll := ((Cocoa classNamed: 'NSScrollView') onMain alloc) onMain
+            initWithFrame: (Array with: 0.0 with: 0.0 with: w with: h).
+        SourceScroll onMain setHasVerticalScroller: true.
+        SourceScroll onMain setHasHorizontalScroller: true.
+        SourceScroll onMain setAutoresizingMask: CocoaUI maskWidthSizable + CocoaUI maskHeightSizable.
+        SourceView := ((Cocoa classNamed: 'NSTextView') onMain alloc) onMain
+            initWithFrame: (Array with: 0.0 with: 0.0 with: w with: h).
+        SourceView onMain setEditable: false.
+        SourceView onMain setFont: ((Cocoa classNamed: 'NSFont') onMain userFixedPitchFontOfSize: 12.0).
+        SourceView onMain setVerticallyResizable: true.
+        SourceView onMain setHorizontallyResizable: false.
+        SourceView onMain setString: self placeholder.
+        (SourceView onMain textContainer) ifNotNil: [ :tc | tc onMain setWidthTracksTextView: true. tc release ].
+        SourceTextDelegate := MacvmDelegate textDelegateOn: self.
+        SourceView onMain setDelegate: SourceTextDelegate.
+        SourceScroll onMain setDocumentView: SourceView.
+    ]
+    CocoaOutliner class >> placeholder [
+        ^'"Select a class to see its definition, or a method to see its source."'
+    ]
+    CocoaOutliner class >> wireAction: aControl to: aBlock [
+        | holder delegate |
+        holder := CocoaToolbarAction on: aBlock.
+        delegate := MacvmDelegate actionTargetOn: holder.
+        aControl onMain setTarget: delegate.
+        aControl onMain setAction: 'macvmAction:'.
+        ActionDelegates add: delegate.
+    ]
+
+    "── refresh: FLAG ONLY (never build the tree from inside a callback — see
+       view_refresh.rs / CocoaBrowser requestRefresh for why this rule exists) ──"
+    CocoaOutliner class >> requestRefresh [
+        CocoaBrowser hostService onMain requestOutlinerRefresh
+    ]
+    "The live sweep + tree build + install. Top-level only (drain_perform
+     servicing the flag, or directly from a `gui doit` script)."
+    CocoaOutliner class >> doRefresh [
+        | count |
+        RootNode := self classNode: (ClassMirror on: Object).
+        self releaseHandles.
+        Outline isNil ifFalse: [
+            Outline onMain reloadData.
+            Outline onMain expandItem: (self handleFor: '') ].
+        count := self countNodes: RootNode.
+        StatusLabel isNil ifFalse: [
+            StatusLabel onMain setStringValue: count printString , ' classes (live)' ].
+    ]
+    CocoaOutliner class >> countNodes: node [
+        | n |
+        (node at: 1) == #class ifFalse: [ ^0 ].
+        n := 1.
+        (node at: 4) do: [ :k | n := n + (self countNodes: k) ].
+        ^n
+    ]
+
+    "── the tree: {kind label payload children}, built from ClassMirror ──"
+    CocoaOutliner class >> classNode: aMirror [
+        | kids |
+        kids := OrderedCollection new.
+        kids add: (self varGroup: 'instance variables' names: aMirror instanceVariables).
+        kids add: (self varGroup: 'class variables' names: aMirror classVariables).
+        kids add: (self methodGroup: 'instance methods' behavior: aMirror theClass
+                       class: aMirror name side: 'instance' selectors: aMirror instanceSelectors).
+        kids add: (self methodGroup: 'class methods' behavior: aMirror theClass class
+                       class: aMirror name side: 'class' selectors: aMirror classSelectors).
+        aMirror subclassMirrors do: [ :sub | kids add: (self classNode: sub) ].
+        ^Array with: #class with: aMirror name with: aMirror name with: kids asArray
+    ]
+    CocoaOutliner class >> varGroup: label names: names [
+        | kids |
+        kids := OrderedCollection new.
+        names do: [ :n | kids add: (Array with: #var with: n asString with: nil with: (Array new: 0)) ].
+        ^Array with: #group with: label , ' (' , names size printString , ')'
+               with: nil with: kids asArray
+    ]
+    CocoaOutliner class >> methodGroup: label behavior: behavior class: className side: side selectors: sels [
+        | kids |
+        kids := OrderedCollection new.
+        sels do: [ :sel | | prim disp |
+            prim := ClassMirror primitiveOf: behavior selector: sel.
+            disp := sel asString , (prim = 0 ifTrue: [ '' ] ifFalse: [ ' <primitive>' ]).
+            kids add: (Array with: #method with: disp
+                             with: (Array with: className with: side with: sel asString)
+                             with: (Array new: 0)) ].
+        ^Array with: #group with: label , ' (' , sels size printString , ')'
+               with: nil with: kids asArray
+    ]
+
+    "── the path scheme ('' = root; '2.14' = 0-based child hops), identical to
+       CocoaBrowser's own (a separate handle cache — different tree, same idiom) ──"
+    CocoaOutliner class >> handleFor: path [
+        | k h |
+        Handles isNil ifTrue: [ Handles := Dictionary new. HandleList := OrderedCollection new ].
+        k := path asSymbol.
+        h := Handles at: k ifAbsent: [ nil ].
+        h isNil ifTrue: [
+            h := Cocoa nsString: path.
+            Handles at: k put: h.
+            HandleList add: h ].
+        ^h
+    ]
+    CocoaOutliner class >> releaseHandles [
+        HandleList isNil ifTrue: [ ^self ].
+        HandleList do: [ :h | h isValid ifTrue: [ h release ] ].
+        Handles := nil. HandleList := nil.
+    ]
+    CocoaOutliner class >> pathOf: item [
+        ^item isNil ifTrue: [ '' ] ifFalse: [ item sendString: 'description' ]
+    ]
+    CocoaOutliner class >> resolvePath: pathString [
+        | node kids |
+        RootNode isNil ifTrue: [ ^nil ].
+        node := RootNode.
+        pathString = '' ifTrue: [ ^node ].
+        (CocoaBrowser splitPath: pathString) do: [ :i |
+            kids := node at: 4.
+            i < kids size ifFalse: [ ^nil ].
+            node := kids at: i + 1 ].
+        ^node
+    ]
+
+    "── outline data source/delegate (NSOutlineView) — generic over the
+       {kind label payload children} shape (children at slot 4) ──"
+    CocoaOutliner class >> outlineView: ov numberOfChildrenOfItem: item [
+        | node |
+        item isNil ifTrue: [ ^RootNode isNil ifTrue: [ 0 ] ifFalse: [ 1 ] ].
+        node := self resolvePath: (self pathOf: item).
+        ^node isNil ifTrue: [ 0 ] ifFalse: [ (node at: 4) size ]
+    ]
+    CocoaOutliner class >> outlineView: ov isItemExpandable: item [
+        ^(self outlineView: ov numberOfChildrenOfItem: item) > 0
+    ]
+    CocoaOutliner class >> outlineView: ov child: i ofItem: item [
+        | p |
+        item isNil ifTrue: [ ^self handleFor: '' ].
+        p := self pathOf: item.
+        ^self handleFor: (p = '' ifTrue: [ i printString ] ifFalse: [ p , '.' , i printString ])
+    ]
+    CocoaOutliner class >> outlineView: ov objectValueForTableColumn: col byItem: item [
+        | node |
+        node := self resolvePath: (self pathOf: item).
+        ^node isNil ifTrue: [ '' ] ifFalse: [ node at: 2 ]
+    ]
+    CocoaOutliner class >> outlineViewSelectionDidChange: aNote [
+        | row item node |
+        Outline isNil ifTrue: [ ^self ].
+        row := Outline onMain selectedRow.
+        row < 0 ifTrue: [ ^self ].
+        item := Outline onMain itemAtRow: row.
+        item isNil ifTrue: [ ^self ].
+        node := self resolvePath: (self pathOf: item).
+        item release.
+        self showSourceFor: node.
+    ]
+
+    "── the source pane: a class shows its whole-class definition, a method its
+       body — both DB-read (image_store), reusing the browser's own fetchers
+       (the source TEXT isn't in the VM to reflect; only the STRUCTURE is) ──"
+    CocoaOutliner class >> showSourceFor: node [
+        node isNil ifTrue: [ ^self showSourceText: '' ].
+        (node at: 1) == #class ifTrue: [
+            ^self showSourceText: (CocoaBrowser hostClassSource: (node at: 3)) ].
+        (node at: 1) == #method ifTrue: [
+            | p |
+            p := node at: 3.
+            ^self showSourceText:
+                (CocoaBrowser hostSourceClass: (p at: 1) side: (p at: 2) selector: (p at: 3)) ].
+        self showSourceText: ''.
+    ]
+    CocoaOutliner class >> showSourceText: aString [
+        SourceView isNil ifTrue: [ ^self ].
+        SourceView onMain setString: (aString isEmpty ifTrue: [ self placeholder ] ifFalse: [ aString ]).
+        self recolorize.
+    ]
+    CocoaOutliner class >> textDidChange: aNote [ "read-only; the delegate role requires this selector" ]
+    CocoaOutliner class >> recolorize [
+        | ts |
+        SourceView isNil ifTrue: [ ^self ].
+        ts := SourceView onMain textStorage.
+        ts isNil ifTrue: [ ^self ].
+        CocoaBrowser hostService onMain colorizeStorage: ts.
+        ts release.
+    ]
+
+    "── scripting/automation (rusttcl `gui doit`) ──"
+    CocoaOutliner class >> classCount [
+        RootNode isNil ifTrue: [ ^0 ].
+        ^self countNodes: RootNode
+    ]
+    CocoaOutliner class >> selectPath: aString [
+        | idx |
+        Outline isNil ifTrue: [ ^self ].
+        idx := Outline onMain rowForItem: (self handleFor: aString).
+        idx < 0 ifTrue: [ ^self ].
+        Outline onMain selectRowIndexes: ((Cocoa classNamed: 'NSIndexSet') onMain
+                                              indexSetWithIndex: idx)
+                byExtendingSelection: false.
+        self outlineViewSelectionDidChange: nil.
+    ]
+    CocoaOutliner class >> expandPath: aString [
+        Outline isNil ifTrue: [ ^self ].
+        Outline onMain expandItem: (self handleFor: aString)
+    ]
+    CocoaOutliner class >> sourceText [
+        SourceView isNil ifTrue: [ ^'' ].
+        ^SourceView sendString: 'string'
+    ]
+
+    CocoaOutliner class >> environmentRestarted [ self requestRefresh ]
+
+    CocoaOutliner class >> teardown [
+        ActionDelegates isNil ifFalse: [
+            ActionDelegates do: [ :d | d isValid ifTrue: [ d release ] ] ].
+        OutlineDelegate isNil ifFalse: [ OutlineDelegate isValid ifTrue: [ OutlineDelegate release ] ].
+        SourceTextDelegate isNil ifFalse: [ SourceTextDelegate isValid ifTrue: [ SourceTextDelegate release ] ].
+        self releaseHandles.
+        CocoaBrowser releaseView: OCol. CocoaBrowser releaseView: Outline.
+        CocoaBrowser releaseView: OutlineScroll. CocoaBrowser releaseView: SourceView.
+        CocoaBrowser releaseView: SourceScroll. CocoaBrowser releaseView: VSplit.
+        CocoaBrowser releaseView: RefreshBtn. CocoaBrowser releaseView: StatusLabel.
+        CocoaBrowser releaseView: TopStrip. CocoaBrowser releaseView: Container.
+        ActionDelegates := nil. OutlineDelegate := nil. SourceTextDelegate := nil.
+        OCol := nil. Outline := nil. OutlineScroll := nil. SourceView := nil.
+        SourceScroll := nil. VSplit := nil. RefreshBtn := nil. StatusLabel := nil.
+        TopStrip := nil. Container := nil. RootNode := nil.
+    ]
+]

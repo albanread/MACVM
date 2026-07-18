@@ -1,6 +1,8 @@
-//! DB-query view refreshes (the Browser's class tree, the Find field's
-//! autocomplete options) — the SAME flag-and-drain pattern CG9's `rebuild.rs`
-//! uses, for the same reason.
+//! View refreshes that must never run inline from a C6 callback — the
+//! Browser's class tree and the Find field's autocomplete options (DB
+//! queries), and the Outliner's class tree (LIVE `ClassMirror` reflection on
+//! the UI worker's own VM) — the SAME flag-and-drain pattern CG9's
+//! `rebuild.rs` uses, for the same reason.
 //!
 //! A callback (a tab's `onShow`, a search) must NEVER run the actual query +
 //! Smalltalk tree-build + `NSOutlineView reloadData` / `NSComboBox
@@ -22,6 +24,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 static BROWSER_REFRESH_REQUESTED: AtomicBool = AtomicBool::new(false);
 static FIND_REFRESH_REQUESTED: AtomicBool = AtomicBool::new(false);
+static OUTLINER_REFRESH_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 pub fn request_browser() {
     BROWSER_REFRESH_REQUESTED.store(true, Ordering::Release);
@@ -29,12 +32,16 @@ pub fn request_browser() {
 pub fn request_find() {
     FIND_REFRESH_REQUESTED.store(true, Ordering::Release);
 }
+pub fn request_outliner() {
+    OUTLINER_REFRESH_REQUESTED.store(true, Ordering::Release);
+}
 
-/// Take (and clear) both pending requests — called once per drain pass.
-/// Returns `(browser, find)`.
-pub fn take_requests() -> (bool, bool) {
+/// Take (and clear) all pending requests — called once per drain pass.
+/// Returns `(browser, find, outliner)`.
+pub fn take_requests() -> (bool, bool, bool) {
     (
         BROWSER_REFRESH_REQUESTED.swap(false, Ordering::AcqRel),
         FIND_REFRESH_REQUESTED.swap(false, Ordering::AcqRel),
+        OUTLINER_REFRESH_REQUESTED.swap(false, Ordering::AcqRel),
     )
 }
