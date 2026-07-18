@@ -3491,6 +3491,38 @@ mod tests {
         );
     }
 
+    /// The live-compile guarantee the browser's Accept flows rest on: a CLASS
+    /// DEFINITION (not just an expression) shipped as an ordinary `#doit`
+    /// compiles into the live primary — the same `vm.exec` semantics the web
+    /// GUI's `live_compile` uses, reached over the request channel.
+    #[test]
+    fn ui_doit_live_compiles_a_class_definition_on_the_primary() {
+        let mut primary = boot_worker_primary();
+        let (id, inbox, to_primary) =
+            crate::runtime::workers::register_hosted_worker(&mut primary.vm, Arc::new(|| {}))
+                .expect("register the hosted UI worker");
+        let mut ui = boot_ui_worker(id, to_primary);
+        ui_doit_round_trip(
+            &mut primary,
+            &mut ui,
+            &inbox,
+            "Object subclass: CGLive [ foo [ ^41 + 1 ] ]",
+            "'nil'",
+        );
+        // The class is now live on the primary: methods compile and run.
+        ui_doit_round_trip(&mut primary, &mut ui, &inbox, "CGLive new foo", "'42'");
+        // And a REOPEN adds a method to the existing class (the one-method
+        // accept path's exact live-compile shape).
+        ui_doit_round_trip(
+            &mut primary,
+            &mut ui,
+            &inbox,
+            "Object subclass: CGLive [ bar [ ^self foo * 2 ] ]",
+            "'nil'",
+        );
+        ui_doit_round_trip(&mut primary, &mut ui, &inbox, "CGLive new bar", "'84'");
+    }
+
     #[test]
     fn peer_corr_namespacing_prevents_cross_peer_continuation_collision() {
         // Review R4 (cocoa_gui_design.md §7.3): PendingReplies keyed by corr

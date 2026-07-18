@@ -14,6 +14,7 @@
 //! a stored pointer that could drift out of sync.
 
 pub mod export;
+pub mod flows;
 pub mod import;
 pub mod mst;
 

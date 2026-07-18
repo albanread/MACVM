@@ -53,9 +53,9 @@ Object subclass: CocoaToolbarAction [
 ]
 
 Object subclass: CocoaUI [
-    <classVars: Win Toolbar ContentHost Transcript ActTarget TranscriptText
-                Views ActiveView ToolbarDelegates ToolbarButtons MetricLabels
-                MemBarFill MemBarWidth Workspace>
+    <classVars: Win Toolbar ContentHost Transcript TranscriptScroll ActTarget
+                TranscriptText Views ActiveView ToolbarDelegates ToolbarButtons
+                MetricLabels MemBarFill MemBarWidth Workspace>
 
     CocoaUI class >> title [ ^'MACVM' ]
 
@@ -479,14 +479,25 @@ Print it does the same and inserts the result right after it."
         | tvClass frame |
         tvClass := Cocoa classNamed: 'NSTextView'.
         frame := content onMain frame.
+        "Scroll-wrapped: a BARE NSTextView draws past its frame when the text
+         outgrows it — long transcripts bled UP over the content view (the
+         CG7 'mess' screenshots). The scroll view clips and scrolls."
+        TranscriptScroll := ((Cocoa classNamed: 'NSScrollView') onMain alloc) onMain
+            initWithFrame: (Array with: 0.0 with: 0.0
+                                  with: (frame at: 3) with: self transcriptHeight).
+        TranscriptScroll onMain setHasVerticalScroller: true.
+        TranscriptScroll onMain setAutoresizingMask: self maskWidthSizable + self maskMaxYMargin.
         Transcript := (tvClass onMain alloc) onMain
             initWithFrame: (Array with: 0.0 with: 0.0
                                   with: (frame at: 3) with: self transcriptHeight).
         Transcript onMain setEditable: false.
         Transcript onMain setFont: ((Cocoa classNamed: 'NSFont') onMain
             userFixedPitchFontOfSize: 11.0).
-        Transcript onMain setAutoresizingMask: self maskWidthSizable + self maskMaxYMargin.
-        content onMain addSubview: Transcript.
+        Transcript onMain setVerticallyResizable: true.
+        Transcript onMain setHorizontallyResizable: false.
+        Transcript onMain setAutoresizingMask: self maskWidthSizable.
+        TranscriptScroll onMain setDocumentView: Transcript.
+        content onMain addSubview: TranscriptScroll.
     ]
 
     CocoaUI class >> appendTranscript: aString [
@@ -523,9 +534,10 @@ Print it does the same and inserts the result right after it."
             Toolbar isNil ifFalse: [ Toolbar isValid ifTrue: [ Toolbar release ] ].
             ContentHost isNil ifFalse: [ ContentHost isValid ifTrue: [ ContentHost release ] ].
             Transcript isNil ifFalse: [ Transcript isValid ifTrue: [ Transcript release ] ].
+            TranscriptScroll isNil ifFalse: [ TranscriptScroll isValid ifTrue: [ TranscriptScroll release ] ].
             Win isValid ifTrue: [ Win release ].
             Win := nil. Workspace := nil. Toolbar := nil. ContentHost := nil.
-            Transcript := nil. ActTarget := nil. ToolbarDelegates := nil.
+            Transcript := nil. TranscriptScroll := nil. ActTarget := nil. ToolbarDelegates := nil.
             ToolbarButtons := nil. MetricLabels := nil. Views := nil.
             MemBarFill := nil. MemBarWidth := nil ]
     ]

@@ -21,9 +21,34 @@ use std::ffi::{c_void, CStr, CString};
 use std::os::raw::c_char;
 use std::path::PathBuf;
 
-use image_store::{Image, Side};
+use image_store::{flows, Image, Side};
 
 use crate::objc::{self, Id, Sel};
+
+/// Reply conventions for the WRITE methods: `OK <payload>` / `ERR <message>`
+/// (the Smalltalk side checks the prefix). Field separator for multi-part
+/// payloads is the unit separator (0x1F) — it can't occur in identifiers.
+const SEP: char = '\u{1f}';
+
+fn ok(payload: &str) -> Id {
+    objc::nsstring(&format!("OK {payload}"))
+}
+fn err(msg: &str) -> Id {
+    objc::nsstring(&format!("ERR {msg}"))
+}
+
+fn side_from(s: &str) -> Side {
+    match s {
+        "class" => Side::Class,
+        _ => Side::Instance,
+    }
+}
+
+/// The write-capable image open (schema-ensuring — the same `Image::open`
+/// the web GUI's own write path uses).
+fn writer() -> Result<Image, String> {
+    Image::open(&image_path()).map_err(|e| e.to_string())
+}
 
 /// The image the source pane reads: `MACVM_IMAGE_PATH` or the same
 /// `world/image.sqlite3` default the WKWebView GUI browses. Opened per call —
@@ -85,6 +110,106 @@ extern "C" fn imp_class_source_for(
     objc::nsstring(&text)
 }
 
+/// `classShellFor:` — "superclass␟instanceVars␟classVars" from the image
+/// (empty string when the class isn't stored). The browser's variables pane
+/// reads THIS (the image), not the live snapshot — the web's own split: a
+/// just-added variable shows immediately even though live instance shape
+/// waits for the next boot.
+extern "C" fn imp_class_shell_for(_this: *mut c_void, _cmd: *mut c_void, class_name: Id) -> Id {
+    let class_name = ns_to_string(class_name);
+    let shell = Image::open_read_only(&image_path())
+        .ok()
+        .and_then(|img| img.class_named(&class_name).ok())
+        .flatten()
+        .map(|c| {
+            format!(
+                "{}{SEP}{}{SEP}{}",
+                c.superclass.unwrap_or_else(|| "nil".to_string()),
+                c.instance_vars,
+                c.class_vars
+            )
+        })
+        .unwrap_or_default();
+    objc::nsstring(&shell)
+}
+
+/// `newClassFrom:` — `flows::new_class_from_source` (the web's NewClass
+/// accept sequence). `OK <name>` / `ERR <why>`.
+extern "C" fn imp_new_class_from(_this: *mut c_void, _cmd: *mut c_void, text: Id) -> Id {
+    let text = ns_to_string(text);
+    match writer().and_then(|img| flows::new_class_from_source(&img, &text)) {
+        Ok(name) => ok(&name),
+        Err(e) => err(&e),
+    }
+}
+
+/// `saveMethodFor:side:source:` — `flows::save_method` (the web's NewMethod/
+/// Method accept sequence, versioned create-or-update). `OK <selector>`.
+extern "C" fn imp_save_method(
+    _this: *mut c_void,
+    _cmd: *mut c_void,
+    class_name: Id,
+    side: Id,
+    source: Id,
+) -> Id {
+    let class_name = ns_to_string(class_name);
+    let side = side_from(&ns_to_string(side));
+    let source = ns_to_string(source);
+    match writer().and_then(|img| flows::save_method(&img, &class_name, side, &source)) {
+        Ok(selector) => ok(&selector),
+        Err(e) => err(&e),
+    }
+}
+
+/// `removeMethodFor:side:selector:` — `Image::remove_method`, exactly the
+/// web's BrowserRemoveMethod image half.
+extern "C" fn imp_remove_method(
+    _this: *mut c_void,
+    _cmd: *mut c_void,
+    class_name: Id,
+    side: Id,
+    selector: Id,
+) -> Id {
+    let class_name = ns_to_string(class_name);
+    let side = side_from(&ns_to_string(side));
+    let selector = ns_to_string(selector);
+    match writer().map(|img| img.remove_method(&class_name, side, &selector)) {
+        Ok(Ok(true)) => ok(""),
+        Ok(Ok(false)) => err("no such method in the image"),
+        Ok(Err(e)) => err(&e.to_string()),
+        Err(e) => err(&e),
+    }
+}
+
+/// `removeClassNamed:` — `Image::remove_class` (BrowserRemoveClass's image half).
+extern "C" fn imp_remove_class(_this: *mut c_void, _cmd: *mut c_void, class_name: Id) -> Id {
+    let class_name = ns_to_string(class_name);
+    match writer().map(|img| img.remove_class(&class_name)) {
+        Ok(Ok(true)) => ok(""),
+        Ok(Ok(false)) => err("no such class in the image"),
+        Ok(Err(e)) => err(&e.to_string()),
+        Err(e) => err(&e),
+    }
+}
+
+/// `addVarFor:kind:name:` — `flows::add_variable` (SmapplAddVar's image
+/// half); `kind` is `'instance'` / `'class'`.
+extern "C" fn imp_add_var(
+    _this: *mut c_void,
+    _cmd: *mut c_void,
+    class_name: Id,
+    kind: Id,
+    name: Id,
+) -> Id {
+    let class_name = ns_to_string(class_name);
+    let is_class_var = ns_to_string(kind) == "class";
+    let name = ns_to_string(name);
+    match writer().and_then(|img| flows::add_variable(&img, &class_name, is_class_var, &name)) {
+        Ok(()) => ok(""),
+        Err(e) => err(&e),
+    }
+}
+
 type AllocPair = unsafe extern "C" fn(Id, *const c_char, usize) -> Id;
 type RegisterPair = unsafe extern "C" fn(Id);
 type AddMethod = unsafe extern "C" fn(Id, Sel, *const c_void, *const c_char) -> u8;
@@ -102,20 +227,17 @@ pub fn register() {
     if cls.is_null() {
         return; // already registered (a restart re-runs boot paths)
     }
-    let methods: [(&str, *const c_void, &str); 2] = [
-        (
-            "sourceForClass:side:selector:",
-            imp_source_for
-                as extern "C" fn(*mut c_void, *mut c_void, Id, Id, Id) -> Id
-                as *const c_void,
-            "@@:@@@",
-        ),
-        (
-            "classSourceFor:",
-            imp_class_source_for as extern "C" fn(*mut c_void, *mut c_void, Id) -> Id
-                as *const c_void,
-            "@@:@",
-        ),
+    type Imp1 = extern "C" fn(*mut c_void, *mut c_void, Id) -> Id;
+    type Imp3 = extern "C" fn(*mut c_void, *mut c_void, Id, Id, Id) -> Id;
+    let methods: [(&str, *const c_void, &str); 8] = [
+        ("sourceForClass:side:selector:", imp_source_for as Imp3 as *const c_void, "@@:@@@"),
+        ("classSourceFor:", imp_class_source_for as Imp1 as *const c_void, "@@:@"),
+        ("classShellFor:", imp_class_shell_for as Imp1 as *const c_void, "@@:@"),
+        ("newClassFrom:", imp_new_class_from as Imp1 as *const c_void, "@@:@"),
+        ("saveMethodFor:side:source:", imp_save_method as Imp3 as *const c_void, "@@:@@@"),
+        ("removeMethodFor:side:selector:", imp_remove_method as Imp3 as *const c_void, "@@:@@@"),
+        ("removeClassNamed:", imp_remove_class as Imp1 as *const c_void, "@@:@"),
+        ("addVarFor:kind:name:", imp_add_var as Imp3 as *const c_void, "@@:@@@"),
     ];
     for (sel_name, imp, types) in methods {
         let types = CString::new(types).expect("types");
