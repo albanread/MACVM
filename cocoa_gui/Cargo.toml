@@ -18,6 +18,11 @@ path = "src/main.rs"
 # [NSApp run]. Path dep exactly as the `gui` (WKWebView) crate depends on it.
 macvm = { path = ".." }
 
+# CG7: the browser's SOURCE pane is host-served from the SQLite image (the VM
+# keeps no method source) — the same image_store the WKWebView GUI reads, so
+# both GUIs show identical text for the same method.
+image_store = { path = "../image_store" }
+
 # NOTE (structural decision, CG2): this crate owns a MINIMAL raw-AppKit objc
 # helper (src/objc.rs) rather than factoring `gui/src/objc.rs` into a shared
 # crate. Rationale — the boot glue needs only NSApplication / activation policy /

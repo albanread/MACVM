@@ -97,6 +97,9 @@ Object subclass: CocoaUI [
 
         self registerViewNamed: #workspace title: 'Workspace' icon: 'texteditor'
              activate: [ self activateWorkspaceView ].
+        "CG7: later-loading views register themselves — resolved by name so
+         this file never depends on files after it in cocoaui.list."
+        (Worker classNamed: #CocoaBrowser) ifNotNil: [ :bc | bc register ].
 
         "Forwarded primary transcript lines (§7.4) append to our Transcript view."
         Worker onTranscriptLine: [ :t | CocoaUI appendTranscript: t ].
@@ -139,11 +142,13 @@ Object subclass: CocoaUI [
         captionFont := fontClass onMain systemFontOfSize: 9.0.
         valueFont := fontClass onMain monospacedDigitSystemFontOfSize: 11.0 weight: 0.0.
         names := #('GC' 'ALLOC' 'CODE' 'JIT' 'MEM').
-        w := self metricCellWidth.
         x := (aToolbar onMain frame) at: 3.
         MetricLabels := Dictionary new.
         names do: [ :n |
-            | caption value |
+            | caption value w |
+            "MEM's value is 'used/capacity' — the widest cell by far ('540.9K/68.0M');
+             the uniform width clipped it at the slash (seen in the CG7 snap)."
+            w := n = 'MEM' ifTrue: [ 104.0 ] ifFalse: [ self metricCellWidth ].
             x := x - w.
             caption := (tfClass onMain alloc) onMain
                 initWithFrame: (Array with: x with: 26.0 with: w - 8.0 with: 11.0).
@@ -209,6 +214,8 @@ Object subclass: CocoaUI [
             f := (pct min: 100) max: 0.
             MemBarFill onMain setFrameSize: (Array with: MemBarWidth * f / 100.0 with: 2.0) ].
     ]
+
+    CocoaUI class >> contentHost [ ^ContentHost ]
 
     "── content host: the swappable middle 'screen' ──"
     CocoaUI class >> buildContentHostIn: content [
@@ -400,18 +407,21 @@ Print it does the same and inserts the result right after it."
     CocoaUI class >> macvmPrintIt: sender [ ^self printIt ]
     CocoaUI class >> macvmDoIt: sender [ ^self doIt ]
 
-    CocoaUI class >> selectionOrAll [
-        "The selection-or-everything rule (WKWebView GUI's
-         workspaceEvalTarget, ported verbatim): a non-empty selection wins;
-         an empty (collapsed) selection falls back to the whole buffer.
-         Answers an Array #(source insertAt)."
-        | full range loc len sub |
-        full := self workspaceText.
-        range := Workspace onMain selectedRange.
-        loc := range at: 1. len := range at: 2.
+    CocoaUI class >> evalTargetFor: full loc: loc len: len [
+        "PURE (headless-testable — the CG6 gate): the selection-or-everything
+         rule (WKWebView GUI's workspaceEvalTarget, ported verbatim): a
+         non-empty selection wins; an empty (collapsed) selection falls back
+         to the whole buffer. loc/len are the NSRange's 0-based location and
+         length. Answers an Array #(source insertAt)."
         len = 0 ifTrue: [ ^Array with: full with: full size ].
-        sub := full copyFrom: loc + 1 to: loc + len.
-        ^Array with: sub with: loc + len
+        ^Array with: (full copyFrom: loc + 1 to: loc + len) with: loc + len
+    ]
+
+    CocoaUI class >> selectionOrAll [
+        "Read the live NSTextView's selection and apply the pure rule above."
+        | range |
+        range := Workspace onMain selectedRange.
+        ^self evalTargetFor: self workspaceText loc: (range at: 1) len: (range at: 2)
     ]
 
     CocoaUI class >> doIt [
@@ -434,15 +444,25 @@ Print it does the same and inserts the result right after it."
         Worker uiDoit: source onReply: [ :result | CocoaUI insertPrintResult: result at: insertAt ].
     ]
 
-    CocoaUI class >> insertPrintResult: result at: anInteger [
-        | full at text newText |
-        Workspace isNil ifTrue: [ ^self ].
-        full := self workspaceText.
-        at := anInteger min: full size.
+    CocoaUI class >> splice: result into: full at: anInteger [
+        "PURE (headless-testable — the CG6 gate): splice ' result' into full
+         right after position anInteger, clamped into [0, full size] (the
+         captured insertion point can exceed the current text when the buffer
+         shrank between Print It and the async reply). Answers
+         #(newText caretAfter)."
+        | at text |
+        at := (anInteger min: full size) max: 0.
         text := ' ' , result.
-        newText := (full copyFrom: 1 to: at) , text , (full copyFrom: at + 1 to: full size).
-        Workspace onMain setString: newText.
-        Workspace onMain setSelectedRange: (Array with: at + text size with: 0).
+        ^Array with: (full copyFrom: 1 to: at) , text , (full copyFrom: at + 1 to: full size)
+               with: at + text size
+    ]
+
+    CocoaUI class >> insertPrintResult: result at: anInteger [
+        | spliced |
+        Workspace isNil ifTrue: [ ^self ].
+        spliced := self splice: result into: self workspaceText at: anInteger.
+        Workspace onMain setString: (spliced at: 1).
+        Workspace onMain setSelectedRange: (Array with: (spliced at: 2) with: 0).
     ]
 
     CocoaUI class >> workspaceText [
@@ -486,6 +506,8 @@ Print it does the same and inserts the result right after it."
          is local)."
         Worker abandonPending.
         self appendTranscript: '— environment restarted (primary respawned) —'.
+        "Snapshot views re-sync against the FRESH primary (CG7)."
+        (Worker classNamed: #CocoaBrowser) ifNotNil: [ :bc | bc environmentRestarted ].
     ]
 
     CocoaUI class >> teardown [
@@ -493,6 +515,7 @@ Print it does the same and inserts the result right after it."
          restarted UI leaks nothing)."
         Win isNil ifFalse: [
             Win onMain orderOut: nil.
+            (Worker classNamed: #CocoaBrowser) ifNotNil: [ :bc | bc teardown ].
             ActTarget isNil ifFalse: [ ActTarget isValid ifTrue: [ ActTarget release ] ].
             ToolbarDelegates isNil ifFalse: [
                 ToolbarDelegates do: [ :d | d isValid ifTrue: [ d release ] ] ].

@@ -273,6 +273,183 @@ fn main() {
         "#doIt"
     );
 
+    // (CG7) The outline data source's item-producing half: `child:ofItem:`
+    // answers a handle object (an NSString keyed by tree path) that AppKit
+    // hands BACK as `item` in every later call — the full round-trip is the
+    // property under test, plus the pointer STABILITY NSOutlineView's item
+    // identity model depends on (same node → same handle id, so the world side
+    // must cache handles per path, keyed by Symbol — String keys would hash by
+    // identity and mint fresh NSStrings every call).
+    vm.exec(
+        "Object subclass: CG7Tree [ <classVars: Handles Sels> \
+           CG7Tree class >> reset [ Handles := Dictionary new. Sels := 0 ] \
+           CG7Tree class >> sels [ ^Sels ] \
+           CG7Tree class >> noteSel [ Sels := (Sels ifNil: [ 0 ]) + 1 ] \
+           CG7Tree class >> handleFor: path [ \
+               | k h | k := path asSymbol. \
+               h := Handles at: k ifAbsent: [ nil ]. \
+               h isNil ifTrue: [ h := Cocoa nsString: path. Handles at: k put: h ]. \
+               ^h ] \
+           pathOf: item [ ^item isNil ifTrue: [ '' ] ifFalse: [ item sendString: 'description' ] ] \
+           outlineView: ov numberOfChildrenOfItem: item [ \
+               | p | p := self pathOf: item. \
+               p = '' ifTrue: [ ^2 ]. \
+               p = '1' ifTrue: [ ^3 ]. \
+               ^0 ] \
+           outlineView: ov isItemExpandable: item [ \
+               ^(self outlineView: ov numberOfChildrenOfItem: item) > 0 ] \
+           outlineView: ov child: i ofItem: item [ \
+               | p | p := self pathOf: item. \
+               ^CG7Tree handleFor: (p = '' ifTrue: [ i printString ] \
+                                          ifFalse: [ p , '.' , i printString ]) ] \
+           outlineView: ov objectValueForTableColumn: col byItem: item [ \
+               ^'label-' , (self pathOf: item) ] \
+           outlineViewSelectionDidChange: aNote [ CG7Tree noteSel ] ]",
+    )
+    .expect("define the outline tree model");
+    vm.exec("CG7Tree reset.").expect("reset the tree model");
+    let tree = mint(&mut vm, "outline", "CG7Tree new");
+
+    // child 1 of the ROOT (item = nil crosses as NULL): a real NSString handle.
+    let mut gpr = [0u64; SEND_GPR_SLOTS];
+    gpr[1] = 1; // the child INDEX (an NSInteger between two ids)
+    let out = objc_bridge::try_send_full(
+        tree,
+        "outlineView:child:ofItem:",
+        &gpr,
+        &[0.0; SEND_FPR_SLOTS],
+        &[0u64; SEND_STACK_SLOTS],
+        RetKind::Gpr,
+    )
+    .expect("child:ofItem: send must not throw");
+    let h1 = out.gpr[0] as *mut c_void;
+    assert!(!h1.is_null(), "child:ofItem: must answer a handle id");
+    assert_eq!(
+        String::from_utf8_lossy(&objc_bridge::nsstring_utf8_bytes(h1).expect("a real NSString")),
+        "1",
+        "the root's child 1 handle is its tree path"
+    );
+
+    // Hand the handle BACK as the item: the node resolves by content.
+    assert_eq!(
+        send_gpr(
+            tree,
+            "outlineView:numberOfChildrenOfItem:",
+            std::ptr::null_mut(),
+            h1
+        ),
+        3,
+        "the handed-back item must resolve to ITS node (3 children)"
+    );
+    assert_eq!(
+        send_gpr(
+            tree,
+            "outlineView:isItemExpandable:",
+            std::ptr::null_mut(),
+            h1
+        ) & 0xFF,
+        1,
+        "a node with children is expandable"
+    );
+
+    // Item pointer STABILITY: asking for the same child again must answer the
+    // SAME id (NSOutlineView tracks expansion/selection by item identity).
+    let out2 = objc_bridge::try_send_full(
+        tree,
+        "outlineView:child:ofItem:",
+        &gpr,
+        &[0.0; SEND_FPR_SLOTS],
+        &[0u64; SEND_STACK_SLOTS],
+        RetKind::Gpr,
+    )
+    .expect("second child:ofItem: send");
+    assert_eq!(
+        out2.gpr[0] as *mut c_void, h1,
+        "the same node must answer the SAME handle id every time"
+    );
+
+    // A NESTED child: child 2 of node "1" → path "1.2".
+    let mut gpr_n = [0u64; SEND_GPR_SLOTS];
+    gpr_n[1] = 2;
+    gpr_n[2] = h1 as u64;
+    let out3 = objc_bridge::try_send_full(
+        tree,
+        "outlineView:child:ofItem:",
+        &gpr_n,
+        &[0.0; SEND_FPR_SLOTS],
+        &[0u64; SEND_STACK_SLOTS],
+        RetKind::Gpr,
+    )
+    .expect("nested child:ofItem: send");
+    assert_eq!(
+        String::from_utf8_lossy(
+            &objc_bridge::nsstring_utf8_bytes(out3.gpr[0] as *mut c_void)
+                .expect("a real NSString")
+        ),
+        "1.2",
+        "a nested child's handle extends its parent's path"
+    );
+
+    // The display value for an item: a Smalltalk String marshaled to NSString.
+    let mut gpr_v = [0u64; SEND_GPR_SLOTS];
+    gpr_v[2] = h1 as u64; // (outline, column, item)
+    let out4 = objc_bridge::try_send_full(
+        tree,
+        "outlineView:objectValueForTableColumn:byItem:",
+        &gpr_v,
+        &[0.0; SEND_FPR_SLOTS],
+        &[0u64; SEND_STACK_SLOTS],
+        RetKind::Gpr,
+    )
+    .expect("objectValueForTableColumn:byItem: send");
+    assert_eq!(
+        String::from_utf8_lossy(
+            &objc_bridge::nsstring_utf8_bytes(out4.gpr[0] as *mut c_void)
+                .expect("a real NSString")
+        ),
+        "label-1",
+        "the display value comes from the node the item resolves to"
+    );
+
+    // ItemId fail-closed (CG7 review): `child:ofItem:` produces an object
+    // AppKit STORES across run-loop turns, so a handler answering a bare
+    // String is refused (NULL) — the Id shape's autoreleased-NSString
+    // fallback would hand AppKit a pointer that dangles after the next pool
+    // drain. Only a world-retained ObjcRef may cross as an item.
+    vm.exec(
+        "Object subclass: CG7Bad [ \
+           outlineView: ov child: i ofItem: item [ ^'not-a-handle' ] ]",
+    )
+    .expect("define the misbehaving item producer");
+    let bad = mint(&mut vm, "outline", "CG7Bad new");
+    let out_bad = objc_bridge::try_send_full(
+        bad,
+        "outlineView:child:ofItem:",
+        &gpr,
+        &[0.0; SEND_FPR_SLOTS],
+        &[0u64; SEND_STACK_SLOTS],
+        RetKind::Gpr,
+    )
+    .expect("bad child:ofItem: send must not throw");
+    assert_eq!(
+        out_bad.gpr[0], 0,
+        "a bare-String item answer must fail CLOSED (NULL), never an autoreleased NSString"
+    );
+
+    // The selection notification (void, delegate-side) lands at the SAME
+    // receiver as the data-source rows.
+    let _ = send_gpr(
+        tree,
+        "outlineViewSelectionDidChange:",
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+    );
+    assert_eq!(
+        vm.eval("CG7Tree sels").expect("sels").trim(),
+        "1",
+        "outlineViewSelectionDidChange: must dispatch to the model"
+    );
+
     // (4) Stale-fail-closed (design §4.3): re-publishing the UI worker bumps the
     // generation, so every delegate minted at the old generation — a not-yet-
     // closed window's data source after a restart — now fails closed rather than

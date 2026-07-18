@@ -11,6 +11,7 @@
 //! drains the UI worker's inbox on the main thread (§8). ⌘Q quits clean.
 
 mod boot;
+mod host_service;
 mod objc;
 mod snapshot;
 mod supervisor;
@@ -217,6 +218,10 @@ fn main() {
     // heap address of the drain state.
     let info = &mut *drain as *mut DrainState as *mut c_void;
     objc::install_default_mode_drain(info, drain_perform);
+
+    // (CG7) The host-service class the browser's source pane resolves by name —
+    // registered before `CocoaUI startup` so `Cocoa classNamed:` always finds it.
+    host_service::register();
 
     // The app menu (⌘Q → `terminate:`) + the quit-on-last-window-close delegate
     // MUST be installed BEFORE `CocoaUI startup`: startup's `installMenu` ADDS

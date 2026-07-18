@@ -1,0 +1,282 @@
+"66_cocoabrowser.mst — CocoaBrowser: the native class browser (CG7). Loaded
+ ONLY via world/cocoaui.list, after 64_cocoaui.mst (CocoaUI registers it at
+ startup by name, so this file is optional at runtime and absent everywhere
+ else).
+
+ The classic split, dual-placed (feedback_dual_placement_not_migration):
+   ROWS   — a names-only snapshot of the PRIMARY's live class hierarchy
+            ({name. ivars. classVars. instSels. classSels. children} nodes,
+            UiBrowserService on the primary, shipped as {#browserTree. tree}
+            over the CG4 request protocol). Strings/Arrays only — the worker
+            pickle REFUSES class oops, so a mirror can never leak across (R3).
+   SOURCE — host-served from the SQLite image (MacvmHostService, Rust,
+            image_store) — the SAME store the WKWebView GUI reads, because
+            the VM keeps no method source. Live-defined classes therefore
+            browse (rows) but show a no-source note (text) — honest, and
+            exactly what the web GUI would show after a reseed lag.
+
+ The outline is an NSOutlineView whose dataSource AND delegate are ONE
+ MacvmOutlineSource (C6) bound to this class. AppKit's item objects are
+ HANDLE NSStrings, one per tree path ('2.0.14'), minted on demand and cached
+ by Symbol key — cached because NSOutlineView tracks expansion/selection by
+ item IDENTITY, so the same node must answer the same id every time (the
+ cocoa_delegate gate pins this); Symbol-keyed because String Dictionary keys
+ hash by identity here and would silently defeat the cache. The wrap retains,
+ so a cached handle's NSString lives until the re-blast releases it.
+
+ A class node's combined child list is [instance selectors][class selectors]
+ [subclasses] — leaf, leaf, expandable — resolved by walking the snapshot
+ from the root on every callback (depth ≤ hierarchy depth; human-paced).
+
+ Selection: outlineViewSelectionDidChange: resolves the selected item's path;
+ a method leaf fetches sourceForClass:side:selector:, a class node fetches
+ classSourceFor:, both through the host service, into the read-only source
+ pane at the bottom."
+
+Object subclass: CocoaBrowser [
+    <classVars: Snapshot Handles HandleList Container Scroll Outline Col
+                SourceView Delegate Svc>
+
+    CocoaBrowser class >> sourcePaneHeight [ ^170.0 ]
+
+    "── registration (called by CocoaUI startup, by name) ──"
+    CocoaBrowser class >> register [
+        CocoaUI registerViewNamed: #browser title: 'Browser' icon: 'hierarchy'
+                activate: [ self activate ]
+    ]
+
+    CocoaBrowser class >> activate [
+        Container isNil ifTrue: [ self buildView ].
+        CocoaUI contentHost onMain addSubview: Container.
+        Snapshot isNil ifTrue: [ self requestRefresh ].
+    ]
+
+    "── the snapshot: request, install, invalidate ──"
+    CocoaBrowser class >> requestRefresh [
+        Worker uiRequest: #refresh args: (Array with: #browser) onReply: [ :r |
+            ((r isKindOf: Array) and: [ (r at: 1) == #browserTree ])
+                ifTrue: [ CocoaBrowser installSnapshot: (r at: 2) ] ]
+    ]
+    CocoaBrowser class >> installSnapshot: tree [
+        "Blast, don't patch: a fresh tree replaces everything. The order is
+         LOAD-BEARING (CG7 review): releaseHandles BEFORE reloadData, because
+         reloadData's synchronous callbacks re-mint and cache the NEW
+         generation's handles — releasing after would drop exactly those. The
+         old NSStrings can't dangle in the window between: this all runs
+         synchronously on main (no nested run loop, so AppKit cannot call
+         back mid-install), and NSOutlineView retains the items it still
+         holds until the reload."
+        self releaseHandles.
+        Snapshot := tree.
+        Outline isNil ifFalse: [ Outline onMain reloadData ].
+    ]
+    CocoaBrowser class >> environmentRestarted [
+        "The primary respawned from source: the old tree describes a dead
+         world (session-defined classes vanished). Re-request if we ever
+         loaded one; the reply re-blasts."
+        Snapshot isNil ifFalse: [ self requestRefresh ].
+    ]
+    CocoaBrowser class >> snapshot [ ^Snapshot ]
+
+    "── path scheme: '' = the root class node; '2.0.14' = 0-based child hops ──"
+    CocoaBrowser class >> handleFor: path [
+        | k h |
+        Handles isNil ifTrue: [ Handles := Dictionary new. HandleList := OrderedCollection new ].
+        k := path asSymbol.
+        h := Handles at: k ifAbsent: [ nil ].
+        h isNil ifTrue: [
+            h := Cocoa nsString: path.
+            Handles at: k put: h.
+            HandleList add: h ].
+        ^h
+    ]
+    CocoaBrowser class >> releaseHandles [
+        HandleList isNil ifTrue: [ ^self ].
+        HandleList do: [ :h | h isValid ifTrue: [ h release ] ].
+        Handles := nil. HandleList := nil.
+    ]
+    CocoaBrowser class >> pathOf: item [
+        ^item isNil ifTrue: [ '' ] ifFalse: [ item sendString: 'description' ]
+    ]
+    CocoaBrowser class >> splitPath: aString [
+        "'2.0.14' -> #(2 0 14) (digits only, by construction)."
+        | out cur |
+        out := OrderedCollection new.
+        cur := 0.
+        aString do: [ :ch |
+            ch = $.
+                ifTrue: [ out add: cur. cur := 0 ]
+                ifFalse: [ cur := cur * 10 + (ch value - 48) ] ].
+        out add: cur.
+        ^out asArray
+    ]
+
+    "Resolve a path against the snapshot. Answers
+       {#class. classNode} | {#imeth. classNode. sel} | {#cmeth. classNode. sel}
+     or nil for a stale/invalid path (a callback racing a re-blast) — every
+     caller treats nil as empty, so a stale handle fails CLOSED, never raises."
+    CocoaBrowser class >> resolvePath: pathString [
+        | node parts last i nI nC |
+        Snapshot isNil ifTrue: [ ^nil ].
+        node := Snapshot.
+        pathString = '' ifTrue: [ ^Array with: #class with: node ].
+        parts := self splitPath: pathString.
+        last := parts size.
+        1 to: last do: [ :d |
+            i := parts at: d.
+            nI := (node at: 4) size.
+            nC := (node at: 5) size.
+            i < nI ifTrue: [
+                d = last ifFalse: [ ^nil ].
+                ^Array with: #imeth with: node with: ((node at: 4) at: i + 1) ].
+            i < (nI + nC) ifTrue: [
+                d = last ifFalse: [ ^nil ].
+                ^Array with: #cmeth with: node with: ((node at: 5) at: i - nI + 1) ].
+            i - nI - nC < (node at: 6) size ifFalse: [ ^nil ].
+            node := (node at: 6) at: i - nI - nC + 1 ].
+        ^Array with: #class with: node
+    ]
+    CocoaBrowser class >> childCountOf: resolved [
+        | node |
+        resolved isNil ifTrue: [ ^0 ].
+        (resolved at: 1) == #class ifFalse: [ ^0 ].
+        node := resolved at: 2.
+        ^(node at: 4) size + (node at: 5) size + (node at: 6) size
+    ]
+    CocoaBrowser class >> labelFor: resolved [
+        resolved isNil ifTrue: [ ^'' ].
+        (resolved at: 1) == #imeth ifTrue: [ ^resolved at: 3 ].
+        (resolved at: 1) == #cmeth ifTrue: [ ^'class >> ' , (resolved at: 3) ].
+        ^(resolved at: 2) at: 1
+    ]
+
+    "── the C6 data-source/delegate callbacks (one receiver serves both) ──"
+    CocoaBrowser class >> outlineView: ov numberOfChildrenOfItem: item [
+        ^self childCountOf: (self resolvePath: (self pathOf: item))
+    ]
+    CocoaBrowser class >> outlineView: ov isItemExpandable: item [
+        ^(self childCountOf: (self resolvePath: (self pathOf: item))) > 0
+    ]
+    CocoaBrowser class >> outlineView: ov child: i ofItem: item [
+        | p |
+        p := self pathOf: item.
+        ^self handleFor: (p = '' ifTrue: [ i printString ]
+                                 ifFalse: [ p , '.' , i printString ])
+    ]
+    CocoaBrowser class >> outlineView: ov objectValueForTableColumn: col byItem: item [
+        ^self labelFor: (self resolvePath: (self pathOf: item))
+    ]
+    CocoaBrowser class >> outlineViewSelectionDidChange: aNote [
+        self showSelection
+    ]
+
+    "── selection → the source pane (host-served from the image) ──"
+    CocoaBrowser class >> showSelection [
+        | row item resolved kind node |
+        Outline isNil ifTrue: [ ^self ].
+        row := Outline onMain selectedRow.
+        row < 0 ifTrue: [ ^self ].
+        item := Outline onMain itemAtRow: row.
+        item isNil ifTrue: [ ^self ].
+        resolved := self resolvePath: (self pathOf: item).
+        "itemAtRow: minted a FRESH wrapper (+1) on the handle NSString — drop
+         it now the path is read, or every selection leaks one (CG7 review)."
+        item release.
+        resolved isNil ifTrue: [ ^self ].
+        kind := resolved at: 1.
+        node := resolved at: 2.
+        kind == #class ifTrue: [ ^self showSource: (self hostClassSource: (node at: 1)) ].
+        kind == #imeth ifTrue: [
+            ^self showSource: (self hostSourceClass: (node at: 1) side: 'instance' selector: (resolved at: 3)) ].
+        kind == #cmeth ifTrue: [
+            ^self showSource: (self hostSourceClass: (node at: 1) side: 'class' selector: (resolved at: 3)) ].
+    ]
+    CocoaBrowser class >> hostService [
+        Svc isNil ifTrue: [
+            Svc := ((Cocoa classNamed: 'MacvmHostService') onMain alloc) onMain init ].
+        ^Svc
+    ]
+    CocoaBrowser class >> hostSourceClass: c side: s selector: m [
+        | ns text |
+        ns := self hostService onMain sourceForClass: c side: s selector: m.
+        ns isNil ifTrue: [ ^'' ].
+        text := ns sendString: 'description'.
+        "The reply NSString's wrapper is +1 and per-click FRESH (a whole
+         method's source text) — release once copied, or it leaks (CG7 review)."
+        ns release.
+        ^text
+    ]
+    CocoaBrowser class >> hostClassSource: c [
+        | ns text |
+        ns := self hostService onMain classSourceFor: c.
+        ns isNil ifTrue: [ ^'' ].
+        text := ns sendString: 'description'.
+        ns release.
+        ^text
+    ]
+    CocoaBrowser class >> showSource: aString [
+        | text |
+        SourceView isNil ifTrue: [ ^self ].
+        text := aString isEmpty
+            ifTrue: [ '"no source in the image for this selection (defined live this session, or a primitive-only method) — the rows are the primary''s, the text is the image''s"' ]
+            ifFalse: [ aString ].
+        SourceView onMain setString: text.
+    ]
+
+    "── the view: an outline (scrolling) over a read-only source pane ──"
+    CocoaBrowser class >> buildView [
+        | host frame w h viewCls outlineH |
+        host := CocoaUI contentHost.
+        frame := host onMain frame.
+        w := frame at: 3.
+        h := frame at: 4.
+        outlineH := h - self sourcePaneHeight.
+        viewCls := Cocoa classNamed: 'NSView'.
+        Container := (viewCls onMain alloc) onMain
+            initWithFrame: (Array with: 0.0 with: 0.0 with: w with: h).
+        Container onMain setAutoresizingMask: CocoaUI maskWidthSizable + CocoaUI maskHeightSizable.
+
+        SourceView := ((Cocoa classNamed: 'NSTextView') onMain alloc) onMain
+            initWithFrame: (Array with: 0.0 with: 0.0 with: w with: self sourcePaneHeight).
+        SourceView onMain setEditable: false.
+        SourceView onMain setFont: ((Cocoa classNamed: 'NSFont') onMain
+            userFixedPitchFontOfSize: 12.0).
+        SourceView onMain setAutoresizingMask: CocoaUI maskWidthSizable + CocoaUI maskMaxYMargin.
+        Container onMain addSubview: SourceView.
+
+        Scroll := ((Cocoa classNamed: 'NSScrollView') onMain alloc) onMain
+            initWithFrame: (Array with: 0.0 with: self sourcePaneHeight with: w with: outlineH).
+        Scroll onMain setAutoresizingMask: CocoaUI maskWidthSizable + CocoaUI maskHeightSizable.
+        Scroll onMain setHasVerticalScroller: true.
+
+        Outline := ((Cocoa classNamed: 'NSOutlineView') onMain alloc) onMain
+            initWithFrame: (Array with: 0.0 with: 0.0 with: w with: outlineH).
+        Col := ((Cocoa classNamed: 'NSTableColumn') onMain alloc) onMain
+            initWithIdentifier: 'c'.
+        Col onMain setWidth: w - 40.0.
+        Outline onMain addTableColumn: Col.
+        Outline onMain setOutlineTableColumn: Col.
+        Outline onMain setHeaderView: nil.
+        Delegate := MacvmDelegate outlineSourceOn: self.
+        Outline onMain setDataSource: Delegate.
+        Outline onMain setDelegate: Delegate.
+        Scroll onMain setDocumentView: Outline.
+        Container onMain addSubview: Scroll.
+        self showSource: '"select a class or method above"'.
+    ]
+
+    CocoaBrowser class >> teardown [
+        "Idempotent release of everything native (mirrors CocoaUI teardown,
+         which calls this by name)."
+        self releaseHandles.
+        Delegate isNil ifFalse: [ Delegate isValid ifTrue: [ Delegate release ] ].
+        Svc isNil ifFalse: [ Svc isValid ifTrue: [ Svc release ] ].
+        Col isNil ifFalse: [ Col isValid ifTrue: [ Col release ] ].
+        Outline isNil ifFalse: [ Outline isValid ifTrue: [ Outline release ] ].
+        Scroll isNil ifFalse: [ Scroll isValid ifTrue: [ Scroll release ] ].
+        SourceView isNil ifFalse: [ SourceView isValid ifTrue: [ SourceView release ] ].
+        Container isNil ifFalse: [ Container isValid ifTrue: [ Container release ] ].
+        Snapshot := nil. Delegate := nil. Svc := nil. Col := nil.
+        Outline := nil. Scroll := nil. SourceView := nil. Container := nil.
+    ]
+]

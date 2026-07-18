@@ -368,12 +368,20 @@ Object subclass: Worker [
         result := self primEvalDoit: aSource.
         ^self replyTo: peer corr: corr payload: (Array with: #uiReply with: corr with: result printString)
     ]
-    "Per-view request handlers the browser/codeview views (CG5/CG6) install;
-     until then they answer a benign placeholder so the protocol is complete and
-     a stray request never raises."
+    "Per-view request handlers a specialized primary MAY install (checked
+     first); the built-in services below are the defaults. Unknown views
+     answer a benign placeholder so a stray request never raises."
     Worker class >> onUiRequest: aBlock [ UiReqHandler := aBlock ]
     Worker class >> serveUiRefresh: viewId [
         UiReqHandler isNil ifFalse: [ ^UiReqHandler value: #refresh value: viewId ].
+        "#browser (CG7): the names-only class-hierarchy snapshot, produced by
+         UiBrowserService (34_tools.mst) — late-bound by name so this protocol
+         file carries no compile-time dependency on the tools layer."
+        viewId == #browser ifTrue: [
+            | svc |
+            svc := self classNamed: #UiBrowserService.
+            svc isNil ifFalse: [
+                ^Array with: #browserTree with: svc browseSnapshot ] ].
         ^Array with: #uiPending with: viewId
     ]
     Worker class >> serveUiSelect: payload [

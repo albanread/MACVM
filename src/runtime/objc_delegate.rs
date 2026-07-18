@@ -113,6 +113,12 @@ enum RetShape {
     /// `@` — an object id: a `String` becomes a fresh (+0, borrowed) `NSString`;
     /// an `ObjcRef` yields its raw id; `nil`/anything else → NULL.
     Id,
+    /// `@` that AppKit will STORE across run-loop turns (an outline ITEM from
+    /// `child:ofItem:`): only a world-RETAINED `ObjcRef` may cross — the
+    /// handler's cached handle keeps it alive. A plain `String` answer is
+    /// refused (NULL, fail closed) rather than minted as an autoreleased
+    /// NSString that would dangle after the pool drains (CG7 review).
+    ItemId,
 }
 
 // ── the generic dispatcher: one top-level entry per callback ─────────────────
@@ -237,6 +243,9 @@ fn marshal_ret(vm: &mut VmState, result: Oop, ret: RetShape) -> u64 {
             .map(|s| s.value() as u64)
             .unwrap_or(0),
         RetShape::Id => marshal_id_ret(vm, result),
+        RetShape::ItemId => crate::runtime::objc_bridge::read_id(vm, result)
+            .map(|id| id as u64)
+            .unwrap_or(0),
     }
 }
 
@@ -379,6 +388,54 @@ extern "C" fn imp_is_expandable(
         RetShape::Bool,
     ) as u8
 }
+// The item-producing half (CG7): `child:ofItem:` answers the ITEM OBJECT AppKit
+// will hand back in every later data-source call for that node — the handler
+// answers a retained `ObjcRef` handle it keeps alive for the snapshot
+// generation (an NSString keyed by tree path, design §7.1); AppKit does NOT
+// retain outline items, so world-side ownership is load-bearing.
+extern "C" fn imp_child_of_item(
+    this: *mut c_void,
+    _cmd: *mut c_void,
+    outline: *mut c_void,
+    index: i64,
+    item: *mut c_void,
+) -> *mut c_void {
+    dispatch(
+        this,
+        "outlineView:child:ofItem:",
+        &[ArgVal::Id(outline), ArgVal::Int(index), ArgVal::Id(item)],
+        RetShape::ItemId,
+    ) as *mut c_void
+}
+extern "C" fn imp_object_value_by_item(
+    this: *mut c_void,
+    _cmd: *mut c_void,
+    outline: *mut c_void,
+    column: *mut c_void,
+    item: *mut c_void,
+) -> *mut c_void {
+    dispatch(
+        this,
+        "outlineView:objectValueForTableColumn:byItem:",
+        &[ArgVal::Id(outline), ArgVal::Id(column), ArgVal::Id(item)],
+        RetShape::Id,
+    ) as *mut c_void
+}
+// `NSOutlineViewDelegate`'s selection notification (same v@:@ notification
+// shape as windowWillClose:) — one delegate instance serves as BOTH dataSource
+// and delegate, so selection lands at the same receiver as the rows.
+extern "C" fn imp_outline_selection_did_change(
+    this: *mut c_void,
+    _cmd: *mut c_void,
+    note: *mut c_void,
+) {
+    dispatch(
+        this,
+        "outlineViewSelectionDidChange:",
+        &[ArgVal::Id(note)],
+        RetShape::Void,
+    );
+}
 
 // ── per-role class registration (the MacvmAction pattern, generalized) ───────
 
@@ -439,6 +496,10 @@ type ImpIdTcr =
     extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void, i64) -> *mut c_void;
 type ImpQ2 = extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void) -> i64;
 type ImpB2 = extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void) -> u8;
+type ImpIdChild =
+    extern "C" fn(*mut c_void, *mut c_void, *mut c_void, i64, *mut c_void) -> *mut c_void;
+type ImpIdByItem =
+    extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void, *mut c_void) -> *mut c_void;
 
 static WINDOW_DELEGATE_CLASS: OnceLock<Option<usize>> = OnceLock::new();
 static TEXT_DELEGATE_CLASS: OnceLock<Option<usize>> = OnceLock::new();
@@ -523,6 +584,21 @@ fn outline_source_class() -> Option<*mut c_void> {
                         "outlineView:isItemExpandable:",
                         imp_ptr!(imp_is_expandable, ImpB2),
                         "B@:@@",
+                    ),
+                    (
+                        "outlineView:child:ofItem:",
+                        imp_ptr!(imp_child_of_item, ImpIdChild),
+                        "@@:@q@",
+                    ),
+                    (
+                        "outlineView:objectValueForTableColumn:byItem:",
+                        imp_ptr!(imp_object_value_by_item, ImpIdByItem),
+                        "@@:@@@",
+                    ),
+                    (
+                        "outlineViewSelectionDidChange:",
+                        imp_ptr!(imp_outline_selection_did_change, ImpV1),
+                        "v@:@",
                     ),
                 ],
             )

@@ -111,6 +111,12 @@ fn sym(name: &str) -> *mut c_void {
     p
 }
 
+/// A resolved runtime symbol address for sibling modules registering their own
+/// ObjC classes (`host_service`) — the same panic-on-missing contract as `sym`.
+pub fn sym_addr(name: &str) -> *mut c_void {
+    sym(name)
+}
+
 fn msg_send_ptr() -> *mut c_void {
     static PTR: OnceLock<usize> = OnceLock::new();
     *PTR.get_or_init(|| sym("objc_msgSend") as usize) as *mut c_void

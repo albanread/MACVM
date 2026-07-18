@@ -221,6 +221,19 @@ impl Image {
         Ok(Self { conn })
     }
 
+    /// Open for READING only — no schema creation, no migrations, no write
+    /// lock ever taken. For pure readers of an image another actor owns (the
+    /// Cocoa GUI's source pane, CG7): a concurrent writer can't be blocked by
+    /// us, we can't mutate a file we don't own, and a busy/missing image is an
+    /// immediate `Err` the caller degrades on — never a main-thread stall.
+    pub fn open_read_only(path: &Path) -> rusqlite::Result<Self> {
+        let conn = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        Ok(Self { conn })
+    }
+
     pub fn open_in_memory() -> rusqlite::Result<Self> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch(SCHEMA)?;

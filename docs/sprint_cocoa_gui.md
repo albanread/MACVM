@@ -328,6 +328,17 @@ on-screen PNGs proving the shell renders before any human looks at it.
 **Design ref:** §7.4 (Transcript), §11 Q4/R9 (Workspace text is local — the
 view host doesn't change that), `project_gui_themes`, `project_metrics_dashboard`.
 
+**As built (CG7 close-out note).** The view registry landed **Smalltalk-side**
+(`CocoaUI`'s `Views`/`registerViewNamed:title:icon:activate:` +
+`installViewMenuOn:`), not as the Rust-side `ViewRegistry` this entry
+specified — deliberately: the UI worker owns all view construction, so the
+registry lives beside it, and the View menu is still built purely from
+registrations. The planned "pure Rust unit test" gate is therefore void; the
+registry's machine gate is the CG7 differential/headless suite plus
+`MACVM_COCOA_SNAP`. CG6's selection-or-everything + inline Print It shipped
+early inside CG5's commits (`64_cocoaui.mst` carries both); its headless
+splice/selection gates land with CG7 slice 0.
+
 ---
 
 ## CG6 — Workspace, properly: selection eval + inline Print it (design G2c) `S`
@@ -407,6 +418,29 @@ model); the snapshot pickles clean (a round-trip proving no class oop
 crossed).
 
 **Design ref:** §7.1, §7.2, §10 G3.
+
+**As built.** Rows exactly as designed: `UiBrowserService` (base world,
+beside `ClassMirror`) projects the live hierarchy into names-only 6-slot
+nodes, served late-bound by the `#refresh(#browser)` verb; `CocoaBrowser`
+(`world/66_cocoabrowser.mst`, cocoaui layer) resolves 0-based path handles
+(`'2.0.14'` NSStrings, Symbol-key cached for the item-identity stability
+NSOutlineView requires) over the snapshot, one `MacvmOutlineSource` serving
+as both dataSource and delegate. The outline-source role grew its three
+missing IMPs (`child:ofItem:`, `objectValueForTableColumn:byItem:`,
+`outlineViewSelectionDidChange:`) — the row-by-row marshalling discipline.
+**One deliberate deviation:** the source pane is NOT a `#select` round trip
+to the primary — the primary keeps no method source (methods compile and
+drop their text), so source is **host-served** from the SQLite image by a
+`MacvmHostService` ObjC class (`cocoa_gui/src/host_service.rs`,
+`image_store::method_source`/`class_source`) reached as an ordinary C3
+bridge send — the exact split the WKWebView GUI uses (`vm_host` →
+`image_store`), dual placement: the VM owns the rows, the image owns the
+text. Live-defined classes browse with a "no source in the image" note.
+`#select` stays reserved for CG8's save path. Gates: the embed differential
+(`browse_snapshot_matches…`, incl. pickle round-trip + the two-VM `#refresh`
+protocol trip), the path-resolution fail-closed gate
+(`cocoa_browser_resolves_paths…`), and the `cocoa_delegate` item round-trip
+(pointer stability, nested paths, selection dispatch).
 
 ---
 

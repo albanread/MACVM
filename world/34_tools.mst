@@ -569,3 +569,44 @@ Visual subclass: DefinitionsView [
         ^true
     ]
 ]
+
+"--- UiBrowserService: the primary-side browse snapshot (Cocoa GUI CG7) ---
+ The #refresh(#browser) verb's producer: project the LIVE class hierarchy into
+ a names-only nested tree — Strings/Arrays/smis only, so the worker pickle can
+ never refuse it and no class oop can leak across a VM boundary (design R3;
+ the pickle REFUSING classes is the enforcement, proven in the embed gate).
+ Node shape (6 slots):
+   {name. instVarNames. classVarNames. instSelectors. classSelectors. children}
+ Selectors alphabetically sorted (ClassMirror's own order), children in
+ allClasses order — the SAME projection the WKWebView outliner renders
+ (ClassHierarchyOutliner's subclassMirrors walk), so the two GUIs browse
+ identical rows (the CG7 differential gate pins this)."
+Object subclass: UiBrowserService [
+    UiBrowserService class >> browseSnapshot [
+        ^self nodeFor: (ClassMirror on: Object)
+    ]
+    UiBrowserService class >> nodeFor: aMirror [
+        | node |
+        node := Array new: 6.
+        node at: 1 put: aMirror name.
+        node at: 2 put: (self namesOf: aMirror instanceVariables).
+        node at: 3 put: (self namesOf: aMirror classVariables).
+        node at: 4 put: (self namesOf: aMirror instanceSelectors).
+        node at: 5 put: (self namesOf: aMirror classSelectors).
+        node at: 6 put: (self childrenOf: aMirror).
+        ^node
+    ]
+    "A collection of Symbols -> an Array of Strings (pickle-plain, UI-ready)."
+    UiBrowserService class >> namesOf: symbols [
+        | out |
+        out := OrderedCollection new.
+        symbols do: [ :s | out add: s asString ].
+        ^out asArray
+    ]
+    UiBrowserService class >> childrenOf: aMirror [
+        | out |
+        out := OrderedCollection new.
+        aMirror subclassMirrors do: [ :m | out add: (self nodeFor: m) ].
+        ^out asArray
+    ]
+]

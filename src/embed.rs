@@ -3140,6 +3140,12 @@ mod tests {
             Path::new("world"),
         )
         .expect("boot the UI worker VM in place");
+        // The conditional Cocoa layer, exactly as `cocoa_gui`'s boot does —
+        // class definitions only; nothing here touches AppKit until a view is
+        // built, so the layer is fully loadable headless (the CG6 pure-rule
+        // gates run against the real `CocoaUI`).
+        crate::frontend::world::load_list(&mut ui.vm, Path::new("world/cocoaui.list"))
+            .expect("layer the Cocoa UI world onto the UI worker");
         ui.install_worker_role(id, to_primary);
         ui.exec(
             "Object subclass: UiT [ <classVars: R>
@@ -3208,6 +3214,265 @@ mod tests {
         // A second, different doit proves the corr advances and the loop keeps
         // routing to the right continuation.
         ui_doit_round_trip(&mut primary, &mut ui, &inbox, "6 * 7", "'42'");
+    }
+
+    /// The CG6 headless gate (sprint_cocoa_gui.md): the Workspace's two pure
+    /// rules, tested in a real UI-worker VM (cocoaui.list loaded, no AppKit).
+    /// `evalTargetFor:loc:len:` is the selection-or-everything rule;
+    /// `splice:into:at:` is Print It's inline insert with the captured
+    /// insertion point clamped — the async-race case (`pendingPrintInsertAt`)
+    /// where the buffer shrank before the `#uiReply` landed.
+    #[test]
+    fn cocoaui_workspace_selection_and_print_splice_rules_are_pure() {
+        let mut primary = boot_worker_primary();
+        let (id, _inbox, to_primary) =
+            crate::runtime::workers::register_hosted_worker(&mut primary.vm, Arc::new(|| {}))
+                .expect("register the hosted UI worker on the primary");
+        let mut ui = boot_ui_worker(id, to_primary);
+
+        // Selection rule: a real selection evaluates exactly the substring…
+        assert_eq!(
+            ui.eval("(CocoaUI evalTargetFor: '3 + 4. 6 * 7.' loc: 7 len: 5) at: 1")
+                .expect("selected substring")
+                .trim(),
+            "'6 * 7'"
+        );
+        // …and a collapsed (len 0) selection falls back to the whole buffer,
+        // inserting at the end.
+        assert_eq!(
+            ui.eval("(CocoaUI evalTargetFor: '3 + 4.' loc: 3 len: 0) at: 1")
+                .expect("whole buffer")
+                .trim(),
+            "'3 + 4.'"
+        );
+        assert_eq!(
+            ui.eval("(CocoaUI evalTargetFor: '3 + 4.' loc: 3 len: 0) at: 2")
+                .expect("insert at end")
+                .trim(),
+            "6"
+        );
+
+        // Print It splice: the result lands right after the captured point…
+        assert_eq!(
+            ui.eval("(CocoaUI splice: '7' into: '3 + 4. rest' at: 6) at: 1")
+                .expect("spliced text")
+                .trim(),
+            "'3 + 4. 7 rest'"
+        );
+        assert_eq!(
+            ui.eval("(CocoaUI splice: '7' into: '3 + 4. rest' at: 6) at: 2")
+                .expect("caret lands after the inserted result")
+                .trim(),
+            "8"
+        );
+        // …and a stale insertion point beyond the (shrunk) buffer clamps to the
+        // end instead of raising — the race `pendingPrintInsertAt` exists for.
+        assert_eq!(
+            ui.eval("(CocoaUI splice: '7' into: '3 + 4.' at: 999) at: 1")
+                .expect("clamped splice")
+                .trim(),
+            "'3 + 4. 7'"
+        );
+    }
+
+    /// The CG7 primary-side gate: `UiBrowserService browseSnapshot` projects the
+    /// LIVE hierarchy into a names-only tree that (a) matches the class model's
+    /// own answers row for row (the differential vs the same `ClassMirror` calls
+    /// the WKWebView outliner renders from), (b) pickles clean (a class oop
+    /// ANYWHERE in the tree would make `Worker pickle:` raise — R3's enforcement),
+    /// and (c) arrives end-to-end through a real `{#uiReq. corr. #refresh.
+    /// #browser}` round trip between two VMs.
+    #[test]
+    fn browse_snapshot_matches_the_class_model_and_round_trips() {
+        let mut primary = boot_worker_primary();
+        primary
+            .exec(
+                "Object subclass: CGDiff [ <classVars: T> \
+                   CGDiff class >> t: x [ T := x ]  CGDiff class >> t [ ^T ] \
+                   CGDiff class >> find: aName in: node [ \
+                       | f | \
+                       (node at: 1) = aName ifTrue: [ ^node ]. \
+                       (node at: 6) do: [ :k | \
+                           f := CGDiff find: aName in: k. \
+                           f isNil ifFalse: [ ^f ] ]. \
+                       ^nil ] \
+                   CGDiff class >> has: aString in: anArray [ \
+                       anArray do: [ :s | s = aString ifTrue: [ ^true ] ]. \
+                       ^false ] ]",
+            )
+            .expect("define the tree walker");
+        primary
+            .exec("CGDiff t: UiBrowserService browseSnapshot.")
+            .expect("produce the snapshot once");
+
+        // The root is Object, and a mid-hierarchy class's row set matches the
+        // model exactly (count + a known member, both sides sorted the same).
+        assert_eq!(
+            primary.eval("CGDiff t at: 1").expect("root").trim(),
+            "'Object'"
+        );
+        assert_eq!(
+            primary
+                .eval(
+                    "((CGDiff find: 'OrderedCollection' in: CGDiff t) at: 4) size \
+                     = (ClassMirror selectorsOf: OrderedCollection) size"
+                )
+                .expect("instance-selector row count")
+                .trim(),
+            "true",
+            "the snapshot's instance selectors must match ClassMirror's own count"
+        );
+        assert_eq!(
+            primary
+                .eval("CGDiff has: 'add:' in: ((CGDiff find: 'OrderedCollection' in: CGDiff t) at: 4)")
+                .expect("known instance selector")
+                .trim(),
+            "true"
+        );
+        // Class-side selectors and ivar names project too.
+        assert_eq!(
+            primary
+                .eval("CGDiff has: 'errno' in: ((CGDiff find: 'Posix' in: CGDiff t) at: 5)")
+                .expect("known class-side selector")
+                .trim(),
+            "true"
+        );
+        assert_eq!(
+            primary
+                .eval("((CGDiff find: 'Kqueue' in: CGDiff t) at: 2) size")
+                .expect("Kqueue's two ivars")
+                .trim(),
+            "2",
+            "instance-variable names must ride the node (kq, buf)"
+        );
+
+        // (b) The whole tree pickles + unpickles — no class oop crossed.
+        assert_eq!(
+            primary
+                .eval("(Worker unpickle: (Worker pickle: CGDiff t)) at: 1")
+                .expect("pickle round trip")
+                .trim(),
+            "'Object'",
+            "the snapshot must survive the worker pickle (names only, R3)"
+        );
+
+        // (c) End to end: the UI worker ships {#uiReq. corr. #refresh. #browser},
+        // the primary's late-bound UiBrowserService serves it, and the
+        // {#browserTree. tree} payload lands in the UI-side continuation.
+        let (id, inbox, to_primary) =
+            crate::runtime::workers::register_hosted_worker(&mut primary.vm, Arc::new(|| {}))
+                .expect("register the hosted UI worker");
+        let mut ui = boot_ui_worker(id, to_primary);
+        ui.exec("Worker uiRequest: #refresh args: (Array with: #browser) onReply: [:r | UiT r: r].")
+            .expect("ship the #refresh request");
+        primary
+            .exec("Worker dispatchInbox.")
+            .expect("the primary serves the #refresh");
+        let mut drained = 0;
+        while let Some(env) = inbox.poll() {
+            ui.stage_pending(env);
+            ui.exec("Worker dispatchInbox.")
+                .expect("the UI worker routes the reply");
+            drained += 1;
+        }
+        assert!(drained >= 1, "the #uiReply must reach the UI worker");
+        assert_eq!(
+            ui.eval("UiT r at: 1").expect("payload tag").trim(),
+            "#browserTree"
+        );
+        assert_eq!(
+            ui.eval("(UiT r at: 2) at: 1").expect("tree root").trim(),
+            "'Object'",
+            "the tree itself crossed the channel intact"
+        );
+    }
+
+    /// The CG7 UI-side gate: `CocoaBrowser`'s path scheme — the pure model the
+    /// NSOutlineView data-source callbacks answer from — resolved over an
+    /// installed snapshot, headless. A class node's combined child list is
+    /// [instance sels][class sels][subclasses]; paths are 0-based hops; stale
+    /// or invalid paths resolve to nil and every consumer fails CLOSED (0
+    /// children / empty label), never raises — the property that makes a
+    /// callback racing a re-blast safe.
+    #[test]
+    fn cocoa_browser_resolves_paths_over_a_snapshot_and_fails_closed() {
+        let mut primary = boot_worker_primary();
+        let (id, _inbox, to_primary) =
+            crate::runtime::workers::register_hosted_worker(&mut primary.vm, Arc::new(|| {}))
+                .expect("register the hosted UI worker");
+        let mut ui = boot_ui_worker(id, to_primary);
+        ui.exec(
+            "Object subclass: CGB7 [
+                CGB7 class >> mk [
+                    | root sub |
+                    sub := Array new: 6.
+                    sub at: 1 put: 'Kid'.          sub at: 2 put: #('x').
+                    sub at: 3 put: (Array new: 0). sub at: 4 put: #('kidM').
+                    sub at: 5 put: (Array new: 0). sub at: 6 put: (Array new: 0).
+                    root := Array new: 6.
+                    root at: 1 put: 'Object'.      root at: 2 put: (Array new: 0).
+                    root at: 3 put: (Array new: 0). root at: 4 put: #('foo' 'bar:').
+                    root at: 5 put: #('make').     root at: 6 put: (Array with: sub).
+                    ^root ] ]",
+        )
+        .expect("define the snapshot builder");
+        ui.exec("CocoaBrowser installSnapshot: CGB7 mk.")
+            .expect("install a small snapshot (no outline built — headless)");
+
+        // The root and its combined child list: 2 inst + 1 class + 1 subclass.
+        assert_eq!(
+            ui.eval("(CocoaBrowser resolvePath: '') at: 1").expect("root kind").trim(),
+            "#class"
+        );
+        assert_eq!(
+            ui.eval("CocoaBrowser childCountOf: (CocoaBrowser resolvePath: '')")
+                .expect("root child count")
+                .trim(),
+            "4"
+        );
+        // Child ranges: instance sel, class sel (labelled), subclass, nested.
+        assert_eq!(
+            ui.eval("CocoaBrowser labelFor: (CocoaBrowser resolvePath: '0')")
+                .expect("first instance selector")
+                .trim(),
+            "'foo'"
+        );
+        assert_eq!(
+            ui.eval("CocoaBrowser labelFor: (CocoaBrowser resolvePath: '2')")
+                .expect("the class-side selector")
+                .trim(),
+            "'class >> make'"
+        );
+        assert_eq!(
+            ui.eval("(CocoaBrowser resolvePath: '3') at: 1").expect("subclass kind").trim(),
+            "#class"
+        );
+        assert_eq!(
+            ui.eval("CocoaBrowser labelFor: (CocoaBrowser resolvePath: '3')")
+                .expect("subclass label")
+                .trim(),
+            "'Kid'"
+        );
+        assert_eq!(
+            ui.eval("CocoaBrowser labelFor: (CocoaBrowser resolvePath: '3.0')")
+                .expect("nested method")
+                .trim(),
+            "'kidM'"
+        );
+        // Fail-closed: an out-of-range hop and a path THROUGH a leaf both
+        // resolve nil → zero children, empty label.
+        assert_eq!(
+            ui.eval("CocoaBrowser childCountOf: (CocoaBrowser resolvePath: '9')")
+                .expect("out of range")
+                .trim(),
+            "0"
+        );
+        assert_eq!(
+            ui.eval("CocoaBrowser labelFor: (CocoaBrowser resolvePath: '0.0')")
+                .expect("a path through a method leaf")
+                .trim(),
+            "''"
+        );
     }
 
     #[test]

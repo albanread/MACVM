@@ -14,3 +14,7 @@
 # list order — not the filename number — is what fixes the forward reference.
 65_cocoadelegate.mst
 64_cocoaui.mst
+# CocoaBrowser (CG7) loads after CocoaUI: startup resolves it BY NAME and asks
+# it to register its view, so the file is optional — remove the line and the
+# shell simply has no Browser entry.
+66_cocoabrowser.mst
