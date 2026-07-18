@@ -130,6 +130,52 @@ extern "C" fn imp_class_names(_this: *mut c_void, _cmd: *mut c_void) -> Id {
     objc::nsstring(&text)
 }
 
+/// `browseRecords` — the whole class hierarchy as flat records for the browser
+/// tree, ONE per class, fields `␟`-separated:
+///   `name ␟ superclass ␟ instVars ␟ classVars ␟ instSelectors ␟ classSelectors`
+/// (the four var/selector lists are space-separated names), records `\n`-joined.
+/// This is the DATABASE-query replacement for the primary VM's live reflection
+/// snapshot (`UiBrowserService browseSnapshot`) — the image is the source of
+/// truth, same as the editor + the Find views. The UI rebuilds the nested tree
+/// from the `superclass` links.
+extern "C" fn imp_browse_records(_this: *mut c_void, _cmd: *mut c_void) -> Id {
+    let text = Image::open_read_only(&image_path())
+        .ok()
+        .map(|img| {
+            let mut out = String::new();
+            for name in img.class_names().unwrap_or_default() {
+                let cls = img.class_named(&name).ok().flatten();
+                let (superc, ivars, cvars) = match &cls {
+                    Some(c) => (
+                        c.superclass.clone().unwrap_or_default(),
+                        c.instance_vars.clone(),
+                        c.class_vars.clone(),
+                    ),
+                    None => (String::new(), String::new(), String::new()),
+                };
+                let methods = img.all_methods_of(&name).unwrap_or_default();
+                let inst = methods
+                    .iter()
+                    .filter(|m| m.side != Side::Class)
+                    .map(|m| m.selector.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let clss = methods
+                    .iter()
+                    .filter(|m| m.side == Side::Class)
+                    .map(|m| m.selector.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                out.push_str(&format!(
+                    "{name}{SEP}{superc}{SEP}{ivars}{SEP}{cvars}{SEP}{inst}{SEP}{clss}\n"
+                ));
+            }
+            out
+        })
+        .unwrap_or_default();
+    objc::nsstring(&text)
+}
+
 /// `classShellFor:` — "superclass␟instanceVars␟classVars" from the image
 /// (empty string when the class isn't stored). The browser's variables pane
 /// reads THIS (the image), not the live snapshot — the web's own split: a
@@ -487,9 +533,10 @@ pub fn register() {
     type Imp0 = extern "C" fn(*mut c_void, *mut c_void) -> Id;
     type Imp1 = extern "C" fn(*mut c_void, *mut c_void, Id) -> Id;
     type Imp3 = extern "C" fn(*mut c_void, *mut c_void, Id, Id, Id) -> Id;
-    let methods: [(&str, *const c_void, &str); 16] = [
+    let methods: [(&str, *const c_void, &str); 17] = [
         ("requestUiRebuild", imp_request_ui_rebuild as Imp0 as *const c_void, "@@:"),
         ("classNames", imp_class_names as Imp0 as *const c_void, "@@:"),
+        ("browseRecords", imp_browse_records as Imp0 as *const c_void, "@@:"),
         ("acceptEditorClass:", imp_accept_editor_class as Imp1 as *const c_void, "@@:@"),
         ("launchDemo:", imp_launch_demo as Imp1 as *const c_void, "@@:@"),
         ("colorizeStorage:", imp_colorize_storage as Imp1 as *const c_void, "@@:@"),

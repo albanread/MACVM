@@ -67,11 +67,56 @@ Object subclass: CocoaBrowser [
         ^Container
     ]
 
-    "── snapshot (rows = the primary's live truth) ──"
+    "── snapshot: DB-QUERIED from the image (the class hierarchy + selectors),
+       NOT a live-VM reflection relay. The image is the source of truth — same as
+       the editor + the Find views. `browseRecords` returns one flat record per
+       class; buildTreeFromRecords: rebuilds the nested tree from the superclass
+       links. Synchronous host call — no #uiReq round-trip to the primary. ──"
     CocoaBrowser class >> requestRefresh [
-        Worker uiRequest: #refresh args: (Array with: #browser) onReply: [ :r |
-            ((r isKindOf: Array) and: [ (r at: 1) == #browserTree ])
-                ifTrue: [ CocoaBrowser installSnapshot: (r at: 2) ] ]
+        self installSnapshot: (self buildTreeFromRecords:
+            (self readReply: (self hostService onMain browseRecords)))
+    ]
+    CocoaBrowser class >> buildTreeFromRecords: text [
+        "Flat records -> the nested 6-slot tree {name. ivars. classVars.
+         instSels. classSels. children}, rooted at Object. Each record:
+         name US super US ivars US classVars US instSels US classSels (the last
+         four space-separated); records LF-separated."
+        | nodes supers lf line objectNode |
+        nodes := Dictionary new. supers := Dictionary new.
+        lf := Character value: 10. line := ''.
+        text do: [ :ch |
+            ch = lf
+                ifTrue: [ self ingestRecord: line into: nodes supers: supers. line := '' ]
+                ifFalse: [ line := line , (String with: ch) ] ].
+        self ingestRecord: line into: nodes supers: supers.
+        "Link each class under its superclass (order of appearance)."
+        nodes keysAndValuesDo: [ :name :node |
+            | sup parent |
+            sup := supers at: name ifAbsent: [ '' ].
+            (sup isEmpty or: [ sup = 'nil' ]) ifFalse: [
+                parent := nodes at: sup ifAbsent: [ nil ].
+                parent isNil ifFalse: [ (parent at: 6) add: node ] ] ].
+        "children OrderedCollections -> Arrays (resolvePath: indexes them)."
+        nodes keysAndValuesDo: [ :k :node | node at: 6 put: (node at: 6) asArray ].
+        objectNode := nodes at: 'Object' ifAbsent: [ nil ].
+        ^objectNode
+    ]
+    CocoaBrowser class >> ingestRecord: line into: nodes supers: supers [
+        | f name node |
+        line isEmpty ifTrue: [ ^self ].
+        f := self splitShell: line.       "US-splitter, returns all fields"
+        f size < 6 ifTrue: [ ^self ].
+        name := f at: 1.
+        name isEmpty ifTrue: [ ^self ].
+        node := Array new: 6.
+        node at: 1 put: name.
+        node at: 2 put: (self tokensOf: (f at: 3)).
+        node at: 3 put: (self tokensOf: (f at: 4)).
+        node at: 4 put: (self tokensOf: (f at: 5)).
+        node at: 5 put: (self tokensOf: (f at: 6)).
+        node at: 6 put: OrderedCollection new.
+        nodes at: name put: node.
+        supers at: name put: (f at: 2).
     ]
     CocoaBrowser class >> installSnapshot: tree [
         "Order is LOAD-BEARING: releaseHandles BEFORE reloadData (reload's
