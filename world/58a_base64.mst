@@ -1,0 +1,64 @@
+"58a_base64.mst — Base64 (RFC 4648, standard alphabet + padding). A library
+ gap fill: encoding only, for exactly one job — crossing an arbitrary
+ ByteArray (a Pixmap's raw RGBA bytes) over a String-only channel, the same
+ reason the web GUI's own Canvas pixel path base64s (docs/CANVAS.md §6a:
+ 'evaluateJavaScript carries a source string, not binary'). The Cocoa GUI's
+ ObjC bridge has the identical shape: an `@`-typed outbound argument marshals
+ a Smalltalk String to NSString, but there is no ByteArray->NSData case
+ (src/runtime/objc_bridge.rs's `ObjcArg::Id` arm) — encoding here, decoding
+ host-side (Rust), needs no VM/bridge change at all.
+
+ Lettered file (matching 04a_blockclosure.mst's own precedent): 01-62 are
+ fully packed (world/cocoaui.list's own header note), and this is a general
+ codec, not Cocoa-specific, so it belongs in the base world, not 63+."
+Object subclass: Base64 [
+    Base64 class >> alphabet [
+        ^'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+    ]
+    "Standard RFC 4648 encode with '=' padding. aByteArray may be any
+     indexable byte collection (ByteArray, or a String read as bytes)."
+    Base64 class >> encode: bytes [
+        | alpha out n i b0 b1 b2 tail |
+        alpha := self alphabet.
+        out := WriteStream on: String new.
+        n := bytes size.
+        i := 1.
+        [ i + 2 <= n ] whileTrue: [
+            b0 := bytes at: i. b1 := bytes at: i + 1. b2 := bytes at: i + 2.
+            out nextPut: (alpha at: (b0 bitShift: -2) + 1).
+            out nextPut: (alpha at: (((b0 bitAnd: 3) bitShift: 4) bitOr: (b1 bitShift: -4)) + 1).
+            out nextPut: (alpha at: (((b1 bitAnd: 15) bitShift: 2) bitOr: (b2 bitShift: -6)) + 1).
+            out nextPut: (alpha at: (b2 bitAnd: 63) + 1).
+            i := i + 3 ].
+        tail := n - i + 1.
+        tail = 1 ifTrue: [
+            b0 := bytes at: i.
+            out nextPut: (alpha at: (b0 bitShift: -2) + 1).
+            out nextPut: (alpha at: ((b0 bitAnd: 3) bitShift: 4) + 1).
+            out nextPutAll: '==' ].
+        tail = 2 ifTrue: [
+            b0 := bytes at: i. b1 := bytes at: i + 1.
+            out nextPut: (alpha at: (b0 bitShift: -2) + 1).
+            out nextPut: (alpha at: (((b0 bitAnd: 3) bitShift: 4) bitOr: (b1 bitShift: -4)) + 1).
+            out nextPut: (alpha at: ((b1 bitAnd: 15) bitShift: 2) + 1).
+            out nextPutAll: '=' ].
+        ^out contents
+    ]
+]
+
+"Reopen Pixmap (world/36 — loads long before Base64 above, so this couldn't
+ live there: naming Base64 at file 36's load point would be a compile-time
+ undeclared-global error). SAME FILE as Base64 itself (not Cocoa-only): a
+ `Worker uiDoit:`-relayed expression runs on the PRIMARY, which boots ONLY
+ world.list — NEVER cocoaui.list (that file's own header comment: 'Loaded
+ ONLY by the UI worker... NEVER from world/world.list') — so a Cocoa-only
+ placement would DNU there. A DNU inside a doit is SILENT by design (world/47
+ serveUiDoit:'s own contract: 'unwinds the whole dispatch and sends no
+ reply'), which is exactly how this bug first showed up: the Cocoa Canvas
+ tab's Mandelbrot button hung at 'computing…' forever with nothing logged."
+Object subclass: Pixmap [
+    "Base64 of the raw RGBA bytes — the pixel-buffer transport
+     docs/CANVAS.md §6a describes; the Cocoa GUI's showCanvasPixelsOn:
+     base64:width:height: (cocoa_gui/src/canvas.rs) consumes it directly."
+    asCanvasBase64 [ ^Base64 encode: self bytes ]
+]

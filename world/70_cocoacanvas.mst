@@ -1,0 +1,255 @@
+"70_cocoacanvas.mst — CocoaCanvas: a Smalltalk-drawable RGBA canvas tab
+ (docs/CANVAS.md, the Cocoa GUI's native counterpart). Loaded ONLY via
+ world/cocoaui.list, after 66_cocoabrowser.mst (reuses CocoaBrowser's
+ hostService handle + readReply:).
+
+ TWO independent drawing paths into the SAME NSImageView, matching the web
+ GUI's own two Canvas mechanisms exactly (docs/CANVAS.md §5.2/§6a):
+
+ - PIXELS — a Pixmap (world/36_pixmap.mst: atX:y:r:g:b:, lineFrom:y:to:x:y:
+   r:g:b:) is the right primitive for a per-pixel image (Mandelbrot-style):
+   base64-encode its raw RGBA bytes (Base64, world/58a — the SAME reason the
+   web GUI's own pixel path does: the ObjC bridge's `@`-arg marshaller has no
+   ByteArray->NSData case, only String->NSString) and hand them to
+   `showCanvasPixelsOn:base64:width:height:`.
+ - COMMANDS — a vector command batch, the EXACT `[['op',...args],...]`
+   wire format `BenchmarkDashboard>>chartForWidth:height:` already emits for
+   the web GUI (docs/CANVAS.md §5.2) — reused VERBATIM, zero Smalltalk
+   changes, rendered natively via CoreGraphics/AppKit
+   (`showCanvasCommandsOn:commands:width:height:`, cocoa_gui/src/canvas.rs).
+
+ An `evalString` field lets ANY Smalltalk expression drive the canvas — the
+ web GUI's own generic CanvasEval/CanvasEvalPixels mechanism, ported: type an
+ expression answering a Pixmap (Pixel mode) or a command-batch String
+ (Command mode), pick the mode, Draw.
+
+ SAFETY: evaluating the expression + building the image runs top-level only
+ (the flag-and-drain pattern this session's browser crash fix, view_refresh.rs,
+ established as the standing rule for anything beyond a trivial synchronous
+ read) — a Draw button only flags a pending eval; drain_perform services it."
+
+Object subclass: CocoaCanvas [
+    <classVars: Container TopStrip ModePicker EvalField DrawBtn MandelBtn
+                ChartBtn StatusLabel ImageScroll ImageView ActionDelegates>
+
+    CocoaCanvas class >> stripHeight [ ^34.0 ]
+    CocoaCanvas class >> canvasWidth [ ^420 ]
+    CocoaCanvas class >> canvasHeight [ ^240 ]
+
+    CocoaCanvas class >> register [
+        CocoaUI registerViewNamed: #canvas title: 'Canvas' icon: 'documentation'
+                container: [ self containerView ]
+                onShow: [ ]
+    ]
+    CocoaCanvas class >> containerView [
+        Container isNil ifTrue: [ self buildView ].
+        ^Container
+    ]
+
+    "── build ──"
+    CocoaCanvas class >> buildView [
+        | host frame w h |
+        host := CocoaUI contentHost.
+        frame := host onMain frame.
+        w := frame at: 3. h := frame at: 4.
+        ActionDelegates := OrderedCollection new.
+        Container := ((Cocoa classNamed: 'NSView') onMain alloc) onMain
+            initWithFrame: (Array with: 0.0 with: 0.0 with: w with: h).
+        Container onMain setAutoresizingMask: CocoaUI maskWidthSizable + CocoaUI maskHeightSizable.
+        Container onMain setAutoresizesSubviews: true.
+
+        self buildTopStripIn: Container width: w height: h.
+        self buildImageSurfaceIn: Container width: w height: h.
+    ]
+    CocoaCanvas class >> buildTopStripIn: aContainer width: w height: h [
+        | popup |
+        TopStrip := ((Cocoa classNamed: 'NSView') onMain alloc) onMain
+            initWithFrame: (Array with: 0.0 with: h - self stripHeight with: w with: self stripHeight).
+        TopStrip onMain setAutoresizingMask: CocoaUI maskWidthSizable + CocoaUI maskMinYMargin.
+
+        self mandelBtn: w.
+        self chartBtn: w.
+
+        popup := ((Cocoa classNamed: 'NSPopUpButton') onMain alloc) onMain
+            initWithFrame: (Array with: 244.0 with: 5.0 with: 96.0 with: 24.0) pullsDown: false.
+        popup onMain addItemWithTitle: 'Pixels'.
+        popup onMain addItemWithTitle: 'Commands'.
+        ModePicker := popup.
+        TopStrip onMain addSubview: popup.
+
+        EvalField := ((Cocoa classNamed: 'NSTextField') onMain alloc) onMain
+            initWithFrame: (Array with: 346.0 with: 6.0 with: w - 346.0 - 60.0 with: 22.0).
+        EvalField onMain setPlaceholderString: 'expression: answers a Pixmap (Pixels) or a command-batch String (Commands)'.
+        EvalField onMain setAutoresizingMask: CocoaUI maskWidthSizable.
+        self wireAction: EvalField to: [ self drawEval ].
+        TopStrip onMain addSubview: EvalField.
+
+        DrawBtn := self stripButton: 'Draw'
+            frame: (Array with: w - 54.0 with: 5.0 with: 48.0 with: 24.0)
+            action: [ self drawEval ].
+        DrawBtn onMain setAutoresizingMask: CocoaUI maskMinXMargin.
+
+        StatusLabel := ((Cocoa classNamed: 'NSTextField') onMain alloc) onMain
+            initWithFrame: (Array with: 6.0 with: h - self stripHeight - 16.0 with: w - 12.0 with: 14.0).
+        StatusLabel onMain setEditable: false. StatusLabel onMain setBordered: false.
+        StatusLabel onMain setDrawsBackground: false. StatusLabel onMain setSelectable: false.
+        StatusLabel onMain setFont: ((Cocoa classNamed: 'NSFont') onMain systemFontOfSize: 10.0).
+        StatusLabel onMain setTextColor: (Cocoa classNamed: 'NSColor') onMain secondaryLabelColor.
+        StatusLabel onMain setStringValue: ''.
+        StatusLabel onMain setAutoresizingMask: CocoaUI maskWidthSizable + CocoaUI maskMinYMargin.
+        aContainer onMain addSubview: StatusLabel.
+        aContainer onMain addSubview: TopStrip.
+    ]
+    CocoaCanvas class >> mandelBtn: w [
+        MandelBtn := self stripButton: 'Mandelbrot'
+            frame: (Array with: 6.0 with: 5.0 with: 112.0 with: 24.0)
+            action: [ self runMandelbrot ].
+        TopStrip onMain addSubview: MandelBtn.
+    ]
+    CocoaCanvas class >> chartBtn: w [
+        ChartBtn := self stripButton: 'Benchmark Chart'
+            frame: (Array with: 122.0 with: 5.0 with: 116.0 with: 24.0)
+            action: [ self runBenchChart ].
+        TopStrip onMain addSubview: ChartBtn.
+    ]
+    CocoaCanvas class >> buildImageSurfaceIn: aContainer width: w height: h [
+        ImageScroll := ((Cocoa classNamed: 'NSScrollView') onMain alloc) onMain
+            initWithFrame: (Array with: 0.0 with: 0.0 with: w with: h - self stripHeight - 18.0).
+        ImageScroll onMain setHasVerticalScroller: true.
+        ImageScroll onMain setHasHorizontalScroller: true.
+        ImageScroll onMain setAutoresizingMask: CocoaUI maskWidthSizable + CocoaUI maskHeightSizable.
+        ImageView := ((Cocoa classNamed: 'NSImageView') onMain alloc) onMain
+            initWithFrame: (Array with: 0.0 with: 0.0 with: self canvasWidth with: self canvasHeight).
+        ImageView onMain setImageScaling: 0. "NSImageScaleProportionallyUpOrDown"
+        ImageScroll onMain setDocumentView: ImageView.
+        aContainer onMain addSubview: ImageScroll.
+    ]
+    CocoaCanvas class >> stripButton: title frame: rect action: aBlock [
+        | btn holder delegate |
+        btn := ((Cocoa classNamed: 'NSButton') onMain alloc) onMain initWithFrame: rect.
+        btn onMain setTitle: title.
+        btn onMain setBezelStyle: 1.
+        btn onMain setAutoresizingMask: CocoaUI maskMinXMargin + CocoaUI maskMinYMargin.
+        holder := CocoaToolbarAction on: aBlock.
+        delegate := MacvmDelegate actionTargetOn: holder.
+        btn onMain setTarget: delegate.
+        btn onMain setAction: 'macvmAction:'.
+        ActionDelegates add: delegate.
+        Container onMain addSubview: btn.
+        ^btn
+    ]
+    CocoaCanvas class >> wireAction: aControl to: aBlock [
+        | holder delegate |
+        holder := CocoaToolbarAction on: aBlock.
+        delegate := MacvmDelegate actionTargetOn: holder.
+        aControl onMain setTarget: delegate.
+        aControl onMain setAction: 'macvmAction:'.
+        ActionDelegates add: delegate.
+    ]
+
+    "── the two built-in demos (mirror the web GUI's own buttons) ──"
+    CocoaCanvas class >> runMandelbrot [
+        self drawPixmapExpr: 'Mandelbrot new maxIter: 100; pixmapForWidth: '
+            , self canvasWidth printString , ' height: ' , self canvasHeight printString
+    ]
+    CocoaCanvas class >> runBenchChart [
+        self drawCommandsExpr: 'BenchmarkDashboard chartForWidth: '
+            , self canvasWidth printString , ' height: ' , self canvasHeight printString
+    ]
+
+    "── the generic eval field: mode picker decides Pixels vs Commands ──"
+    CocoaCanvas class >> drawEval [
+        | expr |
+        EvalField isNil ifTrue: [ ^self ].
+        expr := EvalField sendString: 'stringValue'.
+        (expr isNil or: [ expr isEmpty ]) ifTrue: [ ^self ].
+        (self isPixelMode)
+            ifTrue: [ self drawPixmapExpr: expr ]
+            ifFalse: [ self drawCommandsExpr: expr ]
+    ]
+    CocoaCanvas class >> isPixelMode [
+        ModePicker isNil ifTrue: [ ^true ].
+        ^(ModePicker onMain indexOfSelectedItem) = 0
+    ]
+
+    "── draw: evaluate top-level (never nested — the doIt path already runs
+       top-level via Worker uiDoit:), base64/host-display the RESULT ──"
+    CocoaCanvas class >> drawPixmapExpr: expr [
+        self setStatus: 'computing…'.
+        Worker uiDoit: '(' , expr , ') asCanvasBase64'
+            onReply: [ :b64 | self showPixelsResult: b64 ].
+    ]
+    CocoaCanvas class >> drawCommandsExpr: expr [
+        self setStatus: 'computing…'.
+        Worker uiDoit: expr onReply: [ :cmds | self showCommandsResult: cmds ].
+    ]
+    CocoaCanvas class >> showPixelsResult: reply [
+        | b64 |
+        (reply isNil or: [ reply isEmpty ]) ifTrue: [ ^self setStatus: 'error: no reply' ].
+        b64 := self unquotePrintString: reply.
+        CocoaBrowser hostService onMain
+            showCanvasPixelsOn: ImageView base64: b64
+            width: self canvasWidth printString height: self canvasHeight printString.
+        self setStatus: 'drawn (pixels, ' , b64 size printString , ' base64 chars).'.
+    ]
+    CocoaCanvas class >> showCommandsResult: reply [
+        | cmds |
+        (reply isNil or: [ reply isEmpty ]) ifTrue: [ ^self setStatus: 'error: no reply' ].
+        cmds := self unquotePrintString: reply.
+        CocoaBrowser hostService onMain
+            showCanvasCommandsOn: ImageView commands: cmds
+            width: self canvasWidth printString height: self canvasHeight printString.
+        self setStatus: 'drawn (commands).'.
+    ]
+    "`Worker uiDoit:`'s reply is ALWAYS `result printString` (world/47's
+     serveUiDoit:, shared with the Workspace's own Do it/Print it — not
+     something to special-case for one caller). For a String-valued result
+     (our base64/command-batch text) that means the reply arrives QUOTED
+     ('TWFu...' with literal quote characters, embedded quotes doubled) — the
+     exact inverse of what printString did. Answers `s` unchanged if it
+     doesn't look like a quoted literal (a non-String result, or an error)."
+    CocoaCanvas class >> unquotePrintString: s [
+        | body out i ch |
+        (s size >= 2 and: [ (s at: 1) = $' and: [ (s at: s size) = $' ] ])
+            ifFalse: [ ^s ].
+        body := s copyFrom: 2 to: s size - 1.
+        out := WriteStream on: String new.
+        i := 1.
+        [ i <= body size ] whileTrue: [
+            ch := body at: i.
+            (ch = $' and: [ i < body size and: [ (body at: i + 1) = $' ] ])
+                ifTrue: [ out nextPut: $'. i := i + 2 ]
+                ifFalse: [ out nextPut: ch. i := i + 1 ] ].
+        ^out contents
+    ]
+    CocoaCanvas class >> setStatus: aString [
+        StatusLabel isNil ifFalse: [ StatusLabel onMain setStringValue: aString ]
+    ]
+
+    "── scripting/automation (rusttcl `gui doit`) ──"
+    CocoaCanvas class >> typeExpr: aString mode: aSymbol [
+        EvalField isNil ifFalse: [ EvalField onMain setStringValue: aString ].
+        ModePicker isNil ifFalse: [
+            ModePicker onMain selectItemAtIndex: (aSymbol == #pixels ifTrue: [ 0 ] ifFalse: [ 1 ]) ]
+    ]
+    CocoaCanvas class >> status [ ^StatusLabel isNil ifTrue: [ '' ] ifFalse: [ StatusLabel sendString: 'stringValue' ] ]
+    CocoaCanvas class >> hasImage [
+        ImageView isNil ifTrue: [ ^false ].
+        ^(ImageView onMain image) isNil not
+    ]
+
+    CocoaCanvas class >> environmentRestarted [ ]
+
+    CocoaCanvas class >> teardown [
+        ActionDelegates isNil ifFalse: [
+            ActionDelegates do: [ :d | d isValid ifTrue: [ d release ] ] ].
+        CocoaBrowser releaseView: ImageView. CocoaBrowser releaseView: ImageScroll.
+        CocoaBrowser releaseView: EvalField. CocoaBrowser releaseView: ModePicker.
+        CocoaBrowser releaseView: MandelBtn. CocoaBrowser releaseView: ChartBtn.
+        CocoaBrowser releaseView: DrawBtn. CocoaBrowser releaseView: StatusLabel.
+        CocoaBrowser releaseView: TopStrip. CocoaBrowser releaseView: Container.
+        ActionDelegates := nil. ImageView := nil. ImageScroll := nil.
+        EvalField := nil. ModePicker := nil. MandelBtn := nil. ChartBtn := nil.
+        DrawBtn := nil. StatusLabel := nil. TopStrip := nil. Container := nil.
+    ]
+]

@@ -434,6 +434,46 @@ extern "C" fn imp_request_outliner_refresh(_this: *mut c_void, _cmd: *mut c_void
     std::ptr::null_mut()
 }
 
+/// `showCanvasPixelsOn:base64:width:height:` — decode `base64` (the Pixmap's
+/// raw RGBA bytes, world/36_pixmap.mst) and set it on `view` (an NSImageView
+/// Smalltalk built and passed in directly — arrives here as the real ObjC id,
+/// no conversion needed, since a non-String `@` arg crosses as an ObjcRef's
+/// raw id). `view` is the RAW Id itself: this IMP receives it as `Id` already
+/// (the bridge's `ObjcArg::Id` marshaller passes an ObjcRef's `read_id`
+/// straight through — only a String-shaped arg gets NSString-converted).
+extern "C" fn imp_show_canvas_pixels(
+    _this: *mut c_void,
+    _cmd: *mut c_void,
+    view: Id,
+    base64: Id,
+    width: Id,
+    height: Id,
+) -> Id {
+    let b64 = ns_to_string(base64);
+    let w: u32 = ns_to_string(width).parse().unwrap_or(0);
+    let h: u32 = ns_to_string(height).parse().unwrap_or(0);
+    crate::canvas::show_pixels_base64(view, &b64, w, h);
+    std::ptr::null_mut()
+}
+
+/// `showCanvasCommandsOn:commands:width:height:` — the vector-command path
+/// (docs/CANVAS.md §5.2), e.g. `BenchmarkDashboard chartForWidth:height:`'s
+/// own JSON, reused verbatim.
+extern "C" fn imp_show_canvas_commands(
+    _this: *mut c_void,
+    _cmd: *mut c_void,
+    view: Id,
+    commands: Id,
+    width: Id,
+    height: Id,
+) -> Id {
+    let ops = ns_to_string(commands);
+    let w: u32 = ns_to_string(width).parse().unwrap_or(0);
+    let h: u32 = ns_to_string(height).parse().unwrap_or(0);
+    crate::canvas::show_commands(view, &ops, w, h);
+    std::ptr::null_mut()
+}
+
 /// `launchDemo:` — CG10: launch a GamePane demo by its entry doit (e.g.
 /// `'MandelZoom launch'`). Flags it to run TOP-LEVEL on the primary's supervisor
 /// loop, NOT via a nested `uiDoit`/`primEvalDoit` (which corrupts the frame
@@ -564,11 +604,22 @@ pub fn register() {
     type Imp0 = extern "C" fn(*mut c_void, *mut c_void) -> Id;
     type Imp1 = extern "C" fn(*mut c_void, *mut c_void, Id) -> Id;
     type Imp3 = extern "C" fn(*mut c_void, *mut c_void, Id, Id, Id) -> Id;
-    let methods: [(&str, *const c_void, &str); 21] = [
+    type Imp4 = extern "C" fn(*mut c_void, *mut c_void, Id, Id, Id, Id) -> Id;
+    let methods: [(&str, *const c_void, &str); 23] = [
         ("requestUiRebuild", imp_request_ui_rebuild as Imp0 as *const c_void, "@@:"),
         ("requestBrowserRefresh", imp_request_browser_refresh as Imp0 as *const c_void, "@@:"),
         ("requestFindRefresh", imp_request_find_refresh as Imp0 as *const c_void, "@@:"),
         ("requestOutlinerRefresh", imp_request_outliner_refresh as Imp0 as *const c_void, "@@:"),
+        (
+            "showCanvasPixelsOn:base64:width:height:",
+            imp_show_canvas_pixels as Imp4 as *const c_void,
+            "@@:@@@@",
+        ),
+        (
+            "showCanvasCommandsOn:commands:width:height:",
+            imp_show_canvas_commands as Imp4 as *const c_void,
+            "@@:@@@@",
+        ),
         ("classNames", imp_class_names as Imp0 as *const c_void, "@@:"),
         ("allSelectors", imp_all_selectors as Imp0 as *const c_void, "@@:"),
         ("browseRecords", imp_browse_records as Imp0 as *const c_void, "@@:"),

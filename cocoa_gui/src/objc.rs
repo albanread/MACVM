@@ -117,7 +117,7 @@ pub fn sym_addr(name: &str) -> *mut c_void {
     sym(name)
 }
 
-fn msg_send_ptr() -> *mut c_void {
+pub(crate) fn msg_send_ptr() -> *mut c_void {
     static PTR: OnceLock<usize> = OnceLock::new();
     *PTR.get_or_init(|| sym("objc_msgSend") as usize) as *mut c_void
 }
@@ -197,6 +197,25 @@ pub fn send3_id(recv: Id, s: Sel, a: Id, b: Id, c: Id) -> Id {
     let f: extern "C" fn(Id, Sel, Id, Id, Id) -> Id =
         unsafe { std::mem::transmute(msg_send_ptr()) };
     f(recv, s, a, b, c)
+}
+
+/// Four `CGFloat` arguments (`colorWithSRGBRed:green:blue:alpha:`) — also the
+/// right shape for any ONE `NSRect`-by-value argument (`bezierPathWithRect:`):
+/// arm64 AAPCS64 passes a ≤4-member all-`f64` struct (an HFA) in d0..d3
+/// sequentially, bit-identical to 4 separate `f64` params, so this one helper
+/// covers both call shapes.
+pub fn send4_f64(recv: Id, s: Sel, a: f64, b: f64, c: f64, d: f64) -> Id {
+    let f: extern "C" fn(Id, Sel, f64, f64, f64, f64) -> Id =
+        unsafe { std::mem::transmute(msg_send_ptr()) };
+    f(recv, s, a, b, c, d)
+}
+
+/// Two `CGFloat` (an `NSPoint`-by-value first argument, same HFA reasoning as
+/// `send4_f64`) then one `id` (`drawAtPoint:withAttributes:`).
+pub fn send2_f64_id(recv: Id, s: Sel, x: f64, y: f64, attrs: Id) -> Id {
+    let f: extern "C" fn(Id, Sel, f64, f64, Id) -> Id =
+        unsafe { std::mem::transmute(msg_send_ptr()) };
+    f(recv, s, x, y, attrs)
 }
 
 /// `[[cls alloc] init]`.
