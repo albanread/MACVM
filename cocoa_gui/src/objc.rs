@@ -205,6 +205,52 @@ pub fn alloc_init(class_name: &str) -> Id {
     send0(send0(cls, sel("alloc")), sel("init"))
 }
 
+/// Register an `NSObject` subclass `name` carrying `methods` (each `(selector,
+/// IMP, @encode types)`), once. Idempotent: a name collision leaves the prior
+/// registration in place. The generalized form of `install_app_delegate`'s
+/// inline class-pair dance — used by the CG10 game-timer target.
+pub fn register_class(name: &str, methods: &[(&str, *const c_void, &str)]) {
+    let superclass = get_class("NSObject");
+    let cname = match CString::new(name) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let alloc_pair: extern "C" fn(Class, *const i8, usize) -> Class =
+        unsafe { std::mem::transmute(sym("objc_allocateClassPair")) };
+    let cls = alloc_pair(superclass, cname.as_ptr(), 0);
+    if cls.is_null() {
+        return; // already registered
+    }
+    let add_method: extern "C" fn(Class, Sel, *const c_void, *const i8) -> u8 =
+        unsafe { std::mem::transmute(sym("class_addMethod")) };
+    for (selector, imp, types) in methods {
+        if let Ok(ctypes) = CString::new(*types) {
+            add_method(cls, sel(selector), *imp, ctypes.as_ptr());
+        }
+    }
+    let register_pair: extern "C" fn(Class) =
+        unsafe { std::mem::transmute(sym("objc_registerClassPair")) };
+    register_pair(cls);
+}
+
+/// `+[NSTimer scheduledTimerWithTimeInterval:target:selector:userInfo:repeats:]`
+/// — added to the current run loop in `NSDefaultRunLoopMode` (so it does NOT
+/// fire inside AppKit's nested tracking/modal loops — the same tracking-safety
+/// the drain source has, §8). Returns the timer; send `invalidate` to stop it.
+pub fn scheduled_timer(interval: f64, target: Id, selector: Sel, repeats: bool) -> Id {
+    let f: extern "C" fn(Class, Sel, f64, Id, Sel, Id, bool) -> Id =
+        unsafe { std::mem::transmute(msg_send_ptr()) };
+    f(
+        get_class("NSTimer"),
+        sel("scheduledTimerWithTimeInterval:target:selector:userInfo:repeats:"),
+        interval,
+        target,
+        selector,
+        NIL,
+        repeats,
+    )
+}
+
 // ── App lifecycle ─────────────────────────────────────────────────────────────
 
 /// `[NSApplication sharedApplication]` — the process-singleton app object.

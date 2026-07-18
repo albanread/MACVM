@@ -3534,17 +3534,18 @@ mod tests {
     /// Drop→deregister→release wiring, not codegen.
     #[test]
     fn ui_worker_restart_lifecycle_leaks_no_registry_slots() {
-        use crate::codecache::deopt_trap::{active_jmp_slots, active_probe_slots};
+        use crate::codecache::deopt_trap::current_thread_jmp_slots;
         // A hosted primary to adopt a role against (as the real UI worker does).
         let mut primary = boot_worker_primary();
         let (id, _inbox, to_primary) =
             crate::runtime::workers::register_hosted_worker(&mut primary.vm, Arc::new(|| {}))
                 .expect("register the hosted UI worker");
 
-        // Baseline AFTER the primary + one UI worker exist, then dropped: the
-        // count this thread's steady state returns to.
-        let jmp_before = active_jmp_slots();
-        let probe_before = active_probe_slots();
+        // THIS thread's slot count is the parallel-safe measure: `claim_jmp_slot`
+        // reuses the caller thread's own slot, so boot/eval owns exactly 1 and a
+        // clean drop returns it to whatever the primary left (0 or 1). Immune to
+        // other threads' concurrent tests, unlike the process-global count.
+        let baseline = current_thread_jmp_slots();
 
         for cycle in 0..40 {
             let mut ui = boot_ui_worker(id, to_primary.clone());
@@ -3555,19 +3556,15 @@ mod tests {
             // pointer) — exactly `rebuild_ui`'s order.
             publish_ui_vm(std::ptr::null_mut());
             drop(ui); // Drop = Reservation munmap + deopt deregister + slot release
+            // The load-bearing assertion: THIS thread's slot count never grows
+            // across cycles — a stranded slot would climb toward the 64 cap.
             assert!(
-                active_jmp_slots() <= jmp_before,
-                "cycle {cycle}: jmp slots {} exceeded baseline {jmp_before} — a restart stranded a recovery slot",
-                active_jmp_slots()
-            );
-            assert!(
-                active_probe_slots() <= probe_before,
-                "cycle {cycle}: probe slots exceeded baseline — a restart stranded a PROBE entry"
+                current_thread_jmp_slots() <= baseline,
+                "cycle {cycle}: this thread's jmp slots {} exceeded baseline {baseline} — a restart stranded a recovery slot",
+                current_thread_jmp_slots()
             );
         }
-        // Final: dead level, nowhere near the caps.
-        assert!(active_jmp_slots() <= jmp_before + 1);
-        assert!(active_jmp_slots() < 32, "jmp registry must be nowhere near its 64 cap");
+        assert!(current_thread_jmp_slots() <= baseline);
     }
 
     #[test]

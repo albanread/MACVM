@@ -23,6 +23,15 @@ macvm = { path = ".." }
 # both GUIs show identical text for the same method.
 image_store = { path = "../image_store" }
 
+# CG10: the native game pane is REUSED, not rebuilt — the same MacGamePane
+# graphics/audio engine + `metal` the WKWebView GUI drives (gui/src/game_pane.rs).
+# A demo's GameCommands cross from the primary to main over cocoa_gui's existing
+# worker→main transport; main applies them to this pane in its own NSWindow.
+macgamepane-graphics = { path = "../../MacGamePane/graphics" }
+macgamepane-audio = { path = "../../MacGamePane/audio" }
+metal = "0.33"
+core-graphics-types = "0.2"
+
 # NOTE (structural decision, CG2): this crate owns a MINIMAL raw-AppKit objc
 # helper (src/objc.rs) rather than factoring `gui/src/objc.rs` into a shared
 # crate. Rationale — the boot glue needs only NSApplication / activation policy /

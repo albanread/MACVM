@@ -331,6 +331,20 @@ pub fn active_probe_slots() -> usize {
         .count()
 }
 
+/// How many `sigsetjmp` recovery slots THIS thread owns (0 or 1 in practice —
+/// `claim_jmp_slot` reuses the caller thread's slot). The parallel-safe leak
+/// gate: a `VmHandle` boot/drop cycle on one thread must return this to 0,
+/// immune to other threads' concurrent tests (unlike the process-global
+/// [`active_jmp_slots`]).
+pub fn current_thread_jmp_slots() -> usize {
+    let me = unsafe { libc::pthread_self() } as u64;
+    let _g = JMP_REGISTRY_LOCK.lock().unwrap();
+    JMP_OWNER
+        .iter()
+        .filter(|o| o.load(Ordering::Acquire) == me)
+        .count()
+}
+
 /// Async-signal-safe: does THIS (faulting) thread have a registered
 /// recovery slot? A fixed-array linear scan matched by `pthread_self()`,
 /// no lock, no allocation — the same shape as `lookup_pc_full` above, just

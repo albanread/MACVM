@@ -385,7 +385,35 @@ Print it does the same and inserts the result right after it."
 
         self installViewMenuOn: mainMenu.
         self installThemeMenuOn: mainMenu.
+        self installDemosMenuOn: mainMenu.
         self installDebugMenuOn: mainMenu.
+    ]
+
+    CocoaUI class >> installDemosMenuOn: mainMenu [
+        "CG10: launch a native GamePane demo on the PRIMARY (it spawns the
+         compute workers ParallelMandel needs; its frames cross to the main
+         thread's Metal pane over the worker→main protocol). Each opens the
+         game in its own window; Escape ends it."
+        | demosMenu demosItem pairs |
+        demosMenu := (Cocoa classNamed: 'NSMenu') onMain alloc onMain init.
+        pairs := OrderedCollection new.
+        pairs add: (Array with: 'Breakout' with: 'Breakout launch').
+        pairs add: (Array with: 'MandelZoom' with: 'MandelZoom launch').
+        pairs add: (Array with: 'Parallel Mandelbrot' with: 'ParallelMandel launch').
+        pairs do: [ :pair |
+            | title entry item holder delegate |
+            title := pair at: 1. entry := pair at: 2.
+            item := ((Cocoa classNamed: 'NSMenuItem') onMain alloc) onMain
+                initWithTitle: title action: 'macvmAction:' keyEquivalent: ''.
+            holder := CocoaToolbarAction on: [ Worker uiDoit: entry onReply: [ :r | ] ].
+            delegate := MacvmDelegate actionTargetOn: holder.
+            item onMain setTarget: delegate.
+            demosMenu onMain addItem: item.
+            ToolbarDelegates add: delegate ].
+        demosItem := ((Cocoa classNamed: 'NSMenuItem') onMain alloc) onMain
+            initWithTitle: 'Demos' action: nil keyEquivalent: ''.
+        demosItem onMain setSubmenu: demosMenu.
+        mainMenu onMain addItem: demosItem.
     ]
 
     CocoaUI class >> installDebugMenuOn: mainMenu [

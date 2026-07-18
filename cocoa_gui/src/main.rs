@@ -13,6 +13,7 @@
 mod boot;
 mod colorize;
 mod control;
+mod game;
 mod host_service;
 mod objc;
 mod rebuild;
@@ -162,6 +163,11 @@ extern "C" fn drain_perform(info: *mut c_void) {
     if let Some(rx) = &st.ctl {
         control::serve(rx, &mut st.ui);
     }
+    // (CG10) Apply any game commands the primary's sink reported to main. The
+    // frame STEP itself runs top-level on the primary's own supervisor loop
+    // (never a nested VM entry — that trips the frame-walk invariant under GC),
+    // so nothing to submit here.
+    game::drain();
     refresh_metrics(st);
 }
 

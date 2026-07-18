@@ -324,6 +324,12 @@ fn primary_generation_main(
     // registry). It boots compute workers from the same source (CG8).
     primary.set_worker_boot(world_boot.clone());
 
+    // (CG10) The primary drives the game demos (only a primary can spawn the
+    // compute workers ParallelMandel needs). Its GameCommands cross to the main
+    // thread over the shared queue + run-loop wake — the same worker→main
+    // transport everything else uses. Re-installed on every respawned generation.
+    primary.set_game_sink(Box::new(crate::game::PrimaryGameSink));
+
     // Register the UI worker as an externally-hosted peer (CG1). `ui_wake` fires
     // whenever this primary `send`s the UI worker — cloned here (it's an `Arc`)
     // because the beat loop below also calls it directly, unconditionally,
@@ -377,7 +383,16 @@ fn primary_generation_main(
     while !stop.load(Ordering::Acquire) {
         *metrics.lock().unwrap_or_else(|e| e.into_inner()) = primary.metrics();
         ui_wake();
-        let _ = primary.exec(&format!("Worker pumpInbox: {PUMP_BEAT_MS}."));
+        // (CG10) While a game runs, spin fast — a short inbox timeout so band
+        // replies dispatch promptly — and run each frame step at TOP LEVEL here
+        // (the timer on main gates it to ~60Hz via STEP_DUE). Running the step
+        // as a fresh top-level entry, not a nested uiReq, is what keeps its
+        // JIT-compiled compute clear of the frame-walk invariant under GC.
+        let beat = if crate::game::is_active() { 4 } else { PUMP_BEAT_MS };
+        let _ = primary.exec(&format!("Worker pumpInbox: {beat}."));
+        if let Some(step) = crate::game::poll_primary_step() {
+            let _ = primary.exec(&step);
+        }
     }
 }
 
