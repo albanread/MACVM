@@ -311,12 +311,21 @@ extern "C" fn imp_text_did_change(this: *mut c_void, _cmd: *mut c_void, note: *m
 // main thread. This is the correct mechanism for a UI-worker-LOCAL control (a
 // Workspace ⌘P/⌘D) — unlike C4 `Cocoa action:`, which posts a fire-and-forget
 // envelope to the primary and so could not read the local NSTextView and ship
-// its text. Two selectors so ⌘P and ⌘D can be distinct menu items on one target.
+// its text. Two named selectors so ⌘P and ⌘D can be distinct menu items on one
+// target, plus ONE generic `macvmAction:` (CG5) so an arbitrary NUMBER of
+// controls (a toolbar's N buttons) each mint their OWN `MacvmActionTarget`
+// (its own ticket → its own Smalltalk receiver, `MacvmDelegate
+// actionTargetOn:`), all sharing this one IMP — dispatch already routes by
+// ticket, so no new IMP is needed per button; the receiver just implements
+// `macvmAction: sender`.
 extern "C" fn imp_menu_do_it(this: *mut c_void, _cmd: *mut c_void, sender: *mut c_void) {
     dispatch(this, "macvmDoIt:", &[ArgVal::Id(sender)], RetShape::Void);
 }
 extern "C" fn imp_menu_print_it(this: *mut c_void, _cmd: *mut c_void, sender: *mut c_void) {
     dispatch(this, "macvmPrintIt:", &[ArgVal::Id(sender)], RetShape::Void);
+}
+extern "C" fn imp_menu_action(this: *mut c_void, _cmd: *mut c_void, sender: *mut c_void) {
+    dispatch(this, "macvmAction:", &[ArgVal::Id(sender)], RetShape::Void);
 }
 
 // MacvmTableSource — `NSTableViewDataSource`.
@@ -530,6 +539,7 @@ fn action_target_class() -> Option<*mut c_void> {
                 &[
                     ("macvmDoIt:", imp_ptr!(imp_menu_do_it, ImpV1), "v@:@"),
                     ("macvmPrintIt:", imp_ptr!(imp_menu_print_it, ImpV1), "v@:@"),
+                    ("macvmAction:", imp_ptr!(imp_menu_action, ImpV1), "v@:@"),
                 ],
             )
             .map(|c| c as usize)

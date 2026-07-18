@@ -343,3 +343,172 @@ pub fn wake_main_runloop() {
         }
     }
 }
+
+// ── In-app client-area screenshots (dev aid) ────────────────────────────────
+//
+// Capture the front window's ON-SCREEN CONTENT to a PNG from INSIDE the app —
+// so on-screen work is inspectable without a display. Driven by `snapshot.rs`
+// off `MACVM_COCOA_SNAP`.
+//
+// Deliberately does NOT render via NSView + a struct-by-value `objc_msgSend`
+// call (`cacheDisplayInRect:toBitmap:` etc., each needing an NSRect argument
+// marshalled through a runtime-`transmute`d function pointer): that is exactly
+// the ARM64 pitfall where a `#[repr(C)]` struct's true AAPCS64 HFA classification
+// (passed in v0–v3) can silently disagree with what a transmuted, non-variadic-
+// looking fn pointer causes LLVM to generate at the CALL SITE — it crashed here
+// (`cache_display`, confirmed via a per-step trace: execution reached `rep=...`
+// then aborted inside the very next struct-by-value call, "panic in a function
+// that cannot unwind"). Instead this uses ONLY real, compiler-typed `extern
+// "C"` declarations (`CGWindowListCreateImage`, ImageIO) — LLVM generates the
+// correct calling convention for every struct argument at COMPILE time, same
+// as the `CFRunLoop*` calls above, never via `transmute`. The one AppKit send
+// needed (`windowNumber`) returns a plain `NSInteger` scalar — no struct-passing
+// risk at all.
+
+const K_CG_WINDOW_LIST_OPTION_INCLUDING_WINDOW: u32 = 1 << 3;
+const K_CG_WINDOW_IMAGE_DEFAULT: u32 = 0;
+const K_CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
+
+/// `CGRect` = `{{x,y},{w,h}}`. Only ever passed to a REAL typed `extern "C"`
+/// function below (never transmuted) — see the module note above.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CgRect {
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+}
+
+#[link(name = "CoreGraphics", kind = "framework")]
+extern "C" {
+    /// Rasterize a window's on-screen content. `screen_bounds` is ignored when
+    /// `list_option` is `kCGWindowListOptionIncludingWindow` (captures that
+    /// window's own extent regardless), so `CgRect` here is passed correctly by
+    /// the compiler even though its VALUE doesn't matter for this call shape.
+    fn CGWindowListCreateImage(
+        screen_bounds: CgRect,
+        list_option: u32,
+        window_id: u32,
+        image_option: u32,
+    ) -> *mut c_void;
+}
+
+#[link(name = "ImageIO", kind = "framework")]
+extern "C" {
+    fn CGImageDestinationCreateWithURL(
+        url: *mut c_void,
+        image_type: *mut c_void,
+        count: usize,
+        options: *mut c_void,
+    ) -> *mut c_void;
+    fn CGImageDestinationAddImage(dest: *mut c_void, image: *mut c_void, properties: *mut c_void);
+    fn CGImageDestinationFinalize(dest: *mut c_void) -> u8;
+}
+
+extern "C" {
+    fn CFRelease(cf: *mut c_void);
+    fn CFStringCreateWithCString(
+        alloc: *const c_void,
+        c_str: *const i8,
+        encoding: u32,
+    ) -> *mut c_void;
+    fn CFURLCreateFromFileSystemRepresentation(
+        alloc: *const c_void,
+        buffer: *const u8,
+        buf_len: isize,
+        is_directory: u8,
+    ) -> *mut c_void;
+}
+
+/// `[win windowNumber]` — a plain `NSInteger` return, no struct in sight.
+fn window_number(win: Id) -> i64 {
+    let f: extern "C" fn(Id, Sel) -> i64 = unsafe { std::mem::transmute(msg_send_ptr()) };
+    f(win, sel("windowNumber"))
+}
+
+/// Write a `CGImageRef` to `path` as a PNG via ImageIO. Consumes nothing owned
+/// by the caller; `image` is still the caller's to release.
+unsafe fn write_cgimage_png(image: *mut c_void, path: &str) -> bool {
+    let Ok(c_path) = CString::new(path) else {
+        return false;
+    };
+    let url = CFURLCreateFromFileSystemRepresentation(
+        std::ptr::null(),
+        c_path.as_ptr() as *const u8,
+        c_path.as_bytes().len() as isize,
+        0,
+    );
+    if url.is_null() {
+        return false;
+    }
+    let Ok(png_type_str) = CString::new("public.png") else {
+        CFRelease(url);
+        return false;
+    };
+    let png_type = CFStringCreateWithCString(
+        std::ptr::null(),
+        png_type_str.as_ptr(),
+        K_CF_STRING_ENCODING_UTF8,
+    );
+    if png_type.is_null() {
+        CFRelease(url);
+        return false;
+    }
+    let dest = CGImageDestinationCreateWithURL(url, png_type, 1, std::ptr::null_mut());
+    let ok = if !dest.is_null() {
+        CGImageDestinationAddImage(dest, image, std::ptr::null_mut());
+        let finalized = CGImageDestinationFinalize(dest) != 0;
+        CFRelease(dest);
+        finalized
+    } else {
+        false
+    };
+    CFRelease(png_type);
+    CFRelease(url);
+    ok
+}
+
+/// Capture the front window's on-screen content to `path`. Runs on whatever
+/// thread calls it — `CGWindowListCreateImage`/ImageIO are ordinary Quartz
+/// calls, not AppKit view rendering, so no main-thread hop is needed; the one
+/// AppKit send (`keyWindow`/`windowNumber`) is safe to call cross-thread for a
+/// read like this (matches the design's existing off-main Foundation-read
+/// posture). Best-effort: returns false if there is no window yet, or capture
+/// fails (e.g. Screen Recording permission not granted).
+pub fn snapshot_client_area(path: &str) -> bool {
+    let app = app_shared();
+    let mut win = send0(app, sel("keyWindow"));
+    if win.is_null() {
+        let windows = send0(app, sel("windows"));
+        if !windows.is_null() {
+            win = send0(windows, sel("firstObject"));
+        }
+    }
+    if win.is_null() {
+        return false;
+    }
+    let wid = window_number(win);
+    if wid <= 0 {
+        return false;
+    }
+    let image = unsafe {
+        CGWindowListCreateImage(
+            CgRect {
+                x: 0.0,
+                y: 0.0,
+                w: 0.0,
+                h: 0.0,
+            },
+            K_CG_WINDOW_LIST_OPTION_INCLUDING_WINDOW,
+            wid as u32,
+            K_CG_WINDOW_IMAGE_DEFAULT,
+        )
+    };
+    if image.is_null() {
+        return false;
+    }
+    let ok = unsafe { write_cgimage_png(image, path) };
+    unsafe { CFRelease(image) };
+    ok
+}

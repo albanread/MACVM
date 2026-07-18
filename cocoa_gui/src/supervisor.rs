@@ -28,10 +28,11 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use macvm::embed::VmMetrics;
 use macvm::runtime::workers::{HostedInbox, InboxSender, InboxWakeFn, WorkerBootFn};
 use macvm::runtime::VmError;
 
@@ -82,6 +83,12 @@ pub struct PrimarySupervisor {
     #[allow(dead_code)]
     events: Sender<Event>,
     resync_rx: Receiver<PrimaryLink>,
+    /// The latest `VmMetrics` sample (CG5), written by the CURRENT generation's
+    /// own beat loop on ITS thread (`primary.metrics()` — a cheap field read of
+    /// its own live `VmState`, never a cross-thread VmState touch) and read by
+    /// main's toolbar-refresh timer via [`metrics`](Self::metrics). Survives a
+    /// respawn: a fresh generation just starts writing into the same cell.
+    metrics: Arc<Mutex<VmMetrics>>,
     /// Detached — never joined (the watchdog outlives every generation and the
     /// process ends by `[NSApp terminate:]`).
     _watchdog: JoinHandle<()>,
@@ -104,8 +111,10 @@ impl PrimarySupervisor {
         // can surface a boot failure synchronously; later generations arrive as
         // re-syncs on `resync_rx`.
         let (first_tx, first_rx) = mpsc::channel::<Result<PrimaryLink, VmError>>();
+        let metrics: Arc<Mutex<VmMetrics>> = Arc::new(Mutex::new(VmMetrics::default()));
 
         let events_for_hb = events_tx.clone();
+        let metrics_for_watchdog = metrics.clone();
         let watchdog = std::thread::Builder::new()
             .name("macvm-cocoa-watchdog".into())
             .spawn(move || {
@@ -116,6 +125,7 @@ impl PrimarySupervisor {
                     events_rx,
                     first_tx,
                     resync_tx,
+                    metrics_for_watchdog,
                 );
             })
             .map_err(|e| VmError {
@@ -135,10 +145,18 @@ impl PrimarySupervisor {
             PrimarySupervisor {
                 events: events_tx,
                 resync_rx,
+                metrics,
                 _watchdog: watchdog,
             },
             first,
         ))
+    }
+
+    /// The most recent `VmMetrics` sample from the CURRENT primary generation
+    /// (CG5) — a cheap lock+copy, safe to poll from a main-thread timer at any
+    /// rate. `VmMetrics::default()` (all zero) before the first sample lands.
+    pub fn metrics(&self) -> VmMetrics {
+        *self.metrics.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Request an immediate respawn of the primary from source — the explicit
@@ -171,6 +189,7 @@ fn watchdog_main(
     events_rx: Receiver<Event>,
     first_tx: Sender<Result<PrimaryLink, VmError>>,
     resync_tx: Sender<PrimaryLink>,
+    metrics: Arc<Mutex<VmMetrics>>,
 ) {
     let mut generation: u64 = 0;
     let mut consecutive_boot_failures: u32 = 0;
@@ -186,9 +205,12 @@ fn watchdog_main(
         let wake = ui_wake.clone();
         let hb = events_tx.clone();
         let stop_for_gen = stop.clone();
+        let metrics_for_gen = metrics.clone();
         let spawned = std::thread::Builder::new()
             .name(format!("macvm-cocoa-primary-gen{generation}"))
-            .spawn(move || primary_generation_main(boot, wake, reg_tx, hb, stop_for_gen));
+            .spawn(move || {
+                primary_generation_main(boot, wake, reg_tx, hb, stop_for_gen, metrics_for_gen)
+            });
         if let Err(e) = spawned {
             let _ = first_tx.send(Err(VmError {
                 msg: format!("could not spawn primary generation {generation}: {e}"),
@@ -287,6 +309,7 @@ fn primary_generation_main(
     reg_tx: Sender<Result<PrimaryLink, VmError>>,
     events: Sender<Event>,
     stop: Arc<AtomicBool>,
+    metrics: Arc<Mutex<VmMetrics>>,
 ) {
     let mut primary = match world_boot() {
         Ok(h) => h,
@@ -302,8 +325,11 @@ fn primary_generation_main(
     primary.set_worker_boot(world_boot.clone());
 
     // Register the UI worker as an externally-hosted peer (CG1). `ui_wake` fires
-    // whenever this primary `send`s the UI worker.
-    let Some((id, hosted_inbox, to_primary)) = primary.register_hosted_worker(ui_wake) else {
+    // whenever this primary `send`s the UI worker — cloned here (it's an `Arc`)
+    // because the beat loop below also calls it directly, unconditionally,
+    // every beat (CG5 metrics tick).
+    let Some((id, hosted_inbox, to_primary)) = primary.register_hosted_worker(ui_wake.clone())
+    else {
         let _ = reg_tx.send(Err(VmError {
             msg: "register_hosted_worker failed (not a primary, or the fleet is at its cap)".into(),
         }));
@@ -341,7 +367,16 @@ fn primary_generation_main(
     // first). A recoverable guest error rewinds the VM to its clean idle
     // baseline and returns `Err`: keep serving — a bad doit never restarts the
     // whole environment, and a long-running one is not death.
+    //
+    // CG5: sample `primary.metrics()` (a cheap field read of THIS thread's own
+    // live VmState — never a cross-thread touch) into the shared cell every
+    // beat, then wake the UI worker's inbox UNCONDITIONALLY (not just when a
+    // real send happened) — this turns the already-existing default-mode drain
+    // source into a de-facto ~4Hz toolbar-refresh tick, reusing 100% proven
+    // wiring instead of a new NSTimer/CFRunLoopTimer.
     while !stop.load(Ordering::Acquire) {
+        *metrics.lock().unwrap_or_else(|e| e.into_inner()) = primary.metrics();
+        ui_wake();
         let _ = primary.exec(&format!("Worker pumpInbox: {PUMP_BEAT_MS}."));
     }
 }

@@ -1,81 +1,259 @@
-"64_cocoaui.mst — CocoaUI: the Cocoa GUI's Smalltalk terminal (CG2 window +
- CG4 Workspace/Transcript + request protocol). Loaded ONLY by the UI worker via
- `frontend::world::load_list(vm, world/cocoaui.list)`, NEVER from world/world.list
- — so the CLI, the WKWebView GUI, and the base test suite carry none of it
- (files 63+, the conditional layer, §12.3).
+"64_cocoaui.mst — CocoaUI: the Cocoa GUI's native app shell (CG2 window +
+ CG4 protocol/restart + CG5 toolbar/metrics/view-switcher + CG6 Workspace).
+ Loaded ONLY by the UI worker via `frontend::world::load_list(vm,
+ world/cocoaui.list)`, NEVER from world/world.list — so the CLI, the
+ WKWebView GUI, and the base test suite carry none of it (files 63+, the
+ conditional layer, §12.3).
 
- The UI worker VM runs pinned to the process's MAIN thread (AppKit requires it).
- The Rust `cocoa_gui` glue bootstraps NSApplication, boots this VM in place, runs
- `CocoaUI startup` once (this class), then enters [NSApp run] with the VM at rest
- — so every AppKit call below runs INLINE on main (the bridge's `onMain` hop is a
- no-op when the caller already IS main). Building an NSWindow off the main thread
- is refused by the §8 guard — as it should be; only this VM, on main, may.
+ The UI worker VM runs pinned to the process's MAIN thread (AppKit requires
+ it). The Rust `cocoa_gui` glue bootstraps NSApplication, boots this VM in
+ place, runs `CocoaUI startup` once (this class), then enters [NSApp run]
+ with the VM at rest — so every AppKit call below runs INLINE on main (the
+ bridge's `onMain` hop is a no-op when the caller already IS main).
 
- CG4 (docs/cocoa_gui_design.md §6, §7.3, §7.4): the window carries a Workspace
- (top, editable) and a Transcript (bottom, read-only). ⌘P/⌘D ship the Workspace
- text to the PRIMARY as a {#uiReq. corr. #doit. source} request — the doit runs
- where the persistent objects live, on the primary's thread, so this UI never
- blocks — and the {#uiReply. corr. result} appends to the Transcript. The
- primary's own transcript is forwarded here too (§7.4). The Do It / Print It
- controls dispatch SYNCHRONOUSLY on the main thread through a C6 action-target
- delegate (MacvmActionTarget), the correct mechanism for a UI-worker-local
- control (a C4 `Cocoa action:` would post to the primary, unable to read this
- local NSTextView). Text is local to the NSTextView (§11 Q4/R9).
+ CG5 layout (top to bottom, matching the WKWebView GUI's own shell): a
+ TOOLBAR strip (view-switcher buttons left, live VmMetrics readout right),
+ a CONTENT HOST that swaps its single subview per the active registered
+ view, and a small REVERSE-CHRONOLOGICAL Transcript dock at the bottom
+ (newest line first — a log to glance at, not the primary output surface;
+ CG6's Workspace Print it is that now). Every subview carries the correct
+ NSView autoresizingMask so the window is genuinely resizable (unflipped
+ AppKit coordinates: MinYMargin-flexible pins to the TOP, MaxYMargin-
+ flexible pins to the BOTTOM, both-sizable fills the middle).
 
- ON-SCREEN status: the AppKit view construction + text read/append here are the
- USER's on-screen gate (computer-use can't attach to the bare binary). The
- request round-trip and the (peer,corr) routing this rides are headless-proven
- (embed.rs CG4 tests); the action dispatch is headless-proven (cocoa_delegate
- gate). Ownership: setReleasedWhenClosed: false is load-bearing; rebuild is
- idempotent so a restart-in-place leaks no wrappers."
+ The toolbar's per-button action is the C6 `macvmAction:` selector
+ (`MacvmActionTarget`, CG5): each button mints its OWN action-target ticket
+ bound to a tiny `CocoaToolbarAction` block-holder, so N buttons share ONE
+ Rust IMP with no per-button Rust code (`objc_delegate.rs`'s existing
+ ticket-routing does the rest) — the reusable mechanism this sprint exists
+ to prove.
+
+ Icons are the SAME `gui/assets/icons-mono/*.svg` files the WKWebView GUI's
+ own toolbar already ships (relative to the process cwd — the repo root,
+ matching the `MACVM_WORLD` convention), loaded as `NSImage` template images
+ so a future theme's tint color recolors them for free — no duplicate art.
+
+ ON-SCREEN status: the AppKit view construction here is the USER's on-screen
+ gate (a `MACVM_COCOA_SNAP` sequence self-verifies before that). The request
+ round-trip and (peer,corr) routing are headless-proven (embed.rs CG4
+ tests); the action dispatch is headless-proven (cocoa_delegate gate)."
+
+Object subclass: CocoaToolbarAction [
+    "A block-holder so N toolbar buttons can each mint their own C6
+     action-target ticket (`MacvmDelegate actionTargetOn:`) while sharing
+     ONE Rust IMP (`macvmAction:`). Kept alive by the world-side ticket→
+     receiver registry (GC-rooted) — nothing else needs to hold it."
+    <classVars: nil>
+    | Block |
+    CocoaToolbarAction class >> on: aBlock [
+        | h | h := self new. h setBlock: aBlock. ^h
+    ]
+    setBlock: aBlock [ Block := aBlock ]
+    macvmAction: sender [ ^Block value ]
+]
+
 Object subclass: CocoaUI [
-    <classVars: Win Workspace Transcript ActTarget TranscriptText>
+    <classVars: Win Toolbar ContentHost Transcript ActTarget TranscriptText
+                Views ActiveView ToolbarDelegates ToolbarButtons MetricLabels
+                Workspace>
 
-    CocoaUI class >> title [ ^'MACVM — Cocoa (Smalltalk inside)' ]
+    CocoaUI class >> title [ ^'MACVM' ]
+
+    "── layout constants ──"
+    CocoaUI class >> toolbarHeight [ ^44.0 ]
+    CocoaUI class >> transcriptHeight [ ^110.0 ]
+    CocoaUI class >> iconDir [ ^'gui/assets/icons-mono/' ]
+
+    "── autoresizing mask bits (NSView) ──"
+    CocoaUI class >> maskWidthSizable [ ^2 ]
+    CocoaUI class >> maskHeightSizable [ ^16 ]
+    CocoaUI class >> maskMinYMargin [ ^8 ]   "flexible space BELOW -> pins to TOP"
+    CocoaUI class >> maskMaxYMargin [ ^32 ]  "flexible space ABOVE -> pins to BOTTOM"
+    CocoaUI class >> maskMinXMargin [ ^1 ]   "flexible space LEFT -> pins to RIGHT"
 
     CocoaUI class >> startup [
-        "Build (or rebuild) the main window + the Workspace/Transcript terminal
-         through the Cocoa bridge, on the main thread, and order it front.
-         Returns to Rust with the VM at rest; Rust then calls [NSApp run]."
-        | winClass tvClass content |
+        "Build (or rebuild) the window shell and order it front. Returns to
+         Rust with the VM at rest; Rust then calls [NSApp run]."
+        | winClass content |
         self teardown.
         TranscriptText := ''.
+        Views := OrderedCollection new.
+        ToolbarDelegates := OrderedCollection new.
+        ToolbarButtons := Dictionary new.
         winClass := Cocoa classNamed: 'NSWindow'.
-        tvClass := Cocoa classNamed: 'NSTextView'.
 
         Win := ((winClass onMain alloc) onMain
-            initWithContentRect: (Array with: 240.0 with: 240.0 with: 640.0 with: 460.0)
+            initWithContentRect: (Array with: 240.0 with: 180.0 with: 780.0 with: 560.0)
             styleMask: 15 backing: 2 defer: false).
         Win onMain setReleasedWhenClosed: false.
         Win onMain setTitle: self title.
+        Win onMain setMinSize: (Array with: 480.0 with: 320.0).
         content := Win onMain contentView.
+        content onMain setAutoresizesSubviews: true.
 
-        "Workspace (top): editable — you type an expression here."
-        Workspace := ((tvClass onMain alloc) onMain
-            initWithFrame: (Array with: 12.0 with: 250.0 with: 616.0 with: 190.0)).
-        Workspace onMain setEditable: true.
-        Workspace onMain setString: '3 + 4'.
-        content onMain addSubview: Workspace.
+        self buildToolbarIn: content.
+        self buildContentHostIn: content.
+        self buildTranscriptIn: content.
 
-        "Transcript (bottom): read-only — results and the primary's transcript."
-        Transcript := ((tvClass onMain alloc) onMain
-            initWithFrame: (Array with: 12.0 with: 12.0 with: 616.0 with: 220.0)).
-        Transcript onMain setEditable: false.
-        content onMain addSubview: Transcript.
+        self registerViewNamed: #workspace title: 'Workspace' icon: 'texteditor'
+             activate: [ self activateWorkspaceView ].
 
         "Forwarded primary transcript lines (§7.4) append to our Transcript view."
         Worker onTranscriptLine: [ :t | CocoaUI appendTranscript: t ].
 
         self installMenu.
+        self switchToView: #workspace.
         Win onMain makeKeyAndOrderFront: nil.
-        self appendTranscript: 'CocoaUI: ready — ⌘P evaluates the Workspace on the primary.'.
+        self appendTranscript: 'CocoaUI: ready.'.
         ^Win
     ]
 
+    "── toolbar ──"
+    CocoaUI class >> buildToolbarIn: content [
+        | nsRect frame |
+        nsRect := Cocoa classNamed: 'NSView'.
+        frame := content onMain frame.
+        Toolbar := (nsRect onMain alloc) onMain
+            initWithFrame: (Array with: 0.0 with: (frame at: 4) - self toolbarHeight
+                                  with: (frame at: 3) with: self toolbarHeight).
+        Toolbar onMain setAutoresizingMask: self maskWidthSizable + self maskMinYMargin.
+        content onMain addSubview: Toolbar.
+        self buildMetricsClusterIn: Toolbar.
+    ]
+
+    CocoaUI class >> buildMetricsClusterIn: aToolbar [
+        "Five small, right-anchored read-only labels — MEM/JIT/CODE/ALLOC/GC —
+         matching the WKWebView GUI's own toolbar metrics cluster (same
+         VmMetrics fields, same semantics; sampled off the PRIMARY by the
+         Rust watchdog and pushed here via CocoaUI updateMetrics:...).
+         Right-anchored (MinXMargin flexible) so they track the edge on resize."
+        | names w x tfClass |
+        tfClass := Cocoa classNamed: 'NSTextField'.
+        names := #('GC' 'ALLOC' 'CODE' 'JIT' 'MEM').
+        w := 132.0.
+        x := (aToolbar onMain frame) at: 3.
+        MetricLabels := Dictionary new.
+        names do: [ :n |
+            | tf |
+            x := x - w.
+            tf := (tfClass onMain alloc) onMain
+                initWithFrame: (Array with: x with: 10.0 with: w - 6.0 with: 24.0).
+            tf onMain setEditable: false.
+            tf onMain setBordered: false.
+            tf onMain setDrawsBackground: false.
+            tf onMain setSelectable: false.
+            tf onMain setStringValue: n , ' —'.
+            tf onMain setAutoresizingMask: self maskMinXMargin.
+            aToolbar onMain addSubview: tf.
+            MetricLabels at: n asSymbol put: tf ].
+    ]
+
+    CocoaUI class >> updateMetricsMem: memStr jit: jitStr code: codeStr alloc: allocStr gc: gcStr [
+        "Called from Rust (a ~1s main-thread timer reading the primary's
+         VmMetrics via the watchdog's supervisor sample — no VM round-trip,
+         no new protocol verb) to refresh the toolbar readout in place."
+        MetricLabels isNil ifTrue: [ ^self ].
+        (MetricLabels at: #MEM ifAbsent: [ nil ]) ifNotNil: [ :tf | tf onMain setStringValue: 'MEM ' , memStr ].
+        (MetricLabels at: #JIT ifAbsent: [ nil ]) ifNotNil: [ :tf | tf onMain setStringValue: 'JIT ' , jitStr ].
+        (MetricLabels at: #CODE ifAbsent: [ nil ]) ifNotNil: [ :tf | tf onMain setStringValue: 'CODE ' , codeStr ].
+        (MetricLabels at: #ALLOC ifAbsent: [ nil ]) ifNotNil: [ :tf | tf onMain setStringValue: 'ALLOC ' , allocStr ].
+        (MetricLabels at: #GC ifAbsent: [ nil ]) ifNotNil: [ :tf | tf onMain setStringValue: 'GC ' , gcStr ].
+    ]
+
+    "── content host: the swappable middle 'screen' ──"
+    CocoaUI class >> buildContentHostIn: content [
+        | nsRect frame |
+        nsRect := Cocoa classNamed: 'NSView'.
+        frame := content onMain frame.
+        ContentHost := (nsRect onMain alloc) onMain
+            initWithFrame: (Array with: 0.0 with: self transcriptHeight
+                                  with: (frame at: 3)
+                                  with: (frame at: 4) - self toolbarHeight - self transcriptHeight).
+        ContentHost onMain setAutoresizingMask: self maskWidthSizable + self maskHeightSizable.
+        content onMain addSubview: ContentHost.
+    ]
+
+    "── the view registry ──"
+    CocoaUI class >> registerViewNamed: aSymbol title: aTitle icon: iconBaseName activate: aBlock [
+        "Add a persistent view: mint its toolbar button (icon, falling back to
+         a text title if the image fails to load — never an invisible
+         control) wired through its OWN CocoaToolbarAction/macvmAction:
+         ticket, and record its activation block for switchToView:."
+        | btnClass imgClass img btn holder delegate x |
+        Views add: (Array with: aSymbol with: aBlock).
+        btnClass := Cocoa classNamed: 'NSButton'.
+        x := 8.0 + (ToolbarButtons size * 98.0).
+        btn := (btnClass onMain alloc) onMain
+            initWithFrame: (Array with: x with: 6.0 with: 92.0 with: 32.0).
+        btn onMain setBordered: false.
+        btn onMain setTitle: aTitle.
+        imgClass := Cocoa classNamed: 'NSImage'.
+        img := (imgClass onMain alloc) onMain
+            initWithContentsOfFile: self iconDir , iconBaseName , '.svg'.
+        img isNil ifFalse: [
+            img onMain setTemplate: true.
+            btn onMain setImage: img.
+            btn onMain setImagePosition: 1. "NSImageOnly — icon loaded, hide the fallback title"
+        ].
+        holder := CocoaToolbarAction on: aBlock.
+        delegate := MacvmDelegate actionTargetOn: holder.
+        btn onMain setTarget: delegate.
+        btn onMain setAction: 'macvmAction:'.
+        Toolbar onMain addSubview: btn.
+        ToolbarDelegates add: delegate.
+        ToolbarButtons at: aSymbol put: btn.
+    ]
+
+    CocoaUI class >> switchToView: aSymbol [
+        "Remove every current child. `subviews` is a real ObjC NSArray, not a
+         Smalltalk Array — `count`/`objectAtIndex:`, not `size`/`at:`.
+         Re-fetch it fresh each iteration (never assume it live-updates as
+         removeFromSuperview mutates the real subview list underneath)."
+        | entry cur |
+        entry := Views detect: [ :e | (e at: 1) == aSymbol ] ifNone: [ nil ].
+        entry isNil ifTrue: [ ^self ].
+        [ (cur := ContentHost onMain subviews) count > 0 ] whileTrue: [
+            (cur objectAtIndex: 0) onMain removeFromSuperview ].
+        ActiveView := aSymbol.
+        (entry at: 2) value.
+    ]
+
+    "── the Workspace view (CG6: selection-or-everything, inline Print it) ──"
+    CocoaUI class >> activateWorkspaceView [
+        | tvClass frame |
+        Workspace isNil ifTrue: [
+            tvClass := Cocoa classNamed: 'NSTextView'.
+            frame := ContentHost onMain frame.
+            Workspace := (tvClass onMain alloc) onMain
+                initWithFrame: (Array with: 0.0 with: 0.0
+                                      with: (frame at: 3) with: (frame at: 4)).
+            Workspace onMain setEditable: true.
+            Workspace onMain setAutomaticQuoteSubstitutionEnabled: false.
+            Workspace onMain setAutomaticDashSubstitutionEnabled: false.
+            Workspace onMain setAutomaticTextReplacementEnabled: false.
+            Workspace onMain setFont: ((Cocoa classNamed: 'NSFont') onMain
+                userFixedPitchFontOfSize: 13.0).
+            Workspace onMain setString: self placeholderText.
+            Workspace onMain setAutoresizingMask: self maskWidthSizable + self maskHeightSizable.
+        ].
+        ContentHost onMain addSubview: Workspace.
+        Win onMain makeFirstResponder: Workspace.
+    ]
+
+    CocoaUI class >> placeholderText [
+        ^'"Type Smalltalk here.
+Do it runs the selection (or everything, if nothing''s selected).
+Print it does the same and inserts the result right after it."
+3 + 4.'
+    ]
+
+    CocoaUI class >> workspace [ ^Workspace ]
+
+    "── toolbar/menu Do it / Print it (CG6: selection-aware) ──"
     CocoaUI class >> installMenu [
-        "A Workspace menu with Print It (⌘P) and Do It (⌘D), targeting a C6
-         action-target delegate that dispatches SYNCHRONOUSLY on main to
-         macvmPrintIt:/macvmDoIt: here."
+        "The app menu (⌘Q) is installed by Rust BEFORE startup (main.rs) so
+         `mainMenu` already exists here and this ADDS the Workspace submenu
+         to it, never replaces it (the CG4-review menu-clobber fix)."
         | app mainMenu wsItem wsMenu printItem doItem |
         ActTarget := MacvmDelegate actionTargetOn: CocoaUI.
         app := (Cocoa classNamed: 'NSApplication') onMain sharedApplication.
@@ -101,33 +279,84 @@ Object subclass: CocoaUI [
     ]
 
     "── C6 action-target callbacks (dispatched synchronously on main) ──"
-    CocoaUI class >> macvmPrintIt: sender [ ^self shipDoit ]
-    CocoaUI class >> macvmDoIt: sender [ ^self shipDoit ]
+    CocoaUI class >> macvmPrintIt: sender [ ^self printIt ]
+    CocoaUI class >> macvmDoIt: sender [ ^self doIt ]
 
-    CocoaUI class >> shipDoit [
-        "Read the Workspace text and ship it to the primary as a #doit request;
-         the {#uiReply. corr. result} appends to the Transcript. The primary
-         evaluates it on ITS thread, so this UI never blocks (§6)."
-        | source |
-        source := self workspaceText.
+    CocoaUI class >> selectionOrAll [
+        "The selection-or-everything rule (WKWebView GUI's
+         workspaceEvalTarget, ported verbatim): a non-empty selection wins;
+         an empty (collapsed) selection falls back to the whole buffer.
+         Answers an Array #(source insertAt)."
+        | full range loc len sub |
+        full := self workspaceText.
+        range := Workspace onMain selectedRange.
+        loc := range at: 1. len := range at: 2.
+        len = 0 ifTrue: [ ^Array with: full with: full size ].
+        sub := full copyFrom: loc + 1 to: loc + len.
+        ^Array with: sub with: loc + len
+    ]
+
+    CocoaUI class >> doIt [
+        | target source |
+        target := self selectionOrAll.
+        source := target at: 1.
         source isEmpty ifTrue: [ ^self ].
-        self appendTranscript: source.
-        Worker uiDoit: source onReply: [ :result | CocoaUI appendTranscript: result ].
+        Worker uiDoit: source onReply: [ :result | CocoaUI appendTranscript: source , ' => ' , result ].
+    ]
+
+    CocoaUI class >> printIt [
+        "Capture the insertion point NOW (at invocation) — the selection can
+         move before the async #uiReply lands (the web GUI's
+         pendingPrintInsertAt discipline, ported verbatim)."
+        | target source insertAt |
+        target := self selectionOrAll.
+        source := target at: 1.
+        insertAt := target at: 2.
+        source isEmpty ifTrue: [ ^self ].
+        Worker uiDoit: source onReply: [ :result | CocoaUI insertPrintResult: result at: insertAt ].
+    ]
+
+    CocoaUI class >> insertPrintResult: result at: anInteger [
+        | full at text newText |
+        Workspace isNil ifTrue: [ ^self ].
+        full := self workspaceText.
+        at := anInteger min: full size.
+        text := ' ' , result.
+        newText := (full copyFrom: 1 to: at) , text , (full copyFrom: at + 1 to: full size).
+        Workspace onMain setString: newText.
+        Workspace onMain setSelectedRange: (Array with: at + text size with: 0).
     ]
 
     CocoaUI class >> workspaceText [
         "The Workspace NSTextView's current text as a Smalltalk String. `string`
          returns an NSString, which `sendString:` copies to a Smalltalk String —
          NOT `UTF8String` (that returns a `char*`, which `sendString:` would
-         misread as an object id and crash). On main (a delegate callback)."
+         misread as an object id and crash — the CG4 SIGBUS fix)."
+        Workspace isNil ifTrue: [ ^'' ].
         ^Workspace sendString: 'string'
     ]
 
+    "── the transcript: a SMALL, reverse-chronological dock at the bottom ──"
+    CocoaUI class >> buildTranscriptIn: content [
+        | tvClass frame |
+        tvClass := Cocoa classNamed: 'NSTextView'.
+        frame := content onMain frame.
+        Transcript := (tvClass onMain alloc) onMain
+            initWithFrame: (Array with: 0.0 with: 0.0
+                                  with: (frame at: 3) with: self transcriptHeight).
+        Transcript onMain setEditable: false.
+        Transcript onMain setFont: ((Cocoa classNamed: 'NSFont') onMain
+            userFixedPitchFontOfSize: 11.0).
+        Transcript onMain setAutoresizingMask: self maskWidthSizable + self maskMaxYMargin.
+        content onMain addSubview: Transcript.
+    ]
+
     CocoaUI class >> appendTranscript: aString [
-        "Append a line to the Transcript view. Blast the WHOLE text each change
+        "PREPEND — newest line first (reverse chronological, CG5): a log to
+         glance at, not read top to bottom. Blast the WHOLE text each change
          (feedback_blast_dont_patch) — never an incremental NSTextView patch."
         TranscriptText isNil ifTrue: [ TranscriptText := '' ].
-        TranscriptText := TranscriptText, aString, String lf.
+        TranscriptText := aString , String lf , TranscriptText.
         Transcript isNil ifFalse: [ Transcript onMain setString: TranscriptText ].
     ]
 
@@ -147,13 +376,18 @@ Object subclass: CocoaUI [
         Win isNil ifFalse: [
             Win onMain orderOut: nil.
             ActTarget isNil ifFalse: [ ActTarget isValid ifTrue: [ ActTarget release ] ].
+            ToolbarDelegates isNil ifFalse: [
+                ToolbarDelegates do: [ :d | d isValid ifTrue: [ d release ] ] ].
             Workspace isNil ifFalse: [ Workspace isValid ifTrue: [ Workspace release ] ].
+            Toolbar isNil ifFalse: [ Toolbar isValid ifTrue: [ Toolbar release ] ].
+            ContentHost isNil ifFalse: [ ContentHost isValid ifTrue: [ ContentHost release ] ].
             Transcript isNil ifFalse: [ Transcript isValid ifTrue: [ Transcript release ] ].
             Win isValid ifTrue: [ Win release ].
-            Win := nil. Workspace := nil. Transcript := nil. ActTarget := nil ]
+            Win := nil. Workspace := nil. Toolbar := nil. ContentHost := nil.
+            Transcript := nil. ActTarget := nil. ToolbarDelegates := nil.
+            ToolbarButtons := nil. MetricLabels := nil. Views := nil ]
     ]
 
     CocoaUI class >> window [ ^Win ]
-    CocoaUI class >> workspace [ ^Workspace ]
     CocoaUI class >> transcriptView [ ^Transcript ]
 ]

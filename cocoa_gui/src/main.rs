@@ -12,6 +12,7 @@
 
 mod boot;
 mod objc;
+mod snapshot;
 mod supervisor;
 
 use std::ffi::c_void;
@@ -33,6 +34,66 @@ struct DrainState {
     ui: VmHandle,
     inbox: HostedInbox,
     supervisor: PrimarySupervisor,
+    /// CG5: the previous tick's `bytes_allocated`, to derive a per-tick alloc
+    /// RATE (the toolbar shows B/s, `VmMetrics` only carries the running
+    /// total). `None` before the first sample (no rate yet, not zero).
+    prev_alloc: Option<u64>,
+}
+
+/// `1536` -> `"1.5K"`, base-1024, one decimal past the first suffix — the
+/// same compact style the WKWebView GUI's own toolbar uses for MEM/ALLOC.
+fn format_bytes(n: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "K", "M", "G", "T"];
+    let mut v = n as f64;
+    let mut u = 0;
+    while v >= 1024.0 && u < UNITS.len() - 1 {
+        v /= 1024.0;
+        u += 1;
+    }
+    if u == 0 {
+        format!("{n}{}", UNITS[0])
+    } else {
+        format!("{v:.1}{}", UNITS[u])
+    }
+}
+
+/// Sample the primary's live `VmMetrics` and push a formatted readout into the
+/// toolbar (CG5) — `CocoaUI updateMetricsMem:jit:code:alloc:gc:`. Called from
+/// `drain_perform`, which now fires ~4Hz regardless of real UI traffic (the
+/// supervisor's beat loop wakes unconditionally) — a free, already-proven
+/// tick, not a new NSTimer.
+fn refresh_metrics(st: &mut DrainState) {
+    let m = st.supervisor.metrics();
+    // `old_committed` (the actually-mapped, currently-usable portion), NOT
+    // `old_reserved` (the full virtual-address reservation upfront for
+    // growth-without-remap — often gigabytes even on a small idle VM, whose
+    // formatted string overflowed the toolbar label and got clipped).
+    let mem = format!(
+        "{}/{}",
+        format_bytes(m.eden_used + m.old_used),
+        format_bytes(m.eden_capacity + m.old_committed)
+    );
+    let jit = if m.compilations == 0 {
+        "—".to_string()
+    } else {
+        format!("{}c", m.compilations)
+    };
+    let code = format!("{} nm", m.nmethods);
+    let alloc_rate = match st.prev_alloc {
+        Some(prev) => {
+            let delta = m.bytes_allocated.saturating_sub(prev);
+            // One beat is PUMP_BEAT_MS (250ms); *4 approximates bytes/sec.
+            format!("{}/s", format_bytes(delta.saturating_mul(4)))
+        }
+        None => "—".to_string(),
+    };
+    st.prev_alloc = Some(m.bytes_allocated);
+    let gc = format!("{}·{}", m.scavenges, m.full_gcs);
+
+    let doit = format!(
+        "CocoaUI updateMetricsMem: '{mem}' jit: '{jit}' code: '{code}' alloc: '{alloc_rate}' gc: '{gc}'."
+    );
+    let _ = st.ui.exec(&doit);
 }
 
 /// The default-mode drain `perform` (CG4 §8): apply any pending re-sync (re-point
@@ -69,6 +130,7 @@ extern "C" fn drain_perform(info: *mut c_void) {
             eprintln!("macvm-cocoa: UI worker drain error: {e}");
         }
     }
+    refresh_metrics(st);
 }
 
 fn main() {
@@ -135,6 +197,7 @@ fn main() {
         ui,
         inbox: link.hosted_inbox,
         supervisor: sup,
+        prev_alloc: None,
     });
 
     // (design §3 step 4) Publish the thread-local `*mut VmHandle` the CG3/CG4
@@ -174,6 +237,9 @@ fn main() {
     // Drain the startup pool; from here CF's own run-loop pools own the main
     // thread's autorelease lifecycle.
     objc::autorelease_pool_pop(startup_pool);
+    // Dev aid: if MACVM_COCOA_SNAP is set, capture a timestamped PNG sequence of
+    // the client area from inside the app (so on-screen work is inspectable).
+    snapshot::start();
     objc::run(app);
 
     // Keep the drain state (UI worker VM, supervisor) alive for the whole run.
