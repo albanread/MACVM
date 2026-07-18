@@ -18,7 +18,8 @@
  GUI's own editor path."
 
 Object subclass: CocoaEditor [
-    <classVars: Container Picker Buffer BufferScroll ActionDelegates LastVmId>
+    <classVars: Container Picker Buffer BufferScroll ActionDelegates LastVmId
+                EditorDelegate>
 
     CocoaEditor class >> stripHeight [ ^36.0 ]
 
@@ -72,13 +73,21 @@ Object subclass: CocoaEditor [
         BufferScroll onMain setAutoresizingMask: CocoaUI maskWidthSizable + CocoaUI maskHeightSizable.
         Buffer := ((Cocoa classNamed: 'NSTextView') onMain alloc) onMain
             initWithFrame: (Array with: 0.0 with: 0.0 with: w with: h - self stripHeight).
-        Buffer onMain setEditable: false.
+        "Editable, but a DUMB TERMINAL: the editorTerminal delegate intercepts
+         every user edit (shouldChange -> NO) and routes it to the VMapp, which
+         blasts the whole buffer back. Substitutions off so typed source isn't
+         mangled (the Workspace's discipline)."
+        Buffer onMain setEditable: true.
         Buffer onMain setAutomaticQuoteSubstitutionEnabled: false.
+        Buffer onMain setAutomaticDashSubstitutionEnabled: false.
+        Buffer onMain setAutomaticTextReplacementEnabled: false.
         Buffer onMain setFont: ((Cocoa classNamed: 'NSFont') onMain userFixedPitchFontOfSize: 12.0).
         Buffer onMain setVerticallyResizable: true.
         Buffer onMain setHorizontallyResizable: false.
         Buffer onMain setString: self placeholder.
         (Buffer onMain textContainer) ifNotNil: [ :tc | tc onMain setWidthTracksTextView: true. tc release ].
+        EditorDelegate := MacvmDelegate editorTerminalOn: self.
+        Buffer onMain setDelegate: EditorDelegate.
         BufferScroll onMain setDocumentView: Buffer.
         Container onMain addSubview: BufferScroll.
 
@@ -161,15 +170,44 @@ Enter in the field — to read its whole-class source here."'
      the text verbatim. (E2a leaves the buffer read-only; E2b sets the caret and
      makes it editable.)"
     CocoaEditor class >> paint: render [
-        | lf idx body |
+        | lf idx caret body |
         (render isNil or: [ Buffer isNil ]) ifTrue: [ ^self ].
         lf := Character value: 10.
         idx := 0.
         1 to: render size do: [ :i | (idx = 0 and: [ (render at: i) = lf ]) ifTrue: [ idx := i ] ].
         idx = 0 ifTrue: [ ^Buffer onMain setString: render ].
+        caret := self parseInt: (render copyFrom: 1 to: idx - 1).
         body := render copyFrom: idx + 1 to: render size.
         Buffer onMain setString: body.
         self recolorize.
+        "Place the caret where the VMapp says it is (0-based, empty selection)."
+        Buffer onMain setSelectedRange: (Array with: (caret max: 0) with: 0).
+    ]
+    CocoaEditor class >> parseInt: aString [
+        "The render header is a small non-negative integer string."
+        | n z d |
+        n := 0. z := $0 asInteger.
+        aString do: [ :ch | d := ch asInteger - z.
+            (d >= 0 and: [ d <= 9 ]) ifTrue: [ n := (n * 10) + d ] ].
+        ^n
+    ]
+
+    "── the dumb terminal: route a user edit to the VMapp, paint the blast ──"
+    CocoaEditor class >> routeEditAt: loc len: len with: s [
+        "s is a Smalltalk String. Relay a range edit to the editor VMapp; its
+         render (the whole new buffer + caret) blasts back to paint:."
+        Worker uiRequest: #editorEdit args: (Array with: loc with: len with: s)
+            onReply: [ :render | CocoaEditor paint: render ].
+    ]
+    CocoaEditor class >> editShouldReplaceAt: loc len: len with: repl [
+        "The editorTerminal delegate callback: AppKit is about to apply a user
+         edit (replace `len` chars at 0-based `loc` with `repl`). Route it and
+         answer false — the native edit is BLOCKED; the VMapp is the authority.
+         `repl` is an NSString id (nil for a pure deletion) — copy it out first."
+        | s |
+        s := repl isNil ifTrue: [ '' ] ifFalse: [ repl sendString: 'description' ].
+        self routeEditAt: loc len: len with: s.
+        ^false
     ]
 
     CocoaEditor class >> recolorize [
@@ -199,6 +237,16 @@ Enter in the field — to read its whole-class source here."'
             onReply: [ :r | LastVmId := r ].
     ]
     CocoaEditor class >> vmId [ ^LastVmId isNil ifTrue: [ '(none)' ] ifFalse: [ LastVmId ] ]
+    "Simulate a user edit (for scripted verification) — the SAME path the
+     terminal delegate's shouldChange takes, so a test can 'type' without
+     synthetic key events: replace `len` chars at 0-based `loc` with `s`."
+    CocoaEditor class >> simulateEditAt: loc len: len with: s [
+        self routeEditAt: loc len: len with: s.
+    ]
+    CocoaEditor class >> caretOffset [
+        Buffer isNil ifTrue: [ ^-1 ].
+        ^(Buffer onMain selectedRange) at: 1
+    ]
     CocoaEditor class >> classNameCount [
         Picker isNil ifTrue: [ ^0 ].
         ^Picker onMain numberOfItems
@@ -214,11 +262,12 @@ Enter in the field — to read its whole-class source here."'
     CocoaEditor class >> teardown [
         ActionDelegates isNil ifFalse: [
             ActionDelegates do: [ :d | d isValid ifTrue: [ d release ] ] ].
+        EditorDelegate isNil ifFalse: [ EditorDelegate isValid ifTrue: [ EditorDelegate release ] ].
         CocoaBrowser releaseView: Buffer.
         CocoaBrowser releaseView: BufferScroll.
         CocoaBrowser releaseView: Picker.
         CocoaBrowser releaseView: Container.
-        ActionDelegates := nil. Buffer := nil. BufferScroll := nil.
+        ActionDelegates := nil. EditorDelegate := nil. Buffer := nil. BufferScroll := nil.
         Picker := nil. Container := nil.
     ]
 ]
