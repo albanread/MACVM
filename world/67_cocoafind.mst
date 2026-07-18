@@ -24,12 +24,12 @@ Object subclass: CocoaFind [
 
     CocoaFind class >> register [
         CocoaUI registerViewNamed: #find title: 'Find' icon: 'implementors'
-                activate: [ self activate ]
+                container: [ self containerView ]
+                onShow: [ CocoaUI window onMain makeFirstResponder: SearchField ]
     ]
-    CocoaFind class >> activate [
+    CocoaFind class >> containerView [
         Container isNil ifTrue: [ self buildView ].
-        CocoaUI contentHost onMain addSubview: Container.
-        CocoaUI window onMain makeFirstResponder: SearchField.
+        ^Container
     ]
 
     "── the queries (host-served; reuse the browser's reply reader) ──"

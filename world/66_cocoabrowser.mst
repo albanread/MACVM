@@ -55,15 +55,16 @@ Object subclass: CocoaBrowser [
     CocoaBrowser class >> sourcePaneHeight [ ^210.0 ]
     CocoaBrowser class >> buttonRowHeight [ ^30.0 ]
 
-    "── registration ──"
+    "── registration (tab-host protocol: container built lazily, onShow per
+       switch — CocoaUI's NSTabView owns the view from first show) ──"
     CocoaBrowser class >> register [
         CocoaUI registerViewNamed: #browser title: 'Browser' icon: 'hierarchy'
-                activate: [ self activate ]
+                container: [ self containerView ]
+                onShow: [ Snapshot isNil ifTrue: [ self requestRefresh ] ]
     ]
-    CocoaBrowser class >> activate [
+    CocoaBrowser class >> containerView [
         Container isNil ifTrue: [ self buildView ].
-        CocoaUI contentHost onMain addSubview: Container.
-        Snapshot isNil ifTrue: [ self requestRefresh ].
+        ^Container
     ]
 
     "── snapshot (rows = the primary's live truth) ──"

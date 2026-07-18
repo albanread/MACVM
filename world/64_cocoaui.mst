@@ -56,7 +56,7 @@ Object subclass: CocoaUI [
     <classVars: Win Toolbar ContentHost Transcript TranscriptScroll ActTarget
                 TranscriptText Views ActiveView ToolbarDelegates ToolbarButtons
                 MetricLabels MemBarFill MemBarWidth Workspace WorkspaceScroll
-                WorkspaceTextDelegate>
+                WorkspaceTextDelegate TabItems TabIndexes>
 
     CocoaUI class >> title [ ^'MACVM' ]
 
@@ -81,6 +81,8 @@ Object subclass: CocoaUI [
         Views := OrderedCollection new.
         ToolbarDelegates := OrderedCollection new.
         ToolbarButtons := Dictionary new.
+        TabItems := OrderedCollection new.
+        TabIndexes := Dictionary new.
         winClass := Cocoa classNamed: 'NSWindow'.
 
         Win := ((winClass onMain alloc) onMain
@@ -97,7 +99,8 @@ Object subclass: CocoaUI [
         self buildTranscriptIn: content.
 
         self registerViewNamed: #workspace title: 'Workspace' icon: 'texteditor'
-             activate: [ self activateWorkspaceView ].
+             container: [ self workspaceContainer ]
+             onShow: [ Win onMain makeFirstResponder: Workspace ].
         "CG7/CG8: later-loading views register themselves — resolved by name
          so this file never depends on files after it in cocoaui.list."
         (Worker classNamed: #CocoaBrowser) ifNotNil: [ :bc | bc register ].
@@ -219,27 +222,35 @@ Object subclass: CocoaUI [
 
     CocoaUI class >> contentHost [ ^ContentHost ]
 
-    "── content host: the swappable middle 'screen' ──"
+    "── content host: a TABLESS NSTabView — the Cocoa-native view switcher.
+       Each registered view is an NSTabViewItem; AppKit owns insertion,
+       removal, clipping and repaint on every switch (the manual
+       remove-subviews/add-subview swapper this replaces left stale drawing
+       behind — views 'drew over each other'). Our themed toolbar buttons and
+       the View menu ARE the tab bar; they drive selectTabViewItemAtIndex:."
     CocoaUI class >> buildContentHostIn: content [
-        | nsRect frame |
-        nsRect := Cocoa classNamed: 'NSView'.
+        | frame |
         frame := content onMain frame.
-        ContentHost := (nsRect onMain alloc) onMain
+        ContentHost := ((Cocoa classNamed: 'NSTabView') onMain alloc) onMain
             initWithFrame: (Array with: 0.0 with: self transcriptHeight
                                   with: (frame at: 3)
                                   with: (frame at: 4) - self toolbarHeight - self transcriptHeight).
+        ContentHost onMain setTabViewType: 6. "NSNoTabsNoBorder — chrome is ours"
         ContentHost onMain setAutoresizingMask: self maskWidthSizable + self maskHeightSizable.
         content onMain addSubview: ContentHost.
     ]
 
     "── the view registry ──"
-    CocoaUI class >> registerViewNamed: aSymbol title: aTitle icon: iconBaseName activate: aBlock [
+    CocoaUI class >> registerViewNamed: aSymbol title: aTitle icon: iconBaseName container: containerBlock onShow: onShowBlock [
         "Add a persistent view: mint its toolbar button (icon, falling back to
          a text title if the image fails to load — never an invisible
          control) wired through its OWN CocoaToolbarAction/macvmAction:
-         ticket, and record its activation block for switchToView:."
+         ticket. `containerBlock` answers the view's root NSView (building
+         lazily on first show — it becomes the tab item's view, owned by the
+         NSTabView from then on); `onShowBlock` runs on every switch TO the
+         view (refresh requests, first responder)."
         | btnClass imgClass img btn holder delegate x |
-        Views add: (Array with: aSymbol with: aTitle with: aBlock).
+        Views add: (Array with: aSymbol with: aTitle with: containerBlock with: onShowBlock).
         btnClass := Cocoa classNamed: 'NSButton'.
         x := 8.0 + (ToolbarButtons size * 98.0).
         btn := (btnClass onMain alloc) onMain
@@ -254,7 +265,11 @@ Object subclass: CocoaUI [
             btn onMain setImage: img.
             btn onMain setImagePosition: 1. "NSImageOnly — icon loaded, hide the fallback title"
         ].
-        holder := CocoaToolbarAction on: aBlock.
+        "EVERY switch path goes through switchToView: — the toolbar buttons
+         previously ran the raw activate blocks, adding views ON TOP of the
+         current one (the 'views draw over each other' bug's second head;
+         only the View menu did the swap)."
+        holder := CocoaToolbarAction on: [ self switchToView: aSymbol ].
         delegate := MacvmDelegate actionTargetOn: holder.
         btn onMain setTarget: delegate.
         btn onMain setAction: 'macvmAction:'.
@@ -264,27 +279,33 @@ Object subclass: CocoaUI [
     ]
 
     CocoaUI class >> switchToView: aSymbol [
-        "Remove every current child. `subviews` is a real ObjC NSArray, not a
-         Smalltalk Array — `count`/`objectAtIndex:`, not `size`/`at:`.
-         Re-fetch it fresh each iteration (never assume it live-updates as
-         removeFromSuperview mutates the real subview list underneath)."
-        | entry cur child |
+        "Select the view's tab, creating its NSTabViewItem lazily on first
+         visit (the container block builds the view then). AppKit swaps the
+         item views in and out of the hierarchy itself — no manual subview
+         surgery, no stale drawing."
+        | entry idx item container |
         entry := Views detect: [ :e | (e at: 1) == aSymbol ] ifNone: [ nil ].
         entry isNil ifTrue: [ ^self ].
-        [ (cur := ContentHost onMain subviews) count > 0 ] whileTrue: [
-            child := cur objectAtIndex: 0.
-            child onMain removeFromSuperview.
-            "objectAtIndex: minted a fresh +1 wrapper — drop it (leak rule)."
-            child release ].
+        idx := TabIndexes at: aSymbol ifAbsent: [ nil ].
+        idx isNil ifTrue: [
+            container := (entry at: 3) value.
+            container isNil ifTrue: [ ^self ].
+            item := ((Cocoa classNamed: 'NSTabViewItem') onMain alloc) onMain
+                initWithIdentifier: nil.
+            item onMain setView: container.
+            ContentHost onMain addTabViewItem: item.
+            TabItems add: item.
+            idx := TabItems size - 1.
+            TabIndexes at: aSymbol put: idx ].
+        ContentHost onMain selectTabViewItemAtIndex: idx.
         ActiveView := aSymbol.
-        (entry at: 3) value.
-        "Repaint the whole host region: the outgoing view's stale drawing
-         must not survive under the incoming view's transparent areas."
-        ContentHost onMain setNeedsDisplay: true.
+        (entry at: 4) value.
     ]
 
     "── the Workspace view (CG6: selection-or-everything, inline Print it) ──"
-    CocoaUI class >> activateWorkspaceView [
+    CocoaUI class >> workspaceContainer [
+        "Answer the workspace's root view (the scroll), building lazily —
+         the tab host owns it from first show onward."
         | tvClass frame |
         Workspace isNil ifTrue: [
             tvClass := Cocoa classNamed: 'NSTextView'.
@@ -322,8 +343,7 @@ Object subclass: CocoaUI [
             Workspace onMain setDelegate: WorkspaceTextDelegate.
             self recolorizeWorkspace.
         ].
-        ContentHost onMain addSubview: WorkspaceScroll.
-        Win onMain makeFirstResponder: Workspace.
+        ^WorkspaceScroll
     ]
 
     CocoaUI class >> placeholderText [
@@ -586,6 +606,9 @@ Print it does the same and inserts the result right after it."
             ContentHost isNil ifFalse: [ ContentHost isValid ifTrue: [ ContentHost release ] ].
             Transcript isNil ifFalse: [ Transcript isValid ifTrue: [ Transcript release ] ].
             TranscriptScroll isNil ifFalse: [ TranscriptScroll isValid ifTrue: [ TranscriptScroll release ] ].
+            TabItems isNil ifFalse: [
+                TabItems do: [ :t | t isValid ifTrue: [ t release ] ] ].
+            TabItems := nil. TabIndexes := nil.
             Win isValid ifTrue: [ Win release ].
             Win := nil. Workspace := nil. Toolbar := nil. ContentHost := nil.
             Transcript := nil. TranscriptScroll := nil. ActTarget := nil. ToolbarDelegates := nil.
