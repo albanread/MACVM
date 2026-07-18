@@ -178,6 +178,17 @@ Object subclass: Time [
         nsec := ts signedLongAt: 9.
         ^(sec * 1000) + (nsec // 1000000)
     ]
+    "Run aBlock and answer its wall-clock duration in milliseconds. Deliberately
+     `Smalltalk millisecondClock` (elapsed-since-VM-start, monotonic), NOT
+     `millisecondClockValue` above (real epoch time, above) — a DURATION must
+     never observe a wall-clock adjustment (NTP, DST) as elapsed time; the
+     monotonic clock is the one BenchmarkDashboard already times runs with."
+    Time class >> millisecondsToRun: aBlock [
+        | t0 |
+        t0 := Smalltalk millisecondClock.
+        aBlock value.
+        ^Smalltalk millisecondClock - t0
+    ]
     initSeconds: s [
         seconds := s.
     ]
