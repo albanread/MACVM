@@ -230,7 +230,7 @@ Object subclass: CocoaUI [
          control) wired through its OWN CocoaToolbarAction/macvmAction:
          ticket, and record its activation block for switchToView:."
         | btnClass imgClass img btn holder delegate x |
-        Views add: (Array with: aSymbol with: aBlock).
+        Views add: (Array with: aSymbol with: aTitle with: aBlock).
         btnClass := Cocoa classNamed: 'NSButton'.
         x := 8.0 + (ToolbarButtons size * 98.0).
         btn := (btnClass onMain alloc) onMain
@@ -265,7 +265,7 @@ Object subclass: CocoaUI [
         [ (cur := ContentHost onMain subviews) count > 0 ] whileTrue: [
             (cur objectAtIndex: 0) onMain removeFromSuperview ].
         ActiveView := aSymbol.
-        (entry at: 2) value.
+        (entry at: 3) value.
     ]
 
     "── the Workspace view (CG6: selection-or-everything, inline Print it) ──"
@@ -326,6 +326,74 @@ Print it does the same and inserts the result right after it."
             initWithTitle: 'Workspace' action: nil keyEquivalent: ''.
         wsItem onMain setSubmenu: wsMenu.
         mainMenu onMain addItem: wsItem.
+
+        self installViewMenuOn: mainMenu.
+        self installThemeMenuOn: mainMenu.
+    ]
+
+    CocoaUI class >> installViewMenuOn: mainMenu [
+        "Built FROM the view registry (§ registerViewNamed:...), never hand-
+         maintained — one item per persistent view, sharing the exact
+         macvmAction: mechanism the toolbar's own buttons use (CG5)."
+        | viewMenu viewItem |
+        viewMenu := (Cocoa classNamed: 'NSMenu') onMain alloc onMain init.
+        Views do: [ :e |
+            | sym title item holder delegate |
+            sym := e at: 1. title := e at: 2.
+            item := ((Cocoa classNamed: 'NSMenuItem') onMain alloc) onMain
+                initWithTitle: title action: 'macvmAction:' keyEquivalent: ''.
+            holder := CocoaToolbarAction on: [ self switchToView: sym ].
+            delegate := MacvmDelegate actionTargetOn: holder.
+            item onMain setTarget: delegate.
+            viewMenu onMain addItem: item.
+            ToolbarDelegates add: delegate ].
+        viewItem := ((Cocoa classNamed: 'NSMenuItem') onMain alloc) onMain
+            initWithTitle: 'View' action: nil keyEquivalent: ''.
+        viewItem onMain setSubmenu: viewMenu.
+        mainMenu onMain addItem: viewItem.
+    ]
+
+    CocoaUI class >> installThemeMenuOn: mainMenu [
+        "Minimal theme infrastructure (CG5): an NSAppearance swap on the
+         window. The toolbar's icons are already NSImage TEMPLATE images
+         (isTemplate: true, § registerViewNamed:...), which AppKit tints
+         automatically from the effective appearance — so this alone
+         proves the icon-reuse-across-themes claim holds, with zero new
+         art. Full palette/13-theme parity with the WKWebView GUI's
+         Theme::ALL is deferred (project_gui_themes) — this is the seam."
+        | themeMenu themeItem pairs |
+        themeMenu := (Cocoa classNamed: 'NSMenu') onMain alloc onMain init.
+        pairs := OrderedCollection new.
+        pairs add: (Array with: 'System' with: #system).
+        pairs add: (Array with: 'Light' with: #light).
+        pairs add: (Array with: 'Dark' with: #dark).
+        pairs do: [ :pair |
+            | title sym item holder delegate |
+            title := pair at: 1. sym := pair at: 2.
+            item := ((Cocoa classNamed: 'NSMenuItem') onMain alloc) onMain
+                initWithTitle: title action: 'macvmAction:' keyEquivalent: ''.
+            holder := CocoaToolbarAction on: [ self applyTheme: sym ].
+            delegate := MacvmDelegate actionTargetOn: holder.
+            item onMain setTarget: delegate.
+            themeMenu onMain addItem: item.
+            ToolbarDelegates add: delegate ].
+        themeItem := ((Cocoa classNamed: 'NSMenuItem') onMain alloc) onMain
+            initWithTitle: 'Theme' action: nil keyEquivalent: ''.
+        themeItem onMain setSubmenu: themeMenu.
+        mainMenu onMain addItem: themeItem.
+    ]
+
+    CocoaUI class >> applyTheme: aSymbol [
+        "#system reverts to following the OS appearance (setAppearance:
+         nil); #light/#dark force NSAppearanceNameAqua/DarkAqua."
+        | name appearance |
+        aSymbol == #system ifTrue: [ Win onMain setAppearance: nil. ^self ].
+        aSymbol == #light ifTrue: [ name := 'NSAppearanceNameAqua' ].
+        aSymbol == #dark ifTrue: [ name := 'NSAppearanceNameDarkAqua' ].
+        name isNil ifTrue: [ ^self ].
+        appearance := (Cocoa classNamed: 'NSAppearance') onMain
+            appearanceNamed: (Cocoa nsString: name).
+        Win onMain setAppearance: appearance.
     ]
 
     "── C6 action-target callbacks (dispatched synchronously on main) ──"
