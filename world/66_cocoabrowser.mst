@@ -613,7 +613,11 @@ Object subclass: CocoaBrowser [
         btn := ((Cocoa classNamed: 'NSButton') onMain alloc) onMain initWithFrame: rect.
         btn onMain setTitle: title.
         btn onMain setBezelStyle: 1. "rounded"
-        btn onMain setAutoresizingMask: CocoaUI maskMinYMargin. "pin to BOTTOM row"
+        "Pin to the pane's BOTTOM row: maskMaxYMargin = flexible space ABOVE
+         (unflipped coords). MinYMargin here was the CG8 button-float bug —
+         top-pinned buttons drifted INTO the list rows on any pane taller
+         than its build-time frame."
+        btn onMain setAutoresizingMask: CocoaUI maskMaxYMargin.
         holder := CocoaToolbarAction on: aBlock.
         delegate := MacvmDelegate actionTargetOn: holder.
         btn onMain setTarget: delegate.
@@ -702,7 +706,8 @@ Object subclass: CocoaBrowser [
         AddVarField := ((Cocoa classNamed: 'NSTextField') onMain alloc) onMain
             initWithFrame: (Array with: 4.0 with: 4.0 with: w - 8.0 with: 22.0).
         AddVarField onMain setPlaceholderString: '+ add variable (Enter)'.
-        AddVarField onMain setAutoresizingMask: CocoaUI maskWidthSizable + CocoaUI maskMinYMargin.
+        "Bottom-pinned (MaxYMargin) — same fix as the button rows."
+        AddVarField onMain setAutoresizingMask: CocoaUI maskWidthSizable + CocoaUI maskMaxYMargin.
         self wireAction: AddVarField to: [ self addVarEntered ].
         MiddlePane onMain addSubview: AddVarField.
     ]
