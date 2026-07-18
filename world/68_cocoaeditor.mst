@@ -1,0 +1,196 @@
+"68_cocoaeditor.mst — CocoaEditor: the native class text editor view (the web
+ GUI's `texteditor`, as a Cocoa tab). Loaded ONLY via world/cocoaui.list, after
+ 66_cocoabrowser.mst (it reuses the browser's `hostService` handle for image
+ access) — so the CLI, the WKWebView GUI, and the base tests carry none of it.
+
+ The picker is an NSComboBox over every class in the image (the native analog
+ of the web editor's `<datalist>`: type-ahead complete OR pick from the list),
+ whose action loads that class's WHOLE-CLASS `.mst` text — image_store's
+ `class_source`, host-served read-only, the same idempotent round-trip text the
+ web editor shows (docs/editor_design.md §5).
+
+ SLICE STATUS — E1: the tab + picker + read-only source. The buffer is a plain
+ read-only NSTextView here. E2 turns it into a dumb terminal onto an editor
+ VMapp — a worker VM the PRIMARY spawns (Worker spawn:) to run `EditorSession`
+ (the rope buffer), driven over the uiReq relay (docs/editor_design.md M5). The
+ model (Rope/TextBuffer/EditorSession, world/60_editor.mst) is shared verbatim
+ with the web GUI; only the DRIVER differs, so nothing here touches the web
+ GUI's own editor path."
+
+Object subclass: CocoaEditor [
+    <classVars: Container Picker Buffer BufferScroll ActionDelegates>
+
+    CocoaEditor class >> stripHeight [ ^36.0 ]
+
+    CocoaEditor class >> register [
+        "Self-registration, resolved by name from `CocoaUI startup` — remove the
+         cocoaui.list line and the shell simply has no Editor tab."
+        CocoaUI registerViewNamed: #editor title: 'Editor' icon: 'blankSheet'
+                container: [ self containerView ]
+                onShow: [ self refreshClassNames.
+                          CocoaUI window onMain makeFirstResponder: Picker ]
+    ]
+    CocoaEditor class >> containerView [
+        Container isNil ifTrue: [ self buildView ].
+        ^Container
+    ]
+
+    "── build ──"
+    CocoaEditor class >> buildView [
+        | host frame w h |
+        host := CocoaUI contentHost.
+        frame := host onMain frame.
+        w := frame at: 3. h := frame at: 4.
+        ActionDelegates := OrderedCollection new.
+        Container := ((Cocoa classNamed: 'NSView') onMain alloc) onMain
+            initWithFrame: (Array with: 0.0 with: 0.0 with: w with: h).
+        Container onMain setAutoresizingMask: CocoaUI maskWidthSizable + CocoaUI maskHeightSizable.
+        Container onMain setAutoresizesSubviews: true.
+
+        "── the picker strip (top): an NSComboBox over every class + Load ──"
+        Picker := ((Cocoa classNamed: 'NSComboBox') onMain alloc) onMain
+            initWithFrame: (Array with: 6.0 with: h - 30.0 with: w - 118.0 with: 24.0).
+        Picker onMain setCompletes: true.
+        Picker onMain setNumberOfVisibleItems: 16.
+        Picker onMain setPlaceholderString: 'class name, e.g. Mandelbrot'.
+        Picker onMain setAutoresizingMask: CocoaUI maskWidthSizable + CocoaUI maskMinYMargin.
+        "The combo's action fires on Enter in the field AND on a dropdown pick."
+        self wireAction: Picker to: [ self loadPicked ].
+        Container onMain addSubview: Picker.
+
+        self stripButton: 'Load'
+            frame: (Array with: w - 106.0 with: h - 31.0 with: 100.0 with: 26.0)
+            action: [ self loadPicked ].
+
+        "── the buffer (below the strip): scroll-wrapped, NEVER a bare NSTextView
+           (a bare one draws past its frame and bleeds through the next tab —
+           the CG7 'mess'). Read-only in E1. ──"
+        BufferScroll := ((Cocoa classNamed: 'NSScrollView') onMain alloc) onMain
+            initWithFrame: (Array with: 0.0 with: 0.0 with: w with: h - self stripHeight).
+        BufferScroll onMain setHasVerticalScroller: true.
+        BufferScroll onMain setHasHorizontalScroller: true.
+        BufferScroll onMain setAutoresizingMask: CocoaUI maskWidthSizable + CocoaUI maskHeightSizable.
+        Buffer := ((Cocoa classNamed: 'NSTextView') onMain alloc) onMain
+            initWithFrame: (Array with: 0.0 with: 0.0 with: w with: h - self stripHeight).
+        Buffer onMain setEditable: false.
+        Buffer onMain setAutomaticQuoteSubstitutionEnabled: false.
+        Buffer onMain setFont: ((Cocoa classNamed: 'NSFont') onMain userFixedPitchFontOfSize: 12.0).
+        Buffer onMain setVerticallyResizable: true.
+        Buffer onMain setHorizontallyResizable: false.
+        Buffer onMain setString: self placeholder.
+        (Buffer onMain textContainer) ifNotNil: [ :tc | tc onMain setWidthTracksTextView: true. tc release ].
+        BufferScroll onMain setDocumentView: Buffer.
+        Container onMain addSubview: BufferScroll.
+
+        self refreshClassNames.
+    ]
+
+    CocoaEditor class >> placeholder [
+        ^'"Pick a class above (type-ahead or the dropdown), then Load — or press
+Enter in the field — to read its whole-class source here."'
+    ]
+
+    CocoaEditor class >> stripButton: title frame: rect action: aBlock [
+        | btn holder delegate |
+        btn := ((Cocoa classNamed: 'NSButton') onMain alloc) onMain initWithFrame: rect.
+        btn onMain setTitle: title.
+        btn onMain setBezelStyle: 1.
+        btn onMain setAutoresizingMask: CocoaUI maskMinXMargin + CocoaUI maskMinYMargin.
+        holder := CocoaToolbarAction on: aBlock.
+        delegate := MacvmDelegate actionTargetOn: holder.
+        btn onMain setTarget: delegate.
+        btn onMain setAction: 'macvmAction:'.
+        ActionDelegates add: delegate.
+        Container onMain addSubview: btn.
+        ^btn
+    ]
+    CocoaEditor class >> wireAction: aControl to: aBlock [
+        | holder delegate |
+        holder := CocoaToolbarAction on: aBlock.
+        delegate := MacvmDelegate actionTargetOn: holder.
+        aControl onMain setTarget: delegate.
+        aControl onMain setAction: 'macvmAction:'.
+        ActionDelegates add: delegate.
+    ]
+
+    "── the picker options: every class in the image (host-served) ──"
+    CocoaEditor class >> refreshClassNames [
+        "`readReply:` copies the NSString reply out to a Smalltalk String AND
+         releases its +1 wrapper (the browser's leak discipline) — the host IMPs
+         answer NSStrings, never Smalltalk Strings."
+        | reply names |
+        Picker isNil ifTrue: [ ^self ].
+        reply := CocoaBrowser readReply: (CocoaBrowser hostService onMain classNames).
+        names := self splitLines: reply.
+        Picker onMain removeAllItems.
+        names do: [ :n | n isEmpty ifFalse: [ Picker onMain addItemWithObjectValue: n ] ].
+    ]
+    CocoaEditor class >> splitLines: aString [
+        "Split on LF into a collection of non-empty lines (the host joins the
+         class names with newlines, same as the find queries)."
+        | lines line lf |
+        lines := OrderedCollection new. line := ''. lf := Character value: 10.
+        aString do: [ :ch |
+            ch = lf ifTrue: [ line isEmpty ifFalse: [ lines add: line ]. line := '' ]
+                    ifFalse: [ line := line , (String with: ch) ] ].
+        line isEmpty ifFalse: [ lines add: line ].
+        ^lines
+    ]
+
+    "── load: fetch the picked class's whole-class source (host-served) ──"
+    CocoaEditor class >> loadPicked [
+        "Reuse the browser's own class-source fetch (readReply: conversion +
+         wrapper release) — the same whole-class round-trip text it shows."
+        | name src |
+        Picker isNil ifTrue: [ ^self ].
+        name := Picker sendString: 'stringValue'.
+        (name isNil or: [ name isEmpty ]) ifTrue: [ ^self ].
+        src := CocoaBrowser hostClassSource: name.
+        (src isNil or: [ src isEmpty ])
+            ifTrue: [ Buffer onMain setString: '"No class named ', name, ' in the image."' ]
+            ifFalse: [ Buffer onMain setString: src. self recolorize ].
+    ]
+
+    CocoaEditor class >> recolorize [
+        "Same host-side colorizer the browser's source pane and the Workspace
+         use (attribute-only, so it never disturbs the text or the caret)."
+        | ts |
+        Buffer isNil ifTrue: [ ^self ].
+        ts := Buffer onMain textStorage.
+        ts isNil ifTrue: [ ^self ].
+        CocoaBrowser hostService onMain colorizeStorage: ts.
+        ts release.
+    ]
+
+    "── scripting/automation (rusttcl `gui doit`), so I can drive + snapshot ──"
+    CocoaEditor class >> typeClass: aString [
+        Picker isNil ifFalse: [ Picker onMain setStringValue: aString ]
+    ]
+    CocoaEditor class >> load [ ^self loadPicked ]
+    CocoaEditor class >> bufferText [
+        Buffer isNil ifTrue: [ ^'' ].
+        ^Buffer sendString: 'string'
+    ]
+    CocoaEditor class >> classNameCount [
+        Picker isNil ifTrue: [ ^0 ].
+        ^Picker onMain numberOfItems
+    ]
+
+    CocoaEditor class >> environmentRestarted [
+        "The primary respawned (CG4 §5.1) — its image is unchanged, so just
+         refresh the picker against the fresh primary. (E2's live VMapp handle,
+         if any, is abandoned by the supervisor's abandonPending.)"
+        self refreshClassNames.
+    ]
+
+    CocoaEditor class >> teardown [
+        ActionDelegates isNil ifFalse: [
+            ActionDelegates do: [ :d | d isValid ifTrue: [ d release ] ] ].
+        CocoaBrowser releaseView: Buffer.
+        CocoaBrowser releaseView: BufferScroll.
+        CocoaBrowser releaseView: Picker.
+        CocoaBrowser releaseView: Container.
+        ActionDelegates := nil. Buffer := nil. BufferScroll := nil.
+        Picker := nil. Container := nil.
+    ]
+]

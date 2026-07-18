@@ -19,3 +19,7 @@
 # shell simply has no Browser entry.
 66_cocoabrowser.mst
 67_cocoafind.mst
+# CocoaEditor (the class text editor tab) also self-registers by name; E1 is
+# read-only (host-served class source), E2 makes it a dumb terminal onto a
+# primary-spawned editor VMapp (docs/editor_design.md M5).
+68_cocoaeditor.mst

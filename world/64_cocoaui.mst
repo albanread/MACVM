@@ -105,6 +105,7 @@ Object subclass: CocoaUI [
          so this file never depends on files after it in cocoaui.list."
         (Worker classNamed: #CocoaBrowser) ifNotNil: [ :bc | bc register ].
         (Worker classNamed: #CocoaFind) ifNotNil: [ :fc | fc register ].
+        (Worker classNamed: #CocoaEditor) ifNotNil: [ :ec | ec register ].
 
         "Forwarded primary transcript lines (§7.4) append to our Transcript view."
         Worker onTranscriptLine: [ :t | CocoaUI appendTranscript: t ].
@@ -659,6 +660,7 @@ Print it does the same and inserts the result right after it."
         self appendTranscript: '— environment restarted (primary respawned) —'.
         "Snapshot views re-sync against the FRESH primary (CG7)."
         (Worker classNamed: #CocoaBrowser) ifNotNil: [ :bc | bc environmentRestarted ].
+        (Worker classNamed: #CocoaEditor) ifNotNil: [ :ec | ec environmentRestarted ].
     ]
 
     CocoaUI class >> teardown [
@@ -668,6 +670,7 @@ Print it does the same and inserts the result right after it."
             Win onMain orderOut: nil.
             (Worker classNamed: #CocoaBrowser) ifNotNil: [ :bc | bc teardown ].
             (Worker classNamed: #CocoaFind) ifNotNil: [ :fc | fc teardown ].
+            (Worker classNamed: #CocoaEditor) ifNotNil: [ :ec | ec teardown ].
             ActTarget isNil ifFalse: [ ActTarget isValid ifTrue: [ ActTarget release ] ].
             ToolbarDelegates isNil ifFalse: [
                 ToolbarDelegates do: [ :d | d isValid ifTrue: [ d release ] ] ].

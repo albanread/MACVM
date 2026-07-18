@@ -110,6 +110,18 @@ extern "C" fn imp_class_source_for(
     objc::nsstring(&text)
 }
 
+/// `classNames` — every class name in the image, newline-joined (the editor's
+/// picker options — the Cocoa analog of the web editor's `<datalist>` fed by
+/// `Image::class_names`). Read-only image open, same as every other fetch here.
+extern "C" fn imp_class_names(_this: *mut c_void, _cmd: *mut c_void) -> Id {
+    let text = Image::open_read_only(&image_path())
+        .ok()
+        .and_then(|img| img.class_names().ok())
+        .map(|names| names.join("\n"))
+        .unwrap_or_default();
+    objc::nsstring(&text)
+}
+
 /// `classShellFor:` — "superclass␟instanceVars␟classVars" from the image
 /// (empty string when the class isn't stored). The browser's variables pane
 /// reads THIS (the image), not the live snapshot — the web's own split: a
@@ -366,8 +378,9 @@ pub fn register() {
     type Imp0 = extern "C" fn(*mut c_void, *mut c_void) -> Id;
     type Imp1 = extern "C" fn(*mut c_void, *mut c_void, Id) -> Id;
     type Imp3 = extern "C" fn(*mut c_void, *mut c_void, Id, Id, Id) -> Id;
-    let methods: [(&str, *const c_void, &str); 14] = [
+    let methods: [(&str, *const c_void, &str); 15] = [
         ("requestUiRebuild", imp_request_ui_rebuild as Imp0 as *const c_void, "@@:"),
+        ("classNames", imp_class_names as Imp0 as *const c_void, "@@:"),
         ("launchDemo:", imp_launch_demo as Imp1 as *const c_void, "@@:@"),
         ("colorizeStorage:", imp_colorize_storage as Imp1 as *const c_void, "@@:@"),
         ("implementorsOf:", imp_implementors_of as Imp1 as *const c_void, "@@:@"),
