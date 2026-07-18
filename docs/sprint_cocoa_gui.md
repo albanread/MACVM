@@ -105,7 +105,7 @@ rest. ⌘Q quits clean.
 **Deliverables.**
 - **The `cocoa_gui` workspace crate** + the `macvm-cocoa` bin; `objc::
   bootstrap()` factored out of the `gui` crate so both call it. (Inherits
-  the GamePane path-deps for later — CG8 — but no GamePane yet.)
+  the GamePane path-deps for later — CG10 — but no GamePane yet.)
 - **The parked-main boot handshake** (§3): main bootstraps AppKit, spawns
   the primary on the watchdog thread, parks; the primary boots the world,
   registers the UI worker (CG1) and signals ready; main boots the UI worker
@@ -172,7 +172,7 @@ VM entry, with Layer-1 recovery.
   such path exists in CG3, but rather than rely on the assumption, a thread-local
   `callback_active` flag makes a re-entrant callback fail **closed** (shape
   default) BEFORE the trampoline re-borrows the `VmHandle`. This is what keeps
-  the door sound as CG5 introduces the first nesting paths.
+  the door sound as CG7 introduces the first nesting paths.
 
 **Acceptance gate (headless, proxied — no display needed).** A registered
 `MacvmTableSource` bound to a Smalltalk object answers
@@ -250,7 +250,136 @@ while a live primary is never respawned on time alone.**
 
 ---
 
-## CG5 — ClassBrowser: names-only snapshots + outline handles (design G3) `M`
+## CG5 — Native app shell: toolbar, metrics, theming, view switcher (design G2b) `M`
+
+**Goal.** CG4 proved the window works; nothing built after it has anywhere to
+live. Every later view (ClassBrowser, CodeView, Outliner) needs a shell that
+already knows how to host a swappable content view, show a real menu, and
+carry the toolbar/metrics/theme chrome — so build the shell BEFORE the views,
+not implicitly alongside the first one. Layout (user-specified): a toolbar at
+the top, the current view in the middle, a small reverse-chronological
+Transcript dock at the bottom, and a real macOS menu bar.
+
+**Deliverables.**
+- **A real menu bar** — beyond CG2's bare Quit item: an App menu (About/
+  Preferences stub/Quit), a **View menu** listing every registered persistent
+  view (Workspace now; Browser/Editor/Outliner land as CG6+ register
+  themselves — the menu is built FROM the registry, never hand-maintained),
+  and the existing Workspace submenu (Do it/Print it) folded in as a
+  per-view menu contribution (§ design below).
+- **The view-switcher content host** — a Rust-side `ViewRegistry` (name →
+  `{activate, deactivate, menuContribution}` triple) and ONE `NSView`
+  container in the window's middle region that swaps its single subview on
+  switch. `CocoaUI` keeps owning the window/toolbar/transcript; each
+  registered view owns only its own content `NSView` + Smalltalk-side
+  controller — the same "dual placement, not migration" split the WKWebView
+  GUI's view models already follow (`feedback_dual_placement_not_migration`).
+  Workspace becomes the first (and initially only) registered view, migrated
+  onto this host unchanged in behavior.
+- **The toolbar** — a custom `NSView` strip (not `NSToolbar`; its fixed
+  macOS-native chrome doesn't fit a themeable, icon-driven design), left
+  side = view-switcher buttons (icons below), right side = the live metrics
+  readout.
+  - **Icons, reused not forked**: the SAME `gui/assets/icons-mono/*.svg`
+    files the web GUI already ships, loaded as `NSImage(contentsOfFile:)`
+    with `isTemplate = true` — AppKit's template-image mechanism IS the
+    native equivalent of the web toolbar's "currentColor mask" trick
+    (`project_gui_themes`): one glyph asset, tinted per-theme via
+    `contentTintColor`, zero duplicate art.
+  - **Metrics, reused not reinvented**: `src/embed.rs`'s existing
+    `VmMetrics`/`VmHandle::metrics()` (the same struct the web GUI's
+    toolbar already polls, `gui/src/main.rs::metrics_on_snapshot`) —
+    sampled straight off the PRIMARY's own `VmHandle`, inside
+    `supervisor.rs`'s existing `primary_generation_main` beat (already
+    running every 250ms on the primary's own thread — a free, in-process,
+    zero-new-protocol read), published to a shared cell
+    `PrimarySupervisor::metrics()` reads cross-thread. A ~1s `NSTimer`
+    on main renders it into the toolbar's readout (heap used/cap, nmethods,
+    alloc rate, scavenges/full GCs — the same fields, same semantics as the
+    web toolbar's MEM/JIT/CODE/ALLOC/GC row).
+- **Theme infrastructure** — a `CocoaTheme` value (background/text/accent
+  `NSColor`s + a monospace font choice), a `Theme` menu, and NSAppearance
+  wiring so System/Light/Dark at minimum work end to end (System driven by
+  `NSApp.effectiveAppearance`, Light/Dark forced). This is infrastructure
+  for the eventual 13-theme parity with `Theme::ALL`
+  (`project_gui_themes`) — NOT full parity in this sprint: the web GUI's
+  pixel-art/CRT-scanline themes are CSS-rendering tricks with no direct
+  AppKit-control equivalent, and are explicitly deferred, not blocking.
+  Every icon send must go through the tint color so a theme swap repaints
+  the toolbar with zero new art (proving the reuse actually holds).
+- **The Transcript, corrected**: CG4 built it append-at-bottom, full-height,
+  as the primary output surface — wrong on both counts once Workspace
+  Print It exists (results insert inline in the Workspace, per CG6 below).
+  Re-dock it as a SMALL, fixed-height strip at the window bottom, newest
+  line FIRST (reverse chronological) — a log to glance at, not read top to
+  bottom.
+
+**Acceptance gate.** *On-screen (user):* the toolbar shows live, moving
+metrics while a Workspace doit runs; the View menu (currently one item)
+switches content correctly; the Theme menu changes toolbar icon tint +
+window colors; the Transcript is small, newest-first, and doesn't crowd the
+Workspace. *Headless:* `ViewRegistry` register/switch/menu-build is a pure
+Rust unit test; `PrimarySupervisor::metrics()` returns a real `VmMetrics`
+sampled from a live primary in the existing supervisor test harness; a
+`MACVM_COCOA_SNAP` sequence (this sprint's own build-verification tool —
+`cocoa_gui/src/snapshot.rs`, `objc::snapshot_client_area`) captures real
+on-screen PNGs proving the shell renders before any human looks at it.
+
+**Design ref:** §7.4 (Transcript), §11 Q4/R9 (Workspace text is local — the
+view host doesn't change that), `project_gui_themes`, `project_metrics_dashboard`.
+
+---
+
+## CG6 — Workspace, properly: selection eval + inline Print it (design G2c) `S`
+
+**Goal.** CG4's Workspace evaluates its ENTIRE fixed buffer on every Do it —
+a canned demo, not an editable scratch buffer. Match the WKWebView GUI's
+`workspace_render.rs`/`smtk.js` convention exactly (same product, second
+renderer — `feedback_dual_placement_not_migration`): Do it/Print it act on
+the current TEXT SELECTION, or the whole buffer if nothing's selected;
+Print it additionally inserts the result INLINE right after the evaluated
+text, at the exact point Print it was invoked (not appended at buffer end).
+
+**Deliverables.**
+- **Selection-aware `shipDoit`** — read the `NSTextView`'s
+  `selectedRange` (a plain `NSRange`, two `NSUInteger`s — no HFA/struct-by-
+  value AppKit pitfall the CG4-fixed autorelease/CG5-fixed-snapshot work
+  already hit; verify the marshalling path chosen doesn't reopen it) instead
+  of always `workspaceText`; empty selection falls back to the full buffer,
+  matching `workspaceEvalTarget()`'s exact selection-or-everything rule.
+- **Print it's own round trip** — mirrors the web GUI's split (`doit` vs
+  `workspacePrintIt`, `gui/src/vm_host.rs`'s two request kinds): Do it
+  discards the result (side-effect only, as today); Print it captures the
+  insertion point at invocation time (a selection can move before the async
+  `#uiReply` lands — the web GUI's `pendingPrintInsertAt` capture-at-click
+  discipline, ported verbatim) and splices the result text in on reply.
+- **Starter content** — replace the fixed `'3 + 4'` buffer with the SAME
+  placeholder comment + example the web GUI opens with
+  (`workspace_render.rs::PLACEHOLDER_TEXT`) — one buffer, one voice, across
+  both renderers.
+- **A stateful demo worth testing** — the acceptance gate below exercises a
+  primary-persists-state proof (a counter), not a single fixed expression;
+  this is the sprint's actual point per the standing request ("this is a
+  mini demo not a workspace... create something actually worth testing").
+
+**Acceptance gate.** *On-screen (user):* type `Counter := 0.` Do it; type
+`Counter := Counter + 1. Counter` and Print it repeatedly — the printed
+value climbs each time, proving the primary is a persistent, stateful VM,
+not a fixed-expression demo; selecting a sub-expression and Print it inserts
+the result at the selection, not the buffer end; a `MACVM_COCOA_SNAP`
+sequence captures the climbing counter on screen. *Headless:* a selection-
+range round-trip test (select a substring, Do it, confirm only the
+substring reached the primary); a Print it round trip confirms the result
+splices at the captured insertion point even when the selection moved
+before the reply arrived (the async-race case `pendingPrintInsertAt` exists
+for).
+
+**Design ref:** §11 Q4/R9, the web GUI's `workspace_render.rs`/`smtk.js`
+(§4 "Workspace" section) as the pinned reference behavior.
+
+---
+
+## CG7 — ClassBrowser: names-only snapshots + outline handles (design G3) `M`
 
 **Goal.** The classic Smalltalk browser, native — an `NSOutlineView`
 data-sourced from a snapshot that projects **names, not oops**.
@@ -281,7 +410,7 @@ crossed).
 
 ---
 
-## CG6 — CodeView editing + Find views (design G4, part 1) `M`
+## CG8 — CodeView editing + Find views (design G4, part 1) `M`
 
 **Goal.** Edit a method natively and save it; the find tools as tables.
 
@@ -306,7 +435,7 @@ lists the same implementors/senders the web model does.
 
 ---
 
-## CG7 — UI-worker restart-in-place (design G4, part 2) `M`
+## CG9 — UI-worker restart-in-place (design G4, part 2) `M`
 
 **Goal.** An AppKit-internal fault rebuilds the GUI in place, cleanly —
 proving the Layer-2/3 recovery the design's crash story rests on.
@@ -338,7 +467,7 @@ reboots; the backstop trips after N/T.
 
 ---
 
-## CG8 — Worker bracket + GamePane drive + tracking-safe drain (design G5) `M`
+## CG10 — Worker bracket + GamePane drive + tracking-safe drain (design G5) `M`
 
 **Goal.** The payoff: the UI stays live while heavy work runs elsewhere, a
 native GamePane window, and a drain that survives menu tracking.
@@ -374,30 +503,39 @@ CG0 (alt-stacks, ExitProcess)  ─┐
 CG1 (hosted worker, wake, load_list) ─┴─► CG2 (crate, boot, window)
                                             └─► CG3 (C6 delegates)
                                                   └─► CG4 (protocol, workspace, restart-primary)
-                                                        ├─► CG5 (browser)
-                                                        │     └─► CG6 (codeview, find)
-                                                        └─► CG7 (restart-UI-in-place)   [needs CG3 registry + CG2 boot]
-                                                              └─► CG8 (workers, gamepane, drain)
+                                                        └─► CG5 (app shell: toolbar, metrics, theme, view switcher)
+                                                              ├─► CG6 (workspace, properly: selection + inline print it)
+                                                              ├─► CG7 (browser)
+                                                              │     └─► CG8 (codeview, find)
+                                                              └─► CG9 (restart-UI-in-place)   [needs CG3 registry + CG2 boot]
+                                                                    └─► CG10 (workers, gamepane, drain)
 ```
 
 - **CG0 + CG1 are core-only** and land before any AppKit code — they are
   soundness/infra that also strengthen the existing worker + WKWebView modes.
 - **CG2 + CG3** hold the real design risk (top-level-entry dispatch, the boot
   handshake, reverse dispatch). Get them right and CG4+ are mapping work.
-- **CG7** (UI restart) can follow CG3+CG2 independently of CG5/CG6; schedule
-  it early if crash resilience matters more than the browser.
+- **CG5 (app shell) gates every later view** — CG6–CG10 all need somewhere
+  to live; it is deliberately inserted before the browser, not built
+  implicitly alongside it (the gap this revision closes).
+- **CG9** (UI restart) can follow CG3+CG2 independently of CG5–CG8; schedule
+  it early if crash resilience matters more than the views.
 - The track is **parallel to the core**; no CG gate blocks a core sprint,
   and no core stress gate needs the Cocoa GUI.
 
 ## Standing rules (inherited)
 
 - **On-screen is the user's; headless gates are mandatory** — every sprint's
-  machine-checkable seam has a test that runs without a display.
+  machine-checkable seam has a test that runs without a display. CG5+ also
+  has `MACVM_COCOA_SNAP` (`cocoa_gui/src/snapshot.rs`): a timestamped PNG
+  sequence of the real running app, captured from Rust via
+  `CGWindowListCreateImage` — self-verification before a human looks,
+  not a substitute for the user's own on-screen check.
 - **Commit to main, often, all of it** (`feedback_commit_to_main_often`);
   each CG lands green and alone.
 - **Stress/soak in RELEASE + PARALLEL** where a recovery/GC seam is touched
-  (CG0, CG7 especially) — `feedback_parallel_release_stress`.
-- **Adversarial review before the big commits** (CG3, CG7) — the design
+  (CG0, CG9 especially) — `feedback_parallel_release_stress`.
+- **Adversarial review before the big commits** (CG3, CG9) — the design
   itself was shaped by two; the recovery and reverse-dispatch code deserve
   the same.
 - **Dual placement, not migration** (`feedback_dual_placement_not_migration`):

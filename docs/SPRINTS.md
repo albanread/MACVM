@@ -293,16 +293,20 @@ gate blocks a core sprint.
 | CG2 crate + boot + window (G0) | `M` | CG0, CG1, bridge C0–C5 | parked-main boot completes; one Smalltalk-built `NSWindow`; `[NSApp run]` from Rust; ⌘Q clean; main-thread guard rejects a background-VM AppKit send |
 | CG3 C6 reverse dispatch (G1) | `L` | CG2, `perform:withArguments:` | a `MacvmTableSource` answers `numberOfRowsInTableView:` with a real int; a raising delegate returns the shape default + next call dispatches; a forced SIGSEGV in a callback recovers |
 | CG4 protocol + workspace + primary-restart (G2) | `L` | CG3 | `#uiReq`/`#uiReply` round-trip; `(peer,corr)` non-collision; primary death → respawn → re-sync; ⌘P → `7` |
-| CG5 ClassBrowser (G3) | `M` | CG4 | outline data-source answers the same rows the `htmlFragment` model does (differential); snapshot pickles clean (no class oop) |
-| CG6 CodeView + Find (G4a) | `M` | CG5, W4 accept path | a `#saveMethod` round-trips through `image_store` byte-identically to the web path |
-| CG7 UI restart-in-place (G4b) | `M` | CG3, CG2 | a scripted foreign fault Drops the old handle (no reservation / PROBE-registry leak across many restarts) + reboots; N/T backstop trips |
-| CG8 worker bracket + GamePane + drain (G5) | `M` | CG4; GamePane render | `do:then:` round-trip; default-mode drain not delivered in a nested mode; UI live during a parallel dive |
+| CG5 app shell: toolbar, metrics, theme, view switcher (G2b) | `M` | CG4 | `ViewRegistry` register/switch/menu-build (pure unit test); `PrimarySupervisor::metrics()` returns real `VmMetrics` from a live primary; `MACVM_COCOA_SNAP` captures real on-screen PNGs |
+| CG6 Workspace, properly: selection + inline print it (G2c) | `S` | CG5 | selection-range round-trip (only the selected substring reaches the primary); Print it splices at the captured insertion point even if the selection moved before the reply |
+| CG7 ClassBrowser (G3) | `M` | CG6 | outline data-source answers the same rows the `htmlFragment` model does (differential); snapshot pickles clean (no class oop) |
+| CG8 CodeView + Find (G4a) | `M` | CG7, W4 accept path | a `#saveMethod` round-trips through `image_store` byte-identically to the web path |
+| CG9 UI restart-in-place (G4b) | `M` | CG3, CG2 | a scripted foreign fault Drops the old handle (no reservation / PROBE-registry leak across many restarts) + reboots; N/T backstop trips |
+| CG10 worker bracket + GamePane + drain (G5) | `M` | CG5; GamePane render | `do:then:` round-trip; default-mode drain not delivered in a nested mode; UI live during a parallel dive |
 
 Sequencing: **CG0 + CG1 are core-only** (soundness + infra; land before any
 AppKit code). **CG2 + CG3** hold the real risk (top-level-entry callback
 dispatch, the boot handshake, reverse dispatch); CG4+ are mapping over a
-proven base. CG7 can follow CG2+CG3 independently of the browser if crash
-resilience is the priority.
+proven base. **CG5 (app shell) gates CG6–CG10** — every later view needs
+somewhere to live, so it lands before the browser rather than implicitly
+alongside it. CG9 can follow CG2+CG3 independently of the shell/views if
+crash resilience is the priority.
 
 ## Phase W — world track (library + apps, parallel after S6)
 
