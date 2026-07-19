@@ -82,14 +82,23 @@ fn format_bytes(n: u64) -> String {
 /// tick, not a new NSTimer.
 fn refresh_metrics(st: &mut DrainState) {
     let m = st.supervisor.metrics();
-    // `old_committed` (the actually-mapped, currently-usable portion), NOT
-    // `old_reserved` (the full virtual-address reservation upfront for
-    // growth-without-remap — often gigabytes even on a small idle VM, whose
-    // formatted string overflowed the toolbar label and got clipped).
+    // `old_reserved` (the full virtual-address reservation `heap_mib`
+    // configures — `boot::vm_options()` bounds it to 512 MiB by default for
+    // both cocoa_gui VMs) — NOT `old_committed` (the actually-mapped,
+    // currently-usable portion, which starts at OLD_INITIAL_SEGMENT = 16 MiB
+    // and only grows on demand under GC pressure). `old_committed` reads as
+    // "the VM can only ever use 20 MiB" — misleadingly small; the primary's
+    // real ceiling is the 512 MiB reservation. An EARLIER version of this
+    // line used `old_reserved` too and reverted to `old_committed` because,
+    // on the library's OWN unconfigured default (`VmOptions::
+    // DEFAULT_HEAP_MIB` = 8192 MiB), the formatted string overflowed the
+    // fixed-width MEM cell — that risk doesn't apply here, since cocoa_gui's
+    // own boot path always bounds heap_mib to a small, known value (512,
+    // or whatever `MACVM_HEAP` deliberately overrides it to).
     let mem = format!(
         "{}/{}",
         format_bytes(m.eden_used + m.old_used),
-        format_bytes(m.eden_capacity + m.old_committed)
+        format_bytes(m.eden_capacity + m.old_reserved)
     );
     let jit = if m.compilations == 0 {
         "—".to_string()
@@ -107,7 +116,10 @@ fn refresh_metrics(st: &mut DrainState) {
     };
     st.prev_alloc = Some(m.bytes_allocated);
     let gc = format!("{}·{}", m.scavenges, m.full_gcs);
-    let cap = (m.eden_capacity + m.old_committed).max(1);
+    // Same denominator as `mem` above (`old_reserved`, not `old_committed`)
+    // — otherwise the usage bar's own fill fraction wouldn't match what the
+    // text label right above it says.
+    let cap = (m.eden_capacity + m.old_reserved).max(1);
     let used = m.eden_used + m.old_used;
     let mem_pct = ((used as f64 / cap as f64) * 100.0).round().clamp(0.0, 100.0) as i64;
 

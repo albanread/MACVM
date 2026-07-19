@@ -244,6 +244,8 @@ Object subclass: CocoaUI [
     ]
 
     "── the view registry ──"
+    CocoaUI class >> toolbarButtonWidth [ ^36.0 ]
+    CocoaUI class >> toolbarButtonStep [ ^40.0 ]
     CocoaUI class >> registerViewNamed: aSymbol title: aTitle icon: iconBaseName container: containerBlock onShow: onShowBlock [
         "Add a persistent view: mint its toolbar button (icon, falling back to
          a text title if the image fails to load — never an invisible
@@ -251,13 +253,25 @@ Object subclass: CocoaUI [
          ticket. `containerBlock` answers the view's root NSView (building
          lazily on first show — it becomes the tab item's view, owned by the
          NSTabView from then on); `onShowBlock` runs on every switch TO the
-         view (refresh requests, first responder)."
+         view (refresh requests, first responder).
+
+         Button width/step are sized for the ICON-ONLY case (every current
+         icon loads, so that's the case that actually renders): 92px-wide,
+         98px-apart buttons were sized for the OLD fallback text titles
+         ('Workspace', 'Outliner', ...) and left large gaps between icon
+         glyphs once every icon started loading — user report: 'the icons
+         should be placed together... without lots of space between them
+         ... crash into the metrics on smaller windows'. A fallback text
+         title still fits (clipped, not invisible) in the tighter width if
+         an icon ever fails to load — the doc's own bar ('never an
+         invisible control') doesn't require it to look good, just to
+         exist and stay clickable."
         | btnClass imgClass img btn holder delegate x |
         Views add: (Array with: aSymbol with: aTitle with: containerBlock with: onShowBlock).
         btnClass := Cocoa classNamed: 'NSButton'.
-        x := 8.0 + (ToolbarButtons size * 98.0).
+        x := 8.0 + (ToolbarButtons size * self toolbarButtonStep).
         btn := (btnClass onMain alloc) onMain
-            initWithFrame: (Array with: x with: 6.0 with: 92.0 with: 32.0).
+            initWithFrame: (Array with: x with: 6.0 with: self toolbarButtonWidth with: 32.0).
         btn onMain setBordered: false.
         btn onMain setTitle: aTitle.
         imgClass := Cocoa classNamed: 'NSImage'.
