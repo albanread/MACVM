@@ -145,46 +145,71 @@ extern "C" fn imp_all_selectors(_this: *mut c_void, _cmd: *mut c_void) -> Id {
 
 /// `browseRecords` — the whole class hierarchy as flat records for the browser
 /// tree, ONE per class, fields `␟`-separated:
-///   `name ␟ superclass ␟ instVars ␟ classVars ␟ instSelectors ␟ classSelectors`
-/// (the four var/selector lists are space-separated names), records `\n`-joined.
-/// This is the DATABASE-query replacement for the primary VM's live reflection
-/// snapshot (`UiBrowserService browseSnapshot`) — the image is the source of
-/// truth, same as the editor + the Find views. The UI rebuilds the nested tree
-/// from the `superclass` links.
+///   `name ␟ superclass ␟ instVars ␟ classVars ␟ instSelectors ␟ classSelectors ␟ loaded`
+/// (the four var/selector lists are space-separated names; `loaded` is `1`/`0`),
+/// records `\n`-joined. This is the DATABASE-query replacement for the primary
+/// VM's live reflection snapshot (`UiBrowserService browseSnapshot`) — the image
+/// is the source of truth, same as the editor + the Find views. The UI rebuilds
+/// the nested tree from the `superclass` links.
+///
+/// `loaded` (M6, `docs/package_aware_editing_design.md` §4.3): the tree is the
+/// WHOLE database (every package), but the primary VM boots only
+/// [`crate::boot::PRIMARY_LISTS`]' packages — so a class the primary never
+/// booted (`CocoaHelp`, a `cocoaui` class) still appears here and is editable,
+/// but M5's gate applies its edit to the image ONLY, not live. This flag marks
+/// which classes the primary actually has, so the browser can annotate the
+/// database-only rows. Sound by construction: a class whose package is in one of
+/// the primary's booted lists IS booted there, so `loaded == 1` never
+/// over-claims (it can only under-claim a class defined live this session, whose
+/// `interactive` package isn't in `world` — the safe direction: the annotation
+/// never promises "live" for an edit M5 would gate).
+/// The pure record-builder behind [`imp_browse_records`] — separated so the
+/// 7-field record shape + the M6 `loaded` flag are unit-testable without the
+/// Objective-C runtime. `primary_lists` is which lists the primary booted
+/// ([`crate::boot::PRIMARY_LISTS`] in the bin); a class is `loaded` iff its
+/// package is in one of them.
+fn browse_records_text(img: &Image, primary_lists: &[&str]) -> String {
+    let primary_pkgs: std::collections::HashSet<String> = primary_lists
+        .iter()
+        .flat_map(|l| img.packages_in_list(l).unwrap_or_default())
+        .collect();
+    let mut out = String::new();
+    for name in img.class_names().unwrap_or_default() {
+        let cls = img.class_named(&name).ok().flatten();
+        let (superc, ivars, cvars, category) = match &cls {
+            Some(c) => (
+                c.superclass.clone().unwrap_or_default(),
+                c.instance_vars.clone(),
+                c.class_vars.clone(),
+                c.category.clone(),
+            ),
+            None => (String::new(), String::new(), String::new(), String::new()),
+        };
+        let methods = img.all_methods_of(&name).unwrap_or_default();
+        let inst = methods
+            .iter()
+            .filter(|m| m.side != Side::Class)
+            .map(|m| m.selector.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let clss = methods
+            .iter()
+            .filter(|m| m.side == Side::Class)
+            .map(|m| m.selector.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let loaded = if primary_pkgs.contains(&category) { "1" } else { "0" };
+        out.push_str(&format!(
+            "{name}{SEP}{superc}{SEP}{ivars}{SEP}{cvars}{SEP}{inst}{SEP}{clss}{SEP}{loaded}\n"
+        ));
+    }
+    out
+}
+
 extern "C" fn imp_browse_records(_this: *mut c_void, _cmd: *mut c_void) -> Id {
     let text = Image::open_read_only(&image_path())
         .ok()
-        .map(|img| {
-            let mut out = String::new();
-            for name in img.class_names().unwrap_or_default() {
-                let cls = img.class_named(&name).ok().flatten();
-                let (superc, ivars, cvars) = match &cls {
-                    Some(c) => (
-                        c.superclass.clone().unwrap_or_default(),
-                        c.instance_vars.clone(),
-                        c.class_vars.clone(),
-                    ),
-                    None => (String::new(), String::new(), String::new()),
-                };
-                let methods = img.all_methods_of(&name).unwrap_or_default();
-                let inst = methods
-                    .iter()
-                    .filter(|m| m.side != Side::Class)
-                    .map(|m| m.selector.as_str())
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                let clss = methods
-                    .iter()
-                    .filter(|m| m.side == Side::Class)
-                    .map(|m| m.selector.as_str())
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                out.push_str(&format!(
-                    "{name}{SEP}{superc}{SEP}{ivars}{SEP}{cvars}{SEP}{inst}{SEP}{clss}\n"
-                ));
-            }
-            out
-        })
+        .map(|img| browse_records_text(&img, crate::boot::PRIMARY_LISTS))
         .unwrap_or_default();
     objc::nsstring(&text)
 }
@@ -678,4 +703,60 @@ pub fn register() {
         unsafe { add(cls, objc::sel(sel_name), imp, types.as_ptr()) };
     }
     unsafe { reg(cls) };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    fn world_dir() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../world")
+    }
+
+    /// M6 (`docs/package_aware_editing_design.md` §4.3): `browse_records_text`
+    /// tags each class with a 7th field, `loaded` (1/0), computed from whether
+    /// its package is in the primary's booted lists. A base-world class
+    /// (`Object`) is `1`; a `cocoaui`-only class (`CocoaHelp`) is `0` when the
+    /// primary boots only `["world"]` — the DATABASE tree carries the whole
+    /// world, but the flag lets the browser annotate the rows the primary
+    /// never loaded. The same class flips to `1` once `cocoaui` is in the
+    /// booted set, proving the flag tracks the requested lists, not the class.
+    #[test]
+    fn browse_records_flags_each_class_loaded_iff_its_package_is_in_the_booted_lists() {
+        let image_path = std::env::temp_dir()
+            .join(format!("macvm_m6_browse_{}.sqlite3", std::process::id()));
+        std::fs::remove_file(&image_path).ok();
+        // Seeds every *.list (world + cocoaui), so CocoaHelp is in the image.
+        let img = image_store::import::open_or_seed(&world_dir(), &image_path)
+            .expect("seed the whole world");
+
+        // field 7 (the loaded flag) of the record whose field 1 == `class`.
+        let loaded_field = |text: &str, class: &str| -> String {
+            text.lines()
+                .find(|line| line.split(SEP).next() == Some(class))
+                .unwrap_or_else(|| panic!("no record for {class}"))
+                .split(SEP)
+                .nth(6)
+                .unwrap_or("<missing field 7>")
+                .to_string()
+        };
+
+        // Primary boots world only: Object loaded, CocoaHelp not.
+        let world_only = browse_records_text(&img, &["world"]);
+        assert_eq!(loaded_field(&world_only, "Object"), "1", "Object is base-world");
+        assert_eq!(
+            loaded_field(&world_only, "CocoaHelp"),
+            "0",
+            "CocoaHelp (a cocoaui class) is NOT loaded on a world-only primary"
+        );
+
+        // Add cocoaui to the booted set: the SAME CocoaHelp record flips to 1
+        // — the flag tracks the requested lists, not the class.
+        let with_cocoaui = browse_records_text(&img, &["world", "cocoaui"]);
+        assert_eq!(loaded_field(&with_cocoaui, "CocoaHelp"), "1");
+        assert_eq!(loaded_field(&with_cocoaui, "Object"), "1");
+
+        std::fs::remove_file(&image_path).ok();
+    }
 }

@@ -117,19 +117,27 @@ Object subclass: CocoaBrowser [
         ^objectNode
     ]
     CocoaBrowser class >> ingestRecord: line into: nodes supers: supers [
+        "Node is 7 slots: {name. ivars. classVars. instSels. classSels.
+         children. loadedInPrimary}. Slot 7 (M6, §4.3) marks whether the
+         PRIMARY has this class booted (host field 7 = '1'/'0') — the tree is
+         the whole database, but the primary boots only its own lists, so a
+         class it never loaded still shows here and is editable; the flag lets
+         the row be annotated database-only. A missing field 7 defaults to
+         loaded (true) so a stale host can't spuriously mark the whole tree."
         | f name node |
         line isEmpty ifTrue: [ ^self ].
         f := self splitShell: line.       "US-splitter, returns all fields"
         f size < 6 ifTrue: [ ^self ].
         name := f at: 1.
         name isEmpty ifTrue: [ ^self ].
-        node := Array new: 6.
+        node := Array new: 7.
         node at: 1 put: name.
         node at: 2 put: (self tokensOf: (f at: 3)).
         node at: 3 put: (self tokensOf: (f at: 4)).
         node at: 4 put: (self tokensOf: (f at: 5)).
         node at: 5 put: (self tokensOf: (f at: 6)).
         node at: 6 put: OrderedCollection new.
+        node at: 7 put: ((f size < 7) or: [ (f at: 7) = '1' ]).
         nodes at: name put: node.
         supers at: name put: (f at: 2).
     ]
@@ -381,9 +389,17 @@ Object subclass: CocoaBrowser [
                                  ifFalse: [ p , '.' , i printString ])
     ]
     CocoaBrowser class >> outlineView: ov objectValueForTableColumn: col byItem: item [
+        "M6 (§4.3): a class the PRIMARY hasn't booted (slot 7 false) is shown
+         with a trailing ' ·' marker — still selectable + editable, but its
+         edits go to the image only (M5's gate), not live. Display-only: the
+         marker is NOT stored in the node, so `selectedClassName` /
+         `pathToClassNamed:` still see the clean name."
         | node |
         node := self resolvePath: (self pathOf: item).
-        ^node isNil ifTrue: [ '' ] ifFalse: [ node at: 1 ]
+        node isNil ifTrue: [ ^'' ].
+        ^(node at: 7)
+            ifTrue: [ node at: 1 ]
+            ifFalse: [ (node at: 1) , ' ·' ]
     ]
     CocoaBrowser class >> outlineViewSelectionDidChange: aNote [
         | row item |
@@ -429,11 +445,22 @@ Object subclass: CocoaBrowser [
 
     "── source pane display ──"
     CocoaBrowser class >> showClassDefinition [
-        | cls src |
+        "M6 (§4.3): when the selected class is NOT loaded in this running
+         environment (slot 7 false), prepend a comment banner explaining that
+         edits save to the image and take effect on next launch, not live —
+         the discoverable, full-text counterpart to the tree's ' ·' marker.
+         VIEWING-mode display only (source not editable, no Accept path for an
+         existing class's definition), so the banner never reaches an accept."
+        | cls src node banner |
         cls := self selectedClassName.
         cls isNil ifTrue: [ ^self ].
         src := self hostClassSource: cls.
-        self showSource: (src isEmpty
+        node := SelectedPath isNil ifTrue: [ nil ] ifFalse: [ self resolvePath: SelectedPath ].
+        banner := (node notNil and: [ (node at: 7) == false ])
+            ifTrue: [ '"— ' , cls , ' is NOT loaded in this running environment (its package is not booted here). '
+                        , 'Edits save to the image and take effect on the next launch, not live."' , String lf , String lf ]
+            ifFalse: [ '' ].
+        self showSource: banner , (src isEmpty
             ifTrue: [ '"' , cls , ' has no stored definition in the image (defined live this session?)"' ]
             ifFalse: [ src ])
     ]
