@@ -76,6 +76,10 @@ Object subclass: BenchmarkDashboard [
     ]
     BenchmarkDashboard class >> benchDeltaBlue [
         | r |
+        "The GUI boots from the DB, which does NOT replay 41a's top-level
+         `Strength initStrengths.` doit (it reconstructs classes+methods, not
+         doits), so seed the strength table here — idempotent (a clean reopen)."
+        Strength initStrengths.
         DeltaBlue setUp.
         r := DeltaBlue runOne.
         (DeltaBlue checkResult: r) ifFalse: [ ^self error: 'deltablue: wrong result' ].
