@@ -642,6 +642,82 @@ fn persist_editor_class(img: &Image, text: &str) -> String {
     }
 }
 
+/// `commentFor:` — the selected class's stored comment (`""` if none). The V2
+/// browser's "Comment" source-mode reads THIS; the comment is also the leading
+/// string of `classSourceFor:`, but the stored field is exact and cheap.
+extern "C" fn imp_comment_for(_this: *mut c_void, _cmd: *mut c_void, class_name: Id) -> Id {
+    let class_name = ns_to_string(class_name);
+    let text = Image::open_read_only(&image_path())
+        .ok()
+        .and_then(|img| img.class_named(&class_name).ok())
+        .flatten()
+        .map(|c| c.comment)
+        .unwrap_or_default();
+    objc::nsstring(&text)
+}
+
+/// `packageTree` — the V2 browser's system-category pane: the package lists
+/// (M1) as a two-level grouping, one line per `(list, package)`:
+///   `list ␟ package ␟ class1 class2 …`   (classes space-separated, sorted)
+/// records `\n`-joined. A class's category IS its package (its source-file
+/// stem, e.g. `ordered`); `package_lists`/`packages_in_list` group packages
+/// into `world` / `cocoaui`. Every class already carries a category (0
+/// orphans today), but categories that belong to no list — the empty category
+/// of an interactively-created class, say — are emitted under a synthetic
+/// `(other)` list so NO class ever disappears from the pane (the display side
+/// of "a class with no category falls back to its list").
+fn package_tree_text(img: &Image) -> String {
+    use std::collections::{HashMap, HashSet};
+    let mut by_cat: HashMap<String, Vec<String>> = HashMap::new();
+    for name in img.class_names().unwrap_or_default() {
+        let cat = img
+            .class_named(&name)
+            .ok()
+            .flatten()
+            .map(|c| c.category)
+            .unwrap_or_default();
+        by_cat.entry(cat).or_default().push(name);
+    }
+    for classes in by_cat.values_mut() {
+        classes.sort();
+    }
+    let mut out = String::new();
+    let mut emitted: HashSet<String> = HashSet::new();
+    for list in img.package_lists().unwrap_or_default() {
+        for pkg in img.packages_in_list(&list).unwrap_or_default() {
+            emitted.insert(pkg.clone());
+            let classes = by_cat.get(&pkg).cloned().unwrap_or_default();
+            out.push_str(&format!("{list}{SEP}{pkg}{SEP}{}\n", classes.join(" ")));
+        }
+    }
+    let mut orphans: Vec<(&String, &Vec<String>)> =
+        by_cat.iter().filter(|(k, _)| !emitted.contains(*k)).collect();
+    orphans.sort_by(|a, b| a.0.cmp(b.0));
+    for (cat, classes) in orphans {
+        let label = if cat.is_empty() { "(uncategorized)" } else { cat };
+        out.push_str(&format!("(other){SEP}{label}{SEP}{}\n", classes.join(" ")));
+    }
+    out
+}
+
+extern "C" fn imp_package_tree(_this: *mut c_void, _cmd: *mut c_void) -> Id {
+    let text = Image::open_read_only(&image_path())
+        .ok()
+        .map(|img| package_tree_text(&img))
+        .unwrap_or_default();
+    objc::nsstring(&text)
+}
+
+/// `requestBrowser2Refresh` — flag the V2 browser for a DB re-query and wake
+/// the run loop; serviced top-level by `drain_perform` (`CocoaBrowser2
+/// doRefresh`), never inside the calling callback — the view_refresh.rs
+/// pattern, same as the V1 browser. Answers nil.
+extern "C" fn imp_request_browser2_refresh(_this: *mut c_void, _cmd: *mut c_void) -> Id {
+    crate::view_refresh::request_browser2();
+    crate::objc::wake_main_runloop();
+    std::ptr::null_mut()
+}
+
 type AllocPair = unsafe extern "C" fn(Id, *const c_char, usize) -> Id;
 type RegisterPair = unsafe extern "C" fn(Id);
 type AddMethod = unsafe extern "C" fn(Id, Sel, *const c_void, *const c_char) -> u8;
@@ -663,10 +739,13 @@ pub fn register() {
     type Imp1 = extern "C" fn(*mut c_void, *mut c_void, Id) -> Id;
     type Imp3 = extern "C" fn(*mut c_void, *mut c_void, Id, Id, Id) -> Id;
     type Imp4 = extern "C" fn(*mut c_void, *mut c_void, Id, Id, Id, Id) -> Id;
-    let methods: [(&str, *const c_void, &str); 25] = [
+    let methods: [(&str, *const c_void, &str); 28] = [
         ("requestUiRebuild", imp_request_ui_rebuild as Imp0 as *const c_void, "@@:"),
         ("requestPrimaryRestart", imp_request_primary_restart as Imp0 as *const c_void, "@@:"),
         ("requestBrowserRefresh", imp_request_browser_refresh as Imp0 as *const c_void, "@@:"),
+        ("requestBrowser2Refresh", imp_request_browser2_refresh as Imp0 as *const c_void, "@@:"),
+        ("packageTree", imp_package_tree as Imp0 as *const c_void, "@@:"),
+        ("commentFor:", imp_comment_for as Imp1 as *const c_void, "@@:@"),
         ("requestFindRefresh", imp_request_find_refresh as Imp0 as *const c_void, "@@:"),
         ("requestOutlinerRefresh", imp_request_outliner_refresh as Imp0 as *const c_void, "@@:"),
         ("requestFindQuery", imp_request_find_query as Imp0 as *const c_void, "@@:"),
@@ -756,6 +835,44 @@ mod tests {
         let with_cocoaui = browse_records_text(&img, &["world", "cocoaui"]);
         assert_eq!(loaded_field(&with_cocoaui, "CocoaHelp"), "1");
         assert_eq!(loaded_field(&with_cocoaui, "Object"), "1");
+
+        std::fs::remove_file(&image_path).ok();
+    }
+
+    /// The V2 browser's `packageTree`: one `list ␟ package ␟ classes` line per
+    /// package, classes grouped by their category (= package) and packages by
+    /// their list. `Object`'s package `object` is in the `world` list and holds
+    /// the `Object` class; a `cocoaui` package (`cocoabrowser`) sits under the
+    /// `cocoaui` list — the two-level grouping the category pane renders.
+    #[test]
+    fn package_tree_groups_classes_by_list_then_package() {
+        let image_path =
+            std::env::temp_dir().join(format!("macvm_v2_tree_{}.sqlite3", std::process::id()));
+        std::fs::remove_file(&image_path).ok();
+        let img = image_store::import::open_or_seed(&world_dir(), &image_path).expect("seed");
+
+        let text = package_tree_text(&img);
+        let line_for = |pkg: &str| -> String {
+            text.lines()
+                .find(|l| l.split(SEP).nth(1) == Some(pkg))
+                .unwrap_or_else(|| panic!("no package line for {pkg}"))
+                .to_string()
+        };
+
+        let obj = line_for("object");
+        let f: Vec<&str> = obj.split(SEP).collect();
+        assert_eq!(f[0], "world", "the `object` package is in the `world` list");
+        assert!(
+            f[2].split(' ').any(|c| c == "Object"),
+            "the Object class groups under its `object` package: {obj}"
+        );
+
+        let cb = line_for("cocoabrowser");
+        assert_eq!(
+            cb.split(SEP).next(),
+            Some("cocoaui"),
+            "a cocoaui package sits under the cocoaui list"
+        );
 
         std::fs::remove_file(&image_path).ok();
     }

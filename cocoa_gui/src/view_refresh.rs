@@ -23,6 +23,9 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
 static BROWSER_REFRESH_REQUESTED: AtomicBool = AtomicBool::new(false);
+/// The V2 category browser (world/72) — its own channel so a V2-only refresh
+/// never re-queries V1 and vice versa; same flag-and-drain contract.
+static BROWSER2_REFRESH_REQUESTED: AtomicBool = AtomicBool::new(false);
 static FIND_REFRESH_REQUESTED: AtomicBool = AtomicBool::new(false);
 static OUTLINER_REFRESH_REQUESTED: AtomicBool = AtomicBool::new(false);
 /// Implementors/Senders/Definitions: `CocoaFind`'s search term + kind are
@@ -40,6 +43,9 @@ static FIND_QUERY_REQUESTED: AtomicBool = AtomicBool::new(false);
 pub fn request_browser() {
     BROWSER_REFRESH_REQUESTED.store(true, Ordering::Release);
 }
+pub fn request_browser2() {
+    BROWSER2_REFRESH_REQUESTED.store(true, Ordering::Release);
+}
 pub fn request_find() {
     FIND_REFRESH_REQUESTED.store(true, Ordering::Release);
 }
@@ -51,10 +57,11 @@ pub fn request_find_query() {
 }
 
 /// Take (and clear) all pending requests — called once per drain pass.
-/// Returns `(browser, find, outliner, find_query)`.
-pub fn take_requests() -> (bool, bool, bool, bool) {
+/// Returns `(browser, browser2, find, outliner, find_query)`.
+pub fn take_requests() -> (bool, bool, bool, bool, bool) {
     (
         BROWSER_REFRESH_REQUESTED.swap(false, Ordering::AcqRel),
+        BROWSER2_REFRESH_REQUESTED.swap(false, Ordering::AcqRel),
         FIND_REFRESH_REQUESTED.swap(false, Ordering::AcqRel),
         OUTLINER_REFRESH_REQUESTED.swap(false, Ordering::AcqRel),
         FIND_QUERY_REQUESTED.swap(false, Ordering::AcqRel),

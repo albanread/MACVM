@@ -33,3 +33,9 @@
 # CocoaHelp (a read-only Markdown documentation tab, docs/macvm_help.md)
 # also self-registers by name; no dependency on any other Cocoa GUI file.
 71_cocoahelp.mst
+# CocoaBrowser2 (V2, additive — V1's 66_cocoabrowser stays): a classic
+# Smalltalk-80 category browser — system-category / class / protocol / method
+# panes (categories from the M1 package lists, protocols derived heuristically
+# from selectors) + a Comment/Definition/Source pane. Read-only browsing;
+# self-registers by name as the 'Browser V2' view.
+72_cocoabrowser2.mst

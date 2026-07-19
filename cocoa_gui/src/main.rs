@@ -163,9 +163,13 @@ extern "C" fn drain_perform(info: *mut c_void) {
     // View refreshes (Browser tree, Find options, Outliner tree, a pending
     // Find query): a fresh top-level `exec` here, never inside a callback —
     // see view_refresh.rs.
-    let (browser_due, find_due, outliner_due, find_query_due) = view_refresh::take_requests();
+    let (browser_due, browser2_due, find_due, outliner_due, find_query_due) =
+        view_refresh::take_requests();
     if browser_due {
         let _ = st.ui.exec("CocoaBrowser doRefresh.");
+    }
+    if browser2_due {
+        let _ = st.ui.exec("CocoaBrowser2 doRefresh.");
     }
     if find_due {
         let _ = st.ui.exec("CocoaFind doRefreshOptions.");

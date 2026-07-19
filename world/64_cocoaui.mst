@@ -107,6 +107,7 @@ Object subclass: CocoaUI [
         "CG7/CG8: later-loading views register themselves — resolved by name
          so this file never depends on files after it in cocoaui.list."
         (Worker classNamed: #CocoaBrowser) ifNotNil: [ :bc | bc register ].
+        (Worker classNamed: #CocoaBrowser2) ifNotNil: [ :b2 | b2 register ].
         (Worker classNamed: #CocoaFind) ifNotNil: [ :fc | fc register ].
         (Worker classNamed: #CocoaEditor) ifNotNil: [ :ec | ec register ].
         (Worker classNamed: #CocoaOutliner) ifNotNil: [ :oc | oc register ].
