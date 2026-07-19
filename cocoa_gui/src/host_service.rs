@@ -656,6 +656,26 @@ extern "C" fn imp_comment_for(_this: *mut c_void, _cmd: *mut c_void, class_name:
     objc::nsstring(&text)
 }
 
+/// `setCommentFor:comment:` — persist an edited class comment to the image
+/// (`Image::set_class_comment`, the same versioned write the web editor uses).
+/// A comment is metadata, so it takes effect immediately for the browser (it
+/// reads the image) with no live recompile. `OK` / `ERR <why>`.
+extern "C" fn imp_set_comment_for(
+    _this: *mut c_void,
+    _cmd: *mut c_void,
+    class_name: Id,
+    comment: Id,
+) -> Id {
+    let class_name = ns_to_string(class_name);
+    let comment = ns_to_string(comment);
+    match writer().map(|img| img.set_class_comment(&class_name, &comment)) {
+        Ok(Ok(true)) => ok(""),
+        Ok(Ok(false)) => err("no such class in the image"),
+        Ok(Err(e)) => err(&e.to_string()),
+        Err(e) => err(&e),
+    }
+}
+
 /// `packageTree` — the V2 browser's system-category pane: the package lists
 /// (M1) as a two-level grouping, one line per `(list, package)`:
 ///   `list ␟ package ␟ class1 class2 …`   (classes space-separated, sorted)
@@ -737,15 +757,17 @@ pub fn register() {
     }
     type Imp0 = extern "C" fn(*mut c_void, *mut c_void) -> Id;
     type Imp1 = extern "C" fn(*mut c_void, *mut c_void, Id) -> Id;
+    type Imp2 = extern "C" fn(*mut c_void, *mut c_void, Id, Id) -> Id;
     type Imp3 = extern "C" fn(*mut c_void, *mut c_void, Id, Id, Id) -> Id;
     type Imp4 = extern "C" fn(*mut c_void, *mut c_void, Id, Id, Id, Id) -> Id;
-    let methods: [(&str, *const c_void, &str); 28] = [
+    let methods: [(&str, *const c_void, &str); 29] = [
         ("requestUiRebuild", imp_request_ui_rebuild as Imp0 as *const c_void, "@@:"),
         ("requestPrimaryRestart", imp_request_primary_restart as Imp0 as *const c_void, "@@:"),
         ("requestBrowserRefresh", imp_request_browser_refresh as Imp0 as *const c_void, "@@:"),
         ("requestBrowser2Refresh", imp_request_browser2_refresh as Imp0 as *const c_void, "@@:"),
         ("packageTree", imp_package_tree as Imp0 as *const c_void, "@@:"),
         ("commentFor:", imp_comment_for as Imp1 as *const c_void, "@@:@"),
+        ("setCommentFor:comment:", imp_set_comment_for as Imp2 as *const c_void, "@@:@@"),
         ("requestFindRefresh", imp_request_find_refresh as Imp0 as *const c_void, "@@:"),
         ("requestOutlinerRefresh", imp_request_outliner_refresh as Imp0 as *const c_void, "@@:"),
         ("requestFindQuery", imp_request_find_query as Imp0 as *const c_void, "@@:"),
