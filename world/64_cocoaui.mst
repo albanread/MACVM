@@ -377,7 +377,31 @@ Print it does the same and inserts the result right after it."
     CocoaUI class >> installMenu [
         "The app menu (⌘Q) is installed by Rust BEFORE startup (main.rs) so
          `mainMenu` already exists here and this ADDS the Workspace submenu
-         to it, never replaces it (the CG4-review menu-clobber fix)."
+         to it, never replaces it (the CG4-review menu-clobber fix).
+
+         CG9's UI rebuild re-runs `startup` -> `installMenu` against that
+         SAME, still-live mainMenu — NSApplication's own menu bar is a
+         native object that persists across a UI-worker rebuild, unlike the
+         window/toolbar/content host, which teardown actually tears down.
+         Left unguarded, every rebuild appended a SECOND full set of
+         Workspace/View/Theme/Demos/Debug submenus on top of the first —
+         visible as duplicate entries, the stale half permanently greyed
+         out (their targets are delegates bound to the dead prior VM's own
+         MacvmDelegate registry, which fails closed on dispatch; AppKit
+         shows an item whose action can't fire as disabled).
+
+         FIRST FIX ATTEMPT (WRONG, do not repeat): track the top-level
+         items THIS method installed in a classVar, remove them next call.
+         Looked right, verifiably did nothing — a rebuild boots a WHOLE
+         FRESH UI-worker VM from source, so every Smalltalk-side classVar
+         (including that tracking list) is nil again at the top of THIS
+         very call, on every single generation, forever. Only the native
+         mainMenu object itself survives a rebuild; nothing on the
+         Smalltalk side does. FIX: read the fresh set's own fixed, known
+         titles back OFF mainMenu directly (itemWithTitle:) and remove
+         whatever's there before adding the new set — stateless from the
+         VM's own perspective by construction, so it can't go stale across
+         a rebuild the way a classVar can."
         | app mainMenu wsItem wsMenu printItem doItem |
         ActTarget := MacvmDelegate actionTargetOn: CocoaUI.
         app := (Cocoa classNamed: 'NSApplication') onMain sharedApplication.
@@ -385,6 +409,11 @@ Print it does the same and inserts the result right after it."
         mainMenu isNil ifTrue: [
             mainMenu := (Cocoa classNamed: 'NSMenu') onMain alloc onMain init.
             app onMain setMainMenu: mainMenu ].
+
+        #('Workspace' 'View' 'Theme' 'Demos' 'Debug') do: [ :title |
+            | old |
+            old := mainMenu onMain itemWithTitle: title.
+            old isNil ifFalse: [ mainMenu onMain removeItem: old ] ].
 
         wsMenu := (Cocoa classNamed: 'NSMenu') onMain alloc onMain init.
         printItem := ((Cocoa classNamed: 'NSMenuItem') onMain alloc) onMain
@@ -436,19 +465,25 @@ Print it does the same and inserts the result right after it."
             initWithTitle: 'Demos' action: nil keyEquivalent: ''.
         demosItem onMain setSubmenu: demosMenu.
         mainMenu onMain addItem: demosItem.
+        ^demosItem
     ]
 
     CocoaUI class >> installDebugMenuOn: mainMenu [
         "CG9: a Debug menu to exercise the recovery machinery on-screen —
          'Rebuild UI' (Layer 2: tears down + rebuilds the whole window set on
-         a fresh UI worker VM; the primary and its state are untouched) and
-         'Force Fault' (Layer 1: a deliberate bad Alien deref in a callback,
-         recovered by the C6 door to its shape default — the run loop pumps
-         on)."
+         a fresh UI worker VM; the primary and its state are untouched),
+         'Restart Primary VM' (the SAME respawn-from-source a fatal doit
+         triggers automatically, on demand — the primary's whole object
+         heap is discarded and rebooted from the world source; the UI shell
+         is untouched and re-syncs onto the fresh primary automatically),
+         and 'Force Fault' (Layer 1: a deliberate bad Alien deref in a
+         callback, recovered by the C6 door to its shape default — the run
+         loop pumps on)."
         | debugMenu debugItem pairs |
         debugMenu := (Cocoa classNamed: 'NSMenu') onMain alloc onMain init.
         pairs := OrderedCollection new.
         pairs add: (Array with: 'Rebuild UI' with: [ self requestRebuild ]).
+        pairs add: (Array with: 'Restart Primary VM' with: [ self requestPrimaryRestart ]).
         pairs add: (Array with: 'Force Fault (recovered)' with: [ self forceFault ]).
         pairs do: [ :pair |
             | title item holder delegate |
@@ -464,12 +499,21 @@ Print it does the same and inserts the result right after it."
             initWithTitle: 'Debug' action: nil keyEquivalent: ''.
         debugItem onMain setSubmenu: debugMenu.
         mainMenu onMain addItem: debugItem.
+        ^debugItem
     ]
     CocoaUI class >> requestRebuild [
         "Ask the host to rebuild the UI worker in place (serviced on the next
          main-thread drain, never inside this callback)."
         ((Cocoa classNamed: 'MacvmHostService') onMain alloc) onMain init
             onMain requestUiRebuild.
+    ]
+    CocoaUI class >> requestPrimaryRestart [
+        "Ask the host to respawn the primary VM from source (serviced on the
+         next main-thread drain, never inside this callback) — the exact
+         same watchdog path a fatal doit triggers automatically, fired on
+         demand for testing/debugging."
+        ((Cocoa classNamed: 'MacvmHostService') onMain alloc) onMain init
+            onMain requestPrimaryRestart.
     ]
     CocoaUI class >> forceFault [
         "A deliberate native fault inside a C6 callback — the door recovers it
@@ -499,6 +543,7 @@ Print it does the same and inserts the result right after it."
             initWithTitle: 'View' action: nil keyEquivalent: ''.
         viewItem onMain setSubmenu: viewMenu.
         mainMenu onMain addItem: viewItem.
+        ^viewItem
     ]
 
     CocoaUI class >> installThemeMenuOn: mainMenu [
@@ -529,6 +574,7 @@ Print it does the same and inserts the result right after it."
             initWithTitle: 'Theme' action: nil keyEquivalent: ''.
         themeItem onMain setSubmenu: themeMenu.
         mainMenu onMain addItem: themeItem.
+        ^themeItem
     ]
 
     CocoaUI class >> applyTheme: aSymbol [

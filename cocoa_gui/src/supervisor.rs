@@ -160,11 +160,11 @@ impl PrimarySupervisor {
     }
 
     /// Request an immediate respawn of the primary from source — the explicit
-    /// restart (a future ⌘R "Restart Environment"; the deterministic trigger the
-    /// headless supervisor gate uses). The automatic fatal-recovery path does not
-    /// need this: a fatal doit's own `Died` hook wakes the watchdog directly. The
-    /// fresh generation's link arrives on [`poll_resync`](Self::poll_resync).
-    #[allow(dead_code)]
+    /// restart: the Debug menu's "Restart Primary VM" (`primary_restart.rs`) and
+    /// the deterministic trigger the headless supervisor gate uses. The automatic
+    /// fatal-recovery path does not need this: a fatal doit's own `Died` hook
+    /// wakes the watchdog directly. The fresh generation's link arrives on
+    /// [`poll_resync`](Self::poll_resync).
     pub fn restart(&self) {
         let _ = self.events.send(Event::Restart);
     }

@@ -17,6 +17,7 @@ mod control;
 mod game;
 mod host_service;
 mod objc;
+mod primary_restart;
 mod rebuild;
 mod snapshot;
 mod supervisor;
@@ -146,6 +147,15 @@ extern "C" fn drain_perform(info: *mut c_void) {
     if rebuild::take_request() {
         rebuild_ui(st);
         return; // the fresh generation drains on the next pass
+    }
+
+    // A manual primary restart (Debug menu): just kicks off the SAME
+    // respawn-from-source the watchdog already does automatically on a
+    // fatal doit — the poll_resync() loop below picks up the fresh
+    // generation whenever the watchdog thread finishes it, exactly as it
+    // already does for the automatic case. See primary_restart.rs.
+    if primary_restart::take_request() {
+        st.supervisor.restart();
     }
 
     // View refreshes (Browser tree, Find options, Outliner tree, a pending

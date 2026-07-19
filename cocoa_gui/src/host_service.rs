@@ -413,6 +413,18 @@ extern "C" fn imp_request_ui_rebuild(_this: *mut c_void, _cmd: *mut c_void) -> I
     crate::objc::wake_main_runloop();
     std::ptr::null_mut()
 }
+/// `requestPrimaryRestart` — a Debug-menu action that flags an immediate
+/// primary respawn-from-source (the same watchdog path a fatal doit
+/// triggers automatically, CG4 §5.1) and wakes the run loop. Serviced by
+/// `drain_perform` on its next pass, which calls `PrimarySupervisor::
+/// restart()` itself — never directly from this callback, since the
+/// supervisor instance lives in `DrainState`, unreachable from a static
+/// `extern "C"` IMP (see primary_restart.rs). Answers nil.
+extern "C" fn imp_request_primary_restart(_this: *mut c_void, _cmd: *mut c_void) -> Id {
+    crate::primary_restart::request();
+    crate::objc::wake_main_runloop();
+    std::ptr::null_mut()
+}
 
 /// `requestBrowserRefresh` / `requestFindRefresh` — flag the Browser tree /
 /// Find options for a DB re-query and wake the run loop. Serviced by
@@ -618,8 +630,9 @@ pub fn register() {
     type Imp1 = extern "C" fn(*mut c_void, *mut c_void, Id) -> Id;
     type Imp3 = extern "C" fn(*mut c_void, *mut c_void, Id, Id, Id) -> Id;
     type Imp4 = extern "C" fn(*mut c_void, *mut c_void, Id, Id, Id, Id) -> Id;
-    let methods: [(&str, *const c_void, &str); 24] = [
+    let methods: [(&str, *const c_void, &str); 25] = [
         ("requestUiRebuild", imp_request_ui_rebuild as Imp0 as *const c_void, "@@:"),
+        ("requestPrimaryRestart", imp_request_primary_restart as Imp0 as *const c_void, "@@:"),
         ("requestBrowserRefresh", imp_request_browser_refresh as Imp0 as *const c_void, "@@:"),
         ("requestFindRefresh", imp_request_find_refresh as Imp0 as *const c_void, "@@:"),
         ("requestOutlinerRefresh", imp_request_outliner_refresh as Imp0 as *const c_void, "@@:"),
