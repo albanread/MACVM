@@ -753,6 +753,31 @@ impl Image {
         Ok(())
     }
 
+    /// THIS method's own `source_file`, `None` if it has none yet (or the
+    /// method itself doesn't exist) — distinct from [`Self::class_home_file`],
+    /// which answers a majority vote across the whole class's methods and
+    /// would wrongly attribute a brand-new, not-yet-homed method to whatever
+    /// file most of its *siblings* came from. `flows::save_method` uses this
+    /// (not `class_home_file`) to decide whether a method already has real
+    /// provenance worth preserving.
+    pub fn method_source_file(
+        &self,
+        class_name: &str,
+        side: Side,
+        selector: &str,
+    ) -> rusqlite::Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT m.source_file FROM classes c \
+                 JOIN methods m ON m.class_id = c.class_id \
+                 WHERE c.name = ?1 AND m.side = ?2 AND m.selector = ?3",
+                params![class_name, side.as_str(), selector],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map(|opt| opt.flatten())
+    }
+
     /// The world file most of `class_name`'s methods live in — where `export`
     /// puts a newly-created method instead of the catch-all additions file.
     /// `None` if none of the class's methods has a recorded home yet.

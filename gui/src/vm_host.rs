@@ -2220,7 +2220,26 @@ fn handle(
                                 let created = world.create_or_reopen_method(&class_name, selection.side, &selector, &category, &text);
                                 let image_error = image.and_then(|img| {
                                     match img.create_or_reopen_method(&class_name, side_to_image(selection.side), &selector, &category, &text) {
-                                        Ok(Some(_)) => None,
+                                        Ok(Some(_)) => {
+                                            // M3 (docs/package_aware_editing_design.md §4.2): only
+                                            // assign a home if this exact method has none yet — an
+                                            // edit of an already-imported method must keep its real
+                                            // source_file, never the synthetic marker.
+                                            let has_home = img
+                                                .method_source_file(&class_name, side_to_image(selection.side), &selector)
+                                                .ok()
+                                                .flatten()
+                                                .is_some();
+                                            if !has_home {
+                                                let _ = img.set_method_home_file(
+                                                    &class_name,
+                                                    side_to_image(selection.side),
+                                                    &selector,
+                                                    image_store::flows::INTERACTIVE_SOURCE_FILE,
+                                                );
+                                            }
+                                            None
+                                        }
                                         Ok(None) => Some("class not found in the image (mirror/image out of sync?)".to_string()),
                                         Err(e) => Some(e.to_string()),
                                     }
@@ -2260,6 +2279,17 @@ fn handle(
                                 if let Some(img) = image {
                                     if img.create_or_reopen_method(&new_name, side_to_image(side), &m.selector, "as yet unclassified", &m.source).is_err() {
                                         failed_methods += 1;
+                                    } else {
+                                        // M3 (docs/package_aware_editing_design.md §4.2): every
+                                        // method of a BRAND NEW class is unconditionally new, so
+                                        // (unlike NewMethod's edit-or-create case) no "already
+                                        // homed" check is needed here.
+                                        let _ = img.set_method_home_file(
+                                            &new_name,
+                                            side_to_image(side),
+                                            &m.selector,
+                                            image_store::flows::INTERACTIVE_SOURCE_FILE,
+                                        );
                                     }
                                 }
                             }
@@ -3583,6 +3613,87 @@ mod tests {
         assert!(
             dup.iter().any(|resp| matches!(resp, VmResponse::Transcript(t) if t.contains("already exists"))),
             "duplicate class must be refused, got {dup:?}"
+        );
+
+        std::fs::remove_file(&tmp).ok();
+    }
+
+    /// M3 (docs/package_aware_editing_design.md §4.2): unlike
+    /// `SmapplNewMethod`/`SmapplNewClass` (a separate, deliberately
+    /// out-of-scope code path exercised by the test above), `BrowserSaveSource`
+    /// is the real class browser's own accept path — its `NewMethod`/`NewClass`
+    /// arms must give every created method a non-`NULL` `source_file` too, so
+    /// `class_home_file` is never left unanswerable for browser-created content.
+    #[test]
+    fn browser_save_source_new_method_and_new_class_get_a_home_in_the_image() {
+        OPEN_OUTLINERS.with(|o| o.borrow_mut().clear());
+        let world_dir = test_world_dir();
+        let tmp = std::env::temp_dir()
+            .join(format!("macvm_browser_home_{}.sqlite3", std::process::id()));
+        std::fs::remove_file(&tmp).ok();
+        let image = open_or_seed_image(&world_dir, &tmp).expect("seed");
+        let mut vm = VmHandle::boot_without_world(macvm::runtime::VmOptions {
+            heap_mib: 64,
+            jit: macvm::runtime::JitMode::Off,
+            ..Default::default()
+        });
+        crate::world_boot::load_world_from_image(&mut vm, &image, WORLD_DOITS).expect("db load");
+        let mut world = MockWorld::seed();
+
+        // A new method on an existing class (Point, already used above).
+        let mut selection = BrowserSelection {
+            class: Some("Point".to_string()),
+            edit_target: SourceEditTarget::NewMethod,
+            ..Default::default()
+        };
+        handle(
+            VmRequest::BrowserSaveSource {
+                text: "quadrupled\n\t^self * 4".to_string(),
+                saved_package: String::new(),
+                saved_class: "Point".to_string(),
+                saved_side: "instance".to_string(),
+                saved_category: String::new(),
+                saved_method: String::new(),
+                saved_target: "new_method".to_string(),
+            },
+            &mut world,
+            &mut selection,
+            Some(&image),
+            &mut vm,
+        );
+        assert_eq!(
+            image
+                .method_source_file("Point", image_store::Side::Instance, "quadrupled")
+                .unwrap(),
+            Some(image_store::flows::INTERACTIVE_SOURCE_FILE.to_string()),
+            "a new method through the real browser accept path must get a home"
+        );
+
+        // A new class: every one of its methods gets a home too.
+        let mut selection = BrowserSelection {
+            package: Some("scratch".to_string()),
+            edit_target: SourceEditTarget::NewClass,
+            ..Default::default()
+        };
+        handle(
+            VmRequest::BrowserSaveSource {
+                text: "Object subclass: BrowserHomeTest [\n\tping [ ^1 ]\n]".to_string(),
+                saved_package: "scratch".to_string(),
+                saved_class: String::new(),
+                saved_side: "instance".to_string(),
+                saved_category: String::new(),
+                saved_method: String::new(),
+                saved_target: "new_class".to_string(),
+            },
+            &mut world,
+            &mut selection,
+            Some(&image),
+            &mut vm,
+        );
+        assert_eq!(
+            image.class_home_file("BrowserHomeTest").unwrap(),
+            Some(image_store::flows::INTERACTIVE_SOURCE_FILE.to_string()),
+            "a new class's methods through the real browser accept path must get a home"
         );
 
         std::fs::remove_file(&tmp).ok();

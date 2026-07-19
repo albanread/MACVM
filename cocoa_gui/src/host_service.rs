@@ -211,10 +211,13 @@ extern "C" fn imp_class_shell_for(_this: *mut c_void, _cmd: *mut c_void, class_n
 }
 
 /// `newClassFrom:` — `flows::new_class_from_source` (the web's NewClass
-/// accept sequence). `OK <name>` / `ERR <why>`.
+/// accept sequence). `OK <name>` / `ERR <why>`. `None` for `default_source_file`
+/// (docs/package_aware_editing_design.md §4.2): CocoaBrowser's create flow
+/// isn't package-scoped, same as the web outliner's own NewClass arm — the
+/// new class's methods fall back to `flows::INTERACTIVE_SOURCE_FILE`.
 extern "C" fn imp_new_class_from(_this: *mut c_void, _cmd: *mut c_void, text: Id) -> Id {
     let text = ns_to_string(text);
-    match writer().and_then(|img| flows::new_class_from_source(&img, &text)) {
+    match writer().and_then(|img| flows::new_class_from_source(&img, &text, None)) {
         Ok(name) => ok(&name),
         Err(e) => err(&e),
     }
@@ -222,6 +225,9 @@ extern "C" fn imp_new_class_from(_this: *mut c_void, _cmd: *mut c_void, text: Id
 
 /// `saveMethodFor:side:source:` — `flows::save_method` (the web's NewMethod/
 /// Method accept sequence, versioned create-or-update). `OK <selector>`.
+/// `None` for `default_source_file` — see `imp_new_class_from`; an edit of
+/// an already-imported method keeps its real home regardless (`save_method`'s
+/// own doc comment).
 extern "C" fn imp_save_method(
     _this: *mut c_void,
     _cmd: *mut c_void,
@@ -232,7 +238,7 @@ extern "C" fn imp_save_method(
     let class_name = ns_to_string(class_name);
     let side = side_from(&ns_to_string(side));
     let source = ns_to_string(source);
-    match writer().and_then(|img| flows::save_method(&img, &class_name, side, &source)) {
+    match writer().and_then(|img| flows::save_method(&img, &class_name, side, &source, None)) {
         Ok(selector) => ok(&selector),
         Err(e) => err(&e),
     }
