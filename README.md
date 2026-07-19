@@ -2,35 +2,42 @@
 
 ## Motivation
 
-A new from scratch - Apple Silicon compiler for Smalltalk.
+A from-scratch Apple Silicon compiler for Smalltalk — the most complex
+compiler project in my repos, and like the others, it may take a while
+before it turns into a useful system.
 
-This is the most complex compiler project here in my repos, and like the other 
-projects, it may take a while before it is turned into a useful system.
+This isn't a history lesson, just my own experience of one. Strongtalk was
+released to the public in 2002 — first as documentation I thoroughly
+enjoyed reading, then as full C++ source. At the time it executed Smalltalk
+at high speed, and the released repo was fascinating, ambitious, and richly
+engineered. I spent many happy hours exploring it and came away impressed
+by the design: Strongtalk — and Self before it — pioneered adaptive
+optimization (polymorphic inline caches, type feedback, deoptimization),
+the ideas that went on to power the Java HotSpot VM, and added on top of
+that an optional static type system and a live, hypertext programming
+environment. There's a great deal of brilliant engineering there to learn
+from and build on.
 
-This is not a history lesson, it just my experience.
-Strongtalk was released to the public first (2002) as interesting documentation, which I really enjoyed reading, 
-then as full c++ source code; at the time it was able to execute Smalltalk at high
-speed, and the repo that was released was fascinating, ambitious, and richly engineered.
+Decades later, software technology and AI have made life far simpler — it's
+much easier to write compilers now, and I find re-implementing a strong,
+well-documented design one of the most rewarding ways to work. So MACVM is
+built to a large extent on Strongtalk's own design and documentation. I'm
+cheating to the maximum extent possible: the bytecode interpreter and
+compiler are written in Rust, my own assembler is reused in the compiler,
+and only the GC had to be entirely new. It also carries the almost absurd
+level of introspection, debugging, and testing a project this complex
+needs, in the hope it adds up to reliability.
 
-I spent many enjoyable hours exploring it, and came away impressed by the design. Strongtalk — and Self before it — pioneered adaptive optimization: polymorphic inline caches, type feedback, and deoptimization, the ideas that went on to power the Java HotSpot VM. On top of that, Strongtalk added an optional static type system and a live, hypertext programming environment. There is a great deal of brilliant engineering there to learn from and build on.
-
-Decades later software technology and AI have made life far simpler, it is much easier to write compilers now, and I find re-implementing a strong, well-documented design one of the most rewarding ways to work.
-
-So the compiler here is a project based to a large extent on the design and documentation of Strongtalk, I am cheating to the maximum extent possible, the bytecode interpreter and compiler are written in rust, my assembler is reused in the compiler, the gc unfortunately has to be new. 
-This compiler also has the almost absurd level of introspection and debugging needed to create something this complex, and extensive tests, which I hope will lead to reliability.
-
---
-
-A research virtual machine for macOS on Apple Silicon (arm64), in the
-**Self → Strongtalk** lineage: a **class-based object model** with an
-**adaptive optimizing compiler** driven by type feedback.
-
-MACVM is not a port. It takes the adaptive-optimization machinery both VMs share
+MACVM is not a port. It's a research virtual machine for macOS on Apple
+Silicon (arm64), in the **Self → Strongtalk** lineage: a **class-based
+object model** with an **adaptive optimizing compiler** driven by type
+feedback. It takes the adaptive-optimization machinery both VMs share
 (inline caches, PICs, type feedback, deoptimization) and Strongtalk's
-representation (classes + direct pointers, no object table), reimplemented in
-Rust for 64-bit Apple Silicon. Both reference VMs are cloned alongside this repo
-(`../self-repo`, `../strongtalk-repo`); the source-level analysis that drove the
-design is in [`docs/reference-vm-analysis.md`](docs/reference-vm-analysis.md).
+representation (classes + direct pointers, no object table), reimplemented
+in Rust for 64-bit Apple Silicon. Both reference VMs are cloned alongside
+this repo (`../self-repo`, `../strongtalk-repo`); the source-level analysis
+that drove the design is in
+[`docs/reference-vm-analysis.md`](docs/reference-vm-analysis.md).
 
 ## Status — working, and it compiles
 
@@ -80,15 +87,29 @@ allocating. See [`docs/PERF.md`](docs/PERF.md) for the arc and methodology.
   a64 disassembler, IR dumps, and step-between-calls ([`docs/DEBUGGER.md`](docs/DEBUGGER.md)).
 - **Image store** — offline SQLite image editing + a DB→VM boot loader that
   reconstructs the world byte-identically to a `.mst` boot ([`docs/IMAGE.md`](docs/IMAGE.md)).
-- **Embedding + GUI** — a `VmHandle` library API and a Cocoa/WKWebView
-  Strongtalk-style **programming environment** that runs the language on a
-  dedicated thread and survives a guest-thread crash: a live **class browser**
-  whose accepts compile into the running VM *and* persist to the image, an
-  outliner (new class / new method / add variable), **find tools**
-  (definitions, implementors, senders — SQLite-indexed), a **Workspace** with
-  do-it/print-it, a **Canvas** drawing widget, a live **VM/GC metrics
-  dashboard** in the toolbar, and a built-in help + tour
-  ([`docs/vm_handle.md`](docs/vm_handle.md), [`gui/PLAN.md`](gui/PLAN.md)).
+- **Embedding + two GUIs** — a `VmHandle` library API embeds the language on
+  a dedicated thread that survives a guest-thread crash, behind **two
+  independent front-ends** built on the same primitives:
+  - **`gui/` (`macvm-gui`)** — a faithful recreation of the 1996
+    **Strongtalk hypertext programming environment**, rendered as HTML in a
+    `WKWebView` inside a native Cocoa window/menu bar/toolbar. The truer
+    read of the original interface, and the one with the built-in help +
+    tour.
+  - **`cocoa_gui/` (`macvm-cocoa`)** — a lighter, **native AppKit shell
+    whose own interface is written in Smalltalk**: real Cocoa views
+    (`NSButton`, `NSOutlineView`, `NSTextView`, …), driven by a Smalltalk VM
+    pinned to the main thread through the Cocoa bridge — no HTML, no JS, no
+    WebKit process. The environment *is* the language, all the way up.
+
+  Both ship the same core toolset — a live **class browser** whose accepts
+  compile into the running VM *and* persist to the image, an outliner,
+  **find tools** (definitions, implementors, senders — SQLite-indexed), a
+  **Workspace** with do-it/print-it, a **Canvas** drawing widget, and a live
+  **VM/GC metrics dashboard** — each built the way its own front-end works
+  best (`gui/`'s tools are DB-and-JS-driven; `cocoa_gui/`'s browser is
+  DB-backed while its outliner reflects the live VM directly)
+  ([`docs/vm_handle.md`](docs/vm_handle.md), [`gui/PLAN.md`](gui/PLAN.md),
+  [`docs/cocoa_gui_design.md`](docs/cocoa_gui_design.md)).
 - **Game engine** — a native Metal game pane driven entirely from Smalltalk: an
   8-bit indexed drawing surface, retained GPU sprites, a 60 fps frame loop with
   keyboard input, and sound effects + ABC-notation music through AVFoundation,
@@ -183,8 +204,8 @@ maths and libm calls**:
   libm preserves the callee-saved `d`-registers, so a plotted curve costs one
   library call per point plus register arithmetic.
 
-Measured on the GUI's Mandelbrot demo (420×220, release, Apple Silicon), each
-layer removing a *category* of cost:
+Measured on the WKWebView GUI's Mandelbrot demo (420×220, release, Apple
+Silicon), each layer removing a *category* of cost:
 
 | stage | time | allocation per render |
 |-------|------|-----------------------|
@@ -289,6 +310,7 @@ for direct pointers and a fast JIT.
 | [`docs/SIMD.md`](docs/SIMD.md) | SIMD vector support (built): `Float64x2`/`Float32x4`/`Int32x4` value classes fused to NEON by the JIT, plus `FloatArray` bulk kernels + reductions |
 | [`docs/FFI.md`](docs/FFI.md) | The foreign-function interface: `dlsym` resolution, shape-keyed trampolines, the `<primitive: FFI …>` pragma, and the `Alien` raw-memory type |
 | [`docs/cocoa_bridge_design.md`](docs/cocoa_bridge_design.md) | The Cocoa bridge (designed): how the moving GC and Cocoa's reference counting coexist — retain-on-wrap `ObjcRef` tickets, zero GC changes, main-thread hops, callback tickets, the C0–C5 ladder |
+| [`docs/cocoa_gui_design.md`](docs/cocoa_gui_design.md) | The native Cocoa GUI (built, `cocoa_gui/`): the environment written in itself — a Smalltalk VM pinned to the main thread *is* the interface, a second VM behind it is the persistent environment; C6 reverse-dispatch delegates, the restart-in-place supervisor |
 | [`docs/DEBUGGER.md`](docs/DEBUGGER.md) | The debugging ladder: PROBE crash dossiers, breakpoints, mixed-tier backtraces, the a64 disassembler, IR dumps |
 | [`docs/ASM.md`](docs/ASM.md) / [`docs/CANVAS.md`](docs/CANVAS.md) | Side-track designs with working preview tools: hand-written native-AArch64 methods (`<asm:>`), and the GUI Canvas widget |
 | [`docs/gamepane_design.md`](docs/gamepane_design.md) | The native Metal game engine driven from Smalltalk (MacGamePane): the frame/threading architecture, drawing/sprite/audio command channel, and the milestone ladder |
@@ -313,7 +335,8 @@ for direct pointers and a fast JIT.
 | `src/embed.rs` | `VmHandle` embedding API |
 | `src/rusttcl/` | Embedded RUSTTCL console |
 | `world/` | The object world / image sources, tests, benchmarks |
-| `gui/` | Strongtalk-style HTML GUI (Cocoa + WKWebView) |
+| `gui/` | The Strongtalk-style HTML GUI (`macvm-gui`) — rendered in a `WKWebView` |
+| `cocoa_gui/` | The native Cocoa GUI (`macvm-cocoa`) — its own interface written in Smalltalk, driving AppKit directly |
 | `image_store/` | The versioned SQLite class/method source database (importer, exporter, send-index) |
 | `examples/` | Embedding examples (`mandel_demo`: boot a fresh VM, run a demo headless, exit) |
 | `docs/` | Design notes, specs, per-sprint guidance |
@@ -333,11 +356,23 @@ differential oracle every JIT change is gated against (compiled output must be
 byte-identical to interpreted output). Tests: `cargo test`; the stress matrix
 (GC / deopt) and world differentials are in `tests/` and the `justfile` gates.
 
-The GUI launches with `./run-gui.sh` (release build; the **Demos** menu holds
-Breakout and the three Mandelbrots, including the 4-worker parallel dive).
-`./run-mandelvm.sh` runs the standalone one-dive demo window that exits itself.
-The GUI boots from a SQLite **image** (`world/image.sqlite3`) rebuilt from the
-`world/*.mst` source. After changing a world class, rebuild it with
+Either GUI launches with a release build by default (both default to `dev`
+under a bare `cargo run`, which measures tens of times slower on
+compute-heavy demos like the Mandelbrot dives — these scripts exist
+specifically to avoid that trap):
+
+```sh
+./run-gui.sh      # the WKWebView Strongtalk-style environment (macvm-gui)
+./run-cocoa.sh    # the native AppKit environment, written in Smalltalk (macvm-cocoa)
+```
+
+Both share the **Demos** menu (Breakout and the three Mandelbrots, including
+the 4-worker parallel dive); `./run-mandelvm.sh` runs the standalone
+one-dive demo window that exits itself. The WKWebView GUI boots its whole
+interface from a SQLite **image** (`world/image.sqlite3`) rebuilt from the
+`world/*.mst` source; the Cocoa GUI boots classes straight from `.mst`
+source every launch, but its DB-backed browser/find tools read the same
+image. After changing a world class, rebuild the image with
 `./reseed-world.sh` (build + fresh reseed + boot-check) — see
 [`docs/managingtheworld.md`](docs/managingtheworld.md) for the full workflow and
 gotchas.
