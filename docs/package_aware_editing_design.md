@@ -1,18 +1,35 @@
 # Package-aware browsing and editing — design
 
-**Status: design, not built.** Written in response to a direct requirement:
-the image database must contain the Cocoa GUI's own Smalltalk source (not
-just the base world), the main browser must be able to show and edit all of
-it, and accepting an edit must never push a live recompile into a VM that
-doesn't have that source's package loaded. Revised once, in response to
-further direction: every VM should boot from the database rather than raw
-`.mst` files, each loading only the world plus the packages it actually
-needs — which means package-list membership (today: which `.mst` files
-`world.list`/`cocoaui.list` name) has to become a database concept in its
-own right, not just a fact about which files got imported (§4.5). This
-document investigates the current architecture against both — with exact
-file/line citations, not assumptions — and proposes a solution. No code
-changes yet.
+**Status: IMPLEMENTED, milestones M1–M7 (2026-07-19).** The whole ladder
+below is built and committed (`3b03cee` M1, `db9fb8a` M2, `3ade410` M3,
+`a7d9f2e` M4, `2917070` M5, `62e7d53` M6, `fe232f6` M7; plus `c6118b0`, a
+pre-existing `mst.rs` parser bug the M4 work surfaced — a class pragma before
+`| ivars |` silently truncated the rest of the file). The sections below are
+the original design (kept as the record of intent, with exact file/line
+citations that reflect the *pre-implementation* tree); **two claims the build
+proved wrong or changed are corrected inline** where they appear — search for
+"**Update (implemented):**". The two material deviations from this design:
+
+1. **The live-compile gate (§4.4) is TWO round trips, not one folded doit.**
+   The doc's `ifFalse: [ Super subclass: Cls [...] ]` fold is impossible:
+   `X subclass: Y [...]` is a top-level-only special form (un-nestable in a
+   block), and a doit runs only its *first* top-level item
+   (`parse_one_top_item`). The gate must check existence in one `uiDoit:`,
+   then (only if present) ship the reopen in a second. See §4.4's inline note.
+2. **M7 landed in `macvm-gui`, not the bare `macvm` bin** (§4.5, M7 row): the
+   literal target is a dependency cycle (`image_store` depends on `macvm`, so
+   the root bin can't depend on `image_store`). See those inline notes.
+
+Written in response to a direct requirement: the image database must contain
+the Cocoa GUI's own Smalltalk source (not just the base world), the main
+browser must be able to show and edit all of it, and accepting an edit must
+never push a live recompile into a VM that doesn't have that source's package
+loaded. Revised once, in response to further direction: every VM should boot
+from the database rather than raw `.mst` files, each loading only the world
+plus the packages it actually needs — which means package-list membership
+(today: which `.mst` files `world.list`/`cocoaui.list` name) has to become a
+database concept in its own right, not just a fact about which files got
+imported (§4.5).
 
 ## 1. The problem, precisely
 
@@ -52,6 +69,20 @@ calls this out explicitly: "the SAME projection the WKWebView outliner
 renders... so the two GUIs browse identical rows." Since `cocoaui.list` is
 never loaded into a primary, its classes can never appear as rows, in either
 GUI, regardless of what the database contains.
+
+> **Update (implemented, M6):** this was already only half true at design
+> time and the M6 work confirmed it: the *outliner* (`ClassHierarchyOutliner`,
+> the WKWebView tree and the smappl outliner) is the live-reflection path
+> described here, but the multi-pane class *browsers* both GUIs actually ship
+> read their rows from the DATABASE, not a live sweep — the Cocoa
+> `CocoaBrowser` via `host_service.rs`'s `browseRecords` (an
+> `Image::open_read_only` query), the WKWebView browser via a `MockWorld`
+> mirrored from `image.all_classes()`. So once M1 imported `cocoaui.list`,
+> `CocoaHelp` *already* appeared and was editable in the Cocoa browser with no
+> further work — M6's real deliverable was not "make it visible" (already
+> true) but the live-vs-database-only **annotation** (§4.3). The design's
+> premise here — "its classes can never appear as rows" — held only for the
+> live-reflection outliner, never for the DB-backed browser.
 
 **Accepting an edit always live-compiles, unconditionally, in both GUIs.**
 Three save paths, all the same shape:
@@ -196,6 +227,30 @@ Worker uiDoit: doit onReply: [ :r |
                              ' to the image, but live compile failed: ', r ] ] ].
 ```
 
+> **Update (implemented, M5):** the one-folded-doit above **does not work** —
+> discovered empirically, not assumed. Two hard VM constraints kill it: (1)
+> `X subclass: Y [...]` is a *top-level-only special form* — nested inside any
+> block (the `ifFalse:` here) it fails to parse (`expected ']' to close
+> block`); and (2) a doit compiles and runs only its **first** top-level item
+> (`frontend::parser::parse_one_top_item`, SPEC §16.2), so even a
+> `.`-separated `guard. reopen` in one doit silently never reaches the reopen
+> — and because a class-def answers `nil`, an `r = 'nil'` success check
+> *cannot tell* "ran and returned nil" from "never ran", so it looks like it
+> worked until a `ClassMirror selectorsOf:` check shows the method was never
+> installed. The shipped gate is therefore **two round trips**: `Worker
+> uiDoit: '(Worker classNamed: #Cls) notNil'`, and only if that answers
+> `'true'` a second `Worker uiDoit:` ships the reopen. The Cocoa side factors
+> this into one shared helper, `CocoaBrowser>>liveReopen:for:onDone:onSkipped:`
+> (extracting it also avoids a real `uiDoit:onReply:ifFalse:` greedy-keyword
+> misparse an inlined version hit); the WKWebView side is `vm_has_class` +
+> `live_compile_reopen` in `vm_host.rs`. The check/act race two trips open is
+> immaterial for a single-user local dev tool — not worth a new primitive.
+> The `CocoaEditor save` case is left **ungated** on purpose: it ships a full
+> class definition (real ivars via `Image::class_source`), which either boots
+> the class correctly on a first-seen VM or fails an honest compile error —
+> never §3's silent wrong-shape shell — the same reasoning that exempts
+> `acceptClass` just below.
+
 The gate applies to **editing an existing class's method** — `CocoaEditor
 save` and `CocoaBrowser acceptMethod` — because that's the shape §3's bug
 lives in (a reopen assuming the class already has its real shape). It does
@@ -314,7 +369,20 @@ the interpreter-is-the-oracle rule, etc.) actively wants to keep around, not
 retire. Once M2's shared replay logic exists, giving the CLI an *additional*,
 opt-in `--from-image` boot path is a small, low-risk add — but its default
 should stay `.mst`-direct on purpose, not as leftover scope. Listed as a
-**later, optional milestone** (M6 below).
+**later, optional milestone** (M7 below).
+
+> **Update (implemented, M7):** "the bare CLI" turned out to be the wrong
+> home, and for a hard reason: M2 put the shared replay logic in
+> `image_store`, and `image_store` depends on `macvm` — so the root `macvm`
+> bin *cannot* depend on `image_store` (a dependency cycle). The
+> `--from-image` path therefore ships as **`macvm-gui run <file.mst>
+> [--from-image]`** — the `gui` crate depends on both `macvm` and
+> `image_store` and already hosts the `seed`/`render`/`export` CLI
+> subcommands. The bare `macvm run`'s `.mst`-direct boot stays its only mode,
+> exactly as the reasoning above wants. Equivalence is proven by
+> `gui/tests/it_run_from_image.rs` (runs the real binary both ways, asserts
+> identical stdout) on top of `image_store`'s own
+> `db_booted_world_matches_mst_booted_world`.
 
 The WKWebView GUI's own `BrowserSaveSource` handling gets the equivalent
 §4.4 gate for the same reason as before (§3's bug shape doesn't care which
@@ -350,7 +418,7 @@ true under the old "DB-boot loads everything" default.
 | **M4** | `Image::classes_for_lists`; the moved replay fn takes a list-name slice; `macvm-gui` and `macvm-cocoa`'s primary switch to DB-boot requesting `["world"]`; the UI worker requests `["world", "cocoaui"]` | each VM's live `ClassMirror allClasses` sweep matches exactly the classes in its requested lists — no more, no less; existing boot-time tests (`world_image_installs_all_classes_without_error` and friends) still pass against the now-selective boot |
 | **M5** | The live-compile gate (§4.4) in `CocoaEditor`/`CocoaBrowser`, and the WKWebView GUI's equivalent | editing a `CocoaHelp` method while connected to the primary (which requests `["world"]` only) saves to the database and reports "not applied live" — verified by driving the real app (`MACVM_COCOA_CTL`), not assumed; a normal base-world edit is unaffected; same proof, other GUI |
 | **M6** | Database-only rows in the browser (§4.3) | `CocoaHelp` is visible and its source opens for editing from a fresh Cocoa GUI session that never touched it any other way |
-| **M7** | Optional, later: the bare CLI's opt-in `--from-image` boot path | `macvm run --world world --from-image` boots identically to the `.mst`-direct default |
+| **M7** | Optional, later: an opt-in `--from-image` boot path. *(Implemented as `macvm-gui run --from-image`, NOT the bare `macvm` bin — the literal target is a crate cycle; see §4.5's inline note.)* | `macvm-gui run <file> --from-image` boots identically to the `.mst`-direct default (`it_run_from_image.rs`) |
 
 M1–M5 carry the real risk and the actual bug fix (§3); M6 is mostly mapping
 over a proven base; M7 is optional and explicitly deferred — matching this
