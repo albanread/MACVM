@@ -780,6 +780,14 @@ Object subclass: CocoaBrowser [
         OutlineDelegate := MacvmDelegate outlineSourceOn: self.
         Outline onMain setDataSource: OutlineDelegate.
         Outline onMain setDelegate: OutlineDelegate.
+        "The single column fills the pane width (uniform autoresizing) rather
+         than staying a fixed 900px — an oversized column made the row-
+         selection highlight overflow the pane's clip view. Harmless on the
+         left/middle panes (a split divider masked it) but on the RIGHTMOST
+         pane the clip edge IS the window edge, so the selection rectangle's
+         right side ran off-screen. Names too long to fit now ellipsize, the
+         standard browser behavior."
+        Outline onMain setColumnAutoresizingStyle: 1.
         OutlineScroll onMain setDocumentView: Outline.
         ClassPane onMain addSubview: OutlineScroll.
         NewClassBtn := self actionButton: '+ New Class'
@@ -832,6 +840,7 @@ Object subclass: CocoaBrowser [
         VarsDelegate := MacvmDelegate tableSourceOn: VarsFace.
         VarsTable onMain setDataSource: VarsDelegate.
         VarsTable onMain setDelegate: VarsDelegate.
+        VarsTable onMain setColumnAutoresizingStyle: 1. "column fills the pane — see the class pane"
         VarsScroll onMain setDocumentView: VarsTable.
         MiddlePane onMain addSubview: VarsScroll.
 
@@ -865,6 +874,9 @@ Object subclass: CocoaBrowser [
         SelDelegate := MacvmDelegate tableSourceOn: SelFace.
         Table onMain setDataSource: SelDelegate.
         Table onMain setDelegate: SelDelegate.
+        "column fills the pane (the fix's real target — this is the rightmost
+         pane whose selection rectangle ran off-screen; see the class pane)."
+        Table onMain setColumnAutoresizingStyle: 1.
         TableScroll onMain setDocumentView: Table.
         MethodPane onMain addSubview: TableScroll.
         NewMethodBtn := self actionButton: '+ New Method'

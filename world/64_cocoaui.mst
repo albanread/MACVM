@@ -139,27 +139,42 @@ Object subclass: CocoaUI [
         self buildMetricsClusterIn: Toolbar.
     ]
 
-    CocoaUI class >> buildToolbarBackgroundIn: aToolbar [
-        "A subtle tiled grain behind the toolbar contents so the strip reads
-         as a textured surface, not a blank sheet. A pattern NSColor (a plain
-         color — no CGColorRef marshalling, same safety as the mem bar's
-         setFillColor:) fills a borderless custom NSBox sized to the toolbar,
-         added FIRST so every icon/metric renders on top of it, unchanged.
-         Fails soft: a missing texture file just leaves the toolbar plain."
-        | img color boxClass box frame |
+    CocoaUI class >> texturePatternColor [
+        "The tiled grain as a pattern NSColor, or nil if the texture file is
+         missing. A fresh load per strip is cheap and avoids a stale handle
+         across a UI rebuild."
+        | img |
         img := (Cocoa classNamed: 'NSImage') onMain alloc onMain
             initWithContentsOfFile: self toolbarTexturePath.
-        img isNil ifTrue: [ ^self ].
-        color := (Cocoa classNamed: 'NSColor') onMain colorWithPatternImage: img.
-        frame := aToolbar onMain frame.
-        boxClass := Cocoa classNamed: 'NSBox'.
-        box := (boxClass onMain alloc) onMain
-            initWithFrame: (Array with: 0.0 with: 0.0 with: (frame at: 3) with: (frame at: 4)).
+        img isNil ifTrue: [ ^nil ].
+        ^(Cocoa classNamed: 'NSColor') onMain colorWithPatternImage: img
+    ]
+    CocoaUI class >> addTexturedBoxFrame: rect resize: mask in: aParent [
+        "Fill `rect` in `aParent` with the grain pattern — a borderless custom
+         NSBox, plain-color fill (no CGColorRef marshalling, same safety as
+         the mem bar). Added as a subview, so whatever is added AFTER renders
+         on top of it, unchanged. Fails soft: no texture file -> nothing
+         added, `nil` returned. Answers the box (for teardown/z-order)."
+        | color box |
+        color := self texturePatternColor.
+        color isNil ifTrue: [ ^nil ].
+        box := ((Cocoa classNamed: 'NSBox') onMain alloc) onMain initWithFrame: rect.
         box onMain setBoxType: 4.   "NSBoxCustom"
         box onMain setBorderType: 0. "NSNoBorder"
         box onMain setFillColor: color.
-        box onMain setAutoresizingMask: self maskWidthSizable + self maskHeightSizable.
-        aToolbar onMain addSubview: box.
+        box onMain setAutoresizingMask: mask.
+        aParent onMain addSubview: box.
+        ^box
+    ]
+    CocoaUI class >> buildToolbarBackgroundIn: aToolbar [
+        "The grain behind the toolbar contents so the strip reads as a
+         textured surface, not a blank sheet. Called FIRST in buildToolbarIn:,
+         so every icon/metric renders on top of it, unchanged."
+        | frame |
+        frame := aToolbar onMain frame.
+        self addTexturedBoxFrame: (Array with: 0.0 with: 0.0 with: (frame at: 3) with: (frame at: 4))
+             resize: self maskWidthSizable + self maskHeightSizable
+             in: aToolbar.
     ]
 
     CocoaUI class >> metricCellWidth [ ^64.0 ]
@@ -781,6 +796,15 @@ Print it does the same and inserts the result right after it."
         boxClass := Cocoa classNamed: 'NSBox'.
         frame := content onMain frame.
         w := frame at: 3.
+
+        "The grain strip behind the Clear button — same texture as the
+         toolbar, so the transcript dock's control bar isn't a blank sheet
+         either. Added FIRST so the divider + Clear button render on top."
+        self addTexturedBoxFrame:
+            (Array with: 0.0 with: self transcriptHeight - self transcriptStripHeight
+                   with: w with: self transcriptStripHeight)
+            resize: self maskWidthSizable + self maskMaxYMargin
+            in: content.
 
         "A 1px divider right at the dock's own top edge — the existing
          NSScrollView edge alone read as 'not very visible' (user report);
