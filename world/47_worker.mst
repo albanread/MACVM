@@ -327,6 +327,24 @@ Object subclass: Worker [
          and run the continuation on the (String) result."
         ^self uiRequest: #doit args: (Array with: aSource) onReply: aBlock
     ]
+    Worker class >> uiRequest: aVerb args: anArray onReplyTimed: aBlock [
+        "Like uiRequest:args:onReply: but hands the 2-arg block (result, ms):
+         reply element 4 is the primary's eval duration (serveUiDoit:), or 0 when
+         a handler answered a 3-element reply."
+        | c payload |
+        c := self nextCorr.
+        self registerReply: [ :reply |
+            aBlock value: (reply at: 3)
+                   value: (reply size >= 4 ifTrue: [ reply at: 4 ] ifFalse: [ 0 ]) ]
+            fromPeer: 0 corr: c.
+        payload := (Array with: #uiReq with: c with: aVerb), anArray.
+        self primSend: 0 corr: c bytes: (self pickle: payload).
+        ^c
+    ]
+    Worker class >> uiDoit: aSource onReplyTimed: aBlock [
+        "A ⌘P/⌘D that also reports the primary's eval time — aBlock is [:result :ms|]."
+        ^self uiRequest: #doit args: (Array with: aSource) onReplyTimed: aBlock
+    ]
 
     "── primary-side request service (§7.3): dispatch by verb. The (peer, corr)
        context is SNAPSHOTTED into locals at the top, BEFORE any request body
@@ -364,9 +382,15 @@ Object subclass: Worker [
          doit unwinds the whole dispatch and sends no reply (v1, the RPC path's
          property); the watchdog restarts the environment on a genuinely fatal
          doit (§5)."
-        | result |
-        result := self primEvalDoit: aSource.
-        ^self replyTo: peer corr: corr payload: (Array with: #uiReply with: corr with: result printString)
+        | result ms |
+        "Time the eval on the PRIMARY (Time millisecondsToRun: → monotonic
+         Smalltalk millisecondClock) and return the duration as reply element 4.
+         Backward-compatible: reply at: 3 is still the result printString for the
+         plain uiDoit:onReply: callers (browser accepts, liveReopen); only the
+         timed uiDoit:onReplyTimed: reads element 4."
+        ms := Time millisecondsToRun: [ result := self primEvalDoit: aSource ].
+        ^self replyTo: peer corr: corr payload:
+            (Array with: #uiReply with: corr with: result printString with: ms)
     ]
     "Per-view request handlers a specialized primary MAY install (checked
      first); the built-in services below are the defaults. Unknown views

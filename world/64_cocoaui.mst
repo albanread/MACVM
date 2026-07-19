@@ -741,7 +741,8 @@ Print it does the same and inserts the result right after it."
         target := self selectionOrAll.
         source := target at: 1.
         source isEmpty ifTrue: [ ^self ].
-        Worker uiDoit: source onReply: [ :result | CocoaUI appendTranscript: source , ' => ' , result ].
+        Worker uiDoit: source onReplyTimed: [ :result :ms |
+            CocoaUI appendTranscript: source , ' => ' , result , ' (' , ms printString , ' ms)' ].
     ]
 
     CocoaUI class >> printIt [
@@ -753,7 +754,9 @@ Print it does the same and inserts the result right after it."
         source := target at: 1.
         insertAt := target at: 2.
         source isEmpty ifTrue: [ ^self ].
-        Worker uiDoit: source onReply: [ :result | CocoaUI insertPrintResult: result at: insertAt ].
+        Worker uiDoit: source onReplyTimed: [ :result :ms |
+            CocoaUI insertPrintResult: result at: insertAt.
+            CocoaUI appendTranscript: source , ' => ' , result , ' (' , ms printString , ' ms)' ].
     ]
 
     CocoaUI class >> splice: result into: full at: anInteger [
