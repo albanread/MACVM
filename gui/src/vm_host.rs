@@ -83,7 +83,7 @@ use std::time::{Duration, Instant};
 /// The two top-level doIts the `.mst` world runs at load (`Transcript` bind +
 /// `Character initTable`). S22-B moves these into the image; until then they
 /// are replayed explicitly by [`crate::world_boot::load_world_from_image`].
-const WORLD_DOITS: &[&str] = &[
+pub(crate) const WORLD_DOITS: &[&str] = &[
     "Transcript := TranscriptStream new.",
     "Character initTable.",
 ];
@@ -91,7 +91,7 @@ const WORLD_DOITS: &[&str] = &[
 /// The package list(s) this GUI's VMs boot: just the base world (M4,
 /// `docs/package_aware_editing_design.md` §4.5) — the WKWebView GUI has no
 /// Cocoa-GUI-specific role, so it never needs `cocoaui`'s classes live.
-const WORLD_LISTS: &[&str] = &["world"];
+pub(crate) const WORLD_LISTS: &[&str] = &["world"];
 
 /// GUI → VM. `Doit` is the only one with a real (stub) handler; the
 /// `BrowserSelect*` variants drive the class browser view
@@ -947,7 +947,7 @@ impl GameSink for ChannelGameSink {
 /// overrides (including `MACVM_JIT=off`); the library default
 /// (`from_env` → off) is deliberately left alone so the test suite keeps its
 /// pure-interpreter baseline (gate scripts opt in explicitly).
-fn gui_vm_options() -> macvm::runtime::VmOptions {
+pub(crate) fn gui_vm_options() -> macvm::runtime::VmOptions {
     let mut opts = macvm::runtime::VmOptions::from_env();
     if std::env::var_os("MACVM_JIT").is_none() {
         opts.jit = macvm::runtime::JitMode::Threshold(10);
@@ -984,7 +984,7 @@ fn boot_real_vm(
 /// The image database path (S22): `MACVM_IMAGE_PATH` if set, else the
 /// default `<world_dir>/image.sqlite3` — so the DB is the out-of-the-box
 /// source of truth, no env var required.
-fn resolve_image_path(world_dir: &Path) -> PathBuf {
+pub(crate) fn resolve_image_path(world_dir: &Path) -> PathBuf {
     std::env::var_os("MACVM_IMAGE_PATH")
         .map(PathBuf::from)
         .unwrap_or_else(|| world_dir.join("image.sqlite3"))

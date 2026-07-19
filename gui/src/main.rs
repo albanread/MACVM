@@ -417,6 +417,93 @@ fn cmd_seed(args: &[String]) {
     }
 }
 
+/// `macvm-gui run <file.mst> [--world DIR] [--from-image]` (M7,
+/// `docs/package_aware_editing_design.md` §4.5/§6). Boots a VM and runs a
+/// `.mst` program to completion, exactly as the bare `macvm run` CLI does —
+/// with an OPT-IN `--from-image` that boots the world from the SQLite image
+/// (via the M2-extracted `world_boot::load_world_from_image`, requesting the
+/// base `WORLD_LISTS`) instead of the `.mst`-direct default.
+///
+/// Why this lives in `macvm-gui`, not the bare `macvm` bin (the design doc's
+/// literal M7 target): `image_store` depends on `macvm`, so the root `macvm`
+/// bin cannot depend on `image_store` — a dependency cycle. This crate
+/// depends on both, so it is the CLI home for a DB-boot path. The `.mst`
+/// default deliberately stays the bare bin's only mode: it is the DB-free
+/// ground-truth boot oracle the differential tests
+/// (`world_image_installs_all_classes_without_error`) compare against.
+///
+/// Both boot paths must produce identical output — the image is a faithful,
+/// byte-identical projection of the `.mst` world
+/// (`image_store::world_boot::db_booted_world_matches_mst_booted_world` proves
+/// the boot equivalence at the library level; `tests/it_run_from_image.rs`
+/// proves it end-to-end through THIS command).
+fn cmd_run_gui(args: &[String]) {
+    let mut world_dir = PathBuf::from("world");
+    let mut from_image = false;
+    let mut file: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--world" => {
+                i += 1;
+                if let Some(d) = args.get(i) {
+                    world_dir = PathBuf::from(d);
+                }
+            }
+            "--from-image" => from_image = true,
+            other if file.is_none() => file = Some(other.to_string()),
+            other => {
+                eprintln!("macvm-gui run: unexpected argument {other:?}");
+                std::process::exit(2);
+            }
+        }
+        i += 1;
+    }
+    let Some(file) = file else {
+        eprintln!("usage: macvm-gui run <file.mst> [--world DIR] [--from-image]");
+        std::process::exit(2);
+    };
+
+    let opts = vm_host::gui_vm_options();
+    let mut vm = if from_image {
+        let image_path = vm_host::resolve_image_path(&world_dir);
+        let image = match image_store::import::open_or_seed(&world_dir, &image_path) {
+            Ok(img) => img,
+            Err(e) => {
+                eprintln!("macvm-gui run --from-image: {e}");
+                std::process::exit(1);
+            }
+        };
+        let mut vm = macvm::embed::VmHandle::boot_without_world(opts);
+        if let Err(e) = world_boot::load_world_from_image(
+            &mut vm,
+            &image,
+            vm_host::WORLD_LISTS,
+            vm_host::WORLD_DOITS,
+        ) {
+            eprintln!("macvm-gui run --from-image: DB-boot failed: {e}");
+            std::process::exit(1);
+        }
+        vm
+    } else {
+        match macvm::embed::VmHandle::boot(opts, &world_dir) {
+            Ok(vm) => vm,
+            Err(e) => {
+                eprintln!("macvm-gui run: boot failed: {}", e.msg);
+                std::process::exit(1);
+            }
+        }
+    };
+
+    match vm.run_file(Path::new(&file)) {
+        Ok(()) => std::process::exit(vm.exit_code().unwrap_or(0)),
+        Err(e) => {
+            eprintln!("{}", e.msg);
+            std::process::exit(1);
+        }
+    }
+}
+
 /// `macvm-gui export --world DIR` — write the image back over `DIR`'s
 /// `world/*.mst` (in place, surgically) so interactive edits can be reviewed and
 /// checked into source control. Headless complement to `seed` (the reverse
@@ -2511,6 +2598,7 @@ fn main() {
         Some("render") => return cmd_render(&cli[1..]),
         Some("seed") => return cmd_seed(&cli[1..]),
         Some("export") => return cmd_export(&cli[1..]),
+        Some("run") => return cmd_run_gui(&cli[1..]),
         _ => {}
     }
 

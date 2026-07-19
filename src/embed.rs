@@ -1138,6 +1138,25 @@ impl VmHandle {
         frontend::world::load_list(&mut self.vm, path).map_err(|e| VmError { msg: e.to_string() })
     }
 
+    /// Run a `.mst` program file to completion — every top-level item in
+    /// order, exactly as the bare `macvm run <file>` CLI does
+    /// (`frontend::world::load_file`). The file-run analog of [`load_list`]
+    /// (which loads a *world*); an embedder that wants CLI-style "boot, then
+    /// run this program" reaches for this. A compile / uncaught-guest error
+    /// surfaces as [`VmError`]. Any exit code the program set is then read via
+    /// [`exit_code`](Self::exit_code).
+    pub fn run_file(&mut self, path: &Path) -> Result<(), VmError> {
+        frontend::world::load_file(&mut self.vm, path).map_err(|e| VmError { msg: e.to_string() })
+    }
+
+    /// The process exit code a program requested (`Smalltalk exit:` / the
+    /// SPEC exit primitive), or `None` if it never set one — the caller
+    /// (a CLI `run`) propagates it, matching bare `macvm run`'s
+    /// `std::process::exit(vm.exit_code.unwrap_or(0))`.
+    pub fn exit_code(&self) -> Option<i32> {
+        self.vm.exit_code
+    }
+
     /// Flip THIS (primary) VM's transcript so its output is forwarded to the UI
     /// worker's inbox as `{#workerTranscript. 0. text}` envelopes (Cocoa GUI
     /// CG4, `cocoa_gui_design.md` §7.4) — the exact `ForwardTranscript` machinery
