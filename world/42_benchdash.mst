@@ -141,7 +141,7 @@ Object subclass: BenchmarkDashboard [
         | titleH bandH labelW valueW barX0 barMaxW maxMs |
         titleH := 26.
         bandH := (h - titleH) // (rows size max: 1).
-        labelW := 46.
+        labelW := 82.
         valueW := 58.
         barX0 := labelW.
         barMaxW := w - labelW - valueW.
