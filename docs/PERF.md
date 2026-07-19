@@ -543,3 +543,33 @@ deep-copy messages) and blitting complete frames.
   in a debug build (workers at `Threshold(10)`; the JIT-off first cut needed
   ~8 s+ *per band*, the usual reminder that compute workers must warm their
   own JIT).
+
+## Dynamic compiled-code coverage — arith/richards/deltablue/sieve (2026-07-19)
+
+The README's "98.6–99.8% of executed bytecode-work runs as compiled native
+code" headline, reproduced fresh (this exact figure previously existed only
+as an unreferenced measurement, not written down here — this section closes
+that gap). Methodology (drift-immune: exact dispatch counts, not wall clock,
+so no A/B interleaving or throttling caveats apply): `MACVM_TRACE=count`'s
+`bytecodes: N` total, `MACVM_JIT=off` (every bytecode interpreted — total
+work) vs `MACVM_JIT=threshold=200` (compiled code never touches
+`vm.bytecode_count`, so the printed total is exactly the *interpreted
+remainder* — startup/warmup plus anything still running cold):
+
+```sh
+MACVM_JIT=off             MACVM_TRACE=count target/release/macvm run world/bench/<name>.mst --world world
+MACVM_JIT=threshold=200   MACVM_TRACE=count target/release/macvm run world/bench/<name>.mst --world world
+```
+
+| bench | total (off) | interpreted remainder (t=200) | still interpreted | moved to compiled |
+|---|---|---|---|---|
+| arith | 75,008,560 | 158,007 | 0.21% | **99.79%** |
+| richards | 137,183,981 | 262,796 | 0.19% | **99.81%** |
+| deltablue | 102,900,884 | 1,482,697 | 1.44% | **98.56%** |
+| sieve | 5,180,807 | 150,485 | 2.90% | **97.10%** |
+
+Matches the earlier (2026-07-11, HEAD 31f86af) measurement of the same four
+benchmarks to within rounding — the S24/OSR work since then hasn't regressed
+it, and sieve holds at its post-fix 97.1% (the pre-fix figure was 4.5%; see
+the OSR cold-send section above). Range: **98.6–99.8%** — the README's own
+figure, now reproducible from this file alone.

@@ -58,7 +58,9 @@ benchmarks the JIT owns essentially all of the runtime:
 (the remainder are native primitives, which lose nothing by staying native),
 and on real workloads **98.6–99.8% of executed bytecode-work runs as compiled
 native code** — including closures, which compile and splice inline rather than
-allocating. See [`docs/PERF.md`](docs/PERF.md) for the arc and methodology.
+allocating. See [`docs/next_architecture.md`](docs/next_architecture.md) for
+the coverage arc and [`docs/PERF.md`](docs/PERF.md) for the benchmark-by-benchmark
+measurements.
 
 ### What's implemented
 
@@ -138,11 +140,14 @@ allocating. See [`docs/PERF.md`](docs/PERF.md) for the arc and methodology.
   `#workerDied` message. `ParallelMandel` measures **~2.65 CPUs of sustained
   utilization with 4 workers** on the live zooming Mandelbrot — visibly faster
   than the single-VM dive ([`docs/multi-smalltalk-worker.md`](docs/multi-smalltalk-worker.md)).
-- **The object world** — ~82 classes / 840+ methods of hand-written and
-  Strongtalk-ported library (`world/*.mst`): full collections + streams
-  protocol, Dictionary/Set/OrderedCollection, String/Character text utilities,
-  Fraction and LargeInteger arithmetic, an in-language test suite, and the
-  Richards / DeltaBlue / Stanford benchmark ports in `world/bench/`.
+- **The object world** — 107 classes / 1,269 methods of hand-written and
+  Strongtalk-ported library (`world/*.mst`, `world.list`'s own 64 files;
+  counted via `ClassMirror allClasses`, own — not inherited — selectors):
+  full collections + streams protocol, Dictionary/Set/OrderedCollection,
+  String/Character text utilities, Fraction and LargeInteger arithmetic, an
+  in-language test suite, and the Richards / DeltaBlue / Stanford benchmark
+  ports in `world/bench/` (counted separately — loaded on demand, not part
+  of the boot-time figure above).
 - **Scripting** — an embedded RUSTTCL console for driving the VM and its
   debugger ([`docs/RUSTTCL.md`](docs/RUSTTCL.md)).
 
@@ -229,8 +234,13 @@ Apple `clang`, warmed, best-of-30 on the same machine:
 |--------|------|----------|
 | C, ‑O2 (== ‑O3 ‑march=native) | 4.6 ms | 1.0× |
 | C, ‑O0 | 13.1 ms | 2.9× |
-| **MACVM tier‑1 JIT** | **25.2 ms** | **5.5×** |
-| MACVM interpreter | 3406 ms | 745× |
+| **MACVM tier‑1 JIT** | **25.2 ms**¹ | **5.5×** |
+| MACVM interpreter | 3406 ms¹ | 745× |
+
+¹ Independently re-timed 2026-07-19 (23 ms / 3337 ms — within noise; see
+[`docs/float_fastpath_design.md`](docs/float_fastpath_design.md)'s own
+verification note). This repo has no committed C source or build script for
+the two C rows, so only MACVM's own two rows are source-verifiable here.
 
 So the tier‑1 JIT lands **~1.9× off *unoptimized* C and ~5.5× off optimized
 C** — solid-baseline-JIT territory for a dynamic language (the "~30×" above is
@@ -307,6 +317,8 @@ for direct pointers and a fast JIT.
 | [`docs/DESIGN.md`](docs/DESIGN.md) | High-level architecture + decisions of record (D1–D13) |
 | [`docs/PERF.md`](docs/PERF.md) | The performance record: every optimization arc, measured |
 | [`docs/float_fastpath_design.md`](docs/float_fastpath_design.md) | Unboxed float regions: the IR review, the reducer, the `d`-register file, `DoubleSlot` deopt |
+| [`docs/mandelbrot_walkthrough.md`](docs/mandelbrot_walkthrough.md) | The Mandelbrot flagship as a teaching example: 746 ms → 166 ms, 708 MB → 4 MB allocation, walked through arithmetic-vs-representation cost |
+| [`docs/next_architecture.md`](docs/next_architecture.md) | The compiler-coverage arc (now met — ~98.7% of run methods compile): why MACVM's interpreter/JIT boundary exists and what closing it further would take |
 | [`docs/SIMD.md`](docs/SIMD.md) | SIMD vector support (built): `Float64x2`/`Float32x4`/`Int32x4` value classes fused to NEON by the JIT, plus `FloatArray` bulk kernels + reductions |
 | [`docs/FFI.md`](docs/FFI.md) | The foreign-function interface: `dlsym` resolution, shape-keyed trampolines, the `<primitive: FFI …>` pragma, and the `Alien` raw-memory type |
 | [`docs/cocoa_bridge_design.md`](docs/cocoa_bridge_design.md) | The Cocoa bridge (designed): how the moving GC and Cocoa's reference counting coexist — retain-on-wrap `ObjcRef` tickets, zero GC changes, main-thread hops, callback tickets, the C0–C5 ladder |

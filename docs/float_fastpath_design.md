@@ -347,3 +347,26 @@ SmallInteger).
   bit-exact interpreter parity is preferred over the contraction speedup.**
   Revisit only if a workload ever makes the tradeoff worth an explicit
   "IEEE-contraction-permitted" mode gated separately from the strict path.
+
+## Verification (2026-07-19) — README's "How close to C?" table, the MACVM rows
+
+Re-timed `Mandelbrot new pixmapForWidth: 420 height: 220` (default `maxIter:
+120`, warmed 10 calls before the timed one, `Time millisecondsToRun:`) to
+spot-check the README's comparison table, which cites four rows but this
+repo only has build artifacts for two of them — the C `-O2`/`-O0` rows are
+an external yardstick with no C source or benchmark script committed here,
+so they remain unverified by source (flagged separately, not asserted here):
+
+| row | README | reproduced today |
+|---|---|---|
+| MACVM tier-1 JIT (`MACVM_JIT=threshold=10`) | 25.2 ms | **23 ms** |
+| MACVM interpreter (`MACVM_JIT=off`) | 3406 ms | **3337 ms** |
+
+Both within a few percent — consistent with this addendum's own earlier
+"24 ms" flagship baseline above and ordinary machine-load variance (load
+average ~2.6–3.0 at measurement time), not a regression or a stale number.
+The strength-reduced-coordinates/d-register-residency intermediate stages
+in the README's OWN progression table (166 → 38 → 25 ms) aren't otherwise
+written down anywhere in this repo — only the endpoints (746 ms and this
+~25 ms figure) are independently documented, here and in
+`docs/mandelbrot_walkthrough.md`.
