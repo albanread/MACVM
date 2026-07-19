@@ -203,8 +203,17 @@ impl NavState {
     }
 }
 
+/// The GUI's resource root (start page, `assets/`, `reference/`, and the
+/// `.rendered/` scratch dir). Defaults to this crate's source dir
+/// (`CARGO_MANIFEST_DIR`) for a dev `cargo run`, but is overridable via
+/// `MACVM_GUI_ROOT` so a packaged `.app` can point it at a bundled,
+/// writable copy of `gui/` (the app launcher sets this) — the baked
+/// build-time path doesn't exist on another machine, or after the source
+/// tree moves.
 fn gui_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    std::env::var_os("MACVM_GUI_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")))
 }
 
 /// A sentinel `NavState` entry for the class browser view — not a real

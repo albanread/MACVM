@@ -27,3 +27,4 @@
 # `cargo run -p image_store --bin import_world` (docs/IMAGE.md); not source,
 # and grows with live edits made through the GUI class browser.
 /world/*.sqlite3
+/dist/
