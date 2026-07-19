@@ -363,12 +363,39 @@ fn attr_value(tag: &str, name: &str) -> Option<String> {
     Some(tag[start..start + len].to_string())
 }
 
-/// Absolute `file://` URL for a path under the `gui/` crate root
-/// (`CARGO_MANIFEST_DIR`, baked in at build time — fine for a dev/test
-/// shell run via `cargo run`; revisit if this ever ships as an app bundle).
+/// Absolute `file://` URL for a path under the GUI resource root — resolved
+/// at RUNTIME via [`crate::gui_root`] (which honors `MACVM_GUI_ROOT`), NOT the
+/// build-time `CARGO_MANIFEST_DIR`. This is what builds the live page's theme
+/// `<link rel="stylesheet">` and smtk.js `<script src>` (see `chrome_head`),
+/// so a baked build-time path is doubly wrong in a packaged `.app`: it names
+/// the dev checkout (absent on another machine) AND falls outside the
+/// webview's `loadFileURL:allowingReadAccessToURL:<gui_root>` grant, so the
+/// stylesheet/script silently load as nothing — the exact "no theme CSS /
+/// dead themes in the app" symptom. The path is percent-encoded because the
+/// bundled root contains a space (`~/Library/Application Support/MACVM/…`),
+/// which an unencoded `file://` href cannot carry.
 fn gui_file_url(relative: &str) -> String {
-    let root = env!("CARGO_MANIFEST_DIR");
-    format!("file://{root}/{relative}")
+    let full = format!("{}/{relative}", crate::gui_root().to_string_lossy());
+    format!("file://{}", percent_encode_path(&full))
+}
+
+/// Percent-encode a filesystem path for embedding in a `file://` URL: keeps
+/// the path separator and the RFC 3986 unreserved set literal, byte-encodes
+/// everything else (so a space becomes `%20` and any non-ASCII byte is UTF-8
+/// percent-encoded). Enough for a `<link href>`/`<script src>` WKWebView must
+/// resolve; the asset suffixes we pass are plain ASCII, so their `assets/…`
+/// text survives verbatim (the theme tests assert on it).
+fn percent_encode_path(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for b in path.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b'.' | b'-' | b'_' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 /// Rewrite `<a doit="CODE">` → `<a class="doit" href="javascript:void(0)"
@@ -574,7 +601,11 @@ fn statusbar_html(transcript: &str) -> String {
 /// links/images would resolve against `.rendered/` instead of wherever the
 /// original file actually lives.
 fn base_href_tag(dir: &Path) -> String {
-    format!("<base href=\"file://{}/\">", dir.display())
+    // Percent-encode for the same reason `gui_file_url` does: in a packaged
+    // `.app` this directory lives under the spaced bundle root
+    // (`~/Library/Application Support/…`), and an unencoded `file://` base
+    // silently breaks every relative link/image on the page.
+    format!("<base href=\"file://{}/\">", percent_encode_path(&dir.to_string_lossy()))
 }
 
 /// The `zoom` CSS property (non-standard, but WebKit implements it fully —
@@ -1000,6 +1031,42 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn percent_encode_path_encodes_spaces_keeps_separators() {
+        // A space (the packaged bundle root has one) → %20; separators and the
+        // unreserved set pass through so `assets/dark.css` stays readable.
+        assert_eq!(percent_encode_path("/tmp/My Bundle/gui"), "/tmp/My%20Bundle/gui");
+        assert_eq!(percent_encode_path("/plain/ascii-_.~/x.css"), "/plain/ascii-_.~/x.css");
+    }
+
+    /// Regression for "no theme CSS / dead themes in the packaged `.app`": the
+    /// live page's theme stylesheet and smtk.js links must resolve at RUNTIME
+    /// under `gui_root()` (the `MACVM_GUI_ROOT` the launcher sets), NOT the
+    /// baked `CARGO_MANIFEST_DIR` — and must survive the space in the bundle
+    /// root (`~/Library/Application Support/…`). A build-time link there is
+    /// absent on another machine and outside the webview's read-access grant,
+    /// so it loads as nothing.
+    #[test]
+    fn theme_links_use_runtime_gui_root_and_encode_spaces() {
+        let prev = std::env::var_os("MACVM_GUI_ROOT");
+        std::env::set_var("MACVM_GUI_ROOT", "/tmp/My Bundle/gui");
+        let head = chrome_head_extra(Path::new("."), Theme::Dark, 100);
+        // Restore immediately so a failed assert can't leak the override into
+        // sibling tests (they assert only on env-independent relative suffixes).
+        match prev {
+            Some(v) => std::env::set_var("MACVM_GUI_ROOT", v),
+            None => std::env::remove_var("MACVM_GUI_ROOT"),
+        }
+        assert!(
+            head.contains("file:///tmp/My%20Bundle/gui/assets/dark.css"),
+            "theme stylesheet must be rooted at the runtime gui_root, space-encoded: {head}"
+        );
+        assert!(
+            head.contains("file:///tmp/My%20Bundle/gui/assets/smtk.js"),
+            "smtk.js src must be rooted at the runtime gui_root: {head}"
+        );
     }
 
     #[test]
