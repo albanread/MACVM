@@ -63,6 +63,24 @@ Object subclass: BenchmarkDashboard [
         1 to: 200000 do: [:i | last := Association key: i value: last ].
         ^last key
     ]
+    "The two classic OO macro-benchmarks (world/42a_bench_workloads.mst), driven
+     through their are-we-fast-yet setUp/runOne/checkResult: protocol. runOne
+     already verifies its own result; we assert it too so a wrong answer can't
+     masquerade as a fast time."
+    BenchmarkDashboard class >> benchRichards [
+        | r |
+        RichardsBenchmark setUp.
+        r := RichardsBenchmark runOne.
+        (RichardsBenchmark checkResult: r) ifFalse: [ ^self error: 'richards: wrong result' ].
+        ^r
+    ]
+    BenchmarkDashboard class >> benchDeltaBlue [
+        | r |
+        DeltaBlue setUp.
+        r := DeltaBlue runOne.
+        (DeltaBlue checkResult: r) ifFalse: [ ^self error: 'deltablue: wrong result' ].
+        ^r
+    ]
 
     "── timing ──"
 
@@ -98,6 +116,8 @@ Object subclass: BenchmarkDashboard [
         rows add: (self row: 'sieve' block: [ self benchSieve ]).
         rows add: (self row: 'dict'  block: [ self benchDict ]).
         rows add: (self row: 'alloc' block: [ self benchAlloc ]).
+        rows add: (self row: 'richards'  block: [ self benchRichards ]).
+        rows add: (self row: 'deltablue' block: [ self benchDeltaBlue ]).
         ^rows
     ]
     BenchmarkDashboard class >> row: name block: aBlock [
