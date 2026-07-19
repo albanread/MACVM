@@ -56,7 +56,8 @@ Object subclass: CocoaUI [
     <classVars: Win Toolbar ContentHost Transcript TranscriptScroll ActTarget
                 TranscriptText Views ActiveView ToolbarDelegates ToolbarButtons
                 MetricLabels MemBarFill MemBarWidth Workspace WorkspaceScroll
-                WorkspaceTextDelegate TabItems TabIndexes>
+                WorkspaceTextDelegate TabItems TabIndexes
+                TranscriptDivider TranscriptClearBtn>
 
     CocoaUI class >> title [ ^'MACVM' ]
 
@@ -632,21 +633,52 @@ Print it does the same and inserts the result right after it."
     ]
 
     "── the transcript: a SMALL, reverse-chronological dock at the bottom ──"
+    CocoaUI class >> transcriptStripHeight [ ^22.0 ]
+
     CocoaUI class >> buildTranscriptIn: content [
-        | tvClass frame |
+        | tvClass frame w scrollH colorClass boxClass |
         tvClass := Cocoa classNamed: 'NSTextView'.
+        colorClass := Cocoa classNamed: 'NSColor'.
+        boxClass := Cocoa classNamed: 'NSBox'.
         frame := content onMain frame.
+        w := frame at: 3.
+
+        "A 1px divider right at the dock's own top edge — the existing
+         NSScrollView edge alone read as 'not very visible' (user report);
+         this plus the scroll view's own line border below make the dock's
+         boundary unambiguous against the content area above it."
+        TranscriptDivider := (boxClass onMain alloc) onMain
+            initWithFrame: (Array with: 0.0 with: self transcriptHeight - 1.0
+                                  with: w with: 1.0).
+        TranscriptDivider onMain setBoxType: 4. "NSBoxCustom"
+        TranscriptDivider onMain setBorderType: 0. "NSNoBorder"
+        TranscriptDivider onMain setFillColor: colorClass onMain separatorColor.
+        TranscriptDivider onMain setAutoresizingMask: self maskWidthSizable + self maskMaxYMargin.
+        content onMain addSubview: TranscriptDivider.
+
+        "A thin strip for the Clear button, just below the divider — same
+         'controls above content' shape CocoaCanvas/CocoaFind already use."
+        TranscriptClearBtn := self stripButton: 'Clear'
+            frame: (Array with: w - 54.0 with: self transcriptHeight - self transcriptStripHeight
+                          with: 48.0 with: 18.0)
+            action: [ self clearTranscript ]
+            in: content.
+        TranscriptClearBtn onMain setAutoresizingMask: self maskMinXMargin + self maskMaxYMargin.
+
         "Scroll-wrapped: a BARE NSTextView draws past its frame when the text
          outgrows it — long transcripts bled UP over the content view (the
          CG7 'mess' screenshots). The scroll view clips and scrolls."
+        scrollH := self transcriptHeight - self transcriptStripHeight - 1.0.
         TranscriptScroll := ((Cocoa classNamed: 'NSScrollView') onMain alloc) onMain
-            initWithFrame: (Array with: 0.0 with: 0.0
-                                  with: (frame at: 3) with: self transcriptHeight).
+            initWithFrame: (Array with: 0.0 with: 0.0 with: w with: scrollH).
         TranscriptScroll onMain setHasVerticalScroller: true.
+        "NSLineBorder — a plain scroll-view edge reads as barely-there; this
+         draws a clean 1px box around the whole log (user report: 'a more
+         distinct boundary... its not very visible yet')."
+        TranscriptScroll onMain setBorderType: 1.
         TranscriptScroll onMain setAutoresizingMask: self maskWidthSizable + self maskMaxYMargin.
         Transcript := (tvClass onMain alloc) onMain
-            initWithFrame: (Array with: 0.0 with: 0.0
-                                  with: (frame at: 3) with: self transcriptHeight).
+            initWithFrame: (Array with: 0.0 with: 0.0 with: w with: scrollH).
         Transcript onMain setEditable: false.
         Transcript onMain setFont: ((Cocoa classNamed: 'NSFont') onMain
             userFixedPitchFontOfSize: 11.0).
@@ -657,13 +689,47 @@ Print it does the same and inserts the result right after it."
         content onMain addSubview: TranscriptScroll.
     ]
 
+    "Mint a small flat button wired through the SAME CocoaToolbarAction/
+     macvmAction: ticket path registerViewNamed:... uses — CocoaCanvas/
+     CocoaFind's own stripButton:frame:action: shape, added onto aParent
+     directly (they add onto their own Container class var; CocoaUI has
+     none, so the parent is explicit) and tracked in ToolbarDelegates so
+     teardown releases it with everything else."
+    CocoaUI class >> stripButton: title frame: rect action: aBlock in: aParent [
+        | btn holder delegate |
+        btn := ((Cocoa classNamed: 'NSButton') onMain alloc) onMain initWithFrame: rect.
+        btn onMain setTitle: title.
+        btn onMain setBezelStyle: 1.
+        btn onMain setFont: ((Cocoa classNamed: 'NSFont') onMain systemFontOfSize: 10.0).
+        holder := CocoaToolbarAction on: aBlock.
+        delegate := MacvmDelegate actionTargetOn: holder.
+        btn onMain setTarget: delegate.
+        btn onMain setAction: 'macvmAction:'.
+        ToolbarDelegates isNil ifTrue: [ ToolbarDelegates := OrderedCollection new ].
+        ToolbarDelegates add: delegate.
+        aParent onMain addSubview: btn.
+        ^btn
+    ]
+
     CocoaUI class >> appendTranscript: aString [
         "PREPEND — newest line first (reverse chronological, CG5): a log to
          glance at, not read top to bottom. Blast the WHOLE text each change
-         (feedback_blast_dont_patch) — never an incremental NSTextView patch."
+         (feedback_blast_dont_patch) — never an incremental NSTextView patch.
+         Always snaps the visible scroll position back to the very top
+         afterward: newest-first ordering alone only holds until the log
+         outgrows the dock and someone (a prior manual scroll, or growth
+         itself) leaves the viewport anywhere else — a 'log to glance at'
+         must always show the latest line without the viewer scrolling for it."
         TranscriptText isNil ifTrue: [ TranscriptText := '' ].
         TranscriptText := aString , String lf , TranscriptText.
-        Transcript isNil ifFalse: [ Transcript onMain setString: TranscriptText ].
+        Transcript isNil ifFalse: [
+            Transcript onMain setString: TranscriptText.
+            Transcript onMain scrollRangeToVisible: (Array with: 0 with: 0) ].
+    ]
+
+    CocoaUI class >> clearTranscript [
+        TranscriptText := ''.
+        Transcript isNil ifFalse: [ Transcript onMain setString: '' ].
     ]
 
     CocoaUI class >> environmentRestarted [
@@ -703,12 +769,15 @@ Print it does the same and inserts the result right after it."
             ContentHost isNil ifFalse: [ ContentHost isValid ifTrue: [ ContentHost release ] ].
             Transcript isNil ifFalse: [ Transcript isValid ifTrue: [ Transcript release ] ].
             TranscriptScroll isNil ifFalse: [ TranscriptScroll isValid ifTrue: [ TranscriptScroll release ] ].
+            TranscriptDivider isNil ifFalse: [ TranscriptDivider isValid ifTrue: [ TranscriptDivider release ] ].
+            TranscriptClearBtn isNil ifFalse: [ TranscriptClearBtn isValid ifTrue: [ TranscriptClearBtn release ] ].
             TabItems isNil ifFalse: [
                 TabItems do: [ :t | t isValid ifTrue: [ t release ] ] ].
             TabItems := nil. TabIndexes := nil.
             Win isValid ifTrue: [ Win release ].
             Win := nil. Workspace := nil. Toolbar := nil. ContentHost := nil.
             Transcript := nil. TranscriptScroll := nil. ActTarget := nil. ToolbarDelegates := nil.
+            TranscriptDivider := nil. TranscriptClearBtn := nil.
             ToolbarButtons := nil. MetricLabels := nil. Views := nil.
             MemBarFill := nil. MemBarWidth := nil ]
     ]
