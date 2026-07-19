@@ -313,6 +313,38 @@ Object subclass: CocoaBrowser2 [
         SelectedMethod := Methods at: row + 1.
         SourceMode := #source. self syncModeSeg. self renderSource.
     ]
+    "── click actions (wired via setAction: on each table). NSTableView fires
+       tableViewSelectionDidChange: ONLY when the selected INDEX changes, so a
+       re-click on the already-selected row never updates the views. The table's
+       action fires on EVERY click (reading clickedRow), so clicking always
+       refreshes the panes — the fix for 'the 2nd selection does nothing'. Rows
+       are non-editable labels (the columns setEditable: false), so a click
+       selects the row instead of entering cell text-edit. ──"
+    CocoaBrowser2 class >> classClicked [
+        | row |
+        ClassTable isNil ifTrue: [ ^self ].
+        row := ClassTable onMain clickedRow.
+        (row < 0 or: [ Classes isNil or: [ row >= Classes size ] ]) ifTrue: [ ^self ].
+        self selectClass: (Classes at: row + 1).
+    ]
+    CocoaBrowser2 class >> protocolClicked [
+        | row p |
+        ProtoTable isNil ifTrue: [ ^self ].
+        row := ProtoTable onMain clickedRow.
+        (row < 0 or: [ Protocols isNil or: [ row >= Protocols size ] ]) ifTrue: [ ^self ].
+        p := Protocols at: row + 1.
+        SelectedProtocol := p = '(all)' ifTrue: [ nil ] ifFalse: [ p ].
+        Methods := self methodsForProtocol.
+        self deferReload: MethTable.
+    ]
+    CocoaBrowser2 class >> methodClicked [
+        | row |
+        MethTable isNil ifTrue: [ ^self ].
+        row := MethTable onMain clickedRow.
+        (row < 0 or: [ Methods isNil or: [ row >= Methods size ] ]) ifTrue: [ ^self ].
+        SelectedMethod := Methods at: row + 1.
+        SourceMode := #source. self syncModeSeg. self renderSource.
+    ]
 
     "── class selection core (shared by the table click and scripting) ──"
     CocoaBrowser2 class >> selectClass: aName [
@@ -736,6 +768,8 @@ Object subclass: CocoaBrowser2 [
         ClassTable onMain setDataSource: ClassDelegate.
         ClassTable onMain setDelegate: ClassDelegate.
         ClassTable onMain setColumnAutoresizingStyle: 1.
+        ClassCol onMain setEditable: false.
+        self wireAction: ClassTable to: [ self classClicked ].
         ClassScroll onMain setDocumentView: ClassTable.
         ClassListPane onMain addSubview: ClassScroll.
         NewClassBtn := self actionButton: '+ New Class'
@@ -770,6 +804,8 @@ Object subclass: CocoaBrowser2 [
         ProtoTable onMain setDataSource: ProtoDelegate.
         ProtoTable onMain setDelegate: ProtoDelegate.
         ProtoTable onMain setColumnAutoresizingStyle: 1.
+        ProtoCol onMain setEditable: false.
+        self wireAction: ProtoTable to: [ self protocolClicked ].
         ProtoScroll onMain setDocumentView: ProtoTable.
         ProtoPane onMain addSubview: ProtoScroll.
     ]
@@ -790,6 +826,8 @@ Object subclass: CocoaBrowser2 [
         MethTable onMain setDataSource: MethDelegate.
         MethTable onMain setDelegate: MethDelegate.
         MethTable onMain setColumnAutoresizingStyle: 1.
+        MethCol onMain setEditable: false.
+        self wireAction: MethTable to: [ self methodClicked ].
         MethScroll onMain setDocumentView: MethTable.
         MethodPane onMain addSubview: MethScroll.
         NewMethodBtn := self actionButton: '+ New Method'
