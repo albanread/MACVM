@@ -5,6 +5,10 @@
 # class — the GUI boots from the image, NOT the .mst, so a stale image is what
 # makes edits "not show up" or the VM fail to boot. See docs/managingtheworld.md.
 #
+# Seeds from EVERY world/*.list file, not just world.list — world.list first,
+# then every other *.list file found (e.g. cocoaui.list), each recorded as its
+# own package list in the image (docs/package_aware_editing_design.md §4.5).
+#
 # A FRESH rebuild (the default) is the safe choice: it sidesteps the incremental
 # reseed's edge cases (a removed class var, a renamed/removed class, a changed
 # superclass) that an in-place merge can't express.
@@ -34,7 +38,7 @@ if [[ $keep -eq 0 ]]; then
 	rm -f world/image.sqlite3
 fi
 
-echo "▸ seeding world/image.sqlite3 from world/*.mst…"
+echo "▸ seeding world/image.sqlite3 from world/*.mst (every world/*.list)…"
 ./target/release/macvm-gui seed --world world
 
 if [[ $verify -eq 1 ]]; then

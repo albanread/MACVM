@@ -153,6 +153,15 @@ CREATE TABLE IF NOT EXISTS method_sends (
     PRIMARY KEY (method_version_id, selector)
 );
 CREATE INDEX IF NOT EXISTS idx_method_sends_selector ON method_sends(selector);
+CREATE TABLE IF NOT EXISTS package_lists (
+    list_id  INTEGER PRIMARY KEY,
+    name     TEXT NOT NULL UNIQUE
+);
+CREATE TABLE IF NOT EXISTS package_list_members (
+    list_id  INTEGER NOT NULL REFERENCES package_lists(list_id),
+    package  TEXT NOT NULL,
+    UNIQUE(list_id, package)
+);
 CREATE VIEW IF NOT EXISTS latest_class_versions AS
     SELECT cv.* FROM class_versions cv
     WHERE cv.version_number = (SELECT MAX(version_number) FROM class_versions WHERE class_id = cv.class_id);
@@ -291,6 +300,85 @@ impl Image {
              GROUP BY lcv.category ORDER BY first_lo",
         )?;
         let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        rows.collect()
+    }
+
+    /// Named package-list names (`docs/package_aware_editing_design.md` §4.5)
+    /// — a boot request names one or more of these, e.g. `["world"]` or
+    /// `["world", "cocoaui"]`. `list_id` order, which is creation order (the
+    /// importer processes `world.list` before any other `*.list` file, so
+    /// this is also a reasonable "most-foundational-first" default).
+    pub fn package_lists(&self) -> rusqlite::Result<Vec<String>> {
+        let mut stmt = self.conn.prepare("SELECT name FROM package_lists ORDER BY list_id")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        rows.collect()
+    }
+
+    /// The packages `list_name` contains (empty if the list doesn't exist —
+    /// not an error, matching `packages()`'s own "empty is a legitimate
+    /// answer" shape).
+    pub fn packages_in_list(&self, list_name: &str) -> rusqlite::Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT plm.package FROM package_list_members plm \
+             JOIN package_lists pl ON pl.list_id = plm.list_id \
+             WHERE pl.name = ?1 ORDER BY plm.package",
+        )?;
+        let rows = stmt.query_map(params![list_name], |r| r.get::<_, String>(0))?;
+        rows.collect()
+    }
+
+    /// Record that `list_name` contains `package` — idempotent (a re-import
+    /// or an incremental reseed calls this again for the same pair). Creates
+    /// `list_name`'s own `package_lists` row on first mention; no separate
+    /// "create the list" step exists or is needed.
+    pub fn ensure_package_list_member(&self, list_name: &str, package: &str) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO package_lists (name) VALUES (?1)",
+            params![list_name],
+        )?;
+        self.conn.execute(
+            "INSERT OR IGNORE INTO package_list_members (list_id, package) \
+             SELECT list_id, ?2 FROM package_lists WHERE name = ?1",
+            params![list_name, package],
+        )?;
+        Ok(())
+    }
+
+    /// Every class whose package belongs to any of `list_names`, in the
+    /// same dependency-safe `load_order` `all_classes()` uses — a single
+    /// global sequence assigned once at import time, so it sorts correctly
+    /// across any subset of packages without a separate per-list ordering
+    /// column. Boot's entry point for a selective (non-`all_classes()`) load
+    /// (`docs/package_aware_editing_design.md` §4.5) — not yet called by any
+    /// boot path as of this writing (that's a later milestone); exists now
+    /// so the schema and its query are provably correct together.
+    pub fn classes_for_lists(&self, list_names: &[&str]) -> rusqlite::Result<Vec<FullClass>> {
+        if list_names.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = list_names.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT c.name, lcv.superclass_name, lcv.category, lcv.comment, \
+                    lcv.instance_vars, lcv.class_vars, c.load_order \
+             FROM classes c JOIN latest_class_versions lcv ON lcv.class_id = c.class_id \
+             WHERE lcv.deleted = 0 AND lcv.category IN ( \
+                 SELECT DISTINCT plm.package FROM package_list_members plm \
+                 JOIN package_lists pl ON pl.list_id = plm.list_id \
+                 WHERE pl.name IN ({placeholders}) \
+             ) ORDER BY c.load_order"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(list_names.iter()), |r| {
+            Ok(FullClass {
+                name: r.get(0)?,
+                superclass: r.get(1)?,
+                category: r.get(2)?,
+                comment: r.get(3)?,
+                instance_vars: r.get(4)?,
+                class_vars: r.get(5)?,
+                load_order: r.get(6)?,
+            })
+        })?;
         rows.collect()
     }
 

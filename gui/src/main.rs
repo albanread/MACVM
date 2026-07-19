@@ -396,11 +396,12 @@ fn cmd_seed(args: &[String]) {
             std::process::exit(1);
         }
     };
-    match image_store::import::import_world_dir(&image, &world_dir) {
+    match image_store::import::import_all_lists(&image, &world_dir) {
         Ok(stats) => {
             let sends = image.backfill_method_sends().unwrap_or(0);
+            let lists = image.package_lists().unwrap_or_default();
             println!(
-                "seeded {} ({stats:?}, {sends} send-edges indexed)",
+                "seeded {} ({stats:?}, {sends} send-edges indexed, package lists: {lists:?})",
                 image_path.display()
             );
         }
