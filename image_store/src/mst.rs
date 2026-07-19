@@ -247,6 +247,35 @@ impl<'a> Scanner<'a> {
         self.s[start..self.pos].to_string()
     }
 
+    /// Attempts to read a `| ident1 ident2 ... |` instance-variable list at
+    /// the current position. On success (a run of identifiers closed by a
+    /// second `|`), returns them space-joined, having consumed through the
+    /// closing `|`. On failure — `|` actually opens a binary-selector method
+    /// named `|` (`02_nil_boolean.mst`'s `| aBoolean [ ... ]`): one
+    /// identifier then `[`, not another `|` — the position is rewound and
+    /// `None` is returned, so the caller's normal selector/method parsing
+    /// picks it up unchanged. Assumes the caller already confirmed
+    /// `peek() == Some('|')`.
+    fn try_read_ivar_list(&mut self) -> Option<String> {
+        let save = self.pos;
+        self.advance(); // the opening `|`
+        let mut vars = Vec::new();
+        loop {
+            self.skip_ws_and_comments();
+            if self.peek() == Some('|') {
+                self.advance();
+                return Some(vars.join(" "));
+            }
+            match self.read_identifier() {
+                Some(v) => vars.push(v),
+                None => {
+                    self.pos = save; // not actually an ivar list — rewind
+                    return None;
+                }
+            }
+        }
+    }
+
     fn read_bracketed_body(&mut self) -> Option<&'a str> {
         self.skip_ws_and_comments();
         if self.peek() != Some('[') {
@@ -784,30 +813,6 @@ pub fn parse_mst_source(text: &str) -> Vec<ParsedClass> {
         sc.advance(); // consume the class body's opening [
 
         let mut instance_vars = String::new();
-        // Optional "| a b c |" instance-variable declaration, only legal
-        // as the very first thing in the class body.
-        sc.skip_ws_and_comments();
-        if sc.peek() == Some('|') {
-            let save = sc.pos;
-            sc.advance();
-            let mut vars = Vec::new();
-            loop {
-                sc.skip_ws_and_comments();
-                if sc.peek() == Some('|') {
-                    sc.advance();
-                    instance_vars = vars.join(" ");
-                    break;
-                }
-                match sc.read_identifier() {
-                    Some(v) => vars.push(v),
-                    None => {
-                        sc.pos = save; // not actually an ivar list — rewind
-                        break;
-                    }
-                }
-            }
-        }
-
         let mut class_vars = String::new();
         let mut methods = Vec::new();
         loop {
@@ -818,6 +823,25 @@ pub fn parse_mst_source(text: &str) -> Vec<ParsedClass> {
             }
             if sc.peek().is_none() {
                 break;
+            }
+
+            // The "| a b c |" instance-variable declaration — usually the
+            // very first thing in the class body, but a preceding pragma
+            // pushes it later (`<classVars: nil>` before `| Block |` in
+            // `64_cocoaui.mst`'s `CocoaToolbarAction` — a real corpus case
+            // that silently truncated this file's whole remaining parse
+            // before this fix, dropping `CocoaUI` and everything after it).
+            // Tried on every iteration rather than once up front, so it's
+            // recognized regardless of what precedes it.
+            // `try_read_ivar_list` rewinds cleanly when `|` actually opens a
+            // binary method instead (`02_nil_boolean.mst`'s
+            // `| aBoolean [ ... ]`), so real `|` methods still parse as
+            // methods.
+            if sc.peek() == Some('|') {
+                if let Some(vars) = sc.try_read_ivar_list() {
+                    instance_vars = vars;
+                    continue;
+                }
             }
 
             // A class-level pragma, e.g. `<classVars: Table>` or
@@ -1131,5 +1155,84 @@ Object subclass: Message [
         assert!(sels.contains(&"<"), "got {sels:?}");
         assert!(sels.contains(&"<="), "got {sels:?}");
         assert!(sels.contains(&">="), "got {sels:?}");
+    }
+
+    #[test]
+    fn binary_pipe_selector_still_parses_as_a_method_not_an_ivar_list() {
+        // `|` is ALSO a binary selector (`02_nil_boolean.mst`'s `True | aBoolean`,
+        // `False | aBoolean`) — `try_read_ivar_list`'s rewind-on-failure must not
+        // swallow it. One identifier followed by `[` (not a second `|`) is a
+        // method, not an ivar list.
+        let src = "Object subclass: True [\n    | aBoolean [ ^true ]\n]\n";
+        let c = &parse_mst_source(src)[0];
+        assert!(
+            c.instance_vars.is_empty(),
+            "a `| param [` method must not be mistaken for an ivar list, got {:?}",
+            c.instance_vars
+        );
+        let sels: Vec<&str> = c.methods.iter().map(|m| m.selector.as_str()).collect();
+        assert!(sels.contains(&"|"), "got {sels:?}");
+    }
+
+    #[test]
+    fn a_pragma_before_the_ivar_list_does_not_truncate_the_rest_of_the_class_or_file() {
+        // The real bug (`64_cocoaui.mst`'s `CocoaToolbarAction`): a
+        // `<classVars: …>` pragma before `| ivars |` used to leave the ivar
+        // list unrecognized (the one-shot check only looked immediately after
+        // `[`), so the orphaned `|` was misread as starting a binary-selector
+        // method, its "parameter" ate the ivar name, no `[` followed, and the
+        // whole per-member loop silently gave up — dropping that class's
+        // methods AND every class after it in the file (the outer loop
+        // couldn't resync either). Minimal shape reproducing it: a pragma,
+        // THEN ivars, THEN a real method, THEN a second class.
+        let src = "Object subclass: First [\n    <classVars: nil>\n    | Block |\n    setBlock: aBlock [ Block := aBlock ]\n]\nObject subclass: Second [\n    two [ ^2 ]\n]\n";
+        let classes = parse_mst_source(src);
+        assert_eq!(
+            classes.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+            vec!["First", "Second"],
+            "both classes must survive — a pragma before the ivar list must not truncate the file"
+        );
+        assert_eq!(classes[0].instance_vars, "Block");
+        assert_eq!(
+            classes[0].methods.iter().map(|m| m.selector.as_str()).collect::<Vec<_>>(),
+            vec!["setBlock:"]
+        );
+        assert_eq!(
+            classes[1].methods.iter().map(|m| m.selector.as_str()).collect::<Vec<_>>(),
+            vec!["two"]
+        );
+    }
+
+    #[test]
+    fn the_real_64_cocoaui_mst_file_yields_cocoaui_with_its_full_method_set() {
+        // End-to-end regression guard on the actual corpus file, not just the
+        // synthetic shape above: `CocoaUI` (and everything declared after it —
+        // `CocoaToolbarAction` is first in the file) must come back, with a
+        // real method count, not silently vanish.
+        let text = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../world/64_cocoaui.mst"),
+        )
+        .unwrap();
+        let classes = parse_mst_source(&text);
+        let names: Vec<&str> = classes.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["CocoaToolbarAction", "CocoaUI"],
+            "both classes in 64_cocoaui.mst must parse"
+        );
+        let toolbar_action = &classes[0];
+        assert_eq!(toolbar_action.instance_vars, "Block");
+        assert_eq!(
+            toolbar_action.methods.iter().map(|m| m.selector.as_str()).collect::<Vec<_>>(),
+            vec!["on:", "setBlock:", "macvmAction:"]
+        );
+        let cocoa_ui = &classes[1];
+        assert!(
+            cocoa_ui.methods.len() > 20,
+            "CocoaUI has dozens of real methods (CG2/CG4/CG5/CG6), got {}",
+            cocoa_ui.methods.len()
+        );
+        assert!(cocoa_ui.methods.iter().any(|m| m.selector == "title" && m.is_class_side));
+        assert!(cocoa_ui.methods.iter().any(|m| m.selector == "startup" && m.is_class_side));
     }
 }
