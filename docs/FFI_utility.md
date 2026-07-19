@@ -144,9 +144,15 @@ ship an updated build — the running app never needs the database.
 
 ## Real limits (independent of `cocoa_data`)
 
-- **Variadic C functions** (`printf`, `open` with the optional mode) — the FFI
-  primitive is fixed-arity; wrap them in a non-variadic shim or a dedicated
-  primitive.
+- **Variadic C functions** (`printf`, `open` with the optional `mode`) — the
+  FFI primitive is fixed-arity, so a variadic tail mis-marshals (arm64
+  stack-passes variadic args while the trampoline loads registers). Three ways
+  out, cheapest first: reach for a non-variadic libc equivalent, split the
+  call, or add a shim/primitive. `world/61_posix_io.mst` takes the first two
+  for files — it binds the fixed 2-arg `creat(path, mode)` to create/truncate
+  and `open(path, flags)` (never `O_CREAT`, whose `mode` is the variadic tail)
+  to open existing files, so `PosixFile` reaches the whole file surface with no
+  variadic call at all.
 - **Block / function-pointer arguments** to ObjC methods — the dynamic bridge
   doesn't synthesize a C callback from a Smalltalk block for arbitrary
   signatures (the reverse path is the C6 delegate mechanism, not a general
@@ -160,6 +166,27 @@ For any of these, the fix is Rust-side (extend the bridge / add a primitive),
 not a data lookup — `cocoa_data` classifies ABIs, it doesn't remove these
 marshalling gaps.
 
+## Worked example — whole-file access
+
+Both paths side by side: the two file classes (pure Smalltalk, zero new Rust).
+
+- **`PosixFile`** (`world/61_posix_io.mst`, Path B) — byte-exact fd I/O over
+  `open`/`creat`/`read`/`write`/`lseek`/`close` bindings; whole-file
+  `slurp:`/`spit:contents:` on a `NativeBuffer`.
+- **`CocoaFile`** (`world/49a_cocoafile.mst`, Path A) — UTF-8 text through
+  `NSString`'s own file methods, sent with the direct bridge (no binding, so it
+  also works headless).
+
+```smalltalk
+PosixFile spit: '/tmp/x' contents: 'raw bytes'.    PosixFile slurp: '/tmp/x'.
+CocoaFile spit: '/tmp/x' contents: 'héllo ☕'.       CocoaFile slurp: '/tmp/x'.
+```
+
+`PosixFile` moves bytes verbatim (binary-safe: a `String` and a `ByteArray`
+are both byte-indexed, so a file's bytes *are* a String's UTF-8); `CocoaFile`
+decodes/encodes UTF-8 explicitly (a non-UTF-8 file slurps as `nil`). On valid
+UTF-8 the two interoperate byte-for-byte.
+
 ## See also
 
 - [`FFI.md`](FFI.md) — the FFI design, the two-tier model, the native call
@@ -169,4 +196,5 @@ marshalling gaps.
 - The FFI primitive + `dlsym` resolution: `src/runtime/ffi.rs`,
   `src/codecache/ffi_stubs.rs`.
 - Worked bindings in the world: `world/30_date_time.mst`,
-  `world/61_posix_io.mst`, `world/49_cocoa.mst`.
+  `world/61_posix_io.mst` (POSIX + `PosixFile`), `world/49_cocoa.mst`,
+  `world/49a_cocoafile.mst` (`CocoaFile`).
