@@ -129,13 +129,23 @@ fn doit_assigned_global(doit: &str) -> Option<&str> {
 /// `Transcript := TranscriptStream new.` and `Character initTable.`); S22-B
 /// moves them into the image (a doits table + `Image::all_doits`), after
 /// which this reads them from `image` and drops the parameter.
+///
+/// `list_names` selects which package lists to load
+/// (`docs/package_aware_editing_design.md` §4.5, M4) — `Image::
+/// classes_for_lists`, not `all_classes()`, so a VM boots exactly the world
+/// plus the packages it needs, no more. Pass `&["world"]` for a VM with no
+/// Cocoa-GUI role; a UI worker also wanting `cocoaui`'s classes passes
+/// `&["world", "cocoaui"]`. `classes_for_lists` already sorts by the same
+/// global `load_order` `all_classes()` used, so this is a pure narrowing —
+/// dependency-safety is unaffected by which subset is requested.
 pub fn load_world_from_image(
     vm: &mut VmHandle,
     image: &Image,
+    list_names: &[&str],
     doits: &[&str],
 ) -> Result<LoadStats, String> {
     let classes = image
-        .all_classes()
+        .classes_for_lists(list_names)
         .map_err(|e| format!("reading classes from image: {e}"))?;
 
     // Phase 1: bind every class global (shells only) in load_order.
@@ -315,7 +325,7 @@ mod tests {
         // just below) is compile-only and can't DNU, so ordering is fine.
         macvm::embed::set_fatal_mode(macvm::embed::FatalMode::ExitProcess);
 
-        let stats = load_world_from_image(&mut db_vm, &image, &doits).expect("db load");
+        let stats = load_world_from_image(&mut db_vm, &image, &["world"], &doits).expect("db load");
 
         let expected: Vec<Result<String, String>> = battery
             .iter()
@@ -352,7 +362,7 @@ mod tests {
         let (image, path) = seed_image();
         let mut vm = VmHandle::boot_without_world(opts());
         let doits = ["Transcript := TranscriptStream new.", "Character initTable."];
-        let result = load_world_from_image(&mut vm, &image, &doits);
+        let result = load_world_from_image(&mut vm, &image, &["world"], &doits);
         std::fs::remove_file(&path).ok();
         match result {
             Ok(stats) => assert!(stats.classes >= 40, "expected the whole world, got {stats:?}"),
@@ -373,6 +383,7 @@ mod tests {
         load_world_from_image(
             &mut vm,
             &image,
+            &["world"],
             &[
                 "Transcript := TranscriptStream new.",
                 "Character initTable.",

@@ -88,6 +88,11 @@ const WORLD_DOITS: &[&str] = &[
     "Character initTable.",
 ];
 
+/// The package list(s) this GUI's VMs boot: just the base world (M4,
+/// `docs/package_aware_editing_design.md` §4.5) — the WKWebView GUI has no
+/// Cocoa-GUI-specific role, so it never needs `cocoaui`'s classes live.
+const WORLD_LISTS: &[&str] = &["world"];
+
 /// GUI → VM. `Doit` is the only one with a real (stub) handler; the
 /// `BrowserSelect*` variants drive the class browser view
 /// (`browser_render.rs`) against `macvm-mock-vm`'s invented class world —
@@ -834,7 +839,7 @@ fn worker_loop(
                     }
                 })?;
                 let mut h = VmHandle::boot_without_world(gui_vm_options());
-                crate::world_boot::load_world_from_image(&mut h, &img, WORLD_DOITS)
+                crate::world_boot::load_world_from_image(&mut h, &img, WORLD_LISTS, WORLD_DOITS)
                     .map_err(|msg| macvm::runtime::VmError { msg })?;
                 Ok(h)
             })
@@ -988,31 +993,13 @@ fn resolve_image_path(world_dir: &Path) -> PathBuf {
 /// Opens the image at `image_path` (creating the file if missing), seeding
 /// it from `world_dir`'s `.mst` files the first time (when it has no
 /// classes) so a fresh checkout Just Works with zero setup. `docs/IMAGE.md`
-/// §6/§8.
+/// §6/§8. A thin wrapper: the real logic moved to `image_store::import::
+/// open_or_seed` (M4, `docs/package_aware_editing_design.md` §4.5) so
+/// `cocoa_gui` shares it rather than duplicating it — `image_store`'s own
+/// doc comment on that function explains why `world.list`-only would have
+/// been a real bug for the other GUI.
 fn open_or_seed_image(world_dir: &Path, image_path: &Path) -> Result<image_store::Image, String> {
-    let image = image_store::Image::open(image_path)
-        .map_err(|e| format!("opening image {}: {e}", image_path.display()))?;
-    let empty = image
-        .all_classes()
-        .map_err(|e| format!("reading image {}: {e}", image_path.display()))?
-        .is_empty();
-    if empty {
-        let stats = image_store::import::import_world_dir(&image, world_dir)?;
-        eprintln!(
-            "vm_host: seeded {} from {} ({} classes, {} methods)",
-            image_path.display(),
-            world_dir.display(),
-            stats.classes,
-            stats.methods
-        );
-    }
-    // Ensure the senders index (method_sends) is populated: a no-op once full, a
-    // one-time backfill on an image seeded before senders-indexing existed.
-    match image.backfill_method_sends() {
-        Ok(n) if n > 0 => eprintln!("vm_host: backfilled {n} method-send edges for senders"),
-        _ => {}
-    }
-    Ok(image)
+    image_store::import::open_or_seed(world_dir, image_path)
 }
 
 /// File ▸ "Save World to Files" — write the image back over `world/*.mst`
@@ -1075,7 +1062,7 @@ fn boot_vm_from_image(
         responses: responses.clone(),
         wake,
     }));
-    match crate::world_boot::load_world_from_image(&mut vm, image, WORLD_DOITS) {
+    match crate::world_boot::load_world_from_image(&mut vm, image, WORLD_LISTS, WORLD_DOITS) {
         Ok(stats) => {
             eprintln!(
                 "vm_host: booted VM from image ({} classes, {} methods, {} doits)",
@@ -3407,7 +3394,7 @@ mod tests {
             jit: macvm::runtime::JitMode::Off,
             ..Default::default()
         });
-        crate::world_boot::load_world_from_image(&mut vm, &image, WORLD_DOITS).expect("db load");
+        crate::world_boot::load_world_from_image(&mut vm, &image, WORLD_LISTS, WORLD_DOITS).expect("db load");
         let mut world = MockWorld::seed();
         let mut sel = BrowserSelection::default();
 
@@ -3474,7 +3461,7 @@ mod tests {
             jit: macvm::runtime::JitMode::Off,
             ..Default::default()
         });
-        crate::world_boot::load_world_from_image(&mut vm, &image, WORLD_DOITS).expect("db load");
+        crate::world_boot::load_world_from_image(&mut vm, &image, WORLD_LISTS, WORLD_DOITS).expect("db load");
         let mut world = MockWorld::seed();
         let mut sel = BrowserSelection::default();
 
@@ -3542,7 +3529,7 @@ mod tests {
             jit: macvm::runtime::JitMode::Off,
             ..Default::default()
         });
-        crate::world_boot::load_world_from_image(&mut vm, &image, WORLD_DOITS).expect("db load");
+        crate::world_boot::load_world_from_image(&mut vm, &image, WORLD_LISTS, WORLD_DOITS).expect("db load");
         let mut world = MockWorld::seed();
         let mut sel = BrowserSelection::default();
 
@@ -3637,7 +3624,7 @@ mod tests {
             jit: macvm::runtime::JitMode::Off,
             ..Default::default()
         });
-        crate::world_boot::load_world_from_image(&mut vm, &image, WORLD_DOITS).expect("db load");
+        crate::world_boot::load_world_from_image(&mut vm, &image, WORLD_LISTS, WORLD_DOITS).expect("db load");
         let mut world = MockWorld::seed();
 
         // A new method on an existing class (Point, already used above).
@@ -3716,7 +3703,7 @@ mod tests {
             jit: macvm::runtime::JitMode::Off,
             ..Default::default()
         });
-        crate::world_boot::load_world_from_image(&mut vm, &image, WORLD_DOITS).expect("db load");
+        crate::world_boot::load_world_from_image(&mut vm, &image, WORLD_LISTS, WORLD_DOITS).expect("db load");
         let mut world = MockWorld::seed();
         let mut selection = BrowserSelection::default();
 
@@ -3793,7 +3780,7 @@ mod tests {
             jit: macvm::runtime::JitMode::Off,
             ..Default::default()
         });
-        crate::world_boot::load_world_from_image(&mut vm, &image, WORLD_DOITS).expect("db load");
+        crate::world_boot::load_world_from_image(&mut vm, &image, WORLD_LISTS, WORLD_DOITS).expect("db load");
 
         let mut world = MockWorld::seed();
         let mut selection = BrowserSelection::default();
@@ -3841,7 +3828,7 @@ mod tests {
             jit: macvm::runtime::JitMode::Off,
             ..Default::default()
         });
-        crate::world_boot::load_world_from_image(&mut vm, &image, WORLD_DOITS).expect("db load");
+        crate::world_boot::load_world_from_image(&mut vm, &image, WORLD_LISTS, WORLD_DOITS).expect("db load");
 
         let html = vm
             .render_fragment("Button labeled: 'DB' action: [ :b | b ]")
@@ -4443,7 +4430,7 @@ mod tests {
             jit: macvm::runtime::JitMode::Off,
             ..Default::default()
         });
-        crate::world_boot::load_world_from_image(&mut vm, &image, WORLD_DOITS).expect("db load");
+        crate::world_boot::load_world_from_image(&mut vm, &image, WORLD_LISTS, WORLD_DOITS).expect("db load");
 
         vm.exec(
             "Object subclass: FFIProbe [\n\
@@ -4482,7 +4469,7 @@ mod tests {
             jit: macvm::runtime::JitMode::Off,
             ..Default::default()
         });
-        crate::world_boot::load_world_from_image(&mut vm, &image, WORLD_DOITS).expect("db load");
+        crate::world_boot::load_world_from_image(&mut vm, &image, WORLD_LISTS, WORLD_DOITS).expect("db load");
 
         let parse_ms = |vm: &mut VmHandle| -> i64 {
             vm.eval("Time millisecondClockValue.")

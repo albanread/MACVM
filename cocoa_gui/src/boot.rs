@@ -41,6 +41,29 @@ use macvm::runtime::{JitMode, VmError, VmOptions};
 /// `VmOptions::from_env`'s `MACVM_HEAP`.
 const DEFAULT_HEAP_MIB: usize = 512;
 
+/// The two top-level doIts the `.mst` world runs at load — mirrors `gui/src/
+/// vm_host.rs`'s own `WORLD_DOITS` verbatim (a 2-line constant, not worth a
+/// third `image_store` extraction the way `world_boot.rs` itself was: S22-B
+/// moves these into the image, at which point both copies disappear).
+pub(crate) const WORLD_DOITS: &[&str] = &[
+    "Transcript := TranscriptStream new.",
+    "Character initTable.",
+];
+
+/// The package lists the PRIMARY (and, inheriting its boot closure, every
+/// compute worker it spawns) boots: just the base world (M4,
+/// `docs/package_aware_editing_design.md` §4.5) — the persistent environment
+/// never runs AppKit UI code, so `cocoaui`'s classes would be dead weight
+/// there, same role split as before, now expressed as a DB query instead of
+/// which raw `.mst` files got read.
+pub(crate) const PRIMARY_LISTS: &[&str] = &["world"];
+
+/// The package lists the UI WORKER boots: the base world plus its own
+/// implementation (`CocoaUI`/`CocoaBrowser`/`CocoaHelp`/etc.) — the two
+/// `.list` files `world/cocoaui.list`'s own header comment already
+/// documents, now requested by name instead of layered via `load_list`.
+pub(crate) const UI_WORKER_LISTS: &[&str] = &["world", "cocoaui"];
+
 /// The two wired VMs handed back to `main.rs` after the handshake, with the run
 /// loop **not yet entered**. `ui_worker` is booted in place on the current
 /// (main) thread; the primary lives on `primary_thread`.
@@ -68,28 +91,41 @@ pub struct WiredVms {
 }
 
 /// Boot the UI worker VM **in place on the current (main) thread** and wire it to
-/// the primary (Cocoa GUI CG4): boot the base world, flip to `ui_fatal_mode`
-/// (`ExitProcess` on main — CG0), layer the conditional `cocoaui.list`, and take
-/// on the Worker role so its `reply:`/`uiRequest:` reach the primary through
-/// `to_primary`. `id`/`to_primary` come from the primary's
+/// the primary (Cocoa GUI CG4): boot from the image database (M4,
+/// `docs/package_aware_editing_design.md` §4.5) requesting [`UI_WORKER_LISTS`]
+/// — the base world plus its own implementation — flip to `ui_fatal_mode`
+/// (`ExitProcess` on main — CG0), and take on the Worker role so its
+/// `reply:`/`uiRequest:` reach the primary through `to_primary`. `id`/
+/// `to_primary` come from the primary's
 /// [`macvm::embed::VmHandle::register_hosted_worker`] (via the watchdog
 /// supervisor); on a respawn the caller re-points the role in place
 /// (`install_worker_role`), never re-booting the UI worker (it holds no durable
 /// state — `feedback_recover_clean_or_die`).
+///
+/// `world_dir` is still needed here, not just `image_path`: [`image_store::
+/// import::open_or_seed`] falls back to it to seed a missing/empty image —
+/// the `.mst` files remain the checked-in source of truth the database is
+/// derived from, this just changes which one boot itself reads from.
 pub fn boot_ui_worker(
     world_dir: &std::path::Path,
-    cocoaui_list: &std::path::Path,
+    image_path: &std::path::Path,
     ui_fatal_mode: FatalMode,
     id: u32,
     to_primary: InboxSender,
 ) -> Result<VmHandle, VmError> {
-    let mut ui = VmHandle::boot(vm_options(), world_dir).map_err(|e| VmError {
-        msg: format!("UI worker boot failed: {}", e.msg),
+    let image = image_store::import::open_or_seed(world_dir, image_path).map_err(|msg| VmError {
+        msg: format!("UI worker image open/seed failed: {msg}"),
     })?;
+    let mut ui = VmHandle::boot_without_world(vm_options());
+    // CG0: flip to the caller's fatal mode BEFORE any work that could fault —
+    // same ordering `handshake_wire_vms` already documents (a true fatal on
+    // main must exit the PROCESS, not `pthread_exit` main into a headless
+    // zombie; `boot_without_world` arms the library default, `ExitThread`).
     macvm::embed::set_fatal_mode(ui_fatal_mode);
-    ui.load_list(cocoaui_list).map_err(|e| VmError {
-        msg: format!("loading {} failed: {}", cocoaui_list.display(), e.msg),
-    })?;
+    image_store::world_boot::load_world_from_image(&mut ui, &image, UI_WORKER_LISTS, WORLD_DOITS)
+        .map_err(|msg| VmError {
+            msg: format!("UI worker DB-boot failed: {msg}"),
+        })?;
     ui.install_worker_role(id, to_primary);
     Ok(ui)
 }
@@ -406,6 +442,80 @@ mod tests {
         // its boot poke arrived). Dropping `wired` detaches it — exactly the
         // pre-`[NSApp run]` state the bin enters the run loop in.
         drop(wired);
+    }
+
+    /// M4 (`docs/package_aware_editing_design.md` §4.5, §6 M4): [`boot_ui_worker`]
+    /// now DB-boots, requesting [`UI_WORKER_LISTS`] (world + cocoaui) — while a
+    /// VM that requests only [`PRIMARY_LISTS`] (world) from the SAME image gets
+    /// none of the cocoaui classes. This is the M4 proof criterion itself: each
+    /// VM's live class set matches exactly its requested lists — now a DB query,
+    /// not which `.mst` files happened to get read.
+    #[test]
+    fn boot_ui_worker_db_boots_world_plus_cocoaui_selectively() {
+        use macvm::runtime::workers::WorkerBootFn;
+
+        let wd = world_dir();
+        let image_path = std::env::temp_dir().join(format!(
+            "macvm_boot_ui_worker_test_{}.sqlite3",
+            std::process::id()
+        ));
+        std::fs::remove_file(&image_path).ok();
+
+        // A real primary, to mint a genuine (id, InboxSender) link the way
+        // `main.rs` does — `boot_ui_worker` takes a live link, not a stub. The
+        // primary itself boots from `.mst` (mirroring `supervisor::tests::
+        // boot_fn`) — its own DB-boot correctness is proven elsewhere
+        // (`image_store::world_boot`'s and `open_or_seed`'s own tests); here it's
+        // only a means to a real link.
+        let world_for_primary = wd.clone();
+        let primary_boot: WorkerBootFn = Arc::new(move || VmHandle::boot(vm_options(), &world_for_primary));
+        let (_sup, link) = crate::supervisor::PrimarySupervisor::spawn(primary_boot, Arc::new(|| {}))
+            .expect("boot a primary to link the UI worker against");
+
+        let mut ui = boot_ui_worker(
+            &wd,
+            &image_path,
+            FatalMode::ExitThread,
+            link.hosted_id,
+            link.to_primary.clone(),
+        )
+        .expect("boot_ui_worker must DB-boot cleanly");
+
+        // Live, and BOTH lists present (world + cocoaui, UI_WORKER_LISTS) — the
+        // same two assertions `boot_handshake_wires_both_vms_headless` makes of
+        // the old `.mst`-file boot, now proven of the DB-boot path.
+        assert_eq!(
+            ui.eval("3 + 4").expect("world content must be live").trim(),
+            "7"
+        );
+        assert_eq!(
+            ui.eval("CocoaUIStub ping")
+                .expect("CocoaUIStub (cocoaui list) must be present on a UI_WORKER_LISTS boot")
+                .trim(),
+            "#cocoaUiStubReady"
+        );
+        let title = ui
+            .eval("CocoaUI title")
+            .expect("CocoaUI (cocoaui list) must be present on a UI_WORKER_LISTS boot");
+        assert!(title.contains("MACVM"), "got {title}");
+        drop(ui);
+
+        // The selectivity proof: the SAME (already-seeded) image, booted fresh
+        // with PRIMARY_LISTS (world only), must NOT see the cocoaui classes —
+        // the design's rejected alternative was "load everything,
+        // unconditionally"; this is the regression guard against silently
+        // sliding back to that.
+        let image =
+            image_store::import::open_or_seed(&wd, &image_path).expect("reopen the already-seeded image");
+        let mut primary_only = VmHandle::boot_without_world(vm_options());
+        image_store::world_boot::load_world_from_image(&mut primary_only, &image, PRIMARY_LISTS, WORLD_DOITS)
+            .expect("world-only DB-boot must succeed");
+        let result = primary_only.eval("CocoaUI title");
+        std::fs::remove_file(&image_path).ok();
+        assert!(
+            result.is_err(),
+            "a world-only boot must NOT see CocoaUI (cocoaui was never requested), got {result:?}"
+        );
     }
 
     /// The thread-local `*mut VmHandle` (CG3 stub) round-trips: null by default,

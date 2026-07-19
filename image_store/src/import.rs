@@ -68,6 +68,41 @@ fn list_name_from_filename(list_file: &str) -> &str {
     list_file.strip_suffix(".list").unwrap_or(list_file)
 }
 
+/// Opens the image at `image_path` (creating the file if missing), seeding it
+/// from `world_dir`'s `.mst` files (every `*.list` — [`import_all_lists`],
+/// M4) the first time (when it has no classes), so a fresh checkout Just
+/// Works with zero setup. Shared by both GUIs
+/// (`docs/package_aware_editing_design.md` M2's "move the shared logic, don't
+/// duplicate it" precedent) — `gui/src/vm_host.rs`'s own `open_or_seed_image`
+/// used to do this itself, `world.list`-only, which would have silently left
+/// `macvm-cocoa`'s UI worker unable to find `cocoaui`'s classes in an
+/// auto-seeded image nobody ran `reseed-world.sh` against first.
+pub fn open_or_seed(world_dir: &Path, image_path: &Path) -> Result<Image, String> {
+    let image = Image::open(image_path)
+        .map_err(|e| format!("opening image {}: {e}", image_path.display()))?;
+    let empty = image
+        .all_classes()
+        .map_err(|e| format!("reading image {}: {e}", image_path.display()))?
+        .is_empty();
+    if empty {
+        let stats = import_all_lists(&image, world_dir)?;
+        eprintln!(
+            "image_store: seeded {} from {} ({} classes, {} methods)",
+            image_path.display(),
+            world_dir.display(),
+            stats.classes,
+            stats.methods
+        );
+    }
+    // Ensure the senders index (method_sends) is populated: a no-op once full,
+    // a one-time backfill on an image seeded before senders-indexing existed.
+    match image.backfill_method_sends() {
+        Ok(n) if n > 0 => eprintln!("image_store: backfilled {n} method-send edges for senders"),
+        _ => {}
+    }
+    Ok(image)
+}
+
 /// Imports every file named in `world_dir/<list_file>` (in that order) into
 /// `image`, and records each file's derived package as a member of
 /// `<list_file>`'s own package list ([`list_name_from_filename`]). A class

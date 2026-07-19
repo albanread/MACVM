@@ -53,7 +53,9 @@ fn writer() -> Result<Image, String> {
 /// The image the source pane reads: `MACVM_IMAGE_PATH` or the same
 /// `world/image.sqlite3` default the WKWebView GUI browses. Opened per call —
 /// a click-driven read, and never holding a connection across the run loop.
-fn image_path() -> PathBuf {
+/// `pub(crate)`: `boot.rs` reuses this exact resolution (M4,
+/// `docs/package_aware_editing_design.md` §4.5) rather than a second copy.
+pub(crate) fn image_path() -> PathBuf {
     std::env::var_os("MACVM_IMAGE_PATH")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("world/image.sqlite3"))

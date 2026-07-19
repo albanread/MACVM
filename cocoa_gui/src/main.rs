@@ -51,11 +51,13 @@ struct DrainState {
     ctl: Option<std::sync::mpsc::Receiver<control::CtlReq>>,
     /// CG9: the ingredients to rebuild the UI worker in place — the current
     /// hosted peer id + upstream sender (re-adopted by a fresh VM), and the
-    /// world paths to boot from. Updated on a primary re-sync too.
+    /// world/image paths to boot from (M4: DB-boot, so `image_path` replaces
+    /// the old `cocoaui_list` — `world_dir` stays, `open_or_seed`'s fallback
+    /// seed source). Updated on a primary re-sync too.
     hosted_id: u32,
     to_primary: InboxSender,
     world_dir: PathBuf,
-    cocoaui_list: PathBuf,
+    image_path: PathBuf,
 }
 
 /// `1536` -> `"1.5K"`, base-1024, one decimal past the first suffix — the
@@ -247,7 +249,7 @@ fn rebuild_ui(st: &mut DrainState) {
     //    worker.
     let fresh = match boot::boot_ui_worker(
         &st.world_dir,
-        &st.cocoaui_list,
+        &st.image_path,
         FatalMode::ExitProcess,
         st.hosted_id,
         st.to_primary.clone(),
@@ -284,18 +286,41 @@ fn main() {
     let app = objc::app_shared();
     objc::set_activation_policy_regular(app);
 
-    // The base world + the conditional Cocoa layer. `MACVM_WORLD` overrides the
-    // directory (default `world`), mirroring the CLI/GUI convention.
+    // The base world + the image database both VMs now boot from (M4,
+    // `docs/package_aware_editing_design.md` §4.5). `MACVM_WORLD` overrides the
+    // `.mst` directory (default `world`), mirroring the CLI/GUI convention;
+    // `image_path()` is the SAME `MACVM_IMAGE_PATH`-or-`world/image.sqlite3`
+    // resolution `host_service`'s source pane already uses — one convention,
+    // not two.
     let world_dir =
         PathBuf::from(std::env::var_os("MACVM_WORLD").unwrap_or_else(|| "world".into()));
-    let cocoaui_list = world_dir.join("cocoaui.list");
+    let image_path = host_service::image_path();
 
     // The primary's boot-from-source closure — the watchdog respawns the primary
-    // from it on a fatal doit (§5.1). Same world both generations (and compute
-    // workers) boot from.
+    // from it on a fatal doit (§5.1), and it doubles as every compute worker's
+    // own boot closure (`PrimarySupervisor` installs it via `set_worker_boot`),
+    // so a worker's world matches the primary's for free. DB-boot requesting
+    // `boot::PRIMARY_LISTS` (base world only — the persistent environment never
+    // runs AppKit UI code, so `cocoaui`'s classes would be dead weight here).
     let world_for_boot = world_dir.clone();
-    let world_boot: WorkerBootFn =
-        Arc::new(move || VmHandle::boot(boot::vm_options(), &world_for_boot));
+    let image_for_boot = image_path.clone();
+    let world_boot: WorkerBootFn = Arc::new(move || {
+        let image =
+            image_store::import::open_or_seed(&world_for_boot, &image_for_boot).map_err(|msg| {
+                macvm::runtime::VmError {
+                    msg: format!("primary/worker image open/seed failed: {msg}"),
+                }
+            })?;
+        let mut vm = VmHandle::boot_without_world(boot::vm_options());
+        image_store::world_boot::load_world_from_image(
+            &mut vm,
+            &image,
+            boot::PRIMARY_LISTS,
+            boot::WORLD_DOITS,
+        )
+        .map_err(|msg| macvm::runtime::VmError { msg })?;
+        Ok(vm)
+    });
 
     // The UI worker inbox's run-loop poke: signals the default-mode drain source
     // and wakes the main run loop (§8). Fired by a primary generation whenever it
@@ -314,10 +339,10 @@ fn main() {
         };
 
     // (design §3 step 4) Boot the UI worker VM in place on THIS main thread
-    // (`ExitProcess` — CG0), layer the Cocoa world, take on its Worker role.
+    // (`ExitProcess` — CG0), DB-boot the Cocoa world, take on its Worker role.
     let ui = match boot::boot_ui_worker(
         &world_dir,
-        &cocoaui_list,
+        &image_path,
         FatalMode::ExitProcess,
         link.hosted_id,
         link.to_primary.clone(),
@@ -346,7 +371,7 @@ fn main() {
         hosted_id: link.hosted_id,
         to_primary: link.to_primary.clone(),
         world_dir: world_dir.clone(),
-        cocoaui_list: cocoaui_list.clone(),
+        image_path: image_path.clone(),
     });
 
     // (design §3 step 4) Publish the thread-local `*mut VmHandle` the CG3/CG4
