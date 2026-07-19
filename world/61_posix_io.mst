@@ -316,3 +316,178 @@ Object subclass: Kqueue [
 
     close [ ^Posix close: kq ]
 ]
+
+"── Posix reopened: file open/seek/unlink bindings ───────────────────────────
+ All fixed-arity, so all FFI-reachable. The one trap is open(2): its optional
+ third `mode` argument is VARIADIC, and Apple arm64 puts variadic args on the
+ stack while the trampoline loads registers (docs/FFI.md §6.2, and the header
+ of this file) — so a 3-arg #(g g g) `open` binding would mis-marshal `mode`.
+ The fix is to split the two real uses:
+   • opening an EXISTING file needs no mode -> open(path, flags), a clean
+     2-arg #(g g) binding (never pass O_CREAT through this one — with no mode
+     the kernel reads a garbage permission word off the stack);
+   • CREATING a file goes through creat(path, mode), which is a fixed 2-arg
+     libc call equal to open(path, O_WRONLY|O_CREAT|O_TRUNC, mode).
+ Together they cover read-existing and write-fresh — everything slurp/spit and
+ the common File surface need — with no variadic call anywhere. lseek's off_t
+ is a 64-bit register (#g); unlink is a lone path pointer."
+Object subclass: Posix [
+    Posix class >> openPath: pathAddr flags: fl [
+        <primitive: FFI function: #open ret: #g args: #(g g)>
+    ]
+    Posix class >> creatPath: pathAddr mode: m [
+        <primitive: FFI function: #creat ret: #g args: #(g g)>
+    ]
+    Posix class >> lseekFd: fd offset: off whence: w [
+        <primitive: FFI function: #lseek ret: #g args: #(g g g)>
+    ]
+    Posix class >> unlinkPath: pathAddr [
+        <primitive: FFI function: #unlink ret: #g args: #(g)>
+    ]
+]
+
+"── PosixFile: an fd wrapped in a Smalltalk object ───────────────────────────
+ The low-level, byte-exact half of the file surface (the encoding-aware half
+ is CocoaFile, world/49a). fd-level read/write/seek plus whole-file slurp/spit
+ built on NativeBuffer — a String and a ByteArray are both IndexableBytes, so
+ the bytes a file holds ARE a String's UTF-8 bytes (no re-encoding); reads
+ accumulate through a WriteStream (bulk replaceFrom: memcpy) and writes drain
+ a String's bytes back out a page at a time, looping on the count the kernel
+ actually moved (partial writes handled).
+
+ Memory handed to read(2)/write(2)/open(2) must be GC-stable, so it comes from
+ an mmap'd NativeBuffer, never a heap String. One lazy class-side scratch page
+ is reused for BOTH path-staging and chunk I/O — safe because a VM is strictly
+ serial and the path is consumed by open() before any read/write touches the
+ page. A file whose open fails answers nil (errno via `Posix errno`), matching
+ the return-code discipline of the rest of this file (MACVM has no exceptions)."
+Object subclass: PosixFile [
+    | fd |
+    <classVars: Scratch>
+
+    "── flag / mode / whence constants (Darwin, arm64) ──"
+    PosixFile class >> oRdOnly [ ^0 ]
+    PosixFile class >> oWrOnly [ ^1 ]
+    PosixFile class >> oRdWr   [ ^2 ]
+    PosixFile class >> oAppend [ ^8 ]
+    PosixFile class >> oCreat  [ ^512 ]
+    PosixFile class >> oTrunc  [ ^1024 ]
+    PosixFile class >> oExcl   [ ^2048 ]
+    PosixFile class >> seekSet [ ^0 ]
+    PosixFile class >> seekCur [ ^1 ]
+    PosixFile class >> seekEnd [ ^2 ]
+    PosixFile class >> defaultMode [ ^420 ]     "0644"
+
+    "One page, made once, reused (never munmap'd — like Posix scratch). Both
+     the NUL-terminated path and the 4096-byte I/O chunks live here in turn."
+    PosixFile class >> scratch [
+        Scratch isNil ifTrue: [ Scratch := NativeBuffer page ].
+        ^Scratch
+    ]
+    "Stage aString into `buf` as a NUL-terminated C string; answer its address
+     (a SmallInteger for a #g pointer arg). Darwin PATH_MAX is 1024, so any
+     path fits the 4096-byte page with room to spare."
+    PosixFile class >> cStringOf: aString into: buf [
+        | n |
+        n := aString size.
+        1 to: n do: [ :i | buf byteAt: i - 1 put: (aString basicByteAt: i) ].
+        buf byteAt: n put: 0.
+        ^buf address
+    ]
+
+    "── opening (answer an open PosixFile, or nil on failure) ──"
+    PosixFile class >> open: aPath flags: fl [
+        | rc |
+        rc := Posix openPath: (self cStringOf: aPath into: self scratch) flags: fl.
+        rc < 0 ifTrue: [ ^nil ].
+        ^self basicNew setFd: rc
+    ]
+    PosixFile class >> openForRead: aPath [ ^self open: aPath flags: self oRdOnly ]
+    PosixFile class >> createForWrite: aPath [
+        ^self createForWrite: aPath mode: self defaultMode
+    ]
+    PosixFile class >> createForWrite: aPath mode: m [
+        | rc |
+        rc := Posix creatPath: (self cStringOf: aPath into: self scratch) mode: m.
+        rc < 0 ifTrue: [ ^nil ].
+        ^self basicNew setFd: rc
+    ]
+
+    setFd: anFd [ fd := anFd. ^self ]
+    fd [ ^fd ]
+    isOpen [ ^fd notNil and: [ fd >= 0 ] ]
+
+    "── fd-level (caller owns the NativeBuffer) ──"
+    readInto: aBuffer count: n [ ^Posix read: fd into: aBuffer address count: n ]
+    writeFrom: aBuffer count: n [ ^Posix write: fd from: aBuffer address count: n ]
+    seekTo: off from: whence [ ^Posix lseekFd: fd offset: off whence: whence ]
+    "Size without stat: remember the cursor, seek to end, restore it."
+    sizeInBytes [
+        | cur end |
+        cur := self seekTo: 0 from: self class seekCur.
+        end := self seekTo: 0 from: self class seekEnd.
+        self seekTo: cur from: self class seekSet.
+        ^end
+    ]
+    close [ | rc | rc := Posix close: fd. fd := -1. ^rc ]
+
+    "── whole-file, through the shared 4096-byte scratch page ──"
+    "Read from the current offset to EOF; answer the bytes as a String (the
+     file's bytes verbatim — treat them as the UTF-8 they already are)."
+    readAll [
+        | buf stream n chunk |
+        buf := self class scratch.
+        stream := WriteStream on: (String new: 0).
+        [ n := self readInto: buf count: 4096. n > 0 ] whileTrue: [
+            chunk := String new: n.
+            1 to: n do: [ :i | chunk basicByteAt: i put: (buf byteAt: i - 1) ].
+            stream nextPutAll: chunk ].
+        ^stream contents
+    ]
+    "Write all of aString's bytes; answer the total moved (loops on the kernel's
+     count, so a short write just continues from where it stopped)."
+    writeAll: aString [
+        | buf sz total len moved |
+        buf := self class scratch.
+        sz := aString size.
+        total := 0.
+        [ total < sz ] whileTrue: [
+            len := (sz - total) min: 4096.
+            1 to: len do: [ :i | buf byteAt: i - 1 put: (aString basicByteAt: total + i) ].
+            moved := Posix write: fd from: buf address count: len.
+            moved <= 0 ifTrue: [ ^total ].
+            total := total + moved ].
+        ^total
+    ]
+
+    "── class-side conveniences: open + act + close in one call ──"
+    "Whole file -> String, or nil if it can't be opened."
+    PosixFile class >> slurp: aPath [
+        | f s |
+        f := self openForRead: aPath.
+        f isNil ifTrue: [ ^nil ].
+        s := f readAll.
+        f close.
+        ^s
+    ]
+    "String -> whole file (created/truncated); answer bytes written, or nil if
+     it can't be created."
+    PosixFile class >> spit: aPath contents: aString [
+        | f n |
+        f := self createForWrite: aPath.
+        f isNil ifTrue: [ ^nil ].
+        n := f writeAll: aString.
+        f close.
+        ^n
+    ]
+    PosixFile class >> exists: aPath [
+        | f |
+        f := self openForRead: aPath.
+        f isNil ifTrue: [ ^false ].
+        f close.
+        ^true
+    ]
+    PosixFile class >> delete: aPath [
+        ^(Posix unlinkPath: (self cStringOf: aPath into: self scratch)) = 0
+    ]
+]

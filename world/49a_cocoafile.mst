@@ -1,0 +1,62 @@
+"49a_cocoafile.mst — CocoaFile: whole-file slurp/spit through the Cocoa bridge
+ (world/49_cocoa.mst). The ENCODING-AWARE half of the file surface; PosixFile
+ (world/61) is the byte-exact, fd-level half. A whole file is read/written as a
+ UTF-8 String using NSString's own synchronous file methods — exactly the call
+ CocoaHelp (world/71) already leans on:
+
+     [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil]
+     [aString  writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil]
+
+ Encoding 4 = NSUTF8StringEncoding, pinned EXPLICITLY in both directions (the
+ deprecated encoding-guessing variants misread non-ASCII — CocoaHelp hit
+ em-dashes/arrows round-tripping wrong). The trailing NSError** is nil ('don't
+ care'): a missing/unreadable file comes back as Cocoa nil, which the bridge
+ marshals to Smalltalk nil (NOT a primitive failure), so `isNil` is the check.
+
+ These use the DIRECT bridge send (primitive 240, `send:args:ret:`) rather than
+ the main-thread hop: NSString file I/O is thread-safe and touches no UI, so it
+ runs on the calling VM thread. That is what lets CocoaFile work in the headless
+ CLI — where there is NO AppKit run loop to hop onto — as well as in both GUIs.
+ The bridge dlopens Foundation on first use, so NSString/NSFileManager resolve
+ everywhere.
+
+ Base-world placement (world.list, beside 49_cocoa.mst): the bridge it needs is
+ base-world, and DEFINING these methods never runs an ObjC call, so the file
+ compiles with or without Foundation present — only a slurp:/spit: CALL touches
+ Cocoa. The lettered filename mirrors 58a_base64.mst: slotted after 49 with no
+ renumbering."
+
+Object subclass: CocoaFile [
+    "NSUTF8StringEncoding."
+    CocoaFile class >> utf8 [ ^4 ]
+
+    "Whole file -> String (decoded as UTF-8), or nil if it can't be read."
+    CocoaFile class >> slurp: aPath [
+        | ns |
+        ns := (Cocoa classNamed: 'NSString')
+            send: 'stringWithContentsOfFile:encoding:error:'
+            args: (Array with: (Cocoa nsString: aPath) with: self utf8 with: nil)
+            ret: #id.
+        ns isNil ifTrue: [ ^nil ].
+        ^ns asString
+    ]
+
+    "String -> whole file (UTF-8), written atomically (temp file + rename, so a
+     reader never sees a half-written file). Answer true on success, false on
+     failure."
+    CocoaFile class >> spit: aPath contents: aString [
+        ^(Cocoa nsString: aString)
+            send: 'writeToFile:atomically:encoding:error:'
+            args: (Array with: (Cocoa nsString: aPath) with: true with: self utf8 with: nil)
+            ret: #bool
+    ]
+
+    "Does something exist at aPath? — NSFileManager's own check (encoding- and
+     content-independent; PosixFile>>exists: is the fd-probe equivalent)."
+    CocoaFile class >> exists: aPath [
+        ^((Cocoa classNamed: 'NSFileManager') send: 'defaultManager')
+            send: 'fileExistsAtPath:'
+            args: (Array with: (Cocoa nsString: aPath))
+            ret: #bool
+    ]
+]
