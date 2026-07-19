@@ -1,0 +1,248 @@
+"71_cocoahelp.mst — CocoaHelp: a read-only Markdown documentation tab for
+ the native Cocoa GUI (docs/macvm_help.md, a digested copy of the WKWebView
+ GUI's own macvm-help pages — this window has no HTML renderer, so Markdown
+ is the plain-text-friendly middle ground). Loaded ONLY via
+ world/cocoaui.list, after 64_cocoaui.mst; self-registers by name, the CG7+
+ pattern (CocoaBrowser/CocoaFind/CocoaEditor/CocoaOutliner/CocoaCanvas).
+
+ Rendering path: AppKit already ships a pure Objective-C Markdown parser —
+ NSAttributedString >> initWithMarkdownString:options:baseURL:error:
+ (macOS 12+; confirmed via the cocoa-data runtime database to be ordinary
+ Objective-C, NOT a Swift-only API, so the existing bridge reaches it with
+ zero new Rust code). Its trailing NSError** out-argument is outside C2's
+ auto-shape vocabulary (classify_arg has no `^` pointer case, by design —
+ docs/cocoa_gui_implementation.md §4.1), so the call goes through the
+ explicit send:args:ret: door (primitive 240) instead of plain
+ doesNotUnderstand: dispatch; a Smalltalk nil argument there marshals to a
+ literal NULL GPR word, which is exactly the legal 'I don't want the error
+ detail' argument Cocoa's own convention expects (prim_cocoa_send_general,
+ src/runtime/primitives.rs). Every piece of this path — the file read, the
+ options object, the parser itself — is an existing Cocoa-bridge send; there
+ is no hand-rolled Markdown-to-attributes conversion anywhere here."
+Object subclass: CocoaHelp [
+    <classVars: Container Scroll TextView>
+
+    CocoaHelp class >> helpFile [
+        "Relative to the process's working directory — the SAME assumption
+         CocoaUI iconDir already makes (run-cocoa.sh launches from the repo
+         root); a missing/unreadable file fails closed, not loudly, via
+         loadMarkdown's own nil check."
+        ^'docs/macvm_help.md'
+    ]
+
+    CocoaHelp class >> register [
+        CocoaUI registerViewNamed: #help title: 'Help' icon: 'documentation'
+                container: [ self containerView ]
+                onShow: [ ]
+    ]
+
+    CocoaHelp class >> containerView [
+        Container isNil ifTrue: [ self buildView ].
+        ^Container
+    ]
+
+    CocoaHelp class >> scrollToChar: loc [
+        "Test/debug: jump the view to a character offset (scrollRangeToVisible:,
+         the same call appendTranscript: uses)."
+        TextView onMain scrollRangeToVisible: (Array with: loc with: 0)
+    ]
+
+    "── build ──"
+    CocoaHelp class >> buildView [
+        | frame |
+        frame := CocoaUI contentHost onMain frame.
+        TextView := ((Cocoa classNamed: 'NSTextView') onMain alloc) onMain
+            initWithFrame: (Array with: 0.0 with: 0.0
+                                  with: (frame at: 3) with: (frame at: 4)).
+        TextView onMain setEditable: false.
+        TextView onMain setSelectable: true.
+        TextView onMain setVerticallyResizable: true.
+        TextView onMain setHorizontallyResizable: false.
+        TextView onMain setAutoresizingMask: CocoaUI maskWidthSizable.
+        (TextView onMain textContainer) ifNotNil: [ :tc |
+            tc onMain setWidthTracksTextView: true.
+            tc release ].
+        "Scroll-wrapped like every other text surface in this shell — a bare
+         NSTextView draws past its frame and its stale pixels bleed through
+         the next view after a tab switch."
+        Scroll := ((Cocoa classNamed: 'NSScrollView') onMain alloc) onMain
+            initWithFrame: (Array with: 0.0 with: 0.0
+                                  with: (frame at: 3) with: (frame at: 4)).
+        Scroll onMain setHasVerticalScroller: true.
+        Scroll onMain setAutoresizingMask: CocoaUI maskWidthSizable + CocoaUI maskHeightSizable.
+        Scroll onMain setBorderType: 1. "NSLineBorder — matches the Transcript fix"
+        Scroll onMain setDocumentView: TextView.
+        Container := Scroll.
+        self loadAndRender.
+    ]
+
+    "── content ──"
+    CocoaHelp class >> loadMarkdown [
+        "NSString's own synchronous whole-file reader, EXPLICIT UTF-8 (encoding
+         4 = NSUTF8StringEncoding) — the deprecated one-arg stringWithContentsOfFile:
+         guesses the encoding and got it wrong on this exact file (round-tripped
+         16,890 real Unicode characters as 17,314 — the em-dashes/arrows/× signs
+         misread as a single-byte encoding, then re-inflated on the way back out).
+         The trailing NSError** puts this outside the auto-shape vocabulary
+         (docs/cocoa_gui_implementation.md §4.1), same as the markdown parser
+         below — nil for 'don't care'. A missing/unreadable file answers Cocoa
+         nil, which wrap_result marshals to Smalltalk nil (not a primitive
+         failure) — the ifTrue: below is the real check."
+        | ns argv |
+        argv := Array with: (Cocoa nsString: self helpFile) with: 4 with: nil.
+        ns := (Cocoa classNamed: 'NSString')
+            send: 'stringWithContentsOfFile:encoding:error:' args: argv ret: #id.
+        ns isNil ifTrue: [
+            ^'# MACVM Help
+
+Could not load **', self helpFile, '**.
+
+Run `macvm-cocoa` from the repository root (see `run-cocoa.sh`) — this tab
+reads the file relative to the process''s working directory, the same
+assumption the toolbar icons already make.' ].
+        ^ns asString
+    ]
+
+    CocoaHelp class >> markdownOptions [
+        | opts |
+        opts := (Cocoa classNamed: 'NSAttributedStringMarkdownParsingOptions') alloc init.
+        opts setInterpretedSyntax: 0. "NSAttributedStringMarkdownInterpretedSyntaxFull — headers/lists/code"
+        opts setFailurePolicy: 1.     "ReturnPartiallyParsedIfPossible — degrade, don't just nil"
+        ^opts
+    ]
+
+    CocoaHelp class >> attributedFor: aString [
+        "AppKit's OWN CommonMark-ish parser does the whole conversion; args
+         are (text. options. baseURL. error) — nil baseURL (no relative
+         links to resolve, a single self-contained page) and nil error (see
+         the file header: a Smalltalk nil marshals to NULL, the legal
+         'don't care' form of this argument)."
+        | argv |
+        argv := Array with: (Cocoa nsString: aString) with: self markdownOptions
+                      with: nil with: nil.
+        ^(Cocoa classNamed: 'NSAttributedString') alloc
+            send: 'initWithMarkdownString:options:baseURL:error:'
+            args: argv
+            ret: #id
+    ]
+
+    CocoaHelp class >> blockSeparator [
+        "A visible paragraph gap between reassembled blocks."
+        ^(String with: (Character value: 10)) , (String with: (Character value: 10))
+    ]
+
+    CocoaHelp class >> splitBlocks: aString [
+        "AppKit's markdown parser recognizes headers/lists/code fences fine,
+         but its resulting -string DROPS every inter-block separator entirely
+         (verified empirically: 'Header' , (2 newlines) , 'Body' parses to
+         the plain string 'HeaderBody', zero characters between them —
+         block structure survives only as NSPresentationIntent attribute
+         runs, which this bridge cannot introspect: attribute:atIndex:
+         effectiveRange: wants an NSRangePointer OUT-arg, outside C2's
+         vocabulary same as the error-arg problem this file's header
+         documents). So split on blank lines HERE, parse each block on its
+         own (a header alone in its own string still parses as a header),
+         and reassemble with an explicit separator — sidesteps the gap
+         without introspecting anything.
+         A single newline stays INSIDE a block (soft wrap / the block's own
+         internal line break); a run of 2+ blank lines ends it. A newline is
+         held PENDING, not written immediately — flushed only if a
+         non-newline character follows (one soft break) or dropped entirely
+         at block end / end of string. Writing it eagerly on the first sight
+         (an earlier version of this method did) leaves every block ending
+         in a trailing '\n', which silently breaks a **bold**-wrapped header
+         (boldedIfHeader:): CommonMark's closing ** must be immediately
+         preceded by non-whitespace, and a newline counts as whitespace."
+        | lf blocks buf i n blankRun ch |
+        lf := Character value: 10.
+        blocks := OrderedCollection new.
+        buf := WriteStream on: String new.
+        blankRun := 0.
+        i := 1. n := aString size.
+        [ i <= n ] whileTrue: [
+            ch := aString at: i.
+            ch = lf
+                ifTrue: [
+                    blankRun := blankRun + 1.
+                    blankRun >= 2 ifTrue: [
+                        buf contents isEmpty ifFalse: [
+                            blocks add: buf contents.
+                            buf := WriteStream on: String new ].
+                        blankRun := 0 ] ]
+                ifFalse: [
+                    blankRun = 1 ifTrue: [ buf nextPut: lf ].
+                    blankRun := 0.
+                    buf nextPut: ch ].
+            i := i + 1 ].
+        buf contents isEmpty ifFalse: [ blocks add: buf contents ].
+        ^blocks
+    ]
+
+    CocoaHelp class >> trimTrailingWhitespace: aString [
+        "CommonMark's closing ** must be immediately preceded by
+         non-whitespace (a bare '**foo **' does not parse as bold — the
+         trailing space breaks it); trim before wrapping rather than trust
+         the caller's text has none. Belt-and-braces alongside splitBlocks:'s
+         own no-trailing-newline fix, not a substitute for it — this guards
+         against genuine trailing spaces in the source text too, not just
+         the splitter's own newline handling."
+        | j sp lf tab |
+        sp := Character value: 32. lf := Character value: 10. tab := Character value: 9.
+        j := aString size.
+        [ j >= 1 and: [ (aString at: j) = sp or: [ (aString at: j) = lf or: [ (aString at: j) = tab ] ] ] ]
+            whileTrue: [ j := j - 1 ].
+        ^aString copyFrom: 1 to: j
+    ]
+
+    CocoaHelp class >> boldedIfHeader: block [
+        "An ATX header (1-6 #s, a space, then text) rendered via markdown's
+         OWN bold syntax instead of a real heading: this bridge cannot apply
+         an NSFont size/weight attribute without resolving Foundation's
+         exact NSFontAttributeName symbol value (a real risk of guessing a
+         plausible-looking string and silently no-opping — attribute keys
+         are NOT always their own name, e.g. legacy NSAttributedString keys
+         diverge from the modern ones). **bold** is already proven correct
+         through this exact pipeline (the screenshot verification), so
+         headers ride that instead — real heading typography is a follow-up,
+         not a blocker."
+        | i n hashes sp rest |
+        n := block size.
+        sp := Character value: 32.
+        i := 1.
+        [ i <= n and: [ (block at: i) = $# ] ] whileTrue: [ i := i + 1 ].
+        hashes := i - 1.
+        (hashes >= 1 and: [ hashes <= 6 and: [ i <= n and: [ (block at: i) = sp ] ] ])
+            ifFalse: [ ^block ].
+        rest := self trimTrailingWhitespace: (block copyFrom: i + 1 to: n).
+        ^'**' , rest , '**'
+    ]
+
+    CocoaHelp class >> loadAndRender [
+        "Reassemble block by block (splitBlocks:'s doc comment explains why).
+         A single block's parse failure (rare even under the
+         ReturnPartiallyParsedIfPossible policy) falls back to that block's
+         raw text via the live NSMutableString proxy, never a second parse
+         attempt on error text — and never a blank pane."
+        | md blocks storage first |
+        md := self loadMarkdown.
+        blocks := self splitBlocks: md.
+        storage := TextView onMain textStorage.
+        storage onMain setAttributedString: (((Cocoa classNamed: 'NSAttributedString') onMain alloc) onMain init).
+        first := true.
+        blocks do: [ :block | | attr |
+            first
+                ifTrue: [ first := false ]
+                ifFalse: [ (storage onMain mutableString) onMain appendString: self blockSeparator ].
+            attr := self attributedFor: (self boldedIfHeader: block).
+            attr isNil
+                ifTrue: [ (storage onMain mutableString) onMain appendString: block ]
+                ifFalse: [ storage onMain appendAttributedString: attr ] ].
+    ]
+
+    "── teardown (UI-worker rebuild — CG9; CocoaUI class >> teardown calls this by name) ──"
+    CocoaHelp class >> teardown [
+        TextView isNil ifFalse: [ TextView isValid ifTrue: [ TextView release ] ].
+        Scroll isNil ifFalse: [ Scroll isValid ifTrue: [ Scroll release ] ].
+        Container := nil. Scroll := nil. TextView := nil.
+    ]
+]

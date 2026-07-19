@@ -109,6 +109,7 @@ Object subclass: CocoaUI [
         (Worker classNamed: #CocoaEditor) ifNotNil: [ :ec | ec register ].
         (Worker classNamed: #CocoaOutliner) ifNotNil: [ :oc | oc register ].
         (Worker classNamed: #CocoaCanvas) ifNotNil: [ :cv | cv register ].
+        (Worker classNamed: #CocoaHelp) ifNotNil: [ :hc | hc register ].
 
         "Forwarded primary transcript lines (§7.4) append to our Transcript view."
         Worker onTranscriptLine: [ :t | CocoaUI appendTranscript: t ].
@@ -803,6 +804,7 @@ Print it does the same and inserts the result right after it."
             (Worker classNamed: #CocoaEditor) ifNotNil: [ :ec | ec teardown ].
             (Worker classNamed: #CocoaOutliner) ifNotNil: [ :oc | oc teardown ].
             (Worker classNamed: #CocoaCanvas) ifNotNil: [ :cv | cv teardown ].
+            (Worker classNamed: #CocoaHelp) ifNotNil: [ :hc | hc teardown ].
             ActTarget isNil ifFalse: [ ActTarget isValid ifTrue: [ ActTarget release ] ].
             ToolbarDelegates isNil ifFalse: [
                 ToolbarDelegates do: [ :d | d isValid ifTrue: [ d release ] ] ].

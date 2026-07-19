@@ -30,3 +30,6 @@
 # CocoaCanvas (an RGBA drawing surface — pixel buffer + vector command batch,
 # docs/CANVAS.md) also self-registers; needs 66 (CocoaBrowser hostService).
 70_cocoacanvas.mst
+# CocoaHelp (a read-only Markdown documentation tab, docs/macvm_help.md)
+# also self-registers by name; no dependency on any other Cocoa GUI file.
+71_cocoahelp.mst
