@@ -470,6 +470,35 @@ fn emit_expr(
                 }
             }
         }
+        Expr::DynArray { elems, .. } => {
+            // Squeak/Pharo brace array `{ e1. … en }`: build a FRESH Array at
+            // runtime and fill it — desugared to `(Array new: n)` plus one
+            // `at:put:` per element, so it rides the existing (interp- AND
+            // JIT-compiled) `new:`/`at:put:` primitives with no new bytecode,
+            // no interpreter/JIT/GC change. Elements evaluate left to right;
+            // `Array new: n` runs first (a side-effect-free ordering nuance vs.
+            // strict evaluate-all-then-cons — negligible in practice). The
+            // cascade-style dup/…/pop keeps stack depth constant regardless of
+            // n (`at:put:` answers the value, not the receiver).
+            let n = elems.len();
+            // Reference the Array CLASS directly (a rooted, GC-traced literal),
+            // NOT the name `Array` via normal resolution — so a local/ivar
+            // shadowing `Array` cannot hijack the construction, matching how a
+            // real Smalltalk compiles brace arrays.
+            let array_klass = cx.vm.universe.array_klass.oop();
+            let new_colon = cx.vm.universe.intern(b"new:");
+            let at_put = cx.vm.universe.intern(b"at:put:");
+            b.push_literal(cx.vm, array_klass);
+            emit_literal(cx, cache, b, &Literal::Int(n as i64));
+            b.send(cx.vm, new_colon, 1); // Array new: n  -> the array
+            for (i, el) in elems.iter().enumerate() {
+                b.dup(); // keep the array under at:put:'s result
+                emit_literal(cx, cache, b, &Literal::Int(i as i64 + 1)); // 1-based
+                emit_expr(cx, hoist, cache, b, scope_id, next_hoist_slot, el)?;
+                b.send(cx.vm, at_put, 2); // array at: i put: el  -> el
+                b.pop(); // discard el; the array remains for the next element
+            }
+        }
         Expr::Block(blk) => emit_block_literal(cx, cache, b, blk)?,
         Expr::Return { .. } => {
             unreachable!("Return is statement-position only (parser-guaranteed)")

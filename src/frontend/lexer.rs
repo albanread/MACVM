@@ -33,6 +33,12 @@ pub enum Tok {
     RParen,
     LBracket,
     RBracket,
+    /// `{` / `}` — a Squeak/Pharo brace (dynamic) array `{ e1. e2. … }`,
+    /// whose elements are runtime EXPRESSIONS (unlike `#( … )`'s compile-time
+    /// literals). Lexed unconditionally; the parser's `parse_dyn_array` gives
+    /// them meaning.
+    LBrace,
+    RBrace,
     VBar,
     Semi,
     Period,
@@ -70,6 +76,7 @@ fn tok_ends_expr(t: &Tok) -> bool {
             | Tok::SymLit(_)
             | Tok::RParen
             | Tok::RBracket
+            | Tok::RBrace
     )
 }
 
@@ -455,6 +462,12 @@ impl<'a> Lexer<'a> {
         } else if c == ']' {
             self.bump();
             Tok::RBracket
+        } else if c == '{' {
+            self.bump();
+            Tok::LBrace
+        } else if c == '}' {
+            self.bump();
+            Tok::RBrace
         } else if c == ';' {
             self.bump();
             Tok::Semi

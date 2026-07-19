@@ -65,6 +65,13 @@ type annotations so annotated sources still load.
   `Double`), characters (`$a`), strings (`'hi'`), symbols (`#foo`,
   `#at:put:`), literal arrays (`#(1 2 #three 'four')`), byte arrays
   (`#[1 2 255]`), `nil true false`.
+- **Brace (dynamic) arrays** `{ e1. e2. … }` (Squeak/Pharo): a `.`-separated
+  list of arbitrary EXPRESSIONS, evaluated left to right into a **fresh
+  `Array`** at runtime — contrast `#( … )`, a compile-time constant of
+  literals only. Optional trailing `.`; `{}` is the empty array. Desugared by
+  the compiler to `(Array new: n)` + one `at:put:` per element (referencing
+  the `Array` class directly, so a shadowing local can't hijack it) — no
+  dedicated bytecode, so it runs identically interpreted and JIT-compiled.
 - **Sends**: unary > binary > keyword precedence; parentheses; cascades (`;`).
 - **Assignment** `:=`, **return** `^`, statement separator `.`.
 - **Temporaries** `| a b |`; **blocks** `[:x :y | ...]` with block-local temps,

@@ -48,6 +48,38 @@ fn boots_clean() {
     );
 }
 
+/// Boots the real world, runs `src`'s top-level doIts, and returns what they
+/// printed to the Transcript — the end-to-end path a `.mst` file / the REPL
+/// take (needs the full world: `Array`, `at:put:`, `printString`).
+fn eval_world_transcript(src: &str) -> String {
+    let mut vm = common::test_vm();
+    let buf = OutputBuffer::new();
+    vm.out = Box::new(buf.clone());
+    world::load_world(&mut vm, &world_dir()).expect("load_world");
+    for item in macvm::frontend::parser::parse_file(src).expect("parse") {
+        macvm::frontend::classdef::execute_top_item(&mut vm, item).expect("execute");
+    }
+    buf.as_string()
+}
+
+/// Squeak/Pharo brace (dynamic) arrays `{ e1. e2. … }`: elements are
+/// runtime EXPRESSIONS (not `#( … )`'s compile-time literals), a fresh
+/// `Array` per evaluation. Codegen desugars to `(Array new: n)` + `at:put:`,
+/// so this rides the real world's primitives end to end — arithmetic,
+/// string concat, `size`, nesting, and a genuinely runtime element (a block
+/// parameter) that a literal array could not express.
+#[test]
+fn brace_arrays_build_runtime_arrays() {
+    let out = eval_world_transcript(
+        "Transcript showCr: { 1 + 1. 2 * 3. 'a', 'b' } printString.\n\
+         Transcript showCr: { 10. 20. 30 } size printString.\n\
+         Transcript showCr: {} printString.\n\
+         Transcript showCr: { 1. { 2. 3 }. 4 } printString.\n\
+         Transcript showCr: ([ :x | { x. x * x } ] value: 9) printString.\n",
+    );
+    assert_eq!(out, "#(2 6 'ab')\n3\n#()\n#(1 #(2 3) 4)\n#(9 81)\n");
+}
+
 /// Gate item 1 (`tests_s06.md`): boot, load world.list + tests.list, run
 /// SUnit-lite, exit 0 with a `/^\d+ run, 0 failed$/` report line, total
 /// assertions >= 200.

@@ -283,6 +283,11 @@ fn to_do_needs_real_send(loop_var: &str, body: &[Expr]) -> bool {
                 }
             }
             Expr::Return { value, .. } => scan(value, loop_var, in_nested_block, found),
+            Expr::DynArray { elems, .. } => {
+                for el in elems {
+                    scan(el, loop_var, in_nested_block, found);
+                }
+            }
             Expr::Block(b) => {
                 for stmt in &b.body {
                     scan(stmt, loop_var, true, found);
@@ -379,6 +384,11 @@ fn walk_expr(
             walk_expr(receiver, scope_id, builders, next_id, refs);
             for s in segments.iter_mut() {
                 walk_expr(s, scope_id, builders, next_id, refs);
+            }
+        }
+        Expr::DynArray { elems, .. } => {
+            for el in elems.iter_mut() {
+                walk_expr(el, scope_id, builders, next_id, refs);
             }
         }
         Expr::Return { value, .. } => walk_expr(value, scope_id, builders, next_id, refs),

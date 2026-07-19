@@ -285,6 +285,32 @@ impl<'a> Parser<'a> {
         Ok(Literal::ByteArray(bytes))
     }
 
+    /// `{ e1. e2. … }` — a Squeak/Pharo brace (dynamic) array. Assumes
+    /// `self.cur == LBrace`. Elements are full EXPRESSIONS (not statements:
+    /// no `^` return inside), `.`-separated, with an optional trailing `.`;
+    /// `{}` is the empty array. Not lexed in literal-seq mode, so it never
+    /// collides with `#( … )`. Produces [`Expr::DynArray`].
+    fn parse_dyn_array(&mut self) -> Result<Expr, CompileError> {
+        let span = self.cur.1; // '{'
+        self.bump()?;
+        let mut elems = Vec::new();
+        if !matches!(self.cur.0, Tok::RBrace) {
+            loop {
+                elems.push(self.parse_expression()?);
+                if matches!(self.cur.0, Tok::Period) {
+                    self.bump()?;
+                    if matches!(self.cur.0, Tok::RBrace) {
+                        break; // trailing period before the close
+                    }
+                } else {
+                    break;
+                }
+            }
+        }
+        self.expect(&Tok::RBrace, "expected '}' to close brace array")?;
+        Ok(Expr::DynArray { elems, span })
+    }
+
     // --- expressions --------------------------------------------------------
 
     /// Returns the parsed primary and whether it was literally the `super`
@@ -390,6 +416,7 @@ impl<'a> Parser<'a> {
                 let lit = self.parse_byte_array_literal()?;
                 Ok((Expr::Lit { value: lit, span }, false))
             }
+            Tok::LBrace => Ok((self.parse_dyn_array()?, false)),
             _ => Err(self.error(span, "expected an expression")),
         }
     }
@@ -1564,5 +1591,50 @@ mod tests {
     fn parse_reserved() {
         assert!(parse_file("self := 3.").is_err());
         assert!(parse_file("Object subclass: X [ foo [ | nil | ^1 ] ]").is_err());
+    }
+
+    #[test]
+    fn parse_brace_array_elements_are_expressions() {
+        // Unlike `#( … )` (literals; bare words → symbols), a brace array's
+        // elements are real EXPRESSIONS: `1 + 2` is a Send, `x foo` is a Send.
+        let e = parse_expr("{ 1 + 2. x foo. 3 }");
+        let Expr::DynArray { elems, .. } = &e else {
+            panic!("expected DynArray, got {e:?}");
+        };
+        assert_eq!(elems.len(), 3);
+        assert_eq!(sel_of(&elems[0]), "+");
+        assert_eq!(sel_of(&elems[1]), "foo");
+        assert!(matches!(elems[2], Expr::Lit { .. }));
+    }
+
+    #[test]
+    fn parse_brace_array_empty_nested_and_trailing_period() {
+        let Expr::DynArray { elems, .. } = parse_expr("{}") else {
+            panic!("empty brace array")
+        };
+        assert!(elems.is_empty());
+
+        let Expr::DynArray { elems, .. } = parse_expr("{ 1. 2. }") else {
+            panic!("trailing period")
+        };
+        assert_eq!(elems.len(), 2, "a trailing '.' must not add an element");
+
+        let Expr::DynArray { elems, .. } = parse_expr("{ 1. { 2. 3 }. 4 }") else {
+            panic!("nested")
+        };
+        assert_eq!(elems.len(), 3);
+        assert!(matches!(elems[1], Expr::DynArray { .. }), "nested brace array");
+    }
+
+    #[test]
+    fn brace_array_is_a_primary_in_precedence() {
+        // `{…}` closes an expression (RBrace ends-expr), so `{…} , x` parses
+        // as `({…}) , x` — the brace array is the binary receiver.
+        let e = parse_expr("{ 1. 2 } , x");
+        assert_eq!(sel_of(&e), ",");
+        let Expr::Send { receiver, .. } = &e else {
+            panic!("expected a binary Send")
+        };
+        assert!(matches!(receiver.as_ref(), Expr::DynArray { .. }));
     }
 }

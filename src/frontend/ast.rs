@@ -51,6 +51,15 @@ pub enum Expr {
     },
     /// Marker: the innermost receiver inside each cascade segment.
     CascadeRcvr(Span),
+    /// A Squeak/Pharo brace (dynamic) array `{ e1. e2. … }`. Unlike
+    /// [`Literal::Array`] (a compile-time constant of literal elements), the
+    /// elements are arbitrary EXPRESSIONS evaluated left-to-right at runtime,
+    /// producing a fresh `Array` on each evaluation. Codegen desugars it to
+    /// `(Array new: n)` + one `at:put:` per element (no new bytecode).
+    DynArray {
+        elems: Vec<Expr>,
+        span: Span,
+    },
     Block(Box<BlockNode>),
     /// Statement position only (parser-guaranteed; codegen asserts it).
     Return {
@@ -69,6 +78,7 @@ impl Expr {
             Expr::Send { span, .. } => *span,
             Expr::Cascade { span, .. } => *span,
             Expr::CascadeRcvr(s) => *s,
+            Expr::DynArray { span, .. } => *span,
             Expr::Block(b) => b.span,
             Expr::Return { span, .. } => *span,
         }
