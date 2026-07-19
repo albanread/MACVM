@@ -76,7 +76,7 @@ Object subclass: CocoaEditor [
         Buffer onMain setAutomaticQuoteSubstitutionEnabled: false.
         Buffer onMain setAutomaticDashSubstitutionEnabled: false.
         Buffer onMain setAutomaticTextReplacementEnabled: false.
-        Buffer onMain setFont: ((Cocoa classNamed: 'NSFont') onMain userFixedPitchFontOfSize: 12.0).
+        Buffer onMain setFont: (CocoaUI fixedFontOfSize: 12.0).
         Buffer onMain setVerticallyResizable: true.
         Buffer onMain setHorizontallyResizable: false.
         Buffer onMain setString: self placeholder.
@@ -178,6 +178,12 @@ shape change takes effect on the next launch)."'
         ts isNil ifTrue: [ ^self ].
         CocoaBrowser hostService onMain colorizeStorage: ts.
         ts release.
+    ]
+    CocoaEditor class >> applyCodeFont [
+        "Re-apply the current code font to the edit buffer — CocoaUI's A-/A+
+         buttons broadcast here (nil-safe; the buffer builds lazily and its
+         build site reads `CocoaUI fixedFontOfSize:`)."
+        Buffer isNil ifFalse: [ Buffer onMain setFont: (CocoaUI fixedFontOfSize: 12.0) ]
     ]
 
     "── scripting/automation (rusttcl `gui doit`) so I can drive + snapshot ──"

@@ -484,6 +484,13 @@ Object subclass: CocoaBrowser [
         SourceView isNil ifTrue: [ ^'' ].
         ^SourceView sendString: 'string'
     ]
+    CocoaBrowser class >> applyCodeFont [
+        "Re-apply the current code font to the source pane — CocoaUI's A-/A+
+         buttons broadcast here. Nil-safe: the pane builds lazily, and its
+         own build site reads `CocoaUI fixedFontOfSize:` so a not-yet-built
+         pane picks up the current size when it appears."
+        SourceView isNil ifFalse: [ SourceView onMain setFont: (CocoaUI fixedFontOfSize: 12.0) ]
+    ]
 
     "── edit modes: New Class / New Method -> editable source + Accept ──"
     CocoaBrowser class >> enterEdit: aMode template: aTemplate label: aLabel [
@@ -903,8 +910,7 @@ Object subclass: CocoaBrowser [
         SourceView := ((Cocoa classNamed: 'NSTextView') onMain alloc) onMain
             initWithFrame: (Array with: 0.0 with: 0.0 with: w with: h - barH).
         SourceView onMain setEditable: false.
-        SourceView onMain setFont: ((Cocoa classNamed: 'NSFont') onMain
-            userFixedPitchFontOfSize: 12.0).
+        SourceView onMain setFont: (CocoaUI fixedFontOfSize: 12.0).
         SourceView onMain setAutomaticQuoteSubstitutionEnabled: false.
         SourceView onMain setAutomaticDashSubstitutionEnabled: false.
         SourceView onMain setAutomaticTextReplacementEnabled: false.

@@ -57,7 +57,8 @@ Object subclass: CocoaUI [
                 TranscriptText Views ActiveView ToolbarDelegates ToolbarButtons
                 MetricLabels MemBarFill MemBarWidth Workspace WorkspaceScroll
                 WorkspaceTextDelegate TabItems TabIndexes
-                TranscriptDivider TranscriptClearBtn>
+                TranscriptDivider TranscriptClearBtn FontDelta
+                FontMinusBtn FontPlusBtn>
 
     CocoaUI class >> title [ ^'MACVM' ]
 
@@ -110,6 +111,8 @@ Object subclass: CocoaUI [
         (Worker classNamed: #CocoaOutliner) ifNotNil: [ :oc | oc register ].
         (Worker classNamed: #CocoaCanvas) ifNotNil: [ :cv | cv register ].
         (Worker classNamed: #CocoaHelp) ifNotNil: [ :hc | hc register ].
+        "A- / A+ font-size buttons, after every view's switcher button."
+        self buildFontButtons.
 
         "Forwarded primary transcript lines (§7.4) append to our Transcript view."
         Worker onTranscriptLine: [ :t | CocoaUI appendTranscript: t ].
@@ -297,6 +300,71 @@ Object subclass: CocoaUI [
         ToolbarButtons at: aSymbol put: btn.
     ]
 
+    "── code font size (the A- / A+ toolbar buttons) ──────────────────────
+     One global size DELTA applied on top of each code surface's OWN base
+     size, so the surfaces keep their relative sizing (Workspace 13, Editor/
+     Browser 12, Transcript 11) while scaling together. `fixedFontOfSize:` is
+     the single chokepoint every monospace text view builds its font through
+     — so a view built AFTER a size change picks the new size up for free,
+     and `applyFontEverywhere` re-applies to the already-built ones. Delta
+     resets to 0 on a UI-worker restart (a session preference, not persisted)."
+    CocoaUI class >> fontDelta [ ^FontDelta isNil ifTrue: [ FontDelta := 0 ] ifFalse: [ FontDelta ] ]
+    CocoaUI class >> fixedFontOfSize: base [
+        ^(Cocoa classNamed: 'NSFont') onMain
+            userFixedPitchFontOfSize: ((base + self fontDelta) max: 6)
+    ]
+    CocoaUI class >> increaseFont [ FontDelta := self fontDelta + 1 min: 16. self applyFontEverywhere ]
+    CocoaUI class >> decreaseFont [ FontDelta := self fontDelta - 1 max: -5. self applyFontEverywhere ]
+    CocoaUI class >> applyFontEverywhere [
+        "Re-set the font on every built code surface. Later-loading views
+         (CocoaBrowser/CocoaEditor) are asked by name — nil-safe if a package
+         isn't loaded; each guards its own not-yet-built view."
+        Workspace isNil ifFalse: [ Workspace onMain setFont: (self fixedFontOfSize: 13.0) ].
+        Transcript isNil ifFalse: [ Transcript onMain setFont: (self fixedFontOfSize: 11.0) ].
+        (Worker classNamed: #CocoaBrowser) ifNotNil: [ :c | c applyCodeFont ].
+        (Worker classNamed: #CocoaEditor) ifNotNil: [ :c | c applyCodeFont ].
+    ]
+
+    "── toolbar ACTION buttons (not view switchers) ───────────────────────
+     A lighter sibling of registerViewNamed:: mint an icon button that runs
+     an arbitrary block, without registering a tab/view. Placed left-to-right
+     after the view-switcher buttons, in the same 40px step grid."
+    CocoaUI class >> mintToolbarButton: iconBase tip: aTip action: aBlock atIndex: idx [
+        | btnClass btn imgClass img holder delegate x |
+        btnClass := Cocoa classNamed: 'NSButton'.
+        x := 8.0 + (idx * self toolbarButtonStep).
+        btn := (btnClass onMain alloc) onMain
+            initWithFrame: (Array with: x with: 6.0 with: self toolbarButtonWidth with: 32.0).
+        btn onMain setBordered: false.
+        btn onMain setTitle: aTip.
+        btn onMain setToolTip: aTip.
+        imgClass := Cocoa classNamed: 'NSImage'.
+        img := (imgClass onMain alloc) onMain initWithContentsOfFile: self iconDir , iconBase , '.svg'.
+        img isNil ifFalse: [
+            img onMain setTemplate: true.
+            btn onMain setImage: img.
+            btn onMain setImagePosition: 1 ].
+        holder := CocoaToolbarAction on: aBlock.
+        delegate := MacvmDelegate actionTargetOn: holder.
+        btn onMain setTarget: delegate.
+        btn onMain setAction: 'macvmAction:'.
+        Toolbar onMain addSubview: btn.
+        ToolbarDelegates add: delegate.
+        ^btn
+    ]
+    CocoaUI class >> buildFontButtons [
+        "Two font-size buttons right after the view switchers (biggerText/
+         smallerText — the same icons-mono/ template SVGs the WKWebView
+         toolbar ships). Called once, after every view has registered its
+         button, so `ToolbarButtons size` is the count they occupy."
+        | base |
+        base := ToolbarButtons size.
+        FontMinusBtn := self mintToolbarButton: 'smallerText' tip: 'Decrease text size'
+             action: [ self decreaseFont ] atIndex: base.
+        FontPlusBtn := self mintToolbarButton: 'biggerText' tip: 'Increase text size'
+             action: [ self increaseFont ] atIndex: base + 1.
+    ]
+
     CocoaUI class >> switchToView: aSymbol [
         "Select the view's tab, creating its NSTabViewItem lazily on first
          visit (the container block builds the view then). AppKit swaps the
@@ -336,8 +404,7 @@ Object subclass: CocoaUI [
             Workspace onMain setAutomaticQuoteSubstitutionEnabled: false.
             Workspace onMain setAutomaticDashSubstitutionEnabled: false.
             Workspace onMain setAutomaticTextReplacementEnabled: false.
-            Workspace onMain setFont: ((Cocoa classNamed: 'NSFont') onMain
-                userFixedPitchFontOfSize: 13.0).
+            Workspace onMain setFont: (self fixedFontOfSize: 13.0).
             Workspace onMain setString: self placeholderText.
             "Scroll-wrapped like every other text surface: a bare NSTextView
              draws past its frame and its stale pixels bleed through the next
@@ -727,8 +794,7 @@ Print it does the same and inserts the result right after it."
         Transcript := (tvClass onMain alloc) onMain
             initWithFrame: (Array with: 0.0 with: 0.0 with: w with: scrollH).
         Transcript onMain setEditable: false.
-        Transcript onMain setFont: ((Cocoa classNamed: 'NSFont') onMain
-            userFixedPitchFontOfSize: 11.0).
+        Transcript onMain setFont: (self fixedFontOfSize: 11.0).
         Transcript onMain setVerticallyResizable: true.
         Transcript onMain setHorizontallyResizable: false.
         Transcript onMain setAutoresizingMask: self maskWidthSizable.
@@ -827,9 +893,16 @@ Print it does the same and inserts the result right after it."
             Transcript := nil. TranscriptScroll := nil. ActTarget := nil. ToolbarDelegates := nil.
             TranscriptDivider := nil. TranscriptClearBtn := nil.
             ToolbarButtons := nil. MetricLabels := nil. Views := nil.
+            "Font buttons are subviews of Toolbar (released above) — just drop
+             the stale wrappers so a rebuilt UI re-mints them cleanly."
+            FontMinusBtn := nil. FontPlusBtn := nil.
             MemBarFill := nil. MemBarWidth := nil ]
     ]
 
     CocoaUI class >> window [ ^Win ]
     CocoaUI class >> transcriptView [ ^Transcript ]
+    "Scripting hooks (rusttcl `gui`) — drive the A-/A+ buttons for a real
+     target/action click, exactly as a user's mouse would."
+    CocoaUI class >> fontPlusButton [ ^FontPlusBtn ]
+    CocoaUI class >> fontMinusButton [ ^FontMinusBtn ]
 ]
