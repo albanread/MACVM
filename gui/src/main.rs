@@ -16,7 +16,12 @@ mod objc;
 mod preprocess;
 mod vm_host;
 mod workspace_render;
-mod world_boot;
+// Moved to image_store (docs/package_aware_editing_design.md M2): that
+// crate has no [lib] target, so nothing else could ever depend on it —
+// cocoa_gui needs this same replay logic for its own primary's DB-boot (a
+// later milestone). Re-exported under its old name so every existing
+// `crate::world_boot::...` call site in this crate needed no changes.
+pub(crate) use image_store::world_boot;
 
 use objc::{sel, Id, Sel, NIL};
 use preprocess::Theme;

@@ -22,3 +22,10 @@ path = "src/bin/import_world.rs"
 # crate's zero-dependency Cocoa bridge (that one avoids objc2 specifically
 # for its evolving macro API, not external crates on principle).
 rusqlite = { version = "0.31", features = ["bundled"] }
+# world_boot.rs (moved from gui/, docs/package_aware_editing_design.md M2):
+# replaying a stored image into a VmHandle needs the VM type it replays
+# into. The constraint only ever ran the other direction — macvm itself
+# must stay free of a SQLite dependency (world_boot.rs's own header
+# comment) — so image_store depending on macvm is sound; gui and
+# cocoa_gui both already depend on macvm directly too.
+macvm = { path = ".." }

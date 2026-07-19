@@ -17,6 +17,7 @@ pub mod export;
 pub mod flows;
 pub mod import;
 pub mod mst;
+pub mod world_boot;
 
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;

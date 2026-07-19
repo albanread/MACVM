@@ -10,11 +10,17 @@
 //! (`execute_top_item` → `install_class_def`), so a DB-booted world is the
 //! same VM state as a file-booted one.
 //!
-//! This lives in `gui/` (not the `macvm` crate) on purpose: the VM stays
-//! free of a SQLite dependency, and the embedder wires the database to the
-//! VM (the same separation `docs/SPEC.md` §16 draws for the whole GUI↔VM
-//! boundary). `load_world_from_image` needs only `image_store`'s read
-//! records and `VmHandle`'s `boot_without_world`/`exec`.
+//! Lives in `image_store` (not the `macvm` crate) on purpose: the VM stays
+//! free of a SQLite dependency — the embedder wires the database to the VM
+//! (the same separation `docs/SPEC.md` §16 draws for the whole GUI↔VM
+//! boundary) — while `image_store` may depend on `macvm`'s `VmHandle`
+//! freely; the constraint only ever ran one direction. Moved here from
+//! `gui/src/world_boot.rs` (`docs/package_aware_editing_design.md` M2): that
+//! crate is `[[bin]]`-only with no `[lib]` target, so nothing else could
+//! ever depend on it — `cocoa_gui` needs this same replay logic to move its
+//! own primary onto DB-boot (a later milestone), and `gui` keeps using it
+//! via a one-line re-export (`crate::world_boot` in `gui/src/main.rs`) so
+//! none of its own call sites needed to change.
 //!
 //! Correctness rests on three facts established when this was built (S22):
 //! `all_classes()` returns classes in dependency-safe `load_order`
@@ -34,7 +40,7 @@
 //! `load_order`, then install every class's methods. By the time any method
 //! compiles, every class name it could reference is already a bound global.
 
-use image_store::{FullClass, FullMethod, Image};
+use crate::{FullClass, FullMethod, Image};
 use macvm::embed::VmHandle;
 
 /// Phase-1 shell source for a class: `<super> subclass: <name> [ |ivars| ]`
@@ -178,7 +184,7 @@ pub fn load_world_from_image(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use image_store::Side;
+    use crate::Side;
     use macvm::runtime::{JitMode, VmOptions};
     use std::path::PathBuf;
 
@@ -204,7 +210,7 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&path);
         let image = Image::open(&path).expect("open temp image");
-        image_store::import::import_world_dir(&image, &world_dir()).expect("import world");
+        crate::import::import_world_dir(&image, &world_dir()).expect("import world");
         (image, path)
     }
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
