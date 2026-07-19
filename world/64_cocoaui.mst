@@ -66,6 +66,7 @@ Object subclass: CocoaUI [
     CocoaUI class >> toolbarHeight [ ^44.0 ]
     CocoaUI class >> transcriptHeight [ ^110.0 ]
     CocoaUI class >> iconDir [ ^'gui/assets/icons-mono/' ]
+    CocoaUI class >> toolbarTexturePath [ ^'gui/assets/toolbar-texture.png' ]
 
     "── autoresizing mask bits (NSView) ──"
     CocoaUI class >> maskWidthSizable [ ^2 ]
@@ -134,7 +135,31 @@ Object subclass: CocoaUI [
                                   with: (frame at: 3) with: self toolbarHeight).
         Toolbar onMain setAutoresizingMask: self maskWidthSizable + self maskMinYMargin.
         content onMain addSubview: Toolbar.
+        self buildToolbarBackgroundIn: Toolbar.
         self buildMetricsClusterIn: Toolbar.
+    ]
+
+    CocoaUI class >> buildToolbarBackgroundIn: aToolbar [
+        "A subtle tiled grain behind the toolbar contents so the strip reads
+         as a textured surface, not a blank sheet. A pattern NSColor (a plain
+         color — no CGColorRef marshalling, same safety as the mem bar's
+         setFillColor:) fills a borderless custom NSBox sized to the toolbar,
+         added FIRST so every icon/metric renders on top of it, unchanged.
+         Fails soft: a missing texture file just leaves the toolbar plain."
+        | img color boxClass box frame |
+        img := (Cocoa classNamed: 'NSImage') onMain alloc onMain
+            initWithContentsOfFile: self toolbarTexturePath.
+        img isNil ifTrue: [ ^self ].
+        color := (Cocoa classNamed: 'NSColor') onMain colorWithPatternImage: img.
+        frame := aToolbar onMain frame.
+        boxClass := Cocoa classNamed: 'NSBox'.
+        box := (boxClass onMain alloc) onMain
+            initWithFrame: (Array with: 0.0 with: 0.0 with: (frame at: 3) with: (frame at: 4)).
+        box onMain setBoxType: 4.   "NSBoxCustom"
+        box onMain setBorderType: 0. "NSNoBorder"
+        box onMain setFillColor: color.
+        box onMain setAutoresizingMask: self maskWidthSizable + self maskHeightSizable.
+        aToolbar onMain addSubview: box.
     ]
 
     CocoaUI class >> metricCellWidth [ ^64.0 ]
