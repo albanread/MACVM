@@ -4,9 +4,15 @@
 the image database must contain the Cocoa GUI's own Smalltalk source (not
 just the base world), the main browser must be able to show and edit all of
 it, and accepting an edit must never push a live recompile into a VM that
-doesn't have that source's package loaded. This document investigates the
-current architecture against that requirement — with exact file/line
-citations, not assumptions — and proposes a solution. No code changes yet.
+doesn't have that source's package loaded. Revised once, in response to
+further direction: every VM should boot from the database rather than raw
+`.mst` files, each loading only the world plus the packages it actually
+needs — which means package-list membership (today: which `.mst` files
+`world.list`/`cocoaui.list` name) has to become a database concept in its
+own right, not just a fact about which files got imported (§4.5). This
+document investigates the current architecture against both — with exact
+file/line citations, not assumptions — and proposes a solution. No code
+changes yet.
 
 ## 1. The problem, precisely
 
@@ -66,7 +72,7 @@ Three save paths, all the same shape:
 
 **DB-boot (`load_world_from_image`, `gui/src/world_boot.rs:126`) loads every
 class in the database, unconditionally** — `Image::all_classes()`, no
-filter. This matters for §5.
+filter. This matters for §4.5.
 
 ## 3. Why this is a real bug, not just a missing feature
 
@@ -201,29 +207,121 @@ produces an honest compile error through the existing `r = 'nil' ifFalse:`
 path — not the silent-wrong-shape failure §3 describes, so there's nothing
 new to guard there.
 
-### 4.5 Cross-GUI consistency, and an open question about DB-boot
+### 4.5 Resolved: package lists move into the database; every VM boots from it, selectively
 
-The WKWebView GUI's own `BrowserSaveSource` handling should get the
-equivalent gate for the same reason (§3's bug shape doesn't care which GUI
-shipped the doit). But note an asymmetry worth deciding explicitly, not
-silently: `load_world_from_image` (§2) loads **every** class in the database
-unconditionally. Once §4.1 lands, the WKWebView GUI's single VM would
-therefore always end up with `cocoaui`'s classes compiled in at boot — inert
-(no run loop to invoke `CocoaUI startup` there) but always "loaded," which
-means §4.4's gate would never actually trigger for that GUI. Only
-`macvm-cocoa`'s primary — which deliberately boots from raw `.mst` +
-`world.list` only, never the image — genuinely exercises the "not loaded"
-case today.
+Revision, superseding this section's earlier draft (which left DB-boot's
+selectivity as an open question and recommended deferring it). Direction
+from the user: **everything should boot from the database, each VM loading
+only the world plus the packages it actually needs — and package-list
+membership itself should be a database concept, not just a fact about which
+`.list` file happened to get imported.**
 
-Two honest options, not resolved here: leave DB-boot as "load everything"
-(simplest; the extra classes are harmless dead weight, and the gate still
-does real work for the Cocoa GUI's primary, which is the case that actually
-motivated this) — or make DB-boot selective (a `--packages world,cocoaui`
-style boot filter), which matters once a *third* list exists that some VM
-deliberately should not carry. Recommend deferring the second until there's
-a concrete third package to test it against, and shipping the gate
-universally either way — it's correct and harmless even where it never
-fires.
+This is a better answer than the live-existence check in §4.4 alone would
+give, because it makes "does this VM have package X" a fact that's true **by
+construction** (a VM that boots from package list `"world"` structurally
+cannot have any `cocoaui`-package class defined — nothing ever asked the
+compiler to define one) rather than incidentally true (today's Cocoa GUI
+primary just happens not to load `cocoaui.list`, which is one specific
+binary's boot code doing the right thing, not a property the database
+itself understands or enforces). §4.4's mechanism (fold the check into the
+live-compile doit, evaluated on the target VM) stays correct and stays the
+right implementation — it's now grounded in a guaranteed invariant instead
+of an incidental one.
+
+**Schema addition** — two small tables, no change to anything existing:
+
+```sql
+CREATE TABLE IF NOT EXISTS package_lists (
+    list_id  INTEGER PRIMARY KEY,
+    name     TEXT NOT NULL UNIQUE          -- "world", "cocoaui"
+);
+CREATE TABLE IF NOT EXISTS package_list_members (
+    list_id  INTEGER NOT NULL REFERENCES package_lists(list_id),
+    package  TEXT NOT NULL,                -- matches class_versions.category
+    UNIQUE(list_id, package)
+);
+```
+
+No per-member ordering column: `classes.load_order` (already the historical,
+dependency-safe import order — `world_boot.rs`'s own doc comment establishes
+this: "`all_classes()` returns classes in dependency-safe `load_order`") is
+already the correct sort key across *any* subset of packages, since it's a
+single global sequence assigned once at import time regardless of which file
+or package a class came from. A "list" is genuinely just a **named set of
+packages** — boot order for any combination of lists falls out of the
+existing column for free.
+
+**Population, at import time.** `import_list_file` (§4.1) already knows which
+`.list` file it's processing and already derives each file's package name
+via `package_name_from_filename`. Extend it to also record, per file, that
+the list being imported (its own name derived the same way — `"world.list"`
+→ `"world"`, `"cocoaui.list"` → `"cocoaui"`) contains that package —
+`Image::ensure_package_list_member(list_name, package)`, an idempotent
+insert. The `.list` files on disk remain the checked-in source of truth for
+the *initial* membership (exactly as they already are for classes and
+methods); after import, the database rows are what boot actually reads, and
+they can evolve independently from there — a browser feature to move a
+package between lists, should anyone want one, is just another edit to
+`package_list_members`, versioned the same casual way everything else in the
+image already is.
+
+**Boot becomes list-driven.** A new `Image::classes_for_lists(&[&str]) ->
+Vec<FullClass>` — join `package_list_members` (by list name, unioned across
+however many list names the caller asks for) against
+`classes`/`latest_class_versions` on `category = package`, ordered by
+`classes.load_order`, same shape as `all_classes()` today just filtered.
+`load_world_from_image` (`gui/src/world_boot.rs:126`) takes a `&[&str]` of
+requested list names instead of unconditionally calling `all_classes()`.
+
+**Who requests which lists** (each VM boots "the world plus what it needs,"
+per the direction — nothing here is forced to request everything just
+because everything now exists in the database):
+
+| VM | Requested lists | Why |
+|---|---|---|
+| `macvm-cocoa` primary | `["world"]` | persistent environment; never runs AppKit UI code, so `cocoaui`'s classes would be dead weight there — same role split as today, just now via the DB |
+| `macvm-cocoa` UI worker | `["world", "cocoaui"]` | needs its own implementation live to run at all |
+| `macvm-gui` | `["world"]` | no Cocoa-GUI-specific role; open to revisiting if a reason turns up to want `cocoaui` visible there too |
+| compute workers (`Worker spawn:`) | whatever the spawning VM specifies (defaults to its own list set) | unchanged in spirit from today — a worker inherits its parent's boot shape |
+
+**`world_boot.rs` has to move before `macvm-cocoa`'s primary can use it at
+all — this isn't optional polish, it's a prerequisite.** It lives in
+`gui/src/` today, and `gui` is a `[[bin]]`-only crate (confirmed:
+`gui/Cargo.toml` declares no `[lib]` target, and `cocoa_gui/Cargo.toml` does
+not depend on `gui`) — there is no `[lib]` target for `cocoa_gui` to depend
+on even if it wanted to. So the M3 switch is not "point the primary's boot
+call at a list-name slice instead of `all_classes()`" — that function is
+structurally unreachable from `cocoa_gui` as things stand. Move the
+"replay an image into a `VmHandle`" logic out of `gui/src/world_boot.rs`
+and into `image_store` itself, as its own module. That direction is sound:
+`image_store` may depend on `macvm`'s `VmHandle` freely — the constraint
+`world_boot.rs`'s own header comment states only ever ran one way, *"the
+[core] VM stays free of a SQLite dependency,"* not the reverse. Both `gui`
+and `cocoa_gui` then call the same function. This is a pure extraction (no
+behavior change) for `macvm-gui`, provable by its own existing boot/seed
+tests passing unchanged against the moved code before anything new is built
+on top of it — do it as its own early milestone (M2 below), not folded into
+the bigger M3 change.
+
+**The bare CLI (`macvm run`/`macvm repl`/`macvm rusttcl`) is a different,
+smaller decision, and there's a real reason to leave its *default* alone.**
+`VmHandle::boot` (`src/embed.rs:477`) direct-from-`.mst` is what makes
+`world_image_installs_all_classes_without_error`-style tests possible at
+all — an independent, DB-free "does the checked-in source itself still
+boot" ground truth to catch DB-boot drifting from it, which the differential
+philosophy this whole project runs on (`reference-instructions-are-not-time`,
+the interpreter-is-the-oracle rule, etc.) actively wants to keep around, not
+retire. Once M2's shared replay logic exists, giving the CLI an *additional*,
+opt-in `--from-image` boot path is a small, low-risk add — but its default
+should stay `.mst`-direct on purpose, not as leftover scope. Listed as a
+**later, optional milestone** (M6 below).
+
+The WKWebView GUI's own `BrowserSaveSource` handling gets the equivalent
+§4.4 gate for the same reason as before (§3's bug shape doesn't care which
+GUI shipped the doit) — now doubly justified, since `macvm-gui` requesting
+only `["world"]` means it will *also* genuinely exercise the "not loaded"
+path once `cocoaui`-package content exists in the database, which wasn't
+true under the old "DB-boot loads everything" default.
 
 ## 5. Non-goals for v1
 
@@ -234,18 +332,27 @@ fires.
   classes back out to their `.mst` files on disk is a separate, smaller
   extension of the same file-scoping idea once import is generalized, not
   bundled here.
-- No attempt to make DB-boot selective (§4.5) — flagged, not built.
+- No UI for editing package-list membership itself (moving a package between
+  lists, defining a brand-new list) — the schema and the import-time
+  population support it, but a browser affordance for it is a later ask.
+- The bare CLI's *default* staying on `.mst`-direct boot (§4.5) — a
+  deliberate choice (it's the DB-free ground truth other tests check
+  against), not unresolved scope; an opt-in `--from-image` path is the
+  small, later M7.
 
 ## 6. Milestone ladder
 
 | | Deliverable | Proof |
 |---|---|---|
-| **M1** | `import_list_file` / `import_all_lists`; `cmd_seed` switched over; `reseed-world.sh` rebuilt and verified | `world/image.sqlite3` contains `CocoaHelp` etc.; `Image::packages()` lists `"cocoaui"`; existing importer tests still pass unchanged (`world.list`-only behavior is the same code path, just parameterized) |
-| **M2** | `source_file` provenance for interactively-created classes/methods (§4.2) | a class created via the browser has a non-`NULL` derivable `class_home_file` |
-| **M3** | The live-compile gate (§4.4) in `CocoaEditor`/`CocoaBrowser` | editing a `CocoaHelp` method while connected to the primary (which doesn't load `cocoaui.list`) saves to the database and reports "not applied live" — verified by driving the real app (`MACVM_COCOA_CTL`), not assumed; a normal base-world edit is unaffected |
-| **M4** | Database-only rows in the browser (§4.3) | `CocoaHelp` is visible and its source opens for editing from a fresh Cocoa GUI session that never touched it any other way |
-| **M5** | The WKWebView GUI's equivalent gate | same M3 proof, other GUI |
+| **M1** | `import_list_file` / `import_all_lists`; `package_lists` / `package_list_members` schema + population at import time; `cmd_seed` switched over; `reseed-world.sh` rebuilt and verified | `world/image.sqlite3` contains `CocoaHelp` etc.; `Image::packages()` lists `"cocoaui"`; `package_list_members` correctly maps `"cocoaui"` → the `cocoaui.list` package set; existing importer tests still pass unchanged (`world.list`-only behavior is the same code path, just parameterized) |
+| **M2** | Extract `gui/src/world_boot.rs`'s replay logic into `image_store` (pure move, no behavior change) — the prerequisite §4.5 identifies | `macvm-gui`'s own existing boot/seed tests pass unchanged against the moved code; `cocoa_gui` can now reach it (compiles against it, not yet wired to anything) |
+| **M3** | `source_file` provenance for interactively-created classes/methods (§4.2) | a class created via the browser has a non-`NULL` derivable `class_home_file` |
+| **M4** | `Image::classes_for_lists`; the moved replay fn takes a list-name slice; `macvm-gui` and `macvm-cocoa`'s primary switch to DB-boot requesting `["world"]`; the UI worker requests `["world", "cocoaui"]` | each VM's live `ClassMirror allClasses` sweep matches exactly the classes in its requested lists — no more, no less; existing boot-time tests (`world_image_installs_all_classes_without_error` and friends) still pass against the now-selective boot |
+| **M5** | The live-compile gate (§4.4) in `CocoaEditor`/`CocoaBrowser`, and the WKWebView GUI's equivalent | editing a `CocoaHelp` method while connected to the primary (which requests `["world"]` only) saves to the database and reports "not applied live" — verified by driving the real app (`MACVM_COCOA_CTL`), not assumed; a normal base-world edit is unaffected; same proof, other GUI |
+| **M6** | Database-only rows in the browser (§4.3) | `CocoaHelp` is visible and its source opens for editing from a fresh Cocoa GUI session that never touched it any other way |
+| **M7** | Optional, later: the bare CLI's opt-in `--from-image` boot path | `macvm run --world world --from-image` boots identically to the `.mst`-direct default |
 
-M1–M3 carry the real risk and the actual bug fix; M4–M5 are mostly mapping
-over a proven base, matching this project's own convention for staging a
-build (`cocoa_gui_design.md` §10's shape).
+M1–M5 carry the real risk and the actual bug fix (§3); M6 is mostly mapping
+over a proven base; M7 is optional and explicitly deferred — matching this
+project's own convention for staging a build (`cocoa_gui_design.md` §10's
+shape).
