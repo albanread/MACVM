@@ -1116,6 +1116,48 @@ fn live_compile(vm: &mut VmHandle, mst_source: &str) -> Result<(), String> {
     vm.exec(mst_source).map_err(|e| e.to_string())
 }
 
+/// M5 (`docs/package_aware_editing_design.md` §4.4): whether `vm` — the
+/// ACTUAL VM a reopen is about to run on — already has `class_name` defined.
+/// `world` (the `MockWorld` mirror) is NOT a safe stand-in for this since M4:
+/// it mirrors the WHOLE database, including packages this specific VM never
+/// booted (`import_all_lists`), so `world.class_named(...).is_some()` no
+/// longer implies `vm` has it. A bare reference to an unknown global fails
+/// to compile (`GuestError::Compile`); a known class name evaluates to
+/// itself — so evaluating it directly is a cheap, exact existence check.
+fn vm_has_class(vm: &mut VmHandle, class_name: &str) -> bool {
+    vm.eval(class_name).is_ok()
+}
+
+/// What attempting a live-compile reopen produced.
+enum ReopenOutcome {
+    Applied,
+    /// Skipped — never attempted, so no compile-error text would be honest
+    /// (§4.4: a reopen has no ivar declaration, so running it unconditionally
+    /// on a VM that never loaded `class_name` would silently DEFINE A WRONG-
+    /// SHAPE SHELL under that name instead of failing — the real bug this
+    /// gate exists to close, §3).
+    NotLoaded,
+    Failed(String),
+}
+
+/// The M5-gated counterpart to [`live_compile`] for a REOPEN specifically
+/// (an edit to an existing class assumed to already have its real shape —
+/// `acceptMethod`'s/`reopen_one_method`'s shape). Only ever attempts the
+/// compile once [`vm_has_class`] confirms the target VM already has
+/// `class_name`. Does NOT apply to a full class definition (real ivars
+/// included, e.g. `SmapplNewClass`/`ClassDefinition`) — that shape either
+/// resolves correctly on a VM seeing it for the first time or fails an
+/// honest compile error, never the silent-wrong-shape failure this guards.
+fn live_compile_reopen(vm: &mut VmHandle, class_name: &str, mst_source: &str) -> ReopenOutcome {
+    if !vm_has_class(vm, class_name) {
+        return ReopenOutcome::NotLoaded;
+    }
+    match live_compile(vm, mst_source) {
+        Ok(()) => ReopenOutcome::Applied,
+        Err(e) => ReopenOutcome::Failed(e),
+    }
+}
+
 fn side_to_image(side: Side) -> image_store::Side {
     match side {
         Side::Instance => image_store::Side::Instance,
@@ -1655,9 +1697,12 @@ fn handle(
                 .unwrap_or_else(|| "nil".to_string());
             let reopen = format!("{superclass} subclass: {cls} [\n{}\n]\n", text.trim());
             let versioned = match versioned {
-                Ok(_) => match live_compile(vm, &reopen) {
-                    Ok(()) => format!("Accepted {cls}>>{sel} — versioned to the image and live"),
-                    Err(e) => format!("Accepted {cls}>>{sel} to the image, but compile failed: {e}"),
+                Ok(_) => match live_compile_reopen(vm, &cls, &reopen) {
+                    ReopenOutcome::Applied => format!("Accepted {cls}>>{sel} — versioned to the image and live"),
+                    ReopenOutcome::NotLoaded => format!(
+                        "Accepted {cls}>>{sel} to the image — this VM does not have {cls} loaded, not applied live"
+                    ),
+                    ReopenOutcome::Failed(e) => format!("Accepted {cls}>>{sel} to the image, but compile failed: {e}"),
                 },
                 Err(e) => format!("{cls}>>{sel}: image write FAILED (not versioned): {e}"),
             };
@@ -1691,11 +1736,14 @@ fn handle(
                         }
                     });
                     let reopen = reopen_one_method(world, &cls, &text);
-                    match (image_err, live_compile(vm, &reopen)) {
-                        (None, Ok(())) => {
+                    match (image_err, live_compile_reopen(vm, &cls, &reopen)) {
+                        (None, ReopenOutcome::Applied) => {
                             format!("Added {cls}>>{selector} — versioned to the image and live")
                         }
-                        (None, Err(e)) => {
+                        (None, ReopenOutcome::NotLoaded) => format!(
+                            "Added {cls}>>{selector} to the image — this VM does not have {cls} loaded, not applied live"
+                        ),
+                        (None, ReopenOutcome::Failed(e)) => {
                             format!("Added {cls}>>{selector} to the image, but compile failed: {e}")
                         }
                         (Some(ie), _) => format!("{cls}>>{selector}: image write issue: {ie}"),
@@ -1824,17 +1872,23 @@ fn handle(
                 if is_class_var {
                     // A class variable is a separate association, not part of the
                     // instance shape — reopening the class to append it compiles
-                    // cleanly and takes effect immediately.
+                    // cleanly and takes effect immediately, PROVIDED the target VM
+                    // already has this class (M5, §4.4): the reopen carries no
+                    // ivars, so on a VM that never loaded `cls` it would silently
+                    // define a wrong-shape shell instead (§3).
                     let sc = world
                         .class_named(&cls)
                         .and_then(|c| c.superclass.clone())
                         .unwrap_or_else(|| "Object".to_string());
                     let def = format!("{sc} subclass: {cls} [\n    <classVars: {name}>\n]");
-                    match (image_err, live_compile(vm, &def)) {
-                        (None, Ok(())) => {
+                    match (image_err, live_compile_reopen(vm, &cls, &def)) {
+                        (None, ReopenOutcome::Applied) => {
                             format!("Added class variable {name} to {cls} — live in the VM.")
                         }
-                        (None, Err(e)) => format!(
+                        (None, ReopenOutcome::NotLoaded) => format!(
+                            "Added class variable {name} to {cls} in the image — this VM does not have {cls} loaded, not applied live."
+                        ),
+                        (None, ReopenOutcome::Failed(e)) => format!(
                             "Added class variable {name} to {cls} in the image, but not live: {e}."
                         ),
                         (Some(ie), _) => {
@@ -2305,13 +2359,22 @@ fn handle(
             // compiles nothing (`None`). A live-compile failure is reported
             // but does NOT undo the save — the source is persisted; the user
             // fixes and re-accepts.
-            let vm_live: Option<Result<(), String>> = match (&outcome, &edit_kind) {
+            // M5 (§4.4): Method/NewMethod is a REOPEN (no ivars) — gated on the
+            // VM already having the class, same as SmapplAccept/SmapplNewMethod.
+            // ClassDefinition/NewClass ships a full definition (real ivars via
+            // `text`) — never gated, same as `acceptClass`: it either resolves
+            // correctly on a VM seeing it for the first time or fails an honest
+            // compile error, never the silent-wrong-shape failure §3 describes.
+            let vm_live: Option<ReopenOutcome> = match (&outcome, &edit_kind) {
                 (Ok(_), SourceEditTarget::Method | SourceEditTarget::NewMethod) => selection
                     .class
                     .clone()
-                    .map(|c| live_compile(vm, &reopen_one_method(world, &c, &text))),
+                    .map(|c| live_compile_reopen(vm, &c, &reopen_one_method(world, &c, &text))),
                 (Ok(_), SourceEditTarget::ClassDefinition | SourceEditTarget::NewClass) => {
-                    Some(live_compile(vm, &text))
+                    Some(match live_compile(vm, &text) {
+                        Ok(()) => ReopenOutcome::Applied,
+                        Err(e) => ReopenOutcome::Failed(e),
+                    })
                 }
                 _ => None,
             };
@@ -2326,8 +2389,13 @@ fn handle(
                         }
                     };
                     match vm_live {
-                        Some(Ok(())) => format!("{base} — live in the VM."),
-                        Some(Err(e)) => format!("{base}; saved but NOT live in the VM: {e}."),
+                        Some(ReopenOutcome::Applied) => format!("{base} — live in the VM."),
+                        Some(ReopenOutcome::NotLoaded) => {
+                            format!("{base}; this VM does not have it loaded, not applied live.")
+                        }
+                        Some(ReopenOutcome::Failed(e)) => {
+                            format!("{base}; saved but NOT live in the VM: {e}.")
+                        }
                         None => format!("{base}."),
                     }
                 }
@@ -3759,6 +3827,133 @@ mod tests {
             vm.eval("(Point x: 7 y: 2) y.").unwrap(),
             "7",
             "the edit must be live in the VM, with the x ivar preserved"
+        );
+
+        std::fs::remove_file(&tmp).ok();
+    }
+
+    /// M5 (`docs/package_aware_editing_design.md` §4.4): since M4, `world`
+    /// (the `MockWorld` mirror) and the image can know about a class THIS
+    /// PARTICULAR VM never booted — a `cocoaui`-only class, when this VM
+    /// only requested `WORLD_LISTS` — so a live-compile reopen must be gated
+    /// on the VM ITSELF having the class, not on `world`/`image` knowing
+    /// about it. A reopen has no ivar declaration, so running it
+    /// unconditionally on a VM that never loaded the class would silently
+    /// DEFINE A WRONG-SHAPE SHELL under that name instead of failing (§3) —
+    /// the real bug this design exists to close. (The "gate applies when
+    /// the VM DOES have the class" path is already covered by
+    /// `smappl_accept_versions_the_edit_and_makes_it_live` above — `Point`
+    /// is base-world content, present on that test's VM too — so this test
+    /// only needs to add the NEW "gate skips" behavior.)
+    #[test]
+    fn smappl_new_method_skips_live_compile_when_the_vm_lacks_the_class() {
+        OPEN_OUTLINERS.with(|o| o.borrow_mut().clear());
+        let world_dir = test_world_dir();
+        let tmp =
+            std::env::temp_dir().join(format!("macvm_m5gate_{}.sqlite3", std::process::id()));
+        std::fs::remove_file(&tmp).ok();
+        // world.list AND cocoaui.list both land in the SAME image
+        // (import_all_lists) — the image knows about CocoaHelp.
+        let image = open_or_seed_image(&world_dir, &tmp).expect("seed");
+        assert!(
+            image.class_named("CocoaHelp").unwrap().is_some(),
+            "sanity: the image must know about CocoaHelp (cocoaui.list)"
+        );
+
+        // This VM boots WORLD_LISTS ONLY — it never loaded cocoaui, so it
+        // has no CocoaHelp — exactly M4's selective-boot split.
+        let mut vm = VmHandle::boot_without_world(macvm::runtime::VmOptions {
+            heap_mib: 64,
+            jit: macvm::runtime::JitMode::Off,
+            ..Default::default()
+        });
+        crate::world_boot::load_world_from_image(&mut vm, &image, WORLD_LISTS, WORLD_DOITS)
+            .expect("db load");
+        assert!(
+            vm.eval("CocoaHelp").is_err(),
+            "sanity: this VM must NOT have CocoaHelp loaded"
+        );
+
+        let mut world = MockWorld::seed();
+        let mut selection = BrowserSelection::default();
+
+        let responses = handle(
+            VmRequest::SmapplNewMethod {
+                cls: "CocoaHelp".to_string(),
+                side: "instance".to_string(),
+                text: "m5GateProbe [ ^1 ]".to_string(),
+            },
+            &mut world,
+            &mut selection,
+            Some(&image),
+            &mut vm,
+        );
+        assert!(
+            transcript_containing(&responses, "not applied live"),
+            "must honestly report the VM doesn't have this class loaded, got {responses:?}"
+        );
+
+        // The real proof: no wrong-shape shell was defined on the VM under
+        // this name (§3's actual bug) — CocoaHelp is still simply
+        // undeclared there, exactly as before the request.
+        assert!(
+            vm.eval("CocoaHelp").is_err(),
+            "the gate must not have silently defined a wrong-shape CocoaHelp shell on the VM"
+        );
+
+        std::fs::remove_file(&tmp).ok();
+    }
+
+    /// The `SmapplAddVar` class-var branch builds its OWN reopen (a
+    /// SEPARATE code path from `SmapplNewMethod`, sharing only
+    /// `live_compile_reopen`) — same M5 gate, same shape of proof.
+    #[test]
+    fn smappl_add_class_var_skips_live_compile_when_the_vm_lacks_the_class() {
+        OPEN_OUTLINERS.with(|o| o.borrow_mut().clear());
+        let world_dir = test_world_dir();
+        let tmp =
+            std::env::temp_dir().join(format!("macvm_m5gate_cvar_{}.sqlite3", std::process::id()));
+        std::fs::remove_file(&tmp).ok();
+        let image = open_or_seed_image(&world_dir, &tmp).expect("seed");
+
+        let mut vm = VmHandle::boot_without_world(macvm::runtime::VmOptions {
+            heap_mib: 64,
+            jit: macvm::runtime::JitMode::Off,
+            ..Default::default()
+        });
+        crate::world_boot::load_world_from_image(&mut vm, &image, WORLD_LISTS, WORLD_DOITS)
+            .expect("db load");
+        assert!(vm.eval("CocoaHelp").is_err(), "sanity: not loaded here");
+
+        let mut world = MockWorld::seed();
+        // `SmapplAddVar` has its OWN, unrelated pre-existing sanity guard —
+        // "does the browser mirror know this class at all" — which
+        // `MockWorld::seed()`'s standalone hardcoded fixture doesn't; add it
+        // so that guard passes and the M5 gate itself is what's exercised.
+        // This accurately models the real M4 divergence: the DATABASE
+        // knows about CocoaHelp (M1 imported it), but THIS VM never booted
+        // it (M4 made boot selective).
+        world.add_class("CocoaHelp", Some("Visual"), "GUI", "", "", "");
+        let mut selection = BrowserSelection::default();
+
+        let responses = handle(
+            VmRequest::SmapplAddVar {
+                cls: "CocoaHelp".to_string(),
+                is_class_var: true,
+                name: "M5GateProbeCVar".to_string(),
+            },
+            &mut world,
+            &mut selection,
+            Some(&image),
+            &mut vm,
+        );
+        assert!(
+            transcript_containing(&responses, "not applied live"),
+            "must honestly report the VM doesn't have this class loaded, got {responses:?}"
+        );
+        assert!(
+            vm.eval("CocoaHelp").is_err(),
+            "the gate must not have silently defined a wrong-shape CocoaHelp shell on the VM"
         );
 
         std::fs::remove_file(&tmp).ok();

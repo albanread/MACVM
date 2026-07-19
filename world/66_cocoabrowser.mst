@@ -504,8 +504,37 @@ Object subclass: CocoaBrowser [
         EditMode == #editMethod ifTrue: [ ^self acceptMethod ].
         EditMode == #newClass ifTrue: [ ^self acceptClass ].
     ]
+    "── M5 live-compile gate (docs/package_aware_editing_design.md §4.4) ──
+     Ship a class-reopen to the PRIMARY, but ONLY after confirming the
+     primary already has `cls` loaded. A reopen carries no ivar declaration,
+     so on a primary that never loaded the class it would silently DEFINE A
+     WRONG-SHAPE SHELL under that name (§3) instead of failing — the real
+     bug this whole design exists to close.
+
+     TWO ROUND TRIPS (check, then reopen), NOT the design doc's original
+     one-doit fold — confirmed empirically, not assumed, that a fold cannot
+     work: `X subclass: Y [...]` is a TOP-LEVEL-ONLY special form (nested in
+     a block it fails to parse), AND a doit only ever runs its FIRST
+     top-level item (`frontend::parser::parse_one_top_item`, SPEC §16.2), so
+     a `.`-separated guard-then-reopen silently never reaches the reopen.
+     The check/act race two trips opens is immaterial for a single-user
+     local dev tool clicking one Accept at a time — not worth a primitive.
+
+     Extracted as ONE shallow helper (rather than inlined at each call site)
+     specifically so the nested `uiDoit:onReply:` send can't greedily
+     absorb a caller's trailing `ifFalse:` into a phantom
+     `uiDoit:onReply:ifFalse:` selector — the failure mode an inlined,
+     deeply-nested version actually hit. `doneBlock` is handed the reopen's
+     reply string (a class-form doit answers 'nil' on success, else the
+     primary's compile/runtime error text); `skipBlock` takes no args."
+    CocoaBrowser class >> liveReopen: reopenSource for: cls onDone: doneBlock onSkipped: skipBlock [
+        Worker uiDoit: '(Worker classNamed: #' , cls , ') notNil' onReply: [ :loaded |
+            loaded = 'true'
+                ifTrue: [ Worker uiDoit: reopenSource onReply: doneBlock ]
+                ifFalse: [ skipBlock value ] ]
+    ]
     CocoaBrowser class >> acceptMethod [
-        | cls text reply sel doit |
+        | cls text reply sel reopen |
         cls := self selectedClassName.
         cls isNil ifTrue: [ ^self ].
         text := self sourceText.
@@ -516,16 +545,17 @@ Object subclass: CocoaBrowser [
         sel := self payloadOf: reply.
         "Live-compile the SAME reopen vm_host's live_compile gets
          (flows::reopen_one_method's shape), on the primary, then re-snapshot
-         so the new selector row appears from the live truth."
-        doit := ShellSuper , ' subclass: ' , cls , ' [' , String lf , text , String lf , ']'.
-        Worker uiDoit: doit onReply: [ :r |
-            "A successful class-form doit answers 'nil'; anything else is the
-             primary's compile/runtime error text — report it honestly (the
-             image save above still holds; fix and re-accept makes it live)."
-            r = 'nil'
-                ifTrue: [ CocoaUI appendTranscript: 'browser: saved ' , cls , '>>' , sel , ' (image + live)' ]
-                ifFalse: [ CocoaUI appendTranscript: 'browser: saved ' , cls , '>>' , sel , ' to the image, but live compile failed: ' , r ].
-            CocoaBrowser requestRefresh ].
+         so the new selector row appears from the live truth. Gated through
+         liveReopen:for:onDone:onSkipped: (§4.4) — see its comment."
+        reopen := ShellSuper , ' subclass: ' , cls , ' [' , String lf , text , String lf , ']'.
+        self liveReopen: reopen for: cls
+            onDone: [ :r |
+                r = 'nil'
+                    ifTrue: [ CocoaUI appendTranscript: 'browser: saved ' , cls , '>>' , sel , ' (image + live)' ]
+                    ifFalse: [ CocoaUI appendTranscript: 'browser: saved ' , cls , '>>' , sel , ' to the image, but live compile failed: ' , r ].
+                CocoaBrowser requestRefresh ]
+            onSkipped: [ CocoaUI appendTranscript: 'browser: saved ' , cls , '>>' , sel ,
+                                ' to the image — primary does not have this package loaded, not applied live' ].
         self exitEditMode.
         self showSelectorSource: sel.
     ]
@@ -558,7 +588,7 @@ Object subclass: CocoaBrowser [
 
     "── add variable (the ＋ field; Enter accepts) ──"
     CocoaBrowser class >> addVarEntered [
-        | cls name reply |
+        | cls name reply reopen |
         cls := self selectedClassName.
         cls isNil ifTrue: [ ^CocoaUI appendTranscript: 'browser: select a class first' ].
         name := AddVarField sendString: 'stringValue'.
@@ -570,12 +600,19 @@ Object subclass: CocoaBrowser [
         AddVarField onMain setStringValue: ''.
         Side == #class
             ifTrue: [
-                "A class var is an association, not shape: the web live-compiles
-                 the <classVars:> reopen — same here, same text."
-                Worker uiDoit: ShellSuper , ' subclass: ' , cls , ' [' , String lf ,
-                               '    <classVars: ' , name , '>' , String lf , ']'
-                       onReply: [ :r |
-                           CocoaUI appendTranscript: 'browser: added class variable ' , name , ' to ' , cls , ' (image + live)' ] ]
+                "A class var is an association, not shape: live-compile the
+                 <classVars:> reopen, gated through the SAME §4.4 helper
+                 acceptMethod uses — a bare reopen (no ivars), so identical
+                 §3 risk on a primary that never loaded the class."
+                reopen := ShellSuper , ' subclass: ' , cls , ' [' , String lf ,
+                    '    <classVars: ' , name , '>' , String lf , ']'.
+                self liveReopen: reopen for: cls
+                    onDone: [ :r |
+                        r = 'nil'
+                            ifTrue: [ CocoaUI appendTranscript: 'browser: added class variable ' , name , ' to ' , cls , ' (image + live)' ]
+                            ifFalse: [ CocoaUI appendTranscript: 'browser: added class variable ' , name , ' to ' , cls , ' in the image, but live compile failed: ' , r ] ]
+                    onSkipped: [ CocoaUI appendTranscript: 'browser: added class variable ' , name , ' to ' , cls ,
+                                        ' in the image — primary does not have this package loaded, not applied live' ] ]
             ifFalse: [
                 CocoaUI appendTranscript: 'browser: added instance variable ' , name , ' to ' , cls , ' (image; live shape on next launch)' ].
         self fetchShell.

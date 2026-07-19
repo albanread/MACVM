@@ -631,4 +631,62 @@ mod tests {
             round_trip(&mut ui, &link, "(Array new: 50000) size > 0", "'true'");
         }
     }
+
+    /// M5 (`docs/package_aware_editing_design.md` §4.4): the live-compile
+    /// gate is TWO round trips (check, then reopen) — NOT the design doc's
+    /// original one-doit fold (`ifFalse: [ Super subclass: Cls [...] ]`), and
+    /// NOT a `.`-separated guard-then-reopen in a single doit either. Both of
+    /// those were tried and looked like they worked (no error, a `'nil'`
+    /// result matching the established success convention) right up until a
+    /// direct `ClassMirror selectorsOf:` check showed the method was never
+    /// actually installed. Root cause, found by reading the real compiler
+    /// (`src/embed.rs`'s `eval`/`exec`): a doit compiles/runs its SOLE
+    /// top-level item (`frontend::parser::parse_one_top_item`, SPEC §16.2) —
+    /// a `.`-separated second statement is simply never reached, and
+    /// `X subclass: Y [...]` is ALSO a top-level-only special form (nested in
+    /// a block it fails to parse: "expected ']' to close block"). So the
+    /// check and the reopen must be two separate `Worker uiDoit:onReply:`
+    /// calls, the second chained from the first's callback — this pins that
+    /// shape against a real primary (`CocoaBrowser acceptMethod`/
+    /// `addVarEntered` build the identical two-round-trip shape, just with
+    /// the real edited text spliced in; driving THEM needs the full AppKit
+    /// view stack, verified separately, on-screen, via `MACVM_COCOA_CTL`).
+    #[test]
+    fn the_m5_gate_two_round_trips_skip_on_missing_class_and_apply_when_present() {
+        let ui_wake: InboxWakeFn = Arc::new(|| {});
+        let (_sup, link) =
+            PrimarySupervisor::spawn(boot_fn(), ui_wake).expect("boot the supervised primary");
+        let mut ui = boot_ui(&link);
+
+        // Missing: the existence check answers false, so the caller never
+        // even ships the reopen — no wrong-shape shell gets defined under
+        // this name (the §3 bug this gate exists to close).
+        round_trip(
+            &mut ui,
+            &link,
+            "(Worker classNamed: #M5GateProbeMissing) notNil",
+            "'false'",
+        );
+
+        // Present (UndefinedObject — superclass Object — always exists on a
+        // booted VM): the check answers true, so the caller ships the
+        // reopen as a SEPARATE, second round trip — and the method really
+        // is live afterward. (Reopening Object ITSELF needs `nil subclass:
+        // Object [...]`, not `Object subclass: Object [...]` — its real
+        // superclass is nil, not itself; UndefinedObject sidesteps that
+        // unrelated wrinkle while still proving the same thing.)
+        round_trip(
+            &mut ui,
+            &link,
+            "(Worker classNamed: #UndefinedObject) notNil",
+            "'true'",
+        );
+        round_trip(
+            &mut ui,
+            &link,
+            "Object subclass: UndefinedObject [ m5GateProbeApplied [ ^1 ] ]",
+            "'nil'",
+        );
+        round_trip(&mut ui, &link, "nil m5GateProbeApplied", "'1'");
+    }
 }
