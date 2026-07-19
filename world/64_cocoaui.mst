@@ -58,7 +58,7 @@ Object subclass: CocoaUI [
                 MetricLabels MemBarFill MemBarWidth Workspace WorkspaceScroll
                 WorkspaceTextDelegate TabItems TabIndexes
                 TranscriptDivider TranscriptClearBtn FontDelta
-                FontMinusBtn FontPlusBtn>
+                FontMinusBtn FontPlusBtn JitOn JitMenuItem>
 
     CocoaUI class >> title [ ^'MACVM' ]
 
@@ -588,7 +588,7 @@ Print it does the same and inserts the result right after it."
          and 'Force Fault' (Layer 1: a deliberate bad Alien deref in a
          callback, recovered by the C6 door to its shape default — the run
          loop pumps on)."
-        | debugMenu debugItem pairs |
+        | debugMenu debugItem pairs jitHolder jitDelegate |
         debugMenu := (Cocoa classNamed: 'NSMenu') onMain alloc onMain init.
         pairs := OrderedCollection new.
         pairs add: (Array with: 'Rebuild UI' with: [ self requestRebuild ]).
@@ -604,11 +604,34 @@ Print it does the same and inserts the result right after it."
             item onMain setTarget: delegate.
             debugMenu onMain addItem: item.
             ToolbarDelegates add: delegate ].
+        "Compiler (JIT) — a checkable toggle (default ON). OFF stops the VM
+         compiling NEW methods, so anything not already compiled runs
+         interpreted; ON resumes normal tier-up. Global (all VMs); a plain
+         host-atomic flip, no VM re-entry."
+        JitOn := true.
+        JitMenuItem := ((Cocoa classNamed: 'NSMenuItem') onMain alloc) onMain
+            initWithTitle: 'Compiler (JIT)' action: 'macvmAction:' keyEquivalent: ''.
+        JitMenuItem onMain setState: 1.
+        jitHolder := CocoaToolbarAction on: [ self toggleJit ].
+        jitDelegate := MacvmDelegate actionTargetOn: jitHolder.
+        JitMenuItem onMain setTarget: jitDelegate.
+        debugMenu onMain addItem: JitMenuItem.
+        ToolbarDelegates add: jitDelegate.
+
         debugItem := ((Cocoa classNamed: 'NSMenuItem') onMain alloc) onMain
             initWithTitle: 'Debug' action: nil keyEquivalent: ''.
         debugItem onMain setSubmenu: debugMenu.
         mainMenu onMain addItem: debugItem.
         ^debugItem
+    ]
+    CocoaUI class >> toggleJit [
+        "Flip the global JIT-compile switch and reflect it in the menu checkmark."
+        JitOn := JitOn not.
+        ((Cocoa classNamed: 'MacvmHostService') onMain alloc) onMain init
+            onMain setJitCompile: (JitOn ifTrue: [ '1' ] ifFalse: [ '0' ]).
+        JitMenuItem isNil ifFalse: [
+            JitMenuItem onMain setState: (JitOn ifTrue: [ 1 ] ifFalse: [ 0 ]) ].
+        self appendTranscript: 'compiler (JIT) ', (JitOn ifTrue: [ 'ON' ] ifFalse: [ 'OFF (interpreting new methods)' ]).
     ]
     CocoaUI class >> requestRebuild [
         "Ask the host to rebuild the UI worker in place (serviced on the next

@@ -68,7 +68,8 @@ pub fn activate_block(vm: &mut VmState, closure: ClosureOop, argc: usize) -> Pri
         // Reuse an Alive nmethod FIRST (the send.rs:195-210 compile-storm
         // lesson: invalidation churn must re-USE, not re-compile).
         let mut nm_id = vm.code_table.lookup_block(blk);
-        if nm_id.is_none() && count >= n as i64 && !blk.compile_disabled() {
+        if nm_id.is_none() && count >= n as i64 && !blk.compile_disabled()
+            && crate::runtime::jit_compile_enabled() {
             // v1 gate that only the CLOSURE can reveal: value captures
             // (ncopied beyond receiver+context) need prologue pre-loads the
             // A1 convention doesn't emit. One creation site per

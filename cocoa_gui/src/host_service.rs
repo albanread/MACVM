@@ -728,6 +728,15 @@ extern "C" fn imp_package_tree(_this: *mut c_void, _cmd: *mut c_void) -> Id {
     objc::nsstring(&text)
 }
 
+/// `setJitCompile:` — the Debug menu's Compiler (JIT) toggle. `'1'` enables JIT
+/// compilation, `'0'` disables it (the whole system then runs interpreted for
+/// anything not already compiled). A plain global atomic, safe to flip from the
+/// main thread; each VM's own thread reads it at its next compile trigger.
+extern "C" fn imp_set_jit_compile(_this: *mut c_void, _cmd: *mut c_void, flag: Id) -> Id {
+    macvm::runtime::set_jit_compile_enabled(ns_to_string(flag) == "1");
+    std::ptr::null_mut()
+}
+
 /// `requestBrowser2Refresh` — flag the V2 browser for a DB re-query and wake
 /// the run loop; serviced top-level by `drain_perform` (`CocoaBrowser2
 /// doRefresh`), never inside the calling callback — the view_refresh.rs
@@ -760,7 +769,8 @@ pub fn register() {
     type Imp2 = extern "C" fn(*mut c_void, *mut c_void, Id, Id) -> Id;
     type Imp3 = extern "C" fn(*mut c_void, *mut c_void, Id, Id, Id) -> Id;
     type Imp4 = extern "C" fn(*mut c_void, *mut c_void, Id, Id, Id, Id) -> Id;
-    let methods: [(&str, *const c_void, &str); 29] = [
+    let methods: [(&str, *const c_void, &str); 30] = [
+        ("setJitCompile:", imp_set_jit_compile as Imp1 as *const c_void, "@@:@"),
         ("requestUiRebuild", imp_request_ui_rebuild as Imp0 as *const c_void, "@@:"),
         ("requestPrimaryRestart", imp_request_primary_restart as Imp0 as *const c_void, "@@:"),
         ("requestBrowserRefresh", imp_request_browser_refresh as Imp0 as *const c_void, "@@:"),

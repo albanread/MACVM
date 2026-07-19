@@ -29,7 +29,10 @@ pub mod simd_kernels; // SIMD level 2: explicit hand-written NEON bulk kernels (
 pub mod vm_state;
 pub mod workers; // primary/worker registry + channels — workers M1 (docs/multi-smalltalk-worker.md §3)
 
-pub use vm_state::{InterpRegs, JitMode, TierLink, TraceFlags, VmOptions, VmRegBlock, VmState};
+pub use vm_state::{
+    jit_compile_enabled, set_jit_compile_enabled, InterpRegs, JitMode, TierLink, TraceFlags,
+    VmOptions, VmRegBlock, VmState,
+};
 
 /// A guest-execution failure (SPEC §3.2 bootstrap, `sprint_s05_detail.md`
 /// §Interfaces for later sprints). No Rust-level failure path exists yet

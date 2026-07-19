@@ -198,7 +198,7 @@ pub fn activate_method(
         // body and warmed whatever inner IC was still cold — gets another
         // attempt. An `==` check would only ever fire once at the exact
         // crossing and then never again, silently defeating that retry.
-        if bumped >= n as i64 && !m.compile_disabled() {
+        if bumped >= n as i64 && !m.compile_disabled() && crate::runtime::jit_compile_enabled() {
             let rcvr = vm.stack.get(vm.stack.sp - argc as usize - 1);
             let k = klass_of(vm, rcvr);
             // S14 perf recovery (THE compile-storm fix): REUSE an Alive

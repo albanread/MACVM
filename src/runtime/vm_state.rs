@@ -112,6 +112,28 @@ impl JitMode {
     pub const DEFAULT_THRESHOLD: u32 = 1000;
 }
 
+/// Global runtime kill-switch for JIT *compilation* — the Cocoa Debug menu's
+/// "Compiler (JIT)" toggle. Default on. When off, the method/block compile
+/// triggers ([`crate::interpreter::send::activate_method`] and the block
+/// trigger) skip compiling NEW code, so anything not already compiled runs in
+/// the interpreter; already-Alive nmethods keep running. Deliberately GLOBAL
+/// (all VMs) and a plain relaxed `AtomicBool`: a debug switch flipped from the
+/// UI (main) thread and read live by each VM's own thread at its next trigger,
+/// with no per-VM plumbing and no synchronization beyond atomicity. Per-VM
+/// `VmOptions.jit` (Off/Threshold) is unchanged and still applies when this is
+/// on.
+static JIT_COMPILE_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+/// Is JIT compilation currently allowed? (read at each compile trigger)
+pub fn jit_compile_enabled() -> bool {
+    JIT_COMPILE_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+/// Turn JIT compilation on/off at runtime (the Debug-menu toggle).
+pub fn set_jit_compile_enabled(on: bool) {
+    JIT_COMPILE_ENABLED.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// S21 step 1: how a guest-fatal condition (an uncaught `error:`, DNU with
 /// no library `doesNotUnderstand:` installed, process-stack overflow, heap/
 /// eden exhaustion, a `#cannotReturn:` invariant violation, a debugger
