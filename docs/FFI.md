@@ -1,5 +1,10 @@
 # MACVM FFI Design — Cocoa + POSIX/BSD via `cocoa_data`
 
+> **Just want to call something native?** See
+> [`FFI_utility.md`](FFI_utility.md) — the practical "how do I call a new Cocoa
+> method / add a POSIX binding, and when does `cocoa_data` matter" guide. This
+> document is the design + machinery behind it.
+
 Design for **S20** (`SPRINTS.md`'s existing, unordered Phase-E placeholder,
 "Guest-language Cocoa bridge") — broadened, per this doc, to cover the curated
 POSIX/BSD surface `WORLD.md` §9 already wanted alongside it, since both are the
