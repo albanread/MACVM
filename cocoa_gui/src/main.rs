@@ -25,7 +25,7 @@ mod view_refresh;
 
 use std::ffi::c_void;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use macvm::embed::{FatalMode, VmHandle};
 use macvm::runtime::workers::{HostedInbox, InboxSender, InboxWakeFn, WorkerBootFn};
@@ -84,6 +84,21 @@ fn format_bytes(n: u64) -> String {
 /// supervisor's beat loop wakes unconditionally) — a free, already-proven
 /// tick, not a new NSTimer.
 fn refresh_metrics(st: &mut DrainState) {
+    // Rate-limit to the intended ~4 Hz: drain_perform's cadence is normally
+    // the supervisor beat, but during a game the 4 ms beat + 60 Hz timer wake
+    // ran this exec at up to ~250 Hz — wasted UI-worker VM work per frame
+    // (review hygiene finding). One static Instant; main-thread only.
+    use std::time::{Duration, Instant};
+    static LAST: Mutex<Option<Instant>> = Mutex::new(None);
+    {
+        let mut last = LAST.lock().expect("metrics throttle lock");
+        if let Some(t) = *last {
+            if t.elapsed() < Duration::from_millis(250) {
+                return;
+            }
+        }
+        *last = Some(Instant::now());
+    }
     let m = st.supervisor.metrics();
     // `old_reserved` (the full virtual-address reservation `heap_mib`
     // configures — `boot::vm_options()` bounds it to 512 MiB by default for

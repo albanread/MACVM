@@ -33,6 +33,19 @@ const SEP: char = '\u{1f}';
 fn ok(payload: &str) -> Id {
     objc::nsstring(&format!("OK {payload}"))
 }
+
+/// Defense-in-depth for the `US`/newline-framed record replies
+/// (`browse_records_text`, `package_tree_text`): every interpolated field is
+/// a DB-validated identifier today, but a malformed image row holding a
+/// framing char would silently corrupt the whole record stream on the
+/// Smalltalk side (review latent-hazard finding) — scrub rather than trust.
+fn clean_field(s: &str) -> String {
+    if s.contains(SEP) || s.contains('\n') {
+        s.replace(SEP, " ").replace('\n', " ")
+    } else {
+        s.to_string()
+    }
+}
 fn err(msg: &str) -> Id {
     objc::nsstring(&format!("ERR {msg}"))
 }
@@ -199,6 +212,14 @@ fn browse_records_text(img: &Image, primary_lists: &[&str]) -> String {
             .collect::<Vec<_>>()
             .join(" ");
         let loaded = if primary_pkgs.contains(&category) { "1" } else { "0" };
+        let (name, superc, ivars, cvars, inst, clss) = (
+            clean_field(&name),
+            clean_field(&superc),
+            clean_field(&ivars),
+            clean_field(&cvars),
+            clean_field(&inst),
+            clean_field(&clss),
+        );
         out.push_str(&format!(
             "{name}{SEP}{superc}{SEP}{ivars}{SEP}{cvars}{SEP}{inst}{SEP}{clss}{SEP}{loaded}\n"
         ));
@@ -707,15 +728,22 @@ fn package_tree_text(img: &Image) -> String {
         for pkg in img.packages_in_list(&list).unwrap_or_default() {
             emitted.insert(pkg.clone());
             let classes = by_cat.get(&pkg).cloned().unwrap_or_default();
-            out.push_str(&format!("{list}{SEP}{pkg}{SEP}{}\n", classes.join(" ")));
+            let (list, pkg) = (clean_field(&list), clean_field(&pkg));
+            out.push_str(&format!(
+                "{list}{SEP}{pkg}{SEP}{}\n",
+                clean_field(&classes.join(" "))
+            ));
         }
     }
     let mut orphans: Vec<(&String, &Vec<String>)> =
         by_cat.iter().filter(|(k, _)| !emitted.contains(*k)).collect();
     orphans.sort_by(|a, b| a.0.cmp(b.0));
     for (cat, classes) in orphans {
-        let label = if cat.is_empty() { "(uncategorized)" } else { cat };
-        out.push_str(&format!("(other){SEP}{label}{SEP}{}\n", classes.join(" ")));
+        let label = clean_field(if cat.is_empty() { "(uncategorized)" } else { cat });
+        out.push_str(&format!(
+            "(other){SEP}{label}{SEP}{}\n",
+            clean_field(&classes.join(" "))
+        ));
     }
     out
 }

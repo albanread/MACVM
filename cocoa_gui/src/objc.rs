@@ -122,25 +122,39 @@ pub(crate) fn msg_send_ptr() -> *mut c_void {
     *PTR.get_or_init(|| sym("objc_msgSend") as usize) as *mut c_void
 }
 
-/// `objc_getClass(name)`.
+/// `objc_getClass(name)`. The runtime fn pointer is resolved once (the same
+/// OnceLock discipline as `msg_send_ptr`) — `sel`/`get_class` run on
+/// keystroke-hot paths (colorize) and per-op in the canvas interpreter, where
+/// a dlsym per call was pure churn (review hygiene finding).
 pub fn get_class(name: &str) -> Class {
+    static PTR: OnceLock<usize> = OnceLock::new();
+    let f: extern "C" fn(*const i8) -> Class =
+        unsafe { std::mem::transmute(*PTR.get_or_init(|| sym("objc_getClass") as usize)) };
     let c = CString::new(name).unwrap();
-    let f: extern "C" fn(*const i8) -> Class = unsafe { std::mem::transmute(sym("objc_getClass")) };
     f(c.as_ptr())
 }
 
-/// `sel_registerName(name)`.
+/// `sel_registerName(name)` — fn pointer cached like `get_class`.
 pub fn sel(name: &str) -> Sel {
-    let c = CString::new(name).unwrap();
+    static PTR: OnceLock<usize> = OnceLock::new();
     let f: extern "C" fn(*const i8) -> Sel =
-        unsafe { std::mem::transmute(sym("sel_registerName")) };
+        unsafe { std::mem::transmute(*PTR.get_or_init(|| sym("sel_registerName") as usize)) };
+    let c = CString::new(name).unwrap();
     f(c.as_ptr())
 }
 
 /// `+[NSString stringWithUTF8String:]` — an autoreleased `NSString*` from a
 /// Rust `&str`.
 pub fn nsstring(s: &str) -> Id {
-    let c = CString::new(s).unwrap_or_default();
+    // An interior NUL used to silently EMPTY the whole string
+    // (`unwrap_or_default`) — a saved method source containing a NUL byte came
+    // back as "". Strip NULs instead: the rest of the text survives (review
+    // hygiene finding; NULs have no meaning in Smalltalk source anyway).
+    let c = if s.contains('\0') {
+        CString::new(s.replace('\0', "")).expect("NULs just stripped")
+    } else {
+        CString::new(s).expect("no interior NUL")
+    };
     let cls = get_class("NSString");
     let f: extern "C" fn(Id, Sel, *const i8) -> Id = unsafe { std::mem::transmute(msg_send_ptr()) };
     f(cls, sel("stringWithUTF8String:"), c.as_ptr())

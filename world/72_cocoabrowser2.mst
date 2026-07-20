@@ -81,8 +81,10 @@ Object subclass: CocoaBrowser2 [
         ^Svc
     ]
     CocoaBrowser2 class >> readReply: ns [
+        "V1 parity (review drift finding): a nil reply surfaces as an ERR the
+         write-callers' errorOf: shows, never a silent empty string."
         | text |
-        ns isNil ifTrue: [ ^'' ].
+        ns isNil ifTrue: [ ^'ERR no host service' ].
         text := ns sendString: 'description'.
         ns release.
         ^text
