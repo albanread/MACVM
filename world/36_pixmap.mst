@@ -30,13 +30,21 @@ Object subclass: Pixmap [
     "Write pixel (x, y) as opaque r/g/b (each 0..255). 5 args (+ self) — under
      the JIT's method-entry arity cap (docs/VMregisters.md §2), so this
      compiles; the byteAt:put: stores are primitives, so the hot path never
-     allocates. Off-pane coordinates are silently dropped — a caller that
-     stays in-bounds by construction (Mandelbrot) pays only the 4 compares;
-     one that doesn't (a line crossing an edge) gets clipping, not an index
-     error mid-chart."
+     allocates. Off-pane coordinates are silently dropped — this clip is what
+     keeps a line crossing an edge from bleeding into the next row: without it
+     an x >= width offset is still IN-bounds for the ByteArray (next row), so
+     the store would silently draw the wrong pixel, not error. A caller that
+     is in-bounds by construction skips the 4 compares via basicAtX: below."
     atX: x y: y r: r g: g b: b [
-        | o |
         (x >= 0 and: [ x < width and: [ y >= 0 and: [ y < height ] ] ]) ifFalse: [ ^self ].
+        self basicAtX: x y: y r: r g: g b: b
+    ]
+
+    "The unguarded store — for hot per-pixel loops that are in-bounds by
+     construction (Mandelbrot renders every (px, py) of its own buffer).
+     Callers that compute coordinates (lines, charts) must use atX:y:r:g:b:."
+    basicAtX: x y: y r: r g: g b: b [
+        | o |
         o := ((y * width) + x) * 4.
         bytes at: o + 1 put: r.
         bytes at: o + 2 put: g.

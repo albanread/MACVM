@@ -59,7 +59,7 @@ Object subclass: Mandelbrot [
                         r := (n * 8) \\ 256.
                         g := (n * 5) \\ 256.
                         b := 64 + ((n * 11) \\ 192) ].
-                pm atX: px y: py r: r g: g b: b.
+                pm basicAtX: px y: py r: r g: g b: b.
                 cr := cr + step ].
             ci := ci + step ].
         ^pm
