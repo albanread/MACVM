@@ -74,7 +74,9 @@ Object subclass: CocoaBrowser2 [
         Tree isNil ifFalse: [ self requestRefresh ].
     ]
 
-    "── host service (image reads only; V2 never writes) ──"
+    "── host service (image reads AND writes: saveMethodFor:/newClassFrom:/
+     removeClassNamed:/removeMethodFor:/setCommentFor:/acceptEditorClass: all
+     go through the same vetted flows V1 uses) ──"
     CocoaBrowser2 class >> hostService [
         Svc isNil ifTrue: [
             Svc := ((Cocoa classNamed: 'MacvmHostService') onMain alloc) onMain init ].

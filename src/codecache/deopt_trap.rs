@@ -1053,9 +1053,10 @@ impl DeoptTrampolines {
 /// saved and `rt_uncommon_trap` may clobber it), not carried in a register
 /// across it.
 ///
-/// NB step 5: `rt_uncommon_trap` `unimplemented!()`s (the step-6 seam), so
-/// this teardown never executes yet — it is written correctly now so step 6
-/// inherits a sound epilogue rather than a bug.
+/// (Historical: under step 5 `rt_uncommon_trap` was an `unimplemented!()`
+/// seam and this teardown never executed; step 6 filled it in — it now
+/// materializes the frame, runs `interpret_active`, and returns the deopt
+/// result, so this epilogue is live on every uncommon trap.)
 fn build_uncommon_trampoline() -> crate::compiler::assembler::CodeBlob {
     let mut a = JasmAssembler::new();
 
@@ -1643,7 +1644,8 @@ pub fn install(cache: &mut CodeCache) -> DeoptTrampolines {
 //
 // `handler_redirect_smoke` (tests_s13.md) needs to exercise the
 // signal→ucontext-rewrite→trampoline path in ISOLATION, WITHOUT reaching the
-// step-6-less `rt_uncommon_trap` (which `unimplemented!()`s). These hooks let
+// real (fully implemented) `rt_uncommon_trap` — a hand-built test frame has
+// no genuine deopt record to materialize from. These hooks let
 // a test arm the handler + point `UNCOMMON_TRAMPOLINE` at its OWN benign
 // capture stub that records (pc, x16) and returns, then restore state.
 
