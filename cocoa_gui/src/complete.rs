@@ -104,6 +104,8 @@ pub fn install_once() {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     /// The prefix filter itself (symbols.rs) — pure, no ObjC.
     #[test]
     fn completions_prefix_filter_is_sorted_and_capped() {
@@ -111,5 +113,81 @@ mod tests {
         let none = crate::symbols::completions_for("prin", 10);
         assert!(none.is_empty() || none.iter().all(|s| s.starts_with("prin")));
         assert!(crate::symbols::completions_for("", 10).is_empty());
+    }
+
+    /// The IMP end-to-end, headless: a REAL NSTextView holding `x zap`, a
+    /// REAL temp image defining `zap:`/`zappo`, the actual extern "C" fn —
+    /// everything AppKit's F5 path does except drawing the popup. (The
+    /// Smalltalk-side bridge can't marshal the `^q` out-pointer to drive this
+    /// from a doit, which is why the proof lives here.)
+    #[test]
+    fn completions_imp_answers_matches_from_a_real_image_headless() {
+        let dir = std::env::temp_dir().join(format!("macvm_complete_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let image_path = dir.join("image.sqlite3");
+        {
+            let img = image_store::Image::open(&image_path).unwrap();
+            image_store::flows::new_class_from_source(
+                &img,
+                "Object subclass: Zed [\n    zappo [ ^1 ]\n    zap: x [ ^x ]\n]",
+                None,
+            )
+            .unwrap();
+        }
+        // The cache reads MACVM_IMAGE_PATH; the other cocoa_gui tests never
+        // read it concurrently (they pass images/paths explicitly).
+        std::env::set_var("MACVM_IMAGE_PATH", &image_path);
+
+        // NOT an NSTextView — its init instantiates window machinery, which
+        // AppKit forbids off the main thread (tests run on worker threads).
+        // The IMP only ever sends `string` to the view, and NSTextStorage
+        // (pure model layer, thread-safe to create) answers it identically.
+        let tv = objc::send1_id(
+            objc::send0(objc::get_class("NSTextStorage") as Id, objc::sel("alloc")),
+            objc::sel("initWithString:"),
+            objc::nsstring("x zap"),
+        );
+        assert!(!tv.is_null(), "headless NSTextStorage");
+
+        let mut idx: i64 = -1;
+        // Partial word "zap" = utf16 range (2, 3).
+        let arr = imp_completions(
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            tv,
+            std::ptr::null_mut(),
+            2,
+            3,
+            &mut idx,
+        );
+        assert!(!arr.is_null(), "matches expected for 'zap'");
+        let count = objc::send0_int(arr, objc::sel("count"));
+        assert!(count >= 2, "zap: and zappo expected, got {count}");
+        let joined = objc::send1_id(
+            arr,
+            objc::sel("componentsJoinedByString:"),
+            objc::nsstring(" "),
+        );
+        let joined = crate::host_service::ns_to_string(joined);
+        assert!(
+            joined.contains("zap:") && joined.contains("zappo"),
+            "both selectors offered: {joined}"
+        );
+        assert_eq!(idx, 0, "first item preselected");
+        // Null out-pointer tolerated (belt and braces).
+        let again = imp_completions(
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            tv,
+            std::ptr::null_mut(),
+            2,
+            3,
+            std::ptr::null_mut(),
+        );
+        assert!(!again.is_null());
+        objc::send0(tv, objc::sel("release"));
+        std::env::remove_var("MACVM_IMAGE_PATH");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
