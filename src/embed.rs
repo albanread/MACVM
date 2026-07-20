@@ -5032,6 +5032,60 @@ mod tests {
         assert_eq!(vm.eval("3 + 4.").unwrap(), "7");
     }
 
+    /// Mono-SUPER c2i staleness (2026-07 review, formerly filed-unfixed): a
+    /// compiled method whose `super sel` target was INTERPRETED-ONLY at
+    /// compile time links that site to a c2i adapter baking the ancestor
+    /// MethodOop — and an ancestor reached only via super stays interpreted
+    /// forever (the c2i compile escape hatch skips super sites by design),
+    /// so the adapter is permanent. Redefining the ancestor installs a
+    /// fresh MethodOop that key-selector invalidation never routes to the
+    /// caller (its own key is its own selector; the adapter lives outside
+    /// `code_table`). Before the fix the site ran the PRE-redefinition body
+    /// forever; now `rt_interpret_call`'s super arm re-runs the compile's
+    /// own `lookup(super_klass, sel)` on every c2i super call, exactly as
+    /// `rt_resolve_send` already did for the nmethod super case.
+    #[test]
+    fn compiled_super_send_sees_ancestor_redefinition_through_c2i() {
+        let mut vm = boot_test_vm(JitMode::Threshold(1));
+        // Two traps this test's own drafts fell into, kept as documentation:
+        // the caller's selector (`probe`) must DIFFER from the super-sent
+        // one (`tag`) — the classic `tag [ ^super tag ]` override shape
+        // shares the selector, so selector-keyed invalidation flushes the
+        // caller and heals it by coincidence — AND the ancestor body must
+        // be big enough that the inliner declines it (a `^1` leaf gets
+        // spliced, its `inline_deps` edge invalidates the caller, healed
+        // again). The bug lives only in the NON-inlined, interpreted-only
+        // super target: the c2i-adapter link with no dependency edge.
+        vm.exec(
+            "Object subclass: SupRedefA [ \
+               tag [ | s | s := 0. 1 to: 3 do: [ :i | s := s + i ]. ^s ] ]",
+        )
+        .expect("ancestor (loopy body — non-inlinable, stays interpreted)");
+        vm.exec("SupRedefA subclass: SupRedefB [ probe [ ^super tag + 10 ] ]")
+            .expect("subclass with the super send under a different selector");
+        // Warm: Threshold(1) compiles SupRedefB>>probe on its first
+        // activation; subsequent calls run the COMPILED super site through
+        // the ancestor's c2i adapter (the ancestor never compiles — no
+        // ordinary sends ever reach it, and the c2i compile escape hatch
+        // skips super sites).
+        for _ in 0..3 {
+            assert_eq!(vm.eval("SupRedefB new probe.").unwrap(), "16");
+        }
+        // Live-redefine the ancestor's method (the browser-Accept shape) —
+        // same shape, different bound, still non-inlinable.
+        vm.exec(
+            "Object subclass: SupRedefA [ \
+               tag [ | s | s := 0. 1 to: 4 do: [ :i | s := s + i ]. ^s ] ]",
+        )
+        .expect("redefine the ancestor");
+        assert_eq!(
+            vm.eval("SupRedefB new probe.").unwrap(),
+            "20",
+            "the compiled super site must dispatch the REDEFINED ancestor \
+             body, not the c2i adapter's baked pre-redefinition oop"
+        );
+    }
+
     #[test]
     fn error_policy_defaults_to_resume_and_round_trips() {
         let mut vm = boot_test_vm(JitMode::Off);

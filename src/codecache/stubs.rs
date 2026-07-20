@@ -1425,18 +1425,30 @@ pub unsafe extern "C" fn rt_interpret_call(
     let method = match lookup(vm, k, sel) {
         Some(m) if m.oop().raw() == baked_method.oop().raw() => baked_method,
         looked_up => {
-            // Divergence: either a `super` send (run the baked ancestor) or a
-            // klass-mismatched ordinary dispatch / override / redefinition (run
-            // what lookup found). Disambiguate via the calling site.
+            // Divergence: either a `super` send (dispatch from the site's
+            // STATIC super klass) or a klass-mismatched ordinary dispatch /
+            // override / redefinition (run what lookup found). Disambiguate
+            // via the calling site.
             let ret_addr = vm.reg_block.last_compiled_pc;
-            let is_super_site = vm.code_table.find_by_pc(ret_addr).is_some_and(|caller_id| {
+            let super_k = vm.code_table.find_by_pc(ret_addr).and_then(|caller_id| {
                 let (_, _, _, site_idx, _, _) = find_caller_site(vm, ret_addr);
-                vm.code_table.get(caller_id).unwrap().ic_sites[site_idx]
-                    .super_klass
-                    .is_some()
+                vm.code_table.get(caller_id).unwrap().ic_sites[site_idx].super_klass
             });
-            if is_super_site {
-                baked_method
+            if let Some(sk) = super_k {
+                // Mono-SUPER c2i staleness fix (2026-07 review): the baked
+                // method is only the COMPILE-TIME resolution of
+                // `lookup(super_klass, sel)` — an ancestor redefinition
+                // installs a fresh MethodOop that key-selector invalidation
+                // never propagates here (the caller's own key is its own
+                // selector; the adapter lives outside `code_table`; the
+                // escape hatch below skips super sites). Re-run the same
+                // lookup the compile ran (`driver.rs`'s super resolution,
+                // and what `rt_resolve_send` already does for the nmethod
+                // super case) so a redefined ancestor body takes effect on
+                // the next call instead of never. `None` (the ancestor
+                // method was removed outright) falls back to the baked oop,
+                // the same pathological-edge convention as the ordinary arm.
+                lookup(vm, sk, sel).unwrap_or(baked_method)
             } else {
                 // `None` (receiver genuinely does not understand the selector)
                 // is a pathological polymorphic-site edge; fall back to the
