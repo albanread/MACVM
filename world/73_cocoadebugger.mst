@@ -102,21 +102,26 @@ Object subclass: CocoaDebugger [
        (instance side; class-side fallback), the whole method (§7 — no
        statement-level highlight in v1). ──"
     CocoaDebugger class >> renderSourceForSelected [
-        | fields cls sel src |
+        | fields cls sel src line |
         SourceView isNil ifTrue: [ ^self ].
         (Frames isNil or: [ SelectedRow >= Frames size ]) ifTrue: [ ^SourceView onMain setString: '' ].
         fields := self fieldsOf: (Frames at: SelectedRow + 1).
         fields size < 4 ifTrue: [ ^SourceView onMain setString: '' ].
         cls := fields at: 2. sel := fields at: 3.
+        "field 5 = the 1-based method-relative source line for this frame's bci
+         (empty for a doit/primitive — no highlight then)."
+        line := fields size >= 5 ifTrue: [ fields at: 5 ] ifFalse: [ '0' ].
         src := CocoaBrowser readReply: (CocoaBrowser hostService onMain
                     sourceForClass: cls side: 'instance' selector: sel).
         (src isNil or: [ src isEmpty ]) ifTrue: [
             src := CocoaBrowser readReply: (CocoaBrowser hostService onMain
                     sourceForClass: cls side: 'class' selector: sel) ].
         (src isNil or: [ src isEmpty ]) ifTrue: [
-            src := '"(no image source for ' , cls , '>>' , sel , ' — a doit or generated method)"' ].
+            src := '"(no image source for ' , cls , '>>' , sel , ' — a doit or generated method)"'.
+            line := '0' ].
         SourceView onMain setString: src.
         self colorizeSource.
+        self highlightLine: line inSource: src.
     ]
     CocoaDebugger class >> colorizeSource [
         | ts |
@@ -125,6 +130,26 @@ Object subclass: CocoaDebugger [
         ts isNil ifTrue: [ ^self ].
         CocoaBrowser hostService onMain colorizeStorage: ts.
         ts release.
+    ]
+    CocoaDebugger class >> highlightLine: aLineString inSource: src [
+        "DBG4 §2.2: background the current statement's line (empty/'0' clears).
+         Runs AFTER colorizeSource so the accent background composes over the
+         foreground syntax colours. Also scrolls it visible — the offset is
+         computed from the Smalltalk `src` we just set (never re-read from the
+         native NSString, which isn't a Smalltalk String)."
+        | ts n pos cur lf i |
+        SourceView isNil ifTrue: [ ^self ].
+        ts := SourceView onMain textStorage.
+        ts isNil ifTrue: [ ^self ].
+        CocoaBrowser hostService onMain highlightStorage: ts line: (aLineString isEmpty ifTrue: [ '0' ] ifFalse: [ aLineString ]).
+        ts release.
+        n := 0.
+        aLineString do: [ :ch | (ch value between: 48 and: 57) ifTrue: [ n := n * 10 + (ch value - 48) ] ].
+        n < 1 ifTrue: [ ^self ].
+        pos := 0. cur := 1. lf := Character value: 10. i := 1.
+        [ i <= src size and: [ cur < n ] ] whileTrue: [
+            (src at: i) = lf ifTrue: [ cur := cur + 1. pos := i ]. i := i + 1 ].
+        SourceView onMain scrollRangeToVisible: (Array with: pos with: 0).
     ]
 
     "── commands ──"

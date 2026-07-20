@@ -64,6 +64,12 @@ pub struct BytecodeBuilder {
     /// through it stays valid until `finish()` (or `Drop`, for a session
     /// abandoned mid-build, e.g. a compile error) consumes/releases it.
     scope: Option<HandleScope>,
+    /// DBG4 (docs/gui_debugger_design.md §2.2): the bci→source-line map —
+    /// `(bci, source line)` at the start of each statement, consecutive
+    /// duplicates elided. Read out of the finished builder and stored
+    /// per-method so a halt can highlight the current statement. Pure
+    /// metadata: it never affects the emitted bytecode.
+    pub line_map: Vec<(u16, u32)>,
 }
 
 impl Default for BytecodeBuilder {
@@ -82,7 +88,24 @@ impl BytecodeBuilder {
             ic_sites: Vec::new(),
             labels: Vec::new(),
             scope: None,
+            line_map: Vec::new(),
         }
+    }
+
+    /// DBG4: mark the current bci as the start of a statement on source
+    /// `line`. Consecutive same-line notes collapse (a multi-bytecode
+    /// statement records one entry). Pure metadata.
+    #[inline]
+    pub fn note_line(&mut self, line: u32) {
+        if line == 0 {
+            return;
+        }
+        if let Some(&(_, last)) = self.line_map.last() {
+            if last == line {
+                return;
+            }
+        }
+        self.line_map.push((self.code.len() as u16, line));
     }
 
     #[inline]

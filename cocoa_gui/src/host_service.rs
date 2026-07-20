@@ -788,21 +788,14 @@ extern "C" fn imp_analyze_source(_this: *mut c_void, _cmd: *mut c_void, text: Id
     }
 }
 
-/// `markErrorStorage:line:` — paint an analyze error: clear any previous mark
-/// (whole-range background → clearColor), then, for `line` ≥ 1, background
-/// that line in translucent red. `line` `'0'` = clear only (an OK analyze).
-/// The colorize discipline: attribute-only mutations inside begin/endEditing,
-/// UTF-16 offsets, never moves the caret. Answers nil.
-extern "C" fn imp_mark_error_storage(
-    _this: *mut c_void,
-    _cmd: *mut c_void,
-    storage: Id,
-    line: Id,
-) -> Id {
+/// Shared line-background painter (the Analyze error mark and the DBG4 current-
+/// statement highlight both use it): clear any previous whole-range background,
+/// then for `line` ≥ 1 tint that line with `color_sel` at `alpha`. UTF-16
+/// offsets, attribute-only inside begin/endEditing, never moves the caret.
+fn paint_line_background(storage: Id, line: u64, color_sel: &str, alpha: f64) {
     if storage.is_null() {
-        return std::ptr::null_mut();
+        return;
     }
-    let line: u64 = ns_to_string(line).parse().unwrap_or(0);
     let ns = objc::send0(storage, objc::sel("string"));
     let text = ns_to_string(ns);
     let total = objc::send0_int(ns, objc::sel("length")) as u64;
@@ -835,12 +828,37 @@ extern "C" fn imp_mark_error_storage(
     objc::send0(storage, objc::sel("beginEditing"));
     objc::send_attr(storage, name_bg, clear, 0, total);
     if line >= 1 && start < total && len_line > 0 {
-        let red = objc::send0(nscolor as Id, objc::sel("systemRedColor"));
-        let red = objc::send1_f64(red, objc::sel("colorWithAlphaComponent:"), 0.25);
+        let c = objc::send0(nscolor as Id, objc::sel(color_sel));
+        let c = objc::send1_f64(c, objc::sel("colorWithAlphaComponent:"), alpha);
         let len = len_line.min(total - start);
-        objc::send_attr(storage, name_bg, red, start, len);
+        objc::send_attr(storage, name_bg, c, start, len);
     }
     objc::send0(storage, objc::sel("endEditing"));
+}
+
+/// `markErrorStorage:line:` — Analyze: background the erring line translucent
+/// red (`'0'` = clear only). Answers nil.
+extern "C" fn imp_mark_error_storage(
+    _this: *mut c_void,
+    _cmd: *mut c_void,
+    storage: Id,
+    line: Id,
+) -> Id {
+    let line: u64 = ns_to_string(line).parse().unwrap_or(0);
+    paint_line_background(storage, line, "systemRedColor", 0.25);
+    std::ptr::null_mut()
+}
+
+/// `highlightStorage:line:` — DBG4: background the halted statement's line in
+/// the accent colour (`'0'` = clear only). Answers nil.
+extern "C" fn imp_highlight_storage(
+    _this: *mut c_void,
+    _cmd: *mut c_void,
+    storage: Id,
+    line: Id,
+) -> Id {
+    let line: u64 = ns_to_string(line).parse().unwrap_or(0);
+    paint_line_background(storage, line, "systemYellowColor", 0.35);
     std::ptr::null_mut()
 }
 
@@ -1004,7 +1022,7 @@ pub fn register() {
     type Imp2 = extern "C" fn(*mut c_void, *mut c_void, Id, Id) -> Id;
     type Imp3 = extern "C" fn(*mut c_void, *mut c_void, Id, Id, Id) -> Id;
     type Imp4 = extern "C" fn(*mut c_void, *mut c_void, Id, Id, Id, Id) -> Id;
-    let methods: [(&str, *const c_void, &str); 42] = [
+    let methods: [(&str, *const c_void, &str); 43] = [
         ("addToWorldPath:", imp_add_to_world as Imp1 as *const c_void, "@@:@"),
         ("dbgReport", imp_dbg_report as Imp0 as *const c_void, "@@:"),
         ("dbgCommand:", imp_dbg_command as Imp1 as *const c_void, "@@:@"),
@@ -1015,6 +1033,7 @@ pub fn register() {
         ("formatSource:", imp_format_source as Imp1 as *const c_void, "@@:@"),
         ("analyzeSource:", imp_analyze_source as Imp1 as *const c_void, "@@:@"),
         ("markErrorStorage:line:", imp_mark_error_storage as Imp2 as *const c_void, "@@:@@"),
+        ("highlightStorage:line:", imp_highlight_storage as Imp2 as *const c_void, "@@:@@"),
         ("fileInPath:", imp_file_in_path as Imp1 as *const c_void, "@@:@"),
         ("requestOpenPanel", imp_request_open_panel as Imp0 as *const c_void, "@@:"),
         ("requestSavePanel", imp_request_save_panel as Imp0 as *const c_void, "@@:"),

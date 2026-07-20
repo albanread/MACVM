@@ -110,6 +110,13 @@ pub struct DebugState {
     /// which force-cold makes total). Like `MACVM_TRACE=calls` it forces ICs
     /// cold; unlike it, it stops and services commands instead of just logging.
     pub step_calls: bool,
+    /// DBG4 §2.2: the bci→source-line map per method, keyed
+    /// `"Holder>>selector"` (` class` suffix for the class side). Lines are
+    /// 1-based and RELATIVE to the method's own header (so they align with the
+    /// method source the browser/debugger shows, not the file it loaded from).
+    /// Populated by codegen; read by `line_for` to highlight the halted
+    /// statement. Latest compile wins (redefinition-friendly).
+    pub method_lines: HashMap<String, Vec<(u16, u32)>>,
 }
 
 impl DebugState {
@@ -277,6 +284,44 @@ pub enum HaltReason {
     Breakpoint,
     Step,
     GuestError(String),
+}
+
+/// DBG4: the map key for a method — `Holder>>selector`, with a ` class`
+/// suffix on the class side (matching `resolve_method_by_name`'s grammar and
+/// the browser's own `selectedBreakpointClass`).
+pub fn method_key(holder_name: &str, class_side: bool, selector: &str) -> String {
+    if class_side {
+        format!("{holder_name} class>>{selector}")
+    } else {
+        format!("{holder_name}>>{selector}")
+    }
+}
+
+/// DBG4: record a method's bci→line map (codegen, at compile time). Lines are
+/// already 1-based and method-relative. Empty maps (primitive-only methods)
+/// are skipped.
+pub fn record_line_map(vm: &mut VmState, key: String, map: Vec<(u16, u32)>) {
+    if map.is_empty() {
+        return;
+    }
+    vm.debug.method_lines.insert(key, map);
+}
+
+/// DBG4: the 1-based source line for `bci` in the method keyed `key` — the
+/// largest recorded bci ≤ `bci` (the statement in progress). `None` if the
+/// method has no map (a doit, a primitive, or a method compiled before this
+/// feature). Read at halt to highlight the current statement.
+pub fn line_for(vm: &VmState, key: &str, bci: usize) -> Option<u32> {
+    let map = vm.debug.method_lines.get(key)?;
+    let mut line = None;
+    for &(b, l) in map {
+        if (b as usize) <= bci {
+            line = Some(l);
+        } else {
+            break;
+        }
+    }
+    line
 }
 
 /// DBG1/DBG4: should a would-be-fatal guest error (`error:` / DNU) open the
@@ -477,15 +522,21 @@ fn build_report(
         let holder = KlassOop::try_from(m.holder())
             .map(|k| crate::runtime::error::name_of(k.name()))
             .unwrap_or_else(|| "?".into());
-        let bci = if i == 0 {
-            halt_bci.to_string()
+        let bci_val = if i == 0 {
+            halt_bci
         } else {
             crate::interpreter::stack::Frame { fp: frames[i - 1] }
                 .saved_bci_opt(&vm.stack)
-                .map(|b| b.to_string())
-                .unwrap_or_default()
+                .unwrap_or(0)
         };
-        r.push_str(&format!("{i}{SEP}{holder}{SEP}{sel}{SEP}{bci}\n"));
+        // DBG4 §2.2: the 1-based method-relative source line for this frame's
+        // bci (empty when the method has no map — a doit/primitive). A 5th
+        // field, so old readers that split on 4 stay compatible.
+        let key = format!("{holder}>>{sel}");
+        let line = line_for(vm, &key, bci_val)
+            .map(|l| l.to_string())
+            .unwrap_or_default();
+        r.push_str(&format!("{i}{SEP}{holder}{SEP}{sel}{SEP}{bci_val}{SEP}{line}\n"));
     }
     r.push_str("==FRAME==\n");
     if let Some(&fp) = frames.get(selected) {

@@ -958,6 +958,7 @@ fn emit_statement_discard(
     stmt: &Expr,
     is_block: Option<()>,
 ) -> Result<(), CompileError> {
+    b.note_line(stmt.span().line); // DBG4 bci→line map
     match stmt {
         Expr::Return { value, .. } => {
             emit_expr(cx, hoist, cache, b, scope_id, next_hoist_slot, value)?;
@@ -989,6 +990,7 @@ fn emit_statement_value(
     next_hoist_slot: &mut usize,
     stmt: &Expr,
 ) -> Result<(), CompileError> {
+    b.note_line(stmt.span().line); // DBG4 bci→line map
     match stmt {
         Expr::Assign { name, value, span } => {
             emit_expr(cx, hoist, cache, b, scope_id, next_hoist_slot, value)?;
@@ -1246,9 +1248,32 @@ fn compile_method_inner(
     )?;
     let total_ntemps = next_hoist_slot - argc;
 
+    // DBG4 (docs/gui_debugger_design.md §2.2): capture the bci→line map before
+    // `finish` consumes the builder. Convert absolute source lines to 1-based
+    // method-relative (`line - header_line + 1`) so they align with the method
+    // source the debugger shows, not the file it loaded from. Doits are skipped
+    // (no image source to highlight). Recorded after `m` is built, below.
+    let line_map: Vec<(u16, u32)> = if top_level {
+        Vec::new()
+    } else {
+        let header = method.span.line;
+        std::mem::take(&mut b.line_map)
+            .into_iter()
+            .map(|(bci, line)| (bci, line.saturating_sub(header).saturating_add(1).max(1)))
+            .collect()
+    };
+
     let sel = cx.vm.universe.intern(method.pattern_selector.as_bytes());
     let prim_fails = method.primitive.is_some() && !method.body.is_empty();
     let m = b.finish(cx.vm, sel, argc, total_ntemps);
+    // DBG4: register the bci→line map under this method's key (empty maps —
+    // primitive-only methods — are skipped by `record_line_map`).
+    if !line_map.is_empty() {
+        let holder_klass = cx.holder.get(cx.vm);
+        let holder_name = crate::runtime::error::name_of(holder_klass.name());
+        let key = crate::runtime::debug::method_key(&holder_name, class_side, &method.pattern_selector);
+        crate::runtime::debug::record_line_map(cx.vm, key, line_map);
+    }
     m.set_flags(
         argc,
         total_ntemps,
