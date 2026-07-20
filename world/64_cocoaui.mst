@@ -363,6 +363,7 @@ Object subclass: CocoaUI [
         Workspace isNil ifFalse: [ Workspace onMain setFont: (self fixedFontOfSize: 13.0) ].
         Transcript isNil ifFalse: [ Transcript onMain setFont: (self fixedFontOfSize: 11.0) ].
         (Worker classNamed: #CocoaBrowser) ifNotNil: [ :c | c applyCodeFont ].
+        (Worker classNamed: #CocoaBrowser2) ifNotNil: [ :c | c applyCodeFont ].
         (Worker classNamed: #CocoaEditor) ifNotNil: [ :c | c applyCodeFont ].
     ]
 
@@ -931,6 +932,7 @@ Print it does the same and inserts the result right after it."
         self appendTranscript: '— environment restarted (primary respawned) —'.
         "Snapshot views re-sync against the FRESH primary (CG7)."
         (Worker classNamed: #CocoaBrowser) ifNotNil: [ :bc | bc environmentRestarted ].
+        (Worker classNamed: #CocoaBrowser2) ifNotNil: [ :b2 | b2 environmentRestarted ].
         (Worker classNamed: #CocoaEditor) ifNotNil: [ :ec | ec environmentRestarted ].
         (Worker classNamed: #CocoaOutliner) ifNotNil: [ :oc | oc environmentRestarted ].
         (Worker classNamed: #CocoaCanvas) ifNotNil: [ :cv | cv environmentRestarted ].
@@ -942,6 +944,7 @@ Print it does the same and inserts the result right after it."
         Win isNil ifFalse: [
             Win onMain orderOut: nil.
             (Worker classNamed: #CocoaBrowser) ifNotNil: [ :bc | bc teardown ].
+            (Worker classNamed: #CocoaBrowser2) ifNotNil: [ :b2 | b2 teardown ].
             (Worker classNamed: #CocoaFind) ifNotNil: [ :fc | fc teardown ].
             (Worker classNamed: #CocoaEditor) ifNotNil: [ :ec | ec teardown ].
             (Worker classNamed: #CocoaOutliner) ifNotNil: [ :oc | oc teardown ].

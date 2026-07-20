@@ -159,6 +159,9 @@ fn image_from_rgba(pixels: &[u8], width: u32, height: u32) -> Option<Id> {
     let img = objc::send0(img_cls as Id, objc::sel("alloc"));
     let img = objc::send0(img, objc::sel("init"));
     objc::send1_id(img, objc::sel("addRepresentation:"), rep);
+    // addRepresentation: retains the rep; release our alloc +1 so the image
+    // is the rep's sole owner (the leak-per-render review finding).
+    objc::send0(rep, objc::sel("release"));
     Some(img)
 }
 
@@ -172,6 +175,9 @@ pub fn show_pixels_base64(view: Id, b64: &str, width: u32, height: u32) -> bool 
     match image_from_rgba(&bytes, width, height) {
         Some(img) => {
             objc::send1_id(view, objc::sel("setImage:"), img);
+            // setImage: retains; release our alloc +1 so each render doesn't
+            // permanently leak one NSImage (the review's canvas-leak finding).
+            objc::send0(img, objc::sel("release"));
             true
         }
         None => false,
@@ -415,6 +421,8 @@ pub fn show_commands(view: Id, ops_json: &str, width: u32, height: u32) -> bool 
     match render_commands(ops_json, width, height) {
         Some(img) => {
             objc::send1_id(view, objc::sel("setImage:"), img);
+            // setImage: retains; release our alloc +1 (see show_pixels_base64).
+            objc::send0(img, objc::sel("release"));
             true
         }
         None => false,

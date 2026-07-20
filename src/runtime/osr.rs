@@ -66,6 +66,14 @@ pub fn rt_osr_request(vm: &mut VmState, fp: usize, target_bci: u16) -> OsrOutcom
     if !matches!(vm.options.jit, JitMode::Threshold(_)) {
         return OsrOutcome::Declined;
     }
+    // The Debug-menu Compiler (JIT) kill-switch gates OSR too: "off" promises
+    // that anything not already compiled runs interpreted, and an OSR compile
+    // is exactly the not-already-compiled case. Declining here is the safe
+    // outcome by construction — the counter was reset above, so re-triggers
+    // stay spaced, and the loop simply continues interpreting.
+    if !crate::runtime::jit_compile_enabled() {
+        return OsrOutcome::Declined;
+    }
     // v1 envelope guards beyond the compile-side ones (has_ctx/closures are
     // compile_method_osr's): a MARKED frame (ensure/ifCurtailed handler) or
     // a caller mid-resume-sentinel needs `do_return`'s full machinery,

@@ -40,6 +40,14 @@ pub const MAX_VERSIONS: u8 = 3;
 /// The nested run may have done arbitrary work (GC, invalidation, even a
 /// competing compile), so everything is re-checked against the live tables.
 pub fn note_uncommon_trap(vm: &mut VmState, id: NmethodId) {
+    // The Debug-menu Compiler (JIT) kill-switch: with compilation off, don't
+    // version-recompile a trap-storming nmethod — the old code stays Alive and
+    // keeps trap-deopting to the interpreter, the same accepted behavior as
+    // the MAX_VERSIONS thrash cap below ("live with the deopts"). Counting
+    // resumes when the switch turns back on.
+    if !crate::runtime::jit_compile_enabled() {
+        return;
+    }
     let Some(nm) = vm.code_table.get(id) else {
         return; // flushed during the nested run
     };
