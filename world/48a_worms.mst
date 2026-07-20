@@ -1,10 +1,14 @@
 "48a_worms.mst — WORMS, a grid-based snake/light-cycle demo for the native
  game pane. You control one worm with the arrow keys; two computer-controlled
- worms share the field. All three grow by eating fruit and die by crashing
- into an edge or into ANY worm's body, including their own. The player's
- death resets the whole game (never dead-ends, like Breakout); a dead
- computer worm respawns on its own a couple of seconds later, so the field
- never stays empty for long.
+ worms share the field, with several fruit out at once so there is usually
+ something nearby to chase. All three grow by eating fruit; the player dies
+ by crashing into an edge, into its own body, or into another worm's body,
+ and that resets the whole game (never dead-ends, like Breakout). A computer
+ worm dies only by crashing into an edge or into ANOTHER worm — it is immune
+ to its own body, since a short-sighted one-move-lookahead player would
+ otherwise corner itself on its own tail embarrassingly often; a dead
+ computer worm respawns a couple of seconds later, so the field never stays
+ empty for long.
 
  The field is a 40x28 grid of 8px cells below a 16px HUD strip (pane is
  320x240). Movement is turn-based against a frame counter (one move every
@@ -13,15 +17,17 @@
  worm is an ordered list of cells, tail first; moving adds a new head and
  (unless the worm just ate) drops the tail, and eating leaves the tail in
  place for one extra tick, which is how a worm grows. Collision is checked
- against every worm's OWN pre-move occupancy (so turning back into the cell
- your tail is just about to vacate still counts as a crash) and, separately,
- against every other worm's intended new head cell in the same tick, so two
- worms turning into each other die together.
+ against every worm's pre-move occupancy (so turning back into a cell your
+ own tail is just about to vacate still counts as a crash, for the worms
+ that self-collide) and, separately, against every other worm's intended new
+ head cell in the same tick, so two worms turning into each other die
+ together.
 
  The computer worms use a small one-step-lookahead heuristic, not real
- pathfinding: each tick they pick whichever safe direction closes the most
- distance to the fruit, falling back to any other safe direction, and simply
- dying if none exists — enough to look purposeful without being unbeatable.
+ pathfinding: each tick they aim at whichever fruit is nearest, try the
+ direction that would close the most distance to it first (then the next
+ closest, and so on), take whichever of those is safe, and simply die if
+ none is — enough to look purposeful without being unbeatable.
 
  Launch it from the Demos menu, or a Workspace: Worms launch. Harmless to
  load in a headless VM (every game primitive silently fails there)."
@@ -102,15 +108,17 @@ Object subclass: Worm [
     kill [ alive := false. respawnIn := 0 ]
 ]
 
-"I run one game of Worms end to end: three Worm instances, the shared
- fruit, and the move clock. Launch me from the Demos menu, or a Workspace:
- Worms launch. Steer with the arrow keys; eating fruit grows your worm by
- one cell and scores a point, and crashing into any edge or any worm's body
- — including your own — ends your run and restarts the whole game. The two
- computer worms play by the same rules and respawn a couple of seconds
- after they die, so the field is rarely empty for long."
+"I run one game of Worms end to end: three Worm instances, the fruit out on
+ the field, and the move clock. Launch me from the Demos menu, or a
+ Workspace: Worms launch. Steer with the arrow keys; eating fruit grows your
+ worm by one cell and scores a point, and crashing into any edge or any
+ worm's body — including your own — ends your run and restarts the whole
+ game. The two computer worms chase whichever fruit is nearest, are immune
+ to crashing into their own body (only edges and other worms kill them),
+ and respawn a couple of seconds after they die, so the field is rarely
+ empty for long."
 Object subclass: Worms [
-    | pane player ai1 ai2 fruitCol fruitRow tickCounter moveInterval
+    | pane player ai1 ai2 fruits tickCounter moveInterval
       score rng |
 
     Worms class >> cols [ ^40 ]
@@ -118,6 +126,7 @@ Object subclass: Worms [
     Worms class >> cellSize [ ^8 ]
     Worms class >> fieldTop [ ^16 ]        "HUD strip height, in pixels"
     Worms class >> respawnTicks [ ^18 ]    "computer-worm respawn delay, in MOVES"
+    Worms class >> fruitCount [ ^4 ]       "how many fruit are out at once"
 
     Worms class >> launch [
         "Open the game pane and start a new game."
@@ -137,7 +146,8 @@ Object subclass: Worms [
             body: 20 head: 21 isPlayer: false.
         ai2 := Worm new startAt: 6 row: 13 dir: #(1 0) length: 3
             body: 22 head: 23 isPlayer: false.
-        self placeFruit.
+        fruits := OrderedCollection new.
+        self placeFruits.
         pane onStep: [ self step ]; run.
         ^self
     ]
@@ -189,7 +199,7 @@ Object subclass: Worms [
      every worm IS at the start of the tick, and against each other's
      intended new head cell, never against a half-moved worm."
     advanceWorms [
-        | living intents survivors dead ateFruit |
+        | living intents survivors dead |
         self serviceRespawns.
         living := self worms select: [ :w | w alive ].
         living do: [ :w | w isPlayer ifFalse: [ self decideAiDir: w ] ].
@@ -206,7 +216,7 @@ Object subclass: Worms [
                 or: [ (nrow < 0) or: [ nrow >= self class rows ] ] ])
                 ifTrue: [ dead add: intent ]
                 ifFalse: [
-                    (self anyWormOccupiesCol: ncol row: nrow)
+                    (self isFatalCol: ncol row: nrow for: w)
                         ifTrue: [ dead add: intent ]
                         ifFalse: [ survivors add: intent ] ] ].
 
@@ -234,24 +244,38 @@ Object subclass: Worms [
             ifTrue: [ self resetGame ].
 
         survivors do: [ :intent |
-            | w ncol nrow |
+            | w ncol nrow eaten |
             w := intent at: 1. ncol := intent at: 2. nrow := intent at: 3.
-            ateFruit := (ncol = fruitCol) and: [ nrow = fruitRow ].
-            w advanceToCol: ncol row: nrow grew: ateFruit.
-            ateFruit ifTrue: [ self onFruitEaten: w ] ].
+            eaten := fruits detect: [ :f | (f at: 1) = ncol and: [ (f at: 2) = nrow ] ] ifNone: [ nil ].
+            w advanceToCol: ncol row: nrow grew: eaten notNil.
+            eaten ifNotNil: [ self onFruitEaten: w at: eaten ] ].
         ^self
     ]
 
-    "Is (col, row) occupied by any LIVING worm's current body — the
-     pre-move occupancy every intended move is checked against."
+    "Is (col, row) occupied by any LIVING worm's current body — used to
+     keep fruit and computer-worm respawns from landing under somebody."
     anyWormOccupiesCol: col row: row [
         ^self worms anySatisfy: [ :w | w alive and: [ w occupiesCol: col row: row ] ]
     ]
 
-    onFruitEaten: aWorm [
+    "Would (col, row) be a FATAL landing for `w`? Any OTHER living worm's
+     body always is — but `w`'s OWN body only counts against the player.
+     The computer worms are deliberately immune to their own tail: a
+     one-move-lookahead AI has no way to see a self-trap coming several
+     moves out, and dying to a mistake it couldn't have avoided just
+     looked like a bug, not a fair loss."
+    isFatalCol: col row: row for: w [
+        (self worms anySatisfy: [ :other |
+            other ~~ w and: [ other alive and: [ other occupiesCol: col row: row ] ] ])
+            ifTrue: [ ^true ].
+        ^w isPlayer and: [ w occupiesCol: col row: row ]
+    ]
+
+    onFruitEaten: aWorm at: eatenFruit [
         aWorm isPlayer ifTrue: [ score := score + 1 ].
         Sound coin play.
-        self placeFruit.
+        fruits remove: eatenFruit ifAbsent: [ ].
+        self addOneFruit.
     ]
 
     "A computer worm crashed: mark it dead and start its respawn clock.
@@ -279,7 +303,7 @@ Object subclass: Worms [
     respawn: aWorm [
         | col row dir |
         col := 0. row := 0.
-        [ (self anyWormOccupiesCol: col row: row) or: [ (col = fruitCol) and: [ row = fruitRow ] ] ]
+        [ (self anyWormOccupiesCol: col row: row) or: [ self fruitAtCol: col row: row ] ]
             whileTrue: [
                 col := rng nextInteger \\ self class cols.
                 row := rng nextInteger \\ self class rows ].
@@ -290,14 +314,41 @@ Object subclass: Worms [
         ^self
     ]
 
-    "Pick a random empty cell for the fruit — one not sitting under any
-     living worm's body."
-    placeFruit [
-        fruitCol := 0. fruitRow := 0.
-        [ self anyWormOccupiesCol: fruitCol row: fruitRow ] whileTrue: [
-            fruitCol := rng nextInteger \\ self class cols.
-            fruitRow := rng nextInteger \\ self class rows ].
+    "Whether a fruit already sits at (col, row) — checked so a fresh fruit
+     or a computer-worm respawn never lands on top of an existing one."
+    fruitAtCol: col row: row [
+        ^fruits anySatisfy: [ :f | (f at: 1) = col and: [ (f at: 2) = row ] ]
+    ]
+
+    "Top `fruits` back up to `fruitCount`, each new one at a random empty
+     cell — not under any worm's body, and not on another fruit."
+    placeFruits [
+        [ fruits size < self class fruitCount ] whileTrue: [ self addOneFruit ].
         ^self
+    ]
+    addOneFruit [
+        | col row |
+        col := 0. row := 0.
+        [ (self anyWormOccupiesCol: col row: row) or: [ self fruitAtCol: col row: row ] ]
+            whileTrue: [
+                col := rng nextInteger \\ self class cols.
+                row := rng nextInteger \\ self class rows ].
+        fruits addLast: (Array with: col with: row).
+        ^self
+    ]
+
+    "The fruit nearest `aWorm`'s head (Manhattan distance), or nil if
+     there is none out — there always is one in practice (fruitCount > 0),
+     but a computer worm mid-decision shouldn't crash if that ever changes."
+    nearestFruitTo: aWorm [
+        | best bestDist d |
+        fruits isEmpty ifTrue: [ ^nil ].
+        best := fruits first.
+        bestDist := (aWorm headCol - (best at: 1)) abs + (aWorm headRow - (best at: 2)) abs.
+        fruits do: [ :f |
+            d := (aWorm headCol - (f at: 1)) abs + (aWorm headRow - (f at: 2)) abs.
+            d < bestDist ifTrue: [ best := f. bestDist := d ] ].
+        ^best
     ]
 
     "The player died: rebuild everything and start over, so the demo loops
@@ -308,35 +359,44 @@ Object subclass: Worms [
         player startAt: 10 row: 6 dir: #(1 0) length: 3 body: 18 head: 19 isPlayer: true.
         ai1 startAt: 30 row: 20 dir: #(-1 0) length: 3 body: 20 head: 21 isPlayer: false.
         ai2 startAt: 6 row: 13 dir: #(1 0) length: 3 body: 22 head: 23 isPlayer: false.
-        self placeFruit.
+        fruits := OrderedCollection new.
+        self placeFruits.
         ^self
     ]
 
-    "A computer worm's one move decision: try the direction that most
-     closes the gap to the fruit first, then the two directions
-     perpendicular to its current heading, then finally reversing — the
-     first of those four that doesn't immediately crash wins. Never real
-     pathfinding, just enough sense of purpose for a demo."
+    "A computer worm's one move decision: aim at whichever fruit is
+     nearest, try all four directions in order of how much each would
+     close the distance to it, and take the first that doesn't immediately
+     crash. Never real pathfinding, just enough sense of purpose for a
+     demo — and since a computer worm can't crash into itself, it never
+     needlessly dodges its own tail while chasing."
     decideAiDir: aWorm [
-        | dCol dRow candidates toward chosen |
-        dCol := fruitCol - aWorm headCol.
-        dRow := fruitRow - aWorm headRow.
-        toward := OrderedCollection new.
-        dCol > 0 ifTrue: [ toward add: #(1 0) ].
-        dCol < 0 ifTrue: [ toward add: #(-1 0) ].
-        dRow > 0 ifTrue: [ toward add: #(0 1) ].
-        dRow < 0 ifTrue: [ toward add: #(0 -1) ].
+        | target candidates chosen |
         candidates := OrderedCollection new.
-        candidates addAll: toward.
         candidates add: #(1 0); add: #(-1 0); add: #(0 1); add: #(0 -1).
+        target := self nearestFruitTo: aWorm.
+        target ifNotNil: [
+            candidates := candidates asSortedCollection: [ :a :b |
+                (self distanceAfter: a for: aWorm toward: target)
+                    <= (self distanceAfter: b for: aWorm toward: target) ] ].
         chosen := candidates detect: [ :d | self isSafeDir: d for: aWorm ] ifNone: [
             Array with: aWorm dirX with: aWorm dirY ].
         aWorm setDir: chosen.
         ^self
     ]
 
+    "The Manhattan distance from aWorm's head, moved one cell in direction
+     d, to `target` — the sort key decideAiDir: ranks all four directions
+     by."
+    distanceAfter: d for: aWorm toward: target [
+        | ncol nrow |
+        ncol := aWorm headCol + (d at: 1).
+        nrow := aWorm headRow + (d at: 2).
+        ^(ncol - (target at: 1)) abs + (nrow - (target at: 2)) abs
+    ]
+
     "Would moving `aWorm` one cell in direction `d` immediately be a
-     crash (a wall, or any living worm's current body)? Used only to
+     crash (a wall, or a FATAL body per isFatalCol:row:for:)? Used only to
      steer the computer worms — it looks one move ahead, not further."
     isSafeDir: d for: aWorm [
         | ncol nrow |
@@ -344,15 +404,16 @@ Object subclass: Worms [
         nrow := aWorm headRow + (d at: 2).
         (ncol < 0 or: [ ncol >= self class cols ]) ifTrue: [ ^false ].
         (nrow < 0 or: [ nrow >= self class rows ]) ifTrue: [ ^false ].
-        ^(self anyWormOccupiesCol: ncol row: nrow) not
+        ^(self isFatalCol: ncol row: nrow for: aWorm) not
     ]
 
     draw [
         pane cls: 16.
         self worms do: [ :w | w alive ifTrue: [ self drawWorm: w ] ].
-        pane disc: (fruitCol * self class cellSize) + 4
-             y: (fruitRow * self class cellSize) + self class fieldTop + 4
-             radius: 3 color: 24.
+        fruits do: [ :f |
+            pane disc: ((f at: 1) * self class cellSize) + 4
+                 y: ((f at: 2) * self class cellSize) + self class fieldTop + 4
+                 radius: 3 color: 24 ].
         pane fill: 4 y: 4 width: ((score * 6) min: 300) height: 8 color: 17.
         pane present.
         ^self
