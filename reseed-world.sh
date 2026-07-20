@@ -44,9 +44,16 @@ echo "▸ seeding world/image.sqlite3 from world/*.mst (every world/*.list)…"
 if [[ $verify -eq 1 ]]; then
 	echo "▸ verifying the world image installs every class and boots…"
 	# Seeds a throwaway image from world/ and boots it — fails loudly if any
-	# class won't install (e.g. a class var that didn't round-trip).
-	cargo test -p macvm-gui --bin macvm-gui \
-		world_image_installs_all_classes_without_error -- --quiet
+	# class won't install (e.g. a class var that didn't round-trip). The test
+	# lives in the image_store LIB (world_boot.rs), not the macvm-gui bin — a
+	# bin-scoped filter matches nothing and passes vacuously.
+	out=$(cargo test -p image_store --lib \
+		world_image_installs_all_classes_without_error -- --quiet 2>&1)
+	echo "$out"
+	grep -q '1 passed' <<<"$out" || {
+		echo "reseed-world.sh: boot-check test did not run — filter matched 0 tests"
+		exit 1
+	}
 fi
 
 echo "✓ world image rebuilt and boots — launch it with ./run-gui.sh"
