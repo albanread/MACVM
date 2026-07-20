@@ -388,6 +388,10 @@ fn primary_generation_main(
     // real send happened) — this turns the already-existing default-mode drain
     // source into a de-facto ~4Hz toolbar-refresh tick, reusing 100% proven
     // wiring instead of a new NSTimer/CFRunLoopTimer.
+    // This generation's file-in birth stamp (filein.rs): only requests made
+    // BEFORE this generation existed are ours to run — the fresh-world half
+    // of File In's contract.
+    let filein_birth = crate::filein::birth_stamp();
     while !stop.load(Ordering::Acquire) {
         *metrics.lock().unwrap_or_else(|e| e.into_inner()) = primary.metrics();
         ui_wake();
@@ -405,11 +409,12 @@ fn primary_generation_main(
         // own thread, between top-level entries — via run_file (every
         // top-level item, exactly `macvm run <file>`). The outcome rides the
         // primary's transcript forwarding back to the UI Transcript view.
-        if let Some(path) = crate::filein::take() {
+        if let Some(path) = crate::filein::take_for(filein_birth) {
             let note = match primary.run_file(std::path::Path::new(&path)) {
                 Ok(()) => format!("file-in: loaded {path}"),
                 Err(e) => format!("file-in FAILED: {}", e.msg),
             };
+            eprintln!("macvm-cocoa: {note}");
             let _ = primary.exec(&format!(
                 "Transcript showCr: '{}'.",
                 crate::filein::escape_st(&note)

@@ -844,13 +844,15 @@ extern "C" fn imp_mark_error_storage(
     std::ptr::null_mut()
 }
 
-/// `fileInPath:` — File ▸ File In: park the path for the supervisor's primary
-/// pump, which runs `VmHandle::run_file` TOP-LEVEL on the primary's own
-/// thread (every top-level item, exactly `macvm run <file>`) — never a nested
-/// uiDoit. The outcome is reported through the primary's transcript
-/// forwarding. Answers nil.
+/// `fileInPath:` — File ▸ File In. THE CONTRACT: a fresh world, then the
+/// file (filein.rs's module doc) — park the path for after-restart, then
+/// request the same primary respawn the Debug menu's Restart uses. The new
+/// generation's pump runs `VmHandle::run_file` top-level; the outcome is
+/// reported through the primary's transcript forwarding. Answers nil.
 extern "C" fn imp_file_in_path(_this: *mut c_void, _cmd: *mut c_void, path: Id) -> Id {
-    crate::filein::request(ns_to_string(path));
+    crate::filein::request_after_restart(ns_to_string(path));
+    crate::primary_restart::request();
+    crate::objc::wake_main_runloop();
     std::ptr::null_mut()
 }
 

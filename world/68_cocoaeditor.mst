@@ -180,9 +180,22 @@ shape change takes effect on the next launch)."'
        exactly `macvm run <file>`), and the outcome lands on the Transcript. ──"
     CocoaEditor class >> currentPath [ ^CurrentPath ]
     CocoaEditor class >> fileNew [
+        "A fresh, unsaved buffer seeded with a working class template — edit,
+         then File > Save (choose a path) / File In (compiles into the primary)."
         CurrentPath := nil.
-        self setBufferText: '"New file — write classes here, then File > Save / File In."'.
-        CocoaUI appendTranscript: 'editor: new file'.
+        self setBufferText: '"New class file. Rename MyClass, add methods, then:
+ File > Save As...  writes this file to disk;
+ File > File In     compiles it into the running VM;
+ Source > Analyze   syntax-checks;  Source > Format  re-indents."
+
+Object subclass: MyClass [
+    | instanceVar |
+
+    greeting [
+        ^''hello from MyClass''
+    ]
+]'.
+        CocoaUI appendTranscript: 'editor: new file (unsaved)'.
     ]
     CocoaEditor class >> fileOpen [ CocoaBrowser hostService onMain requestOpenPanel ]
     CocoaEditor class >> openedPath: aPath [
@@ -206,8 +219,11 @@ shape change takes effect on the next launch)."'
     ]
     CocoaEditor class >> fileInScratchPath [ ^'/tmp/macvm-editor-filein.mst' ]
     CocoaEditor class >> fileIn [
-        "Write the buffer to its file (or a scratch path when unsaved), then
-         hand the path to the host — the primary runs it top-level."
+        "THE CONTRACT: a fresh world, then your file. The primary RESTARTS from
+         its clean boot state and the file loads on top — `macvm run <file>`
+         inside the GUI. No persistence between file-ins: the same file loads
+         N times without shape errors, and every run starts identical. Write
+         the buffer to its file (or a scratch path when unsaved) first."
         | path text |
         text := self bufferText.
         (text isNil or: [ text isEmpty ]) ifTrue: [ ^self ].
@@ -215,7 +231,7 @@ shape change takes effect on the next launch)."'
         (CocoaFile spit: path contents: text)
             ifFalse: [ ^CocoaUI appendTranscript: 'editor: cannot write ', path ].
         CocoaBrowser hostService onMain fileInPath: path.
-        CocoaUI appendTranscript: 'editor: file-in requested — ', path.
+        CocoaUI appendTranscript: 'editor: file-in — fresh world, then ', path.
     ]
 
     "── the Source menu: Format (host re-indenter, comment/string-preserving)
