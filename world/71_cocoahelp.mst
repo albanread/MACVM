@@ -227,7 +227,7 @@ assumption the toolbar icons already make.' ].
          ReturnPartiallyParsedIfPossible policy) falls back to that block's
          raw text via the live NSMutableString proxy, never a second parse
          attempt on error text — and never a blank pane."
-        | md blocks storage first empty |
+        | md blocks storage first empty len color |
         md := self loadMarkdown.
         blocks := self splitBlocks: md.
         storage := TextView onMain textStorage.
@@ -256,6 +256,19 @@ assumption the toolbar icons already make.' ].
                 ifFalse: [
                     storage onMain appendAttributedString: attr.
                     attr release ] ].
+        "NSAttributedString markdown parsing bakes in a FIXED black text colour
+         (no appearance-adaptive NSColor involved) — invisible against the
+         dark-theme window background (applyTheme:'s NSAppearance swap changes
+         the WINDOW, not the parsed run colours). Force every run's foreground
+         to labelColor, which itself adapts, so light/dark/system all read.
+         Attribute-only, after the whole build so it composes over the
+         markdown's own bold/heading runs rather than fighting them."
+        len := storage onMain length.
+        len > 0 ifTrue: [
+            color := (Cocoa classNamed: 'NSColor') onMain labelColor.
+            storage onMain beginEditing.
+            storage onMain addAttribute: 'NSColor' value: color range: (Array with: 0 with: len).
+            storage onMain endEditing ].
         storage release.
     ]
 
