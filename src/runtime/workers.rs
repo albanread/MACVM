@@ -75,7 +75,16 @@ impl InboxSender {
     pub fn send(&self, env: Envelope) -> Result<(), InboxClosed> {
         self.tx.send(env).map_err(|_| InboxClosed)?;
         if !self.wake_pending.swap(true, Ordering::AcqRel) {
-            let hook = self.wake.lock().unwrap().clone();
+            // Poison-tolerant: the critical section (here and at every other
+            // lock of `wake`) only clones/replaces the `Arc`'d hook, so a
+            // panic elsewhere while holding it leaves nothing torn — and one
+            // poisoned sender must not turn every future cross-VM send into
+            // a panic cascade.
+            let hook = self
+                .wake
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
             if let Some(w) = hook {
                 w();
             }
@@ -189,7 +198,8 @@ impl WorkerState {
     /// return only (the GUI's is an unbounded-channel send + async wake).
     pub fn set_wake(&self, f: InboxWakeFn) {
         if let WorkerState::Primary { inbox_tx, .. } = self {
-            *inbox_tx.wake.lock().unwrap() = Some(f);
+            // Poison-tolerant for the same reason as `InboxSender::send`.
+            *inbox_tx.wake.lock().unwrap_or_else(|e| e.into_inner()) = Some(f);
         }
     }
 
