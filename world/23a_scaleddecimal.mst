@@ -1,0 +1,166 @@
+"23a_scaleddecimal.mst — ScaledDecimal: Squeak/Pharo's exact decimal number
+ with a display scale, backing the `3.14s2` literal syntax (the lexer/parser
+ desugar such a literal to `ScaledDecimal numerator:denominator:scale:`, the
+ same build-at-runtime treatment brace arrays get). As in Squeak, this is a
+ Fraction SUBCLASS: the value is an exact rational — arithmetic never loses
+ precision — and `scale` only governs how many decimal places printing shows
+ (rounded for display, exact underneath). Being a Fraction, every existing
+ Fraction/Integer arithmetic path accepts one as an argument unchanged; the
+ overrides below make results STAY scaled when the receiver is scaled, with
+ the larger scale winning when both sides carry one.
+
+ Two deliberate divergences from Squeak, both small: a plain `Integer op
+ ScaledDecimal` answers an unscaled rational (Squeak's generality tower
+ re-scales it; this world's simpler type-test dispatch puts the receiver in
+ charge), and equal-value ScaledDecimal/Integer pairs can hash differently
+ (same pre-existing property Fraction has vs Double)."
+
+nil subclass: Object [
+    isScaledDecimal [
+        ^false
+    ]
+]
+
+"Integer as a rational: numerator/denominator/asFraction let one Integer
+ flow through every rational-arithmetic path (Fraction's and
+ ScaledDecimal's) without a special case — Squeak defines exactly these."
+Number subclass: Integer [
+    numerator [ ^self ]
+    denominator [ ^1 ]
+    asFraction [ ^self ]
+]
+
+Number subclass: Fraction [
+    asFraction [ ^self ]
+]
+
+"I am an exact decimal number: a Fraction that remembers how many decimal
+ places to show. Write me as a literal — 3.14s2, 0.05s2, 100s2, 2.5s (scale
+ from the fraction digits) — or build me with numerator:denominator:scale:
+ or aNumber asScaledDecimal: places. My value is exact rational arithmetic
+ (1s0 / 3s0 is exactly one third); scale only rounds what printing shows,
+ so (1s0 / 3s0) printString is '0s0' but the value stays 1/3. Arithmetic
+ with Integers, Fractions and other ScaledDecimals answers a ScaledDecimal
+ carrying the larger scale; mixing with a Double answers a Double."
+Fraction subclass: ScaledDecimal [
+    | scale |
+
+    "Reduce like Fraction but NEVER collapse to a plain Integer — 2.00s2
+     must stay a ScaledDecimal (denominator 1 is legal here, unlike in
+     Fraction proper, whose factory answers the Integer instead)."
+    ScaledDecimal class >> numerator: n denominator: d scale: s [
+        | g num den sign |
+        d = 0 ifTrue: [ ^self error: 'division by zero' ].
+        sign := d < 0 ifTrue: [ -1 ] ifFalse: [ 1 ].
+        num := n * sign.
+        den := d * sign.
+        g := num gcd: den.
+        g = 0 ifTrue: [ g := 1 ].
+        ^(self basicNew setNumerator: num // g denominator: den // g) setScale: s
+    ]
+    "Wrap any exact rational (Integer, Fraction, or ScaledDecimal)."
+    ScaledDecimal class >> fromRational: r scale: s [
+        ^self numerator: r numerator denominator: r denominator scale: s
+    ]
+
+    setScale: s [ scale := s. ^self ]
+    scale [ ^scale ]
+    isScaledDecimal [ ^true ]
+
+    "The plain (unscaled) exact value — a Fraction, or an Integer when the
+     denominator is 1 (Fraction's factory collapses it)."
+    asFraction [
+        ^Fraction numerator: self numerator denominator: self denominator
+    ]
+
+    "The result scale: mine, or the larger of the two when the other side
+     is scaled too — Squeak's rule."
+    scaleWith: aNumber [
+        ^aNumber isScaledDecimal
+            ifTrue: [ scale max: aNumber scale ]
+            ifFalse: [ scale ]
+    ]
+
+    "── arithmetic: exact underneath, scaled on top; Double converts ──
+     The exact work is delegated to Fraction's own operations on the
+     unscaled values (which handle Integer/Fraction/ScaledDecimal
+     arguments uniformly — a ScaledDecimal IS a Fraction), then the
+     result is re-wrapped at the combined scale."
+    + aNumber [
+        aNumber isDouble ifTrue: [ ^self asDouble + aNumber ].
+        ^ScaledDecimal fromRational: self asFraction + aNumber
+            scale: (self scaleWith: aNumber)
+    ]
+    - aNumber [
+        aNumber isDouble ifTrue: [ ^self asDouble - aNumber ].
+        ^ScaledDecimal fromRational: self asFraction - aNumber
+            scale: (self scaleWith: aNumber)
+    ]
+    * aNumber [
+        aNumber isDouble ifTrue: [ ^self asDouble * aNumber ].
+        ^ScaledDecimal fromRational: self asFraction * aNumber
+            scale: (self scaleWith: aNumber)
+    ]
+    / aNumber [
+        aNumber isDouble ifTrue: [ ^self asDouble / aNumber ].
+        ^ScaledDecimal fromRational: self asFraction / aNumber
+            scale: (self scaleWith: aNumber)
+    ]
+    negated [
+        ^ScaledDecimal numerator: self numerator negated
+            denominator: self denominator scale: scale
+    ]
+    abs [
+        ^self negative ifTrue: [ self negated ] ifFalse: [ self ]
+    ]
+    reciprocal [
+        ^ScaledDecimal numerator: self denominator
+            denominator: self numerator scale: scale
+    ]
+
+    "Equality is by VALUE across the whole exact tower: 2.00s2 = 2 and
+     3.14s2 = 157/50 are both true (the inherited Fraction = would answer
+     false against an Integer, because a proper Fraction is never whole).
+     Comparison (<, <= ...) needs no override — Fraction's cross-multiply
+     is value-exact for a denominator of 1 too."
+    = aNumber [
+        aNumber isDouble ifTrue: [ ^self asDouble = aNumber ].
+        aNumber isScaledDecimal ifTrue: [ ^self asFraction = aNumber asFraction ].
+        ^self asFraction = aNumber
+    ]
+    hash [
+        ^self asFraction hash
+    ]
+
+    "Print rounded to `scale` decimal places, then the s-suffix — the
+     literal syntax back again: 3.14s2, -0.50s2, 100s0. The value itself
+     stays exact; only the digits shown are rounded."
+    printOn: aStream [
+        | den scaled intPart fracPart digits |
+        self negative ifTrue: [ aStream nextPutAll: '-' ].
+        den := 10 raisedTo: scale.
+        scaled := self asFraction abs * den.
+        scaled := scaled isFraction ifTrue: [ scaled rounded ] ifFalse: [ scaled ].
+        intPart := scaled // den.
+        fracPart := scaled \\ den.
+        intPart printOn: aStream.
+        scale > 0 ifTrue: [
+            aStream nextPutAll: '.'.
+            digits := fracPart printString.
+            (scale - digits size) timesRepeat: [ aStream nextPutAll: '0' ].
+            aStream nextPutAll: digits ].
+        aStream nextPutAll: 's'.
+        scale printOn: aStream.
+    ]
+]
+
+"Convert any exact number to a scaled decimal: 17 asScaledDecimal: 2
+ prints '17.00s2'; (1/3) asScaledDecimal: 4 prints '0.3333s4'. Defined for
+ the exact tower only — a Double's bits are not a decimal the user wrote,
+ so guessing a rational for one is a trap Squeak also declines."
+Number subclass: Integer [
+    asScaledDecimal: s [ ^ScaledDecimal fromRational: self scale: s ]
+]
+Number subclass: Fraction [
+    asScaledDecimal: s [ ^ScaledDecimal fromRational: self scale: s ]
+]

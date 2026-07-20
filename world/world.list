@@ -32,6 +32,10 @@
 21_collections_ext.mst
 22_set.mst
 23_fraction.mst
+# ScaledDecimal: Squeak's exact decimal with a display scale, backing the
+# 3.14s2 literal (lexer/parser desugar it to numerator:denominator:scale:).
+# A Fraction subclass — exact value, scale only governs printing.
+23a_scaleddecimal.mst
 24_readstream.mst
 25_sortedcollection.mst
 26_bag.mst

@@ -23,6 +23,18 @@ pub enum Tok {
         radix: u8,
         digits: String,
     },
+    /// A Squeak/Pharo scaled-decimal literal (`3.14s2`, `100s2`, `2.5s`) —
+    /// an EXACT rational plus a display scale. Carried as raw digit text
+    /// (like `IntLit`) so no precision is lost; the parser desugars it to a
+    /// `ScaledDecimal numerator:denominator:scale:` send (`world/23a`), the
+    /// same build-at-runtime treatment brace arrays get. `scale` defaults to
+    /// the fraction-digit count when the `s` carries no digits of its own.
+    ScaledLit {
+        negative: bool,
+        int_digits: String,
+        frac_digits: String,
+        scale: u16,
+    },
     FloatLit(f64),
     CharLit(char),
     StrLit(String),
@@ -70,6 +82,7 @@ fn tok_ends_expr(t: &Tok) -> bool {
         t,
         Tok::Ident(_)
             | Tok::IntLit { .. }
+            | Tok::ScaledLit { .. }
             | Tok::FloatLit(_)
             | Tok::CharLit(_)
             | Tok::StrLit(_)
@@ -228,12 +241,14 @@ impl<'a> Lexer<'a> {
         self.consume_while(|c| c.is_ascii_digit() || c.is_ascii_uppercase())
     }
 
-    /// Consumes an optional `e|d [-] digits` exponent suffix, returning it
-    /// normalized to `"e[-]digits"`, or `None` (consuming nothing) if the
+    /// Consumes an optional `e|d [-] digits` exponent suffix, answering
+    /// `(marker, negative, digits)` with the marker normalized to lowercase
+    /// — the e/d distinction is load-bearing (Squeak: `1e3` is an Integer,
+    /// `1d3` forces a Float) — or `None` (consuming nothing) if the
     /// lookahead doesn't confirm a valid exponent.
-    fn try_consume_exponent(&mut self) -> Result<Option<String>, LexError> {
+    fn try_consume_exponent(&mut self) -> Result<Option<(char, bool, String)>, LexError> {
         let marker = match self.peek_char() {
-            Some(c @ ('e' | 'E' | 'd' | 'D')) => c,
+            Some(c @ ('e' | 'E' | 'd' | 'D')) => c.to_ascii_lowercase(),
             _ => return Ok(None),
         };
         let neg = self.peek_char_at(1) == Some('-');
@@ -244,13 +259,42 @@ impl<'a> Lexer<'a> {
         {
             return Ok(None);
         }
-        let _ = marker;
         self.bump(); // marker
         if neg {
             self.bump();
         }
         let digits = self.consume_while(|c| c.is_ascii_digit());
-        Ok(Some(format!("e{}{digits}", if neg { "-" } else { "" })))
+        Ok(Some((marker, neg, digits)))
+    }
+
+    /// Consumes an optional scaled-decimal `s [digits]` suffix, answering
+    /// the scale, or `None` (consuming nothing). The `s` is only claimed
+    /// when what follows it is a digit or NOT an identifier character —
+    /// `3.14s2` and `2.5s` are scaled, but `2 sqrt`-style code written as
+    /// `2sqrt` keeps today's lexing (IntLit then Ident), and `100s:` stays
+    /// a keyword send. Explicit scale defaults to `default` when absent.
+    fn try_consume_scale(&mut self, default: u16, start: Span) -> Result<Option<u16>, LexError> {
+        if self.peek_char() != Some('s') {
+            return Ok(None);
+        }
+        match self.peek_char_at(1) {
+            Some(c) if c.is_ascii_digit() => {
+                self.bump(); // 's'
+                let digits = self.consume_while(|c| c.is_ascii_digit());
+                let scale: u32 = digits
+                    .parse()
+                    .map_err(|_| self.err(start, "scaled-decimal scale too large"))?;
+                if scale > u16::MAX as u32 {
+                    return Err(self.err(start, "scaled-decimal scale too large"));
+                }
+                Ok(Some(scale as u16))
+            }
+            Some(c) if Self::is_ident_cont(c) || c == ':' => Ok(None),
+            _ => {
+                self.bump(); // bare 's'
+                Ok(Some(default))
+            }
+        }
     }
 
     /// L3/L4: caller has already established the token starts with a digit
@@ -289,9 +333,20 @@ impl<'a> Lexer<'a> {
         {
             self.bump(); // '.'
             let frac = self.consume_while(|c| c.is_ascii_digit());
+            // A scale suffix claims the number as an EXACT scaled decimal
+            // (`3.14s2`, `2.5s` — default scale = fraction-digit count);
+            // scale and exponent are mutually exclusive, as in Squeak.
+            if let Some(scale) = self.try_consume_scale(frac.len().min(u16::MAX as usize) as u16, start)? {
+                return Ok(Tok::ScaledLit {
+                    negative,
+                    int_digits: lead,
+                    frac_digits: frac,
+                    scale,
+                });
+            }
             let mut text = format!("{lead}.{frac}");
-            if let Some(exp) = self.try_consume_exponent()? {
-                text.push_str(&exp);
+            if let Some((_, neg, digits)) = self.try_consume_exponent()? {
+                text.push_str(&format!("e{}{digits}", if neg { "-" } else { "" }));
             }
             let v: f64 = text
                 .parse()
@@ -299,8 +354,44 @@ impl<'a> Lexer<'a> {
             return Ok(Tok::FloatLit(if negative { -v } else { v }));
         }
 
-        if let Some(exp) = self.try_consume_exponent()? {
-            let text = format!("{lead}{exp}");
+        // Integer form of a scaled decimal (`100s2`, `5s`) — checked before
+        // the exponent so `s` binds tighter than a following unary send.
+        if let Some(scale) = self.try_consume_scale(0, start)? {
+            return Ok(Tok::ScaledLit {
+                negative,
+                int_digits: lead,
+                frac_digits: String::new(),
+                scale,
+            });
+        }
+
+        if let Some((marker, neg, exp_digits)) = self.try_consume_exponent()? {
+            // Squeak semantics: an `e` exponent on a plain integer stays an
+            // INTEGER (`1e3` = 1000; before this it was a Double — the one
+            // silent divergence found in the syntax survey). Realized by
+            // appending zeros to the digit text, so a large result flows to
+            // LargeInteger exactly like any long written-out literal. `d`
+            // (and any negative exponent, where Squeak answers a Fraction we
+            // choose not to build) still answers a Float.
+            if marker == 'e' && !neg {
+                let exp: u32 = exp_digits
+                    .parse()
+                    .map_err(|_| self.err(start, "integer exponent too large"))?;
+                if exp > 10_000 {
+                    return Err(self.err(
+                        start,
+                        "integer exponent too large (limit 10000 digits)",
+                    ));
+                }
+                let mut digits = lead;
+                digits.extend(std::iter::repeat('0').take(exp as usize));
+                return Ok(Tok::IntLit {
+                    negative,
+                    radix: 10,
+                    digits,
+                });
+            }
+            let text = format!("{lead}e{}{exp_digits}", if neg { "-" } else { "" });
             let v: f64 = text
                 .parse()
                 .map_err(|_| self.err(start, format!("malformed float literal '{text}'")))?;
@@ -591,14 +682,70 @@ mod tests {
 
     #[test]
     fn lex_float_forms() {
+        // Squeak semantics (2026-07): a bare-`e` integer exponent stays an
+        // INTEGER token (zero-extended digits); `d`, a decimal point, or a
+        // negative exponent still lex as floats.
         let toks = lex_all("3.25 1e10 2.5e-3 1d2").unwrap();
         assert_eq!(
             toks,
             vec![
                 Tok::FloatLit(3.25),
-                Tok::FloatLit(1e10),
+                Tok::IntLit {
+                    negative: false,
+                    radix: 10,
+                    digits: "10000000000".to_string(),
+                },
                 Tok::FloatLit(2.5e-3),
                 Tok::FloatLit(1e2),
+            ]
+        );
+        // Scaled-decimal forms: fraction, integer, default-scale, and the
+        // non-claims (identifier adjacency, keyword send).
+        let scaled = lex_all("3.14s2 100s2 2.5s").unwrap();
+        assert_eq!(
+            scaled,
+            vec![
+                Tok::ScaledLit {
+                    negative: false,
+                    int_digits: "3".to_string(),
+                    frac_digits: "14".to_string(),
+                    scale: 2,
+                },
+                Tok::ScaledLit {
+                    negative: false,
+                    int_digits: "100".to_string(),
+                    frac_digits: String::new(),
+                    scale: 2,
+                },
+                Tok::ScaledLit {
+                    negative: false,
+                    int_digits: "2".to_string(),
+                    frac_digits: "5".to_string(),
+                    scale: 1,
+                },
+            ]
+        );
+        let not_scaled = lex_all("5sqrt 100s: 1").unwrap();
+        assert_eq!(
+            not_scaled,
+            vec![
+                Tok::IntLit {
+                    negative: false,
+                    radix: 10,
+                    digits: "5".to_string(),
+                },
+                Tok::Ident("sqrt".to_string()),
+                Tok::IntLit {
+                    negative: false,
+                    radix: 10,
+                    digits: "100".to_string(),
+                },
+                Tok::Keyword("s:".to_string()),
+                Tok::IntLit {
+                    negative: false,
+                    radix: 10,
+                    digits: "1".to_string(),
+                },
             ]
         );
         let toks2 = lex_all("5.").unwrap();

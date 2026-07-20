@@ -50,4 +50,5 @@ TestRunner run: RopeTests.
 TestRunner run: EditorSessionTests.
 TestRunner run: PosixIoTests.
 TestRunner run: IoStreamTests.
+TestRunner run: ScaledDecimalTests.
 TestRunner report.

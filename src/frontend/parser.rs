@@ -221,6 +221,11 @@ impl<'a> Parser<'a> {
             }
             Tok::LitArrayOpen => self.parse_array_literal(),
             Tok::ByteArrayOpen => self.parse_byte_array_literal(),
+            Tok::ScaledLit { .. } => Err(self.error(
+                span,
+                "scaled-decimal literals are not supported inside literal arrays \
+                 (a ScaledDecimal is built at runtime — use a brace array instead)",
+            )),
             _ => Err(self.error(span, "invalid literal array element")),
         }
     }
@@ -373,6 +378,51 @@ impl<'a> Parser<'a> {
                 Ok((
                     Expr::Lit {
                         value: Literal::Float(v),
+                        span,
+                    },
+                    false,
+                ))
+            }
+            Tok::ScaledLit {
+                negative,
+                int_digits,
+                frac_digits,
+                scale,
+            } => {
+                // Desugared to `ScaledDecimal numerator:denominator:scale:`
+                // (world/23a) — the same build-at-runtime treatment brace
+                // arrays get, so no new Literal kind ripples through codegen
+                // or the literal frame. Exactness is preserved by carrying
+                // the digits textually: 3.14s2 -> numerator 314 (all digits
+                // concatenated), denominator 10^(fraction digits).
+                self.bump()?;
+                let all_digits = format!("{int_digits}{frac_digits}");
+                let numerator = Self::intlit_to_literal(negative, 10, &all_digits);
+                let mut den_digits = String::from("1");
+                den_digits.extend(std::iter::repeat('0').take(frac_digits.len()));
+                let denominator = Self::intlit_to_literal(false, 10, &den_digits);
+                Ok((
+                    Expr::Send {
+                        receiver: Box::new(Expr::Var {
+                            name: "ScaledDecimal".to_string(),
+                            span,
+                        }),
+                        selector: "numerator:denominator:scale:".to_string(),
+                        args: vec![
+                            Expr::Lit {
+                                value: numerator,
+                                span,
+                            },
+                            Expr::Lit {
+                                value: denominator,
+                                span,
+                            },
+                            Expr::Lit {
+                                value: Literal::Int(scale as i64),
+                                span,
+                            },
+                        ],
+                        is_super: false,
                         span,
                     },
                     false,
@@ -1371,6 +1421,119 @@ mod tests {
         assert!(parse_file("#[256].").is_err());
         assert!(parse_file("#[-1].").is_err());
         assert!(parse_file("#[foo].").is_err());
+    }
+
+    /// Squeak integer-exponent semantics: bare-`e` stays an Integer (zero-
+    /// extended digit text, so big results flow to LargeInteger like any
+    /// written-out literal); `d`, a decimal point, or a negative exponent
+    /// answers a Float.
+    #[test]
+    fn parse_integer_exponent_stays_integer() {
+        assert_eq!(
+            parse_expr("1e3"),
+            Expr::Lit {
+                value: Literal::Int(1000),
+                span: Span { line: 1, col: 1 }
+            }
+        );
+        assert_eq!(
+            parse_expr("25e2"),
+            Expr::Lit {
+                value: Literal::Int(2500),
+                span: Span { line: 1, col: 1 }
+            }
+        );
+        assert!(matches!(
+            parse_expr("1d3"),
+            Expr::Lit {
+                value: Literal::Float(v),
+                ..
+            } if v == 1000.0
+        ));
+        assert!(matches!(
+            parse_expr("1e-3"),
+            Expr::Lit {
+                value: Literal::Float(v),
+                ..
+            } if v == 0.001
+        ));
+        assert!(matches!(
+            parse_expr("1.5e2"),
+            Expr::Lit {
+                value: Literal::Float(v),
+                ..
+            } if v == 150.0
+        ));
+        // Runaway exponents are a lex error, not a memory bomb.
+        assert!(parse_file("1e999999.").is_err());
+    }
+
+    /// `3.14s2` desugars to `ScaledDecimal numerator: 314 denominator: 100
+    /// scale: 2` — exactness carried in the digit text, no Float anywhere.
+    #[test]
+    fn parse_scaled_decimal_desugars_to_a_send() {
+        let e = parse_expr("3.14s2");
+        let Expr::Send {
+            receiver,
+            selector,
+            args,
+            ..
+        } = e
+        else {
+            panic!("expected a Send, got {e:?}");
+        };
+        assert!(matches!(*receiver, Expr::Var { ref name, .. } if name == "ScaledDecimal"));
+        assert_eq!(selector, "numerator:denominator:scale:");
+        let vals: Vec<_> = args
+            .iter()
+            .map(|a| match a {
+                Expr::Lit {
+                    value: Literal::Int(v),
+                    ..
+                } => *v,
+                other => panic!("expected Int literal arg, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(vals, vec![314, 100, 2]);
+
+        // Integer form, explicit scale; default scale = fraction digits;
+        // negative literal keeps its sign on the numerator.
+        let forms = [
+            ("100s2", vec![100, 1, 2]),
+            ("2.5s", vec![25, 10, 1]),
+            ("-0.05s2", vec![-5, 100, 2]),
+        ];
+        for (src, expect) in forms {
+            let Expr::Send { args, .. } = parse_expr(src) else {
+                panic!("{src}: expected a Send");
+            };
+            let vals: Vec<_> = args
+                .iter()
+                .map(|a| match a {
+                    Expr::Lit {
+                        value: Literal::Int(v),
+                        ..
+                    } => *v,
+                    other => panic!("{src}: expected Int literal, got {other:?}"),
+                })
+                .collect();
+            assert_eq!(vals, expect, "{src}");
+        }
+
+        // The `s` binds only when it IS a scale: `5squared`-style adjacency
+        // keeps today's lexing (number, then identifier), and `100s:` stays
+        // a keyword send.
+        assert!(matches!(
+            parse_expr("5 sqrt"),
+            Expr::Send { ref selector, .. } if selector == "sqrt"
+        ));
+        assert!(matches!(
+            parse_expr("100 s: 1"),
+            Expr::Send { ref selector, .. } if selector == "s:"
+        ));
+
+        // Not a literal-array element (built at runtime, like brace arrays).
+        assert!(parse_file("#(1.5s2).").is_err());
     }
 
     #[test]

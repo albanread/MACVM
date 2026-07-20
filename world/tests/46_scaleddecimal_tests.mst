@@ -1,0 +1,94 @@
+"46_scaleddecimal_tests.mst — ScaledDecimalTests: the gate for the 3.14s2
+ literal syntax (lexer/parser desugaring) and the ScaledDecimal class
+ (world/23a). The invariants pinned here are Squeak's: the VALUE is an exact
+ rational (arithmetic never rounds), the SCALE only governs printing
+ (rounded for display), results stay scaled when the receiver is scaled with
+ the larger scale winning, and equality is by value across the exact tower."
+
+TestCase subclass: ScaledDecimalTests [
+    runAll [
+        self runTest: #testLiteralFormsAndClass do: [ self testLiteralFormsAndClass ].
+        self runTest: #testPrintingRoundTrip do: [ self testPrintingRoundTrip ].
+        self runTest: #testExactness do: [ self testExactness ].
+        self runTest: #testStickyScaledArithmetic do: [ self testStickyScaledArithmetic ].
+        self runTest: #testValueEquality do: [ self testValueEquality ].
+        self runTest: #testComparisonsAndConversion do: [ self testComparisonsAndConversion ].
+        self runTest: #testIntegerExponentLiterals do: [ self testIntegerExponentLiterals ].
+    ]
+
+    testLiteralFormsAndClass [
+        self assert: 3.14s2 class == ScaledDecimal.
+        self assert: 100s2 class == ScaledDecimal.      "integer form"
+        self assert: 2.5s class == ScaledDecimal.       "default scale"
+        self assert: 2.5s scale = 1.                    "= fraction digits"
+        self assert: 100s2 scale = 2.
+        self assert: 0.005s3 scale = 3.
+        "The s only binds when scaled: an identifier keeps its meaning."
+        self assert: 4 sqrt = 2.0.
+    ]
+
+    testPrintingRoundTrip [
+        self assert: 3.14s2 printString = '3.14s2'.
+        self assert: 100s2 printString = '100.00s2'.
+        self assert: 2.5s printString = '2.5s1'.
+        self assert: 0.05s2 printString = '0.05s2'.
+        self assert: 0.05s2 negated printString = '-0.05s2'.
+        self assert: 7s0 printString = '7s0'.
+        "Display rounds; the third really shows as its scale-0 rounding."
+        self assert: (1s0 / 3s0) printString = '0s0'.
+        self assert: ((2s0 / 3s0) asScaledDecimal: 2) printString = '0.67s2'.
+    ]
+
+    testExactness [
+        "The value underneath is a true rational, not the printed rounding."
+        self assert: ((1s0 / 3s0) * 3) = 1.
+        self assert: (0.1s1 + 0.2s1) = (3/10).
+        self assert: 3.14s2 asFraction = (157/50).
+        self assert: (1s0 / 3s0) asFraction = (1/3).
+    ]
+
+    testStickyScaledArithmetic [
+        "Scaled receiver -> scaled result; larger scale wins."
+        self assert: (3.14s2 + 1) class == ScaledDecimal.
+        self assert: (3.14s2 + 1) printString = '4.14s2'.
+        self assert: (3.14s2 - 0.14s2) printString = '3.00s2'.
+        self assert: (1.5s1 * 1.5s3) printString = '2.250s3'.
+        self assert: (1.5s1 * 1.5s3) scale = 3.
+        self assert: (5s0 / 2) printString = '3s0'.     "5/2 shown rounded at scale 0"
+        self assert: (5s0 / 2) = (5/2).                 "...but held exactly"
+        self assert: (3.14s2 + (1/2)) printString = '3.64s2'.
+        "Mixing with a Double leaves the exact tower."
+        self assert: (1.5s1 + 0.5) class == Double.
+        self assert: (1.5s1 + 0.5) = 2.0.
+    ]
+
+    testValueEquality [
+        self assert: 2.00s2 = 2.
+        self assert: 3.14s2 = (157/50).
+        self assert: 1.50s2 = 1.5s1.
+        self assert: (3.14s2 = 3.15s2) not.
+        self assert: (2.00s2 = 'two') not.
+    ]
+
+    testComparisonsAndConversion [
+        self assert: 3.14s2 < (22/7).
+        self assert: 3.14s2 > 3.
+        self assert: 3.14s2 asDouble = 3.14.
+        self assert: (17 asScaledDecimal: 2) printString = '17.00s2'.
+        self assert: ((1/3) asScaledDecimal: 4) printString = '0.3333s4'.
+        self assert: 3.14s2 truncated = 3.
+        self assert: 3.14s2 negated abs printString = '3.14s2'.
+    ]
+
+    testIntegerExponentLiterals [
+        "Squeak semantics: a bare-`e` integer exponent stays an Integer."
+        self assert: 1e3 = 1000.
+        self assert: 1e3 class == SmallInteger.
+        self assert: 25e2 = 2500.
+        "A decimal point, `d`, or a negative exponent answers a Double."
+        self assert: 1.5e2 = 150.0.
+        self assert: 1.5e2 class == Double.
+        self assert: 1d3 class == Double.
+        self assert: 1e-2 class == Double.
+    ]
+]

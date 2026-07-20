@@ -11,7 +11,14 @@ TestCase subclass: DoubleTests [
 
     testArithLiterals [
         self assert: 3.14 class == Double.
-        self assert: 1e10 class == Double.
+        "Squeak exponent semantics (changed 2026-07): a bare-`e` integer
+         exponent stays an INTEGER; a decimal point, a `d` marker, or a
+         negative exponent answers a Double."
+        self assert: 1e10 class == SmallInteger.
+        self assert: 1e10 = 10000000000.
+        self assert: 1.0e10 class == Double.
+        self assert: 1d10 class == Double.
+        self assert: 1e-3 class == Double.
         self assert: (1.0 + 2.0) = 3.0.
         self assert: (3.0 - 1.0) = 2.0.
     ]
