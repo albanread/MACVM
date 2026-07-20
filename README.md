@@ -250,6 +250,27 @@ measure). The remaining gap to ‑O2 is specific and known: no FMA fusion
 compiled *send* rather than inlined into the pixel loop the way C inlines
 `escape()`.
 
+### Replace, don't mutate — there is no persistent image
+
+MACVM never mutates a persistent image. Where classic Smalltalk carries one
+long-lived heap snapshot forward across years of in-place modification, MACVM
+keeps its truth in a **source-code database** — the `.mst` world files and the
+SQLite image they seed — and spins up VMs from it in well under a second. VMs
+are plural and disposable: the system would always rather **throw a VM away and
+rebuild it from source than mutate one in place**.
+
+You can feel the difference in the tools. When you file development code into
+the GUI, it is not patched into the long-running VM: a **fresh VM is recreated
+from the world and your file loads on top of it**. Filing in the same file
+twenty times just works — there is no accumulated state to collide with,
+because there is no accumulated state at all. To a Smalltalker raised on the
+image this reads as less dynamic, almost static. In operation, though, MACVM is
+a true Smalltalk system — live objects, live compilation, everything inspectable
+while it runs. The difference is only in how change lands: **replacement instead
+of mutation**, with every piece of state visible in source you can read, diff,
+and version — never implicit in a heap that remembers things no one can point
+to.
+
 ### Why there's no `become:`
 
 MACVM has no `become:` — the Smalltalk primitive that swaps one object's
