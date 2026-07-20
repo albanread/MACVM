@@ -934,6 +934,29 @@ extern "C" fn imp_set_halt_on_error(_this: *mut c_void, _cmd: *mut c_void, flag:
     std::ptr::null_mut()
 }
 
+/// `setBreakpointClass:selector:` / `clearBreakpointClass:selector:` — DBG4
+/// "Break on entry": park a breakpoint request for the supervisor pump (it
+/// runs on the primary's own thread; the outcome rides the primary
+/// transcript). Answer nil.
+extern "C" fn imp_set_breakpoint(
+    _this: *mut c_void,
+    _cmd: *mut c_void,
+    class: Id,
+    selector: Id,
+) -> Id {
+    crate::debugger::request_breakpoint(ns_to_string(class), ns_to_string(selector), true);
+    std::ptr::null_mut()
+}
+extern "C" fn imp_clear_breakpoint(
+    _this: *mut c_void,
+    _cmd: *mut c_void,
+    class: Id,
+    selector: Id,
+) -> Id {
+    crate::debugger::request_breakpoint(ns_to_string(class), ns_to_string(selector), false);
+    std::ptr::null_mut()
+}
+
 /// `requestOpenPanel` / `requestSavePanel` — File ▸ Open… / Save As…: flag a
 /// modal panel for `drain_perform` (top-level, VM quiescent — a modal event
 /// pump must never spin inside this callback). The drain hands the chosen
@@ -981,11 +1004,13 @@ pub fn register() {
     type Imp2 = extern "C" fn(*mut c_void, *mut c_void, Id, Id) -> Id;
     type Imp3 = extern "C" fn(*mut c_void, *mut c_void, Id, Id, Id) -> Id;
     type Imp4 = extern "C" fn(*mut c_void, *mut c_void, Id, Id, Id, Id) -> Id;
-    let methods: [(&str, *const c_void, &str); 40] = [
+    let methods: [(&str, *const c_void, &str); 42] = [
         ("addToWorldPath:", imp_add_to_world as Imp1 as *const c_void, "@@:@"),
         ("dbgReport", imp_dbg_report as Imp0 as *const c_void, "@@:"),
         ("dbgCommand:", imp_dbg_command as Imp1 as *const c_void, "@@:@"),
         ("setHaltOnError:", imp_set_halt_on_error as Imp1 as *const c_void, "@@:@"),
+        ("setBreakpointClass:selector:", imp_set_breakpoint as Imp2 as *const c_void, "@@:@@"),
+        ("clearBreakpointClass:selector:", imp_clear_breakpoint as Imp2 as *const c_void, "@@:@@"),
         ("setJitCompile:", imp_set_jit_compile as Imp1 as *const c_void, "@@:@"),
         ("formatSource:", imp_format_source as Imp1 as *const c_void, "@@:@"),
         ("analyzeSource:", imp_analyze_source as Imp1 as *const c_void, "@@:@"),

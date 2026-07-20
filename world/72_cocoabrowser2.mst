@@ -92,6 +92,15 @@ Object subclass: CocoaBrowser2 [
     CocoaBrowser2 class >> sideString [
         ^Side == #class ifTrue: [ 'class' ] ifFalse: [ 'instance' ]
     ]
+    "── DBG4 breakpoint support: the current selection, for the Debug menu's
+       Break on Entry. The class name carries the ' class' suffix on the class
+       side, matching the VM's resolve_method_by_name grammar. ──"
+    CocoaBrowser2 class >> selectedClassName [ ^SelectedClass ]
+    CocoaBrowser2 class >> selectedMethodName [ ^SelectedMethod ]
+    CocoaBrowser2 class >> selectedBreakpointClass [
+        SelectedClass isNil ifTrue: [ ^nil ].
+        ^Side == #class ifTrue: [ SelectedClass , ' class' ] ifFalse: [ SelectedClass ]
+    ]
 
     "── fetch + parse the model (two host reads: the category tree + the flat
        per-class selector records) ──"
@@ -345,6 +354,13 @@ Object subclass: CocoaBrowser2 [
         row := MethTable onMain clickedRow.
         (row < 0 or: [ Methods isNil or: [ row >= Methods size ] ]) ifTrue: [ ^self ].
         SelectedMethod := Methods at: row + 1.
+        SourceMode := #source. self syncModeSeg. self renderSource.
+    ]
+
+    "── method selection core (shared by the table click and scripting;
+       scripting/DBG4 selects a method without a click) ──"
+    CocoaBrowser2 class >> selectMethod: aName [
+        SelectedMethod := aName.
         SourceMode := #source. self syncModeSeg. self renderSource.
     ]
 

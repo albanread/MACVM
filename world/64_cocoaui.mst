@@ -675,6 +675,8 @@ Object subclass: CocoaUI [
         | debugMenu debugItem pairs jitHolder jitDelegate |
         debugMenu := (Cocoa classNamed: 'NSMenu') onMain alloc onMain init.
         pairs := OrderedCollection new.
+        pairs add: (Array with: 'Break on Entry (Browser V2 selection)' with: [ self breakOnBrowserSelection: true ]).
+        pairs add: (Array with: 'Clear Break (Browser V2 selection)' with: [ self breakOnBrowserSelection: false ]).
         pairs add: (Array with: 'Rebuild UI' with: [ self requestRebuild ]).
         pairs add: (Array with: 'Restart Primary VM' with: [ self requestPrimaryRestart ]).
         pairs add: (Array with: 'Force Fault (recovered)' with: [ self forceFault ]).
@@ -729,6 +731,26 @@ Object subclass: CocoaUI [
         JitMenuItem isNil ifFalse: [
             JitMenuItem onMain setState: (JitOn ifTrue: [ 1 ] ifFalse: [ 0 ]) ].
         self appendTranscript: 'compiler (JIT) ', (JitOn ifTrue: [ 'ON' ] ifFalse: [ 'OFF (interpreting new methods)' ]).
+    ]
+    CocoaUI class >> breakOnBrowserSelection: setIt [
+        "DBG4 Break on Entry: plant (or clear) a breakpoint on Browser V2's
+         currently-selected method. The host parks it; the primary pump applies
+         it on its own thread and reports on the Transcript. A halt then opens
+         the Debugger tab the next time that method is entered."
+        | b2 cls sel svc |
+        b2 := Worker classNamed: #CocoaBrowser2.
+        b2 isNil ifTrue: [ ^self appendTranscript: 'debugger: Browser V2 not loaded' ].
+        cls := b2 selectedBreakpointClass.
+        sel := b2 selectedMethodName.
+        (cls isNil or: [ sel isNil ]) ifTrue: [
+            ^self appendTranscript: 'debugger: select a method in Browser V2 first' ].
+        "Build the host service directly (this file loads before CocoaBrowser,
+         so `CocoaBrowser hostService` would be a compile error here)."
+        svc := ((Cocoa classNamed: 'MacvmHostService') onMain alloc) onMain init.
+        setIt
+            ifTrue: [ svc onMain setBreakpointClass: cls selector: sel ]
+            ifFalse: [ svc onMain clearBreakpointClass: cls selector: sel ].
+        self appendTranscript: 'debugger: ', (setIt ifTrue: [ 'break on ' ] ifFalse: [ 'clear break on ' ]), cls, '>>', sel.
     ]
     CocoaUI class >> toggleHaltOnError [
         "Flip the DBG4 halt-on-error switch (host atomic; the primary's pump

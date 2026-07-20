@@ -86,3 +86,25 @@ pub fn send_command(line: String) {
         }
     }
 }
+
+/// Pending "Break on entry" / "Clear break" requests — `(class, selector,
+/// set?)`. Planting a breakpoint mutates the PRIMARY's VmState (pins the
+/// method to tier-0), so it must run on the primary's own thread; the host
+/// verb parks the request here and the supervisor pump applies it (the
+/// filein flag pattern).
+static PENDING_BREAKPOINTS: Mutex<Vec<(String, String, bool)>> = Mutex::new(Vec::new());
+
+/// Park a breakpoint request (`set` true = plant, false = clear).
+pub fn request_breakpoint(class: String, selector: String, set: bool) {
+    if let Ok(mut q) = PENDING_BREAKPOINTS.lock() {
+        q.push((class, selector, set));
+    }
+}
+
+/// Drain the pending requests — called by the supervisor pump each beat.
+pub fn take_breakpoints() -> Vec<(String, String, bool)> {
+    PENDING_BREAKPOINTS
+        .lock()
+        .map(|mut q| std::mem::take(&mut *q))
+        .unwrap_or_default()
+}

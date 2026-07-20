@@ -411,6 +411,23 @@ fn primary_generation_main(
         primary.set_halt_on_error(
             crate::debugger::HALT_ON_ERROR.load(std::sync::atomic::Ordering::Acquire),
         );
+        // DBG4 "Break on entry": apply any parked breakpoint requests HERE,
+        // on the primary's own thread (planting pins the method to tier-0).
+        for (class, sel, set) in crate::debugger::take_breakpoints() {
+            let r = if set {
+                primary.set_breakpoint_by_name(&class, &sel)
+            } else {
+                primary.clear_breakpoint_by_name(&class, &sel)
+            };
+            let note = match r {
+                Ok(m) => format!("debugger: {m}"),
+                Err(e) => format!("debugger: breakpoint FAILED — {e}"),
+            };
+            let _ = primary.exec(&format!(
+                "Transcript showCr: '{}'.",
+                crate::filein::escape_st(&note)
+            ));
+        }
         let beat = if crate::game::is_active() { 4 } else { PUMP_BEAT_MS };
         let _ = primary.exec(&format!("Worker pumpInbox: {beat}."));
         if let Some(step) = crate::game::poll_primary_step() {

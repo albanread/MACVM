@@ -1057,6 +1057,20 @@ impl VmHandle {
         self.vm.debug.halt_on_error = on;
     }
 
+    /// DBG4 "Break on entry": plant a breakpoint at `class>>selector` bci 0
+    /// (`class` may end in " class" for the metaclass side). Pins the method
+    /// to tier-0 so the dispatch hook fires. Runs on the primary's own thread
+    /// (the supervisor pump services the GUI's request). `Ok(msg)`/`Err(why)`.
+    pub fn set_breakpoint_by_name(&mut self, class: &str, selector: &str) -> Result<String, String> {
+        self.vm.debug.active = true;
+        crate::runtime::debug::set_breakpoint_by_name(&mut self.vm, class, selector, 0)
+    }
+
+    /// The clearing twin of [`set_breakpoint_by_name`].
+    pub fn clear_breakpoint_by_name(&mut self, class: &str, selector: &str) -> Result<String, String> {
+        crate::runtime::debug::clear_breakpoint_by_name(&mut self.vm, class, selector, 0)
+    }
+
     /// Registers how THIS vm spawns worker VMs (docs/multi-smalltalk-worker.md
     /// §3, workers M1) — the `GameSink` pattern: the CLI/tests pass a
     /// `VmHandle::boot(opts, world_dir)` closure, the GUI its image-boot path,
