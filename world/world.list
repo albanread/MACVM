@@ -84,6 +84,10 @@
 # ParallelMandel: the worker capstone — the MandelZoom dive computed in
 # parallel bands by N worker VMs, assembled + blitted by the primary (M4).
 48_parallelmandel.mst
+# Worms: a grid-based snake/light-cycle demo — you vs. two computer worms,
+# grow by eating fruit, die on any edge or any worm's body (docs/gamepane_
+# design.md, same GamePane engine as Breakout/MandelZoom).
+48a_worms.mst
 # Cocoa bridge C0-C3: ObjcRef (retained id in a GC-opaque byte tail), the
 # Cocoa facade, DNU dispatch, the main-thread hop + ObjcMainProxy
 # (docs/cocoa_bridge_design.md; prims 230-242). Fails cleanly headless.

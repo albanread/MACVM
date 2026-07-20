@@ -699,6 +699,7 @@ Object subclass: CocoaUI [
         pairs add: (Array with: 'Breakout' with: 'Breakout launch').
         pairs add: (Array with: 'MandelZoom' with: 'MandelZoom launch').
         pairs add: (Array with: 'Parallel Mandelbrot' with: 'ParallelMandel launch').
+        pairs add: (Array with: 'Worms' with: 'Worms launch').
         pairs do: [ :pair |
             | title entry item holder delegate |
             title := pair at: 1. entry := pair at: 2.
