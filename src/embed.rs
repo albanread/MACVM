@@ -563,6 +563,26 @@ impl VmHandle {
         }
     }
 
+    /// The decision at a native-fault recovery point (a recovered SIGSEGV/
+    /// SIGBUS — e.g. a bad `Alien` deref, S20), applying [`ErrorPolicy`]
+    /// exactly like [`handle_guest_fatal`]: the `siglongjmp` that landed us
+    /// here skipped every `Drop` just as a guest fatal's does, so Resume must
+    /// rewind to the clean idle baseline before returning the error — leaving
+    /// the aborted doit's frames/handle scopes/tier journal in place would
+    /// not merely leak, it would be captured as the new "clean" state by the
+    /// NEXT entry point's `snapshot_idle_baseline`, and a stale tier link or
+    /// anchor makes a later GC walk panic or touch freed native stack.
+    #[inline]
+    fn handle_native_fault(&mut self, sig: i32, pc: u64, far: u64) -> GuestError {
+        match self.error_policy {
+            ErrorPolicy::Resume => {
+                self.restore_after_guest_fatal();
+                GuestError::NativeFault { sig, pc, far }
+            }
+            ErrorPolicy::Die => crate::runtime::vm_state::fatal_exit(1),
+        }
+    }
+
     /// Rewind the VM to the last [`snapshot_idle_baseline`] after a guest-fatal
     /// `siglongjmp` landed on the recovery branch. The jump skipped every RAII
     /// `Drop` between the fault and here, so three things the aborted doit left
@@ -658,7 +678,7 @@ impl VmHandle {
         if rc != 0 {
             let (sig, pc, far) = deopt_trap::take_last_crash_info()
                 .expect("sigsetjmp returned nonzero without a recorded crash");
-            return Err(GuestError::NativeFault { sig, pc, far });
+            return Err(self.handle_native_fault(sig, pc, far));
         }
 
         // Capture the clean watermark before any guest code runs, so a
@@ -706,7 +726,7 @@ impl VmHandle {
         if rc != 0 {
             let (sig, pc, far) = deopt_trap::take_last_crash_info()
                 .expect("sigsetjmp returned nonzero without a recorded crash");
-            return Err(GuestError::NativeFault { sig, pc, far });
+            return Err(self.handle_native_fault(sig, pc, far));
         }
         // Capture the clean watermark before any guest code runs, so a
         // guest-fatal abort can rewind to exactly here (`restore_after_guest_fatal`).
@@ -849,7 +869,7 @@ impl VmHandle {
         if rc != 0 {
             let (sig, pc, far) = deopt_trap::take_last_crash_info()
                 .expect("sigsetjmp returned nonzero without a recorded crash");
-            return Err(GuestError::NativeFault { sig, pc, far });
+            return Err(self.handle_native_fault(sig, pc, far));
         }
         // Capture the clean watermark before any guest code runs, so a
         // guest-fatal abort can rewind to exactly here (`restore_after_guest_fatal`).
@@ -907,7 +927,7 @@ impl VmHandle {
         if rc != 0 {
             let (sig, pc, far) = deopt_trap::take_last_crash_info()
                 .expect("sigsetjmp returned nonzero without a recorded crash");
-            return Err(GuestError::NativeFault { sig, pc, far });
+            return Err(self.handle_native_fault(sig, pc, far));
         }
         // Capture the clean watermark before any guest code runs, so a
         // guest-fatal abort can rewind to exactly here (`restore_after_guest_fatal`).
@@ -952,7 +972,7 @@ impl VmHandle {
         if rc != 0 {
             let (sig, pc, far) = deopt_trap::take_last_crash_info()
                 .expect("sigsetjmp returned nonzero without a recorded crash");
-            return Err(GuestError::NativeFault { sig, pc, far });
+            return Err(self.handle_native_fault(sig, pc, far));
         }
         // Capture the clean watermark before any guest code runs, so a
         // guest-fatal abort can rewind to exactly here (`restore_after_guest_fatal`).
@@ -997,7 +1017,7 @@ impl VmHandle {
         if rc != 0 {
             let (sig, pc, far) = deopt_trap::take_last_crash_info()
                 .expect("sigsetjmp returned nonzero without a recorded crash");
-            return Err(GuestError::NativeFault { sig, pc, far });
+            return Err(self.handle_native_fault(sig, pc, far));
         }
         // Capture the clean watermark before any guest code runs, so a
         // guest-fatal abort can rewind to exactly here (`restore_after_guest_fatal`).
@@ -4794,6 +4814,65 @@ mod tests {
             }
 
             // And the VM is genuinely healthy afterward, not just clean-looking.
+            assert_eq!(vm.eval("6 * 7.").unwrap(), "42");
+        }
+    }
+
+    /// The same clean-baseline invariant as the previous test, but for a
+    /// recovered NATIVE fault (SIGSEGV via a bad `Alien` deref, the S20/S21
+    /// mechanism) arriving through `eval`/`exec` — not through
+    /// `dispatch_callback`, which always had its own restore. The native-fault
+    /// arm of the six ordinary entry points used to return
+    /// `Err(NativeFault)` WITHOUT `restore_after_guest_fatal`, so the aborted
+    /// doit's frames/handle scopes/tier journal survived the `siglongjmp` and
+    /// the NEXT eval's `snapshot_idle_baseline` captured the polluted state as
+    /// the new "clean" watermark — baking the leak in and (with a stale tier
+    /// link) arming a GC-walk panic. This pins the fix: after a recovered
+    /// native fault the VM is byte-for-byte back at the idle baseline, across
+    /// repeated faults, under both JIT modes, through both `eval` and `exec`.
+    #[test]
+    fn eval_recovers_to_a_clean_baseline_after_a_native_fault() {
+        for jit in [JitMode::Off, JitMode::Threshold(1)] {
+            let mut vm = boot_test_vm(jit);
+            vm.eval("3 + 4.").unwrap();
+            let base_sp = vm.vm.stack.sp;
+            let base_frame = vm.vm.stack.has_frame();
+            let base_arena = vm.vm.handle_arena.len();
+
+            // A deref of unmapped low memory: a genuine SIGSEGV outside the
+            // JIT code cache, recovered by the foreign-fault handler.
+            let bomb = "(Alien forAddress: 8 size: 8) byteAt: 1.";
+            for round in 0..3 {
+                let err = vm.eval(bomb).expect_err("the bad deref must Err");
+                assert!(
+                    matches!(err, GuestError::NativeFault { .. }),
+                    "jit={jit:?} round={round}: expected NativeFault, got {err:?}"
+                );
+                assert_eq!(
+                    vm.vm.stack.sp, base_sp,
+                    "jit={jit:?} round={round}: stack sp leaked after a native fault"
+                );
+                assert_eq!(
+                    vm.vm.stack.has_frame(),
+                    base_frame,
+                    "jit={jit:?} round={round}: a frame was left active"
+                );
+                assert_eq!(
+                    vm.vm.handle_arena.len(),
+                    base_arena,
+                    "jit={jit:?} round={round}: handle arena leaked"
+                );
+                assert!(
+                    vm.vm.tier_links.is_empty() && vm.vm.compiled_depth == 0,
+                    "jit={jit:?} round={round}: stale tier journal after recovery"
+                );
+                // `exec` shares the same arm; alternate it in.
+                let err = vm.exec(bomb).expect_err("exec's bad deref must Err");
+                assert!(matches!(err, GuestError::NativeFault { .. }));
+                assert_eq!(vm.vm.stack.sp, base_sp, "exec leaked stack");
+                assert_eq!(vm.vm.handle_arena.len(), base_arena, "exec leaked arena");
+            }
+
             assert_eq!(vm.eval("6 * 7.").unwrap(), "42");
         }
     }
