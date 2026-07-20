@@ -520,7 +520,7 @@ Print it does the same and inserts the result right after it."
             mainMenu := (Cocoa classNamed: 'NSMenu') onMain alloc onMain init.
             app onMain setMainMenu: mainMenu ].
 
-        #('Workspace' 'View' 'Theme' 'Demos' 'Debug') do: [ :title |
+        #('Workspace' 'File' 'Source' 'View' 'Theme' 'Demos' 'Debug') do: [ :title |
             | old |
             old := mainMenu onMain itemWithTitle: title.
             old isNil ifFalse: [ mainMenu onMain removeItem: old ] ].
@@ -540,10 +540,62 @@ Print it does the same and inserts the result right after it."
         wsItem onMain setSubmenu: wsMenu.
         mainMenu onMain addItem: wsItem.
 
+        self installFileMenuOn: mainMenu.
+        self installSourceMenuOn: mainMenu.
         self installViewMenuOn: mainMenu.
         self installThemeMenuOn: mainMenu.
         self installDemosMenuOn: mainMenu.
         self installDebugMenuOn: mainMenu.
+    ]
+
+    "── File + Source menus (the editor's file workflow): every item first
+       fronts the Editor view (building it lazily, exactly what the View menu
+       does), then acts on it. Open…/Save As… only FLAG a host panel — the
+       modal pump runs top-level in drain_perform, never in this callback. ──"
+    CocoaUI class >> editorDo: aBlock [
+        "Front the Editor and hand its CLASS to the one-arg block — late-bound
+         by NAME (this file compiles before 68_cocoaeditor; a bareword
+         CocoaEditor here is a compile error, the Debug menu's own rule)."
+        (Worker classNamed: #CocoaEditor) ifNotNil: [ :ec |
+            self switchToView: #editor.
+            aBlock value: ec ].
+    ]
+    CocoaUI class >> menu: aTitle on: mainMenu triples: someTriples [
+        "Build one submenu from {title. keyEquivalent. block} triples —
+         the Debug menu's own delegate wiring, factored."
+        | menu topItem |
+        menu := (Cocoa classNamed: 'NSMenu') onMain alloc onMain init.
+        someTriples do: [ :t |
+            | item holder delegate |
+            item := ((Cocoa classNamed: 'NSMenuItem') onMain alloc) onMain
+                initWithTitle: (t at: 1) action: 'macvmAction:' keyEquivalent: (t at: 2).
+            holder := CocoaToolbarAction on: (t at: 3).
+            delegate := MacvmDelegate actionTargetOn: holder.
+            item onMain setTarget: delegate.
+            menu onMain addItem: item.
+            ToolbarDelegates add: delegate ].
+        topItem := ((Cocoa classNamed: 'NSMenuItem') onMain alloc) onMain
+            initWithTitle: aTitle action: nil keyEquivalent: ''.
+        topItem onMain setSubmenu: menu.
+        mainMenu onMain addItem: topItem.
+        ^topItem
+    ]
+    CocoaUI class >> installFileMenuOn: mainMenu [
+        | triples |
+        triples := OrderedCollection new.
+        triples add: (Array with: 'New' with: 'n' with: [ self editorDo: [ :ec | ec fileNew ] ]).
+        triples add: (Array with: 'Open…' with: 'o' with: [ self editorDo: [ :ec | ec fileOpen ] ]).
+        triples add: (Array with: 'Save' with: 's' with: [ self editorDo: [ :ec | ec fileSave ] ]).
+        triples add: (Array with: 'Save As…' with: 'S' with: [ self editorDo: [ :ec | ec fileSaveAs ] ]).
+        triples add: (Array with: 'File In' with: '' with: [ self editorDo: [ :ec | ec fileIn ] ]).
+        self menu: 'File' on: mainMenu triples: triples.
+    ]
+    CocoaUI class >> installSourceMenuOn: mainMenu [
+        | triples |
+        triples := OrderedCollection new.
+        triples add: (Array with: 'Format' with: 'F' with: [ self editorDo: [ :ec | ec formatBuffer ] ]).
+        triples add: (Array with: 'Analyze' with: 'A' with: [ self editorDo: [ :ec | ec analyzeBuffer ] ]).
+        self menu: 'Source' on: mainMenu triples: triples.
     ]
 
     CocoaUI class >> installDemosMenuOn: mainMenu [

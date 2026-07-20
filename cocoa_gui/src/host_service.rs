@@ -765,6 +765,110 @@ extern "C" fn imp_set_jit_compile(_this: *mut c_void, _cmd: *mut c_void, flag: I
     std::ptr::null_mut()
 }
 
+/// `formatSource:` — Source ▸ Format: the comment/string-preserving
+/// re-indenter (`crate::format`). Pure text → text; the Smalltalk side swaps
+/// the buffer.
+extern "C" fn imp_format_source(_this: *mut c_void, _cmd: *mut c_void, text: Id) -> Id {
+    objc::nsstring(&crate::format::format_source(&ns_to_string(text)))
+}
+
+/// `analyzeSource:` — Source ▸ Analyze: the REAL compiler front end
+/// (`frontend::parser::parse_file`, the same gate `acceptEditorClass:` uses).
+/// Answers `OK` or `ERR <line> <col> <message>` (message newline-flattened) —
+/// the Smalltalk side reports it and marks/scrolls to the line.
+extern "C" fn imp_analyze_source(_this: *mut c_void, _cmd: *mut c_void, text: Id) -> Id {
+    match macvm::frontend::parser::parse_file(&ns_to_string(text)) {
+        Ok(_) => objc::nsstring("OK"),
+        Err(e) => objc::nsstring(&format!(
+            "ERR {} {} {}",
+            e.span.line,
+            e.span.col,
+            e.msg.replace('\n', " ")
+        )),
+    }
+}
+
+/// `markErrorStorage:line:` — paint an analyze error: clear any previous mark
+/// (whole-range background → clearColor), then, for `line` ≥ 1, background
+/// that line in translucent red. `line` `'0'` = clear only (an OK analyze).
+/// The colorize discipline: attribute-only mutations inside begin/endEditing,
+/// UTF-16 offsets, never moves the caret. Answers nil.
+extern "C" fn imp_mark_error_storage(
+    _this: *mut c_void,
+    _cmd: *mut c_void,
+    storage: Id,
+    line: Id,
+) -> Id {
+    if storage.is_null() {
+        return std::ptr::null_mut();
+    }
+    let line: u64 = ns_to_string(line).parse().unwrap_or(0);
+    let ns = objc::send0(storage, objc::sel("string"));
+    let text = ns_to_string(ns);
+    let total = objc::send0_int(ns, objc::sel("length")) as u64;
+
+    // UTF-16 start/len of 1-based line N.
+    let (mut off, mut start, mut len_line) = (0u64, 0u64, 0u64);
+    let mut cur = 1u64;
+    for ch in text.chars() {
+        let w = ch.len_utf16() as u64;
+        if cur == line {
+            if ch == '\n' {
+                break;
+            }
+            len_line += w;
+        } else if ch == '\n' {
+            cur += 1;
+            if cur == line {
+                start = off + w;
+            }
+        }
+        off += w;
+    }
+    if line == 1 {
+        start = 0;
+    }
+
+    let name_bg = objc::nsstring("NSBackgroundColor"); // NSBackgroundColorAttributeName
+    let nscolor = objc::get_class("NSColor");
+    let clear = objc::send0(nscolor as Id, objc::sel("clearColor"));
+    objc::send0(storage, objc::sel("beginEditing"));
+    objc::send_attr(storage, name_bg, clear, 0, total);
+    if line >= 1 && start < total && len_line > 0 {
+        let red = objc::send0(nscolor as Id, objc::sel("systemRedColor"));
+        let red = objc::send1_f64(red, objc::sel("colorWithAlphaComponent:"), 0.25);
+        let len = len_line.min(total - start);
+        objc::send_attr(storage, name_bg, red, start, len);
+    }
+    objc::send0(storage, objc::sel("endEditing"));
+    std::ptr::null_mut()
+}
+
+/// `fileInPath:` — File ▸ File In: park the path for the supervisor's primary
+/// pump, which runs `VmHandle::run_file` TOP-LEVEL on the primary's own
+/// thread (every top-level item, exactly `macvm run <file>`) — never a nested
+/// uiDoit. The outcome is reported through the primary's transcript
+/// forwarding. Answers nil.
+extern "C" fn imp_file_in_path(_this: *mut c_void, _cmd: *mut c_void, path: Id) -> Id {
+    crate::filein::request(ns_to_string(path));
+    std::ptr::null_mut()
+}
+
+/// `requestOpenPanel` / `requestSavePanel` — File ▸ Open… / Save As…: flag a
+/// modal panel for `drain_perform` (top-level, VM quiescent — a modal event
+/// pump must never spin inside this callback). The drain hands the chosen
+/// path back via `CocoaEditor openedPath:` / `savePathChosen:`. Answers nil.
+extern "C" fn imp_request_open_panel(_this: *mut c_void, _cmd: *mut c_void) -> Id {
+    crate::panels::request_open();
+    crate::objc::wake_main_runloop();
+    std::ptr::null_mut()
+}
+extern "C" fn imp_request_save_panel(_this: *mut c_void, _cmd: *mut c_void) -> Id {
+    crate::panels::request_save();
+    crate::objc::wake_main_runloop();
+    std::ptr::null_mut()
+}
+
 /// `requestBrowser2Refresh` — flag the V2 browser for a DB re-query and wake
 /// the run loop; serviced top-level by `drain_perform` (`CocoaBrowser2
 /// doRefresh`), never inside the calling callback — the view_refresh.rs
@@ -797,8 +901,14 @@ pub fn register() {
     type Imp2 = extern "C" fn(*mut c_void, *mut c_void, Id, Id) -> Id;
     type Imp3 = extern "C" fn(*mut c_void, *mut c_void, Id, Id, Id) -> Id;
     type Imp4 = extern "C" fn(*mut c_void, *mut c_void, Id, Id, Id, Id) -> Id;
-    let methods: [(&str, *const c_void, &str); 30] = [
+    let methods: [(&str, *const c_void, &str); 36] = [
         ("setJitCompile:", imp_set_jit_compile as Imp1 as *const c_void, "@@:@"),
+        ("formatSource:", imp_format_source as Imp1 as *const c_void, "@@:@"),
+        ("analyzeSource:", imp_analyze_source as Imp1 as *const c_void, "@@:@"),
+        ("markErrorStorage:line:", imp_mark_error_storage as Imp2 as *const c_void, "@@:@@"),
+        ("fileInPath:", imp_file_in_path as Imp1 as *const c_void, "@@:@"),
+        ("requestOpenPanel", imp_request_open_panel as Imp0 as *const c_void, "@@:"),
+        ("requestSavePanel", imp_request_save_panel as Imp0 as *const c_void, "@@:"),
         ("requestUiRebuild", imp_request_ui_rebuild as Imp0 as *const c_void, "@@:"),
         ("requestPrimaryRestart", imp_request_primary_restart as Imp0 as *const c_void, "@@:"),
         ("requestBrowserRefresh", imp_request_browser_refresh as Imp0 as *const c_void, "@@:"),

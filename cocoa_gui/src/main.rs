@@ -14,9 +14,12 @@ mod boot;
 mod canvas;
 mod colorize;
 mod control;
+mod filein;
+mod format;
 mod game;
 mod host_service;
 mod objc;
+mod panels;
 mod primary_restart;
 mod rebuild;
 mod snapshot;
@@ -194,6 +197,27 @@ extern "C" fn drain_perform(info: *mut c_void) {
     }
     if find_query_due {
         let _ = st.ui.exec("CocoaFind doFindQuery.");
+    }
+
+    // File ▸ Open… / Save As… (panels.rs): run the modal panel HERE — main
+    // thread, VM quiescent, never inside the menu callback that asked — then
+    // hand the chosen path back with a fresh top-level exec. Cancel = no-op.
+    let (open_due, save_due) = panels::take_requests();
+    if open_due {
+        if let Some(path) = panels::run_open_panel() {
+            let _ = st.ui.exec(&format!(
+                "CocoaEditor openedPath: '{}'.",
+                filein::escape_st(&path)
+            ));
+        }
+    }
+    if save_due {
+        if let Some(path) = panels::run_save_panel() {
+            let _ = st.ui.exec(&format!(
+                "CocoaEditor savePathChosen: '{}'.",
+                filein::escape_st(&path)
+            ));
+        }
     }
 
     while let Some(link) = st.supervisor.poll_resync() {

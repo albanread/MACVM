@@ -17,7 +17,8 @@
  does not drive it."
 
 Object subclass: CocoaEditor [
-    <classVars: Container Picker Buffer BufferScroll ActionDelegates BufferDelegate LastProbe>
+    <classVars: Container Picker Buffer BufferScroll ActionDelegates BufferDelegate LastProbe
+                CurrentPath>
 
     CocoaEditor class >> stripHeight [ ^36.0 ]
 
@@ -167,6 +168,105 @@ shape change takes effect on the next launch)."'
     ]
     CocoaEditor class >> notePrimary: r [
         CocoaUI appendTranscript: 'editor: primary VM <- ' , r.
+    ]
+
+    "── the File menu: work on a USER FILE of classes (open/edit/save/file-in).
+       Disk I/O is CocoaFile (world/49a — UTF-8 slurp/spit, direct bridge send,
+       fine on the UI worker). Open…/Save As… go through the HOST's panel
+       flags (a modal panel must never spin inside this menu callback —
+       panels.rs runs it top-level and calls back openedPath:/savePathChosen:).
+       File In parks the path with the host; the supervisor's primary pump runs
+       the file TOP-LEVEL on the primary (VmHandle::run_file — every item,
+       exactly `macvm run <file>`), and the outcome lands on the Transcript. ──"
+    CocoaEditor class >> currentPath [ ^CurrentPath ]
+    CocoaEditor class >> fileNew [
+        CurrentPath := nil.
+        self setBufferText: '"New file — write classes here, then File > Save / File In."'.
+        CocoaUI appendTranscript: 'editor: new file'.
+    ]
+    CocoaEditor class >> fileOpen [ CocoaBrowser hostService onMain requestOpenPanel ]
+    CocoaEditor class >> openedPath: aPath [
+        | text |
+        text := CocoaFile slurp: aPath.
+        text isNil ifTrue: [ ^CocoaUI appendTranscript: 'editor: cannot read ', aPath ].
+        CurrentPath := aPath.
+        self setBufferText: text.
+        CocoaUI appendTranscript: 'editor: opened ', aPath.
+    ]
+    CocoaEditor class >> fileSave [
+        CurrentPath isNil ifTrue: [ ^self fileSaveAs ].
+        (CocoaFile spit: CurrentPath contents: self bufferText)
+            ifTrue: [ CocoaUI appendTranscript: 'editor: saved ', CurrentPath ]
+            ifFalse: [ CocoaUI appendTranscript: 'editor: SAVE FAILED — ', CurrentPath ].
+    ]
+    CocoaEditor class >> fileSaveAs [ CocoaBrowser hostService onMain requestSavePanel ]
+    CocoaEditor class >> savePathChosen: aPath [
+        CurrentPath := aPath.
+        self fileSave.
+    ]
+    CocoaEditor class >> fileInScratchPath [ ^'/tmp/macvm-editor-filein.mst' ]
+    CocoaEditor class >> fileIn [
+        "Write the buffer to its file (or a scratch path when unsaved), then
+         hand the path to the host — the primary runs it top-level."
+        | path text |
+        text := self bufferText.
+        (text isNil or: [ text isEmpty ]) ifTrue: [ ^self ].
+        path := CurrentPath isNil ifTrue: [ self fileInScratchPath ] ifFalse: [ CurrentPath ].
+        (CocoaFile spit: path contents: text)
+            ifFalse: [ ^CocoaUI appendTranscript: 'editor: cannot write ', path ].
+        CocoaBrowser hostService onMain fileInPath: path.
+        CocoaUI appendTranscript: 'editor: file-in requested — ', path.
+    ]
+
+    "── the Source menu: Format (host re-indenter, comment/string-preserving)
+       and Analyze (the REAL compiler parser; an error marks + scrolls to the
+       offending line). ──"
+    CocoaEditor class >> formatBuffer [
+        | reply |
+        Buffer isNil ifTrue: [ ^self ].
+        reply := CocoaBrowser readReply: (CocoaBrowser hostService onMain formatSource: self bufferText).
+        reply isEmpty ifFalse: [ self setBufferText: reply ].
+        CocoaUI appendTranscript: 'editor: formatted'.
+    ]
+    CocoaEditor class >> analyzeBuffer [
+        | reply parts line |
+        Buffer isNil ifTrue: [ ^self ].
+        reply := CocoaBrowser readReply: (CocoaBrowser hostService onMain analyzeSource: self bufferText).
+        (CocoaBrowser isOk: reply) ifTrue: [
+            self markLine: '0'.
+            ^CocoaUI appendTranscript: 'editor: syntax OK' ].
+        "ERR <line> <col> <message>"
+        parts := CocoaBrowser tokensOf: reply.
+        line := parts size >= 2 ifTrue: [ parts at: 2 ] ifFalse: [ '0' ].
+        self markLine: line.
+        self scrollToLine: line.
+        CocoaUI appendTranscript: 'editor: syntax error @ line/col ', (CocoaBrowser errorOf: reply).
+    ]
+    CocoaEditor class >> markLine: aLineString [
+        "Host-side error mark: clears any previous mark, then (line >= 1)
+         backgrounds that line translucent red. '0' = clear only."
+        | ts |
+        Buffer isNil ifTrue: [ ^self ].
+        ts := Buffer onMain textStorage.
+        ts isNil ifTrue: [ ^self ].
+        CocoaBrowser hostService onMain markErrorStorage: ts line: aLineString.
+        ts release.
+    ]
+    CocoaEditor class >> scrollToLine: aLineString [
+        "Put the caret at the start of 1-based line N and scroll it visible.
+         (Char offsets; UTF-16 drift on heavy non-ASCII source is tolerable —
+         the red mark itself is host-computed and exact.)"
+        | n text pos cur lf i |
+        n := 0.
+        aLineString do: [ :ch | (ch value between: 48 and: 57) ifTrue: [ n := n * 10 + (ch value - 48) ] ].
+        n < 1 ifTrue: [ ^self ].
+        text := self bufferText.
+        pos := 0. cur := 1. lf := Character value: 10. i := 1.
+        [ i <= text size and: [ cur < n ] ] whileTrue: [
+            (text at: i) = lf ifTrue: [ cur := cur + 1. pos := i ].
+            i := i + 1 ].
+        Buffer onMain setSelectedRange: (Array with: pos with: 0).
+        Buffer onMain scrollRangeToVisible: (Array with: pos with: 0).
     ]
 
     "── recolour (host-side; fires on load and on every native edit) ──"

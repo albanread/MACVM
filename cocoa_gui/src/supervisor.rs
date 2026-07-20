@@ -401,6 +401,20 @@ fn primary_generation_main(
         if let Some(step) = crate::game::poll_primary_step() {
             let _ = primary.exec(&step);
         }
+        // File ▸ File In (filein.rs): run the user's .mst HERE — the primary's
+        // own thread, between top-level entries — via run_file (every
+        // top-level item, exactly `macvm run <file>`). The outcome rides the
+        // primary's transcript forwarding back to the UI Transcript view.
+        if let Some(path) = crate::filein::take() {
+            let note = match primary.run_file(std::path::Path::new(&path)) {
+                Ok(()) => format!("file-in: loaded {path}"),
+                Err(e) => format!("file-in FAILED: {}", e.msg),
+            };
+            let _ = primary.exec(&format!(
+                "Transcript showCr: '{}'.",
+                crate::filein::escape_st(&note)
+            ));
+        }
     }
 }
 
