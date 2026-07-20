@@ -4964,6 +4964,74 @@ mod tests {
         }
     }
 
+    /// FFI hardening (2026-07 review follow-up): every guest-reachable
+    /// mistake in a hand-authored `<primitive: FFI …>` pragma — a typo'd
+    /// symbol name, an unsupported declared shape token, a Tier-2 selector
+    /// pragma with no runtime yet — used to `panic!` in
+    /// `dispatch_ffi_primitive`, taking the whole embedding host down for
+    /// a Workspace-level error. They now raise GUEST fatals: the eval
+    /// answers `Err` with the named cause, and the same VM keeps serving.
+    /// (The old `#[should_panic]` gates in `runtime/ffi.rs` moved here —
+    /// a bare test VM has no jmp slot and cannot observe the recovery.)
+    #[test]
+    fn ffi_guest_mistakes_recover_as_errors_not_host_panics() {
+        let mut vm = boot_test_vm(JitMode::Off);
+
+        // (1) A typo'd function name — the everyday case.
+        vm.exec(
+            "Object subclass: FfiTypo [ \
+               FfiTypo class >> go [ <primitive: FFI function: #noSuchSymbolXyzzyQ ret: #g args: #()> ] ]",
+        )
+        .expect("the pragma compiles fine — the typo only surfaces at call time");
+        let err = vm
+            .eval("FfiTypo go.")
+            .expect_err("a typo'd symbol must Err, not kill the host");
+        assert!(
+            format!("{err}").contains("no symbol named \"noSuchSymbolXyzzyQ\""),
+            "the error must name the missing symbol, got: {err}"
+        );
+        assert_eq!(vm.eval("6 * 7.").unwrap(), "42", "the VM must keep serving");
+
+        // (2) An unsupported return-shape token (struct/HFA, no trampoline).
+        vm.exec(
+            "Object subclass: FfiBadRet [ \
+               FfiBadRet class >> go [ <primitive: FFI function: #getpid ret: #h4 args: #()> ] ]",
+        )
+        .expect("compiles");
+        let err = vm.eval("FfiBadRet go.").expect_err("h4 must Err");
+        assert!(
+            format!("{err}").contains("unsupported return-shape token \"h4\""),
+            "must name the token, got: {err}"
+        );
+
+        // (3) A Tier-2 (`selector:`) pragma — no runtime support yet.
+        vm.exec(
+            "Object subclass: FfiTier2 [ \
+               frame [ <primitive: FFI selector: #frame class: #NSView ret: #h4> ] ]",
+        )
+        .expect("compiles");
+        let err = vm.eval("FfiTier2 new frame.").expect_err("Tier 2 must Err");
+        assert!(
+            format!("{err}").contains("Tier 2"),
+            "must name the missing tier, got: {err}"
+        );
+
+        // (4) An unsupported argument-shape token.
+        vm.exec(
+            "Object subclass: FfiBadArg [ \
+               FfiBadArg class >> go: x [ <primitive: FFI function: #abs ret: #g args: #(s)> ] ]",
+        )
+        .expect("compiles");
+        let err = vm.eval("FfiBadArg go: 3.").expect_err("arg token s must Err");
+        assert!(
+            format!("{err}").contains("unsupported argument-shape token \"s\""),
+            "must name the token, got: {err}"
+        );
+
+        // After all four recovered guest fatals: still byte-for-byte alive.
+        assert_eq!(vm.eval("3 + 4.").unwrap(), "7");
+    }
+
     #[test]
     fn error_policy_defaults_to_resume_and_round_trips() {
         let mut vm = boot_test_vm(JitMode::Off);

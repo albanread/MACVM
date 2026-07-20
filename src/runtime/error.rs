@@ -157,6 +157,43 @@ pub fn dnu_fallback(vm: &mut VmState, selector: SymbolOop, receiver_klass: Klass
     crate::codecache::deopt_trap::raise_guest_fatal(message);
 }
 
+/// A fatal GUEST-level error raised from Rust runtime code — the same
+/// recipe as [`dnu_fallback`] (report + stack trace, debugger error-halt
+/// hook, probe dossier when the condition is about to end the process,
+/// curtailment blocks, `raise_guest_fatal`), packaged for call sites
+/// outside the send path. An embedded `VmHandle` recovers it as an
+/// ordinary `Err` and the VM keeps serving; plain CLI use stays fatal
+/// (exit 1) with the message and walkback already printed.
+///
+/// Use this for conditions the GUEST program caused — a typo'd symbol in a
+/// hand-authored FFI pragma, an unsupported declared shape token — where a
+/// silent `Fallthrough` would masquerade as success (an FFI method's body
+/// is empty) but a Rust `panic!` would take down the whole embedding host
+/// for a Workspace-level mistake. VM invariant violations stay `panic!`.
+pub fn guest_fatal(vm: &mut VmState, message: String) -> ! {
+    let _ = writeln!(vm.out, "{message}");
+    print_stack_trace(vm);
+    let _ = vm.out.flush();
+    if crate::runtime::debug::wants_error_halt(vm) {
+        if let Some(m) = vm.regs.method {
+            let bci = vm.regs.bci;
+            crate::runtime::debug::halt(
+                vm,
+                m,
+                bci,
+                crate::runtime::debug::HaltReason::GuestError(message.clone()),
+            );
+        }
+    }
+    if !crate::codecache::deopt_trap::has_registered_jmp_slot()
+        && crate::runtime::probe::guest_report_enabled()
+    {
+        crate::runtime::probe::fatal_guest_report(vm, &message);
+    }
+    crate::interpreter::unwind::run_curtailment_blocks_on_error(vm);
+    crate::codecache::deopt_trap::raise_guest_fatal(message);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

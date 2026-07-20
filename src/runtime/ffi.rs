@@ -33,16 +33,22 @@
 //!     codebase (`runtime::primitives`) treats that class of problem as
 //!     `PrimitiveOutcome::Fallthrough` — never a Rust panic. This module
 //!     follows the same convention.
-//!   - **Missing runtime/feature support** (an ABI shape token with no
-//!     trampoline yet, Tier 2 Cocoa dispatch, a symbol that fails to
-//!     resolve for a `ffi_gen`-generated binding) is "a well-formed,
-//!     correctly-compiled program reached a path with no runtime support
-//!     behind it yet" — the same class of situation `try_primitive`
-//!     itself already `panic!`s on for an unknown primitive id. This
-//!     module panics for exactly that class too, with a message naming
-//!     the missing piece, rather than silently `Fallthrough`ing (which,
+//!   - **Missing runtime/feature support or a bad binding** (an ABI shape
+//!     token with no trampoline yet, Tier 2 Cocoa dispatch, a symbol that
+//!     fails to resolve, a return value no oop can represent) fails LOUD,
+//!     naming the missing piece — never a silent `Fallthrough` (which,
 //!     for an FFI pragma whose generated method body is otherwise EMPTY,
 //!     would return the receiver and look exactly like quiet success).
+//!     But loud at the GUEST level (`error::guest_fatal`: message + stack
+//!     trace + debugger/probe hooks, then a guest-fatal raise an embedded
+//!     `VmHandle` recovers as an ordinary `Err`), NOT a Rust `panic!`:
+//!     every one of these conditions is reachable from a hand-authored
+//!     pragma in ordinary Smalltalk source (all of world/61's Posix
+//!     surface is hand-authored; a Workspace typo in a `function:` name
+//!     lands exactly on the dlsym arm), and a Workspace-level mistake
+//!     must cost that doit, not the whole embedding host. Genuine VM
+//!     invariants (the compiler-built descriptor's own shape) stay
+//!     `expect`/`panic!`.
 
 use crate::interpreter::send::PrimitiveOutcome;
 use crate::memory::alloc;
@@ -93,11 +99,18 @@ pub(crate) fn dispatch_ffi_primitive(vm: &mut VmState, m: MethodOop, argc: u8) -
         // argument, a Tier-2 pragma's generated method body is EMPTY
         // besides the pragma itself, so a silent `Fallthrough` here would
         // return the receiver and look exactly like the send succeeded
-        // while doing nothing whatsoever. Loud failure, naming why.
-        panic!(
-            "runtime::ffi::dispatch_ffi_primitive: Tier 2 FFI dispatch (kind {kind:?}, selector \
-             {name:?}) isn't implemented yet — S20 step 7",
-            name = sym_text(desc.at(DESC_NAME)),
+        // while doing nothing whatsoever. Loud failure, naming why — but a
+        // GUEST-fatal one, not a Rust panic: a Tier-2 pragma compiles from
+        // ordinary Smalltalk source, so reaching here is a guest program's
+        // doing, and it must cost that guest's doit, not the whole
+        // embedding host (`error::guest_fatal`'s contract).
+        crate::runtime::error::guest_fatal(
+            vm,
+            format!(
+                "FFI: Tier 2 dispatch (kind {kind:?}, selector {name:?}) isn't implemented yet \
+                 — S20 step 7",
+                name = sym_text(desc.at(DESC_NAME)),
+            ),
         );
     }
     let name = sym_text(desc.at(DESC_NAME));
@@ -107,11 +120,17 @@ pub(crate) fn dispatch_ffi_primitive(vm: &mut VmState, m: MethodOop, argc: u8) -
         "g" => crate::codecache::ffi_stubs::FfiRetClass::G,
         "f" => crate::codecache::ffi_stubs::FfiRetClass::F,
         "v" => crate::codecache::ffi_stubs::FfiRetClass::V,
-        other => panic!(
-            "runtime::ffi::dispatch_ffi_primitive: unsupported FFI return-shape token {other:?} \
-             for function {name:?} — only \"g\"/\"f\"/\"v\" have a trampoline \
-             (codecache/ffi_stubs.rs's FfiRetClass); struct/HFA return shapes (h2/h3/h4/i1/i2/b/s) \
-             are Tier 2/deferred territory (docs/FFI.md §3)"
+        // A declared shape with no trampoline. The token comes straight
+        // from guest source (`ret: #h2` parses fine), so this is a guest
+        // mistake/unsupported-feature report, not a VM invariant — fatal
+        // to the DOIT (recoverable when embedded), never a host panic.
+        other => crate::runtime::error::guest_fatal(
+            vm,
+            format!(
+                "FFI: unsupported return-shape token {other:?} for function {name:?} — only \
+                 \"g\"/\"f\"/\"v\" have a trampoline; struct/HFA return shapes (h2/h3/h4/i1/i2/\
+                 b/s) are Tier 2/deferred territory (docs/FFI.md §3)"
+            ),
         ),
     };
 
@@ -182,11 +201,15 @@ pub(crate) fn dispatch_ffi_primitive(vm: &mut VmState, m: MethodOop, argc: u8) -
                 argv_f[next_f] = word;
                 next_f += 1;
             }
-            other => panic!(
-                "runtime::ffi::dispatch_ffi_primitive: unsupported FFI argument-shape token \
-                 {other:?} (arg #{i} of function {name:?}) — only \"g\"/\"f\" have a marshaling \
-                 path today; struct/HFA argument shapes are Tier 2/deferred territory \
-                 (docs/FFI.md §3)"
+            // Same class as the return-shape case above: a guest-declared
+            // token with no marshaling path — guest-fatal, not a panic.
+            other => crate::runtime::error::guest_fatal(
+                vm,
+                format!(
+                    "FFI: unsupported argument-shape token {other:?} (arg #{i} of function \
+                     {name:?}) — only \"g\"/\"f\" have a marshaling path today; struct/HFA \
+                     argument shapes are Tier 2/deferred territory (docs/FFI.md §3)"
+                ),
             ),
         }
     }
@@ -209,19 +232,22 @@ pub(crate) fn dispatch_ffi_primitive(vm: &mut VmState, m: MethodOop, argc: u8) -
     // not an oversight: this step's brief is "make the pragma callable at
     // all", and `dlsym` against the process-global namespace (`RTLD_
     // DEFAULT`, via `lib: None`) is correct and cheap enough for now.
-    let target =
-        crate::vendor::wfasm::native_macos::dlsym_resolve(None, &name).unwrap_or_else(|| {
-            // A `ffi_gen`-generated binding names only functions verified
-            // to exist in the real ABI database (docs/FFI.md) — resolution
-            // failing here means the process environment itself is wrong
-            // (missing library, stripped symbol), not a Smalltalk-level
-            // data problem. Loud failure, naming the symbol.
-            panic!(
-                "runtime::ffi::dispatch_ffi_primitive: dlsym_resolve found no symbol named \
-                 {name:?} in the process-global namespace (RTLD_DEFAULT) — a ffi_gen-generated \
-                 binding should never name a function that doesn't exist in this process"
-            )
-        });
+    let Some(target) = crate::vendor::wfasm::native_macos::dlsym_resolve(None, &name) else {
+        // A `ffi_gen`-generated binding names only functions verified to
+        // exist in the real ABI database (docs/FFI.md) — but bindings are
+        // also HAND-authored every day (all of world/61's Posix surface, a
+        // Workspace experiment), and a typo'd symbol name lands exactly
+        // here on first call. That is a guest-program mistake: loud, named,
+        // fatal to the doit — and recoverable when embedded, instead of a
+        // Rust panic taking down the whole GUI for a misspelled binding.
+        crate::runtime::error::guest_fatal(
+            vm,
+            format!(
+                "FFI: dlsym found no symbol named {name:?} in the process-global namespace \
+                 (RTLD_DEFAULT) — check the function: name in the pragma"
+            ),
+        );
+    };
 
     let result = vm.ffi_stubs.invoke(ret_class, target, &argv_g, &argv_f);
 
@@ -238,19 +264,20 @@ pub(crate) fn dispatch_ffi_primitive(vm: &mut VmState, m: MethodOop, argc: u8) -
                 // On real macOS/arm64 (48-bit-or-smaller user virtual
                 // address space) every real POSIX return value — pointers,
                 // fds, error sentinels like -1 — always fits an SMI's
-                // 61-bit magnitude; this is not expected to ever fire for
-                // a real call. There is no BigInt/LargeInteger oop wrapper
-                // anywhere in this codebase yet (only an AST-level
-                // `Literal::BigInt` exists, no runtime oop), so there is
-                // no graceful fallback available — and silently truncating
-                // would corrupt a real returned pointer/value far worse
-                // than a loud crash. Internal invariant violation, not
-                // user-recoverable Smalltalk-level data: panic, don't
-                // truncate.
-                panic!(
-                    "runtime::ffi::dispatch_ffi_primitive: function {name:?}'s \"g\" return \
-                     value {signed} overflows SmallInt's range ({SMI_MIN}..={SMI_MAX}) — no \
-                     BigInt/LargeInteger oop exists yet to fall back to"
+                // 61-bit magnitude. But a HAND-authored binding can name a
+                // function whose full-width u64 return genuinely overflows
+                // (strtoull of user data, a hash), so this is
+                // guest-reachable, not "can't happen". Silently truncating
+                // would corrupt the value far worse than failing loud — but
+                // the loud failure belongs to the GUEST's doit (recoverable
+                // when embedded), not to the host process.
+                crate::runtime::error::guest_fatal(
+                    vm,
+                    format!(
+                        "FFI: function {name:?}'s \"g\" return value {signed} overflows \
+                         SmallInt's range ({SMI_MIN}..={SMI_MAX}) — no BigInt/LargeInteger oop \
+                         exists yet to fall back to"
+                    ),
                 );
             }
             PrimitiveOutcome::Result(SmallInt::new(signed).oop())
@@ -526,50 +553,13 @@ mod tests {
         }
     }
 
-    /// Unsupported ret-class token (`"h4"`, a struct/HFA return shape with
-    /// no trampoline yet) must panic, naming the token — "feature doesn't
-    /// exist yet", not "bad Smalltalk data".
-    #[test]
-    #[should_panic(expected = "unsupported FFI return-shape token \"h4\"")]
-    fn ffi_unsupported_ret_token_panics() {
-        let mut vm = test_vm();
-        let klass = test_klass(&mut vm, "FFIUnsupportedRet");
-        let mut method = first_method_of(
-            "Object subclass: FFIUnsupportedRet [ \
-                frame [ <primitive: FFI selector: #frame class: #NSView ret: #h4> ] \
-            ]",
-        );
-        // This particular pragma is `kind: #selector` (Tier 2) by
-        // construction (`ret: #h4` only ever shows up on a Tier 2 shape in
-        // practice) — force it to `#function` so the ret-token check (not
-        // the earlier Tier-2 check) is what actually fires, isolating
-        // exactly the panic this test means to name.
-        let m = compile_method(&mut vm, klass, false, &mut method).expect("compile");
-        let desc = m.literals();
-        let function_sym = vm.universe.intern(b"function").oop();
-        desc.at_put(DESC_KIND, function_sym);
-        let nil = vm.universe.nil_obj;
-        let _ = run_method(&mut vm, m, nil, &[]);
-    }
-
-    /// `kind: #selector` (Tier 2 Cocoa dispatch) has no runtime support
-    /// yet (S20 step 7) — must panic, naming why, rather than silently
-    /// `Fallthrough`ing and returning the receiver as if it had succeeded.
-    #[test]
-    #[should_panic(expected = "Tier 2 FFI dispatch")]
-    fn ffi_tier2_selector_kind_panics() {
-        let mut vm = test_vm();
-        let nil = vm.universe.nil_obj;
-        let _ = compile_and_run(
-            &mut vm,
-            "FFITier2",
-            "Object subclass: FFITier2 [ \
-                frame [ <primitive: FFI selector: #frame class: #NSView ret: #h4> ] \
-            ]",
-            nil,
-            &[],
-        );
-    }
+    // The unsupported-shape / Tier-2 / typo'd-symbol paths were once
+    // `#[should_panic]` tests here; they now raise a GUEST fatal
+    // (`error::guest_fatal` — recoverable when embedded, `fatal_exit` in
+    // plain CLI use), which a bare `test_vm()` cannot observe without
+    // killing the test process. Their gates live in `embed::tests`
+    // (`ffi_guest_mistakes_recover_as_errors_not_host_panics`), where the
+    // recovery contract they now follow is the very thing under test.
 
     // A `ret: #v` end-to-end `.mst`-level test is deliberately deferred:
     // there is no side-effect-observable, pointer-free void libc function
