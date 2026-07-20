@@ -24,6 +24,17 @@
    Kqueue       — watch/unwatch fds, poll events; the readiness engine the
                   slice-B IoWorker event loop is built on"
 
+"I am the raw POSIX face: fixed-arity libc bindings on my class side —
+ kqueue/kevent, read/write/close, pipe, sockets (socket, bind, listen,
+ accept, connect), mmap, open/creat/lseek/unlink. Variadic C functions
+ cannot be called through the FFI, so anything needing one (fcntl, open
+ with a creation mode) is unavailable or covered by a fixed-arity twin
+ such as creat. There are no exceptions here: every call answers the C
+ return code, and `Posix errno` reads the error number after a failure.
+ Buffer, path and struct arguments are raw addresses — stage them in a
+ NativeBuffer, never a heap object. Conveniences build loopback TCP
+ sockets on kernel-assigned ports: tcpListenLoopback:, tcpConnectLoopback:,
+ boundPortOf:, acceptOn:."
 Object subclass: Posix [
     <classVars: Scratch>
     "── raw bindings — every one fixed-arity (no variadic tail) ──"
@@ -94,6 +105,14 @@ Object subclass: Posix [
     ]
 ]
 
+"I wrap one 4096-byte page of mmap-allocated memory whose address is
+ stable under the moving garbage collector — the memory you hand to a
+ syscall that reads or writes it. `address` answers the raw address for
+ pointer arguments; byteAt:, u16At:, u32At:, i64At: (0-based offsets,
+ little-endian, with put: variants) read and write fields. I also pack and
+ unpack the kernel structs the I/O layer needs: kevent entries, timespec
+ timeouts, and sockaddr_in (network byte order). Get one with
+ NativeBuffer page; pages are never unmapped."
 Object subclass: NativeBuffer [
     | addr alien |
     NativeBuffer class >> page [ ^self basicNew initPage ]
@@ -251,6 +270,15 @@ Object subclass: Posix [
  is what the IoWorker's wake rides on (world/62). Since worker VMs share
  one fd table, `Kqueue onFd:` lets another VM poke the SAME kernel kqueue
  through its own handle."
+"I watch file descriptors for readiness through a kqueue. Register fds
+ with watchRead: / watchWrite: (and the matching unwatch calls), then poll
+ with pollMs: or pollForever. A poll answers an Array of events, each
+ {ident. filter. data. flags} — data is the readable byte count, writable
+ space, or pending-connection backlog, which is what makes bounded I/O on
+ ordinary blocking fds safe. registerUserEvent / triggerUserEvent give any
+ thread holding the fd a latching wakeup that ends an infinite sleep and
+ never loses a poke. Kqueue onFd: wraps a kqueue made by another VM (file
+ descriptors are process-wide); close closes mine."
 Object subclass: Kqueue [
     | kq buf |
     Kqueue class >> new [ ^self basicNew init ]
@@ -361,6 +389,15 @@ Object subclass: Posix [
  serial and the path is consumed by open() before any read/write touches the
  page. A file whose open fails answers nil (errno via `Posix errno`), matching
  the return-code discipline of the rest of this file (MACVM has no exceptions)."
+"I am a file descriptor wrapped as an object — the low-level, byte-exact
+ half of the file surface (CocoaFile is the encoding-aware half). Open me
+ with openForRead: or createForWrite: (each answers nil on failure; Posix
+ errno says why), then readInto:count:, writeFrom:count:, seekTo:from:,
+ sizeInBytes, readAll, writeAll:, and close. The class-side conveniences
+ do it all in one call: slurp: answers a whole file as a String (its bytes
+ verbatim, treated as the UTF-8 they already are) or nil; spit:contents:
+ writes a String and answers the byte count or nil; exists: and delete:
+ round out the surface. Failures are return values, never raises."
 Object subclass: PosixFile [
     | fd |
     <classVars: Scratch>

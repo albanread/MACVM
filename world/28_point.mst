@@ -25,6 +25,13 @@ nil subclass: Object [
     ]
 ]
 
+"I represent a position or extent on a plane as an x and a y coordinate.
+ Create me with the @ operator: 3 @ 4. Arithmetic (+, -, *, /, //) works
+ coordinatewise against another Point, and my comparisons answer true only
+ when BOTH coordinates satisfy the relation, so p < q and q < p can both
+ be false. Other protocol: min:, max:, abs, negated, floor, rounded,
+ truncated, truncateTo:, dist: (Euclidean distance), dotProduct:,
+ translatedBy:, and relativeTo:. I print myself as x@y."
 Object subclass: Point [
     | x y |
 

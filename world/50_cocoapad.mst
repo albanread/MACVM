@@ -11,6 +11,13 @@
  programmatic NSWindow defaults to releasing itself on close, which would
  double-free under our wrapper's own +1. Repeated launches release the
  previous window's chain first (idempotent demo, no wrapper leaks)."
+"I am a small demonstration of the Objective-C bridge: a native window with
+ a text field and a button, built entirely from Smalltalk. The button's
+ target/action is a Smalltalk block, so a click drives guest code, which
+ answers by updating the field through AppKit again. `launch` builds (or
+ rebuilds) the window; `teardown` releases it. Launched from the Demos
+ menu; headless, the first send fails cleanly — there is no AppKit run
+ loop to reach."
 Object subclass: CocoaPad [
     <classVars: Win Field Btn Act Count>
 

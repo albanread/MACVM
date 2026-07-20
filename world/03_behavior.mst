@@ -3,6 +3,12 @@
  1 format, 2 non_indexable_size, 3 superclass, 4 methods, 5 name,
  6 inst_var_names, 7 class_vars, 8 mixin."
 
+"I am the abstract superclass of Class and Metaclass — the objects that
+ describe other objects. I know my name, superclass and instVarNames, I
+ make instances with new and new: (for indexable classes), and I answer
+ inheritance questions with inheritsFrom:. Every object reaches me
+ through its class, e.g. anObject class name."
+
 Object subclass: Behavior [
     name [
         ^self instVarAt: 5
@@ -29,8 +35,18 @@ Object subclass: Behavior [
     ]
 ]
 
+"I represent an ordinary class: Object, String and every class you
+ define are my instances. All of my useful behavior — name, superclass,
+ new, new:, inheritsFrom: — is inherited from Behavior; I exist so that
+ classes proper can be told apart from metaclasses."
+
 Behavior subclass: Class [
 ]
+
+"I represent the class of a class. Each class has its own metaclass,
+ which holds its class-side methods (those defined with ClassName class
+ >> selector). Like Class, everything I actually do is inherited from
+ Behavior."
 
 Behavior subclass: Metaclass [
 ]

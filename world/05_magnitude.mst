@@ -2,6 +2,12 @@
  to:do: is the real-send twin of S5's inlined to:do: (Pitfall P6) — must
  match the inlined pattern's result (the receiver) exactly."
 
+"I am the abstract superclass of objects with a linear order — numbers
+ and characters. A subclass defines < and = ; from those I derive >,
+ <=, >=, max:, min: and between:and:. Anything that answers < and =
+ gains the whole comparison protocol and can live in a
+ SortedCollection."
+
 Object subclass: Magnitude [
     < aMagnitude [
         self subclassResponsibility
@@ -25,6 +31,14 @@ Object subclass: Magnitude [
         ^(self >= lo) and: [ self <= hi ]
     ]
 ]
+
+"I am the abstract superclass of all numbers: SmallInteger and
+ LargeInteger, Double, and Fraction. Beyond Magnitude comparison I
+ provide sign and shape (abs, negated, sign, isZero, squared,
+ reciprocal, sqrt, raisedTo:), counted loops (to:do:, to:by:do:),
+ Interval building (to:, to:by:) and Point building with @ . Mixed-mode
+ arithmetic coerces automatically: an integer combined with a Double
+ answers a Double, with a Fraction a Fraction."
 
 Magnitude subclass: Number [
     abs [

@@ -28,6 +28,14 @@
  established as the standing rule for anything beyond a trivial synchronous
  read) — a Draw button only flags a pending eval; drain_perform services it."
 
+"I am the Canvas tab: a Smalltalk-drawable RGBA image surface. Two drawing
+ paths feed the same image view — Pixels (an expression answering a
+ Pixmap, whose raw RGBA bytes cross to the host Base64-encoded) and
+ Commands (an expression answering a vector command-batch String, rendered
+ natively). Type any expression in the eval field, pick the mode, and
+ press Draw; the built-in buttons render a Mandelbrot and a benchmark
+ chart. The expression is evaluated on the primary VM. I run in the UI
+ worker VM and talk to the host service."
 Object subclass: CocoaCanvas [
     <classVars: Container TopStrip ModePicker EvalField DrawBtn MandelBtn
                 ChartBtn StatusLabel ImageScroll ImageView ActionDelegates>

@@ -18,6 +18,16 @@
  pattern. A stale delegate (from a UI worker since restarted, CG7) fails closed in
  Rust before it ever reaches this class; an unknown/tombstoned ticket here answers
  nil so the trampoline returns the shape's default (0 rows / nil / NO)."
+"I let native Cocoa controls call back into Smalltalk. My class side keeps
+ a registry from integer tickets to receiver objects; a minted native
+ delegate or data source holds only its ticket, and when AppKit invokes it
+ (a table asking for its row count, a button firing its action) the host
+ dispatches here and I perform the same-named selector on the registered
+ receiver, answering its result synchronously. Mint one with on:role: or
+ the conveniences tableSourceOn:, outlineSourceOn:, windowDelegateOn:,
+ textDelegateOn:, actionTargetOn:. unregister: tombstones a ticket; an
+ unknown ticket answers nil, which the host turns into the safe default
+ for the callback's shape (0 rows, nil, NO)."
 Object subclass: MacvmDelegate [
     <classVars: Registry NextTicket>
 

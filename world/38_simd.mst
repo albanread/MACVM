@@ -7,6 +7,12 @@
  same way the float fast-path fused Double. Elementwise ops are per-lane
  bit-identical to scalar Double arithmetic, which the fast-path must also
  honour. Reopens the genesis klass (like Number subclass: Double)."
+"I am an immutable 2-lane vector of double-precision floats packed in a
+ fixed 16-byte body. Create me with Float64x2 x:y: or splat:; combine me
+ with + - * / — elementwise, each lane bit-identical to scalar Double
+ arithmetic, and fused to native NEON instructions by the JIT. Read lanes
+ 1-based with at:, or via x and y; hsum answers the scalar sum of both
+ lanes. I am a value: there is no lane store."
 Object subclass: Float64x2 [
     Float64x2 class >> x: a y: b [ <primitive: 127> ]
     Float64x2 class >> splat: v [ <primitive: 128> ]
@@ -48,6 +54,13 @@ Object subclass: Float64x2 [
  `hsum` is a genuine reduction, and because integer add IS associative it is
  bit-exact regardless of lane-combination order (unlike the FP reductions,
  docs/SIMD.md Part D). Lane access answers a SmallInteger."
+"I am an immutable 4-lane vector of 32-bit signed integers packed in a
+ fixed 16-byte body. Create me with Int32x4 x:y:z:w: or splat:; + - * are
+ elementwise, fused to native NEON by the JIT, and WRAP on 32-bit overflow
+ (a fixed-width lane does not promote to a LargeInteger). There is no
+ vector divide. Read lanes 1-based with at:, or via x y z w (each answers
+ a SmallInteger); hsum answers the exact scalar sum of the four lanes.
+ I am a value: there is no lane store."
 Object subclass: Int32x4 [
     Int32x4 class >> x: a y: b z: c w: d [ <primitive: 148> ]
     Int32x4 class >> splat: v [ <primitive: 149> ]
@@ -90,6 +103,13 @@ Object subclass: Int32x4 [
  lanes packed in NEON `.4s` element order. Each elementwise op is per-lane
  bit-identical to a scalar f32 op, which the JIT `.4s` fuse (VecArith) must
  also honour. Lane access answers a Double (exact f32->f64 widening)."
+"I am an immutable 4-lane vector of single-precision floats packed in a
+ fixed 16-byte body. Create me with Float32x4 x:y:z:w: or splat:; combine
+ me with + - * / — elementwise, each lane bit-identical to a scalar
+ single-precision operation, fused to native NEON by the JIT. Read lanes
+ 1-based with at:, or via x y z w (each answers a Double, an exact
+ widening); hsum folds the four lanes left to right into a Double.
+ I am a value: there is no lane store."
 Object subclass: Float32x4 [
     Float32x4 class >> x: a y: b z: c w: d [ <primitive: 134> ]
     Float32x4 class >> splat: v [ <primitive: 135> ]

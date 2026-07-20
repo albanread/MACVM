@@ -24,6 +24,13 @@
  reference the global; its own body needs no forward names (sends are
  late-bound). Only meaningful in a GUI host whose run loop drains the main
  queue — headless, every send through it fails cleanly."
+"I am a main-thread proxy on an ObjcRef: every message sent to me runs the
+ same Objective-C message on the process main thread, synchronously, and
+ answers the result. AppKit is main-thread-only, so use me for all window
+ and view work: `window onMain makeKeyAndOrderFront: nil`. Obtain me with
+ ObjcRef>>onMain; `target` answers the underlying ObjcRef for wrapper
+ operations such as release and isValid. In a headless host with no main
+ run loop, every send through me fails cleanly."
 Object subclass: ObjcMainProxy [
     | ref |
     ObjcMainProxy class >> on: anObjcRef [
@@ -45,6 +52,19 @@ Object subclass: ObjcMainProxy [
     ]
 ]
 
+"I am a Smalltalk handle on one retained Objective-C object. I am minted
+ only by the bridge (Cocoa classNamed:, Cocoa nsString:, and the results of
+ sends); the native pointer lives in my byte tail, invisible to the moving
+ garbage collector. Any message I do not implement myself becomes an
+ Objective-C send — the selector text is identical in both languages, the
+ argument and result shapes are resolved from the live runtime, and results
+ come back as ObjcRefs, Booleans, SmallIntegers, Doubles, Strings, or small
+ Arrays of numbers for the common structs. Typed sends (send:args:ret:,
+ sendString:, sendI64:, sendBool:, ...) pin the return shape explicitly.
+ `onMain` answers a proxy that runs every send on the main thread (required
+ for AppKit). I own one reference: send me `release` exactly once, or mint
+ me inside Cocoa poolDo: and let the scope release me. After release I am
+ poisoned and further sends fail cleanly."
 Object subclass: ObjcRef [
     "The id lives in the byte tail; instances are minted only by the
      bridge (Cocoa classNamed:/nsString:, and send results)."
@@ -209,6 +229,11 @@ Object subclass: ObjcRef [
 "CocoaPool — what a poolDo: block receives (C4, design §3.3): keep: marks
  a wrapper as surviving the scope; everything else minted inside is
  released on the way out."
+"I am the argument a Cocoa poolDo: block receives. Every ObjcRef minted
+ inside the block is released when the scope exits unless the block marks
+ it with keep: — which answers the wrapper, so
+ `Cocoa poolDo: [:p | p keep: (Cocoa nsString: 'mine')]` reads naturally.
+ A kept wrapper becomes the caller's responsibility to release."
 Object subclass: CocoaPool [
     | kept |
     CocoaPool class >> new [
@@ -225,6 +250,17 @@ Object subclass: CocoaPool [
     isKept: w [ ^kept includes: w ]
 ]
 
+"I am the class-side facade of the Objective-C bridge. `Cocoa classNamed:`
+ answers an ObjcRef on a native class, `Cocoa nsString:` makes a fresh
+ NSString from a String, and from there ordinary Smalltalk keyword sends
+ drive native objects directly. `poolDo:` runs a block in an ownership
+ scope: every ObjcRef minted inside is released on the way out unless the
+ block keep:s it via the CocoaPool it receives. `action:` wraps a Smalltalk
+ block as a native target/action object so a button or menu item can fire
+ guest code (the block runs between doits, never mid-send). A caught
+ NSException prints to the Transcript and raises an ordinary Smalltalk
+ error; in a build without the Objective-C runtime every primitive fails
+ cleanly."
 Object subclass: Cocoa [
     <classVars: Actions NextTicket>
     Cocoa class >> classNamed: aName [

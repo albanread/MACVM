@@ -788,9 +788,13 @@ pub fn parse_mst_source(text: &str) -> Vec<ParsedClass> {
         sc.skip_ws();
         if sc.peek() == Some('"') {
             let c = sc.skip_comment();
-            if pending_comment.is_none() {
-                pending_comment = Some(c);
-            }
+            // NEAREST preceding comment wins (the `ParsedClass::comment`
+            // contract): when a file header / section banner AND a dedicated
+            // class comment both precede a class, the one written directly
+            // above the definition is the class comment. (This was
+            // first-wins until 2026-07: every class whose dedicated comment
+            // followed the file header silently got the header instead.)
+            pending_comment = Some(c);
             continue;
         }
         if sc.peek().is_none() {
@@ -1017,6 +1021,32 @@ Object subclass: Message [
         assert!(do_method.source.contains("aBlock value: (self at: i)"));
         // Confirms the outer `]` wasn't mistaken for the method's own close.
         assert!(do_method.source.trim_end().ends_with(']'));
+    }
+
+    /// When a file header comment AND a dedicated class comment both precede
+    /// a class definition, the NEAREST one is the class comment — the
+    /// `ParsedClass::comment` contract. (Regression: this was first-wins,
+    /// so every class whose dedicated comment sat below the file header
+    /// silently imported the header as its browser comment instead.)
+    #[test]
+    fn nearest_preceding_comment_wins_over_the_file_header() {
+        let src = r#""99_file.mst — the file header, tooling notes, not a class comment."
+"I am the class comment a browser should show."
+Object subclass: Commented [
+    foo [ ^1 ]
+]
+"a stray comment between classes"
+"I am the second class's own comment."
+Object subclass: Commented2 [
+    bar [ ^2 ]
+]
+"#;
+        let classes = parse_mst_source(src);
+        assert_eq!(
+            classes[0].comment,
+            "I am the class comment a browser should show."
+        );
+        assert_eq!(classes[1].comment, "I am the second class's own comment.");
     }
 
     #[test]

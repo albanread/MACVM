@@ -8,6 +8,12 @@
  It reuses ALL of MandelZoom's compute + render (world/45_mandelzoom.mst) by
  subclassing it and overriding just the end-of-dive hook. In a headless VM every
  game primitive silently fails, so loading this class outside the GUI is harmless."
+"I am MandelZoom with an ending: I dive into the Mandelbrot set exactly
+ once and then stop the frame loop instead of resetting. I inherit all of
+ MandelZoom's compute and rendering, overriding only the end-of-dive hook
+ (diveBottomed sends `pane stop`). I exist for the standalone-window demo
+ mode, where the app opens, runs my single dive and quits when the loop
+ stops. Launch me with: MandelVM launch."
 MandelZoom subclass: MandelVM [
     MandelVM class >> launch [
         "Open the game pane and run a single dive (given its own explicit launch

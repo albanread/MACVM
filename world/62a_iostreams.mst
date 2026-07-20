@@ -26,6 +26,17 @@
  extension if a workload ever needs it. Errors are VALUES (a short total),
  never raises — the slice-B rule."
 
+"I am a buffered reader and writer over one file descriptor watched by an
+ IoWorker. There is no blocking read: register a continuation and it fires
+ once, as soon as it is satisfiable — nextLineDo: (the next line without
+ its terminator; nil at end of input), nextCount:do: (exactly n bytes,
+ short only at end of input), upToEndDo: (everything, at end of input),
+ and eachLineDo:, the server idiom that re-arms itself per line until the
+ nil terminator. Requests queue strictly first-in-first-out. write: and
+ writeLine: go straight out the fd and answer the byte count actually
+ written (a short count is the error report). close unwatches, closes the
+ fd, and drains every pending request so nothing dangles. Make me with
+ IoStream on:fd: or connectLoopback:on: (nil if the connect fails)."
 Object subclass: IoStream [
     | io fd inBuf eof pending servicing |
     <classVars: Scratch>
@@ -239,6 +250,12 @@ Object subclass: IoStream [
  IoWorker accepts, bounded by the kevent backlog count; the new fd crosses
  back as an int). Each accepted fd arrives wrapped as an IoStream on the
  same IoWorker, ready for eachLineDo:."
+"I am a loopback-only TCP listener: I bind 127.0.0.1 on a kernel-assigned
+ ephemeral port (`port` answers it — nothing leaves the machine, no
+ firewall prompt) and hand each accepted connection to your block as a
+ ready IoStream watched on the same IoWorker. Create me with
+ TcpListener on:backlog: (nil if the socket chain fails; Posix errno says
+ why), register the handler with onConnection:, and close when done."
 Object subclass: TcpListener [
     | io fd port |
     "Answers nil if the socket/bind/listen chain fails (errno readable)."

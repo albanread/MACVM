@@ -2,6 +2,15 @@
  (sprint_s06_detail.md #06). Every arithmetic/comparison selector binds its
  primitive with a Large/Double-coercing fallback."
 
+"I am the abstract superclass of the integers; SmallInteger and
+ LargeInteger are my concrete representations, and arithmetic moves
+ between them automatically. I supply the shared whole-number protocol:
+ even, odd, gcd:, lcm:, factorial, isPrime, timesRepeat:, radix
+ printing with printString:, and conversions (asFloat, asCharacter).
+ The division selectors differ: // and \\ are floored quotient and
+ remainder, while / answers an exact Fraction when the division is not
+ whole."
+
 Number subclass: Integer [
     isInteger [
         ^true
@@ -31,6 +40,15 @@ Number subclass: Integer [
         ^a
     ]
 ]
+
+"I am the immediate fixed-size integer: a tagged machine word holding
+ values from minVal to maxVal (a little under 62 signed bits). Literals
+ like 42 are my instances. Arithmetic, comparison and the bit
+ operations (bitAnd:, bitOr:, bitXor:, bitShift:) are single VM
+ primitives, which makes me the fastest number in the system. On
+ overflow, or when the other operand is a LargeInteger, Double or
+ Fraction, my fallback code coerces and answers the right class — you
+ never request the promotion yourself."
 
 Integer subclass: SmallInteger [
     SmallInteger class >> maxVal [

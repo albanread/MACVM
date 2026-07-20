@@ -17,6 +17,13 @@
  follow-up when arbitrary label text becomes reachable."
 
 "--- SmapplRegistry: opaque-id -> live widget (the visualRegistry analog) ---"
+"I keep the class-side registry that connects live widgets to the HTML
+ they render in the web GUI. When a Visual renders itself, it registers
+ under a fresh opaque id (register:), which the generated HTML carries;
+ when the user clicks, the GUI sends me fire: with that id and I run the
+ widget's activate action. reset clears the table, and firing an unknown
+ or stale id is a harmless no-op. I have no instances — all my state lives
+ in class variables."
 Object subclass: SmapplRegistry [
     <classVars: Widgets Counter>
 
@@ -42,6 +49,15 @@ Object subclass: SmapplRegistry [
 ]
 
 "--- Visual: base of the embeddable widget hierarchy ---"
+"I am the root of the embeddable widget hierarchy for the web GUI. A
+ widget expression on a page evaluates to one of my instances; the GUI
+ asks it for htmlFragment and splices the answer into the page, so every
+ widget renders itself to HTML. Subclasses override htmlFragment and
+ activate (the click action); my defaults are an inert placeholder box and
+ a no-op. I also provide promptOk:title:type:action:, which answers a
+ modal dialog overlay, and identity implementations of the decoration
+ chain (withBorder:, with3DBorder, topVisualWithHRule:) so ported code
+ that decorates its widgets runs unchanged."
 Object subclass: Visual [
     Visual class >> coerce: anObject [
         "The generic dynamic cast ElementSMAPPL uses (gui/smappl.md §2). MACVM
@@ -91,11 +107,20 @@ Object subclass: Visual [
 ]
 
 "--- Border: a decoration descriptor (identity for the HTML bridge) ---"
+"I stand in for a widget border decoration. In this environment borders
+ are drawn by the page styling rather than by widget objects, so my
+ factory standard3DRaised: simply answers a token that Visual's identity
+ decoration methods ignore. I exist so ported widget-building code that
+ mentions borders runs unchanged."
 Object subclass: Border [
     Border class >> standard3DRaised: aBool [ ^self ]
 ]
 
 "--- Glue: an invisible rigid spacer (gui/smappl.md §3 shape 6) ---"
+"I am an invisible rigid spacer for laying out widgets in the web GUI.
+ Create me with Glue xRigid: aNumber to hold that many pixels of
+ horizontal space; my htmlFragment renders an empty inline element of that
+ fixed width. I do nothing when activated."
 Visual subclass: Glue [
     | size |
     Glue class >> xRigid: n [
@@ -111,6 +136,12 @@ Visual subclass: Glue [
 ]
 
 "--- Button: labeled (shape 2) and icon (shape 1) push buttons ---"
+"I am a push button widget for the web GUI. Create me with
+ Button labeled: aString action: aBlock for a text button, or with
+ withImage:action: for an icon button whose Image names a themable icon.
+ My htmlFragment registers me with SmapplRegistry and renders a button
+ element; when the user clicks it, activate runs my action block with
+ myself as the argument."
 Visual subclass: Button [
     | label iconName action |
     Button class >> labeled: aString action: aBlock [
@@ -147,6 +178,9 @@ Visual subclass: Button [
 ]
 
 "--- Image/FilePath: just enough to carry an icon path (gui/smappl.md §5) ---"
+"I wrap a file path string. Create me with FilePath for: aString and read
+ it back with path. I exist mainly so image resources can be named the way
+ ported code expects, as in Image fromFile: (FilePath for: aString)."
 Object subclass: FilePath [
     | path |
     FilePath class >> for: aString [
@@ -161,6 +195,10 @@ Object subclass: FilePath [
     ]
 ]
 
+"I represent a named image resource, typically a toolbar icon, created
+ with Image fromFile: aFilePath. I hold no pixels: logicalName answers the
+ underlying path, and the GUI maps that name to a theme-appropriate icon
+ asset when the page is displayed, so widget code stays theme-agnostic."
 Object subclass: Image [
     | source |
     Image class >> fromFile: aFilePath [
@@ -192,6 +230,13 @@ Object subclass: Image [
 
 "The clicked launcher element: the corpus sends it browse/open/find messages;
  each answers the navigation marker for MACVM's matching view."
+"I stand in for an entry in the programming environment launcher, as used
+ by the documentation tour pages' toolbar buttons. Messages such as
+ browseStartPage, openClassHierarchyOutliner, findDefinition,
+ findImplementors, and findSenders each answer a navigation marker string;
+ when a clicked button returns such a marker, the GUI opens its own
+ matching view (home, hierarchy, find, and so on). inSessionProcessDo:
+ simply evaluates its block."
 Object subclass: LauncherElement [
     browseStartPage [ ^'macvm-nav:home' ]
     openClassHierarchyOutliner [ ^'macvm-nav:hierarchy' ]
@@ -205,22 +250,35 @@ Object subclass: LauncherElement [
 ]
 
 "`Launcher launchers anElement` → the LauncherElement above."
+"I am the entry point the documentation tour pages use to reach the
+ launcher: Launcher launchers anElement answers a LauncherElement whose
+ navigation messages open the environment's own views. I have no instance
+ behavior of my own."
 Object subclass: Launcher [
     Launcher class >> launchers [ ^self ]
     Launcher class >> anElement [ ^LauncherElement basicNew ]
 ]
 
 "`Workspace new launch` / `CodeEditor new launch` / `HTMLView forDoc launch`."
+"I let the documentation tour pages open the environment's workspace:
+ Workspace new launch answers the navigation marker that brings up the
+ workspace view, where you can type and evaluate Smalltalk expressions."
 Object subclass: Workspace [
     Workspace class >> new [ ^self basicNew ]
     launch [ ^'macvm-nav:workspace' ]
 ]
 
+"I let the documentation tour pages open a code editing surface:
+ CodeEditor new launch answers the navigation marker that brings up the
+ workspace view, this environment's equivalent of a standalone editor."
 Object subclass: CodeEditor [
     CodeEditor class >> new [ ^self basicNew ]
     launch [ ^'macvm-nav:workspace' ]
 ]
 
+"I let the documentation tour pages open the documentation viewer:
+ HTMLView forDoc launch answers the navigation marker that brings up the
+ documentation view."
 Object subclass: HTMLView [
     HTMLView class >> forDoc [ ^self basicNew ]
     launch [ ^'macvm-nav:documentation' ]
@@ -231,9 +289,17 @@ Object subclass: HTMLView [
  (virtualmachine2.html) demos — Strongtalk classes MACVM has no equivalent for.
  Defining them (even empty) is what lets those outliner embeds render a browser
  instead of failing to the G0 placeholder box."
+"I am an empty placeholder for the Application class some documentation
+ tour pages browse in their embedded class-outliner demos. Defining me,
+ even with no behavior, lets those embeds render a real browser instead of
+ a placeholder box."
 Object subclass: Application [
 ]
 
+"I am an empty placeholder for the Test class one documentation tour page
+ browses in its embedded class-outliner demo. Defining me, even with no
+ behavior, lets that embed render a real browser instead of a placeholder
+ box."
 Object subclass: Test [
 ]
 

@@ -6,6 +6,10 @@
  and runs on top of an already-booted base world (a fresh class that is absent
  from the base world, present only after load_list). The real CocoaUI /
  view-wrapper classes arrive in CG2+ (files 64+)."
+"I am a tiny marker class for the optional native-GUI world layer, which
+ loads on top of an already-booted base world. I exist to prove that layer
+ compiles and runs: `ping` answers a Symbol a headless check can verify.
+ I have no other behavior."
 Object subclass: CocoaUIStub [
     "A trivial marker from the conditional layer. `ping` answers a Symbol so a
      headless gate can prove not just that the class resolves but that a method

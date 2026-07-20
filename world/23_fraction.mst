@@ -27,6 +27,14 @@ nil subclass: Object [
     ]
 ]
 
+"I represent an exact rational number as a numerator and a denominator. I
+ am always kept fully reduced with a positive denominator, and a result
+ whose denominator would be 1 collapses to a plain Integer, so 3/4 answers
+ a Fraction while 4/2 answers 2. Create me by dividing Integers with /, or
+ with Fraction numerator:denominator:. Arithmetic and comparison with
+ Integers and other Fractions stay exact; mixing me with a Double converts
+ to inexact Double arithmetic. Other useful messages: numerator,
+ denominator, truncated, floor, ceiling, rounded, asDouble."
 Number subclass: Fraction [
     | numerator denominator |
 

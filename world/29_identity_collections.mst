@@ -22,6 +22,13 @@
  works for any key/element type, not just the ones Dictionary/Set were
  already exercised against."
 
+"I am a Dictionary whose keys are compared by identity (==) rather than
+ equality (=): two distinct but equal objects are different keys to me. I
+ hash keys with identityHash, so any object works as a key. Use me to
+ attach information to particular objects — for example, mapping specific
+ instances to associated data — where equal-but-separate objects must stay
+ distinct. My protocol is Dictionary's own: at:put:, at:ifAbsent:,
+ includesKey:, keysAndValuesDo:, and the rest."
 Dictionary subclass: IdentityDictionary [
     scanFor: key [
         | cap i probe |
@@ -43,6 +50,12 @@ Dictionary subclass: IdentityDictionary [
     ]
 ]
 
+"I am a Set whose membership test is identity (==) rather than equality
+ (=): I can hold two distinct objects that are = to each other, and
+ includes: answers true only for the very objects that were added. I hash
+ with identityHash, so any object can be an element. Use me to track a
+ group of particular objects, such as those already visited during a
+ traversal. My protocol is Set's own: add:, includes:, remove:, do:, size."
 Set subclass: IdentitySet [
     scanFor: anObject [
         | cap i probe |

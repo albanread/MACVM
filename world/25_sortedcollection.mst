@@ -29,6 +29,14 @@ Object subclass: Magnitude [
     ]
 ]
 
+"I am a collection that keeps its elements in sort order at all times.
+ Every add: inserts the new element at its proper position according to my
+ sortBlock, a two-argument block answering true when its first argument
+ should come first; the default sorts ascending by <=. Create me with new
+ or sortBlock:, or convert any collection via asSortedCollection and
+ asSortedCollection:. I inherit indexed access from OrderedCollection, but
+ do not store with at:put: — it can silently break my ordering. addFirst:
+ is redirected through add: for the same reason."
 OrderedCollection subclass: SortedCollection [
     | sortBlock |
 

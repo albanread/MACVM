@@ -4,6 +4,13 @@
  `<<`/`tab`/`space`. Pitfall P8: the raw-newline string literal below must
  stay alone on its own lines."
 
+"I write text to the system transcript — the console, or the Transcript
+ pane in the GUI. The global Transcript is my single instance; you never
+ need to make another. Key messages: show: (takes any object and prints
+ non-strings via printString), showCr:, cr, and the chainable << .
+ Output goes straight out through a VM primitive; there is nothing to
+ flush."
+
 Object subclass: TranscriptStream [
     basicPrint: aString [
         <primitive: 91>

@@ -22,6 +22,13 @@
  same right answers less efficiently, since do: itself already expands
  each element `occurrences` times."
 
+"I am an unordered collection that counts duplicates: each distinct
+ element is stored once, together with its number of occurrences. Send
+ add:, add:withOccurrences:, remove:, occurrencesOf:, and includes:. My
+ size is the total of all occurrence counts, and do: presents each element
+ once per occurrence. Two Bags are equal when they hold the same elements
+ with the same counts. Any collection answers a Bag of its elements via
+ asBag, which makes me handy for frequency counting."
 Collection subclass: Bag [
     | contents |
 

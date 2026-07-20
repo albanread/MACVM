@@ -16,6 +16,13 @@
  not a MACVM-specific number invented for this port. See
  world/tests/24_random_tests.mst."
 
+"I am a pseudo-random number generator: the classic Park-Miller minimal
+ standard generator, computed in exact integer arithmetic. Send next for a
+ Double strictly between 0 and 1, or nextInteger for a non-negative
+ integer; peek and peekInteger answer the upcoming value without advancing
+ me. Create me with new (seed 1) or newWithSeed: — equal seeds always
+ produce identical sequences, so runs are reproducible. The seed should
+ lie between 1 and 2147483647."
 Object subclass: Random [
     | seed |
 

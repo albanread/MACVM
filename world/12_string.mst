@@ -4,6 +4,17 @@
  identity — the asymmetry is intentional (13_symbol.mst, tested in
  tests/it_world.rs later)."
 
+"I am the mutable sequence of Characters, stored one byte each;
+ literals look like 'hello'. at: answers a Character, and at:put:
+ accepts a Character or an integer code. Comparison (<, <=, ...) is
+ lexicographic byte order, and my = is true for any String with equal
+ bytes — including a Symbol, though a Symbol's own = is identity, so
+ mind the direction of the comparison. Highlights of my full protocol:
+ , (concatenation), copyFrom:to:, asUppercase, withBlanksTrimmed,
+ substrings, startsWith:, includesSubstring:, asInteger (answers nil on
+ non-numeric input), asNumber, asSymbol for interning, and the
+ class-side streamContents: for building text piecewise."
+
 ArrayedCollection subclass: String [
     isString [
         ^true

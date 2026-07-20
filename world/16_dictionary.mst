@@ -3,8 +3,22 @@
  key slot = empty, linear probing, no deletion/tombstones in v1. scanFor:
  is the pinned probe loop (verbatim shape)."
 
+"I am the abstract parent of the hash-based collections: Dictionary and
+ Set, and their identity variants. I define no behavior myself — I
+ exist to group the family in the hierarchy; each subclass owns its own
+ table layout and probing."
+
 Collection subclass: HashedCollection [
 ]
+
+"I map keys to values by hashing: an open-addressed table that doubles
+ once half full. Store with at:put:, fetch with at: (an error when the
+ key is absent), at:ifAbsent:, at:ifAbsentPut: or at:ifPresent:.
+ Iterate with keysAndValuesDo:, keysDo:, or do: (values only), or ask
+ for keys / values snapshots. Keys are compared with = and must answer
+ a consistent hash; nil is not a valid key. I have no removeKey: — the
+ idiom throughout this system is to store nil at the key as a
+ tombstone instead."
 
 HashedCollection subclass: Dictionary [
     | tally keys vals |

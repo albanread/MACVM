@@ -9,6 +9,16 @@
  Row-major, one byte per channel in R,G,B,A order — exactly the browser's
  `ImageData.data` layout, so the GUI writes the buffer straight in with no
  repacking."
+"I am a raw RGBA pixel buffer: width * height * 4 bytes, row-major, one
+ byte per channel in R,G,B,A order. Create me with Pixmap width:height:.
+ Write pixels with atX:y:r:g:b: (bounds-clipped — off-pane stores are
+ silently dropped) or basicAtX:y:r:g:b: (unguarded, for hot loops that are
+ in-bounds by construction), and draw lines with lineFrom:y:to:y:r:g:b:
+ (integer Bresenham, clipped). Every pixel is written opaque, so a freshly
+ filled Pixmap needs no separate clear.
+ Use me for per-pixel images (the Mandelbrot renders into one): `bytes`
+ answers the whole buffer, which the GUI blits in a single operation, and
+ asCanvasBase64 answers it Base64-encoded for the Canvas pixel transport."
 Object subclass: Pixmap [
     | width height bytes |
     Pixmap class >> width: w height: h [

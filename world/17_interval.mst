@@ -2,6 +2,15 @@
  a manual whileTrue: loop, deliberately not the inlined to:do: (which has
  no notion of a non-1 step)."
 
+"I am the arithmetic progression: a finite, read-only sequence of
+ evenly spaced numbers. Build me with Interval from:to:by: or, more
+ usually, 5 to: 25 by: 5 (Number>>to:by:); the step may be negative to
+ count down. I store only start, stop and step and compute each element
+ on demand, so I cost the same at any length. I support the sequence
+ protocol — do:, at:, size, first, last, includes: — and collect:
+ answers an Array. To iterate without building any object at all,
+ prefer to:do: and to:by:do:."
+
 SequenceableCollection subclass: Interval [
     | start stop step |
 

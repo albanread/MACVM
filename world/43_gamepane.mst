@@ -15,6 +15,10 @@
 
 "--- Sprite: a handle to a placed sprite instance (docs/gamepane_design.md).
  Defined before GamePane so GamePane>>defineSprite: can reference it. ---"
+"I am a handle to one sprite instance placed on a GamePane. Obtain me from
+ GamePane>>defineSprite: (which defines the pixel art and places me). Set
+ my palette entries with colorAt:r:g:b: (index 0..15, channels 0..255) and
+ move me with moveTo:y:; changes show on the next presented frame."
 Object subclass: Sprite [
     | pane id |
     Sprite class >> pane: aPane id: anId [
@@ -33,6 +37,20 @@ Object subclass: Sprite [
     ]
 ]
 
+"I drive the native game pane from Smalltalk: a low-resolution palette
+ display with drawing primitives, sprites, sound, keyboard input and a
+ frame loop. Draw with cls:, point:y:color:, line:y:to:y:color:,
+ fill:y:width:height:color:, disc:y:radius:color:, or blit: a whole frame
+ of palette indices in one command; set colours with paletteAt:r:g:b:
+ (user entries 16..255, channels 0..255; index 0 is transparent). Define
+ sprites with defineSprite: (answers a Sprite handle). Register a
+ per-frame block with onStep: — and end every frame with `present`, the
+ one moment the GUI shows it — plus optional cleanup with onReset:; then
+ `run` starts the GUI-owned frame timer and `stop` ends it. Inside the
+ step block, poll held keys with keyHeld: and my class-side key constants
+ (keyLeft, keyRight, keyUp, keyDown, keyA, keyB). In a headless VM every
+ game primitive silently fails, so I am harmless to load outside the GUI.
+ Breakout and MandelZoom are complete worked examples."
 Object subclass: GamePane [
     <classVars: StepBlock Keys NextId ResetBlock>
 
@@ -180,6 +198,10 @@ Object subclass: GamePane [
 
 "--- Sound: a named SFX preset played on the one shared engine
  (docs/gamepane_design.md). `Sound coin play`. ---"
+"I am a named sound-effect preset played on the shared game audio engine:
+ `Sound coin play`. My class-side constructors name the presets — coin,
+ jump, zap, shoot, explode, powerup, hurt, click, bang, blip. In a
+ headless VM `play` is silently a no-op."
 Object subclass: Sound [
     | preset |
     Sound class >> preset: n [ ^self new setPreset: n ]
@@ -200,6 +222,9 @@ Object subclass: Sound [
 
 "--- Tune: an ABC-notation chiptune, played once in the background
  (docs/gamepane_design.md). `(Tune fromAbc: 'C C G G A A G2') playOnce`. ---"
+"I am a chiptune written in ABC notation, played in the background by the
+ game audio engine: (Tune fromAbc: 'C C G G A A G2') playOnce. In a
+ headless VM `playOnce` is silently a no-op."
 Object subclass: Tune [
     | abc |
     Tune class >> fromAbc: aString [ ^self new setAbc: aString ]

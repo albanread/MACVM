@@ -86,6 +86,16 @@ Collection subclass: SequenceableCollection [
     ]
 ]
 
+"I am the abstract superclass of the fixed-size indexable collections
+ (Array, String, ByteArray). To SequenceableCollection's read-only search
+ protocol I add the collection-BUILDING methods, which construct a result
+ of the receiver's own kind via `self class new: n` plus at:put: —
+ with:collect: (pairwise collect), copyWith: (append one element),
+ copyWithout: (drop every equal element), copyReplaceAll:with: (the
+ everyday find-and-replace; a counting pass sizes the result, so the
+ replacement need not match the pattern's length) and
+ copyReplaceFrom:to:with:. These live here rather than one level up
+ because only the indexable classes answer a usable object from new:."
 SequenceableCollection subclass: ArrayedCollection [
     "Pairwise collect into a new collection of self's kind."
     with: aCollection collect: aBlock [

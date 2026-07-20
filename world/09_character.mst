@@ -4,6 +4,15 @@
  (Table's construction needs Array>>at:put: already installed) even though
  the doc numbers this file 09 and Array 10 — see 10_array.mst's header."
 
+"I represent a single character; literals look like $a. I am a
+ Magnitude, ordered by character code (asInteger). Character value: n
+ answers the shared flyweight instance for codes 0..255 — so $a == $a —
+ and a fresh instance for codes beyond that. My protocol covers
+ classification (isDigit, isLetter, isVowel, isSeparator, isUppercase,
+ ...), case conversion (asUppercase, asLowercase), radix digits
+ (digitValue and the class-side digitValue:), and the named constants
+ nl, cr, tab and space."
+
 Magnitude subclass: Character [
     <classVars: Table>
 

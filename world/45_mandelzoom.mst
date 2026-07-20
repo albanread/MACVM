@@ -17,6 +17,14 @@
  start at 16): entry 16 is the near-black interior; entries 17..255 are a
  colourful band cycled by escape count. In a headless VM every game primitive
  silently fails, so loading this class outside the GUI is harmless."
+"I render a continuously zooming Mandelbrot set live in the native game
+ pane, diving toward the seahorse valley one notch per frame and resetting
+ once the dive bottoms out, so I loop forever. Launch me from the Demos
+ menu, or a Workspace: MandelZoom launch. Each frame I compute a whole
+ 320x240 view of palette indices — reusing Mandelbrot escapeAtRe:im: for
+ the Double escape-time math — into a reused buffer, then hand it to the
+ pane in a single blit:, the bulk path for CPU-generated frames. Harmless
+ to load in a headless VM (every game primitive silently fails there)."
 Object subclass: MandelZoom [
     | pane mb maxIter buf centerR centerI scale zoomStep |
 

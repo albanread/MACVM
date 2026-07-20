@@ -23,9 +23,11 @@
  the pane useful now (accessing/testing/printing/…). The COMMENT is the stored
  class comment (host `commentFor:`).
 
- READ-ONLY: V2 is a browsing/navigation tool; editing (New/Remove/Accept) stays
- in V1. All reads are pure host SQLite (`MacvmHostService`) — the same image V1,
- the editor, and the Find views read; no VM reflection relay.
+ READS AND WRITES: V2 began read-only but now carries the full editing surface
+ (Accept method/class source, New/Remove class and method, comment editing),
+ through the same host-service flows as V1. All reads are pure host SQLite
+ (`MacvmHostService`) — the same image V1, the editor, and the Find views
+ read; no VM reflection relay.
 
  Re-entrancy (the view_refresh.rs law, as V1): a callback (onShow, a row click)
  NEVER builds the model + reloads inline — `requestRefresh` flips a host flag
@@ -33,6 +35,17 @@
  reloads triggered from a selection callback defer one run-loop turn
  (`deferReload:`)."
 
+"I am Browser V2: a classic Smalltalk-80 four-pane browser — categories,
+ classes, instance/class protocols, methods — offered alongside the
+ hierarchy-tree browser. Categories come from the package a class's source
+ file belongs to; protocols are derived heuristically from selector shape
+ (the stored format never carried per-method protocols). The bottom pane
+ shows method source, the stored class comment, or the class definition,
+ switched by a segmented control — and each is editable: Accept saves to
+ the image (a method also compiles live on the primary VM; a definition's
+ shape change waits for the next launch), and New Class / New Method /
+ Remove round out the editing set. I run in the UI worker VM and read and
+ write through the host service."
 Object subclass: CocoaBrowser2 [
     <classVars: Tree Records Svc Side SourceMode EditMode ShellSuper RemoveArmed
                 SelectedPackage SelectedPackageName SelectedClass SelectedProtocol SelectedMethod
@@ -1013,6 +1026,10 @@ Object subclass: CocoaBrowser2 [
 "CocoaBrowser2Face — one receiver per table (classes/protocols/methods) so the
  shared data-source selectors dispatch to the right pane; minted BY NAME at
  build time (the same late-bind idiom V1's CocoaTableFace uses)."
+"I am a per-table receiver for Browser V2's classes, protocols and methods
+ tables: each instance carries a tag and forwards row count, cell value
+ and selection changes to CocoaBrowser2, so the shared data-source
+ selectors reach the right pane."
 Object subclass: CocoaBrowser2Face [
     | tag |
     CocoaBrowser2Face class >> on: aTag [ ^self new setTag: aTag ]

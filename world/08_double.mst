@@ -1,6 +1,13 @@
 "08_double.mst — Double (sprint_s06_detail.md #08). Division by zero never
  fails the primitive (IEEE inf/nan) — only a non-Double arg does."
 
+"I am the 64-bit IEEE-754 floating point number; literals like 3.14
+ are my instances. I provide arithmetic and comparison (coercing an
+ integer argument to Double), the transcendentals sin, cos, tan, exp,
+ ln, atan and sqrt, and the rounding family floor, ceiling, truncated,
+ rounded. Following IEEE semantics, dividing by zero does not fail —
+ it answers an infinity or NaN. asInteger truncates toward zero."
+
 Number subclass: Double [
     isDouble [
         ^true

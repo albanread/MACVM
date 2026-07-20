@@ -24,6 +24,13 @@
 
 "--- WorkerMessage: what handlers receive — who sent it (0 = the primary,
  else the worker id) and the rebuilt payload copy. ---"
+"I am what a worker message handler receives: `from` is the sender (0 =
+ the primary VM, otherwise the sending worker's id) and `payload` is the
+ rebuilt deep copy of what was sent. My predicates (isWorkerDied,
+ isCocoaEvent, isWorkerTranscript, isUiReq, isSnapshot) recognize the
+ shape-tagged system messages that arrive through the same inbox — a
+ worker's death, for example, is an ordinary message whose payload is
+ {#workerDied. id}."
 Object subclass: WorkerMessage [
     | from payload |
     WorkerMessage class >> from: f payload: p [ ^self new setFrom: f payload: p ]
@@ -58,6 +65,28 @@ Object subclass: WorkerMessage [
     ]
 ]
 
+"I am a handle to a worker: a completely separate Smalltalk VM — its own
+ heap, JIT and OS thread — running the same world as yours. Use me for
+ real parallelism. Everything that crosses a VM boundary travels as a deep
+ copy: no shared state, no identity across heaps, ever (blocks, contexts,
+ classes and aliens cannot cross). All communication is asynchronous — the
+ sender never blocks; replies run later as continuations.
+
+   | w |
+   w := Worker spawn: 'Worker onMessage: [:m | Worker reply: m payload]'.
+   w send: #(1 2 3) onReply: [:r | Transcript show: r printString].
+   w terminate.
+
+ spawn: runs its argument once in the fresh worker, which is how its
+ onMessage: handler gets installed; a handler answers with Worker reply:.
+ call:on:args:onReply: is the RPC form — it performs a class-side method
+ by name in the worker (no handler needed) and hands the copied result to
+ your continuation; errors go to the optional onError: block. Replies are
+ correlation-matched, so many requests may be in flight at once. A
+ headless program waits with runLoopWhile:; a worker's death arrives as an
+ ordinary message whose payload is {#workerDied. id}. In a VM that cannot
+ host workers, spawn: fails cleanly with a readable error, so I am
+ harmless to load anywhere."
 Object subclass: Worker [
     | id |
     <classVars: Handler ReplyHandler PendingReplies NextCorr CurrentCorr CurrentPeer CocoaEventHandler UiReqHandler SnapshotHandler TranscriptLineHandler>

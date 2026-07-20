@@ -6,6 +6,16 @@
  misread the way a stale doc number gets misread. Self-contained: its own
  benchmarks, no dependency on world/bench/. The GUI Benchmarks button routes
  `BenchmarkDashboard chartForWidth:height:` through the generic CanvasEval."
+"I am the live benchmark view behind the GUI Benchmarks button. I run a
+ fixed set of recognizable benchmarks in-image — arith, fib, sieve, dict,
+ alloc, plus the classic Richards and DeltaBlue workloads — and chart, per
+ benchmark, a COLD bar (the first run, including JIT compilation) beside a
+ WARM bar (the median of the runs after), so one click shows absolute
+ speed and JIT warm-up together. chartForWidth:height: runs everything and
+ answers the whole chart as one Canvas command batch; `run` answers the
+ raw rows (name, cold ms, warm ms) if you just want the numbers. Every
+ benchmark verifies its own result, so a wrong answer cannot masquerade as
+ a fast time."
 Object subclass: BenchmarkDashboard [
     | stream |
 

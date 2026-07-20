@@ -15,6 +15,12 @@
  (O(n^2)); fine at world scale, revisit when it matters."
 
 "--- HtmlWriter: the fragment builder (docs/APPS.md §6) ---"
+"I build HTML fragment strings for the web GUI tools. I hold a
+ WriteStream and offer just two writing messages: raw: appends markup
+ verbatim, while escaped: appends text with angle brackets and ampersands
+ converted to character entities so arbitrary names and source code
+ display safely. contents answers the accumulated fragment. The browser
+ and find views all compose their pages through me."
 Object subclass: HtmlWriter [
     | stream |
     HtmlWriter class >> new [
@@ -55,6 +61,13 @@ Object subclass: HtmlWriter [
  callback) is retained but not wired — the corpus views are read-along source
  illustrations, not accepting editors; wire it when an accepting embed appears
  (mirror the outliner's smapplAccept). ---"
+"I am an embedded source-code view for web GUI pages: a documentation
+ page can show a method body in the same syntax-coloured editor box the
+ class browser uses. Build me with CodeView forString, hand me the text
+ with model:, and I render it via htmlFragment; imbeddedVisual answers
+ myself. The doneBlock: accept callback is retained but not wired — my
+ instances serve as read-along source illustrations, not accepting
+ editors."
 Visual subclass: CodeView [
     | source doneBlock |
     CodeView class >> forString [
@@ -87,6 +100,16 @@ Visual subclass: CodeView [
 ]
 
 "--- ClassMirror: source-level reflection of a class (docs/APPS.md §2) ---"
+"I provide source-level reflection on a class, backed by VM primitives.
+ My class side answers system-wide queries: allClasses (every class in the
+ system), selectorsOf: (a behavior's own selectors — pass the metaclass
+ for the class side), instanceVariablesOf: and classVariablesOf: (own
+ variable names in declaration order), primitiveOf:selector: (a method's
+ primitive number, 0 for none), and methodSends:selector:target: (does a
+ method send a given selector). An instance of me wraps one class: send
+ name, theClass, subclassMirrors, instanceSelectors, classSelectors,
+ instanceVariables, and classVariables. The browsing and find tools are
+ built on me."
 Object subclass: ClassMirror [
     | klass |
     ClassMirror class >> on: aClass [
@@ -167,6 +190,13 @@ Object subclass: ClassMirror [
 ]
 
 "--- ClassHierarchyOutliner: a class tree, rendered to HTML (APPS.md §5.2) ---"
+"I render a class hierarchy as an expandable HTML tree for the web GUI
+ class browser: the root class open, descendants collapsed, each class
+ name a link that opens a ClassOutliner on that class, plus an affordance
+ for creating a new class. Create me with imbeddedVisualForClass: aClass
+ or for: aClassMirror; the GUI asks me for htmlFragment. The ported filter
+ messages (filterOnCommentsContaining: and friends) answer myself
+ unchanged, so a filtered embed renders the full tree."
 Visual subclass: ClassHierarchyOutliner [
     | rootMirror |
     "The start page's shorthand (gui/smappl.md §3.3): answer a Visual for the
@@ -259,6 +289,14 @@ Visual subclass: ClassHierarchyOutliner [
 ]
 
 "--- ClassOutliner: a single class's methods, instance + class side (§3.4) ---"
+"I render a single class for the web GUI class browser: its instance and
+ class variables, its instance-side and class-side methods, and its
+ subclasses, as an expandable HTML outline. Each ordinary method opens
+ into an editable, syntax-coloured source box where accepting saves a new
+ version; a primitive method shows a read-only note instead, since its
+ body is VM code rather than Smalltalk source. I also offer affordances
+ for adding variables and creating new methods. Create me with
+ ClassOutliner for: aClassOrMirror."
 Visual subclass: ClassOutliner [
     | mirror |
     "Accept a ClassMirror or a bare class (the corpus uses `for: (ClassMirror
@@ -438,6 +476,11 @@ Visual subclass: ClassOutliner [
 
 "--- ImplementorsView: every class that defines a selector (find tool,
      docs/APPS.md §5.4). A Visual so render_fragment can drive it. ---"
+"I render the Implementors find-results page of the built-in web browser
+ tooling: given a selector name, I sweep every class with ClassMirror and
+ list each one that defines it, on the instance or class side, with links
+ into the class outliner. Create me with ImplementorsView of: aString. The
+ environment's native find tools have since superseded me."
 Visual subclass: ImplementorsView [
     | query |
     ImplementorsView class >> of: aString [
@@ -481,6 +524,11 @@ Visual subclass: ImplementorsView [
 
 "--- SendersView: every method that SENDS a selector (find tool, APPS.md §5.4).
      Uses methodSends: (an IC-table scan) so no per-method allocation. ---"
+"I render the Senders find-results page of the built-in web browser
+ tooling: given a selector name, I scan every method in the system and
+ list those that send it, using a VM primitive that inspects each method's
+ call sites rather than its source text. Create me with SendersView of:
+ aString. The environment's native find tools have since superseded me."
 Visual subclass: SendersView [
     | query target |
     SendersView class >> of: aString [
@@ -523,6 +571,11 @@ Visual subclass: SendersView [
 
 "--- DefinitionsView: classes whose name matches a query (Find definition,
      APPS.md §5.4). Case-insensitive substring over class names. ---"
+"I render the Find Definition results page of the built-in web browser
+ tooling: given a query string, I list every class whose name contains it,
+ compared case-insensitively, each entry linking to that class's outliner.
+ Create me with DefinitionsView of: aString. The environment's native find
+ tools have since superseded me."
 Visual subclass: DefinitionsView [
     | query |
     DefinitionsView class >> of: aString [
@@ -581,6 +634,13 @@ Visual subclass: DefinitionsView [
  allClasses order — the SAME projection the WKWebView outliner renders
  (ClassHierarchyOutliner's subclassMirrors walk), so the two GUIs browse
  identical rows (the CG7 differential gate pins this)."
+"I produce the class-browser snapshot the native GUI renders. My class
+ side's browseSnapshot walks the live hierarchy from Object and answers a
+ nested tree of plain Arrays, Strings, and integers — for each class: its
+ name, instance and class variable names, instance-side and class-side
+ selectors, and its children. Keeping the snapshot to plain data means it
+ can cross safely to the user-interface worker, with no class objects
+ leaking between virtual machines."
 Object subclass: UiBrowserService [
     UiBrowserService class >> browseSnapshot [
         ^self nodeFor: (ClassMirror on: Object)

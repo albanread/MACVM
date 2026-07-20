@@ -26,6 +26,13 @@
  Cocoa. The lettered filename mirrors 58a_base64.mst: slotted after 49 with no
  renumbering."
 
+"I read and write whole files as UTF-8 text through the Cocoa bridge — the
+ encoding-aware half of the file surface (PosixFile is the byte-exact,
+ fd-level half). `slurp:` answers a file's contents as a String, or nil if
+ it cannot be read; `spit:contents:` writes a String atomically and answers
+ true or false; `exists:` asks NSFileManager. I work headless as well as in
+ either GUI: NSString file I/O is thread-safe, so no main-thread hop is
+ needed."
 Object subclass: CocoaFile [
     "NSUTF8StringEncoding."
     CocoaFile class >> utf8 [ ^4 ]

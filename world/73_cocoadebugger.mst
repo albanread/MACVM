@@ -7,6 +7,16 @@
 
    Because the UI is a SEPARATE VM on the main thread, the whole GUI stays
    live while the primary is frozen in the halt loop — no reentrancy work. ──"
+"I am the Debugger tab, the native face of the primary VM's halt loop.
+ When the primary halts — an error with Halt on Error enabled, a planted
+ breakpoint, or an explicit halt — it parks and publishes a full report; I
+ render the call stack, the halted method's source with the current
+ statement highlighted, and the selected frame's variables, and bring
+ myself to the front. Clicking a stack row selects that frame; the step
+ bar sends commands back (Step Into, Step Over, Finish, Continue, Abort),
+ and the print field evaluates an expression against the selected frame.
+ Because I run in the UI worker VM on the main thread, the whole GUI stays
+ live while the primary sits frozen at the halt."
 Object subclass: CocoaDebugger [
     <classVars: Container BarBox BarButtons StackTable StackCol StackScroll StackFace
                 SourceView SourceScroll FrameView FrameScroll PrintField
@@ -330,6 +340,8 @@ Object subclass: CocoaDebugger [
 "The NSTableView data source/delegate for the stack (the browser's Face
  pattern). Defined LAST — referenced by name in buildView, so it can safely
  reference CocoaDebugger (defined above) by bareword. Mirrors CocoaBrowser2Face."
+"I am the debugger stack table's data-source receiver: I answer the row
+ count and per-row text from CocoaDebugger."
 Object subclass: CocoaDebuggerFace [
     numberOfRowsInTableView: aTable [ ^CocoaDebugger stackRowCount ]
     tableView: aTable objectValueForTableColumn: aCol row: aRow [ ^CocoaDebugger stackValueAt: aRow ]

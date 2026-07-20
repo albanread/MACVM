@@ -4,6 +4,15 @@
  `<<` on non-String/Character objects needs printString (19) to be useful;
  it compiles fine now (just a runtime send) but only works after 19 loads."
 
+"I am a sequential output stream that appends elements to a growable
+ collection, usually a String. Create me with WriteStream on: String new,
+ then send nextPut:, nextPutAll:, or << to append; contents answers a copy
+ of everything written so far. << accepts a String or Character directly
+ and appends any other object via its printString; print: does the same
+ explicitly. cr, nl, tab, and space append the corresponding characters.
+ My backing collection grows automatically by doubling, so building large
+ strings stays cheap. String streamContents: is a convenient way to build
+ a string through me."
 Object subclass: WriteStream [
     | collection position |
 

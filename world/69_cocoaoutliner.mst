@@ -31,6 +31,15 @@
  callback — requestRefresh only flags (view_refresh.rs, CG9's rebuild-flag
  pattern); drain_perform services it with a fresh top-level `exec`."
 
+"I am the Outliner tab: one Strongtalk-style outline of the whole class
+ hierarchy — expand a class to see its instance variables, class
+ variables, instance methods, class methods and subclasses, all nested in
+ a single tree; select a method to read its source in the pane below. I
+ browse by reflection over the UI worker VM's own booted world (which
+ matches the standard boot), with source text fetched from the image via
+ the host service — so a class defined only by a Workspace Do It on the
+ primary will not appear until it is accepted through a browser or the
+ editor. Read-only; Refresh rebuilds the tree. I run in the UI worker VM."
 Object subclass: CocoaOutliner [
     <classVars: Container TopStrip RefreshBtn StatusLabel VSplit
                 OutlineScroll Outline OCol OutlineDelegate

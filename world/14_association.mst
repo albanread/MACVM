@@ -2,6 +2,12 @@
  genesis-declared named instvars (01/02 order) — plain instvar syntax reads
  and writes them directly, no instVarAt: needed."
 
+"I am a key-value pair. Build me with key -> value (any object
+ understands ->) or with Association key:value:. I answer key and
+ value, and both have setters. My = and hash consider the key only —
+ two associations with equal keys are equal regardless of value.
+ Dictionary hands me out from associations and associationsDo:."
+
 Object subclass: Association [
     Association class >> key: k value: v [
         | a |

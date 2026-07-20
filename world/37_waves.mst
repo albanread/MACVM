@@ -9,6 +9,13 @@
  §5.2 JSON command array, drawn by the GUI in one macvmCanvasDraw pass; the
  Canvas view's Waves button routes it through the generic CanvasEval, whose
  transcript line reports the compute time."
+"I draw a small function-plot demo for the Canvas view: sine, cosine and a
+ damped sine as stroked coloured paths over a midline and quarter
+ gridlines. My one entry point, commandsForWidth:height:, answers the
+ whole chart as a single JSON command-array String that the GUI draws in
+ one pass. Every y value is computed in Smalltalk Double arithmetic
+ through the libm sin/cos/exp primitives. The Canvas view's Waves button
+ is my usual caller."
 Object subclass: WaveChart [
     | stream w h midY amp |
 

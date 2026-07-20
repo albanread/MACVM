@@ -18,6 +18,16 @@
  Launch from the Demos menu, or a Workspace:  ParallelMandel launch
  (Needs a worker-boot registration — the GUI provides one; a plain CLI run
  without one raises 'cannot spawn' cleanly.)"
+"I am the parallel Mandelbrot demo: the same zooming seahorse-valley dive
+ as MandelZoom, but every frame is computed in parallel by four worker VMs
+ — one horizontal band each, every worker with its own heap, JIT and core
+ — while I, on the primary VM, only assemble the bands and blit the frame.
+ The dive therefore runs about four times faster than the single-VM
+ MandelZoom: the parallelism is real and visible. Launch me from the Demos
+ menu, or a Workspace: ParallelMandel launch. My class-side computeBand:
+ is the pure-compute half that runs inside each worker via the Worker RPC
+ protocol. I need an environment that can spawn workers (the GUI provides
+ one); a plain CLI run raises a clean cannot-spawn error."
 Object subclass: ParallelMandel [
     | pane buf workers pendingBands centerR centerI scale zoomStep |
 

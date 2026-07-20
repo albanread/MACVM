@@ -3,6 +3,12 @@
  for S5's inlined selectors (Pitfalls P6) — semantics must match the
  inlined patterns exactly, incl. ifTrue: answering nil on the untaken leg."
 
+"I am the class of nil, my one instance. nil is the initial value of
+ every variable and instance variable, and the conventional answer for
+ no result. I answer true to isNil and false to notNil (all other
+ objects answer the reverse), I print as nil, and copying me answers
+ me."
+
 Object subclass: UndefinedObject [
     isNil [
         ^true
@@ -12,8 +18,21 @@ Object subclass: UndefinedObject [
     ]
 ]
 
+"I am the abstract superclass of True and False, the two truth values.
+ My subclasses carry the real protocol: not, & and | (eager — the
+ argument is already evaluated), and: and or: (short-circuit — the
+ argument is a block run only when needed), the ifTrue:/ifFalse:
+ conditionals, and xor:/eqv:. The compiler inlines the common
+ conditional forms; my subclasses keep real methods with identical
+ semantics for when a Boolean is reached through a dynamic send."
+
 Object subclass: Boolean [
 ]
+
+"I am the true case of Boolean; the value true is my one instance. My
+ methods answer each conditional's true leg directly: ifTrue: runs its
+ block, ifFalse: answers nil, and: evaluates its block, or: answers
+ true without looking at its argument."
 
 Boolean subclass: True [
     not [
@@ -44,6 +63,11 @@ Boolean subclass: True [
         ^true
     ]
 ]
+
+"I am the false case of Boolean; the value false is my one instance.
+ My methods mirror True with the legs swapped: ifTrue: answers nil,
+ ifFalse: runs its block, and: answers false without evaluating its
+ argument, or: evaluates its block."
 
 Boolean subclass: False [
     not [

@@ -5,6 +5,15 @@
  Integer>>timesRepeat: and 05's Number>>to:stop:do: already call aBlock
  value/value: for real, so this must load before 05."
 
+"I am a block: code in square brackets, with its own arguments and
+ temporaries, closed over the variables of its enclosing method and
+ ready to run later. Evaluate me with value, value:, value:value:,
+ value:value:value: or valueWithArguments:; numArgs answers how many
+ arguments I expect. ensure: runs a clean-up block whether I complete
+ normally or unwind; ifCurtailed: runs its block only on an unwind.
+ Blocks are the currency of control flow here — conditionals, loops and
+ every iteration protocol take me as an argument."
+
 Object subclass: BlockClosure [
     value [
         <primitive: 50>

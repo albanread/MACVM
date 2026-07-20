@@ -38,6 +38,10 @@
  round-trip and (peer,corr) routing are headless-proven (embed.rs CG4
  tests); the action dispatch is headless-proven (cocoa_delegate gate)."
 
+"I hold one block behind a native target/action control. Each toolbar
+ button or menu item mints its own action-target delegate on an instance
+ of me; when the control fires, macvmAction: runs my block. The delegate
+ registry keeps me alive — nothing else needs to hold me."
 Object subclass: CocoaToolbarAction [
     "A block-holder so N toolbar buttons can each mint their own C6
      action-target ticket (`MacvmDelegate actionTargetOn:`) while sharing
@@ -52,6 +56,19 @@ Object subclass: CocoaToolbarAction [
     macvmAction: sender [ ^Block value ]
 ]
 
+"I am the native GUI's application shell, running in the UI worker VM on
+ the main thread. I build the main window: a toolbar of view-switcher
+ buttons plus a live VM metrics readout, a content host whose tabs the
+ registered views fill (Workspace, the class browsers, Find, Editor,
+ Outliner, Canvas, Help, Debugger), and a newest-first Transcript dock at
+ the bottom. My Workspace evaluates the selection — or, with no selection,
+ the whole buffer — on the primary VM: Do It reports on the Transcript,
+ Print It also splices the result at the caret. I install the menus (File,
+ Source, View, Theme, Demos, Debug), the A-/A+ code-font sizing, and
+ light/dark theming. Views join me with registerViewNamed:...;
+ switchToView: swaps tabs. The primary VM runs off the main thread and is
+ reached by message; when it is restarted, environmentRestarted re-syncs
+ every view against the fresh environment."
 Object subclass: CocoaUI [
     <classVars: Win Toolbar ContentHost Transcript TranscriptScroll ActTarget
                 TranscriptText Views ActiveView ToolbarDelegates ToolbarButtons

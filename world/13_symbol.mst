@@ -2,6 +2,13 @@
  identity (faster than and consistent with hash [^self identityHash]) —
  this is what makes 12_string.mst's String>>= asymmetric against Symbol."
 
+"I am an interned String: the VM guarantees one instance per spelling,
+ so #foo == #foo and my = is simple identity — the fastest possible key
+ comparison. I am immutable (at:put: is an error). Symbols name
+ selectors, classes and well-known values, and make ideal Dictionary
+ keys. asString answers a mutable copy, String>>asSymbol interns, and
+ numArgs answers how many arguments my selector expects."
+
 String subclass: Symbol [
     asSymbol [
         ^self

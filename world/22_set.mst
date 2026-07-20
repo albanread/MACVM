@@ -7,6 +7,13 @@
  to using scanFor: fresh into the new array rather than going through
  add:, so it can never itself trigger a nested checkGrow)."
 
+"I am an unordered collection of distinct elements: adding an object that
+ is already present (by =) leaves me unchanged. I store my elements in a
+ hash table, so add:, includes:, and remove: are fast, but do: enumerates
+ in no particular order. Key messages: add:, addAll:, includes:, remove:,
+ remove:ifAbsent:, size, do:. nil cannot be an element. Any collection
+ answers a Set of its elements via asSet, and I support set algebra with
+ & (intersection), | (union), and difference:."
 HashedCollection subclass: Set [
     | tally elements |
 

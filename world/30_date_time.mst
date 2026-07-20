@@ -44,6 +44,15 @@
  fixed rather than reproduced (e.g. Fraction>>printOn:'s nonexistent
  `stream print:`, Integer>>/'s infinite recursion)."
 
+"I represent a calendar date: a day of the month, a month, and a year.
+ Create me with Date newDay: 17 month: #July year: 2026, or with
+ newDay:monthIndex:year: using a numeric month. I answer dayOfMonth, month
+ (a Symbol), monthIndex, and year, compare fully with < and friends, and
+ print in the style July 17, 2026. My class side translates between day
+ and month names and their indices (daysOfWeek, monthsOfYear,
+ nameOfMonth:, indexOfMonth:, and so on). There is no Date today — nothing
+ constructs a Date from the clock — and no day arithmetic (addDays: and
+ its kin are not implemented)."
 Object subclass: Date [
     | dayOfMonth monthIndex year |
 
@@ -124,6 +133,15 @@ Object subclass: Date [
     ]
 ]
 
+"I represent a time of day as a number of seconds since midnight. Create
+ me with Time fromSeconds:; I answer hour, minute, second, minutes, and
+ asSeconds, compare with < and friends, and combine with addTime: and
+ subtractTime:. My class side also carries the system clocks:
+ millisecondClockValue answers real wall-clock milliseconds since the Unix
+ epoch (via a native clock primitive), while millisecondsToRun: times a
+ block using the VM's monotonic millisecond clock — the right choice for
+ durations. There is no Time now — nothing constructs a Time from the
+ current clock."
 Object subclass: Time [
     | seconds |
     <classVars: ClockBuffer>

@@ -10,6 +10,15 @@
  scalar left-to-right fold, so they differ from `inject:into:` in the low bits
  (docs/SIMD.md Part D). `sequentialSum` is the exact scalar fold for code that
  needs bit-parity with a hand-written loop."
+"I am a contiguous array of double-precision floats. Create me with new:
+ (n zeroed lanes) or from: (any indexable of Numbers); index me 1-based
+ with at: and at:put: (Doubles in and out). My bulk operations run as
+ hand-written NEON vector kernels: +@ (elementwise sum of equal-length
+ arrays), scale: (elementwise multiply by a scalar), and the reductions
+ sum, dot:, max and min. Beware: sum and dot: use a defined pairwise
+ order that can differ from a scalar left-to-right fold in the low bits —
+ use sequentialSum when you need bit-parity with a hand-written loop.
+ max and min raise an error on an empty array."
 ArrayedCollection subclass: FloatArray [
     "N zeroed f64 lanes."
     FloatArray class >> new: n [ <primitive: 141> ]

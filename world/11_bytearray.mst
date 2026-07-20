@@ -3,6 +3,12 @@
  primitives 07_largeinteger.mst already binds under different selector
  names; ByteArray exposes them under their own names directly."
 
+"I am the fixed-size collection of raw bytes; each element is a
+ SmallInteger in 0..255, and literals look like #[1 2 3]. at: and
+ at:put: read and write bytes directly, replaceFrom:to:with: is a bulk
+ byte-copy primitive, and = / compare: / hash work on the raw bytes.
+ Use me for binary data — file contents, network packets, pixel rows."
+
 ArrayedCollection subclass: ByteArray [
     at: i [
         <primitive: 40>

@@ -4,6 +4,15 @@
  installed by the time its top-level doIt runs (world.list is the actual
  load order; filenames keep the doc's numbering for cross-reference)."
 
+"I am the abstract superclass of all collections. A subclass needs only
+ do: (and add: where adding makes sense); from that I derive the shared
+ enumeration protocol: size, isEmpty, includes:, detect:ifNone:,
+ inject:into:, fold:, select:, reject:, collect:, sum, max, min,
+ occurrencesOf:, addAll:, and the conversions asArray,
+ asOrderedCollection, asSortedCollection, asSet and asBag. My default
+ size counts by iterating, so concrete classes override it where they
+ can answer directly."
+
 Object subclass: Collection [
     do: aBlock [
         self subclassResponsibility
@@ -56,6 +65,15 @@ Object subclass: Collection [
         ^r
     ]
 ]
+
+"I am the abstract superclass of collections whose elements sit in a
+ fixed order at 1-based integer indices: Array, String,
+ OrderedCollection, Interval and friends. I add the positional
+ protocol: at:, first, last, indexOf:, copyFrom:to:, reversed,
+ concatenation with , (comma), doWithIndex:, with:do:, findFirst:,
+ sub-sequence search (indexOfSubCollection: and relatives), and
+ in-place sort / sort:. My = compares class, size and elements
+ pairwise."
 
 Collection subclass: SequenceableCollection [
     do: aBlock [
@@ -113,6 +131,13 @@ Collection subclass: SequenceableCollection [
         ^r
     ]
 ]
+
+"I am the fixed-size indexable collection of arbitrary objects — the
+ workhorse sequence. Literal arrays look like #(1 2 3); Array new: n
+ answers n slots, all nil; with:, with:with:, ... build small arrays
+ from values. Access is 1-based through at: and at:put:, each a single
+ VM primitive. I cannot grow — use an OrderedCollection when the size
+ is not known in advance."
 
 ArrayedCollection subclass: Array [
     Array class >> with: a [

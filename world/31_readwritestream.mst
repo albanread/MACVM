@@ -21,6 +21,15 @@
  (`1 to: position`), contentsRemaining = everything still ahead of the
  cursor (`position+1 to: size`)."
 
+"I am a stream that supports both reading and writing over one shared
+ position: nextPut: and next advance the same cursor, so you can write,
+ reposition, and read back. Create me with on: (starting logically empty)
+ or on:numElements: (starting with readable content); I keep a logical
+ size separate from my collection's raw capacity. Reading protocol: next,
+ peek, atEnd, upToEnd, skip:, reset, position:. Writing protocol:
+ nextPut:, nextPutAll:, <<, cr, tab, space. contents answers everything
+ written so far; contentsWritten answers what the cursor has passed, and
+ contentsRemaining what still lies ahead of it."
 Object subclass: ReadWriteStream [
     | collection position size |
 

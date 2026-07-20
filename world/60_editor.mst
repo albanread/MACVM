@@ -26,9 +26,22 @@
 
 "── Rope: shell first, so RopeLeaf/RopeBranch can subclass it and its own real
  methods (added in the reopen below) can name them. ──"
+"I am a persistent text rope: a balanced tree of immutable string
+ fragments (RopeLeaf and RopeBranch are my node classes). Every edit —
+ insert:at:, delete:to:, concat: — answers a NEW rope that shares all
+ untouched structure, so keeping an old root keeps the old document
+ exactly (that is TextBuffer's free undo). Each node also counts newlines,
+ giving O(log n) line lookup: lineOfOffset:, offsetOfLine:, linesFrom:to:.
+ Build me with Rope fromString:; asString answers the whole document.
+ Leaves are bounded and deep spines rebalance, so long runs of edits stay
+ logarithmic."
 Object subclass: Rope [ ]
 
 "── RopeLeaf: an immutable string fragment ────────────────────────────────────"
+"I am a rope leaf: one immutable string fragment with its newline count
+ cached. I answer the recursive rope protocol (at:, size, newlines,
+ splitAt:, newlinesBefore:, offsetAfterNewline:) directly against my
+ string. I am bounded by Rope leafMax; larger texts split across leaves."
 Rope subclass: RopeLeaf [
     | str nl |
 
@@ -77,6 +90,12 @@ Rope subclass: RopeLeaf [
  `weight`/`leftNls` are the left subtree's char/newline totals (the navigation
  keys); `size`/`newlines`/`depth` are this subtree's totals, cached at
  construction so every query is O(1) per node visited."
+"I am a rope interior node: an immutable pair of subropes, with my left
+ subtree's character and newline totals cached as navigation keys and my
+ own size, newline count and depth cached at construction — so indexing
+ and line lookup descend left or right in O(1) per node visited.
+ balancedIfDeep rebuilds me from my leaves when a spine grows too deep, so
+ repeated edits cannot degrade the tree."
 Rope subclass: RopeBranch [
     | left right weight leftNls size newlines depth |
 
@@ -279,6 +298,12 @@ Object subclass: Rope [
  Undo is O(1): pop back to a previous root — no copying, because a persistent
  edit never mutated the shared structure. (Cursor/selection and the GUI damage
  protocol are M3; this is the persistence the design is built on, made concrete.)"
+"I am a mutable handle over an immutable Rope, with undo and redo for
+ free: I hold the current root plus stacks of prior roots. insert:at: and
+ delete:to: commit a new root and clear the redo trail; undo and redo
+ just swap roots — O(1), no copying, because a persistent edit never
+ mutates shared structure. Create me with TextBuffer on: aString (or
+ empty); asString, size and lineCount describe the current document."
 Object subclass: TextBuffer [
     | root undo redo |
 
@@ -329,6 +354,14 @@ Object subclass: TextBuffer [
  it. (Viewport WINDOWING — sending only the on-screen slice of a very large
  document and scrolling it as the caret leaves the screen — is the next step; a
  class fits on screen, so the whole buffer is the viewport for now.)"
+"I am an editing session: a TextBuffer plus a caret, driven one keystroke
+ or range edit at a time by a GUI text view acting as a dumb terminal.
+ handleKey:at: applies one key at the view's real caret position,
+ handleCommand: runs undo/redo, and replaceFrom:length:with: applies a
+ range edit; each answers `render` — the whole document text preceded by a
+ header line carrying the caret offset, which the view repaints from
+ wholesale rather than patching incrementally. The class side holds one
+ Current session (openOn: / current)."
 Object subclass: EditorSession [
     | buffer cursor |
     <classVars: Current>

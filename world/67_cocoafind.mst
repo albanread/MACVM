@@ -15,6 +15,14 @@
  selector — all through CocoaBrowser's own scripting helpers, so a find hit
  lands on the real method with its source showing."
 
+"I am the Find tab: Implementors, Senders, and Definitions searches over
+ the image, shown as a native results table. Type into the combobox — it
+ offers type-ahead over every selector and class name in the image — press
+ one of the three buttons, then click a hit to jump to the class browser
+ with the class, side and selector selected and the source showing.
+ Senders results come from the persisted send index, so they are accurate,
+ not textual. I run in the UI worker VM and query through the host
+ service."
 Object subclass: CocoaFind [
     <classVars: Container SearchField ImplBtn SendBtn DefBtn ResultsScroll
                 Results RCol ResultsFace ResultsDelegate ActionDelegates
@@ -285,6 +293,8 @@ Object subclass: CocoaFind [
 
 "The results table's own receiver (same reason as the browser's table faces:
  table-source selectors are shared, receivers must be distinct objects)."
+"I am the Find results table's data-source receiver: I answer row count
+ and row labels from CocoaFind and forward a selection to its jump."
 Object subclass: CocoaFindFace [
     numberOfRowsInTableView: aTable [ ^CocoaFind rowCount ]
     tableView: aTable objectValueForTableColumn: aCol row: aRow [

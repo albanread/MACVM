@@ -4,6 +4,19 @@
  ~~, isNil, notNil) and printing (printOn:, printString) land later (02,
  19) once their dependencies exist."
 
+"I am the root of the class hierarchy: every class ultimately inherits
+ from me, so my protocol is what every object understands. I provide
+ identity (==, ~~, identityHash), equality (= defaults to identity;
+ subclasses refine it), class membership (class, isKindOf:, isMemberOf:,
+ respondsTo:), nil testing (isNil, notNil) plus the type predicates
+ (isString, isInteger, ...), printing (printString, printOn:,
+ displayString, printNl, inspect), copying (shallowCopy, copy),
+ reflective sends (perform:, perform:withArguments:), and Association
+ building with -> . There is no exception system here: error: stops the
+ program with a message, and doesNotUnderstand: reports an unhandled
+ message the same way. halt opens the debugger when one is armed and is
+ otherwise a no-op."
+
 nil subclass: Object [
     class [
         <primitive: 21>
@@ -67,6 +80,12 @@ nil subclass: Object [
             ' failed — not understood, or wrong number of arguments'
     ]
 ]
+
+"I represent a message that could not be delivered: when an object
+ receives a message it does not understand, the VM hands its
+ doesNotUnderstand: handler an instance of me. Ask me for the selector
+ (a Symbol) and the arguments (an Array) to inspect or report the
+ failed send."
 
 Object subclass: Message [
     selector [

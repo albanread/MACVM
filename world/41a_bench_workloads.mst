@@ -11,6 +11,9 @@
 "════ Richards (world/bench/richards.mst) ════════════════════════════════"
 "--- Richards proper ------------------------------------------------------"
 
+"I am the common superclass of the Richards benchmark classes. I hold the
+ shared task and packet identity constants and the linked-queue
+ append:head: helper the tasks and scheduler use."
 Object subclass: RBObject [
     "Task identities double as taskTable indices (1-based, canonical
      Smalltalk numbering). NoWork/NoTask are plain nil."
@@ -35,6 +38,10 @@ Object subclass: RBObject [
     ]
 ]
 
+"I am one work packet circulating between the simulated tasks of the
+ Richards operating-system benchmark: a linked-list node carrying a
+ destination task identity, a kind (work or device) and a small data
+ buffer."
 RBObject subclass: Packet [
     | link identity kind datum data |
 
@@ -60,6 +67,9 @@ RBObject subclass: Packet [
     data [ ^data ]
 ]
 
+"I hold the three scheduling flags of a Richards task — packet pending,
+ waiting, holding — with the canonical state-transition and predicate
+ protocol. TaskControlBlock inherits me."
 RBObject subclass: TaskState [
     | packetPendingIV taskWaiting taskHolding |
 
@@ -118,6 +128,8 @@ RBObject subclass: TaskState [
 
 "--- per-task private data records (the canonical *TaskDataRecord classes) -"
 
+"I am the private data of a Richards device task: the one packet it is
+ holding pending."
 RBObject subclass: DeviceTaskDataRecord [
     | pending |
     DeviceTaskDataRecord class >> create [ ^self new init ]
@@ -126,6 +138,8 @@ RBObject subclass: DeviceTaskDataRecord [
     pending: aPacket [ pending := aPacket ]
 ]
 
+"I am the private data of a Richards handler task: its queues of incoming
+ work packets and device packets."
 RBObject subclass: HandlerTaskDataRecord [
     | workIn deviceIn |
     HandlerTaskDataRecord class >> create [ ^self new init ]
@@ -138,6 +152,8 @@ RBObject subclass: HandlerTaskDataRecord [
     deviceInAdd: aPacket [ deviceIn := self append: aPacket head: deviceIn ]
 ]
 
+"I am the private data of the Richards idle task: a pseudo-random control
+ word and a countdown of idle cycles."
 RBObject subclass: IdleTaskDataRecord [
     | control count |
     IdleTaskDataRecord class >> create [ ^self new init ]
@@ -148,6 +164,8 @@ RBObject subclass: IdleTaskDataRecord [
     count: v [ count := v ]
 ]
 
+"I am the private data of a Richards worker task: which handler it will
+ send to next, and a running character counter."
 RBObject subclass: WorkerTaskDataRecord [
     | destination count |
     WorkerTaskDataRecord class >> create [ ^self new init ]
@@ -160,6 +178,10 @@ RBObject subclass: WorkerTaskDataRecord [
 
 "--- TaskControlBlock + the four task kinds --------------------------------"
 
+"I am one schedulable task in the Richards benchmark: a linked-list node
+ with an identity, a priority, an input packet queue and my scheduling
+ state (inherited from TaskState). The scheduler runs me via runTask; my
+ subclasses override processWork: with their task-specific behaviour."
 TaskState subclass: TaskControlBlock [
     | link identity priority input handle scheduler |
 
@@ -213,6 +235,8 @@ TaskState subclass: TaskControlBlock [
     ]
 ]
 
+"I am the Richards idle task: I burn scheduling cycles, pseudo-randomly
+ releasing device A or device B each turn, until my countdown runs out."
 TaskControlBlock subclass: IdleTask [
     processWork: work [
         | data control |
@@ -230,6 +254,8 @@ TaskControlBlock subclass: IdleTask [
     ]
 ]
 
+"I am the Richards worker task: I fill each work packet with character
+ data and send it to the two handler tasks alternately."
 TaskControlBlock subclass: WorkerTask [
     processWork: work [
         | data |
@@ -248,6 +274,9 @@ TaskControlBlock subclass: WorkerTask [
     ]
 ]
 
+"I am a Richards handler task: I pair queued work packets with queued
+ device packets, copying the work data into device packets one datum at a
+ time."
 TaskControlBlock subclass: HandlerTask [
     processWork: work [
         | data workPacket count devicePacket |
@@ -271,6 +300,8 @@ TaskControlBlock subclass: HandlerTask [
     ]
 ]
 
+"I am a Richards device task: I hold one packet pending and hand it back
+ to the scheduler on my next turn, simulating a slow device."
 TaskControlBlock subclass: DeviceTask [
     processWork: work [
         | data functionWork |
@@ -289,6 +320,15 @@ TaskControlBlock subclass: DeviceTask [
 
 "--- the scheduler ----------------------------------------------------------"
 
+"I am the classic Richards benchmark — Martin Richards' simulation of an
+ operating-system task scheduler dispatching packets between an idle task,
+ a worker task, two packet handlers and two device tasks. I am the
+ scheduler itself: `start` builds the canonical task set, runs it to
+ completion and answers an encoded check value. Drive me through the
+ class-side harness protocol — setUp, runOne (a fresh scheduler per run)
+ and checkResult:. As a workload I exercise polymorphic message sends,
+ instance-variable access and object allocation: the classic
+ object-oriented dispatch benchmark."
 RBObject subclass: RichardsBenchmark [
     | taskList currentTask currentTaskIdentity taskTable queuePacketCount holdCount |
 
@@ -433,6 +473,11 @@ RBObject subclass: RichardsBenchmark [
  Lower arithmeticValue = stronger. initStrengths is called explicitly at
  the bottom of the file (no automatic class initialization in this world)."
 
+"I am a constraint strength in the DeltaBlue benchmark: an immutable
+ singleton per symbolic level from #required down to #weakest (a lower
+ arithmetic value is stronger). Reach the singletons via Strength of: or
+ the named class-side accessors; Strength initStrengths must run once to
+ seed the table before any constraint is built."
 Object subclass: Strength [
     | symbolicValue arithmeticValue |
     <classVars: Table Required StrongPreferred Preferred StrongDefault Normal WeakDefault Weakest>
@@ -478,6 +523,10 @@ Object subclass: Strength [
 
 "--- Variable ---------------------------------------------------------------"
 
+"I am a constrained variable in the DeltaBlue benchmark: I hold my current
+ value plus the solver bookkeeping — the constraints that mention me,
+ which constraint currently determines me, my walkabout strength, stay
+ flag and traversal mark."
 Object subclass: Variable [
     | value constraints determinedBy walkStrength stay mark |
 
@@ -524,6 +573,9 @@ Object subclass: Variable [
  A Plan IS an ordered list of constraints (the canonical version subclasses
  OrderedCollection exactly like this); execute runs them in order."
 
+"I am an ordered list of satisfied constraints extracted by the Planner
+ for the DeltaBlue benchmark; `execute` runs each constraint in order,
+ propagating an edited value through the constraint graph."
 OrderedCollection subclass: Plan [
     execute [ self do: [:c | c execute ] ]
 ]
@@ -532,6 +584,10 @@ OrderedCollection subclass: Plan [
  The solver. Current is the planner singleton the constraint add/destroy
  protocol reaches (canonical `Planner current`); each test run resets it."
 
+"I am the DeltaBlue incremental constraint solver: I add and remove
+ constraints one at a time, maintaining the walkabout-strength dataflow
+ graph, and extract executable Plans for repeated edits. The solver
+ singleton is Planner current; Planner reset installs a fresh one."
 Object subclass: Planner [
     | currentMark |
     <classVars: Current>
@@ -631,6 +687,10 @@ Object subclass: Planner [
 
 "--- AbstractConstraint ------------------------------------------------------"
 
+"I am the abstract superclass of every DeltaBlue constraint. I carry the
+ strength and the satisfy:/addConstraint/destroyConstraint protocol the
+ Planner drives; my subclasses define their variables, how a direction is
+ chosen, and what `execute` computes."
 Object subclass: AbstractConstraint [
     | strength |
 
@@ -683,6 +743,9 @@ Object subclass: AbstractConstraint [
 
 "--- UnaryConstraint (StayConstraint, EditConstraint) ------------------------"
 
+"I am a DeltaBlue constraint over a single output variable, satisfied
+ when my strength beats the variable's walkabout strength. StayConstraint
+ and EditConstraint are my concrete kinds."
 AbstractConstraint subclass: UnaryConstraint [
     | output satisfied |
 
@@ -719,10 +782,14 @@ AbstractConstraint subclass: UnaryConstraint [
     ]
 ]
 
+"I mark a DeltaBlue variable as preferring to stay unchanged; executing
+ me does nothing."
 UnaryConstraint subclass: StayConstraint [
     execute [ ^self ]
 ]
 
+"I am the DeltaBlue input constraint: I mark a variable the user is
+ editing, anchoring plan extraction; executing me does nothing."
 UnaryConstraint subclass: EditConstraint [
     isInput [ ^true ]
     execute [ ^self ]
@@ -730,6 +797,9 @@ UnaryConstraint subclass: EditConstraint [
 
 "--- BinaryConstraint (EqualityConstraint, ScaleConstraint) ------------------"
 
+"I am a DeltaBlue constraint relating two variables, satisfiable in
+ either direction; the chosen direction decides which variable is my
+ output. EqualityConstraint and ScaleConstraint are my concrete kinds."
 AbstractConstraint subclass: BinaryConstraint [
     | v1 v2 direction |
 
@@ -795,6 +865,8 @@ AbstractConstraint subclass: BinaryConstraint [
     ]
 ]
 
+"I constrain two DeltaBlue variables to be equal; executing me copies the
+ input variable's value to the output variable."
 BinaryConstraint subclass: EqualityConstraint [
     execute [
         (direction == #forward)
@@ -805,6 +877,9 @@ BinaryConstraint subclass: EqualityConstraint [
 
 "ScaleConstraint relates src (v1) and dst (v2) by dst = src * scale + offset,
  where scale and offset are themselves constrainable Variables."
+"I relate a source and a destination DeltaBlue variable by dst = src *
+ scale + offset, where scale and offset are themselves constrainable
+ Variables."
 BinaryConstraint subclass: ScaleConstraint [
     | scale offset |
 
@@ -866,6 +941,15 @@ BinaryConstraint subclass: ScaleConstraint [
  (2025 + sum over i=1..99 of i*5+2000 = 2025 + 222750 = 224775), so
  runOne's exact expected answer is 99 + 224775 = 224874."
 
+"I am the driver for the classic DeltaBlue benchmark: the incremental
+ dataflow constraint-solver workload. runOne runs the two canonical tests
+ — chainTest: pushes values down a chain of equality constraints, and
+ projectionTest: checks that a set of variables tracks a linear
+ scale-and-offset mapping under edits — and both assert their own answers
+ as they go. Drive me through the class-side harness protocol: setUp,
+ runOne and checkResult:. Strength initStrengths must have run once
+ first. As a workload I exercise polymorphic sends and collection churn
+ in the Planner's propagation loops."
 Object subclass: DeltaBlue [
     DeltaBlue class >> setUp [ ^self ]
 

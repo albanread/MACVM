@@ -41,6 +41,17 @@
  nest callbacks). Scripting helpers at the bottom drive every affordance for
  the rusttcl `gui` verb."
 
+"I am the native class browser tab: a class hierarchy outline, an
+ instance/class variables pane, a selectors table, and an editable source
+ pane below. I run in the UI worker VM and read through the host service —
+ the hierarchy and selector rows from the image database, the source text
+ likewise — while an Accept both writes the image and world files and
+ recompiles the class on the primary VM, so methods change immediately and
+ an instance-shape change honestly waits for the next boot. I offer the
+ full editing set: New Class / Remove, New Method / Remove (two-click
+ arm/confirm), add-variable, and Accept/Cancel on the source pane.
+ jumpToClass:side:selector: lets the Find tab land on a method here with
+ its source showing."
 Object subclass: CocoaBrowser [
     <classVars: Snapshot Handles HandleList SelectedPath Side EditMode
                 ShellSuper ShellIvars ShellCvars RemoveArmed PendingJump
@@ -1078,6 +1089,10 @@ Object subclass: CocoaBrowser [
  path); the browser mints faces by NAME at build time (cold), so the file
  compiles with the browser first — the same late-bind idiom CocoaUI uses
  for this class."
+"I am a per-table receiver for the browser's two tables. Both dispatch
+ the same data-source selectors, so each table gets its own instance of me
+ carrying a tag (#vars or #selectors); I forward row count, cell value and
+ selection changes to CocoaBrowser along with that tag."
 Object subclass: CocoaTableFace [
     | tag |
     CocoaTableFace class >> on: aTag [ ^self new setTag: aTag ]

@@ -5,6 +5,15 @@
  fromSmallInteger: never takes an absolute value (Pitfall P3: SmallInteger
  minVal's negation overflows) — it peels two's-complement digits directly."
 
+"I am the abstract arbitrary-precision integer. My indexable bytes ARE
+ my magnitude — base-256 digits, least significant first — and my sign
+ is my concrete class: LargePositiveInteger or LargeNegativeInteger. I
+ exist so SmallInteger arithmetic can overflow safely; results are
+ normalized back to SmallInteger whenever they fit, so you rarely meet
+ me directly. I support +, -, *, comparison, divMod:, negated, asDouble
+ and decimal printing. Full large // and \\ division is not
+ implemented — only divMod:."
+
 Integer subclass: LargeInteger [
     isInteger [
         ^true
@@ -248,8 +257,17 @@ Integer subclass: LargeInteger [
     ]
 ]
 
+"I am a LargeInteger that is zero or greater: my class IS the plus
+ sign. All real behavior lives in LargeInteger; only what depends on
+ sign (such as printing without a leading minus) distinguishes me."
+
 LargeInteger subclass: LargePositiveInteger [
 ]
+
+"I am a LargeInteger below zero: my class IS the minus sign, and my
+ bytes store the plain magnitude, not a twos-complement encoding. All
+ real behavior lives in LargeInteger; only what depends on sign (such
+ as printing the leading minus) distinguishes me."
 
 LargeInteger subclass: LargeNegativeInteger [
 ]

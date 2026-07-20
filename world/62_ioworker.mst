@@ -33,6 +33,19 @@
  (kevent has no pselect-style atomic mask). NEVER poke a #pump send: a pump
  that wakes its own sleep busy-loops."
 
+"I am a dedicated I/O worker VM: I sleep in the kernel watching many file
+ descriptors through one kqueue and message you back when data or
+ connections arrive, so no other VM ever blocks on I/O. On the requesting
+ side, `IoWorker spawn` boots one; watchRead:onData: registers a two-arg
+ continuation [:bytes :eof | ...] for a readable fd, and
+ watchAccept:onConnection: a one-arg continuation for a listening socket;
+ startPumping begins the poll loop (infinite kernel sleeps, woken by a
+ poke whenever you register something new) and stopPumping / terminate end
+ it. Reads and accepts are bounded by what the kernel reported, so they
+ never block; errors are values in messages, never raises. File
+ descriptors are shared across worker VMs, so an fd opened anywhere is
+ valid here. My class side is the server that runs inside the spawned
+ worker itself."
 Object subclass: IoWorker [
     | worker kq readHandlers acceptHandlers pumping |
     <classVars: Kq Buf Accepting>

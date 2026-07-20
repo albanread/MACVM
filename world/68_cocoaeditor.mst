@@ -16,6 +16,17 @@
  EditorSession/Rope model (world/60) stays available for other uses; this view
  does not drive it."
 
+"I am the Editor tab: pick any class from the image (type-ahead combobox),
+ Load its whole-class source into a native text view, edit, and Save —
+ which both recompiles the class live on the primary VM and writes the
+ diffed source back to the image and world files (methods change at once;
+ an instance-shape change takes effect on the next launch). My action bar
+ and the File/Source menus also work on plain source files: New, Open,
+ Save, Save As, File In (a fresh world, then your file — exactly like
+ running it from the command line), Add to World (graduate the file into
+ the standard boot), plus Format and Analyze — a real-parser syntax check
+ that marks and scrolls to the offending line. I run in the UI worker VM
+ and reach the image through the host service."
 Object subclass: CocoaEditor [
     <classVars: Container Picker Buffer BufferScroll ActionDelegates BufferDelegate LastProbe
                 CurrentPath BarBox BarButtons>
@@ -231,6 +242,8 @@ shape change takes effect on the next launch)."'
  File > File In     compiles it into the running VM;
  Source > Analyze   syntax-checks;  Source > Format  re-indents."
 
+"I am the placeholder class in the editor file template, seeded by File
+ New as a minimal working example. Rename me and replace my methods."
 Object subclass: MyClass [
     | instanceVar |
 

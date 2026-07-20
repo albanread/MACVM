@@ -11,6 +11,12 @@
  Lettered file (matching 04a_blockclosure.mst's own precedent): 01-62 are
  fully packed (world/cocoaui.list's own header note), and this is a general
  codec, not Cocoa-specific, so it belongs in the base world, not 63+."
+"I encode bytes as Base64 text (RFC 4648, standard alphabet, = padding).
+ `Base64 encode:` takes any indexable byte collection — a ByteArray, or a
+ String read as bytes — and answers the encoded String. Encoding only: my
+ job is carrying arbitrary binary data (such as a Pixmap's raw RGBA bytes)
+ over channels that accept only Strings; decoding happens on the receiving
+ side."
 Object subclass: Base64 [
     Base64 class >> alphabet [
         ^'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'

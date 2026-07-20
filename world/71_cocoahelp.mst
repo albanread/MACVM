@@ -19,6 +19,11 @@
  src/runtime/primitives.rs). Every piece of this path — the file read, the
  options object, the parser itself — is an existing Cocoa-bridge send; there
  is no hand-rolled Markdown-to-attributes conversion anywhere here."
+"I am the Help tab: a read-only, scrollable viewer for the system's
+ Markdown documentation. I load the help file from disk and render it with
+ AppKit's own Markdown parser, so headings, emphasis, lists and code
+ arrive as styled text with no HTML anywhere. A missing or unreadable file
+ fails quietly. I run in the UI worker VM."
 Object subclass: CocoaHelp [
     <classVars: Container Scroll TextView>
 

@@ -18,6 +18,16 @@
  Geometry (the pane is 320x240): a 10x6 brick wall on a 32x14 cell grid starting
  at y=26 (bricks inset to 28x10); a 44x5 paddle at y=224; a radius-3 ball; the
  top HUD strip is the top 16px (score bar left, remaining lives right)."
+"I am a complete Breakout game for the native game pane. Launch me from
+ the Demos menu, or a Workspace: Breakout launch. Move the paddle with the
+ Left/Right arrow keys; the ball bounces off the walls, the paddle and a
+ six-row brick wall, scoring a point (and a blip) per brick. Miss the ball
+ off the bottom and you lose one of three lives; lose them all or clear
+ the wall and the board simply rebuilds, so I loop forever as a demo.
+ My physics is plain deterministic integer arithmetic, and I exercise the
+ whole pane at once: palette, rectangles, discs, keyboard input, sound
+ effects and the frame loop. Harmless to load in a headless VM (every game
+ primitive silently fails there)."
 Object subclass: Breakout [
     | pane bx by vx vy paddleX score lives bricks bricksLeft |
 

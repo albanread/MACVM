@@ -10,6 +10,14 @@
  'invalid on empty' convention, 15_ordered.mst — no exceptions until
  W5/S18, so this is the house v1 idiom, not a Bluebook-nil-return port)."
 
+"I am a sequential input stream over a sequenceable collection such as a
+ String or an Array. Create me with ReadStream on: aCollection, or ask any
+ collection for readStream. Send next to consume one element, peek to look
+ ahead without consuming (nil at the end), and atEnd to test exhaustion;
+ sending next past the end is an error. Richer protocol: next: (a slice),
+ upTo: (read through a delimiter), nextLine, peekFor:, skip:,
+ skipSeparators, upToEnd, position/position:, reset, and do: over the
+ remaining elements."
 Object subclass: ReadStream [
     | collection position |
 

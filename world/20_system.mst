@@ -7,6 +7,13 @@
  markedBytesLast, contextAllocs — the soak harness and S14's Context-
  elision gate both index into it by position."
 
+"I am the class of Smalltalk, the single object that represents the
+ running system. Send me gcScavenge or gcFull to force a garbage
+ collection, gcStats for an Array of collector counters, millisecondClock
+ for milliseconds elapsed since the VM started (monotonic, not wall-clock
+ time), and quit or quit: to leave the system with an exit code. These are
+ all backed by VM primitives; startUp is a boot hook that currently does
+ nothing."
 Object subclass: SystemDictionary [
     startUp [
         ^self

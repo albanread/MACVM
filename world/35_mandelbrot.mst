@@ -9,6 +9,15 @@
  strings, no fillRect command batch. The buffer crosses to the GUI once and is
  blitted in a single putImageData. Rust only transports the bytes; no VM-side
  Canvas primitive is needed (docs/CANVAS.md §7 stays deferred)."
+"I compute the Mandelbrot set in plain Double arithmetic. My core method
+ escapeAtRe:im: answers the escape count for one complex point, capped at
+ maxIter (settable with maxIter:, default 120). pixmapForWidth:height:
+ renders the whole set into a fresh Pixmap — black interior, colourful
+ bands outside — and pixelsForWidth:height: answers the raw RGBA bytes for
+ the GUI to blit in one operation.
+ My inner loop is deliberately allocation-free floating point, the showcase
+ workload for JIT-compiled float arithmetic; the MandelZoom and
+ ParallelMandel demos reuse escapeAtRe:im: unchanged."
 Object subclass: Mandelbrot [
     | maxIter |
     Mandelbrot class >> new [ ^self basicNew init ]
