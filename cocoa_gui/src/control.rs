@@ -50,6 +50,16 @@ fn read_frame(s: &mut TcpStream) -> std::io::Result<Option<String>> {
         .trim()
         .parse()
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad frame length"))?;
+    // Cap the client-supplied length: an unbounded `vec![0; len]` let a single
+    // malformed frame (e.g. "999999999999\n") abort the whole GUI process via
+    // allocator failure. 16 MB is far above any real doit/eval payload.
+    const MAX_FRAME: usize = 16 * 1024 * 1024;
+    if len > MAX_FRAME {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "frame length exceeds 16MB cap",
+        ));
+    }
     let mut buf = vec![0u8; len];
     s.read_exact(&mut buf)?;
     Ok(Some(String::from_utf8_lossy(&buf).into_owned()))

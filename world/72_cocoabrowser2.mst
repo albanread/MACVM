@@ -651,9 +651,20 @@ Object subclass: CocoaBrowser2 [
         ^Array new: 0
     ]
     CocoaBrowser2 class >> reselectAfterRefresh [
+        "Preserve the METHOD selection + source mode too (review finding: after
+         an Accept the pane jumped to the class comment) — selectClass: resets
+         both, so capture before and re-apply after, if the method survived."
+        | keepMethod keepMode |
+        keepMethod := SelectedMethod. keepMode := SourceMode.
         Classes := self classesInPackage: SelectedPackageName.
         (SelectedClass notNil and: [ Records notNil and: [ Records includesKey: SelectedClass ] ])
-            ifTrue: [ self selectClass: SelectedClass ]
+            ifTrue: [
+                self selectClass: SelectedClass.
+                (keepMethod notNil and: [ self currentSideSelectors includes: keepMethod ])
+                    ifTrue: [
+                        SelectedMethod := keepMethod.
+                        SourceMode := keepMode.
+                        self syncModeSeg. self renderSource ] ]
             ifFalse: [ self clearClassSelection ].
     ]
 

@@ -236,12 +236,18 @@ fn watchdog_main(
                 stop.store(true, Ordering::Release);
                 consecutive_boot_failures += 1;
                 if consecutive_boot_failures >= MAX_CONSECUTIVE_BOOT_FAILURES {
+                    // The honest end (the rebuild.rs Layer-3 doctrine): a
+                    // `return` here left the window alive but permanently
+                    // primary-less — every doit hanging forever with nothing
+                    // surfaced (e.g. a corrupted image reproduces this
+                    // deterministically). Exit instead.
                     eprintln!(
                         "macvm-cocoa: primary respawn failed {consecutive_boot_failures}× \
-                         in a row ({}); giving up",
+                         in a row ({}); exiting — the GUI is useless without a primary \
+                         (is world/image.sqlite3 corrupt?)",
                         e.msg
                     );
-                    return;
+                    std::process::exit(73);
                 }
                 std::thread::sleep(RESPAWN_BACKOFF);
                 continue;
@@ -257,11 +263,13 @@ fn watchdog_main(
                 stop.store(true, Ordering::Release);
                 consecutive_boot_failures += 1;
                 if consecutive_boot_failures >= MAX_CONSECUTIVE_BOOT_FAILURES {
+                    // Same honest-end doctrine as the boot-failure arm above.
                     eprintln!(
                         "macvm-cocoa: primary respawn died before registering \
-                         {consecutive_boot_failures}× in a row; giving up"
+                         {consecutive_boot_failures}× in a row; exiting — the GUI \
+                         is useless without a primary"
                     );
-                    return;
+                    std::process::exit(73);
                 }
                 std::thread::sleep(RESPAWN_BACKOFF);
                 continue;

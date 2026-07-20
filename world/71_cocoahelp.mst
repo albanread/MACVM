@@ -88,7 +88,7 @@ Object subclass: CocoaHelp [
          below — nil for 'don't care'. A missing/unreadable file answers Cocoa
          nil, which wrap_result marshals to Smalltalk nil (not a primitive
          failure) — the ifTrue: below is the real check."
-        | ns argv |
+        | ns argv text |
         argv := Array with: (Cocoa nsString: self helpFile) with: 4 with: nil.
         ns := (Cocoa classNamed: 'NSString')
             send: 'stringWithContentsOfFile:encoding:error:' args: argv ret: #id.
@@ -100,7 +100,9 @@ Could not load **', self helpFile, '**.
 Run `macvm-cocoa` from the repository root (see `run-cocoa.sh`) — this tab
 reads the file relative to the process''s working directory, the same
 assumption the toolbar icons already make.' ].
-        ^ns asString
+        text := ns asString.
+        ns release.
+        ^text
     ]
 
     CocoaHelp class >> markdownOptions [
@@ -117,13 +119,15 @@ assumption the toolbar icons already make.' ].
          links to resolve, a single self-contained page) and nil error (see
          the file header: a Smalltalk nil marshals to NULL, the legal
          'don't care' form of this argument)."
-        | argv |
-        argv := Array with: (Cocoa nsString: aString) with: self markdownOptions
-                      with: nil with: nil.
-        ^(Cocoa classNamed: 'NSAttributedString') alloc
+        | opts attr |
+        opts := self markdownOptions.
+        attr := (Cocoa classNamed: 'NSAttributedString') alloc
             send: 'initWithMarkdownString:options:baseURL:error:'
-            args: argv
-            ret: #id
+            args: (Array with: (Cocoa nsString: aString) with: opts with: nil with: nil)
+            ret: #id.
+        "The options object is ours (alloc init) — the parser doesn't keep it."
+        opts release.
+        ^attr
     ]
 
     CocoaHelp class >> blockSeparator [
@@ -223,20 +227,36 @@ assumption the toolbar icons already make.' ].
          ReturnPartiallyParsedIfPossible policy) falls back to that block's
          raw text via the live NSMutableString proxy, never a second parse
          attempt on error text — and never a blank pane."
-        | md blocks storage first |
+        | md blocks storage first empty |
         md := self loadMarkdown.
         blocks := self splitBlocks: md.
         storage := TextView onMain textStorage.
-        storage onMain setAttributedString: (((Cocoa classNamed: 'NSAttributedString') onMain alloc) onMain init).
+        "Release every fresh wrapper this build path mints (the review's
+         CocoaHelp-leaks finding): the empty seed string, each block's
+         mutableString proxy + parsed NSAttributedString, and the textStorage
+         wrapper itself — the storage/text objects live on in the view; only
+         our +1 handles are dropped."
+        empty := ((Cocoa classNamed: 'NSAttributedString') onMain alloc) onMain init.
+        storage onMain setAttributedString: empty.
+        empty release.
         first := true.
-        blocks do: [ :block | | attr |
+        blocks do: [ :block | | attr ms |
             first
                 ifTrue: [ first := false ]
-                ifFalse: [ (storage onMain mutableString) onMain appendString: self blockSeparator ].
+                ifFalse: [
+                    ms := storage onMain mutableString.
+                    ms onMain appendString: self blockSeparator.
+                    ms release ].
             attr := self attributedFor: (self boldedIfHeader: block).
             attr isNil
-                ifTrue: [ (storage onMain mutableString) onMain appendString: block ]
-                ifFalse: [ storage onMain appendAttributedString: attr ] ].
+                ifTrue: [
+                    ms := storage onMain mutableString.
+                    ms onMain appendString: block.
+                    ms release ]
+                ifFalse: [
+                    storage onMain appendAttributedString: attr.
+                    attr release ] ].
+        storage release.
     ]
 
     "── teardown (UI-worker rebuild — CG9; CocoaUI class >> teardown calls this by name) ──"

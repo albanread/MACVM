@@ -164,10 +164,16 @@ Object subclass: CocoaBrowser [
 
     "── jump (the Find view's landing path; works before first open too) ──"
     CocoaBrowser class >> jumpToClass: cls side: sideOrNil selector: selOrNil [
-        Snapshot isNil ifTrue: [
-            PendingJump := Array with: cls with: sideOrNil with: selOrNil.
-            ^self ].
-        self performJump: cls side: sideOrNil selector: selOrNil
+        "ALWAYS defer — never perform the jump here. This is called from the
+         Find table's selection callback, and a synchronous performJump: drives
+         expandItem:/selectRowIndexes: whose NESTED data-source callbacks are
+         the exact re-entrancy requestRefresh's own comment outlaws (blank pane,
+         or a walk_frames crash once JIT-compiled). Store the jump and flag a
+         refresh: installSnapshot services PendingJump TOP-LEVEL (drain_perform
+         → doRefresh), where the direct expand/select calls are safe. Covers
+         the never-opened case too (the refresh builds the first snapshot)."
+        PendingJump := Array with: cls with: sideOrNil with: selOrNil.
+        self requestRefresh
     ]
     CocoaBrowser class >> performJump: cls side: sideOrNil selector: selOrNil [
         self selectClassNamed: cls.
