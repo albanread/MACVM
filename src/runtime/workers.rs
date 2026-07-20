@@ -323,19 +323,40 @@ pub fn spawn(vm: &mut VmState, init: Option<String>) -> Option<u32> {
     else {
         return None; // workers don't spawn workers (v1 star topology)
     };
-    if links.len() >= MAX_WORKERS {
-        return None;
-    }
+    // Reclaim a TERMINATED slot's index before growing the fleet. `terminate`
+    // (below) marks a link dead but never shrinks `links` — a dead slot's id
+    // must stay stable in case an in-flight reply is still keyed by it — so
+    // without this reuse, a demo that spawns N workers per launch and
+    // cleanly terminates them every time (GamePane's `onReset:` hook) still
+    // permanently consumes N slots per launch and hits MAX_WORKERS after
+    // MAX_WORKERS/N launches even though nothing is actually alive: exactly
+    // ParallelMandel's "breaks after a little use" (observed live: launch 5
+    // of 4-worker rounds hit the cap with zero live workers). `MAX_WORKERS`
+    // is documented as "a pool of up to 16 CONCURRENT worker VMs" (README) —
+    // a monotonic ever-spawned counter was never the intent.
+    let reuse_idx = links.iter().position(|l| !l.alive);
+    let id = match reuse_idx {
+        Some(idx) => (idx + 1) as u32,
+        None => {
+            if links.len() >= MAX_WORKERS {
+                return None;
+            }
+            links.len() as u32 + 1
+        }
+    };
     let (tx, rx) = channel::<Envelope>();
-    let id = links.len() as u32 + 1;
     let boot = boot.clone();
     let to_primary = inbox_tx.clone();
     // Detached on purpose (S21: never join a VM worker thread).
     std::thread::spawn(move || worker_main(id, &boot, &rx, &to_primary, init.as_deref()));
-    links.push(WorkerLink {
+    let link = WorkerLink {
         inbox: InboxSender::detached(tx),
         alive: true,
-    });
+    };
+    match reuse_idx {
+        Some(idx) => links[idx] = link,
+        None => links.push(link),
+    }
     Some(id)
 }
 

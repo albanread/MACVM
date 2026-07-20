@@ -134,6 +134,16 @@ fn ensure_pane() {
             sprite_ids: HashMap::new(),
             timer: objc::NIL,
         });
+        // Start this session with a clean held-key table. HELD_KEYS is only
+        // cleared by a keyUp: delivered to the game's OWN view, so an Escape
+        // that closed the PREVIOUS demo — its keyUp: has nowhere to go, since
+        // that view is already gone — would otherwise still read as held here.
+        // The frame loop's level-triggered Escape check (`game_tick`, below)
+        // would then close THIS brand-new window on its very first tick,
+        // before a single frame is seen: the "second demo exits immediately"
+        // bug, fixed once already in the WKWebView GUI's `display_game_pane`
+        // (`gui/src/main.rs`) but never carried over here.
+        macgamepane_graphics::input::clear_all();
     });
 }
 
@@ -175,7 +185,20 @@ fn close_window() {
                 objc::send1_id(w, objc::sel("setDelegate:"), objc::NIL);
                 objc::send1_id(w, objc::sel("orderOut:"), objc::NIL);
                 objc::send1_id(w, objc::sel("close"), objc::NIL);
+                // `setReleasedWhenClosed:false` (ensure_pane) means AppKit will
+                // NOT release the window on close — that was only ever to keep
+                // the raw ptr valid for OUR OWN use up to this point. Now that
+                // every use is done, release the two objects WE alloc'd
+                // (`GameWindow::create`'s `window_alloc`/`alloc_init("MacGamePaneKeyView")`
+                // each hand back a +1 nothing else was releasing): the window
+                // first (its own dealloc drops its retain on the content
+                // view), then our own +1 on the view. Every prior session
+                // leaked one full NSWindow + CAMetalLayer-backed view +
+                // window-server surface — repeated Demos use accumulated them
+                // without limit.
+                objc::send0(w, objc::sel("release"));
             }
+            objc::send0(g.win.view, objc::sel("release"));
         }
     });
     GAME_ACTIVE.store(false, Ordering::Release);

@@ -231,6 +231,18 @@ extern "C" fn drain_perform(info: *mut c_void) {
     }
 
     while let Some(link) = st.supervisor.poll_resync() {
+        // A demo's state (StepBlock, ParallelMandel's workers, ...) lives on
+        // the primary being replaced — the design's own documented restart
+        // hook (docs/gamepane_design.md), never wired up. Without this, a
+        // primary restart mid-game orphans the window+timer indefinitely:
+        // GAME_ACTIVE never clears (nothing left alive to emit StopLoop), so
+        // `is_active()` keeps the supervisor pinned to its fast ~4ms beat
+        // forever, and the stale pane just sits open and unresponsive. Route
+        // through the SAME stop path Escape/close use — it is main-thread
+        // Cocoa teardown only, independent of the primary that just died.
+        if game::is_active() {
+            game::request_stop();
+        }
         // Drain the DYING generation's inbox before dropping it (CG4 review):
         // its last buffered envelopes — the fatal doit's transcript line, any
         // reply that landed before it died — are delivered now, else they are

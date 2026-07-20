@@ -73,8 +73,21 @@ Object subclass: ParallelMandel [
             workers at: k put: (Worker spawn:
                 'Worker onMessage: [:m | Worker reply: (ParallelMandel computeBand: m payload)]') ].
         self kickRound.
-        pane onStep: [ self step ]; run.
+        pane onStep: [ self step ]; onReset: [ self teardownWorkers ]; run.
         ^self
+    ]
+
+    teardownWorkers [
+        "GamePane's reset hook: this session is ending — however (Escape, the
+         close button, a re-launch, an orphaned pane closed on primary-VM
+         restart). Without this, `workers` — 4 spawned VMs per launch — was
+         never terminated, permanently consuming slots against the fleet's
+         16-worker cap (src/runtime/workers.rs) until repeated Demos use
+         exhausted it and a later launch's `Worker spawn:` started failing
+         mid-`start`, after the window/palette had already appeared."
+        workers isNil ifTrue: [ ^self ].
+        workers do: [ :w | w isNil ifFalse: [ w terminate ] ].
+        workers := nil.
     ]
 
     buildPalette [

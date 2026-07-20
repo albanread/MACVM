@@ -34,7 +34,7 @@ Object subclass: Sprite [
 ]
 
 Object subclass: GamePane [
-    <classVars: StepBlock Keys NextId>
+    <classVars: StepBlock Keys NextId ResetBlock>
 
     clearR: r g: g b: b [
         "Clear the pane to an opaque RGB colour (each 0..255) and present it."
@@ -93,6 +93,17 @@ Object subclass: GamePane [
         StepBlock := aBlock.
         ^self
     ]
+    onReset: aBlock [
+        "Register a one-shot cleanup block, run by `reset` (below) the moment
+         this session ends — however it ends: Escape, the close button, a
+         re-launch while this demo is still running, or an orphaned pane
+         force-closed by a primary-VM restart. For a demo with per-session
+         native/worker state beyond StepBlock (ParallelMandel's spawned
+         workers), THIS is the clean-teardown hook — without it, that state
+         has no reset path at all and just accumulates across runs."
+        ResetBlock := aBlock.
+        ^self
+    ]
     run [
         "Start the frame loop: the GUI's main-thread timer begins pulling one
          frame per tick. Returns immediately — the loop is owned by the timer,
@@ -141,6 +152,12 @@ Object subclass: GamePane [
         ^(Keys bitAnd: (1 bitShift: keyCode)) ~= 0
     ]
     GamePane class >> reset [
+        "Run and clear whatever cleanup a demo registered via `onReset:` FIRST
+         (while its StepBlock closure is still intact to poke at), then the
+         frame-loop state itself. MACVM has no exception system (fail fast is
+         the house rule) — a broken teardown block surfaces normally, exactly
+         like any other guest error."
+        ResetBlock ifNotNil: [ ResetBlock value. ResetBlock := nil ].
         StepBlock := nil.
         Keys := 0.
     ]
