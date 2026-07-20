@@ -58,7 +58,8 @@ Object subclass: CocoaUI [
                 MetricLabels MemBarFill MemBarWidth Workspace WorkspaceScroll
                 WorkspaceTextDelegate TabItems TabIndexes
                 TranscriptDivider TranscriptClearBtn FontDelta
-                FontMinusBtn FontPlusBtn JitOn JitMenuItem>
+                FontMinusBtn FontPlusBtn JitOn JitMenuItem
+                WorkspaceContainer WorkspaceBarBox WorkspaceBarButtons>
 
     CocoaUI class >> title [ ^'MACVM' ]
 
@@ -432,22 +433,40 @@ Object subclass: CocoaUI [
     ]
 
     "── the Workspace view (CG6: selection-or-everything, inline Print it) ──"
+    CocoaUI class >> workspaceBarHeight [ ^30.0 ]
     CocoaUI class >> workspaceContainer [
-        "Answer the workspace's root view (the scroll), building lazily —
-         the tab host owns it from first show onward."
-        | tvClass frame |
+        "Answer the workspace's root view (a wrapper: grained action bar over
+         the scroll), building lazily — the tab host owns it from first show
+         onward. The bar makes Do It / Print It one-click (⌘D/⌘P still work);
+         the old preloaded explainer comment is gone — the buttons say it."
+        | tvClass frame w h barY |
         Workspace isNil ifTrue: [
             tvClass := Cocoa classNamed: 'NSTextView'.
             frame := ContentHost onMain frame.
+            w := frame at: 3. h := frame at: 4.
+            barY := h - self workspaceBarHeight.
+            WorkspaceContainer := ((Cocoa classNamed: 'NSView') onMain alloc) onMain
+                initWithFrame: (Array with: 0.0 with: 0.0 with: w with: h).
+            WorkspaceContainer onMain setAutoresizingMask: self maskWidthSizable + self maskHeightSizable.
+            WorkspaceContainer onMain setAutoresizesSubviews: true.
+            "The grained bar (the transcript/editor bars' own look) — grain
+             first, buttons on top."
+            WorkspaceBarBox := self addTexturedBoxFrame: (Array with: 0.0 with: barY with: w with: self workspaceBarHeight)
+                                    resize: self maskWidthSizable + self maskMinYMargin
+                                    in: WorkspaceContainer.
+            WorkspaceBarButtons := OrderedCollection new.
+            self workspaceBarButton: 'Do It' frame: (Array with: 4.0 with: barY + 3.0 with: 72.0 with: 24.0)
+                 action: [ self doIt ].
+            self workspaceBarButton: 'Print It' frame: (Array with: 80.0 with: barY + 3.0 with: 80.0 with: 24.0)
+                 action: [ self printIt ].
+
             Workspace := (tvClass onMain alloc) onMain
-                initWithFrame: (Array with: 0.0 with: 0.0
-                                      with: (frame at: 3) with: (frame at: 4)).
+                initWithFrame: (Array with: 0.0 with: 0.0 with: w with: barY).
             Workspace onMain setEditable: true.
             Workspace onMain setAutomaticQuoteSubstitutionEnabled: false.
             Workspace onMain setAutomaticDashSubstitutionEnabled: false.
             Workspace onMain setAutomaticTextReplacementEnabled: false.
             Workspace onMain setFont: (self fixedFontOfSize: 13.0).
-            Workspace onMain setString: self placeholderText.
             "Scroll-wrapped like every other text surface: a bare NSTextView
              draws past its frame and its stale pixels bleed through the next
              view's transparent regions after a switch (the browser-first-open
@@ -460,25 +479,33 @@ Object subclass: CocoaUI [
                 tc onMain setWidthTracksTextView: true.
                 tc release ].
             WorkspaceScroll := ((Cocoa classNamed: 'NSScrollView') onMain alloc) onMain
-                initWithFrame: (Array with: 0.0 with: 0.0
-                                      with: (frame at: 3) with: (frame at: 4)).
+                initWithFrame: (Array with: 0.0 with: 0.0 with: w with: barY).
             WorkspaceScroll onMain setHasVerticalScroller: true.
             WorkspaceScroll onMain setAutoresizingMask: self maskWidthSizable + self maskHeightSizable.
             WorkspaceScroll onMain setDocumentView: Workspace.
+            WorkspaceContainer onMain addSubview: WorkspaceScroll.
             "CG8: live syntax colour, same mechanism as the browser's source
              pane (the delegate fires for programmatic setString: too)."
             WorkspaceTextDelegate := MacvmDelegate textDelegateOn: self.
             Workspace onMain setDelegate: WorkspaceTextDelegate.
             self recolorizeWorkspace.
         ].
-        ^WorkspaceScroll
+        ^WorkspaceContainer
     ]
-
-    CocoaUI class >> placeholderText [
-        ^'"Type Smalltalk here.
-Do it runs the selection (or everything, if nothing''s selected).
-Print it does the same and inserts the result right after it."
-3 + 4.'
+    CocoaUI class >> workspaceBarButton: title frame: rect action: aBlock [
+        | btn holder delegate |
+        btn := ((Cocoa classNamed: 'NSButton') onMain alloc) onMain initWithFrame: rect.
+        btn onMain setTitle: title.
+        btn onMain setBezelStyle: 1.
+        btn onMain setAutoresizingMask: self maskMinYMargin.
+        holder := CocoaToolbarAction on: aBlock.
+        delegate := MacvmDelegate actionTargetOn: holder.
+        btn onMain setTarget: delegate.
+        btn onMain setAction: 'macvmAction:'.
+        ToolbarDelegates add: delegate.
+        WorkspaceContainer onMain addSubview: btn.
+        WorkspaceBarButtons add: btn.
+        ^btn
     ]
 
     CocoaUI class >> workspace [ ^Workspace ]
@@ -1009,6 +1036,11 @@ Print it does the same and inserts the result right after it."
             Workspace isNil ifFalse: [ Workspace isValid ifTrue: [ Workspace release ] ].
             WorkspaceScroll isNil ifFalse: [ WorkspaceScroll isValid ifTrue: [ WorkspaceScroll release ] ].
             WorkspaceScroll := nil.
+            WorkspaceBarButtons isNil ifFalse: [
+                WorkspaceBarButtons do: [ :b | b isValid ifTrue: [ b release ] ] ].
+            WorkspaceBarBox isNil ifFalse: [ WorkspaceBarBox isValid ifTrue: [ WorkspaceBarBox release ] ].
+            WorkspaceContainer isNil ifFalse: [ WorkspaceContainer isValid ifTrue: [ WorkspaceContainer release ] ].
+            WorkspaceBarButtons := nil. WorkspaceBarBox := nil. WorkspaceContainer := nil.
             WorkspaceTextDelegate isNil ifFalse: [ WorkspaceTextDelegate isValid ifTrue: [ WorkspaceTextDelegate release ] ].
             WorkspaceTextDelegate := nil.
             Toolbar isNil ifFalse: [ Toolbar isValid ifTrue: [ Toolbar release ] ].
