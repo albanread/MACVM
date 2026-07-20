@@ -103,12 +103,45 @@ fn read_world_list(world_dir: &Path) -> Result<Vec<String>, String> {
     let list_path = world_dir.join("world.list");
     let text = fs::read_to_string(&list_path)
         .map_err(|e| format!("reading {}: {e}", list_path.display()))?;
-    Ok(text
-        .lines()
+    Ok(parse_list(&text))
+}
+
+fn parse_list(text: &str) -> Vec<String> {
+    text.lines()
         .map(|l| l.trim())
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
         .map(|l| l.to_string())
-        .collect())
+        .collect()
+}
+
+/// Every `.mst` named by ANY `*.list` in `world_dir` — the full set of
+/// hand-authored files, not just `world.list`'s.
+///
+/// The pre-scan MUST see all of them. It once read `world.list` alone, so every
+/// class living in another list (all of `cocoaui.list` — `CocoaUI`,
+/// `CocoaBrowser`, `CocoaToolbarAction`, …) looked brand-new and got dumped
+/// wholesale into the additions file. That file is appended to `world.list`,
+/// which loads BEFORE `cocoaui.list`, so the duplicate definition then lost a
+/// shape race against the real one and the boot died with "cannot change shape
+/// of existing class CocoaToolbarAction". Observed live 2026-07-20.
+fn read_all_lists(world_dir: &Path) -> Result<Vec<String>, String> {
+    let mut names: Vec<String> = Vec::new();
+    let dir = fs::read_dir(world_dir)
+        .map_err(|e| format!("reading {}: {e}", world_dir.display()))?;
+    let mut lists: Vec<PathBuf> = dir
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "list"))
+        .collect();
+    lists.sort(); // deterministic order
+    for list in lists {
+        let text = fs::read_to_string(&list).unwrap_or_default();
+        for n in parse_list(&text) {
+            if !names.contains(&n) {
+                names.push(n);
+            }
+        }
+    }
+    Ok(names)
 }
 
 /// Ensure the additions file is named in `world.list` (appended last, so its
@@ -131,13 +164,20 @@ fn ensure_in_world_list(world_dir: &Path, entries: &[String]) -> Result<(), Stri
 
 /// Write the image's current state over `world_dir`'s `.mst` files in place.
 pub fn export_world_dir(image: &Image, world_dir: &Path) -> Result<ExportStats, String> {
+    // `entries` = world.list only (it alone decides where the additions file is
+    // registered), but the PRE-SCAN below must see every list's files — see
+    // `read_all_lists` for the boot-breaking bug that scanning world.list alone
+    // caused.
     let entries = read_world_list(world_dir)?;
-    // The hand-authored files (world.list minus the exporter-owned additions
-    // file, which pass 2 regenerates wholesale).
-    let files: Vec<PathBuf> = entries
+    let all_entries = read_all_lists(world_dir)?;
+    // The hand-authored files (every list, minus the exporter-owned additions
+    // file, which pass 2 regenerates wholesale). Non-existent names are skipped
+    // so a list naming a not-yet-written file can't abort the export.
+    let files: Vec<PathBuf> = all_entries
         .iter()
         .filter(|n| n.as_str() != ADDITIONS_FILE)
         .map(|n| world_dir.join(n))
+        .filter(|p| p.exists())
         .collect();
 
     // Pre-scan: `present` = every (class, side, selector) that lives in some
@@ -311,6 +351,57 @@ pub fn export_world_dir(image: &Image, world_dir: &Path) -> Result<ExportStats, 
 mod tests {
     use super::*;
     use crate::{Image, Side};
+
+    /// The pre-scan must span EVERY `*.list`, not just `world.list`. It used to
+    /// read `world.list` alone, so a class defined in a sibling list looked
+    /// brand-new and got dumped whole into the additions file — which is
+    /// registered in `world.list` and therefore loads BEFORE the sibling list,
+    /// so the duplicate definition then lost a shape race against the real one
+    /// and the boot died ("cannot change shape of existing class …"). Observed
+    /// live 2026-07-20 with `CocoaToolbarAction`.
+    #[test]
+    fn export_scans_every_list_so_sibling_list_classes_are_not_duplicated() {
+        let dir = std::env::temp_dir().join(format!("macvm_export_lists_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        // Core class in world.list; UI class in a SEPARATE list (the cocoaui.list
+        // arrangement the real world uses).
+        fs::write(
+            dir.join("10_foo.mst"),
+            "Object subclass: Foo [\n    | x |\n    bump [\n        x := 1\n    ]\n]\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("60_ui.mst"),
+            "Object subclass: Ui [\n    | b |\n    act [\n        ^b\n    ]\n]\n",
+        )
+        .unwrap();
+        fs::write(dir.join("world.list"), "10_foo.mst\n").unwrap();
+        fs::write(dir.join("ui.list"), "60_ui.mst\n").unwrap();
+
+        let image = Image::open(&dir.join("image.sqlite3")).unwrap();
+        crate::import::import_world_dir(&image, &dir).unwrap();
+        crate::import::import_list_file(&image, &dir, "ui.list").unwrap();
+
+        // A fresh export must be a pure no-op: `Ui` already lives in ui.list, so
+        // nothing may be re-emitted for it.
+        let s = export_world_dir(&image, &dir).unwrap();
+        assert_eq!(s, ExportStats::default(), "fresh export must touch nothing, got {s:?}");
+
+        let adds_path = dir.join(ADDITIONS_FILE);
+        let adds = fs::read_to_string(&adds_path).unwrap_or_default();
+        assert!(
+            !adds.contains("subclass: Ui"),
+            "a class from a sibling list must NOT be duplicated into the additions file: {adds}"
+        );
+        assert!(
+            !fs::read_to_string(dir.join("world.list")).unwrap().contains(ADDITIONS_FILE),
+            "no additions file to register, so world.list must be left alone"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn export_is_idempotent_splices_edits_and_homes_new_methods() {

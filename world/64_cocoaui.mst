@@ -60,7 +60,7 @@ Object subclass: CocoaUI [
                 TranscriptDivider TranscriptClearBtn FontDelta
                 FontMinusBtn FontPlusBtn JitOn JitMenuItem
                 WorkspaceContainer WorkspaceBarBox WorkspaceBarButtons
-                HaltOn HaltMenuItem>
+                HaltOn HaltMenuItem MetricViews MetricsHidden>
 
     CocoaUI class >> title [ ^'MACVM' ]
 
@@ -92,7 +92,12 @@ Object subclass: CocoaUI [
         winClass := Cocoa classNamed: 'NSWindow'.
 
         Win := ((winClass onMain alloc) onMain
-            initWithContentRect: (Array with: 240.0 with: 180.0 with: 780.0 with: 560.0)
+            "1100x700: the toolbar's own arithmetic sets the floor — the view
+             buttons now reach 8 + (11 * 40) = 448px and the metrics cluster
+             needs 360 (104 MEM + 4 * 64), so anything under ~824 starts with
+             the metrics scrunched under the icons. Extra width also suits the
+             4-pane browser and the debugger's stack/source split."
+            initWithContentRect: (Array with: 240.0 with: 180.0 with: 1100.0 with: 700.0)
             styleMask: 15 backing: 2 defer: false).
         Win onMain setReleasedWhenClosed: false.
         Win onMain setTitle: self title.
@@ -119,6 +124,8 @@ Object subclass: CocoaUI [
         (Worker classNamed: #CocoaDebugger) ifNotNil: [ :dc | dc register ].
         "A- / A+ font-size buttons, after every view's switcher button."
         self buildFontButtons.
+        "Now that ToolbarButtons is complete, decide whether the metrics fit."
+        self syncMetricsVisibility.
 
         "Forwarded primary transcript lines (§7.4) append to our Transcript view."
         Worker onTranscriptLine: [ :t | CocoaUI appendTranscript: t ].
@@ -202,6 +209,9 @@ Object subclass: CocoaUI [
         names := #('GC' 'ALLOC' 'CODE' 'JIT' 'MEM').
         x := (aToolbar onMain frame) at: 3.
         MetricLabels := Dictionary new.
+        "Every metric view, for the show/hide sweep (syncMetricsVisibility)."
+        MetricViews := OrderedCollection new.
+        MetricsHidden := false.
         names do: [ :n |
             | caption value w |
             "MEM's value is 'used/capacity' — the widest cell by far ('540.9K/68.0M');
@@ -217,6 +227,7 @@ Object subclass: CocoaUI [
             caption onMain setStringValue: n.
             caption onMain setAutoresizingMask: self maskMinXMargin.
             aToolbar onMain addSubview: caption.
+            MetricViews add: caption.
 
             value := (tfClass onMain alloc) onMain
                 initWithFrame: (Array with: x with: 13.0 with: w - 8.0 with: 14.0).
@@ -226,6 +237,7 @@ Object subclass: CocoaUI [
             value onMain setStringValue: '—'.
             value onMain setAutoresizingMask: self maskMinXMargin.
             aToolbar onMain addSubview: value.
+            MetricViews add: value.
 
             MetricLabels at: n asSymbol put: value.
             n = 'MEM' ifTrue: [ self buildMemBarAt: x width: w - 8.0 in: aToolbar ] ].
@@ -255,6 +267,31 @@ Object subclass: CocoaUI [
         fill onMain setAutoresizingMask: self maskMinXMargin.
         aToolbar onMain addSubview: fill.
         MemBarFill := fill. MemBarWidth := aWidth.
+        MetricViews isNil ifFalse: [ MetricViews add: track; add: fill ].
+    ]
+
+    "── metrics show/hide: the cluster is right-anchored and the view-switcher
+       icons grow leftward-to-rightward, so on a narrow window the icons run
+       UNDER the metrics (the 'scrunched' look). Rather than clip, drop the
+       metrics entirely until there is room again. Re-checked on the ~4Hz
+       metrics tick, which is also how a live resize is picked up (within
+       250ms) — no window-delegate plumbing needed. ──"
+    CocoaUI class >> metricsClusterWidth [
+        "MEM (104) + the four uniform cells."
+        ^104.0 + (4 * self metricCellWidth)
+    ]
+    CocoaUI class >> metricsGap [ ^16.0 ]
+    CocoaUI class >> metricsHidden [ "true when the cluster is suppressed for width" ^MetricsHidden ]
+    CocoaUI class >> syncMetricsVisibility [
+        "Hide the whole cluster when the toolbar buttons would reach into it."
+        | want buttonsRight clusterLeft |
+        (MetricViews isNil or: [ Toolbar isNil ]) ifTrue: [ ^self ].
+        buttonsRight := 8.0 + (ToolbarButtons size * self toolbarButtonStep).
+        clusterLeft := ((Toolbar onMain frame) at: 3) - self metricsClusterWidth.
+        want := clusterLeft < (buttonsRight + self metricsGap).
+        want = MetricsHidden ifTrue: [ ^self ].
+        MetricsHidden := want.
+        MetricViews do: [ :v | v isValid ifTrue: [ v onMain setHidden: want ] ].
     ]
 
     CocoaUI class >> updateMetricsMem: memStr jit: jitStr code: codeStr alloc: allocStr gc: gcStr memPct: pct [
@@ -262,6 +299,11 @@ Object subclass: CocoaUI [
          beat now — CG5 — so this fires ~4Hz with no new NSTimer) to refresh
          the toolbar readout AND the MEM usage bar's fill width in place."
         MetricLabels isNil ifTrue: [ ^self ].
+        "Doubles as the resize check (this is the only periodic tick the UI
+         has): cheap, and it only touches views when the verdict flips. When
+         hidden there is nothing to refresh, so skip the rest."
+        self syncMetricsVisibility.
+        MetricsHidden == true ifTrue: [ ^self ].
         (MetricLabels at: #MEM ifAbsent: [ nil ]) ifNotNil: [ :tf | tf onMain setStringValue: memStr ].
         (MetricLabels at: #JIT ifAbsent: [ nil ]) ifNotNil: [ :tf | tf onMain setStringValue: jitStr ].
         (MetricLabels at: #CODE ifAbsent: [ nil ]) ifNotNil: [ :tf | tf onMain setStringValue: codeStr ].
