@@ -909,7 +909,10 @@ Object subclass: CocoaUI [
         bc isNil ifTrue: [ ^self ].
         ts := Workspace onMain textStorage.
         ts isNil ifTrue: [ ^self ].
-        bc hostService onMain colorizeStorage: ts.
+        "The CHECKED variant: sends the image doesn't know paint red (the
+         editor and browser panes keep plain colorizeStorage: — they write
+         classes whose selectors don't exist yet)."
+        bc hostService onMain colorizeWorkspaceStorage: ts.
         ts release.
     ]
 

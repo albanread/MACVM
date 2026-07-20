@@ -13,6 +13,7 @@
 mod boot;
 mod canvas;
 mod colorize;
+mod complete;
 mod control;
 mod debugger;
 mod filein;
@@ -25,6 +26,7 @@ mod primary_restart;
 mod rebuild;
 mod snapshot;
 mod supervisor;
+mod symbols;
 mod view_refresh;
 
 use std::ffi::c_void;

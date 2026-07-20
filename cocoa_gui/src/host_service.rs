@@ -83,7 +83,7 @@ fn world_dir() -> PathBuf {
 }
 
 /// Read an `NSString` argument's UTF-8 contents (empty for nil / non-string).
-fn ns_to_string(ns: Id) -> String {
+pub(crate) fn ns_to_string(ns: Id) -> String {
     if ns.is_null() {
         return String::new();
     }
@@ -402,14 +402,40 @@ extern "C" fn imp_definitions_of(_this: *mut c_void, _cmd: *mut c_void, term: Id
 /// is safe on every keystroke (the text delegate calls it from
 /// `textDidChange:`). Answers nil (no reply wrapper for the caller to leak).
 extern "C" fn imp_colorize_storage(_this: *mut c_void, _cmd: *mut c_void, storage: Id) -> Id {
-    use crate::colorize::{spans_utf16, Kind};
+    colorize_storage_common(storage, false)
+}
+
+/// `colorizeWorkspaceStorage:` — the workspace's checked variant: same pass,
+/// plus [`Kind::Unknown`] spans (sends the image doesn't know) painted red.
+/// Workspace-only by design: the editor legitimately writes classes whose
+/// selectors don't exist yet, but the workspace is doit-land against the live
+/// world, where image membership is accurate. Falls back to the plain pass
+/// when the image is unreadable. Answers nil.
+extern "C" fn imp_colorize_workspace_storage(
+    _this: *mut c_void,
+    _cmd: *mut c_void,
+    storage: Id,
+) -> Id {
+    // Also the lazy installer for the completions delegate method (its class
+    // registers on first delegate creation, which precedes any colorize).
+    crate::complete::install_once();
+    colorize_storage_common(storage, true)
+}
+
+fn colorize_storage_common(storage: Id, check_unknown: bool) -> Id {
+    use crate::colorize::{spans_utf16, spans_utf16_checked, Kind};
     if storage.is_null() {
         return std::ptr::null_mut();
     }
     let ns = objc::send0(storage, objc::sel("string"));
     let text = ns_to_string(ns);
     let total = objc::send0_int(ns, objc::sel("length")) as u64;
-    let spans = spans_utf16(&text);
+    let spans = if check_unknown {
+        crate::symbols::with_sets(|s| spans_utf16_checked(&text, Some(s)))
+            .unwrap_or_else(|| spans_utf16(&text))
+    } else {
+        spans_utf16(&text)
+    };
 
     let name_color = objc::nsstring("NSColor"); // NSForegroundColorAttributeName
     let name_font = objc::nsstring("NSFont"); // NSFontAttributeName
@@ -447,6 +473,9 @@ extern "C" fn imp_colorize_storage(_this: *mut c_void, _cmd: *mut c_void, storag
             Kind::Keyword => ("systemBlueColor", true),
             Kind::Pseudo => ("systemPurpleColor", false),
             Kind::Number => ("labelColor", true),
+            // The workspace's unknown-send flag: a message the image doesn't
+            // know, painted red (bold, so a one-char typo still stands out).
+            Kind::Unknown => ("systemRedColor", true),
         };
         objc::send_attr(storage, name_color, color_named(color_sel), start, len);
         if bold {
@@ -1022,7 +1051,8 @@ pub fn register() {
     type Imp2 = extern "C" fn(*mut c_void, *mut c_void, Id, Id) -> Id;
     type Imp3 = extern "C" fn(*mut c_void, *mut c_void, Id, Id, Id) -> Id;
     type Imp4 = extern "C" fn(*mut c_void, *mut c_void, Id, Id, Id, Id) -> Id;
-    let methods: [(&str, *const c_void, &str); 43] = [
+    let methods: [(&str, *const c_void, &str); 44] = [
+        ("colorizeWorkspaceStorage:", imp_colorize_workspace_storage as Imp1 as *const c_void, "@@:@"),
         ("addToWorldPath:", imp_add_to_world as Imp1 as *const c_void, "@@:@"),
         ("dbgReport", imp_dbg_report as Imp0 as *const c_void, "@@:"),
         ("dbgCommand:", imp_dbg_command as Imp1 as *const c_void, "@@:@"),
