@@ -588,6 +588,7 @@ Print it does the same and inserts the result right after it."
         triples add: (Array with: 'Save' with: 's' with: [ self editorDo: [ :ec | ec fileSave ] ]).
         triples add: (Array with: 'Save As…' with: 'S' with: [ self editorDo: [ :ec | ec fileSaveAs ] ]).
         triples add: (Array with: 'File In' with: '' with: [ self editorDo: [ :ec | ec fileIn ] ]).
+        triples add: (Array with: 'Add to World' with: '' with: [ self editorDo: [ :ec | ec addToWorld ] ]).
         self menu: 'File' on: mainMenu triples: triples.
     ]
     CocoaUI class >> installSourceMenuOn: mainMenu [

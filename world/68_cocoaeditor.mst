@@ -18,9 +18,10 @@
 
 Object subclass: CocoaEditor [
     <classVars: Container Picker Buffer BufferScroll ActionDelegates BufferDelegate LastProbe
-                CurrentPath>
+                CurrentPath BarBox BarButtons>
 
     CocoaEditor class >> stripHeight [ ^36.0 ]
+    CocoaEditor class >> barHeight [ ^30.0 ]
 
     CocoaEditor class >> register [
         CocoaUI registerViewNamed: #editor title: 'Editor' icon: 'blankSheet'
@@ -35,7 +36,7 @@ Object subclass: CocoaEditor [
 
     "── build ──"
     CocoaEditor class >> buildView [
-        | host frame w h |
+        | host frame w h barY bx |
         host := CocoaUI contentHost.
         frame := host onMain frame.
         w := frame at: 3. h := frame at: 4.
@@ -62,17 +63,42 @@ Object subclass: CocoaEditor [
             frame: (Array with: w - 112.0 with: h - 31.0 with: 104.0 with: 26.0)
             action: [ self save ].
 
+        "── the ACTION BAR: a grained strip (the transcript bar's own look)
+           hosting the file workflow as one-click buttons — the File/Source
+           menus' equivalents. The grain box is added FIRST so the buttons
+           render on top of it; everything pins to the top (MinYMargin)."
+        barY := h - self stripHeight - self barHeight.
+        BarBox := CocoaUI addTexturedBoxFrame: (Array with: 0.0 with: barY with: w with: self barHeight)
+                          resize: CocoaUI maskWidthSizable + CocoaUI maskMinYMargin
+                          in: Container.
+        BarButtons := OrderedCollection new.
+        bx := 4.0.
+        self barButton: 'New' frame: (Array with: bx with: barY + 3.0 with: 56.0 with: 24.0)
+             action: [ self fileNew ]. bx := bx + 60.
+        self barButton: 'Open…' frame: (Array with: bx with: barY + 3.0 with: 64.0 with: 24.0)
+             action: [ self fileOpen ]. bx := bx + 68.
+        self barButton: 'Save' frame: (Array with: bx with: barY + 3.0 with: 56.0 with: 24.0)
+             action: [ self fileSave ]. bx := bx + 60.
+        self barButton: 'File In' frame: (Array with: bx with: barY + 3.0 with: 64.0 with: 24.0)
+             action: [ self fileIn ]. bx := bx + 68.
+        self barButton: 'Add to World' frame: (Array with: bx with: barY + 3.0 with: 104.0 with: 24.0)
+             action: [ self addToWorld ]. bx := bx + 108.
+        self barButton: 'Format' frame: (Array with: bx with: barY + 3.0 with: 64.0 with: 24.0)
+             action: [ self formatBuffer ]. bx := bx + 68.
+        self barButton: 'Analyze' frame: (Array with: bx with: barY + 3.0 with: 68.0 with: 24.0)
+             action: [ self analyzeBuffer ].
+
         "── the buffer: a NATIVE, editable NSTextView, scroll-wrapped (a bare one
            draws past its frame and bleeds through the next tab — the CG7 mess).
            Substitutions off so typed source isn't mangled (the Workspace's
            discipline). The plain text delegate recolours on every change. ──"
         BufferScroll := ((Cocoa classNamed: 'NSScrollView') onMain alloc) onMain
-            initWithFrame: (Array with: 0.0 with: 0.0 with: w with: h - self stripHeight).
+            initWithFrame: (Array with: 0.0 with: 0.0 with: w with: h - self stripHeight - self barHeight).
         BufferScroll onMain setHasVerticalScroller: true.
         BufferScroll onMain setHasHorizontalScroller: true.
         BufferScroll onMain setAutoresizingMask: CocoaUI maskWidthSizable + CocoaUI maskHeightSizable.
         Buffer := ((Cocoa classNamed: 'NSTextView') onMain alloc) onMain
-            initWithFrame: (Array with: 0.0 with: 0.0 with: w with: h - self stripHeight).
+            initWithFrame: (Array with: 0.0 with: 0.0 with: w with: h - self stripHeight - self barHeight).
         Buffer onMain setEditable: true.
         Buffer onMain setAutomaticQuoteSubstitutionEnabled: false.
         Buffer onMain setAutomaticDashSubstitutionEnabled: false.
@@ -109,6 +135,23 @@ shape change takes effect on the next launch)."'
         btn onMain setAction: 'macvmAction:'.
         ActionDelegates add: delegate.
         Container onMain addSubview: btn.
+        ^btn
+    ]
+    CocoaEditor class >> barButton: title frame: rect action: aBlock [
+        "An action-bar button: left-anchored, pinned to the TOP (MinYMargin
+         only — stripButton's MinX pin is for the right-aligned strip pair)."
+        | btn holder delegate |
+        btn := ((Cocoa classNamed: 'NSButton') onMain alloc) onMain initWithFrame: rect.
+        btn onMain setTitle: title.
+        btn onMain setBezelStyle: 1.
+        btn onMain setAutoresizingMask: CocoaUI maskMinYMargin.
+        holder := CocoaToolbarAction on: aBlock.
+        delegate := MacvmDelegate actionTargetOn: holder.
+        btn onMain setTarget: delegate.
+        btn onMain setAction: 'macvmAction:'.
+        ActionDelegates add: delegate.
+        Container onMain addSubview: btn.
+        BarButtons add: btn.
         ^btn
     ]
     CocoaEditor class >> wireAction: aControl to: aBlock [
@@ -234,6 +277,24 @@ Object subclass: MyClass [
         CocoaUI appendTranscript: 'editor: file-in — fresh world, then ', path.
     ]
 
+    CocoaEditor class >> addToWorld [
+        "Graduate the buffer's file INTO THE WORLD: world/user_<name>.mst +
+         world.list + image import, then a fresh primary that CONTAINS these
+         classes — every future fresh world (File In's included, and reseeds)
+         keeps them. Re-adding the same file updates it. Syntax-gated by the
+         host; a broken file is refused with line/col, nothing written."
+        | path text reply |
+        text := self bufferText.
+        (text isNil or: [ text isEmpty ]) ifTrue: [ ^self ].
+        path := CurrentPath isNil ifTrue: [ self fileInScratchPath ] ifFalse: [ CurrentPath ].
+        (CocoaFile spit: path contents: text)
+            ifFalse: [ ^CocoaUI appendTranscript: 'editor: cannot write ', path ].
+        reply := CocoaBrowser readReply: (CocoaBrowser hostService onMain addToWorldPath: path).
+        CocoaUI appendTranscript: 'editor: ' , ((CocoaBrowser isOk: reply)
+            ifTrue: [ CocoaBrowser payloadOf: reply ]
+            ifFalse: [ 'add-to-world FAILED — ' , (CocoaBrowser errorOf: reply) ]).
+    ]
+
     "── the Source menu: Format (host re-indenter, comment/string-preserving)
        and Analyze (the REAL compiler parser; an error marks + scrolls to the
        offending line). ──"
@@ -339,11 +400,13 @@ Object subclass: MyClass [
         ActionDelegates isNil ifFalse: [
             ActionDelegates do: [ :d | d isValid ifTrue: [ d release ] ] ].
         BufferDelegate isNil ifFalse: [ BufferDelegate isValid ifTrue: [ BufferDelegate release ] ].
+        BarButtons isNil ifFalse: [ BarButtons do: [ :b | CocoaBrowser releaseView: b ] ].
+        CocoaBrowser releaseView: BarBox.
         CocoaBrowser releaseView: Buffer.
         CocoaBrowser releaseView: BufferScroll.
         CocoaBrowser releaseView: Picker.
         CocoaBrowser releaseView: Container.
         ActionDelegates := nil. BufferDelegate := nil. Buffer := nil. BufferScroll := nil.
-        Picker := nil. Container := nil.
+        Picker := nil. Container := nil. BarBox := nil. BarButtons := nil.
     ]
 ]

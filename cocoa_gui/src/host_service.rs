@@ -856,6 +856,61 @@ extern "C" fn imp_file_in_path(_this: *mut c_void, _cmd: *mut c_void, path: Id) 
     std::ptr::null_mut()
 }
 
+/// `addToWorldPath:` — File ▸ Add to World: graduate the user's file INTO the
+/// world. Copies it to `world/user_<stem>.mst` (the `user_` prefix makes a
+/// core-file collision impossible; re-adding the same stem overwrites — the
+/// update flow), appends it to `world.list` if absent, re-imports the world
+/// into the image (M1 `import_all_lists` — package `user_<stem>`, list
+/// `world`), then requests a primary restart: every FRESH world from now on —
+/// including File In's — contains these classes, and reseeds keep them (the
+/// list entry is on disk). Syntax-gated first: a broken file is refused with
+/// the parser's own line/col, nothing written. `OK <summary>` / `ERR <why>`.
+extern "C" fn imp_add_to_world(_this: *mut c_void, _cmd: *mut c_void, path: Id) -> Id {
+    let src_path = ns_to_string(path);
+    let text = match std::fs::read_to_string(&src_path) {
+        Ok(t) => t,
+        Err(e) => return err(&format!("cannot read {src_path}: {e}")),
+    };
+    if let Err(e) = macvm::frontend::parser::parse_file(&text) {
+        return err(&format!("not added — {e}"));
+    }
+    let stem: String = std::path::Path::new(&src_path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("classes")
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+        .collect();
+    let fname = format!("user_{stem}.mst");
+    let world = world_dir();
+    if let Err(e) = std::fs::write(world.join(&fname), &text) {
+        return err(&format!("cannot write world/{fname}: {e}"));
+    }
+    let list_path = world.join("world.list");
+    let list = std::fs::read_to_string(&list_path).unwrap_or_default();
+    if !list.lines().any(|l| l.trim() == fname) {
+        let mut list = list;
+        if !list.is_empty() && !list.ends_with('\n') {
+            list.push('\n');
+        }
+        list.push_str(&format!("# user-added via the editor's Add to World\n{fname}\n"));
+        if let Err(e) = std::fs::write(&list_path, list) {
+            return err(&format!("cannot update world.list: {e}"));
+        }
+    }
+    match writer().and_then(|img| image_store::import::import_all_lists(&img, &world)) {
+        Ok(stats) => {
+            crate::primary_restart::request();
+            crate::objc::wake_main_runloop();
+            ok(&format!(
+                "added world/{fname} ({} class(es), {} method(s) imported) — fresh world restarting",
+                stats.classes, stats.methods
+            ))
+        }
+        Err(e) => err(&format!("world import failed: {e}")),
+    }
+}
+
 /// `requestOpenPanel` / `requestSavePanel` — File ▸ Open… / Save As…: flag a
 /// modal panel for `drain_perform` (top-level, VM quiescent — a modal event
 /// pump must never spin inside this callback). The drain hands the chosen
@@ -903,7 +958,8 @@ pub fn register() {
     type Imp2 = extern "C" fn(*mut c_void, *mut c_void, Id, Id) -> Id;
     type Imp3 = extern "C" fn(*mut c_void, *mut c_void, Id, Id, Id) -> Id;
     type Imp4 = extern "C" fn(*mut c_void, *mut c_void, Id, Id, Id, Id) -> Id;
-    let methods: [(&str, *const c_void, &str); 36] = [
+    let methods: [(&str, *const c_void, &str); 37] = [
+        ("addToWorldPath:", imp_add_to_world as Imp1 as *const c_void, "@@:@"),
         ("setJitCompile:", imp_set_jit_compile as Imp1 as *const c_void, "@@:@"),
         ("formatSource:", imp_format_source as Imp1 as *const c_void, "@@:@"),
         ("analyzeSource:", imp_analyze_source as Imp1 as *const c_void, "@@:@"),
