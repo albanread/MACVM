@@ -338,6 +338,13 @@ fn primary_generation_main(
     // transport everything else uses. Re-installed on every respawned generation.
     primary.set_game_sink(Box::new(crate::game::PrimaryGameSink));
 
+    // DBG4: the GUI debugger frontend — the halt loop publishes to the host
+    // cell and blocks on the command channel; `ui_wake` rides along because
+    // the pump (the usual wake source) is parked during a halt. PRIMARY only
+    // (a UI-worker halt would park the main thread). Re-installed per
+    // generation, like the game sink.
+    crate::debugger::install(&mut primary, ui_wake.clone());
+
     // Register the UI worker as an externally-hosted peer (CG1). `ui_wake` fires
     // whenever this primary `send`s the UI worker — cloned here (it's an `Arc`)
     // because the beat loop below also calls it directly, unconditionally,
@@ -400,6 +407,10 @@ fn primary_generation_main(
         // (the timer on main gates it to ~60Hz via STEP_DUE). Running the step
         // as a fresh top-level entry, not a nested uiReq, is what keeps its
         // JIT-compiled compute clear of the frame-walk invariant under GC.
+        // DBG4: keep the Halt on Error toggle in sync (a cheap field write).
+        primary.set_halt_on_error(
+            crate::debugger::HALT_ON_ERROR.load(std::sync::atomic::Ordering::Acquire),
+        );
         let beat = if crate::game::is_active() { 4 } else { PUMP_BEAT_MS };
         let _ = primary.exec(&format!("Worker pumpInbox: {beat}."));
         if let Some(step) = crate::game::poll_primary_step() {

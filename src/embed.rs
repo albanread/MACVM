@@ -1037,6 +1037,26 @@ impl VmHandle {
         self.vm.game_sink = Some(sink);
     }
 
+    /// DBG4 (docs/gui_debugger_design.md): install the GUI debugger frontend
+    /// on THIS vm — the halt loop then publishes reports to it and reads
+    /// commands from it instead of the stdin `(halt)` REPL. Also arms
+    /// `debug.active` (the halt primitive / breakpoints / stepping master
+    /// switch) and defaults halt-on-error ON. The Cocoa supervisor installs
+    /// this on the PRIMARY only — a UI-worker halt would park the main thread.
+    pub fn set_debug_frontend(
+        &mut self,
+        frontend: std::sync::Arc<dyn crate::runtime::debug::DebugFrontend>,
+    ) {
+        self.vm.debug.frontend = Some(frontend);
+        self.vm.debug.active = true;
+        self.vm.debug.halt_on_error = true;
+    }
+
+    /// The Debug ▸ Halt on Error toggle (only meaningful with a frontend).
+    pub fn set_halt_on_error(&mut self, on: bool) {
+        self.vm.debug.halt_on_error = on;
+    }
+
     /// Registers how THIS vm spawns worker VMs (docs/multi-smalltalk-worker.md
     /// §3, workers M1) — the `GameSink` pattern: the CLI/tests pass a
     /// `VmHandle::boot(opts, world_dir)` closure, the GUI its image-boot path,

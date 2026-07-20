@@ -1,0 +1,311 @@
+"── CocoaDebugger (DBG4, docs/gui_debugger_design.md): the native face of the
+   VM's HALT loop. The PRIMARY parks in debug::halt and publishes its FULL
+   report to the host (blast, don't patch); the drain execs `haltArrived`
+   here, which reads dbgReport, renders the stack / source / frame, and (on a
+   fresh halt) auto-fronts this tab. Buttons + the print field send one line
+   back via dbgCommand:. All list/click/reply discipline is the browser's own.
+
+   Because the UI is a SEPARATE VM on the main thread, the whole GUI stays
+   live while the primary is frozen in the halt loop — no reentrancy work. ──"
+Object subclass: CocoaDebugger [
+    <classVars: Container BarBox BarButtons StackTable StackCol StackScroll StackFace
+                SourceView SourceScroll FrameView FrameScroll PrintField
+                Frames Reason Halted SelectedRow SourceDelegate>
+
+    CocoaDebugger class >> barHeight [ ^30.0 ]
+    CocoaDebugger class >> varsHeight [ ^170.0 ]
+    CocoaDebugger class >> stackWidthFor: w [ ^(w * 0.38) max: 200.0 ]
+
+    "── registration (tab-host protocol: lazy container, onShow re-renders the
+       last report so a manual switch shows current state) ──"
+    CocoaDebugger class >> register [
+        CocoaUI registerViewNamed: #debugger title: 'Debugger' icon: 'implementors'
+                container: [ self containerView ]
+                onShow: [ self render ]
+    ]
+    CocoaDebugger class >> containerView [
+        Container isNil ifTrue: [ self buildView ].
+        ^Container
+    ]
+
+    "── the drain entry point: a fresh report is waiting. Render it; if it is
+       a HALT (not a resume), bring this tab to the front. ──"
+    CocoaDebugger class >> haltArrived [
+        self render.
+        Halted ifTrue: [ CocoaUI switchToView: #debugger ].
+    ]
+
+    "── report parse + render (US = Character value: 31 field sep) ──"
+    CocoaDebugger class >> render [
+        "PARSE the report FIRST (always sets Halted/Frames — haltArrived reads
+         Halted to decide whether to auto-front, and the view may not be built
+         yet on the first halt). Only the actual view mutations are guarded by
+         Container being present."
+        | reply lines mode stackLines frameText outText |
+        reply := CocoaBrowser readReply: (CocoaBrowser hostService onMain dbgReport).
+        lines := self linesOf: reply.
+        stackLines := OrderedCollection new.
+        frameText := ''. outText := ''. mode := #head.
+        Halted := false. Reason := ''.
+        lines do: [ :line |
+            (line startsWith: '==STACK==') ifTrue: [ mode := #stack ]
+            ifFalse: [ (line startsWith: '==FRAME==') ifTrue: [ mode := #frame ]
+            ifFalse: [ (line startsWith: '==OUT==') ifTrue: [ mode := #out ]
+            ifFalse: [
+                mode == #head ifTrue: [
+                    (line startsWith: 'HALTED') ifTrue: [
+                        Halted := true.
+                        Reason := line size > 7 ifTrue: [ line copyFrom: 8 to: line size ] ifFalse: [ '' ] ] ].
+                mode == #stack ifTrue: [ line isEmpty ifFalse: [ stackLines add: line ] ].
+                mode == #frame ifTrue: [ frameText := frameText , line , (String with: Character nl) ].
+                mode == #out ifTrue: [ outText := outText , line , (String with: Character nl) ] ] ] ] ].
+        Frames := stackLines asArray.
+        (SelectedRow isNil or: [ SelectedRow >= Frames size ]) ifTrue: [ SelectedRow := 0 ].
+        Container isNil ifTrue: [ ^self ].
+        self deferReloadStack.
+        FrameView isNil ifFalse: [ FrameView onMain setString: frameText , (self dividerFor: outText) , outText ].
+        self renderSourceForSelected.
+        self updateReasonTitle.
+    ]
+    CocoaDebugger class >> dividerFor: outText [
+        ^outText isEmpty ifTrue: [ '' ] ifFalse: [ (String with: Character nl) , '── output ──' , (String with: Character nl) ]
+    ]
+    CocoaDebugger class >> updateReasonTitle [
+        Halted
+            ifTrue: [ CocoaUI appendTranscript: 'debugger: HALTED — ' , Reason ]
+            ifFalse: [ "resumed — nothing to say" ].
+    ]
+
+    "── stack table face ──"
+    CocoaDebugger class >> stackRowCount [ ^Frames isNil ifTrue: [ 0 ] ifFalse: [ Frames size ] ]
+    CocoaDebugger class >> stackValueAt: aRow [
+        | fields |
+        (Frames isNil or: [ aRow >= Frames size ]) ifTrue: [ ^'' ].
+        fields := self fieldsOf: (Frames at: aRow + 1).
+        fields size < 4 ifTrue: [ ^(Frames at: aRow + 1) ].
+        "index  Class>>selector @bci"
+        ^(fields at: 2) , '>>' , (fields at: 3) , '  @' , (fields at: 4)
+    ]
+    CocoaDebugger class >> stackClicked [
+        | row |
+        StackTable isNil ifTrue: [ ^self ].
+        row := StackTable onMain clickedRow.
+        (row < 0 or: [ Frames isNil or: [ row >= Frames size ] ]) ifTrue: [ ^self ].
+        SelectedRow := row.
+        "Ask the primary to select the frame — it re-publishes; the frame/out
+         panes refresh on the next haltArrived. Update the source pane now."
+        CocoaBrowser hostService onMain dbgCommand: 'frame ' , row printString.
+        self renderSourceForSelected.
+    ]
+
+    "── source pane: the selected frame's method source from the image DB
+       (instance side; class-side fallback), the whole method (§7 — no
+       statement-level highlight in v1). ──"
+    CocoaDebugger class >> renderSourceForSelected [
+        | fields cls sel src |
+        SourceView isNil ifTrue: [ ^self ].
+        (Frames isNil or: [ SelectedRow >= Frames size ]) ifTrue: [ ^SourceView onMain setString: '' ].
+        fields := self fieldsOf: (Frames at: SelectedRow + 1).
+        fields size < 4 ifTrue: [ ^SourceView onMain setString: '' ].
+        cls := fields at: 2. sel := fields at: 3.
+        src := CocoaBrowser readReply: (CocoaBrowser hostService onMain
+                    sourceForClass: cls side: 'instance' selector: sel).
+        (src isNil or: [ src isEmpty ]) ifTrue: [
+            src := CocoaBrowser readReply: (CocoaBrowser hostService onMain
+                    sourceForClass: cls side: 'class' selector: sel) ].
+        (src isNil or: [ src isEmpty ]) ifTrue: [
+            src := '"(no image source for ' , cls , '>>' , sel , ' — a doit or generated method)"' ].
+        SourceView onMain setString: src.
+        self colorizeSource.
+    ]
+    CocoaDebugger class >> colorizeSource [
+        | ts |
+        SourceView isNil ifTrue: [ ^self ].
+        ts := SourceView onMain textStorage.
+        ts isNil ifTrue: [ ^self ].
+        CocoaBrowser hostService onMain colorizeStorage: ts.
+        ts release.
+    ]
+
+    "── commands ──"
+    CocoaDebugger class >> send: aCmd [ CocoaBrowser hostService onMain dbgCommand: aCmd ]
+    CocoaDebugger class >> stepInto [ self send: 'step' ]
+    CocoaDebugger class >> stepOver [ self send: 'next' ]
+    CocoaDebugger class >> finish   [ self send: 'finish' ]
+    CocoaDebugger class >> continue [ self send: 'continue' ]
+    CocoaDebugger class >> abort    [ self send: 'abort' ]
+    CocoaDebugger class >> printIt [
+        | expr |
+        PrintField isNil ifTrue: [ ^self ].
+        expr := PrintField onMain stringValue.
+        (expr isNil or: [ expr isEmpty ]) ifTrue: [ ^self ].
+        self send: 'print ' , expr.
+    ]
+
+    "── build ──"
+    CocoaDebugger class >> buildView [
+        | host frame w h barY varsH midY midH sw bx |
+        host := CocoaUI contentHost.
+        frame := host onMain frame.
+        w := frame at: 3. h := frame at: 4.
+        barY := h - self barHeight.
+        varsH := self varsHeight.
+        midY := varsH. midH := barY - varsH.
+        sw := self stackWidthFor: w.
+        BarButtons := OrderedCollection new.
+
+        Container := ((Cocoa classNamed: 'NSView') onMain alloc) onMain
+            initWithFrame: (Array with: 0.0 with: 0.0 with: w with: h).
+        Container onMain setAutoresizingMask: CocoaUI maskWidthSizable + CocoaUI maskHeightSizable.
+        Container onMain setAutoresizesSubviews: true.
+
+        "action bar (grained, top)"
+        BarBox := CocoaUI addTexturedBoxFrame: (Array with: 0.0 with: barY with: w with: self barHeight)
+                          resize: CocoaUI maskWidthSizable + CocoaUI maskMinYMargin
+                          in: Container.
+        bx := 4.0.
+        self barButton: 'Step Into' frame: (Array with: bx with: barY + 3.0 with: 84.0 with: 24.0)
+             action: [ self stepInto ]. bx := bx + 88.
+        self barButton: 'Step Over' frame: (Array with: bx with: barY + 3.0 with: 84.0 with: 24.0)
+             action: [ self stepOver ]. bx := bx + 88.
+        self barButton: 'Finish' frame: (Array with: bx with: barY + 3.0 with: 64.0 with: 24.0)
+             action: [ self finish ]. bx := bx + 68.
+        self barButton: 'Continue' frame: (Array with: bx with: barY + 3.0 with: 78.0 with: 24.0)
+             action: [ self continue ]. bx := bx + 82.
+        self barButton: 'Abort' frame: (Array with: bx with: barY + 3.0 with: 60.0 with: 24.0)
+             action: [ self abort ]. bx := bx + 68.
+        PrintField := ((Cocoa classNamed: 'NSTextField') onMain alloc) onMain
+            initWithFrame: (Array with: bx with: barY + 4.0 with: w - bx - 8.0 with: 22.0).
+        PrintField onMain setPlaceholderString: 'print expression against selected frame ⏎'.
+        PrintField onMain setFont: (CocoaUI fixedFontOfSize: 12.0).
+        PrintField onMain setAutoresizingMask: CocoaUI maskWidthSizable + CocoaUI maskMinYMargin.
+        self wireField: PrintField to: [ self printIt ].
+        Container onMain addSubview: PrintField.
+
+        "stack table (left of the middle band)"
+        StackScroll := self newScrollIn: (Array with: 0.0 with: midY with: sw with: midH)
+                            mask: CocoaUI maskHeightSizable + CocoaUI maskMaxXMargin.
+        StackTable := ((Cocoa classNamed: 'NSTableView') onMain alloc) onMain
+            initWithFrame: (Array with: 0.0 with: 0.0 with: sw with: midH).
+        StackCol := ((Cocoa classNamed: 'NSTableColumn') onMain alloc) onMain initWithIdentifier: 'frame'.
+        StackCol onMain setWidth: 900.0.
+        StackCol onMain setEditable: false.
+        StackTable onMain addTableColumn: StackCol.
+        StackTable onMain setHeaderView: nil.
+        StackTable onMain setColumnAutoresizingStyle: 1.
+        "The data source/delegate must be an ObjC forwarder (MacvmDelegate
+         tableSourceOn:), NOT the raw Smalltalk face — the browsers' own rule."
+        StackFace := MacvmDelegate tableSourceOn: (Worker classNamed: #CocoaDebuggerFace) new.
+        StackTable onMain setDataSource: StackFace.
+        StackTable onMain setDelegate: StackFace.
+        self wireAction: StackTable to: [ self stackClicked ].
+        StackScroll onMain setDocumentView: StackTable.
+        Container onMain addSubview: StackScroll.
+
+        "source pane (right of the middle band, fills remaining width)"
+        SourceScroll := self newScrollIn: (Array with: sw with: midY with: w - sw with: midH)
+                             mask: CocoaUI maskWidthSizable + CocoaUI maskHeightSizable.
+        SourceView := self newTextViewWide: (Array with: 0.0 with: 0.0 with: w - sw with: midH) editable: false.
+        SourceScroll onMain setDocumentView: SourceView.
+        Container onMain addSubview: SourceScroll.
+
+        "frame / vars pane (bottom band)"
+        FrameScroll := self newScrollIn: (Array with: 0.0 with: 0.0 with: w with: varsH)
+                            mask: CocoaUI maskWidthSizable + CocoaUI maskMaxYMargin.
+        FrameView := self newTextViewWide: (Array with: 0.0 with: 0.0 with: w with: varsH) editable: false.
+        FrameScroll onMain setDocumentView: FrameView.
+        Container onMain addSubview: FrameScroll.
+    ]
+
+    "── view helpers (browser idioms, factored for this file) ──"
+    CocoaDebugger class >> newScrollIn: rect mask: aMask [
+        | s |
+        s := ((Cocoa classNamed: 'NSScrollView') onMain alloc) onMain initWithFrame: rect.
+        s onMain setHasVerticalScroller: true.
+        s onMain setAutoresizingMask: aMask.
+        ^s
+    ]
+    CocoaDebugger class >> newTextViewWide: rect editable: canEdit [
+        | tv |
+        tv := ((Cocoa classNamed: 'NSTextView') onMain alloc) onMain initWithFrame: rect.
+        tv onMain setEditable: canEdit.
+        tv onMain setFont: (CocoaUI fixedFontOfSize: 12.0).
+        tv onMain setVerticallyResizable: true.
+        tv onMain setHorizontallyResizable: false.
+        tv onMain setAutoresizingMask: CocoaUI maskWidthSizable.
+        (tv onMain textContainer) ifNotNil: [ :tc | tc onMain setWidthTracksTextView: true. tc release ].
+        ^tv
+    ]
+    CocoaDebugger class >> barButton: title frame: rect action: aBlock [
+        | btn holder delegate |
+        btn := ((Cocoa classNamed: 'NSButton') onMain alloc) onMain initWithFrame: rect.
+        btn onMain setTitle: title.
+        btn onMain setBezelStyle: 1.
+        btn onMain setAutoresizingMask: CocoaUI maskMinYMargin.
+        holder := CocoaToolbarAction on: aBlock.
+        delegate := MacvmDelegate actionTargetOn: holder.
+        btn onMain setTarget: delegate.
+        btn onMain setAction: 'macvmAction:'.
+        BarButtons add: delegate.
+        Container onMain addSubview: btn.
+        ^btn
+    ]
+    CocoaDebugger class >> wireAction: aControl to: aBlock [
+        | holder delegate |
+        holder := CocoaToolbarAction on: aBlock.
+        delegate := MacvmDelegate actionTargetOn: holder.
+        aControl onMain setTarget: delegate.
+        aControl onMain setAction: 'macvmAction:'.
+        BarButtons add: delegate.
+    ]
+    CocoaDebugger class >> wireField: aField to: aBlock [
+        "NSTextField fires its action on ⏎ (Enter) — same delegate wiring."
+        self wireAction: aField to: aBlock.
+    ]
+    CocoaDebugger class >> deferReloadStack [
+        StackTable isNil ifFalse: [
+            StackTable onMain performSelector: 'reloadData' withObject: nil afterDelay: 0.0 ].
+    ]
+
+    "── string helpers ──"
+    CocoaDebugger class >> linesOf: aString [
+        | out cur nl |
+        out := OrderedCollection new. cur := ''. nl := Character nl.
+        aString do: [ :ch |
+            ch = nl ifTrue: [ out add: cur. cur := '' ] ifFalse: [ cur := cur , (String with: ch) ] ].
+        cur isEmpty ifFalse: [ out add: cur ].
+        ^out
+    ]
+    CocoaDebugger class >> fieldsOf: aLine [
+        "US(31)-separated fields of one stack row -> Array of Strings."
+        | out cur us |
+        out := OrderedCollection new. cur := ''. us := Character value: 31.
+        aLine do: [ :ch |
+            ch = us ifTrue: [ out add: cur. cur := '' ] ifFalse: [ cur := cur , (String with: ch) ] ].
+        out add: cur.
+        ^out asArray
+    ]
+
+    "── lifecycle ──"
+    CocoaDebugger class >> environmentRestarted [ "the primary died; a stale halt is gone" self render ]
+    CocoaDebugger class >> teardown [
+        BarButtons isNil ifFalse: [ BarButtons do: [ :d | d isValid ifTrue: [ d release ] ] ].
+        StackFace isNil ifFalse: [ StackFace isValid ifTrue: [ StackFace release ] ].
+        CocoaBrowser releaseView: BarBox.
+        CocoaBrowser releaseView: StackTable. CocoaBrowser releaseView: StackScroll.
+        CocoaBrowser releaseView: SourceView. CocoaBrowser releaseView: SourceScroll.
+        CocoaBrowser releaseView: FrameView. CocoaBrowser releaseView: FrameScroll.
+        CocoaBrowser releaseView: PrintField. CocoaBrowser releaseView: Container.
+        BarButtons := nil. BarBox := nil. StackTable := nil. StackScroll := nil.
+        SourceView := nil. SourceScroll := nil. FrameView := nil. FrameScroll := nil.
+        PrintField := nil. Container := nil. StackFace := nil.
+    ]
+]
+
+"The NSTableView data source/delegate for the stack (the browser's Face
+ pattern). Defined LAST — referenced by name in buildView, so it can safely
+ reference CocoaDebugger (defined above) by bareword. Mirrors CocoaBrowser2Face."
+Object subclass: CocoaDebuggerFace [
+    numberOfRowsInTableView: aTable [ ^CocoaDebugger stackRowCount ]
+    tableView: aTable objectValueForTableColumn: aCol row: aRow [ ^CocoaDebugger stackValueAt: aRow ]
+]

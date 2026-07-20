@@ -124,6 +124,20 @@ pub fn dnu_fallback(vm: &mut VmState, selector: SymbolOop, receiver_klass: Klass
     let _ = writeln!(vm.out, "{message}");
     print_stack_trace(vm);
     let _ = vm.out.flush();
+    // DBG4 (mirrors prim_error's DBG1 hook): an armed debugger turns the
+    // would-be-fatal DNU into a pre-mortem inspectable stop at the erring
+    // activation; the DNU stays terminal on any resume.
+    if crate::runtime::debug::wants_error_halt(vm) {
+        if let Some(m) = vm.regs.method {
+            let bci = vm.regs.bci;
+            crate::runtime::debug::halt(
+                vm,
+                m,
+                bci,
+                crate::runtime::debug::HaltReason::GuestError(message.clone()),
+            );
+        }
+    }
     // DBG0: the fatal-DNU mini-dossier (docs/DEBUGGER.md §4.1) — the
     // deviceInAdd:-hunt tool. `MACVM_PROBE=off` opts out. Skipped when a
     // recovery is actually about to happen (embedded `VmHandle::eval`,

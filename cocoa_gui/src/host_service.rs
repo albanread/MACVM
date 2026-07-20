@@ -911,6 +911,29 @@ extern "C" fn imp_add_to_world(_this: *mut c_void, _cmd: *mut c_void, path: Id) 
     }
 }
 
+/// `dbgReport` — the debugger's current full report (docs/
+/// gui_debugger_design.md §2's format; `RUNNING` when not halted).
+extern "C" fn imp_dbg_report(_this: *mut c_void, _cmd: *mut c_void) -> Id {
+    objc::nsstring(&crate::debugger::report())
+}
+
+/// `dbgCommand:` — one command line into the parked halt loop (`continue`,
+/// `step`, `next`, `finish`, `abort`, `frame N`, `print <expr>`). The loop
+/// re-publishes the full report after every command; the UI just re-renders
+/// on the next haltArrived. Answers nil.
+extern "C" fn imp_dbg_command(_this: *mut c_void, _cmd: *mut c_void, line: Id) -> Id {
+    crate::debugger::send_command(ns_to_string(line));
+    std::ptr::null_mut()
+}
+
+/// `setHaltOnError:` — Debug ▸ Halt on Error ('1'/'0'; default on). Synced
+/// onto the primary by its pump each beat. Answers nil.
+extern "C" fn imp_set_halt_on_error(_this: *mut c_void, _cmd: *mut c_void, flag: Id) -> Id {
+    crate::debugger::HALT_ON_ERROR
+        .store(ns_to_string(flag) == "1", std::sync::atomic::Ordering::Release);
+    std::ptr::null_mut()
+}
+
 /// `requestOpenPanel` / `requestSavePanel` — File ▸ Open… / Save As…: flag a
 /// modal panel for `drain_perform` (top-level, VM quiescent — a modal event
 /// pump must never spin inside this callback). The drain hands the chosen
@@ -958,8 +981,11 @@ pub fn register() {
     type Imp2 = extern "C" fn(*mut c_void, *mut c_void, Id, Id) -> Id;
     type Imp3 = extern "C" fn(*mut c_void, *mut c_void, Id, Id, Id) -> Id;
     type Imp4 = extern "C" fn(*mut c_void, *mut c_void, Id, Id, Id, Id) -> Id;
-    let methods: [(&str, *const c_void, &str); 37] = [
+    let methods: [(&str, *const c_void, &str); 40] = [
         ("addToWorldPath:", imp_add_to_world as Imp1 as *const c_void, "@@:@"),
+        ("dbgReport", imp_dbg_report as Imp0 as *const c_void, "@@:"),
+        ("dbgCommand:", imp_dbg_command as Imp1 as *const c_void, "@@:@"),
+        ("setHaltOnError:", imp_set_halt_on_error as Imp1 as *const c_void, "@@:@"),
         ("setJitCompile:", imp_set_jit_compile as Imp1 as *const c_void, "@@:@"),
         ("formatSource:", imp_format_source as Imp1 as *const c_void, "@@:@"),
         ("analyzeSource:", imp_analyze_source as Imp1 as *const c_void, "@@:@"),

@@ -39,3 +39,8 @@
 # from selectors) + a Comment/Definition/Source pane. Read-only browsing;
 # self-registers by name as the 'Browser V2' view.
 72_cocoabrowser2.mst
+# CocoaDebugger (DBG4, docs/gui_debugger_design.md): the native face of the VM
+# HALT loop — a Debugger tab that shows the halted stack/source/frame, with
+# Step Into/Over/Finish/Continue/Abort + a print-it field. Auto-fronts when the
+# primary halts (breakpoint, `halt`, or Halt-on-Error). Self-registers by name.
+73_cocoadebugger.mst

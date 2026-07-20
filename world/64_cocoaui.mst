@@ -59,7 +59,8 @@ Object subclass: CocoaUI [
                 WorkspaceTextDelegate TabItems TabIndexes
                 TranscriptDivider TranscriptClearBtn FontDelta
                 FontMinusBtn FontPlusBtn JitOn JitMenuItem
-                WorkspaceContainer WorkspaceBarBox WorkspaceBarButtons>
+                WorkspaceContainer WorkspaceBarBox WorkspaceBarButtons
+                HaltOn HaltMenuItem>
 
     CocoaUI class >> title [ ^'MACVM' ]
 
@@ -75,6 +76,7 @@ Object subclass: CocoaUI [
     CocoaUI class >> maskMinYMargin [ ^8 ]   "flexible space BELOW -> pins to TOP"
     CocoaUI class >> maskMaxYMargin [ ^32 ]  "flexible space ABOVE -> pins to BOTTOM"
     CocoaUI class >> maskMinXMargin [ ^1 ]   "flexible space LEFT -> pins to RIGHT"
+    CocoaUI class >> maskMaxXMargin [ ^4 ]   "flexible space RIGHT -> pins to LEFT (fixed width)"
 
     CocoaUI class >> startup [
         "Build (or rebuild) the window shell and order it front. Returns to
@@ -114,6 +116,7 @@ Object subclass: CocoaUI [
         (Worker classNamed: #CocoaOutliner) ifNotNil: [ :oc | oc register ].
         (Worker classNamed: #CocoaCanvas) ifNotNil: [ :cv | cv register ].
         (Worker classNamed: #CocoaHelp) ifNotNil: [ :hc | hc register ].
+        (Worker classNamed: #CocoaDebugger) ifNotNil: [ :dc | dc register ].
         "A- / A+ font-size buttons, after every view's switcher button."
         self buildFontButtons.
 
@@ -699,6 +702,19 @@ Object subclass: CocoaUI [
         debugMenu onMain addItem: JitMenuItem.
         ToolbarDelegates add: jitDelegate.
 
+        "Halt on Error (DBG4, default ON): a would-be-fatal error/DNU on the
+         primary opens the Debugger tab at the fault instead of printing a
+         trace and recovering. A host-atomic flip, synced onto the primary."
+        HaltOn := true.
+        HaltMenuItem := ((Cocoa classNamed: 'NSMenuItem') onMain alloc) onMain
+            initWithTitle: 'Halt on Error' action: 'macvmAction:' keyEquivalent: ''.
+        HaltMenuItem onMain setState: 1.
+        jitHolder := CocoaToolbarAction on: [ self toggleHaltOnError ].
+        jitDelegate := MacvmDelegate actionTargetOn: jitHolder.
+        HaltMenuItem onMain setTarget: jitDelegate.
+        debugMenu onMain addItem: HaltMenuItem.
+        ToolbarDelegates add: jitDelegate.
+
         debugItem := ((Cocoa classNamed: 'NSMenuItem') onMain alloc) onMain
             initWithTitle: 'Debug' action: nil keyEquivalent: ''.
         debugItem onMain setSubmenu: debugMenu.
@@ -713,6 +729,16 @@ Object subclass: CocoaUI [
         JitMenuItem isNil ifFalse: [
             JitMenuItem onMain setState: (JitOn ifTrue: [ 1 ] ifFalse: [ 0 ]) ].
         self appendTranscript: 'compiler (JIT) ', (JitOn ifTrue: [ 'ON' ] ifFalse: [ 'OFF (interpreting new methods)' ]).
+    ]
+    CocoaUI class >> toggleHaltOnError [
+        "Flip the DBG4 halt-on-error switch (host atomic; the primary's pump
+         reads it each beat) and reflect it in the menu checkmark."
+        HaltOn := HaltOn not.
+        ((Cocoa classNamed: 'MacvmHostService') onMain alloc) onMain init
+            onMain setHaltOnError: (HaltOn ifTrue: [ '1' ] ifFalse: [ '0' ]).
+        HaltMenuItem isNil ifFalse: [
+            HaltMenuItem onMain setState: (HaltOn ifTrue: [ 1 ] ifFalse: [ 0 ]) ].
+        self appendTranscript: 'halt on error ', (HaltOn ifTrue: [ 'ON' ] ifFalse: [ 'OFF (errors print a trace + recover)' ]).
     ]
     CocoaUI class >> requestRebuild [
         "Ask the host to rebuild the UI worker in place (serviced on the next
@@ -1016,6 +1042,7 @@ Object subclass: CocoaUI [
         (Worker classNamed: #CocoaEditor) ifNotNil: [ :ec | ec environmentRestarted ].
         (Worker classNamed: #CocoaOutliner) ifNotNil: [ :oc | oc environmentRestarted ].
         (Worker classNamed: #CocoaCanvas) ifNotNil: [ :cv | cv environmentRestarted ].
+        (Worker classNamed: #CocoaDebugger) ifNotNil: [ :dc | dc environmentRestarted ].
     ]
 
     CocoaUI class >> teardown [
@@ -1030,6 +1057,7 @@ Object subclass: CocoaUI [
             (Worker classNamed: #CocoaOutliner) ifNotNil: [ :oc | oc teardown ].
             (Worker classNamed: #CocoaCanvas) ifNotNil: [ :cv | cv teardown ].
             (Worker classNamed: #CocoaHelp) ifNotNil: [ :hc | hc teardown ].
+            (Worker classNamed: #CocoaDebugger) ifNotNil: [ :dc | dc teardown ].
             ActTarget isNil ifFalse: [ ActTarget isValid ifTrue: [ ActTarget release ] ].
             ToolbarDelegates isNil ifFalse: [
                 ToolbarDelegates do: [ :d | d isValid ifTrue: [ d release ] ] ].

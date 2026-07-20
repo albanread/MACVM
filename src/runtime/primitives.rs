@@ -1338,6 +1338,15 @@ pub static PRIMITIVES: &[PrimDesc] = &[
         can_allocate: true,
         can_fail: true,
     },
+    // --- DBG4: the programmer's `debugger;` — open the debugger here ------
+    PrimDesc {
+        id: 251,
+        name: "halt",
+        f: prim_halt,
+        argc: 0,
+        can_allocate: true,
+        can_fail: false,
+    },
 ];
 
 pub fn prim_by_id(id: u16) -> Option<&'static PrimDesc> {
@@ -3773,6 +3782,21 @@ fn prim_vm_stats(vm: &mut VmState, args: &[Oop]) -> PrimResult {
 /// SPEC §6.3: prints the message + a VM stack trace, terminates. Never
 /// returns (its Rust return type is only `PrimResult` so it fits the
 /// `PrimFn` signature — `std::process::exit`'s `!` unifies with it).
+/// DBG4 `halt` (Object) — the programmer's `debugger;` statement: open the
+/// debugger HERE when one is armed, then continue normally (unlike `error:`,
+/// `halt` is NOT terminal — a resume falls through and returns self). A no-op
+/// when no debugger is active. `session_depth` already guards the debugger's
+/// own print-eval doits from recursively halting.
+fn prim_halt(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    if vm.debug.active && vm.debug.session_depth == 0 {
+        if let Some(m) = vm.regs.method {
+            let bci = vm.regs.bci;
+            crate::runtime::debug::halt(vm, m, bci, crate::runtime::debug::HaltReason::Breakpoint);
+        }
+    }
+    PrimResult::Ok(args[0]) // answer self
+}
+
 fn prim_error(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     let text = match ByteArrayOop::try_from(args[1]) {
         Some(b) => {
@@ -3789,7 +3813,7 @@ fn prim_error(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     // guest error becomes an inspectable stop — the halt loop opens on the
     // erring activation. The error stays terminal on resume (`error:` has
     // no proceed semantics in v1); the halt is for looking, not healing.
-    if vm.debug.active && vm.debug.session_depth == 0 {
+    if crate::runtime::debug::wants_error_halt(vm) {
         if let Some(m) = vm.regs.method {
             let bci = vm.regs.bci;
             crate::runtime::debug::halt(
@@ -4851,6 +4875,7 @@ mod tests {
             (248, "numArgs"),
             (249, "MacvmDelegate class>>primNewDelegate:ticket:"),
             (250, "Worker class>>primEvalDoit:"),
+            (251, "halt"),
         ];
         assert_eq!(
             PRIMITIVES.len(),

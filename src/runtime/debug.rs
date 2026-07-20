@@ -59,12 +59,30 @@ pub struct StepPlan {
     pub base_bci: usize,
 }
 
+/// DBG4 (docs/gui_debugger_design.md): the GUI face of the HALT loop. With a
+/// frontend installed, `halt()` swaps stdin/stderr for publish/next_command —
+/// the same command engine, a different terminal. Installed per-VM (the Cocoa
+/// supervisor installs it on the PRIMARY only; a UI-worker halt would park the
+/// main thread).
+pub trait DebugFrontend: Send + Sync {
+    /// The full debugger state (stack + selected frame + last output) — the
+    /// whole report on every change, never a delta.
+    fn publish(&self, report: &str);
+    /// Block until the UI sends the next command line.
+    fn next_command(&self) -> String;
+}
+
 /// §2's shared core: one new `VmState` field. `active` is the master
 /// switch — the ONLY thing the dispatch fast path reads when no debugging
 /// is happening (one untaken branch per bytecode).
 #[derive(Default)]
 pub struct DebugState {
     pub active: bool,
+    /// DBG4: the GUI frontend, if any (see [`DebugFrontend`]).
+    pub frontend: Option<std::sync::Arc<dyn DebugFrontend>>,
+    /// DBG4: route `error:`/DNU to a pre-mortem halt (inspect, then the
+    /// fatal path proceeds on ANY resume — there is no catch-and-continue).
+    pub halt_on_error: bool,
     breakpoints: HashMap<(u32, u16), Breakpoint>,
     pub step: Option<StepPlan>,
     /// §3.6 reentrancy: while > 0 (a halt loop is live), breakpoint hits,
@@ -261,10 +279,23 @@ pub enum HaltReason {
     GuestError(String),
 }
 
+/// DBG1/DBG4: should a would-be-fatal guest error (`error:` / DNU) open the
+/// halt loop before dying? CLI (`macvm debug`): whenever active. GUI (a
+/// frontend is installed): additionally honors the Debug ▸ Halt on Error
+/// toggle. Either way the error stays terminal on resume — the halt is for
+/// looking, not healing.
+pub fn wants_error_halt(vm: &VmState) -> bool {
+    vm.debug.active
+        && vm.debug.session_depth == 0
+        && (vm.debug.frontend.is_none() || vm.debug.halt_on_error)
+}
+
 /// §3.2: the nested command loop. Runs at a bytecode boundary inside
 /// `dispatch_from`; returns when the user resumes (continue/step — step
-/// arms `vm.debug.step` before returning). Commands read from stdin,
-/// output on stderr (stdout stays the guest program's own).
+/// arms `vm.debug.step` before returning). Two faces, one engine: the CLI
+/// reads stdin / writes stderr; with a [`DebugFrontend`] installed (DBG4)
+/// the same commands arrive from `next_command` and the WHOLE state is
+/// re-published after every one (blast, don't patch).
 pub fn halt(vm: &mut VmState, method: MethodOop, bci: usize, reason: HaltReason) {
     vm.debug.session_depth += 1;
     let sel = SymbolOop::try_from(method.selector())
@@ -273,6 +304,16 @@ pub fn halt(vm: &mut VmState, method: MethodOop, bci: usize, reason: HaltReason)
     let holder = KlassOop::try_from(method.holder())
         .map(|k| crate::runtime::error::name_of(k.name()))
         .unwrap_or_else(|| "?".into());
+    if vm.debug.frontend.is_some() {
+        let reason_line = match &reason {
+            HaltReason::Breakpoint => format!("breakpoint {holder}>>{sel} @{bci}"),
+            HaltReason::Step => format!("step {holder}>>{sel} @{bci}"),
+            HaltReason::GuestError(msg) => format!("{msg} (in {holder}>>{sel} @{bci})"),
+        };
+        gui_halt(vm, bci, &reason_line);
+        vm.debug.session_depth -= 1;
+        return;
+    }
     match &reason {
         HaltReason::Breakpoint => eprintln!("halt: breakpoint {holder}>>{sel} @{bci}"),
         HaltReason::Step => eprintln!("halt: step {holder}>>{sel} @{bci}"),
@@ -346,6 +387,116 @@ pub fn halt(vm: &mut VmState, method: MethodOop, bci: usize, reason: HaltReason)
         }
     }
     vm.debug.session_depth -= 1;
+}
+
+/// DBG4: the GUI face of the halt loop — the CLI's command engine with
+/// publish/next_command in place of stderr/stdin. After EVERY command the
+/// full report is re-published; on resume the frontend gets `RUNNING`.
+fn gui_halt(vm: &mut VmState, bci: usize, reason_line: &str) {
+    let fe = vm
+        .debug
+        .frontend
+        .as_ref()
+        .expect("gui_halt: frontend checked by caller")
+        .clone();
+    let frames = interp_frames(vm);
+    let mut selected: usize = 0;
+    let mut out_text = String::new();
+    let status = format!("HALTED {reason_line}");
+    fe.publish(&build_report(vm, &status, &frames, selected, bci, &out_text));
+    loop {
+        let line = fe.next_command();
+        let words: Vec<&str> = line.split_whitespace().collect();
+        match words.as_slice() {
+            [] => {}
+            ["continue"] | ["c"] => break,
+            ["abort"] => {
+                // The guest-fatal path: on the GUI primary that is
+                // ExitThread → the supervisor respawns a fresh world
+                // ("recover clean or die" — no catch-and-continue).
+                fe.publish("RUNNING\n");
+                crate::runtime::vm_state::fatal_exit(1);
+            }
+            ["frame", n] => match n.parse::<usize>() {
+                Ok(n) if n < frames.len() => {
+                    selected = n;
+                    out_text.clear();
+                }
+                _ => {
+                    out_text =
+                        format!("frame: expected 0..{}", frames.len().saturating_sub(1));
+                }
+            },
+            ["step"] | ["s"] => {
+                arm_step(vm, StepKind::Into, bci);
+                break;
+            }
+            ["next"] | ["n"] => {
+                arm_step(vm, StepKind::Over, bci);
+                break;
+            }
+            ["finish"] => {
+                arm_step(vm, StepKind::Out, bci);
+                break;
+            }
+            ["print", rest @ ..] if !rest.is_empty() => {
+                let expr = rest.join(" ");
+                let fp = frames.get(selected).copied().unwrap_or(vm.stack.fp);
+                out_text = print_expr_text(vm, fp, &expr);
+            }
+            other => out_text = format!("unknown: {other:?}"),
+        }
+        fe.publish(&build_report(vm, &status, &frames, selected, bci, &out_text));
+    }
+    fe.publish("RUNNING\n");
+}
+
+/// The DBG4 report — the whole debugger state, sections by marker line,
+/// stack fields `␟`(0x1f)-separated. A frame's CURRENT bci is the halt bci
+/// for the top frame and the CALLEE's saved (resume) bci for every outer
+/// frame — that is where the frame stands.
+fn build_report(
+    vm: &VmState,
+    status: &str,
+    frames: &[usize],
+    selected: usize,
+    halt_bci: usize,
+    out_text: &str,
+) -> String {
+    const SEP: char = '\u{1f}';
+    let mut r = String::new();
+    r.push_str(status);
+    r.push('\n');
+    r.push_str("==STACK==\n");
+    for (i, &fp) in frames.iter().enumerate() {
+        let f = crate::interpreter::stack::Frame { fp };
+        let m = f.method(&vm.stack);
+        let sel = SymbolOop::try_from(m.selector())
+            .map(|s| s.as_string())
+            .unwrap_or_else(|| "?".into());
+        let holder = KlassOop::try_from(m.holder())
+            .map(|k| crate::runtime::error::name_of(k.name()))
+            .unwrap_or_else(|| "?".into());
+        let bci = if i == 0 {
+            halt_bci.to_string()
+        } else {
+            crate::interpreter::stack::Frame { fp: frames[i - 1] }
+                .saved_bci_opt(&vm.stack)
+                .map(|b| b.to_string())
+                .unwrap_or_default()
+        };
+        r.push_str(&format!("{i}{SEP}{holder}{SEP}{sel}{SEP}{bci}\n"));
+    }
+    r.push_str("==FRAME==\n");
+    if let Some(&fp) = frames.get(selected) {
+        r.push_str(&frame_text(vm, fp, selected));
+    }
+    r.push_str("==OUT==\n");
+    r.push_str(out_text);
+    if !out_text.is_empty() && !out_text.ends_with('\n') {
+        r.push('\n');
+    }
+    r
 }
 
 /// DBG5 §D3 (compiled_send_auditor_design.md): the interactive step-call
@@ -582,14 +733,20 @@ fn pool_method_name(vm: &VmState, nm: &crate::codecache::nmethod::Nmethod, pool_
 }
 
 fn show_frame(vm: &VmState, fp: usize, index: usize) {
+    eprint!("{}", frame_text(vm, fp, index));
+}
+
+/// The frame-inspection text (DBG4 string core — the CLI prints it, the GUI
+/// report embeds it).
+fn frame_text(vm: &VmState, fp: usize, index: usize) -> String {
     let f = crate::interpreter::stack::Frame { fp };
     let m = f.method(&vm.stack);
     let sel = SymbolOop::try_from(m.selector())
         .map(|s| s.as_string())
         .unwrap_or_else(|| "?".into());
     let recv = f.receiver(&vm.stack);
-    eprintln!(
-        "frame #{index}: {sel} (argc {}, ntemps {}) receiver={}",
+    let mut out = format!(
+        "frame #{index}: {sel} (argc {}, ntemps {}) receiver={}\n",
         m.argc(),
         m.ntemps(),
         crate::memory::print_oop(&vm.universe, recv)
@@ -597,11 +754,12 @@ fn show_frame(vm: &VmState, fp: usize, index: usize) {
     for t in 0..(m.argc() + m.ntemps()) {
         let v = f.temp(&vm.stack, t);
         let kind = if t < m.argc() { "arg " } else { "temp" };
-        eprintln!(
-            "  {kind}[{t}] = {}",
+        out.push_str(&format!(
+            "  {kind}[{t}] = {}\n",
             crate::memory::print_oop(&vm.universe, v)
-        );
+        ));
     }
+    out
 }
 
 /// §3.2 `print <expr>` — compiled via the frontend's EXISTING doit path
@@ -610,6 +768,12 @@ fn show_frame(vm: &VmState, fp: usize, index: usize) {
 /// restores the paused activation). `session_depth` is already > 0, so
 /// nothing the doit does can recursively halt (§3.6).
 fn print_expr(vm: &mut VmState, fp: usize, expr: &str) {
+    eprintln!("{}", print_expr_text(vm, fp, expr));
+}
+
+/// The `print <expr>` evaluation (DBG4 string core — CLI prints, GUI report
+/// embeds). Same doit path + reentrant door + `session_depth` guard as ever.
+fn print_expr_text(vm: &mut VmState, fp: usize, expr: &str) -> String {
     let receiver = crate::interpreter::stack::Frame { fp }.receiver(&vm.stack);
     let holder = crate::runtime::lookup::klass_of(vm, receiver);
     // The top-item grammar wants a statement terminator; supply it so
@@ -617,22 +781,16 @@ fn print_expr(vm: &mut VmState, fp: usize, expr: &str) {
     let expr = format!("{}.", expr.trim().trim_end_matches('.'));
     let stmt = match crate::frontend::parser::parse_one_top_item(&expr) {
         Ok(Some(crate::frontend::ast::TopItem::DoIt(stmt))) => stmt,
-        Ok(Some(_)) => {
-            eprintln!("print: expected an expression, not a class definition");
-            return;
-        }
-        Ok(None) => return,
-        Err(e) => {
-            eprintln!("print: parse error: {e}");
-            return;
-        }
+        Ok(Some(_)) => return "print: expected an expression, not a class definition".into(),
+        Ok(None) => return String::new(),
+        Err(e) => return format!("print: parse error: {e}"),
     };
     match crate::frontend::codegen::compile_doit(vm, holder, stmt) {
         Ok(m) => {
             let result = crate::interpreter::run_method_reentrant(vm, m, receiver, &[]);
-            eprintln!("{}", print_result(vm, result));
+            print_result(vm, result)
         }
-        Err(e) => eprintln!("print: {e}"),
+        Err(e) => format!("print: {e}"),
     }
 }
 

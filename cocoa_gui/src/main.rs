@@ -14,6 +14,7 @@ mod boot;
 mod canvas;
 mod colorize;
 mod control;
+mod debugger;
 mod filein;
 mod format;
 mod game;
@@ -197,6 +198,13 @@ extern "C" fn drain_perform(info: *mut c_void) {
     }
     if find_query_due {
         let _ = st.ui.exec("CocoaFind doFindQuery.");
+    }
+
+    // DBG4: a fresh debugger report (a halt, a per-command update, or a
+    // resume) — render it top-level. The exec errs harmlessly if the
+    // CocoaDebugger view isn't loaded.
+    if debugger::take_halt_arrived() {
+        let _ = st.ui.exec("CocoaDebugger haltArrived.");
     }
 
     // File ▸ Open… / Save As… (panels.rs): run the modal panel HERE — main
