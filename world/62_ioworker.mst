@@ -58,6 +58,15 @@ Object subclass: IoWorker [
         Accepting at: fd put: true.
         Kq watchRead: fd
     ]
+    "Tombstone (Dictionary has no removeKey: — the codebase idiom): a nil
+     value makes `drain:`'s at:ifAbsent: route the fd as DATA again, which
+     matters when the OS reuses a closed listener's fd number for a data
+     socket — without this, the stale `Accepting` mark would send the new
+     fd's readiness into dead accept() calls and silently drop its bytes."
+    IoWorker class >> unwatchAcceptFd: fd [
+        Accepting at: fd put: nil.
+        Kq unwatchRead: fd
+    ]
 
     IoWorker class >> handle: req [
         | tag |
@@ -71,6 +80,9 @@ Object subclass: IoWorker [
         tag == #watchAccept ifTrue: [
             self watchAcceptFd: (req at: 2).
             ^Worker reply: (Array with: #watched with: (req at: 2)) ].
+        tag == #unwatchAccept ifTrue: [
+            self unwatchAcceptFd: (req at: 2).
+            ^Worker reply: (Array with: #unwatched with: (req at: 2)) ].
         tag == #pump ifTrue: [ ^self pump: (req at: 2) ].
         Worker reply: (Array with: #err with: #unknownRequest)
     ]
@@ -170,6 +182,15 @@ Object subclass: IoWorker [
     watchAccept: fd onConnection: aBlock [
         acceptHandlers at: fd put: aBlock.
         worker send: (Array with: #watchAccept with: fd).
+        self poke.
+        ^self
+    ]
+    "The accept-side twin of unwatchRead: — tombstone the continuation AND
+     clear the worker's `Accepting` mark, so a reused fd number routes as
+     data again (TcpListener close depends on this)."
+    unwatchAccept: fd [
+        acceptHandlers at: fd put: nil.
+        worker send: (Array with: #unwatchAccept with: fd).
         self poke.
         ^self
     ]

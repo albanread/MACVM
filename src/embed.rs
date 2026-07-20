@@ -2827,6 +2827,93 @@ mod tests {
         );
     }
 
+    /// The slice-C capstone (docs/asyncio_design.md): the STREAM library end
+    /// to end. A line-echo TCP server built entirely from the ergonomic
+    /// surface — `TcpListener onConnection:` hands the accepted fd over as a
+    /// ready-made `IoStream`, the server logic is one `eachLineDo:` +
+    /// `writeLine:`, and the client reads replies with chained
+    /// `nextLineDo:`s. The proof of FRAMING (the whole point of slice C over
+    /// slice B's raw batches): the client sends `PING\nPONG\n` split
+    /// MID-LINE across two separate writes, so the server's kevent batches
+    /// cannot align with line boundaries — both sides must reassemble. Two
+    /// intact `ECHO:`-prefixed lines back means: accept → per-connection
+    /// stream → server-side line reassembly → echo → client-side line
+    /// reassembly, all multiplexed by one IoWorker on infinite sleeps.
+    ///
+    /// The split must be DETERMINISTIC to test anything: two back-to-back
+    /// client writes coalesce in the loopback socket buffer and arrive as
+    /// one kevent batch (verified live — a broken buffer still passed).
+    /// So the second write is sequenced behind a marker pipe: the marker
+    /// is written inside `onConnection:` (accept time — the conn was not
+    /// yet watched, so its data can't be in that batch), which puts 'PIN'
+    /// (bounded read, kevent data=3) and the marker in the NEXT batch,
+    /// and the marker's continuation issues the second write only then —
+    /// strictly after 'PIN' was already drained alone.
+    #[test]
+    fn iostream_line_echo_server_reassembles_split_lines() {
+        let mut vm = boot_worker_primary();
+        vm.exec(
+            "Object subclass: LineProbe [
+                <classVars: L Client Replies Buf>
+                LineProbe class >> setUp: iow [
+                    Replies := OrderedCollection new.
+                    Buf := NativeBuffer page.
+                    Posix pipeInto: Buf address.
+                    L := TcpListener on: iow backlog: 8.
+                    L onConnection: [ :s |
+                        s eachLineDo: [ :line | s writeLine: 'ECHO:' , line ].
+                        Posix write: (Buf u32At: 4) from: Buf address + 512 count: 1 ].
+                    iow watchRead: (Buf u32At: 0) onData: [ :bytes :eof |
+                        Client write: 'G' , String lf , 'PONG' , String lf ].
+                    iow startPumping.
+                    Client := IoStream connectLoopback: L port on: iow.
+                    Client nextLineDo: [ :l1 |
+                        Replies add: l1.
+                        Client nextLineDo: [ :l2 | Replies add: l2 ] ].
+                    Client write: 'PIN' ]
+                LineProbe class >> count [ ^Replies size ]
+                LineProbe class >> reply: i [ ^Replies at: i ]
+                LineProbe class >> teardown [ Client close. L close ]
+            ]",
+        )
+        .expect("define LineProbe");
+        vm.exec("WkTest reset.").expect("reset");
+        vm.exec("WkTest w1: IoWorker spawn.")
+            .expect("spawn the IoWorker VM");
+        vm.exec("LineProbe setUp: WkTest w1.")
+            .expect("listen, serve lines, connect, send split lines");
+        vm.exec("Worker runLoopWhile: [ (WkTest tickCapped: 200) and: [ LineProbe count < 2 ] ].")
+            .expect("run the loop until both echoed lines land");
+        assert_eq!(
+            vm.eval("LineProbe count").expect("count").trim(),
+            "2",
+            "both echoed lines must arrive as separate framed lines"
+        );
+        assert_eq!(
+            vm.eval("(LineProbe reply: 1) = 'ECHO:PING'")
+                .expect("reply 1")
+                .trim(),
+            "true",
+            "line one reassembled across the mid-line write split"
+        );
+        assert_eq!(
+            vm.eval("(LineProbe reply: 2) = 'ECHO:PONG'")
+                .expect("reply 2")
+                .trim(),
+            "true",
+            "line two framed and echoed intact"
+        );
+        // Teardown gates the accept-side lifecycle: IoStream close
+        // (unwatchRead tombstone) and TcpListener close (the new
+        // unwatchAccept round-trip clearing the worker's Accepting mark —
+        // without it a reused fd number would route into dead accepts).
+        vm.exec("LineProbe teardown.")
+            .expect("close the client stream and the listener cleanly");
+        vm.exec("WkTest reset.").expect("fresh tick budget");
+        vm.exec("Worker runLoopWhile: [ WkTest tickCapped: 20 ].")
+            .expect("drain the unwatch round-trips");
+    }
+
     #[test]
     fn perform_calls_a_method_by_name() {
         // `perform:withArguments:` (prim 64) + its arity sugar: a Symbol

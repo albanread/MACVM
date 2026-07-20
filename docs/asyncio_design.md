@@ -1,11 +1,13 @@
 # Async I/O over the POSIX FFI
 
-**Status:** slices A + B built + gated 2026-07-16/17, including the cadence
-(infinite kevent sleep + EVFILT_USER wake) and sockets (TCP echo capstone
-green). Remaining: slice C (the stream library). Roadmap item 3 — turn the
-worker model into a *system* (async I/O so I/O never blocks a VM). Pure
-Smalltalk + the S20 FFI; **zero new Rust**, by design — this exercises the FFI
-on its intended real workload.
+**Status: COMPLETE.** Slices A + B built + gated 2026-07-16/17, including the
+cadence (infinite kevent sleep + EVFILT_USER wake) and sockets (TCP echo
+capstone green). Slice C (the stream library — `IoStream`/`TcpListener`,
+`world/62a_iostreams.mst`) built + gated 2026-07-20 (line-echo capstone with a
+deterministic mid-line split). Roadmap item 3 — turn the worker model into a
+*system* (async I/O so I/O never blocks a VM). Pure Smalltalk + the S20 FFI;
+**zero new Rust**, by design — this exercises the FFI on its intended real
+workload.
 
 ## The bet, and the two constraints that shape it
 
@@ -184,11 +186,56 @@ test, 0.04s green; verified to redden on a truncated echo. Plus
 single-VM (listener readiness `data` = pending-connection count, bounded
 accept, 3 bytes across the wire).
 
-## Slice C — a stream library (later)
+## Slice C — the stream library (BUILT: `world/62a_iostreams.mst`)
 
-`Socket`/`FileStream`-style objects over the IoWorker: `readInto:`, `write:`,
-`accept`, buffered line reading — the ergonomic surface. Pure Smalltalk on
-slice B.
+The ergonomic surface over slice B: `IoStream` + `TcpListener`, pure Smalltalk,
+zero new Rust. The design premise: in this VM there IS no blocking read on the
+requester's side — data arrives as messages — so the stream's read surface is
+**continuation-based**, not call-and-wait. An `IoStream` is a buffer between
+two worlds: raw `{bytes. eof}` batches arriving whenever the IoWorker pumps,
+and the caller's framed requests ("a line", "exactly N bytes", "everything").
+
+- **`IoStream on: iow fd: fd`** registers itself as the fd's `onData:`
+  continuation and accumulates arriving bytes in an internal buffer. Requests
+  queue FIFO and each fires **once**, as soon as it is satisfiable:
+  - `nextLineDo: [:line|]` — fires when a LF is buffered (line delivered
+    without its LF, one trailing CR stripped — telnet/HTTP-friendly); at EOF
+    it fires with the unterminated remainder if any, else with `nil` ("no
+    more lines" — the terminator a re-arming reader keys off).
+  - `nextCount: n do: [:bytes|]` — fires when n bytes are buffered (answers a
+    ByteArray); at EOF fires short with whatever is left.
+  - `upToEndDo: [:all|]` — fires at EOF with everything since the last read.
+  - `eachLineDo: [:line|]` — sugar: a `nextLineDo:` that re-arms itself until
+    the nil terminator. THE server idiom (see the capstone).
+  Strict FIFO: only the HEAD request is tested for satisfiability — a queued
+  `nextCount:` behind a `nextLineDo:` never steals bytes out of order. A
+  `servicing` guard makes requests registered *inside* a firing continuation
+  (the re-arm pattern) enqueue for the same service sweep, not recurse.
+- **`write: aString`** stages through a class-side `NativeBuffer` page and
+  loops on the kernel's count (partial writes continue; `<= 0` aborts
+  answering the total so far — errors are VALUES, per the slice-B rule).
+  Deliberate v1 bound: the fd is a *blocking* fd, so a write larger than the
+  socket send buffer can stall the writer VM until the peer drains —
+  fine for loopback/reply-sized payloads; `EVFILT_WRITE`-driven flushing is
+  the slice-C+ extension if a workload ever needs it.
+- **`close`** unwatches, closes the fd, and forces EOF servicing — every
+  pending request fires (remainder / short / nil) rather than dangling.
+- **`TcpListener on: iow backlog: n`** wraps `tcpListenLoopback:` (nil on
+  failure, errno readable); `onConnection: [:stream|]` accepts arrive as
+  ready-made `IoStream`s on the same IoWorker. `IoStream connectLoopback:
+  port on: iow` is the client-side twin. Loopback-only, ephemeral ports,
+  same as slice B.
+
+**Gates:** `IoStreamTests` (`world/tests/45_iostream_tests.mst`, single-VM —
+the buffering/framing logic is fed synthetic `deliverData:eof:` batches, no
+worker needed): line assembly across chunk splits, CRLF stripping, several
+lines in one batch, FIFO head-only servicing, count/short-count, EOF
+remainder + nil terminator, close-forces-EOF. Plus the embed capstone
+`iostream_line_echo_server_reassembles_split_lines`: a line-echo TCP server
+(`eachLineDo:` + `write:`) whose client sends `PING\nPONG\n` **split
+mid-line across two writes** — the reply lines prove framing end to end
+through the IoWorker (accept → per-connection stream → line reassembly →
+echo → client-side line reassembly).
 
 ## Reuse map
 

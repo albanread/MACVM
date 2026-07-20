@@ -1,0 +1,184 @@
+"45_iostream_tests.mst — IoStreamTests: the slice-C gate for the stream
+ library (world/62a_iostreams.mst, docs/asyncio_design.md). The whole
+ framing/buffering brain is exercised SINGLE-VM with no worker and no fd:
+ a detached IoStream (`on: nil fd: -1`) is fed synthetic deliverData:eof:
+ batches — exactly the seam the IoWorker's onData: continuation drives in
+ production — so every chunk-split, FIFO, and EOF rule gates headless in
+ the ordinary it_world suite. The live end (real TCP through a real
+ IoWorker) is gated by the embed capstone
+ `iostream_line_echo_server_reassembles_split_lines`."
+
+TestCase subclass: IoStreamTests [
+    runAll [
+        self runTest: #testLineAssembledAcrossChunkSplits do: [ self testLineAssembledAcrossChunkSplits ].
+        self runTest: #testSeveralLinesInOneBatchDispatchInOrder do: [ self testSeveralLinesInOneBatchDispatchInOrder ].
+        self runTest: #testCrLfStripsOneCr do: [ self testCrLfStripsOneCr ].
+        self runTest: #testFifoHeadOnlyNoStealing do: [ self testFifoHeadOnlyNoStealing ].
+        self runTest: #testNextCountExactAndShortAtEof do: [ self testNextCountExactAndShortAtEof ].
+        self runTest: #testEofRemainderThenNilTerminator do: [ self testEofRemainderThenNilTerminator ].
+        self runTest: #testUpToEndDo do: [ self testUpToEndDo ].
+        self runTest: #testEachLineDoReArmsThroughOneBatch do: [ self testEachLineDoReArmsThroughOneBatch ].
+        self runTest: #testCloseForcesEofServicing do: [ self testCloseForcesEofServicing ].
+        self runTest: #testRequestAgainstAlreadyFullBufferFiresAtOnce do: [ self testRequestAgainstAlreadyFullBufferFiresAtOnce ].
+    ]
+
+    "A detached stream: nil IoWorker (nothing watched), dead fd. `close` on
+     it must not try to close a real fd — fd -1 is guarded in IoStream."
+    detached [ ^IoStream on: nil fd: -1 ]
+    "Feed aString's bytes as one arriving batch (the ByteArray shape the
+     IoWorker's bounded read delivers)."
+    feed: s into: stream [ ^self feed: s into: stream eof: false ]
+    feed: s into: stream eof: e [
+        | bytes |
+        bytes := ByteArray new: s size.
+        1 to: s size do: [ :i | bytes at: i put: (s basicByteAt: i) ].
+        stream deliverData: bytes eof: e
+    ]
+
+    "One logical line arriving in three arbitrary chunk splits — mid-line
+     splits are the normal case (kevent batches at TCP segment boundaries,
+     not line boundaries)."
+    testLineAssembledAcrossChunkSplits [
+        | s got |
+        s := self detached.
+        got := nil.
+        s nextLineDo: [ :line | got := line ].
+        self feed: 'PI' into: s.
+        self assert: got isNil.          "no LF yet — must not fire"
+        self feed: 'N' into: s.
+        self assert: got isNil.
+        self feed: 'G' , String lf into: s.
+        self assert: got = 'PING'.
+    ]
+
+    "Two requests queued, both lines arrive in ONE batch: both fire in the
+     same service sweep, in FIFO order."
+    testSeveralLinesInOneBatchDispatchInOrder [
+        | s got |
+        s := self detached.
+        got := OrderedCollection new.
+        s nextLineDo: [ :line | got add: line ].
+        s nextLineDo: [ :line | got add: line ].
+        self feed: 'one' , String lf , 'two' , String lf into: s.
+        self assert: got size = 2.
+        self assert: (got at: 1) = 'one'.
+        self assert: (got at: 2) = 'two'.
+    ]
+
+    "CRLF: exactly one trailing CR is stripped with the LF; a CR anywhere
+     else (or a doubled CR) survives."
+    testCrLfStripsOneCr [
+        | s got cr |
+        s := self detached.
+        got := OrderedCollection new.
+        cr := String cr.
+        s nextLineDo: [ :line | got add: line ].
+        s nextLineDo: [ :line | got add: line ].
+        self feed: 'web' , cr , String lf , 'mid' , cr , 'dle' , String lf into: s.
+        self assert: (got at: 1) = 'web'.
+        self assert: (got at: 2) = ('mid' , cr , 'dle').
+    ]
+
+    "Strict FIFO: a nextCount: queued BEHIND a nextLineDo: must not steal
+     buffered bytes while the head is still waiting for its LF — even
+     though 3 bytes are sitting right there."
+    testFifoHeadOnlyNoStealing [
+        | s gotLine gotBytes |
+        s := self detached.
+        gotLine := nil.
+        gotBytes := nil.
+        s nextLineDo: [ :line | gotLine := line ].
+        s nextCount: 3 do: [ :bytes | gotBytes := bytes ].
+        self feed: 'abc' into: s.
+        self assert: gotLine isNil.
+        self assert: gotBytes isNil.     "head not satisfied -> tail must wait"
+        self feed: String lf , 'xyz' into: s.
+        self assert: gotLine = 'abc'.
+        self assert: gotBytes size = 3.
+        self assert: (gotBytes at: 1) = 120.    "x"
+    ]
+
+    testNextCountExactAndShortAtEof [
+        | s exact short |
+        s := self detached.
+        exact := nil.
+        short := nil.
+        s nextCount: 4 do: [ :bytes | exact := bytes ].
+        s nextCount: 10 do: [ :bytes | short := bytes ].
+        self feed: 'ABCDEF' into: s.
+        self assert: exact size = 4.     "fires exact the moment 4 are there"
+        self assert: (exact at: 1) = 65.
+        self assert: short isNil.        "only 2 left, not 10 — waits"
+        self feed: '' into: s eof: true.
+        self assert: short size = 2.     "EOF fires it SHORT with the tail"
+    ]
+
+    "EOF line semantics: the unterminated remainder first, then nil — the
+     'no more lines' terminator a re-arming reader keys off."
+    testEofRemainderThenNilTerminator [
+        | s got |
+        s := self detached.
+        got := OrderedCollection new.
+        self feed: 'done' , String lf , 'tail' into: s eof: true.
+        s nextLineDo: [ :line | got add: line ].
+        s nextLineDo: [ :line | got add: line ].
+        s nextLineDo: [ :line | got add: line ].
+        self assert: got size = 3.
+        self assert: (got at: 1) = 'done'.
+        self assert: (got at: 2) = 'tail'.
+        self assert: (got at: 3) isNil.
+        self assert: s atEnd.
+    ]
+
+    testUpToEndDo [
+        | s all |
+        s := self detached.
+        all := nil.
+        s upToEndDo: [ :everything | all := everything ].
+        self feed: 'part one ' into: s.
+        self assert: all isNil.          "#all only fires at EOF"
+        self feed: 'part two' into: s eof: true.
+        self assert: all = 'part one part two'.
+    ]
+
+    "The server idiom: eachLineDo: re-arms INSIDE the fired continuation.
+     Three lines in one batch must dispatch all three in one sweep (the
+     `servicing` guard folds the re-arm into the running loop), then the
+     EOF nil ends the chain without invoking the block."
+    testEachLineDoReArmsThroughOneBatch [
+        | s got |
+        s := self detached.
+        got := OrderedCollection new.
+        s eachLineDo: [ :line | got add: line ].
+        self feed: 'a' , String lf , 'b' , String lf , 'c' , String lf into: s.
+        self assert: got size = 3.
+        self assert: (got at: 3) = 'c'.
+        self feed: '' into: s eof: true.
+        self assert: got size = 3.       "nil terminator never reaches the block"
+    ]
+
+    "close on a stream with pending requests forces EOF servicing: nothing
+     dangles — the pending line fires with the buffered remainder."
+    testCloseForcesEofServicing [
+        | s got |
+        s := self detached.
+        got := nil.
+        s nextLineDo: [ :line | got := line ].
+        self feed: 'partial' into: s.
+        self assert: got isNil.
+        s close.
+        self assert: got = 'partial'.
+        self assert: s atEnd.
+    ]
+
+    "A request registered AFTER the data already arrived fires immediately
+     from the registration's own service call — order independence."
+    testRequestAgainstAlreadyFullBufferFiresAtOnce [
+        | s got |
+        s := self detached.
+        self feed: 'ready' , String lf into: s.
+        got := nil.
+        s nextLineDo: [ :line | got := line ].
+        self assert: got = 'ready'.
+    ]
+]

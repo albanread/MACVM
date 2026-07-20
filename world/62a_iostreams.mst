@@ -1,0 +1,276 @@
+"62a_iostreams.mst — the slice-C stream library (docs/asyncio_design.md):
+ IoStream + TcpListener, the ergonomic surface over the slice-B IoWorker.
+ Pure Smalltalk on world/61 (Posix/NativeBuffer) + world/62 (IoWorker) —
+ ZERO new Rust.
+
+ The design premise: on the requester's side there IS no blocking read —
+ data arrives as messages whenever the IoWorker pumps — so the read surface
+ is CONTINUATION-based, not call-and-wait. An IoStream is the buffer between
+ two framings: raw {bytes. eof} batches (whatever kevent happened to report)
+ in, and the caller's requests (a line, exactly N bytes, everything) out.
+
+ Requests queue FIFO and each fires ONCE, as soon as it is satisfiable.
+ Strict FIFO means only the HEAD request is ever tested — a queued
+ nextCount: behind a nextLineDo: can never steal bytes out of order. The
+ `servicing` guard makes a request registered INSIDE a firing continuation
+ (the eachLineDo: re-arm pattern) enqueue into the same service sweep
+ instead of recursing. (Data cannot re-enter mid-sweep: the VM is serial
+ and a loopback echo written from a continuation only returns via a LATER
+ pump reply — the guard is for the re-arm case alone.)
+
+ Writes go straight out the fd (fds are process-wide): staged through a
+ class-side NativeBuffer page, looping on the kernel's count. v1 bound,
+ deliberate: the fd is a BLOCKING fd, so a write larger than the socket
+ send buffer can stall this VM until the peer drains — fine for loopback
+ and reply-sized payloads; EVFILT_WRITE-driven flushing is the slice-C+
+ extension if a workload ever needs it. Errors are VALUES (a short total),
+ never raises — the slice-B rule."
+
+Object subclass: IoStream [
+    | io fd inBuf eof pending servicing |
+    <classVars: Scratch>
+
+    "── construction ──────────────────────────────────────────────────────
+     `on: iow fd:` wires the stream into a live IoWorker as the fd's onData:
+     continuation. A nil `iow` builds a DETACHED stream (nothing watched) —
+     the unit-test seam: IoStreamTests feeds deliverData:eof: directly, so
+     the framing logic gates single-VM with no worker at all."
+    IoStream class >> on: iow fd: anFd [
+        | s |
+        s := self basicNew setIo: iow fd: anFd.
+        iow isNil ifFalse: [
+            iow watchRead: anFd onData: [ :bytes :e | s deliverData: bytes eof: e ] ].
+        ^s
+    ]
+    "The client-side twin of TcpListener: connect loopback, wrap the fd.
+     Answers nil if the connect fails (errno via `Posix errno`)."
+    IoStream class >> connectLoopback: port on: iow [
+        | cfd |
+        cfd := Posix tcpConnectLoopback: port.
+        cfd < 0 ifTrue: [ ^nil ].
+        ^self on: iow fd: cfd
+    ]
+    setIo: iow fd: anFd [
+        io := iow.
+        fd := anFd.
+        inBuf := ''.
+        eof := false.
+        pending := OrderedCollection new.
+        servicing := false.
+        ^self
+    ]
+    fd [ ^fd ]
+    atEnd [ ^eof and: [ inBuf size = 0 ] ]
+    "Bytes buffered but not yet claimed by any request — a test/debug probe."
+    buffered [ ^inBuf size ]
+
+    "── the inbound seam: the IoWorker's onData: lands here ──────────────
+     Bytes arrive as a ByteArray (the IoWorker's bounded read); they append
+     verbatim as String bytes (a String and a ByteArray are both
+     IndexableBytes — no re-encoding, the PosixFile convention). eof LATCHES:
+     once true it stays true, and servicing drains every request."
+    deliverData: bytes eof: e [
+        | n chunk |
+        "Self-heal a crashed sweep: `service` clears `servicing` only on
+         normal fall-through, so a continuation that raised (guest fatal —
+         the whole doit unwound, no ensure: runs on a fatal) leaves it
+         stuck true and the stream wedged. Data can never arrive DURING a
+         live sweep (serial VM; deliver: only runs at the top loop), so a
+         true flag here is always a crash leftover — reset it, per the
+         recover-clean-or-die rule."
+        servicing := false.
+        n := bytes size.
+        n > 0 ifTrue: [
+            chunk := String new: n.
+            1 to: n do: [ :i | chunk basicByteAt: i put: (bytes at: i) ].
+            inBuf := inBuf , chunk ].
+        e ifTrue: [ eof := true ].
+        self service
+    ]
+
+    "── the read surface: framed requests, FIFO, each fires once ─────────"
+    "Fire with the next LF-terminated line, WITHOUT its LF and with one
+     trailing CR stripped (telnet/HTTP-friendly). At EOF: the unterminated
+     remainder if any, else nil — the 'no more lines' terminator a
+     re-arming reader keys off."
+    nextLineDo: aBlock [
+        pending addLast: (Array with: #line with: aBlock).
+        self service.
+        ^self
+    ]
+    "Fire with exactly n bytes as a ByteArray; at EOF fire SHORT with
+     whatever is left (possibly empty)."
+    nextCount: n do: aBlock [
+        pending addLast: (Array with: #count with: aBlock with: n).
+        self service.
+        ^self
+    ]
+    "Fire at EOF with everything buffered since the last read (a String)."
+    upToEndDo: aBlock [
+        pending addLast: (Array with: #all with: aBlock).
+        self service.
+        ^self
+    ]
+    "THE server idiom: a nextLineDo: that re-arms itself until the nil
+     terminator. The re-arm happens inside the fired continuation, which the
+     `servicing` guard folds into the same sweep — several buffered lines
+     dispatch in one service pass, in order, without recursion."
+    eachLineDo: aBlock [
+        self nextLineDo: [ :line |
+            line isNil ifFalse: [
+                aBlock value: line.
+                self eachLineDo: aBlock ] ].
+        ^self
+    ]
+
+    "── servicing: satisfy the head request, repeat ──────────────────────
+     Head-only (strict FIFO). The guard: continuations may register new
+     requests (the re-arm) or even deliver more data (an echo written from
+     a continuation can come straight back on loopback) — those re-entrant
+     `service` calls just return, and THIS sweep's whileTrue picks up
+     whatever they queued."
+    service [
+        servicing ifTrue: [ ^self ].
+        servicing := true.
+        [ pending size > 0 and: [ self headSatisfiable ] ] whileTrue: [
+            self fireHead ].
+        servicing := false
+    ]
+    headSatisfiable [
+        | req tag |
+        req := pending first.
+        tag := req at: 1.
+        eof ifTrue: [ ^true ].
+        tag == #line ifTrue: [ ^(self lfIndex) > 0 ].
+        tag == #count ifTrue: [ ^inBuf size >= (req at: 3) ].
+        "#all only fires at EOF"
+        ^false
+    ]
+    "Position of the first LF (byte 10) in the buffer, or 0."
+    lfIndex [
+        1 to: inBuf size do: [ :i |
+            (inBuf basicByteAt: i) = 10 ifTrue: [ ^i ] ].
+        ^0
+    ]
+    fireHead [
+        | req tag block |
+        req := pending removeFirst.
+        tag := req at: 1.
+        block := req at: 2.
+        tag == #line ifTrue: [ ^block value: self takeLine ].
+        tag == #count ifTrue: [ ^block value: (self takeCount: (req at: 3)) ].
+        block value: self takeAll
+    ]
+    "Consume through the first LF; strip the LF and one trailing CR. At EOF
+     with no LF: the remainder, or nil when the buffer is empty."
+    takeLine [
+        | k line end |
+        k := self lfIndex.
+        k = 0 ifTrue: [
+            inBuf size = 0 ifTrue: [ ^nil ].
+            line := inBuf.
+            inBuf := ''.
+            ^line ].
+        end := k - 1.
+        (end >= 1 and: [ (inBuf basicByteAt: end) = 13 ]) ifTrue: [ end := end - 1 ].
+        line := inBuf copyFrom: 1 to: end.
+        inBuf := inBuf copyFrom: k + 1 to: inBuf size.
+        ^line
+    ]
+    "Consume min(n, buffered) bytes as a ByteArray (short only at EOF)."
+    takeCount: n [
+        | take bytes |
+        take := n min: inBuf size.
+        bytes := ByteArray new: take.
+        1 to: take do: [ :i | bytes at: i put: (inBuf basicByteAt: i) ].
+        inBuf := inBuf copyFrom: take + 1 to: inBuf size.
+        ^bytes
+    ]
+    takeAll [
+        | all |
+        all := inBuf.
+        inBuf := ''.
+        ^all
+    ]
+
+    "── writes: straight out the fd, staged through the class scratch ────
+     One lazy page for all streams (a VM is strictly serial — the PosixFile
+     pattern). Loops on the kernel's count; answers the total actually
+     written (a short total IS the error report — check it if you care)."
+    IoStream class >> scratch [
+        Scratch isNil ifTrue: [ Scratch := NativeBuffer page ].
+        ^Scratch
+    ]
+    write: aString [
+        | buf sz total len moved |
+        buf := self class scratch.
+        sz := aString size.
+        total := 0.
+        [ total < sz ] whileTrue: [
+            len := (sz - total) min: 4096.
+            1 to: len do: [ :i | buf byteAt: i - 1 put: (aString basicByteAt: total + i) ].
+            moved := Posix write: fd from: buf address count: len.
+            moved <= 0 ifTrue: [ ^total ].
+            total := total + moved ].
+        ^total
+    ]
+    "Convenience: write + LF terminator (the line protocol's other half)."
+    writeLine: aString [
+        ^self write: aString , (String lf)
+    ]
+
+    "── teardown: unwatch, close, and force-drain every pending request ──
+     eof := true makes every queued request satisfiable (remainder / short /
+     nil), so nothing dangles waiting on a closed fd."
+    close [
+        io isNil ifFalse: [ io unwatchRead: fd ].
+        fd >= 0 ifTrue: [ Posix close: fd ].
+        fd := -1.
+        eof := true.
+        self service.
+        ^self
+    ]
+]
+
+"── TcpListener: the accept side, handing out ready-made IoStreams ─────────
+ Wraps the slice-B pieces end to end: `tcpListenLoopback:` (127.0.0.1,
+ ephemeral port — nothing leaves the machine, no firewall prompt),
+ `boundPortOf:` (no hardcoded ports), and `watchAccept:onConnection:` (the
+ IoWorker accepts, bounded by the kevent backlog count; the new fd crosses
+ back as an int). Each accepted fd arrives wrapped as an IoStream on the
+ same IoWorker, ready for eachLineDo:."
+Object subclass: TcpListener [
+    | io fd port |
+    "Answers nil if the socket/bind/listen chain fails (errno readable)."
+    TcpListener class >> on: iow backlog: n [
+        | lfd |
+        lfd := Posix tcpListenLoopback: n.
+        lfd < 0 ifTrue: [ ^nil ].
+        ^self basicNew setIo: iow fd: lfd
+    ]
+    setIo: iow fd: lfd [
+        io := iow.
+        fd := lfd.
+        port := Posix boundPortOf: lfd.
+        ^self
+    ]
+    fd [ ^fd ]
+    port [ ^port ]
+    "`aBlock` is a 1-arg block [:stream | ...] — one IoStream per accepted
+     connection, watched on the same IoWorker."
+    onConnection: aBlock [
+        io watchAccept: fd onConnection: [ :newFd |
+            aBlock value: (IoStream on: io fd: newFd) ].
+        ^self
+    ]
+    "Unwatch BEFORE closing (the IoStream close ordering): clears both the
+     primary-side handler and the worker's `Accepting` mark, so if the OS
+     reuses this fd number for a data socket it routes as data, not into
+     dead accept() calls."
+    close [
+        io isNil ifFalse: [ io unwatchAccept: fd ].
+        fd >= 0 ifTrue: [ Posix close: fd ].
+        fd := -1.
+        ^self
+    ]
+]
