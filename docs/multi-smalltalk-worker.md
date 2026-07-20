@@ -30,8 +30,11 @@ which spends its idle time genuinely asleep (today's primary VM thread already
 sleeps in `request_rx.recv()` between doits — `vm_host::worker_loop`; this
 design rides that same sleep). Replies are handled by **continuations**
 (`send:…onReply: [:r | …]`, correlation-id matched), never by blocking. There
-is no polling anywhere in the system: the event router (§3.1) is the inbox
-channel plus a wake hook, and the *send itself is the wake*.
+is no polling anywhere in the **message plane**: the event router (§3.1) is
+the inbox channel plus a wake hook, and the *send itself is the wake*. (Scope
+note: an embedding shell may add its own bounded control-plane heartbeat on
+top — the Cocoa GUI's supervisor beats ~4 Hz for stop flags/metrics/parked
+requests — but no message is ever delivered, or waited for, by a poll.)
 
 **Non-goals (v1):**
 
@@ -137,9 +140,10 @@ assembly of proven parts.
 ### 3.1 The event router — how a sleeping primary is woken
 
 The primary spends most of its life asleep, and the design keeps it that way:
-**no polling exists anywhere in the system.** The "router" is not a thread or
-a component — it is the inbox channel plus a registered wake hook, and the
-send itself is the wake event:
+**no polling exists anywhere in the message plane** (see the §2 scope note —
+an embedding shell's own control-plane heartbeat is a separate, bounded
+concern). The "router" is not a thread or a component — it is the inbox
+channel plus a registered wake hook, and the send itself is the wake event:
 
 ```
 worker thread:  inbox_tx.send(envelope);

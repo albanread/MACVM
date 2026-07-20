@@ -134,10 +134,17 @@ measurements.
   independently addressable (`send:onReply:` per worker) — a star topology:
   every worker talks only to the primary, and workers don't spawn sub-workers
   (a v1 rule the registry design doesn't preclude lifting later).
-  Fully asynchronous: replies run as `send:onReply:` continuations, delivery is
-  event-driven (the send itself wakes the sleeping receiver), and there is no
-  polling anywhere. A crashed worker dies alone and is reported as an ordinary
-  `#workerDied` message. `ParallelMandel` measures **~2.65 CPUs of sustained
+  Fully asynchronous: replies run as `send:onReply:` continuations and delivery
+  is event-driven — the send itself wakes the sleeping receiver (a coalesced,
+  never-lost wake), so **no one ever polls for a message** and a worker with
+  nothing to do sleeps at zero CPU. (Honesty note: that claim is about the
+  message plane. The Cocoa GUI's supervisor does run a deliberate slow
+  heartbeat — ~4 Hz, control-plane housekeeping only: stop flags, toolbar
+  metrics, servicing parked requests such as File In — and the shell's
+  flag-and-drain pattern sweeps its request flags on each pass, made prompt by
+  a run-loop wake. Bounded ticks by design, not message delivery; the headless
+  worker system runs with no beat at all.) A crashed worker dies alone and is
+  reported as an ordinary `#workerDied` message. `ParallelMandel` measures **~2.65 CPUs of sustained
   utilization with 4 workers** on the live zooming Mandelbrot — visibly faster
   than the single-VM dive ([`docs/multi-smalltalk-worker.md`](docs/multi-smalltalk-worker.md)).
 - **The object world** — 107 classes / 1,269 methods of hand-written and
