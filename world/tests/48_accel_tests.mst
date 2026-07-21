@@ -17,6 +17,53 @@ TestCase subclass: AccelTests [
         self runTest: #testIndirectAlienZeroTail do: [ self testIndirectAlienZeroTail ].
         self runTest: #testMatrixMultiplyThroughStackSpill do: [ self testMatrixMultiplyThroughStackSpill ].
         self runTest: #testDgemmAlphaBetaMixesFprAndSpill do: [ self testDgemmAlphaBetaMixesFprAndSpill ].
+        self runTest: #testFftRoundTripIsUnscaled do: [ self testFftRoundTripIsUnscaled ].
+        self runTest: #testFftFindsASpectralPeak do: [ self testFftFindsASpectralPeak ].
+    ]
+
+    "vDSP FFTs are unscaled: inverse(forward(x)) = n * x, exactly the
+     contract FftSetup's comment states. 8 distinct points make any
+     dropped/reordered lane change the answer."
+    testFftRoundTripIsUnscaled [
+        | fft re im |
+        fft := FftSetup log2n: 3.
+        self assert: fft size = 8.
+        re := NativeFloatArray from: #(1 2 3 4 5 6 7 8).
+        im := NativeFloatArray lanes: 8.
+        fft forwardReal: re imag: im.
+        fft inverseReal: re imag: im.
+        1 to: 8 do: [ :i |
+            self assert: (self close: (re at: i) to: i * 8).
+            self assert: (self close: (im at: i) to: 0.0) ].
+        re free. im free. fft free.
+        self assert: fft isFreed.
+    ]
+
+    "A pure cosine at bin k concentrates its energy at bins k and n-k
+     (real input, complex transform): magnitude n/2 there, ~0 everywhere
+     else. The signal is built by the vector pipeline itself (ramp ->
+     scale -> cos), the same chain the FftScope demo animates."
+    testFftFindsASpectralPeak [
+        | n k fft re im t mag |
+        n := 16. k := 3.
+        fft := FftSetup log2n: 4.
+        re := NativeFloatArray lanes: n.
+        im := NativeFloatArray lanes: n.
+        re rampFrom: 0 step: 2 * Double pi * k / n.
+        re cosInto: re.
+        fft forwardReal: re imag: im.
+        t := NativeFloatArray lanes: n.
+        mag := NativeFloatArray lanes: n.
+        re multiply: re into: mag.
+        im multiply: im into: t.
+        mag add: t into: mag.
+        mag sqrtInto: mag.
+        "Bins are 1-based here: bin index b holds frequency b-1."
+        self assert: (self close: (mag at: k + 1) to: n / 2).
+        self assert: (self close: (mag at: n - k + 1) to: n / 2).
+        self assert: (mag at: 1) abs < 0.000001.        "no DC"
+        self assert: (mag at: 6) abs < 0.000001.        "no off-peak energy"
+        re free. im free. t free. mag free. fft free.
     ]
 
     "vDSP_mmulD is 9 integer args — the first kernel through the

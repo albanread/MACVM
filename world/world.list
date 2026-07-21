@@ -119,6 +119,10 @@
 # (lazy dlopen) + NativeFloatArray (GC-stable mmap lanes, in-place ops,
 # reductions, transcendentals). docs/accelerate_design.md.
 61a_accelerate.mst
+# FftScope: the FFT worked example — a live spectrum analyzer on the native
+# game pane (two-tone signal synthesized by vector ops, split-complex FFT
+# per frame, 128-bin magnitude bars; arrows steer the manual tone).
+61b_fftscope.mst
 62_ioworker.mst
 62a_iostreams.mst
 

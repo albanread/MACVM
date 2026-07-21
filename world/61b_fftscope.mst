@@ -1,0 +1,146 @@
+"61b_fftscope.mst — FFT SCOPE, a live spectrum-analyzer demo for the native
+ game pane: the worked example for the Accelerate FFT surface (world/61a,
+ docs/accelerate_design.md). Every frame it synthesizes a two-tone signal
+ ENTIRELY with vector ops (rampFrom:step: -> sinInto: -> scaleBy: ->
+ add:into:), draws the waveform, transforms it in place with vDSP's
+ split-complex FFT, and draws the 128-bin magnitude spectrum as bars —
+ one sweeping tone walking the spectrum, one manual tone you steer with
+ the Left/Right arrow keys. Sixty FFTs a second from a dynamic language,
+ which is the whole point of the demo.
+
+ Launch it from the Demos menu, or a Workspace: FftScope launch. Escape
+ ends it; onReset: frees the plan and the four native arrays. Harmless to
+ load headless (game primitives no-op; the math still runs)."
+
+"I am a live spectrum analyzer: a two-tone test signal synthesized by
+ Accelerate vector ops, drawn as a waveform, FFT-transformed in place
+ every frame, and shown as a 128-bin magnitude bar display. One tone
+ sweeps by itself; steer the other with the Left/Right arrow keys and
+ watch its bar walk the spectrum. Launch me from the Demos menu or with
+ FftScope launch; Escape ends me and frees my native arrays and FFT plan."
+Object subclass: FftScope [
+    | pane fft re im t mag frame manualFreq |
+
+    FftScope class >> n [ ^256 ]        "2^log2n points per frame"
+    FftScope class >> log2n [ ^8 ]
+
+    FftScope class >> launch [
+        "Open the game pane and start the analyzer."
+        ^self new start
+    ]
+
+    start [
+        pane := GamePane new.
+        self buildPalette.
+        fft := FftSetup log2n: self class log2n.
+        re := NativeFloatArray lanes: self class n.
+        im := NativeFloatArray lanes: self class n.
+        t := NativeFloatArray lanes: self class n.
+        mag := NativeFloatArray lanes: self class n.
+        frame := 0.
+        manualFreq := 96.
+        pane onReset: [ self teardown ].
+        pane onStep: [ self step ].
+        pane run.
+        ^self
+    ]
+
+    "Free every native resource — the onReset: hook runs this however the
+     session ends (Escape, close button, relaunch, primary restart)."
+    teardown [
+        fft isNil ifFalse: [ fft free ].
+        re isNil ifFalse: [ re free ].
+        im isNil ifFalse: [ im free ].
+        t isNil ifFalse: [ t free ].
+        mag isNil ifFalse: [ mag free ].
+        ^self
+    ]
+
+    buildPalette [
+        "16 = background, 17 = waveform, 18 = spectrum bars, 19 = the
+         manual tone's bar (highlight), 20 = axis/HUD lines."
+        pane paletteAt: 16 r: 12  g: 14  b: 24.
+        pane paletteAt: 17 r: 120 g: 230 b: 160.
+        pane paletteAt: 18 r: 90  g: 150 b: 250.
+        pane paletteAt: 19 r: 255 g: 180 b: 60.
+        pane paletteAt: 20 r: 70  g: 76  b: 96.
+        ^self
+    ]
+
+    "One frame: read keys, synthesize, draw the waveform, transform,
+     draw the spectrum. The signal never touches a Smalltalk loop — the
+     synthesis is four vector ops and the analysis one FFT."
+    step [
+        self readInput.
+        frame := frame + 1.
+        self synthesize.
+        pane cls: 16.
+        self drawWaveform.
+        fft forwardReal: re imag: im.
+        self computeMagnitude.
+        self drawSpectrum.
+        pane present.
+        ^self
+    ]
+
+    readInput [
+        (pane keyHeld: GamePane keyLeft)  ifTrue: [ manualFreq := (manualFreq - 1) max: 2 ].
+        (pane keyHeld: GamePane keyRight) ifTrue: [ manualFreq := (manualFreq + 1) min: 120 ].
+        ^self
+    ]
+
+    "The sweeping tone walks bins 8..72 on a slow sine; the manual tone
+     sits wherever the arrow keys put it, at 0.6 amplitude."
+    sweepFreq [
+        ^40 + ((frame * 0.013) sin * 32)
+    ]
+    synthesize [
+        | k |
+        k := 2 * Double pi / self class n.
+        re rampFrom: 0 step: self sweepFreq * k.
+        re sinInto: re.
+        t rampFrom: 0 step: manualFreq * k.
+        t sinInto: t.
+        t scaleBy: 0.6.
+        re add: t into: re.
+        im clear.
+        ^self
+    ]
+
+    computeMagnitude [
+        re multiply: re into: mag.
+        im multiply: im into: t.
+        mag add: t into: mag.
+        mag sqrtInto: mag.
+        ^self
+    ]
+
+    "The time-domain trace across the top: 256 samples as line segments,
+     centre y 55, +/-35 px for the +/-1.6 signal range."
+    drawWaveform [
+        | prevY y |
+        pane line: 32 y: 55 to: 287 y: 55 color: 20.
+        prevY := 55 - ((re at: 1) * 22) truncated.
+        2 to: self class n do: [ :i |
+            y := 55 - ((re at: i) * 22) truncated.
+            pane line: 32 + i - 2 y: prevY to: 32 + i - 1 y: y color: 17.
+            prevY := y ].
+        ^self
+    ]
+
+    "Bins 1..128 (up to Nyquist) as bars rising from the bottom edge; a
+     unit tone's peak magnitude is n/2 = 128, scaled to 120 px. The
+     manual tone's own bin draws in the highlight colour."
+    drawSpectrum [
+        | h x manualBin |
+        pane line: 0 y: 108 to: 319 y: 108 color: 20.
+        manualBin := manualFreq truncated + 1.
+        1 to: 128 do: [ :b |
+            h := (((mag at: b) / 128 * 120) truncated min: 120) max: 0.
+            h > 0 ifTrue: [
+                x := (b - 1) * 5 // 2.
+                pane fill: x y: 230 - h width: 2 height: h
+                     color: (b = manualBin ifTrue: [ 19 ] ifFalse: [ 18 ]) ] ].
+        ^self
+    ]
+]

@@ -162,6 +162,25 @@ Object subclass: Accel [
         <primitive: FFI function: #cblas_dgemm ret: #v args: #(g g g g g g f g g g g f g g)>
     ]
 
+    "── FFT (double-precision, split-complex, in place) ──"
+    "vDSP_create_fftsetupD(log2n, radix): an opaque setup pointer (twiddle
+     tables) reusable for every FFT up to 2^log2n points. Radix 0 = radix-2."
+    Accel class >> createFftSetupLog2n: k radix: r [
+        <primitive: FFI function: #vDSP_create_fftsetupD ret: #g args: #(g g)>
+    ]
+    "vDSP_destroy_fftsetupD(setup)"
+    Accel class >> destroyFftSetup: s [
+        <primitive: FFI function: #vDSP_destroy_fftsetupD ret: #v args: #(g)>
+    ]
+    "vDSP_fft_zipD(setup, &splitComplex, stride, log2n, direction): the
+     in-place complex FFT. splitComplex is a 16-byte struct of two
+     pointers {realp, imagp}, passed BY ADDRESS (staged in a buffer);
+     direction 1 = forward, -1 = inverse. UNSCALED, as all vDSP FFTs are:
+     inverse(forward(x)) answers N*x — callers divide by N."
+    Accel class >> fftZipD: s split: sc stride: st log2n: k direction: d [
+        <primitive: FFI function: #vDSP_fft_zipD ret: #v args: #(g g g g g)>
+    ]
+
     "── vForce transcendentals (the count passes BY POINTER, a C int) ──"
     "vvexp(y, x, &n): y = e^x"
     Accel class >> vvexpY: y x: x nPtr: np [
@@ -192,9 +211,12 @@ Object subclass: Accel [
 "Double reopened: asDouble as identity — every other Number answers a
  conversion here (Integer, Fraction, ScaledDecimal), but nothing had ever
  sent it to a Double until NativeFloatArray>>at:put: coerced its argument
- uniformly. The Squeak-conformant one-liner."
+ uniformly — and pi, which no world code had needed before signal
+ synthesis (ramps scaled by 2*pi*f/n) arrived with the FFT surface. Both
+ Squeak-conformant."
 Number subclass: Double [
     asDouble [ ^self ]
+    Double class >> pi [ ^3.141592653589793 ]
 ]
 
 "I am a contiguous array of double-precision floats living OUTSIDE the
@@ -529,4 +551,58 @@ Object subclass: NativeMatrix [
                 aStream nextPutAll: rows printString, 'x', cols printString ].
         aStream nextPutAll: ')'.
     ]
+]
+
+"I am a reusable FFT plan: Accelerate twiddle tables for transforms of up
+ to 2 raisedTo: log2n complex points. Create me with FftSetup log2n: k,
+ then transform split-complex data held in two equal NativeFloatArrays
+ with forwardReal:imag: and inverseReal:imag: — IN PLACE, and unscaled in
+ the vDSP way (inverse(forward(x)) answers n * x; divide by size to get
+ back where you started). A pure real signal just uses a zeroed imag
+ array. Free me with free when done (my tables are native memory, and
+ like every native resource here my lifecycle is explicit).
+ The FftScope demo (Demos menu) is a worked example: a live audio-style
+ signal built by ramp/sin/scale vector ops, transformed every frame."
+Object subclass: FftSetup [
+    | setup log2n points struct |
+
+    FftSetup class >> log2n: k [
+        | s |
+        Accel ensureLoaded.
+        s := Accel createFftSetupLog2n: k radix: 0.
+        s = 0 ifTrue: [ ^self error: 'vDSP_create_fftsetupD failed' ].
+        ^self basicNew setSetup: s log2n: k
+    ]
+    setSetup: s log2n: k [
+        setup := s.
+        log2n := k.
+        points := 1 bitShift: k.
+        "The DSPDoubleSplitComplex struct: two pointers {realp, imagp},
+         staged in my own page (not Accel's shared scratch — a plan
+         outlives any single send)."
+        struct := NativeBuffer page.
+        ^self
+    ]
+    size [ ^points ]
+    log2n [ ^log2n ]
+
+    forwardReal: re imag: im [ ^self transformReal: re imag: im direction: 1 ]
+    inverseReal: re imag: im [ ^self transformReal: re imag: im direction: -1 ]
+    transformReal: re imag: im direction: d [
+        setup = 0 ifTrue: [ ^self error: 'FftSetup already freed' ].
+        (re size = points and: [ im size = points ])
+            ifFalse: [ ^self error: 'arrays must have exactly ', points printString, ' lanes' ].
+        struct i64At: 0 put: re address.
+        struct i64At: 8 put: im address.
+        Accel fftZipD: setup split: struct address stride: 1 log2n: log2n direction: d.
+        ^self
+    ]
+
+    free [
+        setup = 0 ifTrue: [ ^self ].
+        Accel destroyFftSetup: setup.
+        setup := 0.
+        ^self
+    ]
+    isFreed [ ^setup = 0 ]
 ]
