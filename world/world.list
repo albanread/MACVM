@@ -115,6 +115,10 @@
 59_reflection.mst
 60_editor.mst
 61_posix_io.mst
+# Accelerate (vDSP/vForce) for bulk array math over the FFI — Accel facade
+# (lazy dlopen) + NativeFloatArray (GC-stable mmap lanes, in-place ops,
+# reductions, transcendentals). docs/accelerate_design.md.
+61a_accelerate.mst
 62_ioworker.mst
 62a_iostreams.mst
 

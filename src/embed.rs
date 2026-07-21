@@ -5047,6 +5047,26 @@ mod tests {
             "must name the register limit, got: {err}"
         );
 
+        // (6) A token-list/arity mismatch — authored independently, so a
+        // 2-keyword selector over a 3-token list compiles fine and then
+        // used to no-op silently (the exact authoring bug that no-opped
+        // every vDSP kernel in world/61a's first draft). Must Err naming
+        // both counts.
+        vm.exec(
+            "Object subclass: FfiArity [ \
+               FfiArity class >> a: p1 b: p2 [ \
+                 <primitive: FFI function: #getpid ret: #g args: #(g g g)> ] ]",
+        )
+        .expect("compiles — the mismatch only surfaces at call time");
+        let err = vm
+            .eval("FfiArity a: 1 b: 2.")
+            .expect_err("a token/arity mismatch must Err");
+        assert!(
+            format!("{err}").contains("3 arg token(s)")
+                && format!("{err}").contains("takes 2 argument(s)"),
+            "must name both counts, got: {err}"
+        );
+
         // After all four recovered guest fatals: still byte-for-byte alive.
         assert_eq!(vm.eval("3 + 4.").unwrap(), "7");
     }

@@ -1,0 +1,416 @@
+"61a_accelerate.mst — Apple Accelerate (vDSP + vForce) for bulk array math,
+ through the S20 FFI with zero new Rust (docs/accelerate_design.md; proven
+ by live probe 2026-07-21). Two classes:
+
+   Accel            — class-side facade: one lazy dlopen of the framework
+                      (RTLD_GLOBAL makes its symbols visible to the FFI's
+                      dlsym), then raw fixed-arity bindings.
+   NativeFloatArray — N f64 lanes in an anonymous mmap region: GC-STABLE,
+                      which is what lets kernel calls see the data directly
+                      (heap FloatArray data is movable and must never cross
+                      the FFI — the NativeBuffer rule). High-level in-place
+                      ops delegate to the bindings.
+
+ Division of labour with FloatArray (world/39): FloatArray's in-VM NEON
+ kernels own SMALL arrays (measured ~15x faster at 512 lanes — the FFI's
+ per-call cost dominates down there); NativeFloatArray + Accelerate own
+ BULK (6-8x faster at a million lanes) and the vector transcendentals
+ (vvexp measured 40-60x over a scalar exp loop — nothing in-VM competes).
+ Two tiers, both first-class; copy bridges connect them.
+
+ Apple argument-order trap, encoded ONCE here so no caller ever meets it:
+ vDSP_vsubD and vDSP_vdivD take the SUBTRAHEND/DIVISOR FIRST —
+ vDSP_vsubD(B, 1, A, 1, C, 1, N) computes C = A - B. The Smalltalk-facing
+ selectors say what they compute; the bindings place the operands.
+
+ Lifecycle is explicit, like every native resource here (streams close,
+ Cocoa poolDo:): `free` unmaps, the scoped `lanes:do:` frees on the way
+ out (ensure:, so an erroring block cannot leak the mapping). There are no
+ finalizers in MACVM by design — an unfreed array leaks its mapping until
+ exit, so prefer the scoped form."
+
+"Posix reopened: munmap — the release half of the mmap the NativeBuffer
+ conveniences never needed (their one page deliberately lives forever;
+ a NativeFloatArray's megabytes must not)."
+Object subclass: Posix [
+    Posix class >> munmapAddr: a length: l [
+        <primitive: FFI function: #munmap ret: #g args: #(g g)>
+    ]
+]
+
+"I am the doorway to Apple's Accelerate framework: my class side loads it
+ once on first use and exposes raw vDSP/vForce bindings (fixed-arity FFI
+ calls on GC-stable addresses). Use NativeFloatArray for the friendly
+ surface; come here only for a kernel it does not wrap yet. My binding
+ comments give each C signature; scalar parameters pass BY POINTER (an
+ Accelerate idiom), staged in my scratch page."
+Object subclass: Accel [
+    <classVars: Loaded Scratch>
+
+    Accel class >> dlopenPath: p mode: m [
+        <primitive: FFI function: #dlopen ret: #g args: #(g g)>
+    ]
+
+    "dlopen Accelerate once (latched). RTLD_NOW|RTLD_GLOBAL = 2|8: GLOBAL
+     is what makes the framework's symbols visible to the FFI's own
+     RTLD_DEFAULT dlsym, so every binding below just resolves."
+    Accel class >> ensureLoaded [
+        | h |
+        Loaded = true ifTrue: [ ^self ].
+        h := self dlopenPath:
+            (PosixFile cStringOf: '/System/Library/Frameworks/Accelerate.framework/Accelerate'
+                        into: PosixFile scratch)
+            mode: 10.
+        h = 0 ifTrue: [ ^self error: 'Accelerate framework failed to load' ].
+        Loaded := true.
+        ^self
+    ]
+    "One page for staging pointer-passed scalars and reading back
+     pointer-returned results (a VM is strictly serial — the PosixFile
+     scratch pattern). Offset 0: scalar in; offset 8: result out."
+    Accel class >> scratch [
+        Scratch isNil ifTrue: [ Scratch := NativeBuffer page ].
+        ^Scratch
+    ]
+    Accel class >> scratchAlien [
+        ^Alien forAddress: self scratch address size: 4096
+    ]
+
+    "── vDSP elementwise. Every C parameter is a method argument (the FFI
+     dispatch REQUIRES arity == token count — a mismatch used to silently
+     no-op through the empty pragma body, found the hard way building this
+     very file; it fails loud now). Strides are explicit; the friendly
+     stride-1 wrappers live on NativeFloatArray. ──"
+    "vDSP_vaddD(A, IA, B, IB, C, IC, N): C = A + B"
+    Accel class >> vaddD: a s: sa b: b s2: sb c: c s3: sc n: n [
+        <primitive: FFI function: #vDSP_vaddD ret: #v args: #(g g g g g g g)>
+    ]
+    "vDSP_vsubD(B, IB, A, IA, C, IC, N): C = A - B (subtrahend FIRST)"
+    Accel class >> vsubD: b s: sb a: a s2: sa c: c s3: sc n: n [
+        <primitive: FFI function: #vDSP_vsubD ret: #v args: #(g g g g g g g)>
+    ]
+    "vDSP_vmulD(A, IA, B, IB, C, IC, N): C = A * B"
+    Accel class >> vmulD: a s: sa b: b s2: sb c: c s3: sc n: n [
+        <primitive: FFI function: #vDSP_vmulD ret: #v args: #(g g g g g g g)>
+    ]
+    "vDSP_vdivD(B, IB, A, IA, C, IC, N): C = A / B (divisor FIRST)"
+    Accel class >> vdivD: b s: sb a: a s2: sa c: c s3: sc n: n [
+        <primitive: FFI function: #vDSP_vdivD ret: #v args: #(g g g g g g g)>
+    ]
+    "vDSP_vsmulD(A, IA, &scalar, C, IC, N): C = A * scalar"
+    Accel class >> vsmulD: a s: sa scalarPtr: sp c: c s2: sc n: n [
+        <primitive: FFI function: #vDSP_vsmulD ret: #v args: #(g g g g g g)>
+    ]
+    "vDSP_vabsD(A, IA, C, IC, N)"
+    Accel class >> vabsD: a s: sa c: c s2: sc n: n [
+        <primitive: FFI function: #vDSP_vabsD ret: #v args: #(g g g g g)>
+    ]
+    "vDSP_vnegD(A, IA, C, IC, N)"
+    Accel class >> vnegD: a s: sa c: c s2: sc n: n [
+        <primitive: FFI function: #vDSP_vnegD ret: #v args: #(g g g g g)>
+    ]
+    "vDSP_vfillD(&scalar, C, IC, N)"
+    Accel class >> vfillDPtr: sp c: c s: sc n: n [
+        <primitive: FFI function: #vDSP_vfillD ret: #v args: #(g g g g)>
+    ]
+    "vDSP_vclrD(C, IC, N)"
+    Accel class >> vclrD: c s: sc n: n [
+        <primitive: FFI function: #vDSP_vclrD ret: #v args: #(g g g)>
+    ]
+    "vDSP_vrampD(&start, &step, C, IC, N): C[k] = start + k*step"
+    Accel class >> vrampDStartPtr: sp stepPtr: stp c: c s: sc n: n [
+        <primitive: FFI function: #vDSP_vrampD ret: #v args: #(g g g g g)>
+    ]
+
+    "── vDSP reductions (result written through a pointer) ──"
+    "vDSP_sveD(A, IA, &C, N): sum"
+    Accel class >> sveD: a s: sa resultPtr: r n: n [
+        <primitive: FFI function: #vDSP_sveD ret: #v args: #(g g g g)>
+    ]
+    "vDSP_dotprD(A, IA, B, IB, &C, N)"
+    Accel class >> dotprD: a s: sa b: b s2: sb resultPtr: r n: n [
+        <primitive: FFI function: #vDSP_dotprD ret: #v args: #(g g g g g g)>
+    ]
+    "vDSP_maxvD(A, IA, &C, N)"
+    Accel class >> maxvD: a s: sa resultPtr: r n: n [
+        <primitive: FFI function: #vDSP_maxvD ret: #v args: #(g g g g)>
+    ]
+    "vDSP_minvD(A, IA, &C, N)"
+    Accel class >> minvD: a s: sa resultPtr: r n: n [
+        <primitive: FFI function: #vDSP_minvD ret: #v args: #(g g g g)>
+    ]
+    "vDSP_meanvD(A, IA, &C, N)"
+    Accel class >> meanvD: a s: sa resultPtr: r n: n [
+        <primitive: FFI function: #vDSP_meanvD ret: #v args: #(g g g g)>
+    ]
+
+    "── vForce transcendentals (the count passes BY POINTER, a C int) ──"
+    "vvexp(y, x, &n): y = e^x"
+    Accel class >> vvexpY: y x: x nPtr: np [
+        <primitive: FFI function: #vvexp ret: #v args: #(g g g)>
+    ]
+    "vvlog(y, x, &n): natural log"
+    Accel class >> vvlogY: y x: x nPtr: np [
+        <primitive: FFI function: #vvlog ret: #v args: #(g g g)>
+    ]
+    "vvsqrt(y, x, &n)"
+    Accel class >> vvsqrtY: y x: x nPtr: np [
+        <primitive: FFI function: #vvsqrt ret: #v args: #(g g g)>
+    ]
+    "vvsin(y, x, &n)"
+    Accel class >> vvsinY: y x: x nPtr: np [
+        <primitive: FFI function: #vvsin ret: #v args: #(g g g)>
+    ]
+    "vvcos(y, x, &n)"
+    Accel class >> vvcosY: y x: x nPtr: np [
+        <primitive: FFI function: #vvcos ret: #v args: #(g g g)>
+    ]
+    "vvpow(z, y, x, &n): z = x raisedTo: y, elementwise"
+    Accel class >> vvpowZ: z y: y x: x nPtr: np [
+        <primitive: FFI function: #vvpow ret: #v args: #(g g g g)>
+    ]
+]
+
+"Double reopened: asDouble as identity — every other Number answers a
+ conversion here (Integer, Fraction, ScaledDecimal), but nothing had ever
+ sent it to a Double until NativeFloatArray>>at:put: coerced its argument
+ uniformly. The Squeak-conformant one-liner."
+Number subclass: Double [
+    asDouble [ ^self ]
+]
+
+"I am a contiguous array of double-precision floats living OUTSIDE the
+ Smalltalk heap, in memory the garbage collector never moves — which is
+ what lets Apple's Accelerate kernels read and write my lanes directly.
+ Create me with NativeFloatArray lanes: n (zeroed), from: aCollection, or
+ the scoped lanes:do: which frees my mapping on the way out (preferred:
+ there are no finalizers here, and an unfreed array leaks its memory until
+ you send me free). Index me 1-based with at: and at:put:.
+
+ My bulk operations run in Accelerate and write IN PLACE into an argument
+ array: add:into:, subtract:into:, multiply:into:, divideInto:giving:,
+ scaleBy:, fill:, rampFrom:step:, absInto:, negInto:, and the
+ transcendentals expInto:, logInto:, sqrtInto:, sinInto:, powWith:into:.
+ Reductions answer Doubles: sum, dot:, mean, max, min. Use me for BULK
+ work and transcendentals; for small arrays the plain FloatArray's NEON
+ kernels are faster (its class comment has the numbers), and asFloatArray
+ / fromFloatArray: copy between the two."
+Object subclass: NativeFloatArray [
+    | addr lanes alien |
+
+    NativeFloatArray class >> lanes: n [
+        | a |
+        n < 1 ifTrue: [ ^self error: 'NativeFloatArray needs at least one lane' ].
+        Accel ensureLoaded.
+        a := Posix mmapAddr: 0 length: n * 8 prot: 3 flags: 4098 fd: -1 offset: 0.
+        a = -1 ifTrue: [ ^self error: 'mmap failed for ', (n * 8) printString, ' bytes' ].
+        ^self basicNew setAddr: a lanes: n
+    ]
+    NativeFloatArray class >> from: aCollection [
+        | v i |
+        v := self lanes: aCollection size.
+        i := 1.
+        aCollection do: [ :x | v at: i put: x asDouble. i := i + 1 ].
+        ^v
+    ]
+    NativeFloatArray class >> fromFloatArray: fa [
+        ^self from: fa
+    ]
+    "The scoped form: make, hand to the block, ALWAYS free (ensure:, so an
+     erroring block cannot leak the mapping); answers the block's value."
+    NativeFloatArray class >> lanes: n do: aBlock [
+        | v |
+        v := self lanes: n.
+        ^[ aBlock value: v ] ensure: [ v free ]
+    ]
+
+    setAddr: a lanes: n [
+        addr := a.
+        lanes := n.
+        alien := Alien forAddress: a size: n * 8.
+        ^self
+    ]
+    address [ ^addr ]
+    size [ ^lanes ]
+    isFreed [ ^addr = 0 ]
+
+    "Release my mapping. Every later use is a hard error — better than the
+     silent reuse-after-free a dangling mapping would invite."
+    free [
+        addr = 0 ifTrue: [ ^self ].
+        Posix munmapAddr: addr length: lanes * 8.
+        addr := 0.
+        alien := nil.
+        ^self
+    ]
+    live [
+        addr = 0 ifTrue: [ ^self error: 'NativeFloatArray already freed' ].
+        ^self
+    ]
+
+    "── lane access, 1-based, bounds-checked HERE (the Alien primitive's
+     own failure mode answers self, useless as an error) ──"
+    at: i [
+        self live.
+        (i between: 1 and: lanes) ifFalse: [ ^self error: 'index out of bounds' ].
+        ^alien doubleAt: ((i - 1) * 8) + 1
+    ]
+    at: i put: aNumber [
+        self live.
+        (i between: 1 and: lanes) ifFalse: [ ^self error: 'index out of bounds' ].
+        alien doubleAt: ((i - 1) * 8) + 1 put: aNumber asDouble.
+        ^aNumber
+    ]
+    do: aBlock [
+        1 to: lanes do: [ :i | aBlock value: (self at: i) ]
+    ]
+
+    "Both operands of a two-array op must be same-sized and live."
+    checkPeer: other [
+        self live. other live.
+        other size = lanes ifFalse: [ ^self error: 'size mismatch' ].
+        ^self
+    ]
+
+    "── elementwise, in place into `c` (which may be a or self) ──"
+    add: b into: c [
+        self checkPeer: b. self checkPeer: c.
+        Accel vaddD: addr s: 1 b: b address s2: 1 c: c address s3: 1 n: lanes.
+        ^c
+    ]
+    subtract: b into: c [
+        "c := self - b (the binding places the subtrahend first)."
+        self checkPeer: b. self checkPeer: c.
+        Accel vsubD: b address s: 1 a: addr s2: 1 c: c address s3: 1 n: lanes.
+        ^c
+    ]
+    multiply: b into: c [
+        self checkPeer: b. self checkPeer: c.
+        Accel vmulD: addr s: 1 b: b address s2: 1 c: c address s3: 1 n: lanes.
+        ^c
+    ]
+    divideBy: b into: c [
+        "c := self / b (the binding places the divisor first)."
+        self checkPeer: b. self checkPeer: c.
+        Accel vdivD: b address s: 1 a: addr s2: 1 c: c address s3: 1 n: lanes.
+        ^c
+    ]
+    scaleBy: aNumber [
+        self live.
+        Accel scratchAlien doubleAt: 1 put: aNumber asDouble.
+        Accel vsmulD: addr s: 1 scalarPtr: Accel scratch address c: addr s2: 1 n: lanes.
+        ^self
+    ]
+    fill: aNumber [
+        self live.
+        Accel scratchAlien doubleAt: 1 put: aNumber asDouble.
+        Accel vfillDPtr: Accel scratch address c: addr s: 1 n: lanes.
+        ^self
+    ]
+    rampFrom: start step: step [
+        self live.
+        Accel scratchAlien doubleAt: 1 put: start asDouble.
+        Accel scratchAlien doubleAt: 9 put: step asDouble.
+        Accel vrampDStartPtr: Accel scratch address
+              stepPtr: Accel scratch address + 8
+              c: addr s: 1 n: lanes.
+        ^self
+    ]
+    absInto: c [
+        self checkPeer: c.
+        Accel vabsD: addr s: 1 c: c address s2: 1 n: lanes.
+        ^c
+    ]
+    negInto: c [
+        self checkPeer: c.
+        Accel vnegD: addr s: 1 c: c address s2: 1 n: lanes.
+        ^c
+    ]
+
+    "── vForce transcendentals, elementwise into `c` ──
+     The lane count passes by pointer as a C int (vForce's idiom)."
+    stageCount [
+        Accel scratch u32At: 16 put: lanes.
+        ^Accel scratch address + 16
+    ]
+    expInto: c [
+        self checkPeer: c.
+        Accel vvexpY: c address x: addr nPtr: self stageCount.
+        ^c
+    ]
+    logInto: c [
+        self checkPeer: c.
+        Accel vvlogY: c address x: addr nPtr: self stageCount.
+        ^c
+    ]
+    sqrtInto: c [
+        self checkPeer: c.
+        Accel vvsqrtY: c address x: addr nPtr: self stageCount.
+        ^c
+    ]
+    sinInto: c [
+        self checkPeer: c.
+        Accel vvsinY: c address x: addr nPtr: self stageCount.
+        ^c
+    ]
+    "c := self ** exponents, elementwise (vvpow wants exponents in y)."
+    powWith: exponents into: c [
+        self checkPeer: exponents. self checkPeer: c.
+        Accel vvpowZ: c address y: exponents address x: addr nPtr: self stageCount.
+        ^c
+    ]
+
+    "── reductions -> Double (result read back from the scratch page) ──"
+    sum [
+        self live.
+        Accel sveD: addr s: 1 resultPtr: Accel scratch address + 8 n: lanes.
+        ^Accel scratchAlien doubleAt: 9
+    ]
+    dot: b [
+        self checkPeer: b.
+        Accel dotprD: addr s: 1 b: b address s2: 1 resultPtr: Accel scratch address + 8 n: lanes.
+        ^Accel scratchAlien doubleAt: 9
+    ]
+    mean [
+        self live.
+        Accel meanvD: addr s: 1 resultPtr: Accel scratch address + 8 n: lanes.
+        ^Accel scratchAlien doubleAt: 9
+    ]
+    max [
+        self live.
+        Accel maxvD: addr s: 1 resultPtr: Accel scratch address + 8 n: lanes.
+        ^Accel scratchAlien doubleAt: 9
+    ]
+    min [
+        self live.
+        Accel minvD: addr s: 1 resultPtr: Accel scratch address + 8 n: lanes.
+        ^Accel scratchAlien doubleAt: 9
+    ]
+
+    "── the copy bridge back to the heap tier ──"
+    asFloatArray [
+        | fa |
+        self live.
+        fa := FloatArray new: lanes.
+        1 to: lanes do: [ :i | fa at: i put: (self at: i) ].
+        ^fa
+    ]
+
+    printOn: aStream [
+        aStream nextPutAll: 'NativeFloatArray('.
+        addr = 0
+            ifTrue: [ aStream nextPutAll: 'freed' ]
+            ifFalse: [
+                aStream nextPutAll: lanes printString, ' lanes'.
+                lanes <= 8 ifTrue: [
+                    1 to: lanes do: [ :i |
+                        aStream nextPutAll: ' '.
+                        (self at: i) printOn: aStream ] ] ].
+        aStream nextPutAll: ')'.
+    ]
+]
+
+"FloatArray reopened: the copy bridge into the native tier."
+ArrayedCollection subclass: FloatArray [
+    asNative [ ^NativeFloatArray from: self ]
+]

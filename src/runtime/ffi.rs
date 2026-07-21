@@ -26,13 +26,14 @@
 //! Error-handling policy, spelled out once here rather than re-litigated
 //! at each call site below: this function draws a hard line between two
 //! completely different kinds of "this didn't work" —
-//!   - **Bad Smalltalk-level data** (wrong argument type, an arity
-//!     mismatch between the compiled call site and the descriptor's own
-//!     `args` array) is exactly the kind of thing a hand-authored or
-//!     buggy pragma can trigger, and every other primitive in this
-//!     codebase (`runtime::primitives`) treats that class of problem as
-//!     `PrimitiveOutcome::Fallthrough` — never a Rust panic. This module
-//!     follows the same convention.
+//!   - **Bad Smalltalk-level data that a DIFFERENT call could get right**
+//!     (a wrong argument type) follows every other primitive's convention
+//!     (`runtime::primitives`'s own module doc): `PrimitiveOutcome::
+//!     Fallthrough`, never a Rust panic. Note the line moved in 2026-07:
+//!     an args-token/arity MISMATCH used to sit in this bucket too, but it
+//!     is baked into the method — no call can ever succeed — and on an
+//!     empty pragma body the Fallthrough masqueraded as success, so it now
+//!     fails loud with the second bucket.
 //!   - **Missing runtime/feature support or a bad binding** (an ABI shape
 //!     token with no trampoline yet, Tier 2 Cocoa dispatch, a symbol that
 //!     fails to resolve, a return value no oop can represent) fails LOUD,
@@ -138,12 +139,24 @@ pub(crate) fn dispatch_ffi_primitive(vm: &mut VmState, m: MethodOop, argc: u8) -
         .expect("runtime::ffi::dispatch_ffi_primitive: descriptor's args slot must be an Array");
     let argc_usize = argc as usize;
     if args_desc.len() != argc_usize {
-        // A hand-authored (or otherwise miscompiled) pragma whose declared
-        // arg-token list doesn't match the method's own real arity — a
-        // user-triggerable data problem, not a "feature doesn't exist"
-        // one. Same convention as a bad argument type below: Fallthrough,
-        // never a panic.
-        return PrimitiveOutcome::Fallthrough;
+        // A hand-authored pragma whose declared arg-token list doesn't
+        // match the method's own real arity. This used to Fallthrough —
+        // but the pragma body is empty, so that answered the receiver and
+        // masqueraded as success, and unlike a wrong ARGUMENT (which a
+        // different call might get right) an arity mismatch is baked into
+        // the method: it can never succeed on any call. Found the hard way
+        // building world/61a's Accel bindings, where a 4-keyword selector
+        // over a 7-token list silently no-opped every vDSP kernel.
+        // Guest-fatal, naming both counts.
+        crate::runtime::error::guest_fatal(
+            vm,
+            format!(
+                "FFI: function {name:?}'s pragma declares {} arg token(s) but the method \
+                 takes {argc_usize} argument(s) — the token list must match the selector's \
+                 arity exactly",
+                args_desc.len(),
+            ),
+        );
     }
 
     // Read the real call arguments directly off `vm.stack` — deliberately
@@ -486,53 +499,15 @@ mod tests {
         assert_eq!(got, 3.5);
     }
 
-    /// Negative test: the descriptor's own `args` array length doesn't
-    /// match the method's real declared arity — a hand-authored-pragma
-    /// bug (user-writable, not "can't happen"), so this must fall
-    /// through cleanly rather than panicking. Built directly against
-    /// `dispatch_ffi_primitive` (not through a compiled pragma, since the
-    /// real frontend/parser always keeps `args` and the param list in
-    /// sync by construction) by hand-assembling a mismatched descriptor
-    /// onto an otherwise-ordinary one-argument method.
-    #[test]
-    fn ffi_args_arity_mismatch_falls_through_not_panics() {
-        let mut vm = test_vm();
-        let klass = test_klass(&mut vm, "FFIArityMismatch");
-        // A real 1-arg method (`llabs ret: #g args: #(g)`) compiled
-        // normally, then its descriptor's `args` array is overwritten
-        // in-place with a 2-element one — a length that no longer
-        // matches the method's own (still 1) `argc()`.
-        let mut method = first_method_of(
-            "Object subclass: FFIArityMismatch [ \
-                llabsOf: n [ <primitive: FFI function: #llabs ret: #g args: #(g)> ] \
-            ]",
-        );
-        let m = compile_method(&mut vm, klass, false, &mut method).expect("compile");
-        assert_eq!(m.argc(), 1);
-        let desc = m.literals();
-        let g_sym = vm.universe.intern(b"g").oop();
-        let array_klass = vm.universe.array_klass;
-        let mismatched_args = alloc::alloc_indexable_oops(&mut vm, array_klass, 2);
-        mismatched_args.at_put(0, g_sym);
-        mismatched_args.at_put(1, g_sym);
-        desc.at_put(DESC_ARGS, mismatched_args.oop());
-
-        // Calling `dispatch_ffi_primitive` directly (not through
-        // `run_method`, which drives the FULL `try_primitive` dispatch)
-        // means the stack must be primed exactly as `try_primitive` itself
-        // would have left it before handing off: receiver, then the real
-        // arguments, `vm.stack.sp` sitting just past the last one.
-        let nil = vm.universe.nil_obj;
-        let arg = SmallInt::new(-5).oop();
-        vm.stack.push(nil);
-        vm.stack.push(arg);
-
-        let outcome = dispatch_ffi_primitive(&mut vm, m, 1);
-        match outcome {
-            PrimitiveOutcome::Fallthrough => {}
-            _ => panic!("expected Fallthrough on an args-arity mismatch"),
-        }
-    }
+    // The args-arity-mismatch Fallthrough test that lived here migrated to
+    // the embed gate (case 6 of ffi_guest_mistakes_recover_as_errors_not_
+    // host_panics) when the mismatch became a GUEST fatal: on an
+    // empty-bodied pragma method, Fallthrough answered the receiver and
+    // masqueraded as success — found live when world/61a's first-draft
+    // Accel bindings (4-keyword selectors over 7-token lists) silently
+    // no-opped every vDSP kernel. Note the mismatch IS reachable from the
+    // real compiler: the pragma's token list and the selector's arity are
+    // authored independently.
 
     // A >8-same-class-args pragma (reachable: METHOD_ARGC_MAX is 15) once
     // fell through here — but on an empty-bodied pragma method Fallthrough

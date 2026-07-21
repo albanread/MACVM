@@ -1,0 +1,158 @@
+"48_accel_tests.mst — AccelTests: the gate for the Accelerate layer
+ (world/61a, docs/accelerate_design.md). Everything runs headless — the
+ framework loads via dlopen regardless of any GUI — and every kernel is
+ checked NUMERICALLY, with asymmetric operands wherever Apple's
+ subtrahend-first/divisor-first argument order could silently swap a
+ result (the one trap the bindings exist to encode exactly once)."
+
+TestCase subclass: AccelTests [
+    runAll [
+        self runTest: #testLifecycleAndAccess do: [ self testLifecycleAndAccess ].
+        self runTest: #testElementwiseWithAsymmetricOperands do: [ self testElementwiseWithAsymmetricOperands ].
+        self runTest: #testScalarOpsAndRamp do: [ self testScalarOpsAndRamp ].
+        self runTest: #testReductions do: [ self testReductions ].
+        self runTest: #testTranscendentals do: [ self testTranscendentals ].
+        self runTest: #testCopyBridges do: [ self testCopyBridges ].
+        self runTest: #testScopedFormFrees do: [ self testScopedFormFrees ].
+        self runTest: #testIndirectAlienZeroTail do: [ self testIndirectAlienZeroTail ].
+    ]
+
+    close: a to: b [
+        ^(a - b) abs < 0.000000001
+    ]
+
+    testLifecycleAndAccess [
+        | v |
+        v := NativeFloatArray lanes: 10.
+        self assert: v size = 10.
+        self assert: (v at: 1) = 0.0.          "mmap memory arrives zeroed"
+        self assert: (v at: 10) = 0.0.
+        v at: 3 put: 2.5.
+        self assert: (v at: 3) = 2.5.
+        v at: 3 put: 7.                        "Integers coerce on the way in"
+        self assert: (v at: 3) = 7.0.
+        self assert: v isFreed not.
+        v free.
+        self assert: v isFreed.
+        v free.                                "double-free is a harmless no-op"
+        self assert: v isFreed.
+    ]
+
+    testElementwiseWithAsymmetricOperands [
+        | a b c |
+        a := NativeFloatArray from: #(10 20 30 40).
+        b := NativeFloatArray from: #(1 2 3 4).
+        c := NativeFloatArray lanes: 4.
+        a add: b into: c.
+        self assert: (c at: 1) = 11.0.
+        self assert: (c at: 4) = 44.0.
+        "subtract: — a MINUS b, never the reverse (Apple's vsubD takes the
+         subtrahend first; asymmetric operands catch a swapped binding)."
+        a subtract: b into: c.
+        self assert: (c at: 1) = 9.0.
+        self assert: (c at: 4) = 36.0.
+        a multiply: b into: c.
+        self assert: (c at: 2) = 40.0.
+        "divideBy: — a OVER b (vdivD takes the divisor first)."
+        a divideBy: b into: c.
+        self assert: (c at: 1) = 10.0.
+        self assert: (c at: 4) = 10.0.
+        "In-place: the destination may be an operand."
+        a add: b into: a.
+        self assert: (a at: 1) = 11.0.
+        a free. b free. c free.
+    ]
+
+    testScalarOpsAndRamp [
+        | v w |
+        v := NativeFloatArray from: #(1 2 3).
+        v scaleBy: 2.5.
+        self assert: (v at: 1) = 2.5.
+        self assert: (v at: 3) = 7.5.
+        v fill: 9.25.
+        self assert: (v at: 2) = 9.25.
+        w := NativeFloatArray lanes: 5.
+        w rampFrom: 10 step: 0.5.
+        self assert: (w at: 1) = 10.0.
+        self assert: (w at: 5) = 12.0.
+        v negInto: v.
+        self assert: (v at: 1) = -9.25.
+        v absInto: v.
+        self assert: (v at: 1) = 9.25.
+        v free. w free.
+    ]
+
+    testReductions [
+        | a b |
+        a := NativeFloatArray from: #(1 2 3 4 5).
+        b := NativeFloatArray from: #(2 2 2 2 2).
+        self assert: a sum = 15.0.
+        self assert: (a dot: b) = 30.0.
+        self assert: a mean = 3.0.
+        self assert: a max = 5.0.
+        self assert: a min = 1.0.
+        a free. b free.
+    ]
+
+    testTranscendentals [
+        | x y e |
+        x := NativeFloatArray from: #(0 1 2).
+        y := NativeFloatArray lanes: 3.
+        x expInto: y.
+        self assert: (y at: 1) = 1.0.
+        self assert: (self close: (y at: 2) to: 2.718281828459045).
+        y logInto: y.                          "log(exp(x)) = x, in place"
+        self assert: (self close: (y at: 3) to: 2.0).
+        x := NativeFloatArray from: #(4 9 16).
+        x sqrtInto: x.
+        self assert: (x at: 3) = 4.0.
+        "powWith: — receiver ** exponents (vvpow wants exponents in y)."
+        e := NativeFloatArray from: #(2 2 0.5).
+        x powWith: e into: x.                  "x was 2 3 4 after sqrt"
+        self assert: (x at: 1) = 4.0.
+        self assert: (x at: 2) = 9.0.
+        self assert: (x at: 3) = 2.0.
+        x free. y free. e free.
+    ]
+
+    testCopyBridges [
+        | fa nv back |
+        fa := FloatArray from: #(1.5 2.5 3.5).
+        nv := fa asNative.
+        self assert: nv size = 3.
+        self assert: (nv at: 2) = 2.5.
+        nv scaleBy: 2.
+        back := nv asFloatArray.
+        self assert: back class == FloatArray.
+        self assert: (back at: 3) = 7.0.
+        self assert: (fa at: 3) = 3.5.         "copies, never aliases"
+        nv free.
+    ]
+
+    testScopedFormFrees [
+        | captured result |
+        result := NativeFloatArray lanes: 4 do: [ :v |
+            captured := v.
+            v fill: 3.0.
+            v sum ].
+        self assert: result = 12.0.            "answers the block's value"
+        self assert: captured isFreed.         "and freed on the way out"
+    ]
+
+    "The A0 groundwork this layer stands on: wrapping a large region with
+     an indirect Alien must not cost heap anymore (its real tail is zero
+     bytes; the declared size lives in a named field). Observable here:
+     size answers the declared size, bounds work at the far end, and the
+     wrap is effectively free — wrapping 8 MB before A0 allocated a real
+     8 MB dead tail, which at this heap size would simply have crashed."
+    testIndirectAlienZeroTail [
+        | region a last |
+        region := NativeFloatArray lanes: 1048576.     "8 MB of lanes"
+        a := Alien forAddress: region address size: 8388608.
+        self assert: a size = 8388608.
+        a doubleAt: 8388601 put: 42.5.                 "the LAST lane"
+        last := region at: 1048576.
+        self assert: last = 42.5.
+        region free.
+    ]
+]
