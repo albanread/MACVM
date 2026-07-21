@@ -5028,6 +5028,25 @@ mod tests {
             "must name the token, got: {err}"
         );
 
+        // (5) More than 8 same-class register args (the trampoline's fixed
+        // 8-GPR load; a real 9-keyword selector reaches it) — once a SILENT
+        // no-op via Fallthrough on the empty pragma body, found live when
+        // vDSP_mmulD (9 g args) quietly did nothing. Must Err naming the
+        // limit and the doit must cost only itself.
+        vm.exec(
+            "Object subclass: FfiNineArgs [ \
+               FfiNineArgs class >> a: p1 b: p2 c: p3 d: p4 e: p5 f: p6 g: p7 h: p8 i: p9 [ \
+                 <primitive: FFI function: #getpid ret: #g args: #(g g g g g g g g g)> ] ]",
+        )
+        .expect("compiles");
+        let err = vm
+            .eval("FfiNineArgs a: 1 b: 2 c: 3 d: 4 e: 5 f: 6 g: 7 h: 8 i: 9.")
+            .expect_err("9 g args must Err, not silently answer the receiver");
+        assert!(
+            format!("{err}").contains("more than 8 integer/pointer"),
+            "must name the register limit, got: {err}"
+        );
+
         // After all four recovered guest fatals: still byte-for-byte alive.
         assert_eq!(vm.eval("3 + 4.").unwrap(), "7");
     }

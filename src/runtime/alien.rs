@@ -134,6 +134,20 @@ fn indirect_base(a: AlienOop) -> Option<u64> {
     }
 }
 
+/// The Alien's declared byte size — the single bounds limit every accessor
+/// checks against. Direct: the real tail length (`indexable_len`).
+/// Indirect: the `ALIEN_INDIRECT_SIZE_INDEX` named field, because since
+/// 2026-07 an indirect Alien's real tail is ZERO bytes (wrapping an 8 MB
+/// mmap region used to waste 8 MB of real heap — the deliberate v1
+/// tradeoff this module's doc describes, retired for the Accelerate
+/// design's multi-megabyte NativeFloatArray regions).
+fn effective_len(a: AlienOop) -> usize {
+    match indirect_base(a) {
+        None => a.as_mem().indexable_len(),
+        Some(_) => a.indirect_size(),
+    }
+}
+
 /// Common receiver/index validation every accessor needs: `args[0]` must be
 /// an `Alien`, `args[1]` must be a SmallInt whose 1-based value `i` fits
 /// within `[1, len - width + 1]` for a `width`-byte access starting at
@@ -150,7 +164,7 @@ fn validate_access(args: &[Oop], width: usize) -> Option<(AlienOop, usize)> {
         return None;
     }
     let zero_based = (i - 1) as usize;
-    let len = a.as_mem().indexable_len();
+    let len = effective_len(a);
     // `zero_based + width > len` (rather than `zero_based >= len`) catches
     // a multi-byte access that starts in-bounds but would read/write past
     // the declared end — e.g. `signedLongAt: len` on an 8-byte Alien must
@@ -374,8 +388,7 @@ pub(crate) fn prim_alien_size(_vm: &mut VmState, args: &[Oop]) -> PrimResult {
     let Some(a) = AlienOop::try_from(args[0]) else {
         return PrimResult::Fail;
     };
-    let len = a.as_mem().indexable_len();
-    PrimResult::Ok(SmallInt::new(len as i64).oop())
+    PrimResult::Ok(SmallInt::new(effective_len(a) as i64).oop())
 }
 
 // --- id 119/120: Alien class >> new: / forAddress:size: ---------------------
@@ -411,8 +424,13 @@ pub(crate) fn prim_alien_new(vm: &mut VmState, args: &[Oop]) -> PrimResult {
 }
 
 /// `Alien class >> forAddress: addr size: n` (id 120, argc 2) — a fresh
-/// INDIRECT Alien wrapping the real external address `addr`, with a real
-/// (wasted, per this module's own top-of-file doc) tail of `n` bytes.
+/// INDIRECT Alien wrapping the real external address `addr`. Its real tail
+/// is ZERO bytes: the declared size lives in the `ALIEN_INDIRECT_SIZE_INDEX`
+/// named field, which `effective_len` (and so every bounds check plus
+/// `size`) reads instead of `indexable_len` for indirect Aliens. (Until
+/// 2026-07 this allocated a real n-byte tail that was never touched — a
+/// deliberate v1 tradeoff whose cost became untenable when the Accelerate
+/// design started wrapping multi-megabyte mmap regions.)
 /// `addr` and `n` are both SmallInts — `addr`'s own range is trusted the
 /// same way S20 step 4's own FFI call primitive already trusts a real
 /// native address returned as a plain SmallInt for `ret: #g` (confirmed
@@ -434,11 +452,12 @@ pub(crate) fn prim_alien_for_address_size(vm: &mut VmState, args: &[Oop]) -> Pri
     }
     let addr_value = addr.value();
     let klass = vm.universe.alien_klass;
-    let obj = alloc::alloc_indexable_bytes(vm, klass, nbytes as usize);
+    let obj = alloc::alloc_indexable_bytes(vm, klass, 0);
     let a = AlienOop::try_from(obj.oop()).expect(
         "prim_alien_for_address_size: freshly allocated with alien_klass must be a valid AlienOop",
     );
     a.set_external_addr(addr_value as u64);
+    a.set_indirect_size(nbytes as usize);
     PrimResult::Ok(a.oop())
 }
 

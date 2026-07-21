@@ -175,16 +175,25 @@ pub(crate) fn dispatch_ffi_primitive(vm: &mut VmState, m: MethodOop, argc: u8) -
                 };
                 if next_g >= argv_g.len() {
                     // More than 8 "g"-class arguments — no trampoline
-                    // slot left (ffi_stubs.rs's own fixed 8-GPR-slot
-                    // AAPCS64 contract). MethodOop's argc field is only
-                    // 4 bits wide (METHOD_ARGC_MAX = 15, oops/layout.rs),
-                    // so a hand-authored pragma naming 9+ same-class
-                    // args is syntactically reachable from ordinary
-                    // Smalltalk source (a long keyword selector) — an
-                    // oversized call shape, not "can't happen": treated
-                    // the same as any other bad/oversized call shape,
-                    // Fallthrough rather than an out-of-bounds panic.
-                    return PrimitiveOutcome::Fallthrough;
+                    // slot left (ffi_stubs.rs's fixed 8-GPR register
+                    // load; AAPCS64 puts args 9+ on the STACK, which the
+                    // trampoline does not spill yet — the Accelerate
+                    // design's U2 unlock, docs/accelerate_design.md).
+                    // This used to Fallthrough — but on an empty-bodied
+                    // pragma method that answers the receiver and looks
+                    // exactly like quiet success (found live probing
+                    // vDSP_mmulD, 9 g args, which silently no-opped).
+                    // Guest-fatal per this module's error policy: the
+                    // pragma is guest source, so the mistake costs the
+                    // doit, never the host.
+                    crate::runtime::error::guest_fatal(
+                        vm,
+                        format!(
+                            "FFI: function {name:?} declares more than 8 integer/pointer \
+                             (\"g\") args — args 9+ pass on the stack, which the trampoline \
+                             does not support yet (docs/accelerate_design.md U2)"
+                        ),
+                    );
                 }
                 argv_g[next_g] = word;
                 next_g += 1;
@@ -196,7 +205,14 @@ pub(crate) fn dispatch_ffi_primitive(vm: &mut VmState, m: MethodOop, argc: u8) -
                 if next_f >= argv_f.len() {
                     // Same reasoning as the "g" arm above, for the FPR
                     // register file.
-                    return PrimitiveOutcome::Fallthrough;
+                    crate::runtime::error::guest_fatal(
+                        vm,
+                        format!(
+                            "FFI: function {name:?} declares more than 8 float (\"f\") args — \
+                             args 9+ pass on the stack, which the trampoline does not support \
+                             yet (docs/accelerate_design.md U2)"
+                        ),
+                    );
                 }
                 argv_f[next_f] = word;
                 next_f += 1;
@@ -518,40 +534,14 @@ mod tests {
         }
     }
 
-    /// Adversarial-review finding (S20 step 4): `MethodOop`'s own `argc`
-    /// field is 4 bits wide (`METHOD_ARGC_MAX` = 15, `oops/layout.rs`), so
-    /// a hand-authored pragma can syntactically declare more than 8
-    /// same-class arguments (a real 9-keyword selector), overrunning
-    /// `argv_g`'s fixed 8 slots — an out-of-bounds array write that Rust
-    /// bounds-checks into a hard panic/crash in both debug and release, not
-    /// silent corruption, but still reachable from ordinary, in-range,
-    /// user-writable Smalltalk source with no VM-internal misuse needed.
-    /// Must fall through cleanly instead, same as any other oversized/bad
-    /// call shape.
-    #[test]
-    fn ffi_more_than_eight_same_class_args_falls_through_not_panics() {
-        let mut vm = test_vm();
-        let klass = test_klass(&mut vm, "FFITooManyGArgs");
-        let mut method = first_method_of(
-            "Object subclass: FFITooManyGArgs [ \
-                a: p1 b: p2 c: p3 d: p4 e: p5 f: p6 g: p7 h: p8 i: p9 [ \
-                    <primitive: FFI function: #foo ret: #g args: #(g g g g g g g g g)> \
-                ] \
-            ]",
-        );
-        let m = compile_method(&mut vm, klass, false, &mut method).expect("compile");
-        assert_eq!(m.argc(), 9);
-        let nil = vm.universe.nil_obj;
-        vm.stack.push(nil);
-        for i in 0..9 {
-            vm.stack.push(SmallInt::new(i).oop());
-        }
-        let outcome = dispatch_ffi_primitive(&mut vm, m, 9);
-        match outcome {
-            PrimitiveOutcome::Fallthrough => {}
-            _ => panic!("expected Fallthrough when more than 8 same-class FFI args are declared"),
-        }
-    }
+    // A >8-same-class-args pragma (reachable: METHOD_ARGC_MAX is 15) once
+    // fell through here — but on an empty-bodied pragma method Fallthrough
+    // answers the receiver and masquerades as success (found live: probing
+    // vDSP_mmulD, 9 g args, silently no-opped — docs/accelerate_design.md).
+    // It now raises a GUEST fatal naming the register limit, which a bare
+    // `test_vm()` cannot observe without dying; the gate moved to
+    // `embed::tests::ffi_guest_mistakes_recover_as_errors_not_host_panics`
+    // (case 5), alongside the other guest-fatal FFI gates.
 
     // The unsupported-shape / Tier-2 / typo'd-symbol paths were once
     // `#[should_panic]` tests here; they now raise a GUEST fatal

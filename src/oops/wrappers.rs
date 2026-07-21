@@ -312,6 +312,28 @@ impl AlienOop {
             crate::oops::smi::SmallInt::new(addr as i64).oop(),
         );
     }
+
+    /// Body-word-1 named field (`oops::layout::ALIEN_INDIRECT_SIZE_INDEX`):
+    /// an indirect Alien's declared byte size — the bounds limit its
+    /// accessors check against, since its real tail is zero bytes (the
+    /// wasted-tail tradeoff the original design took was retired when this
+    /// field landed; `runtime::alien`'s module doc has the history). `0`
+    /// for a direct Alien, whose `indexable_len()` stays authoritative.
+    pub fn indirect_size(self) -> usize {
+        crate::oops::smi::SmallInt::try_from(
+            self.as_mem()
+                .body_oop(crate::oops::layout::ALIEN_INDIRECT_SIZE_INDEX),
+        )
+        .expect("Alien indirect-size field is not a SmallInt")
+        .value() as usize
+    }
+
+    pub fn set_indirect_size(self, n: usize) {
+        self.as_mem().set_body_oop(
+            crate::oops::layout::ALIEN_INDIRECT_SIZE_INDEX,
+            crate::oops::smi::SmallInt::new(n as i64).oop(),
+        );
+    }
 }
 
 impl DoubleOop {

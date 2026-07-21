@@ -164,17 +164,28 @@ pub const METHOD_BYTECODE_BYTE_OFFSET: usize = BODY_OFFSET + 8 * (METHOD_SIZE_IN
 /// GC-scanning code paths between direct and indirect Aliens with zero
 /// special-casing (`runtime::alien`'s own module doc elaborates).
 pub const ALIEN_EXTERNAL_ADDR_INDEX: usize = 0;
-/// `Universe::alien_klass`'s `nis_words`: one named field
-/// (`ALIEN_EXTERNAL_ADDR_INDEX`) ahead of Alien's own implicit size slot,
-/// exactly the same pattern `METHOD_NAMED_WORDS` (7) establishes for
-/// `Format::Method`'s klass (`nis = HEADER_WORDS + METHOD_NAMED_WORDS`).
-/// Empirically verified (`runtime::alien`'s own
-/// `alien_nis_words_derivation_is_correct` test): allocating an Alien with
-/// N tail bytes yields `indexable_len() == N` exactly, and writing tail
-/// byte 0 never clobbers the external-address field at body-word 0 — the
-/// size slot lands at body-word 1, the tail starts at body-word 2, so the
-/// two fields (address, tail) never alias.
-pub const ALIEN_NAMED_WORDS: usize = 1;
+/// Body-word-1 named field: an INDIRECT Alien's declared byte size (a
+/// SmallInt, like the address field). This is the "second named field"
+/// the original design deferred (`runtime::alien`'s module doc): with it,
+/// `forAddress:size:` allocates a ZERO-byte real tail — wrapping an 8 MB
+/// mmap region no longer wastes 8 MB of real VM heap — and bounds checks
+/// read this field instead of `indexable_len()` when the Alien is
+/// indirect. Always 0 for a direct Alien (whose `indexable_len()` remains
+/// the single source of truth). Added 2026-07 for the Accelerate design
+/// (`docs/accelerate_design.md`), whose NativeFloatArray wraps
+/// multi-megabyte regions.
+pub const ALIEN_INDIRECT_SIZE_INDEX: usize = 1;
+/// `Universe::alien_klass`'s `nis_words`: two named fields
+/// (`ALIEN_EXTERNAL_ADDR_INDEX`, `ALIEN_INDIRECT_SIZE_INDEX`) ahead of
+/// Alien's own implicit size slot, exactly the same pattern
+/// `METHOD_NAMED_WORDS` (7) establishes for `Format::Method`'s klass
+/// (`nis = HEADER_WORDS + METHOD_NAMED_WORDS`). Empirically verified
+/// (`runtime::alien`'s own `alien_nis_words_derivation_is_correct` test):
+/// allocating an Alien with N tail bytes yields `indexable_len() == N`
+/// exactly, and writing tail byte 0 never clobbers either named field —
+/// the size slot lands at body-word 2, the tail starts at body-word 3, so
+/// the fields and the tail never alias.
+pub const ALIEN_NAMED_WORDS: usize = 2;
 
 // flags packing — SPEC §4.4 (S4-extended) "argc:4 | ntemps:8 | has_ctx:1 |
 // is_block:1 | prim_fails:1 | captures_ctx:1 | nctx:8"
