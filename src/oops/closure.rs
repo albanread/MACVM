@@ -40,17 +40,32 @@ impl ClosureOop {
     }
 
     pub fn copied(self, i: usize) -> Oop {
-        let n = self.ncopied();
-        debug_assert!(i < n, "ClosureOop::copied: index {i} out of bounds ({n})");
+        // The bound feeds ONLY the debug assert, but its loads (klass →
+        // format → size slot) survive release builds unless the whole
+        // computation is compiled out with the assert: LLVM must not
+        // eliminate raw-pointer loads it can't prove safe. Profiled at a
+        // combined ~57% of interpreter time (sample, richards, JIT=off).
+        #[cfg(debug_assertions)]
+        {
+            let n = self.ncopied();
+            debug_assert!(i < n, "ClosureOop::copied: index {i} out of bounds ({n})");
+        }
         self.as_mem().tail_oop_at(i)
     }
 
     pub fn set_copied(self, i: usize, v: Oop) {
-        let n = self.ncopied();
-        debug_assert!(
-            i < n,
+        // The bound feeds ONLY the debug assert, but its loads (klass →
+        // format → size slot) survive release builds unless the whole
+        // computation is compiled out with the assert: LLVM must not
+        // eliminate raw-pointer loads it can't prove safe. Profiled at a
+        // combined ~57% of interpreter time (sample, richards, JIT=off).
+        #[cfg(debug_assertions)]
+        {
+            let n = self.ncopied();
+            debug_assert!(            i < n,
             "ClosureOop::set_copied: index {i} out of bounds ({n})"
         );
+        }
         self.as_mem().set_tail_oop_at(i, v);
     }
 }

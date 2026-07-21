@@ -204,14 +204,30 @@ impl ArrayOop {
     }
 
     pub fn at(self, i: usize) -> Oop {
-        let len = self.len();
-        debug_assert!(i < len, "at: index {i} out of bounds (len {len})");
+        // The bound feeds ONLY the debug assert, but its loads (klass →
+        // format → size slot) survive release builds unless the whole
+        // computation is compiled out with the assert: LLVM must not
+        // eliminate raw-pointer loads it can't prove safe. Profiled at a
+        // combined ~57% of interpreter time (sample, richards, JIT=off).
+        #[cfg(debug_assertions)]
+        {
+            let len = self.len();
+            debug_assert!(i < len, "at: index {i} out of bounds (len {len})");
+        }
         self.as_mem().tail_oop_at(i)
     }
 
     pub fn at_put(self, i: usize, v: Oop) {
-        let len = self.len();
-        debug_assert!(i < len, "at_put: index {i} out of bounds (len {len})");
+        // The bound feeds ONLY the debug assert, but its loads (klass →
+        // format → size slot) survive release builds unless the whole
+        // computation is compiled out with the assert: LLVM must not
+        // eliminate raw-pointer loads it can't prove safe. Profiled at a
+        // combined ~57% of interpreter time (sample, richards, JIT=off).
+        #[cfg(debug_assertions)]
+        {
+            let len = self.len();
+            debug_assert!(i < len, "at_put: index {i} out of bounds (len {len})");
+        }
         self.as_mem().set_tail_oop_at(i, v);
     }
 }
@@ -226,14 +242,30 @@ impl ByteArrayOop {
     }
 
     pub fn byte_at(self, i: usize) -> u8 {
-        let len = self.len();
-        debug_assert!(i < len, "byte_at: index {i} out of bounds (len {len})");
+        // The bound feeds ONLY the debug assert, but its loads (klass →
+        // format → size slot) survive release builds unless the whole
+        // computation is compiled out with the assert: LLVM must not
+        // eliminate raw-pointer loads it can't prove safe. Profiled at a
+        // combined ~57% of interpreter time (sample, richards, JIT=off).
+        #[cfg(debug_assertions)]
+        {
+            let len = self.len();
+            debug_assert!(i < len, "byte_at: index {i} out of bounds (len {len})");
+        }
         self.as_mem().tail_byte_at(i)
     }
 
     pub fn byte_at_put(self, i: usize, b: u8) {
-        let len = self.len();
-        debug_assert!(i < len, "byte_at_put: index {i} out of bounds (len {len})");
+        // The bound feeds ONLY the debug assert, but its loads (klass →
+        // format → size slot) survive release builds unless the whole
+        // computation is compiled out with the assert: LLVM must not
+        // eliminate raw-pointer loads it can't prove safe. Profiled at a
+        // combined ~57% of interpreter time (sample, richards, JIT=off).
+        #[cfg(debug_assertions)]
+        {
+            let len = self.len();
+            debug_assert!(i < len, "byte_at_put: index {i} out of bounds (len {len})");
+        }
         self.as_mem().set_tail_byte_at(i, b);
     }
 

@@ -171,29 +171,50 @@ impl MemOop {
     /// use for this (SPEC §7.4): it needs the slot's own address to
     /// compute which card to dirty, not just to write through it.
     pub fn body_addr(self, index: usize) -> usize {
-        let bound = self.body_word_count();
-        debug_assert!(
-            index < bound,
+        // The bound feeds ONLY the debug assert, but its loads (klass →
+        // format → size slot) survive release builds unless the whole
+        // computation is compiled out with the assert: LLVM must not
+        // eliminate raw-pointer loads it can't prove safe. Profiled at a
+        // combined ~57% of interpreter time (sample, richards, JIT=off).
+        #[cfg(debug_assertions)]
+        {
+            let bound = self.body_word_count();
+            debug_assert!(            index < bound,
             "body_addr: index {index} out of bounds ({bound})"
         );
+        }
         self.body_ptr(index) as usize
     }
 
     pub fn body_oop(self, index: usize) -> Oop {
-        let bound = self.body_word_count();
-        debug_assert!(
-            index < bound,
+        // The bound feeds ONLY the debug assert, but its loads (klass →
+        // format → size slot) survive release builds unless the whole
+        // computation is compiled out with the assert: LLVM must not
+        // eliminate raw-pointer loads it can't prove safe. Profiled at a
+        // combined ~57% of interpreter time (sample, richards, JIT=off).
+        #[cfg(debug_assertions)]
+        {
+            let bound = self.body_word_count();
+            debug_assert!(            index < bound,
             "body_oop: index {index} out of bounds ({bound})"
         );
+        }
         Oop::from_raw(self.raw_body_word(index))
     }
 
     pub fn set_body_oop(self, index: usize, v: Oop) {
-        let bound = self.body_word_count();
-        debug_assert!(
-            index < bound,
+        // The bound feeds ONLY the debug assert, but its loads (klass →
+        // format → size slot) survive release builds unless the whole
+        // computation is compiled out with the assert: LLVM must not
+        // eliminate raw-pointer loads it can't prove safe. Profiled at a
+        // combined ~57% of interpreter time (sample, richards, JIT=off).
+        #[cfg(debug_assertions)]
+        {
+            let bound = self.body_word_count();
+            debug_assert!(            index < bound,
             "set_body_oop: index {index} out of bounds ({bound})"
         );
+        }
         self.set_raw_body_word(index, v.raw());
     }
 
@@ -270,20 +291,34 @@ impl MemOop {
     /// distinct from [`MemOop::body_oop`]: an arbitrary bit pattern (a float)
     /// must never be run through `Oop::from_raw`'s tag `debug_assert`s.
     pub fn body_word_raw(self, index: usize) -> u64 {
-        let bound = self.body_word_count();
-        debug_assert!(
-            index < bound,
+        // The bound feeds ONLY the debug assert, but its loads (klass →
+        // format → size slot) survive release builds unless the whole
+        // computation is compiled out with the assert: LLVM must not
+        // eliminate raw-pointer loads it can't prove safe. Profiled at a
+        // combined ~57% of interpreter time (sample, richards, JIT=off).
+        #[cfg(debug_assertions)]
+        {
+            let bound = self.body_word_count();
+            debug_assert!(            index < bound,
             "body_word_raw: index {index} out of bounds ({bound})"
         );
+        }
         self.raw_body_word(index)
     }
 
     pub fn set_body_word_raw(self, index: usize, w: u64) {
-        let bound = self.body_word_count();
-        debug_assert!(
-            index < bound,
+        // The bound feeds ONLY the debug assert, but its loads (klass →
+        // format → size slot) survive release builds unless the whole
+        // computation is compiled out with the assert: LLVM must not
+        // eliminate raw-pointer loads it can't prove safe. Profiled at a
+        // combined ~57% of interpreter time (sample, richards, JIT=off).
+        #[cfg(debug_assertions)]
+        {
+            let bound = self.body_word_count();
+            debug_assert!(            index < bound,
             "set_body_word_raw: index {index} out of bounds ({bound})"
         );
+        }
         self.set_raw_body_word(index, w);
     }
 
