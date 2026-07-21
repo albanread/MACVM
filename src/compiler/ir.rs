@@ -2357,7 +2357,7 @@ impl<'a> Translator<'a> {
                     let inner_static_self = inner_recv == callee_self
                         && callee_self_klass
                             .is_some_and(|k| self.devirt_self_target(k, inner_sel).is_some());
-                    if !inner_static_self && self.cold_send_traps() {
+                    if !inner_static_self && self.inlined_cold_send_traps() {
                         if let crate::compiler::inline::InlineDecision::Trap =
                             crate::compiler::inline::decide(&inner_fb)
                         {
@@ -3097,7 +3097,7 @@ impl<'a> Translator<'a> {
                         let inner_static_self = inner_recv == callee_self
                             && callee_self_klass
                                 .is_some_and(|k| self.devirt_self_target(k, inner_sel).is_some());
-                        if !inner_static_self && self.cold_send_traps() {
+                        if !inner_static_self && self.inlined_cold_send_traps() {
                             if let crate::compiler::inline::InlineDecision::Trap =
                                 crate::compiler::inline::decide(&inner_fb)
                             {
@@ -3377,6 +3377,30 @@ impl<'a> Translator<'a> {
     /// leaf/nonleaf body, block-arg in-callee graft, spliced block body).
     fn cold_send_traps(&self) -> bool {
         !self.osr
+    }
+
+    /// Whether a COLD (`Untaken`) send spliced from an INLINED callee body may
+    /// be speculatively lowered to a terminating uncommon trap. Always `false`
+    /// — the inlined counterpart to `cold_send_traps`, split off because the
+    /// two heal DIFFERENTLY. A ROOT send's trap re-executes in THIS method and
+    /// warms THIS method's own IC, so `recompile::note_uncommon_trap`'s profile
+    /// snapshot sees the change and recompiles it away. An INLINED send's trap
+    /// re-executes in the CALLEE and warms the CALLEE's IC — which the caller's
+    /// snapshot cannot reliably observe, so the recompile DECLINES ("profile
+    /// unchanged") and the trap fires FOREVER. Found in the wild as
+    /// `ScaleConstraint>>markInputs:` (grafts its OWN `inputsDo:` override,
+    /// whose `direction == #forward` site is cold when the customized
+    /// `markInputs:` compiles): the branch is taken every call, so v0 trapped
+    /// ~102×/run and every resnapshot declined to recompile — a permanent deopt
+    /// storm. `EqualityConstraint>>markInputs:` escaped it only by luck (it
+    /// inlines the SHARED `BinaryConstraint>>inputsDo:`, warm from every other
+    /// binary constraint). Reliability over speculation — the same principle
+    /// `cold_send_traps` already applies to OSR: emit the plain `CallSend`,
+    /// which dispatches correctly on the first call and never storms. A
+    /// genuinely-cold inlined path just compiles as an unreached dispatch — a
+    /// few bytes, zero runtime cost — instead of a trap.
+    fn inlined_cold_send_traps(&self) -> bool {
+        false
     }
 
     fn record_inline_dep(&mut self, klass: KlassOop, selector: SymbolOop) {
@@ -5448,7 +5472,7 @@ impl<'a> Translator<'a> {
                     let inner_static_self = inner_recv == block_self
                         && block_self_klass
                             .is_some_and(|k| self.devirt_self_target(k, inner_sel).is_some());
-                    if !inner_static_self && self.cold_send_traps() {
+                    if !inner_static_self && self.inlined_cold_send_traps() {
                         if let crate::compiler::inline::InlineDecision::Trap =
                             crate::compiler::inline::decide(&inner_fb)
                         {
