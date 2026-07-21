@@ -530,14 +530,15 @@ mod tests {
     // real compiler: the pragma's token list and the selector's arity are
     // authored independently.
 
-    // A >8-same-class-args pragma (reachable: METHOD_ARGC_MAX is 15) once
-    // fell through here — but on an empty-bodied pragma method Fallthrough
-    // answers the receiver and masquerades as success (found live: probing
-    // vDSP_mmulD, 9 g args, silently no-opped — docs/accelerate_design.md).
-    // It now raises a GUEST fatal naming the register limit, which a bare
-    // `test_vm()` cannot observe without dying; the gate moved to
-    // `embed::tests::ffi_guest_mistakes_recover_as_errors_not_host_panics`
-    // (case 5), alongside the other guest-fatal FFI gates.
+    // The >8-g-args story, in three acts (docs/accelerate_design.md):
+    // pre-A0 a 9-g-arg pragma FELL THROUGH here — an empty-bodied pragma
+    // method answering the receiver, masquerading as success (found live:
+    // vDSP_mmulD silently no-opped). A0 made it a loud guest fatal.
+    // A3's stack-spill trampoline tier then made 9..15 g args genuinely
+    // WORK (args 9+ pass on the stack), so today only >16 g (unreachable —
+    // METHOD_ARGC_MAX is 15) and >8 f raise. The live gates: embed case 5
+    // asserts a 9-g-arg binding SUCCEEDS, and ffi_stubs's
+    // ret_g_spills_stack_args_nine_and_beyond pins the spill itself.
 
     // The unsupported-shape / Tier-2 / typo'd-symbol paths were once
     // `#[should_panic]` tests here; they now raise a GUEST fatal

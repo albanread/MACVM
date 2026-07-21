@@ -66,8 +66,11 @@ Object subclass: Accel [
         ^self
     ]
     "One page for staging pointer-passed scalars and reading back
-     pointer-returned results (a VM is strictly serial — the PosixFile
-     scratch pattern). Offset 0: scalar in; offset 8: result out."
+     pointer-returned results (a VM is strictly serial, and arguments are
+     fully evaluated before a method body stages anything — the PosixFile
+     scratch pattern). Layout: offset 0 = scalar in (fill/scale/ramp
+     start), offset 8 = ramp step AND reduction result out (never both in
+     one body), offset 16 = the vForce lane count (a C int)."
     Accel class >> scratch [
         Scratch isNil ifTrue: [ Scratch := NativeBuffer page ].
         ^Scratch
@@ -203,9 +206,10 @@ Number subclass: Double [
  you send me free). Index me 1-based with at: and at:put:.
 
  My bulk operations run in Accelerate and write IN PLACE into an argument
- array: add:into:, subtract:into:, multiply:into:, divideInto:giving:,
- scaleBy:, fill:, rampFrom:step:, absInto:, negInto:, and the
- transcendentals expInto:, logInto:, sqrtInto:, sinInto:, powWith:into:.
+ array: add:into:, subtract:into:, multiply:into:, divideBy:into:,
+ scaleBy:, fill:, clear, rampFrom:step:, absInto:, negInto:, and the
+ transcendentals expInto:, logInto:, sqrtInto:, sinInto:, cosInto:,
+ powWith:into:.
  Reductions answer Doubles: sum, dot:, mean, max, min. Use me for BULK
  work and transcendentals; for small arrays the plain FloatArray's NEON
  kernels are faster (its class comment has the numbers), and asFloatArray
@@ -322,6 +326,12 @@ Object subclass: NativeFloatArray [
         Accel vfillDPtr: Accel scratch address c: addr s: 1 n: lanes.
         ^self
     ]
+    clear [
+        "All lanes to 0.0 (vclrD — cheaper than fill: 0)."
+        self live.
+        Accel vclrD: addr s: 1 n: lanes.
+        ^self
+    ]
     rampFrom: start step: step [
         self live.
         Accel scratchAlien doubleAt: 1 put: start asDouble.
@@ -366,6 +376,11 @@ Object subclass: NativeFloatArray [
     sinInto: c [
         self checkPeer: c.
         Accel vvsinY: c address x: addr nPtr: self stageCount.
+        ^c
+    ]
+    cosInto: c [
+        self checkPeer: c.
+        Accel vvcosY: c address x: addr nPtr: self stageCount.
         ^c
     ]
     "c := self ** exponents, elementwise (vvpow wants exponents in y)."
@@ -488,6 +503,11 @@ Object subclass: NativeMatrix [
     ]
     "The full BLAS form: c := (alpha * self * b) + (beta * c)."
     mm: b into: c scaledBy: alpha plus: beta [
+        "Liveness first (review finding): a freed matrix passes the
+         dimension checks (rows/cols survive free) and would hand dgemm a
+         NULL data pointer — a native segfault, not the promised hard
+         error. `live` on each underlying array closes it."
+        data live. b data live. c data live.
         rows = c rows ifFalse: [ ^self error: 'result rows mismatch' ].
         b columns = c columns ifFalse: [ ^self error: 'result columns mismatch' ].
         cols = b rows ifFalse: [ ^self error: 'inner dimensions mismatch' ].

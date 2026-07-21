@@ -120,6 +120,9 @@ TestCase subclass: AccelTests [
         self assert: (v at: 1) = -9.25.
         v absInto: v.
         self assert: (v at: 1) = 9.25.
+        v clear.
+        self assert: (v at: 1) = 0.0.
+        self assert: (v at: 3) = 0.0.
         v free. w free.
     ]
 
@@ -147,6 +150,13 @@ TestCase subclass: AccelTests [
         x := NativeFloatArray from: #(4 9 16).
         x sqrtInto: x.
         self assert: (x at: 3) = 4.0.
+        y := NativeFloatArray from: #(0 0 0).
+        y cosInto: y.
+        "cos 0 — but vForce is ULP-accurate, not bit-exact (vvcos(0)
+         really answers 0.9999999999999999), so compare with tolerance."
+        self assert: (self close: (y at: 1) to: 1.0).
+        self assert: (self close: (y at: 3) to: 1.0).
+        y free.
         "powWith: — receiver ** exponents (vvpow wants exponents in y)."
         e := NativeFloatArray from: #(2 2 0.5).
         x powWith: e into: x.                  "x was 2 3 4 after sqrt"

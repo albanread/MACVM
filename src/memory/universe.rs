@@ -563,12 +563,15 @@ impl Universe {
         // `at:`/`byteAt:`-family primitives assume no shift at all).
         // `untagged = true`, matching `bytearray_klass`'s own 4th argument
         // (a raw byte tail, never oop-scanned). `nis_words = HEADER_WORDS +
-        // ALIEN_NAMED_WORDS` places the one named field
-        // (`ALIEN_EXTERNAL_ADDR_INDEX`) at body-word 0, Alien's own
-        // implicit size slot at body-word 1, and the byte tail starting at
-        // body-word 2 — the exact same "named fields, then size slot, then
-        // tail" pattern `method_klass` below uses for `Format::Method`'s 7
-        // named fields, just with 1 instead of 7. This derivation is
+        // ALIEN_NAMED_WORDS` places the two named fields
+        // (`ALIEN_EXTERNAL_ADDR_INDEX` at body-word 0,
+        // `ALIEN_INDIRECT_SIZE_INDEX` at body-word 1 — the zero-tail
+        // indirect-Alien size field, 2026-07) ahead of Alien's own
+        // implicit size slot at body-word 2, with the byte tail starting
+        // at body-word 3 — the exact same "named fields, then size slot,
+        // then tail" pattern `method_klass` below uses for
+        // `Format::Method`'s 7 named fields, just with 2 instead of 7.
+        // This derivation is
         // empirically checked by `runtime::alien`'s
         // `alien_nis_words_derivation_is_correct` test (allocate, confirm
         // `indexable_len()` and no aliasing between the address field and

@@ -1,9 +1,20 @@
 # Accelerate for array/vector processing — investigation + design
 
-**Status: DESIGN (investigated empirically 2026-07-21; nothing committed to
-the world yet).** Question asked: can Smalltalk naturally use the matrix/
-vector operations in Apple's Accelerate framework, and how should MACVM
-enable them for array/vector acceleration?
+**Status: BUILT (A0–A4, 2026-07-21).** A0 = zero-tail indirect Aliens + the
+loud >8-arg/arity-mismatch FFI errors (856f9ff). A1 = the `Accel` bindings
++ `NativeFloatArray` world layer + AccelTests (1205e4b). A2 = the U1
+per-descriptor dlsym cache (6fd9f17). A3 = the U2 stack-spill trampoline
+tier + `cblas_dgemm`/`vDSP_mmulD` + `NativeMatrix` (887ba6e). A4 capstone
+measured: a 256×256 matrix product runs 24.5 s as a naive Smalltalk triple
+loop and <1 ms through `NativeMatrix mm:into:` (dgemm) — four orders of
+magnitude, numerically identical results. The FFT worked example is the
+one de-scoped A4 item: `vDSP_create_fftsetupD`/`vDSP_fft_zipD` are
+bindable today (≤5 g args, split-complex staged by pointer) and wait only
+on someone wanting them.
+
+Question asked: can Smalltalk naturally use the matrix/vector operations
+in Apple's Accelerate framework, and how should MACVM enable them for
+array/vector acceleration?
 
 **Answer: yes — a useful majority of Accelerate (vDSP elementwise +
 reductions, all of vForce, double-precision FFT) is callable TODAY with
@@ -77,7 +88,7 @@ The in-VM NEON `FloatArray` kernels are NOT replaced — they own the
 small-N/interactive tier; Accelerate owns bulk and transcendentals. Dual
 placement, complementary tiers.
 
-### A. `NativeFloatArray` — GC-stable lanes (world/39a)
+### A. `NativeFloatArray` — GC-stable lanes (world/61a)
 
 N f64 lanes in an anonymous mmap region: `address` (SmallInteger, for
 `#g` args) + an internal `Alien` for `doubleAt:`-style lane access, plus
@@ -96,7 +107,7 @@ No finalizers exist in MACVM by design, so an unfreed array is simply
 leaked until exit — same honest price the IoWorker kq fd already pays,
 but here with a `free` the user can and should call.
 
-### B. `Accel` — the raw bindings (world/39a)
+### B. `Accel` — the raw bindings (world/61a)
 
 Class-side facade, lazy one-shot `ensureLoaded` (class-var latch around
 the dlopen). The surface that fits ≤8 g args — which is most of what
@@ -117,14 +128,13 @@ matters:
 Every binding follows the Posix file's conventions: fixed arity, errors
 as values, a comment naming the C signature.
 
-### C. High-level API (world/39a)
+### C. High-level API (world/61a)
 
 `NativeFloatArray` gains the ergonomic ops, in-place by default (that is
 vDSP's shape, and the benchmark showed result-allocation is real cost):
 
 ```smalltalk
-a addInto: b            "a := a + b, elementwise, via vaddD"
-a add: b into: c        "c := a + b"
+a add: b into: c        "c := a + b (c may be a — in place)"
 a scaleBy: 2.5          "vsmulD"
 a dot: b                "dotprD -> Double"
 a sum  a mean  a max
