@@ -69,6 +69,15 @@ const DESC_NAME: usize = 1;
 // step's own brief.
 const DESC_RET: usize = 4;
 const DESC_ARGS: usize = 5;
+/// The resolved native address, cached by the first call (nil until then —
+/// `build_ffi_descriptor` allocates the slot nil-filled). A SmallInt of
+/// raw address bits: an IMMEDIATE, so the runtime `at_put` needs no write
+/// barrier and the cache is GC-inert. Correct to cache forever: the FFI
+/// resolves against RTLD_DEFAULT (plus RTLD_GLOBAL dlopens), and a symbol's
+/// address in an already-loaded image never changes for the process life.
+/// Added 2026-07 (docs/accelerate_design.md U1) — dlsym-per-call measured
+/// ~14 µs, the dominant cost of every small-N Accelerate call.
+const DESC_ADDR_CACHE: usize = 6;
 
 /// S20 step 4's entry point, called directly from `interpreter::send::
 /// try_primitive` once it has recognized `m.primitive() == PRIM_ID_FFI`.
@@ -256,11 +265,15 @@ pub(crate) fn dispatch_ffi_primitive(vm: &mut VmState, m: MethodOop, argc: u8) -
     // JIT. The caller pushes the result at `base`, leaving exactly `[result]`.
     vm.stack.sp = base;
 
-    // Resolve fresh on EVERY call — a deliberate, documented scope cut for
-    // a later performance pass (a per-descriptor resolved-address cache),
-    // not an oversight: this step's brief is "make the pragma callable at
-    // all", and `dlsym` against the process-global namespace (`RTLD_
-    // DEFAULT`, via `lib: None`) is correct and cheap enough for now.
+    // Resolve once, cache in the descriptor (slot 6, a SmallInt of raw
+    // address bits — immediate, so no write barrier). The old
+    // resolve-on-every-call scope cut cost ~14 µs/call and dominated every
+    // small-N Accelerate kernel (docs/accelerate_design.md U1).
+    if let Some(cached) = SmallInt::try_from(desc.at(DESC_ADDR_CACHE)) {
+        let target = cached.value() as u64;
+        let result = vm.ffi_stubs.invoke(ret_class, target, &argv_g, &argv_f);
+        return unmarshal_ret(vm, ret_class, result, &name);
+    }
     let Some(target) = crate::vendor::wfasm::native_macos::dlsym_resolve(None, &name) else {
         // A `ffi_gen`-generated binding names only functions verified to
         // exist in the real ABI database (docs/FFI.md) — but bindings are
@@ -278,8 +291,23 @@ pub(crate) fn dispatch_ffi_primitive(vm: &mut VmState, m: MethodOop, argc: u8) -
         );
     };
 
-    let result = vm.ffi_stubs.invoke(ret_class, target, &argv_g, &argv_f);
+    // Cache the resolution (an immediate SmallInt — no write barrier
+    // needed) so every later call takes the fast path above.
+    desc.at_put(DESC_ADDR_CACHE, SmallInt::new(target as i64).oop());
 
+    let result = vm.ffi_stubs.invoke(ret_class, target, &argv_g, &argv_f);
+    unmarshal_ret(vm, ret_class, result, &name)
+}
+
+/// The return-value unmarshal, shared by the cached-address fast path and
+/// the first-call resolve path (factored out when the U1 address cache
+/// split dispatch into those two exits).
+fn unmarshal_ret(
+    vm: &mut VmState,
+    ret_class: crate::codecache::ffi_stubs::FfiRetClass,
+    result: u64,
+    name: &str,
+) -> PrimitiveOutcome {
     match ret_class {
         crate::codecache::ffi_stubs::FfiRetClass::V => {
             // `ret_v` callers ignore the trampoline's raw `u64` entirely

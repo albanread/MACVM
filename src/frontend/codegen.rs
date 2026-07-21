@@ -1397,7 +1397,13 @@ fn build_ffi_descriptor(vm: &mut VmState, scope: &HandleScope, ffi: &FfiPragma) 
     }
     let args_arr_h = scope.handle(vm, args_arr.oop());
 
-    let desc = alloc::alloc_indexable_oops(vm, vm.universe.array_klass, 6);
+    // Slot 6 (`runtime::ffi::DESC_ADDR_CACHE`): the resolved native
+    // address, nil until the first call dlsym-resolves it — the
+    // per-descriptor cache that retired dispatch's dlsym-on-every-call
+    // scope cut (measured ~14 µs/call, the whole reason Accelerate calls
+    // lost to in-VM NEON below ~8 K lanes — docs/accelerate_design.md U1).
+    // `alloc_indexable_oops` nil-fills, so no explicit initialization.
+    let desc = alloc::alloc_indexable_oops(vm, vm.universe.array_klass, 7);
     desc.at_put(0, kind_h.get(vm));
     desc.at_put(1, name_h.get(vm));
     desc.at_put(2, class_h.map(|h| h.get(vm)).unwrap_or(vm.universe.nil_obj));
@@ -1936,7 +1942,16 @@ mod tests {
 
         assert_eq!(m.primitive(), crate::oops::layout::PRIM_ID_FFI);
         let desc = m.literals();
-        assert_eq!(desc.len(), 6, "kind/name/class/classSide/ret/args");
+        assert_eq!(
+            desc.len(),
+            7,
+            "kind/name/class/classSide/ret/args + the U1 address-cache slot"
+        );
+        assert_eq!(
+            desc.at(6),
+            vm.universe.nil_obj,
+            "the address cache starts nil (resolved by the first call)"
+        );
         assert_eq!(sym_str(desc.at(0)), "function");
         assert_eq!(sym_str(desc.at(1)), "mmap");
         assert_eq!(desc.at(2), vm.universe.nil_obj, "Tier 1 has no class");

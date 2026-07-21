@@ -143,7 +143,13 @@ for transcendentals (measured 40–60×) or very large N.
   documented planned pass). Removes the ~14 µs/call tax that currently
   sets the break-even at ~8 K lanes; benefits EVERY FFI user (Posix,
   kqueue, sockets) for free. After it, vDSP should win from a few
-  hundred lanes up.
+  hundred lanes up. **BUILT (A2): descriptor slot 7 caches the resolved
+  address as an immediate SmallInt. Re-measured: the 512-lane × 2000-rep
+  case fell 29 ms → 1-2 ms — vDSP through the FFI is now at parity or
+  faster than the in-VM NEON kernels at EVERY size swept (and 5-8× ahead
+  from 8 K lanes up), so the "small N belongs to FloatArray" guidance
+  weakens to "FloatArray is fine when the data already lives on the
+  heap".**
 - **U2 — stack-spill tier for the trampoline** (`ffi_stubs.rs`): AAPCS64
   passes integer args 9+ on the stack; a second trampoline flavor that
   spills `argv_g[8..15]`/`argv_f[8..]` to `[sp]` (16-byte aligned)
