@@ -50,5 +50,6 @@ tier1.mst
 44_posix_io_tests.mst
 45_iostream_tests.mst
 46_scaleddecimal_tests.mst
+47_socket_tests.mst
 48_accel_tests.mst
 99_run_all.mst

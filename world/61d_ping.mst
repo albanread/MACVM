@@ -1,0 +1,76 @@
+"61d_ping.mst — PING: a real ICMP ping built entirely in Smalltalk, the
+ worked example for the granular-sockets layer (world/61c, docs/
+ sockets_design.md). Every byte of the echo-request packet is authored in
+ the language — type, id, sequence, and the one's-complement checksum —
+ sent over the unprivileged SOCK_DGRAM+IPPROTO_ICMP socket (no root), and
+ the IP+ICMP reply is parsed by hand. 'Granular control over our own
+ protocols' made concrete.
+
+ Ping host: '127.0.0.1' count: 4 prints the classic per-echo lines and a
+ summary. The default target is loopback (on-machine, no network egress,
+ no firewall prompt); any dotted-quad the machine can route to also works.
+ Harmless headless — on a platform that refuses even the unprivileged ICMP
+ socket, `open` answers false and the run reports that cleanly."
+
+Object subclass: Ping [
+    | sock addr sent received totalRtt |
+
+    Ping class >> host: aString [ ^self host: aString count: 4 ]
+    Ping class >> host: aString count: n [
+        ^self new runHost: aString count: n
+    ]
+    "Loopback shortcut."
+    Ping class >> loopback [ ^self host: '127.0.0.1' count: 4 ]
+
+    open [
+        sock := IcmpSocket new.
+        ^sock isOpen
+    ]
+
+    "One echo: send, wait for the reply, answer its round-trip time in ms
+     (or nil if the reply never came / wasn't an echo reply). The DGRAM
+     socket blocks in recvfrom; loopback answers effectively instantly, and
+     a real host answers within the network RTT."
+    pingSeq: seq [
+        | t0 rc reply |
+        t0 := Time millisecondClockValue.
+        rc := sock sendEchoTo: addr id: 4660 seq: seq.
+        rc < 0 ifTrue: [ ^nil ].
+        reply := sock receiveReply.
+        reply isNil ifTrue: [ ^nil ].
+        (reply at: 1) = IcmpSocket echoReplyType ifFalse: [ ^nil ].
+        ^Time millisecondClockValue - t0
+    ]
+
+    runHost: aString count: n [
+        | rtt |
+        addr := InetAddress fromString: aString.
+        addr isNil ifTrue: [ Transcript show: 'ping: bad address ', aString; cr. ^self ].
+        self open ifFalse: [
+            Transcript show: 'ping: could not open an ICMP socket (errno ',
+                Posix errno printString, ')'; cr. ^self ].
+        Transcript show: 'PING ', addr printString, ' — ', n printString,
+            ' echo requests, each byte crafted in Smalltalk'; cr.
+        sent := 0. received := 0. totalRtt := 0.
+        1 to: n do: [ :seq |
+            sent := sent + 1.
+            rtt := self pingSeq: seq.
+            rtt isNil
+                ifTrue: [ Transcript show: '  seq=', seq printString, '  no reply'; cr ]
+                ifFalse: [
+                    received := received + 1.
+                    totalRtt := totalRtt + rtt.
+                    Transcript show: '  ', addr printString,
+                        ': icmp_seq=', seq printString,
+                        '  time=', rtt printString, ' ms'; cr ] ].
+        sock close.
+        Transcript show: '--- ', addr printString, ' ping statistics ---'; cr.
+        Transcript show: '  ', sent printString, ' sent, ', received printString,
+            ' received, ',
+            (sent = 0 ifTrue: [ 0 ] ifFalse: [ (sent - received) * 100 // sent ]) printString,
+            '% loss'; cr.
+        received > 0 ifTrue: [
+            Transcript show: '  avg RTT ', (totalRtt // received) printString, ' ms'; cr ].
+        ^self
+    ]
+]

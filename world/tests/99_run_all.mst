@@ -51,5 +51,6 @@ TestRunner run: EditorSessionTests.
 TestRunner run: PosixIoTests.
 TestRunner run: IoStreamTests.
 TestRunner run: ScaledDecimalTests.
+TestRunner run: SocketTests.
 TestRunner run: AccelTests.
 TestRunner report.

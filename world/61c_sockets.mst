@@ -1,0 +1,349 @@
+"61c_sockets.mst — granular sockets: the full BSD socket surface as
+ first-class Smalltalk, for building your own wire protocols (docs/
+ sockets_design.md). Pure Smalltalk on world/61 (Posix/NativeBuffer) —
+ ZERO new Rust. Extends world/61's connection-oriented, loopback-only TCP
+ conveniences with UDP datagrams, arbitrary addresses, every socket option,
+ and hand-crafted ICMP.
+
+ Everything the kernel reads or writes lives in a NativeBuffer (GC-stable
+ external memory) — a movable heap object must never be handed to a
+ syscall. Errors are VALUES: a negative return code plus `Posix errno`,
+ never a raise (the world/61 discipline; MACVM has no exceptions).
+
+ True SOCK_RAW is privilege-gated by the OS (EPERM without root) — exposed
+ honestly by Socket domain:type:protocol:, which just wraps whatever fd (or
+ negative errno) the kernel returns. The capability that delivers 'our own
+ protocols' WITHOUT root is the unprivileged SOCK_DGRAM+IPPROTO_ICMP path
+ (see IcmpSocket / the Ping demo) plus UDP."
+
+"── Posix reopened: the datagram + option + address bindings ─────────────
+ All fixed-arity, so all FFI-reachable (sendto/recvfrom are 6 args,
+ setsockopt 5). connect/getsockname/bind/listen/accept already live in
+ world/61."
+Object subclass: Posix [
+    "sendto(fd, buf, len, flags, dest_sockaddr, dest_len)"
+    Posix class >> sendtoFd: fd buf: b len: n flags: f addr: a addrLen: al [
+        <primitive: FFI function: #sendto ret: #g args: #(g g g g g g)>
+    ]
+    "recvfrom(fd, buf, len, flags, src_sockaddr, &src_len) — src/len 0/0 to ignore."
+    Posix class >> recvfromFd: fd buf: b len: n flags: f addr: a addrLenPtr: alp [
+        <primitive: FFI function: #recvfrom ret: #g args: #(g g g g g g)>
+    ]
+    "send(fd, buf, len, flags) — a connected socket's datagram/stream write."
+    Posix class >> sendFd: fd buf: b len: n flags: f [
+        <primitive: FFI function: #send ret: #g args: #(g g g g)>
+    ]
+    "recv(fd, buf, len, flags)"
+    Posix class >> recvFd: fd buf: b len: n flags: f [
+        <primitive: FFI function: #recv ret: #g args: #(g g g g)>
+    ]
+    "setsockopt(fd, level, optname, &optval, optlen)"
+    Posix class >> setsockoptFd: fd level: l name: nm val: v len: vl [
+        <primitive: FFI function: #setsockopt ret: #g args: #(g g g g g)>
+    ]
+    "getsockopt(fd, level, optname, &optval, &optlen) — optlen value-result."
+    Posix class >> getsockoptFd: fd level: l name: nm val: v lenPtr: vlp [
+        <primitive: FFI function: #getsockopt ret: #g args: #(g g g g g)>
+    ]
+    "shutdown(fd, how): 0=read 1=write 2=both"
+    Posix class >> shutdownFd: fd how: h [
+        <primitive: FFI function: #shutdown ret: #g args: #(g g)>
+    ]
+    "connect(fd, sockaddr, len) — already declared in world/61 as connect:addr:len:."
+
+    "── constants (named, not magic numbers at the call sites) ──"
+    Posix class >> afInet [ ^2 ]
+    Posix class >> sockStream [ ^1 ]
+    Posix class >> sockDgram [ ^2 ]
+    Posix class >> sockRaw [ ^3 ]
+    Posix class >> protoIcmp [ ^1 ]
+    Posix class >> protoTcp [ ^6 ]
+    Posix class >> protoUdp [ ^17 ]
+    Posix class >> solSocket [ ^65535 ]      "SOL_SOCKET (0xffff on Darwin)"
+    Posix class >> soReuseaddr [ ^4 ]
+    Posix class >> soBroadcast [ ^32 ]
+    Posix class >> soRcvbuf [ ^4098 ]
+    Posix class >> soSndbuf [ ^4097 ]
+    Posix class >> soReuseport [ ^512 ]
+    Posix class >> ipprotoIp [ ^0 ]
+    Posix class >> ipTtl [ ^4 ]
+    Posix class >> ipprotoTcp [ ^6 ]
+    Posix class >> tcpNodelay [ ^1 ]
+]
+
+"── NativeBuffer reopened: sockaddr_in for ANY IPv4 address ───────────────
+ The loopback packer (world/61) was a special case. Address and port are
+ NETWORK (big) endian, packed byte-wise. Reads the 4 address octets back
+ out too, for the peer sockaddr the kernel fills into a recvfrom."
+Object subclass: NativeBuffer [
+    "sin_len(1)=16, sin_family(1)=AF_INET, sin_port(2 net), sin_addr(4 net),
+     sin_zero[8]. `a b c d` are the dotted-quad octets in order."
+    sockaddrInAddr: a b: b c: c d: d port: port at: off [
+        self zero: 16 at: off.
+        self byteAt: off put: 16.
+        self byteAt: off + 1 put: 2.
+        self byteAt: off + 2 put: port // 256.
+        self byteAt: off + 3 put: port \\ 256.
+        self byteAt: off + 4 put: a.
+        self byteAt: off + 5 put: b.
+        self byteAt: off + 6 put: c.
+        self byteAt: off + 7 put: d.
+    ]
+    "The 4 address octets at a sockaddr_in, as a 4-element Array."
+    sockaddrInOctetsAt: off [
+        ^Array with: (self byteAt: off + 4) with: (self byteAt: off + 5)
+               with: (self byteAt: off + 6) with: (self byteAt: off + 7)
+    ]
+]
+
+"I am an IPv4 address: four octets. Build me with InetAddress fromString:
+ '192.168.1.10', InetAddress a: 127 b: 0 c: 0 d: 1, InetAddress loopback,
+ or InetAddress any (0.0.0.0). I pack myself network-order into a
+ sockaddr_in (packInto:port:at:) and format back to a dotted string. I am
+ an immutable value."
+Object subclass: InetAddress [
+    | a b c d |
+
+    InetAddress class >> a: aa b: bb c: cc d: dd [
+        ^self basicNew setA: aa b: bb c: cc d: dd
+    ]
+    InetAddress class >> loopback [ ^self a: 127 b: 0 c: 0 d: 1 ]
+    InetAddress class >> any [ ^self a: 0 b: 0 c: 0 d: 0 ]
+    "Parse a dotted quad. Answers nil on a malformed string (errors are
+     values); each octet must be 0..255."
+    InetAddress class >> fromString: aString [
+        | parts nums |
+        parts := aString tokenize: '.'.
+        parts size = 4 ifFalse: [ ^nil ].
+        nums := parts collect: [ :p | p asInteger ].
+        (nums anySatisfy: [ :n | n isNil or: [ n < 0 or: [ n > 255 ] ] ]) ifTrue: [ ^nil ].
+        ^self a: (nums at: 1) b: (nums at: 2) c: (nums at: 3) d: (nums at: 4)
+    ]
+    InetAddress class >> fromOctets: anArray [
+        ^self a: (anArray at: 1) b: (anArray at: 2) c: (anArray at: 3) d: (anArray at: 4)
+    ]
+
+    setA: aa b: bb c: cc d: dd [ a := aa. b := bb. c := cc. d := dd. ^self ]
+    a [ ^a ] b [ ^b ] c [ ^c ] d [ ^d ]
+    octets [ ^Array with: a with: b with: c with: d ]
+
+    packInto: buf port: port at: off [
+        buf sockaddrInAddr: a b: b c: c d: d port: port at: off.
+        ^self
+    ]
+
+    = other [
+        ^(other isKindOf: InetAddress)
+            and: [ a = other a and: [ b = other b and: [ c = other c and: [ d = other d ] ] ] ]
+    ]
+    hash [ ^((a * 256 + b) * 256 + c) * 256 + d ]
+    printOn: aStream [
+        aStream nextPutAll: a printString, '.', b printString, '.',
+            c printString, '.', d printString
+    ]
+]
+
+"I am a BSD socket wrapped as an object — the general escape hatch for any
+ (domain, type, protocol), including SOCK_RAW (which the OS gates behind
+ root: I then wrap a negative fd and answer isOpen = false, errno readable
+ via Posix errno). Bind me with bindTo:port:, connect with connectTo:port:,
+ move bytes with send:/receiveInto: (connected) or sendTo:port:data:/receive
+ (datagram, answering the peer), tune me with option:level:name:put: /
+ optionLevel:name:, and hand my fd to an IoWorker for non-blocking
+ multiplexing. Every operation answers a value; I never raise. Close me
+ with close (my lifecycle is explicit, like every native resource here)."
+Object subclass: Socket [
+    | fd buf |
+
+    "The general constructor: any domain/type/protocol. A negative fd means
+     the OS refused (errno readable) — e.g. SOCK_RAW without privilege."
+    Socket class >> domain: d type: t protocol: p [
+        ^self basicNew setFd: (Posix socketDomain: d type: t protocol: p)
+    ]
+    "Wrap an already-open fd (e.g. one accepted by an IoWorker)."
+    Socket class >> onFd: anFd [ ^self basicNew setFd: anFd ]
+    "SOCK_RAW convenience — honestly named. EPERM without root."
+    Socket class >> rawInetProtocol: p [
+        ^self domain: Posix afInet type: Posix sockRaw protocol: p
+    ]
+
+    setFd: anFd [
+        fd := anFd.
+        "One page per socket: sockaddr staging + a default I/O area. Only
+         allocated for an actually-open socket (a refused fd needs none)."
+        anFd >= 0 ifTrue: [ buf := NativeBuffer page ].
+        ^self
+    ]
+    fd [ ^fd ]
+    isOpen [ ^fd notNil and: [ fd >= 0 ] ]
+    buffer [ ^buf ]
+
+    bindTo: anInetAddress port: port [
+        anInetAddress packInto: buf port: port at: 0.
+        ^Posix bind: fd addr: buf address len: 16
+    ]
+    connectTo: anInetAddress port: port [
+        anInetAddress packInto: buf port: port at: 0.
+        ^Posix connect: fd addr: buf address len: 16
+    ]
+    "The kernel-assigned local port after a bind to port 0."
+    localPort [ ^Posix boundPortOf: fd ]
+
+    "── connected I/O (send/recv) ──
+     `aString`'s bytes are staged into my page (GC-stable) then sent;
+     answers the count written, or negative on error."
+    send: aString [
+        | n |
+        n := aString size.
+        1 to: n do: [ :i | buf byteAt: 512 + i - 1 put: (aString basicByteAt: i) ].
+        ^Posix sendFd: fd buf: buf address + 512 len: n flags: 0
+    ]
+    "Receive up to `max` bytes into a fresh String (empty on EOF/error)."
+    receiveUpTo: max [
+        | n s cap |
+        cap := max min: 3072.
+        n := Posix recvFd: fd buf: buf address + 512 len: cap flags: 0.
+        n <= 0 ifTrue: [ ^String new: 0 ].
+        s := String new: n.
+        1 to: n do: [ :i | s basicByteAt: i put: (buf byteAt: 512 + i - 1) ].
+        ^s
+    ]
+
+    "── datagram I/O (sendto/recvfrom) ──"
+    sendTo: anInetAddress port: port data: aString [
+        | n |
+        anInetAddress packInto: buf port: port at: 0.
+        n := aString size.
+        1 to: n do: [ :i | buf byteAt: 512 + i - 1 put: (aString basicByteAt: i) ].
+        ^Posix sendtoFd: fd buf: buf address + 512 len: n flags: 0
+               addr: buf address addrLen: 16
+    ]
+    "Receive one datagram; answer { bytes(String). from(InetAddress). port }
+     — the peer the kernel fills in — or nil on error."
+    receive [
+        | n s |
+        buf u32At: 256 put: 128.        "value-result socklen for the peer sockaddr"
+        n := Posix recvfromFd: fd buf: buf address + 512 len: 3072 flags: 0
+                   addr: buf address + 64 addrLenPtr: buf address + 256.
+        n < 0 ifTrue: [ ^nil ].
+        s := String new: n.
+        1 to: n do: [ :i | s basicByteAt: i put: (buf byteAt: 512 + i - 1) ].
+        ^Array with: s
+               with: (InetAddress fromOctets: (buf sockaddrInOctetsAt: 64))
+               with: (buf sockaddrInPortAt: 64)
+    ]
+
+    "── options (typed as a 4-byte int, the common case) ──"
+    option: anInt level: level name: name put: ignored [
+        buf u32At: 256 put: anInt.
+        ^Posix setsockoptFd: fd level: level name: name val: buf address + 256 len: 4
+    ]
+    setOption: level name: name to: anInt [
+        buf u32At: 256 put: anInt.
+        ^Posix setsockoptFd: fd level: level name: name val: buf address + 256 len: 4
+    ]
+    optionLevel: level name: name [
+        buf u32At: 260 put: 4.          "value-result optlen"
+        (Posix getsockoptFd: fd level: level name: name val: buf address + 256
+               lenPtr: buf address + 260) < 0 ifTrue: [ ^nil ].
+        ^buf u32At: 256
+    ]
+    "Common sugar."
+    reuseAddress: aBoolean [
+        ^self setOption: Posix solSocket name: Posix soReuseaddr
+              to: (aBoolean ifTrue: [ 1 ] ifFalse: [ 0 ])
+    ]
+    receiveBufferSize: n [ ^self setOption: Posix solSocket name: Posix soRcvbuf to: n ]
+
+    shutdown: how [ ^Posix shutdownFd: fd how: how ]
+    close [
+        fd notNil ifTrue: [ (fd >= 0 ifTrue: [ Posix close: fd ]). fd := -1 ].
+        ^self
+    ]
+    printOn: aStream [
+        aStream nextPutAll: self class name, '(fd ', fd printString, ')'
+    ]
+]
+
+"I am a UDP socket: SOCK_DGRAM sugar over Socket. UdpSocket new answers an
+ unbound datagram socket; UdpSocket boundToLoopback binds an ephemeral
+ loopback port (localPort reads it back). Send with sendTo:port:data: and
+ receive one datagram (with its peer) via receive."
+Socket subclass: UdpSocket [
+    UdpSocket class >> new [
+        ^self domain: Posix afInet type: Posix sockDgram protocol: 0
+    ]
+    UdpSocket class >> boundToLoopback [
+        | s |
+        s := self new.
+        s isOpen ifFalse: [ ^s ].
+        s bindTo: InetAddress loopback port: 0.
+        ^s
+    ]
+]
+
+"I am the unprivileged ICMP socket (SOCK_DGRAM + IPPROTO_ICMP — macOS's
+ no-root ping path). I build and checksum echo-request packets myself and
+ parse the IP+ICMP reply. The Ping demo (world/61d) is my worked example.
+ On a platform that refuses even this, new answers a closed socket (errno
+ readable), so I am harmless to load anywhere."
+Socket subclass: IcmpSocket [
+    IcmpSocket class >> new [
+        ^self domain: Posix afInet type: Posix sockDgram protocol: Posix protoIcmp
+    ]
+
+    "Internet checksum (RFC 1071): one's-complement sum of the 16-bit
+     big-endian words of `len` bytes at `off` in my page, folded and
+     complemented. THE core of hand-crafting a checksummed protocol."
+    checksumAt: off len: len [
+        | sum i |
+        sum := 0. i := 0.
+        [ i + 1 < len ] whileTrue: [
+            sum := sum + ((buf byteAt: off + i) * 256 + (buf byteAt: off + i + 1)).
+            i := i + 2 ].
+        i < len ifTrue: [ sum := sum + ((buf byteAt: off + i) * 256) ].
+        [ sum > 65535 ] whileTrue: [ sum := (sum bitAnd: 65535) + (sum bitShift: -16) ].
+        ^(sum bitXor: 65535) bitAnd: 65535
+    ]
+
+    "Stage an 8-byte ICMP echo request (type 8, code 0, id, seq, no payload)
+     at page offset 512 and checksum it. The kernel rewrites the id for a
+     DGRAM socket, so `id` is advisory. Answers the packet length (8)."
+    buildEchoId: id seq: seq [
+        | off cksum |
+        off := 512.
+        buf byteAt: off put: 8. buf byteAt: off + 1 put: 0.
+        buf byteAt: off + 2 put: 0. buf byteAt: off + 3 put: 0.
+        buf byteAt: off + 4 put: id // 256. buf byteAt: off + 5 put: id \\ 256.
+        buf byteAt: off + 6 put: seq // 256. buf byteAt: off + 7 put: seq \\ 256.
+        cksum := self checksumAt: off len: 8.
+        buf byteAt: off + 2 put: cksum // 256.
+        buf byteAt: off + 3 put: cksum \\ 256.
+        ^8
+    ]
+
+    "Send one echo request to `anInetAddress`. Answers the sendto result."
+    sendEchoTo: anInetAddress id: id seq: seq [
+        self buildEchoId: id seq: seq.
+        anInetAddress packInto: buf port: 0 at: 0.
+        ^Posix sendtoFd: fd buf: buf address + 512 len: 8 flags: 0
+               addr: buf address addrLen: 16
+    ]
+
+    "Receive one reply and parse it. macOS hands the FULL IP datagram to a
+     DGRAM-ICMP socket, so skip the IP header ((firstByte & 0x0f) * 4 bytes)
+     to reach the ICMP header. Answers { icmpType. icmpCode. seq } or nil."
+    receiveReply [
+        | n ihl icmp |
+        n := Posix recvfromFd: fd buf: buf address + 1024 len: 2048 flags: 0
+                   addr: 0 addrLenPtr: 0.
+        n < 28 ifTrue: [ ^nil ].
+        ihl := ((buf byteAt: 1024) bitAnd: 15) * 4.
+        icmp := 1024 + ihl.
+        ^Array with: (buf byteAt: icmp)
+               with: (buf byteAt: icmp + 1)
+               with: ((buf byteAt: icmp + 6) * 256 + (buf byteAt: icmp + 7))
+    ]
+    IcmpSocket class >> echoReplyType [ ^0 ]
+    IcmpSocket class >> echoRequestType [ ^8 ]
+]

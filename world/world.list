@@ -123,6 +123,13 @@
 # game pane (two-tone signal synthesized by vector ops, split-complex FFT
 # per frame, 128-bin magnitude bars; arrows steer the manual tone).
 61b_fftscope.mst
+# Granular sockets: the full BSD socket surface as first-class Smalltalk —
+# UDP datagrams, arbitrary addresses, socket options, hand-crafted ICMP
+# (docs/sockets_design.md). Zero new Rust, on world/61's Posix bindings.
+61c_sockets.mst
+# Ping: a real unprivileged ICMP ping built entirely in Smalltalk — the
+# worked example for the sockets layer (checksum + packet crafted by hand).
+61d_ping.mst
 62_ioworker.mst
 62a_iostreams.mst
 

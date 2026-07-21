@@ -1,0 +1,111 @@
+"47_socket_tests.mst — SocketTests: the gate for the granular-sockets layer
+ (world/61c + 61d, docs/sockets_design.md). Everything is headless and
+ loopback-only — UDP over 127.0.0.1 and a loopback ICMP ping — so it runs
+ in the ordinary it_world gate with no network egress and no firewall
+ prompt. Proves: address parse/pack, UDP datagram round-trip with peer
+ recovery, socket options, and a hand-crafted ICMP echo actually pinging
+ the loopback interface."
+
+TestCase subclass: SocketTests [
+    runAll [
+        self runTest: #testInetAddressParseFormat do: [ self testInetAddressParseFormat ].
+        self runTest: #testUdpRoundTripRecoversPeer do: [ self testUdpRoundTripRecoversPeer ].
+        self runTest: #testSetAndGetSocketOption do: [ self testSetAndGetSocketOption ].
+        self runTest: #testChecksumIsOnesComplement do: [ self testChecksumIsOnesComplement ].
+        self runTest: #testLoopbackPingRoundTrips do: [ self testLoopbackPingRoundTrips ].
+        self runTest: #testRawSocketRefusedIsAValueNotACrash do: [ self testRawSocketRefusedIsAValueNotACrash ].
+    ]
+
+    testInetAddressParseFormat [
+        | a |
+        a := InetAddress fromString: '192.168.1.10'.
+        self assert: a octets = #(192 168 1 10).
+        self assert: a printString = '192.168.1.10'.
+        self assert: InetAddress loopback printString = '127.0.0.1'.
+        self assert: (InetAddress a: 10 b: 0 c: 0 d: 1) = (InetAddress fromString: '10.0.0.1').
+        "Malformed input answers nil (errors are values), never raises."
+        self assert: (InetAddress fromString: '1.2.3') isNil.
+        self assert: (InetAddress fromString: '1.2.3.999') isNil.
+        self assert: (InetAddress fromString: 'not.an.ip.addr') isNil.
+    ]
+
+    "A datagram round-trip: the server receives the exact bytes AND the
+     kernel-filled peer sockaddr yields the client's own address and its
+     ephemeral source port."
+    testUdpRoundTripRecoversPeer [
+        | srv cli got |
+        srv := UdpSocket boundToLoopback.
+        self assert: srv isOpen.
+        self assert: srv localPort > 0.
+        cli := UdpSocket new.
+        self assert: (cli sendTo: InetAddress loopback port: srv localPort data: 'PING123') = 7.
+        got := srv receive.
+        self assert: got notNil.
+        self assert: (got at: 1) = 'PING123'.
+        self assert: (got at: 2) = InetAddress loopback.
+        self assert: (got at: 3) > 0.               "the client's ephemeral port"
+        srv close. cli close.
+        self assert: srv isOpen not.
+    ]
+
+    testSetAndGetSocketOption [
+        | s |
+        s := UdpSocket new.
+        self assert: (s reuseAddress: true) = 0.
+        "getsockopt's boolean contract is nonzero = enabled (macOS returns
+         an internal flag value, not normalized to 1); 0 = disabled."
+        self assert: (s optionLevel: Posix solSocket name: Posix soReuseaddr) ~= 0.
+        self assert: (s reuseAddress: false) = 0.
+        self assert: (s optionLevel: Posix solSocket name: Posix soReuseaddr) = 0.
+        "Bumping the receive buffer: the kernel may round the value, so
+         only assert it is at least what we asked (a real setsockopt path)."
+        s receiveBufferSize: 65536.
+        self assert: (s optionLevel: Posix solSocket name: Posix soRcvbuf) >= 65536.
+        s close.
+    ]
+
+    "The internet checksum of a known packet — the primitive every
+     hand-crafted protocol needs. An 8-byte echo request with checksum
+     field zeroed, then the checksum re-summed WITH the field, must fold
+     to zero (the RFC 1071 self-check)."
+    testChecksumIsOnesComplement [
+        | s buf c |
+        s := IcmpSocket new.
+        s isOpen ifFalse: [ ^self ].            "platform without unpriv ICMP: skip"
+        s buildEchoId: 4660 seq: 1.
+        buf := s buffer.
+        "Re-summing a checksummed packet (including its checksum word)
+         yields 0 — the classic receiver-side validation."
+        c := s checksumAt: 512 len: 8.
+        self assert: c = 0.
+        s close.
+    ]
+
+    "A real ping: craft the echo request, send it to 127.0.0.1 over the
+     unprivileged ICMP socket, parse the IP+ICMP reply, confirm it is an
+     echo reply. This is the whole point of the feature."
+    testLoopbackPingRoundTrips [
+        | s rc reply |
+        s := IcmpSocket new.
+        s isOpen ifFalse: [ ^self ].            "skip where the OS refuses it"
+        rc := s sendEchoTo: InetAddress loopback id: 4660 seq: 7.
+        self assert: rc = 8.
+        reply := s receiveReply.
+        self assert: reply notNil.
+        self assert: (reply at: 1) = IcmpSocket echoReplyType.    "type 0 = echo reply"
+        self assert: (reply at: 3) = 7.                            "our sequence back"
+        s close.
+    ]
+
+    "SOCK_RAW is OS-gated behind root: unprivileged, the constructor must
+     answer a CLOSED socket with errno readable — a value, never a crash."
+    testRawSocketRefusedIsAValueNotACrash [
+        | s |
+        s := Socket rawInetProtocol: Posix protoIcmp.
+        "Either it opened (running privileged — fine) or it is cleanly
+         closed with a nonzero errno. Never a raise, never a wild fd."
+        s isOpen
+            ifTrue: [ self assert: s fd >= 0. s close ]
+            ifFalse: [ self assert: s fd < 0. self assert: Posix errno > 0 ].
+    ]
+]
