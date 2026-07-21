@@ -4,20 +4,23 @@
 //! integer/pointer, `f` float/double, `v` void — docs/FFI.md §1's token
 //! vocabulary), not one per call site and not one per exact argument-class
 //! sequence: each trampoline unconditionally loads a FIXED 8 GPR argument
-//! slots (`x0..x7`) and 8 FPR argument slots (`d0..d7`) from two marshaled
-//! buffers before the call. This is sound under AAPCS64 regardless of how
-//! many of those slots the real callee's own C signature actually declares
-//! — a function reads only the registers its own prototype names, so
+//! slots (`x0..x7`) and 8 FPR argument slots (`d0..d7`), and SPILLS a
+//! further fixed 8 integer-class slots to the stack (`[sp, #0..56]`,
+//! AAPCS64's home for integer args 9+ — the A3 stack-spill tier,
+//! docs/accelerate_design.md U2, which is what makes `vDSP_mmulD` and
+//! `cblas_dgemm` callable), all from two marshaled buffers before the
+//! call. This is sound under AAPCS64 regardless of how many of those slots
+//! the real callee's own C signature actually declares — a function reads
+//! only the registers and stack words its own prototype names, so
 //! supplying extra (unread) argument words in unused slots is always
 //! harmless, the same reasoning any general-purpose FFI (libffi, `ctypes`)
 //! relies on internally. This collapses what would otherwise be a
 //! combinatorial "one trampoline per (g-count, f-count, interleaving)"
 //! problem down to exactly 3 fixed blobs, covering every real POSIX
-//! function this sprint's Tier 1 slice needs (docs/FFI.md §6.3's
-//! `open`/`read`/`write`/`close`/`mmap` are all ≤6 `g` args) and every
-//! plain-numeric Cocoa method besides (HFA/struct-by-value shapes — `h2`
-//! `h3` `h4` `i1` `i2` `b` `s` — are Tier 2's problem, deferred: S20 step
-//! 7 / docs/FFI.md §3).
+//! function (≤6 `g` args), every plain-numeric Cocoa method, and BLAS/
+//! LAPACK drivers up to `METHOD_ARGC_MAX` total args (HFA/struct-by-value
+//! shapes — `h2` `h3` `h4` `i1` `i2` `b` `s` — remain Tier 2's problem,
+//! deferred: S20 step 7 / docs/FFI.md §3).
 //!
 //! Deliberately NOT anchored the way `codecache::stubs`'s runtime-stub
 //! table is (`VMREG_LAST_COMPILED_FP_OFFSET` etc.): those trampolines are
@@ -29,24 +32,36 @@
 //! ever runs, so no MACVM heap object is reachable only through a register
 //! this code touches. No `VmState` involved at all.
 
-use crate::compiler::assembler::{d, mem, mem_post, mem_pre, sp, x, Assembler, CodeBlob};
+use crate::compiler::assembler::{d, imm, mem, mem_post, mem_pre, sp, x, Assembler, CodeBlob};
 use crate::compiler::jasm_assembler::JasmAssembler;
 
 use super::{CodeCache, CodeHandle};
 
 /// Every FFI trampoline's own Rust-side signature: `target` is the resolved
-/// native function address (S20 step 1's `dlsym_resolve`); `argv_g`/`argv_f`
-/// each point at exactly 8 `u64` words — `argv_g[i]` is the `i`th GPR
-/// argument's raw bits (an integer, a pointer, or a `bool`/`char` widened to
-/// 64 bits — all `g`-class per docs/FFI.md §1), `argv_f[i]` is the `i`th FPR
-/// argument's `f64::to_bits()` (an `f32` is widened to `f64` bits by the
-/// caller — AAPCS64 passes it in the LOW 32 bits of the SAME `d`-register a
-/// double would use, so this one shape covers both). The returned `u64` is
-/// the raw result: `ret_g` callers use it directly (or narrow/widen per the
-/// real return type), `ret_f` callers apply `f64::from_bits`, `ret_v`
-/// callers ignore it.
+/// native function address (S20 step 1's `dlsym_resolve`); `argv_g` points
+/// at exactly [`ARGV_G_WORDS`] (16) `u64` words and `argv_f` at exactly 8 —
+/// `argv_g[i]` is the `i`th integer-class argument's raw bits (an integer,
+/// a pointer, or a `bool`/`char` widened to 64 bits — all `g`-class per
+/// docs/FFI.md §1), `argv_f[i]` is the `i`th FPR argument's
+/// `f64::to_bits()` (an `f32` is widened to `f64` bits by the caller —
+/// AAPCS64 passes it in the LOW 32 bits of the SAME `d`-register a double
+/// would use, so this one shape covers both). g-args 0..8 load into
+/// `x0..x7`; g-args 8..16 SPILL TO THE STACK per AAPCS64 (`[sp, #0..56]`
+/// at call time) — the A3 unlock (docs/accelerate_design.md U2) that makes
+/// `vDSP_mmulD` (9 g) and `cblas_dgemm` (12 g + 2 f) callable. The
+/// returned `u64` is the raw result: `ret_g` callers use it directly (or
+/// narrow/widen per the real return type), `ret_f` callers apply
+/// `f64::from_bits`, `ret_v` callers ignore it.
 pub type FfiCallFn =
     unsafe extern "C" fn(target: u64, argv_g: *const u64, argv_f: *const u64) -> u64;
+
+/// The g-argument buffer's fixed word count: 8 register slots plus 8
+/// stack-spilled slots. One uniform shape for every call (the ~16 extra
+/// instructions the spill costs a small call are noise next to the native
+/// call itself), so there is no second trampoline family and no per-call
+/// shape decision. Bounded comfortably above `METHOD_ARGC_MAX` (15), the
+/// real arity ceiling any pragma can declare.
+pub const ARGV_G_WORDS: usize = 16;
 
 /// The 3 published trampolines' own addresses, installed once at VM
 /// startup (mirrors `codecache::stubs::Stubs`'s own shape).
@@ -94,15 +109,16 @@ impl FfiStubs {
     }
 
     /// Convenience wrapper mirroring `Stubs::invoke` — resolves the right
-    /// trampoline for `ret_class` and calls through it. `argv_g`/`argv_f`
-    /// are always exactly 8 words (unused trailing slots may hold any
-    /// value at all, per this module's own doc — never read by a callee
-    /// whose own C signature doesn't declare that many arguments).
+    /// trampoline for `ret_class` and calls through it. `argv_g` is always
+    /// exactly [`ARGV_G_WORDS`] words and `argv_f` exactly 8 (unused
+    /// trailing slots may hold any value at all, per this module's own doc
+    /// — never read by a callee whose own C signature doesn't declare that
+    /// many arguments).
     pub fn invoke(
         &self,
         ret_class: FfiRetClass,
         target: u64,
-        argv_g: &[u64; 8],
+        argv_g: &[u64; ARGV_G_WORDS],
         argv_f: &[u64; 8],
     ) -> u64 {
         let entry = self.addr_for(ret_class);
@@ -130,6 +146,19 @@ fn emit_ffi_prologue(a: &mut JasmAssembler) {
     a.emit("mov", &[x(10), x(1)]); // argv_g
     a.emit("mov", &[x(11), x(2)]); // argv_f
 
+    // Stack-spilled g args (A3/U2): AAPCS64 places integer args 9+ at
+    // `[sp, #0], [sp, #8], …` at call time — carve 64 bytes (16-byte
+    // aligned already) and copy argv_g[8..16] down. Unconditional for
+    // every call, same reasoning as the fixed 8-register loads below: a
+    // callee only reads the stack words its own prototype names, so
+    // supplying extras is harmless, and ONE shape beats a per-arity
+    // trampoline family.
+    a.emit("sub", &[sp(), sp(), imm(64)]);
+    for i in 8u8..16 {
+        a.emit("ldr", &[x(12), mem(10, 8 * i as i64)]);
+        a.emit("str", &[x(12), mem(31, 8 * (i as i64 - 8))]);
+    }
+
     // GPR args: x0..x7 <- argv_g[0..8].
     for i in 0u8..8 {
         a.emit("ldr", &[x(i), mem(10, 8 * i as i64)]);
@@ -144,6 +173,9 @@ fn emit_ffi_prologue(a: &mut JasmAssembler) {
 }
 
 fn emit_ffi_epilogue(a: &mut JasmAssembler) {
+    // Release the stack-spill area BEFORE restoring fp/lr (the prologue
+    // carved it after the stp, so tear down in reverse).
+    a.emit("add", &[sp(), sp(), imm(64)]);
     a.emit("ldp", &[x(29), x(30), mem_post(31, 16)]);
     a.emit("ret", &[]);
 }
@@ -230,7 +262,7 @@ mod tests {
         let mut cache = test_cache();
         let stubs = install(&mut cache);
         let want = unsafe { getpid() };
-        let got = stubs.invoke(FfiRetClass::G, getpid as *const () as u64, &[0; 8], &[0; 8]);
+        let got = stubs.invoke(FfiRetClass::G, getpid as *const () as u64, &[0; ARGV_G_WORDS], &[0; 8]);
         assert_eq!(got as i32, want);
     }
 
@@ -245,12 +277,56 @@ mod tests {
         }
         let mut cache = test_cache();
         let stubs = install(&mut cache);
-        let argv_g: [u64; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
+        let mut argv_g = [0u64; ARGV_G_WORDS];
+        argv_g[..8].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
         let got = stubs.invoke(FfiRetClass::G, sum8 as *const () as u64, &argv_g, &[0; 8]);
         assert_eq!(
             got,
             1 + 20 + 300 + 4000 + 50000 + 600000 + 7000000 + 80000000
         );
+    }
+
+    /// The A3 stack-spill tier (docs/accelerate_design.md U2): args 9+
+    /// pass on the STACK per AAPCS64. A real 12-integer-arg callee proves
+    /// both halves land — distinct positional weights make any swapped,
+    /// dropped, or mis-offset slot (register OR stack) change the sum. A
+    /// mixed g/f callee below it proves the spill leaves the FPR path and
+    /// the 16-byte stack alignment intact (a misaligned sp would fault or
+    /// corrupt the varargs-free callee's own frame).
+    #[test]
+    fn ret_g_spills_stack_args_nine_and_beyond() {
+        extern "C" fn sum12(
+            a: u64, b: u64, c: u64, d: u64, e: u64, f: u64, g: u64, h: u64,
+            i: u64, j: u64, k: u64, l: u64,
+        ) -> u64 {
+            a + b * 2 + c * 4 + d * 8 + e * 16 + f * 32 + g * 64 + h * 128
+                + i * 256 + j * 512 + k * 1024 + l * 2048
+        }
+        let mut cache = test_cache();
+        let stubs = install(&mut cache);
+        let mut argv_g = [0u64; ARGV_G_WORDS];
+        for (n, slot) in argv_g.iter_mut().take(12).enumerate() {
+            *slot = (n + 1) as u64;
+        }
+        let got = stubs.invoke(FfiRetClass::G, sum12 as *const () as u64, &argv_g, &[0; 8]);
+        let want: u64 = (0..12u64).map(|n| (n + 1) << n).sum();
+        assert_eq!(got, want, "a register or stack slot landed wrong");
+
+        extern "C" fn mixed(
+            a: u64, b: u64, c: u64, d: u64, e: u64, f: u64, g: u64, h: u64,
+            i: u64, j: u64, x: f64, y: f64,
+        ) -> u64 {
+            a + b + c + d + e + f + g + h + i * 100 + j * 1000 + ((x * y) as u64)
+        }
+        let mut argv_g = [0u64; ARGV_G_WORDS];
+        for (n, slot) in argv_g.iter_mut().take(10).enumerate() {
+            *slot = (n + 1) as u64;
+        }
+        let mut argv_f = [0u64; 8];
+        argv_f[0] = 2.5f64.to_bits();
+        argv_f[1] = 4.0f64.to_bits();
+        let got = stubs.invoke(FfiRetClass::G, mixed as *const () as u64, &argv_g, &argv_f);
+        assert_eq!(got, (1 + 2 + 3 + 4 + 5 + 6 + 7 + 8) + 900 + 10000 + 10);
     }
 
     /// FPR args: the `fmov`-via-GPR path (this module's own doc rationale)
@@ -266,7 +342,7 @@ mod tests {
         }
         let mut cache = test_cache();
         let stubs = install(&mut cache);
-        let mut argv_g = [0u64; 8];
+        let mut argv_g = [0u64; ARGV_G_WORDS];
         argv_g[0] = 7; // a
         argv_g[1] = 2; // b
         let mut argv_f = [0u64; 8];
@@ -295,7 +371,7 @@ mod tests {
         let mut cache = test_cache();
         let stubs = install(&mut cache);
         let mut cell: u64 = 0;
-        let mut argv_g = [0u64; 8];
+        let mut argv_g = [0u64; ARGV_G_WORDS];
         argv_g[0] = &mut cell as *mut u64 as u64;
         argv_g[1] = 0xDEAD_BEEF;
         stubs.invoke(
@@ -319,7 +395,9 @@ mod tests {
         }
         let mut cache = test_cache();
         let stubs = install(&mut cache);
-        let argv_g: [u64; 8] = [10, 20, 0xBAD, 0xBAD, 0xBAD, 0xBAD, 0xBAD, 0xBAD];
+        let mut argv_g = [0xBADu64; ARGV_G_WORDS];
+        argv_g[0] = 10;
+        argv_g[1] = 20;
         let argv_f: [u64; 8] = [0xBAD; 8];
         let got = stubs.invoke(FfiRetClass::G, add2 as *const () as u64, &argv_g, &argv_f);
         assert_eq!(got, 30);

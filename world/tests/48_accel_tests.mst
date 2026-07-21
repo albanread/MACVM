@@ -15,6 +15,47 @@ TestCase subclass: AccelTests [
         self runTest: #testCopyBridges do: [ self testCopyBridges ].
         self runTest: #testScopedFormFrees do: [ self testScopedFormFrees ].
         self runTest: #testIndirectAlienZeroTail do: [ self testIndirectAlienZeroTail ].
+        self runTest: #testMatrixMultiplyThroughStackSpill do: [ self testMatrixMultiplyThroughStackSpill ].
+        self runTest: #testDgemmAlphaBetaMixesFprAndSpill do: [ self testDgemmAlphaBetaMixesFprAndSpill ].
+    ]
+
+    "vDSP_mmulD is 9 integer args — the first kernel through the
+     trampoline's stack-spill tier. A 2x3 x 3x2 product with distinct
+     entries: any mis-spilled dimension or address changes the numbers."
+    testMatrixMultiplyThroughStackSpill [
+        | a b c |
+        a := NativeMatrix rows: 2 columns: 3 from: #(1 2 3 4 5 6).
+        b := NativeMatrix rows: 3 columns: 2 from: #(7 8 9 10 11 12).
+        c := NativeMatrix rows: 2 columns: 2.
+        Accel mmulD: a data address s: 1 b: b data address s2: 1
+              c: c data address s3: 1 m: 2 n: 2 p: 3.
+        self assert: (c at: 1 at: 1) = 58.0.
+        self assert: (c at: 1 at: 2) = 64.0.
+        self assert: (c at: 2 at: 1) = 139.0.
+        self assert: (c at: 2 at: 2) = 154.0.
+        a free. b free. c free.
+    ]
+
+    "cblas_dgemm: 12 integer + 2 double args — registers, stack spill AND
+     FPR passing in one call. alpha=1/beta=0 gives the plain product;
+     alpha=2/beta=1 over a pre-filled C proves the two doubles genuinely
+     arrive (a dropped alpha or beta changes every entry)."
+    testDgemmAlphaBetaMixesFprAndSpill [
+        | a b c |
+        a := NativeMatrix rows: 2 columns: 3 from: #(1 2 3 4 5 6).
+        b := NativeMatrix rows: 3 columns: 2 from: #(7 8 9 10 11 12).
+        c := NativeMatrix rows: 2 columns: 2.
+        a mm: b into: c.
+        self assert: (c at: 1 at: 1) = 58.0.
+        self assert: (c at: 2 at: 2) = 154.0.
+        c at: 1 at: 1 put: 1. c at: 1 at: 2 put: 1.
+        c at: 2 at: 1 put: 1. c at: 2 at: 2 put: 1.
+        a mm: b into: c scaledBy: 2 plus: 1.
+        self assert: (c at: 1 at: 1) = 117.0.
+        self assert: (c at: 1 at: 2) = 129.0.
+        self assert: (c at: 2 at: 1) = 279.0.
+        self assert: (c at: 2 at: 2) = 309.0.
+        a free. b free. c free.
     ]
 
     close: a to: b [

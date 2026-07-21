@@ -179,7 +179,7 @@ pub(crate) fn dispatch_ffi_primitive(vm: &mut VmState, m: MethodOop, argc: u8) -
     // `1..=argc` are the real arguments, in declared order.
     let base = vm.stack.sp - argc_usize - 1;
 
-    let mut argv_g = [0u64; 8];
+    let mut argv_g = [0u64; crate::codecache::ffi_stubs::ARGV_G_WORDS];
     let mut argv_f = [0u64; 8];
     let mut next_g = 0usize;
     let mut next_f = 0usize;
@@ -196,24 +196,17 @@ pub(crate) fn dispatch_ffi_primitive(vm: &mut VmState, m: MethodOop, argc: u8) -
                     return PrimitiveOutcome::Fallthrough;
                 };
                 if next_g >= argv_g.len() {
-                    // More than 8 "g"-class arguments — no trampoline
-                    // slot left (ffi_stubs.rs's fixed 8-GPR register
-                    // load; AAPCS64 puts args 9+ on the STACK, which the
-                    // trampoline does not spill yet — the Accelerate
-                    // design's U2 unlock, docs/accelerate_design.md).
-                    // This used to Fallthrough — but on an empty-bodied
-                    // pragma method that answers the receiver and looks
-                    // exactly like quiet success (found live probing
-                    // vDSP_mmulD, 9 g args, which silently no-opped).
-                    // Guest-fatal per this module's error policy: the
-                    // pragma is guest source, so the mistake costs the
-                    // doit, never the host.
+                    // More than ARGV_G_WORDS (16) "g"-class arguments.
+                    // Since the A3 stack-spill tier (args 9..16 pass on
+                    // the stack — docs/accelerate_design.md U2) this is
+                    // unreachable from real source: METHOD_ARGC_MAX (15)
+                    // caps a pragma's total arity below the buffer.
+                    // Defensive and loud all the same.
                     crate::runtime::error::guest_fatal(
                         vm,
                         format!(
-                            "FFI: function {name:?} declares more than 8 integer/pointer \
-                             (\"g\") args — args 9+ pass on the stack, which the trampoline \
-                             does not support yet (docs/accelerate_design.md U2)"
+                            "FFI: function {name:?} declares more than 16 integer/pointer \
+                             (\"g\") args — beyond even the stack-spill tier's buffer"
                         ),
                     );
                 }

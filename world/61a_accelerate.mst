@@ -144,6 +144,21 @@ Object subclass: Accel [
         <primitive: FFI function: #vDSP_meanvD ret: #v args: #(g g g g)>
     ]
 
+    "── matrix kernels (>8 integer args — the trampoline's stack-spill
+     tier carries args 9+ per AAPCS64) ──"
+    "vDSP_mmulD(A, IA, B, IB, C, IC, M, N, P): row-major C[MxN] = A[MxP] x B[PxN]"
+    Accel class >> mmulD: a s: sa b: b s2: sb c: c s3: sc m: m n: n p: p [
+        <primitive: FFI function: #vDSP_mmulD ret: #v args: #(g g g g g g g g g)>
+    ]
+    "cblas_dgemm(Order, TransA, TransB, M, N, K, alpha, A, lda, B, ldb,
+     beta, C, ldc): C = alpha*A*B + beta*C. Order 101 = row-major,
+     trans 111 = none. 12 integer + 2 double args — the full BLAS-3
+     workhorse, mixing the stack-spill tier with FPR passing."
+    Accel class >> dgemmOrder: o transA: ta transB: tb m: m n: n k: k
+        alpha: alpha a: a lda: lda b: b ldb: ldb beta: beta c: c ldc: ldc [
+        <primitive: FFI function: #cblas_dgemm ret: #v args: #(g g g g g g f g g g g f g g)>
+    ]
+
     "── vForce transcendentals (the count passes BY POINTER, a C int) ──"
     "vvexp(y, x, &n): y = e^x"
     Accel class >> vvexpY: y x: x nPtr: np [
@@ -413,4 +428,85 @@ Object subclass: NativeFloatArray [
 "FloatArray reopened: the copy bridge into the native tier."
 ArrayedCollection subclass: FloatArray [
     asNative [ ^NativeFloatArray from: self ]
+]
+
+"I am a dense row-major matrix of double-precision floats, stored in a
+ NativeFloatArray so Accelerate's matrix kernels work on my data directly.
+ Create me with NativeMatrix rows:columns: (zeroed) or rows:columns:from:
+ (row-major initial values); index with at:at: / at:at:put: (row, column,
+ both 1-based). My headline operation is mm:into: — C := self x B, real
+ BLAS-3 (cblas_dgemm) — plus mm:into:scaledBy:plus: for the full
+ C := alpha*A*B + beta*C form, transposed for A-transposed products, and
+ the elementwise/reduction protocol of my underlying rows (data answers
+ the NativeFloatArray). Free me with free (or build inside
+ NativeMatrix rows:columns:do: for scoped release); like every native
+ resource here my lifecycle is explicit."
+Object subclass: NativeMatrix [
+    | rows cols data |
+
+    NativeMatrix class >> rows: m columns: n [
+        ^self basicNew setRows: m columns: n data: (NativeFloatArray lanes: m * n)
+    ]
+    NativeMatrix class >> rows: m columns: n from: aCollection [
+        | mat i |
+        aCollection size = (m * n) ifFalse: [ ^self error: 'need exactly rows*columns values' ].
+        mat := self rows: m columns: n.
+        i := 1.
+        aCollection do: [ :x | mat data at: i put: x asDouble. i := i + 1 ].
+        ^mat
+    ]
+    NativeMatrix class >> rows: m columns: n do: aBlock [
+        | mat |
+        mat := self rows: m columns: n.
+        ^[ aBlock value: mat ] ensure: [ mat free ]
+    ]
+
+    setRows: m columns: n data: d [
+        rows := m. cols := n. data := d. ^self
+    ]
+    rows [ ^rows ]
+    columns [ ^cols ]
+    data [ ^data ]
+    free [ data free. ^self ]
+    isFreed [ ^data isFreed ]
+
+    at: r at: c [
+        ((r between: 1 and: rows) and: [ c between: 1 and: cols ])
+            ifFalse: [ ^self error: 'index out of bounds' ].
+        ^data at: ((r - 1) * cols) + c
+    ]
+    at: r at: c put: aNumber [
+        ((r between: 1 and: rows) and: [ c between: 1 and: cols ])
+            ifFalse: [ ^self error: 'index out of bounds' ].
+        ^data at: ((r - 1) * cols) + c put: aNumber
+    ]
+
+    "C := self x b — the plain matrix product (dgemm, alpha 1 beta 0).
+     self is M x K, b is K x N, c must be M x N."
+    mm: b into: c [
+        ^self mm: b into: c scaledBy: 1.0 plus: 0.0
+    ]
+    "The full BLAS form: c := (alpha * self * b) + (beta * c)."
+    mm: b into: c scaledBy: alpha plus: beta [
+        rows = c rows ifFalse: [ ^self error: 'result rows mismatch' ].
+        b columns = c columns ifFalse: [ ^self error: 'result columns mismatch' ].
+        cols = b rows ifFalse: [ ^self error: 'inner dimensions mismatch' ].
+        Accel dgemmOrder: 101 transA: 111 transB: 111
+              m: rows n: b columns k: cols
+              alpha: alpha asDouble
+              a: data address lda: cols
+              b: b data address ldb: b columns
+              beta: beta asDouble
+              c: c data address ldc: c columns.
+        ^c
+    ]
+
+    printOn: aStream [
+        aStream nextPutAll: 'NativeMatrix('.
+        data isFreed
+            ifTrue: [ aStream nextPutAll: 'freed' ]
+            ifFalse: [
+                aStream nextPutAll: rows printString, 'x', cols printString ].
+        aStream nextPutAll: ')'.
+    ]
 ]
