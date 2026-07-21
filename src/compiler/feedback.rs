@@ -185,23 +185,54 @@ pub(crate) fn resolve_method_ro(
 /// `Untaken → Mono`, and a guard storm is `Mono → Poly` — both tag-visible).
 /// A klass-set-preserving change (same-tag re-targeting) is invisible here,
 /// but redefinition already invalidates through the dependency index.
-pub fn snapshot_profile(_vm: &VmState, method: MethodOop) -> u64 {
+pub fn snapshot_profile(vm: &VmState, method: MethodOop) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325; // FNV-1a offset basis
-    snapshot_into(method, &mut h, 0);
+    let mut visited: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    snapshot_into(vm, method, &mut h, 0, &mut visited);
     h
 }
 
+/// How deep to follow grafted callee methods when snapshotting. The inliner
+/// grafts a bounded proto-chain (a depth-3 blockarg chain is the deepest it
+/// builds); the visited-set below already makes the walk terminating, so this
+/// cap only stops a deep-but-acyclic call graph from making the storm-check
+/// snapshot needlessly expensive. One past the observed graft depth for slack.
+const GRAFT_SNAPSHOT_DEPTH: u8 = 4;
+
 /// One method's (or block's) send-IC states folded into `h`, recursing into
-/// literal blocks (S24 B5 5b): a compile GRAFTS block bodies inline and reads
-/// THEIR ICs for lowering decisions, so a trap inside a grafted block that
-/// warms only the block's own IC must still flip the profile hash — before
-/// this, `note_uncommon_trap` hashed the root method alone and declined the
-/// recompile forever ("profile unchanged"), a permanent deopt storm on
-/// deltablue's constraintsConsuming:do: once multi-BB blockarg splicing
-/// landed. `depth` seeds each nesting level so identical IC layouts at
-/// different levels don't cancel.
-fn snapshot_into(method: MethodOop, h: &mut u64, depth: u8) {
+/// everything a compile GRAFTS inline — literal blocks (S24 B5 5b) AND the
+/// Mono/Poly callee METHODS the inliner devirtualizes (2026-07). The compiler
+/// reads a grafted callee's ICs for its lowering decisions, so a trap inside a
+/// grafted callee that warms only THAT callee's IC must still flip the profile
+/// hash — otherwise `note_uncommon_trap` hashes the root method alone, sees no
+/// change, and declines the recompile FOREVER ("profile unchanged"). That was
+/// a permanent deopt storm across deltablue (`Dictionary>>at:` grafts
+/// `scanFor:`, whose `probe = key` goes nil→Symbol poly; `markInputs:` grafts
+/// `inputsDo:`; `recalculate` grafts the constraint accessors) — ~500
+/// bail-to-interpreter traps per run that could never heal. Block recursion
+/// (B5 5b) already covered grafted BLOCKS; this covers grafted METHODS the
+/// same way.
+///
+/// `read_send_site` gives the grafted target(s) exactly as the inliner sees
+/// them (Mono → the one method, Poly → the dominant + fallback cases). The
+/// `visited` set (method identity) makes mutual/self recursion terminate and
+/// dedups a method reached by two grafted paths; the depth cap bounds the
+/// rest. `depth` seeds each level so identical IC layouts at different levels
+/// don't cancel.
+fn snapshot_into(
+    vm: &VmState,
+    method: MethodOop,
+    h: &mut u64,
+    depth: u8,
+    visited: &mut std::collections::HashSet<u64>,
+) {
     use crate::interpreter::ic::{ic_state, IcState};
+    // Terminating: a method (or block) reached again — via a cycle or a second
+    // grafted path — was already folded in; skip it. Bytecode-order traversal
+    // is deterministic, so the hash is a stable function of the reachable set.
+    if !visited.insert(method.oop().raw()) {
+        return;
+    }
     let fnv = |h: &mut u64, byte: u8| {
         *h ^= byte as u64;
         *h = h.wrapping_mul(0x0000_0100_0000_01b3);
@@ -223,10 +254,27 @@ fn snapshot_into(method: MethodOop, h: &mut u64, depth: u8) {
                 fnv(h, ic as u8);
                 fnv(h, (ic >> 8) as u8);
                 fnv(h, tag);
+                // Follow the grafted callee(s) — the inliner devirtualizes a
+                // Mono/Poly site and reads the callee's own feedback, so its
+                // warmed ICs must reach this hash. Mega is a plain dynamic
+                // send (nothing grafted); Untaken has no target yet.
+                if depth < GRAFT_SNAPSHOT_DEPTH {
+                    match read_send_site(vm, method, ic, None) {
+                        SiteFeedback::Mono { method: target, .. } => {
+                            snapshot_into(vm, target, h, depth.saturating_add(1), visited);
+                        }
+                        SiteFeedback::Poly { cases } => {
+                            for c in cases {
+                                snapshot_into(vm, c.method, h, depth.saturating_add(1), visited);
+                            }
+                        }
+                        SiteFeedback::Untaken | SiteFeedback::Mega => {}
+                    }
+                }
             }
             Instr::PushClosure { lit, .. } => {
                 if let Some(blk) = MethodOop::try_from(method.literals().at(lit as usize)) {
-                    snapshot_into(blk, h, depth.saturating_add(1));
+                    snapshot_into(vm, blk, h, depth.saturating_add(1), visited);
                 }
             }
             _ => {}
