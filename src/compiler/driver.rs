@@ -2722,10 +2722,12 @@ fn holder_name_for_log(vm: &VmState, k: KlassOop) -> String {
     crate::runtime::error::name_of(k.name())
 }
 
-/// F1: is frameless EMISSION enabled? `MACVM_FRAMELESS=1`, cached once (the
-/// env-var-on-a-hot-path lesson). Off by default until F2's measurement
-/// holds; F3 retires the flag.
+/// F3 (docs/frameless_leaf_methods.md §5): frameless emission is ON by
+/// default — F2 measured a consistent (if modest, ~2-4% richards) win with
+/// every gate green, and the F1 contract asserts keep an eligibility hole
+/// loud. `MACVM_FRAMELESS=0` is the kill switch (cached once — the
+/// env-var-on-a-hot-path lesson).
 fn frameless_emission_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("MACVM_FRAMELESS").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("MACVM_FRAMELESS").is_none_or(|v| v != "0"))
 }
