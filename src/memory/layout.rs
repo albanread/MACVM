@@ -7,16 +7,31 @@
 //! sprint's own layer-boundary rule.)
 
 /// Default eden size *(tunable via `VmOptions`/`MACVM_EDEN`)* — SPEC §7.1.
-/// 16 MiB (was 4): the Cog-comparison alloc investigation
+/// 32 MiB (was 4, then 16): the Cog-comparison alloc investigation
 /// (`docs/gc_alloc_gap.md`) measured a 4.8 MB fully-live allocation burst —
 /// an ordinary shape (build-then-drop a collection) — overflowing a 4 MiB
 /// eden into the survivor-overflow promote-all cascade: 65% of allocated
 /// bytes promoted, old filled with soon-dead garbage, full GCs. The eden
-/// size matrix (4/8/16/32 MiB → 17/10/5/4 ms on the isolated bench) knees
-/// at 16. Worst-case promotion is still guaranteed by
-/// `ensure_promotion_guarantee` (full-GC-then-grow before every scavenge),
-/// so the change is safety-neutral; the cost is +12 MiB reserved per VM.
-pub const DEFAULT_EDEN_SIZE: usize = 16 << 20;
+/// size matrix (4/8/16/32 MiB → 17/10/5/4 ms on the isolated bench) knees at
+/// 16, but the WINVM head-to-head (`docs/cog_bench.md`) then showed 32 is
+/// what actually *wins* the alloc benchmark outright (~122 scavenges/run at
+/// 4 MiB → 13 at 32) and matches the order of Cog's own default nursery.
+/// Callers size eden through [`default_eden_for`], which caps it at a quarter
+/// of the reservation so tiny test heaps still boot with old-gen headroom.
+/// Worst-case promotion is still guaranteed by `ensure_promotion_guarantee`
+/// (full-GC-then-grow before every scavenge), so the change is safety-neutral;
+/// the cost is +28 MiB reserved per full-size VM.
+pub const DEFAULT_EDEN_SIZE: usize = 32 << 20;
+
+/// The default-eden choice for a reservation of `total_len` bytes:
+/// [`DEFAULT_EDEN_SIZE`], capped at a quarter of the reservation so tiny test
+/// heaps (16 MiB → 4 MiB eden) keep booting with sane old-gen headroom. An
+/// explicit `MACVM_EDEN`/`eden_kb` override bypasses this entirely (and is
+/// honored as-is — an over-large explicit eden fails loud in
+/// [`HeapLayout::new`] rather than being silently shrunk).
+pub fn default_eden_for(total_len: usize) -> usize {
+    DEFAULT_EDEN_SIZE.min(total_len / 4)
+}
 /// Each survivor space's fixed size *(tunable)* — SPEC §7.1.
 pub const SURVIVOR_SIZE: usize = 512 << 10;
 /// Old gen's first committed segment at boot *(tunable, S8 grows further)*;
@@ -152,16 +167,22 @@ mod tests {
 
     #[test]
     fn small_reservation_still_fits_two_survivors() {
-        // A small reservation must still carve both survivors and leave old
-        // non-empty. 32 MiB with the 16 MiB default eden: eden(16) +
-        // from(0.5) + to(0.5) = 17 MiB, leaving 15 MiB for old. (Test heaps
-        // SMALLER than eden+survivors must override MACVM_EDEN, as the
-        // shrink-for-reachability tests already do.)
-        let l = HeapLayout::new(0, 32 << 20, DEFAULT_EDEN_SIZE);
+        // The smallest heap_mib used anywhere in the test suite (16 MiB):
+        // `default_eden_for` caps eden at a quarter (4 MiB), so
+        // eden(4) + from(0.5) + to(0.5) = 5 MiB, leaving 11 MiB for old.
+        let eden = default_eden_for(16 << 20);
+        assert_eq!(eden, 4 << 20);
+        let l = HeapLayout::new(0, 16 << 20, eden);
         assert!(!l.old.is_empty());
-        assert_eq!(
-            l.old.len(),
-            (32 << 20) - DEFAULT_EDEN_SIZE - 2 * SURVIVOR_SIZE
-        );
+        assert_eq!(l.old.len(), (16 << 20) - eden - 2 * SURVIVOR_SIZE);
+    }
+
+    #[test]
+    fn default_eden_scales_with_reservation() {
+        // Big reservations get the full 32 MiB nursery; small ones a quarter.
+        assert_eq!(default_eden_for(256 << 20), DEFAULT_EDEN_SIZE);
+        assert_eq!(default_eden_for(128 << 20), DEFAULT_EDEN_SIZE);
+        assert_eq!(default_eden_for(64 << 20), 16 << 20);
+        assert_eq!(default_eden_for(16 << 20), 4 << 20);
     }
 }

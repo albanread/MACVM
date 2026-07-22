@@ -207,11 +207,10 @@ pub struct Universe {
     pub sel_cannot_return: SymbolOop,
 }
 
-/// Default eden size *(tunable)* — SPEC §7.1. `options.eden_kb`
-/// (`MACVM_EDEN` env override, S7-10) overrides it — the S7 GC-stress test's
-/// actual consumer: a small eden makes a scavenge reachable without first
-/// allocating megabytes of filler.
-const EDEN_SIZE: usize = super::layout::DEFAULT_EDEN_SIZE;
+// Default eden sizing lives in `layout::default_eden_for` (scales with the
+// reservation); `options.eden_kb` (`MACVM_EDEN` env override, S7-10) bypasses
+// it — the S7 GC-stress test's actual consumer: a small eden makes a scavenge
+// reachable without first allocating megabytes of filler.
 /// Initial symbol table capacity *(tunable)* — SPEC §3.1.
 const SYMBOL_TABLE_CAPACITY: usize = 1024;
 
@@ -219,19 +218,14 @@ impl Universe {
     pub fn genesis(options: &VmOptions) -> Universe {
         // --- step 1: heap up (sprint_s07_detail.md A1) -----------------------
         let heap_bytes = options.heap_mib << 20;
-        let eden_size = options.eden_kb.map(|kb| kb << 10).unwrap_or(EDEN_SIZE);
+        // Default eden scales with the reservation (`layout::default_eden_for`
+        // caps it at a quarter of the heap, so tiny test heaps still boot);
+        // an explicit `MACVM_EDEN` override bypasses that and is honored as-is.
+        let eden_size = options
+            .eden_kb
+            .map(|kb| kb << 10)
+            .unwrap_or_else(|| super::layout::default_eden_for(heap_bytes));
         let reservation = Reservation::reserve(heap_bytes);
-        // Small-reservation clamp: a heap smaller than the default eden +
-        // both survivors (possible since the 16 MiB default eden, 40fc343)
-        // must still boot — shrink eden so old keeps at least an eden's
-        // worth of room, floored at 1 MiB. Explicit MACVM_EDEN values are
-        // clamped the same way (a tiny heap is the stronger constraint).
-        let survivors = 2 * crate::memory::layout::SURVIVOR_SIZE;
-        let max_eden = heap_bytes
-            .saturating_sub(survivors)
-            .saturating_div(2)
-            .max(1 << 20);
-        let eden_size = eden_size.min(max_eden);
         let layout = HeapLayout::new(reservation.base(), heap_bytes, eden_size);
         reservation.commit(layout.eden.start - reservation.base(), layout.eden.len());
         reservation.commit(layout.from.start - reservation.base(), layout.from.len());
@@ -1395,7 +1389,12 @@ mod tests {
         assert_eq!(u.eden.start % 8, 0);
         assert!(u.eden.top > u.eden.start);
         assert!(u.eden.top - u.eden.start < 256 * 1024);
-        assert_eq!(u.eden.end - u.eden.start, EDEN_SIZE);
+        // `boot()` reserves 64 MiB, so `default_eden_for` sizes eden at a
+        // quarter of it (16 MiB), not the full 32 MiB default.
+        assert_eq!(
+            u.eden.end - u.eden.start,
+            crate::memory::layout::default_eden_for(64 << 20)
+        );
     }
 
     #[test]
