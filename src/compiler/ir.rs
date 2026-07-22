@@ -6319,31 +6319,49 @@ pub(crate) fn copy_propagate(m: &mut IrMethod) {
 }
 
 /// Float fast-path rule 4 (`docs/float_fastpath_design.md` B5): FLOAT-TEMP
-/// PROMOTION — a method temp that provably always holds a Double becomes an
+/// PROMOTION — a value that provably always holds a Double becomes an
 /// unboxed fp vreg, living raw across the whole loop (including safepoints:
 /// spill-all parks it in a non-oop frame slot; `resolve_frame_loc` records
 /// `ValueLoc::DoubleSlot`, and the deopt materializer boxes it back).
 ///
-/// A temp `t` qualifies iff ALL hold:
-/// - every real def is `Move { t, s }` with `s` an `FBox` result or a boxed
-///   Double literal (`ConstPool` of a Double oop — rewritten to `FConst`);
-/// - its mandatory nil-init (`ConstPool { t, nil }`) is provably DEAD: a
-///   qualifying def occurs in the ENTRY block before any use of `t` and
-///   before any safepoint (so neither the program nor a deopt can ever
-///   observe the nil — Smalltalk's read-before-write would otherwise DNU
-///   where promoted code would silently read a stale f64);
-/// - every use is an `FUnbox { _, src: t }` (rewritten to a direct fp read,
-///   guard deleted — the value is a Double by construction) or a
-///   `Move { c, t }` whose `c` is DEOPT-ONLY (an operand-stack copy pinned
-///   by reexecute metadata: `c` is promoted alongside `t`, and its DeoptRaw
-///   references become `DoubleSlot` automatically);
-/// - `t` appears in no merge entry stack.
+/// Generalized (spliced-temp promotion) from single root temps to a COPY
+/// TREE: the candidate `t` plus every vreg reachable from it through
+/// single-def `Move`s — exactly the plumbing the splicers thread a value
+/// through (the receiver copy into an inlined body; the boxed result
+/// hopping back out). Without the tree, a loop-carried temp fed through an
+/// inlined float callee re-boxed once per backedge forever
+/// (`s := self scale: s`: the FBox flowed result → splice-return hop → t,
+/// and t → splice receiver hop → FUnbox — neither side matched the old
+/// direct-def / deopt-only-copy tests).
+///
+/// A candidate `t` (with its tree) qualifies iff ALL hold:
+/// - every real def of `t` is `Move { t, s }` with `s` a tree member
+///   (an fp-to-fp move after promotion) or resolvable to an `FBox` result /
+///   Double constant by CHASING single-def `Move` hops (splice-return
+///   plumbing; the emptied hops are swept, orphaning their FBox for rule 3);
+/// - every tree node's every op use is an `FUnbox { _, src: node }`
+///   (rewritten to a direct fp read, guard deleted) or the defining `Move`
+///   of another tree node / of `t` itself. Deopt references are fine on any
+///   node — the node is promoted and its references become `DoubleSlot`
+///   (the materializer re-boxes, including as an inlined frame's receiver);
+/// - DEFINED-BEFORE-OBSERVED, by forward dataflow over the real CFG
+///   (`regalloc::successors`): no path from entry reaches an observation
+///   point while `t` is still undefined — else promotion would show a
+///   garbage f64 where the interpreter shows nil. Observation points are
+///   every op use of a tree node, every deopt site naming one, and — for a
+///   ROOT TEMP (detected by its mandatory nil-init) — every safepoint,
+///   since a root temp is implicitly visible in EVERY safepoint's scope. A
+///   non-temp vreg (splice plumbing, spliced callee temps) is scope-visible
+///   only where deopt metadata names it explicitly. This subsumes the old
+///   "real def in the entry block before any safepoint" gate;
+/// - no tree node appears in a merge entry stack; the nil-init (root temps
+///   only) is unique.
 ///
 /// GATED OFF for OSR compiles: the OSR entry copies INTERPRETER slot values
 /// (boxed oops) into compiled frame slots — an fp slot would need an
 /// unbox-with-guard at OSR entry, deferred.
 fn promote_float_temps(m: &mut IrMethod) {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     let n = m.vregs.len();
 
     // ── Whole-method censuses. ──────────────────────────────────────────
@@ -6355,28 +6373,39 @@ fn promote_float_temps(m: &mut IrMethod) {
     let mut move_copy_of: Vec<Vec<u32>> = vec![Vec::new(); n]; // t → its copies c
     let mut bad_def = vec![false; n];
     let mut move_defs: Vec<u32> = vec![0; n];
+    let mut move_single_src: Vec<u32> = vec![u32::MAX; n]; // valid iff move_defs==1
     let mut nil_init_def: Vec<u32> = vec![0; n];
     let mut deopt_used = vec![false; n];
+    let mut ret_uses: Vec<u32> = vec![0; n];
+    // Per BLOCK INDEX: each deopt site's (code index, referenced vregs) —
+    // the dataflow's explicit observation points.
+    let mut deopt_refs: Vec<Vec<(u32, Vec<u32>)>> = vec![Vec::new(); m.blocks.len()];
 
-    for b in &m.blocks {
+    for (bi, b) in m.blocks.iter().enumerate() {
         for v in &b.entry_stack {
             entry_used[v.0 as usize] = true;
         }
-        for (_, raw) in &b.deopt_sites {
+        for (ci, raw) in &b.deopt_sites {
+            let mut refs: Vec<u32> = Vec::new();
             for v in &raw.stack {
                 deopt_used[v.0 as usize] = true;
+                refs.push(v.0);
             }
             let mut lvl = raw.inline.as_ref();
             while let Some(site) = lvl {
                 deopt_used[site.receiver.0 as usize] = true;
+                refs.push(site.receiver.0);
                 for v in &site.slots {
                     deopt_used[v.0 as usize] = true;
+                    refs.push(v.0);
                 }
                 for v in &site.caller_pending_stack {
                     deopt_used[v.0 as usize] = true;
+                    refs.push(v.0);
                 }
                 lvl = site.parent.as_deref();
             }
+            deopt_refs[bi].push((*ci, refs));
         }
         for op in &b.code {
             op.uses(|v| op_uses[v.0 as usize] += 1);
@@ -6406,7 +6435,9 @@ fn promote_float_temps(m: &mut IrMethod) {
                 Ir::Move { dst, src } => {
                     move_copy_of[src.0 as usize].push(dst.0);
                     move_defs[dst.0 as usize] += 1;
+                    move_single_src[dst.0 as usize] = src.0;
                 }
+                Ir::Ret { val } => ret_uses[val.0 as usize] += 1,
                 _ => {}
             }
             // Non-Move/non-ConstPool defs disqualify their targets.
@@ -6416,11 +6447,67 @@ fn promote_float_temps(m: &mut IrMethod) {
         }
     }
 
+    // CFG predecessors (by block INDEX) for the defined-before-observed
+    // dataflow — same edge set the allocator walks.
+    let idx_of: HashMap<u32, usize> = m
+        .blocks
+        .iter()
+        .enumerate()
+        .map(|(i, b)| (b.id.0, i))
+        .collect();
+    let mut preds: Vec<Vec<usize>> = vec![Vec::new(); m.blocks.len()];
+    for (bi, b) in m.blocks.iter().enumerate() {
+        for s in crate::compiler::regalloc::successors(b) {
+            if let Some(&si) = idx_of.get(&s.0) {
+                preds[si].push(bi);
+            }
+        }
+    }
+
+    // Chase single-def Move plumbing (the splice-return hops) back to an
+    // FBox result or a Double constant. Hop vregs are recorded for the
+    // dead-plumbing sweep once their consumer is rewritten away.
+    enum Root {
+        Fp(VReg),
+        Bits(u64),
+    }
+    let chase = |start: u32, hops: &mut Vec<u32>| -> Option<Root> {
+        let mut v = start;
+        for _ in 0..16 {
+            if let Some(&fp) = fbox_src.get(&v) {
+                return Some(Root::Fp(fp));
+            }
+            if let Some(&bits) = const_double.get(&v) {
+                return Some(Root::Bits(bits));
+            }
+            let vi = v as usize;
+            if move_defs[vi] == 1 && nil_init_def[vi] == 0 && !bad_def[vi] {
+                hops.push(v);
+                v = move_single_src[vi];
+            } else {
+                return None;
+            }
+        }
+        None
+    };
+
     // ── Qualification. ──────────────────────────────────────────────────
-    let mut qualified: Vec<u32> = Vec::new();
+    // A chased def's rewrite, planned at its exact (block index, op index).
+    enum DefRw {
+        Fp(VReg, VReg),   // Move { dst, fp_src }
+        Bits(VReg, u64),  // FConst { dst, bits }
+    }
+    struct Promo {
+        tree: Vec<u32>,
+        def_plan: HashMap<(usize, usize), DefRw>,
+        hops: Vec<u32>,
+    }
+    let mut promos: Vec<Promo> = Vec::new();
+    let mut claimed = vec![false; n]; // each vreg joins at most one tree
     'cand: for t in 1..n as u32 {
         let ti = t as usize;
         if m.vregs[ti].is_fp
+            || claimed[ti]
             || move_defs[ti] == 0
             || bad_def[ti]
             || entry_used[ti]
@@ -6428,42 +6515,57 @@ fn promote_float_temps(m: &mut IrMethod) {
         {
             continue;
         }
-        // Uses: only FUnbox srcs + Move copies (each verified deopt-only).
-        let copies = &move_copy_of[ti];
-        if op_uses[ti] != funbox_uses[ti] + copies.len() as u32 {
-            continue;
+
+        // The copy tree: t plus every vreg reachable via single-def Moves.
+        let mut tree: Vec<u32> = vec![t];
+        let mut in_tree: HashSet<u32> = HashSet::new();
+        in_tree.insert(t);
+        let mut wl: Vec<u32> = vec![t];
+        while let Some(node) = wl.pop() {
+            for &c in &move_copy_of[node as usize] {
+                if c == t {
+                    continue; // Move { t, node } — a def of t, gated below
+                }
+                if in_tree.contains(&c) {
+                    continue 'cand; // a second Move def into a tree node
+                }
+                let ci = c as usize;
+                if move_defs[ci] == 1
+                    && nil_init_def[ci] == 0
+                    && !bad_def[ci]
+                    && !entry_used[ci]
+                    && !claimed[ci]
+                    && !m.vregs[ci].is_fp
+                {
+                    in_tree.insert(c);
+                    tree.push(c);
+                    wl.push(c);
+                } else {
+                    continue 'cand;
+                }
+            }
         }
-        for &c in copies {
-            let ci = c as usize;
-            if op_uses[ci] != 0
-                || entry_used[ci]
-                || move_defs[ci] != 1
-                || nil_init_def[ci] != 0
-                || bad_def[ci]
+        // Every node's op uses are exactly its FUnboxes + its outgoing
+        // Moves (each verified above to land in the tree or redefine t) +
+        // its Rets (re-boxed once at the return — per call, not per
+        // iteration; the rewrite's final pass).
+        for &node in &tree {
+            let ni = node as usize;
+            if op_uses[ni]
+                != funbox_uses[ni] + move_copy_of[ni].len() as u32 + ret_uses[ni]
             {
                 continue 'cand;
             }
         }
-        // Every Move def's source is an FBox result or a Double constant.
-        for b in &m.blocks {
-            for op in &b.code {
-                if let Ir::Move { dst, src } = op {
-                    if dst.0 == t
-                        && !fbox_src.contains_key(&src.0)
-                        && !const_double.contains_key(&src.0)
-                    {
-                        continue 'cand;
-                    }
-                }
-            }
-        }
-        // Every FUnbox of t must be cleanly cancellable: all uses of its dst
-        // are IN THE SAME BLOCK, after the unbox, before any redefinition of
-        // t (the redefinition hazard), and account for the dst's every use.
+
+        // Every FUnbox of a tree node must be cleanly cancellable: all uses
+        // of its dst in the same block, after the unbox, before any
+        // redefinition of that node (only t can be redefined — copies are
+        // single-def), accounting for the dst's every use.
         for b in &m.blocks {
             for (i, op) in b.code.iter().enumerate() {
-                let u = match op {
-                    Ir::FUnbox { dst, src, .. } if src.0 == t => dst.0,
+                let (u, node) = match op {
+                    Ir::FUnbox { dst, src, .. } if in_tree.contains(&src.0) => (dst.0, src.0),
                     _ => continue,
                 };
                 // Deleting the FUnbox deletes u's only def — u must not be
@@ -6486,13 +6588,13 @@ fn promote_float_temps(m: &mut IrMethod) {
                         }
                         in_window += 1;
                     }
-                    let mut defs_t = false;
+                    let mut defs_node = false;
                     later.defs(|v| {
-                        if v.0 == t {
-                            defs_t = true;
+                        if v.0 == node {
+                            defs_node = true;
                         }
                     });
-                    if defs_t {
+                    if defs_node {
                         redefined = true;
                     }
                 }
@@ -6501,55 +6603,146 @@ fn promote_float_temps(m: &mut IrMethod) {
                 }
             }
         }
-        // Dead nil-init: a qualifying Move def in the ENTRY block before any
-        // use of t and before any safepoint — so neither the program nor a
-        // deopt can ever observe the nil this promotion erases.
-        let entry = &m.blocks[0];
-        let mut ok = false;
-        for op in &entry.code {
-            if is_safepoint_op(op) {
-                break;
-            }
-            let mut used_here = false;
-            op.uses(|v| {
-                if v.0 == t {
-                    used_here = true;
-                }
-            });
-            if used_here {
-                break;
-            }
-            if let Ir::Move { dst, .. } = op {
-                if dst.0 == t {
-                    ok = true;
-                    break;
+
+        // Every real def of t: a tree member (fp-to-fp move after
+        // promotion) or a chase to an FBox / Double-const root.
+        let mut def_plan: HashMap<(usize, usize), DefRw> = HashMap::new();
+        let mut hops: Vec<u32> = Vec::new();
+        for (bi, b) in m.blocks.iter().enumerate() {
+            for (i, op) in b.code.iter().enumerate() {
+                if let Ir::Move { dst, src } = op {
+                    if dst.0 != t || in_tree.contains(&src.0) {
+                        continue;
+                    }
+                    match chase(src.0, &mut hops) {
+                        Some(Root::Fp(fp)) => {
+                            def_plan.insert((bi, i), DefRw::Fp(*dst, fp));
+                        }
+                        Some(Root::Bits(bits)) => {
+                            def_plan.insert((bi, i), DefRw::Bits(*dst, bits));
+                        }
+                        None => continue 'cand,
+                    }
                 }
             }
         }
-        if !ok {
-            continue;
+
+        // Defined-before-observed dataflow: no path from entry may reach an
+        // observation of the tree while t is still undefined (promotion
+        // would show garbage f64 where the interpreter shows nil). A root
+        // temp (nil-init present) is implicitly visible in EVERY
+        // safepoint's scope; a non-temp vreg only where deopt metadata
+        // names it explicitly.
+        let is_temp = nil_init_def[ti] == 1;
+        let nb = m.blocks.len();
+        let mut first_obs: Vec<Option<usize>> = vec![None; nb];
+        let mut first_def: Vec<Option<usize>> = vec![None; nb];
+        for (bi, b) in m.blocks.iter().enumerate() {
+            for (i, op) in b.code.iter().enumerate() {
+                let mut observes = false;
+                op.uses(|v| {
+                    if in_tree.contains(&v.0) {
+                        observes = true;
+                    }
+                });
+                if is_temp && is_safepoint_op(op) {
+                    observes = true;
+                }
+                if observes && first_obs[bi].is_none() {
+                    first_obs[bi] = Some(i);
+                }
+                if first_def[bi].is_none() {
+                    if let Ir::Move { dst, .. } = op {
+                        if dst.0 == t {
+                            first_def[bi] = Some(i);
+                        }
+                    }
+                }
+            }
+            for (ci, refs) in &deopt_refs[bi] {
+                if refs.iter().any(|r| in_tree.contains(r)) {
+                    let at = *ci as usize;
+                    if first_obs[bi].is_none_or(|o| at < o) {
+                        first_obs[bi] = Some(at);
+                    }
+                }
+            }
         }
-        qualified.push(t);
+        let mut undef_in = vec![false; nb];
+        let mut undef_out = vec![false; nb];
+        loop {
+            let mut changed = false;
+            for bi in 0..nb {
+                let inn = bi == 0 || preds[bi].iter().any(|&p| undef_out[p]);
+                let out = if first_def[bi].is_some() { false } else { inn };
+                if inn != undef_in[bi] || out != undef_out[bi] {
+                    undef_in[bi] = inn;
+                    undef_out[bi] = out;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        for bi in 0..nb {
+            if !undef_in[bi] {
+                continue;
+            }
+            if let Some(o) = first_obs[bi] {
+                // Observed while possibly undefined — unless a real def in
+                // this block strictly precedes the observation.
+                if first_def[bi].is_none_or(|d| o <= d) {
+                    continue 'cand;
+                }
+            }
+        }
+
+        for &v in &tree {
+            claimed[v as usize] = true;
+        }
+        promos.push(Promo {
+            tree,
+            def_plan,
+            hops,
+        });
     }
-    if qualified.is_empty() {
+    if promos.is_empty() {
         return;
     }
 
     // ── Rewrite (shapes pre-verified above — no bail-outs from here). ───
     let mut is_promoted = vec![false; n];
-    for &t in &qualified {
-        is_promoted[t as usize] = true;
-        m.vregs[t as usize].is_fp = true;
-        m.vregs[t as usize].is_oop = false;
-        for &c in &move_copy_of[t as usize] {
-            m.vregs[c as usize].is_fp = true;
-            m.vregs[c as usize].is_oop = false;
+    let mut all_hops: HashSet<u32> = HashSet::new();
+    let mut def_plan_all: HashMap<(usize, usize), DefRw> = HashMap::new();
+    for p in promos {
+        for &v in &p.tree {
+            is_promoted[v as usize] = true;
+            m.vregs[v as usize].is_fp = true;
+            m.vregs[v as usize].is_oop = false;
         }
+        all_hops.extend(p.hops);
+        def_plan_all.extend(p.def_plan);
     }
-    for b in &mut m.blocks {
+    for (bi, b) in m.blocks.iter_mut().enumerate() {
         let len = b.code.len();
         let mut delete = vec![false; len];
         for i in 0..len {
+            // A chased def of t: retarget the Move straight at the FBox's
+            // fp source (or bake the constant), bypassing the plumbing.
+            if let Some(rw) = def_plan_all.get(&(bi, i)) {
+                b.code[i] = match rw {
+                    DefRw::Fp(dst, fp) => Ir::Move {
+                        dst: *dst,
+                        src: *fp,
+                    },
+                    DefRw::Bits(dst, bits) => Ir::FConst {
+                        dst: *dst,
+                        bits: *bits,
+                    },
+                };
+                continue;
+            }
             let replace: Option<Ir> = match &b.code[i] {
                 Ir::ConstPool { dst, .. } if is_promoted[dst.0 as usize] => {
                     // The provably-dead nil-init — value irrelevant; an
@@ -6557,12 +6750,13 @@ fn promote_float_temps(m: &mut IrMethod) {
                     Some(Ir::FConst { dst: *dst, bits: 0 })
                 }
                 Ir::Move { dst, src } if is_promoted[dst.0 as usize] => {
-                    if let Some(&fp) = fbox_src.get(&src.0) {
-                        Some(Ir::Move { dst: *dst, src: fp })
-                    } else if let Some(&bits) = const_double.get(&src.0) {
-                        Some(Ir::FConst { dst: *dst, bits })
+                    if is_promoted[src.0 as usize] {
+                        None // intra-tree fp-to-fp move — correct as marked
                     } else {
-                        unreachable!("promotion qualified a def it can't rewrite")
+                        unreachable!(
+                            "promotion qualified a def it can't rewrite \
+                             (non-tree defs are all in def_plan)"
+                        )
                     }
                 }
                 _ => None,
@@ -6600,6 +6794,82 @@ fn promote_float_temps(m: &mut IrMethod) {
                 *ci -= removed_before[*ci as usize];
             }
         }
+    }
+
+    // ── Dead-plumbing sweep. The chased hops' consumers were retargeted
+    // above; a hop whose value is now completely unobserved (no op use, no
+    // deopt/entry reference) deletes with its defining Move — iterated,
+    // since each deletion frees the next hop up the chain. The FBoxes this
+    // orphans die in rule 3, which runs after promotion. A hop that IS
+    // still referenced (e.g. pinned in a reexecute stack) simply keeps its
+    // Move and its boxed value — correct, just unoptimized. ──────────────
+    while !all_hops.is_empty() {
+        let mut uses: Vec<u32> = vec![0; n];
+        for b in &m.blocks {
+            for op in &b.code {
+                op.uses(|v| uses[v.0 as usize] += 1);
+            }
+        }
+        let dead: HashSet<u32> = all_hops
+            .iter()
+            .copied()
+            .filter(|&h| {
+                uses[h as usize] == 0 && !deopt_used[h as usize] && !entry_used[h as usize]
+            })
+            .collect();
+        if dead.is_empty() {
+            break;
+        }
+        for h in &dead {
+            all_hops.remove(h);
+        }
+        for b in &mut m.blocks {
+            let len = b.code.len();
+            let mut removed = 0u32;
+            let mut removed_before: Vec<u32> = vec![0; len + 1];
+            let mut keep: Vec<bool> = Vec::with_capacity(len);
+            for (i, op) in b.code.iter().enumerate() {
+                removed_before[i] = removed;
+                let del = matches!(op, Ir::Move { dst, .. } if dead.contains(&dst.0));
+                keep.push(!del);
+                if del {
+                    removed += 1;
+                }
+            }
+            removed_before[len] = removed;
+            if removed == 0 {
+                continue;
+            }
+            let mut it = keep.iter();
+            b.code.retain(|_| *it.next().unwrap());
+            for (ci, _) in b.deopt_sites.iter_mut() {
+                *ci -= removed_before[*ci as usize];
+            }
+        }
+    }
+
+    // ── Ret re-boxing. A promoted value that IS the method's answer boxes
+    // exactly once, at the return — per call, never per iteration. `Ret` is
+    // always its block's final op, so the insertion shifts no deopt-site
+    // index (sites never point at or past a terminator). ─────────────────
+    let mut ret_fixes: Vec<(usize, VReg)> = Vec::new();
+    for (bi, b) in m.blocks.iter().enumerate() {
+        if let Some(Ir::Ret { val }) = b.code.last() {
+            if is_promoted[val.0 as usize] {
+                ret_fixes.push((bi, *val));
+            }
+        }
+    }
+    for (bi, val) in ret_fixes {
+        let boxed = VReg(m.vregs.len() as u32);
+        m.vregs.push(VRegInfo {
+            is_oop: true,
+            is_fp: false,
+        });
+        let b = &mut m.blocks[bi];
+        let ret_ix = b.code.len() - 1;
+        b.code[ret_ix] = Ir::FBox { dst: boxed, src: val };
+        b.code.push(Ir::Ret { val: boxed });
     }
 }
 

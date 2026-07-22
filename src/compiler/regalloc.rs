@@ -97,7 +97,9 @@ fn is_safepoint(ir: &Ir) -> bool {
 /// Every block a given block's terminator can transfer control to —
 /// includes `fail`/`not_bool`/`slow` edges (the bailout block, or an S11
 /// deopt/slow-path block), not just the "normal" successors.
-fn successors(block: &IrBlock) -> Vec<BlockId> {
+/// `pub(crate)`: `ir::promote_float_temps`'s defined-before-use dataflow
+/// walks the same edge set (one definition, not a drifting copy).
+pub(crate) fn successors(block: &IrBlock) -> Vec<BlockId> {
     let mut succs = Vec::new();
     for ir in &block.code {
         match ir {
