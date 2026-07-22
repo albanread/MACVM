@@ -1317,6 +1317,61 @@ impl<'a> Emitter<'a> {
         self.commit(dst, d);
     }
 
+    /// Identity `==`/`~~` (WINVM 9cb272e's `RefCmpVal`, the A64 lowering
+    /// its port left unwritten): one raw compare, branchless boolean
+    /// select — the same tail as [`Self::emit_smi_cmp_val`] minus the tag
+    /// check and fail edge (identity is sound for any operand pair; see
+    /// the IR doc).
+    fn emit_ref_cmp_val(&mut self, dst: VReg, a: VReg, b: VReg, neq: bool) {
+        let ra = self.resolve(a, 16);
+        let rb = self.resolve(b, 17);
+        self.asm.emit("cmp", &[Operand::Reg(ra), Operand::Reg(rb)]);
+        // cmp doesn't write ra/rb -- free to reuse x16/x17 for the two
+        // literal loads regardless of what they held a moment ago.
+        self.asm
+            .ldr_literal(xr(16), self.literal_ids[self.true_lit.0 as usize]);
+        self.asm
+            .ldr_literal(xr(17), self.literal_ids[self.false_lit.0 as usize]);
+        let d = self.dest_target(dst);
+        let cond_sym = Operand::Sym(cond_str(if neq { Cond::Ne } else { Cond::Eq }).to_string());
+        self.asm
+            .emit("csel", &[Operand::Reg(d), x(16), x(17), cond_sym]);
+        self.commit(dst, d);
+    }
+
+    /// Speculated boolean `not` (WINVM 9cb272e's `BoolNot`):
+    /// `dst = src == true ? false : src == false ? true : trap(fail)`.
+    /// `src` resolves into x16 (its only possible spill slot, D3.5's
+    /// first-source convention); both literal compares go through x17,
+    /// which `src`'s resolution never touches — the [`Self::emit_bool_br`]
+    /// discipline. A spilled `dst` computes into the x16 dest-scratch;
+    /// that aliases a spilled `src`, which is safe because on each path
+    /// the dest write happens only after `src`'s final read (the eq-path's
+    /// `ldr d` is never executed on the path that still needs `src`).
+    fn emit_bool_not(&mut self, dst: VReg, src: VReg, fail: BlockId) {
+        let rv = self.resolve(src, 16);
+        let cold = self.block_label(fail);
+        self.asm
+            .ldr_literal(xr(17), self.literal_ids[self.true_lit.0 as usize]);
+        self.asm.emit("cmp", &[Operand::Reg(rv), x(17)]);
+        let not_true = self.asm.new_label();
+        let done = self.asm.new_label();
+        self.asm.b_cond(Cond::Ne, not_true);
+        let d = self.dest_target(dst);
+        self.asm
+            .ldr_literal(d, self.literal_ids[self.false_lit.0 as usize]);
+        self.asm.b(done);
+        self.asm.bind(not_true);
+        self.asm
+            .ldr_literal(xr(17), self.literal_ids[self.false_lit.0 as usize]);
+        self.asm.emit("cmp", &[Operand::Reg(rv), x(17)]);
+        self.asm.b_cond(Cond::Ne, cold);
+        self.asm
+            .ldr_literal(d, self.literal_ids[self.true_lit.0 as usize]);
+        self.asm.bind(done);
+        self.commit(dst, d);
+    }
+
     /// `val` always resolves into x16 (its only possible spilled slot,
     /// D3.5's first-source convention) — both literal loads go through
     /// x17 instead, which `val`'s own resolution never touches, so a
@@ -2095,6 +2150,8 @@ fn emit_ir(e: &mut Emitter, ir: &Ir, next_in_order: Option<BlockId>) {
             b,
             fail,
         } => e.emit_smi_cmp_val(op, dst, a, b, fail),
+        Ir::RefCmpVal { dst, a, b, neq } => e.emit_ref_cmp_val(dst, a, b, neq),
+        Ir::BoolNot { dst, src, fail } => e.emit_bool_not(dst, src, fail),
         Ir::Jump { target } => {
             if next_in_order != Some(target) {
                 let l = e.block_label(target);

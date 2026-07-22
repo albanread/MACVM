@@ -135,6 +135,12 @@ pub(crate) fn successors(block: &IrBlock) -> Vec<BlockId> {
             | Ir::ArrayAt { fail, .. }
             | Ir::ArrayAtPut { fail, .. }
             | Ir::FUnbox { fail, .. }
+            // BoolNot's trap edge MUST be a successor: reverse_postorder
+            // (block layout, positions, liveness) walks these, and a trap
+            // block reachable only through this edge would otherwise be
+            // dropped from layout entirely. (WINVM's successors() misses
+            // this — a latent bug to report upstream.)
+            | Ir::BoolNot { fail, .. }
             | Ir::VecArith { fail, .. } => succs.push(*fail),
             Ir::GuardKlass { fail, .. } => succs.push(*fail),
             // S11 D7: `Alloc` is self-contained (fast path + internal slow

@@ -62,35 +62,45 @@ cargo build --release
 COG_DIR=/path/to/cog ROUNDS=3 ./scripts/cog-bench.sh
 ```
 
-## Scoreboard (2026-07-22, M-series, load 1.6, best of 3 rounds)
+## Scoreboard (2026-07-22, M-series, best of 3 rounds)
 
-| bench     | MACVM ms | Cog ms | verdict            |
-|-----------|---------:|-------:|--------------------|
-| arith     |     35.1 |   58.2 | **MACVM 1.66x**    |
-| fib       |    155.9 |  187.7 | **MACVM 1.20x**    |
-| sieve     |      2.3 |    3.5 | **MACVM 1.50x**    |
-| dict      |      8.3 |   15.4 | **MACVM 1.86x**    |
-| alloc     |     13.0 |   14.7 | **MACVM 1.13x**    |
-| richards  |     63.3 |   22.2 | **Cog 2.85x**      |
-| deltablue |      4.1 |    3.5 | **Cog 1.15x**      |
+Two same-day measurements: BEFORE and AFTER porting WINVM 9cb272e's
+special-selector lowering to arm64 (`Ir::RefCmpVal` for identity `==`/`~~`,
+`Ir::BoolNot` for boolean `not` — `cmp`+`csel` and a guarded literal-compare
+flip in emit.rs, the A64 sequences WINVM's own port left unwritten).
 
-(warm = median of 6 x10-rep batches, microsecond clock; MACVM `threshold=20`,
-richards/deltablue verified threshold-independent — 63 ms at both 10 and 20.)
+| bench     | MACVM before | MACVM after | Cog ms | verdict (after)    |
+|-----------|-------------:|------------:|-------:|--------------------|
+| arith     |         35.1 |        35.3 |   59.6 | **MACVM 1.69x**    |
+| fib       |        155.9 |       158.8 |  189.4 | **MACVM 1.19x**    |
+| sieve     |          2.3 |         2.4 |    3.6 | **MACVM 1.52x**    |
+| dict      |          8.3 |         8.5 |   15.9 | **MACVM 1.86x**    |
+| alloc     |         13.0 |        12.9 |   14.7 | **MACVM 1.14x**    |
+| richards  |     **63.3** |    **20.1** |   22.4 | **MACVM 1.11x**    |
+| deltablue |      **4.1** |     **2.8** |    3.5 | **MACVM 1.23x**    |
+
+(warm = median of 6 x10-rep batches, microsecond clock; MACVM `threshold=20`.)
 
 ## What this says
 
-- **MACVM wins all five micro-benchmarks** (arith, fib, sieve, dict, alloc),
-  1.13–1.86x. The eden bump to 32 MiB (`default_eden_for`, this session)
-  turned alloc from last session's "tie" into a 1.13x win.
-- **MACVM loses both macro-benchmarks** — richards **2.85x**, deltablue
-  1.15x. This is real, threshold-independent, and **not** a deopt storm (44
-  deopts total across the whole 7-bench run, i.e. warmup only).
-- The loss is exactly the shape WINVM found independently on x64 (richards
-  its largest gap): the residual is **per-activation send overhead** —
-  ~130k `==` + ~90k `not` sends per richards run that Cog's bytecode compiler
-  never emits (WINVM commit 9cb272e, the special-selector lowering — present
-  as arch-neutral IR recognition, but the aarch64 machine-code sequences are
-  not yet written), plus per-activation spill-all across safepoints (WINVM's
-  F3c: register-resident oops with oop-maps covering registers). Closing the
-  richards gap is now the top JIT-perf priority — a real 2.85x loss, not the
-  "lead" the old numbers claimed.
+- **MACVM now wins all seven benchmarks.** The morning's honest measurement
+  showed richards **2.85x behind** (63.3 vs 22.2) and deltablue 1.15x behind
+  — real, threshold-independent, and not a deopt storm (44 warmup deopts
+  total). The cause was exactly WINVM's independent x64 diagnosis: richards
+  sends `==` ~130k times and activates `not` ~90k times per run — selectors
+  Cog's bytecode compiler never emits as sends at all.
+- The special-selector port (same day) closed it: richards 63.3 → 20.1 ms
+  (3.1x), deltablue 4.1 → 2.8 ms. Both now BEAT Cog — unlike WINVM/x64,
+  which still trails its Cog ~1.15x on richards (its younger x64 backend
+  spills more per activation; and this port also fuses inside spliced BLOCK
+  bodies, a third splice arm WINVM doesn't have).
+- The port found two upstream-worthy WINVM bugs: its `successors()` misses
+  `BoolNot`'s trap edge (reverse-postorder would drop the trap block), and
+  its canonical-`^false`/`^true` decoder requires the method to END at the
+  ReturnTos — but this frontend appends a dead implicit `ReturnSelf`, so the
+  check never passed and `not` silently stayed generic (the fix accepts dead
+  trailing code after the unconditional return).
+- Remaining Cog gaps: none on this suite. The nearest-to-parity rows
+  (richards 1.11x, alloc 1.14x) are the ones to watch when codegen changes;
+  WINVM's F3c (register-resident oops across safepoints) is the next
+  structural lever if richards needs more headroom later.
