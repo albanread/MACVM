@@ -175,6 +175,11 @@ pub struct Nmethod {
     /// `rt_uncommon_trap` after each completed trap deopt. Crossing
     /// `recompile::UNCOMMON_TRAP_LIMIT` triggers the recompile-on-trap check.
     pub trap_count: u32,
+    /// F0 (docs/frameless_leaf_methods.md): this unit QUALIFIED for frameless
+    /// emission (op scan + regalloc discipline). Recorded for the census and
+    /// tooling honesty (PROBE's "(frameless leaf)" note once F1 emits it);
+    /// nothing at runtime branches on it in F0.
+    pub frameless_eligible: bool,
     /// S14 step 8 (A5): `feedback::snapshot_profile` of the method at compile
     /// time — the effectiveness check compares the live profile against this.
     pub profile_hash: u64,
@@ -358,6 +363,7 @@ impl Nmethod {
         use crate::oops::layout::MEM_TAG;
         use crate::oops::Oop;
         Nmethod {
+            frameless_eligible: false,
             osr_cold_sends: 0,
             id: NmethodId(0),
             // SAFETY: test-only, tag-level shape is never dereferenced by
@@ -989,6 +995,7 @@ mod tests {
         len: usize,
     ) -> Nmethod {
         Nmethod {
+            frameless_eligible: false,
             osr_cold_sends: 0,
             id: NmethodId(0),
             key_klass,

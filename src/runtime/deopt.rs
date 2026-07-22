@@ -1037,6 +1037,7 @@ pub(crate) mod test_support {
             level: 1,
             version: 0,
             trap_count: 0,
+            frameless_eligible: false,
             profile_hash: 0,
             literal_off: 0,
             relocs: Vec::new(),

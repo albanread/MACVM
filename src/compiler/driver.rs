@@ -886,6 +886,23 @@ fn compile_method_full(
     }
     let mut regalloc_result = regalloc::regalloc(&ir_method);
 
+    // F0 (docs/frameless_leaf_methods.md §2): would this unit qualify for
+    // frameless emission? Computed and RECORDED only — emission is F1's job,
+    // behind its own flag; this compile's output is byte-identical.
+    //
+    // `method.primitive() != 0` disqualifies OUTSIDE the IR scan: a
+    // primitive-shim method's `stub_call_primitive` call is emitted by the
+    // prologue path, not represented as an `Ir` op, so the op scan alone
+    // can't see it (census finding: `String class>>basicNew:` scanned clean
+    // — its IR is only the fallback body).
+    let frameless_eligible = method.primitive() == 0
+        && frameless_eligible(&ir_method, &regalloc_result);
+    note_frameless_stats(frameless_eligible, &holder_name_for_log(vm, rcvr_klass), &{
+        crate::oops::wrappers::SymbolOop::try_from(method.selector())
+            .map(|s| s.as_string())
+            .unwrap_or_else(|| "?".into())
+    });
+
     let mut asm = JasmAssembler::new();
     let stub_poll_addr = vm.stubs.stub_poll_addr();
     let must_be_boolean_addr = vm.stubs.must_be_boolean_addr();
@@ -1318,6 +1335,7 @@ fn compile_method_full(
         level: 1,
         version,
         trap_count: 0,
+        frameless_eligible,
         // S14 step 8 (A5): the feedback profile this compile SAW — the
         // effectiveness check re-snapshots at trap time and declines the
         // recompile when nothing changed.
@@ -2604,4 +2622,96 @@ mod tests {
             );
         }
     }
+}
+
+// ── F0: frameless-leaf eligibility (docs/frameless_leaf_methods.md) ─────────
+
+/// Would this compiled unit qualify for frameless emission? Exhaustive over
+/// [`ir::Ir`] — a NEW op added to the enum fails to compile here until someone
+/// decides its column, so eligibility fails CLOSED by construction (§2).
+///
+/// Eligible = ops that neither call (a `bl` clobbers x30, the leaf's only
+/// return-address home), nor reach a safepoint (`Alloc`/`Poll` — a frameless
+/// body must never be observable by GC), nor carry a trap/deopt edge
+/// (a frameless unit is DEOPT-FREE: no metadata, no nil-fills). `StoreField`
+/// qualifies because its write barrier is the INLINE card-dirty sequence
+/// (`emit_store_field` — branches only, no call). Float ops are excluded in
+/// v1, TIGHTER than the design doc: the d8–d15 residency tier is
+/// callee-saved and not worth distinguishing until a float leaf matters.
+///
+/// The regalloc half (§2 "register discipline"): no spill slots, no
+/// x21–x27 residents — a leaf that needs stack or callee-saved registers
+/// falls back to framed.
+fn frameless_eligible(m: &ir::IrMethod, ra: &regalloc::RegallocResult) -> bool {
+    use crate::compiler::ir::Ir as I;
+    let ops_ok = m.blocks.iter().flat_map(|b| b.code.iter()).all(|op| match op {
+        I::ConstSmi { .. }
+        | I::ConstPool { .. }
+        | I::Move { .. }
+        | I::Param { .. }
+        | I::LoadKlass { .. }
+        | I::LoadField { .. }
+        | I::StoreField { .. }
+        | I::SmiCmpBr { .. }
+        | I::SmiCmpVal { .. }
+        | I::RefCmpVal { .. }
+        | I::BoolNot { .. }
+        | I::Jump { .. }
+        | I::BoolBr { .. }
+        | I::Ret { .. }
+        | I::RetSelf => true,
+        I::SmiArith { .. } // overflow edge (v2: trap-once, recompile framed)
+        | I::ArrayAt { .. } // bounds edge
+        | I::ArrayAtPut { .. }
+        | I::FUnbox { .. } // float family: v1 exclusion, see above
+        | I::FBox { .. }
+        | I::FArith { .. }
+        | I::FCmpBr { .. }
+        | I::FCmpVal { .. }
+        | I::FConst { .. }
+        | I::VecArith { .. }
+        | I::GuardKlass { .. }
+        | I::CallSend { .. }
+        | I::CallRuntime { .. }
+        | I::Alloc { .. }
+        | I::Poll
+        | I::UncommonTrap { .. }
+        | I::NlrReturn { .. }
+        | I::Bailout { .. } => false,
+    });
+    ops_ok
+        && ra.frame_slots == 0
+        && ra.intervals.iter().all(|iv| {
+            iv.resident_reg.is_none()
+                && !matches!(iv.assignment, Some(regalloc::Assignment::Spill(_)))
+        })
+}
+
+/// F0's whole deliverable: the running eligible/total census, so the design's
+/// coverage claim ("richards' accessor swarm") is measured before F1 emits a
+/// single different byte. Log per-unit + totals with `MACVM_FRAMELESS_COUNT=1`.
+fn note_frameless_stats(eligible: bool, holder: &str, sel: &str) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static ELIGIBLE: AtomicU64 = AtomicU64::new(0);
+    static TOTAL: AtomicU64 = AtomicU64::new(0);
+    let total = TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
+    let elig = if eligible {
+        ELIGIBLE.fetch_add(1, Ordering::Relaxed) + 1
+    } else {
+        ELIGIBLE.load(Ordering::Relaxed)
+    };
+    // Env read cached once (the env::var-on-a-hot-path 2x lesson).
+    static LOG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *LOG.get_or_init(|| std::env::var_os("MACVM_FRAMELESS_COUNT").is_some()) {
+        if eligible {
+            eprintln!("frameless-eligible: {holder}>>{sel} ({elig}/{total})");
+        } else {
+            eprintln!("frameless-no:       {holder}>>{sel} ({elig}/{total})");
+        }
+    }
+}
+
+fn holder_name_for_log(vm: &VmState, k: KlassOop) -> String {
+    let _ = vm;
+    crate::runtime::error::name_of(k.name())
 }
