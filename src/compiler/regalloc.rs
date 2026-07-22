@@ -757,6 +757,10 @@ pub fn assign_residents(intervals: &mut [LiveInterval]) {
         })
         .collect();
     order.sort_by_key(|&i| std::cmp::Reverse(intervals[i].end - intervals[i].start));
+    #[cfg(debug_assertions)]
+    let dbg = std::env::var("MACVM_DBG_RESIDENTS").is_ok();
+    #[cfg(not(debug_assertions))]
+    let dbg = false;
     for i in order {
         let (s, e) = (intervals[i].start, intervals[i].end);
         let (p, t) = if intervals[i].is_fp {
@@ -770,6 +774,12 @@ pub fn assign_residents(intervals: &mut [LiveInterval]) {
                 intervals[i].resident_reg = Some(*reg);
                 break;
             }
+        }
+        if dbg {
+            eprintln!(
+                "[residents] v{} len={} [{}..{}] fp={} -> {:?}",
+                intervals[i].vreg.0, e - s, s, e, intervals[i].is_fp, intervals[i].resident_reg
+            );
         }
     }
 }
