@@ -136,3 +136,11 @@ machinery was needed. The standing "at least as fast as Cog" target is MET
 on every benchmark in the suite. The harness now stamps `commit=<sha>` into
 every scoreboard header so cross-run deltas are attributable by
 construction.
+
+## 2026-07-22 F3 confirmation — frameless default-on (commit=145c881)
+
+Same protocol, ~30 min after the previous table; Cog stable (richards 22.1
+both runs), MACVM micros ±3%: richards 19.6 -> **18.8** (the frameless F2
+prediction of ~2-4%, visible cross-VM), deltablue flat at 2.8. Final margins:
+richards MACVM 1.17x, deltablue 1.28x, micros 1.17-1.54x — all seven ahead
+with frameless as the shipped default.
