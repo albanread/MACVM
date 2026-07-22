@@ -7,7 +7,16 @@
 //! sprint's own layer-boundary rule.)
 
 /// Default eden size *(tunable via `VmOptions`/`MACVM_EDEN`)* — SPEC §7.1.
-pub const DEFAULT_EDEN_SIZE: usize = 4 << 20;
+/// 16 MiB (was 4): the Cog-comparison alloc investigation
+/// (`docs/gc_alloc_gap.md`) measured a 4.8 MB fully-live allocation burst —
+/// an ordinary shape (build-then-drop a collection) — overflowing a 4 MiB
+/// eden into the survivor-overflow promote-all cascade: 65% of allocated
+/// bytes promoted, old filled with soon-dead garbage, full GCs. The eden
+/// size matrix (4/8/16/32 MiB → 17/10/5/4 ms on the isolated bench) knees
+/// at 16. Worst-case promotion is still guaranteed by
+/// `ensure_promotion_guarantee` (full-GC-then-grow before every scavenge),
+/// so the change is safety-neutral; the cost is +12 MiB reserved per VM.
+pub const DEFAULT_EDEN_SIZE: usize = 16 << 20;
 /// Each survivor space's fixed size *(tunable)* — SPEC §7.1.
 pub const SURVIVOR_SIZE: usize = 512 << 10;
 /// Old gen's first committed segment at boot *(tunable, S8 grows further)*;
@@ -143,13 +152,16 @@ mod tests {
 
     #[test]
     fn small_reservation_still_fits_two_survivors() {
-        // The smallest heap_mib used anywhere in the test suite (16 MiB):
-        // eden(4) + from(0.5) + to(0.5) = 5 MiB, leaving 11 MiB for old.
-        let l = HeapLayout::new(0, 16 << 20, DEFAULT_EDEN_SIZE);
+        // A small reservation must still carve both survivors and leave old
+        // non-empty. 32 MiB with the 16 MiB default eden: eden(16) +
+        // from(0.5) + to(0.5) = 17 MiB, leaving 15 MiB for old. (Test heaps
+        // SMALLER than eden+survivors must override MACVM_EDEN, as the
+        // shrink-for-reachability tests already do.)
+        let l = HeapLayout::new(0, 32 << 20, DEFAULT_EDEN_SIZE);
         assert!(!l.old.is_empty());
         assert_eq!(
             l.old.len(),
-            (16 << 20) - DEFAULT_EDEN_SIZE - 2 * SURVIVOR_SIZE
+            (32 << 20) - DEFAULT_EDEN_SIZE - 2 * SURVIVOR_SIZE
         );
     }
 }

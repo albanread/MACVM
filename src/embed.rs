@@ -2139,14 +2139,16 @@ mod tests {
             "the code cache must report a capacity"
         );
         // Run a hot looping method (so it compiles) that also allocates enough
-        // to force a scavenge (so the GC byte counter moves).
+        // to force a scavenge (so the GC byte counter moves — it tallies at
+        // scavenge time). Sized to overflow the 16 MiB default eden
+        // (layout::DEFAULT_EDEN_SIZE) with margin: 120 x 3000 x ~88 B ≈ 32 MiB.
         vm.exec(
             "Object subclass: MetricProbe [ \
                loop: n [ | s | s := 0. 1 to: n do: [:i | s := s + i]. ^s ] \
                churn: n [ 1 to: n do: [:i | Array new: 8] ] ].",
         )
         .expect("probe class must compile");
-        for _ in 0..30 {
+        for _ in 0..120 {
             vm.exec("MetricProbe new loop: 5000; churn: 3000.")
                 .expect("workload must run");
         }
