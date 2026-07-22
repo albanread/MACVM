@@ -1,0 +1,44 @@
+"MACVM side of the Cog head-to-head (docs/cog_bench.md). Mirrors
+ scripts/cog-bench.st's protocol EXACTLY — 10 inner reps per timing, cold =
+ first batch, warm = median of 6 more — but times with `Smalltalk
+ microsecondClock` (the monotonic µs clock, prim 252) instead of Pharo's
+ `Time microsecondClockValue`, and runs the world's own BenchmarkDashboard
+ benches (world/41a + world/42, byte-identical to the bodies cog-bench.st
+ mirrors). Same checksums assert body-for-body parity across the two VMs.
+ Run via scripts/cog-bench.sh; needs `--world world` for BenchmarkDashboard."
+Object subclass: CogRun [
+    CogRun class >> median: coll [
+        | s | s := coll asSortedCollection asArray.
+        ^s at: (s size + 1) // 2
+    ]
+    CogRun class >> check: name got: got want: want [
+        got = want ifFalse: [
+            Transcript showCr: name, ' WRONG RESULT ', got printString, ' want ', want printString.
+            Smalltalk quit: 1 ]
+    ]
+    CogRun class >> run: name block: aBlock check: want [
+        | times cold t0 r |
+        t0 := Smalltalk microsecondClock.
+        10 timesRepeat: [ r := aBlock value ].
+        self check: name got: r want: want.
+        cold := Smalltalk microsecondClock - t0.
+        times := OrderedCollection new.
+        6 timesRepeat: [
+            t0 := Smalltalk microsecondClock.
+            10 timesRepeat: [ r := aBlock value ].
+            times add: Smalltalk microsecondClock - t0 ].
+        self check: name got: r want: want.
+        Transcript showCr: name, ' cold_us=', cold printString,
+            ' warm_us=', (self median: times) printString
+    ]
+    CogRun class >> runAll [
+        self run: 'arith    ' block: [ BenchmarkDashboard benchArith ]     check: 1124997749998000000.
+        self run: 'fib      ' block: [ BenchmarkDashboard benchFib ]       check: 2178309.
+        self run: 'sieve    ' block: [ BenchmarkDashboard benchSieve ]     check: 1899.
+        self run: 'dict     ' block: [ BenchmarkDashboard benchDict ]      check: 170698668000.
+        self run: 'alloc    ' block: [ BenchmarkDashboard benchAlloc ]     check: 200000.
+        self run: 'richards ' block: [ BenchmarkDashboard benchRichards ]  check: 2324609297.
+        self run: 'deltablue' block: [ BenchmarkDashboard benchDeltaBlue ] check: 224874.
+    ]
+]
+CogRun runAll.

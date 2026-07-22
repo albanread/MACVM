@@ -36,4 +36,11 @@ Object subclass: SystemDictionary [
     millisecondClock [
         <primitive: 92>
     ]
+    microsecondClock [
+        "Monotonic elapsed-since-VM-start clock in microseconds (same source
+         as millisecondClock, without its .as_millis truncation) — the
+         Cog-comparison harness needs microsecond resolution on the sub-ms
+         benches (docs/cog_bench.md, src/runtime/primitives.rs prim 252)."
+        <primitive: 252>
+    ]
 ]

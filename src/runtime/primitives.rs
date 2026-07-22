@@ -1347,6 +1347,17 @@ pub static PRIMITIVES: &[PrimDesc] = &[
         can_allocate: true,
         can_fail: false,
     },
+    // Monotonic microsecond clock for the Cog-comparison harness
+    // (`docs/cog_bench.md`); id kept last so `PRIMITIVES` stays sorted for
+    // `prim_by_id`'s binary search.
+    PrimDesc {
+        id: 252,
+        name: "microsecondClock",
+        f: prim_microsecond_clock,
+        argc: 0,
+        can_allocate: false,
+        can_fail: false,
+    },
 ];
 
 pub fn prim_by_id(id: u16) -> Option<&'static PrimDesc> {
@@ -3390,6 +3401,19 @@ fn prim_millisecond_clock(vm: &mut VmState, _args: &[Oop]) -> PrimResult {
     PrimResult::Ok(SmallInt::new(millis).oop())
 }
 
+/// `Smalltalk microsecondClock` — the monotonic elapsed-since-VM-start clock
+/// (same `start_instant` source as `millisecondClock`, prim 92), in
+/// MICROSECONDS. Added for the Cog-comparison harness (`docs/cog_bench.md`):
+/// `millisecondClock`'s `.as_millis()` truncation costs 25-50% on the sub-ms
+/// benches (deltablue/sieve) that were the whole source of the "Cog is
+/// faster" doubt, so honest same-session pairs need microsecond resolution.
+/// i64 µs overflows only after ~292471 years of uptime; SmallInt (61-bit)
+/// holds it with room to spare.
+fn prim_microsecond_clock(vm: &mut VmState, _args: &[Oop]) -> PrimResult {
+    let micros = vm.start_instant.elapsed().as_micros() as i64;
+    PrimResult::Ok(SmallInt::new(micros).oop())
+}
+
 /// `Smalltalk gcScavenge` (SPEC §10 system group): runs one young-gen
 /// collection, answers the receiver. A stall here is handled exactly like
 /// the allocation cascade's own terminal stall (`alloc::stall_exit`) — an
@@ -4876,6 +4900,7 @@ mod tests {
             (249, "MacvmDelegate class>>primNewDelegate:ticket:"),
             (250, "Worker class>>primEvalDoit:"),
             (251, "halt"),
+            (252, "microsecondClock"),
         ];
         assert_eq!(
             PRIMITIVES.len(),
