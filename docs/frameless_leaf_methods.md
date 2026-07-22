@@ -143,6 +143,16 @@ Consequences, walker by walker:
   fresh binaries, `uptime` first: richards + deltablue, JIT threshold
   config, ≥3 pairs. Keep iff wall-clock wins; `instructions-are-not-time`
   applies in full.
+
+  **MEASURED (d9587cc, same binary, env as the interleave lever):** richards
+  ×100 iterations: 237/204, 207/198, 210/206 ms — frameless wins every pair,
+  ~2-4% steady-state. deltablue ×160: 63/61, 62/62 — ~0-3%. Real but MODEST:
+  the likely explanation is that the inliner already swallows the hottest
+  accessors at their monomorphic call sites, so the standalone frameless
+  units execute mainly at cold/polymorphic sites. The mechanism is sound,
+  fully gated, and costs nothing when off — but the remaining richards gap
+  (if any post-RefCmpVal; the Cog re-measure is still step 0) lives in plan
+  #2 (per-send NLR sentinel) / #3 (spill-all), not here.
 - **F3 — default-on + flag retirement** once F2 holds, then the cog-bench
   re-measure (step 0 of `cog_send_portability.md`, needs the Pharo install
   restored) to restate the honest Cog gap.
