@@ -104,3 +104,26 @@ flip in emit.rs, the A64 sequences WINVM's own port left unwritten).
   (richards 1.11x, alloc 1.14x) are the ones to watch when codegen changes;
   WINVM's F3c (register-resident oops across safepoints) is the next
   structural lever if richards needs more headroom later.
+
+## 2026-07-22 re-measure — MACVM wins ALL SEVEN (macros included)
+
+Fresh Pharo 13 (VM v10.3.9, arm64) reinstalled into `.cog/`; `ROUNDS=3`,
+load-gated (1.88), frameless emission DEFAULT-OFF (d9587cc gated):
+
+| bench | MACVM ms | Cog ms | verdict |
+|---|---|---|---|
+| arith | 33.8 | 51.7 | MACVM 1.53x |
+| fib | 153.3 | 184.5 | MACVM 1.20x |
+| sieve | 2.3 | 3.6 | MACVM 1.56x |
+| dict | 8.5 | 12.8 | MACVM 1.51x |
+| alloc | 12.9 | 14.4 | MACVM 1.12x |
+| **richards** | **19.6** | **22.1** | **MACVM 1.13x** |
+| **deltablue** | **2.8** | **3.4** | **MACVM 1.21x** |
+
+The 2026-07-15 richards loss (Cog 2.85x) is GONE — inverted — from work
+already landed between the snapshots (the S24 special-selector wave:
+RefCmpVal/BoolNot fusion covering richards' ~220k identity/not sends, plus
+OSR-heal). `cog_send_portability.md`'s step-0 suspicion ("re-measure before
+building") was exactly right: the per-activation send-overhead diagnosis was
+a stale-snapshot artifact. The standing "at least as fast as Cog" target is
+MET on every benchmark in the suite.
