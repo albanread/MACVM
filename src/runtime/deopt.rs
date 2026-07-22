@@ -401,8 +401,19 @@ pub fn deoptimize_frame(vm: &mut VmState, frame: FrameView) -> DeoptResume {
             reexecute: site_reexecute,
         });
     if vm.options.trace.is_enabled("deopt") {
+        let ident = vm
+            .code_table
+            .get(frame.nm)
+            .map(|nm| {
+                format!(
+                    "{}>>{}",
+                    crate::memory::print_oop(&vm.universe, nm.key_klass.name()),
+                    nm.key_selector.as_string()
+                )
+            })
+            .unwrap_or_else(|| "?".to_string());
         eprintln!(
-            "[deopt] nm={:?} pc={:#x} fp={:#x} bci={} reexecute={} frames={} result={}",
+            "[deopt] nm={:?} {ident} pc={:#x} fp={:#x} bci={} reexecute={} frames={} result={}",
             frame.nm,
             frame.pc,
             frame.fp,

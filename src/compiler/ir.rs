@@ -1014,6 +1014,24 @@ fn array_op_kind_on(vm: &VmState, method: MethodOop, ic_idx: u16) -> Option<bool
     }
 }
 
+/// True iff the operand on top of `stack` (a send's LAST-pushed arg) was
+/// produced by a `ConstPool` load — i.e. it is a compile-time NON-smi literal
+/// (a Double, LargeInteger, …; a smi literal is an immediate `ConstSmi`, never
+/// pooled). Such an arg can never satisfy a `SmiArith`/`SmiCmp` operand guard,
+/// so fusing the send would emit a fail edge that traps on EVERY call — the
+/// `SmallInteger>>asFloat` (`^self * 1.0`) storm, the smi mirror of the
+/// `aDouble < <smi>` FUnbox storm. Declining the fuse lets the send fall through
+/// to a plain `CallSend`, whose shim runs `SmallInteger>>*`'s own coercing
+/// bytecode fallback (`self asFloat * arg`) with no deopt at all. The hot path
+/// (`x + 1`, `x < n` — smi-const or smi-var args) is untouched: a `ConstSmi`
+/// arg is not a `ConstPool`, and a variable arg has some other producer.
+fn smi_fuse_arg_is_pooled(stack: &[VReg], code: &[Ir]) -> bool {
+    matches!(
+        (stack.last(), code.last()),
+        (Some(&top), Some(Ir::ConstPool { dst, .. })) if *dst == top
+    )
+}
+
 fn classify_smi_send(vm: &VmState, method: MethodOop, ic_idx: u16) -> SmiSendKind {
     let ic = InterpreterIc::at(method, ic_idx);
     assert_eq!(
@@ -3740,7 +3758,9 @@ impl<'a> Translator<'a> {
                 code.push(Ir::CallSend { dst, site, args });
                 stack.push(dst);
             }
-            Instr::Send { ic, .. } if self.is_smi_inlinable(ic) => {
+            Instr::Send { ic, .. }
+                if self.is_smi_inlinable(ic) && !smi_fuse_arg_is_pooled(stack, code) =>
+            {
                 // S13 step 7b: a smi-overflow deopt is `reexecute=true` at the
                 // SEND's bci — the interpreter re-executes the WHOLE send, so
                 // the recorded operand stack must be the state BEFORE this
@@ -3891,6 +3911,26 @@ impl<'a> Translator<'a> {
                 });
                 let b = stack.pop().expect("double fuse: missing arg operand");
                 let a = stack.pop().expect("double fuse: missing receiver operand");
+                // A compile-time SmallInteger arg (`aFloat < 0`, `aFloat * 2`)
+                // can NEVER be FUnbox'd — a tagged smi is not a boxed Double, so
+                // the unbox fails on EVERY call and the whole fused send deopts
+                // forever: a STEADY-STATE trap storm, because the literal is
+                // invariant so the recompile snapshot never changes and keeps
+                // declining ("profile unchanged"). Left the whole world's
+                // `Double>>truncated` (`^self < 0 ifTrue:…`) at ~1200 deopts per
+                // test-suite run. The interpreter fallback `Double>>< aNumber`
+                // takes is `^self < aNumber asDouble` — a plain smi→f64
+                // coercion — so do exactly that at COMPILE time via `FConst`,
+                // byte-identical (`n asDouble` is the same `n as f64`, same
+                // precision loss for a >2^53 smi). The hot Double-vs-Double path
+                // is UNTOUCHED: its arg is not a `ConstSmi`, so it falls through
+                // to the unbox below. The arg's `ConstSmi` is deliberately left
+                // in `code` — the fail edge's `reexec_stack` still names `b`, so
+                // a receiver-guard miss re-executes correctly.
+                let arg_const_smi: Option<i64> = match code.last() {
+                    Some(Ir::ConstSmi { dst, value }) if *dst == b => Some(*value),
+                    _ => None,
+                };
                 let ua = self.fresh_fp();
                 let ub = self.fresh_fp();
                 code.push(Ir::FUnbox {
@@ -3898,11 +3938,17 @@ impl<'a> Translator<'a> {
                     src: a,
                     fail: fail_id,
                 });
-                code.push(Ir::FUnbox {
-                    dst: ub,
-                    src: b,
-                    fail: fail_id,
-                });
+                match arg_const_smi {
+                    Some(v) => code.push(Ir::FConst {
+                        dst: ub,
+                        bits: (v as f64).to_bits(),
+                    }),
+                    None => code.push(Ir::FUnbox {
+                        dst: ub,
+                        src: b,
+                        fail: fail_id,
+                    }),
+                }
                 match classify_double_send(self.vm, self.method, ic) {
                     DoubleSendKind::Arith(op) => {
                         let fd = self.fresh_fp();
