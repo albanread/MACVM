@@ -1014,6 +1014,29 @@ fn array_op_kind_on(vm: &VmState, method: MethodOop, ic_idx: u16) -> Option<bool
     }
 }
 
+/// Float fast-path: free-function twin of `Translator::is_double_inlinable`
+/// for an INLINED callee's own IC table (the splicers fuse their bodies'
+/// Double ops to `FUnbox`/`FArith`/`FBox`/`FCmpVal` exactly like their smi
+/// and array ops). Without this, every Double arithmetic/compare op in an
+/// inlined body decayed to a generic `CallSend` that BOXES its result — a
+/// zero-alloc float loop became box-per-op the moment it was spliced into a
+/// caller (measured: the level-4 inlining probe turned Mandelbrot's 8 MB
+/// into 1 GB of allocation, 12x slower, purely from this decay). Resolves
+/// via (guard klass, selector) rather than the raw IC target, for the same
+/// staleness reason as `classify_double_send`.
+fn is_double_inlinable_on(vm: &VmState, method: MethodOop, ic_idx: u16) -> bool {
+    let ic = InterpreterIc::at(method, ic_idx);
+    if ic.guard().raw() != vm.universe.double_klass.oop().raw() {
+        return false;
+    }
+    let Some(target) =
+        crate::compiler::feedback::resolve_method_ro(vm, vm.universe.double_klass, ic.selector())
+    else {
+        return false;
+    };
+    crate::compiler::driver::DOUBLE_INLINE.contains(&target.primitive())
+}
+
 /// True iff the operand on top of `stack` (a send's LAST-pushed arg) was
 /// produced by a `ConstPool` load — i.e. it is a compile-time NON-smi literal
 /// (a Double, LargeInteger, …; a smi literal is an immediate `ConstSmi`, never
@@ -2316,7 +2339,9 @@ impl<'a> Translator<'a> {
                         bci = next;
                         continue;
                     }
-                    if is_smi_inlinable_on(self.vm, callee, ic) {
+                    if is_smi_inlinable_on(self.vm, callee, ic)
+                        && !smi_fuse_arg_is_pooled(cstack.as_slice(), code.as_slice())
+                    {
                         debug_assert_eq!(inner_argc, 1, "SMI_INLINE ops are all binary");
                         let b_op = cstack.pop().expect("smi fuse: missing rhs");
                         let a_op = cstack.pop().expect("smi fuse: missing lhs");
@@ -2341,6 +2366,70 @@ impl<'a> Translator<'a> {
                                 b: b_op,
                                 fail,
                             }),
+                        }
+                        cstack.push(dst);
+                        bci = next;
+                        continue;
+                    }
+                    // Float fast-path in the splice: `is_double_inlinable`'s
+                    // `_on` twin, same pattern as the smi/array twins above.
+                    if is_double_inlinable_on(self.vm, callee, ic) {
+                        debug_assert_eq!(inner_argc, 1, "DOUBLE_INLINE ops are all binary");
+                        // b4d55a8's storm guard, ported to the splice: a
+                        // compile-time smi arg (`x < 0` in an inlined body) can
+                        // never FUnbox — emit the coerced FConst instead,
+                        // byte-identical to the interpreter fallback's asDouble.
+                        let arg_const_smi: Option<i64> = match (cstack.last(), code.last()) {
+                            (Some(&top), Some(Ir::ConstSmi { dst, value })) if *dst == top => {
+                                Some(*value)
+                            }
+                            _ => None,
+                        };
+                        let b_op = cstack.pop().expect("double fuse: missing rhs");
+                        let a_op = cstack.pop().expect("double fuse: missing lhs");
+                        let mut reexec = cstack.clone();
+                        reexec.push(a_op);
+                        reexec.push(b_op);
+                        let fail =
+                            self.fresh_inlined_trap_block(inner_bci, reexec, inline_proto.clone());
+                        let ua = self.fresh_fp();
+                        let ub = self.fresh_fp();
+                        code.push(Ir::FUnbox {
+                            dst: ua,
+                            src: a_op,
+                            fail,
+                        });
+                        match arg_const_smi {
+                            Some(v) => code.push(Ir::FConst {
+                                dst: ub,
+                                bits: (v as f64).to_bits(),
+                            }),
+                            None => code.push(Ir::FUnbox {
+                                dst: ub,
+                                src: b_op,
+                                fail,
+                            }),
+                        }
+                        let dst = self.fresh(true);
+                        match classify_double_send(self.vm, callee, ic) {
+                            DoubleSendKind::Arith(op) => {
+                                let fd = self.fresh_fp();
+                                code.push(Ir::FArith {
+                                    op,
+                                    dst: fd,
+                                    a: ua,
+                                    b: ub,
+                                });
+                                code.push(Ir::FBox { dst, src: fd });
+                            }
+                            DoubleSendKind::Cmp(op) => {
+                                code.push(Ir::FCmpVal {
+                                    op,
+                                    dst,
+                                    a: ua,
+                                    b: ub,
+                                });
+                            }
                         }
                         cstack.push(dst);
                         bci = next;
@@ -3052,7 +3141,9 @@ impl<'a> Translator<'a> {
                             bci = next;
                             continue;
                         }
-                        if is_smi_inlinable_on(self.vm, callee, ic) {
+                        if is_smi_inlinable_on(self.vm, callee, ic)
+                            && !smi_fuse_arg_is_pooled(cstack.as_slice(), bcode.as_slice())
+                        {
                             debug_assert_eq!(inner_argc, 1, "SMI_INLINE ops are all binary");
                             cstack_ph.truncate(cstack.len().saturating_sub(2));
                             let b_op = cstack.pop().expect("smi fuse: missing rhs");
@@ -3081,6 +3172,73 @@ impl<'a> Translator<'a> {
                                     b: b_op,
                                     fail,
                                 }),
+                            }
+                            cstack.push(dst);
+                            cstack_ph.push(false);
+                            bci = next;
+                            continue;
+                        }
+                        // Float fast-path in the splice: `is_double_inlinable`'s
+                        // `_on` twin, same pattern as the smi twin above.
+                        if is_double_inlinable_on(self.vm, callee, ic) {
+                            debug_assert_eq!(inner_argc, 1, "DOUBLE_INLINE ops are all binary");
+                            // b4d55a8's storm guard, ported: a compile-time smi
+                            // arg can never FUnbox — emit the coerced FConst.
+                            let arg_const_smi: Option<i64> = match (cstack.last(), bcode.last()) {
+                                (Some(&top), Some(Ir::ConstSmi { dst, value })) if *dst == top => {
+                                    Some(*value)
+                                }
+                                _ => None,
+                            };
+                            cstack_ph.truncate(cstack.len().saturating_sub(2));
+                            let b_op = cstack.pop().expect("double fuse: missing rhs");
+                            let a_op = cstack.pop().expect("double fuse: missing lhs");
+                            let mut reexec = cstack.clone();
+                            reexec.push(a_op);
+                            reexec.push(b_op);
+                            let fail = self.fresh_inlined_trap_block(
+                                inner_bci,
+                                reexec,
+                                inline_proto.clone(),
+                            );
+                            let ua = self.fresh_fp();
+                            let ub = self.fresh_fp();
+                            bcode.push(Ir::FUnbox {
+                                dst: ua,
+                                src: a_op,
+                                fail,
+                            });
+                            match arg_const_smi {
+                                Some(v) => bcode.push(Ir::FConst {
+                                    dst: ub,
+                                    bits: (v as f64).to_bits(),
+                                }),
+                                None => bcode.push(Ir::FUnbox {
+                                    dst: ub,
+                                    src: b_op,
+                                    fail,
+                                }),
+                            }
+                            let dst = self.fresh(true);
+                            match classify_double_send(self.vm, callee, ic) {
+                                DoubleSendKind::Arith(op) => {
+                                    let fd = self.fresh_fp();
+                                    bcode.push(Ir::FArith {
+                                        op,
+                                        dst: fd,
+                                        a: ua,
+                                        b: ub,
+                                    });
+                                    bcode.push(Ir::FBox { dst, src: fd });
+                                }
+                                DoubleSendKind::Cmp(op) => {
+                                    bcode.push(Ir::FCmpVal {
+                                        op,
+                                        dst,
+                                        a: ua,
+                                        b: ub,
+                                    });
+                                }
                             }
                             cstack.push(dst);
                             cstack_ph.push(false);
@@ -5462,7 +5620,9 @@ impl<'a> Translator<'a> {
                         bci = next;
                         continue;
                     }
-                    if is_smi_inlinable_on(self.vm, block, inner_ic_idx) {
+                    if is_smi_inlinable_on(self.vm, block, inner_ic_idx)
+                        && !smi_fuse_arg_is_pooled(bstack.as_slice(), code.as_slice())
+                    {
                         debug_assert_eq!(inner_argc, 1, "SMI_INLINE ops are all binary");
                         let b_op = bstack.pop().expect("smi fuse: missing rhs");
                         let a_op = bstack.pop().expect("smi fuse: missing lhs");
@@ -5487,6 +5647,68 @@ impl<'a> Translator<'a> {
                                 b: b_op,
                                 fail,
                             }),
+                        }
+                        bstack.push(dst);
+                        bci = next;
+                        continue;
+                    }
+                    // Float fast-path in the splice: `is_double_inlinable`'s
+                    // `_on` twin, same pattern as the smi twin above.
+                    if is_double_inlinable_on(self.vm, block, inner_ic_idx) {
+                        debug_assert_eq!(inner_argc, 1, "DOUBLE_INLINE ops are all binary");
+                        // b4d55a8's storm guard, ported: a compile-time smi
+                        // arg can never FUnbox — emit the coerced FConst.
+                        let arg_const_smi: Option<i64> = match (bstack.last(), code.last()) {
+                            (Some(&top), Some(Ir::ConstSmi { dst, value })) if *dst == top => {
+                                Some(*value)
+                            }
+                            _ => None,
+                        };
+                        let b_op = bstack.pop().expect("double fuse: missing rhs");
+                        let a_op = bstack.pop().expect("double fuse: missing lhs");
+                        let mut reexec = bstack.clone();
+                        reexec.push(a_op);
+                        reexec.push(b_op);
+                        let fail =
+                            self.fresh_inlined_trap_block(inner_bci, reexec, inline_proto.clone());
+                        let ua = self.fresh_fp();
+                        let ub = self.fresh_fp();
+                        code.push(Ir::FUnbox {
+                            dst: ua,
+                            src: a_op,
+                            fail,
+                        });
+                        match arg_const_smi {
+                            Some(v) => code.push(Ir::FConst {
+                                dst: ub,
+                                bits: (v as f64).to_bits(),
+                            }),
+                            None => code.push(Ir::FUnbox {
+                                dst: ub,
+                                src: b_op,
+                                fail,
+                            }),
+                        }
+                        let dst = self.fresh(true);
+                        match classify_double_send(self.vm, block, inner_ic_idx) {
+                            DoubleSendKind::Arith(op) => {
+                                let fd = self.fresh_fp();
+                                code.push(Ir::FArith {
+                                    op,
+                                    dst: fd,
+                                    a: ua,
+                                    b: ub,
+                                });
+                                code.push(Ir::FBox { dst, src: fd });
+                            }
+                            DoubleSendKind::Cmp(op) => {
+                                code.push(Ir::FCmpVal {
+                                    op,
+                                    dst,
+                                    a: ua,
+                                    b: ub,
+                                });
+                            }
                         }
                         bstack.push(dst);
                         bci = next;
