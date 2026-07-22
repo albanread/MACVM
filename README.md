@@ -62,6 +62,42 @@ allocating. See [`docs/next_architecture.md`](docs/next_architecture.md) for
 the coverage arc and [`docs/PERF.md`](docs/PERF.md) for the benchmark-by-benchmark
 measurements.
 
+### Measured against Cog — a yardstick, not a competition
+
+MACVM does not compete with Squeak, Pharo, or Cog in any way. Those are
+mature production systems with decades of engineering and real communities
+behind them; this is a from-scratch macOS VM exploring the Strongtalk
+lineage. But a JIT still needs an honest yardstick, and Cog — the
+OpenSmalltalk JIT that powers Squeak and Pharo — is the meaningful one:
+same language, same benchmarks, and it sets a high bar.
+
+So the suite runs head-to-head against Pharo 13's Cog on the same machine
+([`scripts/cog-bench.sh`](scripts/cog-bench.sh)): a **microsecond clock on
+both sides**, **checksum-verified identical workloads** (the Pharo side is
+machine-translated from the same `world/` sources), interleaved same-session
+rounds, best-of-rounds. Current scoreboard (Apple M-series, warm ms per ×10
+reps, 2026-07-22):
+
+| benchmark | MACVM | Cog | |
+|-----------|------:|----:|---|
+| arith     |  33.8 | 51.7 | **1.53× faster** |
+| fib       | 153.3 | 184.5 | **1.20× faster** |
+| sieve     |   2.3 |  3.6 | **1.56× faster** |
+| dict      |   8.5 | 12.8 | **1.51× faster** |
+| alloc     |  12.9 | 14.4 | **1.12× faster** |
+| richards  |  19.6 | 22.1 | **1.13× faster** |
+| deltablue |   2.8 |  3.4 | **1.21× faster** |
+
+A follow-up run with frameless leaf methods (now the default) improved
+richards further to **18.8 ms (1.17×)** with the rest stable. All seven
+ahead — a bar this VM only cleared after the harness itself was made
+honest: earlier comparisons were wrong in *both* directions (millisecond
+clocks truncating the sub-5 ms benches, and an unfaithful Cog-side
+translation), and the same-day fixes that followed (special-selector
+inlining, nursery sizing) are what closed the real gaps the honest numbers
+exposed. The full measured record, including those corrections, is
+[`docs/cog_bench.md`](docs/cog_bench.md).
+
 ### What's implemented
 
 - **Object model** — Strongtalk-style classes, direct tagged pointers, **no
