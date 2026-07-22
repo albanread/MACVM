@@ -6360,7 +6360,7 @@ pub(crate) fn copy_propagate(m: &mut IrMethod) {
 /// GATED OFF for OSR compiles: the OSR entry copies INTERPRETER slot values
 /// (boxed oops) into compiled frame slots — an fp slot would need an
 /// unbox-with-guard at OSR entry, deferred.
-fn promote_float_temps(m: &mut IrMethod) {
+fn promote_float_temps(m: &mut IrMethod, osr_bci: Option<u16>) {
     use std::collections::{HashMap, HashSet};
     let n = m.vregs.len();
 
@@ -6375,6 +6375,13 @@ fn promote_float_temps(m: &mut IrMethod) {
     let mut move_defs: Vec<u32> = vec![0; n];
     let mut move_single_src: Vec<u32> = vec![u32::MAX; n]; // valid iff move_defs==1
     let mut nil_init_def: Vec<u32> = vec![0; n];
+    // ROOT-temp discriminator: a root temp's mandatory nil-init sits in
+    // BLOCK 0 (the translation prologue); a SPLICED callee temp's nil-init
+    // (the splicers mirror the interpreter's activation nil-init) sits
+    // mid-method, inside the spliced region. Only a root temp is
+    // implicitly visible at every safepoint's scope — a spliced temp is
+    // visible only where inline deopt metadata names it explicitly.
+    let mut nil_init_in_entry = vec![false; n];
     let mut deopt_used = vec![false; n];
     let mut ret_uses: Vec<u32> = vec![0; n];
     // Per BLOCK INDEX: each deopt site's (code index, referenced vregs) —
@@ -6427,6 +6434,9 @@ fn promote_float_temps(m: &mut IrMethod) {
                     // Symbol, a non-Double literal…) disqualifies outright.
                     if *lit == m.nil_lit {
                         nil_init_def[dst.0 as usize] += 1;
+                        if bi == 0 {
+                            nil_init_in_entry[dst.0 as usize] = true;
+                        }
                     } else {
                         bad_def[dst.0 as usize] = true;
                     }
@@ -6504,8 +6514,38 @@ fn promote_float_temps(m: &mut IrMethod) {
     }
     let mut promos: Vec<Promo> = Vec::new();
     let mut claimed = vec![false; n]; // each vreg joins at most one tree
+    // Debugger (MACVM_DBG_IR's promotion companion): MACVM_DBG_PROMOTE=<N>
+    // prints which gate rejects vreg N in every compile that considers it.
+    // Debug builds only, stderr.
+    #[cfg(debug_assertions)]
+    let dbg_promote: Option<u32> = std::env::var("MACVM_DBG_PROMOTE")
+        .ok()
+        .and_then(|s| s.parse().ok());
+    #[cfg(not(debug_assertions))]
+    let dbg_promote: Option<u32> = None;
+    macro_rules! dbg_reject {
+        ($t:expr, $($msg:tt)*) => {
+            if dbg_promote == Some($t) {
+                eprintln!("[promote] v{} REJECTED: {}", $t, format!($($msg)*));
+            }
+        };
+    }
+    // The OSR header's IR block index (first match = the original block —
+    // spliced blocks share the send's bci but are appended after all
+    // originals). It is a SECOND dataflow entry below: OSR execution begins
+    // there, with every candidate value undefined.
+    let osr_header: Option<usize> =
+        osr_bci.and_then(|bci| m.blocks.iter().position(|b| b.bci == bci as usize));
     'cand: for t in 1..n as u32 {
         let ti = t as usize;
+        // OSR compile: a ROOT temp is copied into the frame as a BOXED
+        // interpreter slot by the OSR entry — promoting it would type-pun
+        // that copy. Spliced temps/plumbing are dead at the header and
+        // stay eligible.
+        if osr_bci.is_some() && nil_init_in_entry[ti] {
+            dbg_reject!(t, "OSR compile: root temp (OSR entry copies boxed slots)");
+            continue;
+        }
         if m.vregs[ti].is_fp
             || claimed[ti]
             || move_defs[ti] == 0
@@ -6513,6 +6553,17 @@ fn promote_float_temps(m: &mut IrMethod) {
             || entry_used[ti]
             || nil_init_def[ti] > 1
         {
+            dbg_reject!(
+                t,
+                "basic filter: is_fp={} claimed={} move_defs={} bad_def={} entry_used={} \
+                 nil_inits={}",
+                m.vregs[ti].is_fp,
+                claimed[ti],
+                move_defs[ti],
+                bad_def[ti],
+                entry_used[ti],
+                nil_init_def[ti]
+            );
             continue;
         }
 
@@ -6527,6 +6578,7 @@ fn promote_float_temps(m: &mut IrMethod) {
                     continue; // Move { t, node } — a def of t, gated below
                 }
                 if in_tree.contains(&c) {
+                    dbg_reject!(t, "second Move def into tree node v{c}");
                     continue 'cand; // a second Move def into a tree node
                 }
                 let ci = c as usize;
@@ -6541,6 +6593,17 @@ fn promote_float_temps(m: &mut IrMethod) {
                     tree.push(c);
                     wl.push(c);
                 } else {
+                    dbg_reject!(
+                        t,
+                        "invalid copy v{c} of v{node}: move_defs={} nil_inits={} bad_def={} \
+                         entry_used={} claimed={} is_fp={}",
+                        move_defs[ci],
+                        nil_init_def[ci],
+                        bad_def[ci],
+                        entry_used[ci],
+                        claimed[ci],
+                        m.vregs[ci].is_fp
+                    );
                     continue 'cand;
                 }
             }
@@ -6554,6 +6617,14 @@ fn promote_float_temps(m: &mut IrMethod) {
             if op_uses[ni]
                 != funbox_uses[ni] + move_copy_of[ni].len() as u32 + ret_uses[ni]
             {
+                dbg_reject!(
+                    t,
+                    "node v{node} use mismatch: op_uses={} funbox={} moves={} rets={}",
+                    op_uses[ni],
+                    funbox_uses[ni],
+                    move_copy_of[ni].len(),
+                    ret_uses[ni]
+                );
                 continue 'cand;
             }
         }
@@ -6571,6 +6642,7 @@ fn promote_float_temps(m: &mut IrMethod) {
                 // Deleting the FUnbox deletes u's only def — u must not be
                 // named by any deopt metadata.
                 if deopt_used[u as usize] {
+                    dbg_reject!(t, "FUnbox dst v{u} of node v{node} is deopt-referenced");
                     continue 'cand;
                 }
                 let mut in_window = 0u32;
@@ -6584,6 +6656,7 @@ fn promote_float_temps(m: &mut IrMethod) {
                     });
                     if uses_u {
                         if redefined {
+                            dbg_reject!(t, "FUnbox dst v{u}: use stranded past a redefinition of v{node}");
                             continue 'cand; // stranded past a redefinition
                         }
                         in_window += 1;
@@ -6599,6 +6672,7 @@ fn promote_float_temps(m: &mut IrMethod) {
                     }
                 }
                 if in_window != op_uses[u as usize] {
+                    dbg_reject!(t, "FUnbox dst v{u}: cross-block use ({in_window} of {})", op_uses[u as usize]);
                     continue 'cand; // cross-block use of the unboxed value
                 }
             }
@@ -6621,7 +6695,10 @@ fn promote_float_temps(m: &mut IrMethod) {
                         Some(Root::Bits(bits)) => {
                             def_plan.insert((bi, i), DefRw::Bits(*dst, bits));
                         }
-                        None => continue 'cand,
+                        None => {
+                            dbg_reject!(t, "def Move src v{} unresolvable (chase failed)", src.0);
+                            continue 'cand;
+                        }
                     }
                 }
             }
@@ -6629,11 +6706,14 @@ fn promote_float_temps(m: &mut IrMethod) {
 
         // Defined-before-observed dataflow: no path from entry may reach an
         // observation of the tree while t is still undefined (promotion
-        // would show garbage f64 where the interpreter shows nil). A root
-        // temp (nil-init present) is implicitly visible in EVERY
-        // safepoint's scope; a non-temp vreg only where deopt metadata
-        // names it explicitly.
-        let is_temp = nil_init_def[ti] == 1;
+        // would show garbage f64 where the interpreter shows nil). A ROOT
+        // temp (nil-init in the entry block) is implicitly visible in
+        // EVERY safepoint's scope; a spliced callee temp (nil-init inside
+        // the spliced region) and plain plumbing are visible only where
+        // deopt metadata names them explicitly — which is what lets a
+        // mid-method spliced init qualify despite the caller's earlier
+        // safepoints.
+        let is_temp = nil_init_def[ti] == 1 && nil_init_in_entry[ti];
         let nb = m.blocks.len();
         let mut first_obs: Vec<Option<usize>> = vec![None; nb];
         let mut first_def: Vec<Option<usize>> = vec![None; nb];
@@ -6673,7 +6753,9 @@ fn promote_float_temps(m: &mut IrMethod) {
         loop {
             let mut changed = false;
             for bi in 0..nb {
-                let inn = bi == 0 || preds[bi].iter().any(|&p| undef_out[p]);
+                let inn = bi == 0
+                    || Some(bi) == osr_header
+                    || preds[bi].iter().any(|&p| undef_out[p]);
                 let out = if first_def[bi].is_some() { false } else { inn };
                 if inn != undef_in[bi] || out != undef_out[bi] {
                     undef_in[bi] = inn;
@@ -6693,6 +6775,7 @@ fn promote_float_temps(m: &mut IrMethod) {
                 // Observed while possibly undefined — unless a real def in
                 // this block strictly precedes the observation.
                 if first_def[bi].is_none_or(|d| o <= d) {
+                    dbg_reject!(t, "observed-while-undef in block index {bi} (obs at {o}, def {:?})", first_def[bi]);
                     continue 'cand;
                 }
             }
@@ -6928,7 +7011,7 @@ fn is_safepoint_op(ir: &Ir) -> bool {
 ///
 /// Runs after [`copy_propagate`] (which collapses the Move chains between an
 /// `FBox` and its consumer `FUnbox`, making rule 2's def visible in-block).
-pub(crate) fn reduce_float_boxes(m: &mut IrMethod, osr: bool) {
+pub(crate) fn reduce_float_boxes(m: &mut IrMethod, osr_bci: Option<u16>) {
     // ── Rule 2: per-block cancel. ────────────────────────────────────────
     for b in &mut m.blocks {
         let mut boxed_src: HashMap<u32, VReg> = HashMap::new(); // FBox dst → fp src
@@ -7028,11 +7111,13 @@ pub(crate) fn reduce_float_boxes(m: &mut IrMethod, osr: bool) {
     }
 
     // ── Rule 4 (docs B5): float-temp promotion — before the sink/census
-    // so the temp-store FBoxes it orphans die in rule 3 below. OSR compiles
-    // are gated out (the OSR entry copies boxed interpreter slots).
-    if !osr {
-        promote_float_temps(m);
-    }
+    // so the temp-store FBoxes it orphans die in rule 3 below. Under an OSR
+    // compile, ROOT temps are gated out per-candidate inside (the OSR entry
+    // copies boxed interpreter slots — which hold exactly the root temps);
+    // spliced callee temps and plumbing still promote (they are dead at
+    // every root loop header: a splice lives inside one send's bci, and the
+    // interpreter can never be mid-splice at an OSR point).
+    promote_float_temps(m, osr_bci);
 
     // ── Rule 3a: deopt-sunk boxing. An intermediate FBox whose boxed
     // result is referenced ONLY by trap-only fail blocks' reexecute
@@ -7196,8 +7281,9 @@ pub fn convert(
     rcvr_klass: KlassOop,
     method: MethodOop,
     cfg: &Cfg,
-    osr: bool,
+    osr_bci: Option<u16>,
 ) -> IrMethod {
+    let osr = osr_bci.is_some();
     let (entry_depth, _max_stack_depth) = compute_entry_depths(method, cfg);
     let sources = entry_stack_sources(cfg, &entry_depth);
 
@@ -7974,7 +8060,7 @@ pub fn convert(
         method_pool_ix,
     };
     copy_propagate(&mut irm);
-    reduce_float_boxes(&mut irm, osr);
+    reduce_float_boxes(&mut irm, osr_bci);
     irm
 }
 
@@ -8049,7 +8135,7 @@ mod tests {
         // call_site, no site_feedback entry, but ONE UncommonTrap deopt site.
         {
             let cfg = decode::decode(method);
-            let ir = convert(&vm, vm.universe.smi_klass, method, &cfg, false);
+            let ir = convert(&vm, vm.universe.smi_klass, method, &cfg, None);
             assert_eq!(
                 ir.site_feedback.len(),
                 ir.call_sites.len(),
@@ -8077,7 +8163,7 @@ mod tests {
         let epoch = vm.ic_epoch;
         InterpreterIc::at(method, 0).set_mono(&mut vm, klass, target, epoch);
         let cfg = decode::decode(method);
-        let ir = convert(&vm, vm.universe.smi_klass, method, &cfg, false);
+        let ir = convert(&vm, vm.universe.smi_klass, method, &cfg, None);
         assert_eq!(
             ir.call_sites.len(),
             1,
@@ -8131,7 +8217,7 @@ mod tests {
         InterpreterIc::at(method, 0).set_mono(&mut vm, recv_klass, val, epoch);
 
         let cfg = decode::decode(method);
-        let ir = convert(&vm, vm.universe.smi_klass, method, &cfg, false);
+        let ir = convert(&vm, vm.universe.smi_klass, method, &cfg, None);
 
         // No CallSend for the inlined site.
         assert_eq!(ir.call_sites.len(), 0, "inlined leaf → no CallSend");
@@ -8203,7 +8289,7 @@ mod tests {
         InterpreterIc::at(method, 0).set_mono(&mut vm, smi_klass, id_method, epoch);
 
         let cfg = decode::decode(method);
-        let ir = convert(&vm, vm.universe.smi_klass, method, &cfg, false);
+        let ir = convert(&vm, vm.universe.smi_klass, method, &cfg, None);
         assert_eq!(ir.call_sites.len(), 0, "^self inlined, no CallSend");
         let smi_guards = ir
             .blocks
@@ -8251,7 +8337,7 @@ mod tests {
         ic.set_mono(&mut vm, smi_klass, plus_method, epoch);
 
         let cfg = decode::decode(method);
-        let ir = convert(&vm, vm.universe.smi_klass, method, &cfg, false);
+        let ir = convert(&vm, vm.universe.smi_klass, method, &cfg, None);
 
         let (fail, a, b_) = ir.blocks[0]
             .code
@@ -8344,7 +8430,7 @@ mod tests {
         ic.set_mono(&mut vm, smi_klass, lt_method, epoch);
 
         let cfg = decode::decode(method);
-        let ir = convert(&vm, vm.universe.smi_klass, method, &cfg, false);
+        let ir = convert(&vm, vm.universe.smi_klass, method, &cfg, None);
 
         let block0 = &ir.blocks[0];
         assert!(
@@ -8408,7 +8494,7 @@ mod tests {
         ic.set_mono(&mut vm, double_klass, lt_method, epoch);
 
         let cfg = decode::decode(method);
-        let ir = convert(&vm, double_klass, method, &cfg, false);
+        let ir = convert(&vm, double_klass, method, &cfg, None);
 
         // Scan every block, not just `blocks[0]`: the double fuse finishes its
         // guard-fail trap block DURING the send's own translation, so the
@@ -8452,7 +8538,7 @@ mod tests {
         let method = b.finish(&mut vm, sel, 0, 0);
 
         let cfg = decode::decode(method);
-        let ir = convert(&vm, vm.universe.smi_klass, method, &cfg, false);
+        let ir = convert(&vm, vm.universe.smi_klass, method, &cfg, None);
 
         // Same block layout as decode::tests::leaders_if_else: 0=condition,
         // 1=true arm, 2=false arm, 3=merge.
@@ -8493,7 +8579,7 @@ mod tests {
         let method = b.finish(&mut vm, sel, 0, 0);
 
         let cfg = decode::decode(method);
-        let ir = convert(&vm, vm.universe.smi_klass, method, &cfg, false);
+        let ir = convert(&vm, vm.universe.smi_klass, method, &cfg, None);
 
         // 2 real blocks (push+jump, then the target) -- S11 step 7: no
         // extra synthetic block anymore unless one is actually NEEDED (a
@@ -8542,7 +8628,7 @@ mod tests {
         let method = b.finish(&mut vm, sel, 0, 1);
 
         let cfg = decode::decode(method);
-        let ir = convert(&vm, vm.universe.smi_klass, method, &cfg, false);
+        let ir = convert(&vm, vm.universe.smi_klass, method, &cfg, None);
 
         let stored_vreg = ir.blocks[0]
             .code
