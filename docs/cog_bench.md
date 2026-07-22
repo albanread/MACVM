@@ -120,10 +120,19 @@ load-gated (1.88), frameless emission DEFAULT-OFF (d9587cc gated):
 | **richards** | **19.6** | **22.1** | **MACVM 1.13x** |
 | **deltablue** | **2.8** | **3.4** | **MACVM 1.21x** |
 
-The 2026-07-15 richards loss (Cog 2.85x) is GONE — inverted — from work
-already landed between the snapshots (the S24 special-selector wave:
-RefCmpVal/BoolNot fusion covering richards' ~220k identity/not sends, plus
-OSR-heal). `cog_send_portability.md`'s step-0 suspicion ("re-measure before
-building") was exactly right: the per-activation send-overhead diagnosis was
-a stale-snapshot artifact. The standing "at least as fast as Cog" target is
-MET on every benchmark in the suite.
+CORRECTED TIMELINE (git-audited): BOTH scoreboards are from 2026-07-22,
+~100 minutes apart — the "07-15" date in earlier notes was wrong. The 2.85x
+snapshot is 7c495f1 (18:17); ONE commit landed in between that touches the
+delta: 20b37b0 (19:09, special selectors — RefCmpVal/BoolNot inlining
+richards' ~130k `==` + ~90k `not` sends), committed from a PARALLEL session
+mid-way through this one. The attribution is clean because everything else
+held still: Cog's numbers are stable across the two runs (richards 22.2 ->
+22.1) and so are MACVM's five micros (±4%); ONLY the two macros moved
+(richards 63.3 -> 19.6, deltablue 4.1 -> 2.8) — exactly the two workloads
+20b37b0's own commit message targets. `cog_send_portability.md`'s step-0
+("re-measure before building") was right in substance: the per-activation
+send-overhead diagnosis was already fixed by 20b37b0 before any new
+machinery was needed. The standing "at least as fast as Cog" target is MET
+on every benchmark in the suite. The harness now stamps `commit=<sha>` into
+every scoreboard header so cross-run deltas are attributable by
+construction.

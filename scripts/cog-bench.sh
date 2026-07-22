@@ -41,7 +41,12 @@ LOAD1=$(uptime | sed -E 's/.*load averages?: *([0-9.]+).*/\1/')
 if [ "${FORCE:-0}" != "1" ] && [ "$(printf '%.0f' "$LOAD1")" -ge 4 ]; then
     echo "1-min load $LOAD1 is too high for a clean comparison; wait for it to settle (or FORCE=1)."; exit 3
 fi
-echo "load=$LOAD1  rounds=$ROUNDS  macvm-threshold=$THRESH  (microsecond clock, no hard pinning — Apple Silicon)"
+# Attribution guard: every scoreboard names the EXACT tree it measured —
+# without this, a commit landing from a parallel session between two runs
+# makes the deltas look inexplicable (the 63.3ms->19.6ms richards "mystery"
+# of 2026-07-22 was exactly this: 20b37b0 landed between two same-day runs).
+GITDESC="$(git rev-parse --short HEAD 2>/dev/null || echo '?')$(git diff --quiet 2>/dev/null || echo '+dirty')"
+echo "load=$LOAD1  rounds=$ROUNDS  macvm-threshold=$THRESH  commit=$GITDESC  (microsecond clock, no hard pinning — Apple Silicon)"
 
 # Richards + DeltaBlue are translated from world/41a on the fly so the .mst
 # stays the single source of truth; the emitted fileIn carries the same
