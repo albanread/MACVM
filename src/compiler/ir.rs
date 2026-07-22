@@ -1050,11 +1050,21 @@ fn is_double_inlinable_on(vm: &VmState, method: MethodOop, ic_idx: u16) -> bool 
 /// bytecode fallback (`self asFloat * arg`) with no deopt at all. The hot path
 /// (`x + 1`, `x < n` — smi-const or smi-var args) is untouched: a `ConstSmi`
 /// arg is not a `ConstPool`, and a variable arg has some other producer.
-fn smi_fuse_arg_is_pooled(stack: &[VReg], code: &[Ir]) -> bool {
-    matches!(
-        (stack.last(), code.last()),
-        (Some(&top), Some(Ir::ConstPool { dst, .. })) if *dst == top
-    )
+fn smi_fuse_arg_is_pooled(stack: &[VReg], code: &[Ir], pool: &PoolBuilder) -> bool {
+    match (stack.last(), code.last()) {
+        (Some(&top), Some(Ir::ConstPool { dst, lit })) if *dst == top => {
+            // Decline only when the pooled literal is genuinely NOT a smi.
+            // LARGE smi literals are pooled too (only small immediates get
+            // `ConstSmi`), and declining those de-fused every smi bit-op
+            // with a big constant mask — caught by the s10_bitsOf golden
+            // (two of its band:/bxor: sites decayed to generic CallSends).
+            crate::oops::smi::SmallInt::try_from(crate::oops::Oop::from_raw(
+                pool.entries[lit.0 as usize].value,
+            ))
+            .is_none()
+        }
+        _ => false,
+    }
 }
 
 fn classify_smi_send(vm: &VmState, method: MethodOop, ic_idx: u16) -> SmiSendKind {
@@ -2423,7 +2433,7 @@ impl<'a> Translator<'a> {
                         continue;
                     }
                     if is_smi_inlinable_on(self.vm, callee, ic)
-                        && !smi_fuse_arg_is_pooled(cstack.as_slice(), code.as_slice())
+                        && !smi_fuse_arg_is_pooled(cstack.as_slice(), code.as_slice(), &self.pool)
                     {
                         debug_assert_eq!(inner_argc, 1, "SMI_INLINE ops are all binary");
                         let b_op = cstack.pop().expect("smi fuse: missing rhs");
@@ -3273,7 +3283,7 @@ impl<'a> Translator<'a> {
                             continue;
                         }
                         if is_smi_inlinable_on(self.vm, callee, ic)
-                            && !smi_fuse_arg_is_pooled(cstack.as_slice(), bcode.as_slice())
+                            && !smi_fuse_arg_is_pooled(cstack.as_slice(), bcode.as_slice(), &self.pool)
                         {
                             debug_assert_eq!(inner_argc, 1, "SMI_INLINE ops are all binary");
                             cstack_ph.truncate(cstack.len().saturating_sub(2));
@@ -4063,7 +4073,7 @@ impl<'a> Translator<'a> {
                 stack.push(dst);
             }
             Instr::Send { ic, .. }
-                if self.is_smi_inlinable(ic) && !smi_fuse_arg_is_pooled(stack, code) =>
+                if self.is_smi_inlinable(ic) && !smi_fuse_arg_is_pooled(stack, code, &self.pool) =>
             {
                 // S13 step 7b: a smi-overflow deopt is `reexecute=true` at the
                 // SEND's bci — the interpreter re-executes the WHOLE send, so
@@ -5780,7 +5790,7 @@ impl<'a> Translator<'a> {
                         continue;
                     }
                     if is_smi_inlinable_on(self.vm, block, inner_ic_idx)
-                        && !smi_fuse_arg_is_pooled(bstack.as_slice(), code.as_slice())
+                        && !smi_fuse_arg_is_pooled(bstack.as_slice(), code.as_slice(), &self.pool)
                     {
                         debug_assert_eq!(inner_argc, 1, "SMI_INLINE ops are all binary");
                         let b_op = bstack.pop().expect("smi fuse: missing rhs");
