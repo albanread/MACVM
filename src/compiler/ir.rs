@@ -1705,6 +1705,44 @@ impl<'a> Translator<'a> {
     /// `X` is a fixed-size `Format::Slots` class small enough for the inline
     /// fast path's 12-bit `add`/`str` immediates. Anything else stays an
     /// ordinary generic `basicNew` send.
+    /// The `_on` twin of [`Translator::alloc_site_klass`] for an INLINED
+    /// callee's own IC table (same pattern as the smi/array/double `_on`
+    /// twins). The RECEIVER const-class still resolves through the caller's
+    /// `const_class` map — a spliced callee's `self` aliases the caller's
+    /// receiver operand vreg directly, so `Association key: i value: last`
+    /// makes the spliced `self basicNew`'s receiver a compile-time class
+    /// constant. This is the alloc-gap fix (`docs/gc_alloc_gap.md` cost 1):
+    /// without it, every class-side constructor's `self basicNew` decayed to
+    /// a generic CallSend -> shim -> Rust prim round trip (~28 ns/object vs
+    /// the inline eden bump's 2-3 ns), and the in-splice call also poisoned
+    /// register residency (`crosses_call`).
+    fn alloc_site_klass_on(
+        &self,
+        callee: MethodOop,
+        ic_idx: u16,
+        receiver: VReg,
+    ) -> Option<(KlassOop, u32)> {
+        let klass = *self.const_class.get(&receiver.0)?;
+        let ic = InterpreterIc::at(callee, ic_idx);
+        if ic.argc() != 0 {
+            return None;
+        }
+        let target = MethodOop::try_from(ic.target())?;
+        if target.primitive() != PRIM_BASIC_NEW {
+            return None;
+        }
+        if !matches!(klass.format(), crate::oops::klass::Format::Slots) {
+            return None;
+        }
+        let size_words = klass.non_indexable_size();
+        if size_words < crate::oops::layout::HEADER_WORDS
+            || size_words * crate::oops::layout::WORD_SIZE >= 4096
+        {
+            return None;
+        }
+        Some((klass, size_words as u32))
+    }
+
     fn alloc_site_klass(&self, ic_idx: u16, receiver: VReg) -> Option<(KlassOop, u32)> {
         let klass = *self.const_class.get(&receiver.0)?;
         let ic = InterpreterIc::at(self.method, ic_idx);
@@ -2302,6 +2340,45 @@ impl<'a> Translator<'a> {
                     // the root's smi-inline path minus branch fusion; the fail
                     // edge is an InlineSite-chained reexecute trap (`a`/`b`
                     // still on the recorded stack).
+                    // S11-D7's alloc fuse, inside the splice: a spliced
+                    // constructor's `self basicNew` whose receiver is the
+                    // caller's literal class compiles to the inline eden bump
+                    // (see `alloc_site_klass_on`). Checked FIRST — an argc-0
+                    // basicNew can't collide with the array/smi/double fuses.
+                    if let Some(recv_v) = cstack.last().copied() {
+                        if let Some((klass, size_words)) =
+                            self.alloc_site_klass_on(callee, ic, recv_v)
+                        {
+                            // Alloc deopts by RE-EXECUTING the basicNew send
+                            // interpreted (reexecute=true) inside the INLINED
+                            // frame: record the body stack with the receiver
+                            // still present, plus the inline proto.
+                            let deopt_stack = cstack.clone();
+                            cstack.pop(); // consume the receiver
+                            let klass_lit =
+                                self.pool.intern(klass.oop().raw(), Some(RelocKind::Oop));
+                            let dst = self.fresh(true);
+                            deopt.push((
+                                code.len() as u32,
+                                DeoptRaw {
+                                    stack: deopt_stack,
+                                    bci: inner_bci,
+                                    kind: SafepointKind::Alloc,
+                                    reexecute: true,
+                                    stack_closures: Vec::new(),
+                                    inline: Some(inline_proto.clone()),
+                                },
+                            ));
+                            code.push(Ir::Alloc {
+                                dst,
+                                klass: klass_lit,
+                                size_words,
+                            });
+                            cstack.push(dst);
+                            bci = next;
+                            continue;
+                        }
+                    }
                     if let Some(is_put) = array_op_kind_on(self.vm, callee, ic) {
                         // S15: in-body array intrinsic (see the root arm).
                         let val = if is_put {
@@ -3107,6 +3184,45 @@ impl<'a> Translator<'a> {
                         // the phantom check: a phantom receiver is never a
                         // fusable smi site. The shadow pops in lockstep
                         // (operands are never phantoms — transparency).
+                        // S11-D7's alloc fuse in the CFG splice (see
+                        // `alloc_site_klass_on` — the constructor pattern
+                        // `Association key:value:` routes HERE: its `| a |`
+                        // temp makes the nonleaf splicer decline). Checked
+                        // first; an argc-0 basicNew never collides with the
+                        // array/smi/double fuses. A phantom receiver can't be
+                        // a class constant, so the ph shadow only truncates.
+                        if let Some(recv_v) = cstack.last().copied() {
+                            if let Some((klass, size_words)) =
+                                self.alloc_site_klass_on(callee, ic, recv_v)
+                            {
+                                let deopt_stack = cstack.clone();
+                                cstack_ph.truncate(cstack.len().saturating_sub(1));
+                                cstack.pop(); // consume the receiver
+                                let klass_lit =
+                                    self.pool.intern(klass.oop().raw(), Some(RelocKind::Oop));
+                                let dst = self.fresh(true);
+                                bdeopt.push((
+                                    bcode.len() as u32,
+                                    DeoptRaw {
+                                        stack: deopt_stack,
+                                        bci: inner_bci,
+                                        kind: SafepointKind::Alloc,
+                                        reexecute: true,
+                                        stack_closures: Vec::new(),
+                                        inline: Some(inline_proto.clone()),
+                                    },
+                                ));
+                                bcode.push(Ir::Alloc {
+                                    dst,
+                                    klass: klass_lit,
+                                    size_words,
+                                });
+                                cstack.push(dst);
+                                cstack_ph.push(false);
+                                bci = next;
+                                continue;
+                            }
+                        }
                         if let Some(is_put) = array_op_kind_on(self.vm, callee, ic) {
                             // S15: in-body array intrinsic (see the root arm).
                             let popped = if is_put { 3 } else { 2 };
