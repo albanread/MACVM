@@ -161,6 +161,10 @@ impl MemOop {
         }
     }
 
+    // Release builds no longer call this (its callers are the
+    // #[cfg(debug_assertions)] bound checks, 94ac9f8) — keep it warning-free
+    // in both profiles.
+    #[cfg_attr(not(debug_assertions), allow(dead_code))]
     fn body_word_count(self) -> usize {
         self.instance_size_words() - HEADER_WORDS
     }

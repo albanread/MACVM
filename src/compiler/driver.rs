@@ -902,6 +902,11 @@ fn compile_method_full(
             .map(|s| s.as_string())
             .unwrap_or_else(|| "?".into())
     });
+    // F1: emission is opt-in until F2's measurement holds (then F3 flips the
+    // default). Blocks keep their frames in v1 regardless — the eligibility
+    // scan's Bailout/NlrReturn disqualifiers already exclude block bodies in
+    // practice, and the `is_block` guard here makes that explicit.
+    let emit_frameless = frameless_eligible && !method.is_block() && frameless_emission_on();
 
     let mut asm = JasmAssembler::new();
     let stub_poll_addr = vm.stubs.stub_poll_addr();
@@ -1157,6 +1162,7 @@ fn compile_method_full(
             // entry guard), so verified_entry == entry.
             if method.is_block() { None } else { Some(guard) },
             osr_req.as_ref(),
+            emit_frameless,
         );
 
     // Debugger (MACVM_DBG_IR's second half): the same selector match also
@@ -2413,7 +2419,7 @@ mod tests {
 
         let mut asm = JasmAssembler::new();
         let (_blob, _pcs, _ve, _ic, safepoint_pcs, _osr_off) =
-            emit::emit(&mut asm, &ir_method, &ra, 0, 0, 0, 0, 0, 0, 0, 0, 0, None, None, None);
+            emit::emit(&mut asm, &ir_method, &ra, 0, 0, 0, 0, 0, 0, 0, 0, 0, None, None, None, false);
         assert_eq!(
             safepoint_pcs.len(),
             2,
@@ -2567,7 +2573,7 @@ mod tests {
 
         let mut asm = JasmAssembler::new();
         let (_blob, _pcs, _ve, _ic, safepoint_pcs, _osr_off) =
-            emit::emit(&mut asm, &ir_method, &ra, 0, 0, 0, 0, 0, 0, 0, 0, 0, None, None, None);
+            emit::emit(&mut asm, &ir_method, &ra, 0, 0, 0, 0, 0, 0, 0, 0, 0, None, None, None, false);
 
         let (blob, pcdescs) = build_deopt_metadata(&ir_method, &ra, &safepoint_pcs);
 
@@ -2714,4 +2720,12 @@ fn note_frameless_stats(eligible: bool, holder: &str, sel: &str) {
 fn holder_name_for_log(vm: &VmState, k: KlassOop) -> String {
     let _ = vm;
     crate::runtime::error::name_of(k.name())
+}
+
+/// F1: is frameless EMISSION enabled? `MACVM_FRAMELESS=1`, cached once (the
+/// env-var-on-a-hot-path lesson). Off by default until F2's measurement
+/// holds; F3 retires the flag.
+fn frameless_emission_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("MACVM_FRAMELESS").is_some_and(|v| v == "1"))
 }

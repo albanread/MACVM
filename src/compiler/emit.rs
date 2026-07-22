@@ -1770,6 +1770,7 @@ pub fn emit(
     prim_shim: Option<(i64, u8)>,
     guard: Option<EntryGuard>,
     osr: Option<&EmitOsr>,
+    frameless: bool,
 ) -> (
     CodeBlob,
     Vec<BlockPc>,
@@ -1854,14 +1855,37 @@ pub fn emit(
     };
 
     // Prologue (D5.2): frame_bytes = 8*frame_slots, rounded to 16.
+    //
+    // F1 (docs/frameless_leaf_methods.md §3): a FRAMELESS unit emits no
+    // prologue at all — bl left the return address in x30, sp/x29 are never
+    // touched, and the eligibility scan (driver.rs `frameless_eligible`)
+    // guarantees nothing below needs a frame: no calls (x30 stays live), no
+    // safepoints (GC can never observe this activation), no deopt edges (no
+    // metadata, no nil-fills), no spills, no residents. The asserts pin the
+    // contract so a scan hole fails loudly at compile time, not as heap
+    // corruption later.
     let frame_bytes = ((8 * regalloc.frame_slots as i64) + 15) & !15;
-    e.asm.emit(
-        "stp",
-        &[x(29), x(30), crate::compiler::assembler::mem_pre(31, -16)],
-    );
-    e.asm.emit("mov", &[x(29), sp()]);
-    if frame_bytes > 0 {
-        e.asm.emit("sub", &[sp(), sp(), imm(frame_bytes)]);
+    if frameless {
+        assert_eq!(regalloc.frame_slots, 0, "frameless unit must have no spill slots");
+        assert!(
+            regalloc.deopt_nil_init_slots.is_empty(),
+            "frameless unit must have no deopt slots"
+        );
+        assert!(prim_shim.is_none(), "frameless unit cannot be a prim-shim method");
+        assert!(osr.is_none(), "frameless unit has no Poll, so no OSR entry");
+        assert!(
+            regalloc.safepoint_positions.is_empty(),
+            "frameless unit must have no safepoints"
+        );
+    } else {
+        e.asm.emit(
+            "stp",
+            &[x(29), x(30), crate::compiler::assembler::mem_pre(31, -16)],
+        );
+        e.asm.emit("mov", &[x(29), sp()]);
+        if frame_bytes > 0 {
+            e.asm.emit("sub", &[sp(), sp(), imm(frame_bytes)]);
+        }
     }
     // Task #94: nil-fill every deopt-referenced spill slot before any block
     // code runs — the normal-entry counterpart of the OSR entry's full
@@ -1873,7 +1897,7 @@ pub fn emit(
     // stack words from dead frames at this SP depth. Params/temps among them
     // are immediately overwritten by their entry-block defs; the handful of
     // redundant stores is the price of not needing path-sensitive liveness.
-    if !regalloc.deopt_nil_init_slots.is_empty() {
+    if !frameless && !regalloc.deopt_nil_init_slots.is_empty() {
         e.asm
             .ldr_literal(xr(16), e.literal_ids[e.nil_lit.0 as usize]);
         for &slot in &regalloc.deopt_nil_init_slots {
@@ -1921,12 +1945,19 @@ pub fn emit(
     }
 
     e.asm.bind(epilogue);
-    e.asm.emit("mov", &[sp(), x(29)]);
-    e.asm.emit(
-        "ldp",
-        &[x(29), x(30), crate::compiler::assembler::mem_post(31, 16)],
-    );
-    e.asm.emit("ret", &[]);
+    if frameless {
+        // F1: no frame to unwind — x30 still holds the caller's return
+        // address (nothing in an eligible body may clobber it), so this is
+        // the whole epilogue.
+        e.asm.emit("ret", &[]);
+    } else {
+        e.asm.emit("mov", &[sp(), x(29)]);
+        e.asm.emit(
+            "ldp",
+            &[x(29), x(30), crate::compiler::assembler::mem_post(31, 16)],
+        );
+        e.asm.emit("ret", &[]);
+    }
 
     // S15 A2 step 4: the synthetic OSR entry block, emitted AFTER the whole
     // body (a cold tail — it runs exactly once per OSR transition). Shape:
@@ -2293,7 +2324,7 @@ mod tests {
         vm.universe.intern(name)
     }
 
-    fn hand_method(blocks: Vec<IrBlock>, vregs: Vec<VRegInfo>, argc: u8) -> IrMethod {
+    pub(crate) fn hand_method(blocks: Vec<IrBlock>, vregs: Vec<VRegInfo>, argc: u8) -> IrMethod {
         IrMethod {
             osr_cold_sends: 0,
             blocks,
@@ -2415,7 +2446,7 @@ mod tests {
         let ra = regalloc::regalloc(&method);
         let mut asm = JasmAssembler::new();
         let (_blob, block_pcs, _verified_entry_off, _ic_sites, _safepoints, _osr_off) =
-            emit(&mut asm, &method, &ra, 0, 0, 0, 0, 0, 0, 0, 0, 0, None, None, None);
+            emit(&mut asm, &method, &ra, 0, 0, 0, 0, 0, 0, 0, 0, 0, None, None, None, false);
 
         assert_eq!(
             block_pcs.len(),
@@ -2494,7 +2525,7 @@ mod tests {
         let ra = regalloc::regalloc(&method);
         let mut asm = JasmAssembler::new();
         let (blob, _pcs, _verified_entry_off, _ic_sites, _safepoints, _osr_off) =
-            emit(&mut asm, &method, &ra, 0, 0, 0, 0, 0, 0, 0, 0, 0, None, None, None);
+            emit(&mut asm, &method, &ra, 0, 0, 0, 0, 0, 0, 0, 0, 0, None, None, None, false);
 
         let mnemonics: Vec<&str> = blob.listing.iter().map(|l| mnemonic(l)).collect();
         let asr_pos = mnemonics.iter().position(|&m| m == "asr");
@@ -2566,7 +2597,7 @@ mod tests {
         let ra = regalloc::regalloc(&near);
         let mut asm = JasmAssembler::new();
         let (blob, _pcs, _verified_entry_off, _ic_sites, _safepoints, _osr_off) =
-            emit(&mut asm, &near, &ra, 0, 0, 0, 0, 0, 0, 0, 0, 0, None, None, None);
+            emit(&mut asm, &near, &ra, 0, 0, 0, 0, 0, 0, 0, 0, 0, None, None, None, false);
         let near_mnemonics: Vec<String> = blob.listing.iter().map(|l| mnemonic(l)).collect();
         assert!(
             near_mnemonics.iter().any(|m| m == "ldur"),
@@ -2583,7 +2614,7 @@ mod tests {
         let ra2 = regalloc::regalloc(&far);
         let mut asm2 = JasmAssembler::new();
         let (blob2, _pcs2, _verified_entry_off2, _ic_sites2, _safepoints, _osr_off) =
-            emit(&mut asm2, &far, &ra2, 0, 0, 0, 0, 0, 0, 0, 0, 0, None, None, None);
+            emit(&mut asm2, &far, &ra2, 0, 0, 0, 0, 0, 0, 0, 0, 0, None, None, None, false);
         let mnemonics: Vec<String> = blob2.listing.iter().map(|l| mnemonic(l)).collect();
         assert!(
             mnemonics.iter().any(|m| m == "sub"),
@@ -2655,6 +2686,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         let mnemonics: Vec<String> = blob.listing.iter().map(|l| mnemonic(l)).collect();
         assert!(
@@ -2692,6 +2724,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         let mnemonics2: Vec<String> = blob2.listing.iter().map(|l| mnemonic(l)).collect();
         assert!(
@@ -2773,7 +2806,7 @@ mod tests {
         let ra = regalloc::regalloc(&method);
         let mut asm = JasmAssembler::new();
         let (blob, _pcs, _ve, _ic, _safepoints, _osr_off) =
-            emit(&mut asm, &method, &ra, 0, 0, 0xAABB, 0, 0, 0, 0, 0, 0, None, None, None);
+            emit(&mut asm, &method, &ra, 0, 0, 0xAABB, 0, 0, 0, 0, 0, 0, None, None, None, false);
         let listing = blob.listing.join("\n");
         let mnemonic = |l: &str| l.split_whitespace().nth(2).unwrap_or("").to_string();
         let mnemonics: Vec<String> = blob.listing.iter().map(|l| mnemonic(l)).collect();
@@ -2873,6 +2906,7 @@ mod tests {
             None,
             Some(guard),
             None,
+            false,
         );
 
         // `verified_entry_off` must land exactly on the S10-era prologue's
@@ -2975,6 +3009,7 @@ mod tests {
         };
         let (blob, _pcs, verified_entry_off, _ic_sites, _safepoints, _osr_off) = emit(
             &mut asm, &method, &ra, 0, 0, 0, 0, 0, 0, 0, 0, 0, None, Some(guard), None,
+            false,
         );
         let guard_lines: Vec<&str> = blob
             .listing
@@ -3051,6 +3086,7 @@ mod tests {
             None,
             Some(guard),
             None,
+            false,
         );
 
         let oop_relocs: Vec<&crate::compiler::assembler::Reloc> = blob
@@ -3179,7 +3215,7 @@ mod tests {
         let ra = regalloc::regalloc(&method);
         let mut asm = JasmAssembler::new();
         let (blob, _pcs, _verified_entry_off, ic_sites, _safepoints, _osr_off) =
-            emit(&mut asm, &method, &ra, 0, 0, 0, 0, 0, 0, 0, 0, 0, None, None, None);
+            emit(&mut asm, &method, &ra, 0, 0, 0, 0, 0, 0, 0, 0, 0, None, None, None, false);
 
         assert_eq!(
             ic_sites.len(),
@@ -3217,5 +3253,75 @@ mod tests {
             ic_sites[0].off < ic_sites[1].off && ic_sites[1].off < ic_sites[2].off,
             "ic_sites must be in encounter order with strictly ascending offsets -- got {ic_sites:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod frameless_tests {
+    use super::*;
+    use crate::compiler::ir::{BlockId, Ir, IrBlock, VReg, VRegInfo};
+    use crate::compiler::jasm_assembler::JasmAssembler;
+    use crate::compiler::regalloc;
+    use super::tests::hand_method;
+
+    /// Listing format: "<pc_off>  <hex_word>  <mnemonic> [<operands>]".
+    fn mnemonic(line: &str) -> &str {
+        line.split_whitespace().nth(2).unwrap_or("")
+    }
+
+    /// F1 (docs/frameless_leaf_methods.md §3): a frameless unit emits its
+    /// guard + body + bare `ret` and NOTHING else — no stp/ldp/mov-sp, no
+    /// sub sp, no nil-fills. The framed twin of the same IR keeps them.
+    #[test]
+    fn frameless_unit_has_no_prologue_or_epilogue() {
+        let make = || {
+            let vregs = vec![VRegInfo { is_oop: true, is_fp: false }];
+            let block0 = IrBlock {
+                id: BlockId(0),
+                bci: 0,
+                code: vec![
+                    Ir::Param { dst: VReg(0), index: 0 },
+                    Ir::RetSelf,
+                ],
+                entry_stack: Vec::new(),
+                deopt_sites: Vec::new(),
+            };
+            hand_method(vec![block0], vregs, 1)
+        };
+
+        let emit_with = |frameless: bool| {
+            let method = make();
+            let ra = regalloc::regalloc(&method);
+            let mut asm = JasmAssembler::new();
+            let guard = EntryGuard {
+                smi_klass_bits: 0x1000,
+                key_klass_bits: 0x2000,
+                resolve_addr: 0x3000,
+            };
+            let (blob, _pcs, verified_entry_off, _ics, safepoints, _osr) = emit(
+                &mut asm, &method, &ra, 0, 0, 0, 0, 0, 0, 0, 0, 0, None,
+                Some(guard), None, frameless,
+            );
+            (blob, verified_entry_off, safepoints.len())
+        };
+
+        let (framed, _, _) = emit_with(false);
+        let framed_mnems: Vec<&str> = framed.listing.iter().map(|l| mnemonic(l)).collect();
+        assert!(framed_mnems.contains(&"stp"), "framed keeps its prologue: {framed_mnems:?}");
+        assert!(framed_mnems.contains(&"ldp"), "framed keeps its epilogue: {framed_mnems:?}");
+
+        let (blob, verified_entry_off, n_safepoints) = emit_with(true);
+        let mnems: Vec<&str> = blob.listing.iter().map(|l| mnemonic(l)).collect();
+        assert!(!mnems.contains(&"stp"), "frameless must not push a frame: {mnems:?}");
+        assert!(!mnems.contains(&"ldp"), "frameless must not pop a frame: {mnems:?}");
+        assert!(
+            !blob.listing.iter().any(|l| l.contains("is_sp: true")),
+            "frameless must never touch sp (listing prints operands as Reg {{ .., is_sp }}): {:?}",
+            blob.listing
+        );
+        assert_eq!(mnems.last(), Some(&"ret"), "frameless body ends in a bare ret");
+        assert_eq!(n_safepoints, 0, "frameless unit records no safepoints");
+        // The guard still precedes the (now prologue-free) verified entry.
+        assert!(verified_entry_off > 0, "guard precedes the verified entry");
     }
 }
