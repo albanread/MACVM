@@ -690,6 +690,8 @@ enum NonLeafOutcome {
 }
 
 pub struct IrMethod {
+    /// OSR-heal: see `Nmethod::osr_cold_sends` (copied there by the driver).
+    pub osr_cold_sends: u16,
     pub blocks: Vec<IrBlock>,
     pub vregs: Vec<VRegInfo>,
     pub pool: Vec<PoolEntry>,
@@ -1367,6 +1369,10 @@ struct Translator<'a> {
     inline_deps: Vec<(KlassOop, SymbolOop)>,
     /// S14 step 4b: recompilation level driving the inline budget
     /// (`inline::budget_for_level`). Tier-1 compiles are always level 1 today
+    /// OSR-heal: count of Untaken-feedback sites lowered to generic
+    /// `CallSend`s in THIS compile (only meaningful under OSR — see
+    /// `Nmethod::osr_cold_sends`).
+    osr_cold_sends: u16,
     /// (`driver::compile_method` sets `level: 1`); threaded here so the budget
     /// tracks it when higher levels arrive.
     level: u8,
@@ -2443,6 +2449,15 @@ impl<'a> Translator<'a> {
                     // `CallSend`. We do NOT recursively inline (depth-1).
                     let inner_fb =
                         crate::compiler::feedback::read_send_site(self.vm, callee, ic, None);
+
+                    if self.osr
+                        && matches!(
+                            crate::compiler::inline::decide(&inner_fb),
+                            crate::compiler::inline::InlineDecision::Trap
+                        )
+                    {
+                        self.osr_cold_sends += 1; // OSR-heal census (see root arm)
+                    }
                     // Pop the inner send's operands off the callee's own stack.
                     let mut inner_args: Vec<VReg> = (0..inner_argc)
                         .map(|_| {
@@ -3247,6 +3262,15 @@ impl<'a> Translator<'a> {
                         }
                         let inner_fb =
                             crate::compiler::feedback::read_send_site(self.vm, callee, ic, None);
+                        if self.osr
+                            && matches!(
+                                crate::compiler::inline::decide(&inner_fb),
+                                crate::compiler::inline::InlineDecision::Trap
+                            )
+                        {
+                            self.osr_cold_sends += 1; // OSR-heal census (see root arm)
+                        }
+
                         let mut inner_args: Vec<VReg> = (0..inner_argc)
                             .map(|_| cstack.pop().expect("cfg splice: send missing arg"))
                             .collect();
@@ -4427,6 +4451,19 @@ impl<'a> Translator<'a> {
                         *trapped = true;
                         return split; // (always None on the trap path)
                     }
+                }
+
+                // OSR-heal census: an `Untaken` site reaching the generic
+                // CallSend below (the S15 de-speculation kept it from
+                // trapping) marks this OSR compile HALF-WARM — see
+                // `Nmethod::osr_cold_sends`.
+                if self.osr
+                    && matches!(
+                        crate::compiler::inline::decide(&feedback),
+                        crate::compiler::inline::InlineDecision::Trap
+                    )
+                {
+                    self.osr_cold_sends += 1;
                 }
 
                 let ic_view = InterpreterIc::at(self.method, ic);
@@ -5720,6 +5757,15 @@ impl<'a> Translator<'a> {
                         inner_ic_idx,
                         None,
                     );
+                    if self.osr
+                        && matches!(
+                            crate::compiler::inline::decide(&inner_fb),
+                            crate::compiler::inline::InlineDecision::Trap
+                        )
+                    {
+                        self.osr_cold_sends += 1; // OSR-heal census (see root arm)
+                    }
+
                     let mut inner_args: Vec<VReg> = (0..inner_argc)
                         .map(|_| {
                             bstack
@@ -7728,6 +7774,7 @@ pub fn convert(
         // sets `level: 1`); the inline budget scales with this when higher
         // levels arrive (S14 step 8).
         level: 1,
+        osr_cold_sends: 0,
         const_class: HashMap::new(),
         // S14 step 7-I: run the escape pre-pass iff M creates a literal closure.
         // Hoisted above (A3b needs it for the materialize decision); a
@@ -8337,6 +8384,7 @@ pub fn convert(
     };
 
     let mut irm = IrMethod {
+        osr_cold_sends: t.osr_cold_sends,
         blocks: ir_blocks,
         vregs: t.vregs,
         pool: t.pool.entries,

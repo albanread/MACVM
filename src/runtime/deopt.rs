@@ -1026,6 +1026,7 @@ pub(crate) mod test_support {
         let sel = format!("s{:x}", code.base as usize);
         let sel_sym = vm.universe.intern(sel.as_bytes());
         Nmethod {
+            osr_cold_sends: 0,
             id: NmethodId(0),
             key_klass: vm.universe.object_klass,
             key_selector: sel_sym,

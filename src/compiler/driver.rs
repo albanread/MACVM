@@ -1304,6 +1304,11 @@ fn compile_method_full(
 
     let nm = Nmethod {
         id: NmethodId(0), // overwritten by CodeTable::install
+        osr_cold_sends: if osr_bci.is_some() {
+            ir_method.osr_cold_sends
+        } else {
+            0
+        },
         key_klass: rcvr_klass,
         key_selector,
         code: h,

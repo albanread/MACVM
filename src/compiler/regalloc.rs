@@ -1020,6 +1020,7 @@ mod tests {
 
     fn hand_method(blocks: Vec<IrBlock>, vregs: Vec<VRegInfo>) -> IrMethod {
         IrMethod {
+            osr_cold_sends: 0,
             blocks,
             vregs,
             pool: Vec::new(),
