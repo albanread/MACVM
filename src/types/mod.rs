@@ -7,14 +7,24 @@
 //! (this module must be `pub` for the separate `[[bin]]` target to reach
 //! it at all).
 //!
-//! T1 (this slice): a `TypeExpr` parser over T0′'s captured annotation
-//! text, a VM-free per-class interface builder, and three checks
-//! (`MalformedTypeExpr`, `UndeclaredTypeName`, `GenericArityMismatch`) run
-//! over the whole world. Send/method/assignment rules and the rest of the
-//! v1 error catalog are T2/T3.
+//! T1: a `TypeExpr` parser over T0′'s captured annotation text, a VM-free
+//! per-class interface builder, and three annotation-syntax checks
+//! (`MalformedTypeExpr`, `UndeclaredTypeName`, `GenericArityMismatch`).
+//!
+//! T2 (this slice): `subtype_of` (nominal, `Self`-aware, block-variant) +
+//! expression-type synthesis for the LOCAL rules — literals, plain
+//! variable references (params/temps/ivars, with real lexical scoping for
+//! block shadowing), assignments, and returns (including non-local
+//! returns lexically inside a block, which target the ENCLOSING method's
+//! own declared return type). Message sends synthesize as `Dynamic` until
+//! T3 adds the send rule — until then, an assignment/return whose RHS
+//! involves a send always trivially passes; that's expected, not a bug
+//! (design doc §6: "gradual typing finds little until signatures exist").
 
 pub mod check;
+pub mod expr_type;
 pub mod interface;
+pub mod subtype;
 pub mod type_expr;
 
 use std::path::Path;

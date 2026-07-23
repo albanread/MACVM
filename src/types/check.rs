@@ -64,6 +64,30 @@ pub enum TypeError {
         first_seen_site: AnnotationSite,
         first_seen_arity: usize,
     },
+    /// T2: the RHS of `var := expr` doesn't satisfy `var`'s declared type
+    /// (`subtype::subtype_of`). Strongtalk's own `DeltaAssignment.dlt` rule
+    /// is UNIFIED — one check regardless of whether `var` is a temp or an
+    /// ivar; an earlier draft of this catalog split that into separate
+    /// "TempInitNotSubtype"/"IvarAssignNotSubtype" kinds without checking
+    /// the source, corrected here to the single kind Strongtalk actually
+    /// has.
+    AssignmentNotSubtype {
+        site: AnnotationSite,
+        var_name: String,
+        declared: String,
+        actual: String,
+    },
+    /// T2: a `^expr` — explicit, or the implicit trailing `self` when a
+    /// method has no explicit return anywhere — doesn't satisfy the
+    /// method's own declared return type (`DeltaMethod>>typecheck`'s rule).
+    /// A `^` lexically inside a BLOCK is a non-local return from the
+    /// ENCLOSING method, so it's checked against the SAME declared type,
+    /// not the block's.
+    ReturnNotSubtype {
+        site: AnnotationSite,
+        declared: String,
+        actual: String,
+    },
 }
 
 impl fmt::Display for TypeError {
@@ -85,6 +109,23 @@ impl fmt::Display for TypeError {
                 f,
                 "{site}: '{head}' applied with {arity} type argument(s), \
                  but {first_seen_site} applied it with {first_seen_arity}"
+            ),
+            TypeError::AssignmentNotSubtype {
+                site,
+                var_name,
+                declared,
+                actual,
+            } => write!(
+                f,
+                "{site}: '{var_name}' is declared {declared}, but this assigns a {actual}"
+            ),
+            TypeError::ReturnNotSubtype {
+                site,
+                declared,
+                actual,
+            } => write!(
+                f,
+                "{site}: declared to return {declared}, but this returns a {actual}"
             ),
         }
     }
@@ -153,6 +194,11 @@ pub fn check_world(model: &WorldModel) -> Vec<TypeError> {
                         check_annotation(model, site, &t.text, &mut errors, &mut generic_arity);
                     }
                 }
+                // T2: the local rules (assignment/return) over this
+                // method's OWN body -- independent of whether its own
+                // signature is annotated (an unannotated method can still
+                // misuse an ANNOTATED ivar or an annotated sibling param).
+                super::expr_type::check_method(model, class_name, class_side, selector, m, &mut errors);
             }
         }
     }

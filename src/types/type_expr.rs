@@ -50,6 +50,58 @@ pub enum TypeExpr {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ParseError(pub String);
 
+impl std::fmt::Display for TypeExpr {
+    /// Canonical re-rendering (T2's error messages: `subtype::ResolvedType`
+    /// wraps this for "declared X, got Y"-style text) — not necessarily
+    /// byte-identical to however the original annotation was WRITTEN
+    /// (spacing, and any token `capture_pragma_body` couldn't faithfully
+    /// preserve), but round-trips through [`parse`] to the same `TypeExpr`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TypeExpr::Named(n) => write!(f, "{n}"),
+            TypeExpr::Generic { head, args } => {
+                write!(f, "{head}[")?;
+                for (i, a) in args.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ",")?;
+                    }
+                    write!(f, "{a}")?;
+                }
+                write!(f, "]")
+            }
+            TypeExpr::Block {
+                arg_types,
+                return_type,
+            } => {
+                write!(f, "[")?;
+                for (i, a) in arg_types.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ",")?;
+                    }
+                    write!(f, "{a}")?;
+                }
+                if let Some(r) = return_type {
+                    if !arg_types.is_empty() {
+                        write!(f, ",")?;
+                    }
+                    write!(f, "^{r}")?;
+                }
+                write!(f, "]")
+            }
+            TypeExpr::Union(variants) => {
+                for (i, v) in variants.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, "|")?;
+                    }
+                    write!(f, "{v}")?;
+                }
+                Ok(())
+            }
+            TypeExpr::InferenceDef(inner) => write!(f, "{inner} def"),
+        }
+    }
+}
+
 /// Parses one annotation's captured text into a [`TypeExpr`]. `Err` for
 /// anything that doesn't fully parse — including trailing text after an
 /// otherwise-complete parse, which is why this consumes to end-of-input

@@ -362,7 +362,9 @@ fn type_error_class_name(e: &macvm::types::TypeError) -> &str {
     match e {
         E::MalformedTypeExpr { site, .. }
         | E::UndeclaredTypeName { site, .. }
-        | E::GenericArityMismatch { site, .. } => &site.class_name,
+        | E::GenericArityMismatch { site, .. }
+        | E::AssignmentNotSubtype { site, .. }
+        | E::ReturnNotSubtype { site, .. } => &site.class_name,
     }
 }
 
@@ -379,6 +381,8 @@ fn print_typecheck_json(errors: &[macvm::types::TypeError]) {
             macvm::types::check::TypeError::MalformedTypeExpr { .. } => "MalformedTypeExpr",
             macvm::types::check::TypeError::UndeclaredTypeName { .. } => "UndeclaredTypeName",
             macvm::types::check::TypeError::GenericArityMismatch { .. } => "GenericArityMismatch",
+            macvm::types::check::TypeError::AssignmentNotSubtype { .. } => "AssignmentNotSubtype",
+            macvm::types::check::TypeError::ReturnNotSubtype { .. } => "ReturnNotSubtype",
         };
         print!(
             "{{\"kind\":\"{kind}\",\"message\":{}}}",

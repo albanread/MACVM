@@ -1,4 +1,4 @@
-//! T1 integration tests (`docs/typechecker_design.md` §6). Two layers:
+//! T1/T2 integration tests (`docs/typechecker_design.md` §6). Two layers:
 //! direct calls into the public `macvm::types` API (as any external
 //! consumer — the GUI, a future editor integration — would use it), and a
 //! real subprocess drive of the `macvm typecheck` CLI (`it_cli.rs`'s own
@@ -68,6 +68,57 @@ fn direct_api_reports_each_t1_error_kind() {
             .any(|e| matches!(e, TypeError::GenericArityMismatch { head, .. } if head == "Cltn")),
         "expected a GenericArityMismatch between 'Cltn[Object]' and \
          'Cltn[Object, Object]', got {errors:#?}"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// T2's two new error kinds, through the SAME public API a T1 caller
+/// would use. `types::expr_type`'s own `src/types/` unit tests already
+/// cover the underlying rules in depth (shadowing, non-local returns,
+/// the implicit `^self` case, …) — this just confirms they surface
+/// correctly through `typecheck_world`, not only from inside the module.
+#[test]
+fn direct_api_reports_each_t2_error_kind() {
+    let dir = temp_world_dir("direct_api_t2");
+    std::fs::write(dir.join("00_object.mst"), "nil subclass: Object [\n]\n").unwrap();
+    std::fs::write(
+        dir.join("01_tower.mst"),
+        "Object subclass: Integer [\n]\nObject subclass: String [\n]\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("02_foo.mst"),
+        "Object subclass: Foo [\n\
+         \x20   badAssign [\n\
+         \x20       | x <Integer> |\n\
+         \x20       x := 'hello'.\n\
+         \x20       ^x\n\
+         \x20   ]\n\
+         \x20   badReturn ^ <Integer> [\n\
+         \x20       ^'hello'\n\
+         \x20   ]\n\
+         ]\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("world.list"),
+        "00_object.mst\n01_tower.mst\n02_foo.mst\n",
+    )
+    .unwrap();
+
+    let (_model, errors) = typecheck_world(&dir).expect("typecheck the fixture");
+    assert!(
+        errors
+            .iter()
+            .any(|e| matches!(e, TypeError::AssignmentNotSubtype { var_name, .. } if var_name == "x")),
+        "expected an AssignmentNotSubtype from x := 'hello', got {errors:#?}"
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|e| matches!(e, TypeError::ReturnNotSubtype { .. })),
+        "expected a ReturnNotSubtype from ^'hello' against ^<Integer>, got {errors:#?}"
     );
 
     std::fs::remove_dir_all(&dir).ok();
