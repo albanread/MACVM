@@ -586,6 +586,7 @@ mod tests {
 
     fn method(params: &[&str], temps: &[&str], body: Vec<Expr>) -> MethodNode {
         MethodNode {
+            type_sig: Default::default(),
             pattern_selector: "m".to_string(),
             params: params.iter().map(|s| s.to_string()).collect(),
             primitive: None,

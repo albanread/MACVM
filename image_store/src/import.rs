@@ -227,8 +227,89 @@ pub fn import_list_file(image: &Image, world_dir: &Path, list_file: &str) -> Res
                     })?;
             }
         }
+        capture_type_signatures(image, &text, filename)?;
     }
     Ok(stats)
+}
+
+/// T0′ (`docs/typechecker_design.md` §5.1/§6): re-parses `text` with the
+/// REAL frontend parser (the same one `frontend::classdef::execute_top_item`
+/// compiles from — deliberately not `mst.rs`'s own lightweight text
+/// extractor, which was never meant to understand annotation syntax) and
+/// records each method's captured `MethodSignature` into `method_signatures`,
+/// keyed by whatever version `add_method`/`set_method_source` just wrote for
+/// it above. Best-effort and NON-FATAL: this file's classes/methods are
+/// already durably recorded by the extraction loop above by the time this
+/// runs, and a parse discrepancy here (there should never be one — the real
+/// parser accepts a strict superset of what `mst.rs` does, annotations) must
+/// never take down the primary import path over what is, for now, pure
+/// analysis metadata nothing yet reads back.
+fn capture_type_signatures(image: &Image, text: &str, filename: &str) -> Result<(), String> {
+    let Ok(items) = macvm::frontend::parser::parse_file(text) else {
+        return Ok(());
+    };
+    for item in items {
+        let macvm::frontend::ast::TopItem::ClassDef(c) = item else {
+            continue;
+        };
+        for m in &c.methods {
+            if m.type_sig.return_type.is_none()
+                && m.type_sig.param_types.iter().all(Option::is_none)
+                && m.type_sig.temp_types.iter().all(Option::is_none)
+            {
+                continue; // nothing annotated -> no row (absence IS "Dynamic")
+            }
+            let side = if m.class_side {
+                Side::Class
+            } else {
+                Side::Instance
+            };
+            let Some(version_id) = image
+                .latest_method_version_id(&c.name, side, &m.pattern_selector)
+                .map_err(|e| format!("{filename}: latest_method_version_id: {e}"))?
+            else {
+                continue; // extraction loop above didn't record this method (shouldn't happen)
+            };
+            image
+                .set_method_signature(
+                    version_id,
+                    m.type_sig.return_type.as_ref().map(|t| t.text.as_str()),
+                    &type_annotations_to_json(&m.type_sig.param_types),
+                    &type_annotations_to_json(&m.type_sig.temp_types),
+                )
+                .map_err(|e| format!("{filename}: set_method_signature: {e}"))?;
+        }
+    }
+    Ok(())
+}
+
+/// `[null,"Integer",null]`-shaped JSON, minimally hand-rolled (no JSON crate
+/// dependency for one array-of-nullable-strings shape) — `TypeAnnotation`
+/// text is reconstructed from tokens (`parser::render_annotation_tok`), but
+/// escaped here anyway rather than trusting that will always stay true.
+fn type_annotations_to_json(types: &[Option<macvm::frontend::ast::TypeAnnotation>]) -> String {
+    let mut s = String::from("[");
+    for (i, t) in types.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        match t {
+            Some(t) => {
+                s.push('"');
+                for ch in t.text.chars() {
+                    match ch {
+                        '"' => s.push_str("\\\""),
+                        '\\' => s.push_str("\\\\"),
+                        c => s.push(c),
+                    }
+                }
+                s.push('"');
+            }
+            None => s.push_str("null"),
+        }
+    }
+    s.push(']');
+    s
 }
 
 /// The file's basename minus a leading `NN_`/`NNa_` load-order prefix
@@ -377,5 +458,54 @@ mod tests {
             vec!["object".to_string(), "ordered".to_string()]
         );
         assert_eq!(image.package_lists().unwrap(), vec!["world".to_string()]);
+    }
+
+    /// T0′ (`docs/typechecker_design.md` §5.1/§6): a method carrying type
+    /// annotations gets a `method_signatures` row (ret type + JSON arg/temp
+    /// arrays, `null` for the unannotated slot); a method with none gets NO
+    /// row at all — "absence is Dynamic," not an all-null row.
+    #[test]
+    fn import_captures_type_signatures() {
+        let dir = temp_world_dir("type_sigs");
+        fs::write(
+            dir.join("01_object.mst"),
+            "Object subclass: Foo [\n\
+             \x20   bump: n <Integer> ^ <Integer> [\n\
+             \x20       | r <Integer> |\n\
+             \x20       r := n.\n\
+             \x20       ^r\n\
+             \x20   ]\n\
+             \x20   bar [ ^1 ]\n\
+             ]\n",
+        )
+        .unwrap();
+        fs::write(dir.join("world.list"), "01_object.mst\n").unwrap();
+
+        let image = Image::open_in_memory().unwrap();
+        import_world_dir(&image, &dir).unwrap();
+
+        let annotated_vid = image
+            .latest_method_version_id("Foo", Side::Instance, "bump:")
+            .unwrap()
+            .expect("bump: was imported");
+        let (ret, args, temps) = image
+            .method_signature(annotated_vid)
+            .unwrap()
+            .expect("bump: has a captured signature");
+        assert_eq!(ret.as_deref(), Some("Integer"));
+        assert_eq!(args, "[\"Integer\"]");
+        assert_eq!(temps, "[\"Integer\"]");
+
+        let unannotated_vid = image
+            .latest_method_version_id("Foo", Side::Instance, "bar")
+            .unwrap()
+            .expect("bar was imported");
+        assert_eq!(
+            image.method_signature(unannotated_vid).unwrap(),
+            None,
+            "an unannotated method must get NO row, not an all-null one"
+        );
+
+        fs::remove_dir_all(&dir).ok();
     }
 }

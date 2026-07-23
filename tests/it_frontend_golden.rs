@@ -338,3 +338,89 @@ fn reopen_object_via_nil_superclass() {
     let result = macvm::interpreter::run_method(&mut vm, m, recv, &[]);
     assert_eq!(result, macvm::oops::smi::SmallInt::new(42).oop());
 }
+
+/// T0′'s differential gate (`docs/typechecker_design.md` §7.2): a
+/// Strongtalk-style type annotation at every capture position — instance
+/// variable, class-side keyword-arg + temp + return type, binary-arg +
+/// return type, unary return type, and a block-type/generic-shaped
+/// annotation (`[Integer, ^Boolean]`, `Cltn[Integer]`) exercising the
+/// bracket/comma/caret rendering in `parser::capture_pragma_body` — must
+/// compile to BYTE-IDENTICAL bytecode as the exact same program with every
+/// annotation removed. This is the machine-checked form of the D11 comment
+/// ("annotations must never change dynamic behavior"): T0′ made the parser
+/// CAPTURE annotations instead of discarding them, and this test is what
+/// keeps that capture from ever leaking into codegen.
+#[test]
+fn type_annotations_are_erased_before_codegen() {
+    const ANNOTATED: &str = "
+Object subclass: TAnnot [
+    | count <Integer> |
+    TAnnot class >> make: n <Integer> ^ <TAnnot> [
+        | t <Integer> |
+        t := n.
+        ^self new
+    ]
+    bump: amount <Integer> ^ <Integer> [
+        | r <Integer> |
+        r := amount + count.
+        ^r
+    ]
+    < other <Magnitude> ^ <Boolean> [
+        ^count < other
+    ]
+    total ^ <Integer> [
+        ^count
+    ]
+    each: aBlock <[Integer, ^Boolean]> upTo: limit <Cltn[Integer]> ^ <Boolean> [
+        ^true
+    ]
+]
+";
+    const STRIPPED: &str = "
+Object subclass: TAnnot [
+    | count |
+    TAnnot class >> make: n [
+        | t |
+        t := n.
+        ^self new
+    ]
+    bump: amount [
+        | r |
+        r := amount + count.
+        ^r
+    ]
+    < other [
+        ^count < other
+    ]
+    total [
+        ^count
+    ]
+    each: aBlock upTo: limit [
+        ^true
+    ]
+]
+";
+    const INSTANCE_SELECTORS: &[&str] = &["bump:", "<", "total", "each:upTo:"];
+
+    fn compile_and_disassemble(src: &str) -> String {
+        let mut vm = common::test_vm();
+        load_source(&mut vm, src);
+        let klass = klass_named(&mut vm, "TAnnot");
+        let mut text = String::new();
+        let ctor = method_named(&mut vm, klass.klass(), "make:");
+        disassemble_deep(&vm, ctor, &mut text);
+        for sel in INSTANCE_SELECTORS {
+            let m = method_named(&mut vm, klass, sel);
+            disassemble_deep(&vm, m, &mut text);
+        }
+        text
+    }
+
+    let annotated = compile_and_disassemble(ANNOTATED);
+    let stripped = compile_and_disassemble(STRIPPED);
+    assert_eq!(
+        annotated, stripped,
+        "type annotations changed codegen — this must NEVER happen \
+         (docs/typechecker_design.md §7.2's differential gate)"
+    );
+}

@@ -1185,6 +1185,7 @@ pub fn compile_doit(
         body: vec![stmt],
         class_side: false,
         span,
+        type_sig: Default::default(),
     };
     compile_method_inner(vm, holder, false, true, &mut method)
 }
@@ -1482,6 +1483,7 @@ mod tests {
 
         let sp = Span { line: 0, col: 0 };
         let mut m1 = MethodNode {
+            type_sig: Default::default(),
             pattern_selector: "m".into(),
             params: vec![],
             primitive: None,
@@ -1510,6 +1512,7 @@ mod tests {
         );
 
         let mut m2 = MethodNode {
+            type_sig: Default::default(),
             pattern_selector: "m2".into(),
             params: vec![],
             primitive: None,
@@ -1548,6 +1551,7 @@ mod tests {
     fn resolve_unbound() {
         let mut vm = test_vm();
         let mut m = MethodNode {
+            type_sig: Default::default(),
             pattern_selector: "m".into(),
             params: vec![],
             primitive: None,
@@ -1588,6 +1592,7 @@ mod tests {
         let mut vm = test_vm();
         let sp = Span { line: 0, col: 0 };
         let mut m = MethodNode {
+            type_sig: Default::default(),
             pattern_selector: "m".into(),
             params: vec![],
             primitive: None,
@@ -1633,6 +1638,7 @@ mod tests {
         let sp = Span { line: 0, col: 0 };
         let recv = || Box::new(Expr::SelfRef(sp));
         let mut m = MethodNode {
+            type_sig: Default::default(),
             pattern_selector: "m".into(),
             params: vec![],
             primitive: None,
@@ -1686,6 +1692,7 @@ mod tests {
         let sp = Span { line: 0, col: 0 };
 
         let mut m1 = MethodNode {
+            type_sig: Default::default(),
             pattern_selector: "a:b:".into(),
             params: vec!["a".into(), "b".into()],
             primitive: None,
@@ -1703,6 +1710,7 @@ mod tests {
         assert!(!c1.prim_fails());
 
         let mut m2 = MethodNode {
+            type_sig: Default::default(),
             pattern_selector: "m2".into(),
             params: vec![],
             primitive: None,
@@ -1726,6 +1734,7 @@ mod tests {
         assert_eq!(c2.nctx(), 1);
 
         let mut m3 = MethodNode {
+            type_sig: Default::default(),
             pattern_selector: "m3".into(),
             params: vec![],
             primitive: Some(7),
@@ -1740,6 +1749,7 @@ mod tests {
         assert_eq!(c3.primitive(), 7);
 
         let mut m4 = MethodNode {
+            type_sig: Default::default(),
             pattern_selector: "m4".into(),
             params: vec![],
             primitive: Some(7),
@@ -1753,6 +1763,7 @@ mod tests {
         assert!(!c4.prim_fails());
 
         let mut m5 = MethodNode {
+            type_sig: Default::default(),
             pattern_selector: "m5".into(),
             params: vec![],
             primitive: None,
@@ -1780,6 +1791,7 @@ mod tests {
         // 18 hex F's = 72 magnitude bits, past the 61-bit smi range.
         let mag = int_lit_magnitude(16, "FFFFFFFFFFFFFFFFFF");
         let mut m = MethodNode {
+            type_sig: Default::default(),
             pattern_selector: "m".into(),
             params: vec![],
             primitive: None,

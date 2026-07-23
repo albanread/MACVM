@@ -95,6 +95,30 @@ pub struct BlockNode {
     pub scope_id: u32,
 }
 
+/// T0′ (`docs/typechecker_design.md` §3): a captured Strongtalk-style type
+/// annotation — the token text between `<` and `>` (exclusive), reconstructed
+/// from the token stream rather than sliced from source (the lexer's `Span`
+/// is line/col only, not a byte offset). `text` is NOT re-parsed here; T1
+/// builds a real `TypeExpr` from it. Never consulted by codegen — see
+/// `tests/it_frontend_golden.rs`'s annotated-vs-stripped differential, which
+/// exists specifically to keep that true.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TypeAnnotation {
+    pub text: String,
+    pub span: Span,
+}
+
+/// T0′: a method's own captured signature — `None`/empty means unannotated
+/// (the type system's `Dynamic`, §4). Parallel to `MethodNode::params`/
+/// `temps` by index; never consulted outside `image_store`'s export and the
+/// (not-yet-built) `macvm typecheck` subcommand.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MethodSignature {
+    pub param_types: Vec<Option<TypeAnnotation>>,
+    pub return_type: Option<TypeAnnotation>,
+    pub temp_types: Vec<Option<TypeAnnotation>>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct MethodNode {
     pub pattern_selector: String,
@@ -110,6 +134,8 @@ pub struct MethodNode {
     pub body: Vec<Expr>,
     pub class_side: bool,
     pub span: Span,
+    /// T0′: captured type annotations, if any (`docs/typechecker_design.md`).
+    pub type_sig: MethodSignature,
 }
 
 /// S20 FFI: the parsed body of a `<primitive: FFI ...>` pragma (docs/FFI.md
@@ -154,6 +180,9 @@ pub struct ClassDefNode {
     pub name: String,
     pub indexable: Option<Indexable>,
     pub inst_vars: Vec<String>,
+    /// T0′: captured type annotations, parallel to `inst_vars` by index
+    /// (`docs/typechecker_design.md` §3's "typed instance variables").
+    pub inst_var_types: Vec<Option<TypeAnnotation>>,
     pub class_vars: Vec<String>,
     pub methods: Vec<MethodNode>,
     pub span: Span,

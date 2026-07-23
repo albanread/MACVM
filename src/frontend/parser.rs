@@ -6,7 +6,8 @@
 use crate::oops::layout::{SMI_MAX, SMI_MIN};
 
 use super::ast::{
-    BlockNode, ClassDefNode, Expr, FfiPragma, Indexable, Literal, MethodNode, TopItem,
+    BlockNode, ClassDefNode, Expr, FfiPragma, Indexable, Literal, MethodNode, MethodSignature,
+    TopItem, TypeAnnotation,
 };
 use super::lexer::{int_lit_magnitude, Lexer, Span, Tok};
 use super::CompileError;
@@ -19,11 +20,43 @@ enum ClassPragma {
 
 const RESERVED: &[&str] = &["self", "super", "nil", "true", "false"];
 
-/// `(primitive id, FFI pragma, temporaries, statements)` — a parsed
-/// `method_body`. `primitive`/`ffi` are never both `Some` — S20's
-/// `<primitive: FFI …>` (`ast::FfiPragma`) is parsed as a DISTINCT pragma
-/// shape from the bare `<primitive: N>` integer form, not a variant of it.
-type MethodBody = (Option<u16>, Option<FfiPragma>, Vec<String>, Vec<Expr>);
+/// T0′ (`docs/typechecker_design.md` §3): render one token back to the text
+/// [`Parser::capture_pragma_body`] accumulates for a type annotation.
+/// `(text, is_word)` — `is_word` is true for `Ident`/`Keyword` (so the
+/// caller can space-separate two adjacent words); every other token is
+/// punctuation that a Strongtalk type expression writes tight against its
+/// neighbors (`Cltn[E]`, `[E,^Boolean]`, `EX|X`). Tokens that cannot occur
+/// in real Strongtalk type syntax (string/char/number literals, `;`, `:=`)
+/// fall through to an empty, non-word piece — dropped from the text rather
+/// than erroring, since T0′ only needs a best-effort capture for T1 to
+/// re-parse, not a rejection of malformed annotations no one writes.
+fn render_annotation_tok(tok: &Tok) -> (String, bool) {
+    match tok {
+        Tok::Ident(s) | Tok::Keyword(s) => (s.clone(), true),
+        Tok::BinarySel(s) => (s.clone(), false), // e.g. ',' (union/generic-arg separator)
+        Tok::VBar => ("|".to_string(), false),   // union type, `EX | X`
+        Tok::Caret => ("^".to_string(), false),  // block-type return arrow, `[E, ^Boolean]`
+        Tok::LBracket => ("[".to_string(), false),
+        Tok::RBracket => ("]".to_string(), false),
+        Tok::LParen => ("(".to_string(), false),
+        Tok::RParen => (")".to_string(), false),
+        _ => (String::new(), false),
+    }
+}
+
+/// `(primitive id, FFI pragma, temporaries, temp type annotations,
+/// statements)` — a parsed `method_body`. `primitive`/`ffi` are never both
+/// `Some` — S20's `<primitive: FFI …>` (`ast::FfiPragma`) is parsed as a
+/// DISTINCT pragma shape from the bare `<primitive: N>` integer form, not a
+/// variant of it. `temp type annotations` is T0′'s addition, parallel to
+/// `temporaries` by index (`docs/typechecker_design.md` §3).
+type MethodBody = (
+    Option<u16>,
+    Option<FfiPragma>,
+    Vec<String>,
+    Vec<Option<TypeAnnotation>>,
+    Vec<Expr>,
+);
 
 fn is_reserved(name: &str) -> bool {
     RESERVED.contains(&name)
@@ -671,12 +704,16 @@ impl<'a> Parser<'a> {
                 let pspan = self.cur.1;
                 let name = self.expect_ident("expected a parameter name after ':'")?;
                 self.check_not_reserved(pspan, &name)?;
-                self.skip_type_annotation()?; // `[:x <Integer> | ...]` (D11)
+                // Captured then dropped: block-level annotations are out of
+                // T0′ scope (docs/typechecker_design.md §3 captures only a
+                // METHOD's own signature) — this still has to CONSUME the
+                // tokens, just doesn't keep the result.
+                let _ = self.capture_type_annotation()?; // `[:x <Integer> | ...]` (D11)
                 params.push(name);
             }
             self.expect(&Tok::VBar, "expected '|' after block parameters")?;
         }
-        let temps = self.parse_optional_temps()?;
+        let (temps, _temp_types) = self.parse_optional_temps()?;
         let body = self.parse_statements()?;
         self.expect(&Tok::RBracket, "expected ']' to close block")?;
         Ok(BlockNode {
@@ -688,57 +725,70 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn parse_optional_temps(&mut self) -> Result<Vec<String>, CompileError> {
+    /// Shared by [`Self::parse_block`] (which discards the returned types —
+    /// out of T0′ scope) and [`Self::parse_method_body`] (which keeps them
+    /// as the method's own `MethodSignature::temp_types`).
+    fn parse_optional_temps(
+        &mut self,
+    ) -> Result<(Vec<String>, Vec<Option<TypeAnnotation>>), CompileError> {
         let mut temps = Vec::new();
+        let mut temp_types = Vec::new();
         if matches!(self.cur.0, Tok::VBar) {
             self.bump()?;
             while let Tok::Ident(n) = self.cur.0.clone() {
                 self.check_not_reserved(self.cur.1, &n)?;
                 temps.push(n);
                 self.bump()?;
-                self.skip_type_annotation()?; // `| x <Integer> |` (D11)
+                temp_types.push(self.capture_type_annotation()?); // `| x <Integer> |` (D11)
             }
             self.expect(&Tok::VBar, "expected closing '|' after temporaries")?;
         }
-        Ok(temps)
+        Ok((temps, temp_types))
     }
 
     // --- pragmas --------------------------------------------------------------
 
-    /// SPEC §1 / DESIGN.md D11: Strongtalk-style TYPE ANNOTATIONS are
-    /// accepted and DISCARDED — "annotations must never change dynamic
-    /// behavior", and this runtime is deliberately untyped (the Strongtalk
-    /// erasure stance: the checker was a separate tool; the compiler never
-    /// consumed annotations). Grammar positions: after a declared
-    /// instance-variable/temporary name, after a method parameter, after a
-    /// block parameter, and `^<T>` after a message pattern. On `<`, consume
-    /// the balanced body with the SAME lexer discipline pragmas use (pragma
-    /// mode, L10: every `>` closes — so nested `<Blk<^Integer>>` closers
-    /// never merge into `>>`) and keep nothing: no AST, no cost downstream.
-    fn skip_type_annotation(&mut self) -> Result<(), CompileError> {
-        if matches!(&self.cur.0, Tok::BinarySel(s) if s == "<") {
-            self.lx.set_pragma_mode(true);
-            self.bump()?; // '<'
-            self.skip_pragma_body(1)?;
+    /// SPEC §1 / DESIGN.md D11, extended by T0′ (`docs/typechecker_design.md`
+    /// §3/§6): Strongtalk-style TYPE ANNOTATIONS are accepted and CAPTURED —
+    /// "annotations must never change dynamic behavior" still holds (codegen
+    /// never reads `TypeAnnotation`; the differential test enforces it), but
+    /// their token text is now kept for the not-yet-built typechecker instead
+    /// of being thrown away. Grammar positions: after a declared instance-
+    /// variable/temporary name, after a method parameter, after a block
+    /// parameter, and `^<T>` after a message pattern. On `<`, consume the
+    /// balanced body with the SAME lexer discipline pragmas use (pragma mode,
+    /// L10: every `>` closes — so nested `<Blk<^Integer>>` closers never
+    /// merge into `>>`), rendering each token back to text as it's consumed
+    /// (the lexer's `Span` is line/col only, not a byte offset, so slicing
+    /// the original source isn't available here). The outer `<`/`>` are the
+    /// annotation's OWN delimiters and are not part of the captured text;
+    /// any NESTED `<...>` is.
+    fn capture_type_annotation(&mut self) -> Result<Option<TypeAnnotation>, CompileError> {
+        if !matches!(&self.cur.0, Tok::BinarySel(s) if s == "<") {
+            return Ok(None);
         }
-        Ok(())
+        let span = self.cur.1;
+        self.lx.set_pragma_mode(true);
+        self.bump()?; // '<' (the outer delimiter — not captured)
+        let text = self.capture_pragma_body(1)?;
+        Ok(Some(TypeAnnotation { text, span }))
     }
 
     /// The `^<ReturnType>` half of a Strongtalk method signature, between the
     /// message pattern and the body's `[`. A bare `^` here is never valid
     /// Smalltalk, so requiring the annotation after it costs nothing.
-    fn skip_return_type_annotation(&mut self) -> Result<(), CompileError> {
-        if matches!(self.cur.0, Tok::Caret) {
-            self.bump()?;
-            if !matches!(&self.cur.0, Tok::BinarySel(s) if s == "<") {
-                return Err(self.error(
-                    self.cur.1,
-                    "expected a type annotation after '^' in a method pattern",
-                ));
-            }
-            self.skip_type_annotation()?;
+    fn capture_return_type_annotation(&mut self) -> Result<Option<TypeAnnotation>, CompileError> {
+        if !matches!(self.cur.0, Tok::Caret) {
+            return Ok(None);
         }
-        Ok(())
+        self.bump()?;
+        if !matches!(&self.cur.0, Tok::BinarySel(s) if s == "<") {
+            return Err(self.error(
+                self.cur.1,
+                "expected a type annotation after '^' in a method pattern",
+            ));
+        }
+        self.capture_type_annotation()
     }
 
     fn skip_pragma_body(&mut self, mut depth: u32) -> Result<(), CompileError> {
@@ -760,6 +810,52 @@ impl<'a> Parser<'a> {
                 }
                 Tok::Eof => return Err(self.error(self.cur.1, "unterminated pragma")),
                 _ => self.bump()?,
+            }
+        }
+    }
+
+    /// T0′'s capturing twin of [`Self::skip_pragma_body`] — same depth
+    /// discipline (every `>` closes one level; the outer pair's own `<`/`>`
+    /// are never pushed to `text`, only nested ones), but renders each
+    /// consumed token back to source-like text via [`render_annotation_tok`]
+    /// instead of discarding it. Word tokens (`Ident`/`Keyword`) get a single
+    /// separating space so e.g. `EX X` (two adjacent identifiers, which can't
+    /// occur in valid Strongtalk type syntax but costs nothing to guard)
+    /// never glues into one word; everything else (`[`, `]`, `,`, `^`, `|`,
+    /// nested `<`/`>`) is emitted tight, matching how these forms are
+    /// written in Strongtalk sources (`Cltn[E]`, `[E,^Boolean]`, `EX|X`).
+    fn capture_pragma_body(&mut self, mut depth: u32) -> Result<String, CompileError> {
+        let mut text = String::new();
+        let mut prev_was_word = false;
+        loop {
+            match &self.cur.0 {
+                Tok::BinarySel(s) if s == "<" => {
+                    depth += 1;
+                    text.push('<'); // depth was >=1 already -> this one is nested content
+                    self.bump()?;
+                    prev_was_word = false;
+                }
+                Tok::BinarySel(s) if s == ">" => {
+                    depth -= 1;
+                    if depth == 0 {
+                        self.lx.set_pragma_mode(false);
+                        self.bump()?;
+                        return Ok(text);
+                    }
+                    text.push('>'); // still nested -> part of the content
+                    self.bump()?;
+                    prev_was_word = false;
+                }
+                Tok::Eof => return Err(self.error(self.cur.1, "unterminated pragma")),
+                other => {
+                    let (piece, is_word) = render_annotation_tok(other);
+                    if is_word && prev_was_word {
+                        text.push(' ');
+                    }
+                    text.push_str(&piece);
+                    prev_was_word = is_word;
+                    self.bump()?;
+                }
             }
         }
     }
@@ -1017,41 +1113,47 @@ impl<'a> Parser<'a> {
 
     // --- methods --------------------------------------------------------------
 
-    fn parse_pattern(&mut self) -> Result<(String, Vec<String>), CompileError> {
+    /// Third element: one captured [`TypeAnnotation`] per param, parallel to
+    /// the second (T0′, `docs/typechecker_design.md` §3).
+    #[allow(clippy::type_complexity)]
+    fn parse_pattern(
+        &mut self,
+    ) -> Result<(String, Vec<String>, Vec<Option<TypeAnnotation>>), CompileError> {
         match self.cur.0.clone() {
             Tok::Ident(name) => {
                 self.bump()?;
-                Ok((name, vec![]))
+                Ok((name, vec![], vec![]))
             }
             Tok::BinarySel(sel) => {
                 self.bump()?;
                 let pspan = self.cur.1;
                 let p = self.expect_ident("expected a parameter name after binary selector")?;
                 self.check_not_reserved(pspan, &p)?;
-                self.skip_type_annotation()?; // `< other <Magnitude>` (D11)
-                Ok((sel, vec![p]))
+                let ty = self.capture_type_annotation()?; // `< other <Magnitude>` (D11)
+                Ok((sel, vec![p], vec![ty]))
             }
             Tok::VBar => {
                 self.bump()?;
                 let pspan = self.cur.1;
                 let p = self.expect_ident("expected a parameter name after '|'")?;
                 self.check_not_reserved(pspan, &p)?;
-                self.skip_type_annotation()?; // (D11)
-                Ok(("|".to_string(), vec![p]))
+                let ty = self.capture_type_annotation()?; // (D11)
+                Ok(("|".to_string(), vec![p], vec![ty]))
             }
             Tok::Keyword(_) => {
                 let mut sel = String::new();
                 let mut params = Vec::new();
+                let mut param_types = Vec::new();
                 while let Tok::Keyword(k) = self.cur.0.clone() {
                     sel.push_str(&k);
                     self.bump()?;
                     let pspan = self.cur.1;
                     let p = self.expect_ident("expected a parameter name after keyword")?;
                     self.check_not_reserved(pspan, &p)?;
-                    self.skip_type_annotation()?; // `add: n <Integer>` (D11)
+                    param_types.push(self.capture_type_annotation()?); // `add: n <Integer>` (D11)
                     params.push(p);
                 }
-                Ok((sel, params))
+                Ok((sel, params, param_types))
             }
             _ => Err(self.error(self.cur.1, "invalid method pattern")),
         }
@@ -1071,17 +1173,17 @@ impl<'a> Parser<'a> {
                 ffi = pragma_ffi;
             }
         }
-        let temps = self.parse_optional_temps()?;
+        let (temps, temp_types) = self.parse_optional_temps()?;
         let body = self.parse_statements()?;
-        Ok((primitive, ffi, temps, body))
+        Ok((primitive, ffi, temps, temp_types, body))
     }
 
     fn parse_method(&mut self, class_side: bool) -> Result<MethodNode, CompileError> {
         let span = self.cur.1;
-        let (pattern_selector, params) = self.parse_pattern()?;
-        self.skip_return_type_annotation()?; // `^<Integer>` before the body (D11)
+        let (pattern_selector, params, param_types) = self.parse_pattern()?;
+        let return_type = self.capture_return_type_annotation()?; // `^<Integer>` before the body (D11)
         self.expect(&Tok::LBracket, "expected '[' to start method body")?;
-        let (primitive, ffi, temps, body) = self.parse_method_body()?;
+        let (primitive, ffi, temps, temp_types, body) = self.parse_method_body()?;
         self.expect(&Tok::RBracket, "expected ']' to close method body")?;
         Ok(MethodNode {
             pattern_selector,
@@ -1092,6 +1194,11 @@ impl<'a> Parser<'a> {
             body,
             class_side,
             span,
+            type_sig: MethodSignature {
+                param_types,
+                return_type,
+                temp_types,
+            },
         })
     }
 
@@ -1106,6 +1213,7 @@ impl<'a> Parser<'a> {
 
         let mut indexable = None;
         let mut inst_vars = Vec::new();
+        let mut inst_var_types = Vec::new();
         let mut class_vars = Vec::new();
         let mut methods = Vec::new();
 
@@ -1140,10 +1248,11 @@ impl<'a> Parser<'a> {
                         let mspan = self.cur.1;
                         let param = self.expect_ident("expected a parameter name")?;
                         self.check_not_reserved(mspan, &param)?;
-                        self.skip_type_annotation()?; // (D11)
-                        self.skip_return_type_annotation()?;
+                        let param_ty = self.capture_type_annotation()?; // (D11)
+                        let return_type = self.capture_return_type_annotation()?;
                         self.expect(&Tok::LBracket, "expected '['")?;
-                        let (primitive, ffi, temps, body) = self.parse_method_body()?;
+                        let (primitive, ffi, temps, temp_types, body) =
+                            self.parse_method_body()?;
                         self.expect(&Tok::RBracket, "expected ']'")?;
                         methods.push(MethodNode {
                             pattern_selector: "|".to_string(),
@@ -1154,6 +1263,11 @@ impl<'a> Parser<'a> {
                             body,
                             class_side: false,
                             span: mspan,
+                            type_sig: MethodSignature {
+                                param_types: vec![param_ty],
+                                return_type,
+                                temp_types,
+                            },
                         });
                     } else {
                         let mut names = Vec::new();
@@ -1161,7 +1275,7 @@ impl<'a> Parser<'a> {
                             self.check_not_reserved(self.cur.1, &n)?;
                             names.push(n);
                             self.bump()?;
-                            self.skip_type_annotation()?; // `| count <Integer> |` (D11)
+                            inst_var_types.push(self.capture_type_annotation()?); // `| count <Integer> |` (D11)
                         }
                         self.expect(&Tok::VBar, "expected closing '|' after instance variables")?;
                         inst_vars.extend(names);
@@ -1202,6 +1316,7 @@ impl<'a> Parser<'a> {
             name,
             indexable,
             inst_vars,
+            inst_var_types,
             class_vars,
             methods,
             span,

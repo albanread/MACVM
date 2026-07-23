@@ -161,7 +161,7 @@ impl<'a> Scanner<'a> {
     /// (next non-ws/comment token is `]`, not the start of a selector).
     fn read_selector(&mut self) -> Option<String> {
         self.skip_ws_and_comments();
-        match self.peek() {
+        let sel = match self.peek() {
             None | Some(']') => None,
             Some(c) if Self::is_binary_char(c) => {
                 let start = self.pos;
@@ -170,6 +170,7 @@ impl<'a> Scanner<'a> {
                 }
                 let sel = self.s[start..self.pos].to_string();
                 self.read_identifier(); // the one binary parameter — discarded, not needed for the selector string
+                self.skip_optional_type_annotation(); // T0′: `< other <Magnitude>` (D11)
                 Some(sel)
             }
             Some(_) => {
@@ -185,6 +186,7 @@ impl<'a> Scanner<'a> {
                         sel.push(':');
                         self.advance(); // the ':'
                         self.read_identifier(); // the parameter name — discarded
+                        self.skip_optional_type_annotation(); // T0′: `add: n <Integer>` (D11)
                         self.skip_ws_and_comments();
                         // Another "identifier:" continues the keyword selector;
                         // anything else (typically '[') ends it.
@@ -204,6 +206,61 @@ impl<'a> Scanner<'a> {
                     Some(first) // unary
                 }
             }
+        };
+        // T0′ (docs/typechecker_design.md §3): `^<ReturnType>` can follow ANY
+        // pattern shape (unary/binary/keyword) — one common tail rather than
+        // three duplicated calls at each `Some(...)` above.
+        if sel.is_some() {
+            self.skip_optional_return_type_annotation();
+        }
+        sel
+    }
+
+    /// T0′: skips ONE optional Strongtalk-style type annotation `< ... >` at
+    /// the current position — a balanced-bracket scan (nested `<...>` counts,
+    /// matching `parser::capture_pragma_body`'s discipline), but simpler than
+    /// [`Self::peek_is_class_pragma`]/[`Self::read_angle_pragma`]: no
+    /// keyword/pragma disambiguation is needed here, since a `<` right after
+    /// a parameter name or a whole method pattern can ONLY be a type
+    /// annotation in this grammar (never a class pragma or another
+    /// selector). No-op if the current char (after whitespace/comments)
+    /// isn't `<`. Skip-only: this scanner already captures each method's
+    /// FULL raw text separately (`read_bracketed_body`'s span includes any
+    /// annotation verbatim); interpreting the annotation is `capture_
+    /// type_signatures`'s job, over the SAME source re-parsed by the real
+    /// frontend parser, not this lightweight scanner's.
+    fn skip_optional_type_annotation(&mut self) {
+        self.skip_ws_and_comments();
+        if self.peek() != Some('<') {
+            return;
+        }
+        self.advance(); // '<'
+        let mut depth = 1u32;
+        while depth > 0 {
+            match self.peek() {
+                Some('<') => {
+                    depth += 1;
+                    self.advance();
+                }
+                Some('>') => {
+                    depth -= 1;
+                    self.advance();
+                }
+                None => break, // unterminated -- let the caller's own EOF handling take over
+                _ => {
+                    self.advance();
+                }
+            }
+        }
+    }
+
+    /// The `^<ReturnType>` half of a method pattern, between the last
+    /// parameter and the body's `[`. No-op if there's no `^` here.
+    fn skip_optional_return_type_annotation(&mut self) {
+        self.skip_ws_and_comments();
+        if self.peek() == Some('^') {
+            self.advance();
+            self.skip_optional_type_annotation();
         }
     }
 
@@ -267,7 +324,10 @@ impl<'a> Scanner<'a> {
                 return Some(vars.join(" "));
             }
             match self.read_identifier() {
-                Some(v) => vars.push(v),
+                Some(v) => {
+                    vars.push(v);
+                    self.skip_optional_type_annotation(); // T0′: `| count <Integer> |` (D11)
+                }
                 None => {
                     self.pos = save; // not actually an ivar list — rewind
                     return None;

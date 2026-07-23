@@ -154,6 +154,12 @@ CREATE TABLE IF NOT EXISTS method_sends (
     PRIMARY KEY (method_version_id, selector)
 );
 CREATE INDEX IF NOT EXISTS idx_method_sends_selector ON method_sends(selector);
+CREATE TABLE IF NOT EXISTS method_signatures (
+    method_version_id INTEGER PRIMARY KEY REFERENCES method_versions(version_id),
+    ret_type          TEXT,
+    arg_types         TEXT NOT NULL DEFAULT '[]',
+    temp_types        TEXT NOT NULL DEFAULT '[]'
+);
 CREATE TABLE IF NOT EXISTS package_lists (
     list_id  INTEGER PRIMARY KEY,
     name     TEXT NOT NULL UNIQUE
@@ -904,6 +910,77 @@ impl Image {
         self.insert_method_version(method_id, &category, new_source, false)?;
         self.prune_method_versions(method_id)?;
         Ok(true)
+    }
+
+    /// T0′ (`docs/typechecker_design.md` §5.1): the CURRENT (latest) version
+    /// id for a `(class, side, selector)` method, or `None` if no such
+    /// method exists. `import.rs`'s consumer: after `add_method`/
+    /// `set_method_source` writes a version, this is how it finds the id to
+    /// key a freshly-captured `method_signatures` row to.
+    pub fn latest_method_version_id(
+        &self,
+        class_name: &str,
+        side: Side,
+        selector: &str,
+    ) -> rusqlite::Result<Option<i64>> {
+        self.conn
+            .query_row(
+                "SELECT lmv.version_id FROM classes c \
+                 JOIN methods m ON m.class_id = c.class_id \
+                 JOIN latest_method_versions lmv ON lmv.method_id = m.method_id \
+                 WHERE c.name = ?1 AND m.side = ?2 AND m.selector = ?3",
+                params![class_name, side.as_str(), selector],
+                |r| r.get(0),
+            )
+            .optional()
+    }
+
+    /// T0′ (`docs/typechecker_design.md` §5.1/§6): record a method version's
+    /// captured type annotations — raw text only, never interpreted here
+    /// (T1 builds the real `TypeExpr` parser over it; nothing today reads
+    /// this table back). `ret_type` is `None` for an unannotated return;
+    /// `arg_types_json`/`temp_types_json` are JSON arrays with `null` for
+    /// each unannotated slot (`Vec<Option<String>>` serialized by the
+    /// caller). Replaces any existing row for the same version — re-
+    /// importing a file re-derives this from the same source, "latest wins"
+    /// like every other importer write in this module.
+    pub fn set_method_signature(
+        &self,
+        method_version_id: i64,
+        ret_type: Option<&str>,
+        arg_types_json: &str,
+        temp_types_json: &str,
+    ) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT INTO method_signatures (method_version_id, ret_type, arg_types, temp_types) \
+             VALUES (?1, ?2, ?3, ?4) \
+             ON CONFLICT(method_version_id) DO UPDATE SET \
+                 ret_type = excluded.ret_type, \
+                 arg_types = excluded.arg_types, \
+                 temp_types = excluded.temp_types",
+            params![method_version_id, ret_type, arg_types_json, temp_types_json],
+        )?;
+        Ok(())
+    }
+
+    /// T0′: read back a method version's captured signature, if any —
+    /// `None` when the method has no annotations at all (the common case
+    /// today: no row was ever written, "absence IS Dynamic" per
+    /// `capture_type_signatures`'s own doc). `(ret_type, arg_types_json,
+    /// temp_types_json)`, the same shape [`Self::set_method_signature`]
+    /// wrote.
+    pub fn method_signature(
+        &self,
+        method_version_id: i64,
+    ) -> rusqlite::Result<Option<(Option<String>, String, String)>> {
+        self.conn
+            .query_row(
+                "SELECT ret_type, arg_types, temp_types FROM method_signatures \
+                 WHERE method_version_id = ?1",
+                params![method_version_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()
     }
 
     /// "Accept" an edited class comment — same shape as `set_method_source`,
