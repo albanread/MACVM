@@ -262,6 +262,21 @@ before the supervisor observes the death. The service layer's `onError:`
 funnel (§5) is the answer at call sites; raw `send:` keeps its current
 semantics.
 
+**As-built (O1): the duplicate-died/reused-id race.** The failed-send
+synthesis above means one crash can produce TWO `#workerDied` envelopes for
+the same id (the worker thread's own report, then the failed send's) — and
+because `spawn` reuses freed slot ids, the stale second notice can arrive
+*addressed to the id of the already-respawned healthy incarnation*. The
+registry cannot distinguish generations by id alone. Resolution, world-side
+and one line: `childDied:` **terminates whatever handle the spec still
+records before clearing it** — an idempotent no-op for a genuine death, and
+for a stale notice it retires the healthy incarnation cleanly so the
+restart that follows leaves no leaked worker thread and no burned registry
+slot. Cost of a stale notice: one clean extra restart cycle, charged to
+intensity — spurious restarts are tolerable, leaks are not. O1's gate
+manufactures the race deliberately (crash, then send until the send fails)
+and proves no leak by filling the fleet to `MAX_WORKERS` afterwards.
+
 ### 4.2 The deadline/intensity sweep
 
 Timeouts and intensity windows need time to pass, and the message plane is

@@ -168,6 +168,9 @@ Object subclass: WorkerSupervisor [
     strategy ^ <Symbol> [ ^strategy ]
     state ^ <Symbol> [ ^state ]
     children ^ <OrderedCollection> [ ^children ]
+    "Restarts still inside the intensity window (pruned lazily at each
+     restart decision) — the observability tests key on."
+    restartCount ^ <Integer> [ ^restartTimes size ]
 
     superviseNamed: aSymbol init: aString ^ <Self> [
         ^self superviseNamed: aSymbol init: aString restart: #permanent
@@ -218,9 +221,21 @@ Object subclass: WorkerSupervisor [
 
     "── the event (routed here by SupervisorRegistry) ─────────────────────"
     childDied: aSpec <WorkerSpec> [
-        "The registry has already retired the dead id. Clear the corpse and
-         its name FIRST — even a #temporary/non-running outcome must leave no
-         stale binding for clients to reach."
+        "The registry has already retired the dead id. Terminate whatever
+         handle the spec still records BEFORE clearing it: for a genuine
+         death that terminate is an idempotent no-op on a dead id, but for a
+         STALE death notice it is load-bearing — a failed send to a corpse
+         synthesizes a DUPLICATE #workerDied (workers.rs::send), and because
+         spawn reuses freed slot ids, that stale notice can arrive addressed
+         to the id of the already-respawned HEALTHY incarnation. Without
+         this terminate, treating it as a death would abandon that healthy
+         VM un-terminated — a leaked worker thread and a permanently-burned
+         registry slot (O1's no-leak gate fills the fleet to MAX_WORKERS to
+         prove it). With it, a stale notice costs one clean extra restart
+         cycle, charged to the intensity window — spurious restarts are
+         tolerable, leaks are not. Then clear the corpse and its name — even
+         a #temporary/non-running outcome must leave no stale binding."
+        aSpec worker notNil ifTrue: [ aSpec worker terminate ].
         aSpec worker: nil.
         WorkerNames unbind: aSpec name.
         state == #running ifFalse: [ ^self ].

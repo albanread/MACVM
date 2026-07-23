@@ -84,6 +84,9 @@ TestCase subclass: SupervisorTests [
     terminateLog ^ <OrderedCollection> [
         ^FakeWorkerHandle log select: [:e | (e at: 1) == #terminate ]
     ]
+    spawnLog ^ <OrderedCollection> [
+        ^FakeWorkerHandle log select: [:e | (e at: 1) == #spawn ]
+    ]
 
     "── 1. compatibility: no supervision, no behavior change ──────────────
      MUST run before any test registers a child (DiedHandler still nil): a
@@ -137,8 +140,9 @@ TestCase subclass: SupervisorTests [
         self assert: newHandle notNil.
         self deny: newHandle id = oldId.                     "a FRESH worker"
         self assert: (WorkerNames named: #b) id equals: 102. "sibling untouched (#oneForOne)"
-        "the restart re-used the spec's stored init source"
-        self assert: ((FakeWorkerHandle log at: 3) at: 3) equals: 'initA'.
+        "the restart re-used the spec's stored init source (the raw log's
+         3rd entry is now the corpse's defensive terminate, so filter)"
+        self assert: ((self spawnLog at: 3) at: 3) equals: 'initA'.
         sup stop
     ]
 
@@ -179,11 +183,18 @@ TestCase subclass: SupervisorTests [
         self kill: #a.
         self assert: sup state equals: #givenUp.
         self assert: self spawnCount equals: 5.              "NO 4th restart"
-        "give-up tears the whole set down in REVERSE start order: b then a —
-         a is already dead (its corpse was cleared), so the only terminate
-         is b's live handle"
-        self assert: self terminateLog size equals: 1.
-        self assert: (self terminateLog first at: 2) equals: 102.
+        "terminates: every childDied: first retires the corpse handle
+         defensively (the duplicate-died/reused-id guard — a no-op on a
+         genuinely dead worker, load-bearing on a stale notice), so the four
+         kills log a's successive incarnations 101/103/104/105; give-up then
+         tears the survivors down in REVERSE start order — b (102) last,
+         a's spec already cleared"
+        self assert: self terminateLog size equals: 5.
+        self assert: ((self terminateLog at: 1) at: 2) equals: 101.
+        self assert: ((self terminateLog at: 2) at: 2) equals: 103.
+        self assert: ((self terminateLog at: 3) at: 2) equals: 104.
+        self assert: ((self terminateLog at: 4) at: 2) equals: 105.
+        self assert: ((self terminateLog at: 5) at: 2) equals: 102.
         self assert: (WorkerNames named: #a) isNil.
         self assert: (WorkerNames named: #b) isNil.
         "a straggler death after give-up changes nothing"

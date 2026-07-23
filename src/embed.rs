@@ -3343,6 +3343,186 @@ mod tests {
         );
     }
 
+    // ── OTP supervision, O1: live crash→respawn (docs/otp_workers_design.md
+    //    §7). O0 proved the decision logic single-VM with synthetic deaths;
+    //    these prove the SAME world-side tree against real spawns, real
+    //    crashes, and the real inbox. ─────────────────────────────────────
+
+    /// The assertions' window onto the tree: the supervisor object plus its
+    /// state/restartCount, readable from `eval`.
+    fn define_sup_test(vm: &mut VmHandle) {
+        vm.exec(
+            "Object subclass: SupTest [
+                <classVars: Sup>
+                SupTest class >> sup: s [ Sup := s ]
+                SupTest class >> sup [ ^Sup ]
+                SupTest class >> state [ ^Sup state ]
+                SupTest class >> restarts [ ^Sup restartCount ]
+            ]",
+        )
+        .expect("SupTest must compile");
+    }
+
+    /// boot_worker_primary + a one-child supervised tree: `#echo` answers
+    /// its payload, or `error:`s on the `#boom` poke — how a test crashes
+    /// the SAME worker on demand.
+    fn boot_supervised_echo() -> VmHandle {
+        let mut vm = boot_worker_primary();
+        define_sup_test(&mut vm);
+        // One chained expression (a doit cannot open with top-level temps);
+        // every builder answers self, so the tree reads left to right.
+        vm.exec(
+            "SupTest sup: (((WorkerSupervisor named: #svc strategy: #oneForOne)
+                 superviseNamed: #echo
+                 init: 'Worker onMessage: [:m | m payload = #boom ifTrue: [ nil error: ''boom'' ] ifFalse: [ Worker reply: m payload ] ]')
+                 start).",
+        )
+        .expect("the supervised echo tree starts");
+        vm
+    }
+
+    #[test]
+    fn supervised_worker_crash_respawns_and_the_name_answers_again() {
+        let mut vm = boot_supervised_echo();
+        // Pre-crash: the tree's worker answers through its NAME.
+        vm.exec("(WorkerNames named: #echo) send: 41 onReply: [:r | WkTest bump: r = 41 ].")
+            .expect("send via the name");
+        vm.exec("Worker runLoopWhile: [ (WkTest tickCapped: 200) and: [ WkTest count < 1 ] ].")
+            .expect("first echo");
+        assert_eq!(vm.eval("WkTest count").expect("count").trim(), "1");
+        // Crash it: the handler error:s. The death is consumed by the TREE
+        // (DiedHandler shape-first), and the restart happens inline during
+        // the drain — never via onReply:.
+        vm.exec("(WorkerNames named: #echo) send: #boom.")
+            .expect("poke the crash");
+        vm.exec("Worker runLoopWhile: [ (WkTest tickCapped: 400) and: [ SupTest restarts < 1 ] ].")
+            .expect("run until the respawn");
+        assert_eq!(vm.eval("SupTest restarts").expect("restarts").trim(), "1");
+        assert_eq!(vm.eval("SupTest state").expect("state").trim(), "#running");
+        // The SAME name answers again — a fresh incarnation, same service.
+        vm.exec("(WorkerNames named: #echo) send: 42 onReply: [:r | WkTest bump: r = 42 ].")
+            .expect("send to the respawned worker");
+        vm.exec("Worker runLoopWhile: [ (WkTest tickCapped: 600) and: [ WkTest count < 2 ] ].")
+            .expect("second echo");
+        assert_eq!(vm.eval("WkTest count").expect("count").trim(), "2");
+        assert_eq!(vm.eval("WkTest bad").expect("bad").trim(), "0");
+        vm.exec("SupTest sup stop.").expect("stop the tree");
+    }
+
+    #[test]
+    fn supervised_init_crash_storm_gives_up_cleanly() {
+        // A child whose INIT crashes: every (re)spawn dies during its init
+        // doit, so the tree restarts it maxRestarts times inside the window
+        // and then gives up — process fine throughout (design §7 O1).
+        let mut vm = boot_worker_primary();
+        define_sup_test(&mut vm);
+        vm.exec(
+            "SupTest sup: ((((WorkerSupervisor named: #storm strategy: #oneForOne)
+                 maxRestarts: 3 perSeconds: 5)
+                 superviseNamed: #bad init: 'nil error: ''initboom''')
+                 start).",
+        )
+        .expect("the storm tree starts (its first death arrives async)");
+        vm.exec("Worker runLoopWhile: [ (WkTest tickCapped: 200) and: [ SupTest state ~~ #givenUp ] ].")
+            .expect("run until give-up");
+        assert_eq!(vm.eval("SupTest state").expect("state").trim(), "#givenUp");
+        assert_eq!(
+            vm.eval("SupTest restarts").expect("restarts").trim(),
+            "3",
+            "exactly maxRestarts restarts inside the window, then give-up"
+        );
+        // The process (and the primary VM) is fine.
+        assert_eq!(vm.eval("3 + 4").expect("eval after give-up").trim(), "7");
+    }
+
+    #[test]
+    fn failed_send_after_crash_costs_one_clean_extra_restart_and_leaks_nothing() {
+        // §4.1's ordering + the duplicate-died/reused-id race, manufactured
+        // deliberately: crash the worker, then keep sending to the corpse
+        // until a send FAILS — that failure synthesizes the SECOND
+        // #workerDied for the same id (the first came from the worker
+        // thread itself) and marks the slot dead, so the respawn REUSES the
+        // id and the stale notice arrives addressed to the healthy new
+        // incarnation. childDied:'s defensive terminate must turn that into
+        // one clean extra restart — never a leaked worker.
+        let mut vm = boot_supervised_echo();
+        vm.exec("(WorkerNames named: #echo) send: #boom.")
+            .expect("crash it");
+        let mut send_failed = false;
+        for _ in 0..200 {
+            match vm.exec("(WorkerNames named: #echo) send: 0.") {
+                Err(e) => {
+                    assert!(
+                        format!("{e}").contains("cannot send"),
+                        "the failure must be the world-side send error, got: {e}"
+                    );
+                    send_failed = true;
+                    break;
+                }
+                // Channel still open (worker mid-exit): the message
+                // evaporates at rx drop — at-most-once, harmless. Retry.
+                Ok(()) => std::thread::sleep(std::time::Duration::from_millis(10)),
+            }
+        }
+        assert!(
+            send_failed,
+            "a send to the corpse must eventually fail (its channel drops)"
+        );
+        // Drain: died#1 → restart #1 (slot reused — the failed send marked
+        // it dead); stale died#2 → defensive terminate of the healthy
+        // incarnation + restart #2.
+        vm.exec("Worker runLoopWhile: [ (WkTest tickCapped: 400) and: [ SupTest restarts < 2 ] ].")
+            .expect("run until both deaths are processed");
+        assert_eq!(vm.eval("SupTest restarts").expect("restarts").trim(), "2");
+        assert_eq!(vm.eval("SupTest state").expect("state").trim(), "#running");
+        vm.exec("(WorkerNames named: #echo) send: 42 onReply: [:r | WkTest bump: r = 42 ].")
+            .expect("service resumed");
+        vm.exec("Worker runLoopWhile: [ (WkTest tickCapped: 600) and: [ WkTest count < 1 ] ].")
+            .expect("echo after the double restart");
+        assert_eq!(vm.eval("WkTest count").expect("count").trim(), "1");
+        assert_eq!(vm.eval("WkTest bad").expect("bad").trim(), "0");
+        // The no-leak proof: stop the tree, then the WHOLE fleet is free —
+        // all 16 slots spawn. A leaked healthy incarnation (the exact bug
+        // the defensive terminate fixes) would burn one slot for the
+        // process's life and fail the 16th spawn here.
+        vm.exec("SupTest sup stop.").expect("stop the tree");
+        vm.exec("1 to: 16 do: [:i | Worker spawn ].")
+            .expect("all 16 slots must be free — nothing leaked");
+        vm.exec("1 to: 16 do: [:i | (Worker new setId: i) terminate ].")
+            .expect("tidy");
+    }
+
+    #[test]
+    fn unsupervised_worker_death_leaves_the_tree_untouched() {
+        // A raw Worker spawn: next to a live tree: its death routes to the
+        // DiedHandler, finds no owner, and is logged-and-dropped — the tree
+        // neither restarts nor charges intensity (design §4.1).
+        let mut vm = boot_supervised_echo();
+        vm.exec("WkTest w1: (Worker spawn: 'Worker onMessage: [:m | nil error: ''raw'']').")
+            .expect("a raw, unsupervised crasher beside the tree");
+        vm.exec("WkTest w1 send: 1.").expect("poke it");
+        // Two full echo round-trips (plus a beat) give the raw death ample
+        // drains to arrive and be dropped.
+        vm.exec("(WorkerNames named: #echo) send: 7 onReply: [:r | WkTest bump: r = 7 ].")
+            .expect("echo 1");
+        vm.exec("Worker runLoopWhile: [ (WkTest tickCapped: 200) and: [ WkTest count < 1 ] ].")
+            .expect("drain 1");
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        vm.exec("(WorkerNames named: #echo) send: 8 onReply: [:r | WkTest bump: r = 8 ].")
+            .expect("echo 2");
+        vm.exec("Worker runLoopWhile: [ (WkTest tickCapped: 400) and: [ WkTest count < 2 ] ].")
+            .expect("drain 2");
+        assert_eq!(vm.eval("WkTest count").expect("count").trim(), "2");
+        assert_eq!(vm.eval("WkTest bad").expect("bad").trim(), "0");
+        assert_eq!(
+            vm.eval("SupTest restarts").expect("restarts").trim(),
+            "0",
+            "the raw death must not charge or restart the tree"
+        );
+        assert_eq!(vm.eval("SupTest state").expect("state").trim(), "#running");
+        vm.exec("SupTest sup stop.").expect("stop");
+    }
+
     #[test]
     fn worker_inbox_wake_fires_and_coalesces() {
         // §3.1: the send itself is the wake, coalesced by the pending flag —
