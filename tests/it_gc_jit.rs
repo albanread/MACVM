@@ -379,6 +379,7 @@ fn compiled_mono_caller_guard_keeps_key_klass_alive() {
     };
     let call_hot_method_ir = IrMethod {
         osr_cold_sends: 0,
+        is_osr: false,
         blocks: vec![block0],
         vregs,
         pool: Vec::new(),
@@ -428,6 +429,7 @@ fn compiled_mono_caller_guard_keeps_key_klass_alive() {
         None,
         None,
         None,
+        false,
     );
     assert_eq!(emitted_ic_sites.len(), 1, "exactly one Ir::CallSend");
 
@@ -450,6 +452,7 @@ fn compiled_mono_caller_guard_keeps_key_klass_alive() {
         .collect();
     let call_hot_nm = Nmethod {
         osr_cold_sends: 0,
+        frameless_eligible: false,
         id: NmethodId(0),
         key_klass: tmp_klass,
         key_selector: call_hot_sel,
@@ -545,6 +548,7 @@ fn install_loop_nmethod(
 ) -> NmethodId {
     let ir = IrMethod {
         osr_cold_sends: 0,
+        is_osr: false,
         blocks,
         vregs,
         pool,
@@ -597,6 +601,7 @@ fn install_loop_nmethod(
         None,
         None,
         None,
+        false,
     );
 
     let h = vm.code_cache.alloc(blob.code.len()).unwrap();
@@ -641,6 +646,7 @@ fn install_loop_nmethod(
         .collect();
     let nm = Nmethod {
         osr_cold_sends: 0,
+        frameless_eligible: false,
         id: NmethodId(0),
         key_klass,
         key_selector: probe_sel,

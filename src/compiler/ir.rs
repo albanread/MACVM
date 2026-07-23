@@ -723,6 +723,11 @@ enum NonLeafOutcome {
 pub struct IrMethod {
     /// OSR-heal: see `Nmethod::osr_cold_sends` (copied there by the driver).
     pub osr_cold_sends: u16,
+    /// True for an OSR compilation. F7 consumer: the prologue nil-fill
+    /// shrink (regalloc's `entry_early_defs`) must NOT trust entry-block
+    /// defs when the OSR entry jumps straight to the loop header,
+    /// bypassing them.
+    pub is_osr: bool,
     pub blocks: Vec<IrBlock>,
     pub vregs: Vec<VRegInfo>,
     pub pool: Vec<PoolEntry>,
@@ -8847,6 +8852,7 @@ pub fn convert(
 
     let mut irm = IrMethod {
         osr_cold_sends: t.osr_cold_sends,
+        is_osr: osr,
         blocks: ir_blocks,
         vregs: t.vregs,
         pool: t.pool.entries,

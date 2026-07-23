@@ -993,12 +993,50 @@ pub fn regalloc(method: &IrMethod) -> RegallocResult {
     // nil-fills these in the prologue, which is what makes `extra_oop_live`'s
     // earlier-safepoint facts sound on paths that never wrote the slot (see
     // `compute_intervals`' own task-#94 comment).
+    //
+    // F7 (ported from WINVM 9cb272e, rule TIGHTENED): a slot whose vreg is
+    // unconditionally written before ANY safepoint can be reached needs no
+    // prologue nil-fill — the def itself initializes the slot on every
+    // path (a spilled def stores its slot at the def; a resident writes
+    // through). "Unconditionally" is enforced by a WHITELIST walk of the
+    // entry block's leading run: only ops that can neither divert control
+    // nor skip their def count (`Param`, `ConstPool`, `ConstSmi`, `Move` —
+    // the params and immediate temp initializers that are F7's entire
+    // payload), and the scan stops at the FIRST op of any other kind.
+    // WINVM's original stopped only at safepoint ops, which is unsound
+    // against task-#94's back-recording: a mid-block fail edge (a smi
+    // guard's overflow arm) can leave the entry block EARLY, reach a trap
+    // whose oop map scans a later-trap-referenced slot via the
+    // earlier-safepoint facts — before the def after that guard ever ran.
+    // The whitelist never counts a def sitting past any divertable op.
+    // Not applied to OSR compiles: their entry jumps straight to the loop
+    // header, bypassing the entry block's leading defs entirely.
+    let entry_early_defs: std::collections::HashSet<u32> = if method.is_osr {
+        Default::default()
+    } else {
+        let mut set = std::collections::HashSet::new();
+        if let Some(&entry) = block_order.first() {
+            for op in &method.blocks[entry.0 as usize].code {
+                match op {
+                    Ir::Param { .. }
+                    | Ir::ConstPool { .. }
+                    | Ir::ConstSmi { .. }
+                    | Ir::Move { .. } => op.defs(|v| {
+                        set.insert(v.0);
+                    }),
+                    _ => break,
+                }
+            }
+        }
+        set
+    };
     let mut deopt_nil_init_slots: Vec<SpillSlot> = {
         let referenced: std::collections::HashSet<u32> =
             extra_oop_live.iter().map(|&(v, _)| v.0).collect();
         intervals
             .iter()
             .filter(|iv| referenced.contains(&iv.vreg.0))
+            .filter(|iv| !entry_early_defs.contains(&iv.vreg.0))
             .filter_map(|iv| match iv.assignment {
                 Some(Assignment::Spill(slot)) => Some(slot),
                 _ => None,
@@ -1027,6 +1065,7 @@ mod tests {
     fn hand_method(blocks: Vec<IrBlock>, vregs: Vec<VRegInfo>) -> IrMethod {
         IrMethod {
             osr_cold_sends: 0,
+            is_osr: false,
             blocks,
             vregs,
             pool: Vec::new(),

@@ -2327,6 +2327,7 @@ mod tests {
     pub(crate) fn hand_method(blocks: Vec<IrBlock>, vregs: Vec<VRegInfo>, argc: u8) -> IrMethod {
         IrMethod {
             osr_cold_sends: 0,
+            is_osr: false,
             blocks,
             vregs,
             pool: Vec::new(),
@@ -2750,6 +2751,7 @@ mod tests {
         // pool[0]=nil, [1]=mark(raw imm), [2]=klass oop.
         let method = IrMethod {
             osr_cold_sends: 0,
+            is_osr: false,
             blocks: vec![IrBlock {
                 id: BlockId(0),
                 bci: 0,
@@ -3169,6 +3171,7 @@ mod tests {
         };
         let method = IrMethod {
             osr_cold_sends: 0,
+            is_osr: false,
             blocks: vec![block0],
             vregs,
             pool: Vec::new(),

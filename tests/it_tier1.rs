@@ -134,6 +134,7 @@ fn run_ir_raw() {
     let method = IrMethod {
 
         osr_cold_sends: 0,
+        is_osr: false,
         blocks: vec![block0, block1, block2, block3],
         vregs,
         pool: Vec::new(),
@@ -183,6 +184,7 @@ fn run_ir_raw() {
         None,
         None,
         None,
+        false,
     );
     assert_eq!(
         pcs.len(),
@@ -240,6 +242,7 @@ fn build_and_publish(cache: &mut CodeCache, stub_poll_addr: u64, method: &IrMeth
         None,
         None,
         None,
+        false,
     );
     let h = cache.alloc(blob.code.len()).unwrap();
     cache.publish(h, &blob)
@@ -286,6 +289,7 @@ fn mul_method() -> IrMethod {
     };
     IrMethod {
         osr_cold_sends: 0,
+        is_osr: false,
         blocks: vec![block0, block1],
         vregs: (0..4).map(|_| VRegInfo { is_oop: true, is_fp: false }).collect(),
         pool: Vec::new(),
@@ -419,6 +423,7 @@ fn run_ir_raw_forces_spill() {
     };
     let method = IrMethod {
         osr_cold_sends: 0,
+        is_osr: false,
         blocks: vec![block0, block1],
         vregs,
         pool: Vec::new(),
@@ -470,6 +475,7 @@ fn run_ir_raw_forces_spill() {
         None,
         None,
         None,
+        false,
     );
     let h = cache.alloc(blob.code.len()).unwrap();
     let entry = cache.publish(h, &blob);
@@ -1612,6 +1618,7 @@ fn compile_and_get_listing(vm: &VmState, method: MethodOop) -> String {
         None,
         None,
         None,
+        false,
     );
     blob.listing.join("\n") + "\n"
 }
@@ -2536,6 +2543,7 @@ fn mono_resolve_patches_call_site_and_dispatches() {
     };
     let caller_method = IrMethod {
         osr_cold_sends: 0,
+        is_osr: false,
         blocks: vec![block0],
         vregs,
         pool: Vec::new(),
@@ -2585,6 +2593,7 @@ fn mono_resolve_patches_call_site_and_dispatches() {
         None,
         None,
         None,
+        false,
     );
     assert_eq!(emitted_ic_sites.len(), 1, "exactly one Ir::CallSend");
 
@@ -2607,6 +2616,7 @@ fn mono_resolve_patches_call_site_and_dispatches() {
         .collect();
     let caller_nm = Nmethod {
         osr_cold_sends: 0,
+        frameless_eligible: false,
         id: NmethodId(0),
         key_klass: target_klass,
         key_selector: caller_probe_sel,
@@ -2726,6 +2736,7 @@ fn build_c2i_scenario(vm: &mut VmState) -> (u64, KlassOop, NmethodId) {
     };
     let caller_method = IrMethod {
         osr_cold_sends: 0,
+        is_osr: false,
         blocks: vec![block0],
         vregs,
         pool: Vec::new(),
@@ -2775,6 +2786,7 @@ fn build_c2i_scenario(vm: &mut VmState) -> (u64, KlassOop, NmethodId) {
         None,
         None,
         None,
+        false,
     );
     assert_eq!(emitted_ic_sites.len(), 1, "exactly one Ir::CallSend");
 
@@ -2797,6 +2809,7 @@ fn build_c2i_scenario(vm: &mut VmState) -> (u64, KlassOop, NmethodId) {
         .collect();
     let caller_nm = Nmethod {
         osr_cold_sends: 0,
+        frameless_eligible: false,
         id: NmethodId(0),
         key_klass: target_klass,
         key_selector: caller_probe_sel,
@@ -2980,6 +2993,7 @@ fn full_ic_lattice_mono_to_pic_to_mega() {
     };
     let caller_method = IrMethod {
         osr_cold_sends: 0,
+        is_osr: false,
         blocks: vec![block0],
         vregs,
         pool: Vec::new(),
@@ -3029,6 +3043,7 @@ fn full_ic_lattice_mono_to_pic_to_mega() {
         None,
         None,
         None,
+        false,
     );
     assert_eq!(emitted_ic_sites.len(), 1);
 
@@ -3051,6 +3066,7 @@ fn full_ic_lattice_mono_to_pic_to_mega() {
         .collect();
     let caller_nm = Nmethod {
         osr_cold_sends: 0,
+        frameless_eligible: false,
         id: NmethodId(0),
         key_klass: klasses[0],
         key_selector: caller_probe_sel,
@@ -3228,6 +3244,7 @@ fn dnu_from_compiled_code_reaches_does_not_understand() {
     };
     let caller_method = IrMethod {
         osr_cold_sends: 0,
+        is_osr: false,
         blocks: vec![block0],
         vregs,
         pool: Vec::new(),
@@ -3277,6 +3294,7 @@ fn dnu_from_compiled_code_reaches_does_not_understand() {
         None,
         None,
         None,
+        false,
     );
     assert_eq!(emitted_ic_sites.len(), 1);
 
@@ -3299,6 +3317,7 @@ fn dnu_from_compiled_code_reaches_does_not_understand() {
         .collect();
     let caller_nm = Nmethod {
         osr_cold_sends: 0,
+        frameless_eligible: false,
         id: NmethodId(0),
         key_klass: target_klass,
         key_selector: caller_probe_sel,
