@@ -11,19 +11,25 @@
 //! per-class interface builder, and three annotation-syntax checks
 //! (`MalformedTypeExpr`, `UndeclaredTypeName`, `GenericArityMismatch`).
 //!
-//! T2 (this slice): `subtype_of` (nominal, `Self`-aware, block-variant) +
-//! expression-type synthesis for the LOCAL rules — literals, plain
-//! variable references (params/temps/ivars, with real lexical scoping for
-//! block shadowing), assignments, and returns (including non-local
-//! returns lexically inside a block, which target the ENCLOSING method's
-//! own declared return type). Message sends synthesize as `Dynamic` until
-//! T3 adds the send rule — until then, an assignment/return whose RHS
-//! involves a send always trivially passes; that's expected, not a bug
-//! (design doc §6: "gradual typing finds little until signatures exist").
+//! T2: `subtype_of` (nominal, `Self`-aware, block-variant) + expression-
+//! type synthesis for the LOCAL rules — literals, plain variable
+//! references (params/temps/ivars, with real lexical scoping for block
+//! shadowing), assignments, and returns (including non-local returns
+//! lexically inside a block, which target the ENCLOSING method's own
+//! declared return type).
+//!
+//! T3 (this slice): the send rule (`send.rs`) — static-DNU + per-argument
+//! subtype checks, wired into `expr_type`'s expression synthesis so a
+//! send's type is now the target method's declared return (was: always
+//! `Dynamic`). Still only checked when the RECEIVER's own type is known —
+//! an unannotated receiver (the overwhelming majority of the real world
+//! today) is never checked, matching the design's own "gradual typing
+//! finds little until signatures exist."
 
 pub mod check;
 pub mod expr_type;
 pub mod interface;
+pub mod send;
 pub mod subtype;
 pub mod type_expr;
 

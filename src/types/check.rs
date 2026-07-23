@@ -88,6 +88,26 @@ pub enum TypeError {
         declared: String,
         actual: String,
     },
+    /// T3: a send's SELECTOR isn't understood anywhere on the receiver's
+    /// own class or its superclass chain — the static-DNU
+    /// (`DeltaSelectorUndefinedError`). Only ever raised when the
+    /// receiver's type is KNOWN (not Dynamic) — the design's own gradual-
+    /// typing promise: an unannotated receiver never triggers this.
+    SelectorUndefined {
+        site: AnnotationSite,
+        receiver_type: String,
+        selector: String,
+    },
+    /// T3: a send argument's synthesized type doesn't satisfy the target
+    /// method's declared formal type at that position
+    /// (`DeltaSendArgumentNotSubtypesError`).
+    SendArgNotSubtype {
+        site: AnnotationSite,
+        selector: String,
+        arg_index: usize,
+        declared: String,
+        actual: String,
+    },
 }
 
 impl fmt::Display for TypeError {
@@ -126,6 +146,24 @@ impl fmt::Display for TypeError {
             } => write!(
                 f,
                 "{site}: declared to return {declared}, but this returns a {actual}"
+            ),
+            TypeError::SelectorUndefined {
+                site,
+                receiver_type,
+                selector,
+            } => write!(
+                f,
+                "{site}: {receiver_type} does not understand '{selector}'"
+            ),
+            TypeError::SendArgNotSubtype {
+                site,
+                selector,
+                arg_index,
+                declared,
+                actual,
+            } => write!(
+                f,
+                "{site}: '{selector}' argument {arg_index} is declared {declared}, but this passes a {actual}"
             ),
         }
     }

@@ -1,14 +1,11 @@
-//! T2 (`docs/typechecker_design.md` §4/§6): expression-type synthesis and
-//! the per-method BODY walk that finds every assignment and return site.
-//!
-//! Message sends synthesize as [`ResolvedType::Dynamic`] until T3 adds the
-//! send rule — `Dynamic` is compatible with everything in both directions
-//! (`subtype::subtype_of`), so an assignment/return whose RHS involves a
-//! send always trivially passes for now. That is expected, not a bug: the
-//! design doc's own T3 checkpoint says gradual typing finds little until
-//! signatures exist; T2's real payoff is literals and plain variable
-//! references (params/temps/ivars), which ARE fully known without any
-//! send-typing machinery.
+//! T2/T3 (`docs/typechecker_design.md` §4/§6): expression-type synthesis
+//! and the per-method BODY walk that finds every assignment, return, and
+//! send site. A `Send`/`Cascade` now resolves to `send::check_send`'s real
+//! result type (T3) rather than a hardcoded `Dynamic` — but the check
+//! itself still only fires when the RECEIVER's own type is known, so an
+//! unannotated receiver (the overwhelming majority of the real world
+//! today) is never checked at all, matching the design's own "gradual
+//! typing finds little until signatures exist."
 
 use std::collections::HashMap;
 
@@ -143,9 +140,9 @@ fn walk_expr(ctx: &mut WalkCtx, scope: &mut Scope, expr: &Expr) {
     match expr {
         Expr::SelfRef(_) | Expr::Var { .. } | Expr::Lit { .. } | Expr::CascadeRcvr(_) => {
             // Leaves -- nothing to descend into, nothing to check (a bare
-            // reference or literal is never itself an assignment/return
-            // site; SYNTHESIZING these only matters as an assignment's RHS
-            // or a return's value, handled where those are found below).
+            // reference or literal is never itself an assignment/return/
+            // send site; SYNTHESIZING these only matters as a larger
+            // expression's sub-part, handled where those are found below).
         }
         Expr::Assign { name, value, .. } => {
             walk_expr(ctx, scope, value);
@@ -153,7 +150,7 @@ fn walk_expr(ctx: &mut WalkCtx, scope: &mut Scope, expr: &Expr) {
                 Some(t) => t.map(ResolvedType::Written).unwrap_or(ResolvedType::Dynamic),
                 None => ivar_type(ctx.model, ctx.class_name, name),
             };
-            let actual = synthesize(ctx.model, ctx.class_name, scope, value);
+            let actual = synthesize(ctx, scope, value);
             let mut trail = Trail::new();
             if !subtype_of(ctx.model, ctx.class_name, &actual, &declared, &mut trail) {
                 ctx.errors.push(super::check::TypeError::AssignmentNotSubtype {
@@ -170,19 +167,78 @@ fn walk_expr(ctx: &mut WalkCtx, scope: &mut Scope, expr: &Expr) {
             }
         }
         Expr::Send {
-            receiver, args, ..
+            receiver,
+            selector,
+            args,
+            is_super,
+            ..
         } => {
             walk_expr(ctx, scope, receiver);
             for a in args {
                 walk_expr(ctx, scope, a);
             }
+            let receiver_type = synthesize(ctx, scope, receiver);
+            let arg_types: Vec<ResolvedType> = args.iter().map(|a| synthesize(ctx, scope, a)).collect();
+            let site = AnnotationSite {
+                class_name: ctx.class_name.to_string(),
+                class_side: ctx.class_side,
+                selector: Some(ctx.selector.to_string()),
+                slot: format!("send '{selector}'"),
+            };
+            super::send::check_send(
+                ctx.model,
+                ctx.class_name,
+                ctx.class_side,
+                *is_super,
+                &receiver_type,
+                selector,
+                &arg_types,
+                &site,
+                ctx.errors,
+            );
         }
         Expr::Cascade {
             receiver, segments, ..
         } => {
             walk_expr(ctx, scope, receiver);
+            let receiver_type = synthesize(ctx, scope, receiver);
             for s in segments {
-                walk_expr(ctx, scope, s);
+                // Every segment is, by construction, a `Send` whose OWN
+                // `receiver` field is `CascadeRcvr` (`parser::parse_cascade`)
+                // -- substitute the cascade's ONE real receiver type here
+                // (`DeltaCascadedSend`'s rule: every segment checks against
+                // the SAME receiver, not the previous segment's result).
+                let Expr::Send {
+                    selector,
+                    args,
+                    is_super,
+                    ..
+                } = s
+                else {
+                    continue; // parser-guaranteed shape; skip rather than panic if it ever isn't
+                };
+                for a in args {
+                    walk_expr(ctx, scope, a);
+                }
+                let arg_types: Vec<ResolvedType> =
+                    args.iter().map(|a| synthesize(ctx, scope, a)).collect();
+                let site = AnnotationSite {
+                    class_name: ctx.class_name.to_string(),
+                    class_side: ctx.class_side,
+                    selector: Some(ctx.selector.to_string()),
+                    slot: format!("cascade send '{selector}'"),
+                };
+                super::send::check_send(
+                    ctx.model,
+                    ctx.class_name,
+                    ctx.class_side,
+                    *is_super,
+                    &receiver_type,
+                    selector,
+                    &arg_types,
+                    &site,
+                    ctx.errors,
+                );
             }
         }
         Expr::DynArray { elems, .. } => {
@@ -207,7 +263,7 @@ fn walk_expr(ctx: &mut WalkCtx, scope: &mut Scope, expr: &Expr) {
         Expr::Return { value, .. } => {
             *ctx.found_return = true;
             walk_expr(ctx, scope, value);
-            let actual = synthesize(ctx.model, ctx.class_name, scope, value);
+            let actual = synthesize(ctx, scope, value);
             let mut trail = Trail::new();
             if !subtype_of(ctx.model, ctx.class_name, &actual, ctx.declared_return, &mut trail) {
                 ctx.errors.push(super::check::TypeError::ReturnNotSubtype {
@@ -242,24 +298,92 @@ fn ivar_type(model: &WorldModel, class_name: &str, name: &str) -> ResolvedType {
         .unwrap_or(ResolvedType::Dynamic)
 }
 
-/// Synthesizes `expr`'s type. Sends/cascades/dynamic-blocks are `Dynamic`
-/// (T3's job — real send typing); literals and plain variable references
+/// Synthesizes `expr`'s type. Literals and plain variable references
 /// (params/temps/ivars, through the SAME scope-then-ivar lookup order
-/// `walk_expr`'s assignment rule uses) are fully known without it.
-fn synthesize(model: &WorldModel, class_name: &str, scope: &Scope, expr: &Expr) -> ResolvedType {
+/// `walk_expr`'s assignment rule uses) are fully known without any send-
+/// typing machinery; a `Send`/`Cascade` recomputes its result type via
+/// `send::check_send`, but with a THROWAWAY errors sink — `walk_expr`'s
+/// own recursive descent already visited this exact node (whenever it's
+/// reachable as an ordinary statement-tree position, which every `Send`
+/// synthesized here is) and reported any real error there EXACTLY once;
+/// re-running the same check here only to answer "what type does this
+/// produce" must not report it a second time. `CascadeRcvr`/`Block` stay
+/// `Dynamic` — a block LITERAL's own arity/component types aren't
+/// captured anywhere (T0′ never captures block-level annotations), and a
+/// bare `CascadeRcvr` is only ever meant to be substituted by
+/// `walk_expr`'s own Cascade handling, never synthesized directly.
+fn synthesize(ctx: &mut WalkCtx, scope: &Scope, expr: &Expr) -> ResolvedType {
     match expr {
         Expr::SelfRef(_) => ResolvedType::named("Self"),
         Expr::Var { name, .. } => match scope.lookup(name) {
             Some(t) => t.map(ResolvedType::Written).unwrap_or(ResolvedType::Dynamic),
-            None => ivar_type(model, class_name, name),
+            None => ivar_type(ctx.model, ctx.class_name, name),
         },
         Expr::Lit { value, .. } => type_of_literal(value),
-        Expr::Assign { value, .. } => synthesize(model, class_name, scope, value),
-        Expr::Send { .. }
-        | Expr::Cascade { .. }
-        | Expr::CascadeRcvr(_)
-        | Expr::Block(_)
-        | Expr::Return { .. } => ResolvedType::Dynamic,
+        Expr::Assign { value, .. } => synthesize(ctx, scope, value),
+        Expr::Send {
+            receiver,
+            selector,
+            args,
+            is_super,
+            ..
+        } => {
+            let receiver_type = synthesize(ctx, scope, receiver);
+            let arg_types: Vec<ResolvedType> = args.iter().map(|a| synthesize(ctx, scope, a)).collect();
+            let mut discard = Vec::new();
+            super::send::check_send(
+                ctx.model,
+                ctx.class_name,
+                ctx.class_side,
+                *is_super,
+                &receiver_type,
+                selector,
+                &arg_types,
+                &AnnotationSite {
+                    class_name: ctx.class_name.to_string(),
+                    class_side: ctx.class_side,
+                    selector: Some(ctx.selector.to_string()),
+                    slot: format!("send '{selector}'"),
+                },
+                &mut discard,
+            )
+        }
+        Expr::Cascade {
+            receiver, segments, ..
+        } => {
+            let receiver_type = synthesize(ctx, scope, receiver);
+            // A cascade expression's own value is its LAST segment's send
+            // result (Smalltalk semantics) -- every earlier segment's
+            // result is a discarded intermediate value.
+            let Some(Expr::Send {
+                selector,
+                args,
+                is_super,
+                ..
+            }) = segments.last()
+            else {
+                return ResolvedType::Dynamic; // parser-guaranteed non-empty; defensive fallback only
+            };
+            let arg_types: Vec<ResolvedType> = args.iter().map(|a| synthesize(ctx, scope, a)).collect();
+            let mut discard = Vec::new();
+            super::send::check_send(
+                ctx.model,
+                ctx.class_name,
+                ctx.class_side,
+                *is_super,
+                &receiver_type,
+                selector,
+                &arg_types,
+                &AnnotationSite {
+                    class_name: ctx.class_name.to_string(),
+                    class_side: ctx.class_side,
+                    selector: Some(ctx.selector.to_string()),
+                    slot: format!("cascade send '{selector}'"),
+                },
+                &mut discard,
+            )
+        }
+        Expr::CascadeRcvr(_) | Expr::Block(_) | Expr::Return { .. } => ResolvedType::Dynamic,
         Expr::DynArray { .. } => ResolvedType::named("Array"),
     }
 }
@@ -470,9 +594,14 @@ mod tests {
         write_number_tower(&dir);
         fs::write(
             dir.join("02_foo.mst"),
+            // Bare literal statements (no message send) -- this test's own
+            // concern is the IMPLICIT-return rule, not send-checking; the
+            // fixture's Integer/Object classes carry no methods at all, so
+            // an incidental `3 + 4` here would (correctly, since T3) trip
+            // SelectorUndefined and mask what this test is actually about.
             "Object subclass: Foo [\n\
-             \x20   bar ^ <Self> [\n        3 + 4.\n    ]\n\
-             \x20   baz ^ <Object> [\n        3 + 4.\n    ]\n\
+             \x20   bar ^ <Self> [\n        5.\n    ]\n\
+             \x20   baz ^ <Object> [\n        5.\n    ]\n\
              ]\n",
         )
         .unwrap();
@@ -584,6 +713,301 @@ mod tests {
 
         let model = build_world_model(&dir).unwrap();
         assert_eq!(super::super::check::check_world(&model), vec![]);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- T3: the send rule ------------------------------------------------
+
+    #[test]
+    fn send_to_a_selector_the_receivers_class_defines_is_clean() {
+        let dir = temp_world_dir("send_ok_own");
+        write_number_tower(&dir);
+        fs::write(
+            dir.join("02_foo.mst"),
+            "Object subclass: Foo [\n\
+             \x20   answer ^ <Integer> [ ^5 ]\n\
+             \x20   bar [\n\
+             \x20       | x <Foo> |\n\
+             \x20       x := self.\n\
+             \x20       ^x answer\n\
+             \x20   ]\n\
+             ]\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("world.list"),
+            "00_object.mst\n01_tower.mst\n02_foo.mst\n",
+        )
+        .unwrap();
+
+        let model = build_world_model(&dir).unwrap();
+        assert_eq!(super::super::check::check_world(&model), vec![]);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn send_to_a_selector_understood_via_inheritance_is_clean() {
+        // `answer` is defined on Base, not Foo itself -- the send-rule's
+        // chain walk (`send::find_method`) must find it via inheritance,
+        // exactly like `subtype_of`'s own superclass-chain walk.
+        let dir = temp_world_dir("send_ok_inherited");
+        write_number_tower(&dir);
+        fs::write(
+            dir.join("02_base.mst"),
+            "Object subclass: Base [\n    answer ^ <Integer> [ ^5 ]\n]\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("03_foo.mst"),
+            "Base subclass: Foo [\n\
+             \x20   bar [\n\
+             \x20       | x <Foo> |\n\
+             \x20       x := self.\n\
+             \x20       ^x answer\n\
+             \x20   ]\n\
+             ]\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("world.list"),
+            "00_object.mst\n01_tower.mst\n02_base.mst\n03_foo.mst\n",
+        )
+        .unwrap();
+
+        let model = build_world_model(&dir).unwrap();
+        assert_eq!(super::super::check::check_world(&model), vec![]);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn send_to_an_undefined_selector_is_flagged() {
+        let dir = temp_world_dir("send_dnu");
+        write_number_tower(&dir);
+        fs::write(
+            dir.join("02_foo.mst"),
+            "Object subclass: Foo [\n\
+             \x20   bar [\n\
+             \x20       | x <Foo> |\n\
+             \x20       x := self.\n\
+             \x20       ^x frobnicate\n\
+             \x20   ]\n\
+             ]\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("world.list"),
+            "00_object.mst\n01_tower.mst\n02_foo.mst\n",
+        )
+        .unwrap();
+
+        let model = build_world_model(&dir).unwrap();
+        let errors = super::super::check::check_world(&model);
+        assert!(
+            errors.iter().any(|e| matches!(
+                e,
+                super::super::check::TypeError::SelectorUndefined { selector, .. }
+                    if selector == "frobnicate"
+            )),
+            "expected SelectorUndefined for 'x frobnicate' (Foo has no such method \
+             and neither does anything on its chain), got {errors:#?}"
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn send_with_unresolved_dynamic_receiver_is_never_checked() {
+        // `n` is an UNANNOTATED param -- Dynamic -- so `n frobnicate` must
+        // never be flagged even though no class anywhere defines
+        // `frobnicate`. This is the design's own "gradual typing finds
+        // little until signatures exist" promise, load-bearing: it's what
+        // keeps the real, unannotated 144-class world at zero findings.
+        let dir = temp_world_dir("send_dynamic_receiver");
+        write_number_tower(&dir);
+        fs::write(
+            dir.join("02_foo.mst"),
+            "Object subclass: Foo [\n    bar: n [\n        ^n frobnicate\n    ]\n]\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("world.list"),
+            "00_object.mst\n01_tower.mst\n02_foo.mst\n",
+        )
+        .unwrap();
+
+        let model = build_world_model(&dir).unwrap();
+        assert_eq!(super::super::check::check_world(&model), vec![]);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn send_argument_of_the_wrong_type_is_flagged() {
+        let dir = temp_world_dir("send_bad_arg");
+        write_number_tower(&dir);
+        fs::write(
+            dir.join("02_foo.mst"),
+            "Object subclass: Foo [\n\
+             \x20   take: n <Integer> [ ^n ]\n\
+             \x20   bar [\n\
+             \x20       | x <Foo> |\n\
+             \x20       x := self.\n\
+             \x20       ^x take: 'hello'\n\
+             \x20   ]\n\
+             ]\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("world.list"),
+            "00_object.mst\n01_tower.mst\n02_foo.mst\n",
+        )
+        .unwrap();
+
+        let model = build_world_model(&dir).unwrap();
+        let errors = super::super::check::check_world(&model);
+        assert!(
+            errors.iter().any(|e| matches!(
+                e,
+                super::super::check::TypeError::SendArgNotSubtype { selector, arg_index: 0, .. }
+                    if selector == "take:"
+            )),
+            "expected SendArgNotSubtype for take: 'hello' (declared <Integer>), got {errors:#?}"
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn cascade_checks_every_segment_against_the_same_receiver() {
+        let dir = temp_world_dir("cascade");
+        write_number_tower(&dir);
+        fs::write(
+            dir.join("02_foo.mst"),
+            "Object subclass: Foo [\n\
+             \x20   one ^ <Integer> [ ^1 ]\n\
+             \x20   bar [\n\
+             \x20       | x <Foo> |\n\
+             \x20       x := self.\n\
+             \x20       ^x one; frobnicate; one\n\
+             \x20   ]\n\
+             ]\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("world.list"),
+            "00_object.mst\n01_tower.mst\n02_foo.mst\n",
+        )
+        .unwrap();
+
+        let model = build_world_model(&dir).unwrap();
+        let errors = super::super::check::check_world(&model);
+        assert_eq!(
+            errors
+                .iter()
+                .filter(|e| matches!(
+                    e,
+                    super::super::check::TypeError::SelectorUndefined { selector, .. }
+                        if selector == "frobnicate"
+                ))
+                .count(),
+            1,
+            "the middle cascade segment (Foo has no 'frobnicate') must be \
+             flagged exactly once against the SAME receiver x, not skipped \
+             and not duplicated, got {errors:#?}"
+        );
+        assert!(
+            !errors.iter().any(|e| matches!(
+                e,
+                super::super::check::TypeError::SelectorUndefined { selector, .. }
+                    if selector == "one"
+            )),
+            "the 'one' segments (before and after) are legitimate sends on \
+             the SAME receiver x and must not be flagged, got {errors:#?}"
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn super_send_looks_up_starting_at_the_enclosing_classs_superclass() {
+        // Base defines `greet` (returns Integer); Foo OVERRIDES `greet`
+        // (returns String) and its OWN `bar` sends `super greet`. The
+        // super-send must resolve to BASE's `greet` (Integer), NOT Foo's
+        // own override (String) -- if it incorrectly used Foo's override,
+        // `^n` (an Integer local) would spuriously mismatch against a
+        // String-declared return, or vice versa depending on which way
+        // the bug ran. Checked by requiring ZERO findings: super correctly
+        // reaching Base's Integer-returning `greet` makes everything here
+        // consistent; reaching Foo's own String-returning override
+        // would not.
+        let dir = temp_world_dir("super_send");
+        write_number_tower(&dir);
+        fs::write(
+            dir.join("02_base.mst"),
+            "Object subclass: Base [\n    greet ^ <Integer> [ ^1 ]\n]\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("03_foo.mst"),
+            "Base subclass: Foo [\n\
+             \x20   greet ^ <String> [ ^'hi' ]\n\
+             \x20   bar ^ <Integer> [\n\
+             \x20       ^super greet\n\
+             \x20   ]\n\
+             ]\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("world.list"),
+            "00_object.mst\n01_tower.mst\n02_base.mst\n03_foo.mst\n",
+        )
+        .unwrap();
+
+        let model = build_world_model(&dir).unwrap();
+        assert_eq!(
+            super::super::check::check_world(&model),
+            vec![],
+            "super greet must resolve to Base's Integer-returning greet, \
+             matching bar's own ^<Integer> -- Foo's own String-returning \
+             override must NOT be consulted"
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn class_side_self_send_is_not_checked() {
+        // No metaclass modeling exists (design doc's own stated v1 gap) --
+        // `self`/`Self` inside a CLASS-SIDE method must be left Dynamic
+        // rather than incorrectly searched against instance_methods.
+        let dir = temp_world_dir("class_side_self");
+        write_number_tower(&dir);
+        fs::write(
+            dir.join("02_foo.mst"),
+            "Object subclass: Foo [\n\
+             \x20   Foo class >> make [\n\
+             \x20       ^self frobnicate\n\
+             \x20   ]\n\
+             ]\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("world.list"),
+            "00_object.mst\n01_tower.mst\n02_foo.mst\n",
+        )
+        .unwrap();
+
+        let model = build_world_model(&dir).unwrap();
+        assert_eq!(
+            super::super::check::check_world(&model),
+            vec![],
+            "self inside a class-side method means 'the class', not 'an \
+             instance of it' -- must be left unchecked, not searched \
+             against instance_methods and wrongly flagged"
+        );
 
         fs::remove_dir_all(&dir).ok();
     }
