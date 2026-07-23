@@ -235,5 +235,24 @@ pub fn check_send(
             });
         }
     }
-    resolve_captured(&method.type_sig.return_type)
+    // `Self` in the CALLEE's declared return means "the receiver of this
+    // send" (late-bound), NOT "whichever class the CALLER happens to be" --
+    // handing the raw `Self` back would make every downstream subtype check
+    // resolve it against the caller's own class (`subtype_of`'s self_class
+    // parameter), a silently-wrong class the moment a `^<Self>`-returning
+    // method (String>>`,`, the ArrayedCollection copy* family, sort, ...) is
+    // called on a receiver of a DIFFERENT type. Substitute the receiver's
+    // nominal class here, at the one point that still knows it: the lookup
+    // head for an ordinary send, and `self_class` for a super send (a super
+    // send's receiver is still `self`). Only a top-level bare `Self` is
+    // rewritten -- no `Self` nested inside a block/union return exists in
+    // the corpus, and inventing a deep-substitution rule for shapes nobody
+    // writes would be speculation, not porting.
+    match resolve_captured(&method.type_sig.return_type) {
+        ResolvedType::Written(TypeExpr::Named(ref n)) if n == "Self" => {
+            let receiver_class = if is_super { self_class } else { head.as_str() };
+            ResolvedType::Written(TypeExpr::Named(receiver_class.to_string()))
+        }
+        other => other,
+    }
 }

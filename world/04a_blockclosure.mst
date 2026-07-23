@@ -15,28 +15,28 @@
  every iteration protocol take me as an argument."
 
 Object subclass: BlockClosure [
-    value [
+    value ^ <Object> [
         <primitive: 50>
     ]
-    value: a1 [
+    value: a1 <Object> ^ <Object> [
         <primitive: 51>
     ]
-    value: a1 value: a2 [
+    value: a1 <Object> value: a2 <Object> ^ <Object> [
         <primitive: 52>
     ]
-    value: a1 value: a2 value: a3 [
+    value: a1 <Object> value: a2 <Object> value: a3 <Object> ^ <Object> [
         <primitive: 53>
     ]
-    valueWithArguments: anArray [
+    valueWithArguments: anArray <Array> ^ <Object> [
         <primitive: 54>
     ]
-    ensure: aBlock [
+    ensure: aBlock <[]> ^ <Object> [
         <primitive: 60>
     ]
-    ifCurtailed: aBlock [
+    ifCurtailed: aBlock <[]> ^ <Object> [
         <primitive: 61>
     ]
-    fork [
+    fork ^ <Self> [
         "Strongtalk runs the receiver on a background process. MACVM is
          single-threaded, and the corpus's only #fork is progenv.html's
          comment-preload sweep (a first-page-load speedup MACVM doesn't need), so

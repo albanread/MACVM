@@ -18,37 +18,37 @@
  otherwise a no-op."
 
 nil subclass: Object [
-    class [
+    class ^ <Behavior> [
         <primitive: 21>
     ]
-    == anObject [
+    == anObject <Object> ^ <Boolean> [
         <primitive: 22>
     ]
-    identityHash [
+    identityHash ^ <Integer> [
         <primitive: 20>
     ]
-    hash [
+    hash ^ <Integer> [
         ^self identityHash
     ]
-    yourself [
+    yourself ^ <Self> [
         ^self
     ]
-    basicNew [
+    basicNew ^ <Object> [
         <primitive: 23>
     ]
-    basicNew: n [
+    basicNew: n <Integer> ^ <Object> [
         <primitive: 24>
     ]
-    instVarAt: i [
+    instVarAt: i <Integer> ^ <Object> [
         <primitive: 25>
     ]
-    -> v [
+    -> v <Object> ^ <Association> [
         ^Association key: self value: v
     ]
-    error: aString [
+    error: aString <String> [
         <primitive: 95>
     ]
-    halt [
+    halt ^ <Self> [
         "The programmer's `debugger;` — open the debugger here when one is
          armed (Cocoa GUI: Debug tab), then continue normally. A no-op with
          no debugger active. Answers self (DBG4, docs/gui_debugger_design.md)."
@@ -57,7 +57,7 @@ nil subclass: Object [
     subclassResponsibility [
         self error: 'subclass responsibility'
     ]
-    doesNotUnderstand: aMessage [
+    doesNotUnderstand: aMessage <Message> ^ <Object> [
         self error: 'does not understand ' , aMessage selector asString
     ]
 
@@ -74,7 +74,7 @@ nil subclass: Object [
      or a selector the receiver does not understand. The `perform:` /
      `perform:with:` … arity sugar is in 32_object_protocol_gaps.mst (it
      references Array, which is not yet bound this early in the load)."
-    perform: aSymbol withArguments: anArray [
+    perform: aSymbol <Symbol> withArguments: anArray <Array> ^ <Object> [
         <primitive: 64>
         ^self error: 'perform: ' , aSymbol printString ,
             ' failed — not understood, or wrong number of arguments'
@@ -88,10 +88,10 @@ nil subclass: Object [
  failed send."
 
 Object subclass: Message [
-    selector [
+    selector ^ <Symbol> [
         ^self instVarAt: 1
     ]
-    arguments [
+    arguments ^ <Array> [
         ^self instVarAt: 2
     ]
 ]

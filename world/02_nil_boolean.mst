@@ -10,10 +10,10 @@
  me."
 
 Object subclass: UndefinedObject [
-    isNil [
+    isNil ^ <Boolean> [
         ^true
     ]
-    notNil [
+    notNil ^ <Boolean> [
         ^false
     ]
 ]
@@ -35,30 +35,33 @@ Object subclass: Boolean [
  true without looking at its argument."
 
 Boolean subclass: True [
-    not [
+    not ^ <Boolean> [
         ^false
     ]
-    and: aBlock [
+    and: aBlock <[^Boolean]> ^ <Boolean> [
         ^aBlock value
     ]
-    or: aBlock [
+    or: aBlock <[^Boolean]> ^ <Boolean> [
         ^true
     ]
-    ifTrue: aBlock [
+    ifTrue: aBlock <[]> ^ <Object> [
         ^aBlock value
     ]
-    ifFalse: aBlock [
+    ifFalse: aBlock <[]> ^ <Object> [
         ^nil
     ]
-    ifTrue: aBlock ifFalse: cBlock [
+    ifTrue: aBlock <[]> ifFalse: cBlock <[]> ^ <Object> [
         ^aBlock value
     ]
-    ifFalse: aBlock ifTrue: cBlock [
+    ifFalse: aBlock <[]> ifTrue: cBlock <[]> ^ <Object> [
         ^cBlock value
     ]
-    & aBoolean [
+    & aBoolean <Boolean> ^ <Boolean> [
         ^aBoolean
     ]
+    "`|` is unannotated: `| arg <T> ... [` is ambiguous with an annotated
+     instance-variable list (see world/56_dict_point_set_ext.mst); the sig
+     is `aBoolean <Boolean> ^ <Boolean>`, same as & above."
     | aBoolean [
         ^true
     ]
@@ -70,74 +73,76 @@ Boolean subclass: True [
  argument, or: evaluates its block."
 
 Boolean subclass: False [
-    not [
+    not ^ <Boolean> [
         ^true
     ]
-    and: aBlock [
+    and: aBlock <[^Boolean]> ^ <Boolean> [
         ^false
     ]
-    or: aBlock [
+    or: aBlock <[^Boolean]> ^ <Boolean> [
         ^aBlock value
     ]
-    ifTrue: aBlock [
+    ifTrue: aBlock <[]> ^ <Object> [
         ^nil
     ]
-    ifFalse: aBlock [
+    ifFalse: aBlock <[]> ^ <Object> [
         ^aBlock value
     ]
-    ifTrue: aBlock ifFalse: cBlock [
+    ifTrue: aBlock <[]> ifFalse: cBlock <[]> ^ <Object> [
         ^cBlock value
     ]
-    ifFalse: aBlock ifTrue: cBlock [
+    ifFalse: aBlock <[]> ifTrue: cBlock <[]> ^ <Object> [
         ^aBlock value
     ]
-    & aBoolean [
+    & aBoolean <Boolean> ^ <Boolean> [
         ^false
     ]
+    "`|` is unannotated for the same reason as True's (parser ambiguity
+     with an ivar list); the sig is `aBoolean <Boolean> ^ <Boolean>`."
     | aBoolean [
         ^aBoolean
     ]
 ]
 
 nil subclass: Object [
-    = anObject [
+    = anObject <Object> ^ <Boolean> [
         ^self == anObject
     ]
-    ~= anObject [
+    ~= anObject <Object> ^ <Boolean> [
         ^(self = anObject) not
     ]
-    ~~ anObject [
+    ~~ anObject <Object> ^ <Boolean> [
         ^(self == anObject) not
     ]
-    isNil [
+    isNil ^ <Boolean> [
         ^false
     ]
-    notNil [
+    notNil ^ <Boolean> [
         ^true
     ]
-    isString [
+    isString ^ <Boolean> [
         ^false
     ]
-    isSymbol [
+    isSymbol ^ <Boolean> [
         ^false
     ]
-    isInteger [
+    isInteger ^ <Boolean> [
         ^false
     ]
-    isDouble [
+    isDouble ^ <Boolean> [
         ^false
     ]
     "Defined HERE, beside its sibling predicates, rather than in
      23_fraction.mst where Fraction itself lives: SmallInteger's arithmetic
      fallbacks (06) test `aNumber isFraction`, and they run long before
      file 23 loads (e.g. smallInt + largeInt during 07-22)."
-    isFraction [
+    isFraction ^ <Boolean> [
         ^false
     ]
-    isCharacter [
+    isCharacter ^ <Boolean> [
         ^false
     ]
-    isClass [
+    isClass ^ <Boolean> [
         ^false
     ]
 ]

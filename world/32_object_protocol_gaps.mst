@@ -49,25 +49,25 @@
  (world/21_collections_ext.mst)."
 
 Object subclass: Collection [
-    allSatisfy: aBlock [
+    allSatisfy: aBlock <[Object,^Boolean]> ^ <Boolean> [
         self do: [:each | (aBlock value: each) ifFalse: [ ^false ] ].
         ^true
     ]
-    anySatisfy: aBlock [
+    anySatisfy: aBlock <[Object,^Boolean]> ^ <Boolean> [
         self do: [:each | (aBlock value: each) ifTrue: [ ^true ] ].
         ^false
     ]
-    = other [
+    = other <Object> ^ <Boolean> [
         ^self == other
             or: [ self class = other class and: [ self hasSameElementsAs: other ] ]
     ]
-    hasSameElementsAs: other [
+    hasSameElementsAs: other <Collection> ^ <Boolean> [
         ^self size = other size and: [ self asBag = other asBag ]
     ]
 ]
 
 Collection subclass: Bag [
-    = other [
+    = other <Object> ^ <Boolean> [
         (other isKindOf: Bag) ifFalse: [ ^false ].
         self == other ifTrue: [ ^true ].
         self size = other size ifFalse: [ ^false ].
@@ -83,16 +83,16 @@ Collection subclass: Bag [
  build an Array to hand to the primitive and `Array` is not bound until
  10_array.mst — far later in the load order than Object's own file."
 nil subclass: Object [
-    perform: aSymbol [
+    perform: aSymbol <Symbol> ^ <Object> [
         ^self perform: aSymbol withArguments: (Array new: 0)
     ]
-    perform: aSymbol with: a [
+    perform: aSymbol <Symbol> with: a <Object> ^ <Object> [
         ^self perform: aSymbol withArguments: (Array with: a)
     ]
-    perform: aSymbol with: a with: b [
+    perform: aSymbol <Symbol> with: a <Object> with: b <Object> ^ <Object> [
         ^self perform: aSymbol withArguments: (Array with: a with: b)
     ]
-    perform: aSymbol with: a with: b with: c [
+    perform: aSymbol <Symbol> with: a <Object> with: b <Object> with: c <Object> ^ <Object> [
         ^self perform: aSymbol withArguments: (Array with: a with: b with: c)
     ]
 ]

@@ -9,25 +9,25 @@
  SortedCollection."
 
 Object subclass: Magnitude [
-    < aMagnitude [
+    < aMagnitude <Magnitude> ^ <Boolean> [
         self subclassResponsibility
     ]
-    > aMagnitude [
+    > aMagnitude <Magnitude> ^ <Boolean> [
         ^aMagnitude < self
     ]
-    <= aMagnitude [
+    <= aMagnitude <Magnitude> ^ <Boolean> [
         ^(aMagnitude < self) not
     ]
-    >= aMagnitude [
+    >= aMagnitude <Magnitude> ^ <Boolean> [
         ^(self < aMagnitude) not
     ]
-    max: aMagnitude [
+    max: aMagnitude <Magnitude> ^ <Magnitude> [
         ^self < aMagnitude ifTrue: [ aMagnitude ] ifFalse: [ self ]
     ]
-    min: aMagnitude [
+    min: aMagnitude <Magnitude> ^ <Magnitude> [
         ^self < aMagnitude ifTrue: [ self ] ifFalse: [ aMagnitude ]
     ]
-    between: lo and: hi [
+    between: lo <Magnitude> and: hi <Magnitude> ^ <Boolean> [
         ^(self >= lo) and: [ self <= hi ]
     ]
 ]
@@ -41,24 +41,24 @@ Object subclass: Magnitude [
  answers a Double, with a Fraction a Fraction."
 
 Magnitude subclass: Number [
-    abs [
+    abs ^ <Number> [
         ^self < 0 ifTrue: [ self negated ] ifFalse: [ self ]
     ]
-    negated [
+    negated ^ <Number> [
         ^0 - self
     ]
-    isZero [
+    isZero ^ <Boolean> [
         ^self = 0
     ]
-    sign [
+    sign ^ <Integer> [
         self < 0 ifTrue: [ ^-1 ].
         self > 0 ifTrue: [ ^1 ].
         ^0
     ]
-    squared [
+    squared ^ <Number> [
         ^self * self
     ]
-    to: stop do: aBlock [
+    to: stop <Number> do: aBlock <[Number]> ^ <Self> [
         | i |
         i := self.
         [ i <= stop ] whileTrue: [ aBlock value: i. i := i + 1 ].

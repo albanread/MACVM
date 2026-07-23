@@ -5,22 +5,22 @@
 
 nil subclass: Object [
     "Print-and-return-self conveniences (the classic REPL/debug helpers)."
-    printNl [ Transcript showCr: self printString. ^self ]
-    displayNl [ Transcript showCr: self displayString. ^self ]
+    printNl ^ <Self> [ Transcript showCr: self printString. ^self ]
+    displayNl ^ <Self> [ Transcript showCr: self displayString. ^self ]
 
     "A plain-text rendering. String/Symbol keep their own (return self / the
      bare characters); everything else falls back to displayString here."
-    asString [ ^self displayString ]
+    asString ^ <String> [ ^self displayString ]
 ]
 
 Object subclass: Boolean [
-    xor: aBoolean [ ^(self = aBoolean) not ]
-    eqv: aBoolean [ ^self = aBoolean ]
+    xor: aBoolean <Boolean> ^ <Boolean> [ ^(self = aBoolean) not ]
+    eqv: aBoolean <Boolean> ^ <Boolean> [ ^self = aBoolean ]
 ]
 
 Magnitude subclass: Character [
     "An Array of the characters from self up to aCharacter inclusive."
-    to: aCharacter [
+    to: aCharacter <Character> ^ <Array> [
         ^(self asInteger to: aCharacter asInteger) collect: [:i | Character value: i ]
     ]
 ]
@@ -28,7 +28,7 @@ Magnitude subclass: Character [
 String subclass: Symbol [
     "The number of arguments this selector takes: keyword selectors count
      their colons, a binary selector is 1, a unary selector is 0."
-    numArgs [
+    numArgs ^ <Integer> [
         | s colons |
         s := self asString.
         s isEmpty ifTrue: [ ^0 ].

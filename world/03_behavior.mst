@@ -10,22 +10,22 @@
  through its class, e.g. anObject class name."
 
 Object subclass: Behavior [
-    name [
+    name ^ <Symbol> [
         ^self instVarAt: 5
     ]
-    superclass [
+    superclass ^ <Behavior|UndefinedObject> [
         ^self instVarAt: 3
     ]
-    instVarNames [
+    instVarNames ^ <Array> [
         ^self instVarAt: 6
     ]
-    new [
+    new ^ <Object> [
         ^self basicNew
     ]
-    new: n [
+    new: n <Integer> ^ <Object> [
         ^self basicNew: n
     ]
-    inheritsFrom: aClass [
+    inheritsFrom: aClass <Behavior> ^ <Boolean> [
         | s |
         s := self superclass.
         [ s notNil ] whileTrue: [
@@ -52,10 +52,10 @@ Behavior subclass: Metaclass [
 ]
 
 nil subclass: Object [
-    isKindOf: aClass [
+    isKindOf: aClass <Behavior> ^ <Boolean> [
         ^self class == aClass or: [ self class inheritsFrom: aClass ]
     ]
-    isMemberOf: aClass [
+    isMemberOf: aClass <Behavior> ^ <Boolean> [
         ^self class == aClass
     ]
 ]

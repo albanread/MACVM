@@ -7,13 +7,13 @@ nil subclass: Object [
     printOn: s [
         s nextPutAll: self class name asString
     ]
-    printString [
+    printString ^ <String> [
         | s |
         s := WriteStream on: (String new: 16).
         self printOn: s.
         ^s contents
     ]
-    displayString [
+    displayString ^ <String> [
         ^self printString
     ]
     inspect [
@@ -107,7 +107,7 @@ Magnitude subclass: Character [
 ]
 
 ArrayedCollection subclass: String [
-    displayString [
+    displayString ^ <String> [
         ^self
     ]
     printOn: s [
@@ -193,11 +193,11 @@ Object subclass: Behavior [
 ]
 
 Object subclass: TranscriptStream [
-    show: anObject [
+    show: anObject <Object> [
         anObject isString ifTrue: [ ^self basicPrint: anObject ].
         ^self show: anObject printString
     ]
-    << anObject [
+    << anObject <Object> ^ <Self> [
         anObject isString ifTrue: [ self show: anObject. ^self ].
         anObject isCharacter ifTrue: [ self show: (String with: anObject). ^self ].
         self show: anObject printString.

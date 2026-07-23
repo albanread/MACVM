@@ -121,7 +121,22 @@ pub fn check_method(
     // off the end of its own Smalltalk statements" -- both keep the
     // implicit-self check as before.
     let is_bare_primitive = m.body.is_empty() && m.primitive.is_some();
-    if !found_return && !is_bare_primitive {
+    // T4's second such exemption (same family as the bare-primitive one): a
+    // body whose LAST statement is an `error:`/`subclassResponsibility` send
+    // never falls off the end at all -- `error:` stops the program (there is
+    // no exception system to resume through, 01_object.mst) -- so checking a
+    // phantom implicit `^self` against the declared return would falsely
+    // reject exactly the abstract-method annotations most worth writing
+    // (`Magnitude>><' aMagnitude <Magnitude> ^<Boolean>` over a
+    // subclassResponsibility body). Only the LAST statement is consulted:
+    // an error: in a mid-body guard still leaves a real fall-off-the-end
+    // path, which keeps the check.
+    let ends_in_never_returning_send = matches!(
+        m.body.last(),
+        Some(Expr::Send { selector, .. })
+            if selector == "error:" || selector == "subclassResponsibility"
+    );
+    if !found_return && !is_bare_primitive && !ends_in_never_returning_send {
         let implicit = ResolvedType::named("Self");
         let mut trail = Trail::new();
         if !subtype_of(model, class_name, &implicit, &declared_return, &mut trail) {
@@ -808,7 +823,126 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
+    #[test]
+    fn subclass_responsibility_body_is_not_checked_against_implicit_self() {
+        // An abstract method's body IS a `self subclassResponsibility`
+        // send -- it never falls off the end (error: stops the program;
+        // there is no exception system to resume through), so its honest
+        // declared return (`Magnitude>>< ... ^<Boolean>` in the real
+        // world) must not be rejected against a phantom implicit `^self`.
+        let dir = temp_world_dir("bottom_body");
+        write_number_tower(&dir);
+        fs::write(
+            dir.join("02_foo.mst"),
+            "Object subclass: Foo [\n\
+             \x20   < other <Foo> ^ <Boolean> [\n\
+             \x20       self subclassResponsibility\n\
+             \x20   ]\n\
+             ]\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("world.list"),
+            "00_object.mst\n01_tower.mst\n02_foo.mst\n",
+        )
+        .unwrap();
+
+        let model = build_world_model(&dir).unwrap();
+        assert_eq!(
+            super::super::check::check_world(&model),
+            vec![],
+            "a subclassResponsibility body never returns normally -- its \
+             declared ^<Boolean> must not be checked against implicit self"
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn mid_body_error_still_checks_implicit_self() {
+        // Only the LAST statement makes a body bottom -- an error: used as
+        // a mid-body guard still leaves a real fall-off-the-end path.
+        let dir = temp_world_dir("mid_body_error");
+        write_number_tower(&dir);
+        fs::write(
+            dir.join("02_foo.mst"),
+            "Object subclass: Foo [\n\
+             \x20   check ^ <Boolean> [\n\
+             \x20       self error: 'nope'.\n\
+             \x20       3 + 4.\n\
+             \x20   ]\n\
+             ]\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("world.list"),
+            "00_object.mst\n01_tower.mst\n02_foo.mst\n",
+        )
+        .unwrap();
+
+        let model = build_world_model(&dir).unwrap();
+        let errors = super::super::check::check_world(&model);
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, super::super::check::TypeError::ReturnNotSubtype { .. })),
+            "an error: that is NOT the last statement must keep the \
+             implicit-self check (Foo is not a Boolean), got {errors:#?}"
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
     // ---- T3: the send rule ------------------------------------------------
+
+    #[test]
+    fn self_return_substitutes_receiver_class_at_call_sites() {
+        // `me ^<Self>` called on a `<Wid>`-typed receiver answers a Wid --
+        // the CALLEE's Self is late-bound to the RECEIVER, never to
+        // whichever class the calling method happens to live in. `bad`
+        // must flag (Wid is not a Foo) and `good` must not (Wid is a
+        // Wid) -- under the pre-fix behavior (raw `Self` handed back and
+        // later resolved against the CALLER's class) both verdicts come
+        // out exactly inverted, so this test locks the direction in.
+        let dir = temp_world_dir("self_return_subst");
+        write_number_tower(&dir);
+        fs::write(
+            dir.join("02_wid.mst"),
+            "Object subclass: Wid [\n\
+             \x20   me ^ <Self> [ ^self ]\n\
+             ]\n\
+             Object subclass: Foo [\n\
+             \x20   | w <Wid> |\n\
+             \x20   bad ^ <Foo> [ ^w me ]\n\
+             \x20   good ^ <Wid> [ ^w me ]\n\
+             ]\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("world.list"),
+            "00_object.mst\n01_tower.mst\n02_wid.mst\n",
+        )
+        .unwrap();
+
+        let model = build_world_model(&dir).unwrap();
+        let errors = super::super::check::check_world(&model);
+        assert_eq!(
+            errors.len(),
+            1,
+            "exactly `bad` must flag (Wid me answers a Wid, not a Foo) and \
+             `good` must stay clean, got {errors:#?}"
+        );
+        assert!(
+            matches!(
+                &errors[0],
+                super::super::check::TypeError::ReturnNotSubtype { site, .. }
+                    if site.selector.as_deref() == Some("bad")
+            ),
+            "the one finding must be bad's return, got {errors:#?}"
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn send_to_a_selector_the_receivers_class_defines_is_clean() {

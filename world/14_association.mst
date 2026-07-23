@@ -9,33 +9,33 @@
  Dictionary hands me out from associations and associationsDo:."
 
 Object subclass: Association [
-    Association class >> key: k value: v [
+    Association class >> key: k <Object> value: v <Object> ^ <Association> [
         | a |
         a := self basicNew.
         a setKey: k value: v.
         ^a
     ]
-    setKey: k value: v [
+    setKey: k <Object> value: v <Object> [
         key := k.
         value := v.
     ]
-    key [
+    key ^ <Object> [
         ^key
     ]
-    value [
+    value ^ <Object> [
         ^value
     ]
-    key: k [
+    key: k <Object> [
         key := k
     ]
-    value: v [
+    value: v <Object> [
         value := v
     ]
-    = other [
+    = other <Object> ^ <Boolean> [
         (other isKindOf: Association) ifFalse: [ ^false ].
         ^key = other key
     ]
-    hash [
+    hash ^ <Integer> [
         ^key hash
     ]
 ]

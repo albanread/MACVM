@@ -20,7 +20,7 @@
  floor/truncated/rounded; Double already has all three, 08_double.mst)."
 
 nil subclass: Object [
-    isPoint [
+    isPoint ^ <Boolean> [
         ^false
     ]
 ]
@@ -33,92 +33,92 @@ nil subclass: Object [
  truncated, truncateTo:, dist: (Euclidean distance), dotProduct:,
  translatedBy:, and relativeTo:. I print myself as x@y."
 Object subclass: Point [
-    | x y |
+    | x <Number> y <Number> |
 
-    Point class >> x: xval y: yval [
+    Point class >> x: xval <Number> y: yval <Number> ^ <Point> [
         ^self basicNew setX: xval y: yval
     ]
-    Point class >> origin [
+    Point class >> origin ^ <Point> [
         ^self x: 0 y: 0
     ]
-    setX: xval y: yval [
+    setX: xval <Number> y: yval <Number> [
         x := xval.
         y := yval.
     ]
-    x [
+    x ^ <Number> [
         ^x
     ]
-    y [
+    y ^ <Number> [
         ^y
     ]
-    isPoint [
+    isPoint ^ <Boolean> [
         ^true
     ]
-    asPoint [
+    asPoint ^ <Point> [
         ^self
     ]
-    hash [
+    hash ^ <Integer> [
         ^(x hash bitShift: 10) bitXor: (x hash bitXor: y hash)
     ]
-    = other [
+    = other <Object> ^ <Boolean> [
         other isPoint ifFalse: [ ^false ].
         ^x = other x and: [ y = other y ]
     ]
-    < other [
+    < other <Point> ^ <Boolean> [
         ^x < other x and: [ y < other y ]
     ]
-    <= other [
+    <= other <Point> ^ <Boolean> [
         ^x <= other x and: [ y <= other y ]
     ]
-    > other [
+    > other <Point> ^ <Boolean> [
         ^x > other x and: [ y > other y ]
     ]
-    >= other [
+    >= other <Point> ^ <Boolean> [
         ^x >= other x and: [ y >= other y ]
     ]
-    + other [
+    + other <Point> ^ <Point> [
         ^Point x: x + other x y: y + other y
     ]
-    - other [
+    - other <Point> ^ <Point> [
         ^Point x: x - other x y: y - other y
     ]
-    * other [
+    * other <Point> ^ <Point> [
         ^Point x: x * other x y: y * other y
     ]
-    / other [
+    / other <Point> ^ <Point> [
         ^Point x: x / other x y: y / other y
     ]
-    // other [
+    // other <Point> ^ <Point> [
         ^Point x: x // other x y: y // other y
     ]
-    abs [
+    abs ^ <Point> [
         ^Point x: x abs y: y abs
     ]
-    negated [
+    negated ^ <Point> [
         ^Point x: x negated y: y negated
     ]
-    floor [
+    floor ^ <Point> [
         ^Point x: x floor y: y floor
     ]
-    rounded [
+    rounded ^ <Point> [
         ^Point x: x rounded y: y rounded
     ]
-    truncated [
+    truncated ^ <Point> [
         ^Point x: x truncated y: y truncated
     ]
-    truncateTo: grid [
+    truncateTo: grid <Number> ^ <Point> [
         ^Point x: (x truncateTo: grid) y: (y truncateTo: grid)
     ]
-    max: other [
+    max: other <Point> ^ <Point> [
         ^Point x: (x max: other x) y: (y max: other y)
     ]
-    min: other [
+    min: other <Point> ^ <Point> [
         ^Point x: (x min: other x) y: (y min: other y)
     ]
-    relativeTo: p [
+    relativeTo: p <Point> ^ <Point> [
         ^self - p
     ]
-    translatedBy: p [
+    translatedBy: p <Point> ^ <Point> [
         ^self + p
     ]
     printOn: s [
@@ -129,22 +129,22 @@ Object subclass: Point [
 ]
 
 Magnitude subclass: Number [
-    @ aNumber [
+    @ aNumber <Number> ^ <Point> [
         ^Point x: self y: aNumber
     ]
-    truncateTo: grid [
+    truncateTo: grid <Number> ^ <Number> [
         ^(self / grid) truncated * grid
     ]
 ]
 
 Number subclass: Integer [
-    floor [
+    floor ^ <Integer> [
         ^self
     ]
-    truncated [
+    truncated ^ <Integer> [
         ^self
     ]
-    rounded [
+    rounded ^ <Integer> [
         ^self
     ]
 ]
