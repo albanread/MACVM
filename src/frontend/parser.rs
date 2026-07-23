@@ -671,6 +671,7 @@ impl<'a> Parser<'a> {
                 let pspan = self.cur.1;
                 let name = self.expect_ident("expected a parameter name after ':'")?;
                 self.check_not_reserved(pspan, &name)?;
+                self.skip_type_annotation()?; // `[:x <Integer> | ...]` (D11)
                 params.push(name);
             }
             self.expect(&Tok::VBar, "expected '|' after block parameters")?;
@@ -695,6 +696,7 @@ impl<'a> Parser<'a> {
                 self.check_not_reserved(self.cur.1, &n)?;
                 temps.push(n);
                 self.bump()?;
+                self.skip_type_annotation()?; // `| x <Integer> |` (D11)
             }
             self.expect(&Tok::VBar, "expected closing '|' after temporaries")?;
         }
@@ -702,6 +704,42 @@ impl<'a> Parser<'a> {
     }
 
     // --- pragmas --------------------------------------------------------------
+
+    /// SPEC §1 / DESIGN.md D11: Strongtalk-style TYPE ANNOTATIONS are
+    /// accepted and DISCARDED — "annotations must never change dynamic
+    /// behavior", and this runtime is deliberately untyped (the Strongtalk
+    /// erasure stance: the checker was a separate tool; the compiler never
+    /// consumed annotations). Grammar positions: after a declared
+    /// instance-variable/temporary name, after a method parameter, after a
+    /// block parameter, and `^<T>` after a message pattern. On `<`, consume
+    /// the balanced body with the SAME lexer discipline pragmas use (pragma
+    /// mode, L10: every `>` closes — so nested `<Blk<^Integer>>` closers
+    /// never merge into `>>`) and keep nothing: no AST, no cost downstream.
+    fn skip_type_annotation(&mut self) -> Result<(), CompileError> {
+        if matches!(&self.cur.0, Tok::BinarySel(s) if s == "<") {
+            self.lx.set_pragma_mode(true);
+            self.bump()?; // '<'
+            self.skip_pragma_body(1)?;
+        }
+        Ok(())
+    }
+
+    /// The `^<ReturnType>` half of a Strongtalk method signature, between the
+    /// message pattern and the body's `[`. A bare `^` here is never valid
+    /// Smalltalk, so requiring the annotation after it costs nothing.
+    fn skip_return_type_annotation(&mut self) -> Result<(), CompileError> {
+        if matches!(self.cur.0, Tok::Caret) {
+            self.bump()?;
+            if !matches!(&self.cur.0, Tok::BinarySel(s) if s == "<") {
+                return Err(self.error(
+                    self.cur.1,
+                    "expected a type annotation after '^' in a method pattern",
+                ));
+            }
+            self.skip_type_annotation()?;
+        }
+        Ok(())
+    }
 
     fn skip_pragma_body(&mut self, mut depth: u32) -> Result<(), CompileError> {
         loop {
@@ -990,6 +1028,7 @@ impl<'a> Parser<'a> {
                 let pspan = self.cur.1;
                 let p = self.expect_ident("expected a parameter name after binary selector")?;
                 self.check_not_reserved(pspan, &p)?;
+                self.skip_type_annotation()?; // `< other <Magnitude>` (D11)
                 Ok((sel, vec![p]))
             }
             Tok::VBar => {
@@ -997,6 +1036,7 @@ impl<'a> Parser<'a> {
                 let pspan = self.cur.1;
                 let p = self.expect_ident("expected a parameter name after '|'")?;
                 self.check_not_reserved(pspan, &p)?;
+                self.skip_type_annotation()?; // (D11)
                 Ok(("|".to_string(), vec![p]))
             }
             Tok::Keyword(_) => {
@@ -1008,6 +1048,7 @@ impl<'a> Parser<'a> {
                     let pspan = self.cur.1;
                     let p = self.expect_ident("expected a parameter name after keyword")?;
                     self.check_not_reserved(pspan, &p)?;
+                    self.skip_type_annotation()?; // `add: n <Integer>` (D11)
                     params.push(p);
                 }
                 Ok((sel, params))
@@ -1038,6 +1079,7 @@ impl<'a> Parser<'a> {
     fn parse_method(&mut self, class_side: bool) -> Result<MethodNode, CompileError> {
         let span = self.cur.1;
         let (pattern_selector, params) = self.parse_pattern()?;
+        self.skip_return_type_annotation()?; // `^<Integer>` before the body (D11)
         self.expect(&Tok::LBracket, "expected '[' to start method body")?;
         let (primitive, ffi, temps, body) = self.parse_method_body()?;
         self.expect(&Tok::RBracket, "expected ']' to close method body")?;
@@ -1098,6 +1140,8 @@ impl<'a> Parser<'a> {
                         let mspan = self.cur.1;
                         let param = self.expect_ident("expected a parameter name")?;
                         self.check_not_reserved(mspan, &param)?;
+                        self.skip_type_annotation()?; // (D11)
+                        self.skip_return_type_annotation()?;
                         self.expect(&Tok::LBracket, "expected '['")?;
                         let (primitive, ffi, temps, body) = self.parse_method_body()?;
                         self.expect(&Tok::RBracket, "expected ']'")?;
@@ -1117,6 +1161,7 @@ impl<'a> Parser<'a> {
                             self.check_not_reserved(self.cur.1, &n)?;
                             names.push(n);
                             self.bump()?;
+                            self.skip_type_annotation()?; // `| count <Integer> |` (D11)
                         }
                         self.expect(&Tok::VBar, "expected closing '|' after instance variables")?;
                         inst_vars.extend(names);
@@ -1799,5 +1844,72 @@ mod tests {
             panic!("expected a binary Send")
         };
         assert!(matches!(receiver.as_ref(), Expr::DynArray { .. }));
+    }
+
+    /// D11 (SPEC §1): Strongtalk type annotations are accepted and DISCARDED
+    /// — an annotated source must parse to the SAME shape as its bare twin.
+    #[test]
+    fn type_annotations_accepted_and_discarded() {
+        let annotated = "Object subclass: Ty [
+    | count <Integer> name <String> |
+    add: n <Integer> to: m <Integer> ^<Integer> [
+        | sum <Integer> |
+        sum := n + m.
+        ^sum
+    ]
+    answer ^<Integer> [ ^42 ]
+    each ^<Integer> [ ^#(1) inject: 0 into: [ :a <Integer> :e <Integer> | a + e ] ]
+    < other <Ty> ^<Boolean> [ ^true ]
+]";
+        let bare = "Object subclass: Ty [
+    | count name |
+    add: n to: m [
+        | sum |
+        sum := n + m.
+        ^sum
+    ]
+    answer [ ^42 ]
+    each [ ^#(1) inject: 0 into: [ :a :e | a + e ] ]
+    < other [ ^true ]
+]";
+        let a = parse_file(annotated).expect("annotated source must parse (D11)");
+        let b = parse_file(bare).expect("bare twin must parse");
+        let (TopItem::ClassDef(ca), TopItem::ClassDef(cb)) = (&a[0], &b[0]) else {
+            panic!("both parse to a class def");
+        };
+        assert_eq!(ca.inst_vars, cb.inst_vars, "ivar names identical, annotations gone");
+        assert_eq!(ca.methods.len(), cb.methods.len());
+        for (ma, mb) in ca.methods.iter().zip(&cb.methods) {
+            assert_eq!(ma.pattern_selector, mb.pattern_selector);
+            assert_eq!(ma.params, mb.params);
+            assert_eq!(ma.temps, mb.temps);
+            assert_eq!(
+                ma.body.len(),
+                mb.body.len(),
+                "{}: same statement count",
+                ma.pattern_selector
+            );
+        }
+    }
+
+    /// The `<`-as-binary-selector ambiguity: expressions are untouched, and a
+    /// bare `^` in a pattern (never valid Smalltalk) reports the annotation
+    /// expectation rather than something cryptic.
+    #[test]
+    fn annotation_skipping_never_eats_comparison_sends() {
+        let items = parse_file("Transcript show: (3 < 4) printString.").expect("expr parses");
+        assert_eq!(items.len(), 1);
+        let err = parse_file("Object subclass: T [ go ^ [ ^1 ] ]").unwrap_err();
+        assert!(
+            err.msg.contains("type annotation"),
+            "bare ^ in a pattern names the annotation rule: {}",
+            err.msg
+        );
+        let err2 = parse_file("Object subclass: T [ go: x <Unterminated [ ^1 ] ]").unwrap_err();
+        assert!(
+            err2.msg.contains("unterminated"),
+            "runaway annotation reports cleanly: {}",
+            err2.msg
+        );
     }
 }
