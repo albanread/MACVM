@@ -58,6 +58,13 @@ TestCase subclass: SupervisorTests [
         self runTest: #testStopTerminatesInReverseOrderAndSilences do: [ self testStopTerminatesInReverseOrderAndSilences ].
         self runTest: #testDiedSeamRoutesThroughDispatchOne do: [ self testDiedSeamRoutesThroughDispatchOne ].
         self runTest: #testUnsupervisedDeathIsIgnoredByRegistry do: [ self testUnsupervisedDeathIsIgnoredByRegistry ].
+        self runTest: #testOneForAllRestartsEverySibling do: [ self testOneForAllRestartsEverySibling ].
+        self runTest: #testRestForOneRestartsOnlyTheSuffix do: [ self testRestForOneRestartsOnlyTheSuffix ].
+        self runTest: #testRestForOneAtLastPositionIsLocal do: [ self testRestForOneAtLastPositionIsLocal ].
+        self runTest: #testOneForAllSkipsTemporaryOnRestart do: [ self testOneForAllSkipsTemporaryOnRestart ].
+        self runTest: #testChildSupervisorGiveUpEscalatesAndRestartsFresh do: [ self testChildSupervisorGiveUpEscalatesAndRestartsFresh ].
+        self runTest: #testEscalationStormGivesUpAtRoot do: [ self testEscalationStormGivesUpAtRoot ].
+        self runTest: #testTreeStartStopOrdering do: [ self testTreeStartStopOrdering ].
         self cleanupHooks
     ]
 
@@ -276,5 +283,181 @@ TestCase subclass: SupervisorTests [
         self assert: self spawnCount equals: 1.
         self assert: (WorkerNames named: #a) notNil.
         sup stop
+    ]
+
+    "── 10. #oneForAll: one death restarts the whole set (O2) ─────────────
+     Teardown of the survivors runs in REVERSE start order, the restart in
+     declared order, and the whole cycle charges intensity ONCE."
+    testOneForAllRestartsEverySibling [
+        | sup |
+        self freshTree.
+        sup := WorkerSupervisor named: #svc strategy: #oneForAll.
+        sup superviseNamed: #a init: 'initA'.
+        sup superviseNamed: #b init: 'initB'.
+        sup superviseNamed: #c init: 'initC'.
+        sup start.                                            "101 102 103"
+        self kill: #b.
+        "childDied first retires b's corpse (102), then the strategy tears
+         down the survivors reverse (c=103, a=101) and restarts a' b' c'"
+        self assert: self terminateLog size equals: 3.
+        self assert: ((self terminateLog at: 1) at: 2) equals: 102.
+        self assert: ((self terminateLog at: 2) at: 2) equals: 103.
+        self assert: ((self terminateLog at: 3) at: 2) equals: 101.
+        self assert: self spawnCount equals: 6.               "3 starts + 3 restarts"
+        self assert: (WorkerNames named: #a) id equals: 104.
+        self assert: (WorkerNames named: #b) id equals: 105.
+        self assert: (WorkerNames named: #c) id equals: 106.
+        self assert: sup restartCount equals: 1.              "ONE charge, not three"
+        self assert: sup state equals: #running.
+        sup stop
+    ]
+
+    "── 11. #restForOne: only the dead child and its successors (O2) ──────"
+    testRestForOneRestartsOnlyTheSuffix [
+        | sup |
+        self freshTree.
+        sup := WorkerSupervisor named: #svc strategy: #restForOne.
+        sup superviseNamed: #a init: 'initA'.
+        sup superviseNamed: #b init: 'initB'.
+        sup superviseNamed: #c init: 'initC'.
+        sup start.                                            "101 102 103"
+        self kill: #b.
+        "suffix = b,c: corpse 102, then c=103 torn down; b'=104 c'=105"
+        self assert: (WorkerNames named: #a) id equals: 101.  "a UNTOUCHED"
+        self assert: (WorkerNames named: #b) id equals: 104.
+        self assert: (WorkerNames named: #c) id equals: 105.
+        self assert: sup restartCount equals: 1.
+        "a death at position 1 restarts everything (the suffix is the set)"
+        self kill: #a.
+        self assert: (WorkerNames named: #a) id equals: 106.
+        self assert: (WorkerNames named: #b) id equals: 107.
+        self assert: (WorkerNames named: #c) id equals: 108.
+        self assert: sup restartCount equals: 2.
+        self assert: sup state equals: #running.
+        sup stop
+    ]
+
+    "── 12. #restForOne at the LAST position degenerates to oneForOne ─────"
+    testRestForOneAtLastPositionIsLocal [
+        | sup |
+        self freshTree.
+        sup := WorkerSupervisor named: #svc strategy: #restForOne.
+        sup superviseNamed: #a init: 'initA'.
+        sup superviseNamed: #b init: 'initB'.
+        sup superviseNamed: #c init: 'initC'.
+        sup start.                                            "101 102 103"
+        self kill: #c.
+        self assert: (WorkerNames named: #a) id equals: 101.
+        self assert: (WorkerNames named: #b) id equals: 102.
+        self assert: (WorkerNames named: #c) id equals: 104.
+        self assert: self terminateLog size equals: 1.        "only c's corpse"
+        self assert: sup restartCount equals: 1.
+        sup stop
+    ]
+
+    "── 13. a strategy teardown removes #temporary children for good ──────
+     (OTP: temporary children are never restarted; only a full stop+start
+     cycle re-creates them.)"
+    testOneForAllSkipsTemporaryOnRestart [
+        | sup |
+        self freshTree.
+        sup := WorkerSupervisor named: #svc strategy: #oneForAll.
+        sup superviseNamed: #a init: 'initA'.
+        sup superviseNamed: #t init: 'initT' restart: #temporary.
+        sup superviseNamed: #c init: 'initC'.
+        sup start.                                            "101 102 103"
+        self kill: #a.
+        "teardown reverse: c=103, t=102, a's corpse already cleared (101
+         retired defensively first); restart: a'=104, t SKIPPED, c'=105"
+        self assert: (WorkerNames named: #a) id equals: 104.
+        self assert: (WorkerNames named: #t) isNil.
+        self assert: (WorkerNames named: #c) id equals: 105.
+        self assert: self spawnCount equals: 5.
+        "a FULL stop+start cycle re-creates the temporary"
+        sup stop.
+        sup start.                                            "106 107 108"
+        self assert: (WorkerNames named: #t) notNil.
+        self assert: (WorkerNames named: #t) id equals: 107.
+        sup stop
+    ]
+
+    "── 14. escalation: a giving-up child supervisor is restarted by its
+     parent, with a FRESH intensity window (O2 trees) ─────────────────────"
+    testChildSupervisorGiveUpEscalatesAndRestartsFresh [
+        | par sub |
+        self freshTree.
+        par := WorkerSupervisor named: #par strategy: #oneForOne.
+        sub := (WorkerSupervisor named: #sub strategy: #oneForOne)
+            maxRestarts: 1 perSeconds: 5.
+        sub superviseNamed: #x init: 'initX'.
+        par superviseNamed: #w init: 'initW'.
+        par superviseSupervisor: sub.
+        par start.                                            "w=101, x=102"
+        self kill: #x.                                        "sub restarts: x'=103"
+        self assert: sub restartCount equals: 1.
+        self kill: #x.
+        "sub's window (1 in 5) is spent: it gives up and ESCALATES; the
+         parent treats that as a child death and restarts the subtree"
+        self assert: sub state equals: #running.              "already restarted"
+        self assert: par restartCount equals: 1.
+        self assert: sub restartCount equals: 0.              "FRESH window"
+        self assert: (WorkerNames named: #x) id equals: 104.
+        self assert: (WorkerNames named: #w) id equals: 101.  "sibling untouched"
+        self assert: par state equals: #running.
+        par stop
+    ]
+
+    "── 15. an escalation storm exhausts the parent too: root gives up and
+     stays down ──────────────────────────────────────────────────────────"
+    testEscalationStormGivesUpAtRoot [
+        | par sub |
+        self freshTree.
+        par := (WorkerSupervisor named: #par strategy: #oneForOne)
+            maxRestarts: 1 perSeconds: 5.
+        sub := (WorkerSupervisor named: #sub strategy: #oneForOne)
+            maxRestarts: 1 perSeconds: 5.
+        sub superviseNamed: #x init: 'initX'.
+        par superviseNamed: #w init: 'initW'.
+        par superviseSupervisor: sub.
+        par start.                                            "w=101, x=102"
+        self kill: #x.                                        "sub charge 1, x'=103"
+        self kill: #x.                                        "sub gives up -> par charge 1, sub fresh, x''=104"
+        self assert: par restartCount equals: 1.
+        self kill: #x.                                        "sub charge 1, x'''=105"
+        self kill: #x.
+        "sub gives up AGAIN; the parent's own window (1 in 5) is spent ->
+         the ROOT gives up: everything down, in reverse (w torn down last)"
+        self assert: par state equals: #givenUp.
+        self assert: sub state equals: #idle.                 "stopped by the parent teardown"
+        self assert: (WorkerNames named: #w) isNil.
+        self assert: (WorkerNames named: #x) isNil.
+        self assert: ((self terminateLog at: (self terminateLog size)) at: 2) equals: 101.
+        "straggler deaths after the root give-up are inert"
+        SupervisorRegistry workerDied: 999.
+        self assert: par state equals: #givenUp
+    ]
+
+    "── 16. tree lifecycle ordering: a sub-supervisor holds an ordinary
+     position — its children start inside it and stop in reverse ──────────"
+    testTreeStartStopOrdering [
+        | par sub |
+        self freshTree.
+        par := WorkerSupervisor named: #par strategy: #oneForOne.
+        sub := WorkerSupervisor named: #sub strategy: #oneForOne.
+        sub superviseNamed: #x init: 'initX'.
+        par superviseNamed: #w1 init: 'initW1'.
+        par superviseSupervisor: sub.
+        par superviseNamed: #w2 init: 'initW2'.
+        par start.
+        "start order: w1, then the subtree (x), then w2"
+        self assert: ((self spawnLog at: 1) at: 3) equals: 'initW1'.
+        self assert: ((self spawnLog at: 2) at: 3) equals: 'initX'.
+        self assert: ((self spawnLog at: 3) at: 3) equals: 'initW2'.
+        par stop.
+        "stop order: exact reverse -- w2, the subtree (x), w1"
+        self assert: self terminateLog size equals: 3.
+        self assert: ((self terminateLog at: 1) at: 2) equals: 103.   "w2"
+        self assert: ((self terminateLog at: 2) at: 2) equals: 102.   "x"
+        self assert: ((self terminateLog at: 3) at: 2) equals: 101.   "w1"
     ]
 ]

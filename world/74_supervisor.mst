@@ -30,12 +30,21 @@
  (re)creates it — the WHOLE restart recipe, since share-nothing workers hold
  no state a restart could migrate — its restart policy (#permanent restarts
  on crash; #temporary never restarts), the currently-live worker handle (nil
- while dead/stopped), and when it last started."
+ while dead/stopped), and when it last started. A child may instead be a
+ whole SUB-SUPERVISOR (O2 trees): then supervisorChild holds it, the worker
+ slot stays forever nil, and (re)starting me means starting that subtree."
 Object subclass: WorkerSpec [
-    | name <Symbol> initSource <String> restart <Symbol> worker startedAt <Integer> |
+    | name <Symbol> initSource <String> restart <Symbol> worker startedAt <Integer>
+      supervisorChild <WorkerSupervisor|UndefinedObject> |
 
     WorkerSpec class >> named: aSymbol init: aString restart: aPolicy ^ <WorkerSpec> [
         ^self basicNew setName: aSymbol init: aString restart: aPolicy
+    ]
+    "A child that is itself a supervisor — OTP's type: supervisor. Always
+     #permanent (a subtree is infrastructure, not a start-once job)."
+    WorkerSpec class >> forSupervisor: aSup <WorkerSupervisor> ^ <WorkerSpec> [
+        ^(self basicNew setName: aSup name init: '' restart: #permanent)
+            setSupervisorChild: aSup
     ]
     setName: aSymbol <Symbol> init: aString <String> restart: aPolicy <Symbol> ^ <Self> [
         name := aSymbol.
@@ -43,9 +52,15 @@ Object subclass: WorkerSpec [
         restart := aPolicy.
         ^self
     ]
+    setSupervisorChild: aSup <WorkerSupervisor> ^ <Self> [
+        supervisorChild := aSup.
+        ^self
+    ]
     name ^ <Symbol> [ ^name ]
     initSource ^ <String> [ ^initSource ]
     restart ^ <Symbol> [ ^restart ]
+    isSupervisorChild ^ <Boolean> [ ^supervisorChild notNil ]
+    supervisorChild ^ <WorkerSupervisor|UndefinedObject> [ ^supervisorChild ]
     "The live handle answers Worker protocol (id/terminate) — or a test
      double installed via WorkerSupervisor spawnHook:, which is why the slot
      is typed Object rather than Worker."
@@ -144,8 +159,8 @@ Object subclass: WorkerSupervisor [
 
     "── building ──────────────────────────────────────────────────────────"
     WorkerSupervisor class >> named: aSymbol strategy: aStrategy ^ <WorkerSupervisor> [
-        (aStrategy == #oneForOne) ifFalse: [
-            ^self error: 'v1 O0 supports #oneForOne only (O2 adds #oneForAll/#restForOne), got: ',
+        (#(#oneForOne #oneForAll #restForOne) includes: aStrategy) ifFalse: [
+            ^self error: 'strategy must be #oneForOne, #oneForAll or #restForOne, got: ',
                 aStrategy printString ].
         ^self basicNew initNamed: aSymbol strategy: aStrategy
     ]
@@ -186,11 +201,30 @@ Object subclass: WorkerSupervisor [
         children add: (WorkerSpec named: aSymbol init: aString restart: aPolicy).
         ^self
     ]
+    "A child that is itself a supervisor (O2 trees): it takes an ordinary
+     position in the start order — its own children start when it does —
+     and its give-up escalates here, handled under THIS supervisor's
+     strategy and intensity exactly like a child death."
+    superviseSupervisor: aSup <WorkerSupervisor> ^ <Self> [
+        (children anySatisfy: [:s | s name == aSup name ]) ifTrue: [
+            ^self error: 'duplicate child name in supervisor ', name printString, ': ',
+                aSup name printString ].
+        aSup parent: self.
+        children add: (WorkerSpec forSupervisor: aSup).
+        ^self
+    ]
+    parent: aSup <WorkerSupervisor> [ parent := aSup ]
 
     "── lifecycle ─────────────────────────────────────────────────────────"
     start ^ <Self> [
         state == #running ifTrue: [ ^self ].
         state := #running.
+        "A (re)start opens a FRESH intensity window — OTP's restarted
+         supervisor is a fresh process; ours is the same object, so the
+         counter resets here (load-bearing for escalation: a parent-
+         restarted child supervisor must not give up again on its very
+         next child death because of charges from its previous life)."
+        restartTimes := OrderedCollection new.
         children do: [:spec | self startChild: spec ].
         ^self
     ]
@@ -205,6 +239,10 @@ Object subclass: WorkerSupervisor [
 
     startChild: aSpec <WorkerSpec> [
         | w |
+        aSpec isSupervisorChild ifTrue: [
+            aSpec supervisorChild start.
+            aSpec startedAt: self clockNow.
+            ^self ].
         w := WorkerSupervisor spawnWorker: aSpec initSource.
         aSpec worker: w.
         aSpec startedAt: self clockNow.
@@ -212,6 +250,7 @@ Object subclass: WorkerSupervisor [
         SupervisorRegistry register: w id supervisor: self spec: aSpec
     ]
     stopChild: aSpec <WorkerSpec> [
+        aSpec isSupervisorChild ifTrue: [ aSpec supervisorChild stop. ^self ].
         aSpec worker isNil ifTrue: [ ^self ].
         SupervisorRegistry unregister: aSpec worker id.
         WorkerNames unbind: aSpec name.
@@ -245,15 +284,51 @@ Object subclass: WorkerSupervisor [
             ^self ].
         self restartOrGiveUp: aSpec
     ]
+    "The escalation event (O2 trees): a child SUPERVISOR exceeded its own
+     intensity and gave up — handled exactly like a child death under THIS
+     supervisor's strategy and intensity. Restarting a supervisor is just
+     start (its specs are all still there; start opens it a fresh window)."
+    childSupervisorGaveUp: aChildSup <WorkerSupervisor> [
+        | spec |
+        spec := children
+            detect: [:s | s isSupervisorChild and: [ s supervisorChild == aChildSup ] ]
+            ifNone: [ nil ].
+        spec isNil ifTrue: [ ^self ].
+        state == #running ifFalse: [ ^self ].
+        self restartOrGiveUp: spec
+    ]
     restartOrGiveUp: aSpec <WorkerSpec> [
         | now |
         now := self clockNow.
         self pruneRestartsBefore: now - (perSeconds * 1000).
         "OTP intensity: maxRestarts restarts within the window are allowed;
-         the one after that trips give-up (the gate pins 'exactly max+1')."
+         the one after that trips give-up (the gate pins 'exactly max+1').
+         ONE charge per death, regardless of how many children the strategy
+         then restarts — OTP counts restart EVENTS, not respawned children."
         restartTimes size >= maxRestarts ifTrue: [ ^self giveUp ].
         restartTimes add: now.
-        self startChild: aSpec
+        self applyStrategyFor: aSpec
+    ]
+    applyStrategyFor: aSpec <WorkerSpec> [
+        strategy == #oneForOne ifTrue: [ ^self startChild: aSpec ].
+        strategy == #oneForAll ifTrue: [ ^self restartAllFrom: 1 ].
+        strategy == #restForOne ifTrue: [ ^self restartAllFrom: (children indexOf: aSpec) ]
+    ]
+    "The shared #oneForAll/#restForOne engine: terminate the still-live
+     members of children[startIndex..] in REVERSE start order (OTP's
+     shutdown rule; the dead child's spec was already cleared, so its
+     stopChild: is a no-op), then restart the range in declared order —
+     EXCEPT #temporary children, which a strategy teardown removes for
+     good (OTP: temporary children are never restarted; only a full
+     stop+start cycle re-creates them)."
+    restartAllFrom: startIndex <Integer> [
+        | n |
+        n := children size.
+        n to: startIndex by: -1 do: [:i | self stopChild: (children at: i) ].
+        startIndex to: n do: [:i |
+            | spec |
+            spec := children at: i.
+            spec restart == #temporary ifFalse: [ self startChild: spec ] ]
     ]
     pruneRestartsBefore: cutoff <Integer> [
         [ restartTimes notEmpty and: [ restartTimes first < cutoff ] ]
