@@ -1,0 +1,269 @@
+"49_supervisor_tests.mst — the O0 gate (docs/otp_workers_design.md §7): the
+ supervisor's ENTIRE decision logic proven single-VM with zero threads. Deaths
+ are synthetic — either fed straight to SupervisorRegistry workerDied: (the
+ exact call the onWorkerDied: hook makes) or, for the seam test, driven
+ through the REAL Worker dispatchOne: with a genuinely-pickled
+ {#workerDied. id} envelope (prims 227/228 are pure and need no worker role —
+ the MOP-M0 fact). Spawning/terminating go through the spawnHook: test double
+ (FakeWorkerHandle below), the clock through clockHook:, so intensity windows
+ are deterministic and instant.
+
+ Ordering matters once: testDiedFallsThroughWithoutSupervision runs FIRST,
+ while Worker's DiedHandler is still nil (SupervisorRegistry installs it
+ lazily on first registration and it then stays for the VM's life) — that is
+ the compatibility half of the seam, pinning that unsupervised embeddings
+ (embed.rs observes deaths via onReply:) keep today's behavior exactly."
+
+"The spawnHook: test double: mints handles with increasing ids and records
+ every spawn/terminate in one shared class-side log the assertions read."
+Object subclass: FakeWorkerHandle [
+    | id <Integer> |
+    <classVars: Log NextId>
+
+    FakeWorkerHandle class >> resetLog [
+        Log := OrderedCollection new.
+        NextId := 100
+    ]
+    FakeWorkerHandle class >> log ^ <OrderedCollection> [ ^Log ]
+    FakeWorkerHandle class >> spawnedWith: initSource <String> ^ <FakeWorkerHandle> [
+        NextId := NextId + 1.
+        Log add: (Array with: #spawn with: NextId with: initSource).
+        ^self basicNew setId: NextId
+    ]
+    setId: n <Integer> ^ <Self> [ id := n. ^self ]
+    id ^ <Integer> [ ^id ]
+    terminate ^ <Self> [
+        Log add: (Array with: #terminate with: id).
+        ^self
+    ]
+]
+
+"A hand-cranked monotonic clock for clockHook: — intensity windows advance
+ exactly when a test says so."
+Object subclass: FakeClock [
+    <classVars: Now>
+    FakeClock class >> reset [ Now := 1000000 ]
+    FakeClock class >> now ^ <Integer> [ ^Now ]
+    FakeClock class >> advanceBy: ms <Integer> [ Now := Now + ms ]
+]
+
+TestCase subclass: SupervisorTests [
+    runAll [
+        self runTest: #testDiedFallsThroughWithoutSupervision do: [ self testDiedFallsThroughWithoutSupervision ].
+        self runTest: #testStartSpawnsInOrderAndBindsNames do: [ self testStartSpawnsInOrderAndBindsNames ].
+        self runTest: #testChildDeathRestartsAndRebindsName do: [ self testChildDeathRestartsAndRebindsName ].
+        self runTest: #testTemporaryChildIsNotRestarted do: [ self testTemporaryChildIsNotRestarted ].
+        self runTest: #testIntensityGivesUpAtExactlyMaxPlusOne do: [ self testIntensityGivesUpAtExactlyMaxPlusOne ].
+        self runTest: #testRestartsOutsideWindowAgeOut do: [ self testRestartsOutsideWindowAgeOut ].
+        self runTest: #testStopTerminatesInReverseOrderAndSilences do: [ self testStopTerminatesInReverseOrderAndSilences ].
+        self runTest: #testDiedSeamRoutesThroughDispatchOne do: [ self testDiedSeamRoutesThroughDispatchOne ].
+        self runTest: #testUnsupervisedDeathIsIgnoredByRegistry do: [ self testUnsupervisedDeathIsIgnoredByRegistry ].
+        self cleanupHooks
+    ]
+
+    "── shared setup/teardown ─────────────────────────────────────────────"
+    freshTree [
+        FakeWorkerHandle resetLog.
+        FakeClock reset.
+        WorkerNames reset.
+        SupervisorRegistry reset.
+        WorkerSupervisor spawnHook: [:src | FakeWorkerHandle spawnedWith: src ].
+        WorkerSupervisor clockHook: [ FakeClock now ]
+    ]
+    cleanupHooks [
+        WorkerSupervisor spawnHook: nil.
+        WorkerSupervisor clockHook: nil
+    ]
+    "The synthetic death: exactly the call the onWorkerDied: hook makes."
+    kill: aName [
+        SupervisorRegistry workerDied: (WorkerNames named: aName) id
+    ]
+    spawnCount ^ <Integer> [
+        ^FakeWorkerHandle log count: [:e | (e at: 1) == #spawn ]
+    ]
+    terminateLog ^ <OrderedCollection> [
+        ^FakeWorkerHandle log select: [:e | (e at: 1) == #terminate ]
+    ]
+
+    "── 1. compatibility: no supervision, no behavior change ──────────────
+     MUST run before any test registers a child (DiedHandler still nil): a
+     {#workerDied. id} envelope pushed through the REAL dispatchOne: falls
+     through to the general onReply: handler, exactly as before this slice."
+    testDiedFallsThroughWithoutSupervision [
+        | seen env |
+        seen := OrderedCollection new.
+        Worker onReply: [:m | m isWorkerDied ifTrue: [ seen add: (m payload at: 2) ] ].
+        env := Array with: 7 with: 0
+                     with: (Worker pickle: (Array with: #workerDied with: 7)).
+        Worker dispatchOne: env.
+        Worker onReply: nil.
+        self assert: seen size equals: 1.
+        self assert: (seen first) equals: 7
+    ]
+
+    "── 2. start: spawn order + names ─────────────────────────────────────"
+    testStartSpawnsInOrderAndBindsNames [
+        | sup log |
+        self freshTree.
+        sup := WorkerSupervisor named: #svc strategy: #oneForOne.
+        sup superviseNamed: #a init: 'initA'.
+        sup superviseNamed: #b init: 'initB'.
+        sup start.
+        self assert: sup state equals: #running.
+        log := FakeWorkerHandle log.
+        self assert: self spawnCount equals: 2.
+        self assert: ((log at: 1) at: 3) equals: 'initA'.   "declared order"
+        self assert: ((log at: 2) at: 3) equals: 'initB'.
+        self assert: (WorkerNames named: #a) notNil.
+        self assert: (WorkerNames named: #b) notNil.
+        self assert: (WorkerNames named: #a) id equals: 101.
+        self assert: (WorkerNames named: #nosuch) isNil.
+        sup stop
+    ]
+
+    "── 3. one death, one restart, name rebound ───────────────────────────"
+    testChildDeathRestartsAndRebindsName [
+        | sup oldId newHandle |
+        self freshTree.
+        sup := WorkerSupervisor named: #svc strategy: #oneForOne.
+        sup superviseNamed: #a init: 'initA'.
+        sup superviseNamed: #b init: 'initB'.
+        sup start.
+        oldId := (WorkerNames named: #a) id.
+        self kill: #a.
+        self assert: sup state equals: #running.
+        self assert: self spawnCount equals: 3.             "2 starts + 1 restart"
+        newHandle := WorkerNames named: #a.
+        self assert: newHandle notNil.
+        self deny: newHandle id = oldId.                     "a FRESH worker"
+        self assert: (WorkerNames named: #b) id equals: 102. "sibling untouched (#oneForOne)"
+        "the restart re-used the spec's stored init source"
+        self assert: ((FakeWorkerHandle log at: 3) at: 3) equals: 'initA'.
+        sup stop
+    ]
+
+    "── 4. #temporary: cleared, never restarted, no intensity charge ──────"
+    testTemporaryChildIsNotRestarted [
+        | sup |
+        self freshTree.
+        sup := WorkerSupervisor named: #svc strategy: #oneForOne.
+        sup superviseNamed: #t init: 'initT' restart: #temporary.
+        sup superviseNamed: #p init: 'initP'.
+        sup start.
+        self kill: #t.
+        self assert: self spawnCount equals: 2.              "no respawn"
+        self assert: (WorkerNames named: #t) isNil.          "name cleared"
+        self assert: sup state equals: #running.
+        "a #temporary death charges nothing: the #permanent sibling still has
+         its full window (maxRestarts kills all restart, no give-up)"
+        self kill: #p. self kill: #p. self kill: #p.
+        self assert: sup state equals: #running.
+        self assert: self spawnCount equals: 5.
+        sup stop
+    ]
+
+    "── 5. intensity: gives up at exactly maxRestarts+1 in the window ─────"
+    testIntensityGivesUpAtExactlyMaxPlusOne [
+        | sup |
+        self freshTree.
+        sup := WorkerSupervisor named: #svc strategy: #oneForOne.
+        sup maxRestarts: 3 perSeconds: 5.
+        sup superviseNamed: #a init: 'initA'.
+        sup superviseNamed: #b init: 'initB'.
+        sup start.
+        "maxRestarts deaths all restart (clock never advances: same window)"
+        self kill: #a. self kill: #a. self kill: #a.
+        self assert: sup state equals: #running.
+        self assert: self spawnCount equals: 5.              "2 starts + 3 restarts"
+        "the (max+1)th death within the window trips give-up"
+        self kill: #a.
+        self assert: sup state equals: #givenUp.
+        self assert: self spawnCount equals: 5.              "NO 4th restart"
+        "give-up tears the whole set down in REVERSE start order: b then a —
+         a is already dead (its corpse was cleared), so the only terminate
+         is b's live handle"
+        self assert: self terminateLog size equals: 1.
+        self assert: (self terminateLog first at: 2) equals: 102.
+        self assert: (WorkerNames named: #a) isNil.
+        self assert: (WorkerNames named: #b) isNil.
+        "a straggler death after give-up changes nothing"
+        SupervisorRegistry workerDied: 999.
+        self assert: sup state equals: #givenUp
+    ]
+
+    "── 6. the window ages out: spaced crashes never give up ──────────────"
+    testRestartsOutsideWindowAgeOut [
+        | sup n |
+        self freshTree.
+        sup := WorkerSupervisor named: #svc strategy: #oneForOne.
+        sup maxRestarts: 3 perSeconds: 5.
+        sup superviseNamed: #a init: 'initA'.
+        sup start.
+        "10 crashes, each 6s apart (> the 5s window): every one restarts"
+        n := 0.
+        [ n < 10 ] whileTrue: [
+            FakeClock advanceBy: 6000.
+            self kill: #a.
+            n := n + 1 ].
+        self assert: sup state equals: #running.
+        self assert: self spawnCount equals: 11.             "1 start + 10 restarts"
+        sup stop
+    ]
+
+    "── 7. stop: reverse order, names unbound, deaths-after-stop inert ────"
+    testStopTerminatesInReverseOrderAndSilences [
+        | sup deadId |
+        self freshTree.
+        sup := WorkerSupervisor named: #svc strategy: #oneForOne.
+        sup superviseNamed: #a init: 'initA'.
+        sup superviseNamed: #b init: 'initB'.
+        sup superviseNamed: #c init: 'initC'.
+        sup start.
+        deadId := (WorkerNames named: #a) id.
+        sup stop.
+        self assert: sup state equals: #idle.
+        self assert: self terminateLog size equals: 3.
+        self assert: ((self terminateLog at: 1) at: 2) equals: 103.   "c first"
+        self assert: ((self terminateLog at: 2) at: 2) equals: 102.   "then b"
+        self assert: ((self terminateLog at: 3) at: 2) equals: 101.   "then a"
+        self assert: (WorkerNames named: #a) isNil.
+        self assert: (WorkerNames named: #b) isNil.
+        self assert: (WorkerNames named: #c) isNil.
+        "a late death notice for a stopped child is unowned -> logged, inert"
+        SupervisorRegistry workerDied: deadId.
+        self assert: sup state equals: #idle.
+        self assert: self spawnCount equals: 3
+    ]
+
+    "── 8. the seam end to end: a real pickled death through dispatchOne: ─"
+    testDiedSeamRoutesThroughDispatchOne [
+        | sup deadId env |
+        self freshTree.
+        sup := WorkerSupervisor named: #svc strategy: #oneForOne.
+        sup superviseNamed: #a init: 'initA'.
+        sup start.
+        deadId := (WorkerNames named: #a) id.
+        "the wire shape workers.rs::died_envelope produces, genuinely pickled"
+        env := Array with: deadId with: 0
+                     with: (Worker pickle: (Array with: #workerDied with: deadId)).
+        Worker dispatchOne: env.
+        self assert: self spawnCount equals: 2.              "restart happened"
+        self assert: (WorkerNames named: #a) notNil.
+        self deny: (WorkerNames named: #a) id = deadId.
+        sup stop
+    ]
+
+    "── 9. deaths nobody owns are logged and dropped ──────────────────────"
+    testUnsupervisedDeathIsIgnoredByRegistry [
+        | sup |
+        self freshTree.
+        sup := WorkerSupervisor named: #svc strategy: #oneForOne.
+        sup superviseNamed: #a init: 'initA'.
+        sup start.
+        SupervisorRegistry workerDied: 424242.
+        self assert: sup state equals: #running.             "tree untouched"
+        self assert: self spawnCount equals: 1.
+        self assert: (WorkerNames named: #a) notNil.
+        sup stop
+    ]
+]

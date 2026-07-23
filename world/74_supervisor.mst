@@ -1,0 +1,269 @@
+"74_supervisor.mst — OTP-style supervision over the worker fleet, slice O0
+ (docs/otp_workers_design.md §3): WorkerSpec, WorkerSupervisor (#oneForOne),
+ WorkerNames, SupervisorRegistry. Pure world-side Smalltalk over the existing
+ worker substrate — the one seam it needs (Worker class >> onWorkerDied:,
+ routed shape-first in dispatchOne:) lives in world/47_worker.mst.
+
+ The spec is Erlang/OTP's supervisor behavior, with the design doc's stated
+ deviations: no #transient (a worker has no normal-exit-with-reason — only
+ silent intended termination or a crash, already distinguishable because
+ terminate synthesizes NO #workerDied); terminate is brutal-after-current-
+ message (share-nothing workers rebuild all state from their init source, so
+ restart IS fresh-init); supervisors are primary-heap OBJECTS, not processes
+ (v1 star topology — only the primary hears deaths), so escalation is a
+ method send and this file runs fine in any VM.
+
+ Two class-side test seams, both defaulting to the real thing
+ (feedback: the O0 gate proves the whole decision logic single-VM with
+ synthetic deaths and zero threads — the MOP-M0 posture):
+ - WorkerSupervisor spawnHook: — how a child is (re)started; default
+   `Worker spawn: initSource`.
+ - WorkerSupervisor clockHook: — the monotonic clock the intensity window
+   prunes by; default `Smalltalk millisecondClock`.
+
+ Numbered 74 (after the packed 63-73 cocoaui block) but BASE world: in a VM
+ with no worker role every real path fails exactly as Worker spawn: itself
+ does, and until a supervisor registers a child the onWorkerDied: hook stays
+ uninstalled, so unsupervised embeddings keep today's behavior untouched."
+
+"I describe one supervised child: its unique name, the init doit that
+ (re)creates it — the WHOLE restart recipe, since share-nothing workers hold
+ no state a restart could migrate — its restart policy (#permanent restarts
+ on crash; #temporary never restarts), the currently-live worker handle (nil
+ while dead/stopped), and when it last started."
+Object subclass: WorkerSpec [
+    | name <Symbol> initSource <String> restart <Symbol> worker startedAt <Integer> |
+
+    WorkerSpec class >> named: aSymbol init: aString restart: aPolicy ^ <WorkerSpec> [
+        ^self basicNew setName: aSymbol init: aString restart: aPolicy
+    ]
+    setName: aSymbol <Symbol> init: aString <String> restart: aPolicy <Symbol> ^ <Self> [
+        name := aSymbol.
+        initSource := aString.
+        restart := aPolicy.
+        ^self
+    ]
+    name ^ <Symbol> [ ^name ]
+    initSource ^ <String> [ ^initSource ]
+    restart ^ <Symbol> [ ^restart ]
+    "The live handle answers Worker protocol (id/terminate) — or a test
+     double installed via WorkerSupervisor spawnHook:, which is why the slot
+     is typed Object rather than Worker."
+    worker ^ <Object> [ ^worker ]
+    worker: aHandle <Object> [ worker := aHandle ]
+    startedAt ^ <Integer> [ ^startedAt ]
+    startedAt: ms <Integer> [ startedAt := ms ]
+]
+
+"I map service names to live worker handles — OTP's whereis. Client code
+ reaches a supervised worker through me (WorkerNames named: #sieve), never by
+ holding a raw handle across restarts: the owning supervisor rebinds the name
+ on every (re)start, so a name is never a corpse. Unknown or unbound names
+ answer nil (a value, not an error)."
+Object subclass: WorkerNames [
+    <classVars: Table>
+
+    WorkerNames class >> bind: aSymbol <Symbol> to: aWorker <Object> [
+        | existing |
+        Table isNil ifTrue: [ Table := Dictionary new ].
+        existing := Table at: aSymbol ifAbsent: [ nil ].
+        (existing notNil and: [ existing ~~ aWorker ]) ifTrue: [
+            ^self error: 'worker name already bound: ', aSymbol printString ].
+        Table at: aSymbol put: aWorker
+    ]
+    WorkerNames class >> named: aSymbol <Symbol> ^ <Object> [
+        Table isNil ifTrue: [ ^nil ].
+        ^Table at: aSymbol ifAbsent: [ nil ]
+    ]
+    "Dictionary has no removeKey: (16_dictionary.mst's documented idiom) —
+     unbinding tombstones with nil, which named:/bind: both treat as absent."
+    WorkerNames class >> unbind: aSymbol <Symbol> [
+        Table isNil ifTrue: [ ^self ].
+        Table at: aSymbol put: nil
+    ]
+    "Test/boot seam: drop every binding (never call under a live tree)."
+    WorkerNames class >> reset [ Table := Dictionary new ]
+]
+
+"I route worker deaths to their owning supervisors: a class-side table of
+ live child id -> {supervisor. spec}, fed by the one onWorkerDied: hook
+ (installed lazily on first registration, so a VM that never builds a tree
+ never even touches the seam). A death nobody owns is logged and dropped —
+ unsupervised workers keep the pre-supervision behavior exactly."
+Object subclass: SupervisorRegistry [
+    <classVars: Owners Installed>
+
+    SupervisorRegistry class >> register: anId <Integer> supervisor: aSup <WorkerSupervisor> spec: aSpec <WorkerSpec> [
+        Owners isNil ifTrue: [ Owners := Dictionary new ].
+        Owners at: anId put: (Array with: aSup with: aSpec).
+        self ensureInstalled
+    ]
+    SupervisorRegistry class >> unregister: anId <Integer> [
+        Owners isNil ifTrue: [ ^self ].
+        Owners at: anId put: nil
+    ]
+    SupervisorRegistry class >> workerDied: anId <Integer> [
+        | entry |
+        entry := Owners isNil
+            ifTrue: [ nil ]
+            ifFalse: [ Owners at: anId ifAbsent: [ nil ] ].
+        entry isNil ifTrue: [
+            Transcript showCr: 'supervision: unsupervised worker ', anId printString, ' died'.
+            ^self ].
+        "Retire the dead id BEFORE the supervisor acts: its restart mints a
+         fresh id, and a stale entry for the old one must never route a
+         late/duplicate death notice into a second restart."
+        Owners at: anId put: nil.
+        (entry at: 1) childDied: (entry at: 2)
+    ]
+    SupervisorRegistry class >> ensureInstalled [
+        Installed == true ifTrue: [ ^self ].
+        Installed := true.
+        Worker onWorkerDied: [:deadId | SupervisorRegistry workerDied: deadId ]
+    ]
+    "Test/boot seam: forget every owner. The onWorkerDied: hook stays
+     installed (harmless: an empty table routes every death to the
+     unsupervised log line)."
+    SupervisorRegistry class >> reset [ Owners := Dictionary new ]
+]
+
+"I am an OTP-style supervisor: I own an ordered list of child WorkerSpecs,
+ start them in order, and when one CRASHES (a #workerDied — a deliberate
+ terminate is silent and restarts nothing) I apply my strategy: #oneForOne
+ restarts just the dead child (O2 adds #oneForAll/#restForOne). Restarts are
+ rate-limited by an intensity window — more than maxRestarts within
+ perSeconds and I give up: every child comes down in reverse start order, my
+ state becomes #givenUp, and my parent (when trees land in O2) treats that
+ exactly as a child death; at the root I report and stay down. Availability
+ becomes my policy, not any worker's luck."
+Object subclass: WorkerSupervisor [
+    | name <Symbol> strategy <Symbol> children <OrderedCollection>
+      maxRestarts <Integer> perSeconds <Integer> restartTimes <OrderedCollection>
+      parent <WorkerSupervisor|UndefinedObject> state <Symbol> |
+    <classVars: SpawnHook ClockHook>
+
+    "── building ──────────────────────────────────────────────────────────"
+    WorkerSupervisor class >> named: aSymbol strategy: aStrategy ^ <WorkerSupervisor> [
+        (aStrategy == #oneForOne) ifFalse: [
+            ^self error: 'v1 O0 supports #oneForOne only (O2 adds #oneForAll/#restForOne), got: ',
+                aStrategy printString ].
+        ^self basicNew initNamed: aSymbol strategy: aStrategy
+    ]
+    initNamed: aSymbol <Symbol> strategy: aStrategy <Symbol> ^ <Self> [
+        name := aSymbol.
+        strategy := aStrategy.
+        children := OrderedCollection new.
+        restartTimes := OrderedCollection new.
+        maxRestarts := 3.      "Elixir Supervisor's default window (3 in 5s);"
+        perSeconds := 5.       "Erlang's own is a stingier 1 in 5 — configurable"
+        state := #idle.
+        ^self
+    ]
+    maxRestarts: n <Integer> perSeconds: s <Integer> ^ <Self> [
+        maxRestarts := n.
+        perSeconds := s.
+        ^self
+    ]
+    name ^ <Symbol> [ ^name ]
+    strategy ^ <Symbol> [ ^strategy ]
+    state ^ <Symbol> [ ^state ]
+    children ^ <OrderedCollection> [ ^children ]
+
+    superviseNamed: aSymbol init: aString ^ <Self> [
+        ^self superviseNamed: aSymbol init: aString restart: #permanent
+    ]
+    superviseNamed: aSymbol <Symbol> init: aString <String> restart: aPolicy <Symbol> ^ <Self> [
+        (aPolicy == #permanent or: [ aPolicy == #temporary ]) ifFalse: [
+            ^self error: 'restart policy must be #permanent or #temporary (no #transient — ',
+                'a worker has no normal exit; see docs/otp_workers_design.md §2.3), got: ',
+                aPolicy printString ].
+        (children anySatisfy: [:s | s name == aSymbol ]) ifTrue: [
+            ^self error: 'duplicate child name in supervisor ', name printString, ': ',
+                aSymbol printString ].
+        children add: (WorkerSpec named: aSymbol init: aString restart: aPolicy).
+        ^self
+    ]
+
+    "── lifecycle ─────────────────────────────────────────────────────────"
+    start ^ <Self> [
+        state == #running ifTrue: [ ^self ].
+        state := #running.
+        children do: [:spec | self startChild: spec ].
+        ^self
+    ]
+    "Terminate children in REVERSE start order (OTP's shutdown rule), unbind
+     their names, retire their registry entries. Deliberate termination is
+     silent (no #workerDied), so stopping never charges the intensity window."
+    stop ^ <Self> [
+        state := #idle.
+        children reverseDo: [:spec | self stopChild: spec ].
+        ^self
+    ]
+
+    startChild: aSpec <WorkerSpec> [
+        | w |
+        w := WorkerSupervisor spawnWorker: aSpec initSource.
+        aSpec worker: w.
+        aSpec startedAt: self clockNow.
+        WorkerNames bind: aSpec name to: w.
+        SupervisorRegistry register: w id supervisor: self spec: aSpec
+    ]
+    stopChild: aSpec <WorkerSpec> [
+        aSpec worker isNil ifTrue: [ ^self ].
+        SupervisorRegistry unregister: aSpec worker id.
+        WorkerNames unbind: aSpec name.
+        aSpec worker terminate.
+        aSpec worker: nil
+    ]
+
+    "── the event (routed here by SupervisorRegistry) ─────────────────────"
+    childDied: aSpec <WorkerSpec> [
+        "The registry has already retired the dead id. Clear the corpse and
+         its name FIRST — even a #temporary/non-running outcome must leave no
+         stale binding for clients to reach."
+        aSpec worker: nil.
+        WorkerNames unbind: aSpec name.
+        state == #running ifFalse: [ ^self ].
+        aSpec restart == #temporary ifTrue: [
+            Transcript showCr: 'supervision: #temporary child ', aSpec name printString,
+                ' died (not restarted)'.
+            ^self ].
+        self restartOrGiveUp: aSpec
+    ]
+    restartOrGiveUp: aSpec <WorkerSpec> [
+        | now |
+        now := self clockNow.
+        self pruneRestartsBefore: now - (perSeconds * 1000).
+        "OTP intensity: maxRestarts restarts within the window are allowed;
+         the one after that trips give-up (the gate pins 'exactly max+1')."
+        restartTimes size >= maxRestarts ifTrue: [ ^self giveUp ].
+        restartTimes add: now.
+        self startChild: aSpec
+    ]
+    pruneRestartsBefore: cutoff <Integer> [
+        [ restartTimes notEmpty and: [ restartTimes first < cutoff ] ]
+            whileTrue: [ restartTimes removeFirst ]
+    ]
+    giveUp [
+        state := #givenUp.
+        children reverseDo: [:spec | self stopChild: spec ].
+        parent isNil
+            ifTrue: [
+                Transcript showCr: 'supervision: supervisor ', name printString,
+                    ' gave up (', maxRestarts printString, ' restarts within ',
+                    perSeconds printString, 's exceeded)' ]
+            ifFalse: [ parent childSupervisorGaveUp: self ]   "escalation — O2"
+    ]
+
+    "── the two test seams (defaults = the real thing) ────────────────────"
+    WorkerSupervisor class >> spawnHook: aBlock [ SpawnHook := aBlock ]
+    WorkerSupervisor class >> clockHook: aBlock [ ClockHook := aBlock ]
+    WorkerSupervisor class >> spawnWorker: initSource <String> ^ <Object> [
+        SpawnHook isNil ifTrue: [ ^Worker spawn: initSource ].
+        ^SpawnHook value: initSource
+    ]
+    clockNow ^ <Integer> [
+        ClockHook isNil ifTrue: [ ^Smalltalk millisecondClock ].
+        ^ClockHook value
+    ]
+]

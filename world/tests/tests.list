@@ -52,4 +52,7 @@ tier1.mst
 46_scaleddecimal_tests.mst
 47_socket_tests.mst
 48_accel_tests.mst
+# OTP supervision O0 (world/74_supervisor.mst): the decision-logic gate,
+# single-VM, synthetic deaths (docs/otp_workers_design.md §7).
+49_supervisor_tests.mst
 99_run_all.mst

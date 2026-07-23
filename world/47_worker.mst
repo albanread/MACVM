@@ -89,7 +89,7 @@ Object subclass: WorkerMessage [
  harmless to load anywhere."
 Object subclass: Worker [
     | id |
-    <classVars: Handler ReplyHandler PendingReplies NextCorr CurrentCorr CurrentPeer CocoaEventHandler UiReqHandler SnapshotHandler TranscriptLineHandler>
+    <classVars: Handler ReplyHandler PendingReplies NextCorr CurrentCorr CurrentPeer CocoaEventHandler UiReqHandler SnapshotHandler TranscriptLineHandler DiedHandler>
 
     "── spawning (primary side) ──"
     Worker class >> spawn: initSource [
@@ -225,6 +225,12 @@ Object subclass: Worker [
     "── receiving, primary side: dispatchInbox runs because the router woke
        us (or the run loop slept into a message) — never called in a poll loop ──"
     Worker class >> onReply: aBlock [ ReplyHandler := aBlock ]
+    Worker class >> onWorkerDied: aBlock [
+        "The supervision seam (docs/otp_workers_design.md §4.1): a 1-arg
+         block handed each crashed worker's id, installed (lazily, on first
+         child registration) by SupervisorRegistry. Routed shape-first in
+         dispatchOne:, so once a tree exists deaths belong to it."
+        DiedHandler := aBlock ]
     Worker class >> onCocoaEvent: aBlock [
         "C4: the Cocoa bridge's dispatch hook — installed lazily by
          Cocoa action: (49_cocoa.mst loads after this file, so the
@@ -294,6 +300,16 @@ Object subclass: Worker [
             CocoaEventHandler isNil ifFalse: [
                 CocoaEventHandler value: (msg payload at: 2) ].
             ^self ].
+        msg isWorkerDied ifTrue: [
+            "Supervision seam (docs/otp_workers_design.md §4.1): with a
+             DiedHandler installed (a supervision tree exists) the death is
+             consumed here; with none it FALLS THROUGH to the pre-existing
+             continuation/ReplyHandler routing below — embed.rs's
+             crash-isolation test observes deaths via onReply:, and
+             unsupervised embeddings keep that behavior exactly."
+            DiedHandler isNil ifFalse: [
+                DiedHandler value: (msg payload at: 2).
+                ^self ] ].
         msg isUiReq ifTrue: [ ^self serveUiReq: msg payload ].
         msg isSnapshot ifTrue: [
             SnapshotHandler isNil ifFalse: [ SnapshotHandler value: msg payload ].

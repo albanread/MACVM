@@ -133,3 +133,7 @@
 62_ioworker.mst
 62a_iostreams.mst
 
+
+# OTP-style supervision over the worker fleet (docs/otp_workers_design.md O0):
+# WorkerSpec/WorkerSupervisor(#oneForOne)/WorkerNames/SupervisorRegistry.
+74_supervisor.mst
