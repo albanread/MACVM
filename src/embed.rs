@@ -3523,6 +3523,132 @@ mod tests {
         vm.exec("SupTest sup stop.").expect("stop");
     }
 
+    /// O3's own gate line (docs/otp_workers_design.md milestone table): "IoWorker
+    /// killed under an active pipe watch -> data flows again after respawn." The
+    /// kqueue and its kernel-level watch registration both live in the PRIMARY
+    /// (world/62_ioworker.mst's own design) and outlive the WORKER VM's death
+    /// untouched -- only the dispatch loop and any in-flight batch are lost. A
+    /// supervised restart's initSource is the SAME `bootSourceOnKq: fd` every
+    /// time (the fd never changes), so recovery is exactly `afterRestart:`
+    /// rebinding the SAME IoWorker facade to the fresh worker and re-arming the
+    /// pump -- with NO watch re-registration at all.
+    #[test]
+    fn supervised_ioworker_recovers_after_a_crash_and_resumes_delivering_data() {
+        let mut vm = boot_worker_primary();
+        define_sup_test(&mut vm);
+        vm.exec(
+            "Object subclass: IoSupProbe [
+                <classVars: Buf ReadFd WriteFd Got Q Iow>
+                IoSupProbe class >> setUpPipe [
+                    Buf := NativeBuffer page.
+                    Posix pipeInto: Buf address.
+                    ReadFd := Buf u32At: 0. WriteFd := Buf u32At: 4.
+                    Got := nil.
+                ]
+                IoSupProbe class >> readFd [ ^ReadFd ]
+                IoSupProbe class >> writeByte: b [
+                    Buf byteAt: 512 put: b.
+                    Posix write: WriteFd from: Buf address + 512 count: 1
+                ]
+                IoSupProbe class >> onData: bytes eof: eof [ Got := bytes ]
+                IoSupProbe class >> got [ ^Got ]
+                IoSupProbe class >> clearGot [ Got := nil ]
+                IoSupProbe class >> q: k [ Q := k ]
+                IoSupProbe class >> q [ ^Q ]
+                IoSupProbe class >> iow: i [ Iow := i ]
+                IoSupProbe class >> iow [ ^Iow ]
+            ]",
+        )
+        .expect("define IoSupProbe");
+        vm.exec("WkTest reset.").expect("reset");
+        vm.exec("IoSupProbe setUpPipe.").expect("pipe set up");
+        // ONE kqueue, owned by the primary, made BEFORE any worker exists.
+        vm.exec("IoSupProbe q: (Kqueue new registerUserEvent; yourself).")
+            .expect("primary-owned kqueue");
+        // The facade, bound to no worker yet -- afterRestart: below supplies
+        // its first (and every later) worker handle.
+        vm.exec("IoSupProbe iow: (IoWorker new setWorker: nil kqueue: IoSupProbe q).")
+            .expect("IoWorker facade");
+        vm.exec(
+            "SupTest sup: (((WorkerSupervisor named: #ioSvc strategy: #oneForOne)
+                 superviseNamed: #io
+                 init: (IoWorker bootSourceOnKq: IoSupProbe q fd)
+                 afterRestart: [:w | IoSupProbe iow rebindAfterRestart: w])
+                 start).",
+        )
+        .expect("the supervised IoWorker tree starts");
+        vm.exec(
+            "IoSupProbe iow watchRead: IoSupProbe readFd
+                onData: [:bytes :eof | IoSupProbe onData: bytes eof: eof ].",
+        )
+        .expect("watch the pipe");
+        // Baseline: prove the FIRST worker genuinely delivers before crashing it.
+        vm.exec("IoSupProbe writeByte: 65.").expect("write A");
+        vm.exec("Worker runLoopWhile: [ (WkTest tickCapped: 200) and: [ IoSupProbe got isNil ] ].")
+            .expect("first delivery");
+        assert_eq!(
+            vm.eval("IoSupProbe got size").expect("size").trim(),
+            "1",
+            "baseline: the watch must deliver through the FIRST worker incarnation"
+        );
+        vm.exec("IoSupProbe clearGot.").expect("clear Got");
+
+        // Quiesce the pump BEFORE crashing (pumpOnce:'s own doc comment:
+        // isAlive's registry entry is only marked dead LAZILY, so a crash
+        // raced against an ALREADY-in-flight #pump reply can still lose
+        // that narrow window and raise on re-arm -- exactly the same
+        // "stop re-arming first" discipline terminate already uses for a
+        // deliberate stop, applied here so the crash below lands cleanly
+        // with nothing pump-related in flight). This does not weaken what
+        // the test proves: the watch registration itself (kernel-level,
+        // §6) is untouched by stopPumping, only the poll LOOP pauses.
+        vm.exec("IoSupProbe iow stopPumping.")
+            .expect("quiesce before crashing");
+        vm.exec("Worker runLoopWhile: [ WkTest tickCapped: 20 ].")
+            .expect("let the quiesce settle");
+
+        // CRASH the worker deliberately: an Integer payload provokes a DNU
+        // inside IoWorker class >> handle:'s `req at: 1` (Integer doesn't
+        // understand at:) -- a REAL thread death (S21 ends it, #workerDied
+        // is synthesized), never a deliberate terminate (which would report
+        // no death at all and never trigger a supervised restart). Still
+        // needs its own poke: a raw send: (unlike every IoWorker facade
+        // method) does not itself wake a blocked kevent sleep, and the
+        // worker may still be parked in the LAST bounded/infinite poll from
+        // before stopPumping's own wake completes its round trip.
+        vm.exec("IoSupProbe iow worker send: 5.")
+            .expect("queue the crash payload");
+        vm.exec("IoSupProbe iow poke.")
+            .expect("wake the blocked pump so the crash gets dispatched");
+        // Wait on the RESTART COUNT (O1's own proven signal), not the worker
+        // id: workers.rs::spawn deliberately REUSES a freed slot's id (the
+        // ParallelMandel cap fix), so a single-child tree's respawn typically
+        // lands back on the SAME id -- comparing ids would never observe a
+        // change and spin to the tick cap.
+        vm.exec("Worker runLoopWhile: [ (WkTest tickCapped: 400) and: [ SupTest restarts < 1 ] ].")
+            .expect("run until the supervisor's restart completes");
+        assert_eq!(
+            vm.eval("SupTest restarts").expect("restarts").trim(),
+            "1",
+            "the supervisor must have restarted the crashed IoWorker exactly once"
+        );
+        assert_eq!(vm.eval("SupTest state").expect("state").trim(), "#running");
+
+        // NEW data, written AFTER the crash+respawn, with ZERO watch
+        // re-registration -- the kqueue and its kernel-level watch survived
+        // the dead worker VM untouched.
+        vm.exec("IoSupProbe writeByte: 66.")
+            .expect("write B after respawn");
+        vm.exec("Worker runLoopWhile: [ (WkTest tickCapped: 400) and: [ IoSupProbe got isNil ] ].")
+            .expect("post-respawn delivery");
+        assert_eq!(
+            vm.eval("IoSupProbe got size").expect("size").trim(),
+            "1",
+            "data written after the crash+respawn must still arrive through \
+             the SAME watch, with no re-registration"
+        );
+    }
+
     #[test]
     fn worker_inbox_wake_fires_and_coalesces() {
         // §3.1: the send itself is the wake, coalesced by the pending flag —
@@ -3734,6 +3860,33 @@ mod tests {
         // A second, different doit proves the corr advances and the loop keeps
         // routing to the right continuation.
         ui_doit_round_trip(&mut primary, &mut ui, &inbox, "6 * 7", "'42'");
+    }
+
+    #[test]
+    fn ui_doit_runs_every_statement_of_a_selection() {
+        // A Workspace selection is often SEVERAL dot-separated statements —
+        // Do It/Print It must run them all and answer the last value, not
+        // silently evaluate only the first (the FloatArray-at-20 trap:
+        // `FA := FloatArray new: 32. FA at: 20 put: 125.9.` used to leave the
+        // array untouched because statement 2 never ran).
+        let mut primary = boot_worker_primary();
+        let (id, inbox, to_primary) =
+            crate::runtime::workers::register_hosted_worker(&mut primary.vm, Arc::new(|| {}))
+                .expect("register the hosted UI worker on the primary");
+        let mut ui = boot_ui_worker(id, to_primary);
+
+        // All three statements run on the primary; the bare final statement
+        // (no trailing period) is the answered value.
+        ui_doit_round_trip(
+            &mut primary,
+            &mut ui,
+            &inbox,
+            "ZzDoit := FloatArray new: 32. ZzDoit at: 20 put: 125.9. ZzDoit at: 20",
+            "'125.9'",
+        );
+        // The globals persist and a trailing period on the last statement is
+        // fine; a statement-only selection answers its own (last) value.
+        ui_doit_round_trip(&mut primary, &mut ui, &inbox, "ZzDoit at: 20. ", "'125.9'");
     }
 
     /// The CG6 headless gate (sprint_cocoa_gui.md): the Workspace's two pure

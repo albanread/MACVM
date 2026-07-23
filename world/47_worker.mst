@@ -89,7 +89,7 @@ Object subclass: WorkerMessage [
  harmless to load anywhere."
 Object subclass: Worker [
     | id |
-    <classVars: Handler ReplyHandler PendingReplies NextCorr CurrentCorr CurrentPeer CocoaEventHandler UiReqHandler SnapshotHandler TranscriptLineHandler DiedHandler>
+    <classVars: Handler ReplyHandler PendingReplies NextCorr CurrentCorr CurrentPeer CocoaEventHandler UiReqHandler SnapshotHandler TranscriptLineHandler DiedHandler AnyDiedHook DeadlineSweepHook>
 
     "── spawning (primary side) ──"
     Worker class >> spawn: initSource [
@@ -231,6 +231,34 @@ Object subclass: Worker [
          child registration) by SupervisorRegistry. Routed shape-first in
          dispatchOne:, so once a tree exists deaths belong to it."
         DiedHandler := aBlock ]
+    Worker class >> onAnyWorkerDied: aBlock [
+        "ServiceWorker's OWN death seam (docs/otp_workers_design.md §3.4/§4.2):
+         unlike DiedHandler (SupervisorRegistry's, populated only once a tree
+         exists), this fires for EVERY death, supervised or not — a plain
+         Worker call: against an unsupervised worker must still fail fast on
+         its target's death. Installed unconditionally at world-load time
+         (below, base-world), so it is always armed."
+        AnyDiedHook := aBlock ]
+    Worker class >> onDeadlineSweep: aBlock [
+        "ServiceWorker's periodic timeout sweep (§4.2), fired every
+         pumpInbox: tick REGARDLESS of whether an envelope arrived that
+         tick — the sweep expires PROMISES, not messages, so it must run on
+         the idle cadence too, not just when there is mail."
+        DeadlineSweepHook := aBlock ]
+    Worker class >> sweepIfArmed [
+        DeadlineSweepHook isNil ifFalse: [ DeadlineSweepHook value ]
+    ]
+    "Retire a registered reply continuation WITHOUT invoking it — the
+     timeout/died paths need the ORIGINAL send:onReply:/call: continuation
+     to simply never fire again once ServiceWorker has already funneled
+     #timeout or #workerDied to the caller's own onError:. Public (not just
+     dispatchOne:'s own inline nil-out) because ServiceWorker (a different
+     class) needs the identical retire — the same (peer, corr) key, the
+     same nil-tombstone idiom PendingReplies already uses everywhere else."
+    Worker class >> retireReplyFromPeer: peer corr: corr [
+        PendingReplies isNil ifFalse: [
+            PendingReplies at: (self replyKeyFor: peer corr: corr) put: nil ]
+    ]
     Worker class >> onCocoaEvent: aBlock [
         "C4: the Cocoa bridge's dispatch hook — installed lazily by
          Cocoa action: (49_cocoa.mst loads after this file, so the
@@ -248,13 +276,9 @@ Object subclass: Worker [
          inbox (primAwaitInbox: blocks in the channel — the OS wake IS the
          router; zero spin), dispatch what arrived, until the condition turns
          false. The GUI never calls this — its run loop is AppKit's, fed by
-         the registered wake hook."
-        | env |
-        [ conditionBlock value ] whileTrue: [
-            env := self primAwaitInbox: 250.
-            env isNil ifFalse: [
-                self dispatchOne: env.
-                self dispatchInbox ] ]
+         the registered wake hook. Routed entirely through pumpInbox: (below)
+         so the ~250ms cadence sweeps deadlines on EVERY tick, envelope or not."
+        [ conditionBlock value ] whileTrue: [ self pumpInbox: 250 ]
     ]
     Worker class >> pumpInbox: ms [
         "One iteration of a Rust-driven primary loop (Cocoa GUI CG4): sleep in
@@ -262,12 +286,18 @@ Object subclass: Worker [
          RETURN to Rust — so the supervisor thread controls the cadence and can
          heartbeat/observe liveness between beats (a `runLoopWhile:` that never
          returns would give it no seam). Answers whether anything was dispatched.
-         The channel send IS the wake; zero spin. Primary only."
+         The channel send IS the wake; zero spin. Primary only.
+         sweepIfArmed runs on EVERY call, envelope or not (docs/otp_workers_
+         design.md §4.2) — a service-call deadline must expire on the idle
+         cadence too, not only when mail happens to arrive; this is also
+         where the GUI's CG4 beat (~4Hz, driving pumpInbox: directly from
+         Rust) gets its own trailing sweep, with no separate timer."
         | env |
         env := self primAwaitInbox: ms.
-        env isNil ifTrue: [ ^false ].
+        env isNil ifTrue: [ self sweepIfArmed. ^false ].
         self dispatchOne: env.
         self dispatchInbox.
+        self sweepIfArmed.
         ^true
     ]
 
@@ -301,12 +331,16 @@ Object subclass: Worker [
                 CocoaEventHandler value: (msg payload at: 2) ].
             ^self ].
         msg isWorkerDied ifTrue: [
-            "Supervision seam (docs/otp_workers_design.md §4.1): with a
-             DiedHandler installed (a supervision tree exists) the death is
-             consumed here; with none it FALLS THROUGH to the pre-existing
-             continuation/ReplyHandler routing below — embed.rs's
+            "Two INDEPENDENT observers, both by shape before any corr lookup
+             (docs/otp_workers_design.md §4.1/§4.2): AnyDiedHook (§4.2,
+             ServiceWorker's in-flight-call cross-check) fires UNCONDITIONALLY
+             — it must work whether or not a supervision tree exists. Then
+             DiedHandler (SupervisorRegistry's own, §4.1): installed, the
+             death is consumed here; with none it FALLS THROUGH to the
+             pre-existing continuation/ReplyHandler routing below — embed.rs's
              crash-isolation test observes deaths via onReply:, and
              unsupervised embeddings keep that behavior exactly."
+            AnyDiedHook isNil ifFalse: [ AnyDiedHook value: (msg payload at: 2) ].
             DiedHandler isNil ifFalse: [
                 DiedHandler value: (msg payload at: 2).
                 ^self ] ].

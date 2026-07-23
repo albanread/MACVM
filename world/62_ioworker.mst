@@ -304,10 +304,27 @@ Object subclass: IoWorker [
      (each link only fires when the previous reply lands). Deliberately NO
      poke here — see the header (a pump waking its own sleep busy-loops)."
     pumpOnce: ms [
+        "Guard the re-arm with worker isAlive, not just pumping: covers the
+         case where the death is ALREADY known to the registry (a prior
+         failed send, or the supervisor's own childDied: has already run
+         and terminate:'d the corpse) by the time this reply is processed.
+         Known NOT covered (docs/otp_workers_design.md O3's honest limit,
+         same family as its own 'in-flight batch lost' caveat): isAlive's
+         registry entry is only marked dead LAZILY -- by a failed send or
+         by the supervisor's own #workerDied handling, never proactively
+         the instant a worker thread actually exits -- so a reply for an
+         OLDER, already-succeeded poll can still be processed (and see
+         isAlive answer stale-true) BEFORE the newer died-envelope from the
+         SAME worker's later crash is even dispatched; the re-arm send can
+         still lose that exact race and raise (no non-raising send exists
+         in this Smalltalk to fully close it). A supervised caller that
+         crashes ITS OWN watched worker deliberately (e.g. a test) should
+         stopPumping first to sidestep this window entirely, exactly as
+         terminate already does for a deliberate stop."
         worker send: (Array with: #pump with: ms)
               onReply: [ :reply |
                   self deliver: (reply at: 2).
-                  pumping ifTrue: [ self pumpOnce: ms ] ]
+                  (pumping and: [ worker isAlive ]) ifTrue: [ self pumpOnce: ms ] ]
     ]
     "The normal mode: infinite sleeps, poke-woken. `startPumping: ms` keeps
      a bounded heartbeat available (tests, belt-and-braces callers)."
@@ -324,6 +341,25 @@ Object subclass: IoWorker [
         pumping := false.
         self poke.
         ^self
+    ]
+
+    "── supervised recovery (docs/otp_workers_design.md §6) ────────────────
+     The kqueue and every kernel-level watch registered on it (watchRead:/
+     watchAccept:/watchDatagram: — all plain kevent() calls against `kq`'s
+     fd) live in the PRIMARY and belong to the KERNEL OBJECT, not to
+     whichever thread happens to be polling it — so both survive the
+     WORKER VM's death untouched. Only three things die with it: the
+     dispatch loop itself, the in-flight #pump reply (any batch already in
+     transit when the crash hit — at-most-once, the honest cost), and
+     `pumping`'s guarantee that a chain is actually running. A supervised
+     restart's initSource is the SAME `bootSourceOnKq: kq fd` every time
+     (the fd never changes), so recovery is just: swap in the fresh worker
+     handle and re-arm the pump — no watch is ever re-sent, because none
+     was ever lost."
+    rebindAfterRestart: w [
+        worker := w.
+        pumping := false.   "clear startPumping's guard -- the old chain is dead"
+        self startPumping
     ]
 
     terminate [

@@ -32,9 +32,35 @@ Object subclass: FakeWorkerHandle [
     ]
     setId: n <Integer> ^ <Self> [ id := n. ^self ]
     id ^ <Integer> [ ^id ]
+    "Always alive: nothing in O0-O2 needed liveness, only identity+log."
+    isAlive ^ <Boolean> [ ^true ]
     terminate ^ <Self> [
         Log add: (Array with: #terminate with: id).
         ^self
+    ]
+]
+
+"A test double standing in for a REAL Worker handle in ServiceWorker's
+ call:/cast: tests: WorkerNames-bindable (id/isAlive), plus a shared log
+ recording every (peer, corr, payload) ServiceWorker's sendHook: routes
+ here instead of a real primSend: — so these tests exercise ServiceWorker's
+ OWN bookkeeping (deadline registration/cancellation/sweep/death-cross-
+ check) with zero threads and zero real IPC, matching O0's posture."
+Object subclass: FakeCallTarget [
+    | id <Integer> alive <Boolean> |
+    <classVars: SendLog>
+
+    FakeCallTarget class >> resetSendLog [ SendLog := OrderedCollection new ]
+    FakeCallTarget class >> sendLog ^ <OrderedCollection> [ ^SendLog ]
+    FakeCallTarget class >> id: n <Integer> ^ <FakeCallTarget> [
+        ^self basicNew setId: n
+    ]
+    setId: n <Integer> ^ <Self> [ id := n. alive := true. ^self ]
+    id ^ <Integer> [ ^id ]
+    isAlive ^ <Boolean> [ ^alive ]
+    markDead [ alive := false ]
+    send: aPayload <Object> [
+        SendLog add: (Array with: #cast with: id with: aPayload)
     ]
 ]
 
@@ -65,6 +91,14 @@ TestCase subclass: SupervisorTests [
         self runTest: #testChildSupervisorGiveUpEscalatesAndRestartsFresh do: [ self testChildSupervisorGiveUpEscalatesAndRestartsFresh ].
         self runTest: #testEscalationStormGivesUpAtRoot do: [ self testEscalationStormGivesUpAtRoot ].
         self runTest: #testTreeStartStopOrdering do: [ self testTreeStartStopOrdering ].
+        self runTest: #testServiceWorkerCastDelegatesToTheNamedTarget do: [ self testServiceWorkerCastDelegatesToTheNamedTarget ].
+        self runTest: #testServiceWorkerCallNormalReplyCancelsTheDeadline do: [ self testServiceWorkerCallNormalReplyCancelsTheDeadline ].
+        self runTest: #testServiceWorkerCallRpcErrorShapedReplyFunnelsToOnError do: [ self testServiceWorkerCallRpcErrorShapedReplyFunnelsToOnError ].
+        self runTest: #testServiceWorkerCallUnboundOrDeadNameFailsFastSynchronously do: [ self testServiceWorkerCallUnboundOrDeadNameFailsFastSynchronously ].
+        self runTest: #testServiceWorkerSweepFiresTimeoutNotBeforeDeadline do: [ self testServiceWorkerSweepFiresTimeoutNotBeforeDeadline ].
+        self runTest: #testServiceWorkerDeathCrossCheckFailsFastAndSuppressesLateReply do: [ self testServiceWorkerDeathCrossCheckFailsFastAndSuppressesLateReply ].
+        self runTest: #testServiceWorkerNoLeakOverManyMixedOutcomes do: [ self testServiceWorkerNoLeakOverManyMixedOutcomes ].
+        self runTest: #testAfterRestartFiresOnEveryStartWithTheFreshHandle do: [ self testAfterRestartFiresOnEveryStartWithTheFreshHandle ].
         self cleanupHooks
     ]
 
@@ -459,5 +493,214 @@ TestCase subclass: SupervisorTests [
         self assert: ((self terminateLog at: 1) at: 2) equals: 103.   "w2"
         self assert: ((self terminateLog at: 2) at: 2) equals: 102.   "x"
         self assert: ((self terminateLog at: 3) at: 2) equals: 101.   "w1"
+    ]
+
+    "── O3: ServiceWorker + the deadline/death funnel ──────────────────────
+     freshServiceWorker's sendHook: reroutes ServiceWorker's OWN send step
+     into FakeCallTarget's log (no primitives touched), but registerReply:/
+     dispatchOne:/PendingReplies are all the REAL Worker machinery — a
+     synthetic reply is delivered by building a genuinely-pickled envelope
+     and driving Worker dispatchOne: directly, exactly O0's seam-test
+     pattern, so these tests exercise real corr-keyed routing end to end."
+    freshServiceWorker [
+        ServiceWorker reset.
+        ServiceWorker sendHook: [:peer :corr :payload |
+            FakeCallTarget sendLog add: (Array with: #call with: peer with: corr with: payload) ].
+        FakeCallTarget resetSendLog.
+        WorkerNames reset.
+        FakeClock reset.
+        WorkerSupervisor clockHook: [ FakeClock now ].   "SHARED clock -- ServiceWorker reads it too"
+    ]
+    cleanupServiceWorkerHooks [
+        ServiceWorker sendHook: nil.
+        WorkerSupervisor clockHook: nil
+    ]
+    "Build the synthetic reply envelope for a call: 's own answered corr,
+     and drive it through the REAL dispatchOne: — the exact wire shape a
+     genuine worker reply arrives as."
+    deliverReplyFrom: peer <Integer> corr: c <Integer> payload: aPayload <Object> [
+        Worker dispatchOne: (Array with: peer with: c with: (Worker pickle: aPayload))
+    ]
+
+    "── 17. cast: delegates straight to the named target's send: ──────────"
+    testServiceWorkerCastDelegatesToTheNamedTarget [
+        | svc target |
+        self freshServiceWorker.
+        target := FakeCallTarget id: 500.
+        WorkerNames bind: #echoSvc to: target.
+        svc := ServiceWorker named: #echoSvc.
+        svc cast: #(recompute 10000).
+        self assert: FakeCallTarget sendLog size equals: 1.
+        self assert: ((FakeCallTarget sendLog first) at: 3) equals: #(recompute 10000).
+        "an unbound name has nothing to send to -- silently"
+        (ServiceWorker named: #nosuch) cast: #ignored.
+        self assert: FakeCallTarget sendLog size equals: 1.
+        self cleanupServiceWorkerHooks
+    ]
+
+    "── 18. a normal reply cancels the deadline before onReply: runs ───────"
+    testServiceWorkerCallNormalReplyCancelsTheDeadline [
+        | svc target c reply errored |
+        self freshServiceWorker.
+        target := FakeCallTarget id: 501.
+        WorkerNames bind: #echoSvc to: target.
+        svc := ServiceWorker named: #echoSvc.
+        reply := nil. errored := false.
+        c := svc call: #(primesBelow 100) timeoutMs: 5000
+            onReply: [:r | reply := r]
+            onError: [:e | errored := true].
+        self assert: c > 0.
+        self assert: ServiceWorker liveDeadlineCount equals: 1.
+        self deliverReplyFrom: 501 corr: c payload: #(2 3 5 7).
+        self assert: reply equals: #(2 3 5 7).
+        self deny: errored.
+        self assert: ServiceWorker liveDeadlineCount equals: 0.       "cancelled, not just answered"
+        "sweeping well past any deadline must NOT also fire onError: --
+         the cancelled entry is truly gone, not merely due-but-skipped"
+        FakeClock advanceBy: 999999.
+        ServiceWorker sweepDeadlines.
+        self deny: errored.
+        self cleanupServiceWorkerHooks
+    ]
+
+    "── 19. an {#rpcError. why} shaped reply funnels to onError:, not onReply: ──"
+    testServiceWorkerCallRpcErrorShapedReplyFunnelsToOnError [
+        | svc target c reply error |
+        self freshServiceWorker.
+        target := FakeCallTarget id: 502.
+        WorkerNames bind: #echoSvc to: target.
+        svc := ServiceWorker named: #echoSvc.
+        reply := nil. error := nil.
+        c := svc call: #(bogus) timeoutMs: 5000
+            onReply: [:r | reply := r]
+            onError: [:e | error := e].
+        self deliverReplyFrom: 502 corr: c payload: (Array with: #rpcError with: 'no such class').
+        self assert: reply isNil.
+        self assert: error equals: 'no such class'.
+        self cleanupServiceWorkerHooks
+    ]
+
+    "── 20. an unbound OR already-dead name fails fast, SYNCHRONOUSLY --
+     no send attempted, no deadline ever registered ─────────────────────"
+    testServiceWorkerCallUnboundOrDeadNameFailsFastSynchronously [
+        | svc target error |
+        self freshServiceWorker.
+        error := nil.
+        (ServiceWorker named: #nosuch) call: #(x) timeoutMs: 1000
+            onReply: [:r | self assert: false]
+            onError: [:e | error := e].
+        self assert: error equals: #workerDied.
+        self assert: FakeCallTarget sendLog isEmpty.
+        self assert: ServiceWorker liveDeadlineCount equals: 0.
+        target := FakeCallTarget id: 503.
+        target markDead.
+        WorkerNames bind: #deadSvc to: target.
+        error := nil.
+        svc := ServiceWorker named: #deadSvc.
+        svc call: #(x) timeoutMs: 1000
+            onReply: [:r | self assert: false]
+            onError: [:e | error := e].
+        self assert: error equals: #workerDied.
+        self assert: FakeCallTarget sendLog isEmpty.
+        self cleanupServiceWorkerHooks
+    ]
+
+    "── 21. the sweep fires #timeout exactly at (not before) the deadline,
+     and never again for the same call ───────────────────────────────────"
+    testServiceWorkerSweepFiresTimeoutNotBeforeDeadline [
+        | svc target c error errorCount |
+        self freshServiceWorker.
+        target := FakeCallTarget id: 504.
+        WorkerNames bind: #echoSvc to: target.
+        svc := ServiceWorker named: #echoSvc.
+        error := nil. errorCount := 0.
+        c := svc call: #(slow) timeoutMs: 1000
+            onReply: [:r | self assert: false]
+            onError: [:e | error := e. errorCount := errorCount + 1].
+        self assert: ServiceWorker liveDeadlineCount equals: 1.
+        "well before the deadline: must NOT fire"
+        FakeClock advanceBy: 500.
+        ServiceWorker sweepDeadlines.
+        self assert: error isNil.
+        self assert: ServiceWorker liveDeadlineCount equals: 1.
+        "past the deadline: fires exactly once"
+        FakeClock advanceBy: 600.
+        ServiceWorker sweepDeadlines.
+        self assert: error equals: #timeout.
+        self assert: errorCount equals: 1.
+        self assert: ServiceWorker liveDeadlineCount equals: 0.
+        "a second sweep, and a late-arriving reply, must both be silent"
+        ServiceWorker sweepDeadlines.
+        self deliverReplyFrom: 504 corr: c payload: #tooLate.
+        self assert: errorCount equals: 1.
+        self cleanupServiceWorkerHooks
+    ]
+
+    "── 22. the death cross-check fails every in-flight call to that peer
+     immediately, and suppresses whatever late reply might still arrive ──"
+    testServiceWorkerDeathCrossCheckFailsFastAndSuppressesLateReply [
+        | svc target c1 c2 err1 err2 reply2 |
+        self freshServiceWorker.
+        target := FakeCallTarget id: 505.
+        WorkerNames bind: #echoSvc to: target.
+        svc := ServiceWorker named: #echoSvc.
+        err1 := nil. err2 := nil. reply2 := nil.
+        c1 := svc call: #(a) timeoutMs: 5000 onReply: [:r | self assert: false] onError: [:e | err1 := e].
+        c2 := svc call: #(b) timeoutMs: 5000 onReply: [:r | reply2 := r] onError: [:e | err2 := e].
+        self assert: ServiceWorker liveDeadlineCount equals: 2.
+        ServiceWorker failPendingCallsTo: 505.
+        self assert: err1 equals: #workerDied.
+        self assert: err2 equals: #workerDied.
+        self assert: ServiceWorker liveDeadlineCount equals: 0.
+        "a reply that somehow still arrives after the death notice is inert"
+        self deliverReplyFrom: 505 corr: c1 payload: #ghost.
+        self deliverReplyFrom: 505 corr: c2 payload: #ghost.
+        self assert: reply2 isNil.
+        self cleanupServiceWorkerHooks
+    ]
+
+    "── 23. no leak: a mix of normal/timeout/died outcomes across many
+     calls always returns liveDeadlineCount to exactly 0 ────────────────"
+    testServiceWorkerNoLeakOverManyMixedOutcomes [
+        | svc target n |
+        self freshServiceWorker.
+        target := FakeCallTarget id: 506.
+        WorkerNames bind: #echoSvc to: target.
+        svc := ServiceWorker named: #echoSvc.
+        n := 60.
+        1 to: n do: [:i |
+            | c m |
+            m := i \\ 3.
+            c := svc call: i timeoutMs: 1000 onReply: [:r | ] onError: [:e | ].
+            m = 0 ifTrue: [ self deliverReplyFrom: 506 corr: c payload: i ].
+            "m = 1 -> left to time out; m = 2 -> left to die below" ].
+        self assert: ServiceWorker liveDeadlineCount equals: (n * 2 / 3).  "1/3 answered already"
+        FakeClock advanceBy: 2000.
+        ServiceWorker sweepDeadlines.          "retires every m=1 AND every m=2 (all overdue)"
+        self assert: ServiceWorker liveDeadlineCount equals: 0.
+        "failPendingCallsTo: after everything already settled is a no-op,
+         not a re-fire -- nothing left to retire"
+        ServiceWorker failPendingCallsTo: 506.
+        self assert: ServiceWorker liveDeadlineCount equals: 0.
+        self cleanupServiceWorkerHooks
+    ]
+
+    "── 24. afterRestart: fires on EVERY (re)start, first and subsequent,
+     each time with that start's fresh worker handle (IoWorker adoption,
+     docs/otp_workers_design.md §6) ───────────────────────────────────────"
+    testAfterRestartFiresOnEveryStartWithTheFreshHandle [
+        | sup seen |
+        self freshTree.
+        seen := OrderedCollection new.
+        sup := WorkerSupervisor named: #svc strategy: #oneForOne.
+        sup superviseNamed: #io init: 'initIo' afterRestart: [:w | seen add: w id ].
+        sup start.
+        self assert: seen size equals: 1.
+        self assert: seen first equals: 101.
+        self kill: #io.
+        self assert: seen size equals: 2.
+        self assert: seen last equals: 102.
+        self deny: (seen first = seen last).
+        sup stop
     ]
 ]

@@ -1,8 +1,20 @@
-"74_supervisor.mst — OTP-style supervision over the worker fleet, slice O0
- (docs/otp_workers_design.md §3): WorkerSpec, WorkerSupervisor (#oneForOne),
- WorkerNames, SupervisorRegistry. Pure world-side Smalltalk over the existing
- worker substrate — the one seam it needs (Worker class >> onWorkerDied:,
- routed shape-first in dispatchOne:) lives in world/47_worker.mst.
+"74_supervisor.mst — OTP-style supervision over the worker fleet: WorkerSpec,
+ WorkerSupervisor (#oneForOne/#oneForAll/#restForOne + trees/escalation),
+ WorkerNames, SupervisorRegistry (O0-O2), and ServiceWorker + the
+ afterRestart: recovery hook (O3, docs/otp_workers_design.md §3.4/§4.2/§6).
+ Pure world-side Smalltalk over the existing worker substrate — the seams it
+ needs (onWorkerDied:/onAnyWorkerDied:/onDeadlineSweep:, all routed shape-
+ first in dispatchOne:/pumpInbox:) live in world/47_worker.mst.
+
+ ServiceWorker is the thin request/reply face over a NAMED worker: cast: for
+ fire-and-forget, call:timeoutMs:onReply:onError: for a deadline-bounded
+ request whose every outcome — a normal reply, an RPC-shaped error, the
+ target's death, or simply running out of time — lands in ONE error/success
+ funnel (#timeout | #workerDied | the RPC error string). Its death seam
+ (onAnyWorkerDied:) is installed UNCONDITIONALLY at the bottom of this file
+ (base-world, like everything else here), independent of whether any
+ WorkerSupervisor tree exists — a call: against a plain, unsupervised
+ worker must still fail fast on its target's death.
 
  The spec is Erlang/OTP's supervisor behavior, with the design doc's stated
  deviations: no #transient (a worker has no normal-exit-with-reason — only
@@ -35,7 +47,7 @@
  slot stays forever nil, and (re)starting me means starting that subtree."
 Object subclass: WorkerSpec [
     | name <Symbol> initSource <String> restart <Symbol> worker startedAt <Integer>
-      supervisorChild <WorkerSupervisor|UndefinedObject> |
+      supervisorChild <WorkerSupervisor|UndefinedObject> afterRestart |
 
     WorkerSpec class >> named: aSymbol init: aString restart: aPolicy ^ <WorkerSpec> [
         ^self basicNew setName: aSymbol init: aString restart: aPolicy
@@ -61,6 +73,13 @@ Object subclass: WorkerSpec [
     restart ^ <Symbol> [ ^restart ]
     isSupervisorChild ^ <Boolean> [ ^supervisorChild notNil ]
     supervisorChild ^ <WorkerSupervisor|UndefinedObject> [ ^supervisorChild ]
+    "The optional recovery hook (docs/otp_workers_design.md §6): a 1-arg
+     block run PRIMARY-SIDE with the FRESH worker handle on every (re)start
+     — including the first — so a handle-holding facade (IoWorker) can
+     rebind to the new incarnation and re-arm whatever it was doing. Plain
+     Object (not Block) so a test double or nil both type-check."
+    afterRestart ^ <Object> [ ^afterRestart ]
+    afterRestart: aBlock <Object> [ afterRestart := aBlock ]
     "The live handle answers Worker protocol (id/terminate) — or a test
      double installed via WorkerSupervisor spawnHook:, which is why the slot
      is typed Object rather than Worker."
@@ -68,6 +87,21 @@ Object subclass: WorkerSpec [
     worker: aHandle <Object> [ worker := aHandle ]
     startedAt ^ <Integer> [ ^startedAt ]
     startedAt: ms <Integer> [ startedAt := ms ]
+]
+
+"The one monotonic clock every piece of this file's time-based bookkeeping
+ shares — WorkerSupervisor's intensity window (O1's clockHook:/clockNow,
+ kept as sugar over me for backward compatibility with the existing gate)
+ and ServiceWorker's call deadlines (O3) both read the SAME notion of
+ 'now', configurable ONCE for deterministic tests rather than each owning
+ an independent hook that could drift out of step with the other."
+Object subclass: SupervisionClock [
+    <classVars: Hook>
+    SupervisionClock class >> hook: aBlock [ Hook := aBlock ]
+    SupervisionClock class >> now ^ <Integer> [
+        Hook isNil ifTrue: [ ^Smalltalk millisecondClock ].
+        ^Hook value
+    ]
 ]
 
 "I map service names to live worker handles — OTP's whereis. Client code
@@ -98,6 +132,136 @@ Object subclass: WorkerNames [
     ]
     "Test/boot seam: drop every binding (never call under a live tree)."
     WorkerNames class >> reset [ Table := Dictionary new ]
+]
+
+"I am the thin request/reply face over a NAMED worker (docs/otp_workers_
+ design.md §3.4, the 'gen_server' vocabulary over the existing worker
+ substrate — no new mechanism, sugar over send:/send:onReply:). cast: is
+ fire-and-forget; call:timeoutMs:onReply:onError: adds a deadline no call
+ ever blocks to enforce (the worker model's first law): every way a call
+ can fail to answer normally — the target's death, running out of time, or
+ an RPC-shaped {#rpcError. why} reply — funnels to the SAME onError:, and a
+ normal reply cancels the deadline before onReply: runs. My own periodic
+ sweep (installed on every pumpInbox: tick, idle or not) retires exactly
+ the calls whose time is up; my own death observer (installed
+ UNCONDITIONALLY below, independent of any supervision tree) retires every
+ call in flight to a worker the instant it dies, rather than waiting out
+ its timeout."
+Object subclass: ServiceWorker [
+    | targetName <Symbol> |
+    <classVars: Deadlines SendHook>
+
+    ServiceWorker class >> named: aSymbol <Symbol> ^ <ServiceWorker> [
+        ^self basicNew setTargetName: aSymbol
+    ]
+    setTargetName: aSymbol <Symbol> ^ <Self> [ targetName := aSymbol. ^self ]
+    targetName ^ <Symbol> [ ^targetName ]
+
+    "Fire-and-forget (OTP's cast). A name that resolves to nothing has
+     nothing to send to — silently. A name that resolves to a genuinely
+     dead worker delegates straight through to Worker>>send: (which raises
+     on send failure, same as any ordinary Worker send: — no swallowed
+     errors here; call:'s isAlive check below is what buys the softer,
+     funneled failure mode for the deadline-bounded form)."
+    cast: aPayload <Object> [
+        | w |
+        w := WorkerNames named: targetName.
+        w isNil ifFalse: [ w send: aPayload ]
+    ]
+
+    "The deadline-bounded request/reply (OTP's call). onError: gets exactly
+     ONE of #timeout, #workerDied, or the RPC error string — never more
+     than one, and never silence: every call ends in exactly one of
+     onReply:/onError: firing exactly once. Answers the correlation id
+     (matching Worker class >> uiRequest:args:onReply:'s own precedent) —
+     not needed for the async contract (nothing blocks either way), but a
+     caller that wants to recognize ITS OWN reply among several in flight
+     can key off it, and it is how this file's own gate manufactures a
+     synthetic reply through the real dispatchOne: path."
+    call: aPayload <Object> timeoutMs: ms <Integer> onReply: aBlock <Object> onError: anErrorBlock <Object> ^ <Integer> [
+        | w peer c key |
+        w := WorkerNames named: targetName.
+        (w isNil or: [ w isAlive not ]) ifTrue: [ anErrorBlock value: #workerDied. ^0 ].
+        peer := w id.
+        c := Worker nextCorr.
+        key := Worker replyKeyFor: peer corr: c.
+        Worker registerReply: [ :reply |
+            ServiceWorker cancelDeadline: key.
+            (ServiceWorker isRpcErrorShaped: reply)
+                ifTrue: [ anErrorBlock value: (reply at: 2) ]
+                ifFalse: [ aBlock value: reply ] ]
+            fromPeer: peer corr: c.
+        ServiceWorker noteDeadlineKey: key peer: peer corr: c
+            dueAt: SupervisionClock now + ms onError: anErrorBlock.
+        ServiceWorker sendPeer: peer corr: c payload: aPayload.
+        ^c
+    ]
+
+    "── the send seam (test double: bypass real primitives entirely — the
+     O0 zero-threads posture) ──"
+    ServiceWorker class >> sendHook: aBlock [ SendHook := aBlock ]
+    ServiceWorker class >> sendPeer: peer corr: c payload: aPayload [
+        SendHook isNil
+            ifTrue: [ Worker primSend: peer corr: c bytes: (Worker pickle: aPayload) ]
+            ifFalse: [ SendHook value: peer value: c value: aPayload ]
+    ]
+
+    "── the deadline table: key -> {peer. corr. dueAt. onErrorBlock}, keyed
+     by the SAME packed (peer,corr) integer PendingReplies uses, so a
+     genuine reply, a timeout, and a death cross-check all agree on which
+     call they mean. nil-tombstoned on retirement (Dictionary has no
+     removeKey: — the house idiom), never removed — matching
+     PendingReplies' own accepted structural limit (docs/otp_workers_
+     design.md §2.3's shutdown-timeout note draws the same line: no
+     structural fix is owed here, only that no LIVE reference lingers). ──"
+    ServiceWorker class >> noteDeadlineKey: key peer: peer corr: c dueAt: due onError: aBlock [
+        Deadlines isNil ifTrue: [ Deadlines := Dictionary new ].
+        Deadlines at: key put: (Array with: peer with: c with: due with: aBlock)
+    ]
+    ServiceWorker class >> cancelDeadline: key [
+        Deadlines isNil ifFalse: [ Deadlines at: key put: nil ]
+    ]
+    "The periodic sweep (docs/otp_workers_design.md §4.2): never fires a
+     continuation EARLY — only entries whose deadline has genuinely passed
+     — and moves no messages, only expires promises (the message plane's
+     'no polling' law is about DELIVERY, untouched by this)."
+    ServiceWorker class >> sweepDeadlines [
+        | now |
+        Deadlines isNil ifTrue: [ ^self ].
+        now := SupervisionClock now.
+        Deadlines keysAndValuesDo: [ :key :entry |
+            (entry notNil and: [ (entry at: 3) < now ]) ifTrue: [
+                Deadlines at: key put: nil.
+                Worker retireReplyFromPeer: (entry at: 1) corr: (entry at: 2).
+                (entry at: 4) value: #timeout ] ]
+    ]
+    "The death cross-check (§4.1/§4.2): a #workerDied for `deadId` fails
+     EVERY call still in flight to it, immediately — no waiting out a
+     timeout that can never now be answered."
+    ServiceWorker class >> failPendingCallsTo: deadId <Integer> [
+        Deadlines isNil ifTrue: [ ^self ].
+        Deadlines keysAndValuesDo: [ :key :entry |
+            (entry notNil and: [ (entry at: 1) = deadId ]) ifTrue: [
+                Deadlines at: key put: nil.
+                Worker retireReplyFromPeer: (entry at: 1) corr: (entry at: 2).
+                (entry at: 4) value: #workerDied ] ]
+    ]
+    "Observability for the no-leak gate: live (non-retired) deadline
+     entries right now — must return to 0 once every issued call has
+     settled, however it settled, regardless of how many slots the
+     underlying Dictionary has ever allocated (it never shrinks — the same
+     accepted structural limit PendingReplies already has)."
+    ServiceWorker class >> liveDeadlineCount ^ <Integer> [
+        Deadlines isNil ifTrue: [ ^0 ].
+        ^Deadlines values count: [ :v | v notNil ]
+    ]
+    "Is `reply` the {#rpcError. why} shape Worker's own RPC service
+     (serveRpc:/call:on:args:onReply:onError:) already uses?"
+    ServiceWorker class >> isRpcErrorShaped: reply <Object> ^ <Boolean> [
+        ^(reply isKindOf: Array) and: [ reply size = 2 and: [ (reply at: 1) == #rpcError ] ]
+    ]
+    "Test/boot seam."
+    ServiceWorker class >> reset [ Deadlines := Dictionary new ]
 ]
 
 "I route worker deaths to their owning supervisors: a class-side table of
@@ -155,7 +319,7 @@ Object subclass: WorkerSupervisor [
     | name <Symbol> strategy <Symbol> children <OrderedCollection>
       maxRestarts <Integer> perSeconds <Integer> restartTimes <OrderedCollection>
       parent <WorkerSupervisor|UndefinedObject> state <Symbol> |
-    <classVars: SpawnHook ClockHook>
+    <classVars: SpawnHook>
 
     "── building ──────────────────────────────────────────────────────────"
     WorkerSupervisor class >> named: aSymbol strategy: aStrategy ^ <WorkerSupervisor> [
@@ -191,6 +355,16 @@ Object subclass: WorkerSupervisor [
         ^self superviseNamed: aSymbol init: aString restart: #permanent
     ]
     superviseNamed: aSymbol <Symbol> init: aString <String> restart: aPolicy <Symbol> ^ <Self> [
+        ^self superviseNamed: aSymbol init: aString restart: aPolicy afterRestart: nil
+    ]
+    "The IoWorker shape (docs/otp_workers_design.md §6): initSource is the
+     FIXED recipe (same string every restart — an IoWorker's kq fd never
+     changes), afterRestart the rebind-and-re-arm hook."
+    superviseNamed: aSymbol <Symbol> init: aString <String> afterRestart: aBlock <Object> ^ <Self> [
+        ^self superviseNamed: aSymbol init: aString restart: #permanent afterRestart: aBlock
+    ]
+    superviseNamed: aSymbol <Symbol> init: aString <String> restart: aPolicy <Symbol> afterRestart: aBlock <Object> ^ <Self> [
+        | spec |
         (aPolicy == #permanent or: [ aPolicy == #temporary ]) ifFalse: [
             ^self error: 'restart policy must be #permanent or #temporary (no #transient — ',
                 'a worker has no normal exit; see docs/otp_workers_design.md §2.3), got: ',
@@ -198,7 +372,9 @@ Object subclass: WorkerSupervisor [
         (children anySatisfy: [:s | s name == aSymbol ]) ifTrue: [
             ^self error: 'duplicate child name in supervisor ', name printString, ': ',
                 aSymbol printString ].
-        children add: (WorkerSpec named: aSymbol init: aString restart: aPolicy).
+        spec := WorkerSpec named: aSymbol init: aString restart: aPolicy.
+        spec afterRestart: aBlock.
+        children add: spec.
         ^self
     ]
     "A child that is itself a supervisor (O2 trees): it takes an ordinary
@@ -247,7 +423,8 @@ Object subclass: WorkerSupervisor [
         aSpec worker: w.
         aSpec startedAt: self clockNow.
         WorkerNames bind: aSpec name to: w.
-        SupervisorRegistry register: w id supervisor: self spec: aSpec
+        SupervisorRegistry register: w id supervisor: self spec: aSpec.
+        aSpec afterRestart isNil ifFalse: [ aSpec afterRestart value: w ]
     ]
     stopChild: aSpec <WorkerSpec> [
         aSpec isSupervisorChild ifTrue: [ aSpec supervisorChild stop. ^self ].
@@ -347,13 +524,23 @@ Object subclass: WorkerSupervisor [
 
     "── the two test seams (defaults = the real thing) ────────────────────"
     WorkerSupervisor class >> spawnHook: aBlock [ SpawnHook := aBlock ]
-    WorkerSupervisor class >> clockHook: aBlock [ ClockHook := aBlock ]
+    "Sugar over SupervisionClock hook: (O3) — kept under its original O0
+     name since every existing gate test already spells it this way; ONE
+     shared clock underneath, not two independently-configurable ones."
+    WorkerSupervisor class >> clockHook: aBlock [ SupervisionClock hook: aBlock ]
     WorkerSupervisor class >> spawnWorker: initSource <String> ^ <Object> [
         SpawnHook isNil ifTrue: [ ^Worker spawn: initSource ].
         ^SpawnHook value: initSource
     ]
-    clockNow ^ <Integer> [
-        ClockHook isNil ifTrue: [ ^Smalltalk millisecondClock ].
-        ^ClockHook value
-    ]
+    clockNow ^ <Integer> [ ^SupervisionClock now ]
 ]
+
+"ServiceWorker's two hooks, installed UNCONDITIONALLY as soon as this base-
+ world file loads (the Character initTable./Transcript := ... precedent) —
+ independent of whether any WorkerSupervisor tree is ever built, so a plain
+ ServiceWorker call: against an unsupervised worker still fails fast on
+ death and still times out. Harmless where never exercised: sweepDeadlines
+ and failPendingCallsTo: are both no-ops while Deadlines has never been
+ touched."
+Worker onAnyWorkerDied: [ :deadId | ServiceWorker failPendingCallsTo: deadId ].
+Worker onDeadlineSweep: [ ServiceWorker sweepDeadlines ].
