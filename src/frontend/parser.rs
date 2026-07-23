@@ -1370,6 +1370,32 @@ pub fn parse_one_top_item(input: &str) -> Result<Option<TopItem>, CompileError> 
     Ok(Some(item))
 }
 
+/// Parses ALL top-level items in a doit/selection — the Workspace's Do It /
+/// Print It entry point, where the selection may hold several dot-separated
+/// statements (`FA := FloatArray new: 32. FA at: 20 put: 125.9.`). Same
+/// grammar as `parse_file`, but with `parse_one_top_item`'s relaxed rule for
+/// the FINAL statement: no terminating period required at end of input, so a
+/// bare trailing `FA at: 20` is complete as-is while genuine garbage
+/// (`3 + 4  5`) still errors.
+pub fn parse_top_items(input: &str) -> Result<Vec<TopItem>, CompileError> {
+    let mut p = Parser::new(input)?;
+    let mut items = Vec::new();
+    while !matches!(p.cur.0, Tok::Eof) {
+        let is_class_def = matches!(&p.cur.0, Tok::Ident(_))
+            && matches!(p.peek2()?, Tok::Keyword(k) if k == "subclass:");
+        if is_class_def {
+            items.push(TopItem::ClassDef(p.parse_class_def()?));
+        } else {
+            let stmt = p.parse_statement()?;
+            if !matches!(p.cur.0, Tok::Eof) {
+                p.expect(&Tok::Period, "expected '.' after statement")?;
+            }
+            items.push(TopItem::DoIt(stmt));
+        }
+    }
+    Ok(items)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2026,5 +2052,26 @@ mod tests {
             "runaway annotation reports cleanly: {}",
             err2.msg
         );
+    }
+
+    #[test]
+    fn parse_top_items_takes_a_whole_selection() {
+        // The Workspace rule: every dot-separated statement parses, and the
+        // FINAL one needs no terminating period.
+        let items = parse_top_items("FA := 3. FA + 4").expect("selection parses");
+        assert_eq!(items.len(), 2);
+        assert!(items.iter().all(|i| matches!(i, TopItem::DoIt(_))));
+        // Trailing period on the last statement is equally fine.
+        assert_eq!(parse_top_items("1 + 2. 3 + 4.").expect("parses").len(), 2);
+        // A class def mixes with statements, same as parse_file (class defs
+        // are self-terminating — no period after the closing bracket).
+        let mixed = parse_top_items("Object subclass: Tt [ go [ ^1 ] ] Tt new go")
+            .expect("class def + doit parses");
+        assert_eq!(mixed.len(), 2);
+        assert!(matches!(mixed[0], TopItem::ClassDef(_)));
+        // Missing period BETWEEN statements is still garbage, not silence.
+        assert!(parse_top_items("3 + 4  5").is_err());
+        // Whitespace/comments-only answers an empty list, not an error.
+        assert!(parse_top_items(" \"just a comment\" ").expect("ok").is_empty());
     }
 }

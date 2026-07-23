@@ -1655,10 +1655,12 @@ fn string_oop(vm: &mut VmState, s: &str) -> Oop {
 
 /// `primEvalDoit:` (250, Cocoa GUI CG4, `cocoa_gui_design.md` §7.3): evaluate a
 /// doit source `String` on THIS (primary) VM through the existing
-/// `execute_do_it` path and answer the RESULT oop. A Workspace `⌘P`/`⌘D` ships
-/// its selection here as a `{#uiReq. corr. #doit. source}` request; the primary
-/// evaluates it (the doit runs where the persistent objects live) and replies
-/// the result.
+/// `execute_do_it` path and answer the RESULT oop — EVERY top-level item in
+/// the source runs in order (a Workspace selection is often several
+/// dot-separated statements), and the answer is the LAST item's value. A
+/// Workspace `⌘P`/`⌘D` ships its selection here as a `{#uiReq. corr. #doit.
+/// source}` request; the primary evaluates it (the doit runs where the
+/// persistent objects live) and replies the result.
 ///
 /// Runs **inline under the caller's top-level recovery guard** — the dispatching
 /// `exec("Worker dispatchInbox.")`. The doit is compiled to an anonymous `#doIt`
@@ -1687,32 +1689,43 @@ fn prim_eval_doit(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     let Some(src) = string_arg(vm, args[1]) else {
         return PrimResult::Fail;
     };
-    let item = match crate::frontend::parser::parse_one_top_item(&src) {
-        Ok(Some(item)) => item,
-        Ok(None) => return PrimResult::Ok(vm.universe.nil_obj),
+    // The WHOLE selection runs, in order, and the LAST item's value is the
+    // answer — classic Do It/Print It over a multi-statement selection
+    // (`FA := FloatArray new: 32. FA at: 20 put: 125.9.` runs both, not just
+    // the first). Parsing is pure Rust (no oops); no oop is held across a
+    // later item's compile/run (each iteration's value is dead before the
+    // next one executes, and the final value returns with no allocation after
+    // its producing run), so nothing here needs rooting against a moving GC.
+    let items = match crate::frontend::parser::parse_top_items(&src) {
+        Ok(items) => items,
         Err(e) => return PrimResult::Ok(string_oop(vm, &format!("parse error: {e}"))),
     };
-    match item {
-        crate::frontend::ast::TopItem::DoIt(stmt) => {
-            let holder = vm.universe.undefined_object_klass;
-            let m = match crate::frontend::codegen::compile_doit(vm, holder, stmt) {
-                Ok(m) => m,
+    let mut result = vm.universe.nil_obj;
+    for item in items {
+        result = match item {
+            crate::frontend::ast::TopItem::DoIt(stmt) => {
+                let holder = vm.universe.undefined_object_klass;
+                let m = match crate::frontend::codegen::compile_doit(vm, holder, stmt) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        return PrimResult::Ok(string_oop(vm, &format!("compile error: {e}")))
+                    }
+                };
+                // Nested interpreter entry (activation saved/restored), receiver
+                // nil — the `#doIt` convention. No allocation between compile
+                // and run, so `m` needs no extra rooting.
+                let recv = vm.universe.nil_obj;
+                crate::interpreter::run_method_reentrant(vm, m, recv, &[])
+            }
+            // A class definition from the Workspace: install it (no nested doit
+            // run — `install_class_def` only compiles methods), answer nil.
+            other => match crate::frontend::classdef::execute_top_item(vm, other) {
+                Ok(_) => vm.universe.nil_obj,
                 Err(e) => return PrimResult::Ok(string_oop(vm, &format!("compile error: {e}"))),
-            };
-            // Nested interpreter entry (activation saved/restored), receiver nil
-            // — the `#doIt` convention. No allocation between compile and run,
-            // so `m` needs no extra rooting.
-            let recv = vm.universe.nil_obj;
-            let result = crate::interpreter::run_method_reentrant(vm, m, recv, &[]);
-            PrimResult::Ok(result)
-        }
-        // A class definition from the Workspace: install it (no nested doit run
-        // — `install_class_def` only compiles methods), answer nil.
-        other => match crate::frontend::classdef::execute_top_item(vm, other) {
-            Ok(_) => PrimResult::Ok(vm.universe.nil_obj),
-            Err(e) => PrimResult::Ok(string_oop(vm, &format!("compile error: {e}"))),
-        },
+            },
+        };
     }
+    PrimResult::Ok(result)
 }
 
 /// Read a String argument's UTF-8 content; `None` for anything else.
