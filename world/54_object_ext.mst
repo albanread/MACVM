@@ -42,13 +42,13 @@ String subclass: Symbol [
 
 ArrayedCollection subclass: String [
     "Fixed constructors mirroring Array's — String only had the 1-arg with:."
-    String class >> with: a with: b [
+    String class >> with: a <Character> with: b <Character> ^ <String> [
         | s | s := self new: 2. s at: 1 put: a. s at: 2 put: b. ^s
     ]
-    String class >> with: a with: b with: c [
+    String class >> with: a <Character> with: b <Character> with: c <Character> ^ <String> [
         | s | s := self new: 3. s at: 1 put: a. s at: 2 put: b. s at: 3 put: c. ^s
     ]
-    String class >> with: a with: b with: c with: d [
+    String class >> with: a <Character> with: b <Character> with: c <Character> with: d <Character> ^ <String> [
         | s | s := self new: 4.
         s at: 1 put: a. s at: 2 put: b. s at: 3 put: c. s at: 4 put: d. ^s
     ]

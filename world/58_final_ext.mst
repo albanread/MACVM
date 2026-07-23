@@ -19,14 +19,14 @@ Magnitude subclass: Number [
 ]
 
 ArrayedCollection subclass: String [
-    asUppercaseFirst [ ^self capitalized ]
+    asUppercaseFirst ^ <String> [ ^self capitalized ]
 
     "Single-character whitespace strings (String cr/lf/tab/space), handy for
      building text — Character cr etc. give the Character, these give a String."
-    String class >> cr [ ^String with: (Character value: 13) ]
-    String class >> lf [ ^String with: (Character value: 10) ]
-    String class >> tab [ ^String with: (Character value: 9) ]
-    String class >> space [ ^String with: (Character value: 32) ]
+    String class >> cr ^ <String> [ ^String with: (Character value: 13) ]
+    String class >> lf ^ <String> [ ^String with: (Character value: 10) ]
+    String class >> tab ^ <String> [ ^String with: (Character value: 9) ]
+    String class >> space ^ <String> [ ^String with: (Character value: 32) ]
 ]
 
 Object subclass: Association [

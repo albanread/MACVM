@@ -10,29 +10,29 @@
  Use me for binary data — file contents, network packets, pixel rows."
 
 ArrayedCollection subclass: ByteArray [
-    at: i [
+    at: i <Integer> ^ <Integer> [
         <primitive: 40>
     ]
-    at: i put: v [
+    at: i <Integer> put: v <Integer> ^ <Integer> [
         <primitive: 41>
     ]
     "Raw byte access, the same name String uses (basicByteAt: is String's
      un-Character'd byte accessor). Here it is just `at:` — a ByteArray's
      element already IS a raw byte — so byte-copy code (e.g. Socket's send
      path) works uniformly on a String OR a ByteArray without caring which."
-    basicByteAt: i [ ^self at: i ]
-    basicByteAt: i put: v [ ^self at: i put: v ]
-    size [
+    basicByteAt: i <Integer> ^ <Integer> [ ^self at: i ]
+    basicByteAt: i <Integer> put: v <Integer> ^ <Integer> [ ^self at: i put: v ]
+    size ^ <Integer> [
         <primitive: 28>
     ]
-    at: i ifAbsent: absentBlock [
+    at: i <Integer> ifAbsent: absentBlock <[]> ^ <Integer> [
         (i between: 1 and: self size) ifFalse: [ ^absentBlock value ].
         ^self at: i
     ]
     "Loop-based, not primitive 43: that primitive always reads its source
      from index 1, which only helps when copying a WHOLE other collection
      in (see `,`) — not when slicing an arbitrary from..to out of self."
-    copyFrom: from to: to [
+    copyFrom: from <Integer> to: to <Integer> ^ <Self> [
         | r n |
         n := to - from + 1.
         r := self class new: n.
@@ -40,31 +40,31 @@ ArrayedCollection subclass: ByteArray [
         ^r
     ]
     "Copies ALL of src (read from src's own index 1) into self[from..to]."
-    replaceFrom: from to: to with: src [
+    replaceFrom: from <Integer> to: to <Integer> with: src <SequenceableCollection> ^ <Self> [
         <primitive: 43>
     ]
-    , other [
+    , other <SequenceableCollection> ^ <Self> [
         | r |
         r := self class new: self size + other size.
         r replaceFrom: 1 to: self size with: self.
         r replaceFrom: self size + 1 to: self size + other size with: other.
         ^r
     ]
-    collect: aBlock [
+    collect: aBlock <[Integer,^Object]> ^ <Array> [
         | r |
         r := Array new: self size.
         1 to: self size do: [:i | r at: i put: (aBlock value: (self at: i)) ].
         ^r
     ]
-    hash [
+    hash ^ <Integer> [
         <primitive: 44>
     ]
-    = other [
+    = other <Object> ^ <Boolean> [
         (other isKindOf: ByteArray) ifFalse: [ ^false ].
         self size = other size ifFalse: [ ^false ].
         ^(self compare: other) = 0
     ]
-    compare: other [
+    compare: other <ByteArray> ^ <Integer> [
         <primitive: 45>
     ]
 ]

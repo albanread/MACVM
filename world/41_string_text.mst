@@ -9,7 +9,7 @@
 ArrayedCollection subclass: String [
     "Split on runs of one or more separator characters (isSeparator),
      answering an OrderedCollection of the non-empty pieces."
-    substrings [
+    substrings ^ <OrderedCollection> [
         | result n i start |
         result := OrderedCollection new.
         n := self size.
@@ -23,7 +23,7 @@ ArrayedCollection subclass: String [
         ^result
     ]
     "Split on any character in aSeparatorString."
-    substrings: aSeparatorString [
+    substrings: aSeparatorString <String> ^ <OrderedCollection> [
         | result n i start |
         result := OrderedCollection new.
         n := self size.
@@ -38,7 +38,7 @@ ArrayedCollection subclass: String [
                 result add: (self copyFrom: start to: i - 1) ] ].
         ^result
     ]
-    tokenize: aSeparatorString [
+    tokenize: aSeparatorString <String> ^ <OrderedCollection> [
         ^self substrings: aSeparatorString
     ]
 ]

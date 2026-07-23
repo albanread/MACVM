@@ -16,138 +16,138 @@
  class-side streamContents: for building text piecewise."
 
 ArrayedCollection subclass: String [
-    isString [
+    isString ^ <Boolean> [
         ^true
     ]
-    basicByteAt: i [
+    basicByteAt: i <Integer> ^ <Integer> [
         <primitive: 40>
     ]
-    basicByteAt: i put: v [
+    basicByteAt: i <Integer> put: v <Integer> ^ <Integer> [
         <primitive: 41>
     ]
-    at: i [
+    at: i <Integer> ^ <Character> [
         ^Character value: (self basicByteAt: i)
     ]
-    at: i put: v [
+    at: i <Integer> put: v <Character|Integer> ^ <Character|Integer> [
         | b |
         b := (v isKindOf: Character) ifTrue: [ v asInteger ] ifFalse: [ v ].
         self basicByteAt: i put: b.
         ^v
     ]
-    size [
+    size ^ <Integer> [
         <primitive: 28>
     ]
-    at: i ifAbsent: absentBlock [
+    at: i <Integer> ifAbsent: absentBlock <[]> ^ <Character> [
         (i between: 1 and: self size) ifFalse: [ ^absentBlock value ].
         ^self at: i
     ]
-    hash [
+    hash ^ <Integer> [
         <primitive: 44>
     ]
-    compare: other [
+    compare: other <String> ^ <Integer> [
         <primitive: 45>
     ]
-    = other [
+    = other <Object> ^ <Boolean> [
         other isString ifFalse: [ ^false ].
         ^(self compare: other) = 0
     ]
-    < other [
+    < other <String> ^ <Boolean> [
         ^(self compare: other) < 0
     ]
-    <= other [
+    <= other <String> ^ <Boolean> [
         ^(self compare: other) <= 0
     ]
-    > other [
+    > other <String> ^ <Boolean> [
         ^(self compare: other) > 0
     ]
-    >= other [
+    >= other <String> ^ <Boolean> [
         ^(self compare: other) >= 0
     ]
     "Copies ALL of src (read from src's own index 1) into self[from..to].
      The primitive is a bulk byte memcpy; the fallback (a non-byte src, e.g.
      an Array of Characters) degrades to element-by-element rather than
      failing the primitive with no body."
-    replaceFrom: from to: to with: src [
+    replaceFrom: from <Integer> to: to <Integer> with: src <SequenceableCollection> ^ <Self> [
         <primitive: 43>
         from to: to do: [:i | self at: i put: (src at: i - from + 1) ].
     ]
-    , other [
+    , other <SequenceableCollection> ^ <Self> [
         | r |
         r := self class new: self size + other size.
         r replaceFrom: 1 to: self size with: self.
         r replaceFrom: self size + 1 to: self size + other size with: other.
         ^r
     ]
-    copyFrom: from to: to [
+    copyFrom: from <Integer> to: to <Integer> ^ <Self> [
         | r n |
         n := to - from + 1.
         r := self class new: n.
         1 to: n do: [:i | r at: i put: (self at: from + i - 1) ].
         ^r
     ]
-    asString [
+    asString ^ <String> [
         ^self
     ]
-    asSymbol [
+    asSymbol ^ <Symbol> [
         <primitive: 110>
     ]
-    asUppercase [
+    asUppercase ^ <Self> [
         | r |
         r := self class new: self size.
         1 to: self size do: [:i | r at: i put: (self at: i) asUppercase ].
         ^r
     ]
-    asLowercase [
+    asLowercase ^ <Self> [
         | r |
         r := self class new: self size.
         1 to: self size do: [:i | r at: i put: (self at: i) asLowercase ].
         ^r
     ]
-    reverse [
+    reverse ^ <Self> [
         | r n |
         n := self size.
         r := self class new: n.
         1 to: n do: [:i | r at: i put: (self at: n - i + 1) ].
         ^r
     ]
-    includesChar: aChar [
+    includesChar: aChar <Character> ^ <Boolean> [
         1 to: self size do: [:i | (self at: i) = aChar ifTrue: [ ^true ] ].
         ^false
     ]
-    indexOf: aChar [
+    indexOf: aChar <Character> ^ <Integer> [
         1 to: self size do: [:i | (self at: i) = aChar ifTrue: [ ^i ] ].
         ^0
     ]
     "A copy with leading and trailing separator characters removed
      (Strongtalk ReadString>>withBlanksTrimmed). All-blank -> empty string."
-    withBlanksTrimmed [
+    withBlanksTrimmed ^ <Self> [
         | first last |
         first := self findFirst: [:c | c isSeparator not ].
         first = 0 ifTrue: [ ^self class new: 0 ].
         last := self findLast: [:c | c isSeparator not ].
         ^self copyFrom: first to: last
     ]
-    trimBlanks [
+    trimBlanks ^ <Self> [
         ^self withBlanksTrimmed
     ]
     "Case-insensitive equality (Strongtalk sameAs:)."
-    sameAs: aString [
+    sameAs: aString <String> ^ <Boolean> [
         self size = aString size ifFalse: [ ^false ].
         1 to: self size do: [:i |
             (self at: i) asLowercase = (aString at: i) asLowercase ifFalse: [ ^false ] ].
         ^true
     ]
-    startsWith: aString [
+    startsWith: aString <String> ^ <Boolean> [
         aString size > self size ifTrue: [ ^false ].
         ^self matchesSubCollection: aString at: 1
     ]
-    endsWith: aString [
+    endsWith: aString <String> ^ <Boolean> [
         aString size > self size ifTrue: [ ^false ].
         ^self matchesSubCollection: aString at: self size - aString size + 1
     ]
     "Parse a signed decimal integer; nil on any non-digit (after an optional
      leading $-). Uses Character>>digitValue."
-    asInteger [
+    asInteger ^ <Integer|UndefinedObject> [
         | n i sign d |
         self isEmpty ifTrue: [ ^nil ].
         i := 1.
@@ -162,7 +162,7 @@ ArrayedCollection subclass: String [
             i := i + 1 ].
         ^n * sign
     ]
-    String class >> with: aChar [
+    String class >> with: aChar <Character> ^ <String> [
         | r |
         r := self new: 1.
         r at: 1 put: aChar.

@@ -16,7 +16,7 @@
 Magnitude subclass: Character [
     <classVars: Table>
 
-    Character class >> value: v [
+    Character class >> value: v <Integer> ^ <Character> [
         (v >= 0 and: [ v < 256 ]) ifTrue: [ ^Table at: v + 1 ].
         ^self basicNew setValue: v
     ]
@@ -24,85 +24,85 @@ Magnitude subclass: Character [
         Table := Array new: 256.
         0 to: 255 do: [:i | Table at: i + 1 put: (self basicNew setValue: i) ]
     ]
-    Character class >> nl [
+    Character class >> nl ^ <Character> [
         ^self value: 10
     ]
-    Character class >> cr [
+    Character class >> cr ^ <Character> [
         ^self value: 13
     ]
-    Character class >> tab [
+    Character class >> tab ^ <Character> [
         ^self value: 9
     ]
-    Character class >> space [
+    Character class >> space ^ <Character> [
         ^self value: 32
     ]
 
-    setValue: v [
+    setValue: v <Integer> ^ <Self> [
         value := v.
         ^self
     ]
-    value [
+    value ^ <Integer> [
         ^value
     ]
-    asInteger [
+    asInteger ^ <Integer> [
         ^value
     ]
-    asCharacter [
+    asCharacter ^ <Character> [
         ^self
     ]
-    isCharacter [
+    isCharacter ^ <Boolean> [
         ^true
     ]
-    = other [
+    = other <Object> ^ <Boolean> [
         (other isKindOf: Character) ifFalse: [ ^false ].
         ^value = other asInteger
     ]
-    hash [
+    hash ^ <Integer> [
         ^value
     ]
-    < other [
+    < other <Character> ^ <Boolean> [
         ^value < other asInteger
     ]
-    isDigit [
+    isDigit ^ <Boolean> [
         ^value >= 48 and: [ value <= 57 ]
     ]
-    isLetter [
+    isLetter ^ <Boolean> [
         ^(value >= 65 and: [ value <= 90 ]) or: [ value >= 97 and: [ value <= 122 ] ]
     ]
-    isVowel [
+    isVowel ^ <Boolean> [
         | u |
         u := self asUppercase asInteger.
         ^u = 65 or: [ u = 69 or: [ u = 73 or: [ u = 79 or: [ u = 85 ] ] ] ]
     ]
-    asUppercase [
+    asUppercase ^ <Character> [
         (value >= 97 and: [ value <= 122 ]) ifTrue: [ ^Character value: value - 32 ].
         ^self
     ]
-    asLowercase [
+    asLowercase ^ <Character> [
         (value >= 65 and: [ value <= 90 ]) ifTrue: [ ^Character value: value + 32 ].
         ^self
     ]
-    isUppercase [
+    isUppercase ^ <Boolean> [
         ^value >= 65 and: [ value <= 90 ]
     ]
-    isLowercase [
+    isLowercase ^ <Boolean> [
         ^value >= 97 and: [ value <= 122 ]
     ]
-    isLetterOrDigit [
+    isLetterOrDigit ^ <Boolean> [
         ^self isLetter or: [ self isDigit ]
     ]
     "A whitespace/layout character: space, tab, LF, form-feed, or CR."
-    isSeparator [
+    isSeparator ^ <Boolean> [
         ^value = 32 or: [ value = 9 or: [ value = 10
             or: [ value = 12 or: [ value = 13 ] ] ] ]
     ]
-    isSpace [
+    isSpace ^ <Boolean> [
         ^value = 32
     ]
     "Radix-digit value: $0..$9 -> 0..9, $A..$Z / $a..$z -> 10..35 (case-
      insensitive), else -1. The basis for Integer readFrom: / radix parsing
      (Strongtalk Character>>digitValue)."
-    digitValue [
+    digitValue ^ <Integer> [
         (value >= 48 and: [ value <= 57 ]) ifTrue: [ ^value - 48 ].
         (value >= 65 and: [ value <= 90 ]) ifTrue: [ ^value - 55 ].
         (value >= 97 and: [ value <= 122 ]) ifTrue: [ ^value - 87 ].
@@ -113,7 +113,7 @@ Magnitude subclass: Character [
 Magnitude subclass: Character [
     "The Character for radix-digit value n: 0..9 -> $0..$9, 10..35 -> $A..$Z.
      Inverse of digitValue; the basis for radix printing."
-    Character class >> digitValue: n [
+    Character class >> digitValue: n <Integer> ^ <Character> [
         n < 10 ifTrue: [ ^Character value: n + 48 ].
         ^Character value: n + 55
     ]

@@ -7,7 +7,7 @@
 
 ArrayedCollection subclass: String [
     "Strip leading and trailing separators (space/tab/newline)."
-    trimSeparators [
+    trimSeparators ^ <Self> [
         | start stop |
         start := 1.
         [ start <= self size and: [ (self at: start) isSeparator ] ]
@@ -19,15 +19,15 @@ ArrayedCollection subclass: String [
     ]
 
     "First character uppercased, the rest unchanged."
-    capitalized [
+    capitalized ^ <String> [
         self isEmpty ifTrue: [ ^self ].
         ^(self copyFrom: 1 to: 1) asUppercase , (self copyFrom: 2 to: self size)
     ]
 
     "Squeak-cased alias of substrings:."
-    subStrings: separators [ ^self substrings: separators ]
+    subStrings: separators <String> ^ <OrderedCollection> [ ^self substrings: separators ]
 
-    includesSubstring: aString [
+    includesSubstring: aString <String> ^ <Boolean> [
         | limit |
         aString isEmpty ifTrue: [ ^true ].
         limit := self size - aString size + 1.
@@ -37,11 +37,11 @@ ArrayedCollection subclass: String [
     ]
 
     "A WriteStream that appends to a fresh copy of this string's species."
-    writeStream [ ^WriteStream on: (String new: 0) ]
+    writeStream ^ <WriteStream> [ ^WriteStream on: (String new: 0) ]
 
     "Parse an integer or a simple decimal (optional leading '-'). Non-numeric
      prefixes yield 0, matching Smalltalk's lenient asNumber."
-    asNumber [
+    asNumber ^ <Number> [
         | s i neg intPart fracPart fracLen result |
         s := self trimSeparators.
         s isEmpty ifTrue: [ ^0 ].
@@ -61,7 +61,7 @@ ArrayedCollection subclass: String [
         ^result
     ]
 
-    String class >> streamContents: aBlock [
+    String class >> streamContents: aBlock <[WriteStream]> ^ <String> [
         | s |
         s := WriteStream on: (String new: 0).
         aBlock value: s.
@@ -71,7 +71,7 @@ ArrayedCollection subclass: String [
 
 Object subclass: ReadStream [
     "Read the next n elements as one same-species slice."
-    next: anInteger [
+    next: anInteger <Integer> ^ <SequenceableCollection> [
         | result |
         result := collection copyFrom: position + 1 to: position + anInteger.
         position := position + anInteger.
@@ -81,7 +81,7 @@ Object subclass: ReadStream [
     "Read up to (and consuming) the first occurrence of anObject; the
      delimiter itself is not included in the answer. Reaching the end
      returns everything remaining."
-    upTo: anObject [
+    upTo: anObject <Object> ^ <SequenceableCollection> [
         | start result |
         start := position.
         [ self atEnd or: [ (collection at: position + 1) = anObject ] ]
@@ -92,13 +92,13 @@ Object subclass: ReadStream [
     ]
 
     "If the next element equals anObject, consume it and answer true."
-    peekFor: anObject [
+    peekFor: anObject <Object> ^ <Boolean> [
         self atEnd ifTrue: [ ^false ].
         (self peek = anObject) ifTrue: [ self next. ^true ].
         ^false
     ]
 
-    nextLine [ ^self upTo: (Character value: 10) ]
+    nextLine ^ <SequenceableCollection> [ ^self upTo: (Character value: 10) ]
 
     skipSeparators [
         [ self atEnd not and: [ (collection at: position + 1) isSeparator ] ]
@@ -109,5 +109,5 @@ Object subclass: ReadStream [
 Object subclass: WriteStream [
     "Append anObject's printString (the printable representation), unlike
      nextPutAll: which needs an already-string argument."
-    print: anObject [ self nextPutAll: anObject printString ]
+    print: anObject <Object> [ self nextPutAll: anObject printString ]
 ]

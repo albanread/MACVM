@@ -10,22 +10,22 @@
  numArgs answers how many arguments my selector expects."
 
 String subclass: Symbol [
-    asSymbol [
+    asSymbol ^ <Symbol> [
         ^self
     ]
-    isSymbol [
+    isSymbol ^ <Boolean> [
         ^true
     ]
-    asString [
+    asString ^ <String> [
         ^(String new: self size) replaceFrom: 1 to: self size with: self
     ]
-    = other [
+    = other <Object> ^ <Boolean> [
         ^self == other
     ]
-    hash [
+    hash ^ <Integer> [
         ^self identityHash
     ]
-    at: i put: v [
+    at: i <Integer> put: v <Character|Integer> [
         self error: 'symbols are immutable'
     ]
 ]
