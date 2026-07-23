@@ -15,26 +15,26 @@
  implemented — only divMod:."
 
 Integer subclass: LargeInteger [
-    isInteger [
+    isInteger ^ <Boolean> [
         ^true
     ]
-    byteAt: i [
+    byteAt: i <Integer> ^ <Integer> [
         <primitive: 40>
     ]
-    byteAt: i put: v [
+    byteAt: i <Integer> put: v <Integer> ^ <Integer> [
         <primitive: 41>
     ]
-    size [
+    size ^ <Integer> [
         <primitive: 28>
     ]
-    asLargeInteger [
+    asLargeInteger ^ <LargeInteger> [
         ^self
     ]
-    classSign [
+    classSign ^ <Integer> [
         ^self class == LargePositiveInteger ifTrue: [ 1 ] ifFalse: [ -1 ]
     ]
 
-    LargeInteger class >> copyDigitsFrom: aLarge [
+    LargeInteger class >> copyDigitsFrom: aLarge <LargeInteger> ^ <LargeInteger> [
         | r n |
         n := aLarge size.
         r := self basicNew: n.
@@ -45,7 +45,7 @@ Integer subclass: LargeInteger [
     "n >= 0: peel magnitude digits directly. n < 0: peel via floored //,\\
      (never overflows, even at minVal) collecting the low bytes of the
      two's-complement of |n|, then invert+add-1 to recover the magnitude."
-    LargeInteger class >> fromSmallInteger: n [
+    LargeInteger class >> fromSmallInteger: n <SmallInteger> ^ <LargeInteger> [
         | count v result i more q d carry j inv s |
         n >= 0
             ifTrue: [
@@ -91,7 +91,7 @@ Integer subclass: LargeInteger [
      preserving concrete class (sign). addMagnitude:/* always over-allocate
      by a carry byte, so results need re-canonicalizing before any
      size-sensitive comparison (compareMagnitude:) can trust them."
-    trimmedTo: n [
+    trimmedTo: n <Integer> ^ <LargeInteger> [
         | r i |
         n = self size ifTrue: [ ^self ].
         r := self class basicNew: n.
@@ -104,7 +104,7 @@ Integer subclass: LargeInteger [
      never overflows a smi; track the highest nonzero byte along the way
      so a too-big-for-smi result can still be trimmed to its canonical
      (no leading zero byte) size. Answer the demoted SmallInteger if it fits."
-    normalize [
+    normalize ^ <Integer> [
         | v i sz |
         v := 0.
         i := self size.
@@ -119,7 +119,7 @@ Integer subclass: LargeInteger [
             ifFalse: [ ^(0 - v) >= SmallInteger minVal ifTrue: [ 0 - v ] ifFalse: [ self trimmedTo: sz ] ]
     ]
 
-    addMagnitude: b [
+    addMagnitude: b <LargeInteger> ^ <LargeInteger> [
         | m n r i da db s c |
         m := self size. n := b size.
         r := LargePositiveInteger basicNew: (m max: n) + 1.
@@ -135,7 +135,7 @@ Integer subclass: LargeInteger [
     ]
 
     "self magnitude - b magnitude; requires |self| >= |b|."
-    subMagnitude: b [
+    subMagnitude: b <LargeInteger> ^ <LargeInteger> [
         | m n r i da db s borrow |
         m := self size. n := b size.
         r := LargePositiveInteger basicNew: m.
@@ -150,7 +150,7 @@ Integer subclass: LargeInteger [
         ^r
     ]
 
-    compareMagnitude: b [
+    compareMagnitude: b <LargeInteger> ^ <Integer> [
         | m n i |
         m := self size. n := b size.
         m > n ifTrue: [ ^1 ].
@@ -165,12 +165,12 @@ Integer subclass: LargeInteger [
 
     "self must be a magnitude-only (LargePositiveInteger-class) scratch
      value; wraps it in the requested sign's class and normalizes."
-    withSign: s [
+    withSign: s <Integer> ^ <LargeInteger> [
         s = 1 ifTrue: [ ^self normalize ].
         ^(LargeNegativeInteger copyDigitsFrom: self) normalize
     ]
 
-    + other [
+    + other <Number> ^ <Number> [
         | b |
         other isDouble ifTrue: [ ^self asDouble + other ].
         b := other asLargeInteger.
@@ -181,11 +181,11 @@ Integer subclass: LargeInteger [
                     ifTrue: [ ^(self subMagnitude: b) withSign: self classSign ]
                     ifFalse: [ ^(b subMagnitude: self) withSign: b classSign ] ]
     ]
-    - other [
+    - other <Number> ^ <Number> [
         other isDouble ifTrue: [ ^self asDouble - other ].
         ^self + other asLargeInteger negated
     ]
-    * other [
+    * other <Number> ^ <Number> [
         | b m n r i j t c |
         other isDouble ifTrue: [ ^self asDouble * other ].
         b := other asLargeInteger.
@@ -207,12 +207,12 @@ Integer subclass: LargeInteger [
             i := i + 1 ].
         ^r withSign: self classSign * b classSign
     ]
-    negated [
+    negated ^ <Integer> [
         self classSign = 1
             ifTrue: [ ^(LargeNegativeInteger copyDigitsFrom: self) normalize ]
             ifFalse: [ ^(LargePositiveInteger copyDigitsFrom: self) normalize ]
     ]
-    < other [
+    < other <Number> ^ <Boolean> [
         | b |
         other isDouble ifTrue: [ ^self asDouble < other ].
         b := other asLargeInteger.
@@ -221,17 +221,17 @@ Integer subclass: LargeInteger [
             ifTrue: [ ^(self compareMagnitude: b) < 0 ]
             ifFalse: [ ^(self compareMagnitude: b) > 0 ]
     ]
-    = other [
+    = other <Object> ^ <Boolean> [
         other isDouble ifTrue: [ ^self asDouble = other ].
         (other isKindOf: LargeInteger) ifFalse: [
             other isInteger ifTrue: [ ^self = other asLargeInteger ].
             ^false ].
         ^(self classSign = other classSign) and: [ (self compareMagnitude: other) = 0 ]
     ]
-    hash [
+    hash ^ <Integer> [
         <primitive: 44>
     ]
-    asDouble [
+    asDouble ^ <Double> [
         | v i |
         v := 0.0.
         i := self size.
@@ -243,7 +243,7 @@ Integer subclass: LargeInteger [
 
     "Magnitude-only divmod by a smi divisor 1 < d <= 255 — printOn:'s only
      consumer (repeated /10); self must already be non-negative."
-    divMod: d [
+    divMod: d <Integer> ^ <Association> [
         | q rem i part |
         q := LargePositiveInteger basicNew: self size.
         rem := 0.

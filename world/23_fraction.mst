@@ -36,9 +36,9 @@ nil subclass: Object [
  to inexact Double arithmetic. Other useful messages: numerator,
  denominator, truncated, floor, ceiling, rounded, asDouble."
 Number subclass: Fraction [
-    | numerator denominator |
+    | numerator <Integer> denominator <Integer> |
 
-    Fraction class >> numerator: n denominator: d [
+    Fraction class >> numerator: n <Integer> denominator: d <Integer> ^ <Number> [
         | g num den sign |
         d = 0 ifTrue: [ ^self error: 'division by zero' ].
         sign := d < 0 ifTrue: [ -1 ] ifFalse: [ 1 ].
@@ -50,40 +50,40 @@ Number subclass: Fraction [
         den = 1 ifTrue: [ ^num ].
         ^self basicNew setNumerator: num denominator: den
     ]
-    setNumerator: n denominator: d [
+    setNumerator: n <Integer> denominator: d <Integer> [
         numerator := n.
         denominator := d.
     ]
-    numerator [
+    numerator ^ <Integer> [
         ^numerator
     ]
-    denominator [
+    denominator ^ <Integer> [
         ^denominator
     ]
-    isFraction [
+    isFraction ^ <Boolean> [
         ^true
     ]
-    hash [
+    hash ^ <Integer> [
         ^numerator hash bitXor: denominator hash
     ]
-    negative [
+    negative ^ <Boolean> [
         ^numerator < 0
     ]
-    negated [
+    negated ^ <Fraction> [
         ^Fraction numerator: numerator negated denominator: denominator
     ]
-    asDouble [
+    asDouble ^ <Double> [
         ^numerator asDouble / denominator asDouble
     ]
-    truncated [
+    truncated ^ <Integer> [
         ^self negative
             ifTrue: [ (numerator negated // denominator) negated ]
             ifFalse: [ numerator // denominator ]
     ]
-    asInteger [
+    asInteger ^ <Integer> [
         ^self truncated
     ]
-    + aNumber [
+    + aNumber <Number> ^ <Number> [
         aNumber isDouble ifTrue: [ ^self asDouble + aNumber ].
         aNumber isFraction ifTrue: [
             ^Fraction
@@ -91,11 +91,11 @@ Number subclass: Fraction [
                 denominator: denominator * aNumber denominator ].
         ^Fraction numerator: numerator + (aNumber * denominator) denominator: denominator
     ]
-    - aNumber [
+    - aNumber <Number> ^ <Number> [
         aNumber isDouble ifTrue: [ ^self asDouble - aNumber ].
         ^self + aNumber negated
     ]
-    * aNumber [
+    * aNumber <Number> ^ <Number> [
         aNumber isDouble ifTrue: [ ^self asDouble * aNumber ].
         aNumber isFraction ifTrue: [
             ^Fraction
@@ -103,7 +103,7 @@ Number subclass: Fraction [
                 denominator: denominator * aNumber denominator ].
         ^Fraction numerator: numerator * aNumber denominator: denominator
     ]
-    / aNumber [
+    / aNumber <Number> ^ <Number> [
         aNumber isDouble ifTrue: [ ^self asDouble / aNumber ].
         aNumber isFraction ifTrue: [
             ^Fraction
@@ -111,22 +111,22 @@ Number subclass: Fraction [
                 denominator: denominator * aNumber numerator ].
         ^Fraction numerator: numerator denominator: denominator * aNumber
     ]
-    < aNumber [
+    < aNumber <Number> ^ <Boolean> [
         aNumber isDouble ifTrue: [ ^self asDouble < aNumber ].
         aNumber isFraction ifTrue: [
             ^(numerator * aNumber denominator) < (aNumber numerator * denominator) ].
         ^numerator < (aNumber * denominator)
     ]
-    <= aNumber [
+    <= aNumber <Number> ^ <Boolean> [
         ^(aNumber < self) not
     ]
-    > aNumber [
+    > aNumber <Number> ^ <Boolean> [
         ^aNumber < self
     ]
-    >= aNumber [
+    >= aNumber <Number> ^ <Boolean> [
         ^(self < aNumber) not
     ]
-    = aNumber [
+    = aNumber <Object> ^ <Boolean> [
         aNumber isDouble ifTrue: [ ^self asDouble = aNumber ].
         aNumber isFraction ifTrue: [
             ^numerator = aNumber numerator and: [ denominator = aNumber denominator ] ].

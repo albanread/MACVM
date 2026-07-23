@@ -105,7 +105,23 @@ pub fn check_method(
     }
     scope.pop_frame();
 
-    if !found_return {
+    // A method whose body is a BARE primitive pragma with NO Smalltalk
+    // fallback code (`m.body` empty, `m.primitive` set — e.g. `asDouble [
+    // <primitive: 108> ]`) never actually "falls off the end of real
+    // code" in the sense the implicit-`^self` rule means: its real return
+    // value is whatever the primitive computes, which is completely
+    // opaque to this checker (T4, found empirically: annotating exactly
+    // these type-CONVERTING primitives, like `asDouble ^<Double>` on
+    // SmallInteger, tripped this check every time, since SmallInteger is
+    // obviously not a subtype of Double -- the checker was insisting the
+    // primitive returns `self` when it demonstrably does not). Only an
+    // otherwise-EMPTY method (no primitive at all) genuinely falls off
+    // the end per ordinary Smalltalk semantics, and only a method WITH
+    // fallback code after its primitive pragma can meaningfully "fall
+    // off the end of its own Smalltalk statements" -- both keep the
+    // implicit-self check as before.
+    let is_bare_primitive = m.body.is_empty() && m.primitive.is_some();
+    if !found_return && !is_bare_primitive {
         let implicit = ResolvedType::named("Self");
         let mut trail = Trail::new();
         if !subtype_of(model, class_name, &implicit, &declared_return, &mut trail) {
@@ -713,6 +729,81 @@ mod tests {
 
         let model = build_world_model(&dir).unwrap();
         assert_eq!(super::super::check::check_world(&model), vec![]);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn bare_primitive_with_no_fallback_is_not_checked_against_implicit_self() {
+        // `asOther [ <primitive: 1> ]` never runs any Smalltalk code at
+        // all -- its real return value is whatever the primitive
+        // computes, which this checker can't see. The implicit-`^self`
+        // rule must NOT apply here (Foo is not a subtype of Other, so a
+        // naive "falls off the end -> self" check would wrongly flag
+        // EXACTLY the type-converting primitives (asFloat/asDouble/…)
+        // T4 needs to annotate).
+        let dir = temp_world_dir("bare_primitive");
+        write_number_tower(&dir);
+        fs::write(
+            dir.join("02_foo.mst"),
+            "Object subclass: Foo [\n\
+             \x20   asDouble ^ <Double> [\n\
+             \x20       <primitive: 1>\n\
+             \x20   ]\n\
+             ]\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("world.list"),
+            "00_object.mst\n01_tower.mst\n02_foo.mst\n",
+        )
+        .unwrap();
+
+        let model = build_world_model(&dir).unwrap();
+        assert_eq!(
+            super::super::check::check_world(&model),
+            vec![],
+            "a bare-primitive method's declared return must NOT be checked \
+             against the implicit self -- Foo is not a Double, but the \
+             primitive (opaque to this checker) legitimately answers one"
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn primitive_with_smalltalk_fallback_still_checks_implicit_self() {
+        // Unlike the bare-primitive case, a primitive FOLLOWED BY real
+        // Smalltalk statements genuinely can fall off the end of THAT
+        // code (if the primitive fails and the fallback itself has no
+        // explicit `^`) -- the implicit-self rule must still apply here.
+        let dir = temp_world_dir("primitive_with_fallback");
+        write_number_tower(&dir);
+        fs::write(
+            dir.join("02_foo.mst"),
+            "Object subclass: Foo [\n\
+             \x20   asDouble ^ <Double> [\n\
+             \x20       <primitive: 1>\n\
+             \x20       3 + 4.\n\
+             \x20   ]\n\
+             ]\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("world.list"),
+            "00_object.mst\n01_tower.mst\n02_foo.mst\n",
+        )
+        .unwrap();
+
+        let model = build_world_model(&dir).unwrap();
+        let errors = super::super::check::check_world(&model);
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, super::super::check::TypeError::ReturnNotSubtype { .. })),
+            "Foo falling off the end of REAL fallback code must still be \
+             checked against ^<Double> (Foo is not a Double), got {errors:#?}"
+        );
 
         fs::remove_dir_all(&dir).ok();
     }

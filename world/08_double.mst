@@ -9,75 +9,75 @@
  it answers an infinity or NaN. asInteger truncates toward zero."
 
 Number subclass: Double [
-    isDouble [
+    isDouble ^ <Boolean> [
         ^true
     ]
-    + aNumber [
+    + aNumber <Number> ^ <Double> [
         <primitive: 100>
         ^self + aNumber asDouble
     ]
-    - aNumber [
+    - aNumber <Number> ^ <Double> [
         <primitive: 101>
         ^self - aNumber asDouble
     ]
-    * aNumber [
+    * aNumber <Number> ^ <Double> [
         <primitive: 102>
         ^self * aNumber asDouble
     ]
-    / aNumber [
+    / aNumber <Number> ^ <Double> [
         <primitive: 103>
         ^self / aNumber asDouble
     ]
-    < aNumber [
+    < aNumber <Number> ^ <Boolean> [
         <primitive: 104>
         ^self < aNumber asDouble
     ]
-    = aNumber [
+    = aNumber <Object> ^ <Boolean> [
         <primitive: 105>
         "primitive 105 only fails when aNumber is not itself a Double."
         aNumber isInteger ifTrue: [ ^self = aNumber asDouble ].
         ^false
     ]
-    ~= aNumber [
+    ~= aNumber <Object> ^ <Boolean> [
         ^(self = aNumber) not
     ]
-    sin [
+    sin ^ <Double> [
         <primitive: 121>
     ]
-    cos [
+    cos ^ <Double> [
         <primitive: 122>
     ]
-    tan [
+    tan ^ <Double> [
         <primitive: 123>
     ]
-    exp [
+    exp ^ <Double> [
         <primitive: 124>
     ]
-    ln [
+    ln ^ <Double> [
         <primitive: 125>
     ]
-    atan [
+    atan ^ <Double> [
         <primitive: 126>
     ]
-    sqrt [
+    sqrt ^ <Double> [
         <primitive: 106>
     ]
-    floor [
+    floor ^ <Integer> [
         <primitive: 107>
     ]
-    ceiling [
+    ceiling ^ <Integer> [
         ^(0 - self) floor negated
     ]
-    truncated [
+    truncated ^ <Integer> [
         ^self < 0 ifTrue: [ self ceiling ] ifFalse: [ self floor ]
     ]
-    rounded [
+    rounded ^ <Integer> [
         ^(self + 0.5) floor
     ]
     printDigits [
         <primitive: 109>
     ]
-    hash [
+    hash ^ <Integer> [
         ^self floor hash
     ]
 ]
