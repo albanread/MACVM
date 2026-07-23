@@ -80,23 +80,22 @@ reps, 2026-07-22):
 
 | benchmark | MACVM | Cog | |
 |-----------|------:|----:|---|
-| arith     |  33.8 | 51.7 | **1.53× faster** |
-| fib       | 153.3 | 184.5 | **1.20× faster** |
-| sieve     |   2.3 |  3.6 | **1.56× faster** |
-| dict      |   8.5 | 12.8 | **1.51× faster** |
-| alloc     |  12.9 | 14.4 | **1.12× faster** |
-| richards  |  19.6 | 22.1 | **1.13× faster** |
-| deltablue |   2.8 |  3.4 | **1.21× faster** |
+| arith     |  34.0 | 51.1 | **1.50× faster** |
+| fib       | 135.4 | 181.0 | **1.34× faster** |
+| sieve     |   2.3 |  3.5 | **1.48× faster** |
+| dict      |   7.7 | 12.0 | **1.55× faster** |
+| alloc     |  12.5 | 14.2 | **1.13× faster** |
+| richards  |  18.8 | 21.9 | **1.17× faster** |
+| deltablue |   2.7 |  3.5 | **1.27× faster** |
 
-A follow-up run with frameless leaf methods (now the default) improved
-richards further to **18.8 ms (1.17×)** with the rest stable. All seven
-ahead — a bar this VM only cleared after the harness itself was made
-honest: earlier comparisons were wrong in *both* directions (millisecond
-clocks truncating the sub-5 ms benches, and an unfaithful Cog-side
-translation), and the same-day fixes that followed (special-selector
-inlining, nursery sizing) are what closed the real gaps the honest numbers
-exposed. The full measured record, including those corrections, is
-[`docs/cog_bench.md`](docs/cog_bench.md).
+All seven ahead — a bar this VM only cleared after the harness itself was
+made honest: earlier comparisons were wrong in *both* directions
+(millisecond clocks truncating the sub-5 ms benches, and an unfaithful
+Cog-side translation), and the fixes that followed the honest numbers
+(special-selector inlining, nursery sizing, frameless leaf methods, the
+prologue nil-fill shrink) are what closed the real gaps they exposed. The
+full measured record, including those corrections and the commit stamp of
+every scoreboard, is [`docs/cog_bench.md`](docs/cog_bench.md).
 
 ### What's implemented
 

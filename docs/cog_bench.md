@@ -144,3 +144,26 @@ both runs), MACVM micros ±3%: richards 19.6 -> **18.8** (the frameless F2
 prediction of ~2-4%, visible cross-VM), deltablue flat at 2.8. Final margins:
 richards MACVM 1.17x, deltablue 1.28x, micros 1.17-1.54x — all seven ahead
 with frameless as the shipped default.
+
+## 2026-07-22 F7 confirmation — fib joins the movers (commit=3072c77)
+
+Fresh quiet-load run (load 2.0, ROUNDS=3) after F7 (prologue nil-fill
+shrink, the WINVM 9cb272e port with the tightened whitelist rule):
+
+| bench | MACVM ms | Cog ms | verdict |
+|---|---|---|---|
+| arith | 34.0 | 51.1 | MACVM 1.50x |
+| **fib** | **135.4** | 181.0 | **MACVM 1.34x** |
+| sieve | 2.3 | 3.5 | MACVM 1.48x |
+| dict | 7.7 | 12.0 | MACVM 1.55x |
+| alloc | 12.5 | 14.2 | MACVM 1.13x |
+| richards | 18.8 | 21.9 | MACVM 1.17x |
+| deltablue | 2.7 | 3.5 | MACVM 1.27x |
+
+Attribution is clean by the same-session rule: Cog held still vs the prior
+sessions (richards 21.9 vs 22.1, arith 51.1 vs 51.7, fib 181.0 vs 184.5)
+and MACVM moved only on F7's predicted prime beneficiary — fib 153.3 ->
+135.4 ms (~12%; its three removed fill stores execute 4.4M times per
+timing). richards matches the frameless-confirmation 18.8 exactly; the
+other five rows are within +-5%. All seven remain ahead with frameless
+(F3) and the fill shrink (F7) both shipped as defaults.
