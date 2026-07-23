@@ -4,11 +4,11 @@
 
 Object subclass: Collection [
     "Sum of the block's value over each element (0 for an empty collection)."
-    sum: aBlock [ ^self inject: 0 into: [:acc :e | acc + (aBlock value: e) ] ]
+    sum: aBlock <[Object,^Number]> ^ <Number> [ ^self inject: 0 into: [:acc :e | acc + (aBlock value: e) ] ]
 
     "Reduce with no seed — combine elements left to right using the FIRST as
      the initial accumulator. Empty is an error (no seed to answer)."
-    fold: aBlock [
+    fold: aBlock <[Object,Object,^Object]> ^ <Object> [
         | acc any |
         any := false. acc := nil.
         self do: [:e |
@@ -21,22 +21,22 @@ Object subclass: Collection [
 
 Collection subclass: SequenceableCollection [
     "value-then-index iteration (the Squeak-cased alias of doWithIndex:)."
-    withIndexDo: aBlock [ ^self doWithIndex: aBlock ]
+    withIndexDo: aBlock <[Object,Integer]> [ ^self doWithIndex: aBlock ]
 
     "collect: with the 1-based index available (value, index) -> Array."
-    withIndexCollect: aBlock [
+    withIndexCollect: aBlock <[Object,Integer,^Object]> ^ <Array> [
         | result i |
         result := Array new: self size.
         i := 0.
         self do: [:e | i := i + 1. result at: i put: (aBlock value: e value: i) ].
         ^result
     ]
-    collectWithIndex: aBlock [ ^self withIndexCollect: aBlock ]
+    collectWithIndex: aBlock <[Object,Integer,^Object]> ^ <Array> [ ^self withIndexCollect: aBlock ]
 ]
 
 SequenceableCollection subclass: Interval [
     "An Interval is immutable, so the inherited reversed (which builds via
      at:put:) fails on it — answer a reversed Array instead."
-    reversed [ ^self asArray reversed ]
-    reverse [ ^self reversed ]
+    reversed ^ <Array> [ ^self asArray reversed ]
+    reverse ^ <Array> [ ^self reversed ]
 ]

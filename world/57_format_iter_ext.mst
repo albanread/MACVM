@@ -4,10 +4,10 @@
 
 Magnitude subclass: Number [
     "Round to the nearest multiple of aNumber (e.g. 3.14159 roundTo: 0.01 -> 3.14)."
-    roundTo: aNumber [ ^(self / aNumber) rounded * aNumber ]
+    roundTo: aNumber <Number> ^ <Number> [ ^(self / aNumber) rounded * aNumber ]
 
     "printString left-padded with aChar to at least width characters."
-    printPaddedWith: aChar to: width [
+    printPaddedWith: aChar <Character> to: width <Integer> ^ <String> [
         | s |
         s := self printString.
         ^String streamContents: [:str |
@@ -20,19 +20,19 @@ Number subclass: Fraction [
     "Rounding, missing on Fraction (only truncated existed) — needed by
      roundTo: when the quotient is fractional (e.g. 17 roundTo: 5). floor
      uses // (which already floors); ceiling and rounded build on it."
-    floor [ ^self numerator // self denominator ]
-    ceiling [ ^self negated floor negated ]
+    floor ^ <Integer> [ ^self numerator // self denominator ]
+    ceiling ^ <Integer> [ ^self negated floor negated ]
     "round-half-up, in pure INTEGER arithmetic: floor((2n + d) / 2d) —
      denominator is always positive (Fraction's reduce invariant). Kept in
      integer form rather than `(self + (self sign / 2)) truncated`: it is
      exact and allocates no intermediate Fraction. (It originally also dodged
      the Integer+Fraction coercion bug — since fixed in world/02+06.)"
-    rounded [ ^((2 * self numerator) + self denominator) // (2 * self denominator) ]
+    rounded ^ <Integer> [ ^((2 * self numerator) + self denominator) // (2 * self denominator) ]
 ]
 
 Number subclass: Integer [
     "This integer written in the given radix (2..36), e.g. 255 printString: 16 -> 'ff'."
-    printString: radix [
+    printString: radix <Integer> ^ <String> [
         | n neg chars stack |
         self = 0 ifTrue: [ ^'0' ].
         n := self abs. neg := self < 0.
@@ -49,7 +49,7 @@ Number subclass: Integer [
 
 Object subclass: Collection [
     "collect: each element to a collection, then concatenate them all."
-    flatCollect: aBlock [
+    flatCollect: aBlock <[Object,^Collection]> ^ <Array> [
         | result |
         result := OrderedCollection new.
         self do: [:e | result addAll: (aBlock value: e) ].
@@ -57,7 +57,7 @@ Object subclass: Collection [
     ]
 
     "The element for which aBlock answers the largest / smallest value."
-    detectMax: aBlock [
+    detectMax: aBlock <[Object,^Magnitude]> ^ <Object> [
         | best bestVal any |
         any := false.
         self do: [:e | | v |
@@ -65,7 +65,7 @@ Object subclass: Collection [
             (any not or: [ v > bestVal ]) ifTrue: [ best := e. bestVal := v. any := true ] ].
         ^best
     ]
-    detectMin: aBlock [
+    detectMin: aBlock <[Object,^Magnitude]> ^ <Object> [
         | best bestVal any |
         any := false.
         self do: [:e | | v |
@@ -76,7 +76,7 @@ Object subclass: Collection [
 
     "Partition into a Dictionary keyed by aBlock's value, each value an
      OrderedCollection of the elements that produced that key."
-    groupBy: aBlock [
+    groupBy: aBlock <[Object,^Object]> ^ <Dictionary> [
         | groups |
         groups := Dictionary new.
         self do: [:e | (groups at: (aBlock value: e) ifAbsentPut: [ OrderedCollection new ]) add: e ].
@@ -86,7 +86,7 @@ Object subclass: Collection [
 
 Collection subclass: SequenceableCollection [
     "Replace every element equal to oldObject with newObject, in place."
-    replaceAll: oldObject with: newObject [
+    replaceAll: oldObject <Object> with: newObject <Object> ^ <Self> [
         1 to: self size do: [:i |
             (self at: i) = oldObject ifTrue: [ self at: i put: newObject ] ].
         ^self
@@ -95,18 +95,18 @@ Collection subclass: SequenceableCollection [
 
 SequenceableCollection subclass: OrderedCollection [
     "Insert every element of aCollection at the front, order preserved."
-    addAllFirst: aCollection [
+    addAllFirst: aCollection <SequenceableCollection> ^ <SequenceableCollection> [
         aCollection reverseDo: [:e | self addFirst: e ].
         ^aCollection
     ]
     "Remove and answer the first / last n elements."
-    removeFirst: n [
+    removeFirst: n <Integer> ^ <OrderedCollection> [
         | result |
         result := OrderedCollection new.
         n timesRepeat: [ result add: self removeFirst ].
         ^result
     ]
-    removeLast: n [
+    removeLast: n <Integer> ^ <OrderedCollection> [
         | result |
         result := OrderedCollection new.
         n timesRepeat: [ result add: self removeLast ].

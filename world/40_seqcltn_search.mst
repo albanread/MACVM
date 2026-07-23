@@ -15,34 +15,34 @@
 Collection subclass: SequenceableCollection [
     "Index of the first/last element satisfying aBlock, or 0 if none
      (Strongtalk SequenceableCollection>>findFirst:/findLast:)."
-    findFirst: aBlock [
+    findFirst: aBlock <[Object,^Boolean]> ^ <Integer> [
         1 to: self size do: [:i | (aBlock value: (self at: i)) ifTrue: [ ^i ] ].
         ^0
     ]
-    findLast: aBlock [
+    findLast: aBlock <[Object,^Boolean]> ^ <Integer> [
         self size to: 1 by: -1 do: [:i | (aBlock value: (self at: i)) ifTrue: [ ^i ] ].
         ^0
     ]
-    count: aBlock [
+    count: aBlock <[Object,^Boolean]> ^ <Integer> [
         | n |
         n := 0.
         self do: [:each | (aBlock value: each) ifTrue: [ n := n + 1 ] ].
         ^n
     ]
     "Iterate in reverse order."
-    reverseDo: aBlock [
+    reverseDo: aBlock <[Object]> [
         self size to: 1 by: -1 do: [:i | aBlock value: (self at: i) ]
     ]
     "Pairwise iteration: aBlock gets (self at: i) and (other at: i). Both must
      be the same size."
-    with: aCollection do: aBlock [
+    with: aCollection <SequenceableCollection> do: aBlock <[Object,Object]> [
         self size = aCollection size
             ifFalse: [ ^self error: 'with:do: collections must be the same size' ].
         1 to: self size do: [:i | aBlock value: (self at: i) value: (aCollection at: i) ]
     ]
     "Does sub occur at exactly `index` (1-based)? The shared inner test for the
      subcollection search + copyReplaceAll:."
-    matchesSubCollection: sub at: index [
+    matchesSubCollection: sub <SequenceableCollection> at: index <Integer> ^ <Boolean> [
         1 to: sub size do: [:j |
             (self at: index + j - 1) = (sub at: j) ifFalse: [ ^false ] ].
         ^true
@@ -50,7 +50,7 @@ Collection subclass: SequenceableCollection [
     "Index of the first occurrence of the subcollection at or after `start`
      (Strongtalk indexOfSubCollection:startingAt:ifAbsent:). Substring search
      over String, subsequence search over Array."
-    indexOfSubCollection: sub startingAt: start ifAbsent: exceptionBlock [
+    indexOfSubCollection: sub <SequenceableCollection> startingAt: start <Integer> ifAbsent: exceptionBlock <[]> ^ <Integer> [
         | n m |
         n := self size.
         m := sub size.
@@ -59,29 +59,29 @@ Collection subclass: SequenceableCollection [
             (self matchesSubCollection: sub at: i) ifTrue: [ ^i ] ].
         ^exceptionBlock value
     ]
-    indexOfSubCollection: sub startingAt: start [
+    indexOfSubCollection: sub <SequenceableCollection> startingAt: start <Integer> ^ <Integer> [
         ^self indexOfSubCollection: sub startingAt: start ifAbsent: [ 0 ]
     ]
-    indexOfSubCollection: sub [
+    indexOfSubCollection: sub <SequenceableCollection> ^ <Integer> [
         ^self indexOfSubCollection: sub startingAt: 1 ifAbsent: [ 0 ]
     ]
-    includesSubCollection: sub [
+    includesSubCollection: sub <SequenceableCollection> ^ <Boolean> [
         ^(self indexOfSubCollection: sub) > 0
     ]
     "Same elements in the same order (no class check, unlike =)."
-    hasSameElementsAndOrderAs: other [
+    hasSameElementsAndOrderAs: other <SequenceableCollection> ^ <Boolean> [
         self size = other size ifFalse: [ ^false ].
         1 to: self size do: [:i | (self at: i) = (other at: i) ifFalse: [ ^false ] ].
         ^true
     ]
     "Is every adjacent pair ordered by aBlock (a sortBlock: aBlock value: a
      value: b answers true when a may precede b)?"
-    isSortedBy: aBlock [
+    isSortedBy: aBlock <[Object,Object,^Boolean]> ^ <Boolean> [
         2 to: self size do: [:i |
             (aBlock value: (self at: i - 1) value: (self at: i)) ifFalse: [ ^false ] ].
         ^true
     ]
-    isSorted [
+    isSorted ^ <Boolean> [
         ^self isSortedBy: [:a :b | a <= b ]
     ]
 ]
@@ -98,7 +98,7 @@ Collection subclass: SequenceableCollection [
  because only the indexable classes answer a usable object from new:."
 SequenceableCollection subclass: ArrayedCollection [
     "Pairwise collect into a new collection of self's kind."
-    with: aCollection collect: aBlock [
+    with: aCollection <SequenceableCollection> collect: aBlock <[Object,Object,^Object]> ^ <Self> [
         | r |
         self size = aCollection size
             ifFalse: [ ^self error: 'with:collect: collections must be the same size' ].
@@ -108,7 +108,7 @@ SequenceableCollection subclass: ArrayedCollection [
         ^r
     ]
     "A copy with newElement appended."
-    copyWith: newElement [
+    copyWith: newElement <Object> ^ <Self> [
         | r n |
         n := self size.
         r := self class new: n + 1.
@@ -117,7 +117,7 @@ SequenceableCollection subclass: ArrayedCollection [
         ^r
     ]
     "A copy with every element equal to oldElement removed."
-    copyWithout: oldElement [
+    copyWithout: oldElement <Object> ^ <Self> [
         | r keep j |
         keep := self count: [:each | each ~= oldElement ].
         r := self class new: keep.
@@ -131,7 +131,7 @@ SequenceableCollection subclass: ArrayedCollection [
      a new collection (Strongtalk copyReplaceAll:with:). Sizes the result from
      a first counting pass, so newSub need not match oldSub's length — this is
      the everyday string find-and-replace."
-    copyReplaceAll: oldSub with: newSub [
+    copyReplaceAll: oldSub <SequenceableCollection> with: newSub <SequenceableCollection> ^ <Self> [
         | m n matches newLen r i j |
         m := oldSub size.
         n := self size.
@@ -156,7 +156,7 @@ SequenceableCollection subclass: ArrayedCollection [
     ]
     "Replace the slice start..stop with replacement (any length), answering a
      new collection."
-    copyReplaceFrom: start to: stop with: replacement [
+    copyReplaceFrom: start <Integer> to: stop <Integer> with: replacement <SequenceableCollection> ^ <Self> [
         | r j |
         r := self class new: self size - (stop - start + 1) + replacement size.
         j := 1.

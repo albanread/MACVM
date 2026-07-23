@@ -30,41 +30,46 @@
  with the same counts. Any collection answers a Bag of its elements via
  asBag, which makes me handy for frequency counting."
 Collection subclass: Bag [
+    "contents deliberately UNANNOTATED: its true type is Strongtalk's
+     VarDict[E,Int] (an element -> occurrence-count map), which v1's
+     type grammar can't express; a plain <Dictionary> would erase the
+     Integer values to Object and falsely contradict occurrencesOf:'s
+     own (correct) ^<Integer> below."
     | contents |
 
-    Bag class >> new [
+    Bag class >> new ^ <Bag> [
         ^self basicNew init
     ]
-    init [
+    init ^ <Self> [
         contents := Dictionary new.
     ]
-    add: el [
+    add: el <Object> ^ <Object> [
         ^self add: el withOccurrences: 1
     ]
-    add: el withOccurrences: oc [
+    add: el <Object> withOccurrences: oc <Integer> ^ <Object> [
         contents at: el put: oc + (self occurrencesOf: el).
         ^el
     ]
-    occurrencesOf: o [
+    occurrencesOf: o <Object> ^ <Integer> [
         ^contents at: o ifAbsent: [ 0 ]
     ]
-    includes: el [
+    includes: el <Object> ^ <Boolean> [
         ^(self occurrencesOf: el) > 0
     ]
-    size [
+    size ^ <Integer> [
         ^contents inject: 0 into: [:tot :occ | tot + occ ]
     ]
-    remove: el [
+    remove: el <Object> ^ <Object> [
         ^self remove: el ifAbsent: [ self error: 'element not found' ]
     ]
-    remove: el ifAbsent: absentBlock [
+    remove: el <Object> ifAbsent: absentBlock <[]> ^ <Object> [
         | oc |
         oc := self occurrencesOf: el.
         oc = 0 ifTrue: [ ^absentBlock value ].
         contents at: el put: oc - 1.
         ^el
     ]
-    do: aBlock [
+    do: aBlock <[Object]> [
         contents keysAndValuesDo: [:el :occ |
             occ timesRepeat: [ aBlock value: el ] ]
     ]
@@ -76,7 +81,7 @@ Collection subclass: Bag [
 ]
 
 Object subclass: Collection [
-    asBag [
+    asBag ^ <Bag> [
         | b |
         b := Bag new.
         self do: [:each | b add: each ].

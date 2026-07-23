@@ -11,46 +11,46 @@
 Object subclass: Collection [
     "Reductions. Empty is an error (there is no meaningful identity for max/min,
      and matching Pharo, sum of empty is refused rather than assumed 0)."
-    sum [
+    sum ^ <Number> [
         | total any |
         any := false. total := 0.
         self do: [:e | any ifTrue: [ total := total + e ] ifFalse: [ total := e. any := true ]].
         any ifFalse: [ ^self error: 'sum of an empty collection' ].
         ^total
     ]
-    max [
+    max ^ <Object> [
         | best any |
         any := false. best := nil.
         self do: [:e | any ifTrue: [ e > best ifTrue: [ best := e ] ] ifFalse: [ best := e. any := true ]].
         any ifFalse: [ ^self error: 'max of an empty collection' ].
         ^best
     ]
-    min [
+    min ^ <Object> [
         | best any |
         any := false. best := nil.
         self do: [:e | any ifTrue: [ e < best ifTrue: [ best := e ] ] ifFalse: [ best := e. any := true ]].
         any ifFalse: [ ^self error: 'min of an empty collection' ].
         ^best
     ]
-    average [ ^self sum / self size ]
+    average ^ <Number> [ ^self sum / self size ]
 
-    includesAll: aCollection [
+    includesAll: aCollection <Collection> ^ <Boolean> [
         aCollection do: [:e | (self includes: e) ifFalse: [ ^false ] ].
         ^true
     ]
-    includesAny: aCollection [
+    includesAny: aCollection <Collection> ^ <Boolean> [
         aCollection do: [:e | (self includes: e) ifTrue: [ ^true ] ].
         ^false
     ]
 
     "Empty-guards. The block is evaluated with no argument (the common
      `coll ifNotEmpty: [ ... ]` form)."
-    ifEmpty: aBlock [ ^self isEmpty ifTrue: [ aBlock value ] ifFalse: [ self ] ]
-    ifNotEmpty: aBlock [ ^self isEmpty ifTrue: [ nil ] ifFalse: [ aBlock value ] ]
-    ifEmpty: emptyBlock ifNotEmpty: notEmptyBlock [
+    ifEmpty: aBlock <[]> ^ <Object> [ ^self isEmpty ifTrue: [ aBlock value ] ifFalse: [ self ] ]
+    ifNotEmpty: aBlock <[]> ^ <Object> [ ^self isEmpty ifTrue: [ nil ] ifFalse: [ aBlock value ] ]
+    ifEmpty: emptyBlock <[]> ifNotEmpty: notEmptyBlock <[]> ^ <Object> [
         ^self isEmpty ifTrue: [ emptyBlock value ] ifFalse: [ notEmptyBlock value ]
     ]
-    ifNotEmpty: notEmptyBlock ifEmpty: emptyBlock [
+    ifNotEmpty: notEmptyBlock <[]> ifEmpty: emptyBlock <[]> ^ <Object> [
         ^self isEmpty ifTrue: [ emptyBlock value ] ifFalse: [ notEmptyBlock value ]
     ]
 ]
@@ -60,13 +60,13 @@ Object subclass: Collection [
      aCollection. Works for any GROWABLE collection (OrderedCollection/Set/Bag
      — `new` gives an empty one and `addAll:` fills it); Array overrides below
      because a fixed-size array can't grow."
-    Collection class >> withAll: aCollection [
+    Collection class >> withAll: aCollection <Collection> ^ <Self> [
         ^self new addAll: aCollection; yourself
     ]
 ]
 
 ArrayedCollection subclass: Array [
-    Array class >> withAll: aCollection [
+    Array class >> withAll: aCollection <Collection> ^ <Array> [
         | arr i |
         arr := self new: aCollection size.
         i := 0.
@@ -78,16 +78,16 @@ ArrayedCollection subclass: Array [
 Collection subclass: SequenceableCollection [
     "Prefix / suffix slices (copyFrom:to: clamps an empty range to an empty
      result, so the edge cases fall out for free)."
-    first: n [ ^self copyFrom: 1 to: n ]
-    last: n [ ^self copyFrom: self size - n + 1 to: self size ]
-    allButFirst [ ^self copyFrom: 2 to: self size ]
-    allButFirst: n [ ^self copyFrom: n + 1 to: self size ]
-    allButLast [ ^self copyFrom: 1 to: self size - 1 ]
-    allButLast: n [ ^self copyFrom: 1 to: self size - n ]
+    first: n <Integer> ^ <SequenceableCollection> [ ^self copyFrom: 1 to: n ]
+    last: n <Integer> ^ <SequenceableCollection> [ ^self copyFrom: self size - n + 1 to: self size ]
+    allButFirst ^ <SequenceableCollection> [ ^self copyFrom: 2 to: self size ]
+    allButFirst: n <Integer> ^ <SequenceableCollection> [ ^self copyFrom: n + 1 to: self size ]
+    allButLast ^ <SequenceableCollection> [ ^self copyFrom: 1 to: self size - 1 ]
+    allButLast: n <Integer> ^ <SequenceableCollection> [ ^self copyFrom: 1 to: self size - n ]
 
-    second [ ^self at: 2 ]
-    third [ ^self at: 3 ]
-    fourth [ ^self at: 4 ]
+    second ^ <Object> [ ^self at: 2 ]
+    third ^ <Object> [ ^self at: 3 ]
+    fourth ^ <Object> [ ^self at: 4 ]
 
     "NOTE: no `copy` here. It used to be `^self copyFrom: 1 to: self size`,
      which worked for Array/String but DNU'd on OrderedCollection (whose
@@ -95,19 +95,19 @@ Collection subclass: SequenceableCollection [
      immutable'). world/59 supplies the real one — Object>>copy =
      shallowCopy + postCopy, on the shallowCopy primitive — which covers
      every sequence correctly, including those two."
-    reverse [ ^self reversed ]
+    reverse ^ <SequenceableCollection> [ ^self reversed ]
 
     "Non-destructive sorts return a fresh Array; sort/sort: order the
      receiver IN PLACE (via at:put:) and answer it."
-    sorted [ ^self asSortedCollection asArray ]
-    sorted: aSortBlock [ ^(self asSortedCollection: aSortBlock) asArray ]
-    sort [
+    sorted ^ <Array> [ ^self asSortedCollection asArray ]
+    sorted: aSortBlock <[Object,Object,^Boolean]> ^ <Array> [ ^(self asSortedCollection: aSortBlock) asArray ]
+    sort ^ <Self> [
         | ordered |
         ordered := self sorted.
         1 to: self size do: [:i | self at: i put: (ordered at: i) ].
         ^self
     ]
-    sort: aSortBlock [
+    sort: aSortBlock <[Object,Object,^Boolean]> ^ <Self> [
         | ordered |
         ordered := self sorted: aSortBlock.
         1 to: self size do: [:i | self at: i put: (ordered at: i) ].

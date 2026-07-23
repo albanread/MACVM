@@ -14,50 +14,50 @@
  can answer directly."
 
 Object subclass: Collection [
-    do: aBlock [
+    do: aBlock <[Object]> [
         self subclassResponsibility
     ]
-    isEmpty [
+    isEmpty ^ <Boolean> [
         ^self size = 0
     ]
-    notEmpty [
+    notEmpty ^ <Boolean> [
         ^self isEmpty not
     ]
-    size [
+    size ^ <Integer> [
         | n |
         n := 0.
         self do: [:each | n := n + 1 ].
         ^n
     ]
-    includes: anObject [
+    includes: anObject <Object> ^ <Boolean> [
         self do: [:each | each = anObject ifTrue: [ ^true ] ].
         ^false
     ]
-    detect: aBlock [
+    detect: aBlock <[Object,^Boolean]> ^ <Object> [
         ^self detect: aBlock ifNone: [ self error: 'element not found' ]
     ]
-    detect: aBlock ifNone: exceptionBlock [
+    detect: aBlock <[Object,^Boolean]> ifNone: exceptionBlock <[]> ^ <Object> [
         self do: [:each | (aBlock value: each) ifTrue: [ ^each ] ].
         ^exceptionBlock value
     ]
-    inject: thisValue into: aBinaryBlock [
+    inject: thisValue <Object> into: aBinaryBlock <[Object,Object,^Object]> ^ <Object> [
         | result |
         result := thisValue.
         self do: [:each | result := aBinaryBlock value: result value: each ].
         ^result
     ]
-    do: aBlock separatedBy: sepBlock [
+    do: aBlock <[Object]> separatedBy: sepBlock <[]> [
         | first |
         first := true.
         self do: [:each |
             first ifTrue: [ first := false ] ifFalse: [ sepBlock value ].
             aBlock value: each ]
     ]
-    addAll: aCollection [
+    addAll: aCollection <Collection> ^ <Collection> [
         aCollection do: [:each | self add: each ].
         ^aCollection
     ]
-    asArray [
+    asArray ^ <Array> [
         | r i |
         r := Array new: self size.
         i := 1.
@@ -76,53 +76,53 @@ Object subclass: Collection [
  pairwise."
 
 Collection subclass: SequenceableCollection [
-    do: aBlock [
+    do: aBlock <[Object]> [
         1 to: self size do: [:i | aBlock value: (self at: i) ]
     ]
-    doWithIndex: aBlock [
+    doWithIndex: aBlock <[Object,Integer]> [
         | i |
         i := 1.
         self do: [:each | aBlock value: each value: i. i := i + 1 ]
     ]
-    keysAndValuesDo: aBlock [
+    keysAndValuesDo: aBlock <[Integer,Object]> [
         | i |
         i := 1.
         self do: [:each | aBlock value: i value: each. i := i + 1 ]
     ]
-    first [
+    first ^ <Object> [
         ^self at: 1
     ]
-    last [
+    last ^ <Object> [
         ^self at: self size
     ]
-    copyFrom: from to: to [
+    copyFrom: from <Integer> to: to <Integer> ^ <SequenceableCollection> [
         | r n |
         n := to - from + 1.
         r := self class new: n.
         1 to: n do: [:i | r at: i put: (self at: from + i - 1) ].
         ^r
     ]
-    reversed [
+    reversed ^ <SequenceableCollection> [
         | r n |
         n := self size.
         r := self class new: n.
         1 to: n do: [:i | r at: i put: (self at: n - i + 1) ].
         ^r
     ]
-    indexOf: anObject ifAbsent: absentBlock [
+    indexOf: anObject <Object> ifAbsent: absentBlock <[]> ^ <Integer> [
         1 to: self size do: [:i | (self at: i) = anObject ifTrue: [ ^i ] ].
         ^absentBlock value
     ]
-    indexOf: anObject [
+    indexOf: anObject <Object> ^ <Integer> [
         ^self indexOf: anObject ifAbsent: [ 0 ]
     ]
-    = other [
+    = other <Object> ^ <Boolean> [
         self class == other class ifFalse: [ ^false ].
         self size = other size ifFalse: [ ^false ].
         1 to: self size do: [:i | (self at: i) = (other at: i) ifFalse: [ ^false ] ].
         ^true
     ]
-    , other [
+    , other <SequenceableCollection> ^ <SequenceableCollection> [
         | r n |
         n := self size + other size.
         r := self class new: n.
@@ -140,20 +140,20 @@ Collection subclass: SequenceableCollection [
  is not known in advance."
 
 ArrayedCollection subclass: Array [
-    Array class >> with: a [
+    Array class >> with: a <Object> ^ <Array> [
         | r |
         r := self new: 1.
         r at: 1 put: a.
         ^r
     ]
-    Array class >> with: a with: b [
+    Array class >> with: a <Object> with: b <Object> ^ <Array> [
         | r |
         r := self new: 2.
         r at: 1 put: a.
         r at: 2 put: b.
         ^r
     ]
-    Array class >> with: a with: b with: c [
+    Array class >> with: a <Object> with: b <Object> with: c <Object> ^ <Array> [
         | r |
         r := self new: 3.
         r at: 1 put: a.
@@ -161,7 +161,7 @@ ArrayedCollection subclass: Array [
         r at: 3 put: c.
         ^r
     ]
-    Array class >> with: a with: b with: c with: d [
+    Array class >> with: a <Object> with: b <Object> with: c <Object> with: d <Object> ^ <Array> [
         | r |
         r := self new: 4.
         r at: 1 put: a.
@@ -170,7 +170,7 @@ ArrayedCollection subclass: Array [
         r at: 4 put: d.
         ^r
     ]
-    Array class >> with: a with: b with: c with: d with: e [
+    Array class >> with: a <Object> with: b <Object> with: c <Object> with: d <Object> with: e <Object> ^ <Array> [
         | r |
         r := self new: 5.
         r at: 1 put: a.
@@ -180,27 +180,27 @@ ArrayedCollection subclass: Array [
         r at: 5 put: e.
         ^r
     ]
-    at: i [
+    at: i <Integer> ^ <Object> [
         <primitive: 26>
     ]
-    at: i put: v [
+    at: i <Integer> put: v <Object> ^ <Object> [
         <primitive: 27>
     ]
-    size [
+    size ^ <Integer> [
         <primitive: 28>
     ]
-    at: i ifAbsent: absentBlock [
+    at: i <Integer> ifAbsent: absentBlock <[]> ^ <Object> [
         (i between: 1 and: self size) ifFalse: [ ^absentBlock value ].
         ^self at: i
     ]
     "Element-by-element (Arrays hold oops, so there's no byte-memcpy
      primitive); lets WriteStream-on-Array use the same bulk-copy protocol
      Strings do (18_writestream.mst's grow/nextPutAll:/contents)."
-    replaceFrom: from to: to with: src [
+    replaceFrom: from <Integer> to: to <Integer> with: src <SequenceableCollection> ^ <Self> [
         from to: to do: [:i | self at: i put: (src at: i - from + 1) ].
         ^self
     ]
-    collect: aBlock [
+    collect: aBlock <[Object,^Object]> ^ <Array> [
         | r |
         r := Array new: self size.
         1 to: self size do: [:i | r at: i put: (aBlock value: (self at: i)) ].

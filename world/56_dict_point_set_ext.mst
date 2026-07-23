@@ -5,25 +5,25 @@
 
 HashedCollection subclass: Dictionary [
     "Evaluate aBlock with the value at key if present; else answer nil."
-    at: key ifPresent: aBlock [
+    at: key <Object> ifPresent: aBlock <[Object]> ^ <Object> [
         ^(self includesKey: key)
             ifTrue: [ aBlock value: (self at: key) ]
             ifFalse: [ nil ]
     ]
-    at: key ifPresent: presentBlock ifAbsent: absentBlock [
+    at: key <Object> ifPresent: presentBlock <[Object]> ifAbsent: absentBlock <[]> ^ <Object> [
         ^(self includesKey: key)
             ifTrue: [ presentBlock value: (self at: key) ]
             ifFalse: [ absentBlock value ]
     ]
 
     "The first key mapping to aValue (=), or nil."
-    keyAtValue: aValue [
+    keyAtValue: aValue <Object> ^ <Object> [
         self keysDo: [:k | (self at: k) = aValue ifTrue: [ ^k ] ].
         ^nil
     ]
 
     "The key->value associations, as an Array."
-    associations [
+    associations ^ <Array> [
         | result |
         result := OrderedCollection new.
         self keysDo: [:k | result add: (k -> (self at: k)) ].
@@ -33,20 +33,25 @@ HashedCollection subclass: Dictionary [
 
 Object subclass: Point [
     "Euclidean distance to aPoint."
-    dist: aPoint [
+    dist: aPoint <Point> ^ <Double> [
         ^((self x - aPoint x) squared + (self y - aPoint y) squared) sqrt
     ]
-    dotProduct: aPoint [ ^(self x * aPoint x) + (self y * aPoint y) ]
+    dotProduct: aPoint <Point> ^ <Number> [ ^(self x * aPoint x) + (self y * aPoint y) ]
 ]
 
 HashedCollection subclass: Set [
     "Set algebra — all answer a fresh Set."
-    & aCollection [
+    & aCollection <Collection> ^ <Set> [
         | result |
         result := Set new.
         self do: [:e | (aCollection includes: e) ifTrue: [ result add: e ] ].
         ^result
     ]
+    "NOTE: `|` (union) carries NO annotations: its header would read
+     `| aCollection <Collection> ^ <Set> [`, which the class-body parser
+     cannot distinguish from an annotated instance-variable list until
+     too late. A v1 syntax limitation, documented rather than worked
+     around; the sig is the same as union:'s below."
     | aCollection [
         | result |
         result := Set new.
@@ -54,9 +59,9 @@ HashedCollection subclass: Set [
         result addAll: aCollection.
         ^result
     ]
-    intersection: aCollection [ ^self & aCollection ]
-    union: aCollection [ ^self | aCollection ]
-    difference: aCollection [
+    intersection: aCollection <Collection> ^ <Set> [ ^self & aCollection ]
+    union: aCollection <Collection> ^ <Set> [ ^self | aCollection ]
+    difference: aCollection <Collection> ^ <Set> [
         | result |
         result := Set new.
         self do: [:e | (aCollection includes: e) ifFalse: [ result add: e ] ].

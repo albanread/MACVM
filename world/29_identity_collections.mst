@@ -30,7 +30,7 @@
  distinct. My protocol is Dictionary's own: at:put:, at:ifAbsent:,
  includesKey:, keysAndValuesDo:, and the rest."
 Dictionary subclass: IdentityDictionary [
-    scanFor: key [
+    scanFor: key <Object> ^ <Integer> [
         | cap i probe |
         cap := keys size.
         i := (key identityHash bitAnd: cap - 1) + 1.
@@ -57,7 +57,7 @@ Dictionary subclass: IdentityDictionary [
  group of particular objects, such as those already visited during a
  traversal. My protocol is Set's own: add:, includes:, remove:, do:, size."
 Set subclass: IdentitySet [
-    scanFor: anObject [
+    scanFor: anObject <Object> ^ <Integer> [
         | cap i probe |
         cap := elements size.
         i := (anObject identityHash bitAnd: cap - 1) + 1.

@@ -15,22 +15,22 @@
  answers a Set of its elements via asSet, and I support set algebra with
  & (intersection), | (union), and difference:."
 HashedCollection subclass: Set [
-    | tally elements |
+    | tally <Integer> elements <Array> |
 
-    Set class >> new [
+    Set class >> new ^ <Set> [
         ^self basicNew init
     ]
-    init [
+    init ^ <Self> [
         tally := 0.
         elements := Array new: 8.
     ]
-    size [
+    size ^ <Integer> [
         ^tally
     ]
-    isEmpty [
+    isEmpty ^ <Boolean> [
         ^tally = 0
     ]
-    scanFor: anObject [
+    scanFor: anObject <Object> ^ <Integer> [
         | cap i probe |
         cap := elements size.
         i := (anObject hash bitAnd: cap - 1) + 1.
@@ -39,7 +39,7 @@ HashedCollection subclass: Set [
             (probe isNil or: [ probe = anObject ]) ifTrue: [ ^i ].
             i := i = cap ifTrue: [ 1 ] ifFalse: [ i + 1 ] ]
     ]
-    add: anObject [
+    add: anObject <Object> ^ <Object> [
         | i |
         anObject isNil ifTrue: [ ^self error: 'nil is not a valid element' ].
         i := self scanFor: anObject.
@@ -49,14 +49,14 @@ HashedCollection subclass: Set [
             self checkGrow ].
         ^anObject
     ]
-    includes: anObject [
+    includes: anObject <Object> ^ <Boolean> [
         ^(elements at: (self scanFor: anObject)) notNil
     ]
     "Remove anObject; evaluate aBlock if absent. Open-addressing deletion:
      nil the slot, then HEAL the following cluster (fixCollisionsFrom:) so no
      later element is stranded past the new gap — this keeps the class's
      no-tombstone invariant (scanFor: is unchanged)."
-    remove: anObject ifAbsent: aBlock [
+    remove: anObject <Object> ifAbsent: aBlock <[]> ^ <Object> [
         | i |
         i := self scanFor: anObject.
         (elements at: i) isNil ifTrue: [ ^aBlock value ].
@@ -65,17 +65,17 @@ HashedCollection subclass: Set [
         self fixCollisionsFrom: i.
         ^anObject
     ]
-    remove: anObject [
+    remove: anObject <Object> ^ <Object> [
         ^self remove: anObject ifAbsent: [ self error: 'object not found' ]
     ]
-    removeAll: aCollection [
+    removeAll: aCollection <Collection> ^ <Collection> [
         aCollection do: [:each | self remove: each ].
         ^aCollection
     ]
     "Re-probe every occupied slot from just after `index` up to the next nil,
      re-inserting each at its correct scanFor: position (which may move it up
      into the freed gap). The standard Squeak/Pharo heal after a deletion."
-    fixCollisionsFrom: index [
+    fixCollisionsFrom: index <Integer> [
         | cap i probe |
         cap := elements size.
         i := index.
@@ -90,7 +90,7 @@ HashedCollection subclass: Set [
         self do: [:each | each printOn: s. s nextPut: $  ].
         s nextPut: $)
     ]
-    do: aBlock [
+    do: aBlock <[Object]> [
         1 to: elements size do: [:i |
             (elements at: i) notNil ifTrue: [ aBlock value: (elements at: i) ] ]
     ]
@@ -114,7 +114,7 @@ HashedCollection subclass: Set [
 ]
 
 Object subclass: Collection [
-    asSet [
+    asSet ^ <Set> [
         | s |
         s := Set new.
         self do: [:each | s add: each ].

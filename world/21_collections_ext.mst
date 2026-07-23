@@ -10,22 +10,22 @@
  these for free unless it already has (and keeps) its own override."
 
 Object subclass: Collection [
-    select: aBlock [
+    select: aBlock <[Object,^Boolean]> ^ <OrderedCollection> [
         | r |
         r := OrderedCollection new.
         self do: [:each | (aBlock value: each) ifTrue: [ r add: each ] ].
         ^r
     ]
-    reject: aBlock [
+    reject: aBlock <[Object,^Boolean]> ^ <OrderedCollection> [
         ^self select: [:each | (aBlock value: each) not ]
     ]
-    collect: aBlock [
+    collect: aBlock <[Object,^Object]> ^ <OrderedCollection> [
         | r |
         r := OrderedCollection new.
         self do: [:each | r add: (aBlock value: each) ].
         ^r
     ]
-    occurrencesOf: anObject [
+    occurrencesOf: anObject <Object> ^ <Integer> [
         | c |
         c := 0.
         self do: [:each | each = anObject ifTrue: [ c := c + 1 ] ].

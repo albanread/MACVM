@@ -24,7 +24,7 @@
  asSet/readStream)."
 
 Object subclass: Magnitude [
-    Magnitude class >> defaultSort [
+    Magnitude class >> defaultSort ^ <[Object,Object,^Boolean]> [
         ^[:a :b | a <= b]
     ]
 ]
@@ -38,25 +38,25 @@ Object subclass: Magnitude [
  do not store with at:put: — it can silently break my ordering. addFirst:
  is redirected through add: for the same reason."
 OrderedCollection subclass: SortedCollection [
-    | sortBlock |
+    | sortBlock <[Object,Object,^Boolean]> |
 
-    SortedCollection class >> new [
+    SortedCollection class >> new ^ <SortedCollection> [
         ^self sortBlock: Magnitude defaultSort
     ]
-    SortedCollection class >> sortBlock: aBlock [
+    SortedCollection class >> sortBlock: aBlock <[Object,Object,^Boolean]> ^ <SortedCollection> [
         | s |
         s := self basicNew.
         s init.
         s setSortBlock: aBlock.
         ^s
     ]
-    setSortBlock: aBlock [
+    setSortBlock: aBlock <[Object,Object,^Boolean]> [
         sortBlock := aBlock.
     ]
-    sortBlock [
+    sortBlock ^ <[Object,Object,^Boolean]> [
         ^sortBlock
     ]
-    add: newObject [
+    add: newObject <Object> ^ <Object> [
         | i |
         self addLast: newObject.
         i := self size.
@@ -69,10 +69,10 @@ OrderedCollection subclass: SortedCollection [
                 i := i - 1 ].
         ^newObject
     ]
-    addFirst: v [
+    addFirst: v <Object> ^ <Object> [
         ^self add: v
     ]
-    isSorted [
+    isSorted ^ <Boolean> [
         2 to: self size do: [:i |
             (sortBlock value: (self at: i - 1) value: (self at: i)) ifFalse: [ ^false ] ].
         ^true
@@ -85,13 +85,13 @@ OrderedCollection subclass: SortedCollection [
 ]
 
 Object subclass: Collection [
-    asSortedCollection [
+    asSortedCollection ^ <SortedCollection> [
         | s |
         s := SortedCollection new.
         self do: [:each | s add: each ].
         ^s
     ]
-    asSortedCollection: aSortBlock [
+    asSortedCollection: aSortBlock <[Object,Object,^Boolean]> ^ <SortedCollection> [
         | s |
         s := SortedCollection sortBlock: aSortBlock.
         self do: [:each | s add: each ].

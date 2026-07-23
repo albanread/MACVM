@@ -12,53 +12,53 @@
  prefer to:do: and to:by:do:."
 
 SequenceableCollection subclass: Interval [
-    | start stop step |
+    | start <Number> stop <Number> step <Number> |
 
-    Interval class >> from: a to: b [
+    Interval class >> from: a <Number> to: b <Number> ^ <Interval> [
         ^self from: a to: b by: 1
     ]
-    Interval class >> from: a to: b by: s [
+    Interval class >> from: a <Number> to: b <Number> by: s <Number> ^ <Interval> [
         | r |
         r := self basicNew.
         r setStart: a stop: b step: s.
         ^r
     ]
-    setStart: a stop: b step: s [
+    setStart: a <Number> stop: b <Number> step: s <Number> [
         start := a.
         stop := b.
         step := s.
     ]
-    size [
+    size ^ <Integer> [
         step > 0
             ifTrue: [ ^((stop - start) // step) + 1 max: 0 ]
             ifFalse: [ ^((start - stop) // (0 - step)) + 1 max: 0 ]
     ]
-    isEmpty [
+    isEmpty ^ <Boolean> [
         ^self size = 0
     ]
-    at: i [
+    at: i <Integer> ^ <Number> [
         (i between: 1 and: self size) ifFalse: [ ^self error: 'index out of range' ].
         ^start + (i - 1 * step)
     ]
-    first [
+    first ^ <Number> [
         ^start
     ]
-    last [
+    last ^ <Number> [
         ^self at: self size
     ]
-    do: aBlock [
+    do: aBlock <[Number]> [
         | v i n |
         n := self size.
         v := start.
         i := 0.
         [ i < n ] whileTrue: [ aBlock value: v. v := v + step. i := i + 1 ]
     ]
-    includes: anObject [
+    includes: anObject <Object> ^ <Boolean> [
         step > 0
             ifTrue: [ ^(anObject >= start) and: [ (anObject <= stop) and: [ (anObject - start) \\ step = 0 ] ] ]
             ifFalse: [ ^(anObject <= start) and: [ (anObject >= stop) and: [ (anObject - start) \\ step = 0 ] ] ]
     ]
-    collect: aBlock [
+    collect: aBlock <[Number,^Object]> ^ <Array> [
         | r |
         r := Array new: self size.
         1 to: self size do: [:i | r at: i put: (aBlock value: (self at: i)) ].
@@ -67,10 +67,10 @@ SequenceableCollection subclass: Interval [
 ]
 
 Magnitude subclass: Number [
-    to: stop [
+    to: stop <Number> ^ <Interval> [
         ^Interval from: self to: stop
     ]
-    to: stop by: step [
+    to: stop <Number> by: step <Number> ^ <Interval> [
         ^Interval from: self to: stop by: step
     ]
 
@@ -78,7 +78,7 @@ Magnitude subclass: Number [
      1-step `to:do:`, this is NOT compiler-inlined, so without this method
      `1 to: 10 by: 2 do: [...]` doesNotUnderstand. Handles both directions:
      a negative step counts DOWN while i >= stop."
-    to: stop by: step do: aBlock [
+    to: stop <Number> by: step <Number> do: aBlock <[Number]> ^ <Self> [
         | i |
         i := self.
         step < 0

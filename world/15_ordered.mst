@@ -12,20 +12,20 @@
  Convert any collection to me with asOrderedCollection."
 
 SequenceableCollection subclass: OrderedCollection [
-    | array firstIndex lastIndex |
+    | array <Array> firstIndex <Integer> lastIndex <Integer> |
 
-    OrderedCollection class >> new [
+    OrderedCollection class >> new ^ <OrderedCollection> [
         ^self basicNew init
     ]
-    init [
+    init ^ <Self> [
         array := Array new: 8.
         firstIndex := 1.
         lastIndex := 0.
     ]
-    size [
+    size ^ <Integer> [
         ^lastIndex - firstIndex + 1
     ]
-    isEmpty [
+    isEmpty ^ <Boolean> [
         ^lastIndex < firstIndex
     ]
     "Preserves the current elements while doubling capacity, resetting to a
@@ -52,22 +52,22 @@ SequenceableCollection subclass: OrderedCollection [
         firstIndex := extra + 1.
         lastIndex := cap.
     ]
-    addLast: v [
+    addLast: v <Object> ^ <Object> [
         lastIndex = array size ifTrue: [ self makeRoomAtEnd ].
         lastIndex := lastIndex + 1.
         array at: lastIndex put: v.
         ^v
     ]
-    add: v [
+    add: v <Object> ^ <Object> [
         ^self addLast: v
     ]
-    addFirst: v [
+    addFirst: v <Object> ^ <Object> [
         firstIndex = 1 ifTrue: [ self makeRoomAtFront ].
         firstIndex := firstIndex - 1.
         array at: firstIndex put: v.
         ^v
     ]
-    removeFirst [
+    removeFirst ^ <Object> [
         | v |
         self isEmpty ifTrue: [ ^self error: 'collection is empty' ].
         v := array at: firstIndex.
@@ -75,7 +75,7 @@ SequenceableCollection subclass: OrderedCollection [
         firstIndex := firstIndex + 1.
         ^v
     ]
-    removeLast [
+    removeLast ^ <Object> [
         | v |
         self isEmpty ifTrue: [ ^self error: 'collection is empty' ].
         v := array at: lastIndex.
@@ -86,7 +86,7 @@ SequenceableCollection subclass: OrderedCollection [
     "Remove the element at logical index i (1-based), shifting the tail down
      one slot and niling the freed slot. The mutating core the remove:-family
      builds on (Strongtalk AddableSequenceableCollection>>removeAt:)."
-    removeAtIndex: i [
+    removeAtIndex: i <Integer> ^ <Object> [
         | v |
         (i between: 1 and: self size) ifFalse: [ ^self error: 'index out of range' ].
         v := self at: i.
@@ -98,21 +98,21 @@ SequenceableCollection subclass: OrderedCollection [
     ]
     "Remove the first element equal to oldObject; evaluate anExceptionBlock if
      none. Reuses the inherited indexOf:ifAbsent:."
-    remove: oldObject ifAbsent: anExceptionBlock [
+    remove: oldObject <Object> ifAbsent: anExceptionBlock <[]> ^ <Object> [
         | i |
         i := self indexOf: oldObject ifAbsent: [ ^anExceptionBlock value ].
         ^self removeAtIndex: i
     ]
-    remove: oldObject [
+    remove: oldObject <Object> ^ <Object> [
         ^self remove: oldObject ifAbsent: [ self error: 'object not found' ]
     ]
     "Remove one occurrence of each element of aCollection; answers it."
-    removeAll: aCollection [
+    removeAll: aCollection <Collection> ^ <Collection> [
         aCollection do: [:each | self remove: each ].
         ^aCollection
     ]
     "Remove every element for which aBlock answers true; answers self."
-    removeAllSuchThat: aBlock [
+    removeAllSuchThat: aBlock <[Object,^Boolean]> ^ <Self> [
         | keep |
         keep := OrderedCollection new.
         self do: [:each | (aBlock value: each) ifFalse: [ keep add: each ] ].
@@ -121,19 +121,19 @@ SequenceableCollection subclass: OrderedCollection [
         lastIndex := keep size.
         ^self
     ]
-    at: i [
+    at: i <Integer> ^ <Object> [
         (i between: 1 and: self size) ifFalse: [ ^self error: 'index out of range' ].
         ^array at: firstIndex + i - 1
     ]
-    at: i put: v [
+    at: i <Integer> put: v <Object> ^ <Object> [
         (i between: 1 and: self size) ifFalse: [ ^self error: 'index out of range' ].
         array at: firstIndex + i - 1 put: v.
         ^v
     ]
-    do: aBlock [
+    do: aBlock <[Object]> [
         firstIndex to: lastIndex do: [:i | aBlock value: (array at: i) ]
     ]
-    collect: aBlock [
+    collect: aBlock <[Object,^Object]> ^ <OrderedCollection> [
         | r |
         r := OrderedCollection new.
         self do: [:each | r add: (aBlock value: each) ].
@@ -142,7 +142,7 @@ SequenceableCollection subclass: OrderedCollection [
 ]
 
 Object subclass: Collection [
-    asOrderedCollection [
+    asOrderedCollection ^ <OrderedCollection> [
         | r |
         r := OrderedCollection new.
         self do: [:each | r add: each ].
