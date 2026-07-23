@@ -22,5 +22,6 @@ pub mod memory; // object memory, allocation, garbage collection
 pub mod oops; // object references, tagging, 2-word headers, classes
 pub mod runtime; // stacks, activation frames, method lookup, inline caches, primitives
 pub mod rusttcl; // live VM-introspection shell (disasm/methods/nmethods/ic/stats/trace), built on vendored rust-tcl
+pub mod types; // optional Strongtalk-style type checker (docs/typechecker_design.md) — advisory, off the run path; reachable ONLY from the `macvm typecheck` subcommand, never from interpreter/compiler/JIT/GC/world boot
 pub mod utils; // shared utilities
 pub mod vendor; // vendored third-party source (S9: JASM's wfasm AArch64 encoder; rust-tcl)

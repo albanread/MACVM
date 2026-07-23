@@ -52,6 +52,7 @@ fn main() {
         Some("debug") => cmd_run(&args[1..], true),
         Some("repl") => cmd_repl(&args[1..]),
         Some("rusttcl") => cmd_rusttcl(&args[1..]),
+        Some("typecheck") => cmd_typecheck(&args[1..]),
         _ => println!("MACVM — Self/Strongtalk-lineage research VM (arm64). Scaffold only."),
     }
 }
@@ -279,6 +280,126 @@ fn cmd_rusttcl(args: &[String]) {
         }
         None => macvm::rusttcl::run_repl(&mut ctx),
     }
+}
+
+/// `macvm typecheck --world <dir> [--class C] [--json] [--strict]`
+/// (`docs/typechecker_design.md` §5/§6, T1). No `VmState` at all — the
+/// checker parses the world with the ordinary frontend and never runs
+/// anything (`types::interface::build_world_model`). Advisory: exit code
+/// is 0 unless `--strict` is given AND at least one finding survived the
+/// `--class` filter (Strongtalk fidelity — checking never gates compiling
+/// or running, only this subcommand's own CI-consumer exit code).
+fn cmd_typecheck(args: &[String]) {
+    let mut world_dir = PathBuf::from("world");
+    let mut class_filter: Option<String> = None;
+    let mut json = false;
+    let mut strict = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--world" => {
+                i += 1;
+                let Some(v) = args.get(i) else {
+                    eprintln!("--world requires a directory argument");
+                    std::process::exit(2);
+                };
+                world_dir = PathBuf::from(v);
+            }
+            "--class" => {
+                i += 1;
+                let Some(v) = args.get(i) else {
+                    eprintln!("--class requires a class name argument");
+                    std::process::exit(2);
+                };
+                class_filter = Some(v.clone());
+            }
+            "--json" => json = true,
+            "--strict" => strict = true,
+            other => {
+                eprintln!("usage: macvm typecheck [--world <dir>] [--class C] [--json] [--strict]");
+                eprintln!("unrecognized argument: {other}");
+                std::process::exit(2);
+            }
+        }
+        i += 1;
+    }
+
+    let (model, mut errors) = match macvm::types::typecheck_world(&world_dir) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    };
+    if let Some(want) = &class_filter {
+        errors.retain(|e| type_error_class_name(e) == want.as_str());
+    }
+
+    if json {
+        print_typecheck_json(&errors);
+    } else {
+        println!(
+            "checked {} classes, {} finding(s){}",
+            model.classes.len(),
+            errors.len(),
+            class_filter
+                .as_ref()
+                .map(|c| format!(" (filtered to class {c})"))
+                .unwrap_or_default()
+        );
+        for e in &errors {
+            println!("  {e}");
+        }
+    }
+
+    if strict && !errors.is_empty() {
+        std::process::exit(1);
+    }
+}
+
+fn type_error_class_name(e: &macvm::types::TypeError) -> &str {
+    use macvm::types::check::TypeError as E;
+    match e {
+        E::MalformedTypeExpr { site, .. }
+        | E::UndeclaredTypeName { site, .. }
+        | E::GenericArityMismatch { site, .. } => &site.class_name,
+    }
+}
+
+/// Hand-rolled (no `serde_json` dependency for one report shape, matching
+/// `image_store::import::type_annotations_to_json`'s own precedent): each
+/// finding as `{"kind":..., "site":"...", "message":"..."}`.
+fn print_typecheck_json(errors: &[macvm::types::TypeError]) {
+    print!("[");
+    for (i, e) in errors.iter().enumerate() {
+        if i > 0 {
+            print!(",");
+        }
+        let kind = match e {
+            macvm::types::check::TypeError::MalformedTypeExpr { .. } => "MalformedTypeExpr",
+            macvm::types::check::TypeError::UndeclaredTypeName { .. } => "UndeclaredTypeName",
+            macvm::types::check::TypeError::GenericArityMismatch { .. } => "GenericArityMismatch",
+        };
+        print!(
+            "{{\"kind\":\"{kind}\",\"message\":{}}}",
+            json_string(&e.to_string())
+        );
+    }
+    println!("]");
+}
+
+fn json_string(s: &str) -> String {
+    let mut out = String::from("\"");
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 fn print_result(vm: &mut VmState, result: Oop) -> String {
