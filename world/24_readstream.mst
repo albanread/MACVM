@@ -19,58 +19,58 @@
  skipSeparators, upToEnd, position/position:, reset, and do: over the
  remaining elements."
 Object subclass: ReadStream [
-    | collection position |
+    | collection <SequenceableCollection> position <Integer> |
 
-    ReadStream class >> on: aCollection [
+    ReadStream class >> on: aCollection <SequenceableCollection> ^ <ReadStream> [
         | s |
         s := self basicNew.
         s setOn: aCollection.
         ^s
     ]
-    setOn: aCollection [
+    setOn: aCollection <SequenceableCollection> [
         collection := aCollection.
         position := 0.
     ]
-    atEnd [
+    atEnd ^ <Boolean> [
         ^position >= collection size
     ]
-    next [
+    next ^ <Object> [
         self atEnd ifTrue: [ ^self error: 'end of stream' ].
         position := position + 1.
         ^collection at: position
     ]
-    peek [
+    peek ^ <Object> [
         self atEnd ifTrue: [ ^nil ].
         ^collection at: position + 1
     ]
-    skip: n [
+    skip: n <Integer> [
         position := position + n.
     ]
     reset [
         position := 0.
     ]
-    position [
+    position ^ <Integer> [
         ^position
     ]
-    position: p [
+    position: p <Integer> [
         position := p.
     ]
-    size [
+    size ^ <Integer> [
         ^collection size
     ]
-    upToEnd [
+    upToEnd ^ <SequenceableCollection> [
         | r |
         r := collection copyFrom: position + 1 to: collection size.
         position := collection size.
         ^r
     ]
-    do: aBlock [
+    do: aBlock <[Object]> [
         [ self atEnd ] whileFalse: [ aBlock value: self next ]
     ]
 ]
 
 Object subclass: Collection [
-    readStream [
+    readStream ^ <ReadStream> [
         ^ReadStream on: self
     ]
 ]

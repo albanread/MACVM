@@ -24,44 +24,44 @@
  produce identical sequences, so runs are reproducible. The seed should
  lie between 1 and 2147483647."
 Object subclass: Random [
-    | seed |
+    | seed <Integer> |
 
-    Random class >> modulus [
+    Random class >> modulus ^ <Integer> [
         ^2147483647
     ]
-    Random class >> multiplier [
+    Random class >> multiplier ^ <Integer> [
         ^16807
     ]
-    Random class >> new [
+    Random class >> new ^ <Random> [
         ^self newWithSeed: 1
     ]
     "Strongtalk's own comment: seed should be between 1 and 2147483647.
      Not enforced here (no exceptions until W5) — an out-of-range seed
      just produces a non-conformant sequence, not a crash."
-    Random class >> newWithSeed: aSeed [
+    Random class >> newWithSeed: aSeed <Integer> ^ <Random> [
         ^self basicNew setSeed: aSeed
     ]
-    setSeed: aSeed [
+    setSeed: aSeed <Integer> [
         seed := aSeed.
     ]
-    seed [
+    seed ^ <Integer> [
         ^seed
     ]
     "Advances the generator and returns a Double in (0, 1)."
-    next [
+    next ^ <Double> [
         seed := (self class multiplier * seed) \\ self class modulus.
         ^seed asDouble / self class modulus asDouble
     ]
     "Like next, but does not advance the generator."
-    peek [
+    peek ^ <Double> [
         | candidate |
         candidate := (self class multiplier * seed) \\ self class modulus.
         ^candidate asDouble / self class modulus asDouble
     ]
-    nextInteger [
+    nextInteger ^ <Integer> [
         ^(SmallInteger maxVal asDouble * self next) truncated
     ]
-    peekInteger [
+    peekInteger ^ <Integer> [
         ^(SmallInteger maxVal asDouble * self peek) truncated
     ]
 ]

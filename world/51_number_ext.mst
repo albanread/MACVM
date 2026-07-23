@@ -11,11 +11,11 @@
 
 Magnitude subclass: Number [
     "1/self — a Fraction for integers, a Float for floats."
-    reciprocal [ ^1 / self ]
+    reciprocal ^ <Number> [ ^1 / self ]
 
     "Real square root, via the Double primitive. Negatives are refused
      (no complex numbers) rather than returning a NaN silently."
-    sqrt [
+    sqrt ^ <Double> [
         self < 0 ifTrue: [ ^self error: 'sqrt of a negative number' ].
         ^self asFloat sqrt
     ]
@@ -23,7 +23,7 @@ Magnitude subclass: Number [
     "self raised to an INTEGER power — fast exponentiation by squaring.
      A negative exponent yields the reciprocal; a non-integer exponent is
      refused (exp/ln are not available yet) rather than silently wrong."
-    raisedTo: aNumber [
+    raisedTo: aNumber <Integer> ^ <Number> [
         | result base n |
         aNumber isInteger ifFalse: [
             ^self error: 'raisedTo: only supports integer exponents' ].
@@ -39,14 +39,14 @@ Magnitude subclass: Number [
         ^result
     ]
 
-    ** aNumber [ ^self raisedTo: aNumber ]
+    ** aNumber <Integer> ^ <Number> [ ^self raisedTo: aNumber ]
 ]
 
 Number subclass: Integer [
     "An exact Integer as the nearest Float."
-    asFloat [ ^self * 1.0 ]
+    asFloat ^ <Double> [ ^self * 1.0 ]
 
-    factorial [
+    factorial ^ <Integer> [
         | result |
         self < 0 ifTrue: [ ^self error: 'factorial of a negative integer' ].
         result := 1.
@@ -55,17 +55,17 @@ Number subclass: Integer [
     ]
 
     "Least common multiple, always non-negative; 0 with either operand zero."
-    lcm: anInteger [
+    lcm: anInteger <Integer> ^ <Integer> [
         (self = 0 or: [ anInteger = 0 ]) ifTrue: [ ^0 ].
         ^(self abs // (self gcd: anInteger)) * anInteger abs
     ]
 
     "Truncated division and its remainder — round toward zero, UNLIKE
      // and \\ which floor. `rem:` carries the sign of the dividend."
-    quo: aNumber [ ^(self abs // aNumber abs) * (self sign * aNumber sign) ]
-    rem: aNumber [ ^self - ((self quo: aNumber) * aNumber) ]
+    quo: aNumber <Integer> ^ <Integer> [ ^(self abs // aNumber abs) * (self sign * aNumber sign) ]
+    rem: aNumber <Integer> ^ <Integer> [ ^self - ((self quo: aNumber) * aNumber) ]
 
-    isPrime [
+    isPrime ^ <Boolean> [
         | i |
         self < 2 ifTrue: [ ^false ].
         self = 2 ifTrue: [ ^true ].
@@ -79,11 +79,11 @@ Number subclass: Integer [
 ]
 
 Number subclass: Double [
-    asFloat [ ^self ]
-    asInteger [ ^self truncated ]
+    asFloat ^ <Double> [ ^self ]
+    asInteger ^ <Integer> [ ^self truncated ]
 ]
 
 Number subclass: Fraction [
-    asFloat [ ^self numerator asFloat / self denominator asFloat ]
-    asInteger [ ^self truncated ]
+    asFloat ^ <Double> [ ^self numerator asFloat / self denominator asFloat ]
+    asInteger ^ <Integer> [ ^self truncated ]
 ]

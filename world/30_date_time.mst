@@ -54,73 +54,73 @@
  constructs a Date from the clock — and no day arithmetic (addDays: and
  its kin are not implemented)."
 Object subclass: Date [
-    | dayOfMonth monthIndex year |
+    | dayOfMonth <Integer> monthIndex <Integer> year <Integer> |
 
-    Date class >> daysOfWeek [
+    Date class >> daysOfWeek ^ <Array> [
         ^#(#Monday #Tuesday #Wednesday #Thursday #Friday #Saturday #Sunday)
     ]
-    Date class >> monthsOfYear [
+    Date class >> monthsOfYear ^ <Array> [
         ^#(#January #February #March #April #May #June #July #August
            #September #October #November #December)
     ]
-    Date class >> dayOfWeek: dayName [
+    Date class >> dayOfWeek: dayName <Symbol> ^ <Integer> [
         ^self daysOfWeek indexOf: dayName ifAbsent: [ self error: 'invalid day name' ]
     ]
-    Date class >> indexOfMonth: aName [
+    Date class >> indexOfMonth: aName <Symbol> ^ <Integer> [
         ^self monthsOfYear indexOf: aName ifAbsent: [ self error: 'invalid month name' ]
     ]
-    Date class >> nameOfDay: dayIndex [
+    Date class >> nameOfDay: dayIndex <Integer> ^ <Symbol> [
         ^self daysOfWeek at: dayIndex
     ]
-    Date class >> nameOfMonth: index [
+    Date class >> nameOfMonth: index <Integer> ^ <Symbol> [
         ^self monthsOfYear at: index
     ]
-    Date class >> newDay: d monthIndex: m year: y [
+    Date class >> newDay: d <Integer> monthIndex: m <Integer> year: y <Integer> ^ <Date> [
         ^self basicNew setDay: d monthIndex: m year: y
     ]
-    Date class >> newDay: d month: m year: y [
+    Date class >> newDay: d <Integer> month: m <Symbol> year: y <Integer> ^ <Date> [
         ^self newDay: d monthIndex: (self indexOfMonth: m) year: y
     ]
-    setDay: d monthIndex: m year: y [
+    setDay: d <Integer> monthIndex: m <Integer> year: y <Integer> [
         dayOfMonth := d.
         monthIndex := m.
         year := y.
     ]
-    dayOfMonth [
+    dayOfMonth ^ <Integer> [
         ^dayOfMonth
     ]
-    monthIndex [
+    monthIndex ^ <Integer> [
         ^monthIndex
     ]
-    year [
+    year ^ <Integer> [
         ^year
     ]
-    month [
+    month ^ <Symbol> [
         ^Date monthsOfYear at: monthIndex
     ]
-    hash [
+    hash ^ <Integer> [
         | h |
         h := year.
         h := ((h bitShift: 4) bitXor: monthIndex) bitXor: h.
         h := ((h bitShift: 4) bitXor: dayOfMonth) bitXor: h.
         ^h
     ]
-    < other [
+    < other <Date> ^ <Boolean> [
         ^year < other year
             or: [ year = other year and: [
                 monthIndex < other monthIndex
                     or: [ monthIndex = other monthIndex and: [ dayOfMonth < other dayOfMonth ] ] ] ]
     ]
-    <= other [
+    <= other <Date> ^ <Boolean> [
         ^(other < self) not
     ]
-    > other [
+    > other <Date> ^ <Boolean> [
         ^other < self
     ]
-    >= other [
+    >= other <Date> ^ <Boolean> [
         ^(self < other) not
     ]
-    = other [
+    = other <Object> ^ <Boolean> [
         (other isKindOf: Date) ifFalse: [ ^false ].
         ^year = other year and: [ monthIndex = other monthIndex and: [ dayOfMonth = other dayOfMonth ] ]
     ]
@@ -143,10 +143,10 @@ Object subclass: Date [
  durations. There is no Time now — nothing constructs a Time from the
  current clock."
 Object subclass: Time [
-    | seconds |
+    | seconds <Integer> |
     <classVars: ClockBuffer>
 
-    Time class >> fromSeconds: s [
+    Time class >> fromSeconds: s <Integer> ^ <Time> [
         ^self basicNew initSeconds: s
     ]
 
@@ -169,13 +169,13 @@ Object subclass: Time [
      struct timeval: timeval's tv_usec is a 4-byte int, needing an accessor
      width Alien doesn't expose; timespec maps directly onto the existing
      signedLongAt: accessor with no width mismatch at all."
-    Time class >> ffiMmapAddr: a1 length: a2 prot: a3 flags: a4 fd: a5 offset: a6 [
+    Time class >> ffiMmapAddr: a1 <Integer> length: a2 <Integer> prot: a3 <Integer> flags: a4 <Integer> fd: a5 <Integer> offset: a6 <Integer> [
         <primitive: FFI function: #mmap ret: #g args: #(g g g g g g)>
     ]
-    Time class >> ffiClockGettime: clockId timespec: addr [
+    Time class >> ffiClockGettime: clockId <Integer> timespec: addr <Integer> [
         <primitive: FFI function: #clock_gettime ret: #g args: #(g g)>
     ]
-    Time class >> clockBufferAddress [
+    Time class >> clockBufferAddress ^ <Integer> [
         ClockBuffer isNil ifTrue: [
             "PROT_READ|PROT_WRITE=3, MAP_PRIVATE|MAP_ANON=4098 (0x1002) —
              real macOS/arm64 flag values, same as world/tests/
@@ -187,7 +187,7 @@ Object subclass: Time [
     "Milliseconds since the Unix epoch (CLOCK_REALTIME=0) — real wall-clock
      time, not elapsed-since-VM-start. Verified live: two calls a few
      milliseconds apart return distinct, correctly-ordered values."
-    Time class >> millisecondClockValue [
+    Time class >> millisecondClockValue ^ <Integer> [
         | addr ts sec nsec |
         addr := self clockBufferAddress.
         self ffiClockGettime: 0 timespec: addr.
@@ -201,53 +201,53 @@ Object subclass: Time [
      `millisecondClockValue` above (real epoch time, above) — a DURATION must
      never observe a wall-clock adjustment (NTP, DST) as elapsed time; the
      monotonic clock is the one BenchmarkDashboard already times runs with."
-    Time class >> millisecondsToRun: aBlock [
+    Time class >> millisecondsToRun: aBlock <[]> ^ <Integer> [
         | t0 |
         t0 := Smalltalk millisecondClock.
         aBlock value.
         ^Smalltalk millisecondClock - t0
     ]
-    initSeconds: s [
+    initSeconds: s <Integer> [
         seconds := s.
     ]
-    asSeconds [
+    asSeconds ^ <Integer> [
         ^seconds
     ]
-    hour [
+    hour ^ <Integer> [
         ^seconds // 3600
     ]
-    minute [
+    minute ^ <Integer> [
         ^(seconds \\ 3600) // 60
     ]
-    minutes [
+    minutes ^ <Integer> [
         ^seconds // 60
     ]
-    second [
+    second ^ <Integer> [
         ^seconds \\ 60
     ]
-    hash [
+    hash ^ <Integer> [
         ^seconds hash
     ]
-    < other [
+    < other <Time> ^ <Boolean> [
         ^seconds < other asSeconds
     ]
-    <= other [
+    <= other <Time> ^ <Boolean> [
         ^(other < self) not
     ]
-    > other [
+    > other <Time> ^ <Boolean> [
         ^other < self
     ]
-    >= other [
+    >= other <Time> ^ <Boolean> [
         ^(self < other) not
     ]
-    = other [
+    = other <Object> ^ <Boolean> [
         (other isKindOf: Time) ifFalse: [ ^false ].
         ^seconds = other asSeconds
     ]
-    addTime: amt [
+    addTime: amt <Time> ^ <Time> [
         ^Time fromSeconds: seconds + amt asSeconds
     ]
-    subtractTime: amt [
+    subtractTime: amt <Time> ^ <Time> [
         ^Time fromSeconds: seconds - amt asSeconds
     ]
     printOn: s [

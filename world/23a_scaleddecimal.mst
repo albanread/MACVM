@@ -16,7 +16,7 @@
  (same pre-existing property Fraction has vs Double)."
 
 nil subclass: Object [
-    isScaledDecimal [
+    isScaledDecimal ^ <Boolean> [
         ^false
     ]
 ]
@@ -25,13 +25,13 @@ nil subclass: Object [
  flow through every rational-arithmetic path (Fraction's and
  ScaledDecimal's) without a special case — Squeak defines exactly these."
 Number subclass: Integer [
-    numerator [ ^self ]
-    denominator [ ^1 ]
-    asFraction [ ^self ]
+    numerator ^ <Integer> [ ^self ]
+    denominator ^ <Integer> [ ^1 ]
+    asFraction ^ <Integer> [ ^self ]
 ]
 
 Number subclass: Fraction [
-    asFraction [ ^self ]
+    asFraction ^ <Fraction> [ ^self ]
 ]
 
 "I am an exact decimal number: a Fraction that remembers how many decimal
@@ -43,12 +43,12 @@ Number subclass: Fraction [
  with Integers, Fractions and other ScaledDecimals answers a ScaledDecimal
  carrying the larger scale; mixing with a Double answers a Double."
 Fraction subclass: ScaledDecimal [
-    | scale |
+    | scale <Integer> |
 
     "Reduce like Fraction but NEVER collapse to a plain Integer — 2.00s2
      must stay a ScaledDecimal (denominator 1 is legal here, unlike in
      Fraction proper, whose factory answers the Integer instead)."
-    ScaledDecimal class >> numerator: n denominator: d scale: s [
+    ScaledDecimal class >> numerator: n <Integer> denominator: d <Integer> scale: s <Integer> ^ <ScaledDecimal> [
         | g num den sign |
         d = 0 ifTrue: [ ^self error: 'division by zero' ].
         sign := d < 0 ifTrue: [ -1 ] ifFalse: [ 1 ].
@@ -59,23 +59,23 @@ Fraction subclass: ScaledDecimal [
         ^(self basicNew setNumerator: num // g denominator: den // g) setScale: s
     ]
     "Wrap any exact rational (Integer, Fraction, or ScaledDecimal)."
-    ScaledDecimal class >> fromRational: r scale: s [
+    ScaledDecimal class >> fromRational: r <Number> scale: s <Integer> ^ <ScaledDecimal> [
         ^self numerator: r numerator denominator: r denominator scale: s
     ]
 
-    setScale: s [ scale := s. ^self ]
-    scale [ ^scale ]
-    isScaledDecimal [ ^true ]
+    setScale: s <Integer> ^ <Self> [ scale := s. ^self ]
+    scale ^ <Integer> [ ^scale ]
+    isScaledDecimal ^ <Boolean> [ ^true ]
 
     "The plain (unscaled) exact value — a Fraction, or an Integer when the
      denominator is 1 (Fraction's factory collapses it)."
-    asFraction [
+    asFraction ^ <Fraction|Integer> [
         ^Fraction numerator: self numerator denominator: self denominator
     ]
 
     "The result scale: mine, or the larger of the two when the other side
      is scaled too — Squeak's rule."
-    scaleWith: aNumber [
+    scaleWith: aNumber <Number> ^ <Integer> [
         ^aNumber isScaledDecimal
             ifTrue: [ scale max: aNumber scale ]
             ifFalse: [ scale ]
@@ -86,34 +86,34 @@ Fraction subclass: ScaledDecimal [
      unscaled values (which handle Integer/Fraction/ScaledDecimal
      arguments uniformly — a ScaledDecimal IS a Fraction), then the
      result is re-wrapped at the combined scale."
-    + aNumber [
+    + aNumber <Number> ^ <Number> [
         aNumber isDouble ifTrue: [ ^self asDouble + aNumber ].
         ^ScaledDecimal fromRational: self asFraction + aNumber
             scale: (self scaleWith: aNumber)
     ]
-    - aNumber [
+    - aNumber <Number> ^ <Number> [
         aNumber isDouble ifTrue: [ ^self asDouble - aNumber ].
         ^ScaledDecimal fromRational: self asFraction - aNumber
             scale: (self scaleWith: aNumber)
     ]
-    * aNumber [
+    * aNumber <Number> ^ <Number> [
         aNumber isDouble ifTrue: [ ^self asDouble * aNumber ].
         ^ScaledDecimal fromRational: self asFraction * aNumber
             scale: (self scaleWith: aNumber)
     ]
-    / aNumber [
+    / aNumber <Number> ^ <Number> [
         aNumber isDouble ifTrue: [ ^self asDouble / aNumber ].
         ^ScaledDecimal fromRational: self asFraction / aNumber
             scale: (self scaleWith: aNumber)
     ]
-    negated [
+    negated ^ <ScaledDecimal> [
         ^ScaledDecimal numerator: self numerator negated
             denominator: self denominator scale: scale
     ]
-    abs [
+    abs ^ <ScaledDecimal> [
         ^self negative ifTrue: [ self negated ] ifFalse: [ self ]
     ]
-    reciprocal [
+    reciprocal ^ <ScaledDecimal> [
         ^ScaledDecimal numerator: self denominator
             denominator: self numerator scale: scale
     ]
@@ -123,12 +123,12 @@ Fraction subclass: ScaledDecimal [
      false against an Integer, because a proper Fraction is never whole).
      Comparison (<, <= ...) needs no override — Fraction's cross-multiply
      is value-exact for a denominator of 1 too."
-    = aNumber [
+    = aNumber <Object> ^ <Boolean> [
         aNumber isDouble ifTrue: [ ^self asDouble = aNumber ].
         aNumber isScaledDecimal ifTrue: [ ^self asFraction = aNumber asFraction ].
         ^self asFraction = aNumber
     ]
-    hash [
+    hash ^ <Integer> [
         ^self asFraction hash
     ]
 
@@ -159,8 +159,8 @@ Fraction subclass: ScaledDecimal [
  the exact tower only — a Double's bits are not a decimal the user wrote,
  so guessing a rational for one is a trap Squeak also declines."
 Number subclass: Integer [
-    asScaledDecimal: s [ ^ScaledDecimal fromRational: self scale: s ]
+    asScaledDecimal: s <Integer> ^ <ScaledDecimal> [ ^ScaledDecimal fromRational: self scale: s ]
 ]
 Number subclass: Fraction [
-    asScaledDecimal: s [ ^ScaledDecimal fromRational: self scale: s ]
+    asScaledDecimal: s <Integer> ^ <ScaledDecimal> [ ^ScaledDecimal fromRational: self scale: s ]
 ]

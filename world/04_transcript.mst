@@ -12,13 +12,13 @@
  flush."
 
 Object subclass: TranscriptStream [
-    basicPrint: aString [
+    basicPrint: aString <String> [
         <primitive: 91>
     ]
-    show: aString [
+    show: aString <String> [
         self basicPrint: aString
     ]
-    showCr: aString [
+    showCr: aString <String> [
         self show: aString.
         self cr
     ]

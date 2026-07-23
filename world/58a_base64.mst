@@ -18,12 +18,12 @@
  over channels that accept only Strings; decoding happens on the receiving
  side."
 Object subclass: Base64 [
-    Base64 class >> alphabet [
+    Base64 class >> alphabet ^ <String> [
         ^'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
     ]
     "Standard RFC 4648 encode with '=' padding. aByteArray may be any
      indexable byte collection (ByteArray, or a String read as bytes)."
-    Base64 class >> encode: bytes [
+    Base64 class >> encode: bytes <SequenceableCollection> ^ <String> [
         | alpha out n i b0 b1 b2 tail |
         alpha := self alphabet.
         out := WriteStream on: String new.

@@ -21,10 +21,10 @@
  max and min raise an error on an empty array."
 ArrayedCollection subclass: FloatArray [
     "N zeroed f64 lanes."
-    FloatArray class >> new: n [ <primitive: 141> ]
+    FloatArray class >> new: n <Integer> ^ <FloatArray> [ <primitive: 141> ]
 
     "Build from any indexable of Numbers (Array, Interval, ...)."
-    FloatArray class >> from: aCollection [
+    FloatArray class >> from: aCollection <Collection> ^ <FloatArray> [
         | fa i |
         fa := self new: aCollection size.
         i := 1.
@@ -33,39 +33,39 @@ ArrayedCollection subclass: FloatArray [
     ]
 
     "Lane access, 1-based (Smalltalk convention): answers/takes a Double."
-    at: i [ <primitive: 142> ]
-    at: i put: aDouble [ <primitive: 143> ]
-    size [ <primitive: 144> ]
+    at: i <Integer> ^ <Double> [ <primitive: 142> ]
+    at: i <Integer> put: aDouble <Number> [ <primitive: 143> ]
+    size ^ <Integer> [ <primitive: 144> ]
 
     "Elementwise sum of two equal-length arrays -> a new FloatArray. Per-lane
      bit-identical to a scalar Double add."
-    +@ other [ <primitive: 145> ]
+    +@ other <FloatArray> ^ <FloatArray> [ <primitive: 145> ]
 
     "Elementwise multiply by a scalar -> a new FloatArray (per-lane exact)."
-    scale: aNumber [ <primitive: 154> ]
+    scale: aNumber <Number> ^ <FloatArray> [ <primitive: 154> ]
 
     "Fast NEON reductions (docs/SIMD.md Part D): a DEFINED pairwise order, not
      the scalar left-fold."
-    sum [ <primitive: 146> ]
-    dot: other [ <primitive: 147> ]
+    sum ^ <Double> [ <primitive: 146> ]
+    dot: other <FloatArray> ^ <Double> [ <primitive: 147> ]
 
     "Largest / smallest lane (fmax/fmin reductions — order-independent, so
      bit-exact). An empty array has no max/min: the primitive fails and we
      raise a readable error rather than return a garbage lane."
     max [ <primitive: 155> self isEmpty ifTrue: [ ^self error: 'max of empty FloatArray' ] ]
     min [ <primitive: 156> self isEmpty ifTrue: [ ^self error: 'min of empty FloatArray' ] ]
-    isEmpty [ ^self size = 0 ]
+    isEmpty ^ <Boolean> [ ^self size = 0 ]
 
     "The exact scalar left-to-right fold, for code that needs bit-parity with a
      hand-written `inject:into:` loop (differs from `sum` in the low bits)."
-    sequentialSum [
+    sequentialSum ^ <Double> [
         | s |
         s := 0.0.
         1 to: self size do: [ :i | s := s + (self at: i) ].
         ^s
     ]
 
-    do: aBlock [ 1 to: self size do: [ :i | aBlock value: (self at: i) ] ]
+    do: aBlock <[Double]> [ 1 to: self size do: [ :i | aBlock value: (self at: i) ] ]
 
     printOn: aStream [
         aStream nextPutAll: 'FloatArray('.
@@ -74,7 +74,7 @@ ArrayedCollection subclass: FloatArray [
             aStream nextPutAll: (self at: i) printString ].
         aStream nextPutAll: ')'
     ]
-    printString [
+    printString ^ <String> [
         | s |
         s := WriteStream on: String new.
         self printOn: s.

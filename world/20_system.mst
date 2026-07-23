@@ -15,10 +15,10 @@
  all backed by VM primitives; startUp is a boot hook that currently does
  nothing."
 Object subclass: SystemDictionary [
-    startUp [
+    startUp ^ <Self> [
         ^self
     ]
-    quit: code [
+    quit: code <Integer> [
         <primitive: 96>
     ]
     quit [
@@ -30,13 +30,13 @@ Object subclass: SystemDictionary [
     gcFull [
         <primitive: 94>
     ]
-    gcStats [
+    gcStats ^ <Array> [
         <primitive: 97>
     ]
-    millisecondClock [
+    millisecondClock ^ <Integer> [
         <primitive: 92>
     ]
-    microsecondClock [
+    microsecondClock ^ <Integer> [
         "Monotonic elapsed-since-VM-start clock in microseconds (same source
          as millisecondClock, without its .as_millis truncation) — the
          Cog-comparison harness needs microsecond resolution on the sub-ms

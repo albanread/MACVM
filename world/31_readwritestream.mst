@@ -31,44 +31,44 @@
  written so far; contentsWritten answers what the cursor has passed, and
  contentsRemaining what still lies ahead of it."
 Object subclass: ReadWriteStream [
-    | collection position size |
+    | collection <SequenceableCollection> position <Integer> size <Integer> |
 
-    ReadWriteStream class >> on: aCollection [
+    ReadWriteStream class >> on: aCollection <SequenceableCollection> ^ <ReadWriteStream> [
         | s |
         s := self basicNew.
         s setOn: aCollection.
         ^s
     ]
-    ReadWriteStream class >> on: aCollection numElements: n [
+    ReadWriteStream class >> on: aCollection <SequenceableCollection> numElements: n <Integer> ^ <ReadWriteStream> [
         | s |
         s := self on: aCollection.
         s setSize: n.
         ^s
     ]
-    setOn: aCollection [
+    setOn: aCollection <SequenceableCollection> [
         collection := aCollection.
         position := 0.
         size := 0.
     ]
-    setSize: n [
+    setSize: n <Integer> [
         size := n.
     ]
-    size [
+    size ^ <Integer> [
         ^size
     ]
-    position [
+    position ^ <Integer> [
         ^position
     ]
-    position: p [
+    position: p <Integer> [
         position := p.
     ]
     reset [
         position := 0.
     ]
-    skip: n [
+    skip: n <Integer> [
         position := position + n.
     ]
-    atEnd [
+    atEnd ^ <Boolean> [
         ^position >= size
     ]
     grow [
@@ -78,49 +78,49 @@ Object subclass: ReadWriteStream [
         1 to: size do: [:i | newColl at: i put: (collection at: i) ].
         collection := newColl.
     ]
-    nextPut: e [
+    nextPut: e <Object> ^ <Object> [
         position = collection size ifTrue: [ self grow ].
         position := position + 1.
         collection at: position put: e.
         position > size ifTrue: [ size := position ].
         ^e
     ]
-    nextPutAll: aColl [
+    nextPutAll: aColl <SequenceableCollection> ^ <SequenceableCollection> [
         aColl do: [:e | self nextPut: e ].
         ^aColl
     ]
-    next [
+    next ^ <Object> [
         self atEnd ifTrue: [ ^self error: 'end of stream' ].
         position := position + 1.
         ^collection at: position
     ]
-    peek [
+    peek ^ <Object> [
         self atEnd ifTrue: [ ^nil ].
         ^collection at: position + 1
     ]
-    upToEnd [
+    upToEnd ^ <SequenceableCollection> [
         | r |
         r := collection copyFrom: position + 1 to: size.
         position := size.
         ^r
     ]
-    do: aBlock [
+    do: aBlock <[Object]> [
         [ self atEnd ] whileFalse: [ aBlock value: self next ]
     ]
     "WriteStream compatibility: the elements written so far, ignoring
      wherever the cursor currently sits (unlike contentsWritten below)."
-    contents [
+    contents ^ <SequenceableCollection> [
         ^collection copyFrom: 1 to: size
     ]
     "Everything the cursor has already passed, read or written."
-    contentsWritten [
+    contentsWritten ^ <SequenceableCollection> [
         ^collection copyFrom: 1 to: position
     ]
     "Everything still ahead of the cursor."
-    contentsRemaining [
+    contentsRemaining ^ <SequenceableCollection> [
         ^collection copyFrom: position + 1 to: size
     ]
-    << anObject [
+    << anObject <Object> ^ <Self> [
         anObject isString ifTrue: [ self nextPutAll: anObject. ^self ].
         anObject isCharacter ifTrue: [ self nextPut: anObject. ^self ].
         self nextPutAll: anObject printString.

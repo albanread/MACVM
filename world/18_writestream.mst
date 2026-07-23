@@ -14,15 +14,15 @@
  strings stays cheap. String streamContents: is a convenient way to build
  a string through me."
 Object subclass: WriteStream [
-    | collection position |
+    | collection <SequenceableCollection> position <Integer> |
 
-    WriteStream class >> on: aCollection [
+    WriteStream class >> on: aCollection <SequenceableCollection> ^ <WriteStream> [
         | s |
         s := self basicNew.
         s setOn: aCollection.
         ^s
     ]
-    setOn: aCollection [
+    setOn: aCollection <SequenceableCollection> [
         collection := aCollection.
         position := 0.
     ]
@@ -33,7 +33,7 @@ Object subclass: WriteStream [
      prefix with the bulk `replaceFrom:to:with:` primitive (a memcpy for
      byte collections) rather than element-by-element — the char-by-char
      copy here was a big part of why building large strings was slow."
-    growTo: minSize [
+    growTo: minSize <Integer> [
         | newSize newColl |
         newSize := collection size max: 4.
         [ newSize < minSize ] whileTrue: [ newSize := newSize * 2 ].
@@ -41,7 +41,7 @@ Object subclass: WriteStream [
         position > 0 ifTrue: [ newColl replaceFrom: 1 to: position with: collection ].
         collection := newColl.
     ]
-    nextPut: e [
+    nextPut: e <Object> ^ <Object> [
         position = collection size ifTrue: [ self grow ].
         position := position + 1.
         collection at: position put: e.
@@ -49,7 +49,7 @@ Object subclass: WriteStream [
     ]
     "Bulk append via one `replaceFrom:to:with:` (a memcpy for byte
      collections) instead of a per-element `nextPut:` loop."
-    nextPutAll: aColl [
+    nextPutAll: aColl <SequenceableCollection> ^ <SequenceableCollection> [
         | n |
         n := aColl size.
         n = 0 ifTrue: [ ^aColl ].
@@ -58,13 +58,13 @@ Object subclass: WriteStream [
         position := position + n.
         ^aColl
     ]
-    contents [
+    contents ^ <SequenceableCollection> [
         | r |
         r := collection class new: position.
         position > 0 ifTrue: [ r replaceFrom: 1 to: position with: collection ].
         ^r
     ]
-    << anObject [
+    << anObject <Object> ^ <Self> [
         anObject isString ifTrue: [ self nextPutAll: anObject. ^self ].
         anObject isCharacter ifTrue: [ self nextPut: anObject. ^self ].
         self nextPutAll: anObject printString.
