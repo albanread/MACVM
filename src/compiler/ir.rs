@@ -7232,8 +7232,27 @@ pub(crate) fn copy_propagate(m: &mut IrMethod) {
     //    fail-block references and nothing ever deletes. ──────────────────
     let mut rewrites = vec![0u32; n];
     let mut fail_rewrites: Vec<(BlockId, HashMap<u32, VReg>)> = Vec::new();
-    for b in &mut m.blocks {
+    // L1 (docs/range_analysis_design.md's sibling — load forwarding, dart124
+    // item 7): redundant `LoadField`/`GuardKlass` positions to delete in
+    // phase C. A redundant load is aliased through the SAME `alias` map (so
+    // uses + deopt metadata + fail-edge rewrites are shared with copy-prop
+    // — correct by construction); a redundant guard has no dst, so it is
+    // just marked for deletion. Klass identity read from a pre-loop pool
+    // snapshot (can't borrow `m.pool` while `m.blocks` is borrowed mut).
+    let pool_vals: Vec<u64> = m.pool.iter().map(|e| e.value).collect();
+    let mut load_deletes: std::collections::HashSet<(usize, usize)> =
+        std::collections::HashSet::new();
+    let mut guard_deletes: std::collections::HashSet<(usize, usize)> =
+        std::collections::HashSet::new();
+    for (bi, b) in m.blocks.iter_mut().enumerate() {
         let mut alias: HashMap<u32, VReg> = HashMap::new();
+        // (canonical obj, byte_off) -> canonical dst of an AVAILABLE field
+        // value; the same klass-guarded obj -> its proven klass raw. Guards
+        // never die on a call (no `become:`: a live object's klass is fixed
+        // for life — [[reference_no_become_static_shape]]); loads die on any
+        // store to the same offset (aliasing across obj vregs) or any call.
+        let mut avail: HashMap<(u32, i32), u32> = HashMap::new();
+        let mut guarded: HashMap<u32, u64> = HashMap::new();
         let mut deopt_iter = b.deopt_sites.iter_mut().peekable();
         for (i, op) in b.code.iter_mut().enumerate() {
             while let Some((ci, _)) = deopt_iter.peek() {
@@ -7268,20 +7287,75 @@ pub(crate) fn copy_propagate(m: &mut IrMethod) {
                 }
                 r
             });
+            // L1 kill: a store to offset `o` may alias ANY obj vreg's slot at
+            // that offset; a call may store arbitrary fields. Guards never
+            // die on a call (klass is immutable for an object's lifetime).
+            match &*op {
+                Ir::StoreField { byte_off, .. } => {
+                    let o = *byte_off;
+                    avail.retain(|&(_, off), _| off != o);
+                }
+                Ir::CallSend { .. } | Ir::CallRuntime { .. } => avail.clear(),
+                _ => {}
+            }
             let mut defined: Option<VReg> = None;
             op.defs(|v| defined = Some(v));
             if let Some(d) = defined {
                 alias.retain(|&k, &mut s| k != d.0 && s != d);
+                // A redefined vreg invalidates any load keyed on it OR cached
+                // in it, and any guard proving its klass.
+                avail.retain(|&(ob, _), &mut v| ob != d.0 && v != d.0);
+                guarded.remove(&d.0);
             }
-            if let Ir::Move { dst, src } = *op {
-                if def_count[dst.0 as usize] == 1 {
+            // L1 record (obj operands now canonical via map_uses; done AFTER
+            // the kill so this op's own def doesn't wipe what it establishes).
+            match *op {
+                Ir::LoadField { dst, obj, byte_off } if def_count[dst.0 as usize] == 1 => {
+                    if let Some(&prev) = avail.get(&(obj.0, byte_off)) {
+                        // Redundant: forward through the alias map (uses +
+                        // deopt + fail-edges rewrite exactly as for a Move).
+                        let r = resolve(&alias, VReg(prev));
+                        alias.insert(dst.0, r);
+                        load_deletes.insert((bi, i));
+                    } else {
+                        avail.insert((obj.0, byte_off), dst.0);
+                    }
+                }
+                Ir::GuardKlass {
+                    obj,
+                    expect,
+                    kind: GuardShape::KlassTest,
+                    ..
+                } => {
+                    let kv = pool_vals[expect.0 as usize];
+                    if guarded.get(&obj.0) == Some(&kv) {
+                        guard_deletes.insert((bi, i)); // already proven this klass
+                    } else {
+                        guarded.insert(obj.0, kv);
+                    }
+                }
+                Ir::Move { dst, src } if def_count[dst.0 as usize] == 1 => {
                     let r = resolve(&alias, src);
                     alias.insert(dst.0, r);
                 }
+                _ => {}
             }
         }
     }
 
+    // L1 census (behavior-free): how often does intra-block forwarding fire?
+    {
+        static LOG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if (!load_deletes.is_empty() || !guard_deletes.is_empty())
+            && *LOG.get_or_init(|| std::env::var_os("MACVM_LOAD_COUNT").is_some())
+        {
+            eprintln!(
+                "load-forward: {} loads + {} guards",
+                load_deletes.len(),
+                guard_deletes.len()
+            );
+        }
+    }
     // ── Phase B: fail-edge blocks' metadata, with the recorded alias state
     //    of the op that owns the edge (their reexecute stacks were captured
     //    at exactly that point). ────────────────────────────────────────────
@@ -7294,7 +7368,7 @@ pub(crate) fn copy_propagate(m: &mut IrMethod) {
     }
 
     // ── Phase C: delete fully-propagated copies, re-keying deopt indices. ──
-    for b in &mut m.blocks {
+    for (bi, b) in m.blocks.iter_mut().enumerate() {
         let mut removed_before = vec![0u32; b.code.len() + 1];
         let mut removed = 0u32;
         let mut keep: Vec<bool> = Vec::with_capacity(b.code.len());
@@ -7306,6 +7380,15 @@ pub(crate) fn copy_propagate(m: &mut IrMethod) {
                         && use_count[dst.0 as usize] > 0
                         && rewrites[dst.0 as usize] == use_count[dst.0 as usize]
                 }
+                // L1: a forwarded load — deletable only if EVERY use was
+                // rewritten (a cross-block use the per-block window missed
+                // leaves rewrites < use_count and keeps the load, same
+                // conservative rule as a Move).
+                Ir::LoadField { dst, .. } if load_deletes.contains(&(bi, i)) => {
+                    rewrites[dst.0 as usize] == use_count[dst.0 as usize]
+                }
+                // L1: a redundant guard — a pure, provably-passing check.
+                Ir::GuardKlass { .. } if guard_deletes.contains(&(bi, i)) => true,
                 _ => false,
             };
             keep.push(!deletable);
