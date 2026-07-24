@@ -1114,6 +1114,111 @@ fn array_op_kind_on(vm: &VmState, method: MethodOop, ic_idx: u16) -> Option<bool
     }
 }
 
+/// CHA (dart124 item 4): how many klasses define `selector` LOCALLY (in
+/// their own method dictionary, not inherited)? Enumerates the global
+/// namespace exactly as `prim_all_classes` does. A count of 1 means the
+/// selector has a SINGLE global implementor — so in untyped Smalltalk EVERY
+/// receiver resolves it to that one method, and an exact-klass mono guard
+/// over it is provably always-true and droppable (register a CHA subtree
+/// dep so an added override re-guards). O(klasses) — a compile-time scan,
+/// cheap vs execution; the census reads it, the real elision would cache.
+fn cha_implementor_count(vm: &VmState, selector: SymbolOop) -> usize {
+    let Some(ns) = crate::oops::wrappers::ArrayOop::try_from(vm.universe.smalltalk) else {
+        return usize::MAX; // can't prove single — be conservative
+    };
+    let tally = crate::oops::smi::SmallInt::try_from(ns.at(0))
+        .map(|s| s.value() as usize)
+        .unwrap_or(0);
+    let mut count = 0usize;
+    for i in 0..tally {
+        let Some(assoc) = crate::oops::wrappers::MemOop::try_from(ns.at(1 + i)) else {
+            continue;
+        };
+        let Some(k) = KlassOop::try_from(assoc.body_oop(1)) else {
+            continue;
+        };
+        if let Some(dict) = crate::oops::method_dict::MethodDictOop::try_from(k.methods()) {
+            if dict.probe(vm, selector).is_some() {
+                count += 1;
+                if count > 1 {
+                    return count; // early out — not single
+                }
+            }
+        }
+    }
+    count
+}
+
+/// Allocation-provenance guard-elision census (the sound cousin of CHA): a
+/// `GuardKlass(obj, K)` whose `obj` traces (through single-def Moves) to an
+/// `Ir::Alloc` of klass K is REDUNDANT — the alloc result is exactly klass K
+/// (no become:, klass fixed for life), so it always understands the selector
+/// and resolves correctly. Dropping it is sound (no DNU→UB, unlike CHA).
+/// Returns `(eligible, same_block, total_klasstest_guards)`.
+fn alloc_guard_census(irm: &IrMethod) -> (u64, u64, u64) {
+    use std::collections::HashMap;
+    let mut def_count: HashMap<u32, u32> = HashMap::new();
+    for b in &irm.blocks {
+        for op in &b.code {
+            op.defs(|v| *def_count.entry(v.0).or_insert(0) += 1);
+        }
+    }
+    // alloc dst -> klass pool value; move dst -> (src, block).
+    let mut alloc_of: HashMap<u32, u64> = HashMap::new();
+    let mut move_src: HashMap<u32, u32> = HashMap::new();
+    let mut alloc_block: HashMap<u32, u32> = HashMap::new();
+    for b in &irm.blocks {
+        for op in &b.code {
+            match op {
+                Ir::Alloc { dst, klass, .. } if def_count[&dst.0] == 1 => {
+                    alloc_of.insert(dst.0, irm.pool[klass.0 as usize].value);
+                    alloc_block.insert(dst.0, b.id.0);
+                }
+                Ir::Move { dst, src } if def_count[&dst.0] == 1 => {
+                    move_src.insert(dst.0, src.0);
+                }
+                _ => {}
+            }
+        }
+    }
+    // Trace v through Moves to an alloc root; return (klass_value, alloc_block).
+    let trace = |mut v: u32| -> Option<(u64, u32)> {
+        for _ in 0..16 {
+            if let Some(&kv) = alloc_of.get(&v) {
+                return Some((kv, alloc_block[&v]));
+            }
+            match move_src.get(&v) {
+                Some(&s) => v = s,
+                None => return None,
+            }
+        }
+        None
+    };
+    let (mut eligible, mut same_block, mut total) = (0u64, 0u64, 0u64);
+    for b in &irm.blocks {
+        for op in &b.code {
+            if let Ir::GuardKlass {
+                obj,
+                expect,
+                kind: GuardShape::KlassTest,
+                ..
+            } = op
+            {
+                total += 1;
+                if let Some((kv, ablk)) = trace(obj.0) {
+                    if kv == irm.pool[expect.0 as usize].value {
+                        eligible += 1;
+                        if ablk == b.id.0 {
+                            same_block += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    (eligible, same_block, total)
+}
+
 /// Free-function twin of `Translator::array_size_op` for an INLINED
 /// callee's own IC table (the splicers' in-body fuse — same pattern as
 /// `array_op_kind_on`).
@@ -5556,6 +5661,19 @@ impl<'a> Translator<'a> {
                         _ => unreachable!("Inline decision from a non-Mono feedback"),
                     };
                     let selector = ic_view.selector();
+                    // CHA census (behavior-free, MACVM_CHA_COUNT=1): of the
+                    // KlassTest-guarded mono accessor inlines, how many have a
+                    // single-implementor selector — the guard CHA could drop?
+                    if matches!(guard_shape, GuardShape::KlassTest) {
+                        static LOG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                        if *LOG.get_or_init(|| std::env::var_os("MACVM_CHA_COUNT").is_some()) {
+                            let single = cha_implementor_count(self.vm, selector) == 1;
+                            eprintln!(
+                                "cha: guard sel={} single_impl={single}",
+                                crate::memory::print::print_oop(&self.vm.universe, selector.oop())
+                            );
+                        }
+                    }
                     let pre_pop_stack = stack.clone();
                     // Pop the send's operands (they alias the callee's
                     // self/args — no stores).
@@ -9859,6 +9977,23 @@ pub fn convert(
                 eprintln!(
                     "deoptlive: recorded={recorded} live={live} dead={} sites={sites} {sel}",
                     recorded.saturating_sub(live)
+                );
+            }
+        }
+    }
+    // Allocation-provenance guard-elision census (MACVM_ALLOCGUARD_COUNT=1,
+    // behavior-free): guards on a compile-time-known Alloc result that are
+    // soundly droppable. Same-block vs total tells L1-extension vs new pass.
+    {
+        static LOG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *LOG.get_or_init(|| std::env::var_os("MACVM_ALLOCGUARD_COUNT").is_some()) {
+            let (eligible, same_block, total) = alloc_guard_census(&irm);
+            if total > 0 {
+                let sel = crate::oops::wrappers::SymbolOop::try_from(method.selector())
+                    .map(|s| s.as_string())
+                    .unwrap_or_else(|| "?".into());
+                eprintln!(
+                    "allocguard: eligible={eligible} same_block={same_block} of {total} {sel}"
                 );
             }
         }
