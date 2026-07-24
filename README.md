@@ -122,6 +122,18 @@ every scoreboard, is [`docs/cog_bench.md`](docs/cog_bench.md).
   ([`docs/SIMD.md`](docs/SIMD.md)).
 - **Debugger** — crash-dossier (PROBE), breakpoints, mixed-tier backtrace, an
   a64 disassembler, IR dumps, and step-between-calls ([`docs/DEBUGGER.md`](docs/DEBUGGER.md)).
+- **Optional static types** — a Strongtalk-style optional type checker:
+  annotate parameters/returns/instance variables
+  (`aNumber <Number> ^ <Boolean>`), get nominal + block + union subtyping, a
+  real `Self`, and a **static-DNU** send rule flagging a selector no
+  reachable class implements — strictly advisory (a byte-identical
+  differential gate proves annotations never reach codegen) and gradual (an
+  unannotated program checks clean by construction). **The entire core
+  library is annotated** — 739 method signatures, real world, 0 findings —
+  staged T0′→T4 against Strongtalk's own signature sources, fixing five
+  genuine soundness bugs in the checker itself along the way, each caught
+  only by running it against the real ~150-class world
+  ([`docs/typechecker_design.md`](docs/typechecker_design.md)).
 - **Image store** — offline SQLite image editing + a DB→VM boot loader that
   reconstructs the world byte-identically to a `.mst` boot ([`docs/IMAGE.md`](docs/IMAGE.md)).
 - **Embedding + two GUIs** — a `VmHandle` library API embeds the language on
@@ -182,8 +194,24 @@ every scoreboard, is [`docs/cog_bench.md`](docs/cog_bench.md).
   reported as an ordinary `#workerDied` message. `ParallelMandel` measures **~2.65 CPUs of sustained
   utilization with 4 workers** on the live zooming Mandelbrot — visibly faster
   than the single-VM dive ([`docs/multi-smalltalk-worker.md`](docs/multi-smalltalk-worker.md)).
-- **The object world** — 107 classes / 1,269 methods of hand-written and
-  Strongtalk-ported library (`world/*.mst`, `world.list`'s own 64 files;
+- **OTP-style supervision** — a supervision layer over the worker fleet:
+  MACVM has no exception system (`self error:` stops the computation
+  outright, and scoped `catch` was deliberately rejected), so a crashed
+  worker is answered Erlang/OTP-style instead — reported as the ordinary
+  `#workerDied` message above, and a `WorkerSupervisor` restarts it by
+  declared policy (`#oneForOne` / `#oneForAll` / `#restForOne`), with
+  supervisors nesting into trees and a child that exhausts its own restart
+  budget escalating to its parent. `WorkerNames` rebinds a service's name on
+  every restart so callers never hold a handle to a corpse; `ServiceWorker`'s
+  deadline-bounded `call:timeoutMs:onReply:onError:` funnels every failure
+  mode — timeout, death, an RPC error — into one callback, never a block,
+  with nothing ever blocking to enforce it. The `IoWorker` (a
+  `kqueue`-multiplexing I/O service) is the first real service supervised
+  this way: its kernel-level watch registrations live in the *primary* and
+  survive a worker's crash untouched, so a supervised restart needs no
+  re-registration at all ([`docs/otp_workers_design.md`](docs/otp_workers_design.md)).
+- **The object world** — 155 classes / 1,872 methods of hand-written and
+  Strongtalk-ported library (`world/*.mst`, `world.list`'s own 74 files;
   counted via `ClassMirror allClasses`, own — not inherited — selectors):
   full collections + streams protocol, Dictionary/Set/OrderedCollection,
   String/Character text utilities, Fraction and LargeInteger arithmetic, an
@@ -292,6 +320,59 @@ measure). The remaining gap to ‑O2 is specific and known: no FMA fusion
 compiled *send* rather than inlined into the pixel loop the way C inlines
 `escape()`.
 
+### Optional static types
+
+Strongtalk's tour named two headline ideas beyond adaptive optimization: a
+live hypertext environment (both GUIs, above) and an *optional* static type
+system layered over ordinary dynamic Smalltalk — types where you want them,
+nothing else changes where you don't. MACVM ports that idea as a genuine
+Rust reimplementation (not a Smalltalk port), staged T0′→T4 against
+Strongtalk's own `.dlt` sources as the executable spec:
+
+```smalltalk
+Magnitude subclass: Number [
+    max: aMagnitude <Magnitude> ^ <Magnitude> [
+        ^self < aMagnitude ifTrue: [ aMagnitude ] ifFalse: [ self ]
+    ]
+]
+```
+
+- **T0′** — the parser captures annotations instead of discarding them.
+- **T1** — a `TypeExpr` grammar (named / generic / block / union types) and
+  a VM-free `WorldModel`, built by re-parsing the world with no `VmState`
+  involved at all.
+- **T2** — real subtyping: nominal (superclass chain), `Self` resolved
+  against the enclosing class, blocks checked contravariantly on arguments
+  and covariantly on return, unions distributing.
+- **T3** — the send rule: **static-DNU** (a selector no reachable class
+  implements, on a receiver whose type is known) plus per-argument subtype
+  checks.
+- **T4** — the entire core library annotated, signatures ported from
+  Strongtalk's own where they exist and inferred mechanically from our own
+  code where they don't: **739 method signatures, real world, 0 findings.**
+
+Two things make it safe to ship as advisory-only:
+
+- **Isolation.** `src/types/` is reachable from exactly one place — the
+  `macvm typecheck` subcommand — verified by grep after every stage.
+  Nothing it does can ever reach codegen.
+- **A byte-identical differential gate.** The world compiles to the *exact
+  same bytecode* with or without every annotation ever written — proven on
+  every commit, the same discipline this project applies to every JIT
+  change.
+
+That safety net is what makes the interesting part possible: **finding
+real soundness bugs in the checker itself by actually running it against a
+substantial, real library**, rather than by inspection — five of them,
+across five stages. The first: a naive `Self`-typed dispatch check flagged
+97 false positives the moment it met real code — `Number>>log` sends `self
+asFloat`, but `Number` itself never implements `asFloat`, only its concrete
+subclasses do (the ordinary Template Method pattern). The fix — a
+`Self`-typed receiver *declines* checking rather than guesses — is the same
+stance this whole project takes toward any claim it can't verify. Full
+design and every stage's gate:
+[`docs/typechecker_design.md`](docs/typechecker_design.md).
+
 ### Replace, don't mutate — there is no persistent image
 
 MACVM never mutates a persistent image. Where classic Smalltalk carries one
@@ -389,9 +470,11 @@ for direct pointers and a fast JIT.
 | [`docs/cocoa_gui_flag_and_drain.md`](docs/cocoa_gui_flag_and_drain.md) | Why a C6 callback may never touch VM-level state directly (two real failure modes: fails closed silently, or crashes the process) and the flag/wake/drain mechanism every UI rebuild, primary restart, and data-backed view refresh uses instead — plus a checklist for adding a new one |
 | [`docs/cocoa_gui_implementation.md`](docs/cocoa_gui_implementation.md) | Implementation walkthrough, real source cited: how a Cocoa class is found at runtime (both directions), how a Smalltalk send becomes `objc_msgSend` and back, how the moving GC and manual refcounting coexist with zero GC changes, how the UI VM and the persistent VM actually talk |
 | [`docs/DEBUGGER.md`](docs/DEBUGGER.md) | The debugging ladder: PROBE crash dossiers, breakpoints, mixed-tier backtraces, the a64 disassembler, IR dumps |
+| [`docs/typechecker_design.md`](docs/typechecker_design.md) | The optional Strongtalk-style type checker (built, T0′–T4): capture → parse+model → subtype+local rules → send rule → the entire core library annotated; the isolation gate and the byte-identical differential gate that make it safe to ship advisory-only |
 | [`docs/ASM.md`](docs/ASM.md) / [`docs/CANVAS.md`](docs/CANVAS.md) | Side-track designs with working preview tools: hand-written native-AArch64 methods (`<asm:>`), and the GUI Canvas widget |
 | [`docs/gamepane_design.md`](docs/gamepane_design.md) | The native Metal game engine driven from Smalltalk (MacGamePane): the frame/threading architecture, drawing/sprite/audio command channel, and the milestone ladder |
 | [`docs/multi-smalltalk-worker.md`](docs/multi-smalltalk-worker.md) | Primary/worker VM parallelism (built, M0–M4): spawn worker VMs from Smalltalk, communicate by deep-copy message passing (the MOP pickle), no shared state — Erlang-style share-nothing across heaps; capstone = the 4-worker parallel Mandelbrot |
+| [`docs/otp_workers_design.md`](docs/otp_workers_design.md) | OTP-style supervision over the worker fleet (built, O0–O3): restart policies (`#oneForOne`/`#oneForAll`/`#restForOne`), supervisor trees + escalation, `ServiceWorker`'s deadline-bounded request/reply, `IoWorker` adopted as the first supervised service |
 | [`docs/IMAGE.md`](docs/IMAGE.md) / [`docs/managingtheworld.md`](docs/managingtheworld.md) | The versioned SQLite world image, and the practical world/image reseed workflow (`./reseed-world.sh`) |
 | [`docs/arm64.md`](docs/arm64.md) | Machine-level design: MAP_JIT/W^X, AAPCS64, PAC, relocs, oop maps, deopt glue |
 | [`docs/reference-vm-analysis.md`](docs/reference-vm-analysis.md) | Source-anchored analysis of Self, Strongtalk, JASM, and the MacNCL GC |
@@ -409,6 +492,7 @@ for direct pointers and a fast JIT.
 | `src/codecache/` | Native code cache, stubs, deopt trap machinery |
 | `src/runtime/` | Dispatch, frames, deopt materializer, OSR, recompile, debugger |
 | `src/frontend/` | `.mst` parser + class-definition loader |
+| `src/types/` | The optional static type checker — isolated, reachable only from `macvm typecheck` |
 | `src/embed.rs` | `VmHandle` embedding API |
 | `src/rusttcl/` | Embedded RUSTTCL console |
 | `world/` | The object world / image sources, tests, benchmarks |
