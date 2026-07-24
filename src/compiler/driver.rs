@@ -878,8 +878,21 @@ fn compile_method_full(
                     eprintln!("    {ir:?}");
                 }
             }
+            let named = |v: u64| -> &'static str {
+                let u = &vm.universe;
+                match v {
+                    _ if v == u.smi_klass.oop().raw() => "SmallInteger",
+                    _ if v == u.symbol_klass.oop().raw() => "Symbol",
+                    _ if v == u.string_klass.oop().raw() => "String",
+                    _ if v == u.array_klass.oop().raw() => "Array",
+                    _ if v == u.undefined_object_klass.oop().raw() => "UndefinedObject",
+                    _ if v == u.character_klass.oop().raw() => "Character",
+                    _ if v == u.association_klass.oop().raw() => "Association",
+                    _ => "",
+                }
+            };
             for (i, e) in ir_method.pool.iter().enumerate() {
-                eprintln!("  pool[{i}] = {:#x} {:?}", e.value, e.kind);
+                eprintln!("  pool[{i}] = {:#x} {:?} {}", e.value, e.kind, named(e.value));
             }
             eprintln!("==== END IR {sel} ====");
         }

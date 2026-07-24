@@ -223,3 +223,52 @@ Attribution is clean by the same-session rule: Cog held still (richards
 on the arc's predicted bench — richards 18.8 -> 17.5 (the MACVM-only runs
 bracketed it at 17.8/17.9; 17.5 is best-of-3 under the interleave). All
 seven remain ahead; the richards watch row improves from 1.17x to 1.27x.
+
+## 2026-07-25 dict collapse — PolyCmpFuse (poly-identity `=`), 6.26 -> 3.35 ms
+
+The first purely benchmark-driven find after retiring census-first. A c2i
+adapter census (`MACVM_C2I_CENSUS=1`, stubs.rs) showed benchDict spending
+4M interpreter dispatches per 200 reps on ONE selector: `SmallInteger>>=`.
+Chain, fully evidenced (MACVM_DBG_IR + MACVM_TRACE=deopt): `Dictionary>>
+scanFor:`'s `probe = key` IC is shared by every Dictionary, and the boot
+world's dictionaries key on Symbols — so v0 compiled the site as
+GuardKlass(Symbol)+RefCmpVal. benchDict's smi keys then failed that guard
+on every probe -> bci-47 trap storm -> the storm recompile (v1) saw a poly
+{Symbol, smi} IC no existing decision could serve (targets differ, so no
+SameTargetPoly; the smi arm's method is a primitive, so no
+DominantWithSlowPath splice) and gave up to a plain CallSend — every key
+compare left compiled code for the interpreter, forever.
+
+Fix: `InlineDecision::PolyCmpFuse` — at a poly `=` site where EVERY arm is
+individually fusible to one raw-bits compare (smi prim 14 with a both-smi
+guard, whose key-miss routes coercion (`3 = 3.0`) to the send; or an
+identity-`=` body `^self == other`, Symbol's shape, sound for any arg),
+lower a receiver-dispatch chain of guarded RefCmpVals, hottest first,
+every miss edge ONE shared rejoining send. No traps anywhere -> can't
+storm; an unseen klass is merely slow, never wrong. No count floor — the
+post-storm site's counts are frozen at ~{0,1} (compiled sends never bump
+interpreter ICs), so any floor would lock in the give-up Call.
+
+Interleaved 3-round A/B (HEAD vs fix, same tree otherwise, load ~2.1):
+
+| bench | before warm us (med) | after warm us (med) | delta |
+|---|---|---|---|
+| **dict** | 6258 | 3354 | **-46% (1.87x)** |
+| deltablue | 6783 | 6353 | -7% (consistent sign, all rounds) |
+| others | — | — | flat within noise |
+
+All 7 checksums held on all 6 runs. Gates: lib 835+3, it_tier1 104 (new
+e2e `poly_cmp_fuse_dispatches_all_legs_and_slow_path` covers both fast
+legs hit+miss, the smi-key coercion route, and the unseen-klass slow
+path, interpreter==compiled), and the 5-mode release differential
+(JIT-off / t=1 / GC_STRESS=1 / GC_STRESS=full:64 / DEOPT_STRESS=64) all
+exit 0 with zero WRONG lines. No Cog interleave this round — the Cog-side
+table above is unchanged; re-stamp dict vs Cog on the next head-to-head.
+
+Also this session, falsified before building: the S11-step-10
+"repatch c2i adapters on tier-up" hypothesis — the census measured
+compiled_avail=0% (the interpreted callees have no compiled version for
+the receiver klass at all; dict's cost was the storm above, not stale
+adapter links). A naive per-method adapter->entry patch also HANGS: the
+adapter is per-method but customization is per-(klass,method), so a
+wrong-klass caller loops guard-miss -> resolve -> same adapter forever.

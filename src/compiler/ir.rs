@@ -5639,6 +5639,156 @@ impl<'a> Translator<'a> {
                     // plain generic CallSend tail below (nothing was emitted).
                 }
 
+                // POLY-IDENTITY COMPARE FUSE (`InlineDecision::PolyCmpFuse`,
+                // the dict `scanFor:` `probe = key` shape): a chain of guarded
+                // `RefCmpVal` legs, hottest first, every miss edge rejoining
+                // through ONE shared real send. Contains NO traps: the guards
+                // are plain control flow (no deopt recording), so this site can
+                // never storm — the failure mode that produced v0's bci-47
+                // storm and v1's give-up-to-send. Leg 0 lives in the current
+                // block; legs 1.. are side blocks; the slow block is the
+                // `SameTargetPoly` leaf leg's rejoining-send recipe verbatim.
+                if let crate::compiler::inline::InlineDecision::PolyCmpFuse { legs } =
+                    &feedback_inline
+                {
+                    use crate::compiler::inline::PolyCmpLeg;
+                    let legs = legs.clone();
+                    debug_assert_eq!(
+                        real_argc, 1,
+                        "PolyCmpFuse: decision only fires on binary compare sites"
+                    );
+                    let selector = ic_view.selector();
+                    let key_op = stack.pop().expect("poly-cmp fuse: missing arg operand");
+                    let probe_op = stack
+                        .pop()
+                        .expect("poly-cmp fuse: missing receiver operand");
+
+                    let continuation_id = self.fresh_block_id();
+                    let slow_id = self.fresh_block_id();
+                    let dst = self.fresh(true);
+                    let dst_slow = self.fresh(true);
+                    let site = self.call_sites.len() as u16;
+                    self.call_sites.push(CallSiteInfo {
+                        selector,
+                        argc: 2,
+                        static_klass: None,
+                    });
+                    self.site_feedback.push(feedback.clone());
+                    self.finish_block(IrBlock {
+                        id: slow_id,
+                        bci,
+                        code: vec![
+                            Ir::CallSend {
+                                dst: dst_slow,
+                                site,
+                                args: vec![probe_op, key_op],
+                            },
+                            Ir::Move { dst, src: dst_slow },
+                            Ir::Jump {
+                                target: continuation_id,
+                            },
+                        ],
+                        entry_stack: Vec::new(),
+                        deopt_sites: vec![(
+                            0,
+                            DeoptRaw {
+                                stack: stack.clone(),
+                                bci,
+                                kind: SafepointKind::Call,
+                                reexecute: false,
+                                stack_closures: Vec::new(),
+                                inline: None,
+                            },
+                        )],
+                    });
+
+                    if self.vm.options.trace.is_enabled("polycmp") {
+                        eprintln!(
+                            "[polycmp] {} legs={}",
+                            crate::memory::print::print_oop(
+                                &self.vm.universe,
+                                selector.oop()
+                            ),
+                            legs.len(),
+                        );
+                    }
+
+                    // Side blocks for legs[1..]; leg i's receiver-guard miss
+                    // goes to the NEXT leg's block, the last leg's to the slow
+                    // send. (A smi leg's ARGUMENT-guard miss always goes to
+                    // the slow send — that is a coercion case, not a
+                    // wrong-receiver case.)
+                    let side_ids: Vec<BlockId> =
+                        legs[1..].iter().map(|_| self.fresh_block_id()).collect();
+                    let smi_lit = self.pool.intern(
+                        self.vm.universe.smi_klass.oop().raw(),
+                        Some(RelocKind::Oop),
+                    );
+                    for (i, leg) in legs.iter().enumerate() {
+                        // legs[0] emits into the current block (falls through
+                        // to the continuation via the translate loop's own
+                        // jump); legs[1..] each finish their own side block.
+                        let next_fail = if i < side_ids.len() {
+                            side_ids[i]
+                        } else {
+                            slow_id
+                        };
+                        let mut leg_code: Vec<Ir> = Vec::new();
+                        match leg {
+                            PolyCmpLeg::Smi => {
+                                leg_code.push(Ir::GuardKlass {
+                                    obj: probe_op,
+                                    expect: smi_lit,
+                                    fail: next_fail,
+                                    kind: GuardShape::SmiTest,
+                                });
+                                leg_code.push(Ir::GuardKlass {
+                                    obj: key_op,
+                                    expect: smi_lit,
+                                    fail: slow_id,
+                                    kind: GuardShape::SmiTest,
+                                });
+                                self.record_inline_dep(self.vm.universe.smi_klass, selector);
+                            }
+                            PolyCmpLeg::Ident(k) => {
+                                let k_lit =
+                                    self.pool.intern(k.oop().raw(), Some(RelocKind::Oop));
+                                leg_code.push(Ir::GuardKlass {
+                                    obj: probe_op,
+                                    expect: k_lit,
+                                    fail: next_fail,
+                                    kind: GuardShape::KlassTest,
+                                });
+                                self.record_inline_dep(*k, selector);
+                            }
+                        }
+                        let t = self.fresh(true);
+                        leg_code.push(Ir::RefCmpVal {
+                            dst: t,
+                            a: probe_op,
+                            b: key_op,
+                            neq: false,
+                        });
+                        leg_code.push(Ir::Move { dst, src: t });
+                        if i == 0 {
+                            code.extend(leg_code);
+                        } else {
+                            leg_code.push(Ir::Jump {
+                                target: continuation_id,
+                            });
+                            self.finish_block(IrBlock {
+                                id: side_ids[i - 1],
+                                bci,
+                                code: leg_code,
+                                entry_stack: Vec::new(),
+                                deopt_sites: Vec::new(),
+                            });
+                        }
+                    }
+                    stack.push(dst);
+                    return Some(continuation_id);
+                }
+
                 if let crate::compiler::inline::InlineDecision::Inline { callee, guard } =
                     feedback_inline
                 {

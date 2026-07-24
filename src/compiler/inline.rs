@@ -253,6 +253,23 @@ pub enum InlineDecision {
         klasses: Vec<KlassOop>,
         callee: MethodOop,
     },
+    /// POLY-IDENTITY COMPARE (the dict `scanFor:` shape, found by the 2026-07
+    /// c2i census: 4M interpreted `SmallInteger>>=` per benchDict run): a
+    /// binary `=`-shaped site whose observed arms resolve to DIFFERENT methods
+    /// (so `SameTargetPoly` can't fire) that are nevertheless EACH fusible to
+    /// one raw-bits `RefCmpVal`:
+    ///   - the smi arm (`SmallInteger>>=`, primitive 14): raw-bits equality IS
+    ///     smi equality — but only when the ARGUMENT is also a smi (prim 14's
+    ///     own fail condition; `3 = 3.0` coerces), so its leg carries a
+    ///     both-smi guard whose key-miss goes to the slow send;
+    ///   - an identity arm (a body that is literally `^self == other`, e.g.
+    ///     `Symbol>>=`): raw-bits equality for ANY argument.
+    /// Lowered as a receiver-dispatch chain of guarded `RefCmpVal` legs
+    /// (hottest first) whose every miss edge is one shared REAL rejoining
+    /// send — NO traps anywhere, so the site can never deopt-storm the way
+    /// the mono-Symbol speculation did (v0's bci-47 storm), and an unseen
+    /// klass or coercing argument is merely slow, never wrong.
+    PolyCmpFuse { legs: Vec<PolyCmpLeg> },
     /// A real compiled send (S11 compiled IC): `Mono`/`Poly`/`Mega` sites all
     /// map here in step 3 (inlining them is later steps).
     Call,
@@ -261,6 +278,50 @@ pub enum InlineDecision {
     /// speculate on. The trap re-executes the send in the interpreter, which
     /// populates the IC for the next compilation (Self's lazy cold path).
     Trap,
+}
+
+/// One receiver-klass leg of a [`InlineDecision::PolyCmpFuse`] dispatch
+/// chain, ordered hottest-first by the IC's count tail.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PolyCmpLeg {
+    /// Receiver is a smi: both-smi guard, then raw-bits compare (prim 14's
+    /// exact fast case). A non-smi ARGUMENT falls to the slow send — that is
+    /// where `SmallInteger>>=`'s Double/LargeInteger coercion semantics live.
+    Smi,
+    /// Receiver is this heap klass, whose `=` is literally `^self == other`:
+    /// klass guard, then raw-bits compare, sound for any argument.
+    Ident(KlassOop),
+}
+
+/// Is `m`'s body literally `^self == other` (the identity-`=` shape,
+/// `Symbol>>=` being the canonical instance)? Exact bytecode match —
+/// `[PushSelf, PushTemp(0), Send{#==}, ReturnTos]` with no primitive — so any
+/// wrapper, guard, or extra statement declines. The `==` selector is compared
+/// by NAME (compile-time only, never hot): `decide_with_budget` deliberately
+/// has no `VmState` to intern against, and `#==` is pinned non-redefinable
+/// (the same pin `Ir::RefCmpVal` itself rests on).
+fn method_is_ident_eq(m: MethodOop) -> bool {
+    if m.primitive() != 0 || m.argc() != 1 {
+        return false;
+    }
+    let (i0, n0) = decode_at(m, 0);
+    if !matches!(i0, Instr::PushSelf) {
+        return false;
+    }
+    let (i1, n1) = decode_at(m, n0);
+    if !matches!(i1, Instr::PushTemp(0)) {
+        return false;
+    }
+    let (i2, n2) = decode_at(m, n1);
+    let Instr::Send { ic, super_: false } = i2 else {
+        return false;
+    };
+    let (i3, _) = decode_at(m, n2);
+    if !matches!(i3, Instr::ReturnTos) {
+        return false;
+    }
+    let site = crate::interpreter::ic::InterpreterIc::at(m, ic);
+    site.selector().as_string() == "=="
 }
 
 /// How an inlined/speculated site proves its receiver's klass before running
@@ -414,6 +475,45 @@ pub fn decide_with_budget(
                 };
             }
 
+            // Poly-identity compare (checked before dominance): different
+            // targets, but EVERY arm fuses to one raw-bits compare — the smi
+            // `=` primitive or an identity-`=` body. Dominance is the wrong
+            // tool here (a dominant pick would slow-send the minority arm on
+            // every call — dict's exact 4M-interpreted-sends failure); the
+            // dispatch chain serves every observed arm fast.
+            //
+            // NO count floor, deliberately — two reasons. (1) The real dict
+            // lifecycle can never accumulate one: the site reaches Poly at
+            // the storm recompile with counts ~{0, 1} and FREEZES there
+            // (compiled sends never bump interpreter counts), so any floor
+            // permanently locks the site into its give-up `Call`. (2) A
+            // floor buys protection against a MIS-speculation cost that this
+            // decision doesn't have: a "wrongly" fused site pays a couple of
+            // guard tests before the same rejoining send it would have made
+            // anyway — never a trap, never a wrong answer. `cases.len() >= 2`
+            // already proves both shapes were genuinely observed.
+            let all_cmp_fusible = cases.len() >= 2
+                && cases.iter().all(|c| {
+                    (c.klass.oop().raw() == smi_klass_bits
+                        && c.method.primitive() == 14
+                        && c.method.argc() == 1)
+                        || method_is_ident_eq(c.method)
+                });
+            if all_cmp_fusible {
+                return InlineDecision::PolyCmpFuse {
+                    legs: cases
+                        .iter()
+                        .map(|c| {
+                            if c.klass.oop().raw() == smi_klass_bits {
+                                PolyCmpLeg::Smi
+                            } else {
+                                PolyCmpLeg::Ident(c.klass)
+                            }
+                        })
+                        .collect(),
+                };
+            }
+
             let dominant = &cases[0];
             let dom = dominant.count.unwrap_or(0) as u64;
             let proven =
@@ -509,6 +609,136 @@ mod tests {
     #[test]
     fn mega_calls() {
         assert!(matches!(decide(&SiteFeedback::Mega), InlineDecision::Call));
+    }
+
+    /// Build the identity-`=` shape (`= other [ ^self == other ]`, `Symbol>>=`'s
+    /// exact body) the way the world compiler would.
+    fn ident_eq_method(vm: &mut VmState) -> MethodOop {
+        let eq_sel = vm.universe.intern(b"=");
+        let eqeq_sel = vm.universe.intern(b"==");
+        let mut b = crate::bytecode::builder::BytecodeBuilder::new();
+        b.push_self();
+        b.push_temp(0);
+        b.send(vm, eqeq_sel, 1);
+        b.ret_tos();
+        b.finish(vm, eq_sel, 1, 0)
+    }
+
+    /// `SmallInteger>>=`'s decision-relevant surface: primitive 14, argc 1.
+    fn smi_eq_method(vm: &mut VmState) -> MethodOop {
+        let eq_sel = vm.universe.intern(b"=");
+        let mut b = crate::bytecode::builder::BytecodeBuilder::new();
+        b.ret_self();
+        let m = b.finish(vm, eq_sel, 1, 0);
+        m.set_primitive(14);
+        m
+    }
+
+    /// The dict `scanFor:` shape: poly {smi `=` (prim 14), identity-`=` heap
+    /// klass} → the no-floor `PolyCmpFuse`, legs in the cases' (count) order.
+    #[test]
+    fn poly_ident_cmp_fuses_smi_plus_identity_arm() {
+        let mut vm = test_vm();
+        let budget = budget_for_level(1);
+        let smi_bits = vm.universe.smi_klass.oop().raw();
+        let smi_m = smi_eq_method(&mut vm);
+        let ident_m = ident_eq_method(&mut vm);
+        let sym_k = vm.universe.symbol_klass;
+        let fb = SiteFeedback::Poly {
+            cases: vec![
+                FeedbackCase {
+                    klass: vm.universe.smi_klass,
+                    method: smi_m,
+                    count: Some(3),
+                },
+                FeedbackCase {
+                    klass: sym_k,
+                    method: ident_m,
+                    count: Some(1),
+                },
+            ],
+        };
+        match decide_with_budget(&fb, &budget, smi_bits) {
+            InlineDecision::PolyCmpFuse { legs } => {
+                assert_eq!(
+                    legs,
+                    vec![PolyCmpLeg::Smi, PolyCmpLeg::Ident(sym_k)],
+                    "legs must mirror the cases' hottest-first order"
+                );
+            }
+            other => panic!("expected PolyCmpFuse, got {other:?}"),
+        }
+    }
+
+    /// The fuse fires on FROZEN post-storm counts (the real dict lifecycle:
+    /// the site reaches Poly at the storm recompile with counts ~{0,1} and
+    /// compiled sends never bump interpreter counts) — no evidence floor.
+    #[test]
+    fn poly_ident_cmp_fires_without_count_floor() {
+        let mut vm = test_vm();
+        let budget = budget_for_level(1);
+        let smi_bits = vm.universe.smi_klass.oop().raw();
+        let smi_m = smi_eq_method(&mut vm);
+        let ident_m = ident_eq_method(&mut vm);
+        let fb = SiteFeedback::Poly {
+            cases: vec![
+                FeedbackCase {
+                    klass: vm.universe.smi_klass,
+                    method: smi_m,
+                    count: Some(1),
+                },
+                FeedbackCase {
+                    klass: vm.universe.symbol_klass,
+                    method: ident_m,
+                    count: Some(0),
+                },
+            ],
+        };
+        assert!(
+            matches!(
+                decide_with_budget(&fb, &budget, smi_bits),
+                InlineDecision::PolyCmpFuse { .. }
+            ),
+            "frozen {{1, 0}} counts must still fuse — a floor would lock the \
+             site into its give-up Call forever"
+        );
+    }
+
+    /// A value-comparing arm (a `=` body that is NOT `^self == other` and not
+    /// the smi primitive — String's content compare shape) disqualifies the
+    /// whole site: raw-bits compare would be WRONG for it.
+    #[test]
+    fn poly_ident_cmp_declines_value_eq_arm() {
+        let mut vm = test_vm();
+        let budget = budget_for_level(1);
+        let smi_bits = vm.universe.smi_klass.oop().raw();
+        let smi_m = smi_eq_method(&mut vm);
+        // A non-identity `=` body: `= other [ ^self ]`.
+        let eq_sel = vm.universe.intern(b"=");
+        let mut b = crate::bytecode::builder::BytecodeBuilder::new();
+        b.ret_self();
+        let value_m = b.finish(&mut vm, eq_sel, 1, 0);
+        let fb = SiteFeedback::Poly {
+            cases: vec![
+                FeedbackCase {
+                    klass: vm.universe.smi_klass,
+                    method: smi_m,
+                    count: Some(3),
+                },
+                FeedbackCase {
+                    klass: vm.universe.string_klass,
+                    method: value_m,
+                    count: Some(1),
+                },
+            ],
+        };
+        assert!(
+            !matches!(
+                decide_with_budget(&fb, &budget, smi_bits),
+                InlineDecision::PolyCmpFuse { .. }
+            ),
+            "a value-`=` arm must decline the fuse"
+        );
     }
 
     /// dart124 items 2+3: dominance is measured, so a count-proven dominant

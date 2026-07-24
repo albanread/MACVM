@@ -1437,6 +1437,45 @@ pub unsafe extern "C" fn rt_interpret_call(
     let sel = SymbolOop::try_from(baked_method.selector())
         .expect("a method's selector is always a Symbol");
     let k = klass_of(vm, receiver);
+    // c2i-adapter census (MACVM_C2I_CENSUS=1) — MEASUREMENT ONLY, no behavior
+    // change: how many interpreter dispatches through a c2i adapter are for a
+    // receiver (klass, selector) that ALREADY has a compiled nmethod. Each
+    // such dispatch is a compiled caller stuck on the shared adapter despite
+    // the callee having tiered up (the deferred S11-step-10 repatch gap). A
+    // ratio near 100% during a bench ⇒ a large "run it compiled instead" win
+    // is available; near 0% ⇒ the interpreter-boundness is something else.
+    {
+        use std::cell::RefCell;
+        use std::collections::HashMap;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *ON.get_or_init(|| std::env::var_os("MACVM_C2I_CENSUS").is_some()) {
+            static TOTAL: AtomicU64 = AtomicU64::new(0);
+            static COMPILED_AVAIL: AtomicU64 = AtomicU64::new(0);
+            thread_local! {
+                static HIST: RefCell<HashMap<String, u64>> = RefCell::new(HashMap::new());
+            }
+            let t = TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
+            if vm.code_table.lookup(k, sel).is_some() {
+                COMPILED_AVAIL.fetch_add(1, Ordering::Relaxed);
+            }
+            let kname = crate::runtime::error::name_of(k.name());
+            let key = format!("{kname}>>{}", sel.as_string());
+            HIST.with(|h| *h.borrow_mut().entry(key).or_insert(0) += 1);
+            if t % 500_000 == 0 {
+                let c = COMPILED_AVAIL.load(Ordering::Relaxed);
+                eprintln!("c2i-census: total={t} compiled_avail={c} ({}%)", c * 100 / t);
+                HIST.with(|h| {
+                    let mut v: Vec<(String, u64)> =
+                        h.borrow().iter().map(|(s, n)| (s.clone(), *n)).collect();
+                    v.sort_by(|a, b| b.1.cmp(&a.1));
+                    for (name, n) in v.iter().take(8) {
+                        eprintln!("  c2i-top: {n:>9} {name}");
+                    }
+                });
+            }
+        }
+    }
     let method = match lookup(vm, k, sel) {
         Some(m) if m.oop().raw() == baked_method.oop().raw() => baked_method,
         looked_up => {

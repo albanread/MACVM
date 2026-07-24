@@ -8545,3 +8545,148 @@ fn b3_klass_sensitive_nopermanent_does_not_poison() {
     );
     assert!(vm.stats.blocks_spliced_nlr > before, "NLR block spliced");
 }
+
+/// Poly-identity compare fuse (`InlineDecision::PolyCmpFuse` — the dict
+/// `scanFor:` `probe = key` shape): a poly `=` site over {smi (prim 14),
+/// identity-`=` heap klass} lowers to a chain of guarded raw-bits compares
+/// whose every miss edge is ONE shared rejoining send — no traps anywhere.
+/// Asserts the structure (one compiled IC site = the slow send; one inline
+/// dep per fused arm) and full interpreter==compiled parity across every
+/// route: both fast legs (hit and miss), the smi leg's ARGUMENT-guard miss
+/// (the coercion route — must take the slow send, not a wrong raw-bits
+/// false), and an unseen receiver klass (slow send).
+#[test]
+fn poly_cmp_fuse_dispatches_all_legs_and_slow_path() {
+    let mut vm = test_vm();
+    let smi_klass = vm.universe.smi_klass;
+    let object_klass = vm.universe.object_klass;
+    let eq_sel = vm.universe.intern(b"=");
+    let eqeq_sel = vm.universe.intern(b"==");
+
+    // The bare test VM has no world: install `Object>>==` (primitive 22, the
+    // identity primitive — world/01_object.mst's exact shape) so the
+    // INTERPRETED runs of the identity-`=` bodies below can dispatch it.
+    let mut eb = BytecodeBuilder::new();
+    eb.ret_self();
+    let eqeq_m = eb.finish(&mut vm, eqeq_sel, 1, 0);
+    eqeq_m.set_primitive(22);
+    install_method(&mut vm, object_klass, eqeq_sel, eqeq_m);
+
+    // Identity-`=` klass (Symbol's shape): `= other [ ^self == other ]`.
+    let ida = vm
+        .universe
+        .new_klass(object_klass, "IdEqA", Format::Slots, false, HEADER_WORDS);
+    let mut ib = BytecodeBuilder::new();
+    ib.push_self();
+    ib.push_temp(0);
+    ib.send(&mut vm, eqeq_sel, 1);
+    ib.ret_tos();
+    let ida_eq = ib.finish(&mut vm, eq_sel, 1, 0);
+    install_method(&mut vm, ida, eq_sel, ida_eq);
+
+    // A SECOND identity-`=` klass, deliberately NOT seeded into the IC — the
+    // unseen-receiver route through the rejoining send.
+    let idu = vm
+        .universe
+        .new_klass(object_klass, "IdEqU", Format::Slots, false, HEADER_WORDS);
+    let mut ub = BytecodeBuilder::new();
+    ub.push_self();
+    ub.push_temp(0);
+    ub.send(&mut vm, eqeq_sel, 1);
+    ub.ret_tos();
+    let idu_eq = ub.finish(&mut vm, eq_sel, 1, 0);
+    install_method(&mut vm, idu, eq_sel, idu_eq);
+
+    // `SmallInteger>>=`: primitive 14 with a `^false` fallback (the fallback
+    // runs exactly when the ARGUMENT is not a smi — the route the compiled
+    // smi leg must reach via the slow send, never via raw-bits compare).
+    let mut sb = BytecodeBuilder::new();
+    sb.push_false();
+    sb.ret_tos();
+    let smi_eq = sb.finish(&mut vm, eq_sel, 1, 0);
+    smi_eq.set_primitive(14);
+    smi_eq.set_flags(1, 0, false, false, true, false, 0); // prim_fails = true
+    install_method(&mut vm, smi_klass, eq_sel, smi_eq);
+
+    // `eq: a to: b [ ^a = b ]` on the smi klass — the site under test.
+    let eqto_sel = vm.universe.intern(b"eq:to:");
+    let mut cb = BytecodeBuilder::new();
+    cb.push_temp(0);
+    cb.push_temp(1);
+    cb.send(&mut vm, eq_sel, 1);
+    cb.ret_tos();
+    let eqto_m = cb.finish(&mut vm, eqto_sel, 2, 0);
+    install_method(&mut vm, smi_klass, eqto_sel, eqto_m);
+
+    // Seed the site's IC POLY {smi -> prim-14 `=`, IdEqA -> identity `=`},
+    // smi hottest — the frozen post-storm shape (counts 1/0 suffice: the
+    // fuse has NO evidence floor by design).
+    let array_klass = vm.universe.array_klass;
+    let pairs = macvm::memory::alloc::alloc_indexable_oops(
+        &mut vm,
+        array_klass,
+        macvm::oops::layout::IC_POLY_ARRAY_LEN,
+    );
+    pairs.at_put(0, smi_klass.oop());
+    pairs.at_put(1, smi_eq.oop());
+    pairs.at_put(2, ida.oop());
+    pairs.at_put(3, ida_eq.oop());
+    pairs.at_put(
+        2 * macvm::oops::layout::IC_POLY_MAX_PAIRS,
+        SmallInt::new(1).oop(),
+    );
+    let epoch = vm.ic_epoch;
+    InterpreterIc::at(eqto_m, 0).set_poly(&mut vm, pairs, epoch);
+
+    let id = driver::compile_method(&mut vm, smi_klass, eqto_m).expect("must compile");
+    {
+        let nm = vm.code_table.get(id).expect("installed");
+        assert_eq!(
+            nm.ic_sites.len(),
+            1,
+            "exactly one compiled IC site: the shared rejoining slow send"
+        );
+        assert_eq!(
+            nm.inline_deps.len(),
+            2,
+            "one (klass, `=`) dep per fused leg: smi + IdEqA"
+        );
+    }
+
+    let a1 = alloc::alloc_slots(&mut vm, ida).oop();
+    let a2 = alloc::alloc_slots(&mut vm, ida).oop();
+    let u1 = alloc::alloc_slots(&mut vm, idu).oop();
+    let self_smi = SmallInt::new(5).oop();
+    let t = vm.universe.true_obj;
+    let f = vm.universe.false_obj;
+    // (probe, key, expected): both fast legs hit and miss, the smi leg's
+    // key-guard coercion route, the reversed mixed pair, and the unseen
+    // receiver klass.
+    let cases: Vec<(macvm::oops::Oop, macvm::oops::Oop, macvm::oops::Oop)> = vec![
+        (SmallInt::new(7).oop(), SmallInt::new(7).oop(), t),
+        (SmallInt::new(7).oop(), SmallInt::new(8).oop(), f),
+        (a1, a1, t),
+        (a1, a2, f),
+        (SmallInt::new(7).oop(), a1, f), // smi probe, heap key -> slow -> prim-14 fallback ^false
+        (a1, SmallInt::new(7).oop(), f), // IdEqA leg, smi key: identity false
+        (u1, u1, t),                     // unseen klass -> slow send -> its own identity `=`
+        (u1, a1, f),
+    ];
+    let call: CallStubFn = unsafe { std::mem::transmute(vm.stubs.call_stub_entry()) };
+    for (probe, key, want) in cases {
+        let interp = macvm::interpreter::run_method(&mut vm, eqto_m, self_smi, &[probe, key]);
+        assert_eq!(interp.raw(), want.raw(), "interpreter parity");
+        let nm = vm.code_table.get(id).expect("installed");
+        let entry = unsafe { nm.code.base.add(nm.entry_off as usize) } as u64;
+        let vm_ptr: *mut VmState = &mut vm;
+        let result = unsafe {
+            call(
+                entry,
+                vm_ptr,
+                [self_smi.raw(), probe.raw(), key.raw()].as_ptr(),
+                3,
+            )
+        };
+        assert_eq!(result, want.raw(), "compiled parity for probe/key route");
+    }
+}
