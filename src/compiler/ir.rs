@@ -9822,7 +9822,171 @@ pub fn convert(
     let array_meta = crate::oops::wrappers::MemOop::try_from(vm.universe.array_klass.oop())
         .map(|mo| mo.klass());
     range_reduce(&mut irm, array_meta);
+    // Deopt-liveness census (docs/f3c_census_findings.md's sibling; F3c-S1
+    // discipline — greenlight or falsify the per-site-liveness rework before
+    // touching the delicate recording path). Behavior-free.
+    {
+        static LOG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *LOG.get_or_init(|| std::env::var_os("MACVM_DEOPTLIVE_COUNT").is_some()) {
+            let (recorded, live, sites) = deopt_slot_census(method, &irm);
+            if sites > 0 {
+                let sel = crate::oops::wrappers::SymbolOop::try_from(method.selector())
+                    .map(|s| s.as_string())
+                    .unwrap_or_else(|| "?".into());
+                eprintln!(
+                    "deoptlive: recorded={recorded} live={live} dead={} sites={sites} {sel}",
+                    recorded.saturating_sub(live)
+                );
+            }
+        }
+    }
     irm
+}
+
+/// Deopt-liveness census (step 0 of the per-site-liveness rework): over the
+/// ROOT-level `UncommonTrap` deopt sites (the smi-overflow / array-bounds /
+/// guard traps that saturate the hot loops, each of which membership-records
+/// ALL `argc+ntemps` root slots), how many of those recorded slots are
+/// BYTECODE-DEAD at the trap's reexecute bci — i.e. no reachable bytecode
+/// reads the slot before rewriting it, so a re-executing interpreter never
+/// observes its value and it need not be spilled/pinned.
+///
+/// Point-accurate: per-block slot use/def, backward dataflow to fixpoint,
+/// then a within-block backward walk to the trap's own bci. Captured slots
+/// (`irm.ctx_vregs`) count as always-live (an escaping block could read them
+/// post-deopt). Args and temps alike (a dead arg is droppable — the frame
+/// slot is never observed). Inlined-body sites are NOT counted here (their
+/// root bci is indirect); `sites` counts only the root traps measured.
+///
+/// Returns `(recorded_slots, live_slots, n_sites)` summed over root traps.
+fn deopt_slot_census(method: MethodOop, irm: &IrMethod) -> (u64, u64, u64) {
+    let n_slots = (method.argc() + method.ntemps()) as usize; // slot indices 0..n_slots
+    if n_slots == 0 {
+        return (0, 0, 0);
+    }
+    let cfg = crate::compiler::decode::decode(method);
+    let nb = cfg.blocks.len();
+
+    // Per-block use (read-before-write) and def (written) slot sets.
+    let mut use_b: Vec<Vec<bool>> = vec![vec![false; n_slots]; nb];
+    let mut def_b: Vec<Vec<bool>> = vec![vec![false; n_slots]; nb];
+    for (bi, blk) in cfg.blocks.iter().enumerate() {
+        let mut bci = blk.bci_start;
+        while bci < blk.bci_end {
+            let (instr, next) = crate::bytecode::decode_at(method, bci);
+            match instr {
+                Instr::PushTemp(t) => {
+                    let t = t as usize;
+                    if t < n_slots && !def_b[bi][t] {
+                        use_b[bi][t] = true;
+                    }
+                }
+                Instr::StoreTemp(t) | Instr::StoreTempPop(t) => {
+                    let t = t as usize;
+                    if t < n_slots {
+                        def_b[bi][t] = true;
+                    }
+                }
+                _ => {}
+            }
+            bci = next;
+        }
+    }
+    let succs = |bi: usize| -> Vec<usize> {
+        match cfg.blocks[bi].terminator {
+            crate::compiler::decode::Terminator::Fallthrough(t)
+            | crate::compiler::decode::Terminator::Jump { target: t, .. } => vec![t],
+            crate::compiler::decode::Terminator::Branch { if_true, if_false } => {
+                vec![if_true, if_false]
+            }
+            crate::compiler::decode::Terminator::Return => vec![],
+        }
+    };
+    // Backward liveness to fixpoint: live_in[B] = use[B] ∪ (live_out[B] \ def[B]).
+    let mut live_in: Vec<Vec<bool>> = vec![vec![false; n_slots]; nb];
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for bi in (0..nb).rev() {
+            let mut out = vec![false; n_slots];
+            for s in succs(bi) {
+                for t in 0..n_slots {
+                    out[t] |= live_in[s][t];
+                }
+            }
+            for t in 0..n_slots {
+                let nv = use_b[bi][t] || (out[t] && !def_b[bi][t]);
+                if nv && !live_in[bi][t] {
+                    live_in[bi][t] = true;
+                    changed = true;
+                }
+            }
+        }
+    }
+    // Captured slots are always live (an escaping block may read them).
+    let mut captured = vec![false; n_slots];
+    for &cv in &irm.ctx_vregs {
+        let s = cv.0 as usize; // vreg = slot+1
+        if s >= 1 && s - 1 < n_slots {
+            captured[s - 1] = true;
+        }
+    }
+    // Find the block containing a bci.
+    let block_of = |bci: usize| -> Option<usize> {
+        cfg.blocks
+            .iter()
+            .position(|b| bci >= b.bci_start && bci < b.bci_end)
+    };
+
+    let (mut recorded, mut live, mut sites) = (0u64, 0u64, 0u64);
+    for blk in &irm.blocks {
+        for (_, raw) in &blk.deopt_sites {
+            if !matches!(raw.kind, SafepointKind::UncommonTrap) || raw.inline.is_some() {
+                continue; // root traps only in this census
+            }
+            let Some(bi) = block_of(raw.bci) else { continue };
+            // Point liveness at raw.bci: live_out[block] walked back to the bci.
+            let mut liveset = vec![false; n_slots];
+            for s in succs(bi) {
+                for t in 0..n_slots {
+                    liveset[t] |= live_in[s][t];
+                }
+            }
+            // Walk the block's ops backward from bci_end down to raw.bci.
+            let mut ops: Vec<(usize, Instr)> = Vec::new();
+            let mut bci = cfg.blocks[bi].bci_start;
+            while bci < cfg.blocks[bi].bci_end {
+                let (instr, next) = crate::bytecode::decode_at(method, bci);
+                ops.push((bci, instr));
+                bci = next;
+            }
+            for &(obci, instr) in ops.iter().rev() {
+                if obci < raw.bci {
+                    break;
+                }
+                match instr {
+                    Instr::StoreTemp(t) | Instr::StoreTempPop(t) => {
+                        if (t as usize) < n_slots {
+                            liveset[t as usize] = false;
+                        }
+                    }
+                    Instr::PushTemp(t) => {
+                        if (t as usize) < n_slots {
+                            liveset[t as usize] = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let live_here = (0..n_slots)
+                .filter(|&t| liveset[t] || captured[t])
+                .count() as u64;
+            recorded += n_slots as u64;
+            live += live_here;
+            sites += 1;
+        }
+    }
+    (recorded, live, sites)
 }
 
 #[cfg(test)]
