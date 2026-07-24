@@ -202,3 +202,24 @@ seeding into leg=cfg) plus the count-seeded dominant e2e; release
 4-mode world differential (plain, GC_STRESS=1, GC_STRESS=full:64,
 DEOPT_STRESS=64) byte-identical JIT-off vs threshold=20 with correct
 checksums — covering the dead-tail fix and all three slices together.
+
+## 2026-07-25 head-to-head confirmation — richards margin 1.17x -> 1.27x (commit=79be668)
+
+Interleaved 3-round run (load 1.58, quiet gate passed) after the dart124
+poly-inlining arc:
+
+| bench | MACVM ms | Cog ms | verdict |
+|---|---|---|---|
+| arith | 34.9 | 50.8 | MACVM 1.45x |
+| fib | 136.7 | 186.0 | MACVM 1.36x |
+| sieve | 2.3 | 3.6 | MACVM 1.56x |
+| dict | 7.9 | 12.5 | MACVM 1.59x |
+| alloc | 11.8 | 14.5 | MACVM 1.23x |
+| **richards** | **17.5** | 22.3 | **MACVM 1.27x** |
+| deltablue | 2.8 | 3.5 | MACVM 1.27x |
+
+Attribution is clean by the same-session rule: Cog held still (richards
+22.3 vs the prior 21.9-22.1 band, fib 186.0 vs 181-184.5) and MACVM moved
+on the arc's predicted bench — richards 18.8 -> 17.5 (the MACVM-only runs
+bracketed it at 17.8/17.9; 17.5 is best-of-3 under the interleave). All
+seven remain ahead; the richards watch row improves from 1.17x to 1.27x.
