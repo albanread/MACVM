@@ -902,6 +902,27 @@ fn compile_method_full(
             .map(|s| s.as_string())
             .unwrap_or_else(|| "?".into())
     });
+    // F3c S1 census (docs/f3c_design.md step 0, behavior-free — see
+    // `regalloc::f3c_census`): per-unit freed/crossing counts under
+    // MACVM_F3C_COUNT=1, named like the frameless census so the bench
+    // kernels are grep-able. Env read cached once.
+    {
+        static LOG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *LOG.get_or_init(|| std::env::var_os("MACVM_F3C_COUNT").is_some()) {
+            let (freed, crossing, freed_ext) =
+                regalloc::f3c_census(&ir_method, &regalloc_result);
+            if crossing > 0 {
+                let sel = crate::oops::wrappers::SymbolOop::try_from(method.selector())
+                    .map(|s| s.as_string())
+                    .unwrap_or_else(|| "?".into());
+                eprintln!(
+                    "f3c-census: freed={freed} trapext={freed_ext} of {crossing} osr={} {}>>{sel}",
+                    ir_method.is_osr,
+                    holder_name_for_log(vm, rcvr_klass),
+                );
+            }
+        }
+    }
     // F1: emission is opt-in until F2's measurement holds (then F3 flips the
     // default). Blocks keep their frames in v1 regardless — the eligibility
     // scan's Bailout/NlrReturn disqualifiers already exclude block bodies in

@@ -944,6 +944,163 @@ pub struct RegallocResult {
     pub deopt_nil_init_slots: Vec<SpillSlot>,
 }
 
+/// F3c S1 census (docs/f3c_design.md, WINVM): how many spilled intervals
+/// would S1 — "poll-only crossings keep registers, saved by the poll's own
+/// slow path" — actually free in THIS unit? Classification only, zero effect
+/// on allocation; the predicate here IS S1's future eligibility rule, so the
+/// census is step 0 of the implementation, not throwaway.
+///
+/// An interval is S1-freeable iff:
+///   - the compile is not OSR (OSR entries seed SLOTS) and the interval is
+///     GP (S1 defers FP) with a real span;
+///   - every safepoint it crosses is an `Ir::Poll` — one call-shaped
+///     crossing (send/runtime/alloc/box/trap) pins it exactly as today;
+///   - its deopt references (the membership pin via `deopt_referenced`)
+///     come from `LoopPoll` sites ONLY — a vreg any `UncommonTrap` or
+///     inlined-body site records must stay slot-pinned, because S1 does not
+///     teach TRAP paths to save registers (that extension is what the
+///     census exists to size); and
+///   - it is not one of the whole-method pinned vregs (block closure,
+///     materialized Context, promoted ctx-temps).
+///
+/// The honest question this answers before any invasive work (the
+/// falsify-before-building rule): in the hot bench kernels, are the
+/// loop-carried accumulator/induction vregs poll-only — or are they ALSO
+/// recorded by the loop body's smi-overflow traps, in which case S1 as
+/// scoped frees nothing there and the design needs the trap-save extension
+/// first?
+pub(crate) fn f3c_census(method: &IrMethod, ra: &RegallocResult) -> (u32, u32, u32) {
+    use std::collections::HashSet;
+    if method.is_osr {
+        let crossing = ra.intervals.iter().filter(|iv| iv.crosses_safepoint).count() as u32;
+        return (0, crossing, 0);
+    }
+    let n_slots = method.argc as u32 + method.ntemps as u32;
+    let mut pos: u32 = 0;
+    let mut poll_positions: HashSet<u32> = HashSet::new();
+    // Trap positions separated from genuinely call-shaped ones: the
+    // trap-save design extension would let UncommonTrap positions stop
+    // pinning (each trap block saves before its brk), while a real call
+    // (send/runtime/alloc/box — clobbers registers via a callee) pins until
+    // S3's callee-saved story.
+    let mut trap_positions: HashSet<u32> = HashSet::new();
+    let mut call_shaped_positions: Vec<u32> = Vec::new();
+    // Vregs pinned by non-poll deopt origins (trap sites, inlined sites,
+    // ctx-widen) — mirrors compute_intervals' two record loops exactly.
+    let mut pin_vregs: HashSet<u32> = HashSet::new();
+    // The subset that stays pinned even WITH the trap-save extension:
+    // inlined-body sites (their rebuilt multi-frame reads span real calls)
+    // and ctx/closure pins.
+    let mut inline_pin_vregs: HashSet<u32> = HashSet::new();
+    for &bid in &ra.block_order {
+        let block = &method.blocks[bid.0 as usize];
+        for (idx, ir) in block.code.iter().enumerate() {
+            if is_safepoint(ir) {
+                match ir {
+                    Ir::Poll => {
+                        poll_positions.insert(pos);
+                    }
+                    Ir::UncommonTrap { .. } => {
+                        trap_positions.insert(pos);
+                        call_shaped_positions.push(pos);
+                    }
+                    _ => call_shaped_positions.push(pos),
+                }
+            }
+            for (ci, raw) in &block.deopt_sites {
+                if *ci != idx as u32 {
+                    continue;
+                }
+                let trap_kind = matches!(raw.kind, SafepointKind::UncommonTrap);
+                let inlined = raw.inline.is_some();
+                if trap_kind || inlined {
+                    pin_vregs.insert(0);
+                    for s in 1..=n_slots {
+                        pin_vregs.insert(s);
+                    }
+                    for v in &raw.stack {
+                        pin_vregs.insert(v.0);
+                    }
+                }
+                if inlined {
+                    inline_pin_vregs.insert(0);
+                    for s in 1..=n_slots {
+                        inline_pin_vregs.insert(s);
+                    }
+                    for v in &raw.stack {
+                        inline_pin_vregs.insert(v.0);
+                    }
+                    let mut level = raw.inline.as_ref();
+                    while let Some(site) = level {
+                        for set in [&mut pin_vregs, &mut inline_pin_vregs] {
+                            set.insert(site.receiver.0);
+                            for slot in &site.slots {
+                                set.insert(slot.0);
+                            }
+                            for v in &site.caller_pending_stack {
+                                set.insert(v.0);
+                            }
+                        }
+                        level = site.parent.as_deref();
+                    }
+                }
+                // ctx-temps are widened across every deopt site (any kind).
+                for cv in &method.ctx_vregs {
+                    pin_vregs.insert(cv.0);
+                    inline_pin_vregs.insert(cv.0);
+                }
+            }
+            pos += 1;
+        }
+    }
+    if let Some(cv) = method.block_closure_vreg {
+        pin_vregs.insert(cv.0);
+        inline_pin_vregs.insert(cv.0);
+    }
+    if let Some((cv, _)) = method.method_ctx_vreg {
+        pin_vregs.insert(cv.0);
+        inline_pin_vregs.insert(cv.0);
+    }
+    let mut freed = 0u32;
+    let mut freed_with_trap_ext = 0u32;
+    let mut crossing = 0u32;
+    for iv in &ra.intervals {
+        if !iv.crosses_safepoint {
+            continue;
+        }
+        crossing += 1;
+        if iv.is_fp || iv.end <= iv.start {
+            continue;
+        }
+        let crossed_polls = poll_positions
+            .iter()
+            .any(|&p| iv.start <= p && iv.end > p);
+        let crossed_call_shaped = call_shaped_positions
+            .iter()
+            .any(|&p| iv.start <= p && iv.end > p);
+        if crossed_polls && !crossed_call_shaped && !pin_vregs.contains(&iv.vreg.0) {
+            freed += 1;
+        }
+        // The design-revision counter: if TRAP fail edges also saved
+        // registers before their brk (cold, per-site stores — Dart's
+        // SlowPathCode applied to guard fails), only genuinely call-shaped
+        // crossings (send/runtime/alloc/box) and inline-site/ctx pins would
+        // remain. This sizes the extension S1 needs on THIS codebase before
+        // the poll relaxation pays anything.
+        let crossed_real_calls = call_shaped_positions
+            .iter()
+            .any(|&p| iv.start <= p && iv.end > p && !trap_positions.contains(&p));
+        let crossed_traps = trap_positions.iter().any(|&p| iv.start <= p && iv.end > p);
+        if (crossed_polls || crossed_traps)
+            && !crossed_real_calls
+            && !inline_pin_vregs.contains(&iv.vreg.0)
+        {
+            freed_with_trap_ext += 1;
+        }
+    }
+    (freed, crossing, freed_with_trap_ext)
+}
+
 pub fn regalloc(method: &IrMethod) -> RegallocResult {
     let (block_order, mut intervals, safepoint_positions, block_start_pos, extra_oop_live) =
         compute_intervals(method);
