@@ -203,6 +203,20 @@ pub enum Ir {
         b: VReg,
         fail: BlockId,
     },
+    /// R1 (docs/range_analysis_design.md): a `SmiArith` whose tag and
+    /// overflow checks were PROVEN unnecessary — `a` is smi-proven and
+    /// upper-bounded by a dominating `SmiCmpBr{Le|Lt}` against a
+    /// compile-time constant (the compare's own tag check proves smi-ness),
+    /// `b` is a smi constant, and `bound + b <= SMI_MAX`. No fail edge, NOT
+    /// a safepoint, no deopt site: one bare tagged `add`/`sub` (tag-00
+    /// arithmetic is exact). Produced ONLY by `range_reduce`; never by
+    /// translation.
+    SmiArithNoOv {
+        op: SmiOp,
+        dst: VReg,
+        a: VReg,
+        b: VReg,
+    },
     /// S15 step 7 (the sieve fix): Array element READ intrinsified — the
     /// same treatment smi arithmetic got in S14. Inline guards (receiver
     /// mem-tagged AND klass == Array, index smi, 1-based bounds vs the
@@ -228,6 +242,25 @@ pub enum Ir {
         /// Pool literal holding the Array klass oop.
         klass: PoolLit,
         fail: BlockId,
+    },
+    /// R2 (docs/range_analysis_design.md): `ArrayAt` with ALL guards PROVEN
+    /// — receiver is this method's own entry-block `Array new:` (dep-
+    /// protected against redefinition), index is the induction vreg with
+    /// proven bounds `1 <= idx <= size`. One address add + one load. No
+    /// fail edge, NOT a safepoint. Produced ONLY by `range_reduce`.
+    ArrayAtNC {
+        dst: VReg,
+        arr: VReg,
+        idx: VReg,
+    },
+    /// R2: `ArrayAtPut` with guards proven away (same license as
+    /// `ArrayAtNC`); keeps the card barrier — proof covers bounds and
+    /// klass, never generational state.
+    ArrayAtPutNC {
+        dst: VReg,
+        arr: VReg,
+        idx: VReg,
+        val: VReg,
     },
     /// The fusion peephole (D3.2): a comparison send whose ONLY consumer
     /// is an immediately-following `br_true_fwd`/`br_false_fwd`.
@@ -466,6 +499,7 @@ impl Ir {
                 f(*val);
             }
             Ir::SmiArith { a, b, .. }
+            | Ir::SmiArithNoOv { a, b, .. }
             | Ir::SmiCmpBr { a, b, .. }
             | Ir::SmiCmpVal { a, b, .. }
             | Ir::RefCmpVal { a, b, .. } => {
@@ -482,11 +516,11 @@ impl Ir {
                 f(*a);
                 f(*b);
             }
-            Ir::ArrayAt { arr, idx, .. } => {
+            Ir::ArrayAt { arr, idx, .. } | Ir::ArrayAtNC { arr, idx, .. } => {
                 f(*arr);
                 f(*idx);
             }
-            Ir::ArrayAtPut { arr, idx, val, .. } => {
+            Ir::ArrayAtPut { arr, idx, val, .. } | Ir::ArrayAtPutNC { arr, idx, val, .. } => {
                 f(*arr);
                 f(*idx);
                 f(*val);
@@ -543,8 +577,11 @@ impl Ir {
             | Ir::LoadKlass { dst, .. }
             | Ir::LoadField { dst, .. }
             | Ir::SmiArith { dst, .. }
+            | Ir::SmiArithNoOv { dst, .. }
             | Ir::ArrayAt { dst, .. }
             | Ir::ArrayAtPut { dst, .. }
+            | Ir::ArrayAtNC { dst, .. }
+            | Ir::ArrayAtPutNC { dst, .. }
             | Ir::SmiCmpVal { dst, .. }
             | Ir::RefCmpVal { dst, .. }
             | Ir::BoolNot { dst, .. }
@@ -6864,6 +6901,7 @@ fn map_uses(op: &mut Ir, mut f: impl FnMut(VReg) -> VReg) {
             *val = f(*val);
         }
         Ir::SmiArith { a, b, .. }
+        | Ir::SmiArithNoOv { a, b, .. }
         | Ir::SmiCmpBr { a, b, .. }
         | Ir::SmiCmpVal { a, b, .. }
         | Ir::RefCmpVal { a, b, .. } => {
@@ -6880,11 +6918,11 @@ fn map_uses(op: &mut Ir, mut f: impl FnMut(VReg) -> VReg) {
             *a = f(*a);
             *b = f(*b);
         }
-        Ir::ArrayAt { arr, idx, .. } => {
+        Ir::ArrayAt { arr, idx, .. } | Ir::ArrayAtNC { arr, idx, .. } => {
             *arr = f(*arr);
             *idx = f(*idx);
         }
-        Ir::ArrayAtPut { arr, idx, val, .. } => {
+        Ir::ArrayAtPut { arr, idx, val, .. } | Ir::ArrayAtPutNC { arr, idx, val, .. } => {
             *arr = f(*arr);
             *idx = f(*idx);
             *val = f(*val);
@@ -8078,6 +8116,362 @@ fn rewrite_uses(op: &mut Ir, from: u32, to: VReg) {
 
 /// Op-level safepoint test for the promotion's dead-nil-init gate — mirrors
 /// `regalloc::is_safepoint` (kept in sync by the shared-variant match).
+/// R1 (docs/range_analysis_design.md): induction-bounded overflow-check
+/// elimination — the minimal structural form of Dart 1.24.3's range pass.
+///
+/// For each block that is the `if_true` target of `SmiCmpBr { Le|Lt, a, b }`
+/// where `b` resolves to a compile-time smi constant K through single-def
+/// `Move`/`ConstSmi`/`ConstPool`(smi-raw) chains: inside that block, before
+/// any redefinition of `a`, a `SmiArith { Add, a, const c }` with `c > 0`
+/// and `bound + c <= SMI_MAX` can NEVER overflow (upper: `a <= bound`;
+/// lower: `a >= SMI_MIN`, `c > 0` — an add of a positive cannot underflow),
+/// and `a`'s smi-ness was proven by the compare's own tag check on the very
+/// path that reaches this block. Rewritten to `SmiArithNoOv` — no fail
+/// edge, no trap block reference. The orphaned trap block becomes
+/// unreachable and drops out of `reverse_postorder`, taking its deopt
+/// site's membership pins with it (the F3c-census payoff).
+///
+/// Deliberately NOT handled in R1 (each needs more than this structural
+/// argument): `Sub` (underflow needs a LOWER bound), `a + a` (ditto),
+/// `Mul`, bounds derived from non-const vregs, cross-block scopes.
+pub(crate) fn range_reduce(m: &mut IrMethod, array_meta: Option<crate::oops::wrappers::KlassOop>) {
+    use std::collections::HashMap;
+    let entry_blk = match m.blocks.first() {
+        Some(b) => b.id.0,
+        None => return,
+    };
+    // Per-vreg def descriptors, each with its defining BLOCK id (R2's
+    // dominance-lite: an entry-block def dominates every loop block).
+    // `NonSmiConst` matters for the BOUND/LOWER resolutions below: a def
+    // that can never pass the compare's tag check (nil-init `ConstPool`s —
+    // the frontend nil-initializes every temp, so slot vregs all carry one)
+    // is IGNORABLE — on any path where the vreg held it, the compare took
+    // its fail edge and the `if_true` block was never entered.
+    #[derive(Clone, Copy, PartialEq)]
+    enum DefK {
+        Smi(i64),
+        NonSmiConst,
+        MoveFrom(u32),
+        /// dst of `SmiArith{Add}`/`SmiArithNoOv{Add}` — for the LOWER-bound
+        /// induction argument (an add of a positive to the bounded vreg's
+        /// own chain never lowers it).
+        AddOf(u32, u32),
+        /// dst of a guarded-metaclass-receiver `new:` send — the array
+        /// whose size is the send's argument (R2's provenance license,
+        /// dep-protected at rewrite time).
+        NewArr {
+            size: u32,
+            site: u16,
+        },
+        Opaque,
+    }
+    let meta_raw = array_meta.map(|k| k.oop().raw());
+    let mut defs_of: HashMap<u32, Vec<(DefK, u32)>> = HashMap::new();
+    for b in &m.blocks {
+        // Vregs proven (in THIS block, before use) to hold the Array
+        // metaclass — a `GuardKlass` against it dominates the send below.
+        let mut guarded_meta: std::collections::HashSet<u32> = Default::default();
+        for op in &b.code {
+            if let (Ir::GuardKlass { obj, expect, .. }, Some(mr)) = (op, meta_raw) {
+                if m.pool[expect.0 as usize].value == mr {
+                    guarded_meta.insert(obj.0);
+                }
+            }
+            let k = match op {
+                Ir::ConstSmi { value, .. } => Some(DefK::Smi(*value)),
+                Ir::ConstPool { lit, .. } => {
+                    // Tag 00 IS the smi encoding, however the entry was
+                    // interned — relocation is a no-op on smis, so the
+                    // reloc kind is irrelevant to smi-ness.
+                    let e = &m.pool[lit.0 as usize];
+                    if e.value & 3 == 0 {
+                        Some(DefK::Smi((e.value as i64) >> 2))
+                    } else {
+                        Some(DefK::NonSmiConst)
+                    }
+                }
+                Ir::Move { src, .. } => Some(DefK::MoveFrom(src.0)),
+                Ir::SmiArith {
+                    op: SmiOp::Add, a, b, ..
+                }
+                | Ir::SmiArithNoOv {
+                    op: SmiOp::Add, a, b, ..
+                } => Some(DefK::AddOf(a.0, b.0)),
+                Ir::CallSend { site, args, .. }
+                    if args.len() == 2
+                        && guarded_meta.contains(&args[0].0)
+                        && m.call_sites
+                            .get(*site as usize)
+                            .is_some_and(|cs| matches!(cs.selector.as_string().as_str(), "new:" | "basicNew:")) =>
+                {
+                    Some(DefK::NewArr {
+                        size: args[1].0,
+                        site: *site,
+                    })
+                }
+                _ => None,
+            };
+            op.defs(|v| {
+                defs_of
+                    .entry(v.0)
+                    .or_default()
+                    .push((k.unwrap_or(DefK::Opaque), b.id.0));
+            });
+        }
+    }
+    type Defs = HashMap<u32, Vec<(DefK, u32)>>;
+    // Bound resolution: every def is NonSmiConst (ignorable — tag-checked
+    // away) or resolves to ONE agreed smi K. Depth-bounded, cycle-safe.
+    fn resolve_bound(v: u32, defs_of: &Defs, depth: u8) -> Option<i64> {
+        if depth == 0 {
+            return None;
+        }
+        let ds = defs_of.get(&v)?;
+        let mut k: Option<i64> = None;
+        for (d, _) in ds {
+            let dk = match d {
+                DefK::NonSmiConst => continue,
+                DefK::Smi(c) => Some(*c),
+                DefK::MoveFrom(s) => resolve_bound(*s, defs_of, depth - 1),
+                _ => None,
+            }?;
+            match k {
+                None => k = Some(dk),
+                Some(prev) if prev == dk => {}
+                Some(_) => return None,
+            }
+        }
+        k
+    }
+    // Addend resolution is STRICT (single smi def, Moves followed): the
+    // rewritten op loses its own tag check, and nothing dominates the
+    // addend the way the compare dominates the bound.
+    fn resolve_strict(v: u32, defs_of: &Defs, depth: u8) -> Option<i64> {
+        if depth == 0 {
+            return None;
+        }
+        match defs_of.get(&v)?.as_slice() {
+            [(DefK::Smi(c), _)] => Some(*c),
+            [(DefK::MoveFrom(s), _)] => resolve_strict(*s, defs_of, depth - 1),
+            _ => None,
+        }
+    }
+    // LOWER bound (R2's induction argument): min over smi defs; an
+    // `AddOf(a, +const)` whose `a`-chain reaches `root` never lowers the
+    // minimum (the induction step). Inner `None` = the arm imposes no
+    // minimum; outer `None` = unprovable.
+    fn chain_reaches(v: u32, root: u32, defs_of: &Defs, depth: u8) -> bool {
+        if v == root {
+            return true;
+        }
+        if depth == 0 {
+            return false;
+        }
+        matches!(defs_of.get(&v).map(Vec::as_slice),
+            Some([(DefK::MoveFrom(s), _)]) if chain_reaches(*s, root, defs_of, depth - 1))
+    }
+    fn lower_bound(v: u32, root: u32, defs_of: &Defs, depth: u8) -> Option<Option<i64>> {
+        if depth == 0 {
+            return None;
+        }
+        let ds = defs_of.get(&v)?;
+        let mut min: Option<i64> = None;
+        for (d, _) in ds {
+            let arm: Option<i64> = match d {
+                DefK::NonSmiConst => continue,
+                DefK::Smi(c) => Some(*c),
+                DefK::MoveFrom(s) => match lower_bound(*s, root, defs_of, depth - 1)? {
+                    Some(c) => Some(c),
+                    None => continue,
+                },
+                DefK::AddOf(a, b) => {
+                    if resolve_strict(*b, defs_of, 8).is_some_and(|c| c > 0)
+                        && chain_reaches(*a, root, defs_of, 8)
+                    {
+                        continue; // the induction step never lowers the min
+                    }
+                    return None;
+                }
+                _ => return None,
+            };
+            min = match (min, arm) {
+                (None, a) => a,
+                (Some(m), Some(a)) => Some(m.min(a)),
+                (m, None) => m,
+            };
+        }
+        Some(min)
+    }
+    // R2 provenance: `v` is (through entry-block Moves, nil-init arms
+    // ignorable) THE array a guarded entry-block `new:` produced. Every
+    // real def must sit in the ENTRY block — entry-block defs dominate
+    // every loop block, so the nil arms are pre-def only.
+    fn resolve_arr(v: u32, entry: u32, defs_of: &Defs, depth: u8) -> Option<(u32, u16)> {
+        if depth == 0 {
+            return None;
+        }
+        let ds = defs_of.get(&v)?;
+        let mut found: Option<(u32, u16)> = None;
+        for (d, blk) in ds {
+            match d {
+                DefK::NonSmiConst => continue,
+                DefK::MoveFrom(s) if *blk == entry => {
+                    let r = resolve_arr(*s, entry, defs_of, depth - 1)?;
+                    if found.is_some_and(|f| f != r) {
+                        return None;
+                    }
+                    found = Some(r);
+                }
+                DefK::NewArr { size, site } if *blk == entry => {
+                    let r = (*size, *site);
+                    if found.is_some_and(|f| f != r) {
+                        return None;
+                    }
+                    found = Some(r);
+                }
+                _ => return None,
+            }
+        }
+        found
+    }
+    let resolve_bound = |v: u32| resolve_bound(v, &defs_of, 8);
+    let resolve_strict = |v: u32| resolve_strict(v, &defs_of, 8);
+    // (if_true block id) -> (bounded vreg, inclusive upper bound).
+    let mut bounds: HashMap<u32, (u32, i64)> = HashMap::new();
+    for b in &m.blocks {
+        for op in &b.code {
+            if let Ir::SmiCmpBr {
+                op: cmp,
+                a,
+                b: rhs,
+                if_true,
+                ..
+            } = op
+            {
+                let Some(k) = resolve_bound(rhs.0) else {
+                    continue;
+                };
+                let upper = match cmp {
+                    CmpOp::Le => k,
+                    CmpOp::Lt => k - 1,
+                    _ => continue,
+                };
+                // One bound per target block; a block entered by two
+                // different compares keeps only a bound both agree on —
+                // simplest sound rule: first writer wins, a second DIFFERENT
+                // (vreg, bound) poisons the entry.
+                match bounds.get(&if_true.0) {
+                    None => {
+                        bounds.insert(if_true.0, (a.0, upper));
+                    }
+                    Some(&(v0, k0)) if v0 == a.0 && k0 == upper => {}
+                    Some(_) => {
+                        bounds.insert(if_true.0, (u32::MAX, 0));
+                    }
+                }
+            }
+        }
+    }
+    let mut rewritten = 0u32;
+    let mut bounds_rewritten = 0u32;
+    let mut deps: Vec<(crate::oops::wrappers::KlassOop, u16)> = Vec::new();
+    for b in &mut m.blocks {
+        let Some(&(bv, upper)) = bounds.get(&b.id.0) else {
+            continue;
+        };
+        if bv == u32::MAX {
+            continue;
+        }
+        // R2 preconditions shared by every array access on `bv` in this
+        // block: 1 <= lower(bv), and computed once per block.
+        let lower_ok = matches!(
+            lower_bound(bv, bv, &defs_of, 8),
+            Some(Some(c)) if c >= 1
+        );
+        let mut bv_alive = true;
+        for op in &mut b.code {
+            if !bv_alive {
+                break;
+            }
+            match *op {
+                Ir::SmiArith {
+                    op: SmiOp::Add,
+                    dst,
+                    a,
+                    b: rhs,
+                    ..
+                } if a.0 == bv => {
+                    if let Some(c) = resolve_strict(rhs.0) {
+                        if c > 0 && upper.saturating_add(c) <= crate::oops::layout::SMI_MAX {
+                            *op = Ir::SmiArithNoOv {
+                                op: SmiOp::Add,
+                                dst,
+                                a,
+                                b: rhs,
+                            };
+                            rewritten += 1;
+                        }
+                    }
+                }
+                Ir::ArrayAt { dst, arr, idx, .. } if idx.0 == bv && lower_ok => {
+                    if let Some((size_v, site)) = resolve_arr(arr.0, entry_blk, &defs_of, 8) {
+                        if resolve_bound(size_v).is_some_and(|s| s >= upper) {
+                            *op = Ir::ArrayAtNC { dst, arr, idx };
+                            bounds_rewritten += 1;
+                            if let Some(meta) = array_meta {
+                                deps.push((meta, site));
+                            }
+                        }
+                    }
+                }
+                Ir::ArrayAtPut {
+                    dst, arr, idx, val, ..
+                } if idx.0 == bv && lower_ok => {
+                    if let Some((size_v, site)) = resolve_arr(arr.0, entry_blk, &defs_of, 8) {
+                        if resolve_bound(size_v).is_some_and(|s| s >= upper) {
+                            *op = Ir::ArrayAtPutNC { dst, arr, idx, val };
+                            bounds_rewritten += 1;
+                            if let Some(meta) = array_meta {
+                                deps.push((meta, site));
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+            let mut redefined = false;
+            op.defs(|v| {
+                if v.0 == bv {
+                    redefined = true;
+                }
+            });
+            if redefined {
+                bv_alive = false;
+            }
+        }
+    }
+    // One (Array metaclass, #new:) dep per distinct providing send: a
+    // redefinition of `new:` invalidates the proof.
+    for (meta, site) in deps {
+        let sel = m.call_sites[site as usize].selector;
+        if !m
+            .inline_deps
+            .iter()
+            .any(|(k, s)| k.oop().raw() == meta.oop().raw() && s.oop().raw() == sel.oop().raw())
+        {
+            m.inline_deps.push((meta, sel));
+        }
+    }
+    static LOG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if (rewritten > 0 || bounds_rewritten > 0)
+        && *LOG.get_or_init(|| std::env::var_os("MACVM_RANGE_COUNT").is_some())
+    {
+        eprintln!(
+            "range-reduce: {rewritten} overflow + {bounds_rewritten} bounds checks deleted"
+        );
+    }
+}
+
 fn is_safepoint_op(ir: &Ir) -> bool {
     matches!(
         ir,
@@ -9165,6 +9559,13 @@ pub fn convert(
     };
     copy_propagate(&mut irm);
     reduce_float_boxes(&mut irm, osr_bci);
+    // R2 provenance license: the Array METACLASS — a `GuardKlass` against it
+    // proves a `new:` receiver IS the Array class, whose postcondition
+    // (fresh Array of exactly the argument's size) becomes compiler
+    // knowledge, dep-protected against redefinition.
+    let array_meta = crate::oops::wrappers::MemOop::try_from(vm.universe.array_klass.oop())
+        .map(|mo| mo.klass());
+    range_reduce(&mut irm, array_meta);
     irm
 }
 

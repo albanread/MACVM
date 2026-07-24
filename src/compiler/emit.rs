@@ -519,10 +519,14 @@ impl<'a> Emitter<'a> {
     /// `arr at: idx` — guards, then one load. Element v (1-based, tagged
     /// idx = 4v) lives at `arr - MEM_TAG + BODY_OFFSET + 8v` (body word 0
     /// is the size slot): base = arr + 2*idx, load at [base + 15].
-    fn emit_array_at(&mut self, dst: VReg, arr: VReg, idx: VReg, klass: PoolLit, fail: BlockId) {
+    /// `guards: None` is the R2 proven form (`ArrayAtNC`) — receiver/index/
+    /// bounds all statically proven, straight to the access.
+    fn emit_array_at(&mut self, dst: VReg, arr: VReg, idx: VReg, guards: Option<(PoolLit, BlockId)>) {
         let rarr = self.resolve(arr, 16);
         let ridx = self.resolve(idx, 17);
-        self.emit_array_guards(rarr, ridx, klass, fail);
+        if let Some((klass, fail)) = guards {
+            self.emit_array_guards(rarr, ridx, klass, fail);
+        }
         self.asm
             .emit("add", &[x(19), Operand::Reg(rarr), Operand::Reg(ridx)]);
         self.asm.emit("add", &[x(19), x(19), Operand::Reg(ridx)]);
@@ -541,12 +545,13 @@ impl<'a> Emitter<'a> {
         arr: VReg,
         idx: VReg,
         val: VReg,
-        klass: PoolLit,
-        fail: BlockId,
+        guards: Option<(PoolLit, BlockId)>,
     ) {
         let rarr = self.resolve(arr, 16);
         let ridx = self.resolve(idx, 17);
-        self.emit_array_guards(rarr, ridx, klass, fail);
+        if let Some((klass, fail)) = guards {
+            self.emit_array_guards(rarr, ridx, klass, fail);
+        }
         self.asm
             .emit("add", &[x(19), Operand::Reg(rarr), Operand::Reg(ridx)]);
         self.asm.emit("add", &[x(19), x(19), Operand::Reg(ridx)]);
@@ -2181,13 +2186,29 @@ fn emit_ir(e: &mut Emitter, ir: &Ir, next_in_order: Option<BlockId>) {
             b,
             fail,
         } => e.emit_smi_arith_simple(op, dst, a, b, fail),
+        // R1: proven-in-range — no tag check (the dominating compare's own
+        // tag check proved smi-ness on this path), no overflow branch. One
+        // bare tagged op (tag-00 arithmetic is exact for add/sub).
+        Ir::SmiArithNoOv { op, dst, a, b } => {
+            debug_assert!(
+                matches!(op, SmiOp::Add | SmiOp::Sub),
+                "range_reduce only proves Add in R1 (Sub reserved for a lower-bound rung)"
+            );
+            let ra = e.resolve(a, 16);
+            let rb = e.resolve(b, 17);
+            let d = e.dest_target_direct(dst);
+            let mnem = if matches!(op, SmiOp::Add) { "add" } else { "sub" };
+            e.asm
+                .emit(mnem, &[Operand::Reg(d), Operand::Reg(ra), Operand::Reg(rb)]);
+            e.commit(dst, d);
+        }
         Ir::ArrayAt {
             dst,
             arr,
             idx,
             klass,
             fail,
-        } => e.emit_array_at(dst, arr, idx, klass, fail),
+        } => e.emit_array_at(dst, arr, idx, Some((klass, fail))),
         Ir::ArrayAtPut {
             dst,
             arr,
@@ -2195,7 +2216,11 @@ fn emit_ir(e: &mut Emitter, ir: &Ir, next_in_order: Option<BlockId>) {
             val,
             klass,
             fail,
-        } => e.emit_array_at_put(dst, arr, idx, val, klass, fail),
+        } => e.emit_array_at_put(dst, arr, idx, val, Some((klass, fail))),
+        Ir::ArrayAtNC { dst, arr, idx } => e.emit_array_at(dst, arr, idx, None),
+        Ir::ArrayAtPutNC { dst, arr, idx, val } => {
+            e.emit_array_at_put(dst, arr, idx, val, None)
+        }
         Ir::SmiCmpBr {
             op,
             a,

@@ -895,7 +895,13 @@ fn compile_method_full(
     // prologue path, not represented as an `Ir` op, so the op scan alone
     // can't see it (census finding: `String class>>basicNew:` scanned clean
     // — its IR is only the fallback body).
+    // `!is_osr`: an OSR unit needs a frame unconditionally — its entry
+    // seeds interpreter state into SLOTS. Pre-R1 this was implied (every
+    // loop carried a trap-bearing SmiArith, a disqualifier); range_reduce
+    // can now delete every disqualifying op from a simple counting loop,
+    // so the gate must be explicit (caught by osr_compile_emits_entry_and_map).
     let frameless_eligible = method.primitive() == 0
+        && !ir_method.is_osr
         && frameless_eligible(&ir_method, &regalloc_result);
     note_frameless_stats(frameless_eligible, &holder_name_for_log(vm, rcvr_klass), &{
         crate::oops::wrappers::SymbolOop::try_from(method.selector())
@@ -2683,6 +2689,12 @@ fn frameless_eligible(m: &ir::IrMethod, ra: &regalloc::RegallocResult) -> bool {
         | I::SmiCmpVal { .. }
         | I::RefCmpVal { .. }
         | I::BoolNot { .. }
+        // R1/R2: proven-in-range ops have no trap, no call, no safepoint —
+        // pure ALU/memory ops (the PutNC barrier is the inline card
+        // sequence, same license as StoreField).
+        | I::SmiArithNoOv { .. }
+        | I::ArrayAtNC { .. }
+        | I::ArrayAtPutNC { .. }
         | I::Jump { .. }
         | I::BoolBr { .. }
         | I::Ret { .. }
