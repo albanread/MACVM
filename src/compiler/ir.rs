@@ -1094,7 +1094,12 @@ fn array_op_kind_on(vm: &VmState, method: MethodOop, ic_idx: u16) -> Option<bool
     if ic.guard().raw() != vm.universe.array_klass.oop().raw() {
         return None;
     }
-    let target = MethodOop::try_from(ic.target())?;
+    // (klass, selector) resolution, NOT the raw IC target: once the callee
+    // `at:`/`at:put:` compiles, the target is a compiled-nmethod smi id that
+    // `MethodOop::try_from` rejects — the fuse would then DECAY to a
+    // CallSend and stay decayed (the CallSend keeps the callee warm). Same
+    // staleness `is_double_inlinable_on`/`array_size_on` already guard.
+    let target = crate::compiler::feedback::resolve_method_ro(vm, vm.universe.array_klass, ic.selector())?;
     match target.primitive() {
         26 => Some(false),
         27 => Some(true),
@@ -1854,7 +1859,14 @@ impl<'a> Translator<'a> {
         if ic.guard().raw() != self.vm.universe.array_klass.oop().raw() {
             return None;
         }
-        let target = MethodOop::try_from(ic.target())?;
+        // (klass, selector) resolution — see `array_op_kind_on`'s staleness
+        // note (a compiled callee's smi id defeats `MethodOop::try_from`,
+        // decaying the fuse to a CallSend permanently).
+        let target = crate::compiler::feedback::resolve_method_ro(
+            self.vm,
+            self.vm.universe.array_klass,
+            ic.selector(),
+        )?;
         match target.primitive() {
             26 => Some(false), // at:
             27 => Some(true),  // at:put:
