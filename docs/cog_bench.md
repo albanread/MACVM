@@ -167,3 +167,38 @@ and MACVM moved only on F7's predicted prime beneficiary — fib 153.3 ->
 timing). richards matches the frameless-confirmation 18.8 exactly; the
 other five rows are within +-5%. All seven remain ahead with frameless
 (F3) and the fill shrink (F7) both shipped as defaults.
+
+## 2026-07-25 dart124 poly-inlining arc — richards 19.0 -> 17.8 (commit=a3405f4)
+
+The WINVM dart124 items-2+3 port, landed as three gated slices mirroring
+WINVM e545380/b45d2d6/8d9325f (plus the dead-tail unlock, 943d896, ported
+earlier the same day): per-arm PIC counts (interpreter row-7 is the
+profiler; upgrade/append seed the triggering arm at 1), count-proven
+dominance at any arity (16-sample/34%-share floors retire the len==2 pin),
+and SameTargetPoly — the all-arms-one-method splice behind the new
+`Ir::GuardKlassIn` membership guard, leaf leg + CFG-graft leg for
+multi-block predicates.
+
+MACVM-only runs (no Cog interleave this session; the .cog install was
+present but the arc's gate is the checksummed differential, not the
+head-to-head):
+
+| bench | before (session baseline) | after slice 3 | confirm |
+|---|---|---|---|
+| richards | 19.0 (18.9-19.2 band, 4 runs) | **17.8** | 17.9 |
+| deltablue | 2.8 | 2.8 | 2.9 |
+| others | — | flat +-3% | — |
+
+Slices 1 and 2 were bench-flat (WINVM's own instructive negative
+reproduced: richards' hot sites are flat-by-klass AND organic warm-up
+starves an unseeded 16-sample floor — 12 < 16); slice 3's count seeding
+is what unlocked the sites, worth ~6%. Honest framing vs WINVM's -25%:
+their gain came off a 27 ms baseline without our mono-splice machinery;
+the same mechanism buys a smaller real slice on top of ours.
+
+Gates: full lib 835/835; the two new it_tier1 e2es (synthetic-seeded
+membership guard; ORGANIC round-robin warm-up through upgrade/append
+seeding into leg=cfg) plus the count-seeded dominant e2e; release
+4-mode world differential (plain, GC_STRESS=1, GC_STRESS=full:64,
+DEOPT_STRESS=64) byte-identical JIT-off vs threshold=20 with correct
+checksums — covering the dead-tail fix and all three slices together.

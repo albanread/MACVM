@@ -319,11 +319,22 @@ States (same lattice as Strongtalk's interpretedIC):
 - **monomorphic**: guard = klassOop, target = CompiledMethod **or** nmethod id
   (smi handle into the code cache — lets an interpreter IC point at compiled
   code, Strongtalk's `compiled_send` state).
-- **polymorphic**: guard = POLY marker, target = Array `[k1,m1,k2,m2,…]`,
-  max 4 pairs *(tunable)*, ordered first-seen. Interpreter POLY entries carry
-  **no hit counts** in v1; compiled PIC stubs add per-entry counters at S14
-  (the optimizer's dominant-case picker uses those, or first-seen order for
-  2-case interpreter sites).
+- **polymorphic**: guard = POLY marker, target = Array
+  `[k1,m1,k2,m2,…, c1..c4]` — max 4 pairs *(tunable)*, first-seen order in
+  the pairs region, followed by a **count tail** (dart124 items 2+3, ported
+  from WINVM e545380/8d9325f): one smi hit-counter per arm, `nil` reads 0.
+  Counts are bumped ONLY by the interpreter's row-7 poly hit (the
+  unoptimized tier is the profiler; compiled code never counts); the
+  mono→poly upgrade and the row-9 append each seed their triggering arm at
+  1 (the triggering dispatch IS that arm's first hit — organic sequential
+  warm-ups would otherwise starve the optimizer's 16-sample evidence
+  floor). Reverification carries each surviving arm's count through
+  compaction and nils vacated tail slots. `feedback::read_poly` returns
+  cases count-descending (stable — first-seen among ties); the dominant
+  picker requires 16 samples and a 34% share, and an all-arms-one-method
+  site takes the `SameTargetPoly` membership-guard splice instead. Readers
+  must walk the PAIRS REGION only (`IC_POLY_MAX_PAIRS`), never
+  `len()/2` — the tail smis are not klass keys.
 - **megamorphic**: guard = MEGA marker; always consults the lookup cache (§6.1).
 
 Because the table is a normal heap Array, **GC scans ICs for free** and the
