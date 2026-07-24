@@ -1,0 +1,110 @@
+<html>
+<head><title>Worker VMs &amp; OTP Supervision</title></head>
+<body>
+
+<h2 align="center">Worker VMs &amp; OTP Supervision</h2>
+
+<p>MACVM's answer to concurrency is not green threads inside one heap but
+<strong>multiple whole VMs</strong> &mdash; each with its own heap, JIT and
+GC, on its own OS thread &mdash; talking to each other only by copying
+messages. On top of that substrate sits an <strong>OTP-style supervision
+layer</strong>: named services, restart policies, and a deadline-bounded
+request/reply protocol, so a worker crashing is an ordinary, recoverable
+event rather than something calling code has to guard against by hand.</p>
+
+<h3 align="left">Workers: share-nothing parallelism</h3>
+
+<p>The primary VM (the one this help page is running in) can spawn
+<strong>worker VMs</strong> and exchange messages with them by
+<em>deep copy</em> &mdash; never by reference. No shared heap, no shared
+globals, no identity across a VM boundary: Erlang-style share-nothing
+parallelism, driven entirely from Smalltalk.</p>
+
+<pre>
+(Worker spawn: 'Worker onMessage: [:m |
+    Worker reply: m payload]')
+    send: 42
+    onReply: [:r |
+        Transcript showCr: 'got ', r printString].
+</pre>
+
+<p>Every send is fire-and-forget; a reply (if any) runs later as a
+<strong>continuation</strong> (<code>send:onReply:</code>), never by
+blocking &mdash; the primary is never waiting on any one worker, only asleep
+until the next envelope wakes it. The <strong>Demos</strong> menu's
+&ldquo;Mandelbrot &mdash; parallel workers&rdquo; computes every frame in
+bands across 4 worker VMs this same way. Full design:
+<code>docs/multi-smalltalk-worker.md</code>.</p>
+
+<h3 align="left">Supervision: let it crash, then recover</h3>
+
+<p>MACVM has no exception system &mdash; <code>self error:</code> stops the
+current computation outright. Rather than build scoped <code>catch</code>
+handling (deliberately rejected &mdash; see
+<code>docs/design_philosophy_roadmap.md</code>), the worker model answers
+the same problem the way Erlang/OTP does: a crashed worker is reported as an
+ordinary message, and a <strong>supervisor</strong> restarts it by policy.
+Full design: <code>docs/otp_workers_design.md</code>.</p>
+
+<ul>
+	<li><strong>WorkerSupervisor</strong> &mdash; owns a set of named
+	children, starts them in order, and reacts to a child's crash (never a
+	deliberate <code>terminate</code>, which reports no death at all) by
+	its <strong>strategy</strong>: <code>#oneForOne</code> restarts just the
+	dead child, <code>#oneForAll</code> restarts every sibling,
+	<code>#restForOne</code> restarts the dead child and everything started
+	after it. A supervisor can itself be a child of another supervisor,
+	building a tree; a child that exhausts its own restart budget
+	(<strong>intensity</strong>: N restarts within a time window)
+	<em>escalates</em> &mdash; its parent treats the give-up exactly like an
+	ordinary child death.</li>
+	<li><strong>WorkerNames</strong> &mdash; a name registry
+	(<code>WorkerNames named: #sieve</code>), rebound on every restart, so
+	calling code never holds a handle to a corpse.</li>
+	<li><strong>ServiceWorker</strong> &mdash; the request/reply face over a
+	named worker: <code>cast:</code> for fire-and-forget,
+	<code>call:timeoutMs:onReply:onError:</code> for a deadline-bounded
+	request whose every failure mode &mdash; a timeout, the target's death,
+	or an RPC-shaped error &mdash; lands in one <code>onError:</code>
+	funnel. Nothing ever blocks: a deadline is just an entry a periodic
+	sweep retires, on the same cadence the worker inbox already wakes on.</li>
+</ul>
+
+<pre>
+(WorkerSupervisor
+    named: #services strategy: #oneForOne)
+    superviseNamed: #echo
+        init: 'Worker onMessage: [:m |
+            Worker reply: m payload]';
+    start.
+
+(ServiceWorker named: #echo)
+    call: 42 timeoutMs: 2000
+    onReply: [:r |
+        Transcript showCr: 'echoed: ', r printString]
+    onError: [:e |
+        Transcript showCr: 'failed: ', e printString].
+</pre>
+
+<p>The <strong>IoWorker</strong> (<code>world/62_ioworker.mst</code>) is the
+first real service built this way: a dedicated worker multiplexing many
+file descriptors through one <code>kqueue</code>, so no other VM ever blocks
+on I/O. Its kernel-level watch registrations live in the
+<em>primary</em>, not the worker &mdash; so when a supervised IoWorker
+crashes and restarts, no watch needs to be re-registered; an
+<code>afterRestart:</code> hook just rebinds the fresh worker handle and
+resumes polling.</p>
+
+<h3 align="left">Try it</h3>
+
+<p>This page's own VM has the supervision classes loaded, so this really
+runs against them &mdash; though spawning actual worker VMs as a side
+effect of reading documentation would be more surprising than useful, so
+this just confirms what is already there without starting anything:
+<a doit="Transcript showCr: 'Loaded: ', WorkerSupervisor name, ', ', ServiceWorker name, ', ', WorkerNames name">Is the supervision layer loaded?</a></p>
+
+<p><a href="index.html">Back to Documentation Index</a> &middot;
+<a href="architecture.html">MACVM architecture</a></p>
+
+</body>
+</html>

@@ -284,6 +284,39 @@ matrices (the same work run while the collector moves frames underneath
 live compiled code, and while speculation is deliberately broken). A change
 that's faster but shifts one bit does not land.
 
+## Multi-Smalltalk workers & supervision
+
+Concurrency comes from **multiple whole VMs**, not green threads in one
+heap: a primary plus up to 16 **worker VMs**, each with its own heap, JIT
+and GC on its own OS thread, exchanging messages by **deep copy** — no
+shared state, no identity across heaps, Erlang-style. Every send is
+fire-and-forget; a reply runs later as a continuation
+(`Worker spawn` / `send:onReply:`), never by blocking — the primary sleeps
+until the next envelope wakes it, never polls. The Demos menu's
+"Mandelbrot — parallel workers" computes every frame in bands across 4
+worker VMs this way.
+
+MACVM has no exception system — `self error:` stops the current
+computation outright, and scoped `catch` handling was deliberately
+rejected. The **supervision layer** answers the same problem the way
+Erlang/OTP does: a crashed worker is reported as an ordinary message
+(`#workerDied`), and a `WorkerSupervisor` restarts it by policy —
+`#oneForOne` (just the dead child), `#oneForAll` (every sibling),
+`#restForOne` (the dead child and everything started after it), with
+supervisors nesting into trees and a child that exhausts its own restart
+budget escalating to its parent. `WorkerNames` rebinds a service's name on
+every restart, so calling code never holds a handle to a corpse, and
+`ServiceWorker`'s deadline-bounded `call:timeoutMs:onReply:onError:`
+funnels every failure mode — timeout, the target's death, an RPC error —
+into one `onError:`, never a block. The `IoWorker` (a dedicated worker
+multiplexing file descriptors through one `kqueue`, so no other VM ever
+blocks on I/O) is the first real service built this way: its kernel-level
+watches live in the *primary*, so a supervised restart needs no
+re-registration at all.
+
+Full design: `docs/multi-smalltalk-worker.md` and
+`docs/otp_workers_design.md`.
+
 ## How MACVM relates to Strongtalk
 
 **Keeps:** the class model (tagged pointers, no object table); adaptive
@@ -295,11 +328,10 @@ mixin-based inheritance (MACVM uses ordinary single inheritance); the
 glyph-based flyweight UI (MACVM hosts a native window instead — either a
 `WKWebView` or, here, real AppKit). Green/native threads with async C
 callouts take a different shape entirely: MACVM keeps each VM strictly
-single-threaded and gets concurrency from **multiple whole VMs**, each on
-its own native thread with its own heap — a primary plus up to 16 workers
-exchanging deep-copied messages (`Worker spawn:` / `send:onReply:`, star
-topology, no shared state). C callouts are synchronous by design: a
-POSIX FFI tier plus the full Cocoa bridge described above.
+single-threaded and gets concurrency from multiple whole VMs instead (see
+"Multi-Smalltalk workers & supervision" above). C callouts are
+synchronous by design: a POSIX FFI tier plus the full Cocoa bridge
+described above.
 
 **New:** the whole VM in Rust, owing nothing to Strongtalk's source;
 Apple-Silicon-first (arm64, `MAP_JIT`/W^X, pointer-authentication aware);

@@ -39,8 +39,13 @@ rather than Self's prototype/map model.</p>
 	across heaps. Replies run as continuations
 	(<code>send:onReply:</code>); the primary never waits and never polls.
 	The Demos menu's &ldquo;Mandelbrot &mdash; parallel workers&rdquo;
-	computes every frame in bands across 4 worker VMs. See
-	<code>docs/multi-smalltalk-worker.md</code>.</li>
+	computes every frame in bands across 4 worker VMs. An OTP-style
+	supervision layer sits on top &mdash; named services, restart
+	policies, crash recovery &mdash; MACVM's answer to having no exception
+	system: let it crash, then a supervisor restarts it. See
+	<a href="workers.html">Worker VMs &amp; OTP supervision</a>,
+	<code>docs/multi-smalltalk-worker.md</code> and
+	<code>docs/otp_workers_design.md</code>.</li>
 </ul>
 
 <h3 align="left">Where things live</h3>
