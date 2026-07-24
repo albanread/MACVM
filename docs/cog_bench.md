@@ -272,3 +272,25 @@ the receiver klass at all; dict's cost was the storm above, not stale
 adapter links). A naive per-method adapter->entry patch also HANGS: the
 adapter is per-method but customization is per-(klass,method), so a
 wrong-klass caller loops guard-miss -> resolve -> same adapter forever.
+
+## 2026-07-25 head-to-head re-stamp after PolyCmpFuse (commit=776f3e2)
+
+Interleaved 3-round run (load 2.12, gate passed), threshold=20, best-of:
+
+| bench | MACVM ms | Cog ms | verdict |
+|---|---|---|---|
+| arith | 35.6 | 52.9 | MACVM 1.49x |
+| fib | 138.1 | 189.1 | MACVM 1.37x |
+| sieve | 2.1 | 3.6 | MACVM 1.68x |
+| **dict** | **3.2** | 12.9 | **MACVM 4.01x** |
+| alloc | 11.9 | 14.5 | MACVM 1.22x |
+| richards | 17.4 | 22.6 | MACVM 1.30x |
+| **deltablue** | **1.9** | 3.6 | **MACVM 1.84x** |
+
+Attribution clean: one commit (776f3e2, PolyCmpFuse) separates this from
+the 79be668 stamp above, and Cog held its band on every row (52.9 vs
+50.8, 189.1 vs 186.0, 12.9 vs 12.5, 22.6 vs 22.3…). MACVM moved exactly
+on the fuse's benches: dict 7.9 -> 3.2 (1.59x -> 4.01x over Cog) and
+deltablue 2.8 -> 1.9 (1.27x -> 1.84x) — deltablue's poly `=` sites gain
+more at the harness's threshold=20 warmup than the t=1000 A/B showed.
+Former weakest rows are now alloc 1.22x and richards 1.30x.
