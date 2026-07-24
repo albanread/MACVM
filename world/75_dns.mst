@@ -1,0 +1,210 @@
+"75_dns.mst — DNS name resolution over the async worker fleet
+ (docs/dns_design.md). Zero new Rust: getaddrinfo(3) is a FIXED-ARITY
+ four-pointer call, so the whole resolver is S20 FFI + world/61's
+ NativeBuffer/Alien, and the async face is O0-O3 supervision + the
+ worker RPC service that every stock worker already answers.
+
+ Why a worker: getaddrinfo BLOCKS — seconds against a dead resolver —
+ and the primary VM must never block (the worker model's first law).
+ So the blocking walk lives in Dns (runs on whichever VM calls it) and
+ DnsService runs it on a supervised, named worker via ServiceWorker
+ call: — deadline-bounded, every failure funneled to onError:.
+
+ Layers:
+   Posix (reopened) — getaddrinfo/freeaddrinfo/gai_strerror/inet_ntop
+   Dns              — the BLOCKING resolve: C-string staging, hints,
+                      the addrinfo-chain walk, text addresses out
+   DnsService       — the async face on the primary: a supervised #dns
+                      worker serving Dns blockingResolve: by RPC"
+
+"── Posix reopened: the resolver bindings (all fixed-arity) ──────────────"
+Object subclass: Posix [
+    "getaddrinfo(node, service, hints, res) — four pointers, answers 0 or
+     an EAI_* code (NOT errno; gai_strerror turns it into text)."
+    Posix class >> getaddrinfoNode: node <Integer> service: serv <Integer> hints: hints <Integer> result: resPtr <Integer> ^ <Integer> [
+        <primitive: FFI function: #getaddrinfo ret: #g args: #(g g g g)>
+    ]
+    "freeaddrinfo(ai) — returns void: ret: #v."
+    Posix class >> freeaddrinfo: ai <Integer> [
+        <primitive: FFI function: #freeaddrinfo ret: #v args: #(g)>
+    ]
+    "gai_strerror(code) — answers a STATIC C string's address (never freed)."
+    Posix class >> gaiStrerror: code <Integer> ^ <Integer> [
+        <primitive: FFI function: #gai_strerror ret: #g args: #(g)>
+    ]
+    "inet_ntop(af, src, dst, size) — binary address to text into OUR buffer;
+     answers dst's address, or 0 on failure."
+    Posix class >> inetNtop: family <Integer> src: srcAddr <Integer> dst: dstAddr <Integer> size: n <Integer> ^ <Integer> [
+        <primitive: FFI function: #inet_ntop ret: #g args: #(g g g g)>
+    ]
+]
+
+"I am the blocking resolver: blockingResolve: turns a hostname into an
+ Array of textual addresses ('127.0.0.1', '::1', ...) by staging the name
+ in my scratch NativeBuffer page, calling getaddrinfo, and walking the
+ returned addrinfo chain through arbitrary-address Aliens. Resolution
+ failure is a NORMAL outcome (NXDOMAIN is not a bug), so it answers the
+ {#dnsError. code. message} shape instead of raising — a raise on a
+ worker aborts the dispatch and sends NO reply, which would surface as a
+ caller timeout instead of the real message (47_worker.mst).
+
+ struct addrinfo, macOS/arm64 (48 bytes — verified by offsetof, see
+ docs/dns_design.md):
+    0 ai_flags     4 ai_family    8 ai_socktype  12 ai_protocol
+   16 ai_addrlen  24 ai_canonname 32 ai_addr     40 ai_next
+ sockaddr_in: sin_addr at +4.  sockaddr_in6: sin6_addr at +8.
+ AF_INET = 2, AF_INET6 = 30 (Darwin), SOCK_STREAM = 1.
+
+ Scratch page layout (one page per VM, reused — the resolver runs one
+ call at a time on its worker):
+     0..255  hostname C string        256..303  hints (48, zeroed)
+   304..311  result-pointer slot      320..383  inet_ntop text out"
+Object subclass: Dns [
+    <classVars: Scratch>
+
+    Dns class >> scratch ^ <NativeBuffer> [
+        Scratch isNil ifTrue: [ Scratch := NativeBuffer page ].
+        ^Scratch
+    ]
+
+    "Is `r` the {#dnsError. code. message} failure shape blockingResolve:
+     answers? (The async face funnels it to onError:.)"
+    Dns class >> isErrorShape: r <Object> ^ <Boolean> [
+        ^(r isKindOf: Array) and: [ r size = 3 and: [ (r at: 1) == #dnsError ] ]
+    ]
+
+    "Resolve `hostString` to an Array of textual addresses, BLOCKING this
+     VM until the resolver answers — call me on a worker (DnsService), or
+     directly only when blocking is acceptable. IPv4 and IPv6 both come
+     back (AF_UNSPEC); hints.ai_socktype = SOCK_STREAM keeps libc from
+     answering every address three times (once per socket type)."
+    Dns class >> blockingResolve: hostString <String> ^ <Object> [
+        | buf rc first node out |
+        hostString size > 255 ifTrue: [
+            ^Array with: #dnsError with: -1 with: 'hostname too long' ].
+        buf := self scratch.
+        1 to: hostString size do: [ :i |
+            buf byteAt: i - 1 put: (hostString at: i) asInteger ].
+        buf byteAt: hostString size put: 0.
+        buf zero: 48 at: 256.
+        buf u32At: 264 put: 1.          "hints.ai_socktype := SOCK_STREAM"
+        buf i64At: 304 put: 0.
+        rc := Posix getaddrinfoNode: buf address
+                    service: 0
+                    hints: buf address + 256
+                    result: buf address + 304.
+        rc = 0 ifFalse: [
+            ^Array with: #dnsError with: rc
+                   with: (self stringFromAddress: (Posix gaiStrerror: rc) max: 128) ].
+        first := buf i64At: 304.
+        out := OrderedCollection new.
+        node := first.
+        [ node = 0 ] whileFalse: [
+            | a fam addrPtr |
+            a := Alien forAddress: node size: 48.
+            fam := self u32Of: a at: 4.
+            addrPtr := self u64Of: a at: 32.
+            (fam = 2 and: [ addrPtr ~= 0 ]) ifTrue: [
+                self ntop: 2 src: addrPtr + 4 into: out ].
+            (fam = 30 and: [ addrPtr ~= 0 ]) ifTrue: [
+                self ntop: 30 src: addrPtr + 8 into: out ].
+            node := self u64Of: a at: 40 ].
+        Posix freeaddrinfo: first.
+        ^out asArray
+    ]
+
+    "── the walk's little tools ──────────────────────────────────────────"
+    "inet_ntop one binary address into the scratch text slot, then collect
+     the string (skipping a failed conversion, and duplicates — v4-mapped
+     names can repeat)."
+    Dns class >> ntop: family <Integer> src: srcAddr <Integer> into: coll <OrderedCollection> [
+        | buf r s |
+        buf := self scratch.
+        r := Posix inetNtop: family src: srcAddr dst: buf address + 320 size: 64.
+        r = 0 ifTrue: [ ^self ].
+        s := self stringFromAddress: buf address + 320 max: 64.
+        (coll includes: s) ifFalse: [ coll add: s ]
+    ]
+
+    "Compose a u32 field from an Alien's bytes (Alien natively does 1- and
+     8-byte only; accessors are 1-based, `off` is the C offset)."
+    Dns class >> u32Of: anAlien <Object> at: off <Integer> ^ <Integer> [
+        ^(anAlien byteAt: off + 1) + ((anAlien byteAt: off + 2) * 256)
+            + ((anAlien byteAt: off + 3) * 65536)
+            + ((anAlien byteAt: off + 4) * 16777216)
+    ]
+    "A pointer field: signedLongAt: is safe — macOS user addresses fit in
+     48 bits, so the sign bit is never set."
+    Dns class >> u64Of: anAlien <Object> at: off <Integer> ^ <Integer> [
+        ^anAlien signedLongAt: off + 1
+    ]
+    "Read a NUL-terminated C string at a raw address (gai_strerror's static
+     message, inet_ntop's text out)."
+    Dns class >> stringFromAddress: addr <Integer> max: n <Integer> ^ <String> [
+        | a s i b |
+        a := Alien forAddress: addr size: n.
+        s := WriteStream on: (String new: 16).
+        i := 1.
+        [ i <= n ] whileTrue: [
+            b := a byteAt: i.
+            b = 0 ifTrue: [ ^s contents ].
+            s nextPut: (Character value: b).
+            i := i + 1 ].
+        ^s contents
+    ]
+]
+
+"I am the async face on the primary: resolve:timeoutMs:onReply:onError:
+ ships the hostname to a SUPERVISED worker named #dns (spawned on first
+ use, #permanent — it respawns if it dies) as the stock {#rpc. #Dns.
+ #blockingResolve:. {host}} request every worker serves with no handler
+ installed (47_worker.mst §5), through ServiceWorker call: so the reply
+ is deadline-bounded: onError: gets exactly one of #timeout,
+ #workerDied, the RPC error string, or a {#dnsError...} message — and
+ onReply: gets the Array of addresses. Nothing here ever blocks the
+ primary; a dead resolver costs the caller its timeout, not the UI.
+
+   DnsService resolve: 'example.com' onReply: [:addrs | ...].
+   DnsService resolve: 'example.com' timeoutMs: 2000
+       onReply: [:addrs | ...] onError: [:why | ...]."
+Object subclass: DnsService [
+    <classVars: Sup>
+
+    DnsService class >> defaultTimeoutMs ^ <Integer> [ ^5000 ]
+
+    "Spawn the supervised resolver on first use. init: 'nil' — a stock
+     worker with no handler is exactly an RPC server."
+    DnsService class >> ensureStarted ^ <Self> [
+        (WorkerNames named: #dns) isNil ifTrue: [
+            Sup := (WorkerSupervisor named: #dnsSvc strategy: #oneForOne)
+                superviseNamed: #dns init: 'nil'.
+            Sup start ].
+        ^self
+    ]
+    "Deliberate stop (tests): terminate the tree, forget it. Silent — a
+     stopped service is not a died worker."
+    DnsService class >> stop [
+        Sup isNil ifFalse: [ Sup stop. Sup := nil ]
+    ]
+
+    DnsService class >> resolve: host <String> timeoutMs: ms <Integer> onReply: aBlock <Object> onError: anErrorBlock <Object> ^ <Integer> [
+        self ensureStarted.
+        ^(ServiceWorker named: #dns)
+            call: (Array with: #rpc with: #Dns with: #blockingResolve:
+                         with: (Array with: host))
+            timeoutMs: ms
+            onReply: [ :reply |
+                | r |
+                r := reply at: 2.        "{#rpcOk. result}"
+                (Dns isErrorShape: r)
+                    ifTrue: [ anErrorBlock value: (r at: 3) ]
+                    ifFalse: [ aBlock value: r ] ]
+            onError: anErrorBlock
+    ]
+    DnsService class >> resolve: host <String> onReply: aBlock <Object> ^ <Integer> [
+        ^self resolve: host timeoutMs: self defaultTimeoutMs
+             onReply: aBlock
+             onError: [ :why |
+                 Transcript showCr: 'dns: ', host, ' failed: ', why printString ]
+    ]
+]

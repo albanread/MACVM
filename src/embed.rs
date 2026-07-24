@@ -3650,6 +3650,74 @@ mod tests {
     }
 
     #[test]
+    fn dns_service_resolves_on_a_supervised_worker() {
+        // The docs/dns_design.md gate: DnsService ships the hostname to its
+        // supervised #dns worker as the stock {#rpc. #Dns. #blockingResolve:.
+        // {host}} request (no handler installed — the built-in RPC service),
+        // the BLOCKING getaddrinfo walk runs THERE, and the reply funnels
+        // back deadline-bounded. Offline-deterministic: 'localhost' comes
+        // from /etc/hosts, and '' fails EAI_NONAME without touching any
+        // resolver — no network is consulted for either.
+        let mut vm = boot_worker_primary();
+        vm.exec(
+            "Object subclass: DnsT [ <classVars: A E>
+                DnsT class >> a: x [ A := x ]  DnsT class >> a [ ^A ]
+                DnsT class >> e: x [ E := x ]  DnsT class >> e [ ^E ] ]",
+        )
+        .expect("scoreboard");
+
+        // Success path: every reply funnels to onReply:, never onError:.
+        vm.exec("WkTest reset.").expect("reset ticks");
+        vm.exec(
+            "DnsService resolve: 'localhost' timeoutMs: 8000
+                 onReply: [:addrs | DnsT a: addrs]
+                 onError: [:why | DnsT e: why].",
+        )
+        .expect("ship the resolve to the supervised worker");
+        vm.exec(
+            "Worker runLoopWhile: [ (WkTest tickCapped: 800)
+                 and: [ DnsT a isNil and: [ DnsT e isNil ] ] ].",
+        )
+        .expect("pump until the reply lands");
+        assert_eq!(
+            vm.eval("DnsT e").expect("e").trim(),
+            "nil",
+            "resolving localhost must not fail"
+        );
+        assert_eq!(
+            vm.eval("DnsT a includes: '127.0.0.1'").expect("v4").trim(),
+            "true",
+            "/etc/hosts guarantees 127.0.0.1 for localhost"
+        );
+
+        // Failure path: a {#dnsError...} from the worker funnels to onError:
+        // as the MESSAGE STRING — and exactly one of the two blocks fires.
+        vm.exec("DnsT a: nil. DnsT e: nil. WkTest reset.")
+            .expect("reset the scoreboard");
+        vm.exec(
+            "DnsService resolve: '' timeoutMs: 8000
+                 onReply: [:addrs | DnsT a: addrs]
+                 onError: [:why | DnsT e: why].",
+        )
+        .expect("ship the doomed resolve");
+        vm.exec(
+            "Worker runLoopWhile: [ (WkTest tickCapped: 800)
+                 and: [ DnsT a isNil and: [ DnsT e isNil ] ] ].",
+        )
+        .expect("pump until the error lands");
+        assert_eq!(
+            vm.eval("DnsT a").expect("a").trim(),
+            "nil",
+            "the doomed resolve must not answer addresses"
+        );
+        assert_eq!(
+            vm.eval("DnsT e isString").expect("e is string").trim(),
+            "true",
+            "EAI_NONAME must arrive as gai_strerror's message via onError:"
+        );
+    }
+
+    #[test]
     fn worker_inbox_wake_fires_and_coalesces() {
         // §3.1: the send itself is the wake, coalesced by the pending flag —
         // a burst of N replies produces at least one wake and at most N.

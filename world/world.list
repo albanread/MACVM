@@ -137,3 +137,8 @@
 # OTP-style supervision over the worker fleet (docs/otp_workers_design.md O0):
 # WorkerSpec/WorkerSupervisor(#oneForOne)/WorkerNames/SupervisorRegistry.
 74_supervisor.mst
+
+# DNS name resolution over the async worker fleet: Posix getaddrinfo/inet_ntop
+# bindings, Dns (the blocking addrinfo-chain walk), DnsService (a supervised
+# #dns worker serving resolves by RPC, deadline-bounded). docs/dns_design.md.
+75_dns.mst
