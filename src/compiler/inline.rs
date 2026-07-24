@@ -127,15 +127,21 @@ pub fn is_inline_eligible_nonleaf(method: MethodOop) -> bool {
     if method.primitive() != 0 || method.has_ctx() || method.is_block() {
         return false;
     }
-    // Single straight-line block ending in a return: reuse the decode CFG the
-    // splicer itself validates against, so the two agree by construction.
+    // The ENTRY block must run straight into a return: reuse the decode CFG
+    // the splicer itself validates against, so the two agree by construction.
+    // Trailing blocks after a Return-terminated entry are UNREACHABLE by
+    // construction (a Return has no successors) — the frontend appends an
+    // implicit `^self` after EVERY method body (`codegen.rs`'s `emit_body`),
+    // so a method whose real last statement already returns (`^ivar`, the
+    // overwhelming majority of real accessors) carries exactly such a dead
+    // second block. Requiring `blocks.len() == 1` rejected every one of them
+    // — ported from WINVM's dart124 finding, confirmed here via decode.rs's
+    // own `unreachable_after_return` test proving the shape.
     let cfg = crate::compiler::decode::decode(method);
-    if cfg.blocks.len() != 1
-        || !matches!(
-            cfg.blocks[0].terminator,
-            crate::compiler::decode::Terminator::Return
-        )
-    {
+    if !matches!(
+        cfg.blocks[0].terminator,
+        crate::compiler::decode::Terminator::Return
+    ) {
         return false;
     }
     // No opcode outside the set the non-leaf splicer handles. A `super` send,

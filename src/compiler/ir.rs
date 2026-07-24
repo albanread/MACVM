@@ -1961,18 +1961,23 @@ impl<'a> Translator<'a> {
         pre_pop_stack: &[VReg],
         code: &mut Vec<Ir>,
     ) -> Option<VReg> {
-        // MINIMUM viable scope: the callee must be a SINGLE straight-line block
-        // ending in a return, and its arity must match what we popped. A
-        // multi-block leaf (a branch/loop with no sends) or an arity mismatch is
-        // out of this narrow step's scope — decline, and the caller does a plain
-        // Call. Validate against the CFG BEFORE emitting anything.
+        // MINIMUM viable scope: the callee's ENTRY block must run straight
+        // into a return, and its arity must match what we popped. A branch/
+        // loop BEFORE the first return, or an arity mismatch, is out of this
+        // narrow step's scope — decline, and the caller does a plain Call.
+        // Validate against the CFG BEFORE emitting anything. Trailing blocks
+        // after a Return-terminated entry are UNREACHABLE by construction (a
+        // Return has no successors) — the frontend's implicit `^self` tail
+        // (every method body, `codegen.rs`'s `emit_body`) is exactly such a
+        // dead block, and requiring `blocks.len() == 1` here rejected every
+        // real-world accessor (WINVM dart124 finding; the splice walk below
+        // already breaks at the first Return, so a dead tail is never
+        // translated).
         let callee_cfg = crate::compiler::decode::decode(callee);
-        if callee_cfg.blocks.len() != 1
-            || !matches!(
-                callee_cfg.blocks[0].terminator,
-                crate::compiler::decode::Terminator::Return
-            )
-            || callee.argc() != args.len()
+        if !matches!(
+            callee_cfg.blocks[0].terminator,
+            crate::compiler::decode::Terminator::Return
+        ) || callee.argc() != args.len()
         {
             return None;
         }
@@ -2245,18 +2250,18 @@ impl<'a> Translator<'a> {
         if !crate::compiler::inline::is_inline_eligible_nonleaf(callee) {
             return None;
         }
-        // Same MINIMUM viable shape as the leaf splice: a single straight-line
-        // block ending in a return, arity matching. Validate against the CFG
-        // BEFORE emitting anything. `is_inline_eligible_nonleaf` already proved
-        // the single-block/return/no-super shape at decision time, but the
+        // Same MINIMUM viable shape as the leaf splice: the ENTRY block runs
+        // straight into a return (trailing blocks are unreachable by
+        // construction — the frontend's implicit `^self` tail; see the leaf
+        // splicer's identical comment), arity matching. Validate against the
+        // CFG BEFORE emitting anything. `is_inline_eligible_nonleaf` already
+        // proved the entry-Return/no-super shape at decision time, but the
         // arity check is site-specific, so re-confirm here.
         let callee_cfg = crate::compiler::decode::decode(callee);
-        if callee_cfg.blocks.len() != 1
-            || !matches!(
-                callee_cfg.blocks[0].terminator,
-                crate::compiler::decode::Terminator::Return
-            )
-            || callee.argc() != args.len()
+        if !matches!(
+            callee_cfg.blocks[0].terminator,
+            crate::compiler::decode::Terminator::Return
+        ) || callee.argc() != args.len()
         {
             return None;
         }
@@ -4958,13 +4963,18 @@ impl<'a> Translator<'a> {
                     // splice succeeds before emitting anything (the slow block
                     // is minted first, and an orphaned block would be dead
                     // weight; a half-spliced fast path would be corruption).
+                    // Entry-block-Return, NOT blocks.len()==1 — the frontend's
+                    // implicit `^self` tail is a dead trailing block every real
+                    // accessor carries (same relaxation as `try_inline_leaf`;
+                    // WINVM dart124 finding). Unlike the leaf/nonleaf/cfg
+                    // ladder above, THIS site has no further fallback below —
+                    // before this fix, any dominant case_method ending in an
+                    // explicit `^` declined straight to a plain uninlined Call.
                     let callee_cfg = crate::compiler::decode::decode(case_method);
-                    let spliceable = callee_cfg.blocks.len() == 1
-                        && matches!(
-                            callee_cfg.blocks[0].terminator,
-                            crate::compiler::decode::Terminator::Return
-                        )
-                        && case_method.argc() == real_argc as usize
+                    let spliceable = matches!(
+                        callee_cfg.blocks[0].terminator,
+                        crate::compiler::decode::Terminator::Return
+                    ) && case_method.argc() == real_argc as usize
                         && leaf_body_is_spliceable(case_method);
                     if spliceable {
                         let selector = ic_view.selector();
