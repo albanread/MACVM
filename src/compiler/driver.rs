@@ -2677,6 +2677,7 @@ fn frameless_eligible(m: &ir::IrMethod, ra: &regalloc::RegallocResult) -> bool {
         | I::FConst { .. }
         | I::VecArith { .. }
         | I::GuardKlass { .. }
+        | I::GuardKlassIn { .. } // deopt-adjacent fail edge + its CallSend slow block
         | I::CallSend { .. }
         | I::CallRuntime { .. }
         | I::Alloc { .. }

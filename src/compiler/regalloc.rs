@@ -142,7 +142,7 @@ pub(crate) fn successors(block: &IrBlock) -> Vec<BlockId> {
             // this — a latent bug to report upstream.)
             | Ir::BoolNot { fail, .. }
             | Ir::VecArith { fail, .. } => succs.push(*fail),
-            Ir::GuardKlass { fail, .. } => succs.push(*fail),
+            Ir::GuardKlass { fail, .. } | Ir::GuardKlassIn { fail, .. } => succs.push(*fail),
             // S11 D7: `Alloc` is self-contained (fast path + internal slow
             // call, `emit::emit_alloc`) — no slow CFG successor. It stays a
             // safepoint via `is_safepoint` so live-across vregs spill before
