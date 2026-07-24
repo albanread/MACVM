@@ -163,6 +163,7 @@ fn run_ir_raw() {
         inline_deps: Vec::new(),
         self_devirt: false,
         method_pool_ix: None,
+        deopt_live_slots: None,
     };
 
     let regalloc_result = regalloc::regalloc(&method);
@@ -316,6 +317,7 @@ fn mul_method() -> IrMethod {
         inline_deps: Vec::new(),
         self_devirt: false,
         method_pool_ix: None,
+        deopt_live_slots: None,
     }
 }
 
@@ -450,6 +452,7 @@ fn run_ir_raw_forces_spill() {
         inline_deps: Vec::new(),
         self_devirt: false,
         method_pool_ix: None,
+        deopt_live_slots: None,
     };
 
     let regalloc_result = regalloc::regalloc(&method);
@@ -2574,6 +2577,7 @@ fn mono_resolve_patches_call_site_and_dispatches() {
         inline_deps: Vec::new(),
         self_devirt: false,
         method_pool_ix: None,
+        deopt_live_slots: None,
     };
     let ra = regalloc::regalloc(&caller_method);
     let mut asm = JasmAssembler::new();
@@ -2767,6 +2771,7 @@ fn build_c2i_scenario(vm: &mut VmState) -> (u64, KlassOop, NmethodId) {
         inline_deps: Vec::new(),
         self_devirt: false,
         method_pool_ix: None,
+        deopt_live_slots: None,
     };
     let ra = regalloc::regalloc(&caller_method);
     let mut asm = JasmAssembler::new();
@@ -3024,6 +3029,7 @@ fn full_ic_lattice_mono_to_pic_to_mega() {
         inline_deps: Vec::new(),
         self_devirt: false,
         method_pool_ix: None,
+        deopt_live_slots: None,
     };
     let ra = regalloc::regalloc(&caller_method);
     let mut asm = JasmAssembler::new();
@@ -3275,6 +3281,7 @@ fn dnu_from_compiled_code_reaches_does_not_understand() {
         inline_deps: Vec::new(),
         self_devirt: false,
         method_pool_ix: None,
+        deopt_live_slots: None,
     };
     let ra = regalloc::regalloc(&caller_method);
     let mut asm = JasmAssembler::new();

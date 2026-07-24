@@ -365,8 +365,33 @@ pub fn compute_intervals(
                     }
                 };
                 record(0);
-                for s in 1..=n_slots {
-                    record(s);
+                // Deopt-liveness rework (docs/deopt_liveness_findings.md):
+                // a ROOT `UncommonTrap` with a bytecode-live-slot set records
+                // only those slots — the dead rest resolve to `Nil` in
+                // `resolve_frame_loc` and re-execution never reads them. Any
+                // other kind (LoopPoll, an inlined-body trap), or the flag
+                // off (`deopt_live_slots == None`), keeps membership.
+                let reduced = if matches!(raw.kind, SafepointKind::UncommonTrap)
+                    && raw.inline.is_none()
+                {
+                    method
+                        .deopt_live_slots
+                        .as_ref()
+                        .and_then(|m| m.get(&raw.bci))
+                } else {
+                    None
+                };
+                match reduced {
+                    Some(live) => {
+                        for &v in live {
+                            record(v);
+                        }
+                    }
+                    None => {
+                        for s in 1..=n_slots {
+                            record(s);
+                        }
+                    }
                 }
                 for &v in &raw.stack {
                     record(v.0);
@@ -1249,6 +1274,7 @@ mod tests {
             inline_deps: Vec::new(),
             self_devirt: false,
             method_pool_ix: None,
+            deopt_live_slots: None,
         }
     }
 

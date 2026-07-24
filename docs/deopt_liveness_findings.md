@@ -49,20 +49,48 @@ before overwriting.
   matter. (DBG4 pins a breakpointed method to tier-0, so compiled frames
   are never debugged — the frameless design already relies on this.)
 
-## Disposition — GREENLIT, next is the rework
+## The rework was BUILT (slice 1, root traps) — and measured: flat, with a corrected hypothesis
 
-Unlike F3c S1, the rework is worth building. The change:
-`compute_intervals`' `record()` loops (regalloc.rs) stop recording all
-`1..=n_slots` and instead record receiver + operand stack + only the
-bytecode-live-in slots at each site's bci. Fewer forced
-`crosses_safepoint` pins ⇒ fewer spills, smaller oopmaps, fewer task-#94
-nil-fills — and the loop-carried vregs F3c wanted in registers stop being
-pinned by dead-slot records.
+`compute_intervals` now records receiver + operand stack + only the
+bytecode-live slots at each ROOT `UncommonTrap` (via `root_trap_live_slots`,
+the census's shared oracle), behind `MACVM_DEOPTLIVE=1`. Flag OFF =
+membership, byte-identical.
 
-Risk is real (the earlier-safepoint task-#94 coverage, the BUG-D
-path-sensitivity scars, the ctx-capture and inlined-frame interactions),
-so the rework lands behind its own flag with the full 4-mode +
-DEOPT_STRESS differential as the gate, and the F3c census re-run
-(`MACVM_F3C_COUNT`) as the confirming second signal — it should move off
-`freed=0` once the dead-slot pins are gone. The census stays permanently
-as the ceiling instrument.
+**Correctness (sound):** 4-mode release world differential byte-identical
+off-vs-`MACVM_DEOPTLIVE=1`, INCLUDING `DEOPT_STRESS=64` — the sharp gate,
+which forces every trap to deopt+re-execute, so a wrongly-dropped live
+slot would read nil and mismatch. It doesn't.
+
+**But the measured effect is essentially ZERO, and two hypotheses were
+WRONG:**
+
+1. *"It will unblock F3c residency."* WRONG. The 58% dead slots are dead
+   TEMPS clustered in large cold-ish methods (projectionTest: 350 of 512).
+   The loop-carried accumulator/induction vregs F3c wants in registers are
+   LIVE at their traps (read every iteration, by definition) — so liveness
+   recording correctly keeps them pinned. Dead slots and F3c-target slots
+   are DISJOINT. F3c census re-run with the flag: STILL `freed=0`.
+
+2. *"Fewer records ⇒ fewer spills/nil-fills."* WRONG at slice 1. Frame
+   slots across the whole suite: 1716 → **1713** (−3, 0.2%). Nil-fills:
+   996 → **996** (zero). Per hot kernel: zero change, every one. Wall-clock
+   (interleaved best-of-3): flat, ±4% both directions = noise.
+
+**Why slice 1 is a structural near-no-op — the subsumption insight:** the
+~1415 removed root-trap records are REDUNDANT. The same dead-temp vregs
+are still pinned by the LoopPoll and inlined-body sites (left at
+membership) and by their own cross-safepoint liveness, so dropping the
+root-trap record doesn't unpin the slot. A slot only truly unpins when
+dropped at ALL its sites at once.
+
+## Disposition — KEPT behind the off-by-default flag as a FOUNDATION
+
+Slice 1 is sound and complete but pays nothing alone. It is retained
+(default OFF ⇒ zero impact) as the first plank + the `root_trap_live_slots`
+machinery for a future ALL-SITE reduction (root + LoopPoll + inlined
+consistently), which is the only version that could move frames — at much
+higher risk (LoopPoll loop-carried liveness, inlined multi-frame
+liveness). The scenario that would justify that: an aggressive inliner
+minting far more deopt sites and dead slots (dart124 item 2). Until then,
+the census (`MACVM_DEOPTLIVE_COUNT`) and `MACVM_FRAMESTAT` stay as the
+permanent ceiling + effect instruments.

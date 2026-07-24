@@ -2409,6 +2409,7 @@ mod tests {
             inline_deps: Vec::new(),
             self_devirt: false,
             method_pool_ix: None,
+            deopt_live_slots: None,
         }
     }
 
@@ -2859,6 +2860,7 @@ mod tests {
             inline_deps: Vec::new(),
             self_devirt: false,
             method_pool_ix: None,
+            deopt_live_slots: None,
         };
         let ra = regalloc::regalloc(&method);
         let mut asm = JasmAssembler::new();
@@ -3269,6 +3271,7 @@ mod tests {
             inline_deps: Vec::new(),
             self_devirt: false,
             method_pool_ix: None,
+            deopt_live_slots: None,
         };
         let ra = regalloc::regalloc(&method);
         let mut asm = JasmAssembler::new();

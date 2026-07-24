@@ -410,6 +410,7 @@ fn compiled_mono_caller_guard_keeps_key_klass_alive() {
         inline_deps: Vec::new(),
         self_devirt: false,
         method_pool_ix: None,
+        deopt_live_slots: None,
     };
     let ra = regalloc::regalloc(&call_hot_method_ir);
     let mut asm = JasmAssembler::new();
@@ -575,6 +576,7 @@ fn install_loop_nmethod(
         inline_deps: Vec::new(),
         self_devirt: false,
         method_pool_ix: None,
+        deopt_live_slots: None,
     };
     let ra: RegallocResult = regalloc::regalloc(&ir);
     let mut asm = JasmAssembler::new();

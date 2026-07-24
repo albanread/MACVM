@@ -908,6 +908,22 @@ fn compile_method_full(
             .map(|s| s.as_string())
             .unwrap_or_else(|| "?".into())
     });
+    // Deopt-liveness stat (behind MACVM_FRAMESTAT=1): the CONCRETE effect of
+    // the recording reduction — frame slots + prologue nil-fills per compile.
+    // Run flag-off vs MACVM_DEOPTLIVE=1 and diff the sums.
+    {
+        static LOG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *LOG.get_or_init(|| std::env::var_os("MACVM_FRAMESTAT").is_some()) {
+            let sel = crate::oops::wrappers::SymbolOop::try_from(method.selector())
+                .map(|s| s.as_string())
+                .unwrap_or_else(|| "?".into());
+            eprintln!(
+                "framestat: slots={} nilfills={} {sel}",
+                regalloc_result.frame_slots,
+                regalloc_result.deopt_nil_init_slots.len()
+            );
+        }
+    }
     // F3c S1 census (docs/f3c_design.md step 0, behavior-free — see
     // `regalloc::f3c_census`): per-unit freed/crossing counts under
     // MACVM_F3C_COUNT=1, named like the frameless census so the bench
