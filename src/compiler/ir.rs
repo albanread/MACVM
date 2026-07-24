@@ -1102,6 +1102,17 @@ fn array_op_kind_on(vm: &VmState, method: MethodOop, ic_idx: u16) -> Option<bool
     }
 }
 
+/// Free-function twin of `Translator::array_size_op` for an INLINED
+/// callee's own IC table (the splicers' in-body fuse — same pattern as
+/// `array_op_kind_on`).
+fn array_size_on(vm: &VmState, method: MethodOop, ic_idx: u16) -> bool {
+    let ic = InterpreterIc::at(method, ic_idx);
+    // (klass, selector) resolution — see `array_size_op`'s staleness note.
+    ic.guard().raw() == vm.universe.array_klass.oop().raw()
+        && crate::compiler::feedback::resolve_method_ro(vm, vm.universe.array_klass, ic.selector())
+            .is_some_and(|t| t.primitive() == 28)
+}
+
 /// Float fast-path: free-function twin of `Translator::is_double_inlinable`
 /// for an INLINED callee's own IC table (the splicers fuse their bodies'
 /// Double ops to `FUnbox`/`FArith`/`FBox`/`FCmpVal` exactly like their smi
@@ -1849,6 +1860,27 @@ impl<'a> Translator<'a> {
             27 => Some(true),  // at:put:
             _ => None,
         }
+    }
+
+    /// Dict-probe intrinsic (profile-driven, S15's exact shape): a
+    /// mono-Array `size` send (primitive 28). The length is the TAGGED SMI
+    /// at body word 0, so the fuse is one klass guard + one
+    /// `LoadField{16}` instead of a `bl stub_call_primitive` round trip
+    /// (`scanFor:`'s `cap := keys size` — 121+135 top-of-stack samples in
+    /// the dict bench profile).
+    fn array_size_op(&self, method: MethodOop, ic_idx: u16) -> bool {
+        let ic = InterpreterIc::at(method, ic_idx);
+        // Resolve by (klass, selector), NOT the raw IC target: a hot site's
+        // mono target is a compiled-nmethod smi id (`set_mono_compiled`),
+        // which `MethodOop::try_from` rejects — the same staleness
+        // `is_double_inlinable_on` handles the same way.
+        ic.guard().raw() == self.vm.universe.array_klass.oop().raw()
+            && crate::compiler::feedback::resolve_method_ro(
+                self.vm,
+                self.vm.universe.array_klass,
+                ic.selector(),
+            )
+            .is_some_and(|t| t.primitive() == 28)
     }
 
     fn is_smi_inlinable(&self, ic_idx: u16) -> bool {
@@ -2623,6 +2655,33 @@ impl<'a> Translator<'a> {
                             self.fresh_inlined_trap_block(inner_bci, reexec, inline_proto.clone());
                         let dst = self.fresh(true);
                         code.push(Ir::BoolNot { dst, src, fail });
+                        cstack.push(dst);
+                        bci = next;
+                        continue;
+                    }
+                    if array_size_on(self.vm, callee, ic) {
+                        // Dict-probe intrinsic (see the root arm).
+                        let arr_op = cstack.pop().expect("size fuse: missing receiver");
+                        let mut reexec = cstack.clone();
+                        reexec.push(arr_op);
+                        let fail =
+                            self.fresh_inlined_trap_block(inner_bci, reexec, inline_proto.clone());
+                        let expect = self.pool.intern(
+                            self.vm.universe.array_klass.oop().raw(),
+                            Some(RelocKind::Oop),
+                        );
+                        code.push(Ir::GuardKlass {
+                            obj: arr_op,
+                            expect,
+                            fail,
+                            kind: GuardShape::KlassTest,
+                        });
+                        let dst = self.fresh(true);
+                        code.push(Ir::LoadField {
+                            dst,
+                            obj: arr_op,
+                            byte_off: 16,
+                        });
                         cstack.push(dst);
                         bci = next;
                         continue;
@@ -3470,6 +3529,38 @@ impl<'a> Translator<'a> {
                                 bci = next;
                                 continue;
                             }
+                        }
+                        if array_size_on(self.vm, callee, ic) {
+                            // Dict-probe intrinsic (see the root arm).
+                            cstack_ph.truncate(cstack.len().saturating_sub(1));
+                            let arr_op = cstack.pop().expect("size fuse: missing receiver");
+                            let mut reexec = cstack.clone();
+                            reexec.push(arr_op);
+                            let fail = self.fresh_inlined_trap_block(
+                                inner_bci,
+                                reexec,
+                                inline_proto.clone(),
+                            );
+                            let expect = self.pool.intern(
+                                self.vm.universe.array_klass.oop().raw(),
+                                Some(RelocKind::Oop),
+                            );
+                            bcode.push(Ir::GuardKlass {
+                                obj: arr_op,
+                                expect,
+                                fail,
+                                kind: GuardShape::KlassTest,
+                            });
+                            let dst = self.fresh(true);
+                            bcode.push(Ir::LoadField {
+                                dst,
+                                obj: arr_op,
+                                byte_off: 16,
+                            });
+                            cstack.push(dst);
+                            cstack_ph.push(false);
+                            bci = next;
+                            continue;
                         }
                         if let Some(is_put) = array_op_kind_on(self.vm, callee, ic) {
                             // S15: in-body array intrinsic (see the root arm).
@@ -4483,6 +4574,49 @@ impl<'a> Translator<'a> {
                         fail: fail_id,
                     });
                 }
+                stack.push(dst);
+            }
+            // Dict-probe intrinsic: mono-Array `size` (prim 28) — one klass
+            // guard + one tagged-smi load of body word 0 (see
+            // `array_size_op`'s doc). Same fail-only, no-split discipline as
+            // the at:/at:put: arm above.
+            Instr::Send { ic, .. } if self.array_size_op(self.method, ic) => {
+                let reexec_stack = stack.clone();
+                let expect = self.pool.intern(
+                    self.vm.universe.array_klass.oop().raw(),
+                    Some(RelocKind::Oop),
+                );
+                let fail_id = self.fresh_block_id();
+                self.finish_block(IrBlock {
+                    id: fail_id,
+                    bci,
+                    code: vec![Ir::UncommonTrap { bci }],
+                    entry_stack: Vec::new(),
+                    deopt_sites: vec![(
+                        0,
+                        DeoptRaw {
+                            stack: reexec_stack,
+                            bci,
+                            kind: SafepointKind::UncommonTrap,
+                            reexecute: true,
+                            stack_closures: Vec::new(),
+                            inline: None,
+                        },
+                    )],
+                });
+                let arr = stack.pop().expect("size: missing receiver operand");
+                code.push(Ir::GuardKlass {
+                    obj: arr,
+                    expect,
+                    fail: fail_id,
+                    kind: GuardShape::KlassTest,
+                });
+                let dst = self.fresh(true);
+                code.push(Ir::LoadField {
+                    dst,
+                    obj: arr,
+                    byte_off: 16,
+                });
                 stack.push(dst);
             }
             // Float fast-path (docs/float_fastpath_design.md B2 rule 1): a
@@ -6360,6 +6494,33 @@ impl<'a> Translator<'a> {
                     // the nonleaf splicer's identical arm) — THE flagship
                     // accumulate block `[:e| sum := sum + e]` becomes a real
                     // `adds` instead of a per-iteration stub call.
+                    if array_size_on(self.vm, block, inner_ic_idx) {
+                        // Dict-probe intrinsic (see the root arm).
+                        let arr_op = bstack.pop().expect("size fuse: missing receiver");
+                        let mut reexec = bstack.clone();
+                        reexec.push(arr_op);
+                        let fail =
+                            self.fresh_inlined_trap_block(inner_bci, reexec, inline_proto.clone());
+                        let expect = self.pool.intern(
+                            self.vm.universe.array_klass.oop().raw(),
+                            Some(RelocKind::Oop),
+                        );
+                        code.push(Ir::GuardKlass {
+                            obj: arr_op,
+                            expect,
+                            fail,
+                            kind: GuardShape::KlassTest,
+                        });
+                        let dst = self.fresh(true);
+                        code.push(Ir::LoadField {
+                            dst,
+                            obj: arr_op,
+                            byte_off: 16,
+                        });
+                        bstack.push(dst);
+                        bci = next;
+                        continue;
+                    }
                     if let Some(is_put) = array_op_kind_on(self.vm, block, inner_ic_idx) {
                         // S15: in-body array intrinsic (see the root arm).
                         let val = if is_put {
