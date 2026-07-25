@@ -73,6 +73,12 @@ impl RusttclCtx {
 /// ([`crate::runtime::globals::global_lookup`]). Shared by every verb that
 /// takes a class-name argument.
 pub fn resolve_klass(ctx: &mut RusttclCtx, name: &str) -> Result<KlassOop, String> {
+    // "Foo class" resolves to Foo's METACLASS (the runtime::debug pin/bp
+    // spec convention) — so class-side methods reach disasm/methods/ic too.
+    if let Some(base) = name.strip_suffix(" class") {
+        let k = resolve_klass(ctx, base)?;
+        return Ok(k.klass());
+    }
     let sym = ctx.vm.universe.intern(name.as_bytes());
     let assoc = crate::runtime::globals::global_lookup(&ctx.vm, sym)
         .ok_or_else(|| format!("no such global: {name}"))?;

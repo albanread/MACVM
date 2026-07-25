@@ -365,6 +365,41 @@ struct Emitter<'a> {
     s2_smi: Vec<bool>,
     /// The S2 store set as `(vreg, start, end, reg, slot)` (GPR only).
     s2_spill_stores: Vec<(u32, u32, u32, u8, crate::compiler::regalloc::SpillSlot)>,
+    /// R1a (`r1a_mode`): pool registers (x21–x27) with NO resident
+    /// assignment anywhere in this method — free to shadow spilled
+    /// values. Empty when every pool register is a resident (feature
+    /// inert) or when `MACVM_R1A=0`.
+    r1a_free: Vec<u8>,
+    /// R1a: `slot.0 -> shadow register currently holding that slot's
+    /// value`. Seeded by `commit` after its write-through store and by
+    /// `resolve` on a vreg's second reload; cleared at block starts and
+    /// before every `is_safepoint_op` (a call/GC may rewrite slots and
+    /// callee nmethods use the pool registers as their own residents).
+    r1a_shadow: std::collections::HashMap<u16, u8>,
+    /// R1a: reverse map — which slot each shadow register mirrors, so a
+    /// modulo collision evicts the previous entry instead of leaving a
+    /// stale one.
+    r1a_of_reg: std::collections::HashMap<u8, u16>,
+    /// R1a (`r1a_profitable_positions`): the positions where seeding pays
+    /// — a later same-region read of the same slot exists. Consulted by
+    /// both seed sites; everywhere else the store/load stays bare.
+    r1a_profitable: std::collections::HashSet<u32>,
+    /// R1a census (printed under MACVM_S2_COUNT): loads served from a
+    /// shadow / shadows seeded, this emission.
+    r1a_hits: u32,
+    r1a_seeds: u32,
+    /// R1a: shadow registers handed to the CURRENT op as resolved
+    /// operands. A seed must never retarget one of these before the op's
+    /// instructions consume it (the sieve miscompile: operand a's hit
+    /// returned x27, then operand b's promotion `mov x27, x17` clobbered
+    /// it and the add computed b+b). Cleared after every op.
+    r1a_hits_live: Vec<u8>,
+    /// R1a: true while a safepoint op's own lowering is emitting. A seed
+    /// planted BEFORE its `bl` (e.g. a VecArith operand's promotion)
+    /// would survive the call with the pre-GC value while the slot moves
+    /// on — so no seeds at all inside a safepoint op. (Its result commit
+    /// loses a minor optimization; correctness first.)
+    r1a_in_safepoint_op: bool,
     /// F3: vregs whose every def is the SAME ConstSmi — no slot traffic at
     /// all: commit skips the store, resolve/reloads rematerialize a movz,
     /// deopt uses ValueLoc::ConstSmi, the GC map skips the slot.
@@ -533,6 +568,84 @@ fn s2_mode() -> u8 {
     })
 }
 
+/// R1a (docs/richards_profile.md): slot-aware resolve. Spilled values are
+/// SHADOWED into pool registers regalloc assigned to nobody this method —
+/// nothing else ever writes those registers between safepoints, so a
+/// shadow seeded by `commit`'s write-through (or promoted on a repeat
+/// reload) stays equal to its slot until the next safepoint or block
+/// join, and `resolve` serves the register instead of re-loading the
+/// slot. Slots stay canonical and every store still happens — GC, deopt,
+/// and the oop maps see exactly the pre-R1a frame; only redundant LOADS
+/// disappear. `MACVM_R1A=0` opts out (byte-identical emission);
+/// `MACVM_R1A=2` is the differential checker: every hit ALSO loads the
+/// slot and `brk`s if the shadow disagrees.
+fn r1a_mode() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var_os("MACVM_R1A") {
+        Some(v) if v == "0" || v == "off" => 0,
+        Some(v) if v == "2" => 2,
+        _ => 1,
+    })
+}
+
+/// R1a checker mode: an UNREGISTERED brk imm — the SIGTRAP handler finds
+/// no trap site at the pc and aborts with a loud dossier, which is the
+/// point (a shadow register disagreed with its canonical slot).
+const R1A_POISON_BRK: u16 = 0xC1A0;
+
+/// R1a: the positions (shared emit/regalloc numbering) where a seed PAYS
+/// — a later read of the same slot exists in the same straight-line
+/// region (before the next safepoint op or block boundary). A seed
+/// anywhere else is pure cost: the canonical case is a loop-tail commit
+/// whose shadow dies at the header's block-start clear before any use —
+/// one dead `mov` per iteration (the first A/B's arith/sieve
+/// regression). Same region model as emission: regions end BEFORE a
+/// safepoint op (the clear runs pre-op) and at block ends.
+fn r1a_profitable_positions(
+    method: &IrMethod,
+    block_order: &[BlockId],
+    assignment: &[Option<Assignment>],
+    resident: &[Option<u8>],
+    const_smi: &std::collections::HashMap<u32, i64>,
+) -> std::collections::HashSet<u32> {
+    let mut profitable = std::collections::HashSet::new();
+    let slot_of = |v: VReg| -> Option<u16> {
+        if resident[v.0 as usize].is_some() || const_smi.contains_key(&v.0) {
+            return None;
+        }
+        match assignment[v.0 as usize] {
+            Some(Assignment::Spill(slot)) => Some(slot.0),
+            _ => None,
+        }
+    };
+    let mut pos: u32 = 0;
+    for bid in block_order {
+        let block = &method.blocks[bid.0 as usize];
+        // (slot -> seed-candidate positions awaiting a later same-region use)
+        let mut open: std::collections::HashMap<u16, Vec<u32>> = std::collections::HashMap::new();
+        for ir in &block.code {
+            if crate::compiler::ir::is_safepoint_op(ir) {
+                open.clear();
+            }
+            ir.uses(|v| {
+                if let Some(slot) = slot_of(v) {
+                    if let Some(list) = open.remove(&slot) {
+                        profitable.extend(list);
+                    }
+                    open.entry(slot).or_default().push(pos);
+                }
+            });
+            ir.defs(|v| {
+                if let Some(slot) = slot_of(v) {
+                    open.entry(slot).or_default().push(pos);
+                }
+            });
+            pos += 1;
+        }
+    }
+    profitable
+}
+
 /// Poison canary: a POSITIVE tagged smi (low two bits 00 — GC ignores it,
 /// no pointer chase) whose upper bits spell 0xC0DE and whose low field
 /// carries the spill-slot index. A stale read that reaches any failure
@@ -575,7 +688,24 @@ impl<'a> Emitter<'a> {
                     emit_mov_imm64(self.asm, xr(scratch), (cv << 2) as u64);
                     return xr(scratch);
                 }
+                // R1a: the slot's value is already mirrored in a shadow
+                // register — serve that (no load). Call sites never write a
+                // register `resolve` returns unless it is the scratch they
+                // passed (the invariant residents already rely on), so
+                // handing back the shadow is as safe as handing back a
+                // resident.
+                if r1a_mode() != 0 {
+                    if let Some(r) = self.r1a_lookup(slot, scratch) {
+                        return r;
+                    }
+                }
                 emit_spill_access(self.asm, "ldr", x(scratch), slot);
+                // R1a: promote the loaded value into a shadow — but only
+                // when the prepass proved a later same-region read exists
+                // to serve from it.
+                if r1a_mode() != 0 && self.r1a_profitable.contains(&self.pos) {
+                    self.r1a_seed(slot, xr(scratch));
+                }
                 xr(scratch)
             }
         }
@@ -663,6 +793,17 @@ impl<'a> Emitter<'a> {
         if let Assignment::Spill(slot) = self.assignment_of(dst) {
             if !self.s2_smi[dst.0 as usize] {
                 emit_spill_access(self.asm, "str", Operand::Reg(computed_in), slot);
+                // R1a: the freshly-stored value is in `computed_in` right
+                // now — shadow it so later resolves skip the reload, but
+                // only where the prepass proved a same-region reader
+                // exists. Residents need no shadow (resolve reads them
+                // directly).
+                if r1a_mode() != 0
+                    && self.resident[dst.0 as usize].is_none()
+                    && self.r1a_profitable.contains(&self.pos)
+                {
+                    self.r1a_seed(slot, computed_in);
+                }
             } else if s2_mode() == 2 {
                 // Poison-canary mode: mirror the value into the resident
                 // FIRST (computed_in may itself be x16/x17), then clobber
@@ -697,6 +838,78 @@ impl<'a> Emitter<'a> {
         for (rr, slot) in live {
             emit_spill_access(self.asm, "str", x(rr), slot);
         }
+    }
+
+    /// R1a: forget every slot↔shadow association. Called at block starts
+    /// (a join's predecessors emitted under different associations), before
+    /// every safepoint op (its call may GC — slots get rewritten and the
+    /// callee nmethod uses the pool registers as its own residents), and at
+    /// the OSR entry section.
+    fn r1a_clear(&mut self) {
+        self.r1a_shadow.clear();
+        self.r1a_of_reg.clear();
+    }
+
+    /// R1a: the (fixed, per-method) shadow register for `slot` — modulo
+    /// over the free pool, so one slot always shadows to one register and
+    /// eviction is a plain map replace.
+    fn r1a_shadow_reg_for(&self, slot: crate::compiler::regalloc::SpillSlot) -> Option<u8> {
+        if self.r1a_free.is_empty() {
+            return None;
+        }
+        Some(self.r1a_free[slot.0 as usize % self.r1a_free.len()])
+    }
+
+    /// R1a: record that `from` holds `slot`'s value, mirroring it into the
+    /// slot's shadow register. Called by `commit` right after its
+    /// write-through store and by `resolve` on a demonstrated re-reader.
+    fn r1a_seed(&mut self, slot: crate::compiler::regalloc::SpillSlot, from: Reg) {
+        let Some(sr) = self.r1a_shadow_reg_for(slot) else {
+            return;
+        };
+        // The current op already holds this register as a resolved operand
+        // — retargeting it now would corrupt that operand before the op's
+        // own instructions read it. Decline; the existing entry (if any)
+        // stays valid precisely BECAUSE we didn't overwrite the register.
+        if self.r1a_hits_live.contains(&sr) {
+            return;
+        }
+        // No seeds inside a safepoint op — anything planted before its
+        // `bl` would serve a pre-GC value afterwards.
+        if self.r1a_in_safepoint_op {
+            return;
+        }
+        if let Some(old) = self.r1a_of_reg.insert(sr, slot.0) {
+            if old != slot.0 {
+                self.r1a_shadow.remove(&old);
+            }
+        }
+        self.r1a_shadow.insert(slot.0, sr);
+        if from.num != sr {
+            self.asm.emit("mov", &[x(sr), Operand::Reg(from)]);
+        }
+        self.r1a_seeds += 1;
+    }
+
+    /// R1a: serve `slot` from its shadow register if one is current.
+    /// Under `MACVM_R1A=2` the hit ALSO loads the canonical slot into
+    /// `scratch` and `brk`s on disagreement (`R1A_POISON_BRK` is
+    /// unregistered — the trap handler aborts with a dossier).
+    fn r1a_lookup(&mut self, slot: crate::compiler::regalloc::SpillSlot, scratch: u8) -> Option<Reg> {
+        let sr = *self.r1a_shadow.get(&slot.0)?;
+        if r1a_mode() == 2 {
+            emit_spill_access(self.asm, "ldr", x(scratch), slot);
+            self.asm.emit("cmp", &[x(scratch), x(sr)]);
+            let ok = self.asm.new_label();
+            self.asm.b_cond(Cond::Eq, ok);
+            crate::codecache::deopt_trap::emit_brk(self.asm, R1A_POISON_BRK);
+            self.asm.bind(ok);
+        }
+        self.r1a_hits += 1;
+        if !self.r1a_hits_live.contains(&sr) {
+            self.r1a_hits_live.push(sr);
+        }
+        Some(xr(sr))
     }
 
     /// Smi fast path S1: each side's guard is emitted only when the vreg is
@@ -2400,6 +2613,22 @@ pub fn emit(
         known_smi: known_smi_set,
         s2_smi,
         s2_spill_stores,
+        r1a_free: {
+            let mut used = [false; 32];
+            for iv in &regalloc.intervals {
+                if let Some(rr) = iv.resident_reg {
+                    used[rr as usize] = true;
+                }
+            }
+            (21u8..=27).filter(|&r| !used[r as usize]).collect()
+        },
+        r1a_shadow: std::collections::HashMap::new(),
+        r1a_of_reg: std::collections::HashMap::new(),
+        r1a_profitable: std::collections::HashSet::new(),
+        r1a_hits: 0,
+        r1a_seeds: 0,
+        r1a_hits_live: Vec::new(),
+        r1a_in_safepoint_op: false,
         s2_extra,
         proven_smi_at: proven_smi_positions(method, regalloc),
         const_smi: crate::compiler::ir::const_smi_vregs(method),
@@ -2447,6 +2676,15 @@ pub fn emit(
             })
             .collect(),
     };
+    if r1a_mode() != 0 {
+        e.r1a_profitable = r1a_profitable_positions(
+            method,
+            &regalloc.block_order,
+            &e.assignment,
+            &e.resident,
+            &e.const_smi,
+        );
+    }
 
     // Prologue (D5.2): frame_bytes = 8*frame_slots, rounded to 16.
     //
@@ -2525,9 +2763,22 @@ pub fn emit(
         // emitted within it (block-granularity, matching `poll_bci`'s own
         // precedent — GC correctness never needs bci, only trace does).
         e.current_bci = block.bci;
+        // R1a: a block start is a join — predecessors emitted under
+        // different slot↔shadow associations, so none survive it.
+        e.r1a_clear();
 
         let next_in_order = regalloc.block_order.get(i + 1).copied();
         for ir in &block.code {
+            // R1a: a safepoint op's call may GC (slots rewritten under the
+            // frame walk) and its callee uses the pool registers as its
+            // own residents — every shadow dies at the op's start (before,
+            // not after: nothing inside the op's own lowering may serve a
+            // shadow across its `bl`).
+            let sp_op = crate::compiler::ir::is_safepoint_op(ir);
+            if sp_op {
+                e.r1a_clear();
+                e.r1a_in_safepoint_op = true;
+            }
             // S12: `e.pos` is THIS ir's own position, in the EXACT same
             // linear numbering `regalloc::compute_intervals` used —
             // incremented AFTER emitting (matching that function's own
@@ -2535,6 +2786,10 @@ pub fn emit(
             // mid-emission reads the position it was actually computed at.
             emit_ir(&mut e, ir, next_in_order);
             e.pos += 1;
+            // R1a: resolved-operand registers are consumed within one op's
+            // emission — the next op may retarget them.
+            e.r1a_hits_live.clear();
+            e.r1a_in_safepoint_op = false;
         }
     }
 
@@ -2565,6 +2820,9 @@ pub fn emit(
     // the first real safepoint is inside the loop body, which carries full
     // scope descs; a deopt there rebuilds the mid-loop interpreter frame).
     let osr_entry_off = osr.map(|req| {
+        // R1a: cold tail emitted after the body — no shadow association
+        // from the body's last block may leak into it.
+        e.r1a_clear();
         let entry_off = e.asm.offset();
         e.asm.emit(
             "stp",
@@ -2611,6 +2869,12 @@ pub fn emit(
         entry_off
     });
 
+    if std::env::var_os("MACVM_S2_COUNT").is_some() && (e.r1a_hits > 0 || e.r1a_seeds > 0) {
+        eprintln!(
+            "r1acensus hits={} seeds={} free={:?}",
+            e.r1a_hits, e.r1a_seeds, e.r1a_free
+        );
+    }
     let ic_sites = e.ic_sites;
     let safepoints = e.safepoints;
     (

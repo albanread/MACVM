@@ -9391,7 +9391,7 @@ pub(crate) fn range_reduce(m: &mut IrMethod, array_meta: Option<crate::oops::wra
     }
 }
 
-fn is_safepoint_op(ir: &Ir) -> bool {
+pub(crate) fn is_safepoint_op(ir: &Ir) -> bool {
     matches!(
         ir,
         Ir::CallSend { .. }

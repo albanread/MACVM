@@ -626,6 +626,7 @@ fn install_loop_nmethod(
             ra.frame_slots,
             sp.position,
             &ra.extra_oop_live,
+            &Default::default(),
         );
         let idx = oopmap::intern(&mut oopmaps, map);
         pcdescs.push(PcDesc {

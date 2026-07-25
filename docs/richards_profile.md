@@ -116,3 +116,52 @@ every bench, fib included — its write-throughs are param/self oops).
 - Fixed: `flag jit <mode>` in a `rusttcl` session that booted with the
   JIT off now arms the SIGTRAP deopt handler; previously the first
   organic deopt killed the shell (exit 133).
+
+## R1a landed — slot-aware resolve (shadow residency in free pool registers)
+
+The mechanism: pool registers (x21–x27) that `assign_residents` left
+unassigned this method are written by NOTHING in the body — so `commit`
+mirrors its write-through value into the slot's (fixed, modulo-chosen)
+free register, and `resolve` serves later reads from it with zero
+instructions. Slots stay canonical: every store still happens, GC/deopt/
+oop maps see the exact pre-R1a frame; only redundant loads disappear.
+Cleared at block starts (joins), before every `is_safepoint_op` (its
+callee uses the pool registers as its own residents, and its GC rewrites
+slots), and at the OSR tail. `MACVM_R1A=0` opts out; `MACVM_R1A=2` is
+the differential checker (every hit also loads the slot and `brk
+#0xC1A0`s on disagreement).
+
+Two real bugs found en route, both now structural guards:
+
+1. **Seed-clobbers-outstanding-hit** (the sieve infinite loop): operand
+   a's hit returned x27, then operand b's promotion `mov x27, x17`
+   retargeted it before the op's `adds` consumed it — computing b+b.
+   The poison checker COULDN'T see this (the shadow's value was right;
+   the caller's operand register was the casualty); lldb on the hung
+   loop named it in one attach. Guard: `r1a_hits_live` — no seed may
+   retarget a register handed out as a hit in the current op.
+2. **Dead loop-tail seeds** (arith +3%/sieve +8% in the first A/B):
+   every in-loop commit seeded, and the header's block-start clear
+   killed the entry before any use — one dead `mov` per iteration.
+   Guard: `r1a_profitable_positions`, a prepass over the shared
+   emit/regalloc numbering marking exactly the positions with a later
+   same-region read of the same slot; both seed sites consult it.
+   Plus: no seeds at all inside a safepoint op's own lowering (a
+   pre-`bl` seed would serve a pre-GC value afterwards).
+
+Measured (four interleaved A/Bs vs fc8232e, best-of, load-gated):
+**richards −6.5..−8.9% (16.6 → ~15.0-15.5 ms)**, **dict −2.9..−5.7%**,
+**deltablue −2.0..−3.5%**, fib/arith/alloc flat; sieve +4% on the final
+layout (codegen structurally identical, 288 vs 286 insns — the
+alignment-bimodality class fib showed in F2; it swung −5.9..+7.9 across
+builds all day; alignment padding remains the standing de-noising
+lever). Gates: checksums both thresholds, tier1 104/0, it_gc_jit
+(revived — its build had been broken since F3's signature change),
+focused debug suites, GC_STRESS both flavors, poison-mode × GC_STRESS,
+R1A=0 opt-out, GUI render boot. Known pre-existing failure documented
+en route: DEOPT_STRESS=64 aborts ~7/8 runs at deopt.rs:665 ("root-block
+scope's receiver ValueLoc must hold the closure") on BASE and R1a trees
+alike — task-flagged, not this slice's regression.
+
+R1a is the first rung of R1; **R1b (heap oops resident across
+safepoints via register-aware oop maps) remains the asymptote-mover.**
