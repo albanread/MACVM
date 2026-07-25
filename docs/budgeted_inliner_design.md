@@ -205,3 +205,28 @@ suite-positive. Gates: tier1 104/0, focused debug suites (codecache 63,
 deopt 24, send 38, driver 25 — 0-fail), stress modes, fresh GUI
 GC_VERIFY boot, both-threshold checksums. Follow-up lever noted:
 branch/function alignment padding as a generic stabilizer.
+
+## F3 landed: ConstSmi slot elision — the untriggered materializer arm fires
+
+A vreg whose EVERY def is the SAME `ConstSmi` needs no slot traffic at
+all. The deopt materializer's `ValueLoc::ConstSmi` arm existed since S13
+("wired in a later step") — F3 is that later step, the producer side:
+`resolve_frame_loc` returns `ConstSmi(v)` for const-uniform vregs (deopt
+rematerializes; the OSR-transfer path deliberately keeps full slot
+semantics), `oopmap::build_for_position` skips their slots (GC never
+scans what is never written), and emission goes slot-free end to end —
+`commit` skips the store, `resolve` and the resident reloads
+rematerialize a `movz`, the S2 sets exclude them, and the call-argument
+parallel-move gains `Src::Imm` (the F1 lesson applied preemptively: the
+marshalling reads slots too, so a const arg materializes straight into
+its x0..x5 destination — an Imm reads no register and can never join a
+shuffle cycle).
+
+Measured (two 4-5-round A/Bs): **fib −10.5%/−10.6%** (const
+write-throughs + dead-slot reloads gone, and F2's alignment penalty
+flipped back with the new layout), **dict −2.8%**, sieve −4.3%/+1.5%
+(band), rest flat. Gates: tier1 104/0, focused debug suites, it_gc_jit,
+GC_STRESS both flavors + DEOPT_STRESS both thresholds (the critical
+ones: unwritten slots under GC at every safepoint, ConstSmi
+materialization under forced deopt), GUI GC_VERIFY boot, both-threshold
+checksums.

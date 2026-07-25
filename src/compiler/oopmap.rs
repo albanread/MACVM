@@ -54,6 +54,9 @@ pub fn build_for_position(
     frame_slots: u16,
     position: u32,
     extra_oop_live: &[(VReg, u32)],
+    // F3: const-uniform smi vregs — their slots are NEVER written (deopt
+    // rematerializes via ValueLoc::ConstSmi), so the GC must not scan them.
+    skip_vregs: &std::collections::HashSet<u32>,
 ) -> OopMap {
     let mut map = OopMap::empty();
     // One pass over the facts per POSITION (not per interval × position):
@@ -68,7 +71,7 @@ pub fn build_for_position(
         .map(|&(v, _)| v.0)
         .collect();
     for iv in intervals {
-        if !iv.is_oop {
+        if !iv.is_oop || skip_vregs.contains(&iv.vreg.0) {
             continue;
         }
         let Some(Assignment::Spill(slot)) = iv.assignment else {
@@ -207,7 +210,7 @@ mod tests {
             spilled(0, 0, true, 0, 5),  // ends at 5, safepoint is at 10: dead
             spilled(1, 1, true, 0, 20), // spans 10: live
         ];
-        let map = build_for_position(&intervals, 2, 10, &[]);
+        let map = build_for_position(&intervals, 2, 10, &[], &Default::default());
         assert!(
             !map.is_oop(0),
             "interval ending before the safepoint must be excluded"
@@ -230,16 +233,16 @@ mod tests {
         let intervals = vec![spilled(0, 0, true, 0, 5)];
         let extra = [(VReg(0), 80)];
         assert!(
-            !build_for_position(&intervals, 1, 68, &extra).is_oop(0),
+            !build_for_position(&intervals, 1, 68, &extra, &Default::default()).is_oop(0),
             "an unrelated safepoint numerically between the organic end and \
              the forced trap position must NOT see the vreg as live"
         );
         assert!(
-            build_for_position(&intervals, 1, 80, &extra).is_oop(0),
+            build_for_position(&intervals, 1, 80, &extra, &Default::default()).is_oop(0),
             "the EXACT forced position must see the vreg as live"
         );
         assert!(
-            !build_for_position(&intervals, 1, 81, &extra).is_oop(0),
+            !build_for_position(&intervals, 1, 81, &extra, &Default::default()).is_oop(0),
             "one past the forced position must not — this is a point fact, \
              not a range"
         );
@@ -251,7 +254,7 @@ mod tests {
     #[test]
     fn oopmap_excludes_interval_ending_at_position() {
         let intervals = vec![spilled(0, 0, true, 0, 10)];
-        let map = build_for_position(&intervals, 1, 10, &[]);
+        let map = build_for_position(&intervals, 1, 10, &[], &Default::default());
         assert!(!map.is_oop(0));
     }
 
@@ -268,14 +271,14 @@ mod tests {
     #[test]
     fn oopmap_excludes_interval_starting_at_position() {
         let intervals = vec![spilled(0, 0, true, 10, 20)];
-        let map = build_for_position(&intervals, 1, 10, &[]);
+        let map = build_for_position(&intervals, 1, 10, &[], &Default::default());
         assert!(
             !map.is_oop(0),
             "a call's own dst (def AT the safepoint) must not be traced during the call"
         );
         // ...and the very next safepoint, once the value genuinely exists,
         // covers it normally.
-        let map_later = build_for_position(&intervals, 1, 15, &[]);
+        let map_later = build_for_position(&intervals, 1, 15, &[], &Default::default());
         assert!(map_later.is_oop(0));
     }
 
@@ -285,7 +288,7 @@ mod tests {
     #[test]
     fn oopmap_excludes_non_oop_interval() {
         let intervals = vec![spilled(0, 0, false, 0, 20)];
-        let map = build_for_position(&intervals, 1, 10, &[]);
+        let map = build_for_position(&intervals, 1, 10, &[], &Default::default());
         assert!(!map.is_oop(0));
     }
 

@@ -68,7 +68,12 @@ pub fn resolve_frame_loc(
     pos: u32,
     intervals: &[LiveInterval],
     extra_oop_live: &[(VReg, u32)],
+    const_smi: &std::collections::HashMap<u32, i64>,
 ) -> ValueLoc {
+    // F3: a const-uniform vreg's slot is never written — rematerialize.
+    if let Some(&v) = const_smi.get(&vreg.0) {
+        return ValueLoc::ConstSmi(v);
+    }
     for iv in intervals {
         if iv.vreg == vreg
             && (iv.start <= pos && iv.end > pos

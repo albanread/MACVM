@@ -1074,6 +1074,10 @@ fn compile_method_full(
                 header_pos,
                 &regalloc_result.intervals,
                 &regalloc_result.extra_oop_live,
+                // OSR transfer keeps full slot materialization (a const's
+                // slot write here is harmless; rematerialization buys
+                // nothing on this cold path).
+                &Default::default(),
             ) {
                 ValueLoc::FrameSlot(off) => {
                     debug_assert!(off < 0 && off % 8 == 0);
@@ -1305,12 +1309,19 @@ fn compile_method_full(
     // share one entry).
     let mut oopmaps: Vec<OopMap> = vec![OopMap::empty()];
     let mut safepoint_pcdescs: Vec<PcDesc> = Vec::with_capacity(safepoint_pcs.len());
+    // F3: const-uniform vregs' slots are never written — exclude from GC maps.
+    let f3_skip: std::collections::HashSet<u32> =
+        crate::compiler::ir::const_smi_vregs(&ir_method)
+            .keys()
+            .copied()
+            .collect();
     for sp in &safepoint_pcs {
         let map = oopmap::build_for_position(
             &regalloc_result.intervals,
             regalloc_result.frame_slots,
             sp.position,
             &regalloc_result.extra_oop_live,
+            &f3_skip,
         );
         let idx = oopmap::intern(&mut oopmaps, map);
         safepoint_pcdescs.push(PcDesc {
@@ -1588,6 +1599,9 @@ fn build_deopt_metadata(
         safepoint_pcs.iter().map(|sp| (sp.position, sp)).collect();
 
     let intervals = &regalloc_result.intervals;
+    // F3: const-uniform vregs rematerialize on deopt (ValueLoc::ConstSmi) —
+    // their slots are never written, so every resolve here must know them.
+    let f3_const = crate::compiler::ir::const_smi_vregs(ir_method);
     let extra_oop_live = &regalloc_result.extra_oop_live;
     let n_slots = ir_method.argc as usize + ir_method.ntemps as usize;
     let mut rec = ScopeDescRecorder::new();
@@ -1617,6 +1631,7 @@ fn build_deopt_metadata(
                     position,
                     intervals,
                     extra_oop_live,
+                    &f3_const,
                 );
                 let root_slots = (0..n_slots)
                     .map(|i| {
@@ -1625,6 +1640,7 @@ fn build_deopt_metadata(
                             position,
                             intervals,
                             extra_oop_live,
+                            &f3_const,
                         )
                     })
                     .collect();
@@ -1656,7 +1672,7 @@ fn build_deopt_metadata(
                     // itself); everywhere else the pin (regalloc) keeps it
                     // live, so `resolve_frame_loc` distinguishes the two
                     // cases exactly.
-                    match resolve_frame_loc(ctx_vreg, position, intervals, extra_oop_live) {
+                    match resolve_frame_loc(ctx_vreg, position, intervals, extra_oop_live, &f3_const) {
                         // Pre-def window (the prologue alloc's own safepoint):
                         // hand the interpreter a FRESH nil-filled Context via
                         // the Elided path — NOT `CtxLoc::None`. The deopt
@@ -1681,7 +1697,7 @@ fn build_deopt_metadata(
                         temps: ir_method
                             .ctx_vregs
                             .iter()
-                            .map(|&v| resolve_frame_loc(v, position, intervals, extra_oop_live))
+                            .map(|&v| resolve_frame_loc(v, position, intervals, extra_oop_live, &f3_const))
                             .collect(),
                     }
                 };
@@ -1733,18 +1749,19 @@ fn build_deopt_metadata(
                             let pending_stack = level
                                 .caller_pending_stack
                                 .iter()
-                                .map(|&v| resolve_frame_loc(v, position, intervals, extra_oop_live))
+                                .map(|&v| resolve_frame_loc(v, position, intervals, extra_oop_live, &f3_const))
                                 .collect();
                             let inl_receiver = resolve_frame_loc(
                                 level.receiver,
                                 position,
                                 intervals,
                                 extra_oop_live,
+                    &f3_const,
                             );
                             let mut inl_slots: Vec<_> = level
                                 .slots
                                 .iter()
-                                .map(|&v| resolve_frame_loc(v, position, intervals, extra_oop_live))
+                                .map(|&v| resolve_frame_loc(v, position, intervals, extra_oop_live, &f3_const))
                                 .collect();
                             // S14 step 7-IV-c: a slot holding an ELIDED-CLOSURE
                             // phantom overrides its (filler) vreg location — the
@@ -1775,7 +1792,7 @@ fn build_deopt_metadata(
                 let mut stack: Vec<_> = raw
                     .stack
                     .iter()
-                    .map(|&v| resolve_frame_loc(v, position, intervals, extra_oop_live))
+                    .map(|&v| resolve_frame_loc(v, position, intervals, extra_oop_live, &f3_const))
                     .collect();
                 // S14 step 7-IV-c: phantom stack entries override their filler
                 // vregs (a block-arg send's guard-cold reexecute stack; in-callee

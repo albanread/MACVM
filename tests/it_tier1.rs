@@ -4019,12 +4019,12 @@ fn deopt_resolve_frame_loc_from_real_regalloc() {
     // recorded stack names it (`extra_oop_live`'s exact-position fact),
     // not a widened range that would also (wrongly) cover unrelated code.
     assert_eq!(
-        resolve_frame_loc(VReg(0), p0, &ra.intervals, &ra.extra_oop_live),
+        resolve_frame_loc(VReg(0), p0, &ra.intervals, &ra.extra_oop_live, &Default::default()),
         expected_self,
         "self must resolve at trap1, which reexecutes `self bar` and needs it"
     );
     assert_eq!(
-        resolve_frame_loc(VReg(0), p1, &ra.intervals, &ra.extra_oop_live),
+        resolve_frame_loc(VReg(0), p1, &ra.intervals, &ra.extra_oop_live, &Default::default()),
         expected_self,
         "self must resolve at trap2 too, which reexecutes `self baz: a` and needs it"
     );
@@ -4036,7 +4036,7 @@ fn deopt_resolve_frame_loc_from_real_regalloc() {
     // which operands the specific reexecuted op reads).
     assert!(
         matches!(
-            resolve_frame_loc(VReg(1), p0, &ra.intervals, &ra.extra_oop_live),
+            resolve_frame_loc(VReg(1), p0, &ra.intervals, &ra.extra_oop_live, &Default::default()),
             ValueLoc::FrameSlot(_)
         ),
         "the arg `a`, a unified slot, must resolve to a frame slot at trap1 too, even though \
@@ -4044,7 +4044,7 @@ fn deopt_resolve_frame_loc_from_real_regalloc() {
     );
     assert!(
         matches!(
-            resolve_frame_loc(VReg(1), p1, &ra.intervals, &ra.extra_oop_live),
+            resolve_frame_loc(VReg(1), p1, &ra.intervals, &ra.extra_oop_live, &Default::default()),
             ValueLoc::FrameSlot(_)
         ),
         "the arg `a`, read by trap2's own recorded stack, must resolve to a frame slot there"
@@ -4053,7 +4053,7 @@ fn deopt_resolve_frame_loc_from_real_regalloc() {
     // A vreg that doesn't exist (or is dead everywhere) → Nil, the
     // materialize-nil case for a value never read after the resume bci.
     assert_eq!(
-        resolve_frame_loc(VReg(9999), p0, &ra.intervals, &ra.extra_oop_live),
+        resolve_frame_loc(VReg(9999), p0, &ra.intervals, &ra.extra_oop_live, &Default::default()),
         ValueLoc::Nil
     );
 }

@@ -345,7 +345,14 @@ struct Emitter<'a> {
     /// SLOW paths reload every entry live at the site (their `bl` may have
     /// GC'd, moving the oops the resident registers point at; the canonical
     /// slots were updated by the GC's frame walk).
-    resident_reloads: Vec<(u32, u32, u8, crate::compiler::regalloc::SpillSlot, bool /*is_fp*/)>,
+    resident_reloads: Vec<(
+        u32, /*vreg*/
+        u32, /*start*/
+        u32, /*end*/
+        u8,
+        crate::compiler::regalloc::SpillSlot,
+        bool, /*is_fp*/
+    )>,
     /// Smi fast path S2 (docs/smi_fastpath_design.md, env-gated MACVM_S2=1):
     /// per-vreg "register is AUTHORITATIVE" flag — resident + spill-assigned
     /// + known-smi + first-def in the unconditional entry straight-line
@@ -358,6 +365,10 @@ struct Emitter<'a> {
     s2_smi: Vec<bool>,
     /// The S2 store set as `(vreg, start, end, reg, slot)` (GPR only).
     s2_spill_stores: Vec<(u32, u32, u32, u8, crate::compiler::regalloc::SpillSlot)>,
+    /// F3: vregs whose every def is the SAME ConstSmi — no slot traffic at
+    /// all: commit skips the store, resolve/reloads rematerialize a movz,
+    /// deopt uses ValueLoc::ConstSmi, the GC map skips the slot.
+    const_smi: std::collections::HashMap<u32, i64>,
     /// F2: (position, vreg) pairs proven smi on every incoming path —
     /// `emit_tag_check`'s second skip source alongside `known_smi`.
     proven_smi_at: std::collections::HashSet<(u32, u32)>,
@@ -558,6 +569,12 @@ impl<'a> Emitter<'a> {
         match self.assignment_of(v) {
             Assignment::Reg(r) => xr(r),
             Assignment::Spill(slot) => {
+                // F3: a const-uniform vreg's slot is dead — rematerialize
+                // the tagged constant instead of loading garbage.
+                if let Some(&cv) = self.const_smi.get(&v.0) {
+                    emit_mov_imm64(self.asm, xr(scratch), (cv << 2) as u64);
+                    return xr(scratch);
+                }
                 emit_spill_access(self.asm, "ldr", x(scratch), slot);
                 xr(scratch)
             }
@@ -589,15 +606,18 @@ impl<'a> Emitter<'a> {
     /// position (its own emission happens after the whole body, where
     /// `self.pos` is past everything).
     fn emit_resident_reloads_at(&mut self, pos: u32) {
-        let live: Vec<(u8, crate::compiler::regalloc::SpillSlot, bool)> = self
+        let live: Vec<(u32, u8, crate::compiler::regalloc::SpillSlot, bool)> = self
             .resident_reloads
             .iter()
-            .filter(|&&(s, e, _, _, _)| s <= pos && e > pos)
-            .map(|&(_, _, rr, slot, fp)| (rr, slot, fp))
+            .filter(|&&(_, s, e, _, _, _)| s <= pos && e > pos)
+            .map(|&(v, _, _, rr, slot, fp)| (v, rr, slot, fp))
             .collect();
-        for (rr, slot, fp) in live {
+        for (v, rr, slot, fp) in live {
             if fp {
                 self.fp_spill_access("ldr", rr, slot);
+            } else if let Some(&cv) = self.const_smi.get(&v) {
+                // F3: the slot is dead — rematerialize the constant.
+                emit_mov_imm64(self.asm, xr(rr), (cv << 2) as u64);
             } else {
                 emit_spill_access(self.asm, "ldr", x(rr), slot);
             }
@@ -635,6 +655,11 @@ impl<'a> Emitter<'a> {
     }
 
     fn commit(&mut self, dst: VReg, computed_in: Reg) {
+        // F3: a const-uniform vreg's slot is dead — never store it.
+        if self.const_smi.contains_key(&dst.0) {
+            self.refresh_resident(dst, computed_in);
+            return;
+        }
         if let Assignment::Spill(slot) = self.assignment_of(dst) {
             if !self.s2_smi[dst.0 as usize] {
                 emit_spill_access(self.asm, "str", Operand::Reg(computed_in), slot);
@@ -1743,11 +1768,25 @@ impl<'a> Emitter<'a> {
         // faster: no ldr for a value already in x21-x27, and the resident
         // pool can never alias a destination x0..x5, so the shuffle below
         // only gets easier.
-        let sources: Vec<Assignment> = args
+        // F3: a const-uniform arg has a DEAD slot — marshal by
+        // rematerializing the tagged constant (Src::Imm below), never by
+        // loading the slot. Resident args marshal from their registers
+        // (the F1-era fix); everything else keeps its assignment.
+        enum ArgSrc {
+            Asn(Assignment),
+            Imm(u64),
+        }
+        let sources: Vec<ArgSrc> = args
             .iter()
             .map(|&a| match self.resident[a.0 as usize] {
-                Some(rr) => Assignment::Reg(rr),
-                None => self.assignment_of(a),
+                Some(rr) => ArgSrc::Asn(Assignment::Reg(rr)),
+                None => {
+                    if let Some(&cv) = self.const_smi.get(&a.0) {
+                        ArgSrc::Imm((cv << 2) as u64)
+                    } else {
+                        ArgSrc::Asn(self.assignment_of(a))
+                    }
+                }
             })
             .collect();
 
@@ -1769,14 +1808,21 @@ impl<'a> Emitter<'a> {
         enum Src {
             Reg(u8),
             Mem(crate::compiler::regalloc::SpillSlot),
+            /// F3: rematerialize a tagged smi constant straight into the
+            /// destination — reads no register, so it can never block or
+            /// participate in a shuffle cycle (same standing as Mem).
+            Imm(u64),
         }
         let mut pending: Vec<(u8, Src)> = sources
             .iter()
             .enumerate()
             .filter_map(|(i, src)| match *src {
-                Assignment::Reg(r) if r != i as u8 => Some((i as u8, Src::Reg(r))),
-                Assignment::Reg(_) => None,
-                Assignment::Spill(slot) => Some((i as u8, Src::Mem(slot))),
+                ArgSrc::Asn(Assignment::Reg(r)) if r != i as u8 => {
+                    Some((i as u8, Src::Reg(r)))
+                }
+                ArgSrc::Asn(Assignment::Reg(_)) => None,
+                ArgSrc::Asn(Assignment::Spill(slot)) => Some((i as u8, Src::Mem(slot))),
+                ArgSrc::Imm(v) => Some((i as u8, Src::Imm(v))),
             })
             .collect();
         while !pending.is_empty() {
@@ -1796,6 +1842,7 @@ impl<'a> Emitter<'a> {
                 match s {
                     Src::Reg(r) => self.asm.emit("mov", &[x(i), x(r)]),
                     Src::Mem(slot) => emit_spill_access(self.asm, "ldr", x(i), slot),
+                    Src::Imm(v) => emit_mov_imm64(self.asm, xr(i), v),
                 }
             } else {
                 // A genuine cycle (e.g. x0<-x1, x1<-x0): only possible
@@ -1807,8 +1854,8 @@ impl<'a> Emitter<'a> {
                 // whichever other pending move still needs to read it.
                 let (i0, r0) = match pending[0] {
                     (i, Src::Reg(r)) => (i, r),
-                    (_, Src::Mem(_)) => {
-                        unreachable!("a Mem source is never part of a genuine cycle")
+                    (_, Src::Mem(_) | Src::Imm(_)) => {
+                        unreachable!("a Mem/Imm source is never part of a genuine cycle")
                     }
                 };
                 self.asm.emit("mov", &[x(16), x(i0)]);
@@ -2103,6 +2150,7 @@ pub fn emit(
     let verified_entry_off = asm.offset();
 
     let known_smi_set = crate::compiler::ir::known_smi_vregs(method);
+    let f3_const_set = crate::compiler::ir::const_smi_vregs(method);
     // S2 selection (env-gated: with MACVM_S2/MACVM_S2_POISON unset the set
     // is empty and emission is byte-identical to the S1+S3 tree). Rules
     // earned by the attempt record: resident + spill + known-smi + first
@@ -2180,6 +2228,10 @@ pub fn emit(
                     && !iv.is_fp
                     && iv.start < s2_def_horizon
                     && known_smi_set.contains(&iv.vreg.0)
+                    // F3: const-uniform vregs have DEAD slots — no S2
+                    // safepoint stores either (commit's const skip covers
+                    // the write-through side).
+                    && !f3_const_set.contains_key(&iv.vreg.0)
                 {
                     v[iv.vreg.0 as usize] = true;
                 }
@@ -2248,6 +2300,7 @@ pub fn emit(
                 || !matches!(iv.assignment, Some(Assignment::Spill(_)))
                 || iv.is_fp
                 || !known_smi_set.contains(&iv.vreg.0)
+                || f3_const_set.contains_key(&iv.vreg.0)
             {
                 continue;
             }
@@ -2349,6 +2402,7 @@ pub fn emit(
         s2_spill_stores,
         s2_extra,
         proven_smi_at: proven_smi_positions(method, regalloc),
+        const_smi: crate::compiler::ir::const_smi_vregs(method),
         true_lit: method.true_lit,
         false_lit: method.false_lit,
         nil_lit: method.nil_lit,
@@ -2387,7 +2441,7 @@ pub fn emit(
             .iter()
             .filter_map(|iv| match (iv.resident_reg, iv.assignment) {
                 (Some(rr), Some(Assignment::Spill(slot))) => {
-                    Some((iv.start, iv.end, rr, slot, iv.is_fp))
+                    Some((iv.vreg.0, iv.start, iv.end, rr, slot, iv.is_fp))
                 }
                 _ => None,
             })

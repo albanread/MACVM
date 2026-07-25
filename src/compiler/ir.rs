@@ -9404,6 +9404,40 @@ fn is_safepoint_op(ir: &Ir) -> bool {
     )
 }
 
+/// F3 (docs/budgeted_inliner_design.md): vregs whose EVERY def is the
+/// SAME `ConstSmi` value — their frame slot carries no information at
+/// all: deopt rematerializes via `ValueLoc::ConstSmi` (the materializer
+/// arm has existed since S13, untriggered until now), GC never scans the
+/// slot, and emission neither stores nor loads it (uses rematerialize a
+/// `movz`). All-defs rule, poison-by-default, no Move-following — a
+/// Move'd constant flows through `known_smi`/`proven_smi` instead.
+pub(crate) fn const_smi_vregs(m: &IrMethod) -> HashMap<u32, i64> {
+    let mut val: HashMap<u32, i64> = HashMap::new();
+    let mut poison: HashSet<u32> = HashSet::new();
+    for b in &m.blocks {
+        for op in &b.code {
+            match op {
+                Ir::ConstSmi { dst, value } => match val.get(&dst.0) {
+                    None => {
+                        val.insert(dst.0, *value);
+                    }
+                    Some(&prev) if prev == *value => {}
+                    Some(_) => {
+                        poison.insert(dst.0);
+                    }
+                },
+                other => other.defs(|d| {
+                    poison.insert(d.0);
+                }),
+            }
+        }
+    }
+    for p in &poison {
+        val.remove(p);
+    }
+    val
+}
+
 /// Smi fast path S1 (`docs/smi_fastpath_design.md`): the set of vregs that
 /// are smi BY CONSTRUCTION — every def is a `ConstSmi`, a smi-arithmetic
 /// result (`SmiArith`/`SmiArithNoOv` dst: their value is always a tagged
