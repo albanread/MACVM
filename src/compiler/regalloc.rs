@@ -1278,6 +1278,62 @@ mod tests {
         }
     }
 
+    /// Smi fast path S1 (`ir::known_smi_vregs`, docs/smi_fastpath_design.md):
+    /// the all-defs known-smi rule, its Move fixpoint (including a cycle),
+    /// the Param/other-op poison-by-default, and the locally-dead nil-init
+    /// refinement (a nil `ConstPool` overwritten in-block before any read
+    /// is not a def; one that is read first, or never overwritten, poisons).
+    #[test]
+    fn known_smi_all_defs_fixpoint_and_dead_nil_inits() {
+        use crate::compiler::ir::PoolEntry;
+        let v = |n: u32| VReg(n);
+        let block = IrBlock {
+            id: BlockId(0),
+            bci: 0,
+            code: vec![
+                Ir::ConstSmi { dst: v(0), value: 7 },              // v0 smi
+                Ir::Param { dst: v(1), index: 0 },                 // v1 poison
+                Ir::Move { dst: v(2), src: v(0) },                 // v2 <- known
+                Ir::Move { dst: v(3), src: v(1) },                 // v3 <- poison
+                Ir::SmiArith { op: SmiOp::Add, dst: v(4), a: v(0), b: v(2), fail: BlockId(0) },
+                Ir::ConstPool { dst: v(5), lit: PoolLit(0) },      // smi pool word
+                Ir::ConstPool { dst: v(6), lit: PoolLit(1) },      // nil, never redefined
+                Ir::ConstPool { dst: v(7), lit: PoolLit(1) },      // nil, dead: redefined below unread
+                Ir::Move { dst: v(7), src: v(0) },
+                Ir::ConstPool { dst: v(8), lit: PoolLit(1) },      // nil, READ before redef
+                Ir::Move { dst: v(9), src: v(8) },
+                Ir::Move { dst: v(8), src: v(0) },
+                // Move cycle among smi-fed temps: both stay known.
+                Ir::ConstSmi { dst: v(10), value: 1 },
+                Ir::Move { dst: v(11), src: v(10) },
+                Ir::Move { dst: v(10), src: v(11) },
+                Ir::Ret { val: v(4) },
+            ],
+            entry_stack: Vec::new(),
+            deopt_sites: Vec::new(),
+        };
+        let mut m = hand_method(
+            vec![block],
+            (0..12)
+                .map(|_| VRegInfo {
+                    is_oop: true,
+                    is_fp: false,
+                })
+                .collect(),
+        );
+        m.pool = vec![
+            PoolEntry { value: 7 << 2, kind: None },  // tagged smi literal
+            PoolEntry { value: 0x1, kind: None },     // nil-shaped (tag 01)
+        ];
+        let known = crate::compiler::ir::known_smi_vregs(&m);
+        for k in [0u32, 2, 4, 5, 7, 10, 11] {
+            assert!(known.contains(&k), "v{k} must be known-smi");
+        }
+        for p in [1u32, 3, 6, 8, 9] {
+            assert!(!known.contains(&p), "v{p} must NOT be known-smi");
+        }
+    }
+
     /// "hand IR: def at 2, uses at 5 and 9" -> interval `[2, 9]`.
     #[test]
     fn intervals_basic() {

@@ -253,6 +253,11 @@ struct Emitter<'a> {
     literal_ids: Vec<LiteralId>,
     labels: Vec<Label>,
     epilogue: Label,
+    /// Smi fast path S1 (`ir::known_smi_vregs`): vregs whose every def is
+    /// smi-producing — `emit_tag_check` skips their operand tag guard (it
+    /// cannot fail). Computed once per emission from the FINAL IrMethod,
+    /// so it sees post-splice, post-pass code.
+    known_smi: std::collections::HashSet<u32>,
     true_lit: PoolLit,
     false_lit: PoolLit,
     /// S11 D7 `Alloc` header/body constants — see `IrMethod::nil_lit`/
@@ -453,18 +458,29 @@ impl<'a> Emitter<'a> {
         self.refresh_resident(dst, computed_in);
     }
 
-    fn emit_tag_check(&mut self, ra: Reg, rb: Reg, fail: BlockId) {
+    /// Smi fast path S1: each side's guard is emitted only when the vreg is
+    /// NOT proven smi-by-construction (`known_smi`). A skipped guard cannot
+    /// fail — `known_smi_vregs`' all-defs rule — so the fail edge simply
+    /// loses a (never-taken) predecessor; behavior is identical.
+    fn emit_tag_check(&mut self, a: VReg, ra: Reg, b: VReg, rb: Reg, fail: BlockId) {
+        if self.known_smi.contains(&a.0) && self.known_smi.contains(&b.0) {
+            return;
+        }
         let fail_label = self.block_label(fail);
-        self.asm.emit("tst", &[Operand::Reg(ra), imm(3)]);
-        self.asm.b_cond(Cond::Ne, fail_label);
-        self.asm.emit("tst", &[Operand::Reg(rb), imm(3)]);
-        self.asm.b_cond(Cond::Ne, fail_label);
+        if !self.known_smi.contains(&a.0) {
+            self.asm.emit("tst", &[Operand::Reg(ra), imm(3)]);
+            self.asm.b_cond(Cond::Ne, fail_label);
+        }
+        if !self.known_smi.contains(&b.0) {
+            self.asm.emit("tst", &[Operand::Reg(rb), imm(3)]);
+            self.asm.b_cond(Cond::Ne, fail_label);
+        }
     }
 
     fn emit_smi_arith_simple(&mut self, op: SmiOp, dst: VReg, a: VReg, b: VReg, fail: BlockId) {
         let ra = self.resolve(a, 16);
         let rb = self.resolve(b, 17);
-        self.emit_tag_check(ra, rb, fail);
+        self.emit_tag_check(a, ra, b, rb, fail);
         let d = self.dest_target_direct(dst);
         let mnem = match op {
             SmiOp::Add => "adds",
@@ -616,7 +632,7 @@ impl<'a> Emitter<'a> {
     fn emit_smi_mul(&mut self, dst: VReg, a: VReg, b: VReg, fail: BlockId) {
         let ra = self.resolve(a, 16);
         let rb0 = self.resolve(b, 17);
-        self.emit_tag_check(ra, rb0, fail);
+        self.emit_tag_check(a, ra, b, rb0, fail);
 
         self.asm.emit("asr", &[x(16), Operand::Reg(ra), imm(2)]); // shifted_a
         let rb1 = self.resolve(b, 17); // fresh: tag check didn't write it, but be explicit
@@ -1321,7 +1337,7 @@ impl<'a> Emitter<'a> {
     ) {
         let ra = self.resolve(a, 16);
         let rb = self.resolve(b, 17);
-        self.emit_tag_check(ra, rb, fail);
+        self.emit_tag_check(a, ra, b, rb, fail);
         self.asm.emit("cmp", &[Operand::Reg(ra), Operand::Reg(rb)]);
         let true_label = self.block_label(if_true);
         self.asm.b_cond(cmp_op_to_cond(op), true_label);
@@ -1332,7 +1348,7 @@ impl<'a> Emitter<'a> {
     fn emit_smi_cmp_val(&mut self, op: CmpOp, dst: VReg, a: VReg, b: VReg, fail: BlockId) {
         let ra = self.resolve(a, 16);
         let rb = self.resolve(b, 17);
-        self.emit_tag_check(ra, rb, fail);
+        self.emit_tag_check(a, ra, b, rb, fail);
         self.asm.emit("cmp", &[Operand::Reg(ra), Operand::Reg(rb)]);
         // cmp doesn't write ra/rb -- free to reuse x16/x17 for the two
         // literal loads regardless of what they held a moment ago.
@@ -1839,6 +1855,7 @@ pub fn emit(
         literal_ids,
         labels,
         epilogue,
+        known_smi: crate::compiler::ir::known_smi_vregs(method),
         true_lit: method.true_lit,
         false_lit: method.false_lit,
         nil_lit: method.nil_lit,

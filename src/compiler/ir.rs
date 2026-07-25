@@ -11,7 +11,7 @@
 //! reassigns the SAME vreg) — not textbook SSA, cheap enough for a tier-1
 //! compiler that never runs SSA-only optimizations.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::bytecode::opcode::{decode_at, Instr};
 use crate::compiler::assembler::RelocKind;
@@ -9023,6 +9023,104 @@ fn is_safepoint_op(ir: &Ir) -> bool {
             | Ir::UncommonTrap { .. }
             | Ir::Poll
     )
+}
+
+/// Smi fast path S1 (`docs/smi_fastpath_design.md`): the set of vregs that
+/// are smi BY CONSTRUCTION — every def is a `ConstSmi`, a smi-arithmetic
+/// result (`SmiArith`/`SmiArithNoOv` dst: their value is always a tagged
+/// smi on the non-fail path, the only path on which the dst is ever read),
+/// a `ConstPool` whose pool word is itself a tagged smi (low two bits 00 —
+/// a smi literal like a `to:` loop limit; heap oops carry tag 01 and can
+/// never qualify), or a `Move` from a vreg already in the set. Emission
+/// (`emit_tag_check`) SKIPS the operand tag guard for members: the guard
+/// cannot fail, so behavior is identical by construction — benchArith's
+/// loop carries ~14 such provably-true guards per iteration today.
+///
+/// NOT flow-sensitive: the IR is not SSA (loop temps are re-`Move`d every
+/// iteration), so the rule is all-defs — a vreg with even one def outside
+/// the list stays guarded. Any def kind not explicitly matched POISONS its
+/// vreg via the generic `defs` walker, so new IR ops are conservative by
+/// default rather than silently trusted. Move chains resolve by optimistic
+/// fixpoint (start known, prune while any move-source is unknown), which
+/// handles Move cycles among loop-carried temps correctly.
+pub(crate) fn known_smi_vregs(m: &IrMethod) -> HashSet<u32> {
+    let mut poison: HashSet<u32> = HashSet::new();
+    let mut move_srcs: HashMap<u32, Vec<u32>> = HashMap::new();
+    let mut has_def: HashSet<u32> = HashSet::new();
+    // The decoder nil-initializes every temp in the entry block (Smalltalk
+    // temps read nil before assignment) — a non-smi def that would poison
+    // every loop temp. But when that nil is overwritten later IN THE SAME
+    // BLOCK with no intervening read, the def's value is unreachable: it
+    // does not exist for smi-ness purposes (the emitted nil store stays —
+    // this is analysis only). Conservative everywhere else: a nil init
+    // whose block ends before a redefinition keeps its poison (some later
+    // block may legitimately read the nil).
+    let locally_dead = |b: &IrBlock, at: usize, v: u32| -> bool {
+        for op in &b.code[at + 1..] {
+            let mut used = false;
+            op.uses(|u| used |= u.0 == v);
+            if used {
+                return false;
+            }
+            let mut redefined = false;
+            op.defs(|d| redefined |= d.0 == v);
+            if redefined {
+                return true;
+            }
+        }
+        false
+    };
+    for b in &m.blocks {
+        for (i, op) in b.code.iter().enumerate() {
+            match op {
+                Ir::ConstSmi { dst, .. }
+                | Ir::SmiArith { dst, .. }
+                | Ir::SmiArithNoOv { dst, .. } => {
+                    has_def.insert(dst.0);
+                }
+                Ir::ConstPool { dst, lit } => {
+                    if m.pool[lit.0 as usize].value & 3 != 0 {
+                        if locally_dead(b, i, dst.0) {
+                            continue; // unreachable value: not a def at all
+                        }
+                        poison.insert(dst.0);
+                    }
+                    has_def.insert(dst.0);
+                }
+                Ir::Move { dst, src } => {
+                    has_def.insert(dst.0);
+                    move_srcs.entry(dst.0).or_default().push(src.0);
+                }
+                other => other.defs(|d| {
+                    has_def.insert(d.0);
+                    poison.insert(d.0);
+                }),
+            }
+        }
+    }
+    let mut known: HashSet<u32> = has_def
+        .iter()
+        .copied()
+        .filter(|v| !poison.contains(v))
+        .collect();
+    loop {
+        let doomed: Vec<u32> = known
+            .iter()
+            .copied()
+            .filter(|v| {
+                move_srcs
+                    .get(v)
+                    .is_some_and(|srcs| srcs.iter().any(|s| !known.contains(s)))
+            })
+            .collect();
+        if doomed.is_empty() {
+            break;
+        }
+        for v in doomed {
+            known.remove(&v);
+        }
+    }
+    known
 }
 
 /// Float fast-path (`docs/float_fastpath_design.md` B2 rules 2–3): the
