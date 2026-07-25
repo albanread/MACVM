@@ -1466,7 +1466,13 @@ enum SpliceOutcome {
 }
 
 enum GraftMode {
-    Method,
+    /// A METHOD body grafted at a send site. `parent` is `None` for a
+    /// root-level splice; the budgeted inliner's I2 passes the enclosing
+    /// splice's own `InlineSite` so the graft's deopt scopes chain
+    /// (depth ≥ 3: leaf-of-graft ← graft ← enclosing ← root).
+    Method {
+        parent: Option<Box<InlineSite>>,
+    },
     // Constructed by B5 step 2 (block_is_spliceable_cfg + splice routing);
     // inert in step 1's byte-identical refactor.
     #[allow(dead_code)]
@@ -1492,9 +1498,14 @@ struct Translator<'a> {
     /// count toward it but are never declined by it (design amendment A1).
     budget_bytes_used: u32,
     /// Budgeted inliner I1: the enclosing inlined frame's `InlineSite` while
-    /// a NESTED `try_inline_leaf` runs (set/cleared by `try_nested_leaf`);
-    /// `None` during every root-level splice.
+    /// a NESTED `try_inline_leaf`/`try_inline_cfg` runs (set/cleared around
+    /// the nested attempt); `None` during every root-level splice.
     nested_inline_scope: Option<InlineSite>,
+    /// Budgeted inliner I2: method raws on the active graft chain (the root
+    /// method + each in-flight nested CFG callee) — a nested candidate
+    /// already on it is direct recursion and declines (dart's recursion
+    /// cap; deeper mutual recursion is bounded by depth + total_bytes).
+    inline_stack: Vec<u64>,
     /// S24 B5 step 4: declinable inline decisions demoted over-budget.
     splice_declined_budget: u32,
     /// S14 step 5 (customization, A3): the receiver klass K this compilation
@@ -3207,7 +3218,7 @@ impl<'a> Translator<'a> {
     ) -> Option<(VReg, BlockId, BlockId)> {
         // S24 B5 step 1: destructured once — the walk consults plain locals.
         let (is_block_graft, graft_parent): (bool, Option<Box<InlineSite>>) = match mode {
-            GraftMode::Method => (false, None),
+            GraftMode::Method { parent } => (false, parent),
             GraftMode::Block { parent } => (true, parent),
         };
         if is_block_graft {
@@ -3279,7 +3290,9 @@ impl<'a> Translator<'a> {
                         kind: SafepointKind::UncommonTrap,
                         reexecute: true,
                         stack_closures: guard_stack_closures,
-                        inline: None,
+                        // I2: a NESTED graft's guard trap re-executes the
+                        // inner send inside the ENCLOSING inlined frame.
+                        inline: self.nested_inline_scope.clone(),
                     },
                 )],
             });
@@ -4003,6 +4016,91 @@ impl<'a> Translator<'a> {
                                 bci = next;
                                 continue;
                             }
+                            // Budgeted inliner I2: a mono NON-LEAF within
+                            // budget grafts here as a nested METHOD graft —
+                            // the whole-chain fusion (at: -> scanFor:). The
+                            // graft's own scopes chain via the parent'd
+                            // proto; its guard trap re-executes the inner
+                            // send in the enclosing frame (nested_inline_
+                            // scope). Segment protocol copied verbatim from
+                            // the block-graft branch above.
+                            if let crate::compiler::feedback::SiteFeedback::Mono {
+                                klass: ik,
+                                method: im,
+                            } = &inner_fb
+                            {
+                                let m = *im;
+                                let budget =
+                                    crate::compiler::inline::budget_for_level(self.level);
+                                let mut depth = 2u32; // enclosing + this graft
+                                let mut pp = inline_proto.parent.as_deref();
+                                while let Some(q) = pp {
+                                    depth += 1;
+                                    pp = q.parent.as_deref();
+                                }
+                                if m.primitive() == 0
+                                    && !self.inline_stack.contains(&m.oop().raw())
+                                    && crate::compiler::inline::is_inline_eligible_cfg(m)
+                                    && crate::compiler::inline::inline_cost(m)
+                                        <= budget.per_call_cost
+                                    && !self.budget_would_exceed(m)
+                                    && depth <= budget.max_depth
+                                {
+                                    let smi_bits = self.vm.universe.smi_klass.oop().raw();
+                                    let shape = if ik.oop().raw() == smi_bits {
+                                        GuardShape::SmiTest
+                                    } else {
+                                        GuardShape::KlassTest
+                                    };
+                                    self.inline_stack.push(m.oop().raw());
+                                    self.nested_inline_scope = Some(inline_proto.clone());
+                                    let grafted = self.try_inline_cfg(
+                                        m,
+                                        Some((*ik, shape)),
+                                        *ik,
+                                        inner_sel,
+                                        inner_recv,
+                                        &inner_args,
+                                        inner_bci,
+                                        &pre_pop,
+                                        &mut bcode,
+                                        &mut bdeopt,
+                                        None,
+                                        GraftMode::Method {
+                                            parent: Some(Box::new(inline_proto.clone())),
+                                        },
+                                    );
+                                    self.nested_inline_scope = None;
+                                    self.inline_stack.pop();
+                                    if let Some((res, entry_id, cont_id)) = grafted {
+                                        if std::env::var_os("MACVM_S2_COUNT").is_some() {
+                                            eprintln!(
+                                                "i2 nested-cfg graft: {}",
+                                                inner_sel.as_string()
+                                            );
+                                        }
+                                        let mut seg_code = std::mem::take(&mut bcode);
+                                        let seg_deopt = std::mem::take(&mut bdeopt);
+                                        seg_code.push(Ir::Jump { target: entry_id });
+                                        self.finish_block(IrBlock {
+                                            id: cur_id,
+                                            bci: send_bci,
+                                            code: seg_code,
+                                            entry_stack: if cur_id == ir_ids[b] {
+                                                entry_stack.clone()
+                                            } else {
+                                                Vec::new()
+                                            },
+                                            deopt_sites: seg_deopt,
+                                        });
+                                        cur_id = cont_id;
+                                        cstack.push(res);
+                                        cstack_ph.push(false);
+                                        bci = next;
+                                        continue;
+                                    }
+                                }
+                            }
                         }
                         let mut send_args = vec![inner_recv];
                         send_args.extend_from_slice(&inner_args);
@@ -4311,9 +4409,8 @@ impl<'a> Translator<'a> {
             code,
         );
         self.nested_inline_scope = None;
-        if res.is_some() {
-            self.budget_commit(m);
-        }
+        // No budget_commit here: `try_inline_leaf` self-commits on success
+        // (its own budget_commit call), same as the CFG grafting engine.
         res
     }
 
@@ -4648,7 +4745,7 @@ impl<'a> Translator<'a> {
                             code,
                             deopt,
                             None,
-                            GraftMode::Method,
+                            GraftMode::Method { parent: None },
                         ) {
                             stack.push(result);
                             debug_assert!(self.pending_jump_target.is_none());
@@ -5232,7 +5329,7 @@ impl<'a> Translator<'a> {
                             code,
                             deopt,
                             None,
-                            GraftMode::Method,
+                            GraftMode::Method { parent: None },
                         ) {
                             self.self_devirt = true;
                             stack.push(result);
@@ -5735,7 +5832,7 @@ impl<'a> Translator<'a> {
                                 code,
                                 deopt,
                                 None,
-                                GraftMode::Method,
+                                GraftMode::Method { parent: None },
                             )
                             .expect("same-target CFG was pre-validated eligible");
                         self.finish_block(IrBlock {
@@ -6024,7 +6121,7 @@ impl<'a> Translator<'a> {
                         code,
                         deopt,
                         None,
-                        GraftMode::Method,
+                        GraftMode::Method { parent: None },
                     ) {
                         stack.push(result);
                         debug_assert!(
@@ -7371,7 +7468,7 @@ impl<'a> Translator<'a> {
                 code,
                 deopt,
                 Some((arg_ix, blk, blk_pool_ix)),
-                GraftMode::Method,
+                GraftMode::Method { parent: None },
             )
             .expect(
                 "splice_blockarg_send: escape proved the callee CFG-inlinable but the \
@@ -9764,6 +9861,7 @@ pub fn convert(
         spliced_multibb: 0,
         budget_bytes_used: 0,
         nested_inline_scope: None,
+        inline_stack: vec![method.oop().raw()],
         splice_declined_budget: 0,
         rcvr_klass,
         self_devirt: false,

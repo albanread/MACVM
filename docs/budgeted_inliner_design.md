@@ -66,3 +66,33 @@ Gates: debug lib 839/0, release lib 827 + tier1 104/0, stress modes
   invocation counters, rank candidate sites by hotness before spending
   `total_bytes` (today: bytecode order — first-come wins the budget).
 - **I4 — recursion cap** (dart's 1) once I2 makes recursion possible.
+
+## I2 landed: nested CFG grafts (parent-chained method grafts)
+
+`GraftMode::Method` now carries `parent: Option<Box<InlineSite>>` (root
+splices pass None — byte-identical), and the CFG walk's generic-send
+path attempts a nested METHOD graft after I1's leaf attempt declines:
+mono + non-primitive + `is_inline_eligible_cfg` + per-call and
+cumulative budgets + proto-chain depth + `inline_stack` recursion guard
+(the root method and every in-flight nested callee's raw; a candidate
+already on it is direct recursion and declines). The graft's own deopt
+scopes chain through the parent'd proto; its guard trap re-executes the
+inner send in the ENCLOSING frame via `nested_inline_scope` (the same
+convention the leaf and CFG cold blocks now share). Segment protocol
+copied verbatim from the proven block-graft branch. try_inline_leaf/cfg
+self-commit to the budget (I1's double-charge removed).
+
+**Honest measurement: FLAT on the 7-bench suite** (all rows within
+noise; deltablue −0.3%). The fire census (`MACVM_S2_COUNT=1`) shows WHY:
+7 nested grafts total — deltablue's `stronger:`/`weaker:` and one
+`add:` — because this suite's deep chain (`at:` → `scanFor:`) already
+fuses at ROOT level (`at:` compiles as its own root and splices
+`scanFor:` there). I2 is correct, budget-bounded, live infrastructure
+whose fire-rate is the lever I3 pulls: count-ranked ordering + budget
+levels decide WHICH sites deserve the graft, and the world corpus
+(GUI boot: streams, collections) offers far more chain shapes than the
+bench micros. Nonleaf-walk nesting stays leaf-only (no segment protocol
+there); its bodies are single-block by construction.
+
+Gates: debug lib 839/0, release lib 827 + tier1 104/0, GC_STRESS +
+DEOPT_STRESS ×2, GUI GC_VERIFY boot, both-threshold checksums.
