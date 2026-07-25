@@ -294,3 +294,52 @@ on the fuse's benches: dict 7.9 -> 3.2 (1.59x -> 4.01x over Cog) and
 deltablue 2.8 -> 1.9 (1.27x -> 1.84x) — deltablue's poly `=` sites gain
 more at the harness's threshold=20 warmup than the t=1000 A/B showed.
 Former weakest rows are now alloc 1.22x and richards 1.30x.
+
+## 2026-07-25 THREE-WAY: the 2017 Dart V1 VM joins the board (commit=622b593)
+
+The real target, finally on the same machine: **Dart 1.24.3 (Dec 18 2017,
+linux-arm64 — the V1 VM's native ARM64 JIT)** running in the Lima ubuntu VM
+(native arm64, no Rosetta), driven by `scripts/dart-bench.dart` — a
+checksum-asserting port of the SAME seven workloads (world/41a bodies,
+class-for-class) — via `scripts/dart-bench.sh` (interleaved Dart+MACVM
+pairs, 3 rounds, load 1.82, best-of). Cog column = same-day stamp above.
+
+| bench | MACVM ms | Dart V1 ms | Cog ms | Dart vs MACVM |
+|---|---|---|---|---|
+| arith | 33.6 | 7.0 | 52.9 | **Dart 4.81x** |
+| fib | 135.1 | 57.0 | 189.1 | Dart 2.37x |
+| sieve | 2.0 | 0.6 | 3.6 | Dart 3.15x |
+| dict | 3.3 | 2.0 | 12.9 | Dart 1.63x |
+| alloc | 11.5 | 4.2 | 14.5 | Dart 2.76x |
+| richards | 17.5 | 4.5 | 22.6 | Dart 3.91x |
+| **deltablue** | **2.0** | **2.2** | 3.6 | **MACVM 1.14x** |
+
+**MACVM beats the 2017 Dart VM on deltablue** — the bench PolyCmpFuse +
+the poly-inlining arc rebuilt. The measured whole-suite gap is 1.6-4.8x
+(the pre-measurement estimate was "4-12x"), and the decomposition names
+the next levers precisely:
+
+- **arith 4.81x is the purest signal**: a smi-only loop, no calls, no
+  allocation — the whole gap is codegen quality: Dart keeps the
+  loop-carried state in registers with branch-on-overflow; MACVM
+  write-through-spills temps every iteration and re-tags. Register-resident
+  loop values (the LIVE-value F3c, not the falsified dead-slot one) +
+  wider untagged arithmetic is the lever.
+- fib 2.37x = per-activation call cost; richards 3.91x = the same smeared
+  across polymorphic dispatch (matches its flat sample profile).
+- dict 1.63x (was ~4x before PolyCmpFuse) and deltablue WON — the
+  send-machinery work of this arc has closed those.
+
+**2017-arm64 JIT archaeology** (why per-bench flags): two corners of the
+V1 arm64 optimizing JIT SIGILL on modern Apple Silicon (Dart release
+builds compile unimplemented/Stop paths as trap instructions):
+(1) the background-compiler install path — every bench runs
+`--no_background_compilation`; (2) the polymorphic-with-deopt /
+megamorphic route — deltablue needs `--no_polymorphic_with_deopt`, while
+richards needs poly-deopt ON (its poly sites through the megamorphic
+route hit the other corner). Checked mode + optimizer-off runs produce
+the exact checksums, so the port is correct and both crashes are the
+VM's own. The flags can only slow Dart: **its column is a floor.** The
+broken corners are, pointedly, exactly the machinery MACVM just built
+and stress-gates (poly dispatch with deopt fallback) — the difference a
+differential test battery makes.
