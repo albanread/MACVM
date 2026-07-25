@@ -179,3 +179,29 @@ modes, GUI GC_VERIFY boot, both-threshold checksums, debug lib 839/0.
 F2 (flow-sensitive param smi-ness) and F3 (ConstSmi slot elision)
 remain from the profile; richards' residue wants a fresh profile after
 F1's self-chains land.
+
+## F2 landed: flow-sensitive proven-smi guard elision
+
+`proven_smi_positions` — a forward MUST-dataflow (meet = intersection)
+over the linearized CFG in the exact per-op position numbering emit and
+regalloc share: a vreg is proven at an op when, on EVERY path there, an
+earlier tag guard on it passed or a smi-producing def reached it with no
+other def in between. `emit_tag_check` skips a side when (pos, vreg) is
+proven — the second skip source alongside S1's flow-insensitive
+`known_smi`. Guards prove operands on the fall-through only; fail edges
+leak the fact harmlessly into trap/slow blocks, which consume none.
+The fib validation: v1 drops to exactly the sound minimum of 4 tst —
+entry guard, `n`'s FIRST guard, and the two send-result guards (call
+results are rightly unprovable). One bug found en route: the fixpoint's
+`slot.take()` emptied the slot before the changed-comparison — an
+infinite loop the 10-minute timeout caught; compare-then-assign.
+
+Measured (two suite A/Bs + isolated run): **sieve −5.0%/−9.6%**, **dict
+−0.6%/−5.6%**, deltablue −0.4/−0.8% consistent; fib +1.3% ISOLATED —
+with strictly fewer instructions in its body, that is branch-alignment
+luck on razor-thin recursion (8 removed bytes shift every downstream
+target), not semantics; arith/alloc drift inside bands. Net
+suite-positive. Gates: tier1 104/0, focused debug suites (codecache 63,
+deopt 24, send 38, driver 25 — 0-fail), stress modes, fresh GUI
+GC_VERIFY boot, both-threshold checksums. Follow-up lever noted:
+branch/function alignment padding as a generic stabilizer.

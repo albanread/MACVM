@@ -358,10 +358,149 @@ struct Emitter<'a> {
     s2_smi: Vec<bool>,
     /// The S2 store set as `(vreg, start, end, reg, slot)` (GPR only).
     s2_spill_stores: Vec<(u32, u32, u32, u8, crate::compiler::regalloc::SpillSlot)>,
+    /// F2: (position, vreg) pairs proven smi on every incoming path —
+    /// `emit_tag_check`'s second skip source alongside `known_smi`.
+    proven_smi_at: std::collections::HashSet<(u32, u32)>,
     /// `RegallocResult::extra_oop_live` restricted to S2 vregs — the SECOND
     /// disjunct of `resolve_frame_loc`'s slot-read predicate, which the
     /// store filter must mirror exactly (its own regression note).
     s2_extra: std::collections::HashSet<(u32, u32)>,
+}
+
+/// F2 (flow-sensitive param smi-ness, docs/budgeted_inliner_design.md):
+/// the set of (position, vreg) pairs where the vreg is PROVEN smi on
+/// EVERY path reaching that op — because an earlier tag guard on it
+/// passed, or a smi-producing def reached it, with no other def in
+/// between. Forward must-dataflow (meet = intersection) over the same
+/// linearized order and per-op position numbering emit/regalloc share.
+/// `emit_tag_check` skips a side whose (pos, vreg) is here: the guard
+/// cannot fail on any path that reaches it. The classic win: a Param
+/// argument guarded once at its first use (fib's `n < 2`) stops
+/// re-guarding at `n - 1` and `n - 2`.
+fn proven_smi_positions(
+    method: &IrMethod,
+    regalloc: &crate::compiler::regalloc::RegallocResult,
+) -> std::collections::HashSet<(u32, u32)> {
+    use std::collections::{HashMap, HashSet};
+    let block_of: HashMap<u32, &crate::compiler::ir::IrBlock> =
+        method.blocks.iter().map(|b| (b.id.0, b)).collect();
+    // Transfer for one op over the running proven-set. Guards prove their
+    // operands on the fall-through (the fail edge leaves for a trap block,
+    // which consumes no facts — harmless imprecision there); smi-producing
+    // defs prove their dst; every OTHER def kills.
+    fn step(
+        cur: &mut HashSet<u32>,
+        op: &Ir,
+        pool: &[crate::compiler::ir::PoolEntry],
+    ) {
+        match op {
+            Ir::SmiArith { dst, a, b, .. } | Ir::SmiArithNoOv { dst, a, b, .. } => {
+                cur.insert(a.0);
+                cur.insert(b.0);
+                cur.insert(dst.0);
+            }
+            Ir::SmiCmpBr { a, b, .. } => {
+                cur.insert(a.0);
+                cur.insert(b.0);
+            }
+            Ir::SmiCmpVal { dst, a, b, .. } => {
+                cur.insert(a.0);
+                cur.insert(b.0);
+                cur.remove(&dst.0); // dst is a boolean oop, not a smi
+            }
+            Ir::ConstSmi { dst, .. } => {
+                cur.insert(dst.0);
+            }
+            Ir::ConstPool { dst, lit } => {
+                if pool[lit.0 as usize].value & 3 == 0 {
+                    cur.insert(dst.0);
+                } else {
+                    cur.remove(&dst.0);
+                }
+            }
+            Ir::Move { dst, src } => {
+                if cur.contains(&src.0) {
+                    cur.insert(dst.0);
+                } else {
+                    cur.remove(&dst.0);
+                }
+            }
+            other => other.defs(|d| {
+                cur.remove(&d.0);
+            }),
+        }
+    }
+    // Fixpoint on block-entry sets: None = universe (optimistic), entry = empty.
+    let entry_id = regalloc.block_order[0].0;
+    let mut ins: HashMap<u32, Option<HashSet<u32>>> = HashMap::new();
+    for b in &method.blocks {
+        ins.insert(
+            b.id.0,
+            if b.id.0 == entry_id {
+                Some(HashSet::new())
+            } else {
+                None
+            },
+        );
+    }
+    loop {
+        let mut changed = false;
+        for bid in regalloc.block_order.iter() {
+            let Some(blk) = block_of.get(&bid.0) else { continue };
+            let mut cur = match ins.get(&bid.0).and_then(|o| o.clone()) {
+                Some(set) => set,
+                None => continue, // universe: wait for a concrete in-set
+            };
+            for op in blk.code.iter() {
+                step(&mut cur, op, &method.pool);
+            }
+            for su in crate::compiler::regalloc::successors(blk) {
+                let slot = ins.get_mut(&su.0).expect("all blocks seeded");
+                let new = match slot.as_ref() {
+                    None => Some(cur.clone()),
+                    Some(prev) => Some(
+                        prev.intersection(&cur).copied().collect::<HashSet<u32>>(),
+                    ),
+                };
+                if new != *slot {
+                    *slot = new;
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    // Recording walk in the SHARED position numbering (one per op,
+    // incremented after, walking block_order — emit/regalloc's exact rule).
+    let mut out: HashSet<(u32, u32)> = HashSet::new();
+    let mut pos: u32 = 0;
+    for bid in regalloc.block_order.iter() {
+        let Some(blk) = block_of.get(&bid.0) else { continue };
+        let mut cur = ins
+            .get(&bid.0)
+            .and_then(|o| o.clone())
+            .unwrap_or_default();
+        for op in &blk.code {
+            match op {
+                Ir::SmiArith { a, b, .. }
+                | Ir::SmiCmpBr { a, b, .. }
+                | Ir::SmiCmpVal { a, b, .. } => {
+                    if cur.contains(&a.0) {
+                        out.insert((pos, a.0));
+                    }
+                    if cur.contains(&b.0) {
+                        out.insert((pos, b.0));
+                    }
+                }
+                _ => {}
+            }
+            step(&mut cur, op, &method.pool);
+            pos += 1;
+        }
+    }
+    out
 }
 
 /// S2 is ON BY DEFAULT (cool-machine verified: arith −9%, fib −7%, sieve
@@ -540,15 +679,22 @@ impl<'a> Emitter<'a> {
     /// fail — `known_smi_vregs`' all-defs rule — so the fail edge simply
     /// loses a (never-taken) predecessor; behavior is identical.
     fn emit_tag_check(&mut self, a: VReg, ra: Reg, b: VReg, rb: Reg, fail: BlockId) {
-        if self.known_smi.contains(&a.0) && self.known_smi.contains(&b.0) {
+        // A side is guard-free when smi BY CONSTRUCTION (S1, known_smi) or
+        // PROVEN on every path to this op (F2, proven_smi_at — an earlier
+        // guard passed / a smi def reached, keyed by this op's position).
+        let a_ok = self.known_smi.contains(&a.0)
+            || self.proven_smi_at.contains(&(self.pos, a.0));
+        let b_ok = self.known_smi.contains(&b.0)
+            || self.proven_smi_at.contains(&(self.pos, b.0));
+        if a_ok && b_ok {
             return;
         }
         let fail_label = self.block_label(fail);
-        if !self.known_smi.contains(&a.0) {
+        if !a_ok {
             self.asm.emit("tst", &[Operand::Reg(ra), imm(3)]);
             self.asm.b_cond(Cond::Ne, fail_label);
         }
-        if !self.known_smi.contains(&b.0) {
+        if !b_ok {
             self.asm.emit("tst", &[Operand::Reg(rb), imm(3)]);
             self.asm.b_cond(Cond::Ne, fail_label);
         }
@@ -2202,6 +2348,7 @@ pub fn emit(
         s2_smi,
         s2_spill_stores,
         s2_extra,
+        proven_smi_at: proven_smi_positions(method, regalloc),
         true_lit: method.true_lit,
         false_lit: method.false_lit,
         nil_lit: method.nil_lit,
