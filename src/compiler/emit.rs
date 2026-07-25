@@ -364,19 +364,21 @@ struct Emitter<'a> {
     s2_extra: std::collections::HashSet<(u32, u32)>,
 }
 
-/// MACVM_S2=1 → commit-skip active. MACVM_S2_POISON=1 → skip replaced by a
-/// per-slot canary write (implies the skip's staleness without its
-/// silence). Both default OFF: with neither set, emission is byte-identical
-/// to the S1+S3 tree.
+/// S2 is ON BY DEFAULT (cool-machine verified: arith −9%, fib −7%, sieve
+/// −6%, the other four flat within noise; full gate ladder + GUI GC_VERIFY
+/// green). `MACVM_S2=0` opts out (emission then byte-identical to the
+/// S1+S3-only tree — the A/B lever); `MACVM_S2_POISON=1` replaces the skip
+/// with a per-slot canary write — the permanent stale-reader checker that
+/// found the call-send marshalling bug.
 fn s2_mode() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *MODE.get_or_init(|| {
         if std::env::var_os("MACVM_S2_POISON").is_some() {
             2
-        } else if std::env::var_os("MACVM_S2").is_some() {
-            1
-        } else {
+        } else if std::env::var_os("MACVM_S2").is_some_and(|v| v == "0" || v == "off") {
             0
+        } else {
+            1
         }
     })
 }

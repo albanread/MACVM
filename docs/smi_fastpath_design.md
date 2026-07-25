@@ -161,3 +161,15 @@ GC_STRESS/DEOPT_STRESS modes + GUI GC_VERIFY boot. The `!smi` census
 also names S2's next coverage frontier beyond S2c: `LoadField`-defined
 loop values (stream/ivar loops) are never known-smi — that is inliner/
 type-feedback territory, not this analysis.
+
+## S2 default ON (cool-machine verified)
+
+4-round env-toggled A/B at load 1.66: **arith −9.2%, fib −7.2%, sieve
+−6.0%; richards −0.1%, dict +1.3%, deltablue +1.2%, alloc +0.4%** — the
+wins reproduce cool and the earlier hot-run dict/richards wobbles were
+thermal artifacts. Flipped: S2 is on by default; `MACVM_S2=0` opts out
+(the A/B lever, byte-identical S1+S3-only emission); `MACVM_S2_POISON=1`
+remains the permanent stale-reader checker. Gates at default-ON: release
+lib 827 + tier1 104 (goldens unchanged — their resident vregs are
+Param-fed, correctly outside S2) + 7-mode battery + GUI GC_VERIFY boot +
+debug lib 839.
