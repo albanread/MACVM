@@ -343,3 +343,28 @@ VM's own. The flags can only slow Dart: **its column is a floor.** The
 broken corners are, pointedly, exactly the machinery MACVM just built
 and stress-gates (poly dispatch with deopt fallback) — the difference a
 differential test battery makes.
+
+## 2026-07-25 THREE-WAY re-stamp after the smi fast path S1+S3 (commit=b22ba8f)
+
+Both harnesses, same session, load ~2.2, interleaved 3 rounds each,
+best-of. The smi fast path (known-smi guard elision + bounded-Mul
+overflow elision, arith −53%) re-draws the arith rows on both boards:
+
+| bench | MACVM ms | Cog ms | vs Cog | Dart V1 ms | vs Dart |
+|---|---|---|---|---|---|
+| **arith** | **15.9-16.7** | 51.3 | **MACVM 3.23x** | 7.5 | Dart 2.23x (was 4.81x) |
+| fib | 136.3-138.1 | 189.1 | MACVM 1.39x | 58.1 | Dart 2.38x |
+| sieve | 2.1 | 3.6 | MACVM 1.68x | 0.7 | Dart 3.23x |
+| dict | 3.1-3.2 | 12.7 | MACVM 4.12x | 2.1 | Dart 1.52x |
+| alloc | 11.7-11.8 | 14.8 | MACVM 1.27x | 4.3 | Dart 2.72x |
+| richards | 17.5 | 22.2 | MACVM 1.27x | 4.5 | Dart 3.86x |
+| **deltablue** | **1.9-2.0** | 3.6 | MACVM 1.83x | 2.4 | **MACVM 1.20x** |
+
+All seven ahead of Cog (arith jumped 1.49x -> 3.23x — MACVM's second-
+biggest margin). Against the 2017 Dart V1 arm64 JIT: the whole-suite gap
+is now **1.5-3.9x** (was 1.6-4.8x pre-smi-fastpath, "4-12x" as folklore),
+the deltablue WIN widened to 1.20x, and dict closed to 1.52x. Weakest
+rows vs Dart: richards 3.86x and sieve 3.23x — per-activation cost and
+the array inner loop, i.e. the S2 register-residency rung (attempt
+record in smi_fastpath_design.md — needs the slot-reader identified
+first) and the inliner remain the levers.
