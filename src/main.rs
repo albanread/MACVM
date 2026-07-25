@@ -142,6 +142,7 @@ fn cmd_run(args: &[String], debug: bool) {
     print_bytecode_count(&mut vm);
     print_gc_bridge_stats(&vm);
     print_vm_stats(&vm);
+    print_nm_map(&vm);
     match result {
         Ok(()) => std::process::exit(vm.exit_code.unwrap_or(0)),
         Err(e) => {
@@ -197,6 +198,29 @@ fn print_vm_stats(vm: &VmState) {
         return;
     }
     eprintln!("{}", macvm::runtime::vm_state::format_vm_stats(vm));
+}
+
+/// `MACVM_TRACE=nmmap`: one line per live nmethod at process exit —
+/// `nmmap: <base> <end> Klass>>selector vN state` — so an external
+/// sampling profiler's anonymous code-cache addresses can be attributed
+/// to compiled methods (sample(1) sees the MAP_JIT region as
+/// "<unknown binary>"). Same-process only: the map is only valid for
+/// the run that printed it.
+fn print_nm_map(vm: &VmState) {
+    if !vm.options.trace.is_enabled("nmmap") {
+        return;
+    }
+    for nm in vm.code_table.iter_all() {
+        let klass_name = macvm::memory::print_oop(&vm.universe, nm.key_klass.name());
+        eprintln!(
+            "nmmap: {:#x} {:#x} {klass_name}>>{} v{} {:?}",
+            nm.code.base as usize,
+            nm.code.base as usize + nm.code.len,
+            nm.key_selector.as_string(),
+            nm.version,
+            nm.state
+        );
+    }
 }
 
 /// `MACVM_TRACE=gc`: a grep-friendly one-line counter summary printed to

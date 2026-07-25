@@ -179,14 +179,15 @@ fn verb_nmethods(_vm: &mut Vm<'_>, _args: &[Value]) -> TclResult<Value> {
     for nm in ctx.vm.code_table.iter_all() {
         let klass_name = crate::memory::print_oop(&ctx.vm.universe, nm.key_klass.name());
         rows.push(format!(
-            "nm={} state={:?} v{} {klass_name}>>{} trap_count={} frame_slots={} code_bytes={}",
+            "nm={} state={:?} v{} {klass_name}>>{} trap_count={} frame_slots={} code_bytes={} base={:#x}",
             nm.id.0,
             nm.state,
             nm.version,
             nm.key_selector.as_string(),
             nm.trap_count,
             nm.frame_slots,
-            nm.code.len
+            nm.code.len,
+            nm.code.base as usize
         ));
     }
     if rows.is_empty() {
@@ -355,6 +356,17 @@ fn flag_set(ctx: &mut super::RusttclCtx, name: &str, value: &str) -> TclResult<(
     match name {
         "jit" => {
             ctx.vm.options.jit = crate::runtime::vm_state::VmOptions::parse_jit(Some(value));
+            // A VM booted with the JIT off never armed the SIGTRAP deopt
+            // handler (`with_options` installs it only when compiled code is
+            // possible), so enabling the JIT here without arming it makes
+            // the first organic deopt a process-killing SIGTRAP.
+            if !matches!(ctx.vm.options.jit, crate::runtime::vm_state::JitMode::Off)
+                && ctx.vm.deopt_trampolines.is_none()
+            {
+                ctx.vm.deopt_trampolines = Some(crate::codecache::deopt_trap::install(
+                    &mut ctx.vm.code_cache,
+                ));
+            }
             Ok(())
         }
         "gc_stress" => {
