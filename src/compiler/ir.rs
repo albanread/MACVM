@@ -79,6 +79,13 @@ pub enum SmiOp {
     And,
     Or,
     Xor,
+    /// R3 (docs/richards_profile.md): Smalltalk `//` — FLOORED division
+    /// (`SmallInt::checked_div`'s `floor_div`). Multi-instruction lowering
+    /// (`emit_smi_divmod`): sdiv + msub + floored correction; zero divisor
+    /// and the single overflow case (SMI_MIN // -1) take the fail edge.
+    Div,
+    /// R3: Smalltalk `\` — floored modulo (sign of the divisor).
+    Mod,
 }
 
 /// Float fast-path (`docs/float_fastpath_design.md`) arithmetic op — the
@@ -1305,6 +1312,8 @@ fn classify_smi_send(vm: &VmState, method: MethodOop, ic_idx: u16) -> SmiSendKin
         1 => SmiSendKind::Arith(SmiOp::Add),
         2 => SmiSendKind::Arith(SmiOp::Sub),
         3 => SmiSendKind::Arith(SmiOp::Mul),
+        4 => SmiSendKind::Arith(SmiOp::Div),
+        5 => SmiSendKind::Arith(SmiOp::Mod),
         6 => SmiSendKind::Arith(SmiOp::And),
         7 => SmiSendKind::Arith(SmiOp::Or),
         8 => SmiSendKind::Arith(SmiOp::Xor),
@@ -2043,13 +2052,24 @@ impl<'a> Translator<'a> {
 
     fn is_smi_inlinable(&self, ic_idx: u16) -> bool {
         let ic = InterpreterIc::at(self.method, ic_idx);
+        let census = std::env::var_os("MACVM_S2_COUNT").is_some();
         if ic.guard().raw() != self.vm.universe.smi_klass.oop().raw() {
+            if census {
+                eprintln!("smifuse decline ic={ic_idx}: guard not smi");
+            }
             return false;
         }
         let Some(target) = MethodOop::try_from(ic.target()) else {
+            if census {
+                eprintln!("smifuse decline ic={ic_idx}: target not MethodOop (compiled id)");
+            }
             return false;
         };
-        crate::compiler::driver::SMI_INLINE.contains(&target.primitive())
+        let ok = crate::compiler::driver::SMI_INLINE.contains(&target.primitive());
+        if census && !ok {
+            eprintln!("smifuse decline ic={ic_idx}: prim {} not inlineable", target.primitive());
+        }
+        ok
     }
 
     /// Float fast-path: `is_smi_inlinable`'s Double twin — a mono-Double-

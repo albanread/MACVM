@@ -972,6 +972,9 @@ impl<'a> Emitter<'a> {
             SmiOp::Or => "orr",
             SmiOp::Xor => "eor",
             SmiOp::Mul => unreachable!("Mul is dispatched to emit_smi_mul, never here"),
+            SmiOp::Div | SmiOp::Mod => {
+                unreachable!("Div/Mod are dispatched to emit_smi_divmod, never here")
+            }
         };
         self.asm
             .emit(mnem, &[Operand::Reg(d), Operand::Reg(ra), Operand::Reg(rb)]);
@@ -1148,6 +1151,55 @@ impl<'a> Emitter<'a> {
         // The value reached dst's slot/register via the custom paths above,
         // bypassing `commit` — mirror it into the resident register too.
         self.refresh_resident(dst, low);
+    }
+
+    /// R3 (docs/richards_profile.md): `//` and `\\` fused — `sdiv` + `msub`
+    /// + the FLOORED correction (`SmallInt::checked_div`/`checked_rem`'s
+    /// `floor_div`/`floor_mod`: quotient toward −∞, remainder takes the
+    /// divisor's sign — arm64 `sdiv` truncates toward zero, so when the
+    /// remainder is nonzero and its sign differs from the divisor's,
+    /// q −= 1 and r += b). Fail edges (the real re-executed send —
+    /// byte-identical Smalltalk semantics): non-smi operands, a ZERO
+    /// divisor (the prim fails → the error path), and the single quotient
+    /// overflow `SMI_MIN // -1` (caught by the tag round-trip; `\\` can
+    /// never overflow — |r| < |b|). Scratch discipline: x19/x20 are the
+    /// emit-local pair (the array-guard convention); q lives in x16 and r
+    /// in x17, both free once the operands are untagged.
+    fn emit_smi_divmod(&mut self, op: SmiOp, dst: VReg, a: VReg, b: VReg, fail: BlockId) {
+        let ra = self.resolve(a, 16);
+        let rb = self.resolve(b, 17);
+        self.emit_tag_check(a, ra, b, rb, fail);
+        let fail_label = self.block_label(fail);
+        self.asm.cbz(rb, fail_label);
+        self.asm.emit("asr", &[x(19), Operand::Reg(ra), imm(2)]); // a, untagged
+        self.asm.emit("asr", &[x(20), Operand::Reg(rb), imm(2)]); // b, untagged
+        self.asm.emit("sdiv", &[x(16), x(19), x(20)]); // q (truncated)
+        self.asm.emit("msub", &[x(17), x(16), x(20), x(19)]); // r = a - q*b
+        // Floored correction: r != 0 && sign(r) != sign(b) → q-1, r+b.
+        let done = self.asm.new_label();
+        self.asm.cbz(xr(17), done);
+        self.asm.emit("eor", &[x(19), x(17), x(20)]);
+        self.asm.emit("cmp", &[x(19), imm(0)]);
+        self.asm.b_cond(Cond::Ge, done);
+        self.asm.emit("sub", &[x(16), x(16), imm(1)]);
+        self.asm.emit("add", &[x(17), x(17), x(20)]);
+        self.asm.bind(done);
+        let d = self.dest_target_direct(dst);
+        match op {
+            SmiOp::Div => {
+                // Retag q. The tag round-trip catches the one overflow.
+                self.asm.emit("lsl", &[x(19), x(16), imm(2)]);
+                self.asm
+                    .emit("cmp", &[x(16), Operand::RegShift(xr(19), Shift::Asr, 2)]);
+                self.asm.b_cond(Cond::Ne, fail_label);
+                self.asm.emit("mov", &[Operand::Reg(d), x(19)]);
+            }
+            SmiOp::Mod => {
+                self.asm.emit("lsl", &[Operand::Reg(d), x(17), imm(2)]);
+            }
+            _ => unreachable!("emit_smi_divmod: only Div/Mod dispatch here"),
+        }
+        self.commit(dst, d);
     }
 
     fn emit_load_field(&mut self, dst: VReg, obj: VReg, byte_off: i32) {
@@ -3070,6 +3122,13 @@ fn emit_ir(e: &mut Emitter, ir: &Ir, next_in_order: Option<BlockId>) {
             b,
             fail,
         } => e.emit_smi_mul(dst, a, b, fail),
+        Ir::SmiArith {
+            op: op @ (SmiOp::Div | SmiOp::Mod),
+            dst,
+            a,
+            b,
+            fail,
+        } => e.emit_smi_divmod(op, dst, a, b, fail),
         Ir::SmiArith {
             op,
             dst,

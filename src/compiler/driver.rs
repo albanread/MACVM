@@ -30,7 +30,7 @@ type CompiledIcState = crate::codecache::nmethod::IcState;
 /// own `mono_smi_inline_send` below is what decides a method compiles AT
 /// ALL, while `is_smi_inlinable` (ir.rs) decides, per send site within an
 /// already-eligible method, fused fast path vs. a real `CallSend`.
-pub(crate) const SMI_INLINE: [i64; 12] = [1, 2, 3, 6, 7, 8, 10, 11, 12, 13, 14, 15];
+pub(crate) const SMI_INLINE: [i64; 14] = [1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15];
 
 /// Float fast-path (`docs/float_fastpath_design.md`): the `Double`
 /// primitives a mono-Double send site fuses to native FP code instead of a
@@ -77,8 +77,8 @@ const PRIM_ACTIVATES_FRAME: [i64; 7] = [50, 51, 52, 53, 54, 60, 61];
 /// Array element ops `at:` (26) / `at:put:` (27) (`array_op_kind`). NOT
 /// included: `basicNew:` (24) is never fused (only bare `basicNew` is), so it
 /// stays a legitimate generic shim.
-const PRIM_ALREADY_FUSED: [i64; 15] = [
-    1, 2, 3, 6, 7, 8, 10, 11, 12, 13, 14, 15, // SMI_INLINE
+const PRIM_ALREADY_FUSED: [i64; 17] = [
+    1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, // SMI_INLINE
     23, // basicNew (alloc_site_klass)
     26, // Array>>at:  (array_op_kind)
     27, // Array>>at:put: (array_op_kind)

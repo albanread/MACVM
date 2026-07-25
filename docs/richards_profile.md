@@ -211,3 +211,40 @@ csel-materialized CONDITIONAL booleans (two defs — correctly outside
 the all-defs rule). The clock levers remaining from this profile are
 R3 (smi `//` fuse) and R4 (per-arm poly inlining); R1b stays the
 asymptote-mover.
+
+## R3 landed — smi `//` and `\\` fuse (richards −4%)
+
+Primitives 4/5 join the smi fuse ladder: a mono-smi `//`/`\\` send
+lowers to tag checks (S1/F2 skips apply), `cbz` on the divisor (a zero
+divisor takes the fail edge — the re-executed send raises the identical
+Smalltalk error), untag, `sdiv`, `msub`, and the FLOORED correction
+(`SmallInt::checked_div`'s `floor_div` semantics: when the remainder is
+nonzero and disagrees with the divisor's sign, q−1/r+b). `//` retags
+through the tag round-trip (`SMI_MIN // -1`, the single overflow, takes
+the fail edge); `\\` can never overflow (|r| < |b|). Prims 4/5 also
+join PRIM_ALREADY_FUSED so `SmallInteger>>//` never acquires its own
+nmethod — the exact staleness that would flip caller ICs to compiled
+ids and silently un-fuse every site (that const's own doc predicted
+it). A 19-case floored-semantics matrix (all sign combos, exact
+division, bounds) passes identically compiled and interpreted.
+
+The measurement chase produced two permanent tools and a lesson:
+richards' disasm showed "no sdiv" through THREE checks — because
+DBG3's decoder had no divide encoding and printed `.word 0x9ad40e70`.
+The module doc says the fallback "is itself a finding"; it was. The
+decoder gained `decode_data2` (sdiv/udiv), and `is_smi_inlinable`
+gained a decline census under MACVM_S2_COUNT (guard-not-smi /
+compiled-id-target / prim-not-inlineable) — the debug build's
+MACVM_DBG_IR had already proven the fuse fired everywhere (both
+richards sites, v0 AND the storm-recompiled v1).
+
+Measured (two 5-round A/Bs vs R2): **richards −4.5%/−3.3%
+(15.4 → ~14.7 ms)** — the profile's ~3.1% `//` chain (send →
+`SmallInteger>>//` nmethod → rt_call_primitive → prim_div) plus
+margin — dict −6.6%/+1.3 (band), deltablue −0.2/−1.0. arith/fib/sieve
+read +1..+5%: **fib's compiled body is BYTE-IDENTICAL across the two
+binaries (70 words, cmp-equal)** — the smear is code-cache placement,
+not mechanism, the third slice running perturbed by layout luck.
+Alignment padding graduates from "noted lever" to overdue hygiene.
+Gates: checksums ×2 thresholds, tier1 104/0, it_gc_jit, focused
+suites, GC_STRESS ×2, poison×GC_STRESS, the semantics matrix ×2 tiers.

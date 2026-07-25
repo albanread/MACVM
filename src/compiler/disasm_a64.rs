@@ -121,6 +121,7 @@ fn decode(word: u32) -> Option<String> {
         .or_else(|| decode_logical_imm(word))
         .or_else(|| decode_bitfield(word))
         .or_else(|| decode_csel(word))
+        .or_else(|| decode_data2(word))
         .or_else(|| decode_data3(word))
         .or_else(|| decode_ldst_pair(word))
         .or_else(|| decode_ldst(word))
@@ -664,6 +665,28 @@ fn decode_csel(word: u32) -> Option<String> {
 /// Data-processing 3-source: `madd`/`msub` (with the `mul`/`mneg` aliases
 /// when Ra=XZR) and the fixed-form `smulh`/`umulh`. The widening multiplies
 /// (`smull`/`umull`) are never emitted and fall back.
+/// Data-processing 2-source: `sdiv`/`udiv` (R3's `//`/`\\` fuse emits
+/// sdiv; udiv for completeness). sf=1 only — the emitter never emits
+/// w-forms.
+fn decode_data2(word: u32) -> Option<String> {
+    let (rm, rn, rd) = ((word >> 16) & 0x1F, (word >> 5) & 0x1F, word & 0x1F);
+    match word & 0xFFE0_FC00 {
+        0x9AC0_0C00 => Some(format!(
+            "sdiv {}, {}, {}",
+            gp(1, rd, false),
+            gp(1, rn, false),
+            gp(1, rm, false)
+        )),
+        0x9AC0_0800 => Some(format!(
+            "udiv {}, {}, {}",
+            gp(1, rd, false),
+            gp(1, rn, false),
+            gp(1, rm, false)
+        )),
+        _ => None,
+    }
+}
+
 fn decode_data3(word: u32) -> Option<String> {
     if word & 0x1F00_0000 != 0x1B00_0000 {
         return None;
