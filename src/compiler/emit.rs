@@ -2041,6 +2041,109 @@ pub fn emit(
         }
         v
     };
+    // S2c (docs/smi_fastpath_design.md): dominance-widened admission for
+    // vregs whose first def is NOT in the entry straight-line — the loop
+    // body's stack temps. A skip is sound iff every position where the
+    // slot could be OBSERVED (safepoints inside the interval, where GC
+    // walks / deopt reads / the store must emit, plus the exact
+    // `extra_oop_live` facts) executes AFTER the first def on every path.
+    // Blocks are straight-line, so within the def's own block that is
+    // position order; across blocks, the single-predecessor chain walked
+    // UP from the observation block must reach the def's block — then the
+    // only way to observe is through the def. A vreg with NO observation
+    // positions at all is trivially admissible (nothing ever reads its
+    // slot, and no call safepoint sits inside its range to clobber the
+    // resident register). OSR entry needs no special case: a chain-
+    // dominated observation is reached through the def regardless of
+    // where execution entered upstream.
+    if s2_active {
+        let mut preds: std::collections::HashMap<u32, Vec<u32>> =
+            std::collections::HashMap::new();
+        for b in &method.blocks {
+            for s in crate::compiler::regalloc::successors(b) {
+                preds.entry(s.0).or_default().push(b.id.0);
+            }
+        }
+        let mut block_starts: Vec<(u32, u32)> = regalloc
+            .block_start_pos
+            .iter()
+            .map(|(&id, &pos)| (pos, id))
+            .collect();
+        block_starts.sort_unstable();
+        let block_of = |pos: u32| -> u32 {
+            match block_starts.binary_search_by_key(&pos, |&(p, _)| p) {
+                Ok(i) => block_starts[i].1,
+                Err(0) => block_starts[0].1,
+                Err(i) => block_starts[i - 1].1,
+            }
+        };
+        let dominates = |def_block: u32, def_pos: u32, obs_pos: u32| -> bool {
+            let ob = block_of(obs_pos);
+            if ob == def_block {
+                return def_pos <= obs_pos;
+            }
+            let mut cur = ob;
+            for _ in 0..64 {
+                match preds.get(&cur).map(Vec::as_slice) {
+                    Some([only]) => {
+                        if *only == def_block {
+                            return true;
+                        }
+                        cur = *only;
+                    }
+                    _ => return false,
+                }
+            }
+            false
+        };
+        for iv in &regalloc.intervals {
+            if s2_smi[iv.vreg.0 as usize]
+                || iv.resident_reg.is_none()
+                || !matches!(iv.assignment, Some(Assignment::Spill(_)))
+                || iv.is_fp
+                || !known_smi_set.contains(&iv.vreg.0)
+            {
+                continue;
+            }
+            let def_block = block_of(iv.start);
+            let interval_ok = regalloc
+                .safepoint_positions
+                .iter()
+                .filter(|&&sp| iv.start <= sp && sp < iv.end)
+                .all(|&sp| dominates(def_block, iv.start, sp));
+            // Pre-def extra facts (p < start) are exempt: the value is
+            // bytecode-dead there (task #94's earlier-safepoint widening),
+            // the slot legitimately holds the prologue nil, and no store
+            // emits for them — the later trap's read is served by the
+            // store AT the trap, which dominance does cover.
+            let extra_ok = regalloc
+                .extra_oop_live
+                .iter()
+                .filter(|&&(v, p)| v == iv.vreg && p >= iv.start)
+                .all(|&(_, p)| dominates(def_block, iv.start, p));
+            if std::env::var_os("MACVM_S2_COUNT").is_some() {
+                let sps: Vec<u32> = regalloc
+                    .safepoint_positions
+                    .iter()
+                    .copied()
+                    .filter(|&sp| iv.start <= sp && sp < iv.end)
+                    .collect();
+                let extras: Vec<u32> = regalloc
+                    .extra_oop_live
+                    .iter()
+                    .filter(|(v, _)| *v == iv.vreg)
+                    .map(|&(_, p)| p)
+                    .collect();
+                eprintln!(
+                    "s2c v{} start={} end={} defblk={} sps={:?} extras={:?} iok={} eok={}",
+                    iv.vreg.0, iv.start, iv.end, def_block, sps, extras, interval_ok, extra_ok
+                );
+            }
+            if interval_ok && extra_ok {
+                s2_smi[iv.vreg.0 as usize] = true;
+            }
+        }
+    }
     for &(v, p) in &regalloc.extra_oop_live {
         if !s2_smi[v.0 as usize] {
             continue;
@@ -2052,6 +2155,9 @@ pub fn emit(
             .expect("an extra_oop_live vreg always has an interval");
         if own.start <= p && own.end > p {
             continue;
+        }
+        if p < own.start {
+            continue; // pre-def: no store emits there (value bytecode-dead)
         }
         let rr = own.resident_reg.expect("s2 implies resident");
         let conflict = regalloc.intervals.iter().any(|iv| {
@@ -2075,7 +2181,14 @@ pub fn emit(
     let s2_extra: std::collections::HashSet<(u32, u32)> = regalloc
         .extra_oop_live
         .iter()
-        .filter(|(v, _)| s2_smi[v.0 as usize])
+        .filter(|&&(v, p)| {
+            s2_smi[v.0 as usize]
+                && regalloc
+                    .intervals
+                    .iter()
+                    .find(|iv| iv.vreg == v)
+                    .is_some_and(|iv| p >= iv.start)
+        })
         .map(|&(v, p)| (v.0, p))
         .collect();
 

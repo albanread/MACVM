@@ -173,3 +173,24 @@ remains the permanent stale-reader checker. Gates at default-ON: release
 lib 827 + tier1 104 (goldens unchanged — their resident vregs are
 Param-fed, correctly outside S2) + 7-mode battery + GUI GC_VERIFY boot +
 debug lib 839.
+
+## S2c landed: dominance-widened admission
+
+In-loop vregs join S2 when every OBSERVATION position (safepoints inside
+the interval + post-def `extra_oop_live` facts) is dominated by the first
+def — same-block by position order (blocks are straight-line), cross-
+block by the single-predecessor chain walked up from the observation
+block (the S3 bound-flow trick, inverted). Two exemptions carry the
+weight: PRE-def extra facts (task #94's earlier-safepoint widening) are
+bytecode-dead — the untouched nil-fill serves them, no store emits, no
+dominance needed; and a vreg with NO observations at all is trivially
+admissible (nothing reads its slot; no call inside its range can clobber
+the resident). benchArith: 3 of 6 stack-temp write-throughs freed (the
+rest are pinned by loop-head trap extras behind the multi-pred loop
+header — future work is recording-level liveness, not more dominance).
+
+A/B vs S1+S3-only: **arith −11.3% total for the S2 family** (S2b was
+−9.2%), fib −4.5%, alloc −1.9%, rest flat, no regressions. Gates:
+debug lib 839/0, release tier1 104/0, 5-mode battery, GUI GC_VERIFY.
+`MACVM_S2_COUNT=1` now also prints per-candidate S2c verdicts (obs
+positions + dominance results).
