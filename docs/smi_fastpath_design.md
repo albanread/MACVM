@@ -139,3 +139,25 @@ version's def shapes (run `MACVM_S2_COUNT=1` on a 3-call arith script
 and read the v1 IR), and consider S2 for OSR bodies' post-entry defs.**
 The def-horizon is entry-straightline only (temps' nil-init defs
 dominate; the first_safepoint clamp was retired as needless).
+
+## S2b (same day): the arith blocker was the OSR exclusion — dropped
+
+The heal-pipeline fact that unblocked it: a fully-warm OSR nmethod
+(`osr_cold_sends == 0`) serves warm calls FOREVER — heal never replaces
+it — so benchArith's hot loop IS its OSR body, and the `!is_osr` guard
+excluded exactly that code. The exclusion was needless: BOTH entries
+initialize S2 residents (normal entry via the entry-block defs; OSR
+entry via the materializer's slot writes + `emit_resident_reloads_at`
+(header)). With it dropped, the OSR loop skips the write-throughs of
+`s` and `i` (bare `mov` where `mov+str` was) while stack temps keep
+theirs (in-loop defs — outside the entry-straightline horizon; widening
+that via block-chain dominance, the S3 bound-flow machinery, is S2c).
+
+A/B (env-toggled, 3 rounds): **arith −9.0%** (16.3→14.9 ms — under 2x
+of Dart V1), fib −7.8%, sieve −6.2%, alloc/deltablue flat; dict and
+richards flip sign across runs (wide thermal bands — re-verify cool
+before quoting). Gates at MACVM_S2=1: release lib 827 + tier1 104 +
+GC_STRESS/DEOPT_STRESS modes + GUI GC_VERIFY boot. The `!smi` census
+also names S2's next coverage frontier beyond S2c: `LoadField`-defined
+loop values (stream/ivar loops) are never known-smi — that is inliner/
+type-feedback territory, not this analysis.

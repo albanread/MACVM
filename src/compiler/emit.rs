@@ -1986,8 +1986,34 @@ pub fn emit(
     }
     let mut s2_smi: Vec<bool> = {
         let mut v = vec![false; method.vregs.len()];
-        if s2_active && !method.is_osr {
+        // OSR bodies are S2-eligible: the OSR entry materializes temps into
+        // slots and `emit_resident_reloads_at(header)` initializes every
+        // resident live there, and the normal entry runs the entry-block
+        // defs — BOTH paths initialize S2 residents before any read or
+        // store. The earlier blanket exclusion was needless, and it was the
+        // arith blocker: a fully-warm OSR nmethod (osr_cold_sends == 0)
+        // serves the warm calls FOREVER (heal never replaces it), so
+        // benchArith's hot loop IS its OSR body.
+        if s2_active {
             for iv in &regalloc.intervals {
+                if std::env::var_os("MACVM_S2_COUNT").is_some()
+                    && iv.resident_reg.is_some()
+                    && !known_smi_set.contains(&iv.vreg.0)
+                {
+                    // Name the poisoning def shapes for S2b diagnosis.
+                    let mut defs: Vec<String> = Vec::new();
+                    for b in &method.blocks {
+                        for op in &b.code {
+                            let mut hit = false;
+                            op.defs(|d| hit |= d.0 == iv.vreg.0);
+                            if hit {
+                                let s: String = format!("{op:?}").chars().take(36).collect();
+                                defs.push(s);
+                            }
+                        }
+                    }
+                    eprintln!("s2census !smi v{} defs: {}", iv.vreg.0, defs.join(" | "));
+                }
                 if std::env::var_os("MACVM_S2_COUNT").is_some() && iv.resident_reg.is_some() {
                     eprintln!(
                         "s2census v{} res={:?} spill={} fp={} start={} horizon={} esl={} smi={}",
