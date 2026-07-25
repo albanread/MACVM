@@ -415,7 +415,7 @@ fn compiled_mono_caller_guard_keeps_key_klass_alive() {
     };
     let ra = regalloc::regalloc(&call_hot_method_ir);
     let mut asm = JasmAssembler::new();
-    let (blob, _pcs, _verified_entry_off, emitted_ic_sites, _safepoints, _osr_off) = emit::emit(
+    let (blob, _pcs, _verified_entry_off, emitted_ic_sites, _safepoints, _osr_off, _lids) = emit::emit(
         &mut asm,
         &call_hot_method_ir,
         &ra,
@@ -581,13 +581,14 @@ fn install_loop_nmethod(
     };
     let ra: RegallocResult = regalloc::regalloc(&ir);
     let mut asm = JasmAssembler::new();
-    let (blob, _pcs, verified_entry_off, emitted_ic_sites, safepoints, _osr_off): (
+    let (blob, _pcs, verified_entry_off, emitted_ic_sites, safepoints, _osr_off, _lids): (
         _,
         _,
         u32,
         _,
         Vec<SafepointPc>,
         Option<u32>,
+        _,
     ) = emit::emit(
         &mut asm,
         &ir,

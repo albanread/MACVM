@@ -69,10 +69,17 @@ pub fn resolve_frame_loc(
     intervals: &[LiveInterval],
     extra_oop_live: &[(VReg, u32)],
     const_smi: &std::collections::HashMap<u32, i64>,
+    const_pool: &std::collections::HashMap<u32, u32>,
 ) -> ValueLoc {
     // F3: a const-uniform vreg's slot is never written — rematerialize.
     if let Some(&v) = const_smi.get(&vreg.0) {
         return ValueLoc::ConstSmi(v);
+    }
+    // R2: same for a pool-literal-uniform vreg. The value here is the POOL
+    // WORD index (the assembler LiteralId, dense id order == word order),
+    // which `read_pool_oop` reads LIVE — GC keeps pool words current.
+    if let Some(&ix) = const_pool.get(&vreg.0) {
+        return ValueLoc::ConstPool(ix);
     }
     for iv in intervals {
         if iv.vreg == vreg

@@ -404,6 +404,13 @@ struct Emitter<'a> {
     /// all: commit skips the store, resolve/reloads rematerialize a movz,
     /// deopt uses ValueLoc::ConstSmi, the GC map skips the slot.
     const_smi: std::collections::HashMap<u32, i64>,
+    /// R2 (`ir::const_pool_vregs`): vregs whose every def is the SAME
+    /// `ConstPool` literal — the heap-oop F3. Slot fully dead: commit
+    /// skips the store, resolve/reloads rematerialize an `ldr` from the
+    /// (GC-current) pool word, deopt uses `ValueLoc::ConstPool`, the GC
+    /// map skips the slot. Values are the `PoolLit` index into
+    /// `literal_ids`.
+    const_pool: std::collections::HashMap<u32, u32>,
     /// F2: (position, vreg) pairs proven smi on every incoming path —
     /// `emit_tag_check`'s second skip source alongside `known_smi`.
     proven_smi_at: std::collections::HashSet<(u32, u32)>,
@@ -607,10 +614,14 @@ fn r1a_profitable_positions(
     assignment: &[Option<Assignment>],
     resident: &[Option<u8>],
     const_smi: &std::collections::HashMap<u32, i64>,
+    const_pool: &std::collections::HashMap<u32, u32>,
 ) -> std::collections::HashSet<u32> {
     let mut profitable = std::collections::HashSet::new();
     let slot_of = |v: VReg| -> Option<u16> {
-        if resident[v.0 as usize].is_some() || const_smi.contains_key(&v.0) {
+        if resident[v.0 as usize].is_some()
+            || const_smi.contains_key(&v.0)
+            || const_pool.contains_key(&v.0)
+        {
             return None;
         }
         match assignment[v.0 as usize] {
@@ -688,6 +699,13 @@ impl<'a> Emitter<'a> {
                     emit_mov_imm64(self.asm, xr(scratch), (cv << 2) as u64);
                     return xr(scratch);
                 }
+                // R2: same for a pool-literal-uniform vreg — one ldr from
+                // the (GC-current) pool word instead of a dead-slot load.
+                if let Some(&pl) = self.const_pool.get(&v.0) {
+                    self.asm
+                        .ldr_literal(xr(scratch), self.literal_ids[pl as usize]);
+                    return xr(scratch);
+                }
                 // R1a: the slot's value is already mirrored in a shadow
                 // register — serve that (no load). Call sites never write a
                 // register `resolve` returns unless it is the scratch they
@@ -748,6 +766,10 @@ impl<'a> Emitter<'a> {
             } else if let Some(&cv) = self.const_smi.get(&v) {
                 // F3: the slot is dead — rematerialize the constant.
                 emit_mov_imm64(self.asm, xr(rr), (cv << 2) as u64);
+            } else if let Some(&pl) = self.const_pool.get(&v) {
+                // R2: dead slot — rematerialize from the pool word.
+                let lid = self.literal_ids[pl as usize];
+                self.asm.ldr_literal(xr(rr), lid);
             } else {
                 emit_spill_access(self.asm, "ldr", x(rr), slot);
             }
@@ -785,8 +807,8 @@ impl<'a> Emitter<'a> {
     }
 
     fn commit(&mut self, dst: VReg, computed_in: Reg) {
-        // F3: a const-uniform vreg's slot is dead — never store it.
-        if self.const_smi.contains_key(&dst.0) {
+        // F3/R2: a const-uniform vreg's slot is dead — never store it.
+        if self.const_smi.contains_key(&dst.0) || self.const_pool.contains_key(&dst.0) {
             self.refresh_resident(dst, computed_in);
             return;
         }
@@ -1988,6 +2010,9 @@ impl<'a> Emitter<'a> {
         enum ArgSrc {
             Asn(Assignment),
             Imm(u64),
+            /// R2: a pool-literal-uniform arg — load the (GC-current) pool
+            /// word straight into the destination register.
+            Lit(LiteralId),
         }
         let sources: Vec<ArgSrc> = args
             .iter()
@@ -1996,6 +2021,15 @@ impl<'a> Emitter<'a> {
                 None => {
                     if let Some(&cv) = self.const_smi.get(&a.0) {
                         ArgSrc::Imm((cv << 2) as u64)
+                    } else if let (Some(&pl), Assignment::Spill(_)) =
+                        (self.const_pool.get(&a.0), self.assignment_of(a))
+                    {
+                        // R2: pool load ONLY where the alternative was a
+                        // slot load (Spill). A Reg-assigned const arg keeps
+                        // its register `mov` — a rename, strictly cheaper
+                        // than any load (the first A/B's fib/arith
+                        // regression: this arm was firing for Reg args).
+                        ArgSrc::Lit(self.literal_ids[pl as usize])
                     } else {
                         ArgSrc::Asn(self.assignment_of(a))
                     }
@@ -2025,6 +2059,9 @@ impl<'a> Emitter<'a> {
             /// destination — reads no register, so it can never block or
             /// participate in a shuffle cycle (same standing as Mem).
             Imm(u64),
+            /// R2: pool-word load — reads no register (same standing as
+            /// Imm/Mem: can be blocked, never blocks, never cycles).
+            Lit(LiteralId),
         }
         let mut pending: Vec<(u8, Src)> = sources
             .iter()
@@ -2036,6 +2073,7 @@ impl<'a> Emitter<'a> {
                 ArgSrc::Asn(Assignment::Reg(_)) => None,
                 ArgSrc::Asn(Assignment::Spill(slot)) => Some((i as u8, Src::Mem(slot))),
                 ArgSrc::Imm(v) => Some((i as u8, Src::Imm(v))),
+                ArgSrc::Lit(l) => Some((i as u8, Src::Lit(l))),
             })
             .collect();
         while !pending.is_empty() {
@@ -2056,6 +2094,7 @@ impl<'a> Emitter<'a> {
                     Src::Reg(r) => self.asm.emit("mov", &[x(i), x(r)]),
                     Src::Mem(slot) => emit_spill_access(self.asm, "ldr", x(i), slot),
                     Src::Imm(v) => emit_mov_imm64(self.asm, xr(i), v),
+                    Src::Lit(l) => self.asm.ldr_literal(xr(i), l),
                 }
             } else {
                 // A genuine cycle (e.g. x0<-x1, x1<-x0): only possible
@@ -2067,8 +2106,8 @@ impl<'a> Emitter<'a> {
                 // whichever other pending move still needs to read it.
                 let (i0, r0) = match pending[0] {
                     (i, Src::Reg(r)) => (i, r),
-                    (_, Src::Mem(_) | Src::Imm(_)) => {
-                        unreachable!("a Mem/Imm source is never part of a genuine cycle")
+                    (_, Src::Mem(_) | Src::Imm(_) | Src::Lit(_)) => {
+                        unreachable!("a Mem/Imm/Lit source is never part of a genuine cycle")
                     }
                 };
                 self.asm.emit("mov", &[x(16), x(i0)]);
@@ -2337,6 +2376,10 @@ pub fn emit(
     Vec<EmittedIcSite>,
     Vec<SafepointPc>,
     Option<u32>,
+    // R2: the PoolLit -> assembler LiteralId map (dense LiteralId order ==
+    // pool word order), so the driver can record ValueLoc::ConstPool with
+    // the pool WORD index deopt's read_pool_oop expects.
+    Vec<LiteralId>,
 ) {
     let literal_ids = intern_pool(asm, method);
 
@@ -2364,6 +2407,20 @@ pub fn emit(
 
     let known_smi_set = crate::compiler::ir::known_smi_vregs(method);
     let f3_const_set = crate::compiler::ir::const_smi_vregs(method);
+    let r2_pool_set = crate::compiler::ir::const_pool_vregs(method);
+    if std::env::var_os("MACVM_S2_COUNT").is_some() && !r2_pool_set.is_empty() {
+        // R2 census: how many pool-const vregs (and how many of them
+        // spilled, i.e. with real slot traffic to elide).
+        let spilled = r2_pool_set
+            .keys()
+            .filter(|&&v| {
+                regalloc.intervals.iter().any(|iv| {
+                    iv.vreg.0 == v && matches!(iv.assignment, Some(Assignment::Spill(_)))
+                })
+            })
+            .count();
+        eprintln!("r2census pool-consts={} spilled={}", r2_pool_set.len(), spilled);
+    }
     // S2 selection (env-gated: with MACVM_S2/MACVM_S2_POISON unset the set
     // is empty and emission is byte-identical to the S1+S3 tree). Rules
     // earned by the attempt record: resident + spill + known-smi + first
@@ -2445,6 +2502,7 @@ pub fn emit(
                     // safepoint stores either (commit's const skip covers
                     // the write-through side).
                     && !f3_const_set.contains_key(&iv.vreg.0)
+                    && !r2_pool_set.contains_key(&iv.vreg.0)
                 {
                     v[iv.vreg.0 as usize] = true;
                 }
@@ -2514,6 +2572,7 @@ pub fn emit(
                 || iv.is_fp
                 || !known_smi_set.contains(&iv.vreg.0)
                 || f3_const_set.contains_key(&iv.vreg.0)
+                || r2_pool_set.contains_key(&iv.vreg.0)
             {
                 continue;
             }
@@ -2632,6 +2691,7 @@ pub fn emit(
         s2_extra,
         proven_smi_at: proven_smi_positions(method, regalloc),
         const_smi: crate::compiler::ir::const_smi_vregs(method),
+        const_pool: crate::compiler::ir::const_pool_vregs(method),
         true_lit: method.true_lit,
         false_lit: method.false_lit,
         nil_lit: method.nil_lit,
@@ -2683,6 +2743,7 @@ pub fn emit(
             &e.assignment,
             &e.resident,
             &e.const_smi,
+            &e.const_pool,
         );
     }
 
@@ -2877,6 +2938,7 @@ pub fn emit(
     }
     let ic_sites = e.ic_sites;
     let safepoints = e.safepoints;
+    let literal_ids_out = e.literal_ids.clone();
     (
         e.asm.finish(),
         block_pcs,
@@ -2884,6 +2946,7 @@ pub fn emit(
         ic_sites,
         safepoints,
         osr_entry_off,
+        literal_ids_out,
     )
 }
 
@@ -3343,8 +3406,7 @@ mod tests {
         let method = branchy_method();
         let ra = regalloc::regalloc(&method);
         let mut asm = JasmAssembler::new();
-        let (_blob, block_pcs, _verified_entry_off, _ic_sites, _safepoints, _osr_off) =
-            emit(&mut asm, &method, &ra, 0, 0, 0, 0, 0, 0, 0, 0, 0, None, None, None, false);
+        let (_blob, block_pcs, _verified_entry_off, _ic_sites, _safepoints, _osr_off, _lids) =            emit(&mut asm, &method, &ra, 0, 0, 0, 0, 0, 0, 0, 0, 0, None, None, None, false);
 
         assert_eq!(
             block_pcs.len(),
@@ -3422,8 +3484,7 @@ mod tests {
         let method = hand_method(vec![block0, block1], vregs, 2);
         let ra = regalloc::regalloc(&method);
         let mut asm = JasmAssembler::new();
-        let (blob, _pcs, _verified_entry_off, _ic_sites, _safepoints, _osr_off) =
-            emit(&mut asm, &method, &ra, 0, 0, 0, 0, 0, 0, 0, 0, 0, None, None, None, false);
+        let (blob, _pcs, _verified_entry_off, _ic_sites, _safepoints, _osr_off, _lids) =            emit(&mut asm, &method, &ra, 0, 0, 0, 0, 0, 0, 0, 0, 0, None, None, None, false);
 
         let mnemonics: Vec<&str> = blob.listing.iter().map(|l| mnemonic(l)).collect();
         let asr_pos = mnemonics.iter().position(|&m| m == "asr");
@@ -3494,8 +3555,7 @@ mod tests {
         let near = make(30);
         let ra = regalloc::regalloc(&near);
         let mut asm = JasmAssembler::new();
-        let (blob, _pcs, _verified_entry_off, _ic_sites, _safepoints, _osr_off) =
-            emit(&mut asm, &near, &ra, 0, 0, 0, 0, 0, 0, 0, 0, 0, None, None, None, false);
+        let (blob, _pcs, _verified_entry_off, _ic_sites, _safepoints, _osr_off, _lids) =            emit(&mut asm, &near, &ra, 0, 0, 0, 0, 0, 0, 0, 0, 0, None, None, None, false);
         let near_mnemonics: Vec<String> = blob.listing.iter().map(|l| mnemonic(l)).collect();
         assert!(
             near_mnemonics.iter().any(|m| m == "ldur"),
@@ -3511,8 +3571,7 @@ mod tests {
         let far = make(31);
         let ra2 = regalloc::regalloc(&far);
         let mut asm2 = JasmAssembler::new();
-        let (blob2, _pcs2, _verified_entry_off2, _ic_sites2, _safepoints, _osr_off) =
-            emit(&mut asm2, &far, &ra2, 0, 0, 0, 0, 0, 0, 0, 0, 0, None, None, None, false);
+        let (blob2, _pcs2, _verified_entry_off2, _ic_sites2, _safepoints, _osr_off, _lids) =            emit(&mut asm2, &far, &ra2, 0, 0, 0, 0, 0, 0, 0, 0, 0, None, None, None, false);
         let mnemonics: Vec<String> = blob2.listing.iter().map(|l| mnemonic(l)).collect();
         assert!(
             mnemonics.iter().any(|m| m == "sub"),
@@ -3568,7 +3627,7 @@ mod tests {
         let with_barrier = make(true);
         let ra = regalloc::regalloc(&with_barrier);
         let mut asm = JasmAssembler::new();
-        let (blob, _pcs, _verified_entry_off, _ic_sites, _safepoints, _osr_off) = emit(
+        let (blob, _pcs, _verified_entry_off, _ic_sites, _safepoints, _osr_off, _lids) = emit(
             &mut asm,
             &with_barrier,
             &ra,
@@ -3606,7 +3665,7 @@ mod tests {
         let without_barrier = make(false);
         let ra2 = regalloc::regalloc(&without_barrier);
         let mut asm2 = JasmAssembler::new();
-        let (blob2, _pcs2, _verified_entry_off2, _ic_sites2, _safepoints, _osr_off) = emit(
+        let (blob2, _pcs2, _verified_entry_off2, _ic_sites2, _safepoints, _osr_off, _lids) = emit(
             &mut asm2,
             &without_barrier,
             &ra2,
@@ -3705,8 +3764,7 @@ mod tests {
         };
         let ra = regalloc::regalloc(&method);
         let mut asm = JasmAssembler::new();
-        let (blob, _pcs, _ve, _ic, _safepoints, _osr_off) =
-            emit(&mut asm, &method, &ra, 0, 0, 0xAABB, 0, 0, 0, 0, 0, 0, None, None, None, false);
+        let (blob, _pcs, _ve, _ic, _safepoints, _osr_off, _lids) =            emit(&mut asm, &method, &ra, 0, 0, 0xAABB, 0, 0, 0, 0, 0, 0, None, None, None, false);
         let listing = blob.listing.join("\n");
         let mnemonic = |l: &str| l.split_whitespace().nth(2).unwrap_or("").to_string();
         let mnemonics: Vec<String> = blob.listing.iter().map(|l| mnemonic(l)).collect();
@@ -3790,7 +3848,7 @@ mod tests {
             key_klass_bits: 0x2000,
             resolve_addr: 0x3000,
         };
-        let (blob, _pcs, verified_entry_off, _ic_sites, _safepoints, _osr_off) = emit(
+        let (blob, _pcs, verified_entry_off, _ic_sites, _safepoints, _osr_off, _lids) = emit(
             &mut asm,
             &method,
             &ra,
@@ -3907,7 +3965,7 @@ mod tests {
             key_klass_bits: 0x1000,
             resolve_addr: 0x3000,
         };
-        let (blob, _pcs, verified_entry_off, _ic_sites, _safepoints, _osr_off) = emit(
+        let (blob, _pcs, verified_entry_off, _ic_sites, _safepoints, _osr_off, _lids) = emit(
             &mut asm, &method, &ra, 0, 0, 0, 0, 0, 0, 0, 0, 0, None, Some(guard), None,
             false,
         );
@@ -3970,7 +4028,7 @@ mod tests {
             key_klass_bits: 0x2000,
             resolve_addr: 0x3000,
         };
-        let (blob, _pcs, _verified_entry_off, _ic_sites, _safepoints, _osr_off) = emit(
+        let (blob, _pcs, _verified_entry_off, _ic_sites, _safepoints, _osr_off, _lids) = emit(
             &mut asm,
             &method,
             &ra,
@@ -4119,8 +4177,7 @@ mod tests {
         };
         let ra = regalloc::regalloc(&method);
         let mut asm = JasmAssembler::new();
-        let (blob, _pcs, _verified_entry_off, ic_sites, _safepoints, _osr_off) =
-            emit(&mut asm, &method, &ra, 0, 0, 0, 0, 0, 0, 0, 0, 0, None, None, None, false);
+        let (blob, _pcs, _verified_entry_off, ic_sites, _safepoints, _osr_off, _lids) =            emit(&mut asm, &method, &ra, 0, 0, 0, 0, 0, 0, 0, 0, 0, None, None, None, false);
 
         assert_eq!(
             ic_sites.len(),
@@ -4203,7 +4260,7 @@ mod frameless_tests {
                 key_klass_bits: 0x2000,
                 resolve_addr: 0x3000,
             };
-            let (blob, _pcs, verified_entry_off, _ics, safepoints, _osr) = emit(
+            let (blob, _pcs, verified_entry_off, _ics, safepoints, _osr, _lids) = emit(
                 &mut asm, &method, &ra, 0, 0, 0, 0, 0, 0, 0, 0, 0, None,
                 Some(guard), None, frameless,
             );

@@ -169,7 +169,7 @@ fn run_ir_raw() {
     let regalloc_result = regalloc::regalloc(&method);
 
     let mut asm = JasmAssembler::new();
-    let (blob, pcs, _verified_entry_off, _ic_sites, _safepoints, _osr_off) = emit::emit(
+    let (blob, pcs, _verified_entry_off, _ic_sites, _safepoints, _osr_off, _lids) = emit::emit(
         &mut asm,
         &method,
         &regalloc_result,
@@ -227,7 +227,7 @@ fn run_ir_raw() {
 fn build_and_publish(cache: &mut CodeCache, stub_poll_addr: u64, method: &IrMethod) -> *const u8 {
     let regalloc_result = regalloc::regalloc(method);
     let mut asm = JasmAssembler::new();
-    let (blob, _pcs, _verified_entry_off, _ic_sites, _safepoints, _osr_off) = emit::emit(
+    let (blob, _pcs, _verified_entry_off, _ic_sites, _safepoints, _osr_off, _lids) = emit::emit(
         &mut asm,
         method,
         &regalloc_result,
@@ -462,7 +462,7 @@ fn run_ir_raw_forces_spill() {
     );
 
     let mut asm = JasmAssembler::new();
-    let (blob, _pcs, _verified_entry_off, _ic_sites, _safepoints, _osr_off) = emit::emit(
+    let (blob, _pcs, _verified_entry_off, _ic_sites, _safepoints, _osr_off, _lids) = emit::emit(
         &mut asm,
         &method,
         &regalloc_result,
@@ -1605,7 +1605,7 @@ fn compile_and_get_listing(vm: &VmState, method: MethodOop) -> String {
     // S10 listing goldens (s10_sumTo/absDiff/bitsOf) -- keeping their output
     // unchanged is the point, not something to revisit as a side effect of
     // step 2's own scope.
-    let (blob, _pcs, _verified_entry_off, _ic_sites, _safepoints, _osr_off) = emit::emit(
+    let (blob, _pcs, _verified_entry_off, _ic_sites, _safepoints, _osr_off, _lids) = emit::emit(
         &mut asm,
         &ir,
         &ra,
@@ -2582,7 +2582,7 @@ fn mono_resolve_patches_call_site_and_dispatches() {
     };
     let ra = regalloc::regalloc(&caller_method);
     let mut asm = JasmAssembler::new();
-    let (blob, _pcs, _verified_entry_off, emitted_ic_sites, _safepoints, _osr_off) = emit::emit(
+    let (blob, _pcs, _verified_entry_off, emitted_ic_sites, _safepoints, _osr_off, _lids) = emit::emit(
         &mut asm,
         &caller_method,
         &ra,
@@ -2777,7 +2777,7 @@ fn build_c2i_scenario(vm: &mut VmState) -> (u64, KlassOop, NmethodId) {
     };
     let ra = regalloc::regalloc(&caller_method);
     let mut asm = JasmAssembler::new();
-    let (blob, _pcs, _verified_entry_off, emitted_ic_sites, _safepoints, _osr_off) = emit::emit(
+    let (blob, _pcs, _verified_entry_off, emitted_ic_sites, _safepoints, _osr_off, _lids) = emit::emit(
         &mut asm,
         &caller_method,
         &ra,
@@ -3036,7 +3036,7 @@ fn full_ic_lattice_mono_to_pic_to_mega() {
     };
     let ra = regalloc::regalloc(&caller_method);
     let mut asm = JasmAssembler::new();
-    let (blob, _pcs, _verified_entry_off, emitted_ic_sites, _safepoints, _osr_off) = emit::emit(
+    let (blob, _pcs, _verified_entry_off, emitted_ic_sites, _safepoints, _osr_off, _lids) = emit::emit(
         &mut asm,
         &caller_method,
         &ra,
@@ -3289,7 +3289,7 @@ fn dnu_from_compiled_code_reaches_does_not_understand() {
     };
     let ra = regalloc::regalloc(&caller_method);
     let mut asm = JasmAssembler::new();
-    let (blob, _pcs, _verified_entry_off, emitted_ic_sites, _safepoints, _osr_off) = emit::emit(
+    let (blob, _pcs, _verified_entry_off, emitted_ic_sites, _safepoints, _osr_off, _lids) = emit::emit(
         &mut asm,
         &caller_method,
         &ra,
@@ -4019,12 +4019,12 @@ fn deopt_resolve_frame_loc_from_real_regalloc() {
     // recorded stack names it (`extra_oop_live`'s exact-position fact),
     // not a widened range that would also (wrongly) cover unrelated code.
     assert_eq!(
-        resolve_frame_loc(VReg(0), p0, &ra.intervals, &ra.extra_oop_live, &Default::default()),
+        resolve_frame_loc(VReg(0), p0, &ra.intervals, &ra.extra_oop_live, &Default::default(), &Default::default()),
         expected_self,
         "self must resolve at trap1, which reexecutes `self bar` and needs it"
     );
     assert_eq!(
-        resolve_frame_loc(VReg(0), p1, &ra.intervals, &ra.extra_oop_live, &Default::default()),
+        resolve_frame_loc(VReg(0), p1, &ra.intervals, &ra.extra_oop_live, &Default::default(), &Default::default()),
         expected_self,
         "self must resolve at trap2 too, which reexecutes `self baz: a` and needs it"
     );
@@ -4036,7 +4036,7 @@ fn deopt_resolve_frame_loc_from_real_regalloc() {
     // which operands the specific reexecuted op reads).
     assert!(
         matches!(
-            resolve_frame_loc(VReg(1), p0, &ra.intervals, &ra.extra_oop_live, &Default::default()),
+            resolve_frame_loc(VReg(1), p0, &ra.intervals, &ra.extra_oop_live, &Default::default(), &Default::default()),
             ValueLoc::FrameSlot(_)
         ),
         "the arg `a`, a unified slot, must resolve to a frame slot at trap1 too, even though \
@@ -4044,7 +4044,7 @@ fn deopt_resolve_frame_loc_from_real_regalloc() {
     );
     assert!(
         matches!(
-            resolve_frame_loc(VReg(1), p1, &ra.intervals, &ra.extra_oop_live, &Default::default()),
+            resolve_frame_loc(VReg(1), p1, &ra.intervals, &ra.extra_oop_live, &Default::default(), &Default::default()),
             ValueLoc::FrameSlot(_)
         ),
         "the arg `a`, read by trap2's own recorded stack, must resolve to a frame slot there"
@@ -4053,7 +4053,7 @@ fn deopt_resolve_frame_loc_from_real_regalloc() {
     // A vreg that doesn't exist (or is dead everywhere) → Nil, the
     // materialize-nil case for a value never read after the resume bci.
     assert_eq!(
-        resolve_frame_loc(VReg(9999), p0, &ra.intervals, &ra.extra_oop_live, &Default::default()),
+        resolve_frame_loc(VReg(9999), p0, &ra.intervals, &ra.extra_oop_live, &Default::default(), &Default::default()),
         ValueLoc::Nil
     );
 }

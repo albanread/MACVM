@@ -165,3 +165,49 @@ alike — task-flagged, not this slice's regression.
 
 R1a is the first rung of R1; **R1b (heap oops resident across
 safepoints via register-aware oop maps) remains the asymptote-mover.**
+
+## R2 landed — ConstOop slot elision (flat on micros; the value is GC-side)
+
+F3's sibling, wired the same way: `ir::const_pool_vregs` (every def the
+SAME `ConstPool` literal, all-defs poison rule), `resolve_frame_loc` →
+`ValueLoc::ConstPool(pool word index)` — the LAST untriggered S13
+materializer arm now has a producer (`read_pool_oop` reads the LIVE
+nmethod pool word, so a post-GC materialization sees the relocated
+oop) — oop maps skip the never-written slots, commit skips the store,
+resolve/reloads rematerialize an `ldr` from the pool, S2/R1a exclude
+the class, and call marshalling gains `ArgSrc::Lit` (no source
+register, can never join a shuffle cycle). `emit` now returns the
+PoolLit→LiteralId map (dense id order == pool word order) so the
+driver can record the index deopt expects.
+
+Census (MACVM_S2_COUNT): richards 201 pool-const vregs / 23 spilled,
+deltablue 472/49, sieve 40/24, dict 47/12, fib 2/0.
+
+Two falsifications recorded on the way to the final shape:
+
+1. **The marshalling `Lit` arm must be Spill-guarded.** The first cut
+   fired it for Reg-assigned const args too, replacing a free register
+   rename (`mov`) with a pool LOAD at every call site — a uniform
+   +1.4..+4.6% regression concentrated on the LOW-spill benches (fib,
+   with zero spilled consts, regressed ~+1.6% twice). Pool loads only
+   where the alternative was a slot load.
+2. **Pool remat is not movz.** F3's rematerialization costs no memory;
+   R2's `ldr` from the nmethod pool trades the hottest line in the
+   machine (the frame) for a colder per-method pool line. Measured
+   consequence: the spilled elisions are cycle-NEUTRAL (5-round A/B vs
+   R1a, all seven within ±1.6%, no reproducible win or loss) — the
+   stores saved pay for the colder loads, no more. What remains is
+   real but not on the clock: 23-49 fewer GC-scanned slots per hot
+   bench at every safepoint, smaller interned oop maps, and the
+   materializer arm coverage.
+
+Gates: checksums both thresholds, tier1 104/0, it_gc_jit, focused
+suites, GC_STRESS ×2, poison×GC_STRESS, GUI render boot (DEOPT_STRESS
+still trips the pre-existing deopt.rs:665 block-receiver abort — on
+base identically). Verdict: LANDED default-on as sound machinery, with
+the honest note that the profile's estimate for R2 ("5-insn shuffles")
+over-credited it — the observed schedule shuffles turned out to be
+csel-materialized CONDITIONAL booleans (two defs — correctly outside
+the all-defs rule). The clock levers remaining from this profile are
+R3 (smi `//` fuse) and R4 (per-arm poly inlining); R1b stays the
+asymptote-mover.

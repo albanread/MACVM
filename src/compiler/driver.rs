@@ -1078,6 +1078,7 @@ fn compile_method_full(
                 // slot write here is harmless; rematerialization buys
                 // nothing on this cold path).
                 &Default::default(),
+                &Default::default(),
             ) {
                 ValueLoc::FrameSlot(off) => {
                     debug_assert!(off < 0 && off % 8 == 0);
@@ -1201,7 +1202,7 @@ fn compile_method_full(
         reload_pos: req.reload_pos,
     });
     let frame_slots_for_osr = regalloc_result.frame_slots;
-    let (blob, block_pcs, verified_entry_off, emitted_ic_sites, safepoint_pcs, osr_off) =
+    let (blob, block_pcs, verified_entry_off, emitted_ic_sites, safepoint_pcs, osr_off, emitted_literal_ids) =
         emit::emit(
             &mut asm,
             &ir_method,
@@ -1313,6 +1314,7 @@ fn compile_method_full(
     let f3_skip: std::collections::HashSet<u32> =
         crate::compiler::ir::const_smi_vregs(&ir_method)
             .keys()
+            .chain(crate::compiler::ir::const_pool_vregs(&ir_method).keys())
             .copied()
             .collect();
     for sp in &safepoint_pcs {
@@ -1421,7 +1423,7 @@ fn compile_method_full(
     // `scopes::resolve_frame_loc` alone resolves receiver/slots/stack; a
     // value not live at the safepoint is dead -> Nil.
     let (deopt_scopes, deopt_pcdescs) =
-        build_deopt_metadata(&ir_method, &regalloc_result, &safepoint_pcs);
+        build_deopt_metadata(&ir_method, &regalloc_result, &safepoint_pcs, &emitted_literal_ids);
 
     let mut nm = Nmethod {
         id: NmethodId(0), // overwritten by CodeTable::install
@@ -1590,6 +1592,8 @@ fn build_deopt_metadata(
     ir_method: &ir::IrMethod,
     regalloc_result: &regalloc::RegallocResult,
     safepoint_pcs: &[emit::SafepointPc],
+    // R2: PoolLit -> assembler LiteralId (pool word index) for ValueLoc::ConstPool.
+    literal_ids: &[crate::compiler::assembler::LiteralId],
 ) -> (Vec<u8>, Vec<crate::compiler::scopes::PcDesc>) {
     use crate::compiler::scopes::{
         resolve_frame_loc, CtxLoc, SafepointState, ScopeDescData, ScopeDescRecorder, SenderLink,
@@ -1602,6 +1606,13 @@ fn build_deopt_metadata(
     // F3: const-uniform vregs rematerialize on deopt (ValueLoc::ConstSmi) —
     // their slots are never written, so every resolve here must know them.
     let f3_const = crate::compiler::ir::const_smi_vregs(ir_method);
+    // R2: pool-literal-uniform vregs rematerialize on deopt via
+    // ValueLoc::ConstPool(pool word index) — translate PoolLit through the
+    // assembler literal table (dense id order == pool word order).
+    let f3_pool: std::collections::HashMap<u32, u32> = crate::compiler::ir::const_pool_vregs(ir_method)
+        .into_iter()
+        .map(|(v, pl)| (v, literal_ids[pl as usize].0))
+        .collect();
     let extra_oop_live = &regalloc_result.extra_oop_live;
     let n_slots = ir_method.argc as usize + ir_method.ntemps as usize;
     let mut rec = ScopeDescRecorder::new();
@@ -1632,6 +1643,7 @@ fn build_deopt_metadata(
                     intervals,
                     extra_oop_live,
                     &f3_const,
+                    &f3_pool,
                 );
                 let root_slots = (0..n_slots)
                     .map(|i| {
@@ -1641,6 +1653,7 @@ fn build_deopt_metadata(
                             intervals,
                             extra_oop_live,
                             &f3_const,
+                            &f3_pool,
                         )
                     })
                     .collect();
@@ -1672,7 +1685,7 @@ fn build_deopt_metadata(
                     // itself); everywhere else the pin (regalloc) keeps it
                     // live, so `resolve_frame_loc` distinguishes the two
                     // cases exactly.
-                    match resolve_frame_loc(ctx_vreg, position, intervals, extra_oop_live, &f3_const) {
+                    match resolve_frame_loc(ctx_vreg, position, intervals, extra_oop_live, &f3_const, &f3_pool) {
                         // Pre-def window (the prologue alloc's own safepoint):
                         // hand the interpreter a FRESH nil-filled Context via
                         // the Elided path — NOT `CtxLoc::None`. The deopt
@@ -1697,7 +1710,7 @@ fn build_deopt_metadata(
                         temps: ir_method
                             .ctx_vregs
                             .iter()
-                            .map(|&v| resolve_frame_loc(v, position, intervals, extra_oop_live, &f3_const))
+                            .map(|&v| resolve_frame_loc(v, position, intervals, extra_oop_live, &f3_const, &f3_pool))
                             .collect(),
                     }
                 };
@@ -1749,7 +1762,7 @@ fn build_deopt_metadata(
                             let pending_stack = level
                                 .caller_pending_stack
                                 .iter()
-                                .map(|&v| resolve_frame_loc(v, position, intervals, extra_oop_live, &f3_const))
+                                .map(|&v| resolve_frame_loc(v, position, intervals, extra_oop_live, &f3_const, &f3_pool))
                                 .collect();
                             let inl_receiver = resolve_frame_loc(
                                 level.receiver,
@@ -1757,11 +1770,12 @@ fn build_deopt_metadata(
                                 intervals,
                                 extra_oop_live,
                     &f3_const,
+                    &f3_pool,
                             );
                             let mut inl_slots: Vec<_> = level
                                 .slots
                                 .iter()
-                                .map(|&v| resolve_frame_loc(v, position, intervals, extra_oop_live, &f3_const))
+                                .map(|&v| resolve_frame_loc(v, position, intervals, extra_oop_live, &f3_const, &f3_pool))
                                 .collect();
                             // S14 step 7-IV-c: a slot holding an ELIDED-CLOSURE
                             // phantom overrides its (filler) vreg location — the
@@ -1792,7 +1806,7 @@ fn build_deopt_metadata(
                 let mut stack: Vec<_> = raw
                     .stack
                     .iter()
-                    .map(|&v| resolve_frame_loc(v, position, intervals, extra_oop_live, &f3_const))
+                    .map(|&v| resolve_frame_loc(v, position, intervals, extra_oop_live, &f3_const, &f3_pool))
                     .collect();
                 // S14 step 7-IV-c: phantom stack entries override their filler
                 // vregs (a block-arg send's guard-cold reexecute stack; in-callee
@@ -2544,7 +2558,7 @@ mod tests {
         let ra = regalloc::regalloc(&ir_method);
 
         let mut asm = JasmAssembler::new();
-        let (_blob, _pcs, _ve, _ic, safepoint_pcs, _osr_off) =
+        let (_blob, _pcs, _ve, _ic, safepoint_pcs, _osr_off, lids) =
             emit::emit(&mut asm, &ir_method, &ra, 0, 0, 0, 0, 0, 0, 0, 0, 0, None, None, None, false);
         assert_eq!(
             safepoint_pcs.len(),
@@ -2552,7 +2566,7 @@ mod tests {
             "two generic sends -> two safepoints"
         );
 
-        let (blob, pcdescs) = build_deopt_metadata(&ir_method, &ra, &safepoint_pcs);
+        let (blob, pcdescs) = build_deopt_metadata(&ir_method, &ra, &safepoint_pcs, &lids);
         assert_eq!(
             pcdescs.len(),
             2,
@@ -2698,10 +2712,10 @@ mod tests {
         let ra = regalloc::regalloc(&ir_method);
 
         let mut asm = JasmAssembler::new();
-        let (_blob, _pcs, _ve, _ic, safepoint_pcs, _osr_off) =
+        let (_blob, _pcs, _ve, _ic, safepoint_pcs, _osr_off, lids) =
             emit::emit(&mut asm, &ir_method, &ra, 0, 0, 0, 0, 0, 0, 0, 0, 0, None, None, None, false);
 
-        let (blob, pcdescs) = build_deopt_metadata(&ir_method, &ra, &safepoint_pcs);
+        let (blob, pcdescs) = build_deopt_metadata(&ir_method, &ra, &safepoint_pcs, &lids);
 
         // Exactly one LoopPoll site among the decoded deopt sites.
         let poll_sites: Vec<_> = pcdescs

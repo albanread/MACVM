@@ -9438,6 +9438,44 @@ pub(crate) fn const_smi_vregs(m: &IrMethod) -> HashMap<u32, i64> {
     val
 }
 
+/// R2 (docs/richards_profile.md): vregs whose EVERY def is the SAME
+/// `ConstPool` literal — the heap-oop sibling of [`const_smi_vregs`].
+/// Their frame slot carries no information: deopt rematerializes via
+/// `ValueLoc::ConstPool` (the S13 materializer arm, untriggered until
+/// now — `read_pool_oop` reads the LIVE nmethod pool word, which GC
+/// keeps current, so a post-move materialization sees the relocated
+/// oop), the oop map skips the never-written slot, and emission
+/// neither stores nor loads it (uses rematerialize an `ldr` from the
+/// pool). Same all-defs poison-by-default rule as `const_smi_vregs`;
+/// values are the `PoolLit` index (the emitter maps it to the
+/// assembler `LiteralId`, whose id IS the pool word index).
+pub(crate) fn const_pool_vregs(m: &IrMethod) -> HashMap<u32, u32> {
+    let mut val: HashMap<u32, u32> = HashMap::new();
+    let mut poison: HashSet<u32> = HashSet::new();
+    for b in &m.blocks {
+        for op in &b.code {
+            match op {
+                Ir::ConstPool { dst, lit } => match val.get(&dst.0) {
+                    None => {
+                        val.insert(dst.0, lit.0);
+                    }
+                    Some(&prev) if prev == lit.0 => {}
+                    Some(_) => {
+                        poison.insert(dst.0);
+                    }
+                },
+                other => other.defs(|d| {
+                    poison.insert(d.0);
+                }),
+            }
+        }
+    }
+    for p in &poison {
+        val.remove(p);
+    }
+    val
+}
+
 /// Smi fast path S1 (`docs/smi_fastpath_design.md`): the set of vregs that
 /// are smi BY CONSTRUCTION — every def is a `ConstSmi`, a smi-arithmetic
 /// result (`SmiArith`/`SmiArithNoOv` dst: their value is always a tagged
