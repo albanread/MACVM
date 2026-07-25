@@ -152,3 +152,30 @@ death-by-activation across poly dispatch. F1-self-call shaves its
 self-send chains too; the poly processWork dispatch itself is
 SameTargetPoly/Dominant territory already built — the residue after F1
 should be re-profiled before further guessing.
+
+## F1 landed: proven-self sends call the verified entry
+
+`CallSiteInfo.self_klass: Option<KlassOop>` marks the two root-level
+CallSend fallbacks reached with `self_send_target.is_some()` — sends
+whose receiver is provably the root method's own `self`, whose klass the
+entry guard already verified. Deliberately separate from `static_klass`
+(no runtime super-dispatch entanglement: an unpatched F1 site resolves
+like any dynamic send). The driver resolves such sites AFTER publish:
+the self-recursive case (`lookup(K, sel)` == the method being compiled —
+fib) patches the `bl` to THIS blob's own verified entry; an
+already-compiled callee patches to its nmethod's verified entry; a
+not-yet-compiled non-self callee stays lazy. Patched sites start
+`CompiledIcState::Mono` on the direct target (the super-site
+convention) and pin a (K, selector) inline dep, so redefinition
+invalidates the caller; a recompiled/invalidated CALLEE is safe because
+make_not_entrant patches BOTH of its entries to the not-entrant stub.
+
+Measured (two A/Bs, 4+5 rounds): **fib −7.6%/−7.0%** (right at the
+16-of-139-insns prediction), **dict −4.0%/−3.8%** (its self-send
+chains), richards/alloc/deltablue flat within bands, sieve's one-run
++4.4% did not reproduce. Gates: tier1 104/0, release lib 827, stress
+modes, GUI GC_VERIFY boot, both-threshold checksums, debug lib 839/0.
+
+F2 (flow-sensitive param smi-ness) and F3 (ConstSmi slot elision)
+remain from the profile; richards' residue wants a fresh profile after
+F1's self-chains land.

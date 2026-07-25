@@ -912,6 +912,16 @@ pub struct CallSiteInfo {
     /// own target and seed `IcState::Mono` directly, instead of patching
     /// to `stub_resolve` and starting `Unresolved` like every other site.
     pub static_klass: Option<KlassOop>,
+    /// F1 (docs/budgeted_inliner_design.md post-I3 profile): `Some(K)` for
+    /// a PROVEN-SELF send — the receiver is the root method's own `self`,
+    /// whose klass K the entry guard already verified. The driver patches
+    /// such a site's `bl` straight to the callee's VERIFIED entry (guard
+    /// skipped: the callee is customized for exactly K), including the
+    /// self-recursive case where the callee IS the nmethod being installed.
+    /// Deliberately separate from `static_klass`: this field never changes
+    /// RUNTIME dispatch semantics — an unpatched F1 site resolves like any
+    /// ordinary dynamic send.
+    pub self_klass: Option<KlassOop>,
 }
 
 // ── conversion ───────────────────────────────────────────────────────────
@@ -3078,6 +3088,7 @@ impl<'a> Translator<'a> {
                         selector: inner_sel,
                         argc: inner_argc + 1,
                         static_klass: None,
+                    self_klass: None,
                     });
                     self.site_feedback.push(inner_fb);
                     let dst = self.fresh(true);
@@ -4118,6 +4129,7 @@ impl<'a> Translator<'a> {
                             selector: inner_sel,
                             argc: inner_argc + 1,
                             static_klass: None,
+                    self_klass: None,
                         });
                         self.site_feedback.push(inner_fb);
                         let dst = self.fresh(true);
@@ -4770,6 +4782,7 @@ impl<'a> Translator<'a> {
                     selector,
                     argc: real_argc + 1,
                     static_klass: Some(super_klass),
+                self_klass: None,
                 });
                 // S14 step 2: annotate the site with its observed feedback (the
                 // inliner prefers the STATIC super_klass above, but the field is
@@ -5560,6 +5573,7 @@ impl<'a> Translator<'a> {
                             selector,
                             argc: real_argc + 1,
                             static_klass: None,
+                    self_klass: None,
                         });
                         self.site_feedback.push(feedback.clone());
                         self.finish_block(IrBlock {
@@ -5708,6 +5722,7 @@ impl<'a> Translator<'a> {
                             selector,
                             argc: real_argc + 1,
                             static_klass: None,
+                    self_klass: None,
                         });
                         self.site_feedback.push(feedback.clone());
                         self.finish_block(IrBlock {
@@ -5804,6 +5819,7 @@ impl<'a> Translator<'a> {
                             selector,
                             argc: real_argc + 1,
                             static_klass: None,
+                    self_klass: None,
                         });
                         self.site_feedback.push(feedback.clone());
                         self.finish_block(IrBlock {
@@ -5912,6 +5928,7 @@ impl<'a> Translator<'a> {
                         selector,
                         argc: 2,
                         static_klass: None,
+                    self_klass: None,
                     });
                     self.site_feedback.push(feedback.clone());
                     self.finish_block(IrBlock {
@@ -6163,6 +6180,12 @@ impl<'a> Translator<'a> {
                         selector,
                         argc: real_argc + 1,
                         static_klass: None,
+                        // F1: same rule as the shared root fallback below.
+                        self_klass: if self_send_target.is_some() {
+                            Some(self.rcvr_klass)
+                        } else {
+                            None
+                        },
                     });
                     self.site_feedback.push(feedback);
                     let dst = self.fresh(true);
@@ -6195,6 +6218,14 @@ impl<'a> Translator<'a> {
                     selector: ic_view.selector(),
                     argc: real_argc + 1,
                     static_klass: None,
+                    // F1: a proven-self send that did NOT splice still calls
+                    // DIRECT — the driver patches it to the callee's verified
+                    // entry (fib's recursive sends are exactly this).
+                    self_klass: if self_send_target.is_some() {
+                        Some(self.rcvr_klass)
+                    } else {
+                        None
+                    },
                 });
                 // S14 step 2: annotate this send with its interpreter feedback
                 // (already read above for the trap decision — kept parallel to
@@ -7289,6 +7320,7 @@ impl<'a> Translator<'a> {
                         selector: inner_sel,
                         argc: inner_argc + 1,
                         static_klass: None,
+                    self_klass: None,
                     });
                     self.site_feedback.push(inner_fb);
                     let dst = self.fresh(true);

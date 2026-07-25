@@ -1344,24 +1344,55 @@ fn compile_method_full(
         .find(|b| b.code.iter().any(|instr| matches!(instr, ir::Ir::Poll)))
         .map(|b| b.bci);
 
+    // F1 (post-I3 profile): a PROVEN-SELF site calls the callee's VERIFIED
+    // entry directly — the receiver is the customization klass this
+    // method's own entry guard already checked, so the callee's guard can
+    // never fail. Resolved AFTER publish so the self-recursive case (the
+    // callee IS this blob — fib) can use `h` + this compile's own
+    // verified_entry_off. A non-self, not-yet-compiled callee stays on the
+    // normal lazy path (None). Each patched site records a
+    // (klass, selector) inline dep below, so a redefinition invalidates
+    // this nmethod exactly like a spliced self-devirt would.
+    let f1_resolutions: Vec<Option<(KlassOop, u64)>> = emitted_ic_sites
+        .iter()
+        .map(|s| {
+            let cs = &ir_method.call_sites[s.site as usize];
+            match (cs.static_klass, cs.self_klass) {
+                (None, Some(k)) => match lookup(vm, k, s.selector) {
+                    Some(m) if m.oop().raw() == method.oop().raw() => {
+                        Some((k, h.base as u64 + verified_entry_off as u64))
+                    }
+                    Some(_) => vm.code_table.lookup(k, s.selector).and_then(|id| {
+                        let cnm = vm.code_table.get(id)?;
+                        Some((k, cnm.code.base as u64 + cnm.verified_entry_off as u64))
+                    }),
+                    None => None,
+                },
+                _ => None,
+            }
+        })
+        .collect();
+
     // S11 D3: every fresh site starts Unresolved -- its `bl` still
     // self-targets (`bl_patchable`'s own placeholder) until the patch pass
     // just below aims it at `stub_resolve` (D3: "no per-site
     // pre-resolution", exactly like an empty interpreter IC) -- EXCEPT a
     // `send_super` site (D4.6), already resolved above: it starts
     // `Mono{klass, target}` directly, its `bl` already pointing at the
-    // real target, never touching `stub_resolve` at all on a normal run.
+    // real target, never touching `stub_resolve` at all on a normal run —
+    // and an F1 proven-self site, which starts `Mono` on its direct
+    // verified-entry target the same way.
     let ic_sites: Vec<IcSite> = emitted_ic_sites
         .iter()
-        .zip(&super_resolutions)
-        .map(|(s, resolved)| IcSite {
+        .zip(super_resolutions.iter().zip(&f1_resolutions))
+        .map(|(s, (resolved, f1))| IcSite {
             off: s.off,
             selector: s.selector,
             argc: s.argc,
-            state: match resolved {
+            state: match resolved.or(*f1) {
                 Some((klass, target)) => CompiledIcState::Mono {
-                    klass: *klass,
-                    target: *target,
+                    klass,
+                    target,
                 },
                 None => CompiledIcState::Unresolved,
             },
@@ -1381,7 +1412,7 @@ fn compile_method_full(
     let (deopt_scopes, deopt_pcdescs) =
         build_deopt_metadata(&ir_method, &regalloc_result, &safepoint_pcs);
 
-    let nm = Nmethod {
+    let mut nm = Nmethod {
         id: NmethodId(0), // overwritten by CodeTable::install
         osr_cold_sends: if osr_bci.is_some() {
             ir_method.osr_cold_sends
@@ -1445,9 +1476,31 @@ fn compile_method_full(
         oopmap::verify(&nm);
     }
     let resolve_addr = vm.stubs.resolve_addr();
-    for (site, resolved) in emitted_ic_sites.iter().zip(&super_resolutions) {
-        let patch_target = resolved.map_or(resolve_addr, |(_, target)| target);
+    for (site, (resolved, f1)) in emitted_ic_sites
+        .iter()
+        .zip(super_resolutions.iter().zip(&f1_resolutions))
+    {
+        let patch_target = resolved
+            .or(*f1)
+            .map_or(resolve_addr, |(_, target)| target);
         vm.code_cache.patch_branch26_at(h, site.off, patch_target);
+    }
+    // F1 deps: every direct-patched proven-self site pins (klass, selector)
+    // — a redefinition of the callee must invalidate this nmethod, since
+    // its `bl` bypasses dynamic dispatch entirely.
+    for (site, f1) in emitted_ic_sites.iter().zip(&f1_resolutions) {
+        if let Some((k, _)) = f1 {
+            let dup = nm
+                .inline_deps
+                .iter()
+                .any(|(dk, ds)| {
+                    dk.oop().raw() == k.oop().raw()
+                        && ds.oop().raw() == site.selector.oop().raw()
+                });
+            if !dup {
+                nm.inline_deps.push((*k, site.selector));
+            }
+        }
     }
     vm.stats.compilations += 1; // S15 A8 tier-balance counter
     let has_osr = nm.osr_map.is_some();

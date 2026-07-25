@@ -405,6 +405,7 @@ fn compiled_mono_caller_guard_keeps_key_klass_alive() {
             selector: hot_sel,
             argc: 0,
             static_klass: None,
+                self_klass: None,
         }],
         site_feedback: Vec::new(),
         inline_deps: Vec::new(),
@@ -859,6 +860,7 @@ fn mid_loop_forced_scavenge() {
         // first draft had (an extra garbage slot scanned as an oop).
         argc: 1,
         static_klass: None,
+                self_klass: None,
     }];
     let pool = base_pool(&vm);
     let nm_id = install_loop_nmethod(
