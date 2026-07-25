@@ -126,3 +126,29 @@ micros don't time. Gates: debug lib 839/0, release lib 827 + tier1
 Remaining staged: I4 recursion depth 1; invocation-count ranking joining
 loop depth; per-site allowances for NESTED rankings (today the ceiling
 is chain-wide).
+
+## Post-I3 profile: where richards/fib actually spend (2026-07-25)
+
+**fib (2.38x behind Dart): the compiled body is 139 instructions, 52 of
+them memory ops, for a method Dart compiles to ~15.** Itemized from the
+listing (DBG_IR=fib:): (1) the ENTRY GUARD — 8 instructions — runs on
+every recursive call although `self fib:` can never fail it (the
+receiver IS the already-verified self); x2 calls per activation. (2) the
+Param `n` is outside known_smi (all-defs is flow-INsensitive — an arg
+may be non-smi) so it reloads + re-guards at each use even after the
+first guard passed. (3) nil-init + param-spill + ConstSmi write-throughs
+(the S3-crumbs item). Ranked levers: **F1-self-call — a mono site whose
+receiver is `self` and whose target is a compiled method calls the
+VERIFIED entry directly** (skips the 8-insn guard; applies to all
+self-sends incl. the non-spliced recursive ones — the self-devirt proof
+already exists, only the call-target choice is missing); **F2 —
+flow-sensitive param smi-ness** (after a Param's first passing guard,
+later guards on the same vreg are redundant on that path);
+**F3 — ConstSmi slot elision** via `ValueLoc::ConstSmi` at recording.
+
+**richards (3.86x): flat unsymbolized-JIT profile + rt_call_primitive at
+~5%** — one dominant nmethod cluster (the spliced scheduler chain),
+death-by-activation across poly dispatch. F1-self-call shaves its
+self-send chains too; the poly processWork dispatch itself is
+SameTargetPoly/Dominant territory already built — the residue after F1
+should be re-profiled before further guessing.
