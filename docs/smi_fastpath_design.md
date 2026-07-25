@@ -74,3 +74,37 @@ regression), commit. Expected composite: arith's ~55/iter → ~20 —
 roughly 33.6 → 13-15 ms batch, closing most of Dart's 4.81× to ~2×.
 fib/richards should ride S1+S2 too (every compiled method has guards;
 every loop has a poll).
+
+## S2 attempt record (2026-07-25): reverted — the missing-reader problem
+
+The first S2 implementation (commit-skip for known-smi resident vregs +
+`emit_s2_spill_stores` before all nine safepoint-creating sites) produced
+a perfect arith loop (zero stores/loads in the fast path, ~18 insns/iter)
+and passed tier1/gc_jit — then **corrupted the Cocoa GUI boot** (a 2.2TB
+allocation request = a garbage value read as a size; deterministic,
+`Array class>>with:with:with:with:` per the new stall dossier).
+
+Falsified along the way (each a real constraint on the next attempt):
+1. Store filter must mirror BOTH `resolve_frame_loc` disjuncts — interval
+   AND `extra_oop_live` exact facts (fixing this cured the
+   depth3_deopt tier1 crash, not the GUI).
+2. Stores before a vreg's first def plant CALLER callee-saved leftovers
+   into nil-filled oopmap slots — the def-before-first-safepoint horizon
+   (+ entry-straightline dominance + no-OSR) closes the reasoning hole
+   but did NOT cure the GUI.
+3. The prim-shim's safepoint is an EMITTER-side push invisible to
+   `regalloc.safepoint_positions` — the def-horizon can't see it. Shim
+   stores removed. Still not the cure.
+4. **The decisive experiment**: stores-everywhere + write-through
+   RESTORED = clean boot. So the added stores are harmless; the SKIP is
+   the bug — some slot reader survives outside the nine covered sites,
+   and MACVM_GC_VERIFY never tripping suggests a direct stale-VALUE read
+   (not GC pointer corruption).
+
+**Next attempt needs the reader identified first, not more site
+patching**: build a debug-mode consistency checker that, at every
+safepoint (and ideally on every slot LOAD), compares an S2 vreg's slot
+against its resident register and names the divergent reader's pc. Keep:
+the stall-path stack dossier (landed), the nine-site store machinery
+design, and the falsification list above. S1+S3 stand alone: arith
+35.6 -> 16.8 ms without S2.

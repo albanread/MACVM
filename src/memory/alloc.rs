@@ -325,6 +325,10 @@ pub fn alloc_words(vm: &mut VmState, words: usize, klass: Oop, tagged: bool) -> 
         size_bytes,
         crate::memory::stall::GcPhase::Mutator,
     );
+    // A stall is the last thing this VM does — name WHO asked. An absurd
+    // request (the 2.2TB class of failure) is a corruption dossier, not a
+    // sizing problem, and the Smalltalk stack is the lead.
+    crate::runtime::error::print_stack_trace(vm);
     stall_exit(err);
 }
 
