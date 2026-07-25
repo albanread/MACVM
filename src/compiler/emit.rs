@@ -2208,15 +2208,27 @@ fn emit_ir(e: &mut Emitter, ir: &Ir, next_in_order: Option<BlockId>) {
         // bare tagged op (tag-00 arithmetic is exact for add/sub).
         Ir::SmiArithNoOv { op, dst, a, b } => {
             debug_assert!(
-                matches!(op, SmiOp::Add | SmiOp::Sub),
-                "range_reduce only proves Add in R1 (Sub reserved for a lower-bound rung)"
+                matches!(op, SmiOp::Add | SmiOp::Sub | SmiOp::Mul),
+                "range_reduce proves Add (R1) and bounded Mul (smi fast path S3)"
             );
             let ra = e.resolve(a, 16);
             let rb = e.resolve(b, 17);
             let d = e.dest_target_direct(dst);
-            let mnem = if matches!(op, SmiOp::Add) { "add" } else { "sub" };
-            e.asm
-                .emit(mnem, &[Operand::Reg(d), Operand::Reg(ra), Operand::Reg(rb)]);
+            if matches!(op, SmiOp::Mul) {
+                // Tagged mul with the overflow proof done at compile time:
+                // untag ONE operand (asr #2), multiply — the product of a
+                // tagged and an untagged smi is correctly tagged. No smulh,
+                // no high-word compare, no guards (range_reduce's rewrite
+                // precondition proves both operands smi). Single-instruction
+                // writes, so `d` aliasing `ra`/`rb` is hazard-free.
+                e.asm.emit("asr", &[x(16), Operand::Reg(ra), imm(2)]);
+                e.asm
+                    .emit("mul", &[Operand::Reg(d), x(16), Operand::Reg(rb)]);
+            } else {
+                let mnem = if matches!(op, SmiOp::Add) { "add" } else { "sub" };
+                e.asm
+                    .emit(mnem, &[Operand::Reg(d), Operand::Reg(ra), Operand::Reg(rb)]);
+            }
             e.commit(dst, d);
         }
         Ir::ArrayAt {

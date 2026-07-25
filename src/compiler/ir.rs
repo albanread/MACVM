@@ -8912,6 +8912,58 @@ pub(crate) fn range_reduce(m: &mut IrMethod, array_meta: Option<crate::oops::wra
             }
         }
     }
+    // Smi fast path S3 (docs/smi_fastpath_design.md): flow each bound down
+    // SINGLE-predecessor chains. A block whose only predecessor carries
+    // (bv, k) inherits the bound iff bv is not redefined anywhere in that
+    // predecessor (conservative: any def kills the flow, even one after the
+    // last use). A decoded loop body is a straight chain of such blocks —
+    // without this, only the compare's immediate `if_true` block sees the
+    // bound and benchArith's `i*3` (three blocks downstream) keeps its
+    // smulh. Merge points (the loop head's two preds) block the flow.
+    {
+        let mut preds: HashMap<u32, Vec<u32>> = HashMap::new();
+        for b in &m.blocks {
+            for s in crate::compiler::regalloc::successors(b) {
+                preds.entry(s.0).or_default().push(b.id.0);
+            }
+        }
+        let redefines = |blk_id: u32, v: u32| -> bool {
+            m.blocks
+                .iter()
+                .find(|b| b.id.0 == blk_id)
+                .is_some_and(|b| {
+                    b.code.iter().any(|op| {
+                        let mut d = false;
+                        op.defs(|dv| d |= dv.0 == v);
+                        d
+                    })
+                })
+        };
+        loop {
+            let mut grew = false;
+            for b in &m.blocks {
+                let id = b.id.0;
+                if bounds.contains_key(&id) {
+                    continue;
+                }
+                let Some(ps) = preds.get(&id) else { continue };
+                if ps.len() != 1 {
+                    continue;
+                }
+                let Some(&(bv, k)) = bounds.get(&ps[0]) else {
+                    continue;
+                };
+                if bv == u32::MAX || redefines(ps[0], bv) {
+                    continue;
+                }
+                bounds.insert(id, (bv, k));
+                grew = true;
+            }
+            if !grew {
+                break;
+            }
+        }
+    }
     let mut rewritten = 0u32;
     let mut bounds_rewritten = 0u32;
     let mut deps: Vec<(crate::oops::wrappers::KlassOop, u16)> = Vec::new();
@@ -8945,6 +8997,61 @@ pub(crate) fn range_reduce(m: &mut IrMethod, array_meta: Option<crate::oops::wra
                         if c > 0 && upper.saturating_add(c) <= crate::oops::layout::SMI_MAX {
                             *op = Ir::SmiArithNoOv {
                                 op: SmiOp::Add,
+                                dst,
+                                a,
+                                b: rhs,
+                            };
+                            rewritten += 1;
+                        }
+                    }
+                }
+                // Smi fast path S3 (docs/smi_fastpath_design.md): loop-bounded
+                // Mul overflow elision. In a block dominated by `bv <= upper`
+                // with 1 <= lower(bv) (`lower_ok` — same precondition the
+                // array rules use, giving nonnegativity), the product's
+                // magnitude is bounded: `bv * bv <= upper²` and
+                // `bv * c <= upper*c` (c a strict positive const). When that
+                // bound fits SMI_MAX the smulh high-word check (and the tag
+                // guards R1-style rewrites always shed) can go. `checked_mul`
+                // keeps the PROOF itself from overflowing i64. benchArith's
+                // `i*i` and `i*3` are exactly these two shapes.
+                Ir::SmiArith {
+                    op: SmiOp::Mul,
+                    dst,
+                    a,
+                    b: rhs,
+                    ..
+                } if a.0 == bv && rhs.0 == bv && lower_ok => {
+                    if upper >= 0
+                        && upper
+                            .checked_mul(upper)
+                            .is_some_and(|k2| k2 <= crate::oops::layout::SMI_MAX)
+                    {
+                        *op = Ir::SmiArithNoOv {
+                            op: SmiOp::Mul,
+                            dst,
+                            a,
+                            b: rhs,
+                        };
+                        rewritten += 1;
+                    }
+                }
+                Ir::SmiArith {
+                    op: SmiOp::Mul,
+                    dst,
+                    a,
+                    b: rhs,
+                    ..
+                } if a.0 == bv && lower_ok => {
+                    if let Some(c) = resolve_strict(rhs.0) {
+                        if upper >= 0
+                            && c > 0
+                            && upper
+                                .checked_mul(c)
+                                .is_some_and(|p| p <= crate::oops::layout::SMI_MAX)
+                        {
+                            *op = Ir::SmiArithNoOv {
+                                op: SmiOp::Mul,
                                 dst,
                                 a,
                                 b: rhs,
