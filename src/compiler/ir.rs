@@ -1491,6 +1491,10 @@ struct Translator<'a> {
     /// splices (value sites, blockarg sites — no legal convert-time fallback)
     /// count toward it but are never declined by it (design amendment A1).
     budget_bytes_used: u32,
+    /// Budgeted inliner I1: the enclosing inlined frame's `InlineSite` while
+    /// a NESTED `try_inline_leaf` runs (set/cleared by `try_nested_leaf`);
+    /// `None` during every root-level splice.
+    nested_inline_scope: Option<InlineSite>,
     /// S24 B5 step 4: declinable inline decisions demoted over-budget.
     splice_declined_budget: u32,
     /// S14 step 5 (customization, A3): the receiver klass K this compilation
@@ -2234,7 +2238,12 @@ impl<'a> Translator<'a> {
                         kind: SafepointKind::UncommonTrap,
                         reexecute: true,
                         stack_closures: Vec::new(),
-                        inline: None,
+                        // Budgeted inliner I1: a NESTED leaf splice's guard
+                        // trap re-executes the inner send INSIDE the enclosing
+                        // inlined frame — `nested_inline_scope` carries that
+                        // frame's proto (None for every root-level splice,
+                        // preserving the original behavior).
+                        inline: self.nested_inline_scope.clone(),
                     },
                 )],
             });
@@ -3020,6 +3029,25 @@ impl<'a> Translator<'a> {
                         }
                     }
 
+                    // Budgeted inliner I1: a mono LEAF at this nested site
+                    // splices right here (accessor colocations — the richards
+                    // gap) instead of dispatching; anything else falls through
+                    // to the plain compiled send below.
+                    let mut pre_pop = cstack.clone();
+                    pre_pop.push(inner_recv);
+                    pre_pop.extend_from_slice(&inner_args);
+                    if let Some(res) = self.try_nested_leaf(
+                        &inner_fb,
+                        inner_sel,
+                        inner_recv,
+                        &inner_args,
+                        inner_bci,
+                        &pre_pop,
+                        &inline_proto,
+                        code,
+                    ) {
+                        cstack.push(res);
+                    } else {
                     // A real compiled send inside the inlined body. Its site is
                     // the callee's own (klass, selector) speculation-independent
                     // dispatch — a plain S11 compiled IC.
@@ -3053,6 +3081,7 @@ impl<'a> Translator<'a> {
                         args: send_args,
                     });
                     cstack.push(dst);
+                    }
                 }
                 Instr::ReturnTos => {
                     result = Some(
@@ -3951,6 +3980,30 @@ impl<'a> Translator<'a> {
                             }
                         }
 
+                        // Budgeted inliner I1: nested mono-LEAF splice (see
+                        // the non-leaf walk's twin). Phantoms on the stack
+                        // decline — a phantom operand must never enter a
+                        // recorded reexecute stack.
+                        if !cstack_ph.iter().any(|&ph| ph) && ph_closures.is_empty() {
+                            let mut pre_pop = cstack.clone();
+                            pre_pop.push(inner_recv);
+                            pre_pop.extend_from_slice(&inner_args);
+                            if let Some(res) = self.try_nested_leaf(
+                                &inner_fb,
+                                inner_sel,
+                                inner_recv,
+                                &inner_args,
+                                inner_bci,
+                                &pre_pop,
+                                &inline_proto,
+                                &mut bcode,
+                            ) {
+                                cstack.push(res);
+                                cstack_ph.push(false);
+                                bci = next;
+                                continue;
+                            }
+                        }
                         let mut send_args = vec![inner_recv];
                         send_args.extend_from_slice(&inner_args);
                         let site = self.call_sites.len() as u16;
@@ -4194,6 +4247,74 @@ impl<'a> Translator<'a> {
         self.budget_bytes_used
             .saturating_add(crate::compiler::inline::inline_cost(callee))
             > budget.total_bytes
+    }
+
+    /// Budgeted inliner I1 (docs/budgeted_inliner_design.md): try to splice
+    /// a mono LEAF callee at a send site INSIDE an already-spliced body —
+    /// the recursion that makes `max_depth`/`total_bytes` real. A leaf has
+    /// no sends, hence no in-body safepoints, hence NO new deopt scope: its
+    /// only record is the entry-guard trap, which re-executes the inner
+    /// send in the ENCLOSING inlined frame (`proto`). Declines (returning
+    /// None, caller emits its plain `CallSend`) on: non-mono feedback, a
+    /// primitive, a non-leaf, per-call or cumulative budget, or depth.
+    fn try_nested_leaf(
+        &mut self,
+        inner_fb: &crate::compiler::feedback::SiteFeedback,
+        inner_sel: SymbolOop,
+        inner_recv: VReg,
+        inner_args: &[VReg],
+        inner_bci: usize,
+        pre_pop: &[VReg],
+        proto: &InlineSite,
+        code: &mut Vec<Ir>,
+    ) -> Option<VReg> {
+        let crate::compiler::feedback::SiteFeedback::Mono { klass, method } = inner_fb else {
+            return None;
+        };
+        let m = *method;
+        if m.primitive() != 0 || !crate::compiler::inline::is_leaf(m) {
+            return None;
+        }
+        let budget = crate::compiler::inline::budget_for_level(self.level);
+        if crate::compiler::inline::inline_cost(m) > budget.per_call_cost
+            || self.budget_would_exceed(m)
+        {
+            return None;
+        }
+        // Depth = enclosing chain + this nested leaf; the proto's parent
+        // links measure how deep the enclosing splice already is.
+        let mut depth = 2u32; // enclosing frame + this leaf
+        let mut p = proto.parent.as_deref();
+        while let Some(q) = p {
+            depth += 1;
+            p = q.parent.as_deref();
+        }
+        if depth > budget.max_depth {
+            return None;
+        }
+        let smi_bits = self.vm.universe.smi_klass.oop().raw();
+        let shape = if klass.oop().raw() == smi_bits {
+            GuardShape::SmiTest
+        } else {
+            GuardShape::KlassTest
+        };
+        self.nested_inline_scope = Some(proto.clone());
+        let res = self.try_inline_leaf(
+            m,
+            Some((*klass, shape)),
+            *klass,
+            inner_sel,
+            inner_recv,
+            inner_args,
+            inner_bci,
+            pre_pop,
+            code,
+        );
+        self.nested_inline_scope = None;
+        if res.is_some() {
+            self.budget_commit(m);
+        }
+        res
     }
 
     /// Whether an `Untaken` (cold-IC) send may be speculatively lowered to a
@@ -9642,6 +9763,7 @@ pub fn convert(
         spliced_nlr: 0,
         spliced_multibb: 0,
         budget_bytes_used: 0,
+        nested_inline_scope: None,
         splice_declined_budget: 0,
         rcvr_klass,
         self_devirt: false,

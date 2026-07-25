@@ -4385,26 +4385,37 @@ fn compiled_inlined_nonleaf_matches_interpreter() {
         driver::eligible(&vm, outer),
         "a mono non-leaf send must be eligible (it inlines)"
     );
-    let id = driver::compile_method(&mut vm, smi_klass, outer).expect("must compile");
+    // Budgeted inliner I1: install `bar` BEFORE compiling. The nested
+    // splice records a (recv_klass, bar) inline dep, so a post-compile
+    // install would (correctly!) invalidate the fresh nmethod — and a
+    // Mono IC only ever points at an installed method in reality anyway.
     install_method(&mut vm, recv_klass, bar_sel, bar);
+    let id = driver::compile_method(&mut vm, smi_klass, outer).expect("must compile");
 
-    // The `x run` send was inlined: it records NO IcSite of its own; the
-    // inlined body's inner `self bar` send DID emit one real compiled IC site
-    // (it dispatches). And the nmethod records the (recv_klass, run) inline dep.
+    // Budgeted inliner I1: the `x run` send was inlined AND the inlined
+    // body's inner `self bar` send — a mono LEAF within budget — was
+    // NESTED-inlined too: ZERO compiled IC sites remain (this test used to
+    // pin exactly one, the depth-1 boundary this feature removes). Both
+    // splices record their inline deps: (recv_klass, run) and
+    // (recv_klass, bar).
     {
         let nm = vm.code_table.get(id).expect("installed");
         assert_eq!(
             nm.ic_sites.len(),
-            1,
-            "the inlined body's inner `self bar` send is one real compiled IC site \
-             (the outer `x run` was inlined away)"
+            0,
+            "the inner `self bar` leaf is nested-inlined — no compiled IC \
+             sites remain (was 1 under depth-1 inlining)"
         );
         assert_eq!(
             nm.inline_deps.len(),
-            1,
-            "one inline dependency recorded (the inlined `run`)"
+            2,
+            "two inline dependencies recorded (the inlined `run` AND the \
+             nested-inlined `bar`)"
         );
-        assert_eq!(nm.inline_deps[0].0.oop().raw(), recv_klass.oop().raw());
+        assert!(nm
+            .inline_deps
+            .iter()
+            .all(|(k, _)| k.oop().raw() == recv_klass.oop().raw()));
     }
 
     // An argument whose instvar0 holds a discriminating value (12321).
