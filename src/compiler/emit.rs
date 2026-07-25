@@ -346,6 +346,48 @@ struct Emitter<'a> {
     /// GC'd, moving the oops the resident registers point at; the canonical
     /// slots were updated by the GC's frame walk).
     resident_reloads: Vec<(u32, u32, u8, crate::compiler::regalloc::SpillSlot, bool /*is_fp*/)>,
+    /// Smi fast path S2 (docs/smi_fastpath_design.md, env-gated MACVM_S2=1):
+    /// per-vreg "register is AUTHORITATIVE" flag — resident + spill-assigned
+    /// + known-smi + first-def in the unconditional entry straight-line
+    /// before any safepoint. `commit` skips these vregs' write-through
+    /// store; slots are brought current only on safepoint-reaching paths
+    /// (`emit_s2_spill_stores`). Under MACVM_S2_POISON=1 the skip becomes a
+    /// CANARY write instead — a tagged-smi poison encoding the slot index —
+    /// so the still-unidentified stale-slot reader (the S2 attempt record's
+    /// open question) names itself in whatever failure it causes.
+    s2_smi: Vec<bool>,
+    /// The S2 store set as `(vreg, start, end, reg, slot)` (GPR only).
+    s2_spill_stores: Vec<(u32, u32, u32, u8, crate::compiler::regalloc::SpillSlot)>,
+    /// `RegallocResult::extra_oop_live` restricted to S2 vregs — the SECOND
+    /// disjunct of `resolve_frame_loc`'s slot-read predicate, which the
+    /// store filter must mirror exactly (its own regression note).
+    s2_extra: std::collections::HashSet<(u32, u32)>,
+}
+
+/// MACVM_S2=1 → commit-skip active. MACVM_S2_POISON=1 → skip replaced by a
+/// per-slot canary write (implies the skip's staleness without its
+/// silence). Both default OFF: with neither set, emission is byte-identical
+/// to the S1+S3 tree.
+fn s2_mode() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        if std::env::var_os("MACVM_S2_POISON").is_some() {
+            2
+        } else if std::env::var_os("MACVM_S2").is_some() {
+            1
+        } else {
+            0
+        }
+    })
+}
+
+/// Poison canary: a POSITIVE tagged smi (low two bits 00 — GC ignores it,
+/// no pointer chase) whose upper bits spell 0xC0DE and whose low field
+/// carries the spill-slot index. A stale read that reaches any failure
+/// dossier (the mutator-stall trace, a wrong-result check) is then
+/// decodable back to the exact slot.
+fn s2_poison_for(slot: crate::compiler::regalloc::SpillSlot) -> u64 {
+    0xC0DE_0000_0000u64 | ((slot.0 as u64) << 4)
 }
 
 impl<'a> Emitter<'a> {
@@ -453,9 +495,42 @@ impl<'a> Emitter<'a> {
 
     fn commit(&mut self, dst: VReg, computed_in: Reg) {
         if let Assignment::Spill(slot) = self.assignment_of(dst) {
-            emit_spill_access(self.asm, "str", Operand::Reg(computed_in), slot);
+            if !self.s2_smi[dst.0 as usize] {
+                emit_spill_access(self.asm, "str", Operand::Reg(computed_in), slot);
+            } else if s2_mode() == 2 {
+                // Poison-canary mode: mirror the value into the resident
+                // FIRST (computed_in may itself be x16/x17), then clobber
+                // the scratches with the canary and store THAT. Any reader
+                // of this slot before the next covered safepoint store now
+                // reads a decodable 0xC0DE|slot signature instead of a
+                // silently-stale value.
+                self.refresh_resident(dst, computed_in);
+                emit_mov_imm64(self.asm, xr(17), s2_poison_for(slot));
+                emit_spill_access(self.asm, "str", x(17), slot);
+                return;
+            }
         }
         self.refresh_resident(dst, computed_in);
+    }
+
+    /// Smi fast path S2: store every S2 vreg live at the current position
+    /// from its (authoritative) resident register to its canonical slot —
+    /// interval-covered OR carrying an `s2_extra` exact fact, mirroring
+    /// BOTH `resolve_frame_loc` disjuncts. MUST run before ANY instruction
+    /// that can reach a safepoint.
+    fn emit_s2_spill_stores(&mut self) {
+        let pos = self.pos;
+        let live: Vec<(u8, crate::compiler::regalloc::SpillSlot)> = self
+            .s2_spill_stores
+            .iter()
+            .filter(|&&(v, s, e, _, _)| {
+                (s <= pos && e > pos) || self.s2_extra.contains(&(v, pos))
+            })
+            .map(|&(_, _, _, rr, slot)| (rr, slot))
+            .collect();
+        for (rr, slot) in live {
+            emit_spill_access(self.asm, "str", x(rr), slot);
+        }
     }
 
     /// Smi fast path S1: each side's guard is emitted only when the vreg is
@@ -904,6 +979,7 @@ impl<'a> Emitter<'a> {
         self.asm
             .ldr_literal(xr(0), self.literal_ids[klass.0 as usize]);
         emit_mov_imm64(self.asm, xr(1), size_bytes as u64);
+        self.emit_s2_spill_stores(); // S2: slot currency before the safepoint
         self.asm.call_far(self.alloc_slow_lit);
         // S12 D2: `Ir::Alloc`'s ONE safepoint position (`is_safepoint`
         // treats fast+slow paths as a single program point) — only the
@@ -1072,6 +1148,7 @@ impl<'a> Emitter<'a> {
         // Slow path: payload bits -> x0, stub allocates + stores + tags.
         self.asm.bind(slow);
         self.asm.emit("fmov", &[x(0), d(ds)]);
+        self.emit_s2_spill_stores(); // S2: slot currency before the safepoint
         self.asm.call_far(self.box_double_lit);
         self.safepoints.push(SafepointPc {
             pc_off: self.asm.offset(),
@@ -1205,6 +1282,7 @@ impl<'a> Emitter<'a> {
         self.asm.bind(slow);
         self.asm.emit("umov", &[x(0), vd_lane(16, 0)]);
         self.asm.emit("umov", &[x(1), vd_lane(16, 1)]);
+        self.emit_s2_spill_stores(); // S2: slot currency before the safepoint
         self.asm.call_far(box_stub);
         self.safepoints.push(SafepointPc {
             pc_off: self.asm.offset(),
@@ -1457,6 +1535,9 @@ impl<'a> Emitter<'a> {
             ],
         );
         self.asm.cbz(xr(16), skip);
+        // S2: the poll-taken path is where a known-smi resident's slot is
+        // brought current — the fast fall-through writes nothing.
+        self.emit_s2_spill_stores();
         self.asm.call_far(self.stub_poll_lit);
         // S13 step 10b: the poll is a deopt SAFEPOINT. Record its `SafepointPc`
         // at the `bl stub_poll` RETURN address — the offset right AFTER the
@@ -1506,7 +1587,21 @@ impl<'a> Emitter<'a> {
     /// did, caught by its own now-removed debug assert once a real
     /// register-pressure test (not just a spilled one) exercised it.
     fn emit_call_send(&mut self, dst: VReg, site: u16, args: &[VReg]) {
-        let sources: Vec<Assignment> = args.iter().map(|&a| self.assignment_of(a)).collect();
+        // A RESIDENT vreg's argument is marshalled from its register, not
+        // its canonical slot — the register mirrors the slot at every
+        // instruction boundary (and under S2 is the ONLY current copy: the
+        // poison-canary hunt caught this very map reading a stale slot and
+        // handing it to `Array class>>new:` as a length). Also simply
+        // faster: no ldr for a value already in x21-x27, and the resident
+        // pool can never alias a destination x0..x5, so the shuffle below
+        // only gets easier.
+        let sources: Vec<Assignment> = args
+            .iter()
+            .map(|&a| match self.resident[a.0 as usize] {
+                Some(rr) => Assignment::Reg(rr),
+                None => self.assignment_of(a),
+            })
+            .collect();
 
         // A single parallel-move problem over ALL args, register- and
         // spill-assigned alike -- NOT spill-loads-first-then-register-
@@ -1581,6 +1676,10 @@ impl<'a> Emitter<'a> {
             }
         }
 
+        // S2: sends are real safepoints (GC + lazy deopt-at-call read this
+        // frame's slots via the call-site scope); residents live in x21-x27
+        // and the arg registers are untouched by these strs.
+        self.emit_s2_spill_stores();
         let off = self.asm.bl_patchable(RelocKind::InlineCache);
         // S12 D2: the safepoint is THIS call's own return address — read
         // `asm.offset()` again right here (not `off + 4`) so this doesn't
@@ -1619,6 +1718,11 @@ impl<'a> Emitter<'a> {
     /// (S12) and a deopt scope (S13), correlated at the brk offset. No result,
     /// no fall-through — control leaves the method via the trap.
     fn emit_uncommon_trap(&mut self) {
+        // S2: the trap's deopt reads recorded slots — store first. A temp's
+        // resident is never mid-op divergent here (divergence exists only
+        // for a failing op's own not-yet-committed expression dst, which is
+        // never a recorded temp), and every stored value is tag-00.
+        self.emit_s2_spill_stores();
         let pc_off = self.asm.offset();
         self.safepoints.push(SafepointPc {
             pc_off,
@@ -1682,6 +1786,7 @@ impl<'a> Emitter<'a> {
         if ra.num != 0 {
             self.asm.emit("mov", &[x(0), Operand::Reg(ra)]);
         }
+        self.emit_s2_spill_stores(); // S2: slot currency before the safepoint
         self.asm.call_far(self.must_be_boolean_lit);
         // S12 D2: same reasoning as `emit_call_send`'s own safepoint push —
         // this call's return address, read fresh rather than derived from
@@ -1849,13 +1954,113 @@ pub fn emit(
     }
     let verified_entry_off = asm.offset();
 
+    let known_smi_set = crate::compiler::ir::known_smi_vregs(method);
+    // S2 selection (env-gated: with MACVM_S2/MACVM_S2_POISON unset the set
+    // is empty and emission is byte-identical to the S1+S3 tree). Rules
+    // earned by the attempt record: resident + spill + known-smi + first
+    // def inside the unconditional entry straight-line BEFORE any
+    // safepoint (linear order is not dominance; callee-saved registers
+    // hold CALLER junk until the first def), never on OSR bodies, and
+    // demoted when an `extra_oop_live` fact falls outside the interval
+    // while another interval owns the same resident register there.
+    let s2_active = s2_mode() != 0;
+    let entry_straightline_end = regalloc
+        .block_order
+        .get(1)
+        .and_then(|b| regalloc.block_start_pos.get(&b.0))
+        .copied()
+        .unwrap_or(u32::MAX);
+    let s2_def_horizon = entry_straightline_end;
+    if std::env::var_os("MACVM_S2_COUNT").is_some() {
+        eprintln!(
+            "s2census method: mode={} osr={} residents={} intervals={}",
+            s2_mode(),
+            method.is_osr,
+            regalloc
+                .intervals
+                .iter()
+                .filter(|iv| iv.resident_reg.is_some())
+                .count(),
+            regalloc.intervals.len()
+        );
+    }
+    let mut s2_smi: Vec<bool> = {
+        let mut v = vec![false; method.vregs.len()];
+        if s2_active && !method.is_osr {
+            for iv in &regalloc.intervals {
+                if std::env::var_os("MACVM_S2_COUNT").is_some() && iv.resident_reg.is_some() {
+                    eprintln!(
+                        "s2census v{} res={:?} spill={} fp={} start={} horizon={} esl={} smi={}",
+                        iv.vreg.0,
+                        iv.resident_reg,
+                        matches!(iv.assignment, Some(Assignment::Spill(_))),
+                        iv.is_fp,
+                        iv.start,
+                        s2_def_horizon,
+                        entry_straightline_end,
+                        known_smi_set.contains(&iv.vreg.0)
+                    );
+                }
+                if iv.resident_reg.is_some()
+                    && matches!(iv.assignment, Some(Assignment::Spill(_)))
+                    && !iv.is_fp
+                    && iv.start < s2_def_horizon
+                    && known_smi_set.contains(&iv.vreg.0)
+                {
+                    v[iv.vreg.0 as usize] = true;
+                }
+            }
+        }
+        v
+    };
+    for &(v, p) in &regalloc.extra_oop_live {
+        if !s2_smi[v.0 as usize] {
+            continue;
+        }
+        let own = regalloc
+            .intervals
+            .iter()
+            .find(|iv| iv.vreg == v)
+            .expect("an extra_oop_live vreg always has an interval");
+        if own.start <= p && own.end > p {
+            continue;
+        }
+        let rr = own.resident_reg.expect("s2 implies resident");
+        let conflict = regalloc.intervals.iter().any(|iv| {
+            iv.vreg != v && iv.resident_reg == Some(rr) && iv.start <= p && iv.end > p
+        });
+        if conflict {
+            s2_smi[v.0 as usize] = false;
+        }
+    }
+    let s2_spill_stores: Vec<(u32, u32, u32, u8, crate::compiler::regalloc::SpillSlot)> = regalloc
+        .intervals
+        .iter()
+        .filter(|iv| s2_smi[iv.vreg.0 as usize])
+        .filter_map(|iv| match (iv.resident_reg, iv.assignment) {
+            (Some(rr), Some(Assignment::Spill(slot))) => {
+                Some((iv.vreg.0, iv.start, iv.end, rr, slot))
+            }
+            _ => None,
+        })
+        .collect();
+    let s2_extra: std::collections::HashSet<(u32, u32)> = regalloc
+        .extra_oop_live
+        .iter()
+        .filter(|(v, _)| s2_smi[v.0 as usize])
+        .map(|&(v, p)| (v.0, p))
+        .collect();
+
     let mut e = Emitter {
         asm,
         assignment,
         literal_ids,
         labels,
         epilogue,
-        known_smi: crate::compiler::ir::known_smi_vregs(method),
+        known_smi: known_smi_set,
+        s2_smi,
+        s2_spill_stores,
+        s2_extra,
         true_lit: method.true_lit,
         false_lit: method.false_lit,
         nil_lit: method.nil_lit,
@@ -2334,6 +2539,7 @@ fn emit_ir(e: &mut Emitter, ir: &Ir, next_in_order: Option<BlockId>) {
             }
             e.asm.emit("mov", &[x(0), x(16)]);
             e.asm.emit("mov", &[x(1), x(17)]);
+            e.emit_s2_spill_stores(); // S2: slot currency before the safepoint
             e.asm.call_far(e.nlr_originate_lit);
             // Same discipline as every other Rust-reaching call site: a
             // PcDesc at the return address so a stress-era walk can

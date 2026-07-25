@@ -108,3 +108,34 @@ against its resident register and names the divergent reader's pc. Keep:
 the stall-path stack dossier (landed), the nine-site store machinery
 design, and the falsification list above. S1+S3 stand alone: arith
 35.6 -> 16.8 ms without S2.
+
+## S2 retry (2026-07-25, later): the canary found the reader — landed env-gated
+
+The prescribed checker worked on the FIRST shot. `MACVM_S2_POISON=1`
+replaces the skipped write-through with a per-slot canary (a tagged smi
+`0xC0DE… | slot<<4`); the GUI-boot failure immediately became decodable:
+`requested_bytes = 8 × (canary(slot 6) + tagged 3)` — slot 6 read as an
+ARRAY LENGTH (+3-word header) by `Array class>>new:`. **The reader:
+`emit_call_send`'s argument marshalling**, whose parallel-move classified
+sources by raw `Assignment` (`Spill → Src::Mem`), bypassing the resident
+cache and loading spilled args from their slots. Fixed by marshalling
+resident vregs from their registers (also simply faster, and x21-x27 can
+never alias the x0..x5 destinations, so the shuffle only gets easier).
+A full audit found no sibling: every other slot load is resident-first.
+
+Landed env-gated: `MACVM_S2=1` activates the commit-skip; poison mode
+stays as the permanent checker; both off = byte-identical emission.
+Validation at MACVM_S2=1: release lib 827 + tier1 104 + gc_jit + 7-mode
+battery + 75 s GUI/GC_VERIFY soak + poison-clean boot. Interleaved
+env-toggled A/B (two runs): **fib −5.3/−8.2%, sieve −2.6/−7.6%,
+richards −2.7/0%, dict −5.2/+1.5%**, deltablue flat, alloc +1.5/+2.5%
+(the pre-safepoint stores at its hot Alloc slow paths — the one real
+cost), **arith FLAT — blocked, precisely**: benchArith's hot code is the
+OSR-heal recompile, and (a) OSR bodies are S2-excluded by design, (b)
+the HEALED whole-body version's loop vregs fail `known_smi` (census:
+half the residents smi=false there — the heal-version IR has def shapes
+the all-defs rule poisons). **S2b follow-up: teach known_smi the healed
+version's def shapes (run `MACVM_S2_COUNT=1` on a 3-call arith script
+and read the v1 IR), and consider S2 for OSR bodies' post-entry defs.**
+The def-horizon is entry-straightline only (temps' nil-init defs
+dominate; the first_safepoint clamp was retired as needless).
