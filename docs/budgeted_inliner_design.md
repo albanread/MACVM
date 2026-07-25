@@ -96,3 +96,33 @@ there); its bodies are single-block by construction.
 
 Gates: debug lib 839/0, release lib 827 + tier1 104/0, GC_STRESS +
 DEOPT_STRESS ×2, GUI GC_VERIFY boot, both-threshold checksums.
+
+## I3 landed: count-ranked budget pre-allocation
+
+The one-pass translator decides sites in bytecode order, so the ranking
+happens BEFORE translation (`rank_site_allowances`, using the Cfg
+convert already receives): enumerate the root's non-super sends, keep
+in-loop mono non-primitive candidates (loop position is the dominant
+tier-1 hotness signal; invocation-count ranking can join later), rank by
+(loop-depth DESC, callee cost ASC), and simulate spending `total_bytes`
+down the ranking. An approved site's allowance covers its callee's
+actual cost (≤ total_bytes/2) and RAISES that site's `per_call_cost`
+only — absent/unranked sites are byte-identical to before. The active
+site's allowance is published as `allowance_ceiling`, which the nested
+leaf/CFG checks max against, so an approved chain's inner grafts can
+afford the ride (at: bringing scanFor: and friends along).
+
+Fire census: nested grafts tripled (7 → 20+: `isEmpty`,
+`between:and:`, `size`, `privateAt:put:value:`, `checkGrow`, `of:` —
+dictionary/collection internals fusing into approved in-loop chains).
+Clocks, honestly, across two 4-5-round A/Bs: flat-to-slightly-positive
+(deltablue −0.9% consistent; dict −0.7%/−4.5% across runs; an alloc
++4.0% in run 1 did NOT reproduce — noise). The micro suite's hot loops
+were already well-served by root-level fusion; the tripled fire-rate's
+main beneficiaries are the world corpus's deeper chains, which these
+micros don't time. Gates: debug lib 839/0, release lib 827 + tier1
+104/0, stress modes, GUI GC_VERIFY boot, both-threshold checksums.
+
+Remaining staged: I4 recursion depth 1; invocation-count ranking joining
+loop depth; per-site allowances for NESTED rankings (today the ceiling
+is chain-wide).

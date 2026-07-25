@@ -1506,6 +1506,15 @@ struct Translator<'a> {
     /// already on it is direct recursion and declines (dart's recursion
     /// cap; deeper mutual recursion is bounded by depth + total_bytes).
     inline_stack: Vec<u64>,
+    /// Budgeted inliner I3: per-root-IC allowance from `rank_site_allowances`
+    /// (0 / absent = base behavior). Raises the ROOT decision's
+    /// `per_call_cost` for approved in-loop sites only.
+    site_allowance: Vec<u32>,
+    /// The ACTIVE root site's allowance while its splice (and everything
+    /// nested under it) lowers — nested per-call checks max against this so
+    /// an approved chain's inner grafts can afford the ride. Overwritten at
+    /// every root send site; the cumulative total_bytes cap still binds.
+    allowance_ceiling: u32,
     /// S24 B5 step 4: declinable inline decisions demoted over-budget.
     splice_declined_budget: u32,
     /// S14 step 5 (customization, A3): the receiver klass K this compilation
@@ -4042,7 +4051,7 @@ impl<'a> Translator<'a> {
                                     && !self.inline_stack.contains(&m.oop().raw())
                                     && crate::compiler::inline::is_inline_eligible_cfg(m)
                                     && crate::compiler::inline::inline_cost(m)
-                                        <= budget.per_call_cost
+                                        <= budget.per_call_cost.max(self.allowance_ceiling)
                                     && !self.budget_would_exceed(m)
                                     && depth <= budget.max_depth
                                 {
@@ -4374,7 +4383,8 @@ impl<'a> Translator<'a> {
             return None;
         }
         let budget = crate::compiler::inline::budget_for_level(self.level);
-        if crate::compiler::inline::inline_cost(m) > budget.per_call_cost
+        if crate::compiler::inline::inline_cost(m)
+            > budget.per_call_cost.max(self.allowance_ceiling)
             || self.budget_would_exceed(m)
         {
             return None;
@@ -5439,7 +5449,19 @@ impl<'a> Translator<'a> {
                 // `CallSend` below. The pre-pop operand `stack` (receiver + args
                 // still present) is the reexecute stack the guard's cold trap
                 // records — snapshot it BEFORE popping.
-                let budget = crate::compiler::inline::budget_for_level(self.level);
+                let mut budget = crate::compiler::inline::budget_for_level(self.level);
+                // I3: an approved in-loop site's allowance raises ITS
+                // per-call ceiling (never lowers; absent = base), and is
+                // published as the ceiling nested grafts under this site
+                // may max against.
+                self.allowance_ceiling = self
+                    .site_allowance
+                    .get(ic as usize)
+                    .copied()
+                    .unwrap_or(0);
+                if self.allowance_ceiling > budget.per_call_cost {
+                    budget.per_call_cost = self.allowance_ceiling;
+                }
                 let smi_bits = self.vm.universe.smi_klass.oop().raw();
                 // S14 step 5: devirtualized self-sends skip the feedback-driven
                 // inline too — the devirt block above already tried the same
@@ -9734,6 +9756,84 @@ pub(crate) fn reduce_float_boxes(m: &mut IrMethod, osr_bci: Option<u16>) {
     }
 }
 
+/// Budgeted inliner I3 (docs/budgeted_inliner_design.md): count-ranked
+/// budget PRE-ALLOCATION. The one-pass translator decides sites in
+/// bytecode order, so ranking must happen before translation: enumerate
+/// the root's non-super send sites, keep the IN-LOOP mono non-primitive
+/// ones (loop position is the dominant hotness signal on a tier-1
+/// compile — invocation-count ranking can join later), rank by
+/// (loop-depth DESC, callee cost ASC), and simulate spending
+/// `total_bytes` down the ranking. An approved site's allowance COVERS
+/// its callee's actual cost (bounded by total_bytes/2), which the root
+/// decision uses to RAISE `per_call_cost` for that site only — this is
+/// what lets a hot in-loop `at:` afford its CFG graft while straight-line
+/// sites keep the base ceiling (absent/unranked sites behave exactly as
+/// before; allowances never lower anything).
+fn rank_site_allowances(vm: &VmState, method: MethodOop, cfg: &Cfg) -> Vec<u32> {
+    let budget = crate::compiler::inline::budget_for_level(1);
+    // Loop ranges from back-edges: [target block's start, source's end).
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    for blk in &cfg.blocks {
+        if let crate::compiler::decode::Terminator::Jump {
+            target,
+            is_backward: true,
+        } = blk.terminator
+        {
+            ranges.push((cfg.blocks[target].bci_start, blk.bci_end));
+        }
+    }
+    if ranges.is_empty() {
+        return Vec::new();
+    }
+    struct Cand {
+        ic: u16,
+        cost: u32,
+        depth: usize,
+    }
+    let mut cands: Vec<Cand> = Vec::new();
+    let mut max_ic = 0usize;
+    let mut bci = 0usize;
+    let len = method.bytecode_len();
+    while bci < len {
+        let (instr, next) = crate::bytecode::opcode::decode_at(method, bci);
+        if let crate::bytecode::opcode::Instr::Send { ic, super_ } = instr {
+            max_ic = max_ic.max(ic as usize + 1);
+            let depth = ranges
+                .iter()
+                .filter(|&&(s, e)| s <= bci && bci < e)
+                .count();
+            if !super_ && depth > 0 {
+                if let crate::compiler::feedback::SiteFeedback::Mono { method: m, .. } =
+                    crate::compiler::feedback::read_send_site(vm, method, ic, None)
+                {
+                    if m.primitive() == 0 {
+                        cands.push(Cand {
+                            ic,
+                            cost: crate::compiler::inline::inline_cost(m),
+                            depth,
+                        });
+                    }
+                }
+            }
+        }
+        bci = next;
+    }
+    if cands.is_empty() {
+        return Vec::new();
+    }
+    let mut allow = vec![0u32; max_ic];
+    cands.sort_by(|a, b| b.depth.cmp(&a.depth).then(a.cost.cmp(&b.cost)));
+    let cap = budget.total_bytes / 2;
+    let mut spent = 0u32;
+    for c in cands {
+        if c.cost <= cap && spent.saturating_add(c.cost) <= budget.total_bytes {
+            allow[c.ic as usize] = c.cost;
+            spent += c.cost;
+        }
+    }
+    allow
+}
+
 pub fn convert(
     vm: &VmState,
     rcvr_klass: KlassOop,
@@ -9862,6 +9962,8 @@ pub fn convert(
         budget_bytes_used: 0,
         nested_inline_scope: None,
         inline_stack: vec![method.oop().raw()],
+        site_allowance: rank_site_allowances(vm, method, cfg),
+        allowance_ceiling: 0,
         splice_declined_budget: 0,
         rcvr_klass,
         self_devirt: false,
