@@ -368,3 +368,29 @@ rows vs Dart: richards 3.86x and sieve 3.23x — per-activation cost and
 the array inner loop, i.e. the S2 register-residency rung (attempt
 record in smi_fastpath_design.md — needs the slot-reader identified
 first) and the inliner remain the levers.
+
+## 2026-07-26 THREE-WAY final stamp — the F-arc complete (commit=fc8232e)
+
+Both harnesses, interleaved 3 rounds, load-gated, best-of. Since the
+b22ba8f stamp the tree gained: S2/S2b/S2c default-ON, the budgeted
+inliner I1-I3, and F1 (verified-entry self-calls) + F2 (flow-sensitive
+proven-smi) + F3 (ConstSmi slot elision). Full history:
+docs/performance_history.md.
+
+| bench | MACVM ms | Cog ms | vs Cog | Dart V1 ms | vs Dart |
+|---|---|---|---|---|---|
+| arith | 14.2 | 55.2 | **MACVM 3.90x** | 8.1 | Dart 1.81x |
+| fib | 110.0 | 191.1 | **MACVM 1.74x** | 62.4 | Dart 1.77x |
+| sieve | 1.9 | 3.7 | **MACVM 1.95x** | 0.7 | Dart 2.48x |
+| dict | 2.9 | 12.3 | **MACVM 4.29x** | 2.2 | Dart 1.28x |
+| alloc | 9.6 | 14.9 | **MACVM 1.55x** | 4.7 | Dart 2.22x |
+| richards | 16.5 | 22.0 | **MACVM 1.33x** | 4.9 | Dart 3.36x |
+| **deltablue** | **1.8** | 3.6 | **MACVM 1.96x** | 2.5 | **MACVM 1.37x** |
+
+All seven vs Cog at their best margins ever recorded (fib joined the
+comfortable rows: 1.39x -> 1.74x). Vs Dart V1 the whole-suite gap is
+now **1.28-3.36x** (was 1.5-3.9x at b22ba8f, 1.6-4.8x at first
+measurement, "4-12x" as pre-measurement folklore); the deltablue win
+widened 1.20x -> 1.37x and dict closed to 1.28x. Weakest rows vs Dart:
+richards 3.36x (activation cost over poly sends — re-profile next) and
+sieve 2.48x (array inner loop).
