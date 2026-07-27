@@ -83,12 +83,13 @@ pub fn read_send_site(
             other => panic!("read_send_site: unrecognized IC guard smi {other}"),
         };
     }
+    let epoch_fresh = ic.epoch() == vm.ic_epoch;
     match KlassOop::try_from(guard) {
-        Some(klass) => match resolve_target(vm, ic.target(), klass, ic.selector()) {
+        Some(klass) => match resolve_target(vm, ic.target(), klass, ic.selector(), epoch_fresh) {
             Some(method) => SiteFeedback::Mono { klass, method },
-            // A stale compiled-id whose (klass, selector) no longer resolves:
-            // treat the site as never-taken — the trap re-dispatches against
-            // the runtime truth. (Never speculate on unverifiable feedback.)
+            // A stale target whose (klass, selector) no longer resolves: treat
+            // the site as never-taken — the trap re-dispatches against the
+            // runtime truth. (Never speculate on unverifiable feedback.)
             None => SiteFeedback::Untaken,
         },
         None => SiteFeedback::Untaken, // guard == nil
@@ -103,6 +104,7 @@ pub fn read_send_site(
 /// so a never-yet-counted site reads exactly as it always did.
 fn read_poly(vm: &VmState, ic: InterpreterIc) -> SiteFeedback {
     let pairs = ArrayOop::try_from(ic.target()).expect("poly IC target must be an Array");
+    let epoch_fresh = ic.epoch() == vm.ic_epoch;
     let mut cases = Vec::new();
     for i in 0..IC_POLY_MAX_PAIRS {
         let Some(klass) = KlassOop::try_from(pairs.at(2 * i)) else {
@@ -110,9 +112,11 @@ fn read_poly(vm: &VmState, ic: InterpreterIc) -> SiteFeedback {
         };
         // Poly pairs only ever store interpreted MethodOops (`reverify_poly`
         // re-derives, never preserves a compiled id — ic.rs's own rule), but
-        // resolve defensively anyway; a pair that no longer resolves is
-        // dropped rather than speculated on.
-        let Some(method) = resolve_target(vm, pairs.at(2 * i + 1), klass, ic.selector()) else {
+        // resolve defensively anyway; a stale-epoch pair (a redefinition since
+        // the stamp) re-resolves through (klass, selector), and a pair that no
+        // longer resolves at all is dropped rather than speculated on.
+        let Some(method) = resolve_target(vm, pairs.at(2 * i + 1), klass, ic.selector(), epoch_fresh)
+        else {
             continue;
         };
         let count = crate::interpreter::ic::poly_count_at(pairs, i);
@@ -126,31 +130,50 @@ fn read_poly(vm: &VmState, ic: InterpreterIc) -> SiteFeedback {
     SiteFeedback::Poly { cases }
 }
 
-/// A mono/poly target is either a plain `MethodOop` (interpreter-resolved) or a
-/// smi `NmethodId` (the site tiered up — `ic::set_mono_compiled`). Resolve both
-/// to the underlying `MethodOop` via the SITE's own (guard klass, selector) —
-/// never through the nmethod the stale id happens to name today:
+/// The method a dispatch behind this site's `klass` guard would invoke. An IC
+/// target is either a plain `MethodOop` (interpreter-resolved) or a smi
+/// `NmethodId` (the site tiered up — `ic::set_mono_compiled`). Which one may be
+/// trusted verbatim depends on `epoch_fresh` — whether the IC's stamped epoch
+/// still equals `vm.ic_epoch`, the SAME test the interpreter's own fast hit
+/// uses (`interpreter::send`, row-3) before trusting a mono IC:
 ///
-/// An interpreter IC holding a compiled id heals only on its next DISPATCH
-/// (send_generic's validity check); the COMPILER can read it any time after
-/// the nmethod was invalidated, swept, or — the dangerous case — its table
-/// slot REUSED for a different (klass, selector) entirely. Trusting the slot
-/// blindly panicked on a freed id (the MACVM_DEOPT_STRESS sieve crash, S14
-/// step 9) and, worse, would hand back the REUSED entry's method: wrong-method
-/// feedback behind a passing klass guard is a silent miscompile. Resolving
-/// through (klass, selector) is immune to both; `None` means the site has no
-/// verifiable target and the caller must not speculate.
+/// * A **fresh-epoch direct `MethodOop`** IS trustworthy. `install_method`
+///   bumps `ic_epoch` on every (re)definition, so a still-current epoch proves
+///   no binding has changed since this target was resolved and stamped — it
+///   still equals `lookup(klass, selector)`, exactly the interpreter's own
+///   invariant. Return it directly (identity-stable, no chain walk).
+/// * A **stale-epoch** target must be RE-RESOLVED through `(klass, selector)`.
+///   The compiler reads the IC passively — it never triggers the interpreter's
+///   on-dispatch self-heal — so a redefinition since the stamp (a browser
+///   Accept, any `subclass:` reopen) leaves the OLD method oop behind an
+///   unchanged klass guard, and trusting it would splice the OLD body: the
+///   inlined callee's redefinition would simply never take effect (found as
+///   exactly that — editing a method and accepting had no effect once callers
+///   had inlined it). Re-resolving reproduces what the interpreter's own
+///   row-4 stale-epoch path would compute.
+/// * A **compiled id** is ALWAYS re-resolved, regardless of epoch: the nmethod
+///   it names may have been invalidated, swept, or had its table slot REUSED
+///   for a different `(klass, selector)` with no epoch bump. Trusting the slot
+///   blindly panicked on a freed id (the `MACVM_DEOPT_STRESS` sieve crash, S14
+///   step 9) and would hand back the reused entry's method.
+///
+/// `None` means `(klass, selector)` no longer resolves at all (the method was
+/// removed) — the site has no verifiable target and the caller must not
+/// speculate.
 fn resolve_target(
     vm: &VmState,
     target: Oop,
     klass: KlassOop,
     selector: crate::oops::wrappers::SymbolOop,
+    epoch_fresh: bool,
 ) -> Option<MethodOop> {
-    if let Some(m) = MethodOop::try_from(target) {
-        return Some(m);
+    if epoch_fresh {
+        if let Some(m) = MethodOop::try_from(target) {
+            return Some(m);
+        }
     }
     debug_assert!(
-        SmallInt::try_from(target).is_some(),
+        MethodOop::try_from(target).is_some() || SmallInt::try_from(target).is_some(),
         "mono IC target must be a MethodOop or an nmethod id"
     );
     resolve_method_ro(vm, klass, selector)

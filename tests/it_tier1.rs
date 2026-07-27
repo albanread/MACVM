@@ -4299,6 +4299,74 @@ fn redefining_inlined_callee_invalidates_caller() {
     );
 }
 
+/// REGRESSION (browser Accept / method redefinition, the end-to-end half the
+/// test above does NOT cover): redefining an inlined callee must not merely
+/// make the caller `NotEntrant` — the caller's RECOMPILE must inline the NEW
+/// callee body, and the compiled result must match the interpreter. The bug:
+/// invalidation fired correctly (the caller went `NotEntrant`), but the
+/// recompile read the caller's still-stale-epoch interpreter IC and trusted
+/// its cached (OLD) callee `MethodOop` verbatim, re-splicing the
+/// pre-redefinition body — so editing a method and accepting the change had NO
+/// effect once its callers had inlined it (the reported "updating and accepting
+/// changes to methods doesn't work"). The fix: `feedback::resolve_target`
+/// re-resolves a stale-epoch IC target through `(klass, selector)`, exactly the
+/// interpreter's own on-dispatch self-heal.
+#[test]
+fn recompiling_caller_after_redefining_inlined_callee_uses_the_new_body() {
+    let mut vm = test_vm();
+    let smi_klass = vm.universe.smi_klass;
+    let (recv_klass, val_sel, caller) = inline_accessor_scenario(&mut vm);
+
+    // Compile the caller — it inlines `val [ ^instvar0 ]`.
+    driver::compile_method(&mut vm, smi_klass, caller).expect("must compile");
+
+    // Redefine the inlined callee to a DISCRIMINATING constant body
+    // (`val [ ^42 ]`, no longer `^instvar0`). `install_method` bumps
+    // `ic_epoch`, so the caller's warm `val` IC is now epoch-stale.
+    let new_val = {
+        let mut vb = BytecodeBuilder::new();
+        vb.push_smi_i8(42);
+        vb.ret_tos();
+        vb.finish(&mut vm, val_sel, 0, 0)
+    };
+    install_method(&mut vm, recv_klass, val_sel, new_val);
+
+    // Recompile the caller FRESH — BEFORE any interpreter run heals the IC — so
+    // the recompile reads the still-stale-epoch site. With the bug it re-inlines
+    // the OLD `^instvar0`; with the fix it re-resolves and inlines the NEW `^42`.
+    let id2 = driver::compile_method(&mut vm, smi_klass, caller).expect("must recompile");
+
+    // An argument whose instvar0 holds a value DISTINCT from the new constant,
+    // so an old-body result (7) and a new-body result (42) are unmistakable.
+    let arg = alloc::alloc_slots(&mut vm, recv_klass).oop();
+    MemOop::try_from(arg)
+        .unwrap()
+        .set_body_oop(0, SmallInt::new(7).oop());
+    let self_smi = SmallInt::new(0).oop(); // customization receiver, unused by the body
+
+    // Interpreter oracle: `^x val` → the REDEFINED `val [ ^42 ]`.
+    let interp = macvm::interpreter::run_method(&mut vm, caller, self_smi, &[arg]);
+    assert_eq!(
+        interp.raw(),
+        SmallInt::new(42).oop().raw(),
+        "interpreter must use the redefined `val` (^42), not the old ^instvar0",
+    );
+
+    // Compiled recompile must match — the redefinition takes effect even inlined.
+    let nm = vm.code_table.get(id2).expect("installed");
+    let entry = unsafe { nm.code.base.add(nm.entry_off as usize) } as u64;
+    let call: CallStubFn = unsafe { std::mem::transmute(vm.stubs.call_stub_entry()) };
+    let vm_ptr: *mut VmState = &mut vm;
+    let result = unsafe { call(entry, vm_ptr, [self_smi.raw(), arg.raw()].as_ptr(), 2) };
+    assert_eq!(
+        result,
+        SmallInt::new(42).oop().raw(),
+        "the recompiled caller must inline the REDEFINED callee (^42), not the \
+         stale ^instvar0 — a redefined/accepted method must take effect even \
+         when it has been inlined into hot callers",
+    );
+}
+
 // ─── S14 step 4c: non-leaf method inlining ─────────────────────────────────
 
 /// Builds the non-leaf inline scenario:
