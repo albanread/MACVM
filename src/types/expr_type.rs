@@ -120,7 +120,16 @@ pub fn check_method(
     // fallback code after its primitive pragma can meaningfully "fall
     // off the end of its own Smalltalk statements" -- both keep the
     // implicit-self check as before.
-    let is_bare_primitive = m.body.is_empty() && m.primitive.is_some();
+    // A body that is NOTHING but a primitive pragma never falls off the end
+    // returning self -- the primitive's own return value is what the method
+    // answers, and it has nothing to do with `self` (a type-converting
+    // primitive like `SmallInteger>>asDouble` is the canonical case). BOTH
+    // primitive forms count: the numbered `<primitive: N>` (`primitive`) AND
+    // the S20 FFI `<primitive: FFI function: ... >` (`ffi`) -- an empty-bodied
+    // FFI binding (`Posix class>>getaddrinfoNode:... ^<Integer>`, the C call's
+    // int result) is exactly as much a bare primitive as a numbered one, and
+    // was wrongly flagged before this covered `ffi`.
+    let is_bare_primitive = m.body.is_empty() && (m.primitive.is_some() || m.ffi.is_some());
     // T4's second such exemption (same family as the bare-primitive one): a
     // body whose LAST statement is an `error:`/`subclassResponsibility` send
     // never falls off the end at all -- `error:` stops the program (there is
@@ -781,6 +790,44 @@ mod tests {
             "a bare-primitive method's declared return must NOT be checked \
              against the implicit self -- Foo is not a Double, but the \
              primitive (opaque to this checker) legitimately answers one"
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn bare_ffi_primitive_with_no_fallback_is_not_checked_against_implicit_self() {
+        // The S20 FFI form of the bare-primitive rule: an empty-bodied
+        // `<primitive: FFI ...>` binding answers whatever the C function
+        // returns, NOT `self` -- so its declared return (an Integer for a
+        // getaddrinfo-shaped `ret: #g`) must not be checked against implicit
+        // self. Found in the wild as Posix class>>getaddrinfoNode:... /
+        // gaiStrerror: / inetNtop: (world/75_dns.mst), wrongly flagged before
+        // the exemption covered `ffi` as well as `primitive`.
+        let dir = temp_world_dir("bare_ffi_primitive");
+        write_number_tower(&dir);
+        fs::write(
+            dir.join("02_foo.mst"),
+            "Object subclass: Foo [\n\
+             \x20   Foo class >> cCall: p <Integer> ^ <Integer> [\n\
+             \x20       <primitive: FFI function: #getaddrinfo ret: #g args: #(g)>\n\
+             \x20   ]\n\
+             ]\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("world.list"),
+            "00_object.mst\n01_tower.mst\n02_foo.mst\n",
+        )
+        .unwrap();
+
+        let model = build_world_model(&dir).unwrap();
+        assert_eq!(
+            super::super::check::check_world(&model),
+            vec![],
+            "an empty-bodied <primitive: FFI ...> method's declared return \
+             must NOT be checked against implicit self -- the C call answers \
+             it, not `self`"
         );
 
         fs::remove_dir_all(&dir).ok();

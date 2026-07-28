@@ -127,15 +127,22 @@ Object subclass: Dns [
     ]
 
     "Compose a u32 field from an Alien's bytes (Alien natively does 1- and
-     8-byte only; accessors are 1-based, `off` is the C offset)."
-    Dns class >> u32Of: anAlien <Object> at: off <Integer> ^ <Integer> [
+     8-byte only; accessors are 1-based, `off` is the C offset). `anAlien` is
+     deliberately UNANNOTATED: it is a native Alien whose byte/word accessors
+     (byteAt:, signedLongAt:) are S20 Rust primitives with no Smalltalk method
+     node, so the static model cannot see them — annotating it (even as the
+     near-vacuous <Object>) would only turn a legitimate native-primitive send
+     into a false 'does not understand' (docs/typechecker_design.md's own
+     leave-the-unmodelable-Dynamic discipline, as with Alien elsewhere)."
+    Dns class >> u32Of: anAlien at: off <Integer> ^ <Integer> [
         ^(anAlien byteAt: off + 1) + ((anAlien byteAt: off + 2) * 256)
             + ((anAlien byteAt: off + 3) * 65536)
             + ((anAlien byteAt: off + 4) * 16777216)
     ]
     "A pointer field: signedLongAt: is safe — macOS user addresses fit in
-     48 bits, so the sign bit is never set."
-    Dns class >> u64Of: anAlien <Object> at: off <Integer> ^ <Integer> [
+     48 bits, so the sign bit is never set. `anAlien` unannotated for the same
+     reason as u32Of: above."
+    Dns class >> u64Of: anAlien at: off <Integer> ^ <Integer> [
         ^anAlien signedLongAt: off + 1
     ]
     "Read a NUL-terminated C string at a raw address (gai_strerror's static
