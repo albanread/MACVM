@@ -394,3 +394,40 @@ measurement, "4-12x" as pre-measurement folklore); the deltablue win
 widened 1.20x -> 1.37x and dict closed to 1.28x. Weakest rows vs Dart:
 richards 3.36x (activation cost over poly sends — re-profile next) and
 sieve 2.48x (array inner loop).
+
+## 2026-08-01 — xvm-bench.sh: three-VM board with NATIVE MACDART (current)
+
+The canonical cross-VM harness is now [`scripts/xvm-bench.sh`](../scripts/xvm-bench.sh),
+which adds **native macOS MACDART** — the *same* Smalltalk JIT-compiled on the
+ported Dart 1.24.3 VM, with a `microsecondClock` primitive added to match — as a
+third VM beside MACVM and Cog, replacing the Lima-hosted "Dart V1" column above
+with the native binary. One rigorous protocol on every VM (cog-bench.{mst,st}
+`run:block:check:`): a cold run, 30 warmup iters, then **41 single-workload µs
+samples** reporting median + MAD (noise is a number), interleaved same-thermal
+rounds, best-of-7, JIT hot everywhere (MACVM via `MACVM_JIT=threshold`). µs per
+iteration, warm — lower is better:
+
+| bench | MACVM | Cog | MACDART | vs Cog | vs MACDART |
+|---|---|---|---|---|---|
+| arith | 1369 | 5223 | 719 | **MACVM 3.8x** | Dart 1.9x |
+| fib | 10741 | 18361 | 7187 | **MACVM 1.7x** | Dart 1.5x |
+| **sieve** | **174** | 361 | 410 | **MACVM 2.1x** | **MACVM 2.4x** |
+| **dict** | **274** | 1021 | 599 | **MACVM 3.7x** | **MACVM 2.2x** |
+| alloc | 588 | 705 | 458 | **MACVM 1.2x** | Dart 1.3x |
+| richards | 1446 | 2197 | 799 | **MACVM 1.5x** | Dart 1.8x |
+| **deltablue** | **176** | 278 | 1271 | **MACVM 1.6x** | **MACVM 7.2x** |
+
+**MACVM is ahead of Cog on all seven.** Against native MACDART it splits 4-3:
+MACVM takes the allocation-bound benches (sieve, dict, deltablue — its
+generational scavenger's home turf), MACDART takes the compute/dispatch-bound
+ones (arith, fib, alloc, richards). Cog is never the fastest of the three. The
+rows that flipped versus the Lima "Dart V1" board above (arith/fib/alloc/richards
+now go to Dart) are the payoff of running MACDART on bare metal instead of
+Lima-hosted Linux, not a change in either VM.
+
+**Methodology note, on the record:** MACVM's JIT must be engaged with
+`MACVM_JIT=threshold=…`. An interim run of `xvm-bench.sh` omitted it, leaving
+MACVM in its *interpreter* (cold == warm, ~50–170× slower) and briefly producing
+a scoreboard in which "MACDART beats MACVM by 50–350×" — entirely an artifact of
+the JIT being off. The harness now sets the flag and comments why, so the trap
+cannot recur.
