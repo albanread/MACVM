@@ -465,3 +465,37 @@ Cog is now beaten outright by MACVM on all seven and by MACDART on six, with
 deltablue a statistical tie (297 vs 280, inside the 4% noise) — so on this
 machine, with this protocol, **Cog is not meaningfully ahead of either sibling on
 any workload in the suite.**
+
+## 2026-08-02b — after MACVM's regalloc arc (tag v2026.08.02b)
+
+Same harness, best-of-3. This time the movement is **MACVM's own**: a
+register-allocation and codegen arc (`docs/regalloc_findings.md`) — residency
+across calls, prologue `stp` pairing, a wider nil-fill skip, and
+`RefCmpVal`+`BoolBr` fusion. MACDART is unchanged since the previous stamp, so
+its columns double as a same-session noise check (≤2% drift per row).
+
+| bench | MACVM | Cog | MACDART | vs Cog | vs MACDART |
+|---|--:|--:|--:|---|---|
+| arith | 1383 | 5221 | **698** | **MACVM 3.8x** | Dart 2.0x |
+| fib | 8955 | 18692 | **6872** | **MACVM 2.1x** | Dart 1.3x |
+| **sieve** | **176** | 363 | 195 | **MACVM 2.1x** | MACVM 1.1x |
+| **dict** | **252** | 1017 | 451 | **MACVM 4.0x** | **MACVM 1.8x** |
+| alloc | 591 | 713 | **398** | **MACVM 1.2x** | Dart 1.5x |
+| richards | 1084 | 2266 | **632** | **MACVM 2.1x** | Dart 1.7x |
+| **deltablue** | **150** | 279 | 299 | **MACVM 1.9x** | **MACVM 2.0x** |
+
+Against the 2026-08-01 board: richards 1446 → 1084 (−25%), fib 10741 → 8955
+(−17%), deltablue 176 → 150 (−15%), dict 274 → 252 (−8%), sieve 174 → 176 (flat),
+arith 1369 → 1383 (flat). The compute rows moved because that is where the
+allocator's spill traffic lived; the allocation rows were already fast.
+
+Effect on the three-way shape: MACVM stays ahead of Cog on all seven and holds
+the allocation-bound three, while MACDART's compute lead narrows — richards
+2.3× → 1.7×, fib 1.5× → 1.3×. The 4–3 split by workload shape is unchanged.
+
+Three changes in that arc were **rejected by the A/B gate** and are documented
+rather than shipped (constant LVN, an immediate-fold peephole, a spill-cost
+model), and a fourth — deopt environments — was **abandoned on measurement
+before being built**: after the earlier stages, frame traffic is only 13% of
+instructions in hot methods, while the change needs GC register maps that do
+not exist. See `regalloc_findings.md`.
