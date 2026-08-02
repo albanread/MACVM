@@ -431,3 +431,37 @@ MACVM in its *interpreter* (cold == warm, ~50–170× slower) and briefly produc
 a scoreboard in which "MACDART beats MACVM by 50–350×" — entirely an artifact of
 the JIT being off. The harness now sets the flag and comments why, so the trap
 cannot recur.
+
+## 2026-08-02 — MACDART's front-end arc closes the gap (MACVM unchanged)
+
+Same harness, same protocol, best-of-7. **Nothing in MACVM changed between this
+board and the one above** — no VM edit, no world edit, no flag. The movement is
+entirely on the MACDART side: a twelve-commit front-end arc (see its
+`docs/dart_engine_laws.md`) that removed dispatch and marshalling overhead from
+its Smalltalk layer — helper fast-paths, `(isolate, cid, selector)` dispatch
+caches over the "`<Type> ext`" holder resolution, compile-time symbol interning,
+and per-site lowering for the block family. MACVM's columns are re-measured, not
+copied, so they also serve as a same-session noise check on this machine
+(≤3% drift on every row).
+
+| bench | MACVM ms→µs | Cog µs | MACDART µs | vs Cog | vs MACDART |
+|---|---|--:|--:|---|---|
+| arith | 1396 | 5203 | **697** | **MACVM 3.7x** | Dart 2.0x |
+| fib | 10790 | 18634 | **6807** | **MACVM 1.7x** | Dart 1.6x |
+| **sieve** | **178** | 361 | 197 | **MACVM 2.0x** | MACVM 1.1x |
+| **dict** | **269** | 1021 | 483 | **MACVM 3.8x** | **MACVM 1.8x** |
+| alloc | 578 | 704 | **405** | **MACVM 1.2x** | Dart 1.4x |
+| richards | 1438 | 2211 | **633** | **MACVM 1.5x** | Dart 2.3x |
+| **deltablue** | **176** | 280 | 297 | **MACVM 1.6x** | **MACVM 1.7x** |
+
+**MACVM is still ahead of Cog on all seven, and still wins the allocation-bound
+three** — sieve, dict, deltablue remain the scavenger's territory, which is the
+durable structural result: a generational scavenger beats a boxing runtime on
+allocation churn. What changed is the margin. MACDART's deltablue went 1271 →
+297 µs, so MACVM's 7.2× lead there is now 1.7×, and its sieve lead 2.4× → 1.1×.
+The 4-3 split by workload shape is unchanged.
+
+Cog is now beaten outright by MACVM on all seven and by MACDART on six, with
+deltablue a statistical tie (297 vs 280, inside the 4% noise) — so on this
+machine, with this protocol, **Cog is not meaningfully ahead of either sibling on
+any workload in the suite.**

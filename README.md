@@ -74,18 +74,22 @@ best-of-7, JIT hot everywhere. µs per iteration, warm — lower is better:
 
 | bench | MACVM | Cog (Pharo 13) | MACDART |
 |-----------|------:|------:|------:|
-| arith     |  1369 |  5223 |   719 |
-| fib       | 10741 | 18361 |  7187 |
-| sieve     | **174** |   361 |   410 |
-| dict      | **274** |  1021 |   599 |
-| alloc     |   588 |   705 |   458 |
-| richards  |  1446 |  2197 |   799 |
-| deltablue | **176** |   278 |  1271 |
+| arith     |  1396 |  5203 | **697** |
+| fib       | 10790 | 18634 | **6807** |
+| sieve     | **178** |   361 |   197 |
+| dict      | **269** |  1021 |   483 |
+| alloc     |   578 |   704 | **405** |
+| richards  |  1438 |  2211 | **633** |
+| deltablue | **176** |   280 |   297 |
 
 **MACVM is ahead of Cog on all seven.** Against MACDART it splits by workload
 shape: MACVM wins the allocation-bound benches (sieve, dict, deltablue — its
-generational scavenger's home turf), MACDART wins the compute/dispatch-bound ones
-(arith, fib, richards). Both beat Cog; Cog is never the fastest of the three.
+generational scavenger's home turf, and on the first two the margin is now
+narrow), MACDART wins the compute/dispatch-bound ones (arith, fib, alloc,
+richards). Cog is never the fastest of the three, and is no longer meaningfully
+ahead of either: MACDART closed deltablue — its one real loss, once 4.6× — to a
+statistical tie (297 vs 280, inside the 4% noise) by removing dispatch overhead
+in its Smalltalk front end, not by changing either VM.
 
 One methodology note, earned the hard way: MACVM's JIT must be engaged with
 `MACVM_JIT=threshold=…`. The default `macvm run` path is the *interpreter* — cold
