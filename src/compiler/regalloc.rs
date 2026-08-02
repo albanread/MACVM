@@ -112,6 +112,19 @@ pub(crate) fn prologue_stp() -> bool {
     })
 }
 
+/// Stage 3: widen F7's entry-run whitelist to every non-diverting,
+/// non-safepoint op. `MACVM_NILFILL_EXT=0` restores the original four-op
+/// whitelist (A/B + bisection hatch).
+pub(crate) fn nilfill_ext() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            std::env::var("MACVM_NILFILL_EXT").as_deref(),
+            Ok("0") | Ok("off") | Ok("no")
+        )
+    })
+}
+
 fn is_safepoint(ir: &Ir) -> bool {
     matches!(
         ir,
@@ -1252,6 +1265,35 @@ pub fn regalloc(method: &IrMethod) -> RegallocResult {
                     | Ir::Move { .. } => op.defs(|v| {
                         set.insert(v.0);
                     }),
+                    // Stage 3 (docs/regalloc_findings.md): the whitelist admits
+                    // any op that satisfies F7's ACTUAL soundness condition —
+                    // it can neither divert control nor skip its def — not just
+                    // the four the original port happened to list. Each of
+                    // these is verified NOT a safepoint (`is_safepoint`) and to
+                    // carry NO fail/branch edge (`successors`), so control
+                    // cannot leave the entry block at it and reach a later
+                    // safepoint with the def unrun. Admitting them both records
+                    // their own defs AND lets the scan continue past them,
+                    // which is where most of the shrink comes from: the old
+                    // walk stopped dead at the first ivar read.
+                    //
+                    // `LoadField` faulting on a bad receiver is a CRASH, not a
+                    // control transfer — it reaches no safepoint, so the
+                    // invariant ("no safepoint sees an unwritten slot") holds.
+                    // `StoreField` defines no vreg; it is here purely so the
+                    // scan does not stop at it.
+                    Ir::LoadField { .. }
+                    | Ir::StoreField { .. }
+                    | Ir::SmiArithNoOv { .. }
+                    | Ir::SmiArithNoOvImm { .. }
+                    | Ir::RefCmpVal { .. }
+                    | Ir::FConst { .. }
+                        if nilfill_ext() =>
+                    {
+                        op.defs(|v| {
+                            set.insert(v.0);
+                        })
+                    }
                     _ => break,
                 }
             }
