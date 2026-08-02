@@ -2874,8 +2874,32 @@ pub fn emit(
     if !frameless && !regalloc.deopt_nil_init_slots.is_empty() {
         e.asm
             .ldr_literal(xr(16), e.literal_ids[e.nil_lit.0 as usize]);
-        for &slot in &regalloc.deopt_nil_init_slots {
-            emit_spill_access(e.asm, "str", x(16), slot);
+        // Stage 2 (docs/regalloc_findings.md): PAIR consecutive slots into one
+        // `stp`. This prologue runs on EVERY activation, and for a small
+        // recursive method it is most of the activation: fib(32) is ~17 cycles
+        // per call, of which this fill was four separate `stur`s. The list is
+        // sorted+deduped by regalloc, so runs of consecutive slots are already
+        // adjacent; slot i sits at [x29, -8(i+1)], so slots (i, i+1) are one
+        // `stp x16, x16, [x29, #-8(i+2)]` (both halves nil — order irrelevant).
+        // `stp`'s scaled imm7 reaches -512; deeper slots keep the imm9-safe
+        // single-store path (`emit_spill_access` computes the address).
+        let slots = &regalloc.deopt_nil_init_slots;
+        let pair = crate::compiler::regalloc::prologue_stp();
+        let mut k = 0usize;
+        while k < slots.len() {
+            if pair && k + 1 < slots.len() && slots[k + 1].0 == slots[k].0 + 1 {
+                let off = spill_offset(slots[k + 1]);
+                if off >= -512 {
+                    e.asm.emit(
+                        "stp",
+                        &[x(16), x(16), crate::compiler::assembler::mem(29, off)],
+                    );
+                    k += 2;
+                    continue;
+                }
+            }
+            emit_spill_access(e.asm, "str", x(16), slots[k]);
+            k += 1;
         }
     }
 

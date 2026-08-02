@@ -100,6 +100,18 @@ pub(crate) fn resident_across_calls() -> bool {
     })
 }
 
+/// Stage 2: pair consecutive prologue nil-fill slots into one `stp`.
+/// `MACVM_PROLOGUE_STP=0` restores individual stores (A/B + bisection hatch).
+pub(crate) fn prologue_stp() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            std::env::var("MACVM_PROLOGUE_STP").as_deref(),
+            Ok("0") | Ok("off") | Ok("no")
+        )
+    })
+}
+
 fn is_safepoint(ir: &Ir) -> bool {
     matches!(
         ir,
