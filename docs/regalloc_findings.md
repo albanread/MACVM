@@ -119,10 +119,46 @@ Every one run in the default (on) configuration:
 - **`MACVM_DEOPT_STRESS=1`** (periodic nmethod invalidation) — checksums verified.
 - World boot clean.
 
+## Stage 1b — spill-cost model: REJECTED by the gate (negative result)
+
+Implemented exactly as proposed above and measured twice; **reverted**. The
+priority key became `Σ uses × 8^loop-depth − Σ crossed calls × same weight`
+(loop depth from back-edge intervals over the reverse-postorder block list),
+replacing interval length. `MACVM_SPILL_COST=0` reproduced Stage-1 codegen
+byte-for-byte, so the A/B was again one-binary/env-flip — this time with
+**alternating arm order** (off,on / on,off / …), the law learned above.
+
+Run 1 (with a `benefit > 0` filter dropping candidates whose reloads outweigh
+their uses): every bench neutral-to-worse, fib clearly worse (+3.9% warm,
++4.5% min). That filter was a genuine bug of mine, and the diagnosis is worth
+keeping: **in a straight-line method every weight is 1**, so in `fib:` (no
+loop) `self` has 2 uses and crosses 2 calls, netting exactly 0 — the filter
+dropped it back to memory-resident and *gave back part of Stage 1's own win*.
+Registers here come from a pool that is often not exhausted, so denying a
+low-benefit interval a register helps nobody.
+
+Run 2 (filter removed, ordering only): fib recovered as predicted
+(+4.5% → +1.5% min), confirming the diagnosis — but **nothing became a win**.
+Best-of-4 deltas, on vs off: arith +3.4%, sieve +2.4%, fib +1.6%, richards
++0.7%, deltablue +0.6%, dict 0.0%, alloc −1.7%. No bench convincingly better;
+several slightly worse.
+
+**Conclusion: interval length is an adequate proxy on this substrate**, and the
+cost model as formulated is not worth its complexity or its per-compile cost.
+Reverted in full (the tree returns to Stage-1 codegen, verified by disassembly).
+Worth retrying only *after* Stage 2/3 change the register pressure it reasons
+about — and if retried, note that the two obvious knobs (the 8× depth weight,
+and whether to weight reload cost at the call's own depth) were never swept;
+the rejection is of this formulation, not of every possible cost model.
+
+> Third negative result of the arc, after the two in `peephole_findings.md`.
+> The pattern is consistent and worth stating plainly: **on this backend,
+> plausible instruction- and heuristic-level improvements keep failing to beat
+> the incumbent, while one structural change (residency across calls) delivered
+> 17%.** Prefer structural levers; gate everything else.
+
 ## Next
 
-- **Stage 1b — spill-cost model** (above). Deterministic, static, and the thing
-  the length heuristic is standing in for.
 - **Stage 2 — parameter register promotion**: stop homing args to frame slots at
   entry; frame stores only on safepoint slow paths.
 - **Stage 3 — frame-init by liveness**: the 12-`stur` nil prologue shrinks to
