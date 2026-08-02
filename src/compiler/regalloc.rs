@@ -66,6 +66,40 @@ pub struct LiveInterval {
     pub resident_reg: Option<u8>,
 }
 
+/// Stage 1 of the regalloc arc (docs/regalloc_findings.md): allow a
+/// CALL-CROSSING spilled interval to keep a resident register, with emit
+/// re-loading it from its canonical slot after every call it spans.
+///
+/// Without this, any value live across a real send is memory-resident for its
+/// WHOLE life — `fib:`'s `n` is stored at entry and `ldur`-ed back at every
+/// use, including the four uses before the first call. The `!crosses_call`
+/// gate exists because (a) a compiled callee uses the same x21–x27 pool as
+/// its own residents, and (b) a GC inside the call moves the oops the
+/// register points at while only the oopmap'd SLOT is updated. A post-call
+/// reload from the slot answers both at once: one `ldur` per crossed call
+/// instead of one per use.
+///
+/// DEFAULT ON since the Stage-1 A/B (one binary, env flip, cooled+alternated,
+/// 3 rounds x 41 samples, twice): richards -17.8%, dict -11%, deltablue -6.8%,
+/// fib -4.1%, alloc -3.7%. arith/sieve read ~+5%/+2% in that harness, but
+/// `benchArith`'s nmethod is OPCODE-IDENTICAL with the flag off and on (it
+/// contains no sends, so no interval can cross a call) — that delta was an
+/// artifact of always running the `off` arm first in each round, i.e. in the
+/// coolest slot. Alternate arm ORDER, not just arm, in future A/Bs.
+///
+/// `MACVM_RESIDENT_CALLS=0` restores the old memory-resident-across-calls
+/// behaviour (bisection escape hatch). Read once; regalloc and emit must agree
+/// within a process.
+pub(crate) fn resident_across_calls() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            std::env::var("MACVM_RESIDENT_CALLS").as_deref(),
+            Ok("0") | Ok("off") | Ok("no")
+        )
+    })
+}
+
 fn is_safepoint(ir: &Ir) -> bool {
     matches!(
         ir,
@@ -783,7 +817,7 @@ pub fn assign_residents(intervals: &mut [LiveInterval]) {
     let mut order: Vec<usize> = (0..intervals.len())
         .filter(|&i| {
             matches!(intervals[i].assignment, Some(Assignment::Spill(_)))
-                && !intervals[i].crosses_call
+                && (!intervals[i].crosses_call || resident_across_calls())
                 && intervals[i].end > intervals[i].start
         })
         .collect();

@@ -758,10 +758,20 @@ impl<'a> Emitter<'a> {
     /// position (its own emission happens after the whole body, where
     /// `self.pos` is past everything).
     fn emit_resident_reloads_at(&mut self, pos: u32) {
+        self.emit_resident_reloads_at_excluding(pos, None);
+    }
+
+    /// As [`Self::emit_resident_reloads_at`], but skipping `skip`'s own
+    /// resident. Stage 1's post-call reload uses it for the call's DESTINATION:
+    /// its interval starts AT the call, so it would otherwise be reloaded with
+    /// the slot's pre-call (stale/nil) value one instruction before `commit`
+    /// overwrites the register with the actual result.
+    fn emit_resident_reloads_at_excluding(&mut self, pos: u32, skip: Option<VReg>) {
         let live: Vec<(u32, u8, crate::compiler::regalloc::SpillSlot, bool)> = self
             .resident_reloads
             .iter()
             .filter(|&&(_, s, e, _, _, _)| s <= pos && e > pos)
+            .filter(|&&(v, _, _, _, _, _)| skip.map_or(true, |sk| sk.0 != v))
             .map(|&(v, _, _, rr, slot, fp)| (v, rr, slot, fp))
             .collect();
         for (v, rr, slot, fp) in live {
@@ -2202,6 +2212,14 @@ impl<'a> Emitter<'a> {
             argc: info.argc,
         });
         self.emit_nlr_check();
+        // Stage 1: the callee clobbered the resident pool and may have GC'd —
+        // restore every resident live across this call from its (oopmap'd,
+        // GC-updated) canonical slot. Cannot touch x0: the resident pool is
+        // x21+, never a destination register.
+        if crate::compiler::regalloc::resident_across_calls() {
+            let pos = self.pos;
+            self.emit_resident_reloads_at_excluding(pos, Some(dst));
+        }
         let d = self.dest_target(dst);
         if d.num != 0 {
             self.asm.emit("mov", &[Operand::Reg(d), x(0)]);
@@ -2304,6 +2322,13 @@ impl<'a> Emitter<'a> {
         // back here exactly like at a send site.
         self.emit_nlr_check();
         let dst = dst.expect("MUST_BE_BOOLEAN always produces a result (a coerced boolean)");
+        // Stage 1: a CallRuntime is a `call_positions` entry too (regalloc's
+        // `crosses_call`), so residents live across it need the same post-call
+        // restore from their canonical slots as at a send.
+        if crate::compiler::regalloc::resident_across_calls() {
+            let pos = self.pos;
+            self.emit_resident_reloads_at_excluding(pos, Some(dst));
+        }
         let d = self.dest_target(dst);
         if d.num != 0 {
             self.asm.emit("mov", &[Operand::Reg(d), x(0)]);
