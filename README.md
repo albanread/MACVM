@@ -45,14 +45,10 @@ MACVM boots a real Smalltalk object world and runs programs on a **two-tier
 engine**: a simple dispatch-based bytecode interpreter plus a **tier-1
 optimizing JIT** that
 recompiles hot code with type feedback and deoptimizes safely. On the standard
-benchmarks the JIT owns essentially all of the runtime:
-
-| benchmark | interpreter | JIT (tier-1) | speedup |
-|-----------|-------------|--------------|---------|
-| deltablue | 214 ms | **4 ms** | **53×** |
-| richards  | ~205 ms | 6–7 ms | ~30× |
-| sieve     | 88 ms | 9 ms | ~10× |
-| ctxloop (closure/OSR) | 134 ms | 1 ms | 134× |
+benchmarks the JIT owns essentially all of the runtime — see the
+[Benchmarks](#benchmarks--cog-and-macdart-same-workloads-honest-protocol) below;
+the interpreter survives only as the differential oracle every JIT change is
+gated against.
 
 **Compiler coverage is achieved**: ~98.7% of methods that actually run compile
 (the remainder are native primitives, which lose nothing by staying native),
@@ -62,40 +58,40 @@ allocating. See [`docs/next_architecture.md`](docs/next_architecture.md) for
 the coverage arc and [`docs/PERF.md`](docs/PERF.md) for the benchmark-by-benchmark
 measurements.
 
-### Measured against Cog — a yardstick, not a competition
+### Benchmarks — Cog and MACDART, same workloads, honest protocol
 
-MACVM does not compete with Squeak, Pharo, or Cog in any way. Those are
-mature production systems with decades of engineering and real communities
-behind them; this is a from-scratch macOS VM exploring the Strongtalk
-lineage. But a JIT still needs an honest yardstick, and Cog — the
-OpenSmalltalk JIT that powers Squeak and Pharo — is the meaningful one:
-same language, same benchmarks, and it sets a high bar.
+MACVM does not compete with Squeak, Pharo, or Cog — those are mature production
+systems with decades of engineering behind them. But a JIT needs an honest
+yardstick, and Cog (the OpenSmalltalk JIT that powers Squeak and Pharo) is the
+meaningful one: same language, same benchmarks, a high bar. The suite now runs
+three-way — MACVM, Cog, and **MACDART** (the *same* Smalltalk running JIT-compiled
+on a ported Dart 1.24.3 VM) — checksum-verified identical workloads, one rigorous
+protocol on every VM ([`scripts/xvm-bench.sh`](scripts/xvm-bench.sh)): a monotonic
+**microsecond clock on all sides**, 30 warmup iterations to reach the JIT steady
+state, then 41 single-workload samples reporting **median + MAD** (so run-to-run
+noise is a printed number, not an RNG), interleaved same-thermal-state rounds,
+best-of-7, JIT hot everywhere. µs per iteration, warm — lower is better:
 
-So the suite runs head-to-head against Pharo 13's Cog on the same machine
-([`scripts/cog-bench.sh`](scripts/cog-bench.sh)): a **microsecond clock on
-both sides**, **checksum-verified identical workloads** (the Pharo side is
-machine-translated from the same `world/` sources), interleaved same-session
-rounds, best-of-rounds. Current scoreboard (Apple M-series, warm ms per ×10
-reps, 2026-07-22):
+| bench | MACVM | Cog (Pharo 13) | MACDART |
+|-----------|------:|------:|------:|
+| arith     |  1369 |  5223 |   719 |
+| fib       | 10741 | 18361 |  7187 |
+| sieve     | **174** |   361 |   410 |
+| dict      | **274** |  1021 |   599 |
+| alloc     |   588 |   705 |   458 |
+| richards  |  1446 |  2197 |   799 |
+| deltablue | **176** |   278 |  1271 |
 
-| benchmark | MACVM | Cog | |
-|-----------|------:|----:|---|
-| arith     |  34.0 | 51.1 | **1.50× faster** |
-| fib       | 135.4 | 181.0 | **1.34× faster** |
-| sieve     |   2.3 |  3.5 | **1.48× faster** |
-| dict      |   7.7 | 12.0 | **1.55× faster** |
-| alloc     |  12.5 | 14.2 | **1.13× faster** |
-| richards  |  18.8 | 21.9 | **1.17× faster** |
-| deltablue |   2.7 |  3.5 | **1.27× faster** |
+**MACVM is ahead of Cog on all seven.** Against MACDART it splits by workload
+shape: MACVM wins the allocation-bound benches (sieve, dict, deltablue — its
+generational scavenger's home turf), MACDART wins the compute/dispatch-bound ones
+(arith, fib, richards). Both beat Cog; Cog is never the fastest of the three.
 
-All seven ahead — a bar this VM only cleared after the harness itself was
-made honest: earlier comparisons were wrong in *both* directions
-(millisecond clocks truncating the sub-5 ms benches, and an unfaithful
-Cog-side translation), and the fixes that followed the honest numbers
-(special-selector inlining, nursery sizing, frameless leaf methods, the
-prologue nil-fill shrink) are what closed the real gaps they exposed. The
-full measured record, including those corrections and the commit stamp of
-every scoreboard, is [`docs/cog_bench.md`](docs/cog_bench.md).
+One methodology note, earned the hard way: MACVM's JIT must be engaged with
+`MACVM_JIT=threshold=…`. The default `macvm run` path is the *interpreter* — cold
+== warm, ~50–170× slower — which silently made an earlier scoreboard here
+meaningless. The harness sets the flag and says why, so the trap can't recur. The
+full measured record is [`docs/cog_bench.md`](docs/cog_bench.md).
 
 ### What's implemented
 
