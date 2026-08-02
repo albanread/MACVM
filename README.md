@@ -74,13 +74,13 @@ best-of-7, JIT hot everywhere. µs per iteration, warm — lower is better:
 
 | bench | MACVM | Cog (Pharo 13) | MACDART |
 |-----------|------:|------:|------:|
-| arith     | 1383 | 5221 | 698 |
-| fib       | 8955 | 18692 | 6872 |
-| sieve     | 176 | 363 | 195 |
-| dict      | 252 | 1017 | 451 |
-| alloc     | 591 | 713 | 398 |
-| richards  | 1084 | 2266 | 632 |
-| deltablue | 150 | 279 | 299 |
+| arith     | 1411 | 5224 | 715 |
+| fib       | 9034 | 18726 | 6935 |
+| sieve     | 180 | 362 | 196 |
+| dict      | 255 | 1024 | 457 |
+| alloc     | 587 | 701 | 384 |
+| richards  | 1087 | 2223 | 628 |
+| deltablue | 150 | 280 | 300 |
 
 **MACVM is ahead of Cog on all seven.** Against MACDART it splits by workload
 shape: MACVM wins the allocation-bound benches — sieve (1.1×), dict (1.8×) and
@@ -93,7 +93,7 @@ reason — each VM went after its own weakest layer. MACDART removed dispatch
 overhead from its Smalltalk front end (deltablue 1271 → 299 µs, from a 4.6× loss
 against Cog to a statistical tie), which narrowed MACVM's lead on the
 allocation-bound rows. MACVM then went after its register allocator and codegen
-(richards 1440 → 1084, fib 10790 → 8955), which narrowed MACDART's lead on the
+(richards 1440 → 1087, fib 10790 → 9034), which narrowed MACDART's lead on the
 compute rows from 2.3× to 1.7× on richards. Neither VM's *engine* changed to
 chase the other; both simply had a layer that was costing more than it should.
 See [`docs/regalloc_findings.md`](docs/regalloc_findings.md) for MACVM's side of
