@@ -28,3 +28,5 @@
 # and grows with live edits made through the GUI class browser.
 /world/*.sqlite3
 /dist/
+.cog/
+.dart/

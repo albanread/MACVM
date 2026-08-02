@@ -16,20 +16,34 @@ Object subclass: CogRun [
             Transcript showCr: name, ' WRONG RESULT ', got printString, ' want ', want printString.
             Smalltalk quit: 1 ]
     ]
+    "Rigorous low-noise protocol (IDENTICAL in scripts/cog-bench.st, so all three
+     VMs time the same way): a cold first run (includes JIT compile), then WARMUP
+     discarded iterations to reach the optimizer's steady state, then SAMPLES
+     single-workload µs timings (inner=1 — the microsecond clock is precise
+     enough that batching only costs wall time). Report median + min + MAD, so
+     run-to-run noise is a NUMBER (mad_us), not an invisible surprise."
     CogRun class >> run: name block: aBlock check: want [
-        | times cold t0 r |
-        t0 := Smalltalk microsecondClock.
-        10 timesRepeat: [ r := aBlock value ].
-        self check: name got: r want: want.
+        | times cold t0 r sorted n med mn mad devs warm samples |
+        warm := 30. samples := 41.
+        t0 := Smalltalk microsecondClock. r := aBlock value.
         cold := Smalltalk microsecondClock - t0.
+        self check: name got: r want: want.
+        warm timesRepeat: [ r := aBlock value ].
         times := OrderedCollection new.
-        6 timesRepeat: [
+        samples timesRepeat: [
             t0 := Smalltalk microsecondClock.
-            10 timesRepeat: [ r := aBlock value ].
+            r := aBlock value.
             times add: Smalltalk microsecondClock - t0 ].
         self check: name got: r want: want.
+        sorted := times asSortedCollection asArray.
+        n := sorted size.
+        med := sorted at: (n + 1) // 2.
+        mn := sorted first.
+        devs := (sorted collect: [:x | (x - med) abs]) asSortedCollection asArray.
+        mad := devs at: (devs size + 1) // 2.
         Transcript showCr: name, ' cold_us=', cold printString,
-            ' warm_us=', (self median: times) printString
+            ' warm_us=', med printString, ' min_us=', mn printString,
+            ' mad_us=', mad printString, ' n=', samples printString
     ]
     CogRun class >> runAll [
         self run: 'arith    ' block: [ BenchmarkDashboard benchArith ]     check: 1124997749998000000.

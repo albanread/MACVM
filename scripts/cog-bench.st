@@ -54,22 +54,31 @@ check: name got: got want: want
 		Stdio stdout nextPutAll: name; nextPutAll: ' WRONG RESULT '; print: got; lf; flush.
 		Smalltalk exitFailure ]!
 run: name block: aBlock check: want
-	"Microsecond clock, reported in ms: Windows quantizes the millisecond
-	 clock to the 15.6 ms timer tick, which rendered every sub-33 ms Cog
-	 number as 0, 15/16, or 31/33 (2026-07-22 pinned sessions)."
-	| times cold t0 r |
-	t0 := Time microsecondClockValue.
-	10 timesRepeat: [ r := aBlock value ].
-	self check: name got: r want: want.
+	"Rigorous low-noise protocol - IDENTICAL to scripts/cog-bench.mst so all three
+	 VMs time the same way: a cold first run, WARMUP discarded iterations to reach
+	 the JIT steady state, then SAMPLES single-workload us timings; report median +
+	 min + MAD so run-to-run noise is a number (mad_us), not a surprise."
+	| times cold t0 r sorted n med mn mad devs warm samples |
+	warm := 30. samples := 41.
+	t0 := Time microsecondClockValue. r := aBlock value.
 	cold := Time microsecondClockValue - t0.
+	self check: name got: r want: want.
+	warm timesRepeat: [ r := aBlock value ].
 	times := OrderedCollection new.
-	6 timesRepeat: [
+	samples timesRepeat: [
 		t0 := Time microsecondClockValue.
-		10 timesRepeat: [ r := aBlock value ].
+		r := aBlock value.
 		times add: Time microsecondClockValue - t0 ].
 	self check: name got: r want: want.
+	sorted := times asSortedCollection asArray.
+	n := sorted size.
+	med := sorted at: (n + 1) // 2.
+	mn := sorted first.
+	devs := (sorted collect: [:x | (x - med) abs]) asSortedCollection asArray.
+	mad := devs at: (devs size + 1) // 2.
 	Stdio stdout nextPutAll: name; nextPutAll: ' cold_us='; print: cold;
-		nextPutAll: ' warm_us='; print: (self median: times); lf; flush!
+		nextPutAll: ' warm_us='; print: med; nextPutAll: ' min_us='; print: mn;
+		nextPutAll: ' mad_us='; print: mad; nextPutAll: ' n='; print: samples; lf; flush!
 runAll
 	self run: 'arith    ' block: [ self benchArith ] check: 1124997749998000000.
 	self run: 'fib      ' block: [ self benchFib ] check: 2178309.
