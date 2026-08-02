@@ -157,6 +157,64 @@ the rejection is of this formulation, not of every possible cost model.
 > the incumbent, while one structural change (residency across calls) delivered
 > 17%.** Prefer structural levers; gate everything else.
 
+## Feature x inline-depth matrix (indicator sweep)
+
+`scripts/matrix-bench.py` + `scripts/matrix-bench.mst`: MACVM against itself,
+no Cog/MACDART interleave. Brief protocol per configuration (25 warmup + 9
+samples, ~0.5 s), 5 reps, best median, over the five responsive benches;
+load-gated + 15 s sleep between configurations. A SCREEN, not a verdict —
+anything it flags is re-measured with the full 41-sample protocol.
+`MACVM_INLINE_LEVEL=1..4` (added for this) pins `budget_for_level`'s row.
+
+% vs default, negative = faster:
+
+| config | fib | richards | deltablue | sieve | dict | mean |
+|---|--:|--:|--:|--:|--:|--:|
+| no-resident-calls | +3.4 | +18.0 | +6.0 | +6.5 | +3.5 | **+7.5** |
+| no-prologue-stp | +14.2 | +1.1 | +7.1 | −1.2 | +6.6 | **+5.6** |
+| peep-imm | −0.5 | +0.6 | −0.6 | −0.6 | +3.1 | +0.4 |
+| inline-2 | +15.6 | +14.1 | +0.6 | −1.2 | +3.9 | +6.6 |
+| inline-3 | +17.4 | +13.7 | +9.5 | −2.9 | +0.8 | +7.7 |
+| inline-4 | +17.8 | **+198.0** | +10.7 | +8.8 | **+118.9** | **+70.9** |
+| inline-2+peep | +20.3 | +15.6 | +1.2 | −2.4 | +0.4 | +7.0 |
+| inline-3+peep | +17.4 | +14.9 | +11.9 | +1.2 | −1.5 | +8.8 |
+| inline-4+peep | +17.5 | +200.7 | +10.7 | +2.9 | +118.1 | +70.0 |
+| inline-4+no-stp | +54.3 | +205.5 | +19.0 | −0.6 | +121.2 | +79.9 |
+
+**1. Both landed stages are independently confirmed.** Turning Stage 1 off
+costs 7.5% mean (richards +18%); Stage 2 off costs 5.6% mean (fib +14%).
+
+**2. Deeper inlining is HARMFUL here, monotonically, and level 4 is
+catastrophic** (richards 3x slower, dict 2.2x). Diagnosed: not deopt storms and
+not GC — at level 4 richards has the *same* `deopt_count=2`, zero scavenges,
+zero IC misses, and only 34% more code (71584 vs 53264 bytes). The 3x is
+**register pressure**: a bigger inlined method holds far more simultaneously
+live values, and spill-all-for-whole-life turns each into memory traffic for
+its entire lifetime. Inlining is a win in every other JIT; it is a loss *here*
+because the allocator cannot absorb the pressure it creates.
+
+> This is **latent, not live**: `level: 1` at every construction site
+> (`driver.rs:1441`, `nmethod.rs:381,1010`) — levels 2–4 are unreachable today.
+> Recompiles do happen (`recompiles=1` on richards) but always at level 1. The
+> higher rows exist for a ladder not yet built.
+>
+> **Sequencing consequence, which is the real value of this sweep:** building
+> the recompilation ladder *before* fixing the allocator would ship a
+> regression. Conversely, a proper allocator (interval splitting / deopt
+> environments) unlocks the inliner as a second, compounding win — the payoff
+> for Stage 4 is larger than its own benchmark delta suggests.
+
+**3. The peephole does NOT pay under register pressure — hypothesis falsified.**
+`inline-N+peep` tracks `inline-N` within noise at every level. `MACVM_PEEP_IMM`
+stays gated off; the "retry it once the substrate changes" note in
+`peephole_findings.md` has now been tested against the highest-pressure
+substrate available and did not survive.
+
+**4. Stage 2's win compounds with inline depth.** At level 4, removing `stp`
+pairing costs fib +54% (versus +14% at default) — bigger frames mean more
+nil-fill slots to pair. Prologue cost scales with inlining, so Stage 3
+(nil-fill by liveness) also matters more as methods grow.
+
 ## Next
 
 - **Stage 2 — parameter register promotion**: stop homing args to frame slots at

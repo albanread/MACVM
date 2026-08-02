@@ -30,10 +30,26 @@ pub struct InlineBudget {
     pub max_depth: u32,
 }
 
+/// `MACVM_INLINE_LEVEL=1..4` pins every compile's inline budget row. Read once.
+pub fn inline_level_override() -> Option<u8> {
+    static LVL: std::sync::OnceLock<Option<u8>> = std::sync::OnceLock::new();
+    *LVL.get_or_init(|| {
+        std::env::var("MACVM_INLINE_LEVEL")
+            .ok()
+            .and_then(|v| v.trim().parse::<u8>().ok())
+            .filter(|&n| (1..=4).contains(&n))
+    })
+}
+
 /// The budget for recompilation level `level` (1..=4, SPEC §8.1). Higher levels
 /// (reached only after the effectiveness/version gates, S14 step 8) inline more
 /// aggressively. Clamps `level >= 4` to the top row.
 pub fn budget_for_level(level: u8) -> InlineBudget {
+    // Matrix testing (docs/regalloc_findings.md): `MACVM_INLINE_LEVEL=N` pins
+    // the budget row so inlining aggressiveness can be swept as a factor
+    // alongside the codegen feature gates, without waiting for the
+    // recompilation ladder to climb on its own. Unset = normal behaviour.
+    let level = inline_level_override().unwrap_or(level);
     match level {
         0 | 1 => InlineBudget {
             per_call_cost: 30,

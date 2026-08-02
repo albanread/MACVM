@@ -1,0 +1,43 @@
+"Brief bench driver for the FEATURE MATRIX sweep (scripts/matrix-bench.sh).
+ Deliberately shorter than cog-bench.mst's rigorous protocol: 10 warmup + 9
+ samples, median + min only. This is an INDICATOR harness — it answers 'does
+ this combination move anything, and which way', cheaply enough to sweep a
+ dozen configurations. Anything it flags gets re-measured with the full
+ 41-sample cog-bench protocol before it is believed. Checksums are still
+ verified on every run: a fast wrong answer is worse than no answer.
+ MACVM-only (no Cog/MACDART interleave — this compares MACVM against itself)."
+Object subclass: MatrixRun [
+    MatrixRun class >> run: name block: aBlock check: want [
+        | times t0 r sorted n med mn |
+        r := aBlock value.
+        r = want ifFalse: [
+            Transcript showCr: name, ' WRONG ', r printString.
+            Smalltalk quit: 1 ].
+        25 timesRepeat: [ r := aBlock value ].
+        times := OrderedCollection new.
+        9 timesRepeat: [
+            t0 := Smalltalk microsecondClock.
+            r := aBlock value.
+            times add: Smalltalk microsecondClock - t0 ].
+        r = want ifFalse: [
+            Transcript showCr: name, ' WRONG ', r printString.
+            Smalltalk quit: 1 ].
+        sorted := times asSortedCollection asArray.
+        n := sorted size.
+        med := sorted at: (n + 1) // 2.
+        mn := sorted first.
+        Transcript showCr: name, ' warm_us=', med printString, ' min_us=', mn printString
+    ]
+    "The responsive subset: fib/richards/deltablue/sieve/dict all moved under
+     the Stage 1-2 changes. arith is excluded (its prologue runs once per
+     benchmark, so per-activation work is invisible to it — proven by an
+     opcode-identical disassembly); alloc is excluded as the noisiest row."
+    MatrixRun class >> runAll [
+        self run: 'fib      ' block: [ BenchmarkDashboard benchFib ]       check: 2178309.
+        self run: 'richards ' block: [ BenchmarkDashboard benchRichards ]  check: 2324609297.
+        self run: 'deltablue' block: [ BenchmarkDashboard benchDeltaBlue ] check: 224874.
+        self run: 'sieve    ' block: [ BenchmarkDashboard benchSieve ]     check: 1899.
+        self run: 'dict     ' block: [ BenchmarkDashboard benchDict ]      check: 170698668000.
+    ]
+]
+MatrixRun runAll.
