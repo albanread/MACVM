@@ -2806,6 +2806,7 @@ fn frameless_eligible(m: &ir::IrMethod, ra: &regalloc::RegallocResult) -> bool {
         // pure ALU/memory ops (the PutNC barrier is the inline card
         // sequence, same license as StoreField).
         | I::SmiArithNoOv { .. }
+        | I::SmiArithNoOvImm { .. }
         | I::ArrayAtNC { .. }
         | I::ArrayAtPutNC { .. }
         | I::Jump { .. }

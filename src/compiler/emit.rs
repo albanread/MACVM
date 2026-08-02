@@ -452,6 +452,10 @@ fn proven_smi_positions(
                 cur.insert(b.0);
                 cur.insert(dst.0);
             }
+            Ir::SmiArithNoOvImm { dst, a, .. } => {
+                cur.insert(a.0);
+                cur.insert(dst.0);
+            }
             Ir::SmiCmpBr { a, b, .. } => {
                 cur.insert(a.0);
                 cur.insert(b.0);
@@ -3162,6 +3166,19 @@ fn emit_ir(e: &mut Emitter, ir: &Ir, next_in_order: Option<BlockId>) {
                 e.asm
                     .emit(mnem, &[Operand::Reg(d), Operand::Reg(ra), Operand::Reg(rb)]);
             }
+            e.commit(dst, d);
+        }
+        Ir::SmiArithNoOvImm { op, dst, a, imm: addend } => {
+            // The peephole's add/sub-immediate: proven-in-range (same license
+            // as SmiArithNoOv), tagged addend = value << 2, guaranteed to fit
+            // imm12 by fold_noov_imm's 0..=1023 guard.
+            let ra = e.resolve(a, 16);
+            let d = e.dest_target_direct(dst);
+            let mnem = if matches!(op, SmiOp::Add) { "add" } else { "sub" };
+            e.asm.emit(
+                mnem,
+                &[Operand::Reg(d), Operand::Reg(ra), imm(addend << 2)],
+            );
             e.commit(dst, d);
         }
         Ir::ArrayAt {

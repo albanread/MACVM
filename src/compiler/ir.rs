@@ -224,6 +224,19 @@ pub enum Ir {
         a: VReg,
         b: VReg,
     },
+    /// Peephole (`fold_noov_imm`): a `SmiArithNoOv{Add|Sub}` whose `b` was a
+    /// block-local `ConstSmi` small enough that the TAGGED addend
+    /// (`value << 2`) fits an a64 imm12 — one `add`/`sub`-immediate, no
+    /// constant materialization. `imm` is the UNTAGGED value (emit shifts,
+    /// exactly like `ConstSmi`). Produced ONLY by `fold_noov_imm`, which runs
+    /// after `range_reduce` — so range analysis never sees this variant.
+    /// Same purity license as `SmiArithNoOv`: no trap, no safepoint.
+    SmiArithNoOvImm {
+        op: SmiOp,
+        dst: VReg,
+        a: VReg,
+        imm: i64,
+    },
     /// S15 step 7 (the sieve fix): Array element READ intrinsified — the
     /// same treatment smi arithmetic got in S14. Inline guards (receiver
     /// mem-tagged AND klass == Array, index smi, 1-based bounds vs the
@@ -513,6 +526,7 @@ impl Ir {
                 f(*a);
                 f(*b);
             }
+            Ir::SmiArithNoOvImm { a, .. } => f(*a),
             Ir::BoolNot { src, .. } => f(*src),
             Ir::FArith { a, b, .. } | Ir::FCmpBr { a, b, .. } | Ir::FCmpVal { a, b, .. } => {
                 f(*a);
@@ -585,6 +599,7 @@ impl Ir {
             | Ir::LoadField { dst, .. }
             | Ir::SmiArith { dst, .. }
             | Ir::SmiArithNoOv { dst, .. }
+            | Ir::SmiArithNoOvImm { dst, .. }
             | Ir::ArrayAt { dst, .. }
             | Ir::ArrayAtPut { dst, .. }
             | Ir::ArrayAtNC { dst, .. }
@@ -7648,6 +7663,7 @@ fn map_uses(op: &mut Ir, mut f: impl FnMut(VReg) -> VReg) {
             *a = f(*a);
             *b = f(*b);
         }
+        Ir::SmiArithNoOvImm { a, .. } => *a = f(*a),
         Ir::BoolNot { src, .. } => *src = f(*src),
         Ir::FArith { a, b, .. } | Ir::FCmpBr { a, b, .. } | Ir::FCmpVal { a, b, .. } => {
             *a = f(*a);
@@ -7691,6 +7707,46 @@ fn map_uses(op: &mut Ir, mut f: impl FnMut(VReg) -> VReg) {
         | Ir::Poll
         | Ir::UncommonTrap { .. }
         | Ir::Bailout { .. } => {}
+    }
+}
+
+/// Peephole pass 2: fold a block-local `ConstSmi` operand of a proven
+/// `SmiArithNoOv{Add|Sub}` into an ADD/SUB-IMMEDIATE (`SmiArithNoOvImm`).
+/// benchArith's loop re-materialized `movz #4` for `i := i + 1` EVERY
+/// iteration; post-fold the increment is one `add dst, a, #4`. The tagged
+/// addend (`value << 2`) must fit a64 imm12, so `0 <= value <= 1023`. The
+/// feeding `ConstSmi` is left in place (deopt metadata may reference its
+/// vreg; if truly dead it costs one movz off the critical path). Runs AFTER
+/// `range_reduce` (the only producer of `SmiArithNoOv`); tracking is
+/// per-block with non-SSA redefinition kills.
+pub(crate) fn fold_noov_imm(m: &mut IrMethod) {
+    if std::env::var_os("MACVM_PEEP_TRACE").is_some() {
+        let n: usize = m.blocks.iter().map(|b| b.code.iter().filter(|o| matches!(o, Ir::SmiArithNoOv{..})).count()).sum();
+        eprintln!("[peep] fold_noov_imm: {} blocks, {} NoOv", m.blocks.len(), n);
+    }
+    use std::collections::HashMap;
+    for b in m.blocks.iter_mut() {
+        // vreg -> its current block-local ConstSmi value.
+        let mut known: HashMap<u32, i64> = HashMap::new();
+        for op in b.code.iter_mut() {
+            if let Ir::SmiArithNoOv { op: sop, dst, a, b: rhs } = *op {
+                if matches!(sop, SmiOp::Add | SmiOp::Sub) {
+                    if let Some(&v) = known.get(&rhs.0) {
+                        if (0..=1023).contains(&v) {
+                            *op = Ir::SmiArithNoOvImm { op: sop, dst, a, imm: v };
+                        }
+                    }
+                }
+            }
+            let mut defined: Option<VReg> = None;
+            op.defs(|v| defined = Some(v));
+            if let Some(d) = defined {
+                known.remove(&d.0);
+                if let Ir::ConstSmi { dst, value } = op {
+                    known.insert(dst.0, *value);
+                }
+            }
+        }
     }
 }
 
@@ -10758,6 +10814,17 @@ pub fn convert(
     let array_meta = crate::oops::wrappers::MemOop::try_from(vm.universe.array_klass.oop())
         .map(|mo| mo.klass());
     range_reduce(&mut irm, array_meta);
+    // MACVM_PEEP_IMM=1: fold ConstSmi operands of proven SmiArithNoOv adds
+    // into add/sub-immediates. DEFAULT OFF, on the A/B evidence (see
+    // docs/peephole_findings.md): under the current spill-all-at-safepoints
+    // register allocation, the fold's interval shrink perturbs linear-scan
+    // around send-bearing loops and cost benchAlloc a consistent ~9% — the
+    // instruction it removes is cheaper than the spill reshuffle it causes.
+    // Re-gate when the regalloc rework (live-across-only spilling /
+    // deopt environments) lands; the pass itself is correct and tested.
+    if std::env::var_os("MACVM_PEEP_IMM").is_some() {
+        fold_noov_imm(&mut irm);
+    }
     // Deopt-liveness rework (behind MACVM_DEOPTLIVE): compute per-root-trap
     // bytecode-live slots AFTER all IR transforms (range_reduce may delete
     // traps); `compute_intervals` reads this to record live slots only.
