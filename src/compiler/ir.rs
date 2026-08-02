@@ -315,6 +315,25 @@ pub enum Ir {
         /// `~~`: select the other way around.
         neq: bool,
     },
+    /// FUSED identity compare-and-branch — `RefCmpVal` + `BoolBr` collapsed.
+    /// `(x == nil) ifTrue:` is the single most common conditional shape in
+    /// this corpus, and unfused it cost ~11 instructions: cmp, load `true`,
+    /// load `false`, csel the boolean OOP, spill it, then reload `true`,
+    /// compare the boolean back against it, and branch. Fused it is `cmp`,
+    /// `b.<eq|ne>`, `b` — the flags the first compare already set.
+    ///
+    /// No `not_bool` edge: a pointer compare's result is ALWAYS `true` or
+    /// `false`, so `BoolBr`'s non-boolean trap is unreachable here. No `fail`
+    /// edge either — identity is sound for every operand pair (see
+    /// `RefCmpVal`). Produced only by `fuse_ref_cmp_br`.
+    RefCmpBr {
+        a: VReg,
+        b: VReg,
+        /// `~~`: branch the other way.
+        neq: bool,
+        if_true: BlockId,
+        if_false: BlockId,
+    },
     /// Speculated boolean negation — `not` on evidence-boolean sites.
     /// GUARDED: `src` must be the `true` or `false` object, anything else
     /// branches to `fail` (a reexecute trap re-sending #not generically —
@@ -527,6 +546,10 @@ impl Ir {
                 f(*b);
             }
             Ir::SmiArithNoOvImm { a, .. } => f(*a),
+            Ir::RefCmpBr { a, b, .. } => {
+                f(*a);
+                f(*b);
+            }
             Ir::BoolNot { src, .. } => f(*src),
             Ir::FArith { a, b, .. } | Ir::FCmpBr { a, b, .. } | Ir::FCmpVal { a, b, .. } => {
                 f(*a);
@@ -629,6 +652,7 @@ impl Ir {
             | Ir::Ret { .. }
             | Ir::RetSelf
             | Ir::NlrReturn { .. }
+            | Ir::RefCmpBr { .. }
             | Ir::Bailout { .. } => {}
         }
     }
@@ -1209,7 +1233,8 @@ fn alloc_guard_census(irm: &IrMethod) -> (u64, u64, u64) {
                 Ir::Move { dst, src } if def_count[&dst.0] == 1 => {
                     move_src.insert(dst.0, src.0);
                 }
-                _ => {}
+                Ir::RefCmpBr { .. } => {}
+            _ => {}
             }
         }
     }
@@ -7664,6 +7689,10 @@ fn map_uses(op: &mut Ir, mut f: impl FnMut(VReg) -> VReg) {
             *b = f(*b);
         }
         Ir::SmiArithNoOvImm { a, .. } => *a = f(*a),
+        Ir::RefCmpBr { a, b, .. } => {
+            *a = f(*a);
+            *b = f(*b);
+        }
         Ir::BoolNot { src, .. } => *src = f(*src),
         Ir::FArith { a, b, .. } | Ir::FCmpBr { a, b, .. } | Ir::FCmpVal { a, b, .. } => {
             *a = f(*a);
@@ -7697,7 +7726,8 @@ fn map_uses(op: &mut Ir, mut f: impl FnMut(VReg) -> VReg) {
         }
         // RetSelf's implicit VReg(0) use is never a copy-prop target (VReg(0)
         // is the multi-use self param, never a single-def Move dst).
-        Ir::RetSelf
+        Ir::RefCmpBr { .. }
+        | Ir::RetSelf
         | Ir::ConstSmi { .. }
         | Ir::ConstPool { .. }
         | Ir::FConst { .. }
@@ -7747,6 +7777,96 @@ pub(crate) fn fold_noov_imm(m: &mut IrMethod) {
                 }
             }
         }
+    }
+}
+
+/// Fuse `RefCmpVal` + `BoolBr` into `RefCmpBr` (docs/regalloc_findings.md).
+///
+/// Measured motivation: in a richards run, 23 of 47 `BoolBr`s (49%) are
+/// immediately preceded by a `RefCmpVal` producing exactly the branched value
+/// — `(x == nil) ifTrue:` and friends. Unfused, each costs ~11 instructions to
+/// build a boolean OOP and then compare it straight back against `true`.
+///
+/// Safety, verified by census before writing this: in every one of those 23
+/// cases the boolean's uses are exactly (a) the `BoolBr` itself and (b) ONE
+/// deopt reference, which lives in the `not_bool` block — a single-op
+/// `UncommonTrap`. Fusing makes that block unreachable (a pointer compare
+/// cannot produce a non-boolean), so the reference dies with the edge. The
+/// block itself is left in place: `reverse_postorder` still gives it a
+/// position and emits it as dead code, which is harmless, and leaving it
+/// avoids touching trap metadata that nothing will ever read.
+///
+/// Conservative on both counts — fuse only when the pair is ADJACENT and the
+/// boolean has exactly one op-use (the branch) and no deopt reference outside
+/// the `not_bool` block.
+pub(crate) fn fuse_ref_cmp_br(m: &mut IrMethod) {
+    // Global op-use counts; deopt references are checked per-candidate below.
+    let mut op_uses: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+    for b in &m.blocks {
+        for op in &b.code {
+            op.uses(|v| *op_uses.entry(v.0).or_insert(0) += 1);
+        }
+        for v in &b.entry_stack {
+            *op_uses.entry(v.0).or_insert(0) += 1;
+        }
+    }
+    // (vreg, block that may legitimately reference it in deopt metadata)
+    let deopt_refs_outside = |d: u32, allowed: u32, m: &IrMethod| -> bool {
+        for bb in &m.blocks {
+            if bb.id.0 == allowed {
+                continue;
+            }
+            for (_, raw) in &bb.deopt_sites {
+                if raw.stack.iter().any(|v| v.0 == d) {
+                    return true;
+                }
+                let mut lvl = raw.inline.as_ref();
+                while let Some(si) = lvl {
+                    if si.receiver.0 == d
+                        || si.slots.iter().any(|v| v.0 == d)
+                        || si.caller_pending_stack.iter().any(|v| v.0 == d)
+                    {
+                        return true;
+                    }
+                    lvl = si.parent.as_deref();
+                }
+            }
+        }
+        false
+    };
+
+    let mut plan: Vec<(usize, usize, Ir)> = Vec::new();
+    for (bi, b) in m.blocks.iter().enumerate() {
+        for i in 0..b.code.len().saturating_sub(1) {
+            let (Ir::RefCmpVal { dst, a, b: rb, neq }, Ir::BoolBr { val, if_true, if_false, not_bool }) =
+                (&b.code[i], &b.code[i + 1])
+            else {
+                continue;
+            };
+            if dst != val || op_uses.get(&dst.0).copied().unwrap_or(0) != 1 {
+                continue;
+            }
+            if deopt_refs_outside(dst.0, not_bool.0, m) {
+                continue;
+            }
+            plan.push((
+                bi,
+                i,
+                Ir::RefCmpBr {
+                    a: *a,
+                    b: *rb,
+                    neq: *neq,
+                    if_true: *if_true,
+                    if_false: *if_false,
+                },
+            ));
+        }
+    }
+    // Apply back-to-front so indices stay valid.
+    for (bi, i, fused) in plan.into_iter().rev() {
+        let code = &mut m.blocks[bi].code;
+        code[i] = fused;
+        code.remove(i + 1);
     }
 }
 
@@ -10814,6 +10934,9 @@ pub fn convert(
     let array_meta = crate::oops::wrappers::MemOop::try_from(vm.universe.array_klass.oop())
         .map(|mo| mo.klass());
     range_reduce(&mut irm, array_meta);
+    if crate::compiler::regalloc::fuse_cmp_br() {
+        fuse_ref_cmp_br(&mut irm);
+    }
     // MACVM_PEEP_IMM=1: fold ConstSmi operands of proven SmiArithNoOv adds
     // into add/sub-immediates. DEFAULT OFF, on the A/B evidence (see
     // docs/peephole_findings.md): under the current spill-all-at-safepoints

@@ -3265,6 +3265,28 @@ fn emit_ir(e: &mut Emitter, ir: &Ir, next_in_order: Option<BlockId>) {
             fail,
         } => e.emit_smi_cmp_val(op, dst, a, b, fail),
         Ir::RefCmpVal { dst, a, b, neq } => e.emit_ref_cmp_val(dst, a, b, neq),
+        Ir::RefCmpBr {
+            a,
+            b,
+            neq,
+            if_true,
+            if_false,
+        } => {
+            // The whole point: the flags this `cmp` sets ARE the branch
+            // condition — no boolean OOP, no true/false literal loads, no
+            // compare-the-boolean-back. x16/x17 are the standard operand
+            // scratches (cmp writes neither).
+            let ra = e.resolve(a, 16);
+            let rb = e.resolve(b, 17);
+            e.asm.emit("cmp", &[Operand::Reg(ra), Operand::Reg(rb)]);
+            let true_label = e.block_label(if_true);
+            e.asm
+                .b_cond(if neq { Cond::Ne } else { Cond::Eq }, true_label);
+            if next_in_order != Some(if_false) {
+                let false_label = e.block_label(if_false);
+                e.asm.b(false_label);
+            }
+        }
         Ir::BoolNot { dst, src, fail } => e.emit_bool_not(dst, src, fail),
         Ir::Jump { target } => {
             if next_in_order != Some(target) {

@@ -125,6 +125,18 @@ pub(crate) fn nilfill_ext() -> bool {
     })
 }
 
+/// Stage 4a: fuse RefCmpVal+BoolBr into RefCmpBr. `MACVM_FUSE_CMPBR=0`
+/// restores the unfused lowering (A/B + bisection hatch).
+pub(crate) fn fuse_cmp_br() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            std::env::var("MACVM_FUSE_CMPBR").as_deref(),
+            Ok("0") | Ok("off") | Ok("no")
+        )
+    })
+}
+
 fn is_safepoint(ir: &Ir) -> bool {
     matches!(
         ir,
@@ -184,6 +196,9 @@ pub(crate) fn successors(block: &IrBlock) -> Vec<BlockId> {
                 succs.push(*fail);
             }
             Ir::FCmpBr {
+                if_true, if_false, ..
+            }
+            | Ir::RefCmpBr {
                 if_true, if_false, ..
             } => {
                 succs.push(*if_true);
