@@ -1114,8 +1114,11 @@ mod tests {
         // Not valid A64 at all.
         assert_eq!(disasm_word(0x0000_0000), ".word 0x00000000");
         assert_eq!(disasm_word(0xFFFF_FFFF), ".word 0xffffffff");
-        // Valid A64, but outside the emitted vocabulary.
-        assert_eq!(disasm_word(asm_word("sdiv x0, x1, x2")), ".word 0x9ac20c20");
+        // sdiv JOINED the vocabulary with the floored-division lowering
+        // (R3) — assert it decodes, so this test tracks vocabulary growth
+        // instead of silently going stale again.
+        assert_eq!(disasm_word(asm_word("sdiv x0, x1, x2")), "sdiv x0, x1, x2");
+        // Valid A64, but still outside the emitted vocabulary.
         assert_eq!(disasm_word(asm_word("dmb ish")), ".word 0xd5033bbf");
     }
 
