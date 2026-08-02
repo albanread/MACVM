@@ -397,6 +397,12 @@ mod tests {
     /// that yields a `Sym` fixup — that path is for `corpus_replay`'s text
     /// front end only. `emit` guards this in debug builds.
     #[test]
+    // The panic under test is a `debug_assert!`, which is COMPILED OUT in
+    // release — so this must not run there. Left ungated it did not merely
+    // fail: `cargo test --release` stops after the failing lib target, so it
+    // silently prevented all 19 integration-test binaries from running in
+    // release at all.
+    #[cfg(debug_assertions)]
     #[should_panic(expected = "P6")]
     fn emit_rejects_sym_fixups() {
         let mut a = JasmAssembler::new();

@@ -87,6 +87,12 @@ mod tests {
     /// P3: a second guard opened while the first is still alive panics
     /// (debug builds — `cargo test`'s default profile).
     #[test]
+    // The panic under test is a `debug_assert!`, which is COMPILED OUT in
+    // release — so this must not run there. Left ungated it did not merely
+    // fail: `cargo test --release` stops after the failing lib target, so it
+    // silently prevented all 19 integration-test binaries from running in
+    // release at all.
+    #[cfg(debug_assertions)]
     #[should_panic(expected = "nested guard")]
     fn guard_depth_asserted() {
         let _outer = JitWriteGuard::new();
