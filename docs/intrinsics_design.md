@@ -234,6 +234,35 @@ and recorded, per Z-D5.
 
 ## 7. Measurement log
 
+### The arc's closing scoreboard (7-round official run, 2026-08-05 evening)
+
+All six Z commits in; same protocol as the morning baseline (µs/iter,
+warm, best-of-7 median, interleaved; worst noise 6%):
+
+| bench | MACDART | Cog | MACVM | MACVM (morning) |
+|---|---:|---:|---:|---:|
+| arith | 692 | 5044 | 1340 | 1335 |
+| fib | 6768 | 18197 | 8970 | 8841 |
+| sieve | 183 | 317 | 171 | 172 |
+| dict | 577 | 1206 | 248 | 246 |
+| alloc | 378 | 709 | 557 | 557 |
+| richards | 579 | 2181 | 1033 | 1045 |
+| deltablue | 269 | 265 | 133 | 137 |
+
+**The classic seven are exactly stable — and that is the predicted result,
+stated in §1 up front:** these workloads spend ~100% of their time in JIT
+code (richards/fib/arith) or in the scavenger (alloc), so no primitive
+work moves them; six substantial JIT commits landing with zero movement in
+either direction is the gate discipline doing its job. The arc's wins
+live where the call-outs lived: the library composite (96–100 → 50–54 ms,
+~1.9x), Random ~5x, Fraction ~3x, String/Symbol/bignum throughout — none
+of which the classic seven exercise. The remaining MACDART gap (arith
+1.9x, fib 1.3x, richards 1.8x, alloc 1.5x vs MACVM wins on sieve, dict
+2.3x, deltablue 2.0x) now belongs entirely to the inliner-reach/codegen
+campaign (`docs/budgeted_inliner_design.md` I2 onward, regalloc
+follow-ons, FMA fusion) and GC throughput — the honest hand-off this doc
+promised.
+
 ### Z5 — the leaf door (landed 2026-08-05)
 
 `leaf_prim_fn` (primitives.rs): a prim qualifies when it cannot allocate,
