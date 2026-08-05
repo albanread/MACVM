@@ -146,3 +146,18 @@ the slot-traffic regalloc arc. P3-as-planned (reproduce-and-flip) is
 moot; the P arc closes here and hands off to a budget/regalloc campaign
 with its premise honestly falsified — which is exactly what P-D1's
 "never mind" branch is for.
+
+### Coda — the budget hypothesis, tested the same evening (zero code)
+
+`MACVM_INLINE_LEVEL=4` (per_call 120 / total 2400 / depth 8) vs default,
+3 interleaved rounds on the classic bench: richards 1080–1104 →
+**3318–3369 µs (3× worse)**, fib 8880–8945 → 10370–10454 (+17%), suite
+total +38% — perfectly reproduced. So brute-force budget raising is
+falsified too, and NOT via the old fusion-decay mode (the Z twins fixed
+that): the giant spliced bodies lose on **slot traffic and register
+pressure** — the same 21–30%-of-instructions cost `richards_profile.md`
+measured in the hot bodies, made worse. The ordering conclusion for the
+next campaign: **the regalloc/slot-traffic arc comes FIRST; selective
+depth (the `processWork:`-into-`runTask` self-send chain specifically)
+only pays after big bodies are cheap.** Both cheap richards hypotheses
+died with data in one evening — that is the P arc's real deliverable.
