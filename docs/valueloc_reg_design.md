@@ -86,6 +86,40 @@ increasing order of work:
 Build (a) first. Everything else keeps today's behaviour, so the GC invariant
 and the return-path contract hold by construction rather than by argument.
 
+## It is a TYPE-BASED policy, and the direction is already proven here
+
+This is not a new mechanism. `assign_residents` (regalloc.rs:823) already runs
+a **write-through residency tier**, selected by type: `is_fp` intervals get
+`d8`–`d15`, integers get `x21`–`x23` via `LiveInterval::resident_reg`, both
+gated on `!crosses_call` and all callee-saved. But — its own comment —
+*"The slot stays canonical (write-through)"*.
+
+Write-through saves the **reloads** and not the **stores**. That is exactly the
+asymmetry in `sieveOnce`: 109 frame stores against 49 frame loads. And the
+store is the loop-carried one (`stur x8, [x29,#-112]`, every iteration), which
+is the kind the critical-path law says actually costs.
+
+So the change is narrow: **make the register canonical instead of
+write-through, for the types the GC never scans.** The tiers, by what the
+collector needs of each:
+
+| type | GC needs | today | possible |
+|---|---|---|---|
+| constant / `ConstSmi` | nothing | already elided (F3) | — |
+| double (`is_fp`) | nothing — never a root | resident `d8`–`d15`, write-through | **canonical register** |
+| smi / proven non-oop | nothing — not a root | resident `x21`–`x23`, write-through | **canonical register** |
+| heap oop | must FIND it, and a moving GC must UPDATE it | slot-canonical | slot-canonical (register-naming oop maps would also need write-BACK — out of scope) |
+
+The oop row is why this stays type-selective rather than universal: finding a
+root in a register needs only a richer oop map, but *relocating* it needs the
+collector to write the register back through the trap frame. That is a
+different and much larger change, and nothing here proposes it.
+
+The two narrower versions of this same idea — F3's `ConstSmi` slot elision and
+the float arc's `d8`–`d15` residency — both landed and both paid. This extends
+the identical reasoning to the integer non-oop case, which is the one sieve's
+induction variable falls into.
+
 ## Sketch
 
 1. `ValueLoc::Reg(u8)` in scopes.rs, encoded/decoded alongside `FrameSlot`.
