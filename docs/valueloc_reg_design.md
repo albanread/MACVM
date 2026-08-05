@@ -120,7 +120,47 @@ the float arc's `d8`–`d15` residency — both landed and both paid. This exten
 the identical reasoning to the integer non-oop case, which is the one sieve's
 induction variable falls into.
 
-## Sketch
+## SUPERSEDED BY A SIMPLER DESIGN: spill in the trap block, not the loop
+
+Attempted 2026-08-05 and abandoned mid-implementation — for a good reason.
+`ValueLoc::Reg` was added cleanly (variant + uleb tag 6 + read/write), and the
+compiler then pointed at the single consumer, `deopt::read_value`. That is
+where it stops: **`rt_uncommon_trap(vm, trap_pc, fp)` does not receive the
+register file.** The `brk` raises SIGTRAP, the handler redirects the pc to a
+trampoline, and the trampoline calls Rust with three arguments. Getting
+`x19`–`x28` to the materializer needs new plumbing through hand-written
+trampoline asm, plus a `FrameView.regs` field that is `None` on the return
+path — real work in the most correctness-sensitive code in the VM.
+
+Working that through surfaced a design that does not need any of it:
+
+> **Keep the register canonical on the hot path, and have the UNCOMMON-TRAP
+> BLOCK store it to its frame slot immediately before trapping.**
+
+The trap block is cold — it runs once, on the way out. After that store the
+slot is authoritative exactly as today, so:
+
+- `ValueLoc` is unchanged. No new variant, no format change, no version skew.
+- `read_value` is unchanged; the materializer keeps reading `FrameSlot`.
+- No signal-handler or trampoline plumbing, no `FrameView.regs`.
+- The GC is untouched, because this still only ever applies to **non-oop**
+  intervals, which no oop map describes either way.
+- The return-path deopt hazard is still closed by requiring `!crosses_call` —
+  no call inside the interval means no return address inside it.
+
+And the hot loop still loses the thing that actually costs: the loop-carried
+`stur x8, [x29,#-112]` every iteration. The cost moves to cold code that runs
+at most once per deopt.
+
+Where the work lands instead: `emit.rs`, at trap-block generation — it must
+know which vregs are register-canonical at that site and emit their stores.
+That is a smaller and far less dangerous surface than the metadata format plus
+the signal path.
+
+**Do the trap-block-spill version. This file's `ValueLoc::Reg` sketch is kept
+only as the record of why it is the wrong shape.**
+
+## Sketch (superseded — see above)
 
 1. `ValueLoc::Reg(u8)` in scopes.rs, encoded/decoded alongside `FrameSlot`.
 2. `FrameView` gains `regs: Option<[u64; 32]>` — `Some` on the trap path
