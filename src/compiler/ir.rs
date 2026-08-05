@@ -6400,40 +6400,62 @@ impl<'a> Translator<'a> {
                     // generic CallSend tail below (nothing was emitted).
                 }
 
-                // P1 (docs/poly_inline_design.md, gated): PER-ARM poly —
-                // both arms leaf-spliced in a hottest-first guard chain.
-                // Structure = DominantWithSlowPath with one extra middle
-                // block: current block guards arm0 (fail -> arm1's block),
-                // arm1's block guards its klass (fail -> the shared slow
-                // block), and all three routes Move into the one shared
-                // `dst` and rejoin at the continuation. Slow block minted
-                // first, then arm1, then arm0 in-block — and the whole
-                // shape is dry-run-validated before anything is emitted.
+                // P2 (docs/poly_inline_design.md, gated): PER-ARM poly —
+                // 2..=4 arms, each arm a send-free leaf (in-place splice) or
+                // a CFG-eligible body (graft, the SameTargetPoly cfg leg's
+                // recipe per arm). Hottest-first guard chain: the current
+                // block guards arm 0 (fail -> arm 1's block), each side
+                // block guards its own klass (fail -> next, last -> the
+                // shared rejoining slow send), and every route Moves into
+                // the ONE shared `dst` before entering the continuation.
+                // No traps anywhere (the PolyCmpFuse storm lesson). Blocks
+                // are minted up front; the whole shape is dry-run-validated
+                // before anything is emitted; side blocks are built LAST-
+                // ARM-FIRST so each guard's fail target already exists.
                 if let crate::compiler::inline::InlineDecision::PerArmPoly { arms } =
                     &feedback_inline
                 {
+                    #[derive(Clone, Copy, PartialEq)]
+                    enum ArmLeg {
+                        Leaf,
+                        Cfg,
+                    }
                     let arms = arms.clone();
-                    let all_ok = arms.iter().all(|(_, m)| {
-                        let cfg = crate::compiler::decode::decode(*m);
-                        matches!(
-                            cfg.blocks[0].terminator,
-                            crate::compiler::decode::Terminator::Return
-                        ) && m.argc() == real_argc as usize
-                            && leaf_body_is_spliceable(*m)
-                    });
-                    if all_ok {
+                    let legs: Vec<Option<ArmLeg>> = arms
+                        .iter()
+                        .map(|(_, m)| {
+                            let cfg = crate::compiler::decode::decode(*m);
+                            if m.argc() != real_argc as usize || cfg.blocks.is_empty() {
+                                return None;
+                            }
+                            let leafy = matches!(
+                                cfg.blocks[0].terminator,
+                                crate::compiler::decode::Terminator::Return
+                            ) && leaf_body_is_spliceable(*m);
+                            if leafy {
+                                Some(ArmLeg::Leaf)
+                            } else if crate::compiler::inline::is_inline_eligible_cfg(*m) {
+                                Some(ArmLeg::Cfg)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    if legs.iter().all(|l| l.is_some()) {
+                        let legs: Vec<ArmLeg> = legs.into_iter().map(|l| l.unwrap()).collect();
+                        let n = arms.len();
                         let selector = ic_view.selector();
-                        // `MACVM_TRACE=perarm`: one line per fired site, so an
-                        // A/B run can prove the decision actually ran (P-D1:
-                        // a flat result must be distinguishable from a dead
-                        // gate).
                         if self.vm.options.trace.is_enabled("perarm") {
                             eprintln!(
-                                "[perarm] {} arms=2",
+                                "[perarm] {} arms={} legs={}",
                                 crate::memory::print::print_oop(
                                     &self.vm.universe,
                                     selector.oop()
-                                )
+                                ),
+                                n,
+                                legs.iter()
+                                    .map(|l| if *l == ArmLeg::Leaf { "L" } else { "C" })
+                                    .collect::<String>(),
                             );
                         }
                         let pre_pop_stack = stack.clone();
@@ -6444,14 +6466,14 @@ impl<'a> Translator<'a> {
                         let receiver =
                             stack.pop().expect("perarm send: missing receiver operand");
 
-                        let continuation_id = self.fresh_block_id();
+                        let my_cont = self.fresh_block_id();
                         let slow_id = self.fresh_block_id();
-                        let arm1_id = self.fresh_block_id();
+                        let arm_ids: Vec<BlockId> =
+                            (1..n).map(|_| self.fresh_block_id()).collect();
                         let dst = self.fresh(true);
                         let dst_slow = self.fresh(true);
 
-                        // Shared rejoining slow block — the dominant path's
-                        // exact shape (real send, reexecute=false).
+                        // Shared rejoining slow block (the standard recipe).
                         let mut send_args = vec![receiver];
                         send_args.extend_from_slice(&inline_args);
                         let site = self.call_sites.len() as u16;
@@ -6472,9 +6494,7 @@ impl<'a> Translator<'a> {
                                     args: send_args,
                                 },
                                 Ir::Move { dst, src: dst_slow },
-                                Ir::Jump {
-                                    target: continuation_id,
-                                },
+                                Ir::Jump { target: my_cont },
                             ],
                             entry_stack: Vec::new(),
                             deopt_sites: vec![(
@@ -6490,71 +6510,141 @@ impl<'a> Translator<'a> {
                             )],
                         });
 
-                        // Middle block: arm 1's guard (fail -> slow) + splice.
-                        let (k1, m1) = arms[1];
-                        let expect1 =
-                            self.pool.intern(k1.oop().raw(), Some(RelocKind::Oop));
-                        let mut arm1_code: Vec<Ir> = vec![Ir::GuardKlass {
-                            obj: receiver,
-                            expect: expect1,
-                            fail: slow_id,
-                            kind: GuardShape::KlassTest,
-                        }];
-                        let r1 = self
-                            .try_inline_leaf(
-                                m1,
-                                None,
-                                k1,
-                                selector,
-                                receiver,
-                                &inline_args,
+                        // Side blocks, last arm first so fail targets exist.
+                        for i in (1..n).rev() {
+                            let (k, m) = arms[i];
+                            let leg = legs[i];
+                            let next = if i + 1 < n { arm_ids[i] } else { slow_id };
+                            let expect =
+                                self.pool.intern(k.oop().raw(), Some(RelocKind::Oop));
+                            let mut acode: Vec<Ir> = vec![Ir::GuardKlass {
+                                obj: receiver,
+                                expect,
+                                fail: next,
+                                kind: GuardShape::KlassTest,
+                            }];
+                            let mut adeopt: Vec<(u32, DeoptRaw)> = Vec::new();
+                            match leg {
+                                ArmLeg::Leaf => {
+                                    let r = self
+                                        .try_inline_leaf(
+                                            m,
+                                            None,
+                                            k,
+                                            selector,
+                                            receiver,
+                                            &inline_args,
+                                            bci,
+                                            &pre_pop_stack,
+                                            &mut acode,
+                                        )
+                                        .expect("perarm leaf arm was pre-validated");
+                                    acode.push(Ir::Move { dst, src: r });
+                                    acode.push(Ir::Jump { target: my_cont });
+                                }
+                                ArmLeg::Cfg => {
+                                    let (r, entry_id, cfg_cont) = self
+                                        .try_inline_cfg(
+                                            m,
+                                            None,
+                                            k,
+                                            selector,
+                                            receiver,
+                                            &inline_args,
+                                            bci,
+                                            &pre_pop_stack,
+                                            &mut acode,
+                                            &mut adeopt,
+                                            None,
+                                            GraftMode::Method { parent: None },
+                                        )
+                                        .expect("perarm cfg arm was pre-validated");
+                                    self.finish_block(IrBlock {
+                                        id: cfg_cont,
+                                        bci,
+                                        code: vec![
+                                            Ir::Move { dst, src: r },
+                                            Ir::Jump { target: my_cont },
+                                        ],
+                                        entry_stack: Vec::new(),
+                                        deopt_sites: Vec::new(),
+                                    });
+                                    acode.push(Ir::Jump { target: entry_id });
+                                }
+                            }
+                            self.finish_block(IrBlock {
+                                id: arm_ids[i - 1],
                                 bci,
-                                &pre_pop_stack,
-                                &mut arm1_code,
-                            )
-                            .expect("perarm arm1 was pre-validated spliceable");
-                        arm1_code.push(Ir::Move { dst, src: r1 });
-                        arm1_code.push(Ir::Jump {
-                            target: continuation_id,
-                        });
-                        self.finish_block(IrBlock {
-                            id: arm1_id,
-                            bci,
-                            code: arm1_code,
-                            entry_stack: Vec::new(),
-                            deopt_sites: Vec::new(),
-                        });
+                                code: acode,
+                                entry_stack: Vec::new(),
+                                deopt_sites: adeopt,
+                            });
+                        }
 
-                        // Arm 0 (hottest), in the current block: guard fails
-                        // into arm 1's block.
+                        // Arm 0 (hottest), in the current block.
                         let (k0, m0) = arms[0];
+                        let fail0 = if n > 1 { arm_ids[0] } else { slow_id };
                         let expect0 =
                             self.pool.intern(k0.oop().raw(), Some(RelocKind::Oop));
                         code.push(Ir::GuardKlass {
                             obj: receiver,
                             expect: expect0,
-                            fail: arm1_id,
+                            fail: fail0,
                             kind: GuardShape::KlassTest,
                         });
-                        let r0 = self
-                            .try_inline_leaf(
-                                m0,
-                                None,
-                                k0,
-                                selector,
-                                receiver,
-                                &inline_args,
-                                bci,
-                                &pre_pop_stack,
-                                code,
-                            )
-                            .expect("perarm arm0 was pre-validated spliceable");
-                        code.push(Ir::Move { dst, src: r0 });
+                        match legs[0] {
+                            ArmLeg::Leaf => {
+                                let r0 = self
+                                    .try_inline_leaf(
+                                        m0,
+                                        None,
+                                        k0,
+                                        selector,
+                                        receiver,
+                                        &inline_args,
+                                        bci,
+                                        &pre_pop_stack,
+                                        code,
+                                    )
+                                    .expect("perarm arm0 was pre-validated");
+                                code.push(Ir::Move { dst, src: r0 });
+                            }
+                            ArmLeg::Cfg => {
+                                let (r0, entry_id, cfg_cont) = self
+                                    .try_inline_cfg(
+                                        m0,
+                                        None,
+                                        k0,
+                                        selector,
+                                        receiver,
+                                        &inline_args,
+                                        bci,
+                                        &pre_pop_stack,
+                                        code,
+                                        deopt,
+                                        None,
+                                        GraftMode::Method { parent: None },
+                                    )
+                                    .expect("perarm arm0 cfg was pre-validated");
+                                self.finish_block(IrBlock {
+                                    id: cfg_cont,
+                                    bci,
+                                    code: vec![
+                                        Ir::Move { dst, src: r0 },
+                                        Ir::Jump { target: my_cont },
+                                    ],
+                                    entry_stack: Vec::new(),
+                                    deopt_sites: Vec::new(),
+                                });
+                                debug_assert!(self.pending_jump_target.is_none());
+                                self.pending_jump_target = Some(entry_id);
+                            }
+                        }
                         stack.push(dst);
-                        return Some(continuation_id);
+                        return Some(my_cont);
                     }
-                    // Unspliceable arm shape: fall through to the generic
-                    // CallSend tail (nothing was emitted).
+                    // Some arm has an unspliceable shape: fall through to the
+                    // generic CallSend tail (nothing was emitted).
                 }
 
                 // dart124 items 2+3 slice 2 (ported from WINVM b45d2d6):

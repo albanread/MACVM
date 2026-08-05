@@ -506,30 +506,6 @@ pub fn decide_with_budget(
                 };
             }
 
-            // P1 (gated, P-D1): every arm its own guarded leaf splice.
-            // Checked after same-target (one body beats N copies of it) and
-            // before poly-cmp/dominance (a full per-arm chain serves every
-            // arm fast; dominance would slow-send the minority). Two arms in
-            // this slice; send-free leaves only, so no in-arm safepoints, no
-            // inline protos, no fusion-decay surface. Every arm must carry
-            // real evidence (a 0-count tail arm reads as drift, not signal).
-            if poly_inline_enabled()
-                && cases.len() == 2
-                && no_smi_case
-                && total >= DOMINANT_MIN_SAMPLES
-                && cases.iter().all(|c| {
-                    c.count.unwrap_or(0) > 0
-                        && c.method.primitive() == 0
-                        && inline_cost(c.method) <= budget.per_call_cost
-                        && is_leaf(c.method)
-                })
-                && cases[0].method.oop().raw() != cases[1].method.oop().raw()
-            {
-                return InlineDecision::PerArmPoly {
-                    arms: cases.iter().map(|c| (c.klass, c.method)).collect(),
-                };
-            }
-
             // Poly-identity compare (checked before dominance): different
             // targets, but EVERY arm fuses to one raw-bits compare — the smi
             // `=` primitive or an identity-`=` body. Dominance is the wrong
@@ -566,6 +542,33 @@ pub fn decide_with_budget(
                             }
                         })
                         .collect(),
+                };
+            }
+
+            // P2 (gated, P-D1): every arm its own guarded splice — 2 to 4
+            // arms, each a send-free leaf OR a CFG-eligible body (richards'
+            // processWork:/runTask shape). Checked after same-target (one
+            // body beats N copies) and after poly-cmp (a raw-bits compare
+            // leg beats a body splice), before dominance (a full chain
+            // serves the minority arms fast too). Every arm needs real
+            // evidence — a 0-count tail arm reads as drift, not signal.
+            // NO count floor, for PolyCmpFuse's exact documented reason:
+            // the real lifecycle freezes poly counts at ~{0, 1} (compiled
+            // sends never bump interpreter counts), so a floor permanently
+            // locks every real site into Call. The mis-speculation cost is
+            // the same as poly-cmp's: guards then the rejoining send, never
+            // a trap — plus code growth, which is what the A/B judges.
+            if poly_inline_enabled()
+                && (2..=4).contains(&cases.len())
+                && no_smi_case
+                && cases.iter().all(|c| {
+                    c.method.primitive() == 0
+                        && inline_cost(c.method) <= budget.per_call_cost
+                        && (is_leaf(c.method) || is_inline_eligible_cfg(c.method))
+                })
+            {
+                return InlineDecision::PerArmPoly {
+                    arms: cases.iter().map(|c| (c.klass, c.method)).collect(),
                 };
             }
 

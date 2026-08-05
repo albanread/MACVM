@@ -110,7 +110,39 @@ library composite, and **zero on richards** — whose poly targets
 (`processWork:`/`runTask` ×4) are 4-arm *branchy* bodies, not leaves.
 A/B: classic-bench warm total 12293 vs 12237 µs (0.5%, inside noise).
 Verdict per P-D1: **default stays off**; the machinery is correct and
-waiting. P2 (3–4 arms + CFG-eligible arm bodies, per-arm inline protos)
-is the slice with real coverage of the richards shape — and the first
-one where the Mandelbrot fusion-decay canary genuinely matters, since
-CFG arms contain sends.
+waiting. P2 widens coverage next.
+
+### P2 landed 2026-08-05 — gate stays OFF, and the premise is falsified
+
+P2 generalizes the lowering to 2–4 arms, each arm a send-free leaf OR a
+CFG-eligible body (each CFG arm = the SameTargetPoly cfg-leg recipe:
+graft, stub continuation Moving into the shared dst, side blocks ending
+in an explicit Jump to their graft entry; built last-arm-first so every
+guard's fail target exists). The count floors were removed for
+PolyCmpFuse's exact documented reason — real poly sites freeze at counts
+~{0,1}, so any floor locks them into Call forever.
+
+Gates: gate-off still byte-identical to pre-P1 (a true no-op); gate-on
+differential byte-identical (6200/0), both GC-stress modes green,
+`MACVM_DEOPT_STRESS=1` green.
+
+**The census finding that closes the arc's question:** richards'
+heavyweights were never poly-dispatch problems. `runTask` is defined
+ONCE on TaskControlBlock — `SameTargetPoly` already serves the schedule
+loop — and `processWork:` is a SELF-send inside `runTask`, which
+per-klass customization already devirtualizes statically, guard-free
+(the profile's "runTask ×4 / processWork: ×4" nmethods are customized
+copies, not dispatch arms). What per-arm inlining actually finds on
+richards is the helper bucket: `#priority` (3 sites, 3-arm leaf) and
+`#taskWaiting:`. A/B, 3 interleaved rounds: classic-bench totals
+12424/12483/12567 (off) vs 12455/12516/12519 (on); richards 1043–1122
+vs 1059–1083 — flat, bands overlap.
+
+**Verdict per P-D1: default stays off. The residual richards lever is
+NOT dispatch shape — it is the inline BUDGET for statically-known
+self-send targets** (`processWork:` bodies are ~300–460 compiled insns,
+far over `per_call_cost`, so the devirtualized call stays a call) plus
+the slot-traffic regalloc arc. P3-as-planned (reproduce-and-flip) is
+moot; the P arc closes here and hands off to a budget/regalloc campaign
+with its premise honestly falsified — which is exactly what P-D1's
+"never mind" branch is for.
