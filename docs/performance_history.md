@@ -248,6 +248,12 @@ Interleaved, load-gated, best-of-rounds; warm = median of 6 ×10-rep
 batches, microsecond clock. Dart = one fresh process per bench with the
 2017-arm64 workaround flags (a floor).
 
+> **⚠️ These milliseconds are per 10-rep BATCH.** Every absolute figure in
+> this file above this line is. `f3bafb8` later changed the timed region
+> to a SINGLE rep, so the next scoreboard's numbers are ~10× smaller for
+> the same speed. **Compare ratios across that boundary, never absolute
+> ms** — fib 110.0 here and 8.9 there is a unit change, not a 12× win.
+
 | bench | MACVM ms | Cog ms | vs Cog | Dart V1 ms | vs Dart |
 |---|---|---|---|---|---|
 | arith | 14.2 | 55.2 | **MACVM 3.90×** | 8.1 | Dart 1.81× |
@@ -267,6 +273,77 @@ batches, microsecond clock. Dart = one fresh process per bench with the
 Selected single-bench journeys, first honest measurement → today:
 richards 208→16.5 ms, deltablue 214→1.8 ms, Mandelbrot 746→25 ms,
 arith 35.6→14.2 ms, dict 8.3→2.9 ms, fib 153→110 ms, sieve 9→1.9 ms.
+
+## The 2026-08-05 re-measure (commit `435bb8b`)
+
+Ten days on, with the Z-arc intrinsics, the per-arm poly-inlining probes
+and the eden-proportional survivors landed, the suite was re-run — and
+the harness itself turned out to need a fix first (below).
+
+**Protocol (current):** cold, then the median of 41 SINGLE-rep samples
+after 30 untimed warm-up reps; microsecond clock; interleaved A/B rounds,
+best-of-3, load-gated. Dart still runs one fresh process per bench with
+the 2017-arm64 workaround flags, so its column remains a floor.
+
+| bench | MACVM ms | Cog ms | vs Cog | Dart V1 ms | vs Dart |
+|---|---|---|---|---|---|
+| arith | 1.394 | 5.123 | **MACVM 3.68×** | 0.789 | Dart 1.77× |
+| fib | 8.907 | 18.507 | **MACVM 2.08×** | 6.195 | Dart 1.45× |
+| sieve | 0.174 | 0.357 | **MACVM 2.05×** | 0.070 | Dart 2.66× |
+| dict | 0.254 | 1.011 | **MACVM 3.98×** | 0.225 | Dart 1.27× |
+| alloc | 0.577 | 0.713 | **MACVM 1.24×** | 0.351 | Dart 1.66× |
+| richards | 1.067 | 2.209 | **MACVM 2.07×** | 0.488 | Dart 2.18× |
+| **deltablue** | **0.136** | 0.277 | **MACVM 2.04×** | 0.233 | **MACVM 1.70×** |
+
+*(ms per rep. The MACVM column is the Cog leg's; the Dart leg measured
+MACVM independently and agreed to <1% on five rows — arith 1.400,
+richards 1.063, deltablue 0.137 — see the dict caveat below. Each ratio
+is a same-round pair, which is the only meaningful comparison.)*
+
+- **vs Cog: still all seven, 1.24–3.98×.** Against the July 26 stamp the
+  margins are broadly up: richards 1.33→2.07×, fib 1.74→2.08×, deltablue
+  1.96→2.04×; dict and arith eased slightly (4.29→3.98, 3.90→3.68) and
+  alloc is the thin row at 1.24×.
+- **vs Dart V1: behind on six (1.27–2.66×), deltablue an outright
+  1.70× win.** Five of seven rows improved: richards 3.36→2.18×, alloc
+  2.22→1.66×, fib 1.77→1.45×, dict 1.28→1.27×, deltablue 1.37→1.70×.
+  arith is flat (1.81→1.77×) and sieve regressed (2.48→2.66×). Dart's own
+  numbers were unchanged from July, so those deltas are real.
+
+**Reproducibility.** Run twice at different machine loads (2.66 and
+1.36): every vs-Cog ratio moved ≤2.5%, five of seven vs-Dart ratios ≤5%,
+and the external controls repeated almost exactly (Cog arith 5.035→5.123,
+Dart fib 6.203→6.195).
+
+**Caveat — `dict` is the noisy row.** 1.09→1.27× vs Dart between runs, and
+its two independent MACVM measurements in one run differ 12% (0.254 vs
+0.285). At ~0.25 ms it has the least headroom over timer and scheduler
+noise; treat a dict move under ~15% as noise. Both runs were taken on a
+machine in light interactive use, not an idle one.
+
+### The harness bug this run exposed
+
+`f3bafb8` moved the two Smalltalk sides (`cog-bench.mst`, `cog-bench.st`)
+from a 10-rep timed batch to a single timed rep, but left
+`scripts/dart-bench.dart` on the old batch. Because the reduce scripts
+treat every VM's `warm_us=` identically, MACVM was reported per REP and
+Dart per TEN: **every Dart ratio was inflated 10× for ten days**, and the
+first re-run printed a triumphant, entirely false "MACVM 5.6–18× faster
+than Dart".
+
+The tell was **treating Cog and Dart as external controls**: Cog's arith
+had apparently improved 55.2→5.0 ms, impossible for a VM this project
+never touches, while Dart's fib held at 62.4→62.3 — the fixed reference
+that localised the fault to the Smalltalk sides. Dividing the broken
+Dart column by 10 predicted arith 1.84×; the corrected run measured
+1.84×, accounting for the whole discrepancy.
+
+`435bb8b` restores parity (`kWarm=30`/`kSamples=41`, one rep timed),
+prints ms to 3 decimals — at one decimal the sub-ms rows rendered as
+0.1/0.2, a single significant figure — and rewrites both footers, since
+the stale "median of 6 ×10-rep batches" line is precisely what made the
+mismatch invisible. **Lesson, now standing: sanity-check any large
+movement against the unchanged rival's column before believing it.**
 
 ## Part V — How the numbers were won (method, not luck)
 
@@ -303,12 +380,16 @@ arith 35.6→14.2 ms, dict 8.3→2.9 ms, fib 153→110 ms, sieve 9→1.9 ms.
 
 ## What remains (ranked, from the standing docs)
 
-- **richards 3.36× vs Dart** — the widest row: activation cost smeared
-  over polymorphic sends. Fresh profile now that F1–F3 changed its
-  shape; I4 (recursion depth 1) and invocation-count ranking joined
-  with loop-depth in the inliner budget.
-- **sieve 2.48× / alloc 2.22×** — array inner loops and allocation
-  path; LoadField loops are inliner+residency territory.
+- **sieve 2.66× vs Dart** — now the widest row (it regressed slightly
+  while the others closed): array inner loops. LoadField loops are
+  inliner+residency territory.
+- **richards 2.18× vs Dart** — was the widest at 3.36×; the Z-arc and
+  F1–F3 waves took a third off it. Activation cost smeared over
+  polymorphic sends. I4 (recursion depth 1) and invocation-count ranking
+  joined with loop-depth in the inliner budget.
+- **alloc 1.66× vs Dart, 1.24× vs Cog** — the allocation path; the
+  eden-proportional survivors bought most of the July gap back, and it is
+  now the thinnest margin over Cog.
 - **Branch/function alignment padding** — F2's fib anomaly proved
   layout luck is worth ±1%; make it deterministic.
 - **Recording-level trap liveness** — the last S2c stack-temp pins are
