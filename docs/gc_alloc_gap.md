@@ -216,3 +216,44 @@ V1 on this row (1.66x) is therefore most plausibly in **promotion policy — whe
 survivors stop being copied** — not in nursery geometry or in codegen. That is
 also the one direction on the whole board with ~30% of a benchmark behind it
 rather than ~3%.
+
+### CORRECTION: GC is zero on five of seven — it cannot explain the Dart gap
+
+The section above ended by calling promotion policy "the strongest remaining
+lead". That over-generalised from one benchmark. Measured GC share across all
+seven (200 timed iterations each, `MACVM_TRACE=gc`):
+
+| bench | total ms | gc ms | gc share | gap vs Dart V1 |
+|---|---|---|---|---|
+| arith | 305 | 0 | **0%** | 1.77x |
+| fib | 1852 | 0 | **0%** | 1.45x |
+| sieve | 9 | 0 | **0%** | 2.59x |
+| **richards** | 224 | 0 | **0%** | **2.31x** |
+| dict | 61 | 3 | 4% | 1.27x |
+| deltablue | 33 | 4 | 12% | *MACVM wins 1.70x* |
+| **alloc** | 173 | 63 | **36%** | 1.66x |
+
+**GC is zero on five of seven, including richards — the second-worst row.** It
+is material only on `alloc`, and mildly on `deltablue`, which is a row MACVM
+already wins. Even eliminating GC entirely would take alloc from 1.66x to
+~1.13x (617us at 36% GC -> ~395us against Dart's 351us) and change NOTHING on
+arith, fib, sieve or richards.
+
+So the gap to Dart V1 is overwhelmingly in **generated-code execution**, not in
+memory management. The GC work above stands as a correct account of `alloc`
+specifically and nothing more.
+
+Worth recording alongside it: Dart's own background-compilation advantage is
+NOT present in these numbers — `scripts/dart-bench.sh` runs every benchmark
+with `--no_background_compilation` because that install path SIGILLs on modern
+arm64. Dart's column is a floor, and its compiler threads are not what is
+beating us here either.
+
+The honest summary of the whole 2026-08-05 arc: every mechanism tested was
+either below the measured noise floor (five gated features, 64-byte loop
+alignment, 2x unrolling, W^X toggling) or real but confined to one benchmark
+(bounds elision 15.5% on sieve; GC 36% on alloc). Nothing found is a general
+1.5x. That is consistent with the remaining gap being **distributed across many
+small things Dart's pipeline does that MACVM's does not** — unboxed
+type-specialised fields, LICM, allocation sinking, and register residency
+across safepoints — rather than concentrated in one undiscovered lever.
