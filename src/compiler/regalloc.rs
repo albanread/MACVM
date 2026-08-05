@@ -208,6 +208,8 @@ pub(crate) fn successors(block: &IrBlock) -> Vec<BlockId> {
             | Ir::SmiCmpVal { fail, .. }
             | Ir::ArrayAt { fail, .. }
             | Ir::ArrayAtPut { fail, .. }
+            | Ir::ByteAt { fail, .. }
+            | Ir::ByteAtPut { fail, .. }
             | Ir::FUnbox { fail, .. }
             // BoolNot's trap edge MUST be a successor: reverse_postorder
             // (block layout, positions, liveness) walks these, and a trap

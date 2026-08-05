@@ -1126,6 +1126,114 @@ impl<'a> Emitter<'a> {
         self.commit(dst, rval);
     }
 
+    /// Z2: `emit_array_guards`' byte-format twin — the size slot lives at
+    /// a klass-derived offset instead of Array's fixed BODY_OFFSET, and the
+    /// klass literal is the site's guard klass (String/Symbol/ByteArray),
+    /// not the Array klass. Same register discipline: x19/x20 scratch,
+    /// receiver in `robj`, index in `ridx`, both left untouched.
+    fn emit_byte_guards(
+        &mut self,
+        robj: Reg,
+        ridx: Reg,
+        klass: PoolLit,
+        len_off: i32,
+        fail: BlockId,
+    ) {
+        let fail_l = self.block_label(fail);
+        self.asm.emit("and", &[x(19), Operand::Reg(robj), imm(3)]);
+        self.asm.emit("cmp", &[x(19), imm(1)]);
+        self.asm.b_cond(Cond::Ne, fail_l);
+        // klass word at [obj + KLASS_OFFSET(8) - MEM_TAG(1)]
+        self.asm.emit("ldur", &[x(19), mem(robj.num, 7)]);
+        self.asm
+            .ldr_literal(xr(20), self.literal_ids[klass.0 as usize]);
+        self.asm.emit("cmp", &[x(19), x(20)]);
+        self.asm.b_cond(Cond::Ne, fail_l);
+        self.asm.emit("tst", &[Operand::Reg(ridx), imm(3)]);
+        self.asm.b_cond(Cond::Ne, fail_l);
+        // tagged byte-count slot at [obj + len_off - MEM_TAG(1)]
+        self.asm
+            .emit("ldur", &[x(19), mem(robj.num, (len_off - 1) as i64)]);
+        self.asm.emit("sub", &[x(20), Operand::Reg(ridx), imm(4)]);
+        self.asm.emit("cmp", &[x(20), x(19)]);
+        self.asm.b_cond(Cond::Hs, fail_l);
+    }
+
+    /// `obj byteAt: idx` — guards, then one byte load + smi-tag. Byte v
+    /// (1-based, tagged idx = 4v) lives at
+    /// `obj - MEM_TAG + tail_off + (v-1)`: x19 = obj + idx>>2, `ldurb` at
+    /// [x19 + tail_off - 2], result tagged by `lsl #2`.
+    fn emit_byte_at(
+        &mut self,
+        dst: VReg,
+        obj: VReg,
+        idx: VReg,
+        klass: PoolLit,
+        len_off: i32,
+        tail_off: i32,
+        fail: BlockId,
+    ) {
+        let robj = self.resolve(obj, 16);
+        let ridx = self.resolve(idx, 17);
+        self.emit_byte_guards(robj, ridx, klass, len_off, fail);
+        self.asm.emit("asr", &[x(19), Operand::Reg(ridx), imm(2)]);
+        self.asm
+            .emit("add", &[x(19), x(19), Operand::Reg(robj)]);
+        let d = self.dest_target(dst);
+        self.asm
+            .emit("ldurb", &[Operand::Reg(d), mem(19, (tail_off - 2) as i64)]);
+        self.asm.emit("lsl", &[Operand::Reg(d), Operand::Reg(d), imm(2)]);
+        self.commit(dst, d);
+    }
+
+    /// `obj byteAt: idx put: val` — guards + a tagged-smi 0..=255 value
+    /// guard, one `sturb`, no card barrier (bytes are not oops). Answers
+    /// `val`. Same spill-scratch discipline as `emit_array_at_put`: `val`
+    /// resolves last, via x20 as the address scratch, never x19 (which
+    /// holds the element address).
+    fn emit_byte_at_put(
+        &mut self,
+        dst: VReg,
+        obj: VReg,
+        idx: VReg,
+        val: VReg,
+        klass: PoolLit,
+        len_off: i32,
+        tail_off: i32,
+        fail: BlockId,
+    ) {
+        let robj = self.resolve(obj, 16);
+        let ridx = self.resolve(idx, 17);
+        self.emit_byte_guards(robj, ridx, klass, len_off, fail);
+        let fail_l = self.block_label(fail);
+        // Element address FIRST — after these two, robj (possibly x16) is
+        // dead, so a spilled `val` may safely load into x16 (the
+        // emit_array_at_put ordering, same reason).
+        self.asm.emit("asr", &[x(19), Operand::Reg(ridx), imm(2)]);
+        self.asm
+            .emit("add", &[x(19), x(19), Operand::Reg(robj)]);
+        let rval = match self.resident[val.0 as usize] {
+            Some(rr) => xr(rr),
+            None => match self.assignment_of(val) {
+                Assignment::Reg(r) => xr(r),
+                Assignment::Spill(slot) => {
+                    emit_spill_access_via(self.asm, "ldr", x(16), slot, 20);
+                    xr(16)
+                }
+            },
+        };
+        // value must be a tagged smi in 0..=255 (tagged: 0..=1020, tag 00);
+        // guards branch out before the store, so no side effect leaks.
+        self.asm.emit("tst", &[Operand::Reg(rval), imm(3)]);
+        self.asm.b_cond(Cond::Ne, fail_l);
+        self.asm.emit("cmp", &[Operand::Reg(rval), imm(1020)]);
+        self.asm.b_cond(Cond::Hi, fail_l);
+        self.asm.emit("asr", &[x(20), Operand::Reg(rval), imm(2)]);
+        self.asm
+            .emit("sturb", &[x(20), mem(19, (tail_off - 2) as i64)]);
+        self.commit(dst, rval);
+    }
+
     /// See this module's own doc for why this differs from D5.3's literal
     /// sequence: `mul` and `smulh` both need `shifted_a` and `b`, so
     /// neither's result may land where the other still needs to read from.
@@ -3249,6 +3357,25 @@ fn emit_ir(e: &mut Emitter, ir: &Ir, next_in_order: Option<BlockId>) {
         Ir::ArrayAtPutNC { dst, arr, idx, val } => {
             e.emit_array_at_put(dst, arr, idx, val, None)
         }
+        Ir::ByteAt {
+            dst,
+            obj,
+            idx,
+            klass,
+            len_off,
+            tail_off,
+            fail,
+        } => e.emit_byte_at(dst, obj, idx, klass, len_off, tail_off, fail),
+        Ir::ByteAtPut {
+            dst,
+            obj,
+            idx,
+            val,
+            klass,
+            len_off,
+            tail_off,
+            fail,
+        } => e.emit_byte_at_put(dst, obj, idx, val, klass, len_off, tail_off, fail),
         Ir::SmiCmpBr {
             op,
             a,

@@ -273,6 +273,40 @@ pub enum Ir {
         arr: VReg,
         idx: VReg,
     },
+    /// Z2 (docs/intrinsics_design.md): byte element READ intrinsified —
+    /// `byteAt:` (prim 40) at a mono `IndexableBytes`-guarded site.
+    /// `ArrayAt`'s guard set (mem-tag, klass, smi index, 1-based bounds vs
+    /// the tagged size slot) then one `ldurb` + smi-tag of the byte.
+    /// `len_off`/`tail_off` are untagged-base byte offsets computed from
+    /// the guard klass at translate time (size slot / tail byte 0), so a
+    /// byte klass with named ivars stays correct.
+    ByteAt {
+        dst: VReg,
+        obj: VReg,
+        idx: VReg,
+        /// Pool literal holding the guard klass oop (GC keeps it current).
+        klass: PoolLit,
+        len_off: i32,
+        tail_off: i32,
+        fail: BlockId,
+    },
+    /// Z2: byte element WRITE — `byteAt:put:` (prim 41): `ByteAt`'s guards
+    /// plus a tagged-smi `0..=255` range guard on the value, then one
+    /// `sturb`. No card barrier — bytes are not oops. Produces the stored
+    /// value (the send's own result). The translate gate declines Symbol
+    /// receivers (the primitive fails there — interning immutability), so
+    /// the fuse can never turn that failure into a trap storm.
+    ByteAtPut {
+        dst: VReg,
+        obj: VReg,
+        idx: VReg,
+        val: VReg,
+        /// Pool literal holding the guard klass oop.
+        klass: PoolLit,
+        len_off: i32,
+        tail_off: i32,
+        fail: BlockId,
+    },
     /// R2: `ArrayAtPut` with guards proven away (same license as
     /// `ArrayAtNC`); keeps the card barrier — proof covers bounds and
     /// klass, never generational state.
@@ -569,6 +603,15 @@ impl Ir {
                 f(*idx);
                 f(*val);
             }
+            Ir::ByteAt { obj, idx, .. } => {
+                f(*obj);
+                f(*idx);
+            }
+            Ir::ByteAtPut { obj, idx, val, .. } => {
+                f(*obj);
+                f(*idx);
+                f(*val);
+            }
             Ir::BoolBr { val, .. } => f(*val),
             Ir::GuardKlass { obj, .. } | Ir::GuardKlassIn { obj, .. } => f(*obj),
             Ir::CallSend { args, .. } | Ir::CallRuntime { args, .. } => {
@@ -627,6 +670,8 @@ impl Ir {
             | Ir::ArrayAtPut { dst, .. }
             | Ir::ArrayAtNC { dst, .. }
             | Ir::ArrayAtPutNC { dst, .. }
+            | Ir::ByteAt { dst, .. }
+            | Ir::ByteAtPut { dst, .. }
             | Ir::SmiCmpVal { dst, .. }
             | Ir::RefCmpVal { dst, .. }
             | Ir::BoolNot { dst, .. }
@@ -2125,6 +2170,33 @@ impl<'a> Translator<'a> {
         }
         let word = guard.non_indexable_size() - crate::oops::layout::HEADER_WORDS;
         Some((BODY_OFFSET + 8 * word) as i32)
+    }
+
+    /// Z2: `byteAt:` / `byteAt:put:` on a mono `IndexableBytes`-guarded
+    /// site — `array_op_kind` one format over. Returns
+    /// `(is_put, len_off, tail_off)`, the offsets klass-derived like
+    /// `byte_size_op`'s. `byteAt:put:` on a Symbol guard declines: the
+    /// primitive always fails there (interning immutability), and a fuse
+    /// would re-trap on every call instead of taking the Smalltalk error
+    /// path through the shim's bytecode fallback.
+    fn byte_at_op(&self, method: MethodOop, ic_idx: u16) -> Option<(bool, i32, i32)> {
+        let ic = InterpreterIc::at(method, ic_idx);
+        let guard = KlassOop::try_from(ic.guard())?;
+        if guard.format() != crate::oops::klass::Format::IndexableBytes {
+            return None;
+        }
+        let target = crate::compiler::feedback::resolve_method_ro(self.vm, guard, ic.selector())?;
+        let is_put = match target.primitive() {
+            40 => false,
+            41 => true,
+            _ => return None,
+        };
+        if is_put && guard.oop().raw() == self.vm.universe.symbol_klass.oop().raw() {
+            return None;
+        }
+        let word = guard.non_indexable_size() - crate::oops::layout::HEADER_WORDS;
+        let len_off = (BODY_OFFSET + 8 * word) as i32;
+        Some((is_put, len_off, len_off + 8))
     }
 
     fn is_smi_inlinable(&self, ic_idx: u16) -> bool {
@@ -5172,6 +5244,65 @@ impl<'a> Translator<'a> {
                 });
                 stack.push(dst);
             }
+            // Z2 (docs/intrinsics_design.md): mono byte-format `byteAt:` /
+            // `byteAt:put:` — the Array at:/at:put: arm one format over,
+            // offsets klass-derived. Same fail-only reexecute-trap, no
+            // continuation split.
+            Instr::Send { ic, .. } if self.byte_at_op(self.method, ic).is_some() => {
+                let (is_put, len_off, tail_off) = self
+                    .byte_at_op(self.method, ic)
+                    .expect("byteAt fuse: gate passed in match guard");
+                let guard_raw = InterpreterIc::at(self.method, ic).guard().raw();
+                let reexec_stack = stack.clone();
+                let klass = self.pool.intern(guard_raw, Some(RelocKind::Oop));
+                let fail_id = self.fresh_block_id();
+                self.finish_block(IrBlock {
+                    id: fail_id,
+                    bci,
+                    code: vec![Ir::UncommonTrap { bci }],
+                    entry_stack: Vec::new(),
+                    deopt_sites: vec![(
+                        0,
+                        DeoptRaw {
+                            stack: reexec_stack,
+                            bci,
+                            kind: SafepointKind::UncommonTrap,
+                            reexecute: true,
+                            stack_closures: Vec::new(),
+                            inline: None,
+                        },
+                    )],
+                });
+                let dst = self.fresh(true);
+                if is_put {
+                    let val = stack.pop().expect("byteAt:put:: missing value operand");
+                    let idx = stack.pop().expect("byteAt:put:: missing index operand");
+                    let obj = stack.pop().expect("byteAt:put:: missing receiver operand");
+                    code.push(Ir::ByteAtPut {
+                        dst,
+                        obj,
+                        idx,
+                        val,
+                        klass,
+                        len_off,
+                        tail_off,
+                        fail: fail_id,
+                    });
+                } else {
+                    let idx = stack.pop().expect("byteAt:: missing index operand");
+                    let obj = stack.pop().expect("byteAt:: missing receiver operand");
+                    code.push(Ir::ByteAt {
+                        dst,
+                        obj,
+                        idx,
+                        klass,
+                        len_off,
+                        tail_off,
+                        fail: fail_id,
+                    });
+                }
+                stack.push(dst);
+            }
             // Float fast-path (docs/float_fastpath_design.md B2 rule 1): a
             // mono-Double arithmetic/compare send collapses to guarded
             // unboxes + one native FP op (+ a box for arithmetic). Same
@@ -7840,6 +7971,15 @@ fn map_uses(op: &mut Ir, mut f: impl FnMut(VReg) -> VReg) {
             *idx = f(*idx);
             *val = f(*val);
         }
+        Ir::ByteAt { obj, idx, .. } => {
+            *obj = f(*obj);
+            *idx = f(*idx);
+        }
+        Ir::ByteAtPut { obj, idx, val, .. } => {
+            *obj = f(*obj);
+            *idx = f(*idx);
+            *val = f(*val);
+        }
         Ir::BoolBr { val, .. } => *val = f(*val),
         Ir::GuardKlass { obj, .. } | Ir::GuardKlassIn { obj, .. } => *obj = f(*obj),
         Ir::CallSend { args, .. } | Ir::CallRuntime { args, .. } => {
@@ -8137,6 +8277,8 @@ pub(crate) fn copy_propagate(m: &mut IrMethod) {
                 match op {
                     Ir::ArrayAt { fail, .. }
                     | Ir::ArrayAtPut { fail, .. }
+                    | Ir::ByteAt { fail, .. }
+                    | Ir::ByteAtPut { fail, .. }
                     | Ir::SmiArith { fail, .. }
                     | Ir::SmiCmpVal { fail, .. }
                     | Ir::SmiCmpBr { fail, .. }

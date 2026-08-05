@@ -261,3 +261,35 @@ Library-profile Rust-side share barely moved (63.7% → 64.8%, within noise —
 the composite is dominated by `replaceFrom:to:with:`/alloc/intern, which are
 Z4/Z5 targets); the *time* moved where the fused sends live. `prim_class`
 and `prim_size` left the top-of-stack table entirely.
+
+### Z2 — `byteAt:` / `byteAt:put:` fuses (landed 2026-08-05)
+
+Implementation: `Ir::ByteAt`/`ByteAtPut` (klass-derived `len_off`/`tail_off`
+fields), gate `byte_at_op` (declines `byteAt:put:` on a Symbol guard — the
+primitive always fails there, and a fuse would trap-storm instead of taking
+the Smalltalk error path), translate arm mirroring the Array at:/at:put:
+arm, emit lowerings `emit_byte_guards`/`emit_byte_at`/`emit_byte_at_put`
+(`ldurb`/`sturb`, smi-tag via `lsl/asr #2`, value guarded as tagged smi
+0..=1020, no card barrier — bytes are not oops), plus the five exhaustive-
+match sites a new op must join (`uses`/`defs`/`map_uses`/fail-edge alias
+rewrites/`successors` — the last is the correctness-critical one: a trap
+block unreachable through `successors()` falls out of layout entirely).
+
+Gates: differential byte-identical (6200/0), GC-stress 1 and full:64 green.
+
+A/B (same protocol as Z1; Z1 numbers as the base):
+
+| row | Z1 | Z2 | note |
+|---|---:|---:|---|
+| Random generation | 28 ms | **10 ms** | see below |
+| String building (WriteStream) | 11–12 ms | **9–10 ms** | `String>>at:put:` chain |
+| Symbol interning | 14 ms | **11–12 ms** | byte scans |
+| total | 91–94 ms | **67–69 ms** | vs 96–100 pre-arc |
+
+The Random 2.8× was not in the design: **`LargeInteger` stores its digits
+as bytes behind `byteAt:`/`byteAt:put:`** (`world/07_largeinteger.mst`),
+and `Random`'s Lehmer step runs in exact integer arithmetic — so the byte
+fuse compiled the digit loops of the whole bignum layer, not just strings.
+Fraction arithmetic (7 ms) barely moved despite also being
+LargeInteger-adjacent — its time is dominated by `gcd:` smi arithmetic,
+already fused pre-arc.

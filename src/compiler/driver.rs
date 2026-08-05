@@ -2817,6 +2817,8 @@ fn frameless_eligible(m: &ir::IrMethod, ra: &regalloc::RegallocResult) -> bool {
         I::SmiArith { .. } // overflow edge (v2: trap-once, recompile framed)
         | I::ArrayAt { .. } // bounds edge
         | I::ArrayAtPut { .. }
+        | I::ByteAt { .. } // Z2: same bounds/klass trap edges as ArrayAt
+        | I::ByteAtPut { .. }
         | I::FUnbox { .. } // float family: v1 exclusion, see above
         | I::FBox { .. }
         | I::FArith { .. }
