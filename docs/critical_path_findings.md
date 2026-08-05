@@ -170,6 +170,50 @@ benchmark identically, which is drift, not signal. It looked entirely plausible.
 Uniform, unsurprising numbers deserve the same suspicion as spectacular ones;
 interleave and rotate, or do not report.
 
+## Code layout is worth more than any lever we measured (2026-08-05)
+
+`MACVM_CODE_PAD=<n>` wastes n bytes before each fresh nmethod allocation,
+shifting every method's start relative to the 64-byte instruction-fetch
+granule. **The generated code is byte-identical across the sweep** — only its
+address changes. Eight offsets (0..112 step 16), 3 rounds, best-of:
+
+| bench | min | max | spread |
+|---|---|---|---|
+| arith | 1508 | 1509 | **+0.1%** |
+| fib | 9233 | 9268 | +0.4% |
+| sieve | 186 | 195 | **+4.8%** |
+| richards | 1084 | 1155 | **+6.5%** |
+| dict | 254 | 288 | **+13.4%** |
+
+**Layout luck is larger than every optimization effect measured in this
+session.** R4's +3.1% on sieve sits inside sieve's own 4.8% layout spread.
+The unroller's +1.3% and the whole ±2% gated-feature matrix are inside it
+several times over. Only the bounds-check ceiling (15.5% on sieve) clears it
+with room to spare.
+
+It also resolves a standing anomaly: **`dict` was never "randomly noisy" — it
+is layout-sensitive at 13.4%.** That is why its column swung −3.8% in the
+matrix and 1.09→1.27 between two R4 runs, and why no dict-based conclusion in
+this file's earlier sections should be trusted below ~15%.
+
+Practical consequences, in order:
+
+1. **Per-benchmark noise floors, measured.** arith ±0.1% and fib ±0.4% are
+   trustworthy instruments. sieve (±4.8%), richards (±6.5%) and dict (±13.4%)
+   are not, below those thresholds. Quote the floor when quoting a delta.
+2. **Deterministic hot-loop alignment is worth building** — not as a speedup
+   but as a *stabilizer*. Removing 5–13% of address-dependent variance from
+   three of seven benchmarks makes every future A/B interpretable. Aligning
+   loop headers to the fetch granule targets the actual mechanism; today only
+   nmethod starts are aligned, and only to 16 bytes (`CodeCache::alloc`).
+3. **There may also be a real ~5% in picking the good side** on sieve and
+   richards, but that is tuning, not a transformation, and it must follow the
+   determinism work rather than precede it.
+
+The knob is kept (default 0, exactly the previous behaviour) as a standing
+instrument: before believing any delta on a small benchmark, sweep the pad and
+check the effect is bigger than the layout spread.
+
 ## Method note
 
 Both numbers come from deliberately **unsound** throwaway probes

@@ -35,6 +35,17 @@ use crate::vendor::wfasm::native_macos::{jit_write_protect, MacJit};
 use crate::vendor::wfasm::relocpatch::{abs_veneer, VENEER_LEN};
 use guard::JitWriteGuard;
 
+fn code_pad() -> usize {
+    static PAD: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *PAD.get_or_init(|| {
+        std::env::var("MACVM_CODE_PAD")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .map(|n| n & !15)
+            .unwrap_or(0)
+    })
+}
+
 fn round_up16(n: usize) -> usize {
     (n + 15) & !15
 }
@@ -146,7 +157,12 @@ impl CodeCache {
                 len: granted,
             });
         }
-        let off = self.top;
+        // MEASUREMENT-ONLY (MACVM_CODE_PAD=<n>, n a multiple of 16): waste n
+        // bytes before each fresh allocation, shifting every nmethod's start
+        // relative to the 64-byte instruction-fetch granule. Used to quantify
+        // how much of a benchmark delta is code-layout luck rather than
+        // codegen. Default 0 = exactly the previous behaviour.
+        let off = self.top + code_pad();
         let new_top = off.checked_add(len)?;
         if new_top > self.cap {
             return None;
