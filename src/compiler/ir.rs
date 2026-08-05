@@ -273,6 +273,22 @@ pub enum Ir {
         arr: VReg,
         idx: VReg,
     },
+    /// Z3 (docs/intrinsics_design.md): `bitShift:` (prim 9) fused — the one
+    /// integer op outside `SMI_INLINE` (its two-direction dynamic count
+    /// never fit `SmiArith`'s shape). Guards: both operands smi, count in
+    /// the primitive's own -61..=61 window; a positive count left-shifts
+    /// with Dart's shift-back-and-compare overflow bail (`lslv`/`asrv`/
+    /// `cmp` — exactly the smi range on tagged values), a negative count
+    /// arithmetic-right-shifts with the shifted-in tag bits cleared.
+    /// `fail` re-executes interpreted: non-smi operands, out-of-window
+    /// counts, and overflow all take the primitive's own Smalltalk
+    /// fallback (the LargeInteger path), byte-identical.
+    SmiShift {
+        dst: VReg,
+        a: VReg,
+        count: VReg,
+        fail: BlockId,
+    },
     /// Z2 (docs/intrinsics_design.md): byte element READ intrinsified —
     /// `byteAt:` (prim 40) at a mono `IndexableBytes`-guarded site.
     /// `ArrayAt`'s guard set (mem-tag, klass, smi index, 1-based bounds vs
@@ -603,6 +619,10 @@ impl Ir {
                 f(*idx);
                 f(*val);
             }
+            Ir::SmiShift { a, count, .. } => {
+                f(*a);
+                f(*count);
+            }
             Ir::ByteAt { obj, idx, .. } => {
                 f(*obj);
                 f(*idx);
@@ -672,6 +692,7 @@ impl Ir {
             | Ir::ArrayAtPutNC { dst, .. }
             | Ir::ByteAt { dst, .. }
             | Ir::ByteAtPut { dst, .. }
+            | Ir::SmiShift { dst, .. }
             | Ir::SmiCmpVal { dst, .. }
             | Ir::RefCmpVal { dst, .. }
             | Ir::BoolNot { dst, .. }
@@ -2197,6 +2218,21 @@ impl<'a> Translator<'a> {
         let word = guard.non_indexable_size() - crate::oops::layout::HEADER_WORDS;
         let len_off = (BODY_OFFSET + 8 * word) as i32;
         Some((is_put, len_off, len_off + 8))
+    }
+
+    /// Z3: a mono-smi `bitShift:` site (prim 9). Its own gate on the
+    /// prim-28 coexistence model — NOT via `SMI_INLINE`, whose membership
+    /// `PRIM_ALREADY_FUSED` copies (adding 9 there would strip the
+    /// method's shim and decay every poly/mega caller to c2i).
+    fn smi_shift_op(&self, method: MethodOop, ic_idx: u16) -> bool {
+        let ic = InterpreterIc::at(method, ic_idx);
+        ic.guard().raw() == self.vm.universe.smi_klass.oop().raw()
+            && crate::compiler::feedback::resolve_method_ro(
+                self.vm,
+                self.vm.universe.smi_klass,
+                ic.selector(),
+            )
+            .is_some_and(|t| t.primitive() == 9)
     }
 
     fn is_smi_inlinable(&self, ic_idx: u16) -> bool {
@@ -5303,6 +5339,40 @@ impl<'a> Translator<'a> {
                 }
                 stack.push(dst);
             }
+            // Z3 (docs/intrinsics_design.md): mono-smi `bitShift:` — its
+            // own arm (the two-direction dynamic count never fit
+            // SmiArith's shape). Same fail-only reexecute-trap discipline.
+            Instr::Send { ic, .. } if self.smi_shift_op(self.method, ic) => {
+                let reexec_stack = stack.clone();
+                let fail_id = self.fresh_block_id();
+                self.finish_block(IrBlock {
+                    id: fail_id,
+                    bci,
+                    code: vec![Ir::UncommonTrap { bci }],
+                    entry_stack: Vec::new(),
+                    deopt_sites: vec![(
+                        0,
+                        DeoptRaw {
+                            stack: reexec_stack,
+                            bci,
+                            kind: SafepointKind::UncommonTrap,
+                            reexecute: true,
+                            stack_closures: Vec::new(),
+                            inline: None,
+                        },
+                    )],
+                });
+                let count = stack.pop().expect("bitShift:: missing count operand");
+                let a = stack.pop().expect("bitShift:: missing receiver operand");
+                let dst = self.fresh(true);
+                code.push(Ir::SmiShift {
+                    dst,
+                    a,
+                    count,
+                    fail: fail_id,
+                });
+                stack.push(dst);
+            }
             // Float fast-path (docs/float_fastpath_design.md B2 rule 1): a
             // mono-Double arithmetic/compare send collapses to guarded
             // unboxes + one native FP op (+ a box for arithmetic). Same
@@ -7971,6 +8041,10 @@ fn map_uses(op: &mut Ir, mut f: impl FnMut(VReg) -> VReg) {
             *idx = f(*idx);
             *val = f(*val);
         }
+        Ir::SmiShift { a, count, .. } => {
+            *a = f(*a);
+            *count = f(*count);
+        }
         Ir::ByteAt { obj, idx, .. } => {
             *obj = f(*obj);
             *idx = f(*idx);
@@ -8279,6 +8353,7 @@ pub(crate) fn copy_propagate(m: &mut IrMethod) {
                     | Ir::ArrayAtPut { fail, .. }
                     | Ir::ByteAt { fail, .. }
                     | Ir::ByteAtPut { fail, .. }
+                    | Ir::SmiShift { fail, .. }
                     | Ir::SmiArith { fail, .. }
                     | Ir::SmiCmpVal { fail, .. }
                     | Ir::SmiCmpBr { fail, .. }

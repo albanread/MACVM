@@ -293,3 +293,20 @@ fuse compiled the digit loops of the whole bignum layer, not just strings.
 Fraction arithmetic (7 ms) barely moved despite also being
 LargeInteger-adjacent — its time is dominated by `gcd:` smi arithmetic,
 already fused pre-arc.
+
+### Z3 — `bitShift:` fuse (landed 2026-08-05)
+
+`Ir::SmiShift` + `smi_shift_op` gate (own gate, NOT via `SMI_INLINE` —
+adding 9 there would also add it to `PRIM_ALREADY_FUSED` and strip the
+method's shim from poly/mega callers). Lowering: both-smi guards, the
+primitive's own -61..=61 count window as one unsigned range check on the
+tagged count (`count+244 <=u 488`), left shift on the tagged value with
+shift-back-and-compare overflow bail (on tagged 64-bit values that IS the
+smi-range check), right shift as `asrv` + `and ~3` to clear shifted-in tag
+bits. The shift-back compare runs entirely in x19/x20 scratch: `dst` may
+alias `a`'s register when `a` dies at this op, so `d` is written exactly
+once, after every read of the sources.
+
+Gates: differential byte-identical (6200/0), GC-stress 1 + full:64 green.
+A/B: Random generation 10 -> 6-7 ms (the Lehmer step's LargeInteger
+normalization shifts), library third-pass total 67-69 -> 64-65 ms.

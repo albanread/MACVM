@@ -1234,6 +1234,47 @@ impl<'a> Emitter<'a> {
         self.commit(dst, rval);
     }
 
+    /// Z3: `a bitShift: count` on tagged smis. Guards: both smi, count in
+    /// the primitive's -61..=61 window (tagged: `count+244` unsigned <=
+    /// 488). Left shift works directly on the tagged value (tag 00 is
+    /// preserved by `lsl`), with the shift-back-and-compare overflow bail —
+    /// on tagged 64-bit values that is exactly the smi-range check. Right
+    /// shift is `asrv` of the tagged value with the shifted-in low bits
+    /// cleared (`and ~3`). The shift-back compare deliberately runs in
+    /// x19/x20 scratch only — `dst`'s register may alias `a`'s when `a`
+    /// dies here, so `d` is written exactly once, after every read of
+    /// `ra`/`rc` is done.
+    fn emit_smi_shift(&mut self, dst: VReg, a: VReg, count: VReg, fail: BlockId) {
+        let ra = self.resolve(a, 16);
+        let rc = self.resolve(count, 17);
+        let fail_l = self.block_label(fail);
+        self.asm.emit("tst", &[Operand::Reg(ra), imm(3)]);
+        self.asm.b_cond(Cond::Ne, fail_l);
+        self.asm.emit("tst", &[Operand::Reg(rc), imm(3)]);
+        self.asm.b_cond(Cond::Ne, fail_l);
+        self.asm.emit("add", &[x(19), Operand::Reg(rc), imm(244)]);
+        self.asm.emit("cmp", &[x(19), imm(488)]);
+        self.asm.b_cond(Cond::Hi, fail_l);
+        self.asm.emit("asr", &[x(19), Operand::Reg(rc), imm(2)]);
+        let right = self.asm.new_label();
+        let done = self.asm.new_label();
+        let d = self.dest_target(dst);
+        self.asm.emit("cmp", &[x(19), imm(0)]);
+        self.asm.b_cond(Cond::Lt, right);
+        self.asm.emit("lslv", &[x(20), Operand::Reg(ra), x(19)]);
+        self.asm.emit("asrv", &[x(19), x(20), x(19)]);
+        self.asm.emit("cmp", &[x(19), Operand::Reg(ra)]);
+        self.asm.b_cond(Cond::Ne, fail_l);
+        self.asm.emit("mov", &[Operand::Reg(d), x(20)]);
+        self.asm.b(done);
+        self.asm.bind(right);
+        self.asm.emit("neg", &[x(19), x(19)]);
+        self.asm.emit("asrv", &[x(20), Operand::Reg(ra), x(19)]);
+        self.asm.emit("and", &[Operand::Reg(d), x(20), imm(-4)]);
+        self.asm.bind(done);
+        self.commit(dst, d);
+    }
+
     /// See this module's own doc for why this differs from D5.3's literal
     /// sequence: `mul` and `smulh` both need `shifted_a` and `b`, so
     /// neither's result may land where the other still needs to read from.
@@ -3376,6 +3417,7 @@ fn emit_ir(e: &mut Emitter, ir: &Ir, next_in_order: Option<BlockId>) {
             tail_off,
             fail,
         } => e.emit_byte_at_put(dst, obj, idx, val, klass, len_off, tail_off, fail),
+        Ir::SmiShift { dst, a, count, fail } => e.emit_smi_shift(dst, a, count, fail),
         Ir::SmiCmpBr {
             op,
             a,
