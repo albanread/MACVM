@@ -173,7 +173,7 @@ pub struct PoolEntry {
 /// translation rows or D5.3's emit table either) are defined here for the
 /// C+D-phase enum shape but never *constructed* by S10's `convert` —
 /// they're S11's to emit.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum Ir {
     ConstSmi {
         dst: VReg,
@@ -733,7 +733,6 @@ impl Ir {
     }
 }
 
-#[derive(Clone)]
 pub struct IrBlock {
     pub id: BlockId,
     /// First bytecode index this block covers — a `PcDesc` seed. The one
@@ -6273,12 +6272,6 @@ impl<'a> Translator<'a> {
                         self.splice_declined_budget += 1;
                         crate::compiler::inline::InlineDecision::Call
                     }
-                    crate::compiler::inline::InlineDecision::PerArmPoly { ref arms }
-                        if arms.iter().any(|(_, m)| self.budget_would_exceed(*m)) =>
-                    {
-                        self.splice_declined_budget += 1;
-                        crate::compiler::inline::InlineDecision::Call
-                    }
                     other => other,
                 };
                 // S14 step 6: a POLY site with a dominant case — inline the
@@ -6412,252 +6405,6 @@ impl<'a> Translator<'a> {
                     // generic CallSend tail below (nothing was emitted).
                 }
 
-                // P2 (docs/poly_inline_design.md, gated): PER-ARM poly —
-                // 2..=4 arms, each arm a send-free leaf (in-place splice) or
-                // a CFG-eligible body (graft, the SameTargetPoly cfg leg's
-                // recipe per arm). Hottest-first guard chain: the current
-                // block guards arm 0 (fail -> arm 1's block), each side
-                // block guards its own klass (fail -> next, last -> the
-                // shared rejoining slow send), and every route Moves into
-                // the ONE shared `dst` before entering the continuation.
-                // No traps anywhere (the PolyCmpFuse storm lesson). Blocks
-                // are minted up front; the whole shape is dry-run-validated
-                // before anything is emitted; side blocks are built LAST-
-                // ARM-FIRST so each guard's fail target already exists.
-                if let crate::compiler::inline::InlineDecision::PerArmPoly { arms } =
-                    &feedback_inline
-                {
-                    #[derive(Clone, Copy, PartialEq)]
-                    enum ArmLeg {
-                        Leaf,
-                        Cfg,
-                    }
-                    let arms = arms.clone();
-                    let legs: Vec<Option<ArmLeg>> = arms
-                        .iter()
-                        .map(|(_, m)| {
-                            let cfg = crate::compiler::decode::decode(*m);
-                            if m.argc() != real_argc as usize || cfg.blocks.is_empty() {
-                                return None;
-                            }
-                            let leafy = matches!(
-                                cfg.blocks[0].terminator,
-                                crate::compiler::decode::Terminator::Return
-                            ) && leaf_body_is_spliceable(*m);
-                            if leafy {
-                                Some(ArmLeg::Leaf)
-                            } else if crate::compiler::inline::is_inline_eligible_cfg(*m) {
-                                Some(ArmLeg::Cfg)
-                            } else {
-                                None
-                            }
-                        })
-                        .collect();
-                    if legs.iter().all(|l| l.is_some()) {
-                        let legs: Vec<ArmLeg> = legs.into_iter().map(|l| l.unwrap()).collect();
-                        let n = arms.len();
-                        let selector = ic_view.selector();
-                        if self.vm.options.trace.is_enabled("perarm") {
-                            eprintln!(
-                                "[perarm] {} arms={} legs={}",
-                                crate::memory::print::print_oop(
-                                    &self.vm.universe,
-                                    selector.oop()
-                                ),
-                                n,
-                                legs.iter()
-                                    .map(|l| if *l == ArmLeg::Leaf { "L" } else { "C" })
-                                    .collect::<String>(),
-                            );
-                        }
-                        let pre_pop_stack = stack.clone();
-                        let mut inline_args: Vec<VReg> = (0..real_argc)
-                            .map(|_| stack.pop().expect("perarm send: missing arg operand"))
-                            .collect();
-                        inline_args.reverse();
-                        let receiver =
-                            stack.pop().expect("perarm send: missing receiver operand");
-
-                        let my_cont = self.fresh_block_id();
-                        let slow_id = self.fresh_block_id();
-                        let arm_ids: Vec<BlockId> =
-                            (1..n).map(|_| self.fresh_block_id()).collect();
-                        let dst = self.fresh(true);
-                        let dst_slow = self.fresh(true);
-
-                        // Shared rejoining slow block (the standard recipe).
-                        let mut send_args = vec![receiver];
-                        send_args.extend_from_slice(&inline_args);
-                        let site = self.call_sites.len() as u16;
-                        self.call_sites.push(CallSiteInfo {
-                            selector,
-                            argc: real_argc + 1,
-                            static_klass: None,
-                            self_klass: None,
-                        });
-                        self.site_feedback.push(feedback.clone());
-                        self.finish_block(IrBlock {
-                            id: slow_id,
-                            bci,
-                            code: vec![
-                                Ir::CallSend {
-                                    dst: dst_slow,
-                                    site,
-                                    args: send_args,
-                                },
-                                Ir::Move { dst, src: dst_slow },
-                                Ir::Jump { target: my_cont },
-                            ],
-                            entry_stack: Vec::new(),
-                            deopt_sites: vec![(
-                                0,
-                                DeoptRaw {
-                                    stack: stack.clone(),
-                                    bci,
-                                    kind: SafepointKind::Call,
-                                    reexecute: false,
-                                    stack_closures: Vec::new(),
-                                    inline: None,
-                                },
-                            )],
-                        });
-
-                        // Side blocks, last arm first so fail targets exist.
-                        for i in (1..n).rev() {
-                            let (k, m) = arms[i];
-                            let leg = legs[i];
-                            let next = if i + 1 < n { arm_ids[i] } else { slow_id };
-                            let expect =
-                                self.pool.intern(k.oop().raw(), Some(RelocKind::Oop));
-                            let mut acode: Vec<Ir> = vec![Ir::GuardKlass {
-                                obj: receiver,
-                                expect,
-                                fail: next,
-                                kind: GuardShape::KlassTest,
-                            }];
-                            let mut adeopt: Vec<(u32, DeoptRaw)> = Vec::new();
-                            match leg {
-                                ArmLeg::Leaf => {
-                                    let r = self
-                                        .try_inline_leaf(
-                                            m,
-                                            None,
-                                            k,
-                                            selector,
-                                            receiver,
-                                            &inline_args,
-                                            bci,
-                                            &pre_pop_stack,
-                                            &mut acode,
-                                        )
-                                        .expect("perarm leaf arm was pre-validated");
-                                    acode.push(Ir::Move { dst, src: r });
-                                    acode.push(Ir::Jump { target: my_cont });
-                                }
-                                ArmLeg::Cfg => {
-                                    let (r, entry_id, cfg_cont) = self
-                                        .try_inline_cfg(
-                                            m,
-                                            None,
-                                            k,
-                                            selector,
-                                            receiver,
-                                            &inline_args,
-                                            bci,
-                                            &pre_pop_stack,
-                                            &mut acode,
-                                            &mut adeopt,
-                                            None,
-                                            GraftMode::Method { parent: None },
-                                        )
-                                        .expect("perarm cfg arm was pre-validated");
-                                    self.finish_block(IrBlock {
-                                        id: cfg_cont,
-                                        bci,
-                                        code: vec![
-                                            Ir::Move { dst, src: r },
-                                            Ir::Jump { target: my_cont },
-                                        ],
-                                        entry_stack: Vec::new(),
-                                        deopt_sites: Vec::new(),
-                                    });
-                                    acode.push(Ir::Jump { target: entry_id });
-                                }
-                            }
-                            self.finish_block(IrBlock {
-                                id: arm_ids[i - 1],
-                                bci,
-                                code: acode,
-                                entry_stack: Vec::new(),
-                                deopt_sites: adeopt,
-                            });
-                        }
-
-                        // Arm 0 (hottest), in the current block.
-                        let (k0, m0) = arms[0];
-                        let fail0 = if n > 1 { arm_ids[0] } else { slow_id };
-                        let expect0 =
-                            self.pool.intern(k0.oop().raw(), Some(RelocKind::Oop));
-                        code.push(Ir::GuardKlass {
-                            obj: receiver,
-                            expect: expect0,
-                            fail: fail0,
-                            kind: GuardShape::KlassTest,
-                        });
-                        match legs[0] {
-                            ArmLeg::Leaf => {
-                                let r0 = self
-                                    .try_inline_leaf(
-                                        m0,
-                                        None,
-                                        k0,
-                                        selector,
-                                        receiver,
-                                        &inline_args,
-                                        bci,
-                                        &pre_pop_stack,
-                                        code,
-                                    )
-                                    .expect("perarm arm0 was pre-validated");
-                                code.push(Ir::Move { dst, src: r0 });
-                            }
-                            ArmLeg::Cfg => {
-                                let (r0, entry_id, cfg_cont) = self
-                                    .try_inline_cfg(
-                                        m0,
-                                        None,
-                                        k0,
-                                        selector,
-                                        receiver,
-                                        &inline_args,
-                                        bci,
-                                        &pre_pop_stack,
-                                        code,
-                                        deopt,
-                                        None,
-                                        GraftMode::Method { parent: None },
-                                    )
-                                    .expect("perarm arm0 cfg was pre-validated");
-                                self.finish_block(IrBlock {
-                                    id: cfg_cont,
-                                    bci,
-                                    code: vec![
-                                        Ir::Move { dst, src: r0 },
-                                        Ir::Jump { target: my_cont },
-                                    ],
-                                    entry_stack: Vec::new(),
-                                    deopt_sites: Vec::new(),
-                                });
-                                debug_assert!(self.pending_jump_target.is_none());
-                                self.pending_jump_target = Some(entry_id);
-                            }
-                        }
-                        stack.push(dst);
-                        return Some(my_cont);
-                    }
-                    // Some arm has an unspliceable shape: fall through to the
-                    // generic CallSend tail (nothing was emitted).
-                }
 
                 // dart124 items 2+3 slice 2 (ported from WINVM b45d2d6):
                 // SAME-TARGET poly. The membership guard (`GuardKlassIn`,
@@ -8815,45 +8562,6 @@ fn map_uses(op: &mut Ir, mut f: impl FnMut(VReg) -> VReg) {
     }
 }
 
-/// Peephole pass 2: fold a block-local `ConstSmi` operand of a proven
-/// `SmiArithNoOv{Add|Sub}` into an ADD/SUB-IMMEDIATE (`SmiArithNoOvImm`).
-/// benchArith's loop re-materialized `movz #4` for `i := i + 1` EVERY
-/// iteration; post-fold the increment is one `add dst, a, #4`. The tagged
-/// addend (`value << 2`) must fit a64 imm12, so `0 <= value <= 1023`. The
-/// feeding `ConstSmi` is left in place (deopt metadata may reference its
-/// vreg; if truly dead it costs one movz off the critical path). Runs AFTER
-/// `range_reduce` (the only producer of `SmiArithNoOv`); tracking is
-/// per-block with non-SSA redefinition kills.
-pub(crate) fn fold_noov_imm(m: &mut IrMethod) {
-    if std::env::var_os("MACVM_PEEP_TRACE").is_some() {
-        let n: usize = m.blocks.iter().map(|b| b.code.iter().filter(|o| matches!(o, Ir::SmiArithNoOv{..})).count()).sum();
-        eprintln!("[peep] fold_noov_imm: {} blocks, {} NoOv", m.blocks.len(), n);
-    }
-    use std::collections::HashMap;
-    for b in m.blocks.iter_mut() {
-        // vreg -> its current block-local ConstSmi value.
-        let mut known: HashMap<u32, i64> = HashMap::new();
-        for op in b.code.iter_mut() {
-            if let Ir::SmiArithNoOv { op: sop, dst, a, b: rhs } = *op {
-                if matches!(sop, SmiOp::Add | SmiOp::Sub) {
-                    if let Some(&v) = known.get(&rhs.0) {
-                        if (0..=1023).contains(&v) {
-                            *op = Ir::SmiArithNoOvImm { op: sop, dst, a, imm: v };
-                        }
-                    }
-                }
-            }
-            let mut defined: Option<VReg> = None;
-            op.defs(|v| defined = Some(v));
-            if let Some(d) = defined {
-                known.remove(&d.0);
-                if let Ir::ConstSmi { dst, value } = op {
-                    known.insert(dst.0, *value);
-                }
-            }
-        }
-    }
-}
 
 /// Fuse `RefCmpVal` + `BoolBr` into `RefCmpBr` (docs/regalloc_findings.md).
 ///
@@ -8945,98 +8653,6 @@ pub(crate) fn fuse_ref_cmp_br(m: &mut IrMethod) {
     }
 }
 
-/// S14 opt: PER-BLOCK COPY PROPAGATION — the pass that makes compiled loops
-/// worth having. `convert`'s D3.2 "always a fresh copy" rule manufactures a
-/// `Move {fresh, src}` for every temp push (soundness against later temp
-/// redefinition), and under S12 spill-all every one of those single-use
-/// copies becomes an `ldr`+`str` round-trip through a fresh frame slot — the
-/// measured reason a fully-compiled, fully-fused `sumTo:` loop ran at
-/// INTERPRETER speed.
-///
-/// The pass, per block, scans forward keeping `alias: dst → src` for each
-/// `Move` whose `dst` has exactly ONE def in the whole method (fresh copies;
-/// never merge vregs or temp slots — both multi-def). Subsequent uses (in ops
-/// AND in deopt-site metadata) rewrite through the alias; an alias dies the
-/// moment its `src` (or `dst`) is redefined — exactly the redefinition hazard
-/// the fresh-copy rule guards against, now checked instead of paid for. A
-/// `Move` whose every use got rewritten (global use count == in-window
-/// rewrites) is deleted, with deopt-site indices re-keyed.
-///
-/// Sound with spill-all/deopt: a rewritten reference reads `src`'s canonical
-/// slot; `src` is not redefined between the (deleted) copy and the reference
-/// (the kill rule), so the slot holds the identical value at every
-/// safepoint in between. Cross-block uses of an alias are left in place (the
-/// window is per-block), which simply keeps that `Move` alive — conservative,
-/// never wrong.
-/// Regalloc-arc Stage 3b (gated `MACVM_LFCSE=1` — docs/regalloc_findings.md's
-/// "gate everything else" law): LOCAL LOAD FORWARDING. Within one block, a
-/// `LoadField` whose exact (base vreg, byte offset) was loaded or stored
-/// earlier — with nothing in between that could run user code, move
-/// objects, or write the heap — is replaced by a `Move` from the cached
-/// vreg (which `copy_propagate`, running next, then dissolves). The
-/// motivating shape is Smalltalk's `push_instvar N … push_instvar N` twins:
-/// richards' `schedule` loads `currentTask` twice within four
-/// instructions, once per bytecode push.
-///
-/// Soundness:
-/// - invalidate EVERYTHING at any `is_safepoint_op` (a send can mutate any
-///   field; Alloc/Poll/FBox can move objects — the cached VREG's slot is
-///   GC-updated, but conservatism here is free since safepoints already
-///   spill);
-/// - invalidate everything at any heap write (`StoreField`, array/byte
-///   puts), then re-enter the stored (obj, off) → val pair — same-slot
-///   store forwarding, conservative about every alias;
-/// - a redefinition of any vreg drops every map entry using it as base or
-///   cached value (the IR is not SSA: poly rejoin `dst`s are written from
-///   several blocks, and in-block redefs must not serve stale values).
-pub(crate) fn load_forward(m: &mut IrMethod) {
-    let trace = std::env::var_os("MACVM_LFCSE").is_some_and(|v| v.to_str() == Some("trace"));
-    let mut merged = 0usize;
-    for b in &mut m.blocks {
-        let mut avail: Vec<((u32, i32), VReg)> = Vec::new();
-        for op in &mut b.code {
-            // Redefinition screen first: drop entries keyed on or caching a
-            // vreg this op is about to (re)define.
-            let mut defd: Vec<u32> = Vec::new();
-            op.defs(|v| defd.push(v.0));
-            if !defd.is_empty() {
-                avail.retain(|((base, _), v)| !defd.contains(base) && !defd.contains(&v.0));
-            }
-            match op {
-                Ir::LoadField { dst, obj, byte_off } => {
-                    if let Some(&(_, cached)) = avail
-                        .iter()
-                        .find(|((base, off), _)| *base == obj.0 && *off == *byte_off)
-                    {
-                        merged += 1;
-                        *op = Ir::Move { dst: *dst, src: cached };
-                    } else {
-                        let key = (obj.0, *byte_off);
-                        let dst = *dst;
-                        avail.push((key, dst));
-                    }
-                }
-                Ir::StoreField { obj, byte_off, val, .. } => {
-                    let key = (obj.0, *byte_off);
-                    let val = *val;
-                    avail.clear();
-                    avail.push((key, val));
-                }
-                Ir::ArrayAtPut { .. }
-                | Ir::ArrayAtPutNC { .. }
-                | Ir::ByteAtPut { .. } => avail.clear(),
-                _ => {
-                    if is_safepoint_op(op) {
-                        avail.clear();
-                    }
-                }
-            }
-        }
-    }
-    if trace && merged > 0 {
-        eprintln!("[lfcse] merged={merged}");
-    }
-}
 
 pub(crate) fn copy_propagate(m: &mut IrMethod) {
     let n = m.vregs.len();
@@ -10290,247 +9906,6 @@ fn rewrite_uses(op: &mut Ir, from: u32, to: VReg) {
 /// Deliberately NOT handled in R1 (each needs more than this structural
 /// argument): `Sub` (underflow needs a LOWER bound), `a + a` (ditto),
 /// `Mul`, bounds derived from non-const vregs, cross-block scopes.
-// ── 2x loop unrolling (docs/unroll_design.md) ───────────────────────────────
-//
-// Measured first: hand-unrolling sieve's marking loop 2x is worth ~10%, and a
-// SERIAL unroll (second index waiting on the first induction update) captures
-// all of it — so this pass needs no induction analysis, no strength reduction
-// and no stride proof. It duplicates the body; the win is amortising the
-// loop-carried overhead (back-branch, `Poll`, induction update + its overflow
-// check, and the induction variable's per-iteration spill).
-//
-// Shape produced, for header H (the condition test) and latch L:
-//
-//      H  : if !cond goto exit          H  : if !cond goto exit
-//      body                             body
-//      L  : goto H            ==>       L  : goto H'
-//                                       H' : if !cond goto exit   (clone of H)
-//                                       body'
-//                                       L' : goto H
-//
-// The condition is re-tested in H' — chaining the bodies unconditionally would
-// run one iteration too many. OSR still enters at the original H, which remains
-// a legal iteration boundary (and originals precede clones, so the
-// first-match block lookups in driver.rs/ir.rs keep selecting them).
-//
-// vregs are deliberately NOT renamed. Both copies write the same slot vregs,
-// which is exactly what consecutive iterations of the original loop did, and
-// it keeps `VReg(0)`/`VReg(1..=argc+ntemps)` — hardcoded in
-// `driver::build_deopt_metadata` — untouched. It also makes SHARING the
-// region's trap blocks between the two copies sound: an unrenamed vreg has one
-// live interval and therefore one physical assignment, so the single trap
-// site's `resolve_frame_loc` answer is valid from both copies.
-
-/// Rewrite every block target in `ir` through `f`.
-fn map_block_targets(ir: &mut Ir, f: &impl Fn(BlockId) -> BlockId) {
-    match ir {
-        Ir::Jump { target } => *target = f(*target),
-        Ir::BoolBr { if_true, if_false, not_bool, .. } => {
-            *if_true = f(*if_true);
-            *if_false = f(*if_false);
-            *not_bool = f(*not_bool);
-        }
-        Ir::SmiCmpBr { if_true, if_false, fail, .. } => {
-            *if_true = f(*if_true);
-            *if_false = f(*if_false);
-            *fail = f(*fail);
-        }
-        Ir::FCmpBr { if_true, if_false, .. } | Ir::RefCmpBr { if_true, if_false, .. } => {
-            *if_true = f(*if_true);
-            *if_false = f(*if_false);
-        }
-        Ir::SmiArith { fail, .. }
-        | Ir::SmiCmpVal { fail, .. }
-        | Ir::ArrayAt { fail, .. }
-        | Ir::ArrayAtPut { fail, .. }
-        | Ir::ByteAt { fail, .. }
-        | Ir::ByteAtPut { fail, .. }
-        | Ir::SmiShift { fail, .. }
-        | Ir::FUnbox { fail, .. }
-        | Ir::BoolNot { fail, .. }
-        | Ir::VecArith { fail, .. }
-        | Ir::GuardKlass { fail, .. }
-        | Ir::GuardKlassIn { fail, .. } => *fail = f(*fail),
-        _ => {}
-    }
-}
-
-/// Ops this v1 refuses to duplicate: they drag in inline caches, the allocator
-/// and their safepoint/deopt interactions. Keeping them out makes the first
-/// version a pure control-flow transform.
-fn unroll_blocked_op(ir: &Ir) -> bool {
-    matches!(
-        ir,
-        Ir::CallSend { .. } | Ir::CallRuntime { .. } | Ir::Alloc { .. } | Ir::UncommonTrap { .. }
-    )
-}
-
-/// Max blocks in one unrolled region — a compile-time guard, not a tuning knob.
-const UNROLL_REGION_MAX: usize = 24;
-
-/// `MACVM_R4=1` — range-analysis R4: prove a variable-stride induction
-/// variable stays positive, so its array accesses drop their bounds check
-/// (docs/range_analysis_design.md). Default OFF until its A/B clears.
-pub(crate) fn r4_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("MACVM_R4").is_some_and(|v| v == "1"))
-}
-
-/// `MACVM_UNROLL=1` — the gate. Default OFF (see `docs/unroll_design.md`).
-pub(crate) fn unroll_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("MACVM_UNROLL").is_some_and(|v| v == "1"))
-}
-
-/// `MACVM_UNROLL_COUNT=1` — report fires, so a flat A/B can be told apart from
-/// a pass that never fired.
-pub(crate) fn unroll_census() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("MACVM_UNROLL_COUNT").is_some())
-}
-
-/// `MACVM_UNROLL=1`: 2x-unroll innermost loops. Returns the number unrolled.
-/// Default OFF until the A/B clears the bar in `docs/unroll_design.md`.
-pub(crate) fn unroll_2x(m: &mut IrMethod) -> u32 {
-    // OSR compiles enter mid-loop at a bci-selected header; leave them alone.
-    if m.is_osr {
-        return 0;
-    }
-    let mut done = 0u32;
-    // Back-edge candidates from ONE initial scan: a block whose last op jumps
-    // to a lower-numbered block. Clones are appended and only L/L' are
-    // patched, so earlier candidates stay valid as we go.
-    let cands: Vec<(usize, usize)> = m
-        .blocks
-        .iter()
-        .enumerate()
-        .filter_map(|(li, b)| match b.code.last() {
-            Some(Ir::Jump { target }) if (target.0 as usize) < li => Some((target.0 as usize, li)),
-            _ => None,
-        })
-        .collect();
-    for (h, l) in cands {
-        if unroll_one(m, h, l) {
-            done += 1;
-        }
-    }
-    done
-}
-
-fn unroll_one(m: &mut IrMethod, h: usize, l: usize) -> bool {
-    let n = m.blocks.len();
-    if h >= n || l >= n {
-        return false;
-    }
-    // The header must end in a two-way test — otherwise there is no condition
-    // to re-check in the clone and unrolling would change trip count.
-    let header_tests = m.blocks[h]
-        .code
-        .iter()
-        .any(|ir| matches!(ir, Ir::SmiCmpBr { .. } | Ir::BoolBr { .. }));
-    if !header_tests {
-        return false;
-    }
-
-    let succ: Vec<Vec<usize>> = m
-        .blocks
-        .iter()
-        .map(|b| {
-            crate::compiler::regalloc::successors(b)
-                .into_iter()
-                .map(|t| t.0 as usize)
-                .filter(|&t| t < n)
-                .collect()
-        })
-        .collect();
-    let mut preds: Vec<Vec<usize>> = vec![Vec::new(); n];
-    for (i, ss) in succ.iter().enumerate() {
-        for &t in ss {
-            preds[t].push(i);
-        }
-    }
-    let reach = |start: usize, edges: &Vec<Vec<usize>>| -> Vec<bool> {
-        let mut seen = vec![false; n];
-        let mut stack = vec![start];
-        seen[start] = true;
-        while let Some(b) = stack.pop() {
-            for &t in &edges[b] {
-                if !seen[t] {
-                    seen[t] = true;
-                    stack.push(t);
-                }
-            }
-        }
-        seen
-    };
-    // The natural loop body: reachable from the header AND able to reach the
-    // latch. Trap blocks fall out (they cannot reach L) and are SHARED by both
-    // copies — sound because vregs are not renamed.
-    let fwd = reach(h, &succ);
-    let bwd = reach(l, &preds);
-    let region: Vec<usize> = (0..n).filter(|&i| fwd[i] && bwd[i]).collect();
-    if !region.contains(&h) || !region.contains(&l) || region.len() > UNROLL_REGION_MAX {
-        return false;
-    }
-    // Innermost only: no other back-edge inside the region.
-    for &r in &region {
-        if r == l {
-            continue;
-        }
-        if let Some(Ir::Jump { target }) = m.blocks[r].code.last() {
-            if (target.0 as usize) < r && region.contains(&(target.0 as usize)) {
-                return false;
-            }
-        }
-    }
-    // v1 refuses sends/allocation/traps inside the duplicated region.
-    if region
-        .iter()
-        .any(|&r| m.blocks[r].code.iter().any(unroll_blocked_op))
-    {
-        return false;
-    }
-
-    // Clone, appending so `blocks[i].id == BlockId(i)` holds and every copy
-    // lands after every original.
-    let mut map: HashMap<usize, BlockId> = HashMap::with_capacity(region.len());
-    for (k, &r) in region.iter().enumerate() {
-        map.insert(r, BlockId((n + k) as u32));
-    }
-    let remap = |t: BlockId| -> BlockId {
-        *map.get(&(t.0 as usize)).unwrap_or(&t)
-    };
-    for &r in &region {
-        let mut nb = m.blocks[r].clone();
-        nb.id = map[&r];
-        for ir in &mut nb.code {
-            map_block_targets(ir, &remap);
-        }
-        debug_assert!(
-            nb.deopt_sites.iter().all(|(ci, _)| (*ci as usize) < nb.code.len()),
-            "unroll: cloned deopt_site index out of range"
-        );
-        m.blocks.push(nb);
-    }
-
-    // Close the chain: original latch -> cloned header; cloned latch -> original
-    // header. The clone's back-edge was remapped to the cloned header above, so
-    // it is patched back here.
-    let h_clone = map[&h];
-    if let Some(Ir::Jump { target }) = m.blocks[l].code.last_mut() {
-        *target = h_clone;
-    }
-    let l_clone = map[&l].0 as usize;
-    if let Some(Ir::Jump { target }) = m.blocks[l_clone].code.last_mut() {
-        *target = BlockId(h as u32);
-    }
-    debug_assert!(
-        m.blocks.iter().enumerate().all(|(i, b)| b.id.0 as usize == i),
-        "unroll: blocks[i].id == BlockId(i) invariant broken"
-    );
-    true
-}
-
 pub(crate) fn range_reduce(
     m: &mut IrMethod,
     array_meta: Option<crate::oops::wrappers::KlassOop>,
@@ -10670,66 +10045,6 @@ pub(crate) fn range_reduce(
         matches!(defs_of.get(&v).map(Vec::as_slice),
             Some([(DefK::MoveFrom(s), _)]) if chain_reaches(*s, root, defs_of, depth - 1))
     }
-    // R4 (docs/range_analysis_design.md): is `v` provably >= 1 on every path?
-    // The induction arm of `lower_bound` only accepted a positive compile-time
-    // CONSTANT addend, so sieve's `k := k + prime` — stride in a temp — was
-    // never proven and kept its bounds check. This answers the weaker question
-    // "is the addend positive" for an arbitrary vreg.
-    //
-    // Sound because an overflowing `SmiArith{Add}` takes its `fail` edge and
-    // traps: if execution reaches the use, the sum is a real smi equal to
-    // a + b, so positive + positive >= 2 >= 1.
-    fn provably_positive(v: u32, defs_of: &Defs, depth: u8) -> bool {
-        if depth == 0 {
-            return false;
-        }
-        let Some(ds) = defs_of.get(&v) else {
-            return false;
-        };
-        if ds.is_empty() {
-            return false;
-        }
-        let mut saw_real = false;
-        for (d, _) in ds {
-            match d {
-                // The frontend nil-initialises every temp; that arm is
-                // pre-definition and cannot reach a use (same license
-                // `resolve_arr` already takes).
-                DefK::NonSmiConst => continue,
-                DefK::Smi(c) => {
-                    if *c <= 0 {
-                        return false;
-                    }
-                    saw_real = true;
-                }
-                DefK::MoveFrom(s) => {
-                    if !provably_positive(*s, defs_of, depth - 1) {
-                        return false;
-                    }
-                    saw_real = true;
-                }
-                DefK::AddOf(a, b) => {
-                    // v's own induction step (v := v + positive) cannot lower
-                    // v's minimum — skip it, exactly as `lower_bound` does.
-                    let step = chain_reaches(*a, v, defs_of, 8)
-                        && (resolve_strict(*b, defs_of, 8).is_some_and(|c| c > 0)
-                            || provably_positive(*b, defs_of, depth - 1));
-                    if step {
-                        continue;
-                    }
-                    if !(provably_positive(*a, defs_of, depth - 1)
-                        && provably_positive(*b, defs_of, depth - 1))
-                    {
-                        return false;
-                    }
-                    saw_real = true;
-                }
-                _ => return false,
-            }
-        }
-        saw_real
-    }
-
     fn lower_bound(v: u32, root: u32, defs_of: &Defs, depth: u8) -> Option<Option<i64>> {
         if depth == 0 {
             return None;
@@ -10745,25 +10060,12 @@ pub(crate) fn range_reduce(
                     None => continue,
                 },
                 DefK::AddOf(a, b) => {
-                    // R4: accept a provably-positive addend, not just a
-                    // positive compile-time constant (sieve strides by a temp).
-                    let pos_addend = resolve_strict(*b, defs_of, 8).is_some_and(|c| c > 0)
-                        || (r4_enabled() && provably_positive(*b, defs_of, 8));
-                    if pos_addend && chain_reaches(*a, root, defs_of, 8) {
+                    if resolve_strict(*b, defs_of, 8).is_some_and(|c| c > 0)
+                        && chain_reaches(*a, root, defs_of, 8)
+                    {
                         continue; // the induction step never lowers the min
                     }
-                    // R4: not the induction step — but a sum of two provably
-                    // positive values is itself >= 2, so 1 is a sound (and
-                    // conservative) lower bound. This is what lets the loop's
-                    // INIT def `k := i + prime` be proven alongside its step.
-                    if r4_enabled()
-                        && provably_positive(*a, defs_of, 8)
-                        && provably_positive(*b, defs_of, 8)
-                    {
-                        Some(1)
-                    } else {
-                        return None;
-                    }
+                    return None;
                 }
                 _ => return None,
             };
@@ -12383,12 +11685,6 @@ pub fn convert(
         method_pool_ix,
         deopt_live_slots: None,
     };
-    // MACVM_LFCSE=1: local load forwarding (Stage 3b, gated off by default
-    // per the regalloc-findings law until its A/B verdict is in). Runs
-    // BEFORE copy_propagate so the Moves it introduces dissolve.
-    if std::env::var_os("MACVM_LFCSE").is_some() {
-        load_forward(&mut irm);
-    }
     copy_propagate(&mut irm);
     reduce_float_boxes(&mut irm, osr_bci);
     // R2 provenance license: the Array METACLASS — a `GuardKlass` against it
@@ -12397,15 +11693,6 @@ pub fn convert(
     // knowledge, dep-protected against redefinition.
     let array_meta = crate::oops::wrappers::MemOop::try_from(vm.universe.array_klass.oop())
         .map(|mo| mo.klass());
-    // MACVM_UNROLL=1: 2x-unroll innermost loops (docs/unroll_design.md).
-    // DEFAULT OFF. Runs BEFORE range_reduce so the cloned body gets the same
-    // bounds/overflow proofs the original does.
-    if unroll_enabled() {
-        let n = unroll_2x(&mut irm);
-        if n > 0 && unroll_census() {
-            eprintln!("[unroll] {n} loop(s) unrolled 2x ({} blocks now)", irm.blocks.len());
-        }
-    }
     let (rr_ovf, rr_bounds) = range_reduce(&mut irm, array_meta);
     if (rr_ovf > 0 || rr_bounds > 0) && std::env::var_os("MACVM_RANGE_COUNT").is_some() {
         eprintln!(
@@ -12416,17 +11703,6 @@ pub fn convert(
     }
     if crate::compiler::regalloc::fuse_cmp_br() {
         fuse_ref_cmp_br(&mut irm);
-    }
-    // MACVM_PEEP_IMM=1: fold ConstSmi operands of proven SmiArithNoOv adds
-    // into add/sub-immediates. DEFAULT OFF, on the A/B evidence (see
-    // docs/peephole_findings.md): under the current spill-all-at-safepoints
-    // register allocation, the fold's interval shrink perturbs linear-scan
-    // around send-bearing loops and cost benchAlloc a consistent ~9% — the
-    // instruction it removes is cheaper than the spill reshuffle it causes.
-    // Re-gate when the regalloc rework (live-across-only spilling /
-    // deopt environments) lands; the pass itself is correct and tested.
-    if std::env::var_os("MACVM_PEEP_IMM").is_some() {
-        fold_noov_imm(&mut irm);
     }
     // Deopt-liveness rework (behind MACVM_DEOPTLIVE): compute per-root-trap
     // bytecode-live slots AFTER all IR transforms (range_reduce may delete
