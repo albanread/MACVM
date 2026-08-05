@@ -1354,6 +1354,59 @@ fn alloc_guard_census(irm: &IrMethod) -> (u64, u64, u64) {
 /// Free-function twin of `Translator::array_size_op` for an INLINED
 /// callee's own IC table (the splicers' in-body fuse — same pattern as
 /// `array_op_kind_on`).
+/// Z1 twins (docs/intrinsics_design.md): free-function forms of the Z-arc
+/// gates, usable from the splicers on an INLINED callee's own IC table —
+/// the `&self` methods delegate here, so the pair cannot drift (the
+/// `is_double_inlinable_on` lesson: a fuse missing inside spliced bodies
+/// decays to a boxing CallSend and the win evaporates).
+fn class_const_op_on(vm: &VmState, method: MethodOop, ic_idx: u16) -> Option<KlassOop> {
+    let ic = InterpreterIc::at(method, ic_idx);
+    let guard = KlassOop::try_from(ic.guard())?;
+    let target = crate::compiler::feedback::resolve_method_ro(vm, guard, ic.selector())?;
+    (target.primitive() == 21).then_some(guard)
+}
+
+fn byte_size_op_on(vm: &VmState, method: MethodOop, ic_idx: u16) -> Option<i32> {
+    let ic = InterpreterIc::at(method, ic_idx);
+    let guard = KlassOop::try_from(ic.guard())?;
+    if guard.format() != crate::oops::klass::Format::IndexableBytes {
+        return None;
+    }
+    let target = crate::compiler::feedback::resolve_method_ro(vm, guard, ic.selector())?;
+    if !matches!(target.primitive(), 28 | 42) {
+        return None;
+    }
+    let word = guard.non_indexable_size() - crate::oops::layout::HEADER_WORDS;
+    Some((BODY_OFFSET + 8 * word) as i32)
+}
+
+fn byte_at_op_on(vm: &VmState, method: MethodOop, ic_idx: u16) -> Option<(bool, i32, i32)> {
+    let ic = InterpreterIc::at(method, ic_idx);
+    let guard = KlassOop::try_from(ic.guard())?;
+    if guard.format() != crate::oops::klass::Format::IndexableBytes {
+        return None;
+    }
+    let target = crate::compiler::feedback::resolve_method_ro(vm, guard, ic.selector())?;
+    let is_put = match target.primitive() {
+        40 => false,
+        41 => true,
+        _ => return None,
+    };
+    if is_put && guard.oop().raw() == vm.universe.symbol_klass.oop().raw() {
+        return None;
+    }
+    let word = guard.non_indexable_size() - crate::oops::layout::HEADER_WORDS;
+    let len_off = (BODY_OFFSET + 8 * word) as i32;
+    Some((is_put, len_off, len_off + 8))
+}
+
+fn smi_shift_op_on(vm: &VmState, method: MethodOop, ic_idx: u16) -> bool {
+    let ic = InterpreterIc::at(method, ic_idx);
+    ic.guard().raw() == vm.universe.smi_klass.oop().raw()
+        && crate::compiler::feedback::resolve_method_ro(vm, vm.universe.smi_klass, ic.selector())
+            .is_some_and(|t| t.primitive() == 9)
+}
+
 fn array_size_on(vm: &VmState, method: MethodOop, ic_idx: u16) -> bool {
     let ic = InterpreterIc::at(method, ic_idx);
     // (klass, selector) resolution — see `array_size_op`'s staleness note.
@@ -2173,10 +2226,7 @@ impl<'a> Translator<'a> {
     /// so a tiered-up compiled target can't decay the fuse, and 21 stays
     /// shimmable for poly/mega sites.
     fn class_const_op(&self, method: MethodOop, ic_idx: u16) -> Option<KlassOop> {
-        let ic = InterpreterIc::at(method, ic_idx);
-        let guard = KlassOop::try_from(ic.guard())?;
-        let target = crate::compiler::feedback::resolve_method_ro(self.vm, guard, ic.selector())?;
-        (target.primitive() == 21).then_some(guard)
+        class_const_op_on(self.vm, method, ic_idx)
     }
 
     /// Z1: byte-format length reads — `array_size_op` one format over. A
@@ -2189,17 +2239,7 @@ impl<'a> Translator<'a> {
     /// hardcoded the way the Array arm's `16` is (same value when the
     /// klass has no named ivars; correct either way).
     fn byte_size_op(&self, method: MethodOop, ic_idx: u16) -> Option<i32> {
-        let ic = InterpreterIc::at(method, ic_idx);
-        let guard = KlassOop::try_from(ic.guard())?;
-        if guard.format() != crate::oops::klass::Format::IndexableBytes {
-            return None;
-        }
-        let target = crate::compiler::feedback::resolve_method_ro(self.vm, guard, ic.selector())?;
-        if !matches!(target.primitive(), 28 | 42) {
-            return None;
-        }
-        let word = guard.non_indexable_size() - crate::oops::layout::HEADER_WORDS;
-        Some((BODY_OFFSET + 8 * word) as i32)
+        byte_size_op_on(self.vm, method, ic_idx)
     }
 
     /// Z2: `byteAt:` / `byteAt:put:` on a mono `IndexableBytes`-guarded
@@ -2210,23 +2250,7 @@ impl<'a> Translator<'a> {
     /// would re-trap on every call instead of taking the Smalltalk error
     /// path through the shim's bytecode fallback.
     fn byte_at_op(&self, method: MethodOop, ic_idx: u16) -> Option<(bool, i32, i32)> {
-        let ic = InterpreterIc::at(method, ic_idx);
-        let guard = KlassOop::try_from(ic.guard())?;
-        if guard.format() != crate::oops::klass::Format::IndexableBytes {
-            return None;
-        }
-        let target = crate::compiler::feedback::resolve_method_ro(self.vm, guard, ic.selector())?;
-        let is_put = match target.primitive() {
-            40 => false,
-            41 => true,
-            _ => return None,
-        };
-        if is_put && guard.oop().raw() == self.vm.universe.symbol_klass.oop().raw() {
-            return None;
-        }
-        let word = guard.non_indexable_size() - crate::oops::layout::HEADER_WORDS;
-        let len_off = (BODY_OFFSET + 8 * word) as i32;
-        Some((is_put, len_off, len_off + 8))
+        byte_at_op_on(self.vm, method, ic_idx)
     }
 
     /// Z3: a mono-smi `bitShift:` site (prim 9). Its own gate on the
@@ -2234,14 +2258,7 @@ impl<'a> Translator<'a> {
     /// `PRIM_ALREADY_FUSED` copies (adding 9 there would strip the
     /// method's shim and decay every poly/mega caller to c2i).
     fn smi_shift_op(&self, method: MethodOop, ic_idx: u16) -> bool {
-        let ic = InterpreterIc::at(method, ic_idx);
-        ic.guard().raw() == self.vm.universe.smi_klass.oop().raw()
-            && crate::compiler::feedback::resolve_method_ro(
-                self.vm,
-                self.vm.universe.smi_klass,
-                ic.selector(),
-            )
-            .is_some_and(|t| t.primitive() == 9)
+        smi_shift_op_on(self.vm, method, ic_idx)
     }
 
     fn is_smi_inlinable(&self, ic_idx: u16) -> bool {
@@ -2332,13 +2349,26 @@ impl<'a> Translator<'a> {
     /// a generic CallSend -> shim -> Rust prim round trip (~28 ns/object vs
     /// the inline eden bump's 2-3 ns), and the in-splice call also poisoned
     /// register residency (`crosses_call`).
+    /// Z4a twin: like the root gate, the receiver may be the CALLEE's own
+    /// `self` when the splice's proven self-klass is a metaclass — the
+    /// allocated class is that metaclass's sole global instance, and the
+    /// caller must front the Alloc with a `GuardShape::ValueTest` (third
+    /// tuple slot `true`).
     fn alloc_site_klass_on(
         &self,
         callee: MethodOop,
         ic_idx: u16,
         receiver: VReg,
-    ) -> Option<(KlassOop, u32)> {
-        let klass = *self.const_class.get(&receiver.0)?;
+        callee_self: VReg,
+        callee_self_klass: Option<KlassOop>,
+    ) -> Option<(KlassOop, u32, bool)> {
+        let (klass, from_self) = match self.const_class.get(&receiver.0) {
+            Some(k) => (*k, false),
+            None if receiver == callee_self => {
+                (self.metaclass_sole_instance(callee_self_klass?)?, true)
+            }
+            None => return None,
+        };
         let ic = InterpreterIc::at(callee, ic_idx);
         if ic.argc() != 0 {
             return None;
@@ -2356,7 +2386,7 @@ impl<'a> Translator<'a> {
         {
             return None;
         }
-        Some((klass, size_words as u32))
+        Some((klass, size_words as u32, from_self))
     }
 
     /// Z4 (docs/intrinsics_design.md): the sole instance of a metaclass —
@@ -3009,17 +3039,33 @@ impl<'a> Translator<'a> {
                     // (see `alloc_site_klass_on`). Checked FIRST — an argc-0
                     // basicNew can't collide with the array/smi/double fuses.
                     if let Some(recv_v) = cstack.last().copied() {
-                        if let Some((klass, size_words)) =
-                            self.alloc_site_klass_on(callee, ic, recv_v)
+                        if let Some((klass, size_words, from_self)) =
+                            self.alloc_site_klass_on(callee, ic, recv_v, callee_self, callee_self_klass)
                         {
                             // Alloc deopts by RE-EXECUTING the basicNew send
                             // interpreted (reexecute=true) inside the INLINED
                             // frame: record the body stack with the receiver
                             // still present, plus the inline proto.
                             let deopt_stack = cstack.clone();
-                            cstack.pop(); // consume the receiver
                             let klass_lit =
                                 self.pool.intern(klass.oop().raw(), Some(RelocKind::Oop));
+                            // Z4a twin: a customized-self site pins
+                            // klass(self), not self — identity-guard the
+                            // receiver (see the root arm).
+                            if from_self {
+                                let fail = self.fresh_inlined_trap_block(
+                                    inner_bci,
+                                    deopt_stack.clone(),
+                                    inline_proto.clone(),
+                                );
+                                code.push(Ir::GuardKlass {
+                                    obj: recv_v,
+                                    expect: klass_lit,
+                                    fail,
+                                    kind: GuardShape::ValueTest,
+                                });
+                            }
+                            cstack.pop(); // consume the receiver
                             let dst = self.fresh(true);
                             deopt.push((
                                 code.len() as u32,
@@ -3139,6 +3185,112 @@ impl<'a> Translator<'a> {
                                 fail,
                             }),
                         }
+                        cstack.push(dst);
+                        bci = next;
+                        continue;
+                    }
+                    if let Some(guard_k) = class_const_op_on(self.vm, callee, ic) {
+                        // Z1 twin (see the root arm): the guard establishes the answer.
+                        let recv = cstack.pop().expect("class fuse: missing receiver");
+                        let mut reexec = cstack.clone();
+                        reexec.push(recv);
+                        let fail = self.fresh_inlined_trap_block(inner_bci, reexec, inline_proto.clone());
+                        let expect = self.pool.intern(guard_k.oop().raw(), Some(RelocKind::Oop));
+                        let is_smi = guard_k.oop().raw() == self.vm.universe.smi_klass.oop().raw();
+                        code.push(Ir::GuardKlass {
+                            obj: recv,
+                            expect,
+                            fail,
+                            kind: if is_smi { GuardShape::SmiTest } else { GuardShape::KlassTest },
+                        });
+                        let dst = self.push_well_known(guard_k.oop().raw(), code);
+                        cstack.push(dst);
+                        bci = next;
+                        continue;
+                    }
+                    if let Some(byte_off) = byte_size_op_on(self.vm, callee, ic) {
+                        // Z1 twin: byte-format size (see the root arm).
+                        let recv = cstack.pop().expect("byteSize fuse: missing receiver");
+                        let mut reexec = cstack.clone();
+                        reexec.push(recv);
+                        let fail = self.fresh_inlined_trap_block(inner_bci, reexec, inline_proto.clone());
+                        let guard_raw = InterpreterIc::at(callee, ic).guard().raw();
+                        let expect = self.pool.intern(guard_raw, Some(RelocKind::Oop));
+                        code.push(Ir::GuardKlass {
+                            obj: recv,
+                            expect,
+                            fail,
+                            kind: GuardShape::KlassTest,
+                        });
+                        let dst = self.fresh(true);
+                        code.push(Ir::LoadField {
+                            dst,
+                            obj: recv,
+                            byte_off,
+                        });
+                        cstack.push(dst);
+                        bci = next;
+                        continue;
+                    }
+                    if let Some((is_put, len_off, tail_off)) = byte_at_op_on(self.vm, callee, ic) {
+                        // Z2 twin: in-body byte element access (see the root arm).
+                        let val = if is_put {
+                            Some(cstack.pop().expect("byte fuse: missing value"))
+                        } else {
+                            None
+                        };
+                        let idx_op = cstack.pop().expect("byte fuse: missing index");
+                        let obj_op = cstack.pop().expect("byte fuse: missing receiver");
+                        let mut reexec = cstack.clone();
+                        reexec.push(obj_op);
+                        reexec.push(idx_op);
+                        if let Some(v) = val {
+                            reexec.push(v);
+                        }
+                        let fail = self.fresh_inlined_trap_block(inner_bci, reexec, inline_proto.clone());
+                        let guard_raw = InterpreterIc::at(callee, ic).guard().raw();
+                        let klass = self.pool.intern(guard_raw, Some(RelocKind::Oop));
+                        let dst = self.fresh(true);
+                        match val {
+                            Some(v) => code.push(Ir::ByteAtPut {
+                                dst,
+                                obj: obj_op,
+                                idx: idx_op,
+                                val: v,
+                                klass,
+                                len_off,
+                                tail_off,
+                                fail,
+                            }),
+                            None => code.push(Ir::ByteAt {
+                                dst,
+                                obj: obj_op,
+                                idx: idx_op,
+                                klass,
+                                len_off,
+                                tail_off,
+                                fail,
+                            }),
+                        }
+                        cstack.push(dst);
+                        bci = next;
+                        continue;
+                    }
+                    if smi_shift_op_on(self.vm, callee, ic) {
+                        // Z3 twin: in-body bitShift: (see the root arm).
+                        let count_op = cstack.pop().expect("shift fuse: missing count");
+                        let a_op = cstack.pop().expect("shift fuse: missing receiver");
+                        let mut reexec = cstack.clone();
+                        reexec.push(a_op);
+                        reexec.push(count_op);
+                        let fail = self.fresh_inlined_trap_block(inner_bci, reexec, inline_proto.clone());
+                        let dst = self.fresh(true);
+                        code.push(Ir::SmiShift {
+                            dst,
+                            a: a_op,
+                            count: count_op,
+                            fail,
+                        });
                         cstack.push(dst);
                         bci = next;
                         continue;
@@ -3936,10 +4088,28 @@ impl<'a> Translator<'a> {
                         // array/smi/double fuses. A phantom receiver can't be
                         // a class constant, so the ph shadow only truncates.
                         if let Some(recv_v) = cstack.last().copied() {
-                            if let Some((klass, size_words)) =
-                                self.alloc_site_klass_on(callee, ic, recv_v)
+                            if let Some((klass, size_words, from_self)) =
+                                self.alloc_site_klass_on(callee, ic, recv_v, callee_self, callee_self_klass)
                             {
                                 let deopt_stack = cstack.clone();
+                                // Z4a twin: identity-guard a customized-self
+                                // receiver (see the root arm).
+                                if from_self {
+                                    let g_lit = self
+                                        .pool
+                                        .intern(klass.oop().raw(), Some(RelocKind::Oop));
+                                    let fail = self.fresh_inlined_trap_block(
+                                        inner_bci,
+                                        deopt_stack.clone(),
+                                        inline_proto.clone(),
+                                    );
+                                    bcode.push(Ir::GuardKlass {
+                                        obj: recv_v,
+                                        expect: g_lit,
+                                        fail,
+                                        kind: GuardShape::ValueTest,
+                                    });
+                                }
                                 cstack_ph.truncate(cstack.len().saturating_sub(1));
                                 cstack.pop(); // consume the receiver
                                 let klass_lit =
@@ -4094,6 +4264,120 @@ impl<'a> Translator<'a> {
                             );
                             let dst = self.fresh(true);
                             bcode.push(Ir::BoolNot { dst, src, fail });
+                            cstack.push(dst);
+                            cstack_ph.push(false);
+                            bci = next;
+                            continue;
+                        }
+                        if let Some(guard_k) = class_const_op_on(self.vm, callee, ic) {
+                            // Z1 twin (see the root arm): the guard establishes the answer.
+                            cstack_ph.truncate(cstack.len().saturating_sub(1));
+                            let recv = cstack.pop().expect("class fuse: missing receiver");
+                            let mut reexec = cstack.clone();
+                            reexec.push(recv);
+                            let fail = self.fresh_inlined_trap_block(inner_bci, reexec, inline_proto.clone());
+                            let expect = self.pool.intern(guard_k.oop().raw(), Some(RelocKind::Oop));
+                            let is_smi = guard_k.oop().raw() == self.vm.universe.smi_klass.oop().raw();
+                            bcode.push(Ir::GuardKlass {
+                                obj: recv,
+                                expect,
+                                fail,
+                                kind: if is_smi { GuardShape::SmiTest } else { GuardShape::KlassTest },
+                            });
+                            let dst = self.push_well_known(guard_k.oop().raw(), &mut bcode);
+                            cstack.push(dst);
+                            cstack_ph.push(false);
+                            bci = next;
+                            continue;
+                        }
+                        if let Some(byte_off) = byte_size_op_on(self.vm, callee, ic) {
+                            // Z1 twin: byte-format size (see the root arm).
+                            cstack_ph.truncate(cstack.len().saturating_sub(1));
+                            let recv = cstack.pop().expect("byteSize fuse: missing receiver");
+                            let mut reexec = cstack.clone();
+                            reexec.push(recv);
+                            let fail = self.fresh_inlined_trap_block(inner_bci, reexec, inline_proto.clone());
+                            let guard_raw = InterpreterIc::at(callee, ic).guard().raw();
+                            let expect = self.pool.intern(guard_raw, Some(RelocKind::Oop));
+                            bcode.push(Ir::GuardKlass {
+                                obj: recv,
+                                expect,
+                                fail,
+                                kind: GuardShape::KlassTest,
+                            });
+                            let dst = self.fresh(true);
+                            bcode.push(Ir::LoadField {
+                                dst,
+                                obj: recv,
+                                byte_off,
+                            });
+                            cstack.push(dst);
+                            cstack_ph.push(false);
+                            bci = next;
+                            continue;
+                        }
+                        if let Some((is_put, len_off, tail_off)) = byte_at_op_on(self.vm, callee, ic) {
+                            // Z2 twin: in-body byte element access (see the root arm).
+                            cstack_ph.truncate(cstack.len().saturating_sub(if is_put { 3 } else { 2 }));
+                            let val = if is_put {
+                                Some(cstack.pop().expect("byte fuse: missing value"))
+                            } else {
+                                None
+                            };
+                            let idx_op = cstack.pop().expect("byte fuse: missing index");
+                            let obj_op = cstack.pop().expect("byte fuse: missing receiver");
+                            let mut reexec = cstack.clone();
+                            reexec.push(obj_op);
+                            reexec.push(idx_op);
+                            if let Some(v) = val {
+                                reexec.push(v);
+                            }
+                            let fail = self.fresh_inlined_trap_block(inner_bci, reexec, inline_proto.clone());
+                            let guard_raw = InterpreterIc::at(callee, ic).guard().raw();
+                            let klass = self.pool.intern(guard_raw, Some(RelocKind::Oop));
+                            let dst = self.fresh(true);
+                            match val {
+                                Some(v) => bcode.push(Ir::ByteAtPut {
+                                    dst,
+                                    obj: obj_op,
+                                    idx: idx_op,
+                                    val: v,
+                                    klass,
+                                    len_off,
+                                    tail_off,
+                                    fail,
+                                }),
+                                None => bcode.push(Ir::ByteAt {
+                                    dst,
+                                    obj: obj_op,
+                                    idx: idx_op,
+                                    klass,
+                                    len_off,
+                                    tail_off,
+                                    fail,
+                                }),
+                            }
+                            cstack.push(dst);
+                            cstack_ph.push(false);
+                            bci = next;
+                            continue;
+                        }
+                        if smi_shift_op_on(self.vm, callee, ic) {
+                            // Z3 twin: in-body bitShift: (see the root arm).
+                            cstack_ph.truncate(cstack.len().saturating_sub(2));
+                            let count_op = cstack.pop().expect("shift fuse: missing count");
+                            let a_op = cstack.pop().expect("shift fuse: missing receiver");
+                            let mut reexec = cstack.clone();
+                            reexec.push(a_op);
+                            reexec.push(count_op);
+                            let fail = self.fresh_inlined_trap_block(inner_bci, reexec, inline_proto.clone());
+                            let dst = self.fresh(true);
+                            bcode.push(Ir::SmiShift {
+                                dst,
+                                a: a_op,
+                                count: count_op,
+                                fail,
+                            });
                             cstack.push(dst);
                             cstack_ph.push(false);
                             bci = next;
@@ -7585,6 +7869,112 @@ impl<'a> Translator<'a> {
                                 fail,
                             }),
                         }
+                        bstack.push(dst);
+                        bci = next;
+                        continue;
+                    }
+                    if let Some(guard_k) = class_const_op_on(self.vm, block, inner_ic_idx) {
+                        // Z1 twin (see the root arm): the guard establishes the answer.
+                        let recv = bstack.pop().expect("class fuse: missing receiver");
+                        let mut reexec = bstack.clone();
+                        reexec.push(recv);
+                        let fail = self.fresh_inlined_trap_block(inner_bci, reexec, inline_proto.clone());
+                        let expect = self.pool.intern(guard_k.oop().raw(), Some(RelocKind::Oop));
+                        let is_smi = guard_k.oop().raw() == self.vm.universe.smi_klass.oop().raw();
+                        code.push(Ir::GuardKlass {
+                            obj: recv,
+                            expect,
+                            fail,
+                            kind: if is_smi { GuardShape::SmiTest } else { GuardShape::KlassTest },
+                        });
+                        let dst = self.push_well_known(guard_k.oop().raw(), code);
+                        bstack.push(dst);
+                        bci = next;
+                        continue;
+                    }
+                    if let Some(byte_off) = byte_size_op_on(self.vm, block, inner_ic_idx) {
+                        // Z1 twin: byte-format size (see the root arm).
+                        let recv = bstack.pop().expect("byteSize fuse: missing receiver");
+                        let mut reexec = bstack.clone();
+                        reexec.push(recv);
+                        let fail = self.fresh_inlined_trap_block(inner_bci, reexec, inline_proto.clone());
+                        let guard_raw = InterpreterIc::at(block, inner_ic_idx).guard().raw();
+                        let expect = self.pool.intern(guard_raw, Some(RelocKind::Oop));
+                        code.push(Ir::GuardKlass {
+                            obj: recv,
+                            expect,
+                            fail,
+                            kind: GuardShape::KlassTest,
+                        });
+                        let dst = self.fresh(true);
+                        code.push(Ir::LoadField {
+                            dst,
+                            obj: recv,
+                            byte_off,
+                        });
+                        bstack.push(dst);
+                        bci = next;
+                        continue;
+                    }
+                    if let Some((is_put, len_off, tail_off)) = byte_at_op_on(self.vm, block, inner_ic_idx) {
+                        // Z2 twin: in-body byte element access (see the root arm).
+                        let val = if is_put {
+                            Some(bstack.pop().expect("byte fuse: missing value"))
+                        } else {
+                            None
+                        };
+                        let idx_op = bstack.pop().expect("byte fuse: missing index");
+                        let obj_op = bstack.pop().expect("byte fuse: missing receiver");
+                        let mut reexec = bstack.clone();
+                        reexec.push(obj_op);
+                        reexec.push(idx_op);
+                        if let Some(v) = val {
+                            reexec.push(v);
+                        }
+                        let fail = self.fresh_inlined_trap_block(inner_bci, reexec, inline_proto.clone());
+                        let guard_raw = InterpreterIc::at(block, inner_ic_idx).guard().raw();
+                        let klass = self.pool.intern(guard_raw, Some(RelocKind::Oop));
+                        let dst = self.fresh(true);
+                        match val {
+                            Some(v) => code.push(Ir::ByteAtPut {
+                                dst,
+                                obj: obj_op,
+                                idx: idx_op,
+                                val: v,
+                                klass,
+                                len_off,
+                                tail_off,
+                                fail,
+                            }),
+                            None => code.push(Ir::ByteAt {
+                                dst,
+                                obj: obj_op,
+                                idx: idx_op,
+                                klass,
+                                len_off,
+                                tail_off,
+                                fail,
+                            }),
+                        }
+                        bstack.push(dst);
+                        bci = next;
+                        continue;
+                    }
+                    if smi_shift_op_on(self.vm, block, inner_ic_idx) {
+                        // Z3 twin: in-body bitShift: (see the root arm).
+                        let count_op = bstack.pop().expect("shift fuse: missing count");
+                        let a_op = bstack.pop().expect("shift fuse: missing receiver");
+                        let mut reexec = bstack.clone();
+                        reexec.push(a_op);
+                        reexec.push(count_op);
+                        let fail = self.fresh_inlined_trap_block(inner_bci, reexec, inline_proto.clone());
+                        let dst = self.fresh(true);
+                        code.push(Ir::SmiShift {
+                            dst,
+                            a: a_op,
+                            count: count_op,
+                            fail,
+                        });
                         bstack.push(dst);
                         bci = next;
                         continue;

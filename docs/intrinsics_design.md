@@ -330,9 +330,31 @@ cargo test --release green.
 A/B: Fraction arithmetic 6-7 -> **2 ms** (its constructors' `self
 basicNew` now bump-allocates inline), library third-pass total 64-65 ->
 **56 ms** (pre-arc: 96-100 — the arc so far is ~1.7x on this composite).
-The classic `alloc` bench did NOT move: its constructors are small enough
-to be INLINED into callers, and inside spliced bodies the `_on` twin
-gates still require a literal class receiver — the deferred-twins
-follow-up (Z1.1/Z2/Z4 `_on` parity, one pass over the three splice
-sites) is where that win lives. dict/deltablue spot numbers were within
-noise of the morning baseline under ambient desktop load.
+The classic `alloc` bench did NOT move at Z4a-time; the twins pass below
+settles why.
+
+### Z-twins — `_on` parity for Z1/Z2/Z3/Z4a (landed 2026-08-05)
+
+The four Z gates refactored to free functions (`*_op_on`; the `&self`
+methods delegate, so the pairs cannot drift), applied at all three splice
+sites (non-leaf, CFG, block) with each site's own idiom
+(`fresh_inlined_trap_block` carries the inline-aware deopt; the CFG site
+maintains its `cstack_ph` shadow). `alloc_site_klass_on` additionally
+accepts the callee's own customized `self` (metaclass → sole global
+instance, `ValueTest`-guarded) — the `Association key:value:` shape the
+gap doc names.
+
+Gates: differential byte-identical (6200/0), stress 1 + full:64 green.
+A/B: library third-pass total 56 -> 54 ms; classic seven flat.
+
+**The alloc-bench hypothesis is now settled, with a profile instead of a
+guess:** on the compiled `benchAlloc` loop, `prim_basic_new` no longer
+appears at top-of-stack at all — the fuse fires — and the surviving
+Rust-side time is entirely the collector (`scavenge_oop`/`scavenge`/
+`instance_size_words`/full-GC marks): the workload deliberately keeps a
+200k-long live Association chain, so every scavenge copies it. The
+allocation *call-out* cost this arc targets is gone; the bench's residual
+gap vs MACDART is GC throughput + loop codegen — the next arcs' turf, not
+this one's. (Also verified en route: a top-level doit block never tiers
+up, so ad-hoc doit-loop profiles measure the interpreter — use a
+class-side driver method when profiling.)
