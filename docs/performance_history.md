@@ -383,10 +383,22 @@ movement against the unchanged rival's column before believing it.**
 - **sieve 2.66× vs Dart** — now the widest row (it regressed slightly
   while the others closed): array inner loops. Its one unproven bounds
   check (the variable-stride marking loop) has a **measured** ceiling of
-  **11–14%**, taken with an unsound remove-all-checks probe on the clock,
+  **15.5%**, taken with an unsound remove-all-checks probe on the clock,
   not from an instruction count — see `range_analysis_design.md` R4.
-  Worth doing later: 14% moves the row to ~2.3×, narrowing the gap
-  without closing it. LoadField loops remain inliner+residency territory.
+  Worth doing later: it moves the row to ~2.3×, narrowing the gap without
+  closing it. LoadField loops remain inliner+residency territory.
+- **Card-barrier elision — FALSIFIED, do not build.** Ranked #2 on the
+  reasoning that Dart elides barriers for constant/bool/smi stores while
+  we emit twelve instructions. Measured with the same probe method:
+  **0%** (48.4 → 49.4 µs, i.e. inside noise). Twelve instructions per
+  store that sit off the critical path are free on an M4 P-core, while the
+  four-instruction bounds check that gates the store is worth 15.5%.
+  `critical_path_findings.md` has the disassembly and the general law:
+  **rank levers by critical-path position, not instruction share.**
+- **Unrolling — the most interesting untried lever**, and the one this
+  machine's spare issue capacity actually argues for: it ADDS instructions
+  but breaks the loop-carried dependency and puts independent stores in
+  flight. Never attempted.
 - **richards 2.18× vs Dart** — was the widest at 3.36×; the Z-arc and
   F1–F3 waves took a third off it. Activation cost smeared over
   polymorphic sends. I4 (recursion depth 1) and invocation-count ranking

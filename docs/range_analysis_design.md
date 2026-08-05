@@ -69,8 +69,11 @@ is heap corruption, not a wrong answer).
 recorded in `f3c_census_findings.md` as the residency-door re-check.
 
 **R4 — variable-stride lower bound. DEFERRED, but the ceiling is now
-MEASURED (2026-08-05, at `682a876`): 11–14% of sieve.** Worth doing
-later; not worth doing first.
+MEASURED (2026-08-05): 15.5% of sieve.** Worth doing later; not worth
+doing first. (A first 6-round sample read 11–14%; a later 8-round
+decomposition at `aa6c368` refined it to 15.5% — see
+`critical_path_findings.md`, which also explains WHY this lever pays
+while the larger card-barrier one does not.)
 
 *The gap.* `lower_bound`'s `DefK::AddOf` arm proves `k` stays positive
 only when the addend is a compile-time positive constant. Sieve's
@@ -113,16 +116,15 @@ still produced `count=1899`, and was measured on the clock and then
 deleted. Since sieve's other two checks are already proven away, the
 probe's delta is precisely this one loop's check.
 
-Interleaved A/B, alternating order, 8 rounds, **no overlap between the
-distributions** (guarded 45–49 µs, unguarded 40–41 µs):
+Interleaved A/B, alternating order, 8 rounds each, **no overlap between
+the distributions**. Two independent samples agree:
 
-| | mean | best-of |
-|---|---|---|
-| guards on | 47.4 µs | 45 µs |
-| guards removed | 40.6 µs | 40 µs |
-| **delta** | **14.2%** | **11.1%** |
+| sample | guards on | guards removed | delta |
+|---|---|---|---|
+| first (6 rounds) | 47.4 µs | 40.6 µs | 14.2% |
+| **refined (8 rounds, 4-arm decomposition)** | **48.4 µs** | **40.9 µs** | **15.5%** |
 
-*Why deferred.* 14% takes sieve from 2.66× behind Dart V1 to roughly
+*Why deferred.* ~15% takes sieve from 2.66× behind Dart V1 to roughly
 2.3× — it narrows the widest row without closing it, on the
 smallest-absolute-time bench in the suite. The sound version also cannot
 capture the whole unsound ceiling (the proof will not always succeed, and
@@ -131,8 +133,16 @@ and it is independent of the inliner arc — so it waits.
 
 *Acceptance criterion, fixed in advance.* Repeat exactly the A/B above
 against a sound implementation and require **≥8%** end-to-end on sieve
-(the unsound 11–14% is the ceiling; a sound pass capturing less than
-two-thirds of it is not worth the dependency machinery). Plus the R1
+(the unsound 15.5% is the ceiling; a sound pass capturing less than half
+of it is not worth the dependency machinery).
+
+*Why this one pays.* Not because it deletes instructions — it deletes
+only four. It pays because those four are a load → compare → conditional
+branch **gating the store**: the store cannot retire until the branch
+resolves and the branch waits on the array's size word. Removing twelve
+card-barrier instructions from the same loop is worth 0%, because they
+run after the store and nothing waits on them. Rank by critical-path
+position, not instruction count — `critical_path_findings.md`. Plus the R1
 tripwire below, whose negative case is the correctness case.
 
 *Negative findings, recorded so they are not re-run.*
