@@ -126,6 +126,50 @@ Two levers fall out, and they are ordered:
    costs no frame slot. Given the 158 spill ops above, remat-instead-of-
    spill is the high-value form of "more instructions, less memory".
 
+## The gated-feature matrix — nothing earns its gate (2026-08-05)
+
+Five optimizations sat gated OFF, each landed on the reasoning that it *ought*
+to pay: `MACVM_R4` (variable-stride bounds), `MACVM_UNROLL` (2x unroller),
+`MACVM_INLINE_POLY` (per-arm poly inlining), `MACVM_LFCSE` (local load
+forwarding), `MACVM_PEEP_IMM` (immediate peepholes). The open question was
+whether they COMPOUND — several sub-noise levers together clearing the bar.
+
+Measured across all seven benchmarks, 4 rounds, config order rotated each
+round, every value normalised against a baseline measured in the SAME round
+(negative = faster):
+
+| config | arith | fib | sieve | dict | alloc | richards | deltablue | MEAN |
+|---|---|---|---|---|---|---|---|---|
+| R4 | +1.7 | +0.5 | −0.4 | −3.8 | +0.2 | +0.5 | +0.0 | **−0.2** |
+| UNROLL | +1.6 | +0.2 | +1.5 | −2.1 | +1.3 | +1.0 | +3.3 | +1.0 |
+| INLINE_POLY | +1.7 | +0.5 | −0.0 | −0.4 | +1.2 | −2.4 | −0.7 | **−0.0** |
+| LFCSE | +2.1 | +0.8 | +2.3 | −0.4 | +1.3 | −0.0 | −0.0 | +0.9 |
+| PEEP_IMM | +2.5 | +0.8 | +4.4 | −0.7 | +5.1 | −0.8 | +0.9 | +1.8 |
+| R4+LFCSE | +2.5 | +1.0 | −0.1 | +2.2 | +1.3 | +0.1 | +2.2 | +1.3 |
+| **ALL FIVE** | +2.8 | +1.0 | −1.2 | +2.9 | +5.3 | −0.4 | −0.0 | **+1.5** |
+
+**Nothing compounds.** All five together is +1.5% — worse than baseline. The
+specific compounding hypothesis (R4 deletes the array size-word load, giving
+LFCSE something to forward) is falsified: R4+LFCSE is worse than either alone.
+
+**Read the uncertainty honestly.** Every config shows +1.5..+2.8% on `arith`,
+including ones that cannot touch it — so ~±2% of systematic bias survived even
+the rotation, and every row sits inside that band. The conclusion is NOT "these
+features are mildly harmful"; it is **"none is measurable, alone or in any
+combination tested."**
+
+Also: R4's isolated +3.1% on sieve did NOT reproduce here (−0.4%). The isolated
+A/B drove `sieveOnce` directly for 400 iterations; `benchSieve` runs it 4x per
+sample with different compile/OSR dynamics. Since R4 only wins in one compile of
+four, the +3.1% was driver-specific, not a general win.
+
+**A methodology note that cost a table.** The first run of this matrix measured
+each config's reps consecutively, baseline first, never re-measured. Every
+config came out 5–11% "worse" on arith — five independent features degrading one
+benchmark identically, which is drift, not signal. It looked entirely plausible.
+Uniform, unsurprising numbers deserve the same suspicion as spectacular ones;
+interleave and rotate, or do not report.
+
 ## Method note
 
 Both numbers come from deliberately **unsound** throwaway probes
