@@ -345,6 +345,70 @@ the stale "median of 6 ×10-rep batches" line is precisely what made the
 mismatch invisible. **Lesson, now standing: sanity-check any large
 movement against the unchanged rival's column before believing it.**
 
+## The 2026-08-05 close (commit `6bf9e93`)
+
+Same protocol as the re-measure above; load 1.63, machine in light use.
+
+| bench | MACVM ms | Cog ms | vs Cog | Dart V1 ms | vs Dart |
+|---|---|---|---|---|---|
+| arith | 1.406 | 5.117 | **MACVM 3.64×** | 0.808 | Dart 1.83× |
+| fib | 9.070 | 18.916 | **MACVM 2.09×** | 6.201 | Dart 1.47× |
+| sieve | 0.178 | 0.356 | **MACVM 2.00×** | 0.070 | Dart 2.57× |
+| dict | 0.263 | 1.020 | **MACVM 3.88×** | 0.224 | Dart 1.21× |
+| alloc | 0.589 | 0.714 | **MACVM 1.21×** | 0.354 | Dart 1.66× |
+| richards | 1.083 | 2.254 | **MACVM 2.08×** | 0.490 | Dart 2.19× |
+| **deltablue** | **0.139** | 0.281 | **MACVM 2.02×** | 0.240 | **MACVM 1.75×** |
+
+Beats Cog on all seven (1.21–3.88×); behind Dart V1 on six (1.21–2.57×) with
+deltablue an outright 1.75× win.
+
+**Read the day's ratio movements with suspicion.** Sieve's absolute number
+ranged 0.173–0.197 across today's runs from code-layout luck and session drift
+alone (`critical_path_findings.md`), so no single-run ratio should be compared
+against another session's. The only trustworthy evidence for a change is an
+INTERLEAVED before/after run.
+
+### What actually shipped: one fix, and it is a correctness fix
+
+`6bf9e93` — `known_smi_vregs` now proves a temp's entry-block `nil`-init dead
+ACROSS blocks, not only within one. Every user-declared Smalltalk temp had been
+poisoned by the decoder's nil-init, losing `s2_smi`, and so paying a
+write-through slot store on every write — including the loop-carried one in
+sieve's marking loop. Frontend-lowered `to:do:` counters were exempt and user
+temps were not, for no reason but where the assignment happened to sit.
+
+Measured twice, both interleaved: **−5.3% through the benchmark harness** and
+**−7.3% through a dedicated driver (8/8 rounds, no overlap)**, against sieve's
+±4.8% floor. Every other row stayed inside its own floor.
+
+It is worth less than the instruction count suggests, and that is the day's
+whole lesson restated: the M4 absorbs most of a store that is not on the
+critical path. The reason this one pays at all is that it is loop-carried.
+
+### What was removed, and what was learned
+
+−764 lines of compiler code: five gated-off optimizations (R4, UNROLL,
+INLINE_POLY, LFCSE, PEEP_IMM), none of which earned its gate individually or in
+any combination — plus 64-byte loop alignment, measured and rejected.
+
+The durable output is calibration rather than levers:
+
+- **Per-benchmark noise floors, measured for the first time** — arith ±0.1%,
+  fib ±0.4%, sieve ±4.8%, richards ±6.5%, dict ±13.4%. Quote the floor with any
+  delta. `dict` was never "randomly noisy"; it is layout-sensitive.
+- **Cost is critical-path position, not instruction count.** Removing 12
+  instructions (card barrier) bought 0%; removing 4 (bounds check) bought
+  15.5%.
+- **Three standing instruments** kept: `MACVM_CODE_PAD` (layout-noise sweep),
+  `MACVM_GUARD_COUNT` (W^X windows — warmup-only, confirmed), and a
+  range-reduce census that now names its method and flags OSR.
+- **GC is 0% on five of seven benchmarks**, so memory management explains
+  `alloc` and nothing else.
+- Four designs were derived from first principles — `ValueLoc::Reg`,
+  trap-block spilling, a residency redesign, eden sizing — and every one of
+  them was already built or already rejected. The actual defect was a `nil`
+  that three separate analyses each have to be taught to ignore.
+
 ## Part V — How the numbers were won (method, not luck)
 
 1. **Benchmark, don't estimate.** Interleaved A/B, load gate < 3,
