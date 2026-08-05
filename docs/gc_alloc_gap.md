@@ -163,3 +163,56 @@ never by the median protocol. The residual alloc-bench gap vs MACDART
 (~580 vs ~380 µs median) is now MUTATOR cost — the allocation loop's
 codegen and ivar writes — not collector time; it belongs to the
 codegen arcs.
+
+## Eden sizing measured and REJECTED; the lever is promotion, not nursery size
+
+*(2026-08-05, M4. Follows the W^X and code-layout work in
+`critical_path_findings.md`.)*
+
+**alloc is GC-frequency-bound — established.** Sweeping `MACVM_EDEN` against an
+isolated `benchAlloc` driver, alloc time tracks scavenge count almost exactly:
+
+| eden | alloc us | scavenges | scav ms | fulls | full ms |
+|---|---|---|---|---|---|
+| 4M | 3960 | 763 | 1105 | 145 | 575 |
+| 8M | 2550 | 381 | 537 | 105 | 413 |
+| 16M | 1304 | 190 | 252 | 20 | 85 |
+| **32M (default)** | **920** | **95** | **110** | **6** | **35** |
+| 64M | 722 | 47 | 67 | 2 | 15 |
+| 128M | 661 | 23 | 33 | 2 | 25 |
+
+The diagnostic detail is the **per-scavenge cost, which is constant**:
+1105/763 = 1.45 ms at 4M, 33/23 = 1.43 ms at 128M. Each scavenge costs the
+same regardless of nursery size, because what it copies is the LIVE SET, not
+the nursery. `benchAlloc` builds a linked list, so ~200k objects are live
+simultaneously (~8 MB) and get copied again and again until promoted (one
+scavenge promotes 5.7 MB, which is what drives the full GCs). GC is ~30% of
+the benchmark (145 ms of ~460 ms at the default).
+
+**But raising the default is REJECTED — it was benchmark overfitting.** Run
+across all seven instead of the isolated driver (3 rounds, mean):
+
+| bench | 128M vs 32M |
+|---|---|
+| arith | +0.0% |
+| fib | +0.2% |
+| sieve | −2.9% |
+| **dict** | **+20.4% WORSE** |
+| alloc | **−6.5%** (not −28%) |
+| richards | +0.6% |
+| **deltablue** | **+5.3% WORSE** |
+
+Two corrections fall out. First, alloc's gain shrinks from −28% to −6.5%: the
+isolated driver ran `benchAlloc` 500x back-to-back, maximising the pathological
+liveness, while the real harness does not. (Same error shape as R4's sieve-only
++3.1% that vanished on `benchSieve` — an isolated driver is not the benchmark.)
+Second, a bigger nursery is a bigger working set to walk, and `dict` — already
+our most cache-sensitive row — degrades 20.4%. Net across the suite it is
+clearly negative. **The 32 MB default stands.**
+
+**Where the real lever is.** Nursery size only defers the copying; the cost is
+that long-lived data is copied repeatedly before it promotes. The gap to Dart
+V1 on this row (1.66x) is therefore most plausibly in **promotion policy — when
+survivors stop being copied** — not in nursery geometry or in codegen. That is
+also the one direction on the whole board with ~30% of a benchmark behind it
+rather than ~3%.
