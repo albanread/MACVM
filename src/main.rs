@@ -143,6 +143,17 @@ fn cmd_run(args: &[String], debug: bool) {
     print_gc_bridge_stats(&vm);
     print_vm_stats(&vm);
     print_nm_map(&vm);
+    // MACVM_GUARD_COUNT=1: W^X write-window census. Run the same workload at
+    // two iteration counts — if the count scales with iterations, guards are a
+    // steady-state cost; if it plateaus, they are warmup-only.
+    if std::env::var_os("MACVM_GUARD_COUNT").is_some() {
+        use std::sync::atomic::Ordering::Relaxed;
+        eprintln!(
+            "wx-guards: {} write windows, {} icache bytes invalidated",
+            macvm::codecache::guard::GUARD_ACQUIRES.load(Relaxed),
+            macvm::codecache::guard::GUARD_ICACHE_BYTES.load(Relaxed),
+        );
+    }
     match result {
         Ok(()) => std::process::exit(vm.exit_code.unwrap_or(0)),
         Err(e) => {

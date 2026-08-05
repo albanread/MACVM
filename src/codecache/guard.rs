@@ -19,6 +19,13 @@ use smallvec::SmallVec;
 
 use crate::vendor::wfasm::native_macos::{icache_invalidate, jit_write_protect};
 
+/// `MACVM_GUARD_COUNT=1`: how many W^X write windows were opened, and how many
+/// icache bytes were invalidated. The question this answers is whether guards
+/// are a WARMUP-only cost (compile + IC settle) or a steady-state one: run the
+/// same workload at two iteration counts and see whether the count scales.
+pub static GUARD_ACQUIRES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static GUARD_ICACHE_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 thread_local! {
     /// P3: the write-protect toggle is per-thread, and nesting a second
     /// guard on the same thread would have the inner `Drop` flip back to
@@ -48,6 +55,7 @@ impl JitWriteGuard {
             );
             d.set(depth + 1);
         });
+        GUARD_ACQUIRES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         jit_write_protect(false);
         JitWriteGuard {
             ranges: SmallVec::new(),
@@ -73,6 +81,10 @@ impl Drop for JitWriteGuard {
         // Exec mode first (P9), so a concurrent fetch on another core never
         // observes writable-but-stale-icache pages as executable.
         jit_write_protect(true);
+        GUARD_ICACHE_BYTES.fetch_add(
+            self.ranges.iter().map(|(_, l)| *l as u64).sum::<u64>(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         for &(start, len) in &self.ranges {
             icache_invalidate(start as *const u8, len);
         }
