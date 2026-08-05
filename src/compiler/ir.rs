@@ -173,7 +173,7 @@ pub struct PoolEntry {
 /// translation rows or D5.3's emit table either) are defined here for the
 /// C+D-phase enum shape but never *constructed* by S10's `convert` —
 /// they're S11's to emit.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Ir {
     ConstSmi {
         dst: VReg,
@@ -733,6 +733,7 @@ impl Ir {
     }
 }
 
+#[derive(Clone)]
 pub struct IrBlock {
     pub id: BlockId,
     /// First bytecode index this block covers — a `PcDesc` seed. The one
@@ -10289,6 +10290,239 @@ fn rewrite_uses(op: &mut Ir, from: u32, to: VReg) {
 /// Deliberately NOT handled in R1 (each needs more than this structural
 /// argument): `Sub` (underflow needs a LOWER bound), `a + a` (ditto),
 /// `Mul`, bounds derived from non-const vregs, cross-block scopes.
+// ── 2x loop unrolling (docs/unroll_design.md) ───────────────────────────────
+//
+// Measured first: hand-unrolling sieve's marking loop 2x is worth ~10%, and a
+// SERIAL unroll (second index waiting on the first induction update) captures
+// all of it — so this pass needs no induction analysis, no strength reduction
+// and no stride proof. It duplicates the body; the win is amortising the
+// loop-carried overhead (back-branch, `Poll`, induction update + its overflow
+// check, and the induction variable's per-iteration spill).
+//
+// Shape produced, for header H (the condition test) and latch L:
+//
+//      H  : if !cond goto exit          H  : if !cond goto exit
+//      body                             body
+//      L  : goto H            ==>       L  : goto H'
+//                                       H' : if !cond goto exit   (clone of H)
+//                                       body'
+//                                       L' : goto H
+//
+// The condition is re-tested in H' — chaining the bodies unconditionally would
+// run one iteration too many. OSR still enters at the original H, which remains
+// a legal iteration boundary (and originals precede clones, so the
+// first-match block lookups in driver.rs/ir.rs keep selecting them).
+//
+// vregs are deliberately NOT renamed. Both copies write the same slot vregs,
+// which is exactly what consecutive iterations of the original loop did, and
+// it keeps `VReg(0)`/`VReg(1..=argc+ntemps)` — hardcoded in
+// `driver::build_deopt_metadata` — untouched. It also makes SHARING the
+// region's trap blocks between the two copies sound: an unrenamed vreg has one
+// live interval and therefore one physical assignment, so the single trap
+// site's `resolve_frame_loc` answer is valid from both copies.
+
+/// Rewrite every block target in `ir` through `f`.
+fn map_block_targets(ir: &mut Ir, f: &impl Fn(BlockId) -> BlockId) {
+    match ir {
+        Ir::Jump { target } => *target = f(*target),
+        Ir::BoolBr { if_true, if_false, not_bool, .. } => {
+            *if_true = f(*if_true);
+            *if_false = f(*if_false);
+            *not_bool = f(*not_bool);
+        }
+        Ir::SmiCmpBr { if_true, if_false, fail, .. } => {
+            *if_true = f(*if_true);
+            *if_false = f(*if_false);
+            *fail = f(*fail);
+        }
+        Ir::FCmpBr { if_true, if_false, .. } | Ir::RefCmpBr { if_true, if_false, .. } => {
+            *if_true = f(*if_true);
+            *if_false = f(*if_false);
+        }
+        Ir::SmiArith { fail, .. }
+        | Ir::SmiCmpVal { fail, .. }
+        | Ir::ArrayAt { fail, .. }
+        | Ir::ArrayAtPut { fail, .. }
+        | Ir::ByteAt { fail, .. }
+        | Ir::ByteAtPut { fail, .. }
+        | Ir::SmiShift { fail, .. }
+        | Ir::FUnbox { fail, .. }
+        | Ir::BoolNot { fail, .. }
+        | Ir::VecArith { fail, .. }
+        | Ir::GuardKlass { fail, .. }
+        | Ir::GuardKlassIn { fail, .. } => *fail = f(*fail),
+        _ => {}
+    }
+}
+
+/// Ops this v1 refuses to duplicate: they drag in inline caches, the allocator
+/// and their safepoint/deopt interactions. Keeping them out makes the first
+/// version a pure control-flow transform.
+fn unroll_blocked_op(ir: &Ir) -> bool {
+    matches!(
+        ir,
+        Ir::CallSend { .. } | Ir::CallRuntime { .. } | Ir::Alloc { .. } | Ir::UncommonTrap { .. }
+    )
+}
+
+/// Max blocks in one unrolled region — a compile-time guard, not a tuning knob.
+const UNROLL_REGION_MAX: usize = 24;
+
+/// `MACVM_UNROLL=1` — the gate. Default OFF (see `docs/unroll_design.md`).
+pub(crate) fn unroll_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("MACVM_UNROLL").is_some_and(|v| v == "1"))
+}
+
+/// `MACVM_UNROLL_COUNT=1` — report fires, so a flat A/B can be told apart from
+/// a pass that never fired.
+pub(crate) fn unroll_census() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("MACVM_UNROLL_COUNT").is_some())
+}
+
+/// `MACVM_UNROLL=1`: 2x-unroll innermost loops. Returns the number unrolled.
+/// Default OFF until the A/B clears the bar in `docs/unroll_design.md`.
+pub(crate) fn unroll_2x(m: &mut IrMethod) -> u32 {
+    // OSR compiles enter mid-loop at a bci-selected header; leave them alone.
+    if m.is_osr {
+        return 0;
+    }
+    let mut done = 0u32;
+    // Back-edge candidates from ONE initial scan: a block whose last op jumps
+    // to a lower-numbered block. Clones are appended and only L/L' are
+    // patched, so earlier candidates stay valid as we go.
+    let cands: Vec<(usize, usize)> = m
+        .blocks
+        .iter()
+        .enumerate()
+        .filter_map(|(li, b)| match b.code.last() {
+            Some(Ir::Jump { target }) if (target.0 as usize) < li => Some((target.0 as usize, li)),
+            _ => None,
+        })
+        .collect();
+    for (h, l) in cands {
+        if unroll_one(m, h, l) {
+            done += 1;
+        }
+    }
+    done
+}
+
+fn unroll_one(m: &mut IrMethod, h: usize, l: usize) -> bool {
+    let n = m.blocks.len();
+    if h >= n || l >= n {
+        return false;
+    }
+    // The header must end in a two-way test — otherwise there is no condition
+    // to re-check in the clone and unrolling would change trip count.
+    let header_tests = m.blocks[h]
+        .code
+        .iter()
+        .any(|ir| matches!(ir, Ir::SmiCmpBr { .. } | Ir::BoolBr { .. }));
+    if !header_tests {
+        return false;
+    }
+
+    let succ: Vec<Vec<usize>> = m
+        .blocks
+        .iter()
+        .map(|b| {
+            crate::compiler::regalloc::successors(b)
+                .into_iter()
+                .map(|t| t.0 as usize)
+                .filter(|&t| t < n)
+                .collect()
+        })
+        .collect();
+    let mut preds: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (i, ss) in succ.iter().enumerate() {
+        for &t in ss {
+            preds[t].push(i);
+        }
+    }
+    let reach = |start: usize, edges: &Vec<Vec<usize>>| -> Vec<bool> {
+        let mut seen = vec![false; n];
+        let mut stack = vec![start];
+        seen[start] = true;
+        while let Some(b) = stack.pop() {
+            for &t in &edges[b] {
+                if !seen[t] {
+                    seen[t] = true;
+                    stack.push(t);
+                }
+            }
+        }
+        seen
+    };
+    // The natural loop body: reachable from the header AND able to reach the
+    // latch. Trap blocks fall out (they cannot reach L) and are SHARED by both
+    // copies — sound because vregs are not renamed.
+    let fwd = reach(h, &succ);
+    let bwd = reach(l, &preds);
+    let region: Vec<usize> = (0..n).filter(|&i| fwd[i] && bwd[i]).collect();
+    if !region.contains(&h) || !region.contains(&l) || region.len() > UNROLL_REGION_MAX {
+        return false;
+    }
+    // Innermost only: no other back-edge inside the region.
+    for &r in &region {
+        if r == l {
+            continue;
+        }
+        if let Some(Ir::Jump { target }) = m.blocks[r].code.last() {
+            if (target.0 as usize) < r && region.contains(&(target.0 as usize)) {
+                return false;
+            }
+        }
+    }
+    // v1 refuses sends/allocation/traps inside the duplicated region.
+    if region
+        .iter()
+        .any(|&r| m.blocks[r].code.iter().any(unroll_blocked_op))
+    {
+        return false;
+    }
+
+    // Clone, appending so `blocks[i].id == BlockId(i)` holds and every copy
+    // lands after every original.
+    let mut map: HashMap<usize, BlockId> = HashMap::with_capacity(region.len());
+    for (k, &r) in region.iter().enumerate() {
+        map.insert(r, BlockId((n + k) as u32));
+    }
+    let remap = |t: BlockId| -> BlockId {
+        *map.get(&(t.0 as usize)).unwrap_or(&t)
+    };
+    for &r in &region {
+        let mut nb = m.blocks[r].clone();
+        nb.id = map[&r];
+        for ir in &mut nb.code {
+            map_block_targets(ir, &remap);
+        }
+        debug_assert!(
+            nb.deopt_sites.iter().all(|(ci, _)| (*ci as usize) < nb.code.len()),
+            "unroll: cloned deopt_site index out of range"
+        );
+        m.blocks.push(nb);
+    }
+
+    // Close the chain: original latch -> cloned header; cloned latch -> original
+    // header. The clone's back-edge was remapped to the cloned header above, so
+    // it is patched back here.
+    let h_clone = map[&h];
+    if let Some(Ir::Jump { target }) = m.blocks[l].code.last_mut() {
+        *target = h_clone;
+    }
+    let l_clone = map[&l].0 as usize;
+    if let Some(Ir::Jump { target }) = m.blocks[l_clone].code.last_mut() {
+        *target = BlockId(h as u32);
+    }
+    debug_assert!(
+        m.blocks.iter().enumerate().all(|(i, b)| b.id.0 as usize == i),
+        "unroll: blocks[i].id == BlockId(i) invariant broken"
+    );
+    true
+}
+
 pub(crate) fn range_reduce(m: &mut IrMethod, array_meta: Option<crate::oops::wrappers::KlassOop>) {
     use std::collections::HashMap;
     let entry_blk = match m.blocks.first() {
@@ -12086,6 +12320,15 @@ pub fn convert(
     // knowledge, dep-protected against redefinition.
     let array_meta = crate::oops::wrappers::MemOop::try_from(vm.universe.array_klass.oop())
         .map(|mo| mo.klass());
+    // MACVM_UNROLL=1: 2x-unroll innermost loops (docs/unroll_design.md).
+    // DEFAULT OFF. Runs BEFORE range_reduce so the cloned body gets the same
+    // bounds/overflow proofs the original does.
+    if unroll_enabled() {
+        let n = unroll_2x(&mut irm);
+        if n > 0 && unroll_census() {
+            eprintln!("[unroll] {n} loop(s) unrolled 2x ({} blocks now)", irm.blocks.len());
+        }
+    }
     range_reduce(&mut irm, array_meta);
     if crate::compiler::regalloc::fuse_cmp_br() {
         fuse_ref_cmp_br(&mut irm);

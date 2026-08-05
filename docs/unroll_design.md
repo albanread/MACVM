@@ -133,6 +133,58 @@ source-level ceiling is ~10%; a compiler pass that captures less than
 two-thirds of a hand-written transform is not worth carrying. Below the bar
 the pass stays gated off and this document records why.
 
+## RESULT: built, correct, +1.3% — BELOW the bar, stays gated OFF
+
+Landed and measured 2026-08-05. The pass fires (`[unroll] 2 loop(s) unrolled
+2x`), is correct under every gate — 829 lib tests green with `MACVM_UNROLL=1`,
+and `count=1899` under plain / `GC_STRESS=1` / `DEOPT_STRESS=64` — and the
+interleaved 8-round A/B says:
+
+| | mean |
+|---|---|
+| gate OFF | 47.6 µs |
+| gate ON | 47.0 µs |
+| **delta** | **+1.3%** |
+
+The bar fixed in advance was ≥6%. **It stays gated off.**
+
+### Why it missed — my design premise was wrong
+
+The pass emits `H(test) → body → L → H'(test) → body' → L' → H`: **two
+condition tests per two stores**, exactly as before. All it removes is one
+unconditional back-branch per two iterations, which is worth ~1%.
+
+The source-level 2× that measured ~10% did something different: it tested
+`k <= size - prime` **once per two stores** and left a tail loop for the
+remainder. The win was never body duplication — it was halving the
+*condition test and the safepoint `Poll`*.
+
+I concluded "no induction analysis needed" from the serial-vs-independent
+experiment. That experiment ruled out **index** strength reduction (computing
+the second index off one `k` rather than serially). It said nothing about
+**guard** restructuring, which is where the win actually lives — and that
+does need the induction variable and its stride, to strengthen the header
+test to `k <= bound - stride` and emit a tail loop.
+
+So the honest cost of the real win is materially higher than this pass:
+induction-variable recognition, a strengthened guard, a cloned tail loop, and
+the overflow reasoning for `bound - stride`. That is a range-analysis-shaped
+slice, and it overlaps heavily with R4 in `range_analysis_design.md` — which
+is measured at 15.5% on the same loop. **If either gets built, build R4
+first**: it is worth more and the induction machinery it needs is the same
+machinery this would need.
+
+### What was kept
+
+The pass itself is retained, gated off, because it is the repo's first
+IR-level block cloner and a v2 would extend rather than replace it: region
+discovery (natural loop body via forward∩backward reachability), append-only
+cloning with the `blocks[i].id == BlockId(i)` invariant asserted, target
+remapping over every branch form, and the shared-trap-block argument. One
+pre-existing test premise was corrected en route —
+`loop_poll_records_loop_poll_deopt_scope` asserted *exactly one* LoopPoll for
+one back-edge, which is only true when nothing duplicates the latch.
+
 ## Risks, ranked
 
 1. **Silent wrong-frame deopt** from cloned-but-unre-keyed `deopt_sites`.
