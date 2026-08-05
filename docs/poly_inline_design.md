@@ -89,4 +89,28 @@ metadata), and both A/B directions per P-D1.
 
 ## 5. Measurement log
 
-*(P0 baseline first; every A/B recorded, rejections included.)*
+### P0 + P1 landed 2026-08-05 — gate stays OFF (P-D1 applied as written)
+
+P0: `poly_inline_enabled()` (`MACVM_INLINE_POLY=1`, read-once) — gate-off
+world-test output is byte-identical to pre-P1 (a true no-op). P1:
+`InlineDecision::PerArmPoly` (2 arms, different targets, every arm a
+send-free leaf within budget, no smi case, evidence floors) + the
+lowering: the DominantWithSlowPath shape with one minted middle block —
+current block guards arm 0 (fail → arm 1's block), arm 1 guards its
+klass (fail → the shared rejoining slow send), all three routes Move
+into one shared dst. `MACVM_TRACE=perarm` prints each fired site so a
+flat A/B is distinguishable from a dead gate.
+
+Gate-on gates: differential byte-identical (6200/0), both GC-stress
+modes green.
+
+**Coverage census (the actual finding):** the leaf-only 2-arm shape
+fires on exactly 2 sites (`#isNil`) on the classic bench, 2 on the
+library composite, and **zero on richards** — whose poly targets
+(`processWork:`/`runTask` ×4) are 4-arm *branchy* bodies, not leaves.
+A/B: classic-bench warm total 12293 vs 12237 µs (0.5%, inside noise).
+Verdict per P-D1: **default stays off**; the machinery is correct and
+waiting. P2 (3–4 arms + CFG-eligible arm bodies, per-arm inline protos)
+is the slice with real coverage of the richards shape — and the first
+one where the Mandelbrot fusion-decay canary genuinely matters, since
+CFG arms contain sends.

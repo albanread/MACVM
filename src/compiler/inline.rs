@@ -286,6 +286,13 @@ pub enum InlineDecision {
     /// the mono-Symbol speculation did (v0's bci-47 storm), and an unseen
     /// klass or coercing argument is merely slow, never wrong.
     PolyCmpFuse { legs: Vec<PolyCmpLeg> },
+    /// P1 (docs/poly_inline_design.md, gated by `MACVM_INLINE_POLY` per
+    /// P-D1): a 2-arm poly site whose arms resolve to DIFFERENT methods,
+    /// each a send-free leaf — every arm gets its own guarded splice in a
+    /// hottest-first chain, and the chain's final miss edge is the same
+    /// real rejoining send `DominantWithSlowPath` carries (never a trap).
+    /// Arms arrive count-descending (the PIC's own order).
+    PerArmPoly { arms: Vec<(KlassOop, MethodOop)> },
     /// A real compiled send (S11 compiled IC): `Mono`/`Poly`/`Mega` sites all
     /// map here in step 3 (inlining them is later steps).
     Call,
@@ -390,6 +397,14 @@ pub fn decide(feedback: &SiteFeedback) -> InlineDecision {
 /// `smi_klass_bits`, not a `KlassOop`: this runs inside `compiler::inline`,
 /// which (like `feedback.rs`) works in raw oops for the whole no-GC compile
 /// window — the caller (`convert`) passes `vm.universe.smi_klass.oop().raw()`.
+/// P0 (docs/poly_inline_design.md P-D1): per-arm poly inlining is OFF by
+/// default — `MACVM_INLINE_POLY=1` opts in. Read once; the A/B harness
+/// flips it per run, and only a reproduced win may change this default.
+pub fn poly_inline_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("MACVM_INLINE_POLY").is_some_and(|v| v == "1"))
+}
+
 pub fn decide_with_budget(
     feedback: &SiteFeedback,
     budget: &InlineBudget,
@@ -488,6 +503,30 @@ pub fn decide_with_budget(
                 return InlineDecision::SameTargetPoly {
                     klasses: cases.iter().map(|c| c.klass).collect(),
                     callee: dedup.method,
+                };
+            }
+
+            // P1 (gated, P-D1): every arm its own guarded leaf splice.
+            // Checked after same-target (one body beats N copies of it) and
+            // before poly-cmp/dominance (a full per-arm chain serves every
+            // arm fast; dominance would slow-send the minority). Two arms in
+            // this slice; send-free leaves only, so no in-arm safepoints, no
+            // inline protos, no fusion-decay surface. Every arm must carry
+            // real evidence (a 0-count tail arm reads as drift, not signal).
+            if poly_inline_enabled()
+                && cases.len() == 2
+                && no_smi_case
+                && total >= DOMINANT_MIN_SAMPLES
+                && cases.iter().all(|c| {
+                    c.count.unwrap_or(0) > 0
+                        && c.method.primitive() == 0
+                        && inline_cost(c.method) <= budget.per_call_cost
+                        && is_leaf(c.method)
+                })
+                && cases[0].method.oop().raw() != cases[1].method.oop().raw()
+            {
+                return InlineDecision::PerArmPoly {
+                    arms: cases.iter().map(|c| (c.klass, c.method)).collect(),
                 };
             }
 
