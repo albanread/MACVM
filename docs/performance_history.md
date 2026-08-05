@@ -381,8 +381,12 @@ movement against the unchanged rival's column before believing it.**
 ## What remains (ranked, from the standing docs)
 
 - **sieve 2.66× vs Dart** — now the widest row (it regressed slightly
-  while the others closed): array inner loops. LoadField loops are
-  inliner+residency territory.
+  while the others closed): array inner loops. Its one unproven bounds
+  check (the variable-stride marking loop) has a **measured** ceiling of
+  **11–14%**, taken with an unsound remove-all-checks probe on the clock,
+  not from an instruction count — see `range_analysis_design.md` R4.
+  Worth doing later: 14% moves the row to ~2.3×, narrowing the gap
+  without closing it. LoadField loops remain inliner+residency territory.
 - **richards 2.18× vs Dart** — was the widest at 3.36×; the Z-arc and
   F1–F3 waves took a third off it. Activation cost smeared over
   polymorphic sends. I4 (recursion depth 1) and invocation-count ranking

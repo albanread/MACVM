@@ -68,6 +68,84 @@ is heap corruption, not a wrong answer).
 (arith + sieve named movers in advance); `MACVM_F3C_COUNT=1` re-run
 recorded in `f3c_census_findings.md` as the residency-door re-check.
 
+**R4 — variable-stride lower bound. DEFERRED, but the ceiling is now
+MEASURED (2026-08-05, at `682a876`): 11–14% of sieve.** Worth doing
+later; not worth doing first.
+
+*The gap.* `lower_bound`'s `DefK::AddOf` arm proves `k` stays positive
+only when the addend is a compile-time positive constant. Sieve's
+marking loop —
+
+```smalltalk
+k := i + prime.
+[ k <= size ] whileTrue: [ flags at: k put: false. k := k + prime ]
+```
+
+— strides by `prime`, a temp, so the proof fails and the store keeps its
+check. The other two loops in the same method (`1 to: size do:` init and
+scan) are both proven, which is exactly what the counter reports:
+
+```
+range-reduce: 1 overflow + 2 bounds checks deleted   # 3 array loops, 2 proven
+```
+
+The proposed relaxation is small: accept an addend that is *provably
+positive* (const OR itself lower-bounded `>= 1`) rather than only a
+constant.
+
+*The measured ceiling — and how it was NOT measured.* The first estimate
+came from a synthetic 15000-store microloop and claimed 37–43%. That is
+wrong, and the way it was wrong is the point: at sieve's scale a clean
+guarded-vs-proven pair could not be reproduced above noise (deltas of
+±9 µs on a ~20 µs loop, and one variant showed the *variable*-stride arm
+faster). Estimating instead from instruction counts — "the guard is 10
+of 13 instructions, so it must be ~77% of the store cost" — is the trap
+this repo already has a receipt for: **−21% instructions once bought
+−0.35%, ~60:1**. A predicted compare-and-branch on a wide out-of-order
+M-series core retires in spare issue slots; added stores are memory
+traffic. They are not interchangeable, and neither substitutes for a
+clock.
+
+What was actually done: a throwaway, deliberately UNSOUND probe
+(`MACVM_UNSAFE_NOBOUNDS=1`) that force-rewrote every `ArrayAt`/
+`ArrayAtPut` to its existing `…NC` form regardless of proof, verified it
+still produced `count=1899`, and was measured on the clock and then
+deleted. Since sieve's other two checks are already proven away, the
+probe's delta is precisely this one loop's check.
+
+Interleaved A/B, alternating order, 8 rounds, **no overlap between the
+distributions** (guarded 45–49 µs, unguarded 40–41 µs):
+
+| | mean | best-of |
+|---|---|---|
+| guards on | 47.4 µs | 45 µs |
+| guards removed | 40.6 µs | 40 µs |
+| **delta** | **14.2%** | **11.1%** |
+
+*Why deferred.* 14% takes sieve from 2.66× behind Dart V1 to roughly
+2.3× — it narrows the widest row without closing it, on the
+smallest-absolute-time bench in the suite. The sound version also cannot
+capture the whole unsound ceiling (the proof will not always succeed, and
+it carries recompile-dependency machinery). It is real, it is bounded,
+and it is independent of the inliner arc — so it waits.
+
+*Acceptance criterion, fixed in advance.* Repeat exactly the A/B above
+against a sound implementation and require **≥8%** end-to-end on sieve
+(the unsound 11–14% is the ceiling; a sound pass capturing less than
+two-thirds of it is not worth the dependency machinery). Plus the R1
+tripwire below, whose negative case is the correctness case.
+
+*Negative findings, recorded so they are not re-run.*
+- `k to: size by: prime do: [...]` marks the identical index set but is
+  **4× slower** (218 µs vs 50 µs) and deletes **zero** checks — a
+  variable `by:` is not lowered to a counted loop at all. Rewriting
+  Smalltalk source into this shape is a pessimisation, not a fix.
+- With the array arriving as an *argument*, no loop form proves anything
+  (its length cannot be related to the bound). Provability needs the
+  array's own `Alloc` in the method, as R2 says.
+- A constant-stride `whileTrue:` over a local array *does* prove after
+  recompile, so the loop form is not the blocker here — the stride is.
+
 ## Gates (every rung)
 
 Full lib suite; it_tier1 loop/OSR/deopt suites; 4-mode release world
