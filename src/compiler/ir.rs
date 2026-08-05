@@ -10462,21 +10462,70 @@ pub(crate) fn known_smi_vregs(m: &IrMethod) -> HashSet<u32> {
     // this is analysis only). Conservative everywhere else: a nil init
     // whose block ends before a redefinition keeps its poison (some later
     // block may legitimately read the nil).
-    let locally_dead = |b: &IrBlock, at: usize, v: u32| -> bool {
-        for op in &b.code[at + 1..] {
+    // Walk one block's code from `at` and report the FIRST thing that happens
+    // to `v`: a read (the nil is observable), a redefinition (it is not), or
+    // neither (the answer lies in this block's successors).
+    enum Ev {
+        Used,
+        Redefined,
+        Neither,
+    }
+    let scan = |b: &IrBlock, at: usize, v: u32| -> Ev {
+        for op in &b.code[at..] {
             let mut used = false;
             op.uses(|u| used |= u.0 == v);
             if used {
-                return false;
+                return Ev::Used;
             }
             let mut redefined = false;
             op.defs(|d| redefined |= d.0 == v);
             if redefined {
-                return true;
+                return Ev::Redefined;
             }
         }
-        false
+        Ev::Neither
     };
+    // Is the value written at `b.code[at]` dead — i.e. is there NO path from
+    // just after it to a read of `v` that does not first pass a redefinition?
+    //
+    // The intra-block case alone (the original rule) leaves every USER-DECLARED
+    // temp poisoned: the decoder nil-initialises them in the entry block, while
+    // the real assignment lives in whatever block the source put it in. That is
+    // why sieve's `k` (`| prime k |`, assigned inside the scan loop) failed
+    // `known_smi` while the frontend-lowered `to:do:` counters passed — same
+    // arithmetic, different birthplace. So follow successors too.
+    //
+    // Conservative in both directions that matter: any reachable read means
+    // live, and running out of budget means live.
+    let dead_on_every_path = |b0: &IrBlock, at: usize, v: u32| -> bool {
+        match scan(b0, at + 1, v) {
+            Ev::Used => return false,
+            Ev::Redefined => return true,
+            Ev::Neither => {}
+        }
+        let mut seen: HashSet<u32> = HashSet::new();
+        let mut work: Vec<BlockId> = crate::compiler::regalloc::successors(b0);
+        let mut budget = 256usize;
+        while let Some(bid) = work.pop() {
+            if budget == 0 {
+                return false; // out of budget: assume live
+            }
+            budget -= 1;
+            if !seen.insert(bid.0) {
+                continue;
+            }
+            let Some(nb) = m.blocks.get(bid.0 as usize) else {
+                return false;
+            };
+            match scan(nb, 0, v) {
+                Ev::Used => return false,
+                Ev::Redefined => continue, // this path is covered
+                Ev::Neither => work.extend(crate::compiler::regalloc::successors(nb)),
+            }
+        }
+        true
+    };
+    let locally_dead = |b: &IrBlock, at: usize, v: u32| -> bool { dead_on_every_path(b, at, v) };
     for b in &m.blocks {
         for (i, op) in b.code.iter().enumerate() {
             match op {
