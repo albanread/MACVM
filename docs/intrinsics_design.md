@@ -310,3 +310,29 @@ once, after every read of the sources.
 Gates: differential byte-identical (6200/0), GC-stress 1 + full:64 green.
 A/B: Random generation 10 -> 6-7 ms (the Lehmer step's LargeInteger
 normalization shifts), library third-pass total 67-69 -> 64-65 ms.
+
+### Z4a — customized-`self basicNew` (landed 2026-08-05)
+
+The `gc_alloc_gap.md` extension, first half: `alloc_site_klass` now
+accepts a receiver that is the compilation's own customized `self` when
+the customization klass is a metaclass, resolving the class-to-allocate
+as the metaclass's SOLE global instance (`metaclass_sole_instance` — a
+compile-time scan of the global namespace; ambiguity or anonymity
+declines). Because customization pins `klass(self)` but not `self`
+itself, the fused `Alloc` is fronted by the new `GuardShape::ValueTest` —
+a 3-instruction identity compare against the class pool literal, which
+also doubles as redefinition protection (a redefined class is a new
+object; the compare fails into the standard reexecute trap).
+
+Gates: differential byte-identical (6200/0), stress 1 + full:64 green,
+cargo test --release green.
+
+A/B: Fraction arithmetic 6-7 -> **2 ms** (its constructors' `self
+basicNew` now bump-allocates inline), library third-pass total 64-65 ->
+**56 ms** (pre-arc: 96-100 — the arc so far is ~1.7x on this composite).
+The classic `alloc` bench did NOT move: its constructors are small enough
+to be INLINED into callers, and inside spliced bodies the `_on` twin
+gates still require a literal class receiver — the deferred-twins
+follow-up (Z1.1/Z2/Z4 `_on` parity, one pass over the three splice
+sites) is where that win lives. dict/deltablue spot numbers were within
+noise of the morning baseline under ambient desktop load.

@@ -148,6 +148,15 @@ pub enum GuardShape {
     /// reject-smi, load the klass word, compare against the expected klass
     /// literal, `b.ne cold` — the receiver must be a heap oop of that klass.
     KlassTest,
+    /// Z4: compare the receiver's VALUE against the expected pool literal
+    /// (`ldr` literal; `cmp`; `b.ne cold`) — identity, not klass. Used by
+    /// the customized-`self basicNew` alloc fuse, where the customization
+    /// pins `klass(self)` but only the sole-instance argument pins `self`
+    /// itself; the guard closes the residual hole (a metaclass acquiring a
+    /// second instance) and doubles as redefinition protection — a
+    /// redefined class is a NEW object, so the compare fails and the send
+    /// re-executes interpreted.
+    ValueTest,
 }
 
 /// One compiler-stage literal-pool entry (D2) — `emit.rs` walks these at
@@ -2350,8 +2359,45 @@ impl<'a> Translator<'a> {
         Some((klass, size_words as u32))
     }
 
-    fn alloc_site_klass(&self, ic_idx: u16, receiver: VReg) -> Option<(KlassOop, u32)> {
-        let klass = *self.const_class.get(&receiver.0)?;
+    /// Z4 (docs/intrinsics_design.md): the sole instance of a metaclass —
+    /// the class C with `C klass == m` — found by scanning the global
+    /// namespace (compile-time only; ~155 entries). `None` unless exactly
+    /// ONE global class matches: anonymity or ambiguity declines the fuse
+    /// rather than guessing. For a non-metaclass `m` (an ordinary
+    /// instance-side customization) no global class can match, so the scan
+    /// doubles as the is-this-a-metaclass test.
+    fn metaclass_sole_instance(&self, m: KlassOop) -> Option<KlassOop> {
+        let arr =
+            crate::oops::wrappers::ArrayOop::try_from(self.vm.universe.smalltalk)?;
+        let mut found: Option<KlassOop> = None;
+        for i in 1..arr.len() {
+            let Some(assoc) = crate::oops::wrappers::MemOop::try_from(arr.at(i)) else {
+                continue;
+            };
+            if let Some(c) = KlassOop::try_from(assoc.body_oop(1)) {
+                if c.klass() == m {
+                    if found.is_some() {
+                        return None;
+                    }
+                    found = Some(c);
+                }
+            }
+        }
+        found
+    }
+
+    /// Third tuple slot: `true` when the klass came from the customized
+    /// `self` of a class-side method rather than a literal class constant —
+    /// the caller must front the `Alloc` with a `GuardShape::ValueTest` on
+    /// the receiver (see `metaclass_sole_instance`'s residual hole).
+    fn alloc_site_klass(&self, ic_idx: u16, receiver: VReg) -> Option<(KlassOop, u32, bool)> {
+        let (klass, from_self) = match self.const_class.get(&receiver.0) {
+            Some(k) => (*k, false),
+            None if receiver == self.self_vreg => {
+                (self.metaclass_sole_instance(self.rcvr_klass)?, true)
+            }
+            None => return None,
+        };
         let ic = InterpreterIc::at(self.method, ic_idx);
         if ic.argc() != 0 {
             return None;
@@ -2371,7 +2417,7 @@ impl<'a> Translator<'a> {
         {
             return None;
         }
-        Some((klass, size_words as u32))
+        Some((klass, size_words as u32, from_self))
     }
 
     /// S14 step 4b: splice a **single-block straight-line leaf** callee inline.
@@ -5600,15 +5646,47 @@ impl<'a> Translator<'a> {
                 // ever consults `const_class`, so a non-zero-argc send whose
                 // top-of-stack is an arg simply returns `None` here.
                 if let Some(receiver) = stack.last().copied() {
-                    if let Some((klass, size_words)) = self.alloc_site_klass(ic, receiver) {
+                    if let Some((klass, size_words, from_self)) = self.alloc_site_klass(ic, receiver) {
                         // S13 step 3b: an `Alloc` deopts by RE-EXECUTING the
                         // `basicNew` send in the interpreter (reexecute=true),
                         // so its recorded stack must still carry the receiver
                         // (the class const) that the send consumes — capture
                         // BEFORE the pop below.
                         let deopt_stack = stack.clone();
-                        stack.pop(); // consume the receiver
                         let klass_lit = self.pool.intern(klass.oop().raw(), Some(RelocKind::Oop));
+                        // Z4: a customized-self site pins klass(self), not
+                        // self itself — front the Alloc with an identity
+                        // guard on the receiver (fail = reexecute trap, the
+                        // standard shape). Covers the metaclass-second-
+                        // instance hole AND class redefinition (a redefined
+                        // class is a new object).
+                        if from_self {
+                            let fail_id = self.fresh_block_id();
+                            self.finish_block(IrBlock {
+                                id: fail_id,
+                                bci,
+                                code: vec![Ir::UncommonTrap { bci }],
+                                entry_stack: Vec::new(),
+                                deopt_sites: vec![(
+                                    0,
+                                    DeoptRaw {
+                                        stack: deopt_stack.clone(),
+                                        bci,
+                                        kind: SafepointKind::UncommonTrap,
+                                        reexecute: true,
+                                        stack_closures: Vec::new(),
+                                        inline: None,
+                                    },
+                                )],
+                            });
+                            code.push(Ir::GuardKlass {
+                                obj: receiver,
+                                expect: klass_lit,
+                                fail: fail_id,
+                                kind: GuardShape::ValueTest,
+                            });
+                        }
+                        stack.pop(); // consume the receiver
                         let dst = self.fresh(true);
                         deopt.push((
                             code.len() as u32,

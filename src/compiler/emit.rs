@@ -1999,6 +1999,15 @@ impl<'a> Emitter<'a> {
                 self.asm.emit("cmp", &[x(17), x(16)]);
                 self.asm.b_cond(Cond::Ne, cold);
             }
+            GuardShape::ValueTest => {
+                // Identity compare against the pool literal — no smi
+                // reject needed (a smi can simply never equal a heap
+                // literal's address).
+                let expect_lit = self.literal_ids[expect.0 as usize];
+                self.asm.ldr_literal(xr(17), expect_lit);
+                self.asm.emit("cmp", &[Operand::Reg(robj), x(17)]);
+                self.asm.b_cond(Cond::Ne, cold);
+            }
         }
     }
 
