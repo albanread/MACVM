@@ -84,3 +84,41 @@ Measured end state (matched-source harness): **alloc x5 = 7 ms on BOTH
 VMs — a dead tie**, from 46 ms (6.6x behind). The full comparison now
 reads: MACVM wins or ties every bench. Cost 3 (scavenge batching) was
 never needed for parity and remains unimplemented.
+
+## 2026-08-06 — the scavenger-throughput root cause: SURVIVOR_SIZE
+
+The Z arc retired the allocation call-out (prim_basic_new no longer
+appears in benchAlloc's profile); the residual alloc gap vs MACDART
+(~575 vs ~380 µs) is collector time, and the counters name the cause.
+
+**Measured, 3000 × benchAlloc (MACVM_TRACE=gc):** 572 scavenges and
+**98 full mark-slide-compact collections** — one full GC per ~30
+iterations of an allocation bench. Scavenge lines read
+`copied 0–512K, promoted 1924–4960K`: survivors bypass young almost
+entirely. The tenuring threshold oscillates 127 ↔ 1 (never-tenure ↔
+tenure-everything).
+
+**Root cause:** `memory/layout.rs`: `SURVIVOR_SIZE = 512 << 10` — a
+FIXED 512KB, while this workload's per-scavenge live set (the current
+iteration's Association chain) is ~3–6MB. Ungar's adaptive threshold
+(`compute_threshold`: keep survivors under half capacity) has no legal
+answer but "tenure everything", so each iteration's chain — dead
+microseconds later — is promoted into old space, which fills at
+~1.5MB/iteration and triggers a 2.5–7.5ms full compaction every ~30
+iterations. The full-GC bill is ~130µs/iteration ≈ **23% of the bench**.
+
+**Falsified variant, for the record:** MACVM_EDEN=131072 (4× eden) cuts
+GC *counts* 4× (572→143 scavenges, 98→25 fulls) but the bench moves only
+~3% — total collector work is survival-driven, not trigger-driven, and
+512KB survivors still force the same promotion volume in bigger batches.
+(MACVM_EDEN=262144 with MACVM_HEAP=1024 silently fell back to defaults —
+identical counters; the clamp deserves a loud warning, noted in passing.)
+
+**The fix shape:** survivor capacity proportional to eden (eden/4-ish, or
+≥8MB at the default 32MB eden) so a transient live set can AGE: with
+eden 32MB the chain spans ≤2 scavenges of its lifetime, so threshold ~3
+holds it in young at the same copy cost promotion already pays, old
+receives only genuinely old data, and the full-GC category ~vanishes on
+this shape. Estimated recovery ≈ the full-GC bill: alloc ~575 → ~445µs
+(MACDART: ~380). Touches the reservation layout math — gate behind the
+S7/S8 stress suites and the soak protocol before default-on.
