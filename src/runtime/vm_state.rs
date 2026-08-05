@@ -849,7 +849,7 @@ pub struct VmState {
     pub lookup_cache: LookupCache,
     /// `sp - argc - 1` at the moment a primitive was entered — lets
     /// `VmState::prim_arg` re-read a live stack slot instead of the
-    /// `[Oop; 6]` copy handed to the `PrimFn`, which primitives with
+    /// `[Oop; 8]` copy handed to the `PrimFn`, which primitives with
     /// `can_allocate = true` must do after their first allocating call
     /// (SPEC §10, the S7 choke-point pattern).
     pub prim_arg_base: usize,

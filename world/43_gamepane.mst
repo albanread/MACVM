@@ -35,6 +35,23 @@ Object subclass: Sprite [
         pane primSpriteColor: id index: index r: r g: g b: b.
         ^self
     ]
+    addFrame: hexRows [
+        "Append another frame of art to my definition (same size + palette as
+         the first) — makes me a multi-frame sprite. Answer myself so frames
+         chain onto a fresh sprite. Select the frame later with moveTo:y:frame:."
+        pane primAddFrame: id rows: hexRows.
+        ^self
+    ]
+    moveTo: x y: y frame: f [
+        "Move me to (x, y) AND show frame `f` (0-based) of my definition."
+        pane primPlace: id x: x y: y frame: f.
+        ^self
+    ]
+    hide [
+        "Stop drawing me until my next moveTo:."
+        pane primHide: id.
+        ^self
+    ]
 ]
 
 "I drive the native game pane from Smalltalk: a low-resolution palette
@@ -156,6 +173,54 @@ Object subclass: GamePane [
     primSpriteColor: id index: index r: r g: g b: b [ <primitive: 211> ^self ]
     primMoveSprite: id x: x y: y [ <primitive: 212> ^self ]
 
+    "--- GamePane extensions: features the MacGamePane engine already renders
+     (docs/gamepane_design.md). All harmless in a headless VM (the primitive
+     fails and the `^self` fallback runs). ---"
+
+    resizeTo: w by: h [
+        "Recreate the pane (indexed buffer + text overlay + shader layer) at
+         `w`x`h`. Call BEFORE drawing if the default 320x240 doesn't fit; a
+         demo that never calls this keeps 320x240. galaxigans is 640x360."
+        <primitive: 253>
+        ^self
+    ]
+
+    frameRate: fps [
+        "Request the frame timer's rate in frames-per-second (1..120). The
+         default is 60; a demo whose logic was tuned for a slower rate asks for
+         it here (galaxigans uses 30). Resets to 60 when the window closes."
+        <primitive: 262>
+        ^self
+    ]
+
+    "The topmost text overlay: a real 5x7 ASCII font drawn in RGB (not palette
+     indices), each font pixel blocked by `scale`. RETAINED between frames, so
+     a changing HUD calls textClear first (else each frame prints over the
+     last until the glyphs smear solid)."
+    text: aString x: x y: y r: r g: g b: b scale: k [ <primitive: 254> ^self ]
+    text: aString x: x y: y r: r g: g b: b [
+        ^self text: aString x: x y: y r: r g: g b: b scale: 1
+    ]
+    textClear [ <primitive: 255> ^self ]
+
+    "Multi-frame sprites: give a definition more frames, then place a specific
+     one. Reached through Sprite>>addFrame:/moveTo:y:frame:/hide."
+    primAddFrame: id rows: hexRows [ <primitive: 256> ^self ]
+    primPlace: id x: x y: y frame: f [ <primitive: 257> ^self ]
+    primHide: id [ <primitive: 258> ^self ]
+
+    "The layer-0 background shader: compile a Metal fragment shader once, then
+     drive its uniforms per frame. `shaderParam: 0 value: n` sets p[0]. The
+     shader reads u.time, u.aspect, u.p[0..7] and in.uv, returns float4."
+    shader: mslSource [ <primitive: 259> ^self ]
+    shaderParam: index value: aNumber [ <primitive: 260> ^self ]
+
+    "The per-scanline (copper-bar) palette: palette index `i` (1..15) can hold
+     a different colour on every scanline, so a shape drawn ONCE in index `i`
+     changes colour down the screen and animates by rewriting the line colours
+     — no pixel redrawn (galaxigans' tractor beam)."
+    linePaletteAt: line index: i r: r g: g b: b [ <primitive: 261> ^self ]
+
     GamePane class >> stepWithKeys: mask [
         "Run one frame: record the held-key bitmask, then run the step block.
          Called by the GUI's frame timer via a GameStep request, once per tick
@@ -215,6 +280,11 @@ Object subclass: Sound [
     Sound class >> click   [ ^self preset: 7 ]
     Sound class >> bang    [ ^self preset: 8 ]
     Sound class >> blip    [ ^self preset: 9 ]
+    "Beyond MACVM's original ten (galaxigans): a UFO warble (two sines a few
+     Hz apart, the beat IS the wah) and the capture boss's tractor hum (the
+     same beating trick an octave-and-a-half down and slower)."
+    Sound class >> saucer  [ ^self preset: 10 ]
+    Sound class >> bossHum [ ^self preset: 11 ]
     setPreset: n [ preset := n. ^self ]
     play [ "Play this sound." self primPlay: preset. ^self ]
     primPlay: n [ <primitive: 213> ^self ]

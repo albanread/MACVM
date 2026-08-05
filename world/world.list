@@ -92,6 +92,10 @@
 # grow by eating fruit, die on any edge or any worm's body (docs/gamepane_
 # design.md, same GamePane engine as Breakout/MandelZoom).
 48a_worms.mst
+# Galaxigans: a Galaxian/Galaga fixed shooter for the native game pane
+# (ported from the MACDART fork; uses the extended GamePane: text, multi-frame
+# sprites, shader backdrops, per-scanline palette).
+49_galaxigans.mst
 # Cocoa bridge C0-C3: ObjcRef (retained id in a GC-opaque byte tail), the
 # Cocoa facade, DNU dispatch, the main-thread hop + ObjcMainProxy
 # (docs/cocoa_bridge_design.md; prims 230-242). Fails cleanly headless.

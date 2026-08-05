@@ -24,7 +24,9 @@ use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Mutex;
 
 use macgamepane_graphics::indexed_pane::IndexedPane;
+use macgamepane_graphics::shader_pane::ShaderPane;
 use macgamepane_graphics::sprites::Sprites;
+use macgamepane_graphics::text_overlay::TextOverlay;
 use macgamepane_graphics::window::GameWindow;
 use macvm::embed::{GameCommand, GameSink};
 use metal::MTLLoadAction;
@@ -88,9 +90,29 @@ struct NativeGame {
     win: GameWindow,
     pane: IndexedPane,
     sprites: Sprites,
+    /// The topmost HUD/text layer (RGB, real 5x7 font) — always composited
+    /// last. Retained between frames; a demo `TextClear`s it each frame.
+    text: TextOverlay,
+    /// The layer-0 background fragment shader, created lazily on the first
+    /// `Shader` command (`None` = no shader; the indexed pane clears the frame).
+    shader: Option<ShaderPane>,
     sprite_ids: HashMap<i64, (usize, usize)>,
+    /// This session's actual pane size (may be `SetPaneSize`d away from the
+    /// 320x240 default — galaxigans is 640x360).
+    w: u32,
+    h: u32,
     timer: objc::Id,
 }
+
+/// The pane size the NEXT `ensure_pane` will create, set by `SetPaneSize`
+/// BEFORE the window exists (a demo sends it first). Defaults to 320x240.
+static REQ_W: AtomicI64 = AtomicI64::new(PANE_W as i64);
+static REQ_H: AtomicI64 = AtomicI64::new(PANE_H as i64);
+/// The requested frame-timer rate in fps (`GamePane>>frameRate:`). Default 60;
+/// galaxigans asks for 30. Reset to 60 on window close so it can't leak into
+/// the next demo.
+const DEFAULT_FPS: i64 = 60;
+static REQ_FPS: AtomicI64 = AtomicI64::new(DEFAULT_FPS);
 
 thread_local! {
     static GAME: std::cell::RefCell<Option<NativeGame>> = const { std::cell::RefCell::new(None) };
@@ -108,14 +130,19 @@ fn ensure_pane() {
         if cell.borrow().is_some() {
             return;
         }
-        let Some(win) = GameWindow::create("MACVM Game", PANE_W as f64, PANE_H as f64) else {
+        let w = REQ_W.load(Ordering::Acquire).clamp(1, 4096) as u32;
+        let h = REQ_H.load(Ordering::Acquire).clamp(1, 4096) as u32;
+        let Some(win) = GameWindow::create("MACVM Game", w as f64, h as f64) else {
             eprintln!("macvm-cocoa: no Metal device — game pane unavailable");
             return;
         };
-        let Ok(pane) = IndexedPane::new(&win.device, PANE_W, PANE_H, PANE_W, PANE_H) else {
+        let Ok(pane) = IndexedPane::new(&win.device, w, h, w, h) else {
             return;
         };
         let Ok(sprites) = Sprites::new(&win.device) else {
+            return;
+        };
+        let Ok(text) = TextOverlay::new(&win.device, w, h) else {
             return;
         };
         // The close button (red) must stop the demo + not dangle the window:
@@ -131,7 +158,11 @@ fn ensure_pane() {
             win,
             pane,
             sprites,
+            text,
+            shader: None,
             sprite_ids: HashMap::new(),
+            w,
+            h,
             timer: objc::NIL,
         });
         // Start this session with a clean held-key table. HELD_KEYS is only
@@ -147,17 +178,45 @@ fn ensure_pane() {
     });
 }
 
-/// Start the default-mode 60Hz frame timer (tracking-safe): its `gameTick:`
-/// flags a step due + reads keys; the primary's supervisor loop runs the step.
-/// Idempotent — invalidates any prior timer first.
+/// Rebuild the pane+window at the current `REQ_W`/`REQ_H` WITHOUT ending the
+/// session (unlike `close_window`, which stops the demo): release the old
+/// window/timer, then let `ensure_pane` recreate at the new size and restart
+/// the frame timer if a loop was running. Only the rare mid-session
+/// `SetPaneSize` reaches here.
+fn rebuild_pane_at_requested_size() {
+    GAME.with(|cell| {
+        if let Some(g) = cell.borrow_mut().take() {
+            objc::send0(g.timer, objc::sel("invalidate"));
+            let w = objc::send0(g.win.view, objc::sel("window"));
+            if !w.is_null() {
+                objc::send1_id(w, objc::sel("setDelegate:"), objc::NIL);
+                objc::send1_id(w, objc::sel("orderOut:"), objc::NIL);
+                objc::send1_id(w, objc::sel("close"), objc::NIL);
+                objc::send0(w, objc::sel("release"));
+            }
+            objc::send0(g.win.view, objc::sel("release"));
+        }
+    });
+    ensure_pane();
+    if GAME_ACTIVE.load(Ordering::Acquire) {
+        start_frame_timer();
+    }
+}
+
+/// Start the default-mode frame timer (tracking-safe) at the requested rate
+/// (`REQ_FPS`, default 60; a demo may request another via `GamePane>>frameRate:`).
+/// Its `gameTick:` flags a step due + reads keys; the primary's supervisor loop
+/// runs the step. Idempotent — invalidates any prior timer first.
 fn start_frame_timer() {
     GAME.with(|cell| {
         if let Some(g) = cell.borrow_mut().as_mut() {
             if g.timer != objc::NIL {
                 objc::send0(g.timer, objc::sel("invalidate"));
             }
+            let fps = REQ_FPS.load(Ordering::Acquire).clamp(1, 120) as f64;
+            eprintln!("macvm-cocoa: game frame timer at {fps} fps");
             g.timer = objc::scheduled_timer(
-                1.0 / 60.0,
+                1.0 / fps,
                 game_timer_target(),
                 objc::sel("gameTick:"),
                 true,
@@ -173,6 +232,11 @@ fn close_window() {
     // still be queued behind this stop, and the drain must NOT re-create the
     // window we're about to close (the "window reopens after stop" bug).
     SESSION_OPEN.store(false, Ordering::Release);
+    // The next demo starts from the default size unless IT requests otherwise
+    // — otherwise galaxigans' 640x360 would leak into the next Breakout launch.
+    REQ_W.store(PANE_W as i64, Ordering::Release);
+    REQ_H.store(PANE_H as i64, Ordering::Release);
+    REQ_FPS.store(DEFAULT_FPS, Ordering::Release);
     GAME.with(|cell| {
         if let Some(g) = cell.borrow_mut().take() {
             objc::send0(g.timer, objc::sel("invalidate"));
@@ -205,15 +269,28 @@ fn close_window() {
 }
 
 /// Upload + present one frame into the layer's next drawable (main thread).
+/// Layer order (bottom→top), the starfield_demo compositing: the shader (if
+/// any) clears + fills layer 0, the indexed pane composites over it with
+/// `Load` (its transparent index 0 lets the shader show through), then sprites,
+/// then the text overlay on top. With no shader the pane clears the frame.
 fn present(g: &mut NativeGame) {
     g.pane.upload();
+    g.text.upload();
     let Some(drawable) = g.win.layer.next_drawable() else {
         return; // compositor has none this instant — skip, not an error
     };
+    let tex = drawable.texture();
     let cb = g.win.command_queue.new_command_buffer();
-    g.pane.render(cb, drawable.texture(), MTLLoadAction::Clear);
+    let pane_load = if let Some(sh) = g.shader.as_mut() {
+        sh.render(cb, tex);
+        MTLLoadAction::Load
+    } else {
+        MTLLoadAction::Clear
+    };
+    g.pane.render(cb, tex, pane_load);
     g.sprites
-        .render(cb, drawable.texture(), 0.0, 0.0, PANE_W as f64, PANE_H as f64);
+        .render(cb, tex, 0.0, 0.0, g.w as f64, g.h as f64);
+    g.text.render(cb, tex);
     cb.present_drawable(drawable);
     cb.commit();
 }
@@ -248,11 +325,60 @@ fn apply(g: &mut NativeGame, cmd: &GameCommand) {
         }
         C::MoveSprite { id, x, y } => {
             if let Some(&(_, inst)) = g.sprite_ids.get(id) {
+                // `moveTo:y:` re-shows a hidden sprite (gamepane.mst contract:
+                // "Stop drawing me until my next moveTo:"). Without this a sprite
+                // that was hidden — e.g. galaxigans' ship on the attract screen —
+                // stays invisible once play starts and only moveTo:y: moves it.
+                g.sprites.show(inst);
                 g.sprites.move_to(inst, *x as f64, *y as f64);
             }
         }
+        // ── GamePane extensions ──
+        C::Text { x, y, text, r, g: gg, b, scale } => {
+            g.text.draw_text(*x, *y, text, *r, *gg, *b, *scale);
+        }
+        C::TextClear => g.text.clear(),
+        C::AddFrame { id, rows } => {
+            if let Some(&(def, _)) = g.sprite_ids.get(id) {
+                g.sprites.add_frame(def, rows);
+            }
+        }
+        C::PlaceSprite { id, x, y, frame } => {
+            if let Some(&(_, inst)) = g.sprite_ids.get(id) {
+                g.sprites.set_frame(inst, *frame as usize);
+                g.sprites.show(inst);
+                g.sprites.move_to(inst, *x as f64, *y as f64);
+            }
+        }
+        C::HideSprite { id } => {
+            if let Some(&(_, inst)) = g.sprite_ids.get(id) {
+                g.sprites.hide(inst);
+            }
+        }
+        C::Shader { src } => match ShaderPane::new(&g.win.device, src) {
+            Ok(mut sh) => {
+                sh.set_aspect(g.w as f32 / g.h as f32);
+                g.shader = Some(sh);
+            }
+            Err(e) => eprintln!("macvm-cocoa: game shader failed to compile: {e}"),
+        },
+        C::ShaderParam { index, value } => {
+            if let Some(sh) = g.shader.as_mut() {
+                sh.set_param(*index, *value);
+            }
+        }
+        C::LinePalette { line, index, r, g: gg, b } => {
+            g.pane.set_line_rgb(*line, *index, *r, *gg, *b);
+        }
         C::Present => present(g),
-        C::StartLoop | C::StopLoop | C::PlaySound { .. } | C::PlayTune { .. } => {}
+        // SetPaneSize is handled in `drain` (before the pane exists); loop and
+        // audio are handled there too. A stray one here is a harmless no-op.
+        C::SetPaneSize { .. }
+        | C::SetFrameRate { .. }
+        | C::StartLoop
+        | C::StopLoop
+        | C::PlaySound { .. }
+        | C::PlayTune { .. } => {}
     }
 }
 
@@ -277,6 +403,31 @@ pub fn drain() {
             GameCommand::StopLoop => close_window(),
             GameCommand::PlaySound { preset } => audio::play_sound(*preset),
             GameCommand::PlayTune { abc } => audio::play_tune(abc),
+            // Record the requested size so the NEXT `ensure_pane` builds at it
+            // (a demo sends this before any draw — no pane exists yet, the
+            // common path). If a pane already exists (a rare mid-session
+            // resize), rebuild it at the new size, keeping the session live.
+            GameCommand::SetPaneSize { w, h } => {
+                REQ_W.store(*w as i64, Ordering::Release);
+                REQ_H.store(*h as i64, Ordering::Release);
+                let exists = GAME.with(|cell| cell.borrow().is_some());
+                if exists && SESSION_OPEN.load(Ordering::Acquire) {
+                    rebuild_pane_at_requested_size();
+                }
+            }
+            // Record the requested fps. If the timer is already running (a demo
+            // set the rate after StartLoop), restart it so the new interval
+            // takes effect; the common case is a demo setting it during start,
+            // before StartLoop, where start_frame_timer picks it up directly.
+            GameCommand::SetFrameRate { fps } => {
+                REQ_FPS.store(*fps as i64, Ordering::Release);
+                let running = GAME.with(|cell| {
+                    cell.borrow().as_ref().map(|g| g.timer != objc::NIL).unwrap_or(false)
+                });
+                if running && SESSION_OPEN.load(Ordering::Acquire) {
+                    start_frame_timer();
+                }
+            }
             // Every draw/palette/present command: create the pane on the FIRST
             // one of a session (a demo paints its opening scene before StartLoop).
             // Only while a session is open — a stray frame arriving AFTER a stop
@@ -494,6 +645,9 @@ mod audio {
             6 => s::hurt(0.30, &mut rng),
             7 => s::click(0.05, &mut rng),
             8 => s::bang(0.40, &mut rng),
+            9 => s::blip(660.0, 0.12),
+            10 => s::saucer(0.9),    // UFO warble (galaxigans)
+            11 => s::boss_hum(1.8),  // tractor-beam hum (galaxigans)
             _ => s::blip(660.0, 0.12),
         }
     }

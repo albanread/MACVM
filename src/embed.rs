@@ -304,7 +304,10 @@ pub trait TranscriptSink: Send {
 /// GUI applies each to the real Metal pane (`gui/src/game_pane.rs`). Drawing
 /// commands mutate the pane's CPU buffer only; `Present` uploads and shows the
 /// frame — so a whole frame's drawing costs one present, not one per op.
-#[derive(Debug, Clone, PartialEq, Eq)]
+// `Eq` intentionally NOT derived: `ShaderParam { value: f32 }` (GamePane
+// extensions) has no total equality. `PartialEq` still gives `==`/`assert_eq!`
+// on commands; nothing keys a HashMap/HashSet on a `GameCommand`.
+#[derive(Debug, Clone, PartialEq)]
 pub enum GameCommand {
     /// Set palette entry `index` (16..=255) to an opaque RGB colour.
     PaletteAt { index: u8, r: u8, g: u8, b: u8 },
@@ -367,6 +370,61 @@ pub enum GameCommand {
     /// Play an ABC-notation tune once in the background (a chiptune via the
     /// engine's ABC->MIDI path). `(Tune fromAbc: '...') playOnce`.
     PlayTune { abc: String },
+
+    // ── GamePane extensions (galaxigans, world/49): features the MacGamePane
+    // engine already renders that MACVM had not wired. Each maps 1:1 to an
+    // engine call the GUI game host already links (`macgamepane-graphics`),
+    // exactly like the commands above; a GUI that has not yet grown the arm
+    // ignores it harmlessly. ──
+
+    /// Resize the pane to `w`x`h`, recreating the indexed framebuffer, text
+    /// overlay and shader layer at the new resolution. A demo sends this FIRST
+    /// (before any draw) if it wants a non-default size; a demo that never
+    /// sends it keeps the 320x240 default (`GamePane new: w height: h`).
+    SetPaneSize { w: u32, h: u32 },
+    /// Request the frame timer's rate in fps (`GamePane>>frameRate:`). Default
+    /// 60; galaxigans asks for 30 (its logic was tuned for a ~33fps original).
+    /// Resets to 60 when the game window closes so it can't leak into the next
+    /// demo.
+    SetFrameRate { fps: u32 },
+    /// Draw `text` at `(x, y)` on the always-topmost text layer in RGB, each
+    /// glyph pixel blocked `scale`x`scale` (`GamePane>>text:x:y:r:g:b:scale:`).
+    Text {
+        x: i64,
+        y: i64,
+        text: String,
+        r: u8,
+        g: u8,
+        b: u8,
+        scale: u32,
+    },
+    /// Clear the text layer (`GamePane>>textClear`) — the overlay is retained
+    /// between frames, so a changing HUD clears it first.
+    TextClear,
+    /// Append another hex-row art frame to sprite definition `id`
+    /// (`Sprite>>addFrame:`). All frames share the sprite's palette + size.
+    AddFrame { id: i64, rows: String },
+    /// Move sprite `id` to `(x, y)` AND select which frame to show
+    /// (`Sprite>>moveTo:y:frame:`). `frame` is 0-based.
+    PlaceSprite { id: i64, x: i64, y: i64, frame: u32 },
+    /// Stop drawing sprite `id` until its next move (`Sprite>>hide`).
+    HideSprite { id: i64 },
+    /// Set the full-screen layer-0 fragment shader from Metal source
+    /// (`GamePane>>shader:`). Compiled once; a bad shader fails the primitive.
+    Shader { src: String },
+    /// Set shader uniform `p[index]` (`index` 0..7) to `value`
+    /// (`GamePane>>shaderParam:value:`).
+    ShaderParam { index: usize, value: f32 },
+    /// Override palette entry `index` (1..15) to an RGB colour ON ONE SCANLINE
+    /// `line` only — the per-scanline (copper-bar) palette
+    /// (`GamePane>>linePaletteAt:index:r:g:b:`).
+    LinePalette {
+        line: u32,
+        index: u8,
+        r: u8,
+        g: u8,
+        b: u8,
+    },
 }
 
 /// Where game-primitive commands go — the game analogue of [`TranscriptSink`].

@@ -1358,6 +1358,90 @@ pub static PRIMITIVES: &[PrimDesc] = &[
         can_allocate: false,
         can_fail: false,
     },
+    // GamePane extensions (docs/gamepane_design.md; galaxigans / world/49) —
+    // the MacGamePane features MACVM had not wired. Same emit-a-GameCommand
+    // shape as the 200-block above; kept here (not 216-219) because the game
+    // block abuts the worker block at 220.
+    PrimDesc {
+        id: 253,
+        name: "GamePane>>resizeTo:by:",
+        f: prim_game_set_pane_size,
+        argc: 2,
+        can_allocate: false,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 254,
+        name: "GamePane>>text:x:y:r:g:b:scale:",
+        f: prim_game_text,
+        argc: 7,
+        can_allocate: false,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 255,
+        name: "GamePane>>textClear",
+        f: prim_game_text_clear,
+        argc: 0,
+        can_allocate: false,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 256,
+        name: "GamePane>>primAddFrame:rows:",
+        f: prim_game_add_frame,
+        argc: 2,
+        can_allocate: false,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 257,
+        name: "GamePane>>primPlace:x:y:frame:",
+        f: prim_game_place_sprite,
+        argc: 4,
+        can_allocate: false,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 258,
+        name: "GamePane>>primHide:",
+        f: prim_game_hide_sprite,
+        argc: 1,
+        can_allocate: false,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 259,
+        name: "GamePane>>shader:",
+        f: prim_game_shader,
+        argc: 1,
+        can_allocate: false,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 260,
+        name: "GamePane>>shaderParam:value:",
+        f: prim_game_shader_param,
+        argc: 2,
+        can_allocate: false,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 261,
+        name: "GamePane>>linePaletteAt:index:r:g:b:",
+        f: prim_game_line_palette,
+        argc: 5,
+        can_allocate: false,
+        can_fail: true,
+    },
+    PrimDesc {
+        id: 262,
+        name: "GamePane>>frameRate:",
+        f: prim_game_set_frame_rate,
+        argc: 1,
+        can_allocate: false,
+        can_fail: true,
+    },
 ];
 
 pub fn prim_by_id(id: u16) -> Option<&'static PrimDesc> {
@@ -1586,6 +1670,141 @@ fn prim_game_blit(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     let mut data = Vec::new();
     bytes.copy_bytes_out(&mut data);
     game_emit(vm, GameCommand::Blit { data });
+    PrimResult::Ok(args[0])
+}
+
+// ── GamePane extensions (ids 253-261) ────────────────────────────────────────
+
+/// A numeric argument (SmallInteger OR Double) as `f32` — `shaderParam:value:`
+/// takes a `Number`. `None` for anything else (fail).
+fn game_num_f32(o: Oop) -> Option<f32> {
+    if let Some(d) = DoubleOop::try_from(o) {
+        return Some(d.value() as f32);
+    }
+    smi_i64(o).map(|i| i as f32)
+}
+
+/// `resizeTo:by:` (253): resize the pane to `w`x`h` (recreate the buffers).
+fn prim_game_set_pane_size(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    let (Some(w), Some(h)) = (smi_i64(args[1]), smi_i64(args[2])) else {
+        return PrimResult::Fail;
+    };
+    if w <= 0 || h <= 0 || w > 4096 || h > 4096 {
+        return PrimResult::Fail;
+    }
+    game_emit(vm, GameCommand::SetPaneSize { w: w as u32, h: h as u32 });
+    PrimResult::Ok(args[0])
+}
+
+/// `text:x:y:r:g:b:scale:` (254): draw text on the topmost overlay.
+fn prim_game_text(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    let (Some(text), Some(x), Some(y), Some(r), Some(g), Some(b), Some(scale)) = (
+        smi_str(args[1]),
+        smi_i64(args[2]),
+        smi_i64(args[3]),
+        smi_byte(args[4]),
+        smi_byte(args[5]),
+        smi_byte(args[6]),
+        smi_i64(args[7]),
+    ) else {
+        return PrimResult::Fail;
+    };
+    let scale = scale.clamp(1, 16) as u32;
+    game_emit(vm, GameCommand::Text { x, y, text, r, g, b, scale });
+    PrimResult::Ok(args[0])
+}
+
+/// `textClear` (255): clear the text overlay.
+fn prim_game_text_clear(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    game_emit(vm, GameCommand::TextClear);
+    PrimResult::Ok(args[0])
+}
+
+/// `primAddFrame:rows:` (256): append a frame to sprite `id`'s definition.
+fn prim_game_add_frame(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    let (Some(id), Some(rows)) = (smi_i64(args[1]), smi_str(args[2])) else {
+        return PrimResult::Fail;
+    };
+    game_emit(vm, GameCommand::AddFrame { id, rows });
+    PrimResult::Ok(args[0])
+}
+
+/// `primPlace:x:y:frame:` (257): move sprite `id` and select its frame.
+fn prim_game_place_sprite(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    let (Some(id), Some(x), Some(y), Some(frame)) = (
+        smi_i64(args[1]),
+        smi_i64(args[2]),
+        smi_i64(args[3]),
+        smi_i64(args[4]),
+    ) else {
+        return PrimResult::Fail;
+    };
+    let frame = frame.max(0) as u32;
+    game_emit(vm, GameCommand::PlaceSprite { id, x, y, frame });
+    PrimResult::Ok(args[0])
+}
+
+/// `primHide:` (258): stop drawing sprite `id`.
+fn prim_game_hide_sprite(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    let Some(id) = smi_i64(args[1]) else {
+        return PrimResult::Fail;
+    };
+    game_emit(vm, GameCommand::HideSprite { id });
+    PrimResult::Ok(args[0])
+}
+
+/// `shader:` (259): set the layer-0 fragment shader from Metal source.
+fn prim_game_shader(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    let Some(src) = smi_str(args[1]) else {
+        return PrimResult::Fail;
+    };
+    game_emit(vm, GameCommand::Shader { src });
+    PrimResult::Ok(args[0])
+}
+
+/// `shaderParam:value:` (260): set shader uniform `p[index]`.
+fn prim_game_shader_param(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    let (Some(index), Some(value)) = (smi_i64(args[1]), game_num_f32(args[2])) else {
+        return PrimResult::Fail;
+    };
+    if !(0..8).contains(&index) {
+        return PrimResult::Fail;
+    }
+    game_emit(vm, GameCommand::ShaderParam { index: index as usize, value });
+    PrimResult::Ok(args[0])
+}
+
+/// `frameRate:` (262): request the game-pane frame timer's rate in fps. The
+/// default is 60; galaxigans asks for 30 (its logic was tuned for a ~33fps
+/// original, so 60 ran it ~2x too fast and piled sound triggers up). Clamped
+/// 1..120; the rate resets to 60 when the window closes so it can't leak into
+/// the next demo.
+fn prim_game_set_frame_rate(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    let Some(fps) = smi_i64(args[1]) else {
+        return PrimResult::Fail;
+    };
+    if fps < 1 || fps > 120 {
+        return PrimResult::Fail;
+    }
+    game_emit(vm, GameCommand::SetFrameRate { fps: fps as u32 });
+    PrimResult::Ok(args[0])
+}
+
+/// `linePaletteAt:index:r:g:b:` (261): per-scanline palette override.
+fn prim_game_line_palette(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    let (Some(line), Some(index), Some(r), Some(g), Some(b)) = (
+        smi_i64(args[1]),
+        smi_byte(args[2]),
+        smi_byte(args[3]),
+        smi_byte(args[4]),
+        smi_byte(args[5]),
+    ) else {
+        return PrimResult::Fail;
+    };
+    if line < 0 || index == 0 || index > 15 {
+        return PrimResult::Fail; // index 0 is transparent; per-line is 1..15
+    }
+    game_emit(vm, GameCommand::LinePalette { line: line as u32, index, r, g, b });
     PrimResult::Ok(args[0])
 }
 
@@ -4930,6 +5149,17 @@ mod tests {
             (250, "Worker class>>primEvalDoit:"),
             (251, "halt"),
             (252, "microsecondClock"),
+            // GamePane extensions (galaxigans arc).
+            (253, "GamePane>>resizeTo:by:"),
+            (254, "GamePane>>text:x:y:r:g:b:scale:"),
+            (255, "GamePane>>textClear"),
+            (256, "GamePane>>primAddFrame:rows:"),
+            (257, "GamePane>>primPlace:x:y:frame:"),
+            (258, "GamePane>>primHide:"),
+            (259, "GamePane>>shader:"),
+            (260, "GamePane>>shaderParam:value:"),
+            (261, "GamePane>>linePaletteAt:index:r:g:b:"),
+            (262, "GamePane>>frameRate:"),
         ];
         assert_eq!(
             PRIMITIVES.len(),

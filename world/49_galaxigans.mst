@@ -1,0 +1,1979 @@
+"Game: Galaxigans — Galaxian-style fixed shooter, ported from x64 assembler"
+"galaxigans.mst — GALAXIGANS: a Galaxian/Galaga-style fixed shooter for the
+ native Metal game pane, ported from the x64 assembler original in
+ MRASM/projects/galaxigans (6251 lines of .was across 35 files).
+
+ THIS FILE IS THE GAME. It lives in demos/ with the other playable files, not
+ in the built-in world: picking it from the Games menu files its classes into
+ the running image and starts it, and the Edit button opens THIS FILE — all
+ five classes — where Save writes back to disk. A game in st/world/ would be
+ part of the system image instead: editable only one class at a time through
+ the Browser, and overwritten by the next world import.
+
+ The port is deliberately FAITHFUL to that game's numbers rather than a vague
+ homage — every constant below comes from its galaxigans_data.inc, so the two
+ can be compared side by side: a 640x360 field, an 8x5 formation of 16x16
+ aliens on a 56x34 grid from (96,56), sway +/-16 at 1px a frame, a dive every 60
+ frames that peels for 12 then homes, divers returning down the screen at 4px a
+ frame to re-dock in their own slot, 4 bullets at 7px a frame on an 8-frame
+ cooldown, 6 bombs at 4px a frame every 22, a bonus saucer every 420 frames
+ worth 200, and a 90-frame respawn beat.
+
+ The dive AI is the heart of Galaga and the most interesting thing to port. It
+ is the original's, transcribed: each dive gets a random seed whose bits ARE the
+ flight plan — weave speed ((seed>>3)&7)+3, weave phase (seed>>8)&255, weave
+ amplitude (seed&7)+2, plus a 'fast' bit raising the descent cap from 8 to 10
+ and a 'hard' bit tripling the homing pull. So no two swoops trace the same
+ curve, and the fleet's behaviour is emergent rather than scripted.
+
+ Ported since: the ten-species creature library and the twelve-level table with
+ the original's own cosmos shaders (layer 0), the saucer's beating wah-wah, its
+ rare SPINNING MINE (threat and treat — it kills the ship, and it pays 150 to
+ shoot), and the triumphal VICTORY DANCE the survivors perform over the
+ game-over card.
+
+ And now the CAPTURE BOSS with its tractor beam, and the pilot row it comes
+ for: the boss enters, stations, descends to the middle of the field, charges,
+ and fires a beam down into your pilots. One rises up it; if it reaches the
+ boss that life is gone, and if you shoot the boss first the pilot drops home
+ saved and you take 500. It will not appear at all when you are down to a last
+ pilot — the original's own rule, and the right one.
+
+ The beam is drawn ONCE per frame as a cone in palette index 1, and flows by
+ rewriting what index 1 MEANS on each scanline — the pane's per-line palette,
+ which is the copper-bar mechanism and the original's own (BeamCascade). No
+ pixel is redrawn to animate it.
+
+ And the music: the original's four melodic cues (galaxigans_music.was) are
+ transcribed note for note — the choir build on the title screen, the
+ glockenspiel fanfare for a cleared wave, the pad swell that announces the
+ saucer, and 'Alien Victory', the square-lead triumph the aliens dance to when
+ they have taken your last ship. Its percussion cues are not ported: the pane's
+ SFX presets already play that part, and doubling them would only muddy it.
+
+ And the HIGH-SCORE TABLE — with the port's best trick: the hall of fame is a
+ CLASS IN THE IMAGE (GxHallOfFame), created and rewritten by the game itself
+ through the browser's own checked accept, so your scores are source, they are
+ browsable, and they survive a full restart because the image is the source of
+ truth. It is deliberately not part of this file: re-filing the game in can
+ never clobber it.
+
+ What is still NOT ported: the original's nano-TCL dev channel — this
+ workspace's own control plane already does that job.
+
+ Controls: Left/Right steer, Space fires (tap, no autofire — the original's
+ shoot_held/shoot_release beat). Launch from the GAMES menu, or a Workspace:
+     Galaxigans launch
+
+ This runs on a 640x360 pane, wider than the 320x240 the other Smalltalk games
+ open (macdart/cocoa/workspace/language.dart, _kStGames 'size'), so there is
+ room for a real fleet and a HUD in the pane's own 5x7 font."
+
+"--- one alien: a slot in the formation, and its own flight plan while diving ---"
+"I am one Galaxigan. In formation I track my home slot plus the fleet's sway;
+ when launched I fly my own swooping dive at the player, drop out of the bottom
+ of the field, and glide back down from the top into my slot to dive again. My
+ dive is not scripted: the random seed I am launched with packs the weave speed,
+ phase and amplitude, and two behaviour bits, so every swoop is different."
+"Forward-declare this file's own classes before the definitions below. MACVM
+ installs classes top-to-bottom and a bare READ of a class global that is not
+ yet installed is a compile error (unlike a genesis class such as Association,
+ which is pre-registered) — and these classes reference each other mutually
+ (Galaxigan names Galaxigans for its dive maths; Galaxigans names all the
+ rest). A top-level assignment auto-declares the uppercase global; each
+ `subclass:` below then binds it to the real class. (GamePane/Sprite/Sound/
+ Tune/Random are already global from 43_gamepane.mst.)"
+Object subclass: Galaxigan [ | x y homeX homeY state kind dt seed bank alive sprite species | ]
+Object subclass: GxShot [ | x y dy live | ]
+Object subclass: GxMine [ | x y anim live sprite | ]
+Object subclass: GxBoss [ | state x y anim timer beamT sprite | ]
+Object subclass: GxSpark [ | x y vx vy life colour | ]
+Object subclass: GxSpecies [ | name art art2 palette | ]
+Object subclass: Galaxigans [
+    <classVars: Sine Species Current Hall>
+    | pane rng gameState stateTimer frame
+      shipX shipSprite lives score hiScore wave respawn
+      fleet swayX swayDir diveTimer bombTimer
+      bullets bombs mines sparks level scene theme flap danceT
+      mineDrops saucerDrops hiTable hiNewRow
+      boss bossOn pilots abducting abducteeX abducteeY beamPhase pilotsTaken
+      saucer saucerX saucerDir saucerTimer saucerWah saucerBombT
+      cooldown fireWasDown |
+]
+
+Object subclass: Galaxigan [
+
+    Galaxigan class >> homeX: hx homeY: hy kind: aKind [
+        ^self new setHomeX: hx homeY: hy kind: aKind
+    ]
+
+    setHomeX: hx homeY: hy kind: aKind [
+        homeX := hx. homeY := hy. kind := aKind.
+        x := hx. y := hy.
+        state := #form. dt := 0. seed := 0. bank := 0. alive := true.
+        ^self
+    ]
+
+    x [ ^x ]
+    y [ ^y ]
+    homeX [ ^homeX ]
+    homeY [ ^homeY ]
+    kind [ ^kind ]
+    species [ ^species ]
+
+    "My species is an index into the game's creature library; my two flap
+     frames sit at (index-1)*2 and +1 on my sprite's definition, which carries
+     every species' art (see Galaxigans>>buildSprites)."
+    species: anIndex name: aName [ species := anIndex. kind := aName ]
+    frameFor: flap [ ^(species isNil ifTrue: [ 1 ] ifFalse: [ species ]) - 1 * 2 + flap ]
+    state [ ^state ]
+    alive [ ^alive ]
+    isDiving [ ^state == #dive ]
+    sprite [ ^sprite ]
+    sprite: s [ sprite := s ]
+
+    kill [ alive := false. state := #dead ]
+
+    "Score is by row: the front rank is worth least, and a diver is worth
+     double — the arcade's own bargain, take the risk for the points."
+    points [
+        "The rarer species (higher up the library) are worth more, and a diver
+         is worth double — the arcade's own bargain, take the risk for points."
+        | base |
+        base := 40 + ((species isNil ifTrue: [ 1 ] ifFalse: [ species ]) * 10).
+        ^state == #dive ifTrue: [ base * 2 ] ifFalse: [ base ]
+    ]
+
+    "Launch me at the player. The seed IS the flight plan (see the class
+     comment); dt drives both the descent ramp and the weave."
+    diveWithSeed: s [
+        state := #dive. dt := 0. seed := s
+    ]
+
+    "One frame of formation flight: sit in my slot, carried by the sway."
+    followFormation: swayX [
+        x := homeX + swayX. y := homeY. bank := 0
+    ]
+
+    "One frame of the glide home: drop from above the field into my own slot,
+     tracking the swaying column on the way in."
+    returnStep: swayX [
+        y := y + 4.
+        x := homeX + swayX.
+        bank := 0.
+        y >= homeY ifTrue: [ y := homeY. state := #form ]
+    ]
+
+    "One frame of the dive — the ported swoop. Answers true when I have left
+     the bottom of the field and should re-enter from the top."
+    diveStep: playerX height: fieldH [
+        | vy weave amp speed phase pull |
+        dt := dt + 1.
+        vy := 2 + (dt // 4).
+        vy := vy min: ((seed bitAnd: 128) = 0 ifTrue: [ 8 ] ifFalse: [ 10 ]).
+        y := y + vy.
+        speed := ((seed bitShift: -3) bitAnd: 7) + 3.
+        phase := ((seed bitShift: -8) bitAnd: 255).
+        amp := (seed bitAnd: 7) + 2.
+        weave := (Galaxigans sineAt: dt * speed + phase) * amp // 256.
+        "The peel: for the first 12 steps I only weave, so I break formation
+         outward before I start hunting. After that the homing pull leans me
+         toward the player — gently, or hard if my seed says so."
+        dt >= 12 ifTrue: [
+            pull := (seed bitAnd: 64) = 0 ifTrue: [ 1 ] ifFalse: [ 3 ].
+            weave := x < playerX
+                ifTrue: [ weave + pull ]
+                ifFalse: [ weave - pull ] ].
+        x := x + weave.
+        bank := weave sign.
+        y > (fieldH + 8) ifTrue: [ ^true ].
+        ^false
+    ]
+
+    "Put me exactly here — the victory dance flies the fleet itself."
+    moveToX: ax y: ay [ x := ax. y := ay. bank := 0 ]
+
+    "Re-enter from above, ready to glide back into my slot."
+    reenterAt: swayX [
+        state := #return. dt := 0. x := homeX + swayX. y := -20
+    ]
+
+    "My hit box, generous by half a pixel in the player's favour."
+    hits: px y: py halfWidth: hw [
+        ^alive and: [ (x - px) abs < (hw + 8) and: [ (y - py) abs < 12 ] ]
+    ]
+]
+
+"--- a shot: one player bullet, or one enemy bomb ---"
+"I am one projectile in a fixed-size pool — a player bullet flying up, or an
+ enemy bomb falling. The pool never grows during play: the original DIMs four
+ bullets and six bombs, and running out IS the game's rate limit."
+Object subclass: GxShot [
+
+    "`super new` is not compilable here (the ST engine's flow-graph builder
+     refuses self/super in a class-method receiver position), so the pool asks
+     for `empty` rather than overriding new."
+    GxShot class >> empty [ ^self new setDead ]
+    setDead [ live := false. x := 0. y := 0. dy := 0. ^self ]
+
+    x [ ^x ]
+    y [ ^y ]
+    live [ ^live ]
+    kill [ live := false ]
+
+    fireFrom: ax y: ay dy: ady [
+        x := ax. y := ay. dy := ady. live := true
+    ]
+
+    "Advance one frame; answers false when I leave the field."
+    stepIn: fieldH [
+        live ifFalse: [ ^false ].
+        y := y + dy.
+        (y < -8 or: [ y > (fieldH + 8) ]) ifTrue: [ live := false. ^false ].
+        ^true
+    ]
+
+    hits: tx y: ty halfWidth: hw halfHeight: hh [
+        ^live and: [ (x - tx) abs < hw and: [ (y - ty) abs < hh ] ]
+    ]
+]
+
+
+"--- the saucer's rare spinning mine ---"
+"I am a space mine: the bonus saucer drops me instead of a bomb about one time
+ in eight. I drift down slowly, spinning, and I am both threat and treat —
+ touching the ship kills it, shooting me pays 150. The original files me under
+ 'the rare spinning mine the saucer sometimes drops' and gives me eight
+ rotation frames; I turn one full circle every 32 frames."
+Object subclass: GxMine [
+
+    GxMine class >> empty [ ^self new setDead ]
+    setDead [ live := false. x := 0. y := 0. anim := 0. ^self ]
+
+    x [ ^x ]
+    y [ ^y ]
+    live [ ^live ]
+    kill [ live := false ]
+    sprite [ ^sprite ]
+    sprite: s [ sprite := s ]
+    "Eight frames, advancing every fourth tick."
+    frame [ ^(anim // 4) \\ 8 ]
+
+    dropAt: ax y: ay [ x := ax. y := ay. anim := 0. live := true ]
+
+    "Half a pixel a frame: it drifts DOWN on the odd ticks only, so it hangs in
+     the field far longer than a bomb and has to be dealt with."
+    stepIn: fieldH [
+        live ifFalse: [ ^false ].
+        anim := anim + 1.
+        (anim bitAnd: 1) = 1 ifTrue: [ y := y + 1 ].
+        y > (fieldH + 8) ifTrue: [ live := false. ^false ].
+        ^true
+    ]
+
+    hits: tx y: ty halfWidth: hw halfHeight: hh [
+        ^live and: [ (x - tx) abs < (hw + 8) and: [ (y - ty) abs < (hh + 8) ] ]
+    ]
+]
+
+"--- the capture boss ---"
+"I am the capture boss: a 32x32 crab that comes for your PILOTS, not your ship.
+ I enter from the top, hover, then descend to the middle of the field, charge,
+ and fire a tractor beam down into the row of pilots along the bottom. A pilot
+ rises up the beam; if it reaches me you lose that life. Shoot me while I am
+ down there and the pilot drops home, saved, and I am worth 500.
+
+ The lifecycle is the original's (galaxigans_boss.was): idle, enter, station,
+ descend, charge, beam, return — with its own rule that I never appear, and
+ never grab, when the player is down to a LAST pilot. Bullying someone out of
+ their final life is not a mechanic, it is just cruelty."
+Object subclass: GxBoss [
+
+    GxBoss class >> empty [ ^self new setIdle ]
+    setIdle [
+        state := #idle. x := 304. y := -36. anim := 0. beamT := 0.
+        timer := Galaxigans bossFirst.
+        ^self
+    ]
+
+    state [ ^state ]
+    x [ ^x ]
+    y [ ^y ]
+    beamT [ ^beamT ]
+    sprite [ ^sprite ]
+    sprite: s [ sprite := s ]
+    isIdle [ ^state == #idle ]
+    "Down where a bullet can reach me — descending, charging or firing."
+    isVulnerable [
+        ^state == #descend or: [ state == #charge or: [ state == #beam ] ]
+    ]
+    isBeaming [ ^state == #charge or: [ state == #beam ] ]
+
+    "Which of my four frames: two idle poses alternating, then the charge and
+     beam poses — the emitter eye grows, which is the tell."
+    frame [
+        state == #beam ifTrue: [ ^3 ].
+        state == #charge ifTrue: [ ^2 ].
+        ^(anim // 16) \\ 2
+    ]
+
+    "The beam's mouth, and how far down it has grown."
+    beamX [ ^x + 16 ]
+    beamTop [ ^y + 24 ]
+    beamBottom: fieldH [
+        state == #beam ifTrue: [ ^350 ].
+        ^(y + 24 + (beamT * 14)) min: 350
+    ]
+
+    wake [ state := #enter. x := 304. y := -36. anim := 0 ]
+    retreat [ state := #return ]
+    vanish [ state := #idle. y := -60. timer := Galaxigans bossRespawn ]
+
+    "One frame. Answers a symbol the game acts on: #none, #charged (start the
+     hum), #grab (a pilot is in the beam) or #done."
+    stepWithLives: lives enabled: enabled [
+        anim := anim + 1.
+        state == #idle ifTrue: [
+            (enabled and: [ lives > 1 ]) ifFalse: [ ^#none ].
+            timer := timer - 1.
+            timer > 0 ifTrue: [ ^#none ].
+            self wake.
+            ^#warn ].
+        state == #enter ifTrue: [
+            y < Galaxigans bossStationY
+                ifTrue: [ y := y + 2 ]
+                ifFalse: [ state := #station. timer := Galaxigans bossDwell ].
+            ^#none ].
+        state == #station ifTrue: [
+            timer := timer - 1.
+            timer > 0 ifTrue: [ ^#none ].
+            "Down to the last pilot? Give up and go home."
+            lives <= 1 ifTrue: [ state := #return. ^#none ].
+            state := #descend.
+            ^#none ].
+        state == #descend ifTrue: [
+            x := x < 304 ifTrue: [ x + 3 ] ifFalse: [ x - 3 ].
+            y < Galaxigans bossCaptureY
+                ifTrue: [ y := y + 3. ^#none ].
+            state := #charge. beamT := 0.
+            ^#charged ].
+        state == #charge ifTrue: [
+            beamT := beamT + 1.
+            beamT < Galaxigans beamCharge ifTrue: [ ^#none ].
+            state := #beam. beamT := 0.
+            ^#charged ].
+        state == #beam ifTrue: [
+            beamT := beamT + 1.
+            beamT >= Galaxigans beamHold ifTrue: [ state := #return. ^#done ].
+            ^#grab ].
+        state == #return ifTrue: [
+            y := y - 4.
+            y < -40 ifTrue: [ self vanish ].
+            ^#none ].
+        ^#none
+    ]
+
+    "A bullet in my 32x32 box, while I am down."
+    hits: bx y: by [
+        ^self isVulnerable and: [
+            bx >= x and: [ bx < (x + 32) and: [ by >= y and: [ by < (y + 32) ] ] ] ]
+    ]
+]
+
+"--- explosion debris ---"
+"I am one spark of an explosion: a coloured pixel with a velocity and a life.
+ A burst of me is the whole particle system — the original ran the same idea
+ through its PtBurst/PtUpdate pool."
+Object subclass: GxSpark [
+
+    GxSpark class >> at: ax y: ay vx: avx vy: avy colour: c [
+        ^self new setX: ax y: ay vx: avx vy: avy colour: c
+    ]
+    setX: ax y: ay vx: avx vy: avy colour: c [
+        x := ax. y := ay. vx := avx. vy := avy. colour := c. life := 18. ^self
+    ]
+
+    x [ ^x ]
+    y [ ^y ]
+    colour [ ^colour ]
+    live [ ^life > 0 ]
+
+    step [
+        x := x + vx. y := y + vy. vy := vy + 1. life := life - 1
+    ]
+]
+
+"--- one alien species: its art, its animation, its palette ---"
+"I am one species of Galaxigan — two frames of 16x16 art and the ten-colour
+ palette they index. Both come VERBATIM from the assembler original's creature
+ library (galaxigans_aliens2.was): its rows are '.'-plus-hex exactly like the
+ pane's own defineSprite: format, and its palette is the comment block above
+ each table. Ten of us exist; a level's formation theme picks five, one per
+ row of the grid."
+Object subclass: GxSpecies [
+
+    GxSpecies class >> name: n art: a art2: b palette: p [
+        ^self new setName: n art: a art2: b palette: p
+    ]
+    setName: n art: a art2: b palette: p [
+        name := n. art := a. art2 := b. palette := p. ^self
+    ]
+
+    name [ ^name ]
+    art [ ^art ]
+    art2 [ ^art2 ]
+
+    "Paint my ten colours onto a sprite. The palette array is flat — r,g,b per
+     index, index 1 first (0 is the sprite format's transparent)."
+    paint: aSprite [
+        1 to: 10 do: [ :i |
+            aSprite
+                colorAt: i
+                r: (palette at: (i - 1) * 3 + 1)
+                g: (palette at: (i - 1) * 3 + 2)
+                b: (palette at: (i - 1) * 3 + 3) ].
+        ^self
+    ]
+]
+
+"--- the game ---"
+"I am GALAXIGANS, a Galaxian/Galaga-style fixed shooter on the native game
+ pane, ported from an x64 assembler original (see the file comment). Left and
+ Right steer, Space fires — one shot per press, four in flight. Shoot the
+ formation before it dives you out of lives; the bonus saucer overhead is worth
+ 200. Launch me from the GAMES menu or a Workspace: Galaxigans launch."
+Object subclass: Galaxigans [
+    "classVars + ivars are declared in the forward shell above (MACVM rejects a
+     reopen that re-declares shape); this reopen adds only methods."
+
+    "--- the field, straight from the original's galaxigans_data.inc ---"
+    Galaxigans class >> fieldWidth [ ^640 ]
+    Galaxigans class >> fieldHeight [ ^360 ]
+    "The pane I want when I am filed in from demos/ — the driver asks a game
+     for these rather than keeping its resolution in a table elsewhere."
+    Galaxigans class >> paneWidth [ ^self fieldWidth ]
+    Galaxigans class >> paneHeight [ ^self fieldHeight ]
+    Galaxigans class >> playerY [ ^310 ]
+    Galaxigans class >> cols [ ^8 ]
+    Galaxigans class >> rows [ ^5 ]
+    Galaxigans class >> colGap [ ^56 ]
+    Galaxigans class >> rowGap [ ^34 ]
+    Galaxigans class >> gridX [ ^96 ]
+    Galaxigans class >> gridY [ ^56 ]
+    Galaxigans class >> divePeriod [ ^60 ]
+    Galaxigans class >> bombPeriod [ ^22 ]
+    Galaxigans class >> saucerPeriod [ ^420 ]
+    "The triumphal dance (galaxigans_dance.was): the survivors orbit the middle
+     of the field on a breathing-radius pinwheel while the game-over card sits
+     over them. Centre is the field's, the radius breathes R0 +/- R1, and each
+     alien is offset around the wheel by its index."
+    Galaxigans class >> danceCX [ ^320 ]
+    Galaxigans class >> danceCY [ ^180 ]
+    Galaxigans class >> danceR0 [ ^95 ]
+    Galaxigans class >> danceR1 [ ^70 ]
+    Galaxigans class >> danceAngleStep [ ^6 ]
+    Galaxigans class >> danceRadStep [ ^10 ]
+    Galaxigans class >> danceLength [ ^420 ]
+    "The attract cycle, in frames at the ~33fps pull rate: the title holds for
+     ~18s, the hall of fame for ~30s, and then round again — the machine never
+     stops on its own, it just waits for a player."
+    Galaxigans class >> attractLength [ ^600 ]
+    Galaxigans class >> hiscoreLength [ ^1000 ]
+
+    "--- the hall of fame: a CLASS IN THE IMAGE, written by the game ---------"
+    "The original keeps six rows in .DATA — ACE 30000 down to WOW 4000 — and
+     slots your score in as YOU. Here the table is a real class,
+     GxHallOfFame, that the game CREATES AND REWRITES through the browser's
+     own checked accept (STHostService acceptEditorClass:): parse-checked,
+     persisted in the SQLite image, hot-reloaded live. Your scores survive a
+     restart because they live in the image — and the hall is BROWSABLE: open
+     GxHallOfFame in the Browser and there they are, as source. It is a
+     separate class, not part of this file, precisely so that re-filing the
+     game in from the Games menu can never clobber it."
+    Galaxigans class >> defaultHall [
+        ^#( #('ACE' 30000) #('ZAP' 22000) #('BUG' 16000)
+            #('FOE' 11000) #('POW' 7000)  #('WOW' 4000) )
+    ]
+
+    "The persisted hall if the image holds one, else the defaults. Resolved by
+     REFLECTION rather than a bare global: naming an undefined class in source
+     would be a compile error, and headless (no image host) the class simply
+     never exists."
+    Galaxigans class >> loadHall [
+        "MACVM adaptation: MACDART persisted the hall as a GxHallOfFame class
+         re-accepted through the Cocoa Browser's host service (STHostService),
+         which this VM's primary game process has no reach to. Here the hall
+         lives in the `Hall` class variable — it persists across games WITHIN a
+         launch (attract -> play -> hall -> newGame all see the same table), and
+         resets to the defaults on a fresh launch. Cross-launch persistence via
+         the SQLite image is a follow-up (docs/gamepane_design.md)."
+        Hall isNil ifTrue: [ ^self defaultHall asOrderedCollection ].
+        ^Hall asOrderedCollection
+    ]
+
+    "GxHallOfFame's whole source, holding [rows] as a literal table."
+    Galaxigans class >> hallSourceFor: rows [
+        | w |
+        w := WriteStream on: String new.
+        w nextPutAll: '"GxHallOfFame - the Galaxigans high-score table. WRITTEN BY THE GAME:'; nl.
+        w nextPutAll: ' each new score re-accepts this class through the same checked path the'; nl.
+        w nextPutAll: ' Browser uses, so the table persists in the image and survives restarts.'; nl.
+        w nextPutAll: ' Edit it here if you like - it is only source."'; nl.
+        w nextPutAll: 'Object subclass: GxHallOfFame ['; nl.
+        w nextPutAll: '    GxHallOfFame class >> table ['; nl.
+        w nextPutAll: '        ^#('.
+        rows do: [ :r |
+            w nextPutAll: ' #('''.
+            w nextPutAll: (r at: 1).
+            w nextPutAll: ''' '.
+            w nextPutAll: (r at: 2) printString.
+            w nextPutAll: ')' ].
+        w nextPutAll: ' )'; nl.
+        w nextPutAll: '    ]'; nl.
+        w nextPutAll: ']'; nl.
+        ^w contents
+    ]
+
+    "Persist [rows] as GxHallOfFame. In the GUI this goes through the image
+     host and answers 'OK ...'; headless there is no host and the reply is an
+     ERR string — the game keeps its in-memory table and shrugs, which is why
+     the battery can drive the whole flow without a window.
+
+     STORE, not accept: we are saving from inside the frame callback. The
+     Browser's acceptEditorClass: hot-reloads the WHOLE world, which re-inits
+     every class's class-side state — including GamePane's StepBlock, the
+     per-frame closure that IS the frame loop. That froze the game on the very
+     frame it saved (the hall of fame came up and never timed out), and the
+     game could not rescue itself: this method's globals are already bound to
+     the pre-reload class, while the driver resolves GamePane by name and gets
+     the new one. storeEditorClass: parse-checks and persists identically, but
+     makes only GxHallOfFame live, so the loop underneath keeps running."
+    Galaxigans class >> saveHall: rows [
+        "MACVM adaptation (see loadHall): store the table in the `Hall` class
+         variable rather than re-accepting a GxHallOfFame class through the
+         Browser host service. Safe to call from inside the frame callback (no
+         world reload, so GamePane's StepBlock — the frame loop itself — is
+         untouched, which is exactly the freeze MACDART's storeEditorClass:
+         note was avoiding). Answers a status string like the original."
+        Hall := rows asOrderedCollection.
+        ^'hall saved (', Hall size printString, ' rows, in-memory)'
+    ]
+
+    "The capture boss (galaxigans_data.inc), and the pilot row it comes for."
+    Galaxigans class >> bossFirst [ ^40 ]
+    Galaxigans class >> bossDwell [ ^60 ]
+    Galaxigans class >> bossRespawn [ ^360 ]
+    Galaxigans class >> bossStationY [ ^18 ]
+    Galaxigans class >> bossCaptureY [ ^140 ]
+    Galaxigans class >> bossScore [ ^500 ]
+    Galaxigans class >> beamCharge [ ^30 ]
+    Galaxigans class >> beamHold [ ^90 ]
+    Galaxigans class >> pilotRowY [ ^344 ]
+    Galaxigans class >> pilotX0 [ ^14 ]
+    Galaxigans class >> pilotGap [ ^16 ]
+    "The original flies its saucer at y=20; here the HUD's own row is up there
+     (5x7 at scale 2 = fourteen pixels from y=8), so it crosses just below,
+     clear of the score."
+    Galaxigans class >> saucerY [ ^30 ]
+    Galaxigans class >> saucerBombGap [ ^28 ]
+    Galaxigans class >> mineScore [ ^150 ]
+
+    Galaxigans class >> launch [
+        "Open the pane and start a new game."
+        ^self new start
+    ]
+
+    "The game that is running, if any — so a script (or the Workspace) can
+     reach it: `Galaxigans current forceNextWave`, `Galaxigans current summary`."
+    Galaxigans class >> current [ ^Current ]
+    Galaxigans class >> register: aGame [ Current := aGame ]
+
+    "A 256-entry sine table in [-256,256], built once. The original carried a
+     sineLUT in .DATA for exactly this reason: the dive weave asks for a sine
+     per diver per frame, and a table keeps the whole flight path in integers —
+     no float in the inner loop, and the same curve every run."
+    Galaxigans class >> sineAt: i [
+        Sine isNil ifTrue: [ self buildSine ].
+        ^Sine at: (i \\ 256) + 1
+    ]
+    Galaxigans class >> buildSine [
+        | t |
+        t := Array new: 256.
+        1 to: 256 do: [ :k |
+            t at: k put: (((k - 1) * 6.283185307179586 / 256.0) sin * 256.0) rounded ].
+        Sine := t
+    ]
+
+    start [
+        Current := self.
+        hiTable := Galaxigans loadHall.
+        hiNewRow := 0.
+        pane := GamePane new.
+        "MACVM's game pane defaults to 320x240; galaxigans is a 640x360 field.
+         Request the size FIRST, before any draw, so the pane is created at it
+         (43_gamepane.mst GamePane>>resizeTo:by:)."
+        pane resizeTo: 640 by: 360.
+        "My motion and timers were tuned for the original's ~33fps pull rate.
+         MACVM's game pane runs at 60fps by default, which plays me twice too
+         fast and piles up sound triggers, so ask for 30 (GamePane>>frameRate:)."
+        pane frameRate: 30.
+        rng := Random new.
+        frame := 0.
+        hiScore := 0.
+        self buildPalette.
+        pane shader: self class cosmosShader.   "layer 0: the twelve cosmos"
+        self buildSprites.
+        self newGame.
+        pane onStep: [ self step ]; run.
+        ^self
+    ]
+
+    "--- setup ------------------------------------------------------------"
+
+    buildPalette [
+        "The indexed layer is drawn OVER the shader, so it is cleared to index
+         0 (transparent) every frame and carries only what the game plots:
+         20 bullet, 21 bomb, 22/23 spark. The background is the shader's now —
+         which is also where the original's stars live."
+        pane paletteAt: 20 r: 255 g: 240 b: 120.
+        pane paletteAt: 21 r: 255 g: 90  b: 220.
+        pane paletteAt: 22 r: 255 g: 200 b: 60.
+        pane paletteAt: 23 r: 255 g: 80  b: 40.
+    ]
+
+    buildSprites [
+        "One sprite instance per formation slot, built ONCE — and each of them
+         carries EVERY species' art as frames: ten species x two flap frames,
+         all 16x16, so a level change is a frame offset and a repaint, not a
+         new sprite. (The pane's Smalltalk face defines and places in one call,
+         and the engine numbers defs per pane-open, so re-defining forty
+         sprites a level would pile up definitions for no reason.)"
+        shipSprite := pane defineSprite: self class shipArt.
+        shipSprite colorAt: 1 r: 230 g: 240 b: 255.
+        shipSprite colorAt: 2 r: 255 g: 140 b: 40.
+        shipSprite colorAt: 3 r: 60  g: 140 b: 255.
+        shipSprite colorAt: 4 r: 255 g: 70  b: 70.
+
+        saucer := pane defineSprite: self class saucerArt.
+        saucer colorAt: 1 r: 220 g: 220 b: 230.
+        saucer colorAt: 2 r: 120 g: 120 b: 140.
+        saucer colorAt: 3 r: 90  g: 220 b: 255.
+        saucer colorAt: 4 r: 255 g: 220 b: 90.
+        saucer hide.
+
+        "The capture boss: one sprite, four frames."
+        boss := GxBoss empty.
+        boss sprite: (pane defineSprite: (self class bossArt at: 1)).
+        2 to: 4 do: [ :k | boss sprite addFrame: (self class bossArt at: k) ].
+        self paintSprite: boss sprite with: self class bossPalette count: 12.
+        boss sprite hide.
+
+        "The pilots: one sprite per life, standing in a row along the bottom.
+         These are what the boss's beam comes for."
+        pilots := (1 to: 4) collect: [ :i | | spr |
+            spr := pane defineSprite: self class pilotArt.
+            self paintSprite: spr with: self class pilotPalette count: 7.
+            spr hide.
+            spr ].
+
+        "Six mines, each a sprite carrying all eight spin frames."
+        mines := (1 to: 6) collect: [ :i | GxMine empty ].
+        mines do: [ :m | | spr pal |
+            spr := pane defineSprite: (self class mineArt at: 1).
+            2 to: 8 do: [ :k | spr addFrame: (self class mineArt at: k) ].
+            pal := self class minePalette.
+            1 to: 8 do: [ :k |
+                spr colorAt: k
+                    r: (pal at: (k - 1) * 3 + 1)
+                    g: (pal at: (k - 1) * 3 + 2)
+                    b: (pal at: (k - 1) * 3 + 3) ].
+            spr hide.
+            m sprite: spr ].
+
+        fleet := OrderedCollection new.
+        1 to: self class rows do: [ :r |
+            1 to: self class cols do: [ :c | | alien spr |
+                alien := Galaxigan
+                    homeX: self class gridX + ((c - 1) * self class colGap)
+                    homeY: self class gridY + ((r - 1) * self class rowGap)
+                    kind: #grunt.
+                spr := pane defineSprite: (self class species at: 1) art.
+                spr addFrame: (self class species at: 1) art2.
+                2 to: self class species size do: [ :k |
+                    spr addFrame: (self class species at: k) art.
+                    spr addFrame: (self class species at: k) art2 ].
+                spr hide.
+                alien sprite: spr.
+                fleet add: alien ] ]
+    ]
+
+    paintSprite: aSprite with: pal count: n [
+        1 to: n do: [ :k |
+            aSprite colorAt: k
+                r: (pal at: (k - 1) * 3 + 1)
+                g: (pal at: (k - 1) * 3 + 2)
+                b: (pal at: (k - 1) * 3 + 3) ]
+    ]
+
+    "Dress the fleet for this level: each row becomes one species — its art is
+     already loaded as frames, so this is a frame offset plus its palette."
+    dressFleet [
+        | rowSpecies |
+        rowSpecies := self class themes at: theme.
+        1 to: fleet size do: [ :i | | a row sp |
+            a := fleet at: i.
+            row := (i - 1) // self class cols + 1.
+            sp := self class species at: (rowSpecies at: row).
+            a species: (rowSpecies at: row) name: sp name.
+            sp paint: a sprite ]
+    ]
+
+    newGame [
+        score := 0.
+        lives := 3.
+        wave := 1.
+        flap := 0.
+        gameState := #attract.
+        stateTimer := self class attractLength.
+        self startWave
+    ]
+
+    startWave [
+        "Rebuild the fleet's state (the objects persist; a wave is a reset, not
+         a reallocation), pick this level's cosmos and formation, and re-arm the
+         timers. The level table wraps, so wave 13 is level 1's backdrop again —
+         with wave 13's dive cadence."
+        level := (wave - 1) \\ self class levels size + 1.
+        scene := (self class levels at: level) at: 1.
+        theme := (self class levels at: level) at: 2.
+        pane shaderParam: 0 value: scene.
+        shipX := self class fieldWidth // 2.
+        respawn := 0.
+        cooldown := 0.
+        fireWasDown := false.
+        swayX := 0. swayDir := 1.
+        diveTimer := self divePeriodNow.
+        bombTimer := self class bombPeriod.
+        saucerX := -60. saucerDir := 0. saucerTimer := self class saucerPeriod.
+        saucerWah := 0.
+        saucerBombT := self class saucerBombGap.
+        fleet do: [ :a | a setHomeX: a homeX homeY: a homeY kind: a kind ].
+        self dressFleet.
+        bullets := (1 to: 4) collect: [ :i | GxShot empty ].
+        bombs := (1 to: 6) collect: [ :i | GxShot empty ].
+        mines do: [ :m | m kill ].
+        mineDrops := 0. saucerDrops := 0.
+        bossOn := ((self class levels at: level) at: 3) = 1.
+        boss setIdle.
+        abducting := 0. abducteeX := 0. abducteeY := 0. beamPhase := 0.
+        pilotsTaken isNil ifTrue: [ pilotsTaken := 0 ].
+        sparks := OrderedCollection new
+    ]
+
+    "Each wave dives harder — the original ramps gDivePeriod the same way."
+    divePeriodNow [ ^(self class divePeriod - (wave - 1 * 6)) max: 18 ]
+
+    "State, readable — for a headless test or a scripted probe. The game runs
+     perfectly well with no window (every pane primitive is a no-op there), so
+     the whole of it can be driven and asserted on from the battery."
+    gameState [ ^gameState ]
+    score [ ^score ]
+    lives [ ^lives ]
+    wave [ ^wave ]
+    aliveCount [
+        | n |
+        n := 0.
+        fleet do: [ :a | a alive ifTrue: [ n := n + 1 ] ].
+        ^n
+    ]
+
+    "Which cosmos and which creatures this level fields — the level table,
+     read back. Used by the battery to walk all twelve."
+    levelReport [
+        | names |
+        names := OrderedCollection new.
+        (self class themes at: theme) do: [ :k |
+            names add: (self class species at: k) name printString ].
+        ^'L', level printString, ' ', (self class sceneNames at: scene + 1),
+         ' [', (names inject: '' into: [ :a :b | a isEmpty ifTrue: [ b ] ifFalse: [ a, ' ', b ] ]), ']'
+    ]
+
+    "Send the bonus saucer across now, instead of waiting out its 420-frame
+     timer — for a test, or for anyone who wants to hear the warble."
+    summonSaucer [ saucerTimer := 1 ]
+
+    "Set the score — so a test (or a workspace doit) can walk a chosen score
+     into the hall without earning it."
+    setScore: n [ score := n ]
+
+    "The hall as one line per row — for the battery and the control plane."
+    hallReport [
+        | w |
+        w := WriteStream on: String new.
+        1 to: hiTable size do: [ :i | | r |
+            r := hiTable at: i.
+            w nextPutAll: i printString, ' ', (r at: 1), ' ', (r at: 2) printString.
+            w nl ].
+        w nextPutAll: 'new row ', hiNewRow printString.
+        ^w contents
+    ]
+
+    "Set the lives, so a test can put the player on their last pilot — the one
+     state the boss is supposed to leave alone."
+    setLives: n [ lives := n ]
+
+    "Start the victory dance now, without dying three times for it."
+    danceNow [ self beginDance ]
+
+    "The aliens have won: they leave formation, and their own tune plays over
+     it — the square-lead 'Alien Victory' from the original's music file."
+    beginDance [
+        gameState := #over.
+        stateTimer := self class danceLength.
+        danceT := 0.
+        (Tune fromAbc: self class tuneAlienVictory) playOnce
+    ]
+
+    "How many mines are in the field, and where the fleet is relative to its
+     formation — the two new features, readable for the battery."
+    mineReport [
+        | n |
+        n := 0.
+        mines do: [ :m | m live ifTrue: [ n := n + 1 ] ].
+        ^'mines ', n printString, ' (dropped ', mineDrops printString,
+         ' of ', saucerDrops printString, ' saucer drops)'
+    ]
+
+    "How far the fleet has left its slots: 0 in formation, large mid-dance."
+    danceSpread [
+        | d n |
+        d := 0. n := 0.
+        fleet do: [ :a |
+            a alive ifTrue: [
+                d := d + (a y - a homeY) abs. n := n + 1 ] ].
+        ^n = 0 ifTrue: [ 0 ] ifFalse: [ d // n ]
+    ]
+
+    "The boss's state and what the beam is doing — for the battery."
+    bossReport [
+        ^boss state printString,
+         (abducting = 1 ifTrue: [ ' abducting' ] ifFalse: [
+            abducting = 2 ifTrue: [ ' freeing' ] ifFalse: [ '' ] ])
+    ]
+    bossOn [ ^bossOn ]
+    "How many pilots the boss has actually carried off — a LIFETIME count, so a
+     test is not fooled by the game resetting under it."
+    pilotsTaken [ ^pilotsTaken ]
+    abductReport [
+        ^'abductee y ', abducteeY printString, ' target ', (boss y + 26) printString,
+         ' beamT ', boss beamT printString
+    ]
+
+    "Where the saucer is and whether its warble is running — for the battery."
+    saucerReport [
+        ^saucerDir = 0
+            ifTrue: [ 'saucer away' ]
+            ifFalse: [ 'saucer at ', saucerX printString,
+                       ' warble in ', saucerWah printString ]
+    ]
+
+    "Skip to the next wave — the battery's way to walk the level table without
+     playing twelve waves out."
+    forceNextWave [
+        wave := wave + 1.
+        self startWave.
+        gameState := #playing
+    ]
+
+    summary [
+        ^gameState printString, ' score ', score printString,
+         ' lives ', lives printString, ' wave ', wave printString,
+         ' alive ', self aliveCount printString
+    ]
+
+    "--- the frame --------------------------------------------------------"
+
+    step [
+        frame := frame + 1.
+        gameState == #playing ifTrue: [ self stepPlay ].
+        gameState == #attract ifTrue: [ self stepAttract ].
+        gameState == #cleared ifTrue: [ self stepCleared ].
+        gameState == #over ifTrue: [ self stepOver ].
+        gameState == #hiscore ifTrue: [ self stepHiscores ].
+        self draw.
+        pane present
+    ]
+
+    stepAttract [
+        "The title, with the fleet swaying behind it. Fire starts a game — and
+         if nobody does, the title hands over to the hall of fame and the cabinet
+         keeps cycling title, table, title, ... for as long as it is left alone.
+         That loop is the whole point of an attract mode: the hall of fame is not
+         somewhere the machine ENDS up after a game, it is one of the two faces
+         the machine shows while it waits for a player."
+        self swayFleet.
+        fleet do: [ :a | a alive ifTrue: [ a followFormation: swayX ] ].
+        (self firePressed) ifTrue: [
+            gameState := #playing.
+            self startWave.
+            (Tune fromAbc: self class tuneTitle) playOnce.
+            ^self ].
+        stateTimer := stateTimer - 1.
+        stateTimer <= 0 ifTrue: [ self showHiscores ]
+    ]
+
+    "Show the hall of fame with nothing highlighted — the attract cycle's turn
+     at the table, as opposed to enterHiscores, which arrives with a fresh score
+     to slot in and a row to flash."
+    showHiscores [
+        hiNewRow := 0.
+        gameState := #hiscore.
+        stateTimer := self class hiscoreLength
+    ]
+
+    stepCleared [
+        stateTimer := stateTimer - 1.
+        stateTimer <= 0 ifTrue: [
+            wave := wave + 1.
+            gameState := #playing.
+            self startWave ]
+    ]
+
+    "Game over: the survivors break formation and dance. Ported from the
+     original's AlienDance — the angle steps once a frame plus each alien's own
+     offset around the wheel, and the radius breathes at HALF that rate, so the
+     pinwheel opens and closes as it turns. Integer sines throughout (the same
+     256-entry table the dive weave uses), so it is exactly reproducible."
+    stepOver [
+        stateTimer := stateTimer - 1.
+        danceT := danceT + 1.
+        self dance.
+        self stepSparks.
+        stateTimer <= 0 ifTrue: [
+            score > hiScore ifTrue: [ hiScore := score ].
+            self enterHiscores ]
+    ]
+
+    "The dance is over: slot the score into the hall (sorted, six rows, named
+     YOU — the original's own InsertHiScore), persist the hall through the
+     image host if one is listening, and show the table for a few seconds
+     before the attract resumes."
+    enterHiscores [
+        | fresh inserted |
+        hiNewRow := 0.
+        fresh := OrderedCollection new.
+        inserted := false.
+        hiTable do: [ :r |
+            (inserted not and: [ score > (r at: 2) ]) ifTrue: [
+                fresh add: (Array with: 'YOU' with: score).
+                inserted := true.
+                hiNewRow := fresh size ].
+            fresh add: r ].
+        inserted ifTrue: [
+            [ fresh size > 6 ] whileTrue: [ fresh removeLast ].
+            hiTable := fresh.
+            Galaxigans saveHall: hiTable.
+            "saveHall STORES rather than accepts (see it), so the world is no
+             longer hot-reloaded underneath the running frame loop and Current
+             survives. Re-register anyway: it costs nothing, and it keeps the
+             control plane and the next save pointed at the running game however
+             the save was made."
+            Galaxigans register: self ].
+        gameState := #hiscore.
+        stateTimer := self class hiscoreLength
+    ]
+
+    stepHiscores [
+        stateTimer := stateTimer - 1.
+        stateTimer <= 0 ifTrue: [ self newGame ]
+    ]
+
+    dance [
+        | i |
+        i := 0.
+        fleet do: [ :a |
+            a alive ifTrue: [ | radius angle |
+                radius := self class danceR0 +
+                    ((Galaxigans sineAt: (danceT // 2) + (i * self class danceRadStep))
+                        * self class danceR1 // 256).
+                angle := danceT + (i * self class danceAngleStep).
+                a moveToX: self class danceCX +
+                        ((Galaxigans sineAt: angle + 64) * radius // 256)
+                  y: self class danceCY +
+                        ((Galaxigans sineAt: angle) * radius // 256).
+                i := i + 1 ] ]
+    ]
+
+    stepPlay [
+        respawn > 0
+            ifTrue: [ respawn := respawn - 1 ]
+            ifFalse: [ self stepShip ].
+        self stepBullets.
+        self stepBombs.
+        self swayFleet.
+        self stepFleet.
+        self stepSaucer.
+        self stepMines.
+        self stepBoss.
+        self stepSparks.
+        self checkCollisions.
+        (fleet anySatisfy: [ :a | a alive ]) ifFalse: [
+            gameState := #cleared.
+            stateTimer := 120.
+            (Tune fromAbc: self class tuneStageClear) playOnce ]
+    ]
+
+    "--- the player -------------------------------------------------------"
+
+    stepShip [
+        | speed |
+        speed := 4.
+        (pane keyHeld: GamePane keyLeft) ifTrue: [ shipX := shipX - speed ].
+        (pane keyHeld: GamePane keyRight) ifTrue: [ shipX := shipX + speed ].
+        shipX := (shipX max: 12) min: self class fieldWidth - 12.
+        cooldown > 0 ifTrue: [ cooldown := cooldown - 1 ].
+        self firePressed ifTrue: [ self fire ]
+    ]
+
+    "Tap to fire: the key must be RELEASED between shots (the original's
+     shoot_held / shoot_release_frames). Holding Space does nothing."
+    firePressed [
+        | down pressed |
+        down := pane keyHeld: GamePane keyA.
+        pressed := down and: [ fireWasDown not ].
+        fireWasDown := down.
+        ^pressed
+    ]
+
+    fire [
+        cooldown > 0 ifTrue: [ ^self ].
+        bullets do: [ :b |
+            b live ifFalse: [
+                b fireFrom: shipX y: self class playerY - 12 dy: -7.
+                cooldown := 8.
+                Sound shoot play.
+                ^self ] ]
+    ]
+
+    stepBullets [
+        bullets do: [ :b | b stepIn: self class fieldHeight ]
+    ]
+
+    "--- the fleet --------------------------------------------------------"
+
+    swayFleet [
+        swayX := swayX + swayDir.
+        swayX >= 16 ifTrue: [ swayDir := -1 ].
+        swayX <= -16 ifTrue: [ swayDir := 1 ]
+    ]
+
+    stepFleet [
+        diveTimer := diveTimer - 1.
+        diveTimer <= 0 ifTrue: [
+            diveTimer := self divePeriodNow.
+            self launchDiver ].
+        bombTimer := bombTimer - 1.
+        bombTimer <= 0 ifTrue: [
+            bombTimer := self class bombPeriod.
+            self dropBomb ].
+        fleet do: [ :a |
+            a alive ifTrue: [
+                a state == #dive
+                    ifTrue: [
+                        (a diveStep: shipX height: self class fieldHeight)
+                            ifTrue: [ a reenterAt: swayX ] ]
+                    ifFalse: [
+                        a state == #return
+                            ifTrue: [ a returnStep: swayX ]
+                            ifFalse: [ a followFormation: swayX ] ] ] ]
+    ]
+
+    "Pick a live alien still sitting in formation and launch it, with a random
+     seed for its flight plan."
+    launchDiver [
+        | candidates |
+        candidates := OrderedCollection new.
+        fleet do: [ :a |
+            (a alive and: [ a state == #form ]) ifTrue: [ candidates add: a ] ].
+        candidates isEmpty ifTrue: [ ^self ].
+        (candidates at: (rng next * candidates size) truncated + 1)
+            diveWithSeed: (rng next * 65535) truncated
+    ]
+
+    "The lowest diver drops the bomb — a bomb from the back of the formation
+     would be a free hit on nobody."
+    dropBomb [
+        | lowest |
+        lowest := nil.
+        fleet do: [ :a |
+            (a alive and: [ a isDiving ]) ifTrue: [
+                (lowest isNil or: [ a y > lowest y ]) ifTrue: [ lowest := a ] ] ].
+        lowest isNil ifTrue: [ ^self ].
+        bombs do: [ :b |
+            b live ifFalse: [
+                b fireFrom: lowest x y: lowest y + 10 dy: 4.
+                ^self ] ]
+    ]
+
+    stepBombs [
+        bombs do: [ :b | b stepIn: self class fieldHeight ]
+    ]
+
+    "--- the bonus saucer -------------------------------------------------"
+
+    stepSaucer [
+        saucerDir = 0
+            ifTrue: [
+                saucerTimer := saucerTimer - 1.
+                saucerTimer <= 0 ifTrue: [
+                    saucerTimer := self class saucerPeriod.
+                    saucerDir := (rng next < 0.5) ifTrue: [ 1 ] ifFalse: [ -1 ].
+                    saucerWah := 0.               "start the warble on arrival"
+                    (Tune fromAbc: self class tuneSaucer) playOnce.
+                    saucerX := saucerDir > 0
+                        ifTrue: [ -30 ]
+                        ifFalse: [ self class fieldWidth + 30 ] ] ]
+            ifFalse: [
+                saucerX := saucerX + (saucerDir * 2).
+                self warble.
+                self saucerDrop.
+                (saucerX < -40 or: [ saucerX > (self class fieldWidth + 40) ])
+                    ifTrue: [ saucerDir := 0. saucer hide ] ]
+    ]
+
+    "The saucer lobs something from its belly every 28 frames while it is over
+     the field — and about one drop in eight is a MINE rather than a bomb, which
+     is the original's own ratio (Rng & 7). The rare one is the interesting one:
+     a bomb is gone in two seconds, a mine hangs there."
+    saucerDrop [
+        (saucerX < 0 or: [ saucerX > (self class fieldWidth - 16) ]) ifTrue: [ ^self ].
+        saucerBombT := saucerBombT - 1.
+        saucerBombT > 0 ifTrue: [ ^self ].
+        saucerBombT := self class saucerBombGap.
+        saucerDrops := saucerDrops + 1.
+        (rng next * 8) truncated = 0
+            ifTrue: [
+                mines do: [ :m |
+                    m live ifFalse: [
+                        m dropAt: saucerX y: self class saucerY + 12.
+                        mineDrops := mineDrops + 1.
+                        ^self ] ] ]
+            ifFalse: [
+                bombs do: [ :b |
+                    b live ifFalse: [
+                        b fireFrom: saucerX y: self class saucerY + 12 dy: 4.
+                        ^self ] ] ]
+    ]
+
+    stepMines [
+        mines do: [ :m | m stepIn: self class fieldHeight ]
+    ]
+
+    "--- the capture boss ---------------------------------------------------"
+
+    stepBoss [
+        | event |
+        "A freed pilot falls home from wherever the beam had got it to — that
+         runs in ANY boss state, including after the boss is gone."
+        abducting = 2 ifTrue: [
+            abducteeY := abducteeY + 5.
+            abducteeY >= self class pilotRowY ifTrue: [ abducting := 0 ] ].
+
+        event := boss stepWithLives: lives enabled: bossOn.
+        event == #warn ifTrue: [ Sound hurt play ].
+        event == #charged ifTrue: [ Sound bossHum play ].
+        event == #done ifTrue: [ self releasePilot ].
+        event == #grab ifTrue: [ self dragPilot ].
+        boss isBeaming ifTrue: [ self cascadeBeam ]
+    ]
+
+    "The abduction: a pilot leaves the row and rises up the beam. It reaching
+     the boss costs a life — and if that was the last one, the aliens have won
+     and the dance begins."
+    dragPilot [
+        abducting = 0 ifTrue: [
+            lives <= 1 ifTrue: [ ^self ].       "never take the last pilot"
+            abducting := 1.
+            abducteeX := boss beamX - 6.
+            abducteeY := self class pilotRowY.
+            ^self ].
+        abducting = 1 ifFalse: [ ^self ].
+        abducteeY := abducteeY - 3.
+        abducteeY > (boss y + 26) ifTrue: [ ^self ].
+        "It made it to the boss."
+        lives := lives - 1.
+        pilotsTaken := pilotsTaken + 1.
+        abducting := 0.
+        Sound hurt play.
+        self burstAt: boss beamX y: boss y + 26 colour: 22.
+        lives <= 0
+            ifTrue: [ self beginDance. boss vanish ]
+            ifFalse: [ boss retreat ]
+    ]
+
+    "The beam times out with nobody taken: whatever is halfway up falls home."
+    releasePilot [
+        abducting = 1 ifTrue: [ abducting := 2 ]
+    ]
+
+    "Shooting the boss frees any pilot in the beam (it drops home, saved) and
+     pays 500 — the best thing on the screen, and the reason to take the risk
+     of standing under a tractor beam."
+    checkBossHit [
+        bullets do: [ :b |
+            (b live and: [ boss hits: b x y: b y ]) ifTrue: [
+                b kill.
+                score := score + self class bossScore.
+                self burstAt: boss x + 16 y: boss y + 16 colour: 23.
+                Sound explode play.
+                self releasePilot.
+                boss retreat.
+                ^self ] ]
+    ]
+
+    "The beam's colour FLOWS without redrawing a pixel: the cone is drawn once
+     in palette index 1, and index 1 means something different on every
+     scanline. Stepping the ramp by (y + phase) each frame sends the bands
+     downward — the copper-bar trick, and the original's own (BeamCascade)."
+    cascadeBeam [
+        | top bot ramp |
+        top := boss beamTop.
+        bot := boss beamBottom: self class fieldHeight.
+        ramp := self class beamRamp.
+        beamPhase := beamPhase + 1.
+        top to: bot do: [ :y |
+            (y >= 0 and: [ y < self class fieldHeight ]) ifTrue: [ | k |
+                k := ((y - top + beamPhase) // 2) \\ 8.
+                pane linePaletteAt: y index: 1
+                     r: (ramp at: k * 3 + 1)
+                     g: (ramp at: k * 3 + 2)
+                     b: (ramp at: k * 3 + 3) ] ]
+    ]
+
+    "The cyan energy ramp, pulsing dim -> white -> dim so it reads as flow."
+    Galaxigans class >> beamRamp [
+        ^#(16 48 64   28 96 120   48 152 184   88 200 232
+           176 244 255   88 200 232   48 152 184   28 96 120)
+    ]
+
+    "The saucer's wah-wah: two sines five Hz apart, beating against each other.
+     One note runs 0.9s and the crossing takes six, so it is re-triggered on a
+     loop while the saucer is on screen — the original does exactly this
+     (PlaySaucerWah), and it is why the warble seems to go on forever and then
+     simply stops when the saucer leaves."
+    warble [
+        saucerWah > 0
+            ifTrue: [ saucerWah := saucerWah - 1 ]
+            ifFalse: [ saucerWah := 50. Sound saucer play ]
+    ]
+
+    "--- collisions -------------------------------------------------------"
+
+    checkCollisions [
+        bullets do: [ :b |
+            b live ifTrue: [
+                (saucerDir ~= 0 and: [ b hits: saucerX y: self class saucerY + 4
+                                        halfWidth: 12 halfHeight: 8 ])
+                    ifTrue: [
+                        b kill.
+                        score := score + 200.
+                        self burstAt: saucerX y: self class saucerY + 4 colour: 22.
+                        Sound coin play.
+                        saucerDir := 0.
+                        saucer moveTo: -80 y: -80 ].
+                b live ifTrue: [
+                    fleet do: [ :a |
+                        (b live and: [ a hits: b x y: b y halfWidth: 4 ]) ifTrue: [
+                            b kill.
+                            score := score + a points.
+                            self burstAt: a x y: a y colour: 23.
+                            Sound explode play.
+                            a kill.
+                            a sprite hide ] ] ] ] ].
+
+        self checkBossHit.
+
+        "Shooting a mine is the treat: 150, the best points on the screen."
+        bullets do: [ :b |
+            b live ifTrue: [
+                mines do: [ :m |
+                    (b live and: [ m hits: b x y: b y halfWidth: 4 halfHeight: 4 ])
+                        ifTrue: [
+                            b kill.
+                            m kill.
+                            m sprite hide.
+                            score := score + self class mineScore.
+                            self burstAt: m x y: m y colour: 22.
+                            Sound bang play ] ] ] ].
+
+        respawn > 0 ifTrue: [ ^self ].
+        "And touching one is the threat."
+        mines do: [ :m |
+            (m hits: shipX y: self class playerY halfWidth: 6 halfHeight: 6)
+                ifTrue: [ m kill. m sprite hide. self loseLife ] ].
+        bombs do: [ :b |
+            (b hits: shipX y: self class playerY halfWidth: 8 halfHeight: 10)
+                ifTrue: [ b kill. self loseLife ] ].
+        fleet do: [ :a |
+            (a isDiving and: [ a hits: shipX y: self class playerY halfWidth: 6 ])
+                ifTrue: [
+                    self burstAt: a x y: a y colour: 23.
+                    a kill.
+                    a sprite hide.
+                    self loseLife ] ]
+    ]
+
+    loseLife [
+        self burstAt: shipX y: self class playerY colour: 22.
+        Sound hurt play.
+        lives := lives - 1.
+        respawn := 90.
+        shipX := self class fieldWidth // 2.
+        lives <= 0 ifTrue: [ self beginDance ]
+    ]
+
+    "--- explosions -------------------------------------------------------"
+
+    burstAt: bx y: by colour: c [
+        | n |
+        n := 14.
+        1 to: n do: [ :i | | ang |
+            ang := (i * 256 // n).
+            sparks add: (GxSpark
+                at: bx y: by
+                vx: (Galaxigans sineAt: ang) * 5 // 256
+                vy: (Galaxigans sineAt: ang + 64) * 5 // 256 - 2
+                colour: c) ].
+        sparks size > 240 ifTrue: [ sparks removeFirst ]
+    ]
+
+    stepSparks [
+        | keep |
+        keep := OrderedCollection new.
+        sparks do: [ :s | s step. s live ifTrue: [ keep add: s ] ].
+        sparks := keep
+    ]
+
+    "--- drawing ----------------------------------------------------------"
+
+    draw [
+        "Index 0 is transparent, so clearing to it leaves the SHADER visible
+         underneath — the indexed layer carries only the game's own pixels."
+        pane cls: 0.
+        sparks do: [ :s |
+            pane fill: s x y: s y width: 2 height: 2 color: s colour ].
+        bullets do: [ :b |
+            b live ifTrue: [
+                pane fill: b x - 1 y: b y width: 3 height: 8 color: 20 ] ].
+        bombs do: [ :b |
+            b live ifTrue: [
+                pane fill: b x - 2 y: b y width: 4 height: 6 color: 21 ] ].
+        self drawBeam.
+        self placeSprites.
+        self drawHud
+    ]
+
+    "The tractor beam: a cone widening from the boss's mouth to the floor,
+     drawn ONCE per frame in palette index 1 — whose colour the cascade has
+     already made different on every scanline. Half-width goes 4 -> 20 down its
+     length, which is the original's own taper."
+    drawBeam [
+        | top bot span |
+        boss isBeaming ifFalse: [ ^self ].
+        top := boss beamTop.
+        bot := boss beamBottom: self class fieldHeight.
+        span := (bot - top) max: 1.
+        top to: bot do: [ :y |
+            | hw |
+            hw := 4 + ((y - top) * 16 // span).
+            pane fill: boss beamX - hw y: y width: hw * 2 height: 1 color: 1 ]
+    ]
+
+    placeSprites [
+        "Sprites are placed by their top-left, so everything is drawn from its
+         centre minus half its art. The fleet flaps: every eighth frame the
+         whole formation switches to its species' second frame. The high-score
+         scene stands alone: everything hides while the table is up."
+        gameState == #hiscore ifTrue: [
+            fleet do: [ :a | a sprite hide ].
+            mines do: [ :m | m sprite hide ].
+            boss sprite hide.
+            pilots do: [ :spr | spr hide ].
+            saucer hide.
+            shipSprite hide.
+            ^self ].
+        flap := (frame // 8) \\ 2.
+        fleet do: [ :a |
+            a alive
+                ifTrue: [ a sprite moveTo: a x - 8 y: a y - 8
+                                   frame: (a frameFor: flap) ]
+                ifFalse: [ a sprite hide ] ].
+        mines do: [ :m |
+            m live
+                ifTrue: [ m sprite moveTo: m x - 8 y: m y - 8 frame: m frame ]
+                ifFalse: [ m sprite hide ] ].
+        boss isIdle
+            ifTrue: [ boss sprite hide ]
+            ifFalse: [ boss sprite moveTo: boss x y: boss y frame: boss frame ].
+        self placePilots.
+        saucerDir = 0
+            ifTrue: [ saucer hide ]
+            ifFalse: [ saucer moveTo: saucerX - 10 y: self class saucerY ].
+        (gameState == #playing and: [ respawn = 0 ])
+            ifTrue: [ shipSprite moveTo: shipX - 8 y: self class playerY - 7 ]
+            ifFalse: [
+                "Blink through the respawn pause instead of vanishing."
+                (respawn > 0 and: [ (respawn // 4) \\ 2 = 0 ])
+                    ifTrue: [ shipSprite moveTo: shipX - 8 y: self class playerY - 7 ]
+                    ifFalse: [ shipSprite hide ] ]
+    ]
+
+    "The pilots standing along the bottom: one per life. A pilot in the beam has
+     LEFT the row — it is drawn wherever the beam has dragged it to, and it is
+     still yours until it reaches the boss."
+    placePilots [
+        | inRow |
+        inRow := abducting > 0 ifTrue: [ lives - 1 ] ifFalse: [ lives ].
+        1 to: pilots size do: [ :i |
+            i <= inRow
+                ifTrue: [ (pilots at: i)
+                            moveTo: self class pilotX0 + ((i - 1) * self class pilotGap)
+                            y: self class pilotRowY ]
+                ifFalse: [ (pilots at: i) hide ] ].
+        abducting > 0 ifTrue: [
+            (pilots at: pilots size) moveTo: abducteeX y: abducteeY ]
+    ]
+
+    "Six digits, zero-padded — the arcade's own score format (HiFmt)."
+    score6: n [
+        | t |
+        t := n printString.
+        [ t size < 6 ] whileTrue: [ t := '0', t ].
+        ^t
+    ]
+
+    drawHiscores [
+        | y r |
+        pane textClear.
+        pane text: 'H I G H   S C O R E S'
+             x: 130 y: 46 r: 255 g: 210 b: 60 scale: 3.
+        y := 110.
+        1 to: hiTable size do: [ :i |
+            r := hiTable at: i.
+            "The row you just took blinks gold; the rest sit quiet."
+            (i = hiNewRow and: [ (frame // 8) \\ 2 = 0 ])
+                ifTrue: [
+                    pane text: i printString, '  ', (r at: 1), '  ', (self score6: (r at: 2))
+                         x: 190 y: y r: 255 g: 220 b: 90 scale: 2 ]
+                ifFalse: [
+                    pane text: i printString, '  ', (r at: 1), '  ', (self score6: (r at: 2))
+                         x: 190 y: y
+                         r: (i = hiNewRow ifTrue: [ 255 ] ifFalse: [ 150 ])
+                         g: (i = hiNewRow ifTrue: [ 220 ] ifFalse: [ 200 ])
+                         b: (i = hiNewRow ifTrue: [ 90 ] ifFalse: [ 255 ])
+                         scale: 2 ].
+            y := y + 26 ].
+        hiNewRow > 0 ifTrue: [
+            pane text: 'A PLACE IN THE HALL'
+                 x: 208 y: 300 r: 120 g: 255 b: 140 scale: 2 ]
+    ]
+
+    drawHud [
+        gameState == #hiscore ifTrue: [ ^self drawHiscores ].
+        pane textClear.
+        pane text: 'SCORE ', score printString
+             x: 10 y: 8 r: 255 g: 255 b: 255 scale: 2.
+        pane text: 'HI ', (hiScore max: score) printString
+             x: 250 y: 8 r: 255 g: 220 b: 90 scale: 2.
+        pane text: 'WAVE ', wave printString
+             x: 440 y: 8 r: 140 g: 220 b: 255 scale: 2.
+        pane text: (self class sceneNames at: scene + 1)
+             x: 440 y: 336 r: 150 g: 150 b: 190 scale: 2.
+        pane text: 'SHIPS ', lives printString
+             x: 10 y: 336 r: 120 g: 200 b: 255 scale: 2.
+        gameState == #attract ifTrue: [
+            pane text: 'GALAXIGANS' x: 176 y: 140 r: 255 g: 210 b: 60 scale: 5.
+            pane text: 'SPACE TO START   ARROWS TO STEER'
+                 x: 152 y: 200 r: 220 g: 220 b: 255 scale: 2 ].
+        gameState == #cleared ifTrue: [
+            pane text: 'WAVE CLEARED' x: 200 y: 150 r: 120 g: 255 b: 140 scale: 4.
+            pane text: 'NEXT: ', (self class sceneNames
+                                     at: ((self class levels
+                                             at: wave \\ self class levels size + 1)
+                                          at: 1) + 1)
+                 x: 200 y: 200 r: 220 g: 220 b: 255 scale: 2 ].
+        gameState == #over ifTrue: [
+            pane text: 'GAME OVER' x: 220 y: 160 r: 255 g: 90 b: 90 scale: 4.
+            pane text: 'SCORE ', score printString
+                 x: 236 y: 210 r: 255 g: 220 b: 120 scale: 2 ]
+    ]
+
+
+    "--- the creature library, the level table, and the cosmos --------------"
+
+    "Ten species, built once. Their art and palettes are the assembler's own."
+    Galaxigans class >> species [
+        "Built one at a time: Array class>>with: stops at five arguments, and
+         ten species is exactly the kind of place that runs out."
+        Species isNil ifTrue: [
+            Species := Array new: 10.
+            Species at: 1  put: self gruntSpecies.
+            Species at: 2  put: self mothSpecies.
+            Species at: 3  put: self beetleSpecies.
+            Species at: 4  put: self scorpionSpecies.
+            Species at: 5  put: self mantisSpecies.
+            Species at: 6  put: self hornetSpecies.
+            Species at: 7  put: self jellyfishSpecies.
+            Species at: 8  put: self spiderSpecies.
+            Species at: 9  put: self stingraySpecies.
+            Species at: 10 put: self squidSpecies ].
+        ^Species
+    ]
+
+    "Formation themes: the species for grid rows 1..5, top row first (and the
+     top row is the toughest). The original ships four themes and rotates them
+     through the level table — classic, then the newer species, then a mix."
+    Galaxigans class >> themes [
+        ^#(
+            #(6 2 1 1 3)      "classic:   hornet moth grunt grunt beetle"
+            #(6 9 2 3 1)      "+ray:      hornet stingray moth beetle grunt"
+            #(10 7 9 8 5)     "new-heavy: squid jellyfish stingray spider mantis"
+            #(7 6 9 4 2)      "full mix:  jellyfish hornet stingray scorpion moth"
+        )
+    ]
+
+    "The level table, ported row for row: {cosmos scene, formation theme}. The
+     scene is which of the twelve backdrops the layer-0 shader draws; levels
+     past the last row wrap it, and the dive cadence keeps tightening."
+    Galaxigans class >> levels [
+        "{cosmos scene, formation theme, capture boss?} — the original's own
+         table, boss column and all: it turns up every third level."
+        ^#(
+            #(0 1 0)  #(1 2 0)  #(2 3 1)   #(3 4 0)
+            #(4 1 0)  #(5 2 1)  #(6 3 0)   #(7 4 0)
+            #(8 1 1)  #(9 2 0)  #(10 3 0)  #(11 4 1)
+        )
+    ]
+
+    Galaxigans class >> sceneNames [
+        ^#('NEBULA' 'GALAXY' 'BLACK HOLE' 'ALIEN WORLD' 'MOON' 'SUPERNOVA'
+           'WORMHOLE' 'GAS GIANT' 'AURORA' 'PULSAR' 'PLASMA' 'BINARY STARS')
+    ]
+
+    "The twelve cosmos backdrops, as one Metal fragment shader with the scene in
+     shader parameter 0. Translated from the original's HLSL (its starfield
+     module compiles the same twelve scenes for D3D) — same maths, same
+     constants, Metal spelling: frac->fract, lerp->mix, and the aspect the
+     original hardcodes as 1.7778 taken from the uniform instead."
+    Galaxigans class >> cosmosShader [
+        ^'float h21(float2 p) { return fract(sin(dot(p, float2(127.1, 311.7))) * 43758.5453); }
+
+float3 scNebula(float2 uv, float t) {
+    float px = uv.x * 640.0, py = uv.y * 360.0;
+    float n = sin(px*0.011 + t*0.30) + sin(py*0.014 - t*0.20)
+            + sin((px+py)*0.007 + t*0.15) + sin((px-py)*0.009 - t*0.10);
+    float neb = (n + 4.0) * 0.125;
+    float3 col = float3(0.015 + neb*0.05, 0.010 + neb*0.03, 0.055 + neb*0.20);
+    for (int L = 0; L < 3; L++) {
+        float sp = 16.0 + float(L)*30.0, cell = 13.0 + float(L)*6.0;
+        float2 cp = float2(px, py - t*sp) / cell;
+        float2 gi = floor(cp);
+        float h = h21(gi);
+        if (h > 0.90) {
+            float2 sub = fract(cp) - 0.5;
+            float d = dot(sub, sub);
+            float tw = 0.55 + 0.45*sin(t*3.0 + h*50.0);
+            col += saturate(1.0 - d*55.0) * tw * (0.45 + 0.5*float(L));
+        }
+    }
+    return col;
+}
+
+float3 scGalaxy(float2 uv, float t, float aspect) {
+    float2 c = uv - 0.5; c.x *= aspect;
+    float r = length(c); float a = atan2(c.y, c.x);
+    float spiral = sin(2.0*(a + t*0.15) + 6.5*log(r + 0.06));
+    float arm = smoothstep(0.0, 0.7, spiral) * exp(-r*2.6);
+    float core = exp(-r*r*38.0);
+    float3 col = float3(0.04, 0.02, 0.09);
+    col += arm * float3(0.45, 0.40, 0.85) * 0.7;
+    col += core * float3(1.0, 0.9, 0.7);
+    col += arm * 0.35 * float3(0.8, 0.5, 0.95) * (0.5 + 0.5*sin(r*60.0 - t));
+    float2 sg = c*70.0; float2 sgi = floor(sg); float sh = h21(sgi);
+    float2 ssb = fract(sg) - 0.5; float sd = dot(ssb, ssb);
+    col += (sh > 0.93 ? 1.0 : 0.0) * saturate(1.0 - sd*55.0) * 0.6 * saturate(1.4 - r*2.0);
+    return col;
+}
+
+float3 scBlack(float2 uv, float t, float aspect) {
+    float2 c = uv - 0.5; c.x *= aspect;
+    float r = length(c); float a = atan2(c.y, c.x);
+    float horizon = smoothstep(0.12, 0.105, r);
+    float rr = (r - 0.19)*8.5; float ring = exp(-rr*rr);
+    float swirl = 0.55 + 0.45*sin(a*3.0 - t*2.2 + 22.0*r);
+    float3 disk = ring * swirl * float3(1.0, 0.55, 0.18);
+    float2 lp = c * (1.0 + 0.04/(r*r + 0.02));
+    float2 sg = lp*72.0; float2 sgi = floor(sg); float sh = h21(sgi);
+    float2 ssb = fract(sg) - 0.5; float sd = dot(ssb, ssb);
+    float stars = (sh > 0.95 ? 1.0 : 0.0) * saturate(1.0 - sd*45.0) * smoothstep(0.11, 0.15, r);
+    float3 col = disk + stars*0.7 + float3(0.02, 0.01, 0.03);
+    col *= (1.0 - horizon);
+    return col;
+}
+
+float3 scAlien(float2 uv, float t, float aspect) {
+    float3 sky = mix(float3(0.02,0.05,0.08), float3(0.10,0.03,0.13), uv.y);
+    float2 pc = uv - float2(0.5, 1.18); pc.x *= aspect;
+    float pr = length(pc); float planet = smoothstep(0.63, 0.62, pr);
+    float bands = 0.5 + 0.5*sin(pc.y*34.0 + sin(pc.x*7.0 + t*0.2)*2.2);
+    float3 psurf = mix(float3(0.20,0.45,0.18), float3(0.55,0.70,0.30), bands);
+    float z = sqrt(saturate(0.40 - pr*pr));
+    float lit = saturate(dot(normalize(float3(pc.x, pc.y, z*1.5)),
+                             normalize(float3(-0.5, -0.6, 0.6))));
+    psurf *= 0.25 + 0.95*lit;
+    float3 col = mix(sky, psurf, planet);
+    float st = h21(floor(uv * float2(220.0, 130.0)));
+    col += (st > 0.985 ? 1.0 : 0.0) * (1.0 - planet) * 0.8;
+    float2 mc = uv - float2(0.80, 0.22); mc.x *= aspect; float mr = length(mc);
+    float moon = smoothstep(0.05, 0.045, mr);
+    float ml = saturate(dot(normalize(float3(mc.x, mc.y, 0.05)),
+                            normalize(float3(-0.4, -0.5, 0.7))));
+    col = mix(col, float3(0.55,0.52,0.48) * (0.4 + 0.7*ml), moon);
+    return col;
+}
+
+float craterH(float2 uv) {
+    float h = 0.0;
+    for (int k = 0; k < 3; k++) {
+        float sc = 5.0 * pow(1.8, float(k));
+        float2 p = uv*sc; float2 gi = floor(p); float2 gf = fract(p) - 0.5;
+        float2 off = float2(h21(gi) - 0.5, h21(gi + 3.3) - 0.5) * 0.5;
+        float d = length(gf - off); float rad = 0.16 + 0.16*h21(gi + 7.7);
+        float rim = smoothstep(rad + 0.05, rad, d) * smoothstep(rad - 0.06, rad, d);
+        float bowl = smoothstep(rad, 0.0, d);
+        h += (rim*0.6 - bowl*0.35) / (float(k) + 1.0);
+    }
+    return h;
+}
+
+float3 scMoon(float2 uv, float t, float aspect) {
+    float2 uvp = uv + float2(t*0.008, 0.0); uvp.x *= aspect;
+    float cr = craterH(uvp);
+    float fine = h21(floor(uv * float2(320.0, 180.0))) * 0.05;
+    float3 col = float3(0.22,0.22,0.24) + cr*float3(0.55,0.54,0.58) + fine;
+    return saturate(col);
+}
+
+float3 scNova(float2 uv, float t, float aspect) {
+    float2 c = uv - 0.5; c.x *= aspect;
+    float r = length(c); float a = atan2(c.y, c.x);
+    float ph = fract(t*0.12);
+    float er = (r - ph*0.75)*7.0; float ring = exp(-er*er);
+    float core = exp(-r*r*26.0) * (1.3 - ph);
+    float rays = 0.6 + 0.4*sin(a*20.0 + t);
+    float3 col = float3(0.05, 0.02, 0.05);
+    col += core * float3(1.0, 0.92, 0.7);
+    col += ring * float3(1.0, 0.55, 0.25) * rays;
+    float st = h21(floor(c*55.0));
+    col += (st > 0.95 ? 1.0 : 0.0) * 0.35 * saturate(1.3 - r);
+    return col;
+}
+
+float3 scWormhole(float2 uv, float t, float aspect) {
+    float2 c = uv - 0.5; c.x *= aspect;
+    float r = length(c) + 0.05; float a = atan2(c.y, c.x);
+    float depth = 0.32/r + t*0.6;
+    float ring = 0.5 + 0.5*sin(depth*9.0);
+    float twist = 0.5 + 0.5*sin(a*6.0 + depth*2.5);
+    float3 col = mix(float3(0.02,0.04,0.10), float3(0.20,0.55,0.95), ring*twist);
+    col *= saturate(r*2.6);
+    col += exp(-r*r*55.0) * float3(0.7, 0.85, 1.0);
+    return col;
+}
+
+float3 scGasGiant(float2 uv, float t, float aspect) {
+    float2 c = uv - float2(0.5, 0.44); c.x *= aspect;
+    float r = length(c); float planet = smoothstep(0.32, 0.31, r);
+    float lat = c.y/0.33;
+    float bands = 0.5 + 0.5*sin(lat*15.0 + sin(lat*4.0 + t*0.1)*1.4);
+    float3 surf = mix(float3(0.55,0.42,0.24), float3(0.85,0.72,0.46), bands);
+    float2 sp = c - float2(0.11, -0.04);
+    float spot = smoothstep(0.06, 0.0, length(sp * float2(1.0, 1.7)));
+    surf = mix(surf, float3(0.82,0.32,0.20), spot*0.7);
+    float z = sqrt(saturate(0.105 - r*r));
+    float lit = saturate(dot(normalize(float3(c.x, c.y, z*3.0)),
+                             normalize(float3(-0.5, -0.3, 0.8))));
+    surf *= 0.30 + 0.9*lit;
+    float2 rc = c * float2(1.0, 3.4); float rr = length(rc);
+    float ring = smoothstep(0.40, 0.43, rr) * smoothstep(0.60, 0.57, rr)
+               * (0.55 + 0.45*sin(rr*90.0));
+    float3 col = float3(0.02, 0.02, 0.05);
+    float st = h21(floor(uv * float2(220.0, 130.0)));
+    col += (st > 0.985 ? 1.0 : 0.0) * 0.7;
+    col = mix(col, float3(0.75,0.68,0.52), ring * (1.0 - planet));
+    col = mix(col, surf, planet);
+    return col;
+}
+
+float3 scAurora(float2 uv, float t) {
+    float3 col = float3(0.01, 0.02, 0.05);
+    float st = h21(floor(uv * float2(200.0, 120.0)));
+    col += (st > 0.98 ? 1.0 : 0.0) * 0.6 * smoothstep(0.55, 0.0, uv.y);
+    float fil = 0.62 + 0.38*sin(uv.x*140.0 + sin(uv.y*8.0)*2.0 + t*1.5);
+    for (int i = 0; i < 4; i++) {
+        float fi = float(i);
+        float cx = 0.18 + fi*0.22 + 0.13*sin(uv.y*3.0 + t*0.4 + fi*1.7);
+        float fx = (uv.x - cx)*11.0; float band = exp(-fx*fx);
+        float hh = smoothstep(0.04, 0.42, uv.y) * (1.0 - smoothstep(0.50, 0.96, uv.y));
+        float3 ac = mix(float3(0.1,0.95,0.45), float3(0.45,0.2,0.9), fract(fi*0.37));
+        col += band * hh * fil * ac * 0.75;
+    }
+    return col;
+}
+
+float3 scPulsar(float2 uv, float t, float aspect) {
+    float2 c = uv - 0.5; c.x *= aspect;
+    float r = length(c); float a = atan2(c.y, c.x);
+    float core = exp(-r*r*70.0);
+    float beam = pow(abs(cos(a - t*1.5)), 40.0) + pow(abs(cos(a - t*1.5 + 3.14159)), 40.0);
+    beam *= exp(-r*1.6);
+    float3 col = float3(0.02, 0.03, 0.06);
+    col += core * float3(0.85, 0.92, 1.0);
+    col += beam * float3(0.45, 0.65, 1.0);
+    float st = h21(floor(c*60.0));
+    col += (st > 0.97 ? 1.0 : 0.0) * 0.45;
+    return col;
+}
+
+float3 scPlasma(float2 uv, float t) {
+    float px = uv.x*6.0, py = uv.y*4.0;
+    float v = sin(px + t) + sin(py*1.3 - t*0.7) + sin((px+py)*0.8 + t*0.5)
+            + sin(length(float2(px, py) - 3.0)*2.2 - t);
+    float3 col = 0.5 + 0.5*cos(float3(v, v + 2.1, v + 4.2));
+    col *= float3(0.42, 0.30, 0.52);
+    return col;
+}
+
+float3 scBinary(float2 uv, float t, float aspect) {
+    float2 c = uv - 0.5; c.x *= aspect;
+    float2 s1 = float2(cos(t*0.4), sin(t*0.4)) * 0.16;
+    float2 s2 = -s1;
+    float d1 = length(c - s1), d2 = length(c - s2);
+    float3 col = float3(0.02, 0.02, 0.05);
+    col += exp(-d1*d1*150.0)*float3(1.0,0.8,0.5) + exp(-d1*9.0)*float3(0.35,0.25,0.12);
+    col += exp(-d2*d2*150.0)*float3(0.6,0.8,1.0) + exp(-d2*9.0)*float3(0.16,0.26,0.4);
+    float st = h21(floor(c*52.0));
+    col += (st > 0.97 ? 1.0 : 0.0) * 0.4;
+    return col;
+}
+
+fragment float4 fmain(VOut in [[stage_in]], constant Uniforms& u [[buffer(0)]]) {
+    float t = u.time;
+    int sc = int(u.p[0] + 0.5);
+    float2 uv = in.uv;
+    float a = u.aspect;
+    float3 col;
+    if (sc == 1) col = scGalaxy(uv, t, a);
+    else if (sc == 2) col = scBlack(uv, t, a);
+    else if (sc == 3) col = scAlien(uv, t, a);
+    else if (sc == 4) col = scMoon(uv, t, a);
+    else if (sc == 5) col = scNova(uv, t, a);
+    else if (sc == 6) col = scWormhole(uv, t, a);
+    else if (sc == 7) col = scGasGiant(uv, t, a);
+    else if (sc == 8) col = scAurora(uv, t);
+    else if (sc == 9) col = scPulsar(uv, t, a);
+    else if (sc == 10) col = scPlasma(uv, t);
+    else if (sc == 11) col = scBinary(uv, t, a);
+    else col = scNebula(uv, t);
+    return float4(col, 1.0);
+}'
+    ]
+
+    Galaxigans class >> gruntSpecies [
+        ^GxSpecies name: #grunt
+            art: '................/..A........A..../...1......1...../....122222....../...12333321...../..1234443321..../8.123454432.8.../8.234595432.8.../7.2349A9432.7.../7.123454321.7.../6..1233321..6.../...12.22.21...../..1..1..1..1..../.1...1..1...1.../................/................'
+            art2: '................/...A......A...../....1....1....../....122222....../...12333321...../..1234443321..../6.123454432.6.../7.234595432.7.../8.2349A9432.8.../8.123454321.8.../7..1233321..7.../...12.22.21...../..1..1..1..1..../.1...1..1...1.../................/................'
+            palette: #(32 8 16 196 32 48 232 64 56 255 104 80 255 176 136 128 48 16 200 104 32 240 168 64 48 224 255 255 255 255)
+    ]
+    Galaxigans class >> mothSpecies [
+        ^GxSpecies name: #moth
+            art: '..1.1666.1.1..../...1.676.1....../.1234167614321../12345168651432../1239A1686193A21./12345167651432../1234516861432.../.1234168614321../..123416861432../...1231676132.../....123676321.../.....12676321.../......1676.1..../.......171....../................/................'
+            art2: '....1666.1....../...1.676.1....../...1234674321.../...1235685321.../..1239A6A9321.../..12341686143.../...1234686431.../...12341686431../....123168631.../....1231676321../.....123676321../......1267631.../......1.676.1.../.......171....../................/................'
+            palette: #(32 24 8 96 72 40 144 112 64 192 160 104 232 216 168 72 40 16 128 80 48 184 136 88 255 64 32 255 224 96)
+    ]
+    Galaxigans class >> beetleSpecies [
+        ^GxSpecies name: #beetle
+            art: '......9..9....../.8....19.91....8/..8..1A6A.1..8../...112344211..../..1234545432.1../8.1234565432.18./.1123476743211../.1234565654321../.1234545454321../8.12344544321.8./..1123443211..../8..1123321..8.../.8...12.21...8../..8..1..1..8..../...8.8..8.8...../................'
+            art2: '......9..9....../..8...19.91...8./...8.1A6A.1.8.../...112344211..../...1234545432.1./.8.1234565432.8./.1123455543211../.1234575754321../.1234545454321../.8.12344544321.8/...1123443211.../...81123321.8.../....812.218...../...8.1..1.8...../....8.8..8.8..../................'
+            palette: #(16 8 24 56 32 96 88 48 152 120 72 200 168 120 240 32 16 64 32 192 160 16 160 136 255 192 32 255 48 96)
+    ]
+    Galaxigans class >> scorpionSpecies [
+        ^GxSpecies name: #scorpion
+            art: '8......99......8/78....1991....87/.67..167761..76./..1..16776.1..1./...1234554321.../..123445544321../.12344A55A44321./.12344555554321./.12344544454321./..1234454432.1../...12344432...../....123321..199./....1.221..1991./...1...1...1991./..1.........199./................'
+            art2: '..8.......199.../..78.....1991.../...671..19910.../....16.16991..../...1234554321.../..123445544321../.12344A55A44321./.12344555554321./.12344544454321./..1234454432.1../...12344432...../....123321....../....1.221.1.1.../...1...1.1.1..../..1.....1......./................'
+            palette: #(24 4 0 128 48 16 176 88 24 224 136 40 255 192 80 96 24 8 160 56 16 216 104 40 64 255 128 255 32 32)
+    ]
+    Galaxigans class >> mantisSpecies [
+        ^GxSpecies name: #mantis
+            art: '..8..........8../..78........87../...7.19.91.7..../...8.9A.A9.8..../..87.149941.78../.87...1331...78./.8.1112442111.8./..712345543217../..7.1234543.17../...8.123432.8.../....1234321...../....1234321...../.....12321....../.....12321....../....1.2.21.1..../...1.......1....'
+            art2: '................/....19.91......./....9A.A9......./...149941......./....1331......../.8.1112442111.8./.78.12345543.87./..7.1234543.17../..87.123432.78../...8.1234321.8../...87.12321.78../....1.12321.1.../.....12321....../.....12321....../....1.2.21.1..../...1.......1....'
+            palette: #(8 24 0 32 96 24 56 136 40 88 184 64 144 232 104 16 64 16 44 120 32 76 168 56 255 224 32 16 8 0)
+    ]
+    Galaxigans class >> hornetSpecies [
+        ^GxSpecies name: #hornet
+            art: '88...1991...88../.88.1923291.88../..8.19A6A91.8.../78..1234321..87./78..1634361..87./78..1234321..87./.8..1645461..8../....1234321...../.....16461....../.....12321....../.....16461....../......1231....../......16461...../.......121A...../........1A....../................'
+            art2: '................/....1991......../..8.1923291.8.../.88.19A6A91.88../788.1234321.887./78..1634361..87./78..1234321..87./.8..1645461..8../....1234321...../.....16461....../.....12321....../.....16461....../......1231....../......16A1....../.......1A......./................'
+            palette: #(24 8 0 128 80 0 192 136 0 240 192 32 255 240 128 16 0 0 80 64 48 192 176 160 255 48 16 224 224 255)
+    ]
+    Galaxigans class >> jellyfishSpecies [
+        ^GxSpecies name: #jellyfish
+            art: '....1A....A1..../...1234334321.../..123455554321../.12345566554321./.12455677654421./1234556776554321/1234556666554321/1234455555544321/.112344554431121/.8.18.18.18.18../..8.8..8..8.8.../...9..8..8..9.../...8..9..9..8.../..9...8..8...9../..8...9..9...8../...9...9.9...9..'
+            art2: '.....1AA1......./....123321....../...12455421...../..1234566432..../..1245677542..../.123456776543.../.123456666543.../.123445555443.../.112344444321.../..1123443211..../...8.8.8.8....../....8.9.8.9...../....9.8.9.8...../.....989.89...../......898.9...../.......99.......'
+            palette: #(16 8 40 48 44 112 72 72 168 104 112 216 156 176 255 255 64 192 255 144 224 80 224 224 160 255 255 255 255 255)
+    ]
+    Galaxigans class >> spiderSpecies [
+        ^GxSpecies name: #spider
+            art: '6............6../.7..6....6..7.../..8.7....7.8..../8..87.99.78..8../.8..1.99.1..8.../..8.1234321.8.../...1234543210.../8.12345554321.8./7.12345554321.7./8.12345554321.8./..1234543210..../...12343210...../..8.123210.8..../.8.7.1AA1.7.8.../8..7..AA..7..8../..6........6....'
+            art2: '................/..6........6..../...7.6..6.7...../....87.78......./8..8.99.8..8..../.8..1.99.1.8..../..8.1234321.8.../...1234543210.../.7.12345554321.7/.8.12345554321.8/...1234543210.../....12343210..../...87123218...../..8..1AA1..8..../.8..7.AA.7..8.../..6..8..8..6....'
+            palette: #(16 4 4 72 20 20 120 32 32 168 56 56 216 104 88 48 16 16 96 48 48 144 96 88 255 224 64 255 255 255)
+    ]
+    Galaxigans class >> stingraySpecies [
+        ^GxSpecies name: #stingray
+            art: '......1221....../.....123321...../...112344211..../..1234999432..../.123459A95432.../1234556665432..1/123456777654321./12345677A7654321/.123456777654321/..1234567654321./...12345654321../....123443218.../.....1232.18..../......121.8...../.......1.8....../........8.......'
+            art2: '1..........1..../.12......21...../..1234..4321..../..1234999432..../.123459A95432.../.123455666543.../12345677765432../12345677A765432./123456777654321./.12345677654321./..123456654321../...8123443210.../....81232.1...../.....81.121...../......8.1......./.......8........'
+            palette: #(4 16 24 24 64 88 40 104 136 64 152 184 112 200 224 12 40 56 192 216 224 255 128 32 32 255 176 255 255 255)
+    ]
+    Galaxigans class >> squidSpecies [
+        ^GxSpecies name: #squid
+            art: '......1221....../.....123321...../....12344321..../...1234554321.../...1239AA9321.../...123A99A321.../...1234554321.../...1234554321.../....12333221..../.6..1234421..6../76.16788761.67../87.7.6776.7.78../.8.8.6.6.8.8..../..7.7.6.6.7.7.../.8.8...6...8.8../8.8....6....8.8.'
+            art2: '......1221....../.....123321...../....12344321..../...1234554321.../...1239AA9321.../...123A99A321.../...1234554321.../...1234554321.../....12333221..../....12344321..../...167887761..../..76.67876.67.../.87.8.676.8.78../.8.7.86.68.7.8../..8.8.7.7.8.8.../...87.....78....'
+            palette: #(24 4 32 112 32 88 160 48 128 208 80 168 255 136 208 96 24 72 192 56 136 255 112 192 32 240 240 16 32 48)
+    ]
+
+    Galaxigans class >> mineArt [
+        "The spinning mine's eight rotation frames, lifted from the
+         original's galaxigans_mineart.was. Frame = (anim >> 2) & 7, so it
+         turns a full circle every 32 frames."
+        ^#(
+            '................/.......77......./......7887....../...26.7887.62.../...6661111666.../....61544416..../....15444431..../.26614444331662./.26614443331662./....14433321..../....61333216..../...6661111666.../...26..66..62.../.......66......./.......22......./................'
+            '................/.......22......./.......66......./...26..66.787.../...6661111888.../....614554187.../....14444441..../.26614444441662./.26613333331662./....13333331..../....61322316..../...6661111666.../...26..66..62.../.......66......./.......22......./................'
+            '................/.......22......./.......66......./...26..66..62.../...6661111666.../....61444516..../....1344445177../.26613344441887./.26613334441887./....1233344177../....61233316..../...6661111666.../...26..66..62.../.......66......./.......22......./................'
+            '................/.......22......./.......66......./...26..66..62.../...6661111666.../....61334416..../....13334441..../.26612334451662./.26612344451662./....13334441..../....613344187.../...6661111888.../...26..66.787.../.......66......./.......22......./................'
+            '................/.......22......./.......66......./...26..66..62.../...6661111666.../....61233316..../....12333441..../.26613334441662./.26613344441662./....13444451..../....61444516..../...6661111666.../...26.7887.62.../......7887....../.......77......./................'
+            '................/.......22......./.......66......./...26..66..62.../...6661111666.../....61322316..../....13333331..../.26613334331662./.26614444441662./....14444441..../...781455416..../...8881111666.../...787.66..62.../.......66......./.......22......./................'
+            '................/.......22......./.......66......./...26..66..62.../...6661111666.../....61333216..../..7714433321..../.78814443331662./.78814444331662./..7715444431..../....61544416..../...6661111666.../...26..66..62.../.......66......./.......22......./................'
+            '................/.......22......./.......66......./...787.66..62.../...8881111666.../...781443316..../....14443331..../.26615443321662./.26615443321662./....14443331..../....61443316..../...6661111666.../...26..66..62.../.......66......./.......22......./................'
+        )
+    ]
+
+    Galaxigans class >> minePalette [
+        "Dark metal ramp, spike grey, and the red trigger light — the
+         original's minePal, slot 9."
+        ^#(24 24 32 48 56 64 80 88 104 120 128 144 176 184 200 96 104 120 128 32 24 255 64 48)
+    ]
+
+    Galaxigans class >> bossArt [
+        "The capture boss, 32x32, four frames from the original's
+         galaxigans_bossart.was: two idle poses it alternates between, then
+         the charging and firing poses — the emitter eye grows through them,
+         which is the tell that the beam is coming."
+        ^#(
+            '................................/...........1........1.........../...........1........1.........../..........11.......141........../..........141.....1441........../.........14441...1.1441........./.........1341.1111.1431........./.........13341444414331........./.........13334444443331........./........1133334444333311......../..........144444444441........../..........144444444441........../.........18844444444881........./.......117773344443377711......./....11177333339AA93333377111..../..117776333333ABBA333333677711../.1776663333333ABBA3333333666771./.11666333333339AA93333333366611./...16333333333333333333333361.../...11333333333333333333333311.../.....1333332333333332333331...../......13333222333322233331....../.......133312223322213331......./........131.12222221.131......../.........12121111112121........./..........121......121........../..........121......121........../..........121......121........../...........1........1.........../...........1........1.........../...........1........1.........../................................'
+            '................................/...........1........1.........../...........1........1.........../..........11.......141........../..........141.....1441........../.........14441...1.1441........./.........1341.1111.1431........./.........13341444414331........./.........13334444443331........./........1133334444333311......../..........144444444441........../..........144444444441........../.......111884444444488111......./..1111177777334444337777711111../.17777766333339AA93333366777771./.1166663333333ABBA3333333666611./...16333333333ABBA33333333361.../...113333333339AA933333333311.../.....1333333333333333333331...../......13333333333333333331....../......13333233333333233331....../.......133322233332223331......./........1331222332221331......../.........11.12222221.11........./.........12121111112121........./..........121......121........../..........121......121........../..........121......121........../...........1........1.........../...........1........1.........../...........1........1.........../................................'
+            '................................/...........1........1.........../...........1........1.........../..........11.......141........../..........141.....1441........../.........14441...1.1441........./.........1341.1111.1431........./.........13341444414331........./.........13334444443331........./........1133334444333311......../..........144444444441........../..........144444444441........../.........18844444444881........./.......11777339BB93377711......./....1117733339BCCB9333377111..../..11777633333BCCCCB33333677711../.177666333333BCCCCB333333666771./.1166633333339BCCB9333333366611./...163333333339BB933333333361.../...11333333333333333333333311.../.....1333332333333332333331...../......13333222333322233331....../.......133312223322213331......./........131.12222221.131......../.........12121111112121........./..........121......121........../..........121......121........../..........121......121........../...........1........1.........../...........1........1.........../...........1........1.........../................................'
+            '................................/...........1........1.........../...........1........1.........../..........11.......141........../..........141.....1441........../.........14441...1.1441........./.........1341.1111.1431........./.........13341444414331........./.........13334444443331........./........1133334444333311......../..........144444444441........../..........144444444441........../.........188444AA444881........./.......117779ACCCCA977711......./....111773399CCCCCC993377111..../..1177763339ACCCCCCA9333677711../117766633339ACCCCCCA933336667711/.166633333399CCCCCC993333336661./..11333333339ACCCCA93333333311../..1.13333333399AA99333333331.1../.....1133332339999332333311...../.......133322233332223331......./........1331222332221331......../.........11.12222221.11........./.........12121111112121........./..........121......121........../..........121......121........../..........121......121........../...........1........1.........../...........1........1.........../...........1........1.........../................................'
+        )
+    ]
+
+    Galaxigans class >> bossPalette [
+        "bossCapPal: purple body, gold trim, cyan emitter eye."
+        ^#(32 8 40 72 24 88 104 48 120 136 72 152 176 108 192 208 128 224 200 160 48 255 224 96 32 96 160 64 192 255 176 236 255 255 255 255)
+    ]
+
+    Galaxigans class >> pilotArt [
+        "A pilot: one of your lives, standing in the row along the bottom.
+         The boss's beam comes for THESE, not for the ship."
+        ^'............/...111111.../..13466631../..16666661../..16666661../...133331.../..13333221../113333322211/133337722221/133333322221/113333322211/..13333221../..13311221../...11..11.../...11..11.../...11..11...'
+    ]
+
+    Galaxigans class >> pilotPalette [
+        ^#(32 40 48 160 168 184 232 236 244 255 255 255 0 0 0 48 192 255 255 192 64)
+    ]
+
+
+    "--- the original's music cues (galaxigans_music.was) -------------------"
+    "Transcribed note for note from the assembler's inline ABC, which its own
+     header traces back to the FreeBASIC original's MUSIC slots. One change,
+     and it is a dialect difference rather than a liberty: the assembler writes
+     `%%MIDI program <voice> <gm#>`, and this pane's ABC reader takes the GM
+     number directly — so `program 1 80` becomes `program 80`, and the square
+     lead is the square lead."
+
+    "Slot 10, 'Alien Victory' — the square-lead triumph the aliens dance to when
+     they have taken your last ship. GM 80, C minor, and it is THEIR tune: the
+     player never hears it in victory."
+    Galaxigans class >> tuneAlienVictory [
+        ^'X:1
+M:4/4
+L:1/8
+Q:1/4=210
+%%MIDI program 80
+K:Cm
+V:1
+G,4 _B,4 | c4 _e4 | _e2d2c2_B2 | G,8 | G,2G,2_A,2_B,2 | c2_e2g2_e2 | c4_B4 | G,8 | _E2F2G2_A2 | _B2c2_e2g2 | f/e/d/c/_B/A/_A/G/ | _E8 |'
+    ]
+
+    "Slot 14, 'Stage Alert' — the ominous choir build on the title screen."
+    Galaxigans class >> tuneTitle [
+        ^'X:1
+M:4/4
+L:1/8
+Q:1/4=84
+%%MIDI program 52
+K:Am
+V:1
+z4 A,2 E2 | A2 c2 e2 d2 | c4 B4 | A8 |'
+    ]
+
+    "Slot 13, 'You Win!' — the glockenspiel fanfare for a cleared wave."
+    Galaxigans class >> tuneStageClear [
+        ^'X:1
+M:4/4
+L:1/8
+Q:1/4=234
+%%MIDI program 9
+K:C
+V:1
+ceg c'' e''c''ba | gecG c2 z2 | fac''f'' e''d''c''b | c''4 |'
+    ]
+
+    "Slot 12, 'Saucer Wooh' — the pad swell that announces the bonus saucer,
+     under the warble rather than instead of it (the original plays both)."
+    Galaxigans class >> tuneSaucer [
+        ^'X:1
+M:4/4
+L:1/8
+Q:1/4=160
+%%MIDI program 91
+K:C
+V:1
+G z G z | GABc cBAG |'
+    ]
+
+    "--- the art ----------------------------------------------------------"
+    "16x16-cell sprites, 4 bits per pixel: '.' is transparent, 1..5 index the
+     per-sprite palette set in paint:kind:row:."
+
+    Galaxigans class >> beeArt [
+        ^'....2......2..../.....2....2...../......1111....../.....115511...../....11155111..../...3111111113.../..331114441133../.33111144441133./.33111111111133./..331111111133../...2211..1122.../....22....22....'
+    ]
+    Galaxigans class >> butterflyArt [
+        ^'......3..3....../.....33..33...../....33111133..../...3311551133.../..331151151133../.33111111111133./..331144441133../.33111444411133./.33111111111133./..331111111133../...2211111122.../....22....22....'
+    ]
+    Galaxigans class >> shipArt [
+        ^'.......11......./.......11......./......1441....../......1441....../.....114411...../.....114411...../....11144111..../...3111441113.../..331111111133../.33111144441133./.33111111111133./.33.11111111.33./..3..111111..3../......2..2......'
+    ]
+    Galaxigans class >> saucerArt [
+        ^'........2222......../......22444422....../....224444444422..../..2111111111111112../..2133333333333312../..2111111111111112../....221111111122..../........2222........'
+    ]
+]

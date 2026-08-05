@@ -990,7 +990,12 @@ pub(crate) fn start_game_loop_timer() {
         if existing != NIL {
             objc::send0(existing, sel("invalidate"));
         }
-        t.set(objc::scheduled_timer(1.0 / 60.0, target, sel("gameTick:"), true));
+        t.set(objc::scheduled_timer(
+            game_pane::req_fps_interval_secs(),
+            target,
+            sel("gameTick:"),
+            true,
+        ));
     });
 }
 
@@ -1005,8 +1010,8 @@ pub(crate) fn stop_game_loop_timer() {
     });
 }
 
-/// True while the native game-pane frame loop is running (the 60 Hz timer is
-/// scheduled). `game_pane::present_if_dirty` uses this to stay out of the way
+/// True while the native game-pane frame loop is running (the frame timer is
+/// scheduled — at `REQ_FPS`, default 60). `game_pane::present_if_dirty` uses this to stay out of the way
 /// during the loop, so a frame is shown only by its own explicit `Present` and
 /// never mid-stream (the anti-flicker invariant — see `present_if_dirty`).
 pub(crate) fn game_loop_active() -> bool {
@@ -1931,6 +1936,18 @@ extern "C" fn run_breakout_demo(_this: Id, _cmd: Sel, _sender: Id) {
     }
 }
 
+/// The Demos menu's "Galaxigans" item: open the native game pane and start the
+/// Galaxigans arcade game (`world/49_galaxigans.mst`). It resizes the pane to
+/// 640x360 itself. Same path as Breakout.
+extern "C" fn run_galaxigans_demo(_this: Id, _cmd: Sel, _sender: Id) {
+    open_game_pane();
+    if let Some(vm) = VM.get() {
+        vm.submit(vm_host::VmRequest::Doit {
+            code: "Galaxigans launch.".to_string(),
+        });
+    }
+}
+
 /// The Demos menu's "CocoaPad" item: the Cocoa-bridge capstone (C5) — a
 /// native NSWindow + text field + button built ENTIRELY in Smalltalk
 /// (world/50_cocoapad.mst): DNU keyword sends, onMain hops, and a
@@ -2066,6 +2083,12 @@ fn build_demos_delegate() -> Id {
         cls,
         sel("runBreakoutDemo:"),
         run_breakout_demo as *const _,
+        "v@:@",
+    );
+    objc::add_method(
+        cls,
+        sel("runGalaxigansDemo:"),
+        run_galaxigans_demo as *const _,
         "v@:@",
     );
     objc::add_method(
@@ -2464,6 +2487,9 @@ fn build_menu_bar() {
     let demos_delegate = build_demos_delegate();
     let breakout_item = menu_item("Breakout — clear the wall (← →)", Some("runBreakoutDemo:"), "");
     objc::send1_id(breakout_item, sel("setTarget:"), demos_delegate);
+    let galaxigans_item =
+        menu_item("Galaxigans — swarm shooter (← → Space)", Some("runGalaxigansDemo:"), "");
+    objc::send1_id(galaxigans_item, sel("setTarget:"), demos_delegate);
     let mandel_item = menu_item("Mandelbrot — a live zooming dive", Some("runMandelDemo:"), "");
     objc::send1_id(mandel_item, sel("setTarget:"), demos_delegate);
     let spawned_item = menu_item(
@@ -2488,6 +2514,7 @@ fn build_menu_bar() {
         "Demos",
         &[
             breakout_item,
+            galaxigans_item,
             mandel_item,
             spawned_item,
             parallel_item,

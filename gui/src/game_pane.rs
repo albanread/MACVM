@@ -13,6 +13,8 @@
 #![allow(dead_code)] // on-screen embedding (M2b) consumes the render helpers below
 
 use macgamepane_graphics::indexed_pane::IndexedPane;
+use macgamepane_graphics::shader_pane::ShaderPane;
+use macgamepane_graphics::text_overlay::TextOverlay;
 
 /// Palette indices for the M2 test scene. Index 0 is transparent; `set_rgb`
 /// asserts index >= 16, so user colours start at 16.
@@ -126,6 +128,12 @@ struct NativePane {
     /// (docs/gamepane_design.md — a HashMap miss is safe; array-index reuse was
     /// the S15 #93 hazard). Registry teardown on VM restart is a follow-up.
     sprite_ids: std::collections::HashMap<i64, (usize, usize)>,
+    /// Topmost HUD/text layer (real 5x7 font, RGB) — composited last, retained
+    /// between frames (`GamePane extensions`, galaxigans).
+    text: TextOverlay,
+    /// Layer-0 background fragment shader, created lazily on the first `Shader`
+    /// command; `None` = the indexed pane clears the frame.
+    shader: Option<ShaderPane>,
     w: u32,
     h: u32,
 }
@@ -135,6 +143,41 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+/// The pane size the next pane build uses, overriding the caller's default when
+/// a demo `SetPaneSize`s (galaxigans is 640x360). `(0, 0)` = use the default.
+static REQ_SIZE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+fn set_req_size(w: u32, h: u32) {
+    REQ_SIZE.store(((w as u64) << 32) | h as u64, std::sync::atomic::Ordering::Release);
+}
+fn req_size_or(default_w: u32, default_h: u32) -> (u32, u32) {
+    let v = REQ_SIZE.load(std::sync::atomic::Ordering::Acquire);
+    if v == 0 {
+        (default_w, default_h)
+    } else {
+        ((v >> 32) as u32, (v & 0xFFFF_FFFF) as u32)
+    }
+}
+
+/// The frame-timer rate a demo requests via `GamePane>>frameRate:`. Default 60;
+/// galaxigans asks for 30 (its logic was tuned for a ~33fps original). Reset to
+/// 60 on teardown so it can't leak into the next demo. Read by
+/// `crate::start_game_loop_timer` when it (re)schedules the NSTimer.
+static REQ_FPS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(60);
+fn set_req_fps(fps: u32) {
+    REQ_FPS.store(fps.clamp(1, 120), std::sync::atomic::Ordering::Release);
+    // A demo normally sets the rate during `start`, before `run` (StartLoop)
+    // creates the timer, so the scheduling below just reads it. If the loop is
+    // already running, restart the timer so the new interval takes effect.
+    if crate::game_loop_active() {
+        crate::start_game_loop_timer();
+    }
+}
+/// The requested frame interval in seconds, for `crate::start_game_loop_timer`.
+pub(crate) fn req_fps_interval_secs() -> f64 {
+    1.0 / REQ_FPS.load(std::sync::atomic::Ordering::Acquire).clamp(1, 120) as f64
+}
+
 /// Build the native pane once (main thread) and return its `NSView` to install
 /// as the window content view. `None` if this Mac has no Metal device.
 pub fn ensure_native_view(w: u32, h: u32) -> Option<objc::Id> {
@@ -142,6 +185,10 @@ pub fn ensure_native_view(w: u32, h: u32) -> Option<objc::Id> {
         {
             let mut slot = cell.borrow_mut();
             if slot.is_none() {
+                // A demo may have requested a non-default size (galaxigans
+                // 640x360) before the view is built; the fixed-size drawable is
+                // upscaled by CA to fill the window either way.
+                let (w, h) = req_size_or(w, h);
                 let device = metal::Device::system_default()?;
                 let queue = device.new_command_queue();
 
@@ -172,6 +219,7 @@ pub fn ensure_native_view(w: u32, h: u32) -> Option<objc::Id> {
                 let mut pane = IndexedPane::new(&device, w, h, w, h).ok()?;
                 load_test_palette(&mut pane);
                 let sprites = macgamepane_graphics::sprites::Sprites::new(&device).ok()?;
+                let text = TextOverlay::new(&device, w, h).ok()?;
 
                 // `device` is moved in last; every borrow of it above is done.
                 *slot = Some(NativePane {
@@ -182,6 +230,8 @@ pub fn ensure_native_view(w: u32, h: u32) -> Option<objc::Id> {
                     pane,
                     sprites,
                     sprite_ids: std::collections::HashMap::new(),
+                    text,
+                    shader: None,
                     w,
                     h,
                 });
@@ -196,16 +246,24 @@ pub fn ensure_native_view(w: u32, h: u32) -> Option<objc::Id> {
 /// has none — skip the frame, not an error).
 fn present_native(n: &mut NativePane) {
     n.pane.upload();
+    n.text.upload();
     let Some(drawable) = n.layer.next_drawable() else {
         return;
     };
+    let tex = drawable.texture();
     let cb = n.queue.new_command_buffer();
-    n.pane
-        .render(cb, drawable.texture(), metal::MTLLoadAction::Clear);
-    // Composite the sprite layer over the indexed background (its own render
-    // loads rather than clears the target).
-    n.sprites
-        .render(cb, drawable.texture(), 0.0, 0.0, n.w as f64, n.h as f64);
+    // Layer order (bottom→top), the starfield_demo compositing: the shader (if
+    // any) clears + fills layer 0, the indexed pane loads over it (transparent
+    // index 0 shows the shader through), then sprites, then text on top.
+    let pane_load = if let Some(sh) = n.shader.as_mut() {
+        sh.render(cb, tex);
+        metal::MTLLoadAction::Load
+    } else {
+        metal::MTLLoadAction::Clear
+    };
+    n.pane.render(cb, tex, pane_load);
+    n.sprites.render(cb, tex, 0.0, 0.0, n.w as f64, n.h as f64);
+    n.text.render(cb, tex);
     cb.present_drawable(drawable);
     cb.commit();
 }
@@ -243,6 +301,14 @@ pub fn apply_command(cmd: &macvm::embed::GameCommand) {
         C::StopLoop => return crate::on_game_loop_stopped(),
         C::PlaySound { preset } => return play_sound(*preset),
         C::PlayTune { abc } => return play_tune(abc),
+        // Record the requested size BEFORE the pane is built (a demo sends it
+        // first). The web GUI builds its pane from main.rs; a size change after
+        // the pane exists is not applied (galaxigans sends it first).
+        C::SetPaneSize { w, h } => return set_req_size(*w, *h),
+        // Record the requested frame rate (galaxigans asks for 30). Sent during
+        // `start`, before StartLoop schedules the timer, so it just takes effect
+        // when the timer is created; a mid-loop change restarts the timer.
+        C::SetFrameRate { fps } => return set_req_fps(*fps),
         _ => {}
     }
     NATIVE.with(|cell| {
@@ -280,15 +346,62 @@ pub fn apply_command(cmd: &macvm::embed::GameCommand) {
             }
             C::MoveSprite { id, x, y } => {
                 if let Some(&(_, inst)) = n.sprite_ids.get(id) {
+                    // `moveTo:y:` re-shows a hidden sprite (gamepane.mst contract:
+                    // "Stop drawing me until my next moveTo:"). Without this a
+                    // sprite hidden earlier — e.g. galaxigans' ship on the attract
+                    // screen — stays invisible once only moveTo:y: moves it.
+                    n.sprites.show(inst);
                     n.sprites.move_to(inst, *x as f64, *y as f64);
                 }
+            }
+            // ── GamePane extensions ──
+            C::Text { x, y, text, r, g, b, scale } => {
+                n.text.draw_text(*x, *y, text, *r, *g, *b, *scale);
+            }
+            C::TextClear => n.text.clear(),
+            C::AddFrame { id, rows } => {
+                if let Some(&(def, _)) = n.sprite_ids.get(id) {
+                    n.sprites.add_frame(def, rows);
+                }
+            }
+            C::PlaceSprite { id, x, y, frame } => {
+                if let Some(&(_, inst)) = n.sprite_ids.get(id) {
+                    n.sprites.set_frame(inst, *frame as usize);
+                    n.sprites.show(inst);
+                    n.sprites.move_to(inst, *x as f64, *y as f64);
+                }
+            }
+            C::HideSprite { id } => {
+                if let Some(&(_, inst)) = n.sprite_ids.get(id) {
+                    n.sprites.hide(inst);
+                }
+            }
+            C::Shader { src } => match ShaderPane::new(&n.device, src) {
+                Ok(mut sh) => {
+                    sh.set_aspect(n.w as f32 / n.h as f32);
+                    n.shader = Some(sh);
+                }
+                Err(e) => eprintln!("macvm-gui: game shader failed to compile: {e}"),
+            },
+            C::ShaderParam { index, value } => {
+                if let Some(sh) = n.shader.as_mut() {
+                    sh.set_param(*index, *value);
+                }
+            }
+            C::LinePalette { line, index, r, g, b } => {
+                n.pane.set_line_rgb(*line, *index, *r, *g, *b);
             }
             C::Present => {
                 present_native(n);
                 DIRTY.with(|d| d.set(false));
                 return;
             }
-            C::StartLoop | C::StopLoop | C::PlaySound { .. } | C::PlayTune { .. } => {
+            C::StartLoop
+            | C::StopLoop
+            | C::PlaySound { .. }
+            | C::PlayTune { .. }
+            | C::SetPaneSize { .. }
+            | C::SetFrameRate { .. } => {
                 unreachable!("handled before the pane check")
             }
         }
@@ -355,6 +468,9 @@ fn synth_preset(preset: u8) -> macgamepane_audio::synth::Sound {
         6 => s::hurt(0.30, &mut rng),
         7 => s::click(0.05, &mut rng),
         8 => s::bang(0.40, &mut rng),
+        9 => s::blip(660.0, 0.12),
+        10 => s::saucer(0.9),    // UFO warble (galaxigans)
+        11 => s::boss_hum(1.8),  // tractor-beam hum (galaxigans)
         _ => s::blip(660.0, 0.12),
     }
 }
@@ -365,6 +481,11 @@ fn synth_preset(preset: u8) -> macgamepane_audio::synth::Sound {
 pub fn teardown() {
     NATIVE.with(|cell| *cell.borrow_mut() = None);
     DIRTY.with(|d| d.set(false));
+    // Next demo starts at its own default size unless it SetPaneSizes — clear
+    // galaxigans' 640x360 so a following Breakout opens at 320x240.
+    REQ_SIZE.store(0, std::sync::atomic::Ordering::Release);
+    // Likewise reset the frame rate to 60 so galaxigans' 30fps can't leak.
+    REQ_FPS.store(60, std::sync::atomic::Ordering::Release);
 }
 
 /// Present the pane if any drawing has happened since the last present (main

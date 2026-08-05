@@ -99,7 +99,10 @@ pub(crate) fn try_primitive(vm: &mut VmState, m: MethodOop, argc: u8) -> Primiti
     let argc_usize = argc as usize;
     let sp = vm.stack.sp;
     let base = sp - argc_usize - 1;
-    let mut buf = [vm.universe.nil_obj; 6];
+    // Holds receiver + up to 7 arguments (8 slots). The widest primitive is
+    // `GamePane>>text:x:y:r:g:b:scale:` (id 254, 7 args); this array must be at
+    // least `max primitive arity + 1`. Overflowing it panics on the slice below.
+    let mut buf = [vm.universe.nil_obj; 8];
     for (i, slot) in buf.iter_mut().enumerate().take(argc_usize + 1) {
         *slot = vm.stack.get(base + i);
     }
