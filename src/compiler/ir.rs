@@ -2404,6 +2404,17 @@ impl<'a> Translator<'a> {
             let Some(assoc) = crate::oops::wrappers::MemOop::try_from(arr.at(i)) else {
                 continue;
             };
+            // `MemOop::try_from` accepts ANY heap object, not just an
+            // Association, and the globals array legitimately holds shorter
+            // objects — so the value slot may not exist. Without this check
+            // `body_oop(1)` debug-asserts (heap.rs:202) and, in release, reads
+            // out of bounds and can hand a garbage KlassOop to the caller's
+            // inline-allocation decision.
+            if assoc.instance_size_words()
+                < crate::oops::layout::HEADER_WORDS + 2
+            {
+                continue;
+            }
             if let Some(c) = KlassOop::try_from(assoc.body_oop(1)) {
                 if c.klass() == m {
                     if found.is_some() {
