@@ -1,7 +1,7 @@
 #!/bin/sh
 # cog-bench.sh — run the micro+macro benchmark suite under Pharo/Cog and
-# MACVM, same workloads, same protocol (10 inner reps; cold then median of 6
-# warm), MICROSECOND clock on BOTH sides, interleaved back-to-back for R
+# MACVM, same workloads, same protocol (cold, then the median of 41 single-rep
+# warm samples), MICROSECOND clock on BOTH sides, interleaved back-to-back for R
 # rounds on the same machine. The standing target: at least as fast as Cog.
 #
 # WHY microsecond: Pharo's millisecond clock and MACVM's `.as_millis()` both
@@ -88,6 +88,7 @@ for b in order:
     r = mv / cg
     verdict = (f"MACVM {cg/mv:.2f}x faster" if r < 0.97 else
                f"Cog {r:.2f}x faster"       if r > 1.03 else "parity")
-    print(f"{b:10} {mv/1000:>9.1f} {cg/1000:>8.1f} {r:>7.2f}  {verdict}")
-print("\n(best-of-rounds, warm = median of 6 x10-rep batches, microsecond clock)")
+    print(f"{b:10} {mv/1000:>9.3f} {cg/1000:>8.3f} {r:>7.2f}  {verdict}")
+print("\n(best-of-rounds, warm = median of 41 single-rep samples after 30 warm-up")
+print(" reps, microsecond clock)")
 PY

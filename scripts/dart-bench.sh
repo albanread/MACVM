@@ -68,8 +68,9 @@ for b in order:
     if mv is None or dv is None: continue
     r = mv / dv
     verdict = ("Dart %.2fx faster" % r) if r > 1 else ("MACVM %.2fx faster" % (1 / r))
-    print("%-10s %8.1f  %8.1f   %5.2f  %s" % (b, mv / 1000, dv / 1000, dv / mv, verdict))
+    print("%-10s %8.3f  %8.3f   %5.2f  %s" % (b, mv / 1000, dv / 1000, dv / mv, verdict))
 print()
-print("(best-of-rounds, warm = median of 6 x10-rep batches, microsecond clock;")
+print("(best-of-rounds, warm = median of 41 single-rep samples after 30 warm-up reps,")
+print(" microsecond clock;")
 print(" Dart = one fresh process per bench with 2017-arm64 JIT workaround flags — a floor)")
 PY

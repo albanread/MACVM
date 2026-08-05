@@ -1,8 +1,9 @@
 // dart-bench.dart — Dart 1.24.3 side of the three-way head-to-head
 // (docs/cog_bench.md). A FAITHFUL port of the seven cog-bench.mst workloads
 // (world/41a + world/42 BenchmarkDashboard bodies) to Dart 1.x, asserting
-// the SAME checksums, with the SAME timing protocol: 10 inner reps per
-// batch, cold = first batch, warm = median of 6 more, microsecond clock
+// the SAME checksums, with the SAME timing protocol: ONE rep per timed
+// sample, cold = the first rep, warm = median of `kSamples` samples taken
+// after `kWarm` untimed reps, microsecond clock
 // (Stopwatch.elapsedMicroseconds), output line shape `name cold_us=N
 // warm_us=M` — so the reduce script can treat all three VMs identically.
 //
@@ -985,18 +986,27 @@ void check(String name, got, want) {
   }
 }
 
+// Protocol (mirrors CogRun): cold = ONE rep timed from a standing start, then
+// `warm` untimed reps, then `samples` SINGLE-rep timed samples, warm = their
+// median. Keep the counts and the one-rep timed region in lockstep with
+// scripts/cog-bench.mst / cog-bench.st — commit f3bafb8 moved the two Smalltalk
+// sides from a 10-rep timed batch to a single rep but left this file on the old
+// batch, which silently made every Dart number 10x MACVM's unit.
+const int kWarm = 30;
+const int kSamples = 41;
+
 void run(String name, Function block, want) {
   var sw = new Stopwatch()..start();
-  var r;
-  for (var i = 0; i < 10; i++) r = block();
+  var r = block();
   var cold = sw.elapsedMicroseconds;
   check(name, r, want);
+  for (var i = 0; i < kWarm; i++) r = block();
   var times = new List();
-  for (var b = 0; b < 6; b++) {
+  for (var b = 0; b < kSamples; b++) {
     sw
       ..reset()
       ..start();
-    for (var i = 0; i < 10; i++) r = block();
+    r = block();
     times.add(sw.elapsedMicroseconds);
   }
   check(name, r, want);
