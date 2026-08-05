@@ -244,3 +244,32 @@ static estimate can supply. When that lands, keep the policy a pure function of
 a *recorded* profile snapshot (`snapshot_profile` exists for exactly this) and
 log the decision: profile-dependent codegen is otherwise non-reproducible, which
 breaks both A/B gating and bug reproduction.
+
+## Stage 3b probe — local load forwarding: correct, gated off, ceiling too low (2026-08-05)
+
+The post-Z-arc anatomy session (fresh `disasm-native` of `schedule` v0, 268
+insns) updated the numbers: static slot traffic is down to 16% (21% in July),
+and 30 of the 45 remaining slot stores are the **OSR entry's** full-frame
+nil-fill — cold, not the hot loop. The visible hot-path redundancy is the
+`push_instvar` twin shape: `currentTask` loaded twice within four
+instructions, once per bytecode push.
+
+`load_forward` (gated `MACVM_LFCSE=1`, before `copy_propagate` so its Moves
+dissolve): per-block forward map of (base vreg, byte off) → value; invalidated
+at every safepoint op, every heap write (with same-slot store forwarding), and
+every redefinition of a base or cached vreg. Differential byte-identical,
+GC-stress green.
+
+**Census verdict: 4 loads forwarded on the whole richards run.** The twin
+loads straddle BLOCK boundaries (`… #==; br_true` ends the block; the re-push
+starts the next), so the block-local scope has near-zero coverage. A
+flow-based version (the `proven_smi_positions` skeleton, meet=intersection)
+would catch them — but the ceiling is ~7 of `schedule`'s 284 instructions
+≈ 1% of richards: below the harness noise floor, i.e. exactly the
+instruction-level shape this doc's own law says keeps losing to the incumbent.
+Kept in tree gated off (the `MACVM_PEEP_IMM` convention); not worth a flow
+upgrade until a structural stage changes the substrate.
+
+**The remaining big rocks are unchanged by this probe:** Stage 2 (parameter
+register promotion), Stage 4 (deopt environments — whole-life spilling dies as
+a category). Both structural; both still open.

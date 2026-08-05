@@ -8956,6 +8956,76 @@ pub(crate) fn fuse_ref_cmp_br(m: &mut IrMethod) {
 /// safepoint in between. Cross-block uses of an alias are left in place (the
 /// window is per-block), which simply keeps that `Move` alive — conservative,
 /// never wrong.
+/// Regalloc-arc Stage 3b (gated `MACVM_LFCSE=1` — docs/regalloc_findings.md's
+/// "gate everything else" law): LOCAL LOAD FORWARDING. Within one block, a
+/// `LoadField` whose exact (base vreg, byte offset) was loaded or stored
+/// earlier — with nothing in between that could run user code, move
+/// objects, or write the heap — is replaced by a `Move` from the cached
+/// vreg (which `copy_propagate`, running next, then dissolves). The
+/// motivating shape is Smalltalk's `push_instvar N … push_instvar N` twins:
+/// richards' `schedule` loads `currentTask` twice within four
+/// instructions, once per bytecode push.
+///
+/// Soundness:
+/// - invalidate EVERYTHING at any `is_safepoint_op` (a send can mutate any
+///   field; Alloc/Poll/FBox can move objects — the cached VREG's slot is
+///   GC-updated, but conservatism here is free since safepoints already
+///   spill);
+/// - invalidate everything at any heap write (`StoreField`, array/byte
+///   puts), then re-enter the stored (obj, off) → val pair — same-slot
+///   store forwarding, conservative about every alias;
+/// - a redefinition of any vreg drops every map entry using it as base or
+///   cached value (the IR is not SSA: poly rejoin `dst`s are written from
+///   several blocks, and in-block redefs must not serve stale values).
+pub(crate) fn load_forward(m: &mut IrMethod) {
+    let trace = std::env::var_os("MACVM_LFCSE").is_some_and(|v| v.to_str() == Some("trace"));
+    let mut merged = 0usize;
+    for b in &mut m.blocks {
+        let mut avail: Vec<((u32, i32), VReg)> = Vec::new();
+        for op in &mut b.code {
+            // Redefinition screen first: drop entries keyed on or caching a
+            // vreg this op is about to (re)define.
+            let mut defd: Vec<u32> = Vec::new();
+            op.defs(|v| defd.push(v.0));
+            if !defd.is_empty() {
+                avail.retain(|((base, _), v)| !defd.contains(base) && !defd.contains(&v.0));
+            }
+            match op {
+                Ir::LoadField { dst, obj, byte_off } => {
+                    if let Some(&(_, cached)) = avail
+                        .iter()
+                        .find(|((base, off), _)| *base == obj.0 && *off == *byte_off)
+                    {
+                        merged += 1;
+                        *op = Ir::Move { dst: *dst, src: cached };
+                    } else {
+                        let key = (obj.0, *byte_off);
+                        let dst = *dst;
+                        avail.push((key, dst));
+                    }
+                }
+                Ir::StoreField { obj, byte_off, val, .. } => {
+                    let key = (obj.0, *byte_off);
+                    let val = *val;
+                    avail.clear();
+                    avail.push((key, val));
+                }
+                Ir::ArrayAtPut { .. }
+                | Ir::ArrayAtPutNC { .. }
+                | Ir::ByteAtPut { .. } => avail.clear(),
+                _ => {
+                    if is_safepoint_op(op) {
+                        avail.clear();
+                    }
+                }
+            }
+        }
+    }
+    if trace && merged > 0 {
+        eprintln!("[lfcse] merged={merged}");
+    }
+}
+
 pub(crate) fn copy_propagate(m: &mut IrMethod) {
     let n = m.vregs.len();
     let mut def_count = vec![0u32; n];
@@ -11991,6 +12061,12 @@ pub fn convert(
         method_pool_ix,
         deopt_live_slots: None,
     };
+    // MACVM_LFCSE=1: local load forwarding (Stage 3b, gated off by default
+    // per the regalloc-findings law until its A/B verdict is in). Runs
+    // BEFORE copy_propagate so the Moves it introduces dissolve.
+    if std::env::var_os("MACVM_LFCSE").is_some() {
+        load_forward(&mut irm);
+    }
     copy_propagate(&mut irm);
     reduce_float_boxes(&mut irm, osr_bci);
     // R2 provenance license: the Array METACLASS — a `GuardKlass` against it
