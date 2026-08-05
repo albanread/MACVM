@@ -197,7 +197,13 @@ Object subclass: GamePane [
      indices), each font pixel blocked by `scale`. RETAINED between frames, so
      a changing HUD calls textClear first (else each frame prints over the
      last until the glyphs smear solid)."
-    text: aString x: x y: y r: r g: g b: b scale: k [ <primitive: 254> ^self ]
+    "The primitive takes a single packed 0xRRGGBB colour (an immediate
+     SmallInteger — a zero-alloc 'structure') so it stays within the primitive
+     argument limit; the r:g:b: forms below just pack it for callers."
+    text: aString x: x y: y rgb: rgb scale: k [ <primitive: 254> ^self ]
+    text: aString x: x y: y r: r g: g b: b scale: k [
+        ^self text: aString x: x y: y rgb: ((r bitShift: 16) + (g bitShift: 8) + b) scale: k
+    ]
     text: aString x: x y: y r: r g: g b: b [
         ^self text: aString x: x y: y r: r g: g b: b scale: 1
     ]
@@ -219,7 +225,10 @@ Object subclass: GamePane [
      a different colour on every scanline, so a shape drawn ONCE in index `i`
      changes colour down the screen and animates by rewriting the line colours
      — no pixel redrawn (galaxigans' tractor beam)."
-    linePaletteAt: line index: i r: r g: g b: b [ <primitive: 261> ^self ]
+    linePaletteAt: line index: i rgb: rgb [ <primitive: 261> ^self ]
+    linePaletteAt: line index: i r: r g: g b: b [
+        ^self linePaletteAt: line index: i rgb: ((r bitShift: 16) + (g bitShift: 8) + b)
+    ]
 
     GamePane class >> stepWithKeys: mask [
         "Run one frame: record the held-key bitmask, then run the step block.

@@ -1372,9 +1372,9 @@ pub static PRIMITIVES: &[PrimDesc] = &[
     },
     PrimDesc {
         id: 254,
-        name: "GamePane>>text:x:y:r:g:b:scale:",
+        name: "GamePane>>text:x:y:rgb:scale:",
         f: prim_game_text,
-        argc: 7,
+        argc: 5,
         can_allocate: false,
         can_fail: true,
     },
@@ -1428,9 +1428,9 @@ pub static PRIMITIVES: &[PrimDesc] = &[
     },
     PrimDesc {
         id: 261,
-        name: "GamePane>>linePaletteAt:index:r:g:b:",
+        name: "GamePane>>linePaletteAt:index:rgb:",
         f: prim_game_line_palette,
-        argc: 5,
+        argc: 3,
         can_allocate: false,
         can_fail: true,
     },
@@ -1696,19 +1696,31 @@ fn prim_game_set_pane_size(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     PrimResult::Ok(args[0])
 }
 
-/// `text:x:y:r:g:b:scale:` (254): draw text on the topmost overlay.
+/// Unpack an `0xRRGGBB` SmallInteger into `(r, g, b)`. The game prims take
+/// colour as a single packed SmallInteger (a zero-alloc "structure") so they
+/// stay within `MAX_PRIMITIVE_ARGS`; the ergonomic `…r:g:b:…` selectors pack it.
+/// Channels are masked to a byte, so out-of-range bits are ignored.
+fn unpack_rgb(rgb: i64) -> (u8, u8, u8) {
+    (
+        ((rgb >> 16) & 0xFF) as u8,
+        ((rgb >> 8) & 0xFF) as u8,
+        (rgb & 0xFF) as u8,
+    )
+}
+
+/// `text:x:y:rgb:scale:` (254): draw text on the topmost overlay. Colour is a
+/// packed `0xRRGGBB` SmallInteger (see `unpack_rgb`).
 fn prim_game_text(vm: &mut VmState, args: &[Oop]) -> PrimResult {
-    let (Some(text), Some(x), Some(y), Some(r), Some(g), Some(b), Some(scale)) = (
+    let (Some(text), Some(x), Some(y), Some(rgb), Some(scale)) = (
         smi_str(args[1]),
         smi_i64(args[2]),
         smi_i64(args[3]),
-        smi_byte(args[4]),
-        smi_byte(args[5]),
-        smi_byte(args[6]),
-        smi_i64(args[7]),
+        smi_i64(args[4]),
+        smi_i64(args[5]),
     ) else {
         return PrimResult::Fail;
     };
+    let (r, g, b) = unpack_rgb(rgb);
     let scale = scale.clamp(1, 16) as u32;
     game_emit(vm, GameCommand::Text { x, y, text, r, g, b, scale });
     PrimResult::Ok(args[0])
@@ -1790,20 +1802,20 @@ fn prim_game_set_frame_rate(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     PrimResult::Ok(args[0])
 }
 
-/// `linePaletteAt:index:r:g:b:` (261): per-scanline palette override.
+/// `linePaletteAt:index:rgb:` (261): per-scanline palette override. Colour is a
+/// packed `0xRRGGBB` SmallInteger (see `unpack_rgb`).
 fn prim_game_line_palette(vm: &mut VmState, args: &[Oop]) -> PrimResult {
-    let (Some(line), Some(index), Some(r), Some(g), Some(b)) = (
+    let (Some(line), Some(index), Some(rgb)) = (
         smi_i64(args[1]),
         smi_byte(args[2]),
-        smi_byte(args[3]),
-        smi_byte(args[4]),
-        smi_byte(args[5]),
+        smi_i64(args[3]),
     ) else {
         return PrimResult::Fail;
     };
     if line < 0 || index == 0 || index > 15 {
         return PrimResult::Fail; // index 0 is transparent; per-line is 1..15
     }
+    let (r, g, b) = unpack_rgb(rgb);
     game_emit(vm, GameCommand::LinePalette { line: line as u32, index, r, g, b });
     PrimResult::Ok(args[0])
 }
@@ -5151,14 +5163,14 @@ mod tests {
             (252, "microsecondClock"),
             // GamePane extensions (galaxigans arc).
             (253, "GamePane>>resizeTo:by:"),
-            (254, "GamePane>>text:x:y:r:g:b:scale:"),
+            (254, "GamePane>>text:x:y:rgb:scale:"),
             (255, "GamePane>>textClear"),
             (256, "GamePane>>primAddFrame:rows:"),
             (257, "GamePane>>primPlace:x:y:frame:"),
             (258, "GamePane>>primHide:"),
             (259, "GamePane>>shader:"),
             (260, "GamePane>>shaderParam:value:"),
-            (261, "GamePane>>linePaletteAt:index:r:g:b:"),
+            (261, "GamePane>>linePaletteAt:index:rgb:"),
             (262, "GamePane>>frameRate:"),
         ];
         assert_eq!(
@@ -5219,6 +5231,21 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Every numbered primitive must fit `try_primitive`'s fixed arg buffer
+    /// (`MAX_PRIMITIVE_ARGS + 1` slots). A natively-registered prim declaring
+    /// more args would overflow it at call time — catch it here, at test time.
+    /// The guest-side mirror is `frontend::codegen::check_limits`.
+    #[test]
+    fn prim_argc_within_buffer() {
+        let max = PRIMITIVES.iter().map(|d| d.argc as usize).max().unwrap_or(0);
+        assert!(
+            max <= crate::oops::layout::MAX_PRIMITIVE_ARGS,
+            "a primitive declares {max} args > MAX_PRIMITIVE_ARGS ({}) — it would \
+             overflow try_primitive's arg buffer",
+            crate::oops::layout::MAX_PRIMITIVE_ARGS,
+        );
     }
 
     #[test]

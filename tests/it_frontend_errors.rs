@@ -116,6 +116,48 @@ fn undeclared_variable_in_method_is_a_codegen_error() {
     assert!(err.span.line >= 1);
 }
 
+fn compile_first_method(vm: &mut VmState, src: &str) -> Result<(), CompileError> {
+    let mut items = parse_file(src).expect("parses");
+    let macvm::frontend::ast::TopItem::ClassDef(mut c) = items.remove(0) else {
+        panic!("expected a class def")
+    };
+    let object_klass = vm.universe.object_klass;
+    codegen::compile_method(vm, object_klass, false, &mut c.methods[0]).map(|_| ())
+}
+
+#[test]
+fn primitive_with_too_many_args_is_a_codegen_error() {
+    // 8 keyword args + a numbered primitive: within METHOD_ARGC_MAX (15) but
+    // over MAX_PRIMITIVE_ARGS (7), so it must be rejected at compile time rather
+    // than overflowing try_primitive's fixed arg buffer at call time.
+    let mut vm = test_vm();
+    let err = compile_first_method(
+        &mut vm,
+        "Object subclass: X [ p: a q: b r: c s: d t: e u: f v: g w: h [ <primitive: 99> ^self ] ]",
+    )
+    .expect_err("an 8-arg numbered primitive must be rejected");
+    assert!(err.msg.contains("primitive"), "msg: {}", err.msg);
+    assert!(err.msg.contains("at most"), "msg: {}", err.msg);
+}
+
+#[test]
+fn seven_arg_primitive_and_eight_arg_ordinary_method_are_ok() {
+    // The guard is primitive-specific and boundary-correct: exactly
+    // MAX_PRIMITIVE_ARGS (7) args on a primitive is fine, and an ordinary
+    // (non-primitive) method may exceed it up to METHOD_ARGC_MAX.
+    let mut vm = test_vm();
+    compile_first_method(
+        &mut vm,
+        "Object subclass: X [ a: a b: b c: c d: d e: e f: f g: g [ <primitive: 99> ^self ] ]",
+    )
+    .expect("a 7-arg primitive fits the buffer");
+    compile_first_method(
+        &mut vm,
+        "Object subclass: Y [ a: a b: b c: c d: d e: e f: f g: g h: h [ ^self ] ]",
+    )
+    .expect("an 8-arg ordinary method is not bound by the primitive limit");
+}
+
 #[test]
 fn reopen_with_new_instvars_errors() {
     let mut vm = test_vm();

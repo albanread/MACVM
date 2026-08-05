@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use crate::bytecode::BytecodeBuilder;
 use crate::memory::alloc;
 use crate::memory::handles::{Handle, HandleScope};
-use crate::oops::layout::{METHOD_ARGC_MAX, METHOD_NCTX_MAX, METHOD_NTEMPS_MAX};
+use crate::oops::layout::{MAX_PRIMITIVE_ARGS, METHOD_ARGC_MAX, METHOD_NCTX_MAX, METHOD_NTEMPS_MAX};
 use crate::oops::smi::SmallInt;
 use crate::oops::wrappers::{ArrayOop, KlassOop, MemOop, MethodOop};
 use crate::oops::Oop;
@@ -1227,6 +1227,23 @@ fn compile_method_inner(
         scope,
     };
     check_limits(&cx, method.span, argc, scope0.frame_temp_count, scope0.nctx)?;
+    // A NUMBERED primitive reads receiver+args from a fixed-size buffer in
+    // `try_primitive` (sized `MAX_PRIMITIVE_ARGS + 1`); declaring one with more
+    // args than that would overflow it at call time. Reject here instead — the
+    // general `METHOD_ARGC_MAX` (15) is looser and lets a primitive method slip
+    // through. FFI primitives (`method.ffi`) read args separately and are exempt.
+    if method.primitive.is_some() && argc > MAX_PRIMITIVE_ARGS {
+        return Err(cx.error(
+            method.span,
+            format!(
+                "primitive method '{}' takes {argc} arguments but a primitive \
+                 supports at most {MAX_PRIMITIVE_ARGS} — pass the extra \
+                 arguments in a structure (e.g. an Array, a spec object, or \
+                 scalars packed into a SmallInteger)",
+                method.pattern_selector,
+            ),
+        ));
+    }
 
     let mut b = BytecodeBuilder::new();
     let mut cache = LitCache::new();

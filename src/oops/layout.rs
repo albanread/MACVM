@@ -215,6 +215,18 @@ pub const METHOD_ARGC_MAX: usize = (1 << METHOD_FLAGS_ARGC_BITS) - 1; // 15
 pub const METHOD_NTEMPS_MAX: usize = (1 << METHOD_FLAGS_NTEMPS_BITS) - 1; // 255
 pub const METHOD_NCTX_MAX: usize = (1 << METHOD_FLAGS_NCTX_BITS) - 1; // 255
 
+/// Max arguments a NUMBERED primitive (`<primitive: N>`) may take. A numbered
+/// primitive reads its receiver+args from a fixed-size stack-copy buffer in
+/// `interpreter::send::try_primitive` (sized `MAX_PRIMITIVE_ARGS + 1`); a method
+/// that declares one must fit, or it would overflow that buffer at call time.
+/// Enforced at compile (`frontend::codegen::check_limits`, a clean error) and by
+/// a `PRIMITIVES`-table unit test on the Rust side. This is TIGHTER than
+/// `METHOD_ARGC_MAX` (15) — ordinary methods and FFI primitives (which read args
+/// separately) are not bound by it; they may take up to `METHOD_ARGC_MAX`. Code
+/// that genuinely needs more than this should pass the extra arguments in a
+/// structure (an `Array`/spec object, or scalars packed into a `SmallInteger`).
+pub const MAX_PRIMITIVE_ARGS: usize = 7;
+
 // --- frame layout (SPEC §5.1, S2/S3, extended S4) ---------------------------
 // S4 inserts two slots (serial, marker); FRAME_TEMPS_BASE moved from 5 to 7 —
 // never hard-code either value outside this constant.
