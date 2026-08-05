@@ -234,6 +234,31 @@ and recorded, per Z-D5.
 
 ## 7. Measurement log
 
+### Z5 — the leaf door (landed 2026-08-05)
+
+`leaf_prim_fn` (primitives.rs): a prim qualifies when it cannot allocate,
+receiver+args fit x0..x5, and it isn't `error:`/`halt` (whose side effects
+want the anchor even without allocating). The shim's leaf branch
+(`emit_prim_shim`) then bypasses the anchored stub entirely: args park in
+the shim's own 64-byte stack scratch (NOT RootSpill — sound because no GC
+can occur under a non-allocating prim), one direct `bl` to
+`rt_call_leaf_primitive` (stubs.rs) with the `PrimFn` pointer baked into
+the literal pool — no anchor writes, no kind tag, no per-call `prim_by_id`
+binary search, no SafepointPc, args reloaded only on the cold Fail edge.
+Trade recorded: a Rust panic *inside* a leaf prim now produces a
+degraded PROBE dossier (stale anchor) — accepted for a door that nothing
+walking the stack can ever observe open.
+
+Gates: differential byte-identical (6200/0), stress 1 + full:64 green,
+cargo test --release green (21 suites).
+
+A/B: library-composite profile Rust-side share **63.7% → 43.0%**;
+`rt_call_primitive` 732 → 236 samples (the remainder is the anchored door
+for allocating prims, which is correct). Library third-pass total 54 →
+50–54 ms. The surviving top lines are now real work — `replaceFrom:`'s
+memcpy, `intern_core`, `alloc_words`, `basicNew:` — i.e. Z4b's and the
+GC arc's turf.
+
 ### Z1 — `class` + byte-`size` fuses (landed 2026-08-05)
 
 Implementation: `ir.rs` gates `class_const_op` / `byte_size_op` (prim-28

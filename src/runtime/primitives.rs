@@ -2964,6 +2964,22 @@ pub fn klass_of(vm: &VmState, o: Oop) -> KlassOop {
     crate::runtime::lookup::klass_of(vm, o)
 }
 
+/// Z5 (docs/intrinsics_design.md): is primitive `id` eligible for the LEAF
+/// call door — the no-anchor, no-RootSpill direct call from a compiled
+/// prim shim? Requires: cannot allocate (no GC can occur while the args
+/// live in unregistered stack scratch), receiver+args fit the x0..x5
+/// marshal (<= 6), and not one of the two prims whose *side effects* need
+/// the anchor machinery even without allocating (`error:` walks frames for
+/// its report; `halt` enters the debugger). Returns the raw `PrimFn`
+/// pointer to bake into the caller's literal pool.
+pub fn leaf_prim_fn(id: i64, argc_plus_recv: u8) -> Option<u64> {
+    if argc_plus_recv > 6 || matches!(id, 95 | 251) {
+        return None;
+    }
+    let desc = prim_by_id(u16::try_from(id).ok()?)?;
+    (!desc.can_allocate).then_some(desc.f as usize as u64)
+}
+
 fn prim_identity_hash(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     let recv = args[0];
     if recv.is_smi() {

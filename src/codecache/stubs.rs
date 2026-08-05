@@ -2284,6 +2284,40 @@ fn build_stub_call_primitive() -> CodeBlob {
 /// `compiler::driver`'s shimmable-primitive eligibility excludes every
 /// primitive capable of it, enforced here by the `debug_assert` below, not
 /// silently assumed.
+/// Z5: the leaf door itself. `f` is the `PrimFn` the compiler baked into
+/// the shim's literal pool (via [`leaf_prim_fn`]); `args` points at the
+/// shim's own stack scratch — NOT RootSpill, NOT GC-registered, which is
+/// sound exactly because a leaf primitive can never allocate (enforced by
+/// `leaf_prim_fn`'s `can_allocate` gate) and therefore never moves an oop
+/// or walks a frame. No anchor is set: nothing that runs under this call
+/// may look at `last_compiled_*`.
+///
+/// # Safety
+/// Called only from the leaf prim shim (`emit::emit_prim_shim`), which
+/// guarantees `vm` is the live VmState, `args[0..n]` are valid oops, and
+/// `f` came from `leaf_prim_fn` on this same process's `PRIMITIVES` table.
+pub unsafe extern "C" fn rt_call_leaf_primitive(
+    vm: *mut crate::runtime::vm_state::VmState,
+    args: *const crate::oops::Oop,
+    n: u64,
+    f: u64,
+) -> u64 {
+    // SAFETY: the shim's contract above.
+    let vm = unsafe { &mut *vm };
+    let args = unsafe { std::slice::from_raw_parts(args, n as usize) };
+    // SAFETY: `f` is a `PrimFn` out of `PRIMITIVES` (leaf_prim_fn), same
+    // process, same ABI.
+    let f: crate::runtime::primitives::PrimFn =
+        unsafe { std::mem::transmute::<u64, crate::runtime::primitives::PrimFn>(f) };
+    match f(vm, args) {
+        crate::runtime::primitives::PrimResult::Ok(v) => v.raw(),
+        crate::runtime::primitives::PrimResult::Fail => crate::oops::layout::PRIM_FAIL_SENTINEL,
+        crate::runtime::primitives::PrimResult::Activated | crate::runtime::primitives::PrimResult::Nlr(_) => unreachable!(
+            "rt_call_leaf_primitive: Activated/Nlr from a leaf prim --              PRIM_ACTIVATES_FRAME prims are never shimmed at all"
+        ),
+    }
+}
+
 pub unsafe extern "C" fn rt_call_primitive(
     vm: *mut VmState,
     prim_id: u64,

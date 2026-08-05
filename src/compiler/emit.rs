@@ -48,7 +48,7 @@
 //! [`emit_mov_imm64`] does the multi-instruction expansion itself.
 
 use crate::compiler::assembler::{
-    d, imm, mem, q, sp, v2d, v4s, vd_lane, x, xr, Assembler, CodeBlob, Cond, Label, LiteralId,
+    d, imm, mem, mem_post, mem_pre, q, sp, v2d, v4s, vd_lane, x, xr, Assembler, CodeBlob, Cond, Label, LiteralId,
     Operand, Reg, RelocKind,
 };
 use crate::compiler::ir::{
@@ -309,6 +309,10 @@ struct Emitter<'a> {
     /// `bl`s here (`compiler::driver`'s shimmable-primitive eligibility).
     /// See [`emit_prim_shim`].
     call_primitive_lit: LiteralId,
+    /// Z5: `Some((rt_call_leaf_primitive, prim_fn))` literals when this
+    /// method's primitive qualifies for the leaf door (emit_prim_shim's
+    /// leaf branch); `None` keeps the generic anchored stub path.
+    leaf_prim_lits: Option<(LiteralId, LiteralId)>,
     /// S24 A1: `stub_nlr_originate`'s address — `Ir::NlrReturn`'s `bl`
     /// target (a block compilation's `nlr_tos` lowering).
     nlr_originate_lit: LiteralId,
@@ -1514,6 +1518,38 @@ impl<'a> Emitter<'a> {
     /// restore of its own: it runs exactly as if this were an ordinary
     /// (non-primitive) compiled method entry, x0 already `self`.
     fn emit_prim_shim(&mut self, prim_id: i64, argc_plus_recv: u8, epilogue: Label) {
+        // Z5: the leaf door. No stub, no anchor, no kind tag, no RootSpill,
+        // no SafepointPc — sound because a leaf prim can never allocate
+        // (leaf_prim_fn's gate), so no GC or frame walk can observe this
+        // window. Args park in the shim's own stack scratch purely so the
+        // Rust side can see them as a slice, and reload only on the cold
+        // Fail edge (the method body needs its x0..x5 back).
+        if let Some((rt_lit, fn_lit)) = self.leaf_prim_lits {
+            let fail = self.asm.new_label();
+            self.asm.emit("stp", &[x(29), x(30), mem_pre(31, -64)]);
+            self.asm.emit("mov", &[x(29), sp()]);
+            self.asm.emit("stp", &[x(0), x(1), mem(31, 16)]);
+            self.asm.emit("stp", &[x(2), x(3), mem(31, 32)]);
+            self.asm.emit("stp", &[x(4), x(5), mem(31, 48)]);
+            self.asm.emit("mov", &[x(0), x(28)]);
+            self.asm.emit("add", &[x(1), sp(), imm(16)]);
+            self.asm.emit("movz", &[x(2), imm(argc_plus_recv as i64)]);
+            self.asm.ldr_literal(xr(3), fn_lit);
+            self.asm.call_far(rt_lit);
+            self.asm.emit(
+                "cmp",
+                &[x(0), imm(crate::oops::layout::PRIM_FAIL_SENTINEL as i64)],
+            );
+            self.asm.b_cond(Cond::Eq, fail);
+            self.asm.emit("ldp", &[x(29), x(30), mem_post(31, 64)]);
+            self.asm.b(epilogue);
+            self.asm.bind(fail);
+            self.asm.emit("ldp", &[x(0), x(1), mem(31, 16)]);
+            self.asm.emit("ldp", &[x(2), x(3), mem(31, 32)]);
+            self.asm.emit("ldp", &[x(4), x(5), mem(31, 48)]);
+            self.asm.emit("ldp", &[x(29), x(30), mem_post(31, 64)]);
+            return;
+        }
         let fail = self.asm.new_label();
         self.asm.emit("movz", &[x(10), imm(prim_id)]);
         self.asm.emit("movz", &[x(11), imm(argc_plus_recv as i64)]);
@@ -2638,6 +2674,17 @@ pub fn emit(
     let box_int32x4_lit = asm.literal_u64(box_int32x4_addr, Some(RelocKind::RuntimeAddr));
     let call_primitive_lit = asm.literal_u64(call_primitive_addr, Some(RelocKind::RuntimeAddr));
     let nlr_originate_lit = asm.literal_u64(nlr_originate_addr, Some(RelocKind::RuntimeAddr));
+    let leaf_prim_lits = prim_shim
+        .and_then(|(id, n)| crate::runtime::primitives::leaf_prim_fn(id, n))
+        .map(|fnptr| {
+            (
+                asm.literal_u64(
+                    crate::codecache::stubs::rt_call_leaf_primitive as usize as u64,
+                    Some(RelocKind::RuntimeAddr),
+                ),
+                asm.literal_u64(fnptr, Some(RelocKind::RuntimeAddr)),
+            )
+        });
 
     if let Some(g) = &guard {
         emit_entry_guard(asm, g);
@@ -2949,6 +2996,7 @@ pub fn emit(
         box_float32x4_lit,
         box_int32x4_lit,
         call_primitive_lit,
+        leaf_prim_lits,
         nlr_originate_lit,
         call_sites: &method.call_sites,
         ic_sites: Vec::new(),
