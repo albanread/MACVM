@@ -10368,6 +10368,14 @@ fn unroll_blocked_op(ir: &Ir) -> bool {
 /// Max blocks in one unrolled region — a compile-time guard, not a tuning knob.
 const UNROLL_REGION_MAX: usize = 24;
 
+/// `MACVM_R4=1` — range-analysis R4: prove a variable-stride induction
+/// variable stays positive, so its array accesses drop their bounds check
+/// (docs/range_analysis_design.md). Default OFF until its A/B clears.
+pub(crate) fn r4_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("MACVM_R4").is_some_and(|v| v == "1"))
+}
+
 /// `MACVM_UNROLL=1` — the gate. Default OFF (see `docs/unroll_design.md`).
 pub(crate) fn unroll_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -10523,11 +10531,14 @@ fn unroll_one(m: &mut IrMethod, h: usize, l: usize) -> bool {
     true
 }
 
-pub(crate) fn range_reduce(m: &mut IrMethod, array_meta: Option<crate::oops::wrappers::KlassOop>) {
+pub(crate) fn range_reduce(
+    m: &mut IrMethod,
+    array_meta: Option<crate::oops::wrappers::KlassOop>,
+) -> (u32, u32) {
     use std::collections::HashMap;
     let entry_blk = match m.blocks.first() {
         Some(b) => b.id.0,
-        None => return,
+        None => return (0, 0),
     };
     // Per-vreg def descriptors, each with its defining BLOCK id (R2's
     // dominance-lite: an entry-block def dominates every loop block).
@@ -10659,6 +10670,66 @@ pub(crate) fn range_reduce(m: &mut IrMethod, array_meta: Option<crate::oops::wra
         matches!(defs_of.get(&v).map(Vec::as_slice),
             Some([(DefK::MoveFrom(s), _)]) if chain_reaches(*s, root, defs_of, depth - 1))
     }
+    // R4 (docs/range_analysis_design.md): is `v` provably >= 1 on every path?
+    // The induction arm of `lower_bound` only accepted a positive compile-time
+    // CONSTANT addend, so sieve's `k := k + prime` — stride in a temp — was
+    // never proven and kept its bounds check. This answers the weaker question
+    // "is the addend positive" for an arbitrary vreg.
+    //
+    // Sound because an overflowing `SmiArith{Add}` takes its `fail` edge and
+    // traps: if execution reaches the use, the sum is a real smi equal to
+    // a + b, so positive + positive >= 2 >= 1.
+    fn provably_positive(v: u32, defs_of: &Defs, depth: u8) -> bool {
+        if depth == 0 {
+            return false;
+        }
+        let Some(ds) = defs_of.get(&v) else {
+            return false;
+        };
+        if ds.is_empty() {
+            return false;
+        }
+        let mut saw_real = false;
+        for (d, _) in ds {
+            match d {
+                // The frontend nil-initialises every temp; that arm is
+                // pre-definition and cannot reach a use (same license
+                // `resolve_arr` already takes).
+                DefK::NonSmiConst => continue,
+                DefK::Smi(c) => {
+                    if *c <= 0 {
+                        return false;
+                    }
+                    saw_real = true;
+                }
+                DefK::MoveFrom(s) => {
+                    if !provably_positive(*s, defs_of, depth - 1) {
+                        return false;
+                    }
+                    saw_real = true;
+                }
+                DefK::AddOf(a, b) => {
+                    // v's own induction step (v := v + positive) cannot lower
+                    // v's minimum — skip it, exactly as `lower_bound` does.
+                    let step = chain_reaches(*a, v, defs_of, 8)
+                        && (resolve_strict(*b, defs_of, 8).is_some_and(|c| c > 0)
+                            || provably_positive(*b, defs_of, depth - 1));
+                    if step {
+                        continue;
+                    }
+                    if !(provably_positive(*a, defs_of, depth - 1)
+                        && provably_positive(*b, defs_of, depth - 1))
+                    {
+                        return false;
+                    }
+                    saw_real = true;
+                }
+                _ => return false,
+            }
+        }
+        saw_real
+    }
+
     fn lower_bound(v: u32, root: u32, defs_of: &Defs, depth: u8) -> Option<Option<i64>> {
         if depth == 0 {
             return None;
@@ -10674,12 +10745,25 @@ pub(crate) fn range_reduce(m: &mut IrMethod, array_meta: Option<crate::oops::wra
                     None => continue,
                 },
                 DefK::AddOf(a, b) => {
-                    if resolve_strict(*b, defs_of, 8).is_some_and(|c| c > 0)
-                        && chain_reaches(*a, root, defs_of, 8)
-                    {
+                    // R4: accept a provably-positive addend, not just a
+                    // positive compile-time constant (sieve strides by a temp).
+                    let pos_addend = resolve_strict(*b, defs_of, 8).is_some_and(|c| c > 0)
+                        || (r4_enabled() && provably_positive(*b, defs_of, 8));
+                    if pos_addend && chain_reaches(*a, root, defs_of, 8) {
                         continue; // the induction step never lowers the min
                     }
-                    return None;
+                    // R4: not the induction step — but a sum of two provably
+                    // positive values is itself >= 2, so 1 is a sound (and
+                    // conservative) lower bound. This is what lets the loop's
+                    // INIT def `k := i + prime` be proven alongside its step.
+                    if r4_enabled()
+                        && provably_positive(*a, defs_of, 8)
+                        && provably_positive(*b, defs_of, 8)
+                    {
+                        Some(1)
+                    } else {
+                        return None;
+                    }
                 }
                 _ => return None,
             };
@@ -10958,14 +11042,7 @@ pub(crate) fn range_reduce(m: &mut IrMethod, array_meta: Option<crate::oops::wra
             m.inline_deps.push((meta, sel));
         }
     }
-    static LOG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if (rewritten > 0 || bounds_rewritten > 0)
-        && *LOG.get_or_init(|| std::env::var_os("MACVM_RANGE_COUNT").is_some())
-    {
-        eprintln!(
-            "range-reduce: {rewritten} overflow + {bounds_rewritten} bounds checks deleted"
-        );
-    }
+    (rewritten, bounds_rewritten)
 }
 
 pub(crate) fn is_safepoint_op(ir: &Ir) -> bool {
@@ -12329,7 +12406,14 @@ pub fn convert(
             eprintln!("[unroll] {n} loop(s) unrolled 2x ({} blocks now)", irm.blocks.len());
         }
     }
-    range_reduce(&mut irm, array_meta);
+    let (rr_ovf, rr_bounds) = range_reduce(&mut irm, array_meta);
+    if (rr_ovf > 0 || rr_bounds > 0) && std::env::var_os("MACVM_RANGE_COUNT").is_some() {
+        eprintln!(
+            "range-reduce: {rr_ovf} overflow + {rr_bounds} bounds checks deleted  [{}{}]",
+            crate::compiler::driver::selector_string(method),
+            if osr { " OSR" } else { "" }
+        );
+    }
     if crate::compiler::regalloc::fuse_cmp_br() {
         fuse_ref_cmp_br(&mut irm);
     }

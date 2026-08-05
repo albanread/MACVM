@@ -145,6 +145,45 @@ run after the store and nothing waits on them. Rank by critical-path
 position, not instruction count — `critical_path_findings.md`. Plus the R1
 tripwire below, whose negative case is the correctness case.
 
+### R4 BUILT AND MEASURED (2026-08-05): +3.1%, below the >=8% bar — gated OFF
+
+Implemented behind `MACVM_R4=1` as a `provably_positive(v)` proof beside
+`lower_bound`: a vreg is >= 1 if every def is a positive `Smi`, a `MoveFrom`
+of such, or an `AddOf` of two such (sound because an overflowing
+`SmiArith{Add}` takes its `fail` edge, so a reached use is a real smi). The
+induction arm now also accepts a *provably positive* addend, not only a
+positive compile-time constant, and a non-induction `AddOf` of two positives
+yields a conservative lower bound of 1 — which is what lets sieve's INIT
+(`k := i + prime`) be proven alongside its step.
+
+It works: `prime := i + i + 1` derives from the outer loop variable, so it is
+provably positive, and the marking loop's check is deleted.
+
+Interleaved 8-round A/B: **48.1 -> 46.6 us, +3.1%** (7 of 8 rounds favour it).
+The bar fixed in advance was >=8%. **Gated off.**
+
+**Why it falls short of the 15.5% ceiling — diagnosed, not guessed.** The
+`MACVM_RANGE_COUNT` census now names its method and flags OSR, which makes the
+answer immediate:
+
+```
+baseline:  1 [sieveOnce OSR] | 2 [sieveOnce] | 2 [sieveOnce OSR] | 2 [sieveOnce]
+R4=1:      1 [sieveOnce OSR] | 3 [sieveOnce] | 2 [sieveOnce OSR] | 2 [sieveOnce]
+```
+
+R4 proves the loop in the FIRST full compile (2 -> 3) but **the recompile —
+the version that actually runs hot — falls back to 2**, and neither OSR compile
+is helped. So roughly one compile in four gets the win, which is about the
+ratio between the measured 3.1% and the 15.5% ceiling.
+
+**Next step, concrete:** find why `provably_positive(prime)` fails on the
+recompile when it succeeded on the first full compile. The likely cause is
+that feedback-driven inlining in the recompile changes `prime`'s def chain
+(an extra merge or `Opaque` arm), or that the OSR-entry defs differ. Fixing
+that — and extending the proof to the OSR compiles — is what converts this
+from 3% to something near the ceiling. The lever is real; its *reach* is the
+problem, not its validity.
+
 *Negative findings, recorded so they are not re-run.*
 - `k to: size by: prime do: [...]` marks the identical index set but is
   **4× slower** (218 µs vs 50 µs) and deletes **zero** checks — a

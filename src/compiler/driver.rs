@@ -1561,7 +1561,7 @@ fn compile_method_full(
     Some(id)
 }
 
-fn selector_string(method: MethodOop) -> String {
+pub(crate) fn selector_string(method: MethodOop) -> String {
     SymbolOop::try_from(method.selector())
         .map(|s| s.as_string())
         .unwrap_or_else(|| "<?>".to_string())
