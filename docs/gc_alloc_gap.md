@@ -111,8 +111,12 @@ iterations. The full-GC bill is ~130µs/iteration ≈ **23% of the bench**.
 GC *counts* 4× (572→143 scavenges, 98→25 fulls) but the bench moves only
 ~3% — total collector work is survival-driven, not trigger-driven, and
 512KB survivors still force the same promotion volume in bigger batches.
-(MACVM_EDEN=262144 with MACVM_HEAP=1024 silently fell back to defaults —
-identical counters; the clamp deserves a loud warning, noted in passing.)
+(A note here previously claimed MACVM_EDEN=262144 + MACVM_HEAP=1024
+"silently fell back" — that was the MEASURING SHELL's word-splitting
+passing one malformed variable to env(1), not the VM: correctly passed,
+the same configuration runs 71 scavenges / 2 fulls. The override is
+honored as-is, exactly as its doc says. Retracted with apologies to
+`universe::genesis`.)
 
 **The fix shape:** survivor capacity proportional to eden (eden/4-ish, or
 ≥8MB at the default 32MB eden) so a transient live set can AGE: with

@@ -514,7 +514,10 @@ for direct pointers and a fast JIT.
 
 ```sh
 cargo build --release
-target/release/macvm run world/bench/deltablue.mst --world world   # runs it
+target/release/macvm run world/bench/fib.mst --world world          # runs it
+# (richards/deltablue now live IN the standard world for the dashboard —
+#  run them via scripts/cog-bench.mst or the GUI's benchmarks, not the
+#  standalone world/bench files, which would redefine their classes)
 MACVM_JIT=off   target/release/macvm run <prog>.mst --world world   # interpreter only
 MACVM_JIT=threshold=200 …                                            # JIT (default gate)
 MACVM_TRACE=stats|jit|deopt|count …                                  # instrumentation

@@ -24,7 +24,9 @@ type CompiledIcState = crate::codecache::nmethod::IcState;
 
 /// D1 point 2: `primitives.rs`'s own pinned ids for
 /// `{ +, -, *, bitAnd:, bitOr:, bitXor:, <, <=, >, >=, =, ~= }` — division
-/// (`//`, `\\`, `bitShift:`: ids 4, 5, 9) excluded in v1. `pub(crate)`: also
+/// `//`/`\\` (4, 5) joined with R3; `bitShift:` (9) fuses via its own
+/// Z3 gate (`ir::smi_shift_op`), deliberately NOT via this list — see
+/// that gate's doc for the PRIM_ALREADY_FUSED interaction. `pub(crate)`: also
 /// read directly by `ir::Translator::is_smi_inlinable` (S11 step 7) — both
 /// readers must agree on exactly the same set, since `eligibility_detail`'s
 /// own `mono_smi_inline_send` below is what decides a method compiles AT

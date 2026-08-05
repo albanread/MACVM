@@ -233,6 +233,21 @@ fn print_nm_map(vm: &VmState) {
 /// combined stress gate). `bridge_old_allocs` is gone with the bridge.
 fn print_gc_bridge_stats(vm: &VmState) {
     if vm.options.trace.is_enabled("gc") {
+        // Wall-clock GC totals at exit — the number the bench median is
+        // structurally blind to (docs/gc_alloc_gap.md's protocol finding:
+        // a full GC lands in 2-3 samples of 41 and the median discards
+        // them). Judge collector work by THIS line or whole-run wall
+        // clock, never by warm_us.
+        let g = &vm.universe.gc_stats;
+        eprintln!(
+            "gc: scavenges={} total_ms={:.0} max_ms={:.1}  fulls={} total_ms={:.0} max_ms={:.1}",
+            g.scavenge_count,
+            g.total_scavenge_pause.as_secs_f64() * 1000.0,
+            g.scavenge_pause_max.as_secs_f64() * 1000.0,
+            g.full_gc_count,
+            g.full_pause_total.as_secs_f64() * 1000.0,
+            g.full_pause_max.as_secs_f64() * 1000.0,
+        );
         eprintln!(
             "gc: gc_under_compiled={}",
             vm.universe.gc_stats.gc_under_compiled

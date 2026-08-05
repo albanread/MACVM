@@ -62,12 +62,12 @@ rather than bytecode-level micro-specialization, keeping the set small
 
 ## Primitives
 
-> **Scope.** The live `PRIMITIVES` table is **153 entries, ids 1–248**
+> **Scope.** The live `PRIMITIVES` table is **157 entries, ids 1–252**
 > (`src/runtime/primitives.rs`; its `prim_ids_frozen` test pins every id→name
 > pair and fails the build if the table grows without this being revisited —
 > that test, not this file, is the authority).
 >
-> The **id map** below covers all 153 and names the owning document for each
+> The **id map** below covers the table and names the owning document for each
 > group. The **id-by-id table** that follows details the core set (ids ≤110)
 > and the reflection group (246–248); the later groups are documented
 > id-by-id in their own design docs rather than duplicated here, because that
