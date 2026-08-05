@@ -76,6 +76,56 @@ of the work".
   breaks the loop-carried `k` dependency and puts several independent
   stores in flight at once. That is precisely the shape this core rewards.
 
+## Unrolling: the prediction, tested (10%, and SOUND)
+
+The law above predicts unrolling should pay: it *adds* instructions but
+removes loop-carried work. Tested at source level on the same marking loop
+(hand-unrolled in Smalltalk, `pJ == J*prime` hoisted as loop invariants,
+tail loop for the remainder, `count=1899` preserved on every arm):
+
+| unroll | run 1 | run 2 | vs 1x |
+|---|---|---|---|
+| 1x (baseline) | 41 µs | 42 µs | — |
+| **2x** | **37 µs** | **38 µs** | **~10% faster** |
+| 4x | 38 µs | 37 µs | ~10% faster |
+| 8x | 40 µs | 39 µs | ~6% — regressing |
+
+**~10%, and it plateaus at 2x.** That the whole benefit arrives at 2x says
+the win is amortising the *loop-carried* overhead — the `k` update, the
+compare/branch, the safepoint poll — not deep instruction-level
+parallelism across many stores. 8x gives it back to code bloat and
+register pressure.
+
+Unlike the two probes above this is a **sound** transformation, and the
+source-level result is a lower bound on what a compiler unroller would get
+(it could also hoist the invariants the guard reloads — see below).
+
+## Loop-invariant memory traffic — the other half
+
+Both hot loops reload compile-time-known values from the constant pool on
+every single iteration:
+
+- marking loop, +0x034c: `ldr x20, pool[0x303000dd1]` — the klass constant
+  for the guard, feeding the `cmp`/`b.ne` that gates the entire body;
+- init loop, +0x0480..+0x0484: `ldr x10, pool[true]` **and then a spill of
+  it** — two memory ops per iteration for the constant `true`.
+
+And the method as a whole executes **158 frame spill/reload operations out
+of 352 instructions** (109 stores, 49 loads).
+
+Two levers fall out, and they are ordered:
+1. **LICM** beats rematerialisation for these, because the values are
+   loop-invariant — hoisting removes the operation entirely rather than
+   trading it for cheaper ALU work. No LICM, dominator tree or pre-header
+   exists anywhere in `src/compiler/` today.
+2. **Rematerialisation** (recompute a pool constant with `movz`/`movk`
+   instead of reloading or, worse, spilling it) is the right tool where a
+   value is *not* loop-invariant or where the allocator would otherwise
+   spill. `0x303000dd1` is three `movz`/`movk` — serially dependent, so
+   roughly latency-neutral against an L1 hit, but it frees a load slot and
+   costs no frame slot. Given the 158 spill ops above, remat-instead-of-
+   spill is the high-value form of "more instructions, less memory".
+
 ## Method note
 
 Both numbers come from deliberately **unsound** throwaway probes
