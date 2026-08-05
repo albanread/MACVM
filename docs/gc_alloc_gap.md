@@ -122,3 +122,40 @@ receives only genuinely old data, and the full-GC category ~vanishes on
 this shape. Estimated recovery ≈ the full-GC bill: alloc ~575 → ~445µs
 (MACDART: ~380). Touches the reservation layout math — gate behind the
 S7/S8 stress suites and the soak protocol before default-on.
+
+### The fix, landed 2026-08-06: eden-proportional survivors (default ON)
+
+`survivor_size_for(eden) = max(512K, eden/4)`, `MACVM_SURVIVOR` (KiB)
+overrides — `=512` reproduces the old geometry, which is what makes the
+one-binary env-flip A/B below possible. Two test adjustments:
+`copy_exact_fill_survivor` pins the old geometry via a 2 MiB explicit
+eden (its root-keeping pushes every survivor onto the guest stack, so
+its fill count must stay bounded); the two layout geometry tests now
+assert `survivor_size_for` instead of the fixed constant.
+
+Gates: differential byte-identical, GC-stress 1/full/full:64 green,
+400-cycle soak clean, full release suite green.
+
+**Measured (3000 × benchAlloc, one binary, env flip, reproduced ×2):**
+
+| | old (512K) | new (eden/4) |
+|---|---|---|
+| scavenges | 572 (981 ms) | 572 (**742 ms**) |
+| full compactions | 98 (618 ms) | **30 (163 ms)** |
+| GC total | 1599 ms | **905 ms (−43%)** |
+| wall clock | 3.39 s | **2.71 s (−20%)** |
+
+Survivor copying beats premature promotion twice over: the scavenges
+themselves got cheaper (1.72 → 1.30 ms — old-space bump/card work is
+dearer than a survivor memcpy) AND two-thirds of the full compactions
+vanished. Classic-seven spot: every row within noise between arms.
+
+**A protocol finding worth its own line:** `cog-bench`'s median-of-41
+warm_us is structurally BLIND to GC improvements on alloc-shaped work —
+a full GC lands in 2–3 samples of 41 and the median discards them, so a
+−43% GC-time change moves warm_us not at all (it even read +3% once).
+GC work must be judged by whole-run wall clock or the trace totals,
+never by the median protocol. The residual alloc-bench gap vs MACDART
+(~580 vs ~380 µs median) is now MUTATOR cost — the allocation loop's
+codegen and ivar writes — not collector time; it belongs to the
+codegen arcs.

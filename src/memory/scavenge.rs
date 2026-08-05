@@ -925,7 +925,22 @@ mod tests {
     /// into promotion instead of corrupting the space.
     #[test]
     fn copy_exact_fill_survivor() {
-        let mut vm = test_vm();
+        // Pin the ORIGINAL 512 KiB survivor geometry via a small explicit
+        // eden (2 MiB / 4 = the floor): the test's root-keeping strategy
+        // pushes every survivor onto the guest operand stack, so its fill
+        // count must stay within stack capacity — with the 2026-08-06
+        // eden-proportional survivors (docs/gc_alloc_gap.md) the default
+        // test heap's survivors grew 8x and the count overflowed the
+        // stack (exit 70). Exact-fill semantics are geometry-independent;
+        // this just keeps the fill small.
+        let mut vm = VmState::with_options(VmOptions {
+            heap_mib: 64,
+            trace: Default::default(),
+            gc_stress: false,
+            gc_stress_full_period: None,
+            eden_kb: Some(2048),
+            jit: crate::runtime::JitMode::Off,
+        });
         // Force tenuring off entirely so everything copies to `to`.
         vm.universe.tenuring_threshold = 127;
 

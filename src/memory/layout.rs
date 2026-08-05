@@ -32,8 +32,33 @@ pub const DEFAULT_EDEN_SIZE: usize = 32 << 20;
 pub fn default_eden_for(total_len: usize) -> usize {
     DEFAULT_EDEN_SIZE.min(total_len / 4)
 }
-/// Each survivor space's fixed size *(tunable)* — SPEC §7.1.
+/// Each survivor space's size FLOOR — SPEC §7.1's original fixed value.
+/// Since 2026-08-06 the actual size is eden-proportional
+/// ([`survivor_size_for`]): the fixed 512 KiB was the measured root cause
+/// of benchAlloc's full-GC churn (docs/gc_alloc_gap.md) — a transient
+/// live set of ~3-6MB can never age in 512 KiB, so Ungar's threshold
+/// slams to tenure-everything and old space fills with about-to-die
+/// data (98 full compactions per 3000 iterations, ~23% of the bench).
 pub const SURVIVOR_SIZE: usize = 512 << 10;
+
+/// Survivor sizing: eden/4 per space, floored at the historical 512 KiB
+/// (tiny test heaps keep booting; an explicit small `MACVM_EDEN` still
+/// gets workable survivors). `MACVM_SURVIVOR` (KiB) overrides exactly —
+/// `MACVM_SURVIVOR=512` reproduces the pre-2026-08-06 geometry, which is
+/// what makes the one-binary env-flip A/B possible (the harness law in
+/// docs/regalloc_findings.md).
+pub fn survivor_size_for(eden_size: usize) -> usize {
+    static OVERRIDE: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    let ov = OVERRIDE.get_or_init(|| {
+        std::env::var("MACVM_SURVIVOR")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+    });
+    if let Some(kb) = ov {
+        return kb << 10;
+    }
+    SURVIVOR_SIZE.max(eden_size / 4)
+}
 /// Old gen's first committed segment at boot *(tunable, S8 grows further)*;
 /// capped to whatever's actually left in the reservation for tiny test
 /// heaps (`old.len()` can be smaller than this for a `heap_mib: 16` test
@@ -90,19 +115,20 @@ impl HeapLayout {
             start: base,
             end: base + eden_size,
         };
+        let survivor = survivor_size_for(eden_size);
         let from = SpaceBounds {
             start: eden.end,
-            end: eden.end + SURVIVOR_SIZE,
+            end: eden.end + survivor,
         };
         let to = SpaceBounds {
             start: from.end,
-            end: from.end + SURVIVOR_SIZE,
+            end: from.end + survivor,
         };
         let old_start = to.end;
         let reservation_end = base + total_len;
         debug_assert!(
             old_start <= reservation_end,
-            "reservation of {total_len} bytes too small for eden ({eden_size}) + 2 survivors ({SURVIVOR_SIZE} each)"
+            "reservation of {total_len} bytes too small for eden ({eden_size}) + 2 survivors ({survivor} each)"
         );
         let old = SpaceBounds {
             start: old_start,
@@ -142,9 +168,9 @@ mod tests {
         assert_eq!(l.eden.start, 0x1000);
         assert_eq!(l.eden.len(), DEFAULT_EDEN_SIZE);
         assert_eq!(l.from.start, l.eden.end);
-        assert_eq!(l.from.len(), SURVIVOR_SIZE);
+        assert_eq!(l.from.len(), survivor_size_for(DEFAULT_EDEN_SIZE));
         assert_eq!(l.to.start, l.from.end);
-        assert_eq!(l.to.len(), SURVIVOR_SIZE);
+        assert_eq!(l.to.len(), survivor_size_for(DEFAULT_EDEN_SIZE));
         assert_eq!(l.old.start, l.to.end);
         assert_eq!(l.old_start, l.old.start);
         assert_eq!(l.old.end, 0x1000 + (64 << 20));
@@ -168,13 +194,14 @@ mod tests {
     #[test]
     fn small_reservation_still_fits_two_survivors() {
         // The smallest heap_mib used anywhere in the test suite (16 MiB):
-        // `default_eden_for` caps eden at a quarter (4 MiB), so
-        // eden(4) + from(0.5) + to(0.5) = 5 MiB, leaving 11 MiB for old.
+        // `default_eden_for` caps eden at a quarter (4 MiB); survivors are
+        // eden-proportional (4 MiB / 4 = 1 MiB each), so
+        // eden(4) + from(1) + to(1) = 6 MiB, leaving 10 MiB for old.
         let eden = default_eden_for(16 << 20);
         assert_eq!(eden, 4 << 20);
         let l = HeapLayout::new(0, 16 << 20, eden);
         assert!(!l.old.is_empty());
-        assert_eq!(l.old.len(), (16 << 20) - eden - 2 * SURVIVOR_SIZE);
+        assert_eq!(l.old.len(), (16 << 20) - eden - 2 * survivor_size_for(eden));
     }
 
     #[test]
