@@ -2090,6 +2090,43 @@ impl<'a> Translator<'a> {
             .is_some_and(|t| t.primitive() == 28)
     }
 
+    /// Z1 (docs/intrinsics_design.md): a mono send whose resolved target is
+    /// the `class` primitive (21). After the klass guard passes, the answer
+    /// IS the guard klass — the send fuses to `GuardKlass` + a pool
+    /// constant, and a downstream `x class == Foo` feeds `RefCmpBr` for
+    /// free. Prim-28 coexistence model: resolved by (guard klass, selector)
+    /// so a tiered-up compiled target can't decay the fuse, and 21 stays
+    /// shimmable for poly/mega sites.
+    fn class_const_op(&self, method: MethodOop, ic_idx: u16) -> Option<KlassOop> {
+        let ic = InterpreterIc::at(method, ic_idx);
+        let guard = KlassOop::try_from(ic.guard())?;
+        let target = crate::compiler::feedback::resolve_method_ro(self.vm, guard, ic.selector())?;
+        (target.primitive() == 21).then_some(guard)
+    }
+
+    /// Z1: byte-format length reads — `array_size_op` one format over. A
+    /// mono site guarded on an `IndexableBytes` klass (String / Symbol /
+    /// ByteArray) whose resolved target is `byteSize` (42) or `size` (28 —
+    /// `prim_size` serves both formats) fuses to `GuardKlass` +
+    /// `LoadField{size slot}`. The slot holds the TAGGED byte count
+    /// (`oops::heap::raw_size_slot`) at body word `nis - HEADER_WORDS`,
+    /// so the byte offset is computed from the guard klass rather than
+    /// hardcoded the way the Array arm's `16` is (same value when the
+    /// klass has no named ivars; correct either way).
+    fn byte_size_op(&self, method: MethodOop, ic_idx: u16) -> Option<i32> {
+        let ic = InterpreterIc::at(method, ic_idx);
+        let guard = KlassOop::try_from(ic.guard())?;
+        if guard.format() != crate::oops::klass::Format::IndexableBytes {
+            return None;
+        }
+        let target = crate::compiler::feedback::resolve_method_ro(self.vm, guard, ic.selector())?;
+        if !matches!(target.primitive(), 28 | 42) {
+            return None;
+        }
+        let word = guard.non_indexable_size() - crate::oops::layout::HEADER_WORDS;
+        Some((BODY_OFFSET + 8 * word) as i32)
+    }
+
     fn is_smi_inlinable(&self, ic_idx: u16) -> bool {
         let ic = InterpreterIc::at(self.method, ic_idx);
         let census = std::env::var_os("MACVM_S2_COUNT").is_some();
@@ -5041,6 +5078,97 @@ impl<'a> Translator<'a> {
                     dst,
                     obj: arr,
                     byte_off: 16,
+                });
+                stack.push(dst);
+            }
+            // Z1 (docs/intrinsics_design.md): `class` on a mono-guarded
+            // receiver. The guard establishes the answer, so the whole send
+            // is GuardKlass + the guard klass as a pool constant — no call,
+            // no shim. A smi guard uses the tag test (a smi has no klass
+            // word to compare). Same fail-only reexecute-trap shape as the
+            // `size` arm above: wrong klass re-runs the send interpreted
+            // and recompilation re-learns the site.
+            Instr::Send { ic, .. } if self.class_const_op(self.method, ic).is_some() => {
+                let guard = self
+                    .class_const_op(self.method, ic)
+                    .expect("class fuse: gate passed in match guard");
+                let reexec_stack = stack.clone();
+                let fail_id = self.fresh_block_id();
+                self.finish_block(IrBlock {
+                    id: fail_id,
+                    bci,
+                    code: vec![Ir::UncommonTrap { bci }],
+                    entry_stack: Vec::new(),
+                    deopt_sites: vec![(
+                        0,
+                        DeoptRaw {
+                            stack: reexec_stack,
+                            bci,
+                            kind: SafepointKind::UncommonTrap,
+                            reexecute: true,
+                            stack_closures: Vec::new(),
+                            inline: None,
+                        },
+                    )],
+                });
+                let recv = stack.pop().expect("class: missing receiver operand");
+                let expect = self.pool.intern(guard.oop().raw(), Some(RelocKind::Oop));
+                let is_smi = guard.oop().raw() == self.vm.universe.smi_klass.oop().raw();
+                code.push(Ir::GuardKlass {
+                    obj: recv,
+                    expect,
+                    fail: fail_id,
+                    kind: if is_smi {
+                        GuardShape::SmiTest
+                    } else {
+                        GuardShape::KlassTest
+                    },
+                });
+                stack.push(self.push_well_known(guard.oop().raw(), code));
+            }
+            // Z1: byte-format `size`/`byteSize` — the `size` arm above one
+            // format over, with the size-slot offset computed from the
+            // guard klass instead of Array's hardcoded 16. The slot holds
+            // the tagged byte count, so the LoadField result IS the
+            // primitive's answer.
+            Instr::Send { ic, .. } if self.byte_size_op(self.method, ic).is_some() => {
+                let byte_off = self
+                    .byte_size_op(self.method, ic)
+                    .expect("byteSize fuse: gate passed in match guard");
+                let ic_oop = InterpreterIc::at(self.method, ic);
+                let guard_raw = ic_oop.guard().raw();
+                let reexec_stack = stack.clone();
+                let fail_id = self.fresh_block_id();
+                self.finish_block(IrBlock {
+                    id: fail_id,
+                    bci,
+                    code: vec![Ir::UncommonTrap { bci }],
+                    entry_stack: Vec::new(),
+                    deopt_sites: vec![(
+                        0,
+                        DeoptRaw {
+                            stack: reexec_stack,
+                            bci,
+                            kind: SafepointKind::UncommonTrap,
+                            reexecute: true,
+                            stack_closures: Vec::new(),
+                            inline: None,
+                        },
+                    )],
+                });
+                let recv = stack.pop().expect("byteSize: missing receiver operand");
+                let expect = self.pool.intern(guard_raw, Some(RelocKind::Oop));
+                code.push(Ir::GuardKlass {
+                    obj: recv,
+                    expect,
+                    fail: fail_id,
+                    kind: GuardShape::KlassTest,
+                });
+                let dst = self.fresh(true);
+                code.push(Ir::LoadField {
+                    dst,
+                    obj: recv,
+                    byte_off,
                 });
                 stack.push(dst);
             }
