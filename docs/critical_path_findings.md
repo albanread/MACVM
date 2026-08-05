@@ -214,6 +214,41 @@ The knob is kept (default 0, exactly the previous behaviour) as a standing
 instrument: before believing any delta on a small benchmark, sweep the pad and
 check the effect is bigger than the layout spread.
 
+### 64-byte loop-header alignment — MEASURED AND REJECTED
+
+The obvious response was to align loop headers to the 64-byte fetch granule.
+Implemented (pad with `nop`s before binding any block that is the target of a
+back-edge; 27 nops in `sieveOnce`, checksums clean) and then tested with the
+RIGHT question — not "is aligned faster" but **"does alignment collapse the
+`MACVM_CODE_PAD` spread"**. With alignment on, every loop header sits at
+address ≡ 0 mod 64 regardless of the pad, so any surviving variance cannot be
+fetch-granule straddling.
+
+| bench | spread, aligned | spread, unaligned |
+|---|---|---|
+| arith | +0.1% | +0.1% |
+| fib | +0.2% | +0.4% |
+| sieve | **+5.9%** | +4.8% |
+| dict | **+5.1%** | +13.4% |
+| richards | **+3.6%** | +6.5% |
+
+**The spread survives at 3.6–5.9%.** Fetch-granule straddling is therefore NOT
+the mechanism; the residual sensitivity comes from higher address bits —
+branch-predictor / BTB indexing or cache set mapping. That also fits the
+pattern: `dict`, the most branch-heavy and most data-dependent benchmark, is
+the most address-sensitive, which is a predictor-aliasing signature rather than
+a fetch-geometry one.
+
+Nor is it a speedup: the minima are unchanged (sieve 186 both ways, richards
+1084 vs 1099, dict 254 vs 257). The apparent dict/richards spread reduction is
+confounded — it comes from a different sampling session, and sieve moved the
+wrong way — so it is not claimable as a variance win either.
+
+Reverted, on the same standard applied to the five gated features: a pass that
+does not clear a bar does not stay in the compiler. **If layout sensitivity is
+ever attacked, the target is address aliasing, not alignment** — and the
+instrument for it already exists in `MACVM_CODE_PAD`.
+
 ## Method note
 
 Both numbers come from deliberately **unsound** throwaway probes
