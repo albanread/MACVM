@@ -75,6 +75,8 @@ Object subclass: CocoaUI [
                 MetricLabels MemBarFill MemBarWidth Workspace WorkspaceScroll
                 WorkspaceTextDelegate TabItems TabIndexes
                 TranscriptDivider TranscriptClearBtn FontDelta
+                TranscriptCollapsed TranscriptToggleBtn TranscriptGrain
+                TranscriptMenuItem
                 FontMinusBtn FontPlusBtn JitOn JitMenuItem
                 WorkspaceContainer WorkspaceBarBox WorkspaceBarButtons
                 HaltOn HaltMenuItem MetricViews MetricsHidden>
@@ -850,7 +852,7 @@ Object subclass: CocoaUI [
         "Built FROM the view registry (§ registerViewNamed:...), never hand-
          maintained — one item per persistent view, sharing the exact
          macvmAction: mechanism the toolbar's own buttons use (CG5)."
-        | viewMenu viewItem |
+        | viewMenu viewItem tHolder tDelegate |
         viewMenu := (Cocoa classNamed: 'NSMenu') onMain alloc onMain init.
         Views do: [ :e |
             | sym title item holder delegate |
@@ -862,6 +864,20 @@ Object subclass: CocoaUI [
             item onMain setTarget: delegate.
             viewMenu onMain addItem: item.
             ToolbarDelegates add: delegate ].
+        "Separator, then the dock toggle — the menu route to the same state
+         the strip's chevron drives. Cmd-Shift-T, next to the other view
+         switches."
+        viewMenu onMain addItem: (Cocoa classNamed: 'NSMenuItem') onMain separatorItem.
+        tHolder := CocoaToolbarAction on: [ self toggleTranscript ].
+        tDelegate := MacvmDelegate actionTargetOn: tHolder.
+        TranscriptMenuItem := ((Cocoa classNamed: 'NSMenuItem') onMain alloc) onMain
+            initWithTitle: self transcriptMenuTitle action: 'macvmAction:' keyEquivalent: 'T'.
+        TranscriptMenuItem onMain setTarget: tDelegate.
+        viewMenu onMain addItem: TranscriptMenuItem.
+        "Retain the DELEGATE (not the holder) — same as the loop above; it is
+         the object AppKit sends macvmAction: to."
+        ToolbarDelegates add: tDelegate.
+
         viewItem := ((Cocoa classNamed: 'NSMenuItem') onMain alloc) onMain
             initWithTitle: 'View' action: nil keyEquivalent: ''.
         viewItem onMain setSubmenu: viewMenu.
@@ -1010,6 +1026,80 @@ Object subclass: CocoaUI [
     "── the transcript: a SMALL, reverse-chronological dock at the bottom ──"
     CocoaUI class >> transcriptStripHeight [ ^22.0 ]
 
+    "── the transcript dock's collapse state ──────────────────────────────"
+
+    CocoaUI class >> transcriptCollapsed [ ^TranscriptCollapsed = true ]
+
+    "The dock's total height right now: the full pane when open, just the
+     control strip when shut."
+    CocoaUI class >> transcriptDockHeight [
+        ^self transcriptCollapsed
+            ifTrue: [ self transcriptStripHeight ]
+            ifFalse: [ self transcriptHeight ]
+    ]
+
+    CocoaUI class >> transcriptToggleTitle [
+        "Points the way the dock will go: down = it is open and will close."
+        ^self transcriptCollapsed ifTrue: [ '▸' ] ifFalse: [ '▾' ]
+    ]
+
+    CocoaUI class >> toggleTranscript [
+        TranscriptCollapsed := self transcriptCollapsed not.
+        self layoutTranscriptDock.
+        TranscriptMenuItem isNil ifFalse: [
+            TranscriptMenuItem onMain setTitle: self transcriptMenuTitle ].
+        ^TranscriptCollapsed
+    ]
+
+    CocoaUI class >> transcriptMenuTitle [
+        ^self transcriptCollapsed ifTrue: [ 'Show Transcript' ] ifFalse: [ 'Hide Transcript' ]
+    ]
+
+    "Re-place every piece of the dock, and give the freed height to the
+     content area above. Called on every toggle; the autoresizing masks keep
+     it right across window resizes afterward (each dock piece is pinned to
+     the bottom, ContentHost's bottom margin is fixed at whatever we set
+     here)."
+    CocoaUI class >> layoutTranscriptDock [
+        | content frame w dockH stripY scrollH |
+        Win isNil ifTrue: [ ^self ].
+        content := Win onMain contentView.
+        frame := content onMain frame.
+        w := frame at: 3.
+        dockH := self transcriptDockHeight.
+        stripY := dockH - self transcriptStripHeight.
+
+        TranscriptGrain isNil ifFalse: [
+            TranscriptGrain onMain setFrame:
+                (Array with: 0.0 with: stripY with: w with: self transcriptStripHeight) ].
+        TranscriptDivider isNil ifFalse: [
+            TranscriptDivider onMain setFrame:
+                (Array with: 0.0 with: dockH - 1.0 with: w with: 1.0) ].
+        TranscriptClearBtn isNil ifFalse: [
+            TranscriptClearBtn onMain setFrame:
+                (Array with: w - 54.0 with: stripY with: 48.0 with: 18.0).
+            "Nothing to clear while it is shut — and hiding it makes the strip
+             read as a title bar rather than a truncated pane."
+            TranscriptClearBtn onMain setHidden: self transcriptCollapsed ].
+        TranscriptToggleBtn isNil ifFalse: [
+            TranscriptToggleBtn onMain setFrame:
+                (Array with: 6.0 with: stripY with: 24.0 with: 18.0).
+            TranscriptToggleBtn onMain setTitle: self transcriptToggleTitle ].
+
+        scrollH := dockH - self transcriptStripHeight - 1.0.
+        TranscriptScroll isNil ifFalse: [
+            TranscriptScroll onMain setHidden: self transcriptCollapsed.
+            self transcriptCollapsed ifFalse: [
+                TranscriptScroll onMain setFrame:
+                    (Array with: 0.0 with: 0.0 with: w with: scrollH) ] ].
+
+        ContentHost isNil ifFalse: [
+            ContentHost onMain setFrame:
+                (Array with: 0.0 with: dockH with: w
+                       with: (frame at: 4) - self toolbarHeight - dockH) ].
+        ^self
+    ]
+
     CocoaUI class >> buildTranscriptIn: content [
         | tvClass frame w scrollH colorClass boxClass |
         tvClass := Cocoa classNamed: 'NSTextView'.
@@ -1021,7 +1111,7 @@ Object subclass: CocoaUI [
         "The grain strip behind the Clear button — same texture as the
          toolbar, so the transcript dock's control bar isn't a blank sheet
          either. Added FIRST so the divider + Clear button render on top."
-        self addTexturedBoxFrame:
+        TranscriptGrain := self addTexturedBoxFrame:
             (Array with: 0.0 with: self transcriptHeight - self transcriptStripHeight
                    with: w with: self transcriptStripHeight)
             resize: self maskWidthSizable + self maskMaxYMargin
@@ -1048,6 +1138,18 @@ Object subclass: CocoaUI [
             action: [ self clearTranscript ]
             in: content.
         TranscriptClearBtn onMain setAutoresizingMask: self maskMinXMargin + self maskMaxYMargin.
+
+        "The collapse control, at the LEFT of the same strip. A chevron that
+         points down when the dock is open and right when it is shut — the
+         disclosure idiom, in the flat style the rest of this strip uses. The
+         strip itself never hides, so there is always something to click to
+         get the log back (a dock that vanishes entirely is a support call)."
+        TranscriptToggleBtn := self stripButton: self transcriptToggleTitle
+            frame: (Array with: 6.0 with: self transcriptHeight - self transcriptStripHeight
+                          with: 24.0 with: 18.0)
+            action: [ self toggleTranscript ]
+            in: content.
+        TranscriptToggleBtn onMain setAutoresizingMask: self maskMaxXMargin + self maskMaxYMargin.
 
         "Scroll-wrapped: a BARE NSTextView draws past its frame when the text
          outgrows it — long transcripts bled UP over the content view (the
