@@ -74,9 +74,9 @@ Object subclass: CocoaUI [
                 TranscriptText Views ActiveView ToolbarDelegates ToolbarButtons
                 MetricLabels MemBarFill MemBarWidth Workspace WorkspaceScroll
                 WorkspaceTextDelegate TabItems TabIndexes
-                TranscriptDivider TranscriptClearBtn FontDelta
+                TranscriptClearBtn FontDelta
                 TranscriptCollapsed TranscriptToggleBtn TranscriptGrain
-                TranscriptMenuItem
+                TranscriptMenuItem TranscriptSplit TranscriptDock
                 FontMinusBtn FontPlusBtn JitOn JitMenuItem
                 WorkspaceContainer WorkspaceBarBox WorkspaceBarButtons
                 HaltOn HaltMenuItem MetricViews MetricsHidden>
@@ -136,12 +136,15 @@ Object subclass: CocoaUI [
         content := Win onMain contentView.
         content onMain setAutoresizesSubviews: true.
 
+        "Read the remembered dock state BEFORE the panes exist, so they can be
+         BUILT at the right sizes. Positioning the divider afterwards does not
+         work at startup: neither addSubview: nor makeKeyAndOrderFront: lays
+         the split view out synchronously, so setPosition: measures against a
+         zero-height frame and clamps the dock to nothing."
+        self loadTranscriptCollapsed.
         self buildToolbarIn: content.
         self buildContentHostIn: content.
         self buildTranscriptIn: content.
-        "Re-apply the remembered dock state now every piece exists — the
-         builders lay out expanded, this collapses if that is how it was left."
-        self loadTranscriptCollapsed ifTrue: [ self layoutTranscriptDock ].
 
         self registerViewNamed: #workspace title: 'Workspace' icon: 'texteditor'
              container: [ self workspaceContainer ]
@@ -357,16 +360,42 @@ Object subclass: CocoaUI [
        remove-subviews/add-subview swapper this replaces left stale drawing
        behind — views 'drew over each other'). Our themed toolbar buttons and
        the View menu ARE the tab bar; they drive selectTabViewItemAtIndex:."
+    "The split view owns everything below the toolbar: content on top, the
+     transcript dock underneath, with a real draggable divider between them.
+     Before this the dock was a hard-coded 110px band — collapsible, but not
+     resizable, which is half of what a Mac user expects from a pane like
+     this. NSSplitView also persists the divider position for us via
+     setAutosaveName:, so the size survives relaunch the same way the window
+     frame does."
     CocoaUI class >> buildContentHostIn: content [
-        | frame |
+        | frame splitH dockH |
         frame := content onMain frame.
+        splitH := (frame at: 4) - self toolbarHeight.
+        dockH := self transcriptCollapsed
+            ifTrue: [ self transcriptStripHeight ]
+            ifFalse: [ self transcriptRestoreHeight ].
+        TranscriptSplit := ((Cocoa classNamed: 'NSSplitView') onMain alloc) onMain
+            initWithFrame: (Array with: 0.0 with: 0.0 with: (frame at: 3) with: splitH).
+        TranscriptSplit onMain setVertical: false. "horizontal divider: panes stack"
+        TranscriptSplit onMain setDividerStyle: 2.  "NSSplitViewDividerStyleThin"
+        TranscriptSplit onMain setAutoresizingMask:
+            self maskWidthSizable + self maskHeightSizable.
+
         ContentHost := ((Cocoa classNamed: 'NSTabView') onMain alloc) onMain
-            initWithFrame: (Array with: 0.0 with: self transcriptHeight
+            initWithFrame: (Array with: 0.0 with: 0.0
                                   with: (frame at: 3)
-                                  with: (frame at: 4) - self toolbarHeight - self transcriptHeight).
+                                  with: splitH - dockH).
         ContentHost onMain setTabViewType: 6. "NSNoTabsNoBorder — chrome is ours"
-        ContentHost onMain setAutoresizingMask: self maskWidthSizable + self maskHeightSizable.
-        content onMain addSubview: ContentHost.
+        TranscriptSplit onMain addSubview: ContentHost.
+
+        "The dock's own container — the strip and the log live in here so the
+         split view has ONE subview to size, and the strip keeps riding at the
+         dock's top edge however the divider moves."
+        TranscriptDock := ((Cocoa classNamed: 'NSView') onMain alloc) onMain
+            initWithFrame: (Array with: 0.0 with: 0.0
+                                  with: (frame at: 3) with: dockH).
+        TranscriptSplit onMain addSubview: TranscriptDock.
+        content onMain addSubview: TranscriptSplit.
     ]
 
     "── the view registry ──"
@@ -1137,11 +1166,15 @@ Object subclass: CocoaUI [
 
     "The dock's total height right now: the full pane when open, just the
      control strip when shut."
+    "The dock's ACTUAL height right now. Since the divider became draggable
+     this is whatever the user left it at — not a constant — so it is read
+     from the view rather than computed. Answers 0.0 before the dock exists."
     CocoaUI class >> transcriptDockHeight [
-        ^self transcriptCollapsed
-            ifTrue: [ self transcriptStripHeight ]
-            ifFalse: [ self transcriptHeight ]
+        TranscriptDock isNil ifTrue: [ ^0.0 ].
+        ^(TranscriptDock onMain frame) at: 4
     ]
+
+    CocoaUI class >> transcriptSplitView [ ^TranscriptSplit ]
 
     CocoaUI class >> transcriptToggleTitle [
         "Points the way the dock will go: down = it is open and will close."
@@ -1174,6 +1207,9 @@ Object subclass: CocoaUI [
     ]
 
     CocoaUI class >> toggleTranscript [
+        "Capture the height BEFORE collapsing, so re-opening returns to
+         whatever the user had dragged rather than the built-in default."
+        self transcriptCollapsed ifFalse: [ self saveTranscriptHeight ].
         TranscriptCollapsed := self transcriptCollapsed not.
         self saveTranscriptCollapsed.
         self layoutTranscriptDock.
@@ -1186,53 +1222,65 @@ Object subclass: CocoaUI [
         ^self transcriptCollapsed ifTrue: [ 'Show Transcript' ] ifFalse: [ 'Hide Transcript' ]
     ]
 
-    "Re-place every piece of the dock, and give the freed height to the
-     content area above. Called on every toggle; the autoresizing masks keep
-     it right across window resizes afterward (each dock piece is pinned to
-     the bottom, ContentHost's bottom margin is fixed at whatever we set
-     here)."
-    CocoaUI class >> layoutTranscriptDock [
-        | content frame w dockH stripY scrollH |
-        Win isNil ifTrue: [ ^self ].
-        content := Win onMain contentView.
-        frame := content onMain frame.
-        w := frame at: 3.
-        dockH := self transcriptDockHeight.
-        stripY := dockH - self transcriptStripHeight.
-
-        TranscriptGrain isNil ifFalse: [
-            TranscriptGrain onMain setFrame:
-                (Array with: 0.0 with: stripY with: w with: self transcriptStripHeight) ].
-        TranscriptDivider isNil ifFalse: [
-            TranscriptDivider onMain setFrame:
-                (Array with: 0.0 with: dockH - 1.0 with: w with: 1.0) ].
-        TranscriptClearBtn isNil ifFalse: [
-            TranscriptClearBtn onMain setFrame:
-                (Array with: w - 54.0 with: stripY with: 48.0 with: 18.0).
-            "Nothing to clear while it is shut — and hiding it makes the strip
-             read as a title bar rather than a truncated pane."
-            TranscriptClearBtn onMain setHidden: self transcriptCollapsed ].
-        TranscriptToggleBtn isNil ifFalse: [
-            TranscriptToggleBtn onMain setFrame:
-                (Array with: 6.0 with: stripY with: 24.0 with: 18.0).
-            TranscriptToggleBtn onMain setTitle: self transcriptToggleTitle ].
-
-        scrollH := dockH - self transcriptStripHeight - 1.0.
-        TranscriptScroll isNil ifFalse: [
-            TranscriptScroll onMain setHidden: self transcriptCollapsed.
-            self transcriptCollapsed ifFalse: [
-                TranscriptScroll onMain setFrame:
-                    (Array with: 0.0 with: 0.0 with: w with: scrollH) ] ].
-
-        ContentHost isNil ifFalse: [
-            ContentHost onMain setFrame:
-                (Array with: 0.0 with: dockH with: w
-                       with: (frame at: 4) - self toolbarHeight - dockH) ].
+    "Drive the split view's divider. The dock's own pieces no longer move:
+     the strip is pinned to the dock's top edge and the log fills the rest, so
+     setting ONE number — the divider position — resizes everything. Collapsed
+     means the dock is exactly its control strip; expanded restores the last
+     dragged height (or the default if it has never been dragged)."
+    "Move the divider so the dock ends up `h` points tall. Position is
+     measured from the split view's TOP edge down to the divider, so the
+     dock's height is whatever is left underneath it."
+    CocoaUI class >> setTranscriptDockHeight: h [
+        | splitH |
+        TranscriptSplit isNil ifTrue: [ ^self ].
+        splitH := (TranscriptSplit onMain frame) at: 4.
+        TranscriptSplit onMain
+            setPosition: splitH - h - (TranscriptSplit onMain dividerThickness)
+            ofDividerAtIndex: 0.
         ^self
     ]
 
-    CocoaUI class >> buildTranscriptIn: content [
-        | tvClass frame w scrollH colorClass boxClass |
+    CocoaUI class >> layoutTranscriptDock [
+        TranscriptSplit isNil ifTrue: [ ^self ].
+        self setTranscriptDockHeight: (self transcriptCollapsed
+            ifTrue: [ self transcriptStripHeight ]
+            ifFalse: [ self transcriptRestoreHeight ]).
+        TranscriptClearBtn isNil ifFalse: [
+            "Nothing to clear while it is shut, and hiding it makes the strip
+             read as a title bar rather than a truncated pane."
+            TranscriptClearBtn onMain setHidden: self transcriptCollapsed ].
+        TranscriptToggleBtn isNil ifFalse: [
+            TranscriptToggleBtn onMain setTitle: self transcriptToggleTitle ].
+        ^self
+    ]
+
+    "The height to come back to when re-opened: whatever the divider was last
+     dragged to, remembered across launches, defaulting to the designed 110.
+     Clamped so a user who dragged the dock almost shut does not reopen it to
+     a sliver that looks broken."
+    CocoaUI class >> transcriptRestoreHeight [
+        | saved |
+        saved := self userDefaults onMain
+            doubleForKey: 'MACVMTranscriptHeight'.
+        (saved isNil or: [ saved < (self transcriptStripHeight * 2) ])
+            ifTrue: [ ^self transcriptHeight ].
+        ^saved
+    ]
+
+    CocoaUI class >> saveTranscriptHeight [
+        | h |
+        (TranscriptDock isNil or: [ self transcriptCollapsed ]) ifTrue: [ ^self ].
+        h := (TranscriptDock onMain frame) at: 4.
+        h > self transcriptStripHeight ifTrue: [
+            self userDefaults onMain setDouble: h forKey: 'MACVMTranscriptHeight' ].
+        ^self
+    ]
+
+    CocoaUI class >> buildTranscriptIn: ignored [
+        | tvClass frame w scrollH colorClass boxClass content |
+        "Ignores the window's content view: the dock is a pane of the split
+         view now, and everything below is placed inside THAT."
+        content := TranscriptDock.
         tvClass := Cocoa classNamed: 'NSTextView'.
         colorClass := Cocoa classNamed: 'NSColor'.
         boxClass := Cocoa classNamed: 'NSBox'.
@@ -1245,21 +1293,12 @@ Object subclass: CocoaUI [
         TranscriptGrain := self addTexturedBoxFrame:
             (Array with: 0.0 with: self transcriptHeight - self transcriptStripHeight
                    with: w with: self transcriptStripHeight)
-            resize: self maskWidthSizable + self maskMaxYMargin
+            resize: self maskWidthSizable + self maskMinYMargin
             in: content.
 
-        "A 1px divider right at the dock's own top edge — the existing
-         NSScrollView edge alone read as 'not very visible' (user report);
-         this plus the scroll view's own line border below make the dock's
-         boundary unambiguous against the content area above it."
-        TranscriptDivider := (boxClass onMain alloc) onMain
-            initWithFrame: (Array with: 0.0 with: self transcriptHeight - 1.0
-                                  with: w with: 1.0).
-        TranscriptDivider onMain setBoxType: 4. "NSBoxCustom"
-        TranscriptDivider onMain setBorderType: 0. "NSNoBorder"
-        TranscriptDivider onMain setFillColor: colorClass onMain separatorColor.
-        TranscriptDivider onMain setAutoresizingMask: self maskWidthSizable + self maskMaxYMargin.
-        content onMain addSubview: TranscriptDivider.
+        "No hand-drawn divider any more: NSSplitView draws (and drags) its
+         own between the panes, which is both the standard look and the thing
+         the user grabs. Two stacked 1px lines read as a rendering bug."
 
         "A thin strip for the Clear button, just below the divider — same
          'controls above content' shape CocoaCanvas/CocoaFind already use."
@@ -1268,7 +1307,7 @@ Object subclass: CocoaUI [
                           with: 48.0 with: 18.0)
             action: [ self clearTranscript ]
             in: content.
-        TranscriptClearBtn onMain setAutoresizingMask: self maskMinXMargin + self maskMaxYMargin.
+        TranscriptClearBtn onMain setAutoresizingMask: self maskMinXMargin + self maskMinYMargin.
 
         "The collapse control, at the LEFT of the same strip. A chevron that
          points down when the dock is open and right when it is shut — the
@@ -1280,12 +1319,12 @@ Object subclass: CocoaUI [
                           with: 24.0 with: 18.0)
             action: [ self toggleTranscript ]
             in: content.
-        TranscriptToggleBtn onMain setAutoresizingMask: self maskMaxXMargin + self maskMaxYMargin.
+        TranscriptToggleBtn onMain setAutoresizingMask: self maskMaxXMargin + self maskMinYMargin.
 
         "Scroll-wrapped: a BARE NSTextView draws past its frame when the text
          outgrows it — long transcripts bled UP over the content view (the
          CG7 'mess' screenshots). The scroll view clips and scrolls."
-        scrollH := self transcriptHeight - self transcriptStripHeight - 1.0.
+        scrollH := self transcriptHeight - self transcriptStripHeight.
         TranscriptScroll := ((Cocoa classNamed: 'NSScrollView') onMain alloc) onMain
             initWithFrame: (Array with: 0.0 with: 0.0 with: w with: scrollH).
         TranscriptScroll onMain setHasVerticalScroller: true.
@@ -1293,7 +1332,8 @@ Object subclass: CocoaUI [
          draws a clean 1px box around the whole log (user report: 'a more
          distinct boundary... its not very visible yet')."
         TranscriptScroll onMain setBorderType: 1.
-        TranscriptScroll onMain setAutoresizingMask: self maskWidthSizable + self maskMaxYMargin.
+        TranscriptScroll onMain setAutoresizingMask:
+            self maskWidthSizable + self maskHeightSizable.
         Transcript := (tvClass onMain alloc) onMain
             initWithFrame: (Array with: 0.0 with: 0.0 with: w with: scrollH).
         Transcript onMain setEditable: false.
@@ -1395,7 +1435,6 @@ Object subclass: CocoaUI [
             ContentHost isNil ifFalse: [ ContentHost isValid ifTrue: [ ContentHost release ] ].
             Transcript isNil ifFalse: [ Transcript isValid ifTrue: [ Transcript release ] ].
             TranscriptScroll isNil ifFalse: [ TranscriptScroll isValid ifTrue: [ TranscriptScroll release ] ].
-            TranscriptDivider isNil ifFalse: [ TranscriptDivider isValid ifTrue: [ TranscriptDivider release ] ].
             TranscriptClearBtn isNil ifFalse: [ TranscriptClearBtn isValid ifTrue: [ TranscriptClearBtn release ] ].
             TabItems isNil ifFalse: [
                 TabItems do: [ :t | t isValid ifTrue: [ t release ] ] ].
@@ -1403,7 +1442,7 @@ Object subclass: CocoaUI [
             Win isValid ifTrue: [ Win release ].
             Win := nil. Workspace := nil. Toolbar := nil. ContentHost := nil.
             Transcript := nil. TranscriptScroll := nil. ActTarget := nil. ToolbarDelegates := nil.
-            TranscriptDivider := nil. TranscriptClearBtn := nil.
+            TranscriptClearBtn := nil.
             ToolbarButtons := nil. MetricLabels := nil. Views := nil.
             "Font buttons are subviews of Toolbar (released above) — just drop
              the stale wrappers so a rebuilt UI re-mints them cleanly."
