@@ -61,6 +61,11 @@ Object subclass: MacvmDelegate [
     "A menu-item/button target answering macvmDoIt:/macvmPrintIt: synchronously
      on the main thread (CG4 Workspace ⌘D/⌘P) — the receiver implements those."
     MacvmDelegate class >> actionTargetOn: aReceiver [ ^self on: aReceiver role: #action ]
+    "An NSToolbarDelegate. Unlike the roles above, all three of its callbacks
+     ANSWER an object — two arrays of item identifiers and one built
+     NSToolbarItem — so the receiver must return real ObjcRefs it keeps alive
+     (AppKit does not retain what a delegate hands back)."
+    MacvmDelegate class >> toolbarDelegateOn: aReceiver [ ^self on: aReceiver role: #toolbar ]
 
     MacvmDelegate class >> primNewDelegate: aRole ticket: ticket [
         <primitive: 249>

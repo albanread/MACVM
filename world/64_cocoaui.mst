@@ -79,7 +79,9 @@ Object subclass: CocoaUI [
                 TranscriptMenuItem TranscriptSplit TranscriptDock
                 FontMinusBtn FontPlusBtn JitOn JitMenuItem
                 WorkspaceContainer WorkspaceBarBox WorkspaceBarButtons
-                HaltOn HaltMenuItem MetricViews MetricsHidden>
+                HaltOn HaltMenuItem MetricViews MetricsHidden
+                WinToolbar ToolbarDelegate ToolbarItems MetricsHost
+                ToolbarIdentArray>
 
     CocoaUI class >> title [ ^'MACVM' ]
 
@@ -142,6 +144,7 @@ Object subclass: CocoaUI [
          the split view out synchronously, so setPosition: measures against a
          zero-height frame and clamps the dock to nothing."
         self loadTranscriptCollapsed.
+        self buildWindowToolbar.
         self buildToolbarIn: content.
         self buildContentHostIn: content.
         self buildTranscriptIn: content.
@@ -185,7 +188,108 @@ Object subclass: CocoaUI [
         Toolbar onMain setAutoresizingMask: self maskWidthSizable + self maskMinYMargin.
         content onMain addSubview: Toolbar.
         self buildToolbarBackgroundIn: Toolbar.
-        self buildMetricsClusterIn: Toolbar.
+    ]
+
+    "── the real NSToolbar (the titlebar one) ─────────────────────────────
+     What AppKit itself draws and manages: it lays the items out, handles
+     window resize by moving overflow into the chevron menu, and gives the
+     window the standard unified look. Everything it shows is vended by the
+     three NSToolbarDelegate callbacks below, driven through a #toolbar-role
+     MacvmDelegate (src/runtime/objc_delegate.rs)."
+
+    CocoaUI class >> toolbarIdentifier [ ^'MACVMMainToolbar' ]
+    CocoaUI class >> metricsItemIdentifier [ ^'macvm.metrics' ]
+    CocoaUI class >> flexibleSpaceIdentifier [ ^'NSToolbarFlexibleSpaceItem' ]
+
+    "The item order AppKit asks for. The flexible space is what pins the
+     metrics to the RIGHT edge and keeps them there on resize — a toolbar's
+     own idiom for it, replacing the hand-rolled MinXMargin arithmetic and the
+     syncMetricsVisibility collision sweep."
+    CocoaUI class >> toolbarItemIdentifiers [
+        ^Array with: self flexibleSpaceIdentifier with: self metricsItemIdentifier
+    ]
+
+    CocoaUI class >> buildWindowToolbar [
+        | tbClass |
+        tbClass := Cocoa classNamed: 'NSToolbar'.
+        ToolbarItems := Dictionary new.
+        "Held in a class var: AppKit does NOT retain what a delegate hands
+         back, so the world stays the owner of every vended object."
+        ToolbarDelegate := MacvmDelegate toolbarDelegateOn: self.
+        WinToolbar := (tbClass onMain alloc) onMain
+            initWithIdentifier: self toolbarIdentifier.
+        WinToolbar onMain setDelegate: ToolbarDelegate.
+        "No customization sheet: the item set is ours, not the user's."
+        WinToolbar onMain setAllowsUserCustomization: false.
+        "NSToolbarDisplayModeIconOnly — no labels under the items, which is
+         what a metrics readout wants (and what the icon strip will want)."
+        WinToolbar onMain setDisplayMode: 2.
+        Win onMain setToolbar: WinToolbar.
+    ]
+
+    "── NSToolbarDelegate (dispatched from Rust; each ANSWERS an object) ──"
+
+    CocoaUI class >> toolbarAllowedItemIdentifiers: aToolbar [
+        ^self toolbarIdentifierArray
+    ]
+    CocoaUI class >> toolbarDefaultItemIdentifiers: aToolbar [
+        ^self toolbarIdentifierArray
+    ]
+    CocoaUI class >> toolbar: aToolbar itemForItemIdentifier: anIdentifier willBeInsertedIntoToolbar: aFlag [
+        "anIdentifier arrives as an ObjcRef on an NSString; `description`
+         answers the receiver for an NSString, so sendString: copies its
+         characters out as a Smalltalk String we can actually compare.
+         Answering nil means 'no such item', which AppKit tolerates."
+        | name |
+        name := anIdentifier sendString: 'description'.
+        name = self metricsItemIdentifier ifTrue: [ ^self metricsToolbarItem ].
+        ^nil
+    ]
+
+    "The identifier array, built once and KEPT — see buildWindowToolbar."
+    CocoaUI class >> toolbarIdentifierArray [
+        ToolbarIdentArray isNil ifTrue: [
+            ToolbarIdentArray := self nsArrayOfStrings: self toolbarItemIdentifiers ].
+        ^ToolbarIdentArray
+    ]
+
+    CocoaUI class >> nsArrayOfStrings: aCollection [
+        "A fresh, world-owned NSArray of NSStrings. alloc/init rather than
+         +array so the ObjcRef owns its +1 outright (no autorelease-pool
+         lifetime to reason about across the callback boundary)."
+        | arr |
+        arr := ((Cocoa classNamed: 'NSMutableArray') onMain alloc) onMain init.
+        aCollection do: [ :each | arr onMain addObject: (Cocoa nsString: each) ].
+        ^arr
+    ]
+
+    "── the metrics, as one custom-view toolbar item ─────────────────────"
+    CocoaUI class >> metricsItemHeight [ ^30.0 ]
+
+    CocoaUI class >> metricsToolbarItem [
+        "Built once and cached: AppKit may ask for the same identifier more
+         than once (toolbar, then overflow menu), and the cluster's views are
+         wired into MetricLabels — a second copy would leave the first one
+         frozen at its last value."
+        | item |
+        item := ToolbarItems at: #metrics ifAbsent: [ nil ].
+        item isNil ifFalse: [ ^item ].
+        MetricsHost := ((Cocoa classNamed: 'NSView') onMain alloc) onMain
+            initWithFrame: (Array with: 0.0 with: 0.0
+                                  with: self metricsClusterWidth
+                                  with: self metricsItemHeight).
+        self buildMetricsClusterIn: MetricsHost.
+        item := ((Cocoa classNamed: 'NSToolbarItem') onMain alloc) onMain
+            initWithItemIdentifier: self metricsItemIdentifier.
+        item onMain setView: MetricsHost.
+        item onMain setLabel: 'Metrics'.
+        item onMain setPaletteLabel: 'Metrics'.
+        item onMain setMinSize: (Array with: self metricsClusterWidth
+                                       with: self metricsItemHeight).
+        item onMain setMaxSize: (Array with: self metricsClusterWidth
+                                       with: self metricsItemHeight).
+        ToolbarItems at: #metrics put: item.
+        ^item
     ]
 
     CocoaUI class >> texturePatternColor [
@@ -227,6 +331,11 @@ Object subclass: CocoaUI [
     ]
 
     CocoaUI class >> metricCellWidth [ ^64.0 ]
+    "The cluster's bottom edge inside its host view: the mem bar sits here,
+     the value row 2pt above it, the caption row 16pt above that. Parametrized
+     because the cluster used to be laid into the 44-high custom strip and now
+     lives in a 30-high NSToolbarItem view."
+    CocoaUI class >> metricsBaseY [ ^2.0 ]
 
     CocoaUI class >> buildMetricsClusterIn: aToolbar [
         "Five small, TIGHTLY-packed, right-anchored two-row cells — a muted
@@ -256,7 +365,8 @@ Object subclass: CocoaUI [
             w := n = 'MEM' ifTrue: [ 104.0 ] ifFalse: [ self metricCellWidth ].
             x := x - w.
             caption := (tfClass onMain alloc) onMain
-                initWithFrame: (Array with: x with: 26.0 with: w - 8.0 with: 11.0).
+                initWithFrame: (Array with: x with: self metricsBaseY + 16.0
+                                      with: w - 8.0 with: 11.0).
             caption onMain setEditable: false. caption onMain setBordered: false.
             caption onMain setDrawsBackground: false. caption onMain setSelectable: false.
             caption onMain setFont: captionFont.
@@ -267,7 +377,8 @@ Object subclass: CocoaUI [
             MetricViews add: caption.
 
             value := (tfClass onMain alloc) onMain
-                initWithFrame: (Array with: x with: 13.0 with: w - 8.0 with: 14.0).
+                initWithFrame: (Array with: x with: self metricsBaseY + 2.0
+                                      with: w - 8.0 with: 14.0).
             value onMain setEditable: false. value onMain setBordered: false.
             value onMain setDrawsBackground: false. value onMain setSelectable: false.
             value onMain setFont: valueFont.
@@ -289,7 +400,7 @@ Object subclass: CocoaUI [
         boxClass := Cocoa classNamed: 'NSBox'.
         colorClass := Cocoa classNamed: 'NSColor'.
         track := (boxClass onMain alloc) onMain
-            initWithFrame: (Array with: x with: 10.0 with: aWidth with: 2.0).
+            initWithFrame: (Array with: x with: self metricsBaseY with: aWidth with: 2.0).
         track onMain setBoxType: 4. "NSBoxCustom"
         track onMain setBorderType: 0. "NSNoBorder"
         track onMain setFillColor: colorClass onMain separatorColor.
@@ -297,7 +408,7 @@ Object subclass: CocoaUI [
         aToolbar onMain addSubview: track.
 
         fill := (boxClass onMain alloc) onMain
-            initWithFrame: (Array with: x with: 10.0 with: 0.0 with: 2.0).
+            initWithFrame: (Array with: x with: self metricsBaseY with: 0.0 with: 2.0).
         fill onMain setBoxType: 4.
         fill onMain setBorderType: 0.
         fill onMain setFillColor: colorClass onMain controlAccentColor.
@@ -320,15 +431,11 @@ Object subclass: CocoaUI [
     CocoaUI class >> metricsGap [ ^16.0 ]
     CocoaUI class >> metricsHidden [ "true when the cluster is suppressed for width" ^MetricsHidden ]
     CocoaUI class >> syncMetricsVisibility [
-        "Hide the whole cluster when the toolbar buttons would reach into it."
-        | want buttonsRight clusterLeft |
-        (MetricViews isNil or: [ Toolbar isNil ]) ifTrue: [ ^self ].
-        buttonsRight := 8.0 + (ToolbarButtons size * self toolbarButtonStep).
-        clusterLeft := ((Toolbar onMain frame) at: 3) - self metricsClusterWidth.
-        want := clusterLeft < (buttonsRight + self metricsGap).
-        want = MetricsHidden ifTrue: [ ^self ].
-        MetricsHidden := want.
-        MetricViews do: [ :v | v isValid ifTrue: [ v onMain setHidden: want ] ].
+        "Retired: the cluster is an NSToolbarItem now, and a toolbar handles
+         its own overflow — a too-narrow window moves the item into the
+         chevron menu instead of letting the icons run under it. Kept as a
+         no-op because the ~4Hz metrics tick and startup both call it."
+        MetricsHidden := false.
     ]
 
     CocoaUI class >> updateMetricsMem: memStr jit: jitStr code: codeStr alloc: allocStr gc: gcStr memPct: pct [
@@ -1443,6 +1550,18 @@ Object subclass: CocoaUI [
             TabItems isNil ifFalse: [
                 TabItems do: [ :t | t isValid ifTrue: [ t release ] ] ].
             TabItems := nil. TabIndexes := nil.
+            "The NSToolbar and everything the delegate vended. Detach it from
+             the window FIRST so AppKit stops asking the delegate for items
+             while we are releasing them."
+            Win isValid ifTrue: [ Win onMain setToolbar: nil ].
+            ToolbarItems isNil ifFalse: [
+                ToolbarItems do: [ :i | i isValid ifTrue: [ i release ] ] ].
+            ToolbarIdentArray isNil ifFalse: [
+                ToolbarIdentArray isValid ifTrue: [ ToolbarIdentArray release ] ].
+            WinToolbar isNil ifFalse: [
+                WinToolbar isValid ifTrue: [ WinToolbar release ] ].
+            WinToolbar := nil. ToolbarDelegate := nil. ToolbarItems := nil.
+            MetricsHost := nil. ToolbarIdentArray := nil.
             Win isValid ifTrue: [ Win release ].
             Win := nil. Workspace := nil. Toolbar := nil. ContentHost := nil.
             Transcript := nil. TranscriptScroll := nil. ActTarget := nil. ToolbarDelegates := nil.
@@ -1452,6 +1571,27 @@ Object subclass: CocoaUI [
              the stale wrappers so a rebuilt UI re-mints them cleanly."
             FontMinusBtn := nil. FontPlusBtn := nil.
             MemBarFill := nil. MemBarWidth := nil ]
+    ]
+
+    "── scripting: write a PNG of the window, TITLEBAR INCLUDED ───────────
+     Rendered in-process off the window's theme frame (contentView's
+     superview — contentView alone omits the titlebar, and with it the
+     NSToolbar). cacheDisplayInRect: draws into our own bitmap, so unlike
+     `screencapture -l` this needs no screen-recording permission and works
+     on a window that is not frontmost. Answers self; check the file."
+    CocoaUI class >> snapshotTo: aPath [
+        | view rect rep data |
+        Win isNil ifTrue: [ ^self ].
+        view := (Win onMain contentView) onMain superview.
+        rect := view onMain bounds.
+        rep := view onMain bitmapImageRepForCachingDisplayInRect: rect.
+        rep isNil ifTrue: [ ^self ].
+        view onMain cacheDisplayInRect: rect toBitmapImageRep: rep.
+        "NSBitmapImageFileTypePNG = 4."
+        data := rep onMain representationUsingType: 4
+                    properties: ((Cocoa classNamed: 'NSDictionary') onMain dictionary).
+        data isNil ifTrue: [ ^self ].
+        data onMain writeToFile: aPath atomically: false.
     ]
 
     CocoaUI class >> window [ ^Win ]

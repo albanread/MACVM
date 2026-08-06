@@ -423,6 +423,60 @@ extern "C" fn imp_child_of_item(
         RetShape::ItemId,
     ) as *mut c_void
 }
+// ── NSToolbarDelegate (the toolbar migration) ───────────────────────────────
+// All three answer an OBJECT, which is why this needs the id-returning path
+// rather than the `macvmAction:` shape the toolbar's BUTTONS use: AppKit asks
+// the delegate what items exist and then asks it to build each one. The two
+// identifier calls answer an NSArray of NSStrings; `itemForItemIdentifier:`
+// answers a fully-built NSToolbarItem. `RetShape::ItemId` (not `Id`) because
+// an NSArray/NSToolbarItem must come back as a real retained ObjcRef the world
+// side owns — never minted here as an autoreleased object that would dangle
+// once the pool drains (the CG7 outline-item lesson).
+extern "C" fn imp_toolbar_allowed_items(
+    this: *mut c_void,
+    _cmd: *mut c_void,
+    toolbar: *mut c_void,
+) -> *mut c_void {
+    dispatch(
+        this,
+        "toolbarAllowedItemIdentifiers:",
+        &[ArgVal::Id(toolbar)],
+        RetShape::ItemId,
+    ) as *mut c_void
+}
+extern "C" fn imp_toolbar_default_items(
+    this: *mut c_void,
+    _cmd: *mut c_void,
+    toolbar: *mut c_void,
+) -> *mut c_void {
+    dispatch(
+        this,
+        "toolbarDefaultItemIdentifiers:",
+        &[ArgVal::Id(toolbar)],
+        RetShape::ItemId,
+    ) as *mut c_void
+}
+extern "C" fn imp_toolbar_item_for_id(
+    this: *mut c_void,
+    _cmd: *mut c_void,
+    toolbar: *mut c_void,
+    ident: *mut c_void,
+    will_insert: u8,
+) -> *mut c_void {
+    dispatch(
+        this,
+        "toolbar:itemForItemIdentifier:willBeInsertedIntoToolbar:",
+        &[
+            ArgVal::Id(toolbar),
+            ArgVal::Id(ident),
+            // ArgVal has no Bool: hand the flag over as 0/1, which the world
+            // side reads as a SmallInteger.
+            ArgVal::Int(will_insert as i64),
+        ],
+        RetShape::ItemId,
+    ) as *mut c_void
+}
+
 extern "C" fn imp_object_value_by_item(
     this: *mut c_void,
     _cmd: *mut c_void,
@@ -514,6 +568,9 @@ type ImpQ2 = extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void) -
 type ImpB2 = extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void) -> u8;
 type ImpIdChild =
     extern "C" fn(*mut c_void, *mut c_void, *mut c_void, i64, *mut c_void) -> *mut c_void;
+type ImpIdTb1 = extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> *mut c_void;
+type ImpIdTbItem =
+    extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void, u8) -> *mut c_void;
 type ImpIdByItem =
     extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void, *mut c_void) -> *mut c_void;
 
@@ -521,6 +578,7 @@ static WINDOW_DELEGATE_CLASS: OnceLock<Option<usize>> = OnceLock::new();
 static TEXT_DELEGATE_CLASS: OnceLock<Option<usize>> = OnceLock::new();
 static TABLE_SOURCE_CLASS: OnceLock<Option<usize>> = OnceLock::new();
 static OUTLINE_SOURCE_CLASS: OnceLock<Option<usize>> = OnceLock::new();
+static TOOLBAR_DELEGATE_CLASS: OnceLock<Option<usize>> = OnceLock::new();
 static ACTION_TARGET_CLASS: OnceLock<Option<usize>> = OnceLock::new();
 
 fn window_delegate_class() -> Option<*mut c_void> {
@@ -582,6 +640,38 @@ fn table_source_class() -> Option<*mut c_void> {
                         "tableViewSelectionDidChange:",
                         imp_ptr!(imp_table_selection_did_change, ImpV1),
                         "v@:@",
+                    ),
+                ],
+            )
+            .map(|c| c as usize)
+        })
+        .map(|p| p as *mut c_void)
+}
+
+/// `NSToolbarDelegate` — the three callbacks AppKit needs to build a toolbar.
+/// Type encodings: `@@:@` for the two identifier-array getters, and
+/// `@@:@@B` for `toolbar:itemForItemIdentifier:willBeInsertedIntoToolbar:`
+/// (id return; args are toolbar, identifier, BOOL).
+fn toolbar_delegate_class() -> Option<*mut c_void> {
+    TOOLBAR_DELEGATE_CLASS
+        .get_or_init(|| {
+            register_class(
+                "MacvmToolbarDelegate",
+                &[
+                    (
+                        "toolbarAllowedItemIdentifiers:",
+                        imp_ptr!(imp_toolbar_allowed_items, ImpIdTb1),
+                        "@@:@",
+                    ),
+                    (
+                        "toolbarDefaultItemIdentifiers:",
+                        imp_ptr!(imp_toolbar_default_items, ImpIdTb1),
+                        "@@:@",
+                    ),
+                    (
+                        "toolbar:itemForItemIdentifier:willBeInsertedIntoToolbar:",
+                        imp_ptr!(imp_toolbar_item_for_id, ImpIdTbItem),
+                        "@@:@@B",
                     ),
                 ],
             )
@@ -652,6 +742,7 @@ fn role_class(role: &str) -> Option<*mut c_void> {
         "text" => text_delegate_class(),
         "table" => table_source_class(),
         "outline" => outline_source_class(),
+        "toolbar" => toolbar_delegate_class(),
         "action" => action_target_class(),
         _ => None,
     }
