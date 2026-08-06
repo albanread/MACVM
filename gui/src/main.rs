@@ -2626,6 +2626,12 @@ fn build_window_and_webview() {
 }
 
 fn main() {
+    // Bundle self-bootstrap (was the `launcher` shell script) — installs the
+    // .app's read-only payload into the writable Application Support home and
+    // points the VM's env vars there. No-op from the source tree. MUST be
+    // first: it sets cwd and env that later defaults read, while the process
+    // is still single-threaded.
+    macvm::bundle::bootstrap_payload("web");
     // Headless "eyes" command — render a page (with all smappls resolved by a
     // real VM) to self-contained HTML, no Cocoa window. Guarded before
     // `objc::bootstrap()` so it runs anywhere, not just a windowing session.

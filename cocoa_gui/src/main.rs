@@ -339,6 +339,12 @@ fn rebuild_ui(st: &mut DrainState) {
 }
 
 fn main() {
+    // Bundle self-bootstrap (was the `launcher` shell script): if we are inside
+    // a .app, install the read-only payload into the writable Application
+    // Support home and point the VM's env vars there. No-op from the source
+    // tree. MUST be first — it sets cwd and env every later default reads, and
+    // it must run while the process is still single-threaded.
+    macvm::bundle::bootstrap_payload("cocoa");
     // (design §3 step 1) AppKit init MUST be on main, before anything AppKit.
     objc::bootstrap();
     // An explicit autorelease pool around ALL pre-`[NSApp run]` work: before the

@@ -14,7 +14,7 @@
 # world/*.mst source, gui/ assets, docs) under Contents/Resources/payload. The
 # ObjC runtime + AppKit/Foundation/WebKit/Cocoa + POSIX libc are loaded from
 # the OS at launch (dlopen), so nothing system-level is bundled. On first run
-# the launcher copies the payload to ~/Library/Application Support/MACVM/<mode>
+# the binary self-bootstraps its payload into ~/Library/Application Support/MACVM/<mode>
 # (a WRITABLE home — the .app itself is read-only), seeds the SQLite image
 # there, and runs from it. A version bump re-copies + reseeds; your edited
 # image survives an unchanged version.
@@ -54,27 +54,13 @@ build_one() {
   rm -rf "$APP"
   mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources/payload"
 
-  # --- the real binary + a launcher (CFBundleExecutable) ---
+  # --- the real binary IS the entry point ---
+  # It self-bootstraps its payload (cocoa_gui/src/bundle.rs) — what a `launcher`
+  # shell script used to do. A Mach-O entry point is what hardened runtime and
+  # entitlements attach to; a script CFBundleExecutable runs under Apple-signed
+  # /bin/bash before exec'ing the real binary, which makes the entitlement chain
+  # hard to reason about and is flagged by notarization.
   cp "$ROOT/target/release/$binname" "$APP/Contents/MacOS/$binname"
-  cat > "$APP/Contents/MacOS/launcher" <<LAUNCH
-#!/bin/bash
-set -e
-HERE="\$(cd "\$(dirname "\$0")" && pwd)"                 # Contents/MacOS
-RES="\$(cd "\$HERE/../Resources" && pwd)"
-SUP="\$HOME/Library/Application Support/MACVM/$mode"
-# First run (or a new app version) -> refresh the writable runtime home.
-if [ ! -f "\$SUP/.version" ] || ! cmp -s "\$RES/payload/.version" "\$SUP/.version" 2>/dev/null; then
-  mkdir -p "\$SUP"
-  /usr/bin/ditto "\$RES/payload/" "\$SUP/"
-  rm -f "\$SUP/world/image.sqlite3"    # force a fresh reseed for the new world
-fi
-cd "\$SUP"
-export MACVM_GUI_ROOT="\$SUP/gui"
-export MACVM_WORLD_PATH="\$SUP/world"
-export MACVM_IMAGE_PATH="\$SUP/world/image.sqlite3"
-exec "\$HERE/$binname" "\$@"
-LAUNCH
-  chmod +x "$APP/Contents/MacOS/launcher"
 
   # --- runtime payload (source of truth; the image is seeded at first run) ---
   rsync -a --exclude='*.sqlite3' --exclude='.DS_Store' "$ROOT/world/" "$APP/Contents/Resources/payload/world/"
@@ -99,7 +85,7 @@ LAUNCH
   <key>CFBundleIdentifier</key><string>$bundleid</string>
   <key>CFBundleVersion</key><string>$VERSION</string>
   <key>CFBundleShortVersionString</key><string>$VERSION</string>
-  <key>CFBundleExecutable</key><string>launcher</string>
+  <key>CFBundleExecutable</key><string>$binname</string>
   <key>CFBundleIconFile</key><string>appicon</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>LSMinimumSystemVersion</key><string>11.0</string>

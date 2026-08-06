@@ -12,6 +12,7 @@
 
 #![deny(unsafe_code)]
 
+pub mod bundle; // .app payload self-bootstrap (both GUI shells)
 pub mod bytecode; // opcode set, CompiledMethod, builder, disassembler
 pub mod codecache; // nmethod code cache: CodeCache, CodeHandle, JitWriteGuard
 pub mod compiler; // adaptive optimizing compiler + abstract codegen
