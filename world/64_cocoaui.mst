@@ -121,12 +121,27 @@ Object subclass: CocoaUI [
         Win onMain setReleasedWhenClosed: false.
         Win onMain setTitle: self title.
         Win onMain setMinSize: (Array with: 480.0 with: 320.0).
+        "Full-screen primary (NSWindowCollectionBehaviorFullScreenPrimary =
+         1<<7): without it the green button only zooms, which on a modern Mac
+         reads as a broken window rather than a deliberate choice."
+        Win onMain setCollectionBehavior: 128.
+        "Remember size and position across launches. setFrameAutosaveName:
+         registers the key and saves on every move/resize; setFrameUsingName:
+         applies whatever was saved (a no-op on first run). Without this the
+         window reopens at the hard-coded 1100x700 every time and silently
+         discards whatever the user chose — the single most noticeable way an
+         app feels un-Mac-like."
+        Win onMain setFrameAutosaveName: 'MACVMMainWindow'.
+        Win onMain setFrameUsingName: 'MACVMMainWindow'.
         content := Win onMain contentView.
         content onMain setAutoresizesSubviews: true.
 
         self buildToolbarIn: content.
         self buildContentHostIn: content.
         self buildTranscriptIn: content.
+        "Re-apply the remembered dock state now every piece exists — the
+         builders lay out expanded, this collapses if that is how it was left."
+        self loadTranscriptCollapsed ifTrue: [ self layoutTranscriptDock ].
 
         self registerViewNamed: #workspace title: 'Workspace' icon: 'texteditor'
              container: [ self workspaceContainer ]
@@ -1043,8 +1058,34 @@ Object subclass: CocoaUI [
         ^self transcriptCollapsed ifTrue: [ '▸' ] ifFalse: [ '▾' ]
     ]
 
+    "The dock's state is a preference, not session state — a user who shuts
+     the log expects it shut next launch. Uses setBool:/boolForKey:, NOT
+     setObject: with a string: the bridge marshals BOOL returns to real
+     Smalltalk booleans, whereas an NSString comes back as an opaque ObjcRef
+     that would compare unequal to every Smalltalk string — so a string-based
+     round trip silently never restores. (An unset key reads false, which is
+     the right default: the dock starts open.)"
+    CocoaUI class >> transcriptDefaultsKey [ ^'MACVMTranscriptCollapsed' ]
+
+    CocoaUI class >> userDefaults [
+        ^(Cocoa classNamed: 'NSUserDefaults') onMain standardUserDefaults
+    ]
+
+    CocoaUI class >> loadTranscriptCollapsed [
+        TranscriptCollapsed :=
+            (self userDefaults onMain boolForKey: self transcriptDefaultsKey) = true.
+        ^TranscriptCollapsed
+    ]
+
+    CocoaUI class >> saveTranscriptCollapsed [
+        self userDefaults onMain
+            setBool: self transcriptCollapsed forKey: self transcriptDefaultsKey.
+        ^self
+    ]
+
     CocoaUI class >> toggleTranscript [
         TranscriptCollapsed := self transcriptCollapsed not.
+        self saveTranscriptCollapsed.
         self layoutTranscriptDock.
         TranscriptMenuItem isNil ifFalse: [
             TranscriptMenuItem onMain setTitle: self transcriptMenuTitle ].
