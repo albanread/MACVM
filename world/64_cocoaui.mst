@@ -626,7 +626,8 @@ Object subclass: CocoaUI [
             mainMenu := (Cocoa classNamed: 'NSMenu') onMain alloc onMain init.
             app onMain setMainMenu: mainMenu ].
 
-        #('Workspace' 'File' 'Source' 'View' 'Theme' 'Demos' 'Debug') do: [ :title |
+        #('Workspace' 'File' 'Edit' 'Source' 'View' 'Theme' 'Demos' 'Debug'
+          'Window' 'Help') do: [ :title |
             | old |
             old := mainMenu onMain itemWithTitle: title.
             old isNil ifFalse: [ mainMenu onMain removeItem: old ] ].
@@ -647,11 +648,16 @@ Object subclass: CocoaUI [
         mainMenu onMain addItem: wsItem.
 
         self installFileMenuOn: mainMenu.
+        self installEditMenuOn: mainMenu.
         self installSourceMenuOn: mainMenu.
         self installViewMenuOn: mainMenu.
         self installThemeMenuOn: mainMenu.
         self installDemosMenuOn: mainMenu.
         self installDebugMenuOn: mainMenu.
+        "Window and Help go LAST, in that order — macOS puts Help at the far
+         right and expects Window immediately before it."
+        self installWindowMenuOn: mainMenu.
+        self installHelpMenuOn: mainMenu.
     ]
 
     "── File + Source menus (the editor's file workflow): every item first
@@ -666,6 +672,90 @@ Object subclass: CocoaUI [
             self switchToView: #editor.
             aBlock value: ec ].
     ]
+    "── the standard Mac menus (Edit / Window / Help) ─────────────────────"
+
+    "Like menu:on:triples: but with NO target, which is the whole point.
+     A nil target makes AppKit send the action down the RESPONDER CHAIN, so
+     `copy:` reaches whichever NSTextView is focused — the workspace, an
+     editor pane, the transcript — without us tracking which. Wiring these to
+     a delegate instead would hard-bind one text view and break the rest, and
+     AppKit also greys an item out automatically when nothing in the chain
+     responds, which is the behaviour users read as 'correct'."
+    CocoaUI class >> standardMenu: aTitle on: mainMenu items: someTriples [
+        | menu topItem |
+        menu := (Cocoa classNamed: 'NSMenu') onMain alloc onMain init.
+        menu onMain setTitle: aTitle.
+        someTriples do: [ :t |
+            (t at: 1) = '-'
+                ifTrue: [ menu onMain addItem: (Cocoa classNamed: 'NSMenuItem') onMain separatorItem ]
+                ifFalse: [
+                    | item |
+                    item := ((Cocoa classNamed: 'NSMenuItem') onMain alloc) onMain
+                        initWithTitle: (t at: 1) action: (t at: 3) keyEquivalent: (t at: 2).
+                    menu onMain addItem: item ] ].
+        topItem := ((Cocoa classNamed: 'NSMenuItem') onMain alloc) onMain
+            initWithTitle: aTitle action: nil keyEquivalent: ''.
+        topItem onMain setSubmenu: menu.
+        mainMenu onMain addItem: topItem.
+        ^menu
+    ]
+
+    "Every Mac app has this, and its absence is loud in an app whose main
+     pane is a text editor: the shortcuts already worked (NSTextView answers
+     them through the responder chain) but there was nowhere to LOOK, which
+     is where most people go first."
+    CocoaUI class >> installEditMenuOn: mainMenu [
+        | items |
+        items := OrderedCollection new.
+        items add: (Array with: 'Undo' with: 'z' with: 'undo:').
+        items add: (Array with: 'Redo' with: 'Z' with: 'redo:').
+        items add: (Array with: '-' with: '' with: nil).
+        items add: (Array with: 'Cut' with: 'x' with: 'cut:').
+        items add: (Array with: 'Copy' with: 'c' with: 'copy:').
+        items add: (Array with: 'Paste' with: 'v' with: 'paste:').
+        items add: (Array with: 'Delete' with: '' with: 'delete:').
+        items add: (Array with: 'Select All' with: 'a' with: 'selectAll:').
+        ^self standardMenu: 'Edit' on: mainMenu items: items
+    ]
+
+    "setWindowsMenu: hands the menu to AppKit, which then keeps the list of
+     open windows in it and ticks the front one — behaviour we would
+     otherwise have to write and keep correct ourselves."
+    CocoaUI class >> installWindowMenuOn: mainMenu [
+        | items menu |
+        items := OrderedCollection new.
+        items add: (Array with: 'Minimize' with: 'm' with: 'performMiniaturize:').
+        items add: (Array with: 'Zoom' with: '' with: 'performZoom:').
+        items add: (Array with: '-' with: '' with: nil).
+        items add: (Array with: 'Bring All to Front' with: '' with: 'arrangeInFront:').
+        menu := self standardMenu: 'Window' on: mainMenu items: items.
+        (Cocoa classNamed: 'NSApplication') onMain sharedApplication onMain
+            setWindowsMenu: menu.
+        ^menu
+    ]
+
+    "setHelpMenu: is what makes the Help search field at the top of the menu
+     find our items; without it macOS may adopt some other menu as Help."
+    CocoaUI class >> installHelpMenuOn: mainMenu [
+        | menu item holder delegate topItem |
+        menu := (Cocoa classNamed: 'NSMenu') onMain alloc onMain init.
+        menu onMain setTitle: 'Help'.
+        item := ((Cocoa classNamed: 'NSMenuItem') onMain alloc) onMain
+            initWithTitle: 'MACVM Help' action: 'macvmAction:' keyEquivalent: '?'.
+        holder := CocoaToolbarAction on: [ self switchToView: #help ].
+        delegate := MacvmDelegate actionTargetOn: holder.
+        item onMain setTarget: delegate.
+        ToolbarDelegates add: delegate.
+        menu onMain addItem: item.
+        topItem := ((Cocoa classNamed: 'NSMenuItem') onMain alloc) onMain
+            initWithTitle: 'Help' action: nil keyEquivalent: ''.
+        topItem onMain setSubmenu: menu.
+        mainMenu onMain addItem: topItem.
+        (Cocoa classNamed: 'NSApplication') onMain sharedApplication onMain
+            setHelpMenu: menu.
+        ^menu
+    ]
+
     CocoaUI class >> menu: aTitle on: mainMenu triples: someTriples [
         "Build one submenu from {title. keyEquivalent. block} triples —
          the Debug menu's own delegate wiring, factored."
