@@ -110,7 +110,7 @@ build_one() {
   <key>NSHighResolutionCapable</key><true/>
   <key>NSPrincipalClass</key><string>NSApplication</string>
   <key>LSApplicationCategoryType</key><string>public.app-category.developer-tools</string>
-  <key>NSHumanReadableCopyright</key><string>MACVM</string>
+  <key>NSHumanReadableCopyright</key><string>© Alban Read 2026</string>
 </dict>
 </plist>
 PLIST
