@@ -81,7 +81,8 @@ Object subclass: CocoaUI [
                 WorkspaceContainer
                 HaltOn HaltMenuItem MetricViews
                 WinToolbar ToolbarDelegate ToolbarItems MetricsHost
-                ToolbarIdentArray ToolbarSpecs ViewItemSpecs>
+                ToolbarIdentArray ToolbarSpecs ViewItemSpecs
+                Theme ThemeMenuItems>
 
     "The DISPLAY name, macOS house style (macOS/macVM) — not the binary,
      the bundle id, or the MACVM_* environment variables, which stay upper."
@@ -177,6 +178,8 @@ Object subclass: CocoaUI [
         Worker onTranscriptLine: [ :t | CocoaUI appendTranscript: t ].
 
         self installMenu.
+        "After installMenu, so the checkmark lands on a live menu item."
+        self applyTheme: self loadTheme.
         self switchToView: #workspace.
         Win onMain makeKeyAndOrderFront: nil.
         self appendTranscript: 'CocoaUI: ready.'.
@@ -810,7 +813,7 @@ Object subclass: CocoaUI [
             mainMenu := (Cocoa classNamed: 'NSMenu') onMain alloc onMain init.
             app onMain setMainMenu: mainMenu ].
 
-        #('Workspace' 'File' 'Edit' 'Source' 'View' 'Theme' 'Demos' 'Debug'
+        #('Workspace' 'File' 'Edit' 'Source' 'View' 'Demos' 'Debug'
           'Window' 'Help') do: [ :title |
             | old |
             old := mainMenu onMain itemWithTitle: title.
@@ -835,7 +838,6 @@ Object subclass: CocoaUI [
         self installEditMenuOn: mainMenu.
         self installSourceMenuOn: mainMenu.
         self installViewMenuOn: mainMenu.
-        self installThemeMenuOn: mainMenu.
         self installDemosMenuOn: mainMenu.
         self installDebugMenuOn: mainMenu.
         "Window and Help go LAST, in that order — macOS puts Help at the far
@@ -1167,6 +1169,11 @@ Object subclass: CocoaUI [
          the object AppKit sends macvmAction: to."
         ToolbarDelegates add: tDelegate.
 
+        "Separator, then Appearance — where macOS puts it, rather than the
+         root-level `Theme` menu this used to be."
+        viewMenu onMain addItem: (Cocoa classNamed: 'NSMenuItem') onMain separatorItem.
+        self installAppearanceMenuOn: viewMenu.
+
         viewItem := ((Cocoa classNamed: 'NSMenuItem') onMain alloc) onMain
             initWithTitle: 'View' action: nil keyEquivalent: ''.
         viewItem onMain setSubmenu: viewMenu.
@@ -1174,48 +1181,105 @@ Object subclass: CocoaUI [
         ^viewItem
     ]
 
-    CocoaUI class >> installThemeMenuOn: mainMenu [
-        "Minimal theme infrastructure (CG5): an NSAppearance swap on the
-         window. The toolbar's icons are already NSImage TEMPLATE images
-         (isTemplate: true, § registerViewNamed:...), which AppKit tints
-         automatically from the effective appearance — so this alone
-         proves the icon-reuse-across-themes claim holds, with zero new
-         art. Full palette/13-theme parity with the WKWebView GUI's
-         Theme::ALL is deferred (project_gui_themes) — this is the seam."
-        | themeMenu themeItem pairs |
-        themeMenu := (Cocoa classNamed: 'NSMenu') onMain alloc onMain init.
+    "── appearance: Light / Dark / follow the system ──────────────────────
+     A submenu of View rather than a top-level `Theme` menu: no Mac app has
+     a root-level appearance menu, and the whole point of this arc was to
+     stop looking like one that does.
+
+     The toolbar's icons are NSImage TEMPLATE images (isTemplate: true, see
+     toolbarIconNamed:), which AppKit re-tints from the effective appearance
+     — so the icon set needs no dark variant. Everything else in the window
+     paints with SEMANTIC colours (labelColor, secondaryLabelColor,
+     separatorColor, controlAccentColor, and the colorizer's systemBlue/
+     Brown/Purple/Red), which are dynamic and re-resolve on their own; and
+     the grain texture is an ALPHA noise PNG, so it darkens whatever is
+     behind it instead of painting a fixed slab. That is why this works with
+     no palette of our own — full 13-theme parity with the WKWebView GUI is
+     still deferred (project_gui_themes)."
+    CocoaUI class >> installAppearanceMenuOn: viewMenu [
+        | menu item pairs |
+        menu := (Cocoa classNamed: 'NSMenu') onMain alloc onMain init.
+        ThemeMenuItems := Dictionary new.
         pairs := OrderedCollection new.
         pairs add: (Array with: 'System' with: #system).
         pairs add: (Array with: 'Light' with: #light).
         pairs add: (Array with: 'Dark' with: #dark).
         pairs do: [ :pair |
-            | title sym item holder delegate |
+            | title sym mi holder delegate |
             title := pair at: 1. sym := pair at: 2.
-            item := ((Cocoa classNamed: 'NSMenuItem') onMain alloc) onMain
+            mi := ((Cocoa classNamed: 'NSMenuItem') onMain alloc) onMain
                 initWithTitle: title action: 'macvmAction:' keyEquivalent: ''.
             holder := CocoaToolbarAction on: [ self applyTheme: sym ].
             delegate := MacvmDelegate actionTargetOn: holder.
-            item onMain setTarget: delegate.
-            themeMenu onMain addItem: item.
+            mi onMain setTarget: delegate.
+            menu onMain addItem: mi.
+            ThemeMenuItems at: sym put: mi.
             ToolbarDelegates add: delegate ].
-        themeItem := ((Cocoa classNamed: 'NSMenuItem') onMain alloc) onMain
-            initWithTitle: 'Theme' action: nil keyEquivalent: ''.
-        themeItem onMain setSubmenu: themeMenu.
-        mainMenu onMain addItem: themeItem.
-        ^themeItem
+        item := ((Cocoa classNamed: 'NSMenuItem') onMain alloc) onMain
+            initWithTitle: 'Appearance' action: nil keyEquivalent: ''.
+        item onMain setSubmenu: menu.
+        viewMenu onMain addItem: item.
+        ^item
+    ]
+
+    CocoaUI class >> themeDefaultsKey [ ^'MACVMAppearance' ]
+    CocoaUI class >> themeOrder [ ^Array with: #system with: #light with: #dark ]
+    CocoaUI class >> theme [ ^Theme isNil ifTrue: [ #system ] ifFalse: [ Theme ] ]
+
+    "Remembered across launches, like the window frame and the transcript
+     dock — an app that forgets which appearance you picked is not following
+     the platform. Stored as an INDEX, not a name: NSUserDefaults'
+     stringForKey: answers an opaque NSString the bridge cannot compare to a
+     Smalltalk String, so a string preference would silently never restore."
+    CocoaUI class >> loadTheme [
+        | i |
+        i := self userDefaults onMain integerForKey: self themeDefaultsKey.
+        (i isNil or: [ i < 1 or: [ i > self themeOrder size ] ]) ifTrue: [ i := 1 ].
+        Theme := self themeOrder at: i.
+        ^Theme
+    ]
+
+    CocoaUI class >> saveTheme [
+        | i |
+        i := self themeOrder indexOf: self theme.
+        i = 0 ifTrue: [ i := 1 ].
+        self userDefaults onMain setInteger: i forKey: self themeDefaultsKey.
+        ^self
     ]
 
     CocoaUI class >> applyTheme: aSymbol [
-        "#system reverts to following the OS appearance (setAppearance:
-         nil); #light/#dark force NSAppearanceNameAqua/DarkAqua."
+        "Scoped to NSApp, not to the window. An appearance is an APPLICATION
+         preference: panels, the About box and any secondary window have to
+         follow it too — a forced-dark window next to a system-light open
+         panel is the giveaway that the setting was only ever skin deep.
+         #system means 'no override', which is how AppKit spells 'follow the
+         OS' (and is what makes a live System Settings flip take effect)."
         | name appearance |
-        aSymbol == #system ifTrue: [ Win onMain setAppearance: nil. ^self ].
+        Theme := aSymbol.
+        self saveTheme.
+        self syncAppearanceMenu.
         aSymbol == #light ifTrue: [ name := 'NSAppearanceNameAqua' ].
         aSymbol == #dark ifTrue: [ name := 'NSAppearanceNameDarkAqua' ].
-        name isNil ifTrue: [ ^self ].
-        appearance := (Cocoa classNamed: 'NSAppearance') onMain
-            appearanceNamed: (Cocoa nsString: name).
-        Win onMain setAppearance: appearance.
+        appearance := name isNil
+            ifTrue: [ nil ]
+            ifFalse: [ (Cocoa classNamed: 'NSAppearance') onMain
+                appearanceNamed: (Cocoa nsString: name) ].
+        (Cocoa classNamed: 'NSApplication') onMain sharedApplication onMain
+            setAppearance: appearance.
+        "The window used to carry the override itself; clear it so NSApp's
+         choice is what actually wins."
+        Win isNil ifFalse: [ Win onMain setAppearance: nil ].
+        ^Theme
+    ]
+
+    CocoaUI class >> syncAppearanceMenu [
+        "The checkmark. Three mutually-exclusive choices with no indication of
+         which is live is the other half of not looking like a Mac app."
+        ThemeMenuItems isNil ifTrue: [ ^self ].
+        ThemeMenuItems keysAndValuesDo: [ :sym :item |
+            "NSControlStateValueOn = 1, NSControlStateValueOff = 0."
+            item onMain setState: (sym == self theme ifTrue: [ 1 ] ifFalse: [ 0 ]) ].
+        ^self
     ]
 
     "── C6 action-target callbacks (dispatched synchronously on main) ──"
@@ -1610,7 +1674,7 @@ Object subclass: CocoaUI [
             Win := nil. Workspace := nil. ContentHost := nil.
             Transcript := nil. TranscriptScroll := nil. ActTarget := nil. ToolbarDelegates := nil.
             TranscriptClearBtn := nil.
-            ToolbarSpecs := nil. ViewItemSpecs := nil.
+            ToolbarSpecs := nil. ViewItemSpecs := nil. ThemeMenuItems := nil.
             MetricLabels := nil. Views := nil.
             MemBarFill := nil. MemBarWidth := nil ]
     ]
@@ -1620,7 +1684,21 @@ Object subclass: CocoaUI [
      superview — contentView alone omits the titlebar, and with it the
      NSToolbar). cacheDisplayInRect: draws into our own bitmap, so unlike
      `screencapture -l` this needs no screen-recording permission and works
-     on a window that is not frontmost. Answers self; check the file."
+     on a window that is not frontmost. Answers self; check the file.
+
+     KNOWN LIMITATION — do not chase this again. cacheDisplayInRect: draws
+     outside any window's context, and whenever NSApp carries an EXPLICIT
+     appearance (either one — Light is as affected as Dark) AppKit re-renders
+     the TITLEBAR chrome wrong: items come out as blank pills, or drop out of
+     the capture entirely. That looks exactly like a theming bug and is not
+     one — on screen it is correct (user-confirmed 2026-08-06). Neither
+     making the view's effectiveAppearance current for the draw nor reading
+     the backing store with lockFocus + initWithFocusedViewRect: fixes it
+     (the latter answers nil outright — layer-backed views do not support
+     it). The window BODY is faithful either way, and the whole capture is
+     faithful under #system. So: judge a forced-appearance toolbar by
+     querying item state (toolbarItemNamed:, appearanceMenuItemFor:), and
+     snapshot under #system when you need to SEE it."
     CocoaUI class >> snapshotTo: aPath [
         | view rect rep data |
         Win isNil ifTrue: [ ^self ].
@@ -1642,6 +1720,10 @@ Object subclass: CocoaUI [
      for a test that wants to assert on its state. The A-/A+ actions
      themselves are just `CocoaUI increaseFont` / `decreaseFont`, since a
      native NSToolbarItem has no performClick:."
+    CocoaUI class >> appearanceMenuItemFor: aSymbol [
+        ThemeMenuItems isNil ifTrue: [ ^nil ].
+        ^ThemeMenuItems at: aSymbol ifAbsent: [ nil ]
+    ]
     CocoaUI class >> toolbarItemNamed: ident [
         ToolbarItems isNil ifTrue: [ ^nil ].
         ^ToolbarItems at: ident ifAbsent: [ nil ]
