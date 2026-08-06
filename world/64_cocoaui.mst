@@ -578,6 +578,13 @@ Object subclass: CocoaUI [
     ]
 
     CocoaUI class >> updateMetricsMem: memStr jit: jitStr code: codeStr alloc: allocStr gc: gcStr memPct: pct [
+        "The ~4 Hz beat is also the scripting layer's deadline sweep (design
+         §5): an `evaluate` whose primary never replied — it died, or the doit
+         raised, which serveUiDoit: answers with no reply at all — must fail
+         with a script error rather than hang the caller until AppleScript's
+         own two-minute timeout. Guarded so a world without the scripting file
+         is unaffected."
+        (Worker classNamed: #CocoaScript) ifNotNil: [ :cs | cs sweepDeadlines ].
         "Called from Rust (the primary's beat loop wakes the UI worker every
          beat now — CG5 — so this fires ~4Hz with no new NSTimer) to refresh
          the toolbar readout AND the MEM usage bar's fill width in place."

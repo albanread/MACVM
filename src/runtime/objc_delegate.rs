@@ -958,6 +958,7 @@ macro_rules! script_command {
     };
 }
 
+script_command!(imp_perform_evaluate, "performEvaluateCommand:");
 script_command!(imp_perform_browse, "performBrowseCommand:");
 script_command!(imp_perform_snapshot, "performSnapshotCommand:");
 script_command!(imp_perform_clear_transcript, "performClearTranscriptCommand:");
@@ -971,6 +972,10 @@ static SCRIPT_COMMAND_CLASSES: OnceLock<()> = OnceLock::new();
 pub fn register_script_commands() -> bool {
     SCRIPT_COMMAND_CLASSES.get_or_init(|| {
         for (name, imp) in [
+            (
+                "MacvmEvaluateCommand",
+                imp_ptr!(imp_perform_evaluate, ImpId0),
+            ),
             (
                 "MacvmBrowseCommand",
                 imp_ptr!(imp_perform_browse, ImpId0),
