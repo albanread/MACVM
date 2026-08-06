@@ -338,6 +338,14 @@ pub fn install_quit_menu(app: Id) {
 /// it, closing hides the window and leaves a headless process running (the
 /// on-screen "close closed the window but left the app running" report). The
 /// delegate is a process-lifetime singleton (deliberately leaked).
+///
+/// Scripting (docs/applescript_design.md §6.2) REPLACES this at world startup:
+/// `CocoaScript install` hands NSApp an `#app`-role delegate that answers the
+/// same terminate question *and* the scripting properties, which this one
+/// cannot — it is a cocoa_gui-crate class with no door into the world. This
+/// stays as the pre-world default and the fallback: it is installed before the
+/// world boots, and a world without `74_cocoascript.mst` never displaces it, so
+/// close-quits-the-app holds either way.
 pub fn install_app_delegate(app: Id) {
     // BOOL-returning IMP: `-(BOOL)applicationShouldTerminateAfterLastWindowClosed:`
     // → always YES (1). ObjC BOOL on arm64 is a 1-byte value; `u8` matches.

@@ -401,6 +401,18 @@ Object subclass: Worker [
         self primSend: 0 corr: c bytes: (self pickle: payload).
         ^c
     ]
+    "How many replies are still outstanding — the signal the Apple Event
+     `busy` property reports (74_cocoascript.mst). Tombstoned entries (nil,
+     the removeKey:-less idiom used throughout) are cancelled requests and
+     do not count."
+    Worker class >> pendingReplyCount [
+        | n |
+        PendingReplies isNil ifTrue: [ ^0 ].
+        n := 0.
+        PendingReplies do: [ :v | v isNil ifFalse: [ n := n + 1 ] ].
+        ^n
+    ]
+
     Worker class >> uiDoit: aSource onReply: aBlock [
         "Convenience: a Workspace ⌘P/⌘D — ship a selection as a #doit request
          and run the continuation on the (String) result."

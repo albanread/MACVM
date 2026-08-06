@@ -511,6 +511,42 @@ form in the first draft (`tell application "macVM"`) only resolves once the
 app is installed somewhere Launch Services indexes, which a `dist/` build is
 not.
 
+**Stage 1b landed and verified (2026-08-06)** — the `#app` role, so the
+properties answer:
+
+- `src/runtime/objc_delegate.rs` gains a `#app` role (`MacvmAppDelegate`):
+  `application:delegateHandlesKey:`, six KVC getters, four setters, and the
+  absorbed `applicationShouldTerminateAfterLastWindowClosed:`. Declared one
+  accessor per property rather than a blanket `valueForKey:` override —
+  a catch-all would claim every key in the runtime and forfeit the module's
+  own invariant that a role's class carries exactly the selectors it answers,
+  which is what makes `respondsToSelector:` natively correct.
+- `world/74_cocoascript.mst` — `CocoaScript`: the key set, the four-char code
+  tables in both directions, the six accessors, and `install`. The
+  cocoa_gui-side delegate is *not* deleted: it is installed before the world
+  boots and stays the fallback, so close-quits-the-app holds even in a world
+  without this file.
+- `CocoaUI` gains `activeView`, `transcriptText`, `setWorkspaceText:`;
+  `Worker` gains `pendingReplyCount` (the honest `busy` signal).
+
+Live against `dist/macVM.app`, every property read and written over Apple
+Events:
+
+| script | answer |
+|---|---|
+| `get transcript` | `CocoaUI: ready.` |
+| `get current view` | `workspace` — the **name**, decompiled from `MvV0` through the dictionary |
+| `get appearance` / `get busy` / `get transcript collapsed` | `system` / `false` / `false` |
+| `set current view to browser` → `get current view` | `browser` (the app switches pane) |
+| `set workspace text to "42 factorial"` → read back | `42 factorial` |
+| `set appearance to dark` → `get appearance` | `dark` |
+| `get name`, `get version` | `macVM`, `1.0.0` — Standard Suite still answered by AppKit |
+
+That last row is the proof `application:delegateHandlesKey:` declines
+correctly: a delegate that over-claimed would have broken `name` and
+`version`. The `-10000` errors from stage 1a are gone; `evaluate` still
+answers `-1717` until stage 2/3 register the command classes.
+
 Each stage is independently shippable, and each has a mechanical gate:
 Script Editor's dictionary viewer renders the terminology; `sdef
 "dist/macVM.app" | sdp -fh --basename macVM` round-trips the file;

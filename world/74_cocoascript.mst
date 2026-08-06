@@ -1,0 +1,193 @@
+"74_cocoascript.mst — CocoaScript: the Apple Event surface's world side.
+
+ docs/applescript_design.md, stage 1b. macVM.app declares a scripting
+ dictionary (Contents/Resources/macVM.sdef); this class is what answers it.
+
+ How a script reaches here:
+
+   osascript ──AE──▶ NSApp ──KVC──▶ MacvmAppDelegate (an #app-role ObjC class,
+   src/runtime/objc_delegate.rs) ──▶ MacvmDelegate dispatchTicket:… ──▶ me.
+
+ macOS resolves `application` properties by KVC against NSApp. NSApp does not
+ implement them, so it asks its delegate `application:delegateHandlesKey:`;
+ answering YES makes KVC send the delegate the accessor named for the key,
+ which the #app role forwards here under the selector of the same name.
+
+ Two representation rules, both from the design:
+
+ * A text property crosses as a Smalltalk String — the delegate trampoline
+   mints the NSString.
+ * An ENUMERATED or BOOLEAN property crosses as an NSNumber, and an
+   enumeration's value is its four-character CODE, not its name: `current
+   view` answers 'MvV6' packed into an integer, and Script Editor decompiles
+   that back to `canvas` through the dictionary. `viewCodes`/`themeCodes`
+   below are that mapping, in both directions, in one place — and
+   tools/check-sdef-parity.py fails the build if their ORDER drifts from the
+   sdef's enumerators (a compiled script stores the code, so a reorder
+   silently repoints every saved script).
+
+ This class is deliberately not a shell: it answers exactly the keys in
+ `scriptKeys` and nothing else."
+
+Object subclass: CocoaScript [
+    <classVars: Delegate>
+
+    "── the key set ──────────────────────────────────────────────────────
+     The single list of properties we answer. `application:delegateHandlesKey:`
+     consults it, so adding a property means adding its accessor here and its
+     name here — no third place to forget."
+    CocoaScript class >> scriptKeys [
+        ^#('scriptCurrentView' 'scriptAppearance' 'scriptTranscript'
+           'scriptWorkspaceText' 'scriptTranscriptCollapsed' 'scriptBusy')
+    ]
+
+    "Called by AppKit (through the #app role) for every `application` property
+     a script touches — including Standard-Suite ones like `name` and
+     `version`, which we must decline so AppKit answers them itself."
+    CocoaScript class >> application: anApp delegateHandlesKey: aKey [
+        | key |
+        aKey isNil ifTrue: [ ^false ].
+        key := aKey asString.
+        ^self scriptKeys includes: key
+    ]
+
+    "── four-character codes ─────────────────────────────────────────────
+     'MvV6' → 16r4D765636. Computed from the characters rather than written
+     as a magic number, so the table reads the same as the sdef does."
+    CocoaScript class >> fourCharCode: aString [
+        | n |
+        n := 0.
+        aString do: [ :c | n := (n bitShift: 8) + c value ].
+        ^n
+    ]
+
+    "The `view` enumeration, in the sdef's order — which is the LIVE
+     registration order in CocoaUI class >> startup (workspace first, then
+     each view class's own register)."
+    CocoaScript class >> viewCodes [
+        ^#(workspace browser browser2 find editor outliner canvas help debugger)
+    ]
+
+    "The `appearance` enumeration — CocoaUI's own themeOrder."
+    CocoaScript class >> themeCodes [ ^CocoaUI themeOrder ]
+
+    "Symbol → its sdef code ('MvV0'..), by position. Answers nil for a symbol
+     the sdef does not name (a view registered but never given a code — the
+     honest answer is 'no code', never a wrong one)."
+    CocoaScript class >> codeFor: aSymbol in: aList prefix: aPrefix [
+        | i |
+        i := 0.
+        aList doWithIndex: [ :s :ix | s == aSymbol ifTrue: [ i := ix ] ].
+        i = 0 ifTrue: [ ^nil ].
+        ^self fourCharCode: aPrefix , (i - 1) printString
+    ]
+
+    "The inverse: an incoming code integer → its symbol, or nil."
+    CocoaScript class >> symbolFor: aCode in: aList prefix: aPrefix [
+        | found |
+        found := nil.
+        aList doWithIndex: [ :s :ix |
+            (self fourCharCode: aPrefix , (ix - 1) printString) = aCode
+                ifTrue: [ found := s ] ].
+        ^found
+    ]
+
+    "An integer as an NSNumber ObjcRef — how an enumerated or boolean property
+     travels over KVC. `numberWithInt:` is autoreleased (+0): AppKit reads it
+     within this same run-loop turn, the same lifetime every other
+     id-returning delegate callback relies on."
+    CocoaScript class >> numberWith: anInteger [
+        ^(Cocoa classNamed: 'NSNumber') numberWithInt: anInteger
+    ]
+
+    "── the properties ──────────────────────────────────────────────────"
+
+    CocoaScript class >> scriptCurrentView [
+        | code |
+        code := self codeFor: CocoaUI activeView in: self viewCodes prefix: 'MvV'.
+        code isNil ifTrue: [ ^nil ].
+        ^self numberWith: code
+    ]
+
+    CocoaScript class >> setScriptCurrentView: aNumber [
+        | sym |
+        aNumber isNil ifTrue: [ ^self ].
+        sym := self symbolFor: (aNumber sendI64: 'intValue')
+                    in: self viewCodes prefix: 'MvV'.
+        sym isNil ifTrue: [ ^self ].
+        CocoaUI switchToView: sym
+    ]
+
+    CocoaScript class >> scriptAppearance [
+        | code |
+        code := self codeFor: CocoaUI theme in: self themeCodes prefix: 'MvA'.
+        code isNil ifTrue: [ ^nil ].
+        ^self numberWith: code
+    ]
+
+    CocoaScript class >> setScriptAppearance: aNumber [
+        | sym |
+        aNumber isNil ifTrue: [ ^self ].
+        sym := self symbolFor: (aNumber sendI64: 'intValue')
+                    in: self themeCodes prefix: 'MvA'.
+        sym isNil ifTrue: [ ^self ].
+        CocoaUI applyTheme: sym.
+        CocoaUI saveTheme
+    ]
+
+    "Read-only: the log itself, newest line first. `clear transcript` is a
+     separate verb rather than a settable property (design §3)."
+    CocoaScript class >> scriptTranscript [ ^CocoaUI transcriptText ]
+
+    CocoaScript class >> scriptWorkspaceText [ ^CocoaUI workspaceText ]
+
+    CocoaScript class >> setScriptWorkspaceText: aString [
+        aString isNil ifTrue: [ ^self ].
+        CocoaUI setWorkspaceText: aString asString
+    ]
+
+    CocoaScript class >> scriptTranscriptCollapsed [
+        ^self numberWith: (CocoaUI transcriptCollapsed ifTrue: [ 1 ] ifFalse: [ 0 ])
+    ]
+
+    CocoaScript class >> setScriptTranscriptCollapsed: aNumber [
+        | want |
+        aNumber isNil ifTrue: [ ^self ].
+        want := (aNumber sendI64: 'intValue') ~= 0.
+        want = CocoaUI transcriptCollapsed ifFalse: [ CocoaUI toggleTranscript ]
+    ]
+
+    "Read-only: is the primary VM working? Outstanding replies is the honest
+     signal available today — it covers a scripted `evaluate` (stage 3) as
+     well as any other in-flight request. It is not a lie in either
+     direction: nothing is pending exactly when nothing was sent."
+    CocoaScript class >> scriptBusy [
+        ^self numberWith: (Worker pendingReplyCount > 0 ifTrue: [ 1 ] ifFalse: [ 0 ])
+    ]
+
+    "── app-level delegate behaviour ─────────────────────────────────────
+     Absorbed from the cocoa_gui-side delegate this role displaces: closing
+     the last window quits the app, rather than leaving a headless process
+     running (the on-screen 'close left the app running' report)."
+    CocoaScript class >> applicationShouldTerminateAfterLastWindowClosed: anApp [
+        ^true
+    ]
+
+    "── installation ────────────────────────────────────────────────────
+     Mint the #app-role delegate bound to me and hand it to NSApp, REPLACING
+     the minimal delegate cocoa_gui installed at startup (which answers the
+     terminate question and nothing else, having no door into the world).
+     Held in a class var for the process's life: AppKit does not retain a
+     delegate, so dropping this reference would leave NSApp holding a dead
+     pointer. Answers true when the app is now scriptable."
+    CocoaScript class >> install [
+        | app |
+        Delegate isNil ifFalse: [ ^true ].
+        app := Cocoa classNamed: 'NSApplication'.
+        app isNil ifTrue: [ ^false ].
+        Delegate := MacvmDelegate on: self role: #app.
+        Delegate isNil ifTrue: [ ^false ].
+        app sharedApplication onMain setDelegate: Delegate.
+        ^true
+    ]
+]

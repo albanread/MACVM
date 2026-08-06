@@ -568,6 +568,9 @@ type ImpQ2 = extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void) -
 type ImpB2 = extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void) -> u8;
 type ImpIdChild =
     extern "C" fn(*mut c_void, *mut c_void, *mut c_void, i64, *mut c_void) -> *mut c_void;
+/// `@@:` — a no-argument, id-returning KVC getter (the `#app` role's
+/// scripting properties).
+type ImpId0 = extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void;
 type ImpIdTb1 = extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> *mut c_void;
 type ImpIdTbItem =
     extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void, u8) -> *mut c_void;
@@ -734,10 +737,170 @@ fn action_target_class() -> Option<*mut c_void> {
         .map(|p| p as *mut c_void)
 }
 
+
+// ── the `#app` role: NSApp's delegate, and the scripting properties ──────────
+//
+// `docs/applescript_design.md` §6.2. Scripting properties on `application` are
+// resolved by KVC against `NSApp`; the sanctioned way to answer them from your
+// own object — rather than subclassing NSApplication or injecting methods into
+// a framework class — is `application:delegateHandlesKey:` on the app delegate,
+// after which KVC sends the delegate the accessor named for the key.
+//
+// So the accessors are declared one per property, NOT as a blanket
+// `valueForKey:` override: this module's whole design is that a role's class
+// carries exactly the selectors it answers, which is what makes
+// `respondsToSelector:` natively correct (see the module doc). A catch-all
+// would claim every key in the runtime and forfeit that.
+//
+// This role also carries `applicationShouldTerminateAfterLastWindowClosed:` —
+// it DISPLACES the cocoa_gui-side delegate that used to answer it (that class
+// has no door into the world), so it must absorb its one behaviour: closing the
+// window quits the app, rather than leaving a headless process running.
+
+/// One id-returning KVC getter: `-(id)name` → the world's `name`.
+macro_rules! script_getter {
+    ($fname:ident, $sel:literal) => {
+        extern "C" fn $fname(this: *mut c_void, _cmd: *mut c_void) -> *mut c_void {
+            dispatch(this, $sel, &[], RetShape::Id) as *mut c_void
+        }
+    };
+}
+
+/// One KVC setter: `-(void)setName:(id)v` → the world's `setName:`.
+macro_rules! script_setter {
+    ($fname:ident, $sel:literal) => {
+        extern "C" fn $fname(this: *mut c_void, _cmd: *mut c_void, value: *mut c_void) {
+            dispatch(this, $sel, &[ArgVal::Id(value)], RetShape::Void);
+        }
+    };
+}
+
+script_getter!(imp_script_current_view, "scriptCurrentView");
+script_getter!(imp_script_appearance, "scriptAppearance");
+script_getter!(imp_script_transcript, "scriptTranscript");
+script_getter!(imp_script_workspace_text, "scriptWorkspaceText");
+script_getter!(imp_script_transcript_collapsed, "scriptTranscriptCollapsed");
+script_getter!(imp_script_busy, "scriptBusy");
+
+script_setter!(imp_set_script_current_view, "setScriptCurrentView:");
+script_setter!(imp_set_script_appearance, "setScriptAppearance:");
+script_setter!(imp_set_script_workspace_text, "setScriptWorkspaceText:");
+script_setter!(
+    imp_set_script_transcript_collapsed,
+    "setScriptTranscriptCollapsed:"
+);
+
+/// `-(BOOL)application:delegateHandlesKey:` — YES for the keys the world
+/// answers. Asking the world (rather than hardcoding the list here) keeps the
+/// key set in ONE place, beside the accessors that serve it.
+extern "C" fn imp_delegate_handles_key(
+    this: *mut c_void,
+    _cmd: *mut c_void,
+    app: *mut c_void,
+    key: *mut c_void,
+) -> u8 {
+    dispatch(
+        this,
+        "application:delegateHandlesKey:",
+        &[ArgVal::Id(app), ArgVal::Id(key)],
+        RetShape::Bool,
+    ) as u8
+}
+
+/// `-(BOOL)applicationShouldTerminateAfterLastWindowClosed:` — absorbed from
+/// the delegate this role displaces. Answered by the world so the policy lives
+/// with the rest of the app-level behaviour; a world that declines (or a
+/// tombstoned ticket) yields NO from `dispatch`'s fail-closed 0, which is the
+/// AppKit default, not a crash.
+extern "C" fn imp_should_terminate_after_last_window(
+    this: *mut c_void,
+    _cmd: *mut c_void,
+    app: *mut c_void,
+) -> u8 {
+    dispatch(
+        this,
+        "applicationShouldTerminateAfterLastWindowClosed:",
+        &[ArgVal::Id(app)],
+        RetShape::Bool,
+    ) as u8
+}
+
+static APP_DELEGATE_CLASS: OnceLock<Option<usize>> = OnceLock::new();
+
+fn app_delegate_class() -> Option<*mut c_void> {
+    APP_DELEGATE_CLASS
+        .get_or_init(|| {
+            register_class(
+                "MacvmAppDelegate",
+                &[
+                    (
+                        "applicationShouldTerminateAfterLastWindowClosed:",
+                        imp_ptr!(imp_should_terminate_after_last_window, ImpB1),
+                        "B@:@",
+                    ),
+                    (
+                        "application:delegateHandlesKey:",
+                        imp_ptr!(imp_delegate_handles_key, ImpB2),
+                        "B@:@@",
+                    ),
+                    (
+                        "scriptCurrentView",
+                        imp_ptr!(imp_script_current_view, ImpId0),
+                        "@@:",
+                    ),
+                    (
+                        "scriptAppearance",
+                        imp_ptr!(imp_script_appearance, ImpId0),
+                        "@@:",
+                    ),
+                    (
+                        "scriptTranscript",
+                        imp_ptr!(imp_script_transcript, ImpId0),
+                        "@@:",
+                    ),
+                    (
+                        "scriptWorkspaceText",
+                        imp_ptr!(imp_script_workspace_text, ImpId0),
+                        "@@:",
+                    ),
+                    (
+                        "scriptTranscriptCollapsed",
+                        imp_ptr!(imp_script_transcript_collapsed, ImpId0),
+                        "@@:",
+                    ),
+                    ("scriptBusy", imp_ptr!(imp_script_busy, ImpId0), "@@:"),
+                    (
+                        "setScriptCurrentView:",
+                        imp_ptr!(imp_set_script_current_view, ImpV1),
+                        "v@:@",
+                    ),
+                    (
+                        "setScriptAppearance:",
+                        imp_ptr!(imp_set_script_appearance, ImpV1),
+                        "v@:@",
+                    ),
+                    (
+                        "setScriptWorkspaceText:",
+                        imp_ptr!(imp_set_script_workspace_text, ImpV1),
+                        "v@:@",
+                    ),
+                    (
+                        "setScriptTranscriptCollapsed:",
+                        imp_ptr!(imp_set_script_transcript_collapsed, ImpV1),
+                        "v@:@",
+                    ),
+                ],
+            )
+            .map(|c| c as usize)
+        })
+        .map(|p| p as *mut c_void)
+}
+
 /// The role symbol (`#window`/`#text`/`#table`/`#outline`/`#action`) → its
 /// registered delegate class. `None` for an unknown role.
 fn role_class(role: &str) -> Option<*mut c_void> {
     match role {
+        "app" => app_delegate_class(),
         "window" => window_delegate_class(),
         "text" => text_delegate_class(),
         "table" => table_source_class(),
@@ -756,7 +919,7 @@ fn role_class(role: &str) -> Option<*mut c_void> {
 /// lifts C4's primary-only refusal for the UI worker (design §4.3, review item 5).
 pub fn new_delegate(role: &str, gen: u64, ticket: i64) -> Result<*mut c_void, String> {
     let cls = role_class(role).ok_or_else(|| {
-        format!("unknown delegate role '{role}' (want window/text/table/outline/action)")
+        format!("unknown delegate role '{role}' (want app/window/text/table/outline/action)")
     })?;
     let inst = crate::runtime::objc_bridge::try_send(
         cls,

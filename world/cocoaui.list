@@ -46,3 +46,4 @@
 # Step Into/Over/Finish/Continue/Abort + a print-it field. Auto-fronts when the
 # primary halts (breakpoint, `halt`, or Halt-on-Error). Self-registers by name.
 73_cocoadebugger.mst
+74_cocoascript.mst

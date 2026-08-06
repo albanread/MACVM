@@ -181,6 +181,12 @@ Object subclass: CocoaUI [
         "After installMenu, so the checkmark lands on a live menu item."
         self applyTheme: self loadTheme.
         self switchToView: #workspace.
+        "Apple Event surface (docs/applescript_design.md): replaces the
+         minimal cocoa_gui-side app delegate with one that has a door into
+         the world. After switchToView:, so a script reading `current view`
+         can never observe the pre-registration nil. Absent (a world without
+         74_cocoascript.mst) the app simply stays unscriptable."
+        (Worker classNamed: #CocoaScript) ifNotNil: [ :cs | cs install ].
         Win onMain makeKeyAndOrderFront: nil.
         self appendTranscript: 'CocoaUI: ready.'.
         ^Win
@@ -1381,6 +1387,28 @@ Object subclass: CocoaUI [
 
     "── the transcript: a SMALL, reverse-chronological dock at the bottom ──"
     CocoaUI class >> transcriptStripHeight [ ^22.0 ]
+
+    "── accessors the scripting surface reads (74_cocoascript.mst) ────────
+     Plain readers over state this class already owns, named so the Apple
+     Event layer never reaches into a class var directly."
+
+    "The pane on screen, as its registry symbol (#workspace, #canvas, …)."
+    CocoaUI class >> activeView [ ^ActiveView ]
+
+    "The whole transcript log, newest line first — the buffer appendTranscript:
+     maintains, not a re-read of the NSTextView."
+    CocoaUI class >> transcriptText [
+        ^TranscriptText isNil ifTrue: [ '' ] ifFalse: [ TranscriptText ]
+    ]
+
+    "Replace the Workspace buffer and re-colourise, the same pair
+     insertPrintResult:at: performs after a programmatic setString: (which
+     posts no textDidChange:, so the recolourise must be explicit)."
+    CocoaUI class >> setWorkspaceText: aString [
+        Workspace isNil ifTrue: [ ^self ].
+        Workspace onMain setString: aString.
+        self recolorizeWorkspace
+    ]
 
     "── the transcript dock's collapse state ──────────────────────────────"
 
