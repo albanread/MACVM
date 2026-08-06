@@ -2,13 +2,13 @@
 #
 # Build a self-contained, double-clickable .app + .dmg for a MACVM GUI mode.
 #
-#   tools/make-macapp.sh cocoa    # -> dist/MACVM Cocoa.app + dist/MACVM-Cocoa.dmg
-#   tools/make-macapp.sh web      # -> dist/MACVM Web.app   + dist/MACVM-Web.dmg
+#   tools/make-macapp.sh cocoa    # -> dist/macVM.app      + dist/macVM.dmg
+#   tools/make-macapp.sh web      # -> dist/macVM Web.app   + dist/macVM-Web.dmg
 #   tools/make-macapp.sh both     # both
 #
 # The app is UNSIGNED (signing/notarization needs an Apple Developer ID this
 # script deliberately never touches). On your own Mac: right-click -> Open the
-# first time, or `xattr -dr com.apple.quarantine "MACVM Cocoa.app"`.
+# first time, or `xattr -dr com.apple.quarantine "macVM.app"`.
 #
 # How it's self-contained: the app carries its whole runtime payload (the
 # world/*.mst source, gui/ assets, docs) under Contents/Resources/payload. The
