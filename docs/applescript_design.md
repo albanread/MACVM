@@ -452,8 +452,8 @@ Recommended follow-ups, out of scope here but noted so they are not lost:
    `application` properties (§4, §6.2). An earlier draft claimed this
    stage needed "no new Rust class registration"; not quite — the
    existing delegate has no door into the world, so the role comes
-   first. Provable with `osascript -e 'tell application "macVM" to get
-   transcript'`, and `bounds of window 1` arrives free with the Standard
+   first. Provable with `osascript -e 'tell application id "com.macvm.cocoa"
+   to get transcript'` (bundle id, per the correction above), and `bounds of window 1` arrives free with the Standard
    Suite.
 2. `browse`, `snapshot`, `clear transcript` — synchronous commands: the
    `NSScriptCommand` subclasses, the `register_class` superclass
@@ -485,6 +485,31 @@ until it lands. Two notes from building it:
   Calendar's own sdef loses its `class-extension` element the same way. Read
   the round-trip gate below as a *parse* check; the dictionary viewer (or
   `sdef` on the built app) is what shows the properties.
+
+**Stage 1a verified end to end (2026-08-06), against `dist/macVM.app`:**
+
+| probe | result |
+|---|---|
+| `sdef dist/macVM.app` | resolves the whole vocabulary — 4 commands, 6 properties, both enumerations |
+| `get version` | `1.0.0` — the Standard Suite answers |
+| `quit` | quits |
+| `get transcript`, `get current view` | error **-10000** (no `#app` delegate, so KVC finds no key) |
+| `evaluate "3 + 4"` | error **-1717** (no `MacvmEvaluateCommand` registered) |
+| app afterwards | **still running** — the failures are ordinary script errors, not crashes |
+
+Those two error numbers are the progress signal for stage 1b/2: **-1717 means
+the command class is not registered; -10000 means the KVC key is unhandled.**
+
+**Gate protocol correction — address by bundle id, never by path.**
+`tell application "dist/macVM.app"` *appears* to work (`get version` answers)
+but is unreliable in the worst way: `quit` sent that way was silently
+ignored, while the same `quit` by
+`tell application id "com.macvm.cocoa"` terminated the app immediately. The
+give-away is `CFURLGetFSRef was passed a URL which has no scheme` on every
+such call. §10's smoke lines below therefore use the bundle id — the name
+form in the first draft (`tell application "macVM"`) only resolves once the
+app is installed somewhere Launch Services indexes, which a `dist/` build is
+not.
 
 Each stage is independently shippable, and each has a mechanical gate:
 Script Editor's dictionary viewer renders the terminology; `sdef
