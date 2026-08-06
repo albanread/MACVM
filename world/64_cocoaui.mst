@@ -355,10 +355,13 @@ Object subclass: CocoaUI [
          target:/action: go in afterwards through the ordinary property
          setters, because the bridge marshals a String argument as an
          NSString, not as the SEL this constructor's last parameter wants."
+        "NSToolbarItemGroupSelectionModeSelectOne = 0. NOT 1 — that is
+         selectAny, under which every segment you click STAYS lit and the bar
+         accumulates highlights instead of moving one. (momentary = 2.)"
         item := (Cocoa classNamed: 'NSToolbarItemGroup') onMain
             groupWithItemIdentifier: self viewGroupIdentifier
             images: imgs
-            selectionMode: 1
+            selectionMode: 0
             labels: labels
             target: nil
             action: nil.
@@ -1720,6 +1723,33 @@ Object subclass: CocoaUI [
      for a test that wants to assert on its state. The A-/A+ actions
      themselves are just `CocoaUI increaseFont` / `decreaseFont`, since a
      native NSToolbarItem has no performClick:."
+    "The view group's segments as a String — '#' the lit one, '.' the rest.
+     Derived from selectedIndex, because NSToolbarItem exposes no
+     per-subitem isSelected: under SelectOne the group's index IS the state.
+
+     Which is also why the real invariant to assert on is
+     viewGroupSelectionMode = 0. Passing 1 there is selectAny, under which
+     every segment you click STAYS lit and the bar accumulates highlights —
+     a bug this string cannot see, because AppKit keeps reporting a single
+     selectedIndex the whole time."
+    CocoaUI class >> viewSegmentStates [
+        | group n idx out |
+        group := self toolbarItemNamed: self viewGroupIdentifier.
+        group isNil ifTrue: [ ^'' ].
+        n := (group onMain subitems) sendI64: 'count'.
+        idx := group sendI64: 'selectedIndex'.
+        out := WriteStream on: String new.
+        0 to: n - 1 do: [ :i | out nextPut: (i = idx ifTrue: [ $# ] ifFalse: [ $. ]) ].
+        ^out contents
+    ]
+
+    CocoaUI class >> viewGroupSelectionMode [
+        | group |
+        group := self toolbarItemNamed: self viewGroupIdentifier.
+        group isNil ifTrue: [ ^-1 ].
+        ^group sendI64: 'selectionMode'
+    ]
+
     CocoaUI class >> appearanceMenuItemFor: aSymbol [
         ThemeMenuItems isNil ifTrue: [ ^nil ].
         ^ThemeMenuItems at: aSymbol ifAbsent: [ nil ]
