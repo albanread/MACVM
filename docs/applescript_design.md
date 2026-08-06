@@ -51,8 +51,12 @@ Smalltalk classes and methods (§7), not files.
 
 ## 2. Suite and codes
 
-One suite, `macVM Suite`. Four-character codes avoid the all-lowercase
-space, which Apple reserves; every macVM code starts `Mv`.
+One suite, `macVM Suite`. Codes are four characters, mixed-case (Apple
+reserves the all-lowercase space); every macVM code starts `Mv`. One sdef
+mechanic the table elides: a *command's* `code` attribute is eight
+characters — event class, then event ID — and the suite code doubles as
+the event class, so `evaluate` appears in the file as `MvSuMvEv`. The
+table lists the ID half.
 
 | Kind | Name | Code |
 |---|---|---|
@@ -72,13 +76,31 @@ space, which Apple reserves; every macVM code starts `Mv`.
 | class | Smalltalk class | `MvCl` |
 | class | Smalltalk method | `MvMe` |
 
-The Standard Suite comes in by reference, which is the ordinary idiom and
-gives `quit`, `get`, `set`, `count`, `exists` for free:
+Enumerators carry codes of their own, and those codes are what a compiled
+script *stores* — Script Editor decompiles `MvV1` back to `browser`
+through the dictionary. That makes them append-only: renumbering breaks
+every saved script, silently. A view added later appends the next code;
+one removed retires its code forever.
+
+| Enumeration | Enumerators |
+|---|---|
+| view `MvVw` | `MvV0` workspace · `MvV1` browser · `MvV2` browser2 · `MvV3` find · `MvV4` editor · `MvV5` outliner · `MvV6` canvas · `MvV7` help · `MvV8` debugger |
+| appearance `MvAe` | `MvA0` system · `MvA1` light · `MvA2` dark |
+
+The Standard Suite comes in by reference — the `<dictionary>` element
+needs `xmlns:xi="http://www.w3.org/2003/XInclude"` — which is the
+ordinary idiom and gives `quit`, `get`, `set`, `count`, `exists`, and the
+`window` class, so `bounds of window 1` works against AppKit's own
+scripting support with zero macVM code:
 
 ```xml
 <xi:include href="file:///System/Library/ScriptingDefinitions/CocoaStandard.sdef"
             xpointer="xpointer(/dictionary/suite)"/>
 ```
+
+The cost is dictionary noise: Script Editor will also show document verbs
+(`open`, `save`, `print`) a document-less app cannot honour. Nearly every
+scriptable app accepts that trade, and macVM does too.
 
 ## 3. Commands
 
@@ -88,15 +110,19 @@ The core verb. Takes Smalltalk source, answers its `printString`.
 
 ```applescript
 evaluate "3 + 4"                              --> "7"
-evaluate "Integer" as target workspace        -- runs it as if typed in the Workspace
+evaluate "SuiteAll run" time limit 300        -- a long doit: raise the guest-side limit
 evaluate "1/0" --> error "ZeroDivide" number -10000
 ```
 
 | Parameter | Type | Optional | Meaning |
 |---|---|---|---|
 | *direct* | text | no | Smalltalk source |
-| `as target` | view enum | yes | which surface's context (default: workspace) |
-| `timeout` | integer | yes | seconds before the command errors out (default 60) |
+| `time limit` | integer | yes | seconds before the command fails with a script error (default 60) |
+
+An earlier draft had a third parameter, `as target`, choosing "which
+surface's context". Cut on review: the implementation has exactly one
+evaluation context — `Worker uiDoit:` posts to the primary VM — and a
+parameter that changes nothing is worse than no parameter.
 
 Answers `text`. It answers the *printString*, not a typed value: the guest
 is a Smalltalk image whose objects have no Apple Event representation, and
@@ -104,11 +130,15 @@ inventing one for arbitrary results is exactly the kind of leaky mapping
 that makes scriptable apps unpleasant. Scripts that want structure ask for
 it — `evaluate "someCollection asArray printString"` — or use §7.
 
-`timeout` deserves a note. AppleScript's own send timeout defaults to 60
-seconds and a script can raise it with `with timeout of N seconds`. The
-command's own `timeout` is the *guest-side* limit — how long macVM waits
-for the primary VM before giving up and answering an error. A runaway doit
-must produce a script error, never a hung Script Editor.
+`time limit` deserves two notes. The name: not `timeout`, because
+`timeout` is an AppleScript *reserved word* (`with timeout of N seconds`),
+and a parameter so named does not compile in Script Editor. The semantics:
+AppleScript's own reply timeout — two minutes by default, adjustable with
+`with timeout` — is the *client* giving up, and it reports a useless
+error. `time limit` is macVM giving up: the command resumes with a script
+error when the primary VM has not answered (§5), and it should always be
+the one that fires. A runaway doit must produce a script error, never a
+hung Script Editor.
 
 ### `browse`
 
@@ -125,10 +155,12 @@ should be one script line.
 ### `snapshot`
 
 ```applescript
-snapshot to POSIX file "/tmp/macvm.png"
+snapshot in POSIX file "/tmp/macvm.png"
 ```
 
-Writes a PNG of the window. Wraps `CocoaUI>>snapshotTo:`, and inherits its
+Writes a PNG of the window — `in`, not `to`, because `save in file` is
+the Standard Suite's own spelling of a write target and matching it is
+free. Wraps `CocoaUI>>snapshotTo:`, and inherits its
 documented limitation — under a forced Light or Dark appearance the
 titlebar chrome does not re-render faithfully offscreen. The `.sdef`
 comment must say so, because a script author cannot be expected to read
@@ -164,15 +196,22 @@ to "why did nothing happen" when a previous long doit is still running.
 Enumerations:
 
 ```
-view:        workspace | browser | browser2 | editor | find
+view:        workspace | browser | browser2 | find | editor
              | outliner | canvas | help | debugger
 appearance:  system | light | dark
 ```
 
-The `view` enumerators are the registry's own symbols, so the enumeration
-is generated from `Views` rather than hand-maintained — the same discipline
-`installViewMenuOn:` already follows. A view added later gets a scripting
-name for free; one removed cannot leave a dangling enumerator.
+The `view` enumerators are the registry's own symbols, in registration
+order — find before editor. (This document's first draft had them
+swapped; the live registry disagreed — `switchToView: #canvas` lights
+segment 6, which only the find-first order predicts.) That is exactly the
+drift a static resource invites, so the names are *parity-tested* against
+`Views`: a cocoa_gui gate boots the world headless, reads the registry,
+parses the sdef out of Resources, and fails when names or codes drift.
+One transport fact shapes the accessors: over KVC an enumeration-typed
+property travels as its four-char code in an `NSNumber`, so
+`current view`'s getter answers `MvV6`, not `"canvas"` — the world-side
+code table is the single mapping in both directions.
 
 ## 5. Asynchrony: suspend and resume
 
@@ -180,38 +219,65 @@ name for free; one removed cannot leave a dangling enumerator.
 Events fit macVM better than a hand-rolled protocol would.
 
 ```
-osascript ──AE──▶ MacvmEvaluateCommand
-                      performDefaultImplementation
-                        ├─ CocoaUI evaluateForScript: src ticket: n
-                        │     └─ Worker uiDoit: src onReplyTimed: [...]   (posts, returns)
-                        ├─ [self suspendExecution]
-                        └─ return nil                    ← AppKit keeps pumping
-                  ...primary VM works...
-                  beat loop delivers the reply
-                      CocoaUI scriptReply: text ticket: n
-                        └─ [command resumeExecutionWithResult: text]
+osascript ──AE──▶ MacvmEvaluateCommand — performDefaultImplementation IMP
+                      dispatch → CocoaScript evaluate: src command: cmd
+                        ├─ cmd suspendExecution        (bridge send, inside the dispatch)
+                        ├─ Worker uiDoit: src onReply: [:r | cmd resumeExecutionWithResult: r]
+                        └─ IMP returns nil             (AppKit keeps pumping)
+                  ...primary VM works; the window stays live...
+                  reply drains on main → the block resumes the command
 osascript ◀──AE── the result
 ```
 
-Three details that are easy to get wrong:
+**The world owns the suspended command.** The IMP hands the command object
+itself into the dispatch as an ordinary argument, so it arrives in
+Smalltalk as an `ObjcRef` — and everything after that is world-side.
+`suspendExecution` goes through the bridge *inside* the synchronous
+dispatch (it must precede the IMP's return); the reply block closes over
+the ref and later sends `resumeExecutionWithResult:`; the error
+properties (`setScriptErrorNumber:` / `setScriptErrorString:`) are plain
+ObjC setters the world can call before resuming. An earlier draft of this
+document specified a Rust-side ticket→command table and a world→Rust
+resume primitive; the review deleted both. Holding AppKit objects the
+framework will not retain for us is already this GUI's ownership
+discipline — the toolbar items — and the command is just one more.
 
-**The command object must be retained across the suspension.** It is held
-in a ticket→command table on the Rust side, keyed the same way
-`MacvmDelegate`'s registry keys receivers. The world side never holds the
-`NSScriptCommand`; it holds the ticket.
+Details that are easy to get wrong:
 
-**The timeout has to fire on our side.** If the primary VM never replies —
-it died, or the doit is an infinite loop — nothing resumes the command and
-the script hangs until AppleScript's own timeout, with a useless error. A
-timer armed at suspension resumes with a script error instead.
+**Exactly one resume.** The reply and the time limit race, and resuming a
+command twice is not survivable. A one-shot guard per suspended command
+makes whichever fires second a no-op.
+
+**The time limit has to be ours.** If the primary never replies — it
+died, or the doit is an infinite loop — nothing resumes the command, and
+the script hangs until AppleScript's own two-minute reply timeout
+delivers a useless error. The ~4Hz beat that already refreshes the
+metrics checks a world-side deadline list and resumes an expired command
+with a script error. No `NSTimer`, no new machinery.
+
+**Resumption must happen on the main thread.** True by construction — the
+reply is drained on main by the same flag/wake mechanism every UI refresh
+uses (`cocoa_gui_flag_and_drain.md`) — but it is a constraint, not an
+accident, so it is written down.
 
 **Re-entrancy.** `dispatch_callback` fails closed if a callback is already
 active on the thread ([embed.rs](src/embed.rs)), which is correct and must
-stay. Suspension is compatible with it: `performDefaultImplementation`
-*returns* before the wait, so the callback is over by the time the run loop
-turns. The resume arrives as a fresh top-level entry. This is the same
-reason the design works at all — the AppKit run loop is entered with the VM
-quiescent (`cocoa_gui_design.md` §1).
+stay. Suspension is compatible: the IMP *returns* before the wait, so the
+callback is over by the time the run loop turns, and the resume is a
+fresh top-level entry. Concurrent `evaluate`s compose the same way — each
+suspends, and they queue on the primary's serial doit queue. This is the
+same reason the design works at all — the AppKit run loop is entered with
+the VM quiescent (`cocoa_gui_design.md` §1).
+
+**The reply must distinguish error from value.** `uiDoit:onReplyTimed:`
+answers text either way — the workspace prints both the same, so it never
+had to care. A script does: `evaluate "1/0"` must raise
+`error number -10000`, not deliver the *text* "ZeroDivide" as a success,
+and string-matching a result is not a protocol. The reply needs an
+explicit discriminator — `uiDoit:onReply:onError:`, following the
+precedent `DnsService` already sets
+(`resolve:timeoutMs:onReply:onError:`, [75_dns.mst](world/75_dns.mst)) —
+a change to the worker protocol, not to scripting.
 
 ## 6. How it lands on the existing bridge
 
@@ -228,21 +294,25 @@ already covers.
 | Piece | Where | Size |
 |---|---|---|
 | non-`NSObject` superclass in `register_class` | [objc_delegate.rs:535](src/runtime/objc_delegate.rs:535) hardcodes `NSObject` | one line + a parameter |
-| `MacvmEvaluateCommand` etc. — `NSScriptCommand` subclasses | `objc_delegate.rs` | one IMP each |
-| ticket→command table, retained across suspension | `objc_delegate.rs` | small |
-| `application:delegateHandlesKey:` + property getters/setters | the app delegate that already exists at [objc.rs:336](cocoa_gui/src/objc.rs:336) | one IMP per property |
+| `MacvmEvaluateCommand` etc. — `NSScriptCommand` subclasses whose IMPs hand the command itself into the dispatch | `objc_delegate.rs` | one IMP each |
+| a `#app` role: `application:delegateHandlesKey:` + a getter/setter per property, absorbing the terminate IMP it displaces | `objc_delegate.rs`, replacing the minimal delegate at [objc.rs:336](cocoa_gui/src/objc.rs:336) | one IMP per property |
+| the guest-error message reaching the script (§6.3) | `embed.rs` | small |
 | `macVM.sdef` | `Contents/Resources/` | the document |
 | `NSAppleScriptEnabled`, `OSAScriptingDefinition` | generated Info.plist | two keys |
-| world-side `CocoaScript` class | `world/` | the verbs |
+| world-side `CocoaScript` class: verbs, suspended-command ownership, the deadline list, the enum-code table | `world/` | the feature |
 
 The property route is worth calling out. Scripting properties on
 `application` are resolved by KVC against `NSApp`, and the sanctioned way
 to answer them from your own object — rather than subclassing
 `NSApplication` or injecting methods into a framework class — is
-`application:delegateHandlesKey:` on the app delegate. macVM already
-installs a delegate for
-`applicationShouldTerminateAfterLastWindowClosed:`, so the properties hang
-off an object we own.
+`application:delegateHandlesKey:` on the app delegate. macVM installs a
+delegate today, but on the wrong side of the boundary for this job: it is
+a cocoa_gui-crate class whose one IMP
+(`applicationShouldTerminateAfterLastWindowClosed:`) answers a constant,
+with no door into the world — `dispatch`/`lookup_entry` are private to
+objc_delegate.rs. So the plan is not "extend it" but "replace it": a
+`#app` role registered by the same machinery as every other delegate,
+carrying the terminate IMP it displaces.
 
 ### 6.3 Errors must carry their message
 
@@ -263,6 +333,15 @@ not silence.
 So the scripting path needs a variant that returns the message rather than
 dropping it, and maps it onto `setScriptErrorString:` /
 `setScriptErrorNumber:`. Nothing else about the recovery changes.
+
+Scope it precisely: this is for errors raised *inside a synchronous
+handler*, so it ships with stage 2 — a `browse` whose handler itself
+fails must become a script error, not a silent success. `evaluate`'s
+guest errors never come through here at all; they travel the reply path,
+which is why §5 requires the reply discriminator instead. And *expected*
+failures (an unknown class name the handler checks for) need neither
+mechanism: the world holds the command and sets the script error
+properties directly through the bridge.
 
 One thing this does *not* fix, and the document should not pretend
 otherwise: a Rust **panic** inside an IMP is `panic_cannot_unwind` →
@@ -353,16 +432,27 @@ Recommended follow-ups, out of scope here but noted so they are not lost:
 
 ## 10. Staging
 
-1. `.sdef` + Info.plist keys + `application` properties (§4). No new
-   Rust class registration — properties go through the existing app
-   delegate. Provable with `osascript -e 'tell application "macVM" to get
-   transcript'`.
-2. `browse`, `snapshot`, `clear transcript` — synchronous commands, which
-   need the `NSScriptCommand` subclass and the `register_class` superclass
-   generalisation but not the suspend/resume machinery.
-3. `evaluate` — suspension, the ticket table, the timeout, and the
-   error-message path of §6.3.
+1. `.sdef` + Info.plist keys + the `#app` role carrying the
+   `application` properties (§4, §6.2). An earlier draft claimed this
+   stage needed "no new Rust class registration"; not quite — the
+   existing delegate has no door into the world, so the role comes
+   first. Provable with `osascript -e 'tell application "macVM" to get
+   transcript'`, and `bounds of window 1` arrives free with the Standard
+   Suite.
+2. `browse`, `snapshot`, `clear transcript` — synchronous commands: the
+   `NSScriptCommand` subclasses, the `register_class` superclass
+   generalisation, and §6.3 (a handler failure must be a script error,
+   not a silent success).
+3. `evaluate` — suspension with world-owned commands, the one-shot
+   resume guard, the beat-loop deadline list, and the
+   `uiDoit:onReply:onError:` reply discriminator (§5).
 4. Phase 2 object model (§7), if it earns its way.
 
-Each stage is independently shippable, and stage 1 alone makes the app
-scriptable enough to be useful.
+Each stage is independently shippable, and each has a mechanical gate:
+Script Editor's dictionary viewer renders the terminology; `sdef
+"dist/macVM.app" | sdp -fh --basename macVM` round-trips the file;
+`defaults write com.macvm.cocoa NSScriptingDebugLogLevel 1` traces
+command dispatch while developing; and an `osascript` smoke line per
+verb sits beside the existing boot gates. Scripting keys live in
+Info.plist, so every gate runs against `dist/macVM.app`, never the bare
+dev binary (§8).
