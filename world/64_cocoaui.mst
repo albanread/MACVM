@@ -56,6 +56,20 @@ Object subclass: CocoaToolbarAction [
     macvmAction: sender [ ^Block value ]
 ]
 
+"CocoaToolbarAction's 1-arg sibling: passes the SENDER through to the block.
+ What a gesture-recognizer target needs — the block asks the recognizer
+ itself for locationInView: (docs/asset_editors_design.md §5). Same ticket
+ discipline: kept alive by the world-side registry, one shared Rust IMP."
+Object subclass: CocoaSenderAction [
+    <classVars: nil>
+    | Block |
+    CocoaSenderAction class >> on: aBlock [
+        | h | h := self new. h setBlock: aBlock. ^h
+    ]
+    setBlock: aBlock [ Block := aBlock ]
+    macvmAction: sender [ ^Block value: sender ]
+]
+
 "I am the native GUI's application shell, running in the UI worker VM on
  the main thread. I build the main window: a toolbar of view-switcher
  buttons plus a live VM metrics readout, a content host whose tabs the
@@ -829,7 +843,7 @@ Object subclass: CocoaUI [
             mainMenu := (Cocoa classNamed: 'NSMenu') onMain alloc onMain init.
             app onMain setMainMenu: mainMenu ].
 
-        #('Workspace' 'File' 'Edit' 'Source' 'View' 'Demos' 'Debug'
+        #('Workspace' 'File' 'Edit' 'Source' 'View' 'Tools' 'Demos' 'Debug'
           'Window' 'Help') do: [ :title |
             | old |
             old := mainMenu onMain itemWithTitle: title.
@@ -854,6 +868,7 @@ Object subclass: CocoaUI [
         self installEditMenuOn: mainMenu.
         self installSourceMenuOn: mainMenu.
         self installViewMenuOn: mainMenu.
+        self installToolsMenuOn: mainMenu.
         self installDemosMenuOn: mainMenu.
         self installDebugMenuOn: mainMenu.
         "Window and Help go LAST, in that order — macOS puts Help at the far
@@ -995,6 +1010,33 @@ Object subclass: CocoaUI [
         triples add: (Array with: 'Format' with: 'F' with: [ self editorDo: [ :ec | ec formatBuffer ] ]).
         triples add: (Array with: 'Analyze' with: 'A' with: [ self editorDo: [ :ec | ec analyzeBuffer ] ]).
         self menu: 'Source' on: mainMenu triples: triples.
+    ]
+
+    CocoaUI class >> installToolsMenuOn: mainMenu [
+        "Asset editors (docs/asset_editors_design.md): utilities summoned by
+         menu, not view-registry tabs — they open their own windows beside
+         the game window they preview into. Late-bound by name (the CG7/CG8
+         discipline): the editor files load after this one in cocoaui.list."
+        | menu toolsItem |
+        menu := (Cocoa classNamed: 'NSMenu') onMain alloc onMain init.
+        self toolsMenu: menu item: 'Sprite Editor…' opens: #CocoaSpriteEditor.
+        toolsItem := ((Cocoa classNamed: 'NSMenuItem') onMain alloc) onMain
+            initWithTitle: 'Tools' action: nil keyEquivalent: ''.
+        toolsItem onMain setSubmenu: menu.
+        mainMenu onMain addItem: toolsItem.
+        ^toolsItem
+    ]
+    CocoaUI class >> toolsMenu: menu item: aTitle opens: aClassSymbol [
+        | item holder delegate |
+        item := ((Cocoa classNamed: 'NSMenuItem') onMain alloc) onMain
+            initWithTitle: aTitle action: 'macvmAction:' keyEquivalent: ''.
+        holder := CocoaToolbarAction on: [
+            (Worker classNamed: aClassSymbol) ifNotNil: [ :c | c open ] ].
+        delegate := MacvmDelegate actionTargetOn: holder.
+        item onMain setTarget: delegate.
+        menu onMain addItem: item.
+        ToolbarDelegates add: delegate.
+        ^item
     ]
 
     CocoaUI class >> installDemosMenuOn: mainMenu [
@@ -1677,6 +1719,7 @@ Object subclass: CocoaUI [
             (Worker classNamed: #CocoaEditor) ifNotNil: [ :ec | ec teardown ].
             (Worker classNamed: #CocoaOutliner) ifNotNil: [ :oc | oc teardown ].
             (Worker classNamed: #CocoaCanvas) ifNotNil: [ :cv | cv teardown ].
+            (Worker classNamed: #CocoaSpriteEditor) ifNotNil: [ :se | se teardown ].
             (Worker classNamed: #CocoaHelp) ifNotNil: [ :hc | hc teardown ].
             (Worker classNamed: #CocoaDebugger) ifNotNil: [ :dc | dc teardown ].
             ActTarget isNil ifFalse: [ ActTarget isValid ifTrue: [ ActTarget release ] ].

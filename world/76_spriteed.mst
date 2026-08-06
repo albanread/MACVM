@@ -1,0 +1,97 @@
+"76_spriteed.mst — the Sprite Editor window (docs/asset_editors_design.md).
+ A utility window, summoned by Tools ▸ Sprite Editor…, that graphically edits
+ the 16-colour hex-row sprites GamePane renders and saves them as sheet
+ classes in the image. This file is the WINDOW (UI worker, Cocoa bridge);
+ the pure document model is SpriteDoc (world/44_spritedoc.mst, world list,
+ headless-testable).
+
+ Stage 1 (this file's first landing): the window skeleton — fixed size,
+ hide-on-close via the #window delegate role, reopened by the menu item.
+ Painting (S3), the engine preview (S4) and persistence (S5) build into it."
+Object subclass: CocoaSpriteEditor [
+    <classVars: Win WinDelegate Delegates StatusLabel Doc>
+
+    CocoaSpriteEditor class >> windowWidth [ ^980.0 ]
+    CocoaSpriteEditor class >> windowHeight [ ^560.0 ]
+
+    "── open / hide ──────────────────────────────────────────────────────"
+
+    CocoaSpriteEditor class >> open [
+        "Show the editor, building it on first use. Re-summoning an open
+         editor just fronts it — state lives in class vars, so hiding (the
+         red button) and reopening lose nothing."
+        Win isNil ifTrue: [ self buildWindow ].
+        Win isNil ifTrue: [ ^self ].
+        Win onMain makeKeyAndOrderFront: nil.
+        ^self
+    ]
+
+    CocoaSpriteEditor class >> windowShouldClose: sender [
+        "The red button HIDES (MACDART's editors chose the same): the doc,
+         palette and preview state all survive to the next Tools-menu summon.
+         Answer false so AppKit never actually closes."
+        Win isNil ifFalse: [ Win onMain orderOut: nil ].
+        ^false
+    ]
+
+    "── construction ─────────────────────────────────────────────────────"
+
+    CocoaSpriteEditor class >> buildWindow [
+        | winClass content |
+        Delegates := OrderedCollection new.
+        winClass := Cocoa classNamed: 'NSWindow'.
+        "styleMask 15 = titled|closable|miniaturizable|resizable minus
+         resizable is 7: the layout is fixed (design §4), so no resize."
+        Win := ((winClass onMain alloc) onMain
+            initWithContentRect: (Array with: 320.0 with: 240.0
+                                        with: self windowWidth with: self windowHeight)
+            styleMask: 7 backing: 2 defer: false).
+        Win onMain setReleasedWhenClosed: false.
+        Win onMain setTitle: 'Sprite Editor'.
+        WinDelegate := MacvmDelegate windowDelegateOn: self.
+        Win onMain setDelegate: WinDelegate.
+        content := Win onMain contentView.
+        content onMain setAutoresizesSubviews: true.
+        self buildStatusIn: content.
+        self setStatus: 'sprite editor — stage 1 skeleton (painting lands in stage 3)'.
+    ]
+
+    CocoaSpriteEditor class >> buildStatusIn: content [
+        "The status line along the bottom — every stage reports here."
+        StatusLabel := ((Cocoa classNamed: 'NSTextField') onMain alloc) onMain
+            initWithFrame: (Array with: 8.0 with: 6.0
+                                  with: self windowWidth - 16.0 with: 16.0).
+        StatusLabel onMain setEditable: false.
+        StatusLabel onMain setBordered: false.
+        StatusLabel onMain setDrawsBackground: false.
+        StatusLabel onMain setSelectable: false.
+        StatusLabel onMain setFont:
+            ((Cocoa classNamed: 'NSFont') onMain systemFontOfSize: 11.0).
+        StatusLabel onMain setTextColor:
+            (Cocoa classNamed: 'NSColor') onMain secondaryLabelColor.
+        content onMain addSubview: StatusLabel.
+    ]
+
+    CocoaSpriteEditor class >> setStatus: aString [
+        StatusLabel isNil ifTrue: [ ^self ].
+        StatusLabel onMain setStringValue: aString.
+    ]
+
+    "── scripting hooks (rusttcl `gui`) ──────────────────────────────────"
+
+    CocoaSpriteEditor class >> isOpen [
+        Win isNil ifTrue: [ ^false ].
+        ^Win sendBool: 'isVisible'
+    ]
+
+    "── teardown (UI-worker rebuild — CocoaUI teardown calls by name) ────"
+
+    CocoaSpriteEditor class >> teardown [
+        Win isNil ifFalse: [
+            Win isValid ifTrue: [
+                Win onMain setDelegate: nil.
+                Win onMain orderOut: nil.
+                Win release ] ].
+        Win := nil. WinDelegate := nil. Delegates := nil. StatusLabel := nil.
+    ]
+]

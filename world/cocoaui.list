@@ -47,3 +47,8 @@
 # primary halts (breakpoint, `halt`, or Halt-on-Error). Self-registers by name.
 73_cocoadebugger.mst
 74_cocoascript.mst
+# CocoaSpriteEditor (docs/asset_editors_design.md): the Sprite Editor window —
+# Tools ▸ Sprite Editor…; edits GamePane hex-row sprites, saves sheet classes.
+# The pure model (SpriteDoc) is a WORLD-list file so games and the headless
+# battery can load it; this file is only the Cocoa face.
+76_spriteed.mst
