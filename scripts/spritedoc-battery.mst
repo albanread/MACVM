@@ -1,0 +1,132 @@
+"SpriteDoc battery (docs/asset_editors_design.md stage 2 gate). Pure-model
+ asserts; prints one FAIL line per broken claim and a final verdict line."
+Object subclass: SpriteDocBattery [
+    <classVars: Fails Count>
+    SpriteDocBattery class >> assert: aBool named: aName [
+        Count := Count + 1.
+        aBool ifFalse: [
+            Fails := Fails + 1.
+            Transcript showCr: 'FAIL: ' , aName ].
+    ]
+    SpriteDocBattery class >> run [
+        | d rows parsed ok snap |
+        Fails := 0. Count := 0.
+
+        "fresh document"
+        d := SpriteDoc new.
+        self assert: d width = 16 named: 'fresh width 16'.
+        self assert: d height = 16 named: 'fresh height 16'.
+        self assert: d frameCount = 1 named: 'fresh one frame'.
+        self assert: (d getPx: 0 x: 5 y: 5) = 0 named: 'fresh all transparent'.
+        self assert: ((d paletteAt: 0) at: 1) = 20 named: 'DB16 entry 0 r=20'.
+        self assert: ((d paletteAt: 15) at: 3) = 214 named: 'DB16 entry 15 b=214'.
+
+        "setPx semantics"
+        self assert: (d setPx: 0 x: 1 y: 2 color: 7) named: 'setPx changes'.
+        self assert: (d getPx: 0 x: 1 y: 2) = 7 named: 'setPx reads back'.
+        self assert: (d setPx: 0 x: 1 y: 2 color: 7) not named: 'same-value write is false'.
+        self assert: (d setPx: 0 x: 99 y: 0 color: 7) not named: 'OOB x is false'.
+        self assert: (d setPx: 9 x: 0 y: 0 color: 7) not named: 'OOB frame is false'.
+        self assert: (d setPx: 0 x: 0 y: 0 color: 99) named: 'over-range colour clamps'.
+        self assert: (d getPx: 0 x: 0 y: 0) = 15 named: 'clamped to 15'.
+
+        "hex rows round-trip incl. '.' and uppercase"
+        d := SpriteDoc new.
+        ok := d loadFrames: (Array with: 'f0F/0.0/A1c').
+        self assert: ok named: 'loadFrames parses mixed case + dot'.
+        self assert: d width = 3 named: 'parsed width 3'.
+        self assert: d height = 3 named: 'parsed height 3'.
+        self assert: (d rowsOf: 0) = 'f0f/000/a1c' named: 'round-trip lowercases, dot->0'.
+
+        "bad parses reject atomically"
+        snap := d rowsOf: 0.
+        self assert: (d loadFrames: (Array with: 'ff/f')) not named: 'ragged rows rejected'.
+        self assert: (d loadFrames: (Array with: 'fg/ff')) not named: 'bad hex rejected'.
+        self assert: (d loadFrames: (Array with: 'ff/ff' with: 'fff/fff/fff')) not
+             named: 'mismatched frame sizes rejected'.
+        self assert: (d rowsOf: 0) = snap named: 'doc untouched after bad load'.
+        self assert: (SpriteDoc parseRows: 'ff//ff') isNil named: 'empty row rejected'.
+        self assert: (SpriteDoc parseRows: '') isNil named: 'empty string rejected'.
+
+        "flood fill"
+        d := SpriteDoc new.
+        d loadFrames: (Array with: '000/010/000').
+        d floodFill: 0 x: 0 y: 0 color: 3.
+        self assert: (d rowsOf: 0) = '333/313/333' named: 'flood fills around the island'.
+        self assert: (d floodFill: 0 x: 0 y: 0 color: 3) not named: 'flood seed=c is a no-op'.
+
+        "shift wraps and reverses"
+        d := SpriteDoc new.
+        d loadFrames: (Array with: 'f00/000/00a').
+        snap := d rowsOf: 0.
+        d shift: 0 dx: 2 dy: 1.
+        self assert: (d rowsOf: 0) ~= snap named: 'shift moved something'.
+        d shift: 0 dx: -2 dy: -1.
+        self assert: (d rowsOf: 0) = snap named: 'negative shift reverses (wrap)'.
+
+        "resize crop + pad"
+        d := SpriteDoc new.
+        d setPx: 0 x: 0 y: 0 color: 5.
+        d setPx: 0 x: 12 y: 12 color: 9.
+        self assert: (d resizeTo: 8 by: 8) named: 'shrink accepted'.
+        self assert: (d getPx: 0 x: 0 y: 0) = 5 named: 'top-left survives shrink'.
+        self assert: d frameCount = 1 named: 'frame count stable across resize'.
+        self assert: (d resizeTo: 16 by: 16) named: 'grow accepted'.
+        self assert: (d getPx: 0 x: 12 y: 12) = 0 named: 'grow pads transparent'.
+        self assert: (d resizeTo: 0 by: 8) not named: 'zero width rejected'.
+        self assert: (d resizeTo: 65 by: 8) not named: 'over-64 rejected'.
+        self assert: (d resizeTo: 16 by: 16) not named: 'same-size is false'.
+
+        "frames"
+        d := SpriteDoc new.
+        d setPx: 0 x: 1 y: 1 color: 4.
+        self assert: d addFrame = 1 named: 'addFrame answers new index'.
+        self assert: (d getPx: 1 x: 1 y: 1) = 0 named: 'added frame is empty'.
+        self assert: (d dupFrame: 0) = 1 named: 'dup inserts after'.
+        self assert: d frameCount = 3 named: 'three frames now'.
+        self assert: (d getPx: 1 x: 1 y: 1) = 4 named: 'dup copied pixels'.
+        d setPx: 1 x: 1 y: 1 color: 9.
+        self assert: (d getPx: 0 x: 1 y: 1) = 4 named: 'dup is a COPY (no aliasing)'.
+        self assert: (d delFrame: 1) named: 'del middle frame'.
+        self assert: d frameCount = 2 named: 'two frames after del'.
+        self assert: (d delFrame: 0) named: 'del first'.
+        self assert: (d delFrame: 0) not named: 'last frame undeletable'.
+
+        "palette"
+        d := SpriteDoc new.
+        self assert: (d setPal: 3 r: 300 g: -5 b: 128) named: 'setPal accepts'.
+        self assert: (d paletteAt: 3) = #(255 0 128) named: 'channels clamp'.
+        self assert: (d setPal: 16 r: 0 g: 0 b: 0) not named: 'entry 16 rejected'.
+
+        "names"
+        self assert: (SpriteDoc validName: 'Ship') named: 'Ship valid'.
+        self assert: (SpriteDoc validName: 'Ship2X') named: 'digits ok'.
+        self assert: (SpriteDoc validName: 'ship') not named: 'lowercase rejected'.
+        self assert: (SpriteDoc validName: '9Ship') not named: 'digit-first rejected'.
+        self assert: (SpriteDoc validName: 'Sh ip') not named: 'space rejected'.
+        self assert: (SpriteDoc validName: '') not named: 'empty rejected'.
+
+        "sheet source + snippet"
+        d := SpriteDoc new.
+        d name: 'BatteryGhost'.
+        d loadFrames: (Array with: 'f0/0f' with: '0f/f0').
+        rows := d sheetSource.
+        self assert: (rows includesSubstring: 'isSpriteSheet') named: 'sheet has marker'.
+        self assert: (rows includesSubstring: 'Object subclass: BatteryGhost')
+             named: 'sheet defines the class'.
+        self assert: (rows includesSubstring: '''f0/0f'' ''0f/f0''')
+             named: 'sheet carries both frames'.
+        self assert: (rows includesSubstring: 'installOn:') named: 'sheet has installOn:'.
+        parsed := d codeSnippet.
+        self assert: (parsed includesSubstring: 'defineSprite: ''f0/0f''')
+             named: 'snippet defines first frame'.
+        self assert: (parsed includesSubstring: 'addFrame: ''0f/f0''')
+             named: 'snippet adds second frame'.
+
+        Transcript showCr: 'SPRITEDOC BATTERY: ' , Count printString , ' checks, '
+            , Fails printString , ' failures'.
+        Fails = 0 ifTrue: [ Transcript showCr: 'BATTERY GREEN' ].
+    ]
+]
+
+SpriteDocBattery run.

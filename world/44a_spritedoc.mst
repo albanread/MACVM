@@ -1,0 +1,357 @@
+"44a_spritedoc.mst — the sprite editor's document, pure and headless
+ (docs/asset_editors_design.md; transcribed from MACDART's
+ spriteed_model.dart, the same lineage both engines share).
+
+ A document is what the game pane's sprite system renders: frames of 4-bit
+ pixels (0..15, 0 = transparent) plus ONE 16-entry RGB palette shared by
+ every frame — the engine's own shape (a def's palette is per-def, not
+ per-frame). Everything here is plain data and string work: no Cocoa, no
+ primitives, so the whole model loads and tests headless (`macvm run`),
+ while the editor window (world/76_spriteed.mst, cocoaui list) drives it
+ live. The two can never drift because the window computes nothing itself.
+
+ The persistence format is SOURCE, the house doctrine: a sheet saves as an
+ ordinary class in the image whose methods answer the art rows and palette
+ as literals, and whose installOn: replays them onto a live pane with the
+ exact sends every shipped game already uses (defineSprite: / addFrame: /
+ colorAt:r:g:b:) — so a saved sheet is one send away from playing, and the
+ Browser can read (or tweak) the art as text.
+
+ Coordinates are 0-based like the engine's own (moveTo:x:y:, art rows top-
+ down): getPx/setPx take x in 0..w-1, y in 0..h-1."
+Object subclass: SpriteDoc [
+    | name w h frames pal |
+
+    SpriteDoc class >> hexDigits [ ^'0123456789abcdef' ]
+
+    "DawnBringer's 16 — the default palette for a fresh document. Entry 1
+     (engine index 0) is the transparent index; its RGB is kept anyway
+     (shown behind a checker in the editor, exported like the rest so
+     round-trips are exact)."
+    SpriteDoc class >> defaultPalette16 [
+        "A fresh outer Array each call; the inner literal rows are shared but
+         never mutated — setPal:r:g:b: replaces a slot wholesale."
+        | p |
+        p := Array new: 16.
+        p at:  1 put: #(20 12 28).    p at:  2 put: #(68 36 52).
+        p at:  3 put: #(48 52 109).   p at:  4 put: #(78 74 78).
+        p at:  5 put: #(133 76 48).   p at:  6 put: #(52 101 36).
+        p at:  7 put: #(208 70 72).   p at:  8 put: #(117 113 97).
+        p at:  9 put: #(89 125 206).  p at: 10 put: #(210 125 44).
+        p at: 11 put: #(133 149 161). p at: 12 put: #(109 170 44).
+        p at: 13 put: #(210 170 153). p at: 14 put: #(109 194 202).
+        p at: 15 put: #(218 212 94).  p at: 16 put: #(222 238 214).
+        ^p
+    ]
+
+    SpriteDoc class >> new [
+        ^super new initSpriteDoc
+    ]
+    initSpriteDoc [
+        name := 'Sprite'.
+        w := 16. h := 16.
+        frames := OrderedCollection new.
+        frames add: (ByteArray new: w * h).
+        pal := self class defaultPalette16.
+        ^self
+    ]
+
+    name [ ^name ]
+    name: aString [ name := aString ]
+    width [ ^w ]
+    height [ ^h ]
+    frameCount [ ^frames size ]
+    paletteAt: i [ "0-based palette index" ^pal at: i + 1 ]
+
+    "── pixels ───────────────────────────────────────────────────────────"
+
+    getPx: f x: x y: y [
+        "Frame f (0-based), pixel (x, y) — 0 for anything out of range."
+        (f < 0 or: [ f >= frames size ]) ifTrue: [ ^0 ].
+        (x < 0 or: [ x >= w or: [ y < 0 or: [ y >= h ] ] ]) ifTrue: [ ^0 ].
+        ^(frames at: f + 1) at: (y * w) + x + 1
+    ]
+
+    setPx: f x: x y: y color: c [
+        "Answers true when the write CHANGED anything — the window uses that
+         to skip repaints while a drag sits inside one cell."
+        | cc buf idx |
+        (f < 0 or: [ f >= frames size ]) ifTrue: [ ^false ].
+        (x < 0 or: [ x >= w or: [ y < 0 or: [ y >= h ] ] ]) ifTrue: [ ^false ].
+        cc := (c max: 0) min: 15.
+        buf := frames at: f + 1.
+        idx := (y * w) + x + 1.
+        (buf at: idx) = cc ifTrue: [ ^false ].
+        buf at: idx put: cc.
+        ^true
+    ]
+
+    floodFill: f x: x y: y color: c [
+        "Classic 4-way flood from (x,y): every connected pixel of the seed's
+         colour becomes c. A no-op when the seed already IS c (the fill would
+         otherwise walk the region writing the value it reads)."
+        | cc buf from stack i ix iy |
+        (f < 0 or: [ f >= frames size ]) ifTrue: [ ^false ].
+        (x < 0 or: [ x >= w or: [ y < 0 or: [ y >= h ] ] ]) ifTrue: [ ^false ].
+        cc := (c max: 0) min: 15.
+        buf := frames at: f + 1.
+        from := buf at: (y * w) + x + 1.
+        from = cc ifTrue: [ ^false ].
+        stack := OrderedCollection new.
+        stack add: (y * w) + x.
+        [ stack isEmpty ] whileFalse: [
+            i := stack removeLast.
+            (buf at: i + 1) = from ifTrue: [
+                buf at: i + 1 put: cc.
+                ix := i \\ w. iy := i // w.
+                ix > 0 ifTrue: [ stack add: i - 1 ].
+                ix < (w - 1) ifTrue: [ stack add: i + 1 ].
+                iy > 0 ifTrue: [ stack add: i - w ].
+                iy < (h - 1) ifTrue: [ stack add: i + w ] ] ].
+        ^true
+    ]
+
+    shift: f dx: dx dy: dy [
+        "Shift the frame by (dx, dy) WITH WRAP — a game sprite's edges
+         usually matter, and a wrapping shift loses nothing, so nudging art
+         into place is always reversible. (\\ is a floored modulo, so
+         negative nudges need no fix-up.)"
+        | src dst nx ny |
+        (f < 0 or: [ f >= frames size ]) ifTrue: [ ^self ].
+        src := frames at: f + 1.
+        dst := ByteArray new: w * h.
+        0 to: h - 1 do: [ :y |
+            0 to: w - 1 do: [ :x |
+                nx := (x + dx) \\ w.
+                ny := (y + dy) \\ h.
+                dst at: (ny * w) + nx + 1 put: (src at: (y * w) + x + 1) ] ].
+        frames at: f + 1 put: dst.
+        ^self
+    ]
+
+    clearFrame: f [
+        (f < 0 or: [ f >= frames size ]) ifTrue: [ ^self ].
+        frames at: f + 1 put: (ByteArray new: w * h).
+        ^self
+    ]
+
+    resizeTo: nw by: nh [
+        "Resize every frame, anchored top-left: content inside the new bounds
+         is kept, growth pads with transparent. Engine-honest bounds (1..64 —
+         a def is a Metal texture, and nothing in the library is remotely
+         that big)."
+        | cw ch src dst |
+        (nw < 1 or: [ nh < 1 or: [ nw > 64 or: [ nh > 64 ] ] ]) ifTrue: [ ^false ].
+        (nw = w and: [ nh = h ]) ifTrue: [ ^false ].
+        cw := nw min: w. ch := nh min: h.
+        1 to: frames size do: [ :fi |
+            src := frames at: fi.
+            dst := ByteArray new: nw * nh.
+            0 to: ch - 1 do: [ :y |
+                0 to: cw - 1 do: [ :x |
+                    dst at: (y * nw) + x + 1 put: (src at: (y * w) + x + 1) ] ].
+            frames at: fi put: dst ].
+        w := nw. h := nh.
+        ^true
+    ]
+
+    "── frames ───────────────────────────────────────────────────────────"
+
+    addFrame [
+        "Append an empty frame; answer its 0-based index."
+        frames add: (ByteArray new: w * h).
+        ^frames size - 1
+    ]
+
+    dupFrame: f [
+        "Duplicate frame f after itself; answer the copy's index, -1 if bad.
+         (OrderedCollection has no positional insert — rebuild, which at
+         sprite-sheet sizes costs nothing.)"
+        | rebuilt |
+        (f < 0 or: [ f >= frames size ]) ifTrue: [ ^-1 ].
+        rebuilt := OrderedCollection new.
+        1 to: frames size do: [ :i |
+            rebuilt add: (frames at: i).
+            i = (f + 1) ifTrue: [ rebuilt add: (frames at: i) copy ] ].
+        frames := rebuilt.
+        ^f + 1
+    ]
+
+    delFrame: f [
+        "The last frame cannot be deleted — a def with zero frames is nothing
+         the engine (or the editor) can show."
+        frames size <= 1 ifTrue: [ ^false ].
+        (f < 0 or: [ f >= frames size ]) ifTrue: [ ^false ].
+        frames removeAtIndex: f + 1.
+        ^true
+    ]
+
+    "── palette ──────────────────────────────────────────────────────────"
+
+    setPal: i r: r g: g b: b [
+        "0-based entry, channels clamped to 0..255."
+        (i < 0 or: [ i > 15 ]) ifTrue: [ ^false ].
+        pal at: i + 1 put: (Array
+            with: ((r max: 0) min: 255)
+            with: ((g max: 0) min: 255)
+            with: ((b max: 0) min: 255)).
+        ^true
+    ]
+
+    "── hex rows (the engine's wire format) ──────────────────────────────"
+
+    rowsOf: f [
+        "Frame f as '/'-separated lowercase hex rows — exactly what
+         defineSprite:/addFrame: consume."
+        | out buf |
+        out := WriteStream on: String new.
+        buf := frames at: f + 1.
+        0 to: h - 1 do: [ :y |
+            y > 0 ifTrue: [ out nextPut: $/ ].
+            0 to: w - 1 do: [ :x |
+                out nextPut: (self class hexDigits at: (buf at: (y * w) + x + 1) + 1) ] ].
+        ^out contents
+    ]
+
+    SpriteDoc class >> parseRows: aString [
+        "Parse '/'-separated hex rows (the engine's own format; '.' is its
+         transparent alias, upper-case hex tolerated). Every row must match
+         the first row's width. Answers #(pixels w h), or nil with nothing
+         changed — parse first, commit after, so a bad string can never
+         half-load."
+        | lines rw px ch v cur |
+        (aString isNil or: [ aString isEmpty ]) ifTrue: [ ^nil ].
+        "Split on $/ by hand (no stdlib tokenizer): a trailing or doubled
+         slash yields an empty row, which the width check below rejects."
+        lines := OrderedCollection new.
+        cur := WriteStream on: String new.
+        aString do: [ :c |
+            c = $/
+                ifTrue: [ lines add: cur contents. cur := WriteStream on: String new ]
+                ifFalse: [ cur nextPut: c ] ].
+        lines add: cur contents.
+        rw := (lines at: 1) size.
+        (rw < 1 or: [ rw > 64 or: [ lines size > 64 ] ]) ifTrue: [ ^nil ].
+        px := ByteArray new: rw * lines size.
+        1 to: lines size do: [ :li |
+            | line |
+            line := lines at: li.
+            line size = rw ifFalse: [ ^nil ].
+            1 to: rw do: [ :i |
+                ch := (line at: i) asLowercase.
+                ch = $.
+                    ifTrue: [ v := 0 ]
+                    ifFalse: [
+                        v := self hexDigits indexOf: ch.
+                        v = 0 ifTrue: [ ^nil ].
+                        v := v - 1 ].
+                px at: ((li - 1) * rw) + i put: v ] ].
+        ^Array with: px with: rw with: lines size
+    ]
+
+    loadFrames: rowsCollection [
+        "Replace the whole document's art from a collection of row strings
+         (all frames the same size, engine rule). Palette untouched.
+         All-or-nothing: any bad string leaves the document as it was."
+        | parsed first one |
+        (rowsCollection isNil or: [ rowsCollection isEmpty ]) ifTrue: [ ^false ].
+        parsed := OrderedCollection new.
+        first := nil.
+        rowsCollection do: [ :rows |
+            one := self class parseRows: rows.
+            one isNil ifTrue: [ ^false ].
+            first isNil
+                ifTrue: [ first := one ]
+                ifFalse: [
+                    ((one at: 2) = (first at: 2) and: [ (one at: 3) = (first at: 3) ])
+                        ifFalse: [ ^false ] ].
+            parsed add: (one at: 1) ].
+        w := first at: 2. h := first at: 3.
+        frames := OrderedCollection new.
+        parsed do: [ :buf | frames add: buf ].
+        ^true
+    ]
+
+    "── the saved form: a sheet class ────────────────────────────────────"
+
+    SpriteDoc class >> validName: aString [
+        "A class name: leading uppercase letter, then letters/digits only."
+        (aString isNil or: [ aString isEmpty ]) ifTrue: [ ^false ].
+        (aString at: 1) isUppercase ifFalse: [ ^false ].
+        2 to: aString size do: [ :i |
+            (aString at: i) isLetterOrDigit ifFalse: [ ^false ] ].
+        ^true
+    ]
+
+    sheetSource [
+        "The whole sheet as class source. isSpriteSheet is the discovery
+         marker (the editor's Load menu sweeps for it); installOn: replays
+         the sheet onto a live pane with the same sends every shipped game
+         uses, so `ship := Ship installOn: pane` is the entire consumption
+         API. Palette entry 0 is skipped there — the engine discards index 0
+         (transparent), so its colour is display-only."
+        | out |
+        out := WriteStream on: String new.
+        out nextPutAll: '"SpriteSheet: '; nextPutAll: name;
+            nextPutAll: ' - WRITTEN BY THE SPRITE EDITOR (Tools menu). '.
+        out nextPutAll: w printString; nextPutAll: 'x'; nextPutAll: h printString;
+            nextPutAll: ', '; nextPutAll: frames size printString;
+            nextPutAll: (frames size = 1 ifTrue: [ ' frame' ] ifFalse: [ ' frames' ]).
+        out nextPutAll: '. Edit it here if you like - it is only source. In a game: '.
+        out nextPutAll: '| s | s := '; nextPutAll: name;
+            nextPutAll: ' installOn: pane. s moveTo: x y: y."'; nl.
+        out nextPutAll: 'Object subclass: '; nextPutAll: name; nextPutAll: ' ['; nl.
+        out nextPutAll: '    '; nextPutAll: name;
+            nextPutAll: ' class >> isSpriteSheet [ ^true ]'; nl.
+        out nextPutAll: '    '; nextPutAll: name;
+            nextPutAll: ' class >> frames ['; nl; nextPutAll: '        ^#('.
+        0 to: frames size - 1 do: [ :f |
+            out nextPutAll: ' '''; nextPutAll: (self rowsOf: f); nextPutAll: '''' ].
+        out nextPutAll: ' )'; nl; nextPutAll: '    ]'; nl.
+        out nextPutAll: '    '; nextPutAll: name;
+            nextPutAll: ' class >> palette ['; nl; nextPutAll: '        ^#('.
+        1 to: 16 do: [ :i |
+            | c |
+            c := pal at: i.
+            out nextPutAll: ' #('; nextPutAll: (c at: 1) printString;
+                nextPutAll: ' '; nextPutAll: (c at: 2) printString;
+                nextPutAll: ' '; nextPutAll: (c at: 3) printString;
+                nextPutAll: ')' ].
+        out nextPutAll: ' )'; nl; nextPutAll: '    ]'; nl.
+        out nextPutAll: '    '; nextPutAll: name;
+            nextPutAll: ' class >> installOn: aPane ['; nl.
+        out nextPutAll: '        | s |'; nl.
+        out nextPutAll: '        s := aPane defineSprite: self frames first.'; nl.
+        out nextPutAll: '        2 to: self frames size do: [ :i |'; nl.
+        out nextPutAll: '            s addFrame: (self frames at: i) ].'; nl.
+        out nextPutAll: '        1 to: 15 do: [ :i | | c |'; nl.
+        out nextPutAll: '            c := self palette at: i + 1.'; nl.
+        out nextPutAll: '            s colorAt: i r: (c at: 1) g: (c at: 2) b: (c at: 3) ].'; nl.
+        out nextPutAll: '        ^s'; nl.
+        out nextPutAll: '    ]'; nl.
+        out nextPutAll: ']'; nl.
+        ^out contents
+    ]
+
+    codeSnippet [
+        "The clipboard export: verbatim game code for someone not using a
+         sheet class — the raw defineSprite:/addFrame:/colorAt: calls."
+        | out |
+        out := WriteStream on: String new.
+        out nextPutAll: '| s |'; nl.
+        out nextPutAll: 's := pane defineSprite: '''; nextPutAll: (self rowsOf: 0);
+            nextPutAll: '''.'; nl.
+        1 to: frames size - 1 do: [ :f |
+            out nextPutAll: 's addFrame: '''; nextPutAll: (self rowsOf: f);
+                nextPutAll: '''.'; nl ].
+        1 to: 15 do: [ :i |
+            | c |
+            c := pal at: i + 1.
+            out nextPutAll: 's colorAt: '; nextPutAll: i printString;
+                nextPutAll: ' r: '; nextPutAll: (c at: 1) printString;
+                nextPutAll: ' g: '; nextPutAll: (c at: 2) printString;
+                nextPutAll: ' b: '; nextPutAll: (c at: 3) printString;
+                nextPutAll: '.'; nl ].
+        ^out contents
+    ]
+]
