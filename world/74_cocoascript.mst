@@ -287,7 +287,7 @@ Object subclass: CocoaScript [
             ifTrue: [ self defaultTimeLimitSeconds ]
             ifFalse: [ secs asNumber ].
         (secs isNil or: [ secs <= 0 ]) ifTrue: [ secs := self defaultTimeLimitSeconds ].
-        ^Time millisecondClock + (secs * 1000)
+        ^Time millisecondClockValue + (secs * 1000)
     ]
 
     CocoaScript class >> performEvaluateCommand: cmd [
@@ -309,16 +309,44 @@ Object subclass: CocoaScript [
         ^nil
     ]
 
+    "Syntax errors (design: a script sending unparseable source must get a
+     SCRIPT ERROR, never the error text as a value). The VM parses inside
+     prim_eval_doit and answers `parse error: ...` as the RESULT STRING, so
+     the conversion happens on the reply path in `resume:with:` below — one
+     round trip to the primary, then a proper script error.
+
+     A pre-flight check here would save that round trip and keep a bad source
+     out of the deadline table entirely, but it needs a PARSE-ONLY entry point
+     the VM does not expose today (prim_eval_doit always parses AND runs).
+     Adding one — `parse_top_items` behind its own primitive — is the honest
+     follow-up; inventing a `Compiler checkSyntax:` that does not exist would
+     just move the failure."
+
     "Resume a suspended command with its answer. One-shot: the entry is
      tombstoned first, so a later deadline sweep (or a duplicate reply) is a
      no-op rather than a second resume."
     CocoaScript class >> resume: key with: aString [
-        | entry cmd |
+        | entry cmd text |
         Suspended isNil ifTrue: [ ^self ].
         entry := Suspended at: key ifAbsent: [ nil ].
         entry isNil ifTrue: [ ^self ].
         Suspended at: key put: nil.
         cmd := entry at: 1.
+        "The primary answers a parse failure as the RESULT STRING
+         'parse error: ...' (prim_eval_doit). A script must see that as an
+         error, not as a value — matching the VM's own generated prefix, not
+         guest data."
+        text := aString isNil ifTrue: [ '' ] ifFalse: [ aString asString ].
+        "serveUiDoit: replies `result printString`, so a String result arrives
+         QUOTED — the marker is 'parse error:' with or without that leading
+         quote. (Matching the VM's own generated prefix, never guest data.)"
+        ((text startsWith: 'parse error:')
+            or: [ text startsWith: '''parse error:' ])
+            ifTrue: [
+                "Setting the error properties is not enough — a suspended
+                 command must still be RESUMED for AppleScript to raise it."
+                self errorOn: cmd number: -2741 message: 'evaluate: ' , text.
+                ^cmd send: 'resumeExecutionWithResult:' with: nil ].
         cmd send: 'resumeExecutionWithResult:' with: (Cocoa nsString: aString asString)
     ]
 
@@ -340,7 +368,7 @@ Object subclass: CocoaScript [
     CocoaScript class >> sweepDeadlines [
         | now expired |
         Suspended isNil ifTrue: [ ^self ].
-        now := Time millisecondClock.
+        now := Time millisecondClockValue.
         expired := nil.
         Suspended keysAndValuesDo: [ :k :v |
             v isNil ifFalse: [

@@ -948,12 +948,15 @@ fn app_delegate_instance() -> *mut c_void {
 macro_rules! script_command {
     ($fname:ident, $sel:literal) => {
         extern "C" fn $fname(this: *mut c_void, _cmd: *mut c_void) -> *mut c_void {
-            dispatch(
-                app_delegate_instance(),
-                $sel,
-                &[ArgVal::Id(this)],
-                RetShape::Id,
-            ) as *mut c_void
+            let del = app_delegate_instance();
+            let out = dispatch(del, $sel, &[ArgVal::Id(this)], RetShape::Id);
+            if std::env::var_os("MACVM_SCRIPT_TRACE").is_some() {
+                eprintln!(
+                    "[script] {} delegate={:?} cmd={:?} -> {:#x}",
+                    $sel, del, this, out
+                );
+            }
+            out as *mut c_void
         }
     };
 }
