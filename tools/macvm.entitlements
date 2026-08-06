@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- REQUIRED. MACVM is a JIT: it maps its code cache MAP_JIT and flips the
+       thread's W^X view with pthread_jit_write_protect_np (docs/arm64.md §2,
+       src/codecache/). Notarization requires the hardened runtime, and the
+       hardened runtime refuses MAP_JIT without this entitlement — so without
+       it the app signs, notarizes, launches, and then dies the moment a method
+       tiers up. There is no fallback: JitMode::Off is not a supported
+       configuration for the embedded VM. -->
+  <key>com.apple.security.cs.allow-jit</key>
+  <true/>
+
+  <!-- NOT set, deliberately — each would widen the attack surface for a
+       capability MACVM does not need under Developer ID distribution:
+
+       com.apple.security.cs.allow-unsigned-executable-memory
+         A blunter instrument than allow-jit; MAP_JIT is the sanctioned path
+         and is sufficient.
+
+       com.apple.security.cs.disable-library-validation
+         Would be needed only if the FFI tier dlopen'd unsigned third-party
+         dylibs. Tier 1 resolves through dlsym(RTLD_DEFAULT) against
+         already-loaded system images, which library validation permits.
+         Add it only if loading foreign dylibs becomes a supported feature,
+         and document why at that point.
+
+       com.apple.security.app-sandbox
+         Mac App Store only. Under Developer ID it would break the FFI tier
+         (guest syscalls hit kernel-level denials) for no distribution
+         benefit. See the App Store notes in tools/make-macapp.sh.
+
+       com.apple.security.network.server
+         The control channel (MACVM_COCOA_CTL) is off unless that variable is
+         set, and is a development affordance. If it is ever enabled by
+         default, this entitlement AND a review of the eval surface are
+         prerequisites. -->
+</dict>
+</plist>
