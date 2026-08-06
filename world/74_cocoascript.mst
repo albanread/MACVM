@@ -165,6 +165,92 @@ Object subclass: CocoaScript [
         ^self numberWith: (Worker pendingReplyCount > 0 ifTrue: [ 1 ] ifFalse: [ 0 ])
     ]
 
+    "── the commands (design §3) ─────────────────────────────────────────
+     Cocoa Scripting mints an NSScriptCommand per invocation and sends it
+     performDefaultImplementation; the Rust subclass hands the command here.
+     Each handler reads its own parameters off the command and answers the
+     verb's result — nil for the void verbs.
+
+     Failure is reported the way a script expects: `errorOn:number:message:`
+     sets the command's own script-error properties, which AppleScript raises
+     at the call site. That covers every failure these three verbs can
+     ANTICIPATE (an unknown class name, a missing path). An unexpected guest
+     error inside a handler is a separate mechanism — design §6.3, the
+     dispatch_callback message that is currently discarded — and until that
+     lands such a failure unwinds through the callback door and answers nil,
+     i.e. the verb silently does nothing. Anticipated failures below are
+     therefore checked explicitly rather than left to raise."
+
+    "Set the script error AppleScript will raise at the caller. -10000 is
+     errAEEventFailed, the general handler failure; the string is what the
+     user sees."
+    CocoaScript class >> errorOn: cmd number: n message: aString [
+        cmd send: 'setScriptErrorNumber:' args: (Array with: n) ret: #void.
+        cmd send: 'setScriptErrorString:'
+            args: (Array with: (Cocoa nsString: aString)) ret: #void.
+        ^nil
+    ]
+
+    "A named argument off the command`s evaluatedArguments, as a Smalltalk
+     String, or nil when the script omitted it."
+    CocoaScript class >> argument: aName of: cmd [
+        | args val |
+        args := cmd send: 'evaluatedArguments'.
+        args isNil ifTrue: [ ^nil ].
+        val := args send: 'objectForKey:' with: (Cocoa nsString: aName).
+        val isNil ifTrue: [ ^nil ].
+        ^val asString
+    ]
+
+    "browse <class name> [selector <sel>] — show it in the Browser."
+    CocoaScript class >> performBrowseCommand: cmd [
+        | name sel browser |
+        name := cmd sendString: 'directParameter'.
+        (name isNil or: [ name isEmpty ])
+            ifTrue: [ ^self errorOn: cmd number: -1701
+                           message: 'browse: no class name given' ].
+        (Worker classNamed: name asSymbol) isNil
+            ifTrue: [ ^self errorOn: cmd number: -1728
+                           message: 'browse: no class named ' , name ].
+        browser := Worker classNamed: #CocoaBrowser.
+        browser isNil
+            ifTrue: [ ^self errorOn: cmd number: -10000
+                           message: 'browse: the browser is not loaded' ].
+        CocoaUI switchToView: #browser.
+        browser selectClassNamed: name.
+        sel := self argument: 'selector' of: cmd.
+        sel isNil ifFalse: [ browser selectSelectorNamed: sel ].
+        ^nil
+    ]
+
+    "snapshot in <file> — write a PNG of the window."
+    CocoaScript class >> performSnapshotCommand: cmd [
+        | url path |
+        url := (cmd send: 'evaluatedArguments')
+                   ifNil: [ nil ]
+                   ifNotNil: [ :a | a send: 'objectForKey:'
+                                      with: (Cocoa nsString: 'file') ].
+        url isNil
+            ifTrue: [ ^self errorOn: cmd number: -1701
+                           message: 'snapshot: no destination given' ].
+        "An AppleScript `file`/`POSIX file` arrives as an NSURL; `path` is its
+         POSIX form. A plain string would answer nil here, so fall back to
+         reading the object itself as text."
+        path := url sendString: 'path'.
+        (path isNil or: [ path isEmpty ]) ifTrue: [ path := url asString ].
+        (path isNil or: [ path isEmpty ])
+            ifTrue: [ ^self errorOn: cmd number: -1701
+                           message: 'snapshot: could not read the destination path' ].
+        CocoaUI snapshotTo: path.
+        ^nil
+    ]
+
+    "clear transcript — empty the log."
+    CocoaScript class >> performClearTranscriptCommand: cmd [
+        CocoaUI clearTranscript.
+        ^nil
+    ]
+
     "── app-level delegate behaviour ─────────────────────────────────────
      Absorbed from the cocoa_gui-side delegate this role displaces: closing
      the last window quits the app, rather than leaving a headless process

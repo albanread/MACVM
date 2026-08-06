@@ -527,12 +527,24 @@ type AddMethod = unsafe extern "C" fn(*mut c_void, *mut c_void, *const c_void, *
 /// exactly `methods` (each `(selector, IMP, @encode types)`), once. `None` on a
 /// missing runtime symbol or a name collision (a prior registration owns it).
 fn register_class(name: &str, methods: &[(&str, *const c_void, &str)]) -> Option<*mut c_void> {
+    register_class_under("NSObject", name, methods)
+}
+
+/// `register_class` with an explicit superclass — scripting's
+/// `NSScriptCommand` subclasses (design §6.2) are the reason this is a
+/// parameter: everything else here is a plain `NSObject` delegate.
+fn register_class_under(
+    superclass_name: &str,
+    name: &str,
+    methods: &[(&str, *const c_void, &str)],
+) -> Option<*mut c_void> {
     let alloc_pair = dlsym("objc_allocateClassPair")?;
     let register_pair = dlsym("objc_registerClassPair")?;
     let add_method = dlsym("class_addMethod")?;
     // NSObject is never AppKit-guarded, so `class_named` resolves it on any
-    // thread even under the CG2 Cocoa-mode guard.
-    let superclass = crate::runtime::objc_bridge::class_named("NSObject")?;
+    // thread even under the CG2 Cocoa-mode guard. NSScriptCommand likewise
+    // lives in Foundation.
+    let superclass = crate::runtime::objc_bridge::class_named(superclass_name)?;
     let cname = CString::new(name).ok()?;
     let cls =
         unsafe { std::mem::transmute::<u64, AllocPair>(alloc_pair)(superclass, cname.as_ptr(), 0) };
@@ -896,11 +908,104 @@ fn app_delegate_class() -> Option<*mut c_void> {
         .map(|p| p as *mut c_void)
 }
 
+
+// ── scripting commands (design §3, §6.2) ────────────────────────────────────
+//
+// Each verb in the sdef names an `NSScriptCommand` subclass; Cocoa Scripting
+// instantiates one PER INVOCATION and sends it `performDefaultImplementation`.
+//
+// That transience is why these cannot use the per-instance delegate registry
+// the roles above rely on: a fresh command object was never minted by
+// `new_delegate` and so has no ticket. They route instead through **NSApp's
+// delegate** — which IS a registered `#app`-role instance — and hand the
+// command object across as an ordinary argument, so the world can read its
+// parameters and set its script-error properties through the bridge. One
+// consequence worth stating: a command sent before `CocoaScript install` has
+// run finds the pre-world delegate, fails the registry lookup, and answers nil
+// — a script error, never a crash.
+
+/// `[[NSApplication sharedApplication] delegate]` — the `#app`-role instance
+/// serving this process, or NULL before the world installs one. Main-thread
+/// only, which every Apple Event dispatch already is.
+fn app_delegate_instance() -> *mut c_void {
+    use crate::runtime::objc_bridge::{class_named, try_send};
+    let nil = std::ptr::null_mut();
+    let Some(cls) = class_named("NSApplication") else {
+        return nil;
+    };
+    let Ok(app) = try_send(cls, "sharedApplication", nil, nil) else {
+        return nil;
+    };
+    if app.is_null() {
+        return nil;
+    }
+    try_send(app, "delegate", nil, nil).unwrap_or(nil)
+}
+
+/// One command's `performDefaultImplementation`: hand the command itself to
+/// the world under `$sel`. The world answers the command's result (an id —
+/// text for a value-answering verb, nil for a void one).
+macro_rules! script_command {
+    ($fname:ident, $sel:literal) => {
+        extern "C" fn $fname(this: *mut c_void, _cmd: *mut c_void) -> *mut c_void {
+            dispatch(
+                app_delegate_instance(),
+                $sel,
+                &[ArgVal::Id(this)],
+                RetShape::Id,
+            ) as *mut c_void
+        }
+    };
+}
+
+script_command!(imp_perform_browse, "performBrowseCommand:");
+script_command!(imp_perform_snapshot, "performSnapshotCommand:");
+script_command!(imp_perform_clear_transcript, "performClearTranscriptCommand:");
+
+static SCRIPT_COMMAND_CLASSES: OnceLock<()> = OnceLock::new();
+
+/// Register the `NSScriptCommand` subclasses the sdef names. Idempotent, and
+/// called from `CocoaScript install` (via `register_script_commands`) rather
+/// than lazily, because Cocoa Scripting resolves the class by NAME out of the
+/// sdef the first time a script sends the verb — it must already exist.
+pub fn register_script_commands() -> bool {
+    SCRIPT_COMMAND_CLASSES.get_or_init(|| {
+        for (name, imp) in [
+            (
+                "MacvmBrowseCommand",
+                imp_ptr!(imp_perform_browse, ImpId0),
+            ),
+            (
+                "MacvmSnapshotCommand",
+                imp_ptr!(imp_perform_snapshot, ImpId0),
+            ),
+            (
+                "MacvmClearTranscriptCommand",
+                imp_ptr!(imp_perform_clear_transcript, ImpId0),
+            ),
+        ] {
+            register_class_under(
+                "NSScriptCommand",
+                name,
+                &[("performDefaultImplementation", imp, "@@:")],
+            );
+        }
+    });
+    crate::runtime::objc_bridge::class_named("MacvmBrowseCommand").is_some()
+}
+
 /// The role symbol (`#window`/`#text`/`#table`/`#outline`/`#action`) → its
 /// registered delegate class. `None` for an unknown role.
 fn role_class(role: &str) -> Option<*mut c_void> {
     match role {
-        "app" => app_delegate_class(),
+        // Installing the app delegate is also when the scripting command
+        // classes must exist (Cocoa Scripting resolves them by name on the
+        // first verb), so the two happen together — one world-side `install`
+        // makes the whole surface live.
+        "app" => {
+            register_script_commands();
+            app_delegate_class()
+        }
         "window" => window_delegate_class(),
         "text" => text_delegate_class(),
         "table" => table_source_class(),

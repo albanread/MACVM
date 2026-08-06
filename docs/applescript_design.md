@@ -547,6 +547,42 @@ correctly: a delegate that over-claimed would have broken `name` and
 `version`. The `-10000` errors from stage 1a are gone; `evaluate` still
 answers `-1717` until stage 2/3 register the command classes.
 
+**Stage 2 landed and verified (2026-08-06)** — the synchronous commands:
+
+| script | result |
+|---|---|
+| `clear transcript` then `get transcript` | empty — it really cleared |
+| `browse "Integer"` then `get current view` | `browser` — pane switched, class selected |
+| `browse "Integer" selector "printOn:"` | ok (the optional parameter path) |
+| `snapshot in POSIX file "/tmp/x.png"` | a real 2200×1568 PNG |
+| `browse "Nonesuch"` | **script error: `browse: no class named Nonesuch`** |
+
+`register_class` grew a superclass parameter (`register_class_under`), and
+three `NSScriptCommand` subclasses now carry `performDefaultImplementation`.
+
+**The transience problem, and how it is solved.** Cocoa Scripting mints a
+command object *per invocation*, so a command is never a `new_delegate`
+instance and has no ticket — the per-instance registry every other role uses
+cannot resolve it. The commands therefore route through **NSApp's delegate**
+(which *is* a registered `#app` instance) and pass the command across as an
+ordinary argument, so the world reads its parameters and sets its script-error
+properties through the bridge. No new global, no new primitive, and it ties the
+verbs to the same world receiver that serves the properties. A verb sent before
+`CocoaScript install` finds the pre-world delegate, misses the registry, and
+answers nil — a script error, never a crash. Registering the command classes
+is folded into the `#app` role's own registration, since Cocoa Scripting
+resolves them by name on the first verb and they must already exist.
+
+**§6.3 is only half-shipped, deliberately.** Every failure these three verbs
+can *anticipate* — an unknown class name, a missing destination — is checked
+explicitly and reported with `setScriptErrorNumber:`/`setScriptErrorString:`
+straight from the world, which is the mechanism §6.3 itself says such failures
+want. What is NOT yet done is the *unexpected* case: a guest error raised
+inside a handler still unwinds through `dispatch_callback`, whose message is
+discarded, so the verb silently does nothing instead of reporting. That is the
+`embed.rs` change §6.3 describes, and it is now the one piece of stage 2 still
+outstanding.
+
 Each stage is independently shippable, and each has a mechanical gate:
 Script Editor's dictionary viewer renders the terminology; `sdef
 "dist/macVM.app" | sdp -fh --basename macVM` round-trips the file;
