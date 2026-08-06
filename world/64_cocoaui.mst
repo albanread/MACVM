@@ -1277,7 +1277,7 @@ Object subclass: CocoaUI [
     ]
 
     CocoaUI class >> buildTranscriptIn: ignored [
-        | tvClass frame w scrollH colorClass boxClass content |
+        | tvClass frame w scrollH colorClass boxClass content dockH |
         "Ignores the window's content view: the dock is a pane of the split
          view now, and everything below is placed inside THAT."
         content := TranscriptDock.
@@ -1286,12 +1286,16 @@ Object subclass: CocoaUI [
         boxClass := Cocoa classNamed: 'NSBox'.
         frame := content onMain frame.
         w := frame at: 3.
+        dockH := frame at: 4.
 
         "The grain strip behind the Clear button — same texture as the
          toolbar, so the transcript dock's control bar isn't a blank sheet
          either. Added FIRST so the divider + Clear button render on top."
+        "Positions come from the DOCK'S OWN height, not the transcriptHeight
+         constant: the dock is built at whatever height was remembered, so a
+         constant here left the strip floating mid-pane with a gap above it."
         TranscriptGrain := self addTexturedBoxFrame:
-            (Array with: 0.0 with: self transcriptHeight - self transcriptStripHeight
+            (Array with: 0.0 with: dockH - self transcriptStripHeight
                    with: w with: self transcriptStripHeight)
             resize: self maskWidthSizable + self maskMinYMargin
             in: content.
@@ -1303,7 +1307,7 @@ Object subclass: CocoaUI [
         "A thin strip for the Clear button, just below the divider — same
          'controls above content' shape CocoaCanvas/CocoaFind already use."
         TranscriptClearBtn := self stripButton: 'Clear'
-            frame: (Array with: w - 54.0 with: self transcriptHeight - self transcriptStripHeight
+            frame: (Array with: w - 54.0 with: dockH - self transcriptStripHeight
                           with: 48.0 with: 18.0)
             action: [ self clearTranscript ]
             in: content.
@@ -1315,7 +1319,7 @@ Object subclass: CocoaUI [
          strip itself never hides, so there is always something to click to
          get the log back (a dock that vanishes entirely is a support call)."
         TranscriptToggleBtn := self stripButton: self transcriptToggleTitle
-            frame: (Array with: 6.0 with: self transcriptHeight - self transcriptStripHeight
+            frame: (Array with: 6.0 with: dockH - self transcriptStripHeight
                           with: 24.0 with: 18.0)
             action: [ self toggleTranscript ]
             in: content.
@@ -1324,7 +1328,7 @@ Object subclass: CocoaUI [
         "Scroll-wrapped: a BARE NSTextView draws past its frame when the text
          outgrows it — long transcripts bled UP over the content view (the
          CG7 'mess' screenshots). The scroll view clips and scrolls."
-        scrollH := self transcriptHeight - self transcriptStripHeight.
+        scrollH := dockH - self transcriptStripHeight.
         TranscriptScroll := ((Cocoa classNamed: 'NSScrollView') onMain alloc) onMain
             initWithFrame: (Array with: 0.0 with: 0.0 with: w with: scrollH).
         TranscriptScroll onMain setHasVerticalScroller: true.
