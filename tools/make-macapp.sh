@@ -54,12 +54,14 @@ make_icns() {   # $1 = source png, $2 = out.icns
 }
 
 build_one() {
-  local mode="$1" crate binname appname bundleid iconpng
+  local mode="$1" crate binname appname bundleid iconpng sdef
   case "$mode" in
     cocoa) crate="cocoa_gui"; binname="macvm-cocoa"; appname="macVM"
-           bundleid="com.macvm.cocoa"; iconpng="$ROOT/tools/app-icon-cocoa.png" ;;
+           bundleid="com.macvm.cocoa"; iconpng="$ROOT/tools/app-icon-cocoa.png"
+           sdef="$ROOT/tools/macVM.sdef" ;;
     web)   crate="macvm-gui"; binname="macvm-gui";   appname="macVM Web"
-           bundleid="com.macvm.web";   iconpng="$ROOT/tools/app-icon-web.png" ;;
+           bundleid="com.macvm.web";   iconpng="$ROOT/tools/app-icon-web.png"
+           sdef="" ;;
     *) echo "unknown mode: $mode" >&2; return 2 ;;
   esac
 
@@ -90,6 +92,19 @@ build_one() {
   cp "$ROOT/docs/macvm_help.md" "$APP/Contents/Resources/payload/docs/macvm_help.md"
   echo "$VERSION" > "$APP/Contents/Resources/payload/.version"
 
+  # --- scripting terminology (docs/applescript_design.md) ---
+  # Gated, not just copied: the `view` enumerators encode the LIVE registration
+  # order, and a compiled AppleScript stores the four-char code rather than the
+  # name — so a reorder silently breaks every saved script. Fail the build.
+  local script_keys=""
+  if [ -n "$sdef" ]; then
+    "$ROOT/tools/check-sdef-parity.py" --world "$ROOT/world" --sdef "$sdef" \
+      | sed 's/^/    /'
+    cp "$sdef" "$APP/Contents/Resources/macVM.sdef"
+    script_keys='  <key>NSAppleScriptEnabled</key><true/>
+  <key>OSAScriptingDefinition</key><string>macVM.sdef</string>'
+  fi
+
   # --- icon + Info.plist ---
   make_icns "$iconpng" "$APP/Contents/Resources/appicon.icns"
   cat > "$APP/Contents/Info.plist" <<PLIST
@@ -111,6 +126,7 @@ build_one() {
   <key>NSPrincipalClass</key><string>NSApplication</string>
   <key>LSApplicationCategoryType</key><string>public.app-category.developer-tools</string>
   <key>NSHumanReadableCopyright</key><string>© Alban Read 2026</string>
+$script_keys
 </dict>
 </plist>
 PLIST

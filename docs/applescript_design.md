@@ -76,6 +76,14 @@ table lists the ID half.
 | class | Smalltalk class | `MvCl` |
 | class | Smalltalk method | `MvMe` |
 
+Command *parameters* carry codes too, assigned when the sdef was written:
+
+| Command | Parameter | Code |
+|---|---|---|
+| evaluate | `time limit` | `MvTl` |
+| browse | `selector` | `MvSl` |
+| snapshot | `in` | `MvIn` |
+
 Enumerators carry codes of their own, and those codes are what a compiled
 script *stores* — Script Editor decompiles `MvV1` back to `browser`
 through the dictionary. That makes them append-only: renumbering breaks
@@ -97,6 +105,14 @@ scripting support with zero macVM code:
 <xi:include href="file:///System/Library/ScriptingDefinitions/CocoaStandard.sdef"
             xpointer="xpointer(/dictionary/suite)"/>
 ```
+
+**Correction from implementation (2026-08-06):** an earlier draft of this
+section gave the namespace as `.../2003/XInclude`. It is **2001** —
+`/System/Library/DTDs/sdef.dtd` declares `xmlns:xi CDATA #FIXED
+'http://www.w3.org/2001/XInclude'`, so 2003 is not DTD-valid. The 2003
+spelling does appear in shipping Apple sdefs (Mail's, for one) and works,
+because the runtime processor does not validate — but it forfeits
+`xmllint --valid` as a gate for no benefit.
 
 The cost is dictionary noise: Script Editor will also show document verbs
 (`open`, `save`, `print`) a document-less app cannot honour. Nearly every
@@ -447,6 +463,28 @@ Recommended follow-ups, out of scope here but noted so they are not lost:
    resume guard, the beat-loop deadline list, and the
    `uiDoit:onReply:onError:` reply discriminator (§5).
 4. Phase 2 object model (§7), if it earns its way.
+
+**Landed 2026-08-06 (stage 1, first half):** [`tools/macVM.sdef`](tools/macVM.sdef)
+— the whole vocabulary above, `sdp`-clean; [`tools/check-sdef-parity.py`](tools/check-sdef-parity.py)
+— the §4 parity gate; and `make-macapp.sh` installs the sdef into
+`Contents/Resources/` and sets both Info.plist keys, for the cocoa app only
+(the web app gets neither). The `#app` role is **not** implemented yet, so
+the Standard Suite works (`quit`, `bounds of window 1`, `name`, `version`)
+while every macVM-Suite verb and property answers *"doesn't understand"*
+until it lands. Two notes from building it:
+
+- The parity gate reads the *registration sequence* out of `CocoaUI class >>
+  startup` statically rather than booting the world headless as this document
+  first proposed — `Views` is populated only under Cocoa, so there is no
+  headless registry to read. The order it recovers (workspace, browser,
+  browser2, find, editor, outliner, canvas, help, debugger) independently
+  confirms §2's table, and swapping two enumerators does make the gate fail.
+- **`sdp -fh` does not merge `class-extension` members into the extended
+  class**, so the generated header shows the four commands but none of the
+  six properties. That is an `sdp` limitation, not a defect in the file:
+  Calendar's own sdef loses its `class-extension` element the same way. Read
+  the round-trip gate below as a *parse* check; the dictionary viewer (or
+  `sdef` on the built app) is what shows the properties.
 
 Each stage is independently shippable, and each has a mechanical gate:
 Script Editor's dictionary viewer renders the terminology; `sdef

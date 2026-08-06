@@ -1,0 +1,127 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE dictionary SYSTEM "file://localhost/System/Library/DTDs/sdef.dtd">
+
+<!--
+  macVM — Apple Event vocabulary.  Design + rationale: docs/applescript_design.md.
+
+  Codes are append-only: a compiled script stores the four-character code, not
+  the name, so renumbering an enumerator silently breaks every saved script.
+  Add at the end; retire a code forever rather than reusing it.
+
+  The view enumerators mirror the LIVE registration order in
+  `CocoaUI class >> start` (world/64_cocoaui.mst) — workspace first, then each
+  view class's own `register`.  `tools/check-sdef-parity.py` fails the build
+  when this file and that order drift apart.
+-->
+
+<dictionary title="macVM Terminology" xmlns:xi="http://www.w3.org/2001/XInclude">
+
+  <!-- quit, get, set, count, exists, and the `window` class (so `bounds of
+       window 1` works against AppKit's own scripting support with no macVM
+       code).  Cost: Script Editor also shows document verbs a document-less
+       app cannot honour — the ordinary trade, accepted (design §2). -->
+  <xi:include href="file:///System/Library/ScriptingDefinitions/CocoaStandard.sdef"
+              xpointer="xpointer(/dictionary/suite)"/>
+
+  <suite name="macVM Suite" code="MvSu"
+         description="Scripting a live Smalltalk image.">
+
+    <!-- ── enumerations ────────────────────────────────────────────────── -->
+
+    <enumeration name="view" code="MvVw"
+                 description="The panes macVM can show.">
+      <enumerator name="workspace" code="MvV0" description="The Workspace."/>
+      <enumerator name="browser"   code="MvV1" description="The class browser."/>
+      <enumerator name="browser2"  code="MvV2" description="The V2 class browser."/>
+      <enumerator name="find"      code="MvV3" description="The find tools."/>
+      <enumerator name="editor"    code="MvV4" description="The whole-class editor."/>
+      <enumerator name="outliner"  code="MvV5" description="The live outliner."/>
+      <enumerator name="canvas"    code="MvV6" description="The drawing canvas."/>
+      <enumerator name="help"      code="MvV7" description="The documentation pane."/>
+      <enumerator name="debugger"  code="MvV8" description="The debugger."/>
+    </enumeration>
+
+    <enumeration name="appearance" code="MvAe"
+                 description="Light/dark appearance, application-wide.">
+      <enumerator name="system" code="MvA0" description="Follow the system setting."/>
+      <enumerator name="light"  code="MvA1" description="Always light."/>
+      <enumerator name="dark"   code="MvA2" description="Always dark."/>
+    </enumeration>
+
+    <!-- ── the application object ──────────────────────────────────────── -->
+
+    <class-extension extends="application" description="The macVM application.">
+      <cocoa class="NSApplication"/>
+
+      <property name="current view" code="MvCv" type="view" access="rw"
+                description="The pane on screen.  Setting it moves the toolbar selection too.">
+        <cocoa key="scriptCurrentView"/>
+      </property>
+
+      <property name="appearance" code="MvAp" type="appearance" access="rw"
+                description="Light, dark, or follow the system.  Persists across launches.">
+        <cocoa key="scriptAppearance"/>
+      </property>
+
+      <property name="transcript" code="MvTr" type="text" access="r"
+                description="The whole transcript log, newest line first.">
+        <cocoa key="scriptTranscript"/>
+      </property>
+
+      <property name="workspace text" code="MvWt" type="text" access="rw"
+                description="The Workspace buffer.  Setting it re-syntax-colours the text.">
+        <cocoa key="scriptWorkspaceText"/>
+      </property>
+
+      <property name="transcript collapsed" code="MvTc" type="boolean" access="rw"
+                description="Whether the transcript dock is collapsed.">
+        <cocoa key="scriptTranscriptCollapsed"/>
+      </property>
+
+      <property name="busy" code="MvBs" type="boolean" access="r"
+                description="True while the Smalltalk image is evaluating something.">
+        <cocoa key="scriptBusy"/>
+      </property>
+    </class-extension>
+
+    <!-- ── commands ────────────────────────────────────────────────────── -->
+
+    <command name="evaluate" code="MvSuMvEv"
+             description="Evaluate Smalltalk source and answer its printString.">
+      <cocoa class="MacvmEvaluateCommand"/>
+      <direct-parameter type="text"
+                        description="Smalltalk source, e.g. &quot;3 + 4&quot;."/>
+      <parameter name="time limit" code="MvTl" type="integer" optional="yes"
+                 description="Seconds to wait before failing with a script error (default 60).  Not &quot;timeout&quot; — that is an AppleScript reserved word.">
+        <cocoa key="timeLimit"/>
+      </parameter>
+      <result type="text"
+              description="The printString of the result.  A Smalltalk error becomes a script error, not a result."/>
+    </command>
+
+    <command name="browse" code="MvSuMvBr"
+             description="Show a class (and optionally one of its methods) in the browser.">
+      <cocoa class="MacvmBrowseCommand"/>
+      <direct-parameter type="text" description="A class name, e.g. &quot;Integer&quot;."/>
+      <parameter name="selector" code="MvSl" type="text" optional="yes"
+                 description="A method selector to select, e.g. &quot;printOn:&quot;.">
+        <cocoa key="selector"/>
+      </parameter>
+    </command>
+
+    <command name="snapshot" code="MvSuMvSn"
+             description="Write a PNG of the macVM window.  Note: under a forced light or dark appearance the titlebar chrome does not re-render faithfully offscreen.">
+      <cocoa class="MacvmSnapshotCommand"/>
+      <parameter name="in" code="MvIn" type="file"
+                 description="Where to write the PNG.">
+        <cocoa key="file"/>
+      </parameter>
+    </command>
+
+    <command name="clear transcript" code="MvSuMvCT"
+             description="Empty the transcript log.">
+      <cocoa class="MacvmClearTranscriptCommand"/>
+    </command>
+
+  </suite>
+</dictionary>
