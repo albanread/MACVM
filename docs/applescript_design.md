@@ -583,6 +583,48 @@ discarded, so the verb silently does nothing instead of reporting. That is the
 `embed.rs` change §6.3 describes, and it is now the one piece of stage 2 still
 outstanding.
 
+### OPEN, and serious: a runtime error in `evaluate` takes the app down
+
+**Status 2026-08-06: a live defect, not a rough edge.** `evaluate "3 + "`
+(syntax) correctly raises a script error. `evaluate "1/0"` (runtime) does
+not: it returns nothing for 90s in my measurement, and on this machine it
+**killed the application**.
+
+Mechanism, as far as it is established:
+
+* `serveUiDoit:` sends **no reply at all** when a doit raises — its own
+  documented contract ("a raise inside the doit unwinds the whole dispatch
+  and sends no reply").
+* So nothing resumes the suspended command. The §5 deadline exists exactly
+  for this, but it is swept by `CocoaUI updateMetricsMem:…` on the ~4 Hz
+  beat — which is driven by the *primary's* beat loop. If the primary is
+  gone, **the sweep dies with the thing it was supposed to protect against**.
+  That is a design flaw in the deadline, not just a missing reply: the
+  watchdog must be independent of the process it watches.
+* `primary_generation_main`'s own doc says a recoverable error
+  (`ErrorPolicy::Resume`) merely surfaces as an `Err` from the beat and
+  serving continues, while a *fatal* doit `pthread_exit`s the thread after
+  posting `Died` for the watchdog to respawn. Which of those `1/0` takes,
+  and why the app did not survive it, is the next thing to establish.
+
+This raises the priority of §5's reply discriminator from ergonomics to
+correctness: **any script can currently crash macVM with one bad
+expression**, and a scripting surface whose failure mode is "kill the app"
+is worse than no scripting surface. The fix has three parts, in order:
+
+1. **An error reply.** MACVM has no exception system, so the world cannot
+   catch this — the recovery is Rust-side, where the message already exists
+   and is discarded (`take_last_guest_fatal_message`, §6.3). The primary's
+   dispatch must, on recovering, send a reply carrying the message, so
+   `uiDoit:onReply:onError:` has something to discriminate on.
+2. **A deadline that does not share fate with the primary.** Sweeping from
+   a beat the primary drives cannot survive the primary dying.
+3. **Only then** the ergonomics: `evaluate "1/0"` raising
+   `error number -10000` with the guest's own message.
+
+Until (1) and (2) land, `evaluate` should be considered safe for
+well-formed expressions only. Syntax is checked; semantics are not.
+
 Each stage is independently shippable, and each has a mechanical gate:
 Script Editor's dictionary viewer renders the terminology; `sdef
 "dist/macVM.app" | sdp -fh --basename macVM` round-trips the file;
