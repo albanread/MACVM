@@ -1781,9 +1781,14 @@ Object subclass: CocoaUI [
      querying item state (toolbarItemNamed:, appearanceMenuItemFor:), and
      snapshot under #system when you need to SEE it."
     CocoaUI class >> snapshotTo: aPath [
+        ^self snapshotWindow: Win to: aPath
+    ]
+    "Same capture for ANY window we own (the asset editors' gates snapshot
+     their own windows through this)."
+    CocoaUI class >> snapshotWindow: aWindow to: aPath [
         | view rect rep data |
-        Win isNil ifTrue: [ ^self ].
-        view := (Win onMain contentView) onMain superview.
+        aWindow isNil ifTrue: [ ^self ].
+        view := (aWindow onMain contentView) onMain superview.
         rect := view onMain bounds.
         rep := view onMain bitmapImageRepForCachingDisplayInRect: rect.
         rep isNil ifTrue: [ ^self ].

@@ -1,18 +1,29 @@
 "76_spriteed.mst — the Sprite Editor window (docs/asset_editors_design.md).
  A utility window, summoned by Tools ▸ Sprite Editor…, that graphically edits
  the 16-colour hex-row sprites GamePane renders and saves them as sheet
- classes in the image. This file is the WINDOW (UI worker, Cocoa bridge);
- the pure document model is SpriteDoc (world/44_spritedoc.mst, world list,
- headless-testable).
+ classes in the image. This file is only the Cocoa face; the document is
+ SpriteDoc (world/44a_spritedoc.mst, world list, headless-tested) and the
+ window computes nothing itself.
 
- Stage 1 (this file's first landing): the window skeleton — fixed size,
- hide-on-close via the #window delegate role, reopened by the menu item.
- Painting (S3), the engine preview (S4) and persistence (S5) build into it."
+ Surfaces are NSImageViews fed by full RGBA base64 blasts through the canvas
+ host verb (showCanvasPixelsOn:base64:width:height: — the CocoaCanvas path);
+ mouse painting is NSClick/NSPanGestureRecognizers targeted at
+ CocoaSenderAction delegates, whose blocks ask the recognizer itself for
+ locationInView: (the reason that 1-arg holder exists). Blast, don't patch:
+ every edit redraws the whole grid image from the model."
 Object subclass: CocoaSpriteEditor [
-    <classVars: Win WinDelegate Delegates StatusLabel Doc>
+    <classVars: Win WinDelegate Delegates StatusLabel
+                Doc CurFrame SelColor Tool
+                GridView SwatchView
+                NameField WField HField
+                RSlider GSlider BSlider RGBLabel
+                FrameLabel ToolButtons>
 
     CocoaSpriteEditor class >> windowWidth [ ^980.0 ]
     CocoaSpriteEditor class >> windowHeight [ ^560.0 ]
+    CocoaSpriteEditor class >> gridBox [ ^432 ]
+    CocoaSpriteEditor class >> gridLeft [ ^16.0 ]
+    CocoaSpriteEditor class >> gridTop [ ^492.0 ]
 
     "── open / hide ──────────────────────────────────────────────────────"
 
@@ -27,8 +38,8 @@ Object subclass: CocoaSpriteEditor [
     ]
 
     CocoaSpriteEditor class >> windowShouldClose: sender [
-        "The red button HIDES (MACDART's editors chose the same): the doc,
-         palette and preview state all survive to the next Tools-menu summon.
+        "The red button HIDES (MACDART's editors chose the same): doc,
+         palette and tool state all survive to the next Tools-menu summon.
          Answer false so AppKit never actually closes."
         Win isNil ifFalse: [ Win onMain orderOut: nil ].
         ^false
@@ -39,11 +50,13 @@ Object subclass: CocoaSpriteEditor [
     CocoaSpriteEditor class >> buildWindow [
         | winClass content |
         Delegates := OrderedCollection new.
+        Doc := SpriteDoc new.
+        CurFrame := 0. SelColor := 15. Tool := #pencil.
         winClass := Cocoa classNamed: 'NSWindow'.
-        "styleMask 15 = titled|closable|miniaturizable|resizable minus
-         resizable is 7: the layout is fixed (design §4), so no resize."
+        "styleMask 7 = titled|closable|miniaturizable: the layout is fixed
+         (design §4), so no resizable bit."
         Win := ((winClass onMain alloc) onMain
-            initWithContentRect: (Array with: 320.0 with: 240.0
+            initWithContentRect: (Array with: 320.0 with: 200.0
                                         with: self windowWidth with: self windowHeight)
             styleMask: 7 backing: 2 defer: false).
         Win onMain setReleasedWhenClosed: false.
@@ -53,23 +66,416 @@ Object subclass: CocoaSpriteEditor [
         content := Win onMain contentView.
         content onMain setAutoresizesSubviews: true.
         self buildStatusIn: content.
-        self setStatus: 'sprite editor — stage 1 skeleton (painting lands in stage 3)'.
+        self buildGridIn: content.
+        self buildToolsRowIn: content.
+        self buildNameRowIn: content.
+        self buildSwatchesIn: content.
+        self buildSlidersIn: content.
+        self buildFrameRowIn: content.
+        self repaintAll.
+        self setStatus: 'new 16x16 sprite — pencil paints colour 15; . is transparent'.
     ]
 
     CocoaSpriteEditor class >> buildStatusIn: content [
-        "The status line along the bottom — every stage reports here."
-        StatusLabel := ((Cocoa classNamed: 'NSTextField') onMain alloc) onMain
-            initWithFrame: (Array with: 8.0 with: 6.0
-                                  with: self windowWidth - 16.0 with: 16.0).
-        StatusLabel onMain setEditable: false.
-        StatusLabel onMain setBordered: false.
-        StatusLabel onMain setDrawsBackground: false.
-        StatusLabel onMain setSelectable: false.
-        StatusLabel onMain setFont:
-            ((Cocoa classNamed: 'NSFont') onMain systemFontOfSize: 11.0).
+        StatusLabel := self label: '' frame: (Array with: 16.0 with: 4.0
+                                                    with: self windowWidth - 32.0 with: 16.0)
+                            in: content.
         StatusLabel onMain setTextColor:
             (Cocoa classNamed: 'NSColor') onMain secondaryLabelColor.
-        content onMain addSubview: StatusLabel.
+    ]
+
+    "── small control factories (the CocoaCanvas idiom) ──────────────────"
+
+    CocoaSpriteEditor class >> label: aString frame: rect in: parent [
+        | l |
+        l := ((Cocoa classNamed: 'NSTextField') onMain alloc) onMain
+            initWithFrame: rect.
+        l onMain setEditable: false. l onMain setBordered: false.
+        l onMain setDrawsBackground: false. l onMain setSelectable: false.
+        l onMain setFont: ((Cocoa classNamed: 'NSFont') onMain systemFontOfSize: 11.0).
+        l onMain setStringValue: aString.
+        parent onMain addSubview: l.
+        ^l
+    ]
+
+    CocoaSpriteEditor class >> button: title frame: rect action: aBlock in: parent [
+        | btn holder delegate |
+        btn := ((Cocoa classNamed: 'NSButton') onMain alloc) onMain initWithFrame: rect.
+        btn onMain setTitle: title.
+        btn onMain setBezelStyle: 1.
+        holder := CocoaToolbarAction on: aBlock.
+        delegate := MacvmDelegate actionTargetOn: holder.
+        btn onMain setTarget: delegate.
+        btn onMain setAction: 'macvmAction:'.
+        Delegates add: delegate.
+        parent onMain addSubview: btn.
+        ^btn
+    ]
+
+    CocoaSpriteEditor class >> field: aString frame: rect in: parent [
+        | f |
+        f := ((Cocoa classNamed: 'NSTextField') onMain alloc) onMain
+            initWithFrame: rect.
+        f onMain setStringValue: aString.
+        parent onMain addSubview: f.
+        ^f
+    ]
+
+    CocoaSpriteEditor class >> recognizer: className on: aView handler: aBlock [
+        "A gesture recognizer wired like every button: target = an action
+         delegate, action = macvmAction:. The 1-arg holder passes the
+         RECOGNIZER through, so the handler can ask it where the pointer is.
+         setAction: takes the selector as a String — the bridge marshals by
+         the property's own SEL type, exactly as the buttons prove daily."
+        | gr holder delegate |
+        gr := ((Cocoa classNamed: className) onMain alloc) onMain init.
+        holder := CocoaSenderAction on: aBlock.
+        delegate := MacvmDelegate actionTargetOn: holder.
+        gr onMain setTarget: delegate.
+        gr onMain setAction: 'macvmAction:'.
+        Delegates add: delegate.
+        aView onMain addGestureRecognizer: gr.
+        ^gr
+    ]
+
+    "── the paint grid ───────────────────────────────────────────────────"
+
+    CocoaSpriteEditor class >> cellSize [
+        ^(self gridBox // (Doc width max: Doc height)) max: 1
+    ]
+    CocoaSpriteEditor class >> gridPixelWidth [ ^self cellSize * Doc width ]
+    CocoaSpriteEditor class >> gridPixelHeight [ ^self cellSize * Doc height ]
+
+    CocoaSpriteEditor class >> buildGridIn: content [
+        GridView := ((Cocoa classNamed: 'NSImageView') onMain alloc) onMain
+            initWithFrame: (Array with: self gridLeft
+                                  with: self gridTop - self gridPixelHeight
+                                  with: self gridPixelWidth asFloat
+                                  with: self gridPixelHeight asFloat).
+        "NSImageScaleNone: the blast is already at view size, pixel for pixel."
+        GridView onMain setImageScaling: 2.
+        content onMain addSubview: GridView.
+        self recognizer: 'NSClickGestureRecognizer' on: GridView
+             handler: [ :gr | self gridEventFrom: gr ].
+        self recognizer: 'NSPanGestureRecognizer' on: GridView
+             handler: [ :gr | self gridEventFrom: gr ].
+    ]
+
+    CocoaSpriteEditor class >> gridEventFrom: gr [
+        "Shared click/pan path: view point -> cell -> tool. locationInView:
+         answers the point in GRID VIEW coordinates, origin BOTTOM-left
+         (unflipped NSView), so the sprite row is flipped."
+        | pt x y |
+        pt := gr send: 'locationInView:' args: (Array with: GridView) ret: #point.
+        x := ((pt at: 1) // self cellSize) asInteger.
+        y := Doc height - 1 - ((pt at: 2) // self cellSize) asInteger.
+        self toolAtX: x y: y.
+    ]
+
+    CocoaSpriteEditor class >> toolAtX: x y: y [
+        "Apply the current tool at sprite cell (x, y) — the ONE path both
+         gestures and the scripting hooks go through."
+        (x < 0 or: [ x >= Doc width or: [ y < 0 or: [ y >= Doc height ] ] ])
+            ifTrue: [ ^self ].
+        Tool = #pick ifTrue: [
+            self selectColor: (Doc getPx: CurFrame x: x y: y).
+            ^self ].
+        Tool = #fill
+            ifTrue: [
+                (Doc floodFill: CurFrame x: x y: y color: SelColor)
+                    ifTrue: [ self repaintGrid ] ]
+            ifFalse: [
+                (Doc setPx: CurFrame x: x y: y color: SelColor)
+                    ifTrue: [ self repaintGrid ] ].
+    ]
+
+    CocoaSpriteEditor class >> repaintGrid [
+        "The whole grid as one RGBA blast: cell colours from the palette,
+         checkerboard for transparent (index 0), a 1px dark gridline lattice.
+         Row 0 of the buffer is the TOP row on screen."
+        | cell gw gh bytes rowbase idx sx sy c r g b checker |
+        cell := self cellSize.
+        gw := self gridPixelWidth. gh := self gridPixelHeight.
+        bytes := ByteArray new: gw * gh * 4.
+        0 to: gh - 1 do: [ :py |
+            sy := py // cell.
+            rowbase := py * gw * 4.
+            0 to: gw - 1 do: [ :px |
+                sx := px // cell.
+                idx := Doc getPx: CurFrame x: sx y: sy.
+                (px \\ cell = 0 or: [ py \\ cell = 0 ])
+                    ifTrue: [ r := 40. g := 40. b := 44 ]
+                    ifFalse: [
+                        idx = 0
+                            ifTrue: [
+                                checker := ((px // 8) + (py // 8)) \\ 2.
+                                checker = 0
+                                    ifTrue: [ r := 58. g := 58. b := 64 ]
+                                    ifFalse: [ r := 74. g := 74. b := 82 ] ]
+                            ifFalse: [
+                                c := Doc paletteAt: idx.
+                                r := c at: 1. g := c at: 2. b := c at: 3 ] ].
+                bytes at: rowbase + (px * 4) + 1 put: r.
+                bytes at: rowbase + (px * 4) + 2 put: g.
+                bytes at: rowbase + (px * 4) + 3 put: b.
+                bytes at: rowbase + (px * 4) + 4 put: 255 ] ].
+        GridView onMain setFrameSize:
+            (Array with: gw asFloat with: gh asFloat).
+        GridView onMain setFrameOrigin:
+            (Array with: self gridLeft with: self gridTop - gh).
+        CocoaBrowser hostService onMain
+            showCanvasPixelsOn: GridView base64: (Base64 encode: bytes)
+            width: gw printString height: gh printString.
+    ]
+
+    "── swatches (the palette strip: 8x2 cells of 48px, click to select) ──"
+
+    CocoaSpriteEditor class >> swatchCell [ ^48 ]
+    CocoaSpriteEditor class >> swatchLeft [ ^472.0 ]
+    CocoaSpriteEditor class >> swatchBottom [ ^330.0 ]
+
+    CocoaSpriteEditor class >> buildSwatchesIn: content [
+        SwatchView := ((Cocoa classNamed: 'NSImageView') onMain alloc) onMain
+            initWithFrame: (Array with: self swatchLeft with: self swatchBottom
+                                  with: (self swatchCell * 8) asFloat
+                                  with: (self swatchCell * 2) asFloat).
+        SwatchView onMain setImageScaling: 2.
+        content onMain addSubview: SwatchView.
+        self recognizer: 'NSClickGestureRecognizer' on: SwatchView
+             handler: [ :gr | self swatchClickFrom: gr ].
+    ]
+
+    CocoaSpriteEditor class >> swatchClickFrom: gr [
+        | pt col row |
+        pt := gr send: 'locationInView:' args: (Array with: SwatchView) ret: #point.
+        col := ((pt at: 1) // self swatchCell) asInteger.
+        row := 1 - ((pt at: 2) // self swatchCell) asInteger.
+        (col between: 0 and: 7) ifFalse: [ ^self ].
+        (row between: 0 and: 1) ifFalse: [ ^self ].
+        self selectColor: (row * 8) + col.
+    ]
+
+    CocoaSpriteEditor class >> selectColor: i [
+        SelColor := (i max: 0) min: 15.
+        self repaintSwatches.
+        self syncSliders.
+        self setStatus: 'colour ' , SelColor printString ,
+            (SelColor = 0 ifTrue: [ ' (transparent)' ] ifFalse: [ '' ]).
+    ]
+
+    CocoaSpriteEditor class >> repaintSwatches [
+        "8x2 palette cells; the selected one wears a 3px white inner ring.
+         Entry 0 is drawn over a checker, its round-trip colour in a centre
+         square — honest about 'kept but transparent'."
+        | cellPx sw sh bytes row col i c r g b border inCentre checker |
+        cellPx := self swatchCell.
+        sw := cellPx * 8. sh := cellPx * 2.
+        bytes := ByteArray new: sw * sh * 4.
+        0 to: sh - 1 do: [ :py |
+            row := py // cellPx.
+            0 to: sw - 1 do: [ :px |
+                col := px // cellPx.
+                i := (row * 8) + col.
+                c := Doc paletteAt: i.
+                r := c at: 1. g := c at: 2. b := c at: 3.
+                i = 0 ifTrue: [
+                    inCentre := ((px \\ cellPx) between: 14 and: 33)
+                        and: [ (py \\ cellPx) between: 14 and: 33 ].
+                    inCentre ifFalse: [
+                        checker := (((px \\ cellPx) // 8) + ((py \\ cellPx) // 8)) \\ 2.
+                        checker = 0
+                            ifTrue: [ r := 58. g := 58. b := 64 ]
+                            ifFalse: [ r := 74. g := 74. b := 82 ] ] ].
+                border := (px \\ cellPx < 3 or: [ px \\ cellPx >= (cellPx - 3)
+                    or: [ py \\ cellPx < 3 or: [ py \\ cellPx >= (cellPx - 3) ] ] ]).
+                (border and: [ i = SelColor ]) ifTrue: [ r := 255. g := 255. b := 255 ].
+                bytes at: (py * sw * 4) + (px * 4) + 1 put: r.
+                bytes at: (py * sw * 4) + (px * 4) + 2 put: g.
+                bytes at: (py * sw * 4) + (px * 4) + 3 put: b.
+                bytes at: (py * sw * 4) + (px * 4) + 4 put: 255 ] ].
+        CocoaBrowser hostService onMain
+            showCanvasPixelsOn: SwatchView base64: (Base64 encode: bytes)
+            width: sw printString height: sh printString.
+    ]
+
+    "── RGB sliders for the selected entry ───────────────────────────────"
+
+    CocoaSpriteEditor class >> buildSlidersIn: content [
+        RGBLabel := self label: '' frame: (Array with: 472.0 with: 300.0 with: 380.0 with: 16.0)
+                         in: content.
+        RSlider := self slider: (Array with: 472.0 with: 272.0 with: 320.0 with: 22.0) in: content.
+        GSlider := self slider: (Array with: 472.0 with: 246.0 with: 320.0 with: 22.0) in: content.
+        BSlider := self slider: (Array with: 472.0 with: 220.0 with: 320.0 with: 22.0) in: content.
+        self syncSliders.
+    ]
+
+    CocoaSpriteEditor class >> slider: rect in: parent [
+        | s holder delegate |
+        s := ((Cocoa classNamed: 'NSSlider') onMain alloc) onMain initWithFrame: rect.
+        s onMain setMinValue: 0.0.
+        s onMain setMaxValue: 255.0.
+        s onMain setContinuous: true.
+        holder := CocoaToolbarAction on: [ self slidersChanged ].
+        delegate := MacvmDelegate actionTargetOn: holder.
+        s onMain setTarget: delegate.
+        s onMain setAction: 'macvmAction:'.
+        Delegates add: delegate.
+        parent onMain addSubview: s.
+        ^s
+    ]
+
+    CocoaSpriteEditor class >> slidersChanged [
+        | r g b |
+        r := (RSlider sendI64: 'integerValue').
+        g := (GSlider sendI64: 'integerValue').
+        b := (BSlider sendI64: 'integerValue').
+        Doc setPal: SelColor r: r g: g b: b.
+        self repaintSwatches.
+        self repaintGrid.
+        self syncRGBLabel.
+    ]
+
+    CocoaSpriteEditor class >> syncSliders [
+        | c |
+        RSlider isNil ifTrue: [ ^self ].
+        c := Doc paletteAt: SelColor.
+        RSlider onMain setIntegerValue: (c at: 1).
+        GSlider onMain setIntegerValue: (c at: 2).
+        BSlider onMain setIntegerValue: (c at: 3).
+        self syncRGBLabel.
+    ]
+
+    CocoaSpriteEditor class >> syncRGBLabel [
+        | c |
+        RGBLabel isNil ifTrue: [ ^self ].
+        c := Doc paletteAt: SelColor.
+        RGBLabel onMain setStringValue: 'colour ' , SelColor printString ,
+            '   R ' , (c at: 1) printString ,
+            '  G ' , (c at: 2) printString ,
+            '  B ' , (c at: 3) printString.
+    ]
+
+    "── name / size row ──────────────────────────────────────────────────"
+
+    CocoaSpriteEditor class >> buildNameRowIn: content [
+        self label: 'Name' frame: (Array with: 472.0 with: 502.0 with: 44.0 with: 16.0) in: content.
+        NameField := self field: 'Sprite'
+                          frame: (Array with: 518.0 with: 498.0 with: 170.0 with: 24.0) in: content.
+        self label: 'W' frame: (Array with: 700.0 with: 502.0 with: 16.0 with: 16.0) in: content.
+        WField := self field: '16'
+                       frame: (Array with: 718.0 with: 498.0 with: 44.0 with: 24.0) in: content.
+        self label: 'H' frame: (Array with: 770.0 with: 502.0 with: 16.0 with: 16.0) in: content.
+        HField := self field: '16'
+                       frame: (Array with: 788.0 with: 498.0 with: 44.0 with: 24.0) in: content.
+        self button: 'Resize' frame: (Array with: 840.0 with: 496.0 with: 80.0 with: 28.0)
+             action: [ self resizeClicked ] in: content.
+    ]
+
+    CocoaSpriteEditor class >> resizeClicked [
+        | nw nh |
+        nw := (WField sendString: 'stringValue') asInteger.
+        nh := (HField sendString: 'stringValue') asInteger.
+        (nw isNil or: [ nh isNil ]) ifTrue: [ ^self setStatus: 'resize: not a number' ].
+        (Doc resizeTo: nw by: nh)
+            ifTrue: [
+                self repaintGrid.
+                self setStatus: 'resized to ' , Doc width printString , 'x' , Doc height printString ]
+            ifFalse: [ self setStatus: 'resize rejected (1..64, and different from now)' ].
+    ]
+
+    "── tools row (under the grid) ───────────────────────────────────────"
+
+    CocoaSpriteEditor class >> buildToolsRowIn: content [
+        ToolButtons := Dictionary new.
+        ToolButtons at: #pencil put: (self button: '• Pencil'
+            frame: (Array with: 16.0 with: 26.0 with: 84.0 with: 26.0)
+            action: [ self selectTool: #pencil ] in: content).
+        ToolButtons at: #fill put: (self button: 'Fill'
+            frame: (Array with: 104.0 with: 26.0 with: 62.0 with: 26.0)
+            action: [ self selectTool: #fill ] in: content).
+        ToolButtons at: #pick put: (self button: 'Pick'
+            frame: (Array with: 170.0 with: 26.0 with: 62.0 with: 26.0)
+            action: [ self selectTool: #pick ] in: content).
+        self button: '◀' frame: (Array with: 244.0 with: 26.0 with: 34.0 with: 26.0)
+             action: [ self shiftBy: -1 dy: 0 ] in: content.
+        self button: '▶' frame: (Array with: 280.0 with: 26.0 with: 34.0 with: 26.0)
+             action: [ self shiftBy: 1 dy: 0 ] in: content.
+        self button: '▲' frame: (Array with: 316.0 with: 26.0 with: 34.0 with: 26.0)
+             action: [ self shiftBy: 0 dy: -1 ] in: content.
+        self button: '▼' frame: (Array with: 352.0 with: 26.0 with: 34.0 with: 26.0)
+             action: [ self shiftBy: 0 dy: 1 ] in: content.
+        self button: 'Clear' frame: (Array with: 390.0 with: 26.0 with: 58.0 with: 26.0)
+             action: [ self clearClicked ] in: content.
+    ]
+
+    CocoaSpriteEditor class >> selectTool: aSymbol [
+        Tool := aSymbol.
+        #(pencil fill pick) do: [ :t |
+            (ToolButtons at: t ifAbsent: [ nil ]) ifNotNil: [ :btn |
+                btn onMain setTitle:
+                    ((t = aSymbol ifTrue: [ '• ' ] ifFalse: [ '' ]) ,
+                     (t = #pencil ifTrue: [ 'Pencil' ]
+                        ifFalse: [ t = #fill ifTrue: [ 'Fill' ] ifFalse: [ 'Pick' ] ])) ] ].
+        self setStatus: 'tool: ' , aSymbol printString.
+    ]
+
+    CocoaSpriteEditor class >> shiftBy: dx dy: dy [
+        Doc shift: CurFrame dx: dx dy: dy.
+        self repaintGrid.
+    ]
+
+    CocoaSpriteEditor class >> clearClicked [
+        Doc clearFrame: CurFrame.
+        self repaintGrid.
+        self setStatus: 'frame cleared'.
+    ]
+
+    "── frames row ───────────────────────────────────────────────────────"
+
+    CocoaSpriteEditor class >> buildFrameRowIn: content [
+        FrameLabel := self label: '' frame: (Array with: 472.0 with: 176.0 with: 96.0 with: 16.0)
+                           in: content.
+        self button: '|<' frame: (Array with: 570.0 with: 170.0 with: 40.0 with: 26.0)
+             action: [ self gotoFrame: 0 ] in: content.
+        self button: '<' frame: (Array with: 612.0 with: 170.0 with: 40.0 with: 26.0)
+             action: [ self gotoFrame: CurFrame - 1 ] in: content.
+        self button: '>' frame: (Array with: 654.0 with: 170.0 with: 40.0 with: 26.0)
+             action: [ self gotoFrame: CurFrame + 1 ] in: content.
+        self button: 'Add' frame: (Array with: 700.0 with: 170.0 with: 52.0 with: 26.0)
+             action: [ self gotoFrame: Doc addFrame ] in: content.
+        self button: 'Dup' frame: (Array with: 754.0 with: 170.0 with: 52.0 with: 26.0)
+             action: [ self gotoFrame: (Doc dupFrame: CurFrame) ] in: content.
+        self button: 'Del' frame: (Array with: 808.0 with: 170.0 with: 52.0 with: 26.0)
+             action: [ self delFrameClicked ] in: content.
+        self syncFrameLabel.
+    ]
+
+    CocoaSpriteEditor class >> gotoFrame: f [
+        (f < 0 or: [ f >= Doc frameCount ]) ifTrue: [ ^self ].
+        CurFrame := f.
+        self syncFrameLabel.
+        self repaintGrid.
+    ]
+
+    CocoaSpriteEditor class >> delFrameClicked [
+        (Doc delFrame: CurFrame)
+            ifFalse: [ ^self setStatus: 'the last frame stays' ].
+        CurFrame := CurFrame min: Doc frameCount - 1.
+        self syncFrameLabel.
+        self repaintGrid.
+    ]
+
+    CocoaSpriteEditor class >> syncFrameLabel [
+        FrameLabel isNil ifTrue: [ ^self ].
+        FrameLabel onMain setStringValue:
+            'Frame ' , (CurFrame + 1) printString , '/' , Doc frameCount printString.
+    ]
+
+    CocoaSpriteEditor class >> repaintAll [
+        self repaintGrid.
+        self repaintSwatches.
+        self syncSliders.
+        self syncFrameLabel.
     ]
 
     CocoaSpriteEditor class >> setStatus: aString [
@@ -77,11 +483,25 @@ Object subclass: CocoaSpriteEditor [
         StatusLabel onMain setStringValue: aString.
     ]
 
-    "── scripting hooks (rusttcl `gui`) ──────────────────────────────────"
+    "── scripting hooks (rusttcl `gui`; the stage gates drive these) ─────"
 
     CocoaSpriteEditor class >> isOpen [
         Win isNil ifTrue: [ ^false ].
         ^Win sendBool: 'isVisible'
+    ]
+    CocoaSpriteEditor class >> doc [ ^Doc ]
+    CocoaSpriteEditor class >> gridView [ ^GridView ]
+    CocoaSpriteEditor class >> swatchView [ ^SwatchView ]
+    CocoaSpriteEditor class >> spedRows [ ^Doc rowsOf: CurFrame ]
+    CocoaSpriteEditor class >> spedColor: i [ self selectColor: i ]
+    CocoaSpriteEditor class >> spedTool: aSymbol [ self selectTool: aSymbol ]
+    CocoaSpriteEditor class >> snapshotTo: aPath [
+        ^CocoaUI snapshotWindow: Win to: aPath
+    ]
+    CocoaSpriteEditor class >> spedPaintX: x y: y [
+        "The gate's paint: the SAME path a grid gesture takes, minus only the
+         locationInView: read."
+        self toolAtX: x y: y
     ]
 
     "── teardown (UI-worker rebuild — CocoaUI teardown calls by name) ────"
@@ -93,5 +513,9 @@ Object subclass: CocoaSpriteEditor [
                 Win onMain orderOut: nil.
                 Win release ] ].
         Win := nil. WinDelegate := nil. Delegates := nil. StatusLabel := nil.
+        GridView := nil. SwatchView := nil. NameField := nil.
+        WField := nil. HField := nil. RSlider := nil. GSlider := nil.
+        BSlider := nil. RGBLabel := nil. FrameLabel := nil. ToolButtons := nil.
+        Doc := nil. CurFrame := nil. SelColor := nil. Tool := nil.
     ]
 ]
