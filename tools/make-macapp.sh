@@ -56,9 +56,9 @@ make_icns() {   # $1 = source png, $2 = out.icns
 build_one() {
   local mode="$1" crate binname appname bundleid iconpng
   case "$mode" in
-    cocoa) crate="cocoa_gui"; binname="macvm-cocoa"; appname="MACVM Cocoa"
+    cocoa) crate="cocoa_gui"; binname="macvm-cocoa"; appname="macVM"
            bundleid="com.macvm.cocoa"; iconpng="$ROOT/tools/app-icon-cocoa.png" ;;
-    web)   crate="macvm-gui"; binname="macvm-gui";   appname="MACVM Web"
+    web)   crate="macvm-gui"; binname="macvm-gui";   appname="macVM Web"
            bundleid="com.macvm.web";   iconpng="$ROOT/tools/app-icon-web.png" ;;
     *) echo "unknown mode: $mode" >&2; return 2 ;;
   esac

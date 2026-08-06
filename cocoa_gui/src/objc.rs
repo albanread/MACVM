@@ -309,7 +309,7 @@ pub fn install_quit_menu(app: Id) {
     let quit_item = send3_id(
         quit_item,
         sel("initWithTitle:action:keyEquivalent:"),
-        nsstring("Quit MACVM"),
+        nsstring("Quit macVM"),
         sel("terminate:"),
         nsstring("q"),
     );

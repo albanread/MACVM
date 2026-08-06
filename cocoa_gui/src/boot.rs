@@ -432,7 +432,7 @@ mod tests {
             .eval("CocoaUI title")
             .expect("CocoaUI (file 64) must be present on the UI worker");
         assert!(
-            title.contains("MACVM"),
+            title.contains("macVM"),
             "CocoaUI title must be the Smalltalk-supplied window title, got {title}"
         );
 
@@ -497,7 +497,7 @@ mod tests {
         let title = ui
             .eval("CocoaUI title")
             .expect("CocoaUI (cocoaui list) must be present on a UI_WORKER_LISTS boot");
-        assert!(title.contains("MACVM"), "got {title}");
+        assert!(title.contains("macVM"), "got {title}");
         drop(ui);
 
         // The selectivity proof: the SAME (already-seeded) image, booted fresh

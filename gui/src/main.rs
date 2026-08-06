@@ -2447,7 +2447,7 @@ fn build_menu_bar() {
         NS_APPLICATION_ACTIVATION_POLICY_REGULAR,
     );
 
-    let app_menu = submenu("MACVM", &[menu_item("Quit MACVM", Some("terminate:"), "q")]);
+    let app_menu = submenu("macVM", &[menu_item("Quit macVM", Some("terminate:"), "q")]);
     // File menu: window control + world ↔ files (image_store export/import), so
     // interactive edits can be checked into source control and pulled back.
     let world_io_delegate = build_world_io_delegate();
@@ -2587,7 +2587,7 @@ fn build_window_and_webview() {
         BACKING_BUFFERED,
         false,
     );
-    objc::send1_id(window, sel("setTitle:"), objc::nsstring("MACVM"));
+    objc::send1_id(window, sel("setTitle:"), objc::nsstring("macVM"));
     objc::send0(window, sel("center"));
 
     let config = objc::alloc_init("WKWebViewConfiguration");

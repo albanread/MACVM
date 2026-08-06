@@ -70,23 +70,24 @@ Object subclass: CocoaToolbarAction [
  reached by message; when it is restarted, environmentRestarted re-syncs
  every view against the fresh environment."
 Object subclass: CocoaUI [
-    <classVars: Win Toolbar ContentHost Transcript TranscriptScroll ActTarget
-                TranscriptText Views ActiveView ToolbarDelegates ToolbarButtons
+    <classVars: Win ContentHost Transcript TranscriptScroll ActTarget
+                TranscriptText Views ActiveView ToolbarDelegates
                 MetricLabels MemBarFill MemBarWidth Workspace WorkspaceScroll
                 WorkspaceTextDelegate TabItems TabIndexes
                 TranscriptClearBtn FontDelta
                 TranscriptCollapsed TranscriptToggleBtn TranscriptGrain
                 TranscriptMenuItem TranscriptSplit TranscriptDock
-                FontMinusBtn FontPlusBtn JitOn JitMenuItem
-                WorkspaceContainer WorkspaceBarBox WorkspaceBarButtons
-                HaltOn HaltMenuItem MetricViews MetricsHidden
+                JitOn JitMenuItem
+                WorkspaceContainer
+                HaltOn HaltMenuItem MetricViews
                 WinToolbar ToolbarDelegate ToolbarItems MetricsHost
-                ToolbarIdentArray>
+                ToolbarIdentArray ToolbarSpecs ViewItemSpecs>
 
-    CocoaUI class >> title [ ^'MACVM' ]
+    "The DISPLAY name, macOS house style (macOS/macVM) — not the binary,
+     the bundle id, or the MACVM_* environment variables, which stay upper."
+    CocoaUI class >> title [ ^'macVM' ]
 
     "── layout constants ──"
-    CocoaUI class >> toolbarHeight [ ^44.0 ]
     CocoaUI class >> transcriptHeight [ ^110.0 ]
     CocoaUI class >> iconDir [ ^'gui/assets/icons-mono/' ]
     CocoaUI class >> toolbarTexturePath [ ^'gui/assets/toolbar-texture.png' ]
@@ -107,7 +108,8 @@ Object subclass: CocoaUI [
         TranscriptText := ''.
         Views := OrderedCollection new.
         ToolbarDelegates := OrderedCollection new.
-        ToolbarButtons := Dictionary new.
+        ToolbarSpecs := OrderedCollection new.
+        ViewItemSpecs := OrderedCollection new.
         TabItems := OrderedCollection new.
         TabIndexes := Dictionary new.
         winClass := Cocoa classNamed: 'NSWindow'.
@@ -122,6 +124,11 @@ Object subclass: CocoaUI [
             styleMask: 15 backing: 2 defer: false).
         Win onMain setReleasedWhenClosed: false.
         Win onMain setTitle: self title.
+        "NSWindowTitleHidden = 1. In the unified titlebar the title would eat
+         ~110pt that the toolbar needs at a normal window width — and a
+         single-window app already names itself in the menu bar. The title is
+         still SET, so Window-menu entries and Mission Control read right."
+        Win onMain setTitleVisibility: 1.
         Win onMain setMinSize: (Array with: 480.0 with: 320.0).
         "Full-screen primary (NSWindowCollectionBehaviorFullScreenPrimary =
          1<<7): without it the green button only zooms, which on a modern Mac
@@ -144,8 +151,6 @@ Object subclass: CocoaUI [
          the split view out synchronously, so setPosition: measures against a
          zero-height frame and clamps the dock to nothing."
         self loadTranscriptCollapsed.
-        self buildWindowToolbar.
-        self buildToolbarIn: content.
         self buildContentHostIn: content.
         self buildTranscriptIn: content.
 
@@ -162,10 +167,11 @@ Object subclass: CocoaUI [
         (Worker classNamed: #CocoaCanvas) ifNotNil: [ :cv | cv register ].
         (Worker classNamed: #CocoaHelp) ifNotNil: [ :hc | hc register ].
         (Worker classNamed: #CocoaDebugger) ifNotNil: [ :dc | dc register ].
-        "A- / A+ font-size buttons, after every view's switcher button."
+        "A- / A+ and Do It / Print It, after every view's switcher item."
         self buildFontButtons.
-        "Now that ToolbarButtons is complete, decide whether the metrics fit."
-        self syncMetricsVisibility.
+        "Every item is registered now, so the toolbar can ask for the full
+         list the moment setToolbar: hands it the delegate."
+        self buildWindowToolbar.
 
         "Forwarded primary transcript lines (§7.4) append to our Transcript view."
         Worker onTranscriptLine: [ :t | CocoaUI appendTranscript: t ].
@@ -175,19 +181,6 @@ Object subclass: CocoaUI [
         Win onMain makeKeyAndOrderFront: nil.
         self appendTranscript: 'CocoaUI: ready.'.
         ^Win
-    ]
-
-    "── toolbar ──"
-    CocoaUI class >> buildToolbarIn: content [
-        | nsRect frame |
-        nsRect := Cocoa classNamed: 'NSView'.
-        frame := content onMain frame.
-        Toolbar := (nsRect onMain alloc) onMain
-            initWithFrame: (Array with: 0.0 with: (frame at: 4) - self toolbarHeight
-                                  with: (frame at: 3) with: self toolbarHeight).
-        Toolbar onMain setAutoresizingMask: self maskWidthSizable + self maskMinYMargin.
-        content onMain addSubview: Toolbar.
-        self buildToolbarBackgroundIn: Toolbar.
     ]
 
     "── the real NSToolbar (the titlebar one) ─────────────────────────────
@@ -201,12 +194,68 @@ Object subclass: CocoaUI [
     CocoaUI class >> metricsItemIdentifier [ ^'macvm.metrics' ]
     CocoaUI class >> flexibleSpaceIdentifier [ ^'NSToolbarFlexibleSpaceItem' ]
 
-    "The item order AppKit asks for. The flexible space is what pins the
-     metrics to the RIGHT edge and keeps them there on resize — a toolbar's
-     own idiom for it, replacing the hand-rolled MinXMargin arithmetic and the
-     syncMetricsVisibility collision sweep."
+    CocoaUI class >> viewGroupIdentifier [ ^'macvm.views' ]
+    CocoaUI class >> doItIdentifier [ ^'macvm.doit' ]
+    CocoaUI class >> printItIdentifier [ ^'macvm.printit' ]
+
+    "── the item specs, in bar order ──────────────────────────────────────
+     Each is (identifier, label, NSImage-or-nil, action delegate). Views and
+     the font/Do It/Print It buttons all register here; the delegate turns a
+     spec into a real NSToolbarItem on demand. Native items rather than
+     embedded NSButtons, so AppKit draws the standard hover/press treatment,
+     sizes them itself, and can put a proper menu item in the overflow
+     chevron when the window gets narrow — which is what replaced the
+     hand-rolled `x := 8 + (n * step)` arithmetic and the collision sweep
+     that used to hide the metrics once the icons grew into them."
+    CocoaUI class >> addToolbarItemIdent: ident label: aLabel icon: iconBase action: aBlock [
+        ToolbarSpecs add: (self toolbarSpecIdent: ident label: aLabel icon: iconBase action: aBlock).
+        ^ident
+    ]
+
+    "The template NSImage for an icons-mono/ base name. Falls back to a
+     system symbol rather than nil, so a missing SVG can never put a nil into
+     the segmented group's `images:` array (which would raise) — and never
+     leaves an invisible control."
+    CocoaUI class >> toolbarIconNamed: iconBase [
+        | img |
+        iconBase isNil ifFalse: [
+            img := ((Cocoa classNamed: 'NSImage') onMain alloc) onMain
+                initWithContentsOfFile: self iconDir , iconBase , '.svg' ].
+        img isNil ifTrue: [
+            ^(Cocoa classNamed: 'NSImage') onMain
+                imageWithSystemSymbolName: 'questionmark.square'
+                accessibilityDescription: nil ].
+        img onMain setTemplate: true.
+        ^img
+    ]
+
+    CocoaUI class >> toolbarSpecIdent: ident label: aLabel icon: iconBase action: aBlock [
+        | img holder delegate |
+        img := iconBase isNil ifTrue: [ nil ] ifFalse: [ self toolbarIconNamed: iconBase ].
+        holder := CocoaToolbarAction on: aBlock.
+        delegate := MacvmDelegate actionTargetOn: holder.
+        ToolbarDelegates add: delegate.
+        ^Array with: ident with: aLabel with: img with: delegate
+    ]
+
+    CocoaUI class >> toolbarSpecFor: ident [
+        ToolbarSpecs isNil ifTrue: [ ^nil ].
+        ^ToolbarSpecs detect: [ :spec | (spec at: 1) = ident ] ifNone: [ nil ]
+    ]
+
+    "The item order AppKit asks for: every registered item, then a flexible
+     space, then the metrics. The flexible space is what pins the metrics to
+     the RIGHT edge and keeps them there on resize — a toolbar's own idiom
+     for it."
     CocoaUI class >> toolbarItemIdentifiers [
-        ^Array with: self flexibleSpaceIdentifier with: self metricsItemIdentifier
+        | ids |
+        ids := OrderedCollection new.
+        ids add: self viewGroupIdentifier.
+        ToolbarSpecs isNil ifFalse: [
+            ToolbarSpecs do: [ :spec | ids add: (spec at: 1) ] ].
+        ids add: self flexibleSpaceIdentifier.
+        ids add: self metricsItemIdentifier.
+        ^ids asArray
     ]
 
     CocoaUI class >> buildWindowToolbar [
@@ -221,10 +270,14 @@ Object subclass: CocoaUI [
         WinToolbar onMain setDelegate: ToolbarDelegate.
         "No customization sheet: the item set is ours, not the user's."
         WinToolbar onMain setAllowsUserCustomization: false.
-        "NSToolbarDisplayModeIconOnly — no labels under the items, which is
-         what a metrics readout wants (and what the icon strip will want)."
+        "NSToolbarDisplayModeIconOnly — no label row under the items, which
+         is what a dense icon bar plus a metrics readout wants."
         WinToolbar onMain setDisplayMode: 2.
         Win onMain setToolbar: WinToolbar.
+        "NSWindowToolbarStyleUnified: the title and the toolbar share one
+         titlebar row — the unified look the rest of macOS uses, and what
+         retires the separate 44pt strip under the titlebar."
+        Win onMain setToolbarStyle: 3.
     ]
 
     "── NSToolbarDelegate (dispatched from Rust; each ANSWERS an object) ──"
@@ -243,7 +296,108 @@ Object subclass: CocoaUI [
         | name |
         name := anIdentifier sendString: 'description'.
         name = self metricsItemIdentifier ifTrue: [ ^self metricsToolbarItem ].
-        ^nil
+        name = self viewGroupIdentifier ifTrue: [ ^self viewGroupToolbarItem ].
+        ^self buttonToolbarItemNamed: name
+    ]
+
+    CocoaUI class >> buttonToolbarItemNamed: ident [
+        "Cached in ToolbarItems: AppKit asks for the same identifier more than
+         once (bar, then overflow menu), and a second copy would carry a second
+         action delegate."
+        | item spec |
+        item := ToolbarItems at: ident ifAbsent: [ nil ].
+        item isNil ifFalse: [ ^item ].
+        spec := self toolbarSpecFor: ident.
+        spec isNil ifTrue: [ ^nil ].
+        item := ((Cocoa classNamed: 'NSToolbarItem') onMain alloc) onMain
+            initWithItemIdentifier: ident.
+        item onMain setLabel: (spec at: 2).
+        item onMain setPaletteLabel: (spec at: 2).
+        item onMain setToolTip: (spec at: 2).
+        (spec at: 3) isNil
+            ifTrue: [
+                "No icon for it — show the label ON the item so it is never an
+                 invisible control (the same bar registerViewNamed: set)."
+                item onMain setTitle: (spec at: 2) ]
+            ifFalse: [ item onMain setImage: (spec at: 3) ].
+        "Big Sur+ toolbar buttons draw a rounded-square background on hover."
+        item onMain setBordered: true.
+        item onMain setTarget: (spec at: 4).
+        item onMain setAction: 'macvmAction:'.
+        ToolbarItems at: ident put: item.
+        ^item
+    ]
+
+    "── the view switchers, as ONE segmented group ────────────────────────
+     Nine loose icon items cost ~400pt of bar and never showed which view was
+     active. An NSToolbarItemGroup in SelectOne mode draws them as a single
+     segmented control — the idiom Mail/Notes/System Settings use for exactly
+     this — which is both far tighter (so the metrics still fit on the right
+     at a normal window width) and self-labelling: the active view's segment
+     stays lit."
+    CocoaUI class >> viewGroupToolbarItem [
+        | item imgs labels holder delegate |
+        item := ToolbarItems at: self viewGroupIdentifier ifAbsent: [ nil ].
+        item isNil ifFalse: [ ^item ].
+        imgs := ((Cocoa classNamed: 'NSMutableArray') onMain alloc) onMain init.
+        labels := ((Cocoa classNamed: 'NSMutableArray') onMain alloc) onMain init.
+        ViewItemSpecs do: [ :spec |
+            imgs onMain addObject: (spec at: 3).
+            labels onMain addObject: (Cocoa nsString: (spec at: 2)) ].
+        "The CONVENIENCE constructor, not alloc/init + setSubitems:. Only the
+         group it builds carries the segmented control representation that
+         selectionMode/selectedIndex drive: a hand-assembled group renders as
+         loose items and silently refuses setSelectedIndex: (measured — it
+         stayed -1 through both a manual set and a live view switch).
+         target:/action: go in afterwards through the ordinary property
+         setters, because the bridge marshals a String argument as an
+         NSString, not as the SEL this constructor's last parameter wants."
+        item := (Cocoa classNamed: 'NSToolbarItemGroup') onMain
+            groupWithItemIdentifier: self viewGroupIdentifier
+            images: imgs
+            selectionMode: 1
+            labels: labels
+            target: nil
+            action: nil.
+        holder := CocoaToolbarAction on: [ self viewGroupClicked ].
+        delegate := MacvmDelegate actionTargetOn: holder.
+        ToolbarDelegates add: delegate.
+        item onMain setTarget: delegate.
+        item onMain setAction: 'macvmAction:'.
+        item onMain setLabel: 'View'.
+        item onMain setPaletteLabel: 'View'.
+        ToolbarItems at: self viewGroupIdentifier put: item.
+        imgs release. labels release.
+        ^item
+    ]
+
+    CocoaUI class >> viewGroupClicked [
+        "A segment fired. When the GROUP owns the selection there is no
+         per-segment target/action — which one was hit is in selectedIndex."
+        | group idx |
+        group := ToolbarItems at: self viewGroupIdentifier ifAbsent: [ nil ].
+        group isNil ifTrue: [ ^self ].
+        idx := group sendI64: 'selectedIndex'.
+        (idx < 0 or: [ idx >= Views size ]) ifTrue: [ ^self ].
+        self switchToView: ((Views at: idx + 1) at: 1).
+    ]
+
+    "Do It / Print It act on the WORKSPACE's text, so they dim on every other
+     tab rather than silently doing nothing. Run from switchToView:, and once
+     at startup after the first switch."
+    CocoaUI class >> syncToolbarEnablement [
+        | on idx |
+        ToolbarItems isNil ifTrue: [ ^self ].
+        on := ActiveView == #workspace.
+        (Array with: self doItIdentifier with: self printItIdentifier) do: [ :ident |
+            (ToolbarItems at: ident ifAbsent: [ nil ]) ifNotNil: [ :item |
+                item onMain setEnabled: on ] ].
+        "Light the segment for the view we just switched to — including when
+         the switch came from the View menu or a script, not the toolbar."
+        (ToolbarItems at: self viewGroupIdentifier ifAbsent: [ nil ]) ifNotNil: [ :group |
+            idx := ViewItemSpecs findFirst: [ :spec |
+                (spec at: 1) = ('macvm.view.' , ActiveView) ].
+            idx > 0 ifTrue: [ group onMain setSelectedIndex: idx - 1 ] ].
     ]
 
     "The identifier array, built once and KEPT — see buildWindowToolbar."
@@ -272,7 +426,7 @@ Object subclass: CocoaUI [
          wired into MetricLabels — a second copy would leave the first one
          frozen at its last value."
         | item |
-        item := ToolbarItems at: #metrics ifAbsent: [ nil ].
+        item := ToolbarItems at: self metricsItemIdentifier ifAbsent: [ nil ].
         item isNil ifFalse: [ ^item ].
         MetricsHost := ((Cocoa classNamed: 'NSView') onMain alloc) onMain
             initWithFrame: (Array with: 0.0 with: 0.0
@@ -288,7 +442,7 @@ Object subclass: CocoaUI [
                                        with: self metricsItemHeight).
         item onMain setMaxSize: (Array with: self metricsClusterWidth
                                        with: self metricsItemHeight).
-        ToolbarItems at: #metrics put: item.
+        ToolbarItems at: self metricsItemIdentifier put: item.
         ^item
     ]
 
@@ -319,18 +473,7 @@ Object subclass: CocoaUI [
         aParent onMain addSubview: box.
         ^box
     ]
-    CocoaUI class >> buildToolbarBackgroundIn: aToolbar [
-        "The grain behind the toolbar contents so the strip reads as a
-         textured surface, not a blank sheet. Called FIRST in buildToolbarIn:,
-         so every icon/metric renders on top of it, unchanged."
-        | frame |
-        frame := aToolbar onMain frame.
-        self addTexturedBoxFrame: (Array with: 0.0 with: 0.0 with: (frame at: 3) with: (frame at: 4))
-             resize: self maskWidthSizable + self maskHeightSizable
-             in: aToolbar.
-    ]
-
-    CocoaUI class >> metricCellWidth [ ^64.0 ]
+    CocoaUI class >> metricCellWidth [ ^58.0 ]
     "The cluster's bottom edge inside its host view: the mem bar sits here,
      the value row 2pt above it, the caption row 16pt above that. Parametrized
      because the cluster used to be laid into the 44-high custom strip and now
@@ -355,14 +498,13 @@ Object subclass: CocoaUI [
         names := #('GC' 'ALLOC' 'CODE' 'JIT' 'MEM').
         x := (aToolbar onMain frame) at: 3.
         MetricLabels := Dictionary new.
-        "Every metric view, for the show/hide sweep (syncMetricsVisibility)."
+        "Every metric view, so a rebuild can find them all."
         MetricViews := OrderedCollection new.
-        MetricsHidden := false.
         names do: [ :n |
             | caption value w |
             "MEM's value is 'used/capacity' — the widest cell by far ('540.9K/68.0M');
              the uniform width clipped it at the slash (seen in the CG7 snap)."
-            w := n = 'MEM' ifTrue: [ 104.0 ] ifFalse: [ self metricCellWidth ].
+            w := n = 'MEM' ifTrue: [ 100.0 ] ifFalse: [ self metricCellWidth ].
             x := x - w.
             caption := (tfClass onMain alloc) onMain
                 initWithFrame: (Array with: x with: self metricsBaseY + 16.0
@@ -418,24 +560,9 @@ Object subclass: CocoaUI [
         MetricViews isNil ifFalse: [ MetricViews add: track; add: fill ].
     ]
 
-    "── metrics show/hide: the cluster is right-anchored and the view-switcher
-       icons grow leftward-to-rightward, so on a narrow window the icons run
-       UNDER the metrics (the 'scrunched' look). Rather than clip, drop the
-       metrics entirely until there is room again. Re-checked on the ~4Hz
-       metrics tick, which is also how a live resize is picked up (within
-       250ms) — no window-delegate plumbing needed. ──"
     CocoaUI class >> metricsClusterWidth [
-        "MEM (104) + the four uniform cells."
-        ^104.0 + (4 * self metricCellWidth)
-    ]
-    CocoaUI class >> metricsGap [ ^16.0 ]
-    CocoaUI class >> metricsHidden [ "true when the cluster is suppressed for width" ^MetricsHidden ]
-    CocoaUI class >> syncMetricsVisibility [
-        "Retired: the cluster is an NSToolbarItem now, and a toolbar handles
-         its own overflow — a too-narrow window moves the item into the
-         chevron menu instead of letting the icons run under it. Kept as a
-         no-op because the ~4Hz metrics tick and startup both call it."
-        MetricsHidden := false.
+        "MEM (100, it carries 'used/capacity') + the four uniform cells."
+        ^100.0 + (4 * self metricCellWidth)
     ]
 
     CocoaUI class >> updateMetricsMem: memStr jit: jitStr code: codeStr alloc: allocStr gc: gcStr memPct: pct [
@@ -443,11 +570,6 @@ Object subclass: CocoaUI [
          beat now — CG5 — so this fires ~4Hz with no new NSTimer) to refresh
          the toolbar readout AND the MEM usage bar's fill width in place."
         MetricLabels isNil ifTrue: [ ^self ].
-        "Doubles as the resize check (this is the only periodic tick the UI
-         has): cheap, and it only touches views when the verdict flips. When
-         hidden there is nothing to refresh, so skip the rest."
-        self syncMetricsVisibility.
-        MetricsHidden == true ifTrue: [ ^self ].
         (MetricLabels at: #MEM ifAbsent: [ nil ]) ifNotNil: [ :tf | tf onMain setStringValue: memStr ].
         (MetricLabels at: #JIT ifAbsent: [ nil ]) ifNotNil: [ :tf | tf onMain setStringValue: jitStr ].
         (MetricLabels at: #CODE ifAbsent: [ nil ]) ifNotNil: [ :tf | tf onMain setStringValue: codeStr ].
@@ -477,7 +599,10 @@ Object subclass: CocoaUI [
     CocoaUI class >> buildContentHostIn: content [
         | frame splitH dockH |
         frame := content onMain frame.
-        splitH := (frame at: 4) - self toolbarHeight.
+        "The split view owns the WHOLE content view now: the 44pt custom
+         toolbar strip it used to sit under became a real NSToolbar, which
+         AppKit draws in the titlebar, outside the content view entirely."
+        splitH := frame at: 4.
         dockH := self transcriptCollapsed
             ifTrue: [ self transcriptStripHeight ]
             ifFalse: [ self transcriptRestoreHeight ].
@@ -506,55 +631,24 @@ Object subclass: CocoaUI [
     ]
 
     "── the view registry ──"
-    CocoaUI class >> toolbarButtonWidth [ ^36.0 ]
-    CocoaUI class >> toolbarButtonStep [ ^40.0 ]
     CocoaUI class >> registerViewNamed: aSymbol title: aTitle icon: iconBaseName container: containerBlock onShow: onShowBlock [
-        "Add a persistent view: mint its toolbar button (icon, falling back to
-         a text title if the image fails to load — never an invisible
-         control) wired through its OWN CocoaToolbarAction/macvmAction:
-         ticket. `containerBlock` answers the view's root NSView (building
-         lazily on first show — it becomes the tab item's view, owned by the
-         NSTabView from then on); `onShowBlock` runs on every switch TO the
-         view (refresh requests, first responder).
+        "Add a persistent view: register its toolbar item (icon, falling back
+         to the title as text if the image fails to load — never an invisible
+         control) wired through its OWN CocoaToolbarAction/macvmAction: ticket.
+         `containerBlock` answers the view's root NSView (building lazily on
+         first show — it becomes the tab item's view, owned by the NSTabView
+         from then on); `onShowBlock` runs on every switch TO the view
+         (refresh requests, first responder).
 
-         Button width/step are sized for the ICON-ONLY case (every current
-         icon loads, so that's the case that actually renders): 92px-wide,
-         98px-apart buttons were sized for the OLD fallback text titles
-         ('Workspace', 'Outliner', ...) and left large gaps between icon
-         glyphs once every icon started loading — user report: 'the icons
-         should be placed together... without lots of space between them
-         ... crash into the metrics on smaller windows'. A fallback text
-         title still fits (clipped, not invisible) in the tighter width if
-         an icon ever fails to load — the doc's own bar ('never an
-         invisible control') doesn't require it to look good, just to
-         exist and stay clickable."
-        | btnClass imgClass img btn holder delegate x |
-        Views add: (Array with: aSymbol with: aTitle with: containerBlock with: onShowBlock).
-        btnClass := Cocoa classNamed: 'NSButton'.
-        x := 8.0 + (ToolbarButtons size * self toolbarButtonStep).
-        btn := (btnClass onMain alloc) onMain
-            initWithFrame: (Array with: x with: 6.0 with: self toolbarButtonWidth with: 32.0).
-        btn onMain setBordered: false.
-        btn onMain setTitle: aTitle.
-        imgClass := Cocoa classNamed: 'NSImage'.
-        img := (imgClass onMain alloc) onMain
-            initWithContentsOfFile: self iconDir , iconBaseName , '.svg'.
-        img isNil ifFalse: [
-            img onMain setTemplate: true.
-            btn onMain setImage: img.
-            btn onMain setImagePosition: 1. "NSImageOnly — icon loaded, hide the fallback title"
-        ].
-        "EVERY switch path goes through switchToView: — the toolbar buttons
+         EVERY switch path goes through switchToView: — the toolbar items
          previously ran the raw activate blocks, adding views ON TOP of the
-         current one (the 'views draw over each other' bug's second head;
-         only the View menu did the swap)."
-        holder := CocoaToolbarAction on: [ self switchToView: aSymbol ].
-        delegate := MacvmDelegate actionTargetOn: holder.
-        btn onMain setTarget: delegate.
-        btn onMain setAction: 'macvmAction:'.
-        Toolbar onMain addSubview: btn.
-        ToolbarDelegates add: delegate.
-        ToolbarButtons at: aSymbol put: btn.
+         current one (the 'views draw over each other' bug's second head; only
+         the View menu did the swap)."
+        Views add: (Array with: aSymbol with: aTitle with: containerBlock with: onShowBlock).
+        ViewItemSpecs add: (Array
+            with: 'macvm.view.' , aSymbol
+            with: aTitle
+            with: (self toolbarIconNamed: iconBaseName)).
     ]
 
     "── code font size (the A- / A+ toolbar buttons) ──────────────────────
@@ -587,40 +681,20 @@ Object subclass: CocoaUI [
      A lighter sibling of registerViewNamed:: mint an icon button that runs
      an arbitrary block, without registering a tab/view. Placed left-to-right
      after the view-switcher buttons, in the same 40px step grid."
-    CocoaUI class >> mintToolbarButton: iconBase tip: aTip action: aBlock atIndex: idx [
-        | btnClass btn imgClass img holder delegate x |
-        btnClass := Cocoa classNamed: 'NSButton'.
-        x := 8.0 + (idx * self toolbarButtonStep).
-        btn := (btnClass onMain alloc) onMain
-            initWithFrame: (Array with: x with: 6.0 with: self toolbarButtonWidth with: 32.0).
-        btn onMain setBordered: false.
-        btn onMain setTitle: aTip.
-        btn onMain setToolTip: aTip.
-        imgClass := Cocoa classNamed: 'NSImage'.
-        img := (imgClass onMain alloc) onMain initWithContentsOfFile: self iconDir , iconBase , '.svg'.
-        img isNil ifFalse: [
-            img onMain setTemplate: true.
-            btn onMain setImage: img.
-            btn onMain setImagePosition: 1 ].
-        holder := CocoaToolbarAction on: aBlock.
-        delegate := MacvmDelegate actionTargetOn: holder.
-        btn onMain setTarget: delegate.
-        btn onMain setAction: 'macvmAction:'.
-        Toolbar onMain addSubview: btn.
-        ToolbarDelegates add: delegate.
-        ^btn
-    ]
     CocoaUI class >> buildFontButtons [
-        "Two font-size buttons right after the view switchers (biggerText/
-         smallerText — the same icons-mono/ template SVGs the WKWebView
-         toolbar ships). Called once, after every view has registered its
-         button, so `ToolbarButtons size` is the count they occupy."
-        | base |
-        base := ToolbarButtons size.
-        FontMinusBtn := self mintToolbarButton: 'smallerText' tip: 'Decrease text size'
-             action: [ self decreaseFont ] atIndex: base.
-        FontPlusBtn := self mintToolbarButton: 'biggerText' tip: 'Increase text size'
-             action: [ self increaseFont ] atIndex: base + 1.
+        "The trailing items, after every view has registered its switcher:
+         the two font-size steppers (the same icons-mono/ template SVGs the
+         WKWebView toolbar ships) and Do It / Print It. The last two have no
+         icon in icons-mono/, so they render as titled toolbar buttons — a
+         mixed icon/text toolbar, which is ordinary Mac."
+        self addToolbarItemIdent: 'macvm.font.smaller' label: 'Smaller Text'
+             icon: 'smallerText' action: [ self decreaseFont ].
+        self addToolbarItemIdent: 'macvm.font.bigger' label: 'Bigger Text'
+             icon: 'biggerText' action: [ self increaseFont ].
+        self addToolbarItemIdent: self doItIdentifier label: 'Do It'
+             icon: nil action: [ self doIt ].
+        self addToolbarItemIdent: self printItIdentifier label: 'Print It'
+             icon: nil action: [ self printIt ].
     ]
 
     CocoaUI class >> switchToView: aSymbol [
@@ -644,39 +718,29 @@ Object subclass: CocoaUI [
             TabIndexes at: aSymbol put: idx ].
         ContentHost onMain selectTabViewItemAtIndex: idx.
         ActiveView := aSymbol.
+        self syncToolbarEnablement.
         (entry at: 4) value.
     ]
 
     "── the Workspace view (CG6: selection-or-everything, inline Print it) ──"
-    CocoaUI class >> workspaceBarHeight [ ^30.0 ]
     CocoaUI class >> workspaceContainer [
-        "Answer the workspace's root view (a wrapper: grained action bar over
-         the scroll), building lazily — the tab host owns it from first show
-         onward. The bar makes Do It / Print It one-click (⌘D/⌘P still work);
-         the old preloaded explainer comment is gone — the buttons say it."
-        | tvClass frame w h barY |
+        "Answer the workspace's root view (a wrapper around the scroll),
+         building lazily — the tab host owns it from first show onward. The
+         grained Do It / Print It bar that used to ride on top is gone: both
+         are toolbar items now (and ⌘D/⌘P still work), so the text gets the
+         full height of the tab."
+        | tvClass frame w h |
         Workspace isNil ifTrue: [
             tvClass := Cocoa classNamed: 'NSTextView'.
             frame := ContentHost onMain frame.
             w := frame at: 3. h := frame at: 4.
-            barY := h - self workspaceBarHeight.
             WorkspaceContainer := ((Cocoa classNamed: 'NSView') onMain alloc) onMain
                 initWithFrame: (Array with: 0.0 with: 0.0 with: w with: h).
             WorkspaceContainer onMain setAutoresizingMask: self maskWidthSizable + self maskHeightSizable.
             WorkspaceContainer onMain setAutoresizesSubviews: true.
-            "The grained bar (the transcript/editor bars' own look) — grain
-             first, buttons on top."
-            WorkspaceBarBox := self addTexturedBoxFrame: (Array with: 0.0 with: barY with: w with: self workspaceBarHeight)
-                                    resize: self maskWidthSizable + self maskMinYMargin
-                                    in: WorkspaceContainer.
-            WorkspaceBarButtons := OrderedCollection new.
-            self workspaceBarButton: 'Do It' frame: (Array with: 4.0 with: barY + 3.0 with: 72.0 with: 24.0)
-                 action: [ self doIt ].
-            self workspaceBarButton: 'Print It' frame: (Array with: 80.0 with: barY + 3.0 with: 80.0 with: 24.0)
-                 action: [ self printIt ].
 
             Workspace := (tvClass onMain alloc) onMain
-                initWithFrame: (Array with: 0.0 with: 0.0 with: w with: barY).
+                initWithFrame: (Array with: 0.0 with: 0.0 with: w with: h).
             Workspace onMain setEditable: true.
             Workspace onMain setAutomaticQuoteSubstitutionEnabled: false.
             Workspace onMain setAutomaticDashSubstitutionEnabled: false.
@@ -694,7 +758,7 @@ Object subclass: CocoaUI [
                 tc onMain setWidthTracksTextView: true.
                 tc release ].
             WorkspaceScroll := ((Cocoa classNamed: 'NSScrollView') onMain alloc) onMain
-                initWithFrame: (Array with: 0.0 with: 0.0 with: w with: barY).
+                initWithFrame: (Array with: 0.0 with: 0.0 with: w with: h).
             WorkspaceScroll onMain setHasVerticalScroller: true.
             WorkspaceScroll onMain setAutoresizingMask: self maskWidthSizable + self maskHeightSizable.
             WorkspaceScroll onMain setDocumentView: Workspace.
@@ -707,22 +771,6 @@ Object subclass: CocoaUI [
         ].
         ^WorkspaceContainer
     ]
-    CocoaUI class >> workspaceBarButton: title frame: rect action: aBlock [
-        | btn holder delegate |
-        btn := ((Cocoa classNamed: 'NSButton') onMain alloc) onMain initWithFrame: rect.
-        btn onMain setTitle: title.
-        btn onMain setBezelStyle: 1.
-        btn onMain setAutoresizingMask: self maskMinYMargin.
-        holder := CocoaToolbarAction on: aBlock.
-        delegate := MacvmDelegate actionTargetOn: holder.
-        btn onMain setTarget: delegate.
-        btn onMain setAction: 'macvmAction:'.
-        ToolbarDelegates add: delegate.
-        WorkspaceContainer onMain addSubview: btn.
-        WorkspaceBarButtons add: btn.
-        ^btn
-    ]
-
     CocoaUI class >> workspace [ ^Workspace ]
 
     "── toolbar/menu Do it / Print it (CG6: selection-aware) ──"
@@ -1535,14 +1583,10 @@ Object subclass: CocoaUI [
             Workspace isNil ifFalse: [ Workspace isValid ifTrue: [ Workspace release ] ].
             WorkspaceScroll isNil ifFalse: [ WorkspaceScroll isValid ifTrue: [ WorkspaceScroll release ] ].
             WorkspaceScroll := nil.
-            WorkspaceBarButtons isNil ifFalse: [
-                WorkspaceBarButtons do: [ :b | b isValid ifTrue: [ b release ] ] ].
-            WorkspaceBarBox isNil ifFalse: [ WorkspaceBarBox isValid ifTrue: [ WorkspaceBarBox release ] ].
             WorkspaceContainer isNil ifFalse: [ WorkspaceContainer isValid ifTrue: [ WorkspaceContainer release ] ].
-            WorkspaceBarButtons := nil. WorkspaceBarBox := nil. WorkspaceContainer := nil.
+            WorkspaceContainer := nil.
             WorkspaceTextDelegate isNil ifFalse: [ WorkspaceTextDelegate isValid ifTrue: [ WorkspaceTextDelegate release ] ].
             WorkspaceTextDelegate := nil.
-            Toolbar isNil ifFalse: [ Toolbar isValid ifTrue: [ Toolbar release ] ].
             ContentHost isNil ifFalse: [ ContentHost isValid ifTrue: [ ContentHost release ] ].
             Transcript isNil ifFalse: [ Transcript isValid ifTrue: [ Transcript release ] ].
             TranscriptScroll isNil ifFalse: [ TranscriptScroll isValid ifTrue: [ TranscriptScroll release ] ].
@@ -1563,13 +1607,11 @@ Object subclass: CocoaUI [
             WinToolbar := nil. ToolbarDelegate := nil. ToolbarItems := nil.
             MetricsHost := nil. ToolbarIdentArray := nil.
             Win isValid ifTrue: [ Win release ].
-            Win := nil. Workspace := nil. Toolbar := nil. ContentHost := nil.
+            Win := nil. Workspace := nil. ContentHost := nil.
             Transcript := nil. TranscriptScroll := nil. ActTarget := nil. ToolbarDelegates := nil.
             TranscriptClearBtn := nil.
-            ToolbarButtons := nil. MetricLabels := nil. Views := nil.
-            "Font buttons are subviews of Toolbar (released above) — just drop
-             the stale wrappers so a rebuilt UI re-mints them cleanly."
-            FontMinusBtn := nil. FontPlusBtn := nil.
+            ToolbarSpecs := nil. ViewItemSpecs := nil.
+            MetricLabels := nil. Views := nil.
             MemBarFill := nil. MemBarWidth := nil ]
     ]
 
@@ -1596,8 +1638,12 @@ Object subclass: CocoaUI [
 
     CocoaUI class >> window [ ^Win ]
     CocoaUI class >> transcriptView [ ^Transcript ]
-    "Scripting hooks (rusttcl `gui`) — drive the A-/A+ buttons for a real
-     target/action click, exactly as a user's mouse would."
-    CocoaUI class >> fontPlusButton [ ^FontPlusBtn ]
-    CocoaUI class >> fontMinusButton [ ^FontMinusBtn ]
+    "Scripting hooks (rusttcl `gui`) — the toolbar item for an identifier,
+     for a test that wants to assert on its state. The A-/A+ actions
+     themselves are just `CocoaUI increaseFont` / `decreaseFont`, since a
+     native NSToolbarItem has no performClick:."
+    CocoaUI class >> toolbarItemNamed: ident [
+        ToolbarItems isNil ifTrue: [ ^nil ].
+        ^ToolbarItems at: ident ifAbsent: [ nil ]
+    ]
 ]
