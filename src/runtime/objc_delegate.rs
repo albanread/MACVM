@@ -943,6 +943,19 @@ fn app_delegate_instance() -> *mut c_void {
     try_send(app, "delegate", nil, nil).unwrap_or(nil)
 }
 
+/// Set an `NSScriptCommand`'s error properties directly (§6.3's Rust half).
+/// Used when the WORLD could not do it — because the world is exactly what
+/// failed. Best-effort: a send that fails here leaves the command reporting
+/// nothing, which is the pre-§6.3 behaviour, never a crash.
+fn set_script_error(cmd: *mut c_void, number: i64, message: &str) {
+    use crate::runtime::objc_bridge::{nsstring_from, try_send};
+    let nil = std::ptr::null_mut();
+    let _ = try_send(cmd, "setScriptErrorNumber:", number as *mut c_void, nil);
+    if let Ok(ns) = nsstring_from(message.as_bytes()) {
+        let _ = try_send(cmd, "setScriptErrorString:", ns, nil);
+    }
+}
+
 /// One command's `performDefaultImplementation`: hand the command itself to
 /// the world under `$sel`. The world answers the command's result (an id —
 /// text for a value-answering verb, nil for a void one).
@@ -951,6 +964,15 @@ macro_rules! script_command {
         extern "C" fn $fname(this: *mut c_void, _cmd: *mut c_void) -> *mut c_void {
             let del = app_delegate_instance();
             let out = dispatch(del, $sel, &[ArgVal::Id(this)], RetShape::Id);
+            // §6.3: a handler that BLEW UP is not a handler that answered
+            // nil. `dispatch_callback` now parks the guest message instead of
+            // discarding it, so an unexpected failure inside a scripting verb
+            // becomes a real script error at the caller rather than a silent
+            // no-op. Anticipated failures set their own error and return nil
+            // WITHOUT a parked message, so they are untouched here.
+            if let Some(msg) = crate::embed::take_last_callback_error() {
+                set_script_error(this, -10000, &format!("macVM: {msg}"));
+            }
             if std::env::var_os("MACVM_SCRIPT_TRACE").is_some() {
                 eprintln!(
                     "[script] {} delegate={:?} cmd={:?} -> {:#x}",

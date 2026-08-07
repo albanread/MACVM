@@ -510,6 +510,27 @@ impl std::io::Write for SinkWriter {
     }
 }
 
+thread_local! {
+    /// §6.3: the guest message from the most recent `dispatch_callback`
+    /// recovery, parked for a caller that wants to report it. Thread-local
+    /// because a callback is a top-level entry on ITS OWN thread (the UI
+    /// worker's), and two threads recovering at once must not race.
+    static LAST_CALLBACK_ERROR: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn set_last_callback_error(msg: String) {
+    LAST_CALLBACK_ERROR.with(|c| *c.borrow_mut() = Some(msg));
+}
+
+/// Take (and clear) the message from the last recovered callback failure on
+/// this thread, if any. `None` when the last callback returned normally —
+/// so a caller can distinguish "the handler answered nil" from "the handler
+/// blew up", which is the whole point (§6.3).
+pub fn take_last_callback_error() -> Option<String> {
+    LAST_CALLBACK_ERROR.with(|c| c.borrow_mut().take())
+}
+
 impl VmHandle {
     /// Boots a fresh VM: arms `FatalMode::ExitThread` and this thread's
     /// foreign-fault handler (module doc), runs genesis, and loads
@@ -857,7 +878,19 @@ impl VmHandle {
             // answer the shape default. Clear the guard: the unwind skipped the
             // normal-return clear below, and the run loop must be able to
             // dispatch the NEXT callback.
-            let _ = deopt_trap::take_last_guest_fatal_message();
+            // §6.3 (docs/applescript_design.md): the message is AVAILABLE
+            // here and used to be dropped on the floor. Dropping it is right
+            // for a delegate answering a row count — the run loop must not
+            // care — but it is exactly wrong for a scripting handler, whose
+            // entire job is to report what went wrong, and it silently
+            // disguised four separate bugs while the Apple Event surface was
+            // being built (a `Time millisecondClock` typo, a deadline
+            // computation, a sweep walk, and a stage-3 session). Park it for
+            // the caller instead; whoever wants it takes it, and anyone who
+            // does not is unaffected.
+            if let Some(m) = deopt_trap::take_last_guest_fatal_message() {
+                set_last_callback_error(m);
+            }
             self.restore_after_guest_fatal();
             set_callback_active(false);
             return default;
@@ -871,6 +904,12 @@ impl VmHandle {
             self.restore_after_guest_fatal();
             set_callback_active(false);
             if let Some((sig, pc, far)) = info {
+                // Same §6.3 reasoning as the guest-fatal arm above: a raw
+                // fault in a handler is even less self-explanatory than a
+                // guest error, so make it takeable too.
+                set_last_callback_error(format!(
+                    "native fault (signal {sig}) at pc={pc:#x} far={far:#x}"
+                ));
                 let _ = writeln!(
                     self.vm.out,
                     "[cocoa-delegate] native fault (signal {sig}) at pc=0x{pc:x} far=0x{far:x} — recovered, delegate answered its default"

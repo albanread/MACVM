@@ -350,6 +350,32 @@ So the scripting path needs a variant that returns the message rather than
 dropping it, and maps it onto `setScriptErrorString:` /
 `setScriptErrorNumber:`. Nothing else about the recovery changes.
 
+**BUILT 2026-08-07.** `dispatch_callback` now parks the message in a
+thread-local instead of discarding it (`embed::take_last_callback_error`),
+and the scripting command IMPs take it: a non-zero take means the handler
+*blew up* rather than answered nil, and the IMP sets the command's error
+properties directly (`set_script_error`, the Rust half — used precisely
+because the world is what failed). The native-fault arm parks a message too,
+so a SIGSEGV inside a handler is reportable rather than mute.
+
+Verified by arming `clear transcript`'s handler to raise: the script now gets
+
+```
+execution error: macVM got an error: macVM: Error: does not understand
+someUndefinedSelector
+```
+
+where before it silently did nothing. Anticipated failures are untouched —
+they set their own error and return nil *without* parking a message, so
+`browse "Nonesuch"` still reports its own wording.
+
+Worth recording why this mattered more than it looked: the discarded message
+disguised **four** separate bugs while this arc was being built — a
+`Time millisecondClock` typo, a deadline computation, a sweep walk, and most
+of a stage-3 session — each presenting as "nothing happens". A mechanism that
+eats error messages does not merely degrade reporting; it systematically
+hides every bug built on top of it.
+
 Scope it precisely: this is for errors raised *inside a synchronous
 handler*, so it ships with stage 2 — a `browse` whose handler itself
 fails must become a script error, not a silent success. `evaluate`'s
