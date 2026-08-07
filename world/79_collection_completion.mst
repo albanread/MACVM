@@ -1,0 +1,388 @@
+"79_collection_completion.mst — the gaps a `respondsTo:` census found across the
+ collection tree, filled at the RIGHT level of the hierarchy.
+
+ Two rules govern where each method landed:
+
+ 1. **Protocol that only needs `do:` belongs on Collection**, not on
+    SequenceableCollection. `count:` was the clearest example: it lived on
+    SequenceableCollection, so `aSet count: [...]`, `aDictionary count: [...]`
+    and `aBag count: [...]` all failed for want of six lines. Anything here
+    that a Set can answer is defined once, on Collection.
+
+ 2. **Protocol that needs indices belongs on SequenceableCollection**, and is
+    written against `at:`/`size`/`do:` only — never against a concrete
+    representation — so Interval and ByteArray inherit it working.
+
+ The one substantial piece of machinery is `Dictionary>>removeKey:`. Until now
+ a Dictionary could be added to but never removed from. It uses the same
+ no-tombstone discipline `Set>>remove:` already establishes (world/22): nil the
+ slot, then re-probe the following cluster so nothing is stranded past the new
+ gap, which leaves `scanFor:` unchanged and needs no new state.
+
+ Error paths here raise `Error signal:`, not `self error:`. The two are
+ identical when nothing handles them (world/78's `unhandled` keeps exactly
+ the old reported-error behaviour), but a signal is CATCHABLE — so
+ `[ aSet anyOne ] on: Error do: [...]` works, where the primitive-backed
+ `error:` (prim 95) terminates and cannot be caught until E4 lands. New
+ library code is the right place to start using the capability; existing
+ `self error:` sites are left alone."
+
+Object subclass: Collection [
+    "Counting and searching that need nothing but `do:` — so every collection
+     gets them, not just the sequenceable ones."
+    count: aBlock <[Object]> ^ <Integer> [
+        "How many of my elements satisfy aBlock."
+        | n |
+        n := 0.
+        self do: [:each | (aBlock value: each) ifTrue: [ n := n + 1 ] ].
+        ^n
+    ]
+    noneSatisfy: aBlock <[Object]> ^ <Boolean> [
+        ^(self anySatisfy: aBlock) not
+    ]
+    anyOne ^ <Object> [
+        "SOME element, unspecified which — for the common `aSet anyOne` idiom
+         where any representative will do. Errors on an empty collection
+         rather than answering nil, which would be indistinguishable from a
+         collection that legitimately holds nil."
+        self do: [:each | ^each ].
+        ^Error signal: 'anyOne: the collection is empty'
+    ]
+
+    "Copies. `copyWith:`/`copyWithout:` answer MY species where that is
+     meaningful; a Collection-level definition builds an OrderedCollection,
+     and the sequenceable classes below narrow it to preserve species."
+    copyWithout: oldElement <Object> ^ <Collection> [
+        "A copy with every occurrence of oldElement left out."
+        | r |
+        r := OrderedCollection new.
+        self do: [:each | each = oldElement ifFalse: [ r add: each ] ].
+        ^r
+    ]
+    copyWith: newElement <Object> ^ <Collection> [
+        | r |
+        r := OrderedCollection new.
+        self do: [:each | r add: each ].
+        r add: newElement.
+        ^r
+    ]
+
+    "Conversions the tree was missing."
+    asDictionary ^ <Dictionary> [
+        "Every element must be an Association (or answer key/value) — the
+         inverse of `aDictionary associations`."
+        | d |
+        d := Dictionary new.
+        self do: [:each | d at: each key put: each value ].
+        ^d
+    ]
+    addIfNotPresent: anObject <Object> ^ <Object> [
+        "Add only when absent; answer the object either way (Set semantics
+         made explicit for any collection that can `includes:`)."
+        (self includes: anObject) ifFalse: [ self add: anObject ].
+        ^anObject
+    ]
+
+    "Removal at the Collection level: subclasses that can remove implement
+     `remove:ifAbsent:`, and these two come free once they do."
+    remove: oldObject <Object> ^ <Object> [
+        ^self remove: oldObject ifAbsent: [ Error signal: 'object not found' ]
+    ]
+    removeAllSuchThat: aBlock <[Object]> [
+        "Collected first, removed after — mutating while `do:` walks is what
+         breaks open-addressed tables mid-heal."
+        | doomed |
+        doomed := OrderedCollection new.
+        self do: [:each | (aBlock value: each) ifTrue: [ doomed add: each ] ].
+        doomed do: [:each | self remove: each ifAbsent: [ nil ] ].
+    ]
+]
+
+Collection subclass: SequenceableCollection [
+    "Index-aware protocol, written against at:/size only so Interval and
+     ByteArray inherit it working."
+    from: start <Integer> to: stop <Integer> do: aBlock <[Object]> [
+        start to: stop do: [:i | aBlock value: (self at: i) ]
+    ]
+    pairsDo: aBlock <[Object,Object]> [
+        "Walk me two at a time: (1,2), (3,4), ... A trailing odd element is
+         not passed — a pair needs two."
+        | i |
+        i := 1.
+        [ i + 1 <= self size ] whileTrue: [
+            aBlock value: (self at: i) value: (self at: i + 1).
+            i := i + 2 ]
+    ]
+    overlappingPairsDo: aBlock <[Object,Object]> [
+        "Every adjacent pair: (1,2), (2,3), (3,4), ... — the shape a
+         difference or slope calculation wants."
+        1 to: self size - 1 do: [:i |
+            aBlock value: (self at: i) value: (self at: i + 1) ]
+    ]
+    atAllPut: anObject <Object> ^ <Self> [
+        1 to: self size do: [:i | self at: i put: anObject ].
+        ^self
+    ]
+    atAll: anIndexCollection <Collection> put: anObject <Object> ^ <Self> [
+        anIndexCollection do: [:i | self at: i put: anObject ].
+        ^self
+    ]
+    at: index <Integer> ifAbsent: aBlock <[]> ^ <Object> [
+        "Bounds-checked read — the alternative to a failing at:, and the
+         reason a caller need not pre-check `size`."
+        (index isInteger and: [ index >= 1 and: [ index <= self size ] ])
+            ifFalse: [ ^aBlock value ].
+        ^self at: index
+    ]
+
+    copyReplaceAll: oldSub <SequenceableCollection> with: newSub <SequenceableCollection> ^ <SequenceableCollection> [
+        "Every non-overlapping occurrence of oldSub replaced by newSub.
+         Answers my species via `copyEmpty`, so a String answers a String.
+         An empty oldSub would match everywhere and never advance, so it
+         answers a plain copy instead of looping forever."
+        | out i n m |
+        n := self size. m := oldSub size.
+        out := self copyEmptyForReplace.
+        m = 0 ifTrue: [
+            1 to: n do: [:k | out add: (self at: k) ].
+            ^self speciesFromReplace: out ].
+        i := 1.
+        [ i <= n ] whileTrue: [
+            (i + m - 1 <= n and: [ self matchesSubCollection: oldSub at: i ])
+                ifTrue: [
+                    1 to: newSub size do: [:k | out add: (newSub at: k) ].
+                    i := i + m ]
+                ifFalse: [
+                    out add: (self at: i).
+                    i := i + 1 ] ].
+        ^self speciesFromReplace: out
+    ]
+    "The two species hooks copyReplaceAll:with: builds on. The default pair
+     accumulates into an OrderedCollection and answers an Array, which is
+     right for Array/OrderedCollection/Interval; String overrides the second
+     to answer a String (world/80)."
+    copyEmptyForReplace ^ <OrderedCollection> [ ^OrderedCollection new ]
+    speciesFromReplace: anOrderedCollection <OrderedCollection> ^ <Object> [
+        ^anOrderedCollection asArray
+    ]
+
+    copyWithout: oldElement <Object> ^ <Object> [
+        "Species-preserving override of Collection's: an Array answers an
+         Array rather than an OrderedCollection."
+        | r |
+        r := OrderedCollection new.
+        self do: [:each | each = oldElement ifFalse: [ r add: each ] ].
+        ^self speciesFromReplace: r
+    ]
+    copyWith: newElement <Object> ^ <Object> [
+        | r |
+        r := OrderedCollection new.
+        self do: [:each | r add: each ].
+        r add: newElement.
+        ^self speciesFromReplace: r
+    ]
+
+    writeStream ^ <WriteStream> [
+        "The write-side companion to Collection>>readStream.
+
+         WriteStream grows its backing store with `collection class new:` and
+         writes through `at:put:`, so the store must be a FIXED-SIZE indexable
+         collection — an OrderedCollection is not one, and handing it one
+         fails inside the first grow. Hence the species hook: an Array-backed
+         stream by default, a String-backed one for String (world/80), which
+         is also what makes `aString writeStream contents` answer a String."
+        ^WriteStream on: (self writeStreamSpecies new: 0)
+    ]
+    writeStreamSpecies ^ <Behavior> [ ^Array ]
+]
+
+SequenceableCollection subclass: OrderedCollection [
+    add: newObject <Object> beforeIndex: index <Integer> ^ <Object> [
+        "Insert so that newObject ends up AT index, shifting the rest right.
+         index = size + 1 appends, which is what makes an insertion loop
+         terminate cleanly at the end."
+        | n |
+        n := self size.
+        (index between: 1 and: n + 1)
+            ifFalse: [ ^Error signal: 'index out of bounds' ].
+        index = (n + 1) ifTrue: [ ^self addLast: newObject ].
+        self addLast: (self at: n).
+        n to: index + 1 by: -1 do: [:i | self at: i put: (self at: i - 1) ].
+        self at: index put: newObject.
+        ^newObject
+    ]
+    addAllLast: aCollection <Collection> ^ <Collection> [
+        aCollection do: [:each | self addLast: each ].
+        ^aCollection
+    ]
+    addAllFirst: aCollection <Collection> ^ <Collection> [
+        "Prepend preserving aCollection's own order (so the first element of
+         aCollection is first in me) — hence the reverse walk."
+        aCollection asArray reverseDo: [:each | self addFirst: each ].
+        ^aCollection
+    ]
+    "An OrderedCollection grows, so it accumulates into and answers its own
+     species rather than an Array."
+    speciesFromReplace: anOrderedCollection <OrderedCollection> ^ <OrderedCollection> [
+        ^anOrderedCollection
+    ]
+]
+
+HashedCollection subclass: Dictionary [
+    "Removal. Until this, a Dictionary could be added to but never removed
+     from — the single largest hole the census found.
+
+     Same no-tombstone discipline as Set>>remove: (world/22): nil the slot,
+     decrement, then re-probe the cluster that follows so no later entry is
+     stranded past the new gap. That keeps `scanFor:` — which stops at the
+     first nil — correct with no extra state and no change to any reader."
+    removeKey: key <Object> ifAbsent: aBlock <[]> ^ <Object> [
+        | i val |
+        i := self scanFor: key.
+        (keys at: i) isNil ifTrue: [ ^aBlock value ].
+        val := vals at: i.
+        keys at: i put: nil.
+        vals at: i put: nil.
+        tally := tally - 1.
+        self fixCollisionsFrom: i.
+        ^val
+    ]
+    removeKey: key <Object> ^ <Object> [
+        ^self removeKey: key ifAbsent: [ Error signal: 'key not found' ]
+    ]
+    "Re-probe every occupied slot after `index` up to the next nil, moving
+     each to its correct scanFor: position (which may now be the freed gap).
+     Both parallel arrays move together — the pair IS the entry."
+    fixCollisionsFrom: index <Integer> [
+        | cap i probeKey probeVal j |
+        cap := keys size.
+        i := index.
+        [ i := i = cap ifTrue: [ 1 ] ifFalse: [ i + 1 ].
+          probeKey := keys at: i.
+          probeKey notNil ] whileTrue: [
+            probeVal := vals at: i.
+            keys at: i put: nil.
+            vals at: i put: nil.
+            j := self scanFor: probeKey.
+            keys at: j put: probeKey.
+            vals at: j put: probeVal ]
+    ]
+
+    associationAt: key <Object> ifAbsent: aBlock <[]> ^ <Object> [
+        | i |
+        i := self scanFor: key.
+        (keys at: i) isNil ifTrue: [ ^aBlock value ].
+        ^Association key: (keys at: i) value: (vals at: i)
+    ]
+    associationAt: key <Object> ^ <Association> [
+        ^self associationAt: key ifAbsent: [ Error signal: 'key not found' ]
+    ]
+    keyAtValue: value <Object> ifAbsent: aBlock <[]> ^ <Object> [
+        self keysAndValuesDo: [:k :v | v = value ifTrue: [ ^k ] ].
+        ^aBlock value
+    ]
+    keysSortedSafely ^ <Array> [
+        "Keys in sorted order — the reproducible walk a hash table cannot
+         otherwise offer. 'Safely' is the traditional name: keys that cannot
+         be compared with < fall back to comparing their printStrings, so a
+         mixed-key dictionary still answers an order instead of failing."
+        | ks allComparable |
+        ks := self keys asArray.
+        allComparable := ks allSatisfy: [:k | k respondsTo: #< ].
+        allComparable ifTrue: [ ^ks sorted ].
+        ^ks sorted: [:a :b | a printString <= b printString ]
+    ]
+    associations ^ <Array> [
+        | r |
+        r := OrderedCollection new.
+        self associationsDo: [:a | r add: a ].
+        ^r asArray
+    ]
+    "Two dictionaries are equal when they hold the same keys mapped to equal
+     values — order of insertion is not part of the value."
+    = other <Object> ^ <Boolean> [
+        (other isKindOf: Dictionary) ifFalse: [ ^false ].
+        other size = self size ifFalse: [ ^false ].
+        self keysAndValuesDo: [:k :v |
+            (other at: k ifAbsent: [ ^false ]) = v ifFalse: [ ^false ] ].
+        ^true
+    ]
+    "Collection>>collect: answers a Bag of the transformed VALUES, which is
+     ANSI; a dictionary-shaped collect is `collect:` over keysAndValues."
+    collectAssociations: aBlock <[Object,Object]> ^ <Dictionary> [
+        | d |
+        d := Dictionary new.
+        self keysAndValuesDo: [:k :v | d at: k put: (aBlock value: k value: v) ].
+        ^d
+    ]
+    select: aBlock <[Object]> ^ <Dictionary> [
+        "A dictionary filtered by VALUE stays a dictionary — Collection's
+         select: would answer a bare Bag and lose every key."
+        | d |
+        d := Dictionary new.
+        self keysAndValuesDo: [:k :v | (aBlock value: v) ifTrue: [ d at: k put: v ] ].
+        ^d
+    ]
+]
+
+HashedCollection subclass: Set [
+    "Two sets are equal when each contains the other's elements."
+    = other <Object> ^ <Boolean> [
+        (other isKindOf: Set) ifFalse: [ ^false ].
+        other size = self size ifFalse: [ ^false ].
+        self do: [:each | (other includes: each) ifFalse: [ ^false ] ].
+        ^true
+    ]
+    hash ^ <Integer> [
+        "Order-independent, so equal sets hash alike: sum the element hashes."
+        | h |
+        h := self size.
+        self do: [:each | h := h + each hash ].
+        ^h
+    ]
+]
+
+Collection subclass: Bag [
+    "Bag's own census protocol — the reason to reach for a Bag at all."
+    valuesAndCounts ^ <Dictionary> [
+        "element -> occurrence count."
+        | d |
+        d := Dictionary new.
+        self do: [:each | d at: each put: (d at: each ifAbsent: [ 0 ]) + 1 ].
+        ^d
+    ]
+    sortedCounts ^ <Array> [
+        "Associations count -> element, most frequent first — the histogram
+         shape (`aBag sortedCounts first value` is the mode)."
+        | assocs |
+        assocs := OrderedCollection new.
+        self valuesAndCounts keysAndValuesDo: [:el :n | assocs add: n -> el ].
+        ^(assocs asArray sorted: [:a :b | a key >= b key ])
+    ]
+    asSet ^ <Set> [
+        | s |
+        s := Set new.
+        self do: [:each | s add: each ].
+        ^s
+    ]
+]
+
+SequenceableCollection subclass: Interval [
+    step ^ <Number> [
+        "The stride. `(1 to: 10 by: 3) step` is 3 — derivable from the first
+         two elements, but a reader should not have to."
+        ^step
+    ]
+    = other <Object> ^ <Boolean> [
+        "An Interval equals any sequenceable collection with the same
+         elements in the same order — `(1 to: 3) = #(1 2 3)` is true."
+        (other isKindOf: SequenceableCollection) ifFalse: [ ^false ].
+        other size = self size ifFalse: [ ^false ].
+        1 to: self size do: [:i |
+            (self at: i) = (other at: i) ifFalse: [ ^false ] ].
+        ^true
+    ]
+    hash ^ <Integer> [
+        ^self size = 0 ifTrue: [ 0 ] ifFalse: [ self first hash + self last hash + self size ]
+    ]
+]

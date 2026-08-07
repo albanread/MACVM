@@ -161,3 +161,15 @@
 # Exceptions (E0+E1, docs/exceptions_design.md): the hierarchy, signal, and
 # BlockClosure>>on:do:. Purely additive — the VM does not signal yet (E4).
 78_exceptions.mst
+# Collection-tree completion (a respondsTo: census, filled at the right level
+# of the hierarchy): Collection gains count:/anyOne/copyWith:/copyWithout:/
+# asDictionary/remove:/removeAllSuchThat:, SequenceableCollection gains
+# copyReplaceAll:with:/pairsDo:/atAllPut:/at:ifAbsent:/writeStream, and
+# Dictionary finally gains removeKey: — the same no-tombstone heal Set uses.
+79_collection_completion.mst
+# Numeric/text completion: Number gains the sign predicates and the whole
+# transcendental family (they lived on Double ONLY, so `1 sin` was a DNU),
+# Integer gains bit/base protocol incl. an exact sqrtFloor, Double gains the
+# IEEE special-value tests, String/Symbol/Character gain text protocol, and
+# Object/UndefinedObject gain REAL ifNil: methods so reflective use works.
+80_numeric_completion.mst

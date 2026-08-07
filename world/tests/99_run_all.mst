@@ -55,4 +55,6 @@ TestRunner run: SocketTests.
 TestRunner run: AccelTests.
 TestRunner run: SupervisorTests.
 TestRunner run: ExceptionTests.
+TestRunner run: CollectionCompletionTests.
+TestRunner run: NumericCompletionTests.
 TestRunner report.

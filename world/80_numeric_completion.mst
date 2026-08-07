@@ -1,0 +1,358 @@
+"80_numeric_completion.mst — the rest of the census (world/79 did the
+ collections): numeric sign and transcendental protocol, integer bit/base
+ protocol, String/Symbol/Character text protocol, and a handful of Object
+ conveniences.
+
+ The organising finding: the transcendental functions lived on **Double
+ only**, so `1 sin`, `2 exp` and `10 ln` were all doesNotUnderstand while
+ `1.0 sin` worked. Every one of them is mathematically defined on any
+ Number, and every one is already implemented on Double — so they belong on
+ Number, coercing with `asFloat` exactly as `Number>>sqrt` and
+ `Number>>log` already do. The same argument put `negative`/`positive` on
+ Number rather than leaving Fraction the only class that had `negative`.
+
+ A note on `ifNil:`/`ifNotNil:`: those already WORK, because the compiler
+ inlines them at the send site — but `respondsTo: #ifNil:` answers false and
+ `perform: #ifNil: with: [...]` fails, because no method exists. The real
+ methods below are the backstop for reflective use; inlined sites never
+ reach them.
+
+ Error paths raise `Error signal:` rather than `self error:` — see
+ world/79's header for why (identical unhandled, but catchable)."
+
+Magnitude subclass: Number [
+    "Sign tests. `sign` existed; the three predicates every library expects
+     to build on it did not."
+    negative ^ <Boolean> [ ^self < 0 ]
+    positive ^ <Boolean> [ "zero counts as positive — ANSI" ^self >= 0 ]
+    strictlyPositive ^ <Boolean> [ ^self > 0 ]
+    isNumber ^ <Boolean> [ ^true ]
+
+    "Transcendentals, defined for every Number by coercing to Float — the
+     coercion `sqrt` and `log` already use. Double overrides each of these
+     with its own primitive-backed version, so this costs nothing there."
+    sin ^ <Double> [ ^self asFloat sin ]
+    cos ^ <Double> [ ^self asFloat cos ]
+    tan ^ <Double> [ ^self asFloat tan ]
+    exp ^ <Double> [ ^self asFloat exp ]
+    ln ^ <Double> [ ^self asFloat ln ]
+    arcTan ^ <Double> [ ^self asFloat atan ]
+
+    "Inverse sine and cosine, via arcTan — the identities that hold on the
+     principal branch. Both error outside [-1, 1] rather than answering a
+     NaN a caller would have to test for."
+    arcSin ^ <Double> [
+        | x |
+        x := self asFloat.
+        (x < -1.0 or: [ x > 1.0 ]) ifTrue: [ ^Error signal: 'arcSin: out of domain' ].
+        (x = 1.0) ifTrue: [ ^Double pi / 2.0 ].
+        (x = -1.0) ifTrue: [ ^Double pi negated / 2.0 ].
+        ^(x / (1.0 - (x * x)) sqrt) arcTan
+    ]
+    arcCos ^ <Double> [
+        | x |
+        x := self asFloat.
+        (x < -1.0 or: [ x > 1.0 ]) ifTrue: [ ^Error signal: 'arcCos: out of domain' ].
+        ^(Double pi / 2.0) - x arcSin
+    ]
+    "Two-argument arctangent: the angle of the point (x, self), correct in
+     all four quadrants — which plain arcTan cannot be, having lost the
+     signs to the division."
+    arcTan: x <Number> ^ <Double> [
+        | y fx |
+        y := self asFloat. fx := x asFloat.
+        fx > 0.0 ifTrue: [ ^(y / fx) arcTan ].
+        fx < 0.0 ifTrue: [
+            y >= 0.0
+                ifTrue: [ ^(y / fx) arcTan + Double pi ]
+                ifFalse: [ ^(y / fx) arcTan - Double pi ] ].
+        y > 0.0 ifTrue: [ ^Double pi / 2.0 ].
+        y < 0.0 ifTrue: [ ^Double pi negated / 2.0 ].
+        ^0.0
+    ]
+
+    degreesToRadians ^ <Double> [ ^self asFloat * Double pi / 180.0 ]
+    radiansToDegrees ^ <Double> [ ^self asFloat * 180.0 / Double pi ]
+]
+
+Number subclass: Integer [
+    "Bit inspection. `bitAnd:`/`bitShift:` are primitives; these are the
+     readable protocol built on them."
+    bitAt: index <Integer> ^ <Integer> [
+        "Bit `index`, 1-based from the least significant end — ANSI's
+         numbering, so `1 bitAt: 1` is 1."
+        index < 1 ifTrue: [ ^Error signal: 'bitAt: index must be >= 1' ].
+        ^(self bitShift: 1 - index) bitAnd: 1
+    ]
+    bitInvert ^ <Integer> [ ^self negated - 1 ]
+    isPowerOfTwo ^ <Boolean> [
+        "Exactly one bit set. Zero and negatives are not powers of two."
+        self <= 0 ifTrue: [ ^false ].
+        ^(self bitAnd: self - 1) = 0
+    ]
+    highBit ^ <Integer> [
+        "The 1-based position of my highest set bit; 0 for zero. Errors on a
+         negative, which has no finite highest bit in two's complement."
+        | n h |
+        self < 0 ifTrue: [ ^Error signal: 'highBit: negative' ].
+        n := self. h := 0.
+        [ n > 0 ] whileTrue: [ h := h + 1. n := n bitShift: -1 ].
+        ^h
+    ]
+    sqrtFloor ^ <Integer> [
+        "floor(sqrt(self)) EXACTLY, by Newton's method on integers — the
+         float sqrt rounds, so `(10 raisedTo: 20) sqrtFloor` would come back
+         one short of the true root often enough to matter."
+        | guess next |
+        self < 0 ifTrue: [ ^Error signal: 'sqrtFloor: negative' ].
+        self < 2 ifTrue: [ ^self ].
+        guess := self.
+        next := (guess + (self // guess)) // 2.
+        [ next < guess ] whileTrue: [
+            guess := next.
+            next := (guess + (self // guess)) // 2 ].
+        ^guess
+    ]
+    printOn: aStream <WriteStream> base: base <Integer> [
+        aStream nextPutAll: (self printString: base)
+    ]
+    asCharacter ^ <Character> [ ^Character value: self ]
+]
+
+Integer subclass: LargeInteger [
+    "── division: the largest hole the census found ──────────────────────
+
+     Before this, a LargeInteger supported + - * < = and NOTHING derived from
+     division. `//` and `\\` were absent, and because every other operation
+     bottoms out in them, ALL of these failed on a large receiver:
+     `quo:` `rem:` `gcd:` `/` `even` `odd` `printString:` `isPrime`.
+     `100 factorial / 2` was a doesNotUnderstand.
+
+     The existing `divMod:` is SHORT division: it walks bytes computing
+     `part // d` with `part` a SmallInteger, so it is correct only for a
+     small POSITIVE divisor. Measured, it is also wrong rather than failing
+     for a negative one (`(10 raisedTo: 20) divMod: -3` answers a quotient
+     ten times too small), and it raises 'large division unimplemented' when
+     the divisor is itself large. So it is kept as the fast path and fenced
+     to the regime where it holds, with a general algorithm behind it."
+
+    "Long division in radix 256 — correct for ANY positive divisor. Same
+     byte walk as short division, but each quotient digit is found by binary
+     search instead of a machine divide, which needs only *, - and <= (all
+     of which LargeInteger already has).
+
+     The digit really is in 0..255: on entry `rem < d`, so after shifting in
+     a byte `rem <= (d-1)*256 + 255 = 256d - 1`, whence `rem // d <= 255`.
+
+     Answers `quotient -> remainder` for a NON-NEGATIVE receiver and a
+     POSITIVE divisor; the sign rules are applied by the callers below."
+    divideMagnitudeBy: d <Integer> ^ <Association> [
+        | q rem i lo hi mid digit |
+        d isZero ifTrue: [ ^ZeroDivide signal: 'division by zero' ].
+        "Fast path: the existing short division — but ONLY where it is valid,
+         and its real precondition is narrower than 'the divisor is small'.
+         divMod: forms `rem * 256 + byte` as a SmallInteger with rem < d, so
+         it needs `256 * d` to still fit. Hand it a merely large-ish
+         SmallInteger and `part` silently becomes a LargeInteger whose own //
+         re-enters this method — an unbounded recursion (measured: a stack
+         overflow six Newton steps into `(10 raisedTo: 20) sqrtFloor`, at the
+         exact iteration where the guess first fell back to a SmallInteger)."
+        ((d isKindOf: LargeInteger) not and: [ (d * 256) class == SmallInteger ])
+            ifTrue: [ ^self divMod: d ].
+        q := LargePositiveInteger basicNew: self size.
+        rem := 0.
+        i := self size.
+        [ i >= 1 ] whileTrue: [
+            rem := (rem * 256) + (self byteAt: i).
+            "Largest digit with digit * d <= rem."
+            lo := 0. hi := 255. digit := 0.
+            [ lo <= hi ] whileTrue: [
+                mid := (lo + hi) // 2.
+                (mid * d) <= rem
+                    ifTrue: [ digit := mid. lo := mid + 1 ]
+                    ifFalse: [ hi := mid - 1 ] ].
+            q byteAt: i put: digit.
+            rem := rem - (digit * d).
+            i := i - 1 ].
+        ^Association key: q normalize value: rem
+    ]
+
+    "FLOORED division — `//` rounds toward negative infinity and `\\` takes
+     the sign of the divisor, which is Smalltalk's rule and NOT what the
+     magnitude-only divMod: answers. Both are derived from one magnitude
+     division so the pair can never disagree."
+    // aNumber <Integer> ^ <Integer> [
+        ^(self flooredDivMod: aNumber) key
+    ]
+    \\ aNumber <Integer> ^ <Integer> [
+        ^(self flooredDivMod: aNumber) value
+    ]
+    flooredDivMod: aNumber <Integer> ^ <Association> [
+        | qr q r negA negB |
+        aNumber isZero ifTrue: [ ^ZeroDivide signal: 'division by zero' ].
+        negA := self negative. negB := aNumber negative.
+        qr := self abs divideMagnitudeBy: aNumber abs.
+        q := qr key. r := qr value.
+        "Exact division: no correction, and the remainder is zero whatever
+         the signs."
+        r isZero ifTrue: [
+            ^Association key: (negA = negB ifTrue: [ q ] ifFalse: [ q negated ])
+                        value: 0 ].
+        (negA = negB) ifTrue: [
+            "Same signs: quotient positive, remainder takes the divisor's sign."
+            ^Association key: q value: (negB ifTrue: [ r negated ] ifFalse: [ r ]) ].
+        "Opposite signs: floor goes one BELOW the truncated quotient, and the
+         remainder is the divisor's magnitude short of it — again signed like
+         the divisor."
+        ^Association key: (q + 1) negated
+                    value: (negB ifTrue: [ (aNumber abs - r) negated ] ifFalse: [ aNumber abs - r ])
+    ]
+
+    "Bit protocol, from the byte representation — Integer's versions go
+     through bitShift:, which LargeInteger does not have, so they would fail
+     on exactly the numbers big enough to need them."
+    bitAt: index <Integer> ^ <Integer> [
+        | byteIndex |
+        index < 1 ifTrue: [ ^Error signal: 'bitAt: index must be >= 1' ].
+        byteIndex := ((index - 1) // 8) + 1.
+        byteIndex > self size ifTrue: [ ^0 ].
+        ^((self byteAt: byteIndex) bitShift: 0 - ((index - 1) \\ 8)) bitAnd: 1
+    ]
+    highBit ^ <Integer> [
+        | i b |
+        self negative ifTrue: [ ^Error signal: 'highBit: negative' ].
+        i := self size.
+        [ i >= 1 and: [ (self byteAt: i) = 0 ] ] whileTrue: [ i := i - 1 ].
+        i < 1 ifTrue: [ ^0 ].
+        b := self byteAt: i.
+        ^((i - 1) * 8) + b highBit
+    ]
+]
+
+Number subclass: Double [
+    "IEEE special-value tests. NaN is the only value not equal to itself —
+     that identity IS the test, and it is why `isNaN` cannot be written as a
+     comparison against a NaN constant."
+    isNaN ^ <Boolean> [ ^(self = self) not ]
+    isInfinite ^ <Boolean> [
+        ^self isNaN not and: [ (self > 1.0e308) or: [ self < -1.0e308 ] ]
+    ]
+    isFinite ^ <Boolean> [ ^self isNaN not and: [ self isInfinite not ] ]
+    "Double's own sign predicates: NaN is neither negative nor positive, so
+     Number's `< 0` / `>= 0` pair would wrongly call it positive."
+    positive ^ <Boolean> [ ^self isNaN not and: [ self >= 0.0 ] ]
+    negative ^ <Boolean> [ ^self isNaN not and: [ self < 0.0 ] ]
+]
+
+ArrayedCollection subclass: String [
+    "A String replacement answers a String — the species hook world/79's
+     copyReplaceAll:with: defers to. Without this override it would answer an
+     Array of Characters, which prints unrecognisably."
+    speciesFromReplace: anOrderedCollection <OrderedCollection> ^ <String> [
+        | s i |
+        s := String new: anOrderedCollection size.
+        i := 1.
+        anOrderedCollection do: [:ch | s at: i put: ch. i := i + 1 ].
+        ^s
+    ]
+    writeStreamSpecies ^ <Behavior> [ ^String ]
+    lines ^ <OrderedCollection> [
+        "Split on newlines, dropping the separators. A trailing newline does
+         NOT produce a final empty line — `'a\nb\n' lines` is two lines, the
+         behaviour every line-oriented reader expects."
+        | out cur lf |
+        lf := Character value: 10.
+        out := OrderedCollection new.
+        cur := WriteStream on: String new.
+        self do: [:ch |
+            ch = lf
+                ifTrue: [ out add: cur contents. cur := WriteStream on: String new ]
+                ifFalse: [ ch = (Character value: 13) ifFalse: [ cur nextPut: ch ] ] ].
+        cur contents isEmpty ifFalse: [ out add: cur contents ].
+        ^out
+    ]
+    linesDo: aBlock <[String]> [ self lines do: [:l | aBlock value: l ] ]
+]
+
+String subclass: Symbol [
+    "Selector shape — what a browser, a linter and `numArgs` all need to
+     know about a symbol used as a selector."
+    isKeyword ^ <Boolean> [
+        ^self size > 0 and: [ (self at: self size) = $: ]
+    ]
+    isBinary ^ <Boolean> [
+        "Every character is a binary-selector character."
+        self size = 0 ifTrue: [ ^false ].
+        ^self allSatisfy: [:ch | '+-*/~<>=&|@%,?!\' includes: ch ]
+    ]
+    isUnary ^ <Boolean> [
+        ^self isKeyword not and: [ self isBinary not ]
+    ]
+    keywords ^ <OrderedCollection> [
+        "A keyword selector split into its parts, colons kept:
+         `#at:put: keywords` is ('at:' 'put:'). A unary or binary selector
+         answers itself as the single element, which is what makes a caller
+         able to walk any selector uniformly."
+        | out cur |
+        self isKeyword ifFalse: [ ^OrderedCollection new add: self asString; yourself ].
+        out := OrderedCollection new.
+        cur := WriteStream on: String new.
+        self do: [:ch |
+            cur nextPut: ch.
+            ch = $: ifTrue: [ out add: cur contents. cur := WriteStream on: String new ] ].
+        ^out
+    ]
+]
+
+Magnitude subclass: Character [
+    isPunctuation ^ <Boolean> [
+        ^'.,;:!?''"`()[]{}<>-_/\|@#$%^&*+=~' includes: self
+    ]
+    asString ^ <String> [ ^String with: self ]
+]
+
+nil subclass: Object [
+    "Real methods for the nil-guards. These already work at every literal
+     send site because the compiler inlines them; what did not work was
+     reflective use — `respondsTo: #ifNil:` answered false and
+     `perform: #ifNil: with: aBlock` failed outright."
+    ifNil: aBlock <[]> ^ <Object> [ ^self ]
+    ifNotNil: aBlock <[Object]> ^ <Object> [ ^aBlock value: self ]
+    ifNil: nilBlock <[]> ifNotNil: notNilBlock <[Object]> ^ <Object> [
+        ^notNilBlock value: self
+    ]
+    ifNotNil: notNilBlock <[Object]> ifNil: nilBlock <[]> ^ <Object> [
+        ^notNilBlock value: self
+    ]
+
+    assert: aBooleanOrBlock <Object> ^ <Self> [
+        "A checked invariant. Takes a Boolean or a Block so the condition can
+         be written either way; a false one errors with a message naming
+         itself, since an unlabelled failure is the least useful kind."
+        | ok |
+        ok := aBooleanOrBlock.
+        (ok == true or: [ ok == false ]) ifFalse: [ ok := aBooleanOrBlock value ].
+        ok == true ifFalse: [ ^Error signal: 'assertion failed' ].
+        ^self
+    ]
+    assert: aBooleanOrBlock <Object> description: aString <String> ^ <Self> [
+        | ok |
+        ok := aBooleanOrBlock.
+        (ok == true or: [ ok == false ]) ifFalse: [ ok := aBooleanOrBlock value ].
+        ok == true ifFalse: [ ^Error signal: 'assertion failed: ' , aString ].
+        ^self
+    ]
+]
+
+Object subclass: UndefinedObject [
+    "nil's half of the pair — the reason the inlined form has to exist at
+     all, and the reason reflective use needs a real method here too."
+    ifNil: aBlock <[]> ^ <Object> [ ^aBlock value ]
+    ifNotNil: aBlock <[Object]> ^ <Object> [ ^nil ]
+    ifNil: nilBlock <[]> ifNotNil: notNilBlock <[Object]> ^ <Object> [ ^nilBlock value ]
+    ifNotNil: notNilBlock <[Object]> ifNil: nilBlock <[]> ^ <Object> [ ^nilBlock value ]
+]
+
+Object subclass: Point [
+    transpose ^ <Point> [ "y @ x — the reflection about the diagonal." ^y @ x ]
+]

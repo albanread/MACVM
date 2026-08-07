@@ -1,0 +1,302 @@
+"51_collection_completion_tests.mst — gates world/79_collection_completion.mst.
+
+ Weighted toward the two things most likely to be wrong: that protocol added
+ to Collection really does reach the NON-sequenceable collections (a Set, a
+ Dictionary, a Bag — the whole reason for placing it there), and that
+ Dictionary removal keeps the open-addressed table's no-tombstone invariant
+ intact under collision, which is where an incorrect heal hides until a
+ later lookup silently misses."
+
+TestCase subclass: CollectionCompletionTests [
+    runAll [
+        self runTest: #testCountReachesNonSequenceable
+             do: [ self testCountReachesNonSequenceable ].
+        self runTest: #testAnyOneAndEmptyError do: [ self testAnyOneAndEmptyError ].
+        self runTest: #testCopyWithAndWithoutPreserveSpecies
+             do: [ self testCopyWithAndWithoutPreserveSpecies ].
+        self runTest: #testAsDictionaryRoundTrips do: [ self testAsDictionaryRoundTrips ].
+        self runTest: #testRemoveAllSuchThatOnSet do: [ self testRemoveAllSuchThatOnSet ].
+        self runTest: #testDictRemoveKey do: [ self testDictRemoveKey ].
+        self runTest: #testDictRemoveKeyHealsCollisions
+             do: [ self testDictRemoveKeyHealsCollisions ].
+        self runTest: #testDictRemoveKeyIfAbsent do: [ self testDictRemoveKeyIfAbsent ].
+        self runTest: #testDictRemoveThenGrow do: [ self testDictRemoveThenGrow ].
+        self runTest: #testDictEqualityAndSelect do: [ self testDictEqualityAndSelect ].
+        self runTest: #testKeysSortedSafely do: [ self testKeysSortedSafely ].
+        self runTest: #testAssociationAt do: [ self testAssociationAt ].
+        self runTest: #testSetEqualityAndHash do: [ self testSetEqualityAndHash ].
+        self runTest: #testBagCensus do: [ self testBagCensus ].
+        self runTest: #testCopyReplaceAll do: [ self testCopyReplaceAll ].
+        self runTest: #testCopyReplaceAllEmptyPattern
+             do: [ self testCopyReplaceAllEmptyPattern ].
+        self runTest: #testPairsDo do: [ self testPairsDo ].
+        self runTest: #testAtIfAbsentBounds do: [ self testAtIfAbsentBounds ].
+        self runTest: #testAtAllPut do: [ self testAtAllPut ].
+        self runTest: #testAddBeforeIndex do: [ self testAddBeforeIndex ].
+        self runTest: #testAddAllFirstKeepsOrder do: [ self testAddAllFirstKeepsOrder ].
+        self runTest: #testIntervalEqualityAndStep do: [ self testIntervalEqualityAndStep ].
+        self runTest: #testWriteStreamSpecies do: [ self testWriteStreamSpecies ].
+    ]
+
+    "── the placement claim: Collection protocol reaches every collection ──"
+
+    testCountReachesNonSequenceable [
+        | s d b |
+        s := Set new. s add: 1; add: 2; add: 3; add: 4.
+        self assert: (s count: [:e | e even ]) equals: 2.
+        d := Dictionary new. d at: #a put: 1; at: #b put: 2; at: #c put: 30.
+        self assert: (d count: [:v | v > 1 ]) equals: 2.
+        b := Bag new. b add: 5; add: 5; add: 6.
+        self assert: (b count: [:e | e = 5 ]) equals: 2.
+        "and the sequenceable side keeps working"
+        self assert: (#(1 2 3 4 5) count: [:e | e odd ]) equals: 3
+    ]
+
+    testAnyOneAndEmptyError [
+        | s |
+        s := Set new. s add: 7.
+        self assert: s anyOne equals: 7.
+        self assert: (#(9) anyOne) equals: 9.
+        "an empty collection errors rather than answering nil, which would be
+         indistinguishable from a stored nil"
+        self assert: ([ Set new anyOne. false ] on: Error do: [ :e | true ])
+    ]
+
+    testCopyWithAndWithoutPreserveSpecies [
+        | a oc |
+        a := #(1 2 3 2) copyWithout: 2.
+        self assert: a equals: #(1 3).
+        self assert: a class equals: Array.
+        self assert: (#(1 2) copyWith: 3) equals: #(1 2 3).
+        oc := OrderedCollection new. oc add: 1; add: 2.
+        self assert: (oc copyWith: 3) class equals: OrderedCollection.
+        self assert: (oc copyWith: 3) asArray equals: #(1 2 3).
+        "a Set has no order, so its copy is an OrderedCollection of members"
+        self assert: ((Set new add: 4; yourself) copyWith: 5) size equals: 2
+    ]
+
+    testAsDictionaryRoundTrips [
+        | d back |
+        d := Dictionary new. d at: #x put: 1; at: #y put: 2.
+        back := d associations asDictionary.
+        self assert: back equals: d.
+        self assert: (back at: #y) equals: 2
+    ]
+
+    testRemoveAllSuchThatOnSet [
+        | s |
+        s := Set new. 1 to: 10 do: [:i | s add: i ].
+        s removeAllSuchThat: [:e | e odd ].
+        self assert: s size equals: 5.
+        self assert: (s includes: 2).
+        self deny: (s includes: 3)
+    ]
+
+    "── Dictionary removal: the machinery this file exists for ──"
+
+    testDictRemoveKey [
+        | d |
+        d := Dictionary new.
+        d at: #a put: 1; at: #b put: 2; at: #c put: 3.
+        self assert: (d removeKey: #b) equals: 2.
+        self assert: d size equals: 2.
+        self deny: (d includesKey: #b).
+        "the survivors are still reachable — the point of the heal"
+        self assert: (d at: #a) equals: 1.
+        self assert: (d at: #c) equals: 3
+    ]
+
+    "Keys chosen to COLLIDE (a Dictionary starts with capacity 8 and buckets
+     on `hash bitAnd: 7`, so 1/9/17 share bucket 2). Removing the first of a
+     cluster is precisely the case a missing fixCollisionsFrom: breaks: the
+     later members sit past a gap that scanFor: now stops at."
+    testDictRemoveKeyHealsCollisions [
+        | d |
+        d := Dictionary new.
+        d at: 1 put: 'one'; at: 9 put: 'nine'; at: 17 put: 'seventeen'.
+        self assert: d size equals: 3.
+        d removeKey: 1.
+        self assert: d size equals: 2.
+        self assert: (d at: 9) equals: 'nine'.
+        self assert: (d at: 17) equals: 'seventeen'.
+        self deny: (d includesKey: 1).
+        "remove the middle of what remains, then re-check the tail"
+        d removeKey: 9.
+        self assert: (d at: 17) equals: 'seventeen'.
+        self assert: (d includesKey: 9) equals: false.
+        "and the freed slots really are reusable"
+        d at: 1 put: 'again'.
+        self assert: (d at: 1) equals: 'again'.
+        self assert: d size equals: 2
+    ]
+
+    testDictRemoveKeyIfAbsent [
+        | d |
+        d := Dictionary new. d at: #k put: 9.
+        self assert: (d removeKey: #missing ifAbsent: [ #none ]) equals: #none.
+        self assert: d size equals: 1.
+        self assert: ([ d removeKey: #missing. false ] on: Error do: [ :e | true ])
+    ]
+
+    "Removal must leave `tally` honest, or checkGrow rehashes at the wrong
+     time and the table degrades silently."
+    testDictRemoveThenGrow [
+        | d |
+        d := Dictionary new.
+        1 to: 40 do: [:i | d at: i put: i * i ].
+        1 to: 20 do: [:i | d removeKey: i ].
+        self assert: d size equals: 20.
+        21 to: 40 do: [:i | self assert: (d at: i) equals: i * i ].
+        1 to: 20 do: [:i | self deny: (d includesKey: i) ].
+        "grow again after the removals"
+        41 to: 60 do: [:i | d at: i put: i ].
+        self assert: d size equals: 40.
+        self assert: (d at: 55) equals: 55.
+        self assert: (d at: 33) equals: 33 * 33
+    ]
+
+    testDictEqualityAndSelect [
+        | a b sel |
+        a := Dictionary new. a at: #x put: 1; at: #y put: 2.
+        b := Dictionary new. b at: #y put: 2; at: #x put: 1.
+        self assert: a equals: b.
+        b at: #z put: 3.
+        self deny: a = b.
+        sel := b select: [:v | v > 1 ].
+        self assert: sel class equals: Dictionary.
+        self assert: sel size equals: 2.
+        self assert: (sel at: #y) equals: 2.
+        self deny: (sel includesKey: #x)
+    ]
+
+    testKeysSortedSafely [
+        | d |
+        d := Dictionary new.
+        d at: 3 put: 'c'; at: 1 put: 'a'; at: 2 put: 'b'.
+        self assert: d keysSortedSafely equals: #(1 2 3)
+    ]
+
+    testAssociationAt [
+        | d a |
+        d := Dictionary new. d at: #k put: 5.
+        a := d associationAt: #k.
+        self assert: a key equals: #k.
+        self assert: a value equals: 5.
+        self assert: (d associationAt: #nope ifAbsent: [ #none ]) equals: #none
+    ]
+
+    testSetEqualityAndHash [
+        | a b |
+        a := Set new. a add: 1; add: 2; add: 3.
+        b := Set new. b add: 3; add: 2; add: 1.
+        self assert: a equals: b.
+        self assert: a hash equals: b hash.
+        b add: 4.
+        self deny: a = b
+    ]
+
+    testBagCensus [
+        | b counts |
+        b := Bag new.
+        b add: #x; add: #x; add: #x; add: #y.
+        counts := b valuesAndCounts.
+        self assert: (counts at: #x) equals: 3.
+        self assert: (counts at: #y) equals: 1.
+        "most frequent first"
+        self assert: b sortedCounts first key equals: 3.
+        self assert: b sortedCounts first value equals: #x.
+        self assert: b asSet size equals: 2
+    ]
+
+    "── sequenceable protocol ──"
+
+    testCopyReplaceAll [
+        self assert: ('hello world' copyReplaceAll: 'o' with: '0')
+                     equals: 'hell0 w0rld'.
+        "a String answers a String, not an Array of Characters"
+        self assert: ('abc' copyReplaceAll: 'b' with: 'XY') class equals: String.
+        self assert: ('abc' copyReplaceAll: 'b' with: 'XY') equals: 'aXYc'.
+        "multi-character pattern, and one that is absent"
+        self assert: ('aXXbXXc' copyReplaceAll: 'XX' with: '-') equals: 'a-b-c'.
+        self assert: ('abc' copyReplaceAll: 'zz' with: '!') equals: 'abc'.
+        "replacing with empty deletes"
+        self assert: ('a-b-c' copyReplaceAll: '-' with: '') equals: 'abc'.
+        "arrays too"
+        self assert: (#(1 2 3 2) copyReplaceAll: #(2) with: #(9)) equals: #(1 9 3 9)
+    ]
+
+    "An empty pattern would match at every position and never advance —
+     the loop must terminate with a plain copy instead of hanging."
+    testCopyReplaceAllEmptyPattern [
+        self assert: ('abc' copyReplaceAll: '' with: 'x') equals: 'abc'
+    ]
+
+    testPairsDo [
+        | acc |
+        acc := OrderedCollection new.
+        #(1 2 3 4 5) pairsDo: [:a :b | acc add: a + b ].
+        "the trailing odd element is not passed — a pair needs two"
+        self assert: acc asArray equals: #(3 7).
+        acc := OrderedCollection new.
+        #(1 2 3) overlappingPairsDo: [:a :b | acc add: b - a ].
+        self assert: acc asArray equals: #(1 1)
+    ]
+
+    testAtIfAbsentBounds [
+        self assert: (#(1 2 3) at: 2 ifAbsent: [ #none ]) equals: 2.
+        self assert: (#(1 2 3) at: 0 ifAbsent: [ #none ]) equals: #none.
+        self assert: (#(1 2 3) at: 4 ifAbsent: [ #none ]) equals: #none.
+        self assert: (OrderedCollection new at: 1 ifAbsent: [ #none ]) equals: #none
+    ]
+
+    testAtAllPut [
+        | a |
+        a := Array new: 4.
+        a atAllPut: 7.
+        self assert: a equals: #(7 7 7 7).
+        a atAll: #(1 3) put: 0.
+        self assert: a equals: #(0 7 0 7)
+    ]
+
+    testAddBeforeIndex [
+        | oc |
+        oc := OrderedCollection new.
+        oc add: 1; add: 3.
+        oc add: 2 beforeIndex: 2.
+        self assert: oc asArray equals: #(1 2 3).
+        "index 1 prepends"
+        oc add: 0 beforeIndex: 1.
+        self assert: oc asArray equals: #(0 1 2 3).
+        "size + 1 appends — what makes an insertion loop terminate cleanly"
+        oc add: 4 beforeIndex: 5.
+        self assert: oc asArray equals: #(0 1 2 3 4).
+        self assert: ([ oc add: 9 beforeIndex: 99. false ] on: Error do: [ :e | true ])
+    ]
+
+    testAddAllFirstKeepsOrder [
+        | oc |
+        oc := OrderedCollection new.
+        oc add: 3; add: 4.
+        oc addAllFirst: #(1 2).
+        "aCollection's own order is preserved at the front"
+        self assert: oc asArray equals: #(1 2 3 4).
+        oc addAllLast: #(5 6).
+        self assert: oc asArray equals: #(1 2 3 4 5 6)
+    ]
+
+    testIntervalEqualityAndStep [
+        self assert: (1 to: 10 by: 3) step equals: 3.
+        self assert: (1 to: 3) step equals: 1.
+        "an Interval equals any sequenceable collection with the same elements"
+        self assert: (1 to: 3) equals: #(1 2 3).
+        self deny: (1 to: 4) = #(1 2 3).
+        self assert: (1 to: 3) hash equals: (1 to: 3) hash
+    ]
+
+    testWriteStreamSpecies [
+        | ws |
+        ws := #(1 2 3) writeStream.
+        ws nextPut: 9.
+        self assert: ws contents size equals: 1
+    ]
+]

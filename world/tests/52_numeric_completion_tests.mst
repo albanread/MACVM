@@ -1,0 +1,361 @@
+"52_numeric_completion_tests.mst — gates world/80_numeric_completion.mst.
+
+ The load-bearing claim under test is the PLACEMENT one: the transcendental
+ family used to live on Double alone, so every assertion here that sends
+ sin/cos/exp/ln to an Integer or a Fraction is checking that the method
+ really was hoisted to Number and really does coerce. Float comparisons are
+ made against a tolerance — asserting exact equality on a transcendental is
+ a test that fails on a library revision rather than on a bug."
+
+TestCase subclass: NumericCompletionTests [
+    runAll [
+        self runTest: #testSignPredicates do: [ self testSignPredicates ].
+        self runTest: #testTranscendentalsOnIntegers
+             do: [ self testTranscendentalsOnIntegers ].
+        self runTest: #testTranscendentalsOnFractions
+             do: [ self testTranscendentalsOnFractions ].
+        self runTest: #testArcSinCos do: [ self testArcSinCos ].
+        self runTest: #testArcTanTwoArgQuadrants do: [ self testArcTanTwoArgQuadrants ].
+        self runTest: #testDegreesRadians do: [ self testDegreesRadians ].
+        self runTest: #testBitAt do: [ self testBitAt ].
+        self runTest: #testIsPowerOfTwoAndHighBit do: [ self testIsPowerOfTwoAndHighBit ].
+        self runTest: #testSqrtFloorIsExact do: [ self testSqrtFloorIsExact ].
+        self runTest: #testIntegerBaseAndCharacter do: [ self testIntegerBaseAndCharacter ].
+        self runTest: #testDoubleSpecialValues do: [ self testDoubleSpecialValues ].
+        self runTest: #testStringLines do: [ self testStringLines ].
+        self runTest: #testSymbolShape do: [ self testSymbolShape ].
+        self runTest: #testCharacterProtocol do: [ self testCharacterProtocol ].
+        self runTest: #testIfNilIsReflective do: [ self testIfNilIsReflective ].
+        self runTest: #testAssert do: [ self testAssert ].
+        self runTest: #testPointTranspose do: [ self testPointTranspose ].
+        self runTest: #testLargeIntegerDivision do: [ self testLargeIntegerDivision ].
+        self runTest: #testLargeIntegerDivisorNearShortDivisionFence
+             do: [ self testLargeIntegerDivisorNearShortDivisionFence ].
+        self runTest: #testLargeIntegerFlooredSigns
+             do: [ self testLargeIntegerFlooredSigns ].
+        self runTest: #testLargeIntegerDerivedProtocol
+             do: [ self testLargeIntegerDerivedProtocol ].
+        self runTest: #testLargeIntegerBits do: [ self testLargeIntegerBits ].
+    ]
+
+    "Float helper: transcendentals are approximations, so every float
+     assertion here is a tolerance test."
+    close: a to: b [ ^(a - b) abs < 0.000001 ]
+
+    testSignPredicates [
+        self assert: 3 positive.
+        self assert: 3 strictlyPositive.
+        self deny: 3 negative.
+        self assert: -3 negative.
+        self deny: -3 positive.
+        "zero is positive but not strictly so — the ANSI split"
+        self assert: 0 positive.
+        self deny: 0 strictlyPositive.
+        self assert: (1/2) positive.
+        self assert: (-1/2) negative.
+        self assert: 2.5 positive.
+        self assert: -2.5 negative.
+        self assert: 7 isNumber
+    ]
+
+    "The reason this file exists: these were Double-only, so every send here
+     was a doesNotUnderstand on an Integer."
+    testTranscendentalsOnIntegers [
+        self assert: (self close: 0 sin to: 0.0).
+        self assert: (self close: 0 cos to: 1.0).
+        self assert: (self close: 0 tan to: 0.0).
+        self assert: (self close: 0 exp to: 1.0).
+        self assert: (self close: 1 ln to: 0.0).
+        self assert: (self close: 0 arcTan to: 0.0).
+        "e^ln(x) = x round-trip on an integer receiver"
+        self assert: (self close: 5 ln exp to: 5.0).
+        "sin^2 + cos^2 = 1, the identity that catches a wrong coercion"
+        self assert: (self close: (2 sin * 2 sin) + (2 cos * 2 cos) to: 1.0)
+    ]
+
+    testTranscendentalsOnFractions [
+        self assert: (self close: (1/2) exp ln to: 0.5).
+        self assert: (self close: (0/1) sin to: 0.0).
+        "and Double still answers for itself"
+        self assert: (self close: 0.0 cos to: 1.0)
+    ]
+
+    testArcSinCos [
+        self assert: (self close: 0 arcSin to: 0.0).
+        self assert: (self close: 1 arcSin to: Double pi / 2.0).
+        self assert: (self close: -1 arcSin to: Double pi negated / 2.0).
+        self assert: (self close: 1 arcCos to: 0.0).
+        self assert: (self close: 0 arcCos to: Double pi / 2.0).
+        "round-trip through sin"
+        self assert: (self close: 0.5 arcSin sin to: 0.5).
+        "outside the domain is an error, not a NaN the caller must test for"
+        self assert: ([ 2 arcSin. false ] on: Error do: [ :e | true ]).
+        self assert: ([ 2 arcCos. false ] on: Error do: [ :e | true ])
+    ]
+
+    "Plain arcTan loses the signs to the division; the two-argument form is
+     the one that can tell quadrant II from quadrant IV."
+    testArcTanTwoArgQuadrants [
+        self assert: (self close: (1 arcTan: 1) to: Double pi / 4.0).
+        self assert: (self close: (1 arcTan: -1) to: Double pi * 3.0 / 4.0).
+        self assert: (self close: (-1 arcTan: -1) to: Double pi * -3.0 / 4.0).
+        self assert: (self close: (-1 arcTan: 1) to: Double pi / -4.0).
+        "the axes"
+        self assert: (self close: (1 arcTan: 0) to: Double pi / 2.0).
+        self assert: (self close: (-1 arcTan: 0) to: Double pi negated / 2.0).
+        self assert: (self close: (0 arcTan: 0) to: 0.0)
+    ]
+
+    testDegreesRadians [
+        self assert: (self close: 180 degreesToRadians to: Double pi).
+        self assert: (self close: Double pi radiansToDegrees to: 180.0).
+        self assert: (self close: 90 degreesToRadians sin to: 1.0)
+    ]
+
+    testBitAt [
+        "1-based from the least significant end — ANSI's numbering"
+        self assert: (1 bitAt: 1) equals: 1.
+        self assert: (1 bitAt: 2) equals: 0.
+        self assert: (2 bitAt: 2) equals: 1.
+        self assert: (5 bitAt: 1) equals: 1.
+        self assert: (5 bitAt: 2) equals: 0.
+        self assert: (5 bitAt: 3) equals: 1.
+        self assert: (0 bitAt: 1) equals: 0.
+        self assert: ([ 5 bitAt: 0. false ] on: Error do: [ :e | true ]).
+        self assert: 5 bitInvert equals: -6
+    ]
+
+    testIsPowerOfTwoAndHighBit [
+        self assert: 1 isPowerOfTwo.
+        self assert: 2 isPowerOfTwo.
+        self assert: 1024 isPowerOfTwo.
+        self deny: 3 isPowerOfTwo.
+        self deny: 0 isPowerOfTwo.
+        self deny: -4 isPowerOfTwo.
+        self assert: 0 highBit equals: 0.
+        self assert: 1 highBit equals: 1.
+        self assert: 255 highBit equals: 8.
+        self assert: 256 highBit equals: 9.
+        self assert: ([ -1 highBit. false ] on: Error do: [ :e | true ])
+    ]
+
+    "Exactness is the whole point — a float sqrt rounds, and on a large
+     enough value it lands one short of the true root."
+    testSqrtFloorIsExact [
+        self assert: 0 sqrtFloor equals: 0.
+        self assert: 1 sqrtFloor equals: 1.
+        self assert: 4 sqrtFloor equals: 2.
+        self assert: 8 sqrtFloor equals: 2.
+        self assert: 9 sqrtFloor equals: 3.
+        self assert: 99 sqrtFloor equals: 9.
+        self assert: 100 sqrtFloor equals: 10.
+        "a perfect square far outside Double's exact-integer range"
+        self assert: (10 raisedTo: 20) sqrtFloor equals: (10 raisedTo: 10).
+        "and one below it, which must NOT round up"
+        self assert: ((10 raisedTo: 20) - 1) sqrtFloor equals: (10 raisedTo: 10) - 1.
+        self assert: ([ -1 sqrtFloor. false ] on: Error do: [ :e | true ])
+    ]
+
+    testIntegerBaseAndCharacter [
+        | ws |
+        ws := WriteStream on: String new.
+        255 printOn: ws base: 16.
+        self assert: ws contents equals: (255 printString: 16).
+        self assert: 65 asCharacter equals: $A
+    ]
+
+    testDoubleSpecialValues [
+        | nan inf |
+        self assert: 1.5 isFinite.
+        self deny: 1.5 isNaN.
+        self deny: 1.5 isInfinite.
+        "NaN is the only value not equal to itself — that identity IS the test"
+        nan := 0.0 / 0.0.
+        self assert: nan isNaN.
+        self deny: nan isFinite.
+        "and NaN is neither positive nor negative, which the Number-level
+         `< 0` / `>= 0` pair would get wrong"
+        self deny: nan positive.
+        self deny: nan negative.
+        inf := 1.0 / 0.0.
+        self assert: inf isInfinite.
+        self deny: inf isFinite.
+        self deny: inf isNaN.
+        self assert: inf positive.
+        self assert: inf negated negative
+    ]
+
+    testStringLines [
+        | s |
+        s := 'alpha' , (String with: (Character value: 10)) , 'beta'.
+        self assert: s lines size equals: 2.
+        self assert: s lines first equals: 'alpha'.
+        self assert: s lines last equals: 'beta'.
+        "a trailing newline does NOT produce a final empty line"
+        self assert: (s , (String with: (Character value: 10))) lines size equals: 2.
+        self assert: '' lines size equals: 0.
+        self assert: 'one' lines size equals: 1
+    ]
+
+    testSymbolShape [
+        self assert: #at:put: isKeyword.
+        self deny: #at:put: isUnary.
+        self deny: #at:put: isBinary.
+        self assert: #size isUnary.
+        self deny: #size isKeyword.
+        self assert: #+ isBinary.
+        self deny: #+ isUnary.
+        self assert: #at:put: keywords size equals: 2.
+        self assert: #at:put: keywords first equals: 'at:'.
+        self assert: #at:put: keywords last equals: 'put:'.
+        "a non-keyword answers itself as the single element, so a caller can
+         walk any selector uniformly"
+        self assert: #size keywords size equals: 1.
+        self assert: #size keywords first equals: 'size'
+    ]
+
+    testCharacterProtocol [
+        self assert: $. isPunctuation.
+        self assert: $! isPunctuation.
+        self deny: $a isPunctuation.
+        self deny: $  isPunctuation.
+        self assert: $a asString equals: 'a'.
+        self assert: $a asString class equals: String
+    ]
+
+    "These already work at every literal send site because the compiler
+     inlines them; what did not work — and is what these assertions exercise
+     — is reaching them reflectively."
+    testIfNilIsReflective [
+        self assert: (nil respondsTo: #ifNil:).
+        self assert: (3 respondsTo: #ifNil:).
+        self assert: (nil perform: #ifNil: with: [ 'was nil' ]) equals: 'was nil'.
+        self assert: (3 perform: #ifNil: with: [ 'was nil' ]) equals: 3.
+        self assert: (3 perform: #ifNotNil: with: [:v | v * 2 ]) equals: 6.
+        self assert: (nil perform: #ifNotNil: with: [:v | v * 2 ]) equals: nil.
+        "the inlined form still behaves"
+        self assert: (nil ifNil: [ 'a' ]) equals: 'a'.
+        self assert: (7 ifNotNil: [:v | v + 1 ]) equals: 8
+    ]
+
+    testAssert [
+        self assert: (3 > 2).
+        "takes a Boolean or a Block, so the condition can be written either way"
+        self assert: ([ Object new assert: true. true ] on: Error do: [ :e | false ]).
+        self assert: ([ Object new assert: [ 1 = 1 ]. true ] on: Error do: [ :e | false ]).
+        self assert: ([ Object new assert: false. false ] on: Error do: [ :e | true ]).
+        self assert: ([ Object new assert: [ 1 = 2 ]. false ] on: Error do: [ :e | true ]).
+        "the description reaches the message"
+        self assert: ([ Object new assert: false description: 'lopsided'. '' ]
+                        on: Error do: [ :e | e messageText ]) = 'assertion failed: lopsided'
+    ]
+
+    testPointTranspose [
+        self assert: (1@2) transpose equals: (2@1)
+    ]
+
+    "── LargeInteger division ────────────────────────────────────────────
+     The census's largest hole: a LargeInteger had + - * < = and nothing
+     derived from division, because // and \\ were simply absent.
+
+     `a // a` is the case that proves the general algorithm rather than the
+     short-division fast path: the divisor is itself large, which is exactly
+     where divMod: raises 'large division unimplemented'."
+    testLargeIntegerDivision [
+        | a b |
+        a := 10 raisedTo: 20.
+        self assert: a class equals: LargePositiveInteger.
+        self assert: (a // 3) equals: 33333333333333333333.
+        self assert: (a \\ 3) equals: 1.
+        "divisor itself large — the long-division path"
+        self assert: (a // a) equals: 1.
+        self assert: (a \\ a) equals: 0.
+        b := 10 raisedTo: 9.
+        self assert: (a // b) equals: (10 raisedTo: 11).
+        self assert: (a \\ b) equals: 0.
+        self assert: ((a + 7) \\ b) equals: 7.
+        "a quotient that needs many distinct digits, not just 0 and 1"
+        self assert: ((a * 7) // a) equals: 7.
+        self assert: (((a * 256) + 255) \\ a) equals: 255.
+        self assert: ([ a // 0. false ] on: ZeroDivide do: [ :e | true ])
+    ]
+
+    "The fast path's real precondition is `256 * d` still fitting, not merely
+     `d` being a SmallInteger: divMod: forms `rem * 256 + byte` as a
+     SmallInteger. A divisor just past that boundary used to make `part` a
+     LargeInteger whose own // re-entered — an unbounded recursion. These
+     divisors straddle the fence, and the identity holds on both sides."
+    testLargeIntegerDivisorNearShortDivisionFence [
+        | a divisors |
+        a := 10 raisedTo: 20.
+        divisors := OrderedCollection new.
+        divisors add: 3; add: 1000000; add: 1000000000000.
+        "either side of where 256 * d stops fitting"
+        divisors add: 1562500000000000020; add: 4611686018427387903; add: 36028797018963968.
+        divisors do: [:d |
+            self assert: ((a // d) * d) + (a \\ d) equals: a.
+            self assert: (a \\ d) < d.
+            self assert: (a \\ d) >= 0 ].
+        "the exact case that overflowed: Newton on a large square"
+        self assert: (10 raisedTo: 20) sqrtFloor equals: (10 raisedTo: 10)
+    ]
+
+    "Floored semantics — // rounds toward negative infinity and \\ takes the
+     sign of the DIVISOR. divMod: is magnitude-only (and measurably wrong for
+     a negative divisor), so these four cases are the ones a naive
+     implementation gets wrong."
+    testLargeIntegerFlooredSigns [
+        | a |
+        a := 10 raisedTo: 20.
+        self assert: (a negated // 3) equals: -33333333333333333334.
+        self assert: (a negated \\ 3) equals: 2.
+        self assert: (a // -3) equals: -33333333333333333334.
+        self assert: (a \\ -3) equals: -2.
+        self assert: (a negated // -3) equals: 33333333333333333333.
+        self assert: (a negated \\ -3) equals: -1.
+        "exact division must NOT take the off-by-one correction"
+        self assert: (a negated // a) equals: -1.
+        self assert: (a negated \\ a) equals: 0.
+        "the defining identity, over every sign combination"
+        #(3 -3) do: [:d |
+            #(1 -1) do: [:s |
+                | x |
+                x := a * s.
+                self assert: ((x // d) * d) + (x \\ d) equals: x ] ].
+        "and it agrees with SmallInteger, which is the reference"
+        self assert: (-7 // 3) equals: -3.
+        self assert: (-7 \\ 3) equals: 2
+    ]
+
+    "Everything below bottoms out in // or \\, so all of it was broken."
+    testLargeIntegerDerivedProtocol [
+        | a |
+        a := 10 raisedTo: 20.
+        self assert: (a quo: 3) equals: 33333333333333333333.
+        self assert: (a rem: 3) equals: 1.
+        self assert: a even.
+        self deny: (a + 1) even.
+        self assert: (a gcd: 6) equals: 2.
+        self assert: ((a / 4) * 4) equals: a.
+        self assert: ((100 factorial / 2) * 2) equals: 100 factorial.
+        self assert: ((16 raisedTo: 20) printString: 16)
+                     equals: '100000000000000000000'
+    ]
+
+    "Integer>>bitAt:/highBit go through bitShift:, which LargeInteger does
+     not have — so they failed on exactly the numbers big enough to need
+     them. These read the byte representation directly."
+    testLargeIntegerBits [
+        | a |
+        a := 2 raisedTo: 100.
+        self assert: a highBit equals: 101.
+        self assert: (a bitAt: 101) equals: 1.
+        self assert: (a bitAt: 100) equals: 0.
+        self assert: (a bitAt: 1) equals: 0.
+        "past the top is zero, not an error"
+        self assert: (a bitAt: 500) equals: 0.
+        self assert: (a + 1) odd.
+        self assert: ((a + 1) bitAt: 1) equals: 1.
+        self assert: ([ a bitAt: 0. false ] on: Error do: [ :e | true ])
+    ]
+]
