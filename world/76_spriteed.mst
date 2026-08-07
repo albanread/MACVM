@@ -31,7 +31,9 @@ Object subclass: CocoaSpriteEditor [
                 GridView SwatchView
                 NameField WField HField
                 RSlider GSlider BSlider RGBLabel
-                FrameLabel ToolButtons EventLog>
+                FrameLabel ToolButtons EventLog
+                PreviewOn PlayAnim Fps PlaySwitch FpsSlider FpsLabel
+                DirtyTicks>
 
     CocoaSpriteEditor class >> windowWidth [ ^980.0 ]
     CocoaSpriteEditor class >> windowHeight [ ^560.0 ]
@@ -66,6 +68,7 @@ Object subclass: CocoaSpriteEditor [
         Delegates := OrderedCollection new.
         Doc := SpriteDoc new.
         CurFrame := 0. SelColor := 15. Tool := #pencil.
+        PreviewOn := false. PlayAnim := true. Fps := 30. DirtyTicks := 0.
         winClass := Cocoa classNamed: 'NSWindow'.
         "styleMask 7 = titled|closable|miniaturizable: the layout is fixed
          (design §4), so no resizable bit."
@@ -86,6 +89,7 @@ Object subclass: CocoaSpriteEditor [
         self buildSwatchesIn: content.
         self buildSlidersIn: content.
         self buildFrameRowIn: content.
+        self buildPreviewRowIn: content.
         self repaintAll.
         self setStatus: 'new 16x16 sprite — pencil paints colour 15; . is transparent'.
     ]
@@ -180,6 +184,7 @@ Object subclass: CocoaSpriteEditor [
         y := Doc height - 1 - ((pt at: 2) asInteger // self cellSize).
         self logEvent: 'grid ' , x printString , ',' , y printString.
         self toolAtX: x y: y.
+        self markDirty.
     ]
 
     CocoaSpriteEditor class >> viewPoint: ev in: aView [
@@ -201,6 +206,16 @@ Object subclass: CocoaSpriteEditor [
         EventLog add: aString.
         EventLog size > 24 ifTrue: [ EventLog removeFirst ].
     ]
+    "Scripting probes: the status line, and the coalescing state — DirtyTicks
+     counts down 2->0 on the ~0.3s timer, so reading it after a mutate-then-
+     wait proves the timer fires (0) or died (still 2) without guessing."
+    CocoaSpriteEditor class >> spedStatus [
+        StatusLabel isNil ifTrue: [ ^'' ].
+        ^StatusLabel sendString: 'stringValue'
+    ]
+    CocoaSpriteEditor class >> spedDirty [ ^(DirtyTicks ifNil: [ -1 ]) printString ]
+    CocoaSpriteEditor class >> addFrameForScript [ ^Doc addFrame ]
+
     CocoaSpriteEditor class >> spedEvents [
         | out |
         EventLog isNil ifTrue: [ ^'(no events)' ].
@@ -370,6 +385,7 @@ Object subclass: CocoaSpriteEditor [
         self repaintSwatches.
         self repaintGrid.
         self syncRGBLabel.
+        self markDirty.
     ]
 
     CocoaSpriteEditor class >> syncSliders [
@@ -415,6 +431,7 @@ Object subclass: CocoaSpriteEditor [
         (nw isNil or: [ nh isNil ]) ifTrue: [ ^self setStatus: 'resize: not a number' ].
         (Doc resizeTo: nw by: nh)
             ifTrue: [
+                self markDirty.
                 self repaintGrid.
                 self setStatus: 'resized to ' , Doc width printString , 'x' , Doc height printString ]
             ifFalse: [ self setStatus: 'resize rejected (1..64, and different from now)' ].
@@ -458,12 +475,14 @@ Object subclass: CocoaSpriteEditor [
 
     CocoaSpriteEditor class >> shiftBy: dx dy: dy [
         Doc shift: CurFrame dx: dx dy: dy.
+        self markDirty.
         self repaintGrid.
     ]
 
     CocoaSpriteEditor class >> clearClicked [
         Doc clearFrame: CurFrame.
         self repaintGrid.
+        self markDirty.
         self setStatus: 'frame cleared'.
     ]
 
@@ -492,6 +511,137 @@ Object subclass: CocoaSpriteEditor [
         CurFrame := f.
         self syncFrameLabel.
         self repaintGrid.
+        self markDirty.
+    ]
+
+    "── the engine preview (design §2: the real pane, driven the way demos
+       are — a composed entry doit through launchDemo:, relaunched whole on
+       every rebuild; the editor never edits engine state) ───────────────"
+
+    CocoaSpriteEditor class >> buildPreviewRowIn: content [
+        self button: 'Preview' frame: (Array with: 472.0 with: 132.0 with: 90.0 with: 26.0)
+             action: [ self previewClicked ] in: content.
+        PlaySwitch := ((Cocoa classNamed: 'NSButton') onMain alloc) onMain
+            initWithFrame: (Array with: 570.0 with: 132.0 with: 64.0 with: 26.0).
+        PlaySwitch onMain setButtonType: 3. "NSButtonTypeSwitch"
+        PlaySwitch onMain setTitle: 'Play'.
+        PlaySwitch onMain setState: 1.
+        self wireControl: PlaySwitch to: [ self playToggled ].
+        content onMain addSubview: PlaySwitch.
+        FpsLabel := self label: 'fps 30' frame: (Array with: 648.0 with: 137.0 with: 56.0 with: 16.0)
+                         in: content.
+        FpsSlider := ((Cocoa classNamed: 'NSSlider') onMain alloc) onMain
+            initWithFrame: (Array with: 708.0 with: 132.0 with: 152.0 with: 26.0).
+        FpsSlider onMain setMinValue: 5.0.
+        FpsSlider onMain setMaxValue: 60.0.
+        FpsSlider onMain setDoubleValue: 30.0.
+        self wireControl: FpsSlider to: [ self fpsChanged ].
+        content onMain addSubview: FpsSlider.
+    ]
+
+    CocoaSpriteEditor class >> wireControl: aControl to: aBlock [
+        | holder delegate |
+        holder := CocoaToolbarAction on: aBlock.
+        delegate := MacvmDelegate actionTargetOn: holder.
+        aControl onMain setTarget: delegate.
+        aControl onMain setAction: 'macvmAction:'.
+        Delegates add: delegate.
+    ]
+
+    CocoaSpriteEditor class >> previewClicked [
+        PreviewOn := true.
+        self previewNow.
+    ]
+    CocoaSpriteEditor class >> playToggled [
+        PlayAnim := (PlaySwitch sendI64: 'state') = 1.
+        self markDirty.
+    ]
+    CocoaSpriteEditor class >> fpsChanged [
+        Fps := ((FpsSlider send: 'doubleValue' args: (Array new: 0) ret: #f64)
+                    max: 5) min: 60.
+        Fps := Fps asInteger.
+        FpsLabel onMain setStringValue: 'fps ' , Fps printString.
+        self markDirty.
+    ]
+
+    "Every mutating edit calls this; CocoaUI's ~4Hz metrics beat calls
+     previewTick (a world-targeted NSTimer never fires — the recognizers'
+     fate again), so two quiet ticks equal roughly half a second of idle —
+     MACDART's own coalescing cap, from a beat that already exists."
+    CocoaSpriteEditor class >> markDirty [
+        PreviewOn == true ifFalse: [ ^self ].
+        DirtyTicks := 2.
+    ]
+    CocoaSpriteEditor class >> previewTick [
+        "Called by CocoaUI's metrics beat whether or not the editor is open —
+         every guard here is a nil guard first."
+        (PreviewOn == true and: [ (DirtyTicks ifNil: [ 0 ]) > 0 ]) ifFalse: [ ^self ].
+        DirtyTicks := DirtyTicks - 1.
+        DirtyTicks = 0 ifTrue: [ self previewNow ].
+    ]
+    CocoaSpriteEditor class >> previewNow [
+        | bc |
+        bc := Worker classNamed: #CocoaBrowser.
+        bc isNil ifTrue: [ ^self setStatus: 'preview: no host service' ].
+        bc hostService onMain launchDemo: self previewDoit.
+        self setStatus: 'preview launched (' , Doc frameCount printString ,
+            (Doc frameCount = 1 ifTrue: [ ' frame, ' ] ifFalse: [ ' frames, ' ]) ,
+            Fps printString , ' fps)'.
+    ]
+
+    CocoaSpriteEditor class >> previewDoit [
+        "The whole preview scene as ONE entry doit for the primary: the real
+         sprite at 1x plus 2x/4x renditions drawn with fill: rects (the
+         engine has no sprite scale), animated by frame-switching in the
+         step block. Regenerated from the model on every rebuild, so the
+         preview cannot drift from the document."
+        | out |
+        out := WriteStream on: String new.
+        out nextPutAll: '| p s fr tick last hex |'; nl.
+        out nextPutAll: 'p := GamePane new.'; nl.
+        out nextPutAll: 'p resizeTo: 320 by: 180.'; nl.
+        out nextPutAll: 'p frameRate: '; nextPutAll: Fps printString; nextPutAll: '.'; nl.
+        out nextPutAll: 'fr := Array'.
+        0 to: Doc frameCount - 1 do: [ :f |
+            out nextPutAll: (f = 0 ifTrue: [ ' with: ''' ] ifFalse: [ ' with: ''' ]);
+                nextPutAll: (Doc rowsOf: f); nextPutAll: '''' ].
+        out nextPutAll: '.'; nl.
+        out nextPutAll: 's := p defineSprite: (fr at: 1).'; nl.
+        out nextPutAll: '2 to: fr size do: [ :i | s addFrame: (fr at: i) ].'; nl.
+        1 to: 15 do: [ :i |
+            | c |
+            c := Doc paletteAt: i.
+            out nextPutAll: 's colorAt: '; nextPutAll: i printString;
+                nextPutAll: ' r: '; nextPutAll: (c at: 1) printString;
+                nextPutAll: ' g: '; nextPutAll: (c at: 2) printString;
+                nextPutAll: ' b: '; nextPutAll: (c at: 3) printString; nextPutAll: '.'; nl.
+            out nextPutAll: 'p paletteAt: '; nextPutAll: (16 + i) printString;
+                nextPutAll: ' r: '; nextPutAll: (c at: 1) printString;
+                nextPutAll: ' g: '; nextPutAll: (c at: 2) printString;
+                nextPutAll: ' b: '; nextPutAll: (c at: 3) printString; nextPutAll: '.'; nl ].
+        out nextPutAll: 'p paletteAt: 16 r: 68 g: 70 b: 84.'; nl.
+        out nextPutAll: 'hex := ''0123456789abcdef''.'; nl.
+        out nextPutAll: 'tick := 0. last := -1.'; nl.
+        out nextPutAll: 'p onStep: [ | f rows y x c row |'; nl.
+        out nextPutAll: '  tick := tick + 1.'; nl.
+        out nextPutAll: (PlayAnim
+            ifTrue: [ '  f := tick // 10 \ fr size.' ]
+            ifFalse: [ '  f := ' , ((CurFrame min: Doc frameCount - 1) max: 0) printString , '.' ]); nl.
+        out nextPutAll: '  f = last ifFalse: ['; nl.
+        out nextPutAll: '    last := f.'; nl.
+        out nextPutAll: '    p fill: 0 y: 0 width: 320 height: 180 color: 16.'; nl.
+        out nextPutAll: '    rows := (fr at: f + 1) subStrings: ''/''.'; nl.
+        out nextPutAll: '    0 to: rows size - 1 do: [ :ry |'; nl.
+        out nextPutAll: '      row := rows at: ry + 1.'; nl.
+        out nextPutAll: '      0 to: row size - 1 do: [ :rx |'; nl.
+        out nextPutAll: '        c := (hex indexOf: (row at: rx + 1)) - 1.'; nl.
+        out nextPutAll: '        c > 0 ifTrue: ['; nl.
+        out nextPutAll: '          p fill: 80 + (rx * 2) y: 30 + (ry * 2) width: 2 height: 2 color: 16 + c.'; nl.
+        out nextPutAll: '          p fill: 160 + (rx * 4) y: 30 + (ry * 4) width: 4 height: 4 color: 16 + c ] ] ].'; nl.
+        out nextPutAll: '    s moveTo: 32 y: 30 frame: f ].'; nl.
+        out nextPutAll: '  p present ].'; nl.
+        out nextPutAll: 'p run.'; nl.
+        ^out contents
     ]
 
     CocoaSpriteEditor class >> delFrameClicked [
@@ -583,6 +733,8 @@ Object subclass: CocoaSpriteEditor [
     "── teardown (UI-worker rebuild — CocoaUI teardown calls by name) ────"
 
     CocoaSpriteEditor class >> teardown [
+        PreviewOn := nil. DirtyTicks := nil.
+        PlaySwitch := nil. FpsSlider := nil. FpsLabel := nil.
         Win isNil ifFalse: [
             Win isValid ifTrue: [
                 Win onMain setDelegate: nil.

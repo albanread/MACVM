@@ -183,6 +183,13 @@ New/Save/Load/Copy Code, status.
   and each repaint is one canvas blast, so drag-rate delivery is harmless.
   `spedSynthClickAt:y:` mints real NSEvents and pushes them through
   `sendEvent:` — the permanent no-hands gate for this whole path.
+- **Coalescing rides CocoaUI's ~4Hz metrics beat**, not an `NSTimer`: a
+  world-targeted timer never fires — the gesture recognizers' fate again,
+  and together they draw the actual line: *control actions* (buttons,
+  menus, sliders) reach world targets; *run-loop-originated callbacks*
+  (recognizers, timers) do not. Anything periodic hooks the metrics tick
+  (`updateMetricsMem:…` calls `previewTick`, late-bound by name); two
+  quiet ticks ≈ half a second, MACDART's own cap.
 - **The grid repaint is a full-canvas base64 blast** (~432×432 RGBA ≈ 1 MB
   of base64 per repaint), which is the house doctrine — blast, don't patch
   — at a cost worth measuring. Coalesce repaints behind a dirty flag at

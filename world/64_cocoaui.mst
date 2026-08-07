@@ -590,6 +590,12 @@ Object subclass: CocoaUI [
          beat now — CG5 — so this fires ~4Hz with no new NSTimer) to refresh
          the toolbar readout AND the MEM usage bar's fill width in place."
         MetricLabels isNil ifTrue: [ ^self ].
+        "The editors' coalescing beat (asset_editors_design.md §5): world-
+         targeted NSTimers never fire (same fate as gesture recognizers —
+         run-loop-originated callbacks), so anything needing a periodic tick
+         rides THIS one, the beat that demonstrably reaches the world ~4Hz.
+         Late-bound by name, the CG7/CG8 discipline."
+        (Worker classNamed: #CocoaSpriteEditor) ifNotNil: [ :ed | ed previewTick ].
         (MetricLabels at: #MEM ifAbsent: [ nil ]) ifNotNil: [ :tf | tf onMain setStringValue: memStr ].
         (MetricLabels at: #JIT ifAbsent: [ nil ]) ifNotNil: [ :tf | tf onMain setStringValue: jitStr ].
         (MetricLabels at: #CODE ifAbsent: [ nil ]) ifNotNil: [ :tf | tf onMain setStringValue: codeStr ].
