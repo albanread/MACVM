@@ -157,6 +157,12 @@ PLIST
   ln -s /Applications "$stage/Applications"
   rm -f "$DMG"
   hdiutil create -volname "$appname" -srcfolder "$stage" -ov -format UDZO "$DMG" >/dev/null
+  # Sign the disk image itself (Apple's guidance — the container gets its own
+  # Developer ID seal, not just the .app inside). No entitlements/runtime on a
+  # dmg; it is data, not code. Notarization below still validates the app within.
+  if [ -n "$SIGN_ID" ]; then
+    codesign --force --timestamp --sign "$SIGN_ID" "$DMG"
+  fi
   # --- notarize + staple (skipped unless NOTARY_PROFILE is set) ---
   # Store credentials once with:
   #   xcrun notarytool store-credentials macvm --apple-id you@example.com --team-id TEAMID
