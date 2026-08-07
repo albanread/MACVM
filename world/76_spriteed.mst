@@ -7,17 +7,31 @@
 
  Surfaces are NSImageViews fed by full RGBA base64 blasts through the canvas
  host verb (showCanvasPixelsOn:base64:width:height: — the CocoaCanvas path);
- mouse painting is NSClick/NSPanGestureRecognizers targeted at
- CocoaSenderAction delegates, whose blocks ask the recognizer itself for
+ mouse painting is a MacvmMouseView (an NSImageView subclass minted from
+ the #mouseview delegate role) whose mouseDown:/mouseDragged: overrides
+ dispatch straight into
  locationInView: (the reason that 1-arg holder exists). Blast, don't patch:
  every edit redraws the whole grid image from the model."
+"A per-view mouse receiver: MacvmMouseView dispatches its overrides to ME
+ through the C6 door, and I hand the NSEvent to a block. One holder per
+ view, so two views on one editor never have to disambiguate."
+Object subclass: CocoaMouseHandler [
+    | Block |
+    CocoaMouseHandler class >> on: aBlock [
+        | h | h := self new. h setBlock: aBlock. ^h
+    ]
+    setBlock: aBlock [ Block := aBlock ]
+    mouseDown: ev [ ^Block value: ev ]
+    mouseDragged: ev [ ^Block value: ev ]
+]
+
 Object subclass: CocoaSpriteEditor [
     <classVars: Win WinDelegate Delegates StatusLabel
                 Doc CurFrame SelColor Tool
                 GridView SwatchView
                 NameField WField HField
                 RSlider GSlider BSlider RGBLabel
-                FrameLabel ToolButtons>
+                FrameLabel ToolButtons EventLog>
 
     CocoaSpriteEditor class >> windowWidth [ ^980.0 ]
     CocoaSpriteEditor class >> windowHeight [ ^560.0 ]
@@ -121,21 +135,17 @@ Object subclass: CocoaSpriteEditor [
         ^f
     ]
 
-    CocoaSpriteEditor class >> recognizer: className on: aView handler: aBlock [
-        "A gesture recognizer wired like every button: target = an action
-         delegate, action = macvmAction:. The 1-arg holder passes the
-         RECOGNIZER through, so the handler can ask it where the pointer is.
-         setAction: takes the selector as a String — the bridge marshals by
-         the property's own SEL type, exactly as the buttons prove daily."
-        | gr holder delegate |
-        gr := ((Cocoa classNamed: className) onMain alloc) onMain init.
-        holder := CocoaSenderAction on: aBlock.
-        delegate := MacvmDelegate actionTargetOn: holder.
-        gr onMain setTarget: delegate.
-        gr onMain setAction: 'macvmAction:'.
-        Delegates add: delegate.
-        aView onMain addGestureRecognizer: gr.
-        ^gr
+    "A mouse-view whose down/drag events run aBlock with the NSEvent.
+     Replaces the gesture-recognizer wiring wholesale: recognizers minted
+     from the world never fired (real or synthetic events, valid SEL and
+     retained target — cause unestablished), and view-level overrides are
+     unconditional. The handler holder rides the SAME ticket registry as
+     every delegate receiver, so it is GC-rooted for the view's life."
+    CocoaSpriteEditor class >> mouseViewFrame: rect handler: aBlock [
+        | view |
+        view := MacvmDelegate mouseViewOn: (CocoaMouseHandler on: aBlock).
+        view onMain setFrame: rect.
+        ^view
     ]
 
     "── the paint grid ───────────────────────────────────────────────────"
@@ -147,29 +157,56 @@ Object subclass: CocoaSpriteEditor [
     CocoaSpriteEditor class >> gridPixelHeight [ ^self cellSize * Doc height ]
 
     CocoaSpriteEditor class >> buildGridIn: content [
-        GridView := ((Cocoa classNamed: 'NSImageView') onMain alloc) onMain
-            initWithFrame: (Array with: self gridLeft
-                                  with: self gridTop - self gridPixelHeight
-                                  with: self gridPixelWidth asFloat
-                                  with: self gridPixelHeight asFloat).
+        GridView := self mouseViewFrame:
+            (Array with: self gridLeft
+                   with: self gridTop - self gridPixelHeight
+                   with: self gridPixelWidth asFloat
+                   with: self gridPixelHeight asFloat)
+            handler: [ :ev | self gridMouse: ev ].
         "NSImageScaleNone: the blast is already at view size, pixel for pixel."
         GridView onMain setImageScaling: 2.
         content onMain addSubview: GridView.
-        self recognizer: 'NSClickGestureRecognizer' on: GridView
-             handler: [ :gr | self gridEventFrom: gr ].
-        self recognizer: 'NSPanGestureRecognizer' on: GridView
-             handler: [ :gr | self gridEventFrom: gr ].
     ]
 
-    CocoaSpriteEditor class >> gridEventFrom: gr [
-        "Shared click/pan path: view point -> cell -> tool. locationInView:
-         answers the point in GRID VIEW coordinates, origin BOTTOM-left
-         (unflipped NSView), so the sprite row is flipped."
+    CocoaSpriteEditor class >> gridMouse: ev [
+        "Down/drag -> cell -> tool. The event's location is in WINDOW base
+         coords; convertPoint:fromView: nil brings it into the view, origin
+         BOTTOM-left (unflipped NSView), so the sprite row is flipped."
         | pt x y |
-        pt := gr send: 'locationInView:' args: (Array with: GridView) ret: #point.
-        x := ((pt at: 1) // self cellSize) asInteger.
-        y := Doc height - 1 - ((pt at: 2) // self cellSize) asInteger.
+        pt := self viewPoint: ev in: GridView.
+        "asInteger FIRST: the point's coordinates are Floats and Float has
+         no // — truncation before integer division is equivalent here."
+        x := (pt at: 1) asInteger // self cellSize.
+        y := Doc height - 1 - ((pt at: 2) asInteger // self cellSize).
+        self logEvent: 'grid ' , x printString , ',' , y printString.
         self toolAtX: x y: y.
+    ]
+
+    CocoaSpriteEditor class >> viewPoint: ev in: aView [
+        "NSEvent window point -> aView's local point (both as #(x y))."
+        | wp |
+        wp := ev send: 'locationInWindow' args: (Array new: 0) ret: #point.
+        ^aView send: 'convertPoint:fromView:'
+               args: (Array with: (wp at: 1) with: (wp at: 2) with: nil)
+               ret: #point
+    ]
+
+    "A rolling log of recognizer fires — the instrument that settles WHICH
+     recognizer delivered (or stayed silent) on a real mouse. Read it with
+     spedEvents; the newest entry also lands on the status line."
+    CocoaSpriteEditor class >> logEvent: aString [
+        "Ring only — the status line belongs to the tools, not to a
+         per-stroke event feed."
+        EventLog isNil ifTrue: [ EventLog := OrderedCollection new ].
+        EventLog add: aString.
+        EventLog size > 24 ifTrue: [ EventLog removeFirst ].
+    ]
+    CocoaSpriteEditor class >> spedEvents [
+        | out |
+        EventLog isNil ifTrue: [ ^'(no events)' ].
+        out := WriteStream on: String new.
+        EventLog do: [ :e | out nextPutAll: e; nextPutAll: ' | ' ].
+        ^out contents
     ]
 
     CocoaSpriteEditor class >> toolAtX: x y: y [
@@ -235,21 +272,21 @@ Object subclass: CocoaSpriteEditor [
     CocoaSpriteEditor class >> swatchBottom [ ^330.0 ]
 
     CocoaSpriteEditor class >> buildSwatchesIn: content [
-        SwatchView := ((Cocoa classNamed: 'NSImageView') onMain alloc) onMain
-            initWithFrame: (Array with: self swatchLeft with: self swatchBottom
-                                  with: (self swatchCell * 8) asFloat
-                                  with: (self swatchCell * 2) asFloat).
+        SwatchView := self mouseViewFrame:
+            (Array with: self swatchLeft with: self swatchBottom
+                   with: (self swatchCell * 8) asFloat
+                   with: (self swatchCell * 2) asFloat)
+            handler: [ :ev | self swatchMouse: ev ].
         SwatchView onMain setImageScaling: 2.
         content onMain addSubview: SwatchView.
-        self recognizer: 'NSClickGestureRecognizer' on: SwatchView
-             handler: [ :gr | self swatchClickFrom: gr ].
     ]
 
-    CocoaSpriteEditor class >> swatchClickFrom: gr [
+    CocoaSpriteEditor class >> swatchMouse: ev [
         | pt col row |
-        pt := gr send: 'locationInView:' args: (Array with: SwatchView) ret: #point.
-        col := ((pt at: 1) // self swatchCell) asInteger.
-        row := 1 - ((pt at: 2) // self swatchCell) asInteger.
+        pt := self viewPoint: ev in: SwatchView.
+        col := (pt at: 1) asInteger // self swatchCell.
+        row := 1 - ((pt at: 2) asInteger // self swatchCell).
+        self logEvent: 'swatch ' , col printString , ',' , row printString.
         (col between: 0 and: 7) ifFalse: [ ^self ].
         (row between: 0 and: 1) ifFalse: [ ^self ].
         self selectColor: (row * 8) + col.
@@ -491,6 +528,7 @@ Object subclass: CocoaSpriteEditor [
     ]
     CocoaSpriteEditor class >> doc [ ^Doc ]
     CocoaSpriteEditor class >> gridView [ ^GridView ]
+    CocoaSpriteEditor class >> windowContentView [ ^Win onMain contentView ]
     CocoaSpriteEditor class >> swatchView [ ^SwatchView ]
     CocoaSpriteEditor class >> spedRows [ ^Doc rowsOf: CurFrame ]
     CocoaSpriteEditor class >> spedColor: i [ self selectColor: i ]
@@ -502,6 +540,44 @@ Object subclass: CocoaSpriteEditor [
         "The gate's paint: the SAME path a grid gesture takes, minus only the
          locationInView: read."
         self toolAtX: x y: y
+    ]
+
+    "── synthetic mouse (the self-service gate: a real NSEvent through the
+       window's own sendEvent:, so hitTest -> recognizer -> action is the
+       exact span exercised — no human hand needed) ──────────────────────"
+
+    CocoaSpriteEditor class >> synthMouse: type atX: x y: y clicks: n [
+        "Array with: caps below ten arguments — build the argument list
+         positionally (the SpriteDoc palette lesson, second sighting)."
+        | args ev |
+        args := Array new: 10.
+        args at: 1 put: type.
+        args at: 2 put: x.               "location.x — the CGPoint's two doubles"
+        args at: 3 put: y.               "location.y"
+        args at: 4 put: 0.               "modifierFlags"
+        args at: 5 put: 0.0.             "timestamp"
+        args at: 6 put: (Win sendI64: 'windowNumber').
+        args at: 7 put: nil.             "context (deprecated, nil)"
+        args at: 8 put: 0.               "eventNumber"
+        args at: 9 put: n.               "clickCount"
+        args at: 10 put: 1.0.            "pressure (float)"
+        "send:args:ret: is a REAL ObjcRef method — never through the onMain
+         proxy (it would forward it as an ObjC selector). Doits run on the
+         UI worker, which lives on the main thread, so direct is also safe."
+        ev := (Cocoa classNamed: 'NSEvent')
+            send: 'mouseEventWithType:location:modifierFlags:timestamp:windowNumber:context:eventNumber:clickCount:pressure:'
+            args: args
+            ret: #id.
+        ev isNil ifTrue: [ ^self setStatus: 'synth: event mint failed' ].
+        Win onMain sendEvent: ev.
+    ]
+
+    CocoaSpriteEditor class >> spedSynthClickAt: x y: y [
+        "A full press: LeftMouseDown (1) then LeftMouseUp (2) at window
+         coords (contentView coords coincide — its origin is the base
+         origin)."
+        self synthMouse: 1 atX: x y: y clicks: 1.
+        self synthMouse: 2 atX: x y: y clicks: 1.
     ]
 
     "── teardown (UI-worker rebuild — CocoaUI teardown calls by name) ────"

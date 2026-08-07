@@ -57,6 +57,14 @@ Object subclass: MacvmDelegate [
     MacvmDelegate class >> tableSourceOn: aReceiver [ ^self on: aReceiver role: #table ]
     MacvmDelegate class >> outlineSourceOn: aReceiver [ ^self on: aReceiver role: #outline ]
     MacvmDelegate class >> windowDelegateOn: aReceiver [ ^self on: aReceiver role: #window ]
+    "An NSImageView SUBCLASS instance (the first view-role): parent it like
+     any view; its mouseDown:/mouseDragged: overrides dispatch to aReceiver.
+     Built because world-minted NSGestureRecognizers never fire — wired
+     identically to every working button, silent for real AND synthetic
+     events — while view-level mouse overrides are delivered by AppKit
+     unconditionally. acceptsFirstMouse answers YES natively (first click
+     paints, not merely focuses)."
+    MacvmDelegate class >> mouseViewOn: aReceiver [ ^self on: aReceiver role: #mouseview ]
     MacvmDelegate class >> textDelegateOn: aReceiver [ ^self on: aReceiver role: #text ]
     "A menu-item/button target answering macvmDoIt:/macvmPrintIt: synchronously
      on the main thread (CG4 Workspace ⌘D/⌘P) — the receiver implements those."

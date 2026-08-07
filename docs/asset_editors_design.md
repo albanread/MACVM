@@ -165,17 +165,24 @@ New/Save/Load/Copy Code, status.
 
 ## 5. Mechanics worth writing down before they bite
 
-- **Mouse painting**: `NSClickGestureRecognizer` (dot) +
-  `NSPanGestureRecognizer` (stroke) on the grid NSImageView, both
-  targeted at an action delegate minted from a new 1-arg holder —
-  `CocoaSenderAction on: [ :sender | … ]` with
-  `macvmAction: sender [ ^Block value: sender ]`. The block reads
-  `sender locationInView:` (the bridge returns `#point` structs by value),
-  flips y (NSView origin is bottom-left), divides by the cell size, paints.
-  Painting is idempotent per cell and each repaint is one canvas blast, so
-  a flooding pan recognizer is harmless. Fallback if the recognizer pair
-  misbehaves through the bridge: click-only painting — still usable, and
-  the decision point is stage 3, not a redesign.
+- **Mouse painting** *(settled in stage 3, the hard way)*: world-minted
+  `NSGestureRecognizer`s never fire — wired identically to every working
+  button (valid SEL, retained target, clean hitTest), silent for real mice
+  AND synthetic `sendEvent:` events; root cause inside AppKit
+  unestablished, leading suspect the recognition arbitration an
+  NSImageView's own built-in recognizer wins. The shipped mechanism is the
+  `#mouseview` role: `MacvmMouseView`, an NSImageView SUBCLASS registered
+  through the C6 door (`register_class_under`, the scripting arc's
+  superclass generalisation), whose `mouseDown:`/`mouseDragged:` overrides
+  dispatch the NSEvent to a per-view `CocoaMouseHandler`. Responder-chain
+  delivery is unconditional — no arbitration to lose — and the class
+  answers `acceptsFirstMouse:` YES natively so the first click paints.
+  The handler converts `locationInWindow` via `convertPoint:fromView:`
+  (`#point` structs cross by value), truncates to Integer BEFORE `//`
+  (Float has no `//`), flips y, paints. Painting is idempotent per cell
+  and each repaint is one canvas blast, so drag-rate delivery is harmless.
+  `spedSynthClickAt:y:` mints real NSEvents and pushes them through
+  `sendEvent:` — the permanent no-hands gate for this whole path.
 - **The grid repaint is a full-canvas base64 blast** (~432×432 RGBA ≈ 1 MB
   of base64 per repaint), which is the house doctrine — blast, don't patch
   — at a cost worth measuring. Coalesce repaints behind a dirty flag at
@@ -225,12 +232,10 @@ carries the whole native surface of the arc.
 
 ## 7. Risks, honestly
 
-- **Gesture recognizers through the bridge are unproven.** Buttons and
-  menu items exercise target/action daily; recognizers use the identical
-  mechanism but have never been minted from the world. If they refuse,
-  stage 3's fallback (plain `mouseDown:` via a click recognizer only, or
-  even swatch-plus-arrow-key painting) keeps the editor alive while the
-  bridge grows whatever is missing.
+- **Gesture recognizers through the bridge — resolved, negatively.** They
+  refuse (see §5); the bridge grew the `#mouseview` role instead, which is
+  the *stronger* mechanism. Any future control that wants mouse input
+  should mint a mouse view, not reach for recognizers.
 - **Preview-by-relaunch cost.** `request_launch` tears down and rebuilds
   the pane window per rebuild. At 300 ms idle coalescing this is fine for
   editing; if it flickers, the fix is a `GameCommand`-level soft-reset (a

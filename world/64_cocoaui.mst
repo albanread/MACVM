@@ -56,19 +56,6 @@ Object subclass: CocoaToolbarAction [
     macvmAction: sender [ ^Block value ]
 ]
 
-"CocoaToolbarAction's 1-arg sibling: passes the SENDER through to the block.
- What a gesture-recognizer target needs — the block asks the recognizer
- itself for locationInView: (docs/asset_editors_design.md §5). Same ticket
- discipline: kept alive by the world-side registry, one shared Rust IMP."
-Object subclass: CocoaSenderAction [
-    <classVars: nil>
-    | Block |
-    CocoaSenderAction class >> on: aBlock [
-        | h | h := self new. h setBlock: aBlock. ^h
-    ]
-    setBlock: aBlock [ Block := aBlock ]
-    macvmAction: sender [ ^Block value: sender ]
-]
 
 "I am the native GUI's application shell, running in the UI worker VM on
  the main thread. I build the main window: a toolbar of view-switcher

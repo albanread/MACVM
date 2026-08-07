@@ -594,6 +594,7 @@ static TEXT_DELEGATE_CLASS: OnceLock<Option<usize>> = OnceLock::new();
 static TABLE_SOURCE_CLASS: OnceLock<Option<usize>> = OnceLock::new();
 static OUTLINE_SOURCE_CLASS: OnceLock<Option<usize>> = OnceLock::new();
 static TOOLBAR_DELEGATE_CLASS: OnceLock<Option<usize>> = OnceLock::new();
+static MOUSEVIEW_CLASS: OnceLock<Option<usize>> = OnceLock::new();
 static ACTION_TARGET_CLASS: OnceLock<Option<usize>> = OnceLock::new();
 
 fn window_delegate_class() -> Option<*mut c_void> {
@@ -1002,6 +1003,51 @@ pub fn register_script_commands() -> bool {
     crate::runtime::objc_bridge::class_named("MacvmBrowseCommand").is_some()
 }
 
+// MacvmMouseView — an `NSImageView` SUBCLASS (the first non-NSObject role):
+// the minted instance IS a view the world parents like any other, and its
+// mouse overrides dispatch through the callback door. Built because world-
+// minted NSGestureRecognizers, wired identically to every working button
+// (valid SEL, retained target), never fire — neither for real mice nor for
+// synthetic events through `NSWindow sendEvent:` — while view-level
+// `mouseDown:` is delivered by AppKit unconditionally. The asset editors'
+// paint surfaces ride on this (docs/asset_editors_design.md §5).
+extern "C" fn imp_mouse_down(this: *mut c_void, _cmd: *mut c_void, event: *mut c_void) {
+    dispatch(this, "mouseDown:", &[ArgVal::Id(event)], RetShape::Void);
+}
+extern "C" fn imp_mouse_dragged(this: *mut c_void, _cmd: *mut c_void, event: *mut c_void) {
+    dispatch(this, "mouseDragged:", &[ArgVal::Id(event)], RetShape::Void);
+}
+/// Constant YES, no dispatch: the first click on a non-key window should
+/// paint, not merely focus.
+extern "C" fn imp_accepts_first_mouse(
+    _this: *mut c_void,
+    _cmd: *mut c_void,
+    _event: *mut c_void,
+) -> u8 {
+    1
+}
+
+fn mouseview_class() -> Option<*mut c_void> {
+    MOUSEVIEW_CLASS
+        .get_or_init(|| {
+            register_class_under(
+                "NSImageView",
+                "MacvmMouseView",
+                &[
+                    ("mouseDown:", imp_ptr!(imp_mouse_down, ImpV1), "v@:@"),
+                    ("mouseDragged:", imp_ptr!(imp_mouse_dragged, ImpV1), "v@:@"),
+                    (
+                        "acceptsFirstMouse:",
+                        imp_ptr!(imp_accepts_first_mouse, ImpB1),
+                        "B@:@",
+                    ),
+                ],
+            )
+            .map(|c| c as usize)
+        })
+        .map(|p| p as *mut c_void)
+}
+
 /// The role symbol (`#window`/`#text`/`#table`/`#outline`/`#action`) → its
 /// registered delegate class. `None` for an unknown role.
 fn role_class(role: &str) -> Option<*mut c_void> {
@@ -1019,6 +1065,7 @@ fn role_class(role: &str) -> Option<*mut c_void> {
         "table" => table_source_class(),
         "outline" => outline_source_class(),
         "toolbar" => toolbar_delegate_class(),
+        "mouseview" => mouseview_class(),
         "action" => action_target_class(),
         _ => None,
     }
