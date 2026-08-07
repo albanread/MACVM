@@ -656,7 +656,38 @@ the test harness, not the code; a single clean instance answers immediately):
 The defect that opened this section is closed: a runtime error is now an
 immediate, explicit script error, and the app survives it.
 
-**Still open — the `time limit` deadline.** Three real bugs were found and
+**CLOSED 2026-08-07 — the `time limit` deadline works.**
+`evaluate "[true] whileTrue: []" time limit 2` now fails in **2 seconds** with
+`evaluate: the image did not answer within the time limit`, and the app keeps
+serving. Four bugs stood between the design and that line, and the last two
+were only findable because §6.3 had just landed:
+
+1. The timer's TARGET was not retained (`Cocoa action: […]` was a temporary).
+2. **`Cocoa action:` is the wrong primitive for a watchdog.**
+   `macvm_action_fire` does not call the world — it *posts an envelope* for
+   the inbox drain to deliver later. A watchdog built on it inherits exactly
+   the stalls it exists to detect; measured, its ticks stopped arriving
+   during a runaway doit. The sweep now hangs off the **`#app` role** as
+   `macvmSweep:`, dispatched SYNCHRONOUSLY on main like every other delegate
+   callback — and the delegate is already retained for the process's life,
+   which disposes of (1) as well.
+3. A debug breadcrumb of mine had its `\\` (modulo) mangled to `\` by shell
+   quoting, so the sweep raised `does not understand \` on **every tick** —
+   71 of them in one run. Silent before §6.3; a labelled line in the log
+   after it. This is the clearest possible demonstration of why that fix
+   mattered.
+4. Removing that breadcrumb cut the `ifTrue:` block's closing bracket. The
+   world tests did not catch it — `tests.list` does not load `cocoaui.list` —
+   but `cargo test -p cocoa_gui`'s headless boot handshake did, immediately.
+   Worth remembering which gate covers which layer.
+
+**A limit worth stating plainly:** the deadline frees the *caller*; it does
+not kill the doit. After a runaway, the primary keeps spinning and later
+`evaluate`s queue behind it. Terminating a running doit is a different
+capability (and, without exceptions, a hard one) — see
+`docs/exceptions_design.md`.
+
+**Superseded — the earlier open note.** Three real bugs were found and
 fixed chasing it, and it still does not expire a runaway:
 
 1. The timer's TARGET was not retained. `SweepTimer` was held but

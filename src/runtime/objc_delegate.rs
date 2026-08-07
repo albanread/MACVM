@@ -788,6 +788,18 @@ macro_rules! script_setter {
     };
 }
 
+/// `-(void)macvmSweep:(NSTimer*)t` — the scripting deadline sweep, driven by
+/// an NSTimer on MAIN. It hangs off the `#app` role rather than a
+/// `Cocoa action:` block because that path is ASYNCHRONOUS: `macvm_action_fire`
+/// posts an envelope for the inbox drain to deliver later, so a watchdog built
+/// on it inherits the very stalls it exists to detect (measured: ticks stopped
+/// arriving exactly when a doit ran away). This IMP dispatches SYNCHRONOUSLY
+/// into the world on the main thread, like every other delegate callback, and
+/// the delegate is already retained for the process's life.
+extern "C" fn imp_macvm_sweep(this: *mut c_void, _cmd: *mut c_void, _timer: *mut c_void) {
+    dispatch(this, "sweepDeadlines", &[], RetShape::Void);
+}
+
 script_getter!(imp_script_current_view, "scriptCurrentView");
 script_getter!(imp_script_appearance, "scriptAppearance");
 script_getter!(imp_script_transcript, "scriptTranscript");
@@ -882,6 +894,7 @@ fn app_delegate_class() -> Option<*mut c_void> {
                         "@@:",
                     ),
                     ("scriptBusy", imp_ptr!(imp_script_busy, ImpId0), "@@:"),
+                    ("macvmSweep:", imp_ptr!(imp_macvm_sweep, ImpV1), "v@:@"),
                     (
                         "setScriptCurrentView:",
                         imp_ptr!(imp_set_script_current_view, ImpV1),

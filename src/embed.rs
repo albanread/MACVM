@@ -520,6 +520,12 @@ thread_local! {
 }
 
 fn set_last_callback_error(msg: String) {
+    // Always announce it. A callback failure that nobody takes is exactly the
+    // silence §6.3 exists to end: a delegate, action or timer handler that
+    // raises otherwise looks like "nothing happened" — the shape that
+    // disguised four bugs in the Apple Event arc. Consumers still take the
+    // message for structured reporting; this is the floor, not a substitute.
+    eprintln!("macvm: callback recovered a guest error: {msg}");
     LAST_CALLBACK_ERROR.with(|c| *c.borrow_mut() = Some(msg));
 }
 

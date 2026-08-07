@@ -30,7 +30,7 @@
  `scriptKeys` and nothing else."
 
 Object subclass: CocoaScript [
-    <classVars: Delegate Suspended NextEvalKey SweepTimer SweepTarget SweepTicks>
+    <classVars: Delegate Suspended NextEvalKey SweepTimer SweepTicks>
 
     "── the key set ──────────────────────────────────────────────────────
      The single list of properties we answer. `application:delegateHandlesKey:`
@@ -418,17 +418,18 @@ Object subclass: CocoaScript [
          compose.) Scheduled on main: a timer attaches to the CURRENT
          thread's run loop, and only main's is pumped."
         SweepTimer isNil ifTrue: [
-            "SweepTarget is held for the process's life ON PURPOSE: NSTimer
-             does not retain... it retains its target, but the ObjcRef
-             wrapper is ours and an unheld action was collected between
-             ticks — the timer then fired into a dead target and NEVER
-             swept (measured: the breadcrumb never appeared). Same
-             ownership rule as the toolbar delegates."
-            SweepTarget := Cocoa action: [ CocoaScript sweepDeadlines ].
+            "Driven by an NSTimer on MAIN, targeting the app delegate we
+             just installed — NOT a `Cocoa action:` block. That path is
+             asynchronous (macvm_action_fire posts an envelope for the inbox
+             drain), so a watchdog built on it stalls exactly when the thing
+             it watches stalls; measured, its ticks stopped arriving during a
+             runaway doit. The delegate dispatches synchronously and is
+             already retained for the process's life, which also disposes of
+             the target-lifetime problem a bare action had."
             SweepTimer := (Cocoa classNamed: 'NSTimer') onMain
                 scheduledTimerWithTimeInterval: 1.0
-                target: SweepTarget
-                selector: 'macvmFire:' userInfo: nil repeats: true ].
+                target: Delegate
+                selector: 'macvmSweep:' userInfo: nil repeats: true ].
         ^true
     ]
 ]
