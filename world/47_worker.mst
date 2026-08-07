@@ -89,7 +89,7 @@ Object subclass: WorkerMessage [
  harmless to load anywhere."
 Object subclass: Worker [
     | id |
-    <classVars: Handler ReplyHandler PendingReplies NextCorr CurrentCorr CurrentPeer CocoaEventHandler UiReqHandler SnapshotHandler TranscriptLineHandler DiedHandler AnyDiedHook DeadlineSweepHook>
+    <classVars: Handler ReplyHandler PendingReplies NextCorr CurrentCorr CurrentPeer CocoaEventHandler UiReqHandler SnapshotHandler TranscriptLineHandler DiedHandler AnyDiedHook DeadlineSweepHook InFlightPeer InFlightCorr>
 
     "── spawning (primary side) ──"
     Worker class >> spawn: initSource [
@@ -452,6 +452,7 @@ Object subclass: Worker [
         peer := CurrentPeer. corr := CurrentCorr.
         verb := payload at: 3.
         verb == #doit ifTrue: [ ^self serveUiDoit: (payload at: 4) peer: peer corr: corr ].
+        verb == #doitq ifTrue: [ ^self serveUiDoitQuiet: (payload at: 4) peer: peer corr: corr ].
         verb == #refresh ifTrue: [
             ^self replyTo: peer corr: corr payload: (Array with: #uiReply with: corr
                                 with: (self serveUiRefresh: (payload at: 4))) ].
@@ -479,10 +480,61 @@ Object subclass: Worker [
          Backward-compatible: reply at: 3 is still the result printString for the
          plain uiDoit:onReply: callers (browser accepts, liveReopen); only the
          timed uiDoit:onReplyTimed: reads element 4."
+        "In-flight tracking (scripting arc): a raise inside the doit unwinds
+         this whole dispatch — the reply below never sends, and before this
+         arc the requester simply never heard back (the scripted `evaluate`
+         hang). The supervisor's beat now recovers the error Rust-side and
+         calls `recoverInFlightWith:` with the guest message; these two
+         class-vars are how that call knows WHERE the lost reply was owed.
+         Single-slot by design: doits are served one at a time off this
+         pump (a doit that itself pumps nested uiReqs is out of scope, and
+         the slot simply tracks the innermost)."
+        InFlightPeer := peer. InFlightCorr := corr.
         ms := Time millisecondsToRun: [ result := self primEvalDoit: aSource ].
+        InFlightPeer := nil. InFlightCorr := nil.
         ^self replyTo: peer corr: corr payload:
             (Array with: #uiReply with: corr with: result printString with: ms)
     ]
+
+    "Called by the supervisor (supervisor.rs) on the beat AFTER a recovered
+     guest error: if a doit was in flight when it raised, its requester is
+     still waiting — reply the error text so a scripted `evaluate` (or a
+     Workspace print-it) reports instead of hanging. The `error: ` prefix is
+     OURS and unambiguous: a legitimate String result always arrives through
+     `result printString` above, i.e. quoted, so an UNQUOTED `error: ` can
+     only come from here (the same reasoning as the parse-error prefix,
+     74_cocoascript.mst)."
+    Worker class >> recoverInFlightWith: msg [
+        | peer corr |
+        InFlightCorr isNil ifTrue: [ ^self ].
+        peer := InFlightPeer. corr := InFlightCorr.
+        InFlightPeer := nil. InFlightCorr := nil.
+        ^self replyTo: peer corr: corr payload:
+            (Array with: #uiReply with: corr with: 'error: ' , msg with: 0)
+    ]
+    "serveUiDoit:'s QUIET twin, for SCRIPTED evaluation (74_cocoascript.mst):
+     identical protocol, but the eval runs with halt-on-error suppressed
+     (prim 253). Halting at a raise is the right thing when a human is at
+     the keyboard — the Debugger pane lights up — and a permanent hang when
+     the caller is an Apple Event: the beat blocks inside the halted exec,
+     so no reply, no recovery, and every later doit queues behind it
+     (measured). With halt suppressed the raise unwinds to the beat's exec
+     door, whose recovery arm replies `error: <message>` via
+     recoverInFlightWith: — so a scripted 1/0 becomes a script error, while
+     ⌘D on the same expression still opens the debugger."
+    Worker class >> serveUiDoitQuiet: aSource peer: peer corr: corr [
+        | result ms |
+        InFlightPeer := peer. InFlightCorr := corr.
+        ms := Time millisecondsToRun: [ result := self primEvalDoitQuiet: aSource ].
+        InFlightPeer := nil. InFlightCorr := nil.
+        ^self replyTo: peer corr: corr payload:
+            (Array with: #uiReply with: corr with: result printString with: ms)
+    ]
+    Worker class >> primEvalDoitQuiet: aSource [
+        <primitive: 264>
+        ^self error: 'primEvalDoitQuiet: failed'
+    ]
+
     "Per-view request handlers a specialized primary MAY install (checked
      first); the built-in services below are the defaults. Unknown views
      answer a benign placeholder so a stray request never raises."

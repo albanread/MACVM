@@ -127,7 +127,7 @@ const PRIM_READS_ARG_BASE: [i64; 2] = [93, 94];
 /// only ever saved the method-entry overhead — both primitives then
 /// parse/compile/lookup and run whole nested Smalltalk, so the win was
 /// noise; the c2i path costs the same order and is correct.
-const PRIM_REENTERS_INTERPRETER: [i64; 2] = [64, 250];
+const PRIM_REENTERS_INTERPRETER: [i64; 3] = [64, 250, 264];
 
 /// `true` iff `prim_id` can become a compiled primitive-call shim
 /// (`emit::emit`'s prologue, driven by `eligibility_detail` below). Five

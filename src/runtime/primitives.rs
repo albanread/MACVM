@@ -1450,6 +1450,24 @@ pub static PRIMITIVES: &[PrimDesc] = &[
         can_allocate: false,
         can_fail: true,
     },
+    // Scripting (docs/applescript_design.md §5): `primEvalDoit:`'s QUIET
+    // twin — identical evaluation, but halt-on-error is suppressed for the
+    // duration. A raising doit under the DBG4 debugger PARKS the primary at
+    // the raise (the right thing for a human at the keyboard, measured as a
+    // permanent hang for a script's `evaluate "1/0"`): with the flag
+    // cleared, the raise unwinds to the beat's exec door instead, whose
+    // recovery arm replies the error text (supervisor.rs). The flag is
+    // restored on the normal path; on the raise path the unwind skips the
+    // restore, and the very next beat re-syncs it from HALT_ON_ERROR —
+    // self-healing by construction.
+    PrimDesc {
+        id: 264,
+        name: "Worker class>>primEvalDoitQuiet:",
+        f: prim_eval_doit_quiet,
+        argc: 1,
+        can_allocate: true,
+        can_fail: true,
+    },
 ];
 
 pub fn prim_by_id(id: u16) -> Option<&'static PrimDesc> {
@@ -1958,6 +1976,17 @@ fn string_oop(vm: &mut VmState, s: &str) -> Oop {
 /// tier journal mispaired and aborted the process (the Cocoa `Worker uiDoit:`
 /// relay crash after ~10 warmed dispatches); see the driver list's own doc
 /// for why the bracket cannot live here in the `PrimFn` body instead.
+/// Prim 253: `prim_eval_doit` with halt-on-error suppressed — see the
+/// table row's comment. Restore-on-normal-exit only, deliberately: the
+/// raise path's unwind skips it, and the beat re-syncs the flag anyway.
+fn prim_eval_doit_quiet(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    let saved = vm.debug.halt_on_error;
+    vm.debug.halt_on_error = false;
+    let r = prim_eval_doit(vm, args);
+    vm.debug.halt_on_error = saved;
+    r
+}
+
 fn prim_eval_doit(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     let Some(src) = string_arg(vm, args[1]) else {
         return PrimResult::Fail;
@@ -5215,6 +5244,7 @@ mod tests {
             (261, "GamePane>>linePaletteAt:index:rgb:"),
             (262, "GamePane>>frameRate:"),
             (263, "Sound class>>playEffect:"),
+            (264, "Worker class>>primEvalDoitQuiet:"),
         ];
         assert_eq!(
             PRIMITIVES.len(),

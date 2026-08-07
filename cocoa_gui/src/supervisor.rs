@@ -429,7 +429,31 @@ fn primary_generation_main(
             ));
         }
         let beat = if crate::game::is_active() { 4 } else { PUMP_BEAT_MS };
-        let _ = primary.exec(&format!("Worker pumpInbox: {beat}."));
+        // A recovered guest error (ErrorPolicy::Resume) surfaces HERE, with
+        // the guest's own message — and used to be discarded, which is how a
+        // raising doit left its requester waiting forever (the scripted
+        // `evaluate "1/0"` hang, docs/applescript_design.md). The VM is
+        // already back at its clean idle baseline, so a fresh top-level exec
+        // is legal: hand the message to the world, which replies to the
+        // in-flight doit's (peer, corr) if one was interrupted
+        // (`Worker recoverInFlightWith:`, 47_worker.mst) and is a no-op
+        // otherwise.
+        if let Err(e) = primary.exec(&format!("Worker pumpInbox: {beat}.")) {
+            // One line, bounded: the guest message can carry newlines (a
+            // dossier fragment), and a multi-line string literal is a parse
+            // error in the recovery doit itself — which would silently lose
+            // the recovery. Seen live before this flattening existed.
+            let mut msg = e.to_string().replace(['\n', '\r'], " | ");
+            msg.truncate(300);
+            eprintln!("macvm-cocoa: beat recovered a guest error: {msg}");
+            match primary.exec(&format!(
+                "Worker recoverInFlightWith: '{}'.",
+                crate::filein::escape_st(&msg)
+            )) {
+                Ok(()) => {}
+                Err(e2) => eprintln!("macvm-cocoa: recoverInFlightWith failed: {e2}"),
+            }
+        }
         if let Some(step) = crate::game::poll_primary_step() {
             let _ = primary.exec(&step);
         }

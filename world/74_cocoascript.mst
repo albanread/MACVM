@@ -30,7 +30,7 @@
  `scriptKeys` and nothing else."
 
 Object subclass: CocoaScript [
-    <classVars: Delegate Suspended NextEvalKey>
+    <classVars: Delegate Suspended NextEvalKey SweepTimer>
 
     "── the key set ──────────────────────────────────────────────────────
      The single list of properties we answer. `application:delegateHandlesKey:`
@@ -305,7 +305,8 @@ Object subclass: CocoaScript [
         CocoaUI appendTranscript: 'script: evaluate ' , src.
         cmd send: 'suspendExecution'.
         Suspended at: key put: (Array with: cmd with: (self deadlineFor: cmd)).
-        Worker uiDoit: src onReply: [ :result | self resume: key with: result ].
+        Worker uiRequest: #doitq args: (Array with: src)
+               onReply: [ :result | self resume: key with: result ].
         ^nil
     ]
 
@@ -341,7 +342,8 @@ Object subclass: CocoaScript [
          QUOTED — the marker is 'parse error:' with or without that leading
          quote. (Matching the VM's own generated prefix, never guest data.)"
         ((text startsWith: 'parse error:')
-            or: [ text startsWith: '''parse error:' ])
+            or: [ (text startsWith: '''parse error:')
+            or: [ text startsWith: 'error: ' ] ])
             ifTrue: [
                 "Setting the error properties is not enough — a suspended
                  command must still be RESUMED for AppleScript to raise it."
@@ -404,6 +406,20 @@ Object subclass: CocoaScript [
         Delegate := MacvmDelegate on: self role: #app.
         Delegate isNil ifTrue: [ ^false ].
         app sharedApplication onMain setDelegate: Delegate.
+        "The deadline sweep must NOT share fate with the primary: the metrics
+         beat that also sweeps is driven by the primary's own dispatch thread
+         (supervisor.rs pumpInbox), so a busy or dead primary starves it —
+         measured: `time limit 5` under a 500M-iteration doit never fired.
+         A main-thread NSTimer ticks regardless. (The design's original 'no
+         NSTimer, no new machinery' claim is thereby falsified and repealed;
+         the metrics-beat sweep stays too — resumes are one-shot, so the two
+         compose.) Scheduled on main: a timer attaches to the CURRENT
+         thread's run loop, and only main's is pumped."
+        SweepTimer isNil ifTrue: [
+            SweepTimer := (Cocoa classNamed: 'NSTimer') onMain
+                scheduledTimerWithTimeInterval: 1.0
+                target: (Cocoa action: [ CocoaScript sweepDeadlines ])
+                selector: 'macvmFire:' userInfo: nil repeats: true ].
         ^true
     ]
 ]

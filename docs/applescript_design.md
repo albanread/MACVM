@@ -583,7 +583,60 @@ discarded, so the verb silently does nothing instead of reporting. That is the
 `embed.rs` change §6.3 describes, and it is now the one piece of stage 2 still
 outstanding.
 
-### OPEN, and serious: a runtime error in `evaluate` takes the app down
+### The runtime-error path: fixed at the source, verification BLOCKED
+
+**2026-08-07.** The three-part fix the previous entry called for is built,
+and the recovery half is *proven working by the app's own log*:
+
+```
+macvm-cocoa: beat recovered a guest error: Error: division by zero
+macvm-cocoa: beat recovered a guest error: Error: does not understand foo
+```
+
+1. **An error reply.** `serveUiDoit:`/`serveUiDoitQuiet:` record the
+   in-flight `(peer, corr)`; the supervisor's beat, which already recovers a
+   guest error to a clean idle baseline and *discarded the message*, now
+   hands it to `Worker recoverInFlightWith:`, which replies
+   `error: <message>` to the waiting requester. `CocoaScript resume:with:`
+   raises it as a script error, on the same unambiguous-prefix reasoning as
+   `parse error:` (a real String result always arrives quoted).
+2. **Halt-on-error had to be suppressed for scripted evaluation.** The
+   deeper cause of the *hang*: DBG4's halt-on-error defaults ON, so a
+   raising doit PARKS the primary at the raise — correct for a human at the
+   keyboard, fatal for an Apple Event, because the beat blocks inside the
+   halted exec and every later doit queues behind it. Prim 264
+   (`primEvalDoitQuiet:`) is `primEvalDoit:`'s twin with the flag cleared
+   for the duration, reached by the new `#doitq` verb, used only by
+   scripting — so ⌘D on `1/0` still opens the debugger.
+3. **A deadline that does not share fate with the primary.** The metrics
+   beat is driven by the primary's own dispatch thread, so a busy or dead
+   primary starves the sweep — measured: `time limit 5` under a
+   500M-iteration doit never fired. A main-thread `NSTimer` now sweeps too.
+   The design's original "no NSTimer, no new machinery" is falsified and
+   repealed; both sweeps coexist because resumes are one-shot.
+
+**What is NOT verified, and why.** End-to-end `evaluate` could not be
+confirmed today: every scripted `evaluate` hangs, *including on `16324b2`* —
+the commit where it was measured working yesterday (`7`, `2870`,
+`#Integer`). So the regression is environmental or latent, NOT this fix and
+NOT the asset-editor arc. The signal to chase is in the app log:
+
+```
+UI worker drain error: native fault (signal 11) at pc=0x18988b914
+far=0x100000000000 — recovered, this eval aborted
+```
+
+A SIGSEGV in the **UI worker's reply drain** would explain the shape exactly:
+the doit runs (its transcript breadcrumb appears), the reply is produced
+(errors are recovered and named), but `resume:with:` is never reached, so the
+suspended command is never resumed. `far=0x100000000000` is a wild address,
+not a null — worth a PROBE dossier. Sync verbs (`browse`) are unaffected,
+which fits: they need no reply drain.
+
+That fault is the next thing to fix, and it is a bigger deal than scripting:
+it is the path every Workspace print-it reply takes too.
+
+### Superseded: the original defect note
 
 **Status 2026-08-06: a live defect, not a rough edge.** `evaluate "3 + "`
 (syntax) correctly raises a script error. `evaluate "1/0"` (runtime) does
