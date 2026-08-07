@@ -30,7 +30,7 @@
  `scriptKeys` and nothing else."
 
 Object subclass: CocoaScript [
-    <classVars: Delegate Suspended NextEvalKey SweepTimer>
+    <classVars: Delegate Suspended NextEvalKey SweepTimer SweepTarget SweepTicks>
 
     "── the key set ──────────────────────────────────────────────────────
      The single list of properties we answer. `application:delegateHandlesKey:`
@@ -164,6 +164,8 @@ Object subclass: CocoaScript [
     CocoaScript class >> scriptBusy [
         ^self numberWith: (Worker pendingReplyCount > 0 ifTrue: [ 1 ] ifFalse: [ 0 ])
     ]
+
+    CocoaScript class >> sweepTicks [ ^SweepTicks isNil ifTrue: [ 0 ] ifFalse: [ SweepTicks ] ]
 
     "── the commands (design §3) ─────────────────────────────────────────
      Cocoa Scripting mints an NSScriptCommand per invocation and sends it
@@ -302,7 +304,6 @@ Object subclass: CocoaScript [
         "Suspend BEFORE posting, and inside this synchronous dispatch — it must
          precede the IMP`s return, or AppKit will treat the nil we answer as
          the command`s result."
-        CocoaUI appendTranscript: 'script: evaluate ' , src.
         cmd send: 'suspendExecution'.
         Suspended at: key put: (Array with: cmd with: (self deadlineFor: cmd)).
         Worker uiRequest: #doitq args: (Array with: src)
@@ -369,6 +370,7 @@ Object subclass: CocoaScript [
      table is empty, which is the normal case."
     CocoaScript class >> sweepDeadlines [
         | now expired |
+        SweepTicks := (SweepTicks isNil ifTrue: [ 0 ] ifFalse: [ SweepTicks ]) + 1.
         Suspended isNil ifTrue: [ ^self ].
         now := Time millisecondClockValue.
         expired := nil.
@@ -416,9 +418,16 @@ Object subclass: CocoaScript [
          compose.) Scheduled on main: a timer attaches to the CURRENT
          thread's run loop, and only main's is pumped."
         SweepTimer isNil ifTrue: [
+            "SweepTarget is held for the process's life ON PURPOSE: NSTimer
+             does not retain... it retains its target, but the ObjcRef
+             wrapper is ours and an unheld action was collected between
+             ticks — the timer then fired into a dead target and NEVER
+             swept (measured: the breadcrumb never appeared). Same
+             ownership rule as the toolbar delegates."
+            SweepTarget := Cocoa action: [ CocoaScript sweepDeadlines ].
             SweepTimer := (Cocoa classNamed: 'NSTimer') onMain
                 scheduledTimerWithTimeInterval: 1.0
-                target: (Cocoa action: [ CocoaScript sweepDeadlines ])
+                target: SweepTarget
                 selector: 'macvmFire:' userInfo: nil repeats: true ].
         ^true
     ]

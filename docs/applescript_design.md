@@ -615,7 +615,46 @@ macvm-cocoa: beat recovered a guest error: Error: does not understand foo
    The design's original "no NSTimer, no new machinery" is falsified and
    repealed; both sweeps coexist because resumes are one-shot.
 
-**What is NOT verified, and why.** End-to-end `evaluate` could not be
+**VERIFIED 2026-08-07, end to end** (the previous entry's blocked
+verification — the hangs were a dual-instance/Apple-Event-routing artifact of
+the test harness, not the code; a single clean instance answers immediately):
+
+| script | result | time |
+|---|---|---|
+| `evaluate "3 + 4"` | `7` | 0s |
+| `evaluate "1/0"` | script error `evaluate: error: Error: division by zero` | **0s** |
+| `evaluate "nil foo"` | script error `… does not understand foo` | 0s |
+| `evaluate "3 + "` | script error `evaluate: 'parse error: …'` | 0s |
+| `evaluate "6 * 7"` after all of it | `42` — the VM kept serving | 0s |
+
+The defect that opened this section is closed: a runtime error is now an
+immediate, explicit script error, and the app survives it.
+
+**Still open — the `time limit` deadline.** Three real bugs were found and
+fixed chasing it, and it still does not expire a runaway:
+
+1. The timer's TARGET was not retained. `SweepTimer` was held but
+   `Cocoa action: […]` was a temporary — the timer then fired into a dead
+   target and never swept. Now held in `SweepTarget`, the same ownership rule
+   the toolbar delegates follow.
+2. With the target held, the timer demonstrably ticks (instrumented: ticks 1,
+   2, 3 at one-second intervals), and
+3. the `time limit` parameter demonstrably reads (`raw='3'`), so
+   `deadlineFor:` computes a real deadline.
+
+Yet `evaluate "[true] whileTrue: []" time limit 3` still does not resume with
+a timeout error, and instrumentation placed after the sweep's iteration never
+printed — i.e. `sweepDeadlines` reaches its tick counter but not its expiry
+branch, every tick, once something is actually suspended. That is the next
+thread to pull, and the shape suggests something raising inside the
+`keysAndValuesDo:` walk (a raise there would be swallowed by the callback
+door — §6.3 again, for the fourth time this arc).
+
+**Priority note:** with the error reply landed, the deadline now only covers
+the *never-replies* cases — a genuinely runaway doit or a dead primary. Real,
+but no longer the common path.
+
+**Separately, a fault worth its own investigation.** End-to-end `evaluate` could not be
 confirmed today: every scripted `evaluate` hangs, *including on `16324b2`* —
 the commit where it was measured working yesterday (`7`, `2870`,
 `#Integer`). So the regression is environmental or latent, NOT this fix and
