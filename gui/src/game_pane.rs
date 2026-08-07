@@ -300,6 +300,7 @@ pub fn apply_command(cmd: &macvm::embed::GameCommand) {
         C::StartLoop => return crate::start_game_loop_timer(),
         C::StopLoop => return crate::on_game_loop_stopped(),
         C::PlaySound { preset } => return play_sound(*preset),
+        C::PlayEffect { params } => return play_effect(params),
         C::PlayTune { abc } => return play_tune(abc),
         // Record the requested size BEFORE the pane is built (a demo sends it
         // first). The web GUI builds its pane from main.rs; a size change after
@@ -399,6 +400,7 @@ pub fn apply_command(cmd: &macvm::embed::GameCommand) {
             C::StartLoop
             | C::StopLoop
             | C::PlaySound { .. }
+            | C::PlayEffect { .. }
             | C::PlayTune { .. }
             | C::SetPaneSize { .. }
             | C::SetFrameRate { .. } => {
@@ -442,6 +444,32 @@ pub fn play_sound(preset: u8) {
             DEFINED_SFX.with(|d| d.set(d.get() | bit));
         }
         sfx.play(preset as usize);
+    });
+}
+
+/// The Sound Editor's parametric audition (asset_editors_design.md §3),
+/// decoded by the synth crate's own `effect_from_params` — the contract's one
+/// decoder, shared with the Cocoa GUI. Slot 16 sits above the preset bitmask.
+pub fn play_effect(params: &[f64]) {
+    use macgamepane_audio::synth as s;
+    let Some((e, seed)) = s::effect_from_params(params) else {
+        return;
+    };
+    let mut rng = s::Lcg::new(seed);
+    let sound = s::render(&e, &mut rng);
+    const EFFECT_SLOT: usize = 16;
+    SFX.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if slot.is_none() {
+            let mut sfx = macgamepane_audio::playback::Sfx::new();
+            if !sfx.start() {
+                return;
+            }
+            *slot = Some(sfx);
+        }
+        let sfx = slot.as_mut().unwrap();
+        sfx.define(EFFECT_SLOT, &sound);
+        sfx.play(EFFECT_SLOT);
     });
 }
 

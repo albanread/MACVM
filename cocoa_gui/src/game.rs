@@ -636,46 +636,19 @@ mod audio {
     /// auditions replace each other, which is what an editor wants.
     /// Fail-soft: malformed params are a no-op, never a panic (the drain runs
     /// on the main thread).
+    /// The parametric wire's landing (asset_editors_design.md §3): decode
+    /// through the synth crate's OWN `effect_from_params` — the contract has
+    /// exactly one decoder, shared with the web GUI — render with the seeded
+    /// Lcg (noisy recipes reproduce exactly), play through the same `Sfx`
+    /// engine as the presets. Slot 16 — above the preset bitmask's 0..15,
+    /// well under `MAX_SFX` — is THE audition slot; auditions replace each
+    /// other, which is what an editor wants. Fail-soft on malformed params.
     pub fn play_effect(params: &[f64]) {
         use macgamepane_audio::synth as s;
-        if params.len() < 14 {
+        let Some((e, seed)) = s::effect_from_params(params) else {
             return;
-        }
-        let osc_count = (params[13] as usize).min(4);
-        if params.len() < 14 + osc_count * 5 {
-            return;
-        }
-        let mut e = s::Effect::new(params[0].clamp(0.01, 4.0));
-        e.set_env(
-            params[1].max(0.0),
-            params[2].max(0.0),
-            params[3].clamp(0.0, 1.0),
-            params[4].max(0.0),
-        );
-        e.sweep_start = params[5].max(0.0);
-        e.sweep_end = params[6].max(0.0);
-        e.noise_mix = params[7].clamp(0.0, 1.0);
-        e.distortion = params[8].max(0.0);
-        e.echo_count = (params[9].max(0.0) as u32).min(8);
-        e.echo_delay = params[10].clamp(0.0, 2.0);
-        e.echo_decay = params[11].clamp(0.0, 1.0);
-        let seed = params[12].max(0.0) as u32;
-        for o in 0..osc_count {
-            let b = 14 + o * 5;
-            let wave = match params[b] as u32 {
-                1 => s::Waveform::Square,
-                2 => s::Waveform::Saw,
-                3 => s::Waveform::Triangle,
-                4 => s::Waveform::Noise,
-                5 => s::Waveform::Pulse,
-                _ => s::Waveform::Sine,
-            };
-            e.add_osc(wave, params[b + 1].clamp(0.0, 20_000.0), params[b + 2].clamp(0.0, 1.0));
-            let idx = e.oscillators.len() - 1;
-            e.oscillators[idx].phase = params[b + 3].clamp(0.0, 1.0);
-            e.oscillators[idx].pulse_width = params[b + 4].clamp(0.01, 0.99);
-        }
-        let mut rng = s::Lcg::new(if seed == 0 { 1 } else { seed });
+        };
+        let mut rng = s::Lcg::new(seed);
         let sound = s::render(&e, &mut rng);
         const EFFECT_SLOT: usize = 16;
         SFX.with(|cell| {
