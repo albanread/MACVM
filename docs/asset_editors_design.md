@@ -1,6 +1,8 @@
 # Asset editors — a Sprite Editor and a Sound Editor, under a Tools menu
 
-**Status: design (stage 1 in progress).** Ports MACDART's sprite and sound
+**Status: BUILT — stages 1-6 complete.** The Sprite Editor and the Sound
+Editor both ship under Tools; what follows is the design they were built to,
+with in-place corrections where implementation overruled it. Ports MACDART's sprite and sound
 editors (`~/claudeprojects/MACDART/SPRITE_EDITOR_PLAN.md`,
 `SOUND_EDITOR_PLAN.md`) to macVM: two utility windows that graphically edit
 the 16-colour sprites and parametric sound effects the GamePane renders,

@@ -1,0 +1,521 @@
+"77_sounded.mst — the Sound Editor (docs/asset_editors_design.md §4, stage 6):
+ Tools ▸ Sound Editor. An ADSR instrument panel over the engine's parametric
+ synth: 12 recipe sliders + up to 4 oscillator rows + preset seeds +
+ Randomize/Mutate (the sfxr joy), auditioned through the REAL synth — prim
+ 263 ships SoundDoc's flat params (§3 contract) via a one-line doit to the
+ primary (only the primary holds a game sink), and the drain plays it with
+ no pane needed. The envelope+sweep visualization is an RGBA canvas blast,
+ the sprite editor's own surface idiom. Sheets save as source in the image
+ (isSoundSheet marker) exactly like sprite sheets.
+
+ Window/controls mirror 76_spriteed.mst's patterns: own NSWindow that hides
+ on close, CocoaToolbarAction-wired controls (control actions reach world
+ targets; run-loop callbacks do not — the S3/S4 lesson), own Delegates list
+ so the sprite editor's teardown can never strand these controls."
+Object subclass: CocoaSoundEditor [
+    <classVars: Win WinDelegate Delegates Doc StatusLabel EnvView
+                NameField SeedField PresetIx PresetBtn Rng
+                PSliders PLabels OscRows OscCount>
+
+    CocoaSoundEditor class >> windowWidth [ ^740.0 ]
+    CocoaSoundEditor class >> windowHeight [ ^580.0 ]
+    CocoaSoundEditor class >> envW [ ^420 ]
+    CocoaSoundEditor class >> envH [ ^120 ]
+
+    CocoaSoundEditor class >> open [
+        Win isNil
+            ifTrue: [ self buildWindow ]
+            ifFalse: [ Win isValid ifFalse: [ self teardown. self buildWindow ] ].
+        Win onMain makeKeyAndOrderFront: nil.
+        ^self
+    ]
+
+    CocoaSoundEditor class >> windowShouldClose: sender [
+        "Hide, don't die (design §2): state survives, reopening is instant."
+        Win onMain orderOut: nil.
+        ^false
+    ]
+
+    CocoaSoundEditor class >> buildWindow [
+        | winClass content |
+        Delegates := OrderedCollection new.
+        Doc := SoundDoc new.
+        PresetIx := -1.
+        Rng := Random newWithSeed: 20260807.
+        winClass := Cocoa classNamed: 'NSWindow'.
+        Win := ((winClass onMain alloc) onMain
+            initWithContentRect: (Array with: 360.0 with: 160.0
+                                        with: self windowWidth with: self windowHeight)
+            styleMask: 7 backing: 2 defer: false).
+        Win onMain setReleasedWhenClosed: false.
+        Win onMain setTitle: 'Sound Editor'.
+        WinDelegate := MacvmDelegate windowDelegateOn: self.
+        Win onMain setDelegate: WinDelegate.
+        content := Win onMain contentView.
+        StatusLabel := self label: '' frame: (Array with: 16.0 with: 4.0 with: 708.0 with: 16.0)
+                            in: content.
+        self buildEnvViewIn: content.
+        self buildTopRightIn: content.
+        self buildOscRowsIn: content.
+        self buildParamSlidersIn: content.
+        self syncAll.
+        self setStatus: 'a fresh 440Hz sine — Play auditions, Preset cycles the twelve'.
+    ]
+
+    "── tiny control helpers (76's, duplicated so retention stays local) ──"
+    CocoaSoundEditor class >> label: aString frame: rect in: parent [
+        | l |
+        l := ((Cocoa classNamed: 'NSTextField') onMain alloc) onMain initWithFrame: rect.
+        l onMain setEditable: false. l onMain setBordered: false.
+        l onMain setDrawsBackground: false. l onMain setSelectable: false.
+        l onMain setStringValue: aString.
+        parent onMain addSubview: l.
+        ^l
+    ]
+    CocoaSoundEditor class >> button: title frame: rect action: aBlock in: parent [
+        | btn |
+        btn := ((Cocoa classNamed: 'NSButton') onMain alloc) onMain initWithFrame: rect.
+        btn onMain setTitle: title.
+        btn onMain setBezelStyle: 1.
+        self wireControl: btn to: aBlock.
+        parent onMain addSubview: btn.
+        ^btn
+    ]
+    CocoaSoundEditor class >> wireControl: aControl to: aBlock [
+        | holder delegate |
+        holder := CocoaToolbarAction on: aBlock.
+        delegate := MacvmDelegate actionTargetOn: holder.
+        aControl onMain setTarget: delegate.
+        aControl onMain setAction: 'macvmAction:'.
+        Delegates add: delegate.
+    ]
+    CocoaSoundEditor class >> slider: rect min: lo max: hi in: parent [
+        | s |
+        s := ((Cocoa classNamed: 'NSSlider') onMain alloc) onMain initWithFrame: rect.
+        s onMain setMinValue: lo.
+        s onMain setMaxValue: hi.
+        s onMain setContinuous: true.
+        self wireControl: s to: [ self paramChanged ].
+        parent onMain addSubview: s.
+        ^s
+    ]
+    CocoaSoundEditor class >> sliderValue: s [
+        ^s send: 'doubleValue' args: (Array new: 0) ret: #f64
+    ]
+
+    CocoaSoundEditor class >> setStatus: aString [
+        StatusLabel isNil ifFalse: [ StatusLabel onMain setStringValue: aString ].
+    ]
+
+    "── top-right: name/seed fields, preset/random/mutate, files ─────────"
+    CocoaSoundEditor class >> buildTopRightIn: content [
+        self label: 'Name' frame: (Array with: 450.0 with: 536.0 with: 44.0 with: 16.0) in: content.
+        NameField := ((Cocoa classNamed: 'NSTextField') onMain alloc) onMain
+            initWithFrame: (Array with: 496.0 with: 532.0 with: 140.0 with: 22.0).
+        NameField onMain setStringValue: Doc name.
+        content onMain addSubview: NameField.
+        self button: 'Play' frame: (Array with: 644.0 with: 530.0 with: 80.0 with: 26.0)
+             action: [ self playClicked ] in: content.
+        PresetBtn := self button: 'Preset: —' frame: (Array with: 450.0 with: 498.0 with: 130.0 with: 26.0)
+             action: [ self presetClicked ] in: content.
+        self button: 'Random' frame: (Array with: 584.0 with: 498.0 with: 70.0 with: 26.0)
+             action: [ self randomClicked ] in: content.
+        self button: 'Mutate' frame: (Array with: 658.0 with: 498.0 with: 66.0 with: 26.0)
+             action: [ self mutateClicked ] in: content.
+        self button: 'New' frame: (Array with: 450.0 with: 466.0 with: 56.0 with: 26.0)
+             action: [ self newClicked ] in: content.
+        self button: 'Save' frame: (Array with: 510.0 with: 466.0 with: 60.0 with: 26.0)
+             action: [ self saveClicked ] in: content.
+        self button: 'Load' frame: (Array with: 574.0 with: 466.0 with: 60.0 with: 26.0)
+             action: [ self loadClicked ] in: content.
+        self button: 'Sounds' frame: (Array with: 638.0 with: 466.0 with: 86.0 with: 26.0)
+             action: [ self soundsClicked ] in: content.
+        self button: 'Copy Code' frame: (Array with: 450.0 with: 434.0 with: 100.0 with: 26.0)
+             action: [ self copyCodeClicked ] in: content.
+        self label: 'seed' frame: (Array with: 560.0 with: 439.0 with: 36.0 with: 16.0) in: content.
+        SeedField := ((Cocoa classNamed: 'NSTextField') onMain alloc) onMain
+            initWithFrame: (Array with: 598.0 with: 436.0 with: 90.0 with: 22.0).
+        SeedField onMain setStringValue: Doc seed printString.
+        content onMain addSubview: SeedField.
+    ]
+
+    "── oscillator rows ──────────────────────────────────────────────────"
+    CocoaSoundEditor class >> buildOscRowsIn: content [
+        OscRows := OrderedCollection new.
+        1 to: 4 do: [ :i |
+            | y row waveB fS fL aS aL pS pL |
+            y := 402.0 - ((i - 1) * 34.0).
+            row := OrderedCollection new.
+            waveB := self button: 'sine' frame: (Array with: 16.0 with: y with: 84.0 with: 26.0)
+                          action: [ self waveClicked: i ] in: content.
+            fS := self slider: (Array with: 106.0 with: y with: 160.0 with: 24.0)
+                       min: 20.0 max: 2000.0 in: content.
+            fL := self label: '' frame: (Array with: 270.0 with: y + 4.0 with: 62.0 with: 16.0) in: content.
+            aS := self slider: (Array with: 336.0 with: y with: 110.0 with: 24.0)
+                       min: 0.0 max: 1.0 in: content.
+            aL := self label: '' frame: (Array with: 450.0 with: y + 4.0 with: 44.0 with: 16.0) in: content.
+            pS := self slider: (Array with: 498.0 with: y with: 90.0 with: 24.0)
+                       min: 0.01 max: 0.99 in: content.
+            pL := self label: '' frame: (Array with: 592.0 with: y + 4.0 with: 44.0 with: 16.0) in: content.
+            row add: waveB; add: fS; add: fL; add: aS; add: aL; add: pS; add: pL.
+            OscRows add: row ].
+        self button: 'Osc +' frame: (Array with: 640.0 with: 402.0 with: 84.0 with: 26.0)
+             action: [ self oscPlus ] in: content.
+        self button: 'Osc -' frame: (Array with: 640.0 with: 368.0 with: 84.0 with: 26.0)
+             action: [ self oscMinus ] in: content.
+    ]
+
+    "── the 12 param sliders, 2 columns x 6 rows ─────────────────────────"
+    CocoaSoundEditor class >> paramSpecs [
+        "#(label lo hi): col A rows 1-6 then col B rows 1-6. Built by adds —
+         Array with: caps at four arguments (the arity trap, third sighting)."
+        | specs |
+        specs := OrderedCollection new.
+        specs add: #('dur' 0.05 4.0).
+        specs add: #('att' 0.0 1.0).
+        specs add: #('dec' 0.0 1.0).
+        specs add: #('sus' 0.0 1.0).
+        specs add: #('rel' 0.0 2.0).
+        specs add: #('echoDec' 0.0 1.0).
+        specs add: #('swp0' 0.0 2000.0).
+        specs add: #('swp1' 0.0 2000.0).
+        specs add: #('noise' 0.0 1.0).
+        specs add: #('dist' 0.0 3.0).
+        specs add: #('echoN' 0.0 8.0).
+        specs add: #('echoDly' 0.0 0.5).
+        ^specs asArray
+    ]
+    CocoaSoundEditor class >> buildParamSlidersIn: content [
+        | specs |
+        specs := self paramSpecs.
+        PSliders := OrderedCollection new.
+        PLabels := OrderedCollection new.
+        1 to: 12 do: [ :i |
+            | spec col row x y lbl s v |
+            spec := specs at: i.
+            col := i <= 6 ifTrue: [ 0 ] ifFalse: [ 1 ].
+            row := i <= 6 ifTrue: [ i ] ifFalse: [ i - 6 ].
+            x := 16.0 + (col * 364.0).
+            y := 224.0 - ((row - 1) * 32.0).
+            lbl := self label: (spec at: 1)
+                        frame: (Array with: x with: y + 4.0 with: 58.0 with: 16.0) in: content.
+            s := self slider: (Array with: x + 62.0 with: y with: 180.0 with: 24.0)
+                      min: (spec at: 2) max: (spec at: 3) in: content.
+            v := self label: '' frame: (Array with: x + 246.0 with: y + 4.0 with: 68.0 with: 16.0)
+                      in: content.
+            PSliders add: s.
+            PLabels add: v ].
+    ]
+
+    "── control handlers ─────────────────────────────────────────────────"
+    CocoaSoundEditor class >> paramChanged [
+        Doc duration: (self sliderValue: (PSliders at: 1)).
+        Doc attack: (self sliderValue: (PSliders at: 2)).
+        Doc decay: (self sliderValue: (PSliders at: 3)).
+        Doc sustain: (self sliderValue: (PSliders at: 4)).
+        Doc release: (self sliderValue: (PSliders at: 5)).
+        Doc echoDecay: (self sliderValue: (PSliders at: 6)).
+        Doc sweepStart: (self sliderValue: (PSliders at: 7)).
+        Doc sweepEnd: (self sliderValue: (PSliders at: 8)).
+        Doc noiseMix: (self sliderValue: (PSliders at: 9)).
+        Doc distortion: (self sliderValue: (PSliders at: 10)).
+        Doc echoCount: (self sliderValue: (PSliders at: 11)) rounded.
+        Doc echoDelay: (self sliderValue: (PSliders at: 12)).
+        1 to: Doc oscCount do: [ :i |
+            | row |
+            row := OscRows at: i.
+            Doc osc: i freq: (self sliderValue: (row at: 2)).
+            Doc osc: i amp: (self sliderValue: (row at: 4)).
+            Doc osc: i pw: (self sliderValue: (row at: 6)) ].
+        self syncValueLabels.
+        self repaintEnv.
+    ]
+
+    CocoaSoundEditor class >> waveClicked: i [
+        i > Doc oscCount ifTrue: [ ^self ].
+        Doc osc: i wave: (((Doc oscAt: i) at: 1) + 1) \\ 6.
+        ((OscRows at: i) at: 1) onMain setTitle: (Doc oscWaveNameAt: i).
+        self playClicked.
+    ]
+    CocoaSoundEditor class >> oscPlus [
+        Doc addOsc ifFalse: [ ^self setStatus: 'four oscillators is the stack' ].
+        self syncAll.
+    ]
+    CocoaSoundEditor class >> oscMinus [
+        Doc removeOsc ifFalse: [ ^self setStatus: 'one oscillator stays' ].
+        self syncAll.
+    ]
+
+    CocoaSoundEditor class >> presetClicked [
+        PresetIx := (PresetIx + 1) \\ 12.
+        Doc loadPreset: PresetIx.
+        self syncAll.
+        PresetBtn onMain setTitle: 'Preset: ' , (SoundDoc presetNames at: PresetIx + 1).
+        self playClicked.
+    ]
+    CocoaSoundEditor class >> randomClicked [
+        Doc randomize: Rng.
+        PresetIx := -1.
+        self syncAll.
+        self playClicked.
+    ]
+    CocoaSoundEditor class >> mutateClicked [
+        Doc mutate: Rng.
+        self syncAll.
+        self playClicked.
+    ]
+    CocoaSoundEditor class >> newClicked [
+        Doc := SoundDoc new.
+        PresetIx := -1.
+        self syncAll.
+        self setStatus: 'fresh document'.
+    ]
+
+    CocoaSoundEditor class >> applyFields [
+        | s |
+        Doc name: (NameField sendString: 'stringValue').
+        s := (SeedField sendString: 'stringValue') asNumber.
+        s isNil ifFalse: [ Doc seed: s ].
+    ]
+    CocoaSoundEditor class >> playClicked [
+        self applyFields.
+        Worker uiDoit: 'Sound playEffect: ' , Doc paramsList printString
+            onReply: [ :r | ].
+        self setStatus: 'played (' , Doc oscCount printString , ' osc, seed '
+            , Doc seed printString , ')'.
+    ]
+
+    "── persistence (the sprite editor's S5 shape, float-aware) ──────────"
+    CocoaSoundEditor class >> hostService [
+        | bc |
+        bc := Worker classNamed: #CocoaBrowser.
+        ^bc isNil ifTrue: [ nil ] ifFalse: [ bc hostService ]
+    ]
+    CocoaSoundEditor class >> saveClicked [
+        | svc reply |
+        self applyFields.
+        (SpriteDoc validName: Doc name) ifFalse: [
+            ^self setStatus: 'save: name must be a capitalised identifier' ].
+        svc := self hostService.
+        svc isNil ifTrue: [ ^self setStatus: 'save: no host service' ].
+        reply := CocoaBrowser readReply: (svc onMain acceptEditorClass: Doc sheetSource).
+        self setStatus: 'save: ' , reply.
+    ]
+    CocoaSoundEditor class >> loadClicked [
+        | nm svc src nums |
+        nm := NameField sendString: 'stringValue'.
+        (SpriteDoc validName: nm) ifFalse: [
+            ^self setStatus: 'load: type the sound class name in Name first' ].
+        svc := self hostService.
+        svc isNil ifTrue: [ ^self setStatus: 'load: no host service' ].
+        src := CocoaBrowser readReply:
+            (svc onMain sourceForClass: nm side: 'class' selector: 'params').
+        src isEmpty ifTrue: [
+            ^self setStatus: 'load: ' , nm , ' has no params (not a sound sheet?)' ].
+        nums := self numbersIn: src.
+        (Doc fromParams: nums) ifFalse: [
+            ^self setStatus: 'load: ' , nm , ' did not parse as a sound sheet' ].
+        Doc name: nm.
+        PresetIx := -1.
+        self syncAll.
+        self setStatus: 'loaded ' , nm.
+    ]
+    CocoaSoundEditor class >> soundsClicked [
+        | svc reply names line out |
+        svc := self hostService.
+        svc isNil ifTrue: [ ^self setStatus: 'no host service' ].
+        reply := CocoaBrowser readReply: (svc onMain implementorsOf: 'isSoundSheet').
+        names := OrderedCollection new.
+        line := WriteStream on: String new.
+        reply do: [ :ch |
+            ch = (Character value: 10)
+                ifTrue: [ names add: line contents. line := WriteStream on: String new ]
+                ifFalse: [
+                    ch = (Character value: 31)
+                        ifTrue: [ line nextPutAll: ' ' ]
+                        ifFalse: [ line nextPut: ch ] ] ].
+        line contents isEmpty ifFalse: [ names add: line contents ].
+        names isEmpty
+            ifTrue: [ self setStatus: 'no sound sheets in the image yet' ]
+            ifFalse: [
+                out := WriteStream on: String new.
+                names do: [ :e |
+                    | stop |
+                    stop := false.
+                    e do: [ :ch |
+                        stop ifFalse: [
+                            ch = (Character value: 32)
+                                ifTrue: [ stop := true ]
+                                ifFalse: [ out nextPut: ch ] ] ].
+                    out nextPutAll: ' ' ].
+                self setStatus: 'sounds: ' , out contents ].
+    ]
+    CocoaSoundEditor class >> copyCodeClicked [
+        | pb |
+        self applyFields.
+        pb := (Cocoa classNamed: 'NSPasteboard') onMain generalPasteboard.
+        pb onMain clearContents.
+        pb onMain setString: Doc codeSnippet forType: 'public.utf8-plain-text'.
+        self setStatus: 'code copied to the clipboard'.
+    ]
+
+    CocoaSoundEditor class >> numbersIn: src [
+        "Every decimal number in the params method source, in order — the
+         only numbers in a sheet the editor itself wrote are its channels."
+        | nums cur |
+        nums := OrderedCollection new.
+        cur := WriteStream on: String new.
+        src do: [ :ch |
+            (ch isDigit or: [ ch = $. ])
+                ifTrue: [ cur nextPut: ch ]
+                ifFalse: [
+                    cur contents isEmpty ifFalse: [
+                        nums add: cur contents asNumber.
+                        cur := WriteStream on: String new ] ] ].
+        cur contents isEmpty ifFalse: [ nums add: cur contents asNumber ].
+        ^nums asArray
+    ]
+
+    "── sync + the envelope canvas ───────────────────────────────────────"
+    CocoaSoundEditor class >> syncAll [
+        | p |
+        p := Doc paramsList.
+        (PSliders at: 1) onMain setDoubleValue: (p at: 1).
+        (PSliders at: 2) onMain setDoubleValue: (p at: 2).
+        (PSliders at: 3) onMain setDoubleValue: (p at: 3).
+        (PSliders at: 4) onMain setDoubleValue: (p at: 4).
+        (PSliders at: 5) onMain setDoubleValue: (p at: 5).
+        (PSliders at: 6) onMain setDoubleValue: (p at: 12).
+        (PSliders at: 7) onMain setDoubleValue: (p at: 6).
+        (PSliders at: 8) onMain setDoubleValue: (p at: 7).
+        (PSliders at: 9) onMain setDoubleValue: (p at: 8).
+        (PSliders at: 10) onMain setDoubleValue: (p at: 9).
+        (PSliders at: 11) onMain setDoubleValue: (p at: 10).
+        (PSliders at: 12) onMain setDoubleValue: (p at: 11).
+        1 to: 4 do: [ :i |
+            | row on |
+            row := OscRows at: i.
+            on := i <= Doc oscCount.
+            row do: [ :ctl | ctl onMain setHidden: on not ].
+            on ifTrue: [
+                (row at: 1) onMain setTitle: (Doc oscWaveNameAt: i).
+                (row at: 2) onMain setDoubleValue: ((Doc oscAt: i) at: 2).
+                (row at: 4) onMain setDoubleValue: ((Doc oscAt: i) at: 3).
+                (row at: 6) onMain setDoubleValue: ((Doc oscAt: i) at: 5) ] ].
+        NameField isNil ifFalse: [ NameField onMain setStringValue: Doc name ].
+        SeedField isNil ifFalse: [ SeedField onMain setStringValue: Doc seed printString ].
+        self syncValueLabels.
+        self repaintEnv.
+    ]
+    CocoaSoundEditor class >> round2: v [
+        ^((v * 100) rounded / 100.0) printString
+    ]
+    CocoaSoundEditor class >> syncValueLabels [
+        (PLabels at: 1) onMain setStringValue: (self round2: Doc duration) , 's'.
+        (PLabels at: 2) onMain setStringValue: (self round2: Doc attack).
+        (PLabels at: 3) onMain setStringValue: (self round2: Doc decay).
+        (PLabels at: 4) onMain setStringValue: (self round2: Doc sustain).
+        (PLabels at: 5) onMain setStringValue: (self round2: Doc release).
+        (PLabels at: 6) onMain setStringValue: (self round2: Doc echoDecay).
+        (PLabels at: 7) onMain setStringValue: Doc sweepStart rounded printString , 'Hz'.
+        (PLabels at: 8) onMain setStringValue: Doc sweepEnd rounded printString , 'Hz'.
+        (PLabels at: 9) onMain setStringValue: (self round2: Doc noiseMix).
+        (PLabels at: 10) onMain setStringValue: (self round2: Doc distortion).
+        (PLabels at: 11) onMain setStringValue: Doc echoCount printString.
+        (PLabels at: 12) onMain setStringValue: (self round2: Doc echoDelay) , 's'.
+        1 to: Doc oscCount do: [ :i |
+            | row |
+            row := OscRows at: i.
+            (row at: 3) onMain setStringValue: ((Doc oscAt: i) at: 2) rounded printString , 'Hz'.
+            (row at: 5) onMain setStringValue: (self round2: ((Doc oscAt: i) at: 3)).
+            (row at: 7) onMain setStringValue: (self round2: ((Doc oscAt: i) at: 5)) ].
+    ]
+
+    CocoaSoundEditor class >> buildEnvViewIn: content [
+        EnvView := ((Cocoa classNamed: 'NSImageView') onMain alloc) onMain
+            initWithFrame: (Array with: 16.0 with: 444.0
+                                  with: self envW asFloat with: self envH asFloat).
+        EnvView onMain setImageScaling: 2.
+        content onMain addSubview: EnvView.
+    ]
+
+    CocoaSoundEditor class >> envLevelAt: t total: total [
+        "The ADSR level (0..1) at time t: gate held for `duration`, release
+         after — the engine's own shape (synth.rs render)."
+        | a d rel sus dur |
+        a := Doc attack. d := Doc decay. sus := Doc sustain.
+        rel := Doc release. dur := Doc duration.
+        t < a ifTrue: [ ^(a <= 0 ifTrue: [ 1.0 ] ifFalse: [ t / a ]) ].
+        t < (a + d) ifTrue: [
+            d <= 0 ifTrue: [ ^sus ].
+            ^1.0 - ((1.0 - sus) * ((t - a) / d)) ].
+        t < dur ifTrue: [ ^sus ].
+        rel <= 0 ifTrue: [ ^0.0 ].
+        ^(sus * (1.0 - ((t - dur) / rel))) max: 0.0
+    ]
+
+    CocoaSoundEditor class >> repaintEnv [
+        | w h bytes total px lvl y i sw |
+        EnvView isNil ifTrue: [ ^self ].
+        w := self envW. h := self envH.
+        bytes := ByteArray new: w * h * 4.
+        "Backdrop 20,22,28."
+        0 to: (w * h) - 1 do: [ :p |
+            bytes at: (p * 4) + 1 put: 20.
+            bytes at: (p * 4) + 2 put: 22.
+            bytes at: (p * 4) + 3 put: 28.
+            bytes at: (p * 4) + 4 put: 255 ].
+        total := Doc duration + Doc release.
+        sw := (Doc sweepStart > 0) or: [ Doc sweepEnd > 0 ].
+        0 to: w - 1 do: [ :x |
+            "Sweep path first (dimmer), env on top."
+            sw ifTrue: [
+                | f t |
+                t := x / (w - 1) * total.
+                t := t min: Doc duration.
+                f := Doc sweepStart + ((Doc sweepEnd - Doc sweepStart) * (t / Doc duration)).
+                y := h - 6 - ((f / 4000.0 * (h - 12)) rounded min: h - 12).
+                i := ((y * w) + x) * 4.
+                bytes at: i + 1 put: 214. bytes at: i + 2 put: 138. bytes at: i + 3 put: 64 ].
+            lvl := self envLevelAt: x / (w - 1) * total total: total.
+            y := h - 6 - ((lvl * (h - 12)) rounded min: h - 12).
+            i := ((y * w) + x) * 4.
+            bytes at: i + 1 put: 96. bytes at: i + 2 put: 148. bytes at: i + 3 put: 230.
+            y < (h - 1) ifTrue: [
+                i := (((y + 1) * w) + x) * 4.
+                bytes at: i + 1 put: 96. bytes at: i + 2 put: 148. bytes at: i + 3 put: 230 ] ].
+        CocoaBrowser hostService onMain
+            showCanvasPixelsOn: EnvView base64: (Base64 encode: bytes)
+            width: w printString height: h printString.
+    ]
+
+    "── scripting probes ─────────────────────────────────────────────────"
+    CocoaSoundEditor class >> sndStatus [
+        StatusLabel isNil ifTrue: [ ^'' ].
+        ^StatusLabel sendString: 'stringValue'
+    ]
+    CocoaSoundEditor class >> sndParams [ ^Doc paramsList printString ]
+    CocoaSoundEditor class >> snapshotTo: aPath [
+        ^CocoaUI snapshotWindow: Win to: aPath
+    ]
+    CocoaSoundEditor class >> sndPreset: i [
+        PresetIx := i - 1.
+        self presetClicked.
+        ^Doc paramsList size printString
+    ]
+    CocoaSoundEditor class >> nameFieldRef [ ^NameField ]
+    CocoaSoundEditor class >> docLoad: params [ ^(Doc fromParams: params) printString ]
+
+    "── teardown (CocoaUI teardown calls by name) ────────────────────────"
+    CocoaSoundEditor class >> teardown [
+        Win isNil ifFalse: [
+            Win isValid ifTrue: [
+                Win onMain setDelegate: nil.
+                Win onMain orderOut: nil.
+                Win release ] ].
+        Win := nil. WinDelegate := nil. Delegates := nil. StatusLabel := nil.
+        EnvView := nil. NameField := nil. SeedField := nil. PresetBtn := nil.
+        PSliders := nil. PLabels := nil. OscRows := nil.
+        Doc := nil. PresetIx := nil. Rng := nil.
+    ]
+]

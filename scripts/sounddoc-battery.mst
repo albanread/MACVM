@@ -1,0 +1,58 @@
+"SoundDoc battery (docs/asset_editors_design.md stage 6 gate). Pure-model
+ asserts; prints one FAIL line per broken claim and a final verdict line."
+Object subclass: SoundDocBattery [
+    <classVars: Fails Count>
+    SoundDocBattery class >> assert: aBool named: aName [
+        Count := Count + 1.
+        aBool ifFalse: [
+            Fails := Fails + 1.
+            Transcript showCr: 'FAIL: ' , aName ].
+    ]
+    SoundDocBattery class >> run [
+        | d p d2 r |
+        Fails := 0. Count := 0.
+        d := SoundDoc new.
+        p := d paramsList.
+        self assert: p size = 19 named: 'default doc is 14 fixed + one osc'.
+        self assert: (p at: 14) = 1 named: 'oscCount rides index 14'.
+        d2 := SoundDoc new.
+        self assert: (d2 fromParams: p) named: 'fromParams: accepts its own emit'.
+        self assert: d2 paramsList = p named: 'params round-trip byte-equal'.
+        d duration: 99.
+        self assert: d duration = 4.0 named: 'duration clamps at 4s (design 3)'.
+        d osc: 1 freq: 5.
+        self assert: ((d oscAt: 1) at: 2) = 20.0 named: 'freq clamps at 20Hz'.
+        d osc: 1 wave: 99.
+        self assert: ((d oscAt: 1) at: 1) = 5 named: 'wave clamps at pulse(5)'.
+        d echoCount: 99.
+        self assert: d echoCount = 8 named: 'echo count clamps at 8'.
+        self assert: (SoundDoc new fromParams: (Array new: 5)) not
+             named: 'short list rejected'.
+        self assert: (SoundDoc new fromParams: p , (Array with: 1)) not
+             named: 'length mismatch rejected'.
+        0 to: 11 do: [ :i |
+            | dd |
+            dd := SoundDoc new loadPreset: i.
+            self assert: (SoundDoc new fromParams: dd paramsList)
+                 named: 'preset ' , (SoundDoc presetNames at: i + 1) , ' round-trips' ].
+        self assert: ((SoundDoc new loadPreset: 0) oscCount = 2)
+             named: 'coin carries two sines'.
+        self assert: ((SoundDoc new loadPreset: 4) paramsList at: 9) = 0.08
+             named: 'explode keeps its distortion'.
+        r := Random newWithSeed: 42.
+        d := SoundDoc new randomize: r.
+        self assert: (SoundDoc new fromParams: d paramsList)
+             named: 'randomize stays in contract'.
+        d mutate: r.
+        self assert: (SoundDoc new fromParams: d paramsList)
+             named: 'mutate stays in contract'.
+        self assert: (d name: 'Laser') ~= nil named: 'name settable'.
+        self assert: (d sheetSource indexOf: $[) > 0 named: 'sheet emits a class'.
+        self assert: (SoundDoc new codeSnippet size > 20) named: 'snippet emits'.
+        Transcript showCr: 'SOUNDDOC BATTERY: ' , Count printString , ' checks, '
+            , Fails printString , ' failures'.
+        Fails = 0 ifTrue: [ Transcript showCr: 'BATTERY GREEN' ].
+    ]
+]
+
+SoundDocBattery run.

@@ -297,6 +297,12 @@ Object subclass: Sound [
     setPreset: n [ preset := n. ^self ]
     play [ "Play this sound." self primPlay: preset. ^self ]
     primPlay: n [ <primitive: 213> ^self ]
+
+    "The parametric wire (docs/asset_editors_design.md §3): render a full
+     Effect recipe — the flat params contract — and play it. What the Sound
+     Editor auditions through, and what a saved sound sheet's `play` calls.
+     Headless: silently a no-op, like every game primitive."
+    Sound class >> playEffect: paramsArray [ <primitive: 263> ^self ]
 ]
 
 "--- Tune: an ABC-notation chiptune, played once in the background

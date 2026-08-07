@@ -52,3 +52,6 @@
 # The pure model (SpriteDoc) is a WORLD-list file so games and the headless
 # battery can load it; this file is only the Cocoa face.
 76_spriteed.mst
+# CocoaSoundEditor (docs/asset_editors_design.md stage 6): Tools > Sound
+# Editor — the ADSR instrument panel over prim 263's parametric synth wire.
+77_sounded.mst

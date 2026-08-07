@@ -1,0 +1,278 @@
+"44b_sounddoc.mst — SoundDoc: the Sound Editor's pure document model
+ (docs/asset_editors_design.md §2/§3). One parametric synth recipe — the
+ SAME Effect the engine renders (MacGamePane audio/src/synth.rs, itself a
+ transcription of Audio.mod): duration + up to 4 oscillators
+ (wave/freq/amp/phase/pulseWidth) + ADSR + linear sweep + noise mix +
+ distortion + echo + the Lcg seed that makes noisy recipes reproduce.
+
+ NO Cocoa sends — headless-testable, world-list (games can file sheets in
+ without the UI). Clamps live HERE (§3: the native side never truncates):
+ duration <= 4s, echo tail <= the remainder. paramsList/fromParams: speak
+ THE flat contract of asset_editors_design.md §3 — one canonical order
+ shared with prim 263 and game.rs play_effect; every consumer cites it.
+
+ The 12 preset seeds are transcribed from synth.rs's own recipes as
+ STARTING POINTS (the noise-mixing presets draw from the rng per render,
+ so a seeded render here is reproducible where the engine preset is not —
+ that is the point of the seed field)."
+Object subclass: SoundDoc [
+    | name duration attack decay sustain release sweepStart sweepEnd
+      noiseMix distortion echoCount echoDelay echoDecay seed oscs |
+
+    SoundDoc class >> waveNames [ ^#('sine' 'square' 'saw' 'triangle' 'noise' 'pulse') ]
+    SoundDoc class >> new [ ^super new initSoundDoc ]
+
+    initSoundDoc [
+        "Effect::new's own defaults, plus one audible oscillator."
+        name := 'Sound1'.
+        duration := 0.3.
+        attack := 0.01. decay := 0.1. sustain := 0.7. release := 0.2.
+        sweepStart := 0.0. sweepEnd := 0.0.
+        noiseMix := 0.0. distortion := 0.0.
+        echoCount := 0. echoDelay := 0.0. echoDecay := 0.0.
+        seed := 1.
+        oscs := OrderedCollection new.
+        oscs add: (Array with: 0 with: 440.0 with: 0.5 with: 0.0 with: 0.5).
+        ^self
+    ]
+
+    name [ ^name ]
+    name: aString [ name := aString ]
+    duration [ ^duration ]
+    attack [ ^attack ]
+    decay [ ^decay ]
+    sustain [ ^sustain ]
+    release [ ^release ]
+    sweepStart [ ^sweepStart ]
+    sweepEnd [ ^sweepEnd ]
+    noiseMix [ ^noiseMix ]
+    distortion [ ^distortion ]
+    echoCount [ ^echoCount ]
+    echoDelay [ ^echoDelay ]
+    echoDecay [ ^echoDecay ]
+    seed [ ^seed ]
+    oscCount [ ^oscs size ]
+
+    "── clamped setters (the model is where bounds live — §3) ────────────"
+    clamp: v lo: lo hi: hi [ ^(v max: lo) min: hi ]
+    duration: v [ duration := self clamp: v lo: 0.05 hi: 4.0 ]
+    attack: v [ attack := self clamp: v lo: 0.0 hi: 2.0 ]
+    decay: v [ decay := self clamp: v lo: 0.0 hi: 2.0 ]
+    sustain: v [ sustain := self clamp: v lo: 0.0 hi: 1.0 ]
+    release: v [ release := self clamp: v lo: 0.0 hi: 2.0 ]
+    sweepStart: v [ sweepStart := self clamp: v lo: 0.0 hi: 4000.0 ]
+    sweepEnd: v [ sweepEnd := self clamp: v lo: 0.0 hi: 4000.0 ]
+    noiseMix: v [ noiseMix := self clamp: v lo: 0.0 hi: 1.0 ]
+    distortion: v [ distortion := self clamp: v lo: 0.0 hi: 3.0 ]
+    echoCount: v [ echoCount := (self clamp: v lo: 0 hi: 8) asInteger ]
+    echoDelay: v [
+        "Echo tail must fit the 10s render cap: count * delay <= ~5s spare."
+        echoDelay := self clamp: v lo: 0.0 hi: 0.5 ]
+    echoDecay: v [ echoDecay := self clamp: v lo: 0.0 hi: 1.0 ]
+    seed: v [ seed := ((v max: 1) min: 4294967295) asInteger ]
+
+    "── oscillators: Array{waveIndex freq amp phase pulseWidth} ─────────"
+    oscAt: i [ "1-based" ^oscs at: i ]
+    addOsc [
+        oscs size >= 4 ifTrue: [ ^false ].
+        oscs add: (Array with: 0 with: 440.0 with: 0.5 with: 0.0 with: 0.5).
+        ^true
+    ]
+    removeOsc [
+        oscs size <= 1 ifTrue: [ ^false ].
+        oscs removeLast.
+        ^true
+    ]
+    osc: i wave: w [ (oscs at: i) at: 1 put: ((self clamp: w lo: 0 hi: 5) asInteger) ]
+    osc: i freq: v [ (oscs at: i) at: 2 put: (self clamp: v lo: 20.0 hi: 8000.0) ]
+    osc: i amp: v [ (oscs at: i) at: 3 put: (self clamp: v lo: 0.0 hi: 1.0) ]
+    osc: i phase: v [ (oscs at: i) at: 4 put: (self clamp: v lo: 0.0 hi: 1.0) ]
+    osc: i pw: v [ (oscs at: i) at: 5 put: (self clamp: v lo: 0.01 hi: 0.99) ]
+    oscWaveNameAt: i [ ^SoundDoc waveNames at: ((oscs at: i) at: 1) + 1 ]
+
+    "── THE flat contract (asset_editors_design.md §3) ───────────────────"
+    paramsList [
+        | out |
+        out := OrderedCollection new.
+        out add: duration; add: attack; add: decay; add: sustain; add: release;
+            add: sweepStart; add: sweepEnd; add: noiseMix; add: distortion;
+            add: echoCount; add: echoDelay; add: echoDecay; add: seed;
+            add: oscs size.
+        oscs do: [ :o |
+            out add: (o at: 1); add: (o at: 2); add: (o at: 3);
+                add: (o at: 4); add: (o at: 5) ].
+        ^out asArray
+    ]
+
+    fromParams: arr [
+        "Parse first, commit through the clamped setters after — a malformed
+         list can never half-load. Answers true/false."
+        | n |
+        (arr isNil or: [ arr size < 14 ]) ifTrue: [ ^false ].
+        n := (arr at: 14) asInteger.
+        (n between: 1 and: 4) ifFalse: [ ^false ].
+        arr size = (14 + (n * 5)) ifFalse: [ ^false ].
+        self duration: (arr at: 1).
+        self attack: (arr at: 2). self decay: (arr at: 3).
+        self sustain: (arr at: 4). self release: (arr at: 5).
+        self sweepStart: (arr at: 6). self sweepEnd: (arr at: 7).
+        self noiseMix: (arr at: 8). self distortion: (arr at: 9).
+        self echoCount: (arr at: 10). self echoDelay: (arr at: 11).
+        self echoDecay: (arr at: 12). self seed: (arr at: 13).
+        oscs := OrderedCollection new.
+        1 to: n do: [ :i |
+            | b |
+            b := 14 + ((i - 1) * 5).
+            oscs add: (Array with: 0 with: 440.0 with: 0.5 with: 0.0 with: 0.5).
+            self osc: i wave: (arr at: b + 1).
+            self osc: i freq: (arr at: b + 2).
+            self osc: i amp: (arr at: b + 3).
+            self osc: i phase: (arr at: b + 4).
+            self osc: i pw: (arr at: b + 5) ].
+        ^true
+    ]
+
+    "── the 12 preset seeds (synth.rs, at play_sound's own durations) ────"
+    SoundDoc class >> presetNames [
+        ^#('coin' 'jump' 'zap' 'shoot' 'explode' 'powerup' 'hurt' 'click'
+           'bang' 'blip' 'saucer' 'bossHum')
+    ]
+    loadPreset: i [
+        "0-based preset index; answers self. Envelope/sweep/noise per the
+         synth.rs recipe; oscillator-less recipes keep one silent sine so the
+         model invariant (1..4 oscs) holds — amp 0 contributes nothing."
+        i = 0 ifTrue: [ ^self preset: 0.3 a: 0.01 d: 0.1 s: 0.3 r: 0.15
+            sw: 0 sw2: 0 n: 0 dist: 0
+            oscs: (Array with: (Array with: 0 with: 987.77 with: 0.5 with: 0.0 with: 0.5)
+                         with: (Array with: 0 with: 1318.51 with: 0.3 with: 0.0 with: 0.5)) ].
+        i = 1 ifTrue: [ ^self preset: 0.3 a: 0.01 d: 0.05 s: 0.5 r: 0.1
+            sw: 300 sw2: 600 n: 0 dist: 0 oscs: (Array with: self silentOsc) ].
+        i = 2 ifTrue: [ ^self preset: 0.3 a: 0.01 d: 0.05 s: 0.3 r: 0.08
+            sw: 1000 sw2: 100 n: 0.2 dist: 0 oscs: (Array with: self silentOsc) ].
+        i = 3 ifTrue: [ ^self preset: 0.3 a: 0.01 d: 0.05 s: 0.4 r: 0.08
+            sw: 800 sw2: 200 n: 0.3 dist: 0 oscs: (Array with: self silentOsc) ].
+        i = 4 ifTrue: [ ^self preset: 0.5 a: 0.0015 d: 0.14 s: 0.0 r: 0.1
+            sw: 135 sw2: 32 n: 0.06 dist: 0.08
+            oscs: (Array with: (Array with: 0 with: 58.0 with: 0.95 with: 0.0 with: 0.5)
+                         with: (Array with: 3 with: 86.0 with: 0.28 with: 0.0 with: 0.5)) ].
+        i = 5 ifTrue: [ ^self preset: 0.4 a: 0.1 d: 0.1 s: 0.8 r: 0.2
+            sw: 200 sw2: 800 n: 0 dist: 0
+            oscs: (Array with: (Array with: 1 with: 400.0 with: 0.4 with: 0.0 with: 0.5)) ].
+        i = 6 ifTrue: [ ^self preset: 0.3 a: 0.01 d: 0.1 s: 0.2 r: 0.15
+            sw: 600 sw2: 200 n: 0.4 dist: 0 oscs: (Array with: self silentOsc) ].
+        i = 7 ifTrue: [ ^self preset: 0.1 a: 0.001 d: 0.01 s: 0.0 r: 0.03
+            sw: 0 sw2: 0 n: 0 dist: 0
+            oscs: (Array with: (Array with: 4 with: 440.0 with: 0.3 with: 0.0 with: 0.5)) ].
+        i = 8 ifTrue: [ ^self preset: 0.3 a: 0.01 d: 0.05 s: 0.0 r: 0.1
+            sw: 0 sw2: 0 n: 0.8 dist: 0 oscs: (Array with: self silentOsc) ].
+        i = 9 ifTrue: [ ^self preset: 0.2 a: 0.01 d: 0.05 s: 0.7 r: 0.1
+            sw: 0 sw2: 0 n: 0 dist: 0
+            oscs: (Array with: (Array with: 0 with: 1200.0 with: 0.5 with: 0.0 with: 0.5)) ].
+        i = 10 ifTrue: [ ^self preset: 0.9 a: 0.08 d: 0.1 s: 0.8 r: 0.15
+            sw: 0 sw2: 0 n: 0 dist: 0
+            oscs: (Array with: (Array with: 0 with: 600.0 with: 0.5 with: 0.0 with: 0.5)
+                         with: (Array with: 0 with: 606.0 with: 0.5 with: 0.0 with: 0.5)) ].
+        i = 11 ifTrue: [ ^self preset: 1.8 a: 0.4 d: 0.2 s: 0.85 r: 0.3
+            sw: 0 sw2: 0 n: 0 dist: 0
+            oscs: (Array with: (Array with: 0 with: 110.0 with: 0.5 with: 0.0 with: 0.5)
+                         with: (Array with: 0 with: 114.0 with: 0.5 with: 0.0 with: 0.5)) ].
+        ^self
+    ]
+    silentOsc [
+        "Sweep/noise recipes carry no oscillator in synth.rs; the model keeps
+         its 1..4 invariant with an inaudible one."
+        ^Array with: 0 with: 440.0 with: 0.0 with: 0.0 with: 0.5
+    ]
+    preset: d a: a d: dc s: su r: r sw: s1 sw2: s2 n: nm dist: di oscs: oArr [
+        self duration: d.
+        self attack: a. self decay: dc. self sustain: su. self release: r.
+        self sweepStart: s1. self sweepEnd: s2.
+        self noiseMix: nm. self distortion: di.
+        echoCount := 0. echoDelay := 0.0. echoDecay := 0.0.
+        oscs := OrderedCollection new.
+        oArr do: [ :o | oscs add: o copy ].
+        ^self
+    ]
+
+    "── the sfxr joy: bounded musical randomization ──────────────────────"
+    rand: aRandom upTo: n [
+        "0 .. n-1 from Random>>next (a Double in 0..1 — 27_random has no
+         bounded-int API)."
+        ^((aRandom next * n) truncated max: 0) min: n - 1
+    ]
+    randomize: aRandom [
+        self duration: 0.1 + ((self rand: aRandom upTo: 800) / 1000.0).
+        self attack: ((self rand: aRandom upTo: 100) / 1000.0).
+        self decay: ((self rand: aRandom upTo: 300) / 1000.0).
+        self sustain: ((self rand: aRandom upTo: 900) / 1000.0).
+        self release: ((self rand: aRandom upTo: 400) / 1000.0).
+        ((self rand: aRandom upTo: 10) < 5)
+            ifTrue: [
+                self sweepStart: 100 + (self rand: aRandom upTo: 1200).
+                self sweepEnd: 50 + (self rand: aRandom upTo: 900) ]
+            ifFalse: [ self sweepStart: 0. self sweepEnd: 0 ].
+        self noiseMix: ((self rand: aRandom upTo: 10) < 4
+            ifTrue: [ (self rand: aRandom upTo: 500) / 1000.0 ] ifFalse: [ 0 ]).
+        self distortion: ((self rand: aRandom upTo: 10) < 3
+            ifTrue: [ (self rand: aRandom upTo: 800) / 1000.0 ] ifFalse: [ 0 ]).
+        echoCount := 0. echoDelay := 0.0. echoDecay := 0.0.
+        oscs := OrderedCollection new.
+        1 to: 1 + (self rand: aRandom upTo: 2) do: [ :i |
+            oscs add: (Array
+                with: (self rand: aRandom upTo: 6) - 1
+                with: (60 + (self rand: aRandom upTo: 1500)) asFloat
+                with: 0.2 + ((self rand: aRandom upTo: 600) / 1000.0)
+                with: 0.0
+                with: 0.25 + ((self rand: aRandom upTo: 500) / 1000.0)) ].
+        self seed: 1 + (self rand: aRandom upTo: 99999).
+        ^self
+    ]
+    mutate: aRandom [
+        "Nudge, don't reroll: each parameter drifts a little."
+        self duration: duration * (0.8 + ((self rand: aRandom upTo: 400) / 1000.0)).
+        self attack: attack * (0.7 + ((self rand: aRandom upTo: 600) / 1000.0)).
+        self decay: decay * (0.7 + ((self rand: aRandom upTo: 600) / 1000.0)).
+        self sustain: sustain * (0.8 + ((self rand: aRandom upTo: 400) / 1000.0)).
+        self release: release * (0.7 + ((self rand: aRandom upTo: 600) / 1000.0)).
+        sweepStart > 0 ifTrue: [
+            self sweepStart: sweepStart * (0.8 + ((self rand: aRandom upTo: 400) / 1000.0)).
+            self sweepEnd: sweepEnd * (0.8 + ((self rand: aRandom upTo: 400) / 1000.0)) ].
+        noiseMix > 0 ifTrue: [
+            self noiseMix: noiseMix * (0.7 + ((self rand: aRandom upTo: 600) / 1000.0)) ].
+        1 to: oscs size do: [ :i |
+            self osc: i freq: ((oscs at: i) at: 2) * (0.9 + ((self rand: aRandom upTo: 200) / 1000.0)) ].
+        self seed: 1 + (self rand: aRandom upTo: 99999).
+        ^self
+    ]
+
+    "── the sheet (isSoundSheet marker; play in one send) ────────────────"
+    sheetSource [
+        | out ps |
+        ps := self paramsList.
+        out := WriteStream on: String new.
+        out nextPutAll: '"SoundFx: '; nextPutAll: name;
+            nextPutAll: ' - WRITTEN BY THE SOUND EDITOR (Tools menu). '.
+        out nextPutAll: 'In a game: Laser play. Params are the flat contract of '.
+        out nextPutAll: 'docs/asset_editors_design.md section 3."'; nl.
+        out nextPutAll: 'Object subclass: '; nextPutAll: name; nextPutAll: ' ['; nl.
+        out nextPutAll: '    '; nextPutAll: name;
+            nextPutAll: ' class >> isSoundSheet [ ^true ]'; nl.
+        out nextPutAll: '    '; nextPutAll: name;
+            nextPutAll: ' class >> params ['; nl; nextPutAll: '        ^#('.
+        ps do: [ :v | out nextPutAll: v printString; nextPutAll: ' ' ].
+        out nextPutAll: ')'; nl; nextPutAll: '    ]'; nl.
+        out nextPutAll: '    '; nextPutAll: name;
+            nextPutAll: ' class >> play [ Sound playEffect: self params ]'; nl.
+        out nextPutAll: ']'; nl.
+        ^out contents
+    ]
+
+    codeSnippet [
+        | out |
+        out := WriteStream on: String new.
+        out nextPutAll: 'Sound playEffect: #('.
+        self paramsList do: [ :v | out nextPutAll: v printString; nextPutAll: ' ' ].
+        out nextPutAll: ').'; nl.
+        ^out contents
+    ]
+]

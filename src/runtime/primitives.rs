@@ -1442,6 +1442,14 @@ pub static PRIMITIVES: &[PrimDesc] = &[
         can_allocate: false,
         can_fail: true,
     },
+    PrimDesc {
+        id: 263,
+        name: "Sound class>>playEffect:",
+        f: prim_game_play_effect,
+        argc: 1,
+        can_allocate: false,
+        can_fail: true,
+    },
 ];
 
 pub fn prim_by_id(id: u16) -> Option<&'static PrimDesc> {
@@ -1682,6 +1690,40 @@ fn game_num_f32(o: Oop) -> Option<f32> {
         return Some(d.value() as f32);
     }
     smi_i64(o).map(|i| i as f32)
+}
+
+/// A numeric argument as `f64` — the effect params are Numbers of either
+/// species.
+fn game_num_f64(o: Oop) -> Option<f64> {
+    if let Some(d) = DoubleOop::try_from(o) {
+        return Some(d.value());
+    }
+    smi_i64(o).map(|i| i as f64)
+}
+
+/// `Sound class>>playEffect:` (263): the parametric synth wire
+/// (docs/asset_editors_design.md §3). Takes the flat parameter Array, ships
+/// it as ONE command; the GUI side builds the `Effect`, renders with the
+/// seeded `Lcg`, and plays. 14 fixed params + 5 per oscillator (0..4), so
+/// any length outside 14..=34 fails here; deep validation (clamps) already
+/// happened in the SoundDoc model, and the GUI apply is fail-soft anyway.
+fn prim_game_play_effect(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    let Some(arr) = ArrayOop::try_from(args[1]) else {
+        return PrimResult::Fail;
+    };
+    let n = arr.len();
+    if !(14..=34).contains(&n) {
+        return PrimResult::Fail;
+    }
+    let mut params = Vec::with_capacity(n);
+    for i in 0..n {
+        let Some(v) = game_num_f64(arr.at(i)) else {
+            return PrimResult::Fail;
+        };
+        params.push(v);
+    }
+    game_emit(vm, GameCommand::PlayEffect { params });
+    PrimResult::Ok(args[0])
 }
 
 /// `resizeTo:by:` (253): resize the pane to `w`x`h` (recreate the buffers).
@@ -5172,6 +5214,7 @@ mod tests {
             (260, "GamePane>>shaderParam:value:"),
             (261, "GamePane>>linePaletteAt:index:rgb:"),
             (262, "GamePane>>frameRate:"),
+            (263, "Sound class>>playEffect:"),
         ];
         assert_eq!(
             PRIMITIVES.len(),

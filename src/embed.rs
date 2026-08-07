@@ -370,6 +370,12 @@ pub enum GameCommand {
     /// Play an ABC-notation tune once in the background (a chiptune via the
     /// engine's ABC->MIDI path). `(Tune fromAbc: '...') playOnce`.
     PlayTune { abc: String },
+    /// Render a parametric synth effect and play it (Tools > Sound Editor).
+    /// `params` is the flat contract of asset_editors_design.md §3:
+    /// [duration, attack, decay, sustain, release, sweepStart, sweepEnd,
+    ///  noiseMix, distortion, echoCount, echoDelay, echoDecay, seed,
+    ///  oscCount, then (wave, freq, amp, phase, pulseWidth) per oscillator].
+    PlayEffect { params: Vec<f64> },
 
     // ── GamePane extensions (galaxigans, world/49): features the MacGamePane
     // engine already renders that MACVM had not wired. Each maps 1:1 to an

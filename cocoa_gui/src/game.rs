@@ -378,6 +378,7 @@ fn apply(g: &mut NativeGame, cmd: &GameCommand) {
         | C::StartLoop
         | C::StopLoop
         | C::PlaySound { .. }
+        | C::PlayEffect { .. }
         | C::PlayTune { .. } => {}
     }
 }
@@ -402,6 +403,7 @@ pub fn drain() {
             }
             GameCommand::StopLoop => close_window(),
             GameCommand::PlaySound { preset } => audio::play_sound(*preset),
+            GameCommand::PlayEffect { params } => audio::play_effect(params),
             GameCommand::PlayTune { abc } => audio::play_tune(abc),
             // Record the requested size so the NEXT `ensure_pane` builds at it
             // (a demo sends this before any draw — no pane exists yet, the
@@ -623,6 +625,71 @@ mod audio {
                 DEFINED.with(|d| d.set(d.get() | bit));
             }
             sfx.play(preset as usize);
+        });
+    }
+
+    /// The parametric wire's landing (asset_editors_design.md §3): rebuild
+    /// the `Effect` from the flat contract, render with the SEEDED Lcg (the
+    /// seed crosses so noisy recipes reproduce exactly), and play through the
+    /// same `Sfx` engine as the presets. Slot 16 — above the preset bitmask's
+    /// 0..15, well under `MAX_SFX` (64) — is THE effect-audition slot;
+    /// auditions replace each other, which is what an editor wants.
+    /// Fail-soft: malformed params are a no-op, never a panic (the drain runs
+    /// on the main thread).
+    pub fn play_effect(params: &[f64]) {
+        use macgamepane_audio::synth as s;
+        if params.len() < 14 {
+            return;
+        }
+        let osc_count = (params[13] as usize).min(4);
+        if params.len() < 14 + osc_count * 5 {
+            return;
+        }
+        let mut e = s::Effect::new(params[0].clamp(0.01, 4.0));
+        e.set_env(
+            params[1].max(0.0),
+            params[2].max(0.0),
+            params[3].clamp(0.0, 1.0),
+            params[4].max(0.0),
+        );
+        e.sweep_start = params[5].max(0.0);
+        e.sweep_end = params[6].max(0.0);
+        e.noise_mix = params[7].clamp(0.0, 1.0);
+        e.distortion = params[8].max(0.0);
+        e.echo_count = (params[9].max(0.0) as u32).min(8);
+        e.echo_delay = params[10].clamp(0.0, 2.0);
+        e.echo_decay = params[11].clamp(0.0, 1.0);
+        let seed = params[12].max(0.0) as u32;
+        for o in 0..osc_count {
+            let b = 14 + o * 5;
+            let wave = match params[b] as u32 {
+                1 => s::Waveform::Square,
+                2 => s::Waveform::Saw,
+                3 => s::Waveform::Triangle,
+                4 => s::Waveform::Noise,
+                5 => s::Waveform::Pulse,
+                _ => s::Waveform::Sine,
+            };
+            e.add_osc(wave, params[b + 1].clamp(0.0, 20_000.0), params[b + 2].clamp(0.0, 1.0));
+            let idx = e.oscillators.len() - 1;
+            e.oscillators[idx].phase = params[b + 3].clamp(0.0, 1.0);
+            e.oscillators[idx].pulse_width = params[b + 4].clamp(0.01, 0.99);
+        }
+        let mut rng = s::Lcg::new(if seed == 0 { 1 } else { seed });
+        let sound = s::render(&e, &mut rng);
+        const EFFECT_SLOT: usize = 16;
+        SFX.with(|cell| {
+            let mut slot = cell.borrow_mut();
+            if slot.is_none() {
+                let mut sfx = macgamepane_audio::playback::Sfx::new();
+                if !sfx.start() {
+                    return;
+                }
+                *slot = Some(sfx);
+            }
+            let sfx = slot.as_mut().unwrap();
+            sfx.define(EFFECT_SLOT, &sound);
+            sfx.play(EFFECT_SLOT);
         });
     }
 

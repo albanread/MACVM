@@ -78,6 +78,12 @@
 # source emit. World-list so games can file sheets in and the battery runs
 # headless; the Cocoa face is 76_spriteed.mst (cocoaui list).
 44a_spritedoc.mst
+# SoundDoc (docs/asset_editors_design.md §3): the Sound Editor's pure document
+# — the parametric Effect recipe (ADSR/oscillators/sweep/noise/echo/seed),
+# clamps, THE flat params contract, 12 transcribed preset seeds,
+# randomize/mutate, sheet-source emit. World-list for the same reason as
+# SpriteDoc; the Cocoa face is 77_sounded.mst (cocoaui list).
+44b_sounddoc.mst
 # Breakout: a small but complete demo game exercising the whole engine
 # (paddle/ball/brick physics, input, SFX, frame loop; docs/gamepane_design.md).
 44_breakout.mst

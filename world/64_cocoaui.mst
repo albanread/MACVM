@@ -1013,6 +1013,7 @@ Object subclass: CocoaUI [
         | menu toolsItem |
         menu := (Cocoa classNamed: 'NSMenu') onMain alloc onMain init.
         self toolsMenu: menu item: 'Sprite Editor…' opens: #CocoaSpriteEditor.
+        self toolsMenu: menu item: 'Sound Editor…' opens: #CocoaSoundEditor.
         toolsItem := ((Cocoa classNamed: 'NSMenuItem') onMain alloc) onMain
             initWithTitle: 'Tools' action: nil keyEquivalent: ''.
         toolsItem onMain setSubmenu: menu.
@@ -1713,6 +1714,7 @@ Object subclass: CocoaUI [
             (Worker classNamed: #CocoaOutliner) ifNotNil: [ :oc | oc teardown ].
             (Worker classNamed: #CocoaCanvas) ifNotNil: [ :cv | cv teardown ].
             (Worker classNamed: #CocoaSpriteEditor) ifNotNil: [ :se | se teardown ].
+            (Worker classNamed: #CocoaSoundEditor) ifNotNil: [ :sn | sn teardown ].
             (Worker classNamed: #CocoaHelp) ifNotNil: [ :hc | hc teardown ].
             (Worker classNamed: #CocoaDebugger) ifNotNil: [ :dc | dc teardown ].
             ActTarget isNil ifFalse: [ ActTarget isValid ifTrue: [ ActTarget release ] ].
