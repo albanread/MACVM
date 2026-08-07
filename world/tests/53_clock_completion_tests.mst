@@ -1,0 +1,214 @@
+"53_clock_completion_tests.mst — gates world/81_clock_completion.mst.
+
+ A clock test must not assert what the clock says, or it fails at midnight
+ and on whoever's machine sits in another zone. So the split here is:
+
+ - the CALENDAR arithmetic is pinned to fixed vectors and round-trips, which
+   are absolute truths and can be asserted exactly. Every epochDays value
+   below was obtained independently from the system `date` command, not
+   from the implementation it checks;
+ - the LIVE clock is asserted only for internal consistency and plausible
+   range — that `Date today` and `Time now` are cut from the same instant,
+   that local and UTC differ by exactly the reported offset, and that the
+   values are in bounds."
+
+TestCase subclass: ClockCompletionTests [
+    runAll [
+        self runTest: #testEpochDayVectors do: [ self testEpochDayVectors ].
+        self runTest: #testCivilRoundTrip do: [ self testCivilRoundTrip ].
+        self runTest: #testPreEpochDates do: [ self testPreEpochDates ].
+        self runTest: #testLeapYears do: [ self testLeapYears ].
+        self runTest: #testDayOfWeek do: [ self testDayOfWeek ].
+        self runTest: #testDayOfYearAndDaysInMonth
+             do: [ self testDayOfYearAndDaysInMonth ].
+        self runTest: #testDateArithmetic do: [ self testDateArithmetic ].
+        self runTest: #testTimeFromEpochSeconds do: [ self testTimeFromEpochSeconds ].
+        self runTest: #testLiveClockIsSelfConsistent
+             do: [ self testLiveClockIsSelfConsistent ].
+        self runTest: #testLiveValuesAreInRange do: [ self testLiveValuesAreInRange ].
+    ]
+
+    "Fixed vectors, every one of them cross-checked against the system
+     `date` command rather than against this implementation."
+    testEpochDayVectors [
+        | d |
+        d := Date fromEpochDays: 0.
+        self assert: d year equals: 1970.
+        self assert: d monthIndex equals: 1.
+        self assert: d dayOfMonth equals: 1.
+        d := Date fromEpochDays: 11016.
+        self assert: d year equals: 2000.
+        self assert: d monthIndex equals: 2.
+        self assert: d dayOfMonth equals: 29.
+        d := Date fromEpochDays: 19782.
+        self assert: d year equals: 2024.
+        self assert: d monthIndex equals: 2.
+        self assert: d dayOfMonth equals: 29.
+        d := Date fromEpochDays: 20672.
+        self assert: d year equals: 2026.
+        self assert: d monthIndex equals: 8.
+        self assert: d dayOfMonth equals: 7.
+        "2100 is NOT a leap year — the century rule, and the case a naive
+         every-four-years implementation gets wrong"
+        d := Date fromEpochDays: 47482.
+        self assert: d year equals: 2100.
+        self assert: d monthIndex equals: 1.
+        self assert: d dayOfMonth equals: 1
+    ]
+
+    "civil_from_days and days_from_civil must be exact inverses. Stepping by
+     a non-multiple of 7 and of 365 keeps the walk from landing on the same
+     weekday or calendar position every time."
+    testCivilRoundTrip [
+        | day |
+        day := -40000.
+        [ day <= 60000 ] whileTrue: [
+            self assert: (Date fromEpochDays: day) asEpochDays equals: day.
+            day := day + 137 ].
+        "and the dense neighbourhood of a leap day, one day at a time"
+        11010 to: 11020 do: [:z |
+            self assert: (Date fromEpochDays: z) asEpochDays equals: z ]
+    ]
+
+    "Hinnant guards the era division because C truncates toward zero;
+     Smalltalk's // already floors, so the guard collapses — which makes
+     negative day numbers the case worth pinning."
+    testPreEpochDates [
+        | d |
+        d := Date fromEpochDays: -1.
+        self assert: d year equals: 1969.
+        self assert: d monthIndex equals: 12.
+        self assert: d dayOfMonth equals: 31.
+        d := Date fromEpochDays: -25508.
+        self assert: d year equals: 1900.
+        self assert: d monthIndex equals: 3.
+        self assert: d dayOfMonth equals: 1.
+        self assert: (Date fromEpochDays: -1) asEpochDays equals: -1.
+        self assert: (Date fromEpochDays: -25508) asEpochDays equals: -25508.
+        "a pre-epoch INSTANT maps to the day it falls in, not the one after:
+         -1 second is 1969-12-31, because // floors"
+        self assert: (Date fromEpochSeconds: -1) year equals: 1969.
+        self assert: (Date fromEpochSeconds: -1) dayOfMonth equals: 31.
+        "and its time of day is 23:59:59, not -1"
+        self assert: (Time fromEpochSeconds: -1) hour equals: 23.
+        self assert: (Time fromEpochSeconds: -1) minute equals: 59.
+        self assert: (Time fromEpochSeconds: -1) second equals: 59
+    ]
+
+    testLeapYears [
+        self assert: (Date newDay: 1 monthIndex: 1 year: 2024) isLeapYear.
+        self assert: (Date newDay: 1 monthIndex: 1 year: 2000) isLeapYear.
+        self deny: (Date newDay: 1 monthIndex: 1 year: 2026) isLeapYear.
+        "the century rule and its 400-year exception"
+        self deny: (Date newDay: 1 monthIndex: 1 year: 1900) isLeapYear.
+        self deny: (Date newDay: 1 monthIndex: 1 year: 2100) isLeapYear.
+        self assert: (Date newDay: 1 monthIndex: 1 year: 1600) isLeapYear.
+        "February's length follows"
+        self assert: (Date newDay: 1 monthIndex: 2 year: 2024) daysInMonth equals: 29.
+        self assert: (Date newDay: 1 monthIndex: 2 year: 2026) daysInMonth equals: 28.
+        self assert: (Date newDay: 1 monthIndex: 2 year: 1900) daysInMonth equals: 28
+    ]
+
+    "Epoch day 0 was a Thursday — the fact the +3 offset is built on."
+    testDayOfWeek [
+        self assert: (Date fromEpochDays: 0) dayOfWeek equals: #Thursday.
+        self assert: (Date fromEpochDays: -1) dayOfWeek equals: #Wednesday.
+        self assert: (Date fromEpochDays: 11016) dayOfWeek equals: #Tuesday.
+        self assert: (Date fromEpochDays: 19782) dayOfWeek equals: #Thursday.
+        self assert: (Date fromEpochDays: 20672) dayOfWeek equals: #Friday.
+        self assert: (Date fromEpochDays: 47482) dayOfWeek equals: #Friday.
+        "pre-epoch, where a truncating remainder would go negative"
+        self assert: (Date fromEpochDays: -25508) dayOfWeek equals: #Thursday.
+        "the index is 1..7 into daysOfWeek, which starts at Monday"
+        self assert: (Date fromEpochDays: 0) dayOfWeekIndex equals: 4.
+        "seven consecutive days give seven distinct weekdays"
+        self assert: ((0 to: 6) collect: [:i | (Date fromEpochDays: i) dayOfWeek ])
+                        asSet size equals: 7
+    ]
+
+    testDayOfYearAndDaysInMonth [
+        self assert: (Date newDay: 1 monthIndex: 1 year: 2026) dayOfYear equals: 1.
+        self assert: (Date newDay: 31 monthIndex: 12 year: 2026) dayOfYear equals: 365.
+        self assert: (Date newDay: 31 monthIndex: 12 year: 2024) dayOfYear equals: 366.
+        self assert: (Date newDay: 7 monthIndex: 8 year: 2026) dayOfYear equals: 219.
+        self assert: (Date newDay: 1 monthIndex: 1 year: 2026) daysInMonth equals: 31.
+        self assert: (Date newDay: 1 monthIndex: 4 year: 2026) daysInMonth equals: 30
+    ]
+
+    testDateArithmetic [
+        | d |
+        d := Date newDay: 28 monthIndex: 2 year: 2024.
+        "into the leap day, then past it"
+        self assert: (d addDays: 1) dayOfMonth equals: 29.
+        self assert: (d addDays: 2) monthIndex equals: 3.
+        self assert: (d addDays: 2) dayOfMonth equals: 1.
+        "and the same step in a non-leap year skips 29 February entirely"
+        self assert: ((Date newDay: 28 monthIndex: 2 year: 2026) addDays: 1) monthIndex
+                     equals: 3.
+        self assert: (d addDays: 366) year equals: 2025.
+        self assert: (d subtractDays: 366) year equals: 2023.
+        self assert: ((d addDays: 10) subtractDays: 10) asEpochDays equals: d asEpochDays.
+        "difference in whole days, signed"
+        self assert: ((Date newDay: 1 monthIndex: 3 year: 2024)
+                        subtractDate: (Date newDay: 1 monthIndex: 2 year: 2024))
+                     equals: 29.
+        self assert: ((Date newDay: 1 monthIndex: 2 year: 2024)
+                        subtractDate: (Date newDay: 1 monthIndex: 3 year: 2024))
+                     equals: -29
+    ]
+
+    testTimeFromEpochSeconds [
+        self assert: (Time fromEpochSeconds: 0) hour equals: 0.
+        self assert: (Time fromEpochSeconds: 0) minute equals: 0.
+        self assert: (Time fromEpochSeconds: 0) second equals: 0.
+        self assert: (Time fromEpochSeconds: 3661) hour equals: 1.
+        self assert: (Time fromEpochSeconds: 3661) minute equals: 1.
+        self assert: (Time fromEpochSeconds: 3661) second equals: 1.
+        self assert: (Time fromEpochSeconds: 86399) hour equals: 23.
+        "the day rolls over, it does not run to 24:00:00"
+        self assert: (Time fromEpochSeconds: 86400) hour equals: 0
+    ]
+
+    "The live clock is asserted for CONSISTENCY, never for a value — a test
+     that asserts what time it is fails at midnight and in other zones."
+    testLiveClockIsSelfConsistent [
+        | epoch localEpoch offset d t |
+        epoch := Time secondsSinceEpoch.
+        offset := Time localOffsetSeconds.
+        localEpoch := Time localSecondsSinceEpoch.
+        "local time is UTC shifted by exactly the reported offset"
+        self assert: localEpoch equals: epoch + offset.
+        "Date today and Time now must be cut from the same instant, or they
+         disagree about which side of midnight it is"
+        d := Date fromEpochSeconds: localEpoch.
+        t := Time fromEpochSeconds: localEpoch.
+        self assert: Date today asEpochDays equals: d asEpochDays.
+        self assert: (Time now asSeconds - t asSeconds) abs <= 2.
+        "the UTC pair agrees with the local pair once the offset is undone"
+        self assert: Date todayUTC asEpochDays
+                     equals: (Date fromEpochSeconds: epoch) asEpochDays.
+        "and the round-trip through the calendar is exact for today"
+        self assert: (Date fromEpochDays: Date today asEpochDays) year
+                     equals: Date today year
+    ]
+
+    testLiveValuesAreInRange [
+        | t |
+        "a sane epoch: after 2020-01-01 and before 2100-01-01, which catches a
+         clock reading zero or garbage without pinning a date"
+        self assert: Time secondsSinceEpoch > 1577836800.
+        self assert: Time secondsSinceEpoch < 4102444800.
+        "offsets run -12h..+14h in the real world"
+        self assert: Time localOffsetSeconds >= -43200.
+        self assert: Time localOffsetSeconds <= 50400.
+        t := Time now.
+        self assert: (t hour between: 0 and: 23).
+        self assert: (t minute between: 0 and: 59).
+        self assert: (t second between: 0 and: 59).
+        self assert: (Date today monthIndex between: 1 and: 12).
+        self assert: (Date today dayOfMonth between: 1 and: 31).
+        self assert: (Date today dayOfMonth <= Date today daysInMonth).
+        self assert: (Date today dayOfYear between: 1 and: 366).
+        self assert: (Date daysOfWeek includes: Date today dayOfWeek)
+    ]
+]

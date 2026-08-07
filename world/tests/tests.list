@@ -59,4 +59,5 @@ tier1.mst
 50_exception_tests.mst
 51_collection_completion_tests.mst
 52_numeric_completion_tests.mst
+53_clock_completion_tests.mst
 99_run_all.mst

@@ -173,3 +173,8 @@
 # IEEE special-value tests, String/Symbol/Character gain text protocol, and
 # Object/UndefinedObject gain REAL ifNil: methods so reflective use works.
 80_numeric_completion.mst
+# Date today / Time now (docs: the census's most surprising hole — the wall
+# clock existed, the calendar layer between it and Date/Time did not).
+# Hinnant civil_from_days in pure Smalltalk; the UTC offset from localtime_r's
+# tm_gmtoff, whose layout was probed on this machine, not assumed.
+81_clock_completion.mst

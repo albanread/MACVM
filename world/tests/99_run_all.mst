@@ -57,4 +57,5 @@ TestRunner run: SupervisorTests.
 TestRunner run: ExceptionTests.
 TestRunner run: CollectionCompletionTests.
 TestRunner run: NumericCompletionTests.
+TestRunner run: ClockCompletionTests.
 TestRunner report.

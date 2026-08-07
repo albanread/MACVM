@@ -1,0 +1,177 @@
+"81_clock_completion.mst — `Date today` and `Time now`.
+
+ The census's most surprising hole: the WALL CLOCK was already there —
+ world/30 reaches real Unix-epoch milliseconds through
+ clock_gettime(CLOCK_REALTIME) over FFI — and `Date` could be built from a
+ day/month/year while `Time` could be built from seconds. What was missing
+ was the layer between them, so nothing in the image could answer *what day
+ is it*. `Date today` and `Time now` were both doesNotUnderstand.
+
+ Two pieces fill it.
+
+ **The calendar arithmetic is pure Smalltalk** — Howard Hinnant's
+ civil_from_days/days_from_civil, exact integer arithmetic with no lookup
+ tables, correct for any proleptic-Gregorian date including leap centuries
+ and dates before the epoch. Hinnant writes the era division defensively
+ because C's `/` truncates toward zero; Smalltalk's `//` already floors, so
+ the guarded form collapses to a plain `//` here — the one deliberate
+ departure from the published algorithm, and the reason the tests below
+ check dates on both sides of 1970.
+
+ **The UTC offset comes from the platform**, not from arithmetic: only
+ localtime_r knows this machine's zone and whether daylight saving is in
+ effect today. It is read from `struct tm`'s tm_gmtoff, whose layout was
+ PROBED on this machine rather than assumed (the discipline world/30 set
+ when it chose timespec over timeval): a C probe compiled against these
+ headers reports sizeof(struct tm) = 56 with tm_gmtoff at offset 40, size 8.
+ Being a full 8-byte long at a naturally aligned offset is what makes it
+ readable with the `signedLongAt:` that Alien already exposes — the 4-byte
+ int fields beside it are exactly the accessor width world/30 recorded as
+ missing, which is why this file reads the offset and does the rest itself
+ rather than lifting y/m/d straight out of the struct."
+
+Object subclass: Time [
+    <classVars: TmBuffer>
+
+    "── epoch access ─────────────────────────────────────────────────────"
+
+    Time class >> secondsSinceEpoch ^ <Integer> [
+        "Seconds since 1970-01-01T00:00:00Z. UTC, like the clock it reads."
+        ^self millisecondClockValue // 1000
+    ]
+
+    "A 64-byte scratch region: an 8-byte time_t at offset 0, then the
+     56-byte struct tm at offset 8. mmap'd for the same reason world/30's
+     clock buffer is — memory handed OUT to native code as a pointer must
+     live outside the GC heap, where it can never move mid-call. Allocated
+     once, reused forever."
+    Time class >> tmBufferAddress ^ <Integer> [
+        TmBuffer isNil ifTrue: [
+            "PROT_READ|PROT_WRITE=3, MAP_PRIVATE|MAP_ANON=4098 — the real
+             macOS/arm64 flag values world/30 already proves."
+            TmBuffer := self ffiMmapAddr: 0 length: 64 prot: 3 flags: 4098 fd: -1 offset: 0 ].
+        ^TmBuffer
+    ]
+    Time class >> ffiLocaltimeR: timePtr <Integer> tm: tmPtr <Integer> [
+        <primitive: FFI function: #localtime_r ret: #g args: #(g g)>
+    ]
+
+    "This machine's offset from UTC right now, in seconds — POSITIVE east of
+     Greenwich, and already including daylight saving, because localtime_r
+     resolves the zone for the INSTANT it is given. Answers 0 if the call
+     fails, so a clock question can never be the thing that raises."
+    Time class >> localOffsetSeconds ^ <Integer> [
+        | addr buf |
+        addr := self tmBufferAddress.
+        addr isNil ifTrue: [ ^0 ].
+        buf := Alien forAddress: addr size: 64.
+        "time_t at offset 0 (1-based byte 1); struct tm at offset 8."
+        buf signedLongAt: 1 put: self secondsSinceEpoch.
+        self ffiLocaltimeR: addr tm: addr + 8.
+        "tm_gmtoff: offset 40 within struct tm, so 8 + 40 = 48 from the base;
+         1-based byte 49."
+        ^buf signedLongAt: 49
+    ]
+
+    Time class >> localSecondsSinceEpoch ^ <Integer> [
+        "Epoch seconds shifted into local time — the value the local calendar
+         and the local clock are both read from, so they can never disagree
+         about which side of midnight it is."
+        ^self secondsSinceEpoch + self localOffsetSeconds
+    ]
+
+    "── the constructors that were missing ───────────────────────────────"
+
+    Time class >> now ^ <Time> [
+        "The current LOCAL time of day."
+        ^self fromSeconds: self localSecondsSinceEpoch \\ 86400
+    ]
+    Time class >> nowUTC ^ <Time> [
+        ^self fromSeconds: self secondsSinceEpoch \\ 86400
+    ]
+    Time class >> fromEpochSeconds: epochSeconds <Integer> ^ <Time> [
+        "The time-of-day part of an epoch instant. `\\` floors, so a negative
+         (pre-1970) instant still lands in 0..86399 rather than going
+         negative."
+        ^self fromSeconds: epochSeconds \\ 86400
+    ]
+]
+
+Object subclass: Date [
+    "── civil calendar from a day number ─────────────────────────────────
+     Hinnant's civil_from_days: exact, table-free, and correct across leap
+     centuries. Day 0 is 1970-01-01."
+
+    Date class >> fromEpochDays: epochDays <Integer> ^ <Date> [
+        | z era doe yoe y doy mp d m |
+        "Shift the epoch to 0000-03-01, which puts the leap day at the END of
+         the era and is what makes the rest of this table-free."
+        z := epochDays + 719468.
+        era := z // 146097.
+        doe := z - (era * 146097).
+        yoe := (doe - (doe // 1460) + (doe // 36524) - (doe // 146096)) // 365.
+        y := yoe + (era * 400).
+        doy := doe - ((365 * yoe) + (yoe // 4) - (yoe // 100)).
+        mp := ((5 * doy) + 2) // 153.
+        d := doy - (((153 * mp) + 2) // 5) + 1.
+        m := mp + (mp < 10 ifTrue: [ 3 ] ifFalse: [ -9 ]).
+        m <= 2 ifTrue: [ y := y + 1 ].
+        ^self newDay: d monthIndex: m year: y
+    ]
+
+    "The exact inverse — days_from_civil. Together the two make the
+     round-trip testable, which is the only way to be sure of arithmetic
+     this dense."
+    Date class >> epochDaysForDay: d <Integer> monthIndex: m <Integer> year: y <Integer> ^ <Integer> [
+        | yy era yoe doy doe |
+        yy := m <= 2 ifTrue: [ y - 1 ] ifFalse: [ y ].
+        era := yy // 400.
+        yoe := yy - (era * 400).
+        doy := ((153 * (m + (m > 2 ifTrue: [ -3 ] ifFalse: [ 9 ]))) + 2) // 5 + d - 1.
+        doe := (yoe * 365) + (yoe // 4) - (yoe // 100) + doy.
+        ^(era * 146097) + doe - 719468
+    ]
+
+    Date class >> today ^ <Date> [
+        "The current LOCAL date."
+        ^self fromEpochDays: Time localSecondsSinceEpoch // 86400
+    ]
+    Date class >> todayUTC ^ <Date> [
+        ^self fromEpochDays: Time secondsSinceEpoch // 86400
+    ]
+    Date class >> fromEpochSeconds: epochSeconds <Integer> ^ <Date> [
+        "`//` floors, so a pre-1970 instant maps to the day it falls in
+         rather than the one after it."
+        ^self fromEpochDays: epochSeconds // 86400
+    ]
+
+    "── instance protocol the above makes answerable ─────────────────────"
+
+    asEpochDays ^ <Integer> [
+        ^Date epochDaysForDay: dayOfMonth monthIndex: monthIndex year: year
+    ]
+    dayOfWeekIndex ^ <Integer> [
+        "1..7 into `Date daysOfWeek`, which starts at Monday. Epoch day 0 —
+         1970-01-01 — was a Thursday, which is what fixes the +3."
+        ^((self asEpochDays + 3) \\ 7) + 1
+    ]
+    dayOfWeek ^ <Symbol> [ ^Date nameOfDay: self dayOfWeekIndex ]
+    isLeapYear ^ <Boolean> [
+        ^(year \\ 4 = 0) and: [ (year \\ 100 ~= 0) or: [ year \\ 400 = 0 ] ]
+    ]
+    daysInMonth ^ <Integer> [
+        | lengths |
+        lengths := #(31 28 31 30 31 30 31 31 30 31 30 31).
+        (monthIndex = 2 and: [ self isLeapYear ]) ifTrue: [ ^29 ].
+        ^lengths at: monthIndex
+    ]
+    dayOfYear ^ <Integer> [
+        ^self asEpochDays - (Date epochDaysForDay: 1 monthIndex: 1 year: year) + 1
+    ]
+    addDays: n <Integer> ^ <Date> [ ^Date fromEpochDays: self asEpochDays + n ]
+    subtractDays: n <Integer> ^ <Date> [ ^self addDays: n negated ]
+    subtractDate: aDate <Date> ^ <Integer> [
+        "Whole days from aDate to me — negative if aDate is later."
+        ^self asEpochDays - aDate asEpochDays
+    ]
+]
