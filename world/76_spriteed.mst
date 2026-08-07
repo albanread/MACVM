@@ -90,6 +90,7 @@ Object subclass: CocoaSpriteEditor [
         self buildSlidersIn: content.
         self buildFrameRowIn: content.
         self buildPreviewRowIn: content.
+        self buildPersistRowIn: content.
         self repaintAll.
         self setStatus: 'new 16x16 sprite — pencil paints colour 15; . is transparent'.
     ]
@@ -514,6 +515,161 @@ Object subclass: CocoaSpriteEditor [
         self markDirty.
     ]
 
+    "── persistence (design §2/§6 S5): sheets are SOURCE IN THE IMAGE.
+       Save composes the sheet class and hands it to acceptEditorClass: —
+       parse-gated, image-diffed, world-tree-spliced, NO live install; so
+       Load reads back from the IMAGE (sourceForClass:side:selector:), never
+       from the live primary — which is also why a just-saved sheet loads
+       back immediately. Sheets lists implementorsOf: 'isSpriteSheet', the
+       find view's own query. ──────────────────────────────────────────"
+
+    CocoaSpriteEditor class >> buildPersistRowIn: content [
+        self button: 'Save' frame: (Array with: 472.0 with: 96.0 with: 84.0 with: 26.0)
+             action: [ self saveClicked ] in: content.
+        self button: 'Load' frame: (Array with: 560.0 with: 96.0 with: 84.0 with: 26.0)
+             action: [ self loadClicked ] in: content.
+        self button: 'Sheets' frame: (Array with: 648.0 with: 96.0 with: 84.0 with: 26.0)
+             action: [ self sheetsClicked ] in: content.
+        self button: 'Copy Code' frame: (Array with: 736.0 with: 96.0 with: 110.0 with: 26.0)
+             action: [ self copyCodeClicked ] in: content.
+    ]
+
+    CocoaSpriteEditor class >> hostService [
+        | bc |
+        bc := Worker classNamed: #CocoaBrowser.
+        ^bc isNil ifTrue: [ nil ] ifFalse: [ bc hostService ]
+    ]
+
+    CocoaSpriteEditor class >> saveClicked [
+        | nm svc reply |
+        nm := NameField sendString: 'stringValue'.
+        (SpriteDoc validName: nm) ifFalse: [
+            ^self setStatus: 'save: name must be a capitalised identifier' ].
+        svc := self hostService.
+        svc isNil ifTrue: [ ^self setStatus: 'save: no host service' ].
+        Doc name: nm.
+        reply := CocoaBrowser readReply: (svc onMain acceptEditorClass: Doc sheetSource).
+        self setStatus: 'save: ' , reply.
+    ]
+
+    CocoaSpriteEditor class >> loadClicked [
+        | nm svc framesSrc palSrc rows triples |
+        nm := NameField sendString: 'stringValue'.
+        (SpriteDoc validName: nm) ifFalse: [
+            ^self setStatus: 'load: type the sheet class name in Name first' ].
+        svc := self hostService.
+        svc isNil ifTrue: [ ^self setStatus: 'load: no host service' ].
+        framesSrc := CocoaBrowser readReply:
+            (svc onMain sourceForClass: nm side: 'class' selector: 'frames').
+        palSrc := CocoaBrowser readReply:
+            (svc onMain sourceForClass: nm side: 'class' selector: 'palette').
+        (framesSrc isEmpty or: [ palSrc isEmpty ]) ifTrue: [
+            ^self setStatus: 'load: ' , nm , ' has no frames/palette (not a sheet?)' ].
+        rows := self quotedStringsIn: framesSrc.
+        triples := self integerTriplesIn: palSrc.
+        (Doc loadFrames: rows palette: triples) ifFalse: [
+            ^self setStatus: 'load: ' , nm , ' did not parse as a sheet' ].
+        Doc name: nm.
+        CurFrame := 0.
+        WField onMain setStringValue: Doc width printString.
+        HField onMain setStringValue: Doc height printString.
+        self repaintAll.
+        self markDirty.
+        self setStatus: 'loaded ' , nm , ' (' , Doc frameCount printString ,
+            (Doc frameCount = 1 ifTrue: [ ' frame)' ] ifFalse: [ ' frames)' ]).
+    ]
+
+    CocoaSpriteEditor class >> sheetsClicked [
+        "`out` is a METHOD temp, not an ifFalse:-branch temp: a temp declared
+         in an inlined branch block reads as nil inside any REAL block that
+         captures it (compiler bug, minimal repro task-flagged 2026-08-07)."
+        | svc reply names us lf line out |
+        svc := self hostService.
+        svc isNil ifTrue: [ ^self setStatus: 'no host service' ].
+        reply := CocoaBrowser readReply: (svc onMain implementorsOf: 'isSpriteSheet').
+        names := OrderedCollection new.
+        us := Character value: 31. lf := Character value: 10.
+        line := WriteStream on: String new.
+        reply do: [ :ch |
+            ch = lf
+                ifTrue: [
+                    names add: line contents.
+                    line := WriteStream on: String new ]
+                ifFalse: [ ch = us ifTrue: [ ch := $\ ]. line nextPut: ch ] ].
+        line contents isEmpty ifFalse: [ names add: line contents ].
+        "Keep only the class name (chars before the separator we mapped to \\)."
+        "Keep only the class name — the chars before the mapped separator.
+         No ^ inside the block: a non-local return there would exit
+         sheetsClicked itself, not the collect."
+        names := names collect: [ :e |
+            | keep stop |
+            keep := WriteStream on: String new.
+            stop := false.
+            e do: [ :ch |
+                stop ifFalse: [
+                    ch = $\
+                        ifTrue: [ stop := true ]
+                        ifFalse: [ keep nextPut: ch ] ] ].
+            keep contents ].
+        names isEmpty
+            ifTrue: [ self setStatus: 'no sprite sheets in the image yet' ]
+            ifFalse: [
+                out := WriteStream on: String new.
+                names do: [ :e | out nextPutAll: e; nextPutAll: ' ' ].
+                self setStatus: 'sheets: ' , out contents ].
+    ]
+
+    CocoaSpriteEditor class >> copyCodeClicked [
+        | pb |
+        pb := (Cocoa classNamed: 'NSPasteboard') onMain generalPasteboard.
+        pb onMain clearContents.
+        pb onMain setString: Doc codeSnippet forType: 'public.utf8-plain-text'.
+        self setStatus: 'code copied to the clipboard'.
+    ]
+
+    "── source scraping (Load): the sheet's methods are literal-array
+       one-liners the editor itself wrote, so a quote scan and an integer
+       scan are honest parsers — rows hold only hex and / (never a quote),
+       and the palette method's only integers are its 48 channels. ──────"
+
+    CocoaSpriteEditor class >> quotedStringsIn: src [
+        | out cur inQ |
+        out := OrderedCollection new.
+        inQ := false.
+        cur := WriteStream on: String new.
+        src do: [ :ch |
+            inQ
+                ifTrue: [
+                    ch = $'
+                        ifTrue: [ out add: cur contents. inQ := false ]
+                        ifFalse: [ cur nextPut: ch ] ]
+                ifFalse: [
+                    ch = $' ifTrue: [ inQ := true. cur := WriteStream on: String new ] ] ].
+        ^out asArray
+    ]
+
+    CocoaSpriteEditor class >> integerTriplesIn: src [
+        | nums cur triples i |
+        nums := OrderedCollection new.
+        cur := WriteStream on: String new.
+        src do: [ :ch |
+            ch isDigit
+                ifTrue: [ cur nextPut: ch ]
+                ifFalse: [
+                    cur contents isEmpty ifFalse: [
+                        nums add: cur contents asInteger.
+                        cur := WriteStream on: String new ] ] ].
+        cur contents isEmpty ifFalse: [ nums add: cur contents asInteger ].
+        nums size = 48 ifFalse: [ ^nil ].
+        triples := Array new: 16.
+        i := 1.
+        1 to: 16 do: [ :t |
+            triples at: t put: (Array with: (nums at: i) with: (nums at: i + 1)
+                                      with: (nums at: i + 2)).
+            i := i + 3 ].
+        ^triples
+    ]
+
     "── the engine preview (design §2: the real pane, driven the way demos
        are — a composed entry doit through launchDemo:, relaunched whole on
        every rebuild; the editor never edits engine state) ───────────────"
@@ -678,6 +834,7 @@ Object subclass: CocoaSpriteEditor [
     ]
     CocoaSpriteEditor class >> doc [ ^Doc ]
     CocoaSpriteEditor class >> gridView [ ^GridView ]
+    CocoaSpriteEditor class >> nameField [ ^NameField ]
     CocoaSpriteEditor class >> windowContentView [ ^Win onMain contentView ]
     CocoaSpriteEditor class >> swatchView [ ^SwatchView ]
     CocoaSpriteEditor class >> spedRows [ ^Doc rowsOf: CurFrame ]

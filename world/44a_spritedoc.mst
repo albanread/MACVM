@@ -198,6 +198,41 @@ Object subclass: SpriteDoc [
         ^true
     ]
 
+    loadFrames: rowStrings palette: triples [
+        "Replace my whole document from parsed sheet data: an Array of
+         '/'-separated row strings (every frame the same size) and 16 #(r g b)
+         triples. Parse EVERYTHING first, commit after — a malformed sheet
+         can never half-load (parseRows:'s own discipline, lifted a level).
+         Answers true, or false with nothing changed."
+        | parsed first newPal |
+        (rowStrings isNil or: [ rowStrings isEmpty ]) ifTrue: [ ^false ].
+        (triples isNil or: [ triples size ~= 16 ]) ifTrue: [ ^false ].
+        parsed := OrderedCollection new.
+        rowStrings do: [ :rs |
+            | one |
+            one := self class parseRows: rs.
+            one isNil ifTrue: [ ^false ].
+            parsed add: one ].
+        first := parsed at: 1.
+        parsed do: [ :one |
+            ((one at: 2) = (first at: 2) and: [ (one at: 3) = (first at: 3) ])
+                ifFalse: [ ^false ] ].
+        newPal := Array new: 16.
+        1 to: 16 do: [ :i |
+            | t |
+            t := triples at: i.
+            (t isNil or: [ t size ~= 3 ]) ifTrue: [ ^false ].
+            newPal at: i put: (Array
+                with: (((t at: 1) max: 0) min: 255)
+                with: (((t at: 2) max: 0) min: 255)
+                with: (((t at: 3) max: 0) min: 255)) ].
+        w := first at: 2. h := first at: 3.
+        frames := OrderedCollection new.
+        parsed do: [ :one | frames add: (one at: 1) ].
+        pal := newPal.
+        ^true
+    ]
+
     "── hex rows (the engine's wire format) ──────────────────────────────"
 
     rowsOf: f [
