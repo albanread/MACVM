@@ -54,4 +54,5 @@ TestRunner run: ScaledDecimalTests.
 TestRunner run: SocketTests.
 TestRunner run: AccelTests.
 TestRunner run: SupervisorTests.
+TestRunner run: ExceptionTests.
 TestRunner report.

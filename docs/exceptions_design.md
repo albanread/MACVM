@@ -161,10 +161,13 @@ something that currently works:
    call would open the debugger. (This exact confusion is what made a scripted
    `evaluate "1/0"` hang for a whole session — see
    `applescript_design.md`.)
-3. **`ensure:` ordering.** Pass 2 must run `ensure:` blocks *between* the
-   signal frame and the handler frame, innermost-first, before the handler
-   activates. Getting this wrong is silent and only shows up in resource
-   leaks.
+3. **`ensure:` ordering — and this note was WRONG.** It claimed `ensure:`
+   blocks must run *before* the handler activates. ANSI is the opposite, and
+   for a reason that matters: the handler runs while the signalling stack is
+   still live (which is what makes resumption possible at all), so the
+   `ensure:` blocks between run when the handler *returns*. The order is
+   **body, handler, ensure** — now pinned by
+   `testEnsureRunsAfterHandler`.
 4. **GC during the walk.** `run_curtailment_blocks_on_error` already models
    the discipline — collect into a `HandleScope` first, run second, because
    running a block re-enters the interpreter and moves closures.
@@ -174,6 +177,48 @@ something that currently works:
 6. **Worker boundaries.** An exception must not cross a `Worker` deep-copy
    boundary as an object graph. It signals *within* a VM; a worker that dies
    still reports `#workerDied`. The two mechanisms compose, they do not merge.
+
+## 3.5 E0+E1 as built (2026-08-07) — and the VM change was not needed
+
+Both slices shipped in **one world file** (`world/78_exceptions.mst`), with
+**no VM change at all**: no new primitive, no new marker kind, no
+`PRIM_ACTIVATES_FRAME` entry, no unwinder edit. §3's frame-marker predicate
+turned out to be unnecessary for the non-resumable case, because the two
+pieces the job needs already exist and compose:
+
+- the **handler stack can live in the world** (`Exception class >> handlers`),
+  so `signal` finds its handler by *searching*, never by touching frames; and
+- **non-local return already unwinds correctly** from arbitrary depth to a
+  specific home frame, running every `ensure:`/`ifCurtailed:` in between.
+
+So `on:do:` pushes `[ :ex | ^aHandlerBlock value: ex ]` — a block whose *home
+is the `on:do:` activation* — and `signal` calls it. The `^` does the
+returning, and the existing unwinder does the rest.
+
+**This is still two-pass, which is the point.** The search does not unwind:
+`signal` locates the handler and calls it with the stack intact. A handler
+that answers *without* a `^` simply returns its value to `signal` — so E3
+(`resume:`) remains reachable without redesigning any of this, exactly as
+§3.2 required.
+
+Gated by `world/tests/50_exception_tests.mst` (8 cases): matching, subclass
+matching, the no-signal path, non-matching-inner-passes-outward,
+re-signalling from inside a handler, ANSI `ensure:` ordering, message text,
+and — the one most likely to rot silently — that the handler stack is left
+empty on *every* exit path. Suite 6200 → **6215, 0 failed**, differential
+byte-identical off-vs-JIT, GC-stress green, and verified hot (33,000
+JIT-compiled `on:do:` activations, no handler-stack leak).
+
+One bug worth keeping: `unhandled` first read `self class name , ': '`, and
+class names are **Symbols**, which are immutable — so the error *reporter*
+raised "symbols are immutable" instead of reporting. `asString` first. A
+reporting path that fails while reporting is the same family of bug as §6.3
+in the scripting arc.
+
+**Still not done (E4):** the VM's own failures do not signal yet. `1/0` and
+DNU terminate exactly as before, so this file is purely additive — which is
+what keeps the differential gate meaningful. `on: ZeroDivide do: […]` today
+catches a ZeroDivide someone *signals*, not one the VM raises.
 
 ## 4. Is the current position defensible?
 

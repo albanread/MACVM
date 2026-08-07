@@ -157,3 +157,7 @@
 # bindings, Dns (the blocking addrinfo-chain walk), DnsService (a supervised
 # #dns worker serving resolves by RPC, deadline-bounded). docs/dns_design.md.
 75_dns.mst
+
+# Exceptions (E0+E1, docs/exceptions_design.md): the hierarchy, signal, and
+# BlockClosure>>on:do:. Purely additive — the VM does not signal yet (E4).
+78_exceptions.mst

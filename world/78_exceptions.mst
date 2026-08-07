@@ -1,0 +1,222 @@
+"78_exceptions.mst — E0 + E1 of docs/exceptions_design.md.
+
+ E0: the class hierarchy — Exception, Error and its concrete kinds, Warning.
+ E1: `on:do:` and `signal`, so a library can finally report a recoverable
+ condition to its caller instead of calling `self error:` and killing the
+ computation.
+
+ ── How this works, and why it needs no VM change ──────────────────────────
+
+ The design doc's §3 proposed a new frame-marker predicate in the unwinder.
+ Building E1 showed that is not necessary for the non-resumable case, because
+ MACVM already has the two pieces the job needs:
+
+   * a HANDLER STACK can live in the world (this file's `Handlers`), so
+     `signal` finds its handler by SEARCHING, without touching frames; and
+   * NON-LOCAL RETURN already unwinds correctly from an arbitrary depth back
+     to a specific home frame, running every `ensure:`/`ifCurtailed:` block
+     in between — which is exactly what `on:do:` must do once a handler
+     decides to return.
+
+ So `on:do:` pushes `[ :ex | ^aHandlerBlock value: ex ]` — a block whose HOME
+ is the `on:do:` activation. `signal` calls it; the `^` inside performs an
+ ordinary non-local return out of `on:do:`, and the existing unwinder does
+ the rest. No new primitive, no new marker kind, no change to the JIT's
+ `PRIM_ACTIVATES_FRAME` set.
+
+ It is also NOT one-pass, which matters for the future: the SEARCH does not
+ unwind. `signal` finds the handler and calls it with the stack intact, so a
+ handler that answers WITHOUT a `^` simply returns its value to `signal` —
+ which is resumption (E3), reachable later without redesigning this.
+
+ ── What is deliberately NOT here (E4) ─────────────────────────────────────
+
+ The VM's own failures — `self error:`, doesNotUnderstand, division by zero —
+ do NOT signal yet. They still terminate exactly as before, so this file is
+ purely additive and every existing gate keeps its meaning. `on: ZeroDivide
+ do: […]` therefore catches a ZeroDivide someone SIGNALS, not yet one the VM
+ raises. Wiring those is E4, and it must keep the no-handler path
+ byte-identical to today."
+
+Object subclass: Exception [
+    | messageText |
+    <classVars: Handlers>
+
+    "── the handler stack ────────────────────────────────────────────────
+     One entry per active `on:do:`, innermost LAST. Held on Exception (the
+     root) so every subclass shares one stack — a handler for Error must be
+     found by a ZeroDivide signalled deeper in."
+
+    Exception class >> handlers [
+        Handlers isNil ifTrue: [ Handlers := OrderedCollection new ].
+        ^Handlers
+    ]
+
+    "Push (exceptionClass, block) and answer the depth to unwind to. The
+     DEPTH, not an index into a list that may have grown — `popHandlerTo:`
+     truncates back to it, so an abandoned frame's entries cannot leak even
+     if a non-local return skipped their own pops."
+    Exception class >> pushHandler: aClass block: aBlock [
+        self handlers add: (Array with: aClass with: aBlock).
+        ^self handlers size - 1
+    ]
+
+    "Truncate back to `aDepth`. Idempotent and total: called from an
+     `ensure:`, so it must be correct after a normal return, after a
+     non-local return through it, and after a curtailment."
+    Exception class >> popHandlerTo: aDepth [
+        Handlers isNil ifTrue: [ ^self ].
+        [ Handlers size > aDepth ] whileTrue: [ Handlers removeLast ]
+    ]
+
+    "The innermost handler whose class this exception is a kind of, as
+     (index, block), or nil. Searched innermost-first — the ANSI rule."
+    Exception class >> findHandlerFor: anException [
+        | hs i |
+        hs := self handlers.
+        i := hs size.
+        [ i >= 1 ] whileTrue: [
+            | entry |
+            entry := hs at: i.
+            (anException isKindOf: (entry at: 1)) ifTrue: [
+                ^Array with: i with: (entry at: 2) ].
+            i := i - 1 ].
+        ^nil
+    ]
+
+    "── construction and text ────────────────────────────────────────────"
+
+    Exception class >> new ^ <Exception> [ ^self basicNew ]
+
+    "Signal a fresh instance of me — `ZeroDivide signal` and
+     `Error signal: 'text'` are the two forms library code uses."
+    Exception class >> signal ^ <Object> [ ^self new signal ]
+    Exception class >> signal: aString <String> ^ <Object> [
+        ^(self new messageText: aString) signal
+    ]
+
+    messageText ^ <Object> [ ^messageText ]
+    messageText: aString <String> ^ <Exception> [ messageText := aString. ^self ]
+
+    "What a report shows. Subclasses override `description` for a default
+     when no messageText was given; messageText always wins if present."
+    description ^ <String> [ ^'An exception occurred' ]
+
+    printOn: aStream [
+        aStream nextPutAll: self class name asString.
+        messageText isNil ifFalse: [
+            aStream nextPutAll: ': '; nextPutAll: messageText ]
+    ]
+
+    "The text a report should show: the specific message when one was given,
+     else the class's own description."
+    report ^ <String> [
+        ^messageText isNil ifTrue: [ self description ] ifFalse: [ messageText ]
+    ]
+
+    "── signalling ───────────────────────────────────────────────────────
+     Search innermost-first for a handler. While it runs, the handler and
+     everything inside it are POPPED, so a signal raised by the handler
+     itself cannot re-enter the same handler (an infinite loop) and instead
+     finds the next one outward — the ANSI rule, and the same shape the
+     unwinder's `curtailing_on_error` guard uses for `ensure:`.
+
+     The handler block is `on:do:`'s wrapper, whose `^` returns from the
+     `on:do:` activation; so in the ordinary case this send does not return
+     here at all. If the handler answers WITHOUT a non-local return, its
+     value is answered from `signal` — the resumption path (E3)."
+    signal ^ <Object> [
+        | found depth block result |
+        found := Exception findHandlerFor: self.
+        found isNil ifTrue: [ ^self unhandled ].
+        depth := (found at: 1) - 1.
+        block := found at: 2.
+        result := [ Exception popHandlerTo: depth. block value: self ]
+                      ensure: [ ].
+        ^result
+    ]
+
+    "No handler matched. v1 keeps EXACTLY the old behaviour — the computation
+     stops with a reported error — so a world that signals but never handles
+     is no worse off than one that called `self error:` directly, and every
+     existing gate keeps its meaning."
+    unhandled ^ <Object> [
+        "asString on the class name: it is a Symbol, and Symbols are
+         immutable — , would try to build in place and raise inside the
+         error reporter itself (found by testing the unhandled path)."
+        ^self error: self class name asString , ': ' , self report
+    ]
+
+    "Is the receiver resumable? Nothing resumes in E1; the accessor exists so
+     E3 has one place to change and so handlers can ask honestly."
+    isResumable ^ <Boolean> [ ^false ]
+]
+
+"── the standard kinds ───────────────────────────────────────────────────
+ Deliberately small. Each exists because the world's own library already
+ fails in exactly this way and currently has no way to say so."
+
+Exception subclass: Error [
+    description ^ <String> [ ^'An error occurred' ]
+]
+
+Error subclass: ZeroDivide [
+    description ^ <String> [ ^'Division by zero' ]
+]
+
+Error subclass: MessageNotUnderstood [
+    | message receiver |
+    message ^ <Object> [ ^message ]
+    message: m <Object> ^ <MessageNotUnderstood> [ message := m. ^self ]
+    receiver ^ <Object> [ ^receiver ]
+    receiver: r <Object> ^ <MessageNotUnderstood> [ receiver := r. ^self ]
+    description ^ <String> [ ^'Message not understood' ]
+]
+
+Error subclass: KeyNotFound [
+    | key |
+    key ^ <Object> [ ^key ]
+    key: k <Object> ^ <KeyNotFound> [ key := k. ^self ]
+    description ^ <String> [ ^'Key not found' ]
+]
+
+Error subclass: IndexOutOfBounds [
+    | index |
+    index ^ <Object> [ ^index ]
+    index: i <Object> ^ <IndexOutOfBounds> [ index := i. ^self ]
+    description ^ <String> [ ^'Index out of bounds' ]
+]
+
+Error subclass: InvalidArgument [
+    description ^ <String> [ ^'Invalid argument' ]
+]
+
+"Resumable by design — the ANSI distinction that keeps the dangerous case
+ opt-in. Nothing resumes until E3; `isResumable` answering true here is the
+ declaration, not the mechanism."
+Exception subclass: Warning [
+    description ^ <String> [ ^'Warning' ]
+    isResumable ^ <Boolean> [ ^true ]
+]
+
+"── E1: the protected block ──────────────────────────────────────────────"
+
+"Re-opened, the world's own idiom for adding methods to an existing class
+ (59_reflection.mst does the same) — a redeclaration carrying only the new
+ method, not a redefinition."
+Object subclass: BlockClosure [
+    "Run me, and if I signal an exception that is a kind of `anExceptionClass`,
+     run `aHandlerBlock` with it and answer ITS value from this `on:do:`.
+
+     The pushed wrapper's `^` is what does the returning: its home is THIS
+     activation, so the existing non-local-return unwinder walks back from
+     wherever the signal happened, running every `ensure:`/`ifCurtailed:`
+     block in between, and lands here. The `ensure:` below pops the handler
+     on every exit path — normal, non-local, or curtailed."
+    on: anExceptionClass <Object> do: aHandlerBlock <[Object,^Object]> ^ <Object> [
+        | depth |
+        depth := Exception pushHandler: anExceptionClass
+                           block: [ :ex | ^aHandlerBlock value: ex ].
+        ^[ self value ] ensure: [ Exception popHandlerTo: depth ]
+    ]
+]
