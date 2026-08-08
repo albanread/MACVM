@@ -337,7 +337,90 @@ from structural changes it can gate. So the recommendation is E0+E1 behind
 the existing differential gate, with E2–E4 judged on whether the library
 actually gets simpler — measured, as usual, rather than assumed.
 
-## 6. OPEN BUG — `retry` fails once `on:do:` is JIT-compiled
+## 6. ROOT-CAUSED — the `retry` failure is a bci-0 loop-header miscompile
+
+**Found 2026-08-08 by the differential gate; root-caused later the same day.
+The bug is not in the exception world and not in value dispatch — §6 as
+first committed blamed the wrong subsystem, kept here only as a record of
+the misdiagnosis. The differential gate stays RED until the compiler fix
+lands.**
+
+**The actual bug (tier-1 compiler, all-methods): a method or block whose
+FIRST statement is a `whileTrue:`-family loop has its loop condition at
+bci 0, so the ENTRY BLOCK is its own loop header. The compiled back edge
+targets the entry block's label, which is bound BEFORE the entry block's
+`Ir::Param` spill/materialization preamble — so every loop re-entry
+re-executes**
+
+```
+stur x0, [x29,#-8]    ; "spill self"  — but x0 is now a dead value
+mov  x21, x0
+stur x1, [x29,#-16]   ; clobbers arg1's slot
+mov  x23, x1
+...
+```
+
+**with long-dead argument registers, overwriting `self` and every argument
+(slot AND resident) with whatever x0/x1/x2 happen to hold at the back
+edge.** In `on:do:` the compiler even loads `nil` into x0 (the value of the
+untaken `ifFalse:`) right before the jump — hence the nil receiver.
+
+Two reproducers, both committed:
+
+- `scripts/repro-retry-jit.mst` — the original: warm `on:do:` sixty times,
+  then one `retry`. `MACVM_JIT=off` → `RETRY OK`;
+  `MACVM_JIT=threshold=20` → `Error: does not understand value`.
+- `scripts/repro-bci0-loop.mst` — the MINIMAL form, no exceptions at all:
+  `run: a [ [ BciZeroLoop tick ] whileTrue: [ 7 printString ]. ^a ]`
+  answers `7` on every call interpreted, and once compiled answers `'7'`
+  — the string left in x1 by the body's `printString` — from the very
+  first compiled call. If the loop condition reads corruptible frame
+  state instead, the loop goes infinite (the first form of this repro
+  hung at 99.8% CPU).
+
+**Why exceptions found it first:** `on:do:`'s loop body ends in
+`ifFalse: [ ^r ]`, so in ordinary use the loop exits on iteration 1 and
+the back edge is COLD — it executes for the first time ever when a real
+`retry` makes the loop go around again. Sixty warm iterations compile the
+method without ever running the back edge; the first retry then corrupts
+the frame, the fused `self class` klass guard sees nil and traps, and the
+deopt faithfully materializes the already-poisoned slots
+(`recv=FrameSlot(-8)` reading `0x300000001` = nil). Counter benchmarks
+survive because `to:do:` loops emit init bytecode before the loop (header
+is never bci 0), and the odd send-free bci-0 `whileTrue:` corrupts slots
+nothing ever reads again.
+
+**How it was pinned:** a software watchpoint on the compiled `on:do:`
+frame's receiver slot (armed at the c2i seam, checked at every tier
+boundary and interpreted send) proved the slot held the closure through
+the ENTIRE interpreted signal/retry drama — including the NLR unwind, the
+c2i return, and `continue_unwind`'s home delivery — and flipped to nil
+only between the c2i return and the trap. Disassembly of nmethod 32 then
+showed the back edge: `b -0x51c` landing at `+0x60` (the param preamble)
+instead of `+0x78` (the loop condition).
+
+**Exonerated along the way:** the value-dispatch fast path
+(`stub_value_dispatch`/`rt_value_target` — §6's original suspect), GC
+(bug reproduces identically with a 512M eden and zero scavenges), the NLR
+escape/park machinery, deopt frame materialization (its `FrameSlot(-8)`
+read was CORRECT — the slot really held nil by then), and the exception
+world itself.
+
+**The fix (not yet attempted — needs its own gating run):** in
+`compiler/ir.rs::convert`, when `cfg.blocks[0].is_loop_header`, emit the
+Param/closure/nil-init preamble into a synthetic entry block that falls
+through to a fresh IR block holding bytecode-block-0's real code, and
+retarget back edges (and any OSR entry resolving to bci 0) at the new
+block. A lighter alternative — binding a second "jump target" label after
+the preamble in emit — fixes the control flow but leaves the preamble
+inside the loop's position range for regalloc's loop-widening analysis;
+the split is the structurally honest form. Gate: full world suite off vs
+threshold=20 differential, GC-stress, deopt-stress, benchmarks, plus both
+repros above as regression tests.
+
+---
+
+### §6 as first committed (misdiagnosis, kept for the record)
 
 **Found 2026-08-08 by the differential gate, which is currently RED.** The
 world suite is 7701/0 under `MACVM_JIT=off` and **crashes under
