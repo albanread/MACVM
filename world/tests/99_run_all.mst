@@ -59,4 +59,5 @@ TestRunner run: CollectionCompletionTests.
 TestRunner run: NumericCompletionTests.
 TestRunner run: ClockCompletionTests.
 TestRunner run: ExceptionVerbTests.
+TestRunner run: ExceptionResumeTests.
 TestRunner report.

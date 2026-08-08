@@ -45,7 +45,7 @@ Object subclass: Exception [
      raised from inside a handler cannot clobber the outer one's routes —
      and `pass`, which deliberately re-signals the SAME exception outward,
      captures its own pair first."
-    | messageText handlerReturn handlerRetry |
+    | messageText handlerReturn handlerRetry handlerResume |
     <classVars: Handlers RetryToken>
 
     "── the handler stack ────────────────────────────────────────────────
@@ -72,6 +72,19 @@ Object subclass: Exception [
         self handlers add:
             (Array with: aClass with: aBlock with: aReturnBlock with: aRetryBlock).
         ^self handlers size - 1
+    ]
+
+    "The entries from `anIndex` to the top, in order — captured before a
+     signal pops them so a resume can put them back (see signal)."
+    Exception class >> handlersFrom: anIndex [
+        | hs out |
+        hs := self handlers.
+        out := OrderedCollection new.
+        anIndex to: hs size do: [ :i | out add: (hs at: i) ].
+        ^out
+    ]
+    Exception class >> restoreHandlers: aCollection [
+        aCollection do: [ :e | self handlers add: e ]
     ]
 
     "A private singleton meaning 'the handler asked to retry'. Compared with
@@ -147,7 +160,7 @@ Object subclass: Exception [
      here at all. If the handler answers WITHOUT a non-local return, its
      value is answered from `signal` — the resumption path (E3)."
     signal ^ <Object> [
-        | found depth entry result |
+        | found depth entry result popped |
         found := Exception findHandlerFor: self.
         found isNil ifTrue: [ ^self unhandled ].
         depth := (found at: 1) - 1.
@@ -156,6 +169,18 @@ Object subclass: Exception [
          retry and pass all reach the protected activation through them."
         handlerReturn := entry at: 3.
         handlerRetry := entry at: 4.
+        "E3: the resume route. Its `^` returns from THIS signal activation,
+         which is the whole trick — pass 1 never unwound, so the signalling
+         frame is still live and answering here continues it. Nothing else in
+         the system can offer this, and it is why E1 chose two-pass.
+
+         Resumption also carries an obligation the other verbs do not: we are
+         about to pop this handler and every inner one, but resuming returns
+         INSIDE all of them, where they must still be armed. So the popped
+         slice is captured first and put back on the way out — otherwise a
+         second signal after a resume would find no handler."
+        popped := Exception handlersFrom: depth + 1.
+        handlerResume := [ :v | Exception restoreHandlers: popped. ^v ].
         Exception popHandlerTo: depth.
         result := (entry at: 2) value: self.
         "The handler fell off its end. ANSI's default action is to `return:`
@@ -227,6 +252,20 @@ Error subclass: InvalidArgument [
 Exception subclass: Warning [
     description ^ <String> [ ^'Warning' ]
     isResumable ^ <Boolean> [ ^true ]
+
+    "An unhandled Warning REPORTS and CARRIES ON, answering nil — the ANSI
+     default action for a resumable exception, and the thing that makes a
+     Warning worth having: a warning that killed the computation when nobody
+     was listening would just be an Error with a friendlier name.
+
+     This is the one place E3 changes what an unhandled signal does, and it
+     is safe to do here because Warning is new in E0 and nothing in the world
+     signals one yet — the compatibility hinge (E4: VM errors behave exactly
+     as today when unhandled) is untouched."
+    unhandled ^ <Object> [
+        Transcript showCr: 'Warning: ' , self report.
+        ^nil
+    ]
 ]
 
 "── E2: the handler verbs ────────────────────────────────────────────────
@@ -274,9 +313,27 @@ Object subclass: Exception [
     ]
 
     "Like pass, but if the outer handler RESUMES, control returns to THIS
-     handler with its value instead of leaving. Until E3 nothing resumes, so
-     today the two differ only in that."
+     handler with its value instead of leaving — the difference E3 makes
+     real."
     outer ^ <Object> [ ^self signal ]
+
+    "── E3: resumption (docs/exceptions_design.md E3) ────────────────────
+
+     Abandon the handler and CONTINUE THE SIGNALLING EXPRESSION, which
+     answers aValue. `Warning signal` in the middle of a computation becomes
+     an expression whose value the handler chooses.
+
+     Gated on isResumable — the ANSI rule, and the reason Warning declares
+     itself resumable while Error does not. Resuming an Error would return
+     control to code that had just declared itself unable to continue, so
+     the attempt is refused rather than obeyed."
+    resume: aValue <Object> ^ <Object> [
+        self isResumable ifFalse: [
+            ^Error signal: self class name asString , ' is not resumable' ].
+        handlerResume isNil ifTrue: [ ^Error signal: 'resume: outside a handler' ].
+        ^handlerResume value: aValue
+    ]
+    resume ^ <Object> [ ^self resume: nil ]
 
     "Signal me with a message text — the instance-side twin of the class-side
      `Error signal:` that E0 specified and never got."

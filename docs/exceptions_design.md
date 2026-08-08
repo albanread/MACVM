@@ -159,11 +159,40 @@ keep resumption open is clearly right.
   so they live in an Exception block RE-OPENED after the subclasses — the
   same reason the file re-opens `BlockClosure` at the end rather than
   declaring it early.
-- **E3 — `resume:`.** Only reachable because E1 chose two-pass: pass 1 has not
-  unwound, so the signalling frame is still live and can be continued with the
-  handler's value. Restricted to exceptions that declare themselves resumable
-  (`Warning`, not `Error`) — the ANSI rule, and it keeps the dangerous case
-  opt-in.
+- **E3 — `resume:`. BUILT.** The prediction held exactly: because pass 1
+  never unwound, the signalling frame is still live, and resuming is a third
+  escape route rather than a new mechanism. `resume:`'s block is created
+  inside `signal` itself, so its `^` returns from that `signal` activation —
+  which IS continuing the signalling expression. Still no VM change.
+
+  Resumption carries one obligation the terminating verbs do not, and it is
+  the part a naive implementation gets wrong because a single resume works
+  without it. `signal` pops the chosen handler and every inner one before
+  running the handler (E1's re-entrancy rule), but resuming returns INSIDE
+  all of them, where they must still be armed. So the popped slice is
+  captured first and restored on the way out. A SECOND signal after a resume
+  is what exposes its absence — hence `testHandlerStaysArmedAfterResume` and
+  `testInnerHandlersSurviveResume`.
+
+  `ensure:` correctly does NOT run on a resume, and this is by construction
+  rather than by care: nothing unwinds, so there is nothing to run. The test
+  asserts it against the contrasting terminating case in the same method.
+
+  Gated on `isResumable` — `Warning` yes, `Error` no — and the refusal is a
+  reportable error rather than a silent no-op.
+
+  One behaviour change, confined to `Warning`: an unhandled `Warning` now
+  reports and answers nil instead of terminating. That is ANSI's default
+  action for a resumable exception, and it is what makes `Warning` worth
+  having — a warning that killed the computation when nobody was listening
+  would just be an `Error` with a friendlier name. Safe because `Warning`
+  arrived in E0 and nothing in the world signals one yet; **the compatibility
+  hinge is untouched** — `Error` and the VM's own failures behave exactly as
+  before.
+
+  E2's `outer` also becomes meaningful here: it is the verb that comes back
+  when the enclosing handler resumes, which is precisely what distinguishes
+  it from `pass`.
 - **E4 — the VM's own errors become signals.** `prim_error`, `dnu_fallback`,
   division by zero, index errors: each signals its class **and, if no handler
   matches, does exactly what it does today** — print, PROBE dossier,

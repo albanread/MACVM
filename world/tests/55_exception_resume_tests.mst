@@ -1,0 +1,212 @@
+"55_exception_resume_tests.mst — gates E3, resumption
+ (docs/exceptions_design.md E3). world/tests/50 gates E0+E1 and 54 gates the
+ E2 verbs; this file adds only what resumption introduces.
+
+ Resumption is the one action that does not leave the protected block, so
+ the claims worth testing are all about what must NOT happen:
+
+ - nothing unwinds, so `ensure:` blocks between the signal and the handler
+   must NOT run when the handler resumes;
+ - control returns INSIDE every handler that was popped to reach this one,
+   so those handlers must still be armed afterwards — the obligation the
+   terminating verbs never had, and the one a naive implementation misses
+   because a single resume still works without it;
+ - an Error must refuse to resume, because resuming would hand control back
+   to code that had just declared itself unable to continue."
+
+TestCase subclass: ExceptionResumeTests [
+    runAll [
+        self runTest: #testSignalExpressionAnswersResumeValue
+             do: [ self testSignalExpressionAnswersResumeValue ].
+        self runTest: #testExecutionContinuesAfterSignal
+             do: [ self testExecutionContinuesAfterSignal ].
+        self runTest: #testEnsureDoesNotRunOnResume
+             do: [ self testEnsureDoesNotRunOnResume ].
+        self runTest: #testHandlerStaysArmedAfterResume
+             do: [ self testHandlerStaysArmedAfterResume ].
+        self runTest: #testInnerHandlersSurviveResume
+             do: [ self testInnerHandlersSurviveResume ].
+        self runTest: #testErrorRefusesToResume do: [ self testErrorRefusesToResume ].
+        self runTest: #testResumeOutsideAHandler do: [ self testResumeOutsideAHandler ].
+        self runTest: #testOuterCarriesResumptionInward
+             do: [ self testOuterCarriesResumptionInward ].
+        self runTest: #testPassForwardsResumption do: [ self testPassForwardsResumption ].
+        self runTest: #testUnhandledWarningResumesNil
+             do: [ self testUnhandledWarningResumesNil ].
+        self runTest: #testManyResumesCostNoStack
+             do: [ self testManyResumesCostNoStack ].
+        self runTest: #testResumeAndRetryCompose do: [ self testResumeAndRetryCompose ].
+        self runTest: #testStackEmptyAfterResumePaths
+             do: [ self testStackEmptyAfterResumePaths ].
+    ]
+
+    "The signal becomes an EXPRESSION whose value the handler chooses — the
+     thing no terminating verb can do."
+    testSignalExpressionAnswersResumeValue [
+        self assert: ([ (Warning signal: 'w') + 1 ] on: Warning do: [ :w | w resume: 41 ])
+                     equals: 42.
+        self assert: ([ Warning signal ] on: Warning do: [ :w | w resume ]) equals: nil.
+        self assert: ([ (Warning signal) , '!' ] on: Warning do: [ :w | w resume: 'hi' ])
+                     equals: 'hi!'
+    ]
+
+    testExecutionContinuesAfterSignal [
+        | log r after |
+        log := OrderedCollection new. after := false.
+        r := [ log add: #before. Warning signal. log add: #after. #done ]
+                on: Warning do: [ :w | log add: #handler. w resume: nil. after := true. #never ].
+        self assert: log asArray equals: #(#before #handler #after).
+        self assert: r equals: #done.
+        "resume: abandons the rest of the handler, like the other verbs"
+        self deny: after
+    ]
+
+    "Nothing unwound, so the ensure: between the signal and the handler must
+     not fire until the protected block finishes normally."
+    testEnsureDoesNotRunOnResume [
+        | log |
+        log := OrderedCollection new.
+        [ [ Warning signal. log add: #afterSignal ] ensure: [ log add: #ensure ] ]
+            on: Warning do: [ :w | w resume: nil ].
+        self assert: log asArray equals: #(#afterSignal #ensure).
+        "contrast: a TERMINATING handler runs the ensure straight away, and
+         #afterSignal never happens at all"
+        log := OrderedCollection new.
+        [ [ Warning signal. log add: #afterSignal ] ensure: [ log add: #ensure ] ]
+            on: Warning do: [ :w | w return: nil ].
+        self assert: log asArray equals: #(#ensure)
+    ]
+
+    "signal pops this handler and every inner one before running it, but
+     resuming returns INSIDE them all — so they have to be put back. A single
+     resume works either way; only a SECOND signal exposes a missing
+     restoration."
+    testHandlerStaysArmedAfterResume [
+        | log |
+        log := OrderedCollection new.
+        [ Warning signal: 'a'. Warning signal: 'b'. Warning signal: 'c' ]
+            on: Warning do: [ :w | log add: w messageText. w resume: nil ].
+        self assert: log asArray equals: #('a' 'b' 'c')
+    ]
+
+    "The same obligation for handlers INNER to the resuming one: control
+     lands back inside them."
+    testInnerHandlersSurviveResume [
+        | r log |
+        log := OrderedCollection new.
+        r := [ [ Warning signal: 'w'.
+                 "the inner handler must still be armed here"
+                 [ ZeroDivide signal ] on: ZeroDivide do: [ :z | log add: #innerRan. #zd ] ]
+                 on: ZeroDivide do: [ :z | #wrongHandler ] ]
+                on: Warning do: [ :w | w resume: nil ].
+        self assert: log asArray equals: #(#innerRan).
+        self assert: r equals: #zd
+    ]
+
+    "ANSI: only exceptions that declare themselves resumable may resume.
+     Error does not, and the refusal is itself a reportable error rather
+     than a silent no-op."
+    testErrorRefusesToResume [
+        self assert: ([ [ Error signal: 'e' ] on: Error do: [ :e | e resume: 1 ] ]
+                        on: Error do: [ :e2 | e2 messageText ])
+                     equals: 'Error is not resumable'.
+        self assert: ([ [ ZeroDivide signal ] on: ZeroDivide do: [ :e | e resume: 1 ] ]
+                        on: Error do: [ :e2 | e2 messageText ])
+                     equals: 'ZeroDivide is not resumable'.
+        self assert: Warning new isResumable.
+        self deny: Error new isResumable
+    ]
+
+    testResumeOutsideAHandler [
+        self assert: ([ Warning new resume: 1 ] on: Error do: [ :e | e messageText ])
+                     equals: 'resume: outside a handler'
+    ]
+
+    "outer runs the enclosing handler and, if it resumes, comes BACK — which
+     is exactly what distinguishes outer from pass."
+    testOuterCarriesResumptionInward [
+        | innerContinued r |
+        innerContinued := false.
+        r := [ [ Warning signal ]
+                 on: Warning do: [ :w |
+                     | v |
+                     v := w outer.
+                     innerContinued := true.
+                     'inner got ' , v printString ] ]
+                on: Warning do: [ :w | w resume: 9 ].
+        self assert: r equals: 'inner got 9'.
+        self assert: innerContinued
+    ]
+
+    "pass does NOT come back: the outer resumption value becomes the value of
+     the inner on:do:, and the inner handler does not continue."
+    testPassForwardsResumption [
+        | innerContinued r |
+        innerContinued := false.
+        r := [ [ Warning signal ]
+                 on: Warning do: [ :w | w pass. innerContinued := true. #never ] ]
+                on: Warning do: [ :w | w resume: 3 ].
+        self assert: r equals: 3.
+        self deny: innerContinued
+    ]
+
+    "An unhandled resumable exception reports and CARRIES ON with nil — the
+     ANSI default action, and what makes Warning worth having at all. This is
+     the one place E3 changes unhandled behaviour, and it is confined to
+     Warning; Error's path is untouched."
+    testUnhandledWarningResumesNil [
+        | after |
+        after := false.
+        self assert: (Warning signal: 'nobody listening') equals: nil.
+        "and the computation is still running afterwards"
+        after := true.
+        self assert: after.
+        self assert: 1 + 1 equals: 2
+    ]
+
+    "Resuming returns from signal rather than growing anything, so a hot loop
+     of signal/resume must not accumulate stack or handler entries."
+    testManyResumesCostNoStack [
+        | total before |
+        before := Exception handlers size.
+        total := 0.
+        [ 1 to: 3000 do: [:i | total := total + (Warning signal: 'n') ] ]
+            on: Warning do: [ :w | w resume: 1 ].
+        self assert: total equals: 3000.
+        self assert: Exception handlers size equals: before
+    ]
+
+    "The two loop-shaped actions must compose: a retry re-runs the protected
+     block, inside which resumes still work."
+    testResumeAndRetryCompose [
+        | attempts resumes r |
+        attempts := 0. resumes := 0.
+        "Outer handler retries the whole inner expression; the inner handler
+         resumes a Warning on every attempt. Both loop-shaped actions run in
+         the same nest, each re-arming what the other needs."
+        r := [ [ attempts := attempts + 1.
+                 Warning signal: 'w'.
+                 attempts < 3 ifTrue: [ Error signal: 'again' ].
+                 attempts ]
+                 on: Warning do: [ :w | resumes := resumes + 1. w resume: nil ] ]
+                on: Error do: [ :e | e retry ].
+        self assert: attempts equals: 3.
+        self assert: resumes equals: 3.
+        self assert: r equals: 3
+    ]
+
+    testStackEmptyAfterResumePaths [
+        | before |
+        before := Exception handlers size.
+        [ Warning signal ] on: Warning do: [ :w | w resume: 1 ].
+        self assert: Exception handlers size equals: before.
+        [ [ Warning signal ] on: Warning do: [ :w | w outer ] ]
+            on: Warning do: [ :w | w resume: 1 ].
+        self assert: Exception handlers size equals: before.
+        [ [ Warning signal ] on: Warning do: [ :w | w pass ] ]
+            on: Warning do: [ :w | w resume: 1 ].
+        self assert: Exception handlers size equals: before.
+        Warning signal: 'unhandled, resumes nil'.
+        self assert: Exception handlers size equals: before
+    ]
+]
