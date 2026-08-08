@@ -910,6 +910,14 @@ pub struct IrMethod {
     /// receiver-ARG slot holds the CLOSURE, `activate_block_interp`'s own
     /// shape; the FP+4 receiver copy is derived as `copied[0]`).
     pub block_closure_vreg: Option<VReg>,
+    /// BUG E (docs/exceptions_design.md §6): `Some(id)` iff bytecode block 0
+    /// is a loop header (a method/block whose FIRST statement is a
+    /// `whileTrue:`-family loop) and `convert` split the entry — `id` is the
+    /// relocated block holding bytecode-block-0's real code. Back edges and
+    /// a bci-0 OSR entry target IT, never `BlockId(0)`, whose label sits
+    /// before the once-only Param/init preamble (re-executing that preamble
+    /// on loop re-entry respilled self/args from dead argument registers).
+    pub entry_split_header: Option<BlockId>,
     /// S14 step 7-II-b: the vregs holding M's promoted captured temps (one per
     /// ctx-slot) when M's heap Context is elided; empty otherwise.
     /// `build_deopt_metadata` records `CtxLoc::Elided` over their frame slots so
@@ -10954,8 +10962,6 @@ pub fn convert(
     let (entry_depth, _max_stack_depth) = compute_entry_depths(method, cfg);
     let sources = entry_stack_sources(cfg, &entry_depth);
 
-    let block_id = |i: BlockIndex| BlockId(i as u32);
-
     // S14 step 7-I / S24 A3: the escape pre-pass, iff M creates a literal
     // closure. Hoisted before the vreg allocation because A3b's
     // materialize-vs-elide decision below depends on it.
@@ -11102,6 +11108,32 @@ pub fn convert(
         escape,
         temp_sites: vec![None; method.argc() + method.ntemps()],
         pending_jump_target: None,
+    };
+
+    // BUG E (docs/exceptions_design.md §6): bytecode block 0 is a jump-back
+    // target — the method's FIRST statement is a `whileTrue:`-family loop, so
+    // the entry block IS its own loop header. The entry preamble (Param
+    // spills, temp/ctx init, block-env loads) must run ONCE, outside the
+    // loop: emit it into the synthetic entry `BlockId(0)` and relocate
+    // bytecode-block-0's real code into a fresh block that every back edge
+    // (and a bci-0 OSR entry, via `entry_split_header`) targets instead.
+    // Without the split, the back edge lands on the entry label — bound
+    // BEFORE the preamble — and every loop re-entry respills self/args from
+    // long-dead argument registers (the retry/JIT divergence's root cause).
+    let body0: Option<BlockId> = if cfg.blocks[0].is_loop_header {
+        Some(t.fresh_block_id())
+    } else {
+        None
+    };
+    // Bytecode block index -> IR BlockId. Identity except for a split entry,
+    // where every reference to "block 0" (back-edge targets, `cur_id`, the
+    // entry-stack ownership tests below) means the RELOCATED body block —
+    // the synthetic entry is finished explicitly, by literal `BlockId(0)`.
+    let block_id = |i: BlockIndex| -> BlockId {
+        match (i, body0) {
+            (0, Some(b0)) => b0,
+            _ => BlockId(i as u32),
+        }
     };
 
     // Pre-allocate merge vregs for every block that needs them (D3.2) —
@@ -11368,6 +11400,21 @@ pub fn convert(
                         });
                     }
                 }
+            }
+
+            // BUG E: close the synthetic entry. The preamble above runs once,
+            // on real entry; bytecode-block-0's own code accumulates into the
+            // relocated `body0` block (which `block_id(0)` now names — the
+            // `cur_id` init below picks it up), and back edges land there.
+            if let Some(b0) = body0 {
+                code.push(Ir::Jump { target: b0 });
+                t.finish_block(IrBlock {
+                    id: BlockId(0),
+                    bci: cfg_block.bci_start,
+                    code: std::mem::take(&mut code),
+                    entry_stack: Vec::new(),
+                    deopt_sites: std::mem::take(&mut deopt),
+                });
             }
         }
 
@@ -11717,6 +11764,7 @@ pub fn convert(
         spliced_multibb: t.spliced_multibb,
         splice_declined_budget: t.splice_declined_budget,
         block_closure_vreg,
+        entry_split_header: body0,
         safepoints: Vec::new(),
         true_lit,
         false_lit,
@@ -12006,6 +12054,112 @@ mod tests {
         let m = b.finish(vm, sel, 1, 0);
         m.set_primitive(prim_id);
         m
+    }
+
+    /// BUG E (docs/exceptions_design.md §6): a method whose FIRST statement
+    /// is a `whileTrue:`-family loop has its loop condition at bci 0 — the
+    /// entry block is its own loop header. `convert` must split the entry:
+    /// the once-only Param/init preamble stays in `BlockId(0)`, bytecode-
+    /// block-0's real code relocates to `entry_split_header`, and NO branch
+    /// anywhere targets `BlockId(0)` (a back edge landing on the entry label
+    /// re-executed the param spills from dead argument registers — self and
+    /// every arg went nil/garbage on the second iteration).
+    #[test]
+    fn bci0_loop_header_splits_entry_preamble() {
+        let mut vm = test_vm();
+        let sel = vm.universe.intern(b"m");
+
+        // `m: a [ [ a ] whileTrue: [ self ] ]` — condition at bci 0.
+        let mut b = BytecodeBuilder::new();
+        let loop_head = b.new_label();
+        b.bind(loop_head);
+        b.push_temp(0); // bci 0 — the loop condition read
+        let exit = b.new_label();
+        b.br_false_fwd(exit);
+        b.push_self();
+        b.pop();
+        b.jump_back(loop_head);
+        b.bind(exit);
+        b.ret_self();
+        let method = b.finish(&mut vm, sel, 1, 0);
+
+        let cfg = decode::decode(method);
+        assert!(
+            cfg.blocks[0].is_loop_header,
+            "precondition: bci 0 must be a jump-back target"
+        );
+        let ir = convert(&vm, vm.universe.smi_klass, method, &cfg, None);
+        let split = ir
+            .entry_split_header
+            .expect("a bci-0 loop header must split the entry");
+
+        // The synthetic entry holds the Param preamble and hands off to the
+        // relocated block; the relocated block holds NO Param.
+        let entry = &ir.blocks[0];
+        assert!(
+            entry.code.iter().any(|op| matches!(op, Ir::Param { .. })),
+            "synthetic entry must carry the Param preamble"
+        );
+        assert!(
+            matches!(entry.code.last(), Some(Ir::Jump { target }) if *target == split),
+            "synthetic entry must end by jumping to the relocated block-0 body"
+        );
+        let body = &ir.blocks[split.0 as usize];
+        assert_eq!(body.bci, 0, "relocated body stands for bytecode block 0");
+        assert!(
+            body.code.iter().all(|op| !matches!(op, Ir::Param { .. })),
+            "the relocated body must not re-run any Param"
+        );
+
+        // The load-bearing invariant: nothing branches back to the entry.
+        for (i, blk) in ir.blocks.iter().enumerate() {
+            for op in &blk.code {
+                let targets: Vec<BlockId> = match op {
+                    Ir::Jump { target } => vec![*target],
+                    Ir::SmiCmpBr {
+                        if_true,
+                        if_false,
+                        fail,
+                        ..
+                    } => vec![*if_true, *if_false, *fail],
+                    Ir::BoolBr {
+                        if_true,
+                        if_false,
+                        not_bool,
+                        ..
+                    } => vec![*if_true, *if_false, *not_bool],
+                    Ir::FCmpBr {
+                        if_true, if_false, ..
+                    } => vec![*if_true, *if_false],
+                    _ => continue,
+                };
+                assert!(
+                    targets.iter().all(|t| t.0 != 0),
+                    "block {i} branches to the synthetic entry"
+                );
+            }
+        }
+
+        // Control: a loop that does NOT start at bci 0 needs no split.
+        let mut b2 = BytecodeBuilder::new();
+        b2.push_self();
+        b2.pop(); // real bytecode before the loop
+        let head2 = b2.new_label();
+        b2.bind(head2);
+        b2.push_temp(0);
+        let exit2 = b2.new_label();
+        b2.br_false_fwd(exit2);
+        b2.push_self();
+        b2.pop();
+        b2.jump_back(head2);
+        b2.bind(exit2);
+        b2.ret_self();
+        let sel2 = vm.universe.intern(b"m2");
+        let method2 = b2.finish(&mut vm, sel2, 1, 0);
+        let cfg2 = decode::decode(method2);
+        assert!(!cfg2.blocks[0].is_loop_header);
+        let ir2 = convert(&vm, vm.universe.smi_klass, method2, &cfg2, None);
+        assert_eq!(ir2.entry_split_header, None);
     }
 
     /// S14 step 2/3: `convert` annotates each real (non-inlined, non-trapped)

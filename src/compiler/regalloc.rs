@@ -1361,6 +1361,7 @@ mod tests {
             ntemps: 0,
             ctx_vregs: Vec::new(),
             block_closure_vreg: None,
+            entry_split_header: None,
             method_ctx_vreg: None,
             spliced_nlr: 0,
             spliced_multibb: 0,

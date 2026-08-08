@@ -1,0 +1,44 @@
+"repro-bci0-loop.mst — MINIMAL form of the retry/JIT divergence (no
+ exceptions involved). A method whose FIRST statement is a whileTrue: has
+ its loop condition at bci 0, so the ENTRY BLOCK is the loop header: the
+ compiled back edge re-executes the entry block's param spills
+ (stur x0/[fp-8], stur x1/[fp-16], ...) with long-dead argument
+ registers, corrupting self and every arg on the second iteration.
+
+ The loop CONDITION deliberately reads class-side state (immune to the
+ frame corruption) so the loop terminates either way; `^a` then exposes
+ the clobbered argument slot.
+
+ Interpreted / MACVM_JIT=off:   every call answers 7 -> 'bad calls: 0'.
+ MACVM_JIT=threshold=20:        once run: compiles, iteration 2 has
+                                already overwritten a's slot -> WRONG."
+
+Object subclass: BciZeroLoop [
+    <classVars: Ticks>
+
+    BciZeroLoop class >> reset: n [ Ticks := n ]
+    "Answer true while ticks remain, consuming one — bci-0-safe condition."
+    BciZeroLoop class >> tick [
+        Ticks := Ticks - 1.
+        ^Ticks >= 0
+    ]
+
+    run: a [
+        [ BciZeroLoop tick ] whileTrue: [ 7 printString ].
+        ^a
+    ]
+]
+
+[ | r bad |
+  bad := 0.
+  1 to: 40 do: [ :k |
+      | o |
+      BciZeroLoop reset: 3.
+      o := BciZeroLoop new.
+      r := o run: 7.
+      r = 7 ifFalse: [
+          bad := bad + 1.
+          bad < 4 ifTrue: [
+              Transcript showCr: 'WRONG at call ' , k printString ] ] ].
+  Transcript showCr: 'bad calls: ' , bad printString.
+  Transcript showCr: 'final ' , r printString ] value.

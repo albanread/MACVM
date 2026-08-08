@@ -1005,11 +1005,20 @@ fn compile_method_full(
             .blocks
             .iter()
             .position(|b| b.bci_start == bci as usize)?;
-        let header = crate::compiler::ir::BlockId(header_ix as u32);
-        let header_pos = *regalloc_result
-            .block_start_pos
-            .get(&header_ix.try_into().ok()?)?;
-        let entry_stack = &ir_method.blocks[header_ix].entry_stack;
+        // BUG E (docs/exceptions_design.md §6): a bci-0 loop header's real
+        // code lives in the RELOCATED block — the synthetic entry
+        // (`BlockId(0)`) holds only the once-only Param/init preamble, and
+        // an OSR entry jumping there would respill the transferred state
+        // from dead argument registers exactly like the back-edge bug.
+        let header = if header_ix == 0 {
+            ir_method
+                .entry_split_header
+                .unwrap_or(crate::compiler::ir::BlockId(0))
+        } else {
+            crate::compiler::ir::BlockId(header_ix as u32)
+        };
+        let header_pos = *regalloc_result.block_start_pos.get(&header.0)?;
+        let entry_stack = &ir_method.blocks[header.0 as usize].entry_stack;
 
         // S24 L2 step 3 tripwire T9: the whole phase-A envelope leans on the
         // invariant that a loop HEADER's entry stack never holds an

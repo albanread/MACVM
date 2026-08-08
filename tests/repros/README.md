@@ -640,6 +640,36 @@ ports; the benchmarks' own 4-mode gates stay red until these are fixed):
     `TestRunner>>report` (the sole quit:-ing method) the first COMPILED one
     to quit through a deopt reexecution. Both gated on `vm.exit_requested`.
 
+10. bci0_loop_header_param_respill.mst — BUG E (JIT correctness, silent
+    wrong results / infinite loops; found via the exception world's `retry`,
+    docs/exceptions_design.md §6). **FIXED** (`ir::convert`'s entry split;
+    unit test `compiler::ir::tests::bci0_loop_header_splits_entry_preamble`).
+
+    A method or block whose FIRST statement is a `whileTrue:`-family loop
+    has its loop condition at bci 0, so the ENTRY BLOCK is its own loop
+    header. The compiled back edge targeted the entry label — bound BEFORE
+    the entry block's `Ir::Param` spill/materialization preamble — so every
+    loop re-entry re-executed the param spills from long-dead argument
+    registers, overwriting `self` and every argument (slot AND register
+    resident) with whatever x0/x1/x2 held at the back edge. A bci-0 OSR
+    entry had the same hole (`driver`'s OSR header now maps through
+    `IrMethod::entry_split_header`).
+
+    Why it hid: the back edge is COLD in the common shapes (`on:do:`'s
+    body exits via `^r` on iteration 1 — only a real `retry` ever loops),
+    `to:do:` loops emit init bytecode before the loop (header never at
+    bci 0), and a send-free bci-0 `whileTrue:` corrupts slots nothing
+    reads again. The exception world's `retry` was the first thing in the
+    tree to take such a back edge at all.
+
+    Gate: this repro answers `bad calls: 0 / final 7` under off AND
+    threshold=20 (pre-fix: 21 wrong calls answering `'7'` — the string
+    left in x1 by the body's `printString`); `scripts/repro-retry-jit.mst`
+    prints RETRY OK both tiers; full world suite byte-identical off vs
+    threshold=20 (7701/0); GC_STRESS=full:64 and DEOPT_STRESS=100 world
+    runs clean; both repros clean under GC_STRESS=1/full:64 and
+    DEOPT_STRESS=50.
+
 All repros above also reproduce (or, for BUG A/C, used to) via the full
 benchmarks:
   MACVM_JIT=threshold=1 ./target/release/macvm run world/bench/richards.mst  --world world
