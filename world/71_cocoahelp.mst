@@ -1234,7 +1234,7 @@ Press play. This is a temperature explorer: twelve landmarks from **absolute zer
 
 ```ui
 Object subclass: TempScale [
-    <classVars: Slider Name Readout Bar Fill>
+    <classVars: Slider Name Readout Bar Fill BarW>
     TempScale class >> stops [
         | t |
         t := OrderedCollection new.
@@ -1278,37 +1278,51 @@ Object subclass: TempScale [
         Name onMain setStringValue: (stop at: 1).
         Readout onMain setStringValue:
             c printString , '' C     '' , f printString , '' F     '' , k printString , '' K''.
-        w := 380 * i // self stops size.
+        w := BarW * i // self stops size.
         Fill onMain setFrame: (Array with: 0.0 with: 0.0 with: w asFloat with: 26.0).
         Fill onMain setFillColor: (self colorFor: c).
         Name onMain setTextColor: (self colorFor: c)
     ]
     TempScale class >> containerView [
-        | v holder delegate title |
+        "Fill the pane and lay out from the TOP. A view built at a fixed size
+         sits in the bottom-left corner of a big window, because AppKit''s
+         origin is bottom-left and nothing told it otherwise. Take the host''s
+         size, measure down from `h`, and pin each control with
+         maskMinYMargin (keep the distance to the top) so a resize behaves."
+        | v holder delegate title frame w h top |
+        frame := CocoaUI contentHost onMain frame.
+        w := frame at: 3. h := frame at: 4.
+        BarW := (w - 48) min: 560.
         v := ((Cocoa classNamed: ''NSView'') onMain alloc) onMain
-            initWithFrame: (Array with: 0.0 with: 0.0 with: 460.0 with: 260.0).
+            initWithFrame: (Array with: 0.0 with: 0.0 with: w with: h).
+        v onMain setAutoresizesSubviews: true.
+        top := h - 56.
         title := ((Cocoa classNamed: ''NSTextField'') onMain alloc) onMain
-            initWithFrame: (Array with: 24.0 with: 210.0 with: 400.0 with: 22.0).
+            initWithFrame: (Array with: 24.0 with: top with: 400.0 with: 22.0).
+        title onMain setAutoresizingMask: CocoaUI maskMinYMargin.
         title onMain setEditable: false. title onMain setBordered: false.
         title onMain setDrawsBackground: false.
         title onMain setStringValue: ''How hot is the universe?''.
         v onMain addSubview: title.
         Name := ((Cocoa classNamed: ''NSTextField'') onMain alloc) onMain
-            initWithFrame: (Array with: 24.0 with: 168.0 with: 400.0 with: 30.0).
+            initWithFrame: (Array with: 24.0 with: top - 44 with: 500.0 with: 30.0).
+        Name onMain setAutoresizingMask: CocoaUI maskMinYMargin.
         Name onMain setEditable: false. Name onMain setBordered: false.
         Name onMain setDrawsBackground: false.
         Name onMain setFont: ((Cocoa classNamed: ''NSFont'') onMain
                                   boldSystemFontOfSize: 22.0).
         v onMain addSubview: Name.
         Readout := ((Cocoa classNamed: ''NSTextField'') onMain alloc) onMain
-            initWithFrame: (Array with: 24.0 with: 140.0 with: 400.0 with: 22.0).
+            initWithFrame: (Array with: 24.0 with: top - 76 with: 500.0 with: 22.0).
+        Readout onMain setAutoresizingMask: CocoaUI maskMinYMargin.
         Readout onMain setEditable: false. Readout onMain setBordered: false.
         Readout onMain setDrawsBackground: false.
         Readout onMain setFont: ((Cocoa classNamed: ''NSFont'') onMain
                                      userFixedPitchFontOfSize: 14.0).
         v onMain addSubview: Readout.
         Bar := ((Cocoa classNamed: ''NSBox'') onMain alloc) onMain
-            initWithFrame: (Array with: 24.0 with: 100.0 with: 380.0 with: 26.0).
+            initWithFrame: (Array with: 24.0 with: top - 120 with: BarW with: 26.0).
+        Bar onMain setAutoresizingMask: CocoaUI maskMinYMargin.
         Bar onMain setBoxType: 4. Bar onMain setTitlePosition: 0.
         Bar onMain setFillColor: ((Cocoa classNamed: ''NSColor'') onMain
                                       quaternaryLabelColor).
@@ -1318,7 +1332,8 @@ Object subclass: TempScale [
         Fill onMain setBoxType: 4. Fill onMain setTitlePosition: 0.
         Bar onMain addSubview: Fill.
         Slider := ((Cocoa classNamed: ''NSSlider'') onMain alloc) onMain
-            initWithFrame: (Array with: 24.0 with: 60.0 with: 380.0 with: 24.0).
+            initWithFrame: (Array with: 24.0 with: top - 160 with: BarW with: 24.0).
+        Slider onMain setAutoresizingMask: CocoaUI maskMinYMargin.
         Slider onMain setMinValue: 1.0.
         Slider onMain setMaxValue: self stops size asFloat.
         Slider onMain setNumberOfTickMarks: self stops size.
