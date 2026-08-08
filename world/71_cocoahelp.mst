@@ -1668,7 +1668,27 @@ The UI runs a **supervisor beat** over worker VMs: your code runs in a worker, a
 
 ## The Cocoa bridge
 
-Smalltalk drives AppKit directly: `Cocoa classNamed:` plus ordinary message sends, marshalled to Objective-C; delegates and data sources come back through a ticket registry (`MacvmDelegate`) so native callbacks land as Smalltalk sends. The whole GUI — this browser included — is world code using that one door.
+Under the square brackets, Objective-C is **Smalltalk''s message-passing model bolted onto C** — Cox took the object model straight from Smalltalk-80. So Cocoa and this VM already agree on the one thing that matters: computation is objects sending each other messages. That makes the fit almost embarrassingly good. `Cocoa classNamed: ''NSWindow''` hands you the class as an ordinary object, and a keyword send simply *is* an Objective-C selector — `win makeKeyAndOrderFront: nil` means exactly what it reads as. The whole GUI — this browser, the editor, the debugger, this very page — is world code going through that one door.
+
+Nothing is declared in advance. Any send an `ObjcRef` doesn''t answer itself drops into `doesNotUnderstand:`, which turns the message into a real `objc_msgSend`: arguments cross by **copy** (a Smalltalk `String` becomes a fresh `NSString`, numbers convert, small structs like `CGRect` ride across as short Arrays), the call runs, and the result comes back wrapped or converted. So `(Cocoa classNamed: ''NSCalendar'') currentCalendar` just works — the live runtime is the authority on what methods exist, not a hand-written interface file. Where the two worlds genuinely disagree is **memory**, and that part is worth being honest about.
+
+### Two object worlds, two memory managers
+
+They disagree about nearly everything a pointer cares about. This VM **moves** objects — a scavenge slides them between generations, compaction relocates them — and decides life by reachability. Cocoa **never moves** an object and decides life by a **retain count**: a number some other piece of code bumps and drops. Hand Cocoa a raw Smalltalk pointer and the next GC relocates it out from under Cocoa; stash a bare `id` in a Smalltalk object and it either leaks forever or gets released twice and corrupts a runtime we don''t own.
+
+The rule that dissolves this is blunt: **the two collectors never see each other''s pointers.** A Cocoa reference lives in Smalltalk only inside an `ObjcRef`, which hides the raw `id` in its **byte tail** — the one region of an object the collector never scans. The GC is free to move the *wrapper*; Cocoa never moves the *target*; neither ever walks into the other''s graph. And the retain count earns its keep: it *is* the external root — Cocoa holding the object alive on our behalf, which is precisely what reference counting is for. The quiet headline of the whole design falls out of that: **the garbage collector is not modified at all.** No pin bits, no new roots, no scan hook — eight opaque bytes and a counter neither side shares.
+
+### Who retains, who releases
+
+Every `id` crossing *into* Smalltalk is **retained as it is wrapped**, so an `ObjcRef` always owns exactly one strong reference — which quietly defuses the classic autorelease-pool trap. Cocoa''s ownership rules are just conventions over selector names (`alloc`, `new`, `copy`, and `init` hand back something you already own), and the bridge mechanizes them the same way ARC''s compiler does, so `alloc init` never over-retains.
+
+Giving a reference back is either scoped or explicit. `Cocoa poolDo: [:pool | ... ]` runs a block and releases every `ObjcRef` minted inside it — the ordinary "make some objects, use them, drop them" case with zero manual bookkeeping. Or `ref release` releases now and **poisons the wrapper**: every later send through it fails cleanly instead of dereferencing freed memory. The bias is deliberate — a reference dropped without release *leaks* its one count, which is recoverable and shows up in a wrap/release census (`MACVM_TRACE=cocoa`), whereas an over-release would corrupt a runtime we can''t debug. When in doubt, the bridge leaks.
+
+### Callbacks and the main thread
+
+Cocoa also calls *back* — a button''s action, a window''s delegate — and that direction never gets an oop either. The Smalltalk handler is registered under a **ticket**: a plain integer index into a GC-rooted registry. A small native trampoline carries only that ticket, and when the event fires it posts `{event. ticket. args}` through the same worker inbox the rest of the system uses. The handler then runs **between doits, on the VM thread**, so a callback never interrupts a send half-way — the strictly-serial world the game loop and the workers already rely on stays intact.
+
+One last asymmetry: **AppKit is main-thread-only**, and the VM runs on its own thread. So a view or window message goes through `onMain` — `window onMain makeKeyAndOrderFront: nil` runs that one send on the main thread. Because main-to-VM traffic is always asynchronous (queued and drained on wake), VM-to-main is safe to do synchronously: no wait cycle can ever close, so there is no deadlock to design around.
 
 ## The game pane
 
