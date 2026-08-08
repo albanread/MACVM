@@ -42,6 +42,50 @@ impl Side {
             Side::Class => "class",
         }
     }
+
+    /// The stored `methods.side` text back to the enum. Anything other than
+    /// the CHECK-constrained `'class'` is instance side.
+    fn from_db(s: &str) -> Self {
+        if s == "class" {
+            Side::Class
+        } else {
+            Side::Instance
+        }
+    }
+}
+
+/// What a global "Revert to Previous Version" would act on — see
+/// [`Image::most_recent_undoable`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum UndoTarget {
+    Method {
+        class_name: String,
+        side: Side,
+        selector: String,
+        edited_at: i64,
+    },
+    Class {
+        class_name: String,
+        edited_at: i64,
+    },
+}
+
+impl UndoTarget {
+    /// A one-line human description for the transcript/menu report.
+    pub fn describe(&self) -> String {
+        match self {
+            UndoTarget::Method {
+                class_name,
+                side,
+                selector,
+                ..
+            } => match side {
+                Side::Class => format!("{class_name} class>>{selector}"),
+                Side::Instance => format!("{class_name}>>{selector}"),
+            },
+            UndoTarget::Class { class_name, .. } => format!("class {class_name}"),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -141,6 +185,10 @@ CREATE TABLE IF NOT EXISTS method_versions (
     UNIQUE(method_id, version_number)
 );
 CREATE INDEX IF NOT EXISTS idx_method_versions_latest ON method_versions(method_id, version_number DESC);
+CREATE TABLE IF NOT EXISTS meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS method_bytecode (
     method_version_id INTEGER PRIMARY KEY REFERENCES method_versions(version_id),
     bytecode           BLOB NOT NULL,
@@ -1277,6 +1325,131 @@ impl Image {
         self.insert_method_version(method_id, &category, &source, deleted != 0)?;
         self.prune_method_versions(method_id)?;
         Ok(true)
+    }
+
+    /// `meta` key holding the "everything at or before this `edited_at` is
+    /// SEED content, not a user edit" watermark — see [`Self::edit_baseline`].
+    const BASELINE_KEY: &'static str = "edit_baseline";
+
+    /// Stamp the edit baseline at NOW: every version already in the image
+    /// counts as seed content from here on. Called right after a seed/reseed
+    /// (`import::open_or_seed`, and the GUI's Revert World to Original).
+    pub fn stamp_edit_baseline(&self) -> rusqlite::Result<()> {
+        let now = now_secs();
+        self.conn.execute(
+            "INSERT INTO meta(key, value) VALUES(?1, ?2) \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![Self::BASELINE_KEY, now.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// The edit baseline: versions with `edited_at` at or before it are seed
+    /// content and are NEVER offered as something to revert.
+    ///
+    /// This matters because the world source legitimately redefines methods
+    /// (an early stub, then the real one — `Object>>doesNotUnderstand:`,
+    /// `Array>>at:` and 14 others land with two versions in a FRESH image).
+    /// Without the watermark, "revert the last change" on an untouched image
+    /// would restore one of those stubs — a destructive no-op-looking action
+    /// with nothing to do with anything the user did.
+    ///
+    /// An image seeded before this key existed gets one written lazily, from
+    /// its newest existing version: everything already there becomes the
+    /// baseline, and only later edits are revertable. Monotonic and safe.
+    fn edit_baseline(&self) -> rusqlite::Result<i64> {
+        let stored: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = ?1",
+                params![Self::BASELINE_KEY],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(v) = stored {
+            if let Ok(n) = v.parse::<i64>() {
+                return Ok(n);
+            }
+        }
+        let newest: i64 = self.conn.query_row(
+            "SELECT COALESCE(MAX(at), 0) FROM (\
+               SELECT MAX(edited_at) AS at FROM method_versions \
+               UNION ALL SELECT MAX(edited_at) AS at FROM class_versions)",
+            [],
+            |r| r.get(0),
+        )?;
+        self.conn.execute(
+            "INSERT INTO meta(key, value) VALUES(?1, ?2) \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![Self::BASELINE_KEY, newest.to_string()],
+        )?;
+        Ok(newest)
+    }
+
+    /// The most recently edited item that HAS something to revert to (two or
+    /// more versions on record) AND was edited after the seed baseline — what
+    /// a global "Revert to Previous Version" targets. `None` on a freshly
+    /// seeded image: its multi-version rows are all seed content.
+    ///
+    /// Methods and classes are ranked together by `edited_at`, breaking ties
+    /// on `version_id` so the newest write wins even within a clock tick.
+    pub fn most_recent_undoable(&self) -> rusqlite::Result<Option<UndoTarget>> {
+        let baseline = self.edit_baseline()?;
+        let method: Option<(String, String, String, i64, i64)> = self
+            .conn
+            .query_row(
+                "SELECT c.name, m.side, m.selector, mv.edited_at, mv.version_id \
+                 FROM method_versions mv \
+                 JOIN methods m ON m.method_id = mv.method_id \
+                 JOIN classes c ON c.class_id = m.class_id \
+                 WHERE mv.edited_at > ?1 \
+                   AND (SELECT COUNT(*) FROM method_versions v WHERE v.method_id = mv.method_id) >= 2 \
+                 ORDER BY mv.edited_at DESC, mv.version_id DESC LIMIT 1",
+                params![baseline],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .optional()?;
+        let class: Option<(String, i64, i64)> = self
+            .conn
+            .query_row(
+                "SELECT c.name, cv.edited_at, cv.version_id \
+                 FROM class_versions cv \
+                 JOIN classes c ON c.class_id = cv.class_id \
+                 WHERE cv.edited_at > ?1 \
+                   AND (SELECT COUNT(*) FROM class_versions v WHERE v.class_id = cv.class_id) >= 2 \
+                 ORDER BY cv.edited_at DESC, cv.version_id DESC LIMIT 1",
+                params![baseline],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        Ok(match (method, class) {
+            (None, None) => None,
+            (Some((cls, side, sel, at, _)), None) => Some(UndoTarget::Method {
+                class_name: cls,
+                side: Side::from_db(&side),
+                selector: sel,
+                edited_at: at,
+            }),
+            (None, Some((cls, at, _))) => Some(UndoTarget::Class {
+                class_name: cls,
+                edited_at: at,
+            }),
+            (Some((mc, side, sel, mat, mvid)), Some((cc, cat, cvid))) => {
+                if (mat, mvid) >= (cat, cvid) {
+                    Some(UndoTarget::Method {
+                        class_name: mc,
+                        side: Side::from_db(&side),
+                        selector: sel,
+                        edited_at: mat,
+                    })
+                } else {
+                    Some(UndoTarget::Class {
+                        class_name: cc,
+                        edited_at: cat,
+                    })
+                }
+            }
+        })
     }
 
     /// See `undo_method`'s doc comment — same "carry the restored version's

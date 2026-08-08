@@ -903,6 +903,83 @@ extern "C" fn imp_file_in_path(_this: *mut c_void, _cmd: *mut c_void, path: Id) 
     std::ptr::null_mut()
 }
 
+/// `revertLastChange` — Debug ▸ Revert to Previous Version and Reload. Walks
+/// the image's own version history back one step for the most recently edited
+/// method or class (`Image::most_recent_undoable` + `undo_method`/`undo_class`,
+/// which restore the previous source AS A NEW VERSION — nothing is destroyed,
+/// and the revert is itself undoable), then restarts the primary so the live
+/// world matches the image again. `OK <what>` / `ERR <why>`.
+extern "C" fn imp_revert_last_change(_this: *mut c_void, _cmd: *mut c_void) -> Id {
+    let img = match writer() {
+        Ok(i) => i,
+        Err(e) => return err(&e),
+    };
+    let target = match img.most_recent_undoable() {
+        Ok(Some(t)) => t,
+        Ok(None) => {
+            return err(
+                "nothing to revert — no class or method in the image has an earlier version \
+                 on record (a freshly seeded image starts at version 1)",
+            )
+        }
+        Err(e) => return err(&format!("cannot read version history: {e}")),
+    };
+    let what = target.describe();
+    let done = match &target {
+        image_store::UndoTarget::Method {
+            class_name,
+            side,
+            selector,
+            ..
+        } => img.undo_method(class_name, *side, selector),
+        image_store::UndoTarget::Class { class_name, .. } => img.undo_class(class_name),
+    };
+    match done {
+        Ok(true) => {
+            crate::primary_restart::request();
+            crate::objc::wake_main_runloop();
+            ok(&format!("reverted {what} to its previous version — reloading"))
+        }
+        Ok(false) => err(&format!("nothing to revert for {what}")),
+        Err(e) => err(&format!("revert of {what} failed: {e}")),
+    }
+}
+
+/// `revertWorldToOriginal` — Debug ▸ Revert World to Original. DESTRUCTIVE:
+/// deletes the image database and re-seeds it from the `world/*.mst` source,
+/// so everything you wrote in the Browser/Editor and never saved to a file is
+/// gone, and every class/method restarts at version 1 with no history. Code
+/// already graduated into a world file (File ▸ Add to World) SURVIVES — those
+/// files are the world. Restarts the primary onto the fresh image.
+/// `OK <summary>` / `ERR <why>`. The caller arms this behind a confirm.
+extern "C" fn imp_revert_world_to_original(_this: *mut c_void, _cmd: *mut c_void) -> Id {
+    let path = image_path();
+    // The image is opened PER CALL and never held across the run loop (see
+    // `writer`), so nothing is holding a connection to invalidate here. The
+    // -wal/-shm siblings must go too, or SQLite reopens the old content.
+    for p in [
+        path.clone(),
+        PathBuf::from(format!("{}-wal", path.display())),
+        PathBuf::from(format!("{}-shm", path.display())),
+    ] {
+        if p.exists() {
+            if let Err(e) = std::fs::remove_file(&p) {
+                return err(&format!("cannot remove {}: {e}", p.display()));
+            }
+        }
+    }
+    match image_store::import::open_or_seed(&world_dir(), &path) {
+        Ok(_) => {
+            crate::primary_restart::request();
+            crate::objc::wake_main_runloop();
+            ok("world reverted to its original source — image re-seeded, reloading")
+        }
+        Err(e) => err(&format!(
+            "re-seed failed: {e} (the image was removed; fix world/ and restart)"
+        )),
+    }
+}
+
 /// The first `(class name, world file)` where a class this file defines is
 /// ALREADY defined by a non-`user_` world file — i.e. adding it would write a
 /// shadowing fork. `None` when every class is new (or only re-adds an existing
@@ -1112,7 +1189,7 @@ pub fn register() {
     type Imp2 = extern "C" fn(*mut c_void, *mut c_void, Id, Id) -> Id;
     type Imp3 = extern "C" fn(*mut c_void, *mut c_void, Id, Id, Id) -> Id;
     type Imp4 = extern "C" fn(*mut c_void, *mut c_void, Id, Id, Id, Id) -> Id;
-    let methods: [(&str, *const c_void, &str); 44] = [
+    let methods: [(&str, *const c_void, &str); 46] = [
         ("colorizeWorkspaceStorage:", imp_colorize_workspace_storage as Imp1 as *const c_void, "@@:@"),
         ("addToWorldPath:", imp_add_to_world as Imp1 as *const c_void, "@@:@"),
         ("dbgReport", imp_dbg_report as Imp0 as *const c_void, "@@:"),
@@ -1129,6 +1206,8 @@ pub fn register() {
         ("requestOpenPanel", imp_request_open_panel as Imp0 as *const c_void, "@@:"),
         ("requestSavePanel", imp_request_save_panel as Imp0 as *const c_void, "@@:"),
         ("requestUiRebuild", imp_request_ui_rebuild as Imp0 as *const c_void, "@@:"),
+        ("revertLastChange", imp_revert_last_change as Imp0 as *const c_void, "@@:"),
+        ("revertWorldToOriginal", imp_revert_world_to_original as Imp0 as *const c_void, "@@:"),
         ("requestPrimaryRestart", imp_request_primary_restart as Imp0 as *const c_void, "@@:"),
         ("requestBrowserRefresh", imp_request_browser_refresh as Imp0 as *const c_void, "@@:"),
         ("requestBrowser2Refresh", imp_request_browser2_refresh as Imp0 as *const c_void, "@@:"),

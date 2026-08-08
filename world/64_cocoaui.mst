@@ -83,7 +83,8 @@ Object subclass: CocoaUI [
                 HaltOn HaltMenuItem MetricViews
                 WinToolbar ToolbarDelegate ToolbarItems MetricsHost
                 ToolbarIdentArray ToolbarSpecs ViewItemSpecs
-                Theme ThemeMenuItems>
+                Theme ThemeMenuItems
+                RevertArmed RevertLastItem RevertWorldItem>
 
     "The DISPLAY name, macOS house style (macOS/macVM) — not the binary,
      the bundle id, or the MACVM_* environment variables, which stay upper."
@@ -1148,11 +1149,84 @@ Object subclass: CocoaUI [
         debugMenu onMain addItem: HaltMenuItem.
         ToolbarDelegates add: jitDelegate.
 
+        "── recovery (both DESTRUCTIVE, so both ARM on the first click and act
+           on the second — the browser's arm/confirm rule; a modal NSAlert
+           would run a nested run loop inside this callback, which is exactly
+           the hazard this app avoids everywhere else). ──"
+        debugMenu onMain addItem: ((Cocoa classNamed: 'NSMenuItem') onMain separatorItem).
+        RevertLastItem := self debugItemTitled: 'Revert to Previous Version and Reload'
+                               in: debugMenu action: [ self revertLastChangePressed ].
+        RevertWorldItem := self debugItemTitled: 'Revert World to Original…'
+                                in: debugMenu action: [ self revertWorldPressed ].
+
         debugItem := ((Cocoa classNamed: 'NSMenuItem') onMain alloc) onMain
             initWithTitle: 'Debug' action: nil keyEquivalent: ''.
         debugItem onMain setSubmenu: debugMenu.
         mainMenu onMain addItem: debugItem.
         ^debugItem
+    ]
+
+    CocoaUI class >> debugItemTitled: aTitle in: aMenu action: aBlock [
+        "One Debug-menu item whose HANDLE we keep (its title flips to the
+         armed prompt and back), wired through its own action delegate."
+        | item holder delegate |
+        item := ((Cocoa classNamed: 'NSMenuItem') onMain alloc) onMain
+            initWithTitle: aTitle action: 'macvmAction:' keyEquivalent: ''.
+        holder := CocoaToolbarAction on: aBlock.
+        delegate := MacvmDelegate actionTargetOn: holder.
+        item onMain setTarget: delegate.
+        aMenu onMain addItem: item.
+        ToolbarDelegates add: delegate.
+        ^item
+    ]
+
+    CocoaUI class >> disarmRevert [
+        RevertArmed := nil.
+        RevertLastItem isNil ifFalse: [
+            RevertLastItem onMain setTitle: 'Revert to Previous Version and Reload' ].
+        RevertWorldItem isNil ifFalse: [
+            RevertWorldItem onMain setTitle: 'Revert World to Original…' ].
+    ]
+
+    CocoaUI class >> hostService [
+        ^((Cocoa classNamed: 'MacvmHostService') onMain alloc) onMain init
+    ]
+
+    CocoaUI class >> revertLastChangePressed [
+        "Walk the image's version history back one step for the most recently
+         edited class/method, then reload. NOT destructive — the undo restores
+         the previous source AS A NEW VERSION, so it is itself undoable — but
+         it does restart the primary, so it arms first like its neighbour."
+        | reply |
+        RevertArmed == #last ifFalse: [
+            self disarmRevert.
+            RevertArmed := #last.
+            ^RevertLastItem onMain setTitle: 'Really revert the last change?' ].
+        self disarmRevert.
+        reply := (Worker classNamed: #CocoaBrowser) readReply: (self hostService onMain revertLastChange).
+        self appendTranscript: 'revert: ' , (((Worker classNamed: #CocoaBrowser) isOk: reply)
+            ifTrue: [ (Worker classNamed: #CocoaBrowser) payloadOf: reply ]
+            ifFalse: [ 'FAILED — ' , ((Worker classNamed: #CocoaBrowser) errorOf: reply) ]).
+    ]
+
+    CocoaUI class >> revertWorldPressed [
+        "DESTRUCTIVE. Deletes the image database and re-seeds it from the
+         world/*.mst source: everything written in the Browser/Editor and never
+         saved to a file is GONE, and every class/method restarts at version 1
+         with no history. Code graduated into a world file (File ▸ Add to
+         World) survives — those files ARE the world. Two clicks, and the
+         armed title says exactly what will be lost."
+        | reply |
+        RevertArmed == #world ifFalse: [
+            self disarmRevert.
+            RevertArmed := #world.
+            ^RevertWorldItem onMain setTitle:
+                'Discard ALL image edits and re-seed from world source?' ].
+        self disarmRevert.
+        reply := (Worker classNamed: #CocoaBrowser) readReply: (self hostService onMain revertWorldToOriginal).
+        self appendTranscript: 'revert world: ' , (((Worker classNamed: #CocoaBrowser) isOk: reply)
+            ifTrue: [ (Worker classNamed: #CocoaBrowser) payloadOf: reply ]
+            ifFalse: [ 'FAILED — ' , ((Worker classNamed: #CocoaBrowser) errorOf: reply) ]).
     ]
     CocoaUI class >> toggleJit [
         "Flip the global JIT-compile switch and reflect it in the menu checkmark."

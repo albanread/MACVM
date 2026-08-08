@@ -413,6 +413,13 @@ fn cmd_seed(args: &[String]) {
     match image_store::import::import_all_lists(&image, &world_dir) {
         Ok(stats) => {
             let sends = image.backfill_method_sends().unwrap_or(0);
+            // Everything just imported is world genesis, not a user edit — so
+            // "Revert to Previous Version" can never walk back into it (the
+            // world source redefines a few methods, e.g. a stub then the real
+            // `Object>>doesNotUnderstand:`).
+            if let Err(e) = image.stamp_edit_baseline() {
+                eprintln!("seed: could not stamp the edit baseline: {e}");
+            }
             let lists = image.package_lists().unwrap_or_default();
             println!(
                 "seeded {} ({stats:?}, {sends} send-edges indexed, package lists: {lists:?})",

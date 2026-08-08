@@ -86,6 +86,13 @@ pub fn open_or_seed(world_dir: &Path, image_path: &Path) -> Result<Image, String
         .is_empty();
     if empty {
         let stats = import_all_lists(&image, world_dir)?;
+        // Everything just imported is SEED content, not a user edit — stamp
+        // the watermark so "Revert to Previous Version" can never walk back
+        // into it (the world source legitimately redefines a few methods, so
+        // some arrive with two versions already).
+        if let Err(e) = image.stamp_edit_baseline() {
+            eprintln!("image_store: could not stamp the edit baseline: {e}");
+        }
         eprintln!(
             "image_store: seeded {} from {} ({} classes, {} methods)",
             image_path.display(),
