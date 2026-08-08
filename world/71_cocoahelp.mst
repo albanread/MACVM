@@ -1670,6 +1670,28 @@ The UI runs a **supervisor beat** over worker VMs: your code runs in a worker, a
 
 Smalltalk drives AppKit directly: `Cocoa classNamed:` plus ordinary message sends, marshalled to Objective-C; delegates and data sources come back through a ticket registry (`MacvmDelegate`) so native callbacks land as Smalltalk sends. The whole GUI — this browser included — is world code using that one door.
 
+## The game pane
+
+Beside the tools is a **retro game pane**: a small, native, hardware-flavoured display for pixel-art games, built so a whole game is a page of Smalltalk. It is deliberately not a general graphics API — it gives you the handful of things an 8-bit machine gave you and nothing to get lost in.
+
+Underneath it is a **command stream, not a canvas**. Each drawing method is a thin wrapper over a numbered game primitive, and the primitive touches no pixels — it posts a `GameCommand` onto the VM-to-GUI channel, and the GUI, on its main thread, applies it to a native Metal (`CAMetalLayer`) pane. The VM never sees the GPU; it speaks a tiny command language and the native side rasterizes. In a headless VM every command is a silent no-op, so game code is harmless to load anywhere.
+
+### The palette
+
+Colours are **indices, not RGB** — the retro constraint that makes the look. A pixel is a number 0..255 that the pane maps through a 256-entry palette to a real colour. **Index 0 is transparent**; your colours live at **16..255**, and a fresh `GamePane` already holds a usable 16-colour set in slots 16..31 (before that, a beginner''s first `color: 1` drew nothing onto a black window — the least friendly thing the engine did). Redefine one entry with `paletteAt: i r: g: b:`, or swap the whole set for a real hardware palette: `pane palette: #c64` (also `#cga #spectrum #msx #gameboy #mono #default`). A per-scanline palette override is there too, for copper-bar and gradient tricks.
+
+### Drawing a frame
+
+The verbs are the ones you''d expect and no more: `cls:` clears to a colour, then `point:y:color:`, `line:y:to:y:color:`, `fill:y:width:height:color:`, `disc:y:radius:color:`. For a whole CPU-generated frame — a software renderer, a Mandelbrot, a tilemap — `blit:` overwrites the entire pane from one `ByteArray` of `width*height` palette indices in a single command, far cheaper than a plot per pixel. Whatever you draw, **`present` is what shows it**: it is the one moment a frame becomes visible, and inside the loop you must end every frame with it. The pane never presents mid-frame on its own, precisely so a half-drawn frame is never seen.
+
+### Sprites
+
+Sprites are **retained, not redrawn**. `defineSprite:` takes a small grid of pixel art, places it, and hands back a `Sprite` you keep. It carries its own 16-colour palette (`colorAt: i r: g: b:`); you animate it by appending frames with `addFrame:` and selecting one, and you move it with `moveTo: x y:`. You never clear and repaint a sprite each tick — you move the handle and it reappears on the next presented frame. That is the split from the immediate drawing above: the background is repainted every frame, sprites persist between them.
+
+### The loop
+
+A game is a **step block, not a blocking loop**. `onStep:` registers a block; `run` starts a GUI-owned, main-thread frame timer that calls it once per tick (`frameRate:` sets the rate, default 60) and returns immediately, so the game runs while your doit does not hang. Inside the block, `keyHeld:` tests the live keyboard against named constants (`keyLeft`, `keyRight`, `keyA`, and friends). `onReset:` registers cleanup that fires however a session ends — Escape, the close button, a relaunch — so a game that spawned workers or native state always has a way to tidy up. **Breakout**, **MandelZoom**, **Worms** and **Galaxigans** are complete, readable examples: launch one from the Demos menu, then read its source in the browser.
+
 ## Pedigree, honestly measured
 
 The benchmark protocol is fixed: identical workloads, microsecond clocks, interleaved runs on a quiet machine, medians reported. Against the fastest open Smalltalk VMs, MACVM wins the classic suite; against its other ancestor, the Dart VM, it trades blows and closes the gap release by release. The dashboards in this app run the very same code.
