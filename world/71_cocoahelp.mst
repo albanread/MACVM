@@ -68,6 +68,7 @@ Object subclass: CocoaHelp [
         t add: (Array with: 'The Strongtalk World'   with: #worldText).
         t add: (Array with: 'Guide: Build an App'    with: #appGuideText).
         t add: (Array with: 'Guide: Build a Game'    with: #gameGuideText).
+        t add: (Array with: 'Automation'             with: #automationText).
         t add: (Array with: 'Under the Hood'         with: #internalsText).
         Topics := t asArray.
         ^Topics
@@ -1173,15 +1174,15 @@ The **Demos** menu carries the show-offs: Breakout, MandelZoom, ParallelMandel, 
 
 ## Automation
 
-The app speaks **AppleScript**:
+The app speaks **AppleScript**, so scripts — and AI agents through `osascript` — can drive it:
 
-```
+```ref
 tell application id "com.macvm.cocoa"
     evaluate "6 * 7"
 end tell
 ```
 
-Scripts can run code, switch views, and read state — the full dictionary is in Script Editor''s library window.
+They can run code, switch views, snapshot the window, and read state. See the **Automation** page for the whole story.
 
 > The metrics cluster at the toolbar''s right edge is the VM itself: memory in use, GC activity, compiled-code counts — live, always on.
 ' ]
@@ -1644,6 +1645,43 @@ Each is one readable class, in the Browser:
 > Whole numbers are your friend: they behave predictably *and* run on the VM''s fastest path. Breakout''s physics is nothing but integer addition.
 ' ]
 
+    CocoaHelp class >> automationText [ ^'# Automation
+
+This environment is not a sealed application — it is live Smalltalk that answers from the outside as readily as from the Workspace. macVM ships an **AppleScript** dictionary, so any script — and any AI agent that can run `osascript` — can reach into the same running world your code already lives in.
+
+## AppleScript
+
+macVM ships a scripting dictionary; open it in Script Editor with *File ▸ Open Dictionary…* and choose macVM. Then talk to the app by its bundle id:
+
+```ref
+tell application id "com.macvm.cocoa"
+    evaluate "3 + 4"                       -- answers "7"
+    set current view to canvas             -- switch tabs
+    browse "OrderedCollection" selector "add:"
+    snapshot in (POSIX file "/tmp/shot.png")
+    get transcript                         -- read the log back
+end tell
+```
+
+`evaluate` runs a string of Smalltalk and hands back the result as text; if the code raises, that becomes a real AppleScript error you can catch with `try … on error`. It accepts an optional `time limit` in seconds, because it runs on the supervisor beat rather than blocking the window — the interface never freezes waiting on your expression. Beside it are the verbs `browse`, `snapshot in`, and `clear transcript`, and a handful of properties to read or set: `current view`, `appearance` (system, light, or dark), `workspace text`, and the read-only `transcript` and `busy`.
+
+## From a script or an agent
+
+Because AppleScript is reachable through `osascript`, macVM drives from a plain shell too — which is how a script, or an AI agent with a terminal, works the app without a hand on the mouse:
+
+```ref
+osascript -e ''tell application id "com.macvm.cocoa" to evaluate "3 factorial"''
+```
+
+The result prints straight to standard output. Point anything that can shell out — a Makefile, a test harness, an agent — at that one line and it is holding a conversation with the running image. (The first time, macOS asks once to allow the automation.)
+
+## Why it matters
+
+Because it is Smalltalk all the way down, *automating the app* and *programming the system* are the same act. A script does not poke at a frozen interface from outside; it sends messages into the identical live world the Workspace talks to — the same objects, the same classes, the same worker that runs your code. The window is one client of that world; a script, or an agent, is simply another. Anything you can do here by hand, you can hand to something else to do for you.
+
+> `evaluate` turns an error into an answer instead of a hang: a raise inside your string comes back as an AppleScript error the caller can catch, never a spinning beachball.
+' ]
+
     CocoaHelp class >> internalsText [ ^'# Under the Hood
 
 A short tour of the machine, for the curious. The deep versions live in `docs/` in the repository.
@@ -1664,7 +1702,7 @@ A generational collector: new objects are born in **eden** and scavenged copying
 
 ## The worker model
 
-The UI runs a **supervisor beat** over worker VMs: your code runs in a worker, and if it dies mid-request the supervisor recovers the in-flight state and reports the error — the window never goes down with the experiment. Scripted evaluation (AppleScript, the control channel) rides the same rails with explicit error replies.
+The UI runs a **supervisor beat** over worker VMs: your code runs in a worker, and if it dies mid-request the supervisor recovers the in-flight state and reports the error — the window never goes down with the experiment. Scripted evaluation through AppleScript rides the same rails, with explicit error replies instead of a hung caller.
 
 ## The Cocoa bridge
 
