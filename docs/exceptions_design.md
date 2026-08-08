@@ -127,9 +127,38 @@ keep resumption open is clearly right.
   predicate; `signal` does pass 1 (search) then pass 2 (unwind + activate).
   Handler value becomes `on:do:`'s value. `on:do:` joins
   `PRIM_ACTIVATES_FRAME`. This is the slice that makes the library writable.
-- **E2 — handler verbs.** `return:` (explicit form of the default), `retry`
-  (re-run the protected block — the marker is still armed), `pass` (resume
-  the outward search from this frame).
+- **E2 — handler verbs. BUILT.** `return:`/`return`, `retry`, `pass`,
+  `outer`, and the instance-side `signal:` E0 specified and never got.
+
+  Building it moved one thing. E1 pushed the handler WRAPPED as
+  `[ :ex | ^aHandlerBlock value: ex ]`, and that `^` — returning the
+  handler's value from `on:do:` — was the default action, hard-coded into
+  the wrapper and therefore unreachable from inside the handler. E2 pushes
+  the handler RAW and makes the default explicit as `signal`'s closing
+  `^self return: result`. Once the default is a verb, the other verbs are
+  the same shape: each is one non-local return through a block created in
+  the protected activation, which the stack entry now carries alongside the
+  handler. No unwinder change, no new primitive — as E1 needed none.
+
+  `retry` is a LOOP, not recursion: `on:do:` runs `protect:handler:` in a
+  `whileTrue:` and re-runs it when that answers a private token, so an
+  unbounded retry (a reconnect loop is the motivating case) costs no stack.
+  Gated at 5000 retries, which recursion would not survive.
+
+  `pass` needs no new search: `signal` already truncates the stack past the
+  handler it chose before running it, so re-signalling the same exception
+  searches strictly outward and cannot re-enter its own handler.
+
+  The escape routes live on the EXCEPTION, not on the class, so two
+  exceptions in flight cannot clobber each other's — and `pass`, which
+  re-signals the same exception outward, captures its own route first
+  because signalling rebinds it to whichever handler catches next.
+
+  One placement constraint worth recording: the verbs name `Error` (for the
+  outside-a-handler guards) and the loader resolves globals at compile time,
+  so they live in an Exception block RE-OPENED after the subclasses — the
+  same reason the file re-opens `BlockClosure` at the end rather than
+  declaring it early.
 - **E3 — `resume:`.** Only reachable because E1 chose two-pass: pass 1 has not
   unwound, so the signalling frame is still live and can be continued with the
   handler's value. Restricted to exceptions that declare themselves resumable

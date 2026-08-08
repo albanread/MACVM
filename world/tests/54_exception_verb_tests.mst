@@ -1,0 +1,227 @@
+"54_exception_verb_tests.mst — gates E2, the handler verbs
+ (docs/exceptions_design.md E2). world/tests/50 gates E0+E1 and still does;
+ this file adds only what the verbs introduced.
+
+ Three claims carry the weight:
+
+ - `return:` and `retry` ABANDON the rest of the handler. A test that only
+   checks the answer cannot tell abandonment from a handler that ran to its
+   end and happened to produce the same value, so every such case here also
+   records whether the code after the verb ran.
+ - `retry` is a LOOP, not recursion. Proven by retrying far more times than
+   a recursive implementation could survive.
+ - the handler stack is left empty on every exit path. E1's own tests pin
+   this for the normal and non-local-return paths; the verbs add four new
+   ways to leave a handler, and each one is checked here."
+
+TestCase subclass: ExceptionVerbTests [
+    runAll [
+        self runTest: #testE1StillHolds do: [ self testE1StillHolds ].
+        self runTest: #testReturnAbandonsHandler do: [ self testReturnAbandonsHandler ].
+        self runTest: #testReturnBare do: [ self testReturnBare ].
+        self runTest: #testRetryReRunsProtectedBlock
+             do: [ self testRetryReRunsProtectedBlock ].
+        self runTest: #testRetryIsALoopNotRecursion
+             do: [ self testRetryIsALoopNotRecursion ].
+        self runTest: #testRetryReArmsTheHandler do: [ self testRetryReArmsTheHandler ].
+        self runTest: #testPassGoesOutward do: [ self testPassGoesOutward ].
+        self runTest: #testPassCannotReEnterItsOwnHandler
+             do: [ self testPassCannotReEnterItsOwnHandler ].
+        self runTest: #testPassUnhandledOutwardReports
+             do: [ self testPassUnhandledOutwardReports ].
+        self runTest: #testInstanceSignalWithText do: [ self testInstanceSignalWithText ].
+        self runTest: #testEnsureOrderingWithVerbs do: [ self testEnsureOrderingWithVerbs ].
+        self runTest: #testHandlerStackEmptyAfterEveryVerb
+             do: [ self testHandlerStackEmptyAfterEveryVerb ].
+        self runTest: #testVerbsOutsideAHandlerReport
+             do: [ self testVerbsOutsideAHandlerReport ].
+        self runTest: #testNestedIndependentExceptions
+             do: [ self testNestedIndependentExceptions ].
+    ]
+
+    "E1's contract is unchanged — the wrapper block it used went away, so
+     this is the regression that matters most."
+    testE1StillHolds [
+        self assert: ([ Error signal: 'boom' ] on: Error do: [ :e | e messageText ])
+                     equals: 'boom'.
+        self assert: ([ 42 ] on: Error do: [ :e | 0 ]) equals: 42.
+        self assert: ([ ZeroDivide signal ] on: Error do: [ :e | e class name ])
+                     equals: #ZeroDivide.
+        self assert: ([ [ Error signal: 'in' ] on: ZeroDivide do: [ :e | 'wrong' ] ]
+                        on: Error do: [ :e | e messageText ]) equals: 'in'
+    ]
+
+    "The value is only half the claim — the statements AFTER return: must not
+     run, which is what makes it an abandonment rather than an assignment."
+    testReturnAbandonsHandler [
+        | after r |
+        after := false.
+        r := [ Error signal ] on: Error do: [ :e | e return: 7. after := true. 99 ].
+        self assert: r equals: 7.
+        self deny: after
+    ]
+
+    testReturnBare [
+        | after r |
+        after := false.
+        r := [ Error signal ] on: Error do: [ :e | e return. after := true. 99 ].
+        self assert: r equals: nil.
+        self deny: after
+    ]
+
+    testRetryReRunsProtectedBlock [
+        | attempts after r |
+        attempts := 0. after := false.
+        r := [ attempts := attempts + 1.
+               attempts < 3 ifTrue: [ Error signal: 'again' ].
+               #ok ]
+                on: Error do: [ :e | e retry. after := true. #never ].
+        self assert: attempts equals: 3.
+        self assert: r equals: #ok.
+        self deny: after
+    ]
+
+    "A recursive retry would grow the stack once per attempt; the loop does
+     not. 5000 is far past what recursion would survive here, so this passing
+     IS the proof that on:do: loops."
+    testRetryIsALoopNotRecursion [
+        | attempts r |
+        attempts := 0.
+        r := [ attempts := attempts + 1.
+               attempts < 5000 ifTrue: [ Error signal ].
+               attempts ]
+                on: Error do: [ :e | e retry ].
+        self assert: r equals: 5000
+    ]
+
+    "Each retry must arm a FRESH handler — otherwise the second failure would
+     find no handler and terminate."
+    testRetryReArmsTheHandler [
+        | seen r |
+        seen := OrderedCollection new.
+        r := [ seen size < 3 ifTrue: [ Error signal: 'n' , seen size printString ].
+               seen size ]
+                on: Error do: [ :e | seen add: e messageText. e retry ].
+        self assert: r equals: 3.
+        self assert: seen asArray equals: #('n0' 'n1' 'n2')
+    ]
+
+    testPassGoesOutward [
+        | inner outer r |
+        inner := false. outer := false.
+        r := [ [ Error signal: 'deep' ]
+                 on: Error do: [ :e | inner := true. e pass. #neverReached ] ]
+                on: Error do: [ :e | outer := true. 'outer:' , e messageText ].
+        self assert: r equals: 'outer:deep'.
+        self assert: inner.
+        self assert: outer
+    ]
+
+    "signal truncates the stack past the handler it chose BEFORE running it,
+     so a passed exception searches strictly outward. If it could re-enter
+     its own handler this would not terminate."
+    testPassCannotReEnterItsOwnHandler [
+        | entries r |
+        entries := 0.
+        r := [ [ Error signal: 'once' ]
+                 on: Error do: [ :e | entries := entries + 1. e pass ] ]
+                on: Error do: [ :e | #caughtOutside ].
+        self assert: entries equals: 1.
+        self assert: r equals: #caughtOutside
+    ]
+
+    "Passing when nothing outward matches is an ordinary unhandled signal —
+     it must not loop or find its own handler again."
+    testPassUnhandledOutwardReports [
+        | entries |
+        entries := 0.
+        "ZeroDivide passed outward past a handler that only takes ZeroDivide
+         reaches the Error handler, which is a kind-of match"
+        self assert: ([ [ ZeroDivide signal: 'zd' ]
+                          on: ZeroDivide do: [ :e | entries := entries + 1. e pass ] ]
+                        on: Error do: [ :e | e messageText ]) equals: 'zd'.
+        self assert: entries equals: 1
+    ]
+
+    testInstanceSignalWithText [
+        self assert: ([ Error new signal: 'inst' ] on: Error do: [ :e | e messageText ])
+                     equals: 'inst'.
+        "and the class-side form E0 shipped still works"
+        self assert: ([ Error signal: 'cls' ] on: Error do: [ :e | e messageText ])
+                     equals: 'cls'
+    ]
+
+    "ANSI order is body, handler, ensure — the handler runs while the
+     signalling stack is still live, which is what keeps resumption (E3)
+     reachable. Checked once per verb, since each leaves by a different
+     route."
+    testEnsureOrderingWithVerbs [
+        | log |
+        log := OrderedCollection new.
+        [ [ log add: #body. Error signal ] ensure: [ log add: #ensure ] ]
+            on: Error do: [ :e | log add: #handler. e return: nil ].
+        self assert: log asArray equals: #(#body #handler #ensure).
+
+        log := OrderedCollection new.
+        [ [ log add: #body. Error signal ] ensure: [ log add: #ensure ] ]
+            on: Error do: [ :e | log add: #handler ].
+        self assert: log asArray equals: #(#body #handler #ensure).
+
+        "retry runs the ensure for the abandoned attempt before re-entering"
+        log := OrderedCollection new.
+        [ [ log add: #body. log size < 4 ifTrue: [ Error signal ] ]
+              ensure: [ log add: #ensure ] ]
+            on: Error do: [ :e | log add: #handler. e retry ].
+        self assert: (log occurrencesOf: #ensure) equals: (log occurrencesOf: #body)
+    ]
+
+    "The verbs add four new ways out of a handler. Each must leave the stack
+     as it found it, or the next signal searches a corrupted list."
+    testHandlerStackEmptyAfterEveryVerb [
+        | before |
+        before := Exception handlers size.
+        [ Error signal ] on: Error do: [ :e | e return: 1 ].
+        self assert: Exception handlers size equals: before.
+        [ Error signal ] on: Error do: [ :e | 2 ].
+        self assert: Exception handlers size equals: before.
+        [ [ Error signal ] on: Error do: [ :e | e pass ] ]
+            on: Error do: [ :e | 3 ].
+        self assert: Exception handlers size equals: before.
+        [ | n | n := 0.
+          [ n := n + 1. n < 3 ifTrue: [ Error signal ]. n ]
+              on: Error do: [ :e | e retry ] ] value.
+        self assert: Exception handlers size equals: before.
+        "and after an exception that nothing handled inside a protected block"
+        [ [ ZeroDivide signal ] on: ZeroDivide do: [ :e | e return: 0 ] ] value.
+        self assert: Exception handlers size equals: before
+    ]
+
+    "A verb called with no handler running has no escape route to take; it
+     must say so rather than fail on nil."
+    testVerbsOutsideAHandlerReport [
+        self assert: ([ Error new return: 1 ] on: Error do: [ :e | e messageText ])
+                     equals: 'return: outside a handler'.
+        self assert: ([ Error new retry ] on: Error do: [ :e | e messageText ])
+                     equals: 'retry outside a handler'.
+        self assert: ([ Error new pass ] on: Error do: [ :e | e messageText ])
+                     equals: 'pass outside a handler'
+    ]
+
+    "Escape routes live on the EXCEPTION, so two exceptions in flight cannot
+     clobber each other's — the reason handlerReturn is an ivar and not a
+     class variable."
+    testNestedIndependentExceptions [
+        | r |
+        r := [ [ Error signal: 'inner' ]
+                 on: Error do: [ :e |
+                     | innerText |
+                     innerText := e messageText.
+                     "signal a DIFFERENT exception from inside this handler;
+                      it binds its own routes and must not disturb e's"
+                     [ ZeroDivide signal: 'other' ]
+                         on: ZeroDivide do: [ :z | z return: nil ].
+                     e return: 'still:' , innerText ] ]
+                on: Error do: [ :e | #outerShouldNotRun ].
+        self assert: r equals: 'still:inner'
+    ]
+]

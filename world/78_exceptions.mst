@@ -39,8 +39,14 @@
  byte-identical to today."
 
 Object subclass: Exception [
-    | messageText |
-    <classVars: Handlers>
+    "handlerReturn / handlerRetry are the running handler's two escape
+     routes, bound by `signal` from the handler-stack entry just before the
+     handler runs (E2). They are per-EXCEPTION, not per-class, so a signal
+     raised from inside a handler cannot clobber the outer one's routes —
+     and `pass`, which deliberately re-signals the SAME exception outward,
+     captures its own pair first."
+    | messageText handlerReturn handlerRetry |
+    <classVars: Handlers RetryToken>
 
     "── the handler stack ────────────────────────────────────────────────
      One entry per active `on:do:`, innermost LAST. Held on Exception (the
@@ -57,8 +63,23 @@ Object subclass: Exception [
      truncates back to it, so an abandoned frame's entries cannot leak even
      if a non-local return skipped their own pops."
     Exception class >> pushHandler: aClass block: aBlock [
-        self handlers add: (Array with: aClass with: aBlock).
+        ^self pushHandler: aClass block: aBlock return: nil retry: nil
+    ]
+    "An entry is (class, handlerBlock, returnBlock, retryBlock). The two
+     blocks are created INSIDE the protected activation, so their `^`
+     unwinds to it — which is the whole mechanism behind return:/retry."
+    Exception class >> pushHandler: aClass block: aBlock return: aReturnBlock retry: aRetryBlock [
+        self handlers add:
+            (Array with: aClass with: aBlock with: aReturnBlock with: aRetryBlock).
         ^self handlers size - 1
+    ]
+
+    "A private singleton meaning 'the handler asked to retry'. Compared with
+     ==, and it never escapes this file — a handler answering it by accident
+     is not a thing that can happen."
+    Exception class >> retryToken [
+        RetryToken isNil ifTrue: [ RetryToken := Object new ].
+        ^RetryToken
     ]
 
     "Truncate back to `aDepth`. Idempotent and total: called from an
@@ -70,7 +91,7 @@ Object subclass: Exception [
     ]
 
     "The innermost handler whose class this exception is a kind of, as
-     (index, block), or nil. Searched innermost-first — the ANSI rule."
+     (index, entry), or nil. Searched innermost-first — the ANSI rule."
     Exception class >> findHandlerFor: anException [
         | hs i |
         hs := self handlers.
@@ -79,7 +100,7 @@ Object subclass: Exception [
             | entry |
             entry := hs at: i.
             (anException isKindOf: (entry at: 1)) ifTrue: [
-                ^Array with: i with: (entry at: 2) ].
+                ^Array with: i with: entry ].
             i := i - 1 ].
         ^nil
     ]
@@ -126,15 +147,24 @@ Object subclass: Exception [
      here at all. If the handler answers WITHOUT a non-local return, its
      value is answered from `signal` — the resumption path (E3)."
     signal ^ <Object> [
-        | found depth block result |
+        | found depth entry result |
         found := Exception findHandlerFor: self.
         found isNil ifTrue: [ ^self unhandled ].
         depth := (found at: 1) - 1.
-        block := found at: 2.
-        result := [ Exception popHandlerTo: depth. block value: self ]
-                      ensure: [ ].
-        ^result
+        entry := found at: 2.
+        "Bind this handler's escape routes onto me BEFORE it runs — return:,
+         retry and pass all reach the protected activation through them."
+        handlerReturn := entry at: 3.
+        handlerRetry := entry at: 4.
+        Exception popHandlerTo: depth.
+        result := (entry at: 2) value: self.
+        "The handler fell off its end. ANSI's default action is to `return:`
+         its value — which under E1 was spelled as the `^` inside on:do:'s
+         wrapper block. Making it explicit here is what let the wrapper go
+         away, and with it the reason return: could not be written."
+        ^self return: result
     ]
+
 
     "No handler matched. v1 keeps EXACTLY the old behaviour — the computation
      stops with a reported error — so a world that signals but never handles
@@ -199,6 +229,63 @@ Exception subclass: Warning [
     isResumable ^ <Boolean> [ ^true ]
 ]
 
+"── E2: the handler verbs ────────────────────────────────────────────────
+
+ Re-opened AFTER the subclasses, because these methods name `Error` and the
+ loader resolves globals at compile time — inside Exception's own block,
+ Error does not exist yet. (The same reason the file re-opens BlockClosure
+ below rather than declaring it early.)"
+
+Object subclass: Exception [
+    "── E2: the handler verbs (docs/exceptions_design.md E2) ─────────────
+     Each reaches the protected activation through a block created there, so
+     each is one non-local return — no unwinder change and no new primitive,
+     exactly as E1 needed none."
+
+    "Abandon the handler; `on:do:` answers aValue. The explicit form of what
+     a handler that simply ends already does."
+    return: aValue <Object> ^ <Object> [
+        handlerReturn isNil ifTrue: [ ^Error signal: 'return: outside a handler' ].
+        ^handlerReturn value: aValue
+    ]
+    return ^ <Object> [ ^self return: nil ]
+
+    "Abandon the handler and run the protected block AGAIN with the handler
+     re-armed. The retry block answers a private token that on:do:'s loop
+     recognises, so this is a genuine loop rather than recursion — an
+     unbounded retry (a reconnect loop is the motivating case) costs no
+     stack."
+    retry ^ <Object> [
+        handlerRetry isNil ifTrue: [ ^Error signal: 'retry outside a handler' ].
+        ^handlerRetry value
+    ]
+
+    "Decline: hand this same exception to the NEXT handler outward and let
+     its action stand. The stack is already truncated past our own entry (see
+     signal), so re-signalling searches strictly outward and cannot re-enter
+     us. Our own return route is captured FIRST, because signalling rebinds
+     it to whichever handler catches next; it matters only if that outer
+     handler resumes (E3), the one path that comes back here."
+    pass ^ <Object> [
+        | mine |
+        mine := handlerReturn.
+        mine isNil ifTrue: [ ^Error signal: 'pass outside a handler' ].
+        ^mine value: self signal
+    ]
+
+    "Like pass, but if the outer handler RESUMES, control returns to THIS
+     handler with its value instead of leaving. Until E3 nothing resumes, so
+     today the two differ only in that."
+    outer ^ <Object> [ ^self signal ]
+
+    "Signal me with a message text — the instance-side twin of the class-side
+     `Error signal:` that E0 specified and never got."
+    signal: aString <String> ^ <Object> [
+        messageText := aString.
+        ^self signal
+    ]
+]
+
 "── E1: the protected block ──────────────────────────────────────────────"
 
 "Re-opened, the world's own idiom for adding methods to an existing class
@@ -214,9 +301,28 @@ Object subclass: BlockClosure [
      block in between, and lands here. The `ensure:` below pops the handler
      on every exit path — normal, non-local, or curtailed."
     on: anExceptionClass <Object> do: aHandlerBlock <[Object,^Object]> ^ <Object> [
+        "A LOOP, so `retry` costs no stack however many times it fires. Each
+         turn arms a fresh handler; the private token is the only value that
+         means 'go round again', and it can only come from Exception>>retry."
+        | r |
+        [ true ] whileTrue: [
+            r := self protect: anExceptionClass handler: aHandlerBlock.
+            (r == Exception retryToken) ifFalse: [ ^r ] ]
+    ]
+
+    "One armed attempt. The return and retry blocks are created HERE, so
+     their `^` unwinds to this activation — which is what makes `return:`
+     answer from on:do: and `retry` reach the loop above. The handler block
+     is pushed RAW now; E1 wrapped it as `[ :ex | ^... ]`, and that wrapper's
+     job — answering the handler's value from on:do: — moved into signal's
+     explicit default action, which is precisely what made the verbs
+     expressible."
+    protect: anExceptionClass <Object> handler: aHandlerBlock <[Object,^Object]> ^ <Object> [
         | depth |
         depth := Exception pushHandler: anExceptionClass
-                           block: [ :ex | ^aHandlerBlock value: ex ].
+                           block: aHandlerBlock
+                           return: [ :v | ^v ]
+                           retry: [ ^Exception retryToken ].
         ^[ self value ] ensure: [ Exception popHandlerTo: depth ]
     ]
 ]
