@@ -903,6 +903,51 @@ extern "C" fn imp_file_in_path(_this: *mut c_void, _cmd: *mut c_void, path: Id) 
     std::ptr::null_mut()
 }
 
+/// The first `(class name, world file)` where a class this file defines is
+/// ALREADY defined by a non-`user_` world file — i.e. adding it would write a
+/// shadowing fork. `None` when every class is new (or only re-adds an existing
+/// `user_` file, which is the supported update flow). Text-scans the world
+/// sources rather than the image: it must name the FILE that owns the class,
+/// and it must work the same before the image is ever imported.
+fn defined_by_core_world_file(
+    items: &[macvm::frontend::ast::TopItem],
+) -> Option<(String, String)> {
+    let names: Vec<&str> = items
+        .iter()
+        .filter_map(|i| match i {
+            macvm::frontend::ast::TopItem::ClassDef(c) => Some(c.name.as_str()),
+            _ => None,
+        })
+        .collect();
+    if names.is_empty() {
+        return None;
+    }
+    let world = world_dir();
+    let mut files: Vec<_> = std::fs::read_dir(&world)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|f| f.ends_with(".mst") && !f.starts_with("user_"))
+        .collect();
+    files.sort();
+    for f in files {
+        let Ok(text) = std::fs::read_to_string(world.join(&f)) else {
+            continue;
+        };
+        let Ok(existing) = macvm::frontend::parser::parse_file(&text) else {
+            continue;
+        };
+        for item in &existing {
+            if let macvm::frontend::ast::TopItem::ClassDef(c) = item {
+                if let Some(hit) = names.iter().find(|n| **n == c.name) {
+                    return Some((hit.to_string(), f));
+                }
+            }
+        }
+    }
+    None
+}
+
 /// `addToWorldPath:` — File ▸ Add to World: graduate the user's file INTO the
 /// world. Copies it to `world/user_<stem>.mst` (the `user_` prefix makes a
 /// core-file collision impossible; re-adding the same stem overwrites — the
@@ -918,8 +963,24 @@ extern "C" fn imp_add_to_world(_this: *mut c_void, _cmd: *mut c_void, path: Id) 
         Ok(t) => t,
         Err(e) => return err(&format!("cannot read {src_path}: {e}")),
     };
-    if let Err(e) = macvm::frontend::parser::parse_file(&text) {
-        return err(&format!("not added — {e}"));
+    let items = match macvm::frontend::parser::parse_file(&text) {
+        Ok(items) => items,
+        Err(e) => return err(&format!("not added — {e}")),
+    };
+    // SHADOW GUARD. A class browsed out of the image comes back as
+    // RECONSTRUCTED source (no file comments), so adding one of those to the
+    // world writes a comment-stripped FORK under `user_<stem>.mst` — which
+    // loads LAST and silently shadows the core file from then on, in every
+    // fresh world and every reseed. Observed for real: a `Mandelbrot` fork
+    // shadowed `35_mandelbrot.mst`. Refuse it and name the file that already
+    // owns the class; adding genuinely new classes is unaffected.
+    if let Some(hit) = defined_by_core_world_file(&items) {
+        return err(&format!(
+            "not added — {} is already defined by world/{}. Adding it here would write a \
+             shadowing copy that wins over the original. Rename the class, or edit \
+             world/{} directly.",
+            hit.0, hit.1, hit.1
+        ));
     }
     let stem: String = std::path::Path::new(&src_path)
         .file_stem()
