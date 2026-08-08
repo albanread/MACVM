@@ -193,10 +193,41 @@ keep resumption open is clearly right.
   E2's `outer` also becomes meaningful here: it is the verb that comes back
   when the enclosing handler resumes, which is precisely what distinguishes
   it from `pass`.
-- **E4 — the VM's own errors become signals.** `prim_error`, `dnu_fallback`,
-  division by zero, index errors: each signals its class **and, if no handler
-  matches, does exactly what it does today** — print, PROBE dossier,
-  `run_curtailment_blocks_on_error`, `raise_guest_fatal`.
+- **E4 — the VM's own errors become signals. BUILT** (`world/82_vm_errors.mst`),
+  and like E0-E3 **with no VM change at all**.
+
+  The reason it was cheap: every failure in the world already funnels through
+  `Object>>error:`, and `doesNotUnderstand:` is already a world-level hook the
+  VM *sends*. So `error:` now signals an `Error`, and `Exception>>unhandled`
+  calls `primError:` — the untouched primitive 95. When nothing handles the
+  signal, the same primitive runs at the same point, which is the
+  compatibility hinge made mechanical rather than promised.
+
+  Specific classes reach the early files by ORDINARY SEND
+  (`self signalZeroDivide:`), because a raise site in `world/06` cannot name
+  `ZeroDivide` — the loader resolves globals at compile time, and `world/78`
+  loads far later. Same constraint that placed E2's verbs in a re-opened
+  block.
+
+  It also settles §3.4's debugger interaction for free: halt-on-error hangs
+  off primitive 95, so it now fires on UNHANDLED errors only. A handled
+  `on: Error do:` no longer parks the primary at the raise.
+
+  **Two honest deviations from "byte-identical".** (1) `unhandled` passes
+  `self report`, not the class name plus it — primitive 95 already prefixes
+  `Error: `, and prefixing again turned `Error: division by zero` into
+  `Error: Error: division by zero`. Fixing that also un-breaks E0-E3's own
+  reports. (2) The stack trace gains four plumbing frames above the raise
+  site (`unhandled`/`signal`/`signal:`/`signalZeroDivide:`); the raise site
+  itself is still there, and every real Smalltalk pays the same.
+
+  **And a bug the slice exposed.** `Array>>at:`/`at:put:` were bare
+  `<primitive:>` with no fallback body. The primitive bounds-checks correctly
+  and fails — but a failed primitive with no fallback answers the RECEIVER,
+  so `#(1 2) at: 9` quietly answered `#(1 2)`. Every out-of-range read was a
+  silent wrong answer, and `'ab' at: 9` ran the stack out inside
+  `Character value:`. Fixed here rather than separately, because until E4
+  there was nothing for those methods to signal.
 
 That last clause is the compatibility hinge and deserves emphasis: **E4 is
 purely additive.** A world with no `on:do:` anywhere behaves byte-identically

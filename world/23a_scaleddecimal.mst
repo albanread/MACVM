@@ -50,7 +50,7 @@ Fraction subclass: ScaledDecimal [
      Fraction proper, whose factory answers the Integer instead)."
     ScaledDecimal class >> numerator: n <Integer> denominator: d <Integer> scale: s <Integer> ^ <ScaledDecimal> [
         | g num den sign |
-        d = 0 ifTrue: [ ^self error: 'division by zero' ].
+        d = 0 ifTrue: [ ^self signalZeroDivide: 'division by zero' ].
         sign := d < 0 ifTrue: [ -1 ] ifFalse: [ 1 ].
         num := n * sign.
         den := d * sign.

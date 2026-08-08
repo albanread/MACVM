@@ -178,3 +178,8 @@
 # Hinnant civil_from_days in pure Smalltalk; the UTC offset from localtime_r's
 # tm_gmtoff, whose layout was probed on this machine, not assumed.
 81_clock_completion.mst
+# E4 (docs/exceptions_design.md): the VM's own failures become catchable
+# signals. error: signals; unhandled runs primitive 95 unchanged, so a world
+# with no on:do: behaves byte-identically. Also fixes the silent
+# out-of-bounds: a bare <primitive:> with no fallback answered the RECEIVER.
+82_vm_errors.mst

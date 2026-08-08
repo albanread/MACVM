@@ -1,0 +1,183 @@
+"55_vm_error_tests.mst — gates E4, the VM's own failures as signals
+ (docs/exceptions_design.md E4, world/82_vm_errors.mst).
+
+ E0-E3 could catch anything the LIBRARY signalled and nothing the VM
+ raised, so `[ 1/0 ] on: ZeroDivide do: [...]` — the obvious thing to write
+ — was the one thing that did not work. These tests pin that it does now,
+ and that the compatibility hinge holds.
+
+ The hinge cannot be fully tested from inside the image: an UNHANDLED error
+ terminates the VM, so a test that provoked one would take the suite with
+ it. What can be tested here is everything up to that line — that handled
+ errors are caught by the right class, carry the right payload, and leave
+ the handler stack clean. The unhandled path is checked outside, by the
+ world differential gate (which runs an unhandled `error:` and compares
+ output) and by hand: `1/0` still prints exactly `Error: division by zero`."
+
+TestCase subclass: VmErrorTests [
+    runAll [
+        self runTest: #testDivisionByZeroIsCatchable
+             do: [ self testDivisionByZeroIsCatchable ].
+        self runTest: #testDoesNotUnderstandIsCatchable
+             do: [ self testDoesNotUnderstandIsCatchable ].
+        self runTest: #testDnuCarriesReceiverAndMessage
+             do: [ self testDnuCarriesReceiverAndMessage ].
+        self runTest: #testIndexOutOfBoundsIsCatchable
+             do: [ self testIndexOutOfBoundsIsCatchable ].
+        self runTest: #testInBoundsAccessIsUnaffected
+             do: [ self testInBoundsAccessIsUnaffected ].
+        self runTest: #testGenericLibraryFailuresAreCatchable
+             do: [ self testGenericLibraryFailuresAreCatchable ].
+        self runTest: #testVerbsComposeWithVmErrors
+             do: [ self testVerbsComposeWithVmErrors ].
+        self runTest: #testHandlerStackCleanAfterVmErrors
+             do: [ self testHandlerStackCleanAfterVmErrors ].
+        self runTest: #testReportTextIsUnprefixed
+             do: [ self testReportTextIsUnprefixed ].
+    ]
+
+    "The headline. Caught by its own class, by Error, and by Exception —
+     the kind-of walk has to work for a VM-raised signal exactly as for a
+     library-raised one."
+    testDivisionByZeroIsCatchable [
+        self assert: ([ 1/0 ] on: ZeroDivide do: [ :e | #zd ]) equals: #zd.
+        self assert: ([ 1/0 ] on: Error do: [ :e | #err ]) equals: #err.
+        self assert: ([ 1/0 ] on: Exception do: [ :e | #exc ]) equals: #exc.
+        self assert: ([ 1/0 ] on: ZeroDivide do: [ :e | e messageText ])
+                     equals: 'division by zero'.
+        "an Error is not resumable — the ANSI rule E3 gates on"
+        self deny: ([ 1/0 ] on: ZeroDivide do: [ :e | e isResumable ]).
+        "a handler for the WRONG class must not catch it"
+        self assert: ([ [ 1/0 ] on: MessageNotUnderstood do: [ :e | #wrong ] ]
+                        on: ZeroDivide do: [ :e | #right ]) equals: #right.
+        "and the result is still usable when nothing fails"
+        self assert: ([ 6/3 ] on: ZeroDivide do: [ :e | #never ]) equals: 2
+    ]
+
+    testDoesNotUnderstandIsCatchable [
+        self assert: ([ 3 fooBar ] on: MessageNotUnderstood do: [ :e | #dnu ])
+                     equals: #dnu.
+        self assert: ([ 3 fooBar ] on: Error do: [ :e | #err ]) equals: #err.
+        self assert: ([ nil someMissingSelector ] on: MessageNotUnderstood do: [ :e | #dnu ])
+                     equals: #dnu
+    ]
+
+    "E0 gave MessageNotUnderstood receiver/message ivars and nothing filled
+     them in; E4 is what makes them real."
+    testDnuCarriesReceiverAndMessage [
+        self assert: ([ 3 fooBar ] on: MessageNotUnderstood do: [ :e | e receiver ])
+                     equals: 3.
+        self assert: ([ 'xy' fooBar ] on: MessageNotUnderstood do: [ :e | e receiver ])
+                     equals: 'xy'.
+        self assert: ([ 3 fooBar ] on: MessageNotUnderstood do: [ :e | e message selector ])
+                     equals: #fooBar.
+        self assert: ([ 3 fooBar ] on: MessageNotUnderstood do: [ :e | e messageText ])
+                     equals: 'does not understand fooBar'
+    ]
+
+    "The bug E4 exposed: Array>>at: was a bare <primitive:> with no fallback,
+     and a failed primitive with no fallback answers the RECEIVER — so
+     `#(1 2) at: 9` quietly answered `#(1 2)`. Every out-of-range read was a
+     silent wrong answer."
+    testIndexOutOfBoundsIsCatchable [
+        self assert: ([ #(1 2) at: 9 ] on: IndexOutOfBounds do: [ :e | #oob ])
+                     equals: #oob.
+        self assert: ([ #(1 2) at: 3 ] on: IndexOutOfBounds do: [ :e | #oob ])
+                     equals: #oob.
+        self assert: ([ #(1 2) at: 0 ] on: IndexOutOfBounds do: [ :e | #oob ])
+                     equals: #oob.
+        self assert: ([ #(1 2) at: -1 ] on: IndexOutOfBounds do: [ :e | #oob ])
+                     equals: #oob.
+        "the offending index rides on the exception"
+        self assert: ([ #(1 2) at: 9 ] on: IndexOutOfBounds do: [ :e | e index ])
+                     equals: 9.
+        self assert: ([ (Array new: 2) at: 5 put: 1 ] on: IndexOutOfBounds do: [ :e | e index ])
+                     equals: 5.
+        "String>>at: read through basicByteAt:, whose failure answered the
+         String and then ran the stack out inside Character value:"
+        self assert: ([ 'ab' at: 9 ] on: IndexOutOfBounds do: [ :e | #oob ])
+                     equals: #oob.
+        self assert: ([ 'ab' at: 0 ] on: IndexOutOfBounds do: [ :e | #oob ])
+                     equals: #oob
+    ]
+
+    "The fallback runs only when the primitive fails, so the fast path must
+     be untouched — including the boundary indices either side of the range."
+    testInBoundsAccessIsUnaffected [
+        | a s |
+        a := Array new: 3.
+        a at: 1 put: #x. a at: 3 put: #z.
+        self assert: (a at: 1) equals: #x.
+        self assert: (a at: 3) equals: #z.
+        self assert: (a at: 2) equals: nil.
+        self assert: (#(1 2) at: 1) equals: 1.
+        self assert: (#(1 2) at: 2) equals: 2.
+        s := String new: 2.
+        s at: 1 put: $a. s at: 2 put: $b.
+        self assert: s equals: 'ab'.
+        self assert: ('ab' at: 1) equals: $a.
+        self assert: ('ab' at: 2) equals: $b.
+        "at:ifAbsent: still takes its own path rather than signalling"
+        self assert: (#(1 2) at: 9 ifAbsent: [ #gone ]) equals: #gone
+    ]
+
+    "Everything in the world funnels through Object>>error:, so making that
+     one method signal is what makes the whole library catchable."
+    testGenericLibraryFailuresAreCatchable [
+        self assert: ([ Dictionary new at: #nope ] on: Error do: [ :e | #missing ])
+                     equals: #missing.
+        self assert: ([ Set new anyOne ] on: Error do: [ :e | #empty ])
+                     equals: #empty.
+        self assert: ([ #() first ] on: Error do: [ :e | #empty ]) equals: #empty.
+        self assert: ([ Object new error: 'custom' ] on: Error do: [ :e | e messageText ])
+                     equals: 'custom'
+    ]
+
+    "E2's verbs have to work on VM-raised signals, not just library ones —
+     retry over a failing computation is the motivating case."
+    testVerbsComposeWithVmErrors [
+        | d r |
+        "d=1 divides by zero and retries; d=2 succeeds. The divisor must be
+         zero on the FIRST attempt or the block never raises and the case is
+         vacuous — which is exactly how an earlier version of this test
+         passed while proving nothing."
+        d := 0.
+        r := [ d := d + 1. 1 / (d - 1) ] on: ZeroDivide do: [ :e | e retry ].
+        self assert: r equals: 1.
+        self assert: d equals: 2.
+        self assert: ([ 1/0 ] on: ZeroDivide do: [ :e | e return: #returned ])
+                     equals: #returned.
+        self assert: ([ [ 1/0 ] on: ZeroDivide do: [ :e | e pass ] ]
+                        on: Error do: [ :e | #passed ]) equals: #passed
+    ]
+
+    "A VM error caught mid-expression must leave the stack exactly as a
+     library signal does, or the next signal searches a corrupted list."
+    testHandlerStackCleanAfterVmErrors [
+        | before |
+        before := Exception handlers size.
+        [ 1/0 ] on: ZeroDivide do: [ :e | nil ].
+        self assert: Exception handlers size equals: before.
+        [ 3 fooBar ] on: MessageNotUnderstood do: [ :e | nil ].
+        self assert: Exception handlers size equals: before.
+        [ #(1 2) at: 9 ] on: IndexOutOfBounds do: [ :e | e return: nil ].
+        self assert: Exception handlers size equals: before.
+        [ [ 1/0 ] on: ZeroDivide do: [ :e | e pass ] ] on: Error do: [ :e | nil ].
+        self assert: Exception handlers size equals: before
+    ]
+
+    "The compatibility hinge, as far as it can be reached from inside: the
+     text handed to the unhandled path is the bare report, with no class
+     prefix — because primitive 95 already prefixes 'Error: ', and
+     `error: 'division by zero'` must still print exactly
+     `Error: division by zero` as it always did."
+    testReportTextIsUnprefixed [
+        self assert: ([ 1/0 ] on: ZeroDivide do: [ :e | e report ])
+                     equals: 'division by zero'.
+        self assert: (Error new messageText: 'plain') report equals: 'plain'.
+        "no text given: the class's own description stands in, which is where
+         the class identity survives"
+        self assert: ZeroDivide new report equals: 'Division by zero'.
+        self assert: Error new report equals: 'An error occurred'
+    ]
+]

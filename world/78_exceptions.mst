@@ -199,7 +199,19 @@ Object subclass: Exception [
         "asString on the class name: it is a Symbol, and Symbols are
          immutable — , would try to build in place and raise inside the
          error reporter itself (found by testing the unhandled path)."
-        ^self error: self class name asString , ': ' , self report
+        "primError:, NOT error: — E4 makes error: signal, and signalling from
+         inside the no-handler path would recurse forever. This send is also
+         the exact point where E4 is behaviour-preserving: primitive 95 runs
+         here, at the same moment it always did."
+        "`self report`, NOT the class name plus it: primitive 95 already
+         prefixes 'Error: ', so including the class here doubled the prefix —
+         and, more importantly, E4 routes every VM failure through this
+         point, where `error: 'division by zero'` must still print exactly
+         `Error: division by zero` as it always did. The class identity is
+         not lost: an exception signalled with no messageText reports its
+         own `description` ('Division by zero'), and the raise site is in
+         the trace either way."
+        ^self primError: self report
     ]
 
     "Is the receiver resumable? Nothing resumes in E1; the accessor exists so

@@ -1,0 +1,115 @@
+"82_vm_errors.mst — E4: the VM's own failures become signals
+ (docs/exceptions_design.md E4).
+
+ Until now `1/0`, a doesNotUnderstand and an out-of-range index all ended
+ the computation outright: `Object>>error:` is primitive 95, which reports
+ and terminates, and every failure in the world funnels through it. So the
+ exception system E0–E3 built could catch anything the LIBRARY chose to
+ signal and nothing the VM raised — `[ 1/0 ] on: ZeroDivide do: [...]` was
+ the obvious thing to write and the one thing that did not work.
+
+ **The compatibility hinge, and it is the whole design.** `error:` now
+ signals; `Exception>>unhandled` calls `primError:`, which is the untouched
+ primitive 95. So a world with no `on:do:` anywhere behaves BYTE-IDENTICALLY
+ to before — same message, same PROBE dossier, same curtailment blocks, same
+ fatal exit — because when nothing handles the signal, the very same
+ primitive runs at the very same point. That is what keeps the differential
+ gate meaningful across this slice, and it is why E4 could be purely
+ additive.
+
+ It also fixes the debugger interaction §3.4 predicted: halt-on-error hangs
+ off primitive 95, so it now fires on UNHANDLED errors only. A handled
+ `[ ... ] on: Error do: [...]` no longer parks the primary at the raise —
+ which is the confusion that hung a scripted `evaluate` for a session
+ (applescript_design.md).
+
+ **Load order.** The specific exception classes live in world/78, which loads
+ long after the early library files that raise. A raise site in world/06
+ cannot NAME `ZeroDivide` — the loader resolves globals at compile time. So
+ the sites send an ordinary message (`self signalZeroDivide:`) and the
+ late-bound implementation lives here, where the classes are visible. That is
+ the same constraint that put E2's verbs in a re-opened Exception block.
+
+ **And a real bug this slice exposes.** `Array>>at:` was a bare
+ `<primitive: 26>` with no fallback body. The primitive bounds-checks
+ correctly and fails — but a failed primitive with no fallback answers the
+ RECEIVER, so `#(1 2) at: 9` quietly answered `#(1 2)` rather than raising.
+ Every out-of-range read returned a silent wrong answer. Giving those methods
+ fallbacks that signal is part of E4 rather than a separate fix, because
+ until E4 there was nothing for them to signal."
+
+nil subclass: Object [
+    "The raw primitive-95 path, under its own name. `unhandled` calls this,
+     so the signalling `error:` below cannot recurse into itself — and this
+     is also the exact point at which behaviour is unchanged from before E4."
+    primError: aString <String> [
+        <primitive: 95>
+    ]
+
+    "E4: raise a catchable Error. Everything in the world that fails funnels
+     through here, so this one method makes `1/0`, `subclassResponsibility`,
+     `key not found` and the rest catchable at a stroke — while the unhandled
+     path stays primError:, byte-identical to before."
+    error: aString <String> [
+        ^Error new signal: aString
+    ]
+
+    "── the specific kinds, reachable from files that load BEFORE world/78 ──
+     Each is an ordinary send at the raise site, so the early file never has
+     to name a class it cannot see yet."
+
+    signalZeroDivide: aString <String> ^ <Object> [
+        ^ZeroDivide new signal: aString
+    ]
+    signalIndexOutOfBounds: anIndex <Object> ^ <Object> [
+        ^(IndexOutOfBounds new index: anIndex)
+            signal: 'index out of range: ' , anIndex printString
+    ]
+    signalKeyNotFound: aKey <Object> ^ <Object> [
+        ^(KeyNotFound new key: aKey)
+            signal: 'key not found: ' , aKey printString
+    ]
+
+    "doesNotUnderstand: is already a world-level hook — the VM sends it — so
+     E4 needs no VM change here either. The exception carries the message and
+     the receiver, which is the whole reason MessageNotUnderstood has those
+     ivars (E0 defined them and nothing filled them in until now)."
+    doesNotUnderstand: aMessage <Message> ^ <Object> [
+        ^((MessageNotUnderstood new message: aMessage) receiver: self)
+            signal: 'does not understand ' , aMessage selector asString
+    ]
+]
+
+"── the silent out-of-bounds, fixed ──────────────────────────────────────
+ A bare <primitive:> with no fallback answers the receiver when the
+ primitive fails. These four had exactly that shape, so every out-of-range
+ access was a silent wrong answer rather than an error. The fallback runs
+ only on failure, so the fast path is untouched."
+
+ArrayedCollection subclass: Array [
+    at: i <Integer> ^ <Object> [
+        <primitive: 26>
+        ^self signalIndexOutOfBounds: i
+    ]
+    at: i <Integer> put: v <Object> ^ <Object> [
+        <primitive: 27>
+        ^self signalIndexOutOfBounds: i
+    ]
+]
+
+ArrayedCollection subclass: String [
+    "String>>at: reads through basicByteAt:, whose own failure answered the
+     String — which then re-entered Character value: and ran the stack out.
+     Bounds-checking here answers the honest error instead."
+    at: i <Integer> ^ <Character> [
+        (i isInteger and: [ i >= 1 and: [ i <= self size ] ])
+            ifFalse: [ ^self signalIndexOutOfBounds: i ].
+        ^Character value: (self basicByteAt: i)
+    ]
+    at: i <Integer> put: v <Character|Integer> ^ <Character|Integer> [
+        (i isInteger and: [ i >= 1 and: [ i <= self size ] ])
+            ifFalse: [ ^self signalIndexOutOfBounds: i ].
+        self basicByteAt: i put: (v isCharacter ifTrue: [ v value ] ifFalse: [ v ]).
+        ^v
+    ]
+]

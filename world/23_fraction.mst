@@ -40,7 +40,7 @@ Number subclass: Fraction [
 
     Fraction class >> numerator: n <Integer> denominator: d <Integer> ^ <Number> [
         | g num den sign |
-        d = 0 ifTrue: [ ^self error: 'division by zero' ].
+        d = 0 ifTrue: [ ^self signalZeroDivide: 'division by zero' ].
         sign := d < 0 ifTrue: [ -1 ] ifFalse: [ 1 ].
         num := n * sign.
         den := d * sign.
@@ -151,7 +151,7 @@ Number subclass: Integer [
         aNumber isDouble ifTrue: [ ^self asDouble / aNumber ].
         aNumber isFraction ifTrue: [
             ^Fraction numerator: self * aNumber denominator denominator: aNumber numerator ].
-        aNumber = 0 ifTrue: [ ^self error: 'division by zero' ].
+        aNumber = 0 ifTrue: [ ^self signalZeroDivide: 'division by zero' ].
         ^Fraction numerator: self denominator: aNumber
     ]
 ]
