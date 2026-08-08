@@ -37,6 +37,7 @@
 Object subclass: CocoaHelp [
     <classVars: Topics CodeBlocks Container Sidebar SidebarScroll SidebarFace SidebarDelegate
                 DocView DocScroll FindField RunButton RunButtons RunDelegates ActionDelegates
+                PendingUiSrc UiRunDelegate
                 CurrentTopic DocText FindTerm Matches MatchCursor>
 
     "── registration (CG7+ pattern; CocoaUI startup calls this by name) ──"
@@ -190,7 +191,7 @@ Object subclass: CocoaHelp [
         CodeBlocks do: [ :entry |
             | start len src rect x y btn |
             start := entry at: 1. len := entry at: 2. src := entry at: 3.
-            len > 0 ifTrue: [
+            (len > 0 and: [ (entry at: 4) ~~ #ref ]) ifTrue: [
                 rect := lm onMain
                     boundingRectForGlyphRange: (Array with: start with: len)
                     inTextContainer: tc.
@@ -209,8 +210,10 @@ Object subclass: CocoaHelp [
         btn := ((Cocoa classNamed: 'NSButton') onMain alloc) onMain
             initWithFrame: (Array with: x with: y with: 34.0 with: 20.0).
         img := (Cocoa classNamed: 'NSImage') onMain
-            imageWithSystemSymbolName: (launch ifTrue: [ 'play.rectangle.fill' ]
-                                               ifFalse: [ 'play.fill' ])
+            imageWithSystemSymbolName: (launch
+                ifTrue: [ 'play.rectangle.fill' ]
+                ifFalse: [ aKind == #ui ifTrue: [ 'play.square.fill' ]
+                                        ifFalse: [ 'play.fill' ] ])
             accessibilityDescription: 'Run this example'.
         img isNil
             ifTrue: [ btn onMain setTitle: 'Run' ]
@@ -218,10 +221,14 @@ Object subclass: CocoaHelp [
         btn onMain setBezelStyle: 1.
         btn onMain setToolTip: (launch
             ifTrue: [ 'Launch this as a program (its own window)' ]
-            ifFalse: [ 'Run this example in the Workspace' ]).
+            ifFalse: [ aKind == #ui
+                ifTrue: [ 'Run this here, in the interface VM' ]
+                ifFalse: [ 'Run this example in the Workspace' ] ]).
         btn onMain setAutoresizingMask: 0.
         holder := CocoaToolbarAction on: [
-            launch ifTrue: [ self launch: src ] ifFalse: [ self run: src ] ].
+            aKind == #launch ifTrue: [ self launch: src ] ifFalse: [
+                aKind == #ui ifTrue: [ self runHere: src ]
+                             ifFalse: [ self run: src ] ] ].
         delegate := MacvmDelegate actionTargetOn: holder.
         btn onMain setTarget: delegate.
         btn onMain setAction: 'macvmAction:'.
@@ -248,6 +255,36 @@ Object subclass: CocoaHelp [
         [ j >= 1 and: [ (aString at: j) = sp or: [ (aString at: j) = lf
                         or: [ (aString at: j) = tab ] ] ] ] whileTrue: [ j := j - 1 ].
         ^aString copyFrom: 1 to: j
+    ]
+
+    CocoaHelp class >> runHere: src [
+        "Evaluate in THIS VM — the interface worker. View code (`CocoaUI`,
+         `Cocoa classNamed:`, `MacvmDelegate`) exists only here; the Workspace
+         runs on the primary, where those names are undeclared, so a Workspace
+         run of a view example fails with `undeclared variable 'CocoaUI'`.
+
+         DEFERRED to the next run-loop turn, not run inline: the evaluated
+         source almost always performs `onMain` sends (that is what view code
+         IS), and a main-thread send issued from inside a handler that is
+         itself holding the main thread fails with 'no main run loop?'.
+         Handing it to the run loop puts it in an ordinary main-thread turn
+         where those sends complete."
+        PendingUiSrc := src.
+        UiRunDelegate isNil ifTrue: [
+            UiRunDelegate := MacvmDelegate actionTargetOn:
+                (CocoaToolbarAction on: [ self runPendingUi ]) ].
+        UiRunDelegate onMain performSelector: 'macvmAction:'
+                      withObject: nil afterDelay: 0.0
+    ]
+
+    CocoaHelp class >> runPendingUi [
+        | src r |
+        src := PendingUiSrc.
+        PendingUiSrc := nil.
+        src isNil ifTrue: [ ^self ].
+        r := [ Worker primEvalDoit: src ]
+                on: Error do: [ :e | 'error: ' , e messageText printString ].
+        CocoaUI appendTranscript: 'Docs (interface VM) => ' , r printString.
     ]
 
     CocoaHelp class >> launch: src [
@@ -441,8 +478,10 @@ Object subclass: CocoaHelp [
                 ifFalse: [
                     (self isFence: line) ifTrue: [
                         flushBody value.
-                        fenceKind := (self fenceInfoOf: line) = 'launch'
-                            ifTrue: [ #launch ] ifFalse: [ #code ].
+                        fenceKind := #code.
+                        (self fenceInfoOf: line) = 'launch' ifTrue: [ fenceKind := #launch ].
+                        (self fenceInfoOf: line) = 'ref' ifTrue: [ fenceKind := #ref ].
+                        (self fenceInfoOf: line) = 'ui' ifTrue: [ fenceKind := #ui ].
                         mode := #code ]
                     ifFalse: [ (self headingLevel: line) > 0 ifTrue: [
                         flushBody value.
@@ -586,7 +625,7 @@ Object subclass: CocoaHelp [
             self append: self nl font: nil color: nil into: storage.
             ^self indentFrom: start in: storage first: 22.0 head: 42.0 ].
         tag = #rule ifTrue: [ ^self appendRuleInto: storage ].
-        (tag = #code or: [ tag = #launch ]) ifTrue: [
+        (tag = #code or: [ tag = #launch or: [ tag = #ref or: [ tag = #ui ] ] ]) ifTrue: [
             | start |
             start := storage onMain length.
             "Remember where this listing landed and what it says, so the
@@ -894,6 +933,7 @@ Object subclass: CocoaHelp [
         ActionDelegates := nil. CurrentTopic := nil. DocText := nil.
         RunButton := nil. CodeBlocks := nil.
         RunButtons := nil. RunDelegates := nil.
+        PendingUiSrc := nil. UiRunDelegate := nil.
         FindTerm := nil. Matches := nil. MatchCursor := 0.
     ]
 ]
@@ -1184,78 +1224,96 @@ Source files are the truth, but edits made in the browsers persist to a versione
 
     CocoaHelp class >> appGuideText [ ^'# Guide: Build an App
 
-Let us add a real view to this window — a click counter — live, without restarting anything. Ten minutes.
+We are going to add a **temperature converter** to this window — drag a slider, read Celsius, Fahrenheit and Kelvin at once — while the system runs. Every block with a play button is a **complete program**; nothing carries over between presses, so each step shows the whole thing again.
 
-## 1. Define the model
+> **Where this code runs.** MACVM keeps two VMs. Your own work runs in the **primary**; the **interface** VM owns the window and everything AppKit. View code — `CocoaUI`, `Cocoa classNamed:`, `MacvmDelegate` — exists only in the interface VM, so the buttons on this page run these blocks *there*. Paste them into the Workspace instead and you get `undeclared variable ''CocoaUI''`, because the Workspace talks to the primary.
 
-In the **Workspace**, select this and press Cmd-D:
+## 1. The converter
 
-```
-Object subclass: ClickCounter [
-    <classVars: Count Label>
-    ClickCounter class >> count [ ^Count isNil ifTrue: [ 0 ] ifFalse: [ Count ] ]
-    ClickCounter class >> increment [
-        Count := self count + 1.
-        Label isNil ifFalse: [
-            Label onMain setStringValue: ''Clicks: '' , Count printString ]
+Press play:
+
+```ui
+Object subclass: Converter [
+    <classVars: Slider Readout>
+    Converter class >> update [
+        | c f k |
+        c := (Slider onMain doubleValue) rounded.
+        f := (c * 9 / 5 + 32) rounded.
+        k := c + 273.
+        Readout onMain setStringValue:
+            c printString , '' C      '' ,
+            f printString , '' F      '' ,
+            k printString , '' K''
     ]
-]
-```
-
-## 2. Build a view
-
-Views are ordinary AppKit objects driven from Smalltalk through the Cocoa bridge — `Cocoa classNamed:` fetches a class, `onMain` runs the send on the UI thread:
-
-```
-Object subclass: ClickCounter [
-    ClickCounter class >> containerView [
-        | v btn holder delegate |
+    Converter class >> containerView [
+        | v holder delegate |
         v := ((Cocoa classNamed: ''NSView'') onMain alloc) onMain
-            initWithFrame: (Array with: 0.0 with: 0.0 with: 400.0 with: 300.0).
-        Label := ((Cocoa classNamed: ''NSTextField'') onMain alloc) onMain
-            initWithFrame: (Array with: 20.0 with: 200.0 with: 300.0 with: 30.0).
-        Label onMain setEditable: false.
-        Label onMain setBordered: false.
-        Label onMain setDrawsBackground: false.
-        Label onMain setStringValue: ''Clicks: 0''.
-        v onMain addSubview: Label.
-        btn := ((Cocoa classNamed: ''NSButton'') onMain alloc) onMain
-            initWithFrame: (Array with: 20.0 with: 150.0 with: 140.0 with: 32.0).
-        btn onMain setTitle: ''Click me''.
-        btn onMain setBezelStyle: 1.
-        holder := CocoaToolbarAction on: [ self increment ].
+            initWithFrame: (Array with: 0.0 with: 0.0 with: 460.0 with: 200.0).
+        Readout := ((Cocoa classNamed: ''NSTextField'') onMain alloc) onMain
+            initWithFrame: (Array with: 24.0 with: 120.0 with: 400.0 with: 30.0).
+        Readout onMain setEditable: false.
+        Readout onMain setBordered: false.
+        Readout onMain setDrawsBackground: false.
+        Readout onMain setFont: ((Cocoa classNamed: ''NSFont'') onMain
+                                     boldSystemFontOfSize: 20.0).
+        v onMain addSubview: Readout.
+        Slider := ((Cocoa classNamed: ''NSSlider'') onMain alloc) onMain
+            initWithFrame: (Array with: 24.0 with: 70.0 with: 400.0 with: 24.0).
+        Slider onMain setMinValue: -40.0.
+        Slider onMain setMaxValue: 100.0.
+        Slider onMain setDoubleValue: 20.0.
+        Slider onMain setContinuous: true.
+        holder := CocoaToolbarAction on: [ self update ].
         delegate := MacvmDelegate actionTargetOn: holder.
-        btn onMain setTarget: delegate.
-        btn onMain setAction: ''macvmAction:''.
-        v onMain addSubview: btn.
+        Slider onMain setTarget: delegate.
+        Slider onMain setAction: ''macvmAction:''.
+        v onMain addSubview: Slider.
+        self update.
         ^v
     ]
 ]
 ```
 
-The `MacvmDelegate` line is the whole event story: AppKit calls the minted delegate, the delegate performs your block. Tables, text fields and menus all wire the same way.
+Three ideas carry the whole thing. **`Cocoa classNamed:`** fetches a real AppKit class. **`onMain`** sends the message on the UI thread — that is the entire bridge. **`MacvmDelegate actionTargetOn:`** is the event story: AppKit calls the delegate, the delegate runs your block. `setContinuous: true` is what makes the readout follow the drag instead of waiting for you to let go.
 
-## 3. Register it as a toolbar view
+## 2. Give it a tab
 
-```
-CocoaUI registerViewNamed: #clicks title: ''Clicks'' icon: nil
-        container: [ ClickCounter containerView ]
+```ui
+CocoaUI registerViewNamed: #convert title: ''Convert'' icon: ''thermometer.medium''
+        container: [ Converter containerView ]
         onShow: [ ].
-CocoaUI switchToView: #clicks.
 ```
 
-Your view is now a first-class citizen of the window.
+A **Convert** icon appears in the toolbar — click it, and drag the slider. The icon name is an SF Symbol; the base name of an SVG in `gui/assets/icons-mono/` works too.
 
-## 4. Make it permanent
+## 3. Change it while it runs
 
-Happy with it? Put the class in a file (say `world/85_clickcounter.mst`), add the registration to the startup path, and add the file to `world/cocoaui.list`. The Docs view you are reading followed exactly this path.
+Edit step 1 — add Rankine, or colour the readout blue below zero — press its play button, click another tab and back. The view rebuilds with your changes. Nothing restarted; the system stayed live throughout. That is the whole point of a Smalltalk.
 
-> Every view in this window — Browser, Debugger, this one — is built with precisely these ingredients and nothing more. Read `world/71_cocoahelp.mst` for a complete worked example.
+## 4. Keep it in a file — the familiar way
+
+Nothing here obliges you to grow the image. Treat the VM and image as your operating system, and your program as an ordinary document:
+
+1. Write the class in a plain `.mst` file — the **Editor** tab, or any editor, anywhere you like; your Documents folder is fine.
+2. **File ▸ File In.** The primary restarts from its clean boot state and loads your file on top — the same as `macvm run yourfile.mst`, but inside the running app. Because it starts from a fresh world every time, the same file files in again and again without stale-shape errors.
+3. Run it.
+
+Edit, file in, try. Your work lives in your file, not tangled into the image — and a file-in never leaves the world in a state you cannot get back to.
+
+## 5. Or make it part of the world
+
+When something has earned a permanent place, the Editor''s **Add to World** graduates its file into `world/user_<name>.mst`, adds it to `world.list`, imports it into the image, and restarts the primary with it present — so every future fresh world, and every reseed, still has it.
+
+By hand: drop the file in `world/`, add a line to `world/world.list` (or `world/cocoaui.list` for view code), then run `./reseed-world.sh` — **the app boots from `world/image.sqlite3`, not from the `.mst` files**, so without a reseed your file is never read.
+
+The Docs view you are reading took that path — read `world/71_cocoahelp.mst` for a complete worked example, sidebar and all.
+
+> Every view in this window — Browser, Debugger, this one — is built from these same pieces and nothing more.
 ' ]
 
     CocoaHelp class >> gameGuideText [ ^'# Guide: Build a Game
 
-Press the play button beside any block on this page and it runs. Start here.
+Press the play button beside a block and it runs. Every block that has one is a **complete program** — nothing is remembered between presses, so each step here shows the whole thing again, a little bigger. Copy the newest one and you always have something that works.
 
 ## 1. Make a noise
 
@@ -1263,7 +1321,7 @@ Press the play button beside any block on this page and it runs. Start here.
 Sound coin play.
 ```
 
-That is a whole working program. Try `Sound jump play` and `Sound zap play` too — change the word, press play again.
+A whole working program. Try `Sound jump play` and `Sound zap play` — change the word, press play again.
 
 ## 2. See what the engine can do
 
@@ -1271,28 +1329,26 @@ That is a whole working program. Try `Sound jump play` and `Sound zap play` too 
 Breakout launch
 ```
 
-A window opens and Breakout runs: bricks, a ball, a paddle on the arrow keys. Press **Escape** to close it.
-
-That is the same engine you are about to use, and Breakout is one ordinary Smalltalk class you can read in the Browser.
+A window opens and Breakout runs: bricks, a ball, a paddle on the arrow keys. **Escape** closes it. It is one ordinary class you can read in the Browser.
 
 ## 3. How a game really works
 
-Worth two minutes, because it explains the one thing that trips everyone up.
+Two minutes, and it explains the thing that trips everyone up.
 
-A game is a **program with a session**, not a handful of drawing commands. When you **launch** one, the app opens a game window, then calls your program roughly **60 times a second** to draw the next frame. Escape ends the session and closes the window. One game runs at a time.
+A game is a **program with a session**, not a handful of drawing commands. When you **launch** one, the app opens a game window and then calls your program about **60 times a second** to draw the next frame. Escape ends the session. One game runs at a time.
 
-So the shape of every game is:
+Every game has the same two halves:
 
-- **`start`** — runs once. Make the pane, choose your colours, set things up, then say what to do each frame (`onStep:`) and `run`.
+- **`start`** — runs once. Make the pane, choose colours, set the starting positions, say what to do each frame with `onStep:`, then `run`.
 - **`step`** — runs 60 times a second. Move things, draw the frame, `present` it.
 
-`run` does not loop and does not block; it just tells the app *this program is now live*, and returns. The app owns the clock.
+`run` does not loop and does not block; it says *this program is live* and returns. The app owns the clock.
 
-> **And this is the trap:** drawing commands typed loose in the Workspace do **nothing at all** — no window, no picture, no error. There is no session, so there is nowhere for them to go. Always put a game in a class and **launch** it.
+> **The trap:** drawing commands typed loose in the Workspace do **nothing at all** — no window, no picture, no error. There is no session for them to reach. A game always lives in a class, and you **launch** it.
 
-## 4. Your own game
+## 4. A ball that moves
 
-Press play to teach the system your game:
+Press play to teach the system this program:
 
 ```
 Object subclass: MyGame [
@@ -1316,7 +1372,7 @@ Object subclass: MyGame [
 ]
 ```
 
-Nothing appears yet — you have taught it, not started it. Now press play here:
+Nothing appears yet — you taught it, you did not start it. Now press play here:
 
 ```launch
 MyGame launch
@@ -1324,21 +1380,100 @@ MyGame launch
 
 A yellow ball bounces across the window. **Escape** stops it.
 
-Change a number in the class, press its play button, then launch again. Change, run, look.
-
 ## 5. Three rules that save an hour
 
-**Colours start at 16.** `paletteAt: 16 r: 20 g: 20 b: 40` puts a colour in slot 16; you then draw with `color: 16`. Red, green and blue run 0 to 255. Slots below 16 belong to the system and slot 0 is see-through, so **painting with a number under 16 gives you a black screen** — the most common surprise there is.
+**Colours start at 16.** `paletteAt: 16 r: 20 g: 20 b: 40` puts a colour in slot 16, and you draw with `color: 16`. Red, green and blue run 0 to 255. Slots below 16 belong to the system and slot 0 is see-through, so **painting with a number under 16 gives a black screen** — the most common surprise there is.
 
 **Draw, then `present`.** Drawing happens on a hidden page; `present` is the moment it appears, like taking the photo. End every `step` with it.
 
-**Teach, then launch.** Defining a class does not start it. The launch block does.
+**Teach, then launch.** Defining a class does not start it.
 
-## 6. The screen, and what you can draw
+## 6. Add a paddle you can steer
 
-The pane is **320 dots across and 240 down**, with (0, 0) at the **top-left**. These are messages you send inside `start` or `step`:
+The whole program again, with two new things: it remembers `paddle`, and it asks which arrow keys are held. Press play, then launch it below.
 
 ```
+Object subclass: MyGame [
+    | pane x y dx dy paddle |
+    MyGame class >> launch [ ^self new start ]
+    start [
+        pane := GamePane new.
+        pane paletteAt: 16 r: 20  g: 20  b: 40.
+        pane paletteAt: 17 r: 255 g: 200 b: 0.
+        pane paletteAt: 18 r: 90  g: 200 b: 255.
+        x := 160. y := 60. dx := 3. dy := 3. paddle := 140.
+        pane onStep: [ self step ].
+        pane run
+    ]
+    step [
+        (pane keyHeld: GamePane keyLeft)  ifTrue: [ paddle := (paddle - 7) max: 0 ].
+        (pane keyHeld: GamePane keyRight) ifTrue: [ paddle := (paddle + 7) min: 280 ].
+        x := x + dx. y := y + dy.
+        (x < 8 or: [ x > 312 ]) ifTrue: [ dx := 0 - dx ].
+        y < 8 ifTrue: [ dy := 0 - dy ].
+        (y > 210 and: [ y < 224 and: [ x > paddle and: [ x < (paddle + 40) ] ] ])
+            ifTrue: [ dy := 0 - dy ].
+        y > 240 ifTrue: [ x := 160. y := 60 ].
+        pane cls: 16.
+        pane fill: paddle y: 216 width: 40 height: 6 color: 18.
+        pane disc: x y: y radius: 6 color: 17.
+        pane present
+    ]
+]
+```
+
+```launch
+MyGame launch
+```
+
+Left and right arrows move the paddle. Miss, and the ball starts again from the top.
+
+## 7. Add sound and a score
+
+Once more, whole. Two more lines in `step` — a `coin` when the paddle connects, and the score drawn on screen.
+
+```
+Object subclass: MyGame [
+    | pane x y dx dy paddle score |
+    MyGame class >> launch [ ^self new start ]
+    start [
+        pane := GamePane new.
+        pane paletteAt: 16 r: 20  g: 20  b: 40.
+        pane paletteAt: 17 r: 255 g: 200 b: 0.
+        pane paletteAt: 18 r: 90  g: 200 b: 255.
+        x := 160. y := 60. dx := 3. dy := 3. paddle := 140. score := 0.
+        pane onStep: [ self step ].
+        pane run
+    ]
+    step [
+        (pane keyHeld: GamePane keyLeft)  ifTrue: [ paddle := (paddle - 7) max: 0 ].
+        (pane keyHeld: GamePane keyRight) ifTrue: [ paddle := (paddle + 7) min: 280 ].
+        x := x + dx. y := y + dy.
+        (x < 8 or: [ x > 312 ]) ifTrue: [ dx := 0 - dx ].
+        y < 8 ifTrue: [ dy := 0 - dy ].
+        (y > 210 and: [ y < 224 and: [ x > paddle and: [ x < (paddle + 40) ] ] ])
+            ifTrue: [ dy := 0 - dy. score := score + 1. Sound coin play ].
+        y > 240 ifTrue: [ x := 160. y := 60. score := 0. Sound zap play ].
+        pane cls: 16.
+        pane fill: paddle y: 216 width: 40 height: 6 color: 18.
+        pane disc: x y: y radius: 6 color: 17.
+        pane text: ''SCORE '' , score printString x: 8 y: 8 r: 255 g: 255 b: 255.
+        pane present
+    ]
+]
+```
+
+```launch
+MyGame launch
+```
+
+That is a real little game: input, physics, collision, sound and a score. Everything after this is more of the same.
+
+## 8. The screen, and what you can draw
+
+The pane is **320 dots across and 240 down**, with (0, 0) at the **top-left**. These are the messages you send inside `start` and `step` — a vocabulary to borrow from, not a program to run:
+
+```ref
 pane cls: 16.
 pane point: 10 y: 10 color: 17.
 pane line: 0 y: 0 to: 319 y: 239 color: 17.
@@ -1348,54 +1483,54 @@ pane text: ''SCORE 10'' x: 8 y: 8 r: 255 g: 255 b: 255.
 pane present.
 ```
 
-`cls:` fills the whole screen — start each frame with it. `fill:` is a rectangle: x, y, width, height. `text:` takes real red/green/blue values rather than a slot.
+Keys, for `step`:
 
-## 7. Steering
-
-Ask which keys are held, inside `step`:
-
+```ref
+(pane keyHeld: GamePane keyLeft)  ifTrue: [ ... ].
+(pane keyHeld: GamePane keyRight) ifTrue: [ ... ].
+(pane keyHeld: GamePane keyUp)    ifTrue: [ ... ].
+(pane keyHeld: GamePane keyDown)  ifTrue: [ ... ].
+(pane keyHeld: GamePane keyA)     ifTrue: [ ... ].   "space"
+(pane keyHeld: GamePane keyB)     ifTrue: [ ... ].   "Z"
 ```
-(pane keyHeld: GamePane keyLeft)  ifTrue: [ x := x - 4 ].
-(pane keyHeld: GamePane keyRight) ifTrue: [ x := x + 4 ].
-(pane keyHeld: GamePane keyA)     ifTrue: [ Sound zap play ].
+
+Sounds, anywhere:
+
+```ref
+Sound coin play.
+Sound jump play.
+Sound zap play.
 ```
 
-There is `keyLeft`, `keyRight`, `keyUp`, `keyDown`, `keyA` (space) and `keyB` (Z).
+Sprites — small pictures that move without you repainting behind them. Each row is a line of pixels, each digit one of the sprite''s own colours:
 
-## 8. Sprites
-
-A sprite is a small picture that moves without you repainting behind it. Each row is a line of pixels; each digit picks one of the sprite''s own colours:
-
-```
+```ref
 | id |
 id := pane defineSprite: #(''00111100'' ''01222210'' ''12222221'' ''01222210'' ''00111100'').
 (Sprite pane: pane id: id) moveTo: 100 y: 80.
 ```
 
-Draw them by hand, or in **Tools - Sprite Editor**, which saves them for you and previews them live.
+Cleanup, if your game starts anything that should stop with it:
 
-## 9. Tidying up
-
-If your game starts anything that should be cleaned up when it ends, say so:
-
-```
+```ref
 pane onReset: [ ''stopped'' ]
 ```
 
-That block runs however the session ends — Escape, the close button, or another game being launched.
+**Tools - Sprite Editor** draws sprites for you; **Tools - Sound Editor** designs instruments.
 
 ## If nothing shows up
 
 - Did you **launch** it? Teaching the class is not starting it.
 - Is your colour number **16 or higher**?
 - Did you `present` at the end of `step`?
+- Did you press play on the **newest** whole program? Each block here replaces the last — nothing carries over between presses.
 - Is another game still running? Escape closes it; only one runs at a time.
 
 ## Read the masters
 
 Each is one readable class, in the Browser:
 
-- `Breakout` — bouncing, bricks, lives, score. The best first read.
+- `Breakout` — the same ideas as section 7, plus bricks and lives. The best next read.
 - `Worms`, `Galaxigans` — sprites and swarms.
 - `MandelZoom` — heavy arithmetic, the JIT at full stretch.
 
