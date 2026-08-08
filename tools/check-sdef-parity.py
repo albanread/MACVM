@@ -36,40 +36,30 @@ def sdef_views(sdef_path):
 
 
 def world_views(world_dir):
-    """[name] in live registration order, read out of the world source."""
-    ui = pathlib.Path(world_dir) / "64_cocoaui.mst"
-    src = ui.read_text(encoding="utf-8")
-    # `CocoaUI class >> startup` ends at the next class-side method definition.
-    m = re.search(r"CocoaUI class >> startup\b", src)
+    """[name] in CODE order, read out of `CocoaScript class >> viewCodes`.
+
+    THE MAPPING THE RUNTIME ACTUALLY USES. `scriptCurrentView` answers
+    `codeFor: CocoaUI activeView in: self viewCodes prefix: 'MvV'` — it looks
+    the active view up BY NAME in `viewCodes` and takes the code from its
+    index THERE. So the invariant that keeps a compiled script correct is
+    `viewCodes` order == the sdef's enumerator order, and nothing else.
+
+    This gate used to read the REGISTRATION sequence in `CocoaUI class >>
+    startup` instead. That is a different list for a legitimate reason — a
+    view can be registered in any toolbar position, and CocoaBrowser V1 is
+    deliberately registered as NO tab at all while keeping its `browser`
+    enumerator — so the gate reported drift on a system that was correct, and
+    blocked the app build. Registration order sets where a tab SITS; it has
+    never set which code a view REPORTS.
+    """
+    cs = pathlib.Path(world_dir) / "74_cocoascript.mst"
+    src = cs.read_text(encoding="utf-8")
+    m = re.search(
+        r"CocoaScript class >> viewCodes\s*\[\s*\^#\(([^)]*)\)", src, re.S
+    )
     if not m:
-        raise SystemExit(f"{ui}: no `CocoaUI class >> startup`")
-    body = src[m.end():]
-    end = re.search(r"\n    CocoaUI class >> \w", body)
-    if end:
-        body = body[: end.start()]
-
-    # Map each view class to the symbol it registers, from its own file.
-    registers = {}  # class name -> view symbol
-    for path in sorted(pathlib.Path(world_dir).glob("*.mst")):
-        text = path.read_text(encoding="utf-8")
-        for cls, sym in re.findall(
-            r"(\w+) class >> register\b.*?registerViewNamed: #(\w+)", text, re.S
-        ):
-            registers.setdefault(cls, sym)
-
-    views = []
-    # Walk `start` top to bottom; both shapes register, in the order written.
-    for mm in re.finditer(
-        r"self\s+registerViewNamed:\s*#(\w+)"
-        r"|\(Worker classNamed: #(\w+)\)\s*ifNotNil:",
-        body,
-    ):
-        direct, cls = mm.group(1), mm.group(2)
-        if direct:
-            views.append(direct)
-        elif cls in registers:
-            views.append(registers[cls])
-    return views
+        raise SystemExit(f"{cs}: no `CocoaScript class >> viewCodes` literal")
+    return m.group(1).split()
 
 
 def main():
