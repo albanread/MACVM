@@ -1234,7 +1234,7 @@ Press play. This is a temperature explorer: twelve landmarks from **absolute zer
 
 ```ui
 Object subclass: TempScale [
-    <classVars: Slider Name Readout Bar Fill BarW>
+    <classVars: Slider Name Readout Bar Fill BarW BarY>
     TempScale class >> stops [
         | t |
         t := OrderedCollection new.
@@ -1279,7 +1279,7 @@ Object subclass: TempScale [
         Readout onMain setStringValue:
             c printString , '' C     '' , f printString , '' F     '' , k printString , '' K''.
         w := BarW * i // self stops size.
-        Fill onMain setFrame: (Array with: 0.0 with: 0.0 with: w asFloat with: 26.0).
+        Fill onMain setFrame: (Array with: 24.0 with: BarY with: w asFloat with: 26.0).
         Fill onMain setFillColor: (self colorFor: c).
         Name onMain setTextColor: (self colorFor: c)
     ]
@@ -1320,17 +1320,24 @@ Object subclass: TempScale [
         Readout onMain setFont: ((Cocoa classNamed: ''NSFont'') onMain
                                      userFixedPitchFontOfSize: 14.0).
         v onMain addSubview: Readout.
+        "Track and fill are SIBLINGS, both in the parent view. Putting the
+         fill INSIDE the track looks natural but an NSBox parents subviews
+         into its own content view, which is inset from its frame — the fill
+         then overhangs the top and left edges and reads as a drop shadow.
+         The fill is added second, so it draws over the track."
+        BarY := top - 120.
         Bar := ((Cocoa classNamed: ''NSBox'') onMain alloc) onMain
-            initWithFrame: (Array with: 24.0 with: top - 120 with: BarW with: 26.0).
+            initWithFrame: (Array with: 24.0 with: BarY with: BarW with: 26.0).
         Bar onMain setAutoresizingMask: CocoaUI maskMinYMargin.
         Bar onMain setBoxType: 4. Bar onMain setTitlePosition: 0.
         Bar onMain setFillColor: ((Cocoa classNamed: ''NSColor'') onMain
                                       quaternaryLabelColor).
         v onMain addSubview: Bar.
         Fill := ((Cocoa classNamed: ''NSBox'') onMain alloc) onMain
-            initWithFrame: (Array with: 0.0 with: 0.0 with: 100.0 with: 26.0).
+            initWithFrame: (Array with: 24.0 with: BarY with: 100.0 with: 26.0).
+        Fill onMain setAutoresizingMask: CocoaUI maskMinYMargin.
         Fill onMain setBoxType: 4. Fill onMain setTitlePosition: 0.
-        Bar onMain addSubview: Fill.
+        v onMain addSubview: Fill.
         Slider := ((Cocoa classNamed: ''NSSlider'') onMain alloc) onMain
             initWithFrame: (Array with: 24.0 with: top - 160 with: BarW with: 24.0).
         Slider onMain setAutoresizingMask: CocoaUI maskMinYMargin.
