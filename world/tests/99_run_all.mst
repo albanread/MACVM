@@ -60,5 +60,6 @@ TestRunner run: NumericCompletionTests.
 TestRunner run: ClockCompletionTests.
 TestRunner run: ExceptionVerbTests.
 TestRunner run: VmErrorTests.
+TestRunner run: CocoaStringTests.
 TestRunner run: ExceptionResumeTests.
 TestRunner report.

@@ -1,0 +1,199 @@
+"56_cocoastring_tests.mst — gates world/50_cocoastring.mst.
+
+ The claim under test is not 'CocoaString works' but 'CocoaString counts
+ what Cocoa counts'. Every assertion below that pins a number pins it
+ against the UTF-16 model, and several deliberately show the ordinary
+ String disagreeing — because that disagreement is the reason the class
+ exists, and a test suite that hid it would be testing the wrong thing.
+
+ These run headless. The Objective-C runtime is present in the plain macvm
+ binary (Foundation is dlopen'd), so NSString is reachable without a GUI."
+
+TestCase subclass: CocoaStringTests [
+    runAll [
+        self runTest: #testSizeIsUtf16NotBytes do: [ self testSizeIsUtf16NotBytes ].
+        self runTest: #testIndexingMatchesNsString
+             do: [ self testIndexingMatchesNsString ].
+        self runTest: #testAstralPlaneAndCodePoints
+             do: [ self testAstralPlaneAndCodePoints ].
+        self runTest: #testRangesAreZeroBasedUtf16
+             do: [ self testRangesAreZeroBasedUtf16 ].
+        self runTest: #testAbsentSubstringAnswersNil
+             do: [ self testAbsentSubstringAnswersNil ].
+        self runTest: #testConversionRoundTrips do: [ self testConversionRoundTrips ].
+        self runTest: #testOrdinaryStringProtocol do: [ self testOrdinaryStringProtocol ].
+        self runTest: #testCaseConversionIsUnicodeAware
+             do: [ self testCaseConversionIsUnicodeAware ].
+        self runTest: #testComparison do: [ self testComparison ].
+        self runTest: #testMutability do: [ self testMutability ].
+        self runTest: #testAcceptsEitherSpecies do: [ self testAcceptsEitherSpecies ].
+        self runTest: #testInvalidUtf8RaisesAtTheBoundary
+             do: [ self testInvalidUtf8RaisesAtTheBoundary ].
+    ]
+
+    "The headline disagreement, asserted from both sides."
+    testSizeIsUtf16NotBytes [
+        self assert: 'café' size equals: 5.              "bytes"
+        self assert: 'café' asCocoaString size equals: 4. "UTF-16 units"
+        self assert: 'café' asCocoaString characterCount equals: 4.
+        "pure ASCII is where all three coincide — which is exactly why the
+         editor and colouriser have been correct by luck so far"
+        self assert: 'abc' size equals: 3.
+        self assert: 'abc' asCocoaString size equals: 3.
+        self assert: 'abc' asCocoaString characterCount equals: 3.
+        self assert: '' asCocoaString isEmpty.
+        self assert: 'x' asCocoaString notEmpty
+    ]
+
+    "A byte-String's at: answers half of a multi-byte sequence; ours answers
+     the character."
+    testIndexingMatchesNsString [
+        self assert: ('café' at: 4) asInteger equals: 195.  "first UTF-8 byte of é"
+        self assert: ('café' at: 5) asInteger equals: 169.  "its continuation"
+        self assert: ('café' asCocoaString at: 4) asInteger equals: 233. "é itself"
+        self assert: ('abc' asCocoaString at: 1) equals: $a.
+        self assert: ('abc' asCocoaString at: 3) equals: $c.
+        "1-based like every Smalltalk collection, though NSString is 0-based"
+        self assert: ([ 'abc' asCocoaString at: 0 ] on: IndexOutOfBounds do: [ :e | #oob ])
+                     equals: #oob.
+        self assert: ([ 'abc' asCocoaString at: 4 ] on: IndexOutOfBounds do: [ :e | #oob ])
+                     equals: #oob
+    ]
+
+    "An astral character is ONE scalar and TWO UTF-16 units — the case that
+     separates size from characterCount, and the reason codePointAt: exists."
+    testAstralPlaneAndCodePoints [
+        | e |
+        e := '🎩ab' asCocoaString.
+        self assert: e size equals: 4.            "2 surrogates + a + b"
+        self assert: e characterCount equals: 3.  "the hat, a, b"
+        self assert: (e codePointAt: 1) equals: 16r1F3A9.
+        "the raw units are the surrogate halves"
+        self assert: ((e at: 1) asInteger between: 16rD800 and: 16rDBFF).
+        self assert: ((e at: 2) asInteger between: 16rDC00 and: 16rDFFF).
+        "a non-surrogate answers itself"
+        self assert: (e codePointAt: 3) equals: 97.
+        "and the byte-String sees four bytes for the hat alone"
+        self assert: '🎩' size equals: 4.
+        self assert: '🎩' asCocoaString size equals: 2.
+        self assert: '🎩' asCocoaString characterCount equals: 1
+    ]
+
+    "The point of the class: a range that AppKit can use unchanged —
+     0-based, in UTF-16 units, measured past an astral character."
+    testRangesAreZeroBasedUtf16 [
+        | e |
+        e := '🎩ab' asCocoaString.
+        "'ab' starts at unit 2 because the hat occupies units 0 and 1"
+        self assert: (e rangeOf: 'ab') equals: #(2 2).
+        self assert: (e indexOfSubstring: 'ab') equals: 3.  "1-based Smalltalk"
+        self assert: ('abcd' asCocoaString rangeOf: 'bc') equals: #(1 2).
+        self assert: ('abcd' asCocoaString rangeAll) equals: #(0 4).
+        self assert: ('café' asCocoaString rangeAll) equals: #(0 4).
+        self assert: ('abc' asCocoaString includesSubstring: 'bc')
+    ]
+
+    "NSString answers NSNotFound (NSIntegerMax) for an absent substring, and
+     that does NOT FIT IN A SMALLINTEGER — the #range marshal fails rather
+     than returning a sentinel. rangeOf: asks containsString: first, so the
+     absent case answers nil instead of raising. This is a bridge-wide trap,
+     not a local one."
+    testAbsentSubstringAnswersNil [
+        self assert: ('abc' asCocoaString rangeOf: 'zz') equals: nil.
+        self assert: ('abc' asCocoaString indexOfSubstring: 'zz') equals: 0.
+        self deny: ('abc' asCocoaString includesSubstring: 'zz').
+        self assert: ('' asCocoaString rangeOf: 'x') equals: nil.
+        "NSNotFound really is bigger than a SmallInteger — the premise"
+        self assert: SmallInteger maxVal < 9223372036854775807
+    ]
+
+    testConversionRoundTrips [
+        self assert: 'café' asCocoaString asString equals: 'café'.
+        self assert: '🎩ab' asCocoaString asString equals: '🎩ab'.
+        self assert: '' asCocoaString asString equals: ''.
+        self assert: 'plain ascii' asCocoaString asString equals: 'plain ascii'.
+        self assert: 'sym' asCocoaString asSymbol equals: #sym.
+        "asCocoaString on a CocoaString is the identity, not a re-encode"
+        self assert: 'x' asCocoaString asCocoaString asString equals: 'x'
+    ]
+
+    testOrdinaryStringProtocol [
+        self assert: ('ab' asCocoaString , 'cd') asString equals: 'abcd'.
+        self assert: ('café' asCocoaString copyFrom: 1 to: 3) asString equals: 'caf'.
+        self assert: ('café' asCocoaString copyFrom: 4 to: 4) asString equals: 'é'.
+        self assert: ('abc' asCocoaString startsWith: 'ab').
+        self deny: ('abc' asCocoaString startsWith: 'bc').
+        self assert: ('abc' asCocoaString endsWith: 'bc').
+        self assert: ('  x  ' asCocoaString trimmed) asString equals: 'x'.
+        self assert: ([ 'abc' asCocoaString copyFrom: 1 to: 9 ]
+                        on: IndexOutOfBounds do: [ :e | #oob ]) equals: #oob
+    ]
+
+    "A byte-String cannot uppercase é; NSString can, because it knows what a
+     character is."
+    testCaseConversionIsUnicodeAware [
+        self assert: 'café' asCocoaString asUppercase asString equals: 'CAFÉ'.
+        self assert: 'CAFÉ' asCocoaString asLowercase asString equals: 'café'.
+        self assert: 'abc' asCocoaString asUppercase asString equals: 'ABC'
+    ]
+
+    testComparison [
+        self assert: ('a' asCocoaString compare: 'b') equals: -1.
+        self assert: ('b' asCocoaString compare: 'a') equals: 1.
+        self assert: ('a' asCocoaString compare: 'a') equals: 0.
+        self assert: 'a' asCocoaString < 'b'.
+        self assert: 'b' asCocoaString > 'a'.
+        self assert: 'a' asCocoaString <= 'a'.
+        self assert: 'a' asCocoaString >= 'a'.
+        "= works against both species, and against an equal CocoaString"
+        self assert: 'café' asCocoaString = 'café'.
+        self assert: 'café' asCocoaString = 'café' asCocoaString.
+        self deny: 'café' asCocoaString = 'cafe'.
+        self deny: 'abc' asCocoaString = 3
+    ]
+
+    "Mutability follows Cocoa's own split, and the guard is ours — a clear
+     error beats a Cocoa exception three frames down."
+    testMutability [
+        | m |
+        m := CocoaString mutable: 'x'.
+        self assert: m isMutable.
+        m append: 'y'; append: 'z'.
+        self assert: m asString equals: 'xyz'.
+        self assert: m size equals: 3.
+        self assert: CocoaString new asString equals: ''.
+        self assert: CocoaString new isMutable.
+        self deny: 'x' asCocoaString isMutable.
+        self assert: ([ 'x' asCocoaString append: 'y' ] on: Error do: [ :e | #immutable ])
+                     equals: #immutable
+    ]
+
+    "Every method takes a String or a CocoaString, so a caller never has to
+     convert defensively."
+    testAcceptsEitherSpecies [
+        | c |
+        c := 'abcd' asCocoaString.
+        self assert: (c rangeOf: 'bc' asCocoaString) equals: #(1 2).
+        self assert: (c startsWith: 'ab' asCocoaString).
+        self assert: (c , 'ef' asCocoaString) asString equals: 'abcdef'.
+        self assert: (c compare: 'abcd' asCocoaString) equals: 0.
+        self assert: ((CocoaString mutable: 'p') append: 'q' asCocoaString) asString
+                     equals: 'pq'
+    ]
+
+    "Conversion is where the encoding question belongs, and it is loud now:
+     a String holding non-UTF-8 bytes raises instead of being silently
+     rewritten to U+FFFD (bridge, 1b77596)."
+    testInvalidUtf8RaisesAtTheBoundary [
+        | bad |
+        bad := String new: 2.
+        bad at: 1 put: (Character value: 200).
+        bad at: 2 put: $x.
+        self assert: bad size equals: 2.
+        self assert: ([ bad asCocoaString ] on: Error do: [ :e | #raised ])
+                     equals: #raised.
+        "valid text is unaffected"
+        self assert: ([ 'café' asCocoaString size ] on: Error do: [ :e | #raised ])
+                     equals: 4
+    ]
+]

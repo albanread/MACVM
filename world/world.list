@@ -111,6 +111,11 @@
 # Cocoa facade, DNU dispatch, the main-thread hop + ObjcMainProxy
 # (docs/cocoa_bridge_design.md; prims 230-242). Fails cleanly headless.
 49_cocoa.mst
+# CocoaString (docs/cocoa_bridge_design.md): a Smalltalk string that IS an
+# NSString — size/indices/ranges in UTF-16 units, so any range it answers is
+# valid for AppKit, and objcRef is the NSString itself (no marshalling at the
+# boundary). String stays the byte vector; the two convert explicitly.
+50_cocoastring.mst
 # CocoaFile: whole-file slurp/spit as a UTF-8 String via NSString's own file
 # methods (direct bridge send — thread-safe, works headless). The encoding-
 # aware companion to PosixFile (world/61). Lettered slot, like 58a_base64.

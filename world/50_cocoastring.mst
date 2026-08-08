@@ -1,0 +1,235 @@
+"50_cocoastring.mst — CocoaString: a Smalltalk string that IS an NSString.
+
+ The ordinary `String` is a BYTE VECTOR — one byte per Character, Latin-1
+ flyweights, `size` counting bytes. That is the right model for source code,
+ protocol framing and NativeBuffer I/O, and the wrong one for text that has
+ to meet Cocoa, because the two disagree about what a string even is:
+
+     'café' size            -> 5   (bytes)
+     NSString length        -> 4   (UTF-16 code units)
+     characters             -> 4
+     '🎩' size              -> 4   (bytes)
+     NSString length        -> 2   (a surrogate pair)
+
+ None is wrong; they count different things. But it means an index or range
+ computed on one side is meaningless on the other — and `setSelectedRange:`,
+ `addAttribute:value:range:` and every other AppKit text API takes NSRanges
+ in UTF-16 units. Today the editor and the colouriser are correct only
+ because the code they handle is ASCII, where all three numbers coincide.
+
+ I am the other choice: an NSString held directly. My `size` is its
+ `length`, my indices are its indices, and any range I answer can be handed
+ to AppKit unchanged. I also cost nothing to pass across — `objcRef` IS the
+ NSString, so there is no marshalling at the boundary at all, where a
+ `String` pays a UTF-8 encode on every crossing.
+
+ What I am NOT: a replacement for String. Use String for bytes and for
+ anything that never meets Cocoa; use me for text that does. `asString`
+ and `CocoaString fromString:` convert explicitly, and the conversion is
+ the honest place for the encoding question to surface — invalid UTF-8
+ raises there (bridge, 1b77596) rather than being silently rewritten.
+
+ Mutability follows Cocoa's own split: I wrap an immutable NSString unless
+ built through `new`/`mutable`, which give an NSMutableString. `append:`
+ and friends check, so a mutation on an immutable receiver is a clear error
+ rather than a Cocoa exception from three frames down."
+
+Object subclass: CocoaString [
+    | ref mutable |
+
+    "── construction ─────────────────────────────────────────────────────"
+
+    CocoaString class >> fromString: aString <String> ^ <CocoaString> [
+        "From a Smalltalk String. Raises if the bytes are not valid UTF-8 —
+         the boundary is where that question belongs."
+        ^self basicNew setRef: (Cocoa nsString: aString) mutable: false
+    ]
+    CocoaString class >> on: anObjcRef <ObjcRef> ^ <CocoaString> [
+        "Adopt an NSString we were handed (a delegate argument, a defaults
+         value, an NSTextView's `string`). No copy, no conversion."
+        ^self basicNew setRef: anObjcRef mutable: false
+    ]
+    CocoaString class >> new ^ <CocoaString> [ ^self mutable: '' ]
+    CocoaString class >> mutable: aString <String> ^ <CocoaString> [
+        "An NSMutableString seeded from aString."
+        | m |
+        m := (Cocoa classNamed: 'NSMutableString') send: 'stringWithString:'
+                 with: (Cocoa nsString: aString).
+        ^self basicNew setRef: m mutable: true
+    ]
+
+    setRef: anObjcRef <ObjcRef> mutable: aBool <Boolean> ^ <CocoaString> [
+        ref := anObjcRef. mutable := aBool. ^self
+    ]
+
+    "The NSString itself — hand this to any Cocoa API with no marshalling.
+     That zero-cost hand-off is half the reason I exist."
+    objcRef ^ <ObjcRef> [ ^ref ]
+    isMutable ^ <Boolean> [ ^mutable ]
+    release [ ref isNil ifFalse: [ ref release. ref := nil ]. ^self ]
+    isValid ^ <Boolean> [ ^ref isNil not and: [ ref isValid ] ]
+
+    "── size and indexing, in NSString's own units ────────────────────────
+     UTF-16 code units, deliberately: it is what makes every range I answer
+     valid for AppKit. `codePointAt:` is there for the astral case, where a
+     unit is half a surrogate pair."
+
+    size ^ <Integer> [ ^ref sendI64: 'length' ]
+    isEmpty ^ <Boolean> [ ^self size = 0 ]
+    notEmpty ^ <Boolean> [ ^self size > 0 ]
+
+    at: i <Integer> ^ <Character> [
+        "1-based like every Smalltalk collection, though NSString is 0-based
+         underneath — the translation lives here so callers never juggle it."
+        (i between: 1 and: self size) ifFalse: [ ^self signalIndexOutOfBounds: i ].
+        ^Character value: (ref send: 'characterAtIndex:' args: (Array with: i - 1) ret: #i64)
+    ]
+    codePointAt: i <Integer> ^ <Integer> [
+        "The full Unicode scalar starting at UTF-16 index i, combining a
+         surrogate pair when one starts there. Answers the raw unit for an
+         unpaired half rather than guessing."
+        | hi lo |
+        hi := (self at: i) asInteger.
+        (hi between: 16rD800 and: 16rDBFF) ifFalse: [ ^hi ].
+        i >= self size ifTrue: [ ^hi ].
+        lo := (self at: i + 1) asInteger.
+        (lo between: 16rDC00 and: 16rDFFF) ifFalse: [ ^hi ].
+        ^16r10000 + ((hi - 16rD800) * 1024) + (lo - 16rDC00)
+    ]
+    characterCount ^ <Integer> [
+        "Unicode scalars, NOT UTF-16 units — what a person means by 'how many
+         characters'. Costs a walk; `size` is the cheap one."
+        | n i |
+        n := 0. i := 1.
+        [ i <= self size ] whileTrue: [
+            n := n + 1.
+            i := i + ((self codePointAt: i) > 16rFFFF ifTrue: [ 2 ] ifFalse: [ 1 ]) ].
+        ^n
+    ]
+
+    "── the ranges that are the whole point ──────────────────────────────
+     Every range below is in UTF-16 units and 0-based — exactly what
+     setSelectedRange:, addAttribute:value:range: and scrollRangeToVisible:
+     expect. Handing them one of these is correct by construction."
+
+    rangeOf: aStringOrCocoaString <Object> ^ <Object> [
+        "#(location length) 0-based, or NIL when absent — hence the <Object>
+         return rather than <Array>; the checker was right to notice.
+
+         Ask containsString: FIRST, and this is not defensive politeness:
+         when the substring is absent NSString answers a range whose
+         location is NSNotFound — NSIntegerMax, 9223372036854775807 — which
+         does NOT FIT IN A SMALLINTEGER. The #range marshal fails on the way
+         back, so `rangeOfString:` raises rather than answering a sentinel a
+         guard could test. That is a bridge-wide trap, not a local one: any
+         Cocoa API documented to answer NSNotFound behaves this way here."
+        | ns |
+        ns := self asNsFor: aStringOrCocoaString.
+        (ref send: 'containsString:' args: (Array with: ns) ret: #bool)
+            ifFalse: [ ^nil ].
+        ^ref send: 'rangeOfString:' args: (Array with: ns) ret: #range
+    ]
+    rangeAll ^ <Array> [ ^Array with: 0 with: self size ]
+    includesSubstring: aStringOrCocoaString <Object> ^ <Boolean> [
+        ^(self rangeOf: aStringOrCocoaString) isNil not
+    ]
+    indexOfSubstring: aStringOrCocoaString <Object> ^ <Integer> [
+        "1-based Smalltalk index, or 0 when absent — String>>indexOf:'s own
+         convention, so the two classes read alike."
+        | r |
+        r := self rangeOf: aStringOrCocoaString.
+        ^r isNil ifTrue: [ 0 ] ifFalse: [ (r at: 1) + 1 ]
+    ]
+
+    "── the ordinary string protocol, answered by NSString ───────────────"
+
+    , aStringOrCocoaString <Object> ^ <CocoaString> [
+        ^CocoaString on: (ref send: 'stringByAppendingString:'
+                              with: (self asNsFor: aStringOrCocoaString))
+    ]
+    copyFrom: start <Integer> to: stop <Integer> ^ <CocoaString> [
+        | loc len |
+        loc := start - 1. len := stop - start + 1.
+        (loc >= 0 and: [ len >= 0 and: [ loc + len <= self size ] ])
+            ifFalse: [ ^self signalIndexOutOfBounds: start ].
+        ^CocoaString on: (ref send: 'substringWithRange:'
+                              args: (Array with: loc with: len) ret: #id)
+    ]
+    asUppercase ^ <CocoaString> [ ^CocoaString on: (ref send: 'uppercaseString') ]
+    asLowercase ^ <CocoaString> [ ^CocoaString on: (ref send: 'lowercaseString') ]
+    trimmed ^ <CocoaString> [
+        "NSString trims against a CHARACTER SET, not a default — the
+         whitespace-and-newline set is the one a `trimmed` should mean."
+        | set |
+        set := (Cocoa classNamed: 'NSCharacterSet')
+                   send: 'whitespaceAndNewlineCharacterSet'.
+        ^CocoaString on: (ref send: 'stringByTrimmingCharactersInSet:'
+                              args: (Array with: set) ret: #id)
+    ]
+
+    startsWith: aStringOrCocoaString <Object> ^ <Boolean> [
+        ^ref send: 'hasPrefix:' args: (Array with: (self asNsFor: aStringOrCocoaString))
+             ret: #bool
+    ]
+    endsWith: aStringOrCocoaString <Object> ^ <Boolean> [
+        ^ref send: 'hasSuffix:' args: (Array with: (self asNsFor: aStringOrCocoaString))
+             ret: #bool
+    ]
+
+    "── comparison ───────────────────────────────────────────────────────
+     `=` is exact (isEqualToString:); `compare:` is NSString's ordering and
+     `localizedCompare:` the user-visible one — the distinction Cocoa draws
+     and a byte-comparing String cannot."
+    = anObject <Object> ^ <Boolean> [
+        (anObject isKindOf: CocoaString) ifTrue: [
+            ^ref send: 'isEqualToString:' args: (Array with: anObject objcRef) ret: #bool ].
+        anObject isString ifTrue: [ ^self asString = anObject ].
+        ^false
+    ]
+    hash ^ <Integer> [ ^self asString hash ]
+    compare: other <Object> ^ <Integer> [
+        "-1 / 0 / 1, NSComparisonResult's own values."
+        ^ref send: 'compare:' args: (Array with: (self asNsFor: other)) ret: #i64
+    ]
+    localizedCompare: other <Object> ^ <Integer> [
+        ^ref send: 'localizedCompare:' args: (Array with: (self asNsFor: other)) ret: #i64
+    ]
+    < other <Object> ^ <Boolean> [ ^(self compare: other) < 0 ]
+    <= other <Object> ^ <Boolean> [ ^(self compare: other) <= 0 ]
+    > other <Object> ^ <Boolean> [ ^(self compare: other) > 0 ]
+    >= other <Object> ^ <Boolean> [ ^(self compare: other) >= 0 ]
+
+    "── mutation (NSMutableString only) ──────────────────────────────────"
+
+    append: aStringOrCocoaString <Object> ^ <CocoaString> [
+        self checkMutable.
+        ref send: 'appendString:' with: (self asNsFor: aStringOrCocoaString).
+        ^self
+    ]
+    checkMutable [
+        mutable == true ifFalse: [
+            ^self error: 'this CocoaString is immutable (use CocoaString mutable:)' ].
+        ^self
+    ]
+
+    "── conversion, explicit in both directions ──────────────────────────"
+
+    asString ^ <String> [ ^ref sendString: 'description' ]
+    asSymbol ^ <Symbol> [ ^self asString asSymbol ]
+    asCocoaString ^ <CocoaString> [ ^self ]
+    printOn: aStream [ aStream nextPutAll: self asString ]
+
+    "An NSString for either species, so every method above takes a String or
+     a CocoaString without the caller thinking about it."
+    asNsFor: aStringOrCocoaString <Object> ^ <ObjcRef> [
+        (aStringOrCocoaString isKindOf: CocoaString)
+            ifTrue: [ ^aStringOrCocoaString objcRef ].
+        ^Cocoa nsString: aStringOrCocoaString
+    ]
+]
+
+"Re-opened so `'text' asCocoaString` reads the way `asSymbol` does. String
+ loads long before this file, which is why the extension lives here."
+ArrayedCollection subclass: String [
+    asCocoaString ^ <CocoaString> [ ^CocoaString fromString: self ]
+]
