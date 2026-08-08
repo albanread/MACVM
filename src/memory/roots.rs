@@ -265,6 +265,14 @@ where
     // any `f(vm, oop)` call below can reborrow `vm` mutably. -------------
     let mut frames = Vec::new();
     walk_frames(vm, |fv| frames.push(fv));
+    // DBGPIC (stale-slot forensics): a copy of the walk for the STALE-SLOT
+    // dump below — by the time a stale slot is detected, `frames` itself
+    // has been consumed. FrameView is Copy; the clone is DBGPIC-only.
+    let frames_dbg: Vec<FrameView> = if std::env::var("MACVM_DBGPIC").is_ok() {
+        frames.clone()
+    } else {
+        Vec::new()
+    };
 
     // DBGPIC (S24 A1 GC forensics): a frame appearing TWICE in one walk
     // visits every one of its slots twice — the second visit hands the
@@ -391,15 +399,68 @@ where
                         if a >= vm.universe.to.start && a < vm.universe.to.top {
                             let nm_ref = vm.code_table.get(nm).expect("checked above");
                             eprintln!(
-                                "DBGPIC STALE-SLOT nm={} block={} frame_slots={} fp={fp:#x} ret_pc={ret_pc:#x} rel_pc={:#x} code_base={:#x} slot={slot} word={:#x} scavs={}",
+                                "DBGPIC STALE-SLOT nm={} sel={} block={} frame_slots={} fp={fp:#x} slot_addr={:#x} ret_pc={ret_pc:#x} rel_pc={:#x} code_base={:#x} slot={slot} word={:#x} scavs={}",
                                 nm.0,
+                                nm_ref.key_selector.as_string(),
                                 nm_ref.block_method.is_some(),
                                 nm_ref.frame_slots,
+                                addr as u64,
                                 ret_pc - nm_ref.code.base as u64,
                                 nm_ref.code.base as usize,
                                 old.raw(),
                                 vm.universe.gc_stats.scavenge_count
                             );
+                            // The trapping nmethod's ENTIRE safepoint table:
+                            // pc_off + whether each map covers the stale
+                            // slot — the stale value means SOME earlier-
+                            // visited safepoint's map missed a slot this
+                            // one claims.
+                            for d in &nm_ref.pcdescs {
+                                let m = &nm_ref.oopmaps[d.oopmap as usize];
+                                let s: Vec<u16> = m.iter_slots().collect();
+                                eprintln!(
+                                    "DBGPIC   nm{} pcdesc pc_off={:#x} covers_slot{}={} slots={:?}",
+                                    nm.0,
+                                    d.pc_off,
+                                    slot,
+                                    s.contains(&slot),
+                                    s
+                                );
+                            }
+                            // Full disassembly, stale site marked — to find
+                            // the stores to this slot and the call sites.
+                            eprintln!(
+                                "DBGPIC   ---- disasm nm={} ----\n{}",
+                                nm.0,
+                                crate::compiler::disasm_a64::disasm_slice(
+                                    nm_ref.code.as_bytes(),
+                                    Some((ret_pc - nm_ref.code.base as u64) as usize)
+                                )
+                            );
+                            // The whole walk, with each view's root extent —
+                            // the stale slot means TWO enumerated regions
+                            // overlap this address; the list names them.
+                            for fv in &frames_dbg {
+                                match fv {
+                                    FrameView::Compiled { fp: cfp, nm: cnm, ret_pc: rpc } => {
+                                        let fs = vm.code_table.get(*cnm).map(|n| n.frame_slots).unwrap_or(0);
+                                        eprintln!(
+                                            "DBGPIC   walk: COMPILED nm={} fp={cfp:#x} slots={fs} extent=[{:#x},{cfp:#x}) ret_pc={rpc:#x}",
+                                            cnm.0,
+                                            cfp - 8 * (fs as u64 + 1)
+                                        );
+                                    }
+                                    FrameView::Adapter { fp: afp, kind, caller_pc } => {
+                                        let n = real_oop_rootspill_slots(vm, *kind, *caller_pc);
+                                        eprintln!(
+                                            "DBGPIC   walk: ADAPTER {kind:?} fp={afp:#x} rootspill[{n}]=[{:#x},{:#x}) caller_pc={caller_pc:#x}",
+                                            afp - ROOTSPILL_BYTES as u64,
+                                            afp - ROOTSPILL_BYTES as u64 + 8 * n as u64
+                                        );
+                                    }
+                                    other => eprintln!("DBGPIC   walk: {other:?}"),
+                                }
+                            }
                         }
                     }
                     let new = f(vm, old);

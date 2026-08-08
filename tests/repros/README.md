@@ -670,6 +670,65 @@ ports; the benchmarks' own 4-mode gates stay red until these are fixed):
     runs clean; both repros clean under GC_STRESS=1/full:64 and
     DEOPT_STRESS=50.
 
+11. (no .mst — full-suite-only) BUG F: GC scanned compiled frames with
+    WRONG or STALE-CONTENT oop maps under scavenge-per-allocation.
+    **FIXED** (two independent holes, one commit; found via the
+    world+tests suite at MACVM_GC_STRESS=1 MACVM_JIT=threshold=20, which
+    aborted in the large-integer tests on `scavenge_oop`'s double-copy
+    tripwire — or SIGSEGV'd in the scavenger, depending on where the
+    stale address landed that build).
+
+    **Hole 1 — block-start descs shadowed real safepoint maps.** A
+    block-start PcDesc (trace path only, reserved empty map 0) shares its
+    pc with a call site's safepoint desc whenever the call is its block's
+    LAST instruction — the return address IS the next block's start pc —
+    and the driver's stable `sort_by_key(pc_off)` keeps the block-start
+    desc first. `oopmap_at`'s first-match handed GC the EMPTY map at
+    every such return address: ZERO slots scanned for a live frame, every
+    spilled oop stale after any scavenge inside the callee. Fixed in
+    `oopmap_at` (prefer the non-reserved map among equal-pc descs; unit
+    test `oopmap_at_prefers_real_map_over_block_start_shadow`).
+
+    **Hole 2 — map-live slots holding values no path wrote.** The plain
+    per-vreg [min,max] interval is path-insensitive: LargePositiveInteger
+    `+`'s slot 18 was defined in one arm of a diamond, resident-reloaded
+    after the merge (a dead reload), and therefore map-live at the OTHER
+    arm's call — a path that never wrote the slot, which held a dead
+    prior activation's leftover; after ~74k stress scavenges the leftover
+    aliased to-space and tripped the double-copy guard (or was wild and
+    SIGSEGV'd). The loop-carried variant of the same shape goes stale
+    between a store and a later-window scan when the loop's other
+    safepoints don't cover the slot. Fixed two ways, both map-only (zero
+    mutator cost in emitted bodies): loop GAP-FACTS extended from
+    deopt-referenced vregs to every loop-touching interval, and the
+    prologue nil-fill extended from deopt-referenced slots to EVERY
+    oop-carrying spill slot (nil is the one value that can never go
+    stale; F7's entry-early-defs shrink still applies).
+
+    A def-dominance refinement (skip fills/facts where the def provably
+    runs before every scan) was prototyped and REVERTED: three
+    successive holes surfaced under GC_STRESS=1 (post-widening windows,
+    deopt-fact scans outside the interval window, and a third the
+    stress suite found before analysis did) — each miss is silent heap
+    corruption, and the position-linear model has too many flows
+    (fact-forced spill reshuffling, merge vregs, OSR entries) to carry
+    that proof safely today. Revisit as part of a real per-position
+    liveness rework (the regalloc arc).
+
+    Cost, measured (cog-bench t20, robust minima): dict +19%, alloc +4%,
+    the rest in noise — the price of scan-safe maps until the liveness
+    rework.
+
+    Gate: world+tests suite 7701/0 and byte-identical off vs
+    threshold=20; MACVM_GC_STRESS=1 (previously aborting), full, and
+    full:64 all 7701/0 at threshold=20; MACVM_TRACE=oops reports ZERO
+    suspect slots across a full GC_STRESS=1 run; DEOPT_STRESS=100
+    7701/0; both entry-10 repros clean incl. under stress; cargo test
+    --release 958/0. Forensics that pinned it (kept, MACVM_DBGPIC-gated,
+    in `memory/roots.rs`): the stale-slot dump now prints the trapping
+    nmethod's full pcdesc table, its disassembly, and every walked
+    frame's root extents.
+
 All repros above also reproduce (or, for BUG A/C, used to) via the full
 benchmarks:
   MACVM_JIT=threshold=1 ./target/release/macvm run world/bench/richards.mst  --world world

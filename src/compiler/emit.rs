@@ -3662,7 +3662,16 @@ mod tests {
             is_osr: false,
             blocks,
             vregs,
-            pool: Vec::new(),
+            // One dummy word so `nil_lit: PoolLit(0)` resolves — the
+            // prologue oop-slot nil-fill (repros README #11) loads it for
+            // any hand-built method whose vregs spill. A real compile's
+            // convert interns the true nil unconditionally; tests that
+            // execute hand-built code never read an unwritten slot, so the
+            // placeholder value itself is never observed.
+            pool: vec![crate::compiler::ir::PoolEntry {
+                value: 0,
+                kind: None,
+            }],
             argc,
             ntemps: 0,
             ctx_vregs: Vec::new(),
@@ -4505,7 +4514,9 @@ mod tests {
             is_osr: false,
             blocks: vec![block0],
             vregs,
-            pool: Vec::new(),
+            // One dummy word so nil_lit resolves for the prologue oop-slot
+            // nil-fill (this fixture's cross-call values spill).
+            pool: vec![crate::compiler::ir::PoolEntry { value: 0, kind: None }],
             argc: 3,
             ntemps: 0,
             ctx_vregs: Vec::new(),

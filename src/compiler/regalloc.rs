@@ -173,6 +173,17 @@ fn is_safepoint(ir: &Ir) -> bool {
 pub(crate) fn successors(block: &IrBlock) -> Vec<BlockId> {
     let mut succs = Vec::new();
     for ir in &block.code {
+        op_successors(ir, &mut succs);
+    }
+    succs
+}
+
+/// Per-op half of [`successors`]: the block references THIS op carries
+/// (branch targets and fail edges). Split out so the nil-fill dominance
+/// refinement (repros README #11) can ask "can control leave the block
+/// BEFORE position d" per instruction.
+pub(crate) fn op_successors(ir: &Ir, succs: &mut Vec<BlockId>) {
+    {
         match ir {
             Ir::Jump { target } => succs.push(*target),
             Ir::BoolBr {
@@ -227,7 +238,6 @@ pub(crate) fn successors(block: &IrBlock) -> Vec<BlockId> {
             _ => {}
         }
     }
-    succs
 }
 
 /// D3.4: entry first, loop bodies contiguous. A plain postorder DFS,
@@ -637,6 +647,7 @@ pub fn compute_intervals(
         deopt_live_exact.extend(loop_map_facts);
     }
 
+
     let mut changed = true;
     while changed {
         changed = false;
@@ -703,6 +714,54 @@ pub fn compute_intervals(
         if *e <= sp_pos {
             *e = sp_pos + 1;
         }
+    }
+
+
+    // GC visibility for EVERY loop-touching value (tests/repros/README.md
+    // entry 11 — the GC_STRESS=1 stale-slot corruption): a vreg whose span
+    // sits (wholly or partly) inside a loop leaves its LAST value in its
+    // spill slot across the back edge — the next pass through the span
+    // re-exposes that slot to GC (the interval makes it map-live there),
+    // but at the loop's OTHER safepoints the map said nothing, so a
+    // scavenge there left the slot stale and the next in-span scan handed
+    // `scavenge_oop` a dead pre-move address (LargeInteger `+`'s digit
+    // loop, slot 18: dead-per-path but map-live at one call, stale after
+    // ~74k stress scavenges elsewhere in the loop). Same cure as the
+    // head-2 facts above, extended from deopt-referenced vregs to ALL
+    // loop-touching intervals: exact `(v, safepoint)` GC facts for the
+    // loop's gap safepoints — map-only, the interval (and so regalloc,
+    // spill decisions, emitted code) untouched. Sound because every fact
+    // lands its vreg in `extra_oop_live`, whose slots join
+    // `deopt_nil_init_slots` below — the prologue nil-fills them, so a
+    // scan before the vreg's first def sees nil, and after it sees a
+    // kept-current (possibly dead, never wild) object. BUG D RC1's
+    // interval-precision rule stays untouched: a sibling-block temp's
+    // slot becoming map-live at loop safepoints scans nil/older values,
+    // never the uninitialized stack RC1 fixed.
+    {
+        let mut gap_facts: std::collections::HashSet<(u32, u32)> =
+            std::collections::HashSet::new();
+        let vregs: std::collections::HashSet<u32> =
+            min_def.keys().chain(max_use.keys()).copied().collect();
+        for &v in &vregs {
+            let s = *min_def.get(&v).unwrap_or(&u32::MAX);
+            let e = *max_use.get(&v).unwrap_or(&0);
+            if s == u32::MAX {
+                continue; // never defined in compiled code
+            }
+            for &(ls, le) in &loop_ranges {
+                if s <= le && e >= ls {
+                    for &sp in &safepoint_positions {
+                        // Gap safepoints only — strictly-inside ones are
+                        // already map-live via the plain interval test.
+                        if sp >= ls && sp <= le && !(sp > s && sp < e) {
+                            gap_facts.insert((v, sp));
+                        }
+                    }
+                }
+            }
+        }
+        deopt_live_exact.extend(gap_facts);
     }
 
     // S13 step 7b: every deopt-referenced vreg must be SPILLED (a stable
@@ -1319,11 +1378,29 @@ pub fn regalloc(method: &IrMethod) -> RegallocResult {
         set
     };
     let mut deopt_nil_init_slots: Vec<SpillSlot> = {
-        let referenced: std::collections::HashSet<u32> =
-            extra_oop_live.iter().map(|&(v, _)| v.0).collect();
+        // tests/repros/README.md entry 11 (the GC_STRESS=1 stale-slot
+        // corruption): EVERY oop-carrying spill slot is nil-filled, not
+        // just the deopt-referenced ones. The plain [min,max] interval is
+        // path-insensitive: a vreg defined in one arm of a diamond and
+        // resident-reloaded after the merge is map-live across the OTHER
+        // arm's calls too — a path that never wrote the slot, which then
+        // holds a dead prior activation's leftover at the same stack
+        // depth (LargeInteger `+`, slot 18: a stale pre-move address
+        // after enough scavenges). Nil in the slot is the one value that
+        // can never go stale, so the fill makes every over-approximate
+        // map entry scan-safe by construction. `entry_early_defs` (F7)
+        // still shrinks away slots the entry block provably writes before
+        // any safepoint.
+        //
+        // COST (measured, cog-bench t20): dict +16%, alloc +5%, the rest
+        // in noise. A def-dominance refinement (skip the fill when the
+        // def provably runs before every possible scan) was prototyped
+        // and reverted: the position-linear model has too many flows
+        // (fact-forced spill reshuffling, merge vregs, OSR entries) and
+        // each miss is silent heap corruption; see the #11 repro notes.
         intervals
             .iter()
-            .filter(|iv| referenced.contains(&iv.vreg.0))
+            .filter(|iv| iv.is_oop)
             .filter(|iv| !entry_early_defs.contains(&iv.vreg.0))
             .filter_map(|iv| match iv.assignment {
                 Some(Assignment::Spill(slot)) => Some(slot),
@@ -1356,7 +1433,7 @@ mod tests {
             is_osr: false,
             blocks,
             vregs,
-            pool: Vec::new(),
+            pool: vec![crate::compiler::ir::PoolEntry { value: 0, kind: None }],
             argc: 0,
             ntemps: 0,
             ctx_vregs: Vec::new(),

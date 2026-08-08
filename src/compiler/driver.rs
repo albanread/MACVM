@@ -1314,11 +1314,16 @@ fn compile_method_full(
     vm.code_cache.publish(h, &blob);
 
     // S12 D2: `oopmaps[0]` is always the reserved, always-empty map —
-    // block-start descs (trace path only, never a real safepoint's own
-    // return address, `OopMap::empty`'s own doc) point at it; every REAL
+    // block-start descs (trace path only) point at it; every REAL
     // safepoint below gets its own liveness-intersected map, deduplicated
     // by content (`oopmap_dedup`: two safepoints with identical live sets
-    // share one entry).
+    // share one entry). NOTE a block-start desc CAN share its pc with a
+    // real safepoint desc — a call that is its block's last instruction
+    // returns exactly at the next block's start — and the stable sort
+    // below keeps the block-start desc first at equal pc. `oopmap_at`
+    // therefore prefers the non-reserved map among equal-pc descs; a
+    // first-match there once handed GC the empty map at every such site
+    // (the GC_STRESS=1 stale-slot corruption, tests/repros README #11).
     let mut oopmaps: Vec<OopMap> = vec![OopMap::empty()];
     let mut safepoint_pcdescs: Vec<PcDesc> = Vec::with_capacity(safepoint_pcs.len());
     // F3: const-uniform vregs' slots are never written — exclude from GC maps.

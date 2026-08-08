@@ -317,10 +317,28 @@ impl Nmethod {
     /// three tests later instead of failing loudly at the source.
     pub fn oopmap_at(&self, ret_pc: u64) -> &OopMap {
         let off = (ret_pc - self.code.base as u64) as u32;
+        // Among descs at this EXACT pc, prefer one carrying a real
+        // (non-reserved) map. A block-start desc (trace path only, always
+        // `oopmap: 0` = the reserved empty map) SHARES its pc with a call
+        // site's safepoint desc whenever the call is its block's LAST
+        // instruction — the return address IS the next block's start pc —
+        // and the driver's stable `sort_by_key(pc_off)` keeps the
+        // block-start desc first. A plain first-match therefore handed GC
+        // the EMPTY map at exactly those return addresses, scanning ZERO
+        // slots of a live compiled frame: every spilled oop in it went
+        // stale across any scavenge inside the callee (the GC_STRESS=1
+        // `scavenge_oop` double-copy tripwire / SIGSEGV in the
+        // large-integer tests — tests/repros/README.md entry 11). A real
+        // safepoint whose live set is genuinely empty also interns to map
+        // 0, so "prefer nonzero" changes nothing for that case — both
+        // descs describe the same (empty) scan.
         let idx = self
             .pcdescs
             .iter()
-            .position(|d| d.pc_off == off)
+            .enumerate()
+            .filter(|(_, d)| d.pc_off == off)
+            .max_by_key(|(_, d)| d.oopmap != 0)
+            .map(|(i, _)| i)
             .unwrap_or_else(|| {
                 panic!(
                     "oopmap_at: nmethod {:?} has no safepoint PcDesc at return-address offset \
@@ -1098,6 +1116,67 @@ mod tests {
             result.is_err(),
             "4 bytes after the real safepoint must miss too"
         );
+    }
+
+    /// tests/repros/README.md entry 11: a BLOCK-START desc (trace path,
+    /// reserved empty map 0) shares its pc with a REAL safepoint desc
+    /// whenever a call is its block's last instruction — the return
+    /// address IS the next block's start — and the driver's stable sort
+    /// keeps the block-start desc FIRST at equal pc. `oopmap_at` must
+    /// return the real map, not the shadowing empty one: a first-match
+    /// here scanned ZERO slots of a live frame at exactly those return
+    /// addresses (the GC_STRESS=1 stale-slot corruption).
+    #[test]
+    fn oopmap_at_prefers_real_map_over_block_start_shadow() {
+        let base = 0x10000usize;
+        let mut real = OopMap::empty();
+        real.set(1);
+        real.set(3);
+        let nm = Nmethod {
+            frame_slots: 4,
+            slot_is_oop: vec![false, true, false, true],
+            pcdescs: vec![
+                // Block-start desc first — the driver's stable sort order
+                // at equal pc_off (block_pcs chain before safepoints).
+                PcDesc {
+                    pc_off: 0x40,
+                    bci: 7,
+                    oopmap: 0,
+                },
+                PcDesc {
+                    pc_off: 0x40,
+                    bci: 7,
+                    oopmap: 1,
+                },
+            ],
+            oopmaps: vec![OopMap::empty(), real],
+            ..fake_nmethod(fake_klass(0x1000), fake_selector(0x2000), base, 0x100)
+        };
+
+        let hit = nm.oopmap_at((base + 0x40) as u64);
+        assert!(
+            hit.is_oop(1) && hit.is_oop(3),
+            "the real safepoint map must win over the block-start shadow"
+        );
+
+        // And with the real map second-but-also-first-in-vec (no shadow),
+        // nothing changes: a lone real desc still resolves.
+        let nm2 = Nmethod {
+            frame_slots: 4,
+            slot_is_oop: vec![false, true, false, true],
+            pcdescs: vec![PcDesc {
+                pc_off: 0x40,
+                bci: 7,
+                oopmap: 1,
+            }],
+            oopmaps: vec![OopMap::empty(), {
+                let mut m = OopMap::empty();
+                m.set(1);
+                m
+            }],
+            ..fake_nmethod(fake_klass(0x1000), fake_selector(0x2000), base, 0x100)
+        };
+        assert!(nm2.oopmap_at((base + 0x40) as u64).is_oop(1));
     }
 
     /// tests_s10.md: install -> get by id, lookup by key, find_by_pc

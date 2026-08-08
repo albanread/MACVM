@@ -382,7 +382,7 @@ fn compiled_mono_caller_guard_keeps_key_klass_alive() {
         is_osr: false,
         blocks: vec![block0],
         vregs,
-        pool: Vec::new(),
+        pool: vec![macvm::compiler::ir::PoolEntry { value: 0, kind: None }],
         argc: 1,
         ntemps: 0,
         ctx_vregs: Vec::new(),
