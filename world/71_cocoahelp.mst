@@ -38,7 +38,8 @@ Object subclass: CocoaHelp [
     <classVars: Topics CodeBlocks Container Sidebar SidebarScroll SidebarFace SidebarDelegate
                 DocView DocScroll FindField RunButton RunButtons RunDelegates ActionDelegates
                 PendingUiSrc UiRunDelegate
-                CurrentTopic DocText FindTerm Matches MatchCursor>
+                CurrentTopic DocText FindTerm Matches MatchCursor
+                BodyFont BodyBold BodyItalic BodyCode>
 
     "── registration (CG7+ pattern; CocoaUI startup calls this by name) ──"
     CocoaHelp class >> register [
@@ -418,11 +419,121 @@ Object subclass: CocoaHelp [
                 ifTrue: [ self showTopic: row + 1 ] ]
     ]
 
+    "── text scaling (real point sizes; the A- / A+ toolbar buttons reach here)
+     Every doc font is built at BASE + `CocoaUI fontDelta` — the SAME delta the
+     Workspace/Editor/Browser use — so one control scales the whole app, and
+     changing it simply re-renders the page (reflowForFontChange). The body is
+     styled BY HAND (appendStyled:) rather than by AppKit''s CommonMark parser,
+     because the parser bakes fixed sizes into runs we cannot reach from
+     Smalltalk to resize. This is plain text at a larger size — it reflows in
+     the same column. It is emphatically NOT scroll-view magnification, which
+     (with fullscreen) froze the whole Mac."
+    CocoaHelp class >> docDelta [ ^CocoaUI fontDelta ]
+    CocoaHelp class >> sysFontOfSize: base [
+        ^(Cocoa classNamed: 'NSFont') onMain systemFontOfSize: ((base + self docDelta) max: 6.0)
+    ]
+    CocoaHelp class >> boldFontOfSize: base [
+        ^(Cocoa classNamed: 'NSFont') onMain boldSystemFontOfSize: ((base + self docDelta) max: 6.0)
+    ]
+    CocoaHelp class >> italicFontOfSize: base [
+        | fm plain result |
+        fm := (Cocoa classNamed: 'NSFontManager') onMain sharedFontManager.
+        plain := self sysFontOfSize: base.
+        result := fm onMain convertFont: plain toHaveTrait: 1.  "NSItalicFontMask"
+        plain release. fm release.
+        ^result
+    ]
+    CocoaHelp class >> refreshBodyFonts [
+        "Cache the four inline body fonts at the current delta (released and
+         rebuilt each render) so appendStyled: reuses them across every run
+         instead of minting a wrapper per run."
+        BodyFont isNil ifFalse: [ BodyFont release. BodyFont := nil ].
+        BodyBold isNil ifFalse: [ BodyBold release. BodyBold := nil ].
+        BodyItalic isNil ifFalse: [ BodyItalic release. BodyItalic := nil ].
+        BodyCode isNil ifFalse: [ BodyCode release. BodyCode := nil ].
+        BodyFont := self sysFontOfSize: 13.0.
+        BodyBold := self boldFontOfSize: 13.0.
+        BodyItalic := self italicFontOfSize: 13.0.
+        BodyCode := CocoaUI fixedFontOfSize: 12.0.
+    ]
+    CocoaHelp class >> flattenSoftBreaks: aString [
+        "CommonMark soft break: a single newline inside a paragraph is a space,
+         so the paragraph reflows. Match that before styling."
+        | ws lf |
+        lf := Character value: 10.
+        ws := WriteStream on: String new.
+        aString do: [ :c | ws nextPut: (c = lf ifTrue: [ $  ] ifFalse: [ c ]) ].
+        ^ws contents
+    ]
+    CocoaHelp class >> closeEmph: marker in: s from: start [
+        "1-based index of the closing `*`/`**` whose preceding char is non-space
+         (right-flanking), searching from `start`; 0 if none. The flanking rule
+         keeps a stray literal `*` from opening/closing emphasis."
+        | n k dbl |
+        n := s size. dbl := marker size = 2. k := start.
+        [ k <= n ] whileTrue: [
+            ((s at: k) = $* and: [ k > start and: [ (s at: k - 1) ~= $  ] ]) ifTrue: [
+                dbl
+                    ifTrue: [ (k < n and: [ (s at: k + 1) = $* ]) ifTrue: [ ^k ] ]
+                    ifFalse: [ ^k ] ].
+            k := k + 1 ].
+        ^0
+    ]
+    CocoaHelp class >> appendStyled: aString into: storage [
+        "Render inline **bold**, *italic* and `code` by hand into `storage`,
+         each run in its delta-scaled body font (BodyFont/BodyBold/BodyItalic/
+         BodyCode, cached by refreshBodyFonts). `code` is literal inside."
+        | s i n color plainStart flush |
+        s := self flattenSoftBreaks: aString.
+        n := s size.
+        color := (Cocoa classNamed: 'NSColor') onMain labelColor.
+        i := 1. plainStart := 1.
+        flush := [ :endIx |
+            endIx >= plainStart ifTrue: [
+                self append: (s copyFrom: plainStart to: endIx)
+                     font: BodyFont color: color into: storage ] ].
+        [ i <= n ] whileTrue: [
+            | c handled |
+            c := s at: i. handled := false.
+            c = $` ifTrue: [
+                | j |
+                j := i + 1.
+                [ j <= n and: [ (s at: j) ~= $` ] ] whileTrue: [ j := j + 1 ].
+                j <= n ifTrue: [
+                    flush value: i - 1.
+                    self append: (s copyFrom: i + 1 to: j - 1)
+                         font: BodyCode color: color into: storage.
+                    i := j + 1. plainStart := i. handled := true ] ].
+            (handled not and: [ c = $* ]) ifTrue: [
+                | dbl mstart mend |
+                dbl := (i < n) and: [ (s at: i + 1) = $* ].
+                mstart := dbl ifTrue: [ i + 2 ] ifFalse: [ i + 1 ].
+                (mstart <= n and: [ (s at: mstart) ~= $  ]) ifTrue: [
+                    mend := self closeEmph: (dbl ifTrue: [ '**' ] ifFalse: [ '*' ]) in: s from: mstart.
+                    mend = 0 ifFalse: [
+                        flush value: i - 1.
+                        self append: (s copyFrom: mstart to: mend - 1)
+                             font: (dbl ifTrue: [ BodyBold ] ifFalse: [ BodyItalic ])
+                             color: color into: storage.
+                        i := dbl ifTrue: [ mend + 2 ] ifFalse: [ mend + 1 ].
+                        plainStart := i. handled := true ] ] ].
+            handled ifFalse: [ i := i + 1 ] ].
+        flush value: n.
+    ]
+
     "── rendering ────────────────────────────────────────────────────────"
+    CocoaHelp class >> reflowForFontChange [
+        "A+/A- changed the shared delta: re-render the current topic at the new
+         size (every font is read fresh from `CocoaUI fontDelta`). No zoom, no
+         magnification — just a normal re-render."
+        (Container isNil or: [ CurrentTopic isNil ]) ifTrue: [ ^self ].
+        self showTopic: CurrentTopic.
+    ]
     CocoaHelp class >> showTopic: i [
         | md storage empty ns |
         CurrentTopic := i.
         FindTerm := nil. Matches := nil. MatchCursor := 0.
+        self refreshBodyFonts.
         md := self perform: ((self topics at: i) at: 2).
         storage := DocView onMain textStorage.
         empty := ((Cocoa classNamed: 'NSAttributedString') onMain alloc) onMain init.
@@ -600,26 +711,26 @@ Object subclass: CocoaHelp [
         tag := pair at: 1. text := pair at: 2.
         tag = #h1 ifTrue: [
             self append: text , self nl
-                 font: ((Cocoa classNamed: 'NSFont') onMain boldSystemFontOfSize: 27.0)
+                 font: (self boldFontOfSize: 27.0)
                  color: ((Cocoa classNamed: 'NSColor') onMain systemGreenColor)
                  into: storage.
             ^self appendRuleInto: storage ].
         tag = #h2 ifTrue: [
             self append: self nl , text , self nl
-                 font: ((Cocoa classNamed: 'NSFont') onMain boldSystemFontOfSize: 19.0)
+                 font: (self boldFontOfSize: 19.0)
                  color: ((Cocoa classNamed: 'NSColor') onMain systemBlueColor)
                  into: storage.
             ^self appendRuleInto: storage ].
         tag = #h3 ifTrue: [
             ^self append: self nl , text , self nl , self nl
-                 font: ((Cocoa classNamed: 'NSFont') onMain boldSystemFontOfSize: 15.0)
+                 font: (self boldFontOfSize: 15.0)
                  color: ((Cocoa classNamed: 'NSColor') onMain systemTealColor)
                  into: storage ].
         tag = #bullet ifTrue: [
             | start |
             start := storage onMain length.
             self append: '-   '
-                 font: ((Cocoa classNamed: 'NSFont') onMain systemFontOfSize: 13.0)
+                 font: (self sysFontOfSize: 13.0)
                  color: ((Cocoa classNamed: 'NSColor') onMain systemBlueColor)
                  into: storage.
             self appendInline: text into: storage.
@@ -652,7 +763,7 @@ Object subclass: CocoaHelp [
             self append: self nl font: nil color: nil into: storage.
             start := storage onMain length.
             self append: (self barPrefixed: text) , self nl
-                 font: ((Cocoa classNamed: 'NSFont') onMain systemFontOfSize: 13.0)
+                 font: (self sysFontOfSize: 13.0)
                  color: ((Cocoa classNamed: 'NSColor') onMain systemOrangeColor)
                  into: storage.
             self indentFrom: start in: storage first: 18.0 head: 40.0.
@@ -763,29 +874,12 @@ Object subclass: CocoaHelp [
                 storage onMain addAttribute: 'NSColor' value: aColor range: r ] ].
     ]
 
-    "Body block: AppKit's own CommonMark parser (bold/italic/code spans and
-     bullet lists for free), then force labelColor over JUST this block so
-     dark mode reads without disturbing the styled blocks around it."
+    "Body block: rendered by hand (appendStyled:) rather than by the CommonMark
+     parser, so every inline run is built in a delta-scaled font and the whole
+     page grows/shrinks with the A+/A- buttons. Ends with a blank line."
     CocoaHelp class >> appendMarkdown: aString into: storage [
-        | attr start after ms color |
-        start := storage onMain length.
-        attr := self attributedFor: aString.
-        attr isNil
-            ifTrue: [
-                ms := storage onMain mutableString.
-                ms onMain appendString: aString.
-                ms release ]
-            ifFalse: [
-                storage onMain appendAttributedString: attr.
-                attr release ].
-        after := storage onMain length.
-        after > start ifTrue: [
-            | r |
-            r := Array with: start with: after - start.
-            storage onMain removeAttribute: 'NSBackgroundColor' range: r.
-            storage onMain removeAttribute: 'NSParagraphStyle' range: r.
-            color := (Cocoa classNamed: 'NSColor') onMain labelColor.
-            storage onMain addAttribute: 'NSColor' value: color range: r ].
+        | ms |
+        self appendStyled: aString into: storage.
         ms := storage onMain mutableString.
         ms onMain appendString: self nl , self nl.
         ms release.
@@ -793,26 +887,8 @@ Object subclass: CocoaHelp [
 
     CocoaHelp class >> appendInline: aString into: storage [
         "appendMarkdown:'s sibling for a block whose line breaks WE own (a
-         bullet): parse for inline styling, force labelColor, add nothing."
-        | attr start after ms color |
-        start := storage onMain length.
-        attr := self attributedFor: aString.
-        attr isNil
-            ifTrue: [
-                ms := storage onMain mutableString.
-                ms onMain appendString: aString.
-                ms release ]
-            ifFalse: [
-                storage onMain appendAttributedString: attr.
-                attr release ].
-        after := storage onMain length.
-        after > start ifTrue: [
-            | r |
-            r := Array with: start with: after - start.
-            storage onMain removeAttribute: 'NSBackgroundColor' range: r.
-            storage onMain removeAttribute: 'NSParagraphStyle' range: r.
-            color := (Cocoa classNamed: 'NSColor') onMain labelColor.
-            storage onMain addAttribute: 'NSColor' value: color range: r ].
+         bullet): inline styling only, no trailing gap."
+        self appendStyled: aString into: storage.
     ]
 
     CocoaHelp class >> markdownOptions [

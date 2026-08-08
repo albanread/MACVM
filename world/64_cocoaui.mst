@@ -722,6 +722,9 @@ Object subclass: CocoaUI [
         (Worker classNamed: #CocoaBrowser) ifNotNil: [ :c | c applyCodeFont ].
         (Worker classNamed: #CocoaBrowser2) ifNotNil: [ :c | c applyCodeFont ].
         (Worker classNamed: #CocoaEditor) ifNotNil: [ :c | c applyCodeFont ].
+        "The Docs view re-renders its page at the new point size (real font
+         scaling — never scroll-view magnification, which froze the Mac)."
+        (Worker classNamed: #CocoaHelp) ifNotNil: [ :c | c reflowForFontChange ].
     ]
 
     "── toolbar ACTION buttons (not view switchers) ───────────────────────
