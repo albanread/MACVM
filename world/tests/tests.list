@@ -64,5 +64,6 @@ tier1.mst
 55_vm_error_tests.mst
 56_cocoastring_tests.mst
 57_string_completion_tests.mst
+58_object_stream_tests.mst
 55_exception_resume_tests.mst
 99_run_all.mst

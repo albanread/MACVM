@@ -62,5 +62,6 @@ TestRunner run: ExceptionVerbTests.
 TestRunner run: VmErrorTests.
 TestRunner run: CocoaStringTests.
 TestRunner run: StringCompletionTests.
+TestRunner run: ObjectStreamTests.
 TestRunner run: ExceptionResumeTests.
 TestRunner report.

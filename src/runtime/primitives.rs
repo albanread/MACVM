@@ -1468,6 +1468,14 @@ pub static PRIMITIVES: &[PrimDesc] = &[
         can_allocate: true,
         can_fail: true,
     },
+    PrimDesc {
+        id: 265,
+        name: "instVarAt:put:",
+        f: prim_inst_var_at_put,
+        argc: 2,
+        can_allocate: false,
+        can_fail: true,
+    },
 ];
 
 pub fn prim_by_id(id: u16) -> Option<&'static PrimDesc> {
@@ -3350,6 +3358,31 @@ fn prim_basic_new_colon(vm: &mut VmState, args: &[Oop]) -> PrimResult {
         Format::IndexableBytes => PrimResult::Ok(alloc::alloc_indexable_bytes(vm, klass, n).oop()),
         _ => PrimResult::Fail,
     }
+}
+
+/// `instVarAt:put:` (265) — the write half of `instVarAt:`, which shipped
+/// read-only. Its absence is why a generic `deepCopy` could not copy a plain
+/// object's named instance variables at all: there was no way to set one.
+///
+/// Bounds are prim 25's exactly (named fields only, never the indexed tail),
+/// and the store goes through the BARRIERED `memory::store::store`, not
+/// `set_body_oop` — writing a young oop into a promoted object without the
+/// card mark is precisely the dangling reference the A9 verifier exists to
+/// catch.
+fn prim_inst_var_at_put(vm: &mut VmState, args: &[Oop]) -> PrimResult {
+    let Some(m) = MemOop::try_from(args[0]) else {
+        return PrimResult::Fail;
+    };
+    let Some(idx) = SmallInt::try_from(args[1]) else {
+        return PrimResult::Fail;
+    };
+    let i = idx.value();
+    let named = (m.klass().non_indexable_size() - HEADER_WORDS) as i64;
+    if i < 1 || i > named {
+        return PrimResult::Fail;
+    }
+    crate::memory::store::store(vm, m, (i - 1) as usize, args[2]);
+    PrimResult::Ok(args[2])
 }
 
 fn prim_inst_var_at(_vm: &mut VmState, args: &[Oop]) -> PrimResult {
@@ -5267,6 +5300,7 @@ mod tests {
             (262, "GamePane>>frameRate:"),
             (263, "Sound class>>playEffect:"),
             (264, "Worker class>>primEvalDoitQuiet:"),
+            (265, "instVarAt:put:"),
         ];
         assert_eq!(
             PRIMITIVES.len(),

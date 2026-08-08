@@ -1,0 +1,294 @@
+"84_object_stream_completion.mst — the last census group: Object's copying
+ and type predicates, the stream gaps, and one real bug found on the way.
+
+ **The bug.** `#sym , 'x'` raised 'symbols are immutable', and so did
+ `#sym copyFrom: 1 to: 2`. `String>>,` builds its result with
+ `self class new:` — which for a Symbol receiver asks for a *Symbol*, and
+ Symbols are interned and immutable. The classic Smalltalk answer is
+ `species`: the class a COPY of me should be, which for Symbol is String.
+ Adding it (and routing the copy-producing methods through it) fixes the
+ whole family at once rather than special-casing `,`.
+
+ **deepCopy handles cycles.** A naive recursive copy of a graph that points
+ back at itself never terminates, and object graphs in a live image point
+ back at themselves constantly. The map from original to copy is populated
+ BEFORE the recursion descends, which is what makes a self-referencing
+ structure copy in finite time — the ordering is the whole trick, so it is
+ stated here rather than left to be re-derived.
+
+ What deepCopy deliberately does NOT copy: SmallIntegers, Characters,
+ Symbols, nil/true/false and classes. Copying a Symbol would break
+ interning (`#a == #a` is relied on everywhere); copying a class would be
+ nonsense. These are answered as themselves, which is also what makes the
+ common case cheap.
+
+ **storeOn:** answers an evaluable representation where one exists and says
+ so plainly where it does not — a storeString that silently lies is worse
+ than one that admits it cannot."
+
+"Re-opening a class REQUIRES naming its true superclass — declaring
+ `Object subclass: SequenceableCollection` does not extend it, it
+ RE-PARENTS it, and every method it inherited from Collection vanishes.
+ That mistake here broke detect:ifNone:, notEmpty and includes: across the
+ image at once. Each superclass below was read off the original
+ declaration, not assumed."
+nil subclass: Object [
+    "The class a COPY of me should be. Differs from `class` only where a
+     copy cannot be the same species as the original — Symbol being the
+     case that motivated it."
+    species ^ <Object> [ ^self class ]
+
+    "The write half of instVarAt:, which shipped read-only (prim 25). Without
+     it there was no way to set a named instance variable, which is why a
+     generic deepCopy could not copy a plain object's fields at all — the
+     gap that stopped this file's first version. Prim 265 stores through the
+     barriered path, so writing a young oop into a promoted object cannot
+     leave a dangling reference."
+    instVarAt: i <Integer> put: v <Object> ^ <Object> [
+        <primitive: 265>
+    ]
+
+    "── deep copying ─────────────────────────────────────────────────────"
+
+    deepCopy ^ <Object> [
+        "A copy whose reachable structure is copied too. Cycle-safe."
+        ^self deepCopyWith: IdentityDictionary new
+    ]
+
+    "THE single entry, and deliberately not overridable: it owns the two
+     invariants (atoms are their own copies; a graph is visited once) and
+     then delegates the class-specific part. An earlier version let
+     subclasses override THIS, and ArrayedCollection's override promptly
+     skipped the atom check — which matters because Symbol IS an
+     ArrayedCollection (String < ArrayedCollection, Symbol < String), so
+     `(Array with: #s) deepCopy` tried to at:put: into a Symbol. Putting the
+     guard where it cannot be bypassed is the fix; adding it to each
+     override would have been the patch."
+    deepCopyWith: seen <IdentityDictionary> ^ <Object> [
+        self isDeepCopyAtom ifTrue: [ ^self ].
+        (seen includesKey: self) ifTrue: [ ^seen at: self ].
+        ^self deepCopyStructureWith: seen
+    ]
+
+    "The overridable half. Implementors MUST register their copy in `seen`
+     before descending, or a self-referencing structure recurses forever."
+    deepCopyStructureWith: seen <IdentityDictionary> ^ <Object> [
+        | copy |
+        copy := self shallowCopy.
+        seen at: self put: copy.
+        1 to: self class instVarNames size do: [ :i |
+            copy instVarAt: i put: ((self instVarAt: i) deepCopyWith: seen) ].
+        ^copy
+    ]
+
+    isDeepCopyAtom ^ <Boolean> [
+        ^self isSymbol or: [ self isInteger or: [ self isCharacter
+            or: [ self isNil or: [ self isBoolean or: [ self isClass ] ] ] ] ]
+    ]
+
+    "── store: an evaluable representation, honest about its limits ──────"
+
+    storeOn: aStream <WriteStream> ^ <Self> [
+        "The default cannot produce something evaluable, and says so rather
+         than emitting a printString that looks like source and is not."
+        aStream nextPutAll: '(', self class name asString, ' new "not storable")'.
+        ^self
+    ]
+    storeString ^ <String> [
+        | s |
+        s := WriteStream on: String new.
+        self storeOn: s.
+        ^s contents
+    ]
+
+    "── the type predicates the set was missing ──────────────────────────
+     isString/isSymbol/isInteger/isCharacter/isPoint already existed; these
+     complete the set so a caller never has to guess which spellings this
+     image happens to have."
+    isCollection ^ <Boolean> [ ^false ]
+    isNumber ^ <Boolean> [ ^false ]
+    isBoolean ^ <Boolean> [ ^false ]
+    isBlock ^ <Boolean> [ ^false ]
+    isArray ^ <Boolean> [ ^false ]
+    isDictionary ^ <Boolean> [ ^false ]
+    isClass ^ <Boolean> [ ^false ]
+]
+
+Object subclass: Boolean [ isBoolean ^ <Boolean> [ ^true ] ]
+Magnitude subclass: Number  [ isNumber  ^ <Boolean> [ ^true ] ]
+Object subclass: BlockClosure [ isBlock ^ <Boolean> [ ^true ] ]
+Object subclass: Behavior [
+    isClass ^ <Boolean> [ ^true ]
+    "A class is its own species and its own deep copy — see isDeepCopyAtom."
+    species ^ <Object> [ ^self ]
+]
+
+Object subclass: Collection [
+    isCollection ^ <Boolean> [ ^true ]
+    storeOn: aStream <WriteStream> ^ <Self> [
+        "Evaluable: `(OrderedCollection new add: 1; add: 2; yourself)`."
+        aStream nextPutAll: '('; nextPutAll: self class name asString; nextPutAll: ' new'.
+        self do: [ :e | aStream nextPutAll: ' add: '. e storeOn: aStream. aStream nextPut: $; ].
+        aStream nextPutAll: ' yourself)'.
+        ^self
+    ]
+    "Built FRESH rather than shallowCopy-then-overwrite, because
+     `OrderedCollection>>shallowCopy` SHARES its internal storage (measured;
+     Array's does not). Copying then writing each deep-copied element back
+     through at:put: therefore wrote into the ORIGINAL too, and the two ended
+     up pointing at the same copies — a deepCopy that silently was not one.
+     Registering the fresh collection before filling it keeps cycles safe."
+    deepCopyStructureWith: seen <IdentityDictionary> ^ <Object> [
+        | copy |
+        copy := self species new.
+        seen at: self put: copy.
+        self do: [ :e | copy add: (e deepCopyWith: seen) ].
+        ^copy
+    ]
+]
+
+"Symbol is the case that motivated `species`: a copy of a Symbol must be a
+ String, because Symbols are interned and immutable. Without this,
+ `#sym , 'x'` and `#sym copyFrom:to:` both raised 'symbols are immutable'
+ — the copy-producing methods in String build their result with
+ `self species new:`."
+String subclass: Symbol [
+    species ^ <Object> [ ^String ]
+]
+
+ArrayedCollection subclass: String [
+    "Routed through species so a Symbol receiver produces a String. The two
+     methods below are String's own copy producers; every other copier in
+     the hierarchy already goes through one of them."
+    , other <SequenceableCollection> ^ <Object> [
+        | r |
+        r := self species new: self size + other size.
+        r replaceFrom: 1 to: self size with: self.
+        r replaceFrom: self size + 1 to: self size + other size with: other.
+        ^r
+    ]
+    copyFrom: from <Integer> to: to <Integer> ^ <Object> [
+        | r n |
+        n := to - from + 1.
+        r := self species new: n.
+        1 to: n do: [ :i | r at: i put: (self at: from + i - 1) ].
+        ^r
+    ]
+    isString ^ <Boolean> [ ^true ]
+    storeOn: aStream <WriteStream> ^ <Self> [
+        "A quoted literal, with embedded quotes doubled — evaluable."
+        aStream nextPut: $'.
+        1 to: self size do: [ :i |
+            | c | c := self at: i.
+            c = $' ifTrue: [ aStream nextPut: $' ].
+            aStream nextPut: c ].
+        aStream nextPut: $'.
+        ^self
+    ]
+    "A String's elements are Characters, which are atoms — so copying the
+     bytes IS the deep copy, with no element recursion to do."
+    deepCopyStructureWith: seen <IdentityDictionary> ^ <Object> [
+        | copy |
+        copy := self shallowCopy.
+        seen at: self put: copy.
+        ^copy
+    ]
+]
+
+"A fixed-size collection cannot be built by `add:`, so it takes the
+ shallowCopy route — which is SAFE here precisely because an
+ ArrayedCollection's shallowCopy does not share storage."
+SequenceableCollection subclass: ArrayedCollection [
+    deepCopyStructureWith: seen <IdentityDictionary> ^ <Object> [
+        | copy |
+        copy := self shallowCopy.
+        seen at: self put: copy.
+        1 to: self size do: [ :i |
+            copy at: i put: ((self at: i) deepCopyWith: seen) ].
+        ^copy
+    ]
+]
+
+ArrayedCollection subclass: Array [
+    isArray ^ <Boolean> [ ^true ]
+    storeOn: aStream <WriteStream> ^ <Self> [
+        "Built forwards. An earlier version wrote the separator after every
+         element and then backed up with `skip: -6` — but WriteStream has no
+         skip:, and a stream you cannot rewind is the normal kind. Emitting
+         the separator BEFORE each element except the first needs no
+         rewinding at all."
+        self isEmpty ifTrue: [ aStream nextPutAll: '(Array new: 0)'. ^self ].
+        aStream nextPutAll: '(Array'.
+        self do: [ :e |
+            aStream nextPutAll: ' with: '.
+            e storeOn: aStream ].
+        aStream nextPut: $).
+        ^self
+    ]
+]
+
+HashedCollection subclass: Dictionary [
+    isDictionary ^ <Boolean> [ ^true ]
+    "Keys are NOT deep-copied: a copied key would not be findable under the
+     original key, which is the opposite of what a copy should mean. Values
+     are. Fresh, for the same storage-sharing reason as Collection."
+    deepCopyStructureWith: seen <IdentityDictionary> ^ <Object> [
+        | copy |
+        copy := self species new.
+        seen at: self put: copy.
+        self keysAndValuesDo: [ :k :v | copy at: k put: (v deepCopyWith: seen) ].
+        ^copy
+    ]
+    storeOn: aStream <WriteStream> ^ <Self> [
+        aStream nextPutAll: '(Dictionary new'.
+        self keysAndValuesDo: [ :k :v |
+            aStream nextPutAll: ' at: '. k storeOn: aStream.
+            aStream nextPutAll: ' put: '. v storeOn: aStream.
+            aStream nextPut: $; ].
+        aStream nextPutAll: ' yourself)'.
+        ^self
+    ]
+]
+
+"Literals store as themselves — the case where printString IS evaluable."
+Magnitude subclass: Number [ storeOn: aStream <WriteStream> ^ <Self> [ aStream nextPutAll: self printString. ^self ] ]
+Object subclass: Boolean [ storeOn: aStream <WriteStream> ^ <Self> [ aStream nextPutAll: self printString. ^self ] ]
+Object subclass: UndefinedObject [ storeOn: aStream <WriteStream> ^ <Self> [ aStream nextPutAll: 'nil'. ^self ] ]
+Magnitude subclass: Character [ storeOn: aStream <WriteStream> ^ <Self> [ aStream nextPutAll: self printString. ^self ] ]
+String subclass: Symbol [ storeOn: aStream <WriteStream> ^ <Self> [ aStream nextPutAll: self printString. ^self ] ]
+
+"── the stream gaps ──────────────────────────────────────────────────────"
+
+Object subclass: ReadStream [
+    contents ^ <Object> [
+        "The WHOLE underlying collection, not the unread remainder —
+         Smalltalk's long-standing meaning for `contents` on a read stream,
+         and the reason `upToEnd` exists for the other question."
+        ^collection copyFrom: 1 to: collection size
+    ]
+    skipTo: anObject <Object> ^ <Boolean> [
+        "Advance past the next occurrence; answer whether one was found. On
+         failure the stream is left AT THE END, which is what makes a
+         `[ stream skipTo: x ] whileTrue:` loop terminate."
+        [ self atEnd ] whileFalse: [
+            self next = anObject ifTrue: [ ^true ] ].
+        ^false
+    ]
+    collect: aBlock <[Object,Object]> ^ <OrderedCollection> [
+        "The remaining elements, transformed — consumes the stream."
+        | out |
+        out := OrderedCollection new.
+        [ self atEnd ] whileFalse: [ out add: (aBlock value: self next) ].
+        ^out
+    ]
+]
+
+Object subclass: WriteStream [
+    position ^ <Integer> [ ^position ]
+    reset ^ <Self> [
+        "Rewind to the start; what has been written is forgotten rather than
+         truncated, since the next write overwrites it."
+        position := 0.
+        ^self
+    ]
+]

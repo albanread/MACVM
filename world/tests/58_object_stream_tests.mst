@@ -1,0 +1,195 @@
+"58_object_stream_tests.mst — gates world/84_object_stream_completion.mst.
+
+ The deepCopy cases are the ones that matter, and they are written to fail
+ loudly rather than plausibly. A deepCopy test that only checks `copy = original`
+ passes for a SHALLOW copy too, so every case here mutates the copy and
+ asserts the original did not move — which is the only assertion that can
+ tell the two apart. That is not hypothetical: the first implementation
+ here passed a surface check while sharing storage, because
+ OrderedCollection>>shallowCopy shares its internal array."
+
+TestCase subclass: ObjectStreamTests [
+    runAll [
+        self runTest: #testSpeciesFixesSymbolCopying
+             do: [ self testSpeciesFixesSymbolCopying ].
+        self runTest: #testDeepCopyIsGenuinelyIndependent
+             do: [ self testDeepCopyIsGenuinelyIndependent ].
+        self runTest: #testDeepCopySurvivesCycles do: [ self testDeepCopySurvivesCycles ].
+        self runTest: #testDeepCopyLeavesAtomsAlone
+             do: [ self testDeepCopyLeavesAtomsAlone ].
+        self runTest: #testDeepCopyDictionaryKeysStayFindable
+             do: [ self testDeepCopyDictionaryKeysStayFindable ].
+        self runTest: #testStoreString do: [ self testStoreString ].
+        self runTest: #testTypePredicates do: [ self testTypePredicates ].
+        self runTest: #testReadStreamGaps do: [ self testReadStreamGaps ].
+        self runTest: #testWriteStreamGaps do: [ self testWriteStreamGaps ].
+    ]
+
+    "The bug species was added for: String's copy producers built their
+     result with `self class new:`, which for a Symbol asks for a Symbol,
+     and Symbols are immutable."
+    testSpeciesFixesSymbolCopying [
+        self assert: (#sym , 'x') equals: 'symx'.
+        self assert: (#hello copyFrom: 1 to: 3) equals: 'hel'.
+        self assert: #sym species equals: String.
+        self assert: 'x' species equals: String.
+        self assert: #(1 2) species equals: Array.
+        "the result is a String, not a Symbol — a Symbol would be interned"
+        self deny: (#sym , 'x') isSymbol.
+        self assert: (#sym , 'x') isString.
+        "and the original Symbol is untouched"
+        self assert: #sym equals: #sym
+    ]
+
+    "MUTATE THE COPY, then assert the original did not move. `copy = original`
+     would pass for a shallow copy and prove nothing."
+    testDeepCopyIsGenuinelyIndependent [
+        | a b inner d |
+        a := OrderedCollection new.
+        a add: (OrderedCollection new add: 1; yourself).
+        b := a deepCopy.
+        (b at: 1) add: 99.
+        self assert: (a at: 1) size equals: 1.   "original unmoved"
+        self assert: (b at: 1) size equals: 2.
+        self deny: (a at: 1) == (b at: 1).       "and not the same object"
+        "Arrays too — their shallowCopy does not share, but the nested
+         element still has to be copied"
+        inner := OrderedCollection new add: #x; yourself.
+        a := Array with: inner.
+        b := a deepCopy.
+        (b at: 1) add: #y.
+        self assert: (a at: 1) size equals: 1.
+        self assert: (b at: 1) size equals: 2.
+        "a plain object's named instance variables"
+        d := 1 -> (OrderedCollection new add: 5; yourself).
+        b := d deepCopy.
+        b value add: 6.
+        self assert: d value size equals: 1.
+        self assert: b value size equals: 2
+    ]
+
+    "A graph that points back at itself must copy in finite time — the map
+     is populated before the recursion descends."
+    testDeepCopySurvivesCycles [
+        | cyc copy a b |
+        cyc := OrderedCollection new.
+        cyc add: 1; add: cyc.
+        copy := cyc deepCopy.
+        self assert: copy size equals: 2.
+        self assert: (copy at: 1) equals: 1.
+        "the copy's self-reference points at the COPY, not the original"
+        self assert: (copy at: 2) == copy.
+        self deny: (copy at: 2) == cyc.
+        "two objects referring to each other"
+        a := OrderedCollection new. b := OrderedCollection new.
+        a add: b. b add: a.
+        copy := a deepCopy.
+        self assert: ((copy at: 1) at: 1) == copy.
+        "shared (non-cyclic) structure stays shared in the copy, rather than
+         being duplicated twice"
+        a := OrderedCollection new add: #s; yourself.
+        b := Array with: a with: a.
+        copy := b deepCopy.
+        self assert: (copy at: 1) == (copy at: 2).
+        self deny: (copy at: 1) == a
+    ]
+
+    "Copying a Symbol would break interning; copying a class is nonsense."
+    testDeepCopyLeavesAtomsAlone [
+        self assert: #s deepCopy == #s.
+        self assert: 3 deepCopy == 3.
+        self assert: $a deepCopy == $a.
+        self assert: nil deepCopy == nil.
+        self assert: true deepCopy == true.
+        self assert: Integer deepCopy == Integer.
+        "a String is NOT an atom — it is mutable, so it is copied"
+        self deny: 'abc' deepCopy == 'abc' copy.
+        self assert: 'abc' deepCopy equals: 'abc'
+    ]
+
+    "A copied key would not be findable under the original key, which is the
+     opposite of what a copy should mean."
+    testDeepCopyDictionaryKeysStayFindable [
+        | d c |
+        d := Dictionary new.
+        d at: #k put: (OrderedCollection new add: 1; yourself).
+        c := d deepCopy.
+        self assert: (c at: #k) size equals: 1.
+        (c at: #k) add: 2.
+        self assert: (d at: #k) size equals: 1.   "original unmoved"
+        self assert: (c at: #k) size equals: 2
+    ]
+
+    testStoreString [
+        self assert: 3 storeString equals: '3'.
+        self assert: true storeString equals: 'true'.
+        self assert: nil storeString equals: 'nil'.
+        self assert: 'abc' storeString equals: '''abc'''.
+        "embedded quotes are doubled, so the result really is evaluable"
+        self assert: 'it''s' storeString equals: '''it''''s'''.
+        self assert: #(1 2) storeString equals: '(Array with: 1 with: 2)'.
+        self assert: #() storeString equals: '(Array new: 0)'.
+        self assert: (OrderedCollection new add: 1; add: 2; yourself) storeString
+                     equals: '(OrderedCollection new add: 1; add: 2; yourself)'.
+        "an object with no evaluable form says so rather than emitting
+         something that looks like source and is not"
+        self assert: (Object new storeString includesSubstring: 'not storable')
+    ]
+
+    testTypePredicates [
+        self assert: #(1) isCollection.
+        self assert: (OrderedCollection new) isCollection.
+        self deny: 3 isCollection.
+        self assert: 3 isNumber.
+        self assert: 3.5 isNumber.
+        self assert: (1/2) isNumber.
+        self deny: 'x' isNumber.
+        self assert: true isBoolean.
+        self assert: false isBoolean.
+        self deny: nil isBoolean.
+        self assert: [ 1 ] isBlock.
+        self deny: 3 isBlock.
+        self assert: #(1) isArray.
+        self deny: 'x' isArray.
+        self assert: (Dictionary new) isDictionary.
+        self assert: Integer isClass.
+        self deny: 3 isClass.
+        "the predicates that already existed still answer the same"
+        self assert: 'x' isString.
+        self assert: #x isSymbol.
+        self assert: 3 isInteger
+    ]
+
+    testReadStreamGaps [
+        | rs |
+        rs := ReadStream on: #(1 2 3 4).
+        rs next.
+        "contents is the WHOLE collection, not the unread remainder — the
+         long-standing Smalltalk meaning, and why upToEnd exists"
+        self assert: rs contents equals: #(1 2 3 4).
+        self assert: rs upToEnd equals: #(2 3 4).
+        rs := ReadStream on: #(1 2 3 4).
+        self assert: (rs skipTo: 3).
+        self assert: rs next equals: 4.
+        "a failed skipTo: leaves the stream at the end, so a whileTrue: loop
+         over it terminates"
+        rs := ReadStream on: #(1 2 3).
+        self deny: (rs skipTo: 9).
+        self assert: rs atEnd.
+        rs := ReadStream on: #(1 2 3).
+        self assert: (rs collect: [ :e | e * 2 ]) asArray equals: #(2 4 6)
+    ]
+
+    testWriteStreamGaps [
+        | ws |
+        ws := WriteStream on: String new.
+        self assert: ws position equals: 0.
+        ws nextPutAll: 'abc'.
+        self assert: ws position equals: 3.
+        self assert: ws contents equals: 'abc'.
+        ws reset.
+        self assert: ws position equals: 0.
+        ws nextPutAll: 'z'.
+        self assert: ws contents equals: 'z'
+    ]
+]

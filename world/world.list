@@ -194,3 +194,7 @@
 # (utf8Size, codePointAt:, codePoints) so a byte-String can answer a text
 # question without a Cocoa crossing.
 83_string_completion.mst
+# Object/stream completion: species (fixing `#sym , 'x'`), cycle-safe
+# deepCopy, storeOn:/storeString, the missing type predicates, and
+# ReadStream contents/skipTo:/collect: + WriteStream position/reset.
+84_object_stream_completion.mst
