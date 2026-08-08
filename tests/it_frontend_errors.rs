@@ -176,6 +176,78 @@ fn reopen_with_new_instvars_errors() {
     assert!(err.msg.contains("cannot change shape"));
 }
 
+/// Identical-shape tolerance: re-declaring the class's own inst vars
+/// VERBATIM is a plain method reopen — declared methods are REPLACED,
+/// undeclared ones KEPT — so re-running a whole class-def doc example (or
+/// re-filing an unchanged one) is idempotent instead of a shape error.
+#[test]
+fn reopen_with_identical_instvars_is_a_method_reopen() {
+    let mut vm = test_vm();
+    let run = |vm: &mut VmState, src: &str| -> Option<macvm::oops::Oop> {
+        let mut items = parse_file(src).unwrap();
+        macvm::frontend::classdef::execute_top_item(vm, items.remove(0)).unwrap()
+    };
+    // A bare test VM has no world (no Object>>new), so the class carries its
+    // own instantiation via the basicNew primitive.
+    run(
+        &mut vm,
+        "Object subclass: X [ | a b | X class >> make [ <primitive: 23> ] v [ ^1 ] w [ ^9 ] ]",
+    );
+    // Same ivars, same order: accepted, and v's body is the NEW one.
+    run(
+        &mut vm,
+        "Object subclass: X [ | a b | X class >> make [ <primitive: 23> ] v [ ^2 ] ]",
+    );
+    let v = run(&mut vm, "X make v.").expect("doit answers a value");
+    assert_eq!(
+        macvm::oops::smi::SmallInt::try_from(v).unwrap().value(),
+        2,
+        "the redefined method body must win"
+    );
+    // A method the reopen did not declare survives (classic reopen).
+    let w = run(&mut vm, "X make w.").expect("doit answers a value");
+    assert_eq!(macvm::oops::smi::SmallInt::try_from(w).unwrap().value(), 9);
+}
+
+/// Order matters — slots are positional. `| a b |` vs `| b a |` is a real
+/// shape change and stays the hard error.
+#[test]
+fn reopen_with_reordered_instvars_errors() {
+    let mut vm = test_vm();
+    let mut items1 = parse_file("Object subclass: X [ | a b | ]").unwrap();
+    let macvm::frontend::ast::TopItem::ClassDef(mut c1) = items1.remove(0) else {
+        unreachable!()
+    };
+    macvm::frontend::classdef::install_class_def(&mut vm, &mut c1).unwrap();
+
+    let mut items2 = parse_file("Object subclass: X [ | b a | ]").unwrap();
+    let macvm::frontend::ast::TopItem::ClassDef(mut c2) = items2.remove(0) else {
+        unreachable!()
+    };
+    let err = macvm::frontend::classdef::install_class_def(&mut vm, &mut c2)
+        .expect_err("reordered instvars are a shape change");
+    assert!(err.msg.contains("cannot change shape"));
+}
+
+/// A subset is not identical — dropping an ivar is a shape change too.
+#[test]
+fn reopen_with_fewer_instvars_errors() {
+    let mut vm = test_vm();
+    let mut items1 = parse_file("Object subclass: X [ | a b | ]").unwrap();
+    let macvm::frontend::ast::TopItem::ClassDef(mut c1) = items1.remove(0) else {
+        unreachable!()
+    };
+    macvm::frontend::classdef::install_class_def(&mut vm, &mut c1).unwrap();
+
+    let mut items2 = parse_file("Object subclass: X [ | a | ]").unwrap();
+    let macvm::frontend::ast::TopItem::ClassDef(mut c2) = items2.remove(0) else {
+        unreachable!()
+    };
+    let err = macvm::frontend::classdef::install_class_def(&mut vm, &mut c2)
+        .expect_err("declaring fewer instvars is a shape change");
+    assert!(err.msg.contains("cannot change shape"));
+}
+
 #[test]
 fn reopen_with_indexable_errors() {
     let mut vm = test_vm();

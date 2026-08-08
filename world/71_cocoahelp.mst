@@ -1531,7 +1531,7 @@ Press play to teach the system this program:
 
 ```
 Object subclass: MyGame [
-    | pane x dx |
+    | pane x y dx dy paddle score |
     MyGame class >> launch [ ^self new start ]
     start [
         pane := GamePane new.
@@ -1548,6 +1548,8 @@ Object subclass: MyGame [
     ]
 ]
 ```
+
+The line `| pane x y dx dy paddle score |` names everything this game will ever remember — including the pieces later steps add. That is deliberate: **a class''s shape is fixed for its lifetime.** You can rewrite its methods as often as you like (that is what pressing play again does), but the list of instance variables is settled when the class is first defined, because live objects already have that shape and MACVM will not reshape them underneath you. So declare what you will need up front; an unused one is simply `nil`.
 
 Nothing appears yet — you taught it, you did not start it. Now press play here:
 
@@ -1584,7 +1586,7 @@ The whole program again, with two new things: it remembers `paddle`, and it asks
 
 ```
 Object subclass: MyGame [
-    | pane x y dx dy paddle |
+    | pane x y dx dy paddle score |
     MyGame class >> launch [ ^self new start ]
     start [
         pane := GamePane new.

@@ -130,7 +130,20 @@ fn reopen_klass(
             ),
         ));
     }
-    if !node.inst_vars.is_empty() || node.indexable.is_some() {
+    if node.indexable.is_some() {
+        return Err(err(
+            node.span,
+            format!("cannot change shape of existing class {}", node.name),
+        ));
+    }
+    // Identical-shape tolerance: re-declaring the class's OWN inst vars
+    // VERBATIM (same names, same order) changes nothing about the layout,
+    // so it proceeds as a plain method reopen — re-running a doc example's
+    // whole class def, or re-filing an unchanged one, is idempotent instead
+    // of an error. The law stands: methods are mutable, shape is not (no
+    // `become:` to migrate live instances), so declaring anything DIFFERENT
+    // is the same hard error as always.
+    if !node.inst_vars.is_empty() && !redeclares_own_inst_vars(klass, node) {
         return Err(err(
             node.span,
             format!("cannot change shape of existing class {}", node.name),
@@ -148,6 +161,24 @@ fn reopen_klass(
         append_class_var(vm, klass_h.get(vm), sym);
     }
     Ok(())
+}
+
+/// True iff the reopen declares VERBATIM the klass's own `inst_var_names` —
+/// same names, same order. `create_klass` stores the class's OWN names only
+/// (inherited slots live in the superclass), so this is a like-for-like
+/// compare. Read-only: `as_string` copies bytes Rust-side, no VM-heap
+/// allocation, so no handles are needed.
+fn redeclares_own_inst_vars(klass: KlassOop, node: &ClassDefNode) -> bool {
+    let existing = match ArrayOop::try_from(klass.inst_var_names()) {
+        Some(a) => a,
+        None => return node.inst_vars.is_empty(),
+    };
+    if existing.len() != node.inst_vars.len() {
+        return false;
+    }
+    node.inst_vars.iter().enumerate().all(|(i, name)| {
+        SymbolOop::try_from(existing.at(i)).map_or(false, |s| s.as_string() == *name)
+    })
 }
 
 /// SPEC §3.2 step 2 / `sprint_s05_detail.md` §Algorithms "Class-definition
