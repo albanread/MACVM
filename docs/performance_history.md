@@ -409,6 +409,52 @@ The durable output is calibration rather than levers:
   them was already built or already rejected. The actual defect was a `nil`
   that three separate analyses each have to be taught to ignore.
 
+## The 2026-08-08 exceptions-arc stamp (commit `3c34e87`)
+
+**Machine: the fan-less MacBook Air (Apple M4, 4P+6E, 16 GB, macOS 26.5.1)**
+— the same one every number in this file was measured on.
+
+Same protocol: interleaved A/B within each round, best-of-3, warm = median
+of 41 single-rep samples after 30 warm-up reps, microsecond clock both
+sides. Dart = one fresh process per bench with the 2017-arm64 workaround
+flags (a floor).
+
+| bench | MACVM ms | Cog ms | vs Cog | Dart V1 ms | vs Dart |
+|---|---|---|---|---|---|
+| arith | 1.428 | 5.543 | **MACVM 3.88×** | 0.793 | Dart 1.75× |
+| fib | 9.052 | 18.478 | **MACVM 2.04×** | 6.201 | Dart 1.44× |
+| sieve | 0.175 | 0.376 | **MACVM 2.15×** | 0.068 | Dart 2.47× |
+| dict | 0.272 | 1.023 | **MACVM 3.76×** | 0.226 | Dart 1.28× |
+| alloc | 0.609 | 0.719 | **MACVM 1.18×** | 0.357 | Dart 1.63× |
+| richards | 1.076 | 2.240 | **MACVM 2.08×** | 0.487 | Dart 2.19× |
+| **deltablue** | **0.138** | 0.276 | **MACVM 2.00×** | 0.232 | **MACVM 1.71×** |
+
+- **vs Cog: all seven again**, margins 1.18–3.88×.
+- **vs Dart V1: 1.28–2.47×**, deltablue still an outright win.
+
+**Why this stamp was taken at all.** Not a perf slice — the exceptions arc
+(E0–E4) had just landed, and E4 gave `Array>>at:`/`at:put:` a Smalltalk
+fallback body where they had been bare `<primitive:>`. `at:` is the
+innermost operation in sieve, dict and richards, and adding a fallback is
+exactly the kind of change that can perturb how the JIT treats a hot
+accessor. **It did not.** Against the 2026-08-05 close: richards 1.076 vs
+1.083, deltablue 0.138 vs 0.139, sieve 0.175 vs 0.178, dict 0.272 vs
+0.263 — every delta inside the measured noise floors (dict ±13.4%, sieve
+±4.8%, richards ±6.5%, arith ±0.1%, fib ±0.4%). The fallback runs only
+when the primitive fails, and the numbers say the fast path is genuinely
+untouched.
+
+**Conditions, stated because they are worse than usual.** 1-min load was
+3.01 for the Cog leg and 2.41 for the Dart leg, with OneDrive holding
+~87% of one core throughout. On 10 cores a single-threaded benchmark
+still has P-core room, and the interleaving plus best-of-3 is exactly what
+that design protects against — so the same-round RATIOS above are sound.
+The absolute milliseconds are likely a touch inflated, and the two legs
+are not strictly comparable to each other on absolutes: MACVM reads arith
+1.428 in the Cog leg and 1.391 in the Dart leg, which is the residual
+noise made visible. Compare each row's ratio, not its ms, against the
+2026-08-05 close.
+
 ## Part V — How the numbers were won (method, not luck)
 
 1. **Benchmark, don't estimate.** Interleaved A/B, load gate < 3,
@@ -477,6 +523,8 @@ The durable output is calibration rather than levers:
 - The interpreter half of every story: threading, superinstructions —
   unexplored because the JIT kept paying better.
 
-*Twenty-four days. One machine, one fan-less MacBook Air, every number
-in this file reproducible from `scripts/cog-bench.sh` and
-`scripts/dart-bench.sh` at the stamped commits.*
+*Twenty-four days of campaign, plus the stamps since. One machine
+throughout — a fan-less MacBook Air (Apple M4, 4 performance + 6
+efficiency cores, 16 GB) — and every number in this file reproducible
+from `scripts/cog-bench.sh` and `scripts/dart-bench.sh` at the stamped
+commits.*
