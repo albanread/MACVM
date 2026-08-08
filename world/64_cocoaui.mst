@@ -84,7 +84,7 @@ Object subclass: CocoaUI [
                 WinToolbar ToolbarDelegate ToolbarItems MetricsHost
                 ToolbarIdentArray ToolbarSpecs ViewItemSpecs
                 Theme ThemeMenuItems
-                RevertArmed RevertLastItem RevertWorldItem>
+                RevertArmed RevertLastItem RevertWorldItem RestoreItem CompactItem>
 
     "The DISPLAY name, macOS house style (macOS/macVM) — not the binary,
      the bundle id, or the MACVM_* environment variables, which stay upper."
@@ -888,6 +888,7 @@ Object subclass: CocoaUI [
         self installViewMenuOn: mainMenu.
         self installToolsMenuOn: mainMenu.
         self installDemosMenuOn: mainMenu.
+        self installWorldMenuOn: mainMenu.
         self installDebugMenuOn: mainMenu.
         "Window and Help go LAST, in that order — macOS puts Help at the far
          right and expects Window immediately before it."
@@ -1149,21 +1150,105 @@ Object subclass: CocoaUI [
         debugMenu onMain addItem: HaltMenuItem.
         ToolbarDelegates add: jitDelegate.
 
-        "── recovery (both DESTRUCTIVE, so both ARM on the first click and act
-           on the second — the browser's arm/confirm rule; a modal NSAlert
-           would run a nested run loop inside this callback, which is exactly
-           the hazard this app avoids everywhere else). ──"
-        debugMenu onMain addItem: ((Cocoa classNamed: 'NSMenuItem') onMain separatorItem).
-        RevertLastItem := self debugItemTitled: 'Revert to Previous Version and Reload'
-                               in: debugMenu action: [ self revertLastChangePressed ].
-        RevertWorldItem := self debugItemTitled: 'Revert World to Original…'
-                                in: debugMenu action: [ self revertWorldPressed ].
-
         debugItem := ((Cocoa classNamed: 'NSMenuItem') onMain alloc) onMain
             initWithTitle: 'Debug' action: nil keyEquivalent: ''.
         debugItem onMain setSubmenu: debugMenu.
         mainMenu onMain addItem: debugItem.
         ^debugItem
+    ]
+
+    "── the World menu: managing the world ITSELF (it is a database, not a
+       heap image) — snapshot it, restore it, walk its history back, compact
+       it, or return it to the source it was seeded from. Every destructive
+       item ARMS on the first click and acts on the second, its title saying
+       what will be lost; a modal NSAlert would run a nested run loop inside
+       the callback, the hazard this app avoids everywhere. ──"
+    CocoaUI class >> installWorldMenuOn: mainMenu [
+        | menu topItem |
+        menu := (Cocoa classNamed: 'NSMenu') onMain alloc onMain init.
+        self debugItemTitled: 'Save Snapshot' in: menu
+             action: [ self saveWorldSnapshot ].
+        RestoreItem := self debugItemTitled: 'Restore Latest Snapshot…' in: menu
+             action: [ self restoreWorldPressed ].
+        menu onMain addItem: ((Cocoa classNamed: 'NSMenuItem') onMain separatorItem).
+        RevertLastItem := self debugItemTitled: 'Revert to Previous Version and Reload'
+                               in: menu action: [ self revertLastChangePressed ].
+        CompactItem := self debugItemTitled: 'Compact World (drop history)…' in: menu
+             action: [ self compactWorldPressed ].
+        menu onMain addItem: ((Cocoa classNamed: 'NSMenuItem') onMain separatorItem).
+        RevertWorldItem := self debugItemTitled: 'Revert World to Original…'
+                                in: menu action: [ self revertWorldPressed ].
+        topItem := ((Cocoa classNamed: 'NSMenuItem') onMain alloc) onMain
+            initWithTitle: 'World' action: nil keyEquivalent: ''.
+        topItem onMain setSubmenu: menu.
+        mainMenu onMain addItem: topItem.
+        ^topItem
+    ]
+
+    CocoaUI class >> saveWorldSnapshot [
+        "Write a compact, zipped copy of the whole world. The HOST picks the
+         name (~/Documents/macVM Snapshots/world-<stamp>.zip) and makes the
+         folder, so this is one click and saves never collide. Not
+         destructive, so no arming."
+        | reply |
+        reply := (Worker classNamed: #CocoaBrowser) readReply:
+            (self hostService onMain snapshotWorldDefault).
+        self appendTranscript: 'world: ' , (((Worker classNamed: #CocoaBrowser) isOk: reply)
+            ifTrue: [ (Worker classNamed: #CocoaBrowser) payloadOf: reply ]
+            ifFalse: [ 'snapshot FAILED — ' , ((Worker classNamed: #CocoaBrowser) errorOf: reply) ]).
+    ]
+
+    CocoaUI class >> latestSnapshotPath [
+        "The newest snapshot the host can see, or nil when there is none."
+        | reply |
+        reply := (Worker classNamed: #CocoaBrowser) readReply:
+            (self hostService onMain latestSnapshotPath).
+        ^((Worker classNamed: #CocoaBrowser) isOk: reply)
+            ifTrue: [ (Worker classNamed: #CocoaBrowser) payloadOf: reply ]
+            ifFalse: [ nil ]
+    ]
+
+    CocoaUI class >> restoreWorldPressed [
+        "DESTRUCTIVE: replaces the whole image with the newest snapshot. The
+         armed title names the file, so you confirm the actual restore."
+        | path reply |
+        path := self latestSnapshotPath.
+        path isNil ifTrue: [
+            ^self appendTranscript: 'world: no snapshot saved yet (World ▸ Save Snapshot)' ].
+        RevertArmed == #restore ifFalse: [
+            self disarmRevert.
+            RevertArmed := #restore.
+            ^RestoreItem onMain setTitle:
+                'Replace this world with ' , (self baseNameOf: path) , '?' ].
+        self disarmRevert.
+        reply := (Worker classNamed: #CocoaBrowser) readReply:
+            (self hostService onMain restoreWorldFrom: path).
+        self appendTranscript: 'world: ' , (((Worker classNamed: #CocoaBrowser) isOk: reply)
+            ifTrue: [ (Worker classNamed: #CocoaBrowser) payloadOf: reply ]
+            ifFalse: [ 'restore FAILED — ' , ((Worker classNamed: #CocoaBrowser) errorOf: reply) ]).
+    ]
+
+    CocoaUI class >> baseNameOf: aPath [
+        | i |
+        i := aPath size.
+        [ i > 0 and: [ (aPath at: i) ~= $/ ] ] whileTrue: [ i := i - 1 ].
+        ^aPath copyFrom: i + 1 to: aPath size
+    ]
+
+    CocoaUI class >> compactWorldPressed [
+        "Drop every version but the newest and hand the freed pages back —
+         the 'my image got huge' tool. The LIVE source is untouched, but the
+         history behind it is gone for good, so it arms first."
+        | reply |
+        RevertArmed == #compact ifFalse: [
+            self disarmRevert.
+            RevertArmed := #compact.
+            ^CompactItem onMain setTitle: 'Discard all earlier versions permanently?' ].
+        self disarmRevert.
+        reply := (Worker classNamed: #CocoaBrowser) readReply: (self hostService onMain compactWorld).
+        self appendTranscript: 'world: ' , (((Worker classNamed: #CocoaBrowser) isOk: reply)
+            ifTrue: [ (Worker classNamed: #CocoaBrowser) payloadOf: reply ]
+            ifFalse: [ 'compact FAILED — ' , ((Worker classNamed: #CocoaBrowser) errorOf: reply) ]).
     ]
 
     CocoaUI class >> debugItemTitled: aTitle in: aMenu action: aBlock [
@@ -1186,6 +1271,10 @@ Object subclass: CocoaUI [
             RevertLastItem onMain setTitle: 'Revert to Previous Version and Reload' ].
         RevertWorldItem isNil ifFalse: [
             RevertWorldItem onMain setTitle: 'Revert World to Original…' ].
+        RestoreItem isNil ifFalse: [
+            RestoreItem onMain setTitle: 'Restore Latest Snapshot…' ].
+        CompactItem isNil ifFalse: [
+            CompactItem onMain setTitle: 'Compact World (drop history)…' ].
     ]
 
     CocoaUI class >> hostService [

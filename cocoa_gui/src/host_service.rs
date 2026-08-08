@@ -903,6 +903,195 @@ extern "C" fn imp_file_in_path(_this: *mut c_void, _cmd: *mut c_void, path: Id) 
     std::ptr::null_mut()
 }
 
+/// `snapshotWorldTo:` — World ▸ Save Snapshot. Writes a COMPACT, CONSISTENT
+/// copy of the image (`VACUUM INTO`, which holds a read transaction for the
+/// duration) and zips it, so a whole world travels as one file. `.zip` is
+/// appended when the chosen name lacks it. `OK <path> (<size>)` / `ERR <why>`.
+extern "C" fn imp_snapshot_world_to(_this: *mut c_void, _cmd: *mut c_void, dest: Id) -> Id {
+    let mut zip_path = PathBuf::from(ns_to_string(dest));
+    if zip_path.extension().map_or(true, |e| e != "zip") {
+        zip_path.set_extension("zip");
+    }
+    let tmp = std::env::temp_dir().join(format!("macvm-world-{}.sqlite3", std::process::id()));
+    let _ = std::fs::remove_file(&tmp); // VACUUM INTO refuses an existing file
+    let img = match writer() {
+        Ok(i) => i,
+        Err(e) => return err(&e),
+    };
+    if let Err(e) = img.snapshot_to(&tmp) {
+        return err(&format!("snapshot failed: {e}"));
+    }
+    let _ = std::fs::remove_file(&zip_path);
+    // `-j` junks the temp directory path so the archive holds a bare
+    // `image.sqlite3`; macOS always ships /usr/bin/zip.
+    let staged = tmp.with_file_name("image.sqlite3");
+    let _ = std::fs::rename(&tmp, &staged);
+    let out = std::process::Command::new("/usr/bin/zip")
+        .arg("-j")
+        .arg("-q")
+        .arg(&zip_path)
+        .arg(&staged)
+        .output();
+    let _ = std::fs::remove_file(&staged);
+    match out {
+        Ok(o) if o.status.success() => {
+            let size = std::fs::metadata(&zip_path).map(|m| m.len()).unwrap_or(0);
+            ok(&format!(
+                "saved {} ({:.1} MB)",
+                zip_path.display(),
+                size as f64 / 1_048_576.0
+            ))
+        }
+        Ok(o) => err(&format!(
+            "zip failed: {}",
+            String::from_utf8_lossy(&o.stderr).trim()
+        )),
+        Err(e) => err(&format!("cannot run zip: {e}")),
+    }
+}
+
+/// The folder snapshots live in: `~/Documents/macVM Snapshots`.
+fn snapshot_dir() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    PathBuf::from(home).join("Documents").join("macVM Snapshots")
+}
+
+/// `snapshotWorldDefault` — World ▸ Save Snapshot with no file panel: the
+/// host picks `~/Documents/macVM Snapshots/world-<unix-time>.zip`, creating
+/// the folder, so a save is one click and successive saves never collide.
+extern "C" fn imp_snapshot_world_default(_this: *mut c_void, _cmd: *mut c_void) -> Id {
+    let dir = snapshot_dir();
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        return err(&format!("cannot create {}: {e}", dir.display()));
+    }
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let dest = dir.join(format!("world-{stamp}"));
+    let ns = crate::objc::nsstring(&dest.to_string_lossy());
+    imp_snapshot_world_to(std::ptr::null_mut(), std::ptr::null_mut(), ns)
+}
+
+/// `latestSnapshotPath` — the newest `.zip` in the snapshot folder, so the
+/// menu can name the file it is about to restore. `OK <path>` / `ERR none`.
+extern "C" fn imp_latest_snapshot_path(_this: *mut c_void, _cmd: *mut c_void) -> Id {
+    let dir = snapshot_dir();
+    let newest = std::fs::read_dir(&dir).ok().and_then(|d| {
+        d.filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().map_or(false, |x| x == "zip"))
+            .filter_map(|p| {
+                let t = std::fs::metadata(&p).and_then(|m| m.modified()).ok()?;
+                Some((t, p))
+            })
+            .max_by_key(|(t, _)| *t)
+            .map(|(_, p)| p)
+    });
+    match newest {
+        Some(p) => ok(&p.to_string_lossy()),
+        None => err(&format!("no snapshot in {}", dir.display())),
+    }
+}
+
+/// `restoreWorldFrom:` — World ▸ Restore Snapshot. DESTRUCTIVE: replaces the
+/// image with the one inside the zip and restarts the primary onto it. The
+/// archive is unzipped to a temp file and VALIDATED first (it must open and
+/// hold classes), so a wrong or corrupt file is refused with the current
+/// world untouched. `OK <summary>` / `ERR <why>`. Caller arms this.
+extern "C" fn imp_restore_world_from(_this: *mut c_void, _cmd: *mut c_void, src: Id) -> Id {
+    let zip_path = PathBuf::from(ns_to_string(src));
+    let stage = std::env::temp_dir().join(format!("macvm-restore-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&stage);
+    if let Err(e) = std::fs::create_dir_all(&stage) {
+        return err(&format!("cannot stage the restore: {e}"));
+    }
+    let out = std::process::Command::new("/usr/bin/unzip")
+        .arg("-q")
+        .arg("-o")
+        .arg(&zip_path)
+        .arg("-d")
+        .arg(&stage)
+        .output();
+    match out {
+        Ok(o) if o.status.success() => {}
+        Ok(_) => {
+            // unzip's own failure text is a multi-line "cannot find …, period."
+            // complaint; the useful fact is simply that this is not a snapshot.
+            let _ = std::fs::remove_dir_all(&stage);
+            return err(&format!(
+                "not a readable snapshot archive: {}",
+                zip_path.display()
+            ));
+        }
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&stage);
+            return err(&format!("cannot run unzip: {e}"));
+        }
+    }
+    // Take the first .sqlite3 in the archive, whatever it was named.
+    let found = std::fs::read_dir(&stage)
+        .ok()
+        .and_then(|d| {
+            d.filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .find(|p| p.extension().map_or(false, |x| x == "sqlite3"))
+        });
+    let Some(candidate) = found else {
+        let _ = std::fs::remove_dir_all(&stage);
+        return err("the archive holds no .sqlite3 image");
+    };
+    // VALIDATE before destroying anything: it must open and have classes.
+    match image_store::Image::open(&candidate).and_then(|i| i.all_classes()) {
+        Ok(classes) if !classes.is_empty() => {
+            let target = image_path();
+            for p in [
+                target.clone(),
+                PathBuf::from(format!("{}-wal", target.display())),
+                PathBuf::from(format!("{}-shm", target.display())),
+            ] {
+                let _ = std::fs::remove_file(&p);
+            }
+            if let Err(e) = std::fs::copy(&candidate, &target) {
+                let _ = std::fs::remove_dir_all(&stage);
+                return err(&format!("cannot install the restored image: {e}"));
+            }
+            let n = classes.len();
+            let _ = std::fs::remove_dir_all(&stage);
+            crate::primary_restart::request();
+            crate::objc::wake_main_runloop();
+            ok(&format!("restored {n} classes from the snapshot — reloading"))
+        }
+        Ok(_) => {
+            let _ = std::fs::remove_dir_all(&stage);
+            err("refused — that image holds no classes")
+        }
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&stage);
+            err(&format!("refused — not a readable MACVM image: {e}"))
+        }
+    }
+}
+
+/// `compactWorld` — World ▸ Compact. Drops every version but the newest per
+/// class/method and VACUUMs, handing the freed pages back to the filesystem:
+/// the "my image got huge" tool, since version history is what grows it. The
+/// LIVE source is untouched; only the history behind it goes. `OK <summary>`.
+extern "C" fn imp_compact_world(_this: *mut c_void, _cmd: *mut c_void) -> Id {
+    let img = match writer() {
+        Ok(i) => i,
+        Err(e) => return err(&e),
+    };
+    match img.prune_history(1) {
+        Ok((removed, before, after)) => ok(&format!(
+            "compacted — {removed} old version(s) dropped, {:.1} MB → {:.1} MB",
+            before as f64 / 1_048_576.0,
+            after as f64 / 1_048_576.0
+        )),
+        Err(e) => err(&format!("compact failed: {e}")),
+    }
+}
+
 /// `revertLastChange` — Debug ▸ Revert to Previous Version and Reload. Walks
 /// the image's own version history back one step for the most recently edited
 /// method or class (`Image::most_recent_undoable` + `undo_method`/`undo_class`,
@@ -1189,7 +1378,7 @@ pub fn register() {
     type Imp2 = extern "C" fn(*mut c_void, *mut c_void, Id, Id) -> Id;
     type Imp3 = extern "C" fn(*mut c_void, *mut c_void, Id, Id, Id) -> Id;
     type Imp4 = extern "C" fn(*mut c_void, *mut c_void, Id, Id, Id, Id) -> Id;
-    let methods: [(&str, *const c_void, &str); 46] = [
+    let methods: [(&str, *const c_void, &str); 51] = [
         ("colorizeWorkspaceStorage:", imp_colorize_workspace_storage as Imp1 as *const c_void, "@@:@"),
         ("addToWorldPath:", imp_add_to_world as Imp1 as *const c_void, "@@:@"),
         ("dbgReport", imp_dbg_report as Imp0 as *const c_void, "@@:"),
@@ -1207,6 +1396,11 @@ pub fn register() {
         ("requestSavePanel", imp_request_save_panel as Imp0 as *const c_void, "@@:"),
         ("requestUiRebuild", imp_request_ui_rebuild as Imp0 as *const c_void, "@@:"),
         ("revertLastChange", imp_revert_last_change as Imp0 as *const c_void, "@@:"),
+        ("compactWorld", imp_compact_world as Imp0 as *const c_void, "@@:"),
+        ("snapshotWorldDefault", imp_snapshot_world_default as Imp0 as *const c_void, "@@:"),
+        ("latestSnapshotPath", imp_latest_snapshot_path as Imp0 as *const c_void, "@@:"),
+        ("snapshotWorldTo:", imp_snapshot_world_to as Imp1 as *const c_void, "@@:@"),
+        ("restoreWorldFrom:", imp_restore_world_from as Imp1 as *const c_void, "@@:@"),
         ("revertWorldToOriginal", imp_revert_world_to_original as Imp0 as *const c_void, "@@:"),
         ("requestPrimaryRestart", imp_request_primary_restart as Imp0 as *const c_void, "@@:"),
         ("requestBrowserRefresh", imp_request_browser_refresh as Imp0 as *const c_void, "@@:"),

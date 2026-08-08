@@ -1327,6 +1327,66 @@ impl Image {
         Ok(true)
     }
 
+    /// Write a COMPACT, CONSISTENT copy of the whole image to `dest` —
+    /// SQLite's own `VACUUM INTO`, which takes a read transaction for the
+    /// duration, so the copy is a valid image even if something writes
+    /// meanwhile, and it arrives already defragmented. `dest` must not exist.
+    /// The snapshot/export path (the GUI zips the result).
+    pub fn snapshot_to(&self, dest: &std::path::Path) -> rusqlite::Result<()> {
+        self.conn
+            .execute("VACUUM INTO ?1", params![dest.to_string_lossy()])?;
+        Ok(())
+    }
+
+    /// Drop every version except the newest `keep` per method and per class,
+    /// then `VACUUM` to hand the freed pages back to the filesystem. Answers
+    /// `(versions_removed, bytes_before, bytes_after)`.
+    ///
+    /// History is what makes a long-lived image grow (`method_versions` is
+    /// already the largest table in a FRESH image), so this is the "my world
+    /// got huge" tool. `keep = 1` collapses to just the live source.
+    ///
+    /// The three tables keyed by `method_version_id` — `method_bytecode`,
+    /// `method_sends`, `method_signatures` — are cleaned FIRST, or pruning
+    /// would orphan their rows (and `method_sends` is what the senders tool
+    /// reads, so orphans there are not merely untidy).
+    pub fn prune_history(&self, keep: i64) -> rusqlite::Result<(usize, u64, u64)> {
+        let keep = keep.max(1);
+        let path = self.conn.path().map(|p| p.to_string()).unwrap_or_default();
+        let before = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        // "Doomed" = every method version outside the newest `keep` for its
+        // own method; same shape for classes.
+        let doomed_methods = "SELECT version_id FROM method_versions mv WHERE (\
+             SELECT COUNT(*) FROM method_versions v \
+             WHERE v.method_id = mv.method_id AND v.version_number > mv.version_number) >= ?1";
+        self.conn.execute(
+            &format!("DELETE FROM method_bytecode WHERE method_version_id IN ({doomed_methods})"),
+            params![keep],
+        )?;
+        self.conn.execute(
+            &format!("DELETE FROM method_sends WHERE method_version_id IN ({doomed_methods})"),
+            params![keep],
+        )?;
+        self.conn.execute(
+            &format!("DELETE FROM method_signatures WHERE method_version_id IN ({doomed_methods})"),
+            params![keep],
+        )?;
+        let mut removed = self.conn.execute(
+            &format!("DELETE FROM method_versions WHERE version_id IN ({doomed_methods})"),
+            params![keep],
+        )?;
+        removed += self.conn.execute(
+            "DELETE FROM class_versions WHERE version_id IN (\
+               SELECT version_id FROM class_versions cv WHERE (\
+                 SELECT COUNT(*) FROM class_versions v \
+                 WHERE v.class_id = cv.class_id AND v.version_number > cv.version_number) >= ?1)",
+            params![keep],
+        )?;
+        self.conn.execute_batch("VACUUM")?;
+        let after = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        Ok((removed, before, after))
+    }
+
     /// `meta` key holding the "everything at or before this `edited_at` is
     /// SEED content, not a user edit" watermark — see [`Self::edit_baseline`].
     const BASELINE_KEY: &'static str = "edit_baseline";
@@ -1751,6 +1811,72 @@ mod tests {
         assert!(!img
             .set_method_source("Object", Side::Instance, "nope", "x")
             .unwrap());
+    }
+
+    #[test]
+    /// Pruning keeps the LIVE source, drops the history behind it, and leaves
+    /// no orphan in the three tables keyed by `method_version_id`.
+    #[test]
+    fn prune_history_keeps_latest_and_orphans_nothing() {
+        let img = seeded();
+        for src in ["hash\n\t^1", "hash\n\t^2", "hash\n\t^3"] {
+            img.set_method_source("Object", Side::Instance, "hash", src)
+                .unwrap();
+        }
+        let (removed, _, _) = img.prune_history(1).unwrap();
+        assert!(removed > 0, "there was history to prune");
+        // The live source survives untouched.
+        assert_eq!(
+            img.method_source("Object", Side::Instance, "hash")
+                .unwrap()
+                .unwrap(),
+            "hash\n\t^3"
+        );
+        // Exactly one version per method/class remains…
+        let max_versions: i64 = img
+            .conn
+            .query_row(
+                "SELECT COALESCE(MAX(n),0) FROM (SELECT COUNT(*) n FROM method_versions GROUP BY method_id)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(max_versions, 1);
+        // …and nothing points at a version that no longer exists.
+        for t in ["method_bytecode", "method_sends", "method_signatures"] {
+            let orphans: i64 = img
+                .conn
+                .query_row(
+                    &format!(
+                        "SELECT COUNT(*) FROM {t} WHERE method_version_id NOT IN \
+                         (SELECT version_id FROM method_versions)"
+                    ),
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(orphans, 0, "{t} kept rows for pruned versions");
+        }
+    }
+
+    /// A snapshot is a valid, independent image — openable, same content.
+    #[test]
+    fn snapshot_to_writes_a_readable_copy() {
+        let img = seeded();
+        let dest = std::env::temp_dir().join(format!(
+            "macvm-snap-test-{}-{:?}.sqlite3",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_file(&dest); // VACUUM INTO refuses an existing file
+        img.snapshot_to(&dest).unwrap();
+        let copy = Image::open(&dest).unwrap();
+        assert_eq!(
+            copy.all_classes().unwrap().len(),
+            img.all_classes().unwrap().len()
+        );
+        drop(copy);
+        let _ = std::fs::remove_file(&dest);
     }
 
     #[test]
