@@ -1169,6 +1169,22 @@ pub fn try_send_string(target: *mut c_void, selector: &str) -> Result<Vec<u8>, S
 /// return; the caller wraps it, which retains).
 pub fn nsstring_from(bytes: &[u8]) -> Result<*mut c_void, String> {
     let cls = class_named("NSString").ok_or_else(|| "NSString class missing".to_string())?;
+    // Validate UTF-8 OURSELVES, because Cocoa does not fail here — it
+    // SUBSTITUTES. `stringWithUTF8String:` given the bytes `200 120` answers a
+    // 2-character string, and reading it back yields `239 191 189 120`: the
+    // invalid byte silently became U+FFFD. A Smalltalk String is a byte vector
+    // (one byte per Character, Latin-1 flyweights), so any string built
+    // byte-wise — from a socket, a file, a NativeBuffer — can contain bytes
+    // that are not UTF-8, and used to round-trip through Cocoa CHANGED with
+    // nothing raised. Failing loudly here turns silent corruption into an
+    // ordinary catchable error (E4), which is the whole point.
+    if let Err(e) = std::str::from_utf8(bytes) {
+        return Err(format!(
+            "string is not valid UTF-8 at byte {} (Cocoa would silently \
+             substitute U+FFFD); convert explicitly if that is what you want",
+            e.valid_up_to() + 1
+        ));
+    }
     let c = CString::new(bytes).map_err(|_| "string contains NUL".to_string())?;
     let ns = try_send(
         cls,

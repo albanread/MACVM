@@ -2031,7 +2031,19 @@ fn prim_eval_doit(vm: &mut VmState, args: &[Oop]) -> PrimResult {
 }
 
 /// Read a String argument's UTF-8 content; `None` for anything else.
-fn string_arg(vm: &VmState, oop: Oop) -> Option<String> {
+/// A `String` oop's bytes, verbatim — NO encoding conversion.
+///
+/// This used to be `String::from_utf8_lossy`, which silently replaced any
+/// non-UTF-8 byte with U+FFFD before the caller ever saw it. A Smalltalk
+/// String is a BYTE VECTOR (one byte per Character, Latin-1 flyweights), so
+/// a string built byte-wise — off a socket, out of a file, through a
+/// NativeBuffer — legitimately holds bytes that are not UTF-8, and every one
+/// of them was being rewritten on the way out. Measured: `#(200 120)` went
+/// to Cocoa and came back `#(239 191 189 120)`, losslessly *looking* fine.
+///
+/// Callers that need `str` now ask for it explicitly and decide what an
+/// invalid sequence means for them.
+fn string_bytes_arg(vm: &VmState, oop: Oop) -> Option<Vec<u8>> {
     let m = MemOop::try_from(oop)?;
     if m.klass().oop().raw() != vm.universe.string_klass.oop().raw() {
         return None;
@@ -2039,7 +2051,15 @@ fn string_arg(vm: &VmState, oop: Oop) -> Option<String> {
     let b = ByteArrayOop::try_from(oop)?;
     let mut buf = Vec::new();
     b.copy_bytes_out(&mut buf);
-    Some(String::from_utf8_lossy(&buf).into_owned())
+    Some(buf)
+}
+
+/// A `String` oop as a Rust `String`, LOSSY — for the callers whose contract
+/// is genuinely "some text for a human" (a message, a path echoed into a
+/// log) and where a replacement char is better than a failure. Anything that
+/// hands bytes to another system must use `string_bytes_arg` instead.
+fn string_arg(vm: &VmState, oop: Oop) -> Option<String> {
+    string_bytes_arg(vm, oop).map(|b| String::from_utf8_lossy(&b).into_owned())
 }
 
 /// Build the guest-facing envelope `{fromId. corr. bytes}` — a 3-slot Array.
@@ -3032,10 +3052,12 @@ fn prim_cocoa_release(vm: &mut VmState, args: &[Oop]) -> PrimResult {
 /// `Cocoa class >> primNSString:` (237): a Smalltalk String copied into a
 /// fresh NSString, wrapped (+0 return → wrap retains).
 fn prim_cocoa_nsstring(vm: &mut VmState, args: &[Oop]) -> PrimResult {
-    let Some(s) = string_arg(vm, args[1]) else {
+    // Bytes VERBATIM: nsstring_from is what validates, and it can only do
+    // that if it is handed what the Smalltalk String actually holds.
+    let Some(s) = string_bytes_arg(vm, args[1]) else {
         return PrimResult::Fail;
     };
-    match crate::runtime::objc_bridge::nsstring_from(s.as_bytes()) {
+    match crate::runtime::objc_bridge::nsstring_from(&s) {
         Ok(ns) => PrimResult::Ok(crate::runtime::objc_bridge::wrap(vm, ns)),
         Err(desc) => cocoa_exception_fail(vm, "stringWithUTF8String:", &desc),
     }
