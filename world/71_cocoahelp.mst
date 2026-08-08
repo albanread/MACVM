@@ -70,6 +70,7 @@ Object subclass: CocoaHelp [
         t add: (Array with: 'Guide: Build an App'    with: #appGuideText).
         t add: (Array with: 'Guide: Build a Game'    with: #gameGuideText).
         t add: (Array with: 'Automation'             with: #automationText).
+        t add: (Array with: 'Caring for Your World'  with: #worldCareText).
         t add: (Array with: 'Under the Hood'         with: #internalsText).
         Topics := t asArray.
         ^Topics
@@ -1758,6 +1759,77 @@ The result prints straight to standard output. Point anything that can shell out
 Because it is Smalltalk all the way down, *automating the app* and *programming the system* are the same act. A script does not poke at a frozen interface from outside; it sends messages into the identical live world the Workspace talks to — the same objects, the same classes, the same worker that runs your code. The window is one client of that world; a script, or an agent, is simply another. Anything you can do here by hand, you can hand to something else to do for you.
 
 > `evaluate` turns an error into an answer instead of a hang: a raise inside your string comes back as an AppleScript error the caller can catch, never a spinning beachball.
+' ]
+
+    CocoaHelp class >> worldCareText [ ^'# Caring for Your World
+
+Your **world** is everything this system knows: every class, every method, the whole library and all the tools — including the browser you read it in. It is worth understanding where that lives, because keeping it safe is easy once you know, and bewildering if you don''t.
+
+## Two homes, and only one of them is yours
+
+The world has a **source** and a **live copy**.
+
+The source is `world/*.mst` — ordinary text files, listed in `world/world.list`, loaded in order. That is where the system ships from.
+
+The live copy is `world/image.sqlite3`, a **database**. It is built (*seeded*) from the source once, and from then on it is what the app actually boots. A freshly seeded one holds about **191 classes and 3,273 methods** in roughly **2.5 MB**.
+
+This is the fact everything else follows from: **when you Accept a method in the Browser or the Editor, it goes into the database — not into the source files.** Your work is real, saved, and survives restarts; it just does not live in `world/*.mst` unless you deliberately put it there.
+
+## Where your changes go
+
+There are exactly two doors, and they behave very differently.
+
+**Accept** (Browser or Editor) writes to the database. Every accept is a **new version**: the previous source is kept, and the last **100 versions** of each class and method stay on record. This is the safe, everyday door — nothing is overwritten, everything can be walked back.
+
+**File ▸ Add to World** is the other door. It graduates a file into `world/user_<name>.mst`, adds it to `world.list`, and imports it — so the class survives even a full re-seed. That makes it permanent, and world files have **no version history and no undo**. Use it when something has earned its place, not while you are still experimenting. (It now refuses to add a class a core world file already defines, which would otherwise write a silent copy that shadows the original.)
+
+**File ▸ File In** is deliberately temporary: it restarts from a clean world and loads your file on top. Nothing persists. That is the right tool for trying something out.
+
+## The World menu
+
+Everything you need to look after the world is in one place.
+
+- **Save Snapshot** — writes the whole world, compressed, to `~/Documents/macVM Snapshots`. About **0.8 MB**, a second or two, and stamped so saves never overwrite each other. This is your seatbelt.
+- **Restore Latest Snapshot…** — puts the newest snapshot back and reloads. The archive is checked before anything is replaced, so a wrong or damaged file is refused with your world untouched.
+- **Revert to Previous Version and Reload** — walks the history back one step for the thing you edited most recently. Gentle: the older source returns *as a new version*, so the revert is itself revertable.
+- **Compact World (drop history)…** — throws away every version but the current one and reclaims the space. Use it when the image has grown; the live code is untouched, but its history is gone for good.
+- **Revert World to Original…** — deletes the database and re-seeds from `world/*.mst`. **Everything you accepted and never saved to a file is gone.** Classes you added with *Add to World* survive, because those are world files.
+
+Each destructive item asks twice: the first click changes its title to say exactly what will be lost, the second does it. Nothing here happens by accident.
+
+## How to work safely
+
+**Snapshot before anything ambitious.** It costs a second and under a megabyte. Before a big refactor, before filing in someone else''s code, before an experiment you cannot describe in one sentence — take one.
+
+**Prefer Accept while you explore.** It is versioned; you can always step back. Reach for *Add to World* only when a class is finished enough to keep.
+
+**Compact when it grows, not by habit.** History is what makes the image large, and history is what makes revert possible. Snapshot first, then compact — that way the record still exists somewhere.
+
+**You cannot revert past the beginning.** The system marks the moment the world was seeded, and *Revert to Previous Version* stops there. It will never walk back into the library''s own construction and hand you a half-built method. On an untouched world it simply says there is nothing to revert — which is the truth.
+
+**A class''s shape is fixed once it exists.** You can rewrite its methods freely, but its instance variables are settled when it is first defined, because live objects already have that shape. Declare what you will need up front. Re-running an identical definition is fine — that is just a method update.
+
+## Doing all of it from a script
+
+Every one of these is scriptable, so a backup can be a cron job and an agent can look after its own world:
+
+```ref
+tell application id "com.macvm.cocoa"
+    save snapshot                    -- answers the archive path
+    compact world
+    revert last change
+    restore snapshot                 -- newest, or: from POSIX file "…"
+    revert world
+end tell
+```
+
+## The one idea worth keeping
+
+Every other Smalltalk hands you an **image**: a frozen snapshot of a running heap, all of it, saved and reloaded as one opaque block. Lose it and you lose everything; corrupt it and there is little to say about what broke.
+
+This world is not that. It is a **database** — rows for classes, rows for methods, each one versioned, queryable, revertable, exportable, and readable by tools that know nothing about Smalltalk. That is why you can walk a single method back through its history, prune the past without touching the present, archive the lot into a file you can email, and have every one of those operations be an ordinary transaction rather than an act of faith.
+
+> The world is not a class Smalltalk image. It is a database — and that is what makes it safe to change.
 ' ]
 
     CocoaHelp class >> internalsText [ ^'# Under the Hood
