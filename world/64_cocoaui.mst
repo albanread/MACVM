@@ -161,11 +161,19 @@ Object subclass: CocoaUI [
              onShow: [ Win onMain makeFirstResponder: Workspace ].
         "CG7/CG8: later-loading views register themselves — resolved by name
          so this file never depends on files after it in cocoaui.list."
-        (Worker classNamed: #CocoaBrowser) ifNotNil: [ :bc | bc register ].
+        "Tab order, deliberately: the class library first (Browser V2, the
+         complete Smalltalk-80 category browser, then the Outliner — the
+         Strongtalk unfolding-tree tribute, its natural sibling), then the
+         search/edit/draw tools.
+         CocoaBrowser (V1) registers NO tab: it was never a fully realized
+         browser, and V2 plus the Outliner cover it between them. The CLASS
+         stays LOADED — the Outliner's refresh requests and several CocoaUI
+         paths go through `CocoaBrowser hostService`, and its snapshot feeds
+         the #browser view-refresh verb — it simply has no toolbar entry."
         (Worker classNamed: #CocoaBrowser2) ifNotNil: [ :b2 | b2 register ].
+        (Worker classNamed: #CocoaOutliner) ifNotNil: [ :oc | oc register ].
         (Worker classNamed: #CocoaFind) ifNotNil: [ :fc | fc register ].
         (Worker classNamed: #CocoaEditor) ifNotNil: [ :ec | ec register ].
-        (Worker classNamed: #CocoaOutliner) ifNotNil: [ :oc | oc register ].
         (Worker classNamed: #CocoaCanvas) ifNotNil: [ :cv | cv register ].
         (Worker classNamed: #CocoaHelp) ifNotNil: [ :hc | hc register ].
         (Worker classNamed: #CocoaDebugger) ifNotNil: [ :dc | dc register ].
@@ -236,6 +244,14 @@ Object subclass: CocoaUI [
         iconBase isNil ifFalse: [
             img := ((Cocoa classNamed: 'NSImage') onMain alloc) onMain
                 initWithContentsOfFile: self iconDir , iconBase , '.svg' ].
+        "No SVG of that name in icons-mono/? Try the SAME name as an SF
+         Symbol before giving up — that is how a view asks for a system
+         glyph (the Debugger's 'ladybug') without shipping an asset, and it
+         keeps the questionmark strictly for a genuine typo."
+        img isNil ifTrue: [
+            img := (Cocoa classNamed: 'NSImage') onMain
+                imageWithSystemSymbolName: iconBase
+                accessibilityDescription: nil ].
         img isNil ifTrue: [
             ^(Cocoa classNamed: 'NSImage') onMain
                 imageWithSystemSymbolName: 'questionmark.square'

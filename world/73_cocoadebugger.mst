@@ -29,7 +29,7 @@ Object subclass: CocoaDebugger [
     "── registration (tab-host protocol: lazy container, onShow re-renders the
        last report so a manual switch shows current state) ──"
     CocoaDebugger class >> register [
-        CocoaUI registerViewNamed: #debugger title: 'Debugger' icon: 'implementors'
+        CocoaUI registerViewNamed: #debugger title: 'Debugger' icon: 'ladybug'
                 container: [ self containerView ]
                 onShow: [ self render ]
     ]

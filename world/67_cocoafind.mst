@@ -163,22 +163,24 @@ Object subclass: CocoaFind [
     CocoaFind class >> rowSelected [
         "JUMP: open the hit in the browser via its own scripting helpers.
          For an implementors hit the found selector IS the search term."
-        | row r cls sel side |
+        | row r cls sel b2 |
         Results isNil ifTrue: [ ^self ].
         row := Results onMain selectedRow.
         (row < 0 or: [ Rows isNil or: [ row >= Rows size ] ]) ifTrue: [ ^self ].
         r := Rows at: row + 1.
         cls := r at: 1.
-        CocoaUI switchToView: #browser.
-        "jumpToClass: works even when the browser has never been opened —
-         it defers until the first snapshot lands. A definitions hit is the
-         CLASS itself; the other kinds continue to the method."
-        Kind == #definitions
-            ifTrue: [ CocoaBrowser jumpToClass: cls side: nil selector: nil ]
-            ifFalse: [
-                sel := (r at: 2) isNil ifTrue: [ self searchTerm ] ifFalse: [ r at: 2 ].
-                side := (r at: 3) = 'class' ifTrue: [ #class ] ifFalse: [ #instance ].
-                CocoaBrowser jumpToClass: cls side: side selector: sel ].
+        "Browser V2 is the browser now — V1 lost its toolbar tab, so
+         switching to #browser would silently land nowhere. V2 selects
+         against its own model, so this works whether or not it has been
+         opened before; a definitions hit stops at the CLASS, the other
+         kinds continue to the method."
+        b2 := Worker classNamed: #CocoaBrowser2.
+        b2 isNil ifTrue: [ ^self ].
+        CocoaUI switchToView: #browser2.
+        b2 selectClass: cls.
+        Kind == #definitions ifFalse: [
+            sel := (r at: 2) isNil ifTrue: [ self searchTerm ] ifFalse: [ r at: 2 ].
+            b2 selectMethod: sel ].
     ]
 
     "── build ──"

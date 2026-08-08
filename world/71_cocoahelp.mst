@@ -125,6 +125,7 @@ Object subclass: CocoaHelp [
         Sidebar onMain setDelegate: SidebarDelegate.
         SidebarScroll onMain setDocumentView: Sidebar.
         Container onMain addSubview: SidebarScroll.
+        self deferReload: Sidebar.
     ]
 
     CocoaHelp class >> buildFindField: w height: h [
@@ -178,9 +179,24 @@ Object subclass: CocoaHelp [
     ]
 
     "── sidebar plumbing ─────────────────────────────────────────────────"
+    CocoaHelp class >> deferReload: aView [
+        "Never reload a table synchronously from a callback (the CocoaBrowser
+         rule): post it for the next run-loop turn."
+        aView isNil ifTrue: [ ^self ].
+        aView onMain performSelector: 'reloadData' withObject: nil afterDelay: 0.0
+    ]
+
     CocoaHelp class >> ensureSelection [
+        "Runs on EVERY switch to this view. The reload is the point: an
+         NSTableView fills itself from its data source when it first DRAWS,
+         so a sidebar built while its tab was off-screen — or rebuilt after
+         a UI-worker restart — can come up empty and stay that way, since
+         nothing else ever asks it to refresh. Reload on every show, then
+         re-assert the highlight (a reload drops the selection)."
         Container isNil ifTrue: [ ^self ].
-        CurrentTopic isNil ifTrue: [ self showTopic: 1. self selectSidebarRow: 0 ]
+        CurrentTopic isNil ifTrue: [ self showTopic: 1 ].
+        self deferReload: Sidebar.
+        self selectSidebarRow: CurrentTopic - 1.
     ]
 
     CocoaHelp class >> selectSidebarRow: zeroBased [
@@ -218,6 +234,12 @@ Object subclass: CocoaHelp [
         ns release.
         storage release.
         DocView onMain scrollRangeToVisible: (Array with: 0 with: 0).
+        "AND again next run-loop turn: the text was replaced a moment ago and
+         AppKit lays it out lazily, so an immediate scroll measures against
+         the OLD layout and leaves the new topic's title clipped above the
+         top edge. Same deferral rule as the table reloads."
+        DocView onMain performSelector: 'scrollToBeginningOfDocument:'
+                withObject: nil afterDelay: 0.0.
         self selectSidebarRow: i - 1.
     ]
 
@@ -615,6 +637,10 @@ Object subclass: CocoaHelp [
         self runFind
     ]
     CocoaHelp class >> matchCount [ ^Matches isNil ifTrue: [ 0 ] ifFalse: [ Matches size ] ]
+    CocoaHelp class >> currentTopicIndex [ ^CurrentTopic ]
+    CocoaHelp class >> sidebarSelectedRow [
+        ^Sidebar isNil ifTrue: [ -2 ] ifFalse: [ Sidebar onMain selectedRow ]
+    ]
 
     CocoaHelp class >> clearFind [
         | storage len |

@@ -213,14 +213,17 @@ Object subclass: CocoaScript [
         (Worker classNamed: name asSymbol) isNil
             ifTrue: [ ^self errorOn: cmd number: -1728
                            message: 'browse: no class named ' , name ].
-        browser := Worker classNamed: #CocoaBrowser.
+        "Browser V2 (V1 has no tab since the toolbar cleanup, so switching
+         to #browser would leave the script looking at whatever was already
+         on screen and silently report success)."
+        browser := Worker classNamed: #CocoaBrowser2.
         browser isNil
             ifTrue: [ ^self errorOn: cmd number: -10000
                            message: 'browse: the browser is not loaded' ].
-        CocoaUI switchToView: #browser.
-        browser selectClassNamed: name.
+        CocoaUI switchToView: #browser2.
+        browser selectClass: name.
         sel := self argument: 'selector' of: cmd.
-        sel isNil ifFalse: [ browser selectSelectorNamed: sel ].
+        sel isNil ifFalse: [ browser selectMethod: sel ].
         ^nil
     ]
 
