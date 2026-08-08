@@ -1001,6 +1001,12 @@ script_command!(imp_perform_evaluate, "performEvaluateCommand:");
 script_command!(imp_perform_browse, "performBrowseCommand:");
 script_command!(imp_perform_snapshot, "performSnapshotCommand:");
 script_command!(imp_perform_clear_transcript, "performClearTranscriptCommand:");
+// World management (the World menu's verbs, scriptable too).
+script_command!(imp_perform_save_snapshot, "performSaveSnapshotCommand:");
+script_command!(imp_perform_restore_snapshot, "performRestoreSnapshotCommand:");
+script_command!(imp_perform_compact_world, "performCompactWorldCommand:");
+script_command!(imp_perform_revert_world, "performRevertWorldCommand:");
+script_command!(imp_perform_revert_last, "performRevertLastCommand:");
 
 static SCRIPT_COMMAND_CLASSES: OnceLock<()> = OnceLock::new();
 
@@ -1026,6 +1032,26 @@ pub fn register_script_commands() -> bool {
             (
                 "MacvmClearTranscriptCommand",
                 imp_ptr!(imp_perform_clear_transcript, ImpId0),
+            ),
+            (
+                "MacvmSaveSnapshotCommand",
+                imp_ptr!(imp_perform_save_snapshot, ImpId0),
+            ),
+            (
+                "MacvmRestoreSnapshotCommand",
+                imp_ptr!(imp_perform_restore_snapshot, ImpId0),
+            ),
+            (
+                "MacvmCompactWorldCommand",
+                imp_ptr!(imp_perform_compact_world, ImpId0),
+            ),
+            (
+                "MacvmRevertWorldCommand",
+                imp_ptr!(imp_perform_revert_world, ImpId0),
+            ),
+            (
+                "MacvmRevertLastCommand",
+                imp_ptr!(imp_perform_revert_last, ImpId0),
             ),
         ] {
             register_class_under(

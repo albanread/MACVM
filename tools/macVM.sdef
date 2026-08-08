@@ -118,6 +118,44 @@
       </parameter>
     </command>
 
+    <!-- World management: the World menu's actions, scriptable.  A world is a
+         DATABASE, so these are database operations: archive it, restore it,
+         walk its history back, prune it, or return it to its seed source. -->
+
+    <command name="save snapshot" code="MvSuMvSS"
+             description="Write a compact, zipped copy of the whole world to ~/Documents/macVM Snapshots and answer its path.">
+      <cocoa class="MacvmSaveSnapshotCommand"/>
+      <result type="text" description="The path of the archive just written."/>
+    </command>
+
+    <command name="restore snapshot" code="MvSuMvRS"
+             description="DESTRUCTIVE.  Replace the whole world with a snapshot archive (the newest one when no file is given) and reload.  The archive is validated first; a bad file is refused and the world is left untouched.">
+      <cocoa class="MacvmRestoreSnapshotCommand"/>
+      <parameter name="from" code="MvFr" type="file" optional="yes"
+                 description="The .zip to restore.  Defaults to the newest snapshot.">
+        <cocoa key="from"/>
+      </parameter>
+      <result type="text" description="What was restored."/>
+    </command>
+
+    <command name="compact world" code="MvSuMvCW"
+             description="Drop every version but the newest for each class and method, then reclaim the space.  The live source is untouched; its history is discarded permanently.">
+      <cocoa class="MacvmCompactWorldCommand"/>
+      <result type="text" description="How much was dropped and reclaimed."/>
+    </command>
+
+    <command name="revert world" code="MvSuMvRW"
+             description="DESTRUCTIVE.  Delete the image and re-seed it from the world source files: every edit made in the Browser or Editor and never saved to a file is lost, and versions restart at 1.">
+      <cocoa class="MacvmRevertWorldCommand"/>
+      <result type="text" description="The outcome of the re-seed."/>
+    </command>
+
+    <command name="revert last change" code="MvSuMvRL"
+             description="Walk the world's history back one step for the most recently edited class or method, then reload.  The previous source returns as a new version, so the revert is itself undoable.">
+      <cocoa class="MacvmRevertLastCommand"/>
+      <result type="text" description="What was reverted."/>
+    </command>
+
     <command name="clear transcript" code="MvSuMvCT"
              description="Empty the transcript log.">
       <cocoa class="MacvmClearTranscriptCommand"/>

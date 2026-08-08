@@ -255,6 +255,64 @@ Object subclass: CocoaScript [
         ^nil
     ]
 
+    "── world management (the World menu's verbs, scriptable) ────────────
+     Each answers the host's own `OK <text>` payload as the command result,
+     and turns an `ERR <why>` into a real script error the caller can catch
+     with `try … on error` — the same contract the other verbs keep. No
+     arming here: a script IS the deliberate act, and AppleScript already
+     makes the caller name the verb."
+    CocoaScript class >> worldReply: reply on: cmd what: aLabel [
+        | br |
+        br := Worker classNamed: #CocoaBrowser.
+        (br isOk: reply) ifTrue: [ ^br payloadOf: reply ].
+        self errorOn: cmd number: -2741 message: aLabel , ': ' , (br errorOf: reply).
+        ^nil
+    ]
+
+    CocoaScript class >> performSaveSnapshotCommand: cmd [
+        ^self worldReply: ((Worker classNamed: #CocoaBrowser) readReply:
+                (CocoaUI hostService onMain snapshotWorldDefault))
+              on: cmd what: 'save snapshot'
+    ]
+
+    CocoaScript class >> performRestoreSnapshotCommand: cmd [
+        "`from` is optional — without it, the newest snapshot."
+        | url path |
+        "An AppleScript `file`/`POSIX file` arrives as an NSURL; `path` is its
+         filesystem path (the snapshot verb's own rule, §performSnapshot)."
+        url := (cmd send: 'evaluatedArguments')
+                   ifNil: [ nil ]
+                   ifNotNil: [ :a | a send: 'objectForKey:' with: (Cocoa nsString: 'from') ].
+        path := url isNil
+            ifTrue: [ CocoaUI latestSnapshotPath ]
+            ifFalse: [ | p | p := (url send: 'path') asString.
+                       (p isNil or: [ p isEmpty ]) ifTrue: [ url asString ] ifFalse: [ p ] ].
+        path isNil ifTrue: [
+            ^self errorOn: cmd number: -1728
+                   message: 'restore snapshot: no snapshot saved yet' ].
+        ^self worldReply: ((Worker classNamed: #CocoaBrowser) readReply:
+                (CocoaUI hostService onMain restoreWorldFrom: path))
+              on: cmd what: 'restore snapshot'
+    ]
+
+    CocoaScript class >> performCompactWorldCommand: cmd [
+        ^self worldReply: ((Worker classNamed: #CocoaBrowser) readReply:
+                (CocoaUI hostService onMain compactWorld))
+              on: cmd what: 'compact world'
+    ]
+
+    CocoaScript class >> performRevertWorldCommand: cmd [
+        ^self worldReply: ((Worker classNamed: #CocoaBrowser) readReply:
+                (CocoaUI hostService onMain revertWorldToOriginal))
+              on: cmd what: 'revert world'
+    ]
+
+    CocoaScript class >> performRevertLastCommand: cmd [
+        ^self worldReply: ((Worker classNamed: #CocoaBrowser) readReply:
+                (CocoaUI hostService onMain revertLastChange))
+              on: cmd what: 'revert last change'
+    ]
+
     "── evaluate: the asynchronous verb (design §5) ──────────────────────
      CocoaUI>>doIt posts to the primary VM and the reply lands later on the
      beat; the UI worker must not block. So `evaluate` cannot compute its
