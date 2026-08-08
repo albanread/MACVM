@@ -336,3 +336,56 @@ feature, not a performance fix, and the record shows this project's wins come
 from structural changes it can gate. So the recommendation is E0+E1 behind
 the existing differential gate, with E2–E4 judged on whether the library
 actually gets simpler — measured, as usual, rather than assumed.
+
+## 6. OPEN BUG — `retry` fails once `on:do:` is JIT-compiled
+
+**Found 2026-08-08 by the differential gate, which is currently RED.** The
+world suite is 7701/0 under `MACVM_JIT=off` and **crashes under
+`threshold=20`** (the supported measurement threshold; `threshold=1`
+auto-rewrites to 20, so both spellings hit it).
+
+Reproducer, `scripts/repro-retry-jit.mst` — a warm loop that compiles
+`on:do:`/`protect:handler:`/`signal`, then one `retry`:
+
+```
+MACVM_JIT=off       target/release/macvm run scripts/repro-retry-jit.mst --world world  → RETRY OK
+MACVM_JIT=threshold=20 …                                                                → Error: does not understand value
+```
+
+No verb is required in the warm loop — a plain `on: Error do: [ :e | 2 ]`
+sixty times is enough. It is the *compilation* that matters, not which verb
+warmed it.
+
+**Evidence, gathered by instrumenting `Exception>>retry` at the failure:**
+
+| probe, in the failing moment | result |
+|---|---|
+| `handlerRetry class` | `BlockClosure` — it *is* a block |
+| `handlerRetry numArgs` | `0` — correct arity, and this send works |
+| `[ 7 ] value` | `7` — `value` dispatch is healthy generally |
+| `handlerRetry value` | **DNU `does not understand value`** |
+
+So: other sends to that same block succeed, and `value` succeeds on a fresh
+block — only `value` *on that block* fails. That is not a lookup failure in
+the ordinary sense, which points at the **value-dispatch fast path**:
+`codecache::stubs::resolve_target_entry` intercepts prims 50–53 *before* the
+code-table lookup and routes to `stub_value_dispatch` → `rt_value_target`,
+tail-jumping into a compiled block nmethod with `rt_value_fallback` behind
+it. A stale or invalidated entry there produces exactly this signature.
+
+**Why it is a VM bug and not a world bug:** nothing in `78_exceptions.mst`
+differs between tiers, and the same source is correct interpreted. The
+retry block (`[ ^Exception retryToken ]`, created inside
+`protect:handler:`) is the one block in the arc that is *stored, escapes,
+and is later invoked from a deeper frame* — the shape most likely to expose
+a dispatch-cache lifetime bug.
+
+Ruled out on the way: JIT closure elision of stored blocks (a stored escaping
+block survives compilation intact), and the arity/`nil`-entry theories
+(`numArgs` is 0, `handlerRetry` is non-nil). Also resolved en route: a frame
+printed as `BlockClosure>>aBlock` is how the trace printer names a **block
+frame**, not a method of that name — it misled the first hour of this hunt.
+
+**Not attempted here.** Fixing this means editing the dispatch fast path
+(`stub_value_dispatch` / `rt_value_target`), which needs its own gating run —
+exactly the kind of change this project does not land untested.

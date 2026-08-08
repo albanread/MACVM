@@ -1,0 +1,10 @@
+"Minimal reproducer: docs/exceptions_design.md E2's `retry` under the JIT.
+ Interpreter: prints RETRY OK. MACVM_JIT=threshold=20: dies with
+ `does not understand value`. The warm loop only has to compile on:do: /
+ protect:handler: / signal — no verb in it is itself required."
+[ 1 to: 60 do: [:i | [ Error signal ] on: Error do: [ :e | 2 ] ].
+  Transcript showCr: 'warmed'.
+  [ | n | n := 0.
+    [ n := n + 1. n < 3 ifTrue: [ Error signal ]. n ]
+        on: Error do: [ :e | e retry ] ] value.
+  Transcript showCr: 'RETRY OK' ] value.
